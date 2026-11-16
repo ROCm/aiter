@@ -507,12 +507,13 @@ class PaDecodePipeline:
                 init_state, fx.Int32(self.ctx.part_start), multi_query, q_ops_all, True
             )
         elif const_expr(self.traits.nhd_layout):
-            # NHD DMA zero-fills the tail, so keep its pipelined loop unpeeled.
+            # NHD DMA zero-fills the V tail, so it skips V byte masking, but a
+            # multi-tile final partial tile still needs score masking.
             for loop_i, ostate in range(
                 self.ctx.part_start, self.ctx.part_end, 1, init=init_state
             ):
                 next_state = self.tile(
-                    ostate, fx.Int32(loop_i), multi_query, q_ops_all, False
+                    ostate, fx.Int32(loop_i), multi_query, q_ops_all, True
                 )
                 results = yield next_state
             o_final = results

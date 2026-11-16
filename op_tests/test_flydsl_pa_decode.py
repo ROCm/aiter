@@ -2802,3 +2802,55 @@ def test_pa_decode_unowned_kv_rows(
     assert torch.equal(poisoned, clean)
     if fill == "nan":
         assert torch.equal(run("zero", mask_unowned_kv=False), clean)
+
+
+def test_pa_decode_nhd_partial_tile_zero_logits(device):
+    """Multi-tile NHD q=1 decode must mask scores on the final partial tile."""
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("NHD pa_decode is gfx950-only")
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    num_blocks = 5
+    block_size = 64
+    head_dim = 256
+    query = torch.zeros((1, 8, head_dim), dtype=torch.bfloat16, device=device)
+    key_cache = torch.zeros(
+        (num_blocks, block_size, 1, head_dim), dtype=torch.float8_e4m3fn, device=device
+    )
+    value_cache = torch.ones(
+        (num_blocks, block_size, 1, head_dim), dtype=torch.bfloat16, device=device
+    ).to(torch.float8_e4m3fn)
+    block_tables = torch.arange(num_blocks, dtype=torch.int32, device=device).unsqueeze(
+        0
+    )
+    context_lengths = torch.tensor([257], dtype=torch.int32, device=device)
+    plan = pa.prepare_pa_decode_plan(
+        query,
+        key_cache,
+        value_cache,
+        block_tables,
+        context_lengths,
+        query_length=1,
+        workgroup_budget=1,
+    )
+    output = torch.empty_like(query)
+    pa.pa_decode(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        head_dim**-0.5,
+        1,
+        compute_type=torch.float8_e4m3fn,
+        key_scale=1.0,
+        value_scale=1.0,
+        work_plan=plan,
+        max_context_length=257,
+    )
+    torch.testing.assert_close(
+        output.float(),
+        torch.ones_like(output, dtype=torch.float32),
+        atol=1e-2,
+        rtol=1e-2,
+    )
