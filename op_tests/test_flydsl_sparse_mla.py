@@ -40,8 +40,8 @@ Suites:
                pa_decode_sparse. Rows come in top-k score order (``topk``),
                ascending logical positions mapped through the block table
                (``logical``), or sorted physical slots (``physical``). Caches
-               stay warm; op_benchmarks/triton/bench_sparse_mla.py flushes
-               them and times sparse_mla_fwd with and without the FlyDSL route.
+               stay warm, and flydsl_order_plan times the reorder too. TFLOPS
+               counts 4 * T * H * K * D for QK and PV.
 
 Usage:
     python op_tests/test_flydsl_sparse_mla.py
@@ -910,6 +910,8 @@ def test_performance(tokens, order, has_sink):
         checked = torch.cat((checked[:64], checked[-64:]))
     ref = run_torch(q[checked], kv, rows[checked], sink)
     nbytes = (tokens * TOPK * D + 2 * tokens * H * D) * 2 + rows.nbytes
+    # QK and PV each take 2 * K * D FLOPs per token and head.
+    flops = 4 * tokens * H * TOPK * D
     ret = {
         "gfx": get_gfx_runtime(),
         "distinct MiB": rows.unique().numel() * D * 2 / 2**20,
@@ -927,6 +929,7 @@ def test_performance(tokens, order, has_sink):
             msg=f"T={tokens} {order} {name}: out",
         )
         ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
     # Triton is the baseline only: the FlyDSL candidates must pass the check.
