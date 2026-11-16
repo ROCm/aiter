@@ -300,7 +300,7 @@ class MegaMoeTPEngine:
         situ_linear_beta: float = 1.0,
         swiglu_limit: float | None = None,
         comm_mode: str = "ag_rs",
-        comm_dtype: str = "fp8",
+        comm_dtype: str = "bf16",
         ar_gather: str = "auto",
         schedule: str = "dynamic",
         act_dtype: str = "fp4",
@@ -330,7 +330,9 @@ class MegaMoeTPEngine:
         if ar_gather not in ("bf16", "fp8", "auto"):
             raise ValueError(f"unknown ar_gather {ar_gather!r}")
         self.ag_fp8 = ar_gather == "fp8"
-        self.ag_auto = AG8_MIN if ar_gather == "auto" else 0
+        # (auto: the ar second hop as MXFP8 rows from AG8_MIN tokens -- not with bf16 comm,
+        # whose collectives stay lossless)
+        self.ag_auto = AG8_MIN if ar_gather == "auto" and comm_dtype != "bf16" else 0
         if not 1 <= topk <= experts or max_local_tokens < 1:
             raise ValueError(
                 f"need 1 <= topk ({topk}) <= experts ({experts}), max_local_tokens >= 1"

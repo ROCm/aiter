@@ -138,7 +138,9 @@ class MegaMoeTPConfig:
     linear_beta: float | None = None
     swiglu_limit: float | None = None
     comm_mode: str = "ag_rs"
-    comm_dtype: str = "fp8"
+    # "bf16" (default: lossless collectives), "fp8" / "int8" (quantized wire: the big-M path's
+    # int8 / int4 reduce-scatter and int8 y gather per its tuned rows)
+    comm_dtype: str = "bf16"
     ar_gather: str = "auto"
     schedule: str = "dynamic"
     # "fp4" (a4w4), "fp8", "bf16" (a16w4: two MXFP8 terms, the small-M schedule only), or
