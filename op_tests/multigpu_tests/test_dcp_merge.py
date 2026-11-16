@@ -9,14 +9,19 @@ Against an fp32 torch reference on every rank (each rank rebuilds every rank's
 inputs from their seeds), for:
 - token counts from 1 up to what the LL scratch holds, with rows whose LSE is
   -inf on some ranks or on all of them, owned_counts with zeros, and return_lse;
-- a CUDA graph replayed with new inputs;
+  o and lse contiguous, and strided (o a [..., :128] view of [B, H, 192], lse a
+  transposed view);
+- no tokens (B = 0), followed by a regular call;
+- a CUDA graph replayed with new inputs and new owned_counts;
 - calls interleaved with LL all-reduces and all-gathers, which share its
-  scratch and epochs.
+  scratch and epochs, with one rank (the same choice on every rank) arriving
+  late each round.
 
 Run with: python3 op_tests/multigpu_tests/test_dcp_merge.py -t 4
 """
 
 import argparse
+import random
 from multiprocessing import freeze_support
 
 import torch
@@ -41,18 +46,32 @@ def _inputs(src, b, h, seed, device):
     return o, lse
 
 
-def _owned(src, b, device):
-    """owned_counts of rank src: 0 for every fifth row, offset by the rank."""
-    return ((torch.arange(b, device=device) + src) % 5 != 0).to(torch.int32) * 3
+def _owned(src, b, device, seed=0):
+    """owned_counts of rank src: 0 for every fifth row, offset by the rank and
+    the seed."""
+    rows = torch.arange(b, device=device)
+    return ((rows + src + seed) % 5 != 0).to(torch.int32) * 3
 
 
-def _reference(world, rank, b, h, seed, device, with_owned):
+def _strided(o, lse):
+    """The same values as o and lse, as an o [..., :128] view of [B, H, 192]
+    and a transposed lse view."""
+    b, h, _ = o.shape
+    wide = torch.full((b, h, D + 64), float("nan"), dtype=o.dtype, device=o.device)
+    wide[..., :D] = o
+    lse_t = torch.empty((h, b), dtype=lse.dtype, device=lse.device).t()
+    lse_t.copy_(lse)
+    return wide[..., :D], lse_t
+
+
+def _reference(world, rank, b, h, seed, device, with_owned, owned_seed=0):
     hl = h // world
     os_, ls = [], []
     for s in range(world):
         o, lse = _inputs(s, b, h, seed, device)
         if with_owned:
-            lse = lse.masked_fill(_owned(s, b, device)[:, None] == 0, float("-inf"))
+            owned = _owned(s, b, device, owned_seed)
+            lse = lse.masked_fill(owned[:, None] == 0, float("-inf"))
         os_.append(o[:, rank * hl : (rank + 1) * hl].float())
         ls.append(lse[:, rank * hl : (rank + 1) * hl])
     o, lse = torch.stack(os_), torch.stack(ls)
@@ -100,20 +119,38 @@ def _merge_worker(
         hl = heads // world
         max_b = ca._dcp_merge_max_rows // hl
 
-        # sizes, edge rows, owned_counts and return_lse
+        # sizes, edge rows, owned_counts and return_lse, contiguous and strided
         for b in [x for x in sizes if x <= max_b] + [max_b]:
             for with_owned in (False, True):
-                o, lse = _inputs(rank, b, heads, 1, device)
-                owned = _owned(rank, b, device) if with_owned else None
-                out, out_lse = ca.custom_dcp_merge(o, lse, owned, return_lse=True)
-                ref, ref_lse = _reference(world, rank, b, heads, 1, device, with_owned)
-                _check(out, out_lse, ref, ref_lse, f"{rank=} {b=} {with_owned=}")
+                for strided in (False, True):
+                    o, lse = _inputs(rank, b, heads, 1, device)
+                    if strided:
+                        o, lse = _strided(o, lse)
+                        assert ca.should_custom_dcp_merge(o, lse)
+                    owned = _owned(rank, b, device) if with_owned else None
+                    out, out_lse = ca.custom_dcp_merge(o, lse, owned, return_lse=True)
+                    ref, ref_lse = _reference(
+                        world, rank, b, heads, 1, device, with_owned
+                    )
+                    context = f"{rank=} {b=} {with_owned=} {strided=}"
+                    _check(out, out_lse, ref, ref_lse, context)
         if rank == 0:
             print(f"TP{world} H{heads}: sizes {sizes} and {max_b} tokens pass")
 
-        # a CUDA graph, replayed with new inputs
+        # no tokens, then a regular call (the epochs stay in step)
+        o, lse = _inputs(rank, 4, heads, 3, device)
+        out, out_lse = ca.custom_dcp_merge(o[:0], lse[:0], return_lse=True)
+        assert out.shape == (0, hl, D) and out_lse.shape == (0, hl), f"{rank=} B=0"
+        out = ca.custom_dcp_merge(o, lse)
+        ref, _ = _reference(world, rank, 4, heads, 3, device, False)
+        _check(out, None, ref, None, f"{rank=} after B=0")
+        if rank == 0:
+            print(f"TP{world}: B = 0 passes")
+
+        # a CUDA graph, replayed with new inputs and new owned_counts
         b = sizes[len(sizes) // 2]
         o, lse = _inputs(rank, b, heads, 2, device)
+        owned = _owned(rank, b, device)
         ca.custom_dcp_merge(o, lse)
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
@@ -121,19 +158,25 @@ def _merge_worker(
         stream.wait_stream(torch.cuda.current_stream())
         with ca.capture(), torch.cuda.graph(graph, stream=stream):
             gout = ca.custom_dcp_merge(o, lse)
+            gown = ca.custom_dcp_merge(o, lse, owned)
         torch.cuda.current_stream().wait_stream(stream)
         for it in range(iterations):
             no, nl = _inputs(rank, b, heads, 100 + it, device)
             o.copy_(no)
             lse.copy_(nl)
+            owned.copy_(_owned(rank, b, device, it))
             gout.fill_(float("nan"))
+            gown.fill_(float("nan"))
             graph.replay()
             ref, _ = _reference(world, rank, b, heads, 100 + it, device, False)
             _check(gout, None, ref, None, f"{rank=} graph {it=}")
+            ref, _ = _reference(world, rank, b, heads, 100 + it, device, True, it)
+            _check(gown, None, ref, None, f"{rank=} graph owned {it=}")
         if rank == 0:
             print(f"TP{world}: {iterations} graph replays pass")
 
-        # interleaved with the LL all-reduce and all-gather (shared scratch and epochs)
+        # interleaved with the LL all-reduce and all-gather (shared scratch and
+        # epochs); each round one rank, the same on every rank, arrives late
         cases = [(b, s) for s, b in enumerate(sizes)]
         for it in range(iterations):
             for b, seed in cases:
@@ -143,6 +186,8 @@ def _merge_worker(
                 )
                 ar = ca.custom_all_reduce(x)
                 ag = ca.custom_all_gather(x[:1].contiguous(), 0)
+                if rank == random.Random(1009 * it + seed).randrange(world):
+                    torch.cuda._sleep(2_000_000)
                 out = ca.custom_dcp_merge(o, lse)
                 ref, _ = _reference(
                     world, rank, b, heads, 200 + it + seed, device, False

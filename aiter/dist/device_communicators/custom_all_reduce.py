@@ -2976,15 +2976,21 @@ class CustomAllreduce:
     def should_custom_dcp_merge(self, o: torch.Tensor, lse: torch.Tensor) -> bool:
         """Whether custom_dcp_merge takes these decode context parallel partials.
 
-        gfx1250 only: o [B, H, 128] bf16 with 8-byte aligned rows, lse [B, H]
-        fp32, H divisible by the group, and B * H / world_size rows a source
-        within what the LL scratch holds.
+        gfx1250 only: o [B, H, 128] bf16 whose batch and head strides are
+        multiples of 4 elements, lse [B, H] fp32, H divisible by the group, and
+        B * H / world_size rows a source within what the LL scratch holds.
+
+        The answer depends only on shapes, dtypes and strides, never on an
+        address or other rank-local state: a caller chooses between this kernel
+        and a collective of its own from it, so every rank of the group must get
+        the same answer. (The C++ entry still rejects an o whose rows are not
+        8-byte aligned.)
         """
         if self.disabled or not getattr(self, "_dcp_merge_max_rows", 0):
             return False
         if o.dim() != 3 or o.dtype != torch.bfloat16 or o.shape[2] != 128:
             return False
-        if o.stride(2) != 1 or o.stride(0) % 4 or o.stride(1) % 4 or o.data_ptr() % 8:
+        if o.stride(2) != 1 or o.stride(0) % 4 or o.stride(1) % 4:
             return False
         if lse.dtype != torch.float32 or lse.shape != o.shape[:2]:
             return False
@@ -3011,7 +3017,9 @@ class CustomAllreduce:
         should_custom_dcp_merge(o, lse) must hold.
 
         It reads o and lse in place, so it needs no registered buffer and is
-        the same inside and outside CUDA graph capture.
+        the same inside and outside CUDA graph capture. Like the LL all-reduce
+        and all-gather, whose scratch and epochs it shares, it expects no other
+        LL kernel of this communicator to run at the same time on another stream.
         """
         b, h, d = o.shape
         hl = h // self.world_size

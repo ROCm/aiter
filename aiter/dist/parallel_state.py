@@ -874,6 +874,16 @@ class GroupCoordinator:
         merged by LSE (with return_lse, also the merged LSE). Returns None when
         no custom kernel takes the inputs; the caller then merges its own way
         (for example with an all-to-all).
+
+        Whether it returns None depends only on the inputs' shapes, dtypes and
+        strides and on this group, so every rank makes the same choice. Callers
+        rely on that: the kernel and their fallback are both collectives, and
+        ranks that chose differently would hang the group.
+
+        This is the gfx1250 merge (CustomAllreduce.custom_dcp_merge, over the LL
+        scratch). On gfx950, aiter.ops.flydsl.dcp_mailbox.dcp_lse_combine merges
+        a single-node group through a FlyDSL mailbox with a workspace of its own;
+        it is not reached from here.
         """
         if self.world_size == 1 or self.device_communicator is None:
             return None

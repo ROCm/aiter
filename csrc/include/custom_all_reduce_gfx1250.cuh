@@ -1142,6 +1142,16 @@ __global__ void __launch_bounds__(512, 1) ag_ll_gfx1250(
 // exp(lse_s - g) * o_s in fp32, rounded to bf16 once. A shard whose weight is 0
 // is skipped, since its o may be NaN. owned (optional, [B] int32): a row this
 // rank owns no KV slot of sends -inf.
+//
+// Epochs, as in ar_ll / ag_ll: a block takes its epoch from
+// block_flags[blockIdx.x] when it starts, and every block writes all kMaxBlocks
+// entries when it ends. A block that started only after another block of the
+// same launch had finished would read the advanced epoch and wait forever. So
+// every block of a launch must be resident at once: blocks <= CUs, one a CU,
+// with no other kernel holding CUs it needs. An LL kernel of the same
+// communicator running at the same time on another stream (decode two-batch
+// overlap, say) breaks that, and shares the scratch too: callers keep these
+// calls on one stream.
 template <int ngpus, int U>
 __global__ void __launch_bounds__(1024, 1) dcp_merge_ll_gfx1250(
     uint8_t* const* __restrict__ peer_scratch,
