@@ -1110,7 +1110,8 @@ def _test_prefill_quant_case(rank, shape, dtype, gemma_norm):
 
 def _two_stage_barrier_case(rank, calls=64):
     """Two-stage fused AR + RMSNorm has no end barrier, so back-to-back calls
-    rewrite each rank's staged shard right after peers read it. It must still
+    rewrite each rank's staged shard right after peers read it. Every 4th call
+    one rank, in turn, lags, so peers run ahead of it. Each call must still
     equal the one-stage path bit for bit, also once the barrier epochs wrap."""
     from aiter.jit.utils.hip_runtime import load_hip_runtime
 
@@ -1122,8 +1123,7 @@ def _two_stage_barrier_case(rank, calls=64):
     for near_wrap in (False, True):
         if near_wrap:  # Signal: start, end uint32[512][64], then _flag uint32[512]
             barrier_before_teardown()
-            meta = ca._pool["meta"]
-            ptr = meta.data_ptr() if callable(meta.data_ptr) else meta.data_ptr
+            ptr = ca._pool["meta"].data_ptr
             words = ctypes.c_size_t(512 * 64 * 2 + 512)  # all set to 2**32 - 256
             hip = load_hip_runtime()
             assert hip.hipMemsetD32(ctypes.c_void_p(ptr), -256, words) == 0
@@ -1139,10 +1139,11 @@ def _two_stage_barrier_case(rank, calls=64):
             refs = [run(i, True) for i in range(2)]
             bad = torch.zeros((), dtype=torch.int64, device="cuda")
             for i in range(calls):  # back to back: no host sync until the end
+                if i % 4 == 0 and rank == i // 4 % 4:
+                    torch.cuda._sleep(1_000_000)  # longer than a few calls
                 for a, b in zip(run(i, False), refs[i % 2]):
                     bad += (a.view(torch.uint8) != b.view(torch.uint8)).sum()
             assert bad.item() == 0, f"{m=} {quant=} {near_wrap=}: {bad.item()} bytes"
-    barrier_before_teardown()
 
 
 def _prefill_quant_worker(rank, shapes, distributed_init_method, barrier=False):
