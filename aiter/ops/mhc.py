@@ -13,6 +13,7 @@ from aiter import dtypes
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
+from ..plugin import route as _route
 
 
 @compile_ops("module_mhc", develop=True)
@@ -677,6 +678,7 @@ def mhc_pre_fake(
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=mhc_pre_fake)
+@_route(op="mhc_pre", version=1)
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -693,6 +695,18 @@ def mhc_pre(
     w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed BF16 hi/lo from mhc_shuffle_fn
     res_preshuffle: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The pre half of MHC: normalise, score the heads, and mix.
+
+    Returns ``(post_mix, comb_mix, layer_input)`` -- three newly allocated
+    tensors. Nothing is written through the arguments, which is what the
+    ``mutates_args=[]`` on the guard above already declares; a provider
+    serving this contract allocates its own outputs and returns them.
+
+    ``sinkhorn_repeat=0`` runs the pre step for the hc head only.
+    ``w_preshuffle_bf16`` and ``res_preshuffle`` say that ``fn`` and
+    ``residual`` already arrive packed, so a provider must read them as given
+    rather than assume row-major.
+    """
     if res_preshuffle and mhc_res_shuffle_enabled(residual.size(0)):
         residual = mhc_res_unshuffle(residual)
     m = residual.size(0)
@@ -785,6 +799,7 @@ def _mhc_post(
 
 
 @torch_compile_guard(mutates_args=["out"], gen_fake=lambda *args, **kwargs: None)
+@_route(op="mhc_post", version=1)
 def mhc_post(
     out: torch.Tensor,
     x: torch.Tensor,
@@ -794,6 +809,16 @@ def mhc_post(
     store_nt: int = -1,
     res_preshuffle: bool = False,
 ) -> None:
+    """The post half of MHC: combine the mixed heads back into ``out``.
+
+    Returns nothing. ``out`` is the result and is written in place, which the
+    ``mutates_args=["out"]`` on the guard above declares; a provider serving
+    this contract must leave it fully written, since a caller has no return
+    value to tell a skipped row from a correct one.
+
+    ``res_preshuffle`` says ``residual`` arrives packed; it is unshuffled here
+    when the row count makes that layout active.
+    """
     if res_preshuffle and mhc_res_shuffle_enabled(residual.size(0)):
         residual = mhc_res_unshuffle(residual)
     _mhc_post(out, x, residual, post_layer_mix, comb_res_mix, store_nt)

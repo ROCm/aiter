@@ -117,11 +117,19 @@ class ExpertGrouping:
     recv_bound: int  # the recv-token bound, i.e. the CSV token bucket
     align_m: int  # per-expert row alignment the plan wrote
     rows: int  # row upper bound, bounding the GEMM grid
+    # True only when this step's dispatch shipped one row per token per peer.
+    # The stage-1 kernel does not, and a scatter there would zero the wire
+    # stride that kernel checks.
+    row_gather: bool = False
 
     def scatter_fields(self) -> dict:
         """As ``Stage2ScatterContext``'s compact_* fields."""
         return {
             "compact_layout": True,
+            # The compact wire is one row per token per peer. The grouped GEMM
+            # scatters those rows into expert order, then clears the flag so
+            # GEMM1 loads A contiguously.
+            "compact_row_gather": self.row_gather,
             "compact_masked_m": self.masked_m,
             "compact_psum": self.psum,
             "compact_ep_rowmap": self.ep_rowmap,

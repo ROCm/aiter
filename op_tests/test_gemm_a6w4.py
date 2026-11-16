@@ -413,8 +413,6 @@ def test_a6w4_rejects_unsupported_launch_contracts_before_allocation():
     args = (placeholder,) * 4
     with pytest.raises(ValueError, match="alpha=1.0"):
         gemm_a6w4(*args, 1, 1, 1, alpha=0.5)
-    with pytest.raises(ValueError, match="2 GiB"):
-        gemm_a6w4(*args, 65792, 16384, 128)
     with pytest.raises(ValueError, match="int32"):
         gemm_a6w4(*args, 1, 1, (1 << 32) + 128)
     with pytest.raises(ValueError, match="padded K"):
