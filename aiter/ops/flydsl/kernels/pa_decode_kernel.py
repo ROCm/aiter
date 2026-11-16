@@ -17,7 +17,7 @@ gfx1250 uses wave32 WMMA with native FP8 Q/P conversion or BF16 operands.
 Its four waves process 64- or 128-token compute tiles within each 256-token
 plan tile. Packed FP8 D128/D256 full-attention paths use K128 WMMA; other
 FP8 paths use K64 and BF16 uses K32. Four FP8 D128 query tiles over page128
-caches give each wave its own tile and keep P in registers. Supported layouts
+caches run in wave pairs that each cover half a page and keep P in registers. Supported layouts
 use TDM K/V transfers, with two LDS buffers where capacity permits.
 One-partition plans can write final output directly. Plans with one task slot
 per sequence merge a sequence's few partitions in its last-arriving CTA, and
@@ -61,12 +61,12 @@ import flydsl.expr as fx
 import torch
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .pa_decode.context import PaDecodeContext
 from .pa_decode.op_merge import (
-    CLUSTER_PARTITIONS,
     MERGE_HEAD_DIM,
     MERGE_PARTITIONS,
     Gfx1250ClusterMerge,
@@ -92,6 +92,7 @@ from .pa_decode.traits import (
     PaDecodeTraits,
     pa_fx_dtypes,
 )
+from .pa_decode_plan import CLUSTER_PARTITIONS, CLUSTER_STEP_TOKENS
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -99,6 +100,7 @@ from .tensor_shim import (
 
 __all__ = [
     "CLUSTER_PARTITIONS",
+    "CLUSTER_STEP_TOKENS",
     "FP8_PACK_K",
     "KV_COMPUTE_BLOCK",
     "LOG2E",
@@ -108,6 +110,7 @@ __all__ = [
     "MFMA_MNK",
     "WAVE",
     "compile_pa_decode_tile",
+    "gfx1250_tile_traits",
 ]
 
 # Key by selected specialization, not batch/head/CU scheduling inputs.
@@ -189,6 +192,9 @@ def compile_pa_decode_tile(
     trans_k: bool = True,
     mask_unowned_kv: bool = True,
     cluster_merge: int = 0,
+    cluster_seqs: int = 1,
+    cluster_steps: bool = False,
+    cluster_runs: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -265,35 +271,31 @@ def compile_pa_decode_tile(
                 "gfx1250 PA decode takes an f16/bf16 query and e4m3fn/bf16 KV, "
                 f"got {query_dtype} and {kv_dtype}"
             )
-        if query_splits is None:
-            # Split the measured spilling BF16 specialization into one Q tile
-            # per CTA. Other shapes retain fused queries and their KV reuse.
-            query_splits = (
-                4
-                if kv_fx == fx.BFloat16
-                and head_dim == 1024
-                and query_group_size == 16
-                and query_length == 4
-                and block_size == 128
-                and trans_v
-                and sliding_window == 0
-                else 1
-            )
         return compile_gfx1250_pa_decode(
-            head_dim=head_dim,
-            query_group_size=query_group_size,
-            block_size=block_size,
-            softmax_scale=softmax_scale,
-            query_dtype=_dtype_tag(query_fx),
-            per_token_kv=per_token_kv,
-            query_length=query_length,
-            trans_v=trans_v,
-            sliding_window=sliding_window,
-            compute_dtype=_dtype_tag(kv_fx),
-            direct_output=direct_output and num_partitions == 1,
-            query_splits=query_splits,
-            merge_partitions=direct_output and num_partitions > 1,
-            cluster_merge=cluster_merge,
+            gfx1250_tile_traits(
+                head_dim=head_dim,
+                query_group_size=query_group_size,
+                block_size=block_size,
+                num_seqs=num_seqs,
+                num_kv_heads=num_kv_heads,
+                num_compute_units=num_compute_units,
+                work_capacity=work_capacity,
+                num_partitions=num_partitions,
+                softmax_scale=softmax_scale,
+                query_dtype=query_dtype,
+                kv_dtype=kv_dtype,
+                per_token_kv=per_token_kv,
+                query_length=query_length,
+                trans_v=trans_v,
+                query_splits=query_splits,
+                max_context_length=max_context_length,
+                sliding_window=sliding_window,
+                direct_output=direct_output,
+                cluster_merge=cluster_merge,
+                cluster_seqs=cluster_seqs,
+                cluster_steps=cluster_steps,
+                cluster_runs=cluster_runs,
+            )
         )
     if architecture not in ("gfx942", "gfx950"):
         raise NotImplementedError(f"PA decode does not support {architecture}")
@@ -461,7 +463,7 @@ def compile_pa_decode_tile(
             """Zero this CTA's query rows of ``seq`` in the final output."""
             tid = fx.Int32(gpu.thread_id("x"))
             row_units = traits.head_dim // 8
-            kv_query = fx.Int32(gpu.block_id("y"))
+            kv_query = fx.Int32(gpu.block_id("x" if traits.SPLIT_MAJOR else "y"))
             kv_h = kv_query // traits.query_splits
             first_row = (
                 (kv_query % traits.query_splits)
@@ -490,7 +492,7 @@ def compile_pa_decode_tile(
 
         # Skip cleared padding records: no scratch writes or Q loads.
         # This CTA-uniform guard keeps every task barrier convergent.
-        slot = fx.Int32(gpu.block_id("x"))
+        slot = fx.Int32(gpu.block_id("y" if traits.SPLIT_MAJOR else "x"))
         work = fx.recast_iter(fx.Int32, work_info_ptr)
         if const_expr(traits.DIRECT and traits.kv_dtype != MXFP4_KV_DTYPE):
             # One-partition plan, capacity == batch: slot s runs packed task s
@@ -708,7 +710,11 @@ def compile_pa_decode_tile(
                     num_seqs,
                 )
             ).launch(
-                grid=(work_capacity, num_kv_heads * traits.query_splits, 1),
+                grid=(
+                    (num_kv_heads * traits.query_splits, work_capacity, 1)
+                    if traits.SPLIT_MAJOR
+                    else (work_capacity, num_kv_heads * traits.query_splits, 1)
+                ),
                 block=(traits.CTA_THREADS, 1, 1),
                 stream=stream,
             )
@@ -720,7 +726,7 @@ def compile_pa_decode_tile(
             "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
             "amdgpu-kernarg-preload-count": min(16, AITER_FLYDSL_KERNARG_PRELOAD_COUNT),
         }
-    if traits.FP8_MTP4_LEAN:
+    if traits.FP8_MTP4_LEAN or traits.WAVES_PER_EU_2:
         # Two CTAs per CU: hold the allocator to 256 registers per wave.
         pa_decode_tile_launch.compile_hints["waves_per_eu"] = 2
     compiled = {
@@ -730,70 +736,155 @@ def compile_pa_decode_tile(
     return _PA_DECODE_TILE_CACHE.setdefault(traits.cache_key, compiled)
 
 
-def compile_gfx1250_pa_decode(
+def gfx1250_tile_traits(
     *,
-    head_dim,
-    query_group_size,
-    block_size,
-    softmax_scale,
-    query_dtype,
-    per_token_kv,
-    query_length,
-    trans_v,
-    sliding_window,
-    compute_dtype="fp8",
-    direct_output=False,
-    query_splits=1,
-    merge_partitions=False,
-    cluster_merge=0,
-):
-    """Compile a gfx1250 tile kernel; merging partitions writes final output.
+    head_dim: int,
+    query_group_size: int,
+    block_size: int,
+    num_seqs: int,
+    num_kv_heads: int,
+    num_compute_units: int,
+    work_capacity: int,
+    num_partitions: int = 1,
+    softmax_scale: float | None = None,
+    query_dtype: torch.dtype = torch.float16,
+    kv_dtype: torch.dtype,
+    per_token_kv: bool = False,
+    query_length: int = 1,
+    trans_v: bool = True,
+    query_splits: int | None = None,
+    max_context_length: int | None = None,
+    sliding_window: int = 0,
+    direct_output: bool = False,
+    cluster_merge: int = 0,
+    cluster_seqs: int = 1,
+    cluster_steps: bool = False,
+    cluster_runs: bool = False,
+) -> Gfx1250Traits:
+    """Select the gfx1250 tile ``compile_pa_decode_tile`` compiles.
 
-    ``merge_partitions`` plans keep packed partials and count arrivals per
-    (sequence, KV head) in the plan's zeroed ``arrival_counters``. A positive
-    ``cluster_merge`` P instead launches P CTAs per sequence as one workgroup
-    cluster: CTA i runs the sequence's task i when it has one, and the cluster
-    merges P-way after a cluster barrier. Every sequence must have at most P
-    tasks. In both modes a sequence's single task stores final rows directly,
-    and empty sequences clear their rows.
-    ``merge_partitions`` partial storage must be eight-byte aligned for its
-    device-scope atomic accesses; the host wrapper falls back for offset views.
+    Arguments are those of ``compile_pa_decode_tile``; host-known grid bounds
+    choose step widths and staging. Selection neither validates nor compiles.
     """
-    if query_splits not in (1, 2, 4) or query_length % query_splits:
-        raise ValueError("query_splits must be 1, 2, or 4 and divide query_length")
-    t = Gfx1250Traits(
+    kv_fx, query_fx = pa_fx_dtypes(kv_dtype, query_dtype)
+    compute_dtype = _dtype_tag(kv_fx)
+    if query_splits is None:
+        # Split the measured spilling BF16 specialization into one Q tile
+        # per CTA. Other shapes retain fused queries and their KV reuse.
+        query_splits = (
+            4
+            if compute_dtype == "bf16"
+            and head_dim == 1024
+            and query_group_size == 16
+            and query_length == 4
+            and block_size == 128
+            and trans_v
+            and sliding_window == 0
+            else 1
+        )
+    grid_sequences = (
+        num_seqs
+        if direct_output and num_partitions == 1
+        else (
+            -(-num_seqs // cluster_seqs) * cluster_seqs * cluster_merge
+            if cluster_merge
+            else work_capacity
+        )
+    )
+    grid_ctas = grid_sequences * num_kv_heads * query_splits
+    one_cta_grid = grid_ctas <= num_compute_units
+    # Two-page FP8 steps pay off with one CTA per CU, or when CTAs run several
+    # tiles; two-CTA grids of one-tile tasks lose overlap.
+    wide_pages = one_cta_grid or (
+        grid_ctas <= 2 * num_compute_units
+        and max_context_length is not None
+        and num_seqs * -(-max_context_length // KV_COMPUTE_BLOCK) >= 3 * grid_sequences
+    )
+    return Gfx1250Traits(
         head_dim,
         query_group_size,
         block_size,
         head_dim**-0.5 if softmax_scale is None else softmax_scale,
-        query_dtype,
+        _dtype_tag(query_fx),
         per_token_kv,
         query_length,
         trans_v,
         sliding_window,
         compute_dtype,
-        direct_output,
+        direct_output and num_partitions == 1,
         query_splits,
-        merge_partitions,
+        direct_output and num_partitions > 1,
         cluster_merge,
+        # Wide page16 stages leave room for two CTAs per CU: larger grids
+        # (sparse prefill) keep narrower stages.
+        grid_ctas <= 2 * num_compute_units
+        and compute_dtype == "bf16"
+        and block_size == 16,
+        wide_pages and compute_dtype == "fp8" and block_size == 128,
+        # Step-split clusters run 128-token steps, which their runs and
+        # preloaded page ids assume.
+        one_cta_grid and compute_dtype == "bf16" and not cluster_steps,
+        grid_ctas > 4 * num_compute_units
+        and compute_dtype == "fp8"
+        and block_size == 16,
+        cluster_seqs=cluster_seqs if cluster_merge else 1,
+        latency_grid=one_cta_grid,
+        cluster_steps=cluster_steps,
+        cluster_runs=cluster_runs,
     )
-    if compute_dtype not in ("fp8", "bf16"):
-        raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
-    if t.bf16 and per_token_kv:
+
+
+def compile_gfx1250_pa_decode(t):
+    """Compile a gfx1250 tile kernel; merging partitions writes final output.
+
+    ``t`` holds the ``gfx1250_tile_traits`` selection.
+    ``merge_partitions`` plans keep packed partials and count arrivals per
+    (sequence, KV head) in the plan's zeroed ``arrival_counters``. A positive
+    ``cluster_merge`` P instead launches P CTAs per sequence as one workgroup
+    cluster: a sequence with n tasks splits its tiles over its first min(n, P)
+    CTAs, as the planner splits them, and the cluster merges after a cluster
+    barrier. ``work`` then holds the context lengths. ``cluster_steps`` instead
+    gives CTA p steps [p * 16 / P, (p + 1) * 16 / P) of block tables at most
+    16 steps wide, ignoring the plan's task counts, with partials at slot
+    sequence * P + p. ``cluster_runs`` (page128) likewise gives CTA p tiles
+    [p * run_tiles, (p + 1) * run_tiles), ``run_tiles`` sized by the host from
+    the length bound. In all modes a sequence's single task stores final rows
+    directly, and empty sequences clear their rows.
+    ``merge_partitions`` partial storage must be eight-byte aligned for its
+    device-scope atomic accesses; the host wrapper falls back for offset views.
+    """
+    if t.query_splits not in (1, 2, 4) or t.query_length % t.query_splits:
+        raise ValueError("query_splits must be 1, 2, or 4 and divide query_length")
+    if t.compute_dtype not in ("fp8", "bf16"):
+        raise ValueError(f"Unsupported gfx1250 PA compute dtype: {t.compute_dtype}")
+    if t.bf16 and t.per_token_kv:
         raise ValueError("BF16 PA decode does not use quantization scales")
-    if merge_partitions and (direct_output or head_dim > MERGE_HEAD_DIM):
+    if t.merge_partitions and (t.direct_output or t.head_dim > MERGE_HEAD_DIM):
         raise ValueError(
             f"merge_partitions excludes direct_output and head_dim > {MERGE_HEAD_DIM}"
         )
-    if cluster_merge and (
-        direct_output
-        or merge_partitions
-        or head_dim > MERGE_HEAD_DIM
-        or not 2 <= cluster_merge <= CLUSTER_PARTITIONS
+    if t.cluster_merge and (
+        t.direct_output
+        or t.merge_partitions
+        or t.head_dim > MERGE_HEAD_DIM
+        or not 2 <= t.cluster_merge <= CLUSTER_PARTITIONS
     ):
         raise ValueError(
             f"cluster_merge must be in [2, {CLUSTER_PARTITIONS}] and excludes other "
             f"output modes and head_dim > {MERGE_HEAD_DIM}"
+        )
+    if t.cluster_steps and not (
+        t.cluster_merge
+        and CLUSTER_PARTITIONS % t.cluster_merge == 0
+        and t.block_size == 16
+        and t.query_length == 1
+        and t.sliding_window == 0
+        and t.TOKENS == CLUSTER_STEP_TOKENS
+    ):
+        raise ValueError(
+            "cluster_steps requires a cluster dividing "
+            f"{CLUSTER_PARTITIONS} CTAs over page16 decode rows without a "
+            f"sliding window and {CLUSTER_STEP_TOKENS}-token steps"
         )
     if t.total_bytes > 327680:
         raise NotImplementedError(
@@ -807,19 +898,19 @@ def compile_gfx1250_pa_decode(
         buf: fx.Array[fx.Int32, t.total_bytes // 4, 16]
 
     kernel_name = _pa_decode_tile_kernel_name(
-        kv_dtype=compute_dtype,
-        query_dtype=query_dtype,
-        head_dim=head_dim,
-        block_size=block_size,
-        query_group_size=query_group_size,
-        query_length=query_length,
-        per_token_kv=per_token_kv,
-        trans_v=trans_v,
-        sliding_window=sliding_window,
-        query_splits=query_splits,
-        direct_output=direct_output,
-        merge_partitions=merge_partitions,
-        cluster_merge=cluster_merge,
+        kv_dtype=t.compute_dtype,
+        query_dtype=t.query_dtype,
+        head_dim=t.head_dim,
+        block_size=t.block_size,
+        query_group_size=t.query_group_size,
+        query_length=t.query_length,
+        per_token_kv=t.per_token_kv,
+        trans_v=t.trans_v,
+        sliding_window=t.sliding_window,
+        query_splits=t.query_splits,
+        direct_output=t.direct_output,
+        merge_partitions=t.merge_partitions,
+        cluster_merge=t.cluster_merge,
     )
 
     # Every argument that reducer-fed and direct-output kernels read fits in
@@ -848,6 +939,7 @@ def compile_gfx1250_pa_decode(
         reduce_info: fx.Pointer,
         output: fx.Pointer,
         counters: fx.Pointer,
+        run_tiles: fx.Int32,
     ):
 
         def zero_output(seq, dst):
@@ -874,30 +966,145 @@ def compile_gfx1250_pa_decode(
 
         task_slot = fx.Int32(gpu.block_id("x"))
         if const_expr(t.cluster_merge):
-            # Cluster s runs sequence s's tasks on its leading CTAs.
+            # Cluster s runs sequence s's tasks on its leading CTAs. Their
+            # tiles follow from the context length and task count exactly as
+            # plan_pa_decode splits them: ``work`` holds the context lengths,
+            # read alongside reduce_info instead of after it.
             seq, part = task_slot // t.cluster_merge, task_slot % t.cluster_merge
-            seq_tasks = fx.ptr_load(
-                fx.add_offset(fx.recast_iter(fx.Int32, reduce_info), seq * 2),
-                result_type=fx.Vector.make_type(2, fx.Int32),
+            if const_expr(t.cluster_seqs > 1):
+                # The last cluster pads the grid past the batch.
+                present = seq < sequences
+                seq = present.select(seq, fx.Int32(0))
+            task_context = fx.Int32(fx.recast_iter(fx.Int32, work)[seq])
+            step_bounds = None
+            if const_expr(t.cluster_steps):
+                # Block tables hold at most CLUSTER_PARTITIONS steps, so CTA p
+                # takes steps [p chunk, (p + 1) chunk). Its first page ids
+                # depend on no load, so they load with the context length
+                # rather than after it: the wave's pages, then token 0's for
+                # masked tail slices. The plan's tasks are not read.
+                chunk = CLUSTER_PARTITIONS // t.cluster_merge
+                first_step = part * chunk
+                wave_pages = t.TOKENS // t.block_size // t.NWARP
+                tbl = fx.recast_iter(fx.Int32, table)
+                row = seq * max_blocks
+                page = (
+                    first_step * (t.TOKENS // t.block_size)
+                    + fx.Int32(fx.rocdl.wave_id()) * wave_pages
+                )
+                # Only the active branch reads the ids, and the compiler would
+                # sink their loads into it, after the length's wait; the
+                # readfirstlanes are convergent, so they keep the loads here.
+                stage_pages = [
+                    fx.Int32(
+                        fx.rocdl.readfirstlane(
+                            T.i32, tbl[row + fx.min(page + j, max_blocks - 1)]
+                        )
+                    )
+                    for j in range_constexpr(wave_pages)
+                ] + [fx.Int32(fx.rocdl.readfirstlane(T.i32, tbl[row]))]
+                # The scheduler would still place the loads after the wait.
+                fx.rocdl.sched_barrier(0)
+                length = fx.max(task_context, fx.Int32(0))
+                steps = (length + t.TOKENS - 1) // t.TOKENS
+                count = fx.min((steps + chunk - 1) // chunk, fx.Int32(t.cluster_merge))
+                if const_expr(t.cluster_seqs > 1):
+                    count = present.select(count, fx.Int32(0))
+                first = seq * t.cluster_merge
+                task_slot = first + part
+                step_bounds = (first_step * t.TOKENS, (first_step + chunk) * t.TOKENS)
+                task_seq = seq
+                task_begin = step_bounds[0] // KV_COMPUTE_BLOCK
+                task_end = (step_bounds[1] + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
+                active = part < count
+            elif const_expr(t.cluster_runs):
+                # CTA p takes tiles [p run_tiles, (p + 1) run_tiles), a run the
+                # host sizes from the length bound, so its first stage's page
+                # ids load with the context length rather than after it. Only
+                # the active branch reads them, and the compiler would sink
+                # their loads into it; readfirstlane keeps them here.
+                first_tile = part * run_tiles
+                tbl = fx.recast_iter(fx.Int32, table)
+                row = seq * max_blocks
+                page = first_tile * (KV_COMPUTE_BLOCK // t.block_size)
+                stage_pages = [
+                    fx.Int32(
+                        fx.rocdl.readfirstlane(
+                            T.i32, tbl[row + fx.min(page + j, max_blocks - 1)]
+                        )
+                    )
+                    # BF16 wave pipelines stage two pages up front.
+                    for j in range_constexpr(max(t.TOKENS // t.block_size, 2))
+                ] + [fx.Int32(fx.rocdl.readfirstlane(T.i32, tbl[row]))]
+                # Keep the loads ahead of the length's wait.
+                fx.rocdl.sched_barrier(0)
+                length = fx.max(task_context, fx.Int32(0))
+                tiles = (length + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
+                count = fx.min(
+                    (tiles + run_tiles - 1) // run_tiles, fx.Int32(t.cluster_merge)
+                )
+                first = seq * t.cluster_merge
+                task_slot = first + part
+                task_seq = seq
+                task_begin = first_tile
+                task_end = fx.min(first_tile + run_tiles, tiles)
+                active = first_tile < tiles
+            else:
+                # Scalar loads return out of order, so a use waits for every
+                # load issued before it: issue both before either is used.
+                seq_tasks = fx.ptr_load(
+                    fx.add_offset(fx.recast_iter(fx.Int32, reduce_info), seq * 2),
+                    result_type=fx.Vector.make_type(2, fx.Int32),
+                )
+                fx.rocdl.sched_barrier(0)
+                # A sequence with more tasks than the cluster has CTAs splits its
+                # tiles over the cluster, in its first task slots.
+                first = fx.Int32(seq_tasks[0])
+                count = fx.min(fx.Int32(seq_tasks[1]), fx.Int32(t.cluster_merge))
+                if const_expr(t.cluster_seqs > 1):
+                    count = present.select(count, fx.Int32(0))
+                task_slot = (part < count).select(first + part, fx.Int32(0))
+                # Tiles of an int32 length, times at most 16 parts, fit Int32.
+                length = fx.max(task_context, fx.Int32(0))
+                first_tile = fx.Int32(0)
+                if const_expr(t.sliding_window > 0):
+                    window = min(t.query_length - 1 + t.sliding_window, 2**31 - 1)
+                    first_tile = (
+                        fx.max(length - window, fx.Int32(0)) // KV_COMPUTE_BLOCK
+                    )
+                tiles = (
+                    length // KV_COMPUTE_BLOCK
+                    + fx.Int32(length % KV_COMPUTE_BLOCK != 0)
+                    - first_tile
+                )
+                parts = fx.max(count, fx.Int32(1))
+                task_seq = seq
+                task_begin = first_tile + part * tiles // parts
+                task_end = first_tile + (part + 1) * tiles // parts
+                active = part < count
+        else:
+            if const_expr(t.direct_output):
+                # One task per nonempty sequence; reduce_info supplies its slot.
+                # Later sequences start first: sparse prefill rows grow with
+                # their position, so the longest tasks no longer form a tail.
+                task_slot = sequences - 1 - task_slot
+                direct_seq = task_slot
+                info = fx.recast_iter(fx.Int32, pmax)
+                count = fx.Int32(info[task_slot * 2 + 1])
+                # A trailing empty sequence's start can equal capacity. Its dummy
+                # task read must stay in bounds even though no compute consumes it.
+                task_slot = (count > 0).select(
+                    fx.Int32(info[task_slot * 2]), fx.Int32(0)
+                )
+            task = fx.ptr_load(
+                fx.add_offset(fx.recast_iter(fx.Int32, work), task_slot * 4),
+                result_type=fx.Vector.make_type(4, fx.Int32),
             )
-            first, count = fx.Int32(seq_tasks[0]), fx.Int32(seq_tasks[1])
-            task_slot = (part < count).select(first + part, fx.Int32(0))
-        if const_expr(t.direct_output):
-            # One task per nonempty sequence; reduce_info supplies its packed slot.
-            info = fx.recast_iter(fx.Int32, pmax)
-            count = fx.Int32(info[task_slot * 2 + 1])
-            # A trailing empty sequence's start can equal capacity. Its dummy
-            # task read must stay in bounds even though no compute consumes it.
-            task_slot = (count > 0).select(fx.Int32(info[task_slot * 2]), fx.Int32(0))
-        task = fx.ptr_load(
-            fx.add_offset(fx.recast_iter(fx.Int32, work), task_slot * 4),
-            result_type=fx.Vector.make_type(4, fx.Int32),
-        )
-        active = fx.Int32(task[1]) < fx.Int32(task[2])
-        if const_expr(t.direct_output):
-            active = count > 0
-        if const_expr(t.cluster_merge):
-            active = part < count
+            task_seq, task_begin = fx.Int32(task[0]), fx.Int32(task[1])
+            task_end, task_context = fx.Int32(task[2]), fx.Int32(task[3])
+            active = task_begin < task_end
+            if const_expr(t.direct_output):
+                active = count > 0
         if active:
             ctx = PaDecodeContext(
                 t,
@@ -917,10 +1124,10 @@ def compile_gfx1250_pa_decode(
                 sq_row,
                 sq_head,
                 sequences,
-                fx.Int32(task[0]),
-                fx.Int32(task[1]),
-                fx.Int32(task[2]),
-                fx.Int32(task[3]),
+                task_seq,
+                task_begin,
+                task_end,
+                task_context,
             )
             # Packed partials are [KV heads, capacity, rows] by task slot.
             ctx.task_slot, ctx.capacity = task_slot, capacity
@@ -928,9 +1135,7 @@ def compile_gfx1250_pa_decode(
             if const_expr(t.merge_partitions):
                 # Issued early: only the epilogue reads the sequence's tasks.
                 tasks = fx.ptr_load(
-                    fx.add_offset(
-                        fx.recast_iter(fx.Int32, reduce_info), fx.Int32(task[0]) * 2
-                    ),
+                    fx.add_offset(fx.recast_iter(fx.Int32, reduce_info), task_seq * 2),
                     result_type=fx.Vector.make_type(2, fx.Int32),
                 )
                 ctx.first_task = fx.Int32(tasks[0])
@@ -940,6 +1145,9 @@ def compile_gfx1250_pa_decode(
             if const_expr(t.cluster_merge):
                 ctx.task_count = count
                 ctx.output_ptr = output
+                ctx.step_bounds = step_bounds
+                if const_expr(t.cluster_steps or t.cluster_runs):
+                    ctx.stage_pages = stage_pages
             if const_expr(t.bf16_wave_query_tiles):
                 Gfx1250Bf16WavePipeline(ctx).run()
             elif const_expr(t.bf16_page128_packed):
@@ -949,7 +1157,7 @@ def compile_gfx1250_pa_decode(
             else:
                 Gfx1250Pipeline(ctx).run()
         elif const_expr(t.direct_output):
-            zero_output(gpu.block_id("x"), pout)
+            zero_output(direct_seq, pout)
         if const_expr(t.merge_partitions):
             # Empty sequences own no task. Capacity >= batch gives each one the
             # CTA at its index, which clears its rows.
@@ -957,7 +1165,17 @@ def compile_gfx1250_pa_decode(
             if task_slot < sequences:  # noqa: SIM102
                 if fx.Int32(info[task_slot * 2 + 1]) == 0:
                     zero_output(task_slot, output)
-        if const_expr(t.cluster_merge):
+        if const_expr(t.cluster_merge and t.cluster_seqs > 1):
+            # Sequences sharing a cluster need not agree on their task counts:
+            # every CTA reaches the barrier, and only split sequences merge.
+            Gfx1250ClusterMerge(t, pmax, psum, pout, output, sq_row, sq_head).sync()
+            if count > 1:
+                Gfx1250ClusterMerge(t, pmax, psum, pout, output, sq_row, sq_head).merge(
+                    seq, part, first, count, capacity
+                )
+            elif (count == 0) & (part == 0) & present:
+                zero_output(seq, output)
+        elif const_expr(t.cluster_merge):
             # Every CTA of a cluster reaches its barrier exactly once.
             if count > 1:
                 merge = Gfx1250ClusterMerge(
@@ -990,13 +1208,17 @@ def compile_gfx1250_pa_decode(
         output: fx.Pointer,
         reduce_info: fx.Pointer,
         counters: fx.Pointer,
+        run_tiles: fx.Int32,
         stream: fx.Stream,
     ):
         grid_x = capacity
         if const_expr(t.direct_output):
             grid_x = sequences
         if const_expr(t.cluster_merge):
-            grid_x = sequences * t.cluster_merge
+            # Whole clusters of cluster_seqs sequences.
+            grid_x = ((sequences + t.cluster_seqs - 1) // t.cluster_seqs) * (
+                t.cluster_seqs * t.cluster_merge
+            )
         pa_decode_tile_kernel(
             work,
             table,
@@ -1019,8 +1241,9 @@ def compile_gfx1250_pa_decode(
             reduce_info,
             output,
             counters,
+            run_tiles,
             value_attrs=(
-                {"rocdl.cluster_dims": f"{t.cluster_merge},1,1"}
+                {"rocdl.cluster_dims": f"{t.cluster_merge * t.cluster_seqs},1,1"}
                 if t.cluster_merge
                 else None
             ),
@@ -1028,7 +1251,9 @@ def compile_gfx1250_pa_decode(
             grid=(grid_x, kv_heads * t.query_splits, 1),
             block=(t.BLOCK_THREADS, 1, 1),
             stream=stream,
-            cluster=(t.cluster_merge, 1, 1) if t.cluster_merge else None,
+            cluster=(
+                (t.cluster_merge * t.cluster_seqs, 1, 1) if t.cluster_merge else None
+            ),
         )
 
     llvm_options = {}
