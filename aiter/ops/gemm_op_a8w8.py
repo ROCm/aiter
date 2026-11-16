@@ -23,6 +23,8 @@ from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..jit.utils.build_targets import base_gfx_arch, is_gfx1250_family
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
+from ..jit.utils.eager_guard import plain_eager
+from ..jit.utils.eager_guard import probes_available as eager_probes_available
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import (
     find_padded_m_row,
@@ -950,6 +952,132 @@ def _gemm_a8w8_bpreshuffle_into(
             f"gemm_a8w8_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
             f"{dtype=}, config={config}: {e}"
         ) from e
+
+
+# The custom ops: what torch.compile records, and what runs every call the
+# eager fast path below declines.
+_gemm_a8w8_bpreshuffle_op = gemm_a8w8_bpreshuffle
+_gemm_a8w8_bpreshuffle_ck_op = gemm_a8w8_bpreshuffle_ck
+# `_eager_body` is set only when the guard registered the op itself; a
+# registration made elsewhere may run a different body.
+_eager_a8w8_ops_are_ours = all(
+    hasattr(op, "_eager_body")
+    for op in (gemm_a8w8_bpreshuffle, gemm_a8w8_bpreshuffle_ck)
+)
+
+# Eager fast path. Outside torch.compile a CK bpreshuffle GEMM goes
+# through two torch.ops dispatches (aiter::gemm_a8w8_bpreshuffle, then
+# aiter::gemm_a8w8_bpreshuffle_ck) and the compile_ops wrapper before the
+# pybind call. `_a8w8_bpreshuffle_eager` makes that call directly, after the
+# same config lookup, and declines (None) whenever the op path may do
+# something else.
+_eager_a8w8_ck = None  # pybind entry once resolved; False: off for the run
+
+
+def _resolve_eager_a8w8_ck() -> None:
+    """Look the CK entry up once the op path has run (and so loaded or built
+    the module). Off for the run under per-op argument logging, a forced
+    rebuild, a torch without the probes the guards need, an op running a body
+    other than the one registered here, or a module that cannot be loaded."""
+    global _eager_a8w8_ck
+    from ..jit.core import AITER_LOG_MORE, AITER_REBUILD, get_module
+
+    _eager_a8w8_ck = False
+    if (
+        not _eager_a8w8_ops_are_ours
+        or AITER_LOG_MORE >= 2
+        or AITER_REBUILD
+        or not eager_probes_available
+    ):
+        return
+    try:
+        _eager_a8w8_ck = get_module(
+            "module_gemm_a8w8_bpreshuffle"
+        ).gemm_a8w8_bpreshuffle
+    except ModuleNotFoundError:
+        pass
+
+
+def _a8w8_bpreshuffle_eager(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    bias: Tensor | None,
+    dtype: torch.dtype,
+) -> Tensor | None:
+    """`gemm_a8w8_bpreshuffle` run without the dispatcher when it runs a CK
+    kernel (a CK row of the tuned table, or no row at all), or None to leave
+    the call to the custom op: under torch.compile or jit tracing, inside any
+    dispatch mode, torch-function mode or functorch transform, for tensor
+    subclasses that intercept ops, inputs autograd would record, arguments the
+    op rejects or pads (bias, an unsupported dtype, a K-padded WQ, other
+    ranks), CKTile and FlyDSL rows, untuned shapes on gfx1250, and a rebound
+    ``gemm_a8w8_bpreshuffle_ck``.
+    ``get_GEMM_config_with_quant_type`` is called through the module attribute
+    on every call, as `_gemm_a8w8_bpreshuffle_into` calls it.
+    """
+    if torch.compiler.is_compiling():
+        return None
+    ck = _eager_a8w8_ck
+    if (
+        not ck
+        or bias is not None
+        or (dtype is not torch.bfloat16 and dtype is not torch.float16)
+        or gemm_a8w8_bpreshuffle_ck is not _gemm_a8w8_bpreshuffle_ck_op
+        or not plain_eager((XQ, WQ, x_scale, w_scale))
+        or XQ.dim() != 2
+        or WQ.dim() != 2
+        or WQ.dtype != dtypes.fp8
+    ):
+        return None
+    m, k = XQ.shape
+    n, w_k = WQ.shape
+    if w_k != k:
+        return None
+    config = get_GEMM_config_with_quant_type(
+        m,
+        n,
+        k,
+        dtypes.fp8,
+        AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
+    )
+    if config is not None:
+        if config["libtype"] != "ck":
+            return None
+        Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+        return ck(XQ, WQ, x_scale, w_scale, Y, int(config["splitK"]))
+    # Untuned: the default CK kernel, except where gfx1250 picks a FlyDSL one.
+    if is_gfx1250_family(get_gfx()):
+        return None
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    try:
+        return ck(XQ, WQ, x_scale, w_scale, Y, 0)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"gemm_a8w8_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
+            f"{dtype=}, config={config}: {e}"
+        ) from e
+
+
+def gemm_a8w8_bpreshuffle(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    bias: Tensor | None = None,
+    dtype: torch.dtype = dtypes.bf16,
+    check: bool = False,
+) -> Tensor:
+    """FP8 ``XQ @ WQ.T`` with per-token ``x_scale`` and per-channel ``w_scale``
+    for a preshuffled ``WQ``, in ``dtype``."""
+    result = _a8w8_bpreshuffle_eager(XQ, WQ, x_scale, w_scale, bias, dtype)
+    if result is not None:
+        return result
+    result = _gemm_a8w8_bpreshuffle_op(XQ, WQ, x_scale, w_scale, bias, dtype, check)
+    if _eager_a8w8_ck is None:
+        _resolve_eager_a8w8_ck()
+    return result
 
 
 # Only ``out`` is written, so it is the only argument declared mutable; the

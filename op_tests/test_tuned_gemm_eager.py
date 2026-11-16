@@ -363,11 +363,13 @@ def test_tensor_subclasses():
 
     from torch._subclasses.fake_tensor import FakeTensor
 
-    assert tuned._eager_tensor_type(torch.Tensor)
-    assert tuned._eager_tensor_type(torch.nn.Parameter)
-    assert tuned._eager_tensor_type(Plain)
-    assert not tuned._eager_tensor_type(FakeTensor)
-    assert not tuned._eager_tensor_type(int)
+    from aiter.jit.utils.eager_guard import plain_tensor_type
+
+    assert plain_tensor_type(torch.Tensor)
+    assert plain_tensor_type(torch.nn.Parameter)
+    assert plain_tensor_type(Plain)
+    assert not plain_tensor_type(FakeTensor)
+    assert not plain_tensor_type(int)
 
 
 def test_parameter_weights_take_the_fast_path(fallbacks):

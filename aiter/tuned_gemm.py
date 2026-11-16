@@ -28,6 +28,8 @@ from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logge
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_MORE, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.eager_guard import plain_eager
+from aiter.jit.utils.eager_guard import probes_available as eager_probes_available
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
 from aiter.ops.gradlib import _hipb_mm
@@ -428,25 +430,8 @@ _eager_ops_are_ours = all(
 _eager_hipb = None  # pybind entry points once resolved; False: off for the run
 _eager_gfx_cu: dict[int, tuple[str, int]] = {}
 _eager_dtype_str: dict[torch.dtype, str] = {}
-_eager_tensor_types: dict[type, bool] = {torch.Tensor: True, torch.nn.Parameter: True}
 _eager_weight_handles: OrderedDict = OrderedDict()
 _EAGER_WEIGHT_HANDLES_MAX = 1024
-
-
-def _eager_tensor_type(cls: type) -> bool:
-    """Whether tensors of type ``cls`` may skip the dispatcher.
-
-    A subclass that takes over ``__torch_dispatch__`` (FakeTensor, functional
-    and wrapper tensors) has to see the op. One that only overrides
-    ``__torch_function__`` is caught per call by ``torch._C._has_torch_function``.
-    """
-    ok = _eager_tensor_types.get(cls)
-    if ok is None:
-        ok = issubclass(cls, torch.Tensor) and (
-            cls.__torch_dispatch__ is torch.Tensor.__torch_dispatch__
-        )
-        _eager_tensor_types[cls] = ok
-    return ok
 
 
 def _eager_device_gfx_cu(index: int) -> tuple[str, int]:
@@ -501,16 +486,11 @@ def _resolve_eager_hipb():
         return None
     from aiter.jit.core import _pybind_develop_hooks, get_module
 
-    dispatch_modes = getattr(torch._C, "_len_torch_dispatch_stack", None)
-    functorch_active = getattr(torch._C, "_are_functorch_transforms_active", None)
-    jit_tracing = getattr(torch._C, "_is_tracing", None)
     if (
         not _eager_ops_are_ours
         or _record_gemm_shapes()
         or AITER_LOG_MORE >= 2
-        or dispatch_modes is None
-        or functorch_active is None
-        or jit_tracing is None
+        or not eager_probes_available
     ):
         _eager_hipb = False
         return False
@@ -522,9 +502,6 @@ def _resolve_eager_hipb():
         convert,
         raw_stream,
         current_device,
-        dispatch_modes,
-        functorch_active,
-        jit_tracing,
     )
     return _eager_hipb
 
@@ -555,34 +532,8 @@ def _hipblaslt_eager(
         hipb = _resolve_eager_hipb()
     if not hipb:
         return None
-    (
-        set_stream,
-        hipb_mm_op,
-        convert,
-        raw_stream,
-        current_device,
-        dispatch_modes,
-        functorch_active,
-        jit_tracing,
-    ) = hipb
-    known = _eager_tensor_types.get
-    if (
-        dispatch_modes()
-        or functorch_active()
-        or jit_tracing()
-        or torch._C._has_torch_function((A, B, bias, out))
-        or not (known(type(A)) or _eager_tensor_type(type(A)))
-        or not (known(type(B)) or _eager_tensor_type(type(B)))
-        or not (bias is None or known(type(bias)) or _eager_tensor_type(type(bias)))
-        or not (out is None or known(type(out)) or _eager_tensor_type(type(out)))
-    ):
-        return None
-    if torch.is_grad_enabled() and (
-        A.requires_grad
-        or B.requires_grad
-        or (bias is not None and bias.requires_grad)
-        or (out is not None and out.requires_grad)
-    ):
+    set_stream, hipb_mm_op, convert, raw_stream, current_device = hipb
+    if not plain_eager((A, B, bias, out)):
         return None
     if B.dim() != 2:
         return None
