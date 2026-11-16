@@ -473,7 +473,12 @@ def _rmsnorm_with_add_fake(*args, **kwargs) -> None:
     return
 
 
-@_route(op="rmsnorm_with_add", version=1, fake=_rmsnorm_with_add_fake)
+@_route(
+    op="rmsnorm_with_add",
+    version=1,
+    fake=_rmsnorm_with_add_fake,
+    mutates_args=["out", "residual_out"],
+)
 @torch_compile_guard(
     mutates_args=["out", "residual_out"], gen_fake=lambda *a, **k: None
 )

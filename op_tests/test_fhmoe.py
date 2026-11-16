@@ -1710,6 +1710,7 @@ def test_clamp_shared_preserves_existing_positional_argument_order():
         "clamp_shared",
         "herd_topk",
         "herd_routed_scaling_factor",
+        "deterministic",
         "w1_global_scale",
         "w2_global_scale",
     ]

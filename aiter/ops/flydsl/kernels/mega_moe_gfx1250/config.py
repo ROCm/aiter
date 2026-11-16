@@ -52,6 +52,8 @@ _DISPATCH_EP8_TDM = (
 #
 # Both fields matter: either change on its own is slower than the entry it
 # replaces at both sizes. 384x16 is slower again, 54.0us at tpr 1536 vs 48.7.
+# EP2 top-6 and EP4 top-9 keep their own tables below; this generic tail is
+# the one the mid-size route overlay (_COMPACT_ROUTE_SPEC) refines.
 _DISPATCH_COMPACT = (
     (64, 64, 8, True),
     (256, 192, 8, True),
@@ -64,6 +66,51 @@ _DISPATCH_COMPACT = (
 # on MI455X, MLPerf Endpoints agentic c512.
 _COMPACT_ROUTE_UPTO = 1024
 _COMPACT_ROUTE_SPEC = (384, 16)
+
+# EP4 h7168 topk9 (topk8 + the fused shared expert) fp4 wire. Route-parallel
+# wins at every size here, prefill included; the topk8 table's 384-block decode
+# geometry loses to 1024x8. Dispatch us, MegaMoE microbenchmark (eager):
+#   tpr    old table            this table
+#   64     22.7 (64x8)          15.9 (256x8)
+#   256    24.0 (192x8)         17.8 (256x16)
+#   1024   37.9 (384x16)        31.9 (1024x8)
+#   1536   47.8 (384x16)        38.5 (1024x8)
+#   8192   171.7 (128x16 tok)   100.3 (512x16)
+#   16384  314 (128x16 tok)     182 (512x16)
+_DISPATCH_COMPACT_EP4_TOPK9 = (
+    (64, 256, 8, True),
+    (256, 256, 16, True),
+    (2048, 1024, 8, True),
+    (4096, 256, 16, True),
+    (None, 512, 16, True),
+)
+
+
+# EP2 h5120 topk6 fp4 (DSV4.1 Flash). The EP4 tail is token-major 128x16 past
+# 4096 tokens/rank. On this geometry that tail is slower than 256x16, and
+# route-parallel grids (256/384/512/1024) are slower still: each token hits
+# about two peers, so fanning six routes does not hide the deduped stores.
+# MegaMoE microbenchmark, scatter compact path, tpr 8192, per layer:
+#   128x16 token-major  1075 us
+#   256x16 token-major  1059 us
+#   512x16 route        1072 us
+_DISPATCH_COMPACT_EP2_TOPK6 = (
+    (64, 64, 8, True),
+    (256, 192, 8, True),
+    (512, 192, 16, True),
+    (1536, 384, 16, True),
+    (4096, 256, 16, True),
+    (None, 256, 16, False),
+)
+
+
+def _compact_dispatch_schedule(world_size: int, topk: int):
+    if (int(world_size), int(topk)) == (4, 9):
+        return _DISPATCH_COMPACT_EP4_TOPK9
+    if (int(world_size), int(topk)) == (2, 6):
+        return _DISPATCH_COMPACT_EP2_TOPK6
+    return _DISPATCH_COMPACT
+
 
 _DISPATCH_TDM_SCHEDULES = {
     (4, 7168, 8): _DISPATCH_EP4_TDM,

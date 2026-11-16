@@ -30,6 +30,15 @@ MXFP4_P_EXP_SHIFT = 20
 BF16_LDS_LIMIT_BYTES = 64 * 1024
 MXFP4_LDS_LIMIT_BYTES = 160 * 1024
 PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
+# gfx942 K/V streaming (PaDecodeTraits.STREAM_KV): lane K-row bytes from which
+# a single or two M-tiles stream on busy grids and from which every tile
+# streams, head groups per K load piece, K pieces and V head chunks in flight.
+STREAM_KV_ROW_BYTES = 384
+STREAM_KV_TWO_MTILE_ROW_BYTES = 256
+STREAM_KV_MTILES_ROW_BYTES = 1024
+STREAM_K_GROUPS = 4
+STREAM_K_DEPTH = 2
+STREAM_V_DEPTH = 4
 D256_PIPE_MAX_ROWS = 2 * MFMA_MNK
 # KV cache formats as FlyDSL element types of the cache tensors' torch dtypes.
 # MXFP4 is E2M1 pairs with one E8M0 scale per 32 values; raw uint8 views of its
@@ -161,6 +170,9 @@ class PaDecodeCacheKey(NamedTuple):
     mask_unowned_kv: bool
     direct_output: bool
     sparse_grid: bool
+    gfx942_busy: bool
+    gfx942_two_per_cu: bool
+    split_major: bool
     D256_PIPE: bool
     stage_pages: int
 
@@ -317,6 +329,48 @@ class PaDecodeSchedule:
                 and 2 * split_workgroups <= num_compute_units
             ):
                 query_splits = 2
+            elif (
+                "gfx94" in arch
+                and kv_dtype != MXFP4_KV_DTYPE
+                and query_length * query_group_size > MFMA_MNK
+                and (kv_dtype == fx.BFloat16 or head_dim <= 128)
+            ):
+                # gfx942 MTP tiles with idle CUs: per-CTA latency dominates,
+                # so split the query positions over more CTAs (re-reading K/V
+                # from L2). Split FP8 (to D128; D256 measured 0.93-1.05x) into
+                # single-M-tile CTAs while about three fit per CU, else in two
+                # while two fit; BF16 Q/P tiles twice the size split in two
+                # only while one fits per CU. A sliding window bounds each
+                # task to a few tiles, so windowed MTP splits on busier grids:
+                # FP8 always into single M-tiles, BF16 while four fit per CU.
+                if kv_dtype == fx.BFloat16:
+                    if query_length % 2 == 0 and (
+                        2 * split_workgroups
+                        <= (
+                            4 * num_compute_units
+                            if sliding_window > 0
+                            else (
+                                2 * num_compute_units
+                                if head_dim <= 64
+                                else num_compute_units
+                            )
+                        )
+                        # Four D128 M-tiles hold 360 VGPRs; on busy grids two
+                        # split-major CTAs of two M-tiles share K/V and fit two
+                        # per CU (D192 and two-M-tile rows measured slower).
+                        or (
+                            head_dim == 128
+                            and query_length * query_group_size >= 4 * MFMA_MNK
+                            and split_workgroups > num_compute_units
+                        )
+                    ):
+                        query_splits = 2
+                elif query_length % 4 == 0 and (
+                    sliding_window > 0 or 4 * split_workgroups <= 3 * num_compute_units
+                ):
+                    query_splits = 4
+                elif query_length % 2 == 0 and split_workgroups <= num_compute_units:
+                    query_splits = 2
             if kv_dtype == fx.BFloat16:
                 # Native BF16 doubles Q's LDS footprint. Select the smallest
                 # split that fits, keeping the packed reducer rows unchanged.
@@ -401,6 +455,26 @@ class PaDecodeSchedule:
                 raise NotImplementedError(
                     "MXFP4 PA supports head_dim 128, block 128, one M-tile"
                 )
+        # gfx942: more CTAs than CUs hold work, so occupancy outweighs a
+        # single CTA's latency (V prefetch, STREAM_KV, WAVES_PER_EU_2).
+        gfx942_busy = (
+            "gfx94" in arch and split_workgroups * query_splits > num_compute_units
+        )
+        # Two waves per SIMD only pay when two CTAs per CU have work.
+        gfx942_two_per_cu = (
+            gfx942_busy and split_workgroups * query_splits >= 2 * num_compute_units
+        )
+        # gfx942 one-partition decode on sparse grids walks each task in two
+        # tile groups per CTA (DUAL_GROUP, mirrored from create()).
+        gfx942_dual_group = (
+            "gfx94" in arch
+            and (direct_output or num_partitions == 1)
+            and split_workgroups * query_splits <= num_compute_units
+            and query_length == 1
+            and sliding_window == 0
+            and head_dim == 128
+            and not single_tile_plan
+        )
         # Prefetch supported single-M query tiles independently of grid size.
         prefetch_v = (
             D256_PIPE
@@ -415,6 +489,39 @@ class PaDecodeSchedule:
                 and QUERIES_PER_CTA == 1
                 and TOTAL_ROWS <= MFMA_MNK
             )
+            # gfx942: issuing a single M-tile's V loads at the tile start hides
+            # them behind QK and softmax (FP8 to D256, BF16 page16 D128). FP8
+            # per-tensor page128 vectorized V only gains on busy grids, FP8
+            # per-token D256 page64 only on small ones.
+            or (
+                "gfx94" in arch
+                and M_TILES == 1
+                and (
+                    (
+                        kv_dtype in FP8_KV_DTYPES
+                        and head_dim <= 256
+                        and (
+                            gfx942_busy
+                            or per_token_kv
+                            or block_size != 128
+                            or not trans_v
+                        )
+                        and not (
+                            gfx942_busy
+                            and per_token_kv
+                            and head_dim > 128
+                            and block_size == 64
+                        )
+                    )
+                    # BF16 page16 dual-group decode ran 0.97x with it.
+                    or (
+                        kv_dtype == fx.BFloat16
+                        and block_size == 16
+                        and head_dim <= 128
+                        and not gfx942_dual_group
+                    )
+                )
+            )
         )
         # Keep the tuned page/scale layout selection separate from V prefetch.
         PER_TOKEN_M1 = (
@@ -427,6 +534,28 @@ class PaDecodeSchedule:
                 or partition_workgroups <= num_compute_units
                 or (single_tile_plan and split_workgroups <= 2 * num_compute_units)
             )
+        )
+        # gfx942 split CTAs launch split-major, so a task's splits dispatch
+        # together instead of after every slot of the previous split. BF16
+        # head-dim splits forced by LDS only gain when tasks are long. Several
+        # KV heads launch head-major on small grids, where the plan's empty
+        # slots otherwise delay every head after the first.
+        split_major = "gfx94" in arch and (
+            (
+                query_splits > 1
+                and (
+                    kv_dtype in FP8_KV_DTYPES
+                    or head_dim <= 256
+                    or (
+                        max_context_length is not None
+                        and max_tiles_per_task(
+                            num_seqs, work_capacity, num_partitions, max_context_length
+                        )
+                        >= 4
+                    )
+                )
+            )
+            or (num_kv_heads > 1 and not gfx942_busy)
         )
         cache_key = PaDecodeCacheKey(
             head_dim=head_dim,
@@ -450,6 +579,9 @@ class PaDecodeSchedule:
             direct_output=direct_output,
             # At most one CTA per CU: room for two four-wave groups per CTA.
             sparse_grid=split_workgroups * query_splits <= num_compute_units,
+            gfx942_busy=gfx942_busy,
+            gfx942_two_per_cu=gfx942_two_per_cu,
+            split_major=split_major,
             D256_PIPE=D256_PIPE,
             stage_pages=stage_pages,
         )
@@ -521,6 +653,11 @@ class PaDecodeTraits:
     PAGE16_VPIPE: bool
     PAGE16_PAGES_FIRST: bool
     PAGE16_EARLY_K: bool
+    STREAM_KV: bool
+    WAVES_PER_EU_2: bool
+    GFX942_Q_EARLY: bool
+    PAGES_EARLY: bool
+    SPLIT_MAJOR: bool
     REUSE_KV_PAGES: bool
     SCALES_BEFORE_CURRENT_V: bool
     M1_SCALE_BEFORE_MASK: bool
@@ -611,6 +748,9 @@ class PaDecodeTraits:
         mask_unowned_kv = cache_key.mask_unowned_kv
         DIRECT = cache_key.direct_output
         SPARSE_GRID = cache_key.sparse_grid
+        gfx942_busy = cache_key.gfx942_busy
+        gfx942_two_per_cu = cache_key.gfx942_two_per_cu
+        SPLIT_MAJOR = cache_key.split_major
         D256_PIPE = cache_key.D256_PIPE
         stage_page_capacity = cache_key.stage_pages
         is_gfx950 = schedule.is_gfx950
@@ -815,6 +955,52 @@ class PaDecodeTraits:
         # FP8 also issues the next K from those ids right after QK instead of
         # after the P barrier. BF16's next K is twice the registers and slower.
         PAGE16_EARLY_K = PAGE16_PAGES_FIRST and kv_dtype != fx.BFloat16
+        # gfx942 spills a whole next-tile K prefetch plus the tile's V gather
+        # once a lane's K row reaches STREAM_KV_MTILES_ROW_BYTES; stream K and
+        # V per chunk instead. MTP M-tiles share each streamed chunk. From
+        # STREAM_KV_ROW_BYTES a single M-tile (STREAM_KV_TWO_MTILE_ROW_BYTES
+        # for two) no longer spills but runs at one wave per SIMD; streaming
+        # trades its K prefetch for occupancy, which only pays when more CTAs
+        # than CUs hold work.
+        kv_row_bytes = head_dim * QP_ELEM_BYTES
+        STREAM_KV = (
+            not is_gfx950
+            and kv_dtype != MXFP4_KV_DTYPE
+            and not MTP4_FUSED
+            and not prefetch_v
+            and (
+                kv_row_bytes >= STREAM_KV_MTILES_ROW_BYTES
+                or (
+                    M_TILES == 1 and gfx942_busy and kv_row_bytes >= STREAM_KV_ROW_BYTES
+                )
+                or (
+                    M_TILES == 2
+                    and gfx942_busy
+                    and kv_row_bytes >= STREAM_KV_TWO_MTILE_ROW_BYTES
+                )
+            )
+        )
+        # Multi-M-tile FP8 D128 needs 260-272 VGPRs, one wave per SIMD; capped
+        # at 256 it spills about ten and runs two, which pays on busy grids.
+        # A streamed single M-tile with a 512-byte K row (BF16 D256) fits 256
+        # without spilling.
+        WAVES_PER_EU_2 = (
+            not is_gfx950
+            and gfx942_two_per_cu
+            and (
+                (
+                    kv_dtype in FP8_KV_DTYPES
+                    and head_dim == 128
+                    and M_TILES > 1
+                    and not STREAM_KV
+                )
+                or (
+                    STREAM_KV
+                    and M_TILES == 1
+                    and 512 <= kv_row_bytes < STREAM_KV_MTILES_ROW_BYTES
+                )
+            )
+        )
         REUSE_KV_PAGES = PER_TOKEN_M1 or (D256_PIPE and per_token_kv)
         # gfx950 per-token FP8 B>=2 decode loops (their tiles always have a
         # next tile) store the next tile's scales after PV, so the scale vmcnt
@@ -835,7 +1021,7 @@ class PaDecodeTraits:
         # publishes all of them.
         P_BUFFERS = (
             M_TILES
-            if MTP4_FUSED or D256_PIPE or BF16_MTP_FUSED
+            if MTP4_FUSED or D256_PIPE or BF16_MTP_FUSED or STREAM_KV
             else 2 if TUNE_PAGE128 and M_TILES == 3 else 1
         )
         # PV uses V=A, P=B: output [head-dim, query-row=lane16].
@@ -963,6 +1149,7 @@ class PaDecodeTraits:
             and not single_tile_plan
             and not BF16_MTP_FUSED
             and not MTP4_FUSED
+            and not STREAM_KV
         )
         # Page ids for the task's tiles, one i32 each, staged before the loop.
         # Dual MXFP4 groups stage only their own (alternate) tiles' ids, so
@@ -1049,6 +1236,37 @@ class PaDecodeTraits:
             PAGE16_VPIPE=PAGE16_VPIPE,
             PAGE16_PAGES_FIRST=PAGE16_PAGES_FIRST,
             PAGE16_EARLY_K=PAGE16_EARLY_K,
+            STREAM_KV=STREAM_KV,
+            WAVES_PER_EU_2=WAVES_PER_EU_2,
+            # gfx942 issues Q loads before the first K tile's page and K loads,
+            # so Q staging does not wait behind them on the in-order vmcnt
+            # chain. Streamed kernels start with K pieces and gain nothing.
+            # gfx942 tiles that load V at the tile start (V prefetch, MTP
+            # M-tiles) issue the next tile's page-table read before those V
+            # loads: FP8 per-tensor single M-tiles and MTP except BF16 with
+            # two M-tiles, which measured slower.
+            PAGES_EARLY=(
+                not is_gfx950
+                and kv_dtype != MXFP4_KV_DTYPE
+                and not D256_PIPE
+                and not single_tile_plan
+                and not STREAM_KV
+                and not MTP4_FUSED
+                and (
+                    (
+                        prefetch_v
+                        and M_TILES == 1
+                        and kv_dtype in FP8_KV_DTYPES
+                        and not per_token_kv
+                    )
+                    or M_TILES > 2
+                    or (M_TILES == 2 and kv_dtype in FP8_KV_DTYPES)
+                )
+            ),
+            SPLIT_MAJOR=SPLIT_MAJOR,
+            GFX942_Q_EARLY=(
+                not is_gfx950 and kv_dtype != MXFP4_KV_DTYPE and not STREAM_KV
+            ),
             REUSE_KV_PAGES=REUSE_KV_PAGES,
             SCALES_BEFORE_CURRENT_V=SCALES_BEFORE_CURRENT_V,
             M1_SCALE_BEFORE_MASK=M1_SCALE_BEFORE_MASK,
@@ -1114,6 +1332,25 @@ class Gfx1250Traits:
     merge_partitions: bool = False
     # Workgroups per sequence cluster that merges its partitions; 0 disables.
     cluster_merge: int = 0
+    # Grids within two CTAs per CU stage BF16 page16 pairs per wave.
+    wide_bf16_page16: bool = False
+    # Grids within two CTAs per CU stage two FP8 page128 pages per step.
+    wide_fp8_page128: bool = False
+    # Grids within one CTA per CU stage two BF16 page128 pages per step.
+    wide_bf16_page128: bool = False
+    # Grids beyond four CTAs per CU keep 64-token FP8 page16 steps.
+    narrow_fp8_page16: bool = False
+    # Sequences sharing one cluster of cluster_merge * cluster_seqs CTAs.
+    cluster_seqs: int = 1
+    # Grids within one CTA per CU, where copy latency rather than bandwidth
+    # bounds a task.
+    latency_grid: bool = False
+    # Cluster CTAs take fixed runs of steps across the block table's width and
+    # keep their partials at slot sequence * cluster_merge + part.
+    cluster_steps: bool = False
+    # Page128 cluster CTAs take fixed runs of tiles sized by the host, with
+    # partials at slot sequence * cluster_merge + part.
+    cluster_runs: bool = False
 
     WAVE = 32
     NWARP = 4
@@ -1150,12 +1387,112 @@ class Gfx1250Traits:
         return self.bf16_packed and self.block_size == 128
 
     @property
+    def page16_wide(self):
+        # One FP8 D128 query tile over page16 caches stages two pages per wave,
+        # halving the softmax exchanges per token.
+        return (
+            not self.narrow_fp8_page16
+            and self.packed_lds
+            and self.block_size == 16
+            and self.head_dim == 128
+            and self.m_tiles == 1
+            and self.sliding_window == 0
+        )
+
+    @property
+    def page128_pair(self):
+        # One D128 FP8 query tile over page128 caches on a small grid stages
+        # two pages per softmax step.
+        return (
+            self.wide_fp8_page128
+            and self.packed_lds
+            and self.block_size == 128
+            and self.head_dim == 128
+            and self.m_tiles == 1
+            and self.sliding_window == 0
+        )
+
+    @property
+    def bf16_page128_pair(self):
+        # One D128 BF16 query tile over page128 caches on a one-CTA-per-CU
+        # grid stages two pages per softmax step.
+        return (
+            self.wide_bf16_page128
+            and self.bf16_page128_packed
+            and self.head_dim == 128
+            and self.m_tiles == 1
+            and self.sliding_window == 0
+        )
+
+    @property
+    def early_second_stage(self):
+        # On latency-bound grids, double-buffered page16 steps issue the second
+        # stage in the prologue: short sparse tasks overlap both copies. Fuller
+        # grids and page128 pairs lose more to the earlier copy than they gain.
+        return (
+            self.latency_grid
+            and self.block_size == 16
+            and self.use_tdm
+            and self.buffers == 2
+            and (self.packed_lds or self.bf16_page16_packed)
+        )
+
+    @property
+    def stage_tdm_ops(self):
+        # TDM copies one wave issues for a whole stage; partial stages issue
+        # at least as many.
+        if self.page16_wide:
+            return 2 * self.page16_pages
+        if self.page128_pair:
+            return 4
+        if self.bf16_page16_packed:
+            return 2 * (self.TOKENS // 64)
+        return 2
+
+    @property
+    def stage_async_ops(self):
+        # Asynchronous scale copies a wave issues for a whole stage (wave 0
+        # alone for page128; others issue none). Partial stages issue none.
+        if not self.per_token_kv:
+            return 0
+        if self.page128_pair:
+            return 4
+        return 2
+
+    @property
+    def page16_pages(self):
+        # page16 pages each wave stages per softmax step (four lost accuracy
+        # for no consistent gain).
+        return 2
+
+    @property
     def TOKENS(self):
         # Page-sized transfers amortize page/scale staging and softmax exchange.
         # Windowed rows retain 64-token normalization for FP8 accuracy.
+        if self.page16_wide:
+            return 64 * self.page16_pages
+        if self.page128_pair or self.bf16_page128_pair:
+            return 256
+        if (
+            self.bf16_page16_packed
+            and self.wide_bf16_page128
+            and self.head_dim == 128
+            and self.m_tiles == 1
+            and self.sliding_window == 0
+        ):
+            # One-CTA-per-CU grids stage four BF16 page16 pages per wave.
+            return 256
         return (
             128
             if self.bf16_page128_packed
+            or self.page16_wide
+            or (
+                self.bf16_page16_packed
+                and self.wide_bf16_page16
+                and self.head_dim == 128
+                and self.m_tiles == 1
+                and self.sliding_window == 0
+            )
             or (
                 self.packed_lds
                 and self.head_dim in (128, 256)
@@ -1271,8 +1608,8 @@ class Gfx1250Traits:
 
     @property
     def wave_query_tiles(self):
-        # One query tile per wave keeps scores, P and output in registers:
-        # softmax needs no cross-wave exchange, only the page buffers are shared.
+        # Wave pairs share two query tiles and keep scores, P and output in
+        # registers: softmax needs no cross-wave exchange until the pair merge.
         # fp8_multi_tile bounds four query tiles to D128.
         return self.fp8_multi_tile and self.m_tiles == self.NWARP and self.async_page
 

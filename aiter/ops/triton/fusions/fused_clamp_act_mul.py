@@ -231,6 +231,17 @@ def fused_clamp_act_mul(
     # default block width is the whole row, can change at config
     BLOCK_SIZE_N = triton.next_power_of_2(n_half)
 
+    # A quant group must fit inside the compute tile, otherwise
+    # NUM_QUANT_BLOCKS = BLOCK_SIZE_N // QUANT_BLOCK_SIZE is 0 and the quant
+    # reshape targets 0 elements. This guards the Triton path, whose tile is
+    # exactly next_power_of_2(n_half); the Gluon branch re-checks this against
+    # its (possibly config-overridden) BLOCK_SIZE_N below.
+    if HAS_QUANT:
+        assert BLOCK_SIZE_N % quant_block_size == 0, (
+            f"BLOCK_SIZE_N ({BLOCK_SIZE_N}) must be a multiple of "
+            f"quant_block_size ({quant_block_size})"
+        )
+
     # handle weight constants
     HAVE_WEIGHTS = weights is not None
     if HAVE_WEIGHTS:
