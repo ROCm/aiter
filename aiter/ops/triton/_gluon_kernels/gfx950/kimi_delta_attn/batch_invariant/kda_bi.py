@@ -238,6 +238,42 @@ def _solve(s_l, t0, t1, t2, t3, r0, r1, r2, r3, num_warps: gl.constexpr):
 
 
 @gluon.jit
+def _solve2(
+    s_l, t0, t1, t2, t3, w0, w1, w2, w3, u0, u1, u2, u3, num_warps: gl.constexpr
+):
+    """_solve for two right-hand sides (w and u) with their steps interleaved, so the two
+    chains overlap; each output gets the same operations as from _solve."""
+    z = gl.zeros([BC, D], gl.float32, f32_mfma_layout(num_warps))
+    l10 = -_l_block(s_l, 1, 0, num_warps)
+    l20 = -_l_block(s_l, 2, 0, num_warps)
+    l21 = -_l_block(s_l, 2, 1, num_warps)
+    l30 = -_l_block(s_l, 3, 0, num_warps)
+    l31 = -_l_block(s_l, 3, 1, num_warps)
+    l32 = -_l_block(s_l, 3, 2, num_warps)
+    xw0 = _f32_dot(t0, w0, z, num_warps)
+    xu0 = _f32_dot(t0, u0, z, num_warps)
+    aw = _f32_dot(l10, xw0, w1, num_warps)
+    au = _f32_dot(l10, xu0, u1, num_warps)
+    xw1 = _f32_dot(t1, aw, z, num_warps)
+    xu1 = _f32_dot(t1, au, z, num_warps)
+    aw = _f32_dot(l20, xw0, w2, num_warps)
+    au = _f32_dot(l20, xu0, u2, num_warps)
+    aw = _f32_dot(l21, xw1, aw, num_warps)
+    au = _f32_dot(l21, xu1, au, num_warps)
+    xw2 = _f32_dot(t2, aw, z, num_warps)
+    xu2 = _f32_dot(t2, au, z, num_warps)
+    aw = _f32_dot(l30, xw0, w3, num_warps)
+    au = _f32_dot(l30, xu0, u3, num_warps)
+    aw = _f32_dot(l31, xw1, aw, num_warps)
+    au = _f32_dot(l31, xu1, au, num_warps)
+    aw = _f32_dot(l32, xw2, aw, num_warps)
+    au = _f32_dot(l32, xu2, au, num_warps)
+    xw3 = _f32_dot(t3, aw, z, num_warps)
+    xu3 = _f32_dot(t3, au, z, num_warps)
+    return xw0, xw1, xw2, xw3, xu0, xu1, xu2, xu3
+
+
+@gluon.jit
 def _store_rows(P, stride, x, i: gl.constexpr, n, num_warps: gl.constexpr):
     """bf16 rows [16 i, 16 i + 16) of a [*, 128] output; rows >= n are not written."""
     MF: gl.constexpr = f32_mfma_layout(num_warps)
@@ -346,7 +382,7 @@ def _intra_tile(
         _a_rows(s_q, s_k, s_g, s_l, BETA, sb, AQK, s_a, n, scale, i, num_warps)
 
     t0, t1, t2, t3 = _inverses(s_l, num_warps)
-    x0, x1, x2, x3 = _solve(
+    xw0, xw1, xw2, xw3, xu0, xu1, xu2, xu3 = _solve2(
         s_l,
         t0,
         t1,
@@ -356,28 +392,20 @@ def _intra_tile(
         _w_rhs(s_k, s_g, BETA, sb, 1, n, num_warps),
         _w_rhs(s_k, s_g, BETA, sb, 2, n, num_warps),
         _w_rhs(s_k, s_g, BETA, sb, 3, n, num_warps),
-        num_warps,
-    )
-    _store_rows(W, s_out, x0, 0, n, num_warps)
-    _store_rows(W, s_out, x1, 1, n, num_warps)
-    _store_rows(W, s_out, x2, 2, n, num_warps)
-    _store_rows(W, s_out, x3, 3, n, num_warps)
-    x0, x1, x2, x3 = _solve(
-        s_l,
-        t0,
-        t1,
-        t2,
-        t3,
         _u_rhs(V, sv, BETA, sb, 0, n, num_warps),
         _u_rhs(V, sv, BETA, sb, 1, n, num_warps),
         _u_rhs(V, sv, BETA, sb, 2, n, num_warps),
         _u_rhs(V, sv, BETA, sb, 3, n, num_warps),
         num_warps,
     )
-    _store_rows(U, s_out, x0, 0, n, num_warps)
-    _store_rows(U, s_out, x1, 1, n, num_warps)
-    _store_rows(U, s_out, x2, 2, n, num_warps)
-    _store_rows(U, s_out, x3, 3, n, num_warps)
+    _store_rows(W, s_out, xw0, 0, n, num_warps)
+    _store_rows(W, s_out, xw1, 1, n, num_warps)
+    _store_rows(W, s_out, xw2, 2, n, num_warps)
+    _store_rows(W, s_out, xw3, 3, n, num_warps)
+    _store_rows(U, s_out, xu0, 0, n, num_warps)
+    _store_rows(U, s_out, xu1, 1, n, num_warps)
+    _store_rows(U, s_out, xu2, 2, n, num_warps)
+    _store_rows(U, s_out, xu3, 3, n, num_warps)
 
 
 @gluon.jit
