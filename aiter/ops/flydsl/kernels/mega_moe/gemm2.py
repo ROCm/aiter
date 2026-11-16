@@ -669,7 +669,7 @@ def gemm2_compute_v2(
             if const_expr(a_scale_lds):
                 sa_pair = issue_a_scale_tile_lds(kt_rt)
             issue_a_ds_read(kt_rt % fx.Int32(aStages))
-            if const_expr(fold_rows):
+            if const_expr(fold_rows):  # noqa: SIM102
                 # Before the next A copy is issued, so these LDS reads do not wait for it.
                 if fold:
                     issue_a_ds_read(kt_rt % fx.Int32(aStages), chunks=[kMChunks])
@@ -687,7 +687,7 @@ def gemm2_compute_v2(
             if const_expr(a_scale_lds):
                 sa = wait_a_scale_tile_lds(sa_pair)
             mfma_cluster(bqf, bsf, sa[:kScaleSubBlocks], kt_rt)
-            if const_expr(fold_rows):
+            if const_expr(fold_rows):  # noqa: SIM102
                 if fold:
                     for J in range_constexpr(numAccN):
                         mma_one_j(J, J % 2, shift_scale_word(sa[kScaleSubBlocks], kt_rt),

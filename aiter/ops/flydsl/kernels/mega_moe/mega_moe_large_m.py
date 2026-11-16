@@ -567,7 +567,7 @@ def _plan_expert_slice(
             # (the payload, sent only after this plan publishes, overwrites it).
             for real_row in range(fx.Int32(0), total_count, fx.Int32(g2_skip_bm)):
                 store_at(fx.Int32(0), AddrBuffer(a_sm), local_row_base + real_row)
-                if const_expr(g2_fold_mark > 0):
+                if const_expr(g2_fold_mark > 0):  # noqa: SIM102
                     # GEMM2 folds an m-block whose row g2_fold_mark is padding into its expert's previous one.
                     if real_row + fx.Int32(g2_fold_mark) < total_count:
                         store_at(
@@ -878,9 +878,10 @@ def emit_dispatch_plan(
             comm_ops.fence_system_acquire()
         slice_args = (a_bc, p_mb, a_se, a_trb, a_sm, a_nv, a_max_expert_tiles, a_ready_tail, a_tile_ready,
             a_tile_expected, a_tile_expected_shared, a_expert_tile_end, lane)
-        slice_kw = dict(fz_npes=fz_npes, fz_epr=fz_epr, fz_mtpr=fz_mtpr, fz_rank=fz_rank, fz_tile_m=fz_tile_m,
-            payload_chunk_rows=payload_chunk_rows, g2_skip_bm=g2_skip_bm, g2_fold_mark=g2_fold_mark, hoist_loads=lean_plan,
-            count_tag=_count_tag(expected, parity, fz_npes) if tag_counts else None)
+        slice_kw = {"fz_npes": fz_npes, "fz_epr": fz_epr, "fz_mtpr": fz_mtpr, "fz_rank": fz_rank,
+            "fz_tile_m": fz_tile_m, "payload_chunk_rows": payload_chunk_rows, "g2_skip_bm": g2_skip_bm,
+            "g2_fold_mark": g2_fold_mark, "hoist_loads": lean_plan,
+            "count_tag": _count_tag(expected, parity, fz_npes) if tag_counts else None}
         if const_expr(bucket_pairs):
             # Warp 1 sized the geometry and published the pair order; the other waves plan, so the barrier below
             # does not wait for warp 1's slice behind its geometry.
@@ -905,7 +906,7 @@ def emit_dispatch_plan(
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
     fx.barrier()
-    if const_expr(not bucket_pairs):
+    if const_expr(not bucket_pairs):  # noqa: SIM102
         if tid == fx.Int32(0):
             active_group_blocks = fx.Int32(dispatch_blocks)
             if const_expr(dispatch_blocks > 32):
@@ -1073,7 +1074,7 @@ def emit_presend(
                 + fx.Int64(token_row) * fx.Int64(fz_nbytes))
             for c in range_constexpr(fz_n_i32 // 256):
                 store_at(row_values[c], destination_rsrc, lane * fx.Int32(4) + fx.Int32(c * 256))
-            if const_expr(fz_enable_scales):
+            if const_expr(fz_enable_scales):  # noqa: SIM102
                 if lane * fx.Int32(4) < fx.Int32(fz_scale_n_i32):
                     store_at(row_values[-1], AddrBuffer(load_at(AddrBuffer(p_sc), destination, fx.Int64, 1)),
                         token_row * fx.Int32(fz_scale_n_i32) + lane * fx.Int32(4))
@@ -1321,7 +1322,7 @@ def emit_dispatch_payload(
                     destination_rsrc = AddrBuffer(token_remote + fx.Int64(token_row) * fx.Int64(fz_nbytes))
                     for c in range_constexpr(fz_n_i32 // 256):
                         store_at(row_values[c], destination_rsrc, lane * fx.Int32(4) + fx.Int32(c * 256))
-                    if const_expr(fz_enable_scales):
+                    if const_expr(fz_enable_scales):  # noqa: SIM102
                         if lane * fx.Int32(4) < fx.Int32(fz_scale_n_i32):
                             store_at(row_values[-1], scale_remote_rsrc,
                                 token_row * fx.Int32(fz_scale_n_i32) + lane * fx.Int32(4))
@@ -1558,10 +1559,10 @@ def make_stage2_body_emitter(*, model_dim, topk, rank, npes, max_tok, experts, B
             fx.ptr_store(prev, lds_typed_ptr(fx.Int32(lds_flag_off), T.i32, align=4))
         fx.barrier()
         prev_b = fx.ptr_load(lds_typed_ptr(fx.Int32(lds_flag_off), T.i32, align=4))
-        if prev_b == num_n_blocks - fx.Int32(1):  # noqa: SIM102 - preserve DSL staging
+        if prev_b == num_n_blocks - fx.Int32(1):
             if const_expr(scale_stage_nbytes > 0):
                 _send_staged_scales(m_block_idx, lane, wave, addr_scale_stage)
-                if const_expr(FOLD):
+                if const_expr(FOLD):  # noqa: SIM102
                     # The folded tail's scales sit in the next m-block's staging groups.
                     if fold:
                         _send_staged_scales(m_block_idx + fx.Int32(1), lane, wave, addr_scale_stage, rows=FOLD,
@@ -1661,7 +1662,7 @@ def make_stage2_body_emitter(*, model_dim, topk, rank, npes, max_tok, experts, B
             lds_weight_off=lds_weight_off, lds_peer_off=lds_peer_off, g2_bf16_lds=g2_bf16_lds,
             p2p_quant_type=p2p_quant_type, NW=NW, store_cm=p2p_cache_mod, elem_view_stores=True,
             row_nbytes=p2p_row_nbytes, scale_stage=scale_stage, epi_lean=epi_lean, route_i8=route_i8)
-        if const_expr(FOLD):
+        if const_expr(FOLD):  # noqa: SIM102
             if fold:
                 # The tail's rows: their route rows follow in LDS, their scales go to the next m-block's groups.
                 p2p_scatter_epilog(lds_base_i32, fold_accs, n_block_idx, wave, lane, N_OUT=N_OUT,
@@ -2210,7 +2211,7 @@ def compile_mega_moe_stage1(
         producer = (ticket > fx.Int32(0)) & (ticket <= fx.Int32(dispatch_blocks))
         producer_slot = ticket - fx.Int32(1)
 
-        if const_expr(DISP_EARLY_HIST):
+        if const_expr(DISP_EARLY_HIST):  # noqa: SIM102
             # Rank-local only: overlaps the owner's launch handshake.
             if producer:
                 emit_dispatch_hist(
@@ -2343,7 +2344,7 @@ def compile_mega_moe_stage1(
             presend_limit = fx.Int32(DISP_PRESEND_ROWS) // (i32_cur_tok > fx.Int32(0)).select(i32_cur_tok, fx.Int32(1))
             presend_limit = (presend_limit < fx.Int32(DISP_PRESEND)).select(fx.Int32(DISP_PRESEND), presend_limit)
             presend_limit = (presend_limit > fx.Int32(64)).select(fx.Int32(64), presend_limit)
-        if const_expr(DISP_PRESEND > 0):
+        if const_expr(DISP_PRESEND > 0):  # noqa: SIM102
             if ticket > fx.Int32(dispatch_blocks):
                 # fmt: off
                 emit_presend(num_waves=NUM_WAVES, fz_k=fz_k, fz_epr=fz_epr, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
@@ -2643,7 +2644,7 @@ def compile_mega_moe_stage1(
                                 )
                                 if (f_tsrc & fx.Int32(0xFFFFFF)) >= fx.Int32(fz_npes * fz_mtpr):
                                     g1_mode = fx.Int32(3)
-                            if const_expr(G1_MID_ROWS > 0):
+                            if const_expr(G1_MID_ROWS > 0):  # noqa: SIM102
                                 # No later tile of its expert: this is the expert's last tile.
                                 if ~(f_has_next & (f_next_e == f_e)):
                                     f_msrc = load_at(f_srcmap, f_trb + fx.Int32(G1_MID_ROWS), fx.Int32, 1)
@@ -2670,7 +2671,7 @@ def compile_mega_moe_stage1(
                         _do_fold_tile(work)
                     if g1_mode == fx.Int32(2):
                         _do_short_tile(work)
-                    if const_expr(G1_MID_ROWS > 0):
+                    if const_expr(G1_MID_ROWS > 0):  # noqa: SIM102
                         if g1_mode == fx.Int32(5):
                             _do_mid_tile(work)
                     if tid == fx.Int32(0):
@@ -2800,7 +2801,7 @@ def compile_mega_moe_stage1(
                             g2_has = fx.Int32(2)
                     g2_fold_bit = fx.Int32(0)
                     g2_nt_bit = fx.Int32(0)
-                    if const_expr(G2_FOLD):
+                    if const_expr(G2_FOLD):  # noqa: SIM102
                         if g2_has == fx.Int32(1):
                             # Plan-final rows (row 0 and row G2_FOLD of every real m-block are marked real): m-block m
                             # is a tail iff its row G2_FOLD is padding and it follows an m-block of its expert (the

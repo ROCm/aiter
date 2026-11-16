@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
-# ruff: noqa: B023, SIM102
+# ruff: noqa: SIM102
 """MegaMoEV2 small-input path: quant, dispatch, GEMM1, GEMM2 and combine fused into one kernel.
 
 Dispatch publishes each route into its expert's fixed slot on the destination rank (with dedup_rows the

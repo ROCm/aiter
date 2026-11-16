@@ -1545,10 +1545,22 @@ def _routes_timing(ctx, args):
         if args.check_time_acc:
             # The pinned staged and large-input routes and the routed call, against the fp32
             # reference at the timed token count.
-            checks = [("staged", lambda: _staged_forward(moe, tx, tw, ti))]
+            checks = [
+                ("staged", lambda tx=tx, tw=tw, ti=ti: _staged_forward(moe, tx, tw, ti))
+            ]
             if ctx.large_m:
-                checks.append(("large_m", lambda: _large_forward(moe, tx, tw, ti)))
-            checks.append((f"routed:{route}", lambda: _routed(moe, tx, tw, ti, n)))
+                checks.append(
+                    (
+                        "large_m",
+                        lambda tx=tx, tw=tw, ti=ti: _large_forward(moe, tx, tw, ti),
+                    )
+                )
+            checks.append(
+                (
+                    f"routed:{route}",
+                    lambda tx=tx, tw=tw, ti=ti, n=n: _routed(moe, tx, tw, ti, n),
+                )
+            )
             ref = _moe_reference(moe, tx, tw, ti, ctx.refw[0])
             for label, fn in checks:
                 out = fn()[:n].clone()

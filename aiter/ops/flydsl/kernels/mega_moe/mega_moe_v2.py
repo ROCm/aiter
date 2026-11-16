@@ -434,13 +434,13 @@ class MegaMoEV2:
                 indexed_payload=cfg.gm_indexed_payload,
             )
         ]
-        fused = dict(
-            world_size=self.world_size,
-            model_dim=self.model_dim,
-            inter_dim=self.inter_dim,
-            experts=self.experts,
-            topk=self.topk,
-        )
+        fused = {
+            "world_size": self.world_size,
+            "model_dim": self.model_dim,
+            "inter_dim": self.inter_dim,
+            "experts": self.experts,
+            "topk": self.topk,
+        }
         # Capacities of the routes sharing the payload arena, and of every route.
         route_capacities = list(capacities)
         if plan.large_m:

@@ -310,9 +310,8 @@ class ATileLoader:
                         source_byte = self._chunks[source_index][1]
                         source_row = source_byte // fx.Int32(self._row_bytes)
                     if const_expr(self._group_chunks):
-                        row_byte = self._dma_rows[
-                            round_base // self._total_threads
-                        ]  # noqa: B023
+                        dma_index = round_base // self._total_threads  # noqa: B023
+                        row_byte = self._dma_rows[dma_index]
                     else:
                         row_byte = source_row * fx.Int32(self._row_bytes)
                     src_byte = row_byte + koff + logical_chunk * fx.Int32(16)

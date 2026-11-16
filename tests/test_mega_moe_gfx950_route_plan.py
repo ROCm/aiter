@@ -15,10 +15,10 @@ import pytest
 pytest.importorskip("flydsl", reason="MegaMoE is built with FlyDSL")
 pytest.importorskip("mori.shmem", reason="MegaMoE's runtime imports mori")
 
-import hashlib  # noqa: E402
-from dataclasses import astuple, fields  # noqa: E402
+import hashlib
+from dataclasses import astuple, fields
 
-from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (  # noqa: E402
+from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
     DEFAULT_SMALL_M_MTPRS,
     FUSED_TOKEN_BUCKETS,
     LARGE_M_MIN_TOKENS,
@@ -37,31 +37,40 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (  # noqa: E402
     small_m_mtprs_for,
 )
 
-V4_PRO = dict(
-    arch="gfx950:sramecc+:xnack-",
-    world_size=8,
-    model_dim=7168,
-    inter_dim=3072,
-    experts=384,
-    topk=6,
-    quant="a8w4",
-    swiglu_limit=10.0,
-)
+V4_PRO = {
+    "arch": "gfx950:sramecc+:xnack-",
+    "world_size": 8,
+    "model_dim": 7168,
+    "inter_dim": 3072,
+    "experts": 384,
+    "topk": 6,
+    "quant": "a8w4",
+    "swiglu_limit": 10.0,
+}
 # EP4 DeepSeek-V4.1-Flash: 96 experts a rank.
 V41_FLASH_EP4 = dict(V4_PRO, world_size=4, model_dim=5120, inter_dim=2304, experts=384)
-V41_FLASH_EP4_SHAPE = dict(
-    world_size=4, experts_per_rank=96, model_dim=5120, inter_dim=2304
-)
+V41_FLASH_EP4_SHAPE = {
+    "world_size": 4,
+    "experts_per_rank": 96,
+    "model_dim": 5120,
+    "inter_dim": 2304,
+}
 # EP2 DeepSeek-V4.1-Flash: 192 experts a rank.
 V41_FLASH_EP2 = dict(V41_FLASH_EP4, world_size=2)
-V41_FLASH_EP2_SHAPE = dict(
-    world_size=2, experts_per_rank=192, model_dim=5120, inter_dim=2304
-)
+V41_FLASH_EP2_SHAPE = {
+    "world_size": 2,
+    "experts_per_rank": 192,
+    "model_dim": 5120,
+    "inter_dim": 2304,
+}
 # EP8 DeepSeek-V4.1-Flash: V4-Pro's 48 experts a rank with V4.1-Flash's dims.
 V41_FLASH_EP8 = dict(V4_PRO, model_dim=5120, inter_dim=2304)
-V41_FLASH_EP8_SHAPE = dict(
-    world_size=8, experts_per_rank=48, model_dim=5120, inter_dim=2304
-)
+V41_FLASH_EP8_SHAPE = {
+    "world_size": 8,
+    "experts_per_rank": 48,
+    "model_dim": 5120,
+    "inter_dim": 2304,
+}
 MTPRS = tuple(b for b in TOKEN_BUCKETS if b >= 16)
 
 
@@ -152,7 +161,7 @@ def test_route_exclusions():
 
 
 def test_large_m_capacities_per_layout():
-    shape = dict(world_size=8, model_dim=7168, inter_dim=3072)
+    shape = {"world_size": 8, "model_dim": 7168, "inter_dim": 3072}
     assert large_m_mtprs_for(**shape) == LARGE_M_MTPRS
     # EP4 V4.1-Flash: 8192 and 16384 (it faults at 1024..4096), both with the tune measured at 8192.
     assert large_m_mtprs_for(world_size=4, model_dim=5120, inter_dim=2304) == (
@@ -588,8 +597,20 @@ def test_route_payload_sharing():
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_large_m import LargeMRuntime
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_small_m import SmallMRuntime
 
-    ep8 = dict(world_size=8, model_dim=7168, inter_dim=3072, experts=384, topk=6)
-    ep4 = dict(world_size=4, model_dim=5120, inter_dim=2304, experts=384, topk=6)
+    ep8 = {
+        "world_size": 8,
+        "model_dim": 7168,
+        "inter_dim": 3072,
+        "experts": 384,
+        "topk": 6,
+    }
+    ep4 = {
+        "world_size": 4,
+        "model_dim": 5120,
+        "inter_dim": 2304,
+        "experts": 384,
+        "topk": 6,
+    }
     for mtpr in DEFAULT_SMALL_M_MTPRS:
         assert SmallMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep8)
         assert not SmallMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep4)
@@ -660,7 +681,7 @@ def test_ep2_small_m_token_rows_live_in_the_payload_arena(mtpr):
         SmallMRuntime,
     )
 
-    nvm, rows, row_bytes, _ = SmallMRuntime.payload_capacity(
+    _nvm, rows, row_bytes, _ = SmallMRuntime.payload_capacity(
         world_size=2,
         model_dim=5120,
         inter_dim=2304,
@@ -677,7 +698,13 @@ def test_ep2_routes_keep_their_own_payload():
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_large_m import LargeMRuntime
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_small_m import SmallMRuntime
 
-    ep2 = dict(world_size=2, model_dim=5120, inter_dim=2304, experts=384, topk=6)
+    ep2 = {
+        "world_size": 2,
+        "model_dim": 5120,
+        "inter_dim": 2304,
+        "experts": 384,
+        "topk": 6,
+    }
     for mtpr in DEFAULT_SMALL_M_MTPRS:
         assert not SmallMRuntime.ends_all_ranks(max_tok_per_rank=mtpr, **ep2)
     for mtpr in large_m_mtprs_for(world_size=2, model_dim=5120, inter_dim=2304):
