@@ -11,6 +11,21 @@ from aiter.ops.triton.rope.rope import (
     _get_neox_rotated_x_1D,
 )
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+
+
+def _get_config(key: str) -> dict | None:
+    """Launch options of fused_qk_rope_reshape_and_cache under ``key``. ``qk_norm``:
+    ``BLOCK_H_MAX``, the most q heads one program of the QK-norm path takes. None
+    on arches that ship no table."""
+    table = load_config_json(
+        resolve_config_dir("fusions", "FUSED_QK_ROPE_RESHAPE_AND_CACHE")
+        + "/DEFAULT.json",
+        required=False,
+    )
+    if table is None:
+        return None
+    return dict(table[key])
 
 
 @triton.jit

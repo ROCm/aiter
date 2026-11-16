@@ -11,6 +11,7 @@ from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
 )
 from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_cosine_cache_llama_kernel,
+    _get_config,
 )
 from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_reshape_and_cache_kernel as triton_fused_qk_rope_reshape_and_cache_kernel,
@@ -915,9 +916,15 @@ def fused_qk_rope_reshape_and_cache(
         BLOCK_H = 1
         if t >= _BLOCK_H_MIN_TOKENS:
             qh_per_kh = qh // kh
-            # With the QK norm a program also loads the rotated row; on gfx950
-            # more than 4 heads a program measured slower.
-            for cand in (4, 2) if have_qk_norm else (16, 8, 4, 2):
+            cands = (16, 8, 4, 2)
+            if have_qk_norm:
+                # A QK-norm program also loads the rotated row of each head; on
+                # gfx950 and gfx942 more than 4 heads a program measured slower.
+                # Arches with a table cap the tile at its BLOCK_H_MAX.
+                norm_config = _get_config("qk_norm")
+                if norm_config is not None:
+                    cands = tuple(c for c in cands if c <= norm_config["BLOCK_H_MAX"])
+            for cand in cands:
                 if qh % cand == 0 and (cand % qh_per_kh == 0 or qh_per_kh % cand == 0):
                     BLOCK_H = cand
                     break
