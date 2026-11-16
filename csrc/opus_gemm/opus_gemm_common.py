@@ -25,7 +25,7 @@ _A16W16_CO_TAGS = frozenset(
     {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
 )
 # gfx950 MXFP4 x MXFP4 NT (a4w4 family): the 2x2 pipeline is pre-compiled
-# (.co, gen_co/gfx950/), the 1x4 small-tile pipeline is built by the JIT.
+# (.co, gen_co/gfx950/a4w4_bpreshuffle/), the 1x4 small-tile pipeline is built by the JIT.
 _A4W4_CO_TAGS = frozenset({"a4w4_mxfp4_nt_co"})
 A4W4_TAGS = frozenset({*_A4W4_CO_TAGS, "a4w4_mxfp4_nt_small"})
 
@@ -2805,8 +2805,9 @@ _CO_FAMILY_TAGS = {"gfx1250": _A16W16_CO_TAGS, "gfx950": _A4W4_CO_TAGS}
 
 def co_image_path(path, instance):
     """Return the pre-built image corresponding to an instance JSON file."""
+    sub = ("a4w4_bpreshuffle",) if instance.kernel_tag in _A4W4_CO_TAGS else ()
     return os.path.join(
-        os.path.dirname(path), instance.arch_prefix, f"{instance.name}.co"
+        os.path.dirname(path), instance.arch_prefix, *sub, f"{instance.name}.co"
     )
 
 
@@ -2880,7 +2881,7 @@ gfx1250_4wave_co_kernels_declared = {
 # shuffle_weight(w, layout=(16, 16)) layout, scales in the e8m0_shuffle layout.
 # Kids are local to the a4w4/gfx950/CU namespace:
 #   0-5 persistent, 10-15 one tile per block, 21-25 split-K, 30 persistent
-#   without M/N boundary handling: pre-compiled 2x2 pipeline (gen_co/gfx950,
+#   without M/N boundary handling: pre-compiled 2x2 pipeline (gen_co/gfx950/a4w4_bpreshuffle,
 #   co_kernels.json), tiles indexed 256x256, 256x128, 128x256, 128x128,
 #   192x256, 256x192;
 #   410-416: 1x4 small-tile pipeline (JIT), see A4W4_SMALL_CFGS.

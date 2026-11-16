@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Runtime loader / launcher for the gfx950 pre-compiled opus_gemm code objects (gen_co/gfx950/*.co, built offline by
+// Runtime loader / launcher for the gfx950 pre-compiled opus_gemm code objects (gen_co/gfx950/a4w4_bpreshuffle/*.co, built offline by
 // gen_co/build_co.py --arch gfx950 with the pin toolchain). Host pass only.
 //
 // The .co directory is OPUS_GEN_CO_DIR (environment variable, else the compile-time macro set by the JIT module);
-// images live in <dir>/gfx950/<symbol>.co and contain one extern "C" kernel named <symbol>.
+// images live in <dir>/gfx950/a4w4_bpreshuffle/<symbol>.co and contain one extern "C" kernel named <symbol>.
 #pragma once
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 #include <hip/hip_runtime.h>
@@ -31,7 +31,7 @@ private:
         const char* env = std::getenv("OPUS_GEN_CO_DIR");
         const std::string root = env && *env ? env : OPUS_GEN_CO_DIR;
         AITER_CHECK(!root.empty(), "opus gfx950 .co directory is not set (OPUS_GEN_CO_DIR)");
-        const std::string path = root + "/gfx950/" + symbol + ".co";
+        const std::string path = root + "/gfx950/a4w4_bpreshuffle/" + symbol + ".co";
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         AITER_CHECK(file.is_open(), "opus gfx950: cannot open code object ", path);
         const std::streamsize size = file.tellg();

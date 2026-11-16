@@ -14,7 +14,7 @@ Any M; N % 16 == 0; K % 256 == 0. Output bf16 [M, N] (or [batch, M, N]).
 
 Local kids (``a4w4/gfx950/<CU>``): 0-5 persistent, 10-15 one tile per block,
 21-25 split-K, 30 persistent without M/N boundary handling (the pre-compiled
-2x2 pipeline, ``gen_co/gfx950``), 410-416 the JIT-built 1x4 small-tile
+2x2 pipeline, ``gen_co/gfx950/a4w4_bpreshuffle``), 410-416 the JIT-built 1x4 small-tile
 pipeline. Launched through ``opus_gemm`` / ``opus_bmm`` (``family="a4w4"``,
 ``layout="bpreshuffle"``); ``aiter.gemm_a4w4`` dispatches tuned-CSV rows whose
 kernelName is the OPUS instance name (kernelId = local kid).

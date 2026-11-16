@@ -3255,7 +3255,7 @@ def gen_a4w4_co_instance(
 ):
     """Host launcher of one pre-compiled a4w4 kid.
 
-    The device code is gen_co/gfx950/<k.name>.co (build_co.py --arch gfx950),
+    The device code is gen_co/gfx950/a4w4_bpreshuffle/<k.name>.co (build_co.py --arch gfx950),
     loaded at runtime by opus_co_launch_mxfp4_gfx950.cuh; no device TU.
     Split-K (variant "sk"): splitK = S segments of K, resolved by the caller
     (aiter/ops/opus/gemm_op_a4w4.py); S > 1 needs a caller-owned fp32 workspace
