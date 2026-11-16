@@ -563,6 +563,20 @@ def test_cases_reach_the_gluon_k2():
         assert not missed, f"never reached the Gluon pass C: {missed}"
 
 
+def test_segment_length_cap(monkeypatch):
+    """A hard cap bounds every segment; the fallback's soft cap yields to the
+    segment-count cap on long sequences."""
+    monkeypatch.delenv("CHUNK_DELTA_ATTN_FLASH_KDA_SEG", raising=False)
+    choose = _flash_kda._choose_chunks_per_seg
+    long_seq = 64 * _flash_kda._SEG_MAX_SEGMENTS * 32
+    monkeypatch.setattr(_flash_kda, "_seg_limits", lambda: (64, True))
+    for n_chunks in (64, 512, 4096, long_seq):
+        for H in (1, 4, 12):
+            assert choose(n_chunks, 1, H, K_DIM) <= 64, (n_chunks, H)
+    monkeypatch.setattr(_flash_kda, "_seg_limits", lambda: (32, False))
+    assert choose(long_seq, 1, 1, K_DIM) == long_seq // _flash_kda._SEG_MAX_SEGMENTS
+
+
 # A weak gate is the only setting that exposes the intra-chunk inverse. At the
 # Kimi default lower_bound=-5 the decay damps L to almost nothing, so even an
 # outright wrong inverse stays inside bf16 noise; these three catch it.

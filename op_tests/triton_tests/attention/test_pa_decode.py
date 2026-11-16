@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import itertools
 import random
 
 import pytest
@@ -509,7 +510,21 @@ def test_paged_attn_per_token_quant(
     torch.testing.assert_close(triton_output, torch_output, rtol=2.5e-1, atol=2.5e-1)
 
 
+# Archs that have a PA-DECODE config file. Add an arch here when it gets one.
+_ARCHS = (
+    "gfx942",
+    "gfx950",
+    "gfx1100",
+    "gfx1101",
+    "gfx1150",
+    "gfx1151",
+    "gfx1200",
+    "gfx1201",
+    "gfx1250",
+)
+_TDM_NUM_WARPS = (1, 2, 4, 8)  # the kernel builds warp bases for these only
 _PAGES = (16, 64, 128)
+_MAX_NUM_STAGES = 2  # 3 or more hangs the GPU on gfx1250
 
 
 def _config(arch, **kwargs):
@@ -517,6 +532,101 @@ def _config(arch, **kwargs):
         "attention", "PA-DECODE", backend="triton", arch=arch, **kwargs
     )
     return load_config_json(f"{cfg_dir}/DEFAULT.json", required=False) or {}
+
+
+_SPLIT_RULES = [
+    pytest.param(rule, id=f"{arch}-{dtype}")
+    for arch in _ARCHS
+    for dtype, rule in _config(arch).get("dispatch", {}).items()
+    if "split_target_programs" in rule
+]
+
+
+@pytest.mark.parametrize(
+    "arch, cu_num",
+    [(arch, None) for arch in _ARCHS] + [("gfx1250", 96)],
+)
+def test_pa_decode_config_is_valid(arch, cu_num):
+    config = _config(arch, cu_num=cu_num)
+    assert config, f"no PA-DECODE config for {arch}"
+    for rule in config.get("dispatch", {}).values():
+        assert rule.get("tdm_num_warps") in (None, *_TDM_NUM_WARPS)
+        if "split_target_programs" in rule:
+            assert {"split_max_partitions", "split_sizes"} <= set(rule)
+            # The default size means "do not split".
+            assert pa_decode_mod._SEQ_PARTITION_SIZE in rule["split_sizes"]
+    # The wrapper has no built-in launch options, so every arch needs this entry.
+    assert "v1_w_dot" in config["launch"]
+    for table in config["launch"].values():
+        assert "any" in table
+        for key, entry in table.items():
+            assert key == "any" or key.startswith("BLK_LEQ_")
+            assert entry.get("num_stages", 1) <= _MAX_NUM_STAGES
+
+
+@pytest.mark.parametrize("rule", _SPLIT_RULES)
+def test_split_size_follows_rule(rule):
+    default = pa_decode_mod._SEQ_PARTITION_SIZE
+    busy = rule.get("split_max_programs", 1 << 20)
+    short_seq = rule.get("split_short_seq", 0)
+    short_programs = rule.get("split_short_min_programs", 1 << 20)
+    programs = [1, busy - 1, busy, 2 * busy]
+    seqs = [max(short_seq // 2, 1), max(short_seq, 1), 4 * default]
+    for n, seq, page in itertools.product(programs, seqs, _PAGES):
+        size = pa_decode_mod._select_seq_partition_size(n, seq, page, rule)
+        info = f"programs={n} seq={seq} page={page} size={size}"
+        assert size in rule["split_sizes"] and size % page == 0, info
+        if n >= busy or (seq < short_seq and n >= short_programs):
+            assert size == default, info
+        if size == default:
+            continue
+        assert triton.cdiv(seq, size) <= rule["split_max_partitions"], info
+        # No larger size that is allowed would also reach the target.
+        for larger in (s for s in rule["split_sizes"] if size < s <= seq):
+            reaches = n * triton.cdiv(seq, larger) >= rule["split_target_programs"]
+            assert not (reaches and larger % page == 0), info
+    # The short-sequence rule stops below its limit. At the limit it does not apply.
+    no_short = {k: v for k, v in rule.items() if not k.startswith("split_short")}
+    for n, page in itertools.product(programs, _PAGES):
+        at_limit = pa_decode_mod._select_seq_partition_size(n, short_seq, page, rule)
+        expected = pa_decode_mod._select_seq_partition_size(
+            n, short_seq, page, no_short
+        )
+        assert at_limit == expected, f"programs={n} seq={short_seq} page={page}"
+
+
+@pytest.mark.parametrize("group_size", [4, 1], ids=["gqa", "mha"])
+@pytest.mark.parametrize("rule", _SPLIT_RULES)
+def test_dispatch_passes_partition_size(rule, group_size, monkeypatch):
+    seq, page, kv_heads = 4 * pa_decode_mod._SEQ_PARTITION_SIZE, _PAGES[-1], 1
+    called = []
+    monkeypatch.setattr(pa_decode_mod, "_get_dispatch_config", lambda dtype: rule)
+    for name in ("v1", "v2"):
+        monkeypatch.setattr(
+            pa_decode_mod,
+            f"paged_attn_decode_{name}",
+            lambda *a, _name=name, **k: called.append((_name, a, k)),
+        )
+    paged_attention_decode(
+        output=None,
+        query=torch.empty(1, group_size * kv_heads, 1, dtype=torch.float16),
+        key_cache=torch.empty(1, kv_heads, page, 1, dtype=torch.float16),
+        value_cache=torch.empty(1, kv_heads, page, 1, dtype=torch.float16),
+        seq_lens=None,
+        block_tables=None,
+        attn_scale=1.0,
+        max_seq_len=seq,
+        compute_type=None,
+        k_scale=torch.ones(1),
+        v_scale=torch.ones(1),
+    )
+    # Only the GQA kernels use the selected size.
+    expected = pa_decode_mod._SEQ_PARTITION_SIZE
+    if group_size > 1:
+        expected = pa_decode_mod._select_seq_partition_size(kv_heads, seq, page, rule)
+    ((_, args, kwargs),) = called
+    assert kwargs["seq_partition_size"] == expected
+    assert args[-1] == triton.cdiv(seq, expected)
 
 
 @pytest.mark.parametrize("B", [1, 4])
@@ -724,6 +834,15 @@ _TDM_RULE = {
 }
 
 
+def test_dispatch_uses_tdm_when_enabled(monkeypatch):
+    names, calls = _tdm_dispatch_calls(monkeypatch, _TDM_RULE)
+    assert names == ["tdm"] and calls[0][1] == {
+        "num_warps": 4,
+        "seq_partition_size": pa_decode_mod._TDM_NO_SPLIT,
+        "max_seq_len": 1024,
+    }
+
+
 @pytest.mark.parametrize(
     "rule_change, kwargs",
     [
@@ -772,6 +891,50 @@ def test_paged_attn_gqa_tdm_split(
     torch.testing.assert_close(output.float(), expected, rtol=0, atol=atol)
 
 
+_TDM_SPLIT_RULE = {
+    "tdm_split_target_programs": 1024,
+    "tdm_split_sizes": [4096, 2048, 1024, 512, 256],
+    "tdm_split_max_partitions": 64,
+}
+
+
+@pytest.mark.parametrize("max_seq_len", [1, 256, 4000, 8192, 100000])
+@pytest.mark.parametrize("programs", [1, 8, 100, 512, 1023, 1024, 5000])
+def test_tdm_partition_size_follows_rule(programs, max_seq_len):
+    no_split = pa_decode_mod._TDM_NO_SPLIT
+    rule = _TDM_SPLIT_RULE
+    size = pa_decode_mod._select_tdm_partition_size(programs, max_seq_len, rule)
+    info = f"programs={programs} seq={max_seq_len} size={size}"
+    if programs >= rule["tdm_split_target_programs"]:
+        assert size == no_split, info
+    if size == no_split:
+        return
+    assert size in rule["tdm_split_sizes"] and size < max_seq_len, info
+    parts = triton.cdiv(max_seq_len, size)
+    assert parts <= rule["tdm_split_max_partitions"], info
+    # No larger allowed size would also reach the target.
+    for larger in (s for s in rule["tdm_split_sizes"] if size < s < max_seq_len):
+        reaches = programs * triton.cdiv(max_seq_len, larger) >= 1024
+        assert not reaches, info
+
+
+def test_tdm_partition_size_is_off_without_target():
+    rule = {
+        k: v for k, v in _TDM_SPLIT_RULE.items() if k != "tdm_split_target_programs"
+    }
+    assert pa_decode_mod._select_tdm_partition_size(1, 8192, rule) == (
+        pa_decode_mod._TDM_NO_SPLIT
+    )
+
+
+def test_dispatch_passes_tdm_partition_size(monkeypatch):
+    # No size reaches the target for 16 programs and 1024 tokens, so the smallest size is used.
+    rule = {**_TDM_RULE, **_TDM_SPLIT_RULE}
+    _, calls = _tdm_dispatch_calls(monkeypatch, rule)
+    assert calls[0][1]["seq_partition_size"] == 256
+    assert calls[0][1]["max_seq_len"] == 1024
+
+
 def test_paged_attn_gqa_tdm_is_repeatable():
     """A race in the LDS ring would make repeated runs differ."""
     if get_arch() != "gfx1250":
@@ -798,6 +961,26 @@ def _page128_rule(dtype):
         **_config("gfx1250")["dispatch"][_V1_V2_NAMES[dtype]],
         "tdm_num_warps": None,
     }
+
+
+# (programs relative to v1_min_programs, partitions relative to v1_busy_max_partitions)
+@pytest.mark.parametrize(
+    "d_programs, d_parts, expect",
+    [(0, 0, "v1"), (0, 1, "v2"), (-1, 0, "v2")],
+    ids=["busy_at_limit", "over_partition_limit", "below_program_limit"],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_dispatch_page128_busy_v1_limits(
+    dtype, d_programs, d_parts, expect, monkeypatch
+):
+    rule = _page128_rule(dtype)
+    programs = rule["v1_min_programs"] + d_programs
+    parts = rule["v1_busy_max_partitions"] + d_parts
+    seq = parts * pa_decode_mod._SEQ_PARTITION_SIZE
+    names, _ = _tdm_dispatch_calls(
+        monkeypatch, rule, kv=1, seqs=programs, max_seq_len=seq
+    )
+    assert names == [expect]
 
 
 @pytest.mark.parametrize(

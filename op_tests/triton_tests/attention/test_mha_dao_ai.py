@@ -409,6 +409,161 @@ def test_flash_attn_with_kvcache_correctness(mha_type, causal, new_kv):
     torch.testing.assert_close(v_cache, v_ref, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("return_softmax", [False, True])
+def test_mha_dao_ai_contract(return_softmax):
+    """Each function returns the shapes, dtypes and devices it declares:
+    _flash_attn_forward and _flash_attn_backward as FlashAttention's fake ops declare,
+    the public functions as their docstrings do."""
+    torch.manual_seed(20)
+    batch, seqlen, heads, d = 2, 128, 4, 64
+    q = torch.randn(batch, seqlen, heads, d, device="cuda", dtype=torch.float16)
+    q_unpad = q.flatten(0, 1)
+    cu_seqlens = torch.arange(
+        0, (batch + 1) * seqlen, seqlen, device="cuda", dtype=torch.int32
+    )
+    record = (batch, heads, seqlen, seqlen) if return_softmax else (0,)
+
+    out, lse, s_dmask, _, _, rng_state = mha._flash_attn_forward(
+        q,
+        q,
+        q,
+        0.17,
+        d**-0.5,
+        True,
+        -1,
+        -1,
+        None,
+        None,
+        True,
+        return_softmax,
+        seqlen,
+        seqlen,
+        implementation="dao_ai",
+    )
+    assert out.shape == q.shape and out.dtype == q.dtype
+    assert lse.shape == (batch, heads, seqlen) and lse.dtype == torch.float32
+    assert s_dmask.shape == record and s_dmask.dtype == q.dtype
+    assert rng_state.shape == (2,) and rng_state.dtype == torch.int64
+    assert rng_state.device == q.device
+
+    grads = (torch.empty_like(q), torch.empty_like(q), torch.empty_like(q))
+    softmax_d = mha._flash_attn_backward(
+        torch.ones_like(out),
+        q,
+        q,
+        q,
+        out,
+        lse,
+        *grads,
+        None,
+        0.17,
+        d**-0.5,
+        True,
+        -1,
+        -1,
+        None,
+        False,
+        seqlen,
+        seqlen,
+        rng_state=rng_state,
+        implementation="dao_ai",
+    )
+    assert softmax_d.shape == (batch, heads, seqlen)
+    assert softmax_d.dtype == torch.float32
+
+    out, lse, s_dmask, _, _, rng_state = mha._flash_attn_forward(
+        q_unpad,
+        q_unpad,
+        q_unpad,
+        0.17,
+        d**-0.5,
+        True,
+        -1,
+        -1,
+        None,
+        None,
+        True,
+        return_softmax,
+        seqlen,
+        seqlen,
+        cu_seqlens,
+        cu_seqlens,
+        implementation="dao_ai",
+    )
+    assert out.shape == q_unpad.shape and out.dtype == q.dtype
+    assert lse.shape == (heads, batch * seqlen) and lse.dtype == torch.float32
+    assert s_dmask.shape == record and s_dmask.dtype == q.dtype
+    assert rng_state.shape == (2,) and rng_state.device == q.device
+
+    grads = (
+        torch.empty_like(q_unpad),
+        torch.empty_like(q_unpad),
+        torch.empty_like(q_unpad),
+    )
+    softmax_d = mha._flash_attn_backward(
+        torch.ones_like(out),
+        q_unpad,
+        q_unpad,
+        q_unpad,
+        out,
+        lse,
+        *grads,
+        None,
+        0.17,
+        d**-0.5,
+        True,
+        -1,
+        -1,
+        None,
+        False,
+        seqlen,
+        seqlen,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        rng_state=rng_state,
+        implementation="dao_ai",
+    )
+    assert softmax_d.shape == (heads, batch * seqlen)
+    assert softmax_d.dtype == torch.float32
+
+    out, lse, probs = flash_attn_func(
+        q,
+        q,
+        q,
+        dropout_p=0.17,
+        causal=True,
+        return_lse=True,
+        return_attn_probs=True,
+        implementation="dao_ai",
+    )
+    assert out.shape == q.shape and lse.shape == (batch, heads, seqlen)
+    assert probs.shape == (batch, heads, seqlen, seqlen)
+
+    out, lse, probs = flash_attn_varlen_func(
+        q_unpad,
+        q_unpad,
+        q_unpad,
+        cu_seqlens,
+        cu_seqlens,
+        seqlen,
+        seqlen,
+        dropout_p=0.17,
+        causal=True,
+        return_lse=True,
+        return_attn_probs=True,
+        implementation="dao_ai",
+    )
+    assert out.shape == q_unpad.shape and lse.shape == (heads, batch * seqlen)
+    assert probs.shape == (batch, heads, seqlen, seqlen)
+
+    cache_seqlens = torch.full((batch,), seqlen // 2, device="cuda", dtype=torch.int32)
+    out, lse = flash_attn_with_kvcache(
+        q[:, :1], q, q, cache_seqlens=cache_seqlens, return_softmax_lse=True
+    )
+    assert out.shape == (batch, 1, heads, d) and lse.shape == (batch, heads, 1)
+    assert lse.dtype == torch.float32
+
+
 @pytest.mark.parametrize("head_size", [53, 64])
 def test_mha_dao_ai_routing(monkeypatch, head_size):
     """Each forward's backward runs that forward's implementation, even after

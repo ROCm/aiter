@@ -7,6 +7,7 @@ import torch
 import aiter
 from aiter import flash_attn_varlen_func
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops import mha as mha_module
 from aiter.ops.triton.rope.fused_qk_norm_rope_gate_fp8_quant import (
     FP8_DTYPE,
     FP8_MAX,
@@ -740,6 +741,26 @@ def test_fused_qk_norm_rope_gate_fp8_quant_bounds_padded_tokens():
             ).abs().amax() / reference[start:end].abs().amax()
             assert relative_error < 0.04
             assert torch.isfinite(reconstructed).all()
+
+
+def test_flash_attn_varlen_rejects_descales_without_ck(monkeypatch):
+    monkeypatch.setattr(mha_module, "ENABLE_CK", False)
+    q = torch.empty((1, 1, HEAD_DIM), dtype=FP8_DTYPE, device="cuda")
+    descale = torch.ones((1, 1), dtype=torch.float32, device="cuda")
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    with pytest.raises(RuntimeError, match="requires ENABLE_CK=1"):
+        mha_module.flash_attn_varlen_func(
+            q,
+            q,
+            q,
+            cu_seqlens,
+            cu_seqlens,
+            1,
+            1,
+            q_descale=descale,
+            k_descale=descale,
+            v_descale=descale,
+        )
 
 
 @requires_gfx950

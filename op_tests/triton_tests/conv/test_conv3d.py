@@ -45,6 +45,7 @@ from aiter.ops.triton.conv.conv3d import (
     conv3d_winograd_hw_f4x3,
     conv3d_winograd_hw_f4x3_cblocked,
 )
+from aiter.ops.triton.utils import conv_config_utils
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 from ._helpers import (
@@ -72,7 +73,7 @@ VAE_SHAPES = [
 ]
 
 # (name, N, C, D, H, W, K, T, R, S, stride, pad, dil) — covers both the general
-# path and the specialized 1x1x1 path.
+# path and the specialized 1x1x1 path (routing verified in test_routing).
 EXTRA_SHAPES = [
     ("stride2", 1, 32, 8, 32, 32, 32, 3, 3, 3, (2, 2, 2), (1, 1, 1), (1, 1, 1)),
     ("pad0", 1, 16, 6, 24, 24, 16, 3, 3, 3, (1, 1, 1), (0, 0, 0), (1, 1, 1)),
@@ -474,6 +475,31 @@ def test_conv3d_inference_weight_observes_updates():
     )
 
 
+def test_weight_prepack_cache_uses_lru_eviction(monkeypatch):
+    cache = conv_prepack._LRUPackCache(maxsize=2)
+    monkeypatch.setattr(conv_prepack, "_PACK_CACHE_3D_GENERAL", cache)
+    weights = [
+        (torch.arange(3, device="cuda", dtype=torch.float16) + offset).reshape(
+            1, 1, 1, 1, 3
+        )
+        for offset in (0, 10, 20)
+    ]
+
+    first, _ = conv_prepack.get_or_make_weight_pack_3d(weights[0], block_k=4)
+    second, _ = conv_prepack.get_or_make_weight_pack_3d(weights[1], block_k=4)
+    first_hit, _ = conv_prepack.get_or_make_weight_pack_3d(weights[0], block_k=4)
+    conv_prepack.get_or_make_weight_pack_3d(weights[2], block_k=4)
+
+    assert first_hit is first, "cache hit did not return the original packed weight"
+    assert len(cache._d) == 2, f"expected two cached entries, got {len(cache._d)}"
+    assert (
+        conv_prepack.get_or_make_weight_pack_3d(weights[0], block_k=4)[0] is first
+    ), "recently used entry was unexpectedly evicted"
+    assert (
+        conv_prepack.get_or_make_weight_pack_3d(weights[1], block_k=4)[0] is not second
+    ), "least-recently-used entry was not evicted"
+
+
 def test_general_masks_weight_tail_when_block_k_exceeds_pack_granularity(monkeypatch):
     config = {
         "BLOCK_M": 32,
@@ -504,6 +530,24 @@ def test_general_masks_weight_tail_when_block_k_exceeds_pack_granularity(monkeyp
         ),
     )
     assert y.dtype == torch.float16, f"expected float16 output, got {y.dtype}"
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"stride": (1, 1)}, "stride must be an int or a length-3 sequence"),
+        ({"stride": 0}, "stride values must be positive"),
+        ({"padding": -1}, "padding values must be non-negative"),
+        ({"dilation": 0}, "dilation values must be positive"),
+    ],
+    ids=["stride-length", "stride-zero", "padding-negative", "dilation-zero"],
+)
+def test_invalid_spatial_parameters(kwargs, match):
+    x = torch.empty((1, 4, 3, 4, 4), device="cuda", dtype=torch.float16)
+    w = torch.empty((4, 4, 1, 1, 1), device="cuda", dtype=torch.float16)
+
+    with pytest.raises(ValueError, match=match):
+        conv3d(x, w, **kwargs)
 
 
 def test_conv3d_dims_supports_cpu_tensors():
@@ -814,6 +858,110 @@ def test_bf16_winograd_uses_fp16_transform_storage():
     ), f"relative L2 error {relative_l2_error} exceeds 0.006"
 
 
+def test_routing(monkeypatch):
+    s1 = (1, 1, 1)
+
+    def route(
+        T,
+        R,
+        S,
+        stride=s1,
+        dilation=s1,
+        C=64,
+        D=4,
+        H=32,
+        W=32,
+        K=64,
+        layout="ncdhw",
+        padding=s1,
+    ):
+        return _resolve_route(
+            T,
+            R,
+            S,
+            stride,
+            dilation,
+            1,
+            C,
+            D,
+            H,
+            W,
+            K,
+            layout,
+            padding=padding,
+        )
+
+    # 1x1x1 -> specialized channel-GEMM (layout-independent).
+    assert (
+        route(1, 1, 1, C=128) is Route3D.ONE_X_ONE_X_ONE
+    ), "NCDHW 1x1x1 convolution should use the specialized route"
+    assert (
+        route(1, 1, 1, C=128, layout="ndhwc") is Route3D.ONE_X_ONE_X_ONE
+    ), "NDHWC 1x1x1 convolution should use the specialized route"
+    # The measured wave32 policy accounts for depth utilization, channel
+    # expansion/compression, tile count, and activation-pack cost.
+    monkeypatch.setattr("aiter.ops.triton.conv.conv3d._is_amd_wave32", lambda: True)
+    assert (
+        route(3, 3, 3, C=384, D=3, H=46, W=51, K=384) is Route3D.WINOGRAD_HW
+    ), "expected Wan decoder shape to use Winograd"
+    assert (
+        route(3, 3, 3, C=192, D=6, H=178, W=198, K=192) is Route3D.WINOGRAD_HW
+    ), "expected large low-depth shape to use Winograd"
+    assert (
+        route(3, 3, 3, C=384, D=4, H=90, W=100, K=384) is Route3D.WINOGRAD_HW
+    ), "expected medium-depth shape to use Winograd"
+    assert (
+        route(3, 3, 3, C=96, D=6, H=354, W=394, K=96) is Route3D.CBLOCKED_NCDHW
+    ), "expected low-channel shape to use NCDHWc"
+    assert (
+        route(3, 3, 3, C=64) is Route3D.CBLOCKED_NCDHW
+    ), "expected C=64 shape to use NCDHWc"
+    assert (
+        route(3, 3, 3, C=32) is Route3D.CBLOCKED_NCDHW
+    ), "expected C=32 shape to use NCDHWc"
+    assert (
+        route(3, 3, 3, C=12, D=3, H=354, W=642, K=160, padding=(0, 0, 0))
+        is Route3D.GENERAL
+    ), "expected low-channel unpadded shape to use the general route"
+    assert (
+        route(3, 3, 3, C=384, D=3, H=46, W=51, K=384, padding=(0, 0, 0))
+        is Route3D.CBLOCKED_NCDHW
+    ), "expected unpadded C=384 shape to use NCDHWc"
+    assert (
+        route(3, 3, 3, C=640, D=3, H=46, W=82, K=640, padding=(0, 0, 0))
+        is Route3D.WINOGRAD_HW_CBLOCKED
+    ), "expected wide C=640 shape to use cblocked Winograd"
+    assert (
+        route(3, 3, 3, C=512, D=33, H=34, W=60, K=4096, padding=(0, 1, 1))
+        is Route3D.CBLOCKED_NCDHW
+    ), "expected high-depth expansion shape to use NCDHWc"
+    assert (
+        route(3, 3, 3, stride=(2, 2, 2), C=384) is Route3D.CBLOCKED_NCDHW
+    ), "expected strided 3x3x3 shape to use NCDHWc"
+    # Wave64 uses the conservative 512-channel crossover.
+    monkeypatch.setattr("aiter.ops.triton.conv.conv3d._is_amd_wave32", lambda: False)
+    assert (
+        route(3, 3, 3, C=384, D=4, H=64, W=64, K=384) is Route3D.CBLOCKED_NCDHW
+    ), "expected wave64 C=384 shape to use NCDHWc"
+    assert (
+        route(3, 3, 3, C=512, D=4, H=64, W=64, K=512) is Route3D.WINOGRAD_HW
+    ), "expected wave64 C=512 shape to use Winograd"
+    # 3x3x3 NDHWC -> channels-last kernel.
+    assert (
+        route(3, 3, 3, C=384, layout="ndhwc") is Route3D.NDHWC_3X3X3
+    ), "expected NDHWC 3x3x3 shape to use the channels-last kernel"
+    # No specialized kernel -> general.
+    assert (
+        route(5, 5, 5, C=384) is Route3D.GENERAL
+    ), "expected 5x5x5 shape to use the general route"
+    assert (
+        route(3, 3, 3, dilation=(2, 2, 2), C=384) is Route3D.GENERAL
+    ), "expected dilated 3x3x3 shape to use the general route"
+    assert (
+        route(1, 1, 1, dilation=(2, 2, 2), C=384) is Route3D.GENERAL
+    ), "expected dilated 1x1x1 shape to use the general route"
+
+
 @pytest.mark.parametrize(
     "route,expected_wrapper,layout",
     [
@@ -883,6 +1031,45 @@ def test_route_and_run_dispatches_to_selected_wrapper(
 
 
 # -- Configuration lookup and launcher-key regression tests -----------------
+
+
+@pytest.fixture
+def isolated_conv3d_config_cache():
+    """Keep synthetic configuration tables and their cache test-local."""
+    conv_config_utils._get_conv_config_cached.cache_clear()
+    conv_config_utils.has_conv_config.cache_clear()
+    yield
+    conv_config_utils._get_conv_config_cached.cache_clear()
+    conv_config_utils.has_conv_config.cache_clear()
+
+
+def test_conv3d_config_layout_variant_precedence(
+    monkeypatch, isolated_conv3d_config_cache
+):
+    shape_key = "test-shape"
+    config = {
+        "shapes_ndhwc": {shape_key: {"source": "layout"}},
+        "shapes": {shape_key: {"source": "generic"}},
+        "M_LEQ_64": {"source": "bucket"},
+        "any": {"source": "any"},
+    }
+    monkeypatch.setattr(
+        conv_config_utils, "_get_conv_config_file", lambda _config_name: config
+    )
+
+    def selected(*variants, key=shape_key, M=32):
+        return conv_config_utils.get_conv_config(
+            "TEST-CONV3D-VARIANTS", shape_key=key, M=M, variants=variants
+        )["source"]
+
+    assert selected("ndhwc") == "layout", "layout-specific config was not preferred"
+    assert selected() == "generic", "generic shape config was not selected"
+    assert (
+        selected("ndhwc", key="missing") == "bucket"
+    ), "M bucket was not used after a layout-specific shape miss"
+    assert (
+        selected("ndhwc", key="missing", M=65) == "any"
+    ), "generic fallback was not used after shape and bucket misses"
 
 
 if __name__ == "__main__":

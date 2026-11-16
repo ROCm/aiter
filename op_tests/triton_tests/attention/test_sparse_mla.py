@@ -222,6 +222,83 @@ def test_dot_precision_arch_gate(arch):
             smd._resolve_dot_precision("fp8", "fp8_scalar", arch)
 
 
+@pytest.mark.parametrize("arch", SUPPORTED_ARCHS)
+def test_packed_cache_arch_gate(arch):
+    """Packed caches are gfx950-only even where SUPPORTED_ARCHS is wider.
+
+    They return to pa_decode_sparse before the kernel's own arch gate, so
+    widening that gate does not reach them.
+    """
+    if arch in smd.PACKED_ARCHS:
+        smd._check_packed_arch(arch)
+    else:
+        with pytest.raises(ValueError, match="fp8_dsv4_mla"):
+            smd._check_packed_arch(arch)
+
+
+@pytest.mark.parametrize("arch", SUPPORTED_ARCHS)
+def test_fp8_arch_gate(arch):
+    """fp8 q and fp8 caches, for every arch, from any machine."""
+    smd._check_fp8_arch(arch, "bf16", torch.bfloat16)
+    for fmt, q_dtype in (
+        ("fp8_scalar", torch.bfloat16),
+        ("fp8_dsv32_mla", torch.bfloat16),
+        ("fp8_dsv32_mla", torch.float8_e4m3fn),
+        ("bf16", torch.float8_e4m3fn),
+    ):
+        fnuz_dsv32 = (
+            arch in FNUZ_DSV32_ARCHS
+            and fmt == "fp8_dsv32_mla"
+            and q_dtype == torch.bfloat16
+        )
+        if arch in FP8_ARCHS or fnuz_dsv32:
+            smd._check_fp8_arch(arch, fmt, q_dtype)
+        else:
+            with pytest.raises(ValueError, match="fnuz"):
+                smd._check_fp8_arch(arch, fmt, q_dtype)
+
+
+@pytest.mark.parametrize(
+    "kv_lds_pad, kv_lora_rank, rope, need",
+    [
+        # decode: the KV tile keeps the kernel's default pad
+        (0, 512, 0, None),
+        (0, 512, 64, None),
+        (0, 512, 256, None),
+        (0, 1000, 0, None),  # exactly 64 KB
+        (0, 1008, 0, 66048),
+        (0, 512, 512, 67584),
+        (0, 1024, 0, 67072),
+        (0, 1024, 64, 71680),
+        (0, 2048, 0, 132608),
+        # prefill: the launch pads the KV tile's rows by 16
+        (16, 512, 0, None),
+        (16, 512, 64, None),
+        (16, 512, 256, None),
+        (16, 992, 0, None),  # exactly 64 KB
+        (16, 1000, 0, 66048),
+        (16, 512, 512, 68096),
+        (16, 1024, 0, 67584),
+        (16, 1024, 64, 72192),
+        (16, 2048, 0, 133120),
+    ],
+)
+def test_lds_budget_gfx942_boundary(kv_lds_pad, kv_lora_rank, rope, need):
+    """CPU-only: the gfx942 64 KB guard at the decode and prefill KV pads.
+
+    The GPU suite only launches the default 512/64 geometry. The power-of-two
+    rejects are the byte counts OutOfResources reported for them. 992, 1000 and
+    1008 only pin the comparison at exactly 64 KB: the KV tile's shared layout
+    takes a power-of-two width, so no launch reaches that point.
+    """
+    block_k = smd._get_config("gfx942")["BLOCK_K"]
+    if need is None:
+        smd._check_lds_budget("gfx942", block_k, kv_lora_rank, rope, kv_lds_pad)
+        return
+    with pytest.raises(ValueError, match=rf"needs {need} B of LDS"):
+        smd._check_lds_budget("gfx942", block_k, kv_lora_rank, rope, kv_lds_pad)
+
+
 @pytest.mark.parametrize(
     "C,H,topk,kwargs",
     [

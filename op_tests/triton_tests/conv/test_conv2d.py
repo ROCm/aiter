@@ -39,11 +39,15 @@ import torch.nn.functional as F
 
 import aiter.ops.triton.conv.conv2d as conv2d_module
 from aiter.ops.triton.conv import _prepack as conv_prepack
+from aiter.ops.triton.conv._prepack import clear_conv2d_weight_pack_caches
+from aiter.ops.triton.utils import conv_config_utils
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from op_tests.triton_tests.conv._helpers import (
     ALL_SUPPORTED_ARCHS,
+    CONV2D_WEIGHT_PACK_CACHE_NAMES,
     ORDERED_METHODS,
     TestSuite,
+    assert_weight_pack_cache_clear_is_scoped,
     dynamic_conv_tolerances,
     run_activations,
     run_cross_method,
@@ -157,6 +161,15 @@ def test_scalar_parameters_and_noncontiguous_input(layout):
         ), f"expected contiguous output, got strides={y.stride()}"
 
 
+def test_conv2d_weight_pack_cache_clear_is_scoped(monkeypatch):
+    assert_weight_pack_cache_clear_is_scoped(
+        monkeypatch,
+        conv_prepack,
+        clear_conv2d_weight_pack_caches,
+        CONV2D_WEIGHT_PACK_CACHE_NAMES,
+    )
+
+
 def test_inference_weight_bypasses_pack_cache_and_observes_updates(monkeypatch):
     cache = conv_prepack._LRUPackCache(maxsize=2)
     monkeypatch.setattr(conv_prepack, "_PACK_CACHE_3x3", cache)
@@ -196,3 +209,133 @@ def test_conv2d_inference_weight_observes_updates():
 
 
 # -- Configuration lookup and routing (no kernel launches) -------------------
+
+_GFX1100_PINNED = {
+    "N": 1,
+    "C": 64,
+    "H": 56,
+    "W": 56,
+    "K": 64,
+    "stride": (1, 1),
+    "padding": (1, 1),
+}
+
+_GFX1151_PINNED = {
+    "N": 1,
+    "C": 256,
+    "H": 28,
+    "W": 28,
+    "K": 256,
+    "stride": (2, 2),
+    "padding": (1, 1),
+}
+
+_UNPINNED = {
+    "N": 1,
+    "C": 64,
+    "H": 55,
+    "W": 55,
+    "K": 64,
+    "stride": (1, 1),
+    "padding": (1, 1),
+}
+
+
+@pytest.fixture
+def isolated_conv_config_cache():
+    """Keep mocked architectures and synthetic config tables test-local."""
+    conv_config_utils._get_conv_config_cached.cache_clear()
+    conv_config_utils.has_conv_config.cache_clear()
+    yield
+    conv_config_utils._get_conv_config_cached.cache_clear()
+    conv_config_utils.has_conv_config.cache_clear()
+
+
+def _use_arch(monkeypatch, arch):
+    monkeypatch.setattr(conv_config_utils.arch_info, "get_arch", lambda: arch)
+
+
+def _resolve_nchw_3x3(shape, *, stride=None, padding=None):
+    return conv2d_module._resolve_route(
+        R=3,
+        S=3,
+        stride=shape["stride"] if stride is None else stride,
+        dilation=(1, 1),
+        N=shape["N"],
+        C=shape["C"],
+        H=shape["H"],
+        W_in=shape["W"],
+        K_out=shape["K"],
+        layout="nchw",
+        padding=shape["padding"] if padding is None else padding,
+    )
+
+
+@pytest.mark.parametrize(
+    "arch,shape",
+    [("gfx1100", _GFX1100_PINNED), ("gfx1151", _GFX1151_PINNED)],
+)
+def test_exact_nchw_pin_selects_direct(
+    monkeypatch, isolated_conv_config_cache, arch, shape
+):
+    _use_arch(monkeypatch, arch)
+
+    route = _resolve_nchw_3x3(shape)
+    assert (
+        route is conv2d_module.Route.DIRECT_NCHW_3X3
+    ), f"expected direct NCHW route for pinned {arch} shape, got {route}"
+
+
+@pytest.mark.parametrize("arch", ["gfx1100", "gfx1151"])
+def test_unpinned_nchw_shape_falls_back_to_cblocked(
+    monkeypatch, isolated_conv_config_cache, arch
+):
+    _use_arch(monkeypatch, arch)
+
+    route = _resolve_nchw_3x3(_UNPINNED)
+    assert (
+        route is conv2d_module.Route.CBLOCKED_NCHW
+    ), f"expected NCHWc fallback for unpinned {arch} shape, got {route}"
+
+
+@pytest.mark.parametrize(
+    "route_override",
+    [{"padding": (0, 0)}, {"stride": (2, 2)}],
+    ids=["padding", "stride"],
+)
+def test_exact_nchw_pin_uses_complete_shape_key(
+    monkeypatch, isolated_conv_config_cache, route_override
+):
+    _use_arch(monkeypatch, "gfx1100")
+
+    route = _resolve_nchw_3x3(_GFX1100_PINNED, **route_override)
+    assert (
+        route is conv2d_module.Route.CBLOCKED_NCHW
+    ), f"expected NCHWc after shape-key change {route_override}, got {route}"
+
+
+def test_conv_config_layout_variant_precedence(monkeypatch, isolated_conv_config_cache):
+    shape_key = "test-shape"
+    config = {
+        "shapes_nhwc": {shape_key: {"source": "layout"}},
+        "shapes": {shape_key: {"source": "generic"}},
+        "M_LEQ_64": {"source": "bucket"},
+        "any": {"source": "any"},
+    }
+    monkeypatch.setattr(
+        conv_config_utils, "_get_conv_config_file", lambda _config_name: config
+    )
+
+    def selected(*variants, key=shape_key, M=32):
+        return conv_config_utils.get_conv_config(
+            "TEST-CONV-VARIANTS", shape_key=key, M=M, variants=variants
+        )["source"]
+
+    assert selected("nhwc") == "layout", "layout-specific config was not preferred"
+    assert selected() == "generic", "generic shape config was not selected"
+    assert (
+        selected("nhwc", key="missing") == "bucket"
+    ), "M bucket was not used after a layout-specific shape miss"
+    assert (
+        selected("nhwc", key="missing", M=65) == "any"
+    ), "generic fallback was not used after shape and bucket misses"
