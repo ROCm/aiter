@@ -592,7 +592,7 @@ def test_padding_matches_reference(
         stride,
         padding,
         dilation,
-        padding_mode,
+        padding_mode=padding_mode,
     ).relu()
     if entry_point == "routed":
         method = {
@@ -606,7 +606,7 @@ def test_padding_matches_reference(
             "_nchw_direct_is_profitable",
             lambda *args: route_name == "DIRECT_NCHW_3X3",
         )
-        extra_args = (layout if api == "conv2d" else 64,)
+        layout_kwargs = {"layout": layout} if api == "conv2d" else {}
     else:
         api = {
             "ONE_X_ONE": "conv2d_1x1",
@@ -617,12 +617,11 @@ def test_padding_matches_reference(
             "WF4X3_CBLOCKED": "conv2d_winograd_f4x3_cblocked",
             "WF4X3": "conv2d_winograd_f4x3",
         }[route_name]
-        if route_name in ("ONE_X_ONE", "GENERAL", "WF4X3"):
-            extra_args = (64, layout)
-        elif route_name in ("CBLOCKED_NCHW", "WF4X3_CBLOCKED"):
-            extra_args = (64, None)
-        else:
-            extra_args = (64,)
+        layout_kwargs = (
+            {"layout": layout}
+            if route_name in ("ONE_X_ONE", "GENERAL", "WF4X3")
+            else {}
+        )
     actual = getattr(conv2d_module, api)(
         source,
         weight,
@@ -630,9 +629,9 @@ def test_padding_matches_reference(
         stride,
         padding,
         dilation,
-        "relu",
-        *extra_args,
-        padding_mode,
+        activation="relu",
+        padding_mode=padding_mode,
+        **layout_kwargs,
     )
 
     tolerances = (
