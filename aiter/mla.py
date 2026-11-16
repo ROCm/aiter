@@ -988,6 +988,71 @@ def mla_decode_prepare_page_csr(
     return kv_indptr, kv_indices, kv_last_page_lens
 
 
+_MLA_NARROW_MIN_HEADS = 12
+_MLA_MIN_HEADS = 16
+_MLA_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+
+def mla_decode_min_heads(
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    max_seqlen_q: int,
+    persistent: bool,
+    arch: str | None = None,
+) -> int:
+    """Query-head count, 12 or 16, that an MLA decode with up to 16 heads pads to.
+
+    Returns 12 where ``mla_decode_fwd`` serves exactly 12 query heads for the
+    decode shape, and 16 otherwise. A caller with fewer heads pads its query up
+    to this count with zero heads and plans the persistent metadata
+    (``get_mla_metadata_v1`` with ``fast_mode=True``) for the padded count.
+
+    12 heads are served only on gfx950 in persistent mode (``work_meta_data``
+    given):
+
+    - fp8 Q and fp8 KV with ``12 * max_seqlen_q <= 128``. The asm dispatch
+      remaps ``gqa_ratio == 12`` onto the gqa=32, qseqlen=4 kernel
+      (``mla_asm_decode_remap`` in csrc/py_itfs_cu/asm_mla.cu) and the
+      fast-mode planner plans 12 heads unfolded (``mla_decode_head_plan_v1_2``
+      in csrc/include/mla_decode_shape.h).
+    - bf16 Q and bf16 KV with ``12 * max_seqlen_q >= 64``. The asm dispatch
+      runs it on the bf16 gqa=64, qseqlen=1 kernel (gqa=32, qseqlen=4 from
+      ``12 * max_seqlen_q >= 128``), and the planner takes any bf16 head count
+      on gfx950.
+
+    A return of 16 means no 12-head kernel serves the shape. It does not
+    promise that 16 heads are served: a non-persistent fp8 decode with
+    ``max_seqlen_q > 4``, for one, has no 16-head kernel either. No count from
+    13 to 15 is served on gfx942 or gfx950.
+
+    Counts below 12 are not reported. aiter also has 8-head kernels for some
+    shapes on gfx942, gfx950 and gfx1250 (on gfx950, for example, the fp8
+    persistent decode at ``max_seqlen_q == 4``). A caller with 8 heads or fewer
+    should ask ``aiter.ops.attention.get_mla_decode_shape_support``.
+
+    This is what is served, not which width is faster. At ``max_seqlen_q`` 1
+    to 4, for example, 16 heads run dedicated fp8 qh16 kernels while 12 heads
+    ride the gqa=32 tile, so a caller choosing a width should measure.
+
+    ``max_seqlen_q`` is the widest per-request query length, speculative tokens
+    included. ``arch`` defaults to the current device's (``get_gfx()``). The
+    answer describes the default asm route; ``get_mla_decode_shape_support``
+    reports on a full shape, other backends included.
+    """
+    if max_seqlen_q < 1:
+        raise ValueError(f"max_seqlen_q must be >= 1, got {max_seqlen_q}")
+    if arch is None:
+        arch = get_gfx()
+    if arch != "gfx950" or not persistent:
+        return _MLA_MIN_HEADS
+    rows = _MLA_NARROW_MIN_HEADS * max_seqlen_q
+    if q_dtype in _MLA_FP8_DTYPES and kv_dtype in _MLA_FP8_DTYPES and rows <= 128:
+        return _MLA_NARROW_MIN_HEADS
+    if q_dtype == torch.bfloat16 and kv_dtype == torch.bfloat16 and rows >= 64:
+        return _MLA_NARROW_MIN_HEADS
+    return _MLA_MIN_HEADS
+
+
 def mla_decode_fwd(
     q,
     kv_buffer,
