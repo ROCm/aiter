@@ -43,6 +43,7 @@ it with its config family and where its gluon path exists:
 """
 
 import argparse
+import math
 import os
 import sys
 from collections.abc import Callable
@@ -256,6 +257,55 @@ def batched_gemm_bf16(shape, backend):
         return num_buffers > k_tiles  # the wrapper clamps it there anyway
 
     return call, (x, w, bias, y), should_skip
+
+
+@kernel(
+    "FUSED-BF16-BMM-CAT-QUANT-PAD-MLA",
+    dims=("B", "M", "N", "K"),
+    backend_kwarg=False,
+)
+def fused_bf16_bmm_cat_quant_pad_mla(shape, backend):
+    """B: query heads per rank, N: kv_lora_rank, K: qk_nope_head_dim."""
+    import torch
+
+    from aiter.ops.triton.fusions.fused_bf16_bmm_cat_quant_pad_mla import (
+        fused_bf16_bmm_cat_quant_pad_mla as fused,
+    )
+    from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+    from op_tests.triton_tests.fusions.test_fused_bf16_bmm_cat_quant_pad_mla import (
+        generate_inputs,
+        vllm_fp8_max,
+    )
+
+    B, M, N, K = shape["B"], shape["M"], shape["N"], shape["K"]
+    q_nope, w_uk_t, q_pe = generate_inputs(M, B, kv_lora=N, d_nope=K)
+    q_scale = torch.ones((), dtype=torch.float32, device="cuda")
+    # a multiple of 16 heads for the asm MLA decode, and of B for the wrapper
+    padded_heads = math.lcm(B, 16)
+    out = torch.empty(
+        (M, padded_heads, N + q_pe.shape[-1]),
+        dtype=get_fp8_e4m3_dtype(),
+        device="cuda",
+    )
+    fp8_max = vllm_fp8_max()
+
+    def call(config, q_nope, w_uk_t, q_pe, q_scale, out):
+        return fused(
+            q_nope,
+            w_uk_t,
+            q_pe,
+            q_scale,
+            padded_heads,
+            out=out,
+            fp8_max=fp8_max,
+            config=config,
+        )
+
+    def should_skip(config):
+        block_sizes = (config[f"BLOCK_SIZE_{d}"] for d in "MNK")
+        return min(block_sizes) < 16  # tl.dot needs 16-wide tiles
+
+    return call, (q_nope, w_uk_t, q_pe, q_scale, out), should_skip
 
 
 @kernel(
@@ -546,6 +596,53 @@ def gemm_a8w8(shape, backend):
         )
 
     return call, (x, w, x_scale, w_scale, y), None
+
+
+@kernel("GEMM-A8W8_PRESHUFFLED", bits=(8, 8))
+def gemm_a8w8_preshuffle(shape, backend):
+    import torch
+
+    from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8_preshuffle as gemm
+    from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+    from aiter.ops.triton.utils.types import get_fp8_dtypes
+    from op_tests.triton_tests.gemm.basic.test_gemm_a8w8 import (
+        generate_gemm_a8w8_inputs,
+    )
+
+    M, N, K = shape["M"], shape["N"], shape["K"]
+    _, fp8 = get_fp8_dtypes()
+    x, _, w, x_scale, w_scale, _, y = generate_gemm_a8w8_inputs(
+        M,
+        N,
+        K,
+        in_dtype=fp8,
+        out_dtype=torch.bfloat16,
+        layout="TN",
+        output=True,
+        shuffle=True,
+    )
+
+    def call(config, x, w, x_scale, w_scale, y):
+        if config is not None:
+            compute_splitk_params(
+                config, K
+            )  # mutates: derives SPLITK_BLOCK_SIZE, may shrink BK
+        return gemm(
+            x,
+            w,
+            x_scale,
+            w_scale,
+            bias=None,
+            dtype=torch.bfloat16,
+            y=y,
+            config=config,
+            backend=backend,
+        )
+
+    def should_skip(config):
+        return config["BLOCK_SIZE_N"] % 16 != 0 or config["BLOCK_SIZE_K"] % 32 != 0
+
+    return call, (x, w, x_scale, w_scale, y), should_skip
 
 
 @kernel(

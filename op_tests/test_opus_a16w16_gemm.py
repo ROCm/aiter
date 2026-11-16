@@ -410,6 +410,28 @@ def test_gfx950_mono_fp32_overwrites_poisoned_output(kid):
     _assert_matches_golden(actual, A, B)
 
 
+def test_gfx950_xcd_swizzle_tail_writes_every_tile():
+    """The XCD swizzle's tail must cover every tile."""
+    if _runtime_arch() != "gfx950":
+        pytest.skip("requires gfx950 hardware")
+
+    torch.manual_seed(0x5848)
+    # 13x20 tiles: the swizzle covers 256 of 260 at 4 or 8 dies, ending inside
+    # the last row group, which has 5 rows, fewer than SWIZZLE_W = 8.
+    M = 13 * 256
+    N = 20 * 256
+    A = torch.randn((1, M, 256), device="cuda", dtype=torch.bfloat16)
+    B = torch.randn((1, N, 256), device="cuda", dtype=torch.bfloat16)
+    out = torch.full((1, M, N), float("nan"), device="cuda", dtype=torch.bfloat16)
+
+    # kid 5 is the a16w16 pipeline with 256x256 tiles.
+    actual = opus_bmm(A, B, out, family="a16w16", kid=5)
+    torch.cuda.synchronize()
+
+    assert not actual.isnan().any()
+    _assert_matches_golden(actual, A, B)
+
+
 def test_gfx950_bias_dtype_rules_and_numerics():
     if _runtime_arch() != "gfx950":
         pytest.skip("requires gfx950 hardware")
