@@ -258,7 +258,9 @@ def test_stage1_kernel(token, kernel_name, model_dim=1536, inter_dim=512):
     assert is_a8w4_gfx942_kernel(p) and p["tile_m"] == tile_m, kernel_name
     torch.manual_seed(0)
     x = torch.randn((token, model_dim), dtype=dtypes.bf16)
-    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtypes.bf16)
+    # / 8 keeps every output below SiTUv2's saturation at 100 (~1 % of them reach it
+    # with unit W1), where a wrong W1 scale would not show
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtypes.bf16) / 8
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtypes.bf16)
     topk_weights, topk_ids = fused_topk(
         x, torch.randn((token, E), dtype=dtypes.bf16), topk, True
@@ -332,7 +334,41 @@ def test_stage1_kernel(token, kernel_name, model_dim=1536, inter_dim=512):
         situ_linear_beta=LINEAR_BETA,
         x_layout=p["x_layout"],
     )
+    # the output is by sorted position: row i holds (token, slot) of sorted_ids[i]
+    ids = sorted_ids[: int(num_valid_ids[0])].to(torch.int64)
+    tok, slot = ids & 0xFFFFFF, ids >> 24
+    real = tok < token  # padding rows of each expert block
+    assert int(real.sum()) == token * topk
+
+    def check(log=True):
+        got = torch.empty_like(ref)
+        got[tok[real], slot[real]] = out[: ids.numel()][real]
+        # Same MXFP8 x and FP4 W as the reference, so every element must be within
+        # the default tolerances (the kernel and torch differ only in summation order
+        # and the bf16 rounding of the gate / up sums).
+        err = checkAllclose(
+            ref, got, msg=f"{kernel_name} M={token} vs torch: ", printLog=log
+        )
+        return err, cos_diff(ref, got)
+
+    # The check must catch a wrong scale on one MX block of one column, which a cos
+    # bound with room to spare would not: double the up scale of K block 0 for the
+    # largest output of token 0 / slot 0 (where the gate is negative SiTUv2 is ~0 and
+    # hides it), then relay it as the caller does.
+    col = int(ref[0, 0].abs().argmax())
+    bad = w1_scale.view(torch.uint8).clone().view(E, inter_dim * 2, -1)
+    bad[int(topk_ids[0, 0]), inter_dim + col, 0] += 1
+    bad = shuffle_scale_a16w4(bad.view(w1_scale.dtype).view(w1_scale.shape), E, False)
+    sc = w1_sc8.view(torch.uint8).view(-1)  # the buffer the kernel reads
+    good = sc.clone()
+    sc.copy_(shuffle_scale_a8w4_gfx942(bad).view(torch.uint8).view(-1))
     run()
+    err, cos = check(log=False)
+    assert err > 0, (kernel_name, token, "one wrong W1 block scale passed", cos)
+    sc.copy_(good)
+    run()
+    err, cos = check()
+    assert err == 0, (kernel_name, token, err, cos)
     # Decode runs under CUDA graphs, so the launch must be capturable (one compiled
     # launcher per config: no module load / unload per call) and replay the same output.
     eager = out.clone()
@@ -343,15 +379,6 @@ def test_stage1_kernel(token, kernel_name, model_dim=1536, inter_dim=512):
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(out, eager), (kernel_name, token, "graph replay differs")
-    # the output is by sorted position: row i holds (token, slot) of sorted_ids[i]
-    ids = sorted_ids[: int(num_valid_ids[0])].to(torch.int64)
-    tok, slot = ids & 0xFFFFFF, ids >> 24
-    real = tok < token  # padding rows of each expert block
-    got = torch.empty_like(ref)
-    got[tok[real], slot[real]] = out[: ids.numel()][real]
-    assert int(real.sum()) == token * topk
-    cos = cos_diff(ref, got)
-    assert cos < 1e-3, (kernel_name, token, cos)
     aiter.logger.info(
         "a8w4 gfx942 stage 1 %s M=%d vs torch: cos diff %.2e (CUDA graph replay identical)",
         kernel_name,
