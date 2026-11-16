@@ -269,7 +269,9 @@ def decode_call(c, splits=None, **kw):
 
 
 def prefill_call(c, **kw):
-    out = torch.empty_like(c["q"])
+    # NaN-filled: torch.empty_like hands back the previous call's (correct) output from the
+    # caching allocator, which hides a launch that wrote nothing.
+    out = torch.full_like(c["q"], float("nan"))
     return sparse_pa_nvfp4_prefill(
         c["q"],
         c["cache"],
