@@ -665,10 +665,18 @@ def make_s1f_stage1(
     N1 = 2 * int(inter_dim)
     assert N1 % tile_n == 0
     NT = N1 // tile_n
-    # IOD-placed W1 (iod_locality.place_w13): XCC x is on IOD domain
-    # ((x + c) % 8) >= 4, c the launch's rotation, which holds n-tiles of that
-    # parity. Without xcc_queues, one queue per domain.
-    assert not LOC or NT % 2 == 0, "iod_loc needs an even NT"
+    # IOD-placed W1 (iod_locality.place_w13, domain groups of iod_loc
+    # n-tiles): XCC x is on IOD domain ((x + c) % 8) >= 4, c the launch's
+    # rotation, which holds the n-tiles n with (n / iod_loc) % 2 equal to it;
+    # an odd last group splits, its first half on domain 0. Without
+    # xcc_queues, one queue per domain.
+    LOC_GROUP = int(iod_loc) or 1
+    LOC_GS = LOC_GROUP.bit_length() - 1
+    LOC_NG = NT // LOC_GROUP
+    assert LOC_GROUP == 1 << LOC_GS
+    assert not LOC or (
+        NT % LOC_GROUP == 0 and NT % 2 == 0 and (LOC_NG % 2 == 0 or LOC_GROUP % 2 == 0)
+    ), "iod_loc needs NT/2 n-tiles of whole groups or halves per domain"
     if NT > _ITEM_N_MASK + 1:
         raise ValueError(
             f"an item code packs the n-tile in {_ITEM_N_BITS} bits, got {NT} n-tiles"
@@ -797,6 +805,7 @@ def make_s1f_stage1(
             defer_c_wait=tile_m > 32 and g1_buffers > 2,
             tdm_snop=True,
             b_placed=LOC,
+            loc_group=LOC_GROUP,
         )
 
     def _g1_asprol():
@@ -1715,7 +1724,7 @@ def make_s1f_stage1(
                     return m_tiles * fx.Int32(NT // 2)
                 if const_expr(LOC):
                     # Queue xq: the m-tiles of its rank r among the 4 queues of
-                    # its domain d, the n-tiles of parity d.
+                    # its domain d, the n-tiles of domain d.
                     r = ((xq + loc_c) & fx.Int32(N_XCC - 1)) & fx.Int32(3)
                     mx = fx.Int32(
                         (m_tiles > r).select(
@@ -1733,6 +1742,23 @@ def make_s1f_stage1(
                     return mx * fx.Int32(NT)
                 return m_tiles * fx.Int32(NT)
 
+            def loc_n(i, d):
+                """The i-th n-tile of domain d."""
+                n = (
+                    ((i >> fx.Int32(LOC_GS)) << fx.Int32(LOC_GS + 1))
+                    | (d << fx.Int32(LOC_GS))
+                    | (i & fx.Int32(LOC_GROUP - 1))
+                )
+                if const_expr(LOC_NG % 2):
+                    full = (LOC_NG // 2) * LOC_GROUP
+                    n = (i < fx.Int32(full)).select(
+                        n,
+                        fx.Int32((LOC_NG - 1) * LOC_GROUP)
+                        + d * fx.Int32(LOC_GROUP // 2)
+                        + (i - fx.Int32(full)),
+                    )
+                return n
+
             def q_code(xq, w):
                 if const_expr(LOC and not XQ):
                     k = w // fx.Int32(B1 // 2)
@@ -1743,11 +1769,11 @@ def make_s1f_stage1(
                     rq = r // gsz
                     return (
                         (k * fx.Int32(GM) + r - rq * gsz) << fx.Int32(_ITEM_N_BITS)
-                    ) | (rq * fx.Int32(2) + xq)
+                    ) | loc_n(rq, xq)
                 if const_expr(LOC):
                     xr = (xq + loc_c) & fx.Int32(N_XCC - 1)
                     j = w // fx.Int32(NT // 2)
-                    n = (w - j * fx.Int32(NT // 2)) * fx.Int32(2) + (xr >> fx.Int32(2))
+                    n = loc_n(w - j * fx.Int32(NT // 2), xr >> fx.Int32(2))
                     return (
                         ((xr & fx.Int32(3)) + j * fx.Int32(4)) << fx.Int32(_ITEM_N_BITS)
                     ) | n

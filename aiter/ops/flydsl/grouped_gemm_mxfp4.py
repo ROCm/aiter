@@ -219,6 +219,16 @@ def flydsl_grouped_gemm_a8w4_masked(
     stage = (1 if stage1_act else 2) if gemm_stage is None else gemm_stage
     if stage not in (1, 2):
         raise ValueError("gemm_stage must be 1 or 2")
+    # A weight placed by moe_shuffle_weight_iod at load time (AITER_MOE_LOC,
+    # gfx1250 only) holds only the placed layout, so it is always read placed;
+    # iod_locality.mode picks the schedule.
+    from .iod_locality import lookup, mode as iod_mode
+
+    loc_phase, b_placed, loc_group = lookup(w, w_scales, N, K, tile_n, tile_k)
+    iod_loc = iod_mode() if loc_phase is not None else 0
+    if iod_loc in (1, 2):
+        # A cluster must sit inside one run of a domain's n-tiles.
+        cluster_n = min(cluster_n, loc_group * b_placed)
     cluster_m = _select_cluster_m(cluster_m, cluster_n, stage == 1)
     if m_align:
         # A tile skipped for starting in an expert's padding never reaches the
@@ -253,40 +263,30 @@ def flydsl_grouped_gemm_a8w4_masked(
             f"tdm_as_in_prologue={tdm_as_in_prologue}"
         )
     waves_per_tensor_tdm = _select_num_waves_per_tensor_tdm(waves_per_tensor_tdm)
-    # A weight placed by moe_shuffle_weight_iod at load time (AITER_MOE_LOC,
-    # gfx1250 only) holds only the placed layout, so it is always read placed;
-    # iod_locality.mode picks the schedule.
-    from .iod_locality import lookup, mode as iod_mode
-
-    loc_phase, b_placed = lookup(w, w_scales, N, K, tile_n, tile_k)
     loc_sched = 0
     if loc_phase is not None:
-        if not (
-            cluster_m == 1
-            and cluster_n == 1
-            and waves_per_tensor_tdm == 2
-            and m_warp * n_warp == 4
-        ):
+        if not (waves_per_tensor_tdm == 2 and m_warp * n_warp == 4):
             raise ValueError(
-                "an IOD-placed weight needs cluster 1 x 1, waves_per_tensor_tdm 2 "
-                f"and four waves, got cluster {cluster_m} x {cluster_n}, "
-                f"waves_per_tensor_tdm {waves_per_tensor_tdm}, waves {m_warp} x {n_warp}"
+                "an IOD-placed weight needs waves_per_tensor_tdm 2 and four "
+                f"waves, got waves_per_tensor_tdm {waves_per_tensor_tdm}, "
+                f"waves {m_warp} x {n_warp}"
             )
-        iod_loc = iod_mode()
         # The schedule is persistent, which the EP scatter serves only unquantized.
         if iod_loc in (1, 2) and not (
             stage2_scatter is not None and stage2_scatter.combine_quant_bits
         ):
             loc_sched = iod_loc
-            # Four workers per CU: fewer leave the tail of the per-domain
-            # task list on too few CUs (measured on 256 CUs: 512 -> 73 us,
-            # 1024 -> 68.5 us, 2048 -> 68.5 us).
-            pw = persistent_workers or int(os.environ.get("AITER_MOE_LOC_PW", "0"))
+            # Workgroups in all, four per CU by default: fewer leave the tail
+            # of the per-domain task list on too few CUs (measured on 256 CUs,
+            # no cluster: 512 -> 73 us, 1024 -> 68.5 us, 2048 -> 68.5 us).
+            pw = int(os.environ.get("AITER_MOE_LOC_PW", "0"))
             if not pw:
                 from aiter.jit.utils.chip_info import get_cu_num
 
                 pw = 4 * int(get_cu_num())
-            persistent_workers = (pw + 7) // 8 * 8
+            # The grid's x extent, whole groups of 8 clusters.
+            step = 8 * cluster_n
+            persistent_workers = max(step, pw // cluster_m // step * step)
     rolled_drain = int(rolled_drain)
     if rolled_drain not in (0, 1):
         raise ValueError("rolled_drain must be 0 or 1")
@@ -376,6 +376,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         float(situ_linear_beta),
         *layout_spec,
         ptr_arg(out if loc_phase is None else loc_phase, fx.Int32),
+        loc_group or 1,
         specialization_key=(
             gemm_spec,
             route_spec,
@@ -383,6 +384,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             tdm_spec,
             ep_spec,
             layout_spec,
+            loc_group,
         ),
     )
     return out

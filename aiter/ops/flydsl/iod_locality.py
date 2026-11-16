@@ -17,15 +17,21 @@ whole 32 KiB granule pairs, 64 KiB aligned, q0 pairs past a page start; a
 pair has one granule on each domain, so local granule g of domain d is the
 storage's granule 2 g + bit, bit = d ^ phase[q / 64] ^ (k >> 2) ^ (k >> 5)
 for q = g + q0, k = q % 64.
-Unit (expert e, n-tile nt) is on domain nt % 2 with local index
-lu = e * NT/2 + nt/2. In the weight, its local granules lu * 2 KT + j,
+The n-tiles of an expert run in domain groups of ``group`` (a power of two
+dividing the even NT): unit (expert e, n-tile nt) of group i = nt / group is
+on domain i % 2 with local index
+lu = e * NT/2 + (i / 2) * group + nt % group, so a cluster of consecutive
+n-tiles inside one group reads one domain. An odd last group splits: its
+first half on domain 0, the rest on domain 1, local index
+e * NT/2 + (NT / group / 2) * group + nt % (group / 2). In the weight, its local granules lu * 2 KT + j,
 j = 4 (m / 2) + 2 h + m % 2, hold B rows [tile_n/32 h, ... + tile_n/32)
 x tile_k*8 B of k-tile m (half h, one wave's share). In the scale, its
 2 KiB B-scale stages of k-tiles m sit at byte (lu * KT + m) * 2 KiB of the
-domain's local granules, back to back. A small int32 table, which the
-kernels take as ``arg_loc_phase``, holds the weight's q0, the scale's q0,
-the index of the scale's phases, then the phase of every page the weight
-touches and of every page the scale touches (each list padded by one entry).
+domain's local granules, back to back. A small table, which the kernels take
+as ``arg_loc_phase``, holds two 64-bit masks per unit id e * NT + nt: bit j
+of the first is ``bit`` of the unit's B pair lu * 2 KT + j, of the second
+``bit`` of its scale pair lu * KT * 2 KiB / 16 KiB + j. A tile's B and scale
+addresses then follow from one table read and no page phases.
 The k-tile pairs 2i, 2i + 1 of a half sit 32 KiB apart (q0 even keeps
 them in pairs 2c, 2c + 1, which share a17 and a20), so a GEMM tiled
 tile_n/2 x 2 tile_k reads the same layout (``b_placed=2``) with one TDM load
@@ -51,13 +57,15 @@ SC_STAGE = 2048
 _PLACED = {}
 
 
-def supported(N, K, tile_n, tile_k) -> bool:
-    """Whether a placed layout exists for this layout tiling."""
+def supported(N, K, tile_n, tile_k, group=1) -> bool:
+    """Whether a placed layout exists for this layout tiling and domain group."""
     kt = K // tile_k
     return (
         tile_n * tile_k == 4 * GRAN
         and tile_n % 128 == 0
         and N % (2 * tile_n) == 0
+        and N % (group * tile_n) == 0
+        and (group % 2 == 0 or (N // tile_n // group) % 2 == 0)
         and K % (2 * tile_k) == 0
         and 2 * kt <= LOCAL_PER_PAGE
     )
@@ -126,7 +134,48 @@ def _scatter(dst: torch.Tensor, units: torch.Tensor, phase, q0) -> None:
         dg[ids.to(dst.device)] = units[d]
 
 
-def _place(w, w_scales, E, N, K, tile_n, tile_k):
+def _units(E, nt, group):
+    """Domain and local index of every unit id e nt + n-tile."""
+    u = np.arange(E * nt)
+    e, n = u // nt, u % nt
+    gi, r = n // group, n % group
+    d = gi & 1
+    lu = gi // 2 * group + r
+    ng = nt // group
+    if ng % 2:
+        last = gi == ng - 1
+        d = np.where(last, r // (group // 2), d)
+        lu = np.where(last, ng // 2 * group + r % (group // 2), lu)
+    return d, lu + e * (nt // 2)
+
+
+def _domain_order(E, nt, group):
+    """[2, E nt / 2] unit ids (e nt + n-tile) of each domain, by local index."""
+    d, lu = _units(E, nt, group)
+    order = np.empty((2, E * nt // 2), dtype=np.int64)
+    order[d, lu] = np.arange(E * nt)
+    return torch.from_numpy(order)
+
+
+def _masks(d, g0, phase, q0):
+    """[n] uint64: bit j picks which granule of pair g0 + j is domain d's
+    (``_scatter``'s bit), for each unit's d and first pair g0."""
+    q = g0[:, None] + q0 + np.arange(64)
+    k = q % LOCAL_PER_PAGE
+    ph = phase[np.minimum(q // LOCAL_PER_PAGE, phase.size - 1)]
+    bit = ((d[:, None] ^ ph ^ (k >> 2) ^ (k >> 5)) & 1).astype(np.uint64)
+    return (bit << np.arange(64, dtype=np.uint64)).sum(1, dtype=np.uint64)
+
+
+def _gather(units, order):
+    """[2, n, 16 KiB]: ``units`` [unit, ...] picked per domain by ``order``."""
+    out = units.new_empty((2, order.shape[1]) + tuple(units.shape[1:]))
+    for d in range(2):
+        torch.index_select(units, 0, order[d], out=out[d])
+    return out.view(2, -1, GRAN)
+
+
+def _place(w, w_scales, E, N, K, tile_n, tile_k, group):
     """Re-lay ``w`` / ``w_scales`` (contiguous uint8) in place; their phase table, or None."""
     nt, kt = N // tile_n, K // tile_k
     bstage = tile_n * tile_k // 2
@@ -144,22 +193,28 @@ def _place(w, w_scales, E, N, K, tile_n, tile_k):
             return None
         probes.append((phase, weak, agree, rotations))
 
-    # [E, NT/2, d, half h, rows, KT/2, q, row] -> [d, E, NT/2, KT/2, h, q, 16 KiB]:
-    # local granule j = 4 i + 2 h + q of unit (e, nt/2). The one reshape copies,
-    # so w can take the bytes back.
+    # [unit, half h, rows, KT/2, q, row] -> [unit, KT/2, h, q, 16 KiB]: local
+    # granule j = 4 i + 2 h + q of the unit; then each domain's units in local
+    # order. The gathers copy, so w can take the bytes back.
     rows = tile_n // 32
     qb, qs = ((t.data_ptr() % PAGE) // (2 * GRAN) for t in (w, w_scales))
-    b = w.reshape(E, nt // 2, 2, 2, rows, kt // 2, 2, bstage // (2 * rows))
-    b = b.permute(2, 0, 1, 5, 3, 6, 4, 7).reshape(2, -1, GRAN)
+    order = _domain_order(E, nt, group).to(w.device)
+    b = w.reshape(E * nt, 2, rows, kt // 2, 2, bstage // (2 * rows))
+    b = _gather(b.permute(0, 3, 1, 4, 2, 5), order)
     _scatter(w, b, probes[0][0], qb)
     del b
-    # [E, NT/2, d, rows, KT, row] -> [d, E, NT/2, KT, 2 KiB stage].
-    s = w_scales.reshape(E, nt // 2, 2, rows, kt, -1)
-    s = s.permute(2, 0, 1, 4, 3, 5).reshape(2, -1, GRAN)
+    # [unit, rows, KT, row] -> [unit, KT, 2 KiB stage].
+    s = _gather(w_scales.reshape(E * nt, rows, kt, -1).permute(0, 2, 1, 3), order)
     _scatter(w_scales, s, probes[1][0], qs)
     del s
-    pb, ps = (np.append(p[0], p[0][-1]) for p in probes)
-    table = np.concatenate([[qb, qs, 3 + pb.size], pb, ps]).astype(np.int32)
+    d, lu = _units(E, nt, group)
+    table = np.stack(
+        [
+            _masks(d, lu * 2 * kt, probes[0][0], qb),
+            _masks(d, lu * kt * SC_STAGE // GRAN, probes[1][0], qs),
+        ],
+        1,
+    ).view(np.int32)
     torch.cuda.synchronize()
     logger.info(
         "[iod_locality] placed weight %s in place for %dx%d tiles: %d + %d pages, "
@@ -174,15 +229,16 @@ def _place(w, w_scales, E, N, K, tile_n, tile_k):
         min(p[2].min() for p in probes),
         probes[0][3],
     )
-    return torch.from_numpy(table).to(w.device)
+    return torch.from_numpy(np.ascontiguousarray(table)).to(w.device)
 
 
 # The layout tiling of each placed weight: every 16 KiB granule is one wave's
 # B half of a k-tile. It serves that tiling and the one with tile_n halved and
 # tile_k doubled (``placed_ratio``): GEMM1 runs 256 x 256 at every tuned token
-# count, GEMM2 512 x 128 or 256 x 256.
-W13_TILE = (256, 256)
-W2_TILE = (512, 128)
+# count, GEMM2 512 x 128 or 256 x 256. A domain group (two layout n-tiles)
+# holds a cluster_n 2 GEMM1 cluster and a cluster_n 4 GEMM2 one at 256 x 256.
+W13_TILE, W13_GROUP = (256, 256), 2
+W2_TILE, W2_GROUP = (512, 128), 2
 
 
 def mode() -> int:
@@ -202,7 +258,7 @@ def mode() -> int:
     return int(m) if get_gfx() == "gfx1250" else 0
 
 
-def _register(weight, scale, experts_cnt, tile):
+def _register(weight, scale, experts_cnt, tile, group):
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("IOD placement must run before CUDA graph capture")
     E = int(experts_cnt or weight.shape[0])
@@ -211,8 +267,8 @@ def _register(weight, scale, experts_cnt, tile):
     if weight.data_ptr() in _PLACED:
         return True
     why = None
-    if not supported(N, K, *tile):
-        why = f"no placed layout for {tile[0]}x{tile[1]} tiles"
+    if not supported(N, K, *tile, group):
+        why = f"no placed layout for {tile[0]}x{tile[1]} tiles in groups of {group}"
     elif not (weight.is_contiguous() and scale.is_contiguous()):
         why = "weight or scale is not contiguous"
     else:
@@ -233,10 +289,11 @@ def _register(weight, scale, experts_cnt, tile):
         N,
         K,
         *tile,
+        group,
     )
     if table is None:
         return False
-    _PLACED[weight.data_ptr()] = (table, weight, scale, N, K, tile)
+    _PLACED[weight.data_ptr()] = (table, weight, scale, N, K, tile, group)
     return True
 
 
@@ -252,13 +309,13 @@ def place_w13(w13: torch.Tensor, w13_scale: torch.Tensor, experts_cnt=None) -> b
     aligned whole granule pairs, or the probe finds pages whose IOD home does
     not follow the address formula.
     """
-    return _register(w13, w13_scale, experts_cnt, W13_TILE)
+    return _register(w13, w13_scale, experts_cnt, W13_TILE, W13_GROUP)
 
 
 def place_w2(w2: torch.Tensor, w2_scale: torch.Tensor, experts_cnt=None) -> bool:
     """``place_w13`` for the shuffled GEMM2 weight, laid out for 512 x 128 tiles
     (served to 256 x 256 as well)."""
-    return _register(w2, w2_scale, experts_cnt, W2_TILE)
+    return _register(w2, w2_scale, experts_cnt, W2_TILE, W2_GROUP)
 
 
 def placed_tile(w):
@@ -281,15 +338,15 @@ def pin_tile(w, tile_n=None):
 
 
 def lookup(w, w_scales, N, K, tile_n, tile_k):
-    """(phase table, ``b_placed``) of ``w`` for a tile_n x tile_k GEMM, or
-    (None, 0) when ``w`` was not placed. Raises when ``w`` was placed but this
-    GEMM cannot read it."""
+    """(phase table, ``b_placed``, domain group) of ``w`` for a tile_n x tile_k
+    GEMM, or (None, 0, 0) when ``w`` was not placed. Raises when ``w`` was
+    placed but this GEMM cannot read it."""
     if not _PLACED:
-        return None, 0
+        return None, 0, 0
     hit = _PLACED.get(w.data_ptr())
     if hit is None:
-        return None, 0
-    table, _, scale, pn, pk, layout = hit
+        return None, 0, 0
+    table, _, scale, pn, pk, layout, group = hit
     r = placed_ratio(layout, tile_n, tile_k)
     if scale.data_ptr() != w_scales.data_ptr() or (pn, pk) != (N, K) or not r:
         raise ValueError(
@@ -297,4 +354,4 @@ def lookup(w, w_scales, N, K, tile_n, tile_k):
             f"K={pk} {layout[0]}x{layout[1]} tiles; a N={N} K={K} "
             f"{tile_n}x{tile_k} GEMM (or a different scale tensor) cannot read it"
         )
-    return table, r
+    return table, r, group
