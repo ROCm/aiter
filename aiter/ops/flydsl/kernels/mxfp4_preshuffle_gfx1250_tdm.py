@@ -18,12 +18,14 @@ from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 from .buffer_ops import buffer_store, create_buffer_resource_from_addr
 from .gemm_common_gfx1250 import (
+    INST_PREFETCH,
     batched_silu_swiglu,
     batched_situv2,
     fused_silu_swiglu_elem,
     fused_situv2_elem,
     make_lds_copy_ops,
     pipeline_fence,
+    prefetch_kernel_code,
     situv2_consts,
     workgroup_barrier,
 )
@@ -650,6 +652,7 @@ def build_gemm_a8w4_tdm_task(
         f"_et{int(tdm_early_timeout)}{_wmma_2x4}"
         f"{_prefence}_earlyacc"
         f"{_malign}{_kwaves}"
+        f"{'_ipf' if INST_PREFETCH else ''}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -681,6 +684,9 @@ def build_gemm_a8w4_tdm_task(
         task_id: task_index_type,
         schedule_rows: task_index_type,
     ):
+        # A persistent task runs inside a kernel that has already prefetched.
+        if const_expr(INST_PREFETCH and not persistent_workers):
+            prefetch_kernel_code(block // WAVE)
         A_KROW = K // A_PACK
         Kp16 = (K // 2) * 16
         # Scale dwords per 32-row B super-row: one per k128, padded K included.
@@ -3042,6 +3048,9 @@ def launch_gemm_a8w4_tdm(
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
     ):
+        if const_expr(INST_PREFETCH):
+            prefetch_kernel_code(block // 32)
+
         def run_task(task_id, rows):
             # i32_m remains the allocation capacity: the scale buffer's
             # descriptor must include the padding in its shuffled layout.
