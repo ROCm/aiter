@@ -95,11 +95,6 @@ def fused_qknorm_idxrqknorm(
     skip_index_branch: bool = False,
     qkv_partials: Tensor | None = None,
 ) -> None:
-    # qkv_partials: the FP32 [num_splits, >= num_tokens, row] split-K partials of a
-    #   qkv from gemm_a8w8_bpreshuffle_splitk_deferred (aiter.splitk_partials(qkv)).
-    #   The kernel reduces them exactly as gemm_a8w8_splitk_reduce does, writes the
-    #   reduced row back into qkv and goes on from it; bf16 insert mode with every
-    #   slot processed (no skip_index_branch) only.
     # The main K/V caches are always passed as separate kv_cache_k / kv_cache_v
     # tensors. asm_layout selects the in-cache addressing: page-16 SHUFFLE
     # (asm_layout=True) vs plain page-128 (asm_layout=False, where kv_cache_k /
@@ -111,8 +106,23 @@ def fused_qknorm_idxrqknorm(
     #   no k_scale/v_scale.
     # index_cache_dtype="mxfp4": index_cache is whole contiguous pages; only the index-K write
     #   changes.
+    # kv_cache_dtype="nvfp4" + index_cache_dtype="nvfp4" (together; an index-less layer, skip_index_branch,
+    #   passes index_cache_dtype "auto"): K, V and index-K are quantized to NVFP4 (e2m1 + one e4m3 scale per
+    #   16 elements) straight into the pages, in the same pass as norm/RoPE. kv_cache_k and kv_cache_v are the
+    #   same uint8 [num_pages, 2 * num_kv_heads * 9216] pages ([K data | K scale | V data | V scale]; K scale
+    #   in MFMA lane order, V data in 32-bit words (8 tokens x 4 bit), V scale [group][token]), block_size 128,
+    #   4 B aligned page stride; V is written by atomic and/or on 32-bit words, so no two tokens of one call
+    #   may share a slot;
+    #   index_cache is whole contiguous 9216 B pages ([128 x 64 B e2m1][128 x 8 B e4m3]); k_scale / v_scale are
+    #   the fp32 [1] global scales of K and V (the index key has none). The rounding is integer/compare
+    #   arithmetic, not a hardware convert, but nvfp4 (like mxfp4) is refused off gfx950.
     # q_out may be an e4m3 tensor (fp8 or uint8, insert mode): unit-scale e4m3 cast, saturating
     #   (+-inf too; NaN stays NaN), written instead of the bf16 q (as index_q_out).
+    # qkv_partials: the FP32 [num_splits (2, 4 or 8), >= num_tokens, row] split-K partials of
+    #   a bf16 qkv its GEMM left unreduced. The kernel sums them as the gfx1250 split-K
+    #   GEMM's reduce kernel does (FP32, split order, one round to nearest even), writes the
+    #   reduced row back into qkv and goes on from it; insert mode with every qkv slot
+    #   processed (no skip_index_branch), no fp4 cache or fp8 q_out.
     if index_cache_dtype is None:
         index_cache_dtype = (
             "fp8"
@@ -122,8 +132,9 @@ def fused_qknorm_idxrqknorm(
 
     # opus has no fp4 conversion off gfx950 and no fp8 conversion on gfx1100/gfx115x: the
     # stores would silently write zeros.
-    if "mxfp4" in (kv_cache_dtype, index_cache_dtype) and get_gfx_runtime() != "gfx950":
-        raise RuntimeError("fused_qknorm_idxrqknorm mxfp4 caches require gfx950")
+    fp4_dtypes = {"mxfp4", "nvfp4"} & {kv_cache_dtype, index_cache_dtype}
+    if fp4_dtypes and get_gfx_runtime() != "gfx950":
+        raise RuntimeError("fused_qknorm_idxrqknorm mxfp4/nvfp4 caches require gfx950")
     if (
         q_out is not None
         and q_out.dtype != qkv.dtype
@@ -142,11 +153,13 @@ def fused_qknorm_idxrqknorm(
     )
     use_static_kv_scale = use_fp8_kv_cache and kv_cache_dtype == "fp8_e4m3_static"
     if use_fp8_kv_cache:
-        if not skip_index_branch and index_slot_mapping is None:
+        # An index-less layer (num_index_heads 0) has no index operands.
+        index_branch = num_index_heads > 0 and not skip_index_branch
+        if index_branch and index_slot_mapping is None:
             index_slot_mapping = slot_mapping
         assert slot_mapping is not None
         assert kv_cache_v is not None
-        if not skip_index_branch:
+        if index_branch:
             assert index_q_norm_weight is not None
             assert index_k_norm_weight is not None
             assert index_cache is not None
