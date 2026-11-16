@@ -997,8 +997,7 @@ def _iter_csv_cases():
             continue
         # gfx942 a8w4 rows need their own weight relayout and the separated gate/up
         # layout, which this sweep does not prepare (it gives a8w4 the interleaved
-        # GUGU weights), and they run on MI325X only. test_flydsl_moe_a8w4_gfx942.py
-        # covers them.
+        # GUGU weights). test_flydsl_moe_a8w4_gfx942.py covers them.
         if "_g942" in kernel_name1:
             aiter.logger.info(
                 "skip row token=%s dim=(%s,%s): %s is covered by "

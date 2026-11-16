@@ -3415,8 +3415,9 @@ class FmoeTuner(TunerCommon):
             kernels_list_csv.format(quantDtype=quantDtype, extraInfo=extraInfo)
         )
         for blockM in blockMs:
-            # per_1x32 + fp4x2 is a8w4 (MX-FP8 act + MX-FP4 weight); no ASM kernel exists
-            # for this combo -- the pertokenFp8 CSV only covers per_Token quant.
+            # per_1x32 + fp4x2 is a8w4 (MX-FP8 act + MX-FP4 weight); the pertokenFp8 CSV
+            # only covers per_Token quant. The gfx942 1-stage asm kernel for it is not
+            # tuned here; its rows are hand-placed in the tuned CSV (_tag=asm_situv2).
             if (
                 use_g1u1
                 and q_dtype_w != torch.int4
@@ -5517,8 +5518,9 @@ class FmoeTuner(TunerCommon):
                 return True
 
             if _is_a8w4_g942(q_type, q_dtype_a, q_dtype_w):
-                # gfx942 a8w4 has FlyDSL `_g942` stage-1 kernels only (TUNE_ONLY=flydsl
-                # or empty); the other sources are gfx950-only.
+                # gfx942 a8w4 has FlyDSL `_g942` stage-1 kernels only; the other
+                # sources are gfx950-only. Needs TUNE_ONLY=flydsl: unset, it becomes
+                # "flydslv2" when v2 tasks exist and nothing is scheduled here.
                 if _want("flydsl"):
                     tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
                 continue
