@@ -2375,6 +2375,7 @@ DEFAULT_CASES = [
     ("fp8_kv_cache_pertoken_uint8", "bf16", 17, 16, 64, 4),
     ("asm_layout_fp8_pertoken", "bf16", 17, 16, 64, 4),
     ("asm_layout_fp8_pertoken", "fp16", 19, 16, 96, 4),
+    ("asm_layout_fp8_pertoken", "bf16", 13, 16, 96, 0),  # a dense layer: no index operands
     ("asm_layout_fp8_pertoken_uint8", "bf16", 17, 16, 64, 4),
 ]
 DEFAULT_CASES += [

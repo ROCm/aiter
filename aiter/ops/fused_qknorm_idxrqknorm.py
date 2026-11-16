@@ -10,6 +10,8 @@ from ..jit.utils.chip_info import get_gfx_runtime
 
 FUSED_QKNORM_IDXRQKNORM_SUPPORTS_PACKED_SHUFFLE = True
 FUSED_QKNORM_IDXRQKNORM_SUPPORTS_FP8_INDEX_Q = True
+# A layer without index heads (num_index_heads 0) can insert into an fp8 KV cache.
+FUSED_QKNORM_IDXRQKNORM_SUPPORTS_INDEXLESS_FP8 = True
 
 _FP8_E4M3_DTYPES = tuple(
     dt
@@ -146,11 +148,13 @@ def fused_qknorm_idxrqknorm(
     )
     use_static_kv_scale = use_fp8_kv_cache and kv_cache_dtype == "fp8_e4m3_static"
     if use_fp8_kv_cache:
-        if not skip_index_branch and index_slot_mapping is None:
+        # An index-less layer (num_index_heads 0) has no index operands.
+        index_branch = num_index_heads > 0 and not skip_index_branch
+        if index_branch and index_slot_mapping is None:
             index_slot_mapping = slot_mapping
         assert slot_mapping is not None
         assert kv_cache_v is not None
-        if not skip_index_branch:
+        if index_branch:
             assert index_q_norm_weight is not None
             assert index_k_norm_weight is not None
             assert index_cache is not None
