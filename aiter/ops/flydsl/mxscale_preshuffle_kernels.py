@@ -137,7 +137,7 @@ def flydsl_mxscale_preshuffle_gemm(
     A is [M, K]; N is taken from Out ([M, N]); K from A. Returns Out.
     """
     from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
-        A_BUFFER_LIMIT_BYTES,
+        _SPLITK_MAX_TMP_BYTES,
         SCALE_BLOCKS_A,
         SCALE_BLOCKS_B,
         SCALE_LAYOUTS,
@@ -155,12 +155,6 @@ def flydsl_mxscale_preshuffle_gemm(
     M = int(A.shape[0])
     K = int(A.shape[-1]) * (2 if a_dtype == "fp4" else 1)
     N = int(Out.shape[-1])
-    a_bytes = M * int(A.shape[-1]) * A.element_size()
-    if a_bytes >= A_BUFFER_LIMIT_BYTES:
-        raise ValueError(
-            f"A must be smaller than 4 GiB (the kernel addresses it with 32-bit "
-            f"offsets); got {a_bytes} bytes for M={M}, K={K}"
-        )
     if N % int(tile_n) != 0:
         raise ValueError(f"N ({N}) is not a multiple of tile_n ({tile_n})")
     if K % int(tile_k) != 0:
@@ -254,6 +248,13 @@ def flydsl_mxscale_preshuffle_gemm(
             raise ValueError(
                 f"illegal split_k={split_k} for K={K}, tile_k={tile_k}: "
                 f"K/split_k ({k_per_split}) must be a multiple of tile_k and 256"
+            )
+        # The split-K reduce reads the whole fp32 workspace through one
+        # 32-bit-offset buffer descriptor (fits_shape keeps tuned rows below it).
+        if split_k * M * N * 4 >= _SPLITK_MAX_TMP_BYTES:
+            raise ValueError(
+                f"split_k={split_k} needs a {split_k * M * N * 4}-byte fp32 "
+                f"workspace for M={M}, N={N}; it must be below 4 GiB"
             )
 
     # Constexpr tail of launch_gemm -- the same for the direct and the split-K launch
@@ -519,8 +520,8 @@ def run_gemm_a8w8_mxfp8_gfx950(
         if ki is None:
             raise NotImplementedError(
                 f"[FlyDSL gfx950 mxfp8] no kernel for M={M}, N={N}, K={K} with "
-                f"a {w_scale_block} w_scale (needs K%128==0, N a multiple of a "
-                f"tile_n and A smaller than 4 GiB)"
+                f"a {w_scale_block} w_scale (needs K%128==0 and N a multiple of a "
+                f"tile_n)"
             )
         kernel_name = ki.name
         if warn_untuned:
