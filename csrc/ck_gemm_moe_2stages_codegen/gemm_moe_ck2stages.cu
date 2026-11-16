@@ -4,6 +4,7 @@
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "gemm_moe_ck2stages_lookup.h"
+#include "gemm_moe_ck2stages_nkpad_lookup.h"
 #include "gemm_moe_ck2stages.h"
 #include "ck2stages_moe_stage1_heuristic_dispatch.hpp"
 #include "ck2stages_moe_stage2_heuristic_dispatch.hpp"
@@ -11,6 +12,8 @@
 #include "aiter_logger.h"
 #include <cmath>
 #include <limits>
+#include <unordered_map>
+#include <unordered_set>
 
 using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
 
@@ -65,6 +68,54 @@ MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::
     {
         return moe_stage2_heuristic_dispatch(block_m, inter_dim, x_dtype, w_dtype, y_dtype, 0, quant_type, mul_routed_weight, is_shuffled);
     }
+}
+
+struct MoeNKPadTwin
+{
+    int n_per_block;
+    int k_per_block;
+    MoeKernelSig *kernel;
+};
+
+// Replaces a Default kernel with its NKPadding twin when N or K is not a multiple of its block
+// tile. `padded` tells whether the returned kernel is an NKPadding one.
+static MoeKernel moe_nkpad_dispatch(const MoeKernel &kernel, int N, int K, bool &padded)
+{
+    static const std::unordered_map<MoeKernelSig *, MoeNKPadTwin> twins = GENERATE_NKPAD_LOOKUP_TABLE();
+    static const auto padded_kernels = []
+    {
+        std::unordered_set<MoeKernelSig *> kernels;
+        for (const auto &entry : twins)
+            kernels.insert(entry.second.kernel);
+        return kernels;
+    }();
+
+    padded = false;
+    auto fn = kernel.target<MoeKernelSig *>();
+    if (fn == nullptr)
+        return kernel;
+    if (padded_kernels.count(*fn))
+    {
+        padded = true;
+        return kernel;
+    }
+    auto it = twins.find(*fn);
+    if (it == twins.end() || (N % it->second.n_per_block == 0 && K % it->second.k_per_block == 0))
+        return kernel;
+    padded = true;
+    return it->second.kernel;
+}
+
+static int64_t nkpad_round_up(int64_t x, int64_t tile) { return (x + tile - 1) / tile * tile; }
+
+// NKPadding kernels address each expert's preshuffled B in whole tiles of 16 rows by 64 bytes, so
+// B must be zero-padded to exactly that and no further.
+static void check_nkpad_weight_cols(const torch::Tensor &w, int K, const char *name)
+{
+    const int64_t k_tile = 64 / w.element_size();
+    TORCH_CHECK(w.size(-1) == nkpad_round_up(K, k_tile),
+                name, " must have its K dimension zero-padded to ", nkpad_round_up(K, k_tile),
+                " (a multiple of ", k_tile, ") for K=", K, ", got ", w.size(-1));
 }
 
 void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
@@ -150,6 +201,15 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
     activation = map_activation_to_ck_stage1(activation);
 
     auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled, clamp_enabled);
+    bool padded = false;
+    kernel = moe_nkpad_dispatch(kernel, N, K, padded);
+    if (padded)
+    {
+        // The gate and up halves of w1 are padded to 16 rows each, which a stacked
+        // [e, 2 * n, k] tensor only matches when n itself is a multiple of 16.
+        TORCH_CHECK(N % 16 == 0, "ck_moe_stage1: inter_dim ", N, " must be a multiple of 16");
+        check_nkpad_weight_cols(w1, K, "w1");
+    }
 
     // Narrow a finite positive limit to float without it becoming 0 (disabled)
     // or inf (rejected by CK).
@@ -194,7 +254,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
     int tokens = inter_states.size(0);
     int sorted_size = std::min(int64_t(tokens * topk * block_m.value()), sorted_token_ids.size(0));
     int E = w1.size(0);
-    int N = w2.size(1);
+    int N = out.size(-1);
     int K = inter_states.size(-1);
     int MPerBlock = block_m.value();
 
@@ -222,6 +282,15 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
 
     // stage2 does not apply an activation.
     auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
+    bool padded = false;
+    kernel = moe_nkpad_dispatch(kernel, N, K, padded);
+    const int64_t w2_rows = padded ? nkpad_round_up(N, 16) : N;
+    TORCH_CHECK(w2.size(1) == w2_rows, "ck_moe_stage2: w2 has ", w2.size(1), " rows for ", N,
+                " output columns, expected ", w2_rows);
+    if (padded)
+    {
+        check_nkpad_weight_cols(w2, K, "w2");
+    }
 
     kernel(at::hip::getCurrentHIPStream(),
            tokens, sorted_size, N, K, topk,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
+import copy
 import itertools
 import os
 
@@ -24,8 +25,10 @@ const bool Nswizzle = {Nswizzle};
 const bool PerTensorQuant = {Quant} == static_cast<int>(QuantType::per_Tensor);
 const bool MulRoutedWeight = {MulRoutedWeight};
 const int ActOP = {ActOP};
-CK_MOE_STAGE{Stage}_GEMM_DEFINE({BlockSize}, {MPerBlock}, {NPerBlock}, {KPerBlock}, {MWaves}, {NWaves}, V{PipelineVer})
+CK_MOE_STAGE{Stage}_GEMM{NKPad}_DEFINE({BlockSize}, {MPerBlock}, {NPerBlock}, {KPerBlock}, {MWaves}, {NWaves}, V{PipelineVer})
 """
+
+KERNEL_TEMPLATE_ARGS = "{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V{PipelineVer}, {BlockSize}, {MPerBlock}, {NPerBlock}, {KPerBlock}, {MWaves}, {NWaves}, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}{RuntimeSwigluLimitArg}"
 
 
 LOOKUP_head = """#pragma once
@@ -38,12 +41,24 @@ LOOKUP_head = """#pragma once
 
 LOOKUP_template = """
        {{"{kernel_tag}",                                                                                                       \\
-        ck_moe_stage{Stage}_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V{PipelineVer}, {BlockSize}, {MPerBlock}, {NPerBlock}, {KPerBlock}, {MWaves}, {NWaves}, {Nswizzle}, {Quant} == static_cast<int>(QuantType::per_Tensor), {MulRoutedWeight}, {ActOP}{RuntimeSwigluLimitArg}>}},                       \\"""
+        ck_moe_stage{Stage}_gemm{NKPad}<{TemplateArgs}>}},                       \\"""
 
 LOOKUP_end = """
    }
 
 """
+
+NKPAD_LOOKUP_head = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "gemm_moe_ck2stages_lookup.h"
+
+#define GENERATE_NKPAD_LOOKUP_TABLE()                                                                                \\
+   {                                                                                                                 \\"""
+
+NKPAD_LOOKUP_template = """
+       {{&ck_moe_stage{Stage}_gemm<{TemplateArgs}>,                                                                    \\
+        {{{NPerBlock}, {KPerBlock}, &ck_moe_stage{Stage}_gemm_nkpad<{TemplateArgs}>}}}},                                \\"""
 
 
 gemm1_heuristic_dispatch_head = """#pragma once
@@ -842,6 +857,10 @@ def generate_instance_and_lookUpTable_head(working_path, runtime_swiglu_limit=Fa
         )
         f_lookup.write(LOOKUP_head)
 
+    f_nkpad_lookup = os.path.join(working_path, "gemm_moe_ck2stages_nkpad_lookup.h")
+    with open(f_nkpad_lookup, "w") as f_nkpad:
+        f_nkpad.write(NKPAD_LOOKUP_head)
+
     f_gemm1_heuristic_dispatch = os.path.join(
         working_path, "ck2stages_moe_stage1_heuristic_dispatch.hpp"
     )
@@ -863,6 +882,10 @@ def generate_instance_and_lookUpTable_end(working_path):
     f_lookUpTable = os.path.join(working_path, "gemm_moe_ck2stages_lookup.h")
     with open(f_lookUpTable, "a") as f_lookup:
         f_lookup.write(LOOKUP_end)
+
+    f_nkpad_lookup = os.path.join(working_path, "gemm_moe_ck2stages_nkpad_lookup.h")
+    with open(f_nkpad_lookup, "a") as f_nkpad:
+        f_nkpad.write(LOOKUP_end)
 
     f_gemm1_heuristic_dispatch = os.path.join(
         working_path, "ck2stages_moe_stage1_heuristic_dispatch.hpp"
@@ -970,10 +993,23 @@ class ck_moe_2stage_gemm_codegen:
             }
         else:
             gfx942_only = set()
+        if tag in ("a16w16", "a16w16_gfx950"):
+            nkpad_kernels = [copy.copy(k) for k in kernel_list]
+            for k in nkpad_kernels:
+                k.PadNK = True
+            gfx942_only |= {
+                twin.name
+                for twin, base in zip(nkpad_kernels, kernel_list)
+                if base.name in gfx942_only
+            }
+            kernel_list += nkpad_kernels
 
         f_lookUpTable = os.path.join(self.working_path, "gemm_moe_ck2stages_lookup.h")
+        f_nkpad_lookup = os.path.join(
+            self.working_path, "gemm_moe_ck2stages_nkpad_lookup.h"
+        )
 
-        with open(f_lookUpTable, "a") as f_lookup:
+        with open(f_lookUpTable, "a") as f_lookup, open(f_nkpad_lookup, "a") as f_nkpad:
             for kernel in kernel_list:
                 ## generate instance
                 os.makedirs(os.path.join(self.working_path, "instances"), exist_ok=True)
@@ -1022,6 +1058,7 @@ class ck_moe_2stage_gemm_codegen:
                             MulRoutedWeight=str(
                                 self.mul_routed_weight_stage == kernel.stage
                             ).lower(),
+                            NKPad="_NKPAD" if kernel.PadNK else "",
                         )
                         if "FP4" in self.b_dtype:
                             stage_instance = (
@@ -1034,13 +1071,12 @@ class ck_moe_2stage_gemm_codegen:
                         f_ins.write(stage_instance)
 
                 ## generate lookUpTable
-                lookup_ele = LOOKUP_template.format(
+                template_args = KERNEL_TEMPLATE_ARGS.format(
                     RuntimeSwigluLimitArg=(
                         ", AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT"
                         if kernel.stage == 1
                         else ""
                     ),
-                    kernel_tag=kernel.name,
                     A0DataType=self.a_dtype,
                     B0DataType=self.b_dtype,
                     AccDataType="F32" if self.a_dtype != "I8" else "I32",
@@ -1049,7 +1085,6 @@ class ck_moe_2stage_gemm_codegen:
                     Nswizzle=str(self.nswizzle).lower(),
                     Quant=self.quant_type,
                     ActOP=ACT_OP_MAP[self.activation] if kernel.stage == 1 else 0,
-                    Stage=kernel.stage,
                     BlockSize=kernel.BLOCK_SIZE,
                     MPerBlock=kernel.MPerBlock,
                     NPerBlock=kernel.NPerBlock,
@@ -1061,7 +1096,23 @@ class ck_moe_2stage_gemm_codegen:
                         self.mul_routed_weight_stage == kernel.stage
                     ).lower(),
                 )
-                f_lookup.write(lookup_ele)
+                f_lookup.write(
+                    LOOKUP_template.format(
+                        kernel_tag=kernel.name,
+                        Stage=kernel.stage,
+                        NKPad="_nkpad" if kernel.PadNK else "",
+                        TemplateArgs=template_args,
+                    )
+                )
+                if kernel.PadNK:
+                    f_nkpad.write(
+                        NKPAD_LOOKUP_template.format(
+                            Stage=kernel.stage,
+                            NPerBlock=kernel.NPerBlock,
+                            KPerBlock=kernel.KPerBlock,
+                            TemplateArgs=template_args,
+                        )
+                    )
 
         f_gemm1_heuristic_dispatch = os.path.join(
             self.working_path, "ck2stages_moe_stage1_heuristic_dispatch.hpp"
