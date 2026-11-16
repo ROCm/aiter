@@ -182,11 +182,17 @@ RUN_STRIDE = 32
 FLAG_STRIDE = 256
 FLAG_SPAN = WAVE * FLAG_STRIDE
 
-#: Compact layout (large_m): routes one tally CTA counts (its LDS route table),
-#: the most tally CTAs, the words between two segments' global counters, the
-#: send-table replicas, and the bits of a route slot's segment field.
+#: Compact layout (large_m): routes one tally CTA counts at most (its LDS route
+#: table), the most tally CTAs, the words between two segments' global
+#: counters, the send-table replicas, and the bits of a route slot's segment
+#: field.
 TALLY_MAXR = 2048
-TALLY_MAX = 64
+TALLY_MAX = 256
+#: Routes a tally CTA aims to count (AITER_LM_TALLY_CHUNK overrides): its loops
+#: wait out a global load per pass, so fewer routes per CTA end the tally
+#: sooner; more CTAs put more base atomics on a hot segment's line.
+#: V4.1-Flash DEP4: X1 goes out 5-6.5 us sooner than at 2048.
+TALLY_CHUNK = 128
 SEG_STRIDE = 32
 N_SREP = 16
 SEG_BITS = 10
@@ -433,8 +439,12 @@ def make_decode_mega(
         if npes * SEGS_PAD * 4 > dmk_src_off(EPR) or SEGS_PAD > (1 << SEG_BITS):
             raise ValueError("the X1 rows do not fit the control region")
         MAXR = int(max_tok_per_rank) * K
-        if MAXR > TALLY_MAX * TALLY_MAXR:
+        T_MAX = min(TALLY_MAX, G - 1)
+        if MAXR > T_MAX * TALLY_MAXR:
             raise ValueError("more routes per rank than the tally CTAs count")
+        T_CHUNK = int(os.environ.get("AITER_LM_TALLY_CHUNK", TALLY_CHUNK))
+        if not 1 <= T_CHUNK <= TALLY_MAXR:
+            raise ValueError(f"AITER_LM_TALLY_CHUNK must be in 1..{TALLY_MAXR}")
     TR_BASE = CTL_WORDS  # i64 stamps [G][TR_N] after the control words
     RT_BASE = TR_BASE + 2 * G * TR_N  # i64 [RT_N][4] per-route stamps
     CTL_ARENA_B = dmk_ctl_arena_bytes(npes=npes, experts_per_rank=EPR)
@@ -506,10 +516,17 @@ def make_decode_mega(
     # each SIMD, so ctas_per_cu CTAs need that many waves per EU, which caps
     # the VGPRs (large_m at 4 CTAs per CU: 128). AITER_DMK_WPE=0 drops the cap.
     WPE = int(os.environ.get("AITER_DMK_WPE", str(int(ctas_per_cu))))
+    # AITER_DMK_RED_UNROLL: (token, chunk) items a reduce wave loads at once.
+    # Its passes wait out their loads; large_m's waves own up to ~5 items each
+    # (V4.1-Flash DEP4, 2048 tokens/rank: the reduce 19 -> 14 us at 2).
+    RED_UN_DEF = 2 if COMPACT else 1
+    RED_UN = int(os.environ.get("AITER_DMK_RED_UNROLL", str(RED_UN_DEF)))
     knob_sfx = f"_wpe{WPE}" if WPE else ""
     knob_sfx += "".join(
         f"_{name}{val}"
         for name, val, default in (
+            ("tc", T_CHUNK if COMPACT else TALLY_CHUNK, TALLY_CHUNK),
+            ("ru", RED_UN, RED_UN_DEF),
             ("ps", POLL_SL, POLL_SLEEP),
             ("hs", int(HS and not COMPACT), 0),
             ("pt", PLAN_TAG, 1 if TM <= 16 else 0),
@@ -1032,11 +1049,9 @@ def make_decode_mega(
                 rsrc_route = create_buffer_resource_from_addr(
                     addr_route, num_records_bytes=4 * MAXR
                 )
-                T_ = (n_routes + fx.Int32(TALLY_MAXR - 1)) // fx.Int32(TALLY_MAXR)
+                T_ = (n_routes + fx.Int32(T_CHUNK - 1)) // fx.Int32(T_CHUNK)
                 T_ = fx.Int32((T_ < fx.Int32(1)).select(fx.Int32(1), T_))
-                T_ = fx.Int32(
-                    (T_ > fx.Int32(TALLY_MAX)).select(fx.Int32(TALLY_MAX), T_)
-                )
+                T_ = fx.Int32((T_ > fx.Int32(T_MAX)).select(fx.Int32(T_MAX), T_))
                 # ---- tally: CTAs 1..T_ count a chunk of routes each. LDS
                 # first, then one device atomic per (CTA, segment): the
                 # segment's global base for this chunk, so a hot segment (the
@@ -2049,50 +2064,68 @@ def make_decode_mega(
             stamp(6)
             rsrc_comb = create_buffer_resource_from_addr(peer_va(rank, off_comb_inp))
             rsrc_out = create_buffer_resource_from_addr(addr_out)
-            for w in range(wave_gid, tok * fx.Int32(RED_CH if PH & 8 else 0), G * 4):
-                t = w // fx.Int32(RED_CH)
-                ch = w - t * fx.Int32(RED_CH)
-                accs = [fx.full(8, 0.0, fx.Float32) for _ in range_constexpr(2)]
-                for k in range_constexpr(K):
-                    gid = fx.Int32(
-                        buffer_load(
-                            rsrc_ids,
-                            t * fx.Int32(K) + fx.Int32(k),
-                            vec_width=1,
-                            dtype=T.i32,
-                            is_scalar=True,
-                        )
-                    )
-                    valid = (gid >= fx.Int32(0)) & (gid < fx.Int32(E))
-                    slot_b = (t * fx.Int32(K) + fx.Int32(k)) * fx.Int32(
-                        comb_slot_stride
-                    )
-                    for j in range_constexpr(2):
-                        raw = buffer_load(
-                            rsrc_comb,
-                            (
-                                slot_b
-                                + ch * fx.Int32(RED_ELEMS * 2)
-                                + lane * fx.Int32(32)
+            n_red = tok * fx.Int32(RED_CH if PH & 8 else 0)
+            for w in range(wave_gid, n_red, G * 4 * RED_UN):
+                # Every item's loads first, then each item's sum in k order (the
+                # staged reduce's arithmetic). An item past the end reloads the
+                # first one and skips its store.
+                items = []
+                for u in range_constexpr(RED_UN):
+                    w_u = w + fx.Int32(u * G * 4)
+                    in_u = w_u < n_red
+                    w_u = fx.Int32(in_u.select(w_u, w))
+                    t = w_u // fx.Int32(RED_CH)
+                    ch = w_u - t * fx.Int32(RED_CH)
+                    vals = []
+                    for k in range_constexpr(K):
+                        gid = fx.Int32(
+                            buffer_load(
+                                rsrc_ids,
+                                t * fx.Int32(K) + fx.Int32(k),
+                                vec_width=1,
+                                dtype=T.i32,
+                                is_scalar=True,
                             )
-                            // fx.Int32(4)
-                            + fx.Int32(4 * j),
-                            vec_width=4,
-                            dtype=T.i32,
-                            cache_modifier=SCOPE_SYS,
                         )
-                        v = fx.Vector(raw).bitcast(fx.BFloat16).to(fx.Float32)
-                        v = valid.select(v, fx.full(8, 0.0, fx.Float32))
-                        accs[j] = accs[j] + v
-                o_dw = (
-                    t * fx.Int32(H) + ch * fx.Int32(RED_ELEMS) + lane * fx.Int32(16)
-                ) // fx.Int32(2)
-                for j in range_constexpr(2):
-                    buffer_store(
-                        accs[j].to(fx.BFloat16).bitcast(fx.Int32),
-                        rsrc_out,
-                        o_dw + fx.Int32(4 * j),
-                    )
+                        valid = (gid >= fx.Int32(0)) & (gid < fx.Int32(E))
+                        slot_b = (t * fx.Int32(K) + fx.Int32(k)) * fx.Int32(
+                            comb_slot_stride
+                        )
+                        for j in range_constexpr(2):
+                            raw = buffer_load(
+                                rsrc_comb,
+                                (
+                                    slot_b
+                                    + ch * fx.Int32(RED_ELEMS * 2)
+                                    + lane * fx.Int32(32)
+                                )
+                                // fx.Int32(4)
+                                + fx.Int32(4 * j),
+                                vec_width=4,
+                                dtype=T.i32,
+                                cache_modifier=SCOPE_SYS,
+                            )
+                            vals.append((valid, raw))
+                    items.append((t, ch, in_u, vals))
+                for u in range_constexpr(RED_UN):
+                    t, ch, in_u, vals = items[u]
+                    accs = [fx.full(8, 0.0, fx.Float32) for _ in range_constexpr(2)]
+                    for k in range_constexpr(K):
+                        for j in range_constexpr(2):
+                            valid, raw = vals[2 * k + j]
+                            v = fx.Vector(raw).bitcast(fx.BFloat16).to(fx.Float32)
+                            v = valid.select(v, fx.full(8, 0.0, fx.Float32))
+                            accs[j] = accs[j] + v
+                    o_dw = (
+                        t * fx.Int32(H) + ch * fx.Int32(RED_ELEMS) + lane * fx.Int32(16)
+                    ) // fx.Int32(2)
+                    if in_u:
+                        for j in range_constexpr(2):
+                            buffer_store(
+                                accs[j].to(fx.BFloat16).bitcast(fx.Int32),
+                                rsrc_out,
+                                o_dw + fx.Int32(4 * j),
+                            )
             stamp(7)
 
         kernel(
