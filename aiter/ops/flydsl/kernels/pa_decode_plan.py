@@ -12,11 +12,21 @@ import torch
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-from .tensor_shim import _run_compiled, ptr_arg, ptr_buf_tensor
+from .tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    _run_compiled,
+    ptr_arg,
+    ptr_buf_tensor,
+)
 
 DEFAULT_MAX_BATCH_SIZE = 4096
 # int32 slots per arrival counter: one 128-byte line per (sequence, KV head).
 ARRIVAL_COUNTER_STRIDE = 32
+# Largest gfx1250 workgroup cluster.
+CLUSTER_PARTITIONS = 16
+# Tokens per step of a step-split cluster CTA.
+CLUSTER_STEP_TOKENS = 128
 # Two warp scans and one reduction use at most 512 bytes at 1024 wave32 threads.
 _PLAN_SCAN_LDS_BYTES = 512
 
@@ -235,7 +245,31 @@ def compile_pa_decode_plan(max_batch, threads, windowed, balanced=False):
             lengths, work, reduce_info, batch, capacity, max_parts, window
         ).launch(grid=(1, 1, 1), block=(threads, 1, 1), stream=stream)
 
+    # All 40 argument bytes preload into user SGPRs, so the length loads need
+    # not wait for an argument load.
+    launch.compile_hints["llvm_options"] = {
+        "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+        "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    }
     return launch
+
+
+def _step_slots(properties, batch, num_kv_heads, query_length, sliding_window):
+    """Task slots per sequence that gfx1250 step-split cluster grids need.
+
+    Decode batches of at most one cluster of CLUSTER_PARTITIONS CTAs per CU
+    split each sequence into that many step-sized parts, whatever the plan's
+    partition cap, and keep one partial per part.
+    """
+    if (
+        properties.gcnArchName.split(":")[0] == "gfx1250"
+        and query_length == 1
+        and sliding_window == 0
+        and batch * num_kv_heads * CLUSTER_PARTITIONS
+        <= properties.multi_processor_count
+    ):
+        return CLUSTER_PARTITIONS
+    return 1
 
 
 @dataclass(frozen=True)
@@ -283,8 +317,12 @@ class PADecodePlan:
             raise ValueError("reduce_info must have shape [batch_size, 2]")
         if self.work_info.ndim != 2 or self.work_info.shape[1] != 4:
             raise ValueError("work_info must have shape [capacity, 4]")
-        if not batch_size <= self.capacity <= batch_size * self.max_partitions:
-            raise ValueError("plan capacity must be in [batch, batch * max_partitions]")
+        slots = max(self.max_partitions, CLUSTER_PARTITIONS)
+        if not batch_size <= self.capacity <= batch_size * slots:
+            raise ValueError(
+                "plan capacity must be in [batch, batch * max(max_partitions, "
+                f"{CLUSTER_PARTITIONS})]"
+            )
         metadata = [self.work_info, self.reduce_info]
         if self.arrival_counters is not None:
             counter_shape = (batch_size, num_kv_heads, ARRIVAL_COUNTER_STRIDE)
@@ -326,7 +364,10 @@ def plan_pa_decode(
     then end close together when lengths differ.
 
     ``max_partitions`` is in [1, device CU count], defaulting to CU count;
-    omitting it on refresh preserves the existing limit.
+    omitting it on refresh preserves the existing limit. gfx1250 decode plans
+    (query length 1, no window) for at most CU count / 16 sequences per KV head
+    hold at least 16 slots per sequence, for clusters that split each sequence
+    into 16 parts whatever the cap.
     ``max_batch_size`` defaults to 4096 for a new plan and is retained on refresh.
     Kernels use batch buckets with upper bounds 1, 2, 4, ... clipped to the
     device's LDS capacity, independent of ``max_batch_size``. Each bucket
@@ -399,7 +440,13 @@ def plan_pa_decode(
         if workgroup_budget < 1:
             raise ValueError("workgroup_budget must be positive")
         capacity = min(
-            batch * max_partitions,
+            batch
+            * max(
+                max_partitions,
+                _step_slots(
+                    properties, batch, num_kv_heads, query_length, sliding_window
+                ),
+            ),
             max(batch, (workgroup_budget + num_kv_heads - 1) // num_kv_heads),
         )
         plan = PADecodePlan(
