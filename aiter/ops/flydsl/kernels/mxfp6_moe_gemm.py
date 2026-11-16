@@ -27,7 +27,7 @@ import torch
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, Float6E2M3FN, Float6E3M2FN, Float8E4M3FN
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, buf_copy_store, ptr_arg, ptr_buf_tensor
 from aiter.ops.flydsl.kernels.act import silu_mul_batch
@@ -36,6 +36,7 @@ from aiter.ops.flydsl.kernels.mxfp4_gemm_common import _lds_ptr3
 from .mxfp6_moe_aux import mx_quant_store
 
 FMT_CODE = {"e4m3": 0, "e5m2": 1, "e2m3": 2, "e3m2": 3, "e2m1": 4}
+FMT_ELEM = {"e4m3": Float8E4M3FN, "e2m3": Float6E2M3FN, "e3m2": Float6E3M2FN}
 BITS = {"e4m3": 8, "e2m3": 6, "e3m2": 6}
 
 
@@ -95,7 +96,6 @@ def compile_gg6e(N: int, K: int, a_fmt: str, b_fmt: str, epi: str, gather: bool,
     # swiglu_q: h is quantized in the epilogue to MX a_fmt (stage-2 "A" layout, see aiter.ops.flydsl.mxfp6_moe_quant)
     q_row_bytes = n_out * abits // 8
     KQ2 = (n_out // 128 + 3) // 4
-    cbsz, blgp = FMT_CODE[a_fmt], FMT_CODE[b_fmt]
     BF = BN_ // 16
     A_BYTES, B_BYTES = BM_ * RB, BF * b_frag_bytes
     IA, IB = A_BYTES // 1024, B_BYTES // 1024  # DMA instructions per step (block)
@@ -208,10 +208,12 @@ def compile_gg6e(N: int, K: int, a_fmt: str, b_fmt: str, epi: str, gather: bool,
                         bs_rsrc, _lds_ptr3(lds_i32, dst), _v(SBP), _v(sb_src[t] + q_clamped * fx.Int32(256)), _v(0), _v(0))
 
             # Raw rocdl.raw_ptr_buffer_load_async_lds: every lane DMAs a 16-B piece from its own gathered
-            # voffset into a wave-uniform LDS base (M0); the async form keeps LLVM from inserting
-            # vmcnt(0) before the ds_reads of the current stage (the synchronous buffer->LDS copy did,
-            # which serialized the 3-stage pipeline: 1463 -> 1849 TF/s on MI355X when switched).
-            # TODO: evaluate fx.rocdl.BufferLoadAsyncLDS128b copy atoms with a gathered source layout.
+            # voffset into a wave-uniform LDS base (M0), tracked by asyncmark / wait_asyncmark (the
+            # synchronous buffer->LDS form made LLVM wait vmcnt(0) before every ds_read: 1463 -> 1849 TF/s
+            # when switched). fx.rocdl.cdna4.BufferLoadAsyncLDS128b / 32b copy atoms (fx.copy_atom_call on a
+            # buffer-tensor view) were measured on MI355X, FlyDSL 0.5.0: same results, but the K loop grew
+            # from ~2.8k to ~5.1k instructions, the kernel spilled 12 VGPRs (scratch reloads in the K loop
+            # wait on vmcnt and drain the DMAs) and perf_s / perf_m lost 8-12% (perf_m 32k 12.74 -> 14.27 ms).
             def dma(s_clamped, buf_off):
                 for t in range_constexpr(IAW):
                     dst = buf_off + (wave + fx.Int32(t * NW)) * fx.Int32(1024)
@@ -225,6 +227,15 @@ def compile_gg6e(N: int, K: int, a_fmt: str, b_fmt: str, epi: str, gather: bool,
             def l_frag(off_q, q):
                 vals = [fx.ptr_load(fx.add_offset(lds64, off_q + fx.Int32(qq))) for qq in range_constexpr(q)]
                 return fx.Vector.from_elements(vals, fx.Int64).bitcast(fx.Int32)
+
+            # scaled 16x16x128 MFMA atoms, one per E8M0 scale-byte select (the K step within a scale quad)
+            mma_atoms = [fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(
+                16, 16, 128, FMT_ELEM[a_fmt], FMT_ELEM[b_fmt], opsel_a=jj, opsel_b=jj)) for jj in range(4)]
+
+            def _frag(vec_i32, nw):
+                f = fx.make_rmem_tensor(fx.make_layout(nw, 1), fx.Int32)
+                f.store(vec_i32)
+                return f
 
             # per-fragment LDS offsets as one base + compile-time constants (fold into ds_read immediates)
             a_lds0 = ((wm * fx.Int32(16 * FM) + r) * fx.Int32(RB) + g * fx.Int32(UA)) // fx.Int32(8)
@@ -286,9 +297,9 @@ def compile_gg6e(N: int, K: int, a_fmt: str, b_fmt: str, epi: str, gather: bool,
                     sc = load_scales(s // fx.Int32(4))
                 a_sc, b_sc = sc
                 cur = stage_off(s) // fx.Int32(8)
-                bv = [l_frag(cur + b_lds[ni], 3) for ni in range_constexpr(FN)]
+                bv = [_frag(l_frag(cur + b_lds[ni], 3), 6) for ni in range_constexpr(FN)]
                 out = list(accs)
-                av_next = l_frag(cur + a_lds[0], UA // 8)
+                av_next = _frag(l_frag(cur + a_lds[0], UA // 8), abits)
                 nth = len(thunks)
                 for mi in range_constexpr(FM):
                     av = av_next
@@ -297,14 +308,12 @@ def compile_gg6e(N: int, K: int, a_fmt: str, b_fmt: str, epi: str, gather: bool,
                         for th in thunks[mi * nth // FM:(mi + 1) * nth // FM]:
                             th()
                     if const_expr(mi + 1 < FM):
-                        av_next = l_frag(cur + a_lds[mi + 1], UA // 8)
+                        av_next = _frag(l_frag(cur + a_lds[mi + 1], UA // 8), abits)
                     for ni in range_constexpr(FN):
-                        # Raw scaled MFMA: the A and B formats (cbsz / blgp: FP6 E2M3 / E3M2, FP8 E4M3) and the
-                        # E8M0 scale-byte select j vary per call site; operands are raw 6/8-dword vectors read
-                        # from LDS. TODO: switch to fx.rocdl.cdna4.MFMA_Scale atoms (one per opsel pair).
-                        out[mi * FN + ni] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                            T.vec(4, T.f32),
-                            [av, bv[ni], accs[mi * FN + ni], cbsz, blgp, j, a_sc[mi], j, b_sc[ni]])
+                        cf = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+                        cf.store(accs[mi * FN + ni])
+                        fx.gemm(mma_atoms[j], cf, av, bv[ni], cf, scale_a=a_sc[mi], scale_b=b_sc[ni])
+                        out[mi * FN + ni] = cf.load()
                 if const_expr(IL):
                     rocdl.sched_barrier(0)
                     rocdl.asyncmark()
