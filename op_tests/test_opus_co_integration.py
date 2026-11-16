@@ -69,7 +69,7 @@ def _co_test_profile_dirs(root: Path) -> list[tuple[Path, str]]:
         return [(root, "")]
     return [
         (root / name, name)
-        for name in (GFX1250, f"{GFX1250}-a0")
+        for name in (GFX1250, f"{GFX1250}-strict")
         if (root / name / "build_info.json").is_file()
     ]
 
@@ -158,7 +158,7 @@ def _run_gfx1250_co_override_case(available_kid: int, missing_kid: int) -> None:
     missing_instance = gfx1250_4wave_co_kernels_list[missing_kid]
     missing_images = [
         override_root / directory / f"{missing_instance.name}.co"
-        for directory in (GFX1250, f"{GFX1250}-a0", "")
+        for directory in (GFX1250, f"{GFX1250}-strict", "")
     ]
     try:
         _run_gfx1250_co_case(missing_kid)
@@ -527,7 +527,7 @@ def test_gfx1250_tuner_selects_co_without_split_k(monkeypatch):
 
     instance = gfx1250_4wave_co_kernels_list[min(GFX1250_4WAVE_CO_KIDS)]
     assert candidate_splitK(64, 128, 4096, 1, 256, instance) == [0]
-    assert not kid_rejects_shape(instance, 65, 129, 4097)
+    assert not kid_rejects_shape(instance, 65, 129, 4097, 256)
 
 
 if __name__ == "__main__":

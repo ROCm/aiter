@@ -13,7 +13,7 @@ from aiter.ops import topk as T
 from aiter.ops import topk_select as S
 from aiter.ops.flydsl.topk.topk_per_row import _FLYDSL_TOPK_ONE_BLOCK_ARCHES
 from aiter.ops.topk import _FLYDSL_TOPK_DECODE_GATES
-from aiter.test_common import benchmark, perftest
+from aiter.test_common import benchmark, perftest, run_perftest
 
 
 def create_random_logits(
@@ -514,6 +514,98 @@ def _decode_reference(logits, row_ends, top_k):
     return ref.masked_fill(~mask, -1)
 
 
+def _ordered_keys(x):
+    """The kernel's ranking: ascending key is descending value, -0.0 below +0.0."""
+    bits = x.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    return torch.where(bits >> 31 == 1, bits, bits ^ 0x7FFFFFFF)
+
+
+@benchmark()
+def test_flydsl_one_block_rows(mode, num_rows, width, top_k, stable, data, lens):
+    """One-block radix top-k, values written, against an exact reference.
+
+    Stable rows must return the reference columns index for index; unstable
+    rows the same key multiset, each in-row column once. lens "causal" mixes
+    rows the gfx1250 row cache takes, rows it does not, and rows longer than it.
+    """
+    torch.set_default_device("cuda:0")
+    gen = torch.Generator(device="cuda").manual_seed(top_k + num_rows)
+    logits = {
+        "randn": lambda: torch.randn(num_rows, width, generator=gen),
+        # 64 distinct values overflow a sampled bound's candidate buffer, so
+        # those rows take the two-pass fallback.
+        "ties": lambda: torch.randint(0, 64, (num_rows, width), generator=gen).float(),
+        "const": lambda: torch.full((num_rows, width), 1.5),
+    }[data]()
+    row_lens = torch.full((num_rows,), width, dtype=torch.int32)
+    if lens == "causal":
+        row_lens = torch.linspace(1, width, num_rows).round().to(torch.int32)
+    indices = torch.empty((num_rows, top_k), dtype=torch.int32)
+    values = torch.empty((num_rows, top_k))
+    if mode == "prefill":
+        starts = torch.zeros(num_rows, dtype=torch.int32)
+        args = (logits, starts, row_lens, indices, values, num_rows, width, 1)
+        run = lambda: aiter.flydsl_radix_topk_one_block_prefill(*args, top_k, stable)
+    else:
+        args = (logits, 1, row_lens, indices, num_rows, width, 1, top_k, stable)
+        run = lambda: aiter.flydsl_radix_topk_one_block_decode(*args, values)
+    _, us = run_perftest(run, num_iters=5, num_warmup=1)
+
+    # Columns past a row's end rank last; slots past min(k, len) are not compared.
+    past = torch.arange(width)[None] >= row_lens[:, None]
+    keys = _ordered_keys(logits).masked_fill(past, 1 << 32)
+    ref = torch.sort(keys, dim=1, stable=True)[1][:, :top_k]
+    valid = torch.arange(top_k)[None] < row_lens.clamp(max=top_k)[:, None]
+    got = indices.long()
+    safe = got.clamp(0, width - 1)
+    if stable:
+        ref = torch.sort(ref.masked_fill(~valid, width), dim=1)[0]
+        ok = torch.equal(got[valid], ref[valid])
+    else:
+        in_row = (got >= 0) & (got < row_lens[:, None])
+        cols = torch.sort(got.masked_fill(~valid, -1), dim=1)[0]
+        dup = (cols[:, 1:] == cols[:, :-1]) & (cols[:, 1:] >= 0)
+        key_sets = [
+            torch.sort(keys.gather(1, c).masked_fill(~valid, 1 << 32), dim=1)[0]
+            for c in (safe, ref)
+        ]
+        ok = bool((in_row | ~valid).all() and not dup.any())
+        ok = ok and torch.equal(*key_sets)
+    ok = ok and torch.equal(values[valid], logits.gather(1, safe)[valid])
+    return {"us": us, "all_close": ok}
+
+
+def test_flydsl_one_block_long_rows():
+    """Sampled-bound selection, its fallback, and blocks that walk several rows."""
+    if get_gfx_runtime() not in _FLYDSL_TOPK_ONE_BLOCK_ARCHES:
+        print("[flydsl_one_block_long_rows] one-block kernel not served here; skip")
+        return
+    # 768 and 1024 rows exceed a 256-CU part, so blocks walk rows; stable
+    # k = 4096 at 300 decode rows takes 512-thread blocks without the row cache,
+    # and decode rows of 6144 at k = 2048, too short to sample, without the bound.
+    cases = [
+        ("decode", 768, 32768, 512, "randn", "full"),
+        ("decode", 768, 16384, 512, "ties", "full"),
+        ("decode", 768, 32768, 2048, "randn", "full"),
+        ("decode", 768, 6144, 2048, "randn", "full"),
+        ("decode", 300, 20000, 4096, "randn", "full"),
+        ("prefill", 1024, 40000, 512, "randn", "causal"),
+        ("prefill", 300, 9000, 2048, "randn", "causal"),
+        ("prefill", 512, 8192, 512, "const", "full"),
+    ]
+    df = pd.DataFrame(
+        [
+            test_flydsl_one_block_rows(mode, rows, width, k, stable, data, lens)
+            for mode, rows, width, k, data, lens in cases
+            for stable in (False, True)
+        ]
+    )
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("flydsl one-block long rows summary (markdown):\n%s", df_md)
+    assert df["all_close"].all(), f"flydsl one-block long rows mismatch:\n{df_md}"
+    print("[flydsl_one_block_long_rows] PASS")
+
+
 def test_flydsl_decode_split_reuse():
     """Long rows split across CTAs and merge in the same launch.
 
@@ -648,6 +740,41 @@ def test_flydsl_decode_split_reuse():
         for indices in calls:
             check(logits, indices, False, "concurrent streams")
     print("[flydsl_decode_split_reuse] PASS: eager, graph replay and streams")
+
+
+def test_flydsl_decode_gates():
+    """Each FlyDSL decode gate of this arch routes there and matches torch.topk.
+
+    Walks the gate table itself, at each gate's smallest width and its row
+    limit, so narrowing the sweep shapes cannot leave a gate untested.
+    """
+    arch = get_gfx()
+    if arch not in _FLYDSL_TOPK_DECODE_GATES or T._FLYDSL_TOPK_DECODE_DISABLED:
+        print("[flydsl_decode_gates] FlyDSL decode not served here; skipping")
+        return
+    torch.set_default_device("cuda:0")
+    for stable, gates in _FLYDSL_TOPK_DECODE_GATES[arch].items():
+        for min_width, max_width, num_rows in gates:
+            for k in T._FLYDSL_TOPK_DECODE_KS:
+                # At least 2k wide, so each row selects rather than copies.
+                width = max(min_width, 2 * k)
+                if max_width is not None and width > max_width:
+                    continue
+                seq_lens = torch.full((num_rows,), width, dtype=torch.int32)
+                row_starts = torch.zeros(num_rows, dtype=torch.int32)
+                logits = create_random_logits(row_starts, seq_lens, torch.float32, k)
+                indices = torch.empty((num_rows, k), dtype=torch.int32)
+                args = (logits, 1, seq_lens, indices, num_rows, width, 1)
+                what = f"stable={stable} width={width} rows={num_rows} k={k}"
+                assert T._should_use_flydsl_topk_decode(
+                    *args, k, stable
+                ), f"not routed to FlyDSL decode: {what}"
+                aiter.top_k_per_row_decode(*args, k=k, stable=stable)
+                ref = _decode_reference(logits, seq_lens, k)
+                assert compare_topk_results(
+                    logits, indices, ref, row_starts, seq_lens, k, stable=stable
+                ), f"flydsl decode gate mismatch: {what}"
+    print("[flydsl_decode_gates] PASS: every gate routes and matches torch.topk")
 
 
 def test_mb_workspace_reuse():
@@ -1002,7 +1129,7 @@ parser.add_argument(
     "-c",
     "--context_len",
     type=int,
-    default=[8, 128, 1024, 3072, 4096, 8192, 16384, 32768, 65536, 90000, 128000],
+    default=[8, 4096, 32768, 90000],
     nargs="+",
     help="""number of kv.
     e.g.: -c 64""",
@@ -1012,7 +1139,7 @@ parser.add_argument(
     "-k",
     "--top_k",
     type=int,
-    default=[512, 1024, 2048],
+    default=[512, 2048],
     nargs="+",
     help="""top-k elements per row. The radix backend supports any positive
     int; the `_fast` ASM-kernel path only supports 2048 and is skipped
@@ -1045,7 +1172,7 @@ parser.add_argument(
     "-b",
     "--decode_batch_size",
     type=int,
-    default=[4, 8, 16, 24],
+    default=[4],
     nargs="+",
     help="""decode_batch_size batch size.
     e.g.: -b 4""",
@@ -1055,7 +1182,7 @@ parser.add_argument(
     "-n",
     "--next_n",
     type=int,
-    default=[1, 2, 3, 4],
+    default=[1, 4],
     nargs="+",
     help="""next_n elements per sequence in a row.
     e.g.: -n 4""",
@@ -1072,9 +1199,25 @@ parser.add_argument(
     e.g.: -d random""",
 )
 
+# CI runs `python3 <file>` with no arguments, so the defaults above stay small.
+_FULL_MATRIX = {
+    "context_len": [8, 128, 1024, 3072, 4096, 8192, 16384, 32768, 65536, 90000, 128000],
+    "top_k": [512, 1024, 2048],
+    "decode_batch_size": [4, 8, 16, 24],
+    "next_n": [1, 2, 3, 4],
+}
+
+parser.add_argument(
+    "--full",
+    action="store_true",
+    help="""run the full benchmark matrix; overrides -c, -k, -b and -n.""",
+)
+
 _REGRESSIONS = {
     "mb-workspace-reuse": test_mb_workspace_reuse,
     "flydsl-decode-split-reuse": test_flydsl_decode_split_reuse,
+    "flydsl-decode-gates": test_flydsl_decode_gates,
+    "flydsl-one-block-long-rows": test_flydsl_one_block_long_rows,
     "sampled-routing": test_prefill_sampled_routing,
     "sampled-layout": test_sampled_layout_contract,
     "sampled-nan": test_sampled_nan_order,
@@ -1092,6 +1235,8 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+if args.full:
+    vars(args).update(_FULL_MATRIX)
 
 # Regressions run in CI via `python3 <file>`.
 for name in args.regressions:
