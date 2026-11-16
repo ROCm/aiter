@@ -96,6 +96,24 @@ def test_pa_decode_plan(
         ]
         total_tiles = max(sum(last - first for first, last in ranges), 1)
         remaining = plan.capacity - sum(last > first for first, last in ranges)
+        # gfx942/gfx950 single-block plans bound every task by the smallest
+        # tile count T whose tasks fit the capacity; others split
+        # proportionally.
+        args = calls[-1][0]
+        balanced = len(args) > 3 and args[3] and args[0] <= args[1]
+        if balanced:
+
+            def tasks(tiles, bound):
+                return min(-(-tiles // bound), plan.max_partitions) if tiles else 0
+
+            # The smallest feasible bound from ceil(total / capacity) up;
+            # ceil(total / (capacity - rows)) always fits.
+            low = max(-(-total_tiles // plan.capacity), 1)
+            bound = max(-(-total_tiles // max(remaining, 1)), low)
+            while low < bound:
+                mid = (low + bound) // 2
+                need = sum(tasks(last - first, mid) for first, last in ranges)
+                low, bound = (low, mid) if need <= plan.capacity else (mid + 1, bound)
         cursor = prefix_tiles = 0
         for seq, (ctx, (start, count), (first, last)) in enumerate(
             zip(lengths, info, ranges)
@@ -104,9 +122,12 @@ def test_pa_decode_plan(
             tiles = last - first
             # Verify that the runtime capacity supplies the task budget used
             # to distribute slots by cumulative visible tile count.
-            extra = (prefix_tiles + tiles) * remaining // total_tiles
-            extra -= prefix_tiles * remaining // total_tiles
-            assert count == min(int(tiles > 0) + extra, tiles, plan.max_partitions)
+            if balanced:
+                assert count == tasks(tiles, bound)
+            else:
+                extra = (prefix_tiles + tiles) * remaining // total_tiles
+                extra -= prefix_tiles * remaining // total_tiles
+                assert count == min(int(tiles > 0) + extra, tiles, plan.max_partitions)
             tile = first
             for record in work[start : start + count]:
                 row, begin, end, original_length = record
@@ -215,10 +236,14 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
     Register-only CTAs (24 and 32 partition bounds) and the register branch of
     dual-mode CTAs reduce the same packed partials with one group and with
     split groups; sequences above 32 partitions take the LDS branch and match
-    a float64 reference. Slots past the live tasks hold NaN.
+    a float64 reference. Slots past the live tasks hold NaN. gfx950 splits only
+    dual-mode CTAs (bounds above 64), and its single 32-partition dual rung
+    must match the register-only ladder bit for bit.
     """
-    if get_gfx_runtime() != "gfx1250":
-        pytest.skip("gfx1250 splits register rungs across partition groups")
+    arch = get_gfx_runtime()
+    if arch not in ("gfx950", "gfx1250"):
+        pytest.skip("partition groups split rungs on gfx950 and gfx1250")
+    wave = 32 if arch == "gfx1250" else 64
     import flydsl.compiler as flyc
     import flydsl.expr as fx
 
@@ -259,7 +284,7 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
     def run(partitions, groups):
         pairs = pairs_for(partitions)
         compiled = compile_pa_decode_ps_reduce(
-            architecture="gfx1250",
+            architecture=arch,
             max_context_partition_num=partitions,
             head_size=head_size,
             output_dtype_str=get_dtype_str(dtype),
@@ -317,8 +342,25 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
         reference[seq] = (
             (weights[..., None] * logits[:, f : f + c].double()).sum(1).float()
         )
+
+    def fits(partitions, split):
+        # A CTA holds at most 1024 threads.
+        waves = head_size // (2 if pairs_for(partitions) else 1) // wave
+        return split * waves <= 1024 // wave
+
+    if arch == "gfx950":
+        # Up to 32 live partitions, the dual CTA's single 32-wide rung adds the
+        # same products in the same order as the register-only ladder.
+        ladder = run(32, 1)
+        small = [seq for seq, c in enumerate(counts) if c <= 32]
+        for split in (1, 4):
+            if fits(256, split):
+                rung = run(256, split)
+                assert torch.equal(
+                    ladder[small].view(torch.int16), rung[small].view(torch.int16)
+                ), f"gfx950 dual rung split={split} differs from the ladder"
     for partitions, split in ((32, 4), (24, 4), (32, 2), (64, 16), (256, 4), (256, 16)):
-        if split * head_size // (2 if pairs_for(partitions) else 1) // 32 > 32:
+        if not fits(partitions, split) or (arch == "gfx950" and partitions <= 64):
             continue
         single, grouped = run(partitions, 1), run(partitions, split)
         register = [seq for seq, c in enumerate(counts) if c <= min(partitions, 32)]
@@ -582,9 +624,13 @@ def test_pa_decode_merge_alignment(
         assert torch.count_nonzero(plan.arrival_counters) == 0
     last_arriver = mode == "last" and scratch_offset == 0
     assert compile_kwargs[-1]["direct_output"] == last_arriver
+    # A one-row D128 decode splits its row into 16 step-sized parts; the
+    # one-slot budget of the last-arriver plans leaves no room for them.
+    steps = mode == "cluster" and dim == 128
     assert compile_kwargs[-1]["cluster_merge"] == (
-        0 if last_arriver or mode == "reducer" else 4
+        0 if last_arriver or mode == "reducer" else 16 if steps else 4
     )
+    assert compile_kwargs[-1]["cluster_steps"] == steps
 
 
 @pytest.mark.parametrize("architecture", ["gfx942", "gfx950"])
@@ -932,10 +978,80 @@ _COMMON_CASES = [
         {
             "group_size": 16,
             "block_size": 16,
-            "lengths": (2048,) * 6 + (0, 1, 257, 2047),
+            "lengths": ((2048,) * 6 + (0, 1, 257, 2047)) * 2,
             "max_partitions": 8,
             "capture": True,
             "cluster": 8,
+            "cluster_steps": True,
+        },
+    ),
+    # Batches within one 16-CTA cluster per CU split each row into 16
+    # step-sized parts whatever the cap; short rows leave parts idle.
+    (
+        "cluster16-steps",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (2048,) * 6 + (0, 1, 129, 257, 2047),
+            "max_partitions": 8,
+            "capture": True,
+            "cluster": 16,
+            "cluster_steps": True,
+        },
+    ),
+    # Two KV heads split each row's steps per head and keep their partials
+    # apart.
+    (
+        "cluster16-steps-kv2",
+        {
+            "kv_heads": 2,
+            "group_size": 8,
+            "block_size": 16,
+            "lengths": (2048, 0, 129, 1000, 2047),
+            "max_partitions": 8,
+            "capture": True,
+            "cluster": 16,
+            "cluster_steps": True,
+        },
+    ),
+    # Block tables of more than 16 steps keep plan-derived tasks.
+    (
+        "cluster4-wide-table",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (1000, 0, 777, 1),
+            "table_width": 129,
+            "max_partitions": 8,
+            "cluster": 4,
+            "cluster_steps": False,
+        },
+    ),
+    # Two query tiles take 64-token steps, so these clusters keep
+    # plan-derived tasks rather than 16 step-sized parts.
+    (
+        "cluster2-gqa32",
+        {
+            "group_size": 32,
+            "block_size": 16,
+            "lengths": (512, 0, 1, 300),
+            "max_partitions": 2,
+            "cluster": 2,
+            "cluster_steps": False,
+        },
+    ),
+    # A budget beyond two CTAs per CU grows the grid past the 128-token step
+    # bounds (two CTAs per CU for BF16, four for FP8): plan-derived tasks.
+    (
+        "cluster8-wide-grid",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": ((2048,) * 4 + (0, 1, 129, 1000)) * 20,
+            "max_partitions": 8,
+            "budget": 2048,
+            "cluster": 8,
+            "cluster_steps": False,
         },
     ),
     (
@@ -948,8 +1064,50 @@ _COMMON_CASES = [
             "sink_dtype": torch.float32,
         },
     ),
+    # More than 240 split sequences share two-sequence clusters on gfx1250;
+    # an odd batch pads the last cluster, and empty rows still meet the barrier.
+    (
+        "cluster2-shared",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (512, 0, 300) * 81,
+            "max_partitions": 2,
+            "capture": True,
+            "cluster": 2,
+            "cluster_seqs": 2,
+            "cluster_steps": True,
+        },
+    ),
 ]
 _FP8_CASES = _COMMON_CASES + [
+    # Page128 clusters under a length bound give each CTA a fixed run of
+    # tiles: bound rows split evenly, shorter rows leave CTAs idle, and rows
+    # within one tile store directly. A nine-tile bound takes nine CTAs.
+    (
+        "cluster16-runs-page128",
+        {
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (8192, 0, 1, 129, 1000, 4097, 7777, 8191),
+            "max_partitions": 16,
+            "capture": True,
+            "cluster": 16,
+            "cluster_runs": True,
+        },
+    ),
+    (
+        "cluster16-runs-page128-kv2",
+        {
+            "kv_heads": 2,
+            "group_size": 8,
+            "block_size": 128,
+            "lengths": (2048, 300, 0, 2049),
+            "max_partitions": 16,
+            "cluster": 9,
+            "cluster_runs": True,
+        },
+    ),
     (
         "packed-mtp4",
         {
@@ -1036,6 +1194,30 @@ _FP8_CASES = _COMMON_CASES + [
     ("mtp8-g8-page128", {"query_length": 8, "block_size": 128, "max_partitions": 7}),
 ]
 _BF16_CASES = _COMMON_CASES + [
+    # Fixed runs of tiles, as for FP8; one-CTA grids stage two pages a step.
+    (
+        "cluster16-runs-page128",
+        {
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (8192, 0, 1, 129, 1000, 4097, 7777, 8191),
+            "max_partitions": 16,
+            "capture": True,
+            "cluster": 16,
+            "cluster_runs": True,
+        },
+    ),
+    (
+        "cluster9-runs-page128-bs1",
+        {
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (2049,),
+            "max_partitions": 16,
+            "cluster": 9,
+            "cluster_runs": True,
+        },
+    ),
     (
         "mtp",
         {
@@ -1056,9 +1238,23 @@ _BF16_CASES = _COMMON_CASES + [
         {
             "group_size": 16,
             "block_size": 16,
-            "lengths": (4096,) * 3 + (0, 255),
+            "lengths": ((4096,) * 3 + (0, 255)) * 4,
             "max_partitions": 16,
             "cluster": 16,
+            "cluster_steps": False,
+        },
+    ),
+    # Plain BF16 V takes 64-token page16 steps: plan-derived tasks.
+    (
+        "cluster2-plain-v",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (512, 0, 1, 300),
+            "max_partitions": 2,
+            "trans_v": False,
+            "cluster": 2,
+            "cluster_steps": False,
         },
     ),
     ("head192-decode", {"group_size": 16, "head_dim": 192, "max_partitions": 4}),
@@ -1881,11 +2077,20 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
     if case["cluster"] is not None:
         expected = case["cluster"] if arch == "gfx1250" else 0
         assert compile_kwargs[-1]["cluster_merge"] == expected
+    if case["cluster_seqs"] is not None and arch == "gfx1250":
+        assert compile_kwargs[-1]["cluster_seqs"] == case["cluster_seqs"]
+    if case["cluster_steps"] is not None and arch == "gfx1250":
+        assert compile_kwargs[-1]["cluster_steps"] == case["cluster_steps"]
+    if case["cluster_runs"] is not None and arch == "gfx1250":
+        assert compile_kwargs[-1]["cluster_runs"] == case["cluster_runs"]
     if case["pipe"]:
         schedule_kwargs = dict(compile_kwargs[-1])
         schedule_kwargs.pop("architecture", None)
         schedule_kwargs.pop("direct_output", None)
         schedule_kwargs.pop("cluster_merge", None)
+        schedule_kwargs.pop("cluster_seqs", None)
+        schedule_kwargs.pop("cluster_steps", None)
+        schedule_kwargs.pop("cluster_runs", None)
         traits = PaDecodeTraits.create(PaDecodeSchedule.select(**schedule_kwargs))
         assert traits.D256_PIPE == (arch == "gfx950")
         if traits.D256_PIPE:
@@ -1920,70 +2125,75 @@ def _check_nhd_contracts(pa, output, arguments, options, plan, check):
         check(output)
 
 
-@pytest.mark.parametrize(
-    "case",
-    [
-        *[
-            pytest.param(
-                dict(
-                    geometry,
-                    kv_dtype="fp8",
-                    query_dtype=dtype,
-                    scale_mode=scale_mode,
-                    trans_v=trans_v,
-                ),
-                id=f"fp8-{dtype}-{scale_mode}-{'transposed' if trans_v else 'plain'}-v-{name}",
-            )
-            for name, geometry in _FP8_CASES
-            for dtype, scale_mode, trans_v in product(
-                (torch.bfloat16, torch.float16),
-                ("per-tensor", "per-token"),
-                (False, True),
-            )
-        ],
-        *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
-        *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
-        *[pytest.param(geometry, id=name) for name, geometry in _MXFP4_CASES],
-        *[
-            pytest.param(
-                {
-                    "invalid_input": invalid,
-                    "error": error,
-                    "match": match,
-                    "lengths": (1,),
-                },
-                id=f"invalid-bf16-{invalid}",
-            )
-            for invalid, error, match in _INVALID_CASES
-        ],
-        *[
-            pytest.param(
-                {
-                    "invalid_input": invalid,
-                    "invalid_kind": "mxfp4",
-                    "kv_dtype": "mxfp4",
-                    "error": error,
-                    "match": match,
-                },
-                id=f"invalid-mxfp4-{invalid}",
-            )
-            for invalid, error, match in _MXFP4_INVALID_CASES
-        ],
-        *[
-            pytest.param(
-                {
-                    "invalid_input": invalid,
-                    "invalid_kind": "select",
-                    "error": error,
-                    "match": match,
-                },
-                id=f"invalid-select-{invalid}",
-            )
-            for invalid, error, match in _SELECT_INVALID_CASES
-        ],
+_PA_DECODE_CASES = [
+    *[
+        pytest.param(
+            dict(
+                geometry,
+                kv_dtype="fp8",
+                query_dtype=dtype,
+                scale_mode=scale_mode,
+                trans_v=trans_v,
+            ),
+            id=f"fp8-{dtype}-{scale_mode}-{'transposed' if trans_v else 'plain'}-v-{name}",
+        )
+        for name, geometry in _FP8_CASES
+        for dtype, scale_mode, trans_v in product(
+            (torch.bfloat16, torch.float16),
+            ("per-tensor", "per-token"),
+            (False, True),
+        )
     ],
-)
+    *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
+    *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
+    *[pytest.param(geometry, id=name) for name, geometry in _MXFP4_CASES],
+    *[
+        pytest.param(
+            {
+                "invalid_input": invalid,
+                "error": error,
+                "match": match,
+                "lengths": (1,),
+            },
+            id=f"invalid-bf16-{invalid}",
+        )
+        for invalid, error, match in _INVALID_CASES
+    ],
+    *[
+        pytest.param(
+            {
+                "invalid_input": invalid,
+                "invalid_kind": "mxfp4",
+                "kv_dtype": "mxfp4",
+                "error": error,
+                "match": match,
+            },
+            id=f"invalid-mxfp4-{invalid}",
+        )
+        for invalid, error, match in _MXFP4_INVALID_CASES
+    ],
+    *[
+        pytest.param(
+            {
+                "invalid_input": invalid,
+                "invalid_kind": "select",
+                "error": error,
+                "match": match,
+            },
+            id=f"invalid-select-{invalid}",
+        )
+        for invalid, error, match in _SELECT_INVALID_CASES
+    ],
+]
+
+
+@pytest.mark.parametrize("case", _PA_DECODE_CASES)
 def test_pa_decode(case, device, monkeypatch):
+    """FP8/BF16/MXFP4 decode shares input, reference, planning and replay checks."""
+    _run_pa_decode_case(case, device, monkeypatch)
+
+
+def _run_pa_decode_case(case, device, monkeypatch):
     """FP8/BF16/MXFP4 decode shares input, reference, planning and replay checks.
 
     A case with ``invalid_input`` is an input the wrapper must refuse before any
@@ -2025,6 +2235,9 @@ def test_pa_decode(case, device, monkeypatch):
             "ref_mean_min": None,
             "variants": False,
             "cluster": None,
+            "cluster_seqs": None,
+            "cluster_steps": None,
+            "cluster_runs": None,
         },
         **case,
     )
@@ -2038,6 +2251,13 @@ def test_pa_decode(case, device, monkeypatch):
         and "invalid_input" not in case
     ):
         pytest.skip("BF16 KV requires bfloat16 queries on gfx942/gfx950")
+    if (
+        arch != "gfx1250"
+        and case["kv_dtype"] == "bf16"
+        and not case["trans_v"]
+        and "invalid_input" not in case
+    ):
+        pytest.skip("BF16 KV requires packed V caches on gfx942/gfx950")
     num_cu = torch.cuda.get_device_properties(device).multi_processor_count
     if case["max_partitions"] is not None and case["max_partitions"] > num_cu:
         pytest.skip(f"plan_pa_decode caps max_partitions at {num_cu} CUs")
@@ -2342,6 +2562,9 @@ def test_pa_decode(case, device, monkeypatch):
             output.fill_(float("nan"))
             graph.replay()
             check()
+
+    # Reuse the validated inputs after restoring the test compilation spy.
+    return case, launch, check, arguments, options, plan
 
 
 @pytest.mark.parametrize("variant", ["arch", "bf16", "mtp", "page16", "page128"])
