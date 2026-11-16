@@ -1061,8 +1061,11 @@ def _choose_chunks_per_seg(n_chunks_max, n_seqs, H, V, nchs=None) -> int:
         return n_chunks_max if val <= 0 else val
     blocks = n_seqs * H * max(1, V // 32)
     cus = get_num_sms()
-    # There has to be idle capacity to absorb the extra passes.
-    if blocks > cus:
+    # There has to be idle capacity to absorb the extra passes, unless the longest
+    # walk outlasts the device's share of all the work (one long sequence).
+    if blocks > cus and (
+        nchs is None or sum(nchs) * (blocks // n_seqs) >= n_chunks_max * cus
+    ):
         return n_chunks_max
     if nchs is not None:
         # Shortest length that fits one wave of the CUs, if it pays for pass A + scan.
