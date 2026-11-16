@@ -990,8 +990,8 @@ def mla_decode_prepare_page_csr(
 
 @triton.jit
 def _no_weight_row(O, Lse, ROW, HEADS, HAS_LSE: tl.constexpr, BLOCK: tl.constexpr):
-    # The lowest float, not -inf: mla_reduce_v1's 2- and 3-split path takes
-    # exp(-inf - -inf), a NaN, when every split of a request is empty.
+    # The lowest float, not -inf: with -inf in every partial of a request,
+    # mla_reduce_v1 writes LSE=+inf for it, and NaN O at 3 splits.
     cols = tl.arange(0, BLOCK)
     for c in range(0, ROW, BLOCK):
         tl.store(O + c + cols, 0.0, mask=c + cols < ROW)
