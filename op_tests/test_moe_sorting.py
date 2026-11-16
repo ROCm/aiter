@@ -598,6 +598,64 @@ def test_moe_sorting_flydsl_cuda_graph_capture(
     )
 
 
+def test_moe_sorting_flydsl_under_contention(
+    dtype, token=9000, model_dim=5120, E=384, topk=6, iters=200
+):
+    """FlyDSL sort with a GEMM and a VALU kernel running on a side stream.
+
+    p23_kernel without the barrier before its Step 3 cumsum store gave 13-20%
+    wrong sorts here on MI355X (0 with it). Outputs are poisoned before every
+    sort so dropped writes cannot inherit a previous correct result.
+    """
+    from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_fwd
+
+    topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
+        token, model_dim, E, topk, dtype, False, 0
+    )
+    ref_ids, _, ref_eids, ref_num = run_torch_moe_sorting(
+        topk_ids, topk_weights, E, BLOCK_SIZE_M
+    )
+    n_ids = ref_num[0].item()
+    n_blocks = n_ids // BLOCK_SIZE_M
+
+    def alloc():
+        return [
+            torch.empty_like(ref_ids),
+            torch.empty(ref_ids.shape, dtype=dtypes.fp32, device="cuda"),
+            torch.empty_like(ref_eids),
+            torch.empty(2, dtype=dtypes.i32, device="cuda"),
+            torch.empty((token, model_dim), dtype=dtype, device="cuda"),
+        ]
+
+    batch = 20
+    outs = [alloc() for _ in range(batch)]
+    side = torch.cuda.Stream()
+    a = torch.randn((8192, 8192), dtype=dtypes.bf16, device="cuda")
+    v = torch.randn((64 << 20,), dtype=dtypes.fp32, device="cuda")
+    wrong = 0
+    for _ in range(iters // batch):
+        for out in outs:
+            for t in out:
+                t.fill_(-7) if t.dtype == dtypes.i32 else t.fill_(float("nan"))
+        torch.cuda.synchronize()
+        for out in outs:
+            with torch.cuda.stream(side):
+                torch.mm(a, a)
+                v.sin_().mul_(1.0001)
+            flydsl_moe_sorting_fwd(topk_ids, topk_weights, *out, E, BLOCK_SIZE_M)
+        torch.cuda.synchronize()
+        for ids, _, eids, num, _ in outs:
+            wrong += not (
+                torch.equal(ids[:n_ids], ref_ids[:n_ids])
+                and torch.equal(eids[:n_blocks], ref_eids[:n_blocks])
+                and torch.equal(num, ref_num)
+            )
+    assert wrong == 0, (
+        f"FlyDSL moe_sorting under contention: {wrong}/{iters // batch * batch} wrong "
+        f"(token={token}, E={E}, topk={topk})"
+    )
+
+
 def test_moe_sorting_invalid_topk_ids():
     """Exercise every invalid-ID sorting path against the torch reference."""
     if get_gfx() not in SUPPORTED_GFX:
@@ -979,6 +1037,7 @@ def main():
                     has_expert_mask=expert_mask,
                 )
         aiter.logger.info("moe_sorting FlyDSL cuda-graph capture/replay: all passed")
+        test_moe_sorting_flydsl_under_contention(dtype)
 
         if args.decode_graph:
             decode_rows = []
