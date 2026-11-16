@@ -736,3 +736,30 @@ def test_qsa_scorers_stay_inside_a_narrow_page_table(fmt, rows):
         assert logits.shape == (rows, 12)
         assert torch.equal(visible, ref_visible)
         torch.testing.assert_close(logits, ref, rtol=1e-4, atol=1e-4)
+
+
+def test_qsa_imports_without_a_gpu():
+    import os
+    import subprocess
+    import sys
+
+    # Without a visible GPU, aiter.dtypes.fp8 is a uint8 placeholder.
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", HIP_VISIBLE_DEVICES="")
+    env.pop("AITER_AOT_REPLAY", None)
+    code = (
+        "import torch\n"
+        "assert not torch.cuda.is_available()\n"
+        "import aiter.ops.qsa as qsa\n"
+        "import aiter.ops.triton.attention.qsa\n"
+        "assert qsa.FP8_MAX is None\n"
+        "assert qsa.qsa_cache_row_layout('fp4', 128).dim == 64\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr[-4000:]

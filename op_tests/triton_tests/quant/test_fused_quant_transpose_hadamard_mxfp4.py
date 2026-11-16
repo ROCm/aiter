@@ -7,6 +7,10 @@ import torch
 from aiter.ops.triton.quant import fused_quant_transpose_hadamard_mxfp4
 from aiter.ops.triton.quant.fused_quant_transpose_hadamard_mxfp4 import _philox_streams
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.mxfp4 import (
+    mxfp4_data_shuffle_supported,
+    mxfp4_scale_swizzle_supported,
+)
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, shuffle_weight
 from aiter.utility.fp4_utils import (
     e8m0_to_f32,
@@ -17,6 +21,7 @@ from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
 _BLOCK_SIZE = 32
 _HADAMARD_SIZE = 16
+
 
 requires_gfx950 = pytest.mark.skipif(
     not torch.cuda.is_available() or arch_info.get_arch() != "gfx950",
@@ -308,6 +313,13 @@ def test_fused_quant_transpose_hadamard_mxfp4_does_not_reuse_counters_across_til
     torch.testing.assert_close(scales[:, :1], scales[:, 1:2], atol=0, rtol=0)
     assert not torch.equal(row[:32, :16], row[32:, :16])
     assert not torch.equal(row[:, :16], row[:, 16:32])
+
+
+def test_mxfp4_fused_layout_capability_checks():
+    assert mxfp4_scale_swizzle_supported(32, 8)
+    assert not mxfp4_scale_swizzle_supported(16, 8)
+    assert mxfp4_data_shuffle_supported(16, 32)
+    assert not mxfp4_data_shuffle_supported(16, 16)
 
 
 @pytest.mark.parametrize(
