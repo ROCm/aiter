@@ -1,0 +1,17 @@
+{
+  "contract_version": 1,
+  "gfx950": {
+    "T256": {
+      "o": "94ecad96384318f821fd1dcc9f31e269367db61c869eee2f8faf13bb6526f611",
+      "final_state": "0309a9c0f12833a5ae3e9dcb0b6f0881fd95f719d91559bff1ae1adf6575bada"
+    },
+    "packed": {
+      "o": "e720e78e81ac71de33bca12b50f9f260221f392eb2bcaed391b73faf17b497d0",
+      "final_state": "9af5296b2427ff7f8fd6246395b64c90c837d71e681fa3bf3fac0b9093188a1c"
+    },
+    "init_state": {
+      "o": "8c3c160910f2e72a0318b1d022fca80286e43b965176c61a3ce12ca05a548adc",
+      "final_state": "f7d345cd9f90d31917891e7368861100af6fe742346fb659a70de7d0b1d6e248"
+    }
+  }
+}
