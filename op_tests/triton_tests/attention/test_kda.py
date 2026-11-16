@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from aiter.ops.triton.attention.kda import (
     fused_recurrent_kda,
     fused_recurrent_kda_packed_decode,
+    is_gate_fold_supported,
 )
 from aiter.ops.triton.utils import config_utils as triton_core
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -1780,3 +1781,239 @@ def test_fused_recurrent_kda_packed_decode(state_dtype):
     torch.testing.assert_close(
         cs1[rows[valid]], expected_conv[valid].to(cs.dtype), rtol=0, atol=0
     )
+
+
+gfx950_only = pytest.mark.skipif(arch != "gfx950", reason="gfx950-only feature")
+
+GATE_FOLD_KEYS = ("gate_in", "gate_weight", "out_gate_in", "out_gate_weight")
+
+
+def generate_gate_fold_inputs(
+    N, H, pad=0, seed=0, state_dtype=torch.float32, spare_slots=7, device=DEVICE
+):
+    """Packed decode inputs. The two gate projections are not applied.
+
+    ``bench_kda.py --fold_gates`` uses this generator also. The pools have
+    slot 0 (the pad slot), N slots in use and ``spare_slots`` slots not in use.
+    """
+    D, W, NS = 128, 4, N + 1 + spare_slots
+    lp = H * D
+    torch.manual_seed(seed)
+    # One projection output has q|k|v, the gate inputs and beta as strided views.
+    projected = torch.randn(
+        N, 3 * lp + 2 * D + H + 16, dtype=torch.bfloat16, device=device
+    )
+    parts = projected.split([3 * lp, D, D, H, 16], dim=-1)
+    mixed, gate_in, out_gate_in, beta = parts[:4]
+    cs = torch.randn(NS, W - 1, 3 * lp, dtype=torch.bfloat16, device=device)
+    S = torch.randn(NS, H, D, D, dtype=torch.float32, device=device) * 0.01
+    idx = torch.randperm(NS - 1, device=device)[:N].to(torch.int32) + 1
+    if pad:
+        idx[-pad:] = 0
+    return {
+        "projected": projected,
+        "mixed": mixed,
+        "gate_in": gate_in,
+        "out_gate_in": out_gate_in,
+        "beta": beta,
+        "gate_weight": torch.randn(lp, D, dtype=torch.bfloat16, device=device)
+        * D**-0.5,
+        "out_gate_weight": torch.randn(lp, D, dtype=torch.bfloat16, device=device)
+        * D**-0.5,
+        "cs": cs.transpose(-1, -2) * 0.1,
+        "S": S.to(state_dtype),
+        "cw": torch.randn(3, W, lp, dtype=torch.float32, device=device) * 0.1,
+        "A_log": torch.randn(H, dtype=torch.float32, device=device) * 0.1,
+        "dt_bias": torch.randn(lp, dtype=torch.float32, device=device) * 0.1,
+        "nw": torch.rand(D, dtype=torch.float32, device=device) + 0.5,
+        "idx": idx,
+    }
+
+
+def _packed_decode(inp, out, fold, lower_bound=-5.0, **override):
+    """One packed decode step on the pools of ``inp``."""
+    N, H, D = out.shape
+    if fold:
+        g = og = None
+        gates = {key: inp[key] for key in GATE_FOLD_KEYS}
+    else:
+        # The same kernel reads the gates. PyTorch computes them in fp32.
+        g = inp["gate_in"].float() @ inp["gate_weight"].float().T
+        og = inp["out_gate_in"].float() @ inp["out_gate_weight"].float().T
+        g, og = g.view(N, H, D), og.view(N, H, D)
+        gates = {}
+    args = {**gates, "g": g, "out_gate": og, **override}
+    fused_recurrent_kda_packed_decode(
+        inp["mixed"],
+        args.pop("g"),
+        inp["beta"],
+        inp["A_log"],
+        inp["dt_bias"],
+        lower_bound,
+        inp["S"],
+        inp["idx"],
+        inp["cs"],
+        inp["cw"],
+        args.pop("out_gate"),
+        inp["nw"],
+        1e-5,
+        out,
+        **args,
+    )
+
+
+def _with_own_pools(inp):
+    return dict(inp, S=inp["S"].clone(), cs=inp["cs"].clone())
+
+
+def _check_gate_fold(inp, lower_bound=-5.0, state_ratio=1e-4):
+    """Compare the gate fold with the same kernel on gates from PyTorch."""
+    N, H = inp["beta"].shape
+    out = torch.empty(N, H, 128, dtype=torch.bfloat16, device=DEVICE)
+    ref = torch.empty(N, H, 128, dtype=torch.bfloat16, device=DEVICE)
+    fold_inp, ref_inp = _with_own_pools(inp), _with_own_pools(inp)
+    _packed_decode(fold_inp, out, True, lower_bound)
+    _packed_decode(ref_inp, ref, False, lower_bound)
+    valid = inp["idx"] > 0
+    rows = inp["idx"].long()[valid]
+    assert torch.equal(fold_inp["cs"], ref_inp["cs"]), "conv state"
+    assert_close("output", ref[valid], out[valid], ratio=1e-3)
+    assert_close("state", ref_inp["S"][rows], fold_inp["S"][rows], ratio=state_ratio)
+    assert (out[~valid] == 0).all(), "output of padded sequences"
+    unused = torch.ones(inp["S"].shape[0], dtype=torch.bool, device=DEVICE)
+    unused[rows] = False
+    assert torch.equal(fold_inp["S"][unused], inp["S"][unused]), "unused states"
+    assert torch.equal(fold_inp["cs"][unused], inp["cs"][unused]), "unused conv"
+
+
+@gfx950_only
+@pytest.mark.parametrize("H", [8, 16, 32, 64])
+@pytest.mark.parametrize("N, pad", [(1, 0), (3, 1), (16, 2), (96, 5)])
+def test_fused_recurrent_kda_packed_decode_gate_fold(H, N, pad):
+    _check_gate_fold(generate_gate_fold_inputs(N, H, pad, seed=N + H))
+
+
+@gfx950_only
+@pytest.mark.parametrize("variant", ["int64_slots", "bf16_state", "no_lower_bound"])
+def test_fused_recurrent_kda_packed_decode_gate_fold_variants(variant):
+    bf16_state = variant == "bf16_state"
+    state_dtype = torch.bfloat16 if bf16_state else torch.float32
+    inp = generate_gate_fold_inputs(8, 16, pad=1, seed=11, state_dtype=state_dtype)
+    if variant == "int64_slots":
+        inp["idx"] = inp["idx"].long()
+    _check_gate_fold(
+        inp,
+        lower_bound=None if variant == "no_lower_bound" else -5.0,
+        state_ratio=1e-3 if bf16_state else 1e-4,
+    )
+
+
+@gfx950_only
+def test_fused_recurrent_kda_packed_decode_gate_fold_cuda_graph():
+    N, H = 8, 16
+    inp = generate_gate_fold_inputs(N, H, pad=1, seed=3)
+    new = generate_gate_fold_inputs(N, H, pad=2, seed=4)
+    out = torch.empty(N, H, 128, dtype=torch.bfloat16, device=DEVICE)
+    _packed_decode(inp, out, True)  # compile before the capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _packed_decode(inp, out, True)
+    # The replay must read the new contents of the captured buffers.
+    for key in set(inp) - {"mixed", "gate_in", "out_gate_in", "beta"}:
+        inp[key].copy_(new[key])
+    graph.replay()
+    torch.cuda.synchronize()
+    eager = torch.empty(N, H, 128, dtype=torch.bfloat16, device=DEVICE)
+    _packed_decode(new, eager, True)
+    assert torch.equal(out, eager), "output"
+    assert torch.equal(inp["S"], new["S"]), "state"
+    assert torch.equal(inp["cs"], new["cs"]), "conv state"
+
+
+@gfx950_only
+def test_fused_recurrent_kda_packed_decode_gate_fold_steps():
+    """The state stays on the reference over 16 decode steps."""
+    N, H, steps = 4, 16, 16
+    inp = generate_gate_fold_inputs(N, H, seed=7)
+    fold_inp, ref_inp = _with_own_pools(inp), _with_own_pools(inp)
+    out = torch.empty(N, H, 128, dtype=torch.bfloat16, device=DEVICE)
+    ref = torch.empty(N, H, 128, dtype=torch.bfloat16, device=DEVICE)
+    for step in range(steps):
+        torch.manual_seed(100 + step)
+        inp["projected"].normal_()
+        _packed_decode(fold_inp, out, True)
+        _packed_decode(ref_inp, ref, False)
+        assert_close(f"output, step {step}", ref, out, ratio=1e-3)
+        assert torch.equal(fold_inp["cs"], ref_inp["cs"]), f"conv state, step {step}"
+    rows = inp["idx"].long()
+    assert_close("state", ref_inp["S"][rows], fold_inp["S"][rows], ratio=1e-3)
+
+
+@gfx950_only
+def test_gate_fold_guards():
+    N, H, D = 2, 8, 128
+    assert is_gate_fold_supported(D) and not is_gate_fold_supported(64)
+    inp = generate_gate_fold_inputs(N, H)
+    out = torch.empty(N, H, D, dtype=torch.bfloat16, device=DEVICE)
+    gate = torch.zeros(N, H, D, dtype=torch.bfloat16, device=DEVICE)
+
+    with pytest.raises(ValueError, match="set them to None"):
+        _packed_decode(inp, out, True, g=gate)
+    with pytest.raises(ValueError, match="set them to None"):
+        _packed_decode(inp, out, True, out_gate=gate)
+    with pytest.raises(AssertionError):  # all four fold arguments are necessary
+        _packed_decode(inp, out, True, out_gate_weight=None)
+    with pytest.raises(AssertionError):  # the weights are [H * K, K]
+        _packed_decode(inp, out, True, gate_weight=inp["gate_weight"][:-D])
+    with pytest.raises(AssertionError):  # the gate inputs have the dtype of q
+        _packed_decode(inp, out, True, gate_in=inp["gate_in"].float())
+
+    s = inp["mixed"].stride(0)
+
+    def view(off):
+        return inp["mixed"].as_strided(
+            (N, 1, H, D), (s, s, D, 1), inp["mixed"].storage_offset() + off
+        )
+
+    args = {
+        "q": view(0),
+        "k": view(H * D),
+        "v": view(2 * H * D),
+        "g": None,
+        "beta": inp["beta"].contiguous().unsqueeze(1),
+        "A_log": inp["A_log"],
+        "dt_bias": inp["dt_bias"],
+        "lower_bound": -5.0,
+        "initial_state": inp["S"],
+        "ssm_state_indices": inp["idx"],
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "use_beta_sigmoid_in_kernel": True,
+        "pad_slot_guard": True,
+        "conv_state": inp["cs"],
+        "conv_weight": inp["cw"],
+        "norm_weight": inp["nw"],
+        "gate_in": inp["gate_in"].contiguous().unsqueeze(1),
+        "gate_weight": inp["gate_weight"],
+        "out_gate_in": inp["out_gate_in"].contiguous().unsqueeze(1),
+        "out_gate_weight": inp["out_gate_weight"],
+    }
+    accepted = torch.ones(N, dtype=torch.int32, device=DEVICE)
+    with pytest.raises(ValueError, match="one token per sequence"):
+        fused_recurrent_kda(**dict(args, num_accepted_tokens=accepted))
+    with pytest.raises(ValueError, match="one token per sequence"):
+        fused_recurrent_kda(**dict(args, cu_seqlens=torch.arange(N + 1, device=DEVICE)))
+    with pytest.raises(ValueError, match="use_gate_in_kernel"):
+        fused_recurrent_kda(**dict(args, use_gate_in_kernel=False))
+    with pytest.raises(ValueError, match="conv_state"):
+        fused_recurrent_kda(**dict(args, conv_state=None))
+
+
+@gfx1250_only
+def test_gate_fold_requires_gfx950():
+    N, H = 2, 8
+    assert not is_gate_fold_supported(128)
+    out = torch.empty(N, H, 128, dtype=torch.bfloat16, device=DEVICE)
+    with pytest.raises(ValueError, match="gfx950"):
+        _packed_decode(generate_gate_fold_inputs(N, H), out, True)

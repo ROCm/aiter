@@ -1,16 +1,31 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import sys
 
 import torch
 import torch.nn.functional as F
 import triton
 
-from aiter.ops.triton.attention.kda import fused_recurrent_kda
+from aiter.ops.triton.attention.kda import (
+    fused_recurrent_kda,
+    fused_recurrent_kda_packed_decode,
+    is_gate_fold_supported,
+)
+from aiter.ops.triton.gated_delta_net.fused_kda_decode import fused_kda_decode
+from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.utils._triton import arch_info
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
+from op_tests.triton_tests.attention.test_kda import generate_gate_fold_inputs
 
 try:
     from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd as fla_kda
@@ -24,6 +39,30 @@ BACKENDS = {
     "gluon": "aiter gluon",
     "fla": "fla triton",
 }
+
+# --fold_gates lines: the packed one-token decode with and without the gate fold.
+GATE_FOLD_LINES = {
+    "gates": "gate GEMMs + gluon",
+    "gates_triton": "gate GEMMs + triton",
+    "fold": "gluon gate fold",
+}
+# The keys of generate_gate_fold_inputs that one decode step reads, and the output.
+GATE_FOLD_FIELDS = [
+    "mixed",
+    "gate_in",
+    "out_gate_in",
+    "beta",
+    "gate_weight",
+    "out_gate_weight",
+    "A_log",
+    "dt_bias",
+    "S",
+    "idx",
+    "cs",
+    "cw",
+    "nw",
+    "out",
+]
 
 K3_HEAD_DIM = 128
 K3_NUM_HEADS = [24, 12]  # 96 heads sharded tp4 / tp8
@@ -115,6 +154,130 @@ def make_inputs(
         "num_accepted_tokens": accepted,
         **extra,
     }
+
+
+def gate_fold_fields(provider):
+    """Pool fields of one --fold_gates line. Only the triton kernel reads cu_seqlens."""
+    if provider == "gates_triton":
+        return [*GATE_FOLD_FIELDS, "cu_seqlens"]
+    return GATE_FOLD_FIELDS
+
+
+def gate_fold_pool_entry(fields, B, H, state_dtype, device):
+    """One rotating-buffer entry: the inputs of the unit test and an output buffer."""
+    inp = generate_gate_fold_inputs(
+        B, H, state_dtype=state_dtype, spare_slots=0, device=device
+    )
+    inp["out"] = torch.empty(B, H, K3_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    inp["cu_seqlens"] = torch.arange(B + 1, device=device)
+    return tuple(inp[key] for key in fields)
+
+
+def run_gate_fold(
+    provider,
+    mixed,
+    gate_in,
+    out_gate_in,
+    beta,
+    gate_weight,
+    out_gate_weight,
+    A_log,
+    dt_bias,
+    S,
+    idx,
+    cs,
+    cw,
+    nw,
+    out,
+    cu_seqlens=None,
+):
+    """One packed decode step: the gate fold, or the two gate GEMMs and a kernel."""
+    B, H, D = out.shape
+    if provider == "fold":
+        g = og = None
+        gates = {
+            "gate_in": gate_in,
+            "gate_weight": gate_weight,
+            "out_gate_in": out_gate_in,
+            "out_gate_weight": out_gate_weight,
+        }
+    else:
+        g = gemm_a16w16(gate_in, gate_weight)
+        og = gemm_a16w16(out_gate_in, out_gate_weight)
+        gates = {}
+    if provider == "gates_triton":
+        fused_kda_decode(
+            mixed,
+            cs,
+            cw,
+            g.view(1, B, H, D),
+            beta.unsqueeze(0),
+            og,
+            A_log,
+            dt_bias,
+            S,
+            idx,
+            cu_seqlens,
+            nw,
+            1e-5,
+            D,
+            H,
+            K3_LOWER_BOUND,
+            out=out.view(B, H * D),
+        )
+        return
+    fused_recurrent_kda_packed_decode(
+        mixed,
+        None if g is None else g.view(B, H, D),
+        beta,
+        A_log,
+        dt_bias,
+        K3_LOWER_BOUND,
+        S,
+        idx,
+        cs,
+        cw,
+        None if og is None else og.view(B, H, D),
+        nw,
+        1e-5,
+        out,
+        **gates,
+    )
+
+
+def benchmark_gate_fold(args):
+    """--fold_gates: time one packed decode step for each line, in us."""
+    state_dtype = torch.bfloat16 if args.state_dtype == "bf16" else torch.float32
+    lines = dict(GATE_FOLD_LINES)
+    if state_dtype != torch.float32:
+        del lines["gates_triton"]  # the triton kernel has an fp32 state
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
+    config = triton.testing.Benchmark(
+        x_names=["H", "B"],
+        x_vals=[(h, b) for h in args.num_heads for b in args.batch_sizes],
+        line_arg="provider",
+        line_vals=list(lines),
+        line_names=list(lines.values()),
+        plot_name=get_caller_name_no_ext(),
+        styles=[],
+        ylabel="us",
+        args={},
+    )
+
+    @triton.testing.perf_report([config])
+    def bench_kda_gate_fold(H, B, provider):
+        fields = gate_fold_fields(provider)
+        entry = functools.partial(
+            gate_fold_pool_entry, fields, B, H, state_dtype, args.device
+        )
+        bencher.build_pool([entry], [fields])
+        return bencher.bench(functools.partial(run_gate_fold, provider)) * 1e3
+
+    bench_kda_gate_fold.run(
+        save_path="." if args.o else None, print_data=True, show_plots=False
+    )
 
 
 def traffic_bytes(
@@ -427,6 +590,15 @@ def parse_args():
     parser.add_argument("--paged", action="store_true", default=False)
     parser.add_argument("--fused", action="store_true", default=False)
     parser.add_argument(
+        "--fold_gates",
+        action="store_true",
+        default=False,
+        help="gfx950: time the packed one-token decode with the gate fold and with "
+        "the two gate GEMMs before the gluon or the triton kernel. Reports the time "
+        "in us. RotatingBufferBench does the timing: see the --graph-* and "
+        "--rot-bufs-* options",
+    )
+    parser.add_argument(
         "--backends",
         type=str,
         nargs="+",
@@ -489,6 +661,11 @@ def parse_args():
 def run_bench(args):
     if arch_info.get_arch() not in ("gfx950", "gfx1250"):
         sys.exit(f"KDA gluon decode needs gfx950/gfx1250, got {arch_info.get_arch()}")
+    if args.fold_gates:
+        if not is_gate_fold_supported(args.head_dim) or args.dtype != "bf16":
+            sys.exit("--fold_gates needs gfx950, --head_dim 128 and --dtype bf16")
+        benchmark_gate_fold(args)
+        return
     if args.gluon_configs is None:
         # The gfx950 kernel holds the whole [V, K] state: BV == V.
         gfx950 = arch_info.get_arch() == "gfx950"

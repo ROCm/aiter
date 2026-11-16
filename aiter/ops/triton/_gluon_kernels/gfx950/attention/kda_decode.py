@@ -95,6 +95,50 @@ def _finish(
     return gl.where(m, acc, a)
 
 
+@gluon.jit
+def _matvec(w, x):
+    """w [N, K] @ x [K] in fp32."""
+    return gl.sum(w.to(gl.float32) * x.to(gl.float32)[None, :], axis=1)
+
+
+@gluon.jit
+def _token_fold(
+    x,
+    h0,
+    h1,
+    h2,
+    w0,
+    w1,
+    w2,
+    w3,
+    gw,
+    gi,
+    hb,
+    ho,
+    m,
+    s_pos,
+    a_exp,
+    dt,
+    gate_c,
+    G_LAYOUT: gl.constexpr,
+    USE_GATE_IN_KERNEL: gl.constexpr,
+    USE_LOWER_BOUND: gl.constexpr,
+):
+    """_token for FOLD_GATES: row 2 is gw @ gi. The caller loads the operands."""
+    g = gl.convert_layout(_matvec(gw, gi), G_LAYOUT)
+    x = gl.where(m, x.to(gl.float32), g[None, :])
+    acc = h0.to(gl.float32) * w0 + h1.to(gl.float32) * w1
+    acc += h2.to(gl.float32) * w2 + x * w3
+    gl.amd.cdna4.buffer_store(h1, hb, ho, mask=m, cache=".cs")
+    gl.amd.cdna4.buffer_store(h2, hb, ho + s_pos, mask=m, cache=".cs")
+    gl.amd.cdna4.buffer_store(
+        x.to(hb.dtype.element_ty), hb, ho + 2 * s_pos, mask=m, cache=".cs"
+    )
+    return _finish(
+        x, acc, m, a_exp, dt, gate_c, True, USE_GATE_IN_KERNEL, USE_LOWER_BOUND
+    )
+
+
 _fused_recurrent_kda_packed_decode_repr = make_kernel_repr(
     "fused_recurrent_kda_packed_decode_kernel",
     [
@@ -105,6 +149,7 @@ _fused_recurrent_kda_packed_decode_repr = make_kernel_repr(
         "USE_CONV",
         "USE_RMS_GATE",
         "RESIDENT_STATE",
+        "FOLD_GATES",
     ],
 )
 
@@ -179,6 +224,13 @@ def fused_recurrent_kda_packed_decode_kernel(
     USE_RMS_GATE: gl.constexpr = False,
     TDM_STORE_BUFS: gl.constexpr = 2,
     RESIDENT_STATE: gl.constexpr = False,  # multi-token: state held in registers
+    gate_in_ptr=None,  # FOLD_GATES: [K] inputs of the two gate projections, per token
+    out_gate_in_ptr=None,
+    gate_weight_ptr=None,  # FOLD_GATES: [HV * K, K] weights of the two gate projections
+    out_gate_weight_ptr=None,
+    stride_gate_in_token: gl.constexpr = 0,
+    stride_out_gate_in_token: gl.constexpr = 0,
+    FOLD_GATES: gl.constexpr = False,  # compute g and out_gate from their projections
 ):
     gl.static_assert(STATE_V_FIRST, "gfx950 kda decode keeps the state [V, K]")
     gl.static_assert(BV == V and K == V, "gfx950 kda decode needs BV == V == K")
@@ -310,6 +362,26 @@ def fused_recurrent_kda_packed_decode_kernel(
     else:
         seed = 0
         slot = i_n
+    if FOLD_GATES:
+        gl.static_assert(
+            USE_GATE_IN_KERNEL and USE_RMS_GATE and USE_CONV and not RESIDENT_STATE,
+            "FOLD_GATES needs the fused decode without the resident state",
+        )
+        gl.static_assert(K == 128, "FOLD_GATES needs K == 128")
+        MV: gl.constexpr = gl.BlockedLayout([1, 8], [4, 16], [NUM_WARPS, 1], [1, 0])
+        ii = gl.arange(0, K, layout=gl.SliceLayout(0, MV))
+        w_off = gl.arange(0, K, layout=gl.SliceLayout(1, MV))[:, None] * K + ii[None, :]
+        gw_p = gate_weight_ptr + i_hv * (K * K)
+        ogw_p = out_gate_weight_ptr + i_hv * (K * K)
+        # Row 2 of the q|k|g|v tile is computed. Its load reads q again.
+        xp = gl.where(r == 0, q_p, gl.where(r == 1, k_p, gl.where(m, v_p, q_p))) + c
+        xs = gl.where(
+            r == 0,
+            stride_q_token,
+            gl.where(
+                r == 1, stride_k_token, gl.where(m, stride_v_token, stride_q_token)
+            ),
+        )
     if PAD_SLOT_GUARD and slot <= 0:
         zero = gl.full([V], 0.0, o_ptr.dtype.element_ty, OUT)
         for t in range(n_tok):
@@ -405,7 +477,7 @@ def fused_recurrent_kda_packed_decode_kernel(
         else:
             if not IS_BETA_HEADWISE:
                 b = gl.load(b_p).to(gl.float32)
-            if USE_RMS_GATE:
+            if USE_RMS_GATE and not FOLD_GATES:
                 og = gl.amd.cdna4.buffer_load(og_p, off_o)
         if RESIDENT_STATE:
             if USE_CONV:
@@ -432,6 +504,21 @@ def fused_recurrent_kda_packed_decode_kernel(
                 USE_LOWER_BOUND,
             )
         else:
+            if FOLD_GATES:
+                # Queue the token inputs before the state slab. These loads stay in
+                # the loop, or LICM moves the mat-vec and its wait above the slab.
+                x = gl.load(xp)
+                h0, h1, h2, w0, w1, w2, w3 = _conv_load(
+                    hb, conv_weight_ptr, ho, wo, m, stride_cs_pos, LP
+                )
+                gw = gl.amd.cdna4.buffer_load(gw_p, w_off)
+                gi = gl.amd.cdna4.buffer_load(
+                    gate_in_ptr + (tok0 + t) * stride_gate_in_token, ii
+                )
+                ogi = gl.amd.cdna4.buffer_load(
+                    out_gate_in_ptr + (tok0 + t) * stride_out_gate_in_token, ii
+                )
+                ogw = gl.amd.cdna4.buffer_load(ogw_p, w_off)
             bufs = ()
             for i in gl.static_range(NUM_BUFFERS):
                 bufs = bufs + (
@@ -439,23 +526,48 @@ def fused_recurrent_kda_packed_decode_kernel(
                         s_src + i * K, off_s, mask=s_mask, other=s_other, cache=".cg"
                     ),
                 )
-            y = _token(
-                xp,
-                gp,
-                hb,
-                conv_weight_ptr,
-                ho,
-                wo,
-                m,
-                stride_cs_pos,
-                a_exp,
-                dt,
-                gate_c,
-                LP,
-                USE_CONV,
-                USE_GATE_IN_KERNEL,
-                USE_LOWER_BOUND,
-            )
+            if FOLD_GATES:
+                y = _token_fold(
+                    x,
+                    h0,
+                    h1,
+                    h2,
+                    w0,
+                    w1,
+                    w2,
+                    w3,
+                    gw,
+                    gi,
+                    hb,
+                    ho,
+                    m,
+                    stride_cs_pos,
+                    a_exp,
+                    dt,
+                    gate_c,
+                    gl.SliceLayout(0, FLAT),
+                    USE_GATE_IN_KERNEL,
+                    USE_LOWER_BOUND,
+                )
+                og = gl.convert_layout(_matvec(ogw, ogi), OUT)
+            else:
+                y = _token(
+                    xp,
+                    gp,
+                    hb,
+                    conv_weight_ptr,
+                    ho,
+                    wo,
+                    m,
+                    stride_cs_pos,
+                    a_exp,
+                    dt,
+                    gate_c,
+                    LP,
+                    USE_CONV,
+                    USE_GATE_IN_KERNEL,
+                    USE_LOWER_BOUND,
+                )
         if not IS_BETA_HEADWISE and APPLY_BETA_SIGMOID:
             b = sigmoid(b)
             if ALLOW_NEG_EIGVAL:
