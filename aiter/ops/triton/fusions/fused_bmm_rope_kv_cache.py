@@ -21,8 +21,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-# Token range of the gfx950 FP8 pure-prefill route. The lower limit is the
-# smallest measured size where the route was faster in eager and graph mode.
+# Token range that the gfx950 FP8 pure-prefill configs are tuned for.
 _FP8_PREFILL_MIN_TOKENS = 11072
 _FP8_PREFILL_MAX_TOKENS = 32768
 
@@ -579,7 +578,7 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     QH=8, KH=1, P=192, kv_lora_rank=512, RoPE dim 64, group_size=128, BF16
     inputs and FP8 e4m3 weights and q_out. q_nope must be dense, or a view
     of a (B, QH, P) or (B, QH, P + d_pe) tensor. Other calls use the generic
-    kernel. The two kernels give the same result.
+    kernel.
     """
     _LOGGER.info(
         "FUSED_FP8_BMM_ROPE_CAT_AND_CACHE_MLA: q_nope=%s w_k=%s w_k_scale=%s q_pe=%s k_nope=%s k_rope=%s positions=%s cos=%s sin=%s kv_cache=%s slot_mapping=%s transpose_bm=%s group_size=%d is_neox=%s",
