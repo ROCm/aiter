@@ -955,7 +955,7 @@ def _pa_decode_sparse_fp8(
     a1 = gl.zeros([BLOCK_H, PV_HALF], gl.float32, layout=PV_WMMA_LAYOUT)
 
     NUM_BUFFERS: gl.constexpr = 2
-    NUM_STAGE: gl.constexpr = 1
+    NUM_STAGE: gl.constexpr = 2
     kv_bufs = gl.allocate_shared_memory(
         unified_kv_ptr.dtype.element_ty,
         [NUM_BUFFERS, BLOCK_K, BLOCK_D],
@@ -1105,7 +1105,16 @@ def _pa_decode_sparse_fp8(
     )
 
     gl.assume(num_iters >= 1)
-    for i in tl.range(0, num_iters - 1):
+    # Software-pipelined tile loop (after OPUS mla_v41 16mx1_16nx4, which runs the
+    # QK of tile t + 1 beside the PV of tile t): iteration i computes S(i) and
+    # dequantizes V(i) into one of two bf16 stages, and in the same block runs the
+    # softmax and PV of tile i - 1 from the other stage, so the waves always have an
+    # independent stream to overlap. Iteration 0 multiplies a zeroed stage by P = 0.
+    kv_bf16.index(1).store(
+        gl.zeros([BLOCK_K, BLOCK_D], gl.bfloat16, layout=QDQ_BLOCKED_LAYOUT)
+    )
+    s_prev = gl.full([BLOCK_H, BLOCK_K], float("-inf"), gl.float32, layout=QK_WMMA_LAYOUT)
+    for i in tl.range(0, num_iters):
         if CTAS_H > 1:
             gl.amd.gfx1250.cluster.arrive()
             gl.amd.gfx1250.cluster.wait()
@@ -1141,6 +1150,7 @@ def _pa_decode_sparse_fp8(
             BLOCK_K,
             HAS_EXTRA,
         )
+        # Past the last tile this gathers masked rows (zeros) into the idle buffer.
         _v4_2buff_gather(
             unified_kv_ptr,
             kv_u8_ptr,
@@ -1173,12 +1183,13 @@ def _pa_decode_sparse_fp8(
             ROPE_W,
             SC_OFF,
         )
-
         gl.amd.gfx1250.tdm.async_wait(4)
         if CTAS_H > 1:
             gl.amd.gfx1250.cluster.arrive()
             gl.amd.gfx1250.cluster.wait()
 
+        buf = i % NUM_BUFFERS
+        # ---- S(i)
         if Q_TDM:
             if Q_IN_VGPR:
                 scores = _v4_qk_mx_split_regs(
@@ -1190,8 +1201,8 @@ def _pa_decode_sparse_fp8(
                     qsv1,
                     qsv2,
                     qsv3,
-                    kv_bufs.index(i % NUM_BUFFERS),
-                    scale_bufs.index(i % NUM_BUFFERS),
+                    kv_bufs.index(buf),
+                    scale_bufs.index(buf),
                     dot_k_layout,
                     k_sc_chunk_layout,
                     QK_WMMA_LAYOUT,
@@ -1203,8 +1214,8 @@ def _pa_decode_sparse_fp8(
                 scores = _v4_qk_mx_split(
                     q_smem,
                     qs_smem,
-                    kv_bufs.index(i % NUM_BUFFERS),
-                    scale_bufs.index(i % NUM_BUFFERS),
+                    kv_bufs.index(buf),
+                    scale_bufs.index(buf),
                     dot_q_layout,
                     dot_k_layout,
                     q_sc_chunk_layout,
@@ -1216,8 +1227,8 @@ def _pa_decode_sparse_fp8(
                     MXK,
                 )
         else:
-            k_e4m3 = kv_bufs.index(i % NUM_BUFFERS).permute([1, 0]).load(dot_k_layout)
-            k_scale = scale_bufs.index(i % NUM_BUFFERS).load(k_scale_layout)
+            k_e4m3 = kv_bufs.index(buf).permute([1, 0]).load(dot_k_layout)
+            k_scale = scale_bufs.index(buf).load(k_scale_layout)
             scores = gl.amd.gfx1250.wmma_scaled(
                 mfma_q,
                 q_scale,
@@ -1227,13 +1238,54 @@ def _pa_decode_sparse_fp8(
                 "e4m3",
                 gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=QK_WMMA_LAYOUT),
             )
-        kr_t = rope_bufs.index(i % NUM_BUFFERS).permute([1, 0]).load(dot_kr_layout)
+        kr_t = rope_bufs.index(buf).permute([1, 0]).load(dot_kr_layout)
+        scores = qk_scale * _v4_qk_rope(
+            scores,
+            mfma_qr,
+            qr_sc,
+            kr_t,
+            scale_bufs.index(buf),
+            k_sc_chunk_layout,
+            BF16_WMMA_LAYOUT,
+            QK_WMMA_LAYOUT,
+            BLOCK_H,
+            BLOCK_K,
+            NUM_MX_BLOCKS,
+            ROPE_FP8,
+        )
+        if MASK_TILE:
+            scores = scores + gl.where(cur_valid, 0.0, float("-inf"))[None, :]
+        else:
+            in_range = (tile_start + i) * BLOCK_K + k_offs_mma < kv_len
+            scores = scores + gl.where(in_range, 0.0, float("-inf"))[None, :]
 
+        # ---- softmax and PV of tile i - 1 (independent of S(i) and V(i))
+        m_block = gl.max(s_prev, axis=1)
+        m_new = gl.maximum(m_i, m_block)
+        m_safe = gl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = gl.exp2(m_i - m_safe)
+        p = gl.exp2(s_prev - m_safe[:, None])
+        l_i = l_i * alpha + gl.sum(p, axis=1)
+        m_i = m_new
+        alpha_pv = gl.convert_layout(alpha[:, None], layout=PV_WMMA_LAYOUT)
+        a0 = a0 * alpha_pv
+        a1 = a1 * alpha_pv
+        p_dot = gl.convert_layout(p.to(gl.bfloat16), dot_p_layout)
+        a0, a1 = _v4_pv_bf16(
+            p_dot,
+            kv_bf16.index((i + 1) % 2),
+            a0,
+            a1,
+            dot_v_layout,
+            PV_HALF,
+        )
+
+        # ---- V(i) -> bf16 stage i % 2
         _v4_dequant_lora_mx(
-            kv_bufs.index(i % NUM_BUFFERS),
-            scale_bufs.index(i % NUM_BUFFERS),
-            kv_bf16.index(0),
-            rope_bufs.index(i % NUM_BUFFERS),
+            kv_bufs.index(buf),
+            scale_bufs.index(buf),
+            kv_bf16.index(i % 2),
+            rope_bufs.index(buf),
             KVR_BLOCKED_LAYOUT,
             NOPE_DIM,
             ROPE_DIM,
@@ -1246,46 +1298,7 @@ def _pa_decode_sparse_fp8(
             PV2,
             ROPE_FP8,
         )
-        scores = qk_scale * _v4_qk_rope(
-            scores,
-            mfma_qr,
-            qr_sc,
-            kr_t,
-            scale_bufs.index(i % NUM_BUFFERS),
-            k_sc_chunk_layout,
-            BF16_WMMA_LAYOUT,
-            QK_WMMA_LAYOUT,
-            BLOCK_H,
-            BLOCK_K,
-            NUM_MX_BLOCKS,
-            ROPE_FP8,
-        )
-
-        if MASK_TILE:
-            scores = scores + gl.where(cur_valid, 0.0, float("-inf"))[None, :]
-
-        m_block = gl.max(scores, axis=1)
-        m_new = gl.maximum(m_i, m_block)
-        m_safe = gl.where(m_new == float("-inf"), 0.0, m_new)
-        alpha = gl.exp2(m_i - m_safe)
-        p = gl.exp2(scores - m_safe[:, None])
-        l_new = l_i * alpha + gl.sum(p, axis=1)
-
-        alpha_pv = gl.convert_layout(alpha[:, None], layout=PV_WMMA_LAYOUT)
-        a0 = a0 * alpha_pv
-        a1 = a1 * alpha_pv
-        p_dot = gl.convert_layout(p.to(gl.bfloat16), dot_p_layout)
-        a0, a1 = _v4_pv_bf16(
-            p_dot,
-            kv_bf16.index(0),
-            a0,
-            a1,
-            dot_v_layout,
-            PV_HALF,
-        )
-
-        m_i = m_new
-        l_i = l_new
+        s_prev = scores
         if MASK_TILE:
             cur_valid = next_valid
 
@@ -1293,117 +1306,26 @@ def _pa_decode_sparse_fp8(
     if CTAS_H > 1:
         gl.amd.gfx1250.cluster.arrive()
         gl.amd.gfx1250.cluster.wait()
-    if MASK_TILE:
-        valid_col = cur_valid
-    else:
-        valid_col = (tile_end - 1) * BLOCK_K + k_offs_mma < kv_len
-
-    final_idx = (num_iters - 1) % NUM_BUFFERS
-    if Q_TDM:
-        if Q_IN_VGPR:
-            scores = _v4_qk_mx_split_regs(
-                qv0,
-                qv1,
-                qv2,
-                qv3,
-                qsv0,
-                qsv1,
-                qsv2,
-                qsv3,
-                kv_bufs.index(final_idx),
-                scale_bufs.index(final_idx),
-                dot_k_layout,
-                k_sc_chunk_layout,
-                QK_WMMA_LAYOUT,
-                BLOCK_H,
-                BLOCK_K,
-                MXK,
-            )
-        else:
-            scores = _v4_qk_mx_split(
-                q_smem,
-                qs_smem,
-                kv_bufs.index(final_idx),
-                scale_bufs.index(final_idx),
-                dot_q_layout,
-                dot_k_layout,
-                q_sc_chunk_layout,
-                k_sc_chunk_layout,
-                QK_WMMA_LAYOUT,
-                BLOCK_H,
-                BLOCK_K,
-                BLOCK_D,
-                MXK,
-            )
-    else:
-        k_e4m3 = kv_bufs.index(final_idx).permute([1, 0]).load(dot_k_layout)
-        k_scale = scale_bufs.index(final_idx).load(k_scale_layout)
-        scores = gl.amd.gfx1250.wmma_scaled(
-            mfma_q,
-            q_scale,
-            "e4m3",
-            k_e4m3,
-            k_scale,
-            "e4m3",
-            gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=QK_WMMA_LAYOUT),
-        )
-    kr_t = rope_bufs.index(final_idx).permute([1, 0]).load(dot_kr_layout)
-    scores = qk_scale * _v4_qk_rope(
-        scores,
-        mfma_qr,
-        qr_sc,
-        kr_t,
-        scale_bufs.index(final_idx),
-        k_sc_chunk_layout,
-        BF16_WMMA_LAYOUT,
-        QK_WMMA_LAYOUT,
-        BLOCK_H,
-        BLOCK_K,
-        NUM_MX_BLOCKS,
-        ROPE_FP8,
-    )
-    scores = scores + gl.where(valid_col, 0.0, float("-inf"))[None, :]
-
-    _v4_dequant_lora_mx(
-        kv_bufs.index(final_idx),
-        scale_bufs.index(final_idx),
-        kv_bf16.index(0),
-        rope_bufs.index(final_idx),
-        KVR_BLOCKED_LAYOUT,
-        NOPE_DIM,
-        ROPE_DIM,
-        BLOCK_K,
-        CHUNK2_LAYOUT,
-        CHUNK3_LAYOUT,
-        SC_SPAN,
-        PV0,
-        PV1,
-        PV2,
-        ROPE_FP8,
-    )
-
-    m_block = gl.max(scores, axis=1)
+    # ---- softmax and PV of the last tile
+    m_block = gl.max(s_prev, axis=1)
     m_new = gl.maximum(m_i, m_block)
     m_safe = gl.where(m_new == float("-inf"), 0.0, m_new)
     alpha = gl.exp2(m_i - m_safe)
-    p = gl.exp2(scores - m_safe[:, None])
-    p = gl.where(valid_col[None, :], p, 0.0)
-    l_new = l_i * alpha + gl.sum(p, axis=1)
-
+    p = gl.exp2(s_prev - m_safe[:, None])
+    l_i = l_i * alpha + gl.sum(p, axis=1)
+    m_i = m_new
     alpha_pv = gl.convert_layout(alpha[:, None], layout=PV_WMMA_LAYOUT)
     a0 = a0 * alpha_pv
     a1 = a1 * alpha_pv
     p_dot = gl.convert_layout(p.to(gl.bfloat16), dot_p_layout)
     a0, a1 = _v4_pv_bf16(
         p_dot,
-        kv_bf16.index(0),
+        kv_bf16.index((num_iters - 1) % 2),
         a0,
         a1,
         dot_v_layout,
         PV_HALF,
     )
-    m_i = m_new
-    l_i = l_new
 
     h_offs_o = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, OUT_BLOCKED_LAYOUT))
     h_offs_o_eff = h_off_base + h_offs_o
