@@ -470,9 +470,11 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
         runtime = moe._large_m
         if runtime is None:
             raise AssertionError("large-M path was requested but did not activate")
-        if runtime._s1_op.indexed_payload:
-            raise AssertionError("large-M path must use a non-indexed payload")
         config = runtime._active_config
+        if runtime._s1_op.indexed_payload != config.fused_stage1.dedup_rows:
+            raise AssertionError(
+                "large-M payload must be indexed exactly when the dispatch dedups its rows"
+            )
         if (
             config.stage1.num_waves != 8
             or config.stage2.block_m != 64
@@ -481,7 +483,8 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
             raise AssertionError("large-M path did not select its NW8/BN512 emitter")
         if rank == 0:
             print(
-                "[LARGE-M] active=PASS payload=non-indexed "
+                "[LARGE-M] active=PASS payload="
+                f"{'indexed' if config.fused_stage1.dedup_rows else 'route-major'} "
                 "emitter=NW8/BN512 bf16_launches=2",
                 flush=True,
             )

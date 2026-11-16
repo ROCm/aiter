@@ -3043,11 +3043,29 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
 
 
 class LargeMRuntime:
-    """Non-indexed GEMM1 -> GEMM2 -> combine persistent pipeline."""
+    """GEMM1 -> GEMM2 -> combine persistent pipeline."""
 
-    # Group-major dispatch layout of the fused kernel: compact, 128-row units, route-major payload.
+    # Group-major dispatch layout of the fused kernel: compact, 128-row units; the payload rows are route-major, or
+    # one per source token under dedup_rows (indexed_payload).
     GM_UNIT_SIZE = 128
     GM_COMPACT = True
+
+    @classmethod
+    def indexed_payload(
+        cls, *, world_size, model_dim, inter_dim, experts, max_tok_per_rank
+    ):
+        """Whether the dispatch stores one payload row per (source rank, token): dedup_rows sends a token's row to a
+        destination once, at row rank * mtpr + token, so the route-major rows are never written.
+        """
+        # The large-input config is the same for every token count.
+        return select_fused_config(
+            1,
+            max_tok_per_rank,
+            world_size=world_size,
+            experts_per_rank=experts // world_size,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+        ).fused_stage1.dedup_rows
 
     @classmethod
     def payload_capacity(
@@ -3064,6 +3082,13 @@ class LargeMRuntime:
             unit_size=cls.GM_UNIT_SIZE,
             scale_dim=model_dim // 32,
             compact=cls.GM_COMPACT,
+            indexed_payload=cls.indexed_payload(
+                world_size=world_size,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                experts=experts,
+                max_tok_per_rank=max_tok_per_rank,
+            ),
         )
 
     @classmethod
@@ -3136,7 +3161,9 @@ class LargeMRuntime:
             num_experts_per_token=self.topk, combine_dtype=torch.bfloat16,
             dispatch_dtype=torch.float8_e4m3fn, scale_dim=self._s1_scale_dim, scale_type_size=1,
             enable_std_moe=False, enable_group_major=True, gm_unit_size=self.GM_UNIT_SIZE,
-            gm_scheme=mega_scheme, gm_compact=self.GM_COMPACT, gm_indexed_payload=False,
+            gm_scheme=mega_scheme, gm_compact=self.GM_COMPACT,
+            gm_indexed_payload=self.indexed_payload(world_size=self.world_size, model_dim=self.model_dim,
+                inter_dim=self.inter_dim, experts=self.experts, max_tok_per_rank=self.mtpr),
             max_total_recv_tokens=self.world_size)
         # fmt: on
         self.comb_op = FlyDSLDispatchCombineIntraNodeOp(

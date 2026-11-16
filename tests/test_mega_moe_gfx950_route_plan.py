@@ -247,14 +247,20 @@ def test_large_m_buffers_fit_32bit_offsets(layout):
             model_dim=model_dim,
             inter_dim=inter_dim,
         )
-        num_valid_max = LargeMRuntime.payload_capacity(
+        num_valid_max, payload_rows, _, _ = LargeMRuntime.payload_capacity(
             world_size=world_size,
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=world_size * epr,
             topk=6,
             max_tok_per_rank=mtpr,
-        )[0]
+        )
+        # dedup_rows writes and GEMM1 reads payload rows [0, world_size * mtpr) only: one row a source token.
+        if config.fused_stage1.dedup_rows:
+            assert payload_rows == world_size * mtpr + 1, (layout, mtpr)
+            assert world_size * mtpr * model_dim < 1 << 31, (layout, mtpr)
+        else:
+            assert payload_rows == num_valid_max, (layout, mtpr)
         s2_spec, _ = large_m_kernel_specs(
             config,
             model_dim=model_dim,
