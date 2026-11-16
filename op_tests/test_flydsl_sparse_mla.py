@@ -31,7 +31,8 @@ Suites:
   routes       the V^T route each launch compiles; order_plan keeps the
                caller's indices.
   contract     invalid scales, geometry, devices and metadata are rejected
-               before any compile or launch.
+               before any compile or launch, and flydsl_sparse_mla_fwd_supported
+               agrees with the forward.
   index_order  the physical-page reorder op on full 16384 x 2048 workloads.
   performance  GLM-5.3-Flash chunked prefill and decode on a 4 GiB paged pool
                (3640 blocks x 1152 rows, one 131072-token request), against
@@ -185,6 +186,7 @@ METADATA = (
     "splits_zero",
     "splits_large",
     "workspace",
+    "workspace_overlap",
     "max_seqlen",
 )
 CONTRACT = (
@@ -630,6 +632,12 @@ def contract_call(case):
     elif value == "workspace":
         kwargs["num_splits"] = 2
         kwargs["workspace"] = (q, q)
+    elif value == "workspace_overlap":
+        kwargs["num_splits"] = 2
+        partial = torch.empty((3, 2, H, D))
+        stats = partial.flatten()[: 3 * 2 * H * 2].view(3, 2, H, 2)
+        kwargs["workspace"] = (partial, stats)
+        return (q, kv, indices), kwargs, ValueError, "overlap"
     else:
         kwargs["max_seqlen"] = 0.5
     return (q, kv, indices), kwargs, ValueError, ""
@@ -655,6 +663,64 @@ def test_contract(case):
             assert message in str(exc), f"{case}: unexpected message {exc}"
             return {"rejected": type(exc).__name__}
     raise AssertionError(f"{case}: invalid call accepted")
+
+
+# Routing predicate cases and whether the call is supported.
+SUPPORTED = {
+    "int32": True,
+    "int64": True,
+    "sink_bf16_4x4": True,
+    "device=q": False,
+    "device=kv_buffer": False,
+    "device=kv_indices": False,
+    "device=attn_sink": False,
+    "index_dtype": False,
+    "sink_dtype": False,
+}
+
+
+@benchmark()
+def test_supported(case):
+    """The routing predicate rejects devices and dtypes the forward rejects. A
+    supported call runs once the caller converts indices and sink as documented.
+    """
+    torch.manual_seed(67)
+    q = torch.randn((3, H, D), dtype=dtypes.bf16)
+    kv = torch.randn((64, D), dtype=dtypes.bf16)
+    values = {
+        "q": q,
+        "kv_buffer": kv,
+        "kv_indices": torch.randint(64, (96,), dtype=dtypes.i32),
+        "attn_sink": torch.randn(H),
+    }
+    kind, _, operand = case.partition("=")
+    if kind == "device":
+        values[operand] = values[operand].cpu()
+    elif case == "int64":
+        values["kv_indices"] = values["kv_indices"].long()
+    elif case == "index_dtype":
+        values["kv_indices"] = values["kv_indices"].float()
+    elif case == "sink_bf16_4x4":
+        values["attn_sink"] = values["attn_sink"].view(4, 4).to(dtypes.bf16)
+    elif case == "sink_dtype":
+        values["attn_sink"] = torch.zeros(H, dtype=dtypes.i32)
+    sink = values["attn_sink"]
+    supported = serving.flydsl_sparse_mla_fwd_supported(
+        values["q"],
+        values["kv_buffer"],
+        values["kv_indices"],
+        kv_lora_rank=D,
+        qk_rope_head_dim=0,
+        attn_sink=sink,
+    )
+    assert supported == SUPPORTED[case], f"{case}: supported={supported}"
+    if supported:
+        indices = values["kv_indices"].to(dtypes.i32).contiguous()
+        sink = sink.reshape(-1).to(dtypes.fp32).contiguous()
+        indptr = torch.arange(4, dtype=dtypes.i32) * 32
+        out = flydsl_sparse_mla_fwd(q, kv, indices, kv_indptr=indptr, attn_sink=sink)
+        check_output(run_torch(q, kv, indices.view(3, 32), sink), out, case)
+    return {"supported": supported}
 
 
 @benchmark()
@@ -911,7 +977,9 @@ def suites(args):
         (test_routes, {"source": source})
         for source in ("none", "ordered_indices", "order_plan")
     ]
-    yield "contract", [(test_contract, {"case": case}) for case in CONTRACT]
+    yield "contract", [(test_contract, {"case": case}) for case in CONTRACT] + [
+        (test_supported, {"case": case}) for case in SUPPORTED
+    ]
     yield "index_order", [(test_index_order, {"requests": n}) for n in (1, 2)]
     yield "performance", [
         (test_performance, {"tokens": t, "order": o, "has_sink": bool(s)})

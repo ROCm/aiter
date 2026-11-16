@@ -3,9 +3,9 @@
 
 """gfx942 bf16 absorbed sparse MLA for serving (H=16, D=512).
 
-``sparse_mla_fwd`` (aiter.ops.triton.attention.sparse_mla) routes its
-matching rope-free calls here when AITER_SPARSE_MLA_FLYDSL=1. Call
-``flydsl_sparse_mla_fwd`` directly for dense indices and the ordered routes.
+Call ``flydsl_sparse_mla_fwd`` directly; no existing dispatcher routes here.
+``flydsl_sparse_mla_fwd_supported`` is the metadata check for a caller that
+routes ``sparse_mla_fwd`` calls to it.
 """
 
 from __future__ import annotations
@@ -127,11 +127,20 @@ def flydsl_sparse_mla_fwd_supported(
 ) -> bool:
     """Whether a ``sparse_mla_fwd`` call fits ``flydsl_sparse_mla_fwd``.
 
-    gfx942, rope-free bf16, q [C,16,512], a contiguous bf16 pool that views
-    as [slots,512], an exact-shape contiguous out and a 16-entry sink. The
-    caller still rules out LSE, skip_reduce, extra segments and epilogues.
+    Reads metadata only: gfx942, rope-free bf16, contiguous q [C,16,512] on a
+    GPU, a contiguous bf16 pool that views as [slots,512], an exact-shape
+    contiguous out, integer indices and a floating sink with 16 entries, all
+    on q's device. True means the forward accepts the call after the caller
+    converts indices and indptr to contiguous int32 and the sink to
+    contiguous fp32 [16]. The caller still rules out LSE, skip_reduce, extra
+    segments and epilogues.
     """
-    if get_gfx_runtime() != "gfx942":
+    if get_gfx_runtime() != "gfx942" or q.device.type != "cuda":
+        return False
+    operands = (kv_buffer, kv_indices, out, attn_sink)
+    if any(t is not None and t.device != q.device for t in operands):
+        return False
+    if kv_indices.dtype not in (torch.int32, torch.int64):
         return False
     if (kv_lora_rank, qk_rope_head_dim, dot_precision) != (HEAD_DIM, 0, "bf16"):
         return False
@@ -150,7 +159,9 @@ def flydsl_sparse_mla_fwd_supported(
         out.shape != q.shape or out.dtype != q.dtype or not out.is_contiguous()
     ):
         return False
-    if attn_sink is not None and attn_sink.numel() != NUM_HEADS:
+    if attn_sink is not None and (
+        attn_sink.numel() != NUM_HEADS or not attn_sink.is_floating_point()
+    ):
         return False
     if kv_indices.numel() * 4 > 0xFFFFFFFF:
         return False
@@ -198,6 +209,9 @@ def flydsl_sparse_mla_fwd(
     A reusable workspace is (fp32 [T,S,16,512], fp32 [T,S,16,2]). The first
     tensor is opaque scratch, stored in coalesced [T,S,128,16,4] order. Each call
     writes all partials, including empty splits. This is safe for graph replay.
+    The two tensors must not overlap each other or q, kv, indices and out, and
+    one workspace serves one call at a time: calls that may overlap on other
+    streams need their own.
 
     Index order picks the V^T route of unsplit launches. Results are the
     same either way; only speed changes. The choice is a call-site contract,
@@ -306,6 +320,9 @@ def flydsl_sparse_mla_fwd(
                     f"workspace must contain contiguous fp32 {shape} on q.device"
                 )
         partial, stats = workspace
+        first, second = sorted((partial, stats), key=lambda t: t.data_ptr())
+        if first.data_ptr() + first.nbytes > second.data_ptr():
+            raise ValueError("workspace partials and stats must not overlap")
         target, target_type = partial, fx.Float32
     else:
         target, target_type, stats = out, fx.BFloat16, q
