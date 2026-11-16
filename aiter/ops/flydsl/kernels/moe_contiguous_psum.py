@@ -17,6 +17,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32
 
+from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,

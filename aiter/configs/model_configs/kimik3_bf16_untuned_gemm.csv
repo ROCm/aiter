@@ -619,3 +619,13 @@ M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle
 192,768,7168,False,torch.bfloat16,torch.bfloat16,False,False
 208,768,7168,False,torch.bfloat16,torch.bfloat16,False,False
 224,768,7168,False,torch.bfloat16,torch.bfloat16,False,False
+8,2880,7168,False,torch.bfloat16,torch.bfloat16,False,False
+16,2880,7168,False,torch.bfloat16,torch.bfloat16,False,False
+32,2880,7168,False,torch.bfloat16,torch.bfloat16,False,False
+64,2880,7168,False,torch.bfloat16,torch.bfloat16,False,False
+128,2880,7168,False,torch.bfloat16,torch.bfloat16,False,False
+8,3648,7168,False,torch.bfloat16,torch.bfloat16,False,False
+16,3648,7168,False,torch.bfloat16,torch.bfloat16,False,False
+32,3648,7168,False,torch.bfloat16,torch.bfloat16,False,False
+64,3648,7168,False,torch.bfloat16,torch.bfloat16,False,False
+128,3648,7168,False,torch.bfloat16,torch.bfloat16,False,False
