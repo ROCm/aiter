@@ -591,7 +591,7 @@ def test_routes_run_on_each_device_in_turn(set_current, route_spy):
     # The same geometries on cuda:0 then cuda:1 reuse each launcher, whether or
     # not the caller made the tensors' device current.
     cases = [
-        ("flydsl", lambda: _inputs((300, 4097), 64), {}),
+        ("uniform", lambda: _inputs((300, 4097), 64), {}),
         ("flydsl", lambda: _inputs((300, 4097), 64), {"window_size": WINDOW}),
         ("flydsl", lambda: _ragged_inputs((40, 1, 7), (16384, 4097, 2048), 64), {}),
     ]
