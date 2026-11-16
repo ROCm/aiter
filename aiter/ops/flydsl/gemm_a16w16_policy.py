@@ -68,7 +68,7 @@ class GemmConfigPruner:
             config["k_waves"]
             * config["block_m"]
             * config["block_n"]
-            * (4 if config.get("policy") == "sp" else self.element_bytes),
+            * self.element_bytes,
         )
         if self.tdm:
             pad = 8
@@ -342,8 +342,6 @@ def get_flydsl_a16w16_configs(
 ):
     """Generate and validate the shape-aware policy catalog used by tuning."""
 
-    if min(m, n, k) <= 0:
-        return []
     if dtype not in (torch.float16, torch.bfloat16):
         return []
     if out_dtype not in (dtype, torch.float32):
@@ -357,12 +355,15 @@ def get_flydsl_a16w16_configs(
     if get_gfx_runtime() != "gfx950":
         return []
 
+    # FT may distribute whole K tiles unevenly. The kernel validator retains
+    # the stricter HTI/alignment requirements for each candidate.
+    split_k_candidates = list(range(1, min(k, 9) + 1))
     selections = {
         "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
         "block_n": [16, 32, 64, 80, 96, 128, 160, 256],
         "block_k": [64, 128, 256],
         "stages": list(range(2, 10)),
-        "split_k": list(range(1, 10)),
+        "split_k": split_k_candidates,
         "m_waves": [1, 2, 4],
         "n_waves": [1, 2, 4],
         "k_waves": [1, 2],
@@ -373,23 +374,6 @@ def get_flydsl_a16w16_configs(
         dict(zip(selections, combo))
         for combo in itertools.product(*selections.values())
     ]
-    # The same tile axes feed both protocols. Atomic split-K retains its
-    # equal-partition constraint; independent FP32 planes balance whole K tiles.
-    plane_configs = []
-    if dtype == out_dtype == torch.bfloat16 and not has_bias:
-        plane_configs = [
-            dict(config, policy="sp")
-            for config in configs
-            if not config["use_half_tile_interleaved"]
-            and config["k_waves"] == 1
-            and config["split_k"] > 1
-            and k % config["block_k"] == 0
-            and k // config["block_k"] // config["split_k"] >= config["stages"] - 1
-            and config["split_k"] * m * n * 4 < 2**31
-            and max(m, n) * k * 2 < 2**31
-        ]
-    configs = [config for config in configs if k % config["split_k"] == 0]
-    configs += plane_configs
     device_props = torch.cuda.get_device_properties(torch.cuda.current_device())
     configs = GemmConfigPruner(
         m,
@@ -407,7 +391,7 @@ def get_flydsl_a16w16_configs(
     memory_configs = []
     is_large_gemm = m >= 4096 and n >= 4096 and k >= 4096
     for config in configs:
-        if is_large_gemm and config.get("policy") != "sp":
+        if is_large_gemm:
             if not (
                 config["use_half_tile_interleaved"]
                 and config["block_m"] == 256
@@ -437,11 +421,6 @@ def get_flydsl_a16w16_configs(
             "b_is_transposed": True,
             "has_bias": has_bias,
         }
-        if config.get("policy") == "sp":
-            validation_config.pop("policy")
-            validation_config.update(
-                out_dtype_id=GEMM_A16W16_DTYPE_FP32, split_k_partials=True
-            )
         if (
             make_gemm_a16w16_param_and_validate(
                 m,
@@ -453,9 +432,9 @@ def get_flydsl_a16w16_configs(
         ):
             valid_configs.append(config)
             # Stagger is a measured option, never a global default. At small
-            # M, a single row tile streams B. The plane protocol also compares
-            # stagger and B cache policy as ordinary search dimensions.
-            if config.get("policy") == "sp" or (m <= 128 and m <= config["block_m"]):
+            # M, a single row tile streams B; preserve the original catalog
+            # and let tuning race stagger and B cache policy against the original.
+            if m <= 128 and m <= config["block_m"]:
                 memory_configs.extend(
                     {**config, "k_stagger": stride, "b_non_temporal": nt}
                     for stride in (0, 1, 3)

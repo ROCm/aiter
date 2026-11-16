@@ -331,7 +331,7 @@ def _flydsl_b_non_temporal_configs(configs, mode, gfx):
     if mode not in ("auto", "off", "on", "both"):
         raise ValueError(f"Invalid FlyDSL B non-temporal mode: {mode}")
     if mode == "auto":
-        # Keep the cache policies supplied by the common search pool.
+        # Preserve the previous catalog, including its order and solidx values.
         return configs
     choices = (False, True) if mode == "both" else (mode == "on",)
     selected = []
@@ -339,7 +339,7 @@ def _flydsl_b_non_temporal_configs(configs, mode, gfx):
         policy = config.get(
             "policy", "ht" if config["use_half_tile_interleaved"] else "ft"
         )
-        if gfx == "gfx950" and policy in ("ft", "ht", "hti", "sp"):
+        if gfx == "gfx950" and policy in ("ft", "ht", "hti"):
             selected.extend(dict(config, b_non_temporal=nt) for nt in choices)
         elif config.get("b_non_temporal", False) in choices:
             # Skinny/TDM do not implement BNT; band-stream requires it.
@@ -503,10 +503,9 @@ class GemmA16W16Tuner(GemmCommonTuner):
             dest="flydsl_b_non_temporal",
             choices=("auto", "off", "on", "both"),
             default=self.ARG_DEFAULTS["flydsl_b_non_temporal"],
-            help="FlyDSL B cache-policy candidates: auto keeps the common pool's "
-            "cache choices; off/on select cached/non-temporal loads; both compares "
-            "both for every eligible gfx950 FT/HT/split-plane configuration. "
-            "Policies without that "
+            help="FlyDSL B cache-policy candidates: auto preserves the existing "
+            "catalog; off/on select cached/non-temporal loads; both compares "
+            "both for every eligible gfx950 FT/HT tile. Policies without that "
             "mode are excluded (on yields no candidates on non-gfx950). "
             "This controls tuning only, not runtime CSV selection. Winning "
             "names encode _bnt_; old names without it remain cached.",
