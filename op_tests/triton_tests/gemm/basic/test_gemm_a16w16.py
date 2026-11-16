@@ -62,7 +62,8 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
 # highest M of each tuned gfx1250 Gluon bucket.
 @pytest.mark.parametrize(
     "M, N, K",
-    get_shapes() + [(M, 384, 5120) for M in (545, 576, 641, 672, 737, 768)],
+    get_shapes()
+    + [(M, 384, 5120) for M in (545, 576, 641, 672, 737, 768, 1025, 1344, 1345, 1536)],
 )
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 @pytest.mark.parametrize("kernel_type", ["bandwidth_bound", "compute_bound"])
