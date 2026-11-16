@@ -586,28 +586,24 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     return kernels
 
 
-# PCI device ids the gfx942 a8w4 stage1 is enabled on. MI300X (0x74A1) is the same
-# gfx942 / 304 CU part, so it shares the tuned CSV rows, but there a8w4 is slower than
-# a16w4 at large M (latency-bound stage 1; 0.81-0.89x at M >= 1024).
-_A8W4_GFX942_CHIP_IDS = {0x74A5, 0x74B9}  # MI325X, MI325X VF (SR-IOV guests)
-
-
 @functools.cache
 def _a8w4_gfx942_chip_id(device: int) -> int:
-    # sysfs rather than hipDeviceGetAttribute(PciChipId) from Python: the enum value
-    # is not a stable number (chip_info._get_pci_chip_id uses 10019 on HIP < 7.1,
-    # which returns 0x200 on ROCm 7.2.4 / 7.13 / 7.14; PciChipId is 10020 there).
-    from aiter.jit.utils.chip_info import get_pci_chip_id_sysfs
+    # 0 when the id cannot be read, so the gate fails closed.
+    from aiter.jit.utils.chip_info import _get_pci_chip_id
 
     try:
-        return get_pci_chip_id_sysfs(device)
-    except OSError:
-        # sysfs node unreadable: assume MI325X when the device name says so.
-        return 0x74A5 if "MI325" in torch.cuda.get_device_properties(device).name else 0
+        return _get_pci_chip_id(device)
+    except RuntimeError:
+        return 0
 
 
 def a8w4_gfx942_supported(device=None) -> bool:
-    """True on the gfx942 parts the a8w4 stage1 is enabled on (MI325X)."""
+    """True on the gfx942 parts the a8w4 stage1 is enabled on (MI325X).
+
+    MI300X (0x74A1) is the same gfx942 / 304 CU part, so it shares the tuned CSV rows,
+    but there a8w4 is slower than a16w4 at large M (latency-bound stage 1; 0.81-0.89x
+    at M >= 1024).
+    """
     if os.getenv("AITER_AOT_REPLAY") == "1":
         # An AOT replay has no device and compiles for the arch GPU_ARCHS names; the
         # device check applies when serving.
@@ -615,7 +611,9 @@ def a8w4_gfx942_supported(device=None) -> bool:
     idx = device.index if isinstance(device, torch.device) else device
     if idx is None:
         idx = torch.cuda.current_device()
-    return _a8w4_gfx942_chip_id(int(idx)) in _A8W4_GFX942_CHIP_IDS
+    from aiter.jit.utils.chip_info import MI325X_CHIP_IDS
+
+    return _a8w4_gfx942_chip_id(int(idx)) in MI325X_CHIP_IDS
 
 
 def get_flydsl_stage1_kernels_a8w4_gfx942() -> dict[str, dict]:
