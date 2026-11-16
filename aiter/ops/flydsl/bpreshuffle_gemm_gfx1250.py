@@ -73,12 +73,18 @@ def run_preshuffle_gemm_a8_gfx1250(
     cluster_m: int = 1,
     cluster_n: int = 1,
     split_k: int = 1,
+    partials: Tensor | None = None,
 ) -> Tensor:
     """Run the gfx1250 WMMA a8w8 bpreshuffle (ptpc) GEMM; writes into ``Out``.
 
     XQ: (M, K) FP8 E4M3. WQ: (N, K) FP8 E4M3, 16x16 ``shuffle_weight``.
     x_scale: per-token fp32 ``(M,)`` or ``(M, 1)``. w_scale: per-channel fp32
     ``(N,)`` or ``(N, 1)``. ``Out``: (M, N) bf16/f16.
+
+    ``partials``, for ``split_k > 1`` and a dense ``Out`` only: a contiguous fp32
+    ``(split_k, M, N)`` buffer that receives the split-K partials, which are then
+    left unreduced -- ``Out`` is not written. ``reduce_splitk_partials_gfx1250``
+    (or a consumer that sums them the same way) finishes the GEMM.
     """
     _lazy_import()
 
@@ -158,11 +164,27 @@ def run_preshuffle_gemm_a8_gfx1250(
 
     lda = XQ.stride(0)
     ldc = Out.stride(0)
-    partials = (
-        torch.empty((split_k, M, ldc), dtype=torch.float32, device=Out.device)
-        if split_k > 1
-        else None
-    )
+    defer_reduce = partials is not None
+    if defer_reduce:
+        if split_k == 1 or ldc != N:
+            raise RuntimeError(
+                "[FlyDSL gfx1250] partials needs split_k > 1 and a dense Out, got "
+                f"split_k={split_k}, stride(0)={ldc} for N={N}"
+            )
+        if (
+            partials.dtype != torch.float32
+            or partials.shape != (split_k, M, N)
+            or not partials.is_contiguous()
+        ):
+            raise RuntimeError(
+                "[FlyDSL gfx1250] partials must be a contiguous float32 "
+                f"({split_k}, {M}, {N}) tensor, got {partials.dtype} "
+                f"{tuple(partials.shape)} strides={tuple(partials.stride())}"
+            )
+    elif split_k > 1:
+        partials = torch.empty(
+            (split_k, M, ldc), dtype=torch.float32, device=Out.device
+        )
     gemm_out = Out if partials is None else partials
     out_is_f16 = 1 if out_dtype == "f16" else 0
 
@@ -207,20 +229,51 @@ def run_preshuffle_gemm_a8_gfx1250(
         _ptr_arg(Out),  # arg_scale_out
         specialization_key=gemm_spec,
     )
-    if partials is not None:
-        dense = ldc == N
-        _run_compiled(
-            _compile_splitk_reduce(
-                split_k=split_k, out_dtype_str=out_dtype, partial_dtype_str="f32"
-            ),
-            _ptr_arg(partials),
-            _ptr_arg(Out),
-            M * N if dense else N,
-            1 if dense else M,
-            ldc,
-            M * ldc * partials.element_size(),
-            stream,
+    if partials is not None and not defer_reduce:
+        _launch_splitk_reduce(partials, Out, out_dtype, stream)
+    return Out
+
+
+def _launch_splitk_reduce(partials: Tensor, Out: Tensor, out_dtype: str, stream):
+    """Sum the fp32 ``(split_k, M, ldc)`` partials into ``Out`` in split order."""
+    split_k, M, ldc = partials.shape
+    N = Out.shape[1]
+    dense = ldc == N
+    _run_compiled(
+        _compile_splitk_reduce(
+            split_k=split_k, out_dtype_str=out_dtype, partial_dtype_str="f32"
+        ),
+        _ptr_arg(partials),
+        _ptr_arg(Out),
+        M * N if dense else N,
+        1 if dense else M,
+        ldc,
+        M * ldc * partials.element_size(),
+        stream,
+    )
+
+
+def reduce_splitk_partials_gfx1250(partials: Tensor, Out: Tensor) -> Tensor:
+    """Finish a GEMM run with ``partials=``: reduce its contiguous fp32
+    ``(split_k, M, N)`` partials into the dense ``(M, N)`` bf16/f16 ``Out`` with
+    the same kernel the GEMM would have launched."""
+    _lazy_import()
+    out_dtype = _OUT_DTYPE_NAME.get(Out.dtype)
+    if (
+        out_dtype is None
+        or partials.dim() != 3
+        or partials.dtype != torch.float32
+        or not partials.is_contiguous()
+        or tuple(partials.shape[1:]) != tuple(Out.shape)
+        or not Out.is_contiguous()
+    ):
+        raise RuntimeError(
+            "[FlyDSL gfx1250] reduce needs contiguous float32 (split_k, M, N) "
+            f"partials and a dense bf16/f16 (M, N) Out, got {partials.dtype} "
+            f"{tuple(partials.shape)} and {Out.dtype} {tuple(Out.shape)}"
         )
+    stream = _fx.Stream(torch.cuda.current_stream(device=Out.device))
+    _launch_splitk_reduce(partials, Out, out_dtype, stream)
     return Out
 
 
@@ -247,8 +300,10 @@ def run_gemm_a8w8_bpreshuffle_gfx1250(
     w_scale: Tensor,
     Out: Tensor,
     kernel_name: str,
+    partials: Tensor | None = None,
 ) -> Tensor:
-    """Dispatch entry: decode a tuned wmma kernelName and run the kernel."""
+    """Dispatch entry: decode a tuned wmma kernelName and run the kernel.
+    ``partials``: see ``run_preshuffle_gemm_a8_gfx1250``."""
     cfg = parse_wmma_kernel_name(kernel_name)
     if cfg is None:
         raise ValueError(f"[FlyDSL gfx1250] unrecognised kernelName: {kernel_name!r}")
@@ -267,4 +322,5 @@ def run_gemm_a8w8_bpreshuffle_gfx1250(
         cluster_n=cfg["cluster_n"],
         m_warp=cfg["m_warp"],
         n_warp=cfg["n_warp"],
+        partials=partials,
     )
