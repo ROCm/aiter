@@ -86,6 +86,21 @@ software baseline, nor as an optimization speedup.
 
 ## Recorded baseline
 
+`baselines/minimax_m3_gfx1250.json` is the primary complete baseline: 256 CUs,
+432 GiB HBM, PyTorch `2.11.0+rocm10.1.0a20260811-bkc.20260820`, Triton `3.9.0`
+and FlyDSL `0.5.0`, using the AITER and ATOM revisions below. All **16 UTs passed**,
+including gather and all four Gluon router shapes. All **17 benchmark cases**
+completed with three samples each and non-empty profiler kernel-name evidence.
+
+Representative medians: CP score 20.80 us, local/merge top-k 2.83/2.12 us,
+prefill index score plus top-k 143.62 us, FP8 cache gather 76.52 us, SwiGLU
+M=128 1.71 us, QKV norm/RoPE/cache M=128 4.23 us and Gluon router M=128
+10.15 us. The router profiler names explicitly identify the Gluon gfx1250
+bandwidth-bound implementation. All timing samples and tensor geometry are
+retained in the JSON.
+
+### Additional strict-stack validation
+
 `baselines/minimax_m3_gfx1250_strict.json` records the first measured baseline:
 256 CUs, 432 GiB HBM, PyTorch `2.13.0+rocm10.3.0a20261106`, Triton `3.9.0`,
 FlyDSL `0.5.0`, AITER `3d3d56db3e3e32d823b109bfb60d061a1e0b5b82` and the ATOM
