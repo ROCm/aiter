@@ -614,6 +614,91 @@ def test_pipelined_k_loop(b, m, n, k, kernel_name):
     return mismatch
 
 
+# Fused gate_up + SwiGLU + MXFP8 quant at the DSv4.1 shared-expert shape
+# (2*I = 4608, K = 5120, swiglu_limit 10): M covers every tile bucket of
+# gate_up_silu_kernel_for, ragged M included.
+GATE_UP_SILU_MS = (1, 7, 384, 500, 640, 768, 960, 1152, 1345, 2048, 4096)
+GATE_UP_SILU_SHAPE = (4608, 5120, 10.0)
+
+
+def test_gate_up_silu_fused(m, n2, k, limit, kernel_name=None):
+    """``run_gate_up_silu_mxfp8_32_gfx1250`` against the unfused chain: the
+    bf16 gate_up GEMM (same tile), aiter ``silu_and_mul`` and ATOM
+    ``quantize_fp8``. The e8m0 scales must match exactly; an e4m3 code may
+    differ by one step where the epilogue's exp/rcp and silu_and_mul's
+    round to bf16 values on either side of an e4m3 rounding midpoint.
+    Returns (scale mismatches, e4m3 mismatches, e4m3 codes off by > 1)."""
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
+        gate_up_silu_kernel_for,
+        run_bmm_a8w8_mxfp8_32_gfx1250,
+        run_gate_up_silu_mxfp8_32_gfx1250,
+    )
+
+    name = kernel_name or gate_up_silu_kernel_for(m, n2, k)
+    if name is None:
+        return 0, 0, 0
+    inter = n2 // 2
+    torch.manual_seed(SEED)
+    x = blockwise_randn(m, 1, k, dtype=dtypes.bf16) * 20
+    # Rows past the clamp, tiny rows and a zero row.
+    x[: max(m // 8, 1)] *= 8
+    x[m // 4 : m // 4 + max(m // 8, 1)] *= 1e-3
+    x[m - 1] = 0
+    w = blockwise_randn(1, n2, k, dtype=dtypes.bf16, rows=32)
+    x8, xs8 = quant_act_e8m0(x.to(dtypes.bf16), 32)
+    w8, ws8 = quant_weight_e8m0(w, 32, 32)
+    w_shuf = shuffle_weight(w8)
+
+    gu = torch.empty(m, 1, n2, dtype=dtypes.bf16)
+    run_bmm_a8w8_mxfp8_32_gfx1250(
+        x8, w_shuf, xs8, ws8, gu, kernel_name=name, w_scale_32x32=True
+    )
+    act = torch.empty(m, inter, dtype=dtypes.bf16)
+    aiter.silu_and_mul(act, gu.view(m, n2), limit)
+    q_ref, s_ref = atom_quantize_fp8(act)
+
+    q = torch.empty(m, inter, dtype=dtypes.fp8)
+    sc = torch.empty(m, inter // 32, dtype=torch.uint8)
+    run_gate_up_silu_mxfp8_32_gfx1250(
+        x8.view(m, k),
+        w_shuf.view(n2, k),
+        xs8.view(m, k // 32),
+        ws8.view(n2 // 32, k // 32),
+        q,
+        sc,
+        limit,
+        kernel_name=name,
+    )
+    scale_bad = int((sc != s_ref.view(m, inter // 32)).sum())
+    a = q.view(torch.uint8).to(torch.int32)
+    r = q_ref.view(torch.uint8).to(torch.int32)
+    code_bad = int((a != r).sum())
+    # Same sign and adjacent magnitude codes (e4m3 bytes are sign-magnitude).
+    far = int(
+        ((a != r) & (((a ^ r) & 0x80) | ((a & 0x7F) - (r & 0x7F)).abs() > 1)).sum()
+    )
+    print(
+        f"gate_up silu M={m} N2={n2} K={k} {name}: scale mismatch "
+        f"{scale_bad}/{m * inter // 32}, e4m3 mismatch {code_bad}/{m * inter} "
+        f"(off by more than one code: {far})"
+    )
+    return scale_bad, code_bad, far
+
+
+def _run_gate_up_silu():
+    n2, k, limit = GATE_UP_SILU_SHAPE
+    total = n2 // 2 * sum(GATE_UP_SILU_MS)
+    res = [test_gate_up_silu_fused(m, n2, k, limit) for m in GATE_UP_SILU_MS]
+    scale_bad = sum(r[0] for r in res)
+    code_bad = sum(r[1] for r in res)
+    far = sum(r[2] for r in res)
+    # Isolated one-step e4m3 differences only (far below the MXFP8 noise).
+    if scale_bad or far or code_bad * 10000 > total:
+        print("gate_up silu fused epilogue mismatched")
+        raise SystemExit(1)
+    print("gate_up silu fused epilogue OK")
+
+
 def _run_pipelined():
     bad = sum(bool(test_pipelined_k_loop(*case)) for case in PIPELINED_CASES)
     if bad:
@@ -771,6 +856,7 @@ def main():
         )
         if not custom_shape:
             _run_pipelined()
+            _run_gate_up_silu()
 
 
 if __name__ == "__main__":
