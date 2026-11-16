@@ -24,7 +24,7 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
-from flydsl.expr import arith, range_constexpr, tdm_ops
+from flydsl.expr import arith, const_expr, range_constexpr, tdm_ops
 from flydsl.expr.rocdl import cvt_scale_pk8_f32_fp4, cvt_scale_pk8_f32_fp8
 from flydsl.expr.typing import Int32, Int64, T
 from flydsl.expr.typing import Vector as Vec
@@ -122,6 +122,125 @@ def _make_combine_fused_sync(
     return run
 
 
+# The bf16-wire reduce's lane tile: 8 bf16 (one b128) per lane and slot, 512 lanes
+# a block. A wave covers 256 contiguous elements of one slot row per load.
+DIRECT_ELEMS_PER_LANE = 8
+DIRECT_BLOCK_THREADS = 512
+
+
+def combine_direct_reduce_blocks(hidden_dim, token_count):
+    """Grid of ``_make_combine_direct_reduce`` for ``token_count`` tokens (>= 1)."""
+    lanes = max(int(token_count), 1) * (hidden_dim // DIRECT_ELEMS_PER_LANE)
+    return (lanes + DIRECT_BLOCK_THREADS - 1) // DIRECT_BLOCK_THREADS
+
+
+def _make_combine_direct_reduce(
+    *,
+    experts_per_token,
+    hidden_dim,
+    slot_stride_nbytes,
+    add_shared=False,
+):
+    """Stage B for the bf16 wire without the LDS round trip.
+
+    The same per-token topk sum as ``_make_combine_fused_reduce`` on the bf16
+    wire (and, with ``add_shared``, the same shared-expert add), element for
+    element in the same order: an f32 zero, plus each slot k = 0..topk-1 in
+    turn, rounded to bf16, then ``bf16(f32(that) + f32(shared))``. So the two
+    are bit-identical.
+
+    Each lane owns 8 consecutive elements of one token: it loads them from all
+    topk slots and the shared row straight into registers, sums, and stores
+    one b128. No LDS, no barriers, no TDM descriptors, and one lane slot per
+    element group instead of a persistent tile loop -- the grid is sized to
+    the token count. The slot rows are read once, so their loads are marked
+    non-temporal; the output is read again by the next op, so its store is not.
+    """
+    topk = experts_per_token
+    EPL = DIRECT_ELEMS_PER_LANE
+    lanes = DIRECT_BLOCK_THREADS
+    lanes_per_tok = hidden_dim // EPL
+    if hidden_dim % EPL:
+        raise ValueError(f"hidden_dim must be a multiple of {EPL}")
+    if slot_stride_nbytes % 16:
+        raise ValueError("the slot stride must keep each lane's b128 aligned")
+    stride_e = slot_stride_nbytes // 2
+
+    @flyc.kernel(known_block_size=[lanes, 1, 1])
+    def ep_combine_fused(
+        addr_comb_inp: Int64,
+        addr_out: Int64,
+        cur_rank_num_token: Int32,
+        addr_shared: Int64,
+    ):
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        i16_global = fx.PointerType.get(
+            elem_ty=fx.Int16.ir_type,
+            address_space=fx.AddressSpace.Global,
+            alignment=16,
+        )
+        inp_iter = fx.inttoptr(i16_global, addr_comb_inp)
+        out_iter = fx.inttoptr(i16_global, addr_out)
+        sh_iter = fx.inttoptr(i16_global, addr_shared) if add_shared else None
+        g = bid * lanes + tid
+        tok = g // lanes_per_tok
+        e0 = (g % lanes_per_tok) * EPL
+        if tok < cur_rank_num_token:
+            in_off = fx.Int64(tok) * fx.Int64(topk * stride_e) + fx.Int64(e0)
+            row_off = fx.Int64(tok) * fx.Int64(hidden_dim) + fx.Int64(e0)
+            # All loads first, so a lane has topk (+1) b128 in flight at once.
+            raws = [
+                fx.Vector(
+                    fx.generic_load(
+                        fx.add_offset(inp_iter, in_off + k * stride_e),
+                        count=8,
+                        nontemporal=True,
+                    )
+                )
+                for k in range_constexpr(topk)
+            ]
+            if const_expr(add_shared):
+                sh = fx.Vector(
+                    fx.generic_load(
+                        fx.add_offset(sh_iter, row_off), count=8, nontemporal=True
+                    )
+                )
+            acc = fx.full(8, 0.0, fx.Float32)
+            for k in range_constexpr(topk):
+                acc = acc + raws[k].bitcast(fx.BFloat16).to(fx.Float32)
+            res = acc.to(fx.BFloat16)
+            if const_expr(add_shared):
+                res = (res.to(fx.Float32) + sh.bitcast(fx.BFloat16).to(fx.Float32)).to(
+                    fx.BFloat16
+                )
+            fx.ptr_store(
+                res.bitcast(fx.Int16).ir_value(), fx.add_offset(out_iter, row_off)
+            )
+
+    @flyc.jit
+    def run(
+        addr_comb_inp: Int64,
+        addr_out: Int64,
+        cur_rank_num_token: Int32,
+        addr_shared: Int64,
+        n_blocks: Int32,
+        stream=fx.Stream(None),  # noqa: B008
+    ):
+        ep_combine_fused(
+            addr_comb_inp,
+            addr_out,
+            cur_rank_num_token,
+            addr_shared,
+        ).launch(
+            grid=(n_blocks, 1, 1),
+            block=[lanes, 1, 1],
+            stream=stream,
+        )
+
+    return run
+
+
 # gfx1250 gives a workgroup 320KB of LDS; the reduce runs 512 blocks on 256 CUs,
 # so staying under half of that keeps the 2-blocks-per-CU occupancy.
 COMBINE_LDS_BUDGET = 160 * 1024
@@ -156,8 +275,14 @@ def _make_combine_fused_reduce(
     quant_bits=0,
     tokens_per_block=2,
     chunks_per_iter=4,
+    add_shared=False,
 ):
     """Stage B of the GEMM2-fused scatter combine: the per-token topk sum.
+
+    ``add_shared``: the kernel also adds a bf16 ``[tokens, hidden]`` tensor
+    (the shared expert's output) to each token's sum, as ``bf16(bf16(sum) +
+    shared)`` -- the same bits as the reduce followed by a separate bf16 add --
+    so the caller's add launch and its round trip through memory go away.
 
     gemm2 has already P2P-written each token's WEIGHTED per-expert result into
     this rank's comb_inp[origin_lid*topk + k] (one contiguous topk-block per
@@ -283,6 +408,7 @@ def _make_combine_fused_reduce(
         addr_comb_inp: Int64,
         addr_out: Int64,
         cur_rank_num_token: Int32,
+        addr_shared: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -334,6 +460,7 @@ def _make_combine_fused_reduce(
         )
         inp_iter = fx.inttoptr(i8_global, addr_comb_inp)
         out_iter = fx.inttoptr(i16_global, addr_out)
+        sh_iter = fx.inttoptr(i16_global, addr_shared) if add_shared else None
 
         def global_view(base, off, shape, stride):
             return fx.Tensor(fx.make_view(base + off, fx.make_layout(shape, stride)))
@@ -423,11 +550,35 @@ def _make_combine_fused_reduce(
             )
             fx.copy(atom_in, tIg[None, 0], tIs[None, 0])
 
-        def reduce_tile(buf):
+        def reduce_tile(buf, work):
             """-- dequantize and sum the topk slots out of LDS --"""
             in_idx = ptr_to_idx(in_buf_ptr(buf))
             out_idx = ptr_to_idx(out_buf_ptr(buf))
+            if const_expr(add_shared):
+                sh_tok0, sh_q0 = tile_origin(work)
             for r in range_constexpr(ROUNDS):
+                if const_expr(add_shared):
+                    # Issued first so the load overlaps the topk sum below. A
+                    # padding token past the rank's count reads the last real
+                    # row instead; its sum is dropped by the store's row clamp.
+                    sh_tok = sh_tok0 + lane_tok[r]
+                    sh_tok = (sh_tok < safe_tok).select(sh_tok, safe_tok - 1)
+                    sh_off = (
+                        fx.Int64(sh_tok) * fx.Int64(hidden_dim)
+                        + fx.Int64(sh_q0 + lane_chunk[r]) * fx.Int64(CHUNK_ELEMS)
+                        + fx.Int64(lane_elem[r])
+                    )
+                    sh_vals = [
+                        fx.Vector(
+                            fx.ptr_load(
+                                fx.add_offset(sh_iter, sh_off + j * 8),
+                                result_type=T.vec(8, T.i16),
+                            )
+                        )
+                        .bitcast(fx.BFloat16)
+                        .to(fx.Float32)
+                        for j in range_constexpr(2)
+                    ]
                 t_off = lane_tok[r] * (topk * P_ROW_BYTES)
                 chunk_off = t_off + lane_chunk[r] * IN_CHUNK_BYTES
                 accs = [fx.full(8, 0.0, fx.Float32) for _ in range_constexpr(2)]
@@ -475,10 +626,13 @@ def _make_combine_fused_reduce(
                     + lane_elem[r] * 2
                 )
                 for j in range_constexpr(2):
+                    res = accs[j].to(fx.BFloat16)
+                    if const_expr(add_shared):
+                        res = (res.to(fx.Float32) + sh_vals[j]).to(fx.BFloat16)
                     lds_store_b128(
                         out_idx,
                         out_b + j * 16,
-                        accs[j].to(fx.BFloat16).bitcast(fx.Int32).ir_value(),
+                        res.bitcast(fx.Int32).ir_value(),
                     )
 
         def store_tile(work, buf):
@@ -537,7 +691,7 @@ def _make_combine_fused_reduce(
             # buffer about to be rewritten.
             tdm_ops.tensor_wait(WAIT_N)
             workgroup_barrier()
-            reduce_tile(buf)
+            reduce_tile(buf, work)
             workgroup_barrier()
             store_tile(work, buf)
         tdm_ops.tensor_wait(0)
@@ -547,12 +701,14 @@ def _make_combine_fused_reduce(
         addr_comb_inp: Int64,
         addr_out: Int64,
         cur_rank_num_token: Int32,
+        addr_shared: Int64,
         stream=fx.Stream(None),  # noqa: B008
     ):
         ep_combine_fused(
             addr_comb_inp,
             addr_out,
             cur_rank_num_token,
+            addr_shared,
         ).launch(
             grid=(block_num, 1, 1),
             block=[lanes, 1, 1],
