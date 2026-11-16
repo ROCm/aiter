@@ -449,7 +449,14 @@ def _gemm1_body_a8w4(
                 scales.append(_e8m0_byte_to_f32(dw, fx.Int32(j)))
         return scales
 
-    xs_ms_tiles4 = _global_i32_buffer_tiles(arg_xscale, 0xFFFFFFFF, 4)
+    # fused_dynamic_mxfp8_quant_moe_sort writes pad32(sorted rows) x _ms_npad scale bytes;
+    # this kernel reads rows < cumsum[0] only, so bound the descriptor there: an indexing
+    # slip then reads zeros instead of neighbouring memory.
+    xs_ms_tiles4 = _global_i32_buffer_tiles(
+        arg_xscale,
+        ((fx.Int64(_cumsum0) + fx.Int64(31)) // fx.Int64(32)) * fx.Int64(32 * _ms_npad),
+        4,
+    )
     xs_ms_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(0), fx.Int32)
 
     def load_x_scale_moe_sort(base_k):
