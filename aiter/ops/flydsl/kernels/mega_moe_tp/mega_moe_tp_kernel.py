@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import os
 import struct
 
 import flydsl.compiler as flyc
@@ -209,6 +210,23 @@ def compile_mega_moe_tp(
     TN_IT = ceildiv(TN_V, NTT)
     (ag_ready_all,) = kc.get("ag_ready_all")
 
+    # (debug) AITER_MEGAMOE_TP_TRACE_PTR: a device int32 [grid, TRS] buffer; the kernel
+    # stores the low 32 bits of s_memrealtime (100 MHz) at its phase points (0: off)
+    TRACE = int(os.environ.get("AITER_MEGAMOE_TP_TRACE_PTR", "0"))
+    TRS = 32
+    if TRACE:
+        name = name + "_trace"
+
+    def tr(tid, slot, who=0):
+        if TRACE:
+            _tr(tid, slot, who)
+
+    @flyc.jit
+    def _tr(tid, slot, who):
+        if tid == i32(who):
+            i = i32(gpu.block_id("x")) * i32(TRS) + i32(slot)
+            g_st_sys(fx.Int64(TRACE) + fx.Int64(i * i32(4)), fx.Int32(now()))
+
     @flyc.jit
     def blk_red(L, tid, v, op, slot):
         r = wave_red(v, tid % i32(64), op)
@@ -390,20 +408,28 @@ def compile_mega_moe_tp(
     def roles(L, tid, a, epoch):
         if tid < i32(NT):
             compute_units(L, tid, a)
+            tr(tid, 3)
             if const_expr(DLL):
                 push_dll(L, tid, a, 4 + tid // 64)
+            tr(tid, 4)
             comm_help(L, tid, a, epoch)
+            tr(tid, 5)
         else:
             if tid < i32(NT + 64):
                 ag_send(L, tid % i32(64), a)
+                tr(tid, 9, NT)
                 ag_ready_all(L, tid % i32(64), a, epoch)
+                tr(tid, 10, NT)
                 if const_expr(DLL):
                     push_dll(L, tid, a)
+                    tr(tid, 11, NT)
                     comm_wave(L, tid, a, epoch)
                 else:
                     poll_loop(L, tid, a, epoch)
+                tr(tid, 12, NT)
             elif tid < i32(NT + 128):
                 a_loader(L, tid, a)
+                tr(tid, 13, NT + 64)
                 if const_expr(LBPF):
                     lb_g2_prefetch(L, tid % i32(64), a)
                 if const_expr(DLL):
@@ -416,7 +442,9 @@ def compile_mega_moe_tp(
                         zero_masked(L, tid % i32(64), a, 0, 1)
                         if const_expr(kc.SM):
                             kc.sm_g2_runs(L, tid, a)
+                        tr(tid, 14, NT + 128)
                         push_dll(L, tid, a, 2)
+                        tr(tid, 15, NT + 128)
                     else:
                         push_dll(L, tid, a, 3)
                 comm_help(L, tid, a, epoch)
@@ -475,6 +503,7 @@ def compile_mega_moe_tp(
         for j in range_constexpr(1, MAX_TP):
             mine = (rank == i32(j)).select(peers[j], mine)
         a.update(peer=peers, mine=fx.Int64(mine), ttot=tp * m)
+        tr(tid, 0)
         _dyn_zero(L, tid)
         init_lds(L, tid, a)
         gpu.barrier()
@@ -498,8 +527,10 @@ def compile_mega_moe_tp(
                     _ag_send_meta_ll(tid % i32(64), a)
                 else:
                     _ag_send_meta(tid % i32(64), a)
+        tr(tid, 1)
         quant_chunks(L, tid, NTT, a, i32(0), i32(NCHA))
         gpu.barrier()
+        tr(tid, 2)
         a["ax"] = fx.Int64(mine) + off_x
         a["axs"] = fx.Int64(mine) + off_xs
         roles(L, tid, a, epoch)
@@ -508,9 +539,11 @@ def compile_mega_moe_tp(
         if const_expr(TN):
             wait_vm(0)
         gpu.barrier()
+        tr(tid, 6)
         if const_expr(ar and not ARLL):
             yag_flush(L, tid, a)
             yag_wait(tid, a, epoch)
+        tr(tid, 7)
         if const_expr(TN):
             tn_rows(L, tid, a)
             if const_expr(not TNL):
@@ -521,6 +554,7 @@ def compile_mega_moe_tp(
         if const_expr(lb):
             lb_finish(tid, a, L)
         finish(tid, a, epoch)
+        tr(tid, 8)
 
     kargs = list(inspect.signature(mega_moe_tp_kernel).parameters)
     mega_moe_tp_kernel = flyc.kernel(name=name, known_block_size=[NTT, 1, 1])(
@@ -654,6 +688,9 @@ def compile_bigm_kernel(
     DYNE = NE > 512
 
     od = dict(opts)  # tuned AITER_BIGM_* options (configs/mega_moe_tp_bigm_tuned.csv)
+    # (debug) AITER_BIGM_TRACE_PTR: a device int32 [8 XCDs, BTRACE_N, 4] buffer of item records
+    BTRACE = int(os.environ.get("AITER_BIGM_TRACE_PTR", "0"))
+    BTRACE_N = 16384
 
     def _opt(name, default):
         return od.get(name, default)
@@ -696,6 +733,18 @@ def compile_bigm_kernel(
     # reduce item makes them (no SDMA puts per sub-block); a flag per (source rank, chunk,
     # sub-block) in the peer's qs region (unused with YG8), the launch count its value
     YDS = int(_opt("AITER_BIGM_YDS", "0")) and YG8
+    # (ar, bf16 y rows) YDS's scheme for the bf16 rows: every rank's y rows stored by the CUs
+    # into every peer's q rows as the reduce items make them, a flag per (source rank, chunk,
+    # sub-block); the GW item waits for the peers' flags. The y gather then rides xGMI by the
+    # CUs alongside the SDMA reduce-scatter instead of sharing the SDMA engines with it
+    YDB = (
+        int(_opt("AITER_BIGM_YDB", os.environ.get("AITER_BIGM_YDB", "0")))
+        if tailq == 3 and not YG8
+        else 0
+    )
+    # (ar, bf16 y rows, the replicated batch) the YD items copy every rank's gathered y rows
+    # (once landed) into yout, the caller's output: no copy after the launch (set by the host)
+    YDC = int(_opt("AITER_BIGM_YDC", "0")) if tailq == 3 and not YG8 and xl else 0
     # tokens per sort item (S1 counts / S3 route lists): many routes per token (Kimi K3.1's 16)
     # take more per item: fewer items, fewer atomics on each expert's fill counter
     SRT = SRT0 if K1 <= 9 else 128
@@ -712,7 +761,7 @@ def compile_bigm_kernel(
         PPC[QQ] = PPC[QS] = 0
     if tailq == 3:
         PPC[QS] = 0
-    if YDS:
+    if YDS or YDB:
         PPC[QQ] = 0
     # (ar) XL: the host passes the replicated batch (x / ids / tw of every rank's rows, rank
     # r's at r * m): every rank quantizes every row itself -- no input / routing gather, the
@@ -720,6 +769,12 @@ def compile_bigm_kernel(
     XL = bool(xl)
     if XL:
         PPC[QX] = PPC[QXS] = PPC[QID] = 0
+    # (XL, the y gather) the y rows on the idle input-gather queue QX: MORI puts a peer's
+    # queues on its two SDMA engines by parity, so the RS (QE) and the y gather then run on
+    # different engines (on QQ both share one). AITER_BIGM_YQ=3: QQ
+    QY = QX if XL and tailq == 3 and str(_opt("AITER_BIGM_YQ", os.environ.get("AITER_BIGM_YQ", "2"))) == "2" else QQ
+    if QY != QQ:
+        PPC[QY], PPC[QQ] = PPC[QQ], 0
     ZX = 16  # io: rows per input item (quant + routing copy)
     EPL = ceildiv(E, 64)  # experts per lane of the plan's wave
     # int8 rows of the attention / MoE-output RS: one fp32 scale per 32 values
@@ -849,7 +904,7 @@ def compile_bigm_kernel(
     # (YG8) chunk k's YD after chunk k+1's RF (its peers' y puts landed by then), the last at
     # the end (right after chunk k's RF measured 400-600 us slower at M3.1 ar 32k: CTAs spin
     # on YD ahead of other work)
-    if YG8:
+    if YG8 or YDC:
         o2 = []
         for k_, kd in ORDER:
             o2.append((k_, kd))
@@ -869,7 +924,11 @@ def compile_bigm_kernel(
         + ("_xl" if XL else "")
         + ("_yg8" if YG8 else "")
         + ("_yds" if YDS else "")
+        + ("_ydb" if YDB else "")
+        + ("_ydc" if YDC else "")
+        + ("_trace" if BTRACE else "")
         + ("_hu2" if HU else "")
+        + ("_yq2" if QY != QQ else "")
         + ("_i8r" if I8R else "")
         + ("" if act == "swiglu" else f"_{act}{fb(swiglu_limit)}")
         + (f"_b{fb(situ_beta)}_{fb(situ_linear_beta)}" if act == "situv2" else "")
@@ -1115,7 +1174,7 @@ def compile_bigm_kernel(
         def ca(i):
             return ctrl + fx.Int64(i * i32(4))
 
-        if const_expr(YDS):
+        if const_expr(YDS or YDB):
             # (YDS) this launch's number: the persistent count (read before any item; the GW
             # item stores it + 1 at the end) + 1
             a["yl"] = g_ld_sys(ca(i32(C_ERR + 20))) + i32(1)
@@ -2237,7 +2296,7 @@ def compile_bigm_kernel(
             # put to every peer
             tid, o, s, B, sb, i0, b, rv = rf_head(k, j)
             ryg = rsrc(wp("q"))
-            if const_expr(YDS):
+            if const_expr(YDS or YDB):
                 rpeer = [
                     rsrc(fx.Int64(bld(rpb, i32(p_ * 8), 0, T.i64)) + a["off_q"])
                     for p_ in range(tp)
@@ -2258,6 +2317,12 @@ def compile_bigm_kernel(
                         i8_row_store_multi(
                             f, rpeer, rank * m + o + i, col(tid, kk), tid % i32(64)
                         )
+                    elif const_expr(YDB):
+                        # every rank's q rows (this one's included: rpeer[rank] is ours)
+                        yv = pack_bf16x8(f)
+                        yo = (rank * m + o + i) * i32(H * 2) + col(tid, kk) * i32(16)
+                        for p_ in range_constexpr(tp):
+                            bst(yv, rpeer[p_], yo, 0, AUX_SYS)
                     elif const_expr(tailq == 3 and YG8):
                         i8_row_store(
                             f, ryg, rank * m + o + i, col(tid, kk), tid % i32(64)
@@ -2272,8 +2337,10 @@ def compile_bigm_kernel(
                         )
                     else:
                         bst(pack_bf16x8(f), r_yout, off, 0)
+            if const_expr(YDB):
+                wait_vm(0)  # (the item's peer stores landed before it counts as done)
             done_last(k, P_RF, cnt(P_RF, s))
-            if const_expr(YDS):  # noqa: SIM102 - preserve FlyDSL branches
+            if const_expr(YDS or YDB):  # noqa: SIM102 - preserve FlyDSL branches
                 if done_at(sbc(k, 1, b), sb // i32(ZQ)):  # noqa: SIM102
                     # every item of the sub-block stored (each item's stores waited): its
                     # flag to every peer, after a system release
@@ -2292,7 +2359,7 @@ def compile_bigm_kernel(
                     if tid < i32(tp):
                         g0 = rank * m + o + b * sb
                         tn = k * i32(NSB) + b
-                        take_turn(QQ, tn)
+                        take_turn(QY, tn)
                         if tid != rank:
                             put(
                                 tid,
@@ -2301,9 +2368,9 @@ def compile_bigm_kernel(
                                 "q",
                                 g0 * i32(YRB),
                                 sb * i32(YRB),
-                                QQ,
+                                QY,
                             )
-                        give_turn(QQ, tn)
+                        give_turn(QY, tn)
 
         @flyc.jit
         def item_yd(k, j):
@@ -2333,57 +2400,103 @@ def compile_bigm_kernel(
                         g_st_sys(ca(i32(C_ERR)), i32(1))
                 gpu.barrier()
             else:
-                wait_puts_n(QQ, k * i32(NSB) + b + i32(1))
-            # 16 columns a thread: one 16 B code load + one scale load (the 8-column int8 row
-            # loads -- 8 B codes + a scale -- were issue-bound, 2 small loads per 8 columns)
-            rq = rsrc(wp("q"))
-            lds = []
-            for ii in range_constexpr(ZQ):
-                g = p * m + o + i0 + i32(ii)
-                for kk in range_constexpr(P16):
-                    c16 = fx.min(tid + i32(kk * NT), i32(H // 16 - 1))
-                    lds.append(
-                        (
-                            fx.Vector(
-                                bld(rq, g * i32(RB) + c16 * i32(16), 0, V4I, CAUX)
-                            ),
-                            fx.Int32(
+                wait_puts_n(QY, k * i32(NSB) + b + i32(1))
+            if const_expr(YDC):
+                # (YDC) the bf16 rows of rank p's sub-block from q to yout, 16 columns a thread
+                rq = rsrc(wp("q"))
+                lds = []
+                for ii in range_constexpr(ZQ):
+                    g = p * m + o + i0 + i32(ii)
+                    for kk in range_constexpr(P16):
+                        c16 = fx.min(tid + i32(kk * NT), i32(H // 16 - 1))
+                        for h in range_constexpr(2):
+                            lds.append(
                                 bld(
                                     rq,
-                                    g * i32(RB) + i32(SCO) + (c16 // i32(2)) * i32(4),
+                                    (g * i32(H) + c16 * i32(16) + i32(8 * h)) * i32(2),
                                     0,
-                                    T.i32,
+                                    V4I,
                                     CAUX,
                                 )
-                            ),
-                        )
-                    )
-            for ii in range_constexpr(ZQ):
-                g = p * m + o + i0 + i32(ii)
-                for kk in range_constexpr(P16):
-                    c16 = fx.min(tid + i32(kk * NT), i32(H // 16 - 1))
-                    d, sc = lds[ii * P16 + kk]
-                    scf = sc.bitcast(fx.Float32)
-                    v = []
-                    for q in range_constexpr(4):
-                        v += i8x4_unpack(fx.Int32(d[q]), scf)
-                    if tid + i32(kk * NT) < i32(H // 16):
-                        for h in range_constexpr(2):
-                            bst(
-                                pack_bf16x8(v[8 * h : 8 * h + 8]),
-                                r_yout,
-                                (g * i32(H) + c16 * i32(16) + i32(8 * h)) * i32(2),
-                                0,
-                                0,
                             )
+                for ii in range_constexpr(ZQ):
+                    g = p * m + o + i0 + i32(ii)
+                    for kk in range_constexpr(P16):
+                        c16 = fx.min(tid + i32(kk * NT), i32(H // 16 - 1))
+                        if tid + i32(kk * NT) < i32(H // 16):
+                            for h in range_constexpr(2):
+                                bst(
+                                    lds[(ii * P16 + kk) * 2 + h],
+                                    r_yout,
+                                    (g * i32(H) + c16 * i32(16) + i32(8 * h)) * i32(2),
+                                    0,
+                                    0,
+                                )
+            else:
+                # 16 columns a thread: one 16 B code load + one scale load (the 8-column int8 row
+                # loads -- 8 B codes + a scale -- were issue-bound, 2 small loads per 8 columns)
+                rq = rsrc(wp("q"))
+                lds = []
+                for ii in range_constexpr(ZQ):
+                    g = p * m + o + i0 + i32(ii)
+                    for kk in range_constexpr(P16):
+                        c16 = fx.min(tid + i32(kk * NT), i32(H // 16 - 1))
+                        lds.append(
+                            (
+                                fx.Vector(
+                                    bld(rq, g * i32(RB) + c16 * i32(16), 0, V4I, CAUX)
+                                ),
+                                fx.Int32(
+                                    bld(
+                                        rq,
+                                        g * i32(RB) + i32(SCO) + (c16 // i32(2)) * i32(4),
+                                        0,
+                                        T.i32,
+                                        CAUX,
+                                    )
+                                ),
+                            )
+                        )
+                for ii in range_constexpr(ZQ):
+                    g = p * m + o + i0 + i32(ii)
+                    for kk in range_constexpr(P16):
+                        c16 = fx.min(tid + i32(kk * NT), i32(H // 16 - 1))
+                        d, sc = lds[ii * P16 + kk]
+                        scf = sc.bitcast(fx.Float32)
+                        v = []
+                        for q in range_constexpr(4):
+                            v += i8x4_unpack(fx.Int32(d[q]), scf)
+                        if tid + i32(kk * NT) < i32(H // 16):
+                            for h in range_constexpr(2):
+                                bst(
+                                    pack_bf16x8(v[8 * h : 8 * h + 8]),
+                                    r_yout,
+                                    (g * i32(H) + c16 * i32(16) + i32(8 * h)) * i32(2),
+                                    0,
+                                    0,
+                                )
 
         @flyc.jit
         def item_gw():
             for k in range_constexpr(C):
                 wait_ph(i32(k), P_RF, cnt(P_RF, chunk(i32(k))[1]))
-            if const_expr(tailq in (1, 3) and not YDS):
-                wait_puts(QQ, NSB, i32(C - 1))
-            if const_expr(YDS):
+            if const_expr(tailq in (1, 3) and not (YDS or YDB)):
+                wait_puts(QY, NSB, i32(C - 1))
+            if const_expr(YDB):
+                # every peer's flag of every (chunk, sub-block): flag index (p * C + k) * NSB + b
+                want = yflag_v()
+                for f_ in range(tid, i32(tp * C * NSB), i32(NT)):
+                    fi = i32(f_)
+                    if fi // i32(C * NSB) != rank:
+                        fa = wp("qs") + fx.Int64(fi * i32(4))
+                        t0 = now()
+                        cur = g_ld_sys(fa)
+                        while (cur != want) & alive(t0):
+                            rocdl.s_sleep(2)
+                            cur = g_ld_sys(fa)
+                        if cur != want:
+                            g_st_sys(ca(i32(C_ERR)), i32(1))
+            if const_expr(YDS or YDB):
                 if tid == i32(0):
                     g_st_sys(ca(i32(C_ERR + 20)), a["yl"])
             if const_expr(tailq == 1):
@@ -2419,6 +2532,8 @@ def compile_bigm_kernel(
         t = claim()
         alive_ = t < nall
         while alive_:
+            if const_expr(BTRACE):
+                tb0 = fx.Int32(now())
             kind_r, k_r, jj = decode(
                 slices_of([chunk_v(i32(k)) for k in range(C)])[0], t
             )
@@ -2444,6 +2559,16 @@ def compile_bigm_kernel(
             if t == gw_lo:
                 item_gw()
             gpu.barrier()
+            if const_expr(BTRACE):
+                # (debug) item record [kind | chunk << 8, start, end, index] at slot (XCD, ticket)
+                if tid == i32(0):
+                    rec = fx.Int64(BTRACE) + fx.Int64(
+                        (xc * i32(BTRACE_N) + fx.min(t, i32(BTRACE_N - 1))) * i32(16)
+                    )
+                    g_st_sys(rec, kind_r | (k_r << i32(8)))
+                    g_st_sys(rec + fx.Int64(4), tb0)
+                    g_st_sys(rec + fx.Int64(8), fx.Int32(now()))
+                    g_st_sys(rec + fx.Int64(12), jj)
             t = claim()
             alive_ = t < nall
 

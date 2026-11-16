@@ -7,6 +7,8 @@ final sums, LL packets, comm wave roles and the per-launch init / finish."""
 
 from __future__ import annotations
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr, rocdl
@@ -134,7 +136,19 @@ def build_communication(kc: KernelCtx) -> dict:
     a8, act, agr, ar, comm_bf16 = kc.get("a8 act agr ar comm_bf16")
     a16, APL, XSB, SIB = kc.get("a16 APL XSB SIB")
     XD, L_AGS, XIB, IPB, AGS_RS = kc.get("XD L_AGS XIB IPB AGS_RS")
-    RAW, G2, ALQ = kc.get("RAW G2 ALQ")
+    RAW, G2, ALQ, LLB = kc.get("RAW G2 ALQ LLB")
+    # (debug) the kernel trace's push slots (mega_moe_tp_kernel: AITER_MEGAMOE_TP_TRACE_PTR)
+    TRACE = int(os.environ.get("AITER_MEGAMOE_TP_TRACE_PTR", "0"))
+
+    def trc(tid, slot):
+        if TRACE:
+            _trc(tid, slot)
+
+    @flyc.jit
+    def _trc(tid, slot):
+        if tid == i32(NT):
+            i = i32(gpu.block_id("x")) * i32(32) + i32(slot)
+            g_st_sys(fx.Int64(TRACE) + fx.Int64(i * i32(4)), fx.Int32(now()))
     # the all-gather's destination ranks (ALQ: this one)
     AGP = 1 if ALQ else TPC
     # (RAW) the route rows' column groups (GEMM2 iterations, NW x 64 columns) per RS chunk
@@ -648,7 +662,15 @@ def build_communication(kc: KernelCtx) -> dict:
     @flyc.jit
     def _push_store(a, r_dst, prow, c0, v, acc, ok):
         col = c0 + v * i32(8)
-        if const_expr(comm_bf16 or RAW):  # (RAW: bf16, then the item's flag: _raw_part)
+        if const_expr(LLB):  # (two bf16 LL packets: 4 B per value, no separate flag)
+            d = fx.Vector(pack_bf16x8(acc))
+            p0 = ll_pkt(a, fx.Int32(d[0]), fx.Int32(d[1]), i32(0))
+            p1 = ll_pkt(a, fx.Int32(d[2]), fx.Int32(d[3]), i32(0))
+            if ok:
+                off = (prow * i32(H) + col) * i32(4)
+                bst(p0, r_dst, off, 0, AUX_SYS)
+                bst(p1, r_dst, off + i32(16), 0, AUX_SYS)
+        elif const_expr(comm_bf16 or RAW):  # (RAW: bf16, then the item's flag: _raw_part)
             if ok:
                 bst(pack_bf16x8(acc), r_dst, (prow * i32(H) + col) * i32(2), 0, AUX_SYS)
         else:
@@ -1739,6 +1761,7 @@ def build_communication(kc: KernelCtx) -> dict:
         # (the helpers idle through the compute: a long nap leaves the SIMDs' issue / LDS
         # to the compute waves)
         spin0(L, lane, L_CTL + C_CDONE * 4, i32(1), 4)
+        trc(tid, 27)
         P = uni(lds_ld_acq(L, L_CTL + C_DYNP * 4))
         ttot = a["ttot"]
         it0, istep = _dll_items(ws)
@@ -1763,13 +1786,14 @@ def build_communication(kc: KernelCtx) -> dict:
                     _push_one(L, tid, a, t, c0, v, vc, P, r_dst, prow, ws, 1)
                 else:
                     _push_one(L, tid, a, t, c0, v, vc, P, r_dst, prow, ws, NPC)
-            if const_expr(RAW and ARLL):
-                for pr in range_constexpr(TPC):
-                    _raw_part(a, lane, peer_rs(a, pr, "off_part"), prow, c0)
-            elif const_expr(RAW):
+            if const_expr(RAW and ARLL and not LLB):
+                _raw_part_all(a, lane, prow, c0)
+            elif const_expr(RAW and not ARLL):
                 _raw_part(a, lane, r_dst, prow, c0)
+        trc(tid, 29)
         if const_expr(ARLL):
             final_all_ll(tid, a, ws)
+            trc(tid, 30)
         if const_expr(FINI):
             final_own_ll(tid, a, ws)
 
@@ -1800,6 +1824,7 @@ def build_communication(kc: KernelCtx) -> dict:
             rocdl.s_sleep(2)
             pend = pending()
         _report_if(a, (pend != i32(0)) & (lane == i32(0)), ERR_COMM)
+        trc(tid, 28)
         rb = route_region_bytes(a["ttot"])
         r_routes = rsrc(a["routes"], rb)
         r_pr = rsrc(a["proutes"], i32(NPC - 1) * rb)
@@ -1922,6 +1947,38 @@ def build_communication(kc: KernelCtx) -> dict:
             acc = sum_live(acc, ll_vals2(pk, p, MAX_TP), i32(p) < a["tp"])
         return acc
 
+    def _llb_pkts(a, r_recv, row, rstride, c0, vc):
+        """(LLB) every rank's two bf16 LL packets of row's 8 columns"""
+        out = []
+        for p in range_constexpr(TPC):
+            pc = i32(p)
+            off = ((pc * rstride + row) * i32(H) + c0 + vc * i32(8)) * i32(4)
+            out.append(fx.Vector(bld(r_recv, off, 0, V4I, AUX_SYS)))
+            out.append(fx.Vector(bld(r_recv, off + i32(16), 0, V4I, AUX_SYS)))
+        return out
+
+    @flyc.jit
+    def _llb_recv(a, lane, r_recv, t, trows, c0, v, vc):
+        """(LLB) wait for every rank's packets of row t's 8 columns, their bf16 sum"""
+        live = [v < i32(CW // 8) for p in range(2 * TPC)]
+        pk = _llb_pkts(a, r_recv, t, trows, c0, vc)
+        pend = ll_pending(a, lane, zip(pk, live))
+        t0 = now()
+        while (pend != i32(0)) & alive(t0):
+            rocdl.s_sleep(1)
+            pk = _llb_pkts(a, r_recv, t, trows, c0, vc)
+            pend = ll_pending(a, lane, zip(pk, live))
+        _report_if(a, (pend != i32(0)) & (lane == i32(0)), ERR_COMM)
+        acc = [fx.Float32(0.0)] * 8
+        for p in range_constexpr(TPC):
+            q0, q1 = pk[2 * p], pk[2 * p + 1]
+            d = fx.Vector.from_elements(
+                [fx.Int32(q0[0]), fx.Int32(q0[2]), fx.Int32(q1[0]), fx.Int32(q1[2])],
+                fx.Int32,
+            )
+            acc = [x + y for x, y in zip(acc, bf16x8_to_f32(d))]
+        return acc
+
     def _raw_pflag(a, prow, c0):
         """(RAW) the flag of the partial row prow's column chunk (the recv region's lo
         plane space)"""
@@ -1933,6 +1990,22 @@ def build_communication(kc: KernelCtx) -> dict:
         wait_vm(0)
         if lane == i32(0):
             bst(a["epoch"], r_dst, _raw_pflag(a, prow, c0), 0, AUX_SYS)
+
+    @flyc.jit
+    def _raw_part_all(a, lane, prow, c0):
+        """(RAW one-shot all-reduce, after an item's bf16 partial stores to every rank) their
+        flag to every rank: one wait for the stores, then lane p flags rank p (one per lane:
+        per rank _raw_part would wait for the previous flag's acknowledgement each time --
+        tp serial xGMI round trips)"""
+        wait_vm(0)
+        if lane < a["tp"]:
+            # (a per-lane address: a buffer resource's base is wave-uniform)
+            g_st_sys(
+                peer_sel(a, lane)
+                + fx.Int64(a["off_part"])
+                + fx.Int64(_raw_pflag(a, prow, c0)),
+                a["epoch"],
+            )
 
     @flyc.jit
     def _raw_recv(a, lane, r_recv, row, rstride, c0, vc):
@@ -1977,7 +2050,9 @@ def build_communication(kc: KernelCtx) -> dict:
             for j in range_constexpr(VPL):
                 v = lane + i32(j * 64)
                 vc = fx.min(v, i32(CW // 8 - 1))
-                if const_expr(RAW):
+                if const_expr(LLB):
+                    acc = _llb_recv(a, lane, r_recv, t, trows, c0, v, vc)
+                elif const_expr(RAW):
                     acc = _raw_recv(a, lane, r_recv, t, trows, c0, vc)
                 else:
                     acc = _final_all_pkts(a, lane, r_recv, t, trows, c0, v, vc)

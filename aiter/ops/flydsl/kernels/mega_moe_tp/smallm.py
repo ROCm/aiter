@@ -25,6 +25,7 @@ bytes per CTA even:
 from __future__ import annotations
 
 import math
+import os
 import types
 
 import flydsl.compiler as flyc
@@ -33,6 +34,8 @@ from flydsl.expr import gpu, range_constexpr
 
 from .common import (
     ACQ,
+    g_st_sys,
+    now,
     AUX_SYS,
     REL,
     V4F,
@@ -125,6 +128,19 @@ def build_smallm(kc: KernelCtx) -> dict:
     D = max(1, round(256 * NCK / I))
     # the rest run in single groups (GPC per share)
     RGU = GPC
+
+    # (debug) the kernel trace's small-M slots (mega_moe_tp_kernel: AITER_MEGAMOE_TP_TRACE_PTR)
+    TRACE = int(os.environ.get("AITER_MEGAMOE_TP_TRACE_PTR", "0"))
+
+    def tr(tid, slot):
+        if TRACE:
+            _tr(tid, slot)
+
+    @flyc.jit
+    def _tr(tid, slot):
+        if tid == i32(0):
+            i = i32(gpu.block_id("x")) * i32(32) + i32(slot)
+            g_st_sys(fx.Int64(TRACE) + fx.Int64(i * i32(4)), fx.Int32(now()))
 
     def _rot(L, j):
         """the plan's chunk order starts at the last expert's chunks when it has several
@@ -374,6 +390,7 @@ def build_smallm(kc: KernelCtx) -> dict:
         sk = fx.max(kf.shrui(i32(24)) & i32(0xFF), i32(1))
         e, cc, ce = _chunk(ent)
         R = gather_routes_chunk(L, tid, a, e, cc, ce, det=sk > i32(1))
+        tr(tid, 22)
         if tid == i32(0):
             lds_st(L, L_CTL + C_UROWS * 4, R)
             lds_st_rel(L, L_CTL + C_USEQ * 4, u + i32(1))
@@ -403,6 +420,7 @@ def build_smallm(kc: KernelCtx) -> dict:
                 half=icnt == i32(64),
                 dup=ce > i32(1),
             )
+        tr(tid, 23)
         if sk > i32(1):
             blk = uid // sk
             if tid == i32(0):
@@ -415,11 +433,14 @@ def build_smallm(kc: KernelCtx) -> dict:
                     fx.memory_fence(syncscope="agent", ordering=ACQ)
                 lds_st(L, L_CTL + C_SMLAST * 4, last.select(i32(1), i32(0)))
             cbar(L, tid)
+            tr(tid, 24)
             if lds_ld_i32(L, L_CTL + C_SMLAST * 4) == i32(1):
                 _part_finish(L, tid, a, blk * sk, sk, i0)
                 cbar(L, tid)
+                tr(tid, 25)
                 xq_export(L, tid, a, i0, icnt, i32(0), R)
                 cbar(L, tid)
+                tr(tid, 26)
                 if tid == i32(0):
                     g_add_agent(smc(a, j, bank), 2)
         else:
@@ -431,9 +452,11 @@ def build_smallm(kc: KernelCtx) -> dict:
     @flyc.jit
     def _sm_import(L, tid, a, j, R, bank):
         if lds_ld_i32(L, L_CTL + C_SMK * 4) != j:
+            tr(tid, 19)
             if tid == i32(0):
                 spin_sys_ge(smc(a, j, bank), i32(2 * KS2), a)
             cbar(L, tid)
+            tr(tid, 20)
             lb_import(L, tid, a, R)
             if tid == i32(0):
                 lds_st(L, L_CTL + C_SMK * 4, j)
@@ -512,9 +535,12 @@ def build_smallm(kc: KernelCtx) -> dict:
         """(compute waves, after the plan) the G1 blocks, then the G2 runs"""
         bank = a["epoch"] & i32(1)  # (sm_zero_next: zeroed by the previous launch)
         ue = lds_ld_i32(L, L_CTL + (C_UNIT + 1) * 4)
+        tr(tid, 16)
         for u_ in range(i32(0), ue, i32(1)):
             _sm_g1(L, tid, a, i32(u_), bank)
+        tr(tid, 17)
         spin0(L, tid % i32(64), L_CTL + C_SM2R * 4, i32(1))
+        tr(tid, 18)
         for run in range_constexpr(2):
             _sm_run(
                 L,
@@ -525,5 +551,6 @@ def build_smallm(kc: KernelCtx) -> dict:
                 bank,
                 run,
             )
+        tr(tid, 21)
 
     return locals()

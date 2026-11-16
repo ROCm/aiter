@@ -407,7 +407,8 @@ def kernel_config(
     SCAN_IT = ceildiv(min(TMAX, DYN_MAX) * TOPK // 4, NT)
     SCAN_G = 16
     NPC = 1 if lb else KS2
-    assert not (comm_bf16 and ll_rs)
+    # (bf16 comm: no LL packets, except small-M, whose RAW route rows / partials are bf16)
+    assert not (comm_bf16 and ll_rs and not sm)
     DYN_PS = [p for p in range(1, KS2 + 1) if KS2 % p == 0]
     DLL = bool(ll_rs and ll_route)
     assert not DLL or route_fp8
@@ -493,13 +494,26 @@ def kernel_config(
         + (f"_bpf{BPF}" if BPF else "")
         + ("_xd" if XD else "")
         + ("_alq" if sm and ar and alq else "")
+        + ("_llb" if sm and ar and comm_bf16 and not ar2 and os.environ.get("AITER_MEGAMOE_TP_LLB", "0") == "1" else "")
     )
     # small-M schedule (smallm.py): needs the dynamic schedule's LL route rows
     SM = bool(sm)
     assert not SM or (DLL and not lb)
     # (small-M a16) the route rows bf16 (not two-term LL packets: half the bytes), each
     # (piece, route, column group) then an epoch flag (the lo plane's space of routes)
-    RAW = bool(SM and a16 and os.environ.get("AITER_MEGAMOE_TP_RAW", "1") == "1")
+    # (small-M bf16 comm: always RAW, the bf16 rows the wire carries)
+    RAW = bool(
+        SM
+        and (comm_bf16 or (a16 and os.environ.get("AITER_MEGAMOE_TP_RAW", "1") == "1"))
+    )
+    # (RAW one-shot all-reduce, bf16 comm) the partials as bf16 LL packets (16 B: 4 bf16 in
+    # two words + the epoch twice, ll_pkt): the data is its own flag -- no store
+    # acknowledgement + separate flag per item (one xGMI round trip less). 4 B per value
+    # (2x the bf16 rows), in the recv region's two planes. Measured slower (n=1 +2 us, n=64
+    # +70 us: the bytes and the 16 polled packets per lane): opt-in, AITER_MEGAMOE_TP_LLB=1
+    LLB = bool(
+        RAW and ARLL and comm_bf16 and os.environ.get("AITER_MEGAMOE_TP_LLB", "0") == "1"
+    )
     # (small-M ar: every rank holds every row) each rank quantizes all rows into its own
     # activation buffers instead of its 1 / tp all-gathered: no xGMI hop before GEMM1
     ALQ = bool(SM and ar and alq)

@@ -375,13 +375,12 @@ class MegaMoeTP:
                 opts=(
                     {"AITER_BIGM_R8": "0", "AITER_BIGM_EB": "1", "AITER_BIGM_E4": "0"}
                     if cfg.comm_dtype == "bf16"
-                    # "int8": bf16 route rows, the reduce-scatter (and the ar y gather) as int8
-                    # rows + an f32 scale per 32 (deterministic)
+                    # "int8": the reduce-scatter (and the ar y gather) as int8 rows + an f32
+                    # scale per 32 (deterministic); the route rows per the tuned rows (mode
+                    # "<mode>_int8": bf16, R8 MXFP8 or I8R int8)
                     else (
                         {
-                            "AITER_BIGM_R8": "0",
                             "AITER_BIGM_EB": "0",
-                            "AITER_BIGM_E4": "0",
                             "AITER_BIGM_YG8": "1",
                         }
                         if cfg.comm_dtype == "int8"

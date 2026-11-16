@@ -352,6 +352,11 @@ class MegaMoeTPEngine:
         self.a16 = act_dtype == "bf16"
         self.a8 = act_dtype == "fp8" or self.a16
         self.apl = 2 if self.a16 else 1
+        # planes of the routes / recv buffers: RAW (small-M a16 or bf16 comm) keeps its flags
+        # in a second one
+        self.rawp = 2 if self.a16 or self.comm_bf16 else 1
+        # small-M schedule with bf16 comm (RAW bf16 rows + flags); 0: the dynamic one
+        self.sm_b16 = os.environ.get("AITER_MEGAMOE_TP_SM_BF16", "1") == "1"
         lb = {k: v for k, v in (lb or {}).items() if v is not None}
         # the LB fields set explicitly: they take precedence over the tuned configs
         self._lb_set = frozenset(lb)
@@ -417,7 +422,7 @@ class MegaMoeTPEngine:
         self._recv = arena.reserve(
             # (a16: the LL packets' lo plane after the hi one)
             "recv",
-            (self.tp * self.apl, tot if self.ar else self.mmax, H),
+            (self.tp * self.rawp, tot if self.ar else self.mmax, H),
             torch.bfloat16,
         )
         self._flag = arena.reserve("flag", (FLAG_INTS,), torch.int32)
@@ -440,7 +445,7 @@ class MegaMoeTPEngine:
         self.arena = arena
         self.ctrl = torch.zeros(CTRL_INTS, dtype=torch.int32, device=self.device)
         self.routes = torch.zeros(
-            (tot * topk * self.apl + 1, H), dtype=torch.bfloat16, device=self.device
+            (tot * topk * self.rawp + 1, H), dtype=torch.bfloat16, device=self.device
         )
         self.y = torch.empty(
             (tot if self.ar else self.mmax, H), dtype=torch.bfloat16, device=self.device
@@ -691,7 +696,16 @@ class MegaMoeTPEngine:
         path = os.environ.get("AITER_CONFIG_MEGA_MOE_TP_SM") or (
             AITER_CONFIGS.AITER_CONFIG_MEGA_MOE_TP_SM_FILE
         )
-        row = nearest(tuned_rows(path, key, "tot"), tot, clamp=True)
+        row = None
+        if self.comm_bf16:
+            # (bf16 comm: the RAW bf16 rows, twice the fp8 LL bytes) its own rows first
+            row = nearest(
+                tuned_rows(path, {**key, "comm_mode": self.mode + "_bf16"}, "tot"),
+                tot,
+                clamp=True,
+            )
+        if row is None:
+            row = nearest(tuned_rows(path, key, "tot"), tot, clamp=True)
         if row is None:
             return {}
         return {k: int(row[k]) for k in _SM_TUNED_FIELDS if row.get(k, "") != ""}
@@ -722,6 +736,17 @@ class MegaMoeTPEngine:
             n = SMNC
             nc = n[0] if tot <= 8 else n[1] if tot <= 16 else n[2] if tot <= 32 else 0
         return 0 if nc <= 0 or nc >= self.n_cta else nc
+
+    def _sm_alq(self, tot: int) -> bool:
+        # (ar small-M) every rank quantizes all its replicated rows locally: no input
+        # all-gather over xGMI. AITER_MEGAMOE_TP_ALQ: 1 on, 0 off, else a16 from 64 tokens
+        # (measured: a16 from 64 tokens 3-8 us faster; fewer tokens ~1 us slower)
+        if not self.ar or tot > self.agr * (self._sm_nc(tot) or self.n_cta):
+            return False
+        env = os.environ.get("AITER_MEGAMOE_TP_ALQ", "")
+        if env in ("0", "1"):
+            return env == "1"
+        return self.a16 and tot >= 64
 
     def _sm_ar2(self, tot: int) -> bool:
         if not self.ar:
@@ -755,7 +780,7 @@ class MegaMoeTPEngine:
                 tot >= self.sm_min
                 # (an explicit lb_min keeps its batches on the LB schedule)
                 and not ("min" in self._lb_set and self._lb_ok(tot))
-                and fp8
+                and (fp8 or self.sm_b16)
                 and tot <= self.dyn_max
                 and self._sm_fits(tot)
                 # (a tuned batch measured faster on the dynamic schedule: sm 0)
@@ -773,8 +798,7 @@ class MegaMoeTPEngine:
                     nc=self._sm_nc(tot),
                     nsk=self._sm_nsk(tot),
                     xd=self._sm_xd(tot),
-                    # (measured: a16 from 64 tokens 3-8 us faster; fewer tokens ~1 us slower)
-                    alq=self.ar and self.a16 and tot >= 64,
+                    alq=self._sm_alq(tot),
                 )
                 # (ar small-M: every row quantized by this rank's CTAs, agr rows each)
                 assert not cfg.alq or tot <= self.agr * (cfg.nc or self.n_cta)

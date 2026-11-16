@@ -7,6 +7,7 @@ plans, launches), the bf16 row gather of the fused tail.
 
 import ctypes
 import inspect
+import os
 import time
 
 import torch
@@ -141,7 +142,12 @@ class MegaMoeTPBigM:
         self.ygather = bool(ygather)  # moe(gather=True): the "q" region holds bf16 rows
         self._plans = {}
         self.cfg = (float(eps), bool(gemma), float(swiglu_limit))
-        self.opts = tuple(sorted((opts or {}).items()))  # tuned AITER_BIGM_* options
+        opts = dict(opts or {})
+        if ygather and os.environ.get("AITER_BIGM_YDC", "1") == "1":
+            # (ar, bf16 y rows) the kernel's YD items copy every rank's gathered y rows into
+            # the caller's output (no copy after the launch)
+            opts["AITER_BIGM_YDC"] = "1"
+        self.opts = tuple(sorted(opts.items()))  # tuned AITER_BIGM_* options
         self.w = (
             w1.view(torch.uint8),
             w1_scale.view(torch.uint8),
@@ -169,6 +175,11 @@ class MegaMoeTPBigM:
         }
         # (ar, YG8: the y gather as int8 rows) every rank's dequantized rows land here
         self.yg8 = self.ygather and dict(self.opts).get("AITER_BIGM_YG8") == "1"
+        self.ydc = (
+            self.ygather
+            and not self.yg8
+            and dict(self.opts).get("AITER_BIGM_YDC") == "1"
+        )
         self.ygout = (
             torch.empty((T, H), dtype=torch.bfloat16, device=device)
             if self.yg8
@@ -374,9 +385,26 @@ class MegaMoeTPBigM:
             path = AITER_CONFIGS.AITER_CONFIG_MEGA_MOE_TP_BIGM_FILE
             # rows of this comm mode (column "mode": ar / ag_rs), else the mode-less ones
             mode = "ar" if self.ygather else "ag_rs"
-            tu = nearest(
-                tuned_rows(path, {**key, "mode": mode}, "tokens"), T, clamp=True
+            tu = None
+            # comm_dtype "bf16" (bf16 RS / y gather: twice the wire bytes) / "int8" (int8 RS
+            # and y gather): their own rows (mode "<mode>_bf16" / "<mode>_int8") first
+            sfx = (
+                "_bf16"
+                if o.get("AITER_BIGM_EB") == "1"
+                else "_int8"
+                if o.get("AITER_BIGM_YG8") == "1"
+                else ""
             )
+            if sfx:
+                tu = nearest(
+                    tuned_rows(path, {**key, "mode": mode + sfx}, "tokens"),
+                    T,
+                    clamp=True,
+                )
+            if tu is None:
+                tu = nearest(
+                    tuned_rows(path, {**key, "mode": mode}, "tokens"), T, clamp=True
+                )
             if tu is None:
                 tu = nearest(
                     tuned_rows(path, {**key, "mode": ""}, "tokens"), T, clamp=True
@@ -515,6 +543,10 @@ class MegaMoeTPBigM:
             if gather:
                 # full: (x, topk_weights, topk_ids) of the replicated batch [tp * m] (ar):
                 # every rank quantizes every row itself, no input / routing gather
+                if self.ydc and out is not None:
+                    return self._moe(
+                        x, topk_weights, topk_ids, out, None, local, gather, full
+                    )
                 ya = self._moe(
                     x, topk_weights, topk_ids, None, None, local, gather, full
                 )
@@ -623,6 +655,12 @@ class MegaMoeTPBigM:
             _bigm_cached(launch, (0,) * (n - 1) + (torch.cuda.current_stream(),))
         dist.barrier(group=self.sd.group)
 
+    def ygout_bf16(self, T):
+        """(YDC, no caller output) an internal [T, H] bf16 output"""
+        if getattr(self, "_ygb", None) is None or self._ygb.shape[0] < T:
+            self._ygb = torch.empty((T, self.H), dtype=torch.bfloat16, device=self.device)
+        return self._ygb[:T]
+
     def _moe(
         self, x, topk_weights, topk_ids, out, tail, local, gather=False, full=None
     ):
@@ -639,6 +677,11 @@ class MegaMoeTPBigM:
             res_in, res_out, norm_w = x, self.resout, x
         tq = self.tailq(tail is not None, local, gather)
         xl = full is not None and tq == 3
+        # (YDC: compiled into the replicated-batch kernels only) the YD items write every
+        # rank's rows to the caller's [T, H] output
+        ydc = gather and self.ydc and xl
+        if ydc:
+            y = out if out is not None else self.ygout_bf16(T)
         launch = self._io_launch(m, tq, xl)
         if xl:  # (the kernel reads rank r's rows at r * m)
             x, topk_weights, topk_ids = full
@@ -679,7 +722,7 @@ class MegaMoeTPBigM:
         )
         self._cpar ^= 1  # (the next launch reads what this one's GW wrote)
         if gather:
-            if self.yg8:
+            if self.yg8 or ydc:
                 return y
             return self.sd.view("q", (T, self.H), torch.bfloat16)
         if tail is None:
