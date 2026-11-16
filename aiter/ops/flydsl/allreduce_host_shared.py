@@ -207,11 +207,11 @@ def check_world_size(world_size: int) -> None:
         )
 
 
-def check_payload(inp, out, *, device_index: int, owner: str) -> int:
-    """The payload size of an all-reduce of *inp* into *out*, in bytes.
+def check_tensors(inp, out, *, device_index: int, owner: str) -> tuple[int, int]:
+    """The data pointers of *inp* and *out*.
 
-    Raises unless both are contiguous bf16 CUDA tensors on *device_index*, of
-    the same size, aligned, not overlapping, and within ``MAX_PAYLOAD_BYTES``.
+    Raises unless both are contiguous, aligned bf16 CUDA tensors on
+    *device_index*. Their sizes are the caller's to check.
     """
     align = PAYLOAD_ALIGN_BYTES
     if not isinstance(inp, torch.Tensor) or not isinstance(out, torch.Tensor):
@@ -230,6 +230,17 @@ def check_payload(inp, out, *, device_index: int, owner: str) -> int:
     out_ptr = int(out.data_ptr())
     if inp_ptr % align != 0 or out_ptr % align != 0:
         raise ValueError(f"{owner} requires {align}-byte-aligned input/output")
+    return inp_ptr, out_ptr
+
+
+def check_payload(inp, out, *, device_index: int, owner: str) -> int:
+    """The payload size of an all-reduce of *inp* into *out*, in bytes.
+
+    Raises unless both are contiguous bf16 CUDA tensors on *device_index*, of
+    the same size, aligned, not overlapping, and within ``MAX_PAYLOAD_BYTES``.
+    """
+    align = PAYLOAD_ALIGN_BYTES
+    inp_ptr, out_ptr = check_tensors(inp, out, device_index=device_index, owner=owner)
     live_bytes = int(inp.numel()) * int(inp.element_size())
     if live_bytes > MAX_PAYLOAD_BYTES:
         raise ValueError(f"{owner} payload must not exceed the 4 GiB buffer window")

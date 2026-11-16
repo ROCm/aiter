@@ -33,10 +33,12 @@ from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
 from .allreduce_host_shared import (
     _cuda_index,
+    _launch_artifacts,
     _resolve_inbox_flags,
     _StEngine,
     _validate_ipc_process_group,
     check_payload,
+    check_tensors,
     check_world_size,
     kernel_symbol,
     launcher_loaded,
@@ -45,6 +47,7 @@ from .allreduce_host_shared import (
     require_arch,
 )
 from .allreduce_policy import (
+    MAX_PAYLOAD_BYTES,
     MIN_BATCH_BLOCKS,
     PAYLOAD_ALIGN_BYTES,
     QUANT_MIN_PAYLOAD_BYTES,
@@ -66,6 +69,8 @@ from .kernels.comm.quick_allreduce_mesh import (
     DEFAULT_ATOMS,
     DEFAULT_DIVISOR,
     MESH_CODECS,
+    MODE_AG,
+    MODE_RS,
     SUPER_TILES,
     clamp_grid_cap,
     latency_max_tiles,
@@ -261,6 +266,27 @@ def batches_publishes(inbox_memory: str, algorithm: str, link: str) -> bool:
     return has_release_fence(inbox_memory) or (algorithm == "ring" and link == "pcie")
 
 
+def _check_sp_residency(launch, grid: int, cu_count: int) -> None:
+    """Raise unless a *grid*-block launch of *launch* can have every workgroup
+    resident at once on *cu_count* CUs.
+
+    The single-phase kernels are persistent and spin on their peers' flags, so
+    a block that is still queued while the resident ones wait on it deadlocks
+    the launch. The limit is the occupancy HIP reports for the compiled kernel
+    (``max_blocks_per_cu`` of its artifact, read once it is built), not the
+    all-reduce's measured table.
+    """
+    need = -(-grid // cu_count)
+    for artifact in _launch_artifacts(launch):
+        fits = artifact.max_blocks_per_cu()
+        if fits < need:
+            raise RuntimeError(
+                f"{kernel_symbol(launch)} fits {fits} workgroups per CU, but a "
+                f"grid of {grid} blocks on {cu_count} CUs needs {need}: its "
+                "persistent blocks would wait on peers that are not resident"
+            )
+
+
 class FlyQuickAllReduce:
     """IPC inbox + flag buffer and launch wrapper for ``quick_allreduce_mesh``.
 
@@ -302,6 +328,36 @@ class FlyQuickAllReduce:
 
     ``rmsnorm_hidden`` lists the row widths ``allreduce_rmsnorm`` will be
     called with.
+
+    Every launch, and every replay of a CUDA graph that captured one, of any
+    mode (``allreduce``, ``allreduce_rmsnorm``, ``reduce_scatter``,
+    ``all_gather``) must run in one serialized device order on each rank.
+    Launches through the same engine share its inbox slots and colors: the
+    single-phase modes use the ``super_tile=1`` engine at the default block,
+    and the all-reduce and the fused RMSNorm use it for the sizes whose rung
+    selects it (or falls back to it). Launches in flight at once can read each
+    other's payloads; one order for all launches is the rule that holds for
+    every ladder. The same host call order
+    on every rank is not enough when the calls sit on independent streams; a
+    switch of stream needs an event dependency (``wait_event`` /
+    ``wait_stream``).
+
+    Every method that takes ``stream`` (``allreduce``, ``allreduce_rmsnorm``,
+    ``allreduce_rmsnorm_mxfp4``, ``reduce_scatter``, ``all_gather``) follows
+    these call rules:
+
+    * ``stream=None`` uses the current PyTorch stream on this device.
+    * The call returns once its work is enqueued on the stream. Every tensor
+      it takes must stay allocated until that work has finished, and for a
+      call captured in a CUDA graph until the graph's last replay; ``out`` is
+      not valid, and ``inp`` must not be modified, before then. A tensor that
+      another stream produces or consumes needs an event dependency, as with
+      any kernel.
+    * ``inp`` and ``out`` must be torch tensors, bf16, on this rank's CUDA
+      device, contiguous and 16-byte aligned (``check_tensors``), and must not
+      overlap. Their sizes are checked per method: ``check_payload`` for the
+      all-reduce and the fused RMSNorm, ``_check_sp_payload`` for the
+      single-phase modes.
     """
 
     def __init__(
@@ -392,6 +448,11 @@ class FlyQuickAllReduce:
         self._norm_by_atoms = {}
         self._norm_build_kw = {}
         self._norm_launch = {}
+        # The single-phase builds ``_sp_launcher`` adds on first use, by mode.
+        self._sp_launch = {}
+        # Whether ``_sp_preflight`` last passed on every rank, which the
+        # single-phase launches require.
+        self._sp_ready = False
         # Row widths whose fused builds are all compiled and loaded.
         self._rmsnorm_hidden = set()
         try:
@@ -1090,8 +1151,9 @@ class FlyQuickAllReduce:
     def allreduce(self, inp, out, stream=None, divisor: float = DEFAULT_DIVISOR):
         """Two-shot all-reduce into ``out``, in this engine's wire codecs.
 
-        ``stream=None`` uses the current PyTorch stream on this device.
-        ``divisor`` defaults to 1, which leaves the result unchanged.
+        ``stream=None`` uses the current PyTorch stream on this device; calls
+        on one communicator run in one serialized device order (see the class
+        docstring). ``divisor`` defaults to 1, which leaves the result unchanged.
         Loaded values are divided by it before the first pack, and the
         finished sum is multiplied by it once. Every rank must pass the same
         divisor; this is not checked, and a mismatch silently gives each rank
@@ -1121,3 +1183,213 @@ class FlyQuickAllReduce:
             live_bytes=live_bytes,
             divisor=divisor,
         )
+
+    def _sp_engine(self) -> _StEngine:
+        """The engine the single-phase modes run on: ``super_tile=1`` at the
+        default block, whose inbox and colors they share with the all-reduce
+        launches that select the same engine."""
+        if self.algorithm != "mesh":
+            raise ValueError(
+                "reduce_scatter / all_gather need the mesh algorithm, got "
+                f"algorithm={self.algorithm!r}"
+            )
+        if self.inbox_memory != "uncached":
+            raise ValueError(
+                "reduce_scatter / all_gather are validated on the uncached inbox "
+                f"only, got inbox_memory={self.inbox_memory!r}"
+            )
+        eng = self._by_cfg.get((1, BLOCK))
+        if eng is None:
+            raise ValueError(
+                f"reduce_scatter / all_gather need a super_tile=1, block={BLOCK} "
+                f"engine, this object has {sorted(self._by_cfg)}"
+            )
+        return eng
+
+    def _sp_launcher(self, mode):
+        """Build of the ``super_tile=1`` engine for *mode*, made on first use."""
+        launch = self._sp_launch.get(mode)
+        if launch is None:
+            launch = self._algo.build(**self._build_kw[(1, BLOCK)], mode=mode)["launch"]
+            self._sp_launch[mode] = launch
+        return launch
+
+    def _check_sp_payload(self, mode, inp, out, tile_bytes: int) -> int:
+        """Validate a reduce-scatter / all-gather pair; return the full tensor's bytes."""
+        inp_ptr, out_ptr = check_tensors(
+            inp, out, device_index=self._device_index, owner="FlyQuickAllReduce"
+        )
+        inp_bytes = int(inp.numel()) * int(inp.element_size())
+        out_bytes = int(out.numel()) * int(out.element_size())
+        full_bytes, shard_bytes = (
+            (inp_bytes, out_bytes) if mode == MODE_RS else (out_bytes, inp_bytes)
+        )
+        if full_bytes != self.world_size * shard_bytes:
+            raise ValueError(
+                f"{mode}: the full tensor must be world_size={self.world_size} "
+                f"times the shard, got {full_bytes} and {shard_bytes} bytes"
+            )
+        if full_bytes == 0 or full_bytes % tile_bytes != 0:
+            raise ValueError(
+                f"{mode}: the full tensor must be a non-empty whole number of "
+                f"{tile_bytes}-byte tiles, got {full_bytes} bytes"
+            )
+        if full_bytes > MAX_PAYLOAD_BYTES:
+            raise ValueError(
+                "FlyQuickAllReduce payload must not exceed the 4 GiB buffer window"
+            )
+        if max(inp_ptr, out_ptr) < min(inp_ptr + inp_bytes, out_ptr + out_bytes):
+            raise ValueError("FlyQuickAllReduce requires non-overlapping input/output")
+        return full_bytes
+
+    def _sp_preflight(self, kind, inp, out) -> None:
+        """Collective: build and load both single-phase modes and agree on the
+        call, before any rank launches one.
+
+        A rank that launches while a peer does not, or while a peer launches
+        another size or mode, polls that peer's flags forever. So every rank
+        catches whatever raises locally here (the engine and codec rules, the
+        tensors, a build, the residency check) and the ranks vote on it through
+        ``self.group``, together with the call kind and the full size (the shard
+        size is fixed by it), which are all that can differ between ranks that
+        get this far (the world size is the group's, the grid the minimum over
+        the ranks). If any rank failed or the kinds or sizes differ, all raise:
+        a failing rank its own exception, the others a ``RuntimeError``.
+
+        *kind* is ``"compile_sp"`` or the mode of the eager launch that runs
+        this; *inp* and *out* are that call's tensors, checked as it checks
+        them (``compile_sp`` passes ``full`` and ``shard``). It loads modules,
+        which a CUDA graph capture cannot do, so it is refused there before any
+        vote; every rank must be outside a capture.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"FlyQuickAllReduce: {kind} needs the single-phase preflight, "
+                "which loads kernels and agrees the configuration across ranks "
+                "and cannot run under CUDA graph capture; call "
+                "compile_sp(full, shard) on every rank before capture"
+            )
+        self._sp_ready = False
+        error = fingerprint = None
+        try:
+            eng = self._sp_engine()
+            full_bytes = self._check_sp_payload(
+                MODE_AG if kind == MODE_AG else MODE_RS, inp, out, eng.tile_bytes
+            )
+            args = self._launch_args(eng, 0, 0, None, live_bytes=0, num_tiles=0)
+            with torch.cuda.device(self._device_index):
+                for mode in (MODE_RS, MODE_AG):
+                    launch = self._sp_launcher(mode)
+                    preload_launcher(launch, *args)
+                    _check_sp_residency(launch, eng.grid, self._cu_count)
+            fingerprint = (("kind", kind), ("full_bytes", full_bytes))
+        except Exception as exc:  # noqa: BLE001 -- shared with the peers below
+            error = exc
+        message = None if error is None else f"{type(error).__name__}: {error}"
+        votes = [None] * self.world_size
+        dist.all_gather_object(votes, (message, fingerprint), group=self.group)
+        failed = [
+            f"rank {r}: {msg}" for r, (msg, _fp) in enumerate(votes) if msg is not None
+        ]
+        if not failed and len({fp for _msg, fp in votes}) == 1:
+            self._sp_ready = True
+            return
+        if error is not None:
+            raise error
+        if failed:
+            raise RuntimeError(
+                "FlyQuickAllReduce single-phase preflight failed on another "
+                "rank, so nothing launches: " + "; ".join(failed)
+            )
+        differing = [
+            i
+            for i in range(len(votes[0][1]))
+            if len({fp[i][1] for _msg, fp in votes}) > 1
+        ]
+        raise RuntimeError(
+            "FlyQuickAllReduce single-phase calls differ across ranks, so "
+            "nothing launches: "
+            + "; ".join(
+                f"rank {r} " + ", ".join(f"{fp[i][0]}={fp[i][1]}" for i in differing)
+                for r, (_msg, fp) in enumerate(votes)
+            )
+        )
+
+    def _run_sp(self, mode, inp, out, stream) -> None:
+        # No divisor: the single-phase builds take the default of 1, and the
+        # all-gather's dequant would scale by any other. No ``min_bytes`` floor
+        # either: it guards the all-reduce's small-message accuracy cost, and a
+        # sequence-parallel caller picks this kernel for its layout.
+        if not self._sp_ready:
+            self._sp_preflight(mode, inp, out)
+        eng = self._sp_engine()
+        full_bytes = self._check_sp_payload(mode, inp, out, eng.tile_bytes)
+        self._launch_eng(
+            eng,
+            inp,
+            out,
+            stream,
+            live_bytes=full_bytes,
+            launch=self._sp_launcher(mode),
+        )
+
+    def reduce_scatter(self, inp, out, stream=None):
+        """INT4 reduce-scatter: this rank's contiguous block of the sum.
+
+        ``inp`` is this rank's bf16 ``[T, H]`` partial and ``out`` the
+        ``[T / world_size, H]`` block ``[rank * T/W, (rank + 1) * T/W)`` of the
+        element-wise sum over ranks. Only byte sizes are checked: ``inp`` must
+        be ``world_size`` times ``out`` and a whole number of tiles
+        (``tile_bytes``, 32 KiB), so pass ``T`` divisible by ``world_size``.
+        Every partial, this rank's own included, goes through the INT4 codec,
+        so a row's value does not depend on which rank owns it (the all-reduce
+        adds its own share exactly). Shares the inbox slots and colors with the
+        all-reduce launches that go through the same engine; every rank must
+        issue the same sequence of launches and sizes, and every launch and
+        graph replay on this communicator must run in one serialized device
+        order (see the class docstring, which also has the call rules). Needs
+        the mesh algorithm, the uncached inbox, a ``super_tile=1`` engine at
+        the default block and the INT4 codec (the build refuses the fp16 wire
+        codec).
+
+        Until ``compile_sp`` has passed on every rank, the first eager call
+        runs it with these tensors, which makes that call a collective (every
+        rank makes it, in the same mode and with the same sizes), and a call
+        under CUDA graph capture is refused.
+        """
+        self._run_sp(MODE_RS, inp, out, stream)
+
+    def all_gather(self, inp, out, stream=None):
+        """INT4 all-gather of contiguous row blocks.
+
+        ``inp`` is this rank's bf16 ``[T / world_size, H]`` block and ``out``
+        the ``[T, H]`` concatenation of every rank's block, in rank order. This
+        rank's own block is round-tripped through the codec too, so every rank
+        holds bitwise-equal output. Same size, sequence, ordering, engine,
+        codec and ``compile_sp`` rules as ``reduce_scatter``, and the call
+        rules of the class docstring.
+        """
+        self._run_sp(MODE_AG, inp, out, stream)
+
+    def compile_sp(self, full, shard) -> None:
+        """Collective preflight of ``reduce_scatter`` and ``all_gather``: JIT-
+        compile both and load them onto the device, launching neither, and
+        agree across the ranks that they can run. Call it on every rank, with
+        the same sizes, before CUDA graph capture; the first eager
+        ``reduce_scatter`` or ``all_gather`` runs it if nobody has.
+
+        ``full`` is a ``[T, H]`` tensor and ``shard`` a ``[T / world_size, H]``
+        one; they are checked as ``reduce_scatter`` would check them and left
+        untouched. Each rank catches what fails locally (the engine and codec
+        rules, the tensors, the builds, and whether every block of a build's
+        grid fits the device at once, which the persistent kernels need), and
+        the ranks compare the call kind and these sizes through ``group``. If
+        any rank failed or they differ, every rank raises, the failing rank its
+        own exception and the others a ``RuntimeError``, and no launch is
+        accepted until a preflight passes (a failed repeat call revokes an
+        earlier pass). The exception types differ between ranks, so do not
+        branch on the type. Later shapes are checked on their own rank only,
+        the checks that depend on addresses (overlap, alignment) included, so
+        they must agree across ranks as well. Refused under CUDA graph capture.
+        """
+        self._sp_preflight("compile_sp", full, shard)
