@@ -239,7 +239,6 @@ def build_gemm_a8w4_tdm_task(
     expert_tile_m=0,
     direct_expert_map=0,
     packed_expert_map=0,
-    static_m=0,
     persistent_single_task=0,
     force_mid_compute=0,
     linear_wg_map=0,
@@ -433,9 +432,7 @@ def build_gemm_a8w4_tdm_task(
     sched_mma_group = hyper_params["mma_group"]
     sched_first_group = hyper_params.get("mma_first_group", sched_mma_group)
     # A tuned ds_first_n (>= 0) overrides the per-shape default.
-    sched_ds_first = (
-        ds_first_n if ds_first_n >= 0 else hyper_params["ds_first_group"]
-    )
+    sched_ds_first = ds_first_n if ds_first_n >= 0 else hyper_params["ds_first_group"]
     sched_ds_group = hyper_params["ds_group"] if a_is_fp4 and KWS > 1 else 0
     tdm_early_timeout = hyper_params["tdm_early_timeout"]
     ksl0_prefix_mma = hyper_params["ksl0_prefix_mma"]
@@ -713,7 +710,6 @@ def build_gemm_a8w4_tdm_task(
     _lds_n_partitions = f"_splitnlds{lds_n_partitions}" if lds_n_partitions > 1 else ""
     _row_align = f"_ra{ROW_ALIGNMENT}" if ROW_ALIGNMENT > tile_m else ""
     _direct_expert_map = f"_demap{expert_tile_m}" if direct_expert_map else ""
-    _static_m = f"_sm{static_m}" if static_m else ""
     _kname = (
         f"mxfp4_tdm_{_afp}{_a_layout}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -729,7 +725,7 @@ def build_gemm_a8w4_tdm_task(
         f"{_prefence}_earlyacc"
         f"{_reuse_map}{_defer_output_store_wait}"
         f"{_lds_n_partitions}{_packed_expert_map}"
-        f"{_direct_expert_map}{_row_align}{_static_m}{_malign}{_kwaves}"
+        f"{_direct_expert_map}{_row_align}{_malign}{_kwaves}"
         f"{f'_kg{k_grid}' if k_grid > 1 else ''}"
     )
 
@@ -818,10 +814,7 @@ def build_gemm_a8w4_tdm_task(
         TILES_PER_GROUP = 16
         assert TILES_PER_GROUP % cluster_m == 0
         total_n_tiles = ceildiv(i32_n, tile_n)
-        capacity_rows = static_m if static_m else i32_m
-        total_m_tiles = ceildiv(
-            schedule_rows if persistent_workers else capacity_rows, tile_m
-        )
+        total_m_tiles = ceildiv(schedule_rows if persistent_workers else i32_m, tile_m)
         if const_expr(explicit_tile):
             # Persistent work item: the caller names the tile directly.
             m_tile = task_id
@@ -2556,7 +2549,7 @@ def build_gemm_a8w4_tdm_task(
                 tile_id = fx.Int64(
                     (blk_m // tile_m) * ceildiv(i32_n, tile_n) + blk_n // tile_n
                 )
-                plane_b = fx.Int32(capacity_rows) * fx.Int32(i32_n * 4)
+                plane_b = fx.Int32(i32_m) * fx.Int32(i32_n * 4)
                 ws_rsrc = create_buffer_resource_from_addr(
                     fx.Int64(fx.ptrtoint(arg_splitk_ws)) + tile_id * ws_tile_b,
                     num_records_bytes=fx.Int64(plane_b) * (k_grid - 1) + ws_tile_b,
@@ -2731,9 +2724,7 @@ def build_gemm_a8w4_tdm_task(
                 scale_rsrc = create_buffer_resource_from_addr(
                     fx.ptrtoint(scale_ptr),
                     num_records_bytes=(
-                        fx.Int64(capacity_rows)
-                        * fx.Int64(q_dst_scale_dwpr)
-                        * fx.Int64(4)
+                        fx.Int64(i32_m) * fx.Int64(q_dst_scale_dwpr) * fx.Int64(4)
                     ).ir_value(),
                 )
 
@@ -3354,7 +3345,6 @@ def launch_gemm_a8w4_tdm(
     expert_tile_m: Constexpr[int] = 0,
     direct_expert_map: Constexpr[int] = 0,
     packed_expert_map: Constexpr[int] = 0,
-    static_m: Constexpr[int] = 0,
     persistent_single_task: Constexpr[int] = 0,
     force_mid_compute: Constexpr[int] = 0,
     linear_wg_map: Constexpr[int] = 0,
@@ -3437,7 +3427,6 @@ def launch_gemm_a8w4_tdm(
         expert_tile_m=expert_tile_m,
         direct_expert_map=direct_expert_map,
         packed_expert_map=packed_expert_map,
-        static_m=static_m,
         persistent_single_task=persistent_single_task,
         force_mid_compute=force_mid_compute,
         linear_wg_map=linear_wg_map,
@@ -3535,9 +3524,9 @@ def launch_gemm_a8w4_tdm(
                 if const_expr(defer_output_store_wait_on):
                     tdm_ops.tensor_wait(0)
         else:
-            run_task(fx.block_idx.x, static_m if static_m else i32_m, 0)
+            run_task(fx.block_idx.x, i32_m, 0)
 
-    m_tiles = ceildiv(static_m if static_m else i32_m, tile_m)
+    m_tiles = ceildiv(i32_m, tile_m)
     n_tiles = ceildiv(N, tile_n)
     if arg_ep_row_map is None:
         arg_ep_row_map = arg_c

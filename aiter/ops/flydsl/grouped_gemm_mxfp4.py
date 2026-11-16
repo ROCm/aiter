@@ -259,10 +259,6 @@ def flydsl_grouped_gemm_a8w4_masked(
         # A tile skipped for starting in an expert's padding never reaches the
         # M-cluster barrier its peers wait in; cluster_m only buys B multicast.
         cluster_m = 1
-    # Decode padded M is fixed, prefill is runtime.
-    # Simplifying to constant for decode to reduce runtime
-    decode_static_m = int(stage == 1 and int(contiguous_m) <= 32768)
-    constexpr_m = decode_static_m
     persistent_workers = resolve_persistent_workers(stage, persistent_workers)
     if persistent_workers < 0:
         raise ValueError("persistent_workers must be nonnegative")
@@ -381,7 +377,6 @@ def flydsl_grouped_gemm_a8w4_masked(
         int(expert_tile_m or tile_m),
         int(m_expert_tile_map is not None),
         int(packed_expert_map),
-        int(contiguous_m) if constexpr_m else 0,
         persistent_single_task,
         force_mid_compute,
         linear_wg_map,
