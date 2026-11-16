@@ -20,6 +20,7 @@ f16, scores / softmax / accumulation are fp32, the output is bf16.
 """
 
 import functools
+from typing import NamedTuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -58,6 +59,7 @@ from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
     mfma_f16,
     pk_bf16,
     pk_f16,
+    refuse_alloc_in_capture,
     require,
     scales_up_to,
     unit_scale,
@@ -81,6 +83,8 @@ MAX_SPLIT_ROWS = 1024  # (row, kv head) pairs a split launch can hold
 
 def _atomic_add(addr_i64, value):
     """Relaxed agent-scope atomic add on a global i32; returns the old value."""
+    # llvm atomicrmw, not a copy atom: FlyDSL 0.5.0's UniversalAtomicAdd / BufferAtomicAdd
+    # accumulate into memory but return nothing, and the merge needs the old value (ticket).
     return fx.llvm.atomic_add(
         global_i32_ptr(addr_i64),
         fx.Int32(value),
@@ -90,8 +94,9 @@ def _atomic_add(addr_i64, value):
 
 
 def _page_loader(arg_cache, page_bytes, kvh, hkv, w, n, g):
-    """``(open_page, load_k, load_v)``: ``open_page(page, valid)`` is the buffer resource of a
-    page and ``load_k`` / ``load_v`` read this lane's share of its K / V side as raw dwords:
+    """``(open_page, load_k, load_v)``: ``open_page(page, valid)`` returns a page as three
+    buffer tensors (4-, 2- and 1-dword units) and ``load_k`` / ``load_v`` read this lane's
+    share of its K / V side as raw dwords:
 
       K: raw[0:4], raw[4:8]  K data of key rows st = 0, 1 (dims 32 g .. 32 g + 31)
          raw[8]              K scale bytes [st][group] of those rows
@@ -656,16 +661,44 @@ def _get_kernel(splits: int, topk: int, xcds: int, late_v: bool, device_index: i
     return compile_decode(splits, topk, xcds, late_v)
 
 
-@functools.cache
-def _split_buffers(device_index: int):
-    """Split partials and tickets, one set per device; allocated on first use, so warm up
-    before capture. Launches that split a row share them, so they must not overlap on
-    different streams of one device (see ``sparse_pa_nvfp4_decode``)."""
-    dev = f"cuda:{device_index}"
-    part = torch.empty(
-        (MAX_SPLIT_ROWS + 1) * MAX_SPLITS * 64 * PART_F, dtype=torch.float32, device=dev
+class DecodeWorkspace(NamedTuple):
+    """Scratch of the split launches: ``partials`` fp32 (uninitialised is fine) and ``tickets``
+    int32 (zero when no launch is running; the kernel leaves them zero)."""
+
+    partials: torch.Tensor
+    tickets: torch.Tensor
+
+
+_PART_NUMEL = (MAX_SPLIT_ROWS + 1) * MAX_SPLITS * 64 * PART_F
+_TICKETS_NUMEL = MAX_SPLIT_ROWS + 1
+
+
+def sparse_pa_nvfp4_decode_alloc(device) -> DecodeWorkspace:
+    """Allocate a ``workspace`` for ``sparse_pa_nvfp4_decode`` (~150 MiB) on ``device`` and
+    the device's scale placeholder. Call it outside graph capture; the launches that use
+    one workspace must not overlap (give each stream its own)."""
+    refuse_alloc_in_capture("split scratch")
+    device = (
+        torch.device("cuda", device)
+        if isinstance(device, int)
+        else torch.device(device)
     )
-    return part, torch.zeros(MAX_SPLIT_ROWS + 1, dtype=torch.int32, device=dev)
+    require(device.type == "cuda", f"device must be a CUDA device, got {device}")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    unit_scale(device.index)
+    return DecodeWorkspace(
+        torch.empty(_PART_NUMEL, dtype=torch.float32, device=device),
+        torch.zeros(_TICKETS_NUMEL, dtype=torch.int32, device=device),
+    )
+
+
+@functools.cache
+def _split_buffers(device_index: int) -> DecodeWorkspace:
+    """The default workspace, one per device, allocated on first use (refused during graph
+    capture). Launches that split a row share it, so on one device they must not overlap
+    on different streams: pass a ``workspace`` per stream instead."""
+    return sparse_pa_nvfp4_decode_alloc(device_index)
 
 
 def decode_splits(units: int, topk: int, cus: int) -> int:
@@ -713,18 +746,39 @@ def sparse_pa_nvfp4_decode(
     splits: int | None = None,
     xcds: int | None = None,
     late_v: bool | None = None,
+    workspace: DecodeWorkspace | None = None,  # from sparse_pa_nvfp4_decode_alloc
 ) -> torch.Tensor:
     """Row i is query token i % query_len of request i // query_len and attends to
     the keys of its ``topk_idx`` blocks up to its position. Block ids within a row must
     be distinct (a selector emits every block once): the kernel attends once per slot,
     so a repeated id would be counted twice.
 
-    gfx950 only. Every operand must be on ``q``'s device; ``k_scale`` / ``v_scale`` are
-    one positive float32 element each (a device value, not checked) and ``sm_scale``
-    must be finite and positive. One launch in flight per device: the split partials and
-    arrival counters are one shared buffer per device, so two launches must not overlap
-    on different streams of the same GPU (launches on one stream, and graph replays, are
-    serialized).
+    gfx950 only. Every operand must be on ``q``'s device and ``sm_scale`` must be finite
+    and positive.
+
+    Device values the wrapper cannot check (that needs a device sync, which a capture
+    cannot do) and the kernel reads through raw pointers: ``k_scale`` / ``v_scale``
+    positive; ``seq_lens[r] <= block_table.shape[1] * 128`` (every selected block id up to
+    the row's tail is looked up in ``block_table[r]``); every page id behind a selected
+    block in ``[0, kv_cache.shape[0])``. Ids that are negative or past the row's tail are
+    ignored.
+
+    Split launches (``splits > 1``) keep their partials and arrival tickets in a
+    workspace, by default one per device (~150 MiB, allocated on the first such call).
+    Two launches that use the same workspace must not overlap, so on several streams of
+    one device give each stream its own ``workspace=sparse_pa_nvfp4_decode_alloc(device)``;
+    sharing one is the caller's error and corrupts the results silently (launches on one
+    stream, and graph replays, are serialized). A ``workspace`` is checked for device,
+    dtype, size and contiguity; its tickets must be zero between launches (the kernel
+    leaves them so).
+
+    Graph capture: the scale placeholder and the default workspace are allocated on the
+    first call that needs them, which a capture would record instead of run, so a first
+    call inside a capture is refused: call ``sparse_pa_nvfp4_decode_alloc`` first (it does
+    both), or make one eager call (with ``splits > 1`` for the workspace). The first call
+    of each variant (``splits``, ``topk``, ``xcds``, ``late_v``) also JIT-compiles and
+    loads its module; that worked inside a capture in a test on gfx950 (FlyDSL 0.5.0) but
+    some other FlyDSL ops refuse it, so call each variant a capture uses once eagerly.
     """
     if q.device.type != "cuda":
         raise ValueError(f"q must be a CUDA tensor, got {q.device}")
@@ -779,10 +833,38 @@ def sparse_pa_nvfp4_decode(
                 xcds = 8 if get_num_xcds(default=0) == 8 else 0
     if late_v is None:
         late_v = decode_late_v(rows * hkv * splits, _cu_count(dev))
+    if workspace is not None:
+        require(
+            isinstance(workspace, tuple)
+            and len(workspace) == 2
+            and all(isinstance(t, torch.Tensor) for t in workspace),
+            "workspace must be the (partials, tickets) tensors of sparse_pa_nvfp4_decode_alloc",
+        )
+        wp, wt = workspace
+        require(
+            wp.device == q.device and wt.device == q.device,
+            "workspace must be on q's device",
+        )
+        require(
+            wp.dtype == torch.float32 and wt.dtype == torch.int32,
+            "workspace partials must be float32 and tickets int32",
+        )
+        require(
+            wp.is_contiguous() and wt.is_contiguous(),
+            "workspace tensors must be contiguous",
+        )
+        require(
+            wp.numel() >= _PART_NUMEL and wt.numel() >= _TICKETS_NUMEL,
+            f"workspace needs {_PART_NUMEL} partials and {_TICKETS_NUMEL} tickets",
+        )
+        require(
+            wp.data_ptr() % 16 == 0 and wt.data_ptr() % 4 == 0,
+            "workspace partials must be 16-byte and tickets 4-byte aligned",
+        )
     ks, vs, c = host_scales(q, k_scale, v_scale, sm_scale)
-    # An unsplit launch never touches the split scratch (~144 MiB): pass placeholders.
+    # An unsplit launch never touches the split scratch (~150 MiB): pass placeholders.
     unit = unit_scale(dev)
-    part, cnt = _split_buffers(dev) if splits > 1 else (unit, unit)
+    part, cnt = (workspace or _split_buffers(dev)) if splits > 1 else (unit, unit)
     if xcds:
         grid_x = -(-(rows * hkv) // xcds) * xcds * splits
     else:

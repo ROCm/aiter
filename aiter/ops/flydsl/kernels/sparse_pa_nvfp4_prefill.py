@@ -144,7 +144,6 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
             fx.make_layout(4, 1),
         )
         lds_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
-        # Per row (wave-uniform): its causal limit inside its own block.
         qr = ptr_buf_tensor(
             arg_q,
             fx.Int32,
@@ -186,6 +185,7 @@ def compile_prefill(tq: int = 4, rounds: int = 2):
 
         lim, q_regs = [], []
         for t in range_constexpr(TQ):
+            # Per row (wave-uniform): its causal limit inside its own block.
             tok = bidx * TQ + t
             tc = (tok < i32_T).select(tok, fx.Int32(0))
             kv = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.Int32(kv_p[tc])))
@@ -550,10 +550,7 @@ def sparse_pa_nvfp4_prefill(
         return out
     group = check_operands(q, out, kv_cache, topk_idx, block_table)
     require(topk_idx.shape[-1] == TOPK, f"topk_idx must have {TOPK} slots per row")
-    require(
-        block_table.dim() == 2 and block_table.shape[0] >= 1,
-        "block_table 2-D [reqs, max_blocks] with at least one row",
-    )
+    require(block_table.shape[0] >= 1, "block_table needs at least one request row")
     for t in (row_req_id, row_kv_lens):
         require(
             t.dtype == torch.int32 and t.dim() == 1 and t.stride(-1) == 1,

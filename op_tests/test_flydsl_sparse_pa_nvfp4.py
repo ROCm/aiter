@@ -3,7 +3,7 @@
 
 """MiniMax-M3 NVFP4 sparse paged attention, decode and prefill (FlyDSL, gfx950).
 
-The kernels take the selector's output directly: ``topk_idx [Hkv, rows, 16]`` logical
+The kernels take the selector's output directly: ``topk_idx [Hkv, rows, topk]`` logical
 128-token block ids plus the request block table; K / V pages are the single-buffer
 NVFP4 page (see ``kernels/sparse_pa_nvfp4_common.py``).
 
@@ -28,8 +28,14 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_common import (
+    unit_scale as _unit_scale,
+)
 from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_decode import (
+    MAX_SPLIT_ROWS,
+    _split_buffers,
     sparse_pa_nvfp4_decode,
+    sparse_pa_nvfp4_decode_alloc,
 )
 from aiter.ops.flydsl.kernels.sparse_pa_nvfp4_prefill import (
     sparse_pa_nvfp4_prefill,
@@ -67,7 +73,7 @@ def scale_offsets(device):
     r = t % 32
     n = 4 * (r // 8) + r % 4
     k_off = (((t // 32) * 4 + j // 2) * 16 + n) * 4 + ((r % 8) // 4) * 2 + j % 2
-    v_off = j * BLK + t + 0 * j
+    v_off = j * BLK + t
     return k_off, v_off
 
 
@@ -118,7 +124,8 @@ def make_case(
     group,
     seed=0,
     order="shuffle",
-    fill=TOPK,  # valid ids per row (<= TOPK incl. the tail)
+    topk_n=TOPK,  # slots per row
+    fill=TOPK,  # valid ids per row (<= topk_n incl. the tail)
     junk=False,  # sprinkle invalid ids (-1 in the middle, ids past the tail, negatives)
     dup=0,  # repeat the first `dup` ids of each row in the free slots (out of contract)
     alias=False,  # every logical block of a request maps to the request's first page
@@ -158,7 +165,7 @@ def make_case(
         for j in range(q_lens[r]):
             row_req[i], row_kv[i] = r, seq_lens[r] - q_lens[r] + j + 1
             i += 1
-    topk = torch.full((hkv, rows, TOPK), -1, dtype=torch.int32)
+    topk = torch.full((hkv, rows, topk_n), -1, dtype=torch.int32)
     for i in range(rows):
         sb = (int(row_kv[i]) - 1) // BLK
         for h in range(hkv):
@@ -179,7 +186,7 @@ def make_case(
                 ids = torch.cat([ids, ids[:dup]])[:TOPK]
             topk[h, i, : len(ids)] = ids
             if junk:
-                free = list(range(len(ids), TOPK))
+                free = list(range(len(ids), topk_n))
                 if free:  # an id past the row's own block, and -1 gaps inside the list
                     topk[h, i, free[0]] = (
                         sb + 1 + int(torch.randint(0, 5, (1,), generator=g))
@@ -262,7 +269,9 @@ def decode_call(c, splits=None, **kw):
 
 
 def prefill_call(c, **kw):
-    out = torch.empty_like(c["q"])
+    # NaN-filled: torch.empty_like hands back the previous call's (correct) output from the
+    # caching allocator, which hides a launch that wrote nothing.
+    out = torch.full_like(c["q"], float("nan"))
     return sparse_pa_nvfp4_prefill(
         c["q"],
         c["cache"],
@@ -297,8 +306,18 @@ DECODE_CASES = [
     ("batch40_h1", [300 + 331 * i for i in range(40)], [1] * 40, 1, 16, {}),
     ("batch130_h4", [200 + 97 * i for i in range(130)], [1] * 130, 4, 16, {"fill": 12}),
     ("alias_pages", [129, 3000, 700], [1] * 3, 1, 16, {"alias": True}),
+    ("topk8_h1", [5000, 2300, 900, 100], [1] * 4, 1, 16, {"topk_n": 8, "fill": 8}),
+    ("topk8_h2_mtp4", [5000, 2300, 900, 130], [4] * 4, 2, 8, {"topk_n": 8, "fill": 8}),
+    ("topk1_h1", [5000, 2300, 900, 100], [1] * 4, 1, 16, {"topk_n": 1, "fill": 1}),
+    ("topk64_h1", [9000, 8300, 4000, 300], [1] * 4, 1, 16, {"topk_n": 64, "fill": 64}),
+    ("topk64_h4", [9000, 8300, 4000, 300], [1] * 4, 4, 16, {"topk_n": 64, "fill": 40}),
 ]
 DECODE_SPLITS = (None, 1, 2, 4, 8, 16)
+
+
+def splits_of(kw):
+    """The split counts a case can take (splits <= topk)."""
+    return tuple(s for s in DECODE_SPLITS if s is None or s <= kw.get("topk_n", TOPK))
 
 
 PREFILL_CASES = [
@@ -306,6 +325,8 @@ PREFILL_CASES = [
     ("chunk_h4", [3000, 700, 130], [300, 700, 130], 4, 16, {}),
     ("chunk_h2", [2100, 5], [1000, 5], 2, 16, {}),
     ("group8", [3000, 700], [300, 700], 1, 8, {}),
+    ("group8_h2", [2100, 5, 700], [1000, 5, 300], 2, 8, {}),
+    ("group8_h4", [3000, 700, 130], [300, 700, 130], 4, 8, {}),
     ("one_row", [1, 129], [1, 1], 1, 16, {}),
     ("edges", [128, 256, 257, 255, 1], [128, 256, 5, 3, 1], 1, 16, {}),
     ("full_prompt", [1500], [1500], 1, 16, {}),
@@ -321,7 +342,9 @@ PREFILL_CASES = [
     ("alias_two_blocks", [129], [1], 1, 16, {"alias": True}),
     ("alias_chunk", [3000, 700, 130], [300, 700, 130], 1, 16, {"alias": True}),
 ]
-PREFILL_TQ = ((4, 2), (4, 1), (2, 1), (1, 1))
+# (rows per workgroup, combine rounds): every pair compile_prefill accepts (rounds 1 or 2 and
+# dividing tq: (1, 2) is refused, see refusals()).
+PREFILL_TQ = ((4, 2), (4, 1), (2, 2), (2, 1), (1, 1))
 
 
 def check(name, out, ref, tol=REL_L2_TOL):
@@ -373,7 +396,7 @@ def decode_splits_agree():
             seq_lens, q_lens, hkv, group, seed=zlib.crc32(name.encode()) % 1000, **kw
         )
         base = decode_call(c, 1)
-        for s in DECODE_SPLITS:
+        for s in splits_of(kw):
             if s in (None, 1) or len(seq_lens) * hkv > 1024:
                 continue
             err = rel_l2(decode_call(c, s), base)
@@ -422,14 +445,25 @@ def padding_rows():
         c0 = dict(c, seq_lens=torch.tensor([0, 700], dtype=torch.int32, device="cuda"))
         out = decode_call(c0, s)
         bad += int(out[0].abs().max().item() != 0 or not torch.equal(out[1], ref[1]))
-    c1 = dict(
-        c,
-        row_kv=torch.tensor([0, int(c["row_kv"][1])], dtype=torch.int32, device="cuda"),
-    )
-    out = prefill_call(c1)
-    bad += int(
-        out[0].abs().max().item() != 0 or not torch.equal(out[1], prefill_call(c)[1])
-    )
+    # Every tile, and every position in it: the auto tile for 2 rows is tq 1, where a
+    # padding row never shares a workgroup with its neighbour. The other rows must be
+    # bit-equal to the unpadded call of the same tile and match the oracle.
+    for seq_lens, pads in (([500, 700], (0,)), ([500, 700, 300, 900], (0, 1, 3))):
+        c = make_case(seq_lens, [1] * len(seq_lens), 1, 16, seed=5)
+        ref = run_torch(c)
+        for pad in pads:
+            row_kv = c["row_kv"].clone()
+            row_kv[pad] = 0
+            cp = dict(c, row_kv=row_kv)
+            keep = [r for r in range(len(seq_lens)) if r != pad]
+            for tq, rnd in PREFILL_TQ:
+                out = prefill_call(cp, tq=tq, rounds=rnd)
+                same = torch.equal(out[keep], prefill_call(c, tq=tq, rounds=rnd)[keep])
+                bad += int(
+                    out[pad].abs().max().item() != 0
+                    or not same
+                    or rel_l2(out[keep], ref[keep]) > REL_L2_TOL
+                )
     if bad:
         print("padding rows: FAILED")
     return bad
@@ -534,6 +568,11 @@ def refusals():
     # refused (the 8 GiB buffer below is never read; the refusal comes first).
     c2 = make_case([500, 700], [1, 1], 2, 8, seed=5)
     wide = torch.empty(2**31 + 64, dtype=torch.int32, device="cuda")
+    # 513 rows x 2 kv heads = 1026 > MAX_SPLIT_ROWS units: only splits = 1 can hold them.
+    c3 = make_case([128] * 513, [1] * 513, 2, 8, seed=5)
+    over = {k: c3[k] for k in ("q", "cache", "bt", "seq_lens", "topk")}
+    ws = sparse_pa_nvfp4_decode_alloc(c["q"].device)
+    aligned = torch.empty(ws.partials.numel() + 4, dtype=torch.float32, device="cuda")
     shared = [
         ("strided cache view", {"cache": cache[:, ::2]}, "unit last stride"),
         ("cache too narrow", {"cache": cache[:, :-1]}, "smaller than its payload"),
@@ -543,6 +582,27 @@ def refusals():
         ("fp16 q", {"q": c["q"].half()}, "bfloat16"),
         ("group 4", {"q": c["q"][:, :4]}, "8 or 16 heads"),
         ("2-D topk_idx", {"topk": c["topk"][0]}, "must be 3-D"),
+        ("topk_idx rows < q rows", {"topk": c["topk"][:, :1]}, "[Hkv, >= rows, topk]"),
+        ("int8 kv_cache", {"cache": cache.view(torch.int8)}, "kv_cache must be uint8"),
+        (
+            "strided block_table last dim",
+            {"bt": torch.stack([c["bt"], c["bt"]], -1)[..., 0]},
+            "block_table must be int32 with a unit last stride",
+        ),
+        (
+            "strided topk_idx last dim",
+            {"topk": torch.stack([c["topk"], c["topk"]], -1)[..., 0]},
+            "with a unit last stride",
+        ),
+        (
+            "non-contiguous q",
+            {
+                "q": torch.empty(2, 16, 2 * D, dtype=torch.bfloat16, device="cuda")[
+                    ..., :D
+                ]
+            },
+            "q and out must be contiguous",
+        ),
         ("int64 topk_idx", {"topk": c["topk"].long()}, "topk_idx must be int32"),
         ("flattened block_table", {"bt": c["bt"].flatten()}, "block_table 2-D"),
         ("sm_scale 0", {"sm_scale": 0.0}, "sm_scale"),
@@ -578,6 +638,28 @@ def refusals():
             {"q": torch.empty(2**19 + 1, 16, D, dtype=torch.bfloat16, device="cuda")},
             "2 GiB",
         ),
+        # Exactly 2 GiB is refused too (`<`, not `<=`): the masked lanes store to a sentinel
+        # dword that is only dropped when it lies past the end of `out`, and at exactly 2 GiB
+        # it is the last dword of `out`.
+        (
+            "q exactly 2 GiB",
+            {"q": torch.empty(2**19, 16, D, dtype=torch.bfloat16, device="cuda")},
+            "2 GiB",
+        ),
+        (
+            "fp16 out",
+            {"out": torch.empty_like(c["q"], dtype=torch.float16)},
+            "bfloat16",
+        ),
+        (
+            "out of another shape",
+            {
+                "out": torch.empty(
+                    3, *c["q"].shape[1:], dtype=torch.bfloat16, device="cuda"
+                )
+            },
+            "same shape",
+        ),
     ]
     decode_only = [
         ("splits > MAX_SPLITS", {"splits": 32}, "splits must be"),
@@ -585,25 +667,112 @@ def refusals():
         ("short block_table", {"bt": c["bt"][:1]}, "row per request"),
         ("2-D seq_lens", {"seq_lens": c["seq_lens"][None]}, "seq_lens 1-D"),
         ("xcds 1", {"xcds": 1}, "xcds must be"),
+        ("rows != reqs * query_len", {"query_len": 2}, "rows must be reqs * query_len"),
+        (
+            "splits 2 with rows * Hkv > MAX_SPLIT_ROWS",
+            {**over, "splits": 2},
+            f"splits > 1 needs rows * Hkv <= {MAX_SPLIT_ROWS}",
+        ),
+        (
+            "topk 65",
+            {"topk": torch.full((1, 2, 65), -1, dtype=torch.int32, device="cuda")},
+            "topk must be in [1, 64]",
+        ),
+        (
+            "splits > topk",
+            {
+                "topk": torch.full((1, 2, 4), -1, dtype=torch.int32, device="cuda"),
+                "splits": 8,
+            },
+            "splits must be in [1, topk = 4]",
+        ),
+        (
+            "strided seq_lens",
+            {"seq_lens": torch.stack([c["seq_lens"], c["seq_lens"]], -1)[..., 0]},
+            "seq_lens must be int32 with a unit last stride",
+        ),
+        ("workspace not a pair", {"workspace": ws.partials}, "workspace must be the"),
+        (
+            "workspace partials fp16",
+            {"workspace": (ws.partials.half(), ws.tickets)},
+            "partials must be float32",
+        ),
+        (
+            "workspace tickets int64",
+            {"workspace": (ws.partials, ws.tickets.long())},
+            "tickets int32",
+        ),
+        (
+            "workspace on cpu",
+            {"workspace": (ws.partials[:1].cpu(), ws.tickets)},
+            "q's device",
+        ),
+        (
+            "workspace strided",
+            {"workspace": (ws.partials[::2], ws.tickets)},
+            "contiguous",
+        ),
+        (
+            "workspace partials too small",
+            {"workspace": (ws.partials[:-1], ws.tickets)},
+            "workspace needs",
+        ),
+        (
+            "workspace tickets too small",
+            {"workspace": (ws.partials, ws.tickets[:-1])},
+            "workspace needs",
+        ),
+        (
+            "workspace partials misaligned",
+            {"workspace": (aligned[1 : 1 + ws.partials.numel()], ws.tickets)},
+            "aligned",
+        ),
     ]
     prefill_only = [
-        ("empty block_table", {"bt": c["bt"][:0]}, "block_table 2-D"),
+        ("empty block_table", {"bt": c["bt"][:0]}, "at least one request row"),
         ("tq 3", {"tq": 3}, "tq must be"),
         ("rounds without tq", {"rounds": 1}, "rounds needs tq"),
+        ("rounds 2 does not divide tq 1", {"tq": 1, "rounds": 2}, "divide tq"),
+        ("rounds 3", {"tq": 4, "rounds": 3}, "rounds must be 1 or 2"),
+        ("rounds 0", {"tq": 4, "rounds": 0}, "rounds must be 1 or 2"),
+        (
+            "topk_idx with 8 slots",
+            {"topk": torch.full((1, 2, 8), -1, dtype=torch.int32, device="cuda")},
+            "16 slots",
+        ),
+        ("int64 row_req_id", {"row_req": c["row_req"].long()}, "1-D int32"),
+        ("int64 row_kv_lens", {"row_kv": c["row_kv"].long()}, "1-D int32"),
+        ("2-D row_kv_lens", {"row_kv": c["row_kv"][None]}, "1-D int32"),
+        (
+            "strided row_req_id",
+            {"row_req": torch.stack([c["row_req"], c["row_req"]], -1)[..., 0]},
+            "1-D int32",
+        ),
+        (
+            "row_req_id shorter than rows",
+            {"row_req": c["row_req"][:1]},
+            "a value per row",
+        ),
+        (
+            "row_kv_lens shorter than rows",
+            {"row_kv": c["row_kv"][:1]},
+            "a value per row",
+        ),
+        ("row_kv_lens on cpu", {"row_kv": c["row_kv"].cpu()}, "q's device"),
     ]
 
     def decode(a):
         sparse_pa_nvfp4_decode(
             a["q"], a["cache"], a["topk"], a["bt"], a["seq_lens"], a["sm_scale"],
-            a.get("out"), a["k_scale"], a["v_scale"], query_len=1, splits=a.get("splits"),
-            xcds=a.get("xcds"),
+            a.get("out"), a["k_scale"], a["v_scale"], query_len=a.get("query_len", 1),
+            splits=a.get("splits"), xcds=a.get("xcds"), workspace=a.get("workspace"),
         )  # fmt: skip
 
     def prefill(a):
         sparse_pa_nvfp4_prefill(
-            a["q"], a["cache"], a["topk"], a["bt"], c["row_req"], c["row_kv"],
-            a["sm_scale"], a.get("out"), a["k_scale"], a["v_scale"], tq=a.get("tq"),
-            rounds=a.get("rounds"),
+            a["q"], a["cache"], a["topk"], a["bt"], a.get("row_req", c["row_req"]),
+            a.get("row_kv", c["row_kv"]), a["sm_scale"], a.get("out"), a["k_scale"],
+            a["v_scale"], tq=a.get("tq"), rounds=a.get("rounds"),
         )  # fmt: skip
 
     for kind, call, cases in (
@@ -625,13 +794,305 @@ def refusals():
             else:
                 print(f"refusal: {kind} {name} was accepted")
             bad += 1
+    # Just below the limit a call still runs (prefill; decode shares the check): q and out
+    # are 2**31 - 4096 bytes, and the masked lanes of the last, partial tile store to the
+    # sentinel dword, which has to fall past the end of `out`. The rows are copies of one row.
+    n = 2**19 - 1
+    one = dict(c, q=c["q"][:1], topk=c["topk"][:, :1], row_req=c["row_req"][:1])
+    one["row_kv"] = c["row_kv"][:1]
+    ref = run_torch(one)
+    big = dict(
+        c,
+        q=c["q"][:1].repeat(n, 1, 1),
+        topk=c["topk"][:, :1].expand(-1, n, -1).contiguous(),
+        row_req=c["row_req"][:1].expand(n).contiguous(),
+        row_kv=c["row_kv"][:1].expand(n).contiguous(),
+    )
+    out = prefill_call(big)
+    for r in (0, n - 1):
+        if not check(f"q just below 2 GiB, row {r}", out[r : r + 1], ref)[0]:
+            bad += 1
+    del big, out
     decode_call(c, 16)  # the largest split count still launches
+    # Past the limit the default falls back to one workgroup per unit; only an explicit
+    # split count is refused.
+    if not torch.equal(decode_call(c3), decode_call(c3, 1)):
+        print("rows * Hkv > MAX_SPLIT_ROWS: the default is not splits = 1")
+        bad += 1
     # An aligned padded page is accepted and reads the same data.
     pad4 = torch.zeros(pages, page_b + 4, dtype=torch.uint8, device="cuda")
     pad4[:, :page_b] = cache
     if not torch.equal(decode_call(dict(c, cache=pad4[:, :page_b])), decode_call(c)):
         print("padded page (stride +4) gives a different result")
         bad += 1
+    return bad
+
+
+def capture_scratch():
+    """The scale placeholder and the default split scratch are allocated (and zero-filled) on
+    the first call that needs them; inside a capture the fill would be recorded, not run, so
+    that call is refused. After an eager call the capture replays correctly (and poisoned
+    tickets, what a skipped fill leaves, fail the oracle check); an explicit workspace lets
+    the capture skip the default scratch altogether."""
+    bad = 0
+    dev = torch.cuda.current_device()
+    c = make_case([3000, 2300, 900, 130], [1] * 4, 1, 16, seed=7)
+    ref = run_torch(c)
+
+    # (name, splits, caches the warm-up leaves out, text the refusal must contain)
+    for name, splits, cold, msg in (
+        ("splits 4, cold", 4, (_unit_scale, _split_buffers), "scale placeholder"),
+        ("splits 4, warm for splits 1", 4, (_split_buffers,), "split scratch"),
+        ("splits 1, cold", 1, (_unit_scale,), "scale placeholder"),
+    ):
+        # the compile happens here, so the capture below only meets the allocation
+        decode_call(c, splits)
+        for f in cold:
+            f.cache_clear()
+        g = torch.cuda.CUDAGraph()
+        err = None
+        try:
+            with torch.cuda.graph(g):
+                decode_call(c, splits)
+        except ValueError as e:
+            err = str(e)
+        if err is None or msg not in err:
+            print(f"capture {name}: expected a refusal naming {msg!r}, got {err!r}")
+            bad += 1
+        if any(f.cache_info().currsize for f in cold):
+            print(f"capture {name}: a refused call left a cached allocation")
+            bad += 1
+    # The explicit alloc is refused inside a capture, and outside one it replaces the
+    # eager warm-up of the scratch.
+    for f in (_unit_scale, _split_buffers):
+        f.cache_clear()
+    try:
+        with torch.cuda.graph(torch.cuda.CUDAGraph()):
+            sparse_pa_nvfp4_decode_alloc(dev)
+        print("capture: sparse_pa_nvfp4_decode_alloc was accepted inside a capture")
+        bad += 1
+    except ValueError:
+        pass
+    ws = sparse_pa_nvfp4_decode_alloc(dev)
+    ws.partials.fill_(float("nan"))  # every split stores its partial before it is read
+    out = torch.empty_like(c["q"])
+
+    def run(**kw):
+        sparse_pa_nvfp4_decode(
+            c["q"], c["cache"], c["topk"], c["bt"], c["seq_lens"], SM_SCALE, out,
+            c["k_scale"], c["v_scale"], splits=4, **kw,
+        )  # fmt: skip
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        run(workspace=ws)
+    if _split_buffers.cache_info().currsize:
+        print("capture: a call with a workspace allocated the default scratch")
+        bad += 1
+    for i in range(3):
+        out.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        bad += int(not check(f"capture with workspace, replay {i}", out, ref)[0])
+    # The default scratch: eager warm-up, capture, replays.
+    decode_call(c, 4)  # allocates and fills
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        run()
+    for i in range(3):
+        out.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        bad += int(not check(f"capture replay {i}", out, ref)[0])
+    # Eager calls after the replays still see clean tickets.
+    bad += int(not check("eager after replay", decode_call(c, 4), ref)[0])
+    # A skipped fill would leave the tickets nonzero (no merge): the oracle check must see it.
+    cnt = _split_buffers(dev).tickets
+    cnt.fill_(-1)
+    out.fill_(float("nan"))
+    run()
+    if check("tickets poisoned (expected to fail)", out, ref)[0]:
+        print("capture: poisoned tickets went unnoticed")
+        bad += 1
+    cnt.zero_()
+    return bad
+
+
+def capture_prefill():
+    """Prefill under graph capture. The scale placeholder (the default k / v scale) is
+    allocated and zero-filled on the first call that needs it, which a capture would record
+    instead of run: that call is refused. After an eager call, or after
+    ``sparse_pa_nvfp4_decode_alloc``, the capture replays and matches the oracle at every
+    tile."""
+    bad = 0
+    dev = torch.cuda.current_device()
+    c = make_case([3000, 700, 130], [300, 700, 130], 1, 16, seed=9)
+    ref = run_torch(c)
+    cold = dict(c, k_scale=None, v_scale=None)  # the default scales: the placeholder
+    for tq, rnd in PREFILL_TQ:
+        prefill_call(cold, tq=tq, rounds=rnd)  # the compile happens here
+        _unit_scale.cache_clear()
+        err = None
+        try:
+            with torch.cuda.graph(torch.cuda.CUDAGraph()):
+                prefill_call(cold, tq=tq, rounds=rnd)
+        except ValueError as e:
+            err = str(e)
+        if err is None or "scale placeholder" not in err:
+            print(f"capture prefill tq={tq} r={rnd}: expected a refusal, got {err!r}")
+            bad += 1
+        if _unit_scale.cache_info().currsize:
+            print(f"capture prefill tq={tq} r={rnd}: a refused call left an allocation")
+            bad += 1
+        # Warm-ups that make the capture legal: an eager call, or the decode alloc.
+        for how in ("eager call", "decode_alloc"):
+            _unit_scale.cache_clear()
+            if how == "eager call":
+                prefill_call(c, tq=tq, rounds=rnd)
+            else:
+                sparse_pa_nvfp4_decode_alloc(dev)
+            out = torch.empty_like(c["q"])
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                sparse_pa_nvfp4_prefill(
+                    c["q"], c["cache"], c["topk"], c["bt"], c["row_req"], c["row_kv"],
+                    SM_SCALE, out, c["k_scale"], c["v_scale"], tq=tq, rounds=rnd,
+                )  # fmt: skip
+            for i in range(3):
+                out.fill_(float("nan"))  # a launch that did not run leaves NaN
+                g.replay()
+                torch.cuda.synchronize()
+                name = f"prefill capture after {how}, tq={tq} r={rnd}, replay {i}"
+                bad += int(not check(name, out, ref)[0])
+    return bad
+
+
+def capture_prefill_scales():
+    """Which scales a capture reads. The placeholder is allocated on EVERY call
+    (``host_scales``), also when both scales are passed, so a cold capture is refused
+    whatever the scales are. After an eager call every variant replays and matches the
+    oracle (scales of 1.0, the placeholder's value, output pre-filled with NaN); with the
+    default scales the replay reads the placeholder: set to 2.0 between two replays, the
+    output goes wrong, and it is right again once restored."""
+    bad = 0
+    dev = torch.cuda.current_device()
+    c = make_case(
+        [3000, 700, 130], [300, 700, 130], 1, 16, seed=9, k_scale=1.0, v_scale=1.0
+    )
+    ref = run_torch(c)
+    variants = {  # name -> the k_scale / v_scale the call is given
+        "k and v given": (c["k_scale"], c["v_scale"]),
+        "default k": (None, c["v_scale"]),
+        "default v": (c["k_scale"], None),
+        "default k and v": (None, None),
+    }
+
+    def call(ks, vs, out, tq, rnd):
+        sparse_pa_nvfp4_prefill(
+            c["q"], c["cache"], c["topk"], c["bt"], c["row_req"], c["row_kv"],
+            SM_SCALE, out, ks, vs, tq=tq, rounds=rnd,
+        )  # fmt: skip
+
+    for tq, rnd in PREFILL_TQ:
+        for vname, (ks, vs) in variants.items():
+            tag = f"prefill capture, {vname}, tq={tq} r={rnd}"
+            call(ks, vs, torch.empty_like(c["q"]), tq, rnd)  # the compile happens here
+            _unit_scale.cache_clear()
+            try:
+                with torch.cuda.graph(torch.cuda.CUDAGraph()):
+                    call(ks, vs, torch.empty_like(c["q"]), tq, rnd)
+                err = None
+            except ValueError as e:
+                err = str(e)
+            if err is None or "scale placeholder" not in err:
+                print(f"{tag}: a cold capture must be refused, got {err!r}")
+                bad += 1
+            if _unit_scale.cache_info().currsize:
+                print(f"{tag}: a refused call left an allocation")
+                bad += 1
+            call(ks, vs, torch.empty_like(c["q"]), tq, rnd)  # warm up: allocates it
+            out = torch.empty_like(c["q"])
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                call(ks, vs, out, tq, rnd)
+            for i in range(3):
+                out.fill_(float("nan"))  # a launch that did not run leaves NaN
+                g.replay()
+                torch.cuda.synchronize()
+                bad += int(not check(f"{tag}, replay {i}", out, ref)[0])
+            if vname == "default k and v":
+                unit = _unit_scale(dev)
+                unit.fill_(2.0)
+                out.fill_(float("nan"))
+                g.replay()
+                torch.cuda.synchronize()
+                unit.fill_(1.0)
+                if rel_l2(out, ref) < 1.0:
+                    print(f"{tag}: the replay did not read the placeholder")
+                    bad += 1
+                out.fill_(float("nan"))
+                g.replay()
+                torch.cuda.synchronize()
+                bad += int(not check(f"{tag}, replay after restoring", out, ref)[0])
+    return bad
+
+
+def two_streams(n=64, rounds=3):
+    """Split launches on two streams of one device. Each stream replays a graph of ``n``
+    launches (back to back, so they overlap), unsynchronised, every launch with its own
+    output. With a workspace per stream (partials poisoned with NaN) every output passes
+    ``check`` against the oracle (componentwise too); the same launches on the shared default
+    scratch are the caller's error: their wrong outputs are only reported (a race, so the
+    count varies), then the tickets are reset.
+    """
+    dev = torch.cuda.current_device()
+    c = make_case([3000, 2300, 900, 130, 2000, 1500, 700, 5000], [1] * 8, 1, 16, seed=3)
+    ref = run_torch(c)
+    decode_call(c, 4)  # loads the variant and the default scratch
+
+    def wrong_outputs(workspaces, ok):
+        streams = [torch.cuda.Stream() for _ in range(2)]
+        outs = [[torch.empty_like(c["q"]) for _ in range(n)] for _ in streams]
+        graphs = []
+        for st, ws, os in zip(streams, workspaces, outs):
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=st):
+                for o in os:
+                    sparse_pa_nvfp4_decode(
+                        c["q"], c["cache"], c["topk"], c["bt"], c["seq_lens"], SM_SCALE,
+                        o, c["k_scale"], c["v_scale"], splits=4, workspace=ws,
+                    )  # fmt: skip
+            graphs.append(g)
+        wrong = 0
+        for _ in range(rounds):
+            for os in outs:
+                for o in os:
+                    o.fill_(float("nan"))
+            torch.cuda.synchronize()
+            for st, g in zip(streams, graphs):
+                with torch.cuda.stream(st):
+                    g.replay()
+            torch.cuda.synchronize()
+            wrong += sum(not ok(o) for os in outs for o in os)
+        return wrong
+
+    wss = [sparse_pa_nvfp4_decode_alloc(dev) for _ in range(2)]
+    for ws in wss:
+        ws.partials.fill_(float("nan"))
+    bad = wrong_outputs(
+        wss, lambda o: check("two streams, a workspace each", o, ref)[0]
+    )
+    if bad:
+        print(f"two streams, a workspace each: {bad} of {2 * n * rounds} outputs wrong")
+    shared = wrong_outputs(  # diagnostic only: a whole-output norm is enough to count
+        [None, None],
+        lambda o: rel_l2(o, ref) <= REL_L2_TOL
+        and bool(torch.isfinite(o.float()).all()),
+    )
+    _split_buffers(dev).tickets.zero_()
+    print(
+        f"two streams, shared default scratch (caller error): {shared} of {2 * n * rounds} outputs wrong"
+    )
     return bad
 
 
@@ -727,7 +1188,7 @@ def test_decode_perf(rows, query_len, hkv, group, ctx):
 @benchmark()
 def test_prefill_perf(q_len, hkv, group, ctx):
     """One request, a chunk of ``q_len`` rows ending at ``ctx`` keys; random top-k blocks
-    per row (no overlap between neighbouring rows, the worst case for the page reuse).
+    per row (neighbouring rows overlap only by chance: a low case for the page reuse).
     """
     pool, kd, vd = perf_pool(hkv, 8192)
     g = torch.Generator(device="cuda").manual_seed(2)
@@ -809,7 +1270,7 @@ def main(argv=None):
     rows, failed = [], 0
     for name, seq_lens, q_lens, hkv, group, kw in DECODE_CASES:
         if want(name):
-            for sp in DECODE_SPLITS:
+            for sp in splits_of(kw):
                 rows.append(test_correctness(name, hkv, group, sum(q_lens), sp))
     for name, seq_lens, q_lens, hkv, group, kw in PREFILL_CASES:
         if want(name):
@@ -831,6 +1292,10 @@ def main(argv=None):
     failed += padding_empty_table()
     failed += poisoned_tail()
     failed += refusals()
+    failed += capture_scratch()
+    failed += capture_prefill()
+    failed += capture_prefill_scales()
+    failed += two_streams()
     if args.perf:
         perf = [
             test_decode_perf(r, ql, hkv, g, ctx)
