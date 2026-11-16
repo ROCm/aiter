@@ -14,6 +14,7 @@
 // are shared verbatim.
 #include "opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh"
 
+
 // SF_SHUF_IN_LDS (the kernel's trailing template bool, per kid) stages the
 // shuffle_scale words through the LDS panel instead of reading them from global
 // on every K tile. The two do not buy the same thing -- the panel gets the scale
@@ -93,8 +94,8 @@ OPUS_D void mma_mxscale_wave8_accum(const VA& v_a, const VB& v_b,
     constexpr int b_len = Mma::mma_b_len;
     constexpr int c_len = Mma::mma_c_len;
     // N-repeats per B scale group, and the groups this wave's columns span.
-    constexpr int rep_n_per_scale = T::GROUP_N / T::W_N;
-    static_assert(rep_n_per_scale > 0 && T::GROUP_N % T::W_N == 0);
+    constexpr int rep_n_per_scale = T::SFB_REP_N;
+    static_assert(rep_n_per_scale > 0 && (T::GROUP_N == 1 || T::GROUP_N % T::W_N == 0));
     static_assert(T::SFB_GROUPS * rep_n_per_scale >= T::COM_REP_N,
                   "the wave's B scale groups must cover its n-repeats");
 
@@ -193,7 +194,13 @@ OPUS_D void mma_mxscale_wave8_accum(const VA& v_a, const VB& v_b,
                     opus::number<i_tile_c * c_len + c_len>{});
             });
         });
-        if constexpr (B_EARLY) on_nrep(in_c);
+        if constexpr (B_EARLY) {
+            // Left to itself the scheduler sinks every n-repeat's reissue to the
+            // last one, which issues the next tile's B late and in one burst.
+            __builtin_amdgcn_sched_barrier(0);
+            on_nrep(in_c);
+            __builtin_amdgcn_sched_barrier(0);
+        }
     });
 }
 
@@ -384,21 +391,31 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // the dispatcher's round-robin then scatters across all eight XCDs.
     constexpr bool XCD_FUSE = !std::is_void_v<D_OUT> && !DIRECT_ONLY && T::XCD_FUSE;
     const bool xcd_fused = XCD_FUSE && kargs.ptr_xcd_counters != nullptr;
-    const int num_tiles_m = ceil_div(kargs.m, T::B_M);
-    const int tiles_per_batch = num_tiles_m * ceil_div(kargs.n, T::B_N);
+    // Every index here is non-negative. Unsigned division drops the sign
+    // fixups of a signed one, and each division the common case can skip is
+    // skipped: in a kernel this short the tile decode is on the critical path
+    // to the first load.
+    auto udiv = [](int a, int b) { return (int)((unsigned)a / (unsigned)b); };
+    const int num_tiles_m = (int)(((unsigned)kargs.m + T::B_M - 1) / T::B_M);
+    const int num_tiles_n = (int)(((unsigned)kargs.n + T::B_N - 1) / T::B_N);
+    const int tiles_per_batch = num_tiles_m * num_tiles_n;
     int split_id = 0;
     int wgid     = (int)opus::block_id_x();
     if constexpr (!DIRECT_ONLY) {
         if (xcd_fused) {
             if (wgid >= tiles_per_batch) return;  // the pad to a multiple of 8
             split_id = (int)opus::block_id_y();
-        } else {
-            split_id = (int)opus::block_id_x() % kargs.split_k;
-            wgid     = (int)opus::block_id_x() / kargs.split_k;
+        } else if (kargs.split_k != 1) {
+            wgid     = udiv((int)opus::block_id_x(), kargs.split_k);
+            split_id = (int)opus::block_id_x() - wgid * kargs.split_k;
         }
     }
-    int row = (wgid % num_tiles_m) * T::B_M;
-    int col = (wgid / num_tiles_m) * T::B_N;
+    int row, col;
+    auto plain_tile = [&] {
+        const int q = udiv(wgid, num_tiles_m);
+        row = (wgid - q * num_tiles_m) * T::B_M;
+        col = q * T::B_N;
+    };
     // L2 rasterization, the mapping the reference flydsl kernel runs (its
     // xcd_swizzle value is this band height, not a count of XCDs -- it assumes 8
     // of those unconditionally, as here).
@@ -414,30 +431,46 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // split_k workgroups of one tile are consecutive ids and sit on different
     // XCDs), so the swizzle is off for split-K. It also assumes gridDim.x is a
     // multiple of 8, or block_id_z shifts which XCD a tile lands on.
-    if constexpr (XCD_WGM > 0) {
-        constexpr int NUM_XCD = 8;
-        if (kargs.split_k == 1) {
-            const int num_tiles_n = ceil_div(kargs.n, T::B_N);
-            const int total = num_tiles_m * num_tiles_n;
-            const int per_xcd = total / NUM_XCD;
-            const int rem_xcd = total % NUM_XCD;
-            const int xcd = wgid % NUM_XCD;
-            const int slot = wgid / NUM_XCD;
+    int batch_id = opus::block_id_z();
+    if constexpr (XCD_WGM <= 0) {
+        plain_tile();
+    } else {
+        constexpr unsigned NUM_XCD = 8;
+        if (kargs.split_k != 1) {
+            plain_tile();
+        } else {
+            // The run is taken over every batch's tiles, in dispatch order (x
+            // fastest, then z), so an XCD owns whole batches where it can rather
+            // than a slice of each: at G8 x 32 tiles per batch that is 1/3 the
+            // HBM reads of the per-batch run.
+            const int linear = batch_id * tiles_per_batch + wgid;
+            const int total = kargs.batch * tiles_per_batch;
+            const int per_xcd = (int)((unsigned)total / NUM_XCD);
+            const int rem_xcd = (int)((unsigned)total % NUM_XCD);
+            const int xcd = (int)((unsigned)linear % NUM_XCD);
+            const int slot = (int)((unsigned)linear / NUM_XCD);
             // The first rem_xcd XCDs carry one extra tile, so their runs start
             // one later apiece -- clip at rem_xcd once past them.
-            const int lid = xcd * per_xcd + (xcd < rem_xcd ? xcd : rem_xcd) + slot;
+            const int glid = xcd * per_xcd + (xcd < rem_xcd ? xcd : rem_xcd) + slot;
+            batch_id = kargs.batch == 1 ? 0 : udiv(glid, tiles_per_batch);
+            const int lid = glid - batch_id * tiles_per_batch;
 
             const int per_band = XCD_WGM * num_tiles_n;
-            const int band = lid / per_band;
+            const int band = udiv(lid, per_band);
             const int first_m = band * XCD_WGM;
             const int rows_left_m = num_tiles_m - first_m;
-            const int band_m = rows_left_m < XCD_WGM ? rows_left_m : XCD_WGM;
             const int loc = lid - band * per_band;
-            row = (first_m + loc % band_m) * T::B_M;
-            col = (loc / band_m) * T::B_N;
+            // Only the last band can be short; a full one divides by a constant.
+            if (rows_left_m >= XCD_WGM) {
+                row = (first_m + (int)((unsigned)loc % (unsigned)XCD_WGM)) * T::B_M;
+                col = (int)((unsigned)loc / (unsigned)XCD_WGM) * T::B_N;
+            } else {
+                const int q = udiv(loc, rows_left_m);
+                row = (first_m + loc - q * rows_left_m) * T::B_M;
+                col = q * T::B_N;
+            }
         }
     }
-    const int batch_id = opus::block_id_z();
     const int wave_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / get_warp_size());
     const int lane_id = opus::thread_id_x() % get_warp_size();
     // T_M x T_N (M, N) wave grid. wave_id_m is the fast axis so the waves sharing
@@ -445,8 +478,9 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     const int wave_id_m = wave_id % T::T_M;
     const int wave_id_n = wave_id / T::T_M;
 
-    const int total_iters = ceil_div(kargs.k, T::B_K);
-    const int iters_full = ceil_div(total_iters, kargs.split_k);
+    const int total_iters = (int)(((unsigned)kargs.k + T::B_K - 1) / T::B_K);
+    const int iters_full = kargs.split_k == 1 ? total_iters
+                         : udiv(total_iters + kargs.split_k - 1, kargs.split_k);
     const int loops = (split_id < kargs.split_k - 1)
                     ? iters_full
                     : (total_iters - (kargs.split_k - 1) * iters_full);
@@ -554,9 +588,21 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // so a K tile's scales for all of a lane's subtiles are one read -- but only
     // a register fill can build it. The DMA layout pays COM_REP_M reads a tile
     // to drop the fill's register round trip, which is a win at COM_REP_M = 4
-    // (kid8408 0.96x) and a loss at 8 (kid8406 1.10x, kid8205 1.04x).
-    constexpr bool SF_A_DMA = SF_LDS_A && T::COM_REP_M <= 4;
+    // (kid8408 0.96x) and a loss at 8 (kid8406 1.10x, kid8205 1.04x). GROUP_N=1
+    // already reads a byte per (N repeat, K rep) for B, and there the M-packed
+    // read wins at COM_REP_M = 4 too (kid9766 0.92x).
+    constexpr bool SF_A_DMA = SF_LDS_A && T::COM_REP_M <= (T::GROUP_N == 1 ? 2 : 4);
     constexpr bool SF_A_MPACK = SF_LDS_A && !SF_A_DMA;
+    // A GROUP_N=1 B panel has B_N rows, too many to hold a whole split beside a
+    // second resident workgroup, so a split longer than the panel walks it in
+    // windows of SF_WIN_TILES K tiles that read_scales reloads at each window
+    // boundary. A power of two keeps the rows rotating.
+    constexpr bool SF_WINDOW = T::GROUP_N == 1 && SF_LDS_B;
+    constexpr int SF_WIN_TILES = [] {
+        int w = 1;
+        while (w * 2 <= SFA_K_TILES_MAX) w *= 2;
+        return w;
+    }();
     // Pad each M-packed lane row to separate its LDS banks.
     // The padding follows the scale group and each read's byte width.
     constexpr int SF_A_PAD = !SF_A_MPACK ? 0
@@ -601,7 +647,13 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
              + (loop_k_idx * T::NUM_LOAD_GROUPS_PER_BK + k_group) * T::LOAD_GROUP_K;
     };
 
-    const int sf_k_scales = loops * T::SCALES_PER_BK;
+    const int sf_win_tiles =
+        SF_WINDOW && loops > SFA_K_TILES_MAX ? SF_WIN_TILES : loops;
+    const int sf_k_scales = sf_win_tiles * T::SCALES_PER_BK;
+    // The panel's window: its first K tile, and how many of its scales exist,
+    // which is fewer in a partial last window.
+    int sf_win0 = 0;
+    int sf_fill_scales = sf_k_scales;
     // Panel row, in dwords and in bytes.
     const int sf_row_dw = (sf_k_scales + 3) / 4;
     const int sf_pitch = sf_row_dw * 4;
@@ -616,13 +668,55 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // order and takes the bank conflicts.
     const int sf_rot_mask = (sf_row_dw & (sf_row_dw - 1)) == 0 ? sf_row_dw - 1 : 0;
     auto sf_rot = [&](int r) { return (r & (SFA_MB - 1)) & sf_rot_mask; };
+    // Wraps a rotated dword index back into its row: only a power-of-two row
+    // rotates, so a mask does it, and an unrotated index never needs one.
+    const int sf_wrap_mask = sf_rot_mask ? sf_rot_mask : -1;
     static_assert((SFA_MB & (SFA_MB - 1)) == 0);
+    // A GROUP_N=1 B panel is read a row per lane too, so its rows rotate by the
+    // row's index within its W_N block. At W_N=16 the rotation moves whole
+    // 16-byte chunks, 4*((r>>2)&3) dwords: the 16 rows of a read still land on
+    // 16 banks (r&3 picks the quarter of the banks, the chunk the bank in it),
+    // and a chunk stays contiguous, so the fill can copy it with one dwordx4
+    // DMA. Coarser groups are read wave-uniform and keep their order.
+    constexpr bool SFB_CHUNK_ROT = T::GROUP_N == 1 && T::W_N == 16;
+    auto sfb_rot = [&](int r) {
+        if constexpr (T::GROUP_N != 1) return 0;
+        else if constexpr (SFB_CHUNK_ROT) return (((r >> 2) & 3) << 2) & sf_rot_mask;
+        else return (r & (T::W_N - 1)) & sf_rot_mask;
+    };
+    // Under chunk rotation the B panel places dword d of row r at d ^ rot(r)
+    // rather than (d + rot(r)) % row: the same four positions per 16-dword
+    // group, so the reads stay conflict-free, but rot only has bits 2-3 set and
+    // a tile's first dword leaves its low bits to the K repeat -- the tile's
+    // SCALES_PER_BK/4 dwords. One XOR then places the whole tile, and every K
+    // repeat and N repeat is an immediate offset off it.
+    constexpr bool SFB_XOR = SFB_CHUNK_ROT && T::SCALES_PER_BK % 4 == 0
+                             && T::SCALES_PER_BK <= 16
+                             && (T::SCALES_PER_BK & (T::SCALES_PER_BK - 1)) == 0;
+    // The panel position of row r's dword d, and (being an involution under
+    // XOR) the source dword of position d.
+    auto sfb_pos = [&](int r, int d) {
+        if constexpr (SFB_XOR) {
+            return d ^ sfb_rot(r);
+        } else {
+            d += sfb_rot(r);
+            return d >= sf_row_dw ? d - sf_row_dw : d;
+        }
+    };
+    auto sfb_src = [&](int r, int c) {
+        if constexpr (SFB_XOR) {
+            return c ^ sfb_rot(r);
+        } else {
+            const int d = c - sfb_rot(r);
+            return d < 0 ? d + sf_row_dw : d;
+        }
+    };
 
     // Overrunning the panels would corrupt LDS, so the bail-out stays, but
     // returning leaves Y untouched and a zeroed output reads like a correct
     // answer. The launcher checks the same bound with AITER_CHECK; reaching
     // this return means a caller went around it.
-    if constexpr (SF_LDS_A || SF_LDS_B) {
+    if constexpr ((SF_LDS_A || SF_LDS_B) && !SF_WINDOW) {
         if (loops > SFA_K_TILES_MAX) return;
     }
     // Cooperatively fill both scale panels before A/B prefill. Aligned rows use
@@ -630,27 +724,40 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // Other row strides use byte loads into the same panel layout. OOB M rows
     // are never consumed. The M-packed destination is [row%SFA_MB][k][row/SFA_MB];
     // SFA_PACK groups rows for dword stores while lanes traverse K.
-    auto fill_sfa_mpack = [&]() {
+    auto fill_sfa_mpack = [&](auto reload_c) {
         const int tid = opus::thread_id_x();
+        const int sf_win_off = sf_win0 * T::SCALES_PER_BK;
         auto sm_sfa = make_smem(s_sfa_ptr);
         constexpr int SFA_PACK = (T::COM_REP_M % 4 == 0) ? 4
                                : ((T::COM_REP_M % 2 == 0) ? 2 : 1);
         constexpr int SFA_PACK_GROUPS = T::COM_REP_M / SFA_PACK;
-        auto fill = [&](auto vec_c) {
+        // KCH, when non-zero, is the whole window's chunk count: a compile-time
+        // power of two to split the item index by, where the fill's own count
+        // is a runtime value and costs an integer division per item. Chunks past
+        // a partial window's end are skipped.
+        auto fill = [&](auto vec_c, auto kch_c) {
             constexpr int VEC = decltype(vec_c)::value;
-            const int k_chunks = sf_k_scales / VEC;
+            constexpr int KCH = decltype(kch_c)::value;
+            const int k_chunks = KCH ? KCH : sf_fill_scales / VEC;
             const int items = SFA_MB * SFA_PACK_GROUPS * k_chunks;
-            for (int it = tid; it < items; it += T::BLOCK_SIZE) {
+            // With a constant chunk count every per-lane index here is a
+            // function of tid alone, and the reload sits in the K loop: left
+            // visible, LICM hoists them out and holds them across the MFMAs,
+            // which costs the second resident workgroup.
+            int tid0 = tid;
+            if constexpr (KCH != 0) asm volatile("" : "+v"(tid0));
+            for (int it = tid0; it < items; it += T::BLOCK_SIZE) {
                 const int kc   = it % k_chunks;
                 const int rest = it / k_chunks;
                 const int pk   = rest % SFA_PACK_GROUPS;
                 const int mb   = rest / SFA_PACK_GROUPS;
                 const int kt   = kc * VEC;
+                if (KCH && kt >= sf_fill_scales) continue;
                 opus::vector_t<D_SF, SFA_PACK * VEC> v;
                 opus::static_for<SFA_PACK>([&](auto j_c) {
                     constexpr int j = decltype(j_c)::value;
                     const int r = (pk * SFA_PACK + j) * SFA_MB + mb;
-                    auto rw = load<VEC>(g_sfa, r * kargs.stride_sfa + kt);
+                    auto rw = load<VEC>(g_sfa, r * kargs.stride_sfa + sf_win_off + kt);
                     opus::static_for<VEC>([&](auto i_c) {
                         constexpr int i = decltype(i_c)::value;
                         v[j * VEC + i] = rw[i];
@@ -668,70 +775,144 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                 });
             }
         };
-        // VEC must divide both sf_k_scales and stride_sfa so every read is aligned.
-        const int widths = sf_k_scales | kargs.stride_sfa;
-        if      ((widths & 15) == 0) fill(number<16>{});
-        else if ((widths & 3) == 0)  fill(number<4>{});
-        else                         fill(number<1>{});
+        // VEC must divide the fill, stride_sfa and the window offset so every
+        // read is aligned.
+        const int widths = sf_fill_scales | kargs.stride_sfa | sf_win_off;
+        constexpr int WIN_SC = SF_WIN_TILES * T::SCALES_PER_BK;
+        constexpr bool KCH_OK = SF_WINDOW && WIN_SC % 16 == 0
+                             && (WIN_SC & (WIN_SC - 1)) == 0;
+        // Only a windowed split reloads, so a reload always fills a window.
+        const bool win = KCH_OK && (decltype(reload_c)::value || sf_win_tiles == SF_WIN_TILES);
+        // A mid-split reload runs with the accumulators live. Its 16-wide fill
+        // only fits beside them with the per-lane indices kept in the loop
+        // (KCH's opaque tid); otherwise it costs the second resident workgroup.
+        constexpr bool RELOAD16 = KCH_OK;
+        if ((!decltype(reload_c)::value || RELOAD16) && (widths & 15) == 0) {
+            if constexpr (KCH_OK) {
+                if (win) fill(number<16>{}, number<WIN_SC / 16>{});
+                else     fill(number<16>{}, number<0>{});
+            } else {
+                fill(number<16>{}, number<0>{});
+            }
+        } else if ((widths & 3) == 0) {
+            if constexpr (KCH_OK) {
+                if (win) fill(number<4>{}, number<WIN_SC / 4>{});
+                else     fill(number<4>{}, number<0>{});
+            } else {
+                fill(number<4>{}, number<0>{});
+            }
+        } else {
+            fill(number<1>{}, number<0>{});
+        }
     };
-    auto fill_panels = [&]() {
-    if constexpr (SF_A_MPACK) fill_sfa_mpack();
+    auto fill_panels = [&](auto reload_c) {
+    if constexpr (SF_A_MPACK) fill_sfa_mpack(reload_c);
     if constexpr (SF_LDS_A || SF_LDS_B) {
-        const bool dma_ok = ((kargs.stride_sfa | kargs.stride_sfb | sf_start
+        const int sf_win_off = sf_win0 * T::SCALES_PER_BK;
+        const int sf_fill_dw = (sf_fill_scales + 3) / 4;
+        const bool dma_ok = ((kargs.stride_sfa | kargs.stride_sfb | sf_start | sf_win_off
                               | kargs.stride_sfa_batch | kargs.stride_sfb_batch) & 3) == 0;
         const int sfa_rows_total = SFA_ROWS * sf_row_dw;
         const int sfb_rows_total = T::N_SCALE_GROUPS * sf_row_dw;
-        if (dma_ok) {
+        if (__builtin_expect(dma_ok, 1)) {
             auto g_sfa_dw = make_gmem(
                 reinterpret_cast<const int*>(reinterpret_cast<const D_SF*>(kargs.ptr_sfa)
                     + (size_t)batch_id * kargs.stride_sfa_batch
-                    + (size_t)row * kargs.stride_sfa + sf_start),
+                    + (size_t)row * kargs.stride_sfa + sf_start + sf_win_off),
                 sfa_bytes);
             auto g_sfb_dw = make_gmem(
                 reinterpret_cast<const int*>(reinterpret_cast<const D_SF*>(kargs.ptr_sfb)
                     + (size_t)batch_id * kargs.stride_sfb_batch
-                    + (size_t)(col / T::GROUP_N) * kargs.stride_sfb + sf_start));
+                    + (size_t)(col / T::GROUP_N) * kargs.stride_sfb + sf_start + sf_win_off));
             int* s_sfa_dw = reinterpret_cast<int*>(s_sfa_ptr);
             int* s_sfb_dw = reinterpret_cast<int*>(s_sfb_ptr);
-            if constexpr (SF_A_DMA) {
-                for (int off = wave_id * 64; off < sfa_rows_total; off += T::WAVES * 64) {
-                    const int l = off + lane_id;
-                    if (l < sfa_rows_total) {
-                        const int r = l / sf_row_dw;
-                        int d = l - r * sf_row_dw - sf_rot(r);
-                        if (d < 0) d += sf_row_dw;
-                        g_sfa_dw.template async_load<1>(s_sfa_dw + l,
-                                                        r * (kargs.stride_sfa / 4) + d);
+            // A power-of-two row splits a panel dword index with a shift and a
+            // mask instead of a division. Both are recomputed from l each pass:
+            // the window reload sits inside the K loop, and per-lane values
+            // carried into it are hoisted and held across the MFMAs.
+            constexpr int PASS = T::WAVES * 64;
+            auto dma_panel = [&](auto& g_dw, int* s_dw, int rows_total, int stride_dw,
+                                 auto src) {
+                auto one = [&](int l, int r, int c) {
+                    int d = src(r, c);
+                    // The LDS DMA writes lane i at the first active lane's
+                    // address plus 4i, so a past-the-window dword is
+                    // clamped rather than its lane masked off.
+                    if (d >= sf_fill_dw) d = sf_fill_dw - 1;
+                    g_dw.template async_load<1>(s_dw + l, r * stride_dw + d);
+                };
+                if ((sf_row_dw & (sf_row_dw - 1)) == 0) {
+                    const int sh = __builtin_ctz(sf_row_dw);
+                    for (int off = wave_id * 64; off < rows_total; off += PASS) {
+                        const int l = off + lane_id;
+                        if (l < rows_total) one(l, l >> sh, l & (sf_row_dw - 1));
+                    }
+                } else {
+                    for (int off = wave_id * 64; off < rows_total; off += PASS) {
+                        const int l = off + lane_id;
+                        if (l < rows_total) {
+                            const int r = l / sf_row_dw;
+                            one(l, r, l - r * sf_row_dw);
+                        }
                     }
                 }
-            }
+            };
+            if constexpr (SF_A_DMA)
+                dma_panel(g_sfa_dw, s_sfa_dw, sfa_rows_total, kargs.stride_sfa / 4,
+                          [&](int r, int c) {
+                              const int d = c - sf_rot(r);
+                              return d < 0 ? d + sf_row_dw : d;
+                          });
             if constexpr (SF_LDS_B) {
-                for (int off = wave_id * 64; off < sfb_rows_total; off += T::WAVES * 64) {
-                    const int l = off + lane_id;
-                    if (l < sfb_rows_total) {
-                        const int r = l / sf_row_dw;
-                        g_sfb_dw.template async_load<1>(
-                            s_sfb_dw + l, r * (kargs.stride_sfb / 4) + (l - r * sf_row_dw));
+                // Whole chunks: a row of a multiple of 4 dwords, 16-byte aligned
+                // in global, and a fill that ends on a chunk.
+                bool x4 = false;
+                if constexpr (SFB_CHUNK_ROT)
+                    x4 = (sf_row_dw & 3) == 0 && (sf_row_dw & (sf_row_dw - 1)) == 0
+                      && (sf_fill_dw & 3) == 0
+                      && ((kargs.stride_sfb | kargs.stride_sfb_batch | sf_start | sf_win_off)
+                          & 15) == 0;
+                if (__builtin_expect(x4, 1)) {
+                    const int rc = sf_row_dw >> 2;
+                    const int shc = __builtin_ctz(rc);
+                    const int chunks = T::N_SCALE_GROUPS * rc;
+                    const int fill_c = sf_fill_dw >> 2;
+                    const int stride_dw = kargs.stride_sfb / 4;
+                    for (int off = wave_id * 64; off < chunks; off += PASS) {
+                        const int l = off + lane_id;
+                        if (l < chunks) {
+                            const int r = l >> shc;
+                            int c = SFB_XOR ? (l ^ (sfb_rot(r) >> 2)) & (rc - 1)
+                                            : (l - (sfb_rot(r) >> 2)) & (rc - 1);
+                            if (c >= fill_c) c = fill_c - 1;
+                            g_sfb_dw.template async_load<4>(s_sfb_dw + 4 * l,
+                                                            r * stride_dw + 4 * c);
+                        }
                     }
+                } else {
+                    dma_panel(g_sfb_dw, s_sfb_dw, sfb_rows_total, kargs.stride_sfb / 4,
+                              sfb_src);
                 }
             }
         } else {
             const int tid = opus::thread_id_x();
             if constexpr (SF_A_DMA) {
-                for (int i = tid; i < SFA_ROWS * sf_k_scales; i += T::BLOCK_SIZE) {
-                    const int r = i / sf_k_scales;
-                    const int b = i - r * sf_k_scales;
+                for (int i = tid; i < SFA_ROWS * sf_fill_scales; i += T::BLOCK_SIZE) {
+                    const int r = i / sf_fill_scales;
+                    const int b = i - r * sf_fill_scales;
                     int d = (b >> 2) + sf_rot(r);
                     if (d >= sf_row_dw) d -= sf_row_dw;
                     s_sfa_ptr[r * sf_pitch + d * 4 + (b & 3)] =
-                        load<1>(g_sfa, r * kargs.stride_sfa + b)[0];
+                        load<1>(g_sfa, r * kargs.stride_sfa + sf_win_off + b)[0];
                 }
             }
             if constexpr (SF_LDS_B) {
-                for (int i = tid; i < T::N_SCALE_GROUPS * sf_k_scales; i += T::BLOCK_SIZE) {
-                    const int r = i / sf_k_scales;
-                    const int b = i - r * sf_k_scales;
-                    s_sfb_ptr[r * sf_pitch + b] = load<1>(g_sfb, r * kargs.stride_sfb + b)[0];
+                for (int i = tid; i < T::N_SCALE_GROUPS * sf_fill_scales; i += T::BLOCK_SIZE) {
+                    const int r = i / sf_fill_scales;
+                    const int b = i - r * sf_fill_scales;
+                    const int d = sfb_pos(r, b >> 2);
+                    s_sfb_ptr[r * sf_pitch + d * 4 + (b & 3)] =
+                        load<1>(g_sfb, r * kargs.stride_sfb + sf_win_off + b)[0];
                 }
             }
             s_waitcnt_lgkmcnt(0_I);
@@ -739,7 +920,7 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         if constexpr (SF_A_MPACK) s_waitcnt_lgkmcnt(0_I);
     }
     };
-    fill_panels();
+    fill_panels(opus::false_type{});
 
     // Staging: there are no producer waves, every wave issues its own share of
     // each A tile. A wave takes slot group wave_id%LOAD_WAVES of the A load
@@ -894,18 +1075,28 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // Skipping it would leave fewer copies outstanding than the barrier's vmcnt
     // immediate expects, and the wait would clear with the tile it is meant to
     // publish still in flight.
-    auto issue_a_tile = [&](int issue_k) {
+    // The LDS DMA writes lane i at M0 + i*VEC_A, so its destination is the
+    // wave's lane-0 address. Taking that once leaves M0 scalar arithmetic in
+    // the K loop instead of a readfirstlane per copy.
+    const auto a_ga_os = opus::layout_to_offsets<T::VEC_A>(u_ga);
+    auto a_sa_os = opus::layout_to_offsets<T::VEC_A>(u_sa);
+    constexpr int A_ISSUES = std::remove_cvref_t<decltype(a_ga_os)>::size();
+    for (int i = 0; i < A_ISSUES; i++) a_sa_os[i] = __builtin_amdgcn_readfirstlane(a_sa_os[i]);
+    auto issue_a_tile_at = [&](int issue_k, int slot) {
         const int kk = issue_k < loops ? issue_k : loops - 1;
-        const int slot = issue_k % PF;
         opus::static_for<T::NUM_LOAD_GROUPS_PER_BK>([&](auto kg_c) {
             constexpr int kg = decltype(kg_c)::value;
             opus::static_for<T::NUM_LOAD_GROUPS_PER_BM / T::LOAD_M_SPLIT>([&](auto m_c) {
                 const int m = decltype(m_c)::value * T::LOAD_M_SPLIT + m_block0;
-                async_load<T::VEC_A>(g_a, smem_a_at(slot, m, kg), u_ga, u_sa,
-                                     a_offset(kk, m, kg));
+                opus::static_for<A_ISSUES>([&](auto i_c) {
+                    constexpr int i = decltype(i_c)::value;
+                    g_a.template async_load<T::VEC_A>(smem_a_at(slot, m, kg) + a_sa_os[i],
+                                                      a_ga_os[i], a_offset(kk, m, kg));
+                });
             });
         });
     };
+    auto issue_a_tile = [&](int issue_k) { issue_a_tile_at(issue_k, issue_k % PF); };
 
     auto mma = make_tiled_mma<D_A, D_B, D_ACC>(
         seq<T::COM_REP_M, T::COM_REP_N, T::COM_REP_K>{},
@@ -1054,12 +1245,12 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     // B_BUFS > 1 uses a register ring: consume k%B_BUFS and refill the slot
     // released by tile k-1. Every tile issues its A batch before its B batch;
     // vmcnt thresholds preserve that ordering.
+    constexpr bool B_EARLY_TILE =
+        (T::T_M == 1 && T::WAVES == 4) || (T::B_M == 128 && T::B_N == 128);
     constexpr int B_BUFS = (B_STAGED_WAIT && !SHUFFLE_SCALE) ? T::B_DIRECT_BUFS : 1;
     static_assert(B_BUFS == 1 || B_BUFS >= PF,
                   "the prefill issues B(p + B_BUFS - PF) beside A(p); a shallower "
                   "ring would need B tiles before 0");
-    constexpr bool B_EARLY_TILE =
-        (T::T_M == 1 && T::WAVES == 4) || (T::B_M == 128 && T::B_N == 128);
     constexpr bool B_EARLY = B_EARLY_TILE && B_STAGED_WAIT && !SHUFFLE_SCALE && B_BUFS == 1;
     typename decltype(mma)::vtype_b v_bs[B_BUFS];
     auto issue_b_buf = [&](int loop_k, auto buf_c) {
@@ -1082,8 +1273,30 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     const int sfa_lane_row = wave_id_m * T::W_M + lane_id % T::W_M;
     const int sfa_lane_rot = sf_rot(sfa_lane_row);
     const int sfa_lane_off = sfa_lane_row * sf_pitch;
+    // GROUP_N=1: this lane's B panel row in n-repeat 0, the MFMA's N column.
+    const int sfb_lane_row = sfb_group0 + lane_id % T::W_N;
+    const int sfb_lane_rot = sfb_rot(sfb_lane_row);
+    // Called ahead of tile k's panel reads, before its A fragments are loaded:
+    // the reload's registers then overlap only the accumulators, which is what
+    // keeps a second workgroup resident. The first barrier retires every
+    // wave's reads of the old window.
+    auto sf_window_advance = [&](int loop_k) {
+        if constexpr (SF_WINDOW) {
+            if (__builtin_expect(loop_k - sf_win0 >= sf_win_tiles, 0)) {
+                s_waitcnt_lgkmcnt(0_I);
+                __builtin_amdgcn_s_barrier();
+                sf_win0 += sf_win_tiles;
+                const int left = loops - sf_win0;
+                sf_fill_scales = (left < sf_win_tiles ? left : sf_win_tiles) * T::SCALES_PER_BK;
+                fill_panels(opus::true_type{});
+                s_waitcnt_vmcnt(0_I);
+                s_waitcnt_lgkmcnt(0_I);
+                __builtin_amdgcn_s_barrier();
+            }
+        }
+    };
     auto read_scales = [&](int loop_k, vtype_sfa& v_sfa, vtype_sfb& v_sfb) {
-        const int scale_base = loop_k * T::SCALES_PER_BK;
+        const int scale_base = (SF_WINDOW ? loop_k - sf_win0 : loop_k) * T::SCALES_PER_BK;
         if constexpr (SFA_MPACK_GLOBAL) {
             // The host's M-packed panel: one load for the whole K tile, this
             // lane's COM_REP_M bytes per K group adjacent (the caller passes
@@ -1125,8 +1338,7 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
             if constexpr (SF_PAIR_U16 && T::SF_PER_MFMA_K == 1 && T::COM_REP_K == 2) {
                 // The tile's two scales are adjacent and, scale_base being even,
                 // inside one dword: one u16 per subtile.
-                int d = (scale_base >> 2) + sfa_lane_rot;
-                if (d >= sf_row_dw) d -= sf_row_dw;
+                const int d = ((scale_base >> 2) + sfa_lane_rot) & sf_wrap_mask;
                 const int byte = d * 4 + (scale_base & 3);
                 opus::static_for<T::COM_REP_M>([&](auto im_c) {
                     constexpr int im = decltype(im_c)::value;
@@ -1138,8 +1350,7 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
             opus::static_for<T::COM_REP_K>([&](auto ik_c) {
                 constexpr int ik = decltype(ik_c)::value;
                 const int sc = scale_base + ik * T::SF_PER_MFMA_K + sf_lane_k;
-                int d = (sc >> 2) + sfa_lane_rot;
-                if (d >= sf_row_dw) d -= sf_row_dw;
+                const int d = ((sc >> 2) + sfa_lane_rot) & sf_wrap_mask;
                 const int byte = d * 4 + (sc & 3);
                 opus::static_for<T::COM_REP_M>([&](auto im_c) {
                     constexpr int im = decltype(im_c)::value;
@@ -1148,7 +1359,32 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                 });
             });
         }
-        if constexpr (T::SF_PER_MFMA_K > 1) {
+        if constexpr (T::GROUP_N == 1 && SFB_XOR) {
+            auto sm_b = make_smem(s_sfb_ptr + sfb_lane_row * sf_pitch + sf_lane_k);
+            const int base = ((scale_base >> 2) ^ sfb_lane_rot) << 2;
+            opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
+                constexpr int ng = decltype(ng_c)::value;
+                opus::static_for<T::COM_REP_K>([&](auto ik_c) {
+                    constexpr int ik = decltype(ik_c)::value;
+                    v_sfb[ng * T::SF_LANE_SCALES_PER_BK + ik] =
+                        load<1>(sm_b, base + (ng * T::W_N * sf_pitch + ik * T::SF_PER_MFMA_K))[0];
+                });
+            });
+        } else if constexpr (T::GROUP_N == 1) {
+            // n-repeat ng's row is W_N rows on; W_N is the rotation period, so
+            // every repeat shares the lane's rotation.
+            opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
+                constexpr int ng = decltype(ng_c)::value;
+                auto sm_b = make_smem(s_sfb_ptr + (sfb_lane_row + ng * T::W_N) * sf_pitch);
+                opus::static_for<T::COM_REP_K>([&](auto ik_c) {
+                    constexpr int ik = decltype(ik_c)::value;
+                    const int sc = scale_base + ik * T::SF_PER_MFMA_K + sf_lane_k;
+                    const int d = ((sc >> 2) + sfb_lane_rot) & sf_wrap_mask;
+                    v_sfb[ng * T::SF_LANE_SCALES_PER_BK + ik] =
+                        load<1>(sm_b, d * 4 + (sc & 3))[0];
+                });
+            });
+        } else if constexpr (T::SF_PER_MFMA_K > 1) {
             opus::static_for<T::SFB_GROUPS>([&](auto ng_c) {
                 constexpr int ng = decltype(ng_c)::value;
                 auto sm_b = make_smem(s_sfb_ptr + (sfb_group0 + ng) * sf_pitch + scale_base);
@@ -1180,6 +1416,9 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
     //                                  A batch just issued plus any prefetch,
     //                                  which retires B(k))
     //   issue B(k+1)                  (vmcnt; earliest point, v_b is now dead)
+    // k % PF, carried rather than divided out: every loop below calls k_tile
+    // with k = 0, 1, 2, ... in order.
+    int a_slot = 0;
     auto k_tile = [&](int k, auto kp_c, auto bi_c) {
         constexpr int KP = decltype(kp_c)::value;
         constexpr int BI = decltype(bi_c)::value;
@@ -1205,13 +1444,14 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         // at no measurable cost -- read it as an async copy's LDS write trailing
         // its vmcnt retirement by more than a short tile covers.
         constexpr int BAR_WAIT = A_MB + B_MB + SF_HELD;
+        sf_window_advance(k);
         s_waitcnt_vmcnt(number<BAR_WAIT>{});
         __builtin_amdgcn_s_barrier();
 
         vtype_sfa v_sfa;
         vtype_sfb v_sfb;
 
-        auto sa = make_smem(smem_a_at(k % PF, 0, 0));
+        auto sa = make_smem(smem_a_at(a_slot, 0, 0));
         if constexpr (A_SWZ) {
             // v_a is [M rep][K group][half][VEC_A]; each load is one half.
             auto a0 = load<T::VEC_A>(sa, u_ra_h0);
@@ -1248,7 +1488,8 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
             read_scales(k, v_sfa, v_sfb);
         }
 
-        issue_a_tile(k + PF - 1);
+        // (k + PF - 1) % PF is the slot tile k-1 read.
+        issue_a_tile_at(k + PF - 1, a_slot == 0 ? PF - 1 : a_slot - 1);
         if constexpr (B_BUFS > 1)
             issue_b_buf(k + B_BUFS - 1, number<(BI + B_BUFS - 1) % B_BUFS>{});
 
@@ -1283,6 +1524,7 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         }
 
         if constexpr (!B_EARLY && B_BUFS == 1) issue_b_direct(k + 1);
+        a_slot = a_slot == PF - 1 ? 0 : a_slot + 1;
     };
 
     // Prefill: PF-1 A tiles, then B(0).
@@ -1347,6 +1589,7 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                 T::NUM_LOAD_GROUPS_PER_BM * T::NUM_LOAD_GROUPS_PER_BK
                 * T::smem_per_group_load_size / sizeof(D_A);
             const int a_slot_os = (kk % PF) * A_SLOT_ELEMS;
+            sf_window_advance(kk);
             auto sa = make_smem(smem_a_at(0, 0, 0));
             if constexpr (A_SWZ) {
                 auto a0 = load<T::VEC_A>(sa, u_ra_h0, a_slot_os);
@@ -1585,7 +1828,7 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
         });
     };
 
-    if (direct_store) {
+    if (__builtin_expect(direct_store, 1)) {
         if constexpr (!std::is_void_v<D_OUT>) {
             D_OUT* out_ptr = reinterpret_cast<D_OUT*>(kargs.ptr_c)
                            + (size_t)batch_id * kargs.stride_c_batch
@@ -1593,7 +1836,74 @@ void gemm_a8w8_mxscale_bpreshuffle_wave8_kernel(opus_gemm_scale_splitk_kargs_gfx
                            + (size_t)col;
             auto g_out = make_gmem(out_ptr,
                 (unsigned int)rows_avail * (unsigned int)kargs.stride_c * sizeof(D_OUT));
-            store_c(g_out);
+            // Through LDS: a lane's registers hold 4 columns of 16 rows, so a
+            // direct store writes 32 bytes of each row and the stores back up
+            // behind the partial lines. Staged in the free A slots, each
+            // instruction writes whole B_N-wide rows 16 bytes a lane instead.
+            constexpr int C_ESZ = (int)sizeof(D_OUT);
+            constexpr int C_VEC = 16 / C_ESZ;
+            // 16 bytes of pad puts the 16 rows of a ds_write on distinct banks.
+            constexpr int C_PITCH = T::B_N + C_VEC;
+            constexpr int SMEM_A_BYTES = PF * T::NUM_LOAD_GROUPS_PER_BM
+                                       * T::NUM_LOAD_GROUPS_PER_BK * T::smem_per_group_load_size;
+            constexpr int C_PASSES = [] {
+                int p = 1;
+                while (p < T::COM_REP_M && T::B_M / p * C_PITCH * C_ESZ > SMEM_A_BYTES) p *= 2;
+                return p;
+            }();
+            constexpr int C_ROWS = T::B_M / C_PASSES;
+            constexpr int C_CHUNKS = T::B_N / C_VEC;
+            constexpr bool C_LDS = !SF_WPAIR && C_ESZ <= 4
+                && T::B_N % C_VEC == 0 && T::COM_REP_M % C_PASSES == 0
+                && C_ROWS * C_PITCH * C_ESZ <= SMEM_A_BYTES
+                && (C_ROWS * C_CHUNKS) % T::BLOCK_SIZE == 0;
+            bool c_lds_ok = false;
+            if constexpr (C_LDS)
+                c_lds_ok = ((kargs.stride_c | kargs.stride_c_batch | col) % C_VEC) == 0;
+            if (__builtin_expect(c_lds_ok, 1)) {
+                if constexpr (C_LDS) {
+                    constexpr int IM_P = T::COM_REP_M / C_PASSES;
+                    constexpr int C_ITERS = C_ROWS * C_CHUNKS / T::BLOCK_SIZE;
+                    auto u_lc = partition_layout_c<T::VEC_C>(mma_c2,
+                        opus::make_tuple(C_PITCH, 1_I), p_coord_c1);
+                    auto s_c = make_smem(reinterpret_cast<D_OUT*>(smem_a));
+                    const int tid = opus::thread_id_x();
+                    // The past-the-end A copies may still be landing in the slots.
+                    s_waitcnt_vmcnt(0_I);
+                    __builtin_amdgcn_s_barrier();
+                    opus::static_for<C_PASSES>([&](auto p_c) {
+                        constexpr int p = decltype(p_c)::value;
+                        if constexpr (p > 0) __builtin_amdgcn_s_barrier();
+                        opus::static_for<IM_P>([&](auto i_c) {
+                            constexpr int il = decltype(i_c)::value;
+                            constexpr int im = p * IM_P + il;
+                            opus::static_for<T::COM_REP_N>([&](auto j_c) {
+                                constexpr int j = decltype(j_c)::value;
+                                typename decltype(mma_c2)::vtype_c vj;
+                                opus::static_for<C_LEN>([&](auto e_c) {
+                                    constexpr int e = decltype(e_c)::value;
+                                    vj[e] = v_c[(im * T::COM_REP_N + j) * C_LEN + e];
+                                });
+                                s_c.template store<T::VEC_C>(vj,
+                                    u_lc + il * T::T_M * T::W_M * C_PITCH
+                                         + (wave_id_n * T::COM_REP_N + j) * T::W_N);
+                            });
+                        });
+                        s_waitcnt_lgkmcnt(0_I);
+                        __builtin_amdgcn_s_barrier();
+                        opus::static_for<C_ITERS>([&](auto it_c) {
+                            const int idx = decltype(it_c)::value * T::BLOCK_SIZE + tid;
+                            const int r = idx / C_CHUNKS;
+                            const int c = idx % C_CHUNKS;
+                            auto v = s_c.template load<C_VEC>(r * C_PITCH + c * C_VEC);
+                            g_out.template store<C_VEC>(v,
+                                (p * C_ROWS + r) * kargs.stride_c + c * C_VEC);
+                        });
+                    });
+                }
+            } else {
+                store_c(g_out);
+            }
         }
     } else {
         D_C* ws_c_ptr = reinterpret_cast<D_C*>(kargs.ptr_ws)
