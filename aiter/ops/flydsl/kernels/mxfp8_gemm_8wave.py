@@ -13,9 +13,8 @@ scales, so the epilogue only converts. ``MxMfma`` issues one scaled atom per
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm as _llvm_d
 from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
@@ -27,6 +26,7 @@ from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
     wait_barrier,
 )
 from aiter.ops.flydsl.kernels.kernels_common import ceildiv
+from aiter.ops.flydsl.kernels.mega_moe_tp.common import swap16
 from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import split_row_major_2d
 
 # 1 block = 512 threads = 8 waves (2 in M x 4 in N); the LDS budget below only
@@ -350,43 +350,6 @@ class SwappedMxMfma:
         return self._inner.call(b, a, c, sb, sa, k_pack=k_pack, set_prio=set_prio)
 
 
-def _raw(v):
-    """Unwrap a DSL value to its raw ``ir.Value``, for ops that take one."""
-    return v.ir_value() if hasattr(v, "ir_value") else v
-
-
-def _permlane16_swap(x, y):
-    """gfx950 ``v_permlane16_swap_b32``: exchange 16-lane rows between two VGPRs.
-
-    Verified on hardware rather than assumed::
-
-        vdst_new = [X.r0, Y.r0, X.r2, Y.r2]
-        vsrc_new = [X.r1, Y.r1, X.r3, Y.r3]
-
-    Position *within* a row is preserved, so a lane keeps its ``lane % 16`` and
-    therefore its C row.
-    """
-    st = ir.Type.parse("!llvm.struct<(i32, i32)>")
-    res = fx.rocdl.permlane16_swap(st, _raw(x), _raw(y), False, True)
-    i32 = ir.IntegerType.get_signless(32)
-    return (
-        fx.Int32(
-            _llvm_d.ExtractValueOp(i32, res, ir.DenseI64ArrayAttr.get([0])).result
-        ),
-        fx.Int32(
-            _llvm_d.ExtractValueOp(i32, res, ir.DenseI64ArrayAttr.get([1])).result
-        ),
-    )
-
-
-def _ds_bpermute(value, src_lane):
-    """Pull ``value`` from ``src_lane``. Byte-addressed, hence the <<2."""
-    i32 = ir.IntegerType.get_signless(32)
-    return fx.Int32(
-        fx.rocdl.ds_bpermute(i32, _raw(fx.Int32(src_lane) * fx.Int32(4)), _raw(value))
-    )
-
-
 class StoreBf16Swapped:
     """C store for an A/B-swapped MFMA: 64 bits per lane instead of 16.
 
@@ -474,8 +437,11 @@ class StoreBf16Permlane(StoreBf16Swapped):
                     fx.BFloat16,
                 ).bitcast(fx.Int32)
                 dwords.append((packed[0], packed[1]))
-            a, b = _permlane16_swap(dwords[0][0], dwords[1][0])
-            c, d = _permlane16_swap(dwords[0][1], dwords[1][1])
+            # v_permlane16_swap_b32 (verified on hardware) turns (x, y) into
+            # ([x.r0, y.r0, x.r2, y.r2], [x.r1, y.r1, x.r3, y.r3]) by 16-lane
+            # row; a lane keeps lane % 16, hence its C row.
+            a, b = swap16(dwords[0][0], dwords[1][0])
+            c, d = swap16(dwords[0][1], dwords[1][1])
             if const_expr(self._lane_transpose):
                 # The permlane stage leaves a row's four 8-column chunks in
                 # lanes 16 apart, so a 16-lane group touches 16 rows at 16 bytes
@@ -489,7 +455,11 @@ class StoreBf16Permlane(StoreBf16Swapped):
                 # q's two bits: 0,1,2,3 -> 0,2,1,3.
                 q = lane % 4
                 src_lane = ((q % 2) * 2 + q // 2) * 16 + lane // 4
-                a, c, b, d = (_ds_bpermute(v, src_lane) for v in (a, c, b, d))
+                # ds_bpermute addresses the source lane in bytes.
+                a, c, b, d = (
+                    fx.Int32(fx.rocdl.ds_bpermute(T.i32, src_lane * 4, v))
+                    for v in (a, c, b, d)
+                )
                 row = base_row + ti * 16 + lane // 4
                 col = base_col + q * 8
             else:
@@ -553,6 +523,9 @@ def compile_mxfp8_gemm_8w(
     assert K % BLOCK_K == 0, f"K must be a multiple of {BLOCK_K}, got {K}"
 
     K_ITERS = K // BLOCK_K
+    # The main loop runs K_ITERS - 2 steps and peels the last two, which the
+    # prologue's prefetch of K-tile 1 also assumes.
+    assert K_ITERS >= 2, f"K must be at least {2 * BLOCK_K}, got {K}"
     # Only the preshuffled reader addresses scale words by K-pair (k1 = k // 2),
     # so only it needs a whole number of pairs. ScaleRawLds stages CHUNK steps
     # at a time and its dma() already tolerates a partial last chunk.
