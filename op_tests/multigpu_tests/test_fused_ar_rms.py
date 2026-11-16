@@ -1620,58 +1620,168 @@ try:
         ), f"gemma per-token quant residual err={ret['res_err']} config={ret}"
 
     @pytest.mark.parametrize(
-        "m,n,emit_bf16,lamport",
+        "case,lamport,expected",
         [
-            (16, 4096, False, True),
-            (16, 4096, True, True),
-            (512, 8192, False, True),  # 8 MiB, the TP4 cap
-            (513, 8192, False, False),
-            (16, 6152, False, False),  # not whole waves of 16B packs
-            (16, 12288, True, False),  # a row wider than one block
+            ("eligible", False, True),
+            ("one_token", True, True),
+            ("max_tokens", True, True),
+            ("past_max_tokens", True, False),
+            ("past_max_tokens", False, True),
+            ("max_bytes", False, True),
+            ("past_max_bytes", False, False),
+            ("hidden_6148", False, False),
+            ("hidden_32768", False, False),
+            ("fp16", False, False),
+            ("rows_off", False, False),
+            ("gluon_off", False, False),
+            ("residual_strided", False, False),
+            ("weight_strided", False, False),
+            ("misaligned", False, False),
         ],
     )
-    def test_lamport_per_token_quant_dispatch(m, n, emit_bf16, lamport):
-        """gfx1250 TP4 on the CPU: the per-token FP8 op takes the Lamport kernel
-        wherever should_lamport_ar_rms does; the other calls keep their route."""
+    def test_gluon_ar_norm_gates(case, lamport, expected):
+        """all_reduce_rmsnorm takes contiguous 16-byte aligned bf16 of the hidden
+        sizes of norm_waves up to the 4 MiB of the plain Gluon all-reduce, and up to
+        _GLUON_AR_NORM_MAX_TOKENS rows where the Lamport one-shot could take it."""
+        from types import SimpleNamespace
+
+        from aiter.dist.device_communicators import communicator_cuda as cc
+
+        cap = cc._GLUON_AR_NORM_MAX_TOKENS
+        n = int(case[7:]) if case.startswith("hidden_") else 6152
+        m = {
+            "one_token": 1,
+            "max_tokens": cap,
+            "past_max_tokens": cap + 1,
+            "max_bytes": 340,
+            "past_max_bytes": 341,
+        }.get(case, 16)
+        dtype = torch.float16 if case == "fp16" else torch.bfloat16
+        x = torch.zeros((m, n), dtype=dtype)
+        residual = torch.zeros_like(x)
+        weight = torch.ones(n, dtype=dtype)
+        if case == "residual_strided":
+            residual = torch.zeros((m, 2 * n), dtype=dtype)[:, ::2]
+        if case == "weight_strided":
+            weight = torch.ones(2 * n, dtype=dtype)[::2]
+        if case == "misaligned":
+            x = torch.zeros(m * n + 1, dtype=dtype)[1:].view(m, n)
+        comm = SimpleNamespace(
+            gluon_ar_norm=case != "rows_off",
+            gluon_ar_plain=None if case == "gluon_off" else ("inboxes", "calls"),
+        )
+        assert cc._use_gluon_ar_norm(comm, x, residual, weight, lamport) == expected
+
+    @pytest.mark.parametrize(
+        "quant,m,n,emit_bf16,gluon,expected",
+        [
+            (False, 1, 6144, False, True, "gluon_norm"),
+            (False, 128, 6144, False, True, "gluon_norm"),
+            (False, 129, 6144, False, True, "lamport"),
+            (False, 16, 6144, False, False, "lamport"),
+            (False, 16, 4096, False, True, "gluon_fused"),  # the #6923 kernel
+            (False, 340, 6152, False, True, "gluon_norm"),  # not a Lamport hidden
+            (False, 341, 6152, False, True, "custom_fused"),  # past 4 MiB
+            (False, 16, 12288, False, True, "gluon_norm"),
+            (True, 1, 6144, False, True, "gluon_norm"),
+            (True, 128, 6144, False, True, "gluon_norm"),
+            (True, 129, 6144, False, True, "lamport"),
+            (True, 16, 6144, True, True, "lamport"),  # only Lamport has the bf16 out
+            (True, 16, 6144, False, False, "lamport"),
+            (True, 16, 4096, False, True, "gluon_norm"),
+            (True, 682, 6144, False, True, "lamport"),  # 8 MiB, the TP4 Lamport cap
+            (True, 683, 6144, False, True, "custom_fused"),
+            (True, 513, 8192, False, True, "split"),
+            (True, 340, 6152, False, True, "gluon_norm"),
+            (True, 341, 6152, False, True, "split"),
+            (True, 16, 12288, False, True, "gluon_norm"),
+        ],
+    )
+    def test_ar_norm_precedence(quant, m, n, emit_bf16, gluon, expected):
+        """gfx1250 TP4 on the CPU, with the production gates and the kernels mocked:
+        all_reduce_rmsnorm takes up to _GLUON_AR_NORM_MAX_TOKENS rows (128) where the
+        Lamport one-shot could, and its other sizes up to 4 MiB; the Lamport kernel
+        takes the rest of its sizes, with the per-token quant in the same kernel for
+        FP8. The #6923 Gluon AR + RMSNorm keeps its bf16 sizes."""
         from types import MethodType, SimpleNamespace
         from unittest.mock import Mock, patch
 
         from aiter.dist.device_communicators import communicator_cuda as cc
         from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 
+        assert cc._GLUON_AR_NORM_MAX_TOKENS == 128
         x = torch.zeros((m, n), dtype=torch.bfloat16)
-        q = torch.zeros((m, n), dtype=dtypes.fp8)
+        residual = torch.zeros_like(x)
+        weight = torch.ones(n, dtype=torch.bfloat16)
         scale = torch.ones((m, 1))
         ca = SimpleNamespace(
             disabled=False,
             has_old_arch_fused_kernels=False,
+            _is_gfx1250=True,
             _lamport_max_bytes=8 << 20,
-            should_fuse_ar_rms=lambda *args: False,
             should_custom_ar=lambda *args: True,
+            lamport_fused_ar_rms=Mock(return_value=(x, x)),
             lamport_fused_ar_rms_quant=Mock(
-                side_effect=lambda x, *args: (q, x, scale, x)[: 4 if args[-1] else 3]
+                side_effect=lambda x, *args: (x, x, scale, x)[: 4 if args[-1] else 3]
             ),
+            custom_fused_ar_rms=Mock(return_value=(x, x)),
+            custom_fused_ar_rms_quant=Mock(return_value=(x, x, scale)),
         )
-        ca.should_lamport_ar_rms = MethodType(CustomAllreduce.should_lamport_ar_rms, ca)
+        for name in ("can_fuse_ar_rms", "should_fuse_ar_rms", "should_lamport_ar_rms"):
+            setattr(ca, name, MethodType(getattr(CustomAllreduce, name), ca))
         comm = SimpleNamespace(
             ca_comm=ca,
+            qr_comm=None,
+            world_size=4,
+            cpu_group="group",
+            gluon_ar=("fused_inboxes", "fused_calls") if gluon else None,
+            gluon_ar_plain=("inboxes", "calls") if gluon else None,
+            gluon_ar_norm=gluon,
             _ar_quant_max_bytes=-1,
             _ar_quant_no_prefill_max_bytes=-1,
+            _ar_1stage_max_bytes=-1,
+            _ar_1stage_override=None,
+            all_reduce=Mock(return_value=x),
             fused_allreduce_rmsnorm=Mock(return_value=(x, x)),
         )
-        weight = torch.ones(n, dtype=torch.bfloat16)
-        with patch.object(
-            cc, "get_hip_quant", return_value=Mock(return_value=(q, scale))
+        epilogue = Mock(return_value=(x, residual, scale) if quant else (x, residual))
+        gluon_fused = Mock(return_value=(x, residual))
+        with patch(
+            "aiter.ops.triton.comms.all_reduce.all_reduce_rmsnorm", epilogue
+        ), patch(
+            "aiter.ops.triton.comms.fused.all_reduce_rmsnorm_quant."
+            "all_reduce_rmsnorm_quant",
+            gluon_fused,
+        ), patch(
+            "aiter.rmsnorm2d_fwd_with_add"
+        ) as split_norm, patch.object(
+            cc, "get_hip_quant", return_value=Mock(return_value=(x, scale))
         ):
-            result = cc.CudaCommunicator.fused_allreduce_rmsnorm_quant(
-                comm, x, x, weight, 1e-6, emit_bf16=emit_bf16, gemma_norm=True
-            )
-        assert ca.lamport_fused_ar_rms_quant.called == lamport
-        assert comm.fused_allreduce_rmsnorm.called == (not lamport)
-        assert len(result) == (4 if emit_bf16 else 3)
-        if lamport:
+            if quant:
+                result = cc.CudaCommunicator.fused_allreduce_rmsnorm_quant(
+                    comm, x, residual, weight, 1e-6, emit_bf16=emit_bf16
+                )
+                assert len(result) == (4 if emit_bf16 else 3)
+            else:
+                cc.CudaCommunicator.fused_allreduce_rmsnorm(
+                    comm, x, residual, weight, 1e-6
+                )
+        taken = {
+            "gluon_norm": epilogue.called,
+            "gluon_fused": gluon_fused.called,
+            "lamport": ca.lamport_fused_ar_rms.called
+            or ca.lamport_fused_ar_rms_quant.called,
+            "custom_fused": ca.custom_fused_ar_rms.called
+            or ca.custom_fused_ar_rms_quant.called,
+            "split": split_norm.called or comm.fused_allreduce_rmsnorm.called,
+        }
+        assert taken == {path: path == expected for path in taken}, taken
+        if expected == "gluon_norm":
+            args = epilogue.call_args.args
+            assert args[3:] == (1e-6, False, quant, "group", "inboxes", "calls")
+        if expected == "lamport" and quant:
             args = ca.lamport_fused_ar_rms_quant.call_args.args
-            assert args[3:] == (1e-6, True, emit_bf16)
+            assert args[3:] == (1e-6, False, emit_bf16)
 
 except ImportError:
     pass

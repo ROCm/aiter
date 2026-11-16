@@ -24,6 +24,37 @@ _GLUON_PLAIN_AR_MAX_BYTES = 4 << 20
 
 should_nccl_symm_mem_allreduce = False
 _SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori", "mori_v2")
+# all_reduce_rmsnorm is faster than the Lamport one-shot of the same op (bf16 or
+# per-token FP8 out) up to about this many rows: TP4 graph replay, hidden 2048 to
+# 8192. The Lamport kernel takes more rows where it can.
+_GLUON_AR_NORM_MAX_TOKENS = 128
+
+
+def _use_gluon_ar_norm(comm, input_, res_inp_, weight_, lamport: bool) -> bool:
+    """True if all_reduce_rmsnorm takes the call: up to the 4 MiB of the plain Gluon
+    all-reduce, and up to _GLUON_AR_NORM_MAX_TOKENS rows if the Lamport one-shot can
+    take it (lamport). AITER_GLUON_AR_NORM=0 turns it off."""
+    if not getattr(comm, "gluon_ar_norm", False) or comm.gluon_ar_plain is None:
+        return False
+    from aiter.ops.triton.comms.all_reduce import norm_waves
+
+    return (
+        input_.dim() == 2
+        and norm_waves(input_.shape[1]) > 0
+        and 0 < input_.shape[0]
+        and (input_.shape[0] <= _GLUON_AR_NORM_MAX_TOKENS or not lamport)
+        and input_.dtype == res_inp_.dtype == weight_.dtype == torch.bfloat16
+        and res_inp_.shape == input_.shape
+        and weight_.shape == input_.shape[1:]
+        and input_.is_contiguous()
+        and res_inp_.is_contiguous()
+        and weight_.is_contiguous()
+        and input_.device == res_inp_.device == weight_.device
+        and input_.data_ptr() % 16 == 0
+        and res_inp_.data_ptr() % 16 == 0
+        and weight_.data_ptr() % 16 == 0
+        and input_.numel() * input_.element_size() <= _GLUON_PLAIN_AR_MAX_BYTES
+    )
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -87,6 +118,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.symm_mem_comm = reuse_from.symm_mem_comm
             self.gluon_ar = reuse_from.gluon_ar
             self.gluon_ar_plain = reuse_from.gluon_ar_plain
+            self.gluon_ar_norm = reuse_from.gluon_ar_norm
             return
 
         # lazy import to avoid documentation build error
@@ -139,6 +171,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # long as the process: destroy() runs after the groups are gone.
         self.gluon_ar = None
         self.gluon_ar_plain = None
+        self.gluon_ar_norm = False  # gluon_ar_plain also runs all_reduce_rmsnorm
         if (
             os.environ.get("AITER_GLUON_FUSED_AR") == "1"
             and self.world_size == 4
@@ -150,6 +183,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.gluon_ar_plain = all_reduce_init(
                 self.cpu_group, _GLUON_PLAIN_AR_MAX_BYTES
             )
+            self.gluon_ar_norm = os.environ.get("AITER_GLUON_AR_NORM", "1") == "1"
 
         if self.world_size > 1:
             from aiter.dist.device_communicators.quick_all_reduce import (
@@ -382,11 +416,28 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # gfx1250 Lamport one-shot fused kernel: no barrier and no copy-in, so
         # it beats the routes below up to its size cap (see
         # _LAMPORT_AR_RMS_MAX_BYTES).
-        if (
+        lamport = (
             ca_comm is not None
             and x_pad_to_multiple == 0
             and ca_comm.should_lamport_ar_rms(input_, res_inp_, weight_, out_n)
+        )
+        if x_pad_to_multiple == 0 and _use_gluon_ar_norm(
+            self, input_, res_inp_, weight_, lamport
         ):
+            # The plain Gluon all-reduce and the HIP add_rmsnorm, in one launch.
+            from aiter.ops.triton.comms.all_reduce import all_reduce_rmsnorm
+
+            return all_reduce_rmsnorm(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                gemma_norm,
+                False,
+                self.cpu_group,
+                *self.gluon_ar_plain,
+            )
+        if lamport:
             return ca_comm.lamport_fused_ar_rms(
                 input_, res_inp_, weight_, eps, gemma_norm
             )
@@ -583,9 +634,27 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
         ca_comm = self.ca_comm
         qr_comm = self.qr_comm
-        if ca_comm is not None and ca_comm.should_lamport_ar_rms(
+        lamport = ca_comm is not None and ca_comm.should_lamport_ar_rms(
             input_, res_inp_, weight_, hidden_dim
+        )
+        if not emit_bf16 and _use_gluon_ar_norm(
+            self, input_, res_inp_, weight_, lamport
         ):
+            # The plain Gluon all-reduce, the HIP add_rmsnorm and the per-token
+            # quant, in one launch.
+            from aiter.ops.triton.comms.all_reduce import all_reduce_rmsnorm
+
+            out, res_out, scale_out = all_reduce_rmsnorm(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                gemma_norm,
+                True,
+                self.cpu_group,
+                *self.gluon_ar_plain,
+            )
+        elif lamport:
             # The Lamport one-shot of fused_allreduce_rmsnorm with the per-token
             # quant in the same kernel: one launch, the bits of the two below.
             result = ca_comm.lamport_fused_ar_rms_quant(
