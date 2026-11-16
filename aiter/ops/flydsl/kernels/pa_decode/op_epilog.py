@@ -376,7 +376,7 @@ class PaDecodeEpilogue:
                             # The shared reducer expects maxima in natural-log units.
                             pmax[base] = h_max * fx.Float32(1.0 / LOG2E)
                             psum[base] = h_sum
-        if const_expr(self.traits.ONE_SLOT_PLAN):
+        if const_expr(self.traits.ONE_SLOT_PLAN):  # noqa: SIM102
             if self.ctx.task_count > 1:
                 self._arrive()
 

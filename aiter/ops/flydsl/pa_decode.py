@@ -18,6 +18,13 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.utility import dtypes
 
+from .kernels.pa_decode.traits import MFMA_MNK as MXFP4_FUSED_M_ROWS
+from .kernels.pa_decode.traits import (
+    MXFP4_MAX_HEAD_DIM,
+    mxfp4_max_m_tiles,
+    mxfp4_query_splits,
+    mxfp4_split_positions,
+)
 from .kernels.pa_decode_kernel import (
     CLUSTER_PARTITIONS,
     CLUSTER_STEP_TOKENS,
@@ -26,13 +33,6 @@ from .kernels.pa_decode_kernel import (
     MERGE_PARTITIONS,
     compile_pa_decode_tile,
     gfx1250_tile_traits,
-)
-from .kernels.pa_decode.traits import MFMA_MNK as MXFP4_FUSED_M_ROWS
-from .kernels.pa_decode.traits import (
-    MXFP4_MAX_HEAD_DIM,
-    mxfp4_max_m_tiles,
-    mxfp4_query_splits,
-    mxfp4_split_positions,
 )
 from .kernels.pa_decode_plan import ARRIVAL_COUNTER_STRIDE, PADecodePlan
 

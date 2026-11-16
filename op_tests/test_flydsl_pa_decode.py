@@ -1880,8 +1880,10 @@ _MXFP4_CASES = [
     # More than 16 query heads per KV head: up to four M-tiles a CTA.
     *[
         (
-            f"mxfp4-g{group}{'-mtp2' if query_length > 1 else ''}"
-            f"{'-plan-free' if free else ''}",
+            (
+                f"mxfp4-g{group}{'-mtp2' if query_length > 1 else ''}"
+                f"{'-plan-free' if free else ''}"
+            ),
             {
                 **_MXFP4_BASE,
                 "query_dtype": _E4M3 if group % 2 else torch.bfloat16,
@@ -2077,8 +2079,10 @@ _MXFP4_CASES = [
     # blocks a chunk; V widened one K block at a time past 256).
     *[
         (
-            f"mxfp4-d{dim}{f'-mtp{query_length}' if query_length > 1 else ''}"
-            f"-g{group}{f'-page{page}' if page != 128 else ''}-{mode}",
+            (
+                f"mxfp4-d{dim}{f'-mtp{query_length}' if query_length > 1 else ''}"
+                f"-g{group}{f'-page{page}' if page != 128 else ''}-{mode}"
+            ),
             {
                 **_MXFP4_BASE,
                 "head_dim": dim,
@@ -2126,10 +2130,12 @@ _MXFP4_CASES = [
     # row; contexts sit around the window and tile edges.
     *[
         (
-            f"mxfp4-{'sinks' if sink else ''}{'-' if sink and window else ''}"
-            f"{f'window{window}' if window else ''}"
-            f"{f'-mtp{query_length}' if query_length > 1 else ''}"
-            f"{f'-page{page}' if page != 128 else ''}-{mode}",
+            (
+                f"mxfp4-{'sinks' if sink else ''}{'-' if sink and window else ''}"
+                f"{f'window{window}' if window else ''}"
+                f"{f'-mtp{query_length}' if query_length > 1 else ''}"
+                f"{f'-page{page}' if page != 128 else ''}-{mode}"
+            ),
             {
                 **_MXFP4_BASE,
                 "query_dtype": _E4M3 if query_length % 2 else torch.bfloat16,

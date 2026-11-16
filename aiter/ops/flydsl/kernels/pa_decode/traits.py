@@ -1398,13 +1398,19 @@ class PaDecodeTraits:
             return sMxfp4VBf16_off + NWARP * mxfp4_wave_bytes(parts)[1]
 
         MXFP4_V_PARTS = 1
-        if kv_dtype == MXFP4_KV_DTYPE and MXFP4_KB > 1:
-            if mxfp4_cta_bytes(1) > MXFP4_LDS_LIMIT_BYTES or (
-                not SPARSE_GRID
-                and 2 * mxfp4_cta_bytes(1) > MXFP4_LDS_LIMIT_BYTES
-                and 2 * mxfp4_cta_bytes(MXFP4_KB) <= MXFP4_LDS_LIMIT_BYTES
-            ):
-                MXFP4_V_PARTS = MXFP4_KB
+        if (
+            kv_dtype == MXFP4_KV_DTYPE
+            and MXFP4_KB > 1
+            and (
+                mxfp4_cta_bytes(1) > MXFP4_LDS_LIMIT_BYTES
+                or (
+                    not SPARSE_GRID
+                    and 2 * mxfp4_cta_bytes(1) > MXFP4_LDS_LIMIT_BYTES
+                    and 2 * mxfp4_cta_bytes(MXFP4_KB) <= MXFP4_LDS_LIMIT_BYTES
+                )
+            )
+        ):
+            MXFP4_V_PARTS = MXFP4_KB
         MXFP4_V_CHUNK_BYTES, MXFP4_WAVE_BYTES = mxfp4_wave_bytes(MXFP4_V_PARTS)
         if kv_dtype == MXFP4_KV_DTYPE:
             total_bytes = sMxfp4VBf16_off + NWARP * MXFP4_WAVE_BYTES

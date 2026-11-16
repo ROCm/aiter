@@ -10,9 +10,9 @@ explicit SSA values. Every LDS publication/retirement barrier stays here.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.rocdl import tdm_ops
-from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr.typing import ReductionOp, T
 
 from ..pa_decode_plan import CLUSTER_PARTITIONS
