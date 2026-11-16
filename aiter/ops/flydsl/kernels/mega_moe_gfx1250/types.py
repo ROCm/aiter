@@ -126,10 +126,24 @@ class Stage2ScatterContext:
             raise ValueError("arena_handle must be non-negative")
         if self.combine_input_offset < 0:
             raise ValueError("combine_input_offset must be non-negative")
+        # fused_moe_'s custom-op schema rebuilds only the scalar scatter
+        # fields before the grouped helper restores the live compact context.
+        # Validate the dense pitch by its wire/arena geometry; compact_layout
+        # is not available at that intermediate construction boundary.
+        dense_flash_bf16 = (
+            self.combine_quant_bits == 0
+            and self.world_size == 4
+            and self.max_tokens_per_rank == 16384
+            and self.slot_stride_bytes == 10240
+        )
         if self.slot_stride_bytes <= 0 or (
             self.slot_stride_bytes & (self.slot_stride_bytes - 1)
+            and not dense_flash_bf16
         ):
-            raise ValueError("slot_stride_bytes must be a positive power of two")
+            raise ValueError(
+                "slot_stride_bytes must be a positive power of two or the "
+                "dense Flash EP4 BF16 pitch"
+            )
         if self.max_tokens_per_rank <= 0:
             raise ValueError("max_tokens_per_rank must be positive")
         if self.world_size <= 0:

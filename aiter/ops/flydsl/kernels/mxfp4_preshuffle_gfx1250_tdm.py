@@ -480,7 +480,22 @@ def build_gemm_a8w4_tdm_task(
             "load would run ahead of it"
         )
     if explicit_tile:
-        assert persistent_workers and cluster_m == 1 and cluster_n == 1
+        assert persistent_workers and cluster_m == 1
+        assert cluster_n == 1 or all(
+            (
+                cluster_n == 2,
+                K == 5120,
+                not a_preshuffled,
+                row_major_ascale,
+                tile_m == tile_n == tile_k == 256,
+                m_warp == n_warp == 2,
+                num_buffers == 3,
+                tile_meta is not None,
+                a_ready is not None,
+                item_hooks is not None,
+                raw_drain,
+            )
+        ), "paired S1F requires a shared explicit M tile and matched hooks"
     if wire_preshuffle:
         assert wire_preshuffle in (1, 2)
         assert explicit_tile and a_preshuffled and a_is_fp4
@@ -566,7 +581,11 @@ def build_gemm_a8w4_tdm_task(
     sched_first_group = hyper_params.get("mma_first_group", sched_mma_group)
     sched_ds_first = hyper_params["ds_first_group"]
     sched_ds_group = hyper_params["ds_group"] if a_is_fp4 and KWS > 1 else 0
-    tdm_early_timeout = hyper_params["tdm_early_timeout"]
+    # Matched explicit-tile peers must rendezvous for every A/SA load;
+    # timeout degradation cannot preserve that paired request contract.
+    tdm_early_timeout = hyper_params["tdm_early_timeout"] and not (
+        explicit_tile and cluster_n == 2
+    )
     ksl0_prefix_mma = hyper_params["ksl0_prefix_mma"]
     ksl1_prefence_mma = hyper_params["ksl1_prefence_mma"]
     wmma_in_barrier = hyper_params["wmma_in_barrier"]
@@ -728,7 +747,8 @@ def build_gemm_a8w4_tdm_task(
         and m_warp == n_warp == 2
         and num_buffers in (3, 4)
         and k_waves == 1
-        and cluster_m == cluster_n == 1
+        and cluster_m == 1
+        and cluster_n in (1, 2)
         and K == 5120
     )
     native_mma_order = native_schedule or row_major_mma_reuse
@@ -871,6 +891,13 @@ def build_gemm_a8w4_tdm_task(
             num_buffers == 4,
             k_waves == cluster_m == cluster_n == 1,
         )
+    )
+    # A dense BF16 slot is not a power of two. Flatten peer and slot in
+    # 2-KiB address units instead; CCO's peer VA stride is 4-GiB aligned.
+    # The instance can replay a smaller tile or a non-APRE step on the same
+    # arena, so address validity must not depend on its compute tuning gate.
+    dense_ep_stride = bool(
+        enable_ep_scatter and not ep_quant_bits and ep_slot_stride_bytes == 10240
     )
     partial_m_variants = compact_m_variants and not compact_ep_prefill
     # The short-tile K loop has no separate drain phase. Its S1F hook must
@@ -1118,6 +1145,8 @@ def build_gemm_a8w4_tdm_task(
     _planar_lds = "_planarlds" if planar_lds_on else ""
     _interleaved_lds_load = "_interleavelds" if interleaved_lds_load_on else ""
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
+    if dense_ep_stride:
+        _epq += f"_epunit2048_pitch{ep_slot_stride_bytes}"
     _persistent = (
         f"_pw{persistent_workers}"
         + (f"_n{static_n}" if static_n else "")
@@ -4459,11 +4488,13 @@ def build_gemm_a8w4_tdm_task(
                 elem_bytes = 1 if ep_quant_bits else 2
                 _row_elems = C_ROW_BYTES if ep_quant_bits else STORE_N
                 _lds_row_elems = _lds_row_bytes if ep_quant_bits else STORE_PITCH
-                _stride_elems = ep_slot_stride_bytes // elem_bytes
+                _address_unit_bytes = 2048 if dense_ep_stride else ep_slot_stride_bytes
+                _slot_units = ep_slot_stride_bytes // _address_unit_bytes
+                _stride_elems = _address_unit_bytes // elem_bytes
                 _GRP = SCATTER_GROUP_ROWS
                 _ngrp = scatter_groups
                 _pr = _ep_lsa1 - _ep_lsa0
-                _K = fx.Int32(_pr // fx.Int64(ep_slot_stride_bytes))
+                _K = fx.Int32(_pr // fx.Int64(_address_unit_bytes))
                 # OOB row-index bound: valid idx = pe*K+slot < world*K (world<=256,
                 # slot<K); dropped/padding rows use this index so the HW drops them.
                 _oob = _K * fx.Int32(ep_world_size)
@@ -4498,7 +4529,9 @@ def build_gemm_a8w4_tdm_task(
                     _rm_dst_lane = _rm_dst_lanes[scatter_vector]
                     _dst_pe_lane = _rm_dst_lane // fx.Int32(ep_destination_stride)
                     _dst_slot_lane = _rm_dst_lane % fx.Int32(ep_destination_stride)
-                    _scatter_idx_lane = _dst_pe_lane * _K + _dst_slot_lane
+                    _scatter_idx_lane = _dst_pe_lane * _K + _dst_slot_lane * fx.Int32(
+                        _slot_units
+                    )
                     _scatter_keep_lane = _scatter_lane_valids[scatter_vector] & (
                         _rm_dst_lane >= fx.Int32(0)
                     )

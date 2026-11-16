@@ -597,6 +597,23 @@ class _Stage1Fusion:
         input_preshuffled = 0
         if a_preshuffled:
             num_buffers, input_preshuffled = self._apre_settings()
+        config = self.d.config
+        step = getattr(self.d, "_step", None)
+        recv_bound = config.max_recv if step is None else step.recv_bound
+        # The instance's dense BF16 pitch already applies the shared pin,
+        # geometry and manual-override gate. Keep small steps on CN1 and
+        # include the paired policy in this owner's compiled-launcher cache.
+        pair_cluster_n = (
+            2
+            if (
+                a_preshuffled
+                and not input_preshuffled
+                and num_buffers == 3
+                and int(recv_bound) >= 65536
+                and config.combine_slot_stride_for(0) == 10240
+            )
+            else 1
+        )
         key = (
             tile_m,
             producers,
@@ -609,6 +626,7 @@ class _Stage1Fusion:
             a_preshuffled,
             input_preshuffled,
             num_buffers,
+            pair_cluster_n,
         )
         launch = self.launches.get(key)
         if launch is None:
@@ -643,6 +661,7 @@ class _Stage1Fusion:
                 block_runs=block_runs,
                 ticket_span=self.ticket_span,
                 ctas_per_cu=ctas_per_cu,
+                pair_cluster_n=pair_cluster_n,
             )
             self.launches[key] = launch
         return launch
