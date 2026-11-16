@@ -329,11 +329,13 @@ def dynamic_mxfp4_quant(
         BLOCK_SIZE_N = cfg["BLOCK_SIZE_N"]
         NUM_WARPS = cfg["NUM_WARPS"]
 
+        # CTAs go round-robin over the 8 XCDs. With grid dim 0 a multiple of 8, all
+        # CTAs of a row block run on one XCD, so no cache line of the payload or
+        # scales is written from two XCDs (2x faster). CTAs past M exit.
         grid = (
-            triton.cdiv(M, BLOCK_SIZE_M),
+            triton.cdiv(triton.cdiv(M, BLOCK_SIZE_M), 8) * 8,
             triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
         )
-        even_m_n = (M % BLOCK_SIZE_M == 0) and (N % (BLOCK_SIZE_N * NUM_ITER) == 0)
 
         gluon_dynamic_mxfp4_quant_kernel_gfx1250[grid](
             x,
@@ -345,7 +347,16 @@ def dynamic_mxfp4_quant(
             M=M,
             N=N,
             MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-            EVEN_M_N=even_m_n,
+            EVEN_M=M % BLOCK_SIZE_M == 0,
+            EVEN_N=N % BLOCK_SIZE_N == 0,
+            # TDM scale store: row-major scales, >= 4 B and >= 2 rows per tile; it
+            # measured faster only for N > 2048.
+            SCALE_TDM=(
+                blockscale_e8m0.stride(1) == 1
+                and BLOCK_SIZE_N >= 128
+                and BLOCK_SIZE_M >= 2
+                and N > 2048
+            ),
             NUM_ITER=NUM_ITER,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             BLOCK_SIZE_N=BLOCK_SIZE_N,
@@ -583,8 +594,18 @@ def dynamic_mxfp8_quant(
         NUM_WARPS = cfg["NUM_WARPS"]
         NUM_BUFFERS = cfg["NUM_BUFFERS"]
 
+        # CTAs go round-robin over the 8 XCDs. With grid dim 0 a multiple of 8, all
+        # CTAs of a row block run on one XCD, so no cache line of the scales is
+        # written from two XCDs. CTAs past M exit. One row block stays as is.
+        # 1024 < K <= 2048 and grid_m % 8 == 1 or 7 at grid_m >= 600: the CTAs of a
+        # row run on adjacent XCDs and the split costs little; the padded grid was
+        # 1-3% slower near a full wave (2400-2600 CTAs): no padding there.
+        grid_m = triton.cdiv(M, BLOCK_SIZE_M)
+        pad_m = grid_m > 1 and not (
+            1024 < K <= 2048 and grid_m >= 600 and grid_m % 8 in (1, 7)
+        )
         grid = (
-            triton.cdiv(M, BLOCK_SIZE_M),
+            triton.cdiv(grid_m, 8) * 8 if pad_m else grid_m,
             triton.cdiv(K, BLOCK_SIZE_N * NUM_ITER),
         )
 
@@ -602,6 +623,7 @@ def dynamic_mxfp8_quant(
             NUM_ITER=NUM_ITER,
             MXFP8_QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
             NUM_BUFFERS=NUM_BUFFERS,
+            PAD_M=grid[0] != grid_m,
             num_warps=NUM_WARPS,
             waves_per_eu=cfg["waves_per_eu"],
         )

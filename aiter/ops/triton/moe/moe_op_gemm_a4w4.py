@@ -21,36 +21,9 @@ from aiter.ops.triton.moe.reduce import (
     validate_reduce_out,
 )
 from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
-
-
-def _prefill_lds_bytes(config, x_scales_preload, xs_slab_cols):
-    # Check for prefill kernel's LDS budget, this determines if we can afford x_scales_preload without losing occupancy
-    # please keep in sync with whatever the layout the prefill kernel is using
-    bm, bn, bk = config["block_m"], config["block_n"], config["block_k"]
-    nb = config["num_buffers"]
-    mx_scale_block_k = bk // MXFP4_QUANT_BLOCK_SIZE
-    # x: [bm, bk//2] with 16 pad elements between each of the bm intervals
-    x_buf = nb * (bm * (bk // 2) + (bm - 1) * 16)
-    # w / w-scales: identity swizzle, so exactly their (preshuffled) extents
-    w_buf = nb * bn * (bk // 2)
-    w_scales_buf = nb * bn * mx_scale_block_k
-    if x_scales_preload:
-        x_scales_buf = bm * xs_slab_cols
-    else:
-        x_scales_buf = nb * bm * mx_scale_block_k
-    # +32 is inter-allocation alignment, measured at 16-32B. Rounded up so
-    # this never overstates how many workgroups fit.
-    return x_buf + w_buf + w_scales_buf + x_scales_buf + 32
-
-
-def _workgroups_per_wgp(lds_bytes):
-    cap = arch_info._LDS_CAP_BYTES[get_arch()]
-    return max(1, cap // max(1, lds_bytes))
-
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -198,25 +171,35 @@ def m2bucket(m):
         return "medium2"
     if m <= 512:
         return "large"
-    return "xlarge"
+    if m <= 65536:
+        return "xlarge"
+    # Under EP, m counts every gate slot of the received rows (rows * topk), so
+    # decode steps already land in xlarge; prefill-size calls get their own bucket.
+    return "xxlarge"
 
 
 def get_kernel_config_gluon(m, n, k, routing_data):
     block_m = routing_data.block_m
-    num_xcds = 1
 
     arch = get_arch()
     bucket = m2bucket(m)
     tuned = get_moe_dispatch("A4W4", arch, "gluon")
     key = f"bm{block_m}_n{n}_k{k}_{bucket}"
+    if key not in tuned and bucket == "xxlarge":
+        key = f"bm{block_m}_n{n}_k{k}_xlarge"
     if key not in tuned:
         key = f"bm{block_m}_any"
     cfg = tuned[key]
-    block_n, block_k, num_buffers, num_warps = (
+    # An entry may hold a second config for its bucket's smaller M: "below" applies
+    # under "below_m" rows (one bucket, two M ranges).
+    if m < cfg.get("below_m", 0):
+        cfg = {**cfg, **cfg["below"]}
+    block_n, block_k, num_buffers, num_warps, xcd_swizzle = (
         cfg["block_n"],
         cfg["block_k"],
         cfg["num_buffers"],
         cfg["num_warps"],
+        cfg["xcd_swizzle"],
     )
 
     num_buffers = min(num_buffers, triton.cdiv(k, block_k))
@@ -226,10 +209,13 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         "block_n": block_n,
         "block_k": block_k,
         "num_warps": num_warps,
-        "xcd_swizzle": num_xcds,
+        "xcd_swizzle": xcd_swizzle,
         "num_buffers": num_buffers,
         "waves_per_eu": 0,
         "num_ctas": 1,
+        # gathered x scales by TDM from this many rows up, also where the rule in
+        # moe_gemm_a4w4 does not pick it
+        "x_scales_tdm_min_m": cfg.get("x_scales_tdm_min_m"),
     }
     return ret
 
@@ -304,6 +290,10 @@ def moe_gemm_a4w4(
     # reduction to actually run, i.e. scatter_indx is not None or split_k > 1.
     # Mirrors moe_gemm_a8w4.
     y_out=None,
+    # With gate_valid: (1,) int32 live-row count. The grouped reduce may then leave
+    # the rows past it unwritten instead of zero (their gates are all dead). Only for
+    # consumers that never read those rows. Mirrors moe_gemm_a8w4.
+    reduce_num_rows=None,
     # Deliver GEMM2's un-reduced rows into an EP combine staging window instead
     # of reducing them locally. Same contract as moe_gemm_a8w4's `ep_scatter`.
     # Folded into the gluon epilogue when `ep_scatter.fused`; otherwise (and
@@ -383,8 +373,20 @@ def moe_gemm_a4w4(
     if use_gluon:
         mx_scale_block_k = config["block_k"] // MXFP4_QUANT_BLOCK_SIZE
         ASYNC_COPY_MIN_SCALE_WIDTH = 4
+        # gathered x scales by TDM: the async-copy wait lowers to asynccnt 0 and stalls every K step
         x_scales_tdm = (
-            mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH
+            (
+                config["x_scales_tdm_min_m"] is not None
+                and gather_indx is not None
+                and M >= config["x_scales_tdm_min_m"]
+            )
+            or (
+                gather_indx is not None
+                and block_m > 16
+                and config["block_k"] >= 512
+                and config["num_buffers"] > 1
+            )
+            or mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH
             or K % config["block_k"] != 0
             or x_scales.stride(0) % 16 != 0
         )
@@ -500,36 +502,36 @@ def moe_gemm_a4w4(
         )
         # launch gluon kernel
         _moe_gemm_a4w4_decode[(grid,)](
-            y_ptr,
-            stride_y_m,
-            stride_y_n,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
             x,
+            x_scales,
+            w,
+            w_scales,
+            grid_m,
+            grid_n,
+            num_tokens,
+            N,
+            K,
             x.stride(0),
             x.stride(1),
-            x_scales,
             x_scales.stride(0),
             x_scales.stride(1),
-            w,
             w.stride(0),
             w.stride(1),
             w.stride(2),
-            w_scales,
             w_scales.stride(0),
             w_scales.stride(1),
             w_scales.stride(2),
             bias,
             stride_bias,
             gammas,
-            num_tokens,
-            N,
-            K,
-            gather_indx,
-            expt_hist,
-            expt_token_offs_raw,
-            expt_hist_sum,
-            expt_block_pid_map,
-            grid_m,
-            grid_n,
+            y_ptr,
+            stride_y_m,
+            stride_y_n,
             apply_swiglu_matmul,
             alpha,
             limit,
@@ -574,29 +576,6 @@ def moe_gemm_a4w4(
         clamp_bounds = (K % config["block_k"] != 0) or (
             triton.cdiv(K, config["block_k"]) < config["num_buffers"]
         )
-        XS_SLAB_MAX_BYTES = 32 * 1024
-        xs_slab_cols = triton.next_power_of_2(triton.cdiv(K, MXFP4_QUANT_BLOCK_SIZE))
-        x_scales_preload = (
-            not clamp_bounds
-            and config["block_m"] <= 32
-            and K > 1024
-            and config["block_m"] * (config["block_k"] // MXFP4_QUANT_BLOCK_SIZE) <= 256
-            and config["block_m"] * xs_slab_cols <= XS_SLAB_MAX_BYTES
-            and config["num_ctas"] == 1
-            and preshuffle_weights
-            and swizzle_mx_scale == "GFX1250_SCALE"
-        )
-        if x_scales_preload:
-            wgs_with = _workgroups_per_wgp(
-                _prefill_lds_bytes(config, True, xs_slab_cols)
-            )
-            wgs_without = _workgroups_per_wgp(
-                _prefill_lds_bytes(config, False, xs_slab_cols)
-            )
-            if wgs_with < wgs_without:
-                x_scales_preload = False
-        if not x_scales_preload:
-            xs_slab_cols = 0
 
         # L2 prefetch distance, in K-tiles. The ramp is a fixed burst of
         # prefetches before the K loop, so it only pays off once the loop is
@@ -658,8 +637,6 @@ def moe_gemm_a4w4(
             UPCAST_INDICES=should_upcast_indices(x, w, y_ptr),
             X_SCALES_TDM=x_scales_tdm,
             CLAMP_BOUNDS=clamp_bounds,
-            PRELOAD_X_SCALES=x_scales_preload,
-            XS_SLAB_COLS=xs_slab_cols,
             L2_PREFETCH_DISTANCE=l2_prefetch_distance,
             **layouts,
             YMxScale=y_scale,
@@ -764,6 +741,7 @@ def moe_gemm_a4w4(
         out_dtype=out_dtype,
         swiglu_add_residual=swiglu_add_residual,
         indx_valid=group_valid,
+        num_rows=reduce_num_rows if group_valid is not None else None,
     )
 
     return y_final

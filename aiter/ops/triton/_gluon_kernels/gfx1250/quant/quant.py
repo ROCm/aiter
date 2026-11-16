@@ -16,7 +16,9 @@ _gluon_dynamic_mxfp4_quant_kernel_gfx1250_repr = make_kernel_repr(
         "NUM_ITER",
         "num_warps",
         "MXFP4_QUANT_BLOCK_SIZE",
-        "EVEN_M_N",
+        "EVEN_M",
+        "EVEN_N",
+        "SCALE_TDM",
         "NUM_BUFFERS",
     ],
 )
@@ -52,6 +54,8 @@ def _mxfp4_quant_tile(
     x_buffer,
     out_smem,
     out_desc,
+    bs_smem,
+    bs_desc,
     bs_ptr,
     compute_idx,
     start_n,
@@ -65,7 +69,9 @@ def _mxfp4_quant_tile(
     BLOCK_SIZE_N: gl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    EVEN_M_N: gl.constexpr,
+    EVEN_M: gl.constexpr,
+    EVEN_N: gl.constexpr,
+    SCALE_TDM: gl.constexpr,
 ):
     """Quantize the LDS tile at compute_idx, then store its payload and scales."""
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
@@ -76,7 +82,7 @@ def _mxfp4_quant_tile(
     )
 
     pid_n = start_n + compute_idx
-    if not EVEN_M_N:
+    if not EVEN_N:
         # Tail tile: mask stale ring-buffer columns past N.
         gLayoutN: gl.constexpr = gl.SliceLayout(0, blocked_layout)
         col_valid = (
@@ -89,27 +95,40 @@ def _mxfp4_quant_tile(
 
     out_buf = out_smem.index(compute_idx % NUM_BUFFERS)
     out_buf.store(out_fp4)
+    if SCALE_TDM:
+        # Scales go through LDS and one TDM store (TDM clips the M and N tails).
+        bs_buf = bs_smem.index(compute_idx % NUM_BUFFERS)
+        bs_buf.store(bs_e8m0)
     gl.barrier()
     gl.amd.gfx1250.tdm.async_store(
         out_desc,
         [pid_m * BLOCK_SIZE_M, pid_n * (BLOCK_SIZE_N // 2)],
         out_buf,
     )
-
-    bs_offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
-    bs_offs_n = pid_n * NUM_QUANT_BLOCKS + gl.arange(0, NUM_QUANT_BLOCKS)
-    bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
-    if EVEN_M_N:
-        gl.store(bs_ptr + bs_offs, bs_e8m0)
-    else:
-        gl.store(
-            bs_ptr + bs_offs,
-            bs_e8m0,
-            mask=(bs_offs_m < M)[:, None]
-            & (bs_offs_n < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE)[
-                None, :
-            ],
+    if SCALE_TDM:
+        gl.amd.gfx1250.tdm.async_store(
+            bs_desc, [pid_m * BLOCK_SIZE_M, pid_n * NUM_QUANT_BLOCKS], bs_buf
         )
+    else:
+        bs_offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
+        bs_offs_n = pid_n * NUM_QUANT_BLOCKS + gl.arange(0, NUM_QUANT_BLOCKS)
+        bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
+        if EVEN_N:
+            if EVEN_M:
+                gl.store(bs_ptr + bs_offs, bs_e8m0)
+            else:
+                # A row mask keeps the scale stores vectorized along N.
+                gl.store(bs_ptr + bs_offs, bs_e8m0, mask=(bs_offs_m < M)[:, None])
+        else:
+            gl.store(
+                bs_ptr + bs_offs,
+                bs_e8m0,
+                mask=(bs_offs_m < M)[:, None]
+                & (
+                    bs_offs_n
+                    < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
+                )[None, :],
+            )
 
 
 @gluon.jit(repr=_gluon_dynamic_mxfp4_quant_kernel_gfx1250_repr)
@@ -130,13 +149,18 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
     NUM_ITER: gl.constexpr,
     num_warps: gl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: gl.constexpr,
-    EVEN_M_N: gl.constexpr,
+    EVEN_M: gl.constexpr,
+    EVEN_N: gl.constexpr,
+    SCALE_TDM: gl.constexpr = False,
     NUM_BUFFERS: gl.constexpr = 2,
 ):
     gl.static_assert(NUM_BUFFERS >= 2, "LDS kernel requires NUM_BUFFERS >= 2")
 
     pid_m = gl.program_id(0)
     start_n = gl.program_id(1) * NUM_ITER
+    # The launcher rounds grid dim 0 up to a multiple of 8 (see dynamic_mxfp4_quant).
+    if pid_m * BLOCK_SIZE_M >= M:
+        return
 
     stride_x_m = gl.cast(stride_x_m_in, gl.int64)
     stride_x_n = gl.cast(stride_x_n_in, gl.int64)
@@ -191,6 +215,27 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N // 2),
         layout=SHARED_LAYOUT_O,
     )
+    if SCALE_TDM:
+        # Row-major scales (stride_bs_n == 1): a TDM store per tile.
+        NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+        SHARED_LAYOUT_BS: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[NUM_QUANT_BLOCKS, 8]], [BLOCK_SIZE_M, NUM_QUANT_BLOCKS], [1, 0]
+        )
+        bs_smem = gl.allocate_shared_memory(
+            bs_ptr.type.element_ty,
+            shape=[NUM_BUFFERS, BLOCK_SIZE_M, NUM_QUANT_BLOCKS],
+            layout=SHARED_LAYOUT_BS,
+        )
+        bs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=bs_ptr,
+            shape=(M, (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE),
+            strides=(stride_bs_m, 1),
+            block_shape=(BLOCK_SIZE_M, NUM_QUANT_BLOCKS),
+            layout=SHARED_LAYOUT_BS,
+        )
+    else:
+        bs_smem = None
+        bs_desc = None
 
     load_idx = 0
     compute_idx = 0
@@ -210,7 +255,8 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
         gl.amd.gfx1250.tdm.async_load(
             x_desc, [0, 0], x_buffer.index(load_idx % NUM_BUFFERS)
         )
-        gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 1)  # 1 TDM op/tile
+        # Also waits for the previous tile's stores (TDM ops complete in order).
+        gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 1)
         x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             x_desc, add_offsets=[0, BLOCK_SIZE_N]
         )
@@ -220,6 +266,8 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
             x_buffer,
             out_smem,
             out_desc,
+            bs_smem,
+            bs_desc,
             bs_ptr,
             compute_idx,
             start_n,
@@ -233,7 +281,9 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
             BLOCK_SIZE_N,
             MXFP4_QUANT_BLOCK_SIZE,
             NUM_BUFFERS,
-            EVEN_M_N,
+            EVEN_M,
+            EVEN_N,
+            SCALE_TDM,
         )
         compute_idx += 1
 
@@ -245,6 +295,8 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
             x_buffer,
             out_smem,
             out_desc,
+            bs_smem,
+            bs_desc,
             bs_ptr,
             compute_idx,
             start_n,
@@ -258,7 +310,9 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
             BLOCK_SIZE_N,
             MXFP4_QUANT_BLOCK_SIZE,
             NUM_BUFFERS,
-            EVEN_M_N,
+            EVEN_M,
+            EVEN_N,
+            SCALE_TDM,
         )
         compute_idx += 1
 
@@ -275,6 +329,7 @@ _gluon_dynamic_mxfp8_quant_kernel_gfx1250_repr = make_kernel_repr(
         "num_warps",
         "MXFP8_QUANT_BLOCK_SIZE",
         "NUM_BUFFERS",
+        "PAD_M",
     ],
 )
 
@@ -374,6 +429,7 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
     num_warps: gl.constexpr,
     MXFP8_QUANT_BLOCK_SIZE: gl.constexpr,
     NUM_BUFFERS: gl.constexpr = 2,
+    PAD_M: gl.constexpr = False,
 ):
     # NUM_BUFFERS=1: synchronous, no prefetch.
     gl.static_assert(NUM_BUFFERS >= 1, "LDS kernel requires NUM_BUFFERS >= 1")
@@ -385,6 +441,9 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
 
     pid_m = gl.program_id(0)
     start_n = gl.program_id(1) * NUM_ITER
+    # The launcher rounded grid dim 0 up to a multiple of 8: extra CTAs exit.
+    if PAD_M and pid_m * BLOCK_SIZE_M >= M:
+        return
 
     # Cast strides to int64, in case M*N > max int32.
     stride_x_m = gl.cast(stride_x_m_in, gl.int64)

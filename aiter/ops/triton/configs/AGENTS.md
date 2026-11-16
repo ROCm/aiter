@@ -219,15 +219,23 @@ there is no file. Do not change the returned dict.
 | Family | Backend | Keys | Entry keys |
 | ------ | ------- | ---- | ---------- |
 | `A8W4` | `triton` | `bm<block_m>_n<N>_k<K>` | `BLOCK_SIZE_N`, `BLOCK_SIZE_K`, `num_warps`, `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim` |
-| `A8W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps`, `persistent_iters` |
-| `A4W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps` |
+| `A8W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps`, `persistent_iters`, `xcd_swizzle` |
+| `A4W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps`, `xcd_swizzle`, optional `x_scales_tdm_min_m` |
 
 - `block_m` is the key. Do not put `BLOCK_SIZE_M` or `block_m` in an entry.
 - `<bucket>` comes from `m2bucket()`: `tiny` (M ≤ 8), `small` (M ≤ 32),
-  `medium` (M ≤ 128), `medium2` (M ≤ 256), `large` (M ≤ 512) and `xlarge`
-  (M > 512). Give each new Gluon shape all six buckets. A missing bucket
-  falls back to `bm<block_m>_any`.
+  `medium` (M ≤ 128), `medium2` (M ≤ 256), `large` (M ≤ 512), `xlarge`
+  (M ≤ 65536) and `xxlarge` (M > 65536). Give each new Gluon shape the six
+  buckets `tiny` to `xlarge`. A missing bucket falls back to
+  `bm<block_m>_any`.
+- `xxlarge` is optional. Add it only where a tile is faster than the
+  `xlarge` one at every M in the bucket. A missing `xxlarge` key falls back
+  to the `xlarge` key, then to `bm<block_m>_any`. M is the number of gathered
+  rows: under EP it counts every gate slot of the received tokens (tokens x
+  top-k), so decode steps are in `xlarge` and prefill steps are in `xxlarge`.
 - Each Gluon file has a `bm<block_m>_any` entry for each `block_m`.
+- A4W4 `x_scales_tdm_min_m`: from this many gathered rows (M) up, the x scales load by TDM
+  instead of the async copy.
 
 ## Conv
 
