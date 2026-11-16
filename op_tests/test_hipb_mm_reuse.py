@@ -45,11 +45,23 @@ def _rand(*shape, dtype=BF16, scale=1.0):
     return torch.randn(*shape, device="cuda").mul_(scale).to(dtype)
 
 
-def _solution(x, wt, bias=None, otype=None):
+def _solution(x, wt, bias=None, otype=None, also=()):
+    """A solution whose result does not change between two freshly built
+    descriptors, for ``x`` and every input in ``also``. Some solutions (for
+    instance ones that split K across workgroups) are not deterministic run
+    to run, and comparing them bit for bit would test the kernel, not reuse."""
     sols = hipb_findallsols(x, wt, bias=bias, out_dtype=otype)
     if not sols:
         pytest.skip("no hipBLASLt solution for this problem")
-    return sols[0]
+    inputs = (x, *also)
+    for sol in sols[:8]:
+        first = [hipb_mm(a, wt, sol, bias=bias, out_dtype=otype) for a in inputs]
+        _fresh_extension()
+        again = [hipb_mm(a, wt, sol, bias=bias, out_dtype=otype) for a in inputs]
+        torch.cuda.synchronize()
+        if all(torch.equal(f, a) for f, a in zip(first, again)):
+            return sol
+    pytest.skip("no run-to-run deterministic hipBLASLt solution for this problem")
 
 
 CASES = [
@@ -71,8 +83,7 @@ def test_kept_descriptors_match_fresh_ones(case):
     first = hipb_mm(x, w.t(), sol, bias=b1, out_dtype=otype)  # builds them
     again = hipb_mm(x, w.t(), sol, bias=b1, out_dtype=otype)  # reuses them
     torch.cuda.synchronize()
-    if not torch.equal(first, again):
-        pytest.skip("solution is not deterministic run to run")
+    assert torch.equal(first, again)
     if has_bias:
         # Same configuration, another bias: only the pointer may change.
         b2 = _rand(n, dtype=dtype)
@@ -98,7 +109,7 @@ def test_configurations_do_not_mix():
     x = x_strided.contiguous()
     w = _rand(384, k, scale=k**-0.5)
     b = _rand(384)
-    sol = _solution(x, w.t())
+    sol = _solution(x, w.t(), also=[x_strided, x[:128]])
     sol_b = _solution(x, w.t(), b)
     calls = [
         lambda: hipb_mm(x, w.t(), sol),
@@ -124,10 +135,11 @@ def test_many_configurations():
     w = _rand(n, k, scale=k**-0.5)
     buf = _rand(m * (k + step * count))
     views = [buf.as_strided((m, k), (k + step * i, 1)) for i in range(count)]
-    sol = _solution(views[0], w.t())
+    checked = (0, 1, 511, 1023, 1024, 1099)
+    sol = _solution(views[0], w.t(), also=[views[i] for i in checked[1:]])
     kept = [hipb_mm(x, w.t(), sol) for x in views]
     _fresh_extension()
-    for i in (0, 1, 511, 1023, 1024, 1099):
+    for i in checked:
         assert torch.equal(kept[i], hipb_mm(views[i], w.t(), sol))
         assert torch.equal(kept[i], hipb_mm(views[i].contiguous(), w.t(), sol))
 
@@ -159,7 +171,7 @@ def _thread_calls():
     w = _rand(384, k, scale=k**-0.5)
     sol = _solution(x, w.t())
     biases = [_rand(384) for _ in range(4)]
-    sol_b = _solution(x, w.t(), biases[0])
+    sol_b = _solution(x, w.t(), biases[0], also=[x[:128]])
     x2, w2 = _rand(96, 768), _rand(320, 768, scale=768**-0.5)
     sol2 = _solution(x2, w2.t())
 
