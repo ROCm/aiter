@@ -654,6 +654,35 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
                              use_1stage);
 }
 
+// ---- INT4 Lamport two-shot all-reduce (bf16, lossy) ----
+
+int64_t lamport_q4_2s_buffer_size(int64_t world_size, int64_t max_bytes)
+{
+    const int64_t g = (int64_t)aiter::q4ar::group_of(aiter::q4ar::codec_from_env()) * world_size;
+    return aiter::lamport_q4_2s_buffer_bytes((int)world_size, (max_bytes / 2 + g - 1) / g);
+}
+
+void init_lamport_q4_2s(fptr_t _fa, const std::vector<int64_t>& all_ptrs, int64_t max_bytes)
+{
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    fa->init_lamport_q4_2s(all_ptrs, max_bytes);
+}
+
+void allreduce_lamport_q4_2s(fptr_t _fa, const aiter_tensor_t& inp, const aiter_tensor_t& out)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    if(out.numel() != inp.numel() || out.dtype() != inp.dtype() || !out.is_contiguous() ||
+       !inp.is_contiguous() || out.device_id != inp.device_id)
+        throw std::runtime_error("allreduce_lamport_q4_2s requires matching contiguous inp and out");
+    if(inp.dtype() != AITER_DTYPE_bf16)
+        throw std::runtime_error("allreduce_lamport_q4_2s only supports bfloat16");
+    if(reinterpret_cast<uintptr_t>(inp.data_ptr()) % 8 || reinterpret_cast<uintptr_t>(out.data_ptr()) % 8)
+        throw std::runtime_error("allreduce_lamport_q4_2s needs 8-byte aligned inp and out");
+    fa->allreduce_lamport_q4_2s(stream, inp.data_ptr(), out.data_ptr(), inp.numel());
+}
+
 // ---- Lamport one-shot fused allreduce + RMSNorm ----
 
 int64_t lamport_ar_rms_buffer_size(int64_t world_size, int64_t max_bytes)
