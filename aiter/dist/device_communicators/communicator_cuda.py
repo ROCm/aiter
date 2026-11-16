@@ -269,6 +269,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
             return gluon_all_reduce(input_, self.cpu_group, *self.gluon_ar_plain)
 
+        # gfx1250 Lamport one-shot (opt-in, decode sizes; see should_lamport_ar)
+        ca_lam = self.ca_comm
+        if (
+            ca_lam is not None
+            and not ca_lam.disabled
+            and hasattr(ca_lam, "should_lamport_ar")
+            and ca_lam.should_lamport_ar(input_)
+        ):
+            return ca_lam.lamport_all_reduce(input_)
+
         # Quick reduce, then custom allreduce, then pynccl. (quick reduce just
         # for ROCM MI3*)
         qr_comm = self.qr_comm

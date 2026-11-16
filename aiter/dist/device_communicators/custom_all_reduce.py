@@ -276,6 +276,10 @@ _GFX1250_PLAIN_AR_MAX_SIZE = {
 # TP6/TP8 are not measured and stay off unless the env var below sets a size.
 _LAMPORT_AR_RMS_MAX_BYTES = {2: 16 * 1024 * 1024, 4: 8 * 1024 * 1024}
 _LAMPORT_AR_RMS_MAX_SIZE_ENV = "AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE"
+# Plain all-reduce on the Lamport inbox up to this many bytes (0 = off).
+_LAMPORT_AR_MAX_SIZE = int(
+    os.environ.get("AITER_CUSTOM_AR_LAMPORT_AR_MAX_SIZE", "0") or 0
+)
 # Each rank owns 16B packs of whole waves of 32 (kLamportWave).
 _LAMPORT_AR_RMS_GRAIN = 512
 # hidden must be whole waves of 16B packs and a row at most one 1024-thread
@@ -1834,6 +1838,8 @@ class CustomAllreduce:
         )
         # Sole owner from here on, so its close() releases the buffers.
         self._pool = _SymmMemBufferProxy(meta, inp, (meta_hdl, inp_hdl), self)
+        if self._is_gfx1250:
+            self._init_lamport_symm(world_size)
 
     def _init_gfx1250(self, rank: int, world_size: int, max_size: int):
         """gfx1250 VMM init: used when hipIpc is unusable (ROCm < 7.15). Shares
@@ -2023,6 +2029,33 @@ class CustomAllreduce:
     #     AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE / self._lamport_max_bytes for
     #     AR + RMSNorm,
     #   - name the init after the arch, not the op.
+    def _init_lamport_symm(self, world_size: int):
+        """The Lamport inbox on the torch.symm_mem transport (cross-node groups):
+        one symm_mem buffer a rank, the same init and kernels as the IPC inbox.
+        A group that cannot map its peers' inboxes runs without it."""
+        import torch.distributed._symmetric_memory as symm_mem
+
+        max_bytes = _resolve_lamport_ar_rms_max_size(world_size)
+        if max_bytes <= 0:
+            return
+        size = ops.lamport_ar_rms_buffer_size_gfx1250(world_size, max_bytes)
+        buf = symm_mem.empty(size, dtype=torch.uint8, device=self.device)
+        torch.cuda.synchronize()
+        hdl = self._rendezvous(buf, "lamport")
+        if hdl is None:
+            return
+        ops.init_lamport_ar_rms_gfx1250(self._ptr, list(hdl.buffer_ptrs), max_bytes)
+        # every rank's sentinel fill must land before any rank's first push
+        dist.barrier(group=self.group)
+        self._lamport_symm = (buf, hdl)
+        self._lamport_max_bytes = max_bytes
+        logger.info(
+            "Custom allreduce gfx1250 Lamport inbox on symm_mem: up to %d bytes "
+            "(inbox %d bytes per rank)",
+            max_bytes,
+            size,
+        )
+
     def _init_lamport_ar_rms(self, world_size: int):
         """Set up the Lamport fused AR + RMSNorm inbox (IPC transport only).
 
@@ -2426,6 +2459,31 @@ class CustomAllreduce:
             and nbytes % 16 == 0
             and 0 < nbytes <= self._lamport_max_bytes
         )
+
+    def should_lamport_ar(self, inp: torch.Tensor) -> bool:
+        """Opt-in plain all-reduce on the Lamport inbox (one-shot): inputs of at
+        most AITER_CUSTOM_AR_LAMPORT_AR_MAX_SIZE bytes. Shape-only, so every
+        rank decides the same."""
+        cap = _LAMPORT_AR_MAX_SIZE
+        return (
+            cap > 0
+            and inp.numel() * inp.element_size() <= cap
+            and self.should_lamport_ar_add(inp, inp)
+        )
+
+    def lamport_all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
+        """all_reduce(inp) on the Lamport inbox: lamport_ar_add with a zero
+        addend (inp + 0 rounds to inp, so the result has the plain sum's bits)."""
+        zeros = getattr(self, "_lamport_zeros", None)
+        n = inp.numel()
+        if zeros is None or zeros.dtype != inp.dtype or zeros.numel() < n:
+            zeros = torch.zeros(
+                max(n, self._lamport_max_bytes // inp.element_size()),
+                dtype=inp.dtype,
+                device=inp.device,
+            )
+            self._lamport_zeros = zeros
+        return self.lamport_ar_add(inp, zeros[:n].view(inp.shape))
 
     def lamport_ar_add(self, inp: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
         """Lamport one-shot all-reduce of inp + other on the AR + RMSNorm inbox,
