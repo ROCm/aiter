@@ -988,6 +988,70 @@ def mla_decode_prepare_page_csr(
     return kv_indptr, kv_indices, kv_last_page_lens
 
 
+@triton.jit
+def _no_weight_row(O, Lse, ROW, HEADS, HAS_LSE: tl.constexpr, BLOCK: tl.constexpr):
+    # The lowest float, not -inf: with -inf in every partial of a request,
+    # mla_reduce_v1 writes LSE=+inf for it, and NaN O at 3 splits.
+    cols = tl.arange(0, BLOCK)
+    for c in range(0, ROW, BLOCK):
+        tl.store(O + c + cols, 0.0, mask=c + cols < ROW)
+    if HAS_LSE:
+        for c in range(0, HEADS, BLOCK):
+            tl.store(Lse + c + cols, -3.4028234663852886e38, mask=c + cols < HEADS)
+
+
+@triton.jit
+def _put_empty_work_items_last(
+    Src,
+    Dst,
+    WorkIndptr,
+    O,
+    Lse,
+    PartialO,
+    PartialLse,
+    ROW,
+    HEADS,
+    HAS_LSE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """One CU's work items from Src into Dst, those with no KV last. An empty
+    item's rows get O=0 and the lowest float as LSE: in O and the final LSE
+    when it writes O directly, in its partial slot otherwise."""
+    # A work item is eight int32: partial_qo_loc at 1, qo start and end at 2
+    # and 3, KV start and end at 4 and 5.
+    lo = tl.load(WorkIndptr + tl.program_id(0))
+    hi = tl.load(WorkIndptr + tl.program_id(0) + 1)
+    n_live = 0
+    for i in range(lo, hi):
+        n_live += (tl.load(Src + i * 8 + 5) > tl.load(Src + i * 8 + 4)).to(tl.int32)
+    fields = tl.arange(0, 8)
+    seen = 0
+    for i in range(lo, hi):
+        live = (tl.load(Src + i * 8 + 5) > tl.load(Src + i * 8 + 4)).to(tl.int32)
+        to = tl.where(live == 1, lo + seen, n_live + i - seen)
+        tl.store(Dst + to * 8 + fields, tl.load(Src + i * 8 + fields))
+        seen += live
+        if live == 0:
+            loc = tl.load(Src + i * 8 + 1)
+            q0 = tl.load(Src + i * 8 + 2)
+            for r in range(q0, tl.load(Src + i * 8 + 3)):
+                if loc < 0:
+                    row = r.to(tl.int64)
+                    _no_weight_row(
+                        O + row * ROW, Lse + row * HEADS, ROW, HEADS, HAS_LSE, BLOCK
+                    )
+                else:
+                    row = (loc + r - q0).to(tl.int64)
+                    _no_weight_row(
+                        PartialO + row * ROW,
+                        PartialLse + row * HEADS,
+                        ROW,
+                        HEADS,
+                        True,
+                        BLOCK,
+                    )
+
+
 def mla_decode_fwd(
     q,
     kv_buffer,
@@ -1028,6 +1092,7 @@ def mla_decode_fwd(
     page_table=None,
     kv_csr_layout="page",
     fast_mode=True,
+    empty_work_items=False,
 ):
     """MLA decode with explicit KV byte-layout selection.
 
@@ -1061,6 +1126,15 @@ def mla_decode_fwd(
     indptr, ignoring last-page values (the tensor is still required).
     Physical ``page_size`` remains 64. Token CSR is only supported by the
     shuffled QH64 path; it does not change the KV byte layout.
+
+    ``empty_work_items=True`` lets a persistent work plan hold work items
+    with no KV, as one planned at a KV bound and cut to each request's keys
+    does. The asm kernels end a CU's work at its first empty item, so each
+    CU's empty items are moved after its others in ``work_info_set``, in
+    place, and their partial O and LSE are set to 0 and the lowest float,
+    which gives them no weight in the reduce. A request with no keys gets O=0
+    and the lowest float as its LSE. It costs a copy of the plan and a kernel
+    over it per call.
     """
     if kv_csr_layout not in ("page", "token"):
         raise ValueError(f"unknown MLA kv_csr_layout: {kv_csr_layout!r}")
@@ -1533,6 +1607,21 @@ def mla_decode_fwd(
             if return_lse
             else None
         )
+        if empty_work_items:
+            # In place: the asm kernels read the plan through work_meta_data.
+            _put_empty_work_items_last[(work_indptr.numel() - 1,)](
+                work_info_set.clone(),
+                work_info_set,
+                work_indptr,
+                o,
+                attn_lse if final_lse is None else final_lse,
+                logits,
+                attn_lse,
+                o.stride(0),
+                nhead,
+                HAS_LSE=final_lse is not None,
+                BLOCK=1024,
+            )
 
         use_hk = head_plan.backend == _MlaBackendId.HK
 
