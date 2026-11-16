@@ -48,7 +48,6 @@ class GemmA16W16Gfx950Param:
     stages: fx.Constexpr[int]
     is_split_k: fx.Constexpr[bool]
     split_k_partials: fx.Constexpr[bool]
-    split_count: fx.Constexpr[int]
     device_index: fx.Constexpr[int]
     m_waves: fx.Constexpr[int]
     n_waves: fx.Constexpr[int]
@@ -300,7 +299,6 @@ def make_gemm_a16w16_gfx950_param(
         stages=stages,
         is_split_k=split_k > 1,
         split_k_partials=split_k_partials,
-        split_count=split_k if split_k_partials else 0,
         device_index=device_index,
         m_waves=m_waves,
         n_waves=n_waves,
@@ -333,7 +331,7 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     out_suffix = "_fp32c" if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else ""
     name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
     if param.split_k_partials:
-        name += f"_planes{param.split_count}_dynamic_mnk_d{param.device_index}"
+        name += f"_planes_dynamic_mnk_d{param.device_index}"
     else:
         name += "_kst4" if param.is_split_k else "_ks1"
     name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
@@ -600,8 +598,8 @@ def gemm_a16w16_gfx950_kernel(
     if const_expr(param.split_k_partials):
         # Balance whole K tiles: partitions differ by at most one tile.
         total_tiles = k // block_k
-        tiles = total_tiles // param.split_count
-        extra = total_tiles % param.split_count
+        tiles = total_tiles // split_k
+        extra = total_tiles % split_k
         prefix = (ks_idx < extra).select(ks_idx, fx.Int32(extra))
         ks_begin = (ks_idx * tiles + prefix) * block_k
         k_tiles = fx.Int32(tiles) + (ks_idx < extra).select(fx.Int32(1), fx.Int32(0))
@@ -1504,6 +1502,13 @@ def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
     except Exception:  # noqa: BLE001 - invalid policies are filtered here
         return None
     split_k = kwargs.get("split_k", 1)
+    if result.split_k_partials and (
+        min(m, n, k) <= 0
+        or split_k * m * n * 4 >= 2**31
+        or m * k * 2 >= 2**31
+        or n * k * 2 >= 2**31
+    ):
+        return None
     try:
         assert_no_k_tail(k, kwargs)
     except AssertionError:

@@ -331,7 +331,7 @@ def _flydsl_b_non_temporal_configs(configs, mode, gfx):
     if mode not in ("auto", "off", "on", "both"):
         raise ValueError(f"Invalid FlyDSL B non-temporal mode: {mode}")
     if mode == "auto":
-        # Preserve the previous catalog, including its order and solidx values.
+        # Keep the cache policies supplied by the common search pool.
         return configs
     choices = (False, True) if mode == "both" else (mode == "on",)
     selected = []
@@ -369,31 +369,6 @@ def get_flydsl_bf16_catalog(
         out_dtype,
         fused_bias,
     )
-    # Add the qualified split-plane chain only for explicit cache-policy tuning.
-    # "auto" retains the legacy catalog and its saved solution indices.
-    if (
-        b_non_temporal != "auto"
-        and get_gfx_runtime() == "gfx950"
-        and (m, n, k) == (128, 7168, 12288)
-        and in_dtype == out_dtype == torch.bfloat16
-        and not has_bias
-    ):
-        configs = configs + [
-            {
-                "block_m": 128,
-                "block_n": 160,
-                "block_k": 64,
-                "stages": 3,
-                "split_k": 5,
-                "m_waves": 2,
-                "n_waves": 2,
-                "k_waves": 1,
-                "group_m": 0,
-                "k_stagger": 0,
-                "use_half_tile_interleaved": False,
-                "policy": "sp",
-            }
-        ]
     configs = _flydsl_b_non_temporal_configs(configs, b_non_temporal, get_gfx_runtime())
     kernels = {
         flydsl_hgemm_kernel_name(
@@ -528,10 +503,10 @@ class GemmA16W16Tuner(GemmCommonTuner):
             dest="flydsl_b_non_temporal",
             choices=("auto", "off", "on", "both"),
             default=self.ARG_DEFAULTS["flydsl_b_non_temporal"],
-            help="FlyDSL B cache-policy candidates: auto preserves the existing "
-            "catalog; off/on select cached/non-temporal loads; both compares "
-            "both for every eligible gfx950 FT/HT tile and the qualified "
-            "BF16 (128,7168,12288) split-plane chain. Policies without that "
+            help="FlyDSL B cache-policy candidates: auto keeps the common pool's "
+            "cache choices; off/on select cached/non-temporal loads; both compares "
+            "both for every eligible gfx950 FT/HT/split-plane configuration. "
+            "Policies without that "
             "mode are excluded (on yields no candidates on non-gfx950). "
             "This controls tuning only, not runtime CSV selection. Winning "
             "names encode _bnt_; old names without it remain cached.",

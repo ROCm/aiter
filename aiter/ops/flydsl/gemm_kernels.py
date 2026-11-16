@@ -19,8 +19,11 @@ from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 from .gemm_a16w16_band import band_stream_name_supported, gemm_a16w16_band
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
 from .kernels.gemm_a16w16_gfx950 import (
+    GEMM_A16W16_DTYPE_BF16,
+    GEMM_A16W16_DTYPE_FP32,
     SPLIT_K_SEMAPHORE_MAX_LEN,
     gemm_a16w16,
+    make_gemm_a16w16_param_and_validate,
 )
 from .kernels.gemm_a16w16_skinny_gfx950 import gemm_a16w16_skinny
 from .kernels.tensor_shim import _run_compiled
@@ -213,25 +216,19 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
 
 
 def _split_planes_name_supported(params):
-    # Narrow opt-in coverage; legacy FT/HT names retain their atomic protocol.
-    expected = {
-        "target_gfx": "gfx950",
-        "dtype": "bf16",
-        "out_dtype": "bf16",
-        "has_bias": False,
-        "block_m": 128,
-        "block_n": 160,
-        "block_k": 64,
-        "stages": 3,
-        "split_k": 5,
-        "m_waves": 2,
-        "n_waves": 2,
-        "k_waves": 1,
-        "group_m": 0,
-        "k_stagger": 0,
-    }
-    return isinstance(params.get("b_non_temporal"), bool) and all(
-        params.get(key) == value for key, value in expected.items()
+    return (
+        params["target_gfx"] == "gfx950"
+        and params["dtype"] == params["out_dtype"] == "bf16"
+        and not params["has_bias"]
+        and params["k_waves"] == 1
+        and params["split_k"] > 1
+        and params["stages"] >= 2
+        and min(
+            params[key]
+            for key in ("block_m", "block_n", "block_k", "m_waves", "n_waves")
+        )
+        > 0
+        and isinstance(params.get("b_non_temporal"), bool)
     )
 
 
@@ -241,14 +238,14 @@ def _split_planes_hgemm(a, b, out, bias, out_dtype, stream, params):
 
     if (
         not _split_planes_name_supported(params)
-        or tuple(a.shape) != (128, 12288)
-        or tuple(b.shape) != (7168, 12288)
+        or a.ndim != 2
+        or b.ndim != 2
         or bias is not None
         or getattr(b, "is_shuffled", False)
         or a.device.type != "cuda"
         or out_dtype not in (None, torch.bfloat16)
     ):
-        raise ValueError("split-plane HGEMM supports BF16 (128,7168,12288), no bias")
+        raise ValueError("split-plane HGEMM requires gfx950 BF16 matrices, no bias")
     tensors = (a, b) + (() if out is None else (out,))
     if any(
         t.device != a.device
@@ -262,34 +259,50 @@ def _split_planes_hgemm(a, b, out, bias, out_dtype, stream, params):
         for t in tensors
     ):
         raise ValueError("split-plane HGEMM requires aligned contiguous BF16 tensors")
+    m, k = a.shape
+    n = b.shape[0]
+    if b.shape[1] != k:
+        raise ValueError("split-plane HGEMM input K dimensions must match")
+    kwargs = {
+        key: params[key]
+        for key in (
+            "block_m",
+            "block_n",
+            "block_k",
+            "stages",
+            "split_k",
+            "m_waves",
+            "n_waves",
+            "k_waves",
+            "group_m",
+            "k_stagger",
+            "b_non_temporal",
+        )
+    }
+    kwargs.update(use_half_tile_interleaved=False, split_k_partials=True)
+    validation = dict(
+        kwargs,
+        in_dtype_id=GEMM_A16W16_DTYPE_BF16,
+        out_dtype_id=GEMM_A16W16_DTYPE_FP32,
+        a_is_transposed=False,
+        b_is_transposed=True,
+        has_bias=False,
+    )
+    if make_gemm_a16w16_param_and_validate(m, n, k, validation) is None:
+        raise ValueError("unsupported split-plane HGEMM shape/configuration")
     if out is not None:
-        if tuple(out.shape) != (128, 7168):
-            raise ValueError("split-plane HGEMM output shape must be (128,7168)")
+        if tuple(out.shape) != (m, n):
+            raise ValueError("split-plane HGEMM output must have shape (M,N)")
         lo, hi = out.data_ptr(), out.data_ptr() + out.nbytes
         if any(lo < t.data_ptr() + t.nbytes and t.data_ptr() < hi for t in (a, b)):
             raise ValueError("split-plane HGEMM output must not overlap an input")
     with torch.cuda.stream(stream):
         # Invocation-local scratch is graph/stream-allocator owned, not cached.
         if out is None:
-            out = torch.empty((128, 7168), device=a.device, dtype=torch.bfloat16)
-        partials = torch.empty((5 * 128, 7168), device=a.device, dtype=torch.float32)
-        kwargs = {
-            k: params[k]
-            for k in (
-                "block_m",
-                "block_n",
-                "block_k",
-                "stages",
-                "split_k",
-                "m_waves",
-                "n_waves",
-                "k_waves",
-                "group_m",
-                "k_stagger",
-                "b_non_temporal",
-            )
-        }
-        kwargs.update(use_half_tile_interleaved=False, split_k_partials=True)
+            out = torch.empty((m, n), device=a.device, dtype=torch.bfloat16)
+        partials = torch.empty(
+            (params["split_k"] * m, n), device=a.device, dtype=torch.float32
+        )
         gemm_a16w16(
             a,
             b.t(),
@@ -300,7 +313,7 @@ def _split_planes_hgemm(a, b, out, bias, out_dtype, stream, params):
             out_dtype=torch.float32,
         )
         reducer = compile_gemm_a8w8_splitk_reduce(
-            split_k=5,
+            split_k=params["split_k"],
             partial_dtype_str="f32",
             threads=64,
             unroll=8,
@@ -369,8 +382,10 @@ def flydsl_hgemm(
     ``policy="tdm"/"tdmi"`` selects workspace TDM, plain/interleaved;
     ``"tdma"/"tdmia"`` selects BF16 packed-atomic split-K on gfx1250.
     ``policy="sp"`` selects independently written FP32 K partitions followed
-    by a BF16 reduction, currently qualified only for contiguous BF16
-    (M,N,K)=(128,7168,12288) on gfx950. B remains ordinary weight[N,K].
+    by a BF16 reduction on gfx950, with contiguous BF16 inputs and no bias.
+    M/N/K and the split count determine scratch size; B stays weight[N,K].
+    N must be a multiple of four and K a multiple of block_k; the shortest
+    balanced partition must contain at least stages-1 K tiles.
     Its B loads honor ``b_non_temporal`` in both cached and streaming modes.
     All four TDM policies use the same-dtype output and the existing weight[N,K] convention.
     ``policy="bs"`` selects the BF16 band-stream decode kernel for the
