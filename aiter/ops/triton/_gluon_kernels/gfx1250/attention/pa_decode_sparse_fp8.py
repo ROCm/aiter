@@ -732,19 +732,27 @@ def _pa_decode_sparse_fp8(
         cga_layout=CGA_B,
     )
     SC_SPAN: gl.constexpr = 32
-    SPAN_THREADS: gl.constexpr = SC_SPAN // 8
     CGA_B3: gl.constexpr = _cga_bcast_3d(CGA_H)
+    # One thread owns a whole SC_SPAN-wide scale block of one key row: each E8M0
+    # byte then feeds SC_SPAN / 8 packed upcasts and the [K, W] -> [K, NS, SPAN]
+    # reshape is a no-op. With 8 elements per thread (4 threads per block) every
+    # 8 elements paid their own scale-byte unpack plus a cross-lane shuffle.
+    # Lanes walk key rows, warps walk scale blocks.
+    if BLOCK_K >= WARP_SIZE:
+        DQ_TPW_K: gl.constexpr = WARP_SIZE
+    else:
+        DQ_TPW_K: gl.constexpr = BLOCK_K
     CHUNK2_LAYOUT: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[WARP_SIZE // SPAN_THREADS, SPAN_THREADS],
-        warps_per_cta=[num_warps, 1],
+        size_per_thread=[1, SC_SPAN],
+        threads_per_warp=[DQ_TPW_K, WARP_SIZE // DQ_TPW_K],
+        warps_per_cta=[1, num_warps],
         order=[1, 0],
         cga_layout=CGA_B,
     )
     CHUNK3_LAYOUT: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 1, 8],
-        threads_per_warp=[WARP_SIZE // SPAN_THREADS, 1, SPAN_THREADS],
-        warps_per_cta=[num_warps, 1, 1],
+        size_per_thread=[1, 1, SC_SPAN],
+        threads_per_warp=[DQ_TPW_K, WARP_SIZE // DQ_TPW_K, 1],
+        warps_per_cta=[1, num_warps, 1],
         order=[2, 1, 0],
         cga_layout=CGA_B3,
     )
