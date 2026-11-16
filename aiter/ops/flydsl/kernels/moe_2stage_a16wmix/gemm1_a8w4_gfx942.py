@@ -27,8 +27,6 @@ a16w4 stage 1, so stage 2 is unchanged.
 """
 
 import functools
-import hashlib
-from pathlib import Path
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -793,33 +791,6 @@ def shuffle_scale_a8w4_gfx942(s_a16w4_u8):
 
 
 @functools.cache
-def _source_tag():
-    """Hash of the sources this kernel's device code comes from, put in its name.
-
-    FlyDSL's cache key follows the factory and the functions the kernel body calls,
-    but not a helper reached two calls deep: in FlyDSL 0.3.4.1 an edit to
-    ``_fp4x8_to_fp8x8`` (called from ``_gemm1_body_a8w4``) kept the cached binary.
-    As in ``pa_decode.implementation_cache_tag``, hash the sources once per process,
-    so any edit to them rebuilds the kernel.
-    """
-    here = Path(__file__).resolve().parent
-    kernels = here.parent
-    sources = [
-        Path(__file__).resolve(),
-        here / "utils.py",
-        kernels / "act.py",
-        kernels / "buffer_ops.py",
-        kernels / "dpp_utils.py",
-        kernels / "mxfp4_gemm_common.py",
-    ]
-    digest = hashlib.sha256()
-    for source in sources:
-        digest.update(source.relative_to(kernels).as_posix().encode())
-        digest.update(source.read_bytes())
-    return digest.hexdigest()[:12]
-
-
-@functools.cache
 def compile_gemm1_a8w4_gfx942(
     BM=16,
     *,
@@ -870,9 +841,6 @@ def compile_gemm1_a8w4_gfx942(
         _nm = (TILE_N // (4 // k_wave) // 16) * (BM // 16)
         lds_bytes = max(lds_bytes, 4 * _nm * 64 * 4 * 4)
 
-    # As in pa_decode: a scalar the kernel and launcher bodies read is part of FlyDSL's
-    # cache key (their name is not), so an edit to any hashed source rebuilds them.
-    _a8w4_src_tag = _source_tag()
     _act_tag = "" if act == "silu" else f"_{act}"
     _bcm_tag = "" if b_cache_mod == 2 else f"_bcm{b_cache_mod}"
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
@@ -880,7 +848,7 @@ def compile_gemm1_a8w4_gfx942(
     name_suffix = (
         f"a8w4_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}_tk{TILE_K}"
         f"{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}"
-        f"{f'_kw{k_wave}' if k_wave > 1 else ''}{'_ms' if x_layout == 'moe_sort' else ''}{'_qi' if x_layout == 'bf16' else ''}_src{_a8w4_src_tag}"
+        f"{f'_kw{k_wave}' if k_wave > 1 else ''}{'_ms' if x_layout == 'moe_sort' else ''}{'_qi' if x_layout == 'bf16' else ''}"
     )
 
     @fx.struct
@@ -904,7 +872,6 @@ def compile_gemm1_a8w4_gfx942(
         f32_swiglu_limit: fx.Float32,
         arg_out: fx.Int64,
     ):
-        _ = _a8w4_src_tag
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx_i32 = fx.thread_idx.x
         bx_i32 = fx.block_idx.x
@@ -977,7 +944,6 @@ def compile_gemm1_a8w4_gfx942(
         arg_out: fx.Int64,
         stream: fx.Stream,
     ):
-        _ = _a8w4_src_tag
         gemm1_kernel(
             arg_x,
             arg_xscale,
