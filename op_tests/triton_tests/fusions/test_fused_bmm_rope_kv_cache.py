@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import aiter.ops.triton.fusions.fused_bmm_rope_kv_cache as fused_bmm_module
 from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
     fused_fp4_bmm_rope_cat_and_cache_mla,
     fused_fp8_bmm_rope_cat_and_cache_mla,
@@ -328,6 +329,7 @@ def test_fused_fp8_bmm_rope_cat_and_cache_mla(
             sin,
             group_size=128,
             transpose_bm=True,
+            config=None,
             k_scale=k_scale,
             is_neox=(rotate_style == RotateStyle.NEOX),
             q_out_dtype=dtype,
@@ -412,6 +414,18 @@ def _make_fp8_bmm_mla_inputs(
     }
 
 
+def _use_query_view(inputs, width):
+    """Pass q_nope as a view of a (T, QH, width) tensor. Return that tensor."""
+    T = inputs["q_nope"].shape[1]
+    queries = torch.zeros((T, 8, width), dtype=torch.bfloat16, device="cuda")
+    queries[..., :192].copy_(inputs["q_nope"].transpose(0, 1))
+    inputs["q_nope"] = queries[..., :192].transpose(0, 1)
+    if width == 256:
+        queries[..., 192:].copy_(inputs["q_pe"])
+        inputs["q_pe"] = queries[..., 192:]
+    return queries
+
+
 def _reference_fp8_bmm_mla(inputs):
     # Keep the projection in FP32 until the final output cast.
     q_nope = ref_fp8_bmm(
@@ -445,23 +459,44 @@ def _reference_fp8_bmm_mla(inputs):
     return (q, decode_q_pe, k_pe, zeros.to(inputs["q_nope"].dtype)), kv_cache
 
 
-def _assert_fp8_bmm_mla_result(inputs, actual, expected, expected_cache):
+def _fp8_value_index(x):
+    """Position of each FP8 value in the ordered list of e4m3 values."""
+    code = x.contiguous().view(torch.uint8).to(torch.int16)
+    magnitude = code & 0x7F
+    return torch.where(code >= 0x80, -magnitude, magnitude)
+
+
+def _assert_fp8_bmm_mla_projection(actual, expected):
+    actual = actual[0][..., :512]
+    expected = expected[0][..., :512]
+    if actual.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        torch.testing.assert_close(
+            actual.float(), expected.float(), atol=1e-2, rtol=1e-1
+        )
+        return
+
+    # The kernel and the reference each round an FP32 value to FP8. Rounding
+    # is monotonic. Thus two FP32 values that differ by less than one e4m3
+    # step give the same FP8 value or adjacent FP8 values. They give adjacent
+    # values only when a rounding boundary is between them. An e4m3 step is
+    # at least 2**-4 of the value. Thus a relative FP32 difference of 2**-13
+    # lets at most 2**-9 of the elements differ. A different FP32 summation
+    # order gives a smaller difference. An error in the projection gives a
+    # larger one: an error of 1% changes more than 10% of the elements.
+    assert not torch.isnan(actual.float()).any()
+    steps = (_fp8_value_index(actual) - _fp8_value_index(expected)).abs()
+    assert steps.max().item() <= 1, "FP8 projection is not within one e4m3 step"
+    mismatch = (steps != 0).sum().item() / steps.numel()
+    assert mismatch <= 2**-9, f"too many FP8 projection values differ: {mismatch}"
+
+
+def _assert_fp8_bmm_mla_state(inputs, actual, expected, expected_cache):
     assert len(actual) == len(expected) == 4
     for result, reference in zip(actual, expected):
         assert result.shape == reference.shape
         assert result.dtype == reference.dtype
         assert result.device == reference.device
 
-    # FP8 projection outputs may differ from the reference by one e4m3
-    # rounding step (relative spacing 2**-3) where accumulation order moves
-    # a value across a rounding boundary.
-    fp8_output = actual[0].dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-    torch.testing.assert_close(
-        actual[0][..., :512].float(),
-        expected[0][..., :512].float(),
-        atol=1e-2,
-        rtol=2**-3 if fp8_output else 1e-1,
-    )
     torch.testing.assert_close(
         actual[0][..., 512:].float(),
         expected[0][..., 512:].float(),
@@ -478,6 +513,12 @@ def _assert_fp8_bmm_mla_result(inputs, actual, expected, expected_cache):
     )
 
 
+def _assert_fp8_bmm_mla_result(inputs, actual, expected, expected_cache):
+    # Check the state first. A projection difference must not hide a state error.
+    _assert_fp8_bmm_mla_state(inputs, actual, expected, expected_cache)
+    _assert_fp8_bmm_mla_projection(actual, expected)
+
+
 def _assert_same_tensor_bytes(actual, expected):
     torch.testing.assert_close(
         actual.contiguous().view(-1).view(torch.uint8),
@@ -487,11 +528,83 @@ def _assert_same_tensor_bytes(actual, expected):
     )
 
 
-@pytest.mark.parametrize("T", [6, 12, 64, 65, 1856, 11072, 16385, 32768])
-def test_fused_fp8_bmm_mla_fp8_output(T):
+class _KernelLaunchRecorder:
+    """Record each launch of a Triton kernel, then do the launch."""
+
+    def __init__(self, kernel, route, launches):
+        self._kernel = kernel
+        self._route = route
+        self._launches = launches
+
+    def __getitem__(self, grid):
+        launcher = self._kernel[grid]
+
+        def launch(*args, **kwargs):
+            self._launches.append(self._route)
+            return launcher(*args, **kwargs)
+
+        return launch
+
+
+@pytest.fixture
+def fp8_bmm_routes(monkeypatch):
+    """The kernels that the FP8 wrapper launched, in the sequence of the calls."""
+    launches = []
+    for name, route in (
+        ("_fused_fp8_bmm_rope_cat_and_cache_mla_kernel", "generic"),
+        ("_fused_fp8_bmm_rope_prefill_kernel", "prefill"),
+    ):
+        kernel = getattr(fused_bmm_module, name)
+        monkeypatch.setattr(
+            fused_bmm_module,
+            name,
+            _KernelLaunchRecorder(kernel, route, launches),
+        )
+    return launches
+
+
+def _has_fp8_prefill_route():
+    return arch_info.get_arch() == "gfx950"
+
+
+def _fp8_route(T):
+    """The route of an eligible call with T tokens on this device."""
+    if _has_fp8_prefill_route() and 11072 <= T <= 32768:
+        return "prefill"
+    return "generic"
+
+
+def _skip_without_fp8_prefill_route(T=11072):
+    # Sizes from 11071 tokens are only there to test the gfx950 prefill route.
+    if T >= 11071 and not _has_fp8_prefill_route():
+        pytest.skip("The FP8 pure-prefill route is only on gfx950")
+
+
+@pytest.mark.parametrize(
+    "T",
+    [
+        6,
+        12,
+        64,
+        65,
+        1856,
+        11071,
+        11072,
+        16383,
+        16384,
+        16385,
+        24575,
+        24576,
+        32768,
+        32769,
+    ],
+)
+def test_fused_fp8_bmm_mla_fp8_output(T, fp8_bmm_routes):
+    _skip_without_fp8_prefill_route(T)
     inputs = _make_fp8_bmm_mla_inputs(T)
     expected, expected_cache = _reference_fp8_bmm_mla(inputs)
     actual = fused_fp8_bmm_rope_cat_and_cache_mla(**inputs)
+    assert fp8_bmm_routes == [_fp8_route(T)]
     _assert_fp8_bmm_mla_result(inputs, actual, expected, expected_cache)
 
 
@@ -533,13 +646,7 @@ def test_fused_fp8_bmm_mla_negative_slots():
 @pytest.mark.parametrize("padded", [False, True])
 def test_fused_fp8_bmm_mla_query_views(padded):
     inputs = _make_fp8_bmm_mla_inputs(1856)
-    width = 256 if padded else 192
-    queries = torch.empty((1856, 8, width), dtype=torch.bfloat16, device="cuda")
-    queries[..., :192].copy_(inputs["q_nope"].transpose(0, 1))
-    inputs["q_nope"] = queries[..., :192].transpose(0, 1)
-    if padded:
-        queries[..., 192:].copy_(inputs["q_pe"])
-        inputs["q_pe"] = queries[..., 192:]
+    queries = _use_query_view(inputs, 256 if padded else 192)
     before = queries.clone()
     expected, expected_cache = _reference_fp8_bmm_mla(inputs)
     actual = fused_fp8_bmm_rope_cat_and_cache_mla(**inputs)
@@ -547,9 +654,84 @@ def test_fused_fp8_bmm_mla_query_views(padded):
     _assert_same_tensor_bytes(queries, before)
 
 
-def test_fused_fp8_bmm_mla_shape_alternation_preserves_inputs_and_outputs():
+@pytest.mark.parametrize(
+    "variant, route",
+    [
+        ("neox", "prefill"),
+        ("full-frequencies", "prefill"),
+        ("negative-slots", "prefill"),
+        ("no-k-scale", "prefill"),
+        ("query-view", "prefill"),
+        ("query-view-padded", "prefill"),
+        ("decode", "generic"),
+        ("bf16-output", "generic"),
+        ("unsupported-query-stride", "generic"),
+        ("explicit-config", "generic"),
+    ],
+)
+def test_fused_fp8_bmm_mla_prefill_route_variants(variant, route, fp8_bmm_routes):
+    _skip_without_fp8_prefill_route()
+    T = 11073
+    inputs = _make_fp8_bmm_mla_inputs(
+        T,
+        q_out_dtype=torch.bfloat16 if variant == "bf16-output" else "fp8",
+        num_decode=3 if variant == "decode" else 0,
+        is_neox=variant == "neox",
+        reuse_freqs=variant != "full-frequencies",
+    )
+    if variant == "negative-slots":
+        inputs["slot_mapping"][0] = -1
+        inputs["slot_mapping"][-1] = -1
+    if variant == "no-k-scale":
+        inputs["k_scale"] = None
+    if variant == "explicit-config":
+        # Give the wrapper the config that it loads for the generic route.
+        inputs["config"], _ = fused_bmm_module._get_fp8_config(T, 512, 192)
+    queries = None
+    widths = {
+        "query-view": 192,
+        "query-view-padded": 256,
+        "unsupported-query-stride": 320,
+    }
+    if variant in widths:
+        queries = _use_query_view(inputs, widths[variant])
+        before = queries.clone()
+    expected, expected_cache = _reference_fp8_bmm_mla(inputs)
+    actual = fused_fp8_bmm_rope_cat_and_cache_mla(**inputs)
+    assert fp8_bmm_routes == [route]
+    _assert_fp8_bmm_mla_result(inputs, actual, expected, expected_cache)
+    if queries is not None:
+        _assert_same_tensor_bytes(queries, before)
+
+
+@pytest.mark.parametrize("T", [11072, 16385, 32768])
+def test_fused_fp8_bmm_mla_prefill_route_equals_generic_route(T, fp8_bmm_routes):
+    _skip_without_fp8_prefill_route()
+    inputs = _make_fp8_bmm_mla_inputs(T)
+    # The same data with a query stride that only the generic route accepts.
+    generic_inputs = dict(inputs)
+    generic_inputs["kv_cache"] = inputs["kv_cache"].clone()
+    _use_query_view(generic_inputs, 320)
+
+    actual = fused_fp8_bmm_rope_cat_and_cache_mla(**inputs)
+    generic = fused_fp8_bmm_rope_cat_and_cache_mla(**generic_inputs)
+    assert fp8_bmm_routes == ["prefill", "generic"]
+    for result, reference in zip(actual, generic):
+        assert result.shape == reference.shape
+        assert result.dtype == reference.dtype
+        _assert_same_tensor_bytes(result, reference)
+    _assert_same_tensor_bytes(inputs["kv_cache"], generic_inputs["kv_cache"])
+
+
+def test_fused_fp8_bmm_mla_shape_alternation_preserves_inputs_and_outputs(
+    fp8_bmm_routes,
+):
+    sizes = (64, 65, 1856, 64)
+    if _has_fp8_prefill_route():
+        # Go from the generic route to the prefill route and back.
+        sizes = (64, 11073, 65, 24577, 1856, 64)
     retained = []
-    for seed, T in enumerate((64, 65, 1856, 64)):
+    for seed, T in enumerate(sizes):
         inputs = _make_fp8_bmm_mla_inputs(T, seed=seed)
         before = {
             name: value.clone()
@@ -565,10 +747,12 @@ def test_fused_fp8_bmm_mla_shape_alternation_preserves_inputs_and_outputs():
             for result, saved in zip(previous, snapshot):
                 _assert_same_tensor_bytes(result, saved)
         retained.append((actual, tuple(result.clone() for result in actual)))
+    assert fp8_bmm_routes == [_fp8_route(T) for T in sizes]
 
 
 @pytest.mark.parametrize("T", [1856, 32768])
 def test_fused_fp8_bmm_mla_graph_replay_reads_current_inputs(T):
+    _skip_without_fp8_prefill_route(T)
     inputs = _make_fp8_bmm_mla_inputs(T)
     fused_fp8_bmm_rope_cat_and_cache_mla(**inputs)
     torch.cuda.synchronize()
