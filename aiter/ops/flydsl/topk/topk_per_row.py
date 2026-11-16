@@ -587,6 +587,8 @@ def flydsl_top_k_per_row_decode(
     *,
     row_starts: torch.Tensor | None = None,
     plane_width: int | None = None,
+    arch: str | None = None,
+    finite_only: bool = False,
 ) -> None:
     """Write per-row TopK indices using each request's effective context length.
 
@@ -597,6 +599,11 @@ def flydsl_top_k_per_row_decode(
     Warming up on the capture stream only compiles the kernels outside the capture.
     Eager compact launches keep their candidate buffer at the largest batch seen on
     the stream, so a memory profile that runs the largest batch counts it.
+    `arch` is the GPU this kernel is built for. A caller that cannot probe the device
+    passes it. Omitted, it is the live GPU.
+    `finite_only` never selects a nonfinite column (NaN, +inf, or -inf): a row with
+    fewer than k finite values returns those in column order, then -1. Only the
+    one-workgroup kernel (`plane_width` up to 20000) has it.
 
     `row_starts` [rows] i32: row r's scores start at element row_starts[r]
     of `logits`' first row (a packed buffer viewed with stride0 0), the
@@ -619,6 +626,8 @@ def flydsl_top_k_per_row_decode(
         max_row_len,
         row_starts=row_starts,
         plane_width=plane_width,
+        arch=arch,
+        finite_only=finite_only,
     )
 
 
@@ -639,6 +648,8 @@ def _decode_with_backend(
     row_starts: torch.Tensor | None = None,
     plane_width: int | None = None,
     validated: bool = False,
+    arch: str | None = None,
+    finite_only: bool = False,
 ) -> None:
     """Run the decode on `backend`, which must be the gate's answer or None to ask it.
 
@@ -663,14 +674,26 @@ def _decode_with_backend(
 
     rows, width = logits.shape
     width = width if plane_width is None else plane_width
+    if finite_only and width > _ONE_WORKGROUP_MAX_ROW_WIDTH:
+        raise ValueError(
+            f"finite_only needs rows of at most {_ONE_WORKGROUP_MAX_ROW_WIDTH}"
+        )
     if rows == 0:
         return
     stream = torch.cuda.current_stream(logits.device)
 
+    if finite_only and backend == BACKEND_ADAPTIVE:
+        raise ValueError("finite_only does not run on the adaptive decode kernel")
     # Without a bound the gate can only answer single or default, and both run the
     # single-launch kernel below, so it is not asked. Below 1 is no bound, as in
-    # the gate.
-    if backend is None and max_row_len is not None and max_row_len >= 1:
+    # the gate. finite_only is served by the one-workgroup kernel alone, so the
+    # gate is not asked for it either.
+    if (
+        backend is None
+        and not finite_only
+        and max_row_len is not None
+        and max_row_len >= 1
+    ):
         # The tensor contract was enforced above, so only the shape is asked.
         backend = decode_backend_for_shape(
             logits,
@@ -707,7 +730,7 @@ def _decode_with_backend(
         return
 
     # The bare arch name: the selector keys its radix layout and LDS on it.
-    arch = get_gfx_runtime()
+    arch = arch or get_gfx_runtime()
     wave_size = get_warp_size(arch)
     packed = row_starts is not None
     full_rows = seq_lens is None
@@ -722,6 +745,7 @@ def _decode_with_backend(
             packed_rows=packed,
             full_rows=full_rows,
             exact_rows=full_rows and one_workgroup_rows_are_exact(width),
+            finite_only=finite_only,
         )
         run_topk_launcher(
             launcher,

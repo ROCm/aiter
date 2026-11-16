@@ -1556,6 +1556,9 @@ def _dispatch(
             topk,
             stable=tie == "low" or deterministic,
             max_row_len=max_row_len,
+            # Same arch the stream budget uses, passed in so this call
+            # does not probe a device.
+            arch=_device_arch(input.device.index),
         )
     elif backend == "stream":
         topk_per_row_radix_stream(

@@ -19,11 +19,20 @@ from aiter.ops import topk as T
 from aiter.ops import topk_decode_gate as G
 from aiter.ops import topk_select as S
 from aiter.ops.asm.asm_utils import load_hip
+from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, wave_size_of
 from aiter.ops.flydsl.kernels.topk import (
     topk_per_row_decode_adaptive as adaptive_kernel,
 )
-from aiter.ops.flydsl.kernels.topk.topk_launch import _launcher_on
+from aiter.ops.flydsl.kernels.topk.topk_launch import (
+    _launcher_on,
+    run_topk_launcher,
+)
+from aiter.ops.flydsl.kernels.topk.topk_per_row_decode_persistent import (
+    _COMPACT_LIMIT,
+    _COMPACT_MIN_ROW,
+    build_topk_per_row_decode_one_workgroup_module,
+)
 from aiter.ops.flydsl.topk import topk_per_row as flydsl_decode_host
 from aiter.ops.flydsl.topk.topk_per_row import _FLYDSL_TOPK_ONE_BLOCK_ARCHES
 from aiter.ops.topk import _FLYDSL_TOPK_DECODE_GATES
@@ -2911,11 +2920,144 @@ def test_prefill_sampled_routing():
     print("[prefill_sampled_routing] PASS: by stride0 / rows / k / stable / env")
 
 
+def _f32_from_bits(pattern: int) -> float:
+    signed = pattern if pattern < 2**31 else pattern - 2**32
+    return torch.tensor([signed], dtype=torch.int32).view(torch.float32).item()
+
+
+def test_flydsl_decode_finite_only_drops_nonfinite():
+    """finite_only keeps torch.isfinite columns. NaN and +inf stay unselected.
+
+    The short row has one finite score, so the pack path writes that column
+    and pads with -1, including when k covers the whole row. The ranked row
+    has at least k finite scores, so the radix returns those and not the
+    nonfinites. finite_only=False still ranks NaN above +inf.
+    """
+    if get_gfx() not in _FLYDSL_TOPK_DECODE_GATES:
+        print("[finite-only] FlyDSL decode not served here; skipping")
+        return
+    torch.set_default_device("cuda:0")
+    pos_inf = float("inf")
+    neg_inf = float("-inf")
+    qnan = _f32_from_bits(0x7FC00000)
+    nnan = _f32_from_bits(0xFFC00000)
+    snan = _f32_from_bits(0x7F800001)
+
+    def run(row, k, finite_only):
+        logits = torch.tensor([row], dtype=torch.float32, device="cuda")
+        indices = torch.empty(1, k, dtype=torch.int32, device="cuda")
+        flydsl_decode_host.flydsl_top_k_per_row_decode(
+            logits,
+            1,
+            None,
+            indices,
+            1,
+            logits.stride(0),
+            1,
+            k,
+            finite_only=finite_only,
+        )
+        torch.cuda.synchronize()
+        return indices[0].tolist()
+
+    short = [pos_inf, qnan, 1.0, neg_inf, nnan, snan, neg_inf, neg_inf]
+    got = run(short, 2, True)
+    if got != [2, -1]:
+        raise AssertionError(f"short finite_only k=2: {got}")
+    got = run(short, 8, True)
+    if got != [2, -1, -1, -1, -1, -1, -1, -1]:
+        raise AssertionError(f"short finite_only k=8: {got}")
+
+    ranked = [pos_inf, 4.0, qnan, 3.0, nnan, 2.0, neg_inf, 1.0]
+    got = run(ranked, 2, True)
+    if got != [1, 3]:
+        raise AssertionError(f"ranked finite_only k=2: {got}")
+    got = run(ranked, 4, True)
+    if got != [1, 3, 5, 7]:
+        raise AssertionError(f"ranked finite_only k=4: {got}")
+
+    # k=1 so the winner is the single selected column. At k=2 both specials
+    # are above the cutoff and the scatter writes them in column order.
+    got = run([pos_inf, qnan, 1.0, neg_inf], 1, False)
+    if got != [1]:
+        raise AssertionError(f"default order, quiet NaN above +inf: {got}")
+    got = run([nnan, pos_inf, 1.0, neg_inf], 1, False)
+    if got != [0]:
+        raise AssertionError(f"default order, negative NaN above +inf: {got}")
+    got = run([pos_inf, qnan, 1.0, neg_inf], 1, True)
+    if got != [2]:
+        raise AssertionError(f"finite_only k=1 kept a nonfinite: {got}")
+    print("[finite-only] PASS")
+
+
+def test_flydsl_decode_compact_long_row():
+    """The compact build keeps a short candidate list and falls back past it.
+
+    Each row is one vector past ``_COMPACT_MIN_ROW``. The tied row and the
+    ranked row stay within ``_COMPACT_LIMIT`` candidates, so they take the
+    compact passes. The overflow row has one more, so the same build finishes
+    on the full row. k is 512, the indexer block budget. Higher scores sit at
+    lower columns, which is the column order the stable scatter writes.
+    """
+    if get_gfx_runtime() not in _FLYDSL_TOPK_DECODE_GATES:
+        print("[compact] FlyDSL decode not served here; skipping")
+        return
+    torch.set_default_device("cuda:0")
+    k = 512
+    width = _COMPACT_MIN_ROW + 4
+    tie_n = 600
+    overflow_n = _COMPACT_LIMIT + 1
+    if width % 4 or not k < tie_n <= _COMPACT_LIMIT < overflow_n < width:
+        raise AssertionError(
+            f"compact bounds do not separate the rows: width={width} k={k} "
+            f"tie={tie_n} limit={_COMPACT_LIMIT} overflow={overflow_n}"
+        )
+    rows = 3
+    logits = torch.zeros(rows, width, dtype=torch.float32, device="cuda")
+    logits[0, :tie_n] = 1.0
+    base = width - k
+    logits[1, base:] = torch.arange(k, 0, -1, device="cuda", dtype=torch.float32)
+    logits[2, :overflow_n] = 1.0
+    row_ends = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    indices = torch.full((rows, k), -2, dtype=torch.int32, device="cuda")
+    arch = get_gfx_runtime()
+    launcher = build_topk_per_row_decode_one_workgroup_module(
+        k,
+        wave_size=get_warp_size(arch),
+        write_values=False,
+        compact=True,
+    )
+    run_topk_launcher(
+        launcher,
+        logits,
+        row_ends,
+        row_ends,
+        indices,
+        logits,
+        width,
+        1,
+        int(logits.stride(0)),
+        rows,
+        torch.cuda.current_stream(),
+    )
+    torch.cuda.synchronize()
+    expected = torch.tensor(
+        [list(range(k)), list(range(base, width)), list(range(k))],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    if not torch.equal(indices, expected):
+        raise AssertionError(f"compact indices:\n{indices.tolist()}")
+    print("[compact] PASS")
+
+
 _REGRESSIONS = {
     "mb-workspace-reuse": test_mb_workspace_reuse,
     "flydsl-decode-split-reuse": test_flydsl_decode_split_reuse,
     "flydsl-decode-gates": test_flydsl_decode_gates,
     "flydsl-one-block-long-rows": test_flydsl_one_block_long_rows,
+    "finite-only": test_flydsl_decode_finite_only_drops_nonfinite,
+    "compact": test_flydsl_decode_compact_long_row,
     "sampled-routing": test_prefill_sampled_routing,
     "sampled-layout": test_sampled_layout_contract,
     "sampled-nan": test_sampled_nan_order,
