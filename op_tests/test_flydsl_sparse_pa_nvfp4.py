@@ -439,21 +439,25 @@ def padding_rows():
         c0 = dict(c, seq_lens=torch.tensor([0, 700], dtype=torch.int32, device="cuda"))
         out = decode_call(c0, s)
         bad += int(out[0].abs().max().item() != 0 or not torch.equal(out[1], ref[1]))
-    c1 = dict(
-        c,
-        row_kv=torch.tensor([0, int(c["row_kv"][1])], dtype=torch.int32, device="cuda"),
-    )
-    # Every tile: the auto tile for 2 rows is tq 1, where a padding row never shares a
-    # workgroup with its neighbour.
-    ref = run_torch(c)
-    for tq, rnd in PREFILL_TQ:
-        out = prefill_call(c1, tq=tq, rounds=rnd)
-        same = torch.equal(out[1], prefill_call(c, tq=tq, rounds=rnd)[1])
-        bad += int(
-            out[0].abs().max().item() != 0
-            or not same
-            or rel_l2(out[1], ref[1]) > REL_L2_TOL
-        )
+    # Every tile, and every position in it: the auto tile for 2 rows is tq 1, where a
+    # padding row never shares a workgroup with its neighbour. The other rows must be
+    # bit-equal to the unpadded call of the same tile and match the oracle.
+    for seq_lens, pads in (([500, 700], (0,)), ([500, 700, 300, 900], (0, 1, 3))):
+        c = make_case(seq_lens, [1] * len(seq_lens), 1, 16, seed=5)
+        ref = run_torch(c)
+        for pad in pads:
+            row_kv = c["row_kv"].clone()
+            row_kv[pad] = 0
+            cp = dict(c, row_kv=row_kv)
+            keep = [r for r in range(len(seq_lens)) if r != pad]
+            for tq, rnd in PREFILL_TQ:
+                out = prefill_call(cp, tq=tq, rounds=rnd)
+                same = torch.equal(out[keep], prefill_call(c, tq=tq, rounds=rnd)[keep])
+                bad += int(
+                    out[pad].abs().max().item() != 0
+                    or not same
+                    or rel_l2(out[keep], ref[keep]) > REL_L2_TOL
+                )
     if bad:
         print("padding rows: FAILED")
     return bad
@@ -722,6 +726,30 @@ def refusals():
         ("empty block_table", {"bt": c["bt"][:0]}, "at least one request row"),
         ("tq 3", {"tq": 3}, "tq must be"),
         ("rounds without tq", {"rounds": 1}, "rounds needs tq"),
+        (
+            "topk_idx with 8 slots",
+            {"topk": torch.full((1, 2, 8), -1, dtype=torch.int32, device="cuda")},
+            "16 slots",
+        ),
+        ("int64 row_req_id", {"row_req": c["row_req"].long()}, "1-D int32"),
+        ("int64 row_kv_lens", {"row_kv": c["row_kv"].long()}, "1-D int32"),
+        ("2-D row_kv_lens", {"row_kv": c["row_kv"][None]}, "1-D int32"),
+        (
+            "strided row_req_id",
+            {"row_req": torch.stack([c["row_req"], c["row_req"]], -1)[..., 0]},
+            "1-D int32",
+        ),
+        (
+            "row_req_id shorter than rows",
+            {"row_req": c["row_req"][:1]},
+            "a value per row",
+        ),
+        (
+            "row_kv_lens shorter than rows",
+            {"row_kv": c["row_kv"][:1]},
+            "a value per row",
+        ),
+        ("row_kv_lens on cpu", {"row_kv": c["row_kv"].cpu()}, "q's device"),
     ]
 
     def decode(a):
@@ -733,9 +761,9 @@ def refusals():
 
     def prefill(a):
         sparse_pa_nvfp4_prefill(
-            a["q"], a["cache"], a["topk"], a["bt"], c["row_req"], c["row_kv"],
-            a["sm_scale"], a.get("out"), a["k_scale"], a["v_scale"], tq=a.get("tq"),
-            rounds=a.get("rounds"),
+            a["q"], a["cache"], a["topk"], a["bt"], a.get("row_req", c["row_req"]),
+            a.get("row_kv", c["row_kv"]), a["sm_scale"], a.get("out"), a["k_scale"],
+            a["v_scale"], tq=a.get("tq"), rounds=a.get("rounds"),
         )  # fmt: skip
 
     for kind, call, cases in (
