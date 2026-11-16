@@ -975,6 +975,55 @@ def bench_topk_gating_pad_rows(num_experts, num_tokens, topk, score_func, dtype)
     return {"gfx": get_gfx(), "fused us": us, "pad bad": bad}
 
 
+def bench_topk_gating_unaligned(num_experts, num_tokens, topk, score_func, dtype):
+    """Logits one element past an aligned base (odd row stride), aligned logits
+    with an odd row stride, and a bias one element past an aligned base must
+    route bit for bit as the contiguous aligned launch: these take the
+    scalar-load path where the aligned launch takes vector loads."""
+    torch.random.manual_seed(0)
+    gating_output = _make_gating(num_experts, num_tokens, dtype)
+    bias = torch.randn(num_experts, dtype=torch.float32, device="cuda") * 0.1
+    need_renorm = score_func != "softmax"
+
+    def run(logits, b):
+        weights = torch.empty((num_tokens, topk), dtype=torch.float32, device="cuda")
+        ids = torch.empty((num_tokens, topk), dtype=torch.int32, device="cuda")
+        aiter.topk_gating(
+            weights,
+            ids,
+            logits,
+            b,
+            need_renorm=need_renorm,
+            routed_scaling_factor=2.5,
+            score_func=score_func,
+        )
+        return weights, ids
+
+    wide = torch.empty((num_tokens, num_experts + 1), dtype=dtype, device="cuda").fill_(
+        float("nan")
+    )
+    offset_logits = wide[:, 1:]
+    offset_logits.copy_(gating_output)
+    wide2 = torch.empty_like(wide).fill_(float("nan"))
+    strided_logits = wide2[:, :num_experts]
+    strided_logits.copy_(gating_output)
+    bias_buf = torch.empty(num_experts + 1, dtype=torch.float32, device="cuda")
+    offset_bias = bias_buf[1:]
+    offset_bias.copy_(bias)
+
+    w_ref, ids_ref = run(gating_output, bias)
+    bad = 0
+    for logits, b in (
+        (offset_logits, bias),
+        (strided_logits, bias),
+        (gating_output, offset_bias),
+    ):
+        w, ids = run(logits, b)
+        bad += not torch.equal(ids, ids_ref)
+        bad += not torch.equal(w.view(torch.int32), w_ref.view(torch.int32))
+    return {"gfx": get_gfx(), "unaligned bad": bad}
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("topk_gating unsupported on %s; skipping", get_gfx())
@@ -1025,12 +1074,13 @@ def main():
             "eplb",
             "shared",
             "pad-rows",
+            "unaligned",
         ],
         help="Comma-separated list of sections to run: "
-        "sigmoid,biased-sigmoid,softplus,softmax,nan,ties,eplb,shared,pad-rows "
-        "(default: all except biased-sigmoid). "
+        "sigmoid,biased-sigmoid,softplus,softmax,nan,ties,eplb,shared,pad-rows,"
+        "unaligned (default: all except biased-sigmoid). "
         "Sigmoid, softplus and softmax are named after score functions; nan, ties, "
-        "eplb and pad-rows "
+        "eplb, pad-rows and unaligned "
         "each sweep all score functions. --score-func is a deprecated alias.",
     )
     args = parser.parse_args()
@@ -1280,6 +1330,30 @@ def main():
             print(f"\nERROR: {len(errors)} pad-rows config(s) failed!")
             print(errors.to_string(index=False))
             failed_sections.append("pad-rows")
+
+    # -- unaligned logits / bias: scalar loads route as the vector loads -----
+    if "unaligned" in sections:
+        unaligned_configs = list(
+            itertools.product(
+                num_experts_list,
+                [t for t in num_tokens_list if t <= 1024],
+                topk_list,
+                ["sqrtsoftplus", "sigmoid", "softmax"],
+                dtype_list,
+            )
+        )
+        df = pd.DataFrame(
+            [bench_topk_gating_unaligned(*cfg) for cfg in unaligned_configs]
+        )
+        aiter.logger.info(
+            "topk_gating unaligned summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+        errors = df[df["unaligned bad"] > 0]
+        if len(errors) > 0:
+            print(f"\nERROR: {len(errors)} unaligned config(s) failed!")
+            print(errors.to_string(index=False))
+            failed_sections.append("unaligned")
 
     if failed_sections:
         print(

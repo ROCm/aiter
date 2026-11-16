@@ -100,6 +100,14 @@ inline bool topk_gating_prefer_optn_e128()
     return v;
 }
 
+// The single-wave kernel and its dispatch are measured on gfx1250 only; other
+// wave32 targets (gfx1201, ...) keep the multiwave / reg kernels.
+inline bool topk_gating_vwave_arch()
+{
+    static const bool v = (get_gpu_arch() == "gfx1250");
+    return v;
+}
+
 // E=512 prefill_n is measured on gfx942 and gfx950. Other archs (gfx1201,
 // gfx1250, ...) stay on the smem fallback until benchmarked.
 // Cached: get_gpu_arch() re-queries the driver on every call.
@@ -322,7 +330,13 @@ __device__ __forceinline__ void sort_network_desc(float* vals, float* orig, int*
 
 #undef _CAS_DESC
 
-#undef _CAS_DESC
+// The reg kernel's select-form sort is measured on gfx950 and gfx1250 only;
+// other targets keep the branch form.
+#if defined(__gfx950__) || defined(__gfx1250__)
+constexpr bool REG_SORT_SELECT = true;
+#else
+constexpr bool REG_SORT_SELECT = false;
+#endif
 
 // ---------------------------------------------------------------------------
 // Register-only kernel (for expert counts divisible by WARP_SIZE)
@@ -397,7 +411,7 @@ __global__ void topk_gating_kernel_opt(
         return;
 
     // Step 2: sort thread-local partition descending
-    sort_network_desc<EPT, true>(vals, orig, idxs);
+    sort_network_desc<EPT, REG_SORT_SELECT>(vals, orig, idxs);
 
     // Step 3: warp-level k-way merge
     // Winning lane = expert_idx & (WARP_SIZE-1) -> readlane broadcasts
@@ -1753,7 +1767,7 @@ void topk_gating_launch(const topk_gating_params& p)
                        reinterpret_cast<uintptr_t>(p.bias) % (wpt * sizeof(bias_scalar_t)) == 0;
             };
 #define _DISPATCH_WAVE32_VWAVE_KERNEL(NE, WPT)                              \
-        if(num_experts == NE && topk <= 8 && get_warp_size_func() == 32)    \
+        if(num_experts == NE && topk <= 8 && topk_gating_vwave_arch())      \
         {                                                                   \
             const bool vec = vwave_vec(WPT);                                \
             if(need_renorm)                                                 \
@@ -1787,10 +1801,11 @@ void topk_gating_launch(const topk_gating_params& p)
                 _DISPATCH_WAVE32_VWAVE_KERNEL(384, 2)
                 _DISPATCH_WAVE32_MULTIWAVE_KERNEL(384, 4)
             }
-            // E=256 topk > 8: WPT=8 (EPT=1) is a low-token decode win on gfx1250
-            // (measured ~4.1-6.0us @ T<=256 vs reg ~5.6-6.3us). Above T=256 the
-            // GPU saturates and reg is faster, so fall through.
-            if(num_tokens <= 256 && topk > 8)
+            // E=256 WPT=8 (EPT=1) is a low-token decode win on gfx1250 (measured
+            // ~4.1-6.0us @ T<=256 vs reg ~5.6-6.3us); there the single-wave kernel
+            // takes topk <= 8. Above T=256 the GPU saturates and reg is faster, so
+            // fall through.
+            if(num_tokens <= 256 && (topk > 8 || !topk_gating_vwave_arch()))
             {
                 _DISPATCH_WAVE32_MULTIWAVE_KERNEL(256, 8)
             }
