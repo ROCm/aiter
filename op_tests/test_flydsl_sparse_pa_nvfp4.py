@@ -967,6 +967,76 @@ def capture_prefill():
     return bad
 
 
+def capture_prefill_scales():
+    """Which scales a capture reads. The placeholder is allocated on EVERY call
+    (``host_scales``), also when both scales are passed, so a cold capture is refused
+    whatever the scales are. After an eager call every variant replays and matches the
+    oracle (scales of 1.0, the placeholder's value, output pre-filled with NaN); with the
+    default scales the replay reads the placeholder: set to 2.0 between two replays, the
+    output goes wrong, and it is right again once restored."""
+    bad = 0
+    dev = torch.cuda.current_device()
+    c = make_case(
+        [3000, 700, 130], [300, 700, 130], 1, 16, seed=9, k_scale=1.0, v_scale=1.0
+    )
+    ref = run_torch(c)
+    variants = {  # name -> the k_scale / v_scale the call is given
+        "k and v given": (c["k_scale"], c["v_scale"]),
+        "default k": (None, c["v_scale"]),
+        "default v": (c["k_scale"], None),
+        "default k and v": (None, None),
+    }
+
+    def call(ks, vs, out, tq, rnd):
+        sparse_pa_nvfp4_prefill(
+            c["q"], c["cache"], c["topk"], c["bt"], c["row_req"], c["row_kv"],
+            SM_SCALE, out, ks, vs, tq=tq, rounds=rnd,
+        )  # fmt: skip
+
+    for tq, rnd in PREFILL_TQ:
+        for vname, (ks, vs) in variants.items():
+            tag = f"prefill capture, {vname}, tq={tq} r={rnd}"
+            call(ks, vs, torch.empty_like(c["q"]), tq, rnd)  # the compile happens here
+            _unit_scale.cache_clear()
+            try:
+                with torch.cuda.graph(torch.cuda.CUDAGraph()):
+                    call(ks, vs, torch.empty_like(c["q"]), tq, rnd)
+                err = None
+            except ValueError as e:
+                err = str(e)
+            if err is None or "scale placeholder" not in err:
+                print(f"{tag}: a cold capture must be refused, got {err!r}")
+                bad += 1
+            if _unit_scale.cache_info().currsize:
+                print(f"{tag}: a refused call left an allocation")
+                bad += 1
+            call(ks, vs, torch.empty_like(c["q"]), tq, rnd)  # warm up: allocates it
+            out = torch.empty_like(c["q"])
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                call(ks, vs, out, tq, rnd)
+            for i in range(3):
+                out.fill_(float("nan"))  # a launch that did not run leaves NaN
+                g.replay()
+                torch.cuda.synchronize()
+                bad += int(not check(f"{tag}, replay {i}", out, ref)[0])
+            if vname == "default k and v":
+                unit = _unit_scale(dev)
+                unit.fill_(2.0)
+                out.fill_(float("nan"))
+                g.replay()
+                torch.cuda.synchronize()
+                unit.fill_(1.0)
+                if rel_l2(out, ref) < 1.0:
+                    print(f"{tag}: the replay did not read the placeholder")
+                    bad += 1
+                out.fill_(float("nan"))
+                g.replay()
+                torch.cuda.synchronize()
+                bad += int(not check(f"{tag}, replay after restoring", out, ref)[0])
+    return bad
+
+
 def two_streams(n=64, rounds=3):
     """Split launches on two streams of one device. Each stream replays a graph of ``n``
     launches (back to back, so they overlap), unsynchronised, every launch with its own
@@ -1224,6 +1294,7 @@ def main(argv=None):
     failed += refusals()
     failed += capture_scratch()
     failed += capture_prefill()
+    failed += capture_prefill_scales()
     failed += two_streams()
     if args.perf:
         perf = [
