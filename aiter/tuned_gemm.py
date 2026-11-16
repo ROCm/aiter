@@ -110,25 +110,17 @@ def is_skinny_default_shape(
 
 
 def _row_kernel_fits_shape(config: dict, M: int, N: int, K: int, dtype, otype) -> bool:
-    """Whether an ASM or FlyDSL row's kernel can address this M x N x K.
+    """Whether a row's kernel can address this M x N x K.
 
     getPaddedM(gl=1) serves every M > 8192 with the M = 8192 row, so a row can
-    meet an M far larger than it was tuned at. These kernels give each operand
-    a buffer descriptor with a 32-bit byte size, so A, B and C must each stay
-    below 4 GiB; past it they return wrong values or fault. The ASM 256x256
-    kernels write fp32 output through one descriptor per 256-row tile.
+    meet an M far larger than it was tuned at. The FlyDSL kernel gives each
+    operand one buffer descriptor with 32-bit offsets, so A, B and C must each
+    stay below 4 GiB; beyond that it returns wrong values or faults.
     """
-    if config["libtype"] not in ("asm", "flydsl"):
+    if config["libtype"] != "flydsl":
         return True
     in_bytes, out_bytes = eval(dtype).itemsize, eval(otype).itemsize
-    out_rows = M
-    if (
-        config["libtype"] == "asm"
-        and out_bytes == 4
-        and "256x256" in str(config.get("kernelName"))
-    ):
-        out_rows = min(M, 256)
-    return max(M * K * in_bytes, N * K * in_bytes, out_rows * N * out_bytes) < 1 << 32
+    return max(M * K * in_bytes, N * K * in_bytes, M * N * out_bytes) < 1 << 32
 
 
 def get_GEMM_A16W16_tuned_config(

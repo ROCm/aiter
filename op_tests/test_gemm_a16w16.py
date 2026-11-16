@@ -543,23 +543,19 @@ def _tuned_rows_per_libtype(libtypes):
 
 
 def _padded_row_m_limit(r):
-    """First M at which an ASM or FlyDSL row's kernel can no longer address A or
-    C, or None."""
-    if r.libtype not in ("asm", "flydsl") or 2 * r.N * r.K >= 1 << 32:
+    """First M at which a FlyDSL row's kernel can no longer address A or C, or None."""
+    if r.libtype != "flydsl" or 2 * r.N * r.K >= 1 << 32:
         return None
     out_bytes = 4 if r.outdtype == str(dtypes.fp32) else 2
-    if r.libtype == "asm" and out_bytes == 4 and "256x256" in str(r.kernelName):
-        # fp32 output is written one 256-row tile at a time: only A grows with M.
-        return -(-(1 << 32) // (2 * r.K))
     return -(-(1 << 32) // max(2 * r.K, out_bytes * r.N))
 
 
 def test_padded_row_kernel_limits():
     """An M = 8192 row is not used where its kernel cannot address the operands.
 
-    getPaddedM(gl=1) serves every M > 8192 with the M = 8192 row. ASM and
-    FlyDSL kernels return wrong values or fault once A or C reaches 4 GiB, so
-    the lookup must skip the row there; one M lower it must still use it.
+    getPaddedM(gl=1) serves every M > 8192 with the M = 8192 row. The FlyDSL
+    kernel returns wrong values or faults once A or C reaches 4 GiB, so the
+    lookup must skip the row there; one M lower it must still use it.
     """
     df = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE)
     df = df[
@@ -600,7 +596,9 @@ def test_padded_row_kernel_limits():
                 {"case": f"{r.libtype} row at M={m} N={r.N} K={r.K}", "libtype": lib}
             )
     if not rows:
-        aiter.logger.warning("no M = 8192 row with a kernel size limit on this GPU")
+        aiter.logger.warning(
+            "no M = 8192 FlyDSL row with a kernel size limit on this GPU"
+        )
     return rows
 
 
