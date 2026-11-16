@@ -32,6 +32,7 @@ from aiter.fused_moe_registry import (
     BoundFusedMoeImpl,
     FusedMoeImplResolutionError,
     FusedMoeRequest,
+    make_fused_moe_impl_kernel_name,
     resolve_fused_moe_impl,
 )
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
@@ -59,7 +60,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
-from aiter.ops.moe_limits import normalize_swiglu_limit
+from aiter.ops.moe_limits import RUNTIME_SILU_LIMIT_QUANT_TYPES, normalize_swiglu_limit
 from aiter.ops.moe_mxfp4_aux import (
     _MissingMxfp4MoeAuxInstances,
     _mxfp4_moe_sort_internal_is_supported,
@@ -3646,7 +3647,16 @@ def _flydsl_v2_stage2_wrapper(
     _s2_fp8_inter = epilog == "reduce" and _flydsl_stage2_fp8_enabled()
     if _s2_fp8_inter:
         _s2_fp8_inter = sorted_weights is not None and topk_weights is not None
-    _defer_w = _s2_fp8_inter
+    # AITER_MXFP4_INTERMEDIATE: the same deferred-weight route rows, values in MXFP4.
+    _s2_fp4_inter = (
+        not _s2_fp8_inter
+        and epilog == "reduce"
+        and _mxfp4_intermediate_enabled()
+        and sorted_weights is not None
+        and topk_weights is not None
+        and model_dim_runtime % 32 == 0
+    )
+    _defer_w = _s2_fp8_inter or _s2_fp4_inter
     _fp8_scale_blk = None
     _fp8_pitch_align = None
     _s2_fp4_scatter = (
@@ -3702,6 +3712,15 @@ def _flydsl_v2_stage2_wrapper(
                 torch.uint8,
                 out.device,
             )
+        elif _s2_fp4_inter:
+            from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp4out_row_bytes
+
+            target = _stage2_scratch(
+                "target",
+                (token_num * topk, fp4out_row_bytes(model_dim_runtime)),
+                torch.uint8,
+                out.device,
+            )
         else:
             target = _stage2_scratch(
                 "target", (token_num, topk, model_dim_runtime), out.dtype, out.device
@@ -3738,7 +3757,11 @@ def _flydsl_v2_stage2_wrapper(
         persist=cfg["persist"],
         g2_bf16_lds=cfg["bf16_lds"],
         g2_spart=cfg["spart"],
-        out_dtype="fp8" if _s2_fp8_inter else ("fp4" if _s2_fp4_scatter else "bf16"),
+        out_dtype=(
+            "fp8"
+            if _s2_fp8_inter
+            else ("fp4" if (_s2_fp4_scatter or _s2_fp4_inter) else "bf16")
+        ),
         bias=bias2,
         is_ep=expert_mask is not None,
         out_scale=target_scale,
@@ -3787,6 +3810,7 @@ def _flydsl_v2_stage2_wrapper(
             topk_weights=topk_weights if _defer_w else None,
             fp8_scale_blk=_fp8_scale_blk,
             fp8_pitch_align=_fp8_pitch_align,
+            is_fp4=_s2_fp4_inter,
         )
     return out
 
@@ -4418,7 +4442,7 @@ def get_2stage_cfgs(
 ):
     gate_mode = GateMode(gate_mode)
     cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
-    if q_type == QuantType.per_1x128 and activation == ActivationType.Silu:
+    if q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES and activation == ActivationType.Silu:
         swiglu_limit = normalize_swiglu_limit(swiglu_limit)
     flydsl_can_take_over = _can_reroute_mxfp4_to_flydsl(
         model_dim=model_dim,
@@ -4654,7 +4678,7 @@ def get_2stage_cfgs(
     limit_tag = (
         swiglu_limit_tag(swiglu_limit)
         if config_file is None
-        and q_type == QuantType.per_1x128
+        and q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
         and activation == ActivationType.Silu
         else ""
     )
@@ -4934,6 +4958,41 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
+    # Runtime SiLU clamping is supported only by the non-split CK stage-1 epilogue,
+    # so it must reject ASM 1-stage and FlyDSL whole-graph rows before they resolve.
+    clamp_silu_limit = (
+        bool(swiglu_limit)
+        and q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
+        and activation == ActivationType.Silu
+    )
+    if clamp_silu_limit and q_type != QuantType.per_1x128:
+        if q_dtype_w != dtypes.fp8 or q_dtype_a != dtypes.fp8:
+            raise NotImplementedError(
+                f"fused_moe cannot apply swiglu_limit={swiglu_limit!r} for {q_type} "
+                f"SiLU with weight dtype {q_dtype_w} / activation dtype {q_dtype_a}; "
+                "the runtime-limit CK instances are FP8 only."
+            )
+        if inter_dim % 128 != 0:
+            raise NotImplementedError(
+                f"fused_moe cannot apply swiglu_limit={swiglu_limit!r} for {q_type} "
+                f"SiLU at inter_dim={inter_dim}; the runtime-limit CK stage1 needs a "
+                "multiple of 128."
+            )
+    if clamp_silu_limit and cfg is not None:
+        cfg_ksplit = int(cfg.get("ksplit", 0) or 0)
+        if (
+            cfg.get("run_1stage", False)
+            or "ck2stages" not in str(cfg.get("kernelName1", ""))
+            or cfg_ksplit > 1
+            or "_silu_" not in str(cfg.get("kernelName1", ""))
+        ):
+            logger.warning(
+                f"[fused_moe] discarding tuned config {cfg.get('kernelName1')!r} "
+                f"for {keys}: it cannot apply swiglu_limit={swiglu_limit!r}; "
+                "using default heuristics"
+            )
+            cfg = None
+
     bypass_tuned_config = int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0"))
     kernel_name1 = kn1 if cfg is not None else ""
     weights_shuffled = (
@@ -4947,6 +5006,13 @@ def get_2stage_cfgs(
         logger.warning(f"[fused_moe] {error}; using default heuristics.")
         cfg = None
         full_impl = None
+    # Only the clamped SiLU takes num_local_tokens on a FlyDSL row; the other
+    # rows keep the default heuristics for it.
+    clamped_silu = (
+        gfx == "gfx942"
+        and _swiglu_limit_is_active(swiglu_limit)
+        and activation == ActivationType.Silu
+    )
     if full_impl is not None and kernel_name1.startswith("impl__flydsl_"):
         unsupported = None
         if not weights_shuffled:
@@ -4961,7 +5027,7 @@ def get_2stage_cfgs(
             unsupported = "stage2_scatter"
         elif has_activation_scales:
             unsupported = "prequantized activations"
-        elif has_num_local_tokens:
+        elif has_num_local_tokens and not clamped_silu:
             unsupported = "num_local_tokens"
         elif hidden_pad or intermediate_pad:
             unsupported = "hidden/intermediate padding"
@@ -4976,6 +5042,36 @@ def get_2stage_cfgs(
                 f"[fused_moe] discarding FlyDSL whole-graph config for {keys}: "
                 f"unsupported {unsupported}; using default heuristics"
             )
+    # A clamped SiLU on gfx942 per-token FP8 weights with no FlyDSL row in use:
+    # the default heuristics take the 1-stage kernel, which cannot apply
+    # swiglu_limit, so run the gfx942 FlyDSL backend (it applies the clamp) at
+    # its default config for this token count. Tuned FlyDSL rows still win.
+    if (
+        full_impl is None
+        and (cfg is None or bypass_tuned_config or cfg.get("run_1stage", False))
+        and clamped_silu
+        and q_type == QuantType.per_Token
+        and q_dtype_w == dtypes.fp8
+        and use_g1u1
+        and weights_shuffled
+        and gate_mode is GateMode.SEPARATED
+        and input_dtype in (None, dtypes.bf16)
+        and not (
+            doweight_stage1
+            or has_stage1_bias
+            or has_stage2_bias
+            or has_activation_scales
+            or has_stage2_scatter
+            or hidden_pad
+            or intermediate_pad
+        )
+    ):
+        from aiter.ops.flydsl.fused_moe_gfx942 import default_config
+
+        flydsl_config = default_config(token)
+        kernel_name1 = make_fused_moe_impl_kernel_name("flydsl_gfx942", flydsl_config)
+        full_impl = resolve_fused_moe_impl(kernel_name1)
+        cfg = {"block_m": int(flydsl_config.split("_", 1)[0]), "ksplit": 0}
     if is_ep and full_impl is not None:
         cfg = None
         full_impl = None
@@ -5014,27 +5110,6 @@ def get_2stage_cfgs(
             f"[fused_moe] discarding 1-stage tuned config for unsupported "
             f"activation {activation}; using default heuristics"
         )
-
-    # Runtime SiLU clamping is supported only by the non-split CK stage-1 epilogue.
-    clamp_per_1x128 = (
-        bool(swiglu_limit)
-        and q_type == QuantType.per_1x128
-        and activation == ActivationType.Silu
-    )
-    if clamp_per_1x128 and cfg is not None:
-        cfg_ksplit = int(cfg.get("ksplit", 0) or 0)
-        if (
-            cfg.get("run_1stage", False)
-            or "ck2stages" not in str(cfg.get("kernelName1", ""))
-            or cfg_ksplit > 1
-            or "_silu_" not in str(cfg.get("kernelName1", ""))
-        ):
-            logger.warning(
-                f"[fused_moe] discarding tuned config {cfg.get('kernelName1')!r} "
-                f"for {keys}: it cannot apply swiglu_limit={swiglu_limit!r}; "
-                "using default heuristics"
-            )
-            cfg = None
 
     # The SwiGLU OAI FLAT asm kernels hard-code alpha=1.702 / limit=7.0, take
     # GGUU (separated) gate/up weights and have no per-expert bias input. The
@@ -5101,7 +5176,7 @@ def get_2stage_cfgs(
                 )
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
                 run_1stage = (
-                    not clamp_per_1x128
+                    not clamp_silu_limit
                     and token > 32
                     and inter_dim % 128 == 0
                     and aiter.fmoe_fp8_blockscale_g1u1_has_kernel(
@@ -5214,7 +5289,7 @@ def get_2stage_cfgs(
     ):
         kernelName2 = kernelName2.replace("_afp4_", "_afp8_", 1)
 
-    if clamp_per_1x128:
+    if clamp_silu_limit:
         # Deliberately override tuned, heuristic and AITER_KSPLIT selections.
         ksplit = 0
         run_1stage = False
@@ -6247,8 +6322,12 @@ def fused_moe_2stages(
         _mxfp4_a4w4_stage2_fw,
     ):
         extra_stage2_args["use_valid_token_count"] = num_local_tokens is not None
-    if uses_flydsl_v2_stage2 and not doweight_stage1 and _flydsl_stage2_fp8_enabled():
-        # FP8 route-output reduction applies the route weights after GEMM2.
+    if (
+        uses_flydsl_v2_stage2
+        and not doweight_stage1
+        and (_flydsl_stage2_fp8_enabled() or _mxfp4_intermediate_enabled())
+    ):
+        # FP8/FP4 route-output reduction applies the route weights after GEMM2.
         extra_stage2_args["topk_weights"] = topk_weights
     if stage2_func is _opus_a8w4.opus_a8w4_stage2_wrapper:
         extra_stage2_args["stage2_fp8_enabled"] = _opus_stage2_fp8_enabled()
@@ -6633,7 +6712,10 @@ def torch_moe_stage1(
     situ_linear_beta: float = 25.0,
 ):
     quant_type = quant_remap.get(quant_type, quant_type)
-    if quant_type == QuantType.per_1x128 and activation == ActivationType.Silu:
+    if (
+        quant_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
+        and activation == ActivationType.Silu
+    ):
         swiglu_limit = normalize_swiglu_limit(swiglu_limit)
     ctype = dtypes.fp32  # compute type
     B, _D = hidden_states.shape
@@ -6928,11 +7010,15 @@ def ck_moe_stage1(
         limit = normalize_swiglu_limit(swiglu_limit)
         if limit is not None:
             quant_type = quant_remap.get(quant_type, quant_type)
-            if quant_type != QuantType.per_1x128:
+            w1_dtype = getattr(w1, "dtype", None)
+            if quant_type not in RUNTIME_SILU_LIMIT_QUANT_TYPES or (
+                w1_dtype != dtypes.fp8
+            ):
                 raise NotImplementedError(
-                    f"CK MoE stage1 cannot apply swiglu_limit={swiglu_limit!r}; "
-                    "only FP8 per_1x128 has a clamped CK SiLU epilogue "
-                    "(clamp before SiLU)."
+                    f"CK MoE stage1 cannot apply swiglu_limit={swiglu_limit!r} for "
+                    f"{quant_type} with weight dtype {w1_dtype}; only FP8 "
+                    "per_1x128 / per_Token / per_Tensor have a clamped CK SiLU "
+                    "epilogue (clamp before SiLU)."
                 )
             if kernelName and ("Splitk" in kernelName or "_silu_" not in kernelName):
                 raise ValueError(
