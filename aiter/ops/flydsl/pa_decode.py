@@ -69,7 +69,7 @@ def _constant_scale(device: torch.device, value: float) -> torch.Tensor:
     return scale
 
 
-def fuses_quant_output(
+def _fuses_quant_output(
     tile_options: dict, *, cluster_merge: int, cluster_seqs: int
 ) -> bool:
     """Whether the gfx1250 tile quantizes the FP8 output in its epilogue.
@@ -475,8 +475,8 @@ def pa_decode(
     exp_sums: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size]
     max_logits: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size]
     temporary_output: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size, head_size]
-    quantized_output: torch.Tensor = None,  # optional FP8, same shape/strides as output
-    output_scale: torch.Tensor = None,  # optional FP32 [num_seqs * query_length, 1]
+    quantized_output: torch.Tensor = None,  # optional FP8, output's shape + quantized_pad_rows rows
+    output_scale: torch.Tensor = None,  # optional FP32 [num_seqs * query_length + quantized_pad_rows, 1]
     alibi_slopes: torch.Tensor = None,
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
@@ -513,7 +513,8 @@ def pa_decode(
     ``quantized_output`` and ``output_scale`` (gfx1250) add a per-token FP8
     output. They must be supplied together. It is OCP FP8 in the same logical
     layout as ``output`` with one contiguous FP32 descale per flattened query
-    token, shape ``[num_seqs * query_length, 1]``; dequantization is
+    token, shape ``[num_seqs * query_length, 1]``, each with
+    ``quantized_pad_rows`` extra rows (default 0); dequantization is
     ``quantized_output.float() * output_scale``. The tile kernel's epilogue
     quantizes the output when there is one KV head, the tile does not split
     its query rows over CTAs, and the plan writes either the one-partition
@@ -1215,7 +1216,7 @@ def pa_decode(
     run_tiles = -(-bound_tiles // cluster_merge) if cluster_runs else 0
     # Unfused plans write the BF16 output as usual and quantize it after with
     # the standalone per-token kernel, which is exactly the unfused path.
-    quant_after_output = quant_output and not fuses_quant_output(
+    quant_after_output = quant_output and not _fuses_quant_output(
         tile_options, cluster_merge=cluster_merge, cluster_seqs=cluster_seqs
     )
     if quant_after_output:

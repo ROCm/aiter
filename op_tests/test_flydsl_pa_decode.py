@@ -788,7 +788,7 @@ def _short_bound_pool(*, device):
 
 
 _COMMON_CASES = [
-    ("decode", {"block_size": 16, "max_partitions": 1, "quant": True}),
+    ("decode", {"block_size": 16, "max_partitions": 1, "quant": "fused"}),
     (
         "window",
         {
@@ -829,7 +829,7 @@ _COMMON_CASES = [
             "capture": True,
             "cluster": 8,
             "cluster_steps": True,
-            "quant": True,
+            "quant": "fused",
         },
     ),
     # Batches within one 16-CTA cluster per CU split each row into 16
@@ -844,7 +844,7 @@ _COMMON_CASES = [
             "capture": True,
             "cluster": 16,
             "cluster_steps": True,
-            "quant": True,
+            "quant": "fused",
         },
     ),
     # Two KV heads split each row's steps per head and keep their partials
@@ -915,7 +915,7 @@ _COMMON_CASES = [
             "window": 600,
             "max_partitions": 4,
             "cluster": 4,
-            "quant": True,
+            "quant": "fused",
         },
     ),
     (
@@ -927,7 +927,7 @@ _COMMON_CASES = [
             "lengths": (512,) * 3 + (0, 200),
             "max_partitions": 2,
             "cluster": 2,
-            "quant": True,
+            "quant": "fused",
         },
     ),
     (
@@ -953,7 +953,7 @@ _COMMON_CASES = [
             "cluster": 2,
             "cluster_seqs": 2,
             "cluster_steps": True,
-            "quant": True,
+            "quant": "fallback",
         },
     ),
 ]
@@ -1020,14 +1020,14 @@ _FP8_CASES = _COMMON_CASES + [
     ),
     (
         "default-cap",
-        {"group_size": 16, "block_size": 128, "max_partitions": None, "quant": True},
+        {"group_size": 16, "block_size": 128, "max_partitions": None, "quant": "fused"},
     ),
     # Four 16-row query tiles at D128 give each gfx1250 wave its own tile.
     # Varied token magnitudes make a misplaced per-token scale fail; rows past
     # one page run unmasked interior pages (two-token rows exceed FP8 P error).
     (
         "mtp4-g16-page128-direct",
-        {"query_length": 4, "group_size": 16, "block_size": 128, "quant": True},
+        {"query_length": 4, "group_size": 16, "block_size": 128, "quant": "fused"},
     ),
     (
         "mtp4-g16-page128-varied",
@@ -1071,7 +1071,7 @@ _FP8_CASES = _COMMON_CASES + [
             "group_size": 12,
             "block_size": 128,
             "max_partitions": 7,
-            "quant": True,
+            "quant": "fused",
         },
     ),
     ("mtp8-g8-page128", {"query_length": 8, "block_size": 128, "max_partitions": 7}),
@@ -1136,7 +1136,7 @@ _BF16_CASES = _COMMON_CASES + [
             "group_size": 16,
             "head_dim": 1024,
             "block_size": 128,
-            "quant": True,
+            "quant": "fallback",
         },
     ),
     # Plain BF16 V takes 64-token page16 steps: plan-derived tasks.
@@ -1176,7 +1176,7 @@ _BF16_CASES = _COMMON_CASES + [
     # one slot per sequence merges the long rows' tasks across replays.
     (
         "mtp4-g16-page128-direct",
-        {"query_length": 4, "group_size": 16, "block_size": 128, "quant": True},
+        {"query_length": 4, "group_size": 16, "block_size": 128, "quant": "fused"},
     ),
     (
         "mtp4-g16-page128-cluster",
@@ -1186,7 +1186,7 @@ _BF16_CASES = _COMMON_CASES + [
             "group_size": 16,
             "block_size": 128,
             "max_partitions": 7,
-            "quant": True,
+            "quant": "fallback",
         },
     ),
     (
@@ -1199,7 +1199,7 @@ _BF16_CASES = _COMMON_CASES + [
             "max_partitions": 4,
             "budget": 1,
             "capture": True,
-            "quant": True,
+            "quant": "fallback",
         },
     ),
     (
@@ -1580,6 +1580,7 @@ _INVALID_CASES = [
     ("vector16-k", ValueError, "key_cache shape must be"),
     ("vector16-v", ValueError, "transposed value_cache shape must be"),
     ("scale-only", ValueError, "must either both be provided or both be None"),
+    ("fp8-only", ValueError, "must either both be provided or both be None"),
     ("store-without-fp8", ValueError, "store_output=False requires quantized_output"),
     ("negative-pad-rows", ValueError, "quantized_pad_rows must be a nonnegative int"),
     ("bool-pad-rows", ValueError, "quantized_pad_rows must be a nonnegative int"),
@@ -1673,6 +1674,8 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
         value = torch.empty((1, 1, 4, 128, 16), dtype=query.dtype, device=query.device)
     elif invalid == "scale-only":
         options["output_scale"] = torch.ones(query.shape[0], 1, device=query.device)
+    elif invalid == "fp8-only":
+        options["quantized_output"] = torch.empty_like(query, dtype=dtypes.fp8)
     elif invalid in _QUANT_ARG_ERRORS:
         options.update(_QUANT_ARG_ERRORS[invalid])
 
@@ -1936,7 +1939,7 @@ def test_pa_decode_quant_empty_long_query(device, monkeypatch):
             "head_dim": 256,
             "block_size": 16,
             "lengths": (129, 0),
-            "quant": True,
+            "quant": "fused",
         },
         device,
         monkeypatch,
@@ -1983,7 +1986,7 @@ def _run_pa_decode_case(case, device, monkeypatch):
             "cluster_seqs": None,
             "cluster_steps": None,
             "cluster_runs": None,
-            "quant": False,
+            "quant": None,  # gfx1250 FP8 output path: "fused" or "fallback"
         },
         **case,
     )
@@ -2274,7 +2277,7 @@ def _run_pa_decode_case(case, device, monkeypatch):
     if case["kv_dtype"] != "mxfp4":
         _check_pipe_policy(pa, case, arch, compile_kwargs)
     if case["quant"] and arch == "gfx1250":
-        _check_quant_output(launch, query, output, compile_kwargs, case["capture"])
+        _check_quant_output(launch, query, output, compile_kwargs, case)
     elif case["quant"]:
         with pytest.raises(NotImplementedError, match="requires gfx1250"):
             launch(
@@ -2301,31 +2304,14 @@ def _run_pa_decode_case(case, device, monkeypatch):
     return case, launch, check, arguments, options, plan
 
 
-def _check_quant_output(launch, query, output, compile_kwargs, capture, pad=3):
+def _check_quant_output(launch, query, output, compile_kwargs, case, pad=3):
     """The FP8 output equals PA's output and the standalone per-token quant bit
     for bit, eagerly and in graph replays; poisoned outputs show every row is
-    written, padded rows included. With one KV head, the one-partition direct
-    output and cluster merges with ``cluster_seqs == 1`` quantize in the tile
-    kernel unless the tile splits its query rows; other plans fall back to the
-    standalone quant (``fuses_quant_output``).
+    written, padded rows included. ``case["quant"]`` pins the path: "fused"
+    quantizes in the tile epilogue, "fallback" runs the standalone quant after
+    the BF16 output, so a plan that silently stops fusing fails here.
     """
-    from aiter.ops.flydsl.pa_decode import fuses_quant_output
-
-    # The plain launch's compile arguments are pa_decode's tile options plus
-    # these; a new argument makes the traits call raise rather than drop it.
-    plain = dict(compile_kwargs[-1])
-    cluster = {k: plain.pop(k) for k in ("cluster_merge", "cluster_seqs")}
-    for key in (
-        "architecture",
-        "wide_kv_addressing",
-        "kv_buffer_u32",
-        "trans_k",
-        "mask_unowned_kv",
-        "cluster_steps",
-        "cluster_runs",
-    ):
-        del plain[key]
-    fused = fuses_quant_output(plain, **cluster)
+    fused = case["quant"] == "fused"
     rows = output.shape[0]
     fp8 = torch.empty(
         (rows + pad, *output.shape[1:]), dtype=dtypes.fp8, device=output.device
@@ -2361,7 +2347,7 @@ def _check_quant_output(launch, query, output, compile_kwargs, capture, pad=3):
         run(store_output)
         assert compile_kwargs[-1].get("quant_output", False) == fused
         check(store_output)
-    if capture:
+    if case["capture"]:
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):

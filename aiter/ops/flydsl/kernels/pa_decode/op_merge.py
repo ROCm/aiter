@@ -608,10 +608,11 @@ class Gfx1250OutputQuant:
 
     @flyc.jit
     def store_empty(self, token, tokens, scale, stride_row, stride_head):
-        """FP8 zeros and descale ``scale`` for ``tokens`` tokens from
-        ``token`` on: 0 for an empty sequence, as the separate quant gives,
-        and 1 for a padded token past the query's, so a consumer of the whole
-        padded height reads inert finite rows."""
+        """Zero values quantized with descale ``scale`` for ``tokens`` tokens
+        from ``token`` on. Descale 0 for an empty sequence gives 0xFE bytes, as
+        the separate quant does from 256 values per token up; descale 1 for a
+        padded token past the query's gives FP8 zeros, so a consumer of the
+        whole padded height reads inert finite rows."""
         t, scales, token = self.t, self.scales, fx.Int32(token)
         g, tid = t.query_group_size, fx.Int32(gpu.thread_id("x"))
         size = tokens * g * t.head_dim
