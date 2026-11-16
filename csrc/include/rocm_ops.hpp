@@ -718,6 +718,19 @@ namespace py = pybind11;
           py::arg("inp"),                                                            \
           py::arg("out"),                                                            \
           py::arg("kernel"));                                                        \
+    m.def("lamportArRmsInit", &aiter::lamportArRmsInit, py::arg("_fa"), py::arg("hidden")); \
+    m.def("lamportFusedArRms",                                                       \
+          &aiter::lamportFusedArRms,                                                 \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("res_inp"),                                                        \
+          py::arg("res_out"),                                                        \
+          py::arg("out"),                                                            \
+          py::arg("w"),                                                              \
+          py::arg("eps"),                                                            \
+          py::arg("gemma_norm") = false,                                             \
+          py::arg("kernel")     = 0,                                                 \
+          py::arg("block")      = 0);                                                \
     m.def("register_input_buffer",                                                   \
           &aiter::register_input_buffer,                                             \
           py::arg("_fa"),                                                            \

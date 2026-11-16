@@ -175,6 +175,17 @@ void initLamport(fptr_t _fa,
                  const std::vector<int64_t>& offsets);
 int64_t lamportKernel(fptr_t _fa, int64_t numel);
 void lamportAllReduce(fptr_t _fa, const aiter_tensor_t& inp, const aiter_tensor_t& out, int64_t kernel);
+void lamportArRmsInit(fptr_t _fa, int64_t hidden);
+void lamportFusedArRms(fptr_t _fa,
+                       const aiter_tensor_t& inp,
+                       const aiter_tensor_t& res_inp,
+                       const aiter_tensor_t& res_out,
+                       const aiter_tensor_t& out,
+                       const aiter_tensor_t& w,
+                       double eps,
+                       bool gemma_norm,
+                       int64_t kernel,
+                       int64_t block);
 void register_input_buffer(fptr_t _fa,
                            int64_t self_ptr,
                            const std::vector<int64_t>& ipc_handle_ptrs,

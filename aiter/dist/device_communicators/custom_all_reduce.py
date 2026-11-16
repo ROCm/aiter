@@ -1225,6 +1225,8 @@ class CustomAllreduce:
         self.disabled = True
         # Whether all_reduce may take the lamport kernels (_initLamport).
         self.lamport_enabled = False
+        # hidden sizes lamportArRmsInit has set up (lamportFusedArRms POC)
+        self._lamport_ar_rms_hiddens = set()
         self._register_for_capturing = False
         self._register_for_capturing_init = False
         self._register_for_capturing_requested = False
@@ -1944,6 +1946,47 @@ class CustomAllreduce:
             size >> 20,
             _DISABLE_LAMPORT_ENV,
         )
+
+    def lamportFusedArRms(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        w: torch.Tensor,
+        eps: float,
+        gemma_norm: bool = False,
+        kernel: int = 0,
+        block: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """POC, not in the fused_allreduce_rmsnorm dispatch yet: lamport
+        all-reduce + residual add + RMSNorm in one kernel on the inboxes of
+        _initLamport (gfx9 only). Returns (out, residual_out), bit for bit
+        those of the 1-stage fused kernel.
+
+        kernel 0 lets the C++ side pick, 1 flat (block = 16B packs per block,
+        0 the row), 2 wave split (block = groups of 64 positions per block),
+        both one-shot (at most 640KB); 3 two shot (chunk g of every row
+        reduced on rank g and broadcast, at most 128 rows, block = blocks per
+        row 1 / 2 / 4, 0 auto).
+        Every rank must make the same call. Needs no registered input; the
+        first call of each hidden size sets up its state, so it must not be
+        inside a graph capture (warm up first).
+        """
+        if not self.lamport_enabled:
+            raise RuntimeError("lamportFusedArRms needs the lamport path (_initLamport)")
+        hidden = w.numel()
+        if hidden not in self._lamport_ar_rms_hiddens:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"lamportFusedArRms: hidden {hidden} was not set up before capture"
+                )
+            ops.lamportArRmsInit(self._ptr, hidden)
+            self._lamport_ar_rms_hiddens.add(hidden)
+        out = torch.empty_like(inp)
+        res_out = torch.empty_like(inp)
+        ops.lamportFusedArRms(
+            self._ptr, inp, res_inp, res_out, out, w, eps, gemma_norm, kernel, block
+        )
+        return out, res_out
 
     @property
     def enable_register_for_capturing(self) -> bool:

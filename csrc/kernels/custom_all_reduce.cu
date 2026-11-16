@@ -135,6 +135,66 @@ void lamportAllReduce(fptr_t _fa, const aiter_tensor_t& inp, const aiter_tensor_
     }
 }
 
+// ---- Lamport fused all-reduce + RMSNorm POC ----
+
+void lamportArRmsInit(fptr_t _fa, int64_t hidden)
+{
+    reinterpret_cast<aiter::CustomAllreduce*>(_fa)->lamportArRmsInit((int)hidden);
+}
+
+// out = RMSNorm(all-reduce(inp) + res_inp) * w, res_out = all-reduce(inp) +
+// res_inp. kernel 0 picks the kernel and block itself, 1 flat (block = packs
+// per block, 0 the row), 2 wave split (block = groups of 64 positions per
+// block), both on the lamport one-shot inbox; 3 two shot (chunk g of every
+// row reduced on rank g and broadcast, its own inboxes, block = blocks per
+// row 1 / 2 / 4, 0 auto). inp needs no IPC registration.
+void lamportFusedArRms(fptr_t _fa,
+                       const aiter_tensor_t& inp,
+                       const aiter_tensor_t& res_inp,
+                       const aiter_tensor_t& res_out,
+                       const aiter_tensor_t& out,
+                       const aiter_tensor_t& w,
+                       double eps,
+                       bool gemma_norm,
+                       int64_t kernel,
+                       int64_t block)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    const int64_t hidden = w.numel();
+    for(const aiter_tensor_t* t : {&res_inp, &res_out, &out})
+        if(t->numel() != inp.numel() || t->dtype() != inp.dtype() || t->device_id != inp.device_id)
+            throw std::runtime_error(
+                "lamportFusedArRms: res_inp, res_out and out must match the input");
+    if(w.dtype() != inp.dtype() || hidden <= 0 || inp.numel() % hidden != 0)
+        throw std::runtime_error("lamportFusedArRms: w must be one row of the input's dtype");
+    for(const aiter_tensor_t* t : {&inp, &res_inp, &res_out, &out, &w})
+        if(!t->is_contiguous())
+            throw std::runtime_error("lamportFusedArRms: tensors must be contiguous");
+
+#define RUN_LAMPORT_AR_RMS(T)                                                \
+    fa->lamportFusedArRms<T>(stream,                                         \
+                             reinterpret_cast<const T*>(inp.data_ptr()),     \
+                             reinterpret_cast<const T*>(res_inp.data_ptr()), \
+                             reinterpret_cast<T*>(res_out.data_ptr()),       \
+                             reinterpret_cast<T*>(out.data_ptr()),           \
+                             reinterpret_cast<const T*>(w.data_ptr()),       \
+                             inp.numel() / hidden,                           \
+                             (int)hidden,                                    \
+                             (float)eps,                                     \
+                             gemma_norm,                                     \
+                             static_cast<aiter::LamportArRmsKernel>(kernel), \
+                             (int)block)
+    switch(inp.dtype())
+    {
+    case AITER_DTYPE_fp16: RUN_LAMPORT_AR_RMS(opus::fp16_t); break;
+    case AITER_DTYPE_bf16: RUN_LAMPORT_AR_RMS(opus::bf16_t); break;
+    default: throw std::runtime_error("lamportFusedArRms only supports float16 and bfloat16");
+    }
+#undef RUN_LAMPORT_AR_RMS
+}
+
 // ---- Internal dispatch helpers ----
 
 // Whether _all_reduce takes the fp8 quant kernel instead of allreduce<T>.

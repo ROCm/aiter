@@ -247,6 +247,30 @@ def lamportAllReduce(
 ) -> None: ...
 
 
+# Lamport fused all-reduce + residual + RMSNorm POC (gfx9, on the inbox of
+# initLamport). lamportArRmsInit once per hidden, outside graph capture;
+# kernel 0 auto, 1 flat (block = packs per block, 0 the row), 2 wave split
+# (block = groups of 64 positions per block), 3 two shot (at most 128 rows,
+# block = blocks per row 1 / 2 / 4, 0 auto).
+@compile_ops("module_custom_all_reduce", develop=True)
+def lamportArRmsInit(_fa: int, hidden: int) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def lamportFusedArRms(
+    _fa: int,
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    res_out: torch.Tensor,
+    out: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    gemma_norm: bool = False,
+    kernel: int = 0,
+    block: int = 0,
+) -> None: ...
+
+
 @compile_ops("module_custom_all_reduce", develop=True)
 def register_input_buffer(
     _fa: int, self_ptr: int, ipc_handle_ptrs: list[int], offsets: list[int]

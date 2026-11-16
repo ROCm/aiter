@@ -30,8 +30,10 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace aiter {
@@ -4315,12 +4317,28 @@ inline constexpr int64_t lamportTwoShotInboxBytes(int ngpus)
     return (int64_t)kLamportBuffers * ngpus * lamportTwoShotMaxPart(ngpus) * 16;
 }
 
+// Two-shot fused all-reduce + RMSNorm POC (lamportArRmsTwoShot): rows per
+// launch, and 16B positions per row slot (hidden <= 8192).
+constexpr int kLamportArRms2MaxRows      = 128;
+constexpr int kLamportArRms2SlotPacks    = 1024;
+constexpr int64_t kLamportArRms2BufPacks = (int64_t)kLamportArRms2MaxRows * kLamportArRms2SlotPacks;
+
+// One inbox of lamportArRmsTwoShot: [kLamportBuffers][kLamportArRms2MaxRows]
+// row slots of kLamportArRms2SlotPacks 16B, 6MB. A reduce row slot holds
+// ngpus source slots of kLamportArRms2SlotPacks / ngpus, a broadcast row slot
+// the row.
+inline constexpr int64_t lamportArRms2InboxBytes()
+{
+    return (int64_t)kLamportBuffers * kLamportArRms2BufPacks * 16;
+}
+
 // A rank's lamport IPC buffer: the one-shot inbox, then the two-shot
 // reduce-scatter inbox and all-gather inbox (TP2 / TP4 / TP8: 15.75 / 19.5 /
-// 27MB).
+// 27MB), then the reduce and broadcast inboxes of lamportArRmsTwoShot (12MB).
 inline constexpr int64_t lamportBufferBytes(int ngpus)
 {
-    return lamportInboxBytes(ngpus) + 2 * lamportTwoShotInboxBytes(ngpus);
+    return lamportInboxBytes(ngpus) + 2 * lamportTwoShotInboxBytes(ngpus) +
+           2 * lamportArRms2InboxBytes();
 }
 
 struct __align__(16) LamportPeers
@@ -4600,8 +4618,14 @@ struct LamportState
     LamportPeers two_shot_peers{};        // every rank's rs inbox, its ag inbox follows
     uint32_t* d_one_shot_round = nullptr; // [kLamportMaxBlocks], rank-local
     uint32_t* d_two_shot_round = nullptr; // [lamportTwoShotMaxBlocks(world_size)], rank-local
-    int rank                   = 0;
-    int world_size             = 0;
+    // lamportArRmsTwoShot (POC): every rank's reduce inbox, its broadcast
+    // inbox follows; per row a round counter and, per buffer, the packs a row
+    // put there (what the re-arm clears), both rank-local
+    LamportPeers ar_rms2_peers{};
+    uint32_t* d_ar_rms2_round   = nullptr; // [kLamportArRms2MaxRows]
+    uint32_t* d_ar_rms2_written = nullptr; // [kLamportArRms2MaxRows][kLamportBuffers]
+    int rank                    = 0;
+    int world_size              = 0;
 
     ~LamportState()
     {
@@ -4609,6 +4633,10 @@ struct LamportState
             (void)hipFree(d_one_shot_round);
         if(d_two_shot_round)
             (void)hipFree(d_two_shot_round);
+        if(d_ar_rms2_round)
+            (void)hipFree(d_ar_rms2_round);
+        if(d_ar_rms2_written)
+            (void)hipFree(d_ar_rms2_written);
     }
 
     // largest message of one launch, in bytes
@@ -4683,6 +4711,956 @@ struct LamportState
     }
 };
 
+// ===========================================================================
+// Lamport one-shot all-reduce + residual add + RMSNorm (POC, 2-byte dtypes, wave64)
+// ===========================================================================
+// Not wired into fused_allreduce_rmsnorm: lamportFusedArRms runs the kernel and
+// block shape it is given, so each can be timed against the existing routes
+// (test_lamport_fused_ar_rms.py) and the dispatch written from the numbers.
+//
+// The all-reduce is the lamport one-shot above, on the same inbox and round
+// counters (LamportState::one_shot_peers / d_one_shot_round). A counter covers
+// kLamportWaveSize positions, one block of lamportAllReduceWaveSplit, and the
+// fused kernels key it the same way, so all-reduce and fused calls interleave
+// on one inbox: every launched group of positions re-arms all of them (the
+// fused grid covers whole rows, a row is whole groups).
+//
+// The epilogue follows allreduce_fusion_kernel_1stage step by step, so out and
+// residual_out match it bit for bit:
+//   acc  = rank-order fp32 sum, rounded to T and back, + residual (fp32)
+//   residual_out = acc rounded; sumsq over the fp32 acc
+//   row sumsq: a warpReduce partial per 32 packs, then a butterfly over the
+//   row's partials padded with zeros to a power of two
+//   out  = acc * rsqrt(sumsq / hidden + eps) * w   (w + 1 with gemma_norm)
+//
+// A row's sum of squares:
+//   row    the row is one block, its partials meet in LDS.
+//   split  the row is several blocks. Each 32-pack partial goes to a rank-local
+//          uncached slot with the inbox's sentinel protocol (0xffffffff = not
+//          there yet, a real 0xffffffff is sent as 0x7fffffff, both NaN), and
+//          the blocks of the row poll and fold them. Partials have their own
+//          round counters, one per kLamportWaveSize positions, advanced by
+//          split calls only: all-reduce calls advance the inbox counters of
+//          only part of a row. The blocks of a row then agree on the partial
+//          round as long as hidden is fixed (they always run together), hence
+//          one LamportArRmsState per hidden (lamportArRmsInit).
+//
+// Kernels (LamportArRmsKernel):
+//   flat        a thread owns one pack: pushes it to every peer, polls every
+//               slot of its own inbox (as the gfx1250 kernel of PR 7499).
+//               block = packs per block, 0 for the row.
+//   wave split  as lamportAllReduceWaveSplit: per kLamportWaveSize positions
+//               ngpus waves, wave w pushes to and polls rank (rank + w) %
+//               ngpus only; after one __syncthreads every wave of the group
+//               runs the residual step on a share of the elements, wave 0
+//               then the rest of the epilogue while the others re-arm.
+//               block = groups of kLamportWaveSize positions per block
+//               (ngpus * groups <= 16).
+//   two shot    lamportArRmsTwoShot: chunk g of every row reduced on rank g
+//               and broadcast from there. Its own inboxes
+//               (LamportState::ar_rms2_peers), so no one-shot cap; at most
+//               kLamportArRms2MaxRows rows. block = blocks per row (1 / 2 /
+//               4), 0 the fewest with at most 512 threads.
+// ===========================================================================
+constexpr int kLamportRmsLanes       = 32; // packs per partial (WARP_SIZE of the 1-stage reduction)
+constexpr int kLamportRmsMaxPartials = kLamportMaxPacks / kLamportRmsLanes;
+constexpr int kLamportRmsMaxRowPacks = 1024; // a row fits one block: hidden <= 8192
+
+enum class LamportArRmsKernel : int
+{
+    automatic  = 0,
+    flat       = 1, // lamportArRmsFlat
+    wave_split = 2, // lamportArRmsWaveSplit
+    two_shot   = 3, // lamportArRmsTwoShot
+};
+static_assert(kLamportArRms2SlotPacks == kLamportRmsMaxRowPacks, "a row slot holds the longest row");
+
+// Publish a 32-pack partial in this round's slot and re-arm last round's. The
+// blocks that read last round's slot finished with the previous launch.
+DINLINE void lamportRmsPublish(
+    uint32_t* partials, uint32_t round, uint32_t rearm, int partial_id, float part)
+{
+    uint32_t bits = __builtin_bit_cast(uint32_t, part);
+    bits          = bits == 0xffffffffu ? 0x7fffffffu : bits;
+    __builtin_nontemporal_store(bits, partials + round * kLamportRmsMaxPartials + partial_id);
+    __builtin_nontemporal_store(0xffffffffu, partials + rearm * kLamportRmsMaxPartials + partial_id);
+}
+
+// s_sleep before the split mode polls the row's partials (units of 64
+// clocks, ~0.5us). The blocks of a row publish at about the same time and a
+// poll sent right away mostly reaches memory before the others' partials, so
+// it takes a second ~1.4us round; waiting first saves that. gfx942 sweep:
+// 16 beat 0 by ~0.4us on TP8, 32 was no better.
+constexpr int kLamportRmsPollSleep = 16;
+
+DINLINE float lamportRmsPollPartial(const uint32_t* slot_ptr)
+{
+    uint32_t bits;
+    do
+    {
+        // without the memory clobber the load is hoisted out of the loop
+        asm volatile("" ::: "memory");
+        bits = __builtin_nontemporal_load(slot_ptr);
+    } while(bits == 0xffffffffu);
+    return __builtin_bit_cast(float, bits);
+}
+
+// Butterfly width over a row's partials: the next power of two, as
+// ar_fusion_epilogue_block_reduce pads its warps.
+DINLINE int lamportRmsWidth(int row_partials)
+{
+    int width = 1;
+    while(width < row_partials)
+        width <<= 1;
+    return width;
+}
+
+// Row sum of squares: lane l holds partial l % width of the row (zero past
+// it), folded by the butterfly of ar_fusion_epilogue_block_reduce. Every
+// width-lane segment folds the same values the same way, so every lane gets
+// the bits lane 0 of the 1-stage kernel gets.
+DINLINE float lamportRmsFold(float v, int width)
+{
+    return warpReduceRuntime<AddFunctor, float>(v, width);
+}
+
+// The 1-stage residual step on a rank-order sum: acc becomes the fp32
+// residual_out, res_out its rounding; returns the pack's sum of squares.
+template <typename T, typename P, typename A>
+DINLINE float lamportRmsResidual(A& acc, const P& res, P& res_out)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    float square_sum        = 0.f;
+#pragma unroll
+    for(int j = 0; j < pack_size; ++j)
+    {
+        acc[j]     = upcast_s(downcast_s<T>(acc[j])) + upcast_s(res[j]);
+        res_out[j] = downcast_s<T>(acc[j]);
+    }
+    // The fma chain the 1-stage kernel's `acc = 0; acc += v * v` compiles to
+    // with ROCm 7.0 on gfx942 and gfx950: v_mul for element 1, v_fmac for
+    // element 0 onto it, then elements 2.. in order. HIP contracts with
+    // -ffp-contract=fast, so the order is the backend's choice: it folds the
+    // first fmul of fadd(fmul, fmul) into an fma. Spelled out here: left to
+    // itself the compiler squares this code with v_pk_mul_f32 and adds apart,
+    // and either other order rounds differently, which now and then moves an
+    // output by one bf16 ulp.
+    square_sum = acc[1] * acc[1];
+    square_sum = __builtin_fmaf(acc[0], acc[0], square_sum);
+#pragma unroll
+    for(int j = 2; j < pack_size; ++j)
+        square_sum = __builtin_fmaf(acc[j], acc[j], square_sum);
+    return square_sum;
+}
+
+// lamportRmsResidual, storing residual_out.
+template <typename T, typename P, typename A>
+DINLINE float lamportRmsAddResidual(A& acc, const P& res, P* residual_out_ptr)
+{
+    P res_out;
+    const float square_sum = lamportRmsResidual<T>(acc, res, res_out);
+    *residual_out_ptr      = res_out;
+    return square_sum;
+}
+
+template <typename T, typename P, typename A>
+DINLINE P lamportRmsNorm(const A& acc, const P& w, float rms, bool gemma_norm)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    P out;
+#pragma unroll
+    for(int j = 0; j < pack_size; ++j)
+    {
+        float wj = upcast_s(w[j]);
+        if(gemma_norm)
+            wj += 1.0f;
+        out[j] = downcast_s<T>(acc[j] * rms * wj);
+    }
+    return out;
+}
+
+/*
+ * Flat: thread t owns pack t. ROW: the block is the row (blockDim = hidden / 8
+ * <= BLOCK); else blocks of BLOCK packs, the row split over hidden / 8 / BLOCK
+ * of them.
+ */
+template <typename T, int ngpus, int BLOCK, bool ROW>
+__global__ void __launch_bounds__(BLOCK, 1) lamportArRmsFlat(
+    const T* __restrict__ input,
+    const T* __restrict__ residual_inp,
+    T* __restrict__ residual_out,
+    T* __restrict__ output,
+    const T* __restrict__ weight,
+    LamportPeers peers,
+    uint32_t* __restrict__ inbox_round,   // [kLamportMaxBlocks], the one-shot all-reduce's
+    uint32_t* __restrict__ partials,      // [kLamportBuffers][kLamportRmsMaxPartials], split only
+    uint32_t* __restrict__ partial_round, // [kLamportMaxBlocks], split only
+    int rank,
+    int hidden,
+    float eps,
+    bool gemma_norm)
+{
+    static_assert(sizeof(T) == 2, "sentinel 0xffff is only defined for 2-byte dtypes");
+    static_assert(BLOCK % kLamportWaveSize == 0, "a round counter covers a whole wave");
+    constexpr int pack_size        = 16 / sizeof(T);
+    constexpr int64_t buffer_packs = (int64_t)ngpus * kLamportMaxPacks;
+    using P        = typename opus::vector_t<T, pack_size>;
+    using A        = typename opus::vector_t<opus::fp32_t, pack_size>;
+    using ui32x4_t = __attribute__((__vector_size__(4 * sizeof(uint32_t)))) uint32_t;
+    union pack
+    {
+        P data;
+        ui32x4_t i;
+    };
+
+    __shared__ float s_rms;
+    const int row_packs   = hidden / pack_size;
+    const int block_packs = ROW ? row_packs : BLOCK;
+    // the grid covers whole rows, so every thread owns a pack
+    const int pack_id = blockIdx.x * block_packs + threadIdx.x;
+    const int row     = pack_id / row_packs;
+    const int col     = pack_id - row * row_packs;
+    // a wave is one group of positions, so the counters are scalar loads
+    const int group      = __builtin_amdgcn_readfirstlane(pack_id / kLamportWaveSize);
+    const uint32_t round = inbox_round[group];
+    const uint32_t rearm = (round + 2) % kLamportBuffers;
+
+    ui32x4_t* self_inbox = reinterpret_cast<ui32x4_t*>(peers.ptrs[rank]);
+
+    pack local_pack;
+    local_pack.data = *(reinterpret_cast<const P*>(input) + pack_id);
+#pragma unroll
+    for(int j = 0; j < 4; ++j)
+        local_pack.i[j] = lamportCanonicalize(local_pack.i[j]);
+#pragma unroll
+    for(int i = 1; i < ngpus; ++i)
+    {
+        ui32x4_t* peer_inbox = reinterpret_cast<ui32x4_t*>(peers.ptrs[(rank + i) % ngpus]);
+        __builtin_nontemporal_store(
+            local_pack.i, peer_inbox + round * buffer_packs + rank * kLamportMaxPacks + pack_id);
+    }
+
+    // local operands of the epilogue, loaded before the wait
+    const P res = *(reinterpret_cast<const P*>(residual_inp) + pack_id);
+    const P w   = *(reinterpret_cast<const P*>(weight) + col);
+
+    // slot[rank] is never written and stays the sentinel; it is loaded anyway
+    // and masked out, a branch would make every load wait for the previous one
+    const ui32x4_t* inbox = self_inbox + round * buffer_packs + pack_id;
+    pack scratch[ngpus];
+    uint32_t wait_mask;
+    do
+    {
+        asm volatile("" ::: "memory");
+#pragma unroll
+        for(int g = 0; g < ngpus; ++g)
+            scratch[g].i = __builtin_nontemporal_load(inbox + g * kLamportMaxPacks);
+        // issue every load before any mask math
+        __builtin_amdgcn_sched_barrier(0);
+        wait_mask = 0;
+#pragma unroll
+        for(int g = 0; g < ngpus; ++g)
+        {
+            uint32_t slot_mask = 0;
+#pragma unroll
+            for(int j = 0; j < 4; ++j)
+                slot_mask |= lamportSentinelMask(scratch[g].i[j]);
+            wait_mask |= g == rank ? 0u : slot_mask;
+        }
+    } while(wait_mask != 0);
+
+    A acc;
+#pragma unroll
+    for(int g = 0; g < ngpus; ++g)
+    {
+        const P rank_data = g == rank ? local_pack.data : scratch[g].data;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            acc[j] = g == 0 ? upcast_s(rank_data[j]) : acc[j] + upcast_s(rank_data[j]);
+    }
+    float square_sum =
+        lamportRmsAddResidual<T>(acc, res, reinterpret_cast<P*>(residual_out) + pack_id);
+
+    if constexpr(ROW)
+    {
+        square_sum = ar_fusion_epilogue_block_reduce<AddFunctor, float, kLamportRmsLanes>(
+            square_sum, row_packs);
+        if(threadIdx.x == 0)
+            s_rms = rsqrtf(square_sum / hidden + eps);
+    }
+    else
+    {
+        // wave 0's group is in the row, so its partial round is the row's
+        const uint32_t p_round = partial_round[group];
+        const uint32_t p_rearm = (p_round + 2) % kLamportBuffers;
+        const float part = warpReduce<AddFunctor, float, kLamportRmsLanes>(square_sum);
+        if(threadIdx.x % kLamportRmsLanes == 0)
+            lamportRmsPublish(partials, p_round, p_rearm, pack_id / kLamportRmsLanes, part);
+        if(threadIdx.x < kLamportRmsLanes)
+        {
+            const int row_partials = row_packs / kLamportRmsLanes;
+            float v                = 0.f;
+            if((int)threadIdx.x < row_partials)
+                v = lamportRmsPollPartial(partials + p_round * kLamportRmsMaxPartials +
+                                          row * row_partials + threadIdx.x);
+            // only thread 0's sum is used
+            v = lamportRmsFold(v, lamportRmsWidth(row_partials));
+            if(threadIdx.x == 0)
+                s_rms = rsqrtf(v / hidden + eps);
+        }
+        if(threadIdx.x % kLamportWaveSize == 0)
+            partial_round[group] = (p_round + 1) % kLamportBuffers;
+    }
+    __syncthreads();
+    *(reinterpret_cast<P*>(output) + pack_id) = lamportRmsNorm<T>(acc, w, s_rms, gemma_norm);
+
+    // re-arm last round's buffer, every peer's slot
+    const ui32x4_t sentinel{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+#pragma unroll
+    for(int i = 1; i < ngpus; ++i)
+        __builtin_nontemporal_store(sentinel,
+                                    self_inbox + rearm * buffer_packs +
+                                        (rank + i) % ngpus * kLamportMaxPacks + pack_id);
+
+    if(threadIdx.x % kLamportWaveSize == 0)
+        inbox_round[group] = (round + 1) % kLamportBuffers;
+}
+
+/*
+ * Wave split: GROUPS groups of kLamportWaveSize positions per block, ngpus
+ * waves per group. Wave w of a group pushes the group's packs to rank peer =
+ * (rank + w) % ngpus and polls slot[peer] of its own inbox; wave 0 keeps this
+ * rank's packs and loads the weight. After one __syncthreads all ngpus waves
+ * of the group run the residual step, pack_size / ngpus elements a lane
+ * (rank-order sum, rounding, + residual, residual_out), into s_acc; after a
+ * second one wave 0 takes a pack a lane for the sum of squares and the norm,
+ * the other waves re-arm their slot. Spreading the residual step matters: a
+ * lone wave issues a dependent VALU op every ~6ns on gfx942, and the 8-element
+ * step on wave 0 alone took ~1us (s_memrealtime stamps). The row is the block
+ * when hidden / 8 == GROUPS * kLamportWaveSize (partials in LDS, one more
+ * __syncthreads), else split.
+ */
+template <typename T, int ngpus, int GROUPS>
+__global__ void __launch_bounds__(GROUPS* ngpus* kLamportWaveSize, 1) lamportArRmsWaveSplit(
+    const T* __restrict__ input,
+    const T* __restrict__ residual_inp,
+    T* __restrict__ residual_out,
+    T* __restrict__ output,
+    const T* __restrict__ weight,
+    LamportPeers peers,
+    uint32_t* __restrict__ inbox_round,   // [kLamportMaxBlocks], the one-shot all-reduce's
+    uint32_t* __restrict__ partials,      // [kLamportBuffers][kLamportRmsMaxPartials], split only
+    uint32_t* __restrict__ partial_round, // [kLamportMaxBlocks], split only
+    int rank,
+    int hidden,
+    float eps,
+    bool gemma_norm)
+{
+    static_assert(sizeof(T) == 2, "sentinel 0xffff is only defined for 2-byte dtypes");
+    static_assert(GROUPS * ngpus <= 16, "at most 1024 threads");
+    constexpr int pack_size        = 16 / sizeof(T);
+    constexpr int64_t buffer_packs = (int64_t)ngpus * kLamportMaxPacks;
+    constexpr int wave_partials    = kLamportWaveSize / kLamportRmsLanes;
+    using P        = typename opus::vector_t<T, pack_size>;
+    using A        = typename opus::vector_t<opus::fp32_t, pack_size>;
+    using ui32x4_t = __attribute__((__vector_size__(4 * sizeof(uint32_t)))) uint32_t;
+    union pack
+    {
+        P data;
+        ui32x4_t i;
+    };
+
+    // per lane of a group's ngpus waves: elems_per_lane elements of a pack,
+    // the pack's ngpus lanes adjacent
+    constexpr int elems_per_lane = pack_size / ngpus;
+    __shared__ P s_data[GROUPS][ngpus][kLamportWaveSize]; // by source rank
+    __shared__ float s_part[GROUPS * wave_partials];      // row only
+    __shared__ A s_acc[GROUPS][kLamportWaveSize];         // fp32 residual_out of each pack
+
+    // wave-uniform, so the branches below are scalar and the pointers SGPRs
+    const int wave_id   = __builtin_amdgcn_readfirstlane(threadIdx.x / kLamportWaveSize);
+    const int group_id  = wave_id / ngpus; // in the block
+    const int wave_peer = wave_id % ngpus;
+    const int lane_id   = threadIdx.x % kLamportWaveSize;
+    const int peer      = (rank + wave_peer) % ngpus;
+    const int group     = blockIdx.x * GROUPS + group_id;
+    const int pack_id   = group * kLamportWaveSize + lane_id;
+    const int row_packs = hidden / pack_size;
+    const bool is_row   = row_packs == GROUPS * kLamportWaveSize; // block-uniform
+    const uint32_t round = inbox_round[group];
+    const uint32_t rearm = (round + 2) % kLamportBuffers;
+    // split mode's partial round, read up front (wave-uniform, a scalar load)
+    const uint32_t p_round = partial_round[group];
+
+    ui32x4_t* self_inbox = reinterpret_cast<ui32x4_t*>(peers.ptrs[rank]);
+    ui32x4_t* peer_inbox = reinterpret_cast<ui32x4_t*>(peers.ptrs[peer]);
+
+    // this lane's elements of the epilogue: pack elem_pack of the group,
+    // elements [elem_first, elem_first + elems_per_lane)
+    const int elem_lane  = wave_peer * kLamportWaveSize + lane_id;
+    const int elem_pack  = elem_lane / ngpus;
+    const int elem_first = elem_lane % ngpus * elems_per_lane;
+    const int64_t elem_off =
+        ((int64_t)group * kLamportWaveSize + elem_pack) * pack_size + elem_first;
+    T res_elems[elems_per_lane];
+#pragma unroll
+    for(int e = 0; e < elems_per_lane; ++e)
+        res_elems[e] = residual_inp[elem_off + e];
+
+    // every wave loads the same packs, the repeats mostly hit the cache
+    pack pack_val;
+    pack_val.data = *(reinterpret_cast<const P*>(input) + pack_id);
+#pragma unroll
+    for(int j = 0; j < 4; ++j)
+        pack_val.i[j] = lamportCanonicalize(pack_val.i[j]);
+
+    P w{};
+    if(wave_peer != 0)
+    {
+        __builtin_nontemporal_store(
+            pack_val.i, peer_inbox + round * buffer_packs + rank * kLamportMaxPacks + pack_id);
+        pack_val.i =
+            lamportPollSlot(self_inbox + round * buffer_packs + peer * kLamportMaxPacks + pack_id);
+    }
+    else
+    {
+        w = *(reinterpret_cast<const P*>(weight) + pack_id % row_packs);
+    }
+    s_data[group_id][peer][lane_id] = pack_val.data;
+    __syncthreads();
+
+    // The residual step on all ngpus waves, elems_per_lane elements a lane
+    // (a lone wave runs a dependent VALU op every ~6ns on gfx942, so the
+    // 8-element version on wave 0 alone took ~1us): rank-order sum, rounded
+    // to T and back, + residual; residual_out is its rounding, the fp32 value
+    // goes to s_acc for the sum of squares.
+    {
+        const T* rank_elems = reinterpret_cast<const T*>(&s_data[group_id][0][elem_pack]) + elem_first;
+        T res_out_elems[elems_per_lane];
+#pragma unroll
+        for(int e = 0; e < elems_per_lane; ++e)
+        {
+            float sum = 0.f;
+#pragma unroll
+            for(int g = 0; g < ngpus; ++g)
+            {
+                const float x = upcast_s(rank_elems[g * kLamportWaveSize * pack_size + e]);
+                sum           = g == 0 ? x : sum + x;
+            }
+            const float r    = upcast_s(downcast_s<T>(sum)) + upcast_s(res_elems[e]);
+            res_out_elems[e] = downcast_s<T>(r);
+            reinterpret_cast<float*>(&s_acc[group_id][elem_pack])[elem_first + e] = r;
+        }
+#pragma unroll
+        for(int e = 0; e < elems_per_lane; ++e)
+            residual_out[elem_off + e] = res_out_elems[e];
+    }
+    __syncthreads();
+
+    A acc;
+    float part = 0.f;
+    if(wave_peer != 0)
+    {
+        // re-arm slot[peer] of last round's buffer
+        const ui32x4_t sentinel{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+        __builtin_nontemporal_store(
+            sentinel, self_inbox + rearm * buffer_packs + peer * kLamportMaxPacks + pack_id);
+    }
+    else
+    {
+        acc = s_acc[group_id][lane_id];
+        // the 1-stage kernel's fma order, see lamportRmsResidual
+        float square_sum = acc[1] * acc[1];
+        square_sum       = __builtin_fmaf(acc[0], acc[0], square_sum);
+#pragma unroll
+        for(int j = 2; j < pack_size; ++j)
+            square_sum = __builtin_fmaf(acc[j], acc[j], square_sum);
+        part = warpReduce<AddFunctor, float, kLamportRmsLanes>(square_sum);
+        if(is_row && lane_id % kLamportRmsLanes == 0)
+            s_part[group_id * wave_partials + lane_id / kLamportRmsLanes] = part;
+    }
+    if(is_row)
+        __syncthreads();
+    if(wave_peer != 0)
+        return;
+
+    const int row_partials = row_packs / kLamportRmsLanes;
+    const int width        = lamportRmsWidth(row_partials);
+    const int part_lane    = lane_id & (width - 1);
+    float v                = 0.f;
+    if(is_row)
+    {
+        if(part_lane < row_partials)
+            v = s_part[part_lane];
+    }
+    else
+    {
+        const uint32_t p_rearm = (p_round + 2) % kLamportBuffers;
+        if(lane_id % kLamportRmsLanes == 0)
+            lamportRmsPublish(partials, p_round, p_rearm, pack_id / kLamportRmsLanes, part);
+        const int row = pack_id / row_packs;
+        __builtin_amdgcn_s_sleep(kLamportRmsPollSleep);
+        if(part_lane < row_partials)
+            v = lamportRmsPollPartial(partials + p_round * kLamportRmsMaxPartials +
+                                      row * row_partials + part_lane);
+        if(lane_id == 0)
+            partial_round[group] = (p_round + 1) % kLamportBuffers;
+    }
+    v = lamportRmsFold(v, width);
+    const float rms = rsqrtf(v / hidden + eps);
+    *(reinterpret_cast<P*>(output) + pack_id) = lamportRmsNorm<T>(acc, w, rms, gemma_norm);
+
+    if(lane_id == 0)
+        inbox_round[group] = (round + 1) % kLamportBuffers;
+}
+
+// peers.ptrs[g] for a per-lane g, picked from the scalar pointers: indexing
+// the kernel argument with a VGPR loads it from memory first, a dependent
+// load in front of the push. The empty asm keeps the compiler from turning
+// the selects back into that load; the global address space keeps the push a
+// global (not flat) store.
+template <typename V>
+using LamportGlobalPtr = __attribute__((address_space(1))) V*;
+
+template <int ngpus, typename V>
+DINLINE LamportGlobalPtr<V> lamportPeerPtr(const LamportPeers& peers, int g)
+{
+    uint64_t ptrs[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        ptrs[i] = reinterpret_cast<uint64_t>(peers.ptrs[i]);
+        asm volatile("" : "+s"(ptrs[i]));
+    }
+    uint64_t ptr = ptrs[0];
+#pragma unroll
+    for(int i = 1; i < ngpus; ++i)
+        ptr = g == i ? ptrs[i] : ptr;
+    return (LamportGlobalPtr<V>)ptr;
+}
+
+/*
+ * Two shot. Row r splits into ngpus chunks of cp = row_packs / ngpus packs,
+ * chunk g reduced on rank g (as the two-shot all-reduce does with the whole
+ * message). SPLIT blocks per row on every rank, block (r, s) = blockIdx.x
+ * r * SPLIT + s with row_packs / SPLIT threads; it handles sub-range s, sub =
+ * cp / SPLIT packs from s * sub, of every chunk. Each peer g gets `stride`
+ * threads, whole waves when (ngpus - 1) of them fit the block (one peer a
+ * wave, so its pointer is scalar), else sub; thread q is paired with peer g =
+ * (rank + 1 + q / stride) % ngpus and pack pos = s * sub + q % stride of a
+ * chunk, if q % stride < sub:
+ *   reduce     push pack pos of chunk g into slot[rank] of row r in rank g's
+ *              reduce inbox; poll pack pos of slot[g] in this rank's and put
+ *              it in LDS by source rank (q < sub also loads this rank's own).
+ *   broadcast  after one __syncthreads sum pack pos of this rank's chunk in
+ *              rank order from LDS (every thread the same bits, no second
+ *              sync), round to T, push it to rank g's broadcast inbox at its
+ *              place in the row; q < sub also stores it in this rank's own.
+ *   epilogue   the broadcast inbox now gets the whole row, so every block
+ *              polls all of it (SPLIT packs a thread, loaded together; this
+ *              rank's chunk included), adds this rank's residual and folds the row's sum
+ *              of squares from 32-pack partials in LDS, the 1-stage order;
+ *              it stores out and residual_out of packs [s, s + 1) *
+ *              row_packs / SPLIT only. Every block of a row folds the same
+ *              bits.
+ * Row r of either inbox is used by row r only and row r's counter is
+ * advanced by block (r, 0) on every rank, whatever the row count, so calls of
+ * different sizes interleave. Both inboxes use the one counter: two hops as
+ * the two-shot all-reduce, so ranks stay at most one round apart on a row.
+ * Block (r, 0) moves the counter only after the whole row has arrived, which
+ * needs every block (r, s) of this launch to have pushed, i.e. read it.
+ * hidden and SPLIT may change between calls: the receiver notes the row
+ * length each buffer got and the re-arm clears that much (the blocks of a row
+ * share it out), so a longer earlier row leaves no stale tail.
+ * Unlike the all-reduce kernels a block also waits for the other blocks of
+ * its row on this rank (their part of this rank's chunk): this relies on
+ * blocks being dispatched in id order, so the blocks of the lowest unfinished
+ * row are resident on every rank.
+ *
+ * Inboxes (LamportState::ar_rms2_peers), [kLamportBuffers][row] slots of
+ * kLamportArRms2SlotPacks: reduce, slot[src] at src * (SlotPacks / ngpus);
+ * broadcast, the row as is.
+ */
+template <typename T, int ngpus, int SPLIT>
+__global__ void __launch_bounds__(kLamportArRms2SlotPacks / SPLIT, 1) lamportArRmsTwoShot(
+    const T* __restrict__ input,
+    const T* __restrict__ residual_inp,
+    T* __restrict__ residual_out,
+    T* __restrict__ output,
+    const T* __restrict__ weight,
+    LamportPeers peers,                 // reduce inbox, broadcast inbox follows
+    uint32_t* __restrict__ row_round,   // [kLamportArRms2MaxRows], rank-local
+    uint32_t* __restrict__ row_written, // [kLamportArRms2MaxRows][kLamportBuffers], rank-local
+    int rank,
+    int hidden,
+    float eps,
+    bool gemma_norm)
+{
+    static_assert(sizeof(T) == 2, "sentinel 0xffff is only defined for 2-byte dtypes");
+    constexpr int pack_size       = 16 / sizeof(T);
+    constexpr int src_packs       = kLamportArRms2SlotPacks / ngpus; // reduce slot per source
+    constexpr int64_t inbox_packs = kLamportBuffers * kLamportArRms2BufPacks;
+    using P        = typename opus::vector_t<T, pack_size>;
+    using A        = typename opus::vector_t<opus::fp32_t, pack_size>;
+    using ui32x4_t = __attribute__((__vector_size__(4 * sizeof(uint32_t)))) uint32_t;
+    union pack
+    {
+        P data;
+        ui32x4_t i;
+    };
+
+    __shared__ P s_data[ngpus][src_packs / SPLIT]; // sub-range of this rank's chunk, by source
+    __shared__ float s_part[kLamportArRms2SlotPacks / kLamportRmsLanes];
+    const int row         = blockIdx.x / SPLIT;
+    const int split_id    = blockIdx.x % SPLIT;
+    const int row_packs   = hidden / pack_size;
+    const int block_packs = row_packs / SPLIT; // == blockDim.x
+    const int chunk       = row_packs / ngpus;
+    const int sub         = chunk / SPLIT;
+    const int tid         = threadIdx.x;
+    const P* row_in       = reinterpret_cast<const P*>(input) + (int64_t)row * row_packs;
+    // block-uniform, so these are scalar loads
+    const uint32_t round   = row_round[row];
+    const uint32_t rearm   = (round + 2) % kLamportBuffers;
+    const uint32_t written = row_written[row * kLamportBuffers + rearm];
+
+    ui32x4_t* self_inbox  = reinterpret_cast<ui32x4_t*>(peers.ptrs[rank]);
+    const int64_t row_off = round * kLamportArRms2BufPacks + (int64_t)row * kLamportArRms2SlotPacks;
+
+    const int wave_lanes = (sub + kLamportWaveSize - 1) / kLamportWaveSize * kLamportWaveSize;
+    const int stride     = (ngpus - 1) * wave_lanes <= block_packs ? wave_lanes : sub;
+    const bool is_relay  = tid < (ngpus - 1) * stride && tid % stride < sub;
+    const int relay_peer = (rank + 1 + tid / stride) % ngpus;
+    const int relay_pos  = tid % stride;              // in s_data
+    const int chunk_pos  = split_id * sub + relay_pos; // in a chunk
+
+    // reduce
+    if(is_relay)
+    {
+        pack send;
+        send.data = row_in[relay_peer * chunk + chunk_pos];
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            send.i[j] = lamportCanonicalize(send.i[j]);
+        auto dst = lamportPeerPtr<ngpus, ui32x4_t>(peers, relay_peer);
+        __builtin_nontemporal_store(send.i, dst + row_off + rank * src_packs + chunk_pos);
+    }
+    if(tid < sub)
+    {
+        pack own;
+        own.data = row_in[rank * chunk + split_id * sub + tid];
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            own.i[j] = lamportCanonicalize(own.i[j]);
+        s_data[rank][tid] = own.data;
+    }
+    // local operands of the epilogue, loaded before the waits
+    const int64_t out_id = (int64_t)row * row_packs + split_id * block_packs + tid;
+    P res[SPLIT];
+#pragma unroll
+    for(int k = 0; k < SPLIT; ++k)
+        res[k] = *(reinterpret_cast<const P*>(residual_inp) + (int64_t)row * row_packs +
+                   k * block_packs + tid);
+    const P w = *(reinterpret_cast<const P*>(weight) + split_id * block_packs + tid);
+    if(is_relay)
+    {
+        pack got;
+        got.i = lamportPollSlot(self_inbox + row_off + relay_peer * src_packs + chunk_pos);
+        s_data[relay_peer][relay_pos] = got.data;
+    }
+    __syncthreads();
+
+    // broadcast
+    if(is_relay)
+    {
+        A sum;
+#pragma unroll
+        for(int g = 0; g < ngpus; ++g)
+        {
+            const P rank_data = s_data[g][relay_pos];
+#pragma unroll
+            for(int j = 0; j < pack_size; ++j)
+                sum[j] = g == 0 ? upcast_s(rank_data[j]) : sum[j] + upcast_s(rank_data[j]);
+        }
+        pack sum_val;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            sum_val.data[j] = downcast_s<T>(sum[j]);
+#pragma unroll
+        for(int j = 0; j < 4; ++j)
+            sum_val.i[j] = lamportCanonicalize(sum_val.i[j]);
+        const int64_t bcast_id = inbox_packs + row_off + rank * chunk + chunk_pos;
+        auto dst = lamportPeerPtr<ngpus, ui32x4_t>(peers, relay_peer);
+        __builtin_nontemporal_store(sum_val.i, dst + bcast_id);
+        if(tid < sub)
+            __builtin_nontemporal_store(sum_val.i, self_inbox + bcast_id);
+    }
+
+    // epilogue: the whole row from the broadcast inbox
+    A acc;
+    P res_out;
+    const ui32x4_t* bcast_row = self_inbox + inbox_packs + row_off + tid;
+    pack sums[SPLIT];
+    uint32_t wait_mask;
+    do
+    {
+        // without the memory clobber the loads are hoisted out of the loop
+        asm volatile("" ::: "memory");
+#pragma unroll
+        for(int k = 0; k < SPLIT; ++k)
+            sums[k].i = __builtin_nontemporal_load(bcast_row + k * block_packs);
+        // issue every load before any mask math
+        __builtin_amdgcn_sched_barrier(0);
+        wait_mask = 0;
+#pragma unroll
+        for(int k = 0; k < SPLIT; ++k)
+#pragma unroll
+            for(int j = 0; j < 4; ++j)
+                wait_mask |= lamportSentinelMask(sums[k].i[j]);
+    } while(wait_mask != 0);
+#pragma unroll
+    for(int k = 0; k < SPLIT; ++k)
+    {
+        A acc_k;
+#pragma unroll
+        for(int j = 0; j < pack_size; ++j)
+            acc_k[j] = upcast_s(sums[k].data[j]);
+        P res_out_k;
+        // acc_k is already rounded to T, the rounding in here keeps it
+        const float square_sum = lamportRmsResidual<T>(acc_k, res[k], res_out_k);
+        const float part       = warpReduce<AddFunctor, float, kLamportRmsLanes>(square_sum);
+        if(tid % kLamportRmsLanes == 0)
+            s_part[(k * block_packs + tid) / kLamportRmsLanes] = part;
+        if(k == split_id)
+        {
+            acc     = acc_k;
+            res_out = res_out_k;
+        }
+    }
+    *(reinterpret_cast<P*>(residual_out) + out_id) = res_out;
+    __syncthreads();
+    // every wave folds the row's partials itself, the same bits in each
+    const int row_partials = row_packs / kLamportRmsLanes;
+    const int width        = lamportRmsWidth(row_partials);
+    const int part_lane    = tid % kLamportWaveSize & (width - 1);
+    float v                = part_lane < row_partials ? s_part[part_lane] : 0.f;
+    v                      = lamportRmsFold(v, width);
+    const float rms        = rsqrtf(v / hidden + eps);
+    *(reinterpret_cast<P*>(output) + out_id) = lamportRmsNorm<T>(acc, w, rms, gemma_norm);
+
+    // re-arm what last round's buffer got, shared out over the row's blocks:
+    // written packs of the broadcast row, written / ngpus of every reduce
+    // slot (the own slot is never written, clearing it is harmless)
+    const ui32x4_t sentinel{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+    const int64_t rearm_off =
+        rearm * kLamportArRms2BufPacks + (int64_t)row * kLamportArRms2SlotPacks;
+    const int written_chunk = (int)written / ngpus;
+    for(int p = split_id * block_packs + tid; p < (int)written; p += row_packs)
+    {
+        __builtin_nontemporal_store(sentinel, self_inbox + inbox_packs + rearm_off + p);
+        const int src = p / written_chunk;
+        __builtin_nontemporal_store(
+            sentinel, self_inbox + rearm_off + src * src_packs + (p - src * written_chunk));
+    }
+
+    if(split_id == 0 && tid == 0)
+    {
+        row_written[row * kLamportBuffers + round] = row_packs;
+        row_round[row]                             = (round + 1) % kLamportBuffers;
+    }
+}
+
+// Per-hidden state of the fused kernels' split mode (the inbox is
+// LamportState's). Rank-local, so creating one needs no barrier.
+struct LamportArRmsState
+{
+    uint32_t* partials      = nullptr; // [kLamportBuffers][kLamportRmsMaxPartials], uncached
+    uint32_t* partial_round = nullptr; // [kLamportMaxBlocks]
+    int hidden              = 0;
+
+    ~LamportArRmsState()
+    {
+        if(partials)
+            (void)hipFree(partials);
+        if(partial_round)
+            (void)hipFree(partial_round);
+    }
+
+    // hidden / 8 packs a row: whole groups of kLamportWaveSize, at most one block
+    static bool hiddenOk(int hidden)
+    {
+        return hidden > 0 && hidden % (8 * kLamportWaveSize) == 0 &&
+               hidden / 8 <= kLamportRmsMaxRowPacks;
+    }
+
+    // What LamportArRmsKernel::automatic runs, {kernel, block}. Placeholder
+    // (flat, a row per block; two shot past the one-shot cap) until the
+    // dispatch is written from the gfx942 and gfx950 sweeps of
+    // test_lamport_fused_ar_rms.py.
+    static std::pair<LamportArRmsKernel, int> pick(int world_size, int64_t rows, int row_packs)
+    {
+        (void)world_size;
+        if(rows * row_packs > kLamportMaxPacks)
+            return {LamportArRmsKernel::two_shot, 0};
+        return {LamportArRmsKernel::flat, 0};
+    }
+
+    template <typename T>
+    void run(const LamportState& inbox,
+             hipStream_t stream,
+             const T* input,
+             const T* residual_inp,
+             T* residual_out,
+             T* output,
+             const T* weight,
+             int64_t rows,
+             float eps,
+             bool gemma_norm,
+             LamportArRmsKernel kernel,
+             int block)
+    {
+        constexpr int pack_size = 16 / sizeof(T);
+        const int row_packs     = hidden / pack_size;
+        const int64_t packs     = rows * row_packs;
+        const int ngpus         = inbox.world_size;
+        if(packs == 0)
+            return;
+        if(kernel == LamportArRmsKernel::automatic)
+            std::tie(kernel, block) = pick(ngpus, rows, row_packs);
+        if(kernel == LamportArRmsKernel::two_shot)
+        {
+            if(rows > kLamportArRms2MaxRows)
+                throw std::runtime_error("lamportFusedArRms two shot: at most " +
+                                         std::to_string(kLamportArRms2MaxRows) + " rows, got " +
+                                         std::to_string(rows));
+#define LAUNCH_TWO_SHOT_SPLIT(NG, SP)                                                      \
+    case SP:                                                                               \
+        lamportArRmsTwoShot<T, NG, SP><<<(int)rows * SP, row_packs / SP, 0, stream>>>(     \
+            input, residual_inp, residual_out, output, weight, inbox.ar_rms2_peers,        \
+            inbox.d_ar_rms2_round, inbox.d_ar_rms2_written, inbox.rank, hidden, eps,       \
+            gemma_norm);                                                                   \
+        break;
+#define LAUNCH_TWO_SHOT(NG)                                                                \
+    case NG:                                                                               \
+        switch(block)                                                                      \
+        {                                                                                  \
+            LAUNCH_TWO_SHOT_SPLIT(NG, 1)                                                   \
+            LAUNCH_TWO_SHOT_SPLIT(NG, 2)                                                   \
+            LAUNCH_TWO_SHOT_SPLIT(NG, 4)                                                   \
+        }                                                                                  \
+        break;
+            // block = blocks per row, 0 picks the fewest with at most 512 threads
+            if(block == 0)
+                block = row_packs > 512 ? 2 : 1;
+            if((block != 1 && block != 2 && block != 4) ||
+               row_packs % (kLamportRmsLanes * block) != 0)
+                throw std::runtime_error("lamportFusedArRms two shot: block must be 0 (auto) or "
+                                         "1 / 2 / 4 blocks a row, with whole 32-pack groups a "
+                                         "block, got " + std::to_string(block));
+            switch(ngpus)
+            {
+                LAUNCH_TWO_SHOT(2)
+                LAUNCH_TWO_SHOT(4)
+                LAUNCH_TWO_SHOT(8)
+            default: throw std::runtime_error("lamportFusedArRms: world size must be 2, 4 or 8");
+            }
+#undef LAUNCH_TWO_SHOT_SPLIT
+#undef LAUNCH_TWO_SHOT
+            return;
+        }
+        if(packs > kLamportMaxPacks)
+            throw std::runtime_error("lamportFusedArRms: " + std::to_string(packs * 16) +
+                                     "B exceeds the one-shot cap of " +
+                                     std::to_string((int64_t)kLamportMaxPacks * 16) + "B");
+
+#define LAMPORT_RMS_ARGS                                                                   \
+    input, residual_inp, residual_out, output, weight, inbox.one_shot_peers,               \
+        inbox.d_one_shot_round, partials, partial_round, inbox.rank, hidden, eps, gemma_norm
+#define LAUNCH_FLAT_SPLIT(NG, BS)                                                          \
+    case BS:                                                                               \
+        lamportArRmsFlat<T, NG, BS, false>                                                 \
+            <<<(int)(packs / BS), BS, 0, stream>>>(LAMPORT_RMS_ARGS);                      \
+        break;
+#define LAUNCH_FLAT(NG)                                                                    \
+    case NG:                                                                               \
+        switch(block)                                                                      \
+        {                                                                                  \
+        case 0:                                                                            \
+            lamportArRmsFlat<T, NG, kLamportRmsMaxRowPacks, true>                          \
+                <<<(int)rows, row_packs, 0, stream>>>(LAMPORT_RMS_ARGS);                   \
+            break;                                                                         \
+            LAUNCH_FLAT_SPLIT(NG, 64)                                                      \
+            LAUNCH_FLAT_SPLIT(NG, 128)                                                     \
+            LAUNCH_FLAT_SPLIT(NG, 256)                                                     \
+        }                                                                                  \
+        break;
+#define LAUNCH_WS_GROUPS(NG, GR)                                                           \
+    case GR:                                                                               \
+        if constexpr(NG * GR <= 16)                                                        \
+            lamportArRmsWaveSplit<T, NG, GR>                                               \
+                <<<(int)(packs / (GR * kLamportWaveSize)), NG * GR * kLamportWaveSize, 0,  \
+                   stream>>>(LAMPORT_RMS_ARGS);                                            \
+        break;
+#define LAUNCH_WS(NG)                                                                      \
+    case NG:                                                                               \
+        switch(block)                                                                      \
+        {                                                                                  \
+            LAUNCH_WS_GROUPS(NG, 1)                                                        \
+            LAUNCH_WS_GROUPS(NG, 2)                                                        \
+            LAUNCH_WS_GROUPS(NG, 4)                                                        \
+            LAUNCH_WS_GROUPS(NG, 8)                                                        \
+        }                                                                                  \
+        break;
+
+        if(kernel == LamportArRmsKernel::flat)
+        {
+            if(block != 0 && block != 64 && block != 128 && block != 256)
+                throw std::runtime_error("lamportFusedArRms flat: block must be 0 (row) or "
+                                         "64 / 128 / 256 packs, got " + std::to_string(block));
+            if(block != 0 && row_packs % block != 0)
+                throw std::runtime_error("lamportFusedArRms flat: " + std::to_string(row_packs) +
+                                         " packs a row is not whole blocks of " +
+                                         std::to_string(block));
+            switch(ngpus)
+            {
+                LAUNCH_FLAT(2)
+                LAUNCH_FLAT(4)
+                LAUNCH_FLAT(8)
+            default: throw std::runtime_error("lamportFusedArRms: world size must be 2, 4 or 8");
+            }
+        }
+        else if(kernel == LamportArRmsKernel::wave_split)
+        {
+            if((block != 1 && block != 2 && block != 4 && block != 8) || ngpus * block > 16)
+                throw std::runtime_error("lamportFusedArRms wave split: block must be 1 / 2 / 4 / "
+                                         "8 groups with world_size * groups <= 16, got " +
+                                         std::to_string(block));
+            if(row_packs % (block * kLamportWaveSize) != 0)
+                throw std::runtime_error("lamportFusedArRms wave split: " +
+                                         std::to_string(row_packs) +
+                                         " packs a row is not whole blocks of " +
+                                         std::to_string(block * kLamportWaveSize));
+            switch(ngpus)
+            {
+                LAUNCH_WS(2)
+                LAUNCH_WS(4)
+                LAUNCH_WS(8)
+            default: throw std::runtime_error("lamportFusedArRms: world size must be 2, 4 or 8");
+            }
+        }
+        else
+        {
+            throw std::runtime_error("lamportFusedArRms: kernel must be 0 (auto), 1 (flat), "
+                                     "2 (wave split) or 3 (two shot)");
+        }
+#undef LAUNCH_WS
+#undef LAUNCH_WS_GROUPS
+#undef LAUNCH_FLAT
+#undef LAUNCH_FLAT_SPLIT
+#undef LAMPORT_RMS_ARGS
+    }
+};
+
 class CustomAllreduce
 {
     public:
@@ -4716,6 +5694,8 @@ class CustomAllreduce
 
     // Lamport path of allreduce() (initLamport); null keeps the original dispatch.
     std::unique_ptr<LamportState> lamport_;
+    // Lamport fused all-reduce + RMSNorm POC (lamportArRmsInit), per hidden.
+    std::map<int, std::unique_ptr<LamportArRmsState>> lamport_ar_rms_;
 
     template <typename T>
     T* local_tmp_reduced_ptr() const
@@ -5286,6 +6266,8 @@ class CustomAllreduce
                                     : open_ipc_handle(&handles[i]) + offsets[i];
             state->one_shot_peers.ptrs[i] = base;
             state->two_shot_peers.ptrs[i] = base + lamportInboxBytes(world_size_);
+            state->ar_rms2_peers.ptrs[i] = base + lamportInboxBytes(world_size_) +
+                                           2 * lamportTwoShotInboxBytes(world_size_);
         }
         HIP_CALL(hipMemset(self_ptr, 0xff, lamportBufferBytes(world_size_)));
         HIP_CALL(hipMalloc((void**)&state->d_one_shot_round, sizeof(uint32_t) * kLamportMaxBlocks));
@@ -5293,6 +6275,11 @@ class CustomAllreduce
         const size_t two_shot_round_bytes = sizeof(uint32_t) * lamportTwoShotMaxBlocks(world_size_);
         HIP_CALL(hipMalloc((void**)&state->d_two_shot_round, two_shot_round_bytes));
         HIP_CALL(hipMemset(state->d_two_shot_round, 0, two_shot_round_bytes));
+        const size_t ar_rms2_round_bytes = sizeof(uint32_t) * kLamportArRms2MaxRows;
+        HIP_CALL(hipMalloc((void**)&state->d_ar_rms2_round, ar_rms2_round_bytes));
+        HIP_CALL(hipMemset(state->d_ar_rms2_round, 0, ar_rms2_round_bytes));
+        HIP_CALL(hipMalloc((void**)&state->d_ar_rms2_written, ar_rms2_round_bytes * kLamportBuffers));
+        HIP_CALL(hipMemset(state->d_ar_rms2_written, 0, ar_rms2_round_bytes * kLamportBuffers));
         HIP_CALL(hipDeviceSynchronize());
         lamport_ = std::move(state);
     }
@@ -5339,6 +6326,58 @@ class CustomAllreduce
     LamportKernel lamportDispatch(int64_t numel, int64_t elem_size, bool use_new) const
     {
         return elem_size == 2 && use_new ? lamportKernel(numel) : LamportKernel::none;
+    }
+
+    // -----------------------------------------------------------------------
+    // Lamport fused all-reduce + residual + RMSNorm POC, see lamportArRmsFlat.
+    // Runs on the one-shot inbox of initLamport. Sets up the rank-local split
+    // state of one hidden size, once per hidden; no barrier needed. Must run
+    // outside graph capture.
+    // -----------------------------------------------------------------------
+    void lamportArRmsInit(int hidden)
+    {
+        if(!lamport_)
+            throw std::runtime_error("lamportArRmsInit: initLamport was not called");
+        if(!LamportArRmsState::hiddenOk(hidden))
+            throw std::invalid_argument("lamportArRmsInit: hidden must be a multiple of " +
+                                        std::to_string(8 * kLamportWaveSize) + " and at most " +
+                                        std::to_string(8 * kLamportRmsMaxRowPacks) + ", got " +
+                                        std::to_string(hidden));
+        if(lamport_ar_rms_.count(hidden))
+            return;
+        auto state    = std::make_unique<LamportArRmsState>();
+        state->hidden = hidden;
+        const size_t partial_bytes = sizeof(uint32_t) * kLamportBuffers * kLamportRmsMaxPartials;
+        HIP_CALL(hipExtMallocWithFlags(
+            (void**)&state->partials, partial_bytes, hipDeviceMallocUncached));
+        HIP_CALL(hipMemset(state->partials, 0xff, partial_bytes));
+        HIP_CALL(hipMalloc((void**)&state->partial_round, sizeof(uint32_t) * kLamportMaxBlocks));
+        HIP_CALL(hipMemset(state->partial_round, 0, sizeof(uint32_t) * kLamportMaxBlocks));
+        HIP_CALL(hipDeviceSynchronize());
+        lamport_ar_rms_[hidden] = std::move(state);
+    }
+
+    // rows x hidden input; kernel / block as LamportArRmsState::run.
+    template <typename T>
+    void lamportFusedArRms(hipStream_t stream,
+                           const T* input,
+                           const T* residual_inp,
+                           T* residual_out,
+                           T* output,
+                           const T* weight,
+                           int64_t rows,
+                           int hidden,
+                           float eps,
+                           bool gemma_norm,
+                           LamportArRmsKernel kernel,
+                           int block)
+    {
+        auto it = lamport_ar_rms_.find(hidden);
+        if(!lamport_ || it == lamport_ar_rms_.end())
+            throw std::runtime_error("lamportFusedArRms: call lamportArRmsInit(" +
+                                     std::to_string(hidden) + ") first");
+        it->second->run<T>(*lamport_, stream, input, residual_inp, residual_out, output, weight,
+                           rows, eps, gemma_norm, kernel, block);
     }
 
     // Runs one lamport kernel; LamportKernel::none does nothing.
