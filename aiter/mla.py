@@ -1632,27 +1632,56 @@ def mla_decode_fwd(
                 cp_rank,
             )
         elif use_flydsl_ps1 and q.dtype == dtypes.bf16:
-            from aiter.ops.flydsl.mla_kernels import flydsl_mla_pagesize1_bf16_bf16
+            if kv_buffer.dtype == dtypes.fp8:
+                from aiter.ops.flydsl.mla_kernels import (
+                    flydsl_mla_pagesize1_bf16_fp8,
+                )
 
-            flydsl_mla_pagesize1_bf16_bf16(
-                logits.view(-1, nhead, v_head_dim),
-                attn_lse.view(-1, nhead),
-                o,
-                q,
-                kv_buffer,
-                kv_indices,
-                work_indptr,
-                work_info_set,
-                sm_scale,
-                final_lse=final_lse,
-                max_seqlen_q=max_seqlen_q,
-                causal=causal,
-                qo_indptr=qo_indptr,
-                kv_indptr=kv_indptr,
-                g_kv_indptr=g_kv_indptr,
-                cp_world_size=cp_world_size,
-                cp_rank=cp_rank,
-            )
+                flydsl_kv_scale = _mla_scale_on_device(kv_scale, q, "kv_scale")
+                flydsl_mla_pagesize1_bf16_fp8(
+                    logits.view(-1, nhead, v_head_dim),
+                    attn_lse.view(-1, nhead),
+                    o,
+                    q,
+                    kv_buffer,
+                    kv_indices,
+                    work_indptr,
+                    work_info_set,
+                    sm_scale,
+                    kv_scale=flydsl_kv_scale,
+                    final_lse=final_lse,
+                    max_seqlen_q=max_seqlen_q,
+                    causal=causal,
+                    qo_indptr=qo_indptr,
+                    kv_indptr=kv_indptr,
+                    g_kv_indptr=g_kv_indptr,
+                    cp_world_size=cp_world_size,
+                    cp_rank=cp_rank,
+                )
+            else:
+                from aiter.ops.flydsl.mla_kernels import (
+                    flydsl_mla_pagesize1_bf16_bf16,
+                )
+
+                flydsl_mla_pagesize1_bf16_bf16(
+                    logits.view(-1, nhead, v_head_dim),
+                    attn_lse.view(-1, nhead),
+                    o,
+                    q,
+                    kv_buffer,
+                    kv_indices,
+                    work_indptr,
+                    work_info_set,
+                    sm_scale,
+                    final_lse=final_lse,
+                    max_seqlen_q=max_seqlen_q,
+                    causal=causal,
+                    qo_indptr=qo_indptr,
+                    kv_indptr=kv_indptr,
+                    g_kv_indptr=g_kv_indptr,
+                    cp_world_size=cp_world_size,
+                    cp_rank=cp_rank,
+                )
         elif use_flydsl_ps1:
             from aiter.ops.flydsl.mla_kernels import flydsl_mla_pagesize1_fp8_fp8
 
