@@ -732,6 +732,10 @@ class MegaMoeTPEngine:
         nsk = self._sm_tuned(tot).get("nsk")
         if nsk is None:
             nsk = 2 if self.a16 and tot < 64 else 0
+        if self.sh8 and 0 < nsk < 4:
+            # (the MXFP8 shared expert's loaders take the ring's slots in pairs: a ring of
+            # 2 would leave them one slot)
+            nsk = 0
         return 0 if nsk == NSK else nsk
 
     def _sm_xd(self, tot: int) -> bool:

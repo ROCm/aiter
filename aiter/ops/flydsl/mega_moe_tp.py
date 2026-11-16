@@ -141,7 +141,11 @@ class MegaMoeTPConfig:
     comm_dtype: str = "fp8"
     ar_gather: str = "auto"
     schedule: str = "dynamic"
+    # "fp4" (a4w4), "fp8", "bf16" (a16w4: two MXFP8 terms, the small-M schedule only), or
+    # "auto": a16w4 for the batches below a16_max_tokens global tokens (as aiter fused_moe's
+    # decode: bf16 activations), a4w4 for the rest (and the big-M path)
     act_dtype: str = "fp4"
+    a16_max_tokens: int = 256
     lb_min: int | None = None
     lb_mt: int | str | None = None
     lb_mt_small: int | None = None
@@ -202,7 +206,7 @@ class MegaMoeTP:
         big_ok = (
             cfg.activation
             in (ActivationType.Swiglu, ActivationType.Silu, ActivationType.Situv2)
-            and cfg.act_dtype == "fp4"
+            and cfg.act_dtype in ("fp4", "auto")
             and cfg.model_dim % 256 == 0
             and 0 < cfg.experts - 1 < 1024
             and cfg.topk - 1 <= 64
@@ -231,7 +235,7 @@ class MegaMoeTP:
         # the small engine holds what it can, big-M takes the rest (an explicit
         # bigm_min_tokens above the small engine's capacity: lowered to it, below)
         fit = (big_ok and bmin != 0) or cfg.fit_max_local
-        self.engine = MegaMoeTPEngine(
+        self._engine_kw = dict(
             rank=cfg.rank,
             world_size=cfg.world_size,
             model_dim=cfg.model_dim,
@@ -255,7 +259,7 @@ class MegaMoeTP:
             comm_dtype="fp8" if cfg.comm_dtype == "int8" else cfg.comm_dtype,
             ar_gather=cfg.ar_gather,
             schedule=cfg.schedule,
-            act_dtype=cfg.act_dtype,
+            act_dtype="fp4" if cfg.act_dtype == "auto" else cfg.act_dtype,
             lb={
                 "min": cfg.lb_min,
                 "mt": cfg.lb_mt,
@@ -271,9 +275,32 @@ class MegaMoeTP:
             fit_max_local=fit,
             shared=shared,
         )
+        self.engine = MegaMoeTPEngine(**self._engine_kw)
         if big_ok and bmin != 0 and self.engine.mmax < small_max:
             lim = self.engine.mmax + 1
             self.bigm_m = min(self.bigm_m, lim) if self.bigm_m else lim
+        # (act_dtype "auto") the a16w4 small engine of the batches below a16_max_tokens
+        # global tokens (its own buffers / arena: an engine's activation format is fixed)
+        self.engine16 = None
+        self.a16_local = 0  # local token counts below this run engine16
+        if cfg.act_dtype == "auto":
+            self.a16_local = -(-cfg.a16_max_tokens // cfg.world_size)
+            m16 = min(small_max, self.a16_local - 1)
+            if m16 >= 1:
+                self.engine16 = MegaMoeTPEngine(
+                    **{**self._engine_kw, "max_local_tokens": m16, "act_dtype": "bf16",
+                       "fit_max_local": True}
+                )
+
+    def _eng(self, local_tokens: int):
+        """the small engine of this local token count (act_dtype "auto": a16w4 below
+        a16_max_tokens global tokens)"""
+        if self.engine16 is not None and local_tokens < self.a16_local:
+            return self.engine16
+        return self.engine
+
+    def _engines(self):
+        return [self.engine] + ([self.engine16] if self.engine16 is not None else [])
 
     def forward(
         self,
@@ -315,7 +342,8 @@ class MegaMoeTP:
             if tail is not None and bf16:
                 res = (*res, self._bigm_rows(tail[1], tail[2], local))
             return res
-        return self.engine(x_local, topk_weights, topk_ids, out, tail=tail, bf16=bf16)
+        eng = self._eng(self._local(x_local.shape[0]))
+        return eng(x_local, topk_weights, topk_ids, out, tail=tail, bf16=bf16)
 
     def _local(self, rows: int) -> int:
         """local tokens of a forward of these input rows (ar: replicated, rows / tp per rank)"""
@@ -436,7 +464,8 @@ class MegaMoeTP:
         shared expert format)."""
         shared = (w1_shared, w1_shared_scale, w2_shared, w2_shared_scale)
         shared = None if w1_shared is None else shared
-        self.engine.set_weights(w1, w1_scale, w2, w2_scale, shared)
+        for eng in self._engines():
+            eng.set_weights(w1, w1_scale, w2, w2_scale, shared)
         self.shared = shared
         self._bigm_args.update(w1=w1, w1_scale=w1_scale, w2=w2, w2_scale=w2_scale)
         if self._bigm is not None:
@@ -461,8 +490,10 @@ class MegaMoeTP:
         ar = self.cfg.comm_mode == "ar"
         btail = (tail or tail_bf16) and not ar  # (the ar big-M path has no tail)
         small = [t for t in ts if not self._big(t)]
-        if small:
-            self.engine.prepare(small, tail, tail_bf16, warmup)
+        for eng in self._engines():
+            mine = [t for t in small if self._eng(t) is eng]
+            if mine:
+                eng.prepare(mine, tail, tail_bf16, warmup)
         hi = max([self.cfg.max_local_tokens, *ts])
         if not self._big(hi):
             return
@@ -510,14 +541,14 @@ class MegaMoeTP:
         """forward(tail=...) runs for this local token count."""
         if self._big(local_tokens):
             return self.cfg.comm_mode == "ag_rs"
-        return self.engine.tail_ok(local_tokens)
+        return self._eng(local_tokens).tail_ok(local_tokens)
 
     def launch_config(self, local_tokens: int) -> LaunchCfg | None:
         """The small engine's launch config of this local token count; None: the batch
         runs the big-M kernel (see bigm_plan)."""
         if self._big(local_tokens):
             return None
-        return self.engine.config(local_tokens)
+        return self._eng(local_tokens).config(local_tokens)
 
     def bigm_plan(self, local_tokens: int):
         """The big-M kernel's plan of this local token count: ((chunk weights),
@@ -531,6 +562,8 @@ class MegaMoeTP:
         """Sticky watchdog bits (nonzero: a launch timed out) as a device tensor (no
         sync): the small engine's, | ERR_BIGM for a big-M one."""
         e = self.engine.error_flag()
+        if self.engine16 is not None:
+            e = e | self.engine16.error_flag()
         if self._bigm is None:
             return e
         return e | (self._bigm.error_flag() * ERR_BIGM)
@@ -538,6 +571,8 @@ class MegaMoeTP:
     def poll_errors(self) -> int:
         """Nonzero if a wait inside the kernel gave up (a peer never arrived)."""
         e = self.engine.poll_errors()
+        if not e and self.engine16 is not None:
+            e = self.engine16.poll_errors()
         if not e and self._bigm is not None:
             e = self._bigm.poll_errors()
         return e
@@ -549,16 +584,19 @@ class MegaMoeTP:
             raise RuntimeError(
                 "MegaMoeTP: a big-M wait on a peer gave up (results invalid)"
             )
-        self.engine.check_errors()
+        for eng in self._engines():
+            eng.check_errors()
 
     def clear_errors(self) -> None:
-        self.engine.clear_errors()
+        for eng in self._engines():
+            eng.clear_errors()
         if self._bigm is not None:
             self._bigm.clear_errors()
 
     def reset(self) -> None:
         """Collective: restart the cross-rank state (after a timeout / desync)."""
-        self.engine.reset()
+        for eng in self._engines():
+            eng.reset()
         if self._bigm is not None:
             self._bigm.reset()
 
@@ -568,4 +606,5 @@ class MegaMoeTP:
         if self._bigm is not None:
             self._bigm.close()
             self._bigm = None
-        self.engine.arena.close()
+        for eng in self._engines():
+            eng.arena.close()
