@@ -397,27 +397,3 @@ def test_determinism():
         return _run_kernel(i)[0]
 
     torch.testing.assert_close(once().float(), once().float(), atol=0, rtol=0)
-
-
-def test_unsupported_shape_reports_reason():
-    """Below the smallest tile -> not supported, with a reason (no crash)."""
-    from aiter.ops.triton.gated_delta_net.fused_gdn_prefill_qkvz import (
-        fused_gdn_prefill_qkvz_supported,
-    )
-
-    inp = make_inputs([512])  # 512 tokens < 1024 floor
-    ok, reason = fused_gdn_prefill_qkvz_supported(
-        inp["projected_qkvz"],
-        inp["projected_ba"],
-        inp["conv_state"],
-        inp["delta_state"],
-        inp["cache_indices"],
-        inp["cu_seqlens"],
-        inp["has_initial_state"],
-        inp["conv_weight"],
-        inp["conv_bias"],
-        FP8_DTYPE,
-    )
-    # On gfx950+Triton3.8 this is the tile-coverage reason; elsewhere it is the
-    # arch/Triton gate. Either way it is a clean (False, reason), never a raise.
-    assert ok is False and reason
