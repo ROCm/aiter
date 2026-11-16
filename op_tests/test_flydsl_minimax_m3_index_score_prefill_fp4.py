@@ -86,6 +86,8 @@ GEOM_SHAPES = [
     (4, 128, 16384),  # tile_q 256, 8 waves, L2
     (8, 2048, 16384),  # tile_q 256, 8 waves, L4 -- the production point
 ]
+# the e4m3 arm's own selector reaches one more: the 8-wave tile at 4 pages per wave
+NV_GEOM_SHAPES = [*GEOM_SHAPES, (8, 1024, 32768)]
 
 
 def _prefill_work(batch, q_len, ctx_len):
@@ -363,10 +365,10 @@ def check_prefill_geometry_arms_are_exhaustive():
 
 
 def check_nvfp4_geometry_arms_are_covered(dev):
-    """The NVFP4-only arms -- the 512-row DMA tile (`geometry(..., xwide=True)`) and
-    `exact_geometry` -- each have a case. The xwide thresholds keep it off the small
-    shapes the tests use, so its cases force them (`_with_xwide`) and the arms they
-    reach are compared with the ones the real thresholds reach."""
+    """The NVFP4 arms -- every one `geometry(..., xwide=True)` reaches, the 512-row DMA
+    tile included, and `exact_geometry` -- each have a case. The xwide thresholds keep
+    it off the small shapes the tests use, so its cases force them (`_with_xwide`) and
+    the arms they reach are compared with the ones the real thresholds reach."""
 
     def key(g):
         return (g["tile_q"], g["waves"], g["pages_per_wave"], g["m32"], g.get("dma", 0))
@@ -384,14 +386,15 @@ def check_nvfp4_geometry_arms_are_covered(dev):
         if q_len <= ctx:
             mb = -(-ctx // P)
             g = prefill_geometry(q_len, batch, heads, mb, dev, xwide=True)
-            if g.get("dma"):  # the other arms are the MXFP4 ones checked above
-                reach_x.add(key(g))
+            reach_x.add(key(g))
             reach_e.add(key(prefill_exact_geometry(q_len, batch, heads, mb, dev)))
     cover_x, cover_e = set(), set()
     with _with_xwide():
         for (qls, seqs), heads, ppw in itertools.product(WIDE, (1, 4), WIDE_PPW):
             g = prefill_geometry(max(qls), len(qls), heads, blocks(seqs), dev, True)
             cover_x.add(key({**g, "pages_per_wave": ppw or g["pages_per_wave"]}))
+    for batch, q_len, ctx in NV_GEOM_SHAPES:  # nvfp4_every_geometry
+        cover_x.add(key(prefill_geometry(q_len, batch, 1, -(-ctx // P), dev, True)))
     for batch, q_len, ctx in GEOM_SHAPES:  # nvfp4_exact_every_shape
         cover_e.add(key(prefill_exact_geometry(q_len, batch, 1, -(-ctx // P), dev)))
     for (qls, seqs), heads in itertools.product(SHORT_TAILS, (1, 4)):
@@ -1210,7 +1213,7 @@ def build_cases():
                 (qls, seqs, heads, qdt, "exact"),
             )
         )
-    for batch, q_len, ctx in (GEOM_SHAPES[2], GEOM_SHAPES[5]):  # 128-row, 512-row DMA
+    for batch, q_len, ctx in NV_GEOM_SHAPES:
         cases.append(
             (
                 f"nvfp4_every_geometry_b{batch}_q{q_len}_ctx{ctx}",
