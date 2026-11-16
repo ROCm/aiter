@@ -392,11 +392,11 @@ def check_nvfp4_geometry_arms_are_covered(dev):
         for (qls, seqs), heads, ppw in itertools.product(WIDE, (1, 4), WIDE_PPW):
             g = prefill_geometry(max(qls), len(qls), heads, blocks(seqs), dev, True)
             cover_x.add(key({**g, "pages_per_wave": ppw or g["pages_per_wave"]}))
-    for batch, q_len, ctx in GEOM_SHAPES:  # check_prefill_nvfp4_exact_every_shape
+    for batch, q_len, ctx in GEOM_SHAPES:  # nvfp4_exact_every_shape
         cover_e.add(key(prefill_exact_geometry(q_len, batch, 1, -(-ctx // P), dev)))
     for (qls, seqs), heads in itertools.product(SHORT_TAILS, (1, 4)):
         g = prefill_exact_geometry(max(qls), len(qls), heads, blocks(seqs), dev)
-        cover_e.add(key(g))  # check_prefill_nvfp4_exact_tails
+        cover_e.add(key(g))  # nvfp4_exact_tails
     for (qls, seqs), heads, ppw in itertools.product(WIDE, (1, 4), WIDE_PPW):
         g = prefill_exact_geometry(max(qls), len(qls), heads, blocks(seqs), dev)
         # check_prefill_nvfp4_exact_wide forces the 256-row tile and the ppw
@@ -729,16 +729,12 @@ def _with_xwide(ppw=None):
     return _Patch()
 
 
-def nv_ref_of(c, k_round):
-    return c["e4m3"] if k_round == "e4m3" else c["exact"]
-
-
 def check_prefill_nvfp4_bit_exact(qls, seqs, heads, qdt, k_round):
     """Exact-sum data against the fp32 oracle, bit for bit.
     Dead slots (no visible token) may stay unwritten or be -inf, never a score; live ones must all be written.
     """
     c = nv_case(qls, seqs, heads, exact_sum=True)
-    ref = nv_oracle(c, nv_ref_of(c, k_round))
+    ref = nv_oracle(c, c[k_round])
     got = run_nv(c, qdt, k_round)
     live = torch.isfinite(ref)
     check_scores(got, ref, live, f"q{qls[:3]} seq{seqs[:3]} H{heads}")
@@ -786,10 +782,6 @@ WIDE_PPW = (
 )  # pages per wave forced on the WIDE cases; None keeps the selector's
 
 
-def check_prefill_nvfp4_tails(qls, seqs, heads, qdt):
-    check_prefill_nvfp4_bit_exact(qls, seqs, heads, qdt, "e4m3")
-
-
 def check_prefill_nvfp4_xwide(qls, seqs, heads, qdt, ppw):
     """e4m3 arm on the 512-row tile, exact-sum data, bit for bit against the oracle."""
     with _with_xwide(ppw):
@@ -813,16 +805,6 @@ def check_prefill_nvfp4_exact_wide(qls, seqs, heads, qdt, ppw):
         mod.exact_geometry = orig
 
 
-def check_prefill_nvfp4_exact_tails(qls, seqs, heads, qdt):
-    """The exact arm (f16 MFMA, K = e2m1 * scale unrounded) on the same lengths."""
-    check_prefill_nvfp4_bit_exact(qls, seqs, heads, qdt, "exact")
-
-
-def check_prefill_nvfp4_exact_every_shape(shape, qdt):
-    batch, q_len, ctx_len = shape
-    check_prefill_nvfp4_bit_exact([q_len] * batch, [ctx_len] * batch, 1, qdt, "exact")
-
-
 def check_prefill_nvfp4_exact_random(shape, qdt):
     """Random data against the fp32 oracle on the UNROUNDED K. The accumulation order
     is the MFMA's, so allow a few fp32 ulps -- and require the e4m3 arm to differ (it
@@ -838,11 +820,6 @@ def check_prefill_nvfp4_exact_random(shape, qdt):
     assert float(rel.max()) <= 4e-6, f"{shape}: max rel error {float(rel.max())}"
     rounded = run_nv(cn, qdt, "e4m3")
     assert not torch.equal(got[live], rounded[live]), "exact scored like e4m3"
-
-
-def check_prefill_nvfp4_every_geometry(shape, qdt):
-    batch, q_len, ctx = shape
-    check_prefill_nvfp4_bit_exact([q_len] * batch, [ctx] * batch, 1, qdt, "e4m3")
 
 
 def check_prefill_nvfp4_single_region_views_and_typed_scale():
@@ -978,6 +955,22 @@ def check_prefill_nvfp4_rejections():
     kd4, ks4 = c["kd"], c["ks"][:, :, :4]  # an MXFP4-shaped scale view
     bad("mx scale", lambda: run_nv(c, views=(kd4, ks4)), "[pages, 128, 8]")
     bad("k_round", lambda: run_nv(c, k_round="bf16"), "k_round")
+    bad(
+        "missing k_scale",
+        lambda: score_prefill_flydsl(
+            c["q8"],
+            c["kd"],
+            c["bt"],
+            c["cu"],
+            c["seq"],
+            c["prefix"],
+            64,
+            300,
+            1.0,
+            nvfp4="e4m3",
+        ),
+        "k_scale is required",
+    )
     # typed views are an MXFP4 convenience: NVFP4 scales are e4m3, so e8m0-typed
     # bytes must not be reinterpreted as uint8 and scored as e4m3
     bad(
@@ -1092,7 +1085,7 @@ def test_prefill_nvfp4(batch, q_len, ctx_len):
     k_row = D // 2 + D // 16  # e2m1 data + one e4m3 scale per 16 elements per token
     nbytes = _prefill_bytes(batch, q_len, ctx_len, k_row, 1)  # Q is e4m3
     for k_round in ("e4m3", "exact"):
-        ref = nv_oracle(c, nv_ref_of(c, k_round))  # reference only: not timed
+        ref = nv_oracle(c, c[k_round])  # reference only: not timed
         live = torch.isfinite(ref)
         # Preallocated, sentinel-filled score buffer: the timed region is the scorer
         # alone, and an unwritten live slot fails the comparison.
@@ -1177,7 +1170,7 @@ def build_cases():
     # NVFP4, a minimal matrix:
     # exact-sum data to the bit against the torch oracle for both k_round values, on
     # tile and page boundaries, ragged and empty requests, H = 1/4, both Q dtypes, the
-    # 16- and 32-wide MFMA, the 512-row DMA tile and the 8-wave tile; random data
+    # 16- and 32-wide MFMA and the 512-row DMA tile; random data
     # against aiter's fp8 scorer.
     for (qls, seqs), heads, qdt in itertools.product(SHORT_TAILS, (1, 4), QDTS):
         name = (
@@ -1186,8 +1179,8 @@ def build_cases():
         cases.append(
             (
                 f"nvfp4_tails_{name}",
-                check_prefill_nvfp4_tails,
-                (qls, seqs, heads, qdt),
+                check_prefill_nvfp4_bit_exact,
+                (qls, seqs, heads, qdt, "e4m3"),
             )
         )
     for (qls, seqs), heads, qdt, ppw in itertools.product(WIDE, (1, 4), QDTS, WIDE_PPW):
@@ -1213,26 +1206,24 @@ def build_cases():
         cases.append(
             (
                 f"nvfp4_exact_tails_{name}",
-                check_prefill_nvfp4_exact_tails,
-                (qls, seqs, heads, qdt),
+                check_prefill_nvfp4_bit_exact,
+                (qls, seqs, heads, qdt, "exact"),
             )
         )
-    for shape in (GEOM_SHAPES[2], GEOM_SHAPES[5]):  # a 128-row and the 8-wave tile
-        name = f"b{shape[0]}_q{shape[1]}_ctx{shape[2]}"
+    for batch, q_len, ctx in (GEOM_SHAPES[2], GEOM_SHAPES[5]):  # 128-row, 512-row DMA
         cases.append(
             (
-                f"nvfp4_every_geometry_{name}",
-                check_prefill_nvfp4_every_geometry,
-                (shape, "e4m3"),
+                f"nvfp4_every_geometry_b{batch}_q{q_len}_ctx{ctx}",
+                check_prefill_nvfp4_bit_exact,
+                ([q_len] * batch, [ctx] * batch, 1, "e4m3", "e4m3"),
             )
         )
-    for shape in GEOM_SHAPES:  # every arm `exact_geometry` can reach
-        name = f"b{shape[0]}_q{shape[1]}_ctx{shape[2]}"
+    for batch, q_len, ctx in GEOM_SHAPES:  # every arm `exact_geometry` can reach
         cases.append(
             (
-                f"nvfp4_exact_every_shape_{name}",
-                check_prefill_nvfp4_exact_every_shape,
-                (shape, "e4m3"),
+                f"nvfp4_exact_every_shape_b{batch}_q{q_len}_ctx{ctx}",
+                check_prefill_nvfp4_bit_exact,
+                ([q_len] * batch, [ctx] * batch, 1, "e4m3", "exact"),
             )
         )
     for shape, qdt in itertools.product([SHAPES[2], SHAPES[4], SHAPES[6]], QDTS):
