@@ -123,6 +123,7 @@ inline MlaDecodeHeadPlan mla_decode_head_plan_v1_2(const std::string_view arch_i
                                                    const int32_t max_seqlen_qo,
                                                    const AiterDtype q_dtype,
                                                    const AiterDtype kv_dtype,
+                                                   const int32_t page_size,
                                                    const MlaPlannerFlags flags)
 {
     int32_t qk_batch_ratio = 1;
@@ -161,10 +162,11 @@ inline MlaDecodeHeadPlan mla_decode_head_plan_v1_2(const std::string_view arch_i
          (((num_heads == 32) || (num_heads == 64)) && (max_seqlen_qo <= 4) &&
           (num_heads * max_seqlen_qo <= 128)));
 
+    // gfx942 native QH64 FP8 only supports page_size=64; otherwise fold to QH16.
     const bool natively_supported =
         (num_heads == 16) || gfx1250_flydsl_ps1_heads ||
-        ((arch_id == "gfx942" || arch_id == "gfx950") && (num_heads == 64) && q_is_fp8 &&
-         kv_is_fp8 && (max_seqlen_qo == 1)) ||
+        ((arch_id == "gfx950" || (arch_id == "gfx942" && page_size == 64)) &&
+         (num_heads == 64) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 1)) ||
         ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8) ||
         ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8) ||
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
@@ -222,6 +224,7 @@ inline MlaDecodeHeadPlan mla_decode_head_plan(const std::string_view arch_id,
                                               const int32_t uni_seqlen_qo,
                                               const AiterDtype q_nope_dtype,
                                               const AiterDtype kv_nope_dtype,
+                                              const int32_t page_size,
                                               const bool fast_mode,
                                               const bool intra_batch_mode,
                                               const MlaPlannerFlags flags)
@@ -230,7 +233,7 @@ inline MlaDecodeHeadPlan mla_decode_head_plan(const std::string_view arch_id,
     if(fast_mode)
     {
         return mla_decode_head_plan_v1_2(
-            arch_id, num_heads, max_seqlen_qo, q_nope_dtype, kv_nope_dtype, flags);
+            arch_id, num_heads, max_seqlen_qo, q_nope_dtype, kv_nope_dtype, page_size, flags);
     }
     else if(intra_batch_mode)
     {
