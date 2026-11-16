@@ -10,8 +10,11 @@ kv_cache (dequantized fp8 keys and fp32 scales) and the whole tail cache.
 The reference rounds at the same two bf16 points as the kernel; the only
 sources of difference are 1-ulp fp32 choices (exp, division, log2), so the
 dequantized keys agree to one fp8 ulp and the bytes agree exactly for all but
-a handful of tokens. With ``--vllm-ref <path to vllm kpool_compress.py>`` the
-Triton production kernels are run too and compared byte for byte.
+a handful of tokens. Every case asserts that all dequantized keys are within
+that ulp, all scales are exact and the tail ring is exact. With
+``--vllm-ref <path to vllm kpool_compress.py>`` the Triton production kernels
+are run too and every case with ``ring == pool_size`` (the only ring the Triton
+decode accepts) must match them byte for byte.
 
     python3 test_kpool_compress.py                 # all three writers
     python3 test_kpool_compress.py --only insert   # insert | decode | mixed
@@ -27,9 +30,9 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.kpool_compress import kpool_pick_lanes
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import assertAllclose, benchmark, run_perftest
 
 torch.set_default_device("cuda")
 
@@ -316,14 +319,29 @@ def tail_clone(d):
 
 
 def compare_cache(kv_ref, kv_got, msg):
+    """Fails unless every dequantized key is within one fp8 ulp (rtol 0.13) of
+    the torch reference and every scale is exact. ``diff bytes`` (keys one ulp
+    apart after a 1-ulp fp32 difference) is reported only; the byte-exact
+    contract is checked against vLLM (``--vllm-ref``)."""
     y_ref, s_ref = read_cache(kv_ref)
     y_got, s_got = read_cache(kv_got)
-    err = checkAllclose(
-        y_ref, y_got, rtol=0.13, atol=2e-3, msg=f"{msg} keys (dequantized)"
+    err = assertAllclose(
+        y_ref,
+        y_got,
+        rtol=0.13,
+        atol=2e-3,
+        tol_err_ratio=0.0,
+        msg=f"{msg} keys (dequantized)",
     )
-    err_s = checkAllclose(s_ref, s_got, rtol=1e-6, atol=0, msg=f"{msg} scales")
+    err_s = assertAllclose(
+        s_ref, s_got, rtol=0, atol=0, tol_err_ratio=0.0, msg=f"{msg} scales"
+    )
     diff_bytes = int((kv_ref != kv_got).sum())
     return err, err_s, diff_bytes
+
+
+def assert_vllm_exact(n_diff, msg):
+    assert n_diff == 0, f"{msg}: {n_diff} bytes differ from the vLLM Triton writer"
 
 
 # --------------------------------------------------------------------------
@@ -365,6 +383,7 @@ def test_insert(lens, pool, page, slot_dtype=torch.int64, lanes=0, round_scale=T
         exact = kv.clone()
         vllm_insert(exact, k, gate, ape, slot, pool, round_scale)
         ret["vllm diff bytes"] = int((exact != got).sum())
+        assert_vllm_exact(ret["vllm diff bytes"], "insert")
     return ret
 
 
@@ -467,10 +486,11 @@ def test_decode(
             ret["vllm diff bytes"] = int((kv_e != kv_got).sum()) + int(
                 (tail_e != tail_got).sum()
             )
+            assert_vllm_exact(ret["vllm diff bytes"], "decode (cache + tail)")
         else:
-            # the vendored vLLM walk asserts ring == pool; production rings are
-            # checked byte for byte against Anh Cao's kpool_decode_update_parallel
-            # (tools / cmp_cao.py) instead
+            # vLLM's Triton decode asserts ring == pool_size; the larger
+            # production rings are covered by the torch reference above (exact
+            # tail, keys within one fp8 ulp, exact scales). -1: not compared.
             ret["vllm diff bytes"] = -1
     return ret
 
@@ -556,7 +576,7 @@ def test_mixed(
     )
     tail_ok = torch.equal(tail_ref, tail_got)
     assert tail_ok, "tail ring mismatch"
-    return {
+    ret = {
         "prefill tokens": k.shape[0],
         "err": err,
         "scale err": err_s,
@@ -564,16 +584,140 @@ def test_mixed(
         "tail exact": tail_ok,
         "us": us,
     }
+    if _VLLM is not None:
+        # the vLLM sequence the one launch replaces: insert, kpool_seed_tail_cache,
+        # then the decode update (ring == pool_size, as the Triton decode requires)
+        kv_e, tail_e = kv.clone(), tail_clone(d)
+        vllm_insert(kv_e, k, gate, ape, slot, pool, round_scale)
+        _VLLM.kpool_seed_tail_cache(
+            tail_e, k.contiguous(), gate.contiguous(), tslot.to(torch.int64), pool
+        )
+        vllm_decode(
+            kv_e,
+            tail_e,
+            d["tail_slot"],
+            d["key"],
+            d["score"],
+            ape,
+            d["slot_map"],
+            d["pos"],
+            pool,
+            round_scale,
+        )
+        ret["vllm diff bytes"] = int((kv_e != kv_got).sum()) + int(
+            (tail_e != tail_got).sum()
+        )
+        assert_vllm_exact(ret["vllm diff bytes"], "mixed (cache + tail)")
+    return ret
+
+
+def expect_error(fn, *args, match):
+    try:
+        fn(*args)
+    except RuntimeError as e:
+        assert match in str(e), f"unexpected error: {e}"
+        return
+    raise AssertionError(f"{fn.__name__} accepted invalid arguments ({match})")
+
+
+def test_arg_checks():
+    """Pool sizes per entry point: pool 3 is insert-only (no power-of-two ring
+    is a multiple of 3), unsupported pools are rejected before any launch."""
+    d = make_decode(2, 1, 4, 64, seed=3)
+    k, gate, _, slot, _, kv = make_prefill([64], 4, 64)
+    ape3 = torch.randn(3, HEAD_DIM)
+    for bad in (0, 1, 5, 32):
+        ape = torch.randn(max(bad, 1), HEAD_DIM)
+        expect_error(
+            aiter.kpool_compress_insert, kv, k, gate, ape, slot, bad, match="pool_size"
+        )
+    expect_error(
+        aiter.kpool_decode_update,
+        d["kv"],
+        d["tail"],
+        d["tail_slot"],
+        d["key"],
+        d["score"],
+        ape3,
+        d["slot_map"],
+        d["pos"],
+        3,
+        match="pool_size",
+    )
+    # mixed with decode tokens, then with tail seeding only: pool 3 rejected
+    expect_error(
+        aiter.kpool_mixed_write,
+        d["kv"],
+        ape3,
+        3,
+        True,
+        0,
+        k,
+        gate,
+        slot,
+        None,
+        d["tail"],
+        d["tail_slot"],
+        d["key"],
+        d["score"],
+        d["slot_map"],
+        d["pos"],
+        match="pool_size",
+    )
+    expect_error(
+        aiter.kpool_mixed_write,
+        kv,
+        ape3,
+        3,
+        True,
+        0,
+        k,
+        gate,
+        slot,
+        slot.clone(),
+        d["tail"],
+        match="pool_size",
+    )
+    # a ring that is a multiple of the pool but not a power of two
+    tail12 = torch.zeros(d["tail"].shape[0], 2, 12, HEAD_DIM, dtype=torch.bfloat16)
+    expect_error(
+        aiter.kpool_decode_update,
+        d["kv"],
+        tail12,
+        d["tail_slot"],
+        d["key"],
+        d["score"],
+        d["ape"],
+        d["slot_map"],
+        d["pos"],
+        4,
+        match="power-of-two",
+    )
+    # pool 3 prefill-only through the mixed entry matches the insert reference
+    k3, gate3, ape3, slot3, _, kv3 = make_prefill([130, 17], 3, 64, seed=5)
+    ref = kv3.clone()
+    ref_insert(ref, k3, gate3, ape3, slot3, 3)
+    got = kv3.clone()
+    aiter.kpool_mixed_write(got, ape3, 3, True, 0, k3, gate3, slot3)
+    torch.cuda.synchronize()
+    compare_cache(ref, got, "mixed pool 3 prefill-only")
+    aiter.logger.info("kpool argument checks passed")
 
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="Test the GLM-5.3-Flash kpool cache writers.",
 )
-parser.add_argument("--only", choices=["insert", "decode", "mixed"], default=None)
+parser.add_argument(
+    "--only", choices=["insert", "decode", "mixed", "args"], default=None
+)
 parser.add_argument("--quick", action="store_true", help="fewer and smaller cases")
 parser.add_argument(
-    "--pool", type=int, nargs="*", default=[4, 2, 3, 8, 16], help="pool sizes"
+    "--pool",
+    type=int,
+    nargs="*",
+    default=[4, 2, 3, 8, 16],
+    help="pool sizes of the insert sweep",
 )
 parser.add_argument(
     "--page", type=int, nargs="*", default=[64, 1], help="cache page sizes"
@@ -586,7 +730,7 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-if get_gfx() != "gfx950":
+if get_gfx_runtime() != "gfx950":
     aiter.logger.info(
         "kpool writers target gfx950 (fp8 e4m3fn, permlane swaps); skipping"
     )
@@ -595,6 +739,8 @@ if args.vllm_ref:
     load_vllm_ref(args.vllm_ref)
 
 tables = {}
+if args.only in (None, "args"):
+    test_arg_checks()
 if args.only in (None, "insert"):
     rows = []
     for pool in args.pool:

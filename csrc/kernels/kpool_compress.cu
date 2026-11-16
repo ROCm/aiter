@@ -1217,29 +1217,31 @@ __device__ __forceinline__ void decode_request(
   smask &= vmask;
   cmask &= vmask;
   if constexpr (NMAX == 1) {
-    // One token: it closes a pool only as slot POOL-1 (pos % POOL == POOL-1),
-    // so the other POOL-1 slots are the ring rows phys0 .. phys0 + POOL-2
-    // (ring is a multiple of POOL): no slot selects, no load of the token's
-    // own slot. Gate rows and APE first (the softmax needs only them), K rows
-    // after. The stash (its ring slot is never read in this step) is issued
-    // once the last K row has been consumed: earlier, the compiler's vmcnt
-    // waits for the K rows would also cover the store acks; later, after the
-    // pooled-key stores, its own drain would end the wave. Here the acks
-    // drain under the Hadamard and the quantization.
-    auto stash = [&](uint32_t k0, uint32_t s0) {
-      const gptr<uint16_t> dst = tail_row(blk[0], phys[0]);
-      store_dw(dst, sub, k0);
-      store_dw(dst + (uint32_t)ta.head_elems, sub, s0);
-    };
-    // Layout: the non-closing path (3 steps in 4) is the fall-through right
-    // after the branch and the closing path is the out-of-line block. Without
-    // the hint the compiler puts the stash block behind the closing path, and
-    // every non-closing wave pays an instruction-cache miss (~550 clocks on
-    // the ATT ledger) to reach it.
-    if (__builtin_expect(cmask != 0, 0)) {
-      const gptr<const uint16_t> krow = tail_row(blk[0], phys[0] - (POOL - 1));
-      const gptr<const uint16_t> grow = krow + (uint32_t)ta.head_elems;
-      uint32_t gw[POOL][1], kw[POOL][1];
+      // One token: it closes a pool only as slot POOL-1 (pos % POOL == POOL-1),
+      // so the other POOL-1 slots are the ring rows phys0 - (POOL-1) .. phys0 - 1
+      // (ring is a multiple of POOL, so they do not wrap): no slot selects, no
+      // load of the token's own slot. Gate rows and APE first (the softmax
+      // needs only them), K rows after. The stash (its ring slot is never read
+      // in this step) is issued once the last K row has been consumed:
+      // earlier, the compiler's vmcnt
+      // waits for the K rows would also cover the store acks; later, after the
+      // pooled-key stores, its own drain would end the wave. Here the acks
+      // drain under the Hadamard and the quantization.
+      auto stash = [&](uint32_t k0, uint32_t s0) {
+          const gptr<uint16_t> dst = tail_row(blk[0], phys[0]);
+          store_dw(dst, sub, k0);
+          store_dw(dst + (uint32_t)ta.head_elems, sub, s0);
+      };
+      // Layout: the non-closing path (3 steps in 4) is the fall-through right
+      // after the branch and the closing path is the out-of-line block. Without
+      // the hint the compiler puts the stash block behind the closing path, and
+      // every non-closing wave pays an instruction-cache miss (~550 clocks on
+      // the ATT ledger) to reach it.
+      if(__builtin_expect(cmask != 0, 0))
+      {
+          const gptr<const uint16_t> krow = tail_row(blk[0], phys[0] - (POOL - 1));
+          const gptr<const uint16_t> grow = krow + (uint32_t)ta.head_elems;
+          uint32_t gw[POOL][1], kw[POOL][1];
 #pragma unroll
       for (int s = 0; s < POOL - 1; ++s) gw[s][0] = load_dw<VEC>(grow + s * HEAD_DIM, sub);
       load_ape();
@@ -1546,7 +1548,9 @@ bool aligned(const void* p, int64_t stride_elems, int64_t elem_bytes, int64_t al
 void check_rc(int rc, const char* what)
 {
     AITER_CHECK(rc != -2, what, ": lanes_per_pool must be 16, 32 or 64 and >= pool_size");
-    AITER_CHECK(rc != -3, what, ": pool_size must be 2, 3, 4, 8 or 16");
+    AITER_CHECK(rc != -3,
+                what,
+                ": unsupported pool_size (2, 3, 4, 8 or 16; 2, 4, 8 or 16 with the tail ring)");
     AITER_CHECK(rc != -4, what, ": next_n must be <= 16");
     AITER_CHECK(rc == 0, what, ": ", hipGetErrorString(static_cast<hipError_t>(rc)));
 }
@@ -1562,6 +1566,28 @@ void check_cache(const aiter_tensor_t& kv_cache)
     AITER_CHECK(page_size == 1 || page_size % 16 == 0,
                 "page_size must be 1 or a multiple of 16 (preshuffled tiles), got ", page_size);
     AITER_CHECK(page_size <= (1 << 20), "page_size too large, got ", page_size);
+}
+
+// Pool sizes per entry point. The insert supports {2, 3, 4, 8, 16}. Every
+// path that touches the tail ring (decode, and mixed with tail seeding or
+// decode tokens) needs a ring that is a power of two (shift / mask indexing)
+// and a multiple of pool_size, so only the power-of-two pools {2, 4, 8, 16}.
+// Checked first: the auto lane pick and the ring checks divide by pool_size.
+void check_pool_size(int pool_size, bool uses_ring, const char* what)
+{
+    if(uses_ring)
+        AITER_CHECK(
+            pool_size == 2 || pool_size == 4 || pool_size == 8 || pool_size == 16,
+            what,
+            ": pool_size must be 2, 4, 8 or 16 when the tail ring is used (the ring must be a "
+            "power-of-two multiple of pool_size), got ",
+            pool_size);
+    else
+        AITER_CHECK(pool_size == 2 || pool_size == 3 || pool_size == 4 || pool_size == 8 ||
+                        pool_size == 16,
+                    what,
+                    ": pool_size must be 2, 3, 4, 8 or 16, got ",
+                    pool_size);
 }
 
 void check_ape(const aiter_tensor_t& ape, int pool_size)
@@ -1629,8 +1655,12 @@ DecodeChecked check_decode(const aiter_tensor_t& tail_kv_cache,
                     tail_kv_cache.stride(3) == 1 && tail_kv_cache.stride(2) == KPOOL_HEAD_DIM,
                 "tail_kv_cache must be bf16 [num_blocks, 2, ring, 128] with contiguous rows");
     const int ring = static_cast<int>(tail_kv_cache.size(2));
-    AITER_CHECK(ring >= pool_size && ring % pool_size == 0, "tail ring (", ring,
-                ") must be a multiple of pool_size (", pool_size, ")");
+    AITER_CHECK(ring >= pool_size && ring % pool_size == 0 && (ring & (ring - 1)) == 0,
+                "tail ring (",
+                ring,
+                ") must be a power-of-two multiple of pool_size (",
+                pool_size,
+                ")");
     AITER_CHECK(B * key.stride(0) < (1LL << 31) && B * slot_score.stride(0) < (1LL << 31) &&
                     B * next_n < (1LL << 31),
                 "decode key / slot_score must have < 2^31 elements");
@@ -1682,6 +1712,9 @@ void kpool_compress_insert(aiter_tensor_t& kv_cache,
                            bool round_scale,
                            int lanes_per_pool)
 {
+    // a failed argument check raises a Python RuntimeError instead of aborting
+    aiter_detail::AiterThrowGuard throw_guard;
+    check_pool_size(pool_size, false, "kpool_compress_insert");
     check_cache(kv_cache);
     check_rows(k, "k");
     check_rows(gate_score, "gate_score");
@@ -1718,6 +1751,9 @@ void kpool_decode_update(aiter_tensor_t& kv_cache,
                          int pool_size,
                          bool round_scale)
 {
+    // a failed argument check raises a Python RuntimeError instead of aborting
+    aiter_detail::AiterThrowGuard throw_guard;
+    check_pool_size(pool_size, true, "kpool_decode_update");
     check_cache(kv_cache);
     check_ape(ape, pool_size);
     if(key.size(0) == 0 || key.size(1) == 0)
@@ -1751,6 +1787,9 @@ void kpool_mixed_write(aiter_tensor_t& kv_cache,
                        std::optional<aiter_tensor_t> decode_slot_mapping,
                        std::optional<aiter_tensor_t> decode_positions)
 {
+    // a failed argument check raises a Python RuntimeError instead of aborting
+    aiter_detail::AiterThrowGuard throw_guard;
+    check_pool_size(pool_size, false, "kpool_mixed_write");
     check_cache(kv_cache);
     check_ape(ape, pool_size);
     const int page_size = static_cast<int>(kv_cache.size(1));
@@ -1763,6 +1802,8 @@ void kpool_mixed_write(aiter_tensor_t& kv_cache,
     const bool has_decode  = B > 0 && next_n > 0;
     if(!(has_prefill || has_decode))
         return;
+    // pool 3 is prefill-only: no power-of-two ring is a multiple of 3
+    check_pool_size(pool_size, has_decode || seed, "kpool_mixed_write");
 
     if(has_decode)
     {
@@ -1786,7 +1827,12 @@ void kpool_mixed_write(aiter_tensor_t& kv_cache,
                         tail_kv_cache->stride(3) == 1 && tail_kv_cache->stride(2) == KPOOL_HEAD_DIM,
                     "tail_kv_cache must be bf16 [num_blocks, 2, ring, 128] with contiguous rows");
         const int ring = static_cast<int>(tail_kv_cache->size(2));
-        AITER_CHECK(ring >= pool_size && ring % pool_size == 0, "tail ring must be a multiple of pool_size");
+        AITER_CHECK(ring >= pool_size && ring % pool_size == 0 && (ring & (ring - 1)) == 0,
+                    "tail ring (",
+                    ring,
+                    ") must be a power-of-two multiple of pool_size (",
+                    pool_size,
+                    ")");
         ta       = tail_args(*tail_kv_cache);
         tail_vec = aligned(tail_kv_cache->data_ptr(), tail_kv_cache->stride(0), 2, 4) &&
                    aligned(tail_kv_cache->data_ptr(), tail_kv_cache->stride(1), 2, 4);

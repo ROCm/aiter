@@ -16,7 +16,11 @@ namespace aiter {
 //           in the MFMA 16x16 preshuffled layout when page_size > 1, followed
 //           by page_size fp32 scales); page_size must be 1 or a multiple of 16.
 // ape:      [pool_size, 128] fp32 additive position embedding of the pool.
-// pool_size in {2, 3, 4, 8, 16}; lanes_per_pool 0 (auto) or 16 / 32 / 64.
+// pool_size: {2, 3, 4, 8, 16} for the insert; {2, 4, 8, 16} for every path
+//           that uses the tail ring (decode, mixed with tail seeding or decode
+//           tokens), whose ring must be a power-of-two multiple of pool_size.
+// lanes_per_pool 0 (auto) or 16 / 32 / 64.
+// gfx950 only (fp8 e4m3fn); the Python entry points reject other devices.
 
 // Prefill insert: k, gate_score [n_tokens, 128] bf16 (rows may be strided),
 // slot_mapping [n_tokens] int32 / int64 (>= 0 on the token that closes a pool).
@@ -30,7 +34,8 @@ void kpool_compress_insert(aiter_tensor_t& kv_cache,
                            int lanes_per_pool = 0);
 
 // Decode update: each token stashes its K / gate into the request's tail ring
-// tail_kv_cache [num_blocks, 2, ring, 128] bf16 (ring a multiple of pool_size);
+// tail_kv_cache [num_blocks, 2, ring, 128] bf16 (ring a power-of-two multiple
+// of pool_size);
 // a token that closes a pool compresses it into kv_cache. key, slot_score
 // [num_requests, next_n, 128] bf16; tail_slot_mapping, slot_mapping, positions
 // [num_requests, next_n] all int32 or all int64; next_n <= 16.
