@@ -474,8 +474,12 @@ def per_token_quant_hip(
 SCALE_LAYOUT_M32K4_SUPPORTED = True
 
 
-@torch_compile_guard()
-def per_group_quant_hip(
+# Routed on a neutrally named layer, not on the public spelling: a route's
+# contract is the decorated function's whole signature, so decorating
+# `per_group_quant_hip` would put a backend-named function into a contract
+# providers implement against. `rmsnorm` sits the same way, below its two
+# public names.
+def _per_group_quant_fake(
     x: Tensor,
     scale: Tensor | None = None,
     quant_dtype: torch.dtype = dtypes.i8,
@@ -486,6 +490,57 @@ def per_group_quant_hip(
     scale_type: torch.dtype = dtypes.fp32,
     scale_layout_m32k4: bool = False,
 ) -> "tuple[Tensor, Tensor]":
+    """Shapes only -- both results are freshly allocated here, so neither
+    aliases an argument and registration has nothing to declare about them.
+
+    ``transpose_scale`` shuffles the scale's contents inside the kernel and
+    does not move its shape, so it does not appear below; the scale is
+    allocated to the same shape either way.
+    """
+    shape = x.shape
+    y = torch.empty(shape, dtype=quant_dtype, device=x.device)
+    if scale_layout_m32k4:
+        m = x.numel() // shape[-1]
+        return y, torch.empty(
+            ((m + 31) // 32 * 32, shape[-1] // 32), dtype=scale_type, device=x.device
+        )
+    return y, torch.empty(
+        (*shape[:-1], shape[-1] // group_size), dtype=scale_type, device=x.device
+    )
+
+
+@_route(op="per_group_quant", version=1, fake=_per_group_quant_fake)
+def _per_group_quant_routed(
+    x: Tensor,
+    scale: Tensor | None = None,
+    quant_dtype: torch.dtype = dtypes.i8,
+    group_size: int = 128,
+    transpose_scale: bool = False,
+    num_rows: "torch.Tensor | None" = None,
+    num_rows_factor: int = 1,
+    scale_type: torch.dtype = dtypes.fp32,
+    scale_layout_m32k4: bool = False,
+) -> "tuple[Tensor, Tensor]":
+    """Quantize ``x`` in groups along its last axis, one scale per group.
+
+    Returns ``(y, scale)`` -- a new ``quant_dtype`` tensor shaped like ``x``
+    and its ``scale_type`` scales. Nothing is written through the arguments.
+
+    Args:
+        x: input; the last axis is split into ``group_size``-wide groups.
+        scale: must be None -- a precomputed scale raises rather than being
+            silently ignored.
+        quant_dtype: output dtype.
+        group_size: elements per group; 32, 64 or 128.
+        transpose_scale: emit scales in the shuffled layout the ASM GEMMs
+            read, rather than row-major.
+        num_rows, num_rows_factor: quantize only the leading rows a device
+            tensor names, for a batch whose real height the host does not know.
+        scale_type: dtype of the returned scales.
+        scale_layout_m32k4: MXFP8 1x32 with the scale in the gfx1250 ASM
+            A-scale layout; needs fp8 output, ``group_size=32``, an e8m0
+            ``scale_type`` and ``scale=None``.
+    """
     shape = x.shape
     device = x.device
     if scale_layout_m32k4:
@@ -538,6 +593,37 @@ def per_group_quant_hip(
             num_rows_factor=num_rows_factor,
         )
     return y, scale
+
+
+@torch_compile_guard()
+def per_group_quant_hip(
+    x: Tensor,
+    scale: Tensor | None = None,
+    quant_dtype: torch.dtype = dtypes.i8,
+    group_size: int = 128,
+    transpose_scale: bool = False,
+    num_rows: "torch.Tensor | None" = None,
+    num_rows_factor: int = 1,
+    scale_type: torch.dtype = dtypes.fp32,
+    scale_layout_m32k4: bool = False,
+) -> "tuple[Tensor, Tensor]":
+    """The historical spelling of ``per_group_quant``.
+
+    The name predates a neutral one, so an ordinary call routes and a
+    provider serves callers of this name without any of them changing.
+    Returns ``(y, scale)``; nothing is written through the arguments.
+    """
+    return _per_group_quant_routed(
+        x,
+        scale,
+        quant_dtype,
+        group_size,
+        transpose_scale,
+        num_rows,
+        num_rows_factor,
+        scale_type,
+        scale_layout_m32k4,
+    )
 
 
 def per_1x32_mx_quant_hip(

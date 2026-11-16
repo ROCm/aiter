@@ -53,10 +53,14 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("out"), py::arg("w"), py::arg("eps"), py::arg("gemma_norm") = false);
     m.def("allreduce_add_lamport", &aiter::allreduce_add_lamport,
           py::arg("_fa"), py::arg("inp"), py::arg("other"), py::arg("out"));
+    m.def("all_gather_lamport", &aiter::all_gather_lamport,
+          py::arg("_fa"), py::arg("inp"), py::arg("out"), py::arg("dim"),
+          py::arg("reg_inp_ptr"), py::arg("reg_inp_bytes"));
     m.def("dispose", &aiter::dispose, py::arg("_fa"));
     // Default is the max world size, so callers that omit it get a buffer safe
     // for every supported world size.
     m.def("meta_size", &aiter::meta_size, py::arg("world_size") = 8);
+    m.def("ll_ar_max_bytes", &aiter::ll_ar_max_bytes, py::arg("world_size"));
     m.def("register_input_buffer", &aiter::register_input_buffer,
           py::arg("_fa"), py::arg("self_ptr"), py::arg("all_ptrs"));
     m.def("register_output_buffer", &aiter::register_output_buffer,
