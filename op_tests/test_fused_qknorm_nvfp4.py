@@ -372,6 +372,14 @@ REJECT = {  # name -> (kwargs of the op call, message of the refusal); a failed 
         {"index_cache_dtype": "mxfp4"},
         "go together",
     ),
+    "index not whole pages": (
+        {"idx_bytes": HEAD_SIDE + 128},
+        "whole 9216 B pages",
+    ),
+    "index fewer pages than kv": (
+        {"idx_bytes": HEAD_SIDE},
+        "index_cache must contain at least num_blocks * block_size rows",
+    ),
     "no scales": (
         {"k_scale": None, "v_scale": None},
         "takes the fp32 global k_scale/v_scale",
@@ -391,7 +399,6 @@ def run_reject(name):
     pos = torch.zeros(n, dtype=torch.int64)
     slots = torch.arange(n, dtype=torch.int64)
     kv = torch.zeros(2, 2 * nkv * HEAD_SIDE, dtype=torch.uint8)
-    idx = torch.zeros(2, HEAD_SIDE, dtype=torch.uint8)
     kw = {
         "kv_cache_dtype": "nvfp4",
         "index_cache_dtype": "nvfp4",
@@ -400,6 +407,7 @@ def run_reject(name):
     }
     kw.update(REJECT[name][0])
     block = kw.pop("block", PAGE)
+    idx = torch.zeros(kw.pop("idx_bytes", 2 * HEAD_SIDE), dtype=torch.uint8)
     if kw.pop("alias", False):
         kv = kv[:1].expand(2, -1)  # page stride 0: both pages are the same bytes
     aiter.fused_qknorm_idxrqknorm(
