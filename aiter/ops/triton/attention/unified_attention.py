@@ -235,14 +235,23 @@ def gfx950_gluon_supported(
     use_alibi_slopes: bool = False,
     use_qq_bias: bool = False,
 ) -> bool:
-    """Whether `unified_attention` serves a call with these arguments through the
-    gfx950 Gluon kernel.
+    """Return True if `unified_attention` runs these arguments on the gfx950 Gluon kernel.
 
-    The gate `unified_attention(..., backend="gluon")` applies, taking only the
-    arguments it reads, for a caller that decides something up front from it
-    (e.g. which dtype to give q). `head_size` is the logical one (doubled for an
-    fp4-packed q); `head_size_v` defaults to it. `k_width` is the shuffled K
-    cache's trailing dimension, required with `shuffled_kv_cache`.
+    Args:
+        q_dtype (torch.dtype): Dtype of q.
+        kv_cache_dtype (torch.dtype): Dtype of the K cache.
+        head_size (int): Head size of q and k. Double it for an fp4-packed q.
+        block_size (int): Page size of the KV cache.
+        head_size_v (int | None): Head size of v. Default: head_size.
+        shuffled_kv_cache (bool): True if the KV cache uses the shuffled layout.
+        k_width (int | None): Last dimension of the shuffled K cache. Required if
+            shuffled_kv_cache is True.
+        softcap (float): Softcap of the call. The Gluon kernel supports only 0.
+        use_alibi_slopes (bool): True if the call gives alibi_slopes.
+        use_qq_bias (bool): True if the call gives qq_bias.
+
+    Returns:
+        bool: True if the gfx950 Gluon kernel supports the call.
     """
     if head_size_v is None:
         head_size_v = head_size
