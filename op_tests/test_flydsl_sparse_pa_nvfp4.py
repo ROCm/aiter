@@ -909,6 +909,55 @@ def capture_scratch():
     return bad
 
 
+def capture_prefill():
+    """Prefill under graph capture. The scale placeholder (the default k / v scale) is
+    allocated and zero-filled on the first call that needs it, which a capture would record
+    instead of run: that call is refused. After an eager call, or after
+    ``sparse_pa_nvfp4_decode_alloc``, the capture replays and matches the oracle at every
+    tile."""
+    bad = 0
+    dev = torch.cuda.current_device()
+    c = make_case([3000, 700, 130], [300, 700, 130], 1, 16, seed=9)
+    ref = run_torch(c)
+    cold = dict(c, k_scale=None, v_scale=None)  # the default scales: the placeholder
+    for tq, rnd in PREFILL_TQ:
+        prefill_call(cold, tq=tq, rounds=rnd)  # the compile happens here
+        _unit_scale.cache_clear()
+        err = None
+        try:
+            with torch.cuda.graph(torch.cuda.CUDAGraph()):
+                prefill_call(cold, tq=tq, rounds=rnd)
+        except ValueError as e:
+            err = str(e)
+        if err is None or "scale placeholder" not in err:
+            print(f"capture prefill tq={tq} r={rnd}: expected a refusal, got {err!r}")
+            bad += 1
+        if _unit_scale.cache_info().currsize:
+            print(f"capture prefill tq={tq} r={rnd}: a refused call left an allocation")
+            bad += 1
+        # Warm-ups that make the capture legal: an eager call, or the decode alloc.
+        for how in ("eager call", "decode_alloc"):
+            _unit_scale.cache_clear()
+            if how == "eager call":
+                prefill_call(c, tq=tq, rounds=rnd)
+            else:
+                sparse_pa_nvfp4_decode_alloc(dev)
+            out = torch.empty_like(c["q"])
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                sparse_pa_nvfp4_prefill(
+                    c["q"], c["cache"], c["topk"], c["bt"], c["row_req"], c["row_kv"],
+                    SM_SCALE, out, c["k_scale"], c["v_scale"], tq=tq, rounds=rnd,
+                )  # fmt: skip
+            for i in range(3):
+                out.fill_(float("nan"))  # a launch that did not run leaves NaN
+                g.replay()
+                torch.cuda.synchronize()
+                name = f"prefill capture after {how}, tq={tq} r={rnd}, replay {i}"
+                bad += int(not check(name, out, ref)[0])
+    return bad
+
+
 def two_streams(n=64, rounds=3):
     """Split launches on two streams of one device. Each stream replays a graph of ``n``
     launches (back to back, so they overlap), unsynchronised, every launch with its own
@@ -1165,6 +1214,7 @@ def main(argv=None):
     failed += poisoned_tail()
     failed += refusals()
     failed += capture_scratch()
+    failed += capture_prefill()
     failed += two_streams()
     if args.perf:
         perf = [
