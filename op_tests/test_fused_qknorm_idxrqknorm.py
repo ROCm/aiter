@@ -1723,10 +1723,14 @@ def run_fused_qknorm_idxrqknorm(
     index_dtype: str | None = None,
     q_dtype: torch.dtype | None = None,
     index_pages: torch.Tensor | None = None,
+    qkv_partials: torch.Tensor | None = None,
 ):
     """kv_dtype="mxfp4", index_dtype ("auto", "fp8", "mxfp4"), q_dtype (e4m3) and
-    index_pages (an mxfp4 index cache to write into) override what `mode` implies."""
+    index_pages (an mxfp4 index cache to write into) override what `mode` implies.
+    With qkv_partials the op reduces qkv from them, into a qkv that starts all NaN."""
     qkv = case["qkv"].clone()
+    if qkv_partials is not None:
+        qkv.fill_(float("nan"))
     if mode == "inplace":
         aiter.fused_qknorm_idxrqknorm(
             qkv,
@@ -1839,6 +1843,7 @@ def run_fused_qknorm_idxrqknorm(
         v_scale=v_scale,
         asm_layout=use_asm_layout,
         skip_index_branch="skip_index" in mode,
+        qkv_partials=qkv_partials,
     )
     call()  # `call` is returned too: the op alone, on these buffers, for timing
     return (
@@ -1891,6 +1896,10 @@ def test_fused_qknorm_idxrqknorm(
         return {"err": check_mxfp4_scale_rule(num_tokens)}
     if mode == "mxfp4_reject":
         return {"err": check_mxfp4_reject()}
+    if mode in PARTIALS_MODES:
+        return check_qkv_partials(mode, dtype, num_tokens, block_size, rotary_dim)
+    if mode == "qkv_partials_reject":
+        return {"err": check_qkv_partials_reject()}
 
     case = make_case(
         dtype=dtype,
@@ -2108,6 +2117,23 @@ REJECT_CHILD = (
 )
 
 
+def check_rejects(cases: dict):
+    """name -> (op call, {positional index: replacement}, kwargs, expected message): each
+    call runs in a child and must fail with that message (None: must succeed)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, (call, edits, kwargs, msg) in cases.items():
+            args = [edits.get(i, a) for i, a in enumerate(call.args)]
+            path = os.path.join(tmp, name)
+            torch.save((args, {**call.keywords, **kwargs}), path)
+            cmd = [sys.executable, "-c", REJECT_CHILD, path]
+            r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if msg is None:
+                assert r.returncode == 0, r.stderr[-500:]
+            else:
+                assert r.returncode != 0, name
+                assert msg in r.stderr, f"{name}: {r.stderr[-500:]}"
+
+
 def check_bytes(actual, expected, msg: str):
     return check_close(
         actual.view(torch.uint8), expected.view(torch.uint8), msg=msg, rtol=0, atol=0
@@ -2323,18 +2349,7 @@ def check_mxfp4_reject():
             "with the same num_pages and a contiguous last dim",
         ),
     }
-    with tempfile.TemporaryDirectory() as tmp:
-        for name, (call, edits, kwargs, msg) in cases.items():
-            args = [edits.get(i, a) for i, a in enumerate(call.args)]
-            path = os.path.join(tmp, name)
-            torch.save((args, {**call.keywords, **kwargs}), path)
-            cmd = [sys.executable, "-c", REJECT_CHILD, path]
-            r = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if msg is None:
-                assert r.returncode == 0, r.stderr[-500:]
-            else:
-                assert r.returncode != 0, name
-                assert msg in r.stderr, f"{name}: {r.stderr[-500:]}"
+    check_rejects(cases)
     # Where opus converts to fp4/fp8 as zeros the wrapper raises: fake the arch
     for call, gfx, msg in (
         (page16, "gfx942", "gfx950"),
@@ -2349,6 +2364,122 @@ def check_mxfp4_reject():
                 assert msg in str(e), e
             else:
                 raise AssertionError(f"accepted on {gfx}: {call.keywords}")
+    return 0
+
+
+# qkv_partials: the fp32 [splits, >= num_tokens, row] split-K partials of a bf16 qkv that the
+# gfx1250 split-K GEMM left unreduced. The judge is this op on the reduced qkv: with the
+# partials every output, qkv included, must match it bit for bit (any NaN matching any NaN).
+# mode -> the insert mode it runs in: M3's page-16 fp8 per-token K/V, bf16 K/V, page 128.
+PARTIALS_MODES = {
+    "qkv_partials": "asm_layout_fp8_pertoken",
+    "qkv_partials_bf16": "asm_layout",
+    "qkv_partials_page128": "insert",
+}
+
+
+def reduce_partials(partials: torch.Tensor) -> torch.Tensor:
+    """The GEMM's reduce kernel (gemm_a8w8_splitk_reduce), on the CPU: fp32 adds in split
+    order with denormals kept, then one round to nearest even to bf16."""
+    p = partials.cpu()
+    acc = p[0].clone()
+    for split in p[1:]:
+        acc += split
+    return acc.to(torch.bfloat16).to(partials.device)
+
+
+def make_partials(splits: int, rows: int, row: int) -> torch.Tensor:
+    """Random partials plus columns whose sums are subnormal, overflow, NaN or bf16 ties:
+    where the op's denormal-flushing arithmetic could part from the reduce kernel's."""
+    p = torch.randn(splits, rows, row, device="cuda") * 4
+    tiny = torch.finfo(torch.float32).tiny
+    edges = [
+        (1.5 * tiny, -tiny),  # subnormal sum of normal partials
+        (3e-39, 1e-39),  # subnormal partials
+        (3.3e38, 3.3e38),  # overflow to inf
+        (float("inf"), float("-inf")),  # NaN
+        (1.0, 2.0**-8),  # tie, rounds down to the even 1.0
+        (1.0 + 2.0**-7, 2.0**-8),  # tie, rounds up to the even 1 + 2^-6
+    ]
+    for c, (a, b) in enumerate(edges):
+        cols = slice(c, None, 61)  # a few columns of every head
+        p[:, :, cols] = 0.0
+        p[0, :, cols], p[1, :, cols] = a, b
+    return p
+
+
+def bits(t: torch.Tensor) -> torch.Tensor:
+    """t's bit pattern, every NaN alike (the reference rounds on the CPU)."""
+    ints = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+    i = t.contiguous().view(ints[t.element_size()])
+    return i.masked_fill(t.float().isnan(), -1) if t.is_floating_point() else i
+
+
+def check_qkv_partials(mode, dtype, num_tokens, block_size, rotary_dim):
+    """A sparse layer (one index head) and a dense one, 2 / 4 / 8 splits, q to q_out and
+    in place; the partials hold 3 rows more than num_tokens (a longer split stride)."""
+    base = PARTIALS_MODES[mode]
+    run = partial(
+        run_fused_qknorm_idxrqknorm,
+        mode=base,
+        use_index_slot_mapping=True,
+        use_fp8_kv_cache="fp8" in base,
+    )
+    ret = {"gfx": get_gfx_runtime()}
+    for niq, splits in itertools.product((1, 0), (2, 4, 8)):
+        case = make_case(
+            dtype=dtype,
+            num_tokens=num_tokens,
+            block_size=block_size,
+            num_kv_heads=1,
+            num_index_heads=niq,
+            rotary_dim=rotary_dim,
+        )
+        partials = make_partials(splits, num_tokens + 3, case["qkv"].shape[1])
+        partials = partials[:, :num_tokens]
+        case["qkv"] = reduce_partials(partials)
+        (*want, ref_call), _ = run(case)
+        (*got, call), _ = run(case, qkv_partials=partials)
+        if niq:  # and q in place: q_out (positional 17) None
+            nan_qkv = torch.full_like(case["qkv"], float("nan"))
+            for c, outs, qkv in (
+                (ref_call, want, case["qkv"].clone()),
+                (call, got, nan_qkv),
+            ):
+                c.func(qkv, *c.args[1:17], None, *c.args[18:], **c.keywords)
+                outs.append(qkv)
+        for i, (g, w) in enumerate(zip(got, want)):
+            if isinstance(g, torch.Tensor):
+                msg = f"{mode} niq={niq} {splits} splits, output {i}"
+                assert torch.equal(bits(g), bits(w)), msg
+        if niq:
+            _, ret[f"{splits} splits us"] = run_perftest(call, num_iters=50)
+            _, ret["reduced qkv us"] = run_perftest(ref_call, num_iters=50)
+    return {**ret, "err": 0}
+
+
+def check_qkv_partials_reject():
+    """The calls with no partials instance, and partials the kernel cannot read, are
+    refused ("good" shows the harness is sound)."""
+    case = make_case(
+        dtype=torch.bfloat16, num_tokens=4, num_kv_heads=1, num_index_heads=1
+    )
+    p = make_partials(2, 4, case["qkv"].shape[1])
+    run = partial(run_fused_qknorm_idxrqknorm, use_index_slot_mapping=True)
+    call = run(case, mode="asm_layout", use_fp8_kv_cache=False, qkv_partials=p)[0][-1]
+    fp8_q = torch.zeros(4, 16 * HEAD_DIM, dtype=dtypes.fp8, device="cuda")
+    unaligned = torch.zeros(p.numel() + 1, device="cuda")[1:].view(p.shape)
+    bad = {
+        "not_insert": ({13: None, 14: None, 15: None}, {}),
+        "skip_index_branch": ({15: None}, {"skip_index_branch": True}),
+        "fp8_q_out": ({17: fp8_q}, {}),
+        "3_splits": ({}, {"qkv_partials": p[[0, 1, 1]]}),
+        "fp16_partials": ({}, {"qkv_partials": p.half()}),
+        "short_rows": ({}, {"qkv_partials": p[:, :3]}),
+        "unaligned": ({}, {"qkv_partials": unaligned}),
+    }
+    cases = {k: (call, e, kw, "qkv_partials") for k, (e, kw) in bad.items()}
+    check_rejects({"good": (call, {}, {}, None), **cases})
     return 0
 
 
@@ -2375,8 +2506,23 @@ DEFAULT_CASES = [
     ("fp8_kv_cache_pertoken_uint8", "bf16", 17, 16, 64, 4),
     ("asm_layout_fp8_pertoken", "bf16", 17, 16, 64, 4),
     ("asm_layout_fp8_pertoken", "fp16", 19, 16, 96, 4),
-    ("asm_layout_fp8_pertoken", "bf16", 13, 16, 96, 0),  # a dense layer: no index operands
+    (
+        "asm_layout_fp8_pertoken",
+        "bf16",
+        13,
+        16,
+        96,
+        0,
+    ),  # a dense layer: no index operands
     ("asm_layout_fp8_pertoken_uint8", "bf16", 17, 16, 64, 4),
+]
+DEFAULT_CASES += [
+    # qkv_partials (num_index_heads is not a parameter: each case runs 1 and 0)
+    ("qkv_partials", "bf16", 1, 16, 64, 1),
+    ("qkv_partials", "bf16", 64, 16, 64, 1),
+    ("qkv_partials_bf16", "bf16", 17, 16, 128, 1),
+    ("qkv_partials_page128", "bf16", 33, 128, 96, 1),
+    ("qkv_partials_reject", "bf16", 4, 16, 64, 1),
 ]
 DEFAULT_CASES += [
     (mode, dtype_name, num_tokens, 16 if mode.startswith("asm_layout") else 128, 64, 1)
@@ -2408,6 +2554,8 @@ l_mode = [
     "asm_layout_fp8_pertoken",
     "asm_layout_fp8_pertoken_uint8",
     *MXFP4,
+    *PARTIALS_MODES,
+    "qkv_partials_reject",
 ]
 l_dtype = ["fp16", "bf16"]
 
@@ -2545,6 +2693,7 @@ if args.minimax_benchmark:
 
 df = []
 mxfp4_rows = []
+partials_rows = []
 for (
     mode,
     dtype_name,
@@ -2561,7 +2710,10 @@ for (
         rotary_dim=rotary_dim,
         num_index_heads=num_index_heads,
     )
-    (mxfp4_rows if mode in MXFP4 else df).append(ret)
+    if mode in MXFP4:
+        mxfp4_rows.append(ret)
+    else:
+        (partials_rows if mode.startswith("qkv_partials") else df).append(ret)
 
 df = pd.DataFrame(df)
 if args.minimax_tp4:
@@ -2593,4 +2745,9 @@ else:
         df_md = pd.DataFrame(mxfp4_rows).to_markdown(index=False)
         aiter.logger.info(
             "fused_qknorm_idxrqknorm mxfp4 summary (markdown):\n%s", df_md
+        )
+    if partials_rows:
+        df_md = pd.DataFrame(partials_rows).to_markdown(index=False)
+        aiter.logger.info(
+            "fused_qknorm_idxrqknorm qkv_partials summary (markdown):\n%s", df_md
         )

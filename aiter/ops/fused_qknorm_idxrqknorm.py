@@ -63,6 +63,7 @@ def _fused_qknorm_idxrqknorm_hip(
     v_scale: Tensor | None = None,
     asm_layout: bool = False,
     skip_index_branch: bool = False,
+    qkv_partials: Tensor | None = None,
 ) -> None:
     pass
 
@@ -94,6 +95,7 @@ def fused_qknorm_idxrqknorm(
     v_scale: Tensor | None = None,
     asm_layout: bool = False,
     skip_index_branch: bool = False,
+    qkv_partials: Tensor | None = None,
 ) -> None:
     # The main K/V caches are always passed as separate kv_cache_k / kv_cache_v
     # tensors. asm_layout selects the in-cache addressing: page-16 SHUFFLE
@@ -118,6 +120,11 @@ def fused_qknorm_idxrqknorm(
     #   arithmetic, not a hardware convert, but nvfp4 (like mxfp4) is refused off gfx950.
     # q_out may be an e4m3 tensor (fp8 or uint8, insert mode): unit-scale e4m3 cast, saturating
     #   (+-inf too; NaN stays NaN), written instead of the bf16 q (as index_q_out).
+    # qkv_partials: the FP32 [num_splits (2, 4 or 8), >= num_tokens, row] split-K partials of
+    #   a bf16 qkv its GEMM left unreduced. The kernel sums them as the gfx1250 split-K
+    #   GEMM's reduce kernel does (FP32, split order, one round to nearest even), writes the
+    #   reduced row back into qkv and goes on from it; insert mode with every qkv slot
+    #   processed (no skip_index_branch), no fp4 cache or fp8 q_out.
     if index_cache_dtype is None:
         index_cache_dtype = (
             "fp8"
@@ -193,4 +200,5 @@ def fused_qknorm_idxrqknorm(
         v_scale,
         asm_layout,
         skip_index_branch,
+        qkv_partials,
     )

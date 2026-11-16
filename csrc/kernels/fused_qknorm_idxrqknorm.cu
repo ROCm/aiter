@@ -199,6 +199,129 @@ __device__ __forceinline__ void storeElems(scalar_t* __restrict__ dst,
     *reinterpret_cast<uint2*>(dst) = roundPackElems<scalar_t>(elems);
 }
 
+// FP32 split-K partials of a bf16 qkv that a split-K GEMM left unreduced:
+// [num_splits, >= num_tokens, row], the splits split_stride elements apart.
+// num_splits == 0 means qkv holds the row.
+struct QkvPartials
+{
+    const float* ptr     = nullptr;
+    int num_splits       = 0;
+    int64_t split_stride = 0;
+};
+
+// The reduce kernel adds with f32 denormals; this module flushes them
+// (-fgpu-flush-denormals-to-zero). A lane whose partials or running sums leave the
+// normal range redoes its sum here exactly: each fp32 add is exact in double (both
+// operands are fp32, and where they are 2^29 apart the smaller one cannot change
+// the rounding), then rounded to fp32 with gradual underflow. Never reached by
+// finite real activations; it keeps the result bitwise for every input.
+__device__ __forceinline__ double exactF32ToDouble(float f)
+{
+    const uint32_t u   = __builtin_bit_cast(uint32_t, f);
+    const uint32_t mag = u & 0x7fffffffu;
+    if(mag != 0 && mag < 0x00800000u) // subnormal: the conversion would flush it
+    {
+        const double v = static_cast<double>(mag) * 0x1p-149;
+        return (u >> 31) ? -v : v;
+    }
+    return static_cast<double>(f);
+}
+
+__device__ __forceinline__ double roundToF32(double x)
+{
+    if(fabs(x) < 0x1p-126) // fp32 subnormals are the multiples of 2^-149
+    {
+        return rint(x * 0x1p149) * 0x1p-149;
+    }
+    return static_cast<double>(static_cast<float>(x));
+}
+
+__device__ __forceinline__ uint16_t bf16BitsOfF32(double x)
+{
+    if(fabs(x) < 0x1p-126) // round the subnormal's fp32 bits to nearest even
+    {
+        const uint32_t u = (signbit(x) ? 0x80000000u : 0u) |
+                           static_cast<uint32_t>(fabs(x) * 0x1p149);
+        return static_cast<uint16_t>((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    }
+    return __builtin_bit_cast(uint16_t, static_cast<__bf16>(static_cast<float>(x)));
+}
+
+__device__ __forceinline__ bool isSubnormalF32(float f)
+{
+    const uint32_t mag = __builtin_bit_cast(uint32_t, f) & 0x7fffffffu;
+    return mag != 0 && mag < 0x00800000u;
+}
+
+// One lane's kElemsPerLane qkv elements reduced from kSplits partials as the gfx1250
+// split-K GEMM's reduce kernel (gemm_a8w8_splitk_reduce) does it: every load first,
+// an FP32 sum in split order,
+// then one round-to-nearest-even to bf16 (the same fptrunc the reduce kernel
+// emits), so the result matches the reduced qkv bit for bit.
+template <int kSplits>
+__device__ __forceinline__ void reducePartials(const float* __restrict__ src,
+                                               int64_t split_stride,
+                                               uint16_t (&raw)[kElemsPerLane])
+{
+    static_assert(kElemsPerLane == 4, "one float4 per split and lane");
+    float4 parts[kSplits];
+#pragma unroll
+    for(int s = 0; s < kSplits; ++s)
+    {
+        parts[s] = *reinterpret_cast<const float4*>(src + s * split_stride);
+    }
+    const auto part = [&](int s, int i) {
+        return i == 0 ? parts[s].x : i == 1 ? parts[s].y : i == 2 ? parts[s].z : parts[s].w;
+    };
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        float acc       = part(0, i);
+        bool subnormals = isSubnormalF32(acc);
+#pragma unroll
+        for(int s = 1; s < kSplits; ++s)
+        {
+            acc += part(s, i);
+            // A sum flushed to zero reads as |acc| < 2^-126 too (a NaN does not).
+            subnormals |= isSubnormalF32(part(s, i)) || fabsf(acc) < 0x1p-126f;
+        }
+        raw[i] = __builtin_bit_cast(uint16_t, static_cast<__bf16>(acc));
+        if(subnormals && isfinite(acc))
+        {
+            double exact = exactF32ToDouble(part(0, i));
+#pragma unroll
+            for(int s = 1; s < kSplits; ++s)
+            {
+                exact = roundToF32(exact + exactF32ToDouble(part(s, i)));
+            }
+            raw[i] = bf16BitsOfF32(exact);
+        }
+    }
+}
+
+// The lane's kElemsPerLane bf16 qkv elements, reduced from the split-K partials and
+// written back to the row, so qkv ends up as the standalone reduce leaves it.
+__device__ __forceinline__ void reduceRawElems(hip_bfloat16* __restrict__ row,
+                                               const QkvPartials& partials,
+                                               int64_t partial_off,
+                                               hip_bfloat16 (&raw)[kElemsPerLane])
+{
+    uint16_t bits[kElemsPerLane];
+    const float* src = partials.ptr + partial_off;
+    switch(partials.num_splits)
+    {
+    case 2: reducePartials<2>(src, partials.split_stride, bits); break;
+    case 4: reducePartials<4>(src, partials.split_stride, bits); break;
+    default: reducePartials<8>(src, partials.split_stride, bits); break;
+    }
+#pragma unroll
+    for(int i = 0; i < kElemsPerLane; ++i)
+    {
+        raw[i] = __builtin_bit_cast(hip_bfloat16, bits[i]);
+    }
+    *reinterpret_cast<uint2*>(row) = packRawElems(raw);
+}
+
 // The lane's kElemsPerLane elements are contiguous in dst: one store.
 template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
 __device__ __forceinline__ void storeCacheElems(cache_t* __restrict__ dst,
@@ -686,6 +809,7 @@ template <typename scalar_t,
           bool kKvFp4,
           bool kNvfp4,
           bool kQFp8,
+          bool kPartials,
           int kRows>
 __global__ void fusedQKNormIdxrQKNormKernel(
     scalar_t* __restrict__ qkv,
@@ -730,7 +854,9 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     int64_t v_s_token,
     int64_t v_s_head,
     // Main Q as unit-scale e4m3 (kQFp8 only; replaces the q_out row).
-    opus::fp8_t* __restrict__ q_fp8_out)
+    opus::fp8_t* __restrict__ q_fp8_out,
+    // Unreduced split-K partials of qkv (kPartials only).
+    QkvPartials partials)
 {
     // NVFP4 is K, V and index-K pages together: never a fallback to the MXFP4 stores.
     static_assert(!kNvfp4 || (kKvFp4 && kIndexFp4), "kNvfp4 requires kKvFp4 and kIndexFp4");
@@ -750,6 +876,7 @@ __global__ void fusedQKNormIdxrQKNormKernel(
 
     // A warp takes kRows consecutive (token, slot) rows; a row past the last token
     // (last warp only) loads from the last token and is not processed.
+    static_assert(kRows == 1 || !kPartials, "one row per warp with partials");
     int row_token[kRows];
     int row_slot[kRows];
     row_token[0] = global_warp_idx * kRows / slots_per_token;
@@ -788,7 +915,8 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     // and its position, then the lane's cos/sin, then the cache slot. Scalar loads
     // return out of order, so the wait for the positions (which the cos/sin addresses
     // need) waits for every scalar load issued before it: the cache slot goes out after
-    // the cos/sin loads. A V slot loads the norm inputs too, from valid addresses, and
+    // the cos/sin loads, except with partials, whose split loads wait for kernel
+    // arguments anyway. A V slot loads the norm inputs too, from valid addresses, and
     // uses none; a Q or IQ slot loads a cache slot (insert mode always has both
     // mappings) and stores nothing with it.
     int load_token[kRows];
@@ -811,8 +939,11 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     {
         load_token[r]  = r == 0 ? row_token[0] : min(row_token[r], num_tokens - 1);
         const int slot = row_slot[r];
-        unpackRawElems(*reinterpret_cast<const uint2*>(row_of(load_token[r], slot) + dim_base),
-                       row_raw[r]);
+        if constexpr(!kPartials)
+        {
+            unpackRawElems(*reinterpret_cast<const uint2*>(row_of(load_token[r], slot) + dim_base),
+                           row_raw[r]);
+        }
         // A V slot (v_begin <= slot < iq_begin) has no norm weight: it loads q's.
         const scalar_t* const norm_w = slot < k_begin    ? q_norm_w
                                        : slot < v_begin  ? k_norm_w
@@ -821,6 +952,11 @@ __global__ void fusedQKNormIdxrQKNormKernel(
                                                          : iq_norm_w;
         row_nri[r].w = *reinterpret_cast<const uint2*>(norm_w + dim_base);
         row_pos[r] = positions[load_token[r]];
+        if constexpr(kPartials)
+        {
+            row_cache_slot[r] =
+                cache_slot_of(slot_mapping, index_slot_mapping, is_ik_slot(slot), load_token[r]);
+        }
     }
     // Left alone, the scheduler puts the loads above after the wait for the positions,
     // which only the cos/sin loads below need.
@@ -830,11 +966,20 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     {
         loadCosSin(row_nri[r], dim_base, rotary_dim, cos_sin_cache + row_pos[r] * rotary_dim);
     }
-#pragma unroll
-    for(int r = 0; r < kRows; ++r)
+    if constexpr(kPartials)
     {
-        row_cache_slot[r] = cache_slot_of(
-            slot_mapping, index_slot_mapping, is_ik_slot(row_slot[r]), load_token[r]);
+        // Last: the split loads branch on the split count, and their sum waits for them.
+        scalar_t* row_ptr = row_of(row_token[0], row_slot[0]);
+        reduceRawElems(row_ptr + dim_base, partials, (row_ptr - qkv) + dim_base, row_raw[0]);
+    }
+    else
+    {
+#pragma unroll
+        for(int r = 0; r < kRows; ++r)
+        {
+            row_cache_slot[r] = cache_slot_of(
+                slot_mapping, index_slot_mapping, is_ik_slot(row_slot[r]), load_token[r]);
+        }
     }
 
     const auto process_row = [&](const int token_idx,
@@ -1216,7 +1361,8 @@ void launchFusedQKNormIdxrQKNorm(
     bool static_kv_scale,
     bool asm_layout,
     hipStream_t stream,
-    opus::fp8_t* q_fp8_out = nullptr)
+    opus::fp8_t* q_fp8_out = nullptr,
+    QkvPartials partials   = {})
 {
     const int v_slots = insert_kv ? nkv : 0;
     const int idx_slots = process_index ? niq + 1 : 0;
@@ -1224,11 +1370,12 @@ void launchFusedQKNormIdxrQKNorm(
     constexpr int kWarpsPerBlock = kBlockSize / 32;
     const int64_t total_rows = static_cast<int64_t>(num_tokens) * slots_per_token;
     // Several rows per warp on gfx1250 only. The fp4 caches, which run on gfx950 only (the
-    // Python op refuses them elsewhere), have no multi-row instantiation.
+    // Python op refuses them elsewhere), have no multi-row instantiation, nor does the
+    // split-K partials load.
     constexpr int kMultiRowsCfg = kKvFp4 || kIndexFp4 ? 1 : kMultiRows;
     static const bool multi_row_arch = get_gpu_arch() == "gfx1250"; // queries the driver
     static const int64_t multi_row_min_rows = kMultiRowMinRowsPerCu * get_num_cu_func();
-    const int rows_per_warp = kMultiRowsCfg > 1 && multi_row_arch &&
+    const int rows_per_warp = kMultiRowsCfg > 1 && multi_row_arch && partials.num_splits == 0 &&
                                       total_rows >= multi_row_min_rows
                                   ? kMultiRowsCfg
                                   : 1;
@@ -1239,7 +1386,7 @@ void launchFusedQKNormIdxrQKNorm(
         return;
     }
 
-#define LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, QFP8, ROWS) \
+#define LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, QFP8, PARTIALS, ROWS) \
     fusedQKNormIdxrQKNormKernel<scalar_t,                                                    \
                                 cache_t,                                                     \
                                 index_cache_t,                                               \
@@ -1255,6 +1402,7 @@ void launchFusedQKNormIdxrQKNorm(
                                 kKvFp4,                                                      \
                                 kNvfp4,                                                      \
                                 QFP8,                                                        \
+                                PARTIALS,                                                    \
                                 ROWS>                                                        \
         <<<grid, kBlockSize, 0, stream>>>(qkv,                                               \
                                           q_out,                                             \
@@ -1288,23 +1436,26 @@ void launchFusedQKNormIdxrQKNorm(
                                           v_s_block,                                         \
                                           v_s_token,                                         \
                                           v_s_head,                                          \
-                                          q_fp8_out)
+                                          q_fp8_out,                                         \
+                                          partials)
 
 #define LAUNCH_R(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, QFP8)      \
     do                                                                                       \
     {                                                                                        \
         if(rows_per_warp > 1)                                                                \
         {                                                                                    \
-            LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, QFP8, kMultiRowsCfg); \
+            LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, QFP8, false, kMultiRowsCfg); \
         }                                                                                    \
         else                                                                                 \
         {                                                                                    \
-            LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, QFP8, 1); \
+            LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, QFP8, false, 1); \
         }                                                                                    \
     } while(0)
 
 // The e4m3 q_out store is compiled in only where it can run (insert mode), so the other
-// instantiations are unchanged.
+// instantiations are unchanged. So is the split-K partials load: bf16 insert modes that
+// cover every qkv column, one row per warp (the host checks a call for partials against
+// the same).
 #define LAUNCH(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE)               \
     do                                                                                       \
     {                                                                                        \
@@ -1313,6 +1464,14 @@ void launchFusedQKNormIdxrQKNorm(
             if(q_fp8_out != nullptr)                                                         \
             {                                                                                \
                 LAUNCH_R(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, true); \
+            }                                                                                \
+            else if(partials.num_splits > 0)                                                 \
+            {                                                                                \
+                if constexpr(std::is_same_v<scalar_t, hip_bfloat16> &&                       \
+                             (!(IS_SPARSE) || (PROCESS_INDEX)) && !kKvFp4 && !kIndexFp4)     \
+                {                                                                            \
+                    LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, false, true, 1); \
+                }                                                                            \
             }                                                                                \
             else                                                                             \
             {                                                                                \
@@ -1439,7 +1598,8 @@ static void fused_qknorm_idxrqknorm_impl(
     std::optional<aiter_tensor_t> k_scale,
     std::optional<aiter_tensor_t> v_scale,
     bool asm_layout,
-    bool skip_index_branch)
+    bool skip_index_branch,
+    std::optional<aiter_tensor_t> qkv_partials)
 {
     using namespace fused_qknorm_idxrqknorm_ops;
 
@@ -1854,6 +2014,34 @@ static void fused_qknorm_idxrqknorm_impl(
                     "index_q_out must have num_tokens * num_index_heads * 128 elements");
     }
 
+    QkvPartials partials{};
+    if(qkv_partials.has_value())
+    {
+        // Every qkv column must belong to a slot, so the kernel writes the whole
+        // reduced row back: insert mode, and the index branch when qkv has one.
+        AITER_CHECK(insert_kv && (!has_index || process_index),
+                    "qkv_partials requires the insert mode with every qkv slot processed");
+        AITER_CHECK(qkv.dtype() == AITER_DTYPE_bf16, "qkv_partials requires a bf16 qkv");
+        AITER_CHECK(!fp4_kv_cache && !fp4_index_cache && !q_is_fp8,
+                    "qkv_partials does not support fp4 caches or an fp8 q_out");
+        const aiter_tensor_t& qp = *qkv_partials;
+        AITER_CHECK(qp.is_gpu() && qp.dtype() == AITER_DTYPE_fp32 && qp.dim() == 3,
+                    "qkv_partials must be a float32 CUDA [num_splits, rows, row] tensor");
+        const int64_t splits = qp.size(0);
+        AITER_CHECK(splits == 2 || splits == 4 || splits == 8,
+                    "qkv_partials supports 2, 4 or 8 splits");
+        AITER_CHECK(qp.size(1) >= num_tokens && qp.size(2) == expected_row &&
+                        qp.stride(2) == 1 && qp.stride(1) == expected_row &&
+                        qp.stride(0) >= qp.size(1) * expected_row,
+                    "qkv_partials must hold num_tokens dense qkv rows per split");
+        AITER_CHECK(reinterpret_cast<uintptr_t>(qp.data_ptr()) % 16 == 0 &&
+                        qp.stride(0) % 4 == 0,
+                    "qkv_partials must be 16-byte aligned per split");
+        partials = {reinterpret_cast<const float*>(qp.data_ptr()),
+                    static_cast<int>(splits),
+                    qp.stride(0)};
+    }
+
     HipDeviceGuard device_guard(qkv.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
@@ -1928,7 +2116,8 @@ static void fused_qknorm_idxrqknorm_impl(
                     fp8_kv_static,
                     asm_layout,
                     stream,
-                    q_fp8_ptr);
+                    q_fp8_ptr,
+                    partials);
             };
             using Dt = vllm::Fp8KVCacheDataType;
             if(nvfp4_kv_cache)
@@ -2021,7 +2210,8 @@ static void fused_qknorm_idxrqknorm_impl(
                 fp8_kv_static,
                 asm_layout,
                 stream,
-                q_fp8_ptr);
+                q_fp8_ptr,
+                partials);
             }
             else
             {
@@ -2079,7 +2269,8 @@ static void fused_qknorm_idxrqknorm_impl(
                 fp8_kv_static,
                 asm_layout,
                 stream,
-                q_fp8_ptr);
+                q_fp8_ptr,
+                partials);
             }
         }
         else
@@ -2136,7 +2327,8 @@ static void fused_qknorm_idxrqknorm_impl(
                 fp8_kv_static,
                 asm_layout,
                 stream,
-                q_fp8_ptr);
+                q_fp8_ptr,
+                partials);
             }
             else
             {
@@ -2190,7 +2382,8 @@ static void fused_qknorm_idxrqknorm_impl(
                 fp8_kv_static,
                 asm_layout,
                 stream,
-                q_fp8_ptr);
+                q_fp8_ptr,
+                partials);
             }
         }
     });
@@ -2222,7 +2415,8 @@ void fused_qknorm_idxrqknorm(
     std::optional<aiter_tensor_t> k_scale,
     std::optional<aiter_tensor_t> v_scale,
     bool asm_layout,
-    bool skip_index_branch)
+    bool skip_index_branch,
+    std::optional<aiter_tensor_t> qkv_partials)
 {
     fused_qknorm_idxrqknorm_impl(qkv,
                                                 q_norm_weight,
@@ -2249,7 +2443,8 @@ void fused_qknorm_idxrqknorm(
                                                 k_scale,
                                                 v_scale,
                                                 asm_layout,
-                                                skip_index_branch);
+                                                skip_index_branch,
+                                                qkv_partials);
 }
 
 } // namespace aiter

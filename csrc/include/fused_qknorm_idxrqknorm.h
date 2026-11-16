@@ -35,6 +35,7 @@ void fused_qknorm_idxrqknorm(
     std::optional<aiter_tensor_t> k_scale = std::nullopt,
     std::optional<aiter_tensor_t> v_scale = std::nullopt,
     bool asm_layout = false,
-    bool skip_index_branch = false);
+    bool skip_index_branch = false,
+    std::optional<aiter_tensor_t> qkv_partials = std::nullopt);
 
 } // namespace aiter
