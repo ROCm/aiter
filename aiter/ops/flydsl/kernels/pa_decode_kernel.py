@@ -793,8 +793,6 @@ def gfx1250_tile_traits(
             and block_size == 128
             and trans_v
             and sliding_window == 0
-            # The FP8 output needs a CTA's tokens whole.
-            and not quant_output
             else 1
         )
     grid_sequences = (

@@ -491,17 +491,24 @@ def pa_decode(
     output. They must be supplied together. It is OCP FP8 in the same logical
     layout as ``output`` with one contiguous FP32 descale per flattened query
     token, shape ``[num_seqs * query_length, 1]``; dequantization is
-    ``quantized_output.float() * output_scale``. With one KV head the direct
-    and cluster-merge outputs quantize in the tile kernel's epilogue; other
-    plans run the standalone per-token quant after PA, with identical bytes.
-    Calls that omit both tensors retain the existing output and dispatch
-    unchanged.
+    ``quantized_output.float() * output_scale``. The tile kernel's epilogue
+    quantizes the output when there is one KV head, the tile does not split
+    its query rows over CTAs, and the plan writes either the one-partition
+    direct output or a cluster merge with one sequence per cluster
+    (``cluster_seqs == 1``). Every other plan writes the BF16/FP16 output and
+    then runs the standalone per-token quant, with identical bytes: several KV
+    heads, the last-arriver direct merge, clusters shared by several sequences
+    (more than 15 sequences per 16 CUs), the reducer (sinks included) and the
+    query-split BF16 D1024/G16/MTP4 page128 tile. Calls that omit both tensors
+    retain the existing output and dispatch unchanged.
     With the quantized output, ``store_output=False`` skips the BF16/FP16
     store: ``output`` then only fixes the layout and its contents are left
     unspecified. ``quantized_pad_rows`` extra rows of ``quantized_output`` and
     ``output_scale`` past the query rows (a token bucket padded past the
-    scheduled tokens) are written as FP8 zeros with a unit descale by the same
-    launch, so a consumer of the whole bucket reads finite, inert rows.
+    scheduled tokens) are written as FP8 zeros with a unit descale, so a
+    consumer of the whole bucket reads finite, inert rows. The fused epilogue
+    writes them in the PA launch; the fallback fills them with ``zero_()`` and
+    ``fill_(1.0)`` after the standalone quant.
 
     MTP lengths include the query tokens and use dense causal masking.
     Independently selected sparse queries need separate table rows and
@@ -855,11 +862,6 @@ def pa_decode(
             )
         if output_scale.dtype != torch.float32:
             raise TypeError(f"output_scale must be float32, got {output_scale.dtype}")
-        if quantized_output.stride() != output.stride():
-            raise ValueError(
-                "quantized_output strides must match output, "
-                f"got {quantized_output.stride()} vs {output.stride()}"
-            )
         if not (
             query.is_contiguous()
             and output.is_contiguous()
@@ -1192,12 +1194,14 @@ def pa_decode(
     # a CTA, or the cluster merging its tasks, holds every row of its tokens, so
     # the one-partition direct and the cluster-merge outputs quantize in their
     # epilogue. More KV heads spread a token over separate CTAs (grid y); the
-    # last-arriver merge and clusters shared by several sequences are not
-    # fused. Those write the BF16 output as usual and quantize it after with
-    # the standalone per-token kernel, which is exactly the unfused path.
+    # last-arriver merge, clusters shared by several sequences and query-split
+    # tiles are not fused. Those write the BF16 output as usual and quantize it
+    # after with the standalone per-token kernel, which is exactly the unfused
+    # path.
     quant_after_output = quant_output and not (
         num_kv_heads == 1
         and (one_partition_output or (cluster_merge and cluster_seqs == 1))
+        and gfx1250_tile_traits(**tile_options).query_splits == 1
     )
     if quant_after_output:
         quant_output = False

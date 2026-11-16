@@ -7,6 +7,7 @@ Run with: python -m pytest -q op_tests/test_flydsl_pa_decode.py
 """
 
 import importlib.util
+import inspect
 from functools import partial
 from itertools import product
 
@@ -953,6 +954,7 @@ _COMMON_CASES = [
             "cluster": 2,
             "cluster_seqs": 2,
             "cluster_steps": True,
+            "quant": True,
         },
     ),
 ]
@@ -1124,6 +1126,18 @@ _BF16_CASES = _COMMON_CASES + [
             "max_partitions": 16,
             "cluster": 16,
             "cluster_steps": False,
+        },
+    ),
+    # The spilling D1024/G16/MTP4 page128 tile splits its query rows over four
+    # CTAs on gfx1250, so its FP8 output takes the standalone quant.
+    (
+        "head1024-mtp4-g16-page128",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "head_dim": 1024,
+            "block_size": 128,
+            "quant": True,
         },
     ),
     # Plain BF16 V takes 64-token page16 steps: plan-derived tasks.
@@ -2272,12 +2286,23 @@ def _check_quant_output(launch, query, output, compile_kwargs, capture, pad=3):
     """The FP8 output equals PA's output and the standalone per-token quant bit
     for bit, eagerly and in graph replays; poisoned outputs show every row is
     written, padded rows included. One KV head's direct and cluster outputs
-    quantize in the tile kernel; other plans fall back to the standalone quant.
+    quantize in the tile kernel unless the tile splits its query rows; other
+    plans fall back to the standalone quant.
     """
+    from aiter.ops.flydsl.kernels.pa_decode_kernel import gfx1250_tile_traits
+
     plain = compile_kwargs[-1]
-    fused = plain["num_kv_heads"] == 1 and (
-        (plain["cluster_merge"] > 0 and plain["cluster_seqs"] == 1)
-        or (plain["direct_output"] and plain["num_partitions"] == 1)
+    traits_args = inspect.signature(gfx1250_tile_traits).parameters
+    fused = (
+        plain["num_kv_heads"] == 1
+        and (
+            (plain["cluster_merge"] > 0 and plain["cluster_seqs"] == 1)
+            or (plain["direct_output"] and plain["num_partitions"] == 1)
+        )
+        and gfx1250_tile_traits(
+            **{k: v for k, v in plain.items() if k in traits_args}
+        ).query_splits
+        == 1
     )
     rows = output.shape[0]
     fp8 = torch.empty(
