@@ -31,7 +31,7 @@ def _setup(num_tokens, E, N, K, top_k, device="cuda"):
     torch.manual_seed(0)
     grad = torch.randn(num_tokens, N, dtype=torch.bfloat16, device=device) * 0.1
     inp = torch.randn(num_tokens, K, dtype=torch.bfloat16, device=device) * 0.1
-    scores = torch.randn(num_tokens, E, device=device)
+    scores = torch.randn(num_tokens, E, dtype=torch.float32, device=device)
     topk_ids = scores.topk(top_k, dim=1).indices  # [num_tokens, top_k]
 
     # moe_align_block_size requires pre-allocated output buffers.

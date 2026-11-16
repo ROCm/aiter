@@ -13,6 +13,7 @@ def _exact_sigmoid_biased_topk(
     bias_ptr,
     weights_ptr,
     ids_ptr,
+    num_valid_rows_ptr,  # [1] int32: rows at or past it route to -1
     stride_logits,
     stride_weights,
     stride_ids,
@@ -20,8 +21,10 @@ def _exact_sigmoid_biased_topk(
     routed_scaling,
     N_EXPERTS: tl.constexpr,
     TOPK: tl.constexpr,
+    TOPK_PAD: tl.constexpr,  # next power of two of TOPK
     BLOCK_N: tl.constexpr,
     NEED_RENORM: tl.constexpr,
+    HAS_NUM_VALID_ROWS: tl.constexpr,
 ):
     """Match the gfx1250 HIP fp32/int32 sigmoid-gating contract."""
     row = tl.program_id(0)
@@ -35,9 +38,9 @@ def _exact_sigmoid_biased_topk(
     choice = tl.where(mask, scores + bias, float("-inf"))
     choice = tl.where(choice == choice, choice, float("-inf"))  # noqa: PLR0124
 
-    slots = tl.arange(0, TOPK)
-    selected_ids = tl.zeros((TOPK,), dtype=tl.int32)
-    selected_weights = tl.zeros((TOPK,), dtype=tl.float32)
+    slots = tl.arange(0, TOPK_PAD)
+    selected_ids = tl.zeros((TOPK_PAD,), dtype=tl.int32)
+    selected_weights = tl.zeros((TOPK_PAD,), dtype=tl.float32)
 
     # Match the legacy gfx1250 wave32 float4-LDS reduction order. Vectors are
     # assigned round-robin to lanes and local positions retain source order.
@@ -64,11 +67,15 @@ def _exact_sigmoid_biased_topk(
         selected_weights *= norm_scale
     else:
         selected_weights *= routed_scaling
+    if HAS_NUM_VALID_ROWS:
+        pad = row >= tl.load(num_valid_rows_ptr)
+        selected_ids = tl.where(pad, -1, selected_ids)
+        selected_weights = tl.where(pad, 0.0, selected_weights)
 
-    row_mask = row < n_rows
-    tl.store(ids_ptr + row * stride_ids + slots, selected_ids, mask=row_mask)
+    slot_mask = (row < n_rows) & (slots < TOPK)
+    tl.store(ids_ptr + row * stride_ids + slots, selected_ids, mask=slot_mask)
     tl.store(
         weights_ptr + row * stride_weights + slots,
         selected_weights,
-        mask=row_mask,
+        mask=slot_mask,
     )

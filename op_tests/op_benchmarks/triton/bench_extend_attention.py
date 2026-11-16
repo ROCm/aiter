@@ -157,7 +157,6 @@ def model_benchmark_configs(args):
 
 def benchmark(args):
     dtype = str_to_torch_dtype[args.dtype]
-    torch.set_default_dtype(dtype)
 
     configs = []
 
@@ -314,7 +313,6 @@ def parse_args():
 
 def run_bench(args):
     torch.manual_seed(0)
-    torch.set_default_device(args.device)
     benchmark(args)
 
 

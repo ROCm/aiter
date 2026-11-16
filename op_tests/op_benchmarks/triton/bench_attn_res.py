@@ -70,7 +70,7 @@ def get_benchmark_shapes(args):
 
 def bench_attn_res_fn(N, D, L, layout, metric, args):
     dtype = arg_to_torch_dtype[args.dtype]
-    elem_size = torch.tensor([], dtype=dtype).element_size()
+    elem_size = torch.tensor([], dtype=dtype, device="cuda").element_size()
     # Minimum required traffic: every candidate read once + output written once.
     mem = (N * L * D + N * D) * elem_size
 

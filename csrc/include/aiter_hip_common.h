@@ -209,7 +209,8 @@ extern "C" void __hipRegisterFunction(void* module,
 // ---- gfx1250 asm B0-only gate ------------------------------------------------
 // Gates the shipped asm code objects only; the OPUS .co path is not gated.
 
-// Soft (non-aborting): false only when a gfx1250 A0 (asicRevision 0) is seen.
+// Soft (non-aborting): false when gfx1250-strict or a legacy gfx1250 A0
+// (asicRevision 0) is seen.
 // Undeterminable arch -> true (the load-site gate is the hard stop). Callers
 // also use it to pick a fallback path (e.g. fmha_v3_bwd -> CK).
 //
@@ -232,6 +233,8 @@ static inline bool is_gfx1250_asm_supported()
             size_t colon_pos = arch.find(':');
             if(colon_pos != std::string::npos)
                 arch = arch.substr(0, colon_pos);
+            if(arch == "gfx1250-strict")
+                return false; // strict is the compiler/runtime identity for A0
             if(arch != "gfx1250")
                 continue;
             if(prop.asicRevision < 1) // gfx1250: shipped asm is B0+ only
@@ -272,7 +275,7 @@ static inline bool is_gfx1250_asm_a0_ok(const char* kernel_name)
     if(is_gfx1250_asm_supported() || is_gfx1250_asm_a0_ok(kernel_name))
         return;
     std::string msg = std::string(kernel_name ? kernel_name : "<unknown>") +
-                      " asm code object targets gfx1250 B0+; running device is gfx1250 A0.";
+                      " asm code object targets gfx1250 B0+; running device is MI450 A0 (gfx1250-strict, or gfx1250 asicRevision 0).";
     std::cerr << "[AITER] " << msg << std::endl;
     throw std::runtime_error(std::move(msg));
 }
@@ -297,9 +300,14 @@ class AiterAsmKernelFast
     {
         aiter_detail::FatBinaryWrapper fat_bin{};
         fat_bin.binary = hsaco;
-        module         = aiter_detail::__hipRegisterFatBinary(&fat_bin);
-        AITER_CHECK(module != nullptr, "failed to load module for ", kernel_name);
-        aiter_detail::__hipRegisterFunction(module,
+        // A constructor failure does not run this object's destructor. Own the
+        // registration locally until the function is validated, so throwing on
+        // an unsupported image/runtime unregisters before its bytes are freed.
+        auto unregister = [](void* handle) { aiter_detail::__hipUnregisterFatBinary(handle); };
+        std::unique_ptr<void, decltype(unregister)> registration(
+            aiter_detail::__hipRegisterFatBinary(&fat_bin), unregister);
+        AITER_CHECK(registration != nullptr, "failed to load module for ", kernel_name);
+        aiter_detail::__hipRegisterFunction(registration.get(),
                                             static_cast<void*>(this),
                                             kernel_name,
                                             kernel_name,
@@ -314,8 +322,11 @@ class AiterAsmKernelFast
         // rejected the kernel (e.g. resource limits, arch mismatch). This runs
         // once per kernel variant at init time, not on every launch.
         hipFunction_t probe = nullptr;
-        (void)hipGetFuncBySymbol(&probe, reinterpret_cast<void*>(this));
-        AITER_CHECK(probe != nullptr, "kernel registration failed for '", kernel_name, "'.");
+        const hipError_t probe_status = hipGetFuncBySymbol(&probe, reinterpret_cast<void*>(this));
+        AITER_CHECK(probe_status == hipSuccess && probe != nullptr,
+                    "kernel registration failed for '", kernel_name, "': ",
+                    hipGetErrorString(probe_status));
+        module = registration.release();
     }
 
     public:
@@ -353,9 +364,14 @@ class AiterAsmKernelFast
                                      kargs.arg_size_ptr,
                                      HIP_LAUNCH_PARAM_END};
         hipFunction_t kernel_func = nullptr;
-        // TODO Ask runtime folks to provide an API for hipLaunchKernel with extra arg
-        // Don't error check here -- registration is validated once in init().
-        (void)hipGetFuncBySymbol(&kernel_func, reinterpret_cast<void*>(this));
+        // Resolve against the current device on every launch. Construction only
+        // validates its original device, so do not silently launch a null handle
+        // after a device/context mismatch.
+        const hipError_t function_status =
+            hipGetFuncBySymbol(&kernel_func, reinterpret_cast<void*>(this));
+        AITER_CHECK(function_status == hipSuccess && kernel_func != nullptr,
+                    "cannot resolve registered kernel on the current HIP device: ",
+                    hipGetErrorString(function_status));
 
         if(kargs.cluster_x > 1 || kargs.cluster_y > 1 || kargs.cluster_z > 1)
         {

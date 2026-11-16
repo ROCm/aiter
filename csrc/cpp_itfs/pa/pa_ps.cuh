@@ -218,7 +218,7 @@ __global__ __launch_bounds__(HEAD_SIZE) void pa_decode_ps_reduce_hip_kernel(
     const int eqgs_idx   = static_cast<int>(blockIdx.z);
     const int query_idx  = eqgs_idx / QUERY_GROUP_SIZE;
     const int group_idx  = eqgs_idx - query_idx * QUERY_GROUP_SIZE;
-    const int lane       = tid & (kPaPsReduceWarpSize - 1);
+    const int lane       = tid & (__builtin_amdgcn_wavefrontsize() - 1);
 
     const auto out_rsrc = pa_ps_make_buffer_rsrc(output_ptr);
     const auto es_rsrc = pa_ps_make_buffer_rsrc(exp_sums_ptr);

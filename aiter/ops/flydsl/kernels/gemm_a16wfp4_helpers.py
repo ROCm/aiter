@@ -105,19 +105,6 @@ class DenseGemmTraits:
             f"_tn{self.tile_n}_tk{self.tile_k}_kw{self.k_wave}_wpe{wpe}"
         )
 
-    @property
-    def cache_key(self):
-        return (
-            self.n,
-            self.k,
-            self.block_m,
-            self.tile_n,
-            self.tile_k,
-            self.b_cache_mod,
-            self.k_wave,
-            self.waves_per_eu,
-        )
-
 
 def make_dense_operand_loaders(
     traits,

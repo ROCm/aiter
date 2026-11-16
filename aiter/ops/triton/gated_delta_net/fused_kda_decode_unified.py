@@ -124,7 +124,7 @@ def fused_kda_decode_unified(
         s_bg_slot = s_bg_hv = s_bg_pos = 1
 
     # Dummy tensors for unused pointers
-    dummy = torch.empty(1, device=device)
+    dummy = torch.empty(1, dtype=torch.float32, device=device)
 
     grid = (batch, H)
     _fused_kda_decode_unified_kernel[grid](

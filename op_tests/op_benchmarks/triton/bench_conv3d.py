@@ -270,7 +270,7 @@ def _effective_bytes(
     elements = N * C * D * H * W + K * C * T * R * S + N * K * OD * OH * OW
     if use_bias:
         elements += K
-    return elements * torch.empty((), dtype=dtype).element_size()
+    return elements * torch.empty((), device="cuda", dtype=dtype).element_size()
 
 
 def _metric_value(metric: str, milliseconds: float, flops: float, moved: int):

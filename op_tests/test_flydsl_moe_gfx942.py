@@ -19,7 +19,13 @@ import torch
 
 import aiter
 from aiter import ActivationType, QuantType, dtypes
-from aiter.fused_moe import fused_topk, moe_sorting, torch_moe_stage1, torch_moe_stage2
+from aiter.fused_moe import (
+    AUX_SORT_OPUS,
+    fused_topk,
+    moe_sorting,
+    torch_moe_stage1,
+    torch_moe_stage2,
+)
 from aiter.fused_moe_registry import (
     FusedMoeRequest,
     make_fused_moe_impl_kernel_name,
@@ -27,14 +33,16 @@ from aiter.fused_moe_registry import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-from aiter.ops.flydsl.fused_moe_gfx942 import Config, get_tune_space
+from aiter.ops.flydsl.fused_moe_gfx942 import (
+    Config,
+    _gateup_output,
+    _Problem,
+    get_tune_space,
+)
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
     gemm2_8x1_compact as compact,
 )
-from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
-    invert_sorted_ids,
-    sorted_sum,
-)
+from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import sorted_sum
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import _ptr
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from aiter.ops.shuffle import shuffle_weight
@@ -181,9 +189,11 @@ def test_sorted_sum(token, model_dim, topk, padding):
     dtype = dtypes.bf16
     experts = max(4, topk)
     ids = (torch.arange(token * topk).reshape(token, topk) % experts).to(torch.int32)
+    # Sorting keeps one route of a repeated expert ID and gives the others -1.
+    ids[-1] = 0
     weights = torch.ones((token, topk), dtype=torch.float32)
     storage = torch.full((token * model_dim + 2 * GUARD,), CANARY, dtype=dtype)
-    sorted_ids, _, sorted_experts, valid_rows, output = moe_sorting(
+    _, _, sorted_experts, _, output, _, loc_ids = moe_sorting(
         ids,
         weights,
         experts,
@@ -191,18 +201,19 @@ def test_sorted_sum(token, model_dim, topk, padding):
         dtype,
         64,
         output=storage[GUARD:-GUARD].view(token, model_dim),
+        output_aux=AUX_SORT_OPUS,
     )
-    loc_ids = torch.empty_like(ids)
-    invert_sorted_ids(topk)(sorted_ids, loc_ids, valid_rows, sorted_ids.numel(), token)
+    valid = loc_ids.view(token, topk) >= 0
+    assert int((~valid).sum()) == topk - 1, "repeated expert IDs kept extra routes"
     # Specialized Down rows carry padding that holds canaries the sum must skip.
     down_output = torch.full(
         (sorted_experts.numel() * 64, model_dim + padding // 2), CANARY, dtype=dtype
     )
     routes = torch.randn((token, topk, model_dim)).to(dtype)
-    down_output[loc_ids.long(), :model_dim] = routes
-    reference = routes[:, 0].float()
-    for route in range(1, topk):
-        reference = reference + routes[:, route].float()
+    down_output[loc_ids.view(token, topk)[valid].long(), :model_dim] = routes[valid]
+    reference = torch.zeros((token, model_dim))
+    for route in range(topk):
+        reference = reference + routes[:, route].float() * valid[:, route, None]
     reduce = sorted_sum(topk, model_dim, padding)
 
     def run():
@@ -235,6 +246,10 @@ def test_config_strings():
     # Rows tuned before the Down suffix existed keep loading as the default Down.
     for legacy in ("16_16_16_False", "64_128_128_True", "64_256_128_True"):
         assert Config.from_string(legacy) == Config.from_string(f"{legacy}:default:0")
+    # Tiles without the direct-decoding flag keep their meaning.
+    assert Config.from_string("16_16_16_False_False:default:0") == Config.from_string(
+        "16_16_16_False:default:0"
+    )
     for invalid in (
         "64_256_128_True:default",
         "64_256_128_True:default:0:0",
@@ -243,20 +258,39 @@ def test_config_strings():
         "64_256_128_True:default:128",
         "64_256_128_True:8x2:128",
         "16_16_16_False:8x1_compact:128",
+        "16_16_16_False_Maybe:default:0",
+        "16_16_16_False_True_False:default:0",
+        "16_16_16_True_True:default:0",
+        "16_16_16_False_True:1x4_64x256:128",
+        "64_128_64_False_True:default:0",
     ):
         try:
             Config.from_string(invalid)
         except ValueError:
             continue
         raise AssertionError(f"accepted invalid config {invalid!r}")
+    batch1 = _Problem(1, 8, 256, 512, 512, 128, 2, "no")
+    assert Config.from_string("16_16_16_False").unsupported_reason(batch1) is None
+    for tile in ("32_16_16_False", "16_16_32_False", "16_128_64_False"):
+        assert Config.from_string(tile).unsupported_reason(batch1), tile
 
 
 def route(hidden, experts, topk, routing):
     token = hidden.shape[0]
-    if routing == "random":
-        return fused_topk(
+    if routing in ("random", "padding", "pad_rows"):
+        weights, ids = fused_topk(
             hidden, torch.randn((token, experts), dtype=hidden.dtype), topk, True
         )
+        if routing == "padding":
+            # HIP padding rows: zero weights and expert 0 repeated, which sorting merges.
+            weights[-65:] = 0
+            ids[-65:, :-1] = 0
+        if routing == "pad_rows":
+            # Rows past num_valid_rows: -1 ids, zero weights; the last column stays.
+            pad = min(65, (token + 1) // 2)
+            weights[-pad:, :-1] = 0
+            ids[-pad:, :-1] = -1
+        return weights, ids
     # "hot": every token picks the same highest experts and the others stay empty.
     ids = torch.arange(experts - topk, experts, dtype=torch.int32)
     weights = torch.rand((token, topk), dtype=torch.float32)
@@ -264,6 +298,23 @@ def route(hidden, experts, topk, routing):
         weights / weights.sum(dim=-1, keepdim=True),
         ids.expand(token, topk).contiguous(),
     )
+
+
+def behind_nan_expert(tensor):
+    """The tensor stored after a NaN expert, so reading expert -1 shows up."""
+    if tensor is None:
+        return None
+    storage = torch.empty((tensor.shape[0] + 1, *tensor.shape[1:]), dtype=tensor.dtype)
+    storage[0].fill_(float("nan"))
+    view = storage[1:].copy_(tensor)
+    if hasattr(tensor, "is_shuffled"):
+        view.is_shuffled = tensor.is_shuffled
+    return view
+
+
+def stale_gateup_output(hidden_states, problem):
+    """Gate/Up output that starts as inf, like reused memory."""
+    return _gateup_output(hidden_states, problem).fill_(float("inf"))
 
 
 @functools.lru_cache(maxsize=1)
@@ -328,14 +379,14 @@ def make_case(
     )
     request = FusedMoeRequest(
         hidden_states=hidden,
-        w1=shuffle_weight(w1_q, layout=(16, 16)),
-        w2=shuffle_weight(w2_q, layout=(16, 16)),
+        w1=behind_nan_expert(shuffle_weight(w1_q, layout=(16, 16))),
+        w2=behind_nan_expert(shuffle_weight(w2_q, layout=(16, 16))),
         topk_weight=topk_weights,
         topk_ids=topk_ids,
         activation=act_type,
         quant_type=q_type,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
+        w1_scale=behind_nan_expert(w1_scale),
+        w2_scale=behind_nan_expert(w2_scale),
     )
     # Holds the first FlyDSL output of the case for the cross-path check.
     return request, reference, {}
@@ -420,21 +471,24 @@ def check_moe(
     impl = resolve_fused_moe_impl(make_fused_moe_impl_kernel_name(IMPL, config))
     rms = token_rms(reference)
     tasks = "-"
-    if parsed.down_path == "8x1_compact":
-        device_cu = get_cu_num()
-        output, tasks = run_compact(impl, request, experts, device_cu)
-        # The cached launcher must stay in bounds and correct for the other CU count.
-        for cu_count in CU_COUNTS:
-            if cu_count != device_cu:
-                with patch(
-                    "aiter.ops.flydsl.fused_moe_gfx942.get_cu_num",
-                    return_value=cu_count,
-                ):
-                    other, _ = run_compact(impl, request, experts, cu_count)
-                diff = rms_error(output, other, rms)
-                assert diff < PATH_DIFF_LIMIT, f"{config} at {cu_count} CUs: {diff=}"
-    else:
-        output = impl(request)
+    with patch("aiter.ops.flydsl.fused_moe_gfx942._gateup_output", stale_gateup_output):
+        if parsed.down_path == "8x1_compact":
+            device_cu = get_cu_num()
+            output, tasks = run_compact(impl, request, experts, device_cu)
+            # The cached launcher must stay in bounds and correct for the other CU count.
+            for cu_count in CU_COUNTS:
+                if cu_count != device_cu:
+                    with patch(
+                        "aiter.ops.flydsl.fused_moe_gfx942.get_cu_num",
+                        return_value=cu_count,
+                    ):
+                        other, _ = run_compact(impl, request, experts, cu_count)
+                    diff = rms_error(output, other, rms)
+                    assert (
+                        diff < PATH_DIFF_LIMIT
+                    ), f"{config} at {cu_count} CUs: {diff=}"
+        else:
+            output = impl(request)
     err = check_output(reference, output, config)
     # Decode kernels accumulate routes with atomics, so only prefill paths are compared.
     if parsed.use_prefill:
@@ -543,6 +597,28 @@ EDGE_CASES = [
         for path in ("8x1_compact", "1x4_64x256")
         for padding in (0, 32, 64)
     ),
+    # Padding rows whose merged routes reach the reduction as -1.
+    *(
+        (2048, 2560, 320, 513, 11, quant, "silu", "padding", config)
+        for quant, config in (
+            ("no", "64_128_128_True:default:0"),
+            ("ptpc", "64_128_256_True:1x4_64x256:128"),
+        )
+    ),
+    # Gate/Up skips -1 pad rows, but the per-tensor absmax reads every row.
+    (
+        2048,
+        2560,
+        320,
+        513,
+        11,
+        "per_tensor",
+        "silu",
+        "pad_rows",
+        "64_128_256_True:1x4_64x256:128",
+    ),
+    # Direct decoding reads -1 pad rows from topk_ids without sorting.
+    (2, 2560, 320, 513, 11, "ptpc", "silu", "pad_rows", "16_16_16_False_True"),
 ]
 
 

@@ -147,19 +147,19 @@ def _build_chunk_schedule(
     ``arange(tot) - repeat_interleave(exclusive_prefix_sum(nums), nums)``.
     """
     device = query_start_loc.device
-    seqlens = query_start_loc.diff().to("cpu")
+    seqlens = query_start_loc.diff()
     nums = (-(-seqlens // block_m)).to(torch.int64)  # ceil-div per sequence
     n_seqs = nums.numel()
     tot = int(nums.sum().item())
     if tot == 0:
         z = torch.zeros(0, dtype=torch.int32, device=device)
         return 0, z, z
-    seq_ids = torch.arange(n_seqs, dtype=torch.int32)
-    batch_ptr = torch.repeat_interleave(seq_ids, nums)
+    seq_ids = torch.arange(n_seqs, dtype=torch.int32, device=device)
+    batch_ptr = torch.repeat_interleave(seq_ids, nums, output_size=tot)
     starts = nums.cumsum(0) - nums  # exclusive prefix sum
-    base = torch.repeat_interleave(starts, nums)
-    tco = (torch.arange(tot, dtype=torch.int64) - base).to(torch.int32)
-    return tot, batch_ptr.to(device), tco.to(device)
+    base = torch.repeat_interleave(starts, nums, output_size=tot)
+    tco = (torch.arange(tot, dtype=torch.int64, device=device) - base).to(torch.int32)
+    return tot, batch_ptr, tco
 
 
 def causal_conv1d_split_qkv_triton_tile_fn(
