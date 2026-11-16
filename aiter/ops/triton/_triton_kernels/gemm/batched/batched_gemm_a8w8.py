@@ -16,7 +16,6 @@ _batched_gemm_a8w8_repr = make_kernel_repr(
         "BLOCK_SIZE_K",
         "GROUP_SIZE_M",
         "EVEN_K",
-        "GRID_MN",
     ],
 )
 
@@ -24,8 +23,6 @@ _batched_gemm_a8w8_repr = make_kernel_repr(
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_batched_gemm_a8w8_repr)
@@ -64,7 +61,6 @@ def _batched_gemm_a8w8_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call batched_gemm_a8w8 function
