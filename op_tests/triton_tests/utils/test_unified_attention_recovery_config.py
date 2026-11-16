@@ -129,6 +129,7 @@ def test_recovery_config_excluded_lengths(q, k):
         "row_stride",
         "column_stride",
         "fp16",
+        "v_fp16",
         "batch",
         "heads",
         "cus",
@@ -151,6 +152,8 @@ def test_recovery_config_excluded_metadata(change):
     elif change == "fp16":
         params.q_dtype = params.kv_cache_dtype = torch.float16
         params.out = SimpleNamespace(dtype=torch.float16)
+    elif change == "v_fp16":
+        params.v_cache_dtype = torch.float16
     elif change == "batch":
         params.num_seqs = 2
     elif change == "heads":

@@ -307,6 +307,7 @@ def _prefill_axes(params) -> tuple:
         and not getattr(params, "use_qq_bias", False)
         and params.head_size == params.head_size_v
         and params.q_dtype == params.kv_cache_dtype == torch.bfloat16
+        and getattr(params, "v_cache_dtype", params.kv_cache_dtype) == torch.bfloat16
         and out is not None
         and out.dtype == params.q_dtype
         and all(
