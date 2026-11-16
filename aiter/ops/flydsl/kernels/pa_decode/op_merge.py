@@ -30,6 +30,7 @@ from flydsl.expr.rocdl import SyncScope, cluster
 
 from ..pa_decode_plan import ARRIVAL_COUNTER_STRIDE
 from ..utils import rcp_f32
+from .context import logical_block
 from .traits import LOG2E
 
 # Partition bound of a merged sequence; each one is an unrolled load per row.
@@ -282,7 +283,7 @@ class Gfx1250ClusterMerge:
         # Rows whose partition loads are in flight together (64 VGPRs).
         group = max(1, 128 // (t.cluster_merge * elems))
         lane = fx.Int32(gpu.thread_id("x")) % t.WAVE
-        kv_query = fx.Int32(gpu.block_id("y"))
+        kv_query = logical_block(t)[1]
         kv_h = kv_query // t.query_splits
         rows = t.rows * t.query_splits
         pmax = fx.recast_iter(fx.Float32, self.pmax)

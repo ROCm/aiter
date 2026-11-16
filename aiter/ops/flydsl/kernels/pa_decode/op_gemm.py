@@ -137,32 +137,40 @@ class PaDecodeGemm:
             frag_Ss.append(fx.Vector(acc))
         return frag_Ss
 
-    def qk_mxfp4(self, k_raw, k_scales, q_op, q_scale_byte):
-        """QK of one MXFP4 K tile: per 16-token chunk one scaled MFMA, A = packed
-        E2M1 K (lane: 16 B = one E8M0 group, its scale byte), B = E4M3 Q (``q_op``)
-        scaled by the e8m0 byte ``q_scale_byte``, so the f32 accumulator never exceeds
-        the logit by more than the 2x left in the mantissa of the query scale."""
+    def qk_mxfp4(self, k_raw, k_scales, q_ops, q_scale_byte, pad=None):
+        """QK of one MXFP4 K tile: per 16-token chunk one scaled MFMA per 128-element
+        K block (accumulated), A = packed E2M1 K (lane: 16 B = one E8M0 group,
+        its scale byte ``k_scales[a][kb]``), B = E4M3 Q (``q_ops[kb]``) scaled by
+        the e8m0 byte ``q_scale_byte``, so the f32 accumulator never exceeds the
+        logit by more than the 2x left in the mantissa of the query scale. Lanes
+        where ``pad`` holds take zero K (head_dim 64's padding)."""
+        kb_n = self.traits.MXFP4_KB
         frag_Ss = []
         for a in range_constexpr(self.traits.NCHUNK):
-            a_k = fx.Vector.from_elements(
-                [fx.Int32(k_raw[a * 5 + 1 + i]) for i in range_constexpr(4)]
-                + [fx.Int32(0) for _ in range_constexpr(4)],
-                dtype=fx.Int32,
-            )
-            acc = fx.rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                T.f32x4,
-                [
-                    a_k,
-                    q_op,
-                    fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32),
-                    4,
-                    0,
-                    0,
-                    k_scales[a],
-                    0,
-                    q_scale_byte,
-                ],
-            )
+            acc = fx.full(MFMA_ACC_ELEMS, 0.0, fx.Float32)
+            for kb in range_constexpr(kb_n):
+                i = (a * kb_n + kb) * 5
+                words = [fx.Int32(k_raw[i + 1 + w]) for w in range_constexpr(4)]
+                if const_expr(pad is not None):
+                    words = [pad.select(fx.Int32(0), w) for w in words]
+                a_k = fx.Vector.from_elements(
+                    words + [fx.Int32(0) for _ in range_constexpr(4)],
+                    dtype=fx.Int32,
+                )
+                acc = fx.rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                    T.f32x4,
+                    [
+                        a_k,
+                        q_ops[kb],
+                        acc,
+                        4,
+                        0,
+                        0,
+                        k_scales[a][kb],
+                        0,
+                        q_scale_byte,
+                    ],
+                )
             frag_Ss.append(fx.Vector(acc))
         return frag_Ss
 

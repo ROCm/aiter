@@ -13,6 +13,21 @@ from ..utils import rcp_f32
 from .traits import KV_COMPUTE_BLOCK, MFMA_ACC_ELEMS, MFMA_MNK, WAVE
 
 
+def tree_max(vals, fastmath):
+    """Maximum of scalar ``vals`` as a balanced tree of ``maxnumf``: v_max and
+    v_max3, where a vector reduction lowers to compare-and-select pairs."""
+    while len(vals) > 1:
+        vals = [
+            (
+                fx.maxnumf(vals[i], vals[i + 1], fastmath=fastmath)
+                if i + 1 < len(vals)
+                else vals[i]
+            )
+            for i in range(0, len(vals), 2)
+        ]
+    return vals[0]
+
+
 class PaDecodeSoftmax:
     def __init__(self, ctx, lds, kv, gemm):
         self.ctx = ctx

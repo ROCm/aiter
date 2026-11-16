@@ -57,6 +57,7 @@ def compile_pa_decode_ps_reduce(
     pairs: bool = False,
     parallel_groups: int = 1,
     num_xcds: int = 0,
+    kernarg_preload: bool = False,
 ):
     """Build PA decode's partitioned-softmax reducer.
 
@@ -79,6 +80,8 @@ def compile_pa_decode_ps_reduce(
 
     ``pairs`` gives each lane two adjacent bf16/f16 elements (D % 128 == 0, a
     four-byte aligned base and even strides); output stores stay scalar.
+    ``kernarg_preload`` selects the gfx950 entry whose leading pointer slot
+    carries ``reduce_info``; the launch wrapper retains its argument order.
     ``num_xcds`` > 0 launches a 1-D grid that gives each XCD a contiguous run
     of CTAs; the launch then needs ``rows_magic`` and ``seq_magic`` =
     ceil(2**30 / d) for d = rows and rows * KV heads, valid while
@@ -89,6 +92,8 @@ def compile_pa_decode_ps_reduce(
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture not in ("gfx942", "gfx950", "gfx1250", "gfx1250-strict"):
         raise NotImplementedError(f"PA decode reducer does not support {architecture}")
+    if kernarg_preload and architecture != "gfx950":
+        raise ValueError("explicit reducer kernarg preload requires gfx950")
     wave = 32 if architecture in ("gfx1250", "gfx1250-strict") else WAVE
     register_partitions = min(REGISTER_PARTITIONS, wave)
     max_cta_waves = MAX_CTA_WAVES * WAVE // wave
@@ -152,6 +157,13 @@ def compile_pa_decode_ps_reduce(
     # would otherwise hoist above the count branch; issuing rung 2's loads in
     # reverse keeps them inside it.
     reverse_pair = not dual and partitions > 32
+    # The dual ladder tests counts bottom first, so every rung below the
+    # selected one shares its leading code: the statistics, their mask and the
+    # lower rung's partitions. LLVM hoists that above each count branch and
+    # waits for those loads there, one level at a time. On gfx950 a dual rung
+    # instead computes its partitions' addresses highest first, then loads,
+    # then masks the statistics.
+    descending = dual and architecture == "gfx950"
     # Groups tile whole wave-sized weight chunks, so their slots stay in range.
     weight_chunks = -(-partitions // wave)
     split = (
@@ -184,6 +196,8 @@ def compile_pa_decode_ps_reduce(
         kernel_name += f"_g{groups}"
     if num_xcds:
         kernel_name += f"_xcd{num_xcds}"
+    if kernarg_preload:
+        kernel_name += "_preload"
 
     @flyc.kernel(name=kernel_name, known_block_size=block)
     def pa_decode_reduce_kernel(
@@ -208,6 +222,10 @@ def compile_pa_decode_ps_reduce(
         rows_magic: fx.Int32,
         seq_magic: fx.Int32,
     ):
+        if fx.const_expr(kernarg_preload):
+            # The leading slot carries the first dependent read's metadata.
+            # The launch wrapper swaps these two slots on this path only.
+            output_ptr, reduce_info_ptr = reduce_info_ptr, output_ptr
         if fx.const_expr(num_xcds > 0):
             # Hardware deals linear workgroup ids round-robin over XCDs. Give
             # each XCD a contiguous run of (sequence, KV head, row) so rows
@@ -296,15 +314,18 @@ def compile_pa_decode_ps_reduce(
                 return fx.full(2, 0.0, fx.Float32)
             return zero_f
 
-        def _load_logits(part, unit):
-            return buf_copy_load(
-                logits_buffer,
+        def _logits_offset(part, unit):
+            return (
                 part * stride_logits_part
                 + row_idx * stride_logits_group
-                + unit * fx.Int32(elems),
-                logits_dtype,
-                unit_elems=elems,
+                + unit * fx.Int32(elems)
             )
+
+        def _load_logits_at(offset):
+            return buf_copy_load(logits_buffer, offset, logits_dtype, unit_elems=elems)
+
+        def _load_logits(part, unit):
+            return _load_logits_at(_logits_offset(part, unit))
 
         def _to_f32(value):
             if fx.const_expr(pairs):
@@ -320,7 +341,7 @@ def compile_pa_decode_ps_reduce(
             else:
                 output[offset] = acc.to(output_dtype)
 
-        def _lane_stats(chunk):
+        def _lane_stats(chunk, raw=False):
             # Lane l owns partition l + wave * chunk; part_count <= NP.
             part = lane + fx.Int32(chunk * wave)
             live = part < part_count
@@ -330,9 +351,14 @@ def compile_pa_decode_ps_reduce(
                 + live.select(part, zero_i) * stride_exp_sums_part
                 + row_idx
             )
-            part_sum = live.select(fx.Float32(exp_sums[offset]), zero_f)
-            part_max = live.select(fx.Float32(max_logits[offset]), neg_inf)
-            return part_sum, part_max
+            part_sum = fx.Float32(exp_sums[offset])
+            part_max = fx.Float32(max_logits[offset])
+            if fx.const_expr(not raw):
+                return _mask_stats(live, part_sum, part_max)
+            return live, part_sum, part_max
+
+        def _mask_stats(live, part_sum, part_max):
+            return live.select(part_sum, zero_f), live.select(part_max, neg_inf)
 
         def _softmax_weights(sums, maxes, offsets):
             lane_max = maxes[0]
@@ -370,15 +396,35 @@ def compile_pa_decode_ps_reduce(
             return [value * inv_exp_sum for value in scaled]
 
         def _reduce_register(rung, unit):
-            part_sum, part_max = _lane_stats(0)
-            order = range(rung)
-            if fx.const_expr(reverse_pair and rung == 2):
-                order = (1, 0)
             # Loads stay in the logits dtype until accumulation, so a rung
             # holds half the registers of its FP32 values.
             logits = [None] * rung
-            for part in order:
-                logits[part] = _load_logits(fx.Int32(part), unit)
+            if fx.const_expr(descending):
+                # Addresses come first: they would otherwise read a pending
+                # statistics load's register as an undefined high half and
+                # wait for it. The rung only runs for counts up to it, so the
+                # mask bounded by it is the live mask, distinct per rung. No
+                # stable API keeps the order; the scheduler would lead with
+                # the statistics and their mask.
+                addresses = [
+                    _logits_offset(fx.Int32(part), unit)
+                    for part in range(rung - 1, -1, -1)
+                ]
+                fx.rocdl.sched_barrier(0)
+                _, part_sum, part_max = _lane_stats(0, raw=True)
+                for i, address in enumerate(addresses):
+                    logits[rung - 1 - i] = _load_logits_at(address)
+                fx.rocdl.sched_barrier(0)
+                c_rung = fx.Int32(rung)
+                live = lane < (part_count < c_rung).select(part_count, c_rung)
+                part_sum, part_max = _mask_stats(live, part_sum, part_max)
+            else:
+                part_sum, part_max = _lane_stats(0)
+                order = range(rung)
+                if fx.const_expr(reverse_pair and rung == 2):
+                    order = (1, 0)
+                for part in order:
+                    logits[part] = _load_logits(fx.Int32(part), unit)
             # Wave32 reductions broadcast statistics to every output lane,
             # including lanes without a live partition.
             offsets = _shuffle_offsets(
@@ -622,7 +668,7 @@ def compile_pa_decode_ps_reduce(
         query_rows = query_seq_len * fx.Int32(query_group_size)
         num_ctas = batch_size * num_kv_heads * query_rows
         pa_decode_reduce_kernel(
-            output,
+            reduce_info if fx.const_expr(kernarg_preload) else output,
             exp_sums,
             max_logits,
             logits,
@@ -636,7 +682,7 @@ def compile_pa_decode_ps_reduce(
             stride_logits_head,
             stride_logits_part,
             stride_logits_group,
-            reduce_info,
+            output if fx.const_expr(kernarg_preload) else reduce_info,
             query_rows,
             num_kv_heads,
             num_ctas,
@@ -652,12 +698,16 @@ def compile_pa_decode_ps_reduce(
             stream=stream,
         )
 
-    if architecture in ("gfx1250", "gfx1250-strict"):
-        # All 108 argument bytes preload into user SGPRs, so the first load
-        # is reduce_info.
+    if architecture in ("gfx1250", "gfx1250-strict") or kernarg_preload:
+        # The gfx950 entry exposes reduce_info in its leading preload slot.
+        # Keep the established preload count on the gfx1250 paths.
         launch_pa_decode_ps_reduce_kernel.compile_hints["llvm_options"] = {
             "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
-            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload-count": (
+                min(16, AITER_FLYDSL_KERNARG_PRELOAD_COUNT)
+                if kernarg_preload
+                else AITER_FLYDSL_KERNARG_PRELOAD_COUNT
+            ),
         }
     return {
         "launch": launch_pa_decode_ps_reduce_kernel,

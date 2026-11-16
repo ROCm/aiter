@@ -43,6 +43,7 @@ def device(monkeypatch):
         (4096, None, 8192, 0, 1, None, 4096),
         (1, 1, 1, 0, 1, 1, 1),
         (65, None, None, 0, 1, 100, 128),
+        (8, None, None, 0, 1, None, 8),
         (100, None, None, 0, 1, 100, 128),
         (4097, None, None, 0, 1, 5000, 8192),
         pytest.param(None, None, None, 0, 1, None, None, id="lds-limit"),
@@ -104,14 +105,26 @@ def test_pa_decode_plan(
             def tasks(tiles, bound):
                 return min(-(-tiles // bound), plan.max_partitions) if tiles else 0
 
-            # The smallest feasible bound from ceil(total / capacity) up;
-            # ceil(total / (capacity - rows)) always fits.
-            low = max(-(-total_tiles // plan.capacity), 1)
-            bound = max(-(-total_tiles // max(remaining, 1)), low)
-            while low < bound:
-                mid = (low + bound) // 2
-                need = sum(tasks(last - first, mid) for first, last in ranges)
-                low, bound = (low, mid) if need <= plan.capacity else (mid + 1, bound)
+            def smallest_bound(slots):
+                # The smallest feasible bound from ceil(total / slots) up;
+                # ceil(total / (slots - rows)) always fits.
+                low = max(-(-total_tiles // slots), 1)
+                spare = slots - plan.capacity + remaining
+                bound = max(-(-total_tiles // max(spare, 1)), low)
+                while low < bound:
+                    mid = (low + bound) // 2
+                    need = sum(tasks(last - first, mid) for first, last in ranges)
+                    low, bound = (low, mid) if need <= slots else (mid + 1, bound)
+                return bound
+
+            bound = smallest_bound(plan.capacity)
+            # A compact plan replaces a bound of at most 2 tiles unless it
+            # more than doubles it.
+            rows = plan.capacity - remaining
+            if plan.compact_capacity >= max(rows, 1) and bound <= 2:
+                compact = smallest_bound(plan.compact_capacity)
+                if compact <= 2 * bound:
+                    bound = compact
         cursor = prefix_tiles = 0
         for seq, (ctx, (start, count), (first, last)) in enumerate(
             zip(lengths, info, ranges)
@@ -141,9 +154,11 @@ def test_pa_decode_plan(
     pattern = (-1, 0, 1, 255, 256, 257, 65537, 2**31 - 1)
     lengths = [pattern[i % len(pattern)] for i in range(batch)]
     context = torch.tensor(lengths, dtype=torch.int32, device=device)
+    # One KV head lets default gfx950 plans choose a compact plan.
+    heads = 1 if budget is None else 2
     plan = planner.plan_pa_decode(
         context,
-        2,
+        heads,
         max_partitions=max_parts,
         max_batch_size=max_batch_size,
         workgroup_budget=budget,
@@ -159,7 +174,7 @@ def test_pa_decode_plan(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         refreshed = planner.plan_pa_decode(
-            context, 2, sliding_window=window, query_length=query_length, plan=plan
+            context, heads, sliding_window=window, query_length=query_length, plan=plan
         )
     assert refreshed is plan
     # All-empty replay must erase old active records, then mixed lengths must
@@ -215,6 +230,59 @@ def test_pa_decode_plan(
                 2,
                 max_batch_size=max_batch_size,
             )
+
+
+def test_pa_decode_plan_compact(device):
+    """gfx950 default single-head plans with tasks of at most 2 tiles use one
+    slot per CU unless that more than doubles the longest task."""
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("compact plans are gfx950 only")
+    from aiter.ops.flydsl.kernels import pa_decode_plan as planner
+
+    cus = torch.cuda.get_device_properties(device).multi_processor_count
+
+    def counts(lengths):
+        context = torch.tensor(lengths, dtype=torch.int32, device=device)
+        plan = planner.plan_pa_decode(context, 1)
+        assert plan.capacity == 2 * cus and plan.compact_capacity == cus
+        return [count for _, count in plan.reduce_info.cpu().tolist()]
+
+    # Uniform 8-tile rows: bound 1 at two slots per CU, 2 at one; compact.
+    assert counts([2048] * (cus // 4)) == [4] * (cus // 4)
+    # Uniform 16-tile rows: the full plan's bound 4 is over 2 tiles; full.
+    assert counts([4096] * (cus // 2)) == [4] * (cus // 2)
+    # One 2*CU-tile row among 1-tile rows: the compact bound (about 8) is more
+    # than twice the full plan's 1, so the long row keeps CU tasks.
+    rows = 3 * cus // 4
+    assert counts([256] * (rows - 1) + [2 * cus * 256]) == [1] * (rows - 1) + [cus]
+
+
+def test_pa_decode_plan_short_window(device):
+    """On gfx950, default-budget plans of windows over at most two tiles have one
+    slot per sequence; a window that can touch three tiles keeps the budget, as
+    do other architectures."""
+    from aiter.ops.flydsl.kernels import pa_decode_plan as planner
+
+    gfx950 = get_gfx_runtime() == "gfx950"
+    context = torch.tensor([4096, 100, 0, 700], dtype=torch.int32, device=device)
+    for window, query_length, one_slot in (
+        (128, 1, True),
+        (257, 1, True),
+        (256, 2, True),
+        (258, 1, False),
+        (256, 3, False),
+    ):
+        plan = planner.plan_pa_decode(
+            context, 2, sliding_window=window, query_length=query_length
+        )
+        assert (plan.capacity == len(context)) == (one_slot and gfx950), (
+            window,
+            query_length,
+        )
+    explicit = planner.plan_pa_decode(
+        context, 2, workgroup_budget=64, sliding_window=128
+    )
+    assert explicit.capacity > len(context)
 
 
 @pytest.mark.parametrize(
@@ -515,6 +583,122 @@ def test_pa_decode_fp16_bf16_case_policy(
             test_pa_decode(case, device, monkeypatch)
 
 
+@pytest.mark.parametrize(
+    "ctas, context_bound, splits",
+    [
+        (1, 65536, 256),  # a tile a CTA, one CTA per CU
+        (1, 32768, 128),
+        (9, 5000, 20),
+        (16, 8192, 16),  # one CTA per CU: two tiles each
+        (8, 32768, 64),  # two CTAs per CU
+        (128, 4096, 4),
+        (65, 2048, 4),
+        (129, 2048, 1),  # not two CTAs each within one per CU
+        (256, 2048, 1),
+        (1, 768, 3),
+        (1, 256, 1),
+        (2, 0, 1),
+    ],
+)
+def test_pa_decode_mxfp4_free_splits(ctas, context_bound, splits):
+    """Plan-free MXFP4 CTAs per sequence on 256 CUs."""
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    assert pa._mxfp4_free_splits(ctas, 256, context_bound) == splits
+
+
+@pytest.mark.parametrize(
+    "query_length, group, ctas, head_dim, colocated, splits",
+    [
+        (4, 16, 64, 128, True, 4),  # idle CUs: one 16-row M-tile a CTA
+        (4, 16, 512, 128, True, 2),  # four M-tiles: two CTAs on one XCD
+        (4, 16, 512, 128, False, 1),
+        (4, 16, 256, 128, True, 2),  # fills the CUs at four M-tiles
+        (2, 32, 512, 128, True, 2),
+        (3, 16, 512, 128, True, 1),  # only three single-M-tile splits
+        (4, 8, 512, 128, True, 1),  # two M-tiles already
+        (2, 24, 512, 128, True, 1),  # halves of 24 rows pad a fourth M-tile
+        (4, 16, 512, 64, True, 1),
+        (7, 16, 512, 128, True, 4),  # 4 + 3 positions, then 2 + 2 + 2 + 1
+        (7, 16, 64, 128, True, 4),  # most that fit: 7 does not
+        (7, 16, 16, 128, True, 7),
+        (5, 16, 512, 128, True, 3),  # 3 + 2 positions, then 2 + 2 + 1
+        (6, 16, 512, 128, True, 3),  # 48-row halves, then 32-row thirds
+        (6, 12, 512, 128, True, 3),
+        (3, 12, 512, 128, True, 1),  # halves would add an M-tile
+        (5, 12, 512, 128, True, 1),  # 60 rows in four M-tiles
+        (4, 16, 512, 256, True, 2),  # two M-tiles a CTA at head_dim 256
+        (2, 16, 64, 512, True, 2),  # one M-tile a CTA past head_dim 256
+        (3, 8, 64, 384, True, 2),  # 2 + 1 positions of 8 rows
+    ],
+)
+def test_pa_decode_mxfp4_query_splits(
+    query_length, group, ctas, head_dim, colocated, splits
+):
+    """MXFP4 MTP query splits on 256 CUs."""
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    assert (
+        pa._mxfp4_query_splits(query_length, group, ctas, 256, head_dim, colocated)
+        == splits
+    )
+
+
+@pytest.mark.parametrize(
+    "query_length, group, query_splits, head_dim, colocated, splits",
+    [
+        (1, 64, 1, 128, True, 2),  # four M-tiles, no query to split
+        (1, 64, 1, 128, False, 1),
+        (3, 16, 1, 128, True, 1),  # 48 rows: two CTAs of 24 pad a fourth M-tile
+        (1, 32, 1, 128, True, 1),  # two M-tiles already
+        (4, 16, 2, 128, True, 1),
+        (1, 64, 1, 64, True, 1),
+        (1, 48, 1, 128, True, 1),
+        (2, 32, 1, 128, True, 2),
+        (1, 45, 1, 128, True, 1),  # odd group
+    ],
+)
+def test_pa_decode_mxfp4_kv_head_splits(
+    query_length, group, query_splits, head_dim, colocated, splits
+):
+    """MXFP4 KV-head splits (CTAs over a KV head's query heads)."""
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    assert (
+        pa._mxfp4_kv_head_splits(query_length, group, query_splits, head_dim, colocated)
+        == splits
+    )
+
+
+@pytest.mark.parametrize(
+    "group, sets, head_dim, colocated, splits",
+    [
+        (64, 1, 128, True, 2),
+        (65, 5, 128, True, 5),  # 13 heads: no fewer sets fit
+        (80, 5, 128, True, 5),  # 5 x 16 rows: 5 M-tiles, not 2 x 3
+        (96, 2, 128, True, 3),  # 2 x 48 rows, then 3 x 32
+        (96, 2, 128, False, 2),
+        (96, 2, 64, True, 2),
+        (128, 2, 128, True, 4),
+        (192, 3, 128, True, 6),
+        (2048, 32, 128, True, 32),
+        (67, None, 128, True, None),  # prime: 67 one-head sets
+        (4096, None, 128, True, None),  # more sets than counter words
+        (64, 2, 256, True, 2),  # two M-tiles a set at head_dim 256
+        (96, 3, 256, True, 3),
+        (64, 4, 512, True, 4),  # one M-tile a set past head_dim 256
+        (33, 3, 384, True, 3),
+        (512, 32, 512, True, 32),
+        (528, None, 512, True, None),  # 33 sets of 16
+    ],
+)
+def test_pa_decode_mxfp4_group_sets(group, sets, head_dim, colocated, splits):
+    """Groups past 64 query heads run as equal sets of KV heads."""
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    assert pa._mxfp4_group_sets(group, head_dim) == sets
+    if sets is not None:
+        assert (
+            pa._mxfp4_kv_head_splits(1, group, 1, head_dim, colocated, sets) == splits
+        )
+
+
 def _reference(
     query, key, value, table, lengths, query_length, window, sinks, dtype=torch.float32
 ):
@@ -641,21 +825,22 @@ def _make_inputs(
     return query, key, value, table, context
 
 
-def _mxfp4_dequant(pool):
-    """f32 [pages, heads, 128, 128] of a pool of MXFP4 pages (see ``_mxfp4_pages``)."""
-    pages, heads, _ = pool.shape
-    data = pool[..., : 128 * 64].reshape(-1, 64).clone()
-    scale = pool[..., 128 * 64 :].reshape(-1, 4)
+def _mxfp4_dequant(pool, dim=128):
+    """f32 [pages, heads, P, dim] of a pool of MXFP4 pages (see ``_mxfp4_pages``)."""
+    pages, heads, row = pool.shape
+    page = row // (dim // 2 + dim // 32)
+    data = pool[..., : page * dim // 2].reshape(-1, dim // 2).clone()
+    scale = pool[..., page * dim // 2 :].reshape(-1, dim // 32)
     dequant = fp4_utils.mxfp4_to_f32(data) * fp4_utils.e8m0_to_f32(
         scale
     ).repeat_interleave(32, dim=-1)
-    return dequant.reshape(pages, heads, 128, 128)
+    return dequant.reshape(pages, heads, page, dim)
 
 
 def _mxfp4_pages(x):
-    """x [pages, kv_heads, 128, 128] -> (page pool, f32 dequantization).
+    """x [pages, kv_heads, P, dim] -> (page pool, f32 dequantization).
 
-    A pool row is one (page, head): [128 x 64 B e2m1][128 x 4 B e8m0].
+    A pool row is one (page, head): [P x dim/2 B e2m1][P x dim/32 B e8m0].
     """
     pages, heads, _, dim = x.shape
     data, scale = per_1x32_f4_quant(x.reshape(-1, dim))
@@ -677,15 +862,23 @@ def _round_query_e4m3(query):
     return (query.float() / scale).to(torch.float8_e4m3fn).float() * scale
 
 
-def _mxfp4_views(pool):
+def _mxfp4_views(pool, dim=128):
     """The fp4x2 data and fp8_e8m0 scale views of a pool that pa_decode takes.
 
     The pool holds both per (page, head), so the two views share page and head strides.
     """
-    pages, heads, _ = pool.shape
+    pages, heads, row = pool.shape
+    data_row, scale_row = dim // 2, dim // 32
+    page = row // (data_row + scale_row)
     page_head = pool.stride()[:2]
-    data = pool.as_strided((pages, heads, 128, 64), (*page_head, 64, 1))
-    scale = pool.as_strided((pages, heads, 128, 4), (*page_head, 4, 1), 128 * 64)
+    data = pool.as_strided(
+        (pages, heads, page, data_row), (*page_head, data_row, 1), pool.storage_offset()
+    )
+    scale = pool.as_strided(
+        (pages, heads, page, scale_row),
+        (*page_head, scale_row, 1),
+        pool.storage_offset() + page * data_row,
+    )
     return data.view(dtypes.fp4x2), scale.view(dtypes.fp8_e8m0)
 
 
@@ -1352,9 +1545,9 @@ _PIPE_CASES = [
         },
     ),
 ]
-# MXFP4 K/V on gfx950: head_dim 128, page 128, one query token a row, an e4m3 or a
-# bf16 query. Plan-free runs one task per row; unequal 32-element blocks make a
-# block/scale mix-up visible.
+# MXFP4 K/V on gfx950: head_dim 128, page 128, one query token a row (more below), an e4m3 or a
+# bf16 query. Plan-free splits a short batch's rows over CTAs (and reduces them);
+# unequal 32-element blocks make a block/scale mix-up visible.
 _E4M3 = torch.float8_e4m3fn
 _MXFP4_SWEEP = (1, 15, 16, 17, 127, 128, 129, 255, 256, 257, 511, 2047, 2048)
 _MXFP4_BASE = {
@@ -1365,6 +1558,190 @@ _MXFP4_BASE = {
     "pattern": "block_scales",
 }
 _MXFP4_CASES = [
+    *[
+        (
+            f"mxfp4-eight-wave-compact-d{dim}-p{page}",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": torch.bfloat16,
+                "head_dim": dim,
+                "block_size": page,
+                "kv_heads": 1,
+                "group_size": 16,
+                "lengths": (8191, 2049, 1025, 6145),
+                "compact_scale_rows": True,
+                "capture": True,
+                "mxfp4_waves": 8,
+            },
+        )
+        for dim in (64, 128, 256)
+        for page in (16, 64, 128)
+    ],
+    *[
+        (
+            f"mxfp4-eight-wave-d{dim}-p{page}",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": torch.bfloat16,
+                "head_dim": dim,
+                "block_size": page,
+                "kv_heads": 3,
+                "query_length": 1,
+                "lengths": (0, 17, 31, 33, 257, 1025),
+                "capture": True,
+                "mxfp4_waves": 4,
+            },
+        )
+        for dim in (64, 128, 256)
+        for page in (16, 64, 128)
+    ],
+    *[
+        (
+            f"mxfp4-eight-wave-{name}",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": torch.bfloat16,
+                "lengths": (0, 17, 257, 4097),
+                "capture": True,
+                "mxfp4_waves": 4,
+                **options,
+            },
+        )
+        for name, options in [
+            ("free", {"plan_free": True, "group_size": 5}),
+            ("direct", {"max_partitions": 1}),
+            ("oneslot", {"kv_heads": 3, "group_size": 5, "streams_per_cu": 3}),
+            ("q2", {"query_length": 2}),
+            ("q4", {"query_length": 4}),
+            ("q3-d256", {"query_length": 3, "group_size": 11, "head_dim": 256}),
+            ("fp8q", {"query_dtype": torch.float8_e4m3fn}),
+            ("window", {"window": 128, "sink_dtype": torch.float32}),
+        ]
+    ],
+    *[
+        (
+            f"mxfp4-tail-dense-d{dim}-p{page}",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": torch.bfloat16,
+                "head_dim": dim,
+                "block_size": page,
+                "kv_heads": 8,
+                "query_length": 2,
+                "group_size": 8,
+                "lengths": (0, 17, 257, 1025),
+                "streams_per_cu": 3,
+                "capture": True,
+                "check_first_peel": False,
+            },
+        )
+        for dim in (64, 128, 256)
+        for page in (16, 64, 128)
+    ],
+    (
+        "mxfp4-tail-dense-sparse-control",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "lengths": (0, 17, 257, 1025),
+            "capture": True,
+            "check_first_peel": True,
+        },
+    ),
+    *[
+        (
+            f"mxfp4-streaming-d{dim}-p{page}",
+            {
+                **_MXFP4_BASE,
+                "head_dim": dim,
+                "block_size": page,
+                "kv_heads": 8,
+                "query_dtype": torch.bfloat16,
+                "query_length": 2,
+                "group_size": 8,
+                "lengths": (0, 1, 17, 257, 1025),
+                "capture": True,
+                "streams_per_cu": 1,
+                "mxfp4_nt": True,
+            },
+        )
+        for dim in (64, 128, 256)
+        for page in (16, 64, 128)
+    ],
+    (
+        "mxfp4-streaming-sparse-control",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "lengths": (0, 1, 17, 257),
+            "capture": True,
+            "mxfp4_nt": False,
+        },
+    ),
+    (
+        "mxfp4-streaming-window-control",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "kv_heads": 8,
+            "query_length": 4,
+            "lengths": (0, 17, 257, 1025),
+            "window": 128,
+            "sink_dtype": torch.float32,
+            "capture": True,
+            "streams_per_cu": 1,
+            "mxfp4_nt": False,
+        },
+    ),
+    (
+        "mxfp4-streaming-one-slot-fp8q",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": _E4M3,
+            "kv_heads": 8,
+            "lengths": (0, 17, 257, 1025),
+            "capture": True,
+            "streams_per_cu": 2,
+            "mxfp4_nt": True,
+        },
+    ),
+    (
+        "mxfp4-padded-q-early-dense-control",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "group_size": 1,
+            "kv_heads": 8,
+            "max_partitions": 3,
+            "lengths": (257, 513) * 16,
+            "capture": True,
+            "padded_q_early": False,
+        },
+    ),
+    *[
+        (
+            f"mxfp4-padded-q-early-g{group}-d{dim}-q{ql}",
+            {
+                **_MXFP4_BASE,
+                "head_dim": dim,
+                "group_size": group,
+                "query_length": ql,
+                "query_dtype": dtype,
+                "kv_heads": 2,
+                "max_partitions": 3,
+                "lengths": (1, 17, 257, 513, 1025),
+                "capture": True,
+                "padded_q_early": True,
+            },
+        )
+        for group, dim, ql, dtype in (
+            (1, 128, 1, torch.bfloat16),
+            (8, 128, 1, torch.bfloat16),
+            (3, 128, 3, _E4M3),
+            (8, 64, 1, _E4M3),
+            (3, 256, 2, torch.bfloat16),
+        )
+    ],
     *[
         (
             f"mxfp4-g{group}-{'e4m3' if dtype == _E4M3 else 'bf16'}-q",
@@ -1390,6 +1767,233 @@ _MXFP4_CASES = [
         )
         for dtype in (torch.bfloat16, _E4M3)
     ],
+    # MTP: query rows split over CTAs of at most 16 rows; contexts shorter than
+    # query_length leave a row's first queries empty, and a tile boundary within
+    # the last query_length - 1 tokens masks the tile before the last.
+    *[
+        (
+            f"mxfp4-mtp{query_length}-g{group}{'-plan-free' if free else ''}",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": _E4M3 if group % 2 else torch.bfloat16,
+                "query_length": query_length,
+                "group_size": group,
+                "plan_free": free,
+                "lengths": (1, 2, 3, 255, 256, 257, 258, 1000, 2048, 4097),
+            },
+        )
+        for query_length, group in (
+            *((2, 16), (3, 16), (4, 16), (2, 8), (4, 8), (3, 5)),
+            *((5, 12), (7, 3), (8, 16), (6, 64)),
+        )
+        for free in (False, True)
+    ],
+    # More CTAs than CUs: four 16-row M-tiles split in two, the halves' CTA ids
+    # one XCD stride apart (capacity a multiple of the XCD count).
+    (
+        "mxfp4-mtp4-g16-kv2-xcd-splits",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "query_length": 4,
+            "group_size": 16,
+            "kv_heads": 2,
+            "lengths": (1, 2, 3, 255, 256, 257, 258, 1000, 2048) * 8,
+        },
+    ),
+    # Four M-tiles of query heads split in two CTAs (as two KV heads of 32)
+    # on one XCD: eight sequences or plan slots.
+    *[
+        (
+            f"mxfp4-g64-kv2-head-splits{'-plan-free' if free else ''}",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": torch.bfloat16,
+                "group_size": 64,
+                "kv_heads": 2,
+                "plan_free": free,
+                "lengths": (1, 255, 256, 257, 1000, 2048, 4097, 5000),
+            },
+        )
+        for free in (False, True)
+    ],
+    # Fewer tiles than plan slots: every KV head's row ends in empty slots, so
+    # CTAs take KV heads fastest.
+    (
+        "mxfp4-kv8-padded-plan",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "group_size": 2,
+            "kv_heads": 8,
+            "lengths": (1, 300, 2048),
+        },
+    ),
+    # One task a sequence of at most four tiles: a single group of waves.
+    (
+        "mxfp4-one-partition-short-tasks",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "max_partitions": 1,
+            "lengths": (1, 255, 256, 257, 700, 1024) * 4,
+        },
+    ),
+    (
+        "mxfp4-mtp4-g4-kv2-graph",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "query_length": 4,
+            "group_size": 4,
+            "kv_heads": 2,
+            "max_partitions": 3,
+            "capture": True,
+            "lengths": (2048, 700, 3, 33),
+        },
+    ),
+    # One slot per sequence (budget 1): a sequence's only task writes its rows,
+    # empty sequences free slots whose tasks merge in the sequence's last CTA to
+    # arrive, and every launch resets the arrival counters.
+    *[
+        (
+            f"mxfp4-one-slot-g{group}-d{dim}-q{query_length}",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": torch.bfloat16 if group % 2 == 0 else _E4M3,
+                "head_dim": dim,
+                "group_size": group,
+                "query_length": query_length,
+                "kv_heads": 2,
+                "budget": 1,
+                "lengths": (0, 3000, 0, 0, 257, 0, 0, 0, 1, 0, 9000, 0),
+                "capture": True,
+            },
+        )
+        for group, dim, query_length in (
+            (16, 128, 1),
+            (5, 128, 3),
+            (8, 64, 1),
+            (8, 256, 2),
+        )
+    ],
+    # More than 16 query heads per KV head: up to four M-tiles a CTA.
+    *[
+        (
+            (
+                f"mxfp4-g{group}{'-mtp2' if query_length > 1 else ''}"
+                f"{'-plan-free' if free else ''}"
+            ),
+            {
+                **_MXFP4_BASE,
+                "query_dtype": _E4M3 if group % 2 else torch.bfloat16,
+                "query_length": query_length,
+                "group_size": group,
+                "plan_free": free,
+                "lengths": (1, 2, 255, 256, 257, 1000, 2048, 4097),
+            },
+        )
+        for query_length, group in (
+            *((1, 32), (1, 64), (1, 17), (1, 48), (2, 32)),
+            # Groups past 64 run as equal sets of query heads.
+            *((1, 128), (1, 96), (2, 80), (3, 65)),
+        )
+        for free in (False, True)
+    ],
+    (
+        "mxfp4-g128-sinks-window128-one-slot-graph",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "group_size": 128,
+            "window": 128,
+            "sink_dtype": torch.float32,
+            "capture": True,
+            "lengths": (0, 2048, 0, 129, 1, 0, 300, 4097),
+        },
+    ),
+    (
+        "mxfp4-g192-kv2-mtp2-graph",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": _E4M3,
+            "group_size": 192,
+            "kv_heads": 2,
+            "query_length": 2,
+            "max_partitions": 3,
+            "capture": True,
+            "lengths": (2048, 700, 3, 33),
+        },
+    ),
+    (
+        "mxfp4-g32-kv2-graph",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "group_size": 32,
+            "kv_heads": 2,
+            "max_partitions": 3,
+            "capture": True,
+            "lengths": (2048, 700, 3, 33),
+        },
+    ),
+    # Pages of 16 and 64 tokens: a wave's 64 tokens span four pages or one.
+    *[
+        (
+            f"mxfp4-page{page}-{mode}",
+            {
+                **_MXFP4_BASE,
+                "block_size": page,
+                "query_dtype": _E4M3 if page == 16 else torch.bfloat16,
+                "plan_free": mode in ("plan-free", "unsplit"),
+                "max_partitions": {"mp1": 1, "mp3": 3}.get(mode),
+                "lengths": (
+                    (2048, 1, 129, 777, 1000, 17, 0, 300) * 40
+                    if mode == "unsplit"
+                    else (1, 15, 16, 17, 63, 64, 65, 255, 256, 257, 1000, 4097)
+                ),
+            },
+        )
+        for page in (16, 64)
+        for mode in ("plan", "plan-free", "unsplit", "mp1", "mp3")
+    ],
+    *[
+        (
+            f"mxfp4-page{page}-mtp{query_length}",
+            {
+                **_MXFP4_BASE,
+                "block_size": page,
+                "query_dtype": torch.bfloat16,
+                "query_length": query_length,
+                "group_size": 16,
+                "lengths": (1, 2, 3, 16, 17, 255, 256, 257, 258, 2048),
+            },
+        )
+        for page, query_length in ((16, 4), (64, 3))
+    ],
+    (
+        "mxfp4-page16-graph",
+        {
+            **_MXFP4_BASE,
+            "block_size": 16,
+            "query_dtype": torch.bfloat16,
+            "kv_heads": 2,
+            "group_size": 8,
+            "max_partitions": 7,
+            "capture": True,
+            "lengths": (2048, 700, 3, 33),
+        },
+    ),
+    # Too many rows to split plan-free: one task per row, no reducer.
+    (
+        "mxfp4-plan-free-unsplit",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": _E4M3,
+            "plan_free": True,
+            "lengths": (2048, 1, 129, 777, 1000, 17, 0, 300) * 40,
+        },
+    ),
     *[
         (
             f"mxfp4-kv{kv_heads}-g{group}",
@@ -1471,6 +2075,236 @@ _MXFP4_CASES = [
         )
         for tag, spec in _MXFP4_POOL_SPECS
     ],
+    # Head dims 64 (one zero-padded K block) and 256 to 512 (two to four K
+    # blocks a chunk; V widened one K block at a time past 256).
+    *[
+        (
+            (
+                f"mxfp4-d{dim}{f'-mtp{query_length}' if query_length > 1 else ''}"
+                f"-g{group}{f'-page{page}' if page != 128 else ''}-{mode}"
+            ),
+            {
+                **_MXFP4_BASE,
+                "head_dim": dim,
+                "query_dtype": _E4M3 if group % 2 or page == 16 else torch.bfloat16,
+                "query_length": query_length,
+                "group_size": group,
+                "block_size": page,
+                "plan_free": mode == "plan-free",
+                "max_partitions": {"mp1": 1, "mp3": 3}.get(mode),
+                "lengths": (1, 15, 16, 17, 255, 256, 257, 1000, 2048, 4097),
+            },
+        )
+        for dim in (64, 256, 384, 512)
+        for query_length, group, page in (
+            (1, 8, 128),
+            (1, 16, 16),
+            (2, 8, 64),
+            (1, 33, 128),
+            (4, 16, 128),
+            (1, 64, 128),
+        )
+        for mode in ("plan", "plan-free", "mp1", "mp3")
+    ],
+    *[
+        (
+            f"mxfp4-d{dim}-sinks-window128-kv2-graph",
+            {
+                **_MXFP4_BASE,
+                "head_dim": dim,
+                "query_dtype": torch.bfloat16,
+                "group_size": 8,
+                "kv_heads": 2,
+                "window": 128,
+                "sink_dtype": torch.float32,
+                "max_partitions": 3,
+                "capture": True,
+                "lengths": (2048, 700, 3, 33),
+            },
+        )
+        for dim in (64, 256, 384, 512)
+    ],
+    # Sinks (a -inf and a +inf one among them) apply in the reducer: a
+    # one-partition plan and plan-free decodes take it too. Sliding windows start
+    # at the window's first tile and mask its earlier tokens, with MTP per query
+    # row; contexts sit around the window and tile edges.
+    *[
+        (
+            (
+                f"mxfp4-{'sinks' if sink else ''}{'-' if sink and window else ''}"
+                f"{f'window{window}' if window else ''}"
+                f"{f'-mtp{query_length}' if query_length > 1 else ''}"
+                f"{f'-page{page}' if page != 128 else ''}-{mode}"
+            ),
+            {
+                **_MXFP4_BASE,
+                "query_dtype": _E4M3 if query_length % 2 else torch.bfloat16,
+                "query_length": query_length,
+                "group_size": 8 if query_length > 1 else 16,
+                "block_size": page,
+                "window": window,
+                "sink_dtype": sink,
+                "plan_free": mode == "plan-free",
+                "max_partitions": {"mp1": 1, "mp3": 3}.get(mode),
+                "lengths": (0, 1, 3, 255, 256, 257, 700, 1000, 1023, 2048, 4097),
+            },
+        )
+        for sink, window, query_length, page in (
+            (torch.float32, 0, 1, 128),
+            (torch.bfloat16, 0, 3, 128),
+            (None, 257, 1, 128),
+            (None, 700, 4, 128),
+            (None, 256, 1, 16),
+            (torch.float16, 1000, 2, 64),
+        )
+        for mode in ("plan", "plan-free", "mp1", "mp3")
+    ],
+    # Windows over at most two tiles plan one slot per sequence, so sinks fold
+    # into rows the tile kernel writes: with a G64 head split, and with tasks
+    # that empty sequences' slots gave to others merged in the last CTA. Wide
+    # plan-free grids write rows directly with sinks as well.
+    (
+        "mxfp4-g64-sinks-window128-one-slot",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "group_size": 64,
+            "window": 128,
+            "sink_dtype": torch.float32,
+            "lengths": (0, 2048, 0, 129, 1, 0, 300, 4097),
+        },
+    ),
+    (
+        "mxfp4-sinks-window200-mtp2-one-slot-graph",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "query_length": 2,
+            "group_size": 8,
+            "kv_heads": 2,
+            "window": 200,
+            "sink_dtype": torch.bfloat16,
+            "capture": True,
+            "lengths": (0, 2048, 257, 0, 3, 700),
+        },
+    ),
+    (
+        "mxfp4-sinks-plan-free-direct-kv8",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": _E4M3,
+            "group_size": 2,
+            "kv_heads": 8,
+            "sink_dtype": torch.float16,
+            "plan_free": True,
+            "lengths": (0, 1, 255, 256, 257, 700, 2048, 4097) * 4,
+        },
+    ),
+    (
+        "mxfp4-sinks-window700-mtp2-kv2-graph",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "query_length": 2,
+            "group_size": 8,
+            "kv_heads": 2,
+            "window": 700,
+            "sink_dtype": torch.float32,
+            "max_partitions": 3,
+            "capture": True,
+            "lengths": (2048, 700, 3, 33),
+        },
+    ),
+    # MTP past four positions: a window union of sw + q - 1 tokens, one-slot and
+    # reduced plans, sinks, graph replay.
+    (
+        "mxfp4-sinks-window250-mtp7-one-slot-graph",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "query_length": 7,
+            "group_size": 4,
+            "kv_heads": 2,
+            "window": 250,
+            "sink_dtype": torch.float32,
+            "capture": True,
+            "lengths": (0, 2048, 257, 0, 3, 700, 6, 7),
+        },
+    ),
+    (
+        "mxfp4-sinks-window600-mtp6-g16",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": _E4M3,
+            "query_length": 6,
+            "group_size": 16,
+            "window": 600,
+            "sink_dtype": torch.bfloat16,
+            "max_partitions": 3,
+            "lengths": (2048, 600, 5, 33, 1030),
+        },
+    ),
+    # Query splits that do not divide query_length: the last split starts
+    # ceil(query_length / splits) positions before the end and stores only
+    # the rows past the split before it.
+    *[
+        (
+            f"mxfp4-mtp7-g16-split{splits}{'-plan-free' if free else ''}",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": torch.bfloat16,
+                "query_length": 7,
+                "group_size": 16,
+                "query_splits": splits,
+                "plan_free": free,
+                "lengths": (1, 6, 7, 255, 256, 262, 1000, 4097),
+            },
+        )
+        for splits in (2, 3, 4)
+        for free in (False, True)
+    ],
+    (
+        "mxfp4-sinks-window250-mtp5-g8-split2-one-slot-graph",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": _E4M3,
+            "query_length": 5,
+            "group_size": 8,
+            "kv_heads": 2,
+            "window": 250,
+            "sink_dtype": torch.float32,
+            "query_splits": 2,
+            "capture": True,
+            "lengths": (0, 2048, 257, 0, 3, 700, 4, 5),
+        },
+    ),
+    (
+        "mxfp4-mtp5-g16-split2-plan-free-direct",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "query_length": 5,
+            "group_size": 16,
+            "query_splits": 2,
+            "plan_free": True,
+            "lengths": (0, 5, 300, 0, 2048) * 60,
+        },
+    ),
+    # Tasks of more than 4096 pages stage their first 4096 page ids; later
+    # tiles read the block table (one task a row, two, and a dual group).
+    *[
+        (
+            f"mxfp4-page16-long-task-mp{partitions}",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": torch.bfloat16,
+                "block_size": 16,
+                "max_partitions": partitions,
+                "lengths": lengths,
+            },
+        )
+        for partitions, lengths in ((1, (70000, 3, 0, 65600)), (2, (140000, 300)))
+    ],
     # A two-partition plan over 1024 tokens with max_context_length 128: the reducer
     # must merge both partials, whatever the bound.
     (
@@ -1483,8 +2317,8 @@ _MXFP4_CASES = [
             "lengths": (1024,),
         },
     ),
-    # One task per row three ways: plan-free, a one-partition plan, a strided output (the
-    # reducer); the same bytes as uint8 views; a context-0 row is zero-filled.
+    # Plan-free (split over CTAs), a one-partition plan (one task per row) and a strided
+    # output (the reducer); the same bytes as uint8 views; a context-0 row is zero-filled.
     (
         "mxfp4-one-task-variants",
         {
@@ -1532,14 +2366,13 @@ _INVALID_CASES = [
 _MXFP4_INVALID_CASES = [
     ("fp16-output", TypeError, "bf16 output"),
     ("fp16-query", TypeError, "e4m3 or bf16 query"),
-    ("page-64", ValueError, "uint8 .* view"),
-    ("17-heads", NotImplementedError, "1..16 query heads"),
-    ("sinks", NotImplementedError, "no sinks"),
-    ("sliding-window", NotImplementedError, "no sliding window"),
-    ("query-length-2", NotImplementedError, "query_length 1, got 2"),
+    ("page-32", NotImplementedError, "pages of 16, 64 or 128 tokens"),
+    ("67-heads", NotImplementedError, "equal sets of up to 64"),
+    ("head-dim-96", NotImplementedError, "head_dim 64 or a multiple of 128"),
+    ("sinks-shape", ValueError, r"sinks must have shape \[num_query_heads\]"),
+    ("sinks-dtype", TypeError, "sinks must have dtype"),
     ("compute-type", NotImplementedError, "compute_type None, uint8 or fp4x2"),
     ("plan-free-strides", ValueError, "output needs the query's strides"),
-    ("oversized-task", ValueError, "PAGE_ID_STAGE_LIMIT"),
     # Operands the kernel would read with the wrong layout or plan: each used to
     # produce wrong output (or an AttributeError) instead of an error.
     ("non-contiguous-table", ValueError, "block_tables must be contiguous"),
@@ -1556,7 +2389,7 @@ _MXFP4_INVALID_CASES = [
     ("scale-pages-mismatch", ValueError, "key_scale must be a uint8 .* view"),
     ("misaligned-key", ValueError, "key_cache base pointer must be 16 B aligned"),
     ("misaligned-scale", ValueError, "key_scale base pointer must be 4 B aligned"),
-    # A windowed plan is refused with one partition (served without it) and more.
+    # A windowed plan is refused for an unwindowed decode, one partition or more.
     ("windowed-plan-1", ValueError, "sliding_window must match work_plan"),
     ("windowed-plan-2", ValueError, "sliding_window must match work_plan"),
 ]
@@ -1642,28 +2475,26 @@ def _check_unsupported_mxfp4(invalid, error, match, device):
     query, kd, ks, vd, vs, table, context, _ = _mxfp4_inputs(device)
     output = torch.empty(query.shape, dtype=torch.bfloat16, device=device)
     options = {"key_scale": ks, "value_scale": vs, "work_plan": None}
-    query_length = 1
     if invalid == "fp16-output":
         output = output.half()
     elif invalid == "fp16-query":
         query = query.to(torch.float16)
-    elif invalid == "page-64":
-        kd = kd[:, :, :64]
-    elif invalid == "17-heads":
-        query = torch.cat([query, query[:, :1]], 1)
+    elif invalid == "page-32":
+        kd = kd[:, :, :32]
+    elif invalid == "67-heads":
+        query = torch.cat([query] * 4 + [query[:, :3]], 1)
         output = torch.empty(query.shape, dtype=torch.bfloat16, device=device)
-    elif invalid == "sinks":
-        options["sinks"] = torch.zeros(16, device=device)
-    elif invalid == "sliding-window":
-        options["sliding_window"] = 256
-    elif invalid == "query-length-2":
-        query_length = 2
+    elif invalid == "head-dim-96":
+        query = query[..., :96].contiguous()
+        output = torch.empty(query.shape, dtype=torch.bfloat16, device=device)
+    elif invalid == "sinks-shape":
+        options["sinks"] = torch.zeros(8, device=device)
+    elif invalid == "sinks-dtype":
+        options["sinks"] = torch.zeros(16, dtype=torch.int32, device=device)
     elif invalid == "compute-type":
         options["compute_type"] = torch.float8_e4m3fn
     elif invalid == "plan-free-strides":
         output = torch.empty(4, 32, 128, dtype=torch.bfloat16, device=device)[:, :16]
-    elif invalid == "oversized-task":
-        table = torch.zeros(4, 4097, dtype=torch.int32, device=device)
     elif invalid == "non-contiguous-table":
         table = torch.cat([table, table], 1)[:, ::2]
     elif invalid == "context-on-cpu":
@@ -1710,9 +2541,7 @@ def _check_unsupported_mxfp4(invalid, error, match, device):
             context, 1, max_partitions=int(invalid[-1]), sliding_window=256
         )
     with pytest.raises(error, match=match):
-        pa.pa_decode(
-            output, query, kd, vd, context, table, 1.0, query_length, **options
-        )
+        pa.pa_decode(output, query, kd, vd, context, table, 1.0, 1, **options)
 
 
 def _check_select_rejected(monkeypatch, invalid, error, match):
@@ -1894,6 +2723,7 @@ def _run_pa_decode_case(case, device, monkeypatch):
             "cluster_seqs": None,
             "cluster_steps": None,
             "cluster_runs": None,
+            "query_splits": None,
         },
         **case,
     )
@@ -1915,6 +2745,13 @@ def _run_pa_decode_case(case, device, monkeypatch):
     ):
         pytest.skip("BF16 KV requires packed V caches on gfx942/gfx950")
     num_cu = torch.cuda.get_device_properties(device).multi_processor_count
+    if case.get("compact_scale_rows"):
+        # Keep the test in the same compact-plan regime on different CU counts.
+        case["lengths"] *= max(1, num_cu // (8 * len(case["lengths"])))
+    if case.get("streams_per_cu"):
+        streams = len(case["lengths"]) * case["kv_heads"]
+        repeats = -(-(case["streams_per_cu"] * num_cu) // streams)
+        case["lengths"] = case["lengths"] * repeats
     if case["max_partitions"] is not None and case["max_partitions"] > num_cu:
         pytest.skip(f"plan_pa_decode caps max_partitions at {num_cu} CUs")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
@@ -2008,8 +2845,8 @@ def _run_pa_decode_case(case, device, monkeypatch):
             _mxfp4_pages(value),
         )
         (key_cache, key_scale), (value_cache, value_scale) = (
-            _mxfp4_views(key_pool),
-            _mxfp4_views(value_pool),
+            _mxfp4_views(key_pool, dim),
+            _mxfp4_views(value_pool, dim),
         )
     else:
         logical_key = key.float() * (1.0 if key_scale is None else key_scale)
@@ -2070,6 +2907,18 @@ def _run_pa_decode_case(case, device, monkeypatch):
         return compile_tile(**kwargs)
 
     monkeypatch.setattr(pa, "compile_pa_decode_tile", spy_tile)
+    reduce_compile_kwargs = []
+    compile_reduce = pa.compile_pa_decode_ps_reduce
+
+    def spy_reduce(**kwargs):
+        reduce_compile_kwargs.append(kwargs)
+        return compile_reduce(**kwargs)
+
+    monkeypatch.setattr(pa, "compile_pa_decode_ps_reduce", spy_reduce)
+    if case["query_splits"] is not None:
+        monkeypatch.setattr(
+            pa, "_mxfp4_query_splits", lambda *_args: case["query_splits"]
+        )
 
     output = torch.full_like(
         query,
@@ -2143,9 +2992,10 @@ def _run_pa_decode_case(case, device, monkeypatch):
     launch()
     check()
     if case["variants"]:
-        # Plan-free, a one-partition plan and uint8 views of the same bytes are one
-        # task; a strided output takes the reducer, and a context-0 row is zero-filled
-        # on every path (7.0 would stay otherwise).
+        # A one-partition plan runs one task per row; plan-free splits these four
+        # rows over CTAs (and uint8 views of the same bytes match it bit for bit);
+        # a strided output takes the reducer, and a context-0 row is zero-filled on
+        # every path (7.0 would stay otherwise).
         def run(out, caches=(key_cache, value_cache, key_scale, value_scale), **opts):
             key, value, ks, vs = caches
             pa.pa_decode(
@@ -2173,8 +3023,9 @@ def _run_pa_decode_case(case, device, monkeypatch):
             ),
             work_plan=None,
         )
-        assert torch.equal(free, planned) and torch.equal(free, as_bytes)
+        assert torch.equal(free, as_bytes)
         check(free)
+        check(planned)
         padded = torch.full(
             (query.shape[0], 32, dim), 7.0, dtype=output.dtype, device=device
         )
@@ -2182,6 +3033,53 @@ def _run_pa_decode_case(case, device, monkeypatch):
         assert (padded[:, query.shape[1] :] == 7.0).all()
     if case["kv_dtype"] != "mxfp4":
         _check_pipe_policy(pa, case, arch, compile_kwargs)
+    if "padded_q_early" in case:
+        from aiter.ops.flydsl.kernels.pa_decode.traits import (
+            PaDecodeSchedule,
+            PaDecodeTraits,
+        )
+
+        args = dict(compile_kwargs[-1])
+        args.pop("architecture", None)
+        args.pop("cluster_merge", None)
+        traits = PaDecodeTraits.create(PaDecodeSchedule.select(**args))
+        assert traits.MXFP4_PADDED_Q_EARLY is case["padded_q_early"]
+    if "mxfp4_waves" in case:
+        from aiter.ops.flydsl.kernels.pa_decode.traits import (
+            PaDecodeSchedule,
+            PaDecodeTraits,
+        )
+
+        args = dict(compile_kwargs[-1])
+        args.pop("architecture", None)
+        args.pop("cluster_merge", None)
+        traits = PaDecodeTraits.create(PaDecodeSchedule.select(**args))
+        assert traits.NWARP == case["mxfp4_waves"]
+        assert traits.TOK_PER_WARP * traits.NWARP == 256
+        if traits.NWARP == 8:
+            assert not traits.DUAL_GROUP
+    if "mxfp4_nt" in case:
+        from aiter.ops.flydsl.kernels.pa_decode.traits import (
+            PaDecodeSchedule,
+            PaDecodeTraits,
+        )
+
+        args = dict(compile_kwargs[-1])
+        args.pop("architecture", None)
+        args.pop("cluster_merge", None)
+        traits = PaDecodeTraits.create(PaDecodeSchedule.select(**args))
+        assert traits.MXFP4_NT_KV is case["mxfp4_nt"]
+    if "check_first_peel" in case:
+        from aiter.ops.flydsl.kernels.pa_decode.traits import (
+            PaDecodeSchedule,
+            PaDecodeTraits,
+        )
+
+        args = dict(compile_kwargs[-1])
+        args.pop("architecture", None)
+        args.pop("cluster_merge", None)
+        traits = PaDecodeTraits.create(PaDecodeSchedule.select(**args))
+        assert traits.MXFP4_PEEL_FIRST is case["check_first_peel"]
     if case["capture"]:
         # Compile/allocate before capture; replay must observe changed query data.
         capture_stream = torch.cuda.Stream()
@@ -2193,10 +3091,25 @@ def _run_pa_decode_case(case, device, monkeypatch):
         with torch.cuda.graph(graph, stream=capture_stream):
             launch()
         for _ in range(2):
-            query.neg_()
+            if query.dtype == torch.float8_e4m3fn:
+                query.copy_(-query.float())
+            else:
+                query.neg_()
             output.fill_(float("nan"))
             graph.replay()
             check()
+
+    # Exercise the actual launch policy, including strided one-partition
+    # output and graph capture. Other KV formats retain their reducer entry.
+    mxfp4 = case["kv_dtype"] == "mxfp4"
+    # One-slot plans write final rows from the tile kernel.
+    if mxfp4 and any(
+        not kw.get("direct_output", False) and not kw.get("one_slot_plan", False)
+        for kw in compile_kwargs
+    ):
+        assert reduce_compile_kwargs
+    for kwargs in reduce_compile_kwargs:
+        assert kwargs.get("kernarg_preload", False) is mxfp4
 
     # Reuse the validated inputs after restoring the test compilation spy.
     return case, launch, check, arguments, options, plan
@@ -2225,15 +3138,34 @@ def _poison_unowned(cache, scale, owned, fill):
 @pytest.mark.parametrize("fill", ["nan", "inf"])
 @pytest.mark.parametrize(
     "query_length,kv_heads,group_size,head_dim",
-    [(1, 1, 8, 128), (4, 2, 8, 256), (4, 1, 16, 128)],
+    [(1, 1, 8, 128), (2, 1, 8, 128), (4, 2, 8, 256), (4, 1, 16, 128)],
 )
 @pytest.mark.parametrize("block_size", [16, 64, 128])
 @pytest.mark.parametrize(
-    "kv",
-    ["fp8-per-tensor", "fp8-per-tensor-plain-v", "fp8-per-token", "bf16", "mxfp4"],
+    "kv,dense_mxfp4",
+    [
+        (kv, False)
+        for kv in (
+            "fp8-per-tensor",
+            "fp8-per-tensor-plain-v",
+            "fp8-per-token",
+            "bf16",
+            "mxfp4",
+        )
+    ]
+    + [("mxfp4", True)],
 )
 def test_pa_decode_unowned_kv_rows(
-    device, kv, block_size, query_length, kv_heads, group_size, head_dim, fill
+    device,
+    kv,
+    block_size,
+    query_length,
+    kv_heads,
+    group_size,
+    head_dim,
+    fill,
+    dense_mxfp4,
+    monkeypatch,
 ):
     """Rows no sequence owns contribute exactly zero, even when NaN or Inf.
 
@@ -2244,14 +3176,32 @@ def test_pa_decode_unowned_kv_rows(
     """
     if get_gfx_runtime() == "gfx1250":
         pytest.skip("gfx1250 pipelines still require finite unowned V rows")
-    if kv == "mxfp4" and (
-        get_gfx_runtime() != "gfx950"
-        or (block_size, query_length, head_dim) != (128, 1, 128)
-    ):
-        pytest.skip("MXFP4 pa_decode: gfx950, page 128, head_dim 128, one query token")
+    if kv == "mxfp4" and get_gfx_runtime() != "gfx950":
+        pytest.skip("MXFP4 pa_decode: gfx950")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     torch.manual_seed(0)
     lengths = tuple(max(n, query_length) for n in (1, 17, 255, 257, 1000))
+    if dense_mxfp4:
+        if query_length * group_size > 16:
+            pytest.skip("dense tail-path stress uses one M-tile")
+        cu_count = torch.cuda.get_device_properties(device).multi_processor_count
+        lengths *= -(-3 * cu_count // (len(lengths) * kv_heads))
+        compile_tile = pa.compile_pa_decode_tile
+
+        def check_last_tile(**kwargs):
+            from aiter.ops.flydsl.kernels.pa_decode.traits import (
+                PaDecodeSchedule,
+                PaDecodeTraits,
+            )
+
+            args = dict(kwargs)
+            args.pop("architecture", None)
+            args.pop("cluster_merge", None)
+            traits = PaDecodeTraits.create(PaDecodeSchedule.select(**args))
+            assert not traits.MXFP4_PEEL_FIRST
+            return compile_tile(**kwargs)
+
+        monkeypatch.setattr(pa, "compile_pa_decode_tile", check_last_tile)
     query, key, value, table, context = _make_inputs(
         query_length,
         kv_heads,
@@ -2300,8 +3250,8 @@ def test_pa_decode_unowned_kv_rows(
     def run(fill, mask_unowned_kv=True):
         if kv == "mxfp4":
             (k, ks), (v, vs) = (
-                _mxfp4_views(key_pool.clone()),
-                _mxfp4_views(value_pool.clone()),
+                _mxfp4_views(key_pool.clone(), head_dim),
+                _mxfp4_views(value_pool.clone(), head_dim),
             )
         else:
             k, v = key.clone(), value.clone()
