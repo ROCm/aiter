@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -220,7 +217,6 @@ class MQAAsyncKVLoader:
         WARP_SIZE: gl.constexpr,
         NUM_BUFFERS: gl.constexpr,
         USE_PADDED_SHARED_LAYOUT: gl.constexpr,
-        USE_64BIT_OFFSETS: gl.constexpr = False,
     ):
         kv_cfg = MQAAsyncKVLoaderConfig(
             BLOCK_KV,
@@ -242,12 +238,7 @@ class MQAAsyncKVLoader:
             0, kv_cfg.BLOCK_KV, layout=gl.SliceLayout(0, kv_cfg.blocked)
         )[None, :]
         # Advance the pointer instead of having large offset to enable buffer ops
-        if USE_64BIT_OFFSETS:
-            base_offset = (
-                offs_d.to(gl.int64) * stride_kv_d + offs_n.to(gl.int64) * stride_kv_s
-            )
-        else:
-            base_offset = offs_d * stride_kv_d + offs_n * stride_kv_s
+        base_offset = offs_d * stride_kv_d + offs_n * stride_kv_s
         return MQAAsyncKVLoader(
             kv_cfg,
             KV_ptr,
@@ -1201,29 +1192,17 @@ def _rows8_copy_scales(
     ks_shared,
     kv_scales_ptr,
     offset,
-    stride_ks,
     relative_end,
     BLOCK_KV: gl.constexpr,
     ks_layout: gl.constexpr,
-    USE_BUFFER_LOAD: gl.constexpr,
     MASKED: gl.constexpr,
 ):
     offset = gl.cast(offset, gl.int64)
     cols = gl.arange(0, 2 * BLOCK_KV, layout=ks_layout)
     mask = cols < relative_end - offset if MASKED else None
-    if USE_BUFFER_LOAD:
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            ks_shared,
-            kv_scales_ptr + offset.to(gl.int64) * stride_ks,
-            cols * stride_ks,
-            mask=mask,
-        )
-    else:
-        gl.amd.cdna4.async_copy.global_load_to_shared(
-            ks_shared,
-            kv_scales_ptr + (offset.to(gl.int64) + cols) * stride_ks,
-            mask=mask,
-        )
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        ks_shared, kv_scales_ptr + offset, cols, mask=mask
+    )
 
 
 @gluon.jit
@@ -1257,7 +1236,6 @@ def _rows8_emit_tile(
     BLOCK_KV: gl.constexpr,
     mfma_layout: gl.constexpr,
     output_layout: gl.constexpr,
-    USE_BUFFER_STORE: gl.constexpr,
     relative_end=0,
     MASKED: gl.constexpr = False,
 ):
@@ -1271,11 +1249,7 @@ def _rows8_emit_tile(
         else:
             mask = None
         _store_logits_block(
-            logits_ptr + h * half * stride_logits_k,
-            store_offsets,
-            out,
-            USE_BUFFER_STORE,
-            mask,
+            logits_ptr + h * half * stride_logits_k, store_offsets, out, True, mask
         )
 
 
@@ -1289,14 +1263,16 @@ _gluon_fp8_mqa_logits_rows8_kernel_repr = make_kernel_repr(
         "NUM_WARPS",
         "NUM_BUFFERS",
         "WAVES_PER_EU",
-        "USE_BUFFER_LOAD",
-        "USE_BUFFER_STORE",
         "USE_PADDED_SHARED_LAYOUT",
     ],
 )
 
 
-@gluon.jit(repr=_gluon_fp8_mqa_logits_rows8_kernel_repr)
+# seq_len_kv moves with the batch, as in the kernel above.
+@gluon.jit(
+    repr=_gluon_fp8_mqa_logits_rows8_kernel_repr,
+    do_not_specialize=["seq_len_kv"],
+)
 def _gluon_fp8_mqa_logits_rows8_kernel(
     Q_ptr,
     KV_ptr,
@@ -1315,9 +1291,6 @@ def _gluon_fp8_mqa_logits_rows8_kernel(
     stride_kv_d: gl.constexpr,
     stride_w_s: gl.int64,
     stride_w_h: gl.constexpr,
-    stride_ks: gl.constexpr,
-    stride_cu_start: gl.constexpr,
-    stride_cu_end: gl.constexpr,
     stride_logits_s: gl.int64,
     stride_logits_k: gl.constexpr,
     BLOCK_M: gl.constexpr,
@@ -1325,8 +1298,6 @@ def _gluon_fp8_mqa_logits_rows8_kernel(
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     WAVES_PER_EU: gl.constexpr,
-    USE_BUFFER_LOAD: gl.constexpr,
-    USE_BUFFER_STORE: gl.constexpr,
     USE_PADDED_SHARED_LAYOUT: gl.constexpr,
 ):
     gl.static_assert(BLOCK_M == 8 and NUM_WARPS == 4 and gl.num_warps() == 4)
@@ -1335,24 +1306,18 @@ def _gluon_fp8_mqa_logits_rows8_kernel(
     stride_q_s = stride_q_s.to(gl.int64)
     stride_w_s = stride_w_s.to(gl.int64)
     stride_logits_s = stride_logits_s.to(gl.int64)
-    if USE_BUFFER_LOAD:
-        stride_kv_s = stride_kv_s.to(gl.int32)
-    else:
-        stride_kv_s = stride_kv_s.to(gl.int64)
+    # The KV tile and the output tile use 32-bit buffer offsets.
+    stride_kv_s = stride_kv_s.to(gl.int32)
     row_id = (gl.num_programs(0) - gl.program_id(0) - 1) * BLOCK_M
     row_id = row_id.to(gl.int64)
-    union_start = gl.maximum(gl.load(cu_start_ptr + row_id * stride_cu_start), 0)
-    union_end = gl.minimum(gl.load(cu_end_ptr + row_id * stride_cu_end), seq_len_kv)
+    union_start = gl.maximum(gl.load(cu_start_ptr + row_id), 0)
+    union_end = gl.minimum(gl.load(cu_end_ptr + row_id), seq_len_kv)
     for row in gl.static_range(1, BLOCK_M):
         union_start = gl.minimum(
-            union_start,
-            gl.maximum(gl.load(cu_start_ptr + (row_id + row) * stride_cu_start), 0),
+            union_start, gl.maximum(gl.load(cu_start_ptr + row_id + row), 0)
         )
         union_end = gl.maximum(
-            union_end,
-            gl.minimum(
-                gl.load(cu_end_ptr + (row_id + row) * stride_cu_end), seq_len_kv
-            ),
+            union_end, gl.minimum(gl.load(cu_end_ptr + row_id + row), seq_len_kv)
         )
     # Each split owns whole tile pairs, with at most one partial pair at the end.
     pair_size: gl.constexpr = 2 * BLOCK_KV
@@ -1401,7 +1366,6 @@ def _gluon_fp8_mqa_logits_rows8_kernel(
         64,
         NUM_BUFFERS,
         USE_PADDED_SHARED_LAYOUT,
-        USE_64BIT_OFFSETS=not USE_BUFFER_LOAD,
     )
     output_layout: gl.constexpr = gl.DistributedLinearLayout(
         reg_bases=[],
@@ -1419,33 +1383,24 @@ def _gluon_fp8_mqa_logits_rows8_kernel(
     ]
     cols = gl.arange(0, BLOCK_KV // 2, layout=ks_layout)[None, None, :]
     store_offsets = (2 * pair + row) * stride_logits_s + cols * stride_logits_k
-    if USE_BUFFER_STORE:
-        store_offsets = store_offsets.to(gl.int32)
+    store_offsets = store_offsets.to(gl.int32)
     ks_shared = gl.allocate_shared_memory(
         gl.float32, [pair_size], gl.SwizzledSharedLayout(1, 1, 1, order=[0])
     )
     ks_a = ks_shared.slice(0, BLOCK_KV)
     ks_b = ks_shared.slice(BLOCK_KV, BLOCK_KV)
     ks_copy_layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
-    kv_scales_ptr += start.to(gl.int64) * stride_ks
+    kv_scales_ptr += start.to(gl.int64)
     logits_ptr += row_id * stride_logits_s + start.to(gl.int64) * stride_logits_k
     relative_end = end - start
     full_tiles = relative_end // BLOCK_KV
     full_pairs = full_tiles // 2
     if full_pairs > 0:
         _rows8_copy_scales(
-            ks_shared,
-            kv_scales_ptr,
-            0,
-            stride_ks,
-            relative_end,
-            BLOCK_KV,
-            ks_copy_layout,
-            USE_BUFFER_LOAD,
-            False,
+            ks_shared, kv_scales_ptr, 0, relative_end, BLOCK_KV, ks_copy_layout, False
         )
-        kv_loader.load_to_shared(start, 0, USE_BUFFER_LOAD)
-        kv_loader.load_to_shared(start + BLOCK_KV, 1, USE_BUFFER_LOAD)
+        kv_loader.load_to_shared(start, 0, True)
+        kv_loader.load_to_shared(start + BLOCK_KV, 1, True)
         for i in tl.range(full_pairs):
             tile = 2 * i
             next_a = gl.minimum(tile + 2, full_tiles - 1)
@@ -1459,14 +1414,12 @@ def _gluon_fp8_mqa_logits_rows8_kernel(
                 ks_shared,
                 kv_scales_ptr,
                 next_ks * BLOCK_KV,
-                stride_ks,
                 relative_end,
                 BLOCK_KV,
                 ks_copy_layout,
-                USE_BUFFER_LOAD,
                 False,
             )
-            kv_loader.load_to_shared(start + next_a * BLOCK_KV, 0, USE_BUFFER_LOAD)
+            kv_loader.load_to_shared(start + next_a * BLOCK_KV, 0, True)
             _rows8_emit_tile(
                 q,
                 w,
@@ -1481,11 +1434,10 @@ def _gluon_fp8_mqa_logits_rows8_kernel(
                 BLOCK_KV,
                 mfma_layout,
                 output_layout,
-                USE_BUFFER_STORE,
             )
             kv_loader.wait(1)
             kb = _rows8_load_k(kv_loader.kv_shared.index(1), BLOCK_KV, dot_b_layout)
-            kv_loader.load_to_shared(start + next_b * BLOCK_KV, 1, USE_BUFFER_LOAD)
+            kv_loader.load_to_shared(start + next_b * BLOCK_KV, 1, True)
             _rows8_emit_tile(
                 q,
                 w,
@@ -1500,7 +1452,6 @@ def _gluon_fp8_mqa_logits_rows8_kernel(
                 BLOCK_KV,
                 mfma_layout,
                 output_layout,
-                USE_BUFFER_STORE,
             )
         kv_loader.wait(0)
 
@@ -1511,17 +1462,13 @@ def _gluon_fp8_mqa_logits_rows8_kernel(
             ks_shared,
             kv_scales_ptr,
             tail_offset,
-            stride_ks,
             relative_end,
             BLOCK_KV,
             ks_copy_layout,
-            USE_BUFFER_LOAD,
             True,
         )
-        kv_loader.load_to_shared(start + tail_offset, 0, USE_BUFFER_LOAD, masked=True)
-        kv_loader.load_to_shared(
-            start + tail_offset + BLOCK_KV, 1, USE_BUFFER_LOAD, masked=True
-        )
+        kv_loader.load_to_shared(start + tail_offset, 0, True, masked=True)
+        kv_loader.load_to_shared(start + tail_offset + BLOCK_KV, 1, True, masked=True)
         kv_loader.wait(1)
         ka = _rows8_load_k(kv_loader.kv_shared.index(0), BLOCK_KV, dot_b_layout)
         ksa = _rows8_load_scales(ks_a, BLOCK_KV, ks_layout)
@@ -1539,7 +1486,6 @@ def _gluon_fp8_mqa_logits_rows8_kernel(
             BLOCK_KV,
             mfma_layout,
             output_layout,
-            USE_BUFFER_STORE,
             tail,
             True,
         )
@@ -1561,7 +1507,6 @@ def _gluon_fp8_mqa_logits_rows8_kernel(
                 BLOCK_KV,
                 mfma_layout,
                 output_layout,
-                USE_BUFFER_STORE,
                 tail - BLOCK_KV,
                 True,
             )
