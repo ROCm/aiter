@@ -2823,12 +2823,9 @@ def test_pa_decode_nhd_partial_tile_zero_logits(device):
         0
     )
     context_lengths = torch.tensor([257], dtype=torch.int32, device=device)
-    plan = pa.prepare_pa_decode_plan(
-        query,
-        key_cache,
-        value_cache,
-        block_tables,
+    plan = pa.plan_pa_decode(
         context_lengths,
+        1,
         query_length=1,
         workgroup_budget=1,
     )
