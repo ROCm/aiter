@@ -182,7 +182,7 @@ def _halves(v8, halves):
 
 def _bpermute_acc(addr, src):
     # ds_bpermute with AGPR data and result. fx.rocdl.ds_bpermute cannot pin
-    # either operand to AGPRs; the IMM route keeps gathered dwords there, and
+    # either operand to AGPRs; the AGPR route keeps gathered dwords there, and
     # the VGPR form first copies each one out with v_accvgpr_read (64 a tile).
     # The asm is opaque to the waitcnt pass, so callers wait on lgkmcnt before
     # reading the result.
@@ -221,6 +221,7 @@ def compile_sparse_mla_fwd(
     split_k=1,
     register_vt=False,
     imm_gather=False,
+    agpr_bpermute=False,
 ):
     """Compile one specialization of the sparse MLA forward kernel.
 
@@ -232,9 +233,10 @@ def compile_sparse_mla_fwd(
     workgroup and the kernel writes bf16 output. register_vt selects the
     register V^T route for unsplit launches; split launches ignore it.
     imm_gather (unsplit only) addresses each gathered row from one VGPR base
-    with immediate chunk offsets and keeps the gathered dwords and their
-    lane transfers in AGPRs. Results are identical; see IMM_GATHER_MAX_WIDTH
-    in the host wrapper for when it is faster.
+    with immediate chunk offsets, which drops about 47 VALU per tile.
+    agpr_bpermute (with imm_gather) also keeps the gathered dwords and their
+    lane transfers in AGPRs. Results are identical; see
+    AGPR_BPERMUTE_MAX_WIDTH in the host wrapper for when it is faster.
     """
     if index_format not in INDEX_FORMATS:
         raise ValueError(f"index_format must be one of {INDEX_FORMATS}")
@@ -247,6 +249,7 @@ def compile_sparse_mla_fwd(
     BLOCK_THREADS = NUM_WAVES * WAVE
     HAS_SINK = bool(has_sink) and not SPLIT
     IMM_GATHER = bool(imm_gather) and not SPLIT
+    AGPR_BP = IMM_GATHER and bool(agpr_bpermute)
     vt_route = "register_vt" if REGISTER_VT else "lds_vt"
     # Gather pairs issued in the QK MFMA phase; the rest go out in softmax.
     GM = 8 if SPLIT else 0
@@ -254,7 +257,7 @@ def compile_sparse_mla_fwd(
     assert GS in (1, 2, 4)
     kernel_name = (
         f"sparse_mla_fwd_{index_format}_{vt_route}"
-        f"_sink{int(HAS_SINK)}_split{split_k}{'_imm' if IMM_GATHER else ''}"
+        f"_sink{int(HAS_SINK)}_split{split_k}{'_imm' if IMM_GATHER else ''}{'_agbp' if AGPR_BP else ''}"
     )
     UNBOUNDED = 1 << 24
     CHUNKS_PER_ROW = HEAD_DIM // VEC
@@ -637,7 +640,7 @@ def compile_sparse_mla_fwd(
                     act = sched[n]
                     if const_expr(act[0] == "bp"):
                         pr, i = act[1] // 4, act[1] % 4
-                        if const_expr(IMM_GATHER):
+                        if const_expr(AGPR_BP):
                             moved[pr][i] = _bpermute_acc(perm_addr, fx.Int32(dw[pr][i]))
                             n_bp += 1
                         else:
@@ -675,7 +678,7 @@ def compile_sparse_mla_fwd(
                     else:
                         pr, h = act[1], act[2]
                         if const_expr(kops[pr] is None):
-                            if const_expr(IMM_GATHER):
+                            if const_expr(AGPR_BP):
                                 # LDS returns in order: pair pr's four transfers
                                 # are done once at most this many remain.
                                 fx.rocdl.s_waitcnt(lgkmcnt=min(14, n_bp - 4 * pr - 4))

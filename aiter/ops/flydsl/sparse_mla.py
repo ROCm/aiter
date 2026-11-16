@@ -42,12 +42,14 @@ __all__ = [
 # slot * D and token * H * D are int32 element offsets.
 _MAX_TOKENS = (1 << 31) // (NUM_HEADS * HEAD_DIM)
 _MAX_KV_ROWS = (1 << 31) // HEAD_DIM
-# Register-route rows up to this width use immediate-offset gathers with AGPR
-# lane transfers. MI325X, T=16384, sorted rows: 3-20% faster at K=512 and
-# 1024. At K=2048 the faster waves drift apart and paged rows lose L2 hits
-# (timing turns bimodal). The LDS route gains nothing on score-order rows:
-# every byte comes from DRAM there.
-IMM_GATHER_MAX_WIDTH = 1024
+# The register route gathers with immediate-offset loads at every width. Rows
+# up to this width also keep the gathered dwords and their lane transfers in
+# AGPRs. MI325X, T=16384, sorted rows: that is 3-20% faster at K=512 and 1024.
+# At K=2048 it is no better than plain VGPR transfers (-0.4% on uniform rows)
+# and the faster waves drift apart, so paged rows lose L2 hits and timing turns
+# bimodal. The LDS route gains nothing on score-order rows: every byte comes
+# from DRAM there.
+AGPR_BPERMUTE_MAX_WIDTH = 1024
 
 
 def _require_gfx942():
@@ -338,7 +340,8 @@ def flydsl_sparse_mla_fwd(
                     index_format=index_format,
                     split_k=splits,
                     register_vt=register_vt,
-                    imm_gather=register_vt and width <= IMM_GATHER_MAX_WIDTH,
+                    imm_gather=register_vt,
+                    agpr_bpermute=register_vt and width <= AGPR_BPERMUTE_MAX_WIDTH,
                 ),
                 device,
             ),
