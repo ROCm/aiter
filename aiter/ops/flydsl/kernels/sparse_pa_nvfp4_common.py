@@ -44,6 +44,7 @@ from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.kernels.kernels_common import LOG2E
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     buf_copy_load,
@@ -61,7 +62,6 @@ RAW = 2 * 4 + 1 + 8 + 2  # dwords one lane loads per page
 DATA_B = BLK * D // 2  # e2m1 bytes per head and side
 SCALE_B = BLK * D // 16  # e4m3 scale bytes per head and side
 HEAD_B = DATA_B + SCALE_B
-LOG2E = 1.4426950409
 # Dword index of a masked buffer store (byte 0x7FFFFFFC): past any buffer, so the write is dropped.
 OOB_DWORD = 0x1FFFFFFF
 # Cache-policy bits of buffer loads / stores: sc1 is coherent across the XCDs' L2s.
@@ -88,8 +88,8 @@ def refuse_alloc_in_capture(what):
     # then read uninitialised scratch.
     require(
         not torch.cuda.is_current_stream_capturing(),
-        f"the first sparse_pa_nvfp4 call on a device allocates its {what}: "
-        "run one eager call (same shapes) before graph capture",
+        f"the sparse_pa_nvfp4 kernels allocate their {what} on first use: do that before graph "
+        "capture (sparse_pa_nvfp4_decode_alloc, or an eager call that needs it)",
     )
 
 
