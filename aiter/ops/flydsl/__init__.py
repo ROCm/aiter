@@ -186,9 +186,21 @@ _LAZY_IMPORTS = {
         ".kernels.minimax_m3_index_score",
         "index_score_supported_fp4",
     ),
+    "minimax_m3_index_score_nvfp4_flydsl": (
+        ".kernels.minimax_m3_index_score",
+        "score_flydsl_nvfp4",
+    ),
+    "minimax_m3_index_score_nvfp4_flydsl_supported": (
+        ".kernels.minimax_m3_index_score",
+        "index_score_supported_nvfp4",
+    ),
     "minimax_m3_index_score_prefill_flydsl": (
         ".kernels.minimax_m3_index_score_prefill",
         "score_prefill_flydsl",
+    ),
+    "minimax_m3_index_score_prefill_nvfp4_flydsl": (
+        ".kernels.minimax_m3_index_score_prefill",
+        "score_prefill_flydsl_nvfp4",
     ),
     "minimax_m3_index_score_prefill_fp4_flydsl": (
         ".kernels.minimax_m3_index_score_prefill",
@@ -199,6 +211,18 @@ _LAZY_IMPORTS = {
     "minimax_m3_index_score_prefill_alloc": (
         ".kernels.minimax_m3_index_score_prefill",
         "alloc_score",
+    ),
+    "sparse_pa_nvfp4_decode": (
+        ".kernels.sparse_pa_nvfp4_decode",
+        "sparse_pa_nvfp4_decode",
+    ),
+    "sparse_pa_nvfp4_decode_alloc": (
+        ".kernels.sparse_pa_nvfp4_decode",
+        "sparse_pa_nvfp4_decode_alloc",
+    ),
+    "sparse_pa_nvfp4_prefill": (
+        ".kernels.sparse_pa_nvfp4_prefill",
+        "sparse_pa_nvfp4_prefill",
     ),
 }
 
@@ -252,15 +276,21 @@ __all__ = [
     "minimax_m3_index_score_flydsl_supported",
     "minimax_m3_index_score_fp4_flydsl",
     "minimax_m3_index_score_fp4_flydsl_supported",
+    "minimax_m3_index_score_nvfp4_flydsl",
+    "minimax_m3_index_score_nvfp4_flydsl_supported",
     "minimax_m3_index_score_prefill_alloc",
     "minimax_m3_index_score_prefill_flydsl",
     "minimax_m3_index_score_prefill_fp4_flydsl",
+    "minimax_m3_index_score_prefill_nvfp4_flydsl",
     "minimax_m3_index_score_work_map",
     "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
     "pa_decode",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
+    "sparse_pa_nvfp4_decode",
+    "sparse_pa_nvfp4_decode_alloc",
+    "sparse_pa_nvfp4_prefill",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"

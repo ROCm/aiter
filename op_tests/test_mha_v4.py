@@ -22,6 +22,7 @@ import aiter.ops.mha_v4 as mha_v4_module
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
+    MHA_V4_BLOCK_SPARSE_MODES,
     MHA_V4_SPARSE_MODE,
     AttentionFormat,
     AttentionPack,
@@ -1127,13 +1128,15 @@ def test_mha_v4_dispatchable_objects_bound_their_scale_gathers(arch):
             if line.strip() and not line.startswith("#")
         ]
     header, rows = rows[0], rows[1:]
-    # Skipped explicitly: the gfx950 sorted-sparse objects (every geometry) predate the
-    # bounded-gather rebuild and still fetch MX scales with global loads. They are safe only
+    # Skipped explicitly: the gfx950 sorted-sparse and Sol-Attn objects (every geometry) predate
+    # the bounded-gather rebuild and still fetch MX scales with global loads. They are safe only
     # because MHA_V4_QUERY_TILE_ROWS padding and the launcher's Q backing-storage check are
     # kept for them. Drop this exclusion, and that padding, once they are rebuilt.
     if arch == "gfx950":
         rows = [
-            row for row in rows if int(row[header.index("mode")]) != MHA_V4_SPARSE_MODE
+            row
+            for row in rows
+            if int(row[header.index("mode")]) not in MHA_V4_BLOCK_SPARSE_MODES
         ]
     co_names = sorted({row[header.index("co_name")] for row in rows})
     assert co_names, f"no dispatchable fmha_v4 rows for {arch}"
