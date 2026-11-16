@@ -12,7 +12,8 @@ from aiter.fused_moe_registry import register_fused_moe_impl
 
 from .moe_common import GateMode
 
-_MIN_FLYDSL_VERSION = Version("0.2.4")
+# Need flydsl>=0.4.2 for rocdl.experimental.sched_vgpr used by MXFP8 GEMM tune.
+_MIN_FLYDSL_VERSION = Version("0.4.2")
 
 installed_flydsl_version = getattr(_flydsl, "__version__", None)
 if installed_flydsl_version is None:
