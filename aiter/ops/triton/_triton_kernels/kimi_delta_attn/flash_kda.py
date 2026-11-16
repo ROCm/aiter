@@ -67,12 +67,12 @@ from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils imp
     input_guard,
     tensor_cache,
 )
-from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
+from aiter.ops.triton.utils.fast_launch import fast_launch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 

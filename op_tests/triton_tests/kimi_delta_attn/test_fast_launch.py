@@ -22,8 +22,8 @@ import importlib
 import pytest
 import torch
 
-from aiter.ops.triton._triton_kernels.kimi_delta_attn import fast_launch
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.flash_kda import flash_kda_fwd
+from aiter.ops.triton.utils import fast_launch
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="flash_kda needs a GPU"
