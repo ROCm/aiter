@@ -283,9 +283,8 @@ def chunk_kimi_delta_attn(
     )
 
     # Match fla's `@input_guard`: several kernels below index their operands
-    # with contiguous strides, so a view would be read as garbage. q, k, v and
-    # g are left to `chunk_delta_attn_fwd`, which packs them where needed.
-    beta = beta.contiguous()
+    # with contiguous strides, so a view would be read as garbage. q, k, v, g
+    # and beta are left to `chunk_delta_attn_fwd`, which packs them where needed.
     if A_log is not None:
         A_log = A_log.contiguous()
     if dt_bias is not None:

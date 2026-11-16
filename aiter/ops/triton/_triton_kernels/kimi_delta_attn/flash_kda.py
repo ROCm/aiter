@@ -1144,7 +1144,7 @@ def _seg_plan(seqs, C, L, H, taper):
         c += 0.05
 
 
-def _check_checkpoints(state, indices, H, V, K):
+def _check_checkpoints(state, offsets, indices, N, H, V, K):
     if state is None or state.dtype != torch.float32 or state.dim() != 4:
         raise ValueError("checkpoint_state must be an fp32 [rows, H, V, K] tensor")
     if tuple(state.shape[1:]) != (H, V, K) or state.stride()[1:] != (V * K, K, 1):
@@ -1152,34 +1152,22 @@ def _check_checkpoints(state, indices, H, V, K):
             f"checkpoint_state rows must be packed [{H}, {V}, {K}] (V-first), got "
             f"shape {tuple(state.shape)} and strides {state.stride()}"
         )
-    if indices is not None and indices.dtype.is_floating_point:
-        raise ValueError("checkpoint_state_indices must be an integer tensor")
+    # Read in place, never copied: they must be packed 1-D integer tensors.
+    for name, x in (
+        ("checkpoint_offsets", offsets),
+        ("checkpoint_state_indices", indices),
+    ):
+        if x is not None and (
+            x.dtype.is_floating_point or x.shape != (N,) or x.stride() != (1,)
+        ):
+            raise ValueError(f"{name} must be a contiguous integer [{N}] tensor")
 
 
-def _checkpoint_chunks(offsets, seqs, C):
-    offs = offsets.tolist()
-    if len(offs) != len(seqs):
-        raise ValueError(f"checkpoint_offsets needs {len(seqs)} entries")
-    return tuple(
-        o // C if 0 < o < e - b and o % C == 0 else 0 for o, (b, e) in zip(offs, seqs)
+def _upload(rows, device):
+    # Pinned and non-blocking: a pageable copy would wait for the GPU queue.
+    return torch.tensor(rows, dtype=torch.int32, pin_memory=True).to(
+        device, non_blocking=True
     )
-
-
-def _checkpoint_args(state, indices, ckpts, seg_lens, seg_seq, N):
-    has, at = [], []
-    for lens, c in zip(seg_lens, ckpts):
-        pos = 0
-        for m in lens:
-            has.append(pos < c <= pos + m)
-            at.append(c - pos if pos < c <= pos + m else 0)
-            pos += m
-    dev = seg_seq.device
-    rows = torch.arange(N, device=dev) if indices is None else indices.to(dev)
-    rows = rows.long()[seg_seq.long()]
-    flag = torch.tensor(has, device=dev) & (rows >= 0)
-    off = torch.where(flag, rows * state.stride(0), -1)
-    at = torch.tensor(at, dtype=torch.int64, device=dev)
-    return dict(ckpt_state=state, seg_ckpt=torch.stack([off, at], 1).contiguous())
 
 
 @functools.lru_cache(maxsize=64)
@@ -1231,7 +1219,7 @@ def _scf_table(nsegs, H, NVS, device):
         for q in range(NX):
             tab += lists[q][i] if i < len(lists[q]) else [-1, 0]
     nscan = sum(len(scans[q]) * NVS for q in range(NX))
-    return torch.tensor(tab, dtype=torch.int32, device=device), rmax, nscan
+    return _upload(tab, device), rmax, nscan
 
 
 _EPOCH_BUFS = {}
@@ -1290,7 +1278,7 @@ def _pass_a_rows(seqs, C, seg_lens, H, n_w, device):
     for q in sorted(later, key=lambda q: -part.get((slot[q][0], slot[q][2]), 0)):
         order[q] = rest.pop()
     tab = [rows[order[q][1]] + [order[q][2], 0, 0] for q in range(n)]
-    return torch.tensor(tab, dtype=torch.int32, device=device)
+    return _upload(tab, device)
 
 
 @functools.lru_cache(maxsize=64)
@@ -1380,7 +1368,21 @@ def _check_paged_state_cache(
         raise ValueError(f"state_indices and has_initial_state must have N={N} entries")
 
 
-@input_guard(skip=("q", "k", "v", "g", "state_cache", "out", "out_gate"))
+@input_guard(
+    skip=(
+        "q",
+        "k",
+        "v",
+        "g",
+        "beta",
+        "state_cache",
+        "out",
+        "out_gate",
+        "checkpoint_state",
+        "checkpoint_offsets",
+        "checkpoint_state_indices",
+    )
+)
 def flash_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1496,6 +1498,12 @@ def flash_kda_fwd(
     norm = out_gate is not None
     if norm:
         norm_weight = norm_weight.to(torch.float32).contiguous()
+        # The gate tiles are copied 16 B per lane: a token stride or base that is
+        # not 16 B aligned takes a packed copy.
+        if (
+            out_gate.stride(1) * out_gate.element_size()
+        ) % 16 or out_gate.data_ptr() % 16:
+            out_gate = out_gate.contiguous()
     use_gluon_k1 = AITER_FDA_USE_GLUON_K1 and _gluon_k1_usable(C, K)
     use_gluon_k2 = AITER_FDA_USE_GLUON_K2 and _gluon_k2_usable(C, K, V)
     # The gfx950 Gluon K1 workspace is read only by the Gluon K2: all Gluon or none.
@@ -1513,7 +1521,14 @@ def flash_kda_fwd(
             raise NotImplementedError(
                 "FlashKDA writes prefill checkpoints only on the gfx950 Gluon path"
             )
-        _check_checkpoints(checkpoint_state, checkpoint_state_indices, H, V, K)
+    # The gfx950 Gluon K1 reads beta at its token stride; every other kernel needs
+    # it packed.
+    stride_beta = 0
+    flat = B == 1 or beta.stride(0) == T * beta.stride(1)
+    if gluon_pipeline and beta.stride(-1) == 1 and flat:
+        stride_beta = beta.stride(1)
+    else:
+        beta = beta.contiguous()
     # The gfx1250 Gluon kernels read q, k, g (K1) and v (K2) at their own token
     # stride. Every other kernel needs them packed.
     stride_q = stride_k = stride_g = H * K
@@ -1543,6 +1558,10 @@ def flash_kda_fwd(
         NT = triton.cdiv(T, C)
         total_tiles = B * NT
 
+    if checkpoint_offsets is not None:
+        _check_checkpoints(
+            checkpoint_state, checkpoint_offsets, checkpoint_state_indices, N, H, V, K
+        )
     if paged:
         _check_paged_state_cache(
             state_cache,
@@ -1578,10 +1597,6 @@ def flash_kda_fwd(
             max(chunks_per_seg, plan.kwargs["TAPER_SEG_CHUNKS"]), n_chunks_max
         )
     seg_lens = _seg_plan(seqs, C, chunks_per_seg, H, gluon_pipeline and segmented)
-    ckpts = None
-    if checkpoint_offsets is not None:
-        ckpts = _checkpoint_chunks(checkpoint_offsets, seqs, C)
-        ckpts = ckpts if any(ckpts) else None
 
     CM_LOAD = "" if gluon_pipeline else ".cg"
     CM_STORE = "" if segmented or gluon_pipeline else ".wt"
@@ -1634,6 +1649,7 @@ def flash_kda_fwd(
                 "num_warps": k1_sched.num_warps,
                 "waves_per_eu": k1_sched.kwargs.get("waves_per_eu", 0),
                 "epoch": _call_epoch(dev) if gluon_pipeline else None,
+                "stride_beta": stride_beta,
             }
 
         gluon_k1_prepare(
@@ -1702,9 +1718,17 @@ def flash_kda_fwd(
     desc, seq_seg_off, num_segs, max_segs = _build_segments(seqs, C, seg_lens, dev)
     seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, seg_seq, seg_is_last = desc
     ckpt_args = {}
-    if ckpts is not None:
-        ckpt_args = _checkpoint_args(
-            checkpoint_state, checkpoint_state_indices, ckpts, seg_lens, seg_seq, N
+    if checkpoint_offsets is not None:
+        # All on the device: the kernel finds each snapshot's segment and chunk.
+        ckpt_args = dict(
+            ckpt_state=checkpoint_state,
+            ckpt_offsets=checkpoint_offsets,
+            ckpt_rows=checkpoint_state_indices,
+            ckpt_bos=(
+                cu_seqlens
+                if cu_seqlens is not None
+                else torch.arange(0, N * T, T, device=dev)
+            ),
         )
 
     # The kernel indexes h_in by segment, so normalize a V-first initial state
@@ -1903,7 +1927,7 @@ def flash_kda_fwd(
                 norm
                 and paged
                 and not segmented
-                and ckpts is None
+                and checkpoint_offsets is None
                 and 2 * bw == V
                 and per_xcd <= cus // nx
             ):

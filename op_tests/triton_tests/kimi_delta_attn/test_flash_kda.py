@@ -1554,3 +1554,52 @@ def test_checkpoints_need_the_gfx950_gluon_path():
                 checkpoint_state=torch.zeros(1, 12, K_DIM, K_DIM, device=device),
                 checkpoint_offsets=torch.tensor([128], device=device),
             )
+
+
+def test_checkpoint_into_padded_vllm_state_cache():
+    """vLLM's layout: the destination is the padded paged cache itself, offsets
+    are int32 and rows without a checkpoint are NULL_BLOCK_ID (0) with offset 0.
+    The snapshots land in the cache; row 0 and the padding stay untouched."""
+    _skip_unless_gfx950_gluon()
+    H, lens = 12, [2048, 2048, 512]
+    n = len(lens)
+    args, kw, h0 = _checkpoint_call(lens, H)
+    cache, indices, storage = _paged_pool(n + 2, H, torch.zeros_like(h0[:1]), 256)
+    cache[1 : n + 1] = h0.flip(0)
+    kw.update(state_cache=cache, state_indices=torch.arange(n, 0, -1).int().cuda())
+    offsets = torch.tensor([1024, 1536, 0], device=device, dtype=torch.int32)
+    ref = torch.full((n, H, K_DIM, K_DIM), float("nan"), device=device)
+    before = storage.clone()
+    chunk_kimi_delta_attn(**kw, checkpoint_state=ref, checkpoint_offsets=offsets)
+    storage.copy_(before)
+    rows = torch.tensor([n + 1, n + 2, 0], device=device, dtype=torch.int64)
+    chunk_kimi_delta_attn(
+        **kw,
+        checkpoint_state=cache,
+        checkpoint_offsets=offsets,
+        checkpoint_state_indices=rows,
+    )
+    assert torch.equal(cache[n + 1], ref[0])
+    assert torch.equal(cache[n + 2], ref[1])
+    assert torch.equal(cache[0], before.as_strided(cache[0].shape, cache[0].stride()))
+    pad = torch.as_strided(storage, (n + 4, 256), (cache.stride(0), 1), H * K_DIM**2)
+    assert (pad == 0).all()
+
+
+@pytest.mark.parametrize("norm", [False, True])
+def test_strided_beta_matches_packed(norm):
+    """beta sliced from a wider projection, as vLLM passes it, gives the same
+    result as a packed copy (the gfx950 Gluon K1 reads it in place)."""
+    lens = [2136, 4608, 300]
+    args, kw, _ = _checkpoint_call(lens, norm=norm)
+    T, H = sum(lens), 12
+    proj = torch.randn(T, 3 * H + 5, device=device, dtype=dtype)
+    beta = proj[:, H : 2 * H].view(1, T, H)
+    assert not beta.is_contiguous()
+    cache0 = kw["state_cache"].clone()
+    chunk_kimi_delta_attn(**{**kw, "beta": beta.contiguous()})
+    o_packed, s_packed = kw["out"].clone(), kw["state_cache"].clone()
+    kw["state_cache"].copy_(cache0)
+    chunk_kimi_delta_attn(**{**kw, "beta": beta})
+    assert torch.equal(kw["out"], o_packed)
+    assert torch.equal(kw["state_cache"], s_packed)

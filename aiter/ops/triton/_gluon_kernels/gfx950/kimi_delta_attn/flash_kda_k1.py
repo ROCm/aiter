@@ -242,6 +242,7 @@ def k1_prepare_gluon(
     CM_WS: gl.constexpr = "",
     CM_LOAD: gl.constexpr = ".cg",
     epoch=None,
+    STRIDE_BETA: gl.constexpr = 0,
 ):
     """FlashKDA K1 on gfx950, for the Gluon K2 only: the inverse carries diag(beta),
     and the contraction indices of kd, qd, kr, inv and Mqk are in perm32 order.
@@ -275,9 +276,12 @@ def k1_prepare_gluon(
     # q and k in two K / 2 column halves (fewer live registers); rows past the
     # tile get out-of-range offsets, which load as 0.
     o_bt = gl.arange(0, C, layout=_BLK1)
+    # beta's token stride: H when packed, else the projection it is sliced from.
+    SB: gl.constexpr = H if STRIDE_BETA == 0 else STRIDE_BETA
+    b_base = bos * SB + i_h
     beta_raw_v = gl.amd.cdna4.buffer_load(
         ptr=beta_raw,
-        offsets=gl.where(o_bt < actual_len, base.to(gl.int32) + o_bt * H, 1 << 30),
+        offsets=gl.where(o_bt < actual_len, b_base.to(gl.int32) + o_bt * SB, 1 << 30),
     )
     o_ch = gl.arange(0, C, layout=gl.SliceLayout(1, _BLK_H))
     o_kh = gl.arange(0, KH, layout=gl.SliceLayout(0, _BLK_H))
@@ -446,6 +450,7 @@ def gluon_k1_prepare(
     num_warps=_NUM_WARPS,
     waves_per_eu=0,
     epoch=None,
+    stride_beta=0,
 ):
     if num_warps != _NUM_WARPS:
         raise ValueError(
@@ -479,6 +484,7 @@ def gluon_k1_prepare(
         CM_WS=CM_WS,
         CM_LOAD=CM_LOAD,
         epoch=epoch,
+        STRIDE_BETA=stride_beta,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
     )

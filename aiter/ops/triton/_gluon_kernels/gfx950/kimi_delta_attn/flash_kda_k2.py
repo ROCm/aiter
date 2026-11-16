@@ -973,7 +973,10 @@ def k2_c_gluon(
     RMAX: gl.constexpr = 1,
     HAS_H0: gl.constexpr = False,
     ckpt_state=None,
-    seg_ckpt=None,
+    ckpt_offsets=None,
+    ckpt_rows=None,
+    ckpt_bos=None,
+    CKPT_STRIDE: gl.constexpr = 0,
 ):
     """Pass C: one segment's recurrence from its incoming state, writing outputs.
 
@@ -983,9 +986,9 @@ def k2_c_gluon(
     each chunk is one step late, once the row partials crossed the next barrier).
     ``xbuf``: the copier-wave walk instead. ``tab``: the scan in the same launch (BW
     = V); a pass C program reads h_in once its scan replica's flags rise.
-    ``seg_ckpt``: per segment, the ``ckpt_state`` element offset and the chunk
-    count after which the walk stores its state there (offset -1: none), for
-    mid-prefill checkpoints.
+    ``ckpt_state``: mid-prefill checkpoints. Sequence ``n`` stores its state after
+    ``ckpt_offsets[n]`` tokens to row ``ckpt_rows[n]`` (default ``n``); ``ckpt_bos``
+    holds each sequence's first token.
     """
     CW: gl.constexpr = xbuf is not None
     SCW: gl.constexpr = tab is not None
@@ -1063,15 +1066,26 @@ def k2_c_gluon(
     tok_base = gl.load(seg_tok_base + i_seg).to(gl.int64)
     tok_end = gl.load(seg_tok_end + i_seg).to(gl.int64)
     # Load before the output stores to avoid a waterfall loop on the final-state store.
-    if STORE_FINAL or PAGED_CACHE:
+    if STORE_FINAL or PAGED_CACHE or ckpt_state is not None:
         i_n = gl.load(seg_seq + i_seg).to(gl.int64)
     if STORE_FINAL:
         is_last = gl.load(seg_is_last + i_seg)
     if PAGED_CACHE:
         slot = gl.load(state_indices + i_n).to(gl.int64)
-    if seg_ckpt is not None:
-        ckpt_off = gl.load(seg_ckpt + 2 * i_seg)
-        ckpt_j = gl.load(seg_ckpt + 2 * i_seg + 1)
+    if ckpt_state is not None:
+        # The snapshot point, in tokens into this segment; stored after chunk
+        # ckpt_j if it falls inside the segment and before the sequence end.
+        c_pos = gl.load(ckpt_offsets + i_n).to(gl.int64)
+        rel = c_pos + gl.load(ckpt_bos + i_n).to(gl.int64) - tok_base
+        n_tok = tok_end - tok_base
+        c_last = gl.load(seg_is_last + i_seg)
+        ckpt_row = i_n
+        if ckpt_rows is not None:
+            ckpt_row = gl.load(ckpt_rows + i_n).to(gl.int64)
+        ok = (c_pos > 0) & (c_pos % C == 0) & (rel > 0) & (ckpt_row >= 0)
+        ok = ok & ((rel < n_tok) | ((rel == n_tok) & (c_last == 0)))
+        ckpt_j = gl.where(ok, rel // C, -1)
+        ckpt_off = ckpt_row * CKPT_STRIDE
 
     # The launch's warp count, as a constexpr so it can name the kernel.
     gl.static_assert(NUM_WARPS == gl.num_warps())
@@ -1222,8 +1236,8 @@ def k2_c_gluon(
             s_kr.index(cur).permute((1, 0)), gl.DotOperandLayout(0, MMA, 8)
         )
         h = _update(h, kr_a, big_u, gt, MMA)
-        if seg_ckpt is not None:  # noqa: SIM102
-            if (j + 1 == ckpt_j) & (ckpt_off >= 0):
+        if ckpt_state is not None:  # noqa: SIM102
+            if j + 1 == ckpt_j:
                 gl.amd.cdna4.buffer_store(
                     h, ckpt_state + ckpt_off + i_h * (V * K), s_off_vk
                 )
@@ -1334,7 +1348,9 @@ def gluon_k2_c(
     xepoch=None,
     scf=None,
     ckpt_state=None,
-    seg_ckpt=None,
+    ckpt_offsets=None,
+    ckpt_rows=None,
+    ckpt_bos=None,
 ):
     paged = state_cache is not None
     nx = get_num_xcds()
@@ -1390,7 +1406,10 @@ def gluon_k2_c(
         xbuf=xbuf,
         n_str=num_segs * H,
         ckpt_state=ckpt_state,
-        seg_ckpt=seg_ckpt,
+        ckpt_offsets=ckpt_offsets,
+        ckpt_rows=ckpt_rows,
+        ckpt_bos=ckpt_bos,
+        CKPT_STRIDE=0 if ckpt_state is None else ckpt_state.stride(0),
         **extra,
         num_warps=num_warps,
         waves_per_eu=2 if scf is not None and out_gate is None else 0,
