@@ -3,9 +3,11 @@
 
 """QSA top-level dispatch.
 
-``qsa_select_paged_tokens`` uses ``qsa_indexer_block_ids`` for supported
-indexer shapes. ``qsa_sparse_paged_gqa`` uses ``flydsl_qsa_paged_gqa`` for
-supported sparse-GQA shapes. Every other shape stays on the existing path.
+``qsa_select_paged_tokens`` uses ``qsa_indexer_block_ids`` when
+``allow_flydsl`` is set and the indexer shape is supported.
+``qsa_sparse_paged_gqa`` uses ``flydsl_qsa_paged_gqa`` when
+``allow_flydsl`` is set and the sparse-GQA shape is supported. The default
+stays on the existing path, as does every other shape.
 
 Consumers should import from here rather than from the backend-specific
 modules directly.
@@ -185,10 +187,10 @@ def qsa_select_paged_tokens(
 ) -> torch.Tensor:
     """Score, select and expand in one call.
 
-    Supported indexer shapes on gfx942 and gfx950 call
-    ``qsa_indexer_block_ids`` and then ``qsa_expand_block_indices``. A
-    ``compressed_k_scale`` stays on the logits path, and so does every other
-    shape.
+    With ``allow_flydsl``, a supported indexer shape on gfx942 or gfx950
+    calls ``qsa_indexer_block_ids`` and then ``qsa_expand_block_indices``.
+    The default, a ``compressed_k_scale``, and every other shape stay on
+    the logits path.
     """
     if compress_ratio <= 0 or token_topk <= 0 or token_topk % compress_ratio:
         raise ValueError("token_topk must be positive and divisible by compress_ratio")
@@ -215,7 +217,8 @@ def qsa_select_paged_tokens(
         return out
 
     if (
-        compressed_k_scale is None
+        allow_flydsl
+        and compressed_k_scale is None
         and _qsa_paged is not None
         and _live_flydsl_qsa_arch() is not None
         and _qsa_paged.qsa_indexer_supported(q, compressed_k_cache, page_table) is None
@@ -302,17 +305,19 @@ def qsa_sparse_paged_gqa(
     num_decode_requests: int | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    allow_flydsl: bool = False,
 ) -> torch.Tensor:
     """Grouped-query attention restricted to ``logical_indices`` (``-1`` = padding).
 
-    Supported sparse-GQA shapes on gfx942 and gfx950 call
-    ``flydsl_qsa_paged_gqa``. ``kv_splits``, ``num_decode_requests``, and
-    FP8 ``k_scale`` / ``v_scale`` stay on the Triton kernel, including when
-    a caller set any of them. Every other shape, any other arch, and a
-    missing device do too.
+    With ``allow_flydsl``, a supported sparse-GQA shape on gfx942 or gfx950
+    calls ``flydsl_qsa_paged_gqa``. The default stays on the Triton kernel.
+    ``kv_splits``, ``num_decode_requests``, and FP8 ``k_scale`` / ``v_scale``
+    stay there too, including when a caller set any of them. Every other
+    shape, any other arch, and a missing device do too.
     """
     if (
-        kv_splits is None
+        allow_flydsl
+        and kv_splits is None
         and num_decode_requests is None
         and k_scale is None
         and v_scale is None
