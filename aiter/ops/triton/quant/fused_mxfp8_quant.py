@@ -973,6 +973,11 @@ def fused_minimax_m3_norm_rope_quant_insert(
     if T == 0:
         return q_out, q_scale_out, index_q_out
     qs = q_scale_out if out_quant else q_out
+    # the kernel takes these layouts as constexprs (fewer launch arguments)
+    if (q_out.stride(0) != nq * D or index_q_out.stride(0) != niq * D
+            or (out_quant and q_scale_out.stride(0) != nq * D // 32)
+            or kv.stride(1) != RECORD_BYTES or index_cache.stride(0) != PAGE * 72):  # fmt: skip
+        raise ValueError("q_out / q_scale_out / index_q_out rows, kv_cache records and index_cache pages must be dense")
     qg = _insert_q_programs(T) if q_programs is None else q_programs
     if qg and (qg & (qg - 1) or nq % qg):
         raise ValueError("q_programs must be a power of two dividing num_heads")
@@ -1003,7 +1008,6 @@ def fused_minimax_m3_norm_rope_quant_insert(
         slot_mapping,
         index_slot_mapping,
         kv,
-        kv.view(fp8),
         index_cache,
         v_scale,
         q_out,
@@ -1013,11 +1017,6 @@ def fused_minimax_m3_norm_rope_quant_insert(
         qkv.stride(0),
         cos_sin_cache.stride(0),
         kv.stride(0),
-        kv.stride(1),
-        index_cache.stride(0),
-        q_out.stride(0),
-        qs.stride(0),
-        index_q_out.stride(0),
         NQ=nq,
         NKV=nkv,
         NIQ=niq,

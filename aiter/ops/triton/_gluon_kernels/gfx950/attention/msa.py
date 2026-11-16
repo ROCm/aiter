@@ -29,6 +29,7 @@ D = gl.constexpr(128)
 HG = gl.constexpr(16)
 K_BYTES = gl.constexpr(128 * 128 // 2)
 KS_BYTES = gl.constexpr(128 * 128 // 32)
+RECORD_BYTES = gl.constexpr(128 * 128 // 2 + 128 * 128 // 32 + 128 * 128)  # K + K scales + V
 NUM_SCALES = gl.constexpr(128 // 32)
 
 
@@ -77,6 +78,26 @@ def _copy_k(k_smem, buf, u8_ptr, base, k_src):
 
 
 @gluon.jit
+def _copy_ks(ks_smem, buf, u8_ptr, base, ks_src):
+    """Async-copy a page's K scales into LDS buffer buf (no commit: it joins the
+    K group that follows): 1 KB, the 512 B of scales then 512 B of V, so the 4
+    waves' 64 lanes x 4 B cover it exactly (a replicated lane does not lower)."""
+    gl.amd.cdna4.async_copy.global_load_to_shared(ks_smem.index(buf), u8_ptr + base + ks_src)
+
+
+@gluon.jit
+def _ks_view(kb):
+    """The [128 keys, scales] K scales at the head of a 1 KB K-scale buffer."""
+    return kb.reshape([2 * PAGE, NUM_SCALES]).slice(0, PAGE)
+
+
+@gluon.jit
+def _ks_lds(ks_smem, buf, K_SCL: gl.constexpr):
+    gl.barrier()  # every wave's part of the K-scale copy (each waited for its own)
+    return gl.amd.cdna4.async_copy.load_shared_relaxed(_ks_view(ks_smem.index(buf)), K_SCL)
+
+
+@gluon.jit
 def _copy_v(v_smem, buf, f8_ptr, base, v_src):
     """Async-copy a page's V block into LDS buffer buf (one commit group)."""
     gl.amd.cdna4.async_copy.global_load_to_shared(v_smem.index(buf), f8_ptr + base + v_src)
@@ -106,7 +127,7 @@ def _v_view(vb):
 
 _msa_gfx950_gluon_kernel_repr = make_kernel_repr(
     "msa_gfx950_gluon_kernel",
-    ['BLOCK_M', 'NSEG', 'ATOMIC', 'OUT_MX', 'DECODE_QL', 'QT', 'KV_LDS', 'TOPK', 'NUM_HEADS', 'NUM_WARPS'],
+    ['BLOCK_M', 'NSEG', 'ATOMIC', 'OUT_MX', 'DECODE_QL', 'QT', 'KV_LDS', 'WSPLIT', 'TOPK', 'NUM_HEADS', 'NUM_WARPS'],
 )
 
 
@@ -114,21 +135,14 @@ _msa_gfx950_gluon_kernel_repr = make_kernel_repr(
 def msa_gfx950_gluon_kernel(
     q8_ptr,  # e4m3 [rows, NUM_HEADS, QT, D] (unscaled MXFP8 terms)
     qs_ptr,  # u8 E8M0 [rows, NUM_HEADS, QT, D / 32]
-    cache_u8_ptr,
-    cache_f8_ptr,
-    topk_ptr,  # BLOCK_Q == 1: [Hkv, rows, TOPK] int32 picks
+    cache_u8_ptr,  # k4v8 records [pages, Hkv, RECORD_BYTES] (fp8 V: a bitcast view)
+    topk_ptr,  # BLOCK_Q == 1: [Hkv, rows, TOPK] int32 picks (row stride TOPK)
     block_table_ptr,
-    seq_lens_ptr,
-    query_req_ptr,
-    query_pos_ptr,
-    uniq_ptr,  # BLOCK_Q > 1: the sort_topk pre-pass (msa_sort_topk_kernel)
-    count_ptr,
-    tokblk_ptr,
-    pos_ptr,
+    meta0_ptr,  # decode: seq_lens; prefill: query_req
+    meta1_ptr,  # prefill: query_pos (decode: unused)
+    st_ptr,  # BLOCK_Q > 1: the sort_topk, one int32 buffer [uniq | count | tokblk | pos]
     out_ptr,
-    part_o_ptr,
-    part_ml_ptr,
-    seg_count_ptr,  # int32 [Hkv, groups]: the program's page count (segment 0 writes it)
+    ws_ptr,  # NSEG > 1: fp32 [part_o | part_ml | seg_count (int32)]
     counter_ptr,  # int32 [>= Hkv * groups], zeroed: segment arrivals (ATOMIC)
     mxq_ptr,  # OUT_MX: e4m3 [rows, NUM_HEADS * D], o_proj's MXFP8 input
     mxs_ptr,  # OUT_MX: E8M0 [rows, NUM_HEADS * D / 32]
@@ -137,14 +151,9 @@ def msa_gfx950_gluon_kernel(
     num_rows,
     seg_pages,  # pages a segment covers (split rebalance)
     stride_page,
-    stride_head,
     stride_tk_h,
-    stride_tk_t,
     stride_bt,
     stride_ot,
-    stride_oh,
-    stride_mq,
-    stride_ms,
     NUM_HEADS: gl.constexpr,
     TOPK: gl.constexpr,
     BLOCK_M: gl.constexpr,
@@ -156,6 +165,7 @@ def msa_gfx950_gluon_kernel(
     P_SCALE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     KV_LDS: gl.constexpr,
+    WSPLIT: gl.constexpr = False,
 ):
     """MSA over a k4v8 cache: BLOCK_M = 16 * BLOCK_Q rows (BLOCK_Q consecutive
     query rows x the 16 heads of one KV head) x one split.
@@ -200,6 +210,27 @@ def msa_gfx950_gluon_kernel(
     """
     BLOCK_Q: gl.constexpr = BLOCK_M // HG
     C: gl.constexpr = BLOCK_Q * TOPK
+    # Views and strides the launch no longer passes (fixed by the layouts the
+    # API validates): the fp8 V view of the cache, the row metadata slots, the
+    # sort_topk and split-workspace regions, the dense strides.
+    cache_f8_ptr = cache_u8_ptr.to(gl.pointer_type(gl.float8e4nv), bitcast=True)
+    seq_lens_ptr = meta0_ptr
+    query_req_ptr = meta0_ptr
+    query_pos_ptr = meta1_ptr
+    stride_head: gl.constexpr = RECORD_BYTES
+    stride_tk_t: gl.constexpr = TOPK
+    stride_oh: gl.constexpr = D
+    stride_mq: gl.constexpr = NUM_HEADS * D
+    stride_ms: gl.constexpr = NUM_HEADS * NUM_SCALES
+    n_prog = gl.num_programs(0).to(gl.int64) * gl.num_programs(1)
+    uniq_ptr = st_ptr
+    count_ptr = st_ptr + n_prog * C
+    tokblk_ptr = count_ptr + n_prog
+    pos_ptr = tokblk_ptr + n_prog * (C * BLOCK_Q)
+    n_part = n_prog * NSEG
+    part_o_ptr = ws_ptr
+    part_ml_ptr = ws_ptr + n_part * (BLOCK_M * D)
+    seg_count_ptr = (part_ml_ptr + n_part * (BLOCK_M * 2)).to(gl.pointer_type(gl.int32), bitcast=True)
     MFMA: gl.constexpr = gl.amd.AMDMFMALayout(4, [16, 16, 128], True, [1, NUM_WARPS])
     A_OP: gl.constexpr = gl.DotOperandLayout(0, MFMA, 16)
     B_OP: gl.constexpr = gl.DotOperandLayout(1, MFMA, 16)
@@ -265,7 +296,7 @@ def msa_gfx950_gluon_kernel(
     V_CP: gl.constexpr = gl.BlockedLayout([1, 1, 16], [4, 1, 16], [1, NUM_WARPS, 1], [2, 0, 1])
     NBUF: gl.constexpr = 2 if KV_LDS else 1
     K_R: gl.constexpr = PAGE // 16 if KV_LDS else 1
-    V_R: gl.constexpr = (PAGE // 16) * (D // 64) if KV_LDS else 1
+    V_R: gl.constexpr = (PAGE // 16) * (D // 64) if (KV_LDS and not WSPLIT) else 1
     k_smem = gl.allocate_shared_memory(gl.uint8, [NBUF, K_R, (D // 2) * 16], FLAT)
     v_smem = gl.allocate_shared_memory(gl.float8e4nv, [NBUF, V_R, 4, 256], V_LDS)
     k_src = (
@@ -276,6 +307,16 @@ def msa_gfx950_gluon_kernel(
         gl.arange(0, V_R, layout=gl.SliceLayout(1, gl.SliceLayout(2, V_CP)))[:, None, None] * 1024
         + gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(2, V_CP)))[None, :, None] * 256
         + gl.arange(0, 256, layout=gl.SliceLayout(0, gl.SliceLayout(1, V_CP)))[None, None, :]
+    )
+    # K scales (WSPLIT with KV_LDS: async-copied with K): per buffer [2, 512] u8,
+    # row 0 the page's scales (row 1: V bytes, copied only for exact lane coverage,
+    # as a replicated lane does not lower). Not wave-local: a barrier after the K
+    # wait makes every wave's part visible. Elsewhere: register loads one page ahead.
+    KS_CP: gl.constexpr = gl.BlockedLayout([1, 4], [1, 64], [2, NUM_WARPS // 2], [1, 0])
+    ks_smem = gl.allocate_shared_memory(gl.uint8, [2 if (KV_LDS and WSPLIT) else 1, 2, 512], FLAT)
+    ks_src = K_BYTES + (
+        gl.arange(0, 2, layout=gl.SliceLayout(1, KS_CP))[:, None] * 512
+        + gl.arange(0, 512, layout=gl.SliceLayout(0, KS_CP))[None, :]
     )
     tok_n = gl.arange(0, PAGE, layout=COL)
     head_off = g * stride_head
@@ -326,85 +367,195 @@ def msa_gfx950_gluon_kernel(
         p_nxt = _page_at(uq, u0 + 1, u1, last)
         rb_c = gl.load(tb + gl.minimum(u0, last) * BLOCK_Q)
 
-    base = p_cur.to(gl.int64) * stride_page + head_off
-    if KV_LDS:
-        _copy_k(k_smem, 0, cache_u8_ptr, base, k_src)
-        _copy_v(v_smem, 0, cache_f8_ptr, base, v_src)
-        ks_c = gl.load(cache_u8_ptr + base + ks_offs)
-    else:
-        k_c = gl.load(cache_u8_ptr + base + k_offs)
-        ks_c = gl.load(cache_u8_ptr + base + ks_offs)
-        v_c = gl.load(cache_f8_ptr + base + v_offs)
-    buf = 0
-
-    m_i = gl.full([BLOCK_M], float("-inf"), gl.float32, ROW)
-    l_i = gl.zeros([BLOCK_M], gl.float32, ROW)
-    acc = gl.zeros([BLOCK_M, D], gl.float32, MFMA)
-    for j in range(n_iter):
-        # Issue step j + 1's loads (and step j + 2's page id) before step j's math.
-        if BLOCK_Q == 1:
-            b_nxt2, p_nxt2 = _nth_valid(rank, blks, pages, j0 + j + 2, j_end)
+    if WSPLIT:
+        # Per-wave key split (BLOCK_Q >= 2 prefill). QK as below:
+        # wave w computes key tiles w and w + 4, i.e. keys r * 64 + w * 16 + c.
+        # S is viewed as [wave, row, its 32 keys] in the rank-3 MFMA layout
+        # (the same registers), so each wave keeps its own (m, l, O) and every
+        # softmax reduction stays inside the wave; PV is a rank-3 fp8 MFMA over
+        # the wave's 32 keys. The waves merge once, after the loop.
+        # KV_LDS: K as the 1-tile path (async copy, wave-local); V async-copied
+        # wave-local too: wave w copies the two 2 KB key blocks it reads (keys
+        # [16 w, 16 w + 16) and [64 + 16 w, ...)); the K scales async-copied with
+        # K (not wave-local: a barrier before their read, see ks_smem).
+        gl.static_assert(BLOCK_Q >= 2 and QT == 1 and NUM_WARPS == 4)
+        MF3: gl.constexpr = gl.amd.AMDMFMALayout(4, [16, 16, 32], True, [NUM_WARPS, 1, 1])
+        A3: gl.constexpr = gl.DotOperandLayout(0, MF3, 8)
+        B3: gl.constexpr = gl.DotOperandLayout(1, MF3, 8)
+        ST3: gl.constexpr = gl.SliceLayout(2, MF3)
+        # V_w [32 keys, D] of wave w: key = (k // 16) * 64 + w * 16 + k % 16
+        w3v = gl.arange(0, NUM_WARPS, layout=gl.SliceLayout(1, gl.SliceLayout(2, B3)))[:, None, None]
+        k3v = gl.arange(0, 32, layout=gl.SliceLayout(0, gl.SliceLayout(2, B3)))[None, :, None]
+        d3v = gl.arange(0, D, layout=gl.SliceLayout(0, gl.SliceLayout(1, B3)))[None, None, :]
+        v3_offs = K_BYTES + KS_BYTES + ((k3v // 16) * NUM_WARPS + w3v) * (D * 16) + d3v * 16 + k3v % 16
+        base = p_cur.to(gl.int64) * stride_page + head_off
+        if KV_LDS:
+            # [buf, r, w, d, key % 16]: key block r * 4 + w (2 KB, HBM order d, key % 16)
+            VW_CP: gl.constexpr = gl.BlockedLayout([1, 1, 1, 16], [1, 1, 64, 1], [1, NUM_WARPS, 1, 1], [3, 2, 1, 0])
+            VW_SH: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [3, 2, 1, 0])
+            vw_smem = gl.allocate_shared_memory(gl.float8e4nv, [2, 2, NUM_WARPS, D, 16], VW_SH)
+            vw_r = gl.arange(0, 2, layout=gl.SliceLayout(1, gl.SliceLayout(2, gl.SliceLayout(3, VW_CP))))
+            vw_w = gl.arange(0, NUM_WARPS, layout=gl.SliceLayout(0, gl.SliceLayout(2, gl.SliceLayout(3, VW_CP))))
+            vw_d = gl.arange(0, D, layout=gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(3, VW_CP))))
+            vw_c = gl.arange(0, 16, layout=gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(2, VW_CP))))
+            vw_src = K_BYTES + KS_BYTES + (
+                (vw_r[:, None, None, None] * NUM_WARPS + vw_w[None, :, None, None]) * (D * 16)
+                + vw_d[None, None, :, None] * 16 + vw_c[None, None, None, :]
+            )
+            _copy_ks(ks_smem, 0, cache_u8_ptr, base, ks_src)
+            _copy_k(k_smem, 0, cache_u8_ptr, base, k_src)
+            _copy_v(vw_smem, 0, cache_f8_ptr, base, vw_src)
         else:
+            k_c = gl.load(cache_u8_ptr + base + k_offs)
+            ks_c = gl.load(cache_u8_ptr + base + ks_offs)
+            v3_c = gl.load(cache_f8_ptr + base + v3_offs)
+        buf = 0
+        m3 = gl.full([NUM_WARPS, BLOCK_M], float("-inf"), gl.float32, ST3)
+        l3 = gl.zeros([NUM_WARPS, BLOCK_M], gl.float32, ST3)
+        acc3 = gl.zeros([NUM_WARPS, BLOCK_M, D], gl.float32, MF3)
+        for j in range(n_iter):
             p_nxt2 = _page_at(uq, u0 + j + 2, u1, last)
             rb_n = gl.load(tb + gl.minimum(u0 + j + 1, last) * BLOCK_Q)
-        nbase = p_nxt.to(gl.int64) * stride_page + head_off
-        if KV_LDS:
-            # Step j + 1's copies go first (into the region of the other buffer
-            # this wave read at step j - 1, its reads long consumed), then wait
-            # for step j's K only.
-            _copy_k(k_smem, 1 - buf, cache_u8_ptr, nbase, k_src)
-            _copy_v(v_smem, 1 - buf, cache_f8_ptr, nbase, v_src)
-            ks_n = gl.load(cache_u8_ptr + nbase + ks_offs)
-            gl.amd.cdna4.async_copy.wait_group(3)  # K(j) in; V(j), K / V(j + 1) in flight
-            k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(_k_view(k_smem.index(buf)), B_OP)
-        else:
-            k_n = gl.load(cache_u8_ptr + nbase + k_offs)
-            ks_n = gl.load(cache_u8_ptr + nbase + ks_offs)
-            v_n = gl.load(cache_f8_ptr + nbase + v_offs)
-
-        s = gl.zeros([BLOCK_M, PAGE], gl.float32, MFMA)
-        s = gl.amd.cdna4.mfma_scaled(q_hi, qs_hi, "e4m3", k_c, ks_c, "e2m1", s)
-        if QT == 2:
-            s = gl.amd.cdna4.mfma_scaled(q_lo, qs_lo, "e4m3", k_c, ks_c, "e2m1", s)
-        if BLOCK_Q == 1:
-            if j0 + j == n_safe:  # the diagonal block: mask the keys after pos
-                s = gl.where((b_cur * PAGE + tok_n <= pos)[None, :], s, float("-inf"))
-            # every visited block has a visible key: the max is finite after step 0
-            m_new = gl.maximum(m_i, gl.max(s, axis=1) * qk_scale_log2)
-            m_use = m_new
-        else:
-            ok = (rb_c[:, None] >= 0) & (
-                rb_c[:, None] * PAGE + tok_n[None, :] <= row_pos[:, None]
+            nbase = p_nxt.to(gl.int64) * stride_page + head_off
+            if KV_LDS:
+                _copy_ks(ks_smem, 1 - buf, cache_u8_ptr, nbase, ks_src)
+                _copy_k(k_smem, 1 - buf, cache_u8_ptr, nbase, k_src)
+                _copy_v(vw_smem, 1 - buf, cache_f8_ptr, nbase, vw_src)
+                gl.amd.cdna4.async_copy.wait_group(3)  # K(j) in; V(j), K / V(j + 1) in flight
+                ks_c = _ks_lds(ks_smem, buf, K_SCL)
+                k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(_k_view(k_smem.index(buf)), B_OP)
+            else:
+                k_n = gl.load(cache_u8_ptr + nbase + k_offs)
+                ks_n = gl.load(cache_u8_ptr + nbase + ks_offs)
+                v3_n = gl.load(cache_f8_ptr + nbase + v3_offs)
+            s = gl.zeros([BLOCK_M, PAGE], gl.float32, MFMA)
+            s = gl.amd.cdna4.mfma_scaled(q_hi, qs_hi, "e4m3", k_c, ks_c, "e2m1", s)
+            ok = (rb_c[:, None] >= 0) & (rb_c[:, None] * PAGE + tok_n[None, :] <= row_pos[:, None])
+            s = gl.where(ok, s * qk_scale_log2, float("-inf"))
+            s3 = gl.convert_layout(
+                s.reshape([BLOCK_M, 2, NUM_WARPS, 16]).permute((2, 0, 1, 3)).reshape([NUM_WARPS, BLOCK_M, 32]),
+                MF3,
             )
-            s = gl.where(ok, s, float("-inf"))
-            # a row that did not pick this page stays at -inf: exponentiate against 0
-            m_new = gl.maximum(m_i, gl.max(s, axis=1) * qk_scale_log2)
-            m_use = gl.where(m_new == float("-inf"), 0.0, m_new)
-        alpha = gl.exp2(m_i - m_use)
-        p8 = (gl.exp2(s * qk_scale_log2 - m_use[:, None]) * P_SCALE).to(gl.float8e4nv)
-        l_i = l_i * alpha + gl.sum(p8.to(gl.float32), axis=1)
-        acc = acc * alpha[:, None]
-        if KV_LDS:
-            gl.amd.cdna4.async_copy.wait_group(2)  # V(j) in; K / V(j + 1) in flight
-            v_c = gl.amd.cdna4.async_copy.load_shared_relaxed(_v_view(v_smem.index(buf)), B_OP)
-        acc = gl.amd.cdna4.mfma_scaled(
-            gl.convert_layout(p8, A_OP), None, "e4m3", v_c, None, "e4m3", acc
-        )
-        m_i = m_new
-
-        if KV_LDS:
-            buf = 1 - buf
-            ks_c = ks_n
-        else:
-            k_c = k_n
-            ks_c = ks_n
-            v_c = v_n
-        if BLOCK_Q == 1:
-            b_cur = b_nxt
-            b_nxt = b_nxt2
-        else:
+            m_new3 = gl.maximum(m3, gl.max(s3, axis=2))
+            m_use3 = gl.where(m_new3 == float("-inf"), 0.0, m_new3)
+            al3 = gl.exp2(m3 - m_use3)
+            p3 = (gl.exp2(s3 - m_use3[:, :, None]) * P_SCALE).to(gl.float8e4nv)
+            l3 = l3 * al3 + gl.sum(p3.to(gl.float32), axis=2)
+            acc3 = acc3 * al3[:, :, None]
+            if KV_LDS:
+                gl.amd.cdna4.async_copy.wait_group(2)  # V(j) in (this wave's blocks)
+                v3_c = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    vw_smem.index(buf).permute((1, 0, 3, 2)).reshape([NUM_WARPS, 32, D]), B3)
+            acc3 = gl.amd.cdna4.mfma(gl.convert_layout(p3, A3), v3_c, acc3)
+            m3 = m_new3
+            if KV_LDS:
+                buf = 1 - buf
+            else:
+                k_c = k_n
+                ks_c = ks_n
+                v3_c = v3_n
             rb_c = rb_n
-        p_nxt = p_nxt2
+            p_nxt = p_nxt2
+        # Merge the waves' (m, l, O): the small (m, l) through the compiler's
+        # reductions; O by hand: each wave writes its partial, weighted and
+        # normalized by the total sum (so bounded by |V|: fp16), to one LDS
+        # buffer [wave, row, d], then one barrier and a read with the wave axis
+        # in each thread's registers (an in-thread sum).
+        m_w = gl.max(m3, axis=0)
+        m_wu = gl.where(m_w == float("-inf"), 0.0, m_w)
+        wt3 = gl.exp2(m3 - m_wu[None, :])
+        l_w = gl.sum(wt3 * l3, axis=0)
+        sc3 = wt3 / gl.where(l_w > 0, l_w, 1.0)[None, :]
+        MRG_SH: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[D, 8]], [NUM_WARPS, BLOCK_M, D], [2, 1, 0])
+        MRG_LD: gl.constexpr = gl.BlockedLayout([NUM_WARPS, 1, 8], [1, 4, 16], [1, NUM_WARPS, 1], [2, 1, 0])
+        mrg = gl.allocate_shared_memory(gl.float16, [NUM_WARPS, BLOCK_M, D], MRG_SH)
+        mrg.store((acc3 * sc3[:, :, None]).to(gl.float16))
+        gl.barrier()
+        o_n = gl.sum(mrg.load(MRG_LD).to(gl.float32), axis=0)
+        m_i = gl.convert_layout(m_w, ROW)
+        l_i = gl.convert_layout(l_w, ROW)
+        acc = gl.convert_layout(o_n, MFMA) * l_i[:, None]
+    else:
+        base = p_cur.to(gl.int64) * stride_page + head_off
+        if KV_LDS:
+            _copy_k(k_smem, 0, cache_u8_ptr, base, k_src)
+            _copy_v(v_smem, 0, cache_f8_ptr, base, v_src)
+            ks_c = gl.load(cache_u8_ptr + base + ks_offs)
+        else:
+            k_c = gl.load(cache_u8_ptr + base + k_offs)
+            ks_c = gl.load(cache_u8_ptr + base + ks_offs)
+            v_c = gl.load(cache_f8_ptr + base + v_offs)
+        buf = 0
+
+        m_i = gl.full([BLOCK_M], float("-inf"), gl.float32, ROW)
+        l_i = gl.zeros([BLOCK_M], gl.float32, ROW)
+        acc = gl.zeros([BLOCK_M, D], gl.float32, MFMA)
+        for j in range(n_iter):
+            # Issue step j + 1's loads (and step j + 2's page id) before step j's math.
+            if BLOCK_Q == 1:
+                b_nxt2, p_nxt2 = _nth_valid(rank, blks, pages, j0 + j + 2, j_end)
+            else:
+                p_nxt2 = _page_at(uq, u0 + j + 2, u1, last)
+                rb_n = gl.load(tb + gl.minimum(u0 + j + 1, last) * BLOCK_Q)
+            nbase = p_nxt.to(gl.int64) * stride_page + head_off
+            if KV_LDS:
+                # Step j + 1's copies go first (into the region of the other buffer
+                # this wave read at step j - 1, its reads long consumed), then wait
+                # for step j's K only.
+                _copy_k(k_smem, 1 - buf, cache_u8_ptr, nbase, k_src)
+                _copy_v(v_smem, 1 - buf, cache_f8_ptr, nbase, v_src)
+                ks_n = gl.load(cache_u8_ptr + nbase + ks_offs)
+                gl.amd.cdna4.async_copy.wait_group(3)  # K(j) in; V(j), K / V(j + 1) in flight
+                k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(_k_view(k_smem.index(buf)), B_OP)
+            else:
+                k_n = gl.load(cache_u8_ptr + nbase + k_offs)
+                ks_n = gl.load(cache_u8_ptr + nbase + ks_offs)
+                v_n = gl.load(cache_f8_ptr + nbase + v_offs)
+
+            s = gl.zeros([BLOCK_M, PAGE], gl.float32, MFMA)
+            s = gl.amd.cdna4.mfma_scaled(q_hi, qs_hi, "e4m3", k_c, ks_c, "e2m1", s)
+            if QT == 2:
+                s = gl.amd.cdna4.mfma_scaled(q_lo, qs_lo, "e4m3", k_c, ks_c, "e2m1", s)
+            if BLOCK_Q == 1:
+                if j0 + j == n_safe:  # the diagonal block: mask the keys after pos
+                    s = gl.where((b_cur * PAGE + tok_n <= pos)[None, :], s, float("-inf"))
+                # every visited block has a visible key: the max is finite after step 0
+                m_new = gl.maximum(m_i, gl.max(s, axis=1) * qk_scale_log2)
+                m_use = m_new
+            else:
+                ok = (rb_c[:, None] >= 0) & (
+                    rb_c[:, None] * PAGE + tok_n[None, :] <= row_pos[:, None]
+                )
+                s = gl.where(ok, s, float("-inf"))
+                # a row that did not pick this page stays at -inf: exponentiate against 0
+                m_new = gl.maximum(m_i, gl.max(s, axis=1) * qk_scale_log2)
+                m_use = gl.where(m_new == float("-inf"), 0.0, m_new)
+            alpha = gl.exp2(m_i - m_use)
+            p8 = (gl.exp2(s * qk_scale_log2 - m_use[:, None]) * P_SCALE).to(gl.float8e4nv)
+            l_i = l_i * alpha + gl.sum(p8.to(gl.float32), axis=1)
+            acc = acc * alpha[:, None]
+            if KV_LDS:
+                gl.amd.cdna4.async_copy.wait_group(2)  # V(j) in; K / V(j + 1) in flight
+                v_c = gl.amd.cdna4.async_copy.load_shared_relaxed(_v_view(v_smem.index(buf)), B_OP)
+            acc = gl.amd.cdna4.mfma_scaled(
+                gl.convert_layout(p8, A_OP), None, "e4m3", v_c, None, "e4m3", acc
+            )
+            m_i = m_new
+
+            if KV_LDS:
+                buf = 1 - buf
+                ks_c = ks_n
+            else:
+                k_c = k_n
+                ks_c = ks_n
+                v_c = v_n
+            if BLOCK_Q == 1:
+                b_cur = b_nxt
+                b_nxt = b_nxt2
+            else:
+                rb_c = rb_n
+            p_nxt = p_nxt2
 
     if KV_LDS:
         gl.amd.cdna4.async_copy.wait_group(0)  # the last (unused) prefetch
@@ -549,15 +700,13 @@ def _merge_segments(
 
 _msa_gfx950_gluon_reduce_split_rebalance_kernel_repr = make_kernel_repr(
     "msa_gfx950_gluon_reduce_split_rebalance_kernel",
-    ['BLOCK_M', 'NSEG', 'NUM_WARPS', 'OUT_MX'],
+    ['BLOCK_M', 'NSEG', 'NUM_HEADS', 'NUM_WARPS', 'OUT_MX'],
 )
 
 
 @gluon.jit(repr=_msa_gfx950_gluon_reduce_split_rebalance_kernel_repr)
 def msa_gfx950_gluon_reduce_split_rebalance_kernel(
-    part_o_ptr,  # fp32 [Hkv, groups, NSEG, BLOCK_M, D]
-    part_ml_ptr,  # fp32 [Hkv, groups, NSEG, BLOCK_M, 2] (running max, sum)
-    seg_count_ptr,  # int32 [Hkv, groups]: pages of each program's list
+    ws_ptr,  # fp32 [part_o [Hkv, groups, NSEG, BLOCK_M, D] | part_ml [.., BLOCK_M, 2] | seg_count]
     out_ptr,
     mxq_ptr,  # OUT_MX: e4m3 [rows, H * D] + E8M0 [rows, H * D / 32]
     mxs_ptr,
@@ -565,11 +714,9 @@ def msa_gfx950_gluon_reduce_split_rebalance_kernel(
     num_rows,
     seg_pages,
     stride_ot,
-    stride_oh,
-    stride_mq,
-    stride_ms,
     BLOCK_M: gl.constexpr,
     NSEG: gl.constexpr,
+    NUM_HEADS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     OUT_MX: gl.constexpr,
 ):
@@ -581,11 +728,14 @@ def msa_gfx950_gluon_reduce_split_rebalance_kernel(
     g * 16 + m % 16; a row group with no pages gives zeros."""
     grp = gl.program_id(0)
     g = gl.program_id(1)
+    n_part = gl.num_programs(0).to(gl.int64) * gl.num_programs(1) * NSEG
+    part_ml_ptr = ws_ptr + n_part * (BLOCK_M * D)
+    seg_count_ptr = (part_ml_ptr + n_part * (BLOCK_M * 2)).to(gl.pointer_type(gl.int32), bitcast=True)
     pair = (g * gl.num_programs(0) + grp).to(gl.int64)
     live = (gl.load(seg_count_ptr + pair) + seg_pages - 1) // seg_pages
     _merge_segments(
-        part_o_ptr, part_ml_ptr, out_ptr, v_scale_ptr, pair, grp, g, live, num_rows,
-        stride_ot, stride_oh, mxq_ptr, mxs_ptr, stride_mq, stride_ms,
+        ws_ptr, part_ml_ptr, out_ptr, v_scale_ptr, pair, grp, g, live, num_rows,
+        stride_ot, D, mxq_ptr, mxs_ptr, NUM_HEADS * D, NUM_HEADS * NUM_SCALES,
         BLOCK_M, NSEG, NUM_WARPS, OUT_MX,
     )  # fmt: skip
 

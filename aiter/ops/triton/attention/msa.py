@@ -414,8 +414,12 @@ def _fast(fn):
     return fl
 
 
-# k4v8 Gluon K / V loading: registers (default) or async copy into LDS.
-_KV_LDS = __import__("os").getenv("AITER_MSA_KV_LDS", "0") == "1"
+# k4v8 Gluon K / V loading: async copy into LDS (default) or registers.
+_KV_LDS = __import__("os").getenv("AITER_MSA_KV_LDS", "1") == "1"
+# BLOCK_M 32 / 64 prefill: per-wave key split (each wave its own softmax state over
+# its 32 keys of a page, one merge after the loop; with KV_LDS the K scales are
+# async-copied too). Opt-in.
+_WSPLIT = __import__("os").getenv("AITER_MSA_WAVE_SPLIT", "0") == "1"
 
 
 _PLANS: dict = {}
@@ -454,7 +458,7 @@ def _fp8_view(kv_cache):
 def _gluon_plan(
     q, q_scale, kv_cache, topk, block_table, seq_lens, dql, query_req, query_pos,
     kv_splits, q_mode, p_fp8, block_m, num_warps, kv_lds, sort_topk, use_atomic_add,
-    out_mxfp8,
+    out_mxfp8, out=None,
 ):  # fmt: skip
     """Validation and every size of a _gluon_fwd call that depends only on its
     shapes / flags (cached per signature by _gluon_fwd)."""
@@ -470,6 +474,10 @@ def _gluon_plan(
     if topk.dtype != torch.int32 or topk.ndim != 3 or topk.stride(2) != 1:
         raise ValueError("topk must be int32 [kv_heads, rows, TOPK]")
     n_topk = topk.shape[2]
+    if rows and topk.stride(1) != n_topk:
+        raise ValueError("topk rows must be dense ([kv_heads, rows, TOPK] with row stride TOPK)")
+    if kv_cache.stride(1) != RECORD_BYTES or kv_cache.stride(2) != 1:
+        raise ValueError("k4v8 cache records must be dense [pages, kv_heads, RECORD_BYTES]")
     if q_scale is not None:
         # MXFP8 Q as the insert writes it: one term, unscaled.
         if q_mode != "mxfp8" or q.dtype != _FP8:
@@ -530,6 +538,11 @@ def _gluon_plan(
                 or mxq.shape[-1] != num_heads * HEAD_DIM or mxs.shape[-1] != num_heads * HEAD_DIM // 32
                 or mxq.stride(-1) != 1 or mxs.stride(-1) != 1):  # fmt: skip
             raise ValueError("out_mxfp8 must be (e4m3 [rows, H * 128], uint8 [rows, H * 4]), rows contiguous")
+        if rows and (mxq.stride(0) != num_heads * HEAD_DIM or mxs.stride(0) != num_heads * HEAD_DIM // 32):
+            raise ValueError("out_mxfp8 rows must be dense")
+    elif out is not None and rows and (out.stride(-1) != 1 or out.stride(-2) != HEAD_DIM):
+        raise ValueError("out must be [rows, H, 128] with contiguous heads")
+    wsplit = _WSPLIT and block_q in (2, 4) and qt == 1 and num_warps == 4
     return dict(
         rows=rows, num_kv_heads=num_kv_heads, decode=decode, n_topk=n_topk, num_heads=num_heads,
         qt=qt, hg=hg, block_m=block_m, block_q=block_q, groups=groups, seg_pages=seg_pages,
@@ -537,9 +550,14 @@ def _gluon_plan(
         main_kw=dict(
             NUM_HEADS=num_heads, TOPK=n_topk, BLOCK_M=block_m, NSEG=nseg, ATOMIC=atomic,
             OUT_MX=out_mxfp8 is not None, DECODE_QL=dql if decode else 0, QT=qt, P_SCALE=P_SCALE,
-            NUM_WARPS=num_warps, KV_LDS=kv_lds, num_warps=num_warps,
+            NUM_WARPS=num_warps, KV_LDS=kv_lds,
+            WSPLIT=wsplit,
+            num_warps=num_warps,
         ),
-        reduce_kw=dict(BLOCK_M=block_m, NSEG=nseg, NUM_WARPS=4, OUT_MX=out_mxfp8 is not None, num_warps=4),
+        reduce_kw=dict(
+            BLOCK_M=block_m, NSEG=nseg, NUM_HEADS=num_heads, NUM_WARPS=4,
+            OUT_MX=out_mxfp8 is not None, num_warps=4,
+        ),
         sort_kw=dict(TOPK=n_topk, TQ=block_q, DECODE_QL=dql if decode else 0, num_warps=4),
     )  # fmt: skip
 
@@ -564,7 +582,7 @@ def _gluon_fwd(
         kv_cache.shape, topk.shape, topk.stride(), topk.dtype, seq_lens is None, dql,
         block_m, kv_splits, q_mode, p_fp8, num_warps, kv_lds, sort_topk is None,
         bool(use_atomic_add), None if out_mxfp8 is None else (out_mxfp8[0].stride(), out_mxfp8[1].stride()),
-        dev,
+        None if out is None else out.stride(), kv_cache.stride(), dev,
     )  # fmt: skip
     plan = _PLANS.get(key)
     if plan is None:
@@ -573,7 +591,7 @@ def _gluon_fwd(
         plan = _PLANS[key] = _gluon_plan(
             q, q_scale, kv_cache, topk, block_table, seq_lens, dql, query_req, query_pos,
             kv_splits, q_mode, p_fp8, block_m, num_warps, kv_lds, sort_topk, use_atomic_add,
-            out_mxfp8,
+            out_mxfp8, out,
         )  # fmt: skip
     rows = plan["rows"]
     num_heads = plan["num_heads"]
@@ -606,60 +624,66 @@ def _gluon_fwd(
     num_kv_heads, groups, nseg = plan["num_kv_heads"], plan["groups"], plan["nseg"]
     block_m, block_q, seg_pages = plan["block_m"], plan["block_q"], plan["seg_pages"]
     decode = plan["decode"]
-    st = torch.cuda.current_stream(dev).cuda_stream
-    if block_q > 1 and sort_topk is not None:
-        uniq, count, tokblk, pos = sort_topk  # built by the producer (fused prefill top-k)
-    elif block_q > 1:
-        # the rows' page sort_topk, each page once per row group
+    st_ = torch.cuda.current_stream(dev).cuda_stream
+    n_prog = num_kv_heads * groups
+    if block_q > 1:
         c = plan["c"]
-        n = num_kv_heads * groups
-        uniq = _gws(dev, st, "uniq", n * c, torch.int32)
-        count = _gws(dev, st, "count", n, torch.int32)
-        tokblk = _gws(dev, st, "tokblk", n * c * block_q, torch.int32)
-        pos = _gws(dev, st, "pos", groups * block_q, torch.int32)
-        _fast(msa_sort_topk_kernel)(
-            (groups, num_kv_heads),
-            topk, block_table,
-            seq_lens if decode else query_req, query_req if not decode else seq_lens,
-            query_pos if not decode else seq_lens,
-            uniq, count, tokblk, pos, rows,
-            topk.stride(0), topk.stride(1), block_table.stride(0),
-            **plan["sort_kw"],
-        )  # fmt: skip
+        st_numel = n_prog * c + n_prog + n_prog * c * block_q + groups * block_q
+        if sort_topk is not None:
+            # built by the producer (fused prefill top-k): one buffer
+            # [uniq | count | tokblk | pos] (vLLM's), else gathered into one
+            uniq, count, tokblk, pos = sort_topk
+            st = uniq
+            if not (count.data_ptr() == uniq.data_ptr() + 4 * uniq.numel()
+                    and tokblk.data_ptr() == count.data_ptr() + 4 * count.numel()
+                    and pos.data_ptr() == tokblk.data_ptr() + 4 * tokblk.numel()):  # fmt: skip
+                st = _gws(dev, st_, "sort_topk", st_numel, torch.int32)
+                torch.cat(
+                    [uniq.reshape(-1), count.reshape(-1), tokblk.reshape(-1),
+                     pos.reshape(-1)[: groups * block_q]], out=st,
+                )  # fmt: skip
+        else:
+            # the rows' page sort_topk, each page once per row group
+            st = _gws(dev, st_, "sort_topk", st_numel, torch.int32)
+            o1 = n_prog * c
+            o2 = o1 + n_prog
+            o3 = o2 + n_prog * c * block_q
+            _fast(msa_sort_topk_kernel)(
+                (groups, num_kv_heads),
+                topk, block_table,
+                seq_lens if decode else query_req, query_req if not decode else seq_lens,
+                query_pos if not decode else seq_lens,
+                st[:o1], st[o1:o2], st[o2:o3], st[o3:], rows,
+                topk.stride(0), topk.stride(1), block_table.stride(0),
+                **plan["sort_kw"],
+            )  # fmt: skip
     else:
-        uniq = count = tokblk = pos = topk  # unused at block_m = 16
+        st = topk  # unused at block_m = 16
     if nseg > 1:
-        n = num_kv_heads * groups * nseg
-        part_o = _gws(dev, st, "part_o", n * block_m * HEAD_DIM, torch.float32)
-        part_ml = _gws(dev, st, "part_ml", n * block_m * 2, torch.float32)
-        seg_count = _gws(dev, st, "seg_count", num_kv_heads * groups, torch.int32)
+        n_part = n_prog * nseg
+        ws = _gws(dev, st_, "split", n_part * block_m * (HEAD_DIM + 2) + n_prog, torch.float32)
     else:
-        part_o = part_ml = seg_count = topk  # unused
+        ws = topk  # unused
     atomic = plan["atomic"]
-    counter = _gws(dev, st, "counter", num_kv_heads * groups, torch.int32, zero=True) if atomic else topk
+    counter = _gws(dev, st_, "counter", n_prog, torch.int32, zero=True) if atomic else topk
     if out_mxfp8 is not None:
         mxq, mxs = out_mxfp8
-        mx_args = (mxq, mxs, mxq.stride(0), mxs.stride(0))
-        ost = (0, 0)
+        ost = 0
     else:
-        mx_args = (out, out, 0, 0)  # unused
-        ost = (out.stride(0), out.stride(1))
+        mxq = mxs = out  # unused
+        ost = out.stride(0)
+    meta0, meta1 = (seq_lens, seq_lens) if decode else (query_req, query_pos)
     _fast(msa_gfx950_gluon_kernel)(
         (groups, num_kv_heads, nseg),
-        q8, qs, kv_cache, _fp8_view(kv_cache), topk, block_table,
-        seq_lens if decode else query_req, query_req if not decode else seq_lens,
-        query_pos if not decode else seq_lens, uniq, count, tokblk, pos, out,
-        part_o, part_ml, seg_count, counter, mx_args[0], mx_args[1], vs,
+        q8, qs, kv_cache, topk, block_table, meta0, meta1, st, out, ws, counter, mxq, mxs, vs,
         sm_scale * 1.4426950408889634, rows, seg_pages,
-        kv_cache.stride(0), kv_cache.stride(1), topk.stride(0), topk.stride(1),
-        block_table.stride(0), ost[0], ost[1], mx_args[2], mx_args[3],
+        kv_cache.stride(0), topk.stride(0), block_table.stride(0), ost,
         **plan["main_kw"],
     )  # fmt: skip
     if nseg > 1 and not atomic:
         _fast(msa_gfx950_gluon_reduce_split_rebalance_kernel)(
             (groups, num_kv_heads),
-            part_o, part_ml, seg_count, out, mx_args[0], mx_args[1], vs, rows, seg_pages,
-            ost[0], ost[1], mx_args[2], mx_args[3], **plan["reduce_kw"],
+            ws, out, mxq, mxs, vs, rows, seg_pages, ost, **plan["reduce_kw"],
         )  # fmt: skip
     return out if out_mxfp8 is None else out_mxfp8
 

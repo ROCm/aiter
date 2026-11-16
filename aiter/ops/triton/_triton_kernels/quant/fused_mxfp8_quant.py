@@ -1418,8 +1418,7 @@ def fused_minimax_m3_norm_rope_quant_insert_kernel(
     pos_ptr,
     slot_ptr,
     islot_ptr,
-    kv_u8_ptr,
-    kv_f8_ptr,
+    kv_u8_ptr,  # k4v8 records [pages, NKV, RECORD] (fp8 V: a bitcast view)
     icache_ptr,
     v_scale_ptr,
     q_out_ptr,
@@ -1429,11 +1428,6 @@ def fused_minimax_m3_norm_rope_quant_insert_kernel(
     stride_qkv,
     stride_cs,
     stride_kv_page,
-    stride_kv_head,
-    stride_icache,
-    stride_q_out,
-    stride_q_scale,
-    stride_iq_out,
     NQ: tl.constexpr,
     NKV: tl.constexpr,
     NIQ: tl.constexpr,
@@ -1458,6 +1452,14 @@ def fused_minimax_m3_norm_rope_quant_insert_kernel(
     tl.static_assert(OUT_QUANT_FORMAT == "mxfp8", "OUT_QUANT_FORMAT must be 'mxfp8'")
     K_BYTES: tl.constexpr = PAGE * D // 2  # k4v8 record: K data, then K scales,
     KS_BYTES: tl.constexpr = PAGE * D // 32  # then V
+    # Views / strides fixed by the layouts the wrapper validates (fewer launch
+    # arguments): the fp8 view of the k4v8 cache, dense outputs and pages.
+    kv_f8_ptr = kv_u8_ptr.to(tl.pointer_type(tl.float8e4nv), bitcast=True)
+    stride_kv_head: tl.constexpr = K_BYTES + KS_BYTES + PAGE * D
+    stride_icache: tl.constexpr = PAGE * 72
+    stride_q_out: tl.constexpr = NQ * D
+    stride_q_scale: tl.constexpr = NQ * (D // 32)  # used with OUT_QUANT only
+    stride_iq_out: tl.constexpr = NIQ * D
     t = tl.program_id(0).to(tl.int64)
     row = qkv_ptr + t * stride_qkv
     cs_row = cos_sin_ptr + tl.load(pos_ptr + t).to(tl.int64) * stride_cs
