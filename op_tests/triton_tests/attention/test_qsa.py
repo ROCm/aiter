@@ -354,6 +354,140 @@ def test_qsa_fp4_writer_caps_the_scale_for_the_fp16_decode():
     )
 
 
+def test_qsa_writer_rejects_bad_slots_and_planes():
+    from aiter.ops.qsa import FP8_DTYPE, qsa_store_quantized_rows
+
+    values = torch.randn(4, 2, 256, dtype=torch.float32, device="cuda").bfloat16()
+    backing = torch.arange(8, device="cuda")
+    # The writers read slots[row] without a stride.
+    for fmt in ("fp8", "fp4"):
+        cache, scale = _planes(fmt, 2)
+        for slots in (backing[::2], backing[:4].float(), backing[:4].view(2, 2)):
+            with pytest.raises(ValueError):
+                qsa_store_quantized_rows(cache, scale, slots, values)
+
+    # Planes with fewer pages can have the same strides as the first cache.
+    cache, scale = _planes("fp8", 2)
+    small_cache, small_scale = _planes("fp8", 1)
+    assert small_cache.stride() == cache.stride()
+    assert small_scale.stride() == scale.stride()
+    slots = backing[:4] + 4
+    bad = [
+        (cache, small_scale, (cache.clone(), scale.clone())),
+        (cache, scale, (small_cache, scale.clone())),
+        (cache, scale, (cache.clone(), small_scale)),
+    ]
+    for first_cache, first_scale, (second_cache, second_scale) in bad:
+        with pytest.raises(ValueError):
+            qsa_store_quantized_rows(
+                first_cache,
+                first_scale,
+                slots,
+                values,
+                second_cache,
+                second_scale,
+                values,
+            )
+    second_cache, second_scale = _planes("fp8", 2)
+    qsa_store_quantized_rows(
+        cache, scale, slots, values, second_cache, second_scale, values
+    )
+    assert cache.dtype == FP8_DTYPE
+    assert torch.equal(cache.view(torch.uint8), second_cache.view(torch.uint8))
+    assert torch.equal(scale, second_scale)
+    assert scale[1].all() and not scale[0].any()
+
+    # A second tensor comes with its scale plane and values, or not at all.
+    for fmt in ("fp8", "fp4"):
+        first_cache, first_scale = _planes(fmt, 2)
+        other_cache, other_scale = _planes(fmt, 2)
+        for partial in (
+            (other_cache, None, None),
+            (other_cache, other_scale, None),
+            (None, other_scale, values),
+            (None, None, values),
+        ):
+            with pytest.raises(ValueError):
+                qsa_store_quantized_rows(
+                    first_cache, first_scale, slots, values, *partial
+                )
+        assert not first_scale.any() and not other_scale.any()
+
+
+def test_qsa_writer_rejects_wrong_scale_dtypes_and_pool_slices():
+    from aiter.ops.qsa import qsa_store_quantized_rows
+
+    values = torch.randn(4, 2, 256, dtype=torch.float32, device="cuda").bfloat16()
+    slots = torch.arange(4, device="cuda")
+    for fmt, wrong_dtype in (("fp8", torch.float64), ("fp4", torch.int8)):
+        cache, scale = _planes(fmt, 2)
+        with pytest.raises(ValueError, match="plane of the cache"):
+            qsa_store_quantized_rows(cache, scale.to(wrong_dtype), slots, values)
+        # The first 4 of 8 slots of each page of a larger pool.
+        pool, pool_scale = _planes(fmt, 2, page_size=8)
+        for sliced_cache, sliced_scale in (
+            (pool[:, :4], scale),
+            (cache, pool_scale[:, :4]),
+        ):
+            with pytest.raises(ValueError, match="back to back"):
+                qsa_store_quantized_rows(sliced_cache, sliced_scale, slots, values)
+        assert not scale.any() and not pool_scale.any()
+        qsa_store_quantized_rows(cache, scale, slots, values)
+        assert scale[0].all()
+
+    unquantized = torch.zeros(2, 4, 2, 256, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="FP8 or FP4"):
+        qsa_store_quantized_rows(unquantized, None, slots, values)
+
+
+def test_qsa_scorers_reject_scale_planes_that_do_not_match_the_cache():
+    from aiter.ops.qsa import FP8_DTYPE, qsa_paged_mqa_logits, qsa_sparse_paged_gqa
+
+    q, keys, table, t2r, positions, lens = _case([256], 4, 16)
+    args = (table, t2r, positions, lens, _RATIO)
+    for fmt in ("fp8", "fp4"):
+        cache, scale = _store(fmt, keys.flatten(0, 1), 16)
+        qsa_paged_mqa_logits(q, cache, *args, compressed_k_scale=scale)
+        if fmt == "fp8":
+            bad = [scale[..., None].repeat(1, 1, 1, 4), scale.double()]
+        else:
+            # Three of the four groups: the kernel would read past each row.
+            bad = [scale[..., :3].contiguous(), scale.view(torch.int8)]
+        for wrong in bad:
+            with pytest.raises(ValueError):
+                qsa_paged_mqa_logits(q, cache, *args, compressed_k_scale=wrong)
+
+    shape = (4, 16, 2, 256)
+    k_cache, v_cache = (
+        torch.zeros(shape, device="cuda", dtype=FP8_DTYPE) for _ in "kv"
+    )
+    scale = torch.ones(shape[:3], dtype=torch.float32, device="cuda")
+    q = torch.zeros(1, 4, 256, dtype=torch.bfloat16, device="cuda")
+    selected = torch.zeros(1, 16, dtype=torch.int32, device="cuda")
+    table = torch.arange(4, dtype=torch.int32, device="cuda")[None]
+    t2r = torch.zeros(1, dtype=torch.int32, device="cuda")
+    args = (selected, table, t2r, 1 / 16)
+    qsa_sparse_paged_gqa(q, k_cache, v_cache, *args, k_scale=scale, v_scale=scale)
+    # Fewer pages with the same strides as the K scale.
+    assert scale[:2].stride() == scale.stride()
+    with pytest.raises(ValueError):
+        qsa_sparse_paged_gqa(
+            q, k_cache, v_cache, *args, k_scale=scale, v_scale=scale[:2]
+        )
+    as_int = scale.view(torch.int32)
+    for k_scale, v_scale in ((as_int, as_int), (scale, scale.half())):
+        with pytest.raises(ValueError, match="float32"):
+            qsa_sparse_paged_gqa(
+                q, k_cache, v_cache, *args, k_scale=k_scale, v_scale=v_scale
+            )
+    bf16 = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
+    qsa_sparse_paged_gqa(q, bf16, bf16, *args)
+    with pytest.raises(ValueError):
+        qsa_sparse_paged_gqa(q, bf16, bf16, *args, v_scale=scale)
+    with pytest.raises(ValueError, match="no scale plane"):
+        qsa_sparse_paged_gqa(q, bf16, bf16, *args, k_scale=scale, v_scale=scale)
+
+
 _RATIO = 4
 
 

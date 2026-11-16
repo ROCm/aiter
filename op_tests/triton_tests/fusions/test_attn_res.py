@@ -780,3 +780,12 @@ def test_attn_res_gate_launch_cache_separates_separate_bl_buckets(monkeypatch, N
 
     attn_res_gate(prefix, block_residual, score_weight, 1e-6, close_block=True)
     attn_res_gate(prefix, block_residual, score_weight, 1e-6, close_block=True)
+
+
+def test_attn_res_sequence_requires_d_multiple_of_16():
+    """The sequence gather hints 16-element alignment, so D must be a multiple of 16."""
+    query, residuals, rms_weight, _ = generate_attn_res_inputs(
+        16, 40, 2, torch.float32, with_onorm=False
+    )
+    with pytest.raises(AssertionError, match="multiple of 16"):
+        attn_res_fwd(query, residuals, rms_weight, layout="sequence")

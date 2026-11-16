@@ -357,6 +357,38 @@ def test_dequant_hadamard_quant_accepts_canonical_dtypes():
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
+def test_dequant_hadamard_quant_accepts_inference_tensor_sign():
+    packed = torch.zeros((32, 16), dtype=torch.uint8, device="cuda")
+    scales = torch.zeros((32, 1), dtype=torch.uint8, device="cuda")
+    with torch.inference_mode():
+        sign = torch.ones(16, dtype=torch.float32, device="cuda")
+
+    output, output_scales = dequant_hadamard_quant_mxfp4(packed, scales, sign)
+
+    assert output.shape == (32, 16)
+    assert output_scales.shape == (32, 1)
+
+
+def test_dequant_hadamard_quant_validates_during_first_graph_capture():
+    packed = torch.zeros((32, 16), dtype=torch.uint8, device="cuda")
+    scales = torch.zeros((32, 1), dtype=torch.uint8, device="cuda")
+    dequant_hadamard_quant_mxfp4(
+        packed, scales, torch.ones(16, dtype=torch.float32, device="cuda")
+    )
+    torch.cuda.synchronize()
+
+    uncached_sign = torch.ones(16, dtype=torch.float32, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output, output_scales = dequant_hadamard_quant_mxfp4(
+            packed, scales, uncached_sign
+        )
+    graph.replay()
+
+    assert output.shape == (32, 16)
+    assert output_scales.shape == (32, 1)
+
+
 def test_dequant_hadamard_quant_accepts_strided_inputs():
     generator = torch.Generator(device="cpu").manual_seed(23)
     packed_storage = torch.randint(
@@ -449,3 +481,24 @@ def test_dequant_hadamard_quant_sr_is_reproducible_and_reuses_rtn_scales():
     # RTN and SR share the same E8M0 scale calculation.
     torch.testing.assert_close(actual[1], rtn[1], rtol=0, atol=0)
     assert not torch.equal(actual[0], rtn[0]), "SR must not silently return RTN payload"
+
+
+def test_cached_sign_validation_is_recorded_during_graph_capture(monkeypatch):
+    packed = torch.zeros((32, 16), dtype=torch.uint8, device="cuda")
+    scales = torch.zeros((32, 1), dtype=torch.uint8, device="cuda")
+    sign = _alternating_sign()
+    dequant_hadamard_quant_mxfp4(packed, scales, sign)
+    calls = []
+    original = torch._assert_async
+
+    def record_assert(condition, message):
+        calls.append(message)
+        return original(condition, message)
+
+    monkeypatch.setattr(torch, "_assert_async", record_assert)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        dequant_hadamard_quant_mxfp4(packed, scales, sign)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert calls, "Cached eager validation must not suppress capture assertion"

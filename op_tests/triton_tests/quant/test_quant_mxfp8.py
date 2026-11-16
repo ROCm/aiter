@@ -728,6 +728,22 @@ def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(T, H, padded, apply_n
     )
 
 
+def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_contract():
+    """What it returns without the pack, and what it refuses."""
+    _skip_without_fp8()
+    q, kv, cache, slot, pos, cs = _make_inputs(4, 16, 16, nb=2, block=64)
+    out = fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        q, kv, cache, slot, pos, cs, 64, 1e-6, 16, pack_q=False
+    )
+    assert isinstance(out, torch.Tensor) and out.shape == (4, 16, _QK)
+
+    bad = torch.zeros(2, 64, 584, dtype=torch.uint8, device="cuda")
+    with pytest.raises(RuntimeError, match="640"):
+        fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q, kv, bad, slot, pos, cs, 64, 1e-6, 16
+        )
+
+
 # --------------------------------------------------------------------------- #
 # fused_deepseek_v4_quantize_and_insert_k_cache
 # fused_deepseek_v4_dequantize_and_gather_k_cache

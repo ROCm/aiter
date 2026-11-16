@@ -91,6 +91,13 @@ def test_mxfp8_scale_independent_dequant(is_2d_block, fp8_dtype):
     assert err <= bound, f"independent dequant err {err:.4f} > {bound:.4f}"
 
 
+def test_mxfp8_rejects_unaligned_shape():
+    """M/N not aligned to the tile must raise (kernel loads full tiles unmasked)."""
+    x = torch.randn(100, 100, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(AssertionError):
+        convert_to_mxfp8(x, torch.float8_e4m3fn, use_asm=False)
+
+
 def test_mxfp8_sr_unbiased_portable():
     """SR output is unbiased: mean(dequant(SR(x))) ≈ mean(x) over a large tensor.
 
