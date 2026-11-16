@@ -10,8 +10,11 @@ for both MI308X and MI300X CU counts, and checks the padded sorted reduction.
 """
 
 import argparse
+import dataclasses
 import functools
 import itertools
+import os
+from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
@@ -22,6 +25,7 @@ from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import (
     AUX_SORT_OPUS,
     fused_topk,
+    get_2stage_cfgs,
     moe_sorting,
     torch_moe_stage1,
     torch_moe_stage2,
@@ -275,9 +279,63 @@ def test_config_strings():
         assert Config.from_string(tile).unsupported_reason(batch1), tile
 
 
+def test_num_local_tokens_dispatch():
+    """With num_local_tokens only a clamped SiLU keeps its FlyDSL row. A clamped
+    SiLU with per-token FP8 weights and no FlyDSL row in use takes the FlyDSL
+    default for its token count."""
+    configs = Path(aiter.__file__).parent / "configs/model_configs"
+    qwen_csv = configs / "qwen3_5_35b_fp8_ptpc_tuned_fmoe.csv"
+    qwen, v41 = (2048, 512, 257, 9), (5120, 576, 385, 7)
+
+    def kernel(shape, token, limit, has_num_local_tokens, is_ep=False, bypass="0"):
+        env = {"AITER_CONFIG_FMOE": str(qwen_csv), "AITER_BYPASS_TUNE_CONFIG": bypass}
+        with patch.dict(os.environ, env), patch(
+            "aiter.fused_moe.cfg_2stages", None
+        ), patch("aiter.fused_moe.get_cu_num", return_value=80), patch(
+            # Returns the chosen kernel name in place of its implementation.
+            "aiter.fused_moe.resolve_fused_moe_impl",
+            lambda name: name if name.startswith("impl__") else None,
+        ):
+            AITER_CONFIGS.get_config_file.cache_clear()
+            get_2stage_cfgs.cache_clear()
+            try:
+                return get_2stage_cfgs(
+                    token, *shape, dtypes.bf16, dtypes.fp8, dtypes.fp8,
+                    QuantType.per_Token, True, ActivationType.Silu, False, 0, 0,
+                    is_ep=is_ep, swiglu_limit=limit,
+                    has_num_local_tokens=has_num_local_tokens,
+                ).full_impl  # fmt: skip
+            finally:
+                get_2stage_cfgs.cache_clear()
+                AITER_CONFIGS.get_config_file.cache_clear()
+
+    def flydsl(config):
+        return make_fused_moe_impl_kernel_name(IMPL, config)
+
+    # The row differs from the default, so keeping it and falling back differ.
+    row = flydsl("64_256_128_True:default:0")
+    assert kernel(qwen, 1024, None, False) == row
+    assert kernel(qwen, 1024, None, True) is None
+    assert kernel(qwen, 1024, 10.0, True) == row
+    for token, config in (
+        (1, "16_16_16_False:default:0"),
+        (2, "16_16_16_False_True:default:0"),
+        (32, "16_128_64_False:default:0"),
+        (512, "64_128_128_True:default:0"),
+    ):
+        assert kernel(v41, token, 10.0, True) == flydsl(config), token
+    bypassed = kernel(qwen, 1024, 10.0, True, bypass="1")
+    assert bypassed == flydsl("64_128_128_True:default:0")
+    # Not under EP, nor without an active clamp (vLLM sends 0.0 for none).
+    assert kernel(v41, 1, 10.0, True, is_ep=True) is None
+    for limit in (None, 0.0):
+        assert kernel(v41, 1, limit, True) is None
+
+
 def route(hidden, experts, topk, routing):
     token = hidden.shape[0]
-    if routing in ("random", "padding", "pad_rows"):
+    # "local_tokens" routes every row; num_local_tokens drops the tail.
+    if routing in ("random", "padding", "pad_rows", "local_tokens"):
         weights, ids = fused_topk(
             hidden, torch.randn((token, experts), dtype=hidden.dtype), topk, True
         )
@@ -328,6 +386,7 @@ def make_case(
     activation,
     routing,
     quantize_activations,
+    swiglu_limit=None,
 ):
     """Inputs and torch reference as test_moe_2stage.py builds them."""
     torch.manual_seed(0)
@@ -352,31 +411,50 @@ def make_case(
     else:
         w1_q, w1_scale = torch_quant(w1, quant_dtype=q_dtype)
         w2_q, w2_scale = torch_quant(w2, quant_dtype=q_dtype)
-    a1, a1_scale = quantize_activation(hidden)
-    stage1 = torch_moe_stage1(
-        a1,
-        w1_q,
-        w2_q,
-        topk_weights,
-        topk_ids,
-        dtype=dtypes.bf16,
-        activation=act_type,
-        quant_type=q_type,
-        a1_scale=a1_scale,
-        w1_scale=w1_scale,
-    )
-    a2, a2_scale = quantize_activation(stage1)
-    reference = torch_moe_stage2(
-        a2.view(token, topk, -1),
-        w1_q,
-        w2_q,
-        topk_weights,
-        topk_ids,
-        dtype=dtypes.bf16,
-        quant_type=q_type,
-        w2_scale=w2_scale,
-        a2_scale=a2_scale,
-    )
+    # Rows at and past num_local_tokens (CUDA-graph padding) run no route: the
+    # reference sees zeros there, so its activation scales come from the rest.
+    local = token - min(65, (token + 1) // 2) if routing == "local_tokens" else token
+    a1, a1_scale = quantize_activation(torch.cat((hidden[:local], hidden[local:] * 0)))
+
+    def torch_reference(limit):
+        stage1 = torch_moe_stage1(
+            a1,
+            w1_q,
+            w2_q,
+            topk_weights,
+            topk_ids,
+            dtype=dtypes.bf16,
+            activation=act_type,
+            quant_type=q_type,
+            a1_scale=a1_scale,
+            w1_scale=w1_scale,
+            swiglu_limit=limit,
+        )
+        a2, a2_scale = quantize_activation(stage1)
+        return torch_moe_stage2(
+            a2.view(token, topk, -1),
+            w1_q,
+            w2_q,
+            topk_weights,
+            topk_ids,
+            dtype=dtypes.bf16,
+            quant_type=q_type,
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+        )
+
+    reference = torch_reference(swiglu_limit)
+    if swiglu_limit:
+        # The clamp must move the result, or a kernel that drops it would pass.
+        assert token_error(torch_reference(None), reference) > 2 * TOKEN_ERR_LIMIT
+    num_local_tokens = None
+    if routing == "local_tokens":
+        num_local_tokens = torch.tensor([local], dtype=torch.int32)
+        # A captured graph's padding rows hold stale routes and activations:
+        # keep their real expert ids and make them large, so running one, or a
+        # per-tensor scale over them, shows up.
+        hidden = hidden.clone()
+        hidden[local:] = 1e4
     request = FusedMoeRequest(
         hidden_states=hidden,
         w1=behind_nan_expert(shuffle_weight(w1_q, layout=(16, 16))),
@@ -387,6 +465,8 @@ def make_case(
         quant_type=q_type,
         w1_scale=behind_nan_expert(w1_scale),
         w2_scale=behind_nan_expert(w2_scale),
+        num_local_tokens=num_local_tokens,
+        swiglu_limit=swiglu_limit,
     )
     # Holds the first FlyDSL output of the case for the cross-path check.
     return request, reference, {}
@@ -440,7 +520,10 @@ def run_compact(impl, request, experts, cu_count):
     with patch.object(compact, "allocate_task_buffers", buffers):
         output = impl(request)
     assert buffers.cu_count == cu_count
-    sizes = torch.bincount(request.topk_ids.flatten().long(), minlength=experts)
+    ids = request.topk_ids
+    if request.num_local_tokens is not None:
+        ids = ids[: int(request.num_local_tokens)]
+    sizes = torch.bincount(ids.flatten().long(), minlength=experts)
     blocks = buffers.metadata[: int(((sizes + 63) // 64).sum())].tolist()
     full, tail = check_tasks(blocks, experts, cu_count, *buffers.buffers)
     check_guards(buffers.storages)
@@ -453,7 +536,16 @@ def rms_error(expected, actual, rms):
 
 
 def check_moe(
-    token, model_dim, inter_dim, experts, topk, quant, activation, routing, config
+    token,
+    model_dim,
+    inter_dim,
+    experts,
+    topk,
+    quant,
+    activation,
+    routing,
+    config,
+    swiglu_limit=None,
 ):
     """Run one config through the registered backend and assert its accuracy."""
     parsed = Config.from_string(config)
@@ -467,14 +559,20 @@ def check_moe(
         activation,
         routing,
         parsed.use_prefill,
+        swiglu_limit,
     )
     impl = resolve_fused_moe_impl(make_fused_moe_impl_kernel_name(IMPL, config))
+    # Rows at and past num_local_tokens run no route; their output is unspecified.
+    rows = token
+    if request.num_local_tokens is not None:
+        rows = int(request.num_local_tokens)
+    reference = reference[:rows]
     rms = token_rms(reference)
     tasks = "-"
     with patch("aiter.ops.flydsl.fused_moe_gfx942._gateup_output", stale_gateup_output):
         if parsed.down_path == "8x1_compact":
             device_cu = get_cu_num()
-            output, tasks = run_compact(impl, request, experts, device_cu)
+            full_output, tasks = run_compact(impl, request, experts, device_cu)
             # The cached launcher must stay in bounds and correct for the other CU count.
             for cu_count in CU_COUNTS:
                 if cu_count != device_cu:
@@ -483,12 +581,26 @@ def check_moe(
                         return_value=cu_count,
                     ):
                         other, _ = run_compact(impl, request, experts, cu_count)
-                    diff = rms_error(output, other, rms)
+                    diff = rms_error(full_output[:rows], other[:rows], rms)
                     assert (
                         diff < PATH_DIFF_LIMIT
                     ), f"{config} at {cu_count} CUs: {diff=}"
         else:
-            output = impl(request)
+            full_output = impl(request)
+    # Batch-1 and prefill write zeros past the count; decode leaves those rows.
+    if rows < token and (parsed.use_prefill or parsed.use_batch1_algorithm):
+        assert bool((full_output[rows:] == 0).all()), f"{config}: a padding row ran"
+    output = full_output[:rows]
+    if rows < token and parsed.use_prefill:
+        # Prefill is deterministic: the padding rows must not move the others.
+        alone = dataclasses.replace(
+            request,
+            hidden_states=request.hidden_states[:rows],
+            topk_weight=request.topk_weight[:rows],
+            topk_ids=request.topk_ids[:rows],
+            num_local_tokens=None,
+        )
+        assert torch.equal(impl(alone), output), f"{config}: padding moved the result"
     err = check_output(reference, output, config)
     # Decode kernels accumulate routes with atomics, so only prefill paths are compared.
     if parsed.use_prefill:
@@ -555,6 +667,7 @@ def cross_config_cases(rows):
 
 # Functional checks only, not timed:
 # (token, model_dim, inter_dim, experts, topk, quant, activation, routing, config)
+# and optionally swiglu_limit.
 EDGE_CASES = [
     # The 2048-expert limit of the compact task table, with all or 8 experts active.
     *(
@@ -619,6 +732,50 @@ EDGE_CASES = [
     ),
     # Direct decoding reads -1 pad rows from topk_ids without sorting.
     (2, 2560, 320, 513, 11, "ptpc", "silu", "pad_rows", "16_16_16_False_True"),
+    # num_local_tokens on the batch-1, decode and both prefill Down paths.
+    *(
+        (token, 2560, 320, 513, 11, "ptpc", "silu", "local_tokens", config)
+        for token, config in (
+            (2, "16_16_16_False_True"),
+            (16, "16_16_16_False"),
+            (200, "16_128_64_False"),
+            (2048, "64_128_256_True:1x4_64x256:128"),
+        )
+    ),
+    # The per-tensor activation scale skips the stale padding rows.
+    (
+        2048,
+        2560,
+        320,
+        513,
+        11,
+        "per_tensor",
+        "silu",
+        "local_tokens",
+        "64_128_256_True:1x4_64x256:128",
+    ),
+    (
+        4096,
+        512,
+        256,
+        2048,
+        8,
+        "ptpc",
+        "silu",
+        "local_tokens",
+        "64_256_128_True:8x1_compact:128",
+    ),
+    # V4.1-Flash TP4's MoE, clamped with a row count, on the batch-1, decode and
+    # default prefill paths; experts from 365 need 64-bit weight offsets.
+    *(
+        (token, 5120, 576, 385, 7, "ptpc", "silu", "local_tokens", config, 10.0)
+        for token, config in (
+            (2, "16_16_16_False_True"),
+            (16, "16_16_16_False"),
+            (200, "16_128_64_False"),
+            (2048, "64_128_128_True"),
+        )
+    ),
 ]
 
 
@@ -649,6 +806,7 @@ def main():
     args = parser.parse_args()
 
     test_config_strings()
+    test_num_local_tokens_dispatch()
     summarize(
         "Compact task table",
         [

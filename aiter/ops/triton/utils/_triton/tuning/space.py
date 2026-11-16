@@ -30,6 +30,8 @@ SEARCH_SPACE = {
     "NUM_KSPLIT": [1, 3, 4, 7, 8, 14, 16, 28],
     "NUM_BUFFERS": [2, 3, 4, 5, 6, 7, 8],
     "kernel_type": ["bandwidth_bound", "compute_bound"],
+    # gfx1250 gluon gemm_a16w16 compute_bound epilogue: 0 LDS + TDM store, 1 register store, 2 coalesced register store
+    "REGISTER_STORE": [0, 1, 2],
     "num_ctas": [1, 2, 4, 8, 16],
     "CTAS_M": [1, 2, 4],
     "CTAS_N": [1, 2, 4],
