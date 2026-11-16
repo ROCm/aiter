@@ -1640,9 +1640,10 @@ try:
         ],
     )
     def test_gluon_ar_norm_gates(case, lamport, expected):
-        """all_reduce_rmsnorm takes contiguous 16-byte aligned bf16 of the hidden
-        sizes of norm_waves up to the 4 MiB of the plain Gluon all-reduce, and up to
-        _GLUON_AR_NORM_MAX_TOKENS rows where the Lamport one-shot could take it."""
+        """all_reduce_rmsnorm_per_token_quant takes contiguous 16-byte aligned bf16 of
+        the hidden sizes of norm_waves up to the 4 MiB of the plain Gluon all-reduce,
+        and up to _GLUON_AR_NORM_MAX_TOKENS rows where the Lamport one-shot could take
+        it."""
         from types import SimpleNamespace
 
         from aiter.dist.device_communicators import communicator_cuda as cc
@@ -1699,10 +1700,10 @@ try:
     )
     def test_ar_norm_precedence(quant, m, n, emit_bf16, gluon, expected):
         """gfx1250 TP4 on the CPU, with the production gates and the kernels mocked:
-        all_reduce_rmsnorm takes up to _GLUON_AR_NORM_MAX_TOKENS rows (128) where the
-        Lamport one-shot could, and its other sizes up to 4 MiB; the Lamport kernel
-        takes the rest of its sizes, with the per-token quant in the same kernel for
-        FP8. The #6923 Gluon AR + RMSNorm keeps its bf16 sizes."""
+        all_reduce_rmsnorm_per_token_quant takes up to _GLUON_AR_NORM_MAX_TOKENS rows
+        (128) where the Lamport one-shot could, and its other sizes up to 4 MiB; the
+        Lamport kernel takes the rest of its sizes, with the per-token quant in the
+        same kernel for FP8. The #6923 Gluon AR + RMSNorm keeps its bf16 sizes."""
         from types import MethodType, SimpleNamespace
         from unittest.mock import Mock, patch
 
@@ -1747,7 +1748,8 @@ try:
         epilogue = Mock(return_value=(x, residual, scale) if quant else (x, residual))
         gluon_fused = Mock(return_value=(x, residual))
         with patch(
-            "aiter.ops.triton.comms.all_reduce.all_reduce_rmsnorm", epilogue
+            "aiter.ops.triton.comms.all_reduce.all_reduce_rmsnorm_per_token_quant",
+            epilogue,
         ), patch(
             "aiter.ops.triton.comms.fused.all_reduce_rmsnorm_quant."
             "all_reduce_rmsnorm_quant",
@@ -1777,8 +1779,14 @@ try:
         }
         assert taken == {path: path == expected for path in taken}, taken
         if expected == "gluon_norm":
-            args = epilogue.call_args.args
-            assert args[3:] == (1e-6, False, quant, "group", "inboxes", "calls")
+            call = epilogue.call_args
+            assert call.args[3:] == (1e-6, False)
+            assert call.kwargs == {
+                "quant": quant,
+                "group": "group",
+                "inboxes": "inboxes",
+                "calls": "calls",
+            }
         if expected == "lamport" and quant:
             args = ca.lamport_fused_ar_rms_quant.call_args.args
             assert args[3:] == (1e-6, False, emit_bf16)

@@ -22,7 +22,7 @@ from aiter.ops.triton.comms.all_reduce import (
     all_reduce,
     all_reduce_free,
     all_reduce_init,
-    all_reduce_rmsnorm,
+    all_reduce_rmsnorm_per_token_quant,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_common import ensure_spawn_method
@@ -132,7 +132,9 @@ def _worker(rank, init_method):
     def check(name, tokens, seed, quant, gemma=True, edge=False, hidden=HIDDEN):
         xs, res, w = _inputs(tokens, seed, device, edge, hidden)
         ar = (group, inboxes, calls)
-        outs = all_reduce_rmsnorm(xs[rank], res, w, EPS, gemma, quant, *ar)
+        outs = all_reduce_rmsnorm_per_token_quant(
+            xs[rank], res, w, EPS, gemma, quant, *ar
+        )
         bad = _wrong(outs, xs, res, w, quant, gemma, rank, *ar)
         if bad:
             failures.append(f"rank {rank} {name}: {bad} values differ")
@@ -182,7 +184,7 @@ def _worker(rank, init_method):
             outs = []
             for (t, quant, h), x, res, w in zip(cases, xs, ress, ws):
                 outs.append(
-                    all_reduce_rmsnorm(
+                    all_reduce_rmsnorm_per_token_quant(
                         x, res, w, EPS, True, quant, group, inboxes, calls
                     )
                 )
@@ -207,13 +209,13 @@ def _worker(rank, init_method):
                         f"rank {rank}: graph replay {rep} tokens {t} hidden {h} is wrong"
                     )
 
-        # The public ops pick all_reduce_rmsnorm up to _GLUON_AR_NORM_MAX_TOKENS rows
+        # The public ops pick all_reduce_rmsnorm_per_token_quant up to _GLUON_AR_NORM_MAX_TOKENS rows
         # where the Lamport one-shot could take the call, and up to 4 MiB where it
         # cannot: hidden 6152 is not a multiple of 256.
         comm = tp.device_communicator
         if not comm.gluon_ar_norm:
             failures.append(
-                f"rank {rank}: all_reduce_rmsnorm is off in the communicator"
+                f"rank {rank}: all_reduce_rmsnorm_per_token_quant is off in the communicator"
             )
         else:
             cap = _GLUON_AR_NORM_MAX_TOKENS
@@ -228,8 +230,8 @@ def _worker(rank, init_method):
                         op = tensor_model_parallel_fused_allreduce_rmsnorm
                         kw = {"gemma_norm": True}
                     with patch(
-                        "aiter.ops.triton.comms.all_reduce.all_reduce_rmsnorm",
-                        wraps=all_reduce_rmsnorm,
+                        "aiter.ops.triton.comms.all_reduce.all_reduce_rmsnorm_per_token_quant",
+                        wraps=all_reduce_rmsnorm_per_token_quant,
                     ) as launch:
                         fused = op(xs[rank], res, w, EPS, **kw)
                     name = f"public op tokens {tokens} quant {quant}"
@@ -248,7 +250,7 @@ def _worker(rank, init_method):
         aiter.destroy_dist_env()
 
 
-def test_all_reduce_rmsnorm():
+def test_all_reduce_rmsnorm_per_token_quant():
     ensure_spawn_method()
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     with mp.Pool(processes=WORLD_SIZE) as pool:
@@ -260,4 +262,4 @@ def test_all_reduce_rmsnorm():
 
 
 if __name__ == "__main__":  # CI runs the multi-GPU tests as scripts
-    test_all_reduce_rmsnorm()
+    test_all_reduce_rmsnorm_per_token_quant()

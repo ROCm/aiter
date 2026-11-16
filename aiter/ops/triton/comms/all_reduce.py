@@ -19,9 +19,10 @@ _POOLS = {}  # the IPC pool of each inbox, by its address: the pool owns the inb
 
 
 def norm_waves(hidden: int) -> int:
-    """The waves of an all_reduce_rmsnorm program for rows of hidden values, 2 chunks
-    a wave, or 0 if it does not support hidden. Hidden 6144 is 8 waves, as the 8
-    waves of add_rmsnorm_quant_kernel<256, 24>, so that the results have the same bits.
+    """The waves of an all_reduce_rmsnorm_per_token_quant program for rows of hidden
+    values, 2 chunks a wave, or 0 if it does not support hidden. Hidden 6144 is 8
+    waves, as the 8 waves of add_rmsnorm_quant_kernel<256, 24>, so that the results
+    have the same bits.
     """
     waves = triton.next_power_of_2(triton.cdiv(hidden, 12 * _LINES))
     return waves if hidden > 0 and hidden % 8 == 0 and waves <= 32 else 0
@@ -121,7 +122,7 @@ def all_reduce(x: torch.Tensor, group, inboxes, calls) -> torch.Tensor:
     return y
 
 
-def all_reduce_rmsnorm(
+def all_reduce_rmsnorm_per_token_quant(
     x: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
@@ -141,6 +142,10 @@ def all_reduce_rmsnorm(
     sizes add the squares in another order. All ranks must make the same calls in
     the same order.
     HIP graphs are supported.
+
+    Unlike ``all_reduce_rmsnorm_quant`` (a power-of-2 hidden, one scale for each 128
+    values, inboxes for one hidden size), it takes any hidden in norm_waves, one
+    scale a row, and the inboxes of ``all_reduce``.
 
     Args:
         x, residual (torch.Tensor): Contiguous bf16 (tokens, hidden), 16-byte
@@ -170,7 +175,9 @@ def all_reduce_rmsnorm(
     num_chunks = tokens * triton.cdiv(hidden, 6 * _LINES)
     assert num_chunks <= chunks
 
-    _LOGGER.info("ALL_REDUCE_RMSNORM [gluon]: x=%s quant=%s", x.shape, quant)
+    _LOGGER.info(
+        "ALL_REDUCE_RMSNORM_PER_TOKEN_QUANT [gluon]: x=%s quant=%s", x.shape, quant
+    )
 
     residual_out = torch.empty_like(x)
     if quant:

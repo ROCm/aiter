@@ -24,17 +24,17 @@ _GLUON_PLAIN_AR_MAX_BYTES = 4 << 20
 
 should_nccl_symm_mem_allreduce = False
 _SUPPORTED_ALL2ALL_MANAGER_BACKENDS = ("flydsl", "mori", "mori_v2")
-# all_reduce_rmsnorm is faster than the Lamport one-shot of the same op (bf16 or
-# per-token FP8 out) up to about this many rows: TP4 graph replay, hidden 2048 to
-# 8192. The Lamport kernel takes more rows where it can.
+# all_reduce_rmsnorm_per_token_quant is faster than the Lamport one-shot of the same
+# op (bf16 or per-token FP8 out) up to about this many rows: TP4 graph replay, hidden
+# 2048 to 8192. The Lamport kernel takes more rows where it can.
 _GLUON_AR_NORM_MAX_TOKENS = 128
 
 
 def _use_gluon_ar_norm(comm, input_, res_inp_, weight_, lamport: bool) -> bool:
-    """True if all_reduce_rmsnorm takes the call: up to the 4 MiB of the plain Gluon
-    all-reduce, and up to _GLUON_AR_NORM_MAX_TOKENS rows if the Lamport one-shot can
-    take it (lamport). AITER_GLUON_AR_NORM=0 turns it off."""
-    if not getattr(comm, "gluon_ar_norm", False) or comm.gluon_ar_plain is None:
+    """True if all_reduce_rmsnorm_per_token_quant takes the call: up to the 4 MiB of
+    the plain Gluon all-reduce, and up to _GLUON_AR_NORM_MAX_TOKENS rows if the
+    Lamport one-shot can take it (lamport). AITER_GLUON_AR_NORM=0 turns it off."""
+    if not comm.gluon_ar_norm or comm.gluon_ar_plain is None:
         return False
     from aiter.ops.triton.comms.all_reduce import norm_waves
 
@@ -171,7 +171,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # long as the process: destroy() runs after the groups are gone.
         self.gluon_ar = None
         self.gluon_ar_plain = None
-        self.gluon_ar_norm = False  # gluon_ar_plain also runs all_reduce_rmsnorm
+        # gluon_ar_plain also runs all_reduce_rmsnorm_per_token_quant
+        self.gluon_ar_norm = False
         if (
             os.environ.get("AITER_GLUON_FUSED_AR") == "1"
             and self.world_size == 4
@@ -424,18 +425,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if x_pad_to_multiple == 0 and _use_gluon_ar_norm(
             self, input_, res_inp_, weight_, lamport
         ):
-            # The plain Gluon all-reduce and the HIP add_rmsnorm, in one launch.
-            from aiter.ops.triton.comms.all_reduce import all_reduce_rmsnorm
+            # One launch instead of the plain Gluon all-reduce and the HIP
+            # add_rmsnorm.
+            from aiter.ops.triton.comms.all_reduce import (
+                all_reduce_rmsnorm_per_token_quant,
+            )
 
-            return all_reduce_rmsnorm(
+            inboxes, calls = self.gluon_ar_plain
+            return all_reduce_rmsnorm_per_token_quant(
                 input_,
                 res_inp_,
                 weight_,
                 eps,
                 gemma_norm,
-                False,
-                self.cpu_group,
-                *self.gluon_ar_plain,
+                quant=False,
+                group=self.cpu_group,
+                inboxes=inboxes,
+                calls=calls,
             )
         if lamport:
             return ca_comm.lamport_fused_ar_rms(
@@ -640,19 +646,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if not emit_bf16 and _use_gluon_ar_norm(
             self, input_, res_inp_, weight_, lamport
         ):
-            # The plain Gluon all-reduce, the HIP add_rmsnorm and the per-token
-            # quant, in one launch.
-            from aiter.ops.triton.comms.all_reduce import all_reduce_rmsnorm
+            # One launch instead of the plain Gluon all-reduce, the HIP add_rmsnorm
+            # and the per-token quant.
+            from aiter.ops.triton.comms.all_reduce import (
+                all_reduce_rmsnorm_per_token_quant,
+            )
 
-            out, res_out, scale_out = all_reduce_rmsnorm(
+            inboxes, calls = self.gluon_ar_plain
+            out, res_out, scale_out = all_reduce_rmsnorm_per_token_quant(
                 input_,
                 res_inp_,
                 weight_,
                 eps,
                 gemma_norm,
-                True,
-                self.cpu_group,
-                *self.gluon_ar_plain,
+                quant=True,
+                group=self.cpu_group,
+                inboxes=inboxes,
+                calls=calls,
             )
         elif lamport:
             # The Lamport one-shot of fused_allreduce_rmsnorm with the per-token
