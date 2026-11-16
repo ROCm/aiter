@@ -217,6 +217,64 @@ def test_conv2d_inference_weight_observes_updates():
     )
 
 
+@pytest.mark.parametrize(
+    "api,cpu_argument",
+    [
+        ("conv2d", "input"),
+        ("conv2d_nchw", "weight"),
+        ("conv2d_nhwc", "bias"),
+        ("conv2d_1x1", "bias"),
+        ("conv2d_general", "bias"),
+        ("conv2d_nhwc_3x3", "bias"),
+        ("conv2d_nchw_3x3_direct", "bias"),
+        ("conv2d_nchw_cblocked", "bias"),
+        ("conv2d_winograd_f4x3", "bias"),
+        ("conv2d_winograd_f4x3_cblocked", "bias"),
+    ],
+)
+def test_conv2d_rejects_invalid_devices_before_preparation(
+    api, cpu_argument, monkeypatch
+):
+    source = torch.empty(
+        1,
+        16,
+        5,
+        7,
+        device="cpu" if cpu_argument == "input" else "cuda",
+        dtype=torch.float16,
+    )
+    filter_size = 1 if api == "conv2d_1x1" else 3
+    weight = torch.empty(
+        16,
+        16,
+        filter_size,
+        filter_size,
+        device="cpu" if cpu_argument == "weight" else "cuda",
+        dtype=torch.float16,
+    )
+    bias = torch.empty(
+        16, device="cpu" if cpu_argument == "bias" else "cuda", dtype=torch.float16
+    )
+
+    def unexpected_preparation(*args, **kwargs):
+        pytest.fail(
+            f"{api}: CPU {cpu_argument} must be rejected before padding or packing"
+        )
+
+    monkeypatch.setattr(
+        conv2d_module, "_prepare_conv2d_padding", unexpected_preparation
+    )
+    message = (
+        "conv2d input must be a CUDA/ROCm tensor"
+        if cpu_argument == "input"
+        else "conv2d input, weight, and bias must be on the same device"
+    )
+    with pytest.raises(ValueError, match=message):
+        getattr(conv2d_module, api)(
+            source, weight, bias, padding=(1, 2), padding_mode="reflect"
+        )
+
+
 # -- Configuration lookup and routing (no kernel launches) -------------------
 
 _GFX1100_PINNED = {

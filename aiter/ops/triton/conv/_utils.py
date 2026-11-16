@@ -27,9 +27,16 @@ def _out_hw(H, W, R, S, stride, padding, dilation):
     return P, Q
 
 
+def _validate_conv2d_devices(x, w_oihw, bias=None):
+    """Require input, weight, and optional bias on one CUDA/ROCm device."""
+    if not x.is_cuda:
+        raise ValueError("conv2d input must be a CUDA/ROCm tensor")
+    if w_oihw.device != x.device or (bias is not None and bias.device != x.device):
+        raise ValueError("conv2d input, weight, and bias must be on the same device")
+
+
 def _conv_dims(x, w_oihw, stride, padding, dilation):
     """Shared wrapper preamble: validate inputs and return the conv dimensions."""
-    assert x.is_cuda and w_oihw.is_cuda
     N, C, H, W_in = x.shape
     K_out, Cw, R, S = w_oihw.shape
     assert Cw == C
