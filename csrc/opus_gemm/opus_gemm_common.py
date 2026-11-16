@@ -2679,6 +2679,9 @@ _FUSE_MAX_NCLUSTER = 5
 # available in the release JIT toolchain, so gen_instances emits host launchers
 # only and loads the matching image at runtime.
 CO_KERNELS_JSON = os.path.join(os.path.dirname(__file__), "gen_co", "co_kernels.json")
+# co_kernels.json key of the gfx950 a4w4 bpreshuffle entries, also the directory
+# of their .co images relative to gen_co/.
+A4W4_CO_KEY = "gfx950/a4w4_bpreshuffle"
 
 _CO_DTYPE_BYTES = {
     "bf16_t": 2,
@@ -2805,14 +2808,13 @@ _CO_FAMILY_TAGS = {"gfx1250": _A16W16_CO_TAGS, "gfx950": _A4W4_CO_TAGS}
 
 def co_image_path(path, instance):
     """Return the pre-built image corresponding to an instance JSON file."""
-    sub = ("a4w4_bpreshuffle",) if instance.kernel_tag in _A4W4_CO_TAGS else ()
-    return os.path.join(
-        os.path.dirname(path), instance.arch_prefix, *sub, f"{instance.name}.co"
-    )
+    sub = A4W4_CO_KEY if instance.kernel_tag in _A4W4_CO_TAGS else instance.arch_prefix
+    return os.path.join(os.path.dirname(path), sub, f"{instance.name}.co")
 
 
-def _load_co_kernels(path, require_image=True, arch="gfx1250"):
-    """Load one arch's pre-built CO instances, safely dropping records with no image."""
+def _load_co_kernels(path, require_image=True, arch="gfx1250", key=None):
+    """Load one arch's pre-built CO instances (JSON list ``key``, default ``arch``),
+    safely dropping records with no image."""
     if not os.path.exists(path):
         return {}
 
@@ -2825,7 +2827,7 @@ def _load_co_kernels(path, require_image=True, arch="gfx1250"):
     seen_names = {}
     missing = []
     for entry_arch, entries in document.items():
-        if entry_arch != arch:
+        if entry_arch != (key or arch):
             continue
         for entry in entries:
             kid = entry["kid"]
@@ -2885,9 +2887,9 @@ gfx1250_4wave_co_kernels_declared = {
 #   co_kernels.json), tiles indexed 256x256, 256x128, 128x256, 128x128,
 #   192x256, 256x192;
 #   410-416: 1x4 small-tile pipeline (JIT), see A4W4_SMALL_CFGS.
-a4w4_co_kernels_list = _load_co_kernels(CO_KERNELS_JSON, arch="gfx950")
+a4w4_co_kernels_list = _load_co_kernels(CO_KERNELS_JSON, arch="gfx950", key=A4W4_CO_KEY)
 a4w4_co_kernels_declared = _load_co_kernels(
-    CO_KERNELS_JSON, require_image=False, arch="gfx950"
+    CO_KERNELS_JSON, require_image=False, arch="gfx950", key=A4W4_CO_KEY
 )
 
 # (B_M, B_N, D, KS): D = ring depth, KS = waves splitting K in the block.

@@ -177,7 +177,8 @@ def _run_gfx1250_co_override_case(available_kid: int, missing_kid: int) -> None:
 
 def test_co_manifest_uses_supported_architecture_keys():
     document = json.loads(Path(CO_KERNELS_JSON).read_text())
-    manifest_arches = {key for key in document if not key.startswith("_")}
+    # Keys are an arch, or "<arch>/<family>" for a family with its own image dir.
+    manifest_arches = {key.split("/")[0] for key in document if not key.startswith("_")}
 
     assert GFX1250 in manifest_arches
     assert manifest_arches <= SUPPORTED_OPUS_ARCHES
