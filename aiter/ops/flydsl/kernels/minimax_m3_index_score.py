@@ -21,7 +21,9 @@ and u = lane % 16,
 
 so a lane holds tokens {4g+r} at feature u. The 128-token max is therefore a
 register-local elementwise max, and only the final fold across g needs two
-shuffle_xor steps; at one wave per page there is no LDS and no barrier at all.
+shuffle_xor steps; at one wave per page the reduction needs no LDS and no barrier
+(only the NVFP4 fp8 arm, e4m3 Q with k_round "e4m3", has LDS then: its scale table,
+and one barrier before the loop).
 A 32x32 tile would spread the reduced axis across lanes instead and need DPP,
 permlane and LDS to close it.
 
@@ -735,7 +737,7 @@ def build_index_score(
     # table of every scale byte.
     RED_SLOTS = WAVES * FEAT_TILES_PER_WAVE * WAVE if WAVES_PER_TOK > 1 else 0
     # Built from only the arrays this config uses, so the default config still
-    # reports group_segment_fixed_size = 0 -- no LDS and no barrier at all.
+    # reports group_segment_fixed_size = 0 -- no LDS and no barrier.
     shared = {}
     if RED_SLOTS:
         shared["red"] = fx.Array[fx.Float32, RED_SLOTS, 16]
@@ -780,9 +782,10 @@ def build_index_score(
         Everything is constexpr-unrolled, so "loop" is the shape of the emitted
         code, not a branch. Wave w takes tw (slice of the page's token axis) and
         pw (page slot); at WAVES_PER_TOK == 1 a wave owns whole pages, the
-        reduction stays register-local and there is no LDS and no barrier at
-        all. Above it the per-page epilogue exchanges partial maxes, the only
-        place a barrier appears.
+        reduction stays register-local and needs no LDS and no barrier. Above it
+        the per-page epilogue exchanges partial maxes, a barrier in every page.
+        (The NVFP4 fp8 arm adds an LDS scale table and one barrier before the
+        page loop.)
         """
         # ==================== PROLOGUE ====================
         # The CTA looks up which (b, c) the n-th *dispatched* block owns rather
@@ -918,7 +921,7 @@ def build_index_score(
             return fx.Vector.from_elements(words, dtype=fx.Int32)
 
         def load_q8_lifted(i):
-            """NVFP4 with an e4m3 Q: the four bf16 B-fragments of feature tile i.
+            """NVFP4 with an e4m3 Q: the four f16 B-fragments of feature tile i.
             K's lane group g holds elements 32g.., so two 16 B e4m3 accesses at
             32g and 32g+16 cover its four k-steps; each widens exactly."""
             row, head = q_row_head(i)
@@ -929,18 +932,18 @@ def build_index_score(
                     fx.get_iter(q_buf), (base + fx.Int32(16 * j)) >> fx.Int32(2)
                 ).load(T.vec(4, T.i32))
                 for half in range_constexpr(2):
-                    wdt = fx.Float16 if f16_arm else fx.BFloat16
-                    t = fx.make_rmem_tensor(fx.make_layout(LANE_K, 1), wdt)
+                    t = fx.make_rmem_tensor(fx.make_layout(LANE_K, 1), fx.Float16)
                     t.store(
                         fx.Vector.from_elements(
-                            fp8_dwords_widen(raw, 2 * half, 2, wdt), wdt
+                            fp8_dwords_widen(raw, 2 * half, 2, fx.Float16),
+                            fx.Float16,
                         )
                     )
                     frags.append(t)
             return frags
 
-        # Only the token-wave partial-max exchange needs LDS; otherwise the
-        # kernel has none and reports group_segment_fixed_size = 0.
+        # Only the token-wave partial-max exchange and the NVFP4 fp8 arm's e4m3 table
+        # need LDS; otherwise the kernel has none (group_segment_fixed_size = 0).
         lds = (
             fx.SharedAllocator().allocate(SharedStorage).peek()
             if const_expr(SharedStorage is not None)
@@ -956,9 +959,7 @@ def build_index_score(
         elif const_expr(f16_arm):
             q_frag = [load_q8_lifted(i) for i in range_constexpr(FEAT_TILES_PER_WAVE)]
             mma_atom = fx.make_mma_atom(
-                fx.rocdl.MFMA(
-                    MFMA_M, MFMA_N, MFMA_K, fx.Float16 if f16_arm else fx.BFloat16
-                )
+                fx.rocdl.MFMA(MFMA_M, MFMA_N, MFMA_K, fx.Float16)
             )
         else:
             q_raw = [
@@ -2279,7 +2280,17 @@ def score_flydsl(
     cp_rank: int = 0,
     k_scale=None,
 ):
-    """Host entry point; see `_score_impl`."""
+    """Host entry point.
+
+    `cp_world`/`cp_rank` shard the blocks round robin: this rank owns
+    `block % cp_world == cp_rank`, so its logical block p is global block
+    `p * cp_world + cp_rank`. The global id addresses the block table and
+    positions the causal mask; the score is stored at the local p, giving the
+    compacted [H, tokens, ceil(blocks/world)] shard the CP selector reads.
+
+    `k_scale` selects the MXFP4 cache (see `score_flydsl_fp4`): `cache` is then its
+    data view and `idx_q` may also be e4m3.
+    """
     return _score_impl(
         idx_q,
         cache,

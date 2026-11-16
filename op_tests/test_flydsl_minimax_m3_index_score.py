@@ -2163,11 +2163,12 @@ def check_mxfp4_matches_oracle(case, qdt):
     check_scores(got, ref)
 
 
-def check_mxfp4_every_geometry_matches_oracle(point, qdt, k_round=None):
+def check_fp4_every_geometry_matches_oracle(point, qdt, k_round=None):
     """Every launch geometry the selector can reach (work-chunk depth, token
     split, spread, CP shard) against the oracle. Negative scores expose accidental
-    zero-initialised maxima, as in the fp8 test. `k_round` set: the NVFP4 scorer at
-    that rounding instead (it has no CP shard, so only the world-1 points)."""
+    zero-initialised maxima, as in the fp8 test. `k_round` None: the MXFP4 scorer;
+    else the NVFP4 scorer at that rounding (it has no CP shard, so only world-1 points).
+    """
     S, H, batch, max_block, world, rank = point
     # As in the fp8 test: `max_block` is this rank's LOCAL width, the table and
     # lengths are global, and the score is the compacted shard.
@@ -2566,11 +2567,6 @@ def check_nvfp4_matches_oracle(case, qdt, k_round):
     check_scores(run_nvfp4(q, kd, ks, bt, seq, S, H, mb, k_round), ref)
 
 
-def check_nvfp4_every_geometry_matches_oracle(point, qdt, k_round):
-    """The NVFP4 scorer through every non-CP launch geometry the selector can reach."""
-    check_mxfp4_every_geometry_matches_oracle(point, qdt, k_round)
-
-
 def check_nvfp4_exact_e4m3_q_equals_bf16_q(S, H, lens):
     """The exact arm runs the f16 MFMA for an e4m3 Q and the bf16 MFMA for a bf16 Q; both
     hold K and Q exactly, so on RANDOM data (not only exact-sum data) the same Q must
@@ -2909,9 +2905,7 @@ def build_nvfp4_checks():
         [p for p in GEOM_POINTS if p[4] == 1], QDTS, K_ROUNDS
     ):
         name = f"every_geometry_{geom_id(point)}_{qdt}_{r}"
-        checks.append(
-            (name, check_nvfp4_every_geometry_matches_oracle, (point, qdt, r))
-        )
+        checks.append((name, check_fp4_every_geometry_matches_oracle, (point, qdt, r)))
     for r in K_ROUNDS:
         checks.append((f"tuned_geometry_map_{r}", check_nvfp4_tuned_geometry_map, (r,)))
     for fn in (
@@ -2933,7 +2927,7 @@ def build_mxfp4_checks():
         checks.append((name, check_mxfp4_matches_oracle, (case, qdt)))
     for point, qdt in itertools.product(GEOM_POINTS, QDTS):
         name = f"every_geometry_{geom_id(point)}_{qdt}"
-        checks.append((name, check_mxfp4_every_geometry_matches_oracle, (point, qdt)))
+        checks.append((name, check_fp4_every_geometry_matches_oracle, (point, qdt)))
     for (S, H), layout, in_graph in itertools.product(
         [(1, 4), (4, 2), (8, 4)], ["contiguous", "feature"], [False, True]
     ):
