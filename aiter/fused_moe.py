@@ -8,6 +8,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import IntEnum
+from typing import NamedTuple
 
 import torch
 
@@ -645,6 +646,63 @@ def _mxfp4_inline_sort_unsupported(
     return ""
 
 
+@functools.lru_cache(maxsize=1024)
+def _moe_sorting_opus_workspace_size(tokens, num_experts, topk, policy, device_id):
+    """`moe_sorting_opus_get_workspace_size`, which is host arithmetic on its
+    arguments (and the device's arch) but costs a full op call per sort."""
+    return aiter.moe_sorting_opus_get_workspace_size(
+        tokens, num_experts, topk, policy, device_id
+    )
+
+
+# Per (device, stream): one grow-only byte buffer and the sort-output views cut
+# from it, by size. See _moe_sort_scratch.
+_SORT_SCRATCH: dict = {}
+_SORT_SCRATCH_VIEWS_MAX = 64
+
+
+def _moe_sort_scratch(device, num_sorted, num_blocks, ws_size):
+    """`(sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
+    workspace)` for a sort whose outputs fused_moe consumes before it returns.
+
+    The next call on the same stream is ordered after that, so it can take the
+    same memory: the sort writes every element the stages read, and the Opus
+    API clears its workspace itself. Kept per stream, so calls on two streams
+    never share it. The caller allocates instead while a CUDA graph captures,
+    so no graph records these addresses.
+    """
+    key = (device.index, torch._C._cuda_getCurrentRawStream(device.index))
+    sizes = (num_sorted, num_blocks, ws_size)
+    entry = _SORT_SCRATCH.get(key)
+    if entry is not None:
+        views = entry[1].get(sizes)
+        if views is not None:
+            return views
+    # Each piece starts 512-byte aligned, as its own allocation would.
+    nbytes = (4 * num_sorted, 4 * num_sorted, 4 * num_blocks, 8, ws_size)
+    offsets = []
+    total = 0
+    for n in nbytes:
+        offsets.append(total)
+        total += (n + 511) // 512 * 512
+    if entry is None or entry[0].numel() < total:
+        entry = (torch.empty(total, dtype=torch.uint8, device=device), {})
+        _SORT_SCRATCH[key] = entry
+    buf, views_by_size = entry
+    if len(views_by_size) >= _SORT_SCRATCH_VIEWS_MAX:
+        views_by_size.clear()
+    pieces = [buf[o : o + n] for o, n in zip(offsets, nbytes)]
+    views = (
+        pieces[0].view(dtypes.i32),
+        pieces[1].view(dtypes.fp32),
+        pieces[2].view(dtypes.i32),
+        pieces[3].view(dtypes.i32),
+        pieces[4] if ws_size > 0 else None,
+    )
+    views_by_size[sizes] = views
+    return views
+
+
 def _moe_sorting_impl(
     topk_ids,
     topk_weights,
@@ -660,6 +718,7 @@ def _moe_sorting_impl(
     accumulate=True,
     output_aux=False,
     output=None,
+    scratch=False,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -697,12 +756,34 @@ def _moe_sorting_impl(
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
     max_num_tokens_padded = max_num_m_blocks * block_size
-    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(
-        max_num_tokens_padded, dtype=dtypes.fp32, device=device
+    # The aux and local-id outputs are not scratch; they also switch the Opus
+    # dispatch below, so only a sort without them sizes its workspace here.
+    scratch = (
+        scratch
+        and not output_aux
+        and not return_local_topk_ids
+        and not torch.cuda.is_current_stream_capturing()
     )
-    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    if scratch:
+        ws_size = (
+            _moe_sorting_opus_workspace_size(
+                M, num_experts, topk, dispatch_policy, topk_ids.get_device()
+            )
+            if use_opus
+            else 0
+        )
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, workspace = (
+            _moe_sort_scratch(device, max_num_tokens_padded, max_num_m_blocks, ws_size)
+        )
+    else:
+        sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+        sorted_weights = torch.empty(
+            max_num_tokens_padded, dtype=dtypes.fp32, device=device
+        )
+        sorted_expert_ids = torch.empty(
+            max_num_m_blocks, dtype=dtypes.i32, device=device
+        )
+        num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
     # moe_buf shape depends on the downstream stage2 path:
     #  - accumulate (or EP w/ expert_mask): stage2 atomically accumulates into [M, model_dim].
     #  - else (FlyDSL stage2 reduce mode without mask, or the non-atomic
@@ -736,14 +817,15 @@ def _moe_sorting_impl(
         aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
 
     if use_opus:
-        ws_size = aiter.moe_sorting_opus_get_workspace_size(
-            M, num_experts, topk, dispatch_policy, topk_ids.get_device()
-        )
-        workspace = (
-            torch.empty(ws_size, dtype=torch.uint8, device=device)
-            if ws_size > 0
-            else None
-        )
+        if not scratch:
+            ws_size = _moe_sorting_opus_workspace_size(
+                M, num_experts, topk, dispatch_policy, topk_ids.get_device()
+            )
+            workspace = (
+                torch.empty(ws_size, dtype=torch.uint8, device=device)
+                if ws_size > 0
+                else None
+            )
         aiter.moe_sorting_opus_fwd(
             topk_ids,
             topk_weights,
@@ -877,7 +959,10 @@ def moe_sorting(
     flat: AsmMoeMode | int = AsmMoeMode.SORTED,
     output_aux=False,
     output=None,
+    _scratch=False,
 ):
+    """``_scratch``: the caller consumes the sort outputs before it returns, so
+    they may be reused memory (see ``_moe_sort_scratch``)."""
     asm_mode = AsmMoeMode(flat)
     if (
         not _USE_CK_MOE_SORTING
@@ -926,6 +1011,7 @@ def moe_sorting(
             accumulate=accumulate,
             output_aux=output_aux,
             output=output,
+            scratch=_scratch,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -1192,6 +1278,26 @@ def resolve_activation_dtype(
     return q_dtype_a
 
 
+def _plain_eager(x):
+    """Whether this call runs eagerly on real tensors: not traced by
+    torch.compile, under no TorchDispatchMode (FakeTensorMode, make_fx, ...),
+    and ``x`` is not a tensor subclass. Only then may host-side shortcuts
+    (skipping an op dispatch, reusing cached plans or buffers) stand in for
+    the op as written."""
+    return (
+        not torch.compiler.is_compiling()
+        and type(x) is torch.Tensor
+        and not torch._C._len_torch_dispatch_stack()
+    )
+
+
+def _op_or_eager_body(op, x):
+    """``op``'s Python body when it can be called directly, else ``op``: the
+    ``torch.ops`` dispatch is kept wherever a tracer or mode handles the op as
+    one opaque call."""
+    return getattr(op, "_eager_body", op) if _plain_eager(x) else op
+
+
 @drop_presort_on_error
 def fused_moe(
     hidden_states,
@@ -1356,7 +1462,7 @@ def fused_moe(
         block_size_M = -1
     enable_ep_scatter = stage2_scatter is not None
     scatter_source_map = stage2_scatter.source_token_map if enable_ep_scatter else None
-    return fused_moe_(
+    return _op_or_eager_body(fused_moe_, hidden_states)(
         hidden_states=hidden_states,
         w1=w1,
         w2=w2,
@@ -1562,6 +1668,37 @@ def fused_moe_(
     )
 
 
+class _MoePlan(NamedTuple):
+    """What _fused_moe_impl resolves before sorting: the get_2stage_cfgs call
+    it made, and the values the sort and the stages take."""
+
+    cfg_args: tuple
+    cfg_kwargs: dict
+    metadata: "MOEMetadata"
+    activation: ActivationType
+    quant_type: QuantType
+    gate_mode: GateMode
+    swiglu_limit: float | None
+    silu_limit: bool
+    M: int
+    topk: int
+    model_dim: int
+    global_E: int
+    dtype: torch.dtype
+    q_dtype_a: torch.dtype
+    q_dtype_w: torch.dtype
+    isG1U1: bool
+    block_size_M: int
+    asm_mode: AsmMoeMode
+    stage1_func: Callable
+    need_local_topk_ids: bool
+
+
+# _fused_moe_impl's plans by call signature (its plan_key).
+_MOE_PLANS: dict = {}
+_MOE_PLANS_MAX = 1024
+
+
 def _fused_moe_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1608,6 +1745,96 @@ def _fused_moe_impl(
     # Consume a caller's presort first, so every path (including early returns
     # and errors) clears it.
     presorted_aux = pop_presorted_moe()
+    # Everything resolved below, up to the sort, follows from these, so a call
+    # can take the plan of an earlier one with the same key.
+    plan_key = None
+    if (
+        presorted_aux is None
+        and not deterministic
+        and not herd_topk
+        and stage2_scatter is None
+        and _q_dtype_a is None
+        and _metadata_transform is None
+        and _metadata_config_file is None
+        and _stage1_extra_args is None
+        and _stage2_extra_args is None
+        and _stage2_override is None
+        and not _enforce_metadata_block_size
+        and _plain_eager(hidden_states)
+    ):
+        plan_key = (
+            topk_ids.shape,
+            w1.shape,
+            w2.shape,
+            w1.dtype,
+            hidden_states.dtype,
+            dtype,
+            activation,
+            quant_type,
+            doweight_stage1,
+            block_size_M,
+            hidden_pad,
+            intermediate_pad,
+            swiglu_limit,
+            beta,
+            linear_beta,
+            gate_mode,
+            quant_type_a,
+            quant_dtype_a,
+            quant_dtype_a2,
+            None if expert_mask is None else expert_mask.numel(),
+            bias1 is None,
+            bias2 is None,
+            a1_scale is None,
+            a2_scale is None,
+            num_local_tokens is None,
+            getattr(w1, "is_shuffled", False),
+            getattr(w2, "is_shuffled", False),
+            getattr(w1, "gate_up_interleave", None),
+        )
+        plan = _MOE_PLANS.get(plan_key)
+        # The tuned config is still looked up per call, through whatever
+        # get_2stage_cfgs is now (callers wrap it, tests clear its cache): the
+        # plan holds only while that returns the metadata it was resolved from.
+        if (
+            plan is not None
+            and get_2stage_cfgs(*plan.cfg_args, **plan.cfg_kwargs) is plan.metadata
+        ):
+            # The per-call steps of the resolution below, in its order.
+            if not hidden_states.is_contiguous() and not _is_row_major_2d(
+                hidden_states
+            ):
+                hidden_states = hidden_states.contiguous()
+            if output is not None:
+                _validate_output_buffer_metadata(
+                    output, (plan.M, plan.model_dim), plan.dtype, hidden_states.device
+                )
+                _validate_output_buffer_no_overlap(output, hidden_states)
+            if not hidden_states.is_contiguous():
+                hidden_states = hidden_states.contiguous()
+            return _fused_moe_run(
+                plan,
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                expert_mask,
+                doweight_stage1,
+                w1_scale,
+                w2_scale,
+                a1_scale,
+                a2_scale,
+                num_local_tokens,
+                moe_sorting_dispatch_policy,
+                hidden_pad,
+                intermediate_pad,
+                bias1,
+                bias2,
+                beta,
+                linear_beta,
+                output,
+            )
     # vLLM sends 0.0 for "no limit". Check floats and the raw int first:
     # pybind enum comparisons are much slower than int compares.
     silu_limit = (
@@ -1875,8 +2102,13 @@ def _fused_moe_impl(
         activation, beta, linear_beta, swiglu_limit
     )
 
+    # The get_2stage_cfgs call behind `metadata`, and how many were made.
+    cfg_args = cfg_kwargs = None
+    cfg_lookups = 0
+
     def _resolve_metadata(disable_inline_sort=False, exclude_mxmoe=False):
-        metadata = get_2stage_cfgs(
+        nonlocal cfg_args, cfg_kwargs, cfg_lookups
+        cfg_args = (
             get_padded_M(M),
             model_dim,
             inter_dim,
@@ -1893,25 +2125,29 @@ def _fused_moe_impl(
             intermediate_pad,
             isShuffled,
             gate_mode,
-            is_ep=expert_mask is not None,
-            has_stage1_bias=bias1 is not None,
-            has_stage2_bias=bias2 is not None,
-            situ_beta=config_situ_beta,
-            situ_linear_beta=config_situ_linear_beta,
-            swiglu_limit=swiglu_limit,
-            opus_weights_shuffled=getattr(w1, "is_shuffled", False)
-            and getattr(w2, "is_shuffled", False),
-            gate_up_interleave=getattr(w1, "gate_up_interleave", None),
-            config_file=_metadata_config_file,
-            _disable_inline_sort=disable_inline_sort,
-            _exclude_mxmoe=exclude_mxmoe,
-            q_dtype_a2=quant_dtype_a2,
-            input_dtype=hidden_states.dtype,
-            has_stage2_scatter=stage2_scatter is not None,
-            has_activation_scales=a1_scale is not None or a2_scale is not None,
-            _has_input_activation_scales=a1_scale is not None,
-            has_num_local_tokens=num_local_tokens is not None,
         )
+        cfg_kwargs = {
+            "is_ep": expert_mask is not None,
+            "has_stage1_bias": bias1 is not None,
+            "has_stage2_bias": bias2 is not None,
+            "situ_beta": config_situ_beta,
+            "situ_linear_beta": config_situ_linear_beta,
+            "swiglu_limit": swiglu_limit,
+            "opus_weights_shuffled": getattr(w1, "is_shuffled", False)
+            and getattr(w2, "is_shuffled", False),
+            "gate_up_interleave": getattr(w1, "gate_up_interleave", None),
+            "config_file": _metadata_config_file,
+            "_disable_inline_sort": disable_inline_sort,
+            "_exclude_mxmoe": exclude_mxmoe,
+            "q_dtype_a2": quant_dtype_a2,
+            "input_dtype": hidden_states.dtype,
+            "has_stage2_scatter": stage2_scatter is not None,
+            "has_activation_scales": a1_scale is not None or a2_scale is not None,
+            "_has_input_activation_scales": a1_scale is not None,
+            "has_num_local_tokens": num_local_tokens is not None,
+        }
+        cfg_lookups += 1
+        metadata = get_2stage_cfgs(*cfg_args, **cfg_kwargs)
         return (
             metadata if _metadata_transform is None else _metadata_transform(metadata)
         )
@@ -2090,6 +2326,136 @@ def _fused_moe_impl(
         "gfx950",
     ), f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
 
+    plan = _MoePlan(
+        cfg_args,
+        cfg_kwargs,
+        metadata,
+        activation,
+        quant_type,
+        gate_mode,
+        swiglu_limit,
+        silu_limit,
+        M,
+        topk,
+        model_dim,
+        global_E,
+        dtype,
+        q_dtype_a,
+        q_dtype_w,
+        isG1U1,
+        block_size_M,
+        asm_mode,
+        stage1_func,
+        need_local_topk_ids,
+    )
+    # Kept only where the plan is a function of plan_key: one plain config
+    # lookup, and none of the paths that decide per call -- the gfx1250 grouped
+    # path, the MXFP4 / gfx1250 activation dtype (read from the environment),
+    # and the MXMOE / inline-sort checks on the tensors.
+    if (
+        plan_key is not None
+        and cfg_lookups == 1
+        and gate_mode != GateMode.INTERLEAVE
+        and quant_type != QuantType.per_1x32
+        and get_gfx_runtime() not in ("gfx1250", "gfx1250-strict")
+        and not _is_mxmoe_opus_metadata(metadata)
+        and not _is_mxfp4_inline_sort(metadata)
+    ):
+        if len(_MOE_PLANS) >= _MOE_PLANS_MAX:
+            _MOE_PLANS.clear()
+        _MOE_PLANS[plan_key] = plan
+    return _fused_moe_run(
+        plan,
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        expert_mask,
+        doweight_stage1,
+        w1_scale,
+        w2_scale,
+        a1_scale,
+        a2_scale,
+        num_local_tokens,
+        moe_sorting_dispatch_policy,
+        hidden_pad,
+        intermediate_pad,
+        bias1,
+        bias2,
+        beta,
+        linear_beta,
+        output,
+        herd_topk=herd_topk,
+        herd_routed_scaling_factor=herd_routed_scaling_factor,
+        herd_candidate_ids=herd_candidate_ids,
+        herd_candidate_weights=herd_candidate_weights,
+        presorted_aux=presorted_aux,
+        deterministic=deterministic,
+        _metadata_config_file=_metadata_config_file,
+        _stage1_extra_args=_stage1_extra_args,
+        _stage2_extra_args=_stage2_extra_args,
+        _stage2_override=_stage2_override,
+    )
+
+
+def _fused_moe_run(
+    plan,
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    expert_mask,
+    doweight_stage1,
+    w1_scale,
+    w2_scale,
+    a1_scale,
+    a2_scale,
+    num_local_tokens,
+    moe_sorting_dispatch_policy,
+    hidden_pad,
+    intermediate_pad,
+    bias1,
+    bias2,
+    beta,
+    linear_beta,
+    output,
+    *,
+    herd_topk=0,
+    herd_routed_scaling_factor=1.0,
+    herd_candidate_ids=None,
+    herd_candidate_weights=None,
+    presorted_aux=None,
+    deterministic=False,
+    _metadata_config_file=None,
+    _stage1_extra_args=None,
+    _stage2_extra_args=None,
+    _stage2_override=None,
+):
+    """Sort the routes and run the stages of a fused_moe call resolved to `plan`."""
+    (
+        _,
+        _,
+        metadata,
+        activation,
+        quant_type,
+        gate_mode,
+        swiglu_limit,
+        silu_limit,
+        M,
+        topk,
+        model_dim,
+        global_E,
+        dtype,
+        q_dtype_a,
+        q_dtype_w,
+        isG1U1,
+        block_size_M,
+        asm_mode,
+        stage1_func,
+        need_local_topk_ids,
+    ) = plan
     sort_m_indices = None
     sort_reverse_sorted = None
     runtime_stage2_reduce = _stage2_runtime_uses_route_reduce(
@@ -2298,6 +2664,8 @@ def _fused_moe_impl(
             and asm_mode is not AsmMoeMode.POST_REDUCE,
             flat=asm_mode,
             output=sort_output,
+            # The stages below consume the sort; a bench hook keeps it longer.
+            _scratch=kernel_bench_callable is None and _plain_eager(topk_ids),
         )
         if need_local_topk_ids:
             (
