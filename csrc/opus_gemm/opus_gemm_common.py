@@ -4,6 +4,7 @@
 
 import json
 import os
+import re
 import sys
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -3029,6 +3030,9 @@ def _gfx950_co_image_path(path, entry):
     return os.path.join(root, "gfx950", "a8w8_blockscale_bpreshuffle", entry["image"])
 
 
+MXFP8_DIRECTION_PATTERN = re.compile(r"_mxfp8_(nn|tt|tn)_")
+
+
 def _load_gfx950_co_kernels(path, require_image=True):
     with open(path) as stream:
         document = json.load(stream)
@@ -3055,6 +3059,9 @@ def _load_gfx950_co_kernels(path, require_image=True):
         "prefetch_b_vgpr": "b_vgpr_co",
         "prefetch_b_vgpr_overlap": "b_vgpr_overlap_co",
         "pingpong_lds": "m_repeat_co",
+        "mxfp8_nn": "mxfp8_nn_4wave_co",
+        "mxfp8_tt": "mxfp8_tt_4wave_co",
+        "mxfp8_tn": "mxfp8_tn_4wave_co",
     }
     for entry in entries.values():
         fields = (
@@ -3949,7 +3956,8 @@ def candidate_kids_for_shape(gfx, m, n, k, outdtype="bf16", *, cu_num):
         for kid, instance in sorted(
             get_registry("a8w8_blockscale_bpreshuffle", gfx, cu_num).items()
         )
-        if a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)
+        if not MXFP8_DIRECTION_PATTERN.search(instance.name)
+        and a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)
     ]
 
 
@@ -4117,14 +4125,28 @@ def kid_for_name(family: str, gfx: str, cu_num: int, name: str) -> int:
 
 
 def default_compiled_keys(gfx: str, cu_num: int) -> set[KernelKey]:
-    """Select the A16W16 compile floor from the current CU table."""
+    """Select the A16W16 compile floor from the current CU table.
+
+    On gfx950 the MXFP8 NN / TT / TN CO kids are added as well: the shape
+    heuristic and tuner never pick them, so no tuned row requests them.
+    """
     lookup_gfx = base_gfx_arch(gfx)
     defaults = DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((lookup_gfx, cu_num), ())
-    return {
+    keys = {
         KernelKey("a16w16", gfx, cu_num, kid)
         for kid in get_registry("a16w16", gfx, cu_num)
         if kid in defaults
     }
+    if gfx == "gfx950":
+        keys.update(
+            KernelKey("a8w8_blockscale_bpreshuffle", gfx, cu_num, kid)
+            for kid, instance in get_registry(
+                "a8w8_blockscale_bpreshuffle", gfx, cu_num
+            ).items()
+            if instance.bpreshuffle_co is not None
+            and MXFP8_DIRECTION_PATTERN.search(instance.name)
+        )
+    return keys
 
 
 def _in_group(name, family, instance):
