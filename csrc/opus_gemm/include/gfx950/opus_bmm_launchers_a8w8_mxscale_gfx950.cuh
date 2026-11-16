@@ -25,7 +25,8 @@ static void opus_bmm_a8w8_common_checks(aiter_tensor_t &O, aiter_tensor_t &wo_a,
                                         aiter_tensor_t &x_scale,
                                         aiter_tensor_t &w_scale,
                                         const char *who,
-                                        int group_n, int group_k)
+                                        int group_n, int group_k,
+                                        int m_align, int n_align, int k_align)
 {
   aiter_detail::g_aiter_can_throw = true;
   AITER_CHECK(O.dim() == 3 && wo_a.dim() == 3 && Y.dim() == 3 &&
@@ -57,6 +58,22 @@ static void opus_bmm_a8w8_common_checks(aiter_tensor_t &O, aiter_tensor_t &wo_a,
   AITER_CHECK(K % group_k == 0 && N % group_n == 0,
               who, ": N must be a multiple of ", group_n, " and K of ", group_k,
               "; got N=", N, ", K=", K);
+  // The kid's tiles, which the scale blocks do not imply: a GROUP_K=32 kid can
+  // have B_K of 128, 256 or 512. An unaligned shape is not rejected downstream
+  // -- the K loop is ceil_div(k, B_K) and A/B carry unbounded buffer
+  // descriptors, so a partial tail tile reads the next row's bytes and
+  // accumulates them, while a preload-SF kid returns leaving Y unwritten. Both
+  // are silent. Python's launch plan demands the same three multiples, but the
+  // split_k <= 1 path reaches here without building one, so this is the only
+  // guard on the common case and on any direct caller of the raw entry.
+  AITER_CHECK(m_align > 0 && n_align > 0 && k_align > 0,
+              who, ": kid reported no tile alignment");
+  AITER_CHECK(M % m_align == 0, who, ": kid requires M % ", m_align,
+              " == 0; got M=", M);
+  AITER_CHECK(N % n_align == 0, who, ": kid requires N % ", n_align,
+              " == 0; got N=", N);
+  AITER_CHECK(K % k_align == 0, who, ": kid requires K % ", k_align,
+              " == 0; got K=", K);
   AITER_CHECK(wo_a.size(0) == batch && wo_a.size(2) == K,
               who, ": wo_a must have shape [batch,N,K]");
   AITER_CHECK(Y.size(0) == M && Y.size(1) == batch && Y.size(2) == N,

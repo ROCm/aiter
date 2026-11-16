@@ -697,6 +697,11 @@ class AITER_CONFIG:
             keys.append("cu_num")
         if "gfx" in merge_df.columns and "gfx" not in keys:
             keys.append("gfx")
+        if (
+            merge_name == "batched_gemm_a8w8_blockscale_mxscale_tuned"
+            and "w_scale_block" not in keys
+        ):
+            keys.append("w_scale_block")
         if "_tag" in merge_df.columns:
             keys.append("_tag")
         # Only key on columns actually present in the merged frame. Most
@@ -747,10 +752,18 @@ class AITER_CONFIG:
                 logger.info(f"path {i + 1}: {path} (not exist)")
                 continue
 
-            # Kept as text so the merged file reproduces every cell as written:
-            # parsed, a column with a blank cell turns 64 into 64.0, which
-            # readers that take integers from the text reject.
+            # Preserve cell text while normalizing legacy MXFP8 BMM scale keys.
             df = pd.read_csv(path, dtype=str, keep_default_na=False)
+            if (
+                merge_name == "batched_gemm_a8w8_blockscale_mxscale_tuned"
+                and "w_scale_block" not in df.columns
+            ):
+                logger.warning(
+                    "Legacy MXFP8 BMM tuned CSV %s has no w_scale_block; "
+                    "reading its rows as 128x128",
+                    path,
+                )
+                df["w_scale_block"] = "128x128"
             source_pairs.append((path, df))
 
         if not source_pairs:

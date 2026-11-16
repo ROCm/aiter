@@ -814,46 +814,177 @@ def mxscale_bmm_group_of_block(w_scale_block: str) -> int:
 
 
 def _heuristic_mxscale_bmm_kid(
-    g: int,
-    m: int,
-    n: int,
-    k: int,
-    *,
-    group_size: int = 128,
-    gfx: str | None = None,
-    cu_num: int | None = None,
+    g: int, m: int, n: int, k: int, *, group_size: int = 128, gfx=None, cu_num=None
 ) -> int:
     """Choose a final local row-major kid when the tuned table has no usable row.
 
-    GROUP_K=32 takes each pick's twin (kid + 1000). The 256x256 pipeline tile
-    has none, so large M at 32 falls through to the 64x64 flatmm tile.
+    GROUP_K=32 takes each pick's twin (kid + 1000).
     """
     _validate_mxscale_bmm_group_size(group_size)
+    offset = 1000 if group_size == 32 else 0
 
-    def pick(kid):
-        return kid + MX32_KID_STRIDE if group_size == 32 else kid
+    def divisible(value: int, divisor: int) -> bool:
+        return value % divisor == 0
 
     if (
-        group_size == 128
-        and n % 256 == 0
-        and k % 128 == 0
+        divisible(n, 256)
+        and divisible(k, 256)
         and (m >= 2048 or (m >= 1024 and g >= 8))
     ):
-        seed = 16 if 4096 <= k <= 8192 else 15
+        seed = offset + (16 if 4096 <= k <= 8192 else 154 if k > 8192 else 15)
     elif m < 64:
-        seed = pick(140) if n % 64 == 0 and k % 256 == 0 else pick(144)
-    elif m <= 256 and k <= 1024 and n % 32 == 0 and k % 256 == 0:
-        seed = pick(71)
-    elif n % 64 == 0 and k % 128 == 0:
-        seed = pick(144)
+        seed = offset + (140 if divisible(n, 64) and divisible(k, 256) else 144)
+    elif m <= 256 and k <= 1024 and divisible(n, 32) and divisible(k, 256):
+        seed = offset + 71
+    elif divisible(n, 64) and divisible(k, 128):
+        seed = offset + 144
     else:
-        seed = pick(0)
+        seed = offset
     gfx = gfx or get_gfx()
     cu_num = get_cu_num() if cu_num is None else cu_num
-    instance = get_kernel_instance(gfx, "a8w8_mxscale_bmm", seed, cu_num=cu_num)
-    if instance is None:
+    if get_kernel_instance(gfx, "a8w8_mxscale_bmm", seed, cu_num=cu_num) is None:
         raise ValueError(f"no OPUS MXFP8 BMM heuristic for {gfx}")
     return seed
+
+
+# (B_M, B_N, workgroups per CU) of the flatmm split-K tiles the untuned plan
+# picks among, in 128x128 numbering; the GROUP_K=32 twins are kid + 1000.
+_MX_PLAN_TILES = {
+    66: (16, 32, 2),
+    70: (16, 32, 4),
+    71: (64, 32, 2),
+    72: (32, 32, 2),
+    144: (64, 64, 2),
+    8: (128, 128, 1),
+}
+
+
+def _heuristic_mxscale_bmm_plans(
+    g: int, m: int, n: int, k: int, offset: int, cu_num: int
+):
+    """Untuned (kid, split) candidates, best first.
+
+    The tile follows the output size E = G*M*N, measured on gfx950 over
+    G 1-16, M 1-2048, N 512-7168, K 1024-16384. Below M 64 the tile is as
+    tall as M needs, since every padded row is weight bandwidth spent for
+    nothing. The 256x256 pipeline needs about 2**23 outputs to fill the GPU
+    from K 4096 up (past 8192 on the sliding-panel 154); at short K it is
+    prologue bound and wants twice that. Split-K only pays at
+    K >= 8192, and only while the tiles leave the CUs half empty, keeping at
+    least 2048 of K per split.
+    """
+    e = g * m * n
+    if m < 64:
+        if m <= 16 or (m <= 48 and e < 1 << 16):
+            kid = 70
+        elif m <= 32:
+            kid = 72
+        elif n % 64 == 0 and e >= 1 << 19:
+            kid = 144
+        else:
+            kid = 71
+    else:
+        big_log2 = 23 + (2 if k <= 1024 else 1 if k < 4096 else 0)
+        if n % 256 == 0 and k % 256 == 0 and e >= 1 << big_log2:
+            yield offset + (16 if k <= 8192 else 154), 1
+        if m > 64 and k >= 2048 and n % 128 == 0 and e >= 1 << (20 if k > 8192 else 21):
+            kid = 8
+        elif e <= 1 << 16 and k % 512 == 0:
+            kid = 66
+        elif n % 64 == 0 and (e >= 1 << 19 or k >= 8192):
+            kid = 144
+        else:
+            kid = 72
+    block_m, block_n, wg_per_cu = _MX_PLAN_TILES[kid]
+    tiles = g * -(-m // block_m) * -(-n // block_n)
+    split_k = 1
+    while (
+        split_k < 8
+        and k >= 8192
+        and k // (2 * split_k) >= 2048
+        and tiles * 4 * split_k <= 2 * cu_num * wg_per_cu
+    ):
+        split_k *= 2
+    yield offset + kid, split_k
+    if split_k > 1:
+        yield offset + kid, 1
+
+
+# Row-major-weight 1x32 fallback candidates, most to least preferred; each
+# later one needs less N/K alignment.
+_MX1X32_FALLBACK = (2144, 2140, 2071, 2000, 2069)
+
+
+@cache
+def _mx1x32_twins(gfx: str, cu_num: int) -> dict[int, int]:
+    """{32x32 kid: the row-major 1x32 kid of the same tile}, matched by name."""
+    registry = get_registry("a8w8_mxscale_bmm", gfx, cu_num)
+
+    by_name = {
+        inst.name: int(kid)
+        for kid, inst in registry.items()
+        if inst.GROUP_N == 1 and not inst.needs_preshuffled_b
+    }
+    return {
+        int(kid): by_name[inst.name.replace("_1x32x32", "_1x1x32")]
+        for kid, inst in registry.items()
+        if inst.GROUP_N == 32
+        and inst.GROUP_K == 32
+        and inst.name.replace("_1x32x32", "_1x1x32") in by_name
+    }
+
+
+def _mx1x32_twin(
+    kid32: int, g: int, m: int, n: int, k: int, *, gfx: str, cu_num: int
+) -> int | None:
+    """The 1x32 kid of a 32x32 pick: same tile, per-row B scales.
+
+    The 256x256 pipeline tiles stage a sliding B-row window next to the A panel
+    (2154), which takes a narrower window than the 32x32 tile; below 2**24
+    output elements a flatmm tile is still ahead of it: the 256-wide 2076
+    up to its 64 K-tiles, the 128x128 2008 past them.
+    """
+    if kid32 in (1015, 1154, 1016):
+        if g * m * n >= 1 << 24:
+            return 2154
+        return 2076 if k <= 8192 else 2008
+    return _mx1x32_twins(gfx, cu_num).get(kid32)
+
+
+def _heuristic_mxscale_bmm_1x32_kid(
+    g: int, m: int, n: int, k: int, *, gfx: str, cu_num: int
+) -> tuple[int, int]:
+    """The 1x32 twin of the 32x32 plan, else the first fallback that runs.
+
+    The row-major 1x32 tiles measure within a few percent of their 32x32 twins, so the
+    32x32 table (and heuristic) already ranks them for the shape.
+    """
+    candidates = []
+    try:
+        kid32, split32 = resolve_a8w8_mxscale_bmm_plan(
+            g, m, n, k, w_scale_block="32x32", gfx=gfx, cu_num=cu_num
+        )
+    except (TypeError, ValueError, OverflowError):
+        kid32, split32 = None, 1
+    twin = (
+        None
+        if kid32 is None
+        else _mx1x32_twin(kid32, g, m, n, k, gfx=gfx, cu_num=cu_num)
+    )
+    if twin is not None:
+        candidates += [(twin, split32), (twin, 1)]
+    candidates += [(kid, 1) for kid in _MX1X32_FALLBACK]
+    for kid, split_k in dict.fromkeys(candidates):
+        try:
+            plan = _get_cached_a8w8_mxscale_bmm_plan(
+                gfx, kid, "bf16", m, g, n, k, split_k, cu_num=cu_num
+            )
+        except (TypeError, ValueError, OverflowError):
+            continue
+        return plan.resolved_kid, plan.abi_split_k
+    raise ValueError(
+        f"no row-major 1x32 OPUS MXFP8 BMM kid runs B:{g} M:{m} N:{n} K:{k}"
+    )
 
 
 # Preshuffled-B fallback candidates by M band, in local ids (GROUP_K=32 adds
@@ -1005,8 +1136,6 @@ def resolve_a8w8_mxscale_bmm_plan(
     cu_num = get_cu_num() if cu_num is None else cu_num
     scope = {"gfx": gfx, "cu_num": cu_num}
     group_size = mxscale_bmm_group_of_block(w_scale_block)
-    if w_scale_block == "1x32":
-        raise ValueError("1x32 OPUS BMM requires the preshuffled-weight entry")
     config = lookup_mxscale_bmm_config(g, m, n, k, w_scale_block=w_scale_block, **scope)
     libtype = config.get("libtype", "opus") if config is not None else "opus"
     if libtype != "opus":
@@ -1024,8 +1153,10 @@ def resolve_a8w8_mxscale_bmm_plan(
                 raise ValueError(
                     f"kid {kid} wants a preshuffled B or host-rearranged scales"
                 )
-            if mxscale_bmm_kid_group(kid, **scope) != group_size:
-                raise ValueError(f"kid {kid} does not take group_size={group_size}")
+            if mxscale_bmm_kid_block(kid, **scope) != w_scale_block:
+                raise ValueError(
+                    f"kid {kid} does not take w_scale_block={w_scale_block}"
+                )
             split_k = _parse_mxscale_bmm_tuned_split_k(config["splitK"])
             plan = _get_cached_a8w8_mxscale_bmm_plan(
                 gfx,
@@ -1054,6 +1185,17 @@ def resolve_a8w8_mxscale_bmm_plan(
         else:
             return plan.resolved_kid, plan.abi_split_k
 
+    if w_scale_block == "1x32":
+        return _heuristic_mxscale_bmm_1x32_kid(g, m, n, k, **scope)
+    offset = 1000 if group_size == 32 else 0
+    for kid, split_k in _heuristic_mxscale_bmm_plans(g, m, n, k, offset, cu_num):
+        try:
+            plan = _get_cached_a8w8_mxscale_bmm_plan(
+                gfx, kid, "bf16", m, g, n, k, split_k, cu_num=cu_num
+            )
+        except (TypeError, ValueError, OverflowError):
+            continue
+        return plan.resolved_kid, plan.abi_split_k
     kid = _heuristic_mxscale_bmm_kid(g, m, n, k, group_size=group_size, **scope)
     return kid, 1
 
