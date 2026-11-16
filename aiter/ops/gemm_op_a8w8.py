@@ -1286,7 +1286,7 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
     return Y
 
 
-@_route(op="gemm_a8w8_blockscale")
+@_route(op="gemm_a8w8_blockscale", fake=gemm_a8w8_blockscale_fake, mutates_args=[])
 @torch_compile_guard(mutates_args=[], gen_fake=gemm_a8w8_blockscale_fake)
 def gemm_a8w8_blockscale(
     XQ: Tensor,
