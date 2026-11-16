@@ -4985,9 +4985,9 @@ def get_2stage_cfgs(
                 f"unsupported {unsupported}; using default heuristics"
             )
     # A clamped SiLU on gfx942 per-token FP8 weights with no FlyDSL row: the
-    # default heuristics take the 1-stage kernel, which drops swiglu_limit, so
-    # run the gfx942 FlyDSL backend (it applies the clamp) at its default
-    # config for this token count. Tuned FlyDSL rows still win.
+    # default heuristics take the 1-stage kernel, which cannot apply
+    # swiglu_limit, so run the gfx942 FlyDSL backend (it applies the clamp) at
+    # its default config for this token count. Tuned FlyDSL rows still win.
     if (
         full_impl is None
         and (cfg is None or cfg.get("run_1stage", False))
