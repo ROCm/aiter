@@ -28,7 +28,6 @@ from aiter.ops.topk import _FLYDSL_TOPK_DECODE_GATES
 from aiter.ops.topk_select import _choose as topk_select_backend_for
 from aiter.ops.topk_select import topk_select
 from aiter.test_common import benchmark, perftest
-from aiter.utility.graph_alloc import persistent_alloc
 
 
 def create_random_logits(
@@ -1277,9 +1276,14 @@ def test_adaptive_control_per_capture(card):
     with torch.cuda.stream(warm):
         decode(*warm_cases[0])
     check(warm_cases[0], "eager warm-up")
-    graph_w = capture(warm, warm_cases)
     eager_w = flydsl_decode_host._adaptive_control[(device, warm.cuda_stream)]
+    graph_w = capture(warm, warm_cases)
     assert captured(warm).data_ptr() != eager_w.data_ptr(), "capture took eager buffer"
+    assert (
+        device,
+        warm.cuda_stream,
+    ) not in flydsl_decode_host._adaptive_control, "capture kept the warm-up buffer"
+    del eager_w
     baseline = nodes(graph_w)
 
     # Two graphs on one stream, the later one replayed first.
@@ -1470,7 +1474,7 @@ def _compact_slots(card, rows, width, top_k, stable=False):
 def test_adaptive_scratch_reused(card):
     """Eager compact launches on a stream share one candidate buffer, grown to the
     largest launch and never shrunk, so a repeat allocates nothing; a capture takes
-    its own and leaves that one alone. Growing releases the old buffer while a launch
+    its own and drops that one. Growing releases the old buffer while a launch
     may still be using it, and the freed block is at once taken again on the stream.
     Every row stays exact throughout."""
     top_k, width = 2048, 1 << 20
@@ -1507,8 +1511,7 @@ def test_adaptive_scratch_reused(card):
     with torch.cuda.stream(stream):
         decode(*in_flight)
         decode(*large)
-        with persistent_alloc(device):
-            taker = torch.full((slots[4],), -1, dtype=torch.int32, device=device)
+        taker = torch.full((slots[4],), -1, dtype=torch.int32, device=device)
         decode(*small)
     check(in_flight, "launch whose buffer was released and taken again behind it")
     check(large, "eager launch that grows the buffer")
@@ -1522,7 +1525,8 @@ def test_adaptive_scratch_reused(card):
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.graph(graph, stream=stream):
         decode(*captured)
-    assert held() is grown, "capture touched the eager buffer"
+    assert held() is None, "capture kept the warm-up buffer"
+    del grown
     captured[2].fill_(-7)
     with torch.cuda.stream(stream):
         graph.replay()

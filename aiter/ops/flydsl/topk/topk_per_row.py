@@ -15,7 +15,6 @@ from aiter.ops.topk_decode_gate import (
     decode_adaptive_width,
     decode_backend_for_shape,
 )
-from aiter.utility.graph_alloc import persistent_alloc
 
 from ..kernels.kernels_common import get_warp_size
 from ..kernels.tensor_shim import _run_compiled
@@ -48,7 +47,8 @@ _LONG_ROWS_512_THREAD_ARCHES = ("gfx1250",)
 # Adaptive control buffers. Every launch leaves its buffer zero, so only the first
 # launch on a buffer needs it zeroed. Eager launches share one per (device, stream).
 # A capture gets its own, from the graph's pool, so two graphs replayed at once never
-# share counters; graphs that share a pool already may not replay at once.
+# share counters; graphs that share a pool already may not replay at once. A capture
+# drops its stream's eager buffers, which a warm-up there would leave unread.
 _adaptive_control: dict[tuple[torch.device, int], torch.Tensor] = {}
 # Keyed (device, stream, capture). The zeroing is a node of the graph, so it runs at
 # every replay; a capture that has ended is dropped and its buffer returns to the pool.
@@ -98,7 +98,7 @@ def _get_adaptive_control(
     """The control buffer for `rows` rows on the current stream of `device`, zero when
     the launch runs. `capture` is `_adaptive_capture` of that stream.
 
-    Eager buffers grow in powers of two and stay until
+    Eager buffers grow in powers of two and stay until a capture on their stream or
     `clear_topk_per_row_decode_workspace_cache()`.
     """
     need = _adaptive.decode_control_slots(rows)
@@ -106,14 +106,14 @@ def _get_adaptive_control(
         key = (device, stream_id)
         buf = _adaptive_control.get(key)
         if buf is None or buf.numel() < need:
-            with persistent_alloc(device):
-                buf = torch.zeros(
-                    _adaptive.decode_control_slots(1 << (rows - 1).bit_length()),
-                    device=device,
-                    dtype=torch.int32,
-                )
+            buf = torch.zeros(
+                _adaptive.decode_control_slots(1 << (rows - 1).bit_length()),
+                device=device,
+                dtype=torch.int32,
+            )
             _adaptive_control[key] = buf
         return buf
+    _adaptive_control.pop((device, stream_id), None)
     key = (device, stream_id, capture)
     buf = _captured_adaptive_control.get(key)
     if buf is None or buf.numel() < need:
@@ -130,20 +130,21 @@ def _get_adaptive_scratch(
     """The compact candidate buffer, `slots` int32 or more, on the current stream of
     `device`. `capture` is `_adaptive_capture` of that stream.
 
-    Eager buffers grow to the largest launch seen on their stream and stay until
-    `clear_topk_per_row_decode_workspace_cache()`. A capture allocates from the
-    graph's pool, so graphs replayed at once never share one.
+    Eager buffers grow to the largest launch seen on their stream and stay until a
+    capture on that stream or `clear_topk_per_row_decode_workspace_cache()`. A
+    capture allocates from the graph's pool, so graphs replayed at once never share
+    one.
     """
-    if capture is not None:
-        return torch.empty(slots, device=device, dtype=torch.int32)
     key = (device, stream_id)
+    if capture is not None:
+        _adaptive_scratch.pop(key, None)
+        return torch.empty(slots, device=device, dtype=torch.int32)
     buf = _adaptive_scratch.get(key)
     if buf is None or buf.numel() < slots:
         # Released before the larger one is taken, so growing never holds both.
         _adaptive_scratch.pop(key, None)
         buf = None
-        with persistent_alloc(device):
-            buf = torch.empty(slots, device=device, dtype=torch.int32)
+        buf = torch.empty(slots, device=device, dtype=torch.int32)
         _adaptive_scratch[key] = buf
     return buf
 
@@ -576,8 +577,8 @@ def flydsl_top_k_per_row_decode(
     `aiter.ops.topk.top_k_per_row_decode` holds the `max_row_len` contract.
     `seq_lens=None` makes every row `plane_width` long; the kernels then read no
     length tensor, so a captured graph holds no address for one.
-    Before CUDAGraph capture, warm up on the capture stream so the split and
-    adaptive paths find their stream-local counters already allocated and zeroed.
+    A CUDAGraph capture needs no warm-up: counters it allocates are zeroed in the graph.
+    Warming up on the capture stream only compiles the kernels outside the capture.
     Eager compact launches keep their candidate buffer at the largest batch seen on
     the stream, so a memory profile that runs the largest batch counts it.
 
