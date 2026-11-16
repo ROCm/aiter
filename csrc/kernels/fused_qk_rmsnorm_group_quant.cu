@@ -53,7 +53,8 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     int q_out_u_stride,
     int k_out_stride,
     int q_res_out_stride,
-    int group_size)
+    int group_size,
+    int xcds)
 {
     // Keep internal names stable to avoid touching tuned kernel body logic.
     auto* out1_q = q_out_quantized;
@@ -97,6 +98,10 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
                   "per-token quant only supports fp8 output");
 
     int idx = blockIdx.x;
+    if(xcds > 1) // XCD-major rows, see the host
+    {
+        idx = idx % xcds * (gridDim.x / xcds) + idx / xcds;
+    }
     if(idx >= m)
     {
         return;
@@ -429,7 +434,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(inp1.dtype(), "fused_qk_rmsnorm_group_quant_kernel", [&] {                             \
         using DTYPE_I = typename aiter::hip2opus<scalar_t>::type;                                                                 \
         using DTYPE_OO = DTYPE_O;                                                                                                 \
-        dim3 grid(m, grid_y);                                                                                                     \
+        dim3 grid(xcds > 1 ? (m + xcds - 1) / xcds * xcds : m, grid_y);                                                           \
         dim3 block(BlockSize);                                                                                                    \
         fused_qk_rmsnorm_group_quant_kernel<DTYPE_I,                                                                              \
                                          DTYPE_OO,                                                                                \
@@ -466,7 +471,8 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
             out1_u_stride,                                                                                                        \
             out2_stride,                                                                                                          \
             out_res1_stride,                                                                                                      \
-            group_size);                                                                                                          \
+            group_size,                                                                                                           \
+            xcds);                                                                                                                \
     });
 
 #define FUSED_RMSNORM_GROUP_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, interleave) \
@@ -989,6 +995,14 @@ void fused_qk_rmsnorm_group_quant(
                     " reduce_thread_size is not power of 2");
     }
     HipDeviceGuard device_guard(inp1.device_id);
+    // Column-major scales: workgroups go to the XCDs round-robin, so neighbouring rows, which
+    // share a scale cache line, would write it from every XCD. Past 512 rows (below, it measured
+    // slower) each XCD takes a run of rows.
+    int xcds = 0;
+    if(!no_quant && transpose_scale && m > 512)
+    {
+        HIP_CALL(hipDeviceGetAttribute(&xcds, hipDeviceAttributeNumberOfXccs, inp1.device_id));
+    }
     const hipStream_t stream = aiter::getCurrentHIPStream();
     (void)get_num_cu_func();
 
