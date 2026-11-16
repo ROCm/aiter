@@ -775,6 +775,73 @@ def test_asm_4gib_operands():
     return rows
 
 
+def test_asm_last_tile_at_allocation_end():
+    """A ends an allocation and the last M tile has 1 or 2 rows, at small K.
+
+    Each tile's descriptor covers only that tile's rows, while the kernels
+    lower its size by a fixed step for each K step they prefetch, also past
+    the end of K. The size must stop at zero there: if it wrapped, those
+    prefetches would read past the end of A, which faults (aborting the
+    process) when A ends the allocation.
+    """
+    gfx = get_gfx()
+    if gfx not in ("gfx942", "gfx950"):
+        return []
+    pf3 = "_ZN5aiter37bf16gemm_fp32bf16_tn_64x64_pf3_splitkE"
+    bshuffle = "_ZN5aiter42bf16gemm_fp32bf16_tn_64x64_bshuffle_splitkE"
+    clean = "_ZN5aiter39bf16gemm_fp32bf16_tn_64x64_splitk_cleanE"
+    t256 = "_ZN5aiter24bf16gemm_bf16_tn_256x256E"
+    t256_bpre = "_ZN5aiter36bf16gemm_bf16_tn_256x256_bpreshuffleE"
+    # (name, bpreshuffle, splitK, out dtype, M tile rows, K values); name None
+    # is the heuristic, whose M = 257 and 258 leave 1 or 2 rows in the last
+    # tile of 64-, 128- and 256-row kernels. Split-K with bf16 output adds
+    # bf16 partial sums, so split-K runs use FP32 output. The heuristic runs
+    # without preshuffle at K = 128 only: at K = 64 it picks a *_splitk_clean
+    # kernel at split 1, which faults on main as well.
+    kernels = [
+        (None, False, None, dtypes.fp32, 256, (128,)),
+        (None, True, None, dtypes.fp32, 256, (64, 128)),
+        (pf3, False, 1, dtypes.bf16, 64, (64, 128)),
+        (bshuffle, True, 1, dtypes.bf16, 64, (64, 128)),
+        (clean, False, 2, dtypes.fp32, 64, (128,)),
+    ]
+    if gfx == "gfx950":
+        kernels += [
+            (t256, False, 1, dtypes.bf16, 256, (64, 128)),
+            (t256_bpre, True, 1, dtypes.bf16, 256, (64, 128)),
+        ]
+    # A fresh 64 MiB block is a whole caching-allocator segment, so nothing
+    # mapped follows it; empty the cache so it is not cut from a larger one.
+    torch.cuda.empty_cache()
+    buf = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
+    n = 256
+    rows = []
+    for name, bpreshuffle, split, otype, tile, ks in kernels:
+        for k in ks:
+            for last_rows in (1, 2):
+                m = tile + last_rows
+                x = buf[buf.numel() - m * k * 2 :].view(dtypes.bf16).view(m, k)
+                x.copy_(torch.randn(m, k, dtype=dtypes.bf16, device="cuda"))
+                w = torch.randn(n, k, dtype=dtypes.bf16, device="cuda")
+                out = torch.full((m, n), float("nan"), dtype=otype, device="cuda")
+                aiter.gemm_a16w16_asm(
+                    x,
+                    shuffle_weight(w, layout=(16, 16)) if bpreshuffle else w,
+                    out,
+                    None,
+                    split,
+                    name,
+                    bpreshuffle,
+                )
+                case = (
+                    f"asm {name or 'heuristic'} A at allocation end {(m, n, k)} {otype}"
+                )
+                bad = _asm_mismatches(x, w, out)
+                assert bad == 0, f"{case}: {bad} of {m * n} elements wrong"
+                rows.append({"case": case, "result": "exact"})
+    return rows
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of a16w16_gemm_test",
@@ -791,7 +858,8 @@ parser.add_argument(
           or -t skinny
           or -t out    # tgemm.mm(out=) on every backend
           or -t compile    # torch.compile with weights/biases in one storage
-          or -t asm_4g    # asm with A, B or out of 4 GiB""",
+          or -t asm_4g    # asm with A, B or out of 4 GiB, and A ending
+                          # an allocation with a 1- or 2-row last tile""",
 )
 parser.add_argument(
     "-d",
@@ -882,6 +950,7 @@ for test in args.test:
     elif test == "compile":
         df += test_gemm_compile_packed_params()
     elif test == "asm_4g":
+        df += test_asm_last_tile_at_allocation_end()
         df += test_asm_4gib_operands()
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
