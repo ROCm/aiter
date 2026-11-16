@@ -3,21 +3,39 @@
 
 from __future__ import annotations
 
+import functools
 import math
 from typing import Any
 
 import torch
 import torch.nn.functional as F
+import triton
 
 from aiter.ops.triton._triton_kernels.attention.block_lut import (
     block_attn_mask_to_lut_kernel,
 )
-from aiter.ops.triton._triton_kernels.attention.sol_attn_pool import (
+from aiter.ops.triton._triton_kernels.attention.lse_merge import _lse_merge_kernel
+from aiter.ops.triton.attention.sol_attn_pool import (
     POOL_AUX_NONE,
     POOL_AUX_SQUARE_MEAN,
     POOL_AUX_VARIANCE,
     sol_attn_pool,
 )
+from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
+
+# An arch without a measured entry gets a tile small enough to launch anywhere. On MI355X a sweep
+# of BLOCK_M 8-128 x num_warps 1-8 over the kv_splits shapes of mha_v4 found 16 x 4 within 2% of
+# each shape's best on average, and this fallback 8% behind it.
+_LSE_MERGE_FALLBACK = triton.Config({"BLOCK_M": 32}, num_warps=4)
+
+
+@functools.cache
+def _lse_merge_config() -> triton.Config:
+    """Resolved once per process: an arch without an entry warns on every lookup."""
+    return get_tuned_kernel_config(
+        "attention", "LSE_MERGE", "_lse_merge_kernel", _LSE_MERGE_FALLBACK
+    )
+
 
 # Default tile geometry of the gfx950 Sol-Attn ASM kernels. SOL_ATTN_TS_KV in particular is the
 # pooling block size, which each row fixes rather than reading, so pooling with
@@ -107,7 +125,7 @@ def block_attn_mask_to_ragged_lut(
     block_attn_mask: torch.Tensor,
     num_heads: int | None = None,
     return_none_if_dense: bool = False,
-    BLOCK_KB: int | None = None,
+    BLOCK_KB: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
     """
     Convert a dense block attention mask to a ragged look-up table of KV block
@@ -166,6 +184,80 @@ def block_attn_mask_to_ragged_lut(
     )
 
     return kv_block_indices, lut_start, lut_count
+
+
+def lse_merge(
+    partial_out: torch.Tensor,
+    partial_lse: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor | None = None,
+) -> None:
+    """
+    Merge attention partials over disjoint key ranges into `out` (and `lse`) by log-sum-exp.
+
+    partial_out: BSHD [batch * splits, Sq, H, D]; partial batch b * splits + i holds key
+        range i of batch b. Any strides with a contiguous last dimension.
+    partial_lse: FP32 [batch * splits, H, Sq], natural-log log-sum-exp of each range,
+        with a contiguous last dimension.
+    out: BSHD [batch, Sq, H, D], written as weighted by exp(partial_lse - lse).
+    lse: optional FP32 [batch, H, Sq] receiving the merged log-sum-exp.
+    """
+    batch, sequence, heads, head_dim = out.shape
+    if partial_out.shape[0] % batch or partial_out.shape[1:] != out.shape[1:]:
+        raise ValueError(
+            f"partial_out {tuple(partial_out.shape)} does not fold whole key ranges of "
+            f"out {tuple(out.shape)} into its batch"
+        )
+    splits = partial_out.shape[0] // batch
+    if splits < 1:
+        raise ValueError(
+            f"partial_out {tuple(partial_out.shape)} holds no key range to merge"
+        )
+    if partial_lse.shape != (partial_out.shape[0], heads, sequence):
+        raise ValueError(
+            f"partial_lse must be [batch * splits, heads, Sq] = "
+            f"{(partial_out.shape[0], heads, sequence)}, got {tuple(partial_lse.shape)}"
+        )
+    if lse is not None and lse.shape != (batch, heads, sequence):
+        raise ValueError(
+            f"lse must be [batch, heads, Sq] = {(batch, heads, sequence)}, "
+            f"got {tuple(lse.shape)}"
+        )
+    for name, tensor in (
+        ("partial_out", partial_out),
+        ("partial_lse", partial_lse),
+        ("out", out),
+        ("lse", lse),
+    ):
+        if tensor is not None and tensor.stride(-1) != 1:
+            raise ValueError(f"{name} must have a contiguous last dimension")
+    if head_dim & (head_dim - 1):
+        raise ValueError(f"head dimension must be a power of two, got {head_dim}")
+
+    config = _lse_merge_config()
+    block_m = config.kwargs["BLOCK_M"]
+    lse_strides = (lse.stride(0), lse.stride(1)) if lse is not None else (0, 0)
+    _lse_merge_kernel[(triton.cdiv(sequence, block_m), heads, batch)](
+        partial_out,
+        partial_lse,
+        out,
+        lse if lse is not None else partial_lse,
+        sequence,
+        partial_out.stride(0),
+        partial_out.stride(1),
+        partial_out.stride(2),
+        partial_lse.stride(0),
+        partial_lse.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        *lse_strides,
+        SPLITS=splits,
+        BLOCK_M=block_m,
+        HEAD_DIM=head_dim,
+        WRITE_LSE=lse is not None,
+        num_warps=config.num_warps,
+    )
 
 
 def _sol_attn_pool_kv_quant(
@@ -317,11 +409,38 @@ def _sol_attn_pool_mx(
     # Reconstructed from the requantized pair rather than returning `pooled`: the kernel loads the
     # rounded values, and routing has to see exactly what it will load or a block sitting within
     # rounding distance of the threshold can be selected here and skipped there.
-    result = (mean_data, mean_scale, _e8m0_dequantize(mean_data, mean_scale))
+    result = (
+        mean_data,
+        _sol_attn_pad_scale_rows(mean_scale),
+        _e8m0_dequantize(mean_data, mean_scale),
+    )
     if not variance:
         return result
-    var = _sol_attn_block_variance(dequantized, BLOCK_N)
-    return result + _e8m0_quantize(var, x_quant.dtype)
+    var_data, var_scale = _e8m0_quantize(
+        _sol_attn_block_variance(dequantized, BLOCK_N), x_quant.dtype
+    )
+    return result + (var_data, _sol_attn_pad_scale_rows(var_scale))
+
+
+# The Sol kernels read a pooled E8M0 scale a whole SOL_ATTN_TS_KV rows at a time, whatever the
+# row's own KV tile, so a pooled scale's allocation has to run that far.
+_SOL_ATTN_SCALE_ROW_TILE = SOL_ATTN_TS_KV
+
+
+def _sol_attn_pad_scale_rows(scale: torch.Tensor) -> torch.Tensor:
+    """`scale` as a contiguous view over an allocation zeroed up to a whole scale-row tile.
+
+    The rows past the last pooled block are read but never used, so their value only has to be
+    finite: E8M0 0 is 2^-127, where uninitialized bytes can decode to inf. Only the tail past the
+    last batch is padded, so the view keeps `scale`'s own strides.
+    """
+    pad = (-scale.shape[1] % _SOL_ATTN_SCALE_ROW_TILE) * scale[0, 0].numel()
+    if pad == 0:
+        return scale
+    size = scale.numel()
+    storage = scale.new_zeros(size + pad)
+    storage[:size].copy_(scale.reshape(-1))
+    return storage[:size].view(scale.shape)
 
 
 def _e2m3_decode(code: torch.Tensor) -> torch.Tensor:
@@ -778,7 +897,9 @@ def sol_prepare(
             unless the matching *_scale argument was given.
         mean_k_scale, mean_v_scale: the pooled operand's own E8M0 scale, same layout as the input
             scale with seqlen_k replaced by num_kv_blocks, or None when the source descale was
-            reused. These go in the mode-2 kernarg's pooled scale slots.
+            reused. These go in the mode-2 kernarg's pooled scale slots, except an MXFP6 K's:
+            its packer also stores the scales inside mean_k's tile records, which is where the
+            kernel reads them, so this image is only the readable copy for the host-side helpers.
         mean_k_var: the per-block population variance of k_quant, in mean_k's dtype and layout,
             when k_variance is set; otherwise None. For an 8-bit K it is stored divided by
             SOL_ATTN_FP8_VAR_DIVISOR, which the kernel undoes, and an int8 K's is e4m3. With

@@ -13,6 +13,7 @@ sol_tilt_planes builds them for any recipe, encoded in its own K and V formats.
 
 from __future__ import annotations
 
+import functools
 import math
 from typing import NamedTuple
 
@@ -31,6 +32,14 @@ from aiter.ops.triton._triton_kernels.attention.sol_tilt import (
     _sol_tilt_unit_kernel,
     _sol_tilt_valu_kernel,
 )
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+logger = AiterTritonLogger()
 
 # The FP8 row's score units per nat at unit softmax scale.
 _TILT_LOGIT_UNIT = math.log2(math.e) * 128.0 / 65535.0
@@ -41,6 +50,66 @@ _TILT_B_HEADROOM = 400.0 / 448.0
 # The widest KV tile any Sol row reads K scales in, whole tiles at a time, so every plane's scale
 # rows run zeroed to a multiple of this: E8M0 0 is 2^-127, while stray bytes reach inf.
 _TILT_SCALE_ROW_TILE = 128
+# Triton's default launch, for an arch without a measured SOL_TILT_FACTOR file.
+_FACTOR_FALLBACK = (4, 0)
+
+
+@functools.cache
+def _factor_schedules() -> dict | None:
+    """This device's SOL_TILT_FACTOR file, or None where none is published."""
+    path = f"{resolve_config_dir('attention', 'SOL_TILT_FACTOR')}/DEFAULT.json"
+    schedules = load_config_json(path, required=False)
+    if schedules is None:
+        logger.warning(
+            "No tuned sol_tilt factor schedule in '%s'; using fallback %s",
+            path,
+            _FACTOR_FALLBACK,
+        )
+    return schedules
+
+
+@torch.compiler.assume_constant_result
+def _factor_launch(to_bf16: bool, kv_tile: int) -> tuple[int, int]:
+    """(num_warps, waves_per_eu) of the factor kernel.
+
+    The schedule is keyed by the kernel's path ("fp8" for FP8 K and V, else "bf16", which int8 K
+    also takes), then bucketed by KV tile. The gfx950 values were measured on MI355X at Wan 2.2
+    720p, hd128, 5 and 40 heads and ranks 1 to 4: one warp beats the old 4 warps and 2 waves per
+    EU by 24-39% on the FP8 path and by 35-40% on the bf16 path at a 64 KV tile; at a 128 KV tile
+    the bf16 path wants two warps (9-20% faster), where one warp is up to 30% slower.
+
+    Marked constant so torch.compile reads the file eagerly rather than tracing the read.
+    """
+    schedules = _factor_schedules()
+    key = "bf16" if to_bf16 else "fp8"
+    if schedules is None or key not in schedules:
+        return _FACTOR_FALLBACK
+    entry = select_leq_config(schedules[key], kv_tile, prefix="BLOCK_N_LEQ_")
+    return entry["num_warps"], entry.get("waves_per_eu", 0)
+
+
+def _backed_scale_copy(scale: torch.Tensor) -> torch.Tensor:
+    """A contiguous copy of a pooled E8M0 K scale, backed by zeroed rows past its end.
+
+    clone() would copy only the view and drop those rows, which the kernel still reads: the Sol
+    rows take the scale _TILT_SCALE_ROW_TILE rows at a time, and the MXFP4 K reader also runs the
+    producer's lookahead rows and slack past them. The backing covers both.
+    """
+    from aiter.ops.mha_v4_quant import (
+        MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+        MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
+        block_scale_storage,
+    )
+
+    copy = block_scale_storage(
+        scale,
+        *scale.shape,
+        _TILT_SCALE_ROW_TILE,
+        lookahead_rows=MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+        extra=MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
+    )
+    copy.copy_(scale)
+    return copy
 
 
 def _check_unit_stride(name: str, x: torch.Tensor) -> None:
@@ -48,25 +117,20 @@ def _check_unit_stride(name: str, x: torch.Tensor) -> None:
         raise ValueError(f"{name} needs a unit-stride head dim")
 
 
-_ROTATION_SIGNS: dict[torch.device, torch.Tensor] = {}
+def _pooled_blocks(seqlen_k: int, kv_tile: int, **pooled: torch.Tensor | None) -> int:
+    """K's block count at kv_tile, which every pooled row tensor given must have.
 
-
-def _rotation_signs(device: torch.device) -> torch.Tensor:
-    """The +-1 matrix of the MX packers' hd128 Hadamard rotation, which is it times 128**-0.5."""
-    signs = _ROTATION_SIGNS.get(device)
-    if signs is None:
-        from aiter.ops.mha_v4_quant import rotate_activation_hd128
-
-        eye = (
-            torch.eye(128, dtype=torch.bfloat16, device=device)
-            .view(1, 128, 1, 128)
-            .contiguous()
-        )
-        rows = torch.empty_like(eye)
-        rotate_activation_hd128(rows, eye)
-        signs = rows.view(128, 128).sign().contiguous()
-        _ROTATION_SIGNS[device] = signs
-    return signs
+    The factor kernel writes one plane row per full block of K and the pack kernel reads mean_v
+    over mean_k's blocks, both unmasked, so any other count is refused before they allocate.
+    """
+    blocks = -(-seqlen_k // kv_tile)
+    for name, x in pooled.items():
+        if x is not None and x.shape[1] != blocks:
+            raise ValueError(
+                f"{name} has {x.shape[1]} blocks, but K's {seqlen_k} rows make {blocks} of "
+                f"kv_tile {kv_tile}: it was pooled at another kv_tile"
+            )
+    return blocks
 
 
 def sol_q_abs_max(
@@ -101,7 +165,6 @@ def sol_q_abs_max(
     _sol_q_tile_absmax_kernel[(tiles, heads, batch)](
         q,
         scale,
-        _rotation_signs(q.device) if rotate else out,
         out,
         seqlen,
         d**-0.5,
@@ -220,7 +283,7 @@ def sol_jensen_cap(
 
     if block_scaled:
         per_nat = 0.5 * (softmax_scale / q_multiplier) ** 2
-        var, var_scale = mean_k_var, mean_k_var_scale.clone()
+        var, var_scale = mean_k_var, _backed_scale_copy(mean_k_var_scale)
     else:
         per_nat = (
             0.5
@@ -239,7 +302,7 @@ def sol_jensen_cap(
             gain,
             q_descale if q_descale is not None else gain,
             k_descale if k_descale is not None else gain,
-            mean_k_var_scale if block_scaled else gain,
+            scale_io,
             scale_io,
             per_nat,
             math.log(kv_tile),
@@ -278,24 +341,14 @@ def _refill_mxfp6_scale_tails(
     from aiter.ops.triton.quant import mxfp6_fmha_pack as fp6
 
     batch, rows, heads, _ = scale.shape
-    tiles = -(-rows // 128)
-    if not scale.is_contiguous() or records.stride(2) != tiles * fp6._K_TILE_BYTES:
+    tiles = -(-rows // fp6.FP6_K_TILE_TOKENS)
+    if not scale.is_contiguous() or records.stride(2) != tiles * fp6.FP6_K_TILE_BYTES:
         raise ValueError(
             "an MXFP6 K scale is a contiguous image of the rows the records were packed from"
         )
-    size = batch * heads * tiles * fp6._K_TILE_BYTES + fp6.FP6_K_BUFFER_SLACK_BYTES
+    size = batch * heads * tiles * fp6.FP6_K_TILE_BYTES + fp6.FP6_K_BUFFER_SLACK_BYTES
     flat = records.as_strided((size,), (1,)).clone()
-    fp6._fill_k_scale_tail_kernel[(batch * heads * tiles,)](
-        scale.view(-1),
-        flat,
-        rows,
-        heads,
-        tiles,
-        TILE_BYTES=fp6._K_TILE_BYTES,
-        SCALE_TAIL_OFFSET=fp6._K_SCALE_TAIL_OFFSET,
-        BLOCK=1024,
-        num_warps=4,
-    )
+    fp6.fill_fp6_k_scale_tails(flat, scale)
     return flat.as_strided(records.shape, records.stride())
 
 
@@ -342,7 +395,7 @@ def sol_tilt_factors(
         raise ValueError(
             f"the tilt needs one K/V head per query head, got {q.shape[2]}/{k.shape[2]}"
         )
-    blocks = mean_k.shape[1]
+    blocks = _pooled_blocks(k.shape[1], kv_tile, mean_k=mean_k, mean_v=mean_v)
     fmax = torch.finfo(k.dtype).max
     dev = k.device
     q_head_max = (q_abs_max if q_abs_max is not None else sol_q_abs_max(q))[1]
@@ -404,6 +457,11 @@ def _tilt_factors(
             raise ValueError(
                 f"the tilt's factors take fp8, int8 or bf16 {name}, got {x.dtype}"
             )
+    # The factor kernel loads V unmasked over K's rows, heads and dims.
+    if v.shape != k.shape:
+        raise ValueError(
+            f"the tilt needs V shaped as K, got K {tuple(k.shape)} and V {tuple(v.shape)}"
+        )
     if not 1 <= rank <= d:
         raise ValueError(f"tilt rank must be in [1, {d}], got {rank}")
     full = seqlen_k // kv_tile
@@ -421,6 +479,8 @@ def _tilt_factors(
     if full:
         gain = block_gain if block_gain is not None else planes_a
         gain_strides = block_gain.stride() if block_gain is not None else (0, 0, 0)
+        to_bf16 = not (k.dtype == v.dtype == torch.float8_e4m3fn)
+        num_warps, waves_per_eu = _factor_launch(to_bf16, kv_tile)
         _sol_tilt_factor_kernel[(full, heads, batch)](
             k,
             v,
@@ -440,14 +500,14 @@ def _tilt_factors(
             *gain_strides,
             *planes_a.stride()[:4],
             HAS_GAIN=block_gain is not None,
-            TO_BF16=not (k.dtype == v.dtype == torch.float8_e4m3fn),
+            TO_BF16=to_bf16,
             RANK=rank,
             WIDTH=max(16, triton.next_power_of_2(rank)),
             ITERS=power_iters,
             BLOCK_N=kv_tile,
             HEAD_DIM=d,
-            num_warps=4,
-            waves_per_eu=2,
+            num_warps=num_warps,
+            waves_per_eu=waves_per_eu,
         )
     return planes_a, planes_b, peaks
 
@@ -630,7 +690,14 @@ def sol_tilt_planes(
             "a packed format needs the pooled BF16 rows sol_prepare packed"
         )
     dev = k.device
-    blocks = mean_k.shape[1]
+    blocks = _pooled_blocks(
+        k.shape[1],
+        kv_tile,
+        mean_k=mean_k,
+        mean_v=mean_v,
+        mean_k_pooled=mean_k_pooled,
+        mean_v_pooled=mean_v_pooled,
+    )
     full = k.shape[1] // kv_tile
     planes_a, planes_b, peaks = _tilt_factors(
         k, v, q_abs_max[1], rank, kv_tile, blocks, power_iters, block_gain

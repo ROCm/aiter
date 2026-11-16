@@ -141,6 +141,7 @@ def _stage2_a8w4_traits_alias(kid: int) -> str:
 
 
 def _stage2_a8w4_traits_type(inst) -> str:
+    sort_block = f", {inst.sort_block_m}" if inst.sort_block_m < inst.block_m else ""
     return (
         "OpusMoeStage2A8W4DecodeShape<"
         f"{inst.block_m}, "
@@ -152,7 +153,7 @@ def _stage2_a8w4_traits_type(inst) -> str:
         f"{inst.cachectl_b}, "
         f"{inst.cachectl_wscale}, "
         f"{inst.pair_slots}, "
-        f"{inst.steady_pair_slots}"
+        f"{inst.steady_pair_slots}{sort_block}"
         ">"
     )
 

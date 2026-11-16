@@ -20,6 +20,7 @@ import triton
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha import (
+    flash_attn_fp8_pertensor_func,
     flash_attn_func,
 )
 from aiter.ops.mha_v4 import (
@@ -31,23 +32,22 @@ from aiter.ops.mha_v4 import (
     mha_v4,
     mha_v4_block_tile,
     mha_v4_block_tiles,
+    mha_v4_mx_producers,
     mha_v4_operands,
     mha_v4_packed,
     native_fp8_format,
     scale_modes_for_formats,
 )
 from aiter.ops.mha_v4_quant import (
+    MHA_V4_HD256,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
+    mxfp6_k_view_hd256,
     quantize_fp8,
     quantize_fp8_rotated,
     quantize_int8,
-    quantize_mxfp4_k,
-    quantize_mxfp4_q,
-    quantize_mxfp6_k,
-    quantize_mxfp6_q,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_fp8,
@@ -56,7 +56,9 @@ from aiter.ops.mha_v4_quant import (
     quantize_v_mxfp6_fp6_p,
     rotate_activation_hd128,
 )
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
+from aiter.ops.triton._triton_kernels.attention.dao_ai import (
+    flash_attn_3,
+)
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
     fav3_sage_wrapper_func,
@@ -96,10 +98,13 @@ logger = logging.getLogger(__name__)
 
 
 def _production_quantize_mxfp4(query, key, value, softmax_scale):
-    q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
-    k_raw, k_scale = quantize_mxfp4_k(key)
+    quant_q, quant_k, quant_v = mha_v4_mx_producers(
+        AttentionFormat.MXFP4, query.shape[-1]
+    )
+    q_fp4, q_scale = quant_q(query, mha_v4_q_multiplier(softmax_scale))
+    k_raw, k_scale = quant_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
-    v_raw, v_scale = quantize_v_mxfp4_fp6_p(value)
+    v_raw, v_scale = quant_v(value)
     v_fp4 = mxfp4_v_view(v_raw, v_scale, value.shape[1])
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
 
@@ -114,16 +119,20 @@ def _production_quantize_mxfp8(query, key, value, softmax_scale):
 def _production_quantize_mxfp6(
     query, key, value, softmax_scale, v_format=None, fp6_p=False
 ):
-    q_fp6, q_scale = quantize_mxfp6_q(query, mha_v4_q_multiplier(softmax_scale))
-    k_raw, k_scale_raw = quantize_mxfp6_k(key)
-    batch, sequence, heads, _ = key.shape
-    k_fp6, k_scale = mxfp6_k_view(k_raw, k_scale_raw, batch, sequence, heads)
+    batch, sequence, heads, head_dim = key.shape
+    quant_q, quant_k, quant_v_fp6_p = mha_v4_mx_producers(
+        AttentionFormat.MXFP6, head_dim
+    )
+    q_fp6, q_scale = quant_q(query, mha_v4_q_multiplier(softmax_scale))
+    k_raw, k_scale_raw = quant_k(key)
+    k_view = mxfp6_k_view_hd256 if head_dim == MHA_V4_HD256 else mxfp6_k_view
+    k_fp6, k_scale = k_view(k_raw, k_scale_raw, batch, sequence, heads)
     if v_format is None:
         v_quantized, v_scale = quantize_v_fp8(value)
         return q_fp6, q_scale, k_fp6, k_scale, v_quantized, v_scale
 
     if v_format == AttentionFormat.MXFP6:
-        quantize_v = quantize_v_mxfp6_fp6_p if fp6_p else quantize_v_mxfp6
+        quantize_v = quant_v_fp6_p if fp6_p else quantize_v_mxfp6
         return q_fp6, q_scale, k_fp6, k_scale, *quantize_v(value)
     if v_format != AttentionFormat.MXFP4:
         raise ValueError(f"unsupported MXFP6 Q/K V format: {v_format!r}")
@@ -148,6 +157,8 @@ class KernelSpec:
     uses_hadamard: bool = False
     supports_causal: bool = True
     include_in_all: bool = False
+    # Output comes back in --layout; every other runner is handed BSHD and returns BSHD.
+    follows_layout: bool = False
 
 
 def _mha_v4_spec(
@@ -173,15 +184,20 @@ KERNEL_SPECS = {
         quantized=True,
         supports_block_sparse=True,
         uses_hadamard=True,
+        follows_layout=True,
     ),
     "sage_mxfp4": KernelSpec(
         (0.5, 0.5, 1.0),
         quantized=True,
         supports_block_sparse=True,
         uses_hadamard=True,
+        follows_layout=True,
     ),
     "fav3_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True, uses_hadamard=True),
     "aiter_bf16": KernelSpec((2.0, 2.0, 2.0), include_in_all=True),
+    # FMHA v3 per-tensor FP8, the quantized counterpart to the aiter_bf16 baseline. Select it
+    # explicitly; at d=256 it is the one non-MX row that runs at all.
+    "aiter_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True),
     "mha4_bf16": _mha_v4_spec(
         (2.0, 2.0, 2.0), quantized=False, supports_block_sparse=True
     ),
@@ -224,17 +240,24 @@ KERNEL_SPECS = {
     ),
 }
 
-# The four deployed Sol-Attn (mode 2) rows, each mapped to the kernel whose
-# quantization it reuses, plus what its pooled operands need: whether K carries a
-# pooled scale of its own, and the packed formats K and V are stored in when their
-# codes cannot be pooled directly.
+# One Sol-Attn (mode 2) kernel per mha4_ recipe, each mapped to the kernel whose
+# quantization it reuses, plus what its pooled operands need: whether Q and K carry
+# E8M0 1x32 scales, which routing has to apply to Q and pooling has to give K a pooled
+# copy of, and the packed formats K and V are stored in when their codes cannot be
+# pooled directly. Q is packed exactly when K is, since the two share a format.
 #
-# The all-MXFP4 mode-2 row consumes the FP6-P V order, so its pooled V has to be
-# packed in that order too.
+# Every FP6-P row consumes the FP6-P V order, so its pooled V has to be packed in that
+# order too.
 SOL_KERNELS: dict[str, tuple[str, bool, str | None, str | None]] = {
-    "mha4_fp8_sol": ("mha4_fp8", False, None, None),
+    "mha4_bf16_sol": ("mha4_bf16", False, None, None),
+    "mha4_bf16fp8_sol": ("mha4_bf16fp8", False, None, None),
     "mha4_i8fp8_sol": ("mha4_i8fp8", False, None, None),
     "mha4_mxfp8_sol": ("mha4_mxfp8", True, None, None),
+    "mha4_fp8_sol": ("mha4_fp8", False, None, None),
+    "mha4_f8f6_sol": ("mha4_f8f6", False, None, "mxfp6_fp6_p"),
+    "mha4_f6f8_sol": ("mha4_f6f8", True, "mxfp6", None),
+    "mha4_mxfp6_sol": ("mha4_mxfp6", True, "mxfp6", "mxfp6_fp6_p"),
+    "mha4_f6f4_sol": ("mha4_f6f4", True, "mxfp6", "mxfp4_fp6_p"),
     "mha4_mxfp4_sol": ("mha4_mxfp4", True, "mxfp4", "mxfp4_fp6_p"),
 }
 
@@ -1049,6 +1072,26 @@ def sol_flops_from_lut(
     return exact_flops + total_dense_flops / block_n, total_dense_flops
 
 
+def row_sparse_flops(
+    args: argparse.Namespace,
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    sol_out: dict[str, Any] | None,
+    shape: ShapeSpec,
+) -> float | None:
+    """The useful FLOPs of one timed row, or None when it ran dense.
+
+    A Sol-Attn row is charged for the LUT its plan returned, not the one handed in: the plan forces
+    short tail blocks into the exact pass, and the pooled sweep runs even when that LUT is empty.
+    """
+    if sol_out is not None and "block_lut" in sol_out:
+        return sol_flops_from_lut(args.kernel, sol_out["block_lut"], shape)[0]
+    if block_lut is not None:
+        return sparse_flops_from_lut(
+            args.kernel, block_lut, shape, args.mha4_block_tile
+        )[0]
+    return None
+
+
 def fp8_quantize(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1068,11 +1111,15 @@ def cancel_internal_qk_rotation(
     q: torch.Tensor, k: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pre-rotate Q/K so a fused production Hadamard quantizer emits raw-domain Q/K."""
-    q_rotated = torch.empty_like(q)
-    k_rotated = torch.empty_like(k)
-    rotate_activation_hd128(q_rotated, q)
-    rotate_activation_hd128(k_rotated, k)
-    return q_rotated, k_rotated
+
+    def rotate(x: torch.Tensor) -> torch.Tensor:
+        # The hd256 producers rotate each 128-wide half as its own head, so cancel per half.
+        rows = x.reshape(*x.shape[:-2], -1, 128)
+        rotated = torch.empty_like(rows)
+        rotate_activation_hd128(rotated, rows)
+        return rotated.reshape(x.shape)
+
+    return rotate(q), rotate(k)
 
 
 def rotate_qk_blocks(
@@ -1218,7 +1265,8 @@ def make_fav3_fp8_runner(
 
 def _mha_v4_packed_sparse_kwargs(
     block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
-) -> dict[str, torch.Tensor]:
+    block_tile: tuple[int, int],
+) -> dict[str, Any]:
     if block_lut is None:
         return {}
     kv_block_indices, lut_start, lut_count = block_lut
@@ -1226,6 +1274,7 @@ def _mha_v4_packed_sparse_kwargs(
         "kv_block_indices": kv_block_indices,
         "lut_start": lut_start,
         "lut_count": lut_count,
+        "block_tile": block_tile,
     }
 
 
@@ -1251,25 +1300,26 @@ def _sol_packed_kwargs(
     operands -- needed for the packed recipes, whose stored codes are neither element addressable
     nor pooled from what the kernel reads.
     """
-    quant_q, quant_k, quant_v, _, k_descale, _ = tensors[:6]
-    _, k_needs_pooled_scale, packed_format, v_packed_format = SOL_KERNELS[kernel]
+    quant_q, quant_k, quant_v, q_descale, k_descale, _ = tensors[:6]
+    _, qk_block_scaled, packed_format, v_packed_format = SOL_KERNELS[kernel]
     q_source, k_source, v_source = sources
-    block_m, block_n = kernel_block_sizes(kernel)
+    block_tile = kernel_block_sizes(kernel)
 
     plan = sol_prepare(
         q_source if packed_format is not None else quant_q,
         quant_k,
         quant_v,
         beta=beta if block_mask is None else None,
+        BLOCK_M=block_tile[0],
+        BLOCK_N=block_tile[1],
         num_heads=quant_q.shape[2],
-        k_scale=k_descale if k_needs_pooled_scale and packed_format is None else None,
+        k_scale=k_descale if qk_block_scaled and packed_format is None else None,
+        q_scale=q_descale if qk_block_scaled and packed_format is None else None,
         k_source=k_source if packed_format is not None else None,
-        v_source=v_source if packed_format is not None else None,
+        v_source=v_source if v_packed_format is not None else None,
         k_packed_format=packed_format,
         v_packed_format=v_packed_format,
         block_attn_mask=block_mask,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
     )
     return {
         "kv_block_indices": plan["kv_block_indices"],
@@ -1280,6 +1330,7 @@ def _sol_packed_kwargs(
         "block_bitmap": plan["block_bitmap"],
         "mean_k_scale": plan["mean_k_scale"],
         "mean_v_scale": plan["mean_v_scale"],
+        "block_tile": block_tile,
     }
 
 
@@ -1330,16 +1381,22 @@ def _make_kernel_runner_impl(
     i8fp8_scale_modes = scale_modes_for_formats(
         AttentionFormat.INT8, AttentionFormat.INT8, fp8_format
     )
-    packed_sparse = _mha_v4_packed_sparse_kwargs(block_lut)
+    # The LUT was cut at kernel_block_sizes(), and mha_v4_packed cannot tell a LUT's block size
+    # from its contents, so it is told that same tile.
+    packed_sparse = (
+        _mha_v4_packed_sparse_kwargs(
+            block_lut, kernel_block_sizes(args.kernel, args.mha4_block_tile)
+        )
+        if args.kernel.startswith("mha4_")
+        else {}
+    )
     raw_sparse = (
         {"block_mask": block_mask}
         if block_lut is not None and block_mask is not None
         else {}
     )
-    if args.mha4_block_tile is not None:
-        for sparse in (packed_sparse, raw_sparse):
-            if sparse:
-                sparse["block_tile"] = args.mha4_block_tile
+    if args.mha4_block_tile is not None and raw_sparse:
+        raw_sparse["block_tile"] = args.mha4_block_tile
 
     # A Sol-Attn kernel reuses another row's quantization wholesale and differs only in what is
     # appended to the launch, so the branches below dispatch on the base name.
@@ -1355,10 +1412,15 @@ def _make_kernel_runner_impl(
             return mha_v4_packed(*tensors, **packed_sparse, **kwargs)
         extra = sol_cache.get("kwargs")
         if extra is None:
+            q_source, k_source = q_bshd, k_bshd
+            if SOL_KERNELS[sol_kernel][2] is not None and not args.hadamard_rotate:
+                # A packed row's fused quantizer rotates Q and K, so its exact operands come from
+                # the pre-rotated pair; routing and pooling must see that same pair.
+                q_source, k_source = cancel_internal_qk_rotation(q_bshd, k_bshd)
             extra = _sol_packed_kwargs(
                 sol_kernel,
                 tensors,
-                (q_bshd, k_bshd, v_bshd),
+                (q_source, k_source, v_bshd),
                 args.beta,
                 block_mask,
             )
@@ -1527,7 +1589,60 @@ def _make_kernel_runner_impl(
             return_attn_probs=False,
         )
 
+    if args.kernel == "aiter_fp8":
+        # Plain per-tensor FP8, deliberately unrotated: xDiT's AITER_FP8 Hadamard-rotates Q/K,
+        # so these two are not the same preprocessing and their accuracy is not comparable.
+        def _fp8_v3(q, k, v):
+            q_fp8, q_descale = quantize_fp8(q)
+            k_fp8, k_descale = quantize_fp8(k)
+            v_fp8, v_descale = quantize_fp8(v)
+            return flash_attn_fp8_pertensor_func(
+                q_fp8,
+                k_fp8,
+                v_fp8,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                causal=args.causal,
+                softmax_scale=softmax_scale,
+            )
+
+        if args.e2e:
+            return lambda: _fp8_v3(q_bshd, k_bshd, v_bshd)
+
+        q_fp8, q_descale = quantize_fp8(q_bshd)
+        k_fp8, k_descale = quantize_fp8(k_bshd)
+        v_fp8, v_descale = quantize_fp8(v_bshd)
+        return lambda: flash_attn_fp8_pertensor_func(
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            causal=args.causal,
+            softmax_scale=softmax_scale,
+        )
+
     if base_kernel == "mha4_bf16":
+        if sol_kernel is not None:
+            # The NONE scale modes leave the descale slots unread, so any tensor holds them.
+            bf16_scale_modes = scale_modes_for_formats(
+                AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16
+            )
+            return lambda: launch_mha_v4_packed(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                AttentionFormat.BF16,
+                AttentionFormat.BF16,
+                AttentionFormat.BF16,
+                *bf16_scale_modes,
+                softmax_scale=softmax_scale,
+            )
         return lambda: launch_mha_v4(
             q_bshd,
             k_bshd,
@@ -1851,9 +1966,9 @@ def _make_kernel_runner_impl(
 
 def to_bshd_output_if_needed(
     out: torch.Tensor,
-    layout: Literal["bshd", "bhsd"],
+    args: argparse.Namespace,
 ) -> torch.Tensor:
-    if layout == "bhsd":
+    if args.layout == "bhsd" and KERNEL_SPECS[args.kernel].follows_layout:
         return out.permute(0, 2, 1, 3).contiguous()
     return out
 
@@ -2070,8 +2185,11 @@ def benchmark_single_case(
 
     if args.report_quality:
         current_primary = primary_output(fn())
-        current_primary = to_bshd_output_if_needed(current_primary, args.layout)
-        ref_primary = make_reference_output(args, q, k, v, block_attn_mask)
+        current_primary = to_bshd_output_if_needed(current_primary, args)
+        # Sol-Attn approximates the blocks it leaves out instead of dropping them, so its
+        # reference is full attention whether the selection was routed or supplied.
+        reference_mask = None if args.kernel in SOL_KERNELS else block_attn_mask
+        ref_primary = make_reference_output(args, q, k, v, reference_mask)
         report_quality_against_reference(args, current_primary, ref_primary)
 
     total_flops = (
@@ -2088,13 +2206,7 @@ def benchmark_single_case(
         *benchmark_payload_bytes(args, q, k, v),
     )
 
-    sparse_flops = None
-    if sol_out is not None and "block_lut" in sol_out:
-        sparse_flops, _ = sol_flops_from_lut(args.kernel, sol_out["block_lut"], shape)
-    elif block_lut is not None:
-        sparse_flops, _ = sparse_flops_from_lut(
-            args.kernel, block_lut, shape, args.mha4_block_tile
-        )
+    sparse_flops = row_sparse_flops(args, block_lut, sol_out, shape)
 
     if provider == "time(ms)":
         return ms
@@ -2545,16 +2657,19 @@ def run_block_sparse_repetitions(
         ).to(torch.bool)
         lut = block_attn_mask_to_ragged_lut(mask, return_none_if_dense=True)
 
-        fn = make_kernel_runner(args, q, k, v, block_lut=lut, block_mask=mask)
+        sol_out: dict[str, Any] | None = {} if args.kernel in SOL_KERNELS else None
+        fn = make_kernel_runner(
+            args, q, k, v, block_lut=lut, block_mask=mask, sol_out=sol_out
+        )
         ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
         latencies_ms.append(ms)
 
         dense_tflops = (total_flops / (ms * 1e-3)) / 1e12
         tflops_dense.append(dense_tflops)
 
-        sparse_flops, _ = sparse_flops_from_lut(
-            args.kernel, lut, shape, args.mha4_block_tile
-        )
+        sparse_flops = row_sparse_flops(args, lut, sol_out, shape)
+        if sparse_flops is None:
+            sparse_flops = total_flops
         effective_tflops = (sparse_flops / (ms * 1e-3)) / 1e12
         tflops_effective.append(effective_tflops)
 
@@ -2942,7 +3057,7 @@ def benchmark_all_kernel_row(
         ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
         tflops = total_flops / ms * 1e-9
         current_primary = primary_output(fn())
-        current_primary = to_bshd_output_if_needed(current_primary, args.layout)
+        current_primary = to_bshd_output_if_needed(current_primary, args)
         accuracy = compute_accuracy_metrics(current_primary, ref_primary)
         return AllKernelRow(kernel_name, ms, tflops, accuracy)
     finally:

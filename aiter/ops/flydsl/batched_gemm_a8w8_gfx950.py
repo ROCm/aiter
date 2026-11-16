@@ -33,7 +33,7 @@ from torch import Tensor
 
 from aiter import logger
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.utility.graph_alloc import persistent_alloc
+from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 from .kernels.bmm_a8w8_mxscale_gfx950 import (
     SCALE_BLOCKS,
@@ -234,7 +234,7 @@ def _x_scale_column_major(m: int, x_scale_transposed: bool) -> bool:
 _SPLIT_COUNTERS = 1 << 16
 
 
-@functools.cache
+@capture_scoped_cache
 def _split_counters(device: int, stream: int) -> Tensor:
     with persistent_alloc(torch.device("cuda", device)):
         return torch.zeros(_SPLIT_COUNTERS, dtype=torch.int32, device=device)

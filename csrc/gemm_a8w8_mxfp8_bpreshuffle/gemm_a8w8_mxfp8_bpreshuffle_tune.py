@@ -4,9 +4,15 @@
 
 gfx950 runs two FlyDSL pipelines on unshuffled row-major scales (x_scale
 [M, K/32], w_scale [N, K/32]): the mxpsh kernel and the 8-wave 256x256 one
-(ids from 1_000_000). Every candidate of both that fits the shape is timed and
-the fastest lands in the same table the gfx1250 rows live in, keyed by gfx and
-w_scale_block (1x32: a shape list without the column is one):
+(ids from 1_000_000). Every candidate of both that fits the shape is timed,
+and so is the batched GEMM at B = 1 (bmm, on the same scales). Its candidates
+are the tuned bmm kernels of the shape's N and K at M/2..2M in this table and
+in gemm_a8w8_blockscale_bpreshuffle's e8m0 table (any block), else that
+table's bmm kernels of any N and K at those M, plus the heuristic pick and
+their split-K neighbours. The fastest lands in the same
+table the gfx1250 rows live in, keyed by gfx and w_scale_block (1x32: a shape
+list without the column is one); a bmm row's kernelId is "bmm", which
+gemm_a8w8_mxfp8_bpreshuffle runs as the batched GEMM:
 
     python3 csrc/gemm_a8w8_mxfp8_bpreshuffle/gemm_a8w8_mxfp8_bpreshuffle_tune.py \\
         -i aiter/configs/a8w8_mxfp8_bpreshuffle_untuned_gemm.csv \\
@@ -225,6 +231,40 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             "kernelId names the backend, mxfp8 or bmm.",
         )
 
+    def _bmm_seeds_mxfp8(self):
+        """bmm seeds of a gfx950 1x32 shape in this op's table: ({(N, K):
+        [(M, kernelName)]}, [(M, kernelName)]). The first holds the tuned bmm
+        rows of this table and of gemm_a8w8_blockscale_bpreshuffle's e8m0 one
+        (any w_scale block: a bmm kernelName runs on every block its config
+        admits), the second every such row of the e8m0 table, the pool a shape
+        without rows of its own N and K draws on."""
+        from aiter.jit.core import AITER_CONFIGS
+
+        gfx, cu_num = self.get_gfx(), self.get_cu_num()
+        by_nk, pool = {}, []
+        for path, is_mxfp8 in (
+            (AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE, True),
+            (
+                AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE,
+                False,
+            ),
+        ):
+            try:
+                df = pd.read_csv(path)
+            except (OSError, pd.errors.EmptyDataError):
+                continue
+            df = df[
+                (df["gfx"] == gfx)
+                & (df["cu_num"] == cu_num)
+                & (df["kernelId"].astype(str) == MXSCALE_BMM_KERNEL_ID)
+            ]
+            for r in df.itertuples():
+                seed = (int(r.M), str(r.kernelName))
+                by_nk.setdefault((int(r.N), int(r.K)), []).append(seed)
+                if not is_mxfp8:
+                    pool.append(seed)
+        return by_nk, pool
+
     def _bmm_seeds(self):
         """{(N, K, w_scale_block): [(M, bmm kernelName)]} of the tuned
         gemm_a8w8_blockscale_bpreshuffle table, this arch and CU count."""
@@ -345,6 +385,9 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                 "bpreshuffle's table only: pass --mxscale_table and 128x128 shapes"
             )
         seeds = self._bmm_seeds() if self._mxscale_table else {}
+        # This op's gfx950 1x32 table: bmm joins the mxpsh / 8-wave kernels too.
+        self._bmm_1x32 = gfx == "gfx950" and not self._mxscale_table
+        seeds_nk, seed_pool = self._bmm_seeds_mxfp8() if self._bmm_1x32 else ({}, [])
         for i in range(len(untunedf)):
             M = int(untunedf.loc[i, "M"])
             N = int(untunedf.loc[i, "N"])
@@ -364,12 +407,20 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             )
             run_fn = run_gemm_flydsl_gfx1250 if gfx == "gfx1250" else run_gemm_flydsl
             runs = [(kernel_id, ki.split_k, ki.name, run_fn) for kernel_id, ki in cands]
+            near = None
             if self._mxscale_table and gfx == "gfx950":
                 near = [
                     name
                     for mm, name in seeds.get((N, K, block), ())
                     if M / 2 <= mm <= M * 2
                 ]
+            elif self._bmm_1x32:
+                near = [
+                    name
+                    for mm, name in seeds_nk.get((N, K), ())
+                    if M / 2 <= mm <= M * 2
+                ] or sorted({name for mm, name in seed_pool if M / 2 <= mm <= M * 2})
+            if near is not None:
                 for j, name in enumerate(bmm_candidates(M, N, K, block, near)):
                     from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
                         parse_bmm_kernel_name,
@@ -427,14 +478,18 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             keys, kernelId, splitK, kernelName, libtype = info
             if time in (self.INVALID_TIME, self.INF_TIME):
                 kernelName = "None"
-            elif getattr(self, "_mxscale_table", False) and keys[0] == "gfx950":
+            elif keys[0] == "gfx950" and (
+                getattr(self, "_mxscale_table", False)
+                or getattr(self, "_bmm_1x32", False)
+            ):
                 # gfx1250 rows keep their kernels_list id, as the table's do.
-                kernelId = (
-                    MXSCALE_BMM_KERNEL_ID
-                    # bmm's ids sit between fsk's and the _pf ones
-                    if KERNEL_ID_BASE_BMM <= kernelId < KERNEL_ID_BASE_PF
-                    else MXSCALE_KERNEL_ID
-                )
+                # bmm's ids sit between fsk's and the _pf ones.
+                is_bmm = KERNEL_ID_BASE_BMM <= kernelId < KERNEL_ID_BASE_PF
+                if is_bmm:
+                    kernelId = MXSCALE_BMM_KERNEL_ID
+                elif self._mxscale_table:
+                    kernelId = MXSCALE_KERNEL_ID
+                # This op's table keeps the mxpsh / 8-wave kernelId.
             tflops, bw = self.calculate(el)
             key_dict = dict(zip(self.keys, keys))
             if len(results) == self.topk:

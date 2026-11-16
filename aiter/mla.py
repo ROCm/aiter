@@ -31,6 +31,7 @@ from aiter.ops.attention import (
     _MlaHeadPlanKind,
     mla_ps64_qh128_fp8_asm_fwd,
 )
+from aiter.plugin import route as _route
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
 _FLYDSL_MLA_REDUCE_TARGET_H = 16
@@ -1286,6 +1287,16 @@ def mla_decode_fwd(
             and get_gfx() == "gfx950"
         ):
             mgc = 32
+        # gfx950 fp8 gqa16 qlen1 kernel (a8w8_qh16_qseqlen1) does the same with
+        # SUB_KV=128 tiles.
+        if (
+            nhead == 16
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and max_seqlen_q == 1
+            and get_gfx() == "gfx950"
+        ):
+            mgc = 128
 
         # QH64's BF16 direct-output epilogue does not write LSE. Request FP32
         # partials and merge even a single split when the caller needs LSE.
@@ -2298,6 +2309,7 @@ def mla_prefill_reduce(
 # DSv4 MLA -- additive entry point. Does NOT touch any existing
 #   gqa_ratio=64, sub_Q=64, page_size=1, q_dtype=fp8, kv_dtype=fp8
 # ---------------------------------------------------------------------------
+@_route(op="mla_decode_fwd_v4_nm", version=1)
 def mla_decode_fwd_v4_nm(
     q,  # [total_query_len, num_heads, head_size]   FP8 packed Q+e8m0
     qrope,  # [total_query_len, num_heads, kv_rotary]   BF16
@@ -2664,6 +2676,7 @@ def mla_decode_fwd_v4_nm(
     return logits, attn_lse
 
 
+@_route(op="mla_decode_fwd_v4_nm_ps", version=1)
 def mla_decode_fwd_v4_nm_ps(
     q_packed,  # [N, 128, 512] FP8 packed Q+e8m0
     q_rope,  # [N, 128, 64] BF16

@@ -3,6 +3,7 @@
 
 import functools
 import importlib.util
+import re
 
 import pandas as pd
 import torch
@@ -13,12 +14,82 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ..jit.utils.asm_guard import require_gfx1250_asm
+from ..jit.utils.build_targets import base_gfx_arch
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
 
 _FLYDSL_AVAILABLE = importlib.util.find_spec("flydsl") is not None
+
+
+def _a4w4_fallback_config(row):
+    # Optional CSV columns retain the old choice for unsupported calls / padded M.
+    name = row.get("fallbackKernelName", "")
+    name = name if isinstance(name, str) and name != "0" else ""
+    if name.startswith(("triton_", "flydsl_")):
+        raise ValueError("A4W4 fallbackKernelName must select CK or ASM")
+    split = row.get("fallbackSplitK", 0)
+    return {"kernelName": name, "splitK": 0 if pd.isna(split) else int(split)}
+
+
+@functools.lru_cache(maxsize=1024)
+def _log_a4w4_fallback(m, n, k, dtype, selected, fallback):
+    logger.info(
+        "gemm_a4w4 M:%s N:%s K:%s dtype:%s cannot use configured kernel %s "
+        "for this call or backend availability; using %s",
+        m,
+        n,
+        k,
+        dtype,
+        selected,
+        fallback or "default ASM",
+    )
+
+
+@functools.lru_cache(maxsize=1024)
+def _parse_triton_a4w4_kernel(name):
+    match = re.fullmatch(
+        r"triton_preshuffle_bm(\d+)_bn(\d+)_bk(\d+)_ks(\d+)_w(\d+)_wpe(\d+)"
+        r"(?:_s(\d+)_g(\d+)_mi(\d+))?(?:_cm(cg|ca|none))?",
+        name,
+    )
+    if match is None:
+        raise ValueError(f"Invalid A4W4 Triton kernelName: {name!r}")
+    bm, bn, bk, ks, warps, wpe, stages, group, instr, cache = match.groups()
+    values = tuple(
+        map(int, (bm, bn, bk, ks, warps, wpe, stages or 2, group or 1, instr or 16))
+    )
+    allowed = (
+        (32, 64, 128, 256),
+        (32, 64, 128, 256),
+        (128, 256, 512, 1024),
+        tuple(range(1, 33)),
+        (2, 4, 8),
+        (0, 1, 2, 3, 4),
+        (1, 2, 3, 4),
+        (1, 2, 4, 8, 16, 32),
+        (16, 32),
+    )
+    if any(value not in choices for value, choices in zip(values, allowed)):
+        raise ValueError(f"Unsupported A4W4 Triton parameters: {name!r}")
+    return dict(
+        zip(
+            (
+                "BLOCK_SIZE_M",
+                "BLOCK_SIZE_N",
+                "BLOCK_SIZE_K",
+                "NUM_KSPLIT",
+                "num_warps",
+                "waves_per_eu",
+                "num_stages",
+                "GROUP_SIZE_M",
+                "matrix_instr_nonkdim",
+            ),
+            values,
+        ),
+        cache_modifier=f".{cache}" if cache in ("cg", "ca") else None,
+    )
 
 
 @functools.lru_cache(maxsize=1024)
@@ -70,6 +141,11 @@ def get_GEMM_config(M: int, N: int, K: int):
         )
         config = get_GEMM_config.gemm_dict.get(key, None)
         if config is not None:
+            # New backends are qualified at exact M; keep the old bucket choice.
+            if padded_M != M and str(config["kernelName"]).startswith(
+                ("triton_", "flydsl_")
+            ):
+                config = _a4w4_fallback_config(config)
             if AITER_LOG_TUNED_CONFIG:
                 logger.info(
                     f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE}, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
@@ -163,6 +239,11 @@ def _a4w4_mxscale_config(M: int, N: int, K: int) -> tuple[str, str] | None:
     rows = _load_a4w4_mxscale_tuned(
         AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE_FILE
     )
+    # A0 bring-up: reuse gfx1250 family tuned rows when strict has none.
+    if base_gfx_arch(gfx) != gfx and gfx not in {
+        k[0] for k in rows if isinstance(k, tuple) and k
+    }:
+        gfx = base_gfx_arch(gfx)
     for gl in (None, 0, 1):
         row = rows.get(
             (gfx, cu_num, M if gl is None else get_padded_m(M, N, K, gl), N, K)
@@ -261,6 +342,99 @@ def gemm_a4w4_fake(
     return torch.empty((*A.shape[:-1], n), dtype=dtype, device=A.device)
 
 
+def _gemm_a4w4_preshuffle(A, B, A_scale, B_scale, out, kernel_name):
+    """CSV/tuner adapter for gfx950 MXFP4 with default shuffled 1x32 scales.
+
+    Only views change; no quantization or layout conversion. None means the
+    call is unsupported. Compilation and kernel errors propagate.
+    """
+    name = str(kernel_name)
+    if name.startswith("triton_"):
+        params = dict(_parse_triton_a4w4_kernel(name))
+        output_dtype = dtypes.bf16
+    elif name.startswith("flydsl_"):
+        # The FlyDSL package initializer imports the optional dependency. Check
+        # availability before importing even its otherwise pure name parser.
+        if not _FLYDSL_AVAILABLE:
+            return None
+        from .flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
+            fits_shape,
+            instance_valid,
+            kernelInstance,
+            parse_kernel_name,
+        )
+
+        params = parse_kernel_name(name)
+        if params is None or (params["a_dtype"], params["b_dtype"]) != ("fp4", "fp4"):
+            raise ValueError(f"Invalid A4W4 FlyDSL kernelName: {name!r}")
+        if params["fused_split_k"] or not instance_valid(kernelInstance(**params)):
+            raise ValueError(f"Unsupported A4W4 FlyDSL kernelName: {name!r}")
+        output_dtype = {"bf16": dtypes.bf16, "fp16": dtypes.fp16}[params["out_dtype"]]
+    else:
+        return None
+    m, n, k = A.numel() // A.shape[-1], B.shape[0], A.shape[-1] * 2
+    if not (
+        m >= 32
+        and n % 16 == 0
+        and k % 256 == 0
+        and out.dtype == output_dtype
+        and all(
+            t.is_contiguous() and t.element_size() == 1
+            for t in (A, B, A_scale, B_scale)
+        )
+        and A_scale.ndim == 2
+        and B_scale.ndim == 2
+        and A_scale.shape[-1] == k // 32
+        and B_scale.shape[-1] == k // 32
+        and A_scale.numel() >= ((m + 255) // 256 * 256) * (k // 32)
+        and B_scale.numel() >= ((n + 255) // 256 * 256) * (k // 32)
+    ):
+        return None
+    A2 = A.view(dtypes.u8).view(m, k // 2)
+    B2 = B.view(dtypes.u8)
+    sa, sb = A_scale.view(dtypes.u8), B_scale.view(dtypes.u8)
+    if name.startswith("triton_"):
+        from .triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+
+        gemm_afp4wfp4_preshuffle(
+            A2,
+            B2.view(n // 16, -1),
+            sa.view(-1, sa.shape[-1] * 32),
+            sb.view(-1, sb.shape[-1] * 32),
+            dtype=out.dtype,
+            y=out[:m],
+            config=params,
+        )
+    else:
+        if not fits_shape(
+            kernelInstance(**params),
+            m,
+            n,
+            k,
+            a_scale_block="1x32",
+            b_scale_block="1x32",
+            a_scale_layout="mfma_tile",
+            b_scale_layout="mfma_tile",
+        ):
+            return None
+        from .flydsl.mxscale_preshuffle_kernels import flydsl_mxscale_preshuffle_gemm
+
+        params.pop("out_dtype")
+        flydsl_mxscale_preshuffle_gemm(
+            A2,
+            B2,
+            sa,
+            sb,
+            out[:m],
+            **params,
+            a_scale_block="1x32",
+            b_scale_block="1x32",
+            a_scale_layout="mfma_tile",
+            b_scale_layout="mfma_tile",
+        )
+    return out[:m].view(*A.shape[:-1], n)
+
+
 @torch_compile_guard(gen_fake=gemm_a4w4_fake)
 def gemm_a4w4(
     A: Tensor,  # A:[M, K/2] f4x2
@@ -339,6 +513,30 @@ def gemm_a4w4(
             f"A4W4 GEMM kernel is not supported on gfx942, but got {gfx_arch}!"
         )
     ck_config = get_GEMM_config(m, n, k)
+    if ck_config is not None and str(ck_config["kernelName"]).startswith(
+        ("triton_", "flydsl_")
+    ):
+        if (
+            gfx_arch == "gfx950"
+            and bpreshuffle
+            and not apreshuffle
+            and global_A_scale is None
+            and global_B_scale is None
+            and bias is None
+            and alpha in (None, 1.0)
+            and beta in (None, 0.0)
+        ):
+            result = _gemm_a4w4_preshuffle(
+                A, B, A_scale, B_scale, out, ck_config["kernelName"]
+            )
+            if result is not None:
+                return result
+        fallback = _a4w4_fallback_config(ck_config)
+        if AITER_LOG_TUNED_CONFIG:
+            _log_a4w4_fallback(
+                m, n, k, dtype, ck_config["kernelName"], fallback["kernelName"]
+            )
+        ck_config = fallback
     # splitK = None
     splitK = 0
     kernelName = ""
@@ -347,7 +545,8 @@ def gemm_a4w4(
         kernelName = ck_config["kernelName"]
     if (
         ck_config is not None
-        and kernelName.find("_ZN") == -1
+        and kernelName
+        and not kernelName.startswith("_ZN")
         # or bias is None
     ):
         splitK = 0 if splitK is None else splitK

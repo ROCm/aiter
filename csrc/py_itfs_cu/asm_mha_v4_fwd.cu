@@ -189,7 +189,9 @@ static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_work_table) == 0x2D0);
 // lets the pooled K/V reuse the source descale outright. An E8M0 1x32 scale does vary per token, so
 // those recipes have to pool in dequantized space and requantize, which produces scales of its own
 // that the approximate pass must read instead of K's or V's. Recipes that do not need them leave
-// these slots NULL and keep reading the source scales.
+// these slots NULL and keep reading the source scales. MXFP6 K is the exception among E8M0 Ks:
+// its packer stores every tile's scales inside the tile's own record, so its rows read the pooled
+// scales through mean_k and never touch 0x390 or its strides.
 //
 // A row that declares `jensen` over a K that is not E8M0, whose K-scale slot is therefore idle,
 // reads that slot and its three strides as the optional per-block K variance instead: NULL there
@@ -199,7 +201,8 @@ static_assert(offsetof(FmhaV4SparseSortedKernarg, ptr_work_table) == 0x2D0);
 //
 // An E8M0 K has no idle scale slot and no single unit for a variance, so its jensen row reads the
 // dequantized variance quantized the way mean_k is: codes at 0x420 with mean_k's strides, E8M0
-// scales at 0x430 with mean_k_scale's. NULL codes is the uncorrected pass, as above.
+// scales at 0x430 with mean_k_scale's. An MXFP6 K's variance carries its scales inline as mean_k
+// does, so its rows read 0x420 alone. NULL codes is the uncorrected pass, as above.
 //
 // A row that declares `sorted` also reads ptr_work_table at 0x410: non-NULL, the grid is 1-D and
 // each workgroup takes its (q_tile, head, batch) from the table, heaviest LUT row first; NULL is
@@ -439,6 +442,87 @@ void check_scale_backing_storage(const at::Tensor& descale,
                 "zeroed slack");
 }
 
+// The hd128 64x64 sparse and Sol-Attn MXFP8 and MXFP4 objects read K scales head-major: a run of
+// whole KV tiles per (batch, KV head) at the descale batch and head strides, one E8M0 row per
+// token, so a tile's scales are one contiguous span rather than one cache line per token. The
+// producers write [batch, key_length, key_heads, blocks], which every other object reads as is,
+// the hd256 dense rows' 64-token KV tile included.
+bool reads_head_major_k_scale(const fmha_v4_fwdConfig& cfg)
+{
+    const bool fp8_k = cfg.k_format >= format_id(AttentionFormat::Fp8E4M3) &&
+                       cfg.k_format <= format_id(AttentionFormat::Fp8E5M2Fnuz);
+    return cfg.mode != 0 && cfg.hdim_q == 128 && cfg.ts_kv == 64 &&
+           cfg.k_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32) &&
+           (fp8_k || cfg.k_format == format_id(AttentionFormat::Fp4E2M1));
+}
+
+// One dword per (batch, head, token) of the head-major image, then zeros through the slack: a
+// single launch, so the relayout costs no more launches than the copy it replaces.
+__global__ void head_major_k_scale_kernel(const uint8_t* __restrict__ producer,
+                                          uint32_t* __restrict__ image,
+                                          const int64_t image_dwords,
+                                          const int64_t total_dwords,
+                                          const int64_t sequence,
+                                          const int64_t heads,
+                                          const int64_t padded)
+{
+    const int64_t slot = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if(slot >= total_dwords)
+        return;
+    uint32_t value      = 0;
+    const int64_t token = slot % padded;
+    if(slot < image_dwords && token < sequence)
+    {
+        const int64_t head_run = slot / padded;
+        const uint8_t* row =
+            producer + ((head_run / heads * sequence + token) * heads + head_run % heads) * 4;
+        value = row[0] | row[1] << 8 | row[2] << 16 | static_cast<uint32_t>(row[3]) << 24;
+    }
+    image[slot] = value;
+}
+
+// The producer-layout K scales relaid out for reads_head_major_k_scale() objects. Each head's
+// run is padded to whole KV tiles, and the image is followed by the slack
+// check_scale_backing_storage() demands of a producer tensor; padding and slack are zeroed,
+// since the kernel's speculative tile gathers read into both.
+at::Tensor head_major_k_scale(const at::Tensor& k_descale, int64_t kv_tile)
+{
+    const int64_t batch    = k_descale.size(0);
+    const int64_t sequence = k_descale.size(1);
+    const int64_t heads    = k_descale.size(2);
+    const int64_t blocks   = k_descale.size(3);
+    TORCH_CHECK(blocks == 4 && k_descale.is_contiguous(),
+                "head-major K scales are built from contiguous hd128 E8M0 rows");
+    const int64_t padded = (sequence + kv_tile - 1) / kv_tile * kv_tile;
+    const int64_t slack_rows =
+        (sequence + kKvScaleTileRows - 1) / kKvScaleTileRows * kKvScaleTileRows +
+        kKvScaleLookaheadRows - sequence;
+    const int64_t image = batch * heads * padded * blocks;
+    const int64_t slack = slack_rows * heads * blocks + kKvScaleTrailingDwordSlack;
+
+    at::Tensor storage           = at::empty({image + slack}, k_descale.options());
+    const int64_t total_dwords   = storage.numel() / 4;
+    constexpr int32_t block_size = 256;
+    const dim3 grid(static_cast<uint32_t>((total_dwords + block_size - 1) / block_size));
+    head_major_k_scale_kernel<<<grid, dim3(block_size), 0, at::hip::getCurrentHIPStream()>>>(
+        k_descale.data_ptr<uint8_t>(),
+        reinterpret_cast<uint32_t*>(storage.data_ptr<uint8_t>()),
+        image / 4,
+        total_dwords,
+        sequence,
+        heads,
+        padded);
+    return storage.narrow(0, 0, image)
+        .view({batch, heads, padded, blocks})
+        .narrow(2, 0, sequence)
+        .permute({0, 2, 1, 3});
+}
+
+// The K descale the selected object reads. The caller keeps it alive until the launch is
+// enqueued: a relayout freed earlier could be handed to a later allocation on the same stream.
+at::Tensor launch_k_scale(const fmha_v4_fwdConfig& cfg, const at::Tensor& k_descale)
+{ return reads_head_major_k_scale(cfg) ? head_major_k_scale(k_descale, cfg.ts_kv) : k_descale; }
+
 void check_mx_v_scale_backing_storage(const fmha_v4_fwdConfig& cfg,
                                       const MhaV4Recipe& recipe,
                                       const at::Tensor& v_descale)
@@ -461,6 +545,47 @@ void check_mx_v_scale_backing_storage(const fmha_v4_fwdConfig& cfg,
                 backed,
                 " are backed; allocate it with the aiter.ops.mha_v4_quant producers, which reserve "
                 "zeroed slack");
+}
+
+// The hd128 MXFP6 K packer writes each 128-token tile as one record of codes followed by that
+// tile's E8M0 scales, and the kernels read both from the record. So an MXFP6 K operand has to be a
+// view of such records: a tensor of the right shape with any other backing hands them codes from
+// the wrong rows and scales from whatever follows. The last record's scale read runs past it, into
+// the zeroed slack the packer reserves after the buffer. Mirrors FP6_K_TILE_BYTES and
+// FP6_K_BUFFER_SLACK_BYTES in aiter.ops.triton.quant.mxfp6_fmha_pack.
+constexpr int64_t kMxfp6KTileRows    = 128;
+constexpr int64_t kMxfp6KTileBytes   = 17408;
+constexpr int64_t kMxfp6KRowStride   = kMxfp6KTileBytes / kMxfp6KTileRows;
+constexpr int64_t kMxfp6KBufferSlack = 256;
+
+void check_mxfp6_k_record_storage(const at::Tensor& packed, int64_t rows, const char* name)
+{
+    const int64_t records = (rows + kMxfp6KTileRows - 1) / kMxfp6KTileRows;
+    TORCH_CHECK(packed.stride(3) == 1 && packed.stride(1) == kMxfp6KRowStride &&
+                    packed.stride(2) % kMxfp6KTileBytes == 0 &&
+                    packed.stride(2) >= records * kMxfp6KTileBytes && packed.stride(0) >= 0,
+                name,
+                " must be a view of an MXFP6 K packer buffer: whole ",
+                kMxfp6KTileBytes,
+                "-byte tile records with a ",
+                kMxfp6KRowStride,
+                "-byte row stride, at least ",
+                records,
+                " per head; got strides ",
+                packed.strides());
+    const int64_t required = (packed.size(0) - 1) * packed.stride(0) +
+                             (packed.size(2) - 1) * packed.stride(2) + records * kMxfp6KTileBytes +
+                             kMxfp6KBufferSlack;
+    const int64_t backed   = static_cast<int64_t>(packed.storage().nbytes()) -
+                             packed.storage_offset() * packed.element_size();
+    TORCH_CHECK(backed >= required,
+                name,
+                " needs ",
+                required,
+                " mapped bytes for its tile records and the slack the last scale read runs into, "
+                "but only ",
+                backed,
+                " are backed; pool it with sol_prepare() or pack it with quantize_mxfp6_k");
 }
 
 // Every stride and extent below occupies a 32-bit kernarg slot. Truncating one would not fault; it
@@ -757,6 +882,8 @@ enum LutError : int32_t
     kLutNegative   = 1 << 0,
     kLutOverrun    = 1 << 1,
     kLutIndexRange = 1 << 2,
+    kLutCountRange = 1 << 3,
+    kLutUnordered  = 1 << 4,
 };
 
 __global__ void validate_lut_kernel(const int32_t* __restrict__ lut_start,
@@ -785,6 +912,16 @@ __global__ void validate_lut_kernel(const int32_t* __restrict__ lut_start,
         atomicOr(error, kLutOverrun);
         return;
     }
+    // check_lut_capacity bounds kv_tiles by the row's LUT region, so this is what keeps a row that
+    // repeats indices from overrunning the region it is staged in.
+    if(count > kv_tiles)
+    {
+        atomicOr(error, kLutCountRange);
+        return;
+    }
+    // The kernels finish the first block at or past the partial last one as the masked tail and
+    // stop, so a row must also be ascending: a block listed after it is never visited.
+    int32_t previous = -1;
     for(int32_t i = 0; i < count; ++i)
     {
         const int32_t block = kv_block_indices[start + i];
@@ -793,6 +930,12 @@ __global__ void validate_lut_kernel(const int32_t* __restrict__ lut_start,
             atomicOr(error, kLutIndexRange);
             return;
         }
+        if(block <= previous)
+        {
+            atomicOr(error, kLutUnordered);
+            return;
+        }
+        previous = block;
     }
 }
 
@@ -833,6 +976,14 @@ void validate_lut_contents(const at::Tensor& kv_block_indices,
                 "MHA v4 sparse LUT has a KV block index outside [0, ",
                 kv_tiles,
                 ")");
+    TORCH_CHECK(!(flags & kLutCountRange),
+                "MHA v4 sparse LUT has a lut_count above the key length's ",
+                kv_tiles,
+                " KV blocks");
+    TORCH_CHECK(!(flags & kLutUnordered),
+                "MHA v4 sparse LUT has a row whose KV block indices are not strictly ascending; "
+                "each row lists distinct blocks in order, as block_attn_mask_to_ragged_lut builds "
+                "it");
 }
 
 void populate_dense_kernarg(FmhaV4Kernarg& args,
@@ -1100,6 +1251,20 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
             "MX K descale must have shape [batch, key_length, key_heads, ",
             blocks_per_row,
             "]");
+        // No object reads a descale's token stride, and only the head-major K objects read its
+        // batch and head strides -- from the copy head_major_k_scale() makes, not from this tensor.
+        // The rest derive every scale address from the head counts. hd128 MXFP6 K reads its
+        // scales from the packed records instead, so its descale is never dereferenced.
+        TORCH_CHECK(q_descale.is_contiguous(),
+                    "MX Q descale must be contiguous [batch, query_length, query_heads, ",
+                    blocks_per_row,
+                    "], as the aiter.ops.mha_v4_quant producers write it");
+        TORCH_CHECK(
+            k_descale.is_contiguous() ||
+                (recipe.k_format == format_id(AttentionFormat::Fp6E2M3) && shapes.head_dim == 128),
+            "MX K descale must be contiguous [batch, key_length, key_heads, ",
+            blocks_per_row,
+            "], as the aiter.ops.mha_v4_quant producers write it");
         check_scale_backing_storage(q_descale,
                                     shapes.seqlen_q,
                                     shapes.nhead_q,
@@ -1231,13 +1396,14 @@ void fmha_v4_fwd(const at::Tensor& q,
     const auto& cfg =
         find_config(arch, recipe, /*mode=*/0, shapes.head_dim, /*ts_qo=*/0, /*ts_kv=*/0);
 
+    const at::Tensor k_scale = launch_k_scale(cfg, k_descale);
     FmhaV4Kernarg args{};
     populate_dense_kernarg(args,
                            q,
                            k,
                            v,
                            q_descale,
-                           k_descale,
+                           k_scale,
                            v_descale,
                            out,
                            cfg,
@@ -1383,13 +1549,14 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
     auto work_table       = build_sorted_work_table(
         count, shapes.batch, shapes.nhead_q, q_tiles, order, 1, promote_count(order, kv_tiles));
 
+    const at::Tensor k_scale = launch_k_scale(cfg, k_descale);
     FmhaV4SparseSortedKernarg args{};
     populate_dense_kernarg(args.dense,
                            q,
                            k,
                            v,
                            q_descale,
-                           k_descale,
+                           k_scale,
                            v_descale,
                            out,
                            cfg,
@@ -1527,10 +1694,9 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
                 "kv_block_indices must be non-empty; the sparse kernels dereference the row base "
                 "even for a row that selects no KV block");
 
-    // The pooled tensors are K and V with seqlen -> num_kv_blocks, in the SOURCE quantized dtype,
-    // so the approximate pass reuses q/k/v_descale unchanged. That identity is what keeps the
-    // per-tensor recipes free; a block-granular scale mode would need its own pooled scales, which
-    // is why only per-tensor rows carry a mode-2 manifest entry today.
+    // The pooled tensors are K and V with seqlen -> num_kv_blocks, in the SOURCE quantized dtype
+    // and packing. A per-tensor or per-channel descale survives pooling, so those recipes reuse
+    // q/k/v_descale unchanged; the E8M0 ones bring pooled scales of their own, checked below.
     TORCH_CHECK(mean_k.is_cuda() && mean_v.is_cuda() && block_bitmap.is_cuda(),
                 "Sol-Attn pooled tensors and bitmap must be GPU tensors");
     TORCH_CHECK(mean_k.device() == q.device() && mean_v.device() == q.device() &&
@@ -1568,19 +1734,28 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
                 "]");
     TORCH_CHECK(block_bitmap.is_contiguous(), "block_bitmap must be contiguous");
 
-    // Whether an operand needs a pooled scale is decided by its scale mode, not by the caller: an
-    // E8M0 1x32 scale varies along the axis pooling reduces, so that operand had to be pooled in
-    // dequantized space and requantized, and the approximate pass must read the scale that came out
-    // of that rather than the source one. Anything that does not vary along the sequence axis
-    // survives pooling untouched, so passing a pooled scale for it would describe a read the kernel
-    // never performs.
-    const bool k_needs_pooled_scale =
-        k_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32);
+    // Whether an operand needs a pooled scale is decided by its scale mode and packing, not by the
+    // caller: an E8M0 1x32 scale varies along the axis pooling reduces, so that operand had to be
+    // pooled in dequantized space and requantized, and the approximate pass must read the scale
+    // that came out of that rather than the source one. Anything that does not vary along the
+    // sequence axis survives pooling untouched, so passing a pooled scale for it would describe a
+    // read the kernel never performs. An MXFP6 K is the exception: its packer puts the requantized
+    // scales inside mean_k's tile records, which is where its rows read them, so what has to be
+    // right there is mean_k's backing. Its separate scale image is the readable copy that
+    // sol_jensen_cap and sol_tilt_planes work from; the launch accepts it and ignores it.
+    const bool k_block_scaled  = k_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32);
+    const bool k_scales_inline = k_block_scaled && k_format == format_id(AttentionFormat::Fp6E2M3);
+    const bool k_needs_pooled_scale = k_block_scaled && !k_scales_inline;
     const bool v_needs_pooled_scale =
         v_scale_mode == scale_mode_id(AttentionScaleMode::E8M0Per1x32);
-    TORCH_CHECK(mean_k_scale.has_value() == k_needs_pooled_scale,
-                "Sol-Attn needs mean_k_scale exactly when K's scale mode is E8M0_PER_1X32; K's is ",
+    TORCH_CHECK(k_scales_inline || mean_k_scale.has_value() == k_needs_pooled_scale,
+                "Sol-Attn needs mean_k_scale exactly when K's scale mode is E8M0_PER_1X32 and K "
+                "is not MXFP6; K's scale mode is ",
                 k_scale_mode);
+    if(k_scales_inline)
+    {
+        check_mxfp6_k_record_storage(mean_k, bitmap_groups * blocks_per_tile, "mean_k");
+    }
     TORCH_CHECK(mean_v_scale.has_value() == v_needs_pooled_scale,
                 "Sol-Attn needs mean_v_scale exactly when V's scale mode is E8M0_PER_1X32; V's is ",
                 v_scale_mode);
@@ -1660,6 +1835,16 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
             TORCH_CHECK(vs.sizes() == ks.sizes() && vs.strides() == ks.strides(),
                         "mean_k_var_scale must have mean_k_scale's shape and strides");
         }
+        else if(k_scales_inline)
+        {
+            // Packed like mean_k, scales inline, and read through mean_k's addressing from its own
+            // base alone, so mean_k_var_scale is ignored as mean_k_scale is.
+            TORCH_CHECK(kvar.scalar_type() == mean_k.scalar_type(),
+                        "mean_k_var must have mean_k's dtype");
+            TORCH_CHECK(kvar.strides() == mean_k.strides(),
+                        "mean_k_var must have mean_k's strides");
+            check_mxfp6_k_record_storage(kvar, bitmap_groups * blocks_per_tile, "mean_k_var");
+        }
         else
         {
             // The kernel reads the variance with mean_k's block stride; only its base and
@@ -1712,13 +1897,14 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
                                              promote_count(order, kv_tiles));
     }
 
+    const at::Tensor k_scale = launch_k_scale(cfg, k_descale);
     FmhaV4SolKernarg args{};
     populate_dense_kernarg(args.dense,
                            q,
                            k,
                            v,
                            q_descale,
-                           k_descale,
+                           k_scale,
                            v_descale,
                            out,
                            cfg,
@@ -1761,7 +1947,7 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
     // Left NULL for the per-tensor recipes, which is what keeps their scale reads on the source
     // image. s_mean_v_scale_* stay unset on purpose: no recipe reads them, since the packed V-scale
     // image needs only a base pointer.
-    if(mean_k_scale.has_value())
+    if(k_needs_pooled_scale)
     {
         const auto& ks                  = mean_k_scale.value();
         args.ptr_mean_k_scale.value     = ks.data_ptr();
@@ -1773,10 +1959,13 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
     {
         args.ptr_mean_v_scale.value = mean_v_scale.value().data_ptr();
     }
-    if(mean_k_var_scale.has_value())
+    if(mean_k_var.has_value() && k_block_scaled)
     {
-        args.ptr_mean_k_var.value       = mean_k_var.value().data_ptr();
-        args.ptr_mean_k_var_scale.value = mean_k_var_scale.value().data_ptr();
+        args.ptr_mean_k_var.value = mean_k_var.value().data_ptr();
+        if(k_needs_pooled_scale)
+        {
+            args.ptr_mean_k_var_scale.value = mean_k_var_scale.value().data_ptr();
+        }
     }
     else if(mean_k_var.has_value())
     {

@@ -51,14 +51,16 @@ def _operands(batch, seqlen_q, seqlen_k, nhead_q, nhead_kv, d=128, seed=0):
     near-uniform proxy, which would let a broken threshold still look plausible.
     """
     torch.manual_seed(seed)
-    walk = torch.randn(batch, seqlen_k, nhead_kv, d, device="cuda") / (seqlen_k**0.5)
+    walk = torch.randn(
+        batch, seqlen_k, nhead_kv, d, dtype=torch.float32, device="cuda"
+    ) / (seqlen_k**0.5)
     traj = walk.cumsum(dim=1)
     traj = traj / traj.norm(dim=-1, keepdim=True).clamp(min=1e-6)
     amp = 2.0 * (d**0.5)
 
-    q = torch.randn(batch, seqlen_q, nhead_q, d, device="cuda")
-    k = torch.randn(batch, seqlen_k, nhead_kv, d, device="cuda")
-    v = torch.randn(batch, seqlen_k, nhead_kv, d, device="cuda")
+    q = torch.randn(batch, seqlen_q, nhead_q, d, dtype=torch.float32, device="cuda")
+    k = torch.randn(batch, seqlen_k, nhead_kv, d, dtype=torch.float32, device="cuda")
+    v = torch.randn(batch, seqlen_k, nhead_kv, d, dtype=torch.float32, device="cuda")
     q_traj = (
         torch.nn.functional.interpolate(
             traj.permute(0, 2, 3, 1).reshape(batch * nhead_kv, d, seqlen_k),
@@ -226,23 +228,27 @@ def test_empty_row_rule_matches_the_guarded_form():
     """The unconditional empty-row term is equivalent to the `if empty.any()` version it replaced.
 
     Guarding it saved nothing but a cheap elementwise op, and cost a device sync and a graph break.
-    A flat proxy is constructed here so that the rule actually fires: with an all-equal proxy row
-    nothing exceeds mean + beta * std, so every row is empty and must fall back to its argmax.
+    The proxy row here is built so that the rule actually fires and has one right answer: block 0
+    sits far below the rest, which lifts mean + beta * std above every block, while block 5 stays
+    the unique maximum. Every row is then empty and must fall back to block 5.
     """
     batch, nhead, tiles, blocks, d = 1, 2, 3, 16, 128
-    q_mean = torch.ones(batch, tiles, nhead, d, device="cuda")
-    k_mean = torch.ones(batch, blocks, nhead, d, device="cuda")
-    k_mean[:, 5] += 1e-3  # one block wins the argmax
+    q_mean = torch.ones(batch, tiles, nhead, d, device="cuda", dtype=torch.float32)
+    k_mean = torch.ones(batch, blocks, nhead, d, device="cuda", dtype=torch.float32)
+    k_mean[:, 0] = 0.0  # proxy 0 against ~128: inflates the std past every block
+    k_mean[:, 5] += 1e-3  # still the unique argmax, ~0.26 std above the mean
 
-    selected = _sol_attn_route(q_mean, k_mean, BETA, partial_tail=False)
-    assert int(selected.sum(-1).min()) >= 1, "flat proxy must fall back to argmax"
-    assert bool(selected[..., 5].all()), "fallback must keep the highest-proxy block"
-
-    proxy = torch.einsum("bihd,bjhd->bhij", q_mean.float(), k_mean.float())
+    proxy = torch.einsum("bihd,bjhd->bhij", q_mean, k_mean)
     guarded = proxy > (
         proxy.mean(-1, keepdim=True)
         + BETA * proxy.std(-1, unbiased=False, keepdim=True)
     )
+    assert not bool(guarded.any()), "the threshold alone must clear every row"
+
+    selected = _sol_attn_route(q_mean, k_mean, BETA, partial_tail=False)
+    assert bool((selected.sum(-1) == 1).all()), "an empty row keeps exactly one block"
+    assert bool(selected[..., 5].all()), "fallback must keep the highest-proxy block"
+
     empty = ~guarded.any(dim=-1, keepdim=True)
     if bool(empty.any()):  # the host branch that used to be here
         guarded = guarded | (
@@ -456,7 +462,15 @@ def test_a_supplied_mask_replaces_routing_and_leaves_pooling_alone(
 
     torch.manual_seed(7)
     supplied = (
-        torch.rand(batch, nhead_q, num_q_tiles, num_kv_blocks, device="cuda") > 0.5
+        torch.rand(
+            batch,
+            nhead_q,
+            num_q_tiles,
+            num_kv_blocks,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        > 0.5
     )
     prep = sol_prepare(q, k, v, block_attn_mask=supplied)
 
@@ -503,14 +517,14 @@ def test_a_supplied_mask_and_beta_are_exclusive():
 
 
 @pytest.mark.parametrize(
-    "mask, message",
+    "shape, dtype, message",
     [
-        (torch.zeros(1, 2, 1, 2, dtype=torch.bool), "block_attn_mask must be"),
-        (torch.zeros(1, 2, 2, 3, dtype=torch.bool), "block_attn_mask must be"),
-        (torch.zeros(1, 2, 2, 2, dtype=torch.uint8), "must be bool"),
+        ((1, 2, 1, 2), torch.bool, "block_attn_mask must be"),
+        ((1, 2, 2, 3), torch.bool, "block_attn_mask must be"),
+        ((1, 2, 2, 2), torch.uint8, "must be bool"),
     ],
 )
-def test_a_supplied_mask_is_shape_and_dtype_checked(mask, message):
+def test_a_supplied_mask_is_shape_and_dtype_checked(shape, dtype, message):
     """A wrongly shaped selection would reshape into the bitmap without complaint.
 
     num_work_items * num_kv_blocks is the only thing the packing arithmetic needs, so a mask that
@@ -518,14 +532,15 @@ def test_a_supplied_mask_is_shape_and_dtype_checked(mask, message):
     to the right total and scramble which block each bit refers to.
     """
     q, k, v = _operands(1, 512, 2 * SOL_ATTN_TS_KV, 2, 2)
+    mask = torch.zeros(shape, dtype=dtype, device="cuda")
     with pytest.raises(ValueError, match=message):
-        sol_prepare(q, k, v, block_attn_mask=mask.cuda())
+        sol_prepare(q, k, v, block_attn_mask=mask)
 
 
 def test_a_supplied_mask_stays_fullgraph_traceable():
     """The supplied-mask branch must not cost the traceability the routed path is built around."""
     q, k, v = _operands(1, 512, 4 * SOL_ATTN_TS_KV, 2, 2)
-    mask = torch.rand(1, 2, 2, 4, device="cuda") > 0.5
+    mask = torch.rand(1, 2, 2, 4, dtype=torch.float32, device="cuda") > 0.5
 
     eager = sol_prepare(q, k, v, block_attn_mask=mask)
     compiled = torch.compile(sol_prepare, fullgraph=True, dynamic=False)(
@@ -615,7 +630,7 @@ def test_error_router_takes_a_device_scale():
         v,
         BETA,
         router="error",
-        routing_scale=torch.tensor([ROUTING_SCALE], device="cuda"),
+        routing_scale=torch.tensor([ROUTING_SCALE], dtype=torch.float32, device="cuda"),
     )
     assert torch.equal(as_float["block_attn_mask"], as_tensor["block_attn_mask"])
 
@@ -776,9 +791,48 @@ def test_k_variance_of_a_block_scaled_k_is_the_dequantized_block_variance():
     assert plain["mean_k_var"] is None and plain["mean_k_var_scale"] is None
 
 
+def _allocated_tail(x):
+    """The bytes of x's allocation past x itself, as uint8."""
+    end = x.storage_offset() * x.element_size() + x.numel() * x.element_size()
+    storage = torch.empty(0, dtype=torch.uint8, device=x.device)
+    storage.set_(x.untyped_storage(), 0, (x.untyped_storage().nbytes(),))
+    return storage[end:]
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
+@pytest.mark.parametrize("kv_tile", [64, SOL_ATTN_TS_KV])
+@pytest.mark.parametrize("seqlen_k", [1023, 2048, 9419])
+def test_pooled_scales_run_zeroed_to_a_whole_scale_tile(seqlen_k, kv_tile, compiled):
+    """The kernels read a pooled E8M0 scale SOL_ATTN_TS_KV rows at a time, at every KV tile.
+
+    At 64x64 a 2048-token K pools to 32 rows, and without the padding the MXFP8 row read 96 rows
+    past the allocation: a memory fault whenever it ended at an unmapped page. The tail is read,
+    never used, so it has to exist and be finite; E8M0 0 is 2^-127.
+    """
+    q, k, v = _operands(1, 512, seqlen_k, 2, 2)
+    k_scale = (
+        122 + torch.randint(0, 6, (*k.shape[:3], k.shape[3] // 32), device="cuda")
+    ).to(torch.uint8)
+    prepare = (
+        torch.compile(sol_prepare, fullgraph=True, dynamic=False)
+        if compiled
+        else sol_prepare
+    )
+    prep = prepare(q, k, v, BETA, 64, kv_tile, k_scale=k_scale, k_variance=True)
+
+    blocks = -(-seqlen_k // kv_tile)
+    for name in ("mean_k_scale", "mean_k_var_scale"):
+        scale = prep[name]
+        assert scale.shape[1] == blocks and scale.is_contiguous(), name
+        tail = _allocated_tail(scale)
+        rows = -(-blocks // SOL_ATTN_TS_KV) * SOL_ATTN_TS_KV - blocks
+        assert tail.numel() >= rows * scale[0, 0].numel(), name
+        assert not tail[: rows * scale[0, 0].numel()].any(), name
+
+
 def test_error_router_compiles_fullgraph_and_matches_eager():
     q, k, v = _operands(1, 9419, 9419, 5, 5)
-    scale = torch.tensor([ROUTING_SCALE], device="cuda")
+    scale = torch.tensor([ROUTING_SCALE], dtype=torch.float32, device="cuda")
     kwargs = {"k_variance": True, "router": "error", "routing_scale": scale}
     eager = sol_prepare(q, k, v, BETA, **kwargs)
     compiled = torch.compile(sol_prepare, fullgraph=True, dynamic=False)(

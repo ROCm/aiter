@@ -216,17 +216,23 @@ def _default_kv_tile(q_format=None, v_format=None, mode=MHA_V4_SPARSE_MODE):
     operand-blind query raises. Defaults to the per-tensor FP8 row, which is what most of the
     tests here build, and takes the formats where a test is parametrized over them.
     """
+    return mha_v4_kv_tile(_default_operands(q_format, v_format), mode)
+
+
+def _default_block_tile(q_format=None, v_format=None, mode=MHA_V4_SPARSE_MODE):
+    """The (q_tile, kv_tile) to name to mha_v4_packed for a LUT cut at _default_kv_tile()."""
+    return mha_v4_block_tile(_default_operands(q_format, v_format), mode)
+
+
+def _default_operands(q_format=None, v_format=None):
     q_format = native_fp8_format() if q_format is None else q_format
     v_format = native_fp8_format() if v_format is None else v_format
-    return mha_v4_kv_tile(
-        mha_v4_operands(
-            q_format,
-            q_format,
-            v_format,
-            *scale_modes_for_formats(q_format, q_format, v_format),
-            _v_pack(q_format, v_format),
-        ),
-        mode,
+    return mha_v4_operands(
+        q_format,
+        q_format,
+        v_format,
+        *scale_modes_for_formats(q_format, q_format, v_format),
+        _v_pack(q_format, v_format),
     )
 
 
@@ -274,6 +280,35 @@ def test_mha_v4_packed_rejects_partial_lut():
             AttentionScaleMode.F32_PER_TENSOR,
             AttentionScaleMode.F32_PER_TENSOR,
             kv_block_indices=dummy,
+        )
+
+
+@parametrize("pooled", [False, True], ids=["sparse", "sol"])
+def test_mha_v4_packed_rejects_a_lut_without_its_block_tile(pooled):
+    """A LUT holds block numbers, not their size: read at another KV tile, a 128-key LUT names
+    the wrong 64-key blocks with every index still in range, so no later check can catch it.
+    The geometry has to come from whoever built the LUT, never from a default that moves with
+    the manifest.
+    """
+    dummy = torch.empty(0)
+    lut = {"kv_block_indices": dummy, "lut_start": dummy, "lut_count": dummy}
+    if pooled:
+        lut.update(mean_k=dummy, mean_v=dummy, block_bitmap=dummy)
+    with expect_raises(ValueError, match="pass the block_tile"):
+        mha_v4_packed(
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            AttentionScaleMode.NONE,
+            AttentionScaleMode.NONE,
+            AttentionScaleMode.NONE,
+            **lut,
         )
 
 
@@ -325,6 +360,7 @@ def test_mha_v4_block_mask_without_a_sparse_row_names_the_recipe():
             kv_block_indices=lut,
             lut_start=lut,
             lut_count=lut,
+            block_tile=(256, 64),
         )
 
 
@@ -962,6 +998,7 @@ def _sparse_fp8_launch(q, k, v, block_mask=None):
             "kv_block_indices": indices,
             "lut_start": start,
             "lut_count": count,
+            "block_tile": _default_block_tile(),
         }
     fp8_format = native_fp8_format()
     return mha_v4_packed(
@@ -1267,6 +1304,7 @@ def test_mha_v4_sparse_rejects_empty_kv_block_indices():
             kv_block_indices=torch.zeros(0, dtype=torch.int32, device=device),
             lut_start=torch.zeros(rows, dtype=torch.int32, device=device),
             lut_count=torch.ones(rows, dtype=torch.int32, device=device),
+            block_tile=_default_block_tile(),
         )
 
 
@@ -1351,6 +1389,7 @@ def test_mha_v4_packed_sparse_rejects_per_batch_key_lengths():
             kv_block_indices=torch.zeros(rows, dtype=torch.int32, device=device),
             lut_start=torch.zeros(rows, dtype=torch.int32, device=device),
             lut_count=torch.ones(rows, dtype=torch.int32, device=device),
+            block_tile=_default_block_tile(),
             seqlens_k=torch.full((1,), 128, dtype=torch.int32, device=device),
         )
 
@@ -1383,6 +1422,7 @@ def test_mha_v4_sparse_bf16_rejects_lut_beyond_lds_capacity():
             kv_block_indices=indices,
             lut_start=row,
             lut_count=row,
+            block_tile=_default_block_tile(bf16, bf16),
         )
 
 
@@ -1401,14 +1441,34 @@ def test_mha_v4_sparse_bf16_rejects_lut_beyond_lds_capacity():
             "negative",
             id="negative_start",
         ),
+        param(
+            "indices = torch.zeros(kv_tiles + 1, device='cuda', dtype=torch.int32); "
+            "start.zero_(); count.fill_(kv_tiles + 1)",
+            "above the key length",
+            id="count_above_kv_tiles",
+        ),
+        param(
+            "indices = torch.zeros(2, device='cuda', dtype=torch.int32); "
+            "start.zero_(); count.fill_(2)",
+            "strictly ascending",
+            id="duplicate_index",
+        ),
+        param(
+            "indices = torch.tensor([1, 0], device='cuda', dtype=torch.int32); "
+            "start.zero_(); count.fill_(2)",
+            "strictly ascending",
+            id="descending_indices",
+        ),
     ],
 )
 def test_mha_v4_sparse_validation_rejects_malformed_lut(mutation, message):
     """Enable opt-in validation before AITER loads, without slowing the parent test process."""
     probe = f"""
+import torch
 from op_tests.test_mha_v4_sparse import (
     AttentionFormat,
     AttentionScaleMode,
+    _default_block_tile,
     _default_kv_tile,
     _sparse_fp8_operands,
     _tile_mask,
@@ -1444,6 +1504,7 @@ mha_v4_packed(
     kv_block_indices=indices,
     lut_start=start,
     lut_count=count,
+    block_tile=_default_block_tile(),
 )
 """
     env = {**os.environ, "AITER_MHA_V4_VALIDATE_LUT": "1"}
@@ -1621,6 +1682,12 @@ class _SolAttnRecipe(NamedTuple):
     @property
     def v_carries_pooled_scale(self) -> bool:
         return self.v_scale_mode == AttentionScaleMode.E8M0_PER_1X32
+
+    @property
+    def k_scales_inline(self) -> bool:
+        """An MXFP6 K's packer stores every tile's scales inside the tile's record, which is where
+        the kernel reads them, so the launch ignores its separate pooled scale image."""
+        return self.qk_format == AttentionFormat.MXFP6
 
     @property
     def v_packed(self) -> str | None:
@@ -2055,6 +2122,7 @@ def _sol_attn_launch(
     k_variance=True.
     """
     recipe = _FP8_SOL_ATTN_RECIPE if recipe is None else recipe
+    block_tile = recipe.block_tile() if block_tile is None else block_tile
     return mha_v4_packed(
         q.quantized,
         k.quantized,
@@ -2691,7 +2759,9 @@ def test_mha_v4_sol_reads_the_pooled_scale_it_was_given():
 def test_mha_v4_sol_pooled_scales_must_match_the_scale_modes(recipe):
     """Which operands need a pooled scale follows from the scale modes, so it is not the caller's
     to choose: supplying one for a per-tensor operand describes a read the kernel never does, and
-    omitting one for a block-granular operand leaves it reading unpooled exponents.
+    omitting one for a block-granular operand leaves it reading unpooled exponents. An MXFP6 K
+    reads its pooled scales from mean_k's records instead, so its slot is neither required nor
+    read; test_mha_v4_sol_mxfp6_k_reads_its_pooled_scales_from_the_records covers it.
     """
     heads = 2
     q, k, v = recipe.operands(sequence_k=8 * recipe.kv_tile(), heads=heads)
@@ -2717,6 +2787,7 @@ def test_mha_v4_sol_pooled_scales_must_match_the_scale_modes(recipe):
             mean_k=plan["mean_k"],
             mean_v=plan["mean_v"],
             block_bitmap=plan["block_bitmap"],
+            block_tile=recipe.block_tile(),
             v_pack=recipe.v_pack,
             **scales,
         )
@@ -2727,11 +2798,170 @@ def test_mha_v4_sol_pooled_scales_must_match_the_scale_modes(recipe):
     # one the plan filled, or to supply one the plan left empty.
     correct = {slot: plan[slot] for slot in ("mean_k_scale", "mean_v_scale")}
     for slot, value in correct.items():
+        if slot == "mean_k_scale" and recipe.k_scales_inline:
+            continue
         wrong = dict(correct)
         wrong[slot] = None if value is not None else plan["mean_k"]
         with expect_raises(RuntimeError, match=slot):
             launch(**wrong)
             torch.cuda.synchronize()
+
+
+def _uint8_storage(x):
+    """x's whole allocation as a flat uint8 tensor."""
+    storage = torch.empty(0, dtype=torch.uint8, device=x.device)
+    storage.set_(x.untyped_storage(), 0, (x.untyped_storage().nbytes(),))
+    return storage
+
+
+def _restrided(backing, like):
+    """`like`'s view, rebuilt over another flat uint8 allocation."""
+    return backing.as_strided(like.shape, like.stride(), like.storage_offset())
+
+
+@parametrize(
+    ("recipe", "block_tile"),
+    [
+        param(*p.values, skip=p.skip or get_gfx() != "gfx950", id=p.id)
+        for p in _sol_attn_geometry_params(
+            [r.id for r in _SOL_ATTN_RECIPES if r.k_scales_inline]
+        )
+    ],
+)
+def test_mha_v4_sol_mxfp6_k_reads_its_pooled_scales_from_the_records(
+    recipe, block_tile
+):
+    """An MXFP6 K's rows read the pooled scales from each tile record of mean_k and mean_k_var.
+
+    So the separate scale images change nothing, while the scales inside the records do, and a
+    mean_k or mean_k_var of the right shape over any other backing is refused rather than read
+    out of place. The Jensen term is on throughout, so the variance's own slot is exercised too.
+    """
+    from aiter.ops.triton.quant import mxfp6_fmha_pack as fp6
+
+    heads = 2
+    q, k, v = recipe.operands(sequence_k=8 * recipe.kv_tile(), heads=heads)
+    plan = recipe.prepare(
+        q, k, v, beta=0.4, heads=heads, block_tile=block_tile, k_variance=True
+    )
+    launch = functools.partial(
+        _sol_attn_launch, q, k, v, recipe=recipe, block_tile=block_tile, jensen=True
+    )
+    baseline = launch(plan)
+    torch.cuda.synchronize()
+    assert torch.isfinite(baseline).all()
+
+    def bumped(scale):
+        return (scale.int() + 1).clamp(max=255).to(torch.uint8)
+
+    for scales in (
+        {"mean_k_scale": None, "mean_k_var_scale": None},
+        {
+            "mean_k_scale": bumped(plan["mean_k_scale"]),
+            "mean_k_var_scale": bumped(plan["mean_k_var_scale"]),
+        },
+    ):
+        assert torch.equal(launch({**plan, **scales}), baseline)
+
+    for name in ("mean_k", "mean_k_var"):
+        storage = _uint8_storage(plan[name])
+        records = storage.numel() // fp6.FP6_K_TILE_BYTES
+        tails = storage.clone()
+        tail = tails[: records * fp6.FP6_K_TILE_BYTES].view(records, -1)
+        tail[:, fp6._K_SCALE_TAIL_OFFSET :] = bumped(
+            tail[:, fp6._K_SCALE_TAIL_OFFSET :]
+        )
+        perturbed = launch({**plan, name: _restrided(tails, plan[name])})
+        torch.cuda.synchronize()
+        assert not torch.equal(
+            perturbed, baseline
+        ), f"{name}'s record scales are not read"
+
+        # A plain copy is the right shape and dtype; only its backing is wrong.
+        with expect_raises(RuntimeError, match=f"{name} must"):
+            launch({**plan, name: plan[name].contiguous()})
+        unslacked = storage[: storage.numel() - fp6.FP6_K_BUFFER_SLACK_BYTES].clone()
+        with expect_raises(RuntimeError, match=f"{name} needs"):
+            launch({**plan, name: _restrided(unslacked, plan[name])})
+
+
+_MX_K_SCALE_PARAMS = [
+    param(*p.values, mode, skip=p.skip or get_gfx() != "gfx950", id=f"{p.id}-{mode}")
+    for p in _sol_attn_geometry_params(["mxfp8", "mxfp4_fp6p"])
+    for mode in ("sparse", "sol")
+]
+
+
+def _mx_k_scale_launch(recipe, q, k, v, plan, block_tile, mode):
+    """The plan's selection through the sparse or the Sol-Attn row of an E8M0 K recipe."""
+    if mode == "sol":
+        return _sol_attn_launch(q, k, v, plan, recipe=recipe, block_tile=block_tile)
+    return mha_v4_packed(
+        q.quantized,
+        k.quantized,
+        v.quantized,
+        q.descale,
+        k.descale,
+        v.descale,
+        recipe.qk_format,
+        recipe.qk_format,
+        recipe.v_format,
+        recipe.qk_scale_mode,
+        recipe.qk_scale_mode,
+        recipe.v_scale_mode,
+        kv_block_indices=plan["kv_block_indices"],
+        lut_start=plan["lut_start"],
+        lut_count=plan["lut_count"],
+        block_tile=recipe.block_tile() if block_tile is None else block_tile,
+        v_pack=recipe.v_pack,
+    )
+
+
+@parametrize(("recipe", "block_tile", "mode"), _MX_K_SCALE_PARAMS)
+def test_mha_v4_mx_k_scales_reach_their_own_head(recipe, block_tile, mode):
+    """Every row reads a KV head's E8M0 K scales from that head's slice of the producer layout.
+
+    The 64x64 MXFP8 and MXFP4 objects read them head-major and the rest token-major, from the
+    same caller tensor, so a layout mismatch reads one head's scales as another's. Doubling head
+    1's K scales has to move head 1's output and leave head 0's bit for bit.
+    """
+    heads = 2
+    q, k, v = recipe.operands(sequence_k=8 * recipe.kv_tile(), heads=heads)
+    plan = recipe.prepare(q, k, v, beta=0.4, heads=heads, block_tile=block_tile)
+    baseline = _mx_k_scale_launch(recipe, q, k, v, plan, block_tile, mode)
+    # In place, so an MXFP4 K scale keeps the producer's slack behind it.
+    k.descale[:, :, 1] = (k.descale[:, :, 1].int() + 1).clamp(max=254).to(torch.uint8)
+    bumped = _mx_k_scale_launch(recipe, q, k, v, plan, block_tile, mode)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(baseline).all()
+    assert torch.equal(
+        bumped[:, :, 0], baseline[:, :, 0]
+    ), "head 1's K scales reached head 0"
+    assert not torch.equal(
+        bumped[:, :, 1], baseline[:, :, 1]
+    ), "head 1's K scales were not read"
+
+
+@parametrize(("recipe", "block_tile", "mode"), _MX_K_SCALE_PARAMS)
+def test_mha_v4_mx_scales_must_be_producer_contiguous(recipe, block_tile, mode):
+    """No object reads a Q or K descale's strides, so a strided scale is refused, not misread.
+
+    A head-major copy has the producer's shape and values, so only the layout check can tell it
+    apart.
+    """
+    heads = 2
+    q, k, v = recipe.operands(sequence_k=8 * recipe.kv_tile(), heads=heads)
+    plan = recipe.prepare(q, k, v, beta=0.4, heads=heads, block_tile=block_tile)
+    operands = {"q": q, "k": k, "v": v}
+    for slot in ("q", "k"):
+        strided = operands[slot].descale.transpose(1, 2).contiguous().transpose(1, 2)
+        assert not strided.is_contiguous()
+        launched = {**operands, slot: operands[slot]._replace(descale=strided)}
+        with expect_raises(
+            RuntimeError, match=f"MX {slot.upper()} descale must be contiguous"
+        ):
+            _mx_k_scale_launch(recipe, *launched.values(), plan, block_tile, mode)
 
 
 def test_mha_v4_sol_rejects_recipes_without_a_manifest_row():

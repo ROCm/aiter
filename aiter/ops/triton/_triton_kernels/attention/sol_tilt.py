@@ -15,12 +15,17 @@ import triton
 import triton.language as tl
 from triton.language.extra.hip import libdevice
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-@triton.jit
+_sol_q_tile_absmax_kernel_repr = make_kernel_repr(
+    "_sol_q_tile_absmax_kernel", ["HAS_SCALE", "ROTATE", "Q_TILE", "HEAD_DIM"]
+)
+
+
+@triton.jit(repr=_sol_q_tile_absmax_kernel_repr)
 def _sol_q_tile_absmax_kernel(
     q_ptr,
     scale_ptr,
-    rot_ptr,
     out_ptr,
     seqlen,
     rot_gain,
@@ -41,7 +46,7 @@ def _sol_q_tile_absmax_kernel(
     """max |q| per (tile, head, dim), stored in out_ptr's dtype.
 
     HAS_SCALE dequantizes by an E8M0 byte per 32 dims first; ROTATE takes |q R| for R = rot_gain
-    times the +-1 matrix at rot_ptr instead of |q|.
+    times the MX packers' hd128 Hadamard matrix, H[i, j] = (-1)^popcount(i & j), instead of |q|.
     """
     rot_gain = tl.cast(rot_gain, tl.float32)
     t = tl.program_id(0)
@@ -59,7 +64,12 @@ def _sol_q_tile_absmax_kernel(
         mask=live,
     )
     if ROTATE:
-        signs = tl.load(rot_ptr + cols[:, None] * HEAD_DIM + cols[None, :])
+        tl.static_assert(HEAD_DIM <= 256)
+        parity = cols[:, None] & cols[None, :]
+        parity ^= parity >> 4
+        parity ^= parity >> 2
+        parity ^= parity >> 1
+        signs = (1 - 2 * (parity & 1)).to(tl.bfloat16)
         x = tl.dot(tl.where(live, x, 0.0).to(signs.dtype), signs) * rot_gain
     else:
         x = x.to(tl.float32)
@@ -80,7 +90,12 @@ def _sol_q_tile_absmax_kernel(
     )
 
 
-@triton.jit
+_sol_q_head_absmax_kernel_repr = make_kernel_repr(
+    "_sol_q_head_absmax_kernel", ["TILE_CHUNK", "HEAD_DIM"]
+)
+
+
+@triton.jit(repr=_sol_q_head_absmax_kernel_repr)
 def _sol_q_head_absmax_kernel(
     tile_ptr,
     out_ptr,
@@ -115,7 +130,20 @@ def _sol_q_head_absmax_kernel(
     )
 
 
-@triton.jit
+_sol_jensen_cap_kernel_repr = make_kernel_repr(
+    "_sol_jensen_cap_kernel",
+    [
+        "HAS_MASK",
+        "HAS_DESCALE",
+        "HAS_VAR_SCALE",
+        "EXPONENT_GAIN",
+        "TILE_CHUNK",
+        "HEAD_DIM",
+    ],
+)
+
+
+@triton.jit(repr=_sol_jensen_cap_kernel_repr)
 def _sol_jensen_cap_kernel(
     qmax_ptr,
     var_ptr,
@@ -252,7 +280,13 @@ def _orthonormalize(x, RANK: tl.constexpr, WIDTH: tl.constexpr, PASSES: tl.const
     return x
 
 
-@triton.jit
+_sol_tilt_factor_kernel_repr = make_kernel_repr(
+    "_sol_tilt_factor_kernel",
+    ["HAS_GAIN", "TO_BF16", "RANK", "WIDTH", "ITERS", "BLOCK_N", "HEAD_DIM"],
+)
+
+
+@triton.jit(repr=_sol_tilt_factor_kernel_repr)
 def _sol_tilt_factor_kernel(
     k_ptr,
     v_ptr,
@@ -367,7 +401,10 @@ def _sol_tilt_factor_kernel(
     tl.store(peak + 1, tl.max(tl.max(tl.where(live, tl.abs(fb), 0.0), 1), 0))
 
 
-@triton.jit
+_sol_tilt_shift_kernel_repr = make_kernel_repr("_sol_tilt_shift_kernel", ["BLOCK"])
+
+
+@triton.jit(repr=_sol_tilt_shift_kernel_repr)
 def _sol_tilt_shift_kernel(
     q_descale_ptr,
     k_descale_ptr,
@@ -427,7 +464,12 @@ def _sol_tilt_shift_kernel(
     tl.store(unit_ptr + 1, b_scale / b_unit)
 
 
-@triton.jit
+_sol_tilt_unit_kernel_repr = make_kernel_repr(
+    "_sol_tilt_unit_kernel", ["A_CODES", "B_CODES", "BLOCK"]
+)
+
+
+@triton.jit(repr=_sol_tilt_unit_kernel_repr)
 def _sol_tilt_unit_kernel(
     q_descale_ptr,
     k_descale_ptr,
@@ -484,7 +526,10 @@ def _sol_tilt_unit_kernel(
     tl.store(unit_ptr + 3, b_scale / (vd * b_unit))
 
 
-@triton.jit
+_sol_tilt_valu_kernel_repr = make_kernel_repr("_sol_tilt_valu_kernel", ["STRIDES"])
+
+
+@triton.jit(repr=_sol_tilt_valu_kernel_repr)
 def _sol_tilt_valu_kernel(
     unit_ptr,
     q_descale_ptr,
@@ -520,7 +565,10 @@ def _sol_tilt_valu_kernel(
     tl.store(out_ptr + 1, sigma.to(tl.int32, bitcast=True))
 
 
-@triton.jit
+_sol_tilt_scaled_kernel_repr = make_kernel_repr("_sol_tilt_scaled_kernel", [])
+
+
+@triton.jit(repr=_sol_tilt_scaled_kernel_repr)
 def _sol_tilt_scaled_kernel(unit_ptr, scale_stride, out_ptr, w_max):
     """A scaled-score kernel's tilt parameters, from _sol_tilt_unit_kernel's units.
 
@@ -539,7 +587,12 @@ def _sol_tilt_scaled_kernel(unit_ptr, scale_stride, out_ptr, w_max):
     tl.store(out_ptr + 2, scale_stride)
 
 
-@triton.jit
+_sol_tilt_pack_kernel_repr = make_kernel_repr(
+    "_sol_tilt_pack_kernel", ["ROUND_K", "HEAD_DIM"]
+)
+
+
+@triton.jit(repr=_sol_tilt_pack_kernel_repr)
 def _sol_tilt_pack_kernel(
     a_ptr,
     b_ptr,
@@ -604,7 +657,10 @@ def _sol_tilt_pack_kernel(
         )
 
 
-@triton.jit
+_sol_tilt_stack_kernel_repr = make_kernel_repr("_sol_tilt_stack_kernel", ["BLOCK"])
+
+
+@triton.jit(repr=_sol_tilt_stack_kernel_repr)
 def _sol_tilt_stack_kernel(
     plane0_ptr, planes_ptr, out_ptr, size, width, BLOCK: tl.constexpr
 ):

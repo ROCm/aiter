@@ -145,6 +145,14 @@ hd256 MXFP6 reuses the hd128 MXFP6 producers the same way, then byte-gathers eac
 hd128 K/V records into two 64-token hd256 records: K 13,312 bytes (row stride 208) with its K-scale
 tail inside the record, V 12,288 bytes (row stride 192), V scales 1,024 bytes per 128 tokens.
 
+E8M0 Q and K descales are contiguous `[B, S, H, D / 32]`, as the producers write them, and the
+launcher rejects any other strides: no kernel reads a descale's token stride, and most derive every
+scale address from the head counts. The hd128 64x64 sparse and Sol-Attn MXFP8 and MXFP4 rows read
+K scales head-major instead, one run of whole 64-token tiles per `(batch, KV head)`, so the
+launcher relays them out on every call into a zeroed buffer with the same slack; callers always
+pass the producer layout. hd128 MXFP6 K carries its scales inside the K records, and its descale
+is not read.
+
 `AttentionPack.DEFAULT` is the canonical V token order. `AttentionPack.V_FOR_FP6_P` selects the V
 token order that FP6-P and FP4-P consumers require, and a row's packing no longer depends on the
 mode: dense and sparse rows for the same recipe select the same pack. Numeric format and consumer
@@ -169,13 +177,22 @@ operands being launched; `mha_v4_kv_tile()` without operands raises where the ro
 than returning a tile the mask may not match.
 
 Packed callers pass all or none of the int32 LUT triple: `kv_block_indices`, `lut_start`, and
-`lut_count`, plus `block_tile` for a non-default geometry. LUT/work-table rows are per query head,
+`lut_count`, and with it the `block_tile` the LUT was built for. It is required: a LUT holds block
+numbers, not their size, so one read at another KV tile attends to the wrong keys with every index
+still in range, and a default that moves with the manifest would do exactly that to an old LUT.
+LUT/work-table rows are per query head,
 including under GQA. Dense uses manifest `mode=0`; sorted sparse uses `mode=1` and a separate
 launcher/code object. A row declaring `ragged_kv` accepts a key length that is not a multiple of
 its KV tile; the others refuse it.
 
+Each LUT row lists distinct KV blocks in ascending order, as `block_attn_mask_to_ragged_lut`
+builds it. The kernels stage a row in a region sized for the key length's blocks, so a row that
+repeats a block can overrun it, and they finish at the partial last block, so a block listed after
+it is never visited.
+
 An empty sparse row is valid and writes a zero output tile. Set `AITER_MHA_V4_VALIDATE_LUT=1` for
-device-side start/count/index validation; it synchronizes and is disabled by default.
+device-side validation of each row's start, count and indices, including that they ascend; it
+synchronizes and is disabled by default.
 
 Dense and sparse code objects may use different reduction schedules. Compare their outputs with a
 strict numerical tolerance or cosine threshold, not bit equality. Comparisons between two launches
@@ -208,11 +225,16 @@ kernel, so pool at `mha_v4_block_tile()`'s answer.
 
 Pooled scales: a per-tensor or per-channel descale survives pooling over the sequence, so BF16,
 BF16/FP8, FP8, and INT8/FP8 leave `mean_k_scale` and `mean_v_scale` unset. An E8M0 1x32 operand
-pools in dequantized space and is requantized, so its pooled scale must be passed: an MX Q/K
-recipe (including MXFP8) passes `mean_k_scale`, and an MX V recipe passes `mean_v_scale`. The
-requirement is checked against the scale modes, because an unset slot means "read the source
-scale", not "error". MXFP6/FP8's V descale is per channel, so it passes `mean_k_scale` only. MX
-operands are not element addressable, so name them in `k_packed_format` / `v_packed_format` and
+pools in dequantized space and is requantized, so its pooled scale must be passed: an MXFP4 or
+MXFP8 K passes `mean_k_scale`, and an MX V recipe passes `mean_v_scale`. The requirement is
+checked against the scale modes, because an unset slot means "read the source scale", not
+"error". An MXFP6 K is the exception: its packer stores each 128-token tile's scales inside the
+tile's record, and the kernel reads the pooled scales from `mean_k`'s and `mean_k_var`'s records,
+so the launch ignores `mean_k_scale` and `mean_k_var_scale` there and checks instead that
+`mean_k` and `mean_k_var` are views of whole records with the packer's 256-byte slack behind
+them. `sol_prepare()` still returns those scale images, which `sol_jensen_cap()` and
+`sol_tilt_planes()` work from. MXFP6/FP8's V descale is per channel, so it passes no pooled scale
+at all. MX operands are not element addressable, so name them in `k_packed_format` / `v_packed_format` and
 pass the pre-quantization tensors as `k_source` / `v_source`; FP6-P V rows take `mxfp4_fp6_p` or
 `mxfp6_fp6_p`, and MXFP6/FP8's FP8 V needs neither. A pooled V keeps V's 128-token packing
 whatever the KV tile, so at 64x64 its scale image covers the pooled rows rounded up to 128.

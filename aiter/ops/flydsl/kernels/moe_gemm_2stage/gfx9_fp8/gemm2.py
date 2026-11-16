@@ -603,7 +603,6 @@ def compile_moe_gemm2(
             def postprocess_store2lds(fragC, ldsc_idx):
                 for fc, fsw in fxh.all_elements(fragC, frag_sorted_weight):
                     fc.store(fc.load() * fsw.load())
-                # A closure helper keeps BF16 rounding in this kernel's JIT cache key.
                 _cvt_f32_to_bf16(fragC, fragC_bf16)
                 fx.copy(copy_atom_, fragC_bf16r, thrv_ldsCt[None, None, None, ldsc_idx])
 

@@ -33,7 +33,7 @@ Usage:
     python bench_sol.py                           # fp8, 720p, Ulysses 1 and 8
     python bench_sol.py --resolution 480p --ulysses 8
     python bench_sol.py --recipe f6f8 mxfp6_fp6p --block-tile all --jensen
-    python bench_sol.py --recipe all --sparsity 0.5 0.8 1.0 --markdown
+    python bench_sol.py --recipe all --sparsity 0.5 0.8 1.0 --markdown sol.md
 """
 
 import argparse
@@ -45,6 +45,7 @@ from typing import NamedTuple
 import torch
 import triton
 
+from aiter import logger
 from aiter.ops.mha_v4 import (
     MHA_V4_SOL_MODE,
     MHA_V4_SPARSE_MODE,
@@ -74,10 +75,7 @@ from aiter.ops.mha_v4 import (
     quantize_v_mxfp4_fp6_p,
     quantize_v_mxfp6_fp6_p,
 )
-from aiter.ops.triton.attention.utils import (
-    block_attn_mask_to_ragged_lut,
-    sol_prepare,
-)
+from aiter.ops.triton.attention.utils import sol_prepare
 
 # Wan 2.2 A14B transformer.
 WAN_HEADS = 40
@@ -250,24 +248,27 @@ def build_recipes():
     }
 
 
-def recipe_block_tiles(recipe: Recipe, requested: list[str]) -> list[tuple[int, int]]:
+def recipe_block_tiles(
+    recipe: Recipe, requested: list[str]
+) -> dict[tuple[int, int], bool]:
     """The geometries to time: the recipe's default, every Sol-Attn one, or those named.
 
-    Each must have both a Sol-Attn row and a sparse row for this recipe, since the point is
-    to time the two over one mask cut to one tile.
+    Each maps to whether it was asked for by name (or as 'default') rather than expanded from
+    'all'. Each must have both a Sol-Attn row and a sparse row for this recipe, since the point
+    is to time the two over one mask cut to one tile.
     """
     operands = recipe.manifest_operands()
     shipped = mha_v4_block_tiles(operands, MHA_V4_SOL_MODE)
-    tiles = []
+    tiles: dict[tuple[int, int], bool] = {}
     for name in requested:
         if name == "all":
-            tiles.extend(shipped)
+            for tile in shipped:
+                tiles.setdefault(tile, False)
         elif name == "default":
-            tiles.append(mha_v4_block_tile(operands, MHA_V4_SOL_MODE))
+            tiles[mha_v4_block_tile(operands, MHA_V4_SOL_MODE)] = True
         else:
             q_tile, kv_tile = (int(x) for x in name.lower().split("x"))
-            tiles.append((q_tile, kv_tile))
-    tiles = list(dict.fromkeys(tiles))
+            tiles[(q_tile, kv_tile)] = True
     for q_tile, kv_tile in tiles:
         sparse_kv_tile = mha_v4_kv_tile_for_q_tile(q_tile, operands, MHA_V4_SPARSE_MODE)
         if (q_tile, kv_tile) not in shipped or sparse_kv_tile != kv_tile:
@@ -332,13 +333,14 @@ def _launch_args(operands):
     return (*operands["tensors"], *recipe.formats, *recipe.scale_modes)
 
 
-def time_point(operands, mask, block_tile, jensen, kv_range_tokens, warmup, rep):
-    """Time the sparse and Sol-Attn launches over one selection.
+def _launches(operands, mask, block_tile, jensen, kv_range_tokens):
+    """Plan one selection and return (plan, sparse, Sol-Attn, Sol-Attn + Jensen or None) launches.
 
     sol_prepare owns the mask it returns -- it forces a short tail block onto the
     exact pass, which the approximate branch's constant full-block factor cannot
-    represent -- so the sparse LUT is built from THAT mask, not the one handed in.
-    Otherwise the two kernels would be timed over selections differing by one block.
+    represent -- so the sparse launch reuses the LUT sol_prepare built from THAT mask,
+    not one built from the mask handed in. Otherwise the two kernels would be timed over
+    selections differing by one block.
     """
     recipe = operands["recipe"]
     _, k_quant, v_quant = operands["tensors"][:3]
@@ -352,9 +354,6 @@ def time_point(operands, mask, block_tile, jensen, kv_range_tokens, warmup, rep)
         k_variance=jensen,
         **operands["prepare_kwargs"],
     )
-    used = plan["block_attn_mask"]
-    kv_idx, lut_start, lut_count = block_attn_mask_to_ragged_lut(used)
-    lut_start, lut_count = lut_start.to(torch.int32), lut_count.to(torch.int32)
 
     launch = functools.partial(
         mha_v4_packed,
@@ -364,13 +363,13 @@ def time_point(operands, mask, block_tile, jensen, kv_range_tokens, warmup, rep)
         block_tile=block_tile,
     )
     sparse = functools.partial(
-        launch, kv_block_indices=kv_idx, lut_start=lut_start, lut_count=lut_count
-    )
-    sol_attn = functools.partial(
         launch,
         kv_block_indices=plan["kv_block_indices"],
         lut_start=plan["lut_start"],
         lut_count=plan["lut_count"],
+    )
+    sol_attn = functools.partial(
+        sparse,
         mean_k=plan["mean_k"],
         mean_v=plan["mean_v"],
         block_bitmap=plan["block_bitmap"],
@@ -378,24 +377,105 @@ def time_point(operands, mask, block_tile, jensen, kv_range_tokens, warmup, rep)
         mean_v_scale=plan["mean_v_scale"],
         kv_range_tokens=kv_range_tokens,
     )
-
-    result = {
-        "density": used.float().mean().item(),
-        "sparse_ms": triton.testing.do_bench(sparse, warmup=warmup, rep=rep),
-        "sol_ms": triton.testing.do_bench(sol_attn, warmup=warmup, rep=rep),
-    }
-    if jensen:
-        sol_jensen = functools.partial(
+    sol_jensen = (
+        functools.partial(
             sol_attn,
             mean_k_var=plan["mean_k_var"],
             mean_k_var_scale=plan["mean_k_var_scale"],
         )
+        if jensen
+        else None
+    )
+    return plan, sparse, sol_attn, sol_jensen
+
+
+def time_point(operands, mask, block_tile, jensen, kv_range_tokens, warmup, rep):
+    """Time the sparse and Sol-Attn launches over one selection."""
+    plan, sparse, sol_attn, sol_jensen = _launches(
+        operands, mask, block_tile, jensen, kv_range_tokens
+    )
+    result = {
+        "density": plan["block_attn_mask"].float().mean().item(),
+        "sparse_ms": triton.testing.do_bench(sparse, warmup=warmup, rep=rep),
+        "sol_ms": triton.testing.do_bench(sol_attn, warmup=warmup, rep=rep),
+    }
+    if sol_jensen is not None:
         result["jensen_ms"] = triton.testing.do_bench(
             sol_jensen, warmup=warmup, rep=rep
         )
-    del sparse, sol_attn, plan, kv_idx, lut_start, lut_count
+    del sparse, sol_attn, sol_jensen, plan
     torch.cuda.empty_cache()
     return result
+
+
+# Keys in the probe launch: a whole number of blocks at every geometry the manifest ships.
+PROBE_TOKENS = 256
+
+
+def unsupported_reason(recipe, block_tile, args):
+    """Why this recipe/tile cannot run the requested sweep, or None if it can.
+
+    The KV range quantum is arithmetic. Whether the row declares kv_range and jensen is asked of
+    the launcher itself, through one Sol-Attn launch over a short sequence: its checks run before
+    the kernel and do not depend on the sequence, so this is the refusal the sweep would otherwise
+    hit part way through.
+    """
+    q_tile, kv_tile = block_tile
+    quantum = KV_RANGE_TILES * kv_tile
+    if args.kv_range_tokens % quantum:
+        return (
+            f"--kv-range-tokens must be a multiple of {KV_RANGE_TILES} KV tiles "
+            f"({quantum} tokens at {q_tile}x{kv_tile})"
+        )
+    if not (args.kv_range_tokens or args.jensen):
+        return None
+    operands = build_operands(PROBE_TOKENS, 1, recipe)
+    mask = torch.zeros(
+        1,
+        1,
+        PROBE_TOKENS // q_tile,
+        PROBE_TOKENS // kv_tile,
+        device="cuda",
+        dtype=torch.bool,
+    )
+    try:
+        _, _, sol_attn, sol_jensen = _launches(
+            operands, mask, block_tile, args.jensen, args.kv_range_tokens
+        )
+        (sol_jensen or sol_attn)()
+        torch.cuda.synchronize()
+    except RuntimeError as error:
+        return str(error).splitlines()[0]
+    finally:
+        del operands, mask
+        torch.cuda.empty_cache()
+    return None
+
+
+def select_tiles(recipes, names, args):
+    """Every recipe/tile pair to time, decided before any input is allocated.
+
+    A pair expanded from 'all' that cannot run the sweep is skipped with its reason, and a recipe
+    left with none is dropped; a pair named explicitly raises instead.
+    """
+    selected = {}
+    for name in names:
+        tiles = []
+        for block_tile, named in recipe_block_tiles(
+            recipes[name], args.block_tile
+        ).items():
+            reason = unsupported_reason(recipes[name], block_tile, args)
+            if reason is None:
+                tiles.append(block_tile)
+            elif named and "all" not in args.recipe:
+                raise ValueError(
+                    f"{name} at {block_tile[0]}x{block_tile[1]} cannot run this sweep: {reason}"
+                )
+            else:
+                logger.info("skipping %s at %dx%d: %s", name, *block_tile, reason)
+        if tiles:
+            selected[name] = tiles
+    return selected
 
 
 def _time_dense(operands, warmup, rep):
@@ -409,9 +489,8 @@ def _time_dense(operands, warmup, rep):
     return triton.testing.do_bench(dense, warmup=warmup, rep=rep)
 
 
-def run_recipe(name, recipe, degree, tokens, args):
+def run_recipe(name, recipe, tiles, degree, tokens, args):
     heads = WAN_HEADS // degree
-    tiles = recipe_block_tiles(recipe, args.block_tile)
     # Mode 1 requires a key length that is a whole number of KV tiles, and Wan's token
     # counts are not (75600 leaves 80 over a 128 tile, 32760 leaves 120). Padding up is
     # what a deployment does regardless, and it also keeps the two kernels honest: a
@@ -424,11 +503,20 @@ def run_recipe(name, recipe, degree, tokens, args):
 
     operands = build_operands(seqlen, heads, recipe)
     dense_ms = _time_dense(operands, args.warmup, args.rep)
-    print(
-        f"\n=== Wan 2.2 self-attn, Ulysses {degree}: "
-        f"{heads} heads x {seqlen} tokens x d{WAN_HEAD_DIM}, {name} ===\n"
-        f"{tokens} real tokens padded to {seqlen}, {dense_flops / 1e12:.1f} TFLOP dense, "
-        f"dense (mode 0) {dense_ms:.4f} ms"
+    logger.info(
+        "=== Wan 2.2 self-attn, Ulysses %d: %d heads x %d tokens x d%d, %s ===",
+        degree,
+        heads,
+        seqlen,
+        WAN_HEAD_DIM,
+        name,
+    )
+    logger.info(
+        "%d real tokens padded to %d, %.1f TFLOP dense, dense (mode 0) %.4f ms",
+        tokens,
+        seqlen,
+        dense_flops / 1e12,
+        dense_ms,
     )
 
     rows = []
@@ -436,11 +524,6 @@ def run_recipe(name, recipe, degree, tokens, args):
         q_tile, kv_tile = block_tile
         num_q_tiles = -(-seqlen // q_tile)
         num_kv_blocks = seqlen // kv_tile
-        if args.kv_range_tokens % (KV_RANGE_TILES * kv_tile):
-            raise ValueError(
-                f"--kv-range-tokens must be a multiple of {KV_RANGE_TILES} KV tiles "
-                f"({KV_RANGE_TILES * kv_tile} tokens at {q_tile}x{kv_tile})"
-            )
         header = (
             f"{'sparsity':>9} {'density':>8} {'sparse(ms)':>11} {'sol-attn(ms)':>13}"
             f" {'delta':>8}"
@@ -448,20 +531,36 @@ def run_recipe(name, recipe, degree, tokens, args):
         if args.jensen:
             header += f" {'+jensen(ms)':>12} {'delta':>8}"
         header += f" {'sol vs dense':>13}"
-        print(
-            f"\n{q_tile}x{kv_tile}: {num_q_tiles} query tiles x {num_kv_blocks} KV blocks"
-            + (
-                f", KV ranges of {args.kv_range_tokens} tokens"
-                if args.kv_range_tokens
-                else ""
+        if args.kv_range_tokens:
+            logger.info(
+                "%dx%d: %d query tiles x %d KV blocks, KV ranges of %d tokens",
+                q_tile,
+                kv_tile,
+                num_q_tiles,
+                num_kv_blocks,
+                args.kv_range_tokens,
             )
-        )
-        print(header)
-        print("-" * len(header))
+        else:
+            logger.info(
+                "%dx%d: %d query tiles x %d KV blocks",
+                q_tile,
+                kv_tile,
+                num_q_tiles,
+                num_kv_blocks,
+            )
+        logger.info("%s", header)
+        logger.info("%s", "-" * len(header))
         for sparsity in args.sparsity:
             torch.manual_seed(int(sparsity * 1000))
             mask = (
-                torch.rand(1, heads, num_q_tiles, num_kv_blocks, device="cuda")
+                torch.rand(
+                    1,
+                    heads,
+                    num_q_tiles,
+                    num_kv_blocks,
+                    device="cuda",
+                    dtype=torch.float32,
+                )
                 > sparsity
             )
             point = time_point(
@@ -476,17 +575,23 @@ def run_recipe(name, recipe, degree, tokens, args):
             del mask
             torch.cuda.empty_cache()
             sparse_ms, sol_ms = point["sparse_ms"], point["sol_ms"]
-            line = (
-                f"{sparsity:>9.1f} {100 * point['density']:>7.1f}% {sparse_ms:>11.4f}"
-                f" {sol_ms:>13.4f} {(sol_ms / sparse_ms - 1) * 100:>+7.1f}%"
-            )
+            line = "%9.1f %7.1f%% %11.4f %13.4f %+7.1f%%"
+            values = [
+                sparsity,
+                100 * point["density"],
+                sparse_ms,
+                sol_ms,
+                (sol_ms / sparse_ms - 1) * 100,
+            ]
             if args.jensen:
-                line += (
-                    f" {point['jensen_ms']:>12.4f}"
-                    f" {(point['jensen_ms'] / sparse_ms - 1) * 100:>+7.1f}%"
-                )
-            line += f" {dense_ms / sol_ms:>12.2f}x"
-            print(line)
+                line += " %12.4f %+7.1f%%"
+                values += [
+                    point["jensen_ms"],
+                    (point["jensen_ms"] / sparse_ms - 1) * 100,
+                ]
+            line += " %12.2fx"
+            values.append(dense_ms / sol_ms)
+            logger.info(line, *values)
             rows.append(
                 {
                     "recipe": name,
@@ -505,8 +610,8 @@ def run_recipe(name, recipe, degree, tokens, args):
     return rows
 
 
-def print_markdown(rows, jensen):
-    """One table over every point, for pasting into a PR description."""
+def write_markdown(rows, jensen, path):
+    """Write one table over every point to `path`, for pasting into a PR description."""
     columns = [
         "recipe",
         "tile",
@@ -520,8 +625,10 @@ def print_markdown(rows, jensen):
     if jensen:
         columns += ["Sol+Jensen ms", "Sol+Jensen vs sparse"]
     columns += ["dense ms", "Sol vs dense"]
-    print("\n| " + " | ".join(columns) + " |")
-    print("|" + "|".join("---" for _ in columns) + "|")
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "|" + "|".join("---" for _ in columns) + "|",
+    ]
     for row in rows:
         cells = [
             row["recipe"],
@@ -539,7 +646,9 @@ def print_markdown(rows, jensen):
                 f"{(row['jensen_ms'] / row['sparse_ms'] - 1) * 100:+.1f}%",
             ]
         cells += [f"{row['dense_ms']:.3f}", f"{row['dense_ms'] / row['sol_ms']:.2f}x"]
-        print("| " + " | ".join(cells) + " |")
+        lines.append("| " + " | ".join(cells) + " |")
+    with open(path, "w", encoding="utf-8") as table:
+        table.write("\n".join(lines) + "\n")
 
 
 def main() -> int:
@@ -598,8 +707,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--markdown",
-        action="store_true",
-        help="finish with one markdown table over every point",
+        metavar="PATH",
+        help="also write one markdown table over every point to PATH",
     )
     args = parser.parse_args()
 
@@ -611,17 +720,22 @@ def main() -> int:
         ]
     else:
         names = list(dict.fromkeys(args.recipe))
-    tokens = wan_self_attn_tokens(args.resolution)
-    rows = []
     for degree in args.ulysses:
         if WAN_HEADS % degree:
             raise ValueError(
                 f"Ulysses degree {degree} does not divide {WAN_HEADS} heads"
             )
-        for name in names:
-            rows += run_recipe(name, recipes[name], degree, tokens, args)
+    selected = select_tiles(recipes, names, args)
+    if not selected:
+        raise ValueError("no recipe/tile pair on this GPU can run this sweep")
+    tokens = wan_self_attn_tokens(args.resolution)
+    rows = []
+    for degree in args.ulysses:
+        for name, tiles in selected.items():
+            rows += run_recipe(name, recipes[name], tiles, degree, tokens, args)
     if args.markdown:
-        print_markdown(rows, args.jensen)
+        write_markdown(rows, args.jensen, args.markdown)
+        logger.info("wrote the markdown table to %s", args.markdown)
     return 0
 
 

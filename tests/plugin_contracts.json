@@ -1,0 +1,163 @@
+{
+ "batched_gemm_a8w8_mxscale": {
+  "fingerprint": "e7294cd3de718c0c",
+  "signature": "x:positional:Tensor, wo_a:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, -> Tensor",
+  "source": "aiter/ops/batched_gemm_op_a8w8.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "batched_gemm_a8w8_mxscale_bpreshuffle": {
+  "fingerprint": "e7294cd3de718c0c",
+  "signature": "x:positional:Tensor, wo_a:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, -> Tensor",
+  "source": "aiter/ops/batched_gemm_op_a8w8.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "fused_dual_rmsnorm_mxfp8_quant": {
+  "fingerprint": "944105d153e047dd",
+  "signature": "q:positional:torch.Tensor, k:positional:torch.Tensor, q_weight:positional:torch.Tensor, k_weight:positional:torch.Tensor, eps_q:positional:float, eps_k:positional:float | None=None, amax_floor:positional:float=0.0, -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]",
+  "source": "aiter/ops/triton/quant/fused_mxfp8_quant.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "fused_qk_norm_rope_cache_quant_shuffle": {
+  "fingerprint": "a1743044716f524f",
+  "signature": "q:positional:Tensor, k:positional:Tensor, v:positional:Tensor, num_heads_q:positional:int, num_heads_k:positional:int, num_heads_v:positional:int, head_dim:positional:int, eps:positional:float, qw:positional:Tensor, kw:positional:Tensor, cos_sin_cache:positional:Tensor, is_neox_style:positional:bool, pos_ids:positional:Tensor, k_cache:positional:Tensor, v_cache:positional:Tensor, slot_mapping:positional:Tensor, kv_cache_dtype:positional:str, k_scale:positional:Tensor, v_scale:positional:Tensor, -> None",
+  "source": "aiter/ops/fused_qk_norm_rope_cache_quant.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "gemm_a8w8_blockscale": {
+  "fingerprint": "47ec95c460883544",
+  "signature": "XQ:positional:Tensor, WQ:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, isBpreshuffled:positional:bool=False, split_k:positional:int | None=None, -> torch.Tensor",
+  "source": "aiter/ops/gemm_op_a8w8.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "gemm_a8w8_blockscale_bpreshuffle": {
+  "fingerprint": "dd8528ae4b58d9bb",
+  "signature": "XQ:positional:Tensor, WQ:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, out:positional:Tensor | None=None, -> Tensor",
+  "source": "aiter/ops/gemm_op_a8w8.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "inverse_rope_group_quant": {
+  "fingerprint": "6db72b366b6a355f",
+  "signature": "o:positional:Tensor, positions:positional:Tensor, cos_cache:positional:Tensor, sin_cache:positional:Tensor, num_groups:positional:int, quant_group_size:positional:int=128, scale_layout:positional:str='row', x_fp8:positional:Tensor | None=None, x_scale:positional:Tensor | None=None, -> tuple[Tensor, Tensor]",
+  "source": "aiter/ops/inverse_rope_group_quant.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "mhc_post": {
+  "fingerprint": "2bc5023c8a38ba47",
+  "signature": "out:positional:torch.Tensor, x:positional:torch.Tensor, residual:positional:torch.Tensor, post_layer_mix:positional:torch.Tensor, comb_res_mix:positional:torch.Tensor, store_nt:positional:int=-1, res_preshuffle:positional:bool=False, -> None",
+  "source": "aiter/ops/mhc.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "mhc_pre": {
+  "fingerprint": "6c084f59b1883f48",
+  "signature": "residual:positional:torch.Tensor, fn:positional:torch.Tensor, hc_scale:positional:torch.Tensor, hc_base:positional:torch.Tensor, rms_eps:positional:float=1e-06, hc_pre_eps:positional:float=1e-06, hc_sinkhorn_eps:positional:float=1e-06, hc_post_mult_value:positional:float=1.0, sinkhorn_repeat:positional:int=20, norm_weight:positional:torch.Tensor | None=None, norm_eps:positional:float=1e-06, large_m_splitk:positional:bool=False, w_preshuffle_bf16:positional:int=0, res_preshuffle:positional:bool=False, -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]",
+  "source": "aiter/ops/mhc.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "mla_decode_fwd_v4_nm": {
+  "fingerprint": "da501459c91a356a",
+  "signature": "q:positional, qrope:positional, kv_buffer:positional, kvrope:positional, output:positional, qo_indptr:positional, kv_indptr:positional, kv_page_indices:positional, max_seqlen_q:positional, sink:keyword-only, split_indptr:keyword-only=None, sm_scale:keyword-only=None, out_16_nosplit:keyword-only=0, num_kv_splits:keyword-only=None, logits:keyword-only=None, attn_lse:keyword-only=None, kv_last_page_lens:keyword-only=None",
+  "source": "aiter/mla.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "mla_decode_fwd_v4_nm_ps": {
+  "fingerprint": "1fb9fb43fb0838c0",
+  "signature": "q_packed:positional, q_rope:positional, kv_packed:positional, kv_rope:positional, kv_indptr:positional, kv_page_indices:positional, sink:positional, workspace:positional:MlaV4NmPsWorkspace, out:positional=None, return_lse:positional=False, lse:positional=None",
+  "source": "aiter/mla.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "mla_sparse_prefill": {
+  "fingerprint": "1f95f64a09fbd513",
+  "signature": "q:positional:torch.Tensor, unified_kv:positional:torch.Tensor, kv_indices_prefix:positional:torch.Tensor, kv_indptr_prefix:positional:torch.Tensor, kv:positional:torch.Tensor, kv_indices_extend:positional:torch.Tensor, kv_indptr_extend:positional:torch.Tensor, attn_sink:positional:torch.Tensor | None, softmax_scale:positional:float, out:positional:torch.Tensor | None=None, num_kv_splits:positional:int | None=None, -> torch.Tensor",
+  "source": "aiter/ops/mla_sparse_prefill.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "mla_sparse_prefill_v41": {
+  "fingerprint": "9f9e5d148583a54c",
+  "signature": "q:positional:torch.Tensor, q_scale:positional:torch.Tensor, unified_kv:positional:torch.Tensor, unified_kv_scale:positional:torch.Tensor, kv_indices_prefix:positional:torch.Tensor, kv_indptr_prefix:positional:torch.Tensor, kv:positional:torch.Tensor, kv_scale:positional:torch.Tensor, kv_indices_extend:positional:torch.Tensor, kv_indptr_extend:positional:torch.Tensor, attn_sink:positional:torch.Tensor | None, softmax_scale:positional:float, out:positional:torch.Tensor | None=None, num_kv_splits:positional:int | None=None, -> torch.Tensor",
+  "source": "aiter/ops/mla_sparse_prefill.py",
+  "supersedes": [],
+  "version": 2
+ },
+ "pa_decode_bf16": {
+  "fingerprint": "42a64204b4bb2435",
+  "signature": "Q:positional:torch.Tensor, K:positional:torch.Tensor, V:positional:torch.Tensor, kv_indices:positional:torch.Tensor, context_lens:positional:torch.Tensor, softmax_scale:positional:float, kv_indptr:positional:torch.Tensor, gqa:positional:int=8, mtp:positional:int=0, query_scale:positional:torch.Tensor | None=None, key_scale:positional:torch.Tensor | None=None, value_scale:positional:torch.Tensor | None=None, qo_indptr:positional:torch.Tensor | None=None, work_indptr:positional:torch.Tensor | None=None, work_info:positional:torch.Tensor | None=None, split_o:positional:torch.Tensor | None=None, split_lse:positional:torch.Tensor | None=None, sink:positional:torch.Tensor | None=None, out:positional:torch.Tensor | None=None, -> torch.Tensor",
+  "source": "aiter/ops/attention.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "pa_fwd": {
+  "fingerprint": "6afde3d0a53acf6a",
+  "signature": "Q:positional:torch.Tensor, K:positional:torch.Tensor, V:positional:torch.Tensor, block_tables:positional:torch.Tensor, context_lens:positional:torch.Tensor, block_tables_stride0:positional:int, max_qlen:positional:int=1, K_QScale:positional:torch.Tensor | None=None, V_QScale:positional:torch.Tensor | None=None, out_:positional:torch.Tensor | None=None, qo_indptr:positional:torch.Tensor | None=None, high_precision:positional:int | None=1, -> torch.Tensor",
+  "source": "aiter/ops/attention.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "pa_persistent_fwd": {
+  "fingerprint": "5256b167078255dd",
+  "signature": "Q:positional:torch.Tensor, K:positional:torch.Tensor, V:positional:torch.Tensor, output:positional:torch.Tensor, max_qlen:positional:int, qo_indptr:positional:torch.Tensor, kv_indptr:positional:torch.Tensor, kv_indices:positional:torch.Tensor, context_lens:positional:torch.Tensor, work_indptr:positional:torch.Tensor, work_info:positional:torch.Tensor, reduce_indptr:positional:torch.Tensor, reduce_final_map:positional:torch.Tensor, reduce_partial_map:positional:torch.Tensor, K_QScale:positional:torch.Tensor | None=None, V_QScale:positional:torch.Tensor | None=None, softmax_scale:positional:float | None=None, mask:positional:int=0, quant_type:positional:QuantType=QuantType.per_Token, high_precision:positional:int=1, reduce_waves:positional:int=0, return_lse:positional:bool=True, -> tuple[torch.Tensor, torch.Tensor | None]",
+  "source": "aiter/ops/attention.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "per_group_quant": {
+  "fingerprint": "6c00cb7bcfc0e0b5",
+  "signature": "x:positional:Tensor, scale:positional:Tensor | None=None, quant_dtype:positional:torch.dtype=dtypes.i8, group_size:positional:int=128, transpose_scale:positional:bool=False, num_rows:positional:'torch.Tensor | None'=None, num_rows_factor:positional:int=1, scale_type:positional:torch.dtype=dtypes.fp32, scale_layout_m32k4:positional:bool=False, -> 'tuple[Tensor, Tensor]'",
+  "source": "aiter/ops/quant.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "pertoken_quant": {
+  "fingerprint": "ffb84335bd354c41",
+  "signature": "x:positional, scale:positional=None, x_scale:positional=None, scale_dtype:positional=dtypes.fp32, quant_dtype:positional=dtypes.i8, dtypeMax:positional=None",
+  "source": "aiter/ops/quant.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "rmsnorm": {
+  "fingerprint": "86344aea2f2c16a8",
+  "signature": "input:positional, weight:positional, epsilon:positional, use_model_sensitive_rmsnorm:positional, -> Tensor",
+  "source": "aiter/ops/rmsnorm.py",
+  "supersedes": [],
+  "version": 2
+ },
+ "rmsnorm_with_add": {
+  "fingerprint": "626b013bc0e5008f",
+  "signature": "out:positional:Tensor, input:positional:Tensor, residual_in:positional:Tensor, residual_out:positional:Tensor, weight:positional:Tensor, epsilon:positional:float, gemma_norm:positional:bool=False, use_model_sensitive_rmsnorm:positional:int=0, -> None",
+  "source": "aiter/ops/rmsnorm.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "sp_qkv_fused": {
+  "fingerprint": "9f14942435574b5f",
+  "signature": "q:positional, x:positional, x_scale:positional, w:positional, w_scale:positional, q_norm_w:positional, k_norm_w:positional, cos_cache:positional, sin_cache:positional, positions:positional, slot_mapping:positional, k_cache:positional, v_cache:positional, k_scale:positional, v_scale:positional, mode:keyword-only, k:keyword-only=None, v:keyword-only=None, index_q:keyword-only=None, index_q_norm_w:keyword-only=None, index_k_norm_w:keyword-only=None, index_cache:keyword-only=None, eps:keyword-only=1e-06, group:keyword-only=None, stream:keyword-only=None, -> None",
+  "source": "aiter/ops/gemm_fusion/sp_qkv/op.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "top_k_per_row_decode": {
+  "fingerprint": "254392f1c1ad0fcb",
+  "signature": "logits:positional:torch.Tensor, next_n:positional:int, seqLens:positional:torch.Tensor, indices:positional:torch.Tensor, numRows:positional:int, stride0:positional:int, stride1:positional:int, k:positional:int=2048, stable:positional:bool=False, values:positional:torch.Tensor | None=None, row_starts:keyword-only:torch.Tensor | None=None, plane_width:keyword-only:int | None=None, -> None",
+  "source": "aiter/ops/topk.py",
+  "supersedes": [],
+  "version": 1
+ },
+ "topk_gating": {
+  "fingerprint": "b6325c278faa3184",
+  "signature": "topk_weights:positional:torch.Tensor, topk_indices:positional:torch.Tensor, gating_output:positional:torch.Tensor, correction_bias:positional:torch.Tensor | None=None, need_renorm:positional:bool=True, routed_scaling_factor:positional:float=1.0, score_func:positional:str='sqrtsoftplus', num_shared_experts:positional:int=0, num_valid_rows:positional:torch.Tensor | None=None, -> None",
+  "source": "aiter/ops/topk.py",
+  "supersedes": [],
+  "version": 1
+ }
+}
