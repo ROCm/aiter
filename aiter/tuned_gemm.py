@@ -17,6 +17,7 @@
 
 import functools
 import os
+from collections import OrderedDict
 
 import pandas as pd
 import torch
@@ -428,6 +429,8 @@ _eager_hipb = None  # pybind entry points once resolved; False: off for the run
 _eager_gfx_cu: dict[int, tuple[str, int]] = {}
 _eager_dtype_str: dict[torch.dtype, str] = {}
 _eager_tensor_types: dict[type, bool] = {torch.Tensor: True, torch.nn.Parameter: True}
+_eager_weight_handles: OrderedDict = OrderedDict()
+_EAGER_WEIGHT_HANDLES_MAX = 1024
 
 
 def _eager_tensor_type(cls: type) -> bool:
@@ -459,6 +462,29 @@ def _eager_device_gfx_cu(index: int) -> tuple[str, int]:
 
 def _eager_dtype_name(dtype: torch.dtype) -> str:
     return _eager_dtype_str.setdefault(dtype, str(dtype))
+
+
+def _eager_weight_t_handle(B: Tensor, convert):
+    """The aiter_tensor_t of ``B.t()``, cached per tensor descriptor.
+
+    The handle is a function of (data_ptr, shape, stride, dtype, device) alone
+    and holds no reference to the tensor, so a cached one is exactly what a
+    fresh conversion would build, whether or not ``B`` is still alive. A bounded
+    LRU: weights stay, activations passed as ``B`` rotate out.
+    """
+    key = (B.data_ptr(), B.shape, B.stride(), B.dtype, B.get_device())
+    handles = _eager_weight_handles
+    handle = handles.get(key)
+    if handle is None:
+        handle = handles[key] = convert(B.t())
+        if len(handles) > _EAGER_WEIGHT_HANDLES_MAX:
+            handles.popitem(last=False)
+    else:
+        try:
+            handles.move_to_end(key)
+        except KeyError:  # evicted by another thread meanwhile
+            pass
+    return handle
 
 
 def _resolve_eager_hipb():
@@ -608,7 +634,7 @@ def _hipblaslt_eager(
     set_stream(raw_stream(current_device()))
     hipb_mm_op(
         convert(inp),
-        convert(B.t()),
+        _eager_weight_t_handle(B, convert),
         config["solidx"],
         convert(result),
         None if bias is None else convert(bias),

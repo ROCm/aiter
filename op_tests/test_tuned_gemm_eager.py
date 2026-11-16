@@ -400,6 +400,50 @@ def test_shape_recording_keeps_the_custom_op(fallbacks, monkeypatch):
     assert tuned._eager_hipb is False
 
 
+def test_weight_handles_follow_the_descriptor(fallbacks, table):
+    """The cached handle of a weight is keyed by its descriptor alone: a freed
+    weight whose memory a new one reuses, a view sharing the pointer with a
+    different shape, and a strided view all compute what the op path does."""
+    import gc
+    import weakref
+
+    m, n, k = 128, 256, 512
+    for nn, kk in ((n, k), (n // 2, k), (n, k // 2)):
+        table[_key(m, nn, kk, False, BF16, BF16)] = {
+            "libtype": "hipblaslt",
+            "solidx": -1,
+        }
+    x = _rand(m, k)
+    w1 = _rand(n, k, scale=k**-0.5)
+    assert torch.equal(tgemm.mm(x, w1), OP(x, w1))
+    ptr, alive = w1.data_ptr(), weakref.ref(w1)
+    del w1
+    gc.collect()
+    assert alive() is None  # the cache keeps no tensor alive
+    w2 = _rand(n, k, scale=k**-0.5)
+    if w2.data_ptr() == ptr:  # same descriptor as the freed weight
+        assert torch.equal(tgemm.mm(x, w2), OP(x, w2))
+    assert torch.equal(tgemm.mm(x, w2[: n // 2]), OP(x, w2[: n // 2]))
+    xs = x[:, : k // 2]
+    assert torch.equal(tgemm.mm(xs, w2[:, : k // 2]), OP(xs, w2[:, : k // 2]))
+    assert sum(fallbacks.values()) == 0
+
+
+def test_weight_handles_are_bounded(monkeypatch, table):
+    monkeypatch.setattr(tuned, "_EAGER_WEIGHT_HANDLES_MAX", 4)
+    monkeypatch.setattr(tuned, "_eager_weight_handles", tuned.OrderedDict())
+    m, k = 64, 256
+    x = _rand(m, k)
+    keep = []
+    for n in range(16, 16 * 9, 16):
+        table[_key(m, n, k, False, BF16, BF16)] = {"libtype": "hipblaslt", "solidx": -1}
+        w = _rand(n, k)
+        keep.append(w)
+        assert torch.equal(tgemm.mm(x, w), OP(x, w))
+        assert len(tuned._eager_weight_handles) <= 4
+    assert torch.equal(tgemm.mm(x, keep[0]), OP(x, keep[0]))  # evicted, rebuilt
+
+
 def test_first_call_runs_the_custom_op(fallbacks, monkeypatch):
     """Until the op path has created the hipBLASLt extension, it runs the call."""
     monkeypatch.setattr(tuned, "extensions_created", False)
