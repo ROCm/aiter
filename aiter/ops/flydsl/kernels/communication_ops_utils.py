@@ -64,6 +64,7 @@ __all__ = [
     "load_i64_global",
     "load_v4i32_nt",
     "memrealtime",
+    "spin_mailbox",
     "spin_until_eq_i32",
     "spin_until_ge_i32_agent",
     "spin_until_ge_i32_system",
@@ -138,6 +139,30 @@ def _spin_tagged_bounded(load_all, pending, on_timeout, initial_late):
     return values
 
 
+def spin_mailbox(load_all, pending, debug, epoch_addresses, expected_epoch, diagnostic):
+    """Spin ``load_all`` until ``pending`` is false. A debug build gives up after
+    a bounded wait and ORs the ranks whose epoch is behind into ``diagnostic``."""
+    if not (debug and epoch_addresses is not None):
+        return _spin_tagged(load_all, pending)
+
+    def on_timeout():
+        missing = fx.Int32(0)
+        for rank, address in enumerate(epoch_addresses):
+            seen = buffer_load_i32(address, 0, cache_modifier=CACHE_SYSTEM)
+            behind = ((expected_epoch - seen) & fx.Int32(EPOCH_MASK)) == 1
+            missing = missing | behind.select(1 << rank, 0)
+        atomic_or_global_at(
+            diagnostic + 8,
+            missing | fx.Int32(TIMEOUT_BIT),
+            syncscope=fx.rocdl.SyncScope.Agent,
+        )
+
+    initial_late = (
+        buffer_load_i32(diagnostic, 2, cache_modifier=CACHE_DEVICE) < 0
+    ).select(fx.Int32(1), fx.Int32(0))
+    return _spin_tagged_bounded(load_all, pending, on_timeout, initial_late)
+
+
 class TaggedMailbox:
     """Transfer naturally aligned 32-bit values with adjacent launch tags.
 
@@ -160,22 +185,6 @@ class TaggedMailbox:
         self.epoch_addresses = epoch_addresses
         self.expected_epoch = expected_epoch
         self.diagnostic = diagnostic
-
-    def put(self, address, index, value):
-        bits = (
-            value.bitcast(fx.Int32)
-            if isinstance(value, fx.Float32)
-            else fx.Int32(value)
-        )
-        values = fx.Vector.from_elements([bits, self.tag], fx.Int32)
-        buf_copy_store(
-            ptr_buf_tensor(address, fx.Int32, unit_elems=2, unit_stride=1),
-            index * 2,
-            values,
-            fx.Int32,
-            unit_elems=2,
-            cache_modifier=CACHE_SYSTEM,
-        )
 
     def put_words(self, address, index, words):
         values = []
@@ -221,26 +230,14 @@ class TaggedMailbox:
                 stale = stale | (values[index] != tag)
             return stale
 
-        if self.debug and self.epoch_addresses is not None:
-
-            def on_timeout():
-                missing = fx.Int32(0)
-                for rank, address in enumerate(self.epoch_addresses):
-                    seen = buffer_load_i32(address, 0, cache_modifier=CACHE_SYSTEM)
-                    behind = ((self.expected_epoch - seen) & fx.Int32(EPOCH_MASK)) == 1
-                    missing = missing | behind.select(1 << rank, 0)
-                atomic_or_global_at(
-                    self.diagnostic + 8,
-                    missing | fx.Int32(TIMEOUT_BIT),
-                    syncscope=fx.rocdl.SyncScope.Agent,
-                )
-
-            initial_late = (
-                buffer_load_i32(self.diagnostic, 2, cache_modifier=CACHE_DEVICE) < 0
-            ).select(fx.Int32(1), fx.Int32(0))
-            values = _spin_tagged_bounded(load_all, pending, on_timeout, initial_late)
-        else:
-            values = _spin_tagged(load_all, pending)
+        values = spin_mailbox(
+            load_all,
+            pending,
+            self.debug,
+            self.epoch_addresses,
+            self.expected_epoch,
+            self.diagnostic,
+        )
         out, index = [], 0
         for _, _, count in specs:
             out.append([values[index + 2 * item] for item in range(count)])

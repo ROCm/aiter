@@ -838,8 +838,8 @@ def compile_pa_decode_ps_reduce(
         # The leading arguments preload into the free user SGPRs (14 dwords on
         # gfx950), so the first loads skip a kernarg round trip.
         launch_pa_decode_ps_reduce_kernel.compile_hints["llvm_options"] = {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": 16,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": min(16, AITER_FLYDSL_KERNARG_PRELOAD_COUNT),
         }
     if architecture in ("gfx1250", "gfx1250-strict"):
         # All 108 argument bytes preload into user SGPRs, so the first load

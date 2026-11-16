@@ -4,9 +4,10 @@
 
 """DCP LSE combine as one FlyDSL mailbox launch.
 
-Each rank pushes every peer's head and LSE as tagged pairs. Each rank polls
-its own heads and applies the LSE weights. One CTA owns one or more tokens for
-one local head, and each of its ``dim / 4`` threads owns four head values.
+Each rank pushes every peer's head and LSE as untagged words into the peer's
+sentinel-filled mailbox. Each rank polls its own heads, rearms their slots and
+applies the LSE weights. One CTA owns one or more tokens for one local head,
+and each of its ``dim / 4`` threads owns four head values.
 """
 
 from dataclasses import dataclass
@@ -20,9 +21,9 @@ from flydsl.expr.typing import Int32, Int64
 from aiter.ops.flydsl.dcp_mailbox.common import (
     KernelAbi,
     epoch_offset,
-    pair_layout,
     pair_span,
     token_tile,
+    word_layout,
 )
 from aiter.ops.flydsl.dcp_mailbox.common import (
     peer_bytes as peer_storage_bytes,
@@ -40,7 +41,9 @@ _BUILDS: dict = {}
 
 @dataclass(frozen=True)
 class CombineBuild:
-    tokens: int
+    """Compile-time shape of one combine kernel. The token count is a launch
+    argument, so one build serves every decode width with the same tile."""
+
     ranks: int
     heads: int
     dim: int
@@ -54,12 +57,12 @@ class CombineBuild:
 
 
 def peer_layout(ranks, max_tokens, heads, dim):
-    """One parity of 8-byte aligned bf16/LSE pairs.
+    """One parity of untagged 32-bit words: bf16 pairs, then fp32 LSEs.
 
-    The untagged per-rank epoch slots follow both parities in the allocation.
+    The per-rank epoch slots follow both parities in the allocation.
     """
     slots = ranks * max_tokens * heads
-    return pair_layout([("data", slots * dim // 2), ("lse", slots)])
+    return word_layout([("data", slots * dim // 2), ("lse", slots)])
 
 
 def peer_bytes(ranks, max_tokens, heads, dim):
@@ -85,6 +88,8 @@ ABI = KernelAbi(
         "peers",
         "rank",
         "state",
+        "tokens",
+        "nblk",
     )
 )
 
@@ -95,22 +100,19 @@ def build(key: CombineBuild):
     n, hl, d, mt = key.ranks, key.heads, key.dim, key.max_tokens
     threads = d // 4
     tile = key.token_tile
-    nblk = ((key.tokens + tile - 1) // tile) * hl
     lay = peer_layout(n, mt, hl, d)
     half = pair_span(lay)
     name = (
-        f"aiter_dcp_lse_combine_t{key.tokens}_n{n}_h{hl}_d{d}_m{mt}"
+        f"aiter_dcp_lse_combine_n{n}_h{hl}_d{d}_m{mt}"
         f"_s{key.seqs}_e{int(key.base_e)}_l{int(key.ret_lse)}"
         f"_g{int(key.debug)}_r{int(key.row_mask)}_bt{tile}"
     )
 
-    combine = make_combine_kernel(
-        key, name, nblk, threads, lay, half, epoch_offset(lay)
-    )
-    return _jit(key, combine, nblk, threads)
+    combine = make_combine_kernel(key, name, threads, lay, half, epoch_offset(lay))
+    return _jit(key, combine, threads)
 
 
-def _jit(key, combine, nblk, threads):
+def _jit(key, combine, threads):
     @flyc.jit
     def launch(
         out: Int64,
@@ -129,6 +131,8 @@ def _jit(key, combine, nblk, threads):
         peers: Int64,
         rank: Int32,
         state: Int64,
+        tokens: Int32,
+        nblk: Int32,
         stream: fx.Stream = _STREAM,
     ):
         combine(
@@ -148,7 +152,9 @@ def _jit(key, combine, nblk, threads):
             peers,
             rank,
             state,
-        ).launch(grid=(nblk,), block=(threads,), stream=stream)
+            tokens,
+            nblk,
+        ).launch(grid=(nblk, 1, 1), block=(threads, 1, 1), stream=stream)
 
     ABI.check(combine, launch)
     _BUILDS[key] = launch
@@ -162,6 +168,8 @@ class CombineWorkspace:
     capture. One extra call can silently misalign every later result.
 
     ``debug=True`` enables bounded eager diagnostics and cannot be graph-captured.
+    A workspace that timed out is not reusable: its mailbox may hold payloads
+    that a later launch of the same parity would read as fresh.
     """
 
     def __init__(self, group, device, heads, dim, max_tokens, debug=False):
@@ -177,6 +185,11 @@ class CombineWorkspace:
         self.max_tokens = max_tokens
         nbytes = peer_bytes(self.ranks, max_tokens, heads, dim)
         self.peers = PeerBuffer(nbytes, self.group, self.rank, self.ranks, device)
+        # Both parities start as the sentinel; the epoch slots after them stay 0.
+        lay = peer_layout(self.ranks, max_tokens, heads, dim)
+        self.peers.bytes[: epoch_offset(lay)].fill_(0xFF)
+        torch.cuda.synchronize(device)
+        dist.barrier(group=self.group)
         self.state = torch.zeros(3, dtype=torch.int32, device=device)
 
     def close(self) -> None:
@@ -253,8 +266,8 @@ def dcp_lse_combine(
         (tokens, heads) if return_lse else (1,), device=out.device, dtype=torch.float32
     )
     seqs = 0 if seq_lens is None else seq_lens.shape[0]
+    tile = token_tile(tokens)
     key = CombineBuild(
-        tokens=tokens,
         ranks=ws.ranks,
         heads=heads,
         dim=dim,
@@ -263,7 +276,7 @@ def dcp_lse_combine(
         base_e=base_e,
         ret_lse=return_lse,
         debug=ws.debug,
-        token_tile=token_tile(tokens),
+        token_tile=tile,
         row_mask=row_counts is not None,
     )
     build(key)(
@@ -283,6 +296,8 @@ def dcp_lse_combine(
         ws.peers.addresses.data_ptr(),
         ws.rank,
         ws.state.data_ptr(),
+        tokens,
+        (tokens + tile - 1) // tile * heads,
         stream=torch.cuda.current_stream(),
     )
     _check_debug(ws)
@@ -306,4 +321,12 @@ def _check_debug(ws) -> None:
     diagnostic = int(ws.state[2].item()) & 0xFFFFFFFF
     if diagnostic:
         missing = diagnostic & RANK_MASK
-        raise RuntimeError(f"DCP mailbox timeout: missing ranks=0x{missing:x}")
+        raise RuntimeError(
+            f"DCP mailbox timeout: missing ranks=0x{missing:x}"
+            + (
+                " (every peer arrived: a payload never left the sentinel, or"
+                " the ranks launched with different token counts)"
+                if not missing
+                else ""
+            )
+        )
