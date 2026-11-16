@@ -2883,7 +2883,7 @@ a8w8_mxscale_bmm_kernels_list = {
 
 def _gfx950_co_image_path(path, entry):
     root = os.environ.get("OPUS_GEN_CO_DIR") or os.path.dirname(path)
-    return os.path.join(root, "gfx950", entry["image"])
+    return os.path.join(root, "gfx950", "a8w8_blockscale_bpreshuffle", entry["image"])
 
 
 def _bpreshuffle_name(config_name):
@@ -2949,7 +2949,9 @@ def _load_gfx950_co_kernels(path, require_image=True):
 
 
 GFX950_CO_KERNELS_JSON = os.path.join(
-    os.path.dirname(__file__), "gen_co", "co_kernels_gfx950.json"
+    os.path.dirname(__file__),
+    "gen_co",
+    "co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json",
 )
 gfx950_co_kernels_declared = _load_gfx950_co_kernels(
     GFX950_CO_KERNELS_JSON, require_image=False
