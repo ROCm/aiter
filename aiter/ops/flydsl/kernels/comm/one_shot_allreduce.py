@@ -25,14 +25,15 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
+from ...allreduce_policy import SUPPORTED_BLOCKS, SUPPORTED_WORLDS
+
 # The peer-store/load primitives, the cache-policy table and the inbox-memory
 # taxonomy are shared with the quantized kernels verbatim.
 from .allreduce_shared import (
     _CM_SC0,
     _CM_SC1,
     _INBOX_POLICY,
-    SUPPORTED_BLOCKS,
-    SUPPORTED_WORLDS,
+    _RECV_POLICY,
     _buffer_load,
     _buffer_ptr,
     _buffer_store,
@@ -61,12 +62,7 @@ DEFAULT_ATOMS = 1
 # for a given payload, at the cost of coarser load balance on the last partial
 # tile.
 SUPPORTED_ATOMS = (1, 2, 4)
-DEFAULT_GRID_CAP = 64
-
-# Read our own inbox with the caches bypassed: a peer wrote these lines
-# microseconds ago and an L1 hit here is a stale hit. Same reasoning as the
-# ring kernel's ``_RECV_POLICY``.
-_RECV_POLICY = _CM_SC0 | _CM_SC1
+ONESHOT_DEFAULT_GRID_CAP = 64
 
 # Which axis of the (peer, atom) fanout runs fastest across consecutive stores.
 #
@@ -136,7 +132,7 @@ def make_one_shot_allreduce_kernel(
     world_size: int,
     atoms: int = DEFAULT_ATOMS,
     grid: int,
-    inbox_memory: str = "uncached",
+    inbox_memory: str,
     fanout: str = DEFAULT_FANOUT,
     rank: int,
     block: int = DEFAULT_BLOCK,
@@ -435,7 +431,7 @@ def make_one_shot_allreduce_kernel(
         "tile_bytes": tile_bytes,
         # No handshake sector: a wire slot is just the payload.
         "wire_tile_bytes": tile_bytes,
-        # Shims for ``quick_allreduce_int4._StEngine``, which is reused verbatim for the IPC
+        # Shims for ``quick_allreduce._StEngine``, which is reused verbatim for the IPC
         # inbox and peer table. This schedule has no super-tile (one round per
         # tile, nothing to batch) and no per-rank tile split (every rank sends
         # the whole tile), so the two are 1 and the full tile respectively.

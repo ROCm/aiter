@@ -545,6 +545,98 @@ def attention_ref_block_sparse(
     )
 
 
+def sol_attn_ref(
+    q,
+    k,
+    v,
+    block_attn_mask,
+    k_mean,
+    v_mean,
+    BLOCK_M,
+    BLOCK_N,
+    softmax_scale=None,
+    correction=True,
+    upcast=True,
+):
+    """
+    Sol-Attn reference (arXiv 2607.24027): threshold-routed block-sparse attention with
+    zeroth-order proxy-score reuse as the correction for the unselected blocks.
+
+        O = ( sum_exact  exp(S) V  +  sum_approx exp(q kbar^T) * B * vbar ) / (same, row-summed)
+
+    Both branches share ONE softmax, exactly as the kernel shares one online-softmax state: the
+    approximate columns are appended to the exact ones with log(B) folded into their logit, which
+    reproduces the B factor in the numerator and the denominator simultaneously. Selected blocks are
+    masked OUT of the approximate branch so their mass is not counted twice.
+
+    q, k, v: (batch, seqlen, nheads, head_dim) bshd, DEQUANTIZED. So are k_mean and v_mean, which
+        are (batch, num_kv_blocks, nheads_kv, head_dim) as produced by sol_prepare.
+    block_attn_mask: (batch, nheads_q, num_q_tiles, num_kv_blocks) bool, True == computed exactly.
+        Required, and deliberately not re-routed here: routing is scale invariant in real arithmetic
+        but not in fp32, so an oracle that re-derived the mask from beta would disagree with the
+        caller's on blocks sitting within rounding distance of the threshold. The mask is the host's
+        to own; pass the one the kernel was given.
+    correction: False reduces this to plain keep-or-drop block-sparse attention on the same mask,
+        which is the A/B that isolates the value of the correction term.
+
+    Returns (output, lse).
+    """
+    dtype_og = q.dtype
+    if upcast:
+        q, k, v = q.float(), k.float(), v.float()
+        k_mean, v_mean = k_mean.float(), v_mean.float()
+    _, seqlen_q, hq, d = q.shape
+    seqlen_k = k.shape[1]
+    assert seqlen_k == v.shape[1]
+    assert (
+        block_attn_mask.dim() == 4
+    ), "sol_attn_ref wants a (b, h, q_tile, kv_block) mask"
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(d)
+
+    num_blocks = k_mean.shape[1]
+    # Per-block token counts follow from the shapes: every block is full but a partial tail.
+    counts = torch.full((num_blocks,), BLOCK_N, dtype=torch.float32, device=q.device)
+    if seqlen_k % BLOCK_N:
+        counts[-1] = seqlen_k % BLOCK_N
+
+    k_rep = repeat(k, "b s h d -> b s (h g) d", g=hq // k.shape[2])
+    v_rep = repeat(v, "b s h d -> b s (h g) d", g=hq // v.shape[2])
+    k_mean_rep = repeat(k_mean, "b s h d -> b s (h g) d", g=hq // k_mean.shape[2])
+    v_mean_rep = repeat(v_mean, "b s h d -> b s (h g) d", g=hq // v_mean.shape[2])
+
+    # Exact branch: full-resolution scores, keeping only selected (q_tile, kv_block) pairs.
+    scores = torch.einsum("bthd,bshd->bhts", q * softmax_scale, k_rep)
+    allow = block_attn_mask_to_token_mask(
+        block_attn_mask, seqlen_q, seqlen_k, BLOCK_M, BLOCK_N, q.device
+    )
+    scores = scores.masked_fill(~allow, float("-inf"))
+
+    if correction:
+        # Approximate branch: one column per KV block, weighted by the block's token count, and
+        # masked wherever the exact branch already covers that block.
+        approx = torch.einsum("bthd,bjhd->bhtj", q * softmax_scale, k_mean_rep)
+        approx = approx + torch.log(counts).view(1, 1, 1, num_blocks)
+        q_tile_idx = (
+            torch.arange(seqlen_q, device=q.device)
+            .div(BLOCK_M, rounding_mode="floor")
+            .clamp(max=block_attn_mask.shape[2] - 1)
+        )
+        approx = approx.masked_fill(block_attn_mask[:, :, q_tile_idx, :], float("-inf"))
+        joint = torch.cat([scores, approx], dim=-1)
+        values = torch.cat([v_rep, v_mean_rep], dim=1)
+    else:
+        joint = scores
+        values = v_rep
+
+    lse = torch.logsumexp(joint, dim=-1)
+    attention = torch.softmax(joint, dim=-1)
+    all_masked = torch.isinf(joint).all(dim=-1)
+    attention = attention.masked_fill(all_masked.unsqueeze(-1), 0.0)
+    output = torch.einsum("bhts,bshd->bthd", attention, values)
+    return output.to(dtype=dtype_og), lse.to(dtype=dtype_og)
+
+
 def attention_ref(
     q,
     k,
@@ -714,11 +806,16 @@ def attention_ref_with_tol(q, k, v, do, is_fp8=False, **kwargs):
     return out, (dq, dk, dv), fwd_tol, bwd_tols
 
 
-def opus_ref_lse(q, k, causal, budget=1 << 23):
+def opus_ref_lse(q, k, causal, budget=1 << 23, window_size_left=-1):
     """fp32 logsumexp of the scaled scores, bottom-right causal, GQA-aware.
 
     attention_ref downcasts its lse to the input dtype, too coarse to check against.
     Chunked over query rows (`budget` score elements) to bound peak memory.
+
+    `window_size_left` >= 0 also bounds the mask on the left, so a query at KV
+    coordinate j keeps keys [j - window_size_left, j]. It needs `causal`, matching the
+    kernels that implement it. Rows whose window selects no key get -inf, like rows
+    that see no keys at all.
     """
     batch, seqlen_q, nheads, d = q.shape
     seqlen_k, nheads_k = k.shape[1], k.shape[2]
@@ -738,6 +835,10 @@ def opus_ref_lse(q, k, causal, budget=1 << 23):
         if causal:
             row = torch.arange(lo, hi, device=q.device)[:, None]
             scores = scores.masked_fill(col > row + off, float("-inf"))
+            if window_size_left >= 0:
+                scores = scores.masked_fill(
+                    col < row + off - window_size_left, float("-inf")
+                )
         lse[:, :, lo:hi] = torch.logsumexp(scores, dim=-1).reshape(
             batch, nheads, hi - lo
         )

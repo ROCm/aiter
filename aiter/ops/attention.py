@@ -29,6 +29,7 @@ from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 from ..jit.core import _atoi_flag, compile_ops, env_flag_atoi, is_experimental_enabled
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
+from ..plugin import route as _route
 from .opus.mla import opus_mla_decode_fwd, opus_mla_decode_mxfp8_fwd  # noqa: F401
 
 MD_NAME = "module_attention"
@@ -144,23 +145,30 @@ def _pa_fwd_asm(
 ) -> None: ...
 
 
-def pa_fwd_asm(
+def _check_backend(op: str, backend: str | None, backends: tuple) -> None:
+    """Reject a pin naming a backend this op does not have."""
+    if backend is not None and backend not in backends:
+        raise ValueError(
+            f"{op}: backend must be one of {backends} or None, got {backend!r}"
+        )
+
+
+def _pa_fwd_native(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
     block_tables_stride0: int,
-    max_qlen: int = 1,
-    K_QScale: torch.Tensor | None = None,
-    V_QScale: torch.Tensor | None = None,
-    out_: torch.Tensor | None = None,
-    qo_indptr: torch.Tensor | None = None,
-    high_precision: (
-        int | None
-    ) = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
-    kernelName: str | None = None,
+    max_qlen: int,
+    K_QScale: torch.Tensor | None,
+    V_QScale: torch.Tensor | None,
+    out_: torch.Tensor | None,
+    qo_indptr: torch.Tensor | None,
+    high_precision: int | None,
+    kernelName: str | None,
 ) -> torch.Tensor:
+    """The asm binding, with the output buffer settled. Not public."""
     output = out_ if out_ is not None else torch.empty_like(Q)
     _pa_fwd_asm(
         Q,
@@ -178,6 +186,155 @@ def pa_fwd_asm(
         kernelName,
     )
     return output
+
+
+# Routed here rather than on a public spelling, for the reason `rmsnorm` is:
+# `pa_fwd` and `pa_fwd_asm` are two public names for one op and both arrive
+# here, so this is where the op begins.
+#
+# What this signature leaves out is the point. `kernelName` picks one asm
+# kernel and `backend` picks an implementation -- both name something AITER
+# has and a provider does not, so a provider handed either would have to
+# decline every call that passes one. They stay above this layer, where a
+# caller passing one bypasses routing entirely and gets exactly the kernel it
+# asked for. Nothing a provider cannot honour reaches the contract.
+@_route(op="pa_fwd", version=1)
+def _pa_fwd_routed(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables_stride0: int,
+    max_qlen: int = 1,
+    K_QScale: torch.Tensor | None = None,
+    V_QScale: torch.Tensor | None = None,
+    out_: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    high_precision: int | None = 1,
+) -> torch.Tensor:
+    """Paged attention forward over a block table.
+
+    Args:
+        Q: ``[sum_qlen, heads, head_dim]`` query.
+        K, V: paged caches indexed through ``block_tables``.
+        block_tables: ``[batch, max_blocks]`` page ids per sequence.
+        context_lens: ``[batch]`` KV length per sequence.
+        block_tables_stride0: row stride of ``block_tables``.
+        max_qlen: longest query in the batch; 1 is plain decode.
+        K_QScale, V_QScale: fp8 dequant scales, ``None`` for unquantized KV.
+        out_: optional output buffer. Given, it is written and returned;
+            otherwise one shaped like ``Q`` is allocated.
+        qo_indptr: ``[batch+1]`` query offsets for a ragged batch.
+        high_precision: 0, 1 or 2 for fp8 KV, 2 being the most precise.
+
+    Returns the output tensor -- ``out_`` itself when one was passed.
+    """
+    return _pa_fwd_native(
+        Q,
+        K,
+        V,
+        block_tables,
+        context_lens,
+        block_tables_stride0,
+        max_qlen,
+        K_QScale,
+        V_QScale,
+        out_,
+        qo_indptr,
+        high_precision,
+        None,
+    )
+
+
+def pa_fwd(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables_stride0: int,
+    max_qlen: int = 1,
+    K_QScale: torch.Tensor | None = None,
+    V_QScale: torch.Tensor | None = None,
+    out_: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    high_precision: int | None = 1,
+    backend: str | None = None,
+) -> torch.Tensor:
+    """Paged attention forward -- the neutral name for this op.
+
+    Arguments and output are those of the routed contract; see
+    :func:`_pa_fwd_routed`. ``backend`` pins which implementation AITER runs
+    and bypasses routing when given, so a deployment that wants the asm
+    kernel specifically still gets it.
+    """
+    _check_backend("pa_fwd", backend, ("asm",))
+    args = (
+        Q,
+        K,
+        V,
+        block_tables,
+        context_lens,
+        block_tables_stride0,
+        max_qlen,
+        K_QScale,
+        V_QScale,
+        out_,
+        qo_indptr,
+        high_precision,
+    )
+    if backend is None:
+        return _pa_fwd_routed(*args)
+    return _pa_fwd_native(*args, None)
+
+
+def pa_fwd_asm(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables_stride0: int,
+    max_qlen: int = 1,
+    K_QScale: torch.Tensor | None = None,
+    V_QScale: torch.Tensor | None = None,
+    out_: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    high_precision: (
+        int | None
+    ) = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
+    kernelName: str | None = None,
+) -> torch.Tensor:
+    """The historical spelling of :func:`pa_fwd`. Signature unchanged.
+
+    This name predates the neutral one -- `pa_fwd` had no public spelling, so
+    a caller wanting paged attention had to write the backend into the call.
+    That makes the `_asm` here a historical artifact rather than a caller
+    asking for the asm kernel, which is why an ordinary call routes: a
+    provider serves callers of either name.
+
+    ``kernelName`` is the exception, and the only one. It pins a specific asm
+    kernel, which no provider has, so passing it bypasses routing and runs
+    that kernel directly.
+    """
+    args = (
+        Q,
+        K,
+        V,
+        block_tables,
+        context_lens,
+        block_tables_stride0,
+        max_qlen,
+        K_QScale,
+        V_QScale,
+        out_,
+        qo_indptr,
+        high_precision,
+    )
+    if kernelName is None:
+        return _pa_fwd_routed(*args)
+    return _pa_fwd_native(*args, kernelName)
 
 
 def _should_use_asm_kernel(
@@ -454,7 +611,7 @@ def _pa_decode_bf16_asm(
 ) -> None: ...
 
 
-def pa_decode_bf16_asm(
+def _pa_decode_bf16_native(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
@@ -476,21 +633,7 @@ def pa_decode_bf16_asm(
     out: torch.Tensor | None = None,
     kernelName: str | None = None,
 ) -> torch.Tensor:
-    """Public wrapper for the gfx1250 PA decode kernel.
-
-    Contract details:
-      * `Q`/`K`/`V` are FP8; `out` is bf16 with Q's logical shape.
-      * `query_scale`/`key_scale`/`value_scale` are the per-tensor FP8 dequant
-        scales as 1-element fp32 tensors (None means 1.0); the attention
-        `softmax_scale` (typically 1/sqrt(head_dim)) is
-        passed BY VALUE (kernarg 0x60) and the kernel forms
-        scl_log2e = query_scale * key_scale * softmax_scale * log2e.
-      * `sink` (optional) holds per-Q-head fp32 logits in the SCALED-logit
-        domain (exp(sink), Triton/GPT-OSS convention; the kernel divides by
-        s_eff internally), shape [kv_head_num * gqa].  The kernel always reads
-        this slot, so when `sink` is None a -inf buffer is allocated, making the
-        sink a numerical no-op.
-    """
+    """The asm binding with its buffers settled. Not public."""
     require_gfx1250_asm("pa_decode_bf16_asm")
     device = Q.device
     kv_head_num = K.shape[1]
@@ -535,6 +678,224 @@ def pa_decode_bf16_asm(
         kernelName,
     )
     return out
+
+
+# Routed below the pins, as `pa_fwd` is: `kernelName` names one asm kernel and
+# `backend` one implementation, neither of which a provider has. Both stay
+# above this layer, so the contract carries nothing a provider cannot honour.
+@_route(op="pa_decode_bf16", version=1)
+def _pa_decode_bf16_routed(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    kv_indices: torch.Tensor,
+    context_lens: torch.Tensor,
+    softmax_scale: float,
+    kv_indptr: torch.Tensor,
+    gqa: int = 8,
+    mtp: int = 0,
+    query_scale: torch.Tensor | None = None,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    work_indptr: torch.Tensor | None = None,
+    work_info: torch.Tensor | None = None,
+    split_o: torch.Tensor | None = None,
+    split_lse: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Paged-attention decode on fp8 KV, returning bf16.
+
+    Contract details:
+      * ``Q``/``K``/``V`` are FP8; ``out`` is bf16 with Q's logical shape.
+      * ``query_scale``/``key_scale``/``value_scale`` are the per-tensor FP8
+        dequant scales as 1-element fp32 tensors (None means 1.0); the
+        attention ``softmax_scale`` (typically 1/sqrt(head_dim)) is passed BY
+        VALUE and the kernel forms
+        ``scl_log2e = query_scale * key_scale * softmax_scale * log2e``.
+      * ``sink`` (optional) holds per-Q-head fp32 logits in the SCALED-logit
+        domain (exp(sink), Triton/GPT-OSS convention), shape
+        ``[kv_head_num * gqa]``. A finite large-negative buffer stands in when
+        it is None, making the sink a numerical no-op.
+
+    ``out`` is an optional caller-owned buffer: given, it is written and
+    returned; otherwise one is allocated. The output tensor comes back either
+    way, so a provider returns what it wrote rather than leaving the caller to
+    re-read ``out``.
+    """
+    return _pa_decode_bf16_native(
+        Q,
+        K,
+        V,
+        kv_indices,
+        context_lens,
+        softmax_scale,
+        kv_indptr,
+        gqa,
+        mtp,
+        query_scale,
+        key_scale,
+        value_scale,
+        qo_indptr,
+        work_indptr,
+        work_info,
+        split_o,
+        split_lse,
+        sink,
+        out,
+        None,
+    )
+
+
+def pa_decode_bf16(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    kv_indices: torch.Tensor,
+    context_lens: torch.Tensor,
+    softmax_scale: float,
+    kv_indptr: torch.Tensor,
+    gqa: int = 8,
+    mtp: int = 0,
+    query_scale: torch.Tensor | None = None,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    work_indptr: torch.Tensor | None = None,
+    work_info: torch.Tensor | None = None,
+    split_o: torch.Tensor | None = None,
+    split_lse: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    backend: str | None = None,
+) -> torch.Tensor:
+    """Paged-attention fp8 decode -- the neutral name for this op.
+
+    Arguments and output are those of the routed contract; see
+    :func:`_pa_decode_bf16_routed`. ``backend`` pins the implementation and
+    bypasses routing when given.
+    """
+    _check_backend("pa_decode_bf16", backend, ("asm",))
+    if backend is None:
+        return _pa_decode_bf16_routed(
+            Q,
+            K,
+            V,
+            kv_indices,
+            context_lens,
+            softmax_scale,
+            kv_indptr,
+            gqa,
+            mtp,
+            query_scale,
+            key_scale,
+            value_scale,
+            qo_indptr,
+            work_indptr,
+            work_info,
+            split_o,
+            split_lse,
+            sink,
+            out,
+        )
+    return _pa_decode_bf16_native(
+        Q,
+        K,
+        V,
+        kv_indices,
+        context_lens,
+        softmax_scale,
+        kv_indptr,
+        gqa,
+        mtp,
+        query_scale,
+        key_scale,
+        value_scale,
+        qo_indptr,
+        work_indptr,
+        work_info,
+        split_o,
+        split_lse,
+        sink,
+        out,
+        None,
+    )
+
+
+def pa_decode_bf16_asm(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    kv_indices: torch.Tensor,
+    context_lens: torch.Tensor,
+    softmax_scale: float,
+    kv_indptr: torch.Tensor,
+    gqa: int = 8,
+    mtp: int = 0,
+    query_scale: torch.Tensor | None = None,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    work_indptr: torch.Tensor | None = None,
+    work_info: torch.Tensor | None = None,
+    split_o: torch.Tensor | None = None,
+    split_lse: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    kernelName: str | None = None,
+) -> torch.Tensor:
+    """The historical spelling of :func:`pa_decode_bf16`. Signature unchanged.
+
+    An ordinary call routes: the ``_asm`` is a historical artifact of there
+    having been no neutral spelling, not a caller asking for that backend.
+    ``kernelName`` is the exception -- it pins one asm kernel, which no
+    provider has, so passing it bypasses routing.
+    """
+    if kernelName is None:
+        return _pa_decode_bf16_routed(
+            Q,
+            K,
+            V,
+            kv_indices,
+            context_lens,
+            softmax_scale,
+            kv_indptr,
+            gqa,
+            mtp,
+            query_scale,
+            key_scale,
+            value_scale,
+            qo_indptr,
+            work_indptr,
+            work_info,
+            split_o,
+            split_lse,
+            sink,
+            out,
+        )
+    return _pa_decode_bf16_native(
+        Q,
+        K,
+        V,
+        kv_indices,
+        context_lens,
+        softmax_scale,
+        kv_indptr,
+        gqa,
+        mtp,
+        query_scale,
+        key_scale,
+        value_scale,
+        qo_indptr,
+        work_indptr,
+        work_info,
+        split_o,
+        split_lse,
+        sink,
+        out,
+        kernelName,
+    )
 
 
 def pa_reduce_v1(
@@ -604,6 +965,7 @@ def _pa_ps_reduce_waves(batch_size: int, kv_pages: int, num_cu: int) -> int:
     return 8 if kv_pages * 16 >= batch_size * context_threshold else 0
 
 
+@_route(op="pa_persistent_fwd", version=1)
 def pa_persistent_fwd(
     Q: torch.Tensor,  # [sum_qlen, kv_heads * gqa + kv_heads * 2, head_dim]
     K: torch.Tensor,  # [num_blocks, kv_heads, head_dim / x, block_size, x]

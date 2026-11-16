@@ -10,7 +10,7 @@ New code should use :mod:`aiter.ops.mla_sparse_prefill`: ``mla_sparse_prefill`` 
 import torch
 
 from ..jit.utils.torch_guard import torch_compile_guard
-from .mla_sparse_prefill import _opus_sparse_prefill, _opus_sparse_prefill_v4
+from .mla_sparse_prefill import _mla_sparse_prefill_routed, _opus_sparse_prefill_v4
 from .opus.mla import (
     opus_mla_v4_prefill_a8w8_gfx950_fwd as pa_sparse_prefill_fp8_gfx950_opus_fwd,
 )
@@ -90,8 +90,15 @@ def pa_sparse_prefill_opus(
     out: torch.Tensor | None = None,
     num_kv_splits: int | None = None,
 ) -> torch.Tensor:
-    """:func:`aiter.ops.mla_sparse_prefill.mla_sparse_prefill` on the opus backend."""
-    return _opus_sparse_prefill(
+    """:func:`aiter.ops.mla_sparse_prefill.mla_sparse_prefill` on the opus backend.
+
+    Writes ``out`` when given and returns it either way. Both this spelling and
+    ``mla_sparse_prefill`` enter the op at the same routed layer, so a provider
+    serving the ``mla_sparse_prefill`` contract serves callers of either name --
+    which is why this delegates there rather than to the opus binding beneath
+    it. Behaviour is unchanged: opus is the only backend this contract has.
+    """
+    return _mla_sparse_prefill_routed(
         q,
         unified_kv,
         kv_indices_prefix,

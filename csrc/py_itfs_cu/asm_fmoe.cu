@@ -380,6 +380,28 @@ static bool kernel_fits(
            cfg.flat == static_cast<int>(AsmMoeMode::SORTED);
 }
 
+// The SwiGLU OAI MXFP4 FLAT kernels (16x32/16x128) are validated for inter_dim % 128 == 0
+// (Minimax M3 TP2/TP4/TP8: 1536/768/384). The FLAT grid is ceil(inter_dim / subGU_n)
+// with no partial-tile handling, so reject other sizes here rather than launch a kernel
+// that reads past the expert's weights.
+// Every row in this map is flat=1: it reads the raw top-k ids/weights, not the host
+// moe_sorting output. Only a tuned row (kernel_name set, flat=1 forwarded by fused_moe)
+// passes raw top-k, so an unnamed call must not reach the heuristic below.
+static void
+check_swiglu_oai_flat_launch(const CFG* cfgs, int inter_dim, const std::string& kernel_name)
+{
+    if(cfgs != &cfg_fmoe_bf16_pertokenMXfp4_g1u1_swiglu_oai)
+        return;
+    AITER_CHECK(!kernel_name.empty(),
+                __func__,
+                " SwiGLU OAI MXFP4 FLAT asm kernels need an explicit kernel name: they read "
+                "raw top-k routing, not host-sorted ids, so heuristic selection is not allowed");
+    AITER_CHECK(inter_dim % 128 == 0,
+                __func__,
+                " SwiGLU OAI MXFP4 FLAT asm kernels need inter_dim % 128 == 0, got " +
+                    std::to_string(inter_dim));
+}
+
 FMoeKernel* get_heuristic_kernel(int inter_dim,
                                  int sub_X_cnt,
                                  CFG* cfgs,
@@ -780,8 +802,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
         else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Situv2)
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_situv2;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Swiglu)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_swiglu_oai;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
+        check_swiglu_oai_flat_launch(config_map, inter_dim, kernel_name_str);
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
         impl_ptr->set_4bit(true);
         is_mxfp4 = true;
@@ -802,8 +827,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
         else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Situv2)
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_situv2;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Swiglu)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_swiglu_oai;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1 (bf16 X). ");
+        check_swiglu_oai_flat_launch(config_map, inter_dim, kernel_name_str);
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
         impl_ptr->set_4bit(true);
         is_mxfp4 = true;

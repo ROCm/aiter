@@ -1,0 +1,343 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Eight ranks: FlyDSL DCP mailbox LSE combine and query gather."""
+
+import os
+import time
+import warnings
+
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.dcp_mailbox import (
+    CombineWorkspace,
+    GatherWorkspace,
+    dcp_lse_combine,
+    dcp_quant_query_gather,
+    dcp_query_gather,
+)
+from aiter.ops.flydsl.dcp_mailbox.combine import peer_layout
+from aiter.ops.flydsl.dcp_mailbox.common import epoch_offset
+from aiter.ops.flydsl.kernels.communication_ops_utils import EPOCH_MASK
+
+
+class _Group:
+    def __init__(self, cpu_group, rank, world):
+        self.cpu_group = cpu_group
+        self.rank_in_group = rank
+        self.world_size = world
+
+
+def _reference(parts, lses, base_e):
+    stacked = torch.stack(parts, 0).float()
+    lse = torch.stack(lses, 0).float()
+    lse = torch.where(torch.isnan(lse) | torch.isposinf(lse), float("-inf"), lse)
+    m = lse.max(0).values
+    m = torch.where(torch.isneginf(m), 0.0, m)
+    exp, log = (torch.exp, torch.log) if base_e else (torch.exp2, torch.log2)
+    g = log(exp(lse - m).sum(0)) + m
+    w = exp(lse - g)
+    w = torch.where(torch.isnan(w), 0.0, w)
+    return (stacked * w[..., None]).sum(0).to(torch.bfloat16), g
+
+
+def _row_empty(tokens, seq_lens, qsl):
+    """Rows past qsl[-1] (graph padding) or whose request has no local KV."""
+    rows = torch.arange(tokens, device=seq_lens.device)
+    seq = torch.searchsorted(qsl[1:], rows, right=True).clamp(max=seq_lens.numel() - 1)
+    return (rows >= qsl[-1]) | (seq_lens[seq] == 0)
+
+
+def worker(rank, world, tokens):
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ.setdefault("MASTER_PORT", "29741")
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world)
+    group = _Group(dist.new_group(backend="gloo"), rank, world)
+    try:
+        hl = 12
+        max_tokens = max(tokens, 64)
+        gen = torch.Generator(device="cuda")
+        gen.manual_seed(100 + rank)
+        # Request 1 has no KV on every third rank; the last two rows are padding.
+        qsl = torch.tensor(
+            [0, tokens // 2, tokens - 2], device="cuda", dtype=torch.int32
+        )
+        seq_lens = torch.tensor(
+            [5, 0 if rank % 3 == 0 else 7], device="cuda", dtype=torch.int32
+        )
+        row_counts = torch.ones(tokens, device="cuda", dtype=torch.int32)
+        row_counts[rank % 5 :: 5] = 0
+        # dim 128 runs the debug build: epoch push and bounded poll.
+        for dim, debug in ((64, False), (128, True), (512, False), (576, False)):
+            cws = CombineWorkspace(
+                group, torch.device("cuda"), hl, dim, max_tokens, debug=debug
+            )
+            for base_e in (True, False):
+                for masked in (False, True):
+                    out = torch.randn(
+                        tokens,
+                        world * hl,
+                        dim,
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                        generator=gen,
+                    )
+                    lse = torch.randn(
+                        tokens,
+                        world * hl,
+                        device="cuda",
+                        dtype=torch.float32,
+                        generator=gen,
+                    )
+                    if rank == 0:
+                        lse[0, 0] = float("nan")
+                    mask = {}
+                    if masked:
+                        mask = {
+                            "seq_lens": seq_lens,
+                            "query_start_loc": qsl,
+                            "row_counts": row_counts,
+                        }
+                    res, res_lse = dcp_lse_combine(
+                        cws, out, lse, return_lse=True, base_e=base_e, **mask
+                    )
+                    torch.cuda.synchronize()
+                    if masked:
+                        lse = lse.masked_fill(
+                            (_row_empty(tokens, seq_lens, qsl) | (row_counts == 0))[
+                                :, None
+                            ],
+                            float("-inf"),
+                        )
+                    go = [torch.empty_like(out) for _ in range(world)]
+                    gl = [torch.empty_like(lse) for _ in range(world)]
+                    dist.all_gather(go, out)
+                    dist.all_gather(gl, lse)
+                    sl = slice(rank * hl, (rank + 1) * hl)
+                    exp, exp_lse = _reference(
+                        [g[:, sl] for g in go], [g[:, sl] for g in gl], base_e
+                    )
+                    torch.testing.assert_close(
+                        res.float(), exp.float(), rtol=1e-2, atol=1e-2
+                    )
+                    torch.testing.assert_close(res_lse, exp_lse, rtol=1e-4, atol=1e-4)
+                    if not masked:
+                        plain = dcp_lse_combine(cws, out, lse, base_e=base_e)
+                        torch.testing.assert_close(plain, res, rtol=0, atol=0)
+            if dim == 64:
+                try:
+                    dcp_lse_combine(cws, out, lse, row_counts=row_counts.cpu())
+                except ValueError as error:
+                    assert "output device" in str(error)
+                else:
+                    raise AssertionError("CPU row_counts must be rejected")
+            cws.close()
+
+        dim = 512
+        gws = GatherWorkspace(
+            group,
+            torch.device("cuda"),
+            hl,
+            dim,
+            torch.bfloat16,
+            world * hl,
+            max_tokens,
+            debug=True,
+        )
+        query = torch.randn(
+            tokens, hl, dim, device="cuda", dtype=torch.bfloat16, generator=gen
+        )
+        got = dcp_query_gather(gws, query)
+        torch.cuda.synchronize()
+        parts = [torch.empty_like(query) for _ in range(world)]
+        dist.all_gather(parts, query)
+        exp_q = torch.cat(parts, dim=1)
+        torch.testing.assert_close(got, exp_q)
+        try:
+            dcp_query_gather(gws, query.cpu())
+        except ValueError as error:
+            assert "same device" in str(error)
+        else:
+            raise AssertionError("CPU query must be rejected")
+
+        for _ in range(2):
+            split_query = torch.randn(
+                tokens, hl, dim, device="cuda", dtype=torch.bfloat16, generator=gen
+            )
+            assert dcp_query_gather(gws, split_query, phase=1) is None
+            split_got = dcp_query_gather(gws, split_query, phase=2)
+            split_parts = [torch.empty_like(split_query) for _ in range(world)]
+            dist.all_gather(split_parts, split_query)
+            torch.testing.assert_close(split_got, torch.cat(split_parts, dim=1))
+
+        gws.state[0].fill_(EPOCH_MASK - 2)
+        gws.state[1].zero_()
+        torch.cuda.synchronize()
+        dist.barrier(group=group.cpu_group)
+        for _ in range(6):
+            wrap_query = torch.randn(
+                tokens, hl, dim, device="cuda", dtype=torch.bfloat16, generator=gen
+            )
+            wrap_got = dcp_query_gather(gws, wrap_query)
+            wrap_parts = [torch.empty_like(wrap_query) for _ in range(world)]
+            dist.all_gather(wrap_parts, wrap_query)
+            torch.testing.assert_close(wrap_got, torch.cat(wrap_parts, dim=1))
+        assert int(gws.state[0].item()) == 3
+
+        nope_w, pe_w = 512, 64
+        qdim = nope_w + pe_w
+        qws = GatherWorkspace(
+            group,
+            torch.device("cuda"),
+            hl,
+            qdim,
+            torch.float8_e4m3fn,
+            world * hl,
+            max_tokens,
+        )
+        nope = torch.randn(
+            tokens, hl, nope_w, device="cuda", dtype=torch.bfloat16, generator=gen
+        )
+        pe = torch.randn(
+            tokens, hl, pe_w, device="cuda", dtype=torch.bfloat16, generator=gen
+        )
+        scale = torch.tensor([2.0], device="cuda", dtype=torch.float32)
+        qgot = dcp_quant_query_gather(qws, nope, pe, scale)
+        torch.cuda.synchronize()
+        local = torch.cat([nope, pe], dim=-1)
+        ref = (local.float() / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+        refs = [torch.empty_like(ref) for _ in range(world)]
+        dist.all_gather(refs, ref)
+        exp_fp8 = torch.cat(refs, dim=1)
+        torch.testing.assert_close(qgot.float(), exp_fp8.float(), rtol=0.1, atol=1.0)
+        try:
+            dcp_quant_query_gather(qws, nope, pe, scale.cpu())
+        except ValueError as error:
+            assert "same device" in str(error)
+        else:
+            raise AssertionError("CPU scale must be rejected")
+        qws.close()
+        gws.close()
+
+        bad_gws = GatherWorkspace(
+            group,
+            torch.device("cuda"),
+            hl,
+            576,
+            torch.bfloat16,
+            world * hl,
+            max_tokens,
+        )
+        bad_query = torch.randn(
+            tokens, hl, 576, device="cuda", dtype=torch.bfloat16, generator=gen
+        )
+        try:
+            dcp_query_gather(bad_gws, bad_query)
+        except ValueError as error:
+            assert "at most 256 words" in str(error)
+        else:
+            raise AssertionError("BF16 dim 576 gather must be rejected")
+        bad_gws.close()
+
+        graph_ws = CombineWorkspace(
+            group, torch.device("cuda"), hl, 128, max_tokens, debug=True
+        )
+        graph_out = torch.randn(
+            tokens,
+            world * hl,
+            128,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=gen,
+        )
+        graph_lse = torch.randn(
+            tokens,
+            world * hl,
+            device="cuda",
+            dtype=torch.float32,
+            generator=gen,
+        )
+        graph = torch.cuda.CUDAGraph()
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="The CUDA Graph is empty")
+            try:
+                with torch.cuda.graph(graph):
+                    dcp_lse_combine(graph_ws, graph_out, graph_lse)
+            except RuntimeError as error:
+                assert "do not support graph capture" in str(error)
+            else:
+                raise AssertionError("debug workspace graph capture must be rejected")
+        graph_ws.close()
+
+        missing_ws = CombineWorkspace(
+            group, torch.device("cuda"), hl, 128, max_tokens, debug=True
+        )
+        missing_out = torch.randn(
+            tokens,
+            world * hl,
+            128,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=gen,
+        )
+        missing_lse = torch.randn(
+            tokens,
+            world * hl,
+            device="cuda",
+            dtype=torch.float32,
+            generator=gen,
+        )
+        if rank == 0:
+            start = time.monotonic()
+            try:
+                dcp_lse_combine(missing_ws, missing_out, missing_lse)
+            except RuntimeError as error:
+                expected = ((1 << world) - 1) & ~1
+                assert f"missing ranks=0x{expected:x}" in str(error)
+                assert 8 <= time.monotonic() - start <= 20
+            else:
+                raise AssertionError("missing epoch-zero peers must raise")
+        dist.barrier(group=group.cpu_group)
+        missing_ws.close()
+
+        ahead_ws = CombineWorkspace(
+            group, torch.device("cuda"), hl, 128, max_tokens, debug=True
+        )
+        if rank == 0:
+            offset = epoch_offset(peer_layout(world, max_tokens, hl, 128))
+            ahead_ws.peers.bytes[offset : offset + 4 * world].view(torch.int32).fill_(2)
+            start = time.monotonic()
+            try:
+                dcp_lse_combine(ahead_ws, missing_out, missing_lse)
+            except RuntimeError as error:
+                assert "missing ranks=0x0" in str(error)
+                assert 8 <= time.monotonic() - start <= 20
+            else:
+                raise AssertionError("timeout with an empty rank mask must raise")
+        dist.barrier(group=group.cpu_group)
+        ahead_ws.close()
+
+        if rank == 0:
+            print("DCP_MAILBOX OK", flush=True)
+    finally:
+        dist.destroy_process_group()
+
+
+def main():
+    arch = get_gfx_runtime()
+    if arch != "gfx950":
+        print(f"SKIP DCP_MAILBOX: unsupported architecture {arch}", flush=True)
+        return
+    world = int(os.environ.get("WORLD", "8"))
+    token_counts = [int(value) for value in os.environ.get("TOKENS", "8,99").split(",")]
+    for index, tokens in enumerate(token_counts):
+        os.environ["MASTER_PORT"] = str(29741 + index)
+        mp.spawn(worker, args=(world, tokens), nprocs=world, join=True)
+
+
+if __name__ == "__main__":
+    main()
