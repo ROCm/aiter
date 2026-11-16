@@ -400,7 +400,12 @@ def _run_prefill(
             gemm1_out.view(problem.batch * problem.topk, -1),
             scale=None,
             quant_dtype=w2.dtype,
-            num_rows=None,
+            # Sorting pads each expert with a route that writes past the count.
+            num_rows=(
+                num_local_tokens * problem.topk
+                if quant_type == QuantType.per_Tensor and num_local_tokens is not None
+                else None
+            ),
         )
     else:
         down_in = gemm1_out

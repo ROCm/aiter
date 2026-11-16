@@ -4984,13 +4984,13 @@ def get_2stage_cfgs(
                 f"[fused_moe] discarding FlyDSL whole-graph config for {keys}: "
                 f"unsupported {unsupported}; using default heuristics"
             )
-    # A clamped SiLU on gfx942 per-token FP8 weights with no FlyDSL row: the
-    # default heuristics take the 1-stage kernel, which cannot apply
+    # A clamped SiLU on gfx942 per-token FP8 weights with no FlyDSL row in use:
+    # the default heuristics take the 1-stage kernel, which cannot apply
     # swiglu_limit, so run the gfx942 FlyDSL backend (it applies the clamp) at
     # its default config for this token count. Tuned FlyDSL rows still win.
     if (
         full_impl is None
-        and (cfg is None or cfg.get("run_1stage", False))
+        and (cfg is None or bypass_tuned_config or cfg.get("run_1stage", False))
         and clamped_silu
         and q_type == QuantType.per_Token
         and q_dtype_w == dtypes.fp8
