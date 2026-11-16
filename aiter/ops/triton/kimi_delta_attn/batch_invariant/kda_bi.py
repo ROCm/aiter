@@ -10,10 +10,13 @@ tiles and launch configs are fixed, every sum has a fixed order and the state is
 import functools
 
 import torch
+import triton
 
 from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn.batch_invariant.kda_bi import (
+    _kda_bi_chunk_table_kernel,
     _kda_bi_intra_kernel,
     _kda_bi_out_kernel,
+    _kda_bi_seq_chunks_kernel,
     _kda_bi_state_kernel,
 )
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
@@ -49,23 +52,6 @@ def _state_bv(n_seq_heads: int) -> int:
         bv for bv in choices if n_seq_heads * (HEAD_DIM // bv) >= grid["MIN_PROGRAMS"]
     ]
     return fits[-1] if fits else choices[0]
-
-
-def _chunks(cu_seqlens, n_chunks):
-    """(CHUNKS [NT, 2] int32 row ranges, SEQ_CHUNKS [N + 1] int32) on the device, no sync."""
-    dev = cu_seqlens.device
-    cu = cu_seqlens.to(torch.int64)
-    lens = cu[1:] - cu[:-1]
-    nch = (lens + CHUNK - 1) // CHUNK
-    seq_chunks = torch.zeros(cu.numel(), dtype=torch.int64, device=dev)
-    torch.cumsum(nch, 0, out=seq_chunks[1:])
-    seq = torch.repeat_interleave(
-        torch.arange(lens.numel(), device=dev), nch, output_size=n_chunks
-    )
-    start = cu[seq] + CHUNK * (torch.arange(n_chunks, device=dev) - seq_chunks[seq])
-    end = torch.minimum(start + CHUNK, cu[seq + 1])
-    chunks = torch.stack([start, end], 1).to(torch.int32)
-    return chunks, seq_chunks.to(torch.int32)
 
 
 def kda_bi_fwd(
@@ -146,7 +132,15 @@ def kda_bi_fwd(
     h0 = None if initial_state is None else initial_state.contiguous()
 
     if n_chunks > 0:
-        chunks, seq_chunks = _chunks(cu_seqlens.to(dev), n_chunks)
+        # chunk table on the device (no host sync): chunks per sequence, then each chunk's rows
+        cu = cu_seqlens.to(dev)
+        seq_chunks = torch.empty(N + 1, dtype=torch.int32, device=dev)
+        chunks = torch.empty(n_chunks, 2, dtype=torch.int32, device=dev)
+        c_seq, c_tab = _config("seq_chunks"), _config("chunk_table")
+        _kda_bi_seq_chunks_kernel[(1,)](cu, seq_chunks, N, **c_seq)
+        _kda_bi_chunk_table_kernel[(triton.cdiv(n_chunks, c_tab["BLOCK"]),)](
+            cu, seq_chunks, chunks, N, n_chunks, max(N.bit_length(), 1), **c_tab
+        )
         qg, kg, w, u = (torch.empty_like(q) for _ in range(4))
         aqk = torch.empty(1, T, H, CHUNK, dtype=torch.bfloat16, device=dev)
         glast = torch.empty(n_chunks, H, HEAD_DIM, dtype=torch.float32, device=dev)

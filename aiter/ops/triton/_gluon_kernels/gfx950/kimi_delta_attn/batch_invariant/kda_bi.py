@@ -698,3 +698,62 @@ def _kda_bi_out_kernel(
         BV,
         num_warps,
     )
+
+
+_seq_chunks_repr = make_kernel_repr("_kda_bi_seq_chunks_kernel", ["BLOCK"])
+
+
+@gluon.jit(repr=_seq_chunks_repr)
+def _kda_bi_seq_chunks_kernel(
+    CU, SEQ_CHUNKS, n_seq, BLOCK: gl.constexpr, num_warps: gl.constexpr
+):
+    """SEQ_CHUNKS[s + 1] = 64-row chunks of sequences 0..s (SEQ_CHUNKS[0] = 0), one program."""
+    LAY: gl.constexpr = gl.BlockedLayout(
+        [BLOCK // (64 * num_warps)], [64], [num_warps], [0]
+    )
+    gl.store(SEQ_CHUNKS, 0)
+    carry = gl.to_tensor(0)
+    for t in range(0, n_seq, BLOCK):
+        s = t + gl.arange(0, BLOCK, layout=LAY)
+        m = s < n_seq
+        lens = gl.load(CU + s + 1, mask=m, other=0) - gl.load(CU + s, mask=m, other=0)
+        nch = ((lens + BT - 1) // BT).to(gl.int32)
+        gl.store(SEQ_CHUNKS + s + 1, gl.associative_scan(nch, 0, _add) + carry, mask=m)
+        carry = carry + gl.sum(nch, axis=0)
+
+
+_chunk_table_repr = make_kernel_repr("_kda_bi_chunk_table_kernel", ["BLOCK"])
+
+
+@gluon.jit(repr=_chunk_table_repr)
+def _kda_bi_chunk_table_kernel(
+    CU,
+    SEQ_CHUNKS,
+    CHUNKS,
+    n_seq,
+    n_chunks,
+    n_steps,
+    BLOCK: gl.constexpr,
+    num_warps: gl.constexpr,
+):
+    """CHUNKS[c] = (first row, end row) of chunk c: the sequence is found by binary search in
+    SEQ_CHUNKS (n_steps >= log2(n_seq + 1))."""
+    LAY: gl.constexpr = gl.BlockedLayout(
+        [BLOCK // (64 * num_warps)], [64], [num_warps], [0]
+    )
+    c = gl.program_id(0) * BLOCK + gl.arange(0, BLOCK, layout=LAY)
+    m = c < n_chunks
+    lo = gl.zeros([BLOCK], gl.int32, LAY)
+    hi = gl.zeros([BLOCK], gl.int32, LAY) + n_seq
+    for _ in range(n_steps):
+        live = hi - lo > 1
+        mid = (lo + hi) // 2
+        go = gl.load(SEQ_CHUNKS + mid, mask=m & live, other=0) <= c
+        lo = gl.where(live & go, mid, lo)
+        hi = gl.where(live & (~go), mid, hi)
+    start = gl.load(CU + lo, mask=m, other=0) + BT * (
+        c - gl.load(SEQ_CHUNKS + lo, mask=m, other=0)
+    )
+    end = gl.minimum(start + BT, gl.load(CU + lo + 1, mask=m, other=0))
+    gl.store(CHUNKS + 2 * c, start.to(gl.int32), mask=m)
+    gl.store(CHUNKS + 2 * c + 1, end.to(gl.int32), mask=m)
