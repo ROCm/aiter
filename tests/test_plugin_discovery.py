@@ -105,7 +105,8 @@ def test_an_installed_provider_is_still_not_enabled_by_default(tmp_path, monkeyp
         return left + right
 
     assert add(2, 3) == 5
-    assert plugin.last_decision().reason == "provider-not-enabled"
+    assert plugin.last_decision() is None, "nothing enabled, nothing recorded"
+    assert plugin.explain("demo.add", 2, 3).decision.reason == "provider-not-enabled"
     # It was found, just not allowed to serve.
     assert plugin.status()["providers"][0]["name"] == "aklr"
 

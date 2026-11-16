@@ -30,6 +30,7 @@ from ..ops.gemm_op_common import (
     mxscale_w_scale_block,
     with_mxscale_w_scale_block,
 )
+from ..plugin import route as _route
 from ..utility import dtypes
 from ..utility.graph_alloc import capture_scoped_cache, persistent_alloc
 from .mxfp8fp4gemm_common import (
@@ -1285,6 +1286,7 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
     return Y
 
 
+@_route(op="gemm_a8w8_blockscale", fake=gemm_a8w8_blockscale_fake, mutates_args=[])
 @torch_compile_guard(mutates_args=[], gen_fake=gemm_a8w8_blockscale_fake)
 def gemm_a8w8_blockscale(
     XQ: Tensor,
@@ -1309,6 +1311,10 @@ def gemm_a8w8_blockscale(
     Group32 with isBpreshuffled (weights shuffled (16, 16)) goes to
     gemm_a8w8_blockscale_bpreshuffle's E8M0 route and its
     AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE table.
+
+    Returns a newly allocated ``[M, N]`` tensor of ``dtype``; there is no
+    caller-owned output buffer on this contract. ``gemm_a8w8_blockscale_bpreshuffle``
+    is the one that takes an ``out=``.
     """
     is_group32 = _group32_w_scale_block(XQ, WQ, x_scale, w_scale) is not None
     # A malformed byte-scale layout must not fall through to FP32 CK dispatch.
@@ -1491,6 +1497,12 @@ def _warn_blockscale_asm_row_not_bf16(n: int, k: int, dtype: torch.dtype):
     )
 
 
+# AITER exposes the shuffled-b weight layout as its own public function. It is a
+# layout, not a backend, so the name is allowed here -- but the two are not
+# independent: gemm_a8w8_blockscale with isBpreshuffled delegates to this one's
+# E8M0 route. Whether they should converge is #7150's question, not this one's;
+# routing them as they are keeps this pilot out of a public API change.
+@_route(op="gemm_a8w8_blockscale_bpreshuffle")
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
 def gemm_a8w8_blockscale_bpreshuffle(
     XQ: Tensor,
@@ -1500,6 +1512,31 @@ def gemm_a8w8_blockscale_bpreshuffle(
     dtype: torch.dtype = dtypes.bf16,
     out: Tensor | None = None,
 ) -> Tensor:
+    """Block-scaled A8W8 GEMM whose weight is already in MFMA-fragment order.
+
+    Same math as :func:`gemm_a8w8_blockscale`, but ``WQ`` was permuted by
+    ``shuffle_weight(w, layout=(16, 16))`` at load time. It is a separate
+    contract rather than a flag for the reason the batched pair gives: the
+    shuffled weight has the SAME shape, dtype and strides as the row-major
+    one, so a kernel built for the other layout reads the right bytes in the
+    wrong order and returns a plausible wrong answer instead of failing.
+
+    Args:
+        XQ: ``[M, K]`` fp8 activation.
+        WQ: ``[N, K]`` fp8 weight, ``(16, 16)``-preshuffled.
+        x_scale: per-block activation scales -- ``[M, K // 32]`` e8m0 for the
+            group32 path, else the 128x128 fp32 layout.
+        w_scale: the matching weight scales.
+        dtype: output dtype; ``bf16`` or ``fp16``.
+        out: optional caller-owned ``[M, N]`` output buffer, so the result
+            lands at a FIXED address -- what lets this GEMM's consumer be
+            captured into a cudagraph without a per-step input copy. Must
+            match ``(M, N)``, ``dtype`` and device. Not every backend can
+            honour it: the triton fallbacks self-allocate and assert rather
+            than silently return a different address.
+
+    Returns the output tensor -- ``out`` itself when one was passed.
+    """
     assert dtype in [
         dtypes.bf16,
         dtypes.fp16,
