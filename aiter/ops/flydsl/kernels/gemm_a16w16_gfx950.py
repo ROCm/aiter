@@ -331,7 +331,7 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     out_suffix = "_fp32c" if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else ""
     name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
     if param.split_k_partials:
-        name += f"_sp_d{param.device_index}"
+        name += f"_sp3_d{param.device_index}"
     else:
         name += "_kst4" if param.is_split_k else "_ks1"
     name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
@@ -451,10 +451,11 @@ def async_load_to_lds(
             global_offset = global_k_idx * tile.leading_stride + safe_global_outer_idx
         else:
             global_offset = safe_global_outer_idx * tile.leading_stride + global_k_idx
+        # Keep each LDS DMA issue bracketed: removing these scheduling fences
+        # caused intermittent wrong partials on multi-row-tile SP configurations.
         src = fx.make_view(tile.src_base + global_offset, g2s_copy_layout)
         dst = fx.make_view(lds_ptr, g2s_copy_layout)
-        if const_expr(not param.split_k_partials):
-            rocdl.sched_barrier(0)
+        rocdl.sched_barrier(0)
         if const_expr(tile.non_temporal):
             # The async copy atom has no cache-policy operand. Keep the raw
             # load async too, so the existing asyncmark/wait_asyncmark groups
@@ -471,8 +472,7 @@ def async_load_to_lds(
             )
         else:
             fx.copy_atom_call(context.async_g2s_copy_atom, src, dst)
-        if const_expr(not param.split_k_partials):
-            rocdl.sched_barrier(0)
+        rocdl.sched_barrier(0)
         if i < load_iters - 1:
             lds_ptr = lds_ptr + block_threads * async_load_vec_size
 
@@ -832,8 +832,7 @@ def gemm_a16w16_gfx950_kernel(
         splitk_protocol.zero_c()
         expected_signal = splitk_protocol.take_ticket(split_k)
         splitk_protocol.publish(expected_signal)
-    if const_expr(not param.split_k_partials):
-        rocdl.sched_barrier(0)
+    rocdl.sched_barrier(0)
 
     main_loop_end = k_tiles - (stages - 1)
     for k_tile in range(0, main_loop_end, 1):
@@ -845,8 +844,7 @@ def gemm_a16w16_gfx950_kernel(
         async_load_a_to_lds(k_tile + (stages - 1), write_stage)
         rocdl.asyncmark()
         compute_stage(current_stage, k_tile)
-        if const_expr(not param.split_k_partials):
-            rocdl.sched_barrier(0)
+        rocdl.sched_barrier(0)
 
     current_stage = main_loop_end % stages
     for s in range_constexpr(0, stages - 1):
