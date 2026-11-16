@@ -2893,7 +2893,9 @@ _B_LDS_LIMIT = 160 * 1024
 _BPRESHUFFLE_CACHES = ((0, 0), (1, 17), (17, 1))
 _M_SMALL_STORE_CACHE_PAIRS = ((0, 2), (1, 2), (17, 2))
 GFX950_CO_KERNELS_JSON = os.path.join(
-    os.path.dirname(__file__), "gen_co", "co_kernels_gfx950.json"
+    os.path.dirname(__file__),
+    "gen_co",
+    "co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json",
 )
 a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list = {}
 
@@ -3024,7 +3026,7 @@ def _bpreshuffle_instance(
 
 def _gfx950_co_image_path(path, entry):
     root = os.environ.get("OPUS_GEN_CO_DIR") or os.path.dirname(path)
-    return os.path.join(root, "gfx950", entry["image"])
+    return os.path.join(root, "gfx950", "a8w8_blockscale_bpreshuffle", entry["image"])
 
 
 def _load_gfx950_co_kernels(path, require_image=True):

@@ -30,7 +30,7 @@ private:
         const char* env = std::getenv("OPUS_GEN_CO_DIR");
         const std::string root = env && *env ? env : OPUS_GEN_CO_DIR;
         AITER_CHECK(!root.empty(), "gfx950 CO directory is empty");
-        const auto path = root + "/gfx950/" + image_name;
+        const auto path = root + "/gfx950/a8w8_blockscale_bpreshuffle/" + image_name;
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         AITER_CHECK(file.is_open(), "gfx950 cannot open CO: ", path);
         const std::streamsize size = file.tellg();

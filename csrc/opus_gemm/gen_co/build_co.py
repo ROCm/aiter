@@ -21,8 +21,8 @@ goes through the ordinary JIT path.
 
 Source of truth
 ---------------
-``gen_co/co_kernels_<arch>.json`` -- read by ``opus_gemm_common.py`` to build the kid
-table (which drives the JIT codegen) and re-read from there by this script. One
+CO manifests are read by ``opus_gemm_common.py`` to build the kid table (which
+drives the JIT codegen) and re-read from there by this script. One
 file describes each variant's tile, cluster, launch bounds, VGPR budget, dtypes
 and device flags, so adding a variant never touches Python. Both sides spell the
 traits through ``co_traits_args()``, which is what makes the three names
@@ -31,6 +31,10 @@ identical without any sidecar::
     .co filename == extern "C" symbol inside the .co == host launcher symbol
 
 gfx950 uses short image/launcher names while retaining each verified ELF symbol.
+Its manifest is
+``gen_co/co_kernels_gfx950_a8w8_blockscale_bpreshuffle.json``. Its images and
+build metadata live in ``gen_co/gfx950/a8w8_blockscale_bpreshuffle/``.
+The gfx1250 manifest is ``gen_co/co_kernels_gfx1250.json``.
 
 The compiler is NOT pinned to a version
 ---------------------------------------
@@ -826,7 +830,7 @@ def build_one(k, args, llvm_bin, workdir):
 
 def _default_co_output_dir(arch, offload_arch):
     if arch == "gfx950":
-        return os.path.join(_HERE, arch)
+        return os.path.join(_HERE, arch, "a8w8_blockscale_bpreshuffle")
     if offload_arch == "gfx1250-strict":
         return os.path.join(_HERE, arch + "-strict")
     return os.path.join(_HERE, "named_reg", arch)
