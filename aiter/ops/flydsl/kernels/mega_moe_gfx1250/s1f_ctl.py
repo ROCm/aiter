@@ -86,11 +86,14 @@ _S1F_MAX_RECV = 4096
 #: 8192 tokens/rank: 886 vs 959 us/layer on EP2, 900 vs 1063 on EP4. Top-7 is
 #: the same model with its shared expert fused: 1200 vs 1405 on EP2. Past
 #: 4096 tokens this compiles a few more plan widths (7 instead of 4 at 8192).
+#: DSR1 EP4 with its shared expert fused (top-9) runs the 256-tile S1F past
+#: 4096 as well: 798 vs 899 us/layer at 4096 tokens/rank, 384 vs 422 at 1536.
 _S1F_MAX_RECV_BY_SHAPE: dict = {
     (2, 6): 1 << 30,
     (4, 6): 1 << 30,
     (2, 7): 1 << 30,
     (4, 7): 1 << 30,
+    (4, 9): 1 << 30,
 }
 
 
