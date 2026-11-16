@@ -81,9 +81,9 @@ accepts an integer or `(pad_height, pad_width)`.
 Input spatial dimensions must be positive, and padding must be nonnegative.
 Invalid modes are rejected even when padding is zero.
 
-`zeros` uses implicit padding. For other modes with nonzero padding, the input
-is padded with `torch.nn.functional.pad` before routing and activation packing;
-convolution then uses padding `(0, 0)`. Zero padding amounts skip materialization.
+For nonzero modes with nonzero padding, `torch.nn.functional.pad` runs before
+routing and activation packing; convolution then uses padding `(0, 0)`.
+Zero padding amounts skip materialization.
 Materialized padding allocates a temporary input; layout conversion may require
 an extra copy.
 
@@ -93,8 +93,6 @@ execution within one process is unsupported.
 
 External `x_blocked` requires `padding_mode="zeros"` or zero padding amounts.
 Otherwise, omit it to pack the padded input; passing it raises `ValueError`.
-
-Conv3D supports only implicit zero padding.
 
 ### Inference tensors
 
@@ -170,9 +168,9 @@ and seed under both backends, only VAE convs swapped to Triton): max diff
 
 - Only `groups=1` is implemented; callers must send depthwise or grouped
   convolutions to another backend.
-- All Conv2D APIs support `zeros`, `reflect`, `replicate`, and `circular`
-  padding as described above. Conv3D supports only zero padding. Per-axis pad
-  amounts may differ, for example `(0, 2)` for Conv2D or `(0, 1, 2)` for Conv3D.
+- Conv3D supports only implicit zero padding.
+- Per-axis pad amounts may differ, for example `(0, 2)` for Conv2D or
+  `(0, 1, 2)` for Conv3D.
 - Inputs must be `fp16` or `bf16`.
 - Forward only (no backward / training).
 

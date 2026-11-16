@@ -6,30 +6,13 @@ Kernel correctness tests compare Triton against torch.nn.functional.conv2d on
 synthetic tensors. Routing tests exercise configuration lookup without launching
 kernels. No model loading, network access, or torchvision.
 
-Test matrix (uniform across the four primary test families):
+Numerical tests cover fp16/bf16, NCHW/NHWC, edge cases, fuzzing, bias,
+activations, and NCHW cross-method agreement. Regression tests cover routing,
+configuration selection, scalar parameters, weight-pack caches, and inference
+tensors.
 
-    NCHW × {fp16, bf16} × every kernel  (5 kernels)         = 10
-    NHWC × {fp16, bf16}                  (single dispatch)  =  2
-                                                            ---
-                                  base cases per test family  12
-
-test_edge, test_fuzz, test_no_bias use the base matrix as-is.
-test_activations multiplies the base matrix by 3 (relu/relu6/gelu) -> 36.
-
-Plus test_cross_method (differential correctness) that runs every NCHW
-kernel on shapes routable by all of them and verifies they all match
-F.conv2d. NCHW-only by design; 2 cases (one per dtype).
-
-Plus 7 exact-route and configuration-precedence regression cases, 2
-scalar-parameter cases, 1 cache-clear case, and 2 inference-tensor cases.
-
-Convolution cases: 12 + 12 + 12 + 36 + 2 + 7 + 2 + 1 + 2 = 86.
-Padding preparation adds 20 focused cases for validation, boundary amounts,
-layout conversion, empty batches, no-op reuse, and delegation to F.pad.
-Routed padding integration adds 8 cases for numerical results across specialized
-routes and zero-padding bypass.
-Specialized padding adds 9 cases: seven direct-API comparisons using the same
-matrix and two prepacked-input contracts.
+Padding tests cover routed and specialized APIs, validation, layouts, boundary
+amounts, empty batches, no-op reuse, and prepacked-input restrictions.
 
 The whole module is skipped without a supported GPU. Padding preparation itself
 does not require architecture-specific padding configurations.
