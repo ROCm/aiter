@@ -61,6 +61,13 @@ route-out kid writes `[token * topk, hidden]`; the MXFP8 route-out kid writes
 `[token * topk, hidden + hidden / 8]` as payload plus scale. Both use the
 shared route-output reduce.
 
+Opus A8W4 MXFP8 route output is enabled by default. For model-level accuracy
+debugging, set `AITER_OPUS_STAGE2_FP8=0`. Any tuned MXFP8 route-output kid then
+keeps its CSV-selected GEMM shape, sorting block size, and reduce tile, but
+writes a BF16 route workspace and uses the BF16 reduce path. Direct-atomic and
+already-BF16 kids are unchanged. The switch is read at each invocation, so it
+may be changed after importing `aiter`.
+
 Supported A8W4 kernel ids:
 
 Numbering convention:

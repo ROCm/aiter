@@ -8,9 +8,6 @@ from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla,
 )
-from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
-    batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
-)
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
@@ -22,6 +19,7 @@ from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8_a_per_token_group
 from op_tests.triton_tests.gemm.batched.test_batched_gemm_a16wfp4 import (
     generate_batched_gemm_a16wfp4_inputs,
 )
+from op_tests.triton_tests.quant.test_fused_fp8_quant import per_token_fp8_group_quant
 from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
 
 
@@ -191,12 +189,22 @@ def test_fused_fp4_bmm_rope_cat_and_cache_mla(
     torch.testing.assert_close(ref_kv_cache, triton_kv_cache, atol=1e-1, rtol=1e-1)
 
 
+def ref_fp8_bmm(x, w, w_scale, group_size, dtype):
+    """Torch BMM on the kernels' per-token-group FP8 quant of x: [QH, T, K] -> [T, QH, N]."""
+    QH, T, K = x.shape
+    xq, xs = per_token_fp8_group_quant(x.reshape(-1, K), w.dtype, group_size)
+    x = (xq.float() * xs.repeat_interleave(group_size, dim=-1)[:, :K]).view(QH, T, K)
+    y = torch.bmm(x, w.float().transpose(1, 2)) * w_scale
+    return y.transpose(0, 1).to(dtype)
+
+
 @pytest.mark.parametrize("T", [1, 2, 32, 2048])
 @pytest.mark.parametrize("QH_per_KH", [16])
 @pytest.mark.parametrize("KH", [1, 8])
 @pytest.mark.parametrize("D", [128])
-@pytest.mark.parametrize("D_q_nope", [128])
-@pytest.mark.parametrize("D_lora", [512])
+@pytest.mark.parametrize(
+    "D_q_nope, D_lora", [(128, 512), (512, 192)], ids=["N128-K512", "N512-K192"]
+)
 @pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
 @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
@@ -231,6 +239,7 @@ def test_fused_fp8_bmm_rope_cat_and_cache_mla(
         layout="TN",
         transpose_bm=True,
     )
+    q_nope = torch.randn_like(q_nope)
 
     _, _, _, _, _, positions, _, cos, sin = generate_rope_inputs(
         1,
@@ -274,18 +283,7 @@ def test_fused_fp8_bmm_rope_cat_and_cache_mla(
     slot_mapping = torch.randperm(T, device="cuda")
     kv_cache_og_dtype = kv_cache.dtype
 
-    ref_q_nope_out = (
-        batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-            q_nope,
-            w_k,
-            w_k_scale,
-            group_size=128,
-            bias=None,
-            dtype=dtype,
-            YQ=None,
-            transpose_bm=True,
-        )
-    )
+    ref_q_nope_out = ref_fp8_bmm(q_nope, w_k, w_k_scale, 128, dtype)
 
     ref_kv_cache = kv_cache.clone()
     if cache_dtype == torch.uint8:

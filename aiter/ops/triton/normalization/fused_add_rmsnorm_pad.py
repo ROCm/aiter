@@ -1,14 +1,18 @@
 import torch
 import triton
 
-from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_add_rmsnorm_pad import (
+from aiter.ops.triton._gluon_kernels.gfx1250.normalization.fused_add_rmsnorm_pad import (
     _gluon_fused_add_rmsnorm_pad_kernel,
 )
 from aiter.ops.triton._triton_kernels.normalization.fused_add_rmsnorm_pad import (
     _fused_add_rmsnorm_pad,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -19,10 +23,7 @@ def _get_config(block_size_n: int, backend: str) -> dict:
         "normalization", "FUSED_ADD_RMSNORM_PAD", backend=backend
     )
     raw = load_config_json(f"{config_dir}/DEFAULT.json")
-    for bound in sorted(int(k[len("N_LEQ_") :]) for k in raw if k.startswith("N_LEQ_")):
-        if block_size_n <= bound:
-            return dict(raw[f"N_LEQ_{bound}"])
-    return dict(raw["any"])
+    return select_leq_config(raw, block_size_n)
 
 
 def fused_add_rmsnorm_pad(
@@ -53,7 +54,7 @@ def fused_add_rmsnorm_pad(
     M, N = x.shape
 
     if backend is None:
-        backend = "gluon" if get_arch() == "gfx1250" else "triton"
+        backend = "gluon" if get_arch() in ("gfx1250", "gfx1250-strict") else "triton"
 
     backend = backend.lower()
     assert backend in (
@@ -62,7 +63,7 @@ def fused_add_rmsnorm_pad(
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
 
     if backend == "gluon":
-        if get_arch() == "gfx1250":
+        if get_arch() in ("gfx1250", "gfx1250-strict"):
 
             if x_pad_to_multiple > 0:
                 N_out = triton.cdiv(N, x_pad_to_multiple) * x_pad_to_multiple

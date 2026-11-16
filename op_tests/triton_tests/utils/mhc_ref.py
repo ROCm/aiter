@@ -354,9 +354,9 @@ def generate_mhc_inputs(
     phi = torch.randn(nC, N_total, dtype=dtype, device=device) * 0.1
 
     # scaling factors (Eq 12)
-    alpha_pre = 0.5 + torch.rand(1).item()
-    alpha_post = 0.5 + torch.rand(1).item()
-    alpha_res = 0.5 + torch.rand(1).item()
+    alpha_pre = 0.5 + torch.rand(1, dtype=torch.float32, device=device).item()
+    alpha_post = 0.5 + torch.rand(1, dtype=torch.float32, device=device).item()
+    alpha_res = 0.5 + torch.rand(1, dtype=torch.float32, device=device).item()
 
     # bias (Eq 13)
     bias = torch.randn(N_total, dtype=torch.float32, device=device) * 0.1

@@ -77,9 +77,9 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
 
     blk_size = block_size(x)
     USE_BLOCKED = use_blocked(x)
-    NUM_PRGMS = num_programs_fwd(x)
+    num_prgms = num_programs_fwd(x)
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (num_prgms,)
     _rms_norm_kernel[grid](
         x,
         y,
@@ -92,7 +92,6 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
         epsilon,
         blk_size,
         USE_BLOCKED,
-        NUM_PRGMS,
     )
 
     return y, rsigma
@@ -112,9 +111,9 @@ def _rmsnorm_forward_with_add(
 
     blk_size = block_size(x)
     USE_BLOCKED = use_blocked(x)
-    NUM_PRGMS = num_programs_fwd(x)
+    num_prgms = num_programs_fwd(x)
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (num_prgms,)
     _fused_add_rmsnorm_kernel[grid](
         x,
         out,
@@ -129,7 +128,6 @@ def _rmsnorm_forward_with_add(
         epsilon,
         blk_size,
         USE_BLOCKED,
-        NUM_PRGMS,
     )
 
 
@@ -343,7 +341,9 @@ def rms_norm(input: torch.Tensor, weight: torch.Tensor, epsilon: float):
     Returns:
     - Output: The output tensor with shape (M, N).
     """
-    _LOGGER.info(f"RMSNORM: input={tuple(input.shape)} weight={tuple(weight.shape)} ")
+    _LOGGER.info(
+        "RMSNORM: input=%s weight=%s ", tuple(input.shape), tuple(weight.shape)
+    )
     return _RMSNorm.apply(input, weight, epsilon, torch.is_grad_enabled())
 
 
@@ -371,7 +371,10 @@ def rmsnorm2d_fwd_with_add(
     - Output: The output tensor with shape (M, N).
     """
     _LOGGER.info(
-        f"RMSNORM_2D_FWD_ADD: input={tuple(input.shape)} weight={tuple(weight.shape)} residual_in={tuple(residual_in.shape)}  "
+        "RMSNORM_2D_FWD_ADD: input=%s weight=%s residual_in=%s  ",
+        tuple(input.shape),
+        tuple(weight.shape),
+        tuple(residual_in.shape),
     )
     return _RMSNorm2dFwdWithAdd.apply(
         out, input, residual_in, residual_out, weight, epsilon, torch.is_grad_enabled()
@@ -398,14 +401,17 @@ def rmsnorm2d_fwd_with_smoothquant(
     - Epsilon: A value added to the denominator for numerical stability.
     """
     _LOGGER.info(
-        f"RMSNORM_2D_FWD_SMOOTHQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} "
-        + f"xscale={tuple(xscale.shape)} yscale={tuple(yscale.shape)}  "
+        "RMSNORM_2D_FWD_SMOOTHQUANT: input=%s weight=%s xscale=%s yscale=%s  ",
+        tuple(input.shape),
+        tuple(weight.shape),
+        tuple(xscale.shape),
+        tuple(yscale.shape),
     )
     n_rows, n_cols = input.shape
 
     blk_size = block_size(input)
     USE_BLOCKED = use_blocked(input)
-    NUM_PRGMS = num_programs_fwd(input)
+    num_prgms = num_programs_fwd(input)
 
     IS_SMOOTH = True
     DTYPE_MAX = get_dtype_max(out.dtype)
@@ -421,7 +427,7 @@ def rmsnorm2d_fwd_with_smoothquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (num_prgms,)
     _quant_rms_norm_kernel[grid](
         input,
         out,
@@ -444,7 +450,6 @@ def rmsnorm2d_fwd_with_smoothquant(
         dump_rms_norm,
         blk_size,
         USE_BLOCKED,
-        NUM_PRGMS,
     )
 
 
@@ -469,13 +474,16 @@ def rmsnorm2d_fwd_with_dynamicquant(
     - Epsilon: A value added to the denominator for numerical stability.
     """
     _LOGGER.info(
-        f"RMSNORM_2D_FWD_DYNAMICQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} yscale={tuple(yscale.shape)}  "
+        "RMSNORM_2D_FWD_DYNAMICQUANT: input=%s weight=%s yscale=%s  ",
+        tuple(input.shape),
+        tuple(weight.shape),
+        tuple(yscale.shape),
     )
     n_rows, n_cols = input.shape
 
     blk_size = block_size(input)
     USE_BLOCKED = use_blocked(input)
-    NUM_PRGMS = num_programs_fwd(input)
+    num_prgms = num_programs_fwd(input)
 
     xscale = None
     IS_SMOOTH = False
@@ -491,7 +499,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (num_prgms,)
     _quant_rms_norm_kernel[grid](
         input,
         out,
@@ -514,7 +522,6 @@ def rmsnorm2d_fwd_with_dynamicquant(
         dump_rms_norm,
         blk_size,
         USE_BLOCKED,
-        NUM_PRGMS,
     )
 
     return out_rms_norm
@@ -545,14 +552,18 @@ def rmsnorm2d_fwd_with_add_smoothquant(
     - Epsilon: A value added to the denominator for numerical stability.
     """
     _LOGGER.info(
-        f"RMSNORM_2D_FWD_ADD_SMOOTHQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} "
-        + f"residual_in={tuple(residual_in.shape)} xscale={tuple(xscale.shape)} yscale={tuple(yscale.shape)}  "
+        "RMSNORM_2D_FWD_ADD_SMOOTHQUANT: input=%s weight=%s residual_in=%s xscale=%s yscale=%s  ",
+        tuple(input.shape),
+        tuple(weight.shape),
+        tuple(residual_in.shape),
+        tuple(xscale.shape),
+        tuple(yscale.shape),
     )
     n_rows, n_cols = input.shape
 
     blk_size = block_size(input)
     USE_BLOCKED = use_blocked(input)
-    NUM_PRGMS = num_programs_fwd(input)
+    num_prgms = num_programs_fwd(input)
 
     IS_SMOOTH = True
     DTYPE_MAX = get_dtype_max(out.dtype)
@@ -562,7 +573,7 @@ def rmsnorm2d_fwd_with_add_smoothquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (num_prgms,)
     _quant_fused_add_rmsnorm_kernel[grid](
         input,
         out,
@@ -582,7 +593,6 @@ def rmsnorm2d_fwd_with_add_smoothquant(
         IS_SMOOTH,
         blk_size,
         USE_BLOCKED,
-        NUM_PRGMS,
     )
 
 
@@ -609,13 +619,17 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     - Epsilon: A value added to the denominator for numerical stability.
     """
     _LOGGER.info(
-        f"RMSNORM_2D_FWD_ADD_DYNAMICQUANT: input={input.shape} weight={weight.shape} residual_in={residual_in.shape} yscale={yscale.shape}  "
+        "RMSNORM_2D_FWD_ADD_DYNAMICQUANT: input=%s weight=%s residual_in=%s yscale=%s  ",
+        input.shape,
+        weight.shape,
+        residual_in.shape,
+        yscale.shape,
     )
     n_rows, n_cols = input.shape
 
     blk_size = block_size(input)
     USE_BLOCKED = use_blocked(input)
-    NUM_PRGMS = num_programs_fwd(input)
+    num_prgms = num_programs_fwd(input)
 
     xscale = None
     IS_SMOOTH = False
@@ -626,7 +640,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (num_prgms,)
     _quant_fused_add_rmsnorm_kernel[grid](
         input,
         out,
@@ -646,7 +660,6 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
         IS_SMOOTH,
         blk_size,
         USE_BLOCKED,
-        NUM_PRGMS,
     )
 
 

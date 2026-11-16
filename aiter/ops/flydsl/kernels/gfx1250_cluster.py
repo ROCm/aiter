@@ -15,9 +15,8 @@ Upstream: FlyDSL ``kernels/common/gfx1250_cluster.py`` @ ROCm/FlyDSL#880.
 
 from __future__ import annotations
 
-from flydsl.expr import arith as _arith_ext
+import flydsl.expr as fx
 from flydsl.expr.meta import dsl_loc_tracing
-from flydsl.expr.typing import T
 
 
 @dsl_loc_tracing
@@ -45,23 +44,20 @@ def compute_mcast_masks(local_x, local_y, cluster_m: int, cluster_n: int):
     Returns:
         (a_mask, b_mask) as MLIR i32 values for TDM workgroup_mask.
     """
-    local_x_i32 = _arith_ext.index_cast(T.i32, local_x)
-    local_y_i32 = _arith_ext.index_cast(T.i32, local_y)
-    cluster_m_i32 = _arith_ext.constant(cluster_m, type=T.i32)
+    local_x_i32 = fx.Int32(local_x)
+    local_y_i32 = fx.Int32(local_y)
 
     # A mask: pattern has bits at strides of cluster_m, shifted by local_x.
     a_pattern_val = 0
     for ly in range(cluster_n):
         a_pattern_val |= 1 << (ly * cluster_m)
-    a_pattern = _arith_ext.constant(a_pattern_val, type=T.i32)
-    a_mask = _arith_ext.shli(a_pattern, local_x_i32)
+    a_mask = fx.Int32(a_pattern_val) << local_x_i32
 
     # B mask: cluster_m contiguous low bits, shifted by local_y * cluster_m.
-    b_pattern = _arith_ext.constant((1 << cluster_m) - 1, type=T.i32)
-    col_base = _arith_ext.muli(local_y_i32, cluster_m_i32)
-    b_mask = _arith_ext.shli(b_pattern, col_base)
+    b_mask = fx.Int32((1 << cluster_m) - 1) << (local_y_i32 * cluster_m)
 
-    return a_mask, b_mask
+    # Descriptor builders consume bare i32 SSA values.
+    return a_mask.ir_value(), b_mask.ir_value()
 
 
 __all__ = ["compute_mcast_masks"]

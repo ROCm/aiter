@@ -140,3 +140,7 @@ def test_qr_all_reduce_rmsnorm_matches_torch_reference(dtype: torch.dtype):
             rtol=rtol,
             atol=atol,
         )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

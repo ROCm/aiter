@@ -50,7 +50,6 @@ from .utils import (
 
 
 class SpinTimer:
-
     def record_activity(self):
         pass
 
@@ -87,7 +86,6 @@ class SpinSleepTimer(SpinTimer):
 
 
 class ShmRingBuffer:
-
     def __init__(
         self,
         n_reader: int,
@@ -201,11 +199,19 @@ class ShmRingBuffer:
             self.handle(),
         )
 
+    def close(self):
+        shm = getattr(self, "shared_memory", None)
+        if shm is not None:
+            try:
+                shm.close()
+                if self.is_creator:
+                    shm.unlink()
+            except FileNotFoundError:
+                pass
+            self.shared_memory = None
+
     def __del__(self):
-        if hasattr(self, "shared_memory"):
-            self.shared_memory.close()
-            if self.is_creator:
-                self.shared_memory.unlink()
+        self.close()
 
     @contextmanager
     def get_data(self, current_idx: int):
@@ -233,7 +239,6 @@ class Handle:
 
 
 class MessageQueue:
-
     def __init__(
         self,
         n_reader,  # number of all readers
@@ -252,6 +257,7 @@ class MessageQueue:
         self.n_remote_reader = n_remote_reader
 
         context = Context()
+        self.context = context
 
         if n_local_reader > 0:
             # for local readers, we will:
@@ -318,6 +324,32 @@ class MessageQueue:
     def export_handle(self) -> Handle:
         return self.handle
 
+    def close(self):
+        # Deterministically release the OS resources that outlive the process:
+        # the creator's psm shared-memory segment (unlinked via buffer.close())
+        # and the zmq IPC/TCP sockets + IO thread. Relying on __del__/GC leaks
+        # these when a rank is killed (e.g. a distributed timeout), which
+        # accumulates in /dev/shm across repeated group create/destroy cycles.
+        buf = getattr(self, "buffer", None)
+        if buf is not None:
+            buf.close()
+            self.buffer = None
+        ctx = getattr(self, "context", None)
+        if ctx is not None:
+            # destroy() closes any sockets still open on this context
+            # (local/remote) and terminates its IO thread; linger=0 drops
+            # anything undelivered instead of blocking teardown.
+            try:
+                ctx.destroy(linger=0)
+            except Exception:  # noqa: BLE001, S110
+                pass
+            self.context = None
+            self.local_socket = None
+            self.remote_socket = None
+
+    def __del__(self):
+        self.close()
+
     @staticmethod
     def create_from_handle(handle: Handle, rank) -> "MessageQueue":
         self = MessageQueue.__new__(MessageQueue)
@@ -325,6 +357,7 @@ class MessageQueue:
         self._is_writer = False
 
         context = Context()
+        self.context = context
 
         if rank in handle.local_reader_ranks:
             assert handle.buffer_handle is not None

@@ -97,7 +97,7 @@ def test_cross_entropy_forward_ignore_index():
     torch.manual_seed(7)
     B, SQ, V = 2, 4, 128
     ignore_idx = -100
-    logits = torch.randn(B, SQ, V, device="cuda")
+    logits = torch.randn(B, SQ, V, dtype=torch.float32, device="cuda")
     target = torch.randint(0, V, (B, SQ), device="cuda")
     # mask the first row of each batch
     target[0, 0] = ignore_idx
@@ -132,7 +132,7 @@ def test_cross_entropy_forward_reduce_with_ignore_index():
     torch.manual_seed(13)
     B, SQ, V = 4, 8, 256
     ignore_idx = -100
-    logits = torch.randn(B, SQ, V, device="cuda")
+    logits = torch.randn(B, SQ, V, dtype=torch.float32, device="cuda")
     target = torch.randint(0, V, (B, SQ), device="cuda")
     # ignore a third of the rows
     flat = target.reshape(-1)
@@ -176,7 +176,7 @@ def test_cross_entropy_forward_nonaligned_vocab(V):
     """Unaligned vocab sizes must not cause silent OOB reads."""
     torch.manual_seed(3)
     B, SQ = 4, 8
-    logits = torch.randn(B, SQ, V, device="cuda")
+    logits = torch.randn(B, SQ, V, dtype=torch.float32, device="cuda")
     target = torch.randint(0, V, (B, SQ), device="cuda")
 
     loss_triton, _ = cross_entropy_forward(
@@ -203,7 +203,7 @@ def test_cross_entropy_forward_noncontiguous_input(chunked):
     torch.manual_seed(21)
     B, SQ, V = 3, 5, 128
     # Build a non-contiguous [B, SQ, V] view (inner stride 1, wrong batch stride).
-    base = torch.randn(B, V, SQ, device="cuda")
+    base = torch.randn(B, V, SQ, dtype=torch.float32, device="cuda")
     logits = base.transpose(1, 2)  # [B, SQ, V], not contiguous
     assert not logits.is_contiguous()
     target = torch.randint(0, V, (B, SQ), device="cuda")
@@ -235,7 +235,7 @@ def test_cross_entropy_forward_noncontiguous_input(chunked):
 def test_cross_entropy_all_ignored_finite_grad():
     """An all-ignored batch must give a finite (zero) gradient, not Inf/NaN."""
     B, SQ, V = 2, 4, 64
-    logits = torch.randn(B, SQ, V, device="cuda")
+    logits = torch.randn(B, SQ, V, dtype=torch.float32, device="cuda")
     target = torch.full((B, SQ), -100, device="cuda")  # every row ignored
 
     loss, grad = cross_entropy_forward(
@@ -250,7 +250,7 @@ def test_cross_entropy_all_ignored_finite_grad():
 def test_cross_entropy_forward_rejects_out_of_range_target(bad):
     """Targets outside [0, V) (and != ignore_idx) must raise, not return +inf."""
     B, SQ, V = 2, 4, 64
-    logits = torch.randn(B, SQ, V, device="cuda")
+    logits = torch.randn(B, SQ, V, dtype=torch.float32, device="cuda")
     target = torch.randint(0, V, (B, SQ), device="cuda")
     target[0, 0] = bad
     with pytest.raises(ValueError):
@@ -260,13 +260,13 @@ def test_cross_entropy_forward_rejects_out_of_range_target(bad):
 def test_cross_entropy_backward_rejects_bad_grad_shape():
     """grad_output whose numel is neither 1 nor n_rows must raise."""
     B, SQ, V = 2, 4, 64
-    logits = torch.randn(B, SQ, V, device="cuda")
+    logits = torch.randn(B, SQ, V, dtype=torch.float32, device="cuda")
     target = torch.randint(0, V, (B, SQ), device="cuda")
     _, grad_stored = cross_entropy_forward(
         logits.clone(), target, 0.0, False, None, -100
     )
 
-    bad = torch.ones(B * SQ + 1, device="cuda")  # wrong length
+    bad = torch.ones(B * SQ + 1, dtype=torch.float32, device="cuda")  # wrong length
     with pytest.raises(ValueError):
         cross_entropy_backward(grad_stored, bad)
 
@@ -279,7 +279,7 @@ def test_cross_entropy_backward_grad_scale():
     torch.manual_seed(5)
     B, SQ, V = 2, 4, 64
 
-    logits = torch.randn(B, SQ, V, device="cuda")
+    logits = torch.randn(B, SQ, V, dtype=torch.float32, device="cuda")
     target = torch.randint(0, V, (B, SQ), device="cuda")
 
     _, grad_stored = cross_entropy_forward(
@@ -293,7 +293,7 @@ def test_cross_entropy_backward_grad_scale():
     # Save a copy before in-place backward
     grad_stored_copy = grad_stored.clone()
 
-    grad_output = torch.tensor(2.5, device="cuda")
+    grad_output = torch.tensor(2.5, dtype=torch.float32, device="cuda")
     grad_out = cross_entropy_backward(grad_stored.clone(), grad_output)
 
     torch.testing.assert_close(grad_out, grad_stored_copy * 2.5, atol=1e-5, rtol=1e-5)
@@ -302,13 +302,13 @@ def test_cross_entropy_backward_grad_scale():
 def test_cross_entropy_backward_unit_grad_output():
     """grad_output == 1.0 leaves the gradient unchanged (scale by 1 is exact)."""
     B, SQ, V = 2, 4, 64
-    logits = torch.randn(B, SQ, V, device="cuda")
+    logits = torch.randn(B, SQ, V, dtype=torch.float32, device="cuda")
     target = torch.randint(0, V, (B, SQ), device="cuda")
 
     _, grad_stored = cross_entropy_forward(
         logits.clone(), target, 0.0, False, None, -100
     )
-    grad_id = torch.tensor(1.0, device="cuda")
+    grad_id = torch.tensor(1.0, dtype=torch.float32, device="cuda")
     result = cross_entropy_backward(grad_stored.clone(), grad_id)
     torch.testing.assert_close(result, grad_stored, atol=0, rtol=0)
 
@@ -318,7 +318,9 @@ def test_cross_entropy_autograd_e2e():
     torch.manual_seed(9)
     B, SQ, V = 2, 6, 128
 
-    logits_ref = torch.randn(B, SQ, V, device="cuda", requires_grad=True)
+    logits_ref = torch.randn(
+        B, SQ, V, dtype=torch.float32, device="cuda", requires_grad=True
+    )
     logits_tri = logits_ref.detach().clone().requires_grad_(True)
     target = torch.randint(0, V, (B, SQ), device="cuda")
 
@@ -338,7 +340,7 @@ def test_cross_entropy_autograd_e2e():
         ignore_idx=-100,
     )
     # backward scales the already-normalised grad by grad_output=1.0 (no-op fast path)
-    grad_out = torch.tensor(1.0, device="cuda")
+    grad_out = torch.tensor(1.0, dtype=torch.float32, device="cuda")
     cross_entropy_backward(grad_input, grad_out)
 
     torch.testing.assert_close(
@@ -359,7 +361,7 @@ def test_cross_entropy_forward_chunked_matches_full(chunk_rows, B_SQ):
     """Chunked forward must produce identical loss to the non-chunked path."""
     torch.manual_seed(11)
     V = 256
-    logits = torch.randn(B_SQ, 1, V, device="cuda")
+    logits = torch.randn(B_SQ, 1, V, dtype=torch.float32, device="cuda")
     target = torch.randint(0, V, (B_SQ, 1), device="cuda")
 
     loss_full, _ = cross_entropy_forward(logits.clone(), target, 0.0, False, None, -100)
@@ -377,7 +379,7 @@ def test_cross_entropy_forward_chunked_ignore_index(reduce_loss):
     """Chunked path must zero ignored rows and match the non-chunked path."""
     torch.manual_seed(17)
     B_SQ, V, ignore_idx = 12, 256, -100
-    logits = torch.randn(B_SQ, 1, V, device="cuda")
+    logits = torch.randn(B_SQ, 1, V, dtype=torch.float32, device="cuda")
     target = torch.randint(0, V, (B_SQ, 1), device="cuda")
     target.reshape(-1)[::4] = ignore_idx  # ignore every 4th row
 
@@ -398,7 +400,7 @@ def test_cross_entropy_forward_chunked_ignore_index(reduce_loss):
 
 def test_cross_entropy_forward_chunked_rejects_zero_chunk():
     """chunk_rows < 1 must raise instead of looping forever."""
-    logits = torch.randn(4, 1, 64, device="cuda")
+    logits = torch.randn(4, 1, 64, dtype=torch.float32, device="cuda")
     target = torch.randint(0, 64, (4, 1), device="cuda")
     with pytest.raises(ValueError):
         cross_entropy_forward_chunked(

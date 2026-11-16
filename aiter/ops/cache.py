@@ -200,3 +200,27 @@ def fused_qk_rope_concat_and_cache_mla_seg(
     is_neox: bool,
     is_nope_first: bool = True,
 ) -> None: ...
+
+
+@compile_ops("module_dsv4_dequant_gather_k", develop=True)
+def dsv4_dequantize_and_gather_k(
+    out: Tensor,
+    k_cache: Tensor,
+    seq_lens: Tensor,
+    gather_lens: Tensor | None,
+    block_table: Tensor,
+    block_size: int,
+    offset: int = 0,
+    use_fnuz: bool = False,
+) -> None:
+    """Gather and dequantize the DeepSeek V4 paged K record into bf16.
+
+    ``k_cache`` is ``[num_blocks, block_size, 584]`` uint8: per token 448 fp8
+    e4m3 NoPE dims then 64 bf16 RoPE dims, with the block's 8-byte-per-token
+    UE8M0 scale region (7 scales of 64 dims + pad) after all of its token data.
+
+    Writes ``out[r, offset + i, :512]`` for ``i`` in ``[0, gather_lens[r])``,
+    reading sequence positions ``seq_lens[r] - gather_lens[r]`` onward.
+    ``gather_lens=None`` gathers the whole sequence. ``use_fnuz`` must match
+    the encoder of this cache: e4m3fnuz when True, OCP e4m3 when False.
+    """

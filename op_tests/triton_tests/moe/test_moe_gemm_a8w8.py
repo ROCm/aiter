@@ -21,6 +21,7 @@ from aiter.ops.triton.moe.quant_moe import (
     downcast_to_static_fp8,
     downcast_to_static_fp8_3d,
 )
+from aiter.ops.triton.quant.quant import dynamic_mxfp8_quant
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -206,6 +207,18 @@ class Case:
             Case(300, 400, 400, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 2),
             Case(1000, 704, 2048, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 4),
             Case(8192, 7168, 4096, "mxfloat8_e4m3fn", "mxfloat8_e4m3fn", 8, 4),
+            # gfx942 (fnuz)
+            Case(300, 400, 400, "float8_e4m3fnuz", "float8_e4m3fnuz", 8, 2),
+            Case(300, 400, 416, "mxfloat8_e4m3fnuz", "float8_e4m3fnuz", 8, 2),
+            Case(300, 400, 416, "float8_e4m3fnuz", "mxfloat8_e4m3fnuz", 8, 2),
+            Case(300, 400, 416, "mxfloat8_e4m3fnuz", "mxfloat8_e4m3fnuz", 8, 2),
+            # K=448 has no table entry and takes the BLOCK_K=64 (two-slice) path.
+            Case(300, 400, 448, "mxfloat8_e4m3fnuz", "mxfloat8_e4m3fnuz", 8, 2),
+            Case(1, 512, 6144, "mxfloat8_e4m3fnuz", "mxfloat8_e4m3fnuz", 256, 8),
+            Case(16, 6144, 256, "mxfloat8_e4m3fnuz", "mxfloat8_e4m3fnuz", 256, 8),
+            Case(1024, 512, 6144, "mxfloat8_e4m3fnuz", "mxfloat8_e4m3fnuz", 256, 8),
+            Case(256, 6144, 384, "mxfloat8_e4m3fnuz", "mxfloat8_e4m3fnuz", 256, 8),
+            Case(8192, 768, 6144, "mxfloat8_e4m3fnuz", "mxfloat8_e4m3fnuz", 256, 8),
         ]
     ],
 )
@@ -221,6 +234,7 @@ class Case:
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
 @pytest.mark.parametrize("fused_quant", [False, True])
+@pytest.mark.parametrize("token_expt_scales", [False, True])
 def test_op(
     m,
     n,
@@ -230,6 +244,7 @@ def test_op(
     has_y_gammas,
     apply_swiglu,
     fused_quant,
+    token_expt_scales,
     n_expts_tot,
     n_expts_act,
     act_dtype_str,
@@ -238,11 +253,14 @@ def test_op(
     device="cuda",
 ):
 
-    if get_arch() != "gfx950":
+    fnuz = "fnuz" in act_dtype_str or "fnuz" in weight_dtype_str
+    if fnuz:
+        if get_arch() != "gfx942":
+            pytest.skip("float8_e4m3fnuz is the gfx942 FP8 encoding")
+        if fused_quant:
+            pytest.skip("fused FP8 output quant writes OCP e4m3fn, not fnuz")
+    elif get_arch() != "gfx950":
         pytest.skip("float8 x mx only supported on CDNA4")
-
-    if "float8_e4m3fnuz" in act_dtype_str and get_arch() != "gfx942":
-        pytest.skip("float8_e4m3fnuz only tested on AMD CDNA3 Platform")
 
     if hbm_swizzling:
         if get_arch() != "gfx950":
@@ -263,6 +281,9 @@ def test_op(
     if act_mxfp8:
         act_dtype_str = act_dtype_str[2:]
 
+    if token_expt_scales and (act_mxfp8 or weight_mxfp8):
+        pytest.skip("token/expert scales are tested on the plain-fp8 path")
+
     weight_dtype = dtype_str_to_torch(weight_dtype_str)
     act_dtype = dtype_str_to_torch(act_dtype_str)
     m, rdata, gindx, sindx = init_routing_data(
@@ -282,8 +303,19 @@ def test_op(
         device=device,
     )
     x_ref, w_ref, bias_ref = x_tri.clone(), w_tri.clone(), bias_tri.clone()
+    x_token_scale = None
+    w_expt_scale = None
+    fp8_max = torch.finfo(act_dtype).max
 
-    if weight_mxfp8:
+    if weight_mxfp8 and fnuz:
+        # downcast_to_mxfp only produces OCP fp8.
+        wq, ws = dynamic_mxfp8_quant(w_tri.mT.contiguous(), quant_dtype=weight_dtype)
+        ws = ws.view(*wq.shape[:-1], -1)
+        w_ref = upcast_from_mxfp(wq, ws, torch.bfloat16, axis=-1).mT
+        w_tri, w_scale_tri = wq.mT, ws.mT
+        w_static_scale = None
+        swizzle_mx_scale = None
+    elif weight_mxfp8:
         w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
         w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
         w_static_scale = None
@@ -300,20 +332,36 @@ def test_op(
     else:
         w_scale_tri = None
         swizzle_mx_scale = None
-        w_static_scale = w_tri.abs().max().float() / 448.0
-        w_tri = downcast_to_static_fp8_3d(w_tri, w_static_scale)
-        w_ref = (w_tri.float() * w_static_scale).to(torch.bfloat16)
+        if token_expt_scales:
+            w_static_scale = None
+            w_expt_scale = w_tri.abs().amax(dim=(1, 2)).float() / fp8_max
+            w_tri = (w_tri / w_expt_scale[:, None, None]).to(weight_dtype)
+            w_ref = (w_tri.float() * w_expt_scale[:, None, None]).to(torch.bfloat16)
+        else:
+            w_static_scale = w_tri.abs().max().float() / fp8_max
+            w_tri = downcast_to_static_fp8_3d(w_tri, w_static_scale)
+            w_ref = (w_tri.float() * w_static_scale).to(torch.bfloat16)
 
-    if act_mxfp8:
+    if act_mxfp8 and fnuz:
+        x_tri, x_mx_scales_tri = dynamic_mxfp8_quant(x_tri, quant_dtype=act_dtype)
+        x_ref = upcast_from_mxfp(x_tri, x_mx_scales_tri, torch.bfloat16, axis=-1)
+        x_static_scale = None
+    elif act_mxfp8:
         x_tri, x_mx_scales_tri = downcast_to_mxfp(x_tri, act_dtype, axis=-1)
         x_ref = upcast_from_mxfp(x_tri, x_mx_scales_tri, torch.bfloat16, axis=-1)
         x_static_scale = None
         out_dtype = torch.bfloat16
     else:
         x_mx_scales_tri = None
-        x_static_scale = x_tri.abs().max().float() / 448.0
-        x_tri = downcast_to_static_fp8(x_tri, x_static_scale)
-        x_ref = (x_tri.float() * x_static_scale).to(torch.bfloat16)
+        if token_expt_scales:
+            x_static_scale = None
+            x_token_scale = x_tri.abs().amax(dim=-1).float() / fp8_max
+            x_tri = (x_tri / x_token_scale[:, None]).to(act_dtype)
+            x_ref = (x_tri.float() * x_token_scale[:, None]).to(torch.bfloat16)
+        else:
+            x_static_scale = x_tri.abs().max().float() / fp8_max
+            x_tri = downcast_to_static_fp8(x_tri, x_static_scale)
+            x_ref = (x_tri.float() * x_static_scale).to(torch.bfloat16)
         out_dtype = torch.float8_e4m3fn
 
     ref_y = moe_gemm_torch(
@@ -345,6 +393,8 @@ def test_op(
         swizzle_mx_scale,
         out_dtype,
         apply_swiglu,
+        x_token_scale=x_token_scale,
+        w_expt_scale=w_expt_scale,
     )
     if not act_mxfp8 and fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)

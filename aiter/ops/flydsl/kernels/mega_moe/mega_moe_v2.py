@@ -9,14 +9,17 @@ import flydsl.expr as fx
 import mori.shmem as ms
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.utility import dtypes
+
 from ..flydsl_dispatch_combine_intranode_op import (
     FlyDSLDispatchCombineConfig,
     FlyDSLDispatchCombineIntraNodeOp,
 )
+from . import envs
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
     INDEXED_PAYLOAD_MIN_MTPR,
-    INDEXED_PAYLOAD_MIN_SBM,
     MegaMoEConfig,
     Stage1Config,
     build_mega_moe_bundle_plan,
@@ -24,21 +27,108 @@ from .mega_moe_config import (
 )
 from .mega_moe_stage2_aligned_pair import ALIGNED_PAIR_SCATTER_VEC
 from .quant import per_1x32_mx_quant
+from .weights import check_bindable, contiguous_weights, weight_spec
 
 __all__ = ["MegaMoEV2"]
+
+
+def _small_m_mtprs(mtprs) -> tuple[int, ...]:
+    """Small-input runtime MTPRs; each is an independent single-kernel instance."""
+    mtprs = sorted({int(m) for m in mtprs})
+    if not mtprs:
+        raise ValueError("small_m_mtprs must not be empty")
+    for m in mtprs:
+        if m <= 0 or m & (m - 1) or m > 512:
+            raise ValueError(f"small_m_mtprs: {m} must be a power of two <= 512")
+    return tuple(mtprs)
+
+
+def large_m_eligible(
+    *,
+    enabled: bool,
+    arch: str,
+    world_size: int,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    quant: str,
+    max_tok_per_rank: int,
+    swiglu_limit: float,
+    fanout_masks: tuple[int, ...] = (),
+    act: str = "silu",
+) -> bool:
+    """Whether the large-input path supports this layout (EP8 DeepSeek-V4 a8w4)."""
+    return (
+        enabled
+        and arch.split(":", 1)[0] == "gfx950"
+        and world_size == 8
+        and model_dim == 7168
+        and inter_dim == 3072
+        and experts == 384
+        and experts // world_size == 48
+        and topk == 6
+        and quant == "a8w4"
+        and max_tok_per_rank == 8192
+        and swiglu_limit == 10.0
+        and act == "silu"
+        and not fanout_masks
+    )
+
+
+def small_m_eligible(
+    *,
+    enabled: bool,
+    arch: str,
+    num_cu: int,
+    world_size: int,
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    quant: str,
+    swiglu_limit: float,
+    fanout_masks: tuple[int, ...] = (),
+    act: str = "silu",
+) -> bool:
+    """Whether the small-input path supports this layout (EP8 DeepSeek-V4 a8w4).
+
+    The kernel splits its work across 8 XCDs by XCC id, so it needs the 8-XCD
+    (256-CU) gfx950 parts; a 4-XCD part would leave half the work unclaimed.
+    """
+    return (
+        enabled
+        and arch.split(":", 1)[0] == "gfx950"
+        and num_cu == 256
+        and world_size == 8
+        and model_dim == 7168
+        and inter_dim == 3072
+        and experts == 384
+        and topk == 6
+        and quant == "a8w4"
+        and swiglu_limit == 10.0
+        and act == "silu"
+        and not fanout_masks
+    )
 
 
 class MegaMoEV2:
     """Fused dispatch, GEMM1, GEMM2, and combine with one in-flight launch per instance."""
 
+    # forward(mask_invalid_slots=...) is accepted: combine can skip -1 top-k slots.
+    supports_combine_mask = True
+
     # fmt: off
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
-        max_tok_per_rank: int, mega_scheme: str = "fixedslot", swiglu_limit: float = 0.0,
-        fanout_masks: tuple[int, ...] = ()):
+        max_tok_per_rank: int, mega_scheme: str = "fixedslot", stage2_p2p_quant: str = "auto",
+        swiglu_limit: float = 0.0, fanout_masks: tuple[int, ...] = (),
+        act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
+        large_m_state_slots: int = 1, large_m_enabled: bool | None = None,
+        small_m_mtprs: tuple[int, ...] = (256, 512)):
     # fmt: on
-        if quant != "a8w4":
-            raise ValueError("MegaMoEV2 currently supports quant='a8w4' only")
+        if quant not in ("a4w4", "a8w4"):
+            raise ValueError("MegaMoEV2 quant must be 'a4w4' or 'a8w4'")
         if experts % world_size != 0:
             raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
         if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):
@@ -53,9 +143,28 @@ class MegaMoEV2:
         if not 0 < self.topk <= 16:
             raise ValueError(f"MegaMoEV2 topk must be in [1, 16], got {self.topk}")
         self.mtpr = int(max_tok_per_rank)
+        self._a_dtype = "fp4" if quant == "a4w4" else "fp8"
+        self._a_torch_dtype = (
+            torch.float4_e2m1fn_x2
+            if self._a_dtype == "fp4"
+            else torch.float8_e4m3fn
+        )
+        self._a_view_dim = self.model_dim // 2 if self._a_dtype == "fp4" else self.model_dim
+        self.large_m_state_slots = int(large_m_state_slots)
+        if self.large_m_state_slots <= 0:
+            raise ValueError("large_m_state_slots must be positive")
         self.swiglu_limit = float(swiglu_limit)
+        self.act = act
+        self.situ_beta = float(situ_beta)
+        self.situ_linear_beta = float(situ_linear_beta)
+        if self.act not in ("silu", "situv2"):
+            raise ValueError(f"MegaMoEV2 act must be 'silu' or 'situv2', got {self.act!r}")
+        if self.act == "situv2" and (self.situ_beta <= 0.0 or self.situ_linear_beta <= 0.0):
+            raise ValueError("situv2 requires positive situ_beta / situ_linear_beta")
         self._bundle_plan = build_mega_moe_bundle_plan(
             self.mtpr,
+            a_dtype=self._a_dtype,
+            p2p_quant=stage2_p2p_quant,
             experts_per_rank=self.epr,
             model_dim=self.model_dim,
             inter_dim=self.inter_dim,
@@ -80,7 +189,7 @@ class MegaMoEV2:
         self.comb_cfg = FlyDSLDispatchCombineConfig(rank=self.rank, world_size=self.world_size,
             hidden_dim=self.model_dim, max_num_inp_token_per_rank=self.mtpr, num_experts_per_rank=self.epr,
             num_experts_per_token=self.topk, combine_dtype=torch.bfloat16,
-            dispatch_dtype=torch.float8_e4m3fn, scale_dim=self._s1_scale_dim, scale_type_size=1,
+            dispatch_dtype=self._a_torch_dtype, scale_dim=self._s1_scale_dim, scale_type_size=1,
             enable_std_moe=False, enable_group_major=True, gm_unit_size=capacity_tile_m,
             gm_scheme=mega_scheme, gm_compact=compact,
             gm_indexed_payload=compact and self.mtpr >= INDEXED_PAYLOAD_MIN_MTPR,
@@ -89,17 +198,188 @@ class MegaMoEV2:
         self.comb_op = FlyDSLDispatchCombineIntraNodeOp(self.comb_cfg)
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
-        self.w2 = w2 if w2.is_contiguous() else w2.contiguous()
-        self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
+        # Contiguous copies of strided weights live as long as the instance: a graph captured with
+        # them keeps their pointers even after another bind_weights() call.
+        self._construction_weights = contiguous_weights((w1, w1_scale, w2, w2_scale))
+        w1, w1_scale, w2, w2_scale = self._construction_weights
+        self._weight_spec = weight_spec(self._construction_weights)
+        self.w2 = w2
+        self.w2_scale = w2_scale
         self._build_fused_stage1(w1, w1_scale)
         self._build_fused_stage2()
-        if os.environ.get("AITER_MEGA_MOE_PRELOAD", "0") == "1":
+        self._large_m = None
+        device_arch = get_gfx_runtime()
+        enable_large_m = (
+            envs.AITER_MEGA_LARGE_M
+            if large_m_enabled is None
+            else bool(large_m_enabled)
+        )
+        if large_m_eligible(
+            enabled=enable_large_m,
+            arch=device_arch,
+            world_size=self.world_size,
+            model_dim=self.model_dim,
+            inter_dim=self.inter_dim,
+            experts=self.experts,
+            topk=self.topk,
+            quant=quant,
+            max_tok_per_rank=self.mtpr,
+            swiglu_limit=self.swiglu_limit,
+            fanout_masks=self._initial_fanout_masks,
+            act=self.act,
+        ):
+            large_m_args = {
+                "rank": self.rank,
+                "world_size": self.world_size,
+                "model_dim": self.model_dim,
+                "inter_dim": self.inter_dim,
+                "experts": self.experts,
+                "topk": self.topk,
+                "quant": quant,
+                "w1": w1,
+                "w1_scale": w1_scale,
+                "w2": self.w2,
+                "w2_scale": self.w2_scale,
+                "max_tok_per_rank": self.mtpr,
+                "mega_scheme": mega_scheme,
+                "swiglu_limit": self.swiglu_limit,
+                "state_slots": self.large_m_state_slots,
+            }
+            from .mega_moe_large_m import LargeMRuntime
+
+            self._large_m = LargeMRuntime(**large_m_args)
+        self._large_m_on = self._large_m is not None
+        self._small_m = None
+        self._small_m_runtimes = []
+        if small_m_eligible(
+            enabled=envs.AITER_MEGA_SMALL_M,
+            arch=device_arch,
+            num_cu=torch.cuda.get_device_properties(self.dev).multi_processor_count,
+            world_size=self.world_size,
+            model_dim=self.model_dim,
+            inter_dim=self.inter_dim,
+            experts=self.experts,
+            topk=self.topk,
+            quant=quant,
+            swiglu_limit=self.swiglu_limit,
+            fanout_masks=self._initial_fanout_masks,
+            act=self.act,
+        ):
+            from .mega_moe_small_m import SmallMRuntime
+
+            # Own buffers and protocol state; weights are shared by pointer.
+            self._small_m_runtimes = [
+                SmallMRuntime(
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    model_dim=self.model_dim,
+                    inter_dim=self.inter_dim,
+                    experts=self.experts,
+                    topk=self.topk,
+                    quant=quant,
+                    w1=w1,
+                    w1_scale=w1_scale,
+                    w2=self.w2,
+                    w2_scale=self.w2_scale,
+                    max_tok_per_rank=m,
+                    swiglu_limit=self.swiglu_limit,
+                )
+                for m in _small_m_mtprs(small_m_mtprs)
+            ]
+            self._small_m = self._small_m_runtimes[-1]
+        if envs.AITER_MEGA_MOE_PRELOAD:
             self.preload_aot_bundles()
 
+    @property
+    def small_m_mtpr(self) -> int:
+        """Largest per-rank token count forward_small_m accepts (0 when disabled)."""
+        return self._small_m.mtpr if self._small_m is not None else 0
+
+    def forward_small_m(self, x_bf16, wts, topk_ids, *, max_tokens, stream=None, slice_output=True):
+        """Run the small-input single kernel.
+
+        The caller must make the same main/small-input choice on every EP rank for a
+        given call: the two paths share no protocol state. ``max_tokens`` is the
+        max row count of this call over all EP ranks and picks the runtime; it must
+        be the same on every rank (the runtimes share no protocol state either), so
+        it has no per-rank default. ``topk_ids`` may contain -1 (skipped, contributing zero).
+        """
+        if self._small_m is None:
+            raise RuntimeError("small-input path is not enabled (set AITER_MEGA_SMALL_M=1)")
+        need = int(max_tokens)
+        if need < int(x_bf16.shape[0]):
+            raise ValueError(f"max_tokens={need} is below this rank's {int(x_bf16.shape[0])} rows")
+        runtime = next((r for r in self._small_m_runtimes if r.mtpr >= need), None)
+        if runtime is None:
+            raise ValueError(f"{need} tokens exceed the largest small-input mtpr {self._small_m.mtpr}")
+        return runtime.forward(
+            x_bf16, wts, topk_ids, stream=stream, slice_output=slice_output
+        )
+
+    @property
+    def large_m_available(self) -> bool:
+        """Whether this instance built the large-input path."""
+        return self._large_m is not None
+
+    def set_large_m_enabled(self, enabled: bool) -> None:
+        """Send the following forward calls to the large-input path (True) or the main path (False).
+
+        The two paths share no protocol state, so every EP rank must make the same
+        choice for a call. On by default when the path is available.
+        """
+        if enabled and self._large_m is None:
+            raise RuntimeError("the large-input path is not available (set AITER_MEGA_LARGE_M=1)")
+        self._large_m_on = bool(enabled)
+
+    def _get_large_m(self):
+        """The large-input runtime when it is enabled, else None (main path).
+
+        The choice depends on no per-rank input (token count, mask), so every rank takes the
+        same path. The large-input combine always skips invalid (-1) top-k slots.
+        """
+        return self._large_m if self._large_m_on else None
+
+    def select_layer_state(self, layer_slot: int) -> None:
+        """Select the large-input protocol state for a shared operator layer."""
+        if self._large_m is not None:
+            self._large_m.select_layer_state(layer_slot)
+
+    def bind_weights(self, w1, w1_scale, w2, w2_scale) -> None:
+        """Bind weights for the main path and the optional small- and large-input runtimes."""
+        weights = (w1, w1_scale, w2, w2_scale)
+        # Everything that can refuse runs before any binding changes, so a refusal leaves the main,
+        # small- and large-input paths on the previous weights together.
+        check_bindable(weights, self._weight_spec)
+        w1_bytes, w1_scale_bytes = w1.view(torch.uint8), w1_scale.view(torch.uint8)
+        for runtime in self._small_m_runtimes:
+            runtime.w2_dispatch_table(w2, w2_scale)
+        self._s1_w1 = w1_bytes
+        self._s1_w1_scale = w1_scale_bytes
+        self.w2 = w2
+        self.w2_scale = w2_scale
+        # The runtimes were built from the same weights, so they take the same tensors.
+        if self._large_m is not None:
+            self._large_m.bind_weights(*weights)
+        for runtime in self._small_m_runtimes:
+            runtime.bind_weights(*weights)
+
+    def bind_layer(self, layer_slot: int, w1, w1_scale, w2, w2_scale) -> None:
+        """Bind a stable layer slot and its weights without resetting state; a refused
+        slot or weight binding changes neither."""
+        if self._large_m is not None and not 0 <= int(layer_slot) < self._large_m.state_slots:
+            raise ValueError(f"layer_slot={layer_slot} outside [0, {self._large_m.state_slots})")
+        self.bind_weights(w1, w1_scale, w2, w2_scale)
+        self.select_layer_state(layer_slot)
+
     def preload_aot_bundles(self):
-        """Load the paired Stage1 and Stage2 production bundles."""
+        """Load the paired Stage1 and Stage2 production bundles, and the small- and
+        large-input kernels when this instance built them."""
         self.preload_stage1_bundle()
         self.preload_stage2_bundle()
+        for runtime in self._small_m_runtimes:
+            runtime.preload_aot_bundle()
+        if self._large_m is not None:
+            self._large_m.preload_aot_bundle()
 
     def _build_fused_stage1(self, w1, w1_scale):
         from .mega_moe_prepare import (
@@ -113,6 +393,13 @@ class MegaMoEV2:
         )
 
         self.sort_block_m = 32
+        # Opt-in hardware bounds checking for the Stage1 control buffers.  Off
+        # by default so production keeps today's descriptors; turn it on while
+        # sweeping configurations, where an indexing mistake would otherwise
+        # page-fault and can leave a GPU needing a privileged reset.
+        self._s1_bounds_check = (
+            os.environ.get("AITER_MEGA_MOE_BOUNDS_CHECK", "0") == "1"
+        )
         self._s1_w1 = w1.contiguous().view(torch.uint8)
         self._s1_w1_scale = w1_scale.contiguous().view(torch.uint8)
         op = self.comb_op._gm
@@ -159,19 +446,46 @@ class MegaMoEV2:
         v = op._ll_views()
         self._s1_rx = v["rx_em"]
         self._s1_scale_i32 = v["scale_em_i32"]
+        self._s1_rx_kernel = (
+            self._s1_rx.view(torch.uint8)
+            if self._a_dtype == "fp4"
+            else self._s1_rx
+        )
+        self._s1_scale_kernel = (
+            self._s1_scale_i32.view(torch.uint8)
+            if self._a_dtype == "fp4"
+            else self._s1_scale_i32
+        )
 
         inter_dim = self.inter_dim
         a2rows = self._s1_nvm
-        self._s1_out = torch.zeros((a2rows, inter_dim), dtype=torch.float8_e4m3fn, device=self.dev)
+        if self._a_dtype == "fp4":
+            self._s1_out = torch.zeros(
+                (a2rows, inter_dim // 2), dtype=torch.uint8, device=self.dev
+            ).view(torch.float4_e2m1fn_x2)
+            self._s1_out_kernel = self._s1_out.view(torch.uint8)
+        else:
+            self._s1_out = torch.zeros(
+                (a2rows, inter_dim), dtype=torch.float8_e4m3fn, device=self.dev
+            )
+            self._s1_out_kernel = self._s1_out
         prows = ((a2rows + 255) // 256) * 256
         pcols = (((inter_dim // 32) + 7) // 8) * 8
         self._s1_osd = torch.zeros(prows * pcols + inter_dim, dtype=torch.uint8, device=self.dev)
-        self._s1_quant_x = torch.empty(
-            self.mtpr,
-            self.model_dim,
-            dtype=torch.float8_e4m3fn,
-            device=self.dev,
-        )
+        if self._a_dtype == "fp4":
+            self._s1_quant_x = torch.empty(
+                self.mtpr,
+                self.model_dim // 2,
+                dtype=torch.uint8,
+                device=self.dev,
+            ).view(torch.float4_e2m1fn_x2)
+        else:
+            self._s1_quant_x = torch.empty(
+                self.mtpr,
+                self.model_dim,
+                dtype=torch.float8_e4m3fn,
+                device=self.dev,
+            )
         self._s1_quant_scale = torch.empty(
             self.mtpr,
             self._s1_scale_dim,
@@ -380,8 +694,6 @@ class MegaMoEV2:
                 config.prepare_quant_cu,
                 (quant_groups + 511) // 512,
             )
-            # Preload fused-quant and prequantized-input variants so both public
-            # forward paths remain AOT-only after warmup.
             for preload_quant_blocks in sorted({0, quant_blocks}):
                 self._s1_preload_prepare(
                     fx.Int64(self._s1_disp.data_ptr()),
@@ -403,6 +715,7 @@ class MegaMoEV2:
                     num_prepare_cu=prepare_blocks,
                     num_quant_cu=preload_quant_blocks,
                     quant_cu_capacity=self._s1_quant_cu_capacity,
+                    quant_mode=self._a_dtype,
                     model_dim=self.model_dim,
                     payload_chunk_rows=config.payload_chunk_rows,
                     tile_state_stride=self._s1_tile_state_stride,
@@ -410,10 +723,10 @@ class MegaMoEV2:
 
         op = self._s1_op
         self._s1_preload_bundle(
-            self._s1_out,
-            self._s1_rx,
+            self._s1_out_kernel,
+            self._s1_rx_kernel,
             self._s1_w1,
-            self._s1_scale_i32,
+            self._s1_scale_kernel,
             self._s1_w1_scale,
             op.tile_row_base,
             op.sorted_expert_ids,
@@ -444,6 +757,9 @@ class MegaMoEV2:
             tile_state_stride=self._s1_tile_state_stride,
             variants=self._bundle_plan.stage1_variants,
             swiglu_limit=self.swiglu_limit,
+            act=self.act, situ_beta=self.situ_beta, situ_linear_beta=self.situ_linear_beta,
+            a_dtype=self._a_dtype,
+            out_dtype=self._a_dtype,
         )
 
     def _select_config(self, tokens: int) -> MegaMoEConfig:
@@ -510,6 +826,7 @@ class MegaMoEV2:
             num_prepare_cu=prepare_blocks,
             num_quant_cu=quant_blocks,
             quant_cu_capacity=self._s1_quant_cu_capacity,
+            quant_mode=self._a_dtype,
             model_dim=self.model_dim,
             payload_chunk_rows=config.payload_chunk_rows,
             tile_state_stride=self._s1_tile_state_stride,
@@ -532,10 +849,10 @@ class MegaMoEV2:
         cur_tok = int(x.shape[0])
         if cur_tok > self.mtpr:
             raise ValueError(f"run_tokens={cur_tok} > max_tok_per_rank={self.mtpr}")
-        if x.dtype != torch.float8_e4m3fn or not x.is_contiguous():
-            raise ValueError("x must be contiguous float8_e4m3fn")
-        if tuple(x.shape) != (cur_tok, self.model_dim):
-            raise ValueError(f"x must have shape ({cur_tok}, {self.model_dim})")
+        if x.dtype != self._a_torch_dtype or not x.is_contiguous():
+            raise ValueError(f"x must be contiguous {self._a_torch_dtype}")
+        if tuple(x.shape) != (cur_tok, self._a_view_dim):
+            raise ValueError(f"x must have shape ({cur_tok}, {self._a_view_dim})")
         if wts.dtype != torch.float32 or not wts.is_contiguous():
             raise ValueError("wts must be contiguous float32")
         if tuple(wts.shape) != (cur_tok, self.topk):
@@ -544,14 +861,23 @@ class MegaMoEV2:
             raise ValueError("topk_ids must be contiguous int32")
         if tuple(topk_ids.shape) != (cur_tok, self.topk):
             raise ValueError(f"topk_ids must have shape ({cur_tok}, {self.topk})")
-        if not scales.is_contiguous():
-            raise ValueError("scales must be contiguous")
+        # Other 1-byte dtypes would be read as E8M0 exponents without error.
+        if scales.dtype not in (torch.uint8, dtypes.fp8_e8m0):
+            raise ValueError(f"scales must be E8M0 (uint8 or {dtypes.fp8_e8m0}), got {scales.dtype}")
+        if not scales.is_contiguous() or scales.device != self.dev:
+            raise ValueError(f"scales must be contiguous on {self.dev}")
+        if any(t.device != self.dev for t in (x, wts, topk_ids)):
+            raise ValueError(f"x, wts and topk_ids must be on {self.dev}")
+        if tuple(scales.shape) != (cur_tok, self._s1_scale_dim):
+            # The kernel reads a full row of scales per token.
+            raise ValueError(f"scales must have shape ({cur_tok}, {self._s1_scale_dim})")
         if config is None:
             config = self._select_config(cur_tok).stage1
-        indexed_variant = (
-            self.mtpr >= INDEXED_PAYLOAD_MIN_MTPR
-            and config.sort_block_m >= INDEXED_PAYLOAD_MIN_SBM
-        )
+        # Every rank at the indexed-capable MTPR class uses the indexed payload
+        # (see mega_moe_stage1), so the route-major capacity guard below never
+        # fires there; it stays as a defensive check for a future route-major
+        # variant at this class.
+        indexed_variant = self.mtpr >= INDEXED_PAYLOAD_MIN_MTPR
         if self._s1_op.indexed_payload and not indexed_variant:
             route_rows = (
                 self.world_size * cur_tok * self.topk
@@ -568,7 +894,7 @@ class MegaMoEV2:
             self._run_compact_prepare(topk_ids, cur_tok, config, stream)
         op = self._s1_op
         common_args = (
-            self._s1_out, self._s1_rx, self._s1_w1, self._s1_scale_i32, self._s1_w1_scale,
+            self._s1_out_kernel, self._s1_rx_kernel, self._s1_w1, self._s1_scale_kernel, self._s1_w1_scale,
             op.tile_row_base, op.sorted_expert_ids, op.num_valid, self._s1_osd, fx.Int32(self._s1_nvm),
             fx.Int64(self._s1_disp.data_ptr()), fx.Int32(cur_tok), fx.Int64(x.data_ptr()),
             fx.Int64(topk_ids.data_ptr()), fx.Int64(wts.data_ptr()), fx.Int64(scales.data_ptr()),
@@ -587,6 +913,12 @@ class MegaMoEV2:
             "fixed_slot_dispatch": self._s1_fixed_slot,
             "num_cu": self._s1_num_cu,
             "swiglu_limit": self.swiglu_limit,
+            "act": self.act,
+            "situ_beta": self.situ_beta,
+            "situ_linear_beta": self.situ_linear_beta,
+            "a_dtype": self._a_dtype,
+            "out_dtype": self._a_dtype,
+            "bounds_check": self._s1_bounds_check,
         }
         entry = self._active_bundle_entry
         use_bundle = (
@@ -631,8 +963,21 @@ class MegaMoEV2:
         if x_bf16.shape[0] == 0:
             # A zero-token rank still participates in the downstream
             # collectives, but HIP rejects a zero-grid quant kernel launch.
+            if self._a_dtype == "fp4":
+                return (
+                    torch.empty(
+                        (0, self._a_view_dim),
+                        dtype=self._a_torch_dtype,
+                        device=self.dev,
+                    ),
+                    torch.empty(
+                        (0, self._s1_scale_dim),
+                        dtype=torch.uint8,
+                        device=self.dev,
+                    ),
+                )
             return self._s1_quant_x[:0], self._s1_quant_scale[:0]
-        return per_1x32_mx_quant(x_bf16, quant_mode="fp8")
+        return per_1x32_mx_quant(x_bf16, quant_mode=self._a_dtype)
 
     def _run_joint(
         self,
@@ -646,9 +991,15 @@ class MegaMoEV2:
         *,
         config=None,
         prepared=False,
+        mask_invalid_slots=None,
     ):
         if config is None:
             config = self._select_config(run_tokens)
+        # Combine skips top-k slots with id -1 (never dispatched, so their partial
+        # is stale). The check costs prefill time, so it runs only when the
+        # caller says ids may be -1.
+        if mask_invalid_slots is None:
+            mask_invalid_slots = self._combine_mask
         self._run_fused_stage1(
             x,
             wts,
@@ -658,14 +1009,20 @@ class MegaMoEV2:
             config=config.stage1,
             prepared=prepared,
         )
-        return self._run_stage2(run_tokens, stream, slice_output, config)
+        combine_ids = topk_ids if mask_invalid_slots else None
+        return self._run_stage2(run_tokens, stream, slice_output, config, combine_ids)
 
-    def _run_stage2(self, run_tokens, stream, slice_output, config: MegaMoEConfig):
+    def _run_stage2(
+        self, run_tokens, stream, slice_output, config: MegaMoEConfig, combine_ids=None
+    ):
+        """``combine_ids``: the top-k ids, when combine must skip their -1 slots."""
         if config.stage2.aligned_pair:
             return self._run_aligned_pair_stage2(
-                run_tokens, config, stream, slice_output
+                run_tokens, config, stream, slice_output, combine_ids
             )
-        ret = self._run_fused_stage2(run_tokens, config, stream)
+        ret = self._run_fused_stage2(
+            run_tokens, config, stream, combine_ids=combine_ids
+        )
         return self._stage2_output(ret, run_tokens, slice_output)
 
     def _stage2_output(self, result, run_tokens, slice_output):
@@ -681,7 +1038,11 @@ class MegaMoEV2:
             )
         return out_tok[:run_tokens] if slice_output else out_tok
 
-    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
+    def forward(
+        self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
+    ):
+        """``mask_invalid_slots``: ids may contain -1 (skipped, contributing zero).
+        None defers to AITER_MEGA_COMBINE_MASK (default off)."""
         run_tokens = int(x_bf16.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
@@ -691,10 +1052,23 @@ class MegaMoEV2:
             raise ValueError("wts must be contiguous float32")
         if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
             raise ValueError("topk_ids must be contiguous int32")
+        if any(t.device != self.dev for t in (x_bf16, wts, topk_ids)):
+            # A rank that faults on a foreign pointer would leave its peers waiting.
+            raise ValueError(f"x_bf16, wts and topk_ids must be on {self.dev}")
+        large_m = self._get_large_m()
+        if large_m is not None:
+            return large_m.forward(
+                x_bf16,
+                wts,
+                topk_ids,
+                stream=stream,
+                slice_output=slice_output,
+            )
         if self._s1_fixed_slot:
             x_q, scales = self.quantize(x_bf16)
             return self._run_joint(
-                x_q, scales, wts, topk_ids, run_tokens, stream, slice_output
+                x_q, scales, wts, topk_ids, run_tokens, stream, slice_output,
+                mask_invalid_slots=mask_invalid_slots,
             )
 
         config = self._select_config(run_tokens)
@@ -722,13 +1096,29 @@ class MegaMoEV2:
             slice_output,
             config=config,
             prepared=True,
+            mask_invalid_slots=mask_invalid_slots,
         )
 
-    def forward_prequant(self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True):
+    def forward_prequant(
+        self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
+    ):
         run_tokens = int(x_q.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
-        return self._run_joint(x_q, scales, wts, topk_ids, run_tokens, stream, slice_output)
+        large_m = self._get_large_m()
+        if large_m is not None:
+            return large_m.forward_prequant(
+                x_q,
+                scales,
+                wts,
+                topk_ids,
+                stream=stream,
+                slice_output=slice_output,
+            )
+        return self._run_joint(
+            x_q, scales, wts, topk_ids, run_tokens, stream, slice_output,
+            mask_invalid_slots=mask_invalid_slots,
+        )
 
     forward_bf16 = forward
     __call__ = forward
@@ -744,6 +1134,8 @@ class MegaMoEV2:
         )
 
         FlyDSLDispatchCombineIntraNodeOp._ENABLE_COMBINE_NO_STAGE1 = True
+        # Default of forward(mask_invalid_slots=...).
+        self._combine_mask = envs.AITER_MEGA_COMBINE_MASK
         comb_cfg = self.comb_cfg
         dev = torch.device("cuda", comb_cfg.rank)
         k = comb_cfg.num_experts_per_token
@@ -772,6 +1164,7 @@ class MegaMoEV2:
                 "comb_inp_nbytes": int(comb_cfg.max_num_inp_token_per_rank) * int(k) * p2p_row_nbytes,
                 "HIDDEN_MAX": int(comb_cfg.hidden_dim), "INTER_MAX": int(self.inter_dim), "cu_num": int(cu_num),
                 "p2p_quant_type": p2p_quant, "fixed_slot_dispatch": bool(self._s1_fixed_slot),
+                "a_dtype": self._a_dtype,
             }
         self._g2_combine_placeholder = torch.empty(
             1, comb_cfg.hidden_dim, dtype=comb_cfg.combine_dtype, device=dev
@@ -808,8 +1201,10 @@ class MegaMoEV2:
             BK=stage2.block_k,
             use_nt=stage2.use_nt,
             g2_bhoist=stage2.b_hoist,
+            g2_b2stage=stage2.b2stage,
             g2_ascale_pf=stage2.ascale_prefetch,
             g2_spart=stage2.spatial_partition,
+            g2_deep_a_pipeline=stage2.deep_a_pipeline,
             persist=stage2.persist,
             persist_cu=stage2.persist_cu,
             persist_strided=stage2.persist_strided,
@@ -875,7 +1270,10 @@ class MegaMoEV2:
             use_nt=stage2.use_nt,
             cu_num=stage2.pair_cu,
             g2_bhoist=stage2.b_hoist,
+            g2_b2stage=stage2.b2stage,
             g2_ascale_pf=stage2.ascale_prefetch,
+            g2_deep_a_pipeline=stage2.deep_a_pipeline,
+            a_dtype=str(invariants["a_dtype"]),
         )
 
     def _preload_aligned_pair_stage2(self, config: MegaMoEConfig, stream):
@@ -906,12 +1304,14 @@ class MegaMoEV2:
             )
             self._preload_aligned_pair_stage2(config, stream)
         for entry in self._bundle_plan.entries:
-            self.comb_op.preload_combine_no_stage1(
-                self._g2_combine_placeholder,
-                cur_tok=entry.token_bucket,
-                enable_weights=False,
-                stage2_p2p_quant=entry.config.p2p_quant,
-            )
+            for mask_topk_ids in (False, True):
+                self.comb_op.preload_combine_no_stage1(
+                    self._g2_combine_placeholder,
+                    cur_tok=entry.token_bucket,
+                    enable_weights=False,
+                    stage2_p2p_quant=entry.config.p2p_quant,
+                    mask_topk_ids=mask_topk_ids,
+                )
 
     def _run_fused_stage2(
         self,
@@ -922,6 +1322,7 @@ class MegaMoEV2:
         runtime_pair_skip: bool = False,
         combine: bool = True,
         scatter_vec: int = 8,
+        combine_ids=None,
     ):
         comb_op = self.comb_op
         if stream is None:
@@ -940,8 +1341,8 @@ class MegaMoEV2:
         if not combine:
             return None
         return comb_op.combine_no_stage1(
-            self._g2_combine_placeholder, None, None, cur_tok=run_tokens, enable_weights=False,
-            stage2_p2p_quant=p2p_quant,
+            self._g2_combine_placeholder, None, combine_ids, cur_tok=run_tokens,
+            enable_weights=False, stage2_p2p_quant=p2p_quant,
         )
 
     def _launch_aligned_pair_stage2(self, config: MegaMoEConfig, stream):
@@ -960,6 +1361,7 @@ class MegaMoEV2:
         config: MegaMoEConfig,
         stream,
         slice_output: bool,
+        combine_ids=None,
     ):
         """Overlap the common-pair kernel with the residual Stage2 kernel."""
         main_stream = torch.cuda.current_stream() if stream is None else stream
@@ -986,7 +1388,7 @@ class MegaMoEV2:
         result = self.comb_op.combine_no_stage1(
             self._g2_combine_placeholder,
             None,
-            None,
+            combine_ids,
             cur_tok=run_tokens,
             enable_weights=False,
             stage2_p2p_quant=config.p2p_quant,

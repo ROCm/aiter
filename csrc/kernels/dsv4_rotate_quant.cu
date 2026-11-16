@@ -11,6 +11,7 @@
 #include "aiter_opus_plus.h"
 #include "aiter_stream.h"
 #include "dsv4_rotate_quant.h"
+#include "quant_amax_floor.h"
 #include "rocprim/rocprim.hpp"
 
 namespace aiter {
@@ -87,16 +88,29 @@ __device__ float swap_thread_data(float data)
     return data;
 }
 
+enum class Fp4ScaleLayout : int32_t { Natural, Flydsl, Opus };
+
 __device__ __forceinline__ void store_scale_e8m0(opus::e8m0_t* __restrict__ scale,
                                                   const uint8_t scale_e8m0,
                                                   const int32_t row_idx,
                                                   const int32_t head_num,
                                                   const int32_t groups_per_row,
                                                   const int32_t group_idx,
-                                                  const bool shuffle_scale)
+                                                  const Fp4ScaleLayout fp4_scale_layout)
 {
     auto* scale_u8 = reinterpret_cast<uint8_t*>(scale);
-    if(!shuffle_scale)
+    if(fp4_scale_layout == Fp4ScaleLayout::Opus)
+    {
+        // [token, group%2, head%32, group/2, head/32]: [T,2,32,H/16].
+        const int32_t head = row_idx % head_num;
+        const int32_t tiles = head_num / 32;
+        const int64_t offset = static_cast<int64_t>(row_idx / head_num) * head_num * 4 +
+            (group_idx % 2) * head_num * 2 + (head % 32) * 2 * tiles +
+            (group_idx / 2) * tiles + head / 32;
+        scale_u8[offset] = scale_e8m0;
+        return;
+    }
+    if(fp4_scale_layout == Fp4ScaleLayout::Natural)
     {
         scale_u8[static_cast<int64_t>(row_idx) * groups_per_row + group_idx] = scale_e8m0;
         return;
@@ -377,7 +391,7 @@ __global__ void hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restrict__
                              head_num,
                              groups_per_row,
                              col_offset >> log2_group_size,
-                             shuffle_scale);
+                             shuffle_scale ? Fp4ScaleLayout::Flydsl : Fp4ScaleLayout::Natural);
         }
 
         store_vector<DTYPE_O_STORE, float, vec_size, RT, false, WARP_SIZE, 1, DTYPE_O>(
@@ -390,7 +404,7 @@ __global__ void hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restrict__
 }
 
 #define ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(dim, fp4quant, vec_size, name)                      \
-    const int32_t m_block = vec_size * WARP_SIZE / dim; \
+    int32_t m_block = vec_size * WARP_SIZE / dim; \
     dim3 const grid((m + m_block - 1) / m_block);                              \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), name, \
                                             [&] {                                                \
@@ -428,7 +442,7 @@ void rotate_activation_fp4quant(aiter_tensor_t& out,
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int32_t block_size = WARP_SIZE;
+    int32_t block_size = WARP_SIZE; // not const: a const init would take the host fallback of 64
     AITER_CHECK(dim % block_size == 0, "dim must be divisible by block_size");
     using DTYPE_O = opus::fp4_t;
     AITER_CHECK(scale.element_size() == 1, "scale element size must be 1");
@@ -490,7 +504,7 @@ void rotate_activation(aiter_tensor_t& out,
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int32_t block_size = WARP_SIZE;
+    int32_t block_size = WARP_SIZE; // not const: a const init would take the host fallback of 64
     AITER_CHECK(dim % block_size == 0, "dim must be divisible by block_size");
     opus::e8m0_t* scale_ptr = nullptr;
     if(dim == 128)
@@ -528,8 +542,9 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
                                                                         const int32_t rope_dim,
                                                                         const int32_t stride,
                                                                         const int32_t out_stride,
-                                                                        const bool shuffle_scale,
-                                                                        const int32_t group_size)
+                                                                        const Fp4ScaleLayout fp4_scale_layout,
+                                                                        const int32_t group_size,
+                                                                        const bool round_rope)
 {
     constexpr int warp_size = opus::get_warp_size();
     static_assert(vec_size * warp_size % dim == 0, "vec_size * warp_size must be divisible by dim");
@@ -581,6 +596,13 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
             const float s  = static_cast<float>(s_vec[i]);
             af[even]       = x * c - y * s;
             af[odd]        = y * c + x * s;
+            // round_rope: the rotated value as the input dtype holds it, as a
+            // RoPE that writes its output back (a bf16 model's) leaves it
+            if(round_rope)
+            {
+                af[even] = static_cast<float>(static_cast<DTYPE_I>(af[even]));
+                af[odd]  = static_cast<float>(static_cast<DTYPE_I>(af[odd]));
+            }
         }
     }
     else
@@ -674,7 +696,7 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
                              head_num,
                              groups_per_row,
                              col_offset >> log2_group_size,
-                             shuffle_scale);
+                             fp4_scale_layout);
         }
 
         store_vector<DTYPE_O_STORE, float, vec_size, RT, false, WARP_SIZE, 1, DTYPE_O>(
@@ -689,7 +711,7 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
 #define ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_(dim, do_rotate_act, fp4quant, vec_size, name) \
     AITER_CHECK(vec_size * block_size % dim == 0, "vec_size * block_size must be divisible by dim"); \
     AITER_CHECK(rope_dim % vec_size == 0, "rope_dim must be divisible by vec_size");              \
-    const int32_t m_block = vec_size * WARP_SIZE / dim;                                            \
+    int32_t m_block = vec_size * WARP_SIZE / dim;                                            \
     dim3 const grid((m + m_block - 1) / m_block);                                                   \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), name,                                   \
                                             [&] {                                                  \
@@ -703,7 +725,7 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
                                                         reinterpret_cast<DTYPE_I const*>(cos.data_ptr()), \
                                                         reinterpret_cast<DTYPE_I const*>(sin.data_ptr()), \
                                                         reinterpret_cast<int64_t const*>(positions.data_ptr()), \
-                                                        m, head_num, rope_dim, stride, out_stride, shuffle_scale, group_size); \
+                                                        m, head_num, rope_dim, stride, out_stride, fp4_scale_layout, group_size, round_rope); \
                                             });
 
 #define ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(dim, fp4quant, vec_size, name) \
@@ -721,9 +743,15 @@ void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
                                      const aiter_tensor_t& positions,
                                      const int32_t rope_dim,
                                      const int32_t group_size,
-                                     const bool shuffle_scale,
-                                     const bool do_rotate_act)
+                                     const std::string& scale_layout,
+                                     const bool do_rotate_act,
+                                     const bool round_rope)
 {
+    AITER_CHECK(scale_layout == "none" || scale_layout == "flydsl" || scale_layout == "opus",
+                "scale_layout must be none|flydsl|opus");
+    const auto fp4_scale_layout = scale_layout == "opus" ? Fp4ScaleLayout::Opus :
+                              scale_layout == "flydsl" ? Fp4ScaleLayout::Flydsl :
+                              Fp4ScaleLayout::Natural;
     AITER_CHECK(group_size > 0 && (group_size & (group_size - 1)) == 0,
                 "group_size must be a power of 2");
     AITER_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
@@ -760,11 +788,20 @@ void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int32_t block_size = WARP_SIZE;
+    int32_t block_size = WARP_SIZE; // not const: a const init would take the host fallback of 64
     AITER_CHECK(dim % block_size == 0, "dim must be divisible by block_size");
     AITER_CHECK(scale.element_size() == 1, "scale element size must be 1");
     const int32_t groups_per_row = dim / group_size;
-    if(shuffle_scale)
+    if(fp4_scale_layout == Fp4ScaleLayout::Opus)
+    {
+        AITER_CHECK((head_num == 32 || head_num == 64) && dim == 128 && group_size == 32,
+                    "OPUS scales require H=32 or 64, D=128, group_size=32");
+        AITER_CHECK(scale.is_contiguous() && scale.dim() == 4 &&
+                    scale.size(0) == m / head_num && scale.size(1) == 2 &&
+                    scale.size(2) == 32 && scale.size(3) == head_num / 16,
+                    "OPUS scale must be contiguous [T,2,32,H/16]");
+    }
+    else if(fp4_scale_layout == Fp4ScaleLayout::Flydsl)
     {
         AITER_CHECK(head_num % 16 == 0, "head_num must be divisible by 16 for shuffled scale");
         AITER_CHECK(groups_per_row % 4 == 0,
@@ -817,6 +854,8 @@ void rope_rotate_activation(aiter_tensor_t& out,
                             const int32_t rope_dim,
                             const bool do_rotate_act)
 {
+    // the output is the input dtype: stored, it is rounded there anyway
+    const bool round_rope = false;
     AITER_CHECK(input.dim() >= 2, "input must have at least 2 dims [..., head_num, dim]");
     AITER_CHECK(out.numel() == input.numel(), "input and out must have the same numel");
     AITER_CHECK(out.dtype() == input.dtype(), "input and out dtype must be the same");
@@ -847,14 +886,14 @@ void rope_rotate_activation(aiter_tensor_t& out,
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int32_t block_size = WARP_SIZE;
+    int32_t block_size = WARP_SIZE; // not const: a const init would take the host fallback of 64
     AITER_CHECK(dim % block_size == 0, "dim must be divisible by block_size");
     constexpr int32_t vec_size = 16;
     AITER_CHECK(vec_size * block_size % dim == 0, "vec_size * block_size must be divisible by dim");
     AITER_CHECK(rope_dim % vec_size == 0, "rope_dim must be divisible by vec_size");
 
     const int32_t group_size = 0;
-    const bool shuffle_scale = false;
+    const auto fp4_scale_layout = Fp4ScaleLayout::Natural;
     opus::e8m0_t* scale_ptr = nullptr;
     if(dim == 128)
     {
@@ -1001,12 +1040,12 @@ __global__ void rope_hadamard_rotate_activation_fp8quant_kernel(opus::fp8_t* __r
     }
 
     // per-(row, 1xGROUP) e4m3 quant, matching dynamic_per_group_scaled_quant:
-    //   absMax = max(1e-10f, group_max|x|); scale = absMax / fp8_max;
+    //   absMax = max(kAmaxFloor, group_max|x|); scale = absMax / fp8_max;
     //   out_fp8 = round_to_nearest(af / scale). finfo<fp8_t>::max() is
     //   arch-correct (448 e4m3fn gfx950, 240 e4m3fnuz gfx942).
     constexpr float fp8_max      = static_cast<float>(opus::finfo<opus::fp8_t>::max());
     const float inverted_fp8_max = 1.0 / fp8_max;
-    float absMax                 = 1e-10f;
+    float absMax                 = aiter::kAmaxFloor;
 #pragma unroll
     for(int i = 0; i < vec_size; i++)
     {
@@ -1030,7 +1069,7 @@ __global__ void rope_hadamard_rotate_activation_fp8quant_kernel(opus::fp8_t* __r
 #define ROPE_ROTATE_ACTIVATION_FP8QUANT_KERNEL_IMPL_(dim, do_rotate_act, vec_size, name)             \
     AITER_CHECK(vec_size * block_size % dim == 0, "vec_size * block_size must be divisible by dim"); \
     AITER_CHECK(rope_dim % vec_size == 0, "rope_dim must be divisible by vec_size");                 \
-    const int32_t m_block = vec_size * WARP_SIZE / dim;                                              \
+    int32_t m_block = vec_size * WARP_SIZE / dim;                                              \
     dim3 const grid((m + m_block - 1) / m_block);                                                    \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), name,                                     \
                                             [&] {                                                    \
@@ -1101,7 +1140,7 @@ void rope_rotate_activation_fp8quant(aiter_tensor_t& out,
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int32_t block_size = WARP_SIZE;
+    int32_t block_size = WARP_SIZE; // not const: a const init would take the host fallback of 64
     AITER_CHECK(dim % block_size == 0, "dim must be divisible by block_size");
     if(dim == 128)
     {
@@ -1332,7 +1371,7 @@ __global__ void norm_rope_hadamard_rotate_activation_fp4quant_kvcache_kernel(DTY
                                  1,
                                  groups_per_row,
                                  scale_group_idx,
-                                 false);
+                                 Fp4ScaleLayout::Natural);
             }
         }
 
@@ -1361,7 +1400,7 @@ __global__ void norm_rope_hadamard_rotate_activation_fp4quant_kvcache_kernel(DTY
 #define NORM_ROPE_ROTATE_ACTIVATION_FP4QUANT_KVCACHE_KERNEL_IMPL_(dim, do_rotate_act, fp4quant, vec_size, name) \
     AITER_CHECK(vec_size * block_size % dim == 0, "vec_size * block_size must be divisible by dim"); \
     AITER_CHECK(rope_dim % vec_size == 0, "rope_dim must be divisible by vec_size");              \
-    const int32_t m_block = vec_size * WARP_SIZE / dim;                                            \
+    int32_t m_block = vec_size * WARP_SIZE / dim;                                            \
     dim3 const grid((m + m_block - 1) / m_block);                                                   \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), name,                                   \
                                             [&] {                                                  \
@@ -1478,7 +1517,7 @@ void rmsnorm_rope_rotate_activation_fp4quant_kvcache(aiter_tensor_t& kvcache,
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int32_t block_size = WARP_SIZE;
+    int32_t block_size = WARP_SIZE; // not const: a const init would take the host fallback of 64
     AITER_CHECK(dim % block_size == 0, "dim must be divisible by block_size");
     AITER_CHECK(scale.element_size() == 1, "scale element size must be 1");
     const int32_t groups_per_row = dim / group_size;

@@ -73,7 +73,7 @@ def context_attention_fwd(
     """
 
     _LOGGER.info(
-        f"PA_PREFILL: q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
+        "PA_PREFILL: q=%s k=%s v=%s", tuple(q.shape), tuple(k.shape), tuple(v.shape)
     )
     q_dtype_is_f32 = q.dtype is torch.float32
     # need to reduce num. blocks when using fp32

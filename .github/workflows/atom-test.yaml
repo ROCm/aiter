@@ -93,9 +93,6 @@ jobs:
           default_models = [
               {"model_name": "DeepSeek-R1-0528"},
               {"model_name": "gpt-oss-120b"},
-              # Kimi-K2.7 ATOM (in-tree) downstream gate. Config (model_path,
-              # extraArgs -tp4, threshold) is pulled from ATOM models_accuracy.json.
-              {"model_name": "Kimi-K2.7-Code-MXFP4"},
           ]
 
           labels_raw = os.environ.get("LABELS_JSON") or "[]"
@@ -113,10 +110,8 @@ jobs:
               "linux-atom-mi35x-1": "linux-aiter-mi35x-1",
           }
 
-          # Per-model runner pin (overrides the generic mapping above). Kimi-K2.7
-          # runs the downstream gate on the AITER MI350X pool (TP4 -> 4 GPUs).
+          # Per-model runner pin (overrides the generic mapping above).
           model_runner_overrides = {
-              "Kimi-K2.7-Code-MXFP4": "linux-aiter-do-mi350x-4",
               "DeepSeek-V4-Pro": "linux-aiter-do-mi350x-8",       # -tp 8
               "Qwen3.5-397B-A17B-FP8": "linux-aiter-do-mi350x-4",  # -tp 4
               "MiniMax-M2.7-MXFP4": "linux-aiter-do-mi350x-4",     # -tp 2 (MXFP4)
@@ -280,8 +275,11 @@ jobs:
 
           if [ -f "/etc/podinfo/gha-render-devices" ]; then
             DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+            # Privileged mode bypasses GPU assignment on shared runners.
+            PRIVILEGED_FLAG=()
           else
             DEVICE_FLAG="--device /dev/dri"
+            PRIVILEGED_FLAG=(--privileged)
           fi
 
           MODEL_MOUNT=""
@@ -304,13 +302,14 @@ jobs:
           $MODEL_MOUNT \
           --ipc=host --group-add video \
           --shm-size=16G \
-          --privileged \
+          "${PRIVILEGED_FLAG[@]}" \
           --cap-add=SYS_PTRACE \
           --env-file /tmp/env_file.txt \
           --security-opt seccomp=unconfined \
           --ulimit memlock=-1 \
           --ulimit stack=67108864 \
           -e ATOM_DISABLE_MMAP=true \
+          -e AITER_JIT_VERBOSE=1 \
           -e HF_TOKEN="${HF_TOKEN:-${{ secrets.HF_TOKEN_TEST }}}" \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
@@ -361,6 +360,18 @@ jobs:
           MODEL_LOCK_WAIT_SECONDS: "7200"
           MODEL_LOCK_POLL_INTERVAL: "30"
           MODEL_PROGRESS_INTERVAL: "60"
+
+      - name: Prebuild Kimi-K3 GEMM kernel
+        if: >-
+          matrix.model_name == 'Kimi-K3' &&
+          (matrix.run_on_pr == true || github.event_name != 'pull_request')
+        timeout-minutes: 30
+        run: |
+          docker exec atom_aiter_test bash -euc '
+            MAX_JOBS=$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc)
+            export MAX_JOBS
+            exec python3 /app/aiter-test/.github/scripts/prebuild_atom_kimi_k3.py
+          '
 
       - name: Run ATOM accuracy test
         if: matrix.run_on_pr == true || github.event_name != 'pull_request'

@@ -5,9 +5,32 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
 
 # This code is derived from sglang and FLASHNN projects
 # https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
+
+
+def _load_config() -> dict:
+    cfg_dir = resolve_config_dir("attention", "PA-DECODE", backend="triton")
+    return load_config_json(f"{cfg_dir}/DEFAULT.json", required=False) or {}
+
+
+def _get_dispatch_config(kv_dtype: str) -> dict | None:
+    """v1/v2 dispatch rule for a KV-cache dtype, or None if this arch has none."""
+    return _load_config().get("dispatch", {}).get(kv_dtype)
+
+
+def _get_launch_config(kernel: str, kv_blk_sz: int) -> dict | None:
+    """Launch options of a GQA decode kernel for this page size, or None if not tuned."""
+    table = _load_config().get("launch", {}).get(kernel)
+    if table is None:
+        return None
+    return select_leq_config(table, kv_blk_sz, prefix="BLK_LEQ_")
 
 
 _paged_attn_decode_v1_wo_dot_repr = make_kernel_repr(
@@ -120,7 +143,7 @@ def _paged_attn_decode_v1_wo_dot_kernel(
         # p: [KV_BLK_SZ_POW2]
         p = tl.math.exp2((qk - max_logit_new) * log2e)
         alpha = tl.math.exp2((max_logit - max_logit_new) * log2e)
-        acc *= alpha[:, None]
+        acc *= alpha
 
         # load v [KV_BLK_SZ_POW2, HEAD_SZ_POW2]
         v_0 = tl.load(v_cache_ptr + kv_blk_offs, mask=kv_mask)
@@ -420,7 +443,7 @@ def _paged_attn_decode_v2_wo_dot_kernel(
         # p: [KV_BLK_SZ_POW2]
         p = tl.math.exp2((qk - max_logit_new) * log2e)
         alpha = tl.math.exp2((max_logit - max_logit_new) * log2e)
-        acc *= alpha[:, None]
+        acc *= alpha
 
         # v: [KV_BLK_SZ_POW2, HEAD_SZ_POW2]
         v_0 = tl.load(v_cache_ptr + kv_blk_offs, mask=kv_mask, other=0.0)
@@ -960,7 +983,7 @@ def _paged_attn_decode_v1_wo_dot_kernel_per_token_quant(
         # p: [KV_BLK_SZ_POW2]
         p = tl.math.exp2((qk - max_logit_new) * log2e)
         alpha = tl.math.exp2((max_logit - max_logit_new) * log2e)
-        acc *= alpha[:, None]
+        acc *= alpha
 
         # load v [KV_BLK_SZ_POW2, HEAD_SZ_POW2]
         v_scale = tl.load(v_scale_ptr + kv_scale_offs, mask=kv_scale_mask, other=0.0)
@@ -1282,7 +1305,7 @@ def _paged_attn_decode_v2_wo_dot_kernel_per_token_quant(
         # p: [KV_BLK_SZ_POW2]
         p = tl.math.exp2((qk - max_logit_new) * log2e)
         alpha = tl.math.exp2((max_logit - max_logit_new) * log2e)
-        acc *= alpha[:, None]
+        acc *= alpha
 
         # v: [KV_BLK_SZ_POW2, HEAD_SZ_POW2]
         v_scale = tl.load(v_scale_ptr + kv_scale_offs, mask=kv_scale_mask, other=0.0)

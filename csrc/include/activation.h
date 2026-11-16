@@ -33,5 +33,6 @@ void situv2_and_mul_quant(const aiter_tensor_t& out,
 void gelu_and_mul(const aiter_tensor_t& out, const aiter_tensor_t& input);
 void gelu_tanh_and_mul(const aiter_tensor_t& out, const aiter_tensor_t& input);
 void gelu_fast(const aiter_tensor_t& out, const aiter_tensor_t& input);
+void relu2(const aiter_tensor_t& out, const aiter_tensor_t& input);
 
 } // namespace aiter

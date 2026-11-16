@@ -16,6 +16,7 @@ def opus_gemm(
     Y: Tensor,
     *,
     kid: int,
+    family: str,
     layout: str = "plain",
     x_scale: Tensor | None = None,
     w_scale: Tensor | None = None,
@@ -35,6 +36,7 @@ def opus_gemm(
         WQ,
         Y,
         kid=kid,
+        family=family,
         layout=layout,
         x_scale=x_scale,
         w_scale=w_scale,
@@ -50,6 +52,7 @@ def opus_bmm(
     Y: Tensor,
     *,
     kid: int,
+    family: str,
     layout: str = "plain",
     x_scale: Tensor | None = None,
     w_scale: Tensor | None = None,
@@ -65,6 +68,7 @@ def opus_bmm(
         WQ,
         Y,
         kid=kid,
+        family=family,
         layout=layout,
         x_scale=x_scale,
         w_scale=w_scale,
@@ -98,4 +102,8 @@ def gemm_a16w16_opus(
     )
 
 
-__all__ = ["gemm_a16w16_opus", "opus_bmm", "opus_gemm"]
+__all__ = [
+    "gemm_a16w16_opus",
+    "opus_bmm",
+    "opus_gemm",
+]

@@ -10,10 +10,11 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 
 from ..kernels_common import atomic_add_i32, kernel_signature
-from .topk_per_row_decode import (
+from .topk_common import (
     _f32_to_ord,
     _load_f32x4,
     _row_length,
+    _row_view,
     _warp_inclusive_prefix_i32,
 )
 
@@ -34,12 +35,35 @@ _RUNNING_ABOVE = 6
 _RUNNING_EQUAL = 7
 
 
+def one_workgroup_rows_are_exact(width: int) -> bool:
+    """Whether full rows of `width` are a whole number of this kernel's vectors."""
+    return width % _VEC == 0
+
+
 @cache
 def build_topk_per_row_decode_one_workgroup_module(
     k: int,
     wave_size: int,
     write_values: bool = False,
+    packed_rows: bool = False,
+    full_rows: bool = False,
+    exact_rows: bool = False,
 ):
+    """packed_rows: row r is read from element row_starts[r] of a flat input
+    (indices still relative to that start); otherwise from the input's row r
+    and row_starts is not read.
+
+    full_rows: every row is `width` long and row_ends is not read.
+
+    exact_rows: a full-rows build for a width that is a whole number of
+    vectors (see `one_workgroup_rows_are_exact`), so no column a vector covers
+    lies past the row and the per-element row test is compiled out. Measured
+    against the same build without it, interleaved in one process: 0.976x at
+    64 rows of 16384, k=2048, but 1.007x-1.012x at k=512 over 8192 with fewer
+    instructions and branches -- unexplained. `topk_select` only routes k >= 1024
+    to widths this kernel serves, which is the side that gains."""
+    if exact_rows and not full_rows:
+        raise ValueError("exact_rows is a full-rows build; pass full_rows=True")
     if wave_size not in (32, 64):
         raise ValueError("wave size must be 32 or 64")
     num_waves = _BLOCK_THREADS // wave_size
@@ -53,11 +77,19 @@ def build_topk_per_row_decode_one_workgroup_module(
 
     @flyc.kernel(
         name="topk_per_row_decode_1wg_"
-        + kernel_signature(k=k, wave=wave_size, wv=write_values),
+        + kernel_signature(
+            k=k,
+            wave=wave_size,
+            wv=write_values,
+            **({"packed": 1} if packed_rows else {}),
+            **({"full": 1} if full_rows else {}),
+            **({"exact": 1} if exact_rows else {}),
+        ),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
     def topk_per_row_decode_one_workgroup_kernel(
         input: fx.Tensor,
+        row_starts: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
         values: fx.Tensor,
@@ -90,14 +122,21 @@ def build_topk_per_row_decode_one_workgroup_module(
         # or past 4 GiB is unaddressable -- measured on the small-k selector,
         # which had the same shape: at exactly 4 GiB every row came back wrong
         # with nothing raised. A row is 4 MiB at the widest width here.
+        input_row = _row_view(
+            input, row_starts, row_ends, row, width, next_n, packed_rows, full_rows
+        )
         input_resource = fx.logical_divide(
-            fx.rocdl.make_buffer_tensor(fx.slice(input, (row, None)), max_size=False),
+            fx.rocdl.make_buffer_tensor(input_row, max_size=False),
             fx.make_layout(_VEC, 1),
         )
-        row_len = _row_length(row, row_ends, width, next_n)
+        row_len = _row_length(row, row_ends, width, next_n, full_rows)
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
         row_vectors = (row_len + vec_width - one) // vec_width
+
+        def in_row(col):
+            """Whether `col` lies in the row; a Python True when it must."""
+            return True if exact_rows else col < row_len
 
         def ordered_key(value):
             return _f32_to_ord(value) ^ sign_bit
@@ -202,7 +241,7 @@ def build_topk_per_row_decode_one_workgroup_module(
         def histogram_pass1(col_base, values):
             for lane_idx in range_constexpr(_VEC):
                 col = col_base + lane_idx
-                if col < row_len:
+                if in_row(col):
                     atomic_add_i32(
                         histogram,
                         one,
@@ -213,7 +252,7 @@ def build_topk_per_row_decode_one_workgroup_module(
         def histogram_pass2(col_base, values, first_threshold):
             for lane_idx in range_constexpr(_VEC):
                 col = col_base + lane_idx
-                if col < row_len:
+                if in_row(col):
                     value = values[lane_idx]
                     if high_bucket(value) == first_threshold:
                         atomic_add_i32(
@@ -235,7 +274,7 @@ def build_topk_per_row_decode_one_workgroup_module(
         ):
             for lane_idx in range_constexpr(_VEC):
                 col = col_base + lane_idx
-                if col < row_len:
+                if in_row(col):
                     value = values[lane_idx]
                     if (high_bucket(value) == first_threshold) & (
                         radix_bucket(
@@ -312,7 +351,9 @@ def build_topk_per_row_decode_one_workgroup_module(
                         second_threshold,
                         third_threshold,
                     )
-                    active = active_vector & (col < row_len)
+                    active = active_vector
+                    if const_expr(not exact_rows):
+                        active = active & (col < row_len)
                     above_i32 = (active & above).select(one, zero)
                     equal_i32 = (active & equal).select(one, zero)
                     classes[lane_idx] = above_i32 * two + equal_i32
@@ -357,10 +398,12 @@ def build_topk_per_row_decode_one_workgroup_module(
                     valid = out_pos < row_len
                     row_indices[out_pos] = valid.select(out_pos, fx.Int32(-1))
                     if const_expr(write_values):
-                        row_values[out_pos] = valid.select(
-                            input[row, out_pos],
-                            fx.Float32(float("-inf")),
-                        )
+                        # read only inside the row: a packed row's next
+                        # elements are another row's, or past the buffer
+                        value = fx.Float32(float("-inf"))
+                        if valid:
+                            value = input_row[out_pos]
+                        row_values[out_pos] = value
 
         if row_len > top_k:
             if tid < 8:
@@ -432,6 +475,7 @@ def build_topk_per_row_decode_one_workgroup_module(
     @flyc.jit
     def launch_topk_per_row_decode_one_workgroup(
         input: fx.Tensor,
+        row_starts: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
         values: fx.Tensor,
@@ -443,6 +487,7 @@ def build_topk_per_row_decode_one_workgroup_module(
     ):
         topk_per_row_decode_one_workgroup_kernel(
             input,
+            row_starts,
             row_ends,
             indices,
             values,

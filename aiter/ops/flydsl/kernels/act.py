@@ -20,9 +20,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 
 def sigmoid_batch(xs, *, alpha=1.0):
     """Emit all exponentials before their reciprocals to preserve batch scheduling."""
-    e = [
-        fx.Float32(rocdl.exp2(T.f32, _raw(x * fx.Float32(-alpha * LOG2E)))) for x in xs
-    ]
+    e = [fx.exp2(x * fx.Float32(-alpha * LOG2E), fastmath="afn") for x in xs]
     return [fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + ei))) for ei in e]
 
 
@@ -38,6 +36,12 @@ def clamp_gate_up(g, u, neg_limit):
 def silu_mul_batch(gs, us):
     sig = sigmoid_batch(gs)
     return [gs[i] * sig[i] * us[i] for i in range(len(gs))]
+
+
+def silu_clamped_mul_batch(gates, ups, neg_clamp_limit):
+    """Clamped SiLU with unit sigmoid slope and no offset on the up branch."""
+    clamped = [clamp_gate_up(gate, up, neg_clamp_limit) for gate, up in zip(gates, ups)]
+    return silu_mul_batch([gate for gate, _ in clamped], [up for _, up in clamped])
 
 
 def swiglu_mul_batch(gs, us, neg_clamp_limit):
@@ -56,7 +60,7 @@ def tanh_batch(xs):
     es = []
     for x in xs:
         abs_x = fx.max(x, -x)
-        es.append(fx.Float32(rocdl.exp2(T.f32, _raw(abs_x * neg_two_log2e))))
+        es.append(fx.exp2(abs_x * neg_two_log2e, fastmath="afn"))
     recips = [fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + e))) for e in es]
     zero = fx.Float32(0.0)
     out = []
@@ -126,9 +130,11 @@ def situ_params(beta, beta_rcp, linear_beta, linear_beta_rcp, swiglu_limit):
 def gate_up_act(act, gs, us, situ=None):
     """Fused gate+up epilogue activation: ``act(gate) * up``.
 
-    ``act`` is a compile-time string ("silu", "swiglu", or "situv2");
-    ``situ`` carries runtime activation parameters for the latter two modes.
+    ``act`` is "silu", "silu_clamped", "swiglu", or "situv2";
+    ``situ`` carries runtime parameters for every mode except plain "silu".
     """
+    if const_expr(act == "silu_clamped"):
+        return silu_clamped_mul_batch(gs, us, situ.neg_clamp_limit)
     if const_expr(act == "situv2"):
         return situ_mul_batch(gs, us, *situ)
     if const_expr(act == "swiglu"):

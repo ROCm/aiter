@@ -43,7 +43,10 @@ def gemm_a16w8_blockscale(
     **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n
     """
     _LOGGER.info(
-        f"GEMM_A8W8_BLOCKSCALE: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w_scale.shape)}"
+        "GEMM_A16W8_BLOCKSCALE: x=%s w=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(w_scale.shape),
     )
 
     M, K = x.shape
@@ -59,6 +62,9 @@ def gemm_a16w8_blockscale(
     if config is None:
         config, _ = _get_config(M, N, K)
 
+    # Normalizing can lower NUM_KSPLIT, so size the outputs afterwards.
+    compute_splitk_params(config, K)
+
     return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
 
     if config["NUM_KSPLIT"] > 1:
@@ -70,8 +76,6 @@ def gemm_a16w8_blockscale(
 
     if y is None and not return_y_pp:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
-
-    compute_splitk_params(config, K)
 
     # Scale block sizes
     # TODO: need a better way to pass scale block sizes around
@@ -174,7 +178,10 @@ def gemm_a16w8_blockscale_preshuffle(
     **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n
     """
     _LOGGER.info(
-        f"GEMM_A8W8_BLOCKSCALE: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w_scale.shape)}"
+        "GEMM_A16W8_BLOCKSCALE: x=%s w=%s w_scale=%s",
+        tuple(x.shape),
+        tuple(w.shape),
+        tuple(w_scale.shape),
     )
 
     M, K = x.shape
@@ -188,6 +195,9 @@ def gemm_a16w8_blockscale_preshuffle(
     if config is None:
         config, _ = _get_config(M, N, K, True)
 
+    # Normalizing can lower NUM_KSPLIT, so size the outputs afterwards.
+    compute_splitk_params(config, K)
+
     return_y_pp = config["NUM_KSPLIT"] > 1 and skip_reduce
 
     if config["NUM_KSPLIT"] > 1:
@@ -199,8 +209,6 @@ def gemm_a16w8_blockscale_preshuffle(
 
     if y is None and not return_y_pp:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
-
-    compute_splitk_params(config, K)
 
     # Scale block sizes
     # TODO: need a better way to pass scale block sizes around
