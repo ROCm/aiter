@@ -326,17 +326,21 @@ def test_fp8_mqa_logits_rows8_kernel_is_available():
     "s_q,s_k,expected",
     [
         (8, 4096, False),
+        (8, 4097, False),
         (24, 4223, False),
         (64, 573440, False),
         (4096, 4095, False),
         (2048, 16384, False),
         (1024, 49152, False),
+        (256, 245760, False),
         (4096, 4096, True),
         (4096, 8192, True),
         (4104, 8192, True),
         (2048, 32768, True),
         (1024, 65536, True),
         (1856, 116480, True),
+        (256, 245761, True),
+        (64, 1048576, True),
     ],
 )
 def test_fp8_mqa_logits_rows8_gate(s_q, s_k, expected):
@@ -356,10 +360,12 @@ def _strided_test_tensor(tensor):
 
 
 def _long_kv_test_inputs(
-    s_q, s_k, num_heads=32, head_dim=128, strided=False, requests=0
+    s_q, s_k, num_heads=32, head_dim=128, strided=False, requests=0, out_of_range=False
 ):
     """FP8 inputs with ragged windows. With ``requests``, each request has causal
-    windows in its own keys, and its first row is inside an eight-row group."""
+    windows in its own keys, and its first row is inside an eight-row group.
+    With ``out_of_range``, windows also start before key 0 and end after the
+    last key."""
     q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
@@ -387,6 +393,15 @@ def _long_kv_test_inputs(
     )[phase]
     lengths = torch.where(phase == 6, 127 + (row // 8) % 3, lengths)
     ends = (starts + lengths).clamp_max(s_k)
+    if out_of_range:
+        # Four phases start 200 keys early and four end 200 keys late. Two rows
+        # in each 64 have a window that is fully outside the keys.
+        starts = torch.where(phase < 4, starts - 200, starts)
+        ends = torch.where(phase >= 4, ends + 200, ends)
+        starts = torch.where(row % 64 == 3, s_k + 5, starts)
+        ends = torch.where(row % 64 == 3, s_k + 50, ends)
+        starts = torch.where(row % 64 == 11, -50, starts)
+        ends = torch.where(row % 64 == 11, -5, ends)
     return q_fp8, kv_fp8, scales, weights, starts, ends
 
 
@@ -430,6 +445,7 @@ def _check_long_kv_logits(logits, inputs, clean_logits=False):
         pytest.param(4104, 4097, "", False, "rows8", id="key-tail"),
         pytest.param(4096, 8192, "requests", False, "rows8", id="requests"),
         pytest.param(2048, 32768, "", False, "rows8", id="two-splits"),
+        pytest.param(4096, 4097, "out-of-range", False, "rows8", id="out-of-range"),
         pytest.param(4098, 4097, "", False, "existing", id="row-tail"),
         pytest.param(4096, 4095, "", False, "existing", id="short-kv"),
         pytest.param(4096, 4097, "clean", False, "existing", id="clean"),
@@ -459,6 +475,7 @@ def test_fp8_mqa_logits_long_kv_windows(
         head_dim=64 if variant == "64-wide" else 128,
         strided=variant == "strided",
         requests=3 if variant == "requests" else 0,
+        out_of_range=variant == "out-of-range",
     )
     logits = fp8_mqa_logits(*inputs, clean_logits=variant == "clean")
     assert mqa_launches == [route]
@@ -467,19 +484,35 @@ def test_fp8_mqa_logits_long_kv_windows(
 
 @requires_rows8
 @pytest.mark.parametrize(
-    "s_q,s_k,requests",
-    [(4096, 4097, 0), (4104, 8192, 3), (2048, 32768, 0), (1024, 65536, 4)],
+    "s_q,s_k,requests,out_of_range",
+    [
+        (4096, 4097, 0, False),
+        (4096, 4097, 0, True),
+        (4104, 8192, 3, False),
+        (2048, 32768, 0, False),
+        (1024, 65536, 4, False),
+        (256, 245761, 0, False),
+    ],
 )
 @torch.inference_mode()
-def test_fp8_mqa_logits_rows8_matches_existing_route(s_q, s_k, requests, mqa_launches):
-    """The eight-row scores equal the clean and packed scores bit for bit."""
+def test_fp8_mqa_logits_rows8_matches_existing_route(
+    s_q, s_k, requests, out_of_range, mqa_launches
+):
+    """The eight-row scores equal the clean and packed scores bit for bit.
+
+    The dense output starts as NaN, so a key that the kernel does not write
+    fails the comparison.
+    """
     torch.manual_seed(0)
-    inputs = _long_kv_test_inputs(s_q, s_k, requests=requests)
+    inputs = _long_kv_test_inputs(
+        s_q, s_k, requests=requests, out_of_range=out_of_range
+    )
     inside = _window_mask(inputs)
     lengths = inside.sum(dim=1)
     offsets = lengths.cumsum(0) - lengths
     packed = torch.empty(int(lengths.sum()), device="cuda", dtype=torch.float32)
-    dense = fp8_mqa_logits(*inputs, clean_logits=False)
+    dense = torch.full(inside.shape, float("nan"), device="cuda", dtype=torch.float32)
+    fp8_mqa_logits(*inputs, clean_logits=False, out=dense)
     clean = fp8_mqa_logits(*inputs, clean_logits=True)
     fp8_mqa_logits(*inputs, out=packed, out_offsets=offsets)
     assert mqa_launches == ["rows8", "existing", "existing"]
@@ -543,14 +576,19 @@ def test_fp8_mqa_logits_rows8_keeps_existing_route(change, rows8_forced, mqa_lau
 def test_fp8_mqa_logits_long_kv_nonzero_union(
     s_k, window_length, rows8_forced, mqa_launches
 ):
-    """Check narrow and split KV ranges without a full-range query row."""
+    """Check narrow and split KV ranges without a full-range query row.
+
+    The output starts as NaN, so a key that the kernel does not write fails the
+    reference check.
+    """
     torch.manual_seed(0)
     inputs = _long_kv_test_inputs(8, s_k)
     inputs[-2].fill_(17)
     inputs[-1].fill_(17 + window_length)
-    logits = fp8_mqa_logits(*inputs, clean_logits=False)
+    out = torch.full((8, s_k), float("nan"), device="cuda", dtype=torch.float32)
+    fp8_mqa_logits(*inputs, clean_logits=False, out=out)
     assert mqa_launches == ["rows8"]
-    _check_long_kv_logits(logits, inputs)
+    _check_long_kv_logits(out, inputs)
 
 
 @requires_rows8
