@@ -65,7 +65,8 @@ To add a model suite, see the `add-bench-suite` skill.
 
 - Shapes are one rank of the V4.1-Flash DEP4 recipe (EP4 + DP attention, 64 heads
   a rank); token counts are per rank.
-- `mega_moe` runs the recipe's MegaMoE setup only (S1F stage 1, fp4 dispatch
-  wire, compact route, IOD-local weights); with stage 1 unfused,
-  bench_mega_moe.py does not finish at this shape. It needs four GPUs.
+- `mega_moe` rows come in pairs: `default` is bench_mega_moe.py's own setup,
+  `recipe` adds the recipe's MegaMoE environment (fp4 dispatch wire, S1F, compact
+  route, IOD-local weights). It needs four GPUs, and mori main: with the 1111
+  image's mori (47df0dad) the default (stage 1 unfused) rows hang.
 - MLA decode / prefill run bf16 (opus, triton) and v41_fp4 (asm) at 64 heads.

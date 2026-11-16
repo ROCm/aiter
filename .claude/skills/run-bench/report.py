@@ -239,8 +239,7 @@ SUITE_OPS = {
             "op": "mega_moe",
             "shape": (
                 "EP4 over 4 GPUs: 384 experts, top-6, hidden 5120, inter 2304, "
-                "40 layers. The recipe's setup: S1F stage 1 + Mega combine on an "
-                "fp4 dispatch wire."
+                "40 layers. base+Mega and the recipe's S1F+Mega on an fp4 wire."
             ),
             "dtype": "a4w4_mxfp4",
             "ut": "op_tests/multigpu_tests/bench_mega_moe.py under torchrun x4",
