@@ -323,6 +323,8 @@ PREFILL_CASES = [
     ("chunk_h4", [3000, 700, 130], [300, 700, 130], 4, 16, {}),
     ("chunk_h2", [2100, 5], [1000, 5], 2, 16, {}),
     ("group8", [3000, 700], [300, 700], 1, 8, {}),
+    ("group8_h2", [2100, 5, 700], [1000, 5, 300], 2, 8, {}),
+    ("group8_h4", [3000, 700, 130], [300, 700, 130], 4, 8, {}),
     ("one_row", [1, 129], [1, 1], 1, 16, {}),
     ("edges", [128, 256, 257, 255, 1], [128, 256, 5, 3, 1], 1, 16, {}),
     ("full_prompt", [1500], [1500], 1, 16, {}),
@@ -338,7 +340,9 @@ PREFILL_CASES = [
     ("alias_two_blocks", [129], [1], 1, 16, {"alias": True}),
     ("alias_chunk", [3000, 700, 130], [300, 700, 130], 1, 16, {"alias": True}),
 ]
-PREFILL_TQ = ((4, 2), (4, 1), (2, 1), (1, 1))
+# (rows per workgroup, combine rounds): every pair compile_prefill accepts (rounds 1 or 2 and
+# dividing tq: (1, 2) is refused, see refusals()).
+PREFILL_TQ = ((4, 2), (4, 1), (2, 2), (2, 1), (1, 1))
 
 
 def check(name, out, ref, tol=REL_L2_TOL):
@@ -726,6 +730,9 @@ def refusals():
         ("empty block_table", {"bt": c["bt"][:0]}, "at least one request row"),
         ("tq 3", {"tq": 3}, "tq must be"),
         ("rounds without tq", {"rounds": 1}, "rounds needs tq"),
+        ("rounds 2 does not divide tq 1", {"tq": 1, "rounds": 2}, "divide tq"),
+        ("rounds 3", {"tq": 4, "rounds": 3}, "rounds must be 1 or 2"),
+        ("rounds 0", {"tq": 4, "rounds": 0}, "rounds must be 1 or 2"),
         (
             "topk_idx with 8 slots",
             {"topk": torch.full((1, 2, 8), -1, dtype=torch.int32, device="cuda")},
