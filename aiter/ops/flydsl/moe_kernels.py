@@ -205,6 +205,53 @@ def is_a8w4_gfx942_kernel(name_or_params) -> bool:
     )
 
 
+def check_a8w4_gfx942_inputs(
+    w1, w1_scale, hidden_states, prequantized_a1, params, kernel_name=""
+) -> None:
+    """Raise if fused_moe's inputs do not fit the stage 1 it picked, for the gfx942
+    a8w4 family; a mismatch would otherwise give wrong output without an error.
+
+    - W1 / W1 scale: shuffle_{weight,scale}_a8w4_gfx942 keep shape and dtype, so only
+      their ``a8w4_gfx942_layout`` tag tells the relaid layout from the a16w4
+      preshuffle. A `_g942` stage 1 needs both tagged; any other stage 1 none.
+    - A caller-prequantized A has no agreed layout for the `_g942` kernels.
+    - The `_qi` kernels quantise x themselves and have no input for x scales, so they
+      take bf16 / fp16 x only (a pre-quantised fp8 x would lose its scales).
+    """
+    is_g942 = is_a8w4_gfx942_kernel(params)
+    relaid = [
+        getattr(t, "a8w4_gfx942_layout", False) for t in (w1, w1_scale) if t is not None
+    ]
+    if is_g942 and not (len(relaid) == 2 and all(relaid)):
+        raise ValueError(
+            f"the gfx942 a8w4 stage 1 kernel {kernel_name} reads W1 and W1 scale "
+            "relaid by shuffle_weight_a8w4_gfx942 / shuffle_scale_a8w4_gfx942 "
+            f"(tagged a8w4_gfx942_layout); got tags (w1, w1_scale) = {tuple(relaid)}"
+        )
+    if not is_g942 and any(relaid):
+        raise ValueError(
+            "W1 / W1 scale are relaid for the gfx942 a8w4 stage 1 "
+            "(a8w4_gfx942_layout), which only the `_g942` kernels read, but stage 1 "
+            f"is {kernel_name}; is AITER_SITUV2_A8W4=1 set?"
+        )
+    if not is_g942:
+        return
+    if prequantized_a1 is not None:
+        raise ValueError(
+            "prequantized_a1 is not supported with the gfx942 a8w4 stage 1: its "
+            "kernels read x as bf16 (`_qi`) or in the layout "
+            "fused_dynamic_mxfp8_quant_moe_sort writes"
+        )
+    if params.get("x_layout") == "bf16" and hidden_states.dtype not in (
+        torch.bfloat16,
+        torch.float16,
+    ):
+        raise ValueError(
+            f"the gfx942 a8w4 stage 1 kernel {kernel_name} quantises x itself and "
+            f"takes bf16 / fp16 x, got {hidden_states.dtype}"
+        )
+
+
 def get_flydsl_kernel_params(name: str) -> dict | None:
     """Lookup kernel params by name.
 

@@ -5640,29 +5640,16 @@ def fused_moe_2stages(
             metadata.stage1.keywords.get("kernelName", "")
         )
     _is_a8w4_g942 = _get_flydsl_moe_kernels().is_a8w4_gfx942_kernel(_s1_params)
-    # shuffle_{weight,scale}_a8w4_gfx942 keep shape and dtype, so only their
-    # `a8w4_gfx942_layout` tag tells the relaid W1 from the a16w4 preshuffle; a kernel
-    # reading the other layout gives wrong output without an error.
-    _w1_relaid = [
-        getattr(t, "a8w4_gfx942_layout", False) for t in (w1, w1_scale) if t is not None
-    ]
-    if _is_a8w4_g942 and not (len(_w1_relaid) == 2 and all(_w1_relaid)):
-        raise ValueError(
-            "the gfx942 a8w4 stage 1 kernel "
-            f"{metadata.stage1.keywords.get('kernelName', '')} reads W1 and W1 scale "
-            "relaid by shuffle_weight_a8w4_gfx942 / shuffle_scale_a8w4_gfx942 "
-            "(tagged a8w4_gfx942_layout); got tags (w1, w1_scale) = "
-            f"{tuple(_w1_relaid)}"
-        )
-    if not _is_a8w4_g942 and any(_w1_relaid):
-        _s1_name = getattr(metadata.stage1, "keywords", {}).get(
+    _get_flydsl_moe_kernels().check_a8w4_gfx942_inputs(
+        w1,
+        w1_scale,
+        hidden_states,
+        prequantized_a1,
+        _s1_params,
+        getattr(metadata.stage1, "keywords", {}).get(
             "kernelName", getattr(metadata.stage1, "func", metadata.stage1)
-        )
-        raise ValueError(
-            "W1 / W1 scale are relaid for the gfx942 a8w4 stage 1 "
-            "(a8w4_gfx942_layout), which only the `_g942` kernels read, but stage 1 "
-            f"is {_s1_name}; is AITER_SITUV2_A8W4=1 set?"
-        )
+        ),
+    )
     if prequantized_a1 is not None:
         if quant_type != QuantType.per_1x32:
             raise ValueError(
@@ -5673,27 +5660,13 @@ def fused_moe_2stages(
             raise ValueError(
                 "prequantized_a1_scale must be supplied alongside prequantized_a1"
             )
-        if _is_a8w4_g942:
-            # The gfx942 a8w4 stage 1 reads x either as bf16 (`_qi`) or in the
-            # layout fused_dynamic_mxfp8_quant_moe_sort writes; a caller's
-            # prequantized A has no agreed layout for it.
-            raise ValueError(
-                "prequantized_a1 is not supported with the gfx942 a8w4 stage 1"
-            )
         a1 = prequantized_a1
         a1_scale = prequantized_a1_scale
     elif not metadata.prequant:
         a1 = hidden_states
         a1_scale = None
     elif _is_a8w4_g942 and _s1_params.get("x_layout") == "bf16":
-        # The `_qi` stage 1 quantises x itself and has no input for x scales: a
-        # pre-quantised x (fp8 + a1_scale) cast to bf16 here would lose its scales.
-        if hidden_states.dtype not in (dtypes.bf16, dtypes.fp16):
-            raise ValueError(
-                "the gfx942 a8w4 stage 1 kernel "
-                f"{metadata.stage1.keywords.get('kernelName', '')} quantises x "
-                f"itself and takes bf16 / fp16 x, got {hidden_states.dtype}"
-            )
+        # `_qi` stage 1: quantises the bf16 x itself (inputs checked above)
         a1 = hidden_states.to(dtypes.bf16)
         a1_scale = None
     elif (
