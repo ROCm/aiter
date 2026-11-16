@@ -113,6 +113,16 @@ def rotate_activation_mxfp8_quant(
 
 
 @compile_ops("module_mha_v4_quant", develop=True)
+def rotate_activation_mxfp8_quant_k_hd256(
+    out: Tensor,
+    scale: Tensor,
+    input: Tensor,
+    mean: Tensor,
+) -> None:
+    """Rotate a [b, s, 2h, 128] half-head view of hd256 K into MXFP8 64-token K records."""
+
+
+@compile_ops("module_mha_v4_quant", develop=True)
 def rotate_activation_mxfp6_quant(
     out: Tensor,
     scale: Tensor,
@@ -1071,4 +1081,100 @@ def _quantize_v_mxfp6_fp6_p_hd256_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     return _mxfp6_hd256_v_view(raw, batch, sequence, heads), input.new_empty(
         (batch, heads, mxfp6_v_tiles(sequence) * MHA_V4_MXFP6_HD256_V_SCALE_TILE_BYTES),
         dtype=torch.uint8,
+    )
+
+
+# ---- hd256 MXFP8 ---------------------------------------------------------------------------
+# Q and V stay natural BSHD (Q from the hd128 producer on half-heads). K is one record per 64-token
+# tile: C0 and C1, 8 KiB each, one 1 KiB block per (MFMA head half, 32-token subtile), 16 bytes per
+# lane; then hd256 MXFP6's 1 KiB K-scale tail. Lane hi*32 + token of block (half, n) holds channels
+# half*64 + hi*16 + [0, 16) in C0 and the same +32 in C1: an FP8 operand's dwords 0-3 and 4-7, since
+# its E8M0 block b is dwords 4b..4b+3 of both lane halves, not lane half b.
+MHA_V4_MXFP8_HD256_K_TILE_TOKENS = 64
+MHA_V4_MXFP8_HD256_K_DATA_BYTES = MHA_V4_MXFP8_HD256_K_TILE_TOKENS * MHA_V4_HD256
+MHA_V4_MXFP8_HD256_K_TILE_BYTES = MHA_V4_MXFP8_HD256_K_DATA_BYTES + 1024
+MHA_V4_MXFP8_HD256_K_ROW_BYTES = (
+    MHA_V4_MXFP8_HD256_K_TILE_BYTES // MHA_V4_MXFP8_HD256_K_TILE_TOKENS
+)
+
+
+def mxfp8_hd256_k_tiles(sequence: int) -> int:
+    """Number of 64-token records in an hd256 MXFP8 K head."""
+    return (
+        sequence + MHA_V4_MXFP8_HD256_K_TILE_TOKENS - 1
+    ) // MHA_V4_MXFP8_HD256_K_TILE_TOKENS
+
+
+@torch.library.custom_op("aiter::mha_v4_quantize_mxfp8_q_hd256", mutates_args=())
+def quantize_mxfp8_q_hd256(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
+    """Rotate and quantize hd256 BSHD Q to MXFP8 data and E8M0 block scales."""
+    batch, sequence, heads, _ = _validate_bshd_hd256(
+        input, "hd256 MXFP8 Q quantization"
+    )
+    quantized, scale = quantize_mxfp8_q(_hd256_half_heads(input), multiplier)
+    # Pure reshapes, so the scale keeps the query-tile padding the hd128 producer gave it.
+    return (
+        quantized.reshape(batch, sequence, heads, MHA_V4_HD256),
+        scale.reshape(batch, sequence, heads, MHA_V4_HD256 // 32),
+    )
+
+
+@quantize_mxfp8_q_hd256.register_fake
+def _quantize_mxfp8_q_hd256_fake(
+    input: Tensor, multiplier: float
+) -> tuple[Tensor, Tensor]:
+    del multiplier
+    return input.new_empty(input.shape, dtype=dtypes.fp8), _plain_block_scale(input)
+
+
+@torch.library.custom_op("aiter::mha_v4_quantize_mxfp8_k_hd256_raw", mutates_args=())
+def quantize_mxfp8_k_hd256(
+    input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+) -> tuple[Tensor, Tensor]:
+    """Rotate and quantize hd256 BSHD K into raw MXFP8 ASM records plus its E8M0 block scales.
+
+    The scales also ride inside the records, which is where the kernel reads them; the separate
+    [b, s, h, 8] tensor is what the launcher validates. View the records with mxfp8_k_view_hd256.
+    """
+    batch, sequence, heads, _ = _validate_bshd_hd256(
+        input, "hd256 MXFP8 K quantization"
+    )
+    half_mean = (
+        None if mean is None else mean.reshape(batch, heads * 2, MHA_V4_HD256 // 2)
+    )
+    tiles = mxfp8_hd256_k_tiles(sequence)
+    records = input.new_empty(
+        (batch, heads, tiles, MHA_V4_MXFP8_HD256_K_TILE_BYTES), dtype=torch.uint8
+    )
+    if sequence % MHA_V4_MXFP8_HD256_K_TILE_TOKENS:
+        # The kernel masks tokens past the sequence; zero bytes keep them finite.
+        records[:, :, -1].zero_()
+    records = records.view(-1).view(dtypes.fp8)
+    scale = _plain_block_scale(input)
+    rotate_activation_mxfp8_quant_k_hd256(
+        records, scale, _hd256_half_heads(input), _or_empty(input, half_mean)
+    )
+    return records, scale
+
+
+@quantize_mxfp8_k_hd256.register_fake
+def _quantize_mxfp8_k_hd256_fake(
+    input: Tensor, mean: Optional[Tensor] = None  # noqa: UP045
+) -> tuple[Tensor, Tensor]:
+    del mean
+    batch, sequence, heads, _ = input.shape
+    size = (
+        batch * heads * mxfp8_hd256_k_tiles(sequence) * MHA_V4_MXFP8_HD256_K_TILE_BYTES
+    )
+    return input.new_empty((size,), dtype=dtypes.fp8), _plain_block_scale(input)
+
+
+def mxfp8_k_view_hd256(
+    records: Tensor, batch: int, sequence: int, heads: int
+) -> Tensor:
+    """BSHD view of hd256 MXFP8 K records: token stride is a record's bytes per token."""
+    head_stride = mxfp8_hd256_k_tiles(sequence) * MHA_V4_MXFP8_HD256_K_TILE_BYTES
+    return records.as_strided(
+        (batch, sequence, heads, MHA_V4_HD256),
+        (heads * head_stride, MHA_V4_MXFP8_HD256_K_ROW_BYTES, head_stride, 1),
     )
