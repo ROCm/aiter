@@ -13,7 +13,7 @@ from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+from aiter.jit.utils.lds_capacity import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     make_lds_copy_ops,
     pipeline_fence,

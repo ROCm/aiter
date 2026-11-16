@@ -96,6 +96,18 @@ void allreduce_add_lamport(fptr_t _fa,
                            const aiter_tensor_t& inp,
                            const aiter_tensor_t& other,
                            const aiter_tensor_t& out);
+// Lamport one-shot all-gather on the init_lamport_ar_rms inbox. dim 0
+// concatenates the ranks' inputs, any other dim gathers along the last dim.
+// An input the kernel cannot read in place (unaligned, or overlapping out other
+// than as its own dim-0 slice) is copied into the registered buffer reg_inp_ptr
+// of reg_inp_bytes first. Bit for bit, except that a 0xffff half-word of an
+// fp16/bf16 input comes out 0x7fff (both NaN).
+void all_gather_lamport(fptr_t _fa,
+                        const aiter_tensor_t& inp,
+                        const aiter_tensor_t& out,
+                        int64_t dim,
+                        int64_t reg_inp_ptr,
+                        int64_t reg_inp_bytes);
 void p2p_bw_test(fptr_t _fa,
                   const aiter_tensor_t& inp,
                   const aiter_tensor_t& out,
