@@ -1542,7 +1542,10 @@ class AttentionProgram:
                 q_block_local_idx * self.cfg.BLOCK_Q
                 + offs_m_out // self.cfg.NUM_QUERIES_PER_KV
             )
-            query_offset_0_out = cur_batch_in_all_start_index + query_pos_out
+            # int64 row offset, as on the TDM path: token index * output_stride_0 can pass 2**31
+            query_offset_0_out = (
+                cur_batch_in_all_start_index.to(gl.int64) + query_pos_out
+            )
             query_offset_1_out = (
                 kv_head_idx * self.cfg.NUM_QUERIES_PER_KV
                 + offs_m_out % self.cfg.NUM_QUERIES_PER_KV

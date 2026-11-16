@@ -16,7 +16,9 @@ Correctness: every candidate bit for bit against the rank-order fp32 reference
 (two NaNs count as equal). A mixed sequence then interleaves the add with the
 Lamport AR + RMSNorm on the one shared inbox, with sizes that leave the last
 wave partial, injected 0xffff, fallback calls (past the cap, a broadcast
-operand, against the fake's metadata) and a graph replayed with fresh inputs.
+operand, against the fake's metadata), operands off 16B alignment on the odd
+ranks only (every rank must still take the Lamport kernel) and a graph replayed
+with fresh inputs.
 
 Timing: a CUDA graph of CALLS calls is replayed REPLAYS times; median per rank,
 slowest rank reported (CALLS = 43, the MoE layers of a DeepSeek-V4.1 step).
@@ -76,6 +78,12 @@ def make_inputs(tp, rank, seed, m, n, dtype, nan=False):
     for r in range(1, tp):
         acc = acc + sums[r].float()
     return xs[0, rank].contiguous(), xs[1, rank].contiguous(), acc.to(dtype)
+
+
+def offset_view(t):
+    """t's values one element into a fresh storage, so off 16B alignment."""
+    storage = torch.empty(t.numel() + 1, dtype=t.dtype, device=t.device)
+    return storage[1:].view(t.shape).copy_(t)
 
 
 def bit_mismatch(a, b):
@@ -183,7 +191,20 @@ def check_mixed_sequence(ca, tp, rank, dtype):
     assert got.shape == fake.shape and got.dtype == fake.dtype, (got.shape, fake.shape)
     calls += 2
 
+    # the odd ranks' operands one element into their storage: every rank must
+    # still take the Lamport kernel, the odd ones copying them first
+    for m, n in MIXED_ADD[:2]:
+        x, y, ref = make_inputs(tp, rank, 300 + m, m, n, dtype)
+        if rank % 2:
+            x, y = offset_view(x), offset_view(y)
+        assert ca.should_lamport_ar_add(x, y), (m, n)
+        got = tensor_model_parallel_all_reduce_add(x, y)
+        worst = max(worst, bit_mismatch(got, ref))
+        calls += 1
+
     ins = [make_inputs(tp, rank, 0, m, n, dtype)[:2] for m, n in GRAPH_ADD]
+    if rank % 2:  # unaligned operands inside the graph as well
+        ins[0] = tuple(offset_view(t) for t in ins[0])
     graph = torch.cuda.CUDAGraph()
     with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
         outs = [tensor_model_parallel_all_reduce_add(x, y) for x, y in ins]

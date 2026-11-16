@@ -92,6 +92,27 @@ rules are in [`configs/AGENTS.md`](configs/AGENTS.md).
 
 ## Reference
 
+### FlashAttention Dao-AI implementation
+
+Select the Dao-AI Triton implementation per call through the public MHA API:
+
+```python
+from aiter.ops.triton.attention.mha import flash_attn_func
+
+out = flash_attn_func(q, k, v, implementation="dao_ai")
+```
+
+`flash_attn_varlen_func` accepts the same selector. Omitting it preserves the
+configured Triton default. The selected implementation and dropout RNG state
+are retained for backward. This does not change the separate `aiter.ops.mha`
+dispatch. The Dao-AI varlen LSE layout remains `(heads, total_q)`.
+
+KV-cache attention uses the existing public Triton wrapper. It does not support
+backward, nonzero softcap or split counts above one. Its kernel package is
+internal at `_triton_kernels/attention/dao_ai/`. The former
+`_triton_kernels/flash_attn_triton_amd/` path forwards imports temporarily so
+current FlashAttention releases continue to work during the transition.
+
 ### Folder layout
 
 ```text
