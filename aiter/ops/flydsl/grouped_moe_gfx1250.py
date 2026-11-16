@@ -52,6 +52,20 @@ def _flydsl_dispatch_context():
     return getattr(_MEGA_DISPATCH_TLS, "ctx", None)
 
 
+# Shared-expert add fused into the gather-reduce epilogue (item D C). The caller passes {"addend": tensor, "consumed": False};
+# the grouped path sets "consumed" = True only when it added the addend into its output, so the caller adds it itself
+# otherwise. Thread-local like the dispatch context (fused_moe_ crosses a custom-op schema that cannot carry it).
+_MOE_ADDEND_TLS = threading.local()
+
+
+def set_moe_output_addend(ctx: dict | None):
+    _MOE_ADDEND_TLS.ctx = ctx
+
+
+def _moe_output_addend():
+    return getattr(_MOE_ADDEND_TLS, "ctx", None)
+
+
 def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
     """Contiguous uint8 view of a static MoE weight, cached by data_ptr."""
     key = (w.data_ptr(), tuple(w.shape), tuple(w.stride()), str(w.dtype))
@@ -482,6 +496,26 @@ def route_fused_workspace(E: int, device):
     return count, barrier, slots, starts, psum
 
 
+# AITER_TDM_EP_ROUTE_G2L_FUSED=1 (item D A0, default off): static EP (no a2a, num_local_tokens None) small decode
+# batches route through the single-block moe_route_g2l_fused (LUT + counter zero + route in one launch, replacing
+# moe_g2l_lut + moe_route_g2l_lds), and the constant (1,) nvt / nvr scalars come from a cache filled outside graph
+# capture (no torch.full fill kernel per layer). Values are unchanged: nvt = token_num, nvr = token_num * topk.
+_EP_CONST_I32: dict = {}
+
+
+def _ep_const_i32(value: int, device) -> torch.Tensor:
+    dev = torch.device(device)
+    key = (int(value), dev.type, dev.index)
+    t = _EP_CONST_I32.get(key)
+    if t is not None:
+        return t
+    t = torch.full((1,), int(value), dtype=torch.int32, device=dev)
+    # A fill recorded during capture only runs at replay, so never cache a tensor created while capturing.
+    if not torch.cuda.is_current_stream_capturing():
+        _EP_CONST_I32[key] = t
+    return t
+
+
 def _build_g2l_lut(
     expert_mask: torch.Tensor,
     E: int,
@@ -851,6 +885,29 @@ def _grouped_a8w4_tdm_moe(
         and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
         and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
     )
+    _ep_route_g2l_fused_env = (
+        _is_ep
+        and num_local_tokens is None
+        and os.environ.get("AITER_TDM_EP_ROUTE_G2L_FUSED", "0") in ("1", "true", "True")
+    )
+    _ep_route_g2l_fused = (
+        _ep_route_g2l_fused_env
+        and not _compact
+        and not enable_ep_scatter
+        and not herd_topk
+        and _flydsl_dispatch_context() is None
+        and expert_mask is not None
+        and expert_mask.numel() <= 512  # moe_route_maps.MAX_G2L_EXPERTS (one-block LUT scan)
+        # one block: op bench 11-16 -1.8 us at 32 routes, -1.4 at 128, +1.8 at 1024 -> default cap 256 routes
+        and token_num * topk <= int(os.environ.get("AITER_TDM_EP_ROUTE_G2L_FUSED_MAX_ROUTES", "256"))
+    )
+    # A1: one workgroup also does the psum + remap (moe_route_psum_fused_ep), on top of A0's conditions.
+    _ep_route_psum_fused = (
+        _ep_route_g2l_fused
+        and not a_preshuffled
+        and int(E) <= 512
+        and os.environ.get("AITER_TDM_EP_ROUTE_PSUM_FUSED", "0") in ("1", "true", "True")
+    )
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
         topids_to_rows = None
@@ -866,7 +923,10 @@ def _grouped_a8w4_tdm_moe(
             # this stays legal under CUDA graph capture. torch.tensor([...],
             # device=cuda) would allocate a CPU tensor and cudaMemcpy it, which
             # capture rejects unless pinned.
-            _ep_nvt = torch.full((1,), int(token_num), dtype=torch.int32, device=device)
+            if _ep_route_g2l_fused_env:
+                _ep_nvt = _ep_const_i32(int(token_num), device)
+            else:
+                _ep_nvt = torch.full((1,), int(token_num), dtype=torch.int32, device=device)
         _direct_ep_mask = _flydsl_dispatch_context() is not None and os.environ.get(
             "AITER_TDM_DIRECT_EP_MASK", "1"
         ) in (
@@ -905,6 +965,9 @@ def _grouped_a8w4_tdm_moe(
             )
             _g2l_counter = route_counter_buffer(E, device)
             _ep_nvr = torch.empty(1, dtype=torch.int32, device=device)
+        elif _ep_route_g2l_fused:
+            # A0: expert_mask goes to flydsl_moe_topids_to_rows (fused LUT + route); no LUT / counter here.
+            _ep_nvr = _ep_const_i32(int(token_num) * int(topk), device)
         else:
             _g2l_lut, _g2l_counter, _g2l_nvr = _build_g2l_lut(
                 expert_mask, E, device, nvt=_ep_nvt, topk=int(topk)
@@ -922,19 +985,23 @@ def _grouped_a8w4_tdm_moe(
             # Route kernel writes every entry (kept -> weight_dtype cast,
             # dropped -> 0), so the buffer is fully kernel-written.
             _gather_w_buf = torch.empty((token_num, topk), dtype=dtype, device=device)
-            _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(
-                topk_ids,
-                E,
-                max_m,
-                g2l_lut=_g2l_lut,
-                gather_w=_gather_w_buf,
-                weight_in=topk_weight,
-                counter=_g2l_counter,
-                num_local_tokens=num_local_tokens,
-                num_valid_routes=_ep_nvr,
-                ep_rowmap=ep_rowmap,
-                contiguous_expert_mask=_direct_ep_mask,
-            )
+            if _ep_route_psum_fused:
+                _masked_m = topids_to_rows = None  # A1: fused_route_psum_remap_ep below
+            else:
+                _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(
+                    topk_ids,
+                    E,
+                    max_m,
+                    g2l_lut=None if _ep_route_g2l_fused else _g2l_lut,
+                    expert_mask=expert_mask if _ep_route_g2l_fused else None,
+                    gather_w=_gather_w_buf,
+                    weight_in=topk_weight,
+                    counter=_g2l_counter,
+                    num_local_tokens=num_local_tokens,
+                    num_valid_routes=_ep_nvr,
+                    ep_rowmap=ep_rowmap,
+                    contiguous_expert_mask=_direct_ep_mask,
+                )
     elif not _fused_tp_route:
         _fuse_ep_route_quant = False
         if herd_topk:
@@ -992,6 +1059,10 @@ def _grouped_a8w4_tdm_moe(
     elif _fused_tp_route:
         _masked_m, topids_to_rows, psum = fused_route_psum_remap(
             topk_ids, E, max_m, _align_m
+        )
+    elif _ep_route_psum_fused:
+        _masked_m, topids_to_rows, psum = fused_route_psum_remap_ep(
+            topk_ids, topk_weight, expert_mask, E, max_m, _align_m, _gather_w_buf
         )
     elif _fuse_psum_quant:
         # The remapper's scan and ep_rowmap scatter ride the quant kernel:
@@ -1199,6 +1270,12 @@ def _grouped_a8w4_tdm_moe(
             ep_psum_params=ep_psum_params,
             row_major_scale=_row_major_a1,
             payload_preshuffled=a_preshuffled,
+            static_token_count=(
+                _is_ep
+                and num_local_tokens is None
+                and stage2_scatter is None
+                and _flydsl_dispatch_context() is None
+            ),
         )
         if _compact_ascale:
             a1_scale = flydsl_moe_scatter_preshuffle_scale(
@@ -1577,12 +1654,28 @@ def _grouped_a8w4_tdm_moe(
             if doweight_stage1
             else topk_weight.contiguous()
         )
+    # Item D C: fuse the caller's shared-expert addend only when every output token is written here (no EP dead tail).
+    _add_ctx = _moe_output_addend()
+    _addend = None
+    if _add_ctx is not None and (not _is_ep or num_local_tokens is None):
+        _a = _add_ctx.get("addend")
+        if (
+            _a is not None
+            and _a.dtype == moe_out.dtype
+            and tuple(_a.shape) == tuple(moe_out.shape)
+            and _a.is_contiguous()
+            and _a.device == moe_out.device
+            and _a.data_ptr() != moe_out.data_ptr()
+        ):
+            _addend = _a
+            _add_ctx["consumed"] = True
     flydsl_moe_gather_reduce(
         grouped_out,
         topids_to_rows,
         gather_w,
         out=moe_out,
         num_valid_tokens=(_ep_nvt if _is_ep else None),
+        addend=_addend,
     )
     return moe_out
 
@@ -2032,6 +2125,7 @@ def _get_compiled_gather_reduce(
     vec_dwords: int = 2,
     w_dtype: str = "f32",
     ep_compact: int = 0,
+    add_addend: int = 0,
 ):
     """Compile and cache the one-pass MoE gather-reduce kernel."""
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
@@ -2039,7 +2133,7 @@ def _get_compiled_gather_reduce(
     )
 
     return build_moe_gather_reduce_module(
-        model_dim, topk, out_dtype, split_k, vec_dwords, w_dtype, ep_compact
+        model_dim, topk, out_dtype, split_k, vec_dwords, w_dtype, ep_compact, add_addend
     )
 
 
@@ -2095,6 +2189,56 @@ def _get_compiled_route_psum_fused():
 # are both one slot per lane.
 _FUSED_ROUTE_PSUM_MAX_NUMEL = 2048
 _FUSED_ROUTE_PSUM_MAX_EXPERTS = 512
+
+
+@functools.cache
+def _get_compiled_route_psum_fused_ep(weight_dtype: str):
+    from aiter.ops.flydsl.kernels.moe_route_psum_fused_ep import (
+        build_moe_route_psum_fused_ep_module,
+    )
+
+    return build_moe_route_psum_fused_ep_module(weight_dtype)
+
+
+def fused_route_psum_remap_ep(
+    topk_ids: torch.Tensor,
+    topk_weight: torch.Tensor,
+    expert_mask: torch.Tensor,
+    experts: int,
+    max_m: int,
+    tile_m: int,
+    gather_w: torch.Tensor,
+):
+    """A1: single-workgroup static-EP route + gather_w + psum + remap (global ids, expert_mask <= 512 entries).
+    Returns (masked_m, topids_to_rows[token_num, topk], psum); writes gather_w (kept -> cast weight, dropped -> 0)."""
+    device = topk_ids.device
+    token_num, topk = topk_ids.shape
+    numel = token_num * topk
+    mask_i32 = expert_mask.to(device=device, dtype=torch.int32).reshape(-1)
+    assert mask_i32.numel() <= 512 and int(experts) <= 512
+    topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
+    masked_m = torch.empty(int(experts), dtype=torch.int32, device=device)
+    starts = torch.empty(int(experts), dtype=torch.int32, device=device)
+    psum = torch.empty(int(experts), dtype=torch.int32, device=device)
+    wdt = "f16" if gather_w.dtype == torch.float16 else "bf16"
+    _run_compiled(
+        _get_compiled_route_psum_fused_ep(wdt),
+        ptr_arg(mask_i32),
+        ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
+        ptr_arg(topk_weight.to(torch.float32).reshape(-1)),
+        ptr_arg(topids_to_rows),
+        ptr_arg(gather_w.reshape(-1)),
+        ptr_arg(masked_m),
+        ptr_arg(starts),
+        ptr_arg(psum),
+        int(mask_i32.numel()),
+        int(numel),
+        int(experts),
+        int(max_m),
+        int(tile_m),
+        current_stream_arg(),
+    )
+    return masked_m, topids_to_rows.view(token_num, topk), psum
 
 
 def fused_route_psum_remap(
@@ -2303,6 +2447,7 @@ def flydsl_moe_gather_reduce(
     num_valid_tokens: (
         torch.Tensor | None
     ) = None,  # (1,) int32; skip output tokens >= this (EP dead-tail)
+    addend: torch.Tensor | None = None,  # (token_num, model_dim) same dtype; out = rnd(rnd(sum) + addend)
 ) -> torch.Tensor:
     """One-pass gather-reduce: out[t] = sum_k w[t,k] * grouped[topids_to_rows[t,k]].
 
@@ -2356,8 +2501,11 @@ def flydsl_moe_gather_reduce(
         ep_compact = GR_EP_COMPACT_ENV
     else:
         ep_compact = 2 if token_num >= GR_EP_ROWLOOP_MIN_TOKENS else 1
+    if addend is not None:
+        assert addend.dtype == grouped_out.dtype and tuple(addend.shape) == (token_num, model_dim)
+        assert addend.is_contiguous() and addend.device == device
     launch = _get_compiled_gather_reduce(
-        model_dim, topk, out_dtype, split_k, gather_vec, w_dtype, ep_compact
+        model_dim, topk, out_dtype, split_k, gather_vec, w_dtype, ep_compact, int(addend is not None)
     )
     slice_stride_dw = E * max_m * (model_dim // 2)
     # Skip dead-tail output tokens whose route map is unwritten. Default (no
@@ -2381,6 +2529,7 @@ def flydsl_moe_gather_reduce(
         token_num,
         slice_stride_dw,
         ptr_arg(num_valid_tokens_i32),
+        ptr_arg(addend if addend is not None else torch.empty(0, dtype=grouped_out.dtype, device=device)),
         current_stream_arg(),
     )
     return out

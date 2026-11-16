@@ -108,6 +108,33 @@ def _pack_pair_from_f32(acc_lo, acc_hi, out_dtype):
     return lo_i32 | (hi_i32 << 16)
 
 
+def _epilogue_pack(add_addend, addend, out_row_dw_base, dw_base, vec, row_bytes_i32, acc, out_dtype):
+    """Pack the f32 accumulators to out dtype; with add_addend: out = rnd(f32(rnd(acc)) + f32(addend)), the rounding
+    sequence of a separate `out + addend` in torch (bitwise equal). Plain Python helper (traced inline)."""
+    if not add_addend:
+        return [_pack_pair_from_f32(acc[2 * lane], acc[2 * lane + 1], out_dtype) for lane in range(vec)]
+    rsrc = buffer_ops.create_buffer_resource_from_addr(
+        fx.Uint64(ptrtoint(addend)) + fx.Uint64(out_row_dw_base) * fx.Uint64(4),
+        num_records_bytes=row_bytes_i32,
+    )
+    raw = fx.Vector(buffer_ops.buffer_load(rsrc, dw_base, vec_width=vec, dtype=T.i32))
+    packed = []
+    for lane in range(vec):
+        r_lo, r_hi = _unpack_pair_to_f32(_pack_pair_from_f32(acc[2 * lane], acc[2 * lane + 1], out_dtype), out_dtype)
+        a_lo, a_hi = _unpack_pair_to_f32(fx.Uint32(raw[lane]), out_dtype)
+        packed.append(_pack_pair_from_f32(r_lo + a_lo, r_hi + a_hi, out_dtype))
+    return packed
+
+
+def _epilogue_pack1(add_addend, addend, dw_idx_abs, acc_lo, acc_hi, out_dtype):
+    """Scalar-tail variant of _epilogue_pack (one dword at absolute dword index dw_idx_abs of the output)."""
+    if not add_addend:
+        return _pack_pair_from_f32(acc_lo, acc_hi, out_dtype)
+    r_lo, r_hi = _unpack_pair_to_f32(_pack_pair_from_f32(acc_lo, acc_hi, out_dtype), out_dtype)
+    a_lo, a_hi = _unpack_pair_to_f32(fx.Uint32(ptr_buf_tensor(addend)[dw_idx_abs]), out_dtype)
+    return _pack_pair_from_f32(r_lo + a_lo, r_hi + a_hi, out_dtype)
+
+
 def build_moe_gather_reduce_module(
     model_dim: int,
     topk: int,
@@ -116,8 +143,10 @@ def build_moe_gather_reduce_module(
     vec_dwords: int = 2,
     w_dtype: str = "f32",
     ep_compact: int = 0,
+    add_addend: int = 0,
 ):
     ep_compact = int(ep_compact)
+    add_addend = int(add_addend)
     GR_SKIP_DROPPED = int(ep_compact >= 1)
     GR_ROWLOOP = int(ep_compact >= 2)
     assert model_dim % 2 == 0
@@ -135,6 +164,7 @@ def build_moe_gather_reduce_module(
     module_name = format_kernel_name(
         f"moe_gather_reduce_{out_dtype}_d{model_dim}_tk{topk}_sk{split_k}_v{VEC}"
         f"_w{w_dtype}_frlds{f'_epc{ep_compact}' if ep_compact else ''}"
+        f"{'_add' if add_addend else ''}"
     )
 
     @flyc.kernel(name=module_name)
@@ -146,6 +176,7 @@ def build_moe_gather_reduce_module(
         num_tokens: Int32,
         slice_stride_dw: Int32,
         num_valid_tokens: fx.Pointer,
+        addend: fx.Pointer,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -265,10 +296,9 @@ def build_moe_gather_reduce_module(
                               acc = upd
                           else:
                               acc = _route()
-                      packed = [
-                          _pack_pair_from_f32(acc[2 * lane], acc[2 * lane + 1], out_dtype)
-                          for lane in range(VEC)
-                      ]
+                      packed = _epilogue_pack(
+                          add_addend, addend, out_row_dw_base, dw_base, VEC, row_bytes_i32, acc, out_dtype
+                      )
                       fx.memref_store_vec(
                           fx.Vector.from_elements(packed, fx.Uint32), frag
                       )
@@ -300,8 +330,8 @@ def build_moe_gather_reduce_module(
                                       red_hi = red_hi + hi_f32
                                   acc_lo = acc_lo + w_f32 * red_lo
                                   acc_hi = acc_hi + w_f32 * red_hi
-                              out_t[out_row_dw_base + dw_idx] = _pack_pair_from_f32(
-                                  acc_lo, acc_hi, out_dtype
+                              out_t[out_row_dw_base + dw_idx] = _epilogue_pack1(
+                                  add_addend, addend, out_row_dw_base + dw_idx, acc_lo, acc_hi, out_dtype
                               )
 
     @flyc.jit
@@ -313,6 +343,7 @@ def build_moe_gather_reduce_module(
         num_tokens: fx.Int32,
         slice_stride_dw: fx.Int32,
         num_valid_tokens: fx.Pointer,
+        addend: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         launcher = moe_gather_reduce_kernel(
@@ -323,6 +354,7 @@ def build_moe_gather_reduce_module(
             num_tokens,
             slice_stride_dw,
             num_valid_tokens,
+            addend,
         )
         launcher.launch(
             grid=(fx.Int64(num_tokens), 1 if GR_ROWLOOP else n_iters, 1),

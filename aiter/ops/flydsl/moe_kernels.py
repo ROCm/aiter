@@ -3491,6 +3491,9 @@ def flydsl_moe_fused_quant_preshuffle(
     # row_major_ascale=1. Unsupported with A-preshuffled payloads or quantization.
     row_major_scale: bool = False,
     payload_preshuffled: bool = False,
+    # Caller guarantee: the token count is static (EP over a TP group, no a2a), so the token-multidest drop
+    # variant is also valid inside CUDA-graph capture (AITER_FLYDSL_EP_TOKEN_MULTIDEST_GRAPH=1).
+    static_token_count: bool = False,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle.
 
@@ -3625,7 +3628,14 @@ def flydsl_moe_fused_quant_preshuffle(
             and row_to_token is None
             and os.environ.get("AITER_FLYDSL_EP_TOKEN_MULTIDEST", "0")
             in ("1", "true", "True")
-            and not torch.cuda.is_current_stream_capturing()
+            and (
+                not torch.cuda.is_current_stream_capturing()
+                or (
+                    static_token_count
+                    and os.environ.get("AITER_FLYDSL_EP_TOKEN_MULTIDEST_GRAPH", "0")
+                    in ("1", "true", "True")
+                )
+            )
         )
         multidest_max_topk = (
             _EP_TOKEN_MULTIDEST_MAX_TOPK
@@ -3639,7 +3649,14 @@ def flydsl_moe_fused_quant_preshuffle(
             and not fuse_ep_psum
             and (num_valid_routes is None or ep_multidest)
             and 1 < int(source_topk) <= multidest_max_topk
-            and token_num >= _TOKEN_MULTIDEST_MIN_TOKENS
+            # EP drop variant only: AITER_FLYDSL_EP_TOKEN_MULTIDEST_MIN_TOKENS (default 64 = unchanged); topk 16 static
+            # EP measured 11-16: multidest wins from ~12 tokens (M16 -1.1 us, M32 -4.1, M48 -7.2), loses below (M8 +0.4)
+            and token_num
+            >= (
+                int(os.environ.get("AITER_FLYDSL_EP_TOKEN_MULTIDEST_MIN_TOKENS", str(_TOKEN_MULTIDEST_MIN_TOKENS)))
+                if ep_multidest
+                else _TOKEN_MULTIDEST_MIN_TOKENS
+            )
             and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
             in ("1", "true", "True")
         )
