@@ -1182,9 +1182,11 @@ def _rows8_fold(s, w, mfma_layout: gl.constexpr):
     w = w.broadcast_to([256, 32]).reshape(shape).permute(order)
     sa, sb = s.split()
     wa, wb = w.split()
-    acca = _weighted_fma_fold_serial(relu_f32(sa), wa, 16, 4)
-    accb = _weighted_fma_fold_serial(relu_f32(sb), wb, 16, 4)
-    return acca + accb
+    # Two chains over head bit 4, then head bit 2: the order of NUM_CHAINS=2 in
+    # the two-row tile. Both routes then return the same bits.
+    a0, a1 = _weighted_fma_fold_serial(relu_f32(sa), wa, 8, 3).split()
+    b0, b1 = _weighted_fma_fold_serial(relu_f32(sb), wb, 8, 3).split()
+    return (a0 + a1) + (b0 + b1)
 
 
 @gluon.jit
