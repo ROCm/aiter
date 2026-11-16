@@ -237,8 +237,11 @@ def _auto_waves(max_query_len, batch, heads, max_block, device=None) -> int:
 # LDS two blocks ahead, widened in pieces between the MFMAs of the block before it).
 # It needs the grid to stay full with 4x fewer query tiles than tile_q 128 and enough
 # context to amortise the Q staging: tiles * batch * heads >= 32, or >= 16 with at
-# least 1024 blocks of context.
+# least 1024 blocks of context. And a query longer than the 256-row tile: up to 256
+# rows the 8-wave / tile_q 256 CTA is also one query tile, so the 512-row tile saves no
+# page read, and at ctx 16K / 32K, batch 1-32, H 1-4, q 1-256 it measures 1.6-1.7x slower.
 _XWIDE_TILE_Q = 512
+_XWIDE_MIN_QUERY_LEN = _WIDE_CTA_TILE_Q + 1
 _XWIDE_MIN_BLOCKS = 128
 _XWIDE_MIN_TILES = 32
 _XWIDE_WAVES_PER_EU = 2
@@ -248,11 +251,15 @@ _XWIDE_PPW4_MIN_CHUNK = 32
 @cache
 def _use_xwide(max_query_len, batch, heads, max_block) -> bool:
     tiles = -(-max_query_len // _XWIDE_TILE_Q)
-    return max_block >= _XWIDE_MIN_BLOCKS and (
-        tiles * batch * heads >= _XWIDE_MIN_TILES
-        or (
-            tiles * batch * heads >= _XWIDE_MIN_TILES // 2
-            and max_block >= 8 * _XWIDE_MIN_BLOCKS
+    return (
+        max_query_len >= _XWIDE_MIN_QUERY_LEN
+        and max_block >= _XWIDE_MIN_BLOCKS
+        and (
+            tiles * batch * heads >= _XWIDE_MIN_TILES
+            or (
+                tiles * batch * heads >= _XWIDE_MIN_TILES // 2
+                and max_block >= 8 * _XWIDE_MIN_BLOCKS
+            )
         )
     )
 

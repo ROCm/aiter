@@ -27,6 +27,7 @@ Run (exits nonzero if any check fails):
 """
 
 import argparse
+import contextlib
 import itertools
 import os
 import sys
@@ -709,11 +710,13 @@ def _with_xwide(ppw=None):
     class _Patch:
         def __enter__(self):
             self.saved = (
+                mod._XWIDE_MIN_QUERY_LEN,
                 mod._XWIDE_MIN_BLOCKS,
                 mod._XWIDE_MIN_TILES,
                 mod._XWIDE_PPW4_MIN_CHUNK,
             )
-            mod._XWIDE_MIN_BLOCKS = mod._XWIDE_MIN_TILES = mod._XWIDE_PPW4_MIN_CHUNK = 0
+            mod._XWIDE_MIN_QUERY_LEN = mod._XWIDE_MIN_BLOCKS = 0
+            mod._XWIDE_MIN_TILES = mod._XWIDE_PPW4_MIN_CHUNK = 0
             mod._use_xwide.cache_clear()
             self.orig = mod.geometry
             if ppw is not None:
@@ -724,9 +727,12 @@ def _with_xwide(ppw=None):
 
         def __exit__(self, *exc):
             mod.geometry = self.orig
-            mod._XWIDE_MIN_BLOCKS, mod._XWIDE_MIN_TILES, mod._XWIDE_PPW4_MIN_CHUNK = (
-                self.saved
-            )
+            (
+                mod._XWIDE_MIN_QUERY_LEN,
+                mod._XWIDE_MIN_BLOCKS,
+                mod._XWIDE_MIN_TILES,
+                mod._XWIDE_PPW4_MIN_CHUNK,
+            ) = self.saved
             mod._use_xwide.cache_clear()
 
     return _Patch()
@@ -898,15 +904,15 @@ def check_prefill_nvfp4_block_table_row_stride_beyond_2gib():
 
 def check_prefill_nvfp4_causal_window_near_int32_bound():
     """One query row at the end of a 2147483392-token sequence (an accepted bound) on
-    16 heads takes the 512-row tile. `prefix + q_base + 512` passes 2**31 and, in
-    int32, wrapped negative before the clamp to `seq_len`, so no page was scored.
+    16 heads, on the 512-row tile (forced: a query of 256 rows or fewer does not take it
+    any more) and on the tile the selector picks. `prefix + q_base + 512` passes 2**31
+    and, in int32, wrapped negative before the clamp to `seq_len`, so no page was scored.
     Every block id is page 0, so every block of every head scores the same value."""
     import aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill as mod
 
     S, heads = 2147483392, 16
     c = nv_case([1], [P], heads, exact_sum=True)  # one page, 16 query heads
     mb = -(-S // P)
-    assert mod.geometry(1, 1, heads, mb, "cuda", xwide=True)["tile_q"] == 512
     deq = c["e4m3"].float()[0]  # the one page [128, D]
     ref = torch.einsum("hd,td->ht", c["q8"][0].float(), deq).amax(-1)  # [H]
     c.update(
@@ -917,10 +923,16 @@ def check_prefill_nvfp4_causal_window_near_int32_bound():
         max_seq=S,
         mb=mb,
     )
-    got = run_nv(c)  # [H, 1, mb]
-    unwritten = int((got == SENTINEL).sum())
-    assert unwritten == 0, f"{unwritten} of {got.numel()} slots left unwritten"
-    check_equal(got[:, 0, :], ref[:, None].expand(heads, mb), "near-int32 window")
+    for forced in (True, False):
+        with _with_xwide() if forced else contextlib.nullcontext():
+            tile_q = mod.geometry(1, 1, heads, mb, "cuda", xwide=True)["tile_q"]
+            assert (tile_q == 512) == forced, f"forced={forced}: tile_q {tile_q}"
+            got = run_nv(c)  # [H, 1, mb]
+        unwritten = int((got == SENTINEL).sum())
+        assert unwritten == 0, f"{unwritten} of {got.numel()} slots left unwritten"
+        check_equal(
+            got[:, 0, :], ref[:, None].expand(heads, mb), f"near-int32 window {forced=}"
+        )
 
 
 def check_prefill_nvfp4_exact_geometry_is_not_mutated_by_the_output():
