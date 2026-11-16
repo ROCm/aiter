@@ -1,0 +1,3 @@
+dtype,hdim_q,hdim_v,mask,knl_name,co_name
+fp8,192,128,0,_ZN5aiter42fmha_fp8_pertensor_hd192x128_256x64_varlenE,fmha_fp8_pertensor_hd192x128_256x64_varlen.co
+fp8,192,128,1,_ZN5aiter47fmha_fp8_pertensor_hd192x128_256x64_mask_varlenE,fmha_fp8_pertensor_hd192x128_256x64_mask_varlen.co

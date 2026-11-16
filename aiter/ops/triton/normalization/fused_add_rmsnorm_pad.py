@@ -54,7 +54,7 @@ def fused_add_rmsnorm_pad(
     M, N = x.shape
 
     if backend is None:
-        backend = "gluon" if get_arch() == "gfx1250" else "triton"
+        backend = "gluon" if get_arch() in ("gfx1250", "gfx1250-strict") else "triton"
 
     backend = backend.lower()
     assert backend in (
@@ -63,7 +63,7 @@ def fused_add_rmsnorm_pad(
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
 
     if backend == "gluon":
-        if get_arch() == "gfx1250":
+        if get_arch() in ("gfx1250", "gfx1250-strict"):
 
             if x_pad_to_multiple > 0:
                 N_out = triton.cdiv(N, x_pad_to_multiple) * x_pad_to_multiple

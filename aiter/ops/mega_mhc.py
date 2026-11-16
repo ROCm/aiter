@@ -8,12 +8,26 @@ from dataclasses import dataclass
 from functools import cache
 
 import torch
+import triton
+import triton.language as tl
 from torch import Tensor
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx_runtime
 
-__all__ = ["MegaMHCWorkspace", "mega_mhc", "mega_mhc_shuffle_fn", "prepare_mega_mhc"]
+__all__ = [
+    "MEGA_MHC_RES_KS",
+    "MegaMHCWorkspace",
+    "mega_mhc",
+    "mega_mhc_post_shuffled",
+    "mega_mhc_res_preshuffle_supported",
+    "mega_mhc_res_repeat",
+    "mega_mhc_res_shuffle",
+    "mega_mhc_res_unshuffle",
+    "mega_mhc_shuffle_fn",
+    "precompile_mega_mhc_post_shuffled",
+    "prepare_mega_mhc",
+]
 
 
 _STREAM_HIDDEN_SIZES = (5120, 7168)
@@ -33,6 +47,16 @@ _STREAM_VARIANTS = (
     "large",
     "tail",
     "generic",
+    # gfx1250: IDs 14.. select the kernels in csrc/kernels/mega_mhc_gfx1250.cu.
+    "gfx1250_split32",
+    "gfx1250_split16",
+    "gfx1250_split8",
+    "gfx1250_split4",
+    "gfx1250_split2",
+    "gfx1250_large",
+    "gfx1250_split5",
+    "gfx1250_split10",
+    "gfx1250_split14",
 )
 
 _DISTRIBUTED_VARIANTS = frozenset(
@@ -48,8 +72,32 @@ _DISTRIBUTED_VARIANTS = frozenset(
         "mid512",
         "mid1024",
         "mid2048",
+        "gfx1250_split32",
+        "gfx1250_split16",
+        "gfx1250_split8",
+        "gfx1250_split4",
+        "gfx1250_split2",
+        "gfx1250_split5",
+        "gfx1250_split10",
+        "gfx1250_split14",
     )
 )
+
+# Counters carry generation tags and partials are compact [split, T, 32].
+# gfx1250_large uses them for the split tiles of a partial final CU round.
+_TAGGED_VARIANTS = _DISTRIBUTED_VARIANTS | {"gfx1250_large"}
+
+# Largest split first; each token tile and split gets its own CU.
+_GFX1250_SPLITS = (32, 16, 8, 4, 2)
+
+# On 256 CUs, (split, most token tiles) per hidden size from a gfx1250 sweep
+# of all split counts that divide H / 32. Splits 10 and 14 fill up to 240 and
+# 252 CUs where 16 or 8 would leave a third idle; clusters of 5 (three per
+# 16-WGP shader engine) hold up to 48 tiles.
+_GFX1250_SPLIT_TABLE = {
+    5120: ((32, 8), (10, 24), (8, 32), (5, 48), (4, 64), (2, 128)),
+    7168: ((32, 8), (14, 18), (8, 32), (4, 64), (2, 128)),
+}
 
 
 def _select_stream_variant(tokens, hidden=5120):
@@ -75,6 +123,22 @@ def _select_stream_variant(tokens, hidden=5120):
     if tokens == 4160:
         return "tail", 1
     return "large", 1
+
+
+def _select_gfx1250_variant(tokens, cu, hidden=5120):
+    if tokens == 0:
+        return "generic", 1
+    blocks = (tokens + 15) // 16
+    table = _GFX1250_SPLIT_TABLE.get(hidden) if cu == 256 else None
+    if table is not None:
+        for split, most in table:
+            if blocks <= most:
+                return f"gfx1250_split{split}", split
+        return "gfx1250_large", 1
+    for split in _GFX1250_SPLITS:
+        if blocks * split <= cu:
+            return f"gfx1250_split{split}", split
+    return "gfx1250_large", 1
 
 
 def mega_mhc_shuffle_fn(fn):
@@ -137,6 +201,8 @@ def _native_launcher(hidden):
         identity_pre: bool,
         variant: int,
         mxfp8: bool,
+        res_preshuffle: bool,
+        scale_row_major: bool,
     ) -> None: ...
 
     launch.__name__ = f"_mega_mhc_stream_{suffix}"
@@ -227,11 +293,12 @@ def prepare_mega_mhc(
 ):
     """Prepare private scratch from dimensions on the current stream of device.
 
-    H=5120/7168 on gfx950 uses the tuned stream kernels. Explicit split_k,
-    other H and gfx942 select the portable generic kernel with the same weight
-    layout. The workspace also supports non-default Sinkhorn repeats via the
-    generic path. It never receives or stores weights. Prepare before graph
-    capture; pass the packed weight separately to each mega_mhc call.
+    H=5120/7168 on gfx950 and gfx1250 uses the tuned stream kernels.
+    Explicit split_k, other H and gfx942 select the portable generic kernel
+    with the same weight layout. The workspace also supports non-default
+    Sinkhorn repeats via the generic path. It never receives or stores
+    weights. Prepare before graph capture; pass the packed weight separately
+    to each mega_mhc call.
     """
     with torch.cuda.device(device):
         if torch.cuda.is_current_stream_capturing():
@@ -251,12 +318,16 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
         raise ValueError("unsupported T or H")
     with torch.cuda.device(device):
         arch = get_gfx_runtime()
-        if arch not in ("gfx950", "gfx942"):
-            raise RuntimeError(f"mega_mhc requires gfx950 or gfx942, got {arch}")
+        if arch not in ("gfx950", "gfx942", "gfx1250"):
+            raise RuntimeError(
+                f"mega_mhc requires gfx950, gfx942 or gfx1250, got {arch}"
+            )
         blocks = (tokens + 15) // 16
         cu = torch.cuda.get_device_properties(device).multi_processor_count
         if arch == "gfx950" and hidden in _STREAM_HIDDEN_SIZES:
             variant, selected_split = _select_stream_variant(tokens, hidden)
+        elif arch == "gfx1250" and hidden in _STREAM_HIDDEN_SIZES:
+            variant, selected_split = _select_gfx1250_variant(tokens, cu, hidden)
         else:
             variant = "generic"
             selected_split = max(
@@ -271,8 +342,9 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
             os.environ.get(name) is not None
             for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
         )
-        if distributed and (cu < 256 or masked):
+        if distributed and (masked or (arch != "gfx1250" and cu < 256)):
             variant, selected_split, distributed = "generic", 1, False
+        tagged = variant in _TAGGED_VARIANTS
         split_k = selected_split
         if (
             not isinstance(split_k, int)
@@ -282,29 +354,33 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
             raise ValueError("split_k must be 1..32 and H divisible by 32*split_k")
         # The distributed kernels have a bounded wait and handoff path;
         # still keep the tuned grid at no more than one WG per CU.
-        if distributed and ((blocks + 7) // 8) * split_k > 32:
+        if distributed and (
+            blocks * split_k > cu
+            if arch == "gfx1250"
+            else ((blocks + 7) // 8) * split_k > 32
+        ):
             raise ValueError("distributed split grid exceeds one workgroup per CU")
         if reuse_scratch:
             storage, generic_counters, distributed_counters = _SCRATCH.get(
                 device, split_k * blocks * 16 * 32, blocks * 32
             )
             generic_partials = storage.view(split_k, blocks, 16, 32)
-            counters = distributed_counters if distributed else generic_counters
+            counters = distributed_counters if tagged else generic_counters
         else:
             generic_partials = torch.empty(
                 (split_k, blocks, 16, 32), device=device, dtype=torch.float32
             )
             # Initialize both protocols in one operation for a private workspace.
             counter_storage = torch.zeros(
-                (2 if distributed else 1, blocks * 32),
+                (2 if tagged else 1, blocks * 32),
                 device=device,
                 dtype=torch.int32,
             )
             counters = counter_storage[0]
-            generic_counters = counter_storage[1] if distributed else counters
+            generic_counters = counter_storage[1] if tagged else counters
         partials = (
             generic_partials.view(-1)[: split_k * tokens * 32]
-            if distributed
+            if tagged
             else generic_partials
         )
         return MegaMHCWorkspace(
@@ -323,7 +399,7 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
 def _counter_state_ok(workspace):
     """Synchronizing diagnostic for tests; never call during graph capture."""
     counters = workspace.counters
-    if workspace.variant in _DISTRIBUTED_VARIANTS:
+    if workspace.variant in _TAGGED_VARIANTS:
         counters = counters.view(-1, 32)
         generation = (counters[:, 0].to(torch.int64) & 0xFFFFFFFF) >> 8
         idle = (
@@ -361,6 +437,8 @@ def mega_mhc(
     workspace: MegaMHCWorkspace | None = None,
     w_preshuffle_bf16: bool = False,
     out_dtype: str = "bf16",
+    res_preshuffle: bool = False,
+    scale_row_major: bool = False,
 ):
     """Delayed post/pre/RMSNorm seam, returning (R, post, comb, norm, next_pre).
 
@@ -376,15 +454,34 @@ def mega_mhc(
     pack can be shared across streams after the loading stream has finished.
     Pass an explicit workspace to own private scratch instead. Raw FP32 fn is
     not accepted; w_preshuffle_bf16 must be True, with or without a workspace.
-    H=5120/7168 on gfx950 uses stream dispatch for Sinkhorn=20; other
-    positive repeat counts use the generic stream kernel with the same pack.
+    H=5120/7168 on gfx950 and gfx1250 uses stream dispatch for Sinkhorn=20;
+    other positive repeat counts use the generic stream kernel with the same
+    pack.
 
-    out_dtype="mxfp8" (gfx950 only) returns (norm, q, e8m0) in place of norm:
-    BF16 norm (T, H), float8_e4m3fn q (T, H), and uint8 exponent bytes (T, H/32).
+    out_dtype="mxfp8" (gfx950 and gfx1250) returns (norm, q, e8m0) in place of
+    norm: the BF16 norm (T, H), float8_e4m3fn q (T, H) and uint8 E8M0 exponent
+    bytes, one per group of 32 columns. The call is the same on both
+    architectures. The exponent bytes use the layout of each architecture's
+    MXFP8 GEMM:
+
+    * gfx950: (T, H/32), row-major.
+    * gfx1250: (pad32(T), H/32) in the gfx1250 MXFP8 GEMM A-scale layout, that
+      is the bytes of aiter.ops.shuffle.shuffle_mxfp8fp4_scale. Padding rows
+      hold 0x7F. H must be divisible by 128.
+
+    scale_row_major=True makes gfx1250 write the gfx950 layout, (T, H/32)
+    row-major with no padding rows, for consumers that read row-major A-scales,
+    such as the group32 GEMM with 32x32 weight scales. gfx950 already writes it.
+
     Quantization uses the rounded BF16 norm and group32 power-of-two scales,
     ceil_pow2(max(amax, 1e-10) / 448), matching FlyDSL Mega-MHC. Reinterpret
-    scale bytes with .view(torch.float8_e8m0fnu) for consumers requiring E8M0.
-    The same workspace supports both output modes, including graph replay.
+    the scale bytes with .view(torch.float8_e8m0fnu) for consumers that require
+    E8M0. The same workspace supports both output modes, including graph replay.
+
+    res_preshuffle=True (gfx1250 only): residual and the returned residual are
+    in the aiter.ops.mhc.mhc_res_shuffle layout with ks=32, that is
+    resS[k // 32][stream][token][k % 32] in the same (T, 4, H) shape.
+    sublayer_out and the layer input stay plain.
     """
     assert w_preshuffle_bf16, "mega_mhc requires w_preshuffle_bf16=True"
     if not residual.is_cuda or residual.ndim != 3 or residual.shape[1] != 4:
@@ -437,8 +534,13 @@ def mega_mhc(
             )
         residual_out = residual
     with torch.cuda.device(device):
-        if out_dtype == "mxfp8" and get_gfx_runtime() != "gfx950":
-            raise RuntimeError("Mega-MHC mxfp8 requires gfx950")
+        arch = get_gfx_runtime()
+        if out_dtype == "mxfp8" and arch not in ("gfx950", "gfx1250"):
+            raise RuntimeError("Mega-MHC mxfp8 requires gfx950 or gfx1250")
+        if out_dtype == "mxfp8" and arch == "gfx1250" and h % 128:
+            raise ValueError("Mega-MHC mxfp8 on gfx1250 requires H divisible by 128")
+        if res_preshuffle and arch != "gfx1250":
+            raise RuntimeError("Mega-MHC res_preshuffle requires gfx1250")
         if workspace is None:
             scratch = _prepare_scratch(device, t, h)
         else:
@@ -459,7 +561,12 @@ def mega_mhc(
         layer_input = norm
         if out_dtype == "mxfp8":
             quant_out = torch.empty((t, h), device=device, dtype=torch.float8_e4m3fn)
-            quant_scale = torch.empty((t, h // 32), device=device, dtype=torch.uint8)
+            # gfx1250 pads rows to 32 for the m32k4 GEMM A-scale layout.
+            m32k4 = arch == "gfx1250" and not scale_row_major
+            scale_rows = (t + 31) // 32 * 32 if m32k4 else t
+            quant_scale = torch.empty(
+                (scale_rows, h // 32), device=device, dtype=torch.uint8
+            )
             layer_input = (norm, quant_out, quant_scale)
         partials, counters = scratch.partials, scratch.counters
         variant = scratch.variant
@@ -500,5 +607,195 @@ def mega_mhc(
             pre_mix is None,
             _STREAM_VARIANTS.index(variant),
             out_dtype == "mxfp8",
+            res_preshuffle,
+            scale_row_major,
         )
     return residual_out, post_out, comb_out, layer_input, next_pre
+
+
+# ---------------------------------------------------------------------------
+# Carrying the residual in the res_preshuffle layout between Mega-MHC calls.
+#
+# mega_mhc(res_preshuffle=True) reads and returns the residual as
+# resS[k // MEGA_MHC_RES_KS][stream][token][k % MEGA_MHC_RES_KS], same
+# (T, hc, H) shape. A model that keeps its residual in that layout from the
+# embedding to the end of the stack needs to enter it (repeat), leave it
+# (unshuffle), and, where a sublayer's post cannot fold into the next
+# mega_mhc call, apply the post in place of mhc_post (mega_mhc_post_shuffled).
+# Unlike aiter.ops.mhc's mhc_res_* helpers these never pick the block width
+# or the layout from the row count: the caller decides, and every helper
+# here takes and returns the layout mega_mhc reads, for any rows.
+# ---------------------------------------------------------------------------
+
+#: Block width of the residual layout mega_mhc(res_preshuffle=True) reads.
+MEGA_MHC_RES_KS = 32
+
+
+@cache
+def _res_layout_ops():
+    try:
+        from .mhc import (
+            mhc_res_repeat_flydsl,
+            mhc_res_shuffle_flydsl,
+            mhc_res_unshuffle_flydsl,
+        )
+    except ImportError:
+        return None
+    return mhc_res_repeat_flydsl, mhc_res_shuffle_flydsl, mhc_res_unshuffle_flydsl
+
+
+@cache
+def mega_mhc_res_preshuffle_supported() -> bool:
+    """Whether mega_mhc(res_preshuffle=True) and the helpers below run here."""
+    return get_gfx_runtime() == "gfx1250" and _res_layout_ops() is not None
+
+
+def _res_rows(residual: Tensor) -> Tensor:
+    hc, hidden = residual.shape[-2:]
+    return residual.reshape(-1, hc, hidden).contiguous()
+
+
+def mega_mhc_res_shuffle(residual: Tensor) -> Tensor:
+    """Plain (..., hc, H) residual -> the res_preshuffle layout, same shape."""
+    return _res_layout_ops()[1](_res_rows(residual), MEGA_MHC_RES_KS).view_as(residual)
+
+
+def mega_mhc_res_unshuffle(residual: Tensor) -> Tensor:
+    """res_preshuffle-layout (..., hc, H) residual -> the plain layout."""
+    return _res_layout_ops()[2](_res_rows(residual), MEGA_MHC_RES_KS).view_as(residual)
+
+
+def mega_mhc_res_repeat(hidden_states: Tensor, hc_mult: int) -> Tensor:
+    """(..., H) hidden states -> the (..., hc_mult, H) residual of hc_mult
+    copies, written straight in the res_preshuffle layout."""
+    dim = hidden_states.shape[-1]
+    rows = hidden_states.reshape(-1, dim).contiguous()
+    return _res_layout_ops()[0](rows, hc_mult, MEGA_MHC_RES_KS).view(
+        *hidden_states.shape[:-1], hc_mult, dim
+    )
+
+
+# `num_tokens` only scales strides that are multiples of KS, so specializing on
+# its value buys nothing: one compile per launch config, whatever the rows.
+@triton.jit(do_not_specialize=["num_tokens"])
+def _mega_mhc_post_shuffled_kernel(
+    x_ptr,
+    res_ptr,
+    post_ptr,
+    comb_ptr,
+    out_ptr,
+    num_tokens,
+    DIM: tl.constexpr,
+    TB: tl.constexpr,
+    CH: tl.constexpr,
+    KS: tl.constexpr,
+):
+    # hc = 4. One program: TB tokens x CH columns, all four streams, so each
+    # stream's rows are TB * KS contiguous elements per KS block.
+    tok = (tl.program_id(0) * TB + tl.arange(0, TB)).to(tl.int64)
+    col = tl.program_id(1) * CH + tl.arange(0, CH)
+    tlive = tok < num_tokens
+    live = tlive[:, None] & (col < DIM)[None, :]
+    x = tl.load(x_ptr + tok[:, None] * DIM + col[None, :], live, 0).to(tl.float32)
+    base = (
+        (col // KS)[None, :] * (4 * num_tokens * KS)
+        + tok[:, None] * KS
+        + (col % KS)[None, :]
+    )
+    stream = num_tokens * KS
+    r0 = tl.load(res_ptr + base, live, 0).to(tl.float32)
+    r1 = tl.load(res_ptr + base + stream, live, 0).to(tl.float32)
+    r2 = tl.load(res_ptr + base + 2 * stream, live, 0).to(tl.float32)
+    r3 = tl.load(res_ptr + base + 3 * stream, live, 0).to(tl.float32)
+    for b in tl.static_range(4):
+        # comb_res_mix[token, input_stream, output_stream]
+        c0 = tl.load(comb_ptr + tok * 16 + 0 * 4 + b, tlive, 0)[:, None]
+        c1 = tl.load(comb_ptr + tok * 16 + 1 * 4 + b, tlive, 0)[:, None]
+        c2 = tl.load(comb_ptr + tok * 16 + 2 * 4 + b, tlive, 0)[:, None]
+        c3 = tl.load(comb_ptr + tok * 16 + 3 * 4 + b, tlive, 0)[:, None]
+        p = tl.load(post_ptr + tok * 4 + b, tlive, 0)[:, None]
+        mixed = c0 * r0 + c1 * r1 + c2 * r2 + c3 * r3
+        out = mixed + p * x
+        tl.store(out_ptr + base + b * stream, out, live)
+
+
+# (rows upper bound, (TB, CH, num_warps)), from a gfx1250 H=5120 sweep: small
+# tiles while the grid still fills the device, then taller token tiles, whose
+# TB * KS contiguous elements per KS block keep the loads and stores long.
+_POST_SHUFFLED_LAUNCH = (
+    (256, (8, 128, 4)),
+    (512, (8, 64, 4)),
+    (None, (32, 64, 2)),
+)
+
+
+def _post_shuffled_launch(rows: int):
+    for bound, config in _POST_SHUFFLED_LAUNCH:
+        if bound is None or rows <= bound:
+            return config
+
+
+def _launch_post_shuffled(x, residual, post_mix, combination, out, rows, config):
+    tb, ch, warps = config
+    hidden = residual.shape[-1]
+    _mega_mhc_post_shuffled_kernel[(triton.cdiv(rows, tb), triton.cdiv(hidden, ch))](
+        x,
+        residual,
+        post_mix,
+        combination,
+        out,
+        rows,
+        DIM=hidden,
+        TB=tb,
+        CH=ch,
+        KS=MEGA_MHC_RES_KS,
+        num_warps=warps,
+        enable_fp_fusion=False,
+    )
+
+
+def mega_mhc_post_shuffled(
+    sublayer_out: Tensor,
+    residual: Tensor,
+    post_layer_mix: Tensor,
+    comb_res_mix: Tensor,
+) -> Tensor:
+    """mhc_post on a res_preshuffle-layout residual, returning that layout.
+
+    new[t, b] = sum_a comb_res_mix[t, a, b] * residual[t, a]
+                + post_layer_mix[t, b] * sublayer_out[t], FP32 then BF16,
+    with residual and the result as (..., 4, H) in the res_preshuffle layout
+    and sublayer_out (..., H) plain. For a post that cannot fold into the
+    next mega_mhc call (e.g. a module that reads the residual in between).
+    """
+    hc, hidden = residual.shape[-2:]
+    if hc != 4 or hidden % MEGA_MHC_RES_KS:
+        raise ValueError(
+            f"mega_mhc_post_shuffled needs hc=4 and H % {MEGA_MHC_RES_KS} == 0"
+        )
+    rows = residual.numel() // (hc * hidden)
+    out = torch.empty_like(residual)
+    if rows:
+        _launch_post_shuffled(
+            sublayer_out.reshape(rows, hidden).contiguous(),
+            residual.contiguous(),
+            post_layer_mix.reshape(rows, hc).float().contiguous(),
+            comb_res_mix.reshape(rows, hc, hc).float().contiguous(),
+            out,
+            rows,
+            _post_shuffled_launch(rows),
+        )
+    return out
+
+
+def precompile_mega_mhc_post_shuffled(hidden: int, device) -> None:
+    """Compile every launch config of mega_mhc_post_shuffled on one dummy row,
+    so no step pays a Triton compile (`num_tokens` is not specialized: one
+    compile per config, whatever the rows). Call before graph capture."""
+    x = torch.zeros(1, hidden, dtype=torch.bfloat16, device=device)
+    residual = torch.zeros(1, 4, hidden, dtype=torch.bfloat16, device=device)
+    post_mix = torch.zeros(1, 4, dtype=torch.float32, device=device)
+    combination = torch.zeros(1, 4, 4, dtype=torch.float32, device=device)
+    out = torch.empty_like(residual)
+    for _, config in _POST_SHUFFLED_LAUNCH:
+        _launch_post_shuffled(x, residual, post_mix, combination, out, 1, config)

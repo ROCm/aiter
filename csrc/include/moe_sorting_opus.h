@@ -823,7 +823,7 @@ struct MoeSortingKernel
                             smem_tokens(curr_token_id, eid)++;
                     }
                 }
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
                 opus::s_wait_dscnt(opus::number<0>{});
 #else
                 opus::s_waitcnt_lgkmcnt(opus::number<0>{});
@@ -952,7 +952,7 @@ struct MoeSortingKernel
                     // NOTE: this waitcnt is a must, compiler will not generate waitcnt lgkmcnt()
                     // for above write however __syncthreads will cause barrier with waves other
                     // than 0(which is not we want)
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
                     opus::s_wait_dscnt(opus::number<0>{});
 #else
                     opus::s_waitcnt_lgkmcnt(opus::number<0>{});
@@ -1184,6 +1184,24 @@ struct MoeSortingKernel
 };
 
 namespace impl {
+
+// Vector `i` of a [tokens, topk] id tensor holding `numel` ids. Under a device-side
+// token count (LocalToken) the vector loops run to that count rounded up to the
+// vector width, which can pass the tensor's end when the count is its height; the
+// vector that would is read id by id, its ids past the end -1 (no expert).
+template <typename VecType, typename IndexType, int Vec>
+OPUS_D VecType moe_sorting_load_topk_vec(const VecType* p, opus::index_t i, opus::index_t numel)
+{
+    if((i + 1) * Vec <= numel)
+        return p[i];
+    const IndexType* ids = reinterpret_cast<const IndexType*>(p);
+    VecType x;
+    opus::static_for<Vec>([&](auto j) {
+        const opus::index_t idx = i * Vec + j.value;
+        x[j.value]              = idx < numel ? ids[idx] : static_cast<IndexType>(-1);
+    });
+    return x;
+}
 
 // [expert, padded_tokens]
 OPUS_H_D opus::index_t moe_sorting_mp_mesh_stride(opus::index_t tokens)
@@ -1464,8 +1482,10 @@ moe_sorting_auto_is_oneshot(int tokens_, int num_experts_, int device_id_ = -1)
     if(!is_oneshot)
         return false;
 
-    // gfx950 crossover measured with E=256/257 at M>=8 and E=385 at all M.
-    bool prefer_mp = num_experts_ >= 385 || (num_experts_ >= 256 && tokens_ >= 8);
+    // gfx950 crossover measured with E=128..255 at M>=17, E=256/257 at M>=8,
+    // E=384 at M<8 and E=385 at all M.
+    bool prefer_mp = num_experts_ >= 384 || (num_experts_ >= 256 && tokens_ >= 8) ||
+                     (num_experts_ >= 128 && tokens_ >= 17);
     return !(moe_sorting_device_is_gfx950(device_id_) && prefer_mp);
 }
 
@@ -1757,7 +1777,8 @@ struct MoeSortingMultiPhaseKernel_P0_v1
         for(opus::index_t i = blockIdx.x * kBlockSize + threadIdx.x; i < total_elem;
             i += gridDim.x * kBlockSize)
         {
-            auto x = p_topk_ids[i];
+            auto x = impl::moe_sorting_load_topk_vec<topk_id_t, IndexType, Problem::SubTokenTile>(
+                p_topk_ids, i, kargs.tokens * kargs.topk_mdiv.divisor);
             opus::static_for<Problem::SubTokenTile>([&](auto j) {
                 IndexType eid = x[j.value]; // ext_vector_type must use int to []
                 uint32_t curr_token_id, curr_topk_id;
@@ -1912,7 +1933,8 @@ struct MoeSortingMultiPhaseKernel_P0_v2
 #pragma unroll index_pack
         for(opus::index_t i = threadIdx.x; i < total_elem; i += kBlockSize)
         {
-            auto x = p_topk_ids[i];
+            auto x = impl::moe_sorting_load_topk_vec<topk_id_t, IndexType, index_pack>(
+                p_topk_ids, i, kargs.tokens * kargs.topk_mdiv.divisor);
             opus::static_for<index_pack>([&](auto j) {
                 IndexType eid_x = x[j.value]; // ext_vector_type must use int to []
                 if(eid_x == eid)
@@ -2251,7 +2273,8 @@ struct MoeSortingMultiPhaseKernel_P01
             for(opus::index_t i = blockIdx.x * kBlockSize + threadIdx.x; i < total_elem;
                 i += kBlockSize * gridDim.x)
             {
-                auto x = p_topk_ids[i];
+                auto x = impl::moe_sorting_load_topk_vec<topk_id_t, IndexType, Problem::SubTokenTile>(
+                    p_topk_ids, i, kargs.tokens * kargs.topk_mdiv.divisor);
                 opus::static_for<Problem::SubTokenTile>([&](auto j) {
                     IndexType eid = x[j.value]; // ext_vector_type must use int to []
                     uint32_t curr_token_id, curr_topk_id;

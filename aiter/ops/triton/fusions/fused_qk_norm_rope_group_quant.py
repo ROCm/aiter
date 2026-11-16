@@ -62,7 +62,7 @@ def fused_qk_norm_rope_group_quant(
         k_rope [T, 64] bf16. Bytes [448, 462) of a row hold the 7 scales, each
         written twice. The kernel does not write bytes [462, 512).
     """
-    assert arch_info.get_arch() == "gfx1250"
+    assert arch_info.get_arch() in ("gfx1250", "gfx1250-strict")
     num_tokens, num_heads, head_dim = q.shape
     config = _get_config(num_tokens)
     assert head_dim == HEAD_DIM and num_heads % config["HEADS_PER_PROGRAM"] == 0

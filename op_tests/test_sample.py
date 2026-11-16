@@ -163,6 +163,165 @@ def test_mixed_sample(M, N, dtype=torch.bfloat16, eps=1e-6):
     }
 
 
+def check_exponential_row_bounds(l_dtype=(torch.float32, torch.bfloat16)):
+    """aiter.exponential must fill its row and write nothing past it.
+
+    Same partial-last-vector shape as check_vocab_edges, on the store side.
+    The output descriptor's extent is rounded up to a dword (`oob_o`) because
+    the buffer bound is enforced per dword, so at a 2-byte dtype with
+    N % VecSize != 0 the last store reached one element past the row and a
+    two-row buffer had row 1 clobbered by row 0's noise. Shrinking the extent
+    to N instead drops a real element, since at an odd N elements N-1 and N
+    share a dword -- hence the masked scalar tail in the kernel.
+    """
+    sentinel = -7.0
+    for dtype in l_dtype:
+        for N in (4094, 4095, 4096, 4097, 16385):
+            buf = torch.full((2, N), sentinel, dtype=dtype)
+            aiter.exponential(buf[0:1], lambd=1.0, eps=1e-10)
+            torch.cuda.synchronize()
+            unwritten = int((buf[0] == sentinel).sum())
+            assert (
+                unwritten == 0
+            ), f"exponential {dtype} {N=}: {unwritten} elements left unwritten"
+            assert bool(
+                (buf[1] == sentinel).all()
+            ), f"exponential {dtype} {N=}: wrote past the row into the next one"
+    aiter.logger.info(
+        "exponential row-bounds check passed for %s", [str(d) for d in l_dtype]
+    )
+
+
+def check_vocab_edges(l_dtype=(torch.bfloat16, torch.float32), eps=1e-10):
+    """Every sampler must return a token id in [0, N) for any vocab size.
+
+    Two shapes used to escape that, and neither is reachable from the perf
+    sweep's N (both of its values are multiples of the vector width and far
+    above one block's span):
+
+      * N <= (BlockSize - 1) * VecSize: threads whose first element is past N
+        skipped the prologue load, then ran the tail on undefined registers
+        with a negative base index.
+      * N % VecSize != 0: the row's last vector is partial, and the lanes past
+        N fall outside the row. For the outer-exponential kernels the noise
+        descriptor ends exactly at N, so the 0 it yields lands in the divisor
+        and exp(x - max) / (0 + eps) won the argmax for any logits. The other
+        kernels take their out-of-range value from the logits descriptor
+        instead, so it only wins when every real logit in the row is negative
+        -- hence the all-negative rows below.
+
+    Both block spans are covered: 16384 for greedy_sample (block 1024, 16-wide)
+    and 4096 for every other entry point (block 1024, 4-wide), including
+    argmax_impl as reached through the mixed kernels at temperature 0.
+
+    fp32 is swept as well as bf16: `oob_i` rounds the logits descriptor up to a
+    dword, so at a 2-byte dtype the first lane past an odd N still reads real
+    memory and the corruption is data-dependent, while at fp32 it is a hard 0.
+    """
+    l_vocab = [
+        256,
+        1000,
+        2048,
+        4092,
+        4095,
+        4096,
+        4097,
+        4099,
+        8193,
+        16368,
+        16383,
+        16385,
+        50001,
+        163840,
+        163841,
+    ]
+    M = 4
+    for dtype in l_dtype:
+        for N in l_vocab:
+            for all_negative in (False, True):
+                logits = torch.randn(M, N, device="cuda", dtype=torch.float32) * 4
+                if all_negative:
+                    logits = -logits.abs() - 1.0
+                logits = logits.to(dtype)
+                ref_argmax = logits.to(torch.float).argmax(dim=-1).to(torch.int32)
+                hot = torch.ones(M, dtype=torch.float32, device="cuda")
+                cold = torch.zeros(M, dtype=torch.float32, device="cuda")
+                exponential = torch.empty(M, N, dtype=torch.float32).exponential_(1)
+                tag = f"{dtype} {N=} {all_negative=}"
+
+                out = torch.empty(M, dtype=torch.int32, device="cuda")
+                aiter.greedy_sample(out, logits)
+                assert torch.equal(out, ref_argmax), f"greedy_sample {tag} {out=}"
+
+                for name, fn in (
+                    (
+                        "mixed_sample_outer_exponential",
+                        aiter.mixed_sample_outer_exponential,
+                    ),
+                    (
+                        "random_sample_outer_exponential",
+                        aiter.random_sample_outer_exponential,
+                    ),
+                ):
+                    out = torch.empty(M, dtype=torch.int32, device="cuda")
+                    fn(out, logits, exponential, hot, eps=eps)
+                    probs = softmax(logits.to(torch.float))
+                    ref = probs.div_(exponential + eps).argmax(dim=-1).to(torch.int32)
+                    assert torch.equal(out, ref), f"{name} {tag} {out=}"
+
+                # temperature 0 routes the mixed kernels into argmax_impl, which
+                # the greedy entry point only ever reaches 16 elements wide.
+                out = torch.empty(M, dtype=torch.int32, device="cuda")
+                aiter.mixed_sample_outer_exponential(
+                    out, logits, exponential, cold, eps=eps
+                )
+                assert torch.equal(
+                    out, ref_argmax
+                ), f"mixed_sample_outer_exponential T=0 {tag} {out=}"
+
+                out = torch.empty(M, dtype=torch.int32, device="cuda")
+                aiter.mixed_sample(out, logits, cold, lambd=1.0, eps=eps)
+                assert torch.equal(out, ref_argmax), f"mixed_sample T=0 {tag} {out=}"
+
+                # The inner-exponential kernels draw their own noise, so only
+                # the index is checkable against a reference.
+                for name, fn in (
+                    ("mixed_sample", aiter.mixed_sample),
+                    ("random_sample", aiter.random_sample),
+                ):
+                    out = torch.empty(M, dtype=torch.int32, device="cuda")
+                    fn(out, logits, hot, lambd=1.0, eps=eps)
+                    assert bool(
+                        ((out >= 0) & (out < N)).all()
+                    ), f"{name} {tag} out of range: {out=}"
+    # The most negative finite value of the dtype is something logits can
+    # actually take, so it must not tie with argmax_impl's sentinel and lose it
+    # on the smaller-key rule. Taken per dtype: -FLT_MAX is outside bf16's
+    # range and rounds to -inf, the one case where token 0 is the right answer.
+    for dtype in l_dtype:
+        neg_max = -torch.finfo(dtype).max
+        for N, tok in ((17, 5), (4095, 4094), (16385, 16384)):
+            logits = torch.full((1, N), float("-inf"), dtype=torch.float32)
+            logits[0, tok] = neg_max
+            logits = logits.to(dtype)
+            assert torch.isfinite(logits[0, tok]), f"{dtype} cannot hold {neg_max}"
+            cold = torch.zeros(1, dtype=torch.float32, device="cuda")
+            e = torch.empty(1, N, dtype=torch.float32).exponential_(1)
+            tag = f"{dtype} {N=} finite-logit=-FLT_MAX at {tok}"
+
+            out = torch.empty(1, dtype=torch.int32, device="cuda")
+            aiter.greedy_sample(out, logits)
+            assert int(out[0]) == tok, f"greedy_sample {tag} -> {int(out[0])}"
+
+            out = torch.empty(1, dtype=torch.int32, device="cuda")
+            aiter.mixed_sample_outer_exponential(out, logits, e, cold, eps=eps)
+            assert int(out[0]) == tok, f"mixed T=0 {tag} -> {int(out[0])}"
+
+    aiter.logger.info(
+        "vocab-edge check passed over %s for %s", l_vocab, [str(d) for d in l_dtype]
+    )
+
+
 d_sample = {
     "greedy": test_greedy_sample,
     "random": test_random_sample,
@@ -242,3 +401,9 @@ for test_func in list_sample_func:
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("sample summary (markdown):\n%s", df_md)
+
+# After the sweep: this asserts, and it draws from the same global RNG the
+# sweep does, so running it first would both hide the perf tables on a
+# regressed tree and change the inputs every table above is measured on.
+check_vocab_edges()
+check_exponential_row_bounds()

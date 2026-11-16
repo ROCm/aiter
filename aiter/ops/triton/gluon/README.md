@@ -257,7 +257,7 @@ python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -
 
 **Function:** `pa_decode_gluon(output, query, key_cache, value_cache, context_lengths, block_tables, softmax_scale, query_length, max_context_partition_num, context_partition_size, compute_type, query_scale, key_scale, value_scale, ...)`
 
-**Description:** Paged attention decode with partitioned KV (first pass + reduction). Supports MTP (multi-token prefill, query_length &le; 4), sliding window, ALiBi, causal masking. Three inner kernel variants for different KV block sizes.
+**Description:** Paged attention decode with partitioned KV (first pass + reduction). Supports MTP (multi-token prefill; see the query limits below), sliding window, ALiBi, causal masking. Three inner kernel variants for different KV block sizes.
 
 | Parameter | Details |
 |-----------|---------|
@@ -267,7 +267,8 @@ python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -
 | Output | bf16 (fp8 mode), or matches compute_type |
 | KV block sizes | 16, 64, 1024 (selected by kernel variant) |
 | Context partition | 256 (static_assert) |
-| Constraint | `query_length * query_group_size` &le; 64 |
+| Single-KV-head PS path | One KV head, with `ps=True` or one context partition. `sliding_window` &gt; 0 with 1024-token blocks does not use this path. |
+| Constraint | `query_length` &le; 4 and `query_length * query_group_size` &le; 64. On the single-KV-head PS path, `query_length` can be more than 4: `query_group_size` &le; 64, and `query_length` &lt; `sliding_window` when `sliding_window` &gt; 0. |
 ### `paged_attention_output_gate.py` — Paged Attention Decode + Output Gate + Group-FP8
 
 **Function:** `paged_attention_output_gate_group_fp8_quant(query, key_cache, value_cache, kv_indptr, kv_indices, gate, *, scale, max_context=None, k_scale=None, v_scale=None, quant_dtype=None)`
