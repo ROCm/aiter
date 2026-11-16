@@ -115,11 +115,14 @@ def write(
     rccl_roofs: dict,
     roofline=None,
     *,
+    link: str,
     peaks: dict | None = None,
 ) -> Path:
     """Write the configs of every op and RCCL roof of *records*, and of the
     fabric-peak probes, under *root*, with the measured times where *roofs*
-    / *rccl_roofs* / *peaks* have them. Returns the index path."""
+    / *rccl_roofs* / *peaks* have them. *rccl_roofs* is keyed by the RCCL
+    records' traffic, as ``Roofline.measure_rccl`` returns it; *link* picks
+    RCCL's pattern (``patterns.rccl_traffic``). Returns the index path."""
     peaks = peaks or {}
     root = Path(root)
     _prepare(root)
@@ -138,14 +141,14 @@ def write(
     for r in records:
         if r.impl != RCCL:
             continue
-        rt = patterns.rccl_traffic(r.traffic)
+        rt = patterns.rccl_traffic(r.traffic, link)
         rows += _write_roof(
             root,
             Path(slug(r.case)) / "rccl",
             r.case,
             "rccl",
             patterns.rccl_candidates(rt, settings),
-            rccl_roofs.get(rt),
+            rccl_roofs.get(r.traffic),
         )
     if records:
         n = records[0].traffic.world_size
@@ -161,11 +164,11 @@ def write(
                 pk.roof if pk else None,
             )
     index = root / "README.md"
-    index.write_text(_index(rows, settings, roofline))
+    index.write_text(_index(rows, settings, roofline, link))
     return index
 
 
-def _index(rows, settings: RoofSettings, roofline) -> str:
+def _index(rows, settings: RoofSettings, roofline, link: str) -> str:
     if roofline is None:
         tb = "not run (--no-roof or --tb-dry-run)"
     elif roofline.available:
@@ -178,6 +181,7 @@ def _index(rows, settings: RoofSettings, roofline) -> str:
         f"- TransferBench: {tb}",
         f"- settings: `{settings}`",
         f"- fixed: `{_env_str(patterns.FIXED_ENV)}`",
+        f"- link: {link}; RCCL all-reduce roof: {patterns.rccl_all_reduce_desc(link)}",
         "- the tool also sets `OUTPUT_TO_CSV=0 HIDE_ENV=1` for its parser",
         "",
         *_TIME_RULE.splitlines(),

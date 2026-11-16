@@ -11,13 +11,14 @@ Per op row:
 * ``op eff`` is ``roof us / op us``: 1.0 is the op's TransferBench roof, which
   moves the op's own (wire-format) bytes in its pattern and memory type.
 * ``rccl eff`` is ``rccl roof us / rccl us``. RCCL gets its own roof, because
-  it moves different bytes: bf16, not the op's quantized wire format
-  (``patterns.rccl_traffic``).
+  it moves different bytes: bf16, not the op's quantized wire format, in
+  RCCL's own pattern on the host's link (``patterns.rccl_traffic``).
 * ``roof cfg`` / ``rccl roof cfg`` name the candidate that set each roof.
 * ``op wire/peak`` / ``rccl wire/peak``: the wire rate over the per-rank
-  fabric peak (``Roofline.measure_peaks``, push to all peers), the same
-  for every implementation. A section after the table sums this up per
-  implementation at its largest message (``summary``).
+  fabric peak (``fabric_peak``: the faster ``Roofline.measure_peaks``
+  probe, push to all peers or to one), the same for every implementation.
+  A section after the table sums this up per implementation at its largest
+  message (``summary``).
 
 Both roofs are a stock copy kernel's best, not the link's peak, so an
 implementation with a better copy loop can reach an eff above 1.0 (see
@@ -33,7 +34,12 @@ from dataclasses import replace
 from pathlib import Path
 
 from measure import RCCL, Record
-from patterns import busbw_factor, fabric_bytes_per_rank, rccl_traffic
+from patterns import (
+    busbw_factor,
+    fabric_bytes_per_rank,
+    rccl_all_reduce_desc,
+    rccl_fabric_bytes_per_rank,
+)
 from roof_settings import DEFAULT, RoofSettings
 from roofline import Roof
 
@@ -69,8 +75,13 @@ def _gbps(nbytes: float, us: float) -> float:
 def wire_gbps(r: Record) -> float:
     """The bytes one rank of *r* sent to other GPUs per second: the op's
     wire format, or RCCL's unquantized bytes."""
-    t = rccl_traffic(r.traffic) if r.impl == RCCL else r.traffic
-    return _gbps(fabric_bytes_per_rank(t), r.us)
+    return _gbps(_wire_bytes(r), r.us)
+
+
+def _wire_bytes(r: Record) -> int:
+    if r.impl == RCCL:
+        return rccl_fabric_bytes_per_rank(r.traffic)
+    return fabric_bytes_per_rank(r.traffic)
 
 
 def busbw_gbps(r: Record) -> float:
@@ -87,8 +98,9 @@ def grade(
     peak_gbps: float | None = None,
 ) -> list[dict]:
     """One row per (case, op). RCCL's columns repeat on every op row of
-    its case. *roofs* is keyed by the op traffic, *rccl_roofs* by
-    ``rccl_traffic`` of it. *peak_gbps* is the per-rank fabric peak."""
+    its case. *roofs* is keyed by the op traffic, *rccl_roofs* by the
+    RCCL record's traffic (``Roofline.measure_rccl``). *peak_gbps* is the
+    per-rank fabric peak."""
     rccl_roofs = rccl_roofs or {}
     peak = peak_gbps or math.nan
     rccl = {r.case: r for r in records if r.impl == RCCL}
@@ -101,7 +113,7 @@ def grade(
         roof_us = roof.us if roof else math.nan
         base = rccl.get(r.case)
         rroof: Roof | None = (
-            rccl_roofs.get(rccl_traffic(base.traffic)) if base else None
+            rccl_roofs.get(base.traffic) if base else None
         )
         rroof_us = rroof.us if rroof else math.nan
         rows.append(
@@ -255,17 +267,36 @@ def nominal_gbps(link: str, world_size: int, settings: RoofSettings) -> float:
     return settings.link_gbps * links
 
 
+def fabric_peak(peaks: dict):
+    """The per-rank fabric peak every implementation's ``wire/peak`` divides
+    by: the faster of the ``measure_peaks`` probes, or None if none ran.
+
+    The fastest probe, not the all-peers one: on an xGMI mesh pushing to all
+    peers is fastest, but on PCIe a rank pushes more to one peer than to
+    all of them at once, so a ring (RCCL's on PCIe) would exceed an
+    all-peers peak."""
+    return max(peaks.values(), key=lambda pk: pk.gbps, default=None)
+
+
 def best_known(records: list[Record], peaks: dict) -> tuple[float, str]:
     """The highest per-rank wire rate seen in this run, the fabric peak
-    probe included, and where it was seen."""
+    included, and where it was seen."""
     best = (math.nan, "")
-    if "all_peers" in peaks:
-        best = (peaks["all_peers"].gbps, "TransferBench fabric peak")
+    pk = fabric_peak(peaks)
+    if pk is not None:
+        best = (pk.gbps, "TransferBench fabric peak")
     for r in records:
         g = wire_gbps(r)
         if not math.isnan(g) and not g <= best[0]:  # a NaN best is replaced
             best = (g, f"{r.impl}, {r.case}")
     return best
+
+
+# The fabric-peak probes, as the report names them.
+PEAK_NAMES = {
+    "all_peers": "push to all peers",
+    "one_peer": "push to the next rank only (one ring)",
+}
 
 
 def peak_lines(
@@ -274,10 +305,13 @@ def peak_lines(
     """Header lines with the per-rank peaks the summary divides by."""
     n = records[0].traffic.world_size if records else 0
     mib = settings.peak_bytes_per_peer >> 20
-    out = [f"- link: {link}, {n} ranks"]
+    out = [
+        f"- link: {link}, {n} ranks",
+        f"- RCCL all-reduce roof pattern: {rccl_all_reduce_desc(link)}",
+    ]
     for kind, what in (
         ("all_peers", f"push to all {n - 1} peers"),
-        ("one_peer", "push to the next rank only (one ring)"),
+        ("one_peer", PEAK_NAMES["one_peer"]),
     ):
         pk = peaks.get(kind)
         if pk is None:
@@ -287,6 +321,12 @@ def peak_lines(
             f"- fabric peak per rank, {what}, {mib} MiB per peer: "
             f"{pk.gbps:.1f} GB/s ({pk.per_link_gbps:.1f} per link; "
             f"TransferBench `{pk.roof.label}`)"
+        )
+    pk = fabric_peak(peaks)
+    if pk is not None:
+        out.append(
+            f"- fabric peak per rank (`peak` in wire/peak): {pk.gbps:.1f} GB/s, "
+            f"the faster probe ({PEAK_NAMES[pk.kind]})"
         )
     gbps, where = best_known(records, peaks)
     out.append(f"- best known per rank in this run: {_fmt(gbps)} GB/s ({where})")
@@ -323,13 +363,14 @@ def summary(
     """Per implementation, at its largest message: the per-rank wire rate
     (bytes actually sent to other GPUs, slowest rank) against the per-rank
     peaks, and the logical bus bandwidth against the fabric peak."""
-    peak = peaks["all_peers"].gbps if "all_peers" in peaks else math.nan
+    pk = fabric_peak(peaks)
+    peak = pk.gbps if pk is not None else math.nan
     best, _where = best_known(records, peaks)
     out = []
     for impl in dict.fromkeys(r.impl for r in records):
         mine = [r for r in records if r.impl == impl]
         r = max(mine, key=lambda x: x.traffic.logical_bytes)
-        t = rccl_traffic(r.traffic) if r.impl == RCCL else r.traffic
+        t = r.traffic
         nominal = nominal_gbps(link, t.world_size, settings)
         wire, bus = wire_gbps(r), busbw_gbps(r)
         out.append(
@@ -339,7 +380,7 @@ def summary(
                 "ranks": t.world_size,
                 "impl": impl,
                 "case": r.case,
-                "wire MB per rank": fabric_bytes_per_rank(t) / 1e6,
+                "wire MB per rank": _wire_bytes(r) / 1e6,
                 "wire GB/s per rank": wire,
                 "wire/peak": wire / peak,
                 "wire/best known": wire / best,
@@ -367,10 +408,11 @@ def summary_markdown(rows: list[dict]) -> str:
 _SUMMARY_NOTE = (
     "Per rank, at each implementation's largest message: `wire` is the bytes "
     "one rank sends to other GPUs (the op's wire format; RCCL's bf16) over the "
-    "slowest rank's time. `peak` is the TransferBench fabric peak (push to all "
-    "peers); `best known` the highest per-rank wire rate in this run, peak "
-    "included; `nominal` the datasheet rate (`--link-gbps`). `busbw` counts "
-    "logical bytes, so a quantized op can exceed 1.0 of the peak."
+    "slowest rank's time. `peak` is the TransferBench fabric peak (the faster "
+    "of push to all peers and push to one); `best known` the highest per-rank "
+    "wire rate in this run, peak included; `nominal` the datasheet rate "
+    "(`--link-gbps`). `busbw` counts logical bytes, so a quantized op can "
+    "exceed 1.0 of the peak."
 )
 
 
@@ -389,15 +431,24 @@ def finish(
     if not (args.no_roof or args.tb_dry_run):
         roofline = Roofline(args.tb_bin, settings)
         roofs = roofline.measure(r.traffic for r in records if r.impl != RCCL)
-        rccl_roofs = roofline.measure_rccl(r.traffic for r in records if r.impl == RCCL)
+        rccl_roofs = roofline.measure_rccl(
+            (r.traffic for r in records if r.impl == RCCL), link
+        )
         peaks = roofline.measure_peaks(n)
     tb_dir = Path(args.tb_dir or tb_dump.default_dir(args.report, args.csv))
     configs = tb_dump.write(
-        tb_dir, records, settings, roofs, rccl_roofs, roofline, peaks=peaks
+        tb_dir,
+        records,
+        settings,
+        roofs,
+        rccl_roofs,
+        roofline,
+        link=link,
+        peaks=peaks,
     )
     print(f"TransferBench configs: {configs}", flush=True)
-    peak = peaks["all_peers"].gbps if "all_peers" in peaks else None
-    rows = grade(records, roofs, rccl_roofs, peak)
+    pk = fabric_peak(peaks)
+    rows = grade(records, roofs, rccl_roofs, pk.gbps if pk is not None else None)
     extra = [*header, *peak_lines(records, peaks, link, settings)]
     head = provenance(roofline, extra, settings=settings, configs=configs)
     summ = summary(records, peaks, link, settings)

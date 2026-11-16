@@ -203,30 +203,66 @@ def candidates(traffic: Traffic, settings: RoofSettings = DEFAULT) -> list[Candi
     return _candidates(traffic, settings, own=True)
 
 
-def rccl_traffic(traffic: Traffic) -> Traffic:
-    """The data movement of *traffic*'s RCCL calls, unquantized, as RCCL
-    would do it at best: all-pairs, every peer at once.
+# RCCL's all-reduce link usage per interconnect (``report.detect_link``).
+# PCIe: one ring in rank order, every channel on the same hop. 
+# xGMI: RCCL's channels follow rings of different orders that together use 
+# every link of the mesh at once, which moves bytes like all-pairs. 
+# "unknown" keeps all-pairs, the link-agnostic model.
+RCCL_ALL_REDUCE_PATTERN = {
+    "pcie": Pattern.PUSH_NEXT,
+    "xgmi": Pattern.PUSH_ALL,
+    "unknown": Pattern.PUSH_ALL,
+}
 
-    An all-reduce is a reduce-scatter and an all-gather of ``nbytes / N`` per
-    peer, pipelined in one launch, so each rank sends ``2(N-1)/N`` x
-    ``nbytes``: the busbw convention. An all-to-all sends ``nbytes / N`` to
-    every rank, its own included. Calls run one after another.
+
+def rccl_all_reduce_pattern(link: str) -> Pattern:
+    """The pattern of RCCL's all-reduce on *link* (``RCCL_ALL_REDUCE_PATTERN``)."""
+    try:
+        return RCCL_ALL_REDUCE_PATTERN[link]
+    except KeyError:
+        raise ValueError(
+            f"link must be one of {tuple(RCCL_ALL_REDUCE_PATTERN)}, got {link!r}"
+        ) from None
+
+
+def rccl_all_reduce_desc(link: str) -> str:
+    """RCCL's all-reduce pattern on *link*, for report headers."""
+    if rccl_all_reduce_pattern(link) == Pattern.PUSH_NEXT:
+        return "ring (push to the next rank, rank order)"
+    return "all-pairs (push to every peer at once)"
+
+
+def rccl_traffic(traffic: Traffic, link: str) -> Traffic:
+    """The data movement of *traffic*'s RCCL calls, unquantized, in RCCL's
+    own pattern on *link*.
+
+    An all-reduce is a reduce-scatter and an all-gather lap, pipelined in
+    one launch (so ``fused`` streams both). On PCIe it is RCCL's ring: each
+    lap is ``N - 1`` steps, every step pushing ``nbytes / N`` to the next
+    rank. On xGMI each lap pushes ``nbytes / N`` to every peer at once.
+    Either way each rank sends ``2(N-1)/N`` x ``nbytes``: the busbw
+    convention.
+
+    An all-to-all is RCCL's grouped send/recv: ``nbytes / N`` to every rank,
+    its own included, all at once, on any link. Calls run one after another.
 
     The memory and grid here are placeholders; ``rccl_candidates`` sets
-    them from the settings. Depends only on the RCCL calls and the world
-    size, so every op of a case gets the same RCCL roof.
+    them from the settings. Depends only on the RCCL calls, the world size
+    and the link, so every op of a case gets the same RCCL roof.
     """
     n = traffic.world_size
+    ar_pattern = rccl_all_reduce_pattern(link)
+    ar_repeat = n - 1 if ar_pattern == Pattern.PUSH_NEXT else 1
     phases = []
     pipelined = False
     for call in traffic.rccl:
         chunk = -(-call.nbytes // n)
         if call.collective == "all_reduce":
-            lap = _rccl_phase(chunk, include_self=False)
+            lap = _rccl_phase(ar_pattern, chunk, repeat=ar_repeat)
             phases += [lap, lap]
             pipelined = len(traffic.rccl) == 1
         else:
-            phases.append(_rccl_phase(chunk, include_self=True))
+            phases.append(_rccl_phase(Pattern.PUSH_ALL, chunk, include_self=True))
     total = sum(c.nbytes for c in traffic.rccl)
     return Traffic(
         world_size=n,
@@ -238,12 +274,26 @@ def rccl_traffic(traffic: Traffic) -> Traffic:
     )
 
 
-def _rccl_phase(chunk: int, *, include_self: bool) -> Phase:
+def rccl_fabric_bytes_per_rank(traffic: Traffic) -> int:
+    """Bytes each rank's RCCL calls send to other GPUs: the
+    ``fabric_bytes_per_rank`` of ``rccl_traffic``, the same on every link."""
+    n = traffic.world_size
+    total = 0
+    for call in traffic.rccl:
+        chunk = -(-call.nbytes // n)
+        hops = 2 * (n - 1) if call.collective == "all_reduce" else n - 1
+        total += hops * chunk
+    return total
+
+
+def _rccl_phase(
+    pattern: Pattern, chunk: int, *, include_self: bool = False, repeat: int = 1
+) -> Phase:
     return Phase(
-        pattern=Pattern.PUSH_ALL,
+        pattern=pattern,
         chunk_bytes=chunk,
         include_self=include_self,
-        repeat=1,
+        repeat=repeat,
         peer_mem=PeerMem.UNCACHED,
         workgroups=1,
         waves_per_workgroup=1,

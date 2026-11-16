@@ -202,7 +202,7 @@ many candidates share it.
 
 | knob | op roof | RCCL roof |
 |---|---|---|
-| bytes, pattern | the op's `Traffic` (wire format) | `rccl_traffic()`: bf16 all-pairs push. AR = RS + AG of `nbytes/N` per peer (`2(N-1)/N` x nbytes sent, the busbw convention); A2A = `nbytes/N` to every rank, self included, one phase per call |
+| bytes, pattern | the op's `Traffic` (wire format) | `rccl_traffic(t, link)`: bf16, in RCCL's own pattern on the host's link (`report.detect_link`, from the KFD topology). AR on PCIe = RCCL's ring: RS + AG laps of `N-1` hops each, every hop pushing `nbytes/N` to the next rank in rank order. AR on xGMI (or an unknown link) = RS + AG of `nbytes/N` to every peer at once, as RCCL's rings of different orders use every link. Either way `2(N-1)/N` x nbytes sent, the busbw convention. A2A = grouped send/recv, `nbytes/N` to every rank, self included, one phase per call, on any link |
 | waves per transfer | `own` (as above) and `WAVE_SWEEP` = 16..256 | `WAVE_SWEEP` |
 | block | the op's | 256 threads |
 | schedule | `serial`; plus `fused` if `pipelined` | same (a single AR call is pipelined) |
@@ -302,7 +302,7 @@ From the slowest rank's `t`:
 | algbw | `logical_bytes / t` |
 | busbw | `algbw * factor` (rccl-tests convention) |
 | wire GB/s | bytes one rank sends to other GPUs / t: the op's wire format, RCCL's bf16 |
-| wire/peak | `wire GB/s` / the all-peers fabric peak (section 5.1) |
+| wire/peak | `wire GB/s` / the fabric peak P, the faster probe (section 5.1) |
 | roof us | `roof_us(op traffic)`, blank if TransferBench is absent |
 | op eff | `roof us / op us` |
 | rccl roof us | `roof_us(rccl_traffic(op traffic))`: RCCL's bf16 bytes |
@@ -353,11 +353,16 @@ bandwidth per rank at best, and how close does an implementation get?
   an op. Measured on every run (`Roofline.measure_peaks`, configs in
   `<report>.tb/peak/`): every rank pushes `RoofSettings.peak_bytes_per_peer`
   (64 MiB, enough to saturate) at once to
-  - `all_peers`: every other rank. The headline P: on an xGMI mesh this
-    uses all N - 1 links of a rank.
+  - `all_peers`: every other rank. On an xGMI mesh this uses all N - 1
+    links of a rank.
   - `one_peer`: the next rank only. What a single ring can use.
 
-  Both sweep widths and memory types (`patterns.sweep_candidates`).
+  Both sweep widths and memory types (`patterns.sweep_candidates`). The
+  headline P (`report.fabric_peak`) is the faster of the two: `all_peers` on
+  an xGMI mesh, where it uses N - 1 links, but often `one_peer` on PCIe,
+  where a rank pushes more to one peer than to all of them at once (TP4
+  MI350P: 56.4 vs 46.3 GB/s). With the all-peers probe as P, RCCL's PCIe
+  ring would read 1.18 of the peak.
 - **Two more references.** `best known`: the highest per-rank wire rate in
   the run, P included; TransferBench is not a ceiling (section 4.3), RCCL
   beats it. `nominal`: an optional datasheet rate per link (`--link-gbps`,

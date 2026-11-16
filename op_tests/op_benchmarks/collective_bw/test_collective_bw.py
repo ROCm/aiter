@@ -118,7 +118,7 @@ def test_one_pass_per_launch():
     cacheable peer memory absorb the rewrites in L2."""
     for traffic in (_two_shot(4, 4096, ring=False), _a2a_trio(8, 256 << 20)):
         tests = [t for c in patterns.candidates(traffic) for t in c.tests]
-        rccl = patterns.rccl_candidates(patterns.rccl_traffic(traffic))
+        rccl = patterns.rccl_candidates(patterns.rccl_traffic(traffic, "pcie"))
         tests += [t for c in rccl for t in c.tests]
         assert {dict(t.env)["NUM_SUBITERATIONS"] for t in tests} == {"1"}
 
@@ -160,7 +160,8 @@ def test_grade_columns():
         Record("c", "rccl", 200.0, "graph", op_t),
     ]
     roofs = {op_t: Roof(50.0, (25.0, 25.0), "fused w64")}
-    rccl_roofs = {patterns.rccl_traffic(op_t): Roof(160.0, (160.0,), "fused w32")}
+    # Keyed by the RCCL record's traffic, as Roofline.measure_rccl returns it.
+    rccl_roofs = {op_t: Roof(160.0, (160.0,), "fused w32")}
     (row,) = report.grade(records, roofs, rccl_roofs)
     assert row["op eff"] == 0.5
     # RCCL is graded against its own (bf16) roof, not the op's quantized one.
@@ -217,29 +218,75 @@ def test_candidates_sweep_widths_and_schedules():
 
 def test_rccl_traffic_is_unquantized_and_op_independent():
     """RCCL's roof moves bf16 bytes in the busbw convention, whatever the op's
-    wire format or schedule, and sweeps the memory type."""
+    wire format or schedule, on any link, and sweeps the memory type."""
     n, nbytes = 8, 1024 * 7168 * BF16
     int4_mesh = _two_shot(n, nbytes, ring=False, ratio=0.28125)
     ring = _two_shot(n, nbytes, ring=True, ratio=0.40625)
-    rt = patterns.rccl_traffic(int4_mesh)
-    assert rt == patterns.rccl_traffic(ring)
-    assert rt.pipelined and rt.logical_bytes == nbytes
-    want = patterns.busbw_factor("all_reduce", n) * nbytes
-    assert math.isclose(patterns.fabric_bytes_per_rank(rt), want, rel_tol=1e-6)
-    a2a = patterns.rccl_traffic(_a2a_trio(n, 12_124_160, ratio=0.28125))
-    assert not a2a.pipelined and len(a2a.phases) == 3
-    assert all(p.include_self for p in a2a.phases)
-    want = patterns.busbw_factor("all_to_all", n) * 3 * 12_124_160
-    assert math.isclose(patterns.fabric_bytes_per_rank(a2a), want, rel_tol=1e-6)
-    labels = {c.label for c in patterns.rccl_candidates(rt)}
-    assert labels == {
-        f"{s} w{w} {m}"
-        for s in ("serial", "fused")
-        for w in DEFAULT.wave_sweep
-        for m in "UFG"
-    }
-    lap = next(c for c in patterns.rccl_candidates(rt) if c.label == "serial w32 G")
-    assert lap.tests[0].line.startswith(f"-56 (G0 G0 G1 32 {nbytes // n}) ")
+    a2a_op = _a2a_trio(n, 12_124_160, ratio=0.28125)
+    for link in patterns.RCCL_ALL_REDUCE_PATTERN:
+        rt = patterns.rccl_traffic(int4_mesh, link)
+        assert rt == patterns.rccl_traffic(ring, link)
+        assert rt.pipelined and rt.logical_bytes == nbytes
+        want = patterns.busbw_factor("all_reduce", n) * nbytes
+        got = patterns.fabric_bytes_per_rank(rt)
+        assert math.isclose(got, want, rel_tol=1e-6)
+        assert got == patterns.rccl_fabric_bytes_per_rank(int4_mesh)
+        # The all-to-all is all-pairs on every link.
+        a2a = patterns.rccl_traffic(a2a_op, link)
+        assert not a2a.pipelined and len(a2a.phases) == 3
+        assert all(p.include_self and p.pattern == Pattern.PUSH_ALL for p in a2a.phases)
+        want = patterns.busbw_factor("all_to_all", n) * 3 * 12_124_160
+        got = patterns.fabric_bytes_per_rank(a2a)
+        assert math.isclose(got, want, rel_tol=1e-6)
+        assert got == patterns.rccl_fabric_bytes_per_rank(a2a_op)
+        labels = {c.label for c in patterns.rccl_candidates(rt)}
+        assert labels == {
+            f"{s} w{w} {m}"
+            for s in ("serial", "fused")
+            for w in DEFAULT.wave_sweep
+            for m in "UFG"
+        }
+    try:
+        patterns.rccl_traffic(int4_mesh, "nvlink")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown link name must raise")
+
+
+def test_rccl_all_reduce_is_ring_on_pcie():
+    """On PCIe the all-reduce is RCCL's ring: each lap is N - 1 hops to the
+    next rank, and fused streams all 2(N-1) hops over that one link."""
+    n, nbytes = 8, 1024 * 7168 * BF16
+    chunk = nbytes // n
+    rt = patterns.rccl_traffic(_two_shot(n, nbytes, ring=False), "pcie")
+    assert all(p.pattern == Pattern.PUSH_NEXT and p.repeat == n - 1 for p in rt.phases)
+    cands = {c.label: c for c in patterns.rccl_candidates(rt)}
+    lap = cands["serial w32 G"]
+    assert lap.tests[0].line.startswith(
+        f"-8 (G0 G0 G1 32 {chunk}) (G1 G1 G2 32 {chunk}) "
+    )
+    assert lap.tests[0].line.endswith(f"(G7 G7 G0 32 {chunk})")
+    assert [t.repeat for t in lap.tests] == [n - 1, n - 1]
+    (test,) = cands["fused w32 G"].tests
+    assert test.repeat == 1
+    assert test.line.startswith(f"-8 (G0 G0 G1 32 {2 * (n - 1) * chunk}) ")
+
+
+def test_rccl_all_reduce_is_all_pairs_on_xgmi():
+    """On xGMI (and an unknown link) each all-reduce lap pushes nbytes / N to
+    every peer at once, so RCCL's rings over every link are not undercut."""
+    n, nbytes = 8, 1024 * 7168 * BF16
+    chunk = nbytes // n
+    for link in ("xgmi", "unknown"):
+        rt = patterns.rccl_traffic(_two_shot(n, nbytes, ring=True), link)
+        assert all(p.pattern == Pattern.PUSH_ALL and p.repeat == 1 for p in rt.phases)
+        cands = {c.label: c for c in patterns.rccl_candidates(rt)}
+        lap = cands["serial w32 G"]
+        assert lap.tests[0].line.startswith(f"-56 (G0 G0 G1 32 {chunk}) ")
+        assert [t.repeat for t in lap.tests] == [1, 1]
+        (test,) = cands["fused w32 G"].tests
+        assert test.line.startswith(f"-56 (G0 G0 G1 32 {2 * chunk}) ")
 
 
 def test_roofline_takes_fastest_candidate():
@@ -284,8 +331,15 @@ def test_roofline_takes_fastest_candidate():
         # Cached: a second call runs nothing.
         calls.clear()
         assert rl.measure([ar])[ar] == roof and not calls
+        # RCCL roofs are keyed by the RCCL record's (op) traffic, per link.
+        rr = rl.measure_rccl([ar], "pcie")
+        assert list(rr) == [ar] and rr[ar].label.endswith((" U", " F", " G"))
     finally:
         roofline.tb_text.run = real
+    # Without TransferBench, no roofs and no error.
+    rl = roofline.Roofline(sys.executable)
+    rl.binary = None
+    assert rl.measure_rccl([ar], "pcie") == {} and rl.measure([ar]) == {}
 
 
 def test_settings_reach_every_test():
@@ -296,7 +350,7 @@ def test_settings_reach_every_test():
     cands = patterns.candidates(ar, s)
     labels = [c.label for c in cands]
     assert labels == ["serial own", "fused own", "serial w48", "fused w48"]
-    rccl = patterns.rccl_candidates(patterns.rccl_traffic(ar), s)
+    rccl = patterns.rccl_candidates(patterns.rccl_traffic(ar, "pcie"), s)
     for test in (t for c in cands + rccl for t in c.tests):
         env = dict(test.env)
         assert env["NUM_ITERATIONS"] == "7" and env["NUM_WARMUPS"] == "1"
@@ -304,7 +358,7 @@ def test_settings_reach_every_test():
         assert env["GFX_SE_TYPE"] == "1" and env["NUM_SUBITERATIONS"] == "1"
     # The RCCL block comes from the settings too.
     s4 = RoofSettings(rccl_waves_per_workgroup=2, rccl_mems=(PeerMem.FINE,))
-    rccl = patterns.rccl_candidates(patterns.rccl_traffic(ar), s4)
+    rccl = patterns.rccl_candidates(patterns.rccl_traffic(ar, "xgmi"), s4)
     assert {dict(t.env)["GFX_BLOCK_SIZE"] for c in rccl for t in c.tests} == {"128"}
     assert {c.label.split()[-1] for c in rccl} == {"F"}
 
@@ -343,7 +397,7 @@ def test_dump_writes_runnable_configs():
         (root / "1024x7168").mkdir(parents=True)
         (root / tb_dump.MARKER).touch()
         (root / "stale.cfg").write_text("old")
-        index = tb_dump.write(root, records, DEFAULT, roofs, {})
+        index = tb_dump.write(root, records, DEFAULT, roofs, {}, link="pcie")
         assert not (root / "stale.cfg").exists()
         op_dir = root / "1024x7168" / "fly_mesh"
         assert sorted(f.stem for f in op_dir.glob("*.cfg")) == sorted(
@@ -358,7 +412,7 @@ def test_dump_writes_runnable_configs():
         # Serial laps: two tests in one file, each counted once.
         tests = [line for line in text if line.startswith("-")]
         assert tests == [t.line for t in cands[2].tests] and len(tests) == 2
-        rccl = patterns.rccl_candidates(patterns.rccl_traffic(ar))
+        rccl = patterns.rccl_candidates(patterns.rccl_traffic(ar, "pcie"))
         assert len(list((root / "1024x7168" / "rccl").glob("*.cfg"))) == len(rccl)
         rows = [r for r in index.read_text().splitlines() if r.startswith("| 1024")]
         assert len(rows) == len(cands) + len(rccl)
@@ -465,9 +519,48 @@ def test_summary_against_peaks():
     assert math.isnan(report.nominal_gbps("xgmi", 8, DEFAULT))
     lines = report.peak_lines(records, peaks, "xgmi", s)
     assert lines[0] == "- link: xgmi, 4 ranks"
-    assert "150.0 GB/s (50.0 per link" in lines[1]
-    assert "not measured" in lines[2]
+    head = "- RCCL all-reduce roof pattern:"
+    assert lines[1] == f"{head} all-pairs (push to every peer at once)"
+    assert "150.0 GB/s (50.0 per link" in lines[2]
+    assert "not measured" in lines[3]
+    pcie = report.peak_lines(records, peaks, "pcie", s)
+    assert pcie[1] == f"{head} ring (push to the next rank, rank order)"
     assert "nominal per rank: 192.0 GB/s" in lines[-1]
+    assert "fabric peak per rank (`peak` in wire/peak): 150.0 GB/s" in lines[4]
+
+
+def test_peak_is_the_faster_probe():
+    """On PCIe one peer gets more than all peers at once, so the shared
+    peak is the one-peer probe and a ring (RCCL's) stays under it."""
+    import report
+    from measure import Record
+    from roofline import Peak, Roof
+
+    n, nbytes = 4, 1 << 24
+    t = _two_shot(n, nbytes, ring=True, ratio=0.40625)
+    records = [
+        Record("b", "fly_ring", 1000.0, "graph", t),
+        Record("b", "rccl", 480.0, "graph", t),
+    ]
+    roof = Roof(1.0, (1.0,), "serial w64 U")
+    peaks = {
+        "all_peers": Peak(n, "all_peers", 46.3, 3, roof),
+        "one_peer": Peak(n, "one_peer", 56.4, 1, roof),
+    }
+    assert report.fabric_peak(peaks).kind == "one_peer"
+    assert report.fabric_peak({}) is None
+    rccl_wire = 1.5 * nbytes / 480.0 / 1e3
+    assert 46.3 < rccl_wire < 56.4
+    _fly, rccl = report.summary(records, peaks, "pcie", DEFAULT)
+    assert math.isclose(rccl["wire/peak"], rccl_wire / 56.4)
+    assert report.best_known(records, peaks) == (56.4, "TransferBench fabric peak")
+    (row,) = report.grade(records, {}, {}, report.fabric_peak(peaks).gbps)
+    assert math.isclose(row["rccl wire/peak"], rccl_wire / 56.4)
+    lines = report.peak_lines(records, peaks, "pcie", DEFAULT)
+    assert any(
+        "56.4 GB/s, the faster probe (push to the next rank only" in line
+        for line in lines
+    )
 
 
 def test_find_binary_respects_env(tmp_path=None):

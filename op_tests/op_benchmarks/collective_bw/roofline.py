@@ -10,7 +10,9 @@ way: it has no handshakes, no quantization or layout work, no cross-GPU
 ordering, and it is timed inside the kernel, so the host launch is left out.
 
 The RCCL roof moves RCCL's own bytes (unquantized, ``patterns.rccl_traffic``)
-and also tries every memory type, as RCCL's internals are not modelled.
+in RCCL's own pattern on the host's link (all-reduce: a ring on PCIe,
+all-pairs on xGMI; all-to-all: all-pairs), and tries every memory type, as
+RCCL's buffers are not modelled.
 
 Both are the best of a stock copy kernel, not the link's physical peak. A
 library with a better copy loop can beat them: RCCL's bf16 all-reduce does by
@@ -91,11 +93,17 @@ class Roofline:
         s = self.settings
         return self._solve("op", {t: patterns.candidates(t, s) for t in wanted})
 
-    def measure_rccl(self, traffics: Iterable[Traffic]) -> dict[Traffic, Roof]:
-        """The RCCL roofs of *traffics*, keyed by ``patterns.rccl_traffic``."""
-        wanted = list(dict.fromkeys(patterns.rccl_traffic(t) for t in traffics))
+    def measure_rccl(
+        self, traffics: Iterable[Traffic], link: str
+    ) -> dict[Traffic, Roof]:
+        """The RCCL roofs of *traffics* on *link*, keyed by those traffics
+        (the RCCL records'). Each runs ``patterns.rccl_traffic(t, link)``."""
+        rccl = {t: patterns.rccl_traffic(t, link) for t in dict.fromkeys(traffics)}
         s = self.settings
-        return self._solve("rccl", {t: patterns.rccl_candidates(t, s) for t in wanted})
+        roofs = self._solve(
+            "rccl", {rt: patterns.rccl_candidates(rt, s) for rt in rccl.values()}
+        )
+        return {t: roofs[rt] for t, rt in rccl.items() if rt in roofs}
 
     def measure_peaks(self, world_size: int) -> dict[str, Peak]:
         """The fabric peaks of *world_size* ranks, by ``patterns.PEAK_KINDS``.
