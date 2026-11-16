@@ -1052,7 +1052,7 @@ _fused_fp8_bmm_rope_prefill_repr = make_kernel_repr(
         "LDB",
         "ROPE_BLOCK_T",
         "IL_R",
-        "IL_U",
+        "NUM_XCDS",
         "ILB_NUM",
         "ILB_DEN",
         "XCD_COLOC",
@@ -1172,7 +1172,7 @@ def _fused_fp8_bmm_rope_prefill_kernel(
     ROPE_BLOCK_T: tl.constexpr,
     BLOCK_QH: tl.constexpr,
     IL_R: tl.constexpr,
-    IL_U: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
     ILB_NUM: tl.constexpr,
     ILB_DEN: tl.constexpr,
     XCD_COLOC: tl.constexpr,
@@ -1208,57 +1208,63 @@ def _fused_fp8_bmm_rope_prefill_kernel(
 
     # Interleave projection and rotary work while preserving each group of IDs.
     if ILB_NUM > 0:
-        NBu = bmm_programs // IL_U
-        NRi = tl.minimum(nr // IL_U, (NBu * ILB_NUM) // ILB_DEN)
+        NBu = bmm_programs // NUM_XCDS
+        NRi = tl.minimum(nr // NUM_XCDS, (NBu * ILB_NUM) // ILB_DEN)
         T = NBu + NRi
-        if pid < T * IL_U:
-            u = pid // IL_U
-            gl = pid % IL_U
+        if pid < T * NUM_XCDS:
+            u = pid // NUM_XCDS
+            gl = pid % NUM_XCDS
             a = (u * NRi) // T
             b = ((u + 1) * NRi) // T
-            pid = tl.where(b > a, rope_start + a * IL_U + gl, (u - a) * IL_U + gl)
-        else:
-            r = pid - T * IL_U
-            nb_left = bmm_programs - NBu * IL_U
             pid = tl.where(
-                r < nb_left, NBu * IL_U + r, rope_start + NRi * IL_U + (r - nb_left)
+                b > a, rope_start + a * NUM_XCDS + gl, (u - a) * NUM_XCDS + gl
+            )
+        else:
+            r = pid - T * NUM_XCDS
+            nb_left = bmm_programs - NBu * NUM_XCDS
+            pid = tl.where(
+                r < nb_left,
+                NBu * NUM_XCDS + r,
+                rope_start + NRi * NUM_XCDS + (r - nb_left),
             )
     elif IL_R > 0:
-        ng = tl.minimum(bmm_programs // (IL_R * IL_U), nr // IL_U)
-        GP: tl.constexpr = (IL_R + 1) * IL_U
+        ng = tl.minimum(bmm_programs // (IL_R * NUM_XCDS), nr // NUM_XCDS)
+        GP: tl.constexpr = (IL_R + 1) * NUM_XCDS
         if pid < ng * GP:
             gi = pid // GP
             gr = pid % GP
-            gj = gr // IL_U
-            gl = gr % IL_U
+            gj = gr // NUM_XCDS
+            gl = gr % NUM_XCDS
             pid = tl.where(
-                gj == IL_R, rope_start + gi * IL_U + gl, (gi * IL_R + gj) * IL_U + gl
+                gj == IL_R,
+                rope_start + gi * NUM_XCDS + gl,
+                (gi * IL_R + gj) * NUM_XCDS + gl,
             )
         else:
             r = pid - ng * GP
-            nb_left = bmm_programs - ng * IL_R * IL_U
+            nb_left = bmm_programs - ng * IL_R * NUM_XCDS
             pid = tl.where(
                 r < nb_left,
-                ng * IL_R * IL_U + r,
-                rope_start + ng * IL_U + (r - nb_left),
+                ng * IL_R * NUM_XCDS + r,
+                rope_start + ng * NUM_XCDS + (r - nb_left),
             )
     # Group the heads and rotary tiles that write the same query rows.
     if XCD_COLOC:
         if pid < bmm_programs:
-            g8 = (grid_mn // IL_U) * IL_U
-            if pid < QH * g8:
-                xu = pid // IL_U
-                pid = (xu % QH) * grid_mn + (xu // QH) * IL_U + pid % IL_U
+            full_mn = (grid_mn // NUM_XCDS) * NUM_XCDS
+            if pid < QH * full_mn:
+                xu = pid // NUM_XCDS
+                pid = (xu % QH) * grid_mn + (xu // QH) * NUM_XCDS + pid % NUM_XCDS
             else:
-                xv = pid - QH * g8
-                xrem = grid_mn - g8
-                pid = (xv // xrem) * grid_mn + g8 + xv % xrem
+                xv = pid - QH * full_mn
+                xrem = grid_mn - full_mn
+                pid = (xv // xrem) * grid_mn + full_mn + xv % xrem
         else:
             RPM: tl.constexpr = (BLOCK_SIZE_M * M_PER_CTA) // ROPE_BLOCK_T
             rho = pid - rope_start
-            if rho < (nr // (IL_U * RPM)) * (IL_U * RPM):
-                xs = rho // IL_U
-                rho = ((xs // RPM) * IL_U + rho % IL_U) * RPM + xs % RPM
+            if rho < (nr // (NUM_XCDS * RPM)) * (NUM_XCDS * RPM):
+                xs = rho // NUM_XCDS
+                rho = ((xs // RPM) * NUM_XCDS + rho % NUM_XCDS) * RPM + xs % RPM
             pid = rope_start + rho
 
     if pid < bmm_programs:

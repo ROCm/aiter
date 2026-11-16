@@ -17,7 +17,6 @@
     "M_PER_CTA": 1,
     "LDB": 0,
     "IL_R": 4,
-    "IL_U": 8,
     "ILB_NUM": 0,
     "ILB_DEN": 1,
     "XCD_COLOC": 0
@@ -35,7 +34,6 @@
     "M_PER_CTA": 2,
     "LDB": 1,
     "IL_R": 0,
-    "IL_U": 8,
     "ILB_NUM": 4,
     "ILB_DEN": 5,
     "XCD_COLOC": 1
@@ -53,7 +51,6 @@
     "M_PER_CTA": 2,
     "LDB": 1,
     "IL_R": 0,
-    "IL_U": 8,
     "ILB_NUM": 3,
     "ILB_DEN": 2,
     "XCD_COLOC": 1
@@ -71,7 +68,6 @@
     "M_PER_CTA": 2,
     "LDB": 1,
     "IL_R": 0,
-    "IL_U": 8,
     "ILB_NUM": 3,
     "ILB_DEN": 2,
     "XCD_COLOC": 1

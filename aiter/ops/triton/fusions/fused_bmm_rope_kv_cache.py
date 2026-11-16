@@ -17,6 +17,7 @@ from aiter.ops.triton._triton_kernels.fusions.fused_bmm_rope_kv_cache import (
 from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import get_splitk
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -412,8 +413,8 @@ def _fused_fp8_bmm_rope_prefill(
 
     # Config keys: a program has M_PER_CTA * BLOCK_SIZE_M rows and N_INNER chunks
     # of BLOCK_SIZE_N columns. LDB selects the load order. A rotary program has
-    # ROPE_BLOCK_T tokens. IL_U, IL_R, ILB_NUM, ILB_DEN and XCD_COLOC set the
-    # order of the projection and rotary programs in the grid.
+    # ROPE_BLOCK_T tokens. IL_R, ILB_NUM, ILB_DEN and XCD_COLOC set the order
+    # of the projection and rotary programs in the grid.
     config, _ = _get_fp8_prefill_config(M, N, K)
     rows = config["BLOCK_SIZE_M"] * config["M_PER_CTA"]
     cols = config["BLOCK_SIZE_N"] * config["N_INNER"]
@@ -488,7 +489,7 @@ def _fused_fp8_bmm_rope_prefill(
         ROPE_BLOCK_T=config["ROPE_BLOCK_T"],
         BLOCK_QH=qh,
         IL_R=config["IL_R"],
-        IL_U=config["IL_U"],
+        NUM_XCDS=get_num_xcds(),
         ILB_NUM=config["ILB_NUM"],
         ILB_DEN=config["ILB_DEN"],
         XCD_COLOC=config["XCD_COLOC"],
