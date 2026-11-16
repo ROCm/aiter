@@ -5639,7 +5639,7 @@ def fused_moe_2stages(
         _s1_params = _get_flydsl_moe_kernels().get_flydsl_kernel_params(
             metadata.stage1.keywords.get("kernelName", "")
         )
-    _is_a8w4_g942 = bool(_s1_params) and _s1_params.get("in_dtype") == "a8w4_gfx942"
+    _is_a8w4_g942 = _get_flydsl_moe_kernels().is_a8w4_gfx942_kernel(_s1_params)
     # shuffle_{weight,scale}_a8w4_gfx942 keep shape and dtype, so only their
     # `a8w4_gfx942_layout` tag tells the relaid W1 from the a16w4 preshuffle; a kernel
     # reading the other layout gives wrong output without an error.

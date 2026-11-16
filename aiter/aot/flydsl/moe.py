@@ -169,10 +169,9 @@ def _is_a8w4_gfx942(row: dict) -> bool:
     """A gfx942 a8w4 row: its `_g942` stage 1 reads separated gate/up W1 and W1
     scale relaid by shuffle_{weight,scale}_a8w4_gfx942 on top of the a16w4
     preshuffle."""
-    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+    from aiter.ops.flydsl.moe_kernels import is_a8w4_gfx942_kernel
 
-    params = get_flydsl_kernel_params(_name(row.get("kernelName1"))) or {}
-    return params.get("in_dtype") == "a8w4_gfx942"
+    return is_a8w4_gfx942_kernel(_name(row.get("kernelName1")))
 
 
 def _caller_gate_mode(row: dict):

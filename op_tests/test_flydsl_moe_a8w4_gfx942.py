@@ -46,6 +46,7 @@ from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.flydsl.moe_kernels import (
     a8w4_gfx942_supported,
     get_flydsl_kernel_params,
+    is_a8w4_gfx942_kernel,
 )
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -248,7 +249,7 @@ def test_stage1_kernel(token, kernel_name, model_dim=1536, inter_dim=512):
     """
     E, topk, tile_m = 8, 4, 16
     p = get_flydsl_kernel_params(kernel_name)
-    assert p and p["in_dtype"] == "a8w4_gfx942" and p["tile_m"] == tile_m, kernel_name
+    assert is_a8w4_gfx942_kernel(p) and p["tile_m"] == tile_m, kernel_name
     torch.manual_seed(0)
     x = torch.randn((token, model_dim), dtype=dtypes.bf16)
     w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtypes.bf16)
@@ -385,7 +386,7 @@ def test_stage1_dispatch_by_name():
         if k.startswith("flydsl_moe1_")
         and v.get("a_dtype") == "fp8"
         and v.get("b_dtype") == "fp4"
-        and v.get("in_dtype") != "a8w4_gfx942"
+        and not is_a8w4_gfx942_kernel(v)
     )
     E, model_dim, inter_dim = 4, 256, 128
     x = torch.zeros((1, model_dim), dtype=dtypes.fp8)

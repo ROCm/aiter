@@ -45,6 +45,7 @@ from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_LINEAR_BETA,
     GateMode,
 )
+from aiter.ops.flydsl.moe_kernels import is_a8w4_gfx942_kernel
 from aiter.ops.opus.moe_stage2_a8w4 import _route_workspace_token_capacity
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -999,7 +1000,7 @@ def _iter_csv_cases():
         # layout, which this sweep does not prepare (it gives a8w4 the interleaved
         # GUGU weights), and they run on MI325X only. test_flydsl_moe_a8w4_gfx942.py
         # covers them.
-        if "_g942" in kernel_name1:
+        if is_a8w4_gfx942_kernel(kernel_name1):
             aiter.logger.info(
                 "skip row token=%s dim=(%s,%s): %s is covered by "
                 "test_flydsl_moe_a8w4_gfx942.py",

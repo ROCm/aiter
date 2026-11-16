@@ -82,6 +82,7 @@ from aiter.ops.flydsl.moe_kernels import (
     get_flydsl_stage2_kernels_a16w16,
     get_flydsl_stage2_kernels_int4_bf16,
     get_flydsl_stage2_v2_kernels,
+    is_a8w4_gfx942_kernel,
     runtime_swiglu_limit,
 )
 from aiter.ops.flydsl.mxfp4_kname import (
@@ -1091,7 +1092,7 @@ class FmoeTuner(TunerCommon):
         inter_dim = w1_qt_shffle_ck.shape[1] // 2
         # gfx942 a8w4 x is already MXFP8 (moe_sort) or the bf16 x its `_qi` kernels
         # quantise themselves
-        _g942 = kparams.get("in_dtype") == "a8w4_gfx942"
+        _g942 = is_a8w4_gfx942_kernel(kparams)
         result = flydsl_moe_stage1(
             a=a1_qt.to(dtypes.fp8) if q_dtype_a == dtypes.fp8 and not _g942 else a1_qt,
             w1=w1_qt_shffle_ck,

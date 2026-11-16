@@ -188,6 +188,23 @@ def resolve_flydsl_stage1_tile_n(inter_dim: int, tile_n: int) -> int:
     return tile_n
 
 
+# in_dtype of the gfx942 a8w4 stage-1 family (the `_g942` names, gemm1_a8w4_gfx942).
+A8W4_GFX942_IN_DTYPE = "a8w4_gfx942"
+
+
+def is_a8w4_gfx942_kernel(name_or_params) -> bool:
+    """Whether a stage-1 kernel name, or its params dict, is the gfx942 a8w4 kernel.
+
+    The one test for that family: its weights are relaid, its x layout comes from the
+    name, and it runs on gfx942 only.
+    """
+    if isinstance(name_or_params, str):
+        name_or_params = get_flydsl_kernel_params(name_or_params.strip())
+    return bool(name_or_params) and (
+        name_or_params.get("in_dtype") == A8W4_GFX942_IN_DTYPE
+    )
+
+
 def get_flydsl_kernel_params(name: str) -> dict | None:
     """Lookup kernel params by name.
 
@@ -648,7 +665,7 @@ def get_flydsl_stage1_kernels_a8w4_gfx942() -> dict[str, dict]:
             "tile_n": tn,
             "tile_k": tk,
             "MPerBlock": tm,
-            "in_dtype": "a8w4_gfx942",
+            "in_dtype": A8W4_GFX942_IN_DTYPE,
             "gate_mode": "separated",
             "b_nt": bnt,
             "k_wave": kw,
@@ -1820,10 +1837,11 @@ def _flydsl_moe_stage1_impl(
     # [sorted_size, inter_dim] by sorted position, so stage 2 is the a16w4 kernel.
     # The path is chosen by the kernel name, not by dtype and arch: any other fp8 x fp4
     # name on gfx942 expects other weights and inputs, so it raises below.
-    if in_dtype == "a8w4_gfx942" or (a_dtype == "fp8" and b_dtype == "fp4"):
+    _g942 = is_a8w4_gfx942_kernel({"in_dtype": in_dtype})
+    if _g942 or (a_dtype == "fp8" and b_dtype == "fp4"):
         from aiter.jit.utils.chip_info import get_gfx_runtime
 
-        if in_dtype != "a8w4_gfx942":
+        if not _g942:
             if get_gfx_runtime() == "gfx942":
                 raise NotImplementedError(
                     "fp8 x fp4 stage1 on gfx942 runs only the `_g942` kernels "
