@@ -60,7 +60,7 @@ class MegaMoEV2:
         swiglu_limit: float = 0.0, fanout_masks: tuple[int, ...] = (),
         act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
         large_m_state_slots: int = 1, large_m_enabled: bool | None = None,
-        small_m_mtprs: tuple[int, ...] = DEFAULT_SMALL_M_MTPRS):
+        small_m_mtprs: tuple[int, ...] | None = None, routed: bool = False):
     # fmt: on
         if quant not in ("a4w4", "a8w4"):
             raise ValueError("MegaMoEV2 quant must be 'a4w4' or 'a8w4'")
@@ -102,9 +102,14 @@ class MegaMoEV2:
         if self.swiglu_limit < 0:
             raise ValueError("swiglu_limit must be non-negative")
         self.dev = torch.device("cuda", rank)
-        # The fused routes are built whenever this layout supports them; the plan then picks
-        # one route per call (see MegaMoEBundlePlan.route_for). small_m_mtprs=() or
-        # large_m_enabled=False leaves a route out.
+        # routed=True: the caller passes forward(max_tokens=...), so the fused routes this layout supports are
+        # built and the plan picks one route per call (see MegaMoEBundlePlan.route_for). Without it the instance
+        # holds the staged route only, the memory of a caller that never routes. small_m_mtprs and
+        # large_m_enabled pin a route in or out either way.
+        if small_m_mtprs is None:
+            small_m_mtprs = DEFAULT_SMALL_M_MTPRS if routed else ()
+        if large_m_enabled is None:
+            large_m_enabled = routed
         fused = fused_layout_supported(
             arch=get_gfx_runtime(),
             world_size=self.world_size,
@@ -131,7 +136,7 @@ class MegaMoEV2:
             ),
             large_m=(
                 fused
-                and large_m_enabled is not False
+                and large_m_enabled
                 and self.mtpr
                 in large_m_mtprs_for(
                     world_size=self.world_size,
@@ -1127,9 +1132,10 @@ class MegaMoEV2:
         and large-input routes always skip -1 slots.
 
         ``max_tokens``: rows of this call on its largest EP rank, counting graph
-        padding, passed identically on every rank; it selects the route. None
-        takes the staged route (fixed-slot or compact), or the large-input route
-        when set_large_m_enabled(True) was called.
+        padding, passed identically on every rank; it selects the route among
+        those built (routed=True builds them). None takes the staged route
+        (fixed-slot or compact), or the large-input route when
+        set_large_m_enabled(True) was called.
 
         The output is a view of the route's combine buffer, valid until the next
         call. ``slice_output=False`` returns the whole buffer: as many rows as

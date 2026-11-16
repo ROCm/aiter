@@ -1247,6 +1247,7 @@ def _routes_instance(args, rank, world, device):
         max_tok_per_rank=args.max_tok_per_rank,
         large_m_state_slots=args.large_m_state_slots,
         small_m_mtprs=tuple(args.small_m_mtprs),
+        routed=True,
         **net,
     )
     if moe.small_m_mtpr != max(args.small_m_mtprs):

@@ -284,6 +284,7 @@ def compile_one_config(**job):
                 act=job["act"],
                 situ_beta=job["situ_beta"],
                 situ_linear_beta=job["situ_linear_beta"],
+                routed=True,
                 **_weights(job, device),
             )
             moe.preload_aot_bundles()
