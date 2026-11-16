@@ -493,6 +493,9 @@ def pa_decode(
     FlyDSL autotune to select its budget before graph capture. A cache miss uses
     the device CU count for the gfx950 head-256 pipe shapes and twice that
     otherwise; ``tune=True`` forces a search during preparation.
+    ``pa_decode_policy.prepare_pa_decode_plan_with_policy`` instead selects a
+    partition cap and budget from host geometry without benchmarking or reading
+    tuning files. Both preparation APIs return an explicit reusable plan.
     Decode and graph replay use the explicit plan without accessing autotune. Set its
     partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx950 and
     gfx1250, when sinks are absent and query/output strides match, a cap of one
