@@ -1,0 +1,17 @@
+{
+    "logits": {
+        "num_warps": 2,
+        "waves_per_eu": 2,
+        "target_programs": 4096,
+        "min_split_tiles": 16
+    },
+    "topk": {
+        "block": 2048,
+        "res": 4096,
+        "dbits": 4,
+        "num_warps": 16
+    },
+    "indexer": {
+        "workspace_bytes": 1073741824
+    }
+}
