@@ -104,7 +104,7 @@ def reference(q, deq, indptr, idx, sink=None):
     lse = torch.full((C, H), float("-inf"), dtype=torch.float64)
     for r in range(C):
         ids = idx[indptr[r] : indptr[r + 1]]
-        ids = ids[ids >= 0]
+        ids = ids[(ids >= 0) & (ids < deq.shape[0])]
         s = q[r] @ deq[ids].T * SCALE
         if sink is not None:
             s = torch.cat([s, sink.double().cpu()[:, None]], 1)
@@ -228,10 +228,13 @@ def test_paged_layouts_same_bits(block, pad):
 
 
 def test_invalid_slots_and_sink():
+    """-1 sentinels and ids past the cache are masked out (never read)."""
     inp = make_inputs(LENS, 12, 4096)
     q, kv, indptr, idx, deq = inp
     idx = idx.clone()
     idx[::3] = -1
+    idx[1::7] = 4096 + 5
+    idx[2::11] = 2**31 - 1
     sink = torch.linspace(-2.0, 2.0, 12, dtype=torch.float32, device="cuda")
     out, lse = sparse_mla_bi_fwd(
         q, kv, indptr, idx, SCALE, has_invalid=True, attn_sink=sink, return_lse=True

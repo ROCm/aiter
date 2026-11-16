@@ -1,6 +1,21 @@
 {
     "sparse_mla_bi": {
-        "num_warps": 4,
-        "fused_min_programs": 512
+        "split": {
+            "block_h": 16,
+            "num_warps": 4,
+            "prefetch": false
+        },
+        "fused": {
+            "block_h": 32,
+            "num_warps": 8,
+            "prefetch": true
+        },
+        "fused_small": {
+            "block_h": 16,
+            "num_warps": 4,
+            "prefetch": true
+        },
+        "fused_small_max_heads": 16,
+        "fused_min_programs": 128
     }
 }

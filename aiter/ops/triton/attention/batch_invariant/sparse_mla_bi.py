@@ -23,7 +23,6 @@ BI_CONTRACT_VERSION = 1
 
 KEY_TILE = 64  # keys per tile, in the order of the row's index list
 NUM_SPLITS = 8  # split s owns tiles s, s + 8, ...; merged in order 0 .. 7
-BLOCK_H = 16  # heads per program
 KV_LORA_RANK = 512
 ROPE_DIM = 64
 _DSV32_ROW = KV_LORA_RANK + 4 * (KV_LORA_RANK // 128) + 2 * ROPE_DIM  # 656 B
@@ -130,11 +129,12 @@ def sparse_mla_bi_fwd(
             [slots, 1, 1, 576] or [nb, block, 576]. Slot i is
             (i // block, i % block).
         kv_indptr: [C + 1] int32 offsets of each row's list in kv_indices.
-        kv_indices: flat int32 global slot ids. The ids are not range-checked.
+        kv_indices: flat int32 global slot ids. Ids < 0 (-1 sentinels) and ids
+            past the cache are masked out and never read.
         softmax_scale: the layer's softmax scale.
         kv_scale: must be None.
         kv_lora_rank, qk_rope_head_dim: must be 512 and 64.
-        has_invalid: entries < 0 are masked out.
+        has_invalid: accepted for sparse_mla_fwd parity; masking is always on.
         dot_precision: must be "bf16". q_scale: ignored (bf16 q).
         out: optional [C, H, >= 512] bf16 destination, last stride 1.
         return_lse: also return the natural-log LSE, [C, H] f32 (-inf when a
@@ -163,6 +163,9 @@ def sparse_mla_bi_fwd(
     if kv_buffer.device != q.device:
         raise ValueError(f"kv_buffer is on {kv_buffer.device}, q is on {q.device}")
     fp8, kv, kv16, kv32, block_size, page_stride = _cache_args(kv_buffer, kv_scale, d_qk)
+    num_slots = kv_buffer.shape[0] * block_size
+    if num_slots >= 2**31:
+        raise ValueError(f"the cache has {num_slots} slots; slot ids are int32")
     kv_indptr = _int32_1d(kv_indptr, "kv_indptr", q.device)
     kv_indices = _int32_1d(kv_indices, "kv_indices", q.device)
     if kv_indptr.numel() != C + 1:
@@ -195,23 +198,28 @@ def sparse_mla_bi_fwd(
         return out, (lse if return_lse else None)
 
     cfg = _config()
-    heads_blocks = triton.cdiv(H, BLOCK_H)
-    if _mode is None:
-        fused = C * heads_blocks >= cfg["fused_min_programs"]
-    elif _mode in ("fused", "split"):
-        fused = _mode == "fused"
-    else:
+    if _mode not in (None, "fused", "split"):
         raise ValueError(f"_mode must be None, 'fused' or 'split', got {_mode!r}")
+    # Head tiles hold 16 heads per warp row; the bits do not depend on the tile.
+    big = cfg["fused"] if H > cfg["fused_small_max_heads"] else cfg["fused_small"]
+    if _mode is None:
+        fused = C * triton.cdiv(H, big["block_h"]) >= cfg["fused_min_programs"]
+    else:
+        fused = _mode == "fused"
+    tile = big if fused else cfg["split"]
+    block_h, num_warps = tile["block_h"], tile["num_warps"]
+    prefetch = tile["prefetch"]
+    heads_blocks = triton.cdiv(H, block_h)
     scale_log2 = float(softmax_scale) * math.log2(math.e)
     common = dict(
         FP8=fp8,
-        HAS_INVALID=bool(has_invalid),
-        BLOCK_H=BLOCK_H,
+        BLOCK_H=block_h,
         KEY_TILE=KEY_TILE,
         D=KV_LORA_RANK,
         R=ROPE_DIM,
         NUM_SPLITS=NUM_SPLITS,
-        num_warps=cfg["num_warps"],
+        PREFETCH=prefetch,
+        num_warps=num_warps,
         enable_fp_fusion=False,
     )
     if fused:
@@ -232,6 +240,7 @@ def sparse_mla_bi_fwd(
             out.stride(1),
             block_size,
             page_stride,
+            num_slots,
             H,
             HAS_SINK=has_sink,
             HAS_LSE=return_lse,
@@ -259,6 +268,7 @@ def sparse_mla_bi_fwd(
         q.stride(1),
         block_size,
         page_stride,
+        num_slots,
         H,
         **common,
     )
@@ -274,10 +284,10 @@ def sparse_mla_bi_fwd(
         H,
         HAS_SINK=has_sink,
         HAS_LSE=return_lse,
-        BLOCK_H=BLOCK_H,
+        BLOCK_H=block_h,
         D=KV_LORA_RANK,
         NUM_SPLITS=NUM_SPLITS,
-        num_warps=cfg["num_warps"],
+        num_warps=num_warps,
         enable_fp_fusion=False,
     )
     return out, (lse if return_lse else None)
