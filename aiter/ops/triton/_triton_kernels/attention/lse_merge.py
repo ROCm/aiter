@@ -18,6 +18,7 @@ _lse_merge_kernel_repr = make_kernel_repr(
         "BLOCK_M",
         "HEAD_DIM",
         "WRITE_LSE",
+        "HAS_ROW_BOUNDS",
     ],
 )
 
@@ -28,6 +29,8 @@ def _lse_merge_kernel(
     partial_lse_ptr,
     out_ptr,
     lse_ptr,
+    row_bounds_ptr,
+    row_bounds_last,
     sequence,
     stride_po_b,
     stride_po_s,
@@ -43,6 +46,7 @@ def _lse_merge_kernel(
     BLOCK_M: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     WRITE_LSE: tl.constexpr,
+    HAS_ROW_BOUNDS: tl.constexpr = False,
 ):
     """
     Each program merges BLOCK_M query rows of one (batch, head). Partial batch
@@ -57,6 +61,10 @@ def _lse_merge_kernel(
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = tl.arange(0, HEAD_DIM)
     valid = rows < sequence
+    if HAS_ROW_BOUNDS:
+        row_begin = tl.load(row_bounds_ptr)
+        row_end = tl.load(row_bounds_ptr + row_bounds_last)
+        valid = valid & (rows >= row_begin) & (rows < row_end)
     rows = rows.to(tl.int64)
 
     lse_base = (

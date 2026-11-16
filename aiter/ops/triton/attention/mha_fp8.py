@@ -257,80 +257,107 @@ def mha_fwd(
     return o
 
 
-def mha_fwd_mla_varlen(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    k_pe: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    q_scale: torch.Tensor | None = None,
-    k_scale: torch.Tensor | None = None,
-    v_scale: torch.Tensor | None = None,
-    sm_scale: float | None = None,
-    causal: bool = False,
-    out: torch.Tensor | None = None,
-    lse_out: torch.Tensor | None = None,
-    return_lse: bool = False,
-    o_init: torch.Tensor | None = None,
-    lse_init: torch.Tensor | None = None,
-    config: dict | None = None,
+def _descale_strides(t: torch.Tensor, name: str, rows: int, heads: int, device):
+    assert (
+        t.dtype == torch.float32 and t.device == device
+    ), f"{name} must be float32 on {device}, got {t.dtype} on {t.device}"
+    if t.numel() == 1:
+        return (0, 0)
+    assert t.shape == (
+        rows,
+        heads,
+    ), f"{name} must have one element or be [{rows}, {heads}], got {list(t.shape)}"
+    return t.stride()
+
+
+def _mha_varlen_fwd_gfx1250(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    q_descale,
+    k_descale,
+    v_descale,
+    softmax_scale,
+    causal,
+    return_lse,
+    out,
+    lse,
+    config,
+    k_pe,
+    o_init,
+    lse_init,
 ):
-    """
-    fp8 attention of packed variable-length sequences with MLA heads
-
-    q:         [total_q, HQ, 192] float8_e4m3fn: 128 dims, then 64 PE dims.
-    k:         [total_k, HK, 128] float8_e4m3fn.
-    v:         [total_k, HK, 64 or 128] float8_e4m3fn, with the strides of k.
-    k_pe:      [total_k, 1 or HK, 64] float8_e4m3fn PE dims of k.
-    cu_seqlens_q, cu_seqlens_k: [B + 1] int32 start offsets of the sequences.
-    q_scale:   optional [B, HQ] fp32 dequant scales; k_scale and v_scale [B, HK].
-               Give all three scales or none. None means a scale of 1.
-    sm_scale:  softmax scale, 192 ** -0.5 by default. It must not be negative. A zero
-               scale (also from a zero q or k scale) gives equal weights to the keys.
-    causal:    causal mask aligned to the bottom-right corner of each sequence.
-    out:       optional [total_q, HQ, dv] output; bf16 by default.
-    lse_out:   optional [HQ, total_q] fp32 natural-log LSE; return_lse allocates one.
-    o_init, lse_init: optional result of the same queries over other keys; the
-               output merges it.
-
-    Returns (out, lse_out).
-    """
-    assert get_arch() == "gfx1250", "Only supported on gfx1250"
+    D_NOPE, D_PE = 128, 64
+    if k_pe is None:
+        assert (
+            k.dim() == 3 and k.shape[2] == D_NOPE + D_PE
+        ), f"k must be [T, H, {D_NOPE + D_PE}] when k_pe is not given, got {list(k.shape)}"
+        k, k_pe = k[..., :D_NOPE], k[..., D_NOPE:]
     for t in (q, k, v, k_pe):
         assert t.dtype == torch.float8_e4m3fn and t.dim() == 3
+        assert t.device == q.device, "q, k, v and k_pe must be on the same device"
     total_q, num_heads, _ = q.shape
     num_k_heads, head_dim_v = k.shape[1], v.shape[2]
     num_seqs = cu_seqlens_q.numel() - 1
-    assert q.shape[2] == 192 and k.shape[2] == 128 and k_pe.shape[2] == 64
-    assert head_dim_v in (64, 128) and v.stride() == k.stride()
-    assert k_pe.shape[1] in (1, num_k_heads) and num_heads % num_k_heads == 0
-    if sm_scale is None:
-        sm_scale = q.shape[-1] ** -0.5
-    assert sm_scale >= 0, "sm_scale must be a number that is not negative"
-    has_scales = q_scale is not None
-    assert (k_scale is not None) == has_scales and (v_scale is not None) == has_scales
+    assert (
+        q.shape[2] == D_NOPE + D_PE and k.shape[2] == D_NOPE and k_pe.shape[2] == D_PE
+    ), f"needs d_qk {D_NOPE + D_PE} with {D_PE} rope dims, got q {list(q.shape)}"
+    assert head_dim_v in (64, 128), f"d_v must be 64 or 128, got {head_dim_v}"
+    assert v.shape[:2] == k.shape[:2], "v must have the tokens and heads of k"
+    assert k_pe.shape[0] == k.shape[0] and k_pe.shape[1] in (1, num_k_heads)
+    assert num_heads % num_k_heads == 0
+    for cu in (cu_seqlens_q, cu_seqlens_k):
+        assert (
+            cu.dtype == torch.int32 and cu.is_contiguous() and cu.device == q.device
+        ), "cu_seqlens_q and cu_seqlens_k must be contiguous int32 on the device of q"
+    assert cu_seqlens_k.numel() == cu_seqlens_q.numel(), "cu_seqlens sizes differ"
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    assert softmax_scale >= 0, "softmax_scale must not be negative"
+    has_scales = q_descale is not None
+    assert (k_descale is not None) == has_scales and (
+        v_descale is not None
+    ) == has_scales, "give all of q_descale, k_descale and v_descale, or none"
     if has_scales:
-        assert v_scale.stride() == k_scale.stride()
+        qs_strides = _descale_strides(
+            q_descale, "q_descale", num_seqs, num_heads, q.device
+        )
+        ks_strides = _descale_strides(
+            k_descale, "k_descale", num_seqs, num_k_heads, q.device
+        )
+        vs_strides = _descale_strides(
+            v_descale, "v_descale", num_seqs, num_k_heads, q.device
+        )
+        assert vs_strides == ks_strides, "v_descale must have the strides of k_descale"
+    else:
+        qs_strides = ks_strides = (0, 0)
     if out is None:
         out = q.new_empty((total_q, num_heads, head_dim_v), dtype=torch.bfloat16)
-    assert out.shape == (total_q, num_heads, head_dim_v)
+    assert out.shape == (
+        total_q,
+        num_heads,
+        head_dim_v,
+    ), f"out must be [{total_q}, {num_heads}, {head_dim_v}], got {list(out.shape)}"
     for t in (q, k, v, k_pe, out):
         assert t.data_ptr() % 16 == 0 and t.stride(-1) == 1
         assert all(s * t.element_size() % 16 == 0 for s in t.stride()[:-1])
-    if lse_out is None and (return_lse or o_init is not None):
-        lse_out = torch.empty(
-            (num_heads, total_q), dtype=torch.float32, device=q.device
-        )
+    assert (o_init is None) == (lse_init is None), "give o_init and lse_init together"
+    if lse is None and (return_lse or o_init is not None):
+        lse = torch.empty((num_heads, total_q), dtype=torch.float32, device=q.device)
+    if lse is not None:
+        assert lse.shape == (num_heads, total_q) and lse.dtype == torch.float32
+        assert lse.stride(-1) == 1
     if o_init is not None:
         if o_init.data_ptr() != out.data_ptr():
             out.copy_(o_init)
-        if lse_init.data_ptr() != lse_out.data_ptr():
-            lse_out.copy_(lse_init)
-    if total_q == 0:
-        return out, lse_out
+        if lse_init.data_ptr() != lse.data_ptr():
+            lse.copy_(lse_init)
+    if total_q == 0 or num_seqs == 0:
+        return (out, lse) if return_lse else out
 
     cfg = get_mla_varlen_config(causal, max_seqlen_k, total_q, num_heads)
     cfg.update(config or {})
@@ -354,12 +381,12 @@ def mha_fwd_mla_varlen(
         )
         if o_init is not None:
             o_k[num_splits].copy_(out)
-            lse_k[num_splits].copy_(lse_out)
+            lse_k[num_splits].copy_(lse)
     else:
         o_k = out.unsqueeze(0)
-        lse_k = (out if lse_out is None else lse_out).unsqueeze(0)
+        lse_k = (out if lse is None else lse).unsqueeze(0)
     wmma_layout, wmma_layout_pe = _mla_varlen_layouts(BLOCK_M, cfg["num_warps"])
-    fast_rowsum = bool(cfg.get("ROWSUM_MMA", lse_out is None and o_init is None))
+    fast_rowsum = bool(cfg.get("ROWSUM_MMA", lse is None and o_init is None))
     _mha_fwd_mla_varlen[(num_qblk * num_heads, num_splits)](
         q,
         k,
@@ -369,13 +396,15 @@ def mha_fwd_mla_varlen(
         lse_k,
         cu_seqlens_q,
         cu_seqlens_k,
-        q_scale if has_scales else q,
-        k_scale if has_scales else q,
-        v_scale if has_scales else q,
+        q_descale if has_scales else q,
+        k_descale if has_scales else q,
+        v_descale if has_scales else q,
         q.stride(0),
         q.stride(1),
         k.stride(0),
         k.stride(1),
+        v.stride(0),
+        v.stride(1),
         k_pe.stride(0),
         0 if k_pe.shape[1] == 1 else k_pe.stride(1),
         o_k.stride(1),
@@ -384,21 +413,21 @@ def mha_fwd_mla_varlen(
         lse_k.stride(1),
         lse_k.stride(2),
         lse_k.stride(0),
-        *(q_scale.stride() if has_scales else (0, 0)),
-        *(k_scale.stride() if has_scales else (0, 0)),
-        sm_scale,
+        *qs_strides,
+        *ks_strides,
+        softmax_scale,
         num_seqs,
         num_heads,
         num_heads // num_k_heads,
         qblk_per_seq,
         BLOCK_M=BLOCK_M,
         BLOCK_N=cfg["BLOCK_N"],
-        HEAD_DIM=128,
-        PE_DIM=64,
+        HEAD_DIM=D_NOPE,
+        PE_DIM=D_PE,
         HEAD_DIM_V=head_dim_v,
         CAUSAL=causal,
         NUM_SPLITS=num_splits,
-        RETURN_LSE=num_splits > 1 or lse_out is not None,
+        RETURN_LSE=num_splits > 1 or lse is not None,
         HAS_INIT=num_splits == 1 and o_init is not None,
         HAS_SCALES=has_scales,
         WMMA_LAYOUT=wmma_layout,
@@ -416,9 +445,10 @@ def mha_fwd_mla_varlen(
             o_k,
             lse_k,
             out.unsqueeze(0),
-            None if lse_out is None else lse_out.unsqueeze(0),
+            None if lse is None else lse.unsqueeze(0),
+            row_bounds=cu_seqlens_q,
         )
-    return out, lse_out
+    return (out, lse) if return_lse else out
 
 
 def _get_varlen_config(causal: bool) -> dict:
@@ -448,8 +478,11 @@ def mha_varlen_fwd(
     out: torch.Tensor | None = None,
     lse: torch.Tensor | None = None,
     config: dict | None = None,
+    k_pe: torch.Tensor | None = None,
+    o_init: torch.Tensor | None = None,
+    lse_init: torch.Tensor | None = None,
 ):
-    """FP8 varlen MHA forward (gfx950).
+    """FP8 varlen MHA forward (gfx950 and gfx1250).
 
     Args:
         q, k: [T, H, d_qk] float8_e4m3fn. v: [T, H, d_v] float8_e4m3fn. The last dim is contiguous.
@@ -461,19 +494,56 @@ def mha_varlen_fwd(
         q_descale, k_descale, v_descale: one-element fp32 tensors on the device of q, the
             per-tensor dequant scales.
         softmax_scale: defaults to 1 / sqrt(d_qk).
-        causal: apply the causal mask.
+        causal: apply the causal mask, aligned to the bottom-right corner of each sequence.
         return_lse: also return the log-sum-exp.
         out, lse: optional preallocated outputs.
         config: optional kernel config. The default comes from the JSON config.
+
+    gfx1250 only (MLA prefill, e.g. DeepSeek / Kimi-K3):
+        k_pe: [Tk, 1 or H_k, 64] rope dims of k, given apart from k, e.g. one vector per token
+            shared by the heads, as a view of the latent cache. k is then [Tk, H_k, 128].
+        o_init, lse_init: result of the same queries over other keys (an earlier chunk);
+            the output merges it. They may be ``out`` and ``lse`` themselves.
+        H_k may divide H (GQA), and d_v may be 64. The descales may also be [batch, H] for q
+        and [batch, H_k] for k and v (per sequence and head), or all None for a scale of 1.
+        ``config`` keys override the default config instead of replacing it.
 
     Returns:
         out [Tq, H, d_v] bfloat16, and with ``return_lse`` also lse [H, Tq] float32 (natural log,
         -inf for a row that sees no key).
 
-    Limits: gfx950 only. d_v must be 128. d_qk - d_v, the rope part, must be 0 or 64.
+    Limits: gfx950: d_v must be 128. d_qk - d_v, the rope part, must be 0 or 64.
+    gfx1250: d_qk must be 192 (128 + 64 rope dims) and d_v 64 or 128.
     """
     arch = get_arch()
-    assert arch == "gfx950", f"mha_varlen_fwd is only supported on gfx950, got {arch}"
+    if arch == "gfx1250":
+        return _mha_varlen_fwd_gfx1250(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            q_descale,
+            k_descale,
+            v_descale,
+            softmax_scale,
+            causal,
+            return_lse,
+            out,
+            lse,
+            config,
+            k_pe,
+            o_init,
+            lse_init,
+        )
+    assert (
+        arch == "gfx950"
+    ), f"mha_varlen_fwd is only supported on gfx950 and gfx1250, got {arch}"
+    assert (
+        k_pe is None and o_init is None and lse_init is None
+    ), "k_pe, o_init and lse_init are only supported on gfx1250"
     assert q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
     Tq, H, DQK = q.shape
     DV = v.shape[-1]

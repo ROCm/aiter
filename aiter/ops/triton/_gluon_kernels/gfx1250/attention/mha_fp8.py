@@ -779,6 +779,8 @@ def _mha_fwd_mla_varlen(
     stride_q_h,
     stride_k_t,
     stride_k_h,
+    stride_v_t,
+    stride_v_h,
     stride_kpe_t,
     stride_kpe_h,
     stride_o_t,
@@ -914,9 +916,9 @@ def _mha_fwd_mla_varlen(
         layout=K_SL,
     )
     v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=v_ptr + k_row * stride_k_t + h_k * stride_k_h,
+        base=v_ptr + k_row * stride_v_t + h_k * stride_v_h,
         shape=(seqlen_k, HEAD_DIM_V),
-        strides=(stride_k_t, 1),
+        strides=(stride_v_t, 1),
         block_shape=(BLOCK_N, HEAD_DIM_V),
         layout=V_SL,
     )
