@@ -202,7 +202,7 @@ jobs:
               failed=false
           fi
 
-          if ! python3 .github/scripts/check_moe_2stage_nonstrict_gate.py \
+          if ! docker exec aiter_test python3 .github/scripts/check_moe_2stage_nonstrict_gate.py \
               --log full_matrix.log \
               --allowlist .github/scripts/moe_2stage_known_nonstrict_failures.csv; then
               status="FAILED (unexpected non-strict accuracy failures not in known allowlist)"
@@ -222,6 +222,7 @@ jobs:
             echo "**${status}** -- ${elapsed_s}s"
           } >> "$GITHUB_STEP_SUMMARY"
           if [[ "$failed" == "true" ]]; then
+            echo "::error title=MoE 2-stage full matrix::${status}"
             exit 1
           fi
 
