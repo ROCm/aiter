@@ -352,14 +352,24 @@ _A4W4_PRESHUFFLE_PREFIXES = ("triton_", "flydsl_", OPUS_A4W4_PREFIX)
 def _opus_a4w4_kids(gfx, cu_num):
     from csrc.opus_gemm.opus_gemm_common import get_registry
 
-    return {inst.name: kid for kid, inst in get_registry("a4w4", gfx, cu_num).items()}
+    return {
+        inst.name: (kid, inst)
+        for kid, inst in get_registry("a4w4", gfx, cu_num).items()
+    }
 
 
 def _gemm_a4w4_opus(A, B, A_scale, B_scale, out, kernel_name, kernel_id=None):
     m, n, k = A.numel() // A.shape[-1], B.shape[0], A.shape[-1] * 2
-    kid = _opus_a4w4_kids(get_gfx(), get_cu_num()).get(kernel_name)
+    kids = _opus_a4w4_kids(get_gfx(), get_cu_num())
+    kid, inst = kids.get(kernel_name, (None, None))
     if kid is None or (kernel_id is not None and int(kernel_id) != kid):
         raise ValueError(f"Invalid tuned OPUS kernel {kernel_id} {kernel_name}")
+    # A row tuned at a padded M also serves the smaller M that pad up to it; a
+    # no-bounds-check (nob) tile only fits whole tiles, so run its bounded twin.
+    if inst.co_variant == "nob" and (m % inst.B_M or n % inst.B_N):
+        kid, inst = kids.get(kernel_name.removesuffix("_nob"), (None, None))
+        if kid is None:
+            return None
     if not (
         n % 16 == 0
         and k % 256 == 0
