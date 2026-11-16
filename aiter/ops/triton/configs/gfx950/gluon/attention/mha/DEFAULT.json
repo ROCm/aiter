@@ -122,5 +122,21 @@
       "llvm_fn_attrs": [["amdgpu-agpr-alloc", "0,0"]]
     },
     "fp8_lazy_min_seqlen_k": 2048
+  },
+  "fwd_varlen_fp8": {
+    "causal": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "num_warps": 4,
+      "waves_per_eu": 2
+    },
+    "non_causal": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "num_warps": 4,
+      "waves_per_eu": 2,
+      "TARGET_CTAS": 512,
+      "MAX_SPLITS": 16
+    }
   }
 }

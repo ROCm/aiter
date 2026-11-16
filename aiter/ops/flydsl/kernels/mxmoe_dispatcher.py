@@ -17,6 +17,7 @@ from .mxmoe_gemm_v2 import (
     global_typed_ptr,
     issue_a_load_lds_dt,
     kStages,
+    scatter_lds_pairs_bytes,
 )
 from .tensor_shim import _run_compiled as run_compiled
 
@@ -141,6 +142,7 @@ def compile_gemm2_a4w4_port(
     _input_row_resolver=None,
     _output_n_range=None,
     use_valid_token_count=False,
+    g2_scatter_lds_pairs=False,
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). INTER_MAX must equal the runtime inter_dim (unrolled K-loop); SBM None -> SBM==BM byte-identical."""
     SBM = _norm_sbm(SBM, BM)
@@ -243,6 +245,14 @@ def compile_gemm2_a4w4_port(
         aStages = 3 if (not g2_bf16_lds or 3 * slot_bytes <= c_lds_bytes) else 2
     a_slot_alias = aStages <= kStages
     lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
+    # _ldspa: the bf16 scatter epilogue writes C through LDS with 16-byte nt stores.
+    g2_scatter_lds_pairs = bool(g2_scatter_lds_pairs)
+    if g2_scatter_lds_pairs:
+        if not use_scatter or scatter_out_fp4 or enable_bias:
+            raise AssertionError(
+                "g2_scatter_lds_pairs (_ldspa) needs epilog='scatter', bf16 output and no bias"
+            )
+        lds_bytes = max(lds_bytes, scatter_lds_pairs_bytes(BM, BN))
     K_TILES_RT_MAX = INTER_MAX // BK
     g2_apre = aStages >= K_TILES_RT_MAX
     a_preload = min(aStages, K_TILES_RT_MAX) if g2_apre else kStages
@@ -316,8 +326,9 @@ def compile_gemm2_a4w4_port(
     valid_tokens_tag = "_valid_tokens" if use_valid_token_count else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
     bias_tag = "_bias" if enable_bias else ""
+    ldspa_tag = "_ldspa" if g2_scatter_lds_pairs else ""
     g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{shared_scale_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{noil_tag}{dw_tag}{pitch_tag}{sblk_tag}{out_tag}{compact_tag}{bias_tag}{output_range_tag}_v2_biasabi7{route_guard_tag}"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{shared_scale_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{noil_tag}{dw_tag}{pitch_tag}{sblk_tag}{out_tag}{compact_tag}{bias_tag}{output_range_tag}{ldspa_tag}_v2_biasabi7{route_guard_tag}"
     name = f"gemm2_a4w4_port_{tag}{valid_tokens_tag}" + (
         "_idpf" if g2_prefetch_ids else ""
     )
@@ -450,6 +461,7 @@ def compile_gemm2_a4w4_port(
                 enable_bias=enable_bias,
                 nonatomic=use_scatter,
                 scatter_out_fp4=scatter_out_fp4,
+                scatter_lds_pairs=g2_scatter_lds_pairs,
                 arg_out_scale=arg_out_scale,
                 g2_prefetch_ids=g2_prefetch_ids,
                 mn_idx=mn_idx,
@@ -719,6 +731,7 @@ def get_g2(
     enable_bias=False,
     g2_prefetch_ids=False,
     use_valid_token_count=False,
+    g2_scatter_lds_pairs=False,
 ):
     # Cache key uses compile-time buckets; runtime model_dim shares a launcher
     # within HIDDEN_MAX (INTER_MAX is the exact inter_dim: the K-loop is unrolled).
@@ -759,6 +772,7 @@ def get_g2(
         enable_bias,
         g2_prefetch_ids,
         use_valid_token_count,
+        bool(g2_scatter_lds_pairs),
     )
     launch = G2_CACHE.get(key)
     if launch is None:
@@ -784,6 +798,7 @@ def get_g2(
             enable_bias=enable_bias,
             g2_prefetch_ids=g2_prefetch_ids,
             use_valid_token_count=use_valid_token_count,
+            g2_scatter_lds_pairs=g2_scatter_lds_pairs,
         )
         G2_CACHE[key] = launch
     return launch
@@ -826,6 +841,7 @@ def mxfp4_moe_gemm2(
     is_ep=False,
     out_scale=None,
     use_valid_token_count=False,
+    g2_scatter_lds_pairs=False,
 ):
     """Stage-2 down-proj gemm for unpadded dimensions.
 
@@ -926,6 +942,7 @@ def mxfp4_moe_gemm2(
         enable_bias=bias is not None,
         g2_prefetch_ids=g2_prefetch_ids,
         use_valid_token_count=use_valid_token_count,
+        g2_scatter_lds_pairs=g2_scatter_lds_pairs,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
     if persist:
