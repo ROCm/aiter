@@ -544,6 +544,7 @@ def make_s1f_stage1(
     tdm_as_in_prologue=0,
     xcc_queues=0,
     iod_loc=0,
+    loc_queues=1,
 ):
     """Build the S1F stage-1 kernel; returns a ``@flyc.jit`` launcher.
 
@@ -599,6 +600,10 @@ def make_s1f_stage1(
     ``l`` of queue ``x``; a CTA whose queue is exhausted claims from the next
     queues in turn. Decode m-tiles are one per expert, so B has no reuse to
     keep; with several m-tiles per expert the global m-major order keeps B's.
+
+    ``loc_queues`` (with ``iod_loc``): the GEMM1 queues hold only n-tiles of
+    their IOD domain. Off, the placed W1 is read in the global order, half of
+    it from the other domain.
 
     ``ticket_span`` (default ``workers``): entry tickets per launch, the same
     for every variant sharing one control block. ``ctas_per_cu``: how many
@@ -662,14 +667,15 @@ def make_s1f_stage1(
     SHARED_FIRST = S1F_SHARED_FIRST if S1F_SHARED_FIRST < epr else 0
     XQ = int(bool(xcc_queues))
     LOC = int(bool(iod_loc))
+    LOCQ = int(LOC and bool(loc_queues))
     N1 = 2 * int(inter_dim)
     assert N1 % tile_n == 0
     NT = N1 // tile_n
     # IOD-placed W1 (iod_locality.place_w13, domain groups of iod_loc
     # n-tiles): XCC x is on IOD domain ((x + c) % 8) >= 4, c the launch's
     # rotation, which holds the n-tiles n with (n / iod_loc) % 2 equal to it;
-    # an odd last group splits, its first half on domain 0. Without
-    # xcc_queues, one queue per domain.
+    # an odd last group splits, its first half on domain 0. With loc_queues
+    # and without xcc_queues, one queue per domain.
     LOC_GROUP = int(iod_loc) or 1
     LOC_GS = LOC_GROUP.bit_length() - 1
     LOC_NG = NT // LOC_GROUP
@@ -874,7 +880,7 @@ def make_s1f_stage1(
             + (f"_sf{SHARED_FIRST}" if SHARED_FIRST else "")
             + (f"_ts{SPAN}" if SPAN != G else "")
             + ("_xq" if XQ else "")
-            + ("_loc" if LOC else "")
+            + ("_loc" if LOCQ else ("_locg" if LOC else ""))
             + f"_{g1_name}"
         )
 
@@ -1711,18 +1717,18 @@ def make_s1f_stage1(
             # Global: one queue, consumer c = slot_id - P starts on item c
             # without a claim. XQ: queue x per XCC, its consumer l starts on
             # item l of queue x; each queue's first SQ items are static.
-            # LOC without XQ: queue d per IOD domain, the global order over
+            # loc_queues without XQ: queue d per IOD domain, the global order over
             # the n-tiles of parity d; the domain's 4 * CB consumers start on
             # its first items.
-            SQ = CB if XQ else (4 * CB if LOC else G - P)
-            loc_c = launch_rotation() if const_expr(LOC) else None
+            SQ = CB if XQ else (4 * CB if LOCQ else G - P)
+            loc_c = launch_rotation() if const_expr(LOCQ) else None
             groups = (m_tiles + fx.Int32(GM - 1)) // fx.Int32(GM)
             gs_last = m_tiles - (groups - fx.Int32(1)) * fx.Int32(GM)
 
             def q_items(xq):
-                if const_expr(LOC and not XQ):
+                if const_expr(LOCQ and not XQ):
                     return m_tiles * fx.Int32(NT // 2)
-                if const_expr(LOC):
+                if const_expr(LOCQ):
                     # Queue xq: the m-tiles of its rank r among the 4 queues of
                     # its domain d, the n-tiles of domain d.
                     r = ((xq + loc_c) & fx.Int32(N_XCC - 1)) & fx.Int32(3)
@@ -1760,7 +1766,7 @@ def make_s1f_stage1(
                 return n
 
             def q_code(xq, w):
-                if const_expr(LOC and not XQ):
+                if const_expr(LOCQ and not XQ):
                     k = w // fx.Int32(B1 // 2)
                     r = w - k * fx.Int32(B1 // 2)
                     gsz = fx.Int32(
@@ -1770,7 +1776,7 @@ def make_s1f_stage1(
                     return (
                         (k * fx.Int32(GM) + r - rq * gsz) << fx.Int32(_ITEM_N_BITS)
                     ) | loc_n(rq, xq)
-                if const_expr(LOC):
+                if const_expr(LOCQ):
                     xr = (xq + loc_c) & fx.Int32(N_XCC - 1)
                     j = w // fx.Int32(NT // 2)
                     n = loc_n(w - j * fx.Int32(NT // 2), xr >> fx.Int32(2))
@@ -1798,7 +1804,7 @@ def make_s1f_stage1(
                 return (m_q << fx.Int32(_ITEM_N_BITS)) | rq
 
             def q_head_bytes(xq):
-                if const_expr(XQ or LOC):
+                if const_expr(XQ or LOCQ):
                     return (
                         fx.Int32(CTL_XHEAD)
                         + (par * fx.Int32(N_XCC) + xq) * fx.Int32(32)
@@ -1839,7 +1845,7 @@ def make_s1f_stage1(
                 i = fx.Int32(1)
                 while (code_s == fx.Int32(-2)) & (i < fx.Int32(N_XCC)):
                     xq_c = (xq0 + i) & fx.Int32(N_XCC - 1)
-                    if const_expr(LOC):
+                    if const_expr(LOCQ):
                         # Same-domain queues first, then the other domain's.
                         xr0 = (xq0 + loc_c) & fx.Int32(N_XCC - 1)
                         d_c = (xr0 >> fx.Int32(2)) ^ (i >> fx.Int32(2))
@@ -1860,7 +1866,7 @@ def make_s1f_stage1(
                 (retried if another CTA drained it first)."""
                 if const_expr(XQ):
                     return steal_xcc(xq0)
-                if const_expr(LOC):
+                if const_expr(LOCQ):
                     xq_o = fx.Int32(1) - xq0
                     c = claim_resolve(xq_o, claim_issue(xq_o))
                     return fx.Int32((c == fx.Int32(-2)).select(fx.Int32(-1), c)), xq_o
@@ -2011,13 +2017,13 @@ def make_s1f_stage1(
             # runs, and those cover the earliest tiles.
             # XQ: consumer slots are x-major, so XCC x's consumers are
             # P + x * CB + l, l < CB.
-            # LOC: domain queue xr >> 2, the XCC's rank xr & 3 in it.
-            xr = (xcc + loc_c) & fx.Int32(N_XCC - 1) if LOC else None
-            queue = xcc if XQ else (xr >> fx.Int32(2) if LOC else fx.Int32(0))
+            # loc_queues: domain queue xr >> 2, the XCC's rank xr & 3 in it.
+            xr = (xcc + loc_c) & fx.Int32(N_XCC - 1) if LOCQ else None
+            queue = xcc if XQ else (xr >> fx.Int32(2) if LOCQ else fx.Int32(0))
             q0 = slot_id - fx.Int32(P)
             if const_expr(XQ):
                 q0 = q0 - xcc * fx.Int32(CB)
-            if const_expr(LOC and not XQ):
+            if const_expr(LOCQ and not XQ):
                 q0 = q0 + ((xr & fx.Int32(3)) - xcc) * fx.Int32(CB)
             static_ok = fx.Int32(
                 ((slot_id >= fx.Int32(P)) & (q0 < q_items(queue))).select(

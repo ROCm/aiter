@@ -106,20 +106,38 @@ def s1f_max_recv(world_size: int, topk: int) -> int:
     return _S1F_MAX_RECV_BY_SHAPE.get((int(world_size), int(topk)), _S1F_MAX_RECV)
 
 
-#: Per-XCC GEMM1 queues (``make_s1f_stage1(xcc_queues=1)``) up to this tile_m:
-#: decode buckets have one m-tile per expert, so the order only decides how
-#: many XCCs read each m-tile's A. Wider tiles keep the global m-major order,
-#: whose neighbouring m-tiles of one expert share B.
-_S1F_XCC_QUEUE_MAX_TILE_M = 96
+#: Per-XCC GEMM1 queues (``make_s1f_stage1(xcc_queues=1)``) up to this tile_m;
+#: 0 keeps them off. They cut the XCCs reading each decode m-tile's A, yet the
+#: stage-1 kernel ran 5-9 us slower with them at tile_m 32-96 (EP4, DSV4.1
+#: Flash and DeepSeek-R1).
+_S1F_XCC_QUEUE_MAX_TILE_M = 0
+#: Placed W1: per-IOD-domain GEMM1 queues from this tile_m on. At tile_m 32
+#: they ran the stage-1 kernel ~7% slower than the global order on unplaced
+#: weights, so smaller tiles keep the global order.
+_S1F_LOC_QUEUE_MIN_TILE_M = 128
+
+
+def _s1f_mode(name: str) -> str:
+    mode = os.environ.get(name, "auto").strip() or "auto"
+    if mode not in ("auto", "0", "1"):
+        raise ValueError(f"{name} must be auto, 0 or 1, got {mode!r}")
+    return mode
 
 
 def _s1f_xcc_queues(tile_m: int) -> int:
     """``AITER_MEGA_S1F_XCC_QUEUE``: auto (default), 0 or 1."""
-    mode = os.environ.get("AITER_MEGA_S1F_XCC_QUEUE", "auto").strip() or "auto"
-    if mode not in ("auto", "0", "1"):
-        raise ValueError(f"AITER_MEGA_S1F_XCC_QUEUE must be auto, 0 or 1, got {mode!r}")
+    mode = _s1f_mode("AITER_MEGA_S1F_XCC_QUEUE")
     if mode == "auto":
         return int(int(tile_m) <= _S1F_XCC_QUEUE_MAX_TILE_M)
+    return int(mode)
+
+
+def _s1f_loc_queues(tile_m: int, xcc_queues: int) -> int:
+    """``AITER_MEGA_S1F_LOC_QUEUE``: auto (default), 0 or 1. Auto keeps the
+    per-XCC queues domain-aware."""
+    mode = _s1f_mode("AITER_MEGA_S1F_LOC_QUEUE")
+    if mode == "auto":
+        return int(bool(xcc_queues) or int(tile_m) >= _S1F_LOC_QUEUE_MIN_TILE_M)
     return int(mode)
 
 
@@ -500,6 +518,7 @@ class _Stage1Fusion:
         from .s1f_stage1 import make_s1f_stage1
 
         xcc_queues = _s1f_xcc_queues(tile_m)
+        loc_queues = _s1f_loc_queues(tile_m, xcc_queues) if iod_loc else 0
         key = (
             tile_m,
             producers,
@@ -511,6 +530,7 @@ class _Stage1Fusion:
             tdm_as_in_prologue,
             xcc_queues,
             iod_loc,
+            loc_queues,
         )
         launch = self.launches.get(key)
         if launch is None:
@@ -521,6 +541,7 @@ class _Stage1Fusion:
                 tdm_as_in_prologue=tdm_as_in_prologue,
                 xcc_queues=xcc_queues,
                 iod_loc=iod_loc,
+                loc_queues=loc_queues,
                 rank=config.rank,
                 npes=config.world_size,
                 experts_per_rank=config.experts_per_rank,
@@ -724,10 +745,13 @@ class _Stage1Fusion:
                 fx.Stream(stream),
             )
 
-        # The GEMM1 knobs the stage-1 kernel can embed (the TDM ones from the CSV).
+        # The GEMM1 knobs the stage-1 kernel embeds. The CSV's TDM ones tune the
+        # unfused GEMM1: the tile_m 32 row's B hint and A-scale prologue ran
+        # the stage-1 kernel ~1.5 us slower (DSV4.1 Flash EP4), so it keeps its
+        # own, both off.
         g1_opts = {
-            "tdm_b_th": int(tdm_b_th),
-            "tdm_as_in_prologue": int(bool(tdm_as_in_prologue)),
+            "tdm_b_th": 0,
+            "tdm_as_in_prologue": 0,
             # The placed W1's domain group; 0: not placed.
             "iod_loc": int(loc_group),
         }
