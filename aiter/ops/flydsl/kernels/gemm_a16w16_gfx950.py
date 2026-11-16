@@ -50,9 +50,6 @@ class GemmA16W16Gfx950Param:
     split_k_partials: fx.Constexpr[bool]
     split_count: fx.Constexpr[int]
     device_index: fx.Constexpr[int]
-    static_m: fx.Constexpr[int]
-    static_n: fx.Constexpr[int]
-    static_k: fx.Constexpr[int]
     m_waves: fx.Constexpr[int]
     n_waves: fx.Constexpr[int]
     k_waves: fx.Constexpr[int]
@@ -125,9 +122,6 @@ def make_gemm_a16w16_gfx950_param(
     k_stagger: int = 0,
     b_non_temporal: bool = False,
     split_k_partials: bool = False,
-    static_m: int = 0,
-    static_n: int = 0,
-    static_k: int = 0,
     device_index: int = 0,
 ) -> GemmA16W16Gfx950Param:
     if in_dtype_id not in (GEMM_A16W16_DTYPE_BF16, GEMM_A16W16_DTYPE_FP16):
@@ -162,7 +156,6 @@ def make_gemm_a16w16_gfx950_param(
         or k_waves != 1
         or a_is_transposed
         or not b_is_transposed
-        or min(static_m, static_n, static_k) <= 0
     ):
         raise ValueError("FP32 split planes require BF16 NT, no bias, FT and k_waves=1")
     in_dbytes = 2
@@ -309,9 +302,6 @@ def make_gemm_a16w16_gfx950_param(
         split_k_partials=split_k_partials,
         split_count=split_k if split_k_partials else 0,
         device_index=device_index,
-        static_m=static_m,
-        static_n=static_n,
-        static_k=static_k,
         m_waves=m_waves,
         n_waves=n_waves,
         k_waves=k_waves,
@@ -343,7 +333,7 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     out_suffix = "_fp32c" if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else ""
     name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
     if param.split_k_partials:
-        name += f"_planes{param.split_count}_m{param.static_m}n{param.static_n}k{param.static_k}_d{param.device_index}"
+        name += f"_planes{param.split_count}_dynamic_mnk_d{param.device_index}"
     else:
         name += "_kst4" if param.is_split_k else "_ks1"
     name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
@@ -564,14 +554,6 @@ def gemm_a16w16_gfx950_kernel(
     tiled_mma: fx.TiledMma,
     param: GemmA16W16Gfx950Param,
 ):
-    if const_expr(param.split_k_partials):
-        m, n, k = (
-            fx.Int32(param.static_m),
-            fx.Int32(param.static_n),
-            fx.Int32(param.static_k),
-        )
-        a_leading_stride = fx.Int32(param.static_k)
-        b_leading_stride = fx.Int32(param.static_k)
     is_split_k = param.is_split_k and not param.split_k_partials
     is_slice_k = param.k_waves > 1
     block_m = param.block_m
@@ -617,7 +599,9 @@ def gemm_a16w16_gfx950_kernel(
     ks_idx = fx.block_idx.y
     if const_expr(param.split_k_partials):
         # Balance whole K tiles: partitions differ by at most one tile.
-        tiles, extra = divmod(param.static_k // block_k, param.split_count)
+        total_tiles = k // block_k
+        tiles = total_tiles // param.split_count
+        extra = total_tiles % param.split_count
         prefix = (ks_idx < extra).select(ks_idx, fx.Int32(extra))
         ks_begin = (ks_idx * tiles + prefix) * block_k
         k_tiles = fx.Int32(tiles) + (ks_idx < extra).select(fx.Int32(1), fx.Int32(0))
@@ -1756,7 +1740,7 @@ def gemm_a16w16(
 
     kwargs.update(user_kwargs or {})
     if partials:
-        kwargs.update(static_m=m, static_n=n, static_k=k, device_index=a.device.index)
+        kwargs.update(device_index=a.device.index)
     kwargs["a_is_transposed"] = a_is_transposed
     kwargs["b_is_transposed"] = b_is_transposed
     kwargs["in_dtype_id"] = (
