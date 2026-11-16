@@ -3256,12 +3256,12 @@ def gen_a4w4_co_instance(
     """Host launcher of one pre-compiled a4w4 kid.
 
     The device code is gen_co/gfx950/a4w4_bpreshuffle/<k.name>.co (build_co.py --arch gfx950),
-    loaded at runtime by opus_co_launch_mxfp4_gfx950.cuh; no device TU.
+    loaded at runtime by opus_co_launch_gfx950.cuh; no device TU.
     Split-K (variant "sk"): splitK = S segments of K, resolved by the caller
     (aiter/ops/opus/gemm_op_a4w4.py); S > 1 needs a caller-owned fp32 workspace
     of opus_mxfp4_sk_ws_bytes() whose tile-counter block is zeroed here.
     """
-    from opus_gemm_common import A4W4_CO_MODE
+    from opus_gemm_common import A4W4_CO_DIR, A4W4_CO_MODE
 
     variant = k.co_variant
     mode = A4W4_CO_MODE[variant]
@@ -3295,7 +3295,7 @@ def gen_a4w4_co_instance(
 #include "{traits_header}"
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 #include "opus_gemm_common.cuh"
-#include "gfx950/opus_co_launch_mxfp4_gfx950.cuh"
+#include "gfx950/opus_co_launch_gfx950.cuh"
 {signature}
 {{{kargs_code}
     kargs.stride_b = K / 2;  // row stride of the unshuffled B (bytes)
@@ -3307,8 +3307,8 @@ def gen_a4w4_co_instance(
     kargs.ptr_ws = nullptr;
     {mode_code}
     kargs.grid_blocks = grid_x;
-    static AiterAsmKernelFast& kernel = opus_gfx950_co::mxfp4_co_kernel("{k.name}");
-    opus_mxfp4_co_launch_gfx950(kernel, dim3(grid_x), dim3({k.BLOCK_SIZE}), kargs, stream);
+    static AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel("{k.name}", "{A4W4_CO_DIR}");
+    opus_co_launch_gfx950(kernel, dim3(grid_x), dim3({k.BLOCK_SIZE}), kargs, stream);
 }}
 #endif // launcher only on regular host pass
 """

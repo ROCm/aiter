@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Runtime loader / launcher for the gfx950 pre-compiled opus_gemm code objects (gen_co/gfx950/a4w4_bpreshuffle/*.co, built offline by
-// gen_co/build_co.py --arch gfx950 with the pin toolchain). Host pass only.
+// Runtime loader / launcher for the gfx950 pre-compiled opus_gemm code objects (gen_co/gfx950/<family dir>/*.co, built
+// offline by gen_co/build_co.py --arch gfx950 with the pin toolchain). Host pass only.
 //
 // The .co directory is OPUS_GEN_CO_DIR (environment variable, else the compile-time macro set by the JIT module);
-// images live in <dir>/gfx950/a4w4_bpreshuffle/<symbol>.co and contain one extern "C" kernel named <symbol>.
+// images live in <dir>/<co_dir>/<symbol>.co (co_dir: the family's directory under gen_co/, passed by the launcher) and
+// contain one extern "C" kernel named <symbol>.
 #pragma once
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
 #include <hip/hip_runtime.h>
@@ -20,18 +21,19 @@
 #endif
 
 namespace opus_gfx950_co {
-struct MxCoModule {
+struct CoModule {
     std::vector<char> image;   // kept alive while the kernel is registered
     AiterAsmKernelFast kernel;
 
-    explicit MxCoModule(const std::string& symbol) : image(read_co(symbol)), kernel(symbol.c_str(), image.data()) {}
+    CoModule(const std::string& symbol, const std::string& co_dir)
+        : image(read_co(symbol, co_dir)), kernel(symbol.c_str(), image.data()) {}
 
 private:
-    static std::vector<char> read_co(const std::string& symbol) {
+    static std::vector<char> read_co(const std::string& symbol, const std::string& co_dir) {
         const char* env = std::getenv("OPUS_GEN_CO_DIR");
         const std::string root = env && *env ? env : OPUS_GEN_CO_DIR;
         AITER_CHECK(!root.empty(), "opus gfx950 .co directory is not set (OPUS_GEN_CO_DIR)");
-        const std::string path = root + "/gfx950/a4w4_bpreshuffle/" + symbol + ".co";
+        const std::string path = root + "/" + co_dir + "/" + symbol + ".co";
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         AITER_CHECK(file.is_open(), "opus gfx950: cannot open code object ", path);
         const std::streamsize size = file.tellg();
@@ -45,14 +47,15 @@ private:
     }
 };
 
-inline AiterAsmKernelFast& mxfp4_co_kernel(const std::string& symbol) {
-    static SynchronizedCache<std::string, MxCoModule> cache;
-    return cache.get_or_create(symbol, [&]() { return MxCoModule(symbol); }).kernel;
+// Kernel of image <co_dir>/<symbol>.co, loaded on first use (the module cache is thread-safe).
+inline AiterAsmKernelFast& co_kernel(const std::string& symbol, const std::string& co_dir) {
+    static SynchronizedCache<std::string, CoModule> cache;
+    return cache.get_or_create(co_dir + "/" + symbol, [&]() { return CoModule(symbol, co_dir); }).kernel;
 }
 } // namespace opus_gfx950_co
 
 template <class Kargs>
-inline void opus_mxfp4_co_launch_gfx950(AiterAsmKernelFast& kernel, dim3 grid, dim3 block, Kargs& args, hipStream_t stream) {
+inline void opus_co_launch_gfx950(AiterAsmKernelFast& kernel, dim3 grid, dim3 block, Kargs& args, hipStream_t stream) {
     size_t arg_size = sizeof(args);
     kernel.launch_kernel({&args, &arg_size, int(grid.x), int(grid.y), int(grid.z), int(block.x), int(block.y), int(block.z), stream});
 }
