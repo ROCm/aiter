@@ -8,9 +8,13 @@ import torch.nn.functional as F
 import triton
 
 from aiter.ops.triton.attention.kda import fused_recurrent_kda
+from aiter.ops.triton.attention.kda_atom import fused_sigmoid_gating_delta_rule_update
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
 
 try:
     from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd as fla_kda
@@ -23,7 +27,14 @@ except ImportError:
 BACKENDS = {
     "gluon": "aiter gluon",
     "fla": "fla triton",
+    "atom_same": "atom same",
+    "atom_split": "atom split",
+    "atom_fork": "atom fork",
+    "atom_spec": "atom spec verify",
 }
+# ATOM's gating entry on gfx1250 in Kimi-K3's layouts, for each H. Only
+# atom_spec has more than one token per sequence.
+ATOM_BACKENDS = ("atom_same", "atom_split", "atom_fork", "atom_spec")
 
 K3_HEAD_DIM = 128
 K3_NUM_HEADS = [24, 12]  # 96 heads sharded tp4 / tp8
@@ -144,6 +155,73 @@ def traffic_bytes(
     return B * slab + writes + B * T * per_tok
 
 
+def make_atom_case(B, T, H, provider):
+    """Arguments of ATOM's gating entry in Kimi-K3's layouts.
+
+    beta is a view of the fused in_proj row ``[q | k | v | g | beta | f_a]``.
+    ``atom_same`` passes the write table as the read table, ``atom_split`` a
+    copy of it, and ``atom_fork`` reads each state from a slot that no sequence
+    writes. ``atom_spec`` has ``T`` tokens per sequence, a 2D write table and
+    1 to ``T`` accepted tokens.
+    """
+    D = K3_HEAD_DIM
+    tokens = B * T
+    act = {"dtype": torch.bfloat16, "device": "cuda"}
+    q, k, v, a = (torch.randn((1, tokens, H, D), **act) for _ in range(4))
+    in_proj = torch.randn((tokens, 4 * H * D + H + D), **act)
+    # Only the slots that the call reads or writes, so that a rotating pool
+    # spans the memory that it measures.
+    slots = {"atom_fork": 2 * B, "atom_spec": tokens}.get(provider, B)
+    perm = torch.randperm(slots, device="cuda").to(torch.int32)
+    write = perm[:B]
+    read = None
+    accepted = None
+    if provider == "atom_same":
+        read = write
+    elif provider == "atom_split":
+        read = write.clone()
+    elif provider == "atom_fork":
+        read = perm[B : 2 * B]
+    else:
+        write = perm[:tokens].view(B, T)
+        accepted = torch.randint(1, T + 1, (B,), dtype=torch.int32, device="cuda")
+    return {
+        "A_log": torch.randn(H, device="cuda") * 0.5,
+        "a": a,
+        "b": in_proj[:, 4 * H * D : 4 * H * D + H].unsqueeze(0),
+        "dt_bias": torch.randn(H * D, device="cuda") * 2.0,
+        "q": q,
+        "k": k,
+        "v": v,
+        "o": torch.empty((tokens, H, D), **act),
+        "initial_state": torch.randn((slots, H, D, D), device="cuda"),
+        "cu_seqlens": torch.arange(0, tokens + 1, T, dtype=torch.int32, device="cuda"),
+        "ssm_state_indices": write,
+        "ssm_state_indices_in": read,
+        "num_accepted_tokens": accepted,
+    }
+
+
+def run_atom_case(case):
+    result = fused_sigmoid_gating_delta_rule_update(
+        **case, use_qk_l2norm_in_kernel=True, is_kda=True, lower_bound=K3_LOWER_BOUND
+    )
+    # None means nothing ran, which would time an empty graph.
+    if result is None:
+        raise RuntimeError("kda_gating_kernel does not cover this case")
+    return result
+
+
+def atom_bytes(case):
+    """The activations of each token, one state read for each sequence and one
+    state write for each token."""
+    _, tokens, h, d = case["q"].shape
+    sequences = case["cu_seqlens"].numel() - 1
+    act = case["q"].element_size()
+    state = case["initial_state"].element_size()
+    return tokens * (5 * h * d + h) * act + (sequences + tokens) * h * d * d * state
+
+
 def _time(fn, args):
     """One measurement in ms; cudagraph keeps host launch cost out of the span."""
     if args.timing == "cudagraph":
@@ -254,6 +332,16 @@ def benchmark(args):
     @triton.testing.perf_report(configs)
     def bench_kda(H, B, T, provider):
         torch.manual_seed(0)
+        if provider in ATOM_BACKENDS:
+            if T != 1 and provider != "atom_spec":
+                # A 1D slot table gives each sequence one token.
+                return float("nan"), float("nan"), float("nan")
+
+            def make():
+                return make_atom_case(B, T, H, provider)
+
+            return _record_case(H, B, T, provider, make, run_atom_case, atom_bytes)
+
         inputs = make_inputs(
             B,
             T,
@@ -316,7 +404,34 @@ def benchmark(args):
             def fn():
                 fla_kda(**shared)
 
-        runs = [_time(fn, args) for _ in range(args.runs)]
+        return _record(H, B, T, provider, lambda: _time(fn, args), mem)
+
+    def _record_case(H, B, T, provider, make, run, bytes_of):
+        """Time ``run`` on ``make()``; on a pool of cases for --timing rotating."""
+        case = make()
+        if args.timing == "rotating":
+            bencher = RotatingBufferBench.from_dict(
+                {
+                    "min_pool_len": 1,
+                    "kernels_per_graph": 100,
+                    "num_replays": args.n_replays,
+                }
+            )
+            bencher.build_pool([lambda: tuple(make().values())], [tuple(case)])
+
+            def time_once():
+                ms = bencher.bench(lambda **entry: run(entry))
+                return ms, ms, ms
+
+        else:
+
+            def time_once():
+                return _time(lambda: run(case), args)
+
+        return _record(H, B, T, provider, time_once, bytes_of(case))
+
+    def _record(H, B, T, provider, time_once, mem):
+        runs = [time_once() for _ in range(args.runs)]
         med = sorted(r[0] for r in runs)[len(runs) // 2]
         lo, hi = min(r[1] for r in runs), max(r[2] for r in runs)
         best, worst = min(r[0] for r in runs), max(r[0] for r in runs)
@@ -333,15 +448,17 @@ def benchmark(args):
 
 def report_spread(spread, line_vals, line_names, args):
     name = dict(zip(line_vals, line_names))
-    flush = "no L2 flush, cache-warm" if args.timing == "cudagraph" else "L2 flushed"
+    flush, detail = {
+        "cudagraph": (
+            "no L2 flush, cache-warm",
+            f"{args.n_replays} replays x {args.graph_ms}ms/graph",
+        ),
+        "rotating": ("a pool of input sets, cold state", f"{args.n_replays} replays"),
+        "do_bench": ("L2 flushed", f"rep={args.rep}ms each"),
+    }[args.timing]
     print(
         f"\nvariability (us) -- timing={args.timing} ({flush}), "
-        + (
-            f"{args.runs} run(s) x {args.n_replays} replays "
-            f"x {args.graph_ms}ms/graph"
-            if args.timing == "cudagraph"
-            else f"{args.runs} run(s) x rep={args.rep}ms each"
-        )
+        f"{args.runs} run(s) x {detail}"
     )
     hdr = f"{'H':>4}{'B':>5}{'T':>3}  {'backend':<28}{'best':>9}{'med':>9}{'worst':>9}"
     hdr += f"{'run-run':>9}{'p20-p80':>9}"
@@ -437,12 +554,15 @@ def parse_args():
     parser.add_argument("--rep", type=int, default=100)
     parser.add_argument(
         "--timing",
-        choices=["cudagraph", "do_bench"],
+        choices=["cudagraph", "rotating", "do_bench"],
         default="cudagraph",
         help="cudagraph: capture graph_ms worth of launches and replay n_replays "
         "times, so no host work sits inside the measurement (small batch stops "
         "reporting the ~41 us/call wrapper cost) -- but no L2 flush between "
-        "iterations. do_bench: per-iteration event pairs with a 256 MB flush",
+        "iterations. rotating: a CUDA graph where each call takes the next input "
+        "set of a pool larger than the caches (RotatingBufferBench), so each "
+        "call reads a cold state, as in a decode step; atom backends only. "
+        "do_bench: per-iteration event pairs with a 256 MB flush",
     )
     parser.add_argument(
         "--n_replays",
@@ -486,8 +606,27 @@ def parse_args():
     return parser.parse_args()
 
 
+def _check_atom_shapes(args):
+    """The ATOM backends build Kimi-K3's head size, dtypes and state layout."""
+    problems = []
+    if arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"):
+        problems.append(f"gfx1250 (got {arch_info.get_arch()})")
+    if args.head_dim != K3_HEAD_DIM:
+        problems.append(f"--head_dim {K3_HEAD_DIM}")
+    if args.dtype != "bf16" or args.state_dtype != "fp32":
+        problems.append("--dtype bf16 --state_dtype fp32")
+    if not args.gate or args.fused or args.num_accepted or args.state_k_first:
+        problems.append("gate on, and no --fused, --num_accepted, or --state_k_first")
+    if problems:
+        sys.exit("atom backends need " + "; ".join(problems))
+
+
 def run_bench(args):
-    if arch_info.get_arch() not in ("gfx950", "gfx1250"):
+    if any(b in ATOM_BACKENDS for b in args.backends):
+        _check_atom_shapes(args)
+    if args.timing == "rotating" and any(b not in ATOM_BACKENDS for b in args.backends):
+        sys.exit("--timing rotating supports the atom backends only")
+    if arch_info.get_arch() not in ("gfx950", "gfx1250", "gfx1250-strict"):
         sys.exit(f"KDA gluon decode needs gfx950/gfx1250, got {arch_info.get_arch()}")
     if args.gluon_configs is None:
         # The gfx950 kernel holds the whole [V, K] state: BV == V.
