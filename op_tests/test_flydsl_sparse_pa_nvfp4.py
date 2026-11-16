@@ -628,6 +628,28 @@ def refusals():
             {"q": torch.empty(2**19 + 1, 16, D, dtype=torch.bfloat16, device="cuda")},
             "2 GiB",
         ),
+        # Exactly 2 GiB is refused too (`<`, not `<=`): the masked lanes store to a sentinel
+        # dword that is only dropped when it lies past the end of `out`, and at exactly 2 GiB
+        # it is the last dword of `out`.
+        (
+            "q exactly 2 GiB",
+            {"q": torch.empty(2**19, 16, D, dtype=torch.bfloat16, device="cuda")},
+            "2 GiB",
+        ),
+        (
+            "fp16 out",
+            {"out": torch.empty_like(c["q"], dtype=torch.float16)},
+            "bfloat16",
+        ),
+        (
+            "out of another shape",
+            {
+                "out": torch.empty(
+                    3, *c["q"].shape[1:], dtype=torch.bfloat16, device="cuda"
+                )
+            },
+            "same shape",
+        ),
     ]
     decode_only = [
         ("splits > MAX_SPLITS", {"splits": 32}, "splits must be"),
@@ -735,6 +757,25 @@ def refusals():
             else:
                 print(f"refusal: {kind} {name} was accepted")
             bad += 1
+    # Just below the limit a call still runs (prefill; decode shares the check): q and out
+    # are 2**31 - 4096 bytes, and the masked lanes of the last, partial tile store to the
+    # sentinel dword, which has to fall past the end of `out`. The rows are copies of one row.
+    n = 2**19 - 1
+    one = dict(c, q=c["q"][:1], topk=c["topk"][:, :1], row_req=c["row_req"][:1])
+    one["row_kv"] = c["row_kv"][:1]
+    ref = run_torch(one)
+    big = dict(
+        c,
+        q=c["q"][:1].repeat(n, 1, 1),
+        topk=c["topk"][:, :1].expand(-1, n, -1).contiguous(),
+        row_req=c["row_req"][:1].expand(n).contiguous(),
+        row_kv=c["row_kv"][:1].expand(n).contiguous(),
+    )
+    out = prefill_call(big)
+    for r in (0, n - 1):
+        if not check(f"q just below 2 GiB, row {r}", out[r : r + 1], ref)[0]:
+            bad += 1
+    del big, out
     decode_call(c, 16)  # the largest split count still launches
     # Past the limit the default falls back to one workgroup per unit; only an explicit
     # split count is refused.
