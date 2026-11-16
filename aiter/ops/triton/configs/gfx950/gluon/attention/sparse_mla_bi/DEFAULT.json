@@ -1,0 +1,6 @@
+{
+    "sparse_mla_bi": {
+        "num_warps": 4,
+        "fused_min_programs": 512
+    }
+}
