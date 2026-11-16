@@ -533,8 +533,17 @@ def launch_bmm_a8w8_mxscale(
                 return fx.logical_divide(buf, fx.make_layout(1, 1))
 
             # Rows past M read zero: the A and A-scale records end at the last row.
+            # A starts at this tile's first row (i64 base), so in-tile offsets
+            # stay i32 for any M.
             rows = fx.Int64(i32_m - 1)
-            a_src = _buffer(a_base, T.i8, 16, rows * lda + K)
+            a_rows_left = i32_m - blk_m
+            a_tile_rows = (a_rows_left < tile_m).select(a_rows_left, fx.Int32(tile_m))
+            a_src = _buffer(
+                a_base + fx.Int64(blk_m) * lda,
+                T.i8,
+                16,
+                fx.Int64(a_tile_rows - 1) * lda + K,
+            )
             sa_records = (
                 fx.Int64(i32_m) * (K // x_scale_k)
                 if x_scale_transposed
@@ -711,12 +720,12 @@ def launch_bmm_a8w8_mxscale(
                 base = stage * pitch
                 for i in range_constexpr(copies_a):
                     if const_expr(a_lane is not None):
-                        src = a_lane + (blk_m + i * a_rows) * lda + kt * tile_k
+                        src = a_lane + i * a_rows * lda + kt * tile_k
                     else:
                         lin = (i * threads + tid) * 16
                         row = lin // tile_k
                         col = (lin % tile_k) ^ ((row % k_blk16) * 16)
-                        src = (blk_m + row) * lda + kt * tile_k + col
+                        src = row * lda + kt * tile_k + col
                     _dma(copy16, a_src, src, base + (i * threads + wave * WAVE) * 16)
                 for i in range_constexpr(copies_b):
                     if const_expr(b_lane is not None):
