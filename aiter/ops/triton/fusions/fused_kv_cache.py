@@ -654,6 +654,7 @@ def fused_qk_rope_reshape_and_cache(
     -     the NVFP4 cache.
     - saturate_fp8: clamp the scaled k and v to the FP8 cache dtype's range before
     -     the FP8 cast, so an out-of-range value is stored as +-max and not as NaN.
+    -     It has no effect on a BF16 or NVFP4 cache. Not on the A8K4V8 cache (ValueError).
 
     T is the number of decode tokens, T_cache * block_size is the max number of tokens of kv_cache
     QH must be multiple of KH
@@ -806,6 +807,10 @@ def fused_qk_rope_reshape_and_cache(
             q_norm_weight = q_norm_weight.contiguous()
     else:
         assert q_norm_weight is None, "q_norm_weight needs k_norm_weight"
+    if saturate_fp8 and k4v8:
+        raise ValueError(
+            "saturate_fp8 is not supported on the A8K4V8 cache (NVFP4 K, FP8 V)"
+        )
     saturate_fp8 = saturate_fp8 and kv_cache_dtype == e4m3_dtype
 
     if q_out is None and have_q:

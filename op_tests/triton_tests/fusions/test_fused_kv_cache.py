@@ -943,6 +943,36 @@ def test_fused_qk_rope_reshape_and_cache_qk_norm_strided_weights(T: int):
         assert torch.equal(got, want)
 
 
+def test_fused_qk_rope_reshape_and_cache_saturate_fp8_refuses_a8k4v8():
+    """saturate_fp8 is refused on the A8K4V8 cache, not ignored."""
+    T, KH, D, block_size, num_blocks = 4, 2, 64, 64, 2
+    k = torch.randn((T, KH, D), dtype=torch.bfloat16, device="cuda")
+    cos = torch.randn((T, 1, 1, D // 2), dtype=torch.bfloat16, device="cuda")
+    key_cache = torch.zeros(
+        (num_blocks, KH, block_size, D // 2 + D // 16), dtype=torch.uint8, device="cuda"
+    )
+    value_cache = torch.zeros(
+        (num_blocks, KH, block_size // 16, D, 16), dtype=e4m3_dtype, device="cuda"
+    )
+    with pytest.raises(ValueError, match="saturate_fp8"):
+        fused_qk_rope_reshape_and_cache(
+            k.clone(),
+            k,
+            torch.randn_like(k),
+            key_cache,
+            value_cache,
+            torch.arange(T, device="cuda"),
+            torch.arange(T, device="cuda"),
+            cos,
+            cos,
+            None,
+            torch.ones(1, dtype=torch.float32, device="cuda"),
+            True,
+            flash_layout=False,
+            saturate_fp8=True,
+        )
+
+
 # gpt-oss-120b config: hidden_size=2880, num_attention_heads=64, num_key_value_heads=8, head_dim=64
 GPT_OSS_120B_HEAD_DIM = 64
 GPT_OSS_120B_NUM_ATTENTION_HEADS = 64
