@@ -36,19 +36,19 @@ A operand with the e8m0 byte as block scale; the e4m3 Q option (`q_fp8`) belongs
 that path. Layout and contract: `_validate_cache`.
 
 An NVFP4 index cache (e2m1 pages, one e4m3 scale per 16 elements, no per-tensor
-scale: `score_prefill_flydsl_nvfp4`) takes the fp8 path's compute unchanged for
-`k_round="e4m3"` and changes only how a page reaches LDS (`"exact"` below changes the
-MFMA too): each thread widens its 16 B of e2m1 (with its
-two scale bytes, through a per-CTA LDS table of e4m3_rn_satfinite(mag * scale)) into
-32 e4m3 bytes in natural element order, so the page the MFMAs read is exactly an fp8
-page of K = e4m3_rn_satfinite(e2m1 * scale). One dequant per page per thread,
-amortised over every query row of the tile, instead of one per wave as in decode.
+scale: `score_prefill_flydsl_nvfp4`) changes how a page reaches LDS: each thread
+widens its 16 B of e2m1 (with its two scale bytes, through a per-CTA LDS table of
+e4m3_rn_satfinite(mag * scale)) into 32 e4m3 bytes, each 8 elements as the evens then
+the odds (the order `fp4_dword_to_e4m3` emits; `stage_q_lds` permutes Q to match), and
+the MFMAs then run the fp8 path on that page, K = e4m3_rn_satfinite(e2m1 * scale). One
+dequant per page per thread, amortised over every query row of the tile, instead of one
+per wave as in decode.
 That is `k_round="e4m3"` (the default): K is `e2m1 * scale` rounded to e4m3 (RNE,
 saturating at 448), the product the op test's torch oracle scores.
 `k_round="exact"` keeps K = e2m1 * scale unrounded: e2m1 * e4m3 scale is exact in f16
-(and so is the e4m3 Q), so the page is widened to f16 in LDS (32 KB; one convert and
-one packed multiply per element pair, no table) and scored on the 16x16x32 f16 MFMA,
-four chained k-steps per (token tile, query tile).
+(and so is the e4m3 Q), so the page is widened to f16 in LDS in natural element order
+(32 KB; one convert and one packed multiply per element pair, no table) and scored on
+the 16x16x32 f16 MFMA, four chained k-steps per (token tile, query tile).
 
 Layout contract: this kernel and the decode scorer read the SAME cache and so
 must agree on the k-axis map. The shape constants come from that module rather
@@ -539,6 +539,7 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
     RAW_DATA = PAGE // WAVES * DATA_BYTES
     RAW_SCALE = PAGE // WAVES * NVFP4_SCALE_BYTES
     RAW_W = RAW_DATA + RAW_SCALE
+    RAW_HALF = RAW_DATA // 2  # one 16 B-per-lane DMA pass of a wave's codes
     if DMA:
         _fields["raw"] = fx.Array[fx.Uint8, 2 * WAVES * RAW_W, 16]
         _lut_bytes += 2 * WAVES * RAW_W
@@ -1256,7 +1257,8 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
             # + tid: token f // 4, elements 32*(f % 4).. -- 16 B of e2m1 -- and the
             # scale halfword f (two e4m3 bytes, groups 2q and 2q+1). It writes fp8
             # chunks 2f and 2f+1 of the row-major fp8 page, which is where the fp8
-            # path's readback expects elements 16*(2f%8)... Natural element order.
+            # path's readback expects elements 16*(2f%8)..., in `fp4_dword_to_e4m3`'s
+            # order (evens then odds per 8 elements; `stage_q_lds` permutes Q to match).
             F_CHUNKS = PAGE * DATA_BYTES // ACCESS_BYTES
             PER_THREAD_F = F_CHUNKS // NTHREADS
             if F_CHUNKS % NTHREADS:
@@ -1387,7 +1389,7 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
                 for h in range_constexpr(2):
                     fx.rocdl.raw_ptr_buffer_load_async_lds(
                         dres,
-                        _raw_lds(base + fx.Int32(1024 * h)),
+                        _raw_lds(base + fx.Int32(RAW_HALF * h)),
                         fx.Int32(16).ir_value(),
                         (
                             wave_u * fx.Int32(RAW_DATA)
@@ -1426,7 +1428,7 @@ def build_prefill_score(g, k_fp4=False, q_fp8=False, nvfp4=None):
                 codes = []
                 for h in range_constexpr(2):
                     v = fx.Vector(
-                        _raw_at(base + fx.Int32(1024 * h), 16).load()
+                        _raw_at(base + fx.Int32(RAW_HALF * h), 16).load()
                     ).bitcast(fx.Int32)
                     codes += [fx.Int32(v[i]) for i in range_constexpr(4)]
                 sc = fx.Vector(
@@ -2368,8 +2370,10 @@ def score_prefill_flydsl(
     total_q, heads, head_dim = idx_q.shape
     two_view = k_scale is not None
     k_fp4 = two_view and nvfp4 is None
-    if nvfp4 is not None and (nvfp4 not in NVFP4_ROUNDINGS or not two_view):
+    if nvfp4 is not None and nvfp4 not in NVFP4_ROUNDINGS:
         raise ValueError(f"nvfp4: k_round must be one of {NVFP4_ROUNDINGS}")
+    if nvfp4 is not None and not two_view:
+        raise ValueError("nvfp4: k_scale is required")
     if k_fp4:
         # per_1x32_f4_quant hands back fp4x2 / e8m0: take those as they are. Same
         # bytes either way, so the uint8 view is only a reinterpretation. NVFP4 takes
