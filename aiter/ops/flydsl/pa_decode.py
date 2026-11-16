@@ -866,7 +866,8 @@ def pa_decode(
             and quantized_output.is_contiguous()
         ):
             raise ValueError(
-                "quantized PA output requires contiguous query/output tensors"
+                "quantized PA output requires contiguous query, output and "
+                "quantized_output tensors"
             )
         if not output_scale.is_contiguous():
             raise ValueError("output_scale must be contiguous")

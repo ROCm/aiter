@@ -388,8 +388,10 @@ class Gfx1250ClusterMerge:
                     else:
                         fx.ptr_store(acc.to(t.q_dtype), target)
         if const_expr(self.quant is not None):
-            # The first partition's maxima of the sequence's rows; only the
-            # owner of a row read its entry, before merging it.
+            # The first partition's maxima of the sequence's rows. The owner
+            # of a row read its entry before merging it; other waves' padding
+            # rows, clamped to the last row, also load it before the cluster
+            # barrier, but discard it.
             self.quant.store_cluster(
                 seq,
                 lane,
@@ -421,8 +423,8 @@ class Gfx1250OutputQuant:
       straddle a token; unit maxima meet in LDS behind one workgroup barrier.
     * ``store_cluster``: a cluster merge in which each wave owns whole rows.
       A wave keeps a row's maximum in the first partition's ``pmax`` entry of
-      the row, which only that wave has read; one cluster barrier publishes
-      them.
+      the row, which it has read (padding rows clamped to the last row also
+      read it, and discard it); one cluster barrier publishes them.
 
     The BF16/FP16 output is written only when the caller keeps it.
     """
@@ -466,6 +468,8 @@ class Gfx1250OutputQuant:
                     value = fx.maxnumf(value, fx.Float32(-t.FP8_MAX))
                     value = fx.minnumf(value, fx.Float32(t.FP8_MAX))
                     pair.append(value.ir_value())
+                # Keep this raw intrinsic: FlyDSL 0.5.0 has no typed packed-FP8
+                # conversion.
                 word = fx.rocdl.cvt_pk_fp8_f32(T.i32, pair[0], pair[1], word, half)
             words.append(word)
         if const_expr(floats.numel == 2):
@@ -564,8 +568,8 @@ class Gfx1250OutputQuant:
 
         ``rows`` lists this wave's (row, valid, value, offset), ``valid``
         None when every row is real. ``row_maxima`` holds one float per row
-        that only the row's owner has read; every wave of the cluster must
-        call this or ``sync``.
+        that its owner has read; only discarded padding rows also read it.
+        Every wave of the cluster must call this or ``sync``.
         """
         t, g = self.t, self.t.query_group_size
         for row, valid, value, _ in rows:
