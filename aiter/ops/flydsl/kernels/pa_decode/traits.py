@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -1351,6 +1352,10 @@ class Gfx1250Traits:
     # Page128 cluster CTAs take fixed runs of tiles sized by the host, with
     # partials at slot sequence * cluster_merge + part.
     cluster_runs: bool = False
+    # Emit OCP FP8 plus one FP32 descale per logical query token.
+    quant_output: bool = False
+    # With quant_output, False drops the BF16/FP16 store of the final output.
+    store_output: bool = True
 
     WAVE = 32
     NWARP = 4
@@ -1659,8 +1664,16 @@ class Gfx1250Traits:
         return self.p_offset + self.p_bytes
 
     @property
-    def total_bytes(self):
+    def quant_offset(self):
+        # Per-wave maxima of the FP8 output epilogue's gcd(GQA, 16)-row units.
+        # No loop stage uses them, so a wave can publish its maxima while
+        # others still read P.
         return self.stats_offset + 576
+
+    @property
+    def total_bytes(self):
+        units = self.m_tiles * 16 // math.gcd(self.query_group_size, 16)
+        return self.quant_offset + (units * self.NWARP * 4 if self.quant_output else 0)
 
     @property
     def use_tdm(self):
