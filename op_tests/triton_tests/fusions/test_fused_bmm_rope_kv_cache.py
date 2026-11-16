@@ -434,20 +434,34 @@ def test_fused_fp4_bmm_rope_odd_k_tail_masks(D_q_nope: int, dtype: torch.dtype):
 
 
 def _make_fp8_bmm_mla_inputs(
-    T, seed=0, q_out_dtype="fp8", num_decode=0, is_neox=False, reuse_freqs=True
+    T,
+    seed=0,
+    q_out_dtype="fp8",
+    num_decode=0,
+    is_neox=False,
+    reuse_freqs=True,
+    QH=8,
+    KH=1,
+    N=512,
+    K=192,
+    d_pe=64,
+    group_size=128,
+    extra_k_rows=0,
+    dtype=torch.bfloat16,
 ):
-    if not arch_info.is_fp8_avail():
-        pytest.skip("FP8 is not available on this device")
+    # The limits of the FP8 output checks below are measured on gfx950 only.
+    if arch_info.get_arch() != "gfx950":
+        pytest.skip("The FP8 output tests are validated on gfx950 only")
 
     q_nope, w_k, w_k_scale, _, _ = generate_batched_gemm_a16w8_inputs(
-        8, T, 512, 192, torch.bfloat16, False, False, transpose_bm=True
+        QH, T, N, K, torch.bfloat16, False, False, transpose_bm=True
     )
     _, _, _, _, _, positions, _, cos, sin = generate_rope_inputs(
         1,
         T,
-        1,
-        8,
-        64,
+        KH,
+        QH // KH,
+        d_pe,
         cached=True,
         reuse_freqs_front_part=reuse_freqs,
         nope=False,
@@ -455,31 +469,35 @@ def _make_fp8_bmm_mla_inputs(
         offs=False,
         two_inputs=True,
         layout="thd",
-        dtype=torch.bfloat16,
+        dtype=dtype,
     )
     torch.manual_seed(seed)
     q_nope.normal_()
     q_nope[..., :128].mul_(0.25)
     w_k.copy_(torch.randn_like(w_k, dtype=torch.bfloat16) * 0.25)
     w_k_scale.fill_(0.5)
-    q_pe = torch.randn((T, 8, 64), dtype=torch.bfloat16, device="cuda")
-    k_nope = torch.randn((T, 1, 512), dtype=torch.bfloat16, device="cuda")
-    k_rope = torch.randn((T, 1, 64), dtype=torch.bfloat16, device="cuda")
+    q_pe = torch.randn((T, QH, d_pe), dtype=dtype, device="cuda")
+    # The op accepts more K rows than query tokens.
+    k_rows = T + extra_k_rows
+    k_nope = torch.randn((k_rows, KH, N), dtype=dtype, device="cuda")
+    k_rope = torch.randn((k_rows, KH, d_pe), dtype=dtype, device="cuda")
     # Leave cache rows on both sides untouched by the call.
-    kv_cache = torch.full((T + 7, 1, 576), 0.25, dtype=w_k.dtype, device="cuda")
+    kv_cache = torch.full(
+        (k_rows + 7, KH, N + d_pe), 0.25, dtype=w_k.dtype, device="cuda"
+    )
     return {
-        "q_nope": q_nope,
+        "q_nope": q_nope.to(dtype),
         "w_k": w_k,
         "w_k_scale": w_k_scale,
         "q_pe": q_pe,
         "k_nope": k_nope,
         "k_rope": k_rope,
         "kv_cache": kv_cache,
-        "slot_mapping": torch.randperm(T, device="cuda") + 3,
+        "slot_mapping": torch.randperm(k_rows, device="cuda") + 3,
         "positions": positions,
         "cos": cos.roll(seed, dims=0)[:, None, None, :],
         "sin": sin.roll(seed, dims=0)[:, None, None, :],
-        "group_size": 128,
+        "group_size": group_size,
         "transpose_bm": True,
         "k_scale": torch.full((), 0.75, dtype=torch.float32, device="cuda"),
         "is_neox": is_neox,
@@ -512,7 +530,9 @@ def _reference_fp8_bmm_mla(inputs):
     kv_cache = inputs["kv_cache"].clone()
     num_decode = inputs["num_decode_toks_for_zeros"]
     decode_q_pe = torch.empty(
-        (num_decode, 8, 64), dtype=inputs["q_nope"].dtype, device=q_nope.device
+        (num_decode, *inputs["q_pe"].shape[1:]),
+        dtype=inputs["q_nope"].dtype,
+        device=q_nope.device,
     )
     q, decode_q_pe, k_pe, zeros = fused_qk_rope_cat_and_cache_mla(
         q_nope,
@@ -540,23 +560,19 @@ def _fp8_value_index(x):
     return torch.where(code >= 0x80, -magnitude, magnitude)
 
 
-def _assert_fp8_bmm_mla_projection(actual, expected):
-    actual = actual[0][..., :512]
-    expected = expected[0][..., :512]
-    if actual.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+def _assert_fp8_bmm_mla_projection(inputs, actual, expected):
+    kv_lora_rank = inputs["k_nope"].shape[-1]
+    actual = actual[0][..., :kv_lora_rank]
+    expected = expected[0][..., :kv_lora_rank]
+    if actual.dtype != torch.float8_e4m3fn:
         torch.testing.assert_close(
             actual.float(), expected.float(), atol=1e-2, rtol=1e-1
         )
         return
 
-    # The kernel and the reference each round an FP32 value to FP8. Rounding
-    # is monotonic. Thus two FP32 values that differ by less than one e4m3
-    # step give the same FP8 value or adjacent FP8 values. They give adjacent
-    # values only when a rounding boundary is between them. An e4m3 step is
-    # at least 2**-4 of the value. Thus a relative FP32 difference of 2**-13
-    # lets at most 2**-9 of the elements differ. A different FP32 summation
-    # order gives a smaller difference. An error in the projection gives a
-    # larger one: an error of 1% changes more than 10% of the elements.
+    # The device rounds the FP8 dot products in another way than the Torch
+    # reference, so a few outputs get the adjacent e4m3 value. The limit is
+    # about five times the largest part that was measured on gfx950.
     assert not torch.isnan(actual.float()).any()
     steps = (_fp8_value_index(actual) - _fp8_value_index(expected)).abs()
     assert steps.max().item() <= 1, "FP8 projection is not within one e4m3 step"
@@ -571,9 +587,10 @@ def _assert_fp8_bmm_mla_state(inputs, actual, expected, expected_cache):
         assert result.dtype == reference.dtype
         assert result.device == reference.device
 
+    kv_lora_rank = inputs["k_nope"].shape[-1]
     torch.testing.assert_close(
-        actual[0][..., 512:].float(),
-        expected[0][..., 512:].float(),
+        actual[0][..., kv_lora_rank:].float(),
+        expected[0][..., kv_lora_rank:].float(),
         atol=0,
         rtol=0,
     )
@@ -590,7 +607,7 @@ def _assert_fp8_bmm_mla_state(inputs, actual, expected, expected_cache):
 def _assert_fp8_bmm_mla_result(inputs, actual, expected, expected_cache):
     # Check the state first. A projection difference must not hide a state error.
     _assert_fp8_bmm_mla_state(inputs, actual, expected, expected_cache)
-    _assert_fp8_bmm_mla_projection(actual, expected)
+    _assert_fp8_bmm_mla_projection(inputs, actual, expected)
 
 
 def _assert_same_tensor_bytes(actual, expected):
@@ -637,21 +654,9 @@ def fp8_bmm_routes(monkeypatch):
     return launches
 
 
-def _has_fp8_prefill_route():
-    return arch_info.get_arch() == "gfx950"
-
-
 def _fp8_route(T):
-    """The route of an eligible call with T tokens on this device."""
-    if _has_fp8_prefill_route() and 11072 <= T <= 32768:
-        return "prefill"
-    return "generic"
-
-
-def _skip_without_fp8_prefill_route(T=11072):
-    # Sizes from 11071 tokens are only there to test the gfx950 prefill route.
-    if T >= 11071 and not _has_fp8_prefill_route():
-        pytest.skip("The FP8 pure-prefill route is only on gfx950")
+    """The route of an eligible call with T tokens."""
+    return "prefill" if 11072 <= T <= 32768 else "generic"
 
 
 @pytest.mark.parametrize(
@@ -674,7 +679,6 @@ def _skip_without_fp8_prefill_route(T=11072):
     ],
 )
 def test_fused_fp8_bmm_mla_fp8_output(T, fp8_bmm_routes):
-    _skip_without_fp8_prefill_route(T)
     inputs = _make_fp8_bmm_mla_inputs(T)
     expected, expected_cache = _reference_fp8_bmm_mla(inputs)
     actual = fused_fp8_bmm_rope_cat_and_cache_mla(**inputs)
@@ -741,10 +745,11 @@ def test_fused_fp8_bmm_mla_query_views(padded):
         ("bf16-output", "generic"),
         ("unsupported-query-stride", "generic"),
         ("explicit-config", "generic"),
+        ("no-transpose-bm", "generic"),
+        ("noncontiguous-weight", "generic"),
     ],
 )
 def test_fused_fp8_bmm_mla_prefill_route_variants(variant, route, fp8_bmm_routes):
-    _skip_without_fp8_prefill_route()
     T = 11073
     inputs = _make_fp8_bmm_mla_inputs(
         T,
@@ -761,6 +766,11 @@ def test_fused_fp8_bmm_mla_prefill_route_variants(variant, route, fp8_bmm_routes
     if variant == "explicit-config":
         # Give the wrapper the config that it loads for the generic route.
         inputs["config"], _ = fused_bmm_module._get_fp8_config(T, 512, 192)
+    if variant == "no-transpose-bm":
+        inputs["transpose_bm"] = False
+    if variant == "noncontiguous-weight":
+        # The same weights as a view of a (QH, P, kv_lora_rank) tensor.
+        inputs["w_k"] = inputs["w_k"].transpose(1, 2).contiguous().transpose(1, 2)
     queries = None
     widths = {
         "query-view": 192,
@@ -778,9 +788,40 @@ def test_fused_fp8_bmm_mla_prefill_route_variants(variant, route, fp8_bmm_routes
         _assert_same_tensor_bytes(queries, before)
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"QH": 16},
+        {"KH": 2},
+        {"N": 256},
+        {"K": 256},
+        {"group_size": 64},
+        {"d_pe": 32},
+        {"extra_k_rows": 3},
+        {"dtype": torch.float16},
+    ],
+    ids=[
+        "query-heads",
+        "kv-heads",
+        "kv-lora-rank",
+        "nope-dim",
+        "group-size",
+        "rope-dim",
+        "key-rows",
+        "float16-inputs",
+    ],
+)
+def test_fused_fp8_bmm_mla_excluded_inputs_use_generic_route(overrides, fp8_bmm_routes):
+    # Each case has a token count of the prefill route and one excluded input.
+    inputs = _make_fp8_bmm_mla_inputs(11073, **overrides)
+    expected, expected_cache = _reference_fp8_bmm_mla(inputs)
+    actual = fused_fp8_bmm_rope_cat_and_cache_mla(**inputs)
+    assert fp8_bmm_routes == ["generic"]
+    _assert_fp8_bmm_mla_result(inputs, actual, expected, expected_cache)
+
+
 @pytest.mark.parametrize("T", [11072, 16385, 32768])
 def test_fused_fp8_bmm_mla_prefill_route_equals_generic_route(T, fp8_bmm_routes):
-    _skip_without_fp8_prefill_route()
     inputs = _make_fp8_bmm_mla_inputs(T)
     # The same data with a query stride that only the generic route accepts.
     generic_inputs = dict(inputs)
@@ -800,10 +841,8 @@ def test_fused_fp8_bmm_mla_prefill_route_equals_generic_route(T, fp8_bmm_routes)
 def test_fused_fp8_bmm_mla_shape_alternation_preserves_inputs_and_outputs(
     fp8_bmm_routes,
 ):
-    sizes = (64, 65, 1856, 64)
-    if _has_fp8_prefill_route():
-        # Go from the generic route to the prefill route and back.
-        sizes = (64, 11073, 65, 24577, 1856, 64)
+    # Go from the generic route to the prefill route and back.
+    sizes = (64, 11073, 65, 24577, 1856, 64)
     retained = []
     for seed, T in enumerate(sizes):
         inputs = _make_fp8_bmm_mla_inputs(T, seed=seed)
@@ -826,7 +865,6 @@ def test_fused_fp8_bmm_mla_shape_alternation_preserves_inputs_and_outputs(
 
 @pytest.mark.parametrize("T", [1856, 32768])
 def test_fused_fp8_bmm_mla_graph_replay_reads_current_inputs(T):
-    _skip_without_fp8_prefill_route(T)
     inputs = _make_fp8_bmm_mla_inputs(T)
     fused_fp8_bmm_rope_cat_and_cache_mla(**inputs)
     torch.cuda.synchronize()
