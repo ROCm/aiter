@@ -305,6 +305,16 @@ table for each op (`attn_2d`, `attn_3d`, `reduce`, `kv_split`) and a
 - Do not use `any` in a three-dtype key. Do not write a three-dtype key with
   the same V and K tags: the loader never tries it.
 
+## KDA batch invariant
+
+`kda_bi_fwd` reads `<arch>/gluon/attention/kda_bi/DEFAULT.json` with
+`resolve_config_dir()` and `load_config_json()`. The file has one entry per
+kernel: `intra` (`num_warps`), `state` and `out` (`num_warps`, `bv`, the V
+block). There are no shape keys: the launch values are fixed so that the
+output bits do not depend on the batch. The bits do not depend on `bv`
+either, so `bv` can be retuned; `num_warps` and the kernels' layouts cannot
+change without a new `BI_CONTRACT_VERSION`.
+
 ## Autotune
 
 - Give every `@triton.autotune` its list through

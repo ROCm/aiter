@@ -1,0 +1,5 @@
+{
+    "intra": {"num_warps": 4},
+    "state": {"num_warps": 4, "bv": 16},
+    "out": {"num_warps": 4, "bv": 64}
+}
