@@ -5,14 +5,7 @@ import pytest
 import torch
 
 import aiter.ops.triton.attention.fp8_mqa_logits as mqa_module
-from aiter.ops.triton.attention.fp8_mqa_logits import (
-    ASYNC_COPY_SUPPORTS_DISTRIBUTED,
-    FOLDED_REDUCTED_SUPPORT,
-    fp8_mqa_logits,
-)
-from aiter.ops.triton.attention.fp8_mqa_logits import (
-    arch as mqa_arch,
-)
+from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.utils.types import get_fp8_dtypes
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
@@ -262,21 +255,73 @@ def test_fp8_mqa_logits_nonzero_cu_start(
     assert diff < 1e-4, f"{diff=}"
 
 
-@pytest.fixture(params=["auto", "forced"])
-def rows8_dispatch(request, monkeypatch):
-    """Run with the automatic dispatch and with the eight-row occupancy check
-    bypassed, so small shapes still exercise the eight-row kernel."""
-    if request.param == "forced":
-        monkeypatch.setattr(
-            mqa_module,
-            "_gfx950_rows8_launch",
-            functools.partial(
-                mqa_module._gfx950_rows8_launch, require_full_waves=False
-            ),
-        )
-    return request.param
+# The tests from here to test_fp8_mqa_logits_rows8_empty_output cover the gfx950
+# eight-row path. It needs a Triton build with the folded head reduction.
+requires_rows8 = pytest.mark.skipif(
+    not (
+        mqa_module.arch == "gfx950"
+        and e4m3_type == torch.float8_e4m3fn
+        and mqa_module.ASYNC_COPY_SUPPORTS_DISTRIBUTED
+        and mqa_module.FOLDED_REDUCTED_SUPPORT
+    ),
+    reason="Requires the gfx950 eight-row path",
+)
 
 
+class _RouteProbe(Exception):
+    """Stops a call after the wrapper selects a kernel."""
+
+
+@pytest.fixture
+def mqa_launches(monkeypatch):
+    """Record the Gluon kernel of each wrapper launch: "existing" or "rows8".
+
+    With ``launches.probe = True`` the launch raises _RouteProbe and no kernel
+    runs.
+    """
+
+    class _Launches(list):
+        probe = False
+
+    launches = _Launches()
+
+    class _Recorder:
+        def __init__(self, name, kernel):
+            self.name, self.kernel = name, kernel
+
+        def __getitem__(self, grid):
+            launches.append(self.name)
+            if launches.probe:
+                raise _RouteProbe(self.name)
+            return self.kernel[grid]
+
+    for name, attr in (
+        ("existing", "_gluon_fp8_mqa_logits_kernel"),
+        ("rows8", "_gluon_fp8_mqa_logits_rows8_kernel"),
+    ):
+        kernel = getattr(mqa_module, attr)
+        if kernel is not None:
+            monkeypatch.setattr(mqa_module, attr, _Recorder(name, kernel))
+    return launches
+
+
+@pytest.fixture
+def rows8_forced(monkeypatch):
+    """Skip the minimum grid size, so that small shapes run the eight-row kernel."""
+    monkeypatch.setattr(
+        mqa_module,
+        "_gfx950_rows8_launch",
+        functools.partial(mqa_module._gfx950_rows8_launch, check_min_programs=False),
+    )
+
+
+@requires_rows8
+def test_fp8_mqa_logits_rows8_kernel_is_available():
+    """A failed import of the eight-row kernel must not pass as a fallback."""
+    assert mqa_module._gluon_fp8_mqa_logits_rows8_kernel is not None
+
+
+@requires_rows8
 @pytest.mark.parametrize(
     "s_q,s_k,expected",
     [
@@ -284,13 +329,18 @@ def rows8_dispatch(request, monkeypatch):
         (24, 4223, False),
         (64, 573440, False),
         (4096, 4095, False),
+        (2048, 16384, False),
+        (1024, 49152, False),
+        (4096, 4096, True),
         (4096, 8192, True),
         (4104, 8192, True),
+        (2048, 32768, True),
+        (1024, 65536, True),
         (1856, 116480, True),
     ],
 )
-def test_fp8_mqa_logits_rows8_occupancy_gate(s_q, s_k, expected):
-    """The eight-row path needs a grid that fills every SIMD at its waves."""
+def test_fp8_mqa_logits_rows8_gate(s_q, s_k, expected):
+    """The eight-row path needs min_programs programs and min_seq_len_kv keys."""
     assert (mqa_module._gfx950_rows8_launch(s_q, s_k) is not None) == expected
 
 
@@ -298,25 +348,36 @@ def _strided_test_tensor(tensor):
     storage = torch.empty(
         tuple(2 * size + 1 for size in tensor.shape),
         dtype=tensor.dtype,
-        device=tensor.device,
+        device="cuda",
     )
     view = storage[tuple(slice(1, None, 2) for _ in tensor.shape)]
     view.copy_(tensor)
     return view
 
 
-def _long_kv_test_inputs(s_q, s_k, num_heads, head_dim, strided=False):
+def _long_kv_test_inputs(
+    s_q, s_k, num_heads=32, head_dim=128, strided=False, requests=0
+):
+    """FP8 inputs with ragged windows. With ``requests``, each request has causal
+    windows in its own keys, and its first row is inside an eight-row group."""
     q = torch.randn(s_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(s_k, head_dim, device="cuda", dtype=torch.bfloat16)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
     q_fp8 = q.to(e4m3_type)
     weights = torch.randn(s_q, num_heads, device="cuda", dtype=torch.float32)
     if strided:
-        q_fp8, kv_fp8, weights = (
-            _strided_test_tensor(tensor) for tensor in (q_fp8, kv_fp8, weights)
-        )
+        q_fp8, weights = _strided_test_tensor(q_fp8), _strided_test_tensor(weights)
 
     row = torch.arange(s_q, dtype=torch.int32, device="cuda")
+    if requests:
+        # Request r starts at row r * (s_q // requests) + r.
+        first_row = torch.arange(requests, dtype=torch.int32, device="cuda")
+        first_row = (first_row * (s_q // requests) + first_row).clamp_max(s_q)
+        owner = torch.searchsorted(first_row, row, right=True).to(torch.int32) - 1
+        keys = s_k // requests
+        starts = owner * keys
+        ends = (starts + 1 + (row - first_row[owner]) * 3).clamp_max(starts + keys)
+        return q_fp8, kv_fp8, scales, weights, starts, ends
     phase = (row + row // 8) % 8
     starts = (row * 131) % (s_k - 1)
     starts = torch.where(phase == 5, s_k - 1, starts)
@@ -327,6 +388,12 @@ def _long_kv_test_inputs(s_q, s_k, num_heads, head_dim, strided=False):
     lengths = torch.where(phase == 6, 127 + (row // 8) % 3, lengths)
     ends = (starts + lengths).clamp_max(s_k)
     return q_fp8, kv_fp8, scales, weights, starts, ends
+
+
+def _window_mask(inputs):
+    starts, ends = inputs[4], inputs[5]
+    cols = torch.arange(inputs[1].shape[0], device="cuda")
+    return (cols[None, :] >= starts[:, None]) & (cols[None, :] < ends[:, None])
 
 
 def _check_long_kv_logits(logits, inputs, clean_logits=False):
@@ -354,92 +421,187 @@ def _check_long_kv_logits(logits, inputs, clean_logits=False):
                 )
 
 
+@requires_rows8
 @pytest.mark.parametrize(
-    "s_q,s_k,num_heads,head_dim,clean_logits,strided",
+    "s_q,s_k,variant,forced,route",
     [
-        pytest.param(7, 4096, 32, 128, False, False, id="row-below-eight"),
-        pytest.param(8, 4095, 32, 128, False, False, id="short-kv"),
-        pytest.param(8, 4096, 32, 128, False, False, id="eight-rows"),
-        pytest.param(8, 4097, 32, 128, False, False, id="key-tail"),
-        pytest.param(9, 4097, 32, 128, False, False, id="row-tail"),
-        pytest.param(24, 4223, 32, 128, False, False, id="three-groups"),
-        pytest.param(4096, 4097, 32, 128, False, False, id="many-groups"),
-        pytest.param(4098, 4097, 32, 128, False, False, id="two-row-fallback"),
-        pytest.param(4104, 4097, 32, 128, False, False, id="many-groups-tail"),
-        pytest.param(8, 4097, 32, 128, True, False, id="clean-output"),
-        pytest.param(8, 4097, 64, 128, False, False, id="other-head-count"),
-        pytest.param(8, 4097, 32, 64, False, False, id="other-head-size"),
-        pytest.param(16, 4097, 32, 128, False, True, id="strided-inputs"),
+        pytest.param(8, 4096, "", False, "existing", id="few-rows"),
+        pytest.param(4096, 4097, "", False, "rows8", id="many-groups"),
+        pytest.param(4104, 4097, "", False, "rows8", id="key-tail"),
+        pytest.param(4096, 8192, "requests", False, "rows8", id="requests"),
+        pytest.param(2048, 32768, "", False, "rows8", id="two-splits"),
+        pytest.param(4098, 4097, "", False, "existing", id="row-tail"),
+        pytest.param(4096, 4095, "", False, "existing", id="short-kv"),
+        pytest.param(4096, 4097, "clean", False, "existing", id="clean"),
+        pytest.param(4096, 4097, "64-heads", False, "existing", id="64-heads"),
+        pytest.param(4096, 4097, "64-wide", False, "existing", id="64-wide"),
+        pytest.param(8, 4096, "", True, "rows8", id="forced-one-group"),
+        pytest.param(8, 4097, "", True, "rows8", id="forced-key-tail"),
+        pytest.param(24, 4223, "", True, "rows8", id="forced-groups"),
+        pytest.param(24, 4223, "requests", True, "rows8", id="forced-requests"),
+        pytest.param(16, 4097, "strided", True, "rows8", id="forced-strided"),
+        pytest.param(9, 4097, "", True, "existing", id="forced-row-tail"),
+        pytest.param(8, 4095, "", True, "existing", id="forced-short-kv"),
     ],
 )
 @torch.inference_mode()
 def test_fp8_mqa_logits_long_kv_windows(
-    s_q, s_k, num_heads, head_dim, clean_logits, strided, rows8_dispatch
+    s_q, s_k, variant, forced, route, request, mqa_launches
 ):
-    """Check long-KV row groups and their public-wrapper fallback cases."""
+    """Each case runs the expected kernel and matches the FP32 reference."""
+    if forced:
+        request.getfixturevalue("rows8_forced")
     torch.manual_seed(0)
-    inputs = _long_kv_test_inputs(s_q, s_k, num_heads, head_dim, strided)
-    logits = fp8_mqa_logits(*inputs, clean_logits=clean_logits)
-    _check_long_kv_logits(logits, inputs, clean_logits)
+    inputs = _long_kv_test_inputs(
+        s_q,
+        s_k,
+        num_heads=64 if variant == "64-heads" else 32,
+        head_dim=64 if variant == "64-wide" else 128,
+        strided=variant == "strided",
+        requests=3 if variant == "requests" else 0,
+    )
+    logits = fp8_mqa_logits(*inputs, clean_logits=variant == "clean")
+    assert mqa_launches == [route]
+    _check_long_kv_logits(logits, inputs, variant == "clean")
 
 
+@requires_rows8
+@pytest.mark.parametrize(
+    "s_q,s_k,requests",
+    [(4096, 4097, 0), (4104, 8192, 3), (2048, 32768, 0), (1024, 65536, 4)],
+)
+@torch.inference_mode()
+def test_fp8_mqa_logits_rows8_matches_existing_route(s_q, s_k, requests, mqa_launches):
+    """The eight-row scores equal the clean and packed scores bit for bit."""
+    torch.manual_seed(0)
+    inputs = _long_kv_test_inputs(s_q, s_k, requests=requests)
+    inside = _window_mask(inputs)
+    lengths = inside.sum(dim=1)
+    offsets = lengths.cumsum(0) - lengths
+    packed = torch.empty(int(lengths.sum()), device="cuda", dtype=torch.float32)
+    dense = fp8_mqa_logits(*inputs, clean_logits=False)
+    clean = fp8_mqa_logits(*inputs, clean_logits=True)
+    fp8_mqa_logits(*inputs, out=packed, out_offsets=offsets)
+    assert mqa_launches == ["rows8", "existing", "existing"]
+    assert torch.equal(dense[inside], clean[inside])
+    assert torch.equal(dense[inside], packed)
+
+
+@requires_rows8
+@pytest.mark.parametrize(
+    "change",
+    [
+        "kv_stride",
+        "kv_scales_stride",
+        "cu_starts_stride",
+        "cu_ends_stride",
+        "kv_scales_dtype",
+        "packed",
+        "row_pitch",
+    ],
+)
+@torch.inference_mode()
+def test_fp8_mqa_logits_rows8_keeps_existing_route(change, rows8_forced, mqa_launches):
+    """An input that the eight-row kernel cannot read selects the existing kernel."""
+    torch.manual_seed(0)
+    s_q, s_k = 8, 4097
+    inputs = list(_long_kv_test_inputs(s_q, s_k))
+    kwargs = {}
+    if change == "kv_stride":
+        inputs[1] = _strided_test_tensor(inputs[1])
+    elif change == "kv_scales_stride":
+        inputs[2] = _strided_test_tensor(inputs[2])
+    elif change == "cu_starts_stride":
+        inputs[4] = _strided_test_tensor(inputs[4])
+    elif change == "cu_ends_stride":
+        inputs[5] = _strided_test_tensor(inputs[5])
+    elif change == "kv_scales_dtype":
+        inputs[2] = inputs[2].double()
+    elif change == "packed":
+        kwargs["out"] = torch.empty(s_q * s_k, device="cuda", dtype=torch.float32)
+        kwargs["out_offsets"] = torch.arange(s_q, device="cuda") * s_k
+    else:
+        # Seven rows of this pitch do not fit the 32-bit store offsets.
+        pitch = 2**31 // 28 + 1
+        free, _ = torch.cuda.mem_get_info()
+        if free < 2 * s_q * pitch * 4:
+            pytest.skip("needs a 2.3 GiB caller buffer")
+        storage = torch.empty(s_q * pitch, device="cuda", dtype=torch.float32)
+        kwargs["out"] = storage.view(s_q, pitch)[:, :s_k]
+    mqa_launches.probe = True
+    with pytest.raises(_RouteProbe, match="existing"):
+        fp8_mqa_logits(*inputs, clean_logits=False, **kwargs)
+
+
+@requires_rows8
 @pytest.mark.parametrize(
     "s_k,window_length",
     [(4097, length) for length in (1, 63, 64, 65, 127, 128, 129)]
     + [(65537, 129), (65537, 65501)],
 )
 @torch.inference_mode()
-def test_fp8_mqa_logits_long_kv_nonzero_union(s_k, window_length, rows8_dispatch):
+def test_fp8_mqa_logits_long_kv_nonzero_union(
+    s_k, window_length, rows8_forced, mqa_launches
+):
     """Check narrow and split KV ranges without a full-range query row."""
     torch.manual_seed(0)
-    inputs = _long_kv_test_inputs(8, s_k, 32, 128)
+    inputs = _long_kv_test_inputs(8, s_k)
     inputs[-2].fill_(17)
     inputs[-1].fill_(17 + window_length)
     logits = fp8_mqa_logits(*inputs, clean_logits=False)
+    assert mqa_launches == ["rows8"]
     _check_long_kv_logits(logits, inputs)
 
 
-@pytest.mark.parametrize("s_q,s_k", [(0, 4097), (8, 0), (0, 0)])
-@pytest.mark.parametrize("clean_logits", [False, True])
+@requires_rows8
 @torch.inference_mode()
-def test_fp8_mqa_logits_empty_output(s_q, s_k, clean_logits):
-    q = torch.empty(s_q, 32, 128, device="cuda", dtype=e4m3_type)
-    kv = torch.empty(s_k, 128, device="cuda", dtype=e4m3_type)
-    scales = torch.empty(s_k, device="cuda", dtype=torch.float32)
-    weights = torch.empty(s_q, 32, device="cuda", dtype=torch.float32)
-    starts = torch.zeros(s_q, device="cuda", dtype=torch.int32)
-    ends = torch.zeros_like(starts)
-    logits = fp8_mqa_logits(q, kv, scales, weights, starts, ends, clean_logits)
-    assert logits.shape == (s_q, s_k)
-    assert logits.dtype == torch.float32
-    assert logits.device == q.device
+def test_fp8_mqa_logits_rows8_skips_empty_windows(rows8_forced, mqa_launches):
+    """An empty window adds no keys to the walk of its row group.
 
-
-@torch.inference_mode()
-def test_fp8_mqa_logits_long_kv_caller_buffer(rows8_dispatch):
-    """The eight-row path writes the same scores into a strided caller buffer."""
+    The kernel then writes nothing in the columns that no row of the group needs.
+    """
     torch.manual_seed(0)
-    inputs = _long_kv_test_inputs(16, 4223, 32, 128)
-    seq_len, seq_len_kv = inputs[0].shape[0], inputs[1].shape[0]
-    storage = torch.full(
-        (seq_len, seq_len_kv + 64), 7.0, dtype=torch.float32, device="cuda"
-    )
-    out = storage[:, :seq_len_kv]
+    s_k = 65537
+    inputs = _long_kv_test_inputs(8, s_k)
+    inputs[-2].fill_(s_k - 1)
+    inputs[-1].fill_(s_k)
+    inputs[-2][3] = 0
+    inputs[-1][3] = 0
+    out = torch.full((8, s_k), float("nan"), device="cuda", dtype=torch.float32)
+    fp8_mqa_logits(*inputs, clean_logits=False, out=out)
+    assert mqa_launches == ["rows8"]
+    _check_long_kv_logits(out, inputs)
+    assert torch.isnan(out[:, : s_k - 1]).all()
+
+
+@requires_rows8
+@pytest.mark.parametrize("s_q,s_k,forced", [(16, 4223, True), (4096, 4097, False)])
+@torch.inference_mode()
+def test_fp8_mqa_logits_long_kv_caller_buffer(s_q, s_k, forced, request, mqa_launches):
+    """The eight-row kernel writes the same scores into a wider caller buffer."""
+    if forced:
+        request.getfixturevalue("rows8_forced")
+    torch.manual_seed(0)
+    inputs = _long_kv_test_inputs(s_q, s_k)
+    storage = torch.full((s_q, s_k + 64), 7.0, dtype=torch.float32, device="cuda")
+    out = storage[:, :s_k]
     logits = fp8_mqa_logits(*inputs, clean_logits=False, out=out)
+    assert mqa_launches == ["rows8"]
     assert logits.data_ptr() == out.data_ptr()
     _check_long_kv_logits(out, inputs)
-    assert torch.all(storage[:, seq_len_kv:] == 7.0)
+    assert torch.all(storage[:, s_k:] == 7.0)
 
 
+@requires_rows8
 @torch.inference_mode()
-def test_fp8_mqa_logits_long_kv_graph_replay(rows8_dispatch):
+def test_fp8_mqa_logits_long_kv_graph_replay(rows8_forced, mqa_launches):
     """Alternate two graphs with fresh inputs and changing valid windows."""
     torch.manual_seed(0)
     states = []
     warmup_stream = torch.cuda.Stream()
     warmup_stream.wait_stream(torch.cuda.current_stream())
     for _ in range(2):
-        inputs = _long_kv_test_inputs(16, 4223, 32, 128)
+        inputs = _long_kv_test_inputs(16, 4223)
         warmup_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(warmup_stream):
             for _ in range(3):
@@ -449,11 +611,12 @@ def test_fp8_mqa_logits_long_kv_graph_replay(rows8_dispatch):
         with torch.cuda.graph(graph):
             logits = fp8_mqa_logits(*inputs, clean_logits=False)
         states.append((graph, inputs, logits))
+    assert set(mqa_launches) == {"rows8"}
 
     windows = ("full", "ragged", "empty", "full", "ragged", "full")
     for step, window in enumerate(windows):
         graph, inputs, logits = states[step % 2]
-        fresh = _long_kv_test_inputs(16, 4223, 32, 128)
+        fresh = _long_kv_test_inputs(16, 4223)
         for target, source in zip(inputs, fresh):
             target.copy_(source)
         if window == "full":
@@ -473,23 +636,23 @@ def test_fp8_mqa_logits_long_kv_graph_replay(rows8_dispatch):
         )
 
 
+@requires_rows8
+@pytest.mark.parametrize("s_q,s_k", [(0, 4097), (8, 0), (0, 0)])
+@pytest.mark.parametrize("clean_logits", [False, True])
 @torch.inference_mode()
-def test_fp8_mqa_logits_long_kv_auxiliary_strides(rows8_dispatch):
-    if not (
-        mqa_arch == "gfx950"
-        and e4m3_type == torch.float8_e4m3fn
-        and ASYNC_COPY_SUPPORTS_DISTRIBUTED
-        and FOLDED_REDUCTED_SUPPORT
-    ):
-        pytest.skip("Requires the gfx950 eight-row path")
-    torch.manual_seed(0)
-    inputs = list(_long_kv_test_inputs(8, 4097, 32, 128))
-    inputs[-2].fill_(17)
-    inputs[-1].fill_(146)
-    for i in (2, 4, 5):
-        inputs[i] = _strided_test_tensor(inputs[i])
-    logits = fp8_mqa_logits(*inputs, clean_logits=False)
-    _check_long_kv_logits(logits, inputs)
+def test_fp8_mqa_logits_rows8_empty_output(s_q, s_k, clean_logits, mqa_launches):
+    """An empty output does not reach the eight-row kernel."""
+    q = torch.empty(s_q, 32, 128, device="cuda", dtype=e4m3_type)
+    kv = torch.empty(s_k, 128, device="cuda", dtype=e4m3_type)
+    scales = torch.empty(s_k, device="cuda", dtype=torch.float32)
+    weights = torch.empty(s_q, 32, device="cuda", dtype=torch.float32)
+    starts = torch.zeros(s_q, device="cuda", dtype=torch.int32)
+    ends = torch.zeros_like(starts)
+    logits = fp8_mqa_logits(q, kv, scales, weights, starts, ends, clean_logits)
+    assert "rows8" not in mqa_launches
+    assert logits.shape == (s_q, s_k)
+    assert logits.dtype == torch.float32
+    assert logits.device == q.device
 
 
 @pytest.mark.parametrize(
