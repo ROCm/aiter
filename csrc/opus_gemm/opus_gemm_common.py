@@ -4,6 +4,7 @@
 
 import json
 import os
+import re
 import sys
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -3029,6 +3030,9 @@ def _gfx950_co_image_path(path, entry):
     return os.path.join(root, "gfx950", "a8w8_blockscale_bpreshuffle", entry["image"])
 
 
+MXFP8_DIRECTION_PATTERN = re.compile(r"_mxfp8_(nn|tt|tn)_")
+
+
 def _load_gfx950_co_kernels(path, require_image=True):
     with open(path) as stream:
         document = json.load(stream)
@@ -3055,6 +3059,9 @@ def _load_gfx950_co_kernels(path, require_image=True):
         "prefetch_b_vgpr": "b_vgpr_co",
         "prefetch_b_vgpr_overlap": "b_vgpr_overlap_co",
         "pingpong_lds": "m_repeat_co",
+        "mxfp8_nn": "mxfp8_nn_4wave_co",
+        "mxfp8_tt": "mxfp8_tt_4wave_co",
+        "mxfp8_tn": "mxfp8_tn_4wave_co",
     }
     for entry in entries.values():
         fields = (
@@ -3949,7 +3956,8 @@ def candidate_kids_for_shape(gfx, m, n, k, outdtype="bf16", *, cu_num):
         for kid, instance in sorted(
             get_registry("a8w8_blockscale_bpreshuffle", gfx, cu_num).items()
         )
-        if a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)
+        if not MXFP8_DIRECTION_PATTERN.search(instance.name)
+        and a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)
     ]
 
 
