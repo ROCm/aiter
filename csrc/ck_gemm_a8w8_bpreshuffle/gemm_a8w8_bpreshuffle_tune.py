@@ -790,10 +790,10 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
             try:
                 q_dtype = eval(q_dtype_w)
                 libtype = str(row.get("libtype", "")).strip()
-                # Legacy INT8 rows are ASM, but gfx950 also ships FlyDSL INT8
-                # rows. Route by the configured backend instead of treating
-                # every INT8 byte tensor as an ASM kernel request.
-                is_asm = q_dtype == dtypes.i8 and libtype in ("", "asm")
+                # Legacy INT8 rows are ASM whatever their libtype holds (blank
+                # reads as NaN, a table merge fills 0). gfx950 also ships FlyDSL
+                # INT8 rows, which run through gemm_a8w8_bpreshuffle instead.
+                is_asm = q_dtype == dtypes.i8 and libtype != "flydsl"
                 gd = generate_data(
                     M,
                     N,

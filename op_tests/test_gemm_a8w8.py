@@ -1077,6 +1077,14 @@ def run_int8_4wave_dispatch_checks():
     asm_row = {"libtype": "asm", "splitK": 2, "kernelName": "asm_row"}
     assert asm_launch(flydsl_row) == {"kernel_name": "", "split_k": 1}
     assert asm_launch(asm_row) == {"kernel_name": "asm_row", "split_k": 2}
+    # Every other row is ASM, as before FlyDSL INT8: also with libtype blank
+    # (pandas reads NaN), filled with 0 by a table merge, or absent.
+    legacy_rows = [
+        {**asm_row, "libtype": value} for value in ("", float("nan"), "0", 0)
+    ]
+    legacy_rows.append({key: v for key, v in asm_row.items() if key != "libtype"})
+    for row in legacy_rows:
+        assert asm_launch(row) == {"kernel_name": "asm_row", "split_k": 2}, row
 
     # Oversized shapes are rejected before the tuned-row lookup.
     def lookup_before_check(*_args, **_kwargs):

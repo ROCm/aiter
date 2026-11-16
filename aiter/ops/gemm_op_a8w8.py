@@ -784,9 +784,11 @@ def gemm_a8w8_ASM(
             dtypes.i8,
             AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
         )
-        if candidate is not None and str(candidate.get("libtype", "asm")).strip() in (
-            "",
-            "asm",
+        # Only FlyDSL rows in this shared table belong to another backend. Older
+        # and merged tables leave libtype blank (read as NaN) or fill it with 0.
+        if (
+            candidate is not None
+            and str(candidate.get("libtype", "")).strip() != "flydsl"
         ):
             asm_config = candidate
     if asm_config is not None:
