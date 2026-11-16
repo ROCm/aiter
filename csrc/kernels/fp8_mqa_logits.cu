@@ -34,19 +34,21 @@
 //   -fno-honor-nans            relu = single v_max (no IEEE canonicalize)
 //   -fno-slp-vectorize         keep the epilogue scalar (SLP re-packs the fma pairs into v_pk_fma)
 //   -mllvm -disable-machine-sink  otherwise the last row's MFMA pair of a stage sinks past the loop exit branch
+#include "aiter_hip_common.h"
+#include "aiter_stream.h"
 #include "fp8_mqa_logits.h"
-#include <hip/hip_fp8.h>
+#include <algorithm>
 #include <climits>
 #include <cstdint>
 #include <cstdio>
+#include <hip/hip_fp8.h>
 #include <stdexcept>
 #include <string>
-#include <algorithm>
 #include <type_traits>
 template <int I> using IC = std::integral_constant<int, I>;
 
 using fp8 = __hip_fp8_storage_t;
-constexpr int WARP_SIZE = 64;
+constexpr int WAVE_SIZE = 64;
 constexpr int NUM_HEADS = 32;
 constexpr int HEAD_SIZE = 128;
 #define CDIV_(a, b) (((a) + (b) - 1) / (b))
@@ -78,10 +80,17 @@ __device__ __forceinline__ f8x32 pack(f8x16 lo, f8x16 hi) {
 }
 
 template <int NUM_WARPS, int SUB, int PF, bool CLEAN_LOGITS, bool REVERSE_ROWS>
-__global__ __launch_bounds__(NUM_WARPS * WARP_SIZE)
-void kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, const float* __restrict__ kv_scale_ptr,
-            const float* __restrict__ W_ptr, const int* __restrict__ ks_ptr, const int* __restrict__ ke_ptr,
-            float* __restrict__ logits_ptr, int M, int N, int SplitN)
+__global__
+__launch_bounds__(NUM_WARPS* WAVE_SIZE) void kernel(const fp8* __restrict__ Q_ptr,
+                                                    const fp8* __restrict__ K_ptr,
+                                                    const float* __restrict__ kv_scale_ptr,
+                                                    const float* __restrict__ W_ptr,
+                                                    const int* __restrict__ ks_ptr,
+                                                    const int* __restrict__ ke_ptr,
+                                                    float* __restrict__ logits_ptr,
+                                                    int M,
+                                                    int N,
+                                                    int SplitN)
 {
     constexpr int BLOCK_M    = 4;
     constexpr int ROWS_WG    = BLOCK_M * NUM_WARPS;
@@ -90,7 +99,7 @@ void kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, const 
     constexpr int STAGE_TOK  = TILE_N * SUB;
     constexpr int STAGE_BYTES= TILE_BYTES * SUB;
     constexpr int CHUNKS     = STAGE_BYTES / 16;            // 16-B chunks per stage
-    constexpr int NTHREADS   = NUM_WARPS * WARP_SIZE;
+    constexpr int NTHREADS   = NUM_WARPS * WAVE_SIZE;
     constexpr int STAGES     = 2;
     constexpr int NACC       = 16;
     constexpr int UNIT_SCALE = 0x7f;
@@ -100,12 +109,13 @@ void kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, const 
 
     __shared__ __attribute__((aligned(16))) fp8   k_lds[STAGES][STAGE_BYTES];
     __shared__ __attribute__((aligned(16))) float sc_lds[STAGES][STAGE_TOK];
-    constexpr int SC_WAVES = STAGE_TOK / WARP_SIZE;          // waves that load the stage's scales (1 lane = 1 token)
-    static_assert(STAGE_TOK % WARP_SIZE == 0 && SC_WAVES <= NUM_WARPS, "scale producer mapping");
+    constexpr int SC_WAVES =
+        STAGE_TOK / WAVE_SIZE; // waves that load the stage's scales (1 lane = 1 token)
+    static_assert(STAGE_TOK % WAVE_SIZE == 0 && SC_WAVES <= NUM_WARPS, "scale producer mapping");
 
     const int tid  = threadIdx.x;
-    const int l    = tid % WARP_SIZE;
-    const int warp = __builtin_amdgcn_readfirstlane(tid / WARP_SIZE);
+    const int l         = tid % WAVE_SIZE;
+    const int warp      = __builtin_amdgcn_readfirstlane(tid / WAVE_SIZE);
     const int bx   = REVERSE_ROWS ? (gridDim.x - 1 - blockIdx.x) : blockIdx.x;
     const int m0wg = bx * ROWS_WG;
     const int m0   = m0wg + warp * BLOCK_M;
@@ -169,10 +179,13 @@ void kernel(const fp8* __restrict__ Q_ptr, const fp8* __restrict__ K_ptr, const 
             auto fill_range = [&](float* row, int64_t row_base, int a, int b) {
                 if (((row_base + a) & 3) == 0) {
                     const int vb = a + ((b - a) & ~3);
-                    for (int i = a + l * 4; i < vb; i += WARP_SIZE * 4) *reinterpret_cast<f32x4*>(row + i) = vneg;
-                    for (int i = vb + l; i < b; i += WARP_SIZE) row[i] = NEG_INF;
+                    for(int i = a + l * 4; i < vb; i += WAVE_SIZE * 4)
+                        *reinterpret_cast<f32x4*>(row + i) = vneg;
+                    for(int i = vb + l; i < b; i += WAVE_SIZE)
+                        row[i] = NEG_INF;
                 } else {
-                    for (int i = a + l; i < b; i += WARP_SIZE) row[i] = NEG_INF;
+                    for(int i = a + l; i < b; i += WAVE_SIZE)
+                        row[i] = NEG_INF;
                 }
             };
             #pragma unroll 1
@@ -564,8 +577,9 @@ void dispatch_fp8_mqa_logits(const fp8* Q, const fp8* K, const float* scale, con
                              bool rev, hipStream_t stream) {
     const int row_blocks = CDIV_(M, 4 * num_warps);
     dim3 grid(row_blocks, split_n);
-#define L(NW, CL, RV) \
-    mqa_v35wes::kernel<NW, 2, 4, CL, RV><<<grid, NW * WARP_SIZE, 0, stream>>>(Q, K, scale, w, ks, ke, out, M, N, split_n)
+#define L(NW, CL, RV)                    \
+    mqa_v35wes::kernel<NW, 2, 4, CL, RV> \
+        <<<grid, NW * WAVE_SIZE, 0, stream>>>(Q, K, scale, w, ks, ke, out, M, N, split_n)
 #define LC(NW) \
     if (clean) { if (rev) L(NW, true, true); else L(NW, true, false); } \
     else       { if (rev) L(NW, false, true); else L(NW, false, false); }
@@ -576,47 +590,62 @@ void dispatch_fp8_mqa_logits(const fp8* Q, const fp8* K, const float* scale, con
 }  // namespace
 
 // ============================================================================
-// Torch-facing entry point
+// Entry point (aiter_tensor_t ABI, no torch dependency)
 // ============================================================================
-torch::Tensor fp8_mqa_logits(
-    torch::Tensor q_fp8,        // [M, 32, 128] fp8
-    torch::Tensor k_fp8,        // [N, 128]     fp8
-    torch::Tensor kv_scale,     // [N]          fp32
-    torch::Tensor weights,      // [M, 32]      fp32
-    torch::Tensor cu_seqlen_ks, // [M]          int32
-    torch::Tensor cu_seqlen_ke, // [M]          int32
-    int64_t BlockM,
-    int64_t SplitN,
-    int64_t num_warps,
-    int64_t TotalCuCount,
-    bool clean_logits,
-    int64_t Unroll2,
-    int64_t ReverseRows,
-    std::optional<torch::Tensor> out)
+namespace aiter {
+
+void fp8_mqa_logits(aiter_tensor_t& out,                // [M, N]       fp32
+                    const aiter_tensor_t& q_fp8,        // [M, 32, 128] fp8
+                    const aiter_tensor_t& k_fp8,        // [N, 128]     fp8
+                    const aiter_tensor_t& kv_scale,     // [N]          fp32
+                    const aiter_tensor_t& weights,      // [M, 32]      fp32
+                    const aiter_tensor_t& cu_seqlen_ks, // [M]          int32
+                    const aiter_tensor_t& cu_seqlen_ke, // [M]          int32
+                    int64_t BlockM,
+                    int64_t SplitN,
+                    int64_t num_warps,
+                    int64_t TotalCuCount,
+                    bool clean_logits,
+                    int64_t ReverseRows)
 {
+    // Preserve Python exception behavior for argument failures with the torch-free ABI.
+    aiter_detail::AiterThrowGuard throw_guard;
+
+    AITER_CHECK(q_fp8.dim() == 3 && q_fp8.size(1) == NUM_HEADS && q_fp8.size(2) == HEAD_SIZE,
+                "Only n_heads=32, head_dim=128 supported");
+    AITER_CHECK(k_fp8.dim() == 2 && k_fp8.size(1) == HEAD_SIZE, "K must be [N, 128]");
     const int M = q_fp8.size(0);
     const int N = k_fp8.size(0);
 
-    TORCH_CHECK(q_fp8.dim() == 3 && q_fp8.size(1) == NUM_HEADS && q_fp8.size(2) == HEAD_SIZE,
-                "Only n_heads=32, head_dim=128 supported");
-    TORCH_CHECK(k_fp8.dim() == 2 && k_fp8.size(1) == HEAD_SIZE, "K must be [N, 128]");
-    TORCH_CHECK(q_fp8.element_size() == 1 && k_fp8.element_size() == 1, "q_fp8 and k_fp8 must be fp8");
-    TORCH_CHECK(q_fp8.is_contiguous() && k_fp8.is_contiguous(), "q_fp8 and k_fp8 must be contiguous");
-    TORCH_CHECK(kv_scale.scalar_type() == torch::kFloat32 && kv_scale.is_contiguous() && kv_scale.numel() == N,
+    AITER_CHECK(q_fp8.element_size() == 1 && k_fp8.element_size() == 1,
+                "q_fp8 and k_fp8 must be fp8");
+    AITER_CHECK(q_fp8.is_contiguous() && k_fp8.is_contiguous(),
+                "q_fp8 and k_fp8 must be contiguous");
+    AITER_CHECK(kv_scale.dtype() == AITER_DTYPE_fp32 && kv_scale.is_contiguous() &&
+                    kv_scale.numel() == (size_t)N,
                 "kv_scale must be a contiguous f32 [N] tensor");
-    TORCH_CHECK(weights.scalar_type() == torch::kFloat32 && weights.is_contiguous() &&
-                    weights.numel() == (int64_t)M * NUM_HEADS,
+    AITER_CHECK(weights.dtype() == AITER_DTYPE_fp32 && weights.is_contiguous() &&
+                    weights.numel() == (size_t)M * NUM_HEADS,
                 "weights must be a contiguous f32 [M, 32] tensor");
-    TORCH_CHECK(cu_seqlen_ks.scalar_type() == torch::kInt32 && cu_seqlen_ke.scalar_type() == torch::kInt32 &&
-                    cu_seqlen_ks.is_contiguous() && cu_seqlen_ke.is_contiguous() &&
-                    cu_seqlen_ks.numel() == M && cu_seqlen_ke.numel() == M,
+    AITER_CHECK(cu_seqlen_ks.dtype() == AITER_DTYPE_i32 &&
+                    cu_seqlen_ke.dtype() == AITER_DTYPE_i32 && cu_seqlen_ks.is_contiguous() &&
+                    cu_seqlen_ke.is_contiguous() && cu_seqlen_ks.numel() == (size_t)M &&
+                    cu_seqlen_ke.numel() == (size_t)M,
                 "cu_seqlen_ks/ke must be contiguous int32 [M] tensors");
+    // clean_logits: the kernel writes -inf outside every row's window itself, so the buffer can
+    // start uninitialised. Without clean_logits positions outside the window are left untouched
+    // (only safe when the consumer is range aware, e.g. top_k_per_row_prefill which takes ks/ke). A
+    // caller-provided buffer is used as-is.
+    AITER_CHECK(out.dtype() == AITER_DTYPE_fp32 && out.is_contiguous() && out.dim() == 2 &&
+                    out.size(0) == M && out.size(1) == N,
+                "out must be a contiguous f32 [M, N] tensor");
     // Rows per wave are fixed at 4 (32 per workgroup); BlockM is kept for drop-in compatibility only.
-    TORCH_CHECK(BlockM == 0 || BlockM == 4, "BlockM must be 0 (default) or 4, got ", BlockM);
-    (void)Unroll2;   // no unroll variant: the stage loop is always unrolled x4 over the LDS/prefetch ring
+    AITER_CHECK(BlockM == 0 || BlockM == 4, "BlockM must be 0 (default) or 4, got ", BlockM);
 
     int num_warps_ = num_warps <= 0 ? 8 : static_cast<int>(num_warps);
-    TORCH_CHECK(num_warps_ == 8 || num_warps_ == 4, "num_warps must be 0 (default), 4 or 8, got ", num_warps);
+    AITER_CHECK(num_warps_ == 8 || num_warps_ == 4,
+                "num_warps must be 0 (default), 4 or 8, got ",
+                num_warps);
     int split_n = static_cast<int>(SplitN);
     int rev     = static_cast<int>(ReverseRows);
     if (split_n <= 0) {
@@ -631,22 +660,30 @@ torch::Tensor fp8_mqa_logits(
     }
     if (rev < 0) rev = (N > 2048);
 
-    // clean_logits: the kernel writes -inf outside every row's window itself, so the buffer can start
-    // uninitialised. Without clean_logits positions outside the window are left untouched (only safe when the
-    // consumer is range aware, e.g. top_k_per_row_prefill which takes ks/ke). A caller-provided buffer is used as-is.
-    torch::Tensor out_logits =
-        out.has_value() ? out.value()
-                        : torch::empty({M, N}, torch::dtype(torch::kFloat32).device(q_fp8.device()));
-    TORCH_CHECK(out_logits.scalar_type() == torch::kFloat32 && out_logits.is_contiguous() &&
-                    out_logits.size(0) == M && out_logits.size(1) == N,
-                "out must be a contiguous f32 [M, N] tensor");
-    if (M == 0 || N == 0) return out_logits;
+    if(M == 0 || N == 0)
+        return;
 
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA guard(device_of(out_logits));
-    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
-    dispatch_fp8_mqa_logits(static_cast<const fp8*>(q_fp8.data_ptr()), static_cast<const fp8*>(k_fp8.data_ptr()),
-                            kv_scale.data_ptr<float>(), weights.data_ptr<float>(), cu_seqlen_ks.data_ptr<int>(),
-                            cu_seqlen_ke.data_ptr<int>(), out_logits.data_ptr<float>(), M, N, split_n, num_warps_,
-                            clean_logits, rev > 0, stream);
-    return out_logits;
+    AITER_CHECK(out.is_gpu() && q_fp8.device_id == out.device_id &&
+                    k_fp8.device_id == out.device_id && kv_scale.device_id == out.device_id &&
+                    weights.device_id == out.device_id && cu_seqlen_ks.device_id == out.device_id &&
+                    cu_seqlen_ke.device_id == out.device_id,
+                "all tensors must be on the same GPU");
+    const HipDeviceGuard guard(out.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    dispatch_fp8_mqa_logits(static_cast<const fp8*>(q_fp8.data_ptr()),
+                            static_cast<const fp8*>(k_fp8.data_ptr()),
+                            static_cast<const float*>(kv_scale.data_ptr()),
+                            static_cast<const float*>(weights.data_ptr()),
+                            static_cast<const int*>(cu_seqlen_ks.data_ptr()),
+                            static_cast<const int*>(cu_seqlen_ke.data_ptr()),
+                            static_cast<float*>(out.data_ptr()),
+                            M,
+                            N,
+                            split_n,
+                            num_warps_,
+                            clean_logits,
+                            rev > 0,
+                            stream);
 }
+
+} // namespace aiter

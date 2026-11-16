@@ -14,31 +14,29 @@
 // `aiter.ops.triton.attention.fp8_mqa_logits`, so it drops into the same call site.
 //
 // Fixed at n_heads=32, head_dim=128 -- the GLM-5.x indexer shape.
+//
+// No torch dependency: tensors cross as aiter_tensor_t and the stream comes from
+// aiter::getCurrentHIPStream(). The output is allocated by the Python wrapper
+// (aiter/ops/fp8_mqa_logits.py).
+#include "aiter_tensor.h"
+#include <cstdint>
 
-// aiter builds csrc without hipify, so the ATen CUDA headers (which pull in
-// cuda_runtime_api.h) are unavailable -- use the HIP-flavoured ones, as the rest
-// of csrc does.
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <c10/util/Optional.h>
-#include <torch/all.h>
-#include <torch/extension.h>
-#include <cstdlib>
+namespace aiter {
 
-// Writes into `out` when given (and returns it), otherwise allocates [M, N] f32.
-// Positions outside a row's [ks, ke) window read -inf when `clean_logits`, and are
-// left untouched otherwise.
-torch::Tensor fp8_mqa_logits(torch::Tensor q_fp8,        // [M, 32, 128] fp8
-                             torch::Tensor k_fp8,        // [N, 128]     fp8
-                             torch::Tensor kv_scale,     // [N]          f32
-                             torch::Tensor weights,      // [M, 32]      f32
-                             torch::Tensor cu_seqlen_ks, // [M]          i32
-                             torch::Tensor cu_seqlen_ke, // [M]          i32
-                             int64_t BlockM,
-                             int64_t SplitN,
-                             int64_t num_warps,
-                             int64_t TotalCuCount,
-                             bool clean_logits,
-                             int64_t Unroll2,     // ignored (API compatibility)
-                             int64_t ReverseRows, // -1 = host heuristic, 0/1 = off/on
-                             std::optional<torch::Tensor> out);
+// Writes logits into `out` ([M, N] f32, contiguous). Positions outside a row's
+// [ks, ke) window are written -inf when `clean_logits`, and left untouched otherwise.
+void fp8_mqa_logits(aiter_tensor_t& out,                // [M, N]       f32
+                    const aiter_tensor_t& q_fp8,        // [M, 32, 128] fp8
+                    const aiter_tensor_t& k_fp8,        // [N, 128]     fp8
+                    const aiter_tensor_t& kv_scale,     // [N]          f32
+                    const aiter_tensor_t& weights,      // [M, 32]      f32
+                    const aiter_tensor_t& cu_seqlen_ks, // [M]          i32
+                    const aiter_tensor_t& cu_seqlen_ke, // [M]          i32
+                    int64_t BlockM,
+                    int64_t SplitN,
+                    int64_t num_warps,
+                    int64_t TotalCuCount,
+                    bool clean_logits,
+                    int64_t ReverseRows); // -1 = host heuristic, 0/1 = off/on
+
+} // namespace aiter

@@ -12,9 +12,10 @@ can be A/B'd on identical inputs. Kernel design: see csrc/kernels/fp8_mqa_logits
 
 Fixed at n_heads=32, head_dim=128 -- the GLM-5.x indexer shape.
 ``is_supported()`` gates on that, so a caller that also has to serve other shapes
-can route them to the Triton kernel rather than trip a TORCH_CHECK.
+can route them to the Triton kernel rather than trip an AITER_CHECK.
 """
 
+import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
@@ -34,7 +35,28 @@ def is_supported(num_heads: int, head_dim: int) -> bool:
     )
 
 
-@compile_ops(MD_NAME, fc_name="fp8_mqa_logits")
+# No C++ torch dependency: the module uses the ``aiter_tensor_t`` ABI and
+# ``develop=True`` converts each ``torch.Tensor`` before the call. The output is
+# allocated here (``fp8_mqa_logits`` below) and written in place, so the binding
+# returns ``None``.
+@compile_ops(MD_NAME, fc_name="fp8_mqa_logits", develop=True)
+def _fp8_mqa_logits(
+    out: Tensor,
+    q_fp8: Tensor,
+    k_fp8: Tensor,
+    kv_scale: Tensor,
+    weights: Tensor,
+    cu_seqlen_ks: Tensor,
+    cu_seqlen_ke: Tensor,
+    BlockM: int,
+    SplitN: int,
+    num_warps: int,
+    TotalCuCount: int,
+    clean_logits: bool,
+    reverse_rows: int,
+) -> None: ...
+
+
 def fp8_mqa_logits(
     q_fp8: Tensor,
     k_fp8: Tensor,
@@ -71,3 +93,24 @@ def fp8_mqa_logits(
     outside each row's window the kernel writes -inf when clean_logits, and leaves
     the buffer untouched otherwise.
     """
+    del unroll2  # no unroll variant: the stage loop is always unrolled x4
+    if out is None:
+        out = torch.empty(
+            (q_fp8.shape[0], k_fp8.shape[0]), dtype=torch.float32, device=q_fp8.device
+        )
+    _fp8_mqa_logits(
+        out,
+        q_fp8,
+        k_fp8,
+        kv_scale,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        BlockM,
+        SplitN,
+        num_warps,
+        TotalCuCount,
+        clean_logits,
+        reverse_rows,
+    )
+    return out
