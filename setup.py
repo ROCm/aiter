@@ -96,7 +96,6 @@ if not AITER_TRITON_ONLY and not IS_WINDOWS and is_develop_mode():
 
 
 _TRITON_CONFLICTS = [
-    "amd-triton",
     "triton",
     "pytorch-triton",
     "pytorch-triton-rocm",
@@ -111,7 +110,7 @@ def _uninstall_triton_conflicts():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-    for pkg in ["amd-triton-kernels", "triton-kernels"]:
+    for pkg in ["triton-kernels"]:
         subprocess.call(
             [sys.executable, "-m", "pip", "uninstall", "-y", pkg],
             stdout=subprocess.DEVNULL,
@@ -177,16 +176,15 @@ elif AITER_USE_SYSTEM_TRITON and _triton_info:
         f"[aiter] AITER_USE_SYSTEM_TRITON=1, keeping {_triton_info[0]}=={_triton_info[1]}."
     )
 elif not AITER_USE_SYSTEM_TRITON and not IS_WINDOWS:
-    _needs_triton_install = not _triton_satisfied()
+    _uninstall_triton_conflicts()
 
-    if _needs_triton_install:
+    if not _triton_satisfied():
         if _triton_info:
             print(
                 f"[aiter] Replacing existing {_triton_info[0]}=={_triton_info[1]}"
                 " with aiter-compatible triton"
                 " (set AITER_USE_SYSTEM_TRITON=1 to keep your triton)"
             )
-        _uninstall_triton_conflicts()
         for pkg_spec in [TRITON_VERSION, TRITON_KERNELS_VERSION]:
             try:
                 subprocess.check_call(
