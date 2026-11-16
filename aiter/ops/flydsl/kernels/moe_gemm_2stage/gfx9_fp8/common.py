@@ -143,7 +143,9 @@ def validate_gemm_options(
     swiglu_limit,
 ):
     if act_quant_type is None:
-        act_quant_type = weight_quant_type
+        # Block-scaled split-K/batch1 kernels read BF16 activations.
+        block_bf16_act = weight_quant_type == "block" and alg != "prefill_1x4"
+        act_quant_type = "no" if block_bf16_act else weight_quant_type
     assert (
         BLOCK_TILE_SIZE_M <= 256
     ), "BLOCK_SIZE_M must be less than or equal to 256 due to LDS size limit for sorted ids."
@@ -155,12 +157,22 @@ def validate_gemm_options(
         "no",
         "ptpc",
         "per_tensor",
-    ], "weight_quant_type must be either 'no', 'ptpc' or 'per_tensor'"
+        "block",
+    ], "weight_quant_type must be one of 'no', 'ptpc', 'per_tensor' or 'block'"
     assert act_quant_type in [
         "no",
         "ptpc",
         "per_tensor",
-    ], "act_quant_type must be either 'no', 'ptpc' or 'per_tensor'"
+        "block",
+    ], "act_quant_type must be one of 'no', 'ptpc', 'per_tensor' or 'block'"
+    if weight_quant_type == "block" or act_quant_type == "block":
+        # Block weights: scale per (output row, K group); activations are BF16
+        # (split-K/batch1) or FP8 with a scale per (token, K group) (prefill).
+        assert weight_dtype == "fp8" and weight_quant_type == "block"
+        assert act_quant_type == ("block" if alg == "prefill_1x4" else "no"), (
+            f"block weights need act_quant_type='block' for prefill and 'no' "
+            f"(BF16 activations) otherwise, got {act_quant_type!r} for {alg}"
+        )
     if weight_dtype == "bf16" and (weight_quant_type != "no" or act_quant_type != "no"):
         raise ValueError(
             "BF16 kernels require weight_quant_type='no' and act_quant_type='no'"
@@ -168,13 +180,24 @@ def validate_gemm_options(
     assert activation in [
         "silu",
         "swiglu",
-    ], "activation must be either 'silu' or 'swiglu'"
+        "swiglustep",
+    ], "activation must be one of 'silu', 'swiglu' or 'swiglustep'"
     if activation == "swiglu":
         swiglu_limit = float(swiglu_limit) if swiglu_limit else 7.0
+    elif activation == "swiglustep":
+        if swiglu_limit is None or float(swiglu_limit) <= 0:
+            raise ValueError(
+                f"swiglustep requires a positive swiglu_limit, got {swiglu_limit!r}"
+            )
+        swiglu_limit = float(swiglu_limit)
     if weight_dtype == "fp8" and alg == "prefill_1x4":
-        assert (weight_quant_type == "ptpc" and act_quant_type == "ptpc") or (
-            weight_quant_type == "per_tensor"
-            and act_quant_type in ("ptpc", "per_tensor")
+        assert (
+            (weight_quant_type == "ptpc" and act_quant_type == "ptpc")
+            or (
+                weight_quant_type == "per_tensor"
+                and act_quant_type in ("ptpc", "per_tensor")
+            )
+            or (weight_quant_type == "block" and act_quant_type == "block")
         ), (
             f"unsupported prefill quant combo (weight={weight_quant_type}, "
             f"act={act_quant_type})"
@@ -408,6 +431,24 @@ def _as_ptr(p, dtype=None):
     if dtype is not None and ptr.dtype != dtype:
         ptr = fx.recast_iter(dtype, ptr)
     return ptr
+
+
+def issue_f32x4(ptr):
+    """Start a 128-bit load of four FP32 values; call ``.load()`` on the result to use them."""
+    src = fx.make_view(ptr, fx.make_layout(4, 1))
+    dst = fx.make_fragment_like(src)
+    fx.copy(fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32), src, dst)
+    return dst
+
+
+def scaled_accumulate(acc, part, scale_at):
+    """acc += part * scale_at(v, m, n) over a (4, M, N) MFMA C fragment, element by element."""
+    reps_m = fx.size(fx.get_shape(part)[1]).to_py_value()
+    reps_n = fx.size(fx.get_shape(part)[2]).to_py_value()
+    for m in range_constexpr(reps_m):
+        for n in range_constexpr(reps_n):
+            for v in range_constexpr(4):
+                acc[v, m, n] = acc[v, m, n] + part[v, m, n] * scale_at(v, m, n)
 
 
 def atomic_add_bf16(ptr_base, reg_vec):
@@ -902,7 +943,11 @@ def make_gemm_helpers(K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK):
         lds,
         splitk_waves=4,
         a_with_index=True,
+        k_scale=None,
     ):
+        """``k_scale(k_idx)`` issues the loads of this wave's per-row scales for
+        K tile ``k_idx`` and returns one 4-row Vec per M16 repeat; each tile is
+        then accumulated separately and scaled in FP32 (block-scaled weights)."""
         tid = gpu.thread_idx.x
 
         tile_k_per_wg = TILE_K * splitk_waves
@@ -983,6 +1028,22 @@ def make_gemm_helpers(K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK):
         )
         c_frag = tiled_mma.make_fragment_C(c_fake_tensor)
         c_frag.fill(0)
+        if const_expr(k_scale is not None):
+            c_part = tiled_mma.make_fragment_C(c_fake_tensor)
+            c_part.fill(0)
+            part_m = fx.size(fx.get_shape(c_part)[1]).to_py_value()
+
+        def _mma(b, a, scales):
+            if const_expr(k_scale is None):
+                fx.gemm(tiled_mma, c_frag, b, a, c_frag)
+            else:
+                c_part.fill(0)
+                fx.gemm(tiled_mma, c_part, b, a, c_part)
+                row_scales = [scales[m].load() for m in range_constexpr(part_m)]
+                scaled_accumulate(c_frag, c_part, lambda v, m, n: row_scales[m][v])
+
+        def _issue_scales(k_idx):
+            return None if const_expr(k_scale is None) else k_scale(k_idx)
 
         num_k_iters = K // TILE_K // splitk_waves
 
@@ -1017,6 +1078,8 @@ def make_gemm_helpers(K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK):
         for k2, state in range(0, num_k_iters // 2, 1, init=[acc_init]):
             c_frag.store(state[0])
             k_base = fx.Int32(k2 * 2)
+            # Scale loads go before the prefetch so the vmcnt wait covers them.
+            scales = _issue_scales(k_base)
             _prefetch_a(k_base + 1, 1)
             fx.copy(
                 b_cp_atom_r,
@@ -1027,8 +1090,9 @@ def make_gemm_helpers(K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK):
             rocdl.sched_barrier(0)
             if const_expr(weight_dtype != fx.BFloat16):
                 _cvt_fp8_bf16(b_frag_retile[0], b_frag[0])
-            fx.gemm(tiled_mma, c_frag, b_frag[0], a_frag[0], c_frag)
+            _mma(b_frag[0], a_frag[0], scales)
             rocdl.sched_barrier(0)
+            scales = _issue_scales(k_base + 1)
             _prefetch_a(k_base + 2, 0)
             fx.copy(
                 b_cp_atom_r,
@@ -1039,16 +1103,17 @@ def make_gemm_helpers(K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK):
             rocdl.sched_barrier(0)
             if const_expr(weight_dtype != fx.BFloat16):
                 _cvt_fp8_bf16(b_frag_retile[1], b_frag[1])
-            fx.gemm(tiled_mma, c_frag, b_frag[1], a_frag[1], c_frag)
+            _mma(b_frag[1], a_frag[1], scales)
             rocdl.sched_barrier(0)
 
             results = yield [c_frag.load()]
         c_frag.store(results)
 
         if const_expr(num_k_iters % 2 == 1):
+            scales = _issue_scales(fx.Int32(num_k_iters - 1))
             if const_expr(weight_dtype != fx.BFloat16):
                 _cvt_fp8_bf16(b_frag_retile[0], b_frag[0])
-            fx.gemm(tiled_mma, c_frag, b_frag[0], a_frag[0], c_frag)
+            _mma(b_frag[0], a_frag[0], scales)
 
         c_frag = _select(c_frag, [0, 2, 1])
 

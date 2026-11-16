@@ -34,6 +34,7 @@ def compile_moe_gemm2(
     swiglu_limit=None,
     down_path="default",
     down_output_padding_bytes=0,
+    scale_k=64,
     has_num_local_tokens=False,
 ):
     TILE_K = 64
@@ -48,6 +49,13 @@ def compile_moe_gemm2(
     )
     if alg == "batch1":
         assert K % TILE_K == 0, "batch1 Down requires K divisible by 64"
+    is_block = weight_quant_type == "block"
+    if is_block:
+        assert scale_k % TILE_K == 0 and K % scale_k == 0, f"scale_k={scale_k}, K={K}"
+        assert (
+            alg != "prefill_1x4" or down_path == "1x4_64x256"
+        ), "block-scaled Down prefill requires the 1x4_64x256 Down path"
+    K_GROUPS = K // scale_k
     # The sorted algorithms bound the rows in moe_sorting.
     assert not has_num_local_tokens or alg == "batch1"
     if alg == "prefill_1x4":
@@ -67,6 +75,8 @@ def compile_moe_gemm2(
             "TOPK": TOPK,
             "padding": down_output_padding_bytes,
         }
+        if is_block:
+            options["scale_k"] = scale_k
         if down_path == "1x4_64x256":
             from .gemm2_1x4 import _build_moe_gemm2_1x4_n256
 
@@ -96,6 +106,24 @@ def compile_moe_gemm2(
     TensorWithIndex, _read_sorted_index, gemm_splitk = make_gemm_helpers(
         K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK
     )
+
+    def _splitk_block_scale(tid, p_w_scale, expert_id, blk_n):
+        """Row scales [E, K/scale_k, N] for one single-wave split-K step (64 K)."""
+        if const_expr(not is_block):
+            return None
+        row_base = (
+            fxh._as_ptr(p_w_scale) + blk_n * BLOCK_TILE_SIZE_N + ((tid % 64) // 16) * 4
+        )
+
+        def issue(k_idx):
+            group = (k_idx * TILE_K) // scale_k
+            base = row_base + (expert_id * K_GROUPS + group) * N
+            return [
+                fxh.issue_f32x4(base + m * 16)
+                for m in range_constexpr(BLOCK_TILE_SIZE_N // 16)
+            ]
+
+        return issue
 
     def _apply_down_scale(c_frag, tid, expert_id, blk_n, p_w_scale):
         if const_expr(weight_dtype != fx.BFloat16):
@@ -229,6 +257,7 @@ def compile_moe_gemm2(
                 arg_p_weight,
                 lds,
                 splitk_waves=1,
+                k_scale=_splitk_block_scale(tid, p_w_scale, expert_id, blk_n),
             )
 
             _apply_down_scale(c_frag, tid, expert_id, blk_n, p_w_scale)
@@ -329,6 +358,7 @@ def compile_moe_gemm2(
                 None,
                 splitk_waves=1,
                 a_with_index=False,
+                k_scale=_splitk_block_scale(tid, p_w_scale, expert_id, blk_n),
             )
 
             _apply_down_scale(c_frag, tid, expert_id, blk_n, p_w_scale)

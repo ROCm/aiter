@@ -182,9 +182,10 @@ def get_moe_ck2stages_prebuild_variants(aiter_csrc_dir: str) -> list[dict]:
             and b_dtype == "f8"
         )
 
-        if activation in ("swiglu", "situv2"):
-            # Swiglu / SiTUv2 MXFP4 MoE are owned by FlyDSL; CK 2stages codegen
-            # has no matching instance, so skip these from the CK prebuild.
+        if activation in ("swiglu", "situv2", "swiglustep"):
+            # Swiglu / SiTUv2 MXFP4 and SwigluStep MoE are owned by FlyDSL; CK
+            # 2stages codegen has no matching instance, so skip these from the
+            # CK prebuild.
             continue
 
         # A16W4 per_1x32 (bf16 activation, int4 weight) is owned by FlyDSL,
