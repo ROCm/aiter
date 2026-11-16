@@ -633,7 +633,7 @@ def _pa_decode_sparse_fp8(
         pv_warp_bases: gl.constexpr = []
     elif num_warps == 2:
         qk_warp_bases: gl.constexpr = [[1, 0]]
-        pv_warp_bases: gl.constexpr = [[0, 1]]
+        pv_warp_bases: gl.constexpr = [[1, 0]]
     elif num_warps == 4:
         qk_warp_bases: gl.constexpr = [[1, 0], [2, 0]]
         pv_warp_bases: gl.constexpr = [[0, 1], [0, 2]]
