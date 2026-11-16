@@ -517,6 +517,9 @@ from aiter.ops.flydsl.gemm_a8w8_mxfp8_8wave import (
     K_ALIGN as K_ALIGN_8WAVE,
 )
 from aiter.ops.flydsl.gemm_a8w8_mxfp8_8wave import (
+    K_MIN as K_MIN_8WAVE,
+)
+from aiter.ops.flydsl.gemm_a8w8_mxfp8_8wave import (
     make_mxfp8_8wave_kernel_name,
 )
 
@@ -544,10 +547,10 @@ class EightWaveKernelInstance:
 
 def fits_shape_8wave(ki: EightWaveKernelInstance, M: int, N: int, K: int) -> bool:
     """M and N may be ragged (buffer-descriptor OOB + the kernel's column
-    guard); K must hold whole 256-K scale pairs; the buffer descriptors index
+    guard); K must be whole K tiles, at least two; the buffer descriptors index
     in 32 bits (C is bf16, so its byte count doubles)."""
     del ki
-    if M <= 0 or N % 16 != 0 or K <= 0 or K % K_ALIGN_8WAVE != 0:
+    if M <= 0 or N % 16 != 0 or K < K_MIN_8WAVE or K % K_ALIGN_8WAVE != 0:
         return False
     return not (M * N * 2 >= _I32_MAX or M * K >= _I32_MAX or N * K >= _I32_MAX)
 

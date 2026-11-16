@@ -20,6 +20,8 @@ from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 BLOCK_K = 128
 BLOCK_M = BLOCK_N = 256
 K_ALIGN = BLOCK_K
+# The pipeline peels its last two K steps, so it needs at least two.
+K_MIN = 2 * BLOCK_K
 SCALE_GROUP = 32
 
 # A/B stages: 4 buffers each of (BLOCK/2) x 128 fp8; the row layout adds two
@@ -68,10 +70,10 @@ def _validate(
     AssertionError escaping here would kill the tuner worker process rather than
     just failing the candidate.
     """
-    if K <= 0 or K % K_ALIGN != 0 or (scale_preshuffled and K % 256):
+    if K < K_MIN or K % K_ALIGN != 0 or (scale_preshuffled and K % 256):
         raise ValueError(
-            f"[FlyDSL mxfp8 8wave] K must be a positive multiple of "
-            f"{256 if scale_preshuffled else K_ALIGN}, got {K}"
+            f"[FlyDSL mxfp8 8wave] K must be a multiple of "
+            f"{256 if scale_preshuffled else K_ALIGN} and at least {K_MIN}, got {K}"
         )
     if int(waves_per_eu) < 1:
         raise ValueError(
