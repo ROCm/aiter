@@ -27,14 +27,17 @@ os.environ.setdefault("CU_NUM", "256")
 
 try:
     from aiter import ActivationType, QuantType, dtypes
+    from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
     from aiter.ops.flydsl.grouped_moe_gfx1250 import (
         _find_grouped_config,
+        _find_grouped_config_for,
         _get_padded_m,
     )
 
     _IMPORT_ERR = None
 except Exception as e:  # noqa: BLE001
     ActivationType = QuantType = dtypes = _find_grouped_config = _get_padded_m = None
+    _find_grouped_config_for = _grouped = None
     _IMPORT_ERR = e
 
 try:
@@ -282,6 +285,74 @@ class GroupedNonEpTokenFallbackTest(unittest.TestCase):
         self.add_row(32768, topk="-1")
         expected = self.add_row(65536, topk="-1")
         self.assertIs(self.lookup(_get_padded_m(65536), topk=-1), expected)
+
+
+class GroupedMidBucketLookupTest(unittest.TestCase):
+    """A non-pow2 token row serves the token counts below it in its bucket."""
+
+    setUp = GroupedNonEpTokenFallbackTest.setUp
+    add_row = GroupedNonEpTokenFallbackTest.add_row
+    lookup = GroupedNonEpTokenFallbackTest.lookup
+
+    def tearDown(self):
+        _grouped._MID_TOKEN_CACHE.clear()
+
+    def lookup_for(self, token, *, topk=-1, ep_fused=True):
+        return _find_grouped_config_for(
+            token,
+            model_dim=5120,
+            inter_dim=2304,
+            experts=96,
+            topk=topk,
+            activation=ActivationType.Silu,
+            dtype=dtypes.bf16,
+            q_dtype_a=dtypes.fp4x2,
+            q_dtype_w=dtypes.fp4x2,
+            quant_type=QuantType.per_1x32,
+            ep_fused=ep_fused,
+        )
+
+    def test_without_mid_rows_matches_pow2_lookup(self):
+        for token in (4096, 8192):
+            self.add_row(token, topk="-1")
+        for token in (1, 3000, 4096, 4097, 5376, 8192, 9000):
+            with self.subTest(token=token):
+                self.assertIs(
+                    self.lookup_for(token),
+                    self.lookup(_get_padded_m(token), topk=-1, ep_fused=True),
+                )
+
+    def test_mid_row_covers_its_range(self):
+        low = self.add_row(4096, topk="-1")
+        mid = self.add_row(5376, topk="-1")
+        high = self.add_row(8192, topk="-1")
+        for token, expected in (
+            (4096, low),
+            (4097, mid),
+            (5000, mid),
+            (5376, mid),
+            (5377, high),
+            (8192, high),
+        ):
+            with self.subTest(token=token):
+                self.assertIs(self.lookup_for(token), expected)
+
+    def test_mid_rows_are_per_shape_and_keys(self):
+        self.add_row(5376, topk="-1", expert="32")
+        self.add_row(5376, topk="6")
+        high = self.add_row(8192, topk="-1")
+        # Another expert count's mid row and a topk-6 mid row do not apply.
+        self.assertIs(self.lookup_for(5000), high)
+        self.assertIsNotNone(self.lookup_for(5000, topk=6, ep_fused=False))
+
+    def test_two_mid_rows_pick_the_smallest_cover(self):
+        first = self.add_row(4608, topk="-1")
+        second = self.add_row(5376, topk="-1")
+        high = self.add_row(8192, topk="-1")
+        self.assertIs(self.lookup_for(4100), first)
+        self.assertIs(self.lookup_for(4608), first)
+        self.assertIs(self.lookup_for(4609), second)
+        self.assertIs(self.lookup_for(6000), high)
 
 
 if __name__ == "__main__":
