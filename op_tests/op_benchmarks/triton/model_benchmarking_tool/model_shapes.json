@@ -889,5 +889,150 @@
                 "dv": 512
             }
         ]
+    },
+    "DSv4 Flash": {
+        "gemm_a8w8_blockscale": [
+            {
+                "N": 1536,
+                "K": 4096,
+                "TP_dim": null
+            },
+            {
+                "N": 32768,
+                "K": 1024,
+                "TP_dim": "N"
+            },
+            {
+                "N": 4096,
+                "K": 8192,
+                "TP_dim": "K"
+            },
+            {
+                "N": 8192,
+                "K": 1024,
+                "TP_dim": null
+            },
+            {
+                "N": 4096,
+                "K": 4096,
+                "TP_dim": "N"
+            },
+            {
+                "N": 4096,
+                "K": 2048,
+                "TP_dim": "K"
+            },
+            {
+                "N": 4096,
+                "K": 4096,
+                "TP_dim": null
+            }
+        ],
+        "gemm_a16w16": [
+            {
+                "N": 256,
+                "K": 4096,
+                "TP_dim": null
+            },
+            {
+                "N": 64,
+                "K": 4096,
+                "TP_dim": null
+            },
+            {
+                "N": 129280,
+                "K": 4096,
+                "TP_dim": "N"
+            }
+        ],
+        "batched_gemm_a8w8": [
+            {
+                "B": 8,
+                "N": 1024,
+                "K": 4096,
+                "TP_dim": "B"
+            }
+        ],
+        "moe_op_gemm_a8w4": [
+            {
+                "E": 256,
+                "Dim1": 4096,
+                "Dim2": 4096,
+                "TopK": 6
+            }
+        ],
+        "moe_op_gemm_a4w4": [
+            {
+                "E": 256,
+                "Dim1": 4096,
+                "Dim2": 4096,
+                "TopK": 6
+            }
+        ],
+        "rmsnorm": [
+            {
+                "N": 4096
+            },
+            {
+                "N": 1024
+            },
+            {
+                "N": 512
+            },
+            {
+                "N": 128
+            }
+        ],
+        "sparse_mqa": [
+            {
+                "comment": "SWA",
+                "hq": 64,
+                "hkv": 1,
+                "dqk": 512,
+                "dv": 512,
+                "kv_len": 128,
+                "extra_len": 0,
+                "page": 64
+            },
+            {
+                "comment": "CSA",
+                "hq": 64,
+                "hkv": 1,
+                "dqk": 512,
+                "dv": 512,
+                "kv_len": 128,
+                "extra_len": 256,
+                "page": 64,
+                "extra_page": 64
+            },
+            {
+                "comment": "HCA",
+                "hq": 64,
+                "hkv": 1,
+                "dqk": 512,
+                "dv": 512,
+                "kv_len": 128,
+                "extra_len": 8,
+                "page": 64,
+                "extra_page": 2
+            }
+        ],
+        "mhc": [
+            {
+                "n": 4,
+                "C": 4096,
+                "op": "pre"
+            },
+            {
+                "n": 4,
+                "C": 4096,
+                "op": "post"
+            },
+            {
+                "n": 4,
+                "C": 4096,
+                "op": "head"
+            }
+        ]
     }
 }
