@@ -26,41 +26,11 @@ INFO_COLS = 8
 QK_COLS = ((8, 4, 2, 9), (1, 16, 8, 64))
 
 
-def _buffer(ptr, layout, count, dtype):
-    # Scalar buffers end in a unit mode: copy atoms need one unsliced mode.
+def _buffer(ptr, dtype, layout):
+    # The record bound is the layout's cosize: out-of-range loads return zero,
+    # which the masked Q rows rely on. The 32-bit bound limits a view to 2 GiB.
     view = fx.make_view(fx.recast_iter(dtype, ptr), layout)
-    return fx.Tensor(
-        fx.rocdl.make_buffer_tensor(
-            view, num_records_bytes=fx.Int64(count) * (dtype.width // 8)
-        )
-    )
-
-
-def _ld(buf, coord, dtype, vec=1):
-    frag = fx.make_rmem_tensor(fx.make_layout(vec, 1), dtype)
-    atom = fx.make_copy_atom(fx.rocdl.BufferCopy(dtype.width * vec), dtype)
-    fx.copy_atom_call(atom, fx.slice(buf, coord), frag)
-    return frag.load() if vec != 1 else frag.load()[0]
-
-
-def _st(buf, coord, value, dtype):
-    frag = fx.make_rmem_tensor(fx.make_layout(1, 1), dtype)
-    frag.store(fx.Vector.from_elements([value], dtype=dtype))
-    fx.copy_atom_call(
-        fx.make_copy_atom(fx.rocdl.BufferCopy(dtype.width), dtype),
-        frag,
-        fx.slice(buf, coord),
-    )
-
-
-def _stv(buf, coord, value, dtype, vec=4):
-    frag = fx.make_rmem_tensor(fx.make_layout(vec, 1), dtype)
-    frag.store(value)
-    fx.copy_atom_call(
-        fx.make_copy_atom(fx.rocdl.BufferCopy(dtype.width * vec), dtype),
-        frag,
-        fx.slice(buf, coord),
-    )
+    return fx.Tensor(fx.rocdl.make_buffer_tensor(view, max_size=False))
 
 
 def _rne(v):
@@ -185,51 +155,27 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
         q_rows = total_q * H
         p_rows = num_partial * H
         gq = _buffer(
-            q,
-            fx.make_layout((q_rows * (QK_DIM // 8), 8), (8, 1)),
-            fx.Int64(total_q) * H * QK_DIM,
-            fx.BFloat16,
+            q, fx.BFloat16, fx.make_layout((q_rows * (QK_DIM // 8), 8), (8, 1))
         )
-        gp = _buffer(
-            pages, fx.make_layout((num_indices, 1), (1, 1)), num_indices, fx.Int32
-        )
-        gi = _buffer(
-            indptr, fx.make_layout((num_cus + 1, 1), (1, 1)), num_cus + 1, fx.Int32
-        )
+        gp = _buffer(pages, fx.Int32, fx.make_layout(num_indices, 1))
+        gi = _buffer(indptr, fx.Int32, fx.make_layout(num_cus + 1, 1))
         gw = _buffer(
-            info,
-            fx.make_layout((num_work, INFO_COLS, 1), (INFO_COLS, 1, 1)),
-            fx.Int64(num_work) * INFO_COLS,
-            fx.Int32,
+            info, fx.Int32, fx.make_layout((num_work, INFO_COLS), (INFO_COLS, 1))
         )
         gr = _buffer(
             partial,
+            fx.Float32,
             fx.make_layout((p_rows, OUT_COLS[0]), (V_DIM, OUT_COLS[1])),
-            fx.Int64(num_partial) * H * V_DIM,
-            fx.Float32,
         )
-        gl = _buffer(
-            partial_lse,
-            fx.make_layout((p_rows, 1), (1, 1)),
-            fx.Int64(num_partial) * H,
-            fx.Float32,
-        )
+        gl = _buffer(partial_lse, fx.Float32, fx.make_layout(p_rows, 1))
         go = _buffer(
             output,
-            fx.make_layout((q_rows, OUT_COLS[0]), (V_DIM, OUT_COLS[1])),
-            fx.Int64(total_q) * H * V_DIM,
             fx.BFloat16,
+            fx.make_layout((q_rows, OUT_COLS[0]), (V_DIM, OUT_COLS[1])),
         )
-        gol = _buffer(
-            output_lse,
-            fx.make_layout((q_rows, 1), (1, 1)),
-            fx.Int64(total_q) * H,
-            fx.Float32,
-        )
-        g_scale = _buffer(kv_scale, fx.make_layout((1, 1), (1, 1)), 1, fx.Float32)
-        descale = _uniform(
-            _ld(g_scale, (0, None), fx.Float32).bitcast(fx.Int32)
-        ).bitcast(fx.Float32)
+        gol = _buffer(output_lse, fx.Float32, fx.make_layout(q_rows, 1))
+        g_scale = _buffer(kv_scale, fx.Float32, fx.make_layout(1, 1))
+        descale = _uniform(g_scale[0].bitcast(fx.Int32)).bitcast(fx.Float32)
         score_scale = scale * descale * fx.Float32(1.4426950408889634)
         shared = fx.SharedAllocator().allocate(Shared).peek()
         # One padded KV slab, viewed per access pattern: K operand rows, the
@@ -258,16 +204,16 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
         stats = fx.Tensor(shared.stats.view(fx.make_layout((NT * 16, 3), (3, 1))))
         s_pages = fx.Tensor(shared.pages.view(fx.make_layout(N, 1)))
         sk = shared.kv.ptr
-        begin = _uniform(_ld(gi, (cu, None), fx.Int32))
-        end = _uniform(_ld(gi, (cu + 1, None), fx.Int32))
+        begin = _uniform(gi[cu])
+        end = _uniform(gi[cu + 1])
         for wi in range(begin, end, 1):
             work = fx.Int64(wi)
-            pr = _uniform(_ld(gw, (work, 1, None), fx.Int32))
-            qs = _uniform(_ld(gw, (work, 2, None), fx.Int32))
-            qe = _uniform(_ld(gw, (work, 3, None), fx.Int32))
-            ks = _uniform(_ld(gw, (work, 4, None), fx.Int32))
-            ke = _uniform(_ld(gw, (work, 5, None), fx.Int32))
-            ko = _uniform(_ld(gw, (work, 6, None), fx.Int32))
+            pr = _uniform(gw[(work, 1)])
+            qs = _uniform(gw[(work, 2)])
+            qe = _uniform(gw[(work, 3)])
+            ks = _uniform(gw[(work, 4)])
+            ke = _uniform(gw[(work, 5)])
+            ko = _uniform(gw[(work, 6)])
             qlen = qe - qs
             M = qlen * H
             qregs = []
@@ -288,7 +234,7 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
                         q_off = (r < M).select(
                             q_off, fx.Int64(total_q) * H * (QK_DIM // 8)
                         )
-                        qregs.append(_ld(gq, (q_off, None), fx.BFloat16, 8))
+                        qregs.append(gq[(q_off, None)].load())
             init = [fx.Float32(float("-inf")) for _ in range_constexpr(OWN)]
             init += [fx.Float32(0.0) for _ in range_constexpr(OWN)]
             init += [fx.full(4, 0.0, fx.Float32) for _ in range_constexpr(NT * CD)]
@@ -300,7 +246,7 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
                     tok0 = (tid % (N * GATHER_LANES)) // GATHER_LANES
                     dc0 = tid % GATHER_LANES
                     idx0 = (ks + tok0 < ke).select(ks + tok0, ke - 1)
-                    page0 = _ld(gp, (idx0, None), fx.Int32)
+                    page0 = gp[idx0]
                     base0 = kv + fx.Int64(page0) * QK_DIM
                     for chunk in range_constexpr(3):
                         raw[chunk] = fx.ptr_load(
@@ -318,7 +264,7 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
                     idx = (kb + lookahead + tid < ke).select(
                         kb + lookahead + tid, ke - 1
                     )
-                    page = _ld(gp, (idx, None), fx.Int32)
+                    page = gp[idx]
                     fx.memref_store(
                         fx.ptrtoint(kv + fx.Int64(page) * QK_DIM).to(fx.Uint64),
                         s_pages,
@@ -553,9 +499,9 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
                         for cd in range_constexpr(CD):
                             acc = result[2 * OWN + rt * CD + cd]
                             cols = (store_wave, cd, store_lg, None)
-                            _stv(gr, (out_row, cols), acc * factor, fx.Float32)
+                            gr[(out_row, cols)].store(acc * factor)
                         if (store_wave == 0) & (store_lg == 0):
-                            _st(gl, (out_row, None), lse, fx.Float32)
+                            fx.memref_store(lse, gl, out_row)
                     else:
                         out_row = fx.Int64(qs + qpos) * H + h
                         for cd in range_constexpr(CD):
@@ -565,11 +511,11 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
                                 [_rne(acc[i] * factor) for i in range_constexpr(4)],
                                 dtype=fx.BFloat16,
                             )
-                            _stv(go, (out_row, cols), value, fx.BFloat16)
+                            go[(out_row, cols)].store(value)
                         # Trace-time flag around a device test: they must not be merged.
                         if WRITE_LSE:  # noqa: SIM102
                             if (store_wave == 0) & (store_lg == 0):
-                                _st(gol, (out_row, None), lse, fx.Float32)
+                                fx.memref_store(lse, gol, out_row)
 
     return stage1
 
