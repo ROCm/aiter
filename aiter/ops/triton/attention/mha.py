@@ -121,6 +121,35 @@ def mha_set_impl(impl: Literal["default", "dao_ai"]):
     _MHA_IMPL = _resolve_implementation(impl)
 
 
+def _select_right_window_implementation(
+    implementation: Literal["default", "dao_ai"] | None,
+    q: torch.Tensor,
+    v: torch.Tensor,
+    window_size: tuple[int, int],
+    dropout_p: float,
+    sink: torch.Tensor | None,
+    block_table: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> Literal["default", "dao_ai"] | None:
+    # The default implementation has no right-side sliding window but dao_ai
+    # does, so when the caller hasn't picked an implementation, use dao_ai for
+    # such calls if it supports the rest of the call (no sink, no
+    # positional-encoding head dim, no FP8, no dropout, no block_table/out).
+    if (
+        implementation is None
+        and _MHA_IMPL == "default"
+        and int(window_size[1]) != -1
+        and sink is None
+        and dropout_p == 0.0
+        and q.shape[-1] == v.shape[-1]
+        and not types._is_fp8(q)
+        and block_table is None
+        and out is None
+    ):
+        return "dao_ai"
+    return implementation
+
+
 _USE_INT64_STRIDES = True
 
 
@@ -1270,8 +1299,9 @@ def flash_attn_func(
         q_descale, k_descale, v_descale: optional fp8 dequant scalars, honored only
             by the "gluon" backend when q/k/v are fp8. Shapes (batch, num_q_heads)
             for q and (batch, num_k_heads) for k/v; the output is fp32.
-        implementation: "default" or "dao_ai"; None uses mha_set_impl's default.
-            The selected implementation is retained for backward.
+        implementation: "default" or "dao_ai"; None uses mha_set_impl's default,
+            except that a right sliding window the default implementation can't
+            run goes to dao_ai. The selected implementation is retained for backward.
         backend: "triton" (default) or "gluon". The "gluon" backend runs the
             forward-only gfx950 Gluon kernel and supports the base feature set
             plus FP8, positional encoding, attention sink, a left sliding window
@@ -1411,6 +1441,10 @@ def flash_attn_func(
     backend = _resolve_backend(backend)
     if backend == "gluon" and implementation is not None:
         raise ValueError("implementation is only supported by the Triton backend")
+    if backend == "triton":
+        implementation = _select_right_window_implementation(
+            implementation, q, v, window_size, dropout_p, sink
+        )
     implementation = _resolve_implementation(implementation)
     _LOGGER.info(
         "FLASH_ATTN [%s]:  q=%s  k=%s  v=%s",
@@ -1701,8 +1735,9 @@ def flash_attn_varlen_func(
         q_descale, k_descale, v_descale: optional fp8 dequant scalars, honored only
             by the "gluon" backend when q/k/v are fp8. Shapes (batch, num_q_heads)
             for q and (batch, num_k_heads) for k/v; the output is fp32.
-        implementation: "default" or "dao_ai"; None uses mha_set_impl's default.
-            The selected implementation is retained for backward.
+        implementation: "default" or "dao_ai"; None uses mha_set_impl's default,
+            except that a right sliding window the default implementation can't
+            run goes to dao_ai. The selected implementation is retained for backward.
         backend: "triton" (default) or "gluon". The "gluon" backend runs the
             forward-only gfx950 Gluon kernel and supports the base feature set
             plus FP8, positional encoding, attention sink, a left sliding window
@@ -1723,6 +1758,12 @@ def flash_attn_varlen_func(
     backend = _resolve_backend(backend)
     if backend == "gluon" and implementation is not None:
         raise ValueError("implementation is only supported by the Triton backend")
+    auto_dao_ai = False
+    if backend == "triton" and implementation is None:
+        implementation = _select_right_window_implementation(
+            implementation, q, v, window_size, dropout_p, sink, block_table, out
+        )
+        auto_dao_ai = implementation == "dao_ai"
     implementation = _resolve_implementation(implementation)
     if (
         backend == "triton"
@@ -1770,7 +1811,7 @@ def flash_attn_varlen_func(
             attn_out, softmax_lse, s_dmask, return_lse, return_attn_probs
         )
 
-    return _FlashAttnVarlenFunc.apply(
+    result = _FlashAttnVarlenFunc.apply(
         q,
         k,
         v,
@@ -1794,6 +1835,11 @@ def flash_attn_varlen_func(
         config,
         implementation,
     )
+    if auto_dao_ai and return_lse:
+        # dao_ai returns LSE as (num_q_heads, total_q); a caller that didn't
+        # choose dao_ai expects the documented (total_q, num_q_heads) layout.
+        result = (result[0], result[1].transpose(0, 1), *result[2:])
+    return result
 
 
 def flash_attn_with_kvcache(
