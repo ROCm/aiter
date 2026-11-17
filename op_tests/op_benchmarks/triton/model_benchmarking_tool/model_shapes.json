@@ -995,18 +995,18 @@
                 "page": 64
             },
             {
-                "comment": "CSA",
+                "comment": "CSA, index top-k 512",
                 "hq": 64,
                 "hkv": 1,
                 "dqk": 512,
                 "dv": 512,
                 "kv_len": 128,
-                "extra_len": 256,
+                "extra_len": 512,
                 "page": 64,
                 "extra_page": 64
             },
             {
-                "comment": "HCA",
+                "comment": "HCA, 1024-token context (1024 / 128 compressed keys)",
                 "hq": 64,
                 "hkv": 1,
                 "dqk": 512,
@@ -1150,18 +1150,18 @@
                 "page": 64
             },
             {
-                "comment": "CSA",
+                "comment": "CSA, index top-k 1024",
                 "hq": 128,
                 "hkv": 1,
                 "dqk": 512,
                 "dv": 512,
                 "kv_len": 128,
-                "extra_len": 256,
+                "extra_len": 1024,
                 "page": 64,
                 "extra_page": 64
             },
             {
-                "comment": "HCA",
+                "comment": "HCA, 1024-token context (1024 / 128 compressed keys)",
                 "hq": 128,
                 "hkv": 1,
                 "dqk": 512,

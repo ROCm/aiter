@@ -127,6 +127,12 @@ The sparse MQA benchmark uses `batch_size` as decode token concurrency. It
 gets the context length from `kv_len` and `extra_len`, so the tool runs only
 the first requested `seq_len` value for this kernel.
 
+For DeepSeek-V4, `kv_len` is the 128-key sliding window. On CSA layers,
+`extra_len` is the indexer top-k (`index_topk` in the model config). On HCA
+layers, all compressed keys are read, so `extra_len` is the context length
+divided by 128. It does not change with `seq_len`; set it for the context
+length you want to model.
+
 ### Manifold-constrained hyper-connections (`mhc`)
 
 | Field | Type   | Description                                     |
