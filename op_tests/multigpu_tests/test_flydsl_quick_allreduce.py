@@ -782,10 +782,22 @@ def _test_ladder(
 ) -> tuple:
     """The ladder of a test engine, from the knobs this test pins: the
     production ladder, with *super_tile* and *block* overriding and *grid_cap*
-    bounding every rung.
+    bounding every rung. A schedule with no production ladder on this host
+    (the ring on xGMI) gets one rung, if every knob is pinned.
     """
     link = fly_policy.detect_link()
-    ladder = _ladder(algorithm, world_size, link)
+    pinned = None not in (super_tile, grid_cap, block)
+    if pinned and not _ships(world_size, algorithm, link):
+        ladder = (
+            TwoShotRung(
+                min_bytes=0,
+                super_tile=int(super_tile),
+                grid_cap=int(grid_cap),
+                block=int(block),
+            ),
+        )
+    else:
+        ladder = _ladder(algorithm, world_size, link)
     return tuple(
         dataclasses.replace(
             r,

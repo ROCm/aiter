@@ -36,6 +36,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from ...allreduce_policy import (
+    HANDSHAKES,
     MESH_CODECS,
     SUPER_TILES,
     SUPPORTED_ARCHS,
@@ -52,7 +53,10 @@ from .quick_allreduce_codec import (
     _scale_from_word,
     _splat_f16x2,
     codecs_for_block,
+    lamport_fix,
+    lamport_slots,
     scale_slot_of,
+    split_lamport_packet,
     thread_lane,
 )
 from .quick_allreduce_epilogue import QuickReducePlainEpilogue
@@ -60,17 +64,22 @@ from .quick_allreduce_fusions import check_fusion_args
 from .quick_allreduce_rmsnorm import MeshRMSNormEpilogue
 from .transport import (
     _INBOX_POLICY,
+    _RECV_POLICY,
     ATOMS,
     BLOCK,
     FLAG_I32_PER_LANE,
     FLAG_LANES,
+    LAMPORT_FILL_BYTE,
+    LAMPORT_SENTINEL,
     QUAD_LANES,
     QUADS_PER_WAVE,
     TILE_BYTES,
     WORLD,
     _acquire_inbox,
+    _any_sentinel,
     _buffer_load,
     _buffer_ptr,
+    _buffer_store,
     _color_io,
     _i32_to_bytes,
     _load_flag,
@@ -79,6 +88,7 @@ from .transport import (
     _store_flag_peer,
     _store_v4i32_peer,
     _to_sgpr_i64,
+    lamport_rearm_modifier,
     make_pack_storage,
 )
 
@@ -98,6 +108,16 @@ __all__ = [
 PHASES = 2
 PHASE_REDUCE_SCATTER = 0
 PHASE_ALL_GATHER = 1
+
+# Inbox buffers of the Lamport handshake. A tile (or super-tile group) is two
+# rounds, its reduce-scatter and its all-gather, and round ``r`` uses buffer
+# ``r % 3`` for both laps. A peer is at most one round ahead: its all-gather of
+# group ``g`` needs our reduce-scatter of ``g``, and its reduce-scatter of
+# ``g + 1`` needs our all-gather of ``g``. So while we read round ``r``, a peer
+# writes ``r`` or ``r + 1``, and it writes ``r + 3`` -- our buffer of ``r``
+# again -- only after our push of ``r + 2``. Our re-arm of ``r`` is drained
+# before that push (``_lamport_recv``), so it is never on the critical path.
+LAMPORT_BUFFERS = 3
 
 # (world_size, super_tile) → VGPR-limited workgroups per CU, measured on the
 # mesh kernel. Super-tile widens the live atom list, so residency falls as it
@@ -211,8 +231,14 @@ def make_quick_allreduce_mesh_kernel(
     mxfp4: bool = False,
     low_latency: bool = False,
     rank: int,
+    handshake: str = "flag",
 ):
     check_fusion_args(fusion, hidden, h_pad, mxfp4=mxfp4)
+    if handshake not in HANDSHAKES:
+        raise ValueError(f"handshake must be one of {HANDSHAKES}, got {handshake!r}")
+    lamport = handshake == "lamport"
+    if lamport and fusion != "none":
+        raise ValueError("the lamport handshake has no fused build yet")
     if low_latency and (fusion == "none" or super_tile != 1):
         raise ValueError("low_latency needs a fused build with super_tile=1")
     if world_size not in SUPPORTED_WORLDS:
@@ -263,8 +289,10 @@ def make_quick_allreduce_mesh_kernel(
     # Last-sector pad is ST * rank_atoms * rank_tile_i32 after the ST tiles.
     rank_payload_i32 = rank_atoms * c.rank_tile_i32
     release_i32_off = super_tile * rank_payload_i32
-    wire_tile_i32 = release_i32_off + 16
+    # A Lamport slot has no handshake sector.
+    wire_tile_i32 = release_i32_off + (0 if lamport else 16)
     wire_tile_bytes = wire_tile_i32 * 4
+    rearm_cm = lamport_rearm_modifier(inbox_memory)
 
     # This rank's own index as a trace-time constant: its own slice of every
     # tile never leaves registers, and "all peers but me" is only expressible
@@ -310,14 +338,16 @@ def make_quick_allreduce_mesh_kernel(
     # to be a whole number of 64 B sectors (16 i32s). At a smaller multiple every
     # rank-tile and release sector straddles two hardware sectors, so the 64 B
     # fanout stores and the last-sector release stop being one sector wide.
-    grid_multiple = 16 // (PHASES * world_size)
+    # A Lamport inbox has no flag prefix: its wire area starts at 0.
+    grid_multiple = 1 if lamport else 16 // (PHASES * world_size)
     if grid % grid_multiple != 0:
         raise ValueError(
             f"grid must be a multiple of {grid_multiple} at "
             f"world_size={world_size} to keep the wire area 64 B aligned, got "
             f"{grid}"
         )
-    flags_i32 = PHASES * grid * world_size
+    flags_i32 = 0 if lamport else PHASES * grid * world_size
+    wire_buffers = LAMPORT_BUFFERS if lamport else PHASES
 
     # One signature for both modes; the plain launcher below passes zeros for
     # the fused operands, which a plain epilogue never reads. See the ring
@@ -356,8 +386,10 @@ def make_quick_allreduce_mesh_kernel(
         nt_own_layout = fx.make_layout((c.n_sectors, QUAD_LANES), (16, 4))
         # Four group-16 scale bytes share the i32 slot eight threads already own.
         scale_slot, pair_in_slot = scale_slot_of(tid, block)
+        # The first mode is the lap on the flag handshake, the buffer on the
+        # Lamport one.
         wire_slot_layout = fx.make_layout(
-            (PHASES, grid, world_size, super_tile),
+            (wire_buffers, grid, world_size, super_tile),
             (
                 grid * world_size * wire_tile_i32,
                 world_size * wire_tile_i32,
@@ -373,6 +405,7 @@ def make_quick_allreduce_mesh_kernel(
         peers = _load_peers(peer_ptrs, world_size)
         peer_vec = fx.Vector.from_elements(peers, dtype=fx.Int64)
         inbox = _buffer_ptr(_to_sgpr_i64(peer_vec[rank]), T.i32, 4)
+        inbox_base = peers[self_rank]
 
         def _push_base(j):
             """Inbox base of destination *j*, a lane-varying ``push_peers`` index."""
@@ -484,6 +517,8 @@ def make_quick_allreduce_mesh_kernel(
                     words, scale, is_leader = _codec_quant(
                         c, atoms[dest * rank_atoms + k], lane, tid
                     )
+                    if const_expr(lamport):
+                        words = lamport_fix(c, words, tid)
                     _lds_write_packet(
                         fx.Int32(j * rank_atoms + k), words, scale, is_leader
                     )
@@ -499,6 +534,10 @@ def make_quick_allreduce_mesh_kernel(
             own = []
             for k in range_constexpr(rank_atoms):
                 words, scale, is_leader = _codec_quant(c, accs[k], lane, tid)
+                if const_expr(lamport):
+                    # Before our own decode below, so it decodes what the
+                    # peers do.
+                    words = lamport_fix(c, words, tid)
                 for j in range_constexpr(n_push):
                     _lds_write_packet(
                         fx.Int32(j * rank_atoms + k), words, scale, is_leader
@@ -652,9 +691,12 @@ def make_quick_allreduce_mesh_kernel(
             words, word = _codec_load(c, _get, tid, scale_slot)
             return words, _scale_from_word(c, word, pair_in_slot)
 
-        def _reduce_scattered(sub, own):
+        def _reduce_scattered(sub, own, polled=None):
             """Dequant-accumulate every peer's reduce-scatter packet for *sub*,
-            and *own*, our share from registers, in rank order."""
+            and *own*, our share from registers, in rank order.
+
+            *polled* is ``_lamport_recv``'s result on the Lamport handshake;
+            on the flag handshake the packets are read here."""
             accs = [None] * rank_atoms
             for src in range_constexpr(world_size):
                 for k in range_constexpr(rank_atoms):
@@ -664,16 +706,19 @@ def make_quick_allreduce_mesh_kernel(
                         else:
                             accs[k] = _add_f16(own[k], accs[k])
                     else:
-                        words, scale = _recv_quantized(
-                            PHASE_REDUCE_SCATTER, fx.Int32(src), sub, k
-                        )
+                        if const_expr(polled is None):
+                            words, scale = _recv_quantized(
+                                PHASE_REDUCE_SCATTER, fx.Int32(src), sub, k
+                            )
+                        else:
+                            words, scale = polled[(src, k)]
                         if const_expr(accs[k] is None):
                             accs[k] = _codec_dequant(c, words, scale, tid)
                         else:
                             accs[k] = _codec_dequant(c, words, scale, tid, accs[k])
             return accs
 
-        def _recv_all_gather(sub, own):
+        def _recv_all_gather(sub, own, polled=None):
             """Dequantize every peer's all-gather packet back into full-tile atoms.
 
             Our own chunk is *own*, with ``None`` for atoms stored already.
@@ -686,11 +731,88 @@ def make_quick_allreduce_mesh_kernel(
                     if const_expr(src == self_rank):
                         gathered.append(own[k])
                     else:
-                        words, scale = _recv_quantized(
-                            PHASE_ALL_GATHER, fx.Int32(src), sub, k
-                        )
+                        if const_expr(polled is None):
+                            words, scale = _recv_quantized(
+                                PHASE_ALL_GATHER, fx.Int32(src), sub, k
+                            )
+                        else:
+                            words, scale = polled[(src, k)]
                         gathered.append(_codec_dequant(c, words, _ag_scale(scale), tid))
             return gathered
+
+        def _lamport_fanout(buf, sub):
+            """Push one sub-tile into every peer's slot for this rank in *buf*.
+
+            No drain and no flag: the packet words are their own flag. On a
+            cacheable inbox each wave writes its stores back out of L2.
+            """
+            _fanout_nt(buf, rank, sub)
+            if const_expr(release_scope is not None):
+                _release_inbox(release_scope)
+
+        def _lamport_recv(buf, sub):
+            """Every peer's packet of *sub* in *buf*, ``{(src, k): (words,
+            scale)}``, once none of the dwords this thread reads is the
+            sentinel; then put the sentinel back in them.
+
+            The first reads all go out before any is tested, past L1 and L2.
+            Until every dword has landed, all of them are re-read on each pass,
+            together, rather than one source at a time: a serial spin would
+            pay one more round trip per source. The re-reads are relaxed
+            system-scope atomics (``_load_flag``), which go past L1 and L2 and
+            keep the spin from being deleted. Re-reading a dword that has
+            landed is harmless, since nobody writes it again this round.
+
+            ``vmcnt(0)`` after the spin drains the re-arm of the round before
+            this one, which was issued before these reads: it must land before
+            our next push (``LAMPORT_BUFFERS``). On gfx9 the counter retires
+            in order, so the reads have already waited for it, and this costs
+            nothing; it is explicit so that the argument does not rest on that.
+            A dword that several threads read (scale, extra plane) is read
+            only by lanes of one wave, which all leave the spin before its
+            owner re-arms it.
+            """
+            keys, offs, rearm = [], [], []
+            for src in push_peers:
+                for k in range_constexpr(rank_atoms):
+                    base = _sub_tile_i32(buf, fx.Int32(src), sub) + fx.Int32(
+                        k * c.rank_tile_i32
+                    )
+                    for off, pred in lamport_slots(c, tid, scale_slot):
+                        offs.append(base + off)
+                        rearm.append((base + off, pred))
+                    keys.append((src, k))
+            got = fx.Vector.from_elements(
+                [_buffer_load(inbox, o, 1, fx.Int32, _RECV_POLICY)[0] for o in offs],
+                fx.Int32,
+            )
+            addrs = [inbox_base + _i32_to_bytes(o) for o in offs]
+            while _any_sentinel(got):
+                got = fx.Vector.from_elements([_load_flag(a) for a in addrs], fx.Int32)
+            rocdl.s_waitcnt(vmcnt=0)
+            armed = fx.Vector.from_elements([fx.Int32(LAMPORT_SENTINEL)], fx.Int32)
+            for off, pred in rearm:
+                if pred:
+                    _buffer_store(inbox, off, armed, rearm_cm)
+            per = len(offs) // len(keys)
+            polled = {}
+            for i, key in enumerate(keys):
+                words, word = split_lamport_packet(
+                    c, [got[i * per + j] for j in range_constexpr(per)]
+                )
+                polled[key] = (words, _scale_from_word(c, word, pair_in_slot))
+            return polled
+
+        def _next_buf(buf):
+            nxt = buf + fx.Int32(1)
+            return (nxt >= fx.Int32(LAMPORT_BUFFERS)).select(fx.Int32(0), nxt)
+
+        def _lds_free():
+            """Join the workgroup once this wave's LDS reads have landed, so
+            the next pack cannot overwrite rows a fanout still reads. The flag
+            handshake gets this join from its publish and wait."""
+            rocdl.s_waitcnt(lgkmcnt=0)
+            gpu.barrier()
 
         # ST>1 carries nothing in registers between the three super-tile
         # loops; these move our own share and reduced chunk instead.
@@ -714,8 +836,69 @@ def make_quick_allreduce_mesh_kernel(
         # `grid` still sizes the wire slots and colour array, so
         # n_blocks <= grid always.
         n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
+        # On the flag handshake the colour is the flag value; on the Lamport
+        # one it is the buffer of the next reduce-scatter round.
         color = _load_color()
-        if const_expr(super_tile == 1):
+        if const_expr(lamport and super_tile == 1):
+            for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
+                tile = bid + i * n_blocks
+                atoms = _load_tile_atoms(tile)
+                pre = _prefetch(tile)
+                ag_buf = _next_buf(color)
+                _lds_free()
+                _pack_reduce_scatter(atoms)
+                gpu.barrier()
+                _lamport_fanout(color, fx.Int32(0))
+                polled = _lamport_recv(color, fx.Int32(0))
+                acc = _reduce_scattered(fx.Int32(0), _own_atoms(atoms), polled)
+
+                _lds_free()
+                own_ag = _pack_all_gather(acc)
+                gpu.barrier()
+                _lamport_fanout(ag_buf, fx.Int32(0))
+                polled = _lamport_recv(ag_buf, fx.Int32(0))
+                gathered = _recv_all_gather(fx.Int32(0), own_ag, polled)
+                _finish_tile(tile, gathered, pre)
+                color = _next_buf(ag_buf)
+        elif const_expr(lamport):
+            st_i = fx.Int32(super_tile)
+            for i in range(fx.Int32(0), n_block_tiles, st_i):
+                remain = n_block_tiles - i
+                n_this = (remain < st_i).select(remain, st_i)
+                ag_buf = _next_buf(color)
+
+                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                    tile = bid + (i + s) * n_blocks
+                    atoms = _load_tile_atoms(tile)
+                    _lds_free()
+                    _pack_reduce_scatter(atoms)
+                    gpu.barrier()
+                    _lamport_fanout(color, s)
+
+                # Each sub-tile is reduced as soon as its own packets land,
+                # not once the whole group has.
+                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                    tile = bid + (i + s) * n_blocks
+                    own_rs = [
+                        _load_own_share(tile, k) for k in range_constexpr(rank_atoms)
+                    ]
+                    polled = _lamport_recv(color, s)
+                    acc = _reduce_scattered(s, own_rs, polled)
+                    _lds_free()
+                    own_ag = _pack_all_gather(acc)
+                    for k in range_constexpr(rank_atoms):
+                        _stash_own(tile, self_rank * rank_atoms + k, own_ag[k])
+                    gpu.barrier()
+                    _lamport_fanout(ag_buf, s)
+
+                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                    tile = bid + (i + s) * n_blocks
+                    polled = _lamport_recv(ag_buf, s)
+                    gathered = _recv_all_gather(s, _unstash_own_chunk(tile), polled)
+                    _finish_tile(tile, gathered, None)
+
+                color = _next_buf(ag_buf)
+        elif const_expr(super_tile == 1):
             for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
                 tile = bid + i * n_blocks
                 atoms = _load_tile_atoms(tile)
@@ -891,6 +1074,8 @@ def make_quick_allreduce_mesh_kernel(
     # in cache bits or wire format must not collide in the JIT cache.
     tag = f"{SCALE_CODEC_TAG}_ws{world_size}_r{self_rank}_st{super_tile}_g{grid}"
     tag += f"_{inbox_memory}_{codec}_b{block}" + epilogue.tag
+    if lamport:
+        tag += "_lamport"
     launcher = (
         launch_quick_allreduce_mesh_fused
         if epilogue.takes_operands
@@ -904,7 +1089,7 @@ def make_quick_allreduce_mesh_kernel(
     return {
         "launch": launcher,
         "flags_bytes": flags_i32 * 4,
-        "data_bytes": PHASES * grid * world_size * wire_tile_bytes,
+        "data_bytes": wire_buffers * grid * world_size * wire_tile_bytes,
         "lds_bytes": lds_bytes,
         "tile_bytes": tile_bytes,
         # HBM bytes one tile spans, which is what a tile *count* has to come
@@ -926,5 +1111,8 @@ def make_quick_allreduce_mesh_kernel(
         "grid": grid,
         "block": block,
         "rank": self_rank,
+        "handshake": handshake,
+        # Byte every inbox byte starts as: the Lamport sentinel, or 0.
+        "inbox_fill": LAMPORT_FILL_BYTE if lamport else 0,
         **epilogue.spec(),
     }
