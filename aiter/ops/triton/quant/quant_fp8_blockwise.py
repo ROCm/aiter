@@ -29,6 +29,26 @@ _FP8_MAX = torch.finfo(torch.float8_e4m3fnuz).max
 _BLOCK_SIZE = 128
 
 
+def _no_slp_once_used() -> dict:
+    # LLVM's SLP vectorizer (llvm a9a6edb5935c, in Triton's LLVM since triton#12236) also
+    # seeds from single-use values and packs the software f32 -> fp8 conversion into
+    # <2 x float> / <4 x i8> vectors that gfx950 has to unpack again: +6% instructions
+    # and 4-9% slower blockwise and weight quant. Turn that seeding off for these two
+    # kernels only; the other quant kernels are not affected, and turning it off
+    # globally costs other kernels 10-19%. Triton builds without llvm_cl_opts reject
+    # unknown launch options, so probe for it.
+    try:
+        from triton.backends.amd.compiler import HIPOptions
+    except ImportError:
+        return {}
+    if "llvm_cl_opts" not in HIPOptions.__dataclass_fields__:
+        return {}
+    return {"llvm_cl_opts": "slp-vectorize-once-used=false"}
+
+
+_NO_SLP_ONCE_USED = _no_slp_once_used()
+
+
 def _launch_params(block_size: int) -> dict:
     # Each program loads a [block_size, block_size] tile promoted to fp32.
     # Benchmarks on MI308X show num_warps=4 is the best stable choice across
@@ -107,6 +127,7 @@ def quant_fp8_blockwise(
         AXIS=axis,
         DUAL=False,
         **_launch_params(block_size),
+        **_NO_SLP_ONCE_USED,
     )
     return x_fp8, scales
 
@@ -217,6 +238,7 @@ def quant_fp8_blockwise_for_weight(
         BLOCK_SIZE=block_size,
         FP8_MAX=fp8_max,
         **_launch_params(block_size),
+        **_NO_SLP_ONCE_USED,
     )
     return w_fp8, scales
 
