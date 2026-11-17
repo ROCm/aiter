@@ -39,6 +39,11 @@ For a new kernel to be run by the script, the corresponding benchmark must be im
 | `K`      | int    | Dimension K. |
 | `TP_dim` | string \| null | `"B"`, `"N"`, `"K"`, or `"null"`. |
 
+DeepSeek-V4's grouped low-rank output projection (`wo_a`) is listed under
+`batched_gemm_a8w8` as a stand-in. vLLM, SGLang and ATOM run it as
+`batched_gemm_bf16` or as an FP8 mxscale batched GEMM, and neither is in
+`KERNEL_DICT` yet. Move the shapes to `batched_gemm_bf16` once it is wired.
+
 ### MoE GEMM kernels (e.g. `moe_op_gemm_a8w8`, `moe_op_gemm_a8w8_blockscale`, `moe_op_gemm_a8w4`, `moe_op_gemm_a4w4`)
 
 | Field   | Type | Description |
