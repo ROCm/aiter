@@ -745,6 +745,7 @@ def _grouped_a8w4_tdm_moe(
     next_stage_prefetch=0,
     tdm_as_in_prologue=0,
     tdm_b_th=0,
+    tdm_b_th2=None,
     lds_soa_load_interleave=0,
     rolled_drain=0,
     a_preshuffle=0,
@@ -804,6 +805,8 @@ def _grouped_a8w4_tdm_moe(
         m_warp2 = m_warp
     if n_warp2 is None:
         n_warp2 = n_warp
+    if tdm_b_th2 is None or tdm_b_th2 < 0:
+        tdm_b_th2 = tdm_b_th
     _gemm2_m_align = 0
     if cluster_n2 is None:
         # The two stages want different cluster widths: gemm1 gains from the
@@ -858,6 +861,8 @@ def _grouped_a8w4_tdm_moe(
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
     _align_m = max(tile_m, tile_m2)
+    if tile_m2 < _align_m:
+        _gemm2_m_align = max(_gemm2_m_align, _align_m)
     # Both GEMMs walk the same contiguous layout, each with its own tile height,
     # so every expert must start on a row that is a multiple of both. Aligning to
     # the larger tile only achieves that when it is a multiple of the smaller one.
@@ -1494,7 +1499,7 @@ def _grouped_a8w4_tdm_moe(
         waves_per_tensor_tdm=waves_per_tensor_tdm2,
         next_stage_prefetch=next_stage_prefetch,
         tdm_as_in_prologue=tdm_as_in_prologue,
-        tdm_b_th=tdm_b_th,
+        tdm_b_th=tdm_b_th2,
         lds_soa_load_interleave=lds_soa_load_interleave,
         rolled_drain=rolled_drain,
         k_waves=k_waves2,
@@ -1673,7 +1678,7 @@ def _grouped_a8w4_tdm_moe(
                     waves_per_tensor_tdm=waves_per_tensor_tdm2,
                     next_stage_prefetch=next_stage_prefetch,
                     tdm_as_in_prologue=tdm_as_in_prologue,
-                    tdm_b_th=tdm_b_th,
+                    tdm_b_th=tdm_b_th2,
                     lds_soa_load_interleave=lds_soa_load_interleave,
                     rolled_drain=rolled_drain,
                     k_waves=k_waves2,
@@ -1982,6 +1987,7 @@ def grouped_gemm_gfx1250_a8w4(
                 cfg_row.get("tdm_as_in_prologue"), 0
             )
             _tdm_kw["tdm_b_th"] = _as_int(cfg_row.get("tdm_b_th"), 0)
+            _tdm_kw["tdm_b_th2"] = _as_int(cfg_row.get("tdm_b_th2"), -1)
             _tdm_kw["lds_soa_load_interleave"] = _as_int(
                 cfg_row.get("lds_soa_load_interleave"), 0
             )

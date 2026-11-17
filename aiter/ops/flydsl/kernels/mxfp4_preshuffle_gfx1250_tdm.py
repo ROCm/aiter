@@ -452,10 +452,15 @@ def build_gemm_a8w4_tdm_task(
         ), "persistent EP scatter requires an unquantized combine wire"
     # Resolve per-row settings before specializing the layout and cache key.
     assert lds_soa_load_interleave in (0, 1), "lds_soa_load_interleave must be 0 or 1"
-    planar_lds_on = int(bool(PLANAR_LDS or lds_soa_load_interleave))
+    planar_lds_on = int(
+        bool(
+            PLANAR_LDS
+            or (lds_soa_load_interleave and tile_m == tile_n == tile_k == 256)
+        )
+    )
     # An explicit interleave setting overrides the CSV, including zero.
     interleaved_lds_load_on = int(
-        lds_soa_load_interleave
+        (lds_soa_load_interleave and tile_m == tile_n == tile_k == 256)
         if INTERLEAVED_LDS_LOAD is None
         else INTERLEAVED_LDS_LOAD
     )
@@ -631,10 +636,10 @@ def build_gemm_a8w4_tdm_task(
     )
     interleaved_m_rows = (
         (
-            (inline_zero_acc and stage1_act == 1 and bool(stage1_quant_out))
+            (inline_zero_acc and not enable_ep_scatter)
             or (clustered_persistent and cluster_m == 1)
         )
-        and (cluster_n == 4 or clustered_persistent)
+        and (cluster_n in (2, 4) or clustered_persistent)
         and not row_major_ascale
         and not tdm_as_in_prologue
         and K % tile_k == 0
@@ -646,7 +651,7 @@ def build_gemm_a8w4_tdm_task(
         and a_preshuffled
         and not persistent_workers
         and not enable_ep_scatter
-        and tile_m == 64
+        and tile_m in (64, 128)
         and m_warp == 1
         and n_warp == 4
         and num_buffers == 3
@@ -669,6 +674,8 @@ def build_gemm_a8w4_tdm_task(
         and tile_n == 256
         and tile_k in (128, 256)
     )
+    if narrow_native_row_skip:
+        sched_mma_group, sched_first_group, sched_ds_group = 2, 1, 3
     native_schedule = (
         use_spec_prefill_opt or narrow_native_row_skip or ordinary_short_row_skip
     )
@@ -693,7 +700,10 @@ def build_gemm_a8w4_tdm_task(
     )
     pinned_fp4_prefill = fp4_prefill and explicit_vgpr_partition
     resident_ring_addresses = (
-        pinned_fp4_prefill and bool(next_stage_on) and not rolled_drain
+        pinned_fp4_prefill
+        and bool(next_stage_on)
+        and not rolled_drain
+        and (not plain_gemm_prefill or clustered_persistent)
     )
     persistent_gemm1 = clustered_persistent and stage1_act == 1
     persistent_gemm2 = clustered_persistent and stage1_act == 0
@@ -3594,7 +3604,9 @@ def build_gemm_a8w4_tdm_task(
                 else:
                     run_mainloop(bool(interleaved_lds_load_on), m_reps=8)
             elif const_expr(interleaved_m_rows and clustered_persistent):
-                if mn_oob <= 6 * M_ROW_STEP:
+                if mn_oob <= 4 * M_ROW_STEP:
+                    run_mainloop(bool(interleaved_lds_load_on), m_reps=4)
+                elif mn_oob <= 6 * M_ROW_STEP:
                     run_mainloop(bool(interleaved_lds_load_on), m_reps=6)
                 else:
                     run_mainloop(bool(interleaved_lds_load_on), m_reps=8)
@@ -3626,13 +3638,14 @@ def build_gemm_a8w4_tdm_task(
                     run_mainloop(bool(interleaved_lds_load_on), m_reps=6)
                 else:
                     run_mainloop(bool(interleaved_lds_load_on), m_reps=7)
-            elif const_expr(
-                a_is_fp4 and prefill_w2x2_b4 and cluster_m == 1 and K in (5120, 2304)
-            ):
+            elif const_expr(a_is_fp4 and prefill_w2x2_b4 and cluster_m == 1):
                 # Every wave still executes the full TDM/barrier protocol.
                 # Only 16-row WMMA blocks wholly past the expert end are omitted.
                 if wmb + 4 * M_ROW_STEP >= mn_oob:
-                    if const_expr(compact_skip_empty_wave):
+                    if const_expr(
+                        compact_skip_empty_wave
+                        or (a_preshuffled and not enable_ep_scatter)
+                    ):
                         if wmb >= mn_oob:
                             run_mainloop(bool(interleaved_lds_load_on), m_reps=0)
                         else:
@@ -3883,7 +3896,11 @@ def build_gemm_a8w4_tdm_task(
                                 )
                             else:
                                 # Clamp successive slices without extending every pair's live range.
-                                use_silu_fma = persistent_gemm1 and not is_swiglu
+                                use_silu_fma = (
+                                    persistent_gemm1
+                                    or narrow_native_row_skip
+                                    or ordinary_short_row_skip
+                                ) and not is_swiglu
                                 use_tanh_fma = (
                                     not persistent_gemm1
                                     and native_prefill_compute
@@ -3893,8 +3910,9 @@ def build_gemm_a8w4_tdm_task(
                                 activation_chunk = (
                                     (
                                         16
-                                        if persistent_gemm1
-                                        and (cluster_m == 1 or persistent_workers > 256)
+                                        if not persistent_gemm1
+                                        or cluster_m == 1
+                                        or persistent_workers > 256
                                         else 8
                                     )
                                     if use_silu_fma or use_tanh_fma
@@ -4682,6 +4700,9 @@ def launch_gemm_a8w4_tdm(
     )
     N_UNITS, N_CHUNK, N_PARTS = layout["n_partition"]
     B_COLUMN_MASK = layout["b_column_mask"]
+    balanced_n_sweeps = (
+        next_n_prefetch_on and persistent_packed_m and cluster_m > 1 and stage1_act == 1
+    )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
     def kernel(
@@ -4777,17 +4798,38 @@ def launch_gemm_a8w4_tdm(
                     if N_PARTS > 1 or cluster_m < 4
                     else fx.Float32(0.0)
                 )
-                for owner_job in range(
-                    worker_cluster, owner_count * N_PARTS, cluster_stride
-                ):
-                    owner = owner_job // N_PARTS
-                    first_n = (owner_job % N_PARTS) * N_CHUNK
+                if const_expr(balanced_n_sweeps):
+                    # A contiguous range keeps next-N reuse while bounding the
+                    # longest worker by ceil(total N tasks / resident clusters).
+                    task_count = owner_count * worker_n_units
+                    task_span = ceildiv(task_count, cluster_stride)
+                    task_begin = worker_cluster * task_span
+                    task_end = task_begin + task_span
+                    task_end = (task_end < task_count).select(task_end, task_count)
+                    owner_first = task_begin // worker_n_units
+                    owner_end = ceildiv(task_end, worker_n_units)
+                    owner_step = 1
+                else:
+                    owner_first = worker_cluster
+                    owner_end = owner_count * N_PARTS
+                    owner_step = cluster_stride
+                for owner_job in range(owner_first, owner_end, owner_step):
+                    if const_expr(balanced_n_sweeps):
+                        owner = owner_job
+                        owner_base = owner * worker_n_units
+                        first_n = (task_begin > owner_base).select(
+                            task_begin - owner_base, 0
+                        )
+                    else:
+                        owner = owner_job // N_PARTS
+                        first_n = (owner_job % N_PARTS) * N_CHUNK
                     # Traverse M owners independently of their validated expert bounds.
                     if const_expr(
                         persistent_packed_m
                         and cluster_m == 1
                         and stage1_act == 1
                         and N_PARTS > 1
+                        and not balanced_n_sweeps
                     ):
                         group_first = (owner_job // (64 * N_PARTS)) * 64
                         in_group = owner_job % (64 * N_PARTS)
@@ -4800,7 +4842,10 @@ def launch_gemm_a8w4_tdm(
                         first_n = n_part * N_CHUNK
                         owner = owner_count - 1 - owner
                     n_end = worker_n_units
-                    if const_expr(N_PARTS > 1):
+                    if const_expr(balanced_n_sweeps):
+                        n_end = task_end - owner_base
+                        n_end = (n_end < worker_n_units).select(n_end, worker_n_units)
+                    elif const_expr(N_PARTS > 1):
                         n_end = first_n + N_CHUNK
                         if const_expr(N_UNITS % N_CHUNK):
                             n_end = (n_end < worker_n_units).select(

@@ -51,7 +51,9 @@ def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
         return 1
     if requested_cluster_n not in _SUPPORTED_CLUSTER_N:
         return 1
-    return requested_cluster_n if n_tiles % requested_cluster_n == 0 else 1
+    while n_tiles % requested_cluster_n:
+        requested_cluster_n //= 2
+    return requested_cluster_n
 
 
 def _select_cluster_m(csv_cluster_m: int, cluster_n: int, stage1_act: int) -> int:
