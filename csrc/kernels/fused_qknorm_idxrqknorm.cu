@@ -1616,7 +1616,8 @@ static void fused_qknorm_idxrqknorm_impl(
     std::optional<aiter_tensor_t> v_scale,
     bool asm_layout,
     bool skip_index_branch,
-    std::optional<aiter_tensor_t> qkv_partials)
+    std::optional<aiter_tensor_t> qkv_partials,
+    bool check_only)
 {
     using namespace fused_qknorm_idxrqknorm_ops;
 
@@ -2053,6 +2054,12 @@ static void fused_qknorm_idxrqknorm_impl(
                     qp.stride(0)};
     }
 
+    // check_only: every check above passed, the call would run.
+    if(check_only)
+    {
+        return;
+    }
+
     HipDeviceGuard device_guard(qkv.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
@@ -2447,7 +2454,8 @@ void fused_qknorm_idxrqknorm(
     std::optional<aiter_tensor_t> v_scale,
     bool asm_layout,
     bool skip_index_branch,
-    std::optional<aiter_tensor_t> qkv_partials)
+    std::optional<aiter_tensor_t> qkv_partials,
+    bool check_only)
 {
     // A refused argument raises (RuntimeError in Python) before anything launches.
     aiter_detail::AiterThrowGuard throw_guard;
@@ -2477,7 +2485,8 @@ void fused_qknorm_idxrqknorm(
                                                 v_scale,
                                                 asm_layout,
                                                 skip_index_branch,
-                                                qkv_partials);
+                                                qkv_partials,
+                                                check_only);
 }
 
 } // namespace aiter

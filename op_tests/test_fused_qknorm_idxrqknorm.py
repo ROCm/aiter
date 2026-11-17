@@ -2129,8 +2129,13 @@ def call_edited(call, edits: dict, kwargs: dict, copy: bool = False):
 def check_rejects(cases: dict):
     """name -> (op call, {positional index: replacement}, kwargs, expected message): each
     call must raise RuntimeError with that message, before launching anything (None: must
-    succeed)."""
+    succeed), and fused_qknorm_idxrqknorm_supports must say so beforehand."""
     for name, (call, edits, kwargs, msg) in cases.items():
+        args = [edits.get(i, a) for i, a in enumerate(call.args)]
+        supported = aiter.fused_qknorm_idxrqknorm_supports(
+            *args, **{**call.keywords, **kwargs}
+        )
+        assert supported == (msg is None), f"{name}: supports() said {supported}"
         try:
             call_edited(call, edits, kwargs)
         except RuntimeError as e:

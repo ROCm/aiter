@@ -63,6 +63,7 @@ def _fused_qknorm_idxrqknorm_hip(
     asm_layout: bool = False,
     skip_index_branch: bool = False,
     qkv_partials: Tensor | None = None,
+    check_only: bool = False,
 ) -> None:
     pass
 
@@ -95,6 +96,7 @@ def fused_qknorm_idxrqknorm(
     asm_layout: bool = False,
     skip_index_branch: bool = False,
     qkv_partials: Tensor | None = None,
+    check_only: bool = False,
 ) -> None:
     # The main K/V caches are always passed as separate kv_cache_k / kv_cache_v
     # tensors. asm_layout selects the in-cache addressing: page-16 SHUFFLE
@@ -126,6 +128,8 @@ def fused_qknorm_idxrqknorm(
     #   qkv slot processed (no skip_index_branch), no fp4 cache and no fp8 q_out; by a
     #   reduce kernel launched first otherwise.
     # Refused arguments raise RuntimeError before anything is launched.
+    # check_only: run every check of the call, launch nothing (see
+    #   fused_qknorm_idxrqknorm_supports).
     if index_cache_dtype is None:
         index_cache_dtype = (
             "fp8"
@@ -206,4 +210,16 @@ def fused_qknorm_idxrqknorm(
         asm_layout,
         skip_index_branch,
         qkv_partials,
+        check_only,
     )
+
+
+def fused_qknorm_idxrqknorm_supports(*args, **kwargs) -> bool:
+    """Whether fused_qknorm_idxrqknorm takes this call: the op's own checks, run with
+    the same arguments, without launching anything (host only, no sync). A caller
+    that has another path asks this instead of restating the op's limits."""
+    try:
+        fused_qknorm_idxrqknorm(*args, **kwargs, check_only=True)
+    except (RuntimeError, AssertionError):
+        return False
+    return True
