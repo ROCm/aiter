@@ -323,6 +323,13 @@ The bits do not depend on `bv`, `block` or the `state_grid` values (a test
 checks every `bv`), so these can be retuned. `intra`'s `num_warps` and the
 kernels' layouts cannot change without a new `BI_CONTRACT_VERSION`.
 
+`kda_bi_decode` reads `<arch>/gluon/attention/kda_bi_decode/DEFAULT.json`
+the same way: `step` (`max_requests_one_launch`: the largest request count
+that runs the one-launch kernel; `bv` of that kernel), `out` (`bv` of the
+multi-launch output kernel) and `fill` (`num_warps`). The kernels take
+`num_warps` from the `kda_bi` file, because the shared helpers' layouts
+depend on it. Neither the launch split nor `bv` changes the bits.
+
 ## Autotune
 
 - Give every `@triton.autotune` its list through
