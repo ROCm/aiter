@@ -1290,3 +1290,129 @@ def unified_attention_3d_split_rebalance_kernel(
     want = _floor_div_pos(want + (PROGRAMS - 1), PROGRAMS)
     want = tl.minimum(tl.maximum(want, MIN_TILES), MAX_TILES)
     tl.store(segm_tiles_ptr, want.to(tl.int32))
+
+
+_merge_kv_ring_splits_repr = make_kernel_repr(
+    "merge_kv_ring_splits", ["NUM_SPLITS", "SB", "H", "HB", "D"]
+)
+
+
+@triton.jit(repr=_merge_kv_ring_splits_repr)
+def merge_kv_ring_splits(
+    partial_acc_ptr,  # [num_tokens, H, NUM_SPLITS, D] fp32: each split's normalized output acc / L
+    partial_m_ptr,  # [num_tokens, H, NUM_SPLITS] fp32 raw row max
+    partial_l_ptr,  # [num_tokens, H, NUM_SPLITS] fp32 exp sum
+    output_ptr,
+    output_stride_0,
+    output_stride_1,
+    QK_SCALE,  # softmax scale * log2(e)
+    NUM_SPLITS: tl.constexpr,
+    SB: tl.constexpr,  # splits per loop step (power of 2)
+    H: tl.constexpr,
+    HB: tl.constexpr,  # heads per program (power of 2, divides H)
+    D: tl.constexpr,
+):
+    """Merge the gfx1250 2D loop variant 3 split-KV partials of one query token and HB heads (grid: tokens x H / HB).
+
+    Up to 8 splits: one unrolled step with per-split loads. More: [HB, SB, D] tiles, SB splits at a time, with a running
+    max / sum (any NUM_SPLITS). Every split writes its M / L, and
+    split 0 writes the neutral M = -inf, L = 0 for the empty splits, so an empty split gets weight 0 and its stale
+    acc is selected away, not multiplied."""
+    tok = tl.program_id(0)
+    h = tl.program_id(1) * HB + tl.arange(0, HB)
+    d = tl.arange(0, D)
+    row = tok * (H * NUM_SPLITS) + h * NUM_SPLITS
+    if NUM_SPLITS <= 8:
+        # few splits: per-split [HB, D] loads, unrolled
+        s = tl.arange(0, SB)
+        ml = row[:, None] + s[None, :]
+        smask = (s < NUM_SPLITS)[None, :]
+        m_s = tl.load(partial_m_ptr + ml, mask=smask, other=float("-inf"))
+        l_s = tl.load(partial_l_ptr + ml, mask=smask, other=0.0)
+        mmax = tl.max(m_s, axis=1)
+        w = tl.exp2((m_s - mmax[:, None]) * QK_SCALE)
+        wl = w * l_s
+        o = tl.zeros([HB, D], dtype=tl.float32)
+        for si in tl.static_range(NUM_SPLITS):
+            a = tl.load(partial_acc_ptr + (row + si)[:, None] * D + d[None, :])
+            sel = s[None, :] == si
+            ws = tl.sum(tl.where(sel, w, 0.0), axis=1)[:, None]
+            cs = tl.sum(tl.where(sel, wl, 0.0), axis=1)[:, None]
+            o += tl.where(ws > 0.0, a.to(tl.float32) * cs, 0.0)
+        o = o / tl.sum(wl, axis=1)[:, None]
+    else:
+        m_run = tl.full([HB], float("-inf"), dtype=tl.float32)
+        l_run = tl.zeros([HB], dtype=tl.float32)
+        o = tl.zeros([HB, D], dtype=tl.float32)
+        for s0 in range(0, NUM_SPLITS, SB):
+            s = s0 + tl.arange(0, SB)
+            smask = (s < NUM_SPLITS)[None, :]
+            ml = row[:, None] + s[None, :]
+            m_s = tl.load(partial_m_ptr + ml, mask=smask, other=float("-inf"))
+            l_s = tl.load(partial_l_ptr + ml, mask=smask, other=0.0)
+            a = tl.load(
+                partial_acc_ptr + ml[:, :, None] * D + d[None, None, :],
+                mask=smask[:, :, None],
+                other=0.0,
+            ).to(tl.float32)
+            m_new = tl.maximum(m_run, tl.max(m_s, axis=1))
+            m_ref = tl.where(m_new > float("-inf"), m_new, 0.0)
+            alpha = tl.exp2((m_run - m_ref) * QK_SCALE)
+            wl = tl.exp2((m_s - m_ref[:, None]) * QK_SCALE) * l_s
+            live = wl > 0.0
+            l_run = l_run * alpha + tl.sum(tl.where(live, wl, 0.0), axis=1)
+            o = o * alpha[:, None] + tl.sum(
+                tl.where(live[:, :, None], a * wl[:, :, None], 0.0), axis=1
+            )
+            m_run = m_new
+        o = o / l_run[:, None]
+    tl.store(
+        output_ptr + tok * output_stride_0 + h[:, None] * output_stride_1 + d[None, :],
+        o.to(output_ptr.dtype.element_ty),
+    )
+
+
+_merge_kv_ring_splits_full_repr = make_kernel_repr(
+    "merge_kv_ring_splits_full", ["NUM_SPLITS", "H", "HB", "D"]
+)
+
+
+@triton.jit(repr=_merge_kv_ring_splits_full_repr)
+def merge_kv_ring_splits_full(
+    partial_acc_ptr,  # [num_tokens, H, NUM_SPLITS, D] fp32: each split's normalized output acc / L
+    partial_m_ptr,  # [num_tokens, H, NUM_SPLITS] fp32 raw row max
+    partial_l_ptr,  # [num_tokens, H, NUM_SPLITS] fp32 exp sum
+    output_ptr,
+    output_stride_0,
+    output_stride_1,
+    QK_SCALE,  # softmax scale * log2(e)
+    NUM_SPLITS: tl.constexpr,  # <= 8 (unrolled)
+    H: tl.constexpr,
+    HB: tl.constexpr,  # heads per program (power of 2, divides H)
+    D: tl.constexpr,
+):
+    """Merge for loop variant 3 splits, at most 8 (grid: tokens x H / HB). Same math as
+    merge_kv_ring_splits' unrolled step, with per-split [HB] row weights: every thread computes its own rows'
+    weights (no cross-lane max / sum), and one reciprocal per row replaces the per-element divide. Empty splits
+    (neutral M = -inf, L = 0, acc not written) get weight 0 and their acc is selected away.
+    """
+    tok = tl.program_id(0)
+    h = tl.program_id(1) * HB + tl.arange(0, HB)
+    d = tl.arange(0, D)
+    row = tok * (H * NUM_SPLITS) + h * NUM_SPLITS
+    mmax = tl.load(partial_m_ptr + row)
+    for si in tl.static_range(1, NUM_SPLITS):
+        mmax = tl.maximum(mmax, tl.load(partial_m_ptr + row + si))
+    l_sum = tl.zeros([HB], dtype=tl.float32)
+    o = tl.zeros([HB, D], dtype=tl.float32)
+    for si in tl.static_range(NUM_SPLITS):
+        a = tl.load(partial_acc_ptr + (row + si)[:, None] * D + d[None, :])
+        w = tl.exp2((tl.load(partial_m_ptr + row + si) - mmax) * QK_SCALE)
+        wl = w * tl.load(partial_l_ptr + row + si)
+        l_sum += wl
+        o += tl.where(w[:, None] > 0.0, a.to(tl.float32) * wl[:, None], 0.0)
+    o = o * (1.0 / l_sum)[:, None]
+    tl.store(
+        output_ptr + tok * output_stride_0 + h[:, None] * output_stride_1 + d[None, :],
+        o.to(output_ptr.dtype.element_ty),
+    )
