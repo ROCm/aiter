@@ -1792,7 +1792,18 @@ def _discover_providers() -> (
     for entry_point in entry_points:
         try:
             loaded = entry_point.load()
-            provider = loaded if hasattr(loaded, "select") else loaded()
+            # A class has a `select` attribute too -- the unbound function --
+            # so `hasattr` alone treats the class as its own instance and
+            # later calls `select(op, args, kwargs)` with `op` landing in
+            # `self`. The entry point in this interface's own documentation
+            # points at a class, so that is the common spelling, not an edge
+            # case. Instantiate anything that is a class; a zero-argument
+            # factory and a ready instance both still work.
+            provider = (
+                loaded()
+                if isinstance(loaded, type) or not hasattr(loaded, "select")
+                else loaded
+            )
             name = provider.name
             _ = provider.op_versions
             declared = _declared_api_versions(provider, name)

@@ -69,9 +69,11 @@ Declare the entry point so AITER can find it:
 mylib = "mylib.aiter_provider:MyProvider"
 ```
 
-The target may be a provider instance or a zero-argument factory. Anything with
-a `select` attribute is treated as an instance, so a class object is never
-called.
+The target may be a class (as above), a zero-argument factory, or a ready
+instance. A class is instantiated with no arguments, so give your provider an
+`__init__` that takes none — anything it needs to set up belongs in `select()`
+or behind a lazy import, since discovery happens before any framework has
+enabled you.
 
 Then a framework — not you, and not the environment — turns it on:
 
