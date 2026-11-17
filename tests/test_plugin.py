@@ -711,12 +711,16 @@ def test_a_latency_that_cannot_mean_anything_is_refused(bad):
         )
 
 
-def test_a_reported_latency_does_not_influence_routing(monkeypatch):
-    """Observation, not input. The enable list is still the only preference.
+def test_a_bare_latency_does_not_influence_routing(monkeypatch):
+    """A number on its own is not a comparison, and does not decide anything.
 
-    If this ever became an input, a provider could win by reporting a small
-    number, and the enable list -- the one place that names an owner for the
-    decision -- would stop deciding.
+    Selection reads a *comparison*: a latency together with the AITER baseline
+    it was measured against, and the conditions. Without those, a provider
+    could win by reporting a small number -- and the enable list, the one place
+    that names an owner for the decision, would stop deciding. So a bare
+    `latency_us` is recorded, handed back, and ignored for routing, which is
+    what this asserts: 99999us is selected over 1.0us because the enable list
+    says so and neither report is comparable.
     """
 
     def candidate_at(name, latency, result):
@@ -738,7 +742,7 @@ def test_a_reported_latency_does_not_influence_routing(monkeypatch):
     plugin.configure(enable=("slowpoke", "speedy"), source="test")
     add = _route_add([])
 
-    assert add(2, 3) == 1, "the enable list decides, not the reported number"
+    assert add(2, 3) == 1, "the enable list decides; neither report is comparable"
     assert plugin.last_decision().provider == "slowpoke"
     assert plugin.last_decision().latency_us == 99999.0
 
@@ -2105,3 +2109,156 @@ def test_check_report_says_exactly_what_a_measurement_is_missing():
     assert len(missing) == 4
     assert any("baseline_us" in item for item in missing)
     assert any("measurement_ref" in item for item in missing)
+
+
+# ---------------------------------------------------------------------------
+# Mixed fields, and more than two providers
+#
+# A deployment can have many providers on one contract, each reporting or not
+# independently. The rules are small, but their combinations are where a
+# provider learns whether declining to report costs it anything, so each one is
+# pinned rather than left to follow from the others.
+# ---------------------------------------------------------------------------
+
+
+def _silent(name, result):
+    """A candidate that reports nothing: unmeasured, not slow."""
+
+    return plugin.KernelCandidate(
+        provider=name,
+        kernel_id=f"{name}-kernel",
+        artifact_digest="sha256:abc",
+        run=lambda *args, **kwargs: result,
+    )
+
+
+def test_a_comparable_report_outranks_a_provider_that_reported_nothing(monkeypatch):
+    """Evidence beats enable order, even when the silent one is listed first."""
+
+    quiet = _Provider("quiet", _silent("quiet", 1))
+    loud = _Provider("loud", _measured("loud", 2, latency=4.0, baseline=10.0))
+    _enable(monkeypatch, quiet, loud)
+
+    assert _route_add([])(2, 3) == 2
+    assert plugin.last_decision().reason == plugin.PROVIDER_FASTER
+
+
+def test_reporting_nothing_still_wins_over_reporting_a_loss(monkeypatch):
+    """Silence is "unmeasured", not "slow" -- a measured loss is worse.
+
+    The provider that measured itself against AITER and lost has said
+    something; the one that said nothing may well be faster and simply has not
+    checked. Treating silence as a loss would punish the provider that declines
+    to publish a number it cannot stand behind.
+    """
+
+    lost = _Provider("lost", _measured("lost", 1, latency=12.0, baseline=10.0))
+    quiet = _Provider("quiet", _silent("quiet", 2))
+    _enable(monkeypatch, lost, quiet)
+
+    assert _route_add([])(2, 3) == 2
+    assert plugin.last_decision().provider == "quiet"
+    assert plugin.last_decision().reason == "selected"
+
+
+def test_everyone_silent_is_exactly_the_old_behaviour(monkeypatch):
+    """Three providers, none reporting: enable order, unchanged."""
+
+    first = _Provider("first", _silent("first", 1))
+    second = _Provider("second", _silent("second", 2))
+    third = _Provider("third", _silent("third", 3))
+    _enable(monkeypatch, first, second, third)
+
+    assert _route_add([])(2, 3) == 1
+    assert plugin.last_decision().provider == "first"
+    assert plugin.last_decision().reason == "selected"
+
+
+def test_three_providers_one_of_each_kind(monkeypatch):
+    """Reported-and-faster, reported-and-slower, and silent, together."""
+
+    lost = _Provider("lost", _measured("lost", 1, latency=12.0, baseline=10.0))
+    quiet = _Provider("quiet", _silent("quiet", 2))
+    won = _Provider("won", _measured("won", 3, latency=4.0, baseline=10.0))
+    _enable(monkeypatch, lost, quiet, won)
+
+    # Listed last and still selected: only it carries a comparison it wins.
+    assert _route_add([])(2, 3) == 3
+    decision = plugin.last_decision()
+    assert decision.provider == "won"
+    assert decision.reason == plugin.PROVIDER_FASTER
+    assert all(p.select_calls == 1 for p in (lost, quiet, won))
+
+
+def test_the_fastest_of_several_comparable_reports_serves(monkeypatch):
+    """Absolute reported time, not the largest margin over its own baseline."""
+
+    # "wide" claims the bigger improvement (10x) but is slower in absolute
+    # terms; the offers answer the same call, so absolute time is what compares.
+    wide = _Provider("wide", _measured("wide", 1, latency=5.0, baseline=50.0))
+    quick = _Provider("quick", _measured("quick", 2, latency=3.0, baseline=4.0))
+    middle = _Provider("middle", _measured("middle", 3, latency=4.0, baseline=9.0))
+    _enable(monkeypatch, wide, quick, middle)
+
+    assert _route_add([])(2, 3) == 2
+    assert plugin.last_decision().provider == "quick"
+
+
+def test_excluding_the_fastest_hands_the_call_to_the_next_comparable(monkeypatch):
+    """What a framework does when one kernel is fast and wrong."""
+
+    fast = _Provider("fast", _measured("fast", 1, latency=3.0, baseline=10.0))
+    fast.op_versions = {"test.add": {1}}
+    slower = _Provider("slower", _measured("slower", 2, latency=6.0, baseline=10.0))
+    slower.op_versions = {"test.add": {1}}
+    _installed(monkeypatch, fast, slower)
+
+    plugin.configure(
+        enable=("fast", "slower"), source="test", exclude=("fast:test.add",)
+    )
+    assert _route_add([])(2, 3) == 2
+    assert plugin.last_decision().provider == "slower"
+    # Excluded before being asked, not after being compared.
+    assert fast.select_calls == 0
+
+
+def test_one_provider_raising_does_not_disturb_the_comparison(monkeypatch):
+    """Isolation holds while comparing, not only while asking one at a time."""
+
+    class Exploding:
+        name = "exploding"
+        api_versions: ClassVar[set] = {plugin.API_VERSION}
+        op_versions: ClassVar[dict] = {"test.add": {1}}
+
+        def select(self, op, args, kwargs):
+            raise RuntimeError("select is broken")
+
+    good = _Provider("good", _measured("good", 7, latency=4.0, baseline=10.0))
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("x", Exploding()), _EntryPoint("g", good)),
+    )
+    plugin.configure(enable=("exploding", "good"), source="test")
+
+    assert _route_add([])(2, 3) == 7
+    assert plugin.last_decision().reason == plugin.PROVIDER_FASTER
+
+
+def test_most_providers_declining_is_the_partitioned_case(monkeypatch):
+    """Many providers on one contract, each serving its own slice.
+
+    A deployment can place several providers on one op and have each decline
+    everything outside the shapes it owns. Only one offers, so there is nothing
+    to compare and the reason says so -- the comparison machinery costs such a
+    deployment nothing.
+    """
+
+    declining = [_Provider(f"slice{i}", None) for i in range(5)]
+    owner = _Provider("owner", _silent("owner", 9))
+    _enable(monkeypatch, *declining, owner)
+
+    assert _route_add([])(2, 3) == 9
+    assert plugin.last_decision().provider == "owner"
+    assert plugin.last_decision().reason == "selected"
+    assert all(p.select_calls == 1 for p in declining)
