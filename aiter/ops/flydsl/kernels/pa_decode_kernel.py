@@ -1314,7 +1314,8 @@ def compile_gfx1250_pa_decode(t):
                 t.cluster_seqs * t.cluster_merge
             )
             if const_expr(t.quant_output):
-                # One cluster per P padded FP8 rows past the sequences' tokens.
+                # One cluster per t.cluster_merge padded FP8 rows past the
+                # sequences' tokens.
                 pads = quant_rows - sequences * t.query_length
                 grid_x = (
                     sequences + (pads + t.cluster_merge - 1) // t.cluster_merge

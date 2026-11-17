@@ -1672,7 +1672,9 @@ class Gfx1250Traits:
 
     @property
     def quant_unit(self):
-        # Rows sharing one FP8 output scale group; sizes the LDS maxima above.
+        # Rows behind one per-wave LDS maximum (a token is
+        # query_group_size // quant_unit of them); sizes the maxima region
+        # at quant_offset.
         return math.gcd(self.query_group_size, 16)
 
     @property
