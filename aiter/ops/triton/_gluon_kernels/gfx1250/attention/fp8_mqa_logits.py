@@ -778,14 +778,31 @@ def _gluon_fp8_mqa_logits_kernel(
 # ---------------------------------------------------------------------------
 _gluon_fp8_mqa_logits_rowgroup_kernel_repr = make_kernel_repr(
     "_gluon_fp8_mqa_logits_rowgroup_kernel",
-    ["NUM_HEADS", "HEAD_SIZE", "BLOCK_M", "BLOCK_KV", "NUM_WARPS", "WARPS_M",
-     "USE_BUFFER_LOAD", "USE_BUFFER_STORE"],
+    [
+        "NUM_HEADS",
+        "HEAD_SIZE",
+        "BLOCK_M",
+        "BLOCK_KV",
+        "NUM_WARPS",
+        "WARPS_M",
+        "USE_BUFFER_LOAD",
+        "USE_BUFFER_STORE",
+        "EXACT_ROWS",
+        "PACKED",
+    ],
 )
 
 
 @gluon.jit(repr=_gluon_fp8_mqa_logits_rowgroup_kernel_repr)
 def _gluon_fp8_mqa_logits_rowgroup_kernel(
-    Q_ptr, KV_ptr, kv_scales_ptr, weights_ptr, cu_start_ptr, cu_end_ptr, logits_ptr,
+    Q_ptr,
+    KV_ptr,
+    kv_scales_ptr,
+    weights_ptr,
+    cu_start_ptr,
+    cu_end_ptr,
+    logits_ptr,
+    out_offsets_ptr,  # int32/int64 [seq_len]: each row's start when PACKED
     seq_len: gl.int32,
     seq_len_kv: gl.int32,
     NUM_HEADS: gl.constexpr,
@@ -805,7 +822,12 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
     WARPS_M: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
+    EXACT_ROWS: gl.constexpr = False,
+    PACKED: gl.constexpr = False,
 ):
+    # Without EXACT_ROWS a block writes the union of its rows' key ranges; with it
+    # (clean_logits, packed) each row writes only its own [start, end). The values
+    # are the same either way, so every call mode returns identical bits.
     block_id = gl.num_programs(0) - gl.program_id(axis=0) - 1
     row0 = gl.minimum(block_id * BLOCK_M, seq_len - BLOCK_M)
     if not USE_BUFFER_STORE:
@@ -817,7 +839,11 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
     # warp bases in WMMA-tile units: first along keys, then along rows (one row =
     # NUM_HEADS // 16 tiles of M), so a row's heads stay inside one warp.
     WB_N: gl.constexpr = [[0, 1], [0, 2], [0, 4]]
-    WB_M: gl.constexpr = [[NUM_HEADS // 16, 0], [2 * (NUM_HEADS // 16), 0], [4 * (NUM_HEADS // 16), 0]]
+    WB_M: gl.constexpr = [
+        [NUM_HEADS // 16, 0],
+        [2 * (NUM_HEADS // 16), 0],
+        [4 * (NUM_HEADS // 16), 0],
+    ]
     if WARPS_N == 1:
         if WARPS_M == 1:
             warp_bases: gl.constexpr = []
@@ -847,20 +873,31 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
     else:
         reg_bases: gl.constexpr = []
     mfma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
-        version=3, transposed=False, instr_shape=[16, 16, 128], warp_bases=warp_bases,
+        version=3,
+        transposed=False,
+        instr_shape=[16, 16, 128],
+        warp_bases=warp_bases,
         reg_bases=reg_bases,
     )
-    dot_a_layout: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=16)
-    dot_b_layout: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=16)
+    dot_a_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_layout, k_width=16
+    )
+    dot_b_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_layout, k_width=16
+    )
     Q_INNER: gl.constexpr = HEAD_SIZE // 16
     layout_q: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 16], threads_per_warp=[WARP_SIZE // Q_INNER, Q_INNER],
-        warps_per_cta=[NUM_WARPS, 1], order=[1, 0],
+        size_per_thread=[1, 16],
+        threads_per_warp=[WARP_SIZE // Q_INNER, Q_INNER],
+        warps_per_cta=[NUM_WARPS, 1],
+        order=[1, 0],
     )
     SPT_N: gl.constexpr = max(1, BLOCK_KV // (WARP_SIZE * NUM_WARPS))
     store_layout: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, SPT_N], threads_per_warp=[1, WARP_SIZE],
-        warps_per_cta=[1, NUM_WARPS], order=[1, 0],
+        size_per_thread=[1, SPT_N],
+        threads_per_warp=[1, WARP_SIZE],
+        warps_per_cta=[1, NUM_WARPS],
+        order=[1, 0],
     )
 
     m_q = gl.arange(0, BM_ROWS, layout=gl.SliceLayout(1, layout_q))
@@ -868,14 +905,17 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
     q = gl.amd.cdna4.buffer_load(
         ptr=Q_ptr,
         offsets=(row0 + m_q // NUM_HEADS)[:, None] * stride_q_s
-        + (m_q % NUM_HEADS)[:, None] * stride_q_h + d_q[None, :] * stride_q_d,
+        + (m_q % NUM_HEADS)[:, None] * stride_q_h
+        + d_q[None, :] * stride_q_d,
         cache=".cg",
     )
     mfma_q = gl.convert_layout(q, dot_a_layout)
     m_w = gl.arange(0, BM_ROWS, layout=gl.SliceLayout(1, mfma_layout))
     w = gl.amd.cdna4.buffer_load(
         ptr=weights_ptr,
-        offsets=((row0 + m_w // NUM_HEADS) * stride_w_s + (m_w % NUM_HEADS) * stride_w_h)[:, None],
+        offsets=(
+            (row0 + m_w // NUM_HEADS) * stride_w_s + (m_w % NUM_HEADS) * stride_w_h
+        )[:, None],
         cache=".cg",
     )
 
@@ -889,13 +929,35 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
     union_start = gl.minimum(union_start, union_end)
 
     kv_loader = MQATDMKVLoader.initialize(
-        KV_ptr, union_start, seq_len_kv, stride_kv_s, stride_kv_d,
-        BLOCK_KV, HEAD_SIZE, NUM_WARPS, WARP_SIZE, 2,
+        KV_ptr,
+        union_start,
+        seq_len_kv,
+        stride_kv_s,
+        stride_kv_d,
+        BLOCK_KV,
+        HEAD_SIZE,
+        NUM_WARPS,
+        WARP_SIZE,
+        2,
     )
     rows_st = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, store_layout))
     keys_st = gl.arange(0, BLOCK_KV, layout=gl.SliceLayout(0, store_layout))
-    store_offsets = rows_st[:, None] * stride_logits_s + keys_st[None, :] * stride_logits_k
+    store_offsets = (
+        rows_st[:, None] * stride_logits_s + keys_st[None, :] * stride_logits_k
+    )
+    if EXACT_ROWS:
+        row_start = gl.maximum(gl.load(cu_start_ptr + row0 + rows_st), 0)
+        row_end = gl.minimum(gl.load(cu_end_ptr + row0 + rows_st), seq_len_kv)
+    if PACKED:
+        # column c of row r goes to out_offsets[r] + c - start(r); 32-bit buffer-store
+        # offsets whenever the whole buffer fits (the wrapper sets USE_BUFFER_STORE so)
+        packed_base = gl.load(out_offsets_ptr + row0 + rows_st)
+        if USE_BUFFER_STORE:
+            packed_base = packed_base.to(gl.int32) - row_start
+        else:
+            packed_base = packed_base.to(gl.int64) - row_start
     kv_scales_ptr = kv_scales_ptr + union_start
+    out_base = logits_ptr
     logits_ptr = logits_ptr + row0 * stride_logits_s + union_start * stride_logits_k
     span = union_end - union_start
     num_full_tiles = span // BLOCK_KV
@@ -905,8 +967,12 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
     buf_cur: gl.int32 = 0
     kv_off: gl.int32 = 0
     for i in tl.range(0, num_full_tiles + 1):
-        mfma_k = kv_loader.load_from_shared(wait_count=1, target_layout=dot_b_layout, buffer_id=buf_cur)
-        kv_loader.load_to_shared(kv_off + 2 * BLOCK_KV, buffer_id=buf_cur, USE_BUFFER_LOAD=USE_BUFFER_LOAD)
+        mfma_k = kv_loader.load_from_shared(
+            wait_count=1, target_layout=dot_b_layout, buffer_id=buf_cur
+        )
+        kv_loader.load_to_shared(
+            kv_off + 2 * BLOCK_KV, buffer_id=buf_cur, USE_BUFFER_LOAD=USE_BUFFER_LOAD
+        )
         acc = gl.zeros([BM_ROWS, BLOCK_KV], dtype=gl.float32, layout=mfma_layout)
         sc = gl.amd.gfx1250.wmma(mfma_q, mfma_k, acc)
         sc = relu_f32(sc) * w
@@ -915,8 +981,31 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
         keymask = keys_st < (span - kv_off)
         kvs = gl.load(kv_scales_ptr + kv_off + keys_st, mask=keymask, other=0.0)
         red = red * kvs[None, :]
-        _store_logits_block(logits_ptr, store_offsets, red, USE_BUFFER_STORE,
-                            mask=(keymask[None, :] & (rows_st[:, None] >= 0)))
+        if EXACT_ROWS:
+            col = union_start + kv_off + keys_st
+            inrow = (col[None, :] >= row_start[:, None]) & (
+                col[None, :] < row_end[:, None]
+            )
+            if PACKED:
+                _store_logits_block(
+                    out_base,
+                    packed_base[:, None] + col[None, :],
+                    red,
+                    USE_BUFFER_STORE,
+                    mask=inrow,
+                )
+            else:
+                _store_logits_block(
+                    logits_ptr, store_offsets, red, USE_BUFFER_STORE, mask=inrow
+                )
+        else:
+            _store_logits_block(
+                logits_ptr,
+                store_offsets,
+                red,
+                USE_BUFFER_STORE,
+                mask=(keymask[None, :] & (rows_st[:, None] >= 0)),
+            )
         kv_off += BLOCK_KV
         logits_ptr += BLOCK_KV * stride_logits_k
         buf_cur = 1 - buf_cur

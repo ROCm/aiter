@@ -96,7 +96,13 @@ def _gfx942_tile_fits_lds(
     return lds_bytes <= 0.9 * _GFX942_CU_LDS_BYTES
 
 
-def _gfx1250_launch_config(seq_len_kv: int) -> dict:
+# The row-group kernel runs seq_len // BLOCK_M workgroups. Below 2048 rows (~2 per CU
+# on gfx1250's 256 CUs) one workgroup per row is as fast or faster for every row
+# layout measured (1024 rows: 0.64x-1.18x for the row-group), so it starts there.
+_ROWGROUP_MIN_ROWS = 2048
+
+
+def _gfx1250_launch_config(seq_len_kv: int, num_heads: int, head_size: int) -> dict:
     """gfx1250 launch parameters for this call, from the tuned table.
 
     configs/gfx1250/gluon/attention/fp8_mqa_logits/DEFAULT.json buckets by KV length
@@ -104,20 +110,23 @@ def _gfx1250_launch_config(seq_len_kv: int) -> dict:
     per-row [start, end) ranges. Without the table, keep the previous fixed launch.
     A row may carry a "rowgroup" entry (BLOCK_M, BLOCK_KV, NUM_WARPS, WARPS_M,
     waves_per_eu): the row-group kernel, used when the chunk has >= BLOCK_M rows.
+    The table was tuned for 32 heads x head size 128 (the Kimi-K3.1 DSA indexer); other
+    shapes keep the fixed launch.
     """
-    cfg = dict(
-        BLOCK_KV=128,
-        NUM_WARPS=4,
-        LOOP_VARIANT=1,
-        NUM_CHAINS=8,
-        waves_per_eu=1,
-        enable_fp_fusion=False,
-    )
+    cfg = {
+        "BLOCK_KV": 128,
+        "NUM_WARPS": 4,
+        "LOOP_VARIANT": 1,
+        "NUM_CHAINS": 8,
+        "waves_per_eu": 1,
+    }
     cfg_dir = resolve_config_dir("attention", "FP8_MQA_LOGITS", backend="gluon")
     table = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
-    if table:
+    if table and (num_heads, head_size) == (32, 128):
         keyed = sorted(
-            (int(k.split("_")[-1]), v) for k, v in table.items() if k.startswith("KV_LEQ_")
+            (int(k.split("_")[-1]), v)
+            for k, v in table.items()
+            if k.startswith("KV_LEQ_")
         )
         row = next((v for bound, v in keyed if seq_len_kv <= bound), table.get("any"))
         if row:
@@ -379,11 +388,12 @@ def fp8_mqa_logits(
             }
             grid = ((seq_len + block_m - 1) // block_m, num_kv_splits)
         else:
-            cfg = _gfx1250_launch_config(seq_len_kv)
+            cfg = _gfx1250_launch_config(seq_len_kv, num_heads, head_size)
             rg = cfg.get("rowgroup")
-            # The row-group kernel walks the union of a block's row ranges and writes
-            # it whole, so it needs clean_logits=False (out-of-window = unspecified).
-            if rg and seq_len >= rg["BLOCK_M"] and not clean_logits and not packed:
+            # The row-group kernel serves every call mode of a shape (so all modes
+            # return the same bits); exact per-row stores for clean_logits / packed,
+            # the union of a block's row ranges otherwise (out-of-window unspecified).
+            if rg and seq_len >= max(rg["BLOCK_M"], _ROWGROUP_MIN_ROWS):
                 # Row-group kernel: BLOCK_M rows share each K tile (see the kernel).
                 _gluon_fp8_mqa_logits_rowgroup_kernel[
                     (triton.cdiv(seq_len, rg["BLOCK_M"]),)
@@ -395,6 +405,7 @@ def fp8_mqa_logits(
                     cu_starts,
                     cu_ends,
                     logits,
+                    out_offsets,
                     seq_len=seq_len,
                     seq_len_kv=seq_len_kv,
                     NUM_HEADS=num_heads,
@@ -414,8 +425,15 @@ def fp8_mqa_logits(
                     WARPS_M=rg["WARPS_M"],
                     USE_BUFFER_LOAD=use_buffer_load,
                     USE_BUFFER_STORE=use_buffer_store,
+                    EXACT_ROWS=clean_logits or packed,
+                    PACKED=packed,
                     num_warps=rg["NUM_WARPS"],
-                    waves_per_eu=rg["waves_per_eu"],
+                    # the per-row masks need registers; keep exact-row variants unspilled
+                    waves_per_eu=(
+                        min(rg["waves_per_eu"], 2)
+                        if (clean_logits or packed)
+                        else rg["waves_per_eu"]
+                    ),
                 )
                 return logits
             loop_variant = cfg["LOOP_VARIANT"]
@@ -426,8 +444,6 @@ def fp8_mqa_logits(
             # This kernel has no BLOCK_M: it walks one query row per program.
             block_m = 1
             other = {"LOOP_VARIANT": loop_variant}
-            if cfg["enable_fp_fusion"]:
-                other["enable_fp_fusion"] = True
             grid = ((seq_len + block_m - 1) // block_m,)
 
         _gluon_fp8_mqa_logits_kernel[grid](
