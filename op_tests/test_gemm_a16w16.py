@@ -795,12 +795,12 @@ def test_asm_last_tile_at_allocation_end():
     # (name, bpreshuffle, splitK, out dtype, M tile rows, K values); name None
     # is the heuristic, whose M = 257 and 258 leave 1 or 2 rows in the last
     # tile of 64-, 128- and 256-row kernels. Split-K with bf16 output adds
-    # bf16 partial sums, so split-K runs use FP32 output. The heuristic runs
-    # without preshuffle at K = 128 only: at K = 64 it picks a *_splitk_clean
-    # kernel at split 1, which faults on main as well.
+    # bf16 partial sums, so split-K runs use FP32 output. The heuristic runs at
+    # K = 128 only, except with preshuffle on gfx950: at K = 64 it can pick a
+    # *_splitk_clean kernel at split 1, which faults on main as well.
     kernels = [
         (None, False, None, dtypes.fp32, 256, (128,)),
-        (None, True, None, dtypes.fp32, 256, (64, 128)),
+        (None, True, None, dtypes.fp32, 256, (64, 128) if gfx == "gfx950" else (128,)),
         (pf3, False, 1, dtypes.bf16, 64, (64, 128)),
         (bshuffle, True, 1, dtypes.bf16, 64, (64, 128)),
         (clean, False, 2, dtypes.fp32, 64, (128,)),
