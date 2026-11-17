@@ -4,11 +4,12 @@
 """DeepSeek-V4.1-Flash EP4 MXFP4 (a4w4) fused-MoE rows are what fused_moe looks up.
 
 Under 4-way expert parallelism the target's MoE has 96 local experts (top-6) and the
-DSpark drafter's 32 (top-3), hidden 5120, intermediate 2304. Their rows at
-M = 512..16384 live in model_configs/dsv41_fp4_tuned_fmoe.csv. After AITER merges
-every tuned_fmoe table, each of these keys must resolve to exactly one row, that
-row must be the one below, and no other table may carry the key. get_padded_M maps
-every receive buffer of 257-16384 rows onto these six keys.
+DSpark drafter's 32 (top-3), hidden 5120, intermediate 2304. Their rows, the target's
+at M = 512..16384 and the drafter's at M = 256..16384, live in
+model_configs/dsv41_fp4_tuned_fmoe.csv. After AITER merges every tuned_fmoe table,
+each of these keys must resolve to exactly one row, that row must be the one below,
+and no other table may carry the key. get_padded_M maps every buffer of 257-16384
+rows onto the target's keys and of 129-16384 rows onto the drafter's.
 
 Requires torch (importing aiter pulls it in). No GPU: ``GPU_ARCHS`` and
 ``CU_NUM`` stand in for the device.
@@ -67,6 +68,11 @@ EXPECTED = {
         "flydsl_moe1_afp4_wfp4_bf16_t128x128x256_fp4",
         "flydsl_moe2_afp4_wfp4_bf16_t64x128x256_atomic_bnt2_sbm128",
     ),
+    (32, 3, 256): (
+        32,
+        "flydsl_moe1_afp4_wfp4_bf16_t32x32x256_w3_kw4_fp4",
+        "flydsl_moe2_afp4_wfp4_bf16_t32x128x256_atomic_bnt2",
+    ),
     (32, 3, 512): (
         32,
         "flydsl_moe1_afp4_wfp4_bf16_t32x64x256_w4_kw2_fp4",
@@ -99,7 +105,7 @@ EXPECTED = {
     ),
 }
 
-# The rest of the key, shared by all twelve rows.
+# The rest of the key, shared by all thirteen rows.
 SHAPE = {
     "gfx": "gfx950",
     "cu_num": "256",
@@ -176,13 +182,16 @@ class Dsv41FlashEp4FmoeRowsTest(unittest.TestCase):
                     else:
                         self.assertEqual(n, 0)
 
-    def test_receive_buffers_of_257_to_16384_rows_use_these_keys(self):
-        keys = {token for _, _, token in EXPECTED}
-        for rows in (257, 384, 512, 768, 1344, 2240, 4096, 5120, 10240, 14336, 16384):
-            with self.subTest(rows=rows):
-                self.assertIn(get_padded_M(rows), keys)
-        self.assertNotIn(get_padded_M(256), keys)
-        self.assertNotIn(get_padded_M(16385), keys)
+    def test_buffers_map_onto_these_keys(self):
+        for expert, first, last in ((96, 257, 16384), (32, 129, 16384)):
+            keys = {token for e, _, token in EXPECTED if e == expert}
+            for rows in (first, 192, 384, 768, 1344, 2240, 4096, 10240, 14336, last):
+                if rows < first:
+                    continue
+                with self.subTest(expert=expert, rows=rows):
+                    self.assertIn(get_padded_M(rows), keys)
+            self.assertNotIn(get_padded_M(first - 1), keys)
+            self.assertNotIn(get_padded_M(last + 1), keys)
 
 
 if __name__ == "__main__":
