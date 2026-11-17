@@ -17,6 +17,8 @@ amounts, empty batches, no-op reuse, and prepacked-input restrictions.
 The whole module is skipped without a supported GPU. Padding preparation itself
 does not require architecture-specific padding configurations.
 
+Benchmark regression tests cover rotating pools, packing, graph replay, and cleanup.
+
 Where a kernel's guard rejects a shape (e.g. winograd on a 5x5), the
 shape is silently skipped inside run_all_methods.
 
@@ -41,6 +43,8 @@ from op_tests.triton_tests.conv._helpers import (
     ORDERED_METHODS,
     TestSuite,
     _winograd_tolerances,
+    assert_conv_benchmark_graph_packing_and_outputs,
+    assert_prepacked_pool_sizes_only_rotating_packed_inputs,
     assert_weight_pack_cache_clear_is_scoped,
     conv2d_padding_reference,
     dynamic_conv_tolerances,
@@ -763,3 +767,75 @@ def test_specialized_padding_prepacked_input(api):
                 f"padding={padding}:\n{details}"
             ),
         )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Convolution benchmarks require a GPU"
+)
+def test_prepacked_pool_sizes_only_rotating_packed_inputs(monkeypatch):
+    assert_prepacked_pool_sizes_only_rotating_packed_inputs(monkeypatch, dimensions=2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Convolution benchmarks require a GPU"
+)
+@pytest.mark.parametrize(
+    "method,layout,kernel_size,channels",
+    [
+        ("auto", "nchw", 1, 8),
+        ("cblocked", "nchw", 3, 64),
+        ("winograd_f4x3_cblocked", "nchw", 3, 64),
+    ],
+)
+def test_conv_benchmark_graph_packing_and_outputs(
+    monkeypatch, tmp_path, method, layout, kernel_size, channels
+):
+    assert_conv_benchmark_graph_packing_and_outputs(
+        monkeypatch,
+        tmp_path,
+        dimensions=2,
+        method=method,
+        layout=layout,
+        kernel_size=kernel_size,
+        channels=channels,
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Convolution benchmarks require a GPU"
+)
+def test_conv2d_pool_cleanup_on_failure(monkeypatch):
+    from op_tests.op_benchmarks.triton import bench_conv2d
+    from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+        RotatingBufferBench,
+    )
+
+    bencher = RotatingBufferBench.from_dict(
+        {
+            "target_rot_pool_sz_mb": 0.001,
+            "max_pool_len": 4,
+        }
+    )
+
+    def fail_bench(*args, **kwargs):
+        raise RuntimeError("graph capture failed")
+
+    monkeypatch.setattr(bencher, "bench", fail_bench)
+    with pytest.raises(RuntimeError, match="graph capture failed"):
+        bench_conv2d.bench_one_shape(
+            1,
+            3,
+            5,
+            5,
+            8,
+            3,
+            3,
+            (1, 1),
+            (1, 1),
+            (1, 1),
+            torch.float16,
+            "cblocked",
+            "nchw",
+            bencher=bencher,
+        )
+    assert bencher.rot_bufs is None

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Test-side library: TestSuite, method registry, and runners.
+"""Shared convolution generators, assertions, method registry, and runners.
 
 Library code (no ``test_`` prefix) — pytest does not collect this file.
-``test_conv2d.py`` imports the runners and registry from here.
+Conv2D and Conv3D tests and benchmarks import shared code from here.
 
 Public surface:
 
@@ -34,8 +34,17 @@ Public surface:
 - ``assert_weight_pack_cache_clear_is_scoped(...)``
     Shared setup and assertions for the dimension-specific Conv2D and Conv3D
     weight-pack cache-clear tests.
+
+- ``generate_conv_input(...)``, ``generate_conv_weights(...)``
+    GPU input generators shared by the tests and benchmarks.
+
+- ``assert_prepacked_pool_sizes_only_rotating_packed_inputs(...)``,
+  ``assert_conv_benchmark_graph_packing_and_outputs(...)``
+    Shared checks for rotating pools, packing, and graph replay.
 """
 
+import csv
+import math
 import random
 import traceback
 from collections import namedtuple
@@ -76,6 +85,30 @@ _ALL_WEIGHT_PACK_CACHE_NAMES = (
     *CONV2D_WEIGHT_PACK_CACHE_NAMES,
     *CONV3D_WEIGHT_PACK_CACHE_NAMES,
 )
+
+
+def generate_conv_input(shape, dtype, layout):
+    """Make one input in the requested physical layout on the GPU."""
+    memory_format = {
+        "nchw": torch.contiguous_format,
+        "nhwc": torch.channels_last,
+        "ncdhw": torch.contiguous_format,
+        "ndhwc": torch.channels_last_3d,
+    }[layout]
+    input_tensor = torch.empty(
+        shape, device="cuda", dtype=dtype, memory_format=memory_format
+    ).normal_()
+    return (input_tensor,)
+
+
+def generate_conv_weights(shape, dtype, use_bias):
+    """Make ordinary tensors so the convolution weight-pack cache can be used."""
+    with torch.inference_mode(False):
+        weight = torch.randn(shape, device="cuda", dtype=dtype)
+        bias = (
+            torch.randn((shape[0],), device="cuda", dtype=dtype) if use_bias else None
+        )
+    return weight, bias
 
 
 def assert_weight_pack_cache_clear_is_scoped(
@@ -616,3 +649,272 @@ def run_random_fuzzing(
                     f"{type(e).__name__}: {e}\n{tb}",
                 )
             )
+
+
+def assert_prepacked_pool_sizes_only_rotating_packed_inputs(monkeypatch, dimensions):
+    from op_tests.op_benchmarks.triton import bench_conv2d, bench_conv3d
+    from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+        RotatingBufferBench,
+    )
+
+    bencher = RotatingBufferBench.from_dict(
+        {
+            "target_rot_pool_sz_mb": 0.01,
+            "min_pool_len": 1,
+            "max_pool_len": 32,
+        }
+    )
+    inspected = []
+
+    def inspect_pool(function):
+        pool = bencher.rot_bufs
+        packed = "x_blocked" in pool[0]
+        input_key = "x_blocked" if packed else "input_tensor"
+        input_bytes = pool[0][input_key].untyped_storage().nbytes()
+        expected_length = min(32, math.ceil(0.01 * 1024**2 / input_bytes))
+        assert len(pool) == expected_length
+        assert len({entry[input_key].data_ptr() for entry in pool}) == len(pool)
+        if packed:
+            assert len({entry["input_tensor"].data_ptr() for entry in pool}) == 1
+        assert len({entry["weight"].data_ptr() for entry in pool}) == 1
+        assert len({entry["bias"].data_ptr() for entry in pool}) == 1
+        inspected.append(packed)
+        return 1.0
+
+    monkeypatch.setattr(bencher, "bench", inspect_pool)
+    monkeypatch.setattr(
+        RotatingBufferBench,
+        "from_dict",
+        classmethod(lambda _cls, _config: bencher),
+    )
+    if dimensions == 2:
+        bench_conv2d.main(
+            [
+                "--N",
+                "1",
+                "--C",
+                "3",
+                "--H",
+                "3",
+                "--W",
+                "3",
+                "--K",
+                "8",
+                "--R",
+                "3",
+                "--S",
+                "3",
+                "--pad-h",
+                "1",
+                "--pad-w",
+                "1",
+                "--method",
+                "cblocked",
+            ]
+        )
+    else:
+        bench_conv3d.main(
+            [
+                "--shape",
+                "1",
+                "3",
+                "3",
+                "3",
+                "3",
+                "8",
+                "3",
+                "3",
+                "3",
+                "--padding",
+                "1",
+                "1",
+                "1",
+                "--method",
+                "cblocked",
+            ]
+        )
+    assert inspected == [True, False]
+    assert bencher.rot_bufs is None
+
+
+def assert_conv_benchmark_graph_packing_and_outputs(
+    monkeypatch,
+    tmp_path,
+    dimensions,
+    method,
+    layout,
+    kernel_size,
+    channels,
+):
+    from aiter.ops.triton.conv import _prepack as conv_prepack
+    from op_tests.op_benchmarks.triton import bench_conv2d, bench_conv3d
+    from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+        RotatingBufferBench,
+    )
+
+    monkeypatch.chdir(tmp_path)
+    captured_packs = []
+    captured_weight_packs = []
+    launch_name = (
+        "_launch_nchw_to_cblocked" if dimensions == 2 else "_launch_ncdhw_to_cblocked"
+    )
+    original_launch = getattr(conv_prepack, launch_name)
+
+    def observed_pack(*args, **kwargs):
+        if torch.cuda.is_current_stream_capturing():
+            captured_packs.append(True)
+        return original_launch(*args, **kwargs)
+
+    monkeypatch.setattr(conv_prepack, launch_name, observed_pack)
+    weight_packers = (
+        "prepack_oihw_to_kmajor",
+        "prepack_oihw_to_3x3",
+        "prepack_winograd_filter_f4x3",
+        "prepack_oidhw_to_kmajor",
+        "prepack_oidhw_to_3x3x3",
+        "prepack_winograd_hw_filter_f4x3",
+    )
+    for name in weight_packers:
+        original_packer = getattr(conv_prepack, name)
+
+        def observed_weight_pack(*args, packer=original_packer, **kwargs):
+            if torch.cuda.is_current_stream_capturing():
+                captured_weight_packs.append(True)
+            return packer(*args, **kwargs)
+
+        monkeypatch.setattr(conv_prepack, name, observed_weight_pack)
+
+    original_bench = RotatingBufferBench.bench
+    measurements = []
+    used_benchers = []
+
+    def checked_bench(bencher, function, **kwargs):
+        used_benchers.append(bencher)
+        assert bencher.kernels_per_graph == 4
+        assert bencher.num_replays == 2
+        assert bencher.warmup_iters == 1
+        assert bencher.warmup_replays == 1
+        assert bencher.min_pool_len == 2
+        assert bencher.max_pool_len == 4
+        assert bencher.target_rot_pool_sz_mb == 1
+        pool = bencher.rot_bufs
+        packed = "x_blocked" in pool[0]
+        input_key = "x_blocked" if packed else "input_tensor"
+        assert len({entry[input_key].data_ptr() for entry in pool}) == len(pool)
+        assert len({entry["weight"].data_ptr() for entry in pool}) == 1
+        captured = []
+        previous_packs = len(captured_packs)
+
+        def observed(**entry):
+            output = function(**entry)
+            if torch.cuda.is_current_stream_capturing():
+                captured.append((entry, output))
+            return output
+
+        milliseconds = original_bench(bencher, observed, **kwargs)
+        assert math.isfinite(milliseconds) and milliseconds > 0
+        assert len(captured) == 4
+        assert not captured_weight_packs
+        measurements.append(len(captured_packs) - previous_packs)
+
+        for entry, output in captured:
+            input_tensor = entry["input_tensor"]
+            if packed:
+                blocked = entry["x_blocked"]
+                permutation = (0, 1, blocked.ndim - 1, *range(2, blocked.ndim - 1))
+                input_tensor = blocked.permute(permutation).reshape(
+                    input_tensor.shape[0], -1, *input_tensor.shape[2:]
+                )[:, :channels]
+            reference_fn = F.conv2d if dimensions == 2 else F.conv3d
+            bias = entry["bias"]
+            reference = reference_fn(
+                input_tensor.float(),
+                entry["weight"].float(),
+                bias.float() if bias is not None else None,
+                padding=kernel_size // 2,
+            )
+            reduction = channels * kernel_size**dimensions
+            tolerances = (
+                _winograd_tolerances
+                if "winograd" in method
+                else dynamic_conv_tolerances
+            )
+            relative, absolute = tolerances(torch.float16, reduction)
+            torch.testing.assert_close(
+                output.float(),
+                reference,
+                rtol=relative,
+                atol=absolute,
+            )
+        return milliseconds
+
+    monkeypatch.setattr(RotatingBufferBench, "bench", checked_bench)
+    common = [
+        "--method",
+        method,
+        "--layout",
+        layout,
+        "--metric",
+        "time",
+        "--graph-kernels-per-graph",
+        "4",
+        "--graph-num-replays",
+        "2",
+        "--graph-warmup-iters",
+        "1",
+        "--graph-warmup-replays",
+        "1",
+        "--rot-bufs-min-pool-len",
+        "2",
+        "--rot-bufs-target-mb",
+        "1",
+    ]
+    if dimensions == 2:
+        bench_conv2d.main(
+            common
+            + [
+                "--N",
+                "1",
+                "--C",
+                str(channels),
+                "--H",
+                "7",
+                "--W",
+                "7",
+                "--K",
+                "8",
+                "--R",
+                str(kernel_size),
+                "--S",
+                str(kernel_size),
+                "--pad-h",
+                str(kernel_size // 2),
+                "--pad-w",
+                str(kernel_size // 2),
+            ]
+        )
+    else:
+        bench_conv3d.main(
+            common
+            + [
+                "--shape",
+                "1",
+                str(channels),
+                "2",
+                "7",
+                "7",
+                "8",
+                *([str(kernel_size)] * 3),
+                "--padding",
+                *([str(kernel_size // 2)] * 3),
+                "-o",
+            ]
+        )
+        (output_file,) = tmp_path.glob("conv3d_*.csv")
+        with output_file.open() as stream:
+            rows = list(csv.DictReader(stream))
+        assert len(rows) == len(measurements)
+        assert all(row["weight_policy"] == "fixed" for row in rows)
+        assert all(row["provider"] != "torch" for row in rows)
+    assert measurements == ([0, 4] if "cblocked" in method else [0])
+    assert all(bencher.rot_bufs is None for bencher in used_benchers)

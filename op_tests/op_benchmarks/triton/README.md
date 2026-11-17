@@ -9,3 +9,10 @@ that with the unit test. If it is shared then import the function from unit test
 5. No testing for accuracy or assert_close calls in the benchmarks. Do that in the unit
 test.
 6. Benchmark only Triton ops. You may see some current benchmarks that do that, but they will be moved out in future.
+
+## Conv2D and Conv3D
+
+Uses rotating activations and fixed weights/bias (`weight_policy=fixed`).
+Graph timings exclude weight preparation. Channel-blocked routes report input
+packing excluded/included; `--end-to-end` or nonzero `--padding-mode` reports
+one full GPU call. Configure with `--graph-*` and `--rot-bufs-*`.
