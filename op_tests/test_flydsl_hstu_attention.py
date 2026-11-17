@@ -734,6 +734,32 @@ def _ref_for(args):
     )  # fmt: skip
 
 
+@requires_cuda
+@pytest.mark.parametrize("pingpong", [None, False, True])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_flydsl_hstu_attention_noncontiguous_v(pingpong, head_dim):
+    """A non-contiguous v, after and before a contiguous one of the same shape.
+
+    The output used to inherit v's strides: the ping-pong stores whole rows and
+    wrote the wrong elements, and either kernel's cached compiled handle was
+    wrong for the second layout.
+    """
+    if pingpong and get_gfx_runtime() != "gfx942":
+        pytest.skip("the ping-pong forward is gfx942-only")
+    # N=4096 so the default dispatch picks the ping-pong at both head dims.
+    args, ref = _pp_case(
+        4096, 0, 0, 20, True, attn_dim=head_dim, hidden_dim=head_dim,
+        batch_size=3, heads=2,
+    )  # fmt: skip
+    v = args[4]
+    v_nc = v.permute(0, 2, 1).contiguous().permute(0, 2, 1)
+    assert torch.equal(v_nc, v) and not v_nc.is_contiguous()
+    for vv in (v, v_nc, v):
+        out = flydsl_hstu_attention_fwd(*args[:4], vv, *args[5:], pingpong=pingpong)
+        assert out.is_contiguous()
+        _assert_matches_ref(out, ref, args[0])
+
+
 @requires_pp
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("max_attn_len", [0, 512])

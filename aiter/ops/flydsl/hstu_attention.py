@@ -584,7 +584,9 @@ def flydsl_hstu_attention_fwd(
         pingpong=pingpong,
     )
 
-    out = torch.empty_like(v)
+    # Contiguous whatever v's layout: the kernels store whole rows, and a cached
+    # compiled handle is only valid for the out layout it was compiled with.
+    out = torch.empty_like(v, memory_format=torch.contiguous_format)
     if num_targets is None:
         num_targets = torch.zeros(1, dtype=seq_offsets.dtype, device=out.device)
 
