@@ -13,11 +13,14 @@ Each rank builds the EP group with ``aiter.init_dist_env`` and asks the
   it with FlyDSL; dispatch returns no scales, the received rows, weights and
   ids equal the source tokens' (and a mori handle's for the same call), and
   combine equals an f32 sum over the distinct destination ranks (and mori's).
+  The same no-scales dispatch + combine captured in a CUDA graph and replayed
+  gives the same result.
 * ``lifetime``: a handle the caller dropped is returned again (same op, no new
   IPC allocation); another ``index`` gets its own op; ``destroy()`` unmaps
   every peer mapping and frees every allocation; a handle requested after
   ``destroy()`` works; ``aiter.destroy_dist_env()`` with live FlyDSL handles
-  (process groups destroyed before the communicator) returns cleanly.
+  returns cleanly and releases their IPC memory (every mapping closed, every
+  allocation freed).
 * ``agreement``: when opening a peer's IPC handle fails on one rank, building
   the op raises on every rank (no rank hangs in the next collective), and every
   allocation and peer mapping made so far is released.
@@ -27,6 +30,7 @@ Each rank builds the EP group with ``aiter.init_dist_env`` and asks the
 
 import argparse
 import gc
+import os
 import queue
 import sys
 import time
@@ -34,6 +38,9 @@ import time
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_flydsl_ep_intranode import _bitdiff, _reference
 
 CASES = ("scales", "lifetime", "agreement")
 
@@ -96,32 +103,6 @@ def _ids(T, K, E, g):
     )
 
 
-def _reference(x, ids, epr, rank_scale):
-    """f32 sum over distinct destination ranks in top-k order -> bf16, where
-    destination rank r returns its received row times ``rank_scale(r)``."""
-    T, K = ids.shape
-    acc = torch.zeros(T, x.shape[1], dtype=torch.float32, device=x.device)
-    dest = torch.div(ids.long(), epr, rounding_mode="floor")
-    xf = x.float()
-    for k in range(K):
-        first = torch.ones(T, dtype=torch.bool, device=x.device)
-        for j in range(k):
-            first &= dest[:, j] != dest[:, k]
-        scale = torch.tensor(
-            [rank_scale(int(r)) for r in dest[:, k].tolist()],
-            dtype=torch.float32,
-            device=x.device,
-        )
-        contrib = (xf * scale[:, None]).to(torch.bfloat16).float()
-        acc += torch.where(first[:, None], contrib, torch.zeros_like(contrib))
-    return acc.to(torch.bfloat16)
-
-
-def _bitdiff(x, y):
-    d = (x.view(torch.int16) != y.view(torch.int16)) & ~((x == 0) & (y == 0))
-    return int(d.sum().item())
-
-
 def _round_trip(handle, x, w, ids, epr, rank, launch):
     """dispatch(x, w, None, ids) + combine of (received row * rank factor).
 
@@ -136,6 +117,32 @@ def _round_trip(handle, x, w, ids, epr, rank, launch):
     res = handle.combine(cin, None, ids, *launch)[0][: x.shape[0]].clone()
     torch.cuda.synchronize()
     return recv, n, out[2], res
+
+
+def _graph_round_trip(handle, x, w, ids, rank, launch, group, replays=3):
+    """``_round_trip``'s dispatch(x, w, None, ids) + combine captured in one
+    CUDA graph and replayed; returns the combine result after the replays."""
+
+    def step():
+        out = handle.dispatch(x, w, None, ids, *launch)
+        cin = (out[0].float() * (1.0 + rank / 8.0)).to(torch.bfloat16)
+        return handle.combine(cin, None, ids, *launch)[0]
+
+    dist.barrier(group=group)
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=s):
+            res = step()
+    torch.cuda.synchronize()
+    dist.barrier(group=group)
+    for _ in range(replays):
+        graph.replay()
+    torch.cuda.synchronize()
+    out = res[: x.shape[0]].clone()
+    del graph
+    dist.barrier(group=group)
+    return out
 
 
 def _case_scales(manager, rank, world, dev, failures, has_mori):
@@ -202,10 +209,14 @@ def _case_scales(manager, rank, world, dev, failures, has_mori):
             for name, a, b in zip(("rows", "weights", "ids"), got, want):
                 if not torch.equal(a.view(torch.uint8), b.view(torch.uint8)):
                     failures.append(f"{tag}: received {name} differ")
-        ref = _reference(x, ids, epr, lambda r: 1.0 + r / 8.0)
+        ref = _reference(x.float(), ids, epr)
         bad = _bitdiff(res, ref)
         if bad:
             failures.append(f"{tag}: combine {bad} elements differ from reference")
+        res_g = _graph_round_trip(fly, x, w, ids, rank, launch, manager.cpu_group)
+        bad = _bitdiff(res_g, ref)
+        if bad:
+            failures.append(f"{tag}: graph replay {bad} elements differ")
         if mori_h is not None:
             m_got, m_n, m_scales, m_res = _round_trip(
                 mori_h, x, w, ids, epr, rank, launch
@@ -248,7 +259,7 @@ def _check_small(handle, rank, world, dev, tag, failures):
     w = w.to(dev)
     x = torch.randn(T, 2048, generator=g).to(torch.bfloat16).to(dev)
     _, _, _, res = _round_trip(handle, x, w, ids, epr, rank, ())
-    bad = _bitdiff(res, _reference(x, ids, epr, lambda r: 1.0 + r / 8.0))
+    bad = _bitdiff(res, _reference(x.float(), ids, epr))
     if bad:
         failures.append(f"{tag}: combine {bad} elements differ")
 
@@ -351,6 +362,16 @@ def _worker(rank, world, port, cases, result_q):
             aiter.destroy_dist_env()
         except Exception as e:  # noqa: BLE001
             failures.append(f"rank{rank} destroy_dist_env: {type(e).__name__}: {e}")
+        else:
+            # Everything mapped since init, the FlyDSL heap the lifetime case
+            # leaves live included, is released by the teardown.
+            left_o = counter.live_open - counter.base_open
+            left_a = counter.live_alloc - counter.base_alloc
+            if left_o or left_a:
+                failures.append(
+                    f"rank{rank} destroy_dist_env: {len(left_o)} peer mappings "
+                    f"open, {len(left_a)} allocations not freed"
+                )
     except Exception as e:  # noqa: BLE001
         failures.append(f"rank{rank}: {type(e).__name__}: {e}")
     result_q.put((rank, failures))

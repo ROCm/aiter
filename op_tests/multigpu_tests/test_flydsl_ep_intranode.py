@@ -4,15 +4,21 @@
 """Correctness of the FlyDSL intra-node EP dispatch / combine over HIP IPC
 symmetric buffers (no mori).
 
-Each rank dispatches MXFP8 rows (fp8 + e8m0 scales) with its top-k ids and
-weights, then combines bf16 rows that are a function of what it received.
+Each rank dispatches rows with e8m0 scales, its top-k ids and weights, then
+combines bf16 rows that are a function of what it received. Variants:
+
+* ``fp8``: MXFP8 rows (fp8 + e8m0 scales), bf16 combine.
+* ``fp8_direct_cast``: the same dispatch; combine keeps bf16 at the API and
+  moves fp8 between ranks (``combine_quant_type="fp8_direct_cast"``).
+* ``fp4``: MXFP4 rows (packed e2m1 + e8m0 scales), bf16 combine.
 
 * dispatch: the received count equals the number of (source token, this rank)
   pairs with at least one valid expert here; every received row, its scales,
   weights and ids equal the source token's (looked up through the reported
   source position).
 * combine: equal, bit for bit (+0 / -0 aside), to an f32 sum over the token's
-  distinct destination ranks in top-k slot order, rounded to bf16. Negative ids
+  distinct destination ranks in top-k slot order, rounded to bf16 (each
+  contribution rounded to fp8 first under ``fp8_direct_cast``). Negative ids
   are skipped, duplicates of a rank count once.
 * the same pair captured in a CUDA graph and replayed several times gives the
   same result (launch epochs advance on the device).
@@ -32,6 +38,30 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 ROUTINGS = ("random", "onerank", "skip0", "dupe", "neg", "empty")
+VARIANTS = ("fp8", "fp8_direct_cast", "fp4")
+
+# e2m1 code -> value; the low nibble of a byte is the first element.
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_E2M1 = _E2M1 + tuple(-v for v in _E2M1)
+
+
+_LUTS = {}
+
+
+def _as_float(t):
+    """Rows as f32; packed fp4 rows are decoded to twice as many columns.
+
+    The decode table is uploaded on the first (eager) call per device, so the
+    same call can be captured in a CUDA graph later."""
+    if t.dtype != torch.float4_e2m1fn_x2:
+        return t.float()
+    lut = _LUTS.get(t.device)
+    if lut is None:
+        lut = _LUTS[t.device] = torch.tensor(
+            _E2M1, dtype=torch.float32, device=t.device
+        )
+    b = t.view(torch.uint8).long()
+    return torch.stack((lut[b & 15], lut[b >> 4]), dim=-1).flatten(-2)
 
 
 def _make_ids(routing, T, K, E, epr, world, rank, g):
@@ -77,23 +107,27 @@ def _stacked(all_rows, t_max, j, cols, dtype):
     return out
 
 
-def _reference(x_fp8, ids, epr):
-    """f32 sum over distinct destination ranks in top-k order -> bf16."""
+def _reference(xf, ids, epr, wire_fp8=False):
+    """Combine reference for source rows ``xf`` (f32): destination rank r
+    returns its received row times ``1 + r / 8`` in bf16; f32 sum over the
+    distinct valid destination ranks in top-k order -> bf16. ``wire_fp8``:
+    each returned row travels as fp8 (``fp8_direct_cast``)."""
     T, K = ids.shape
-    acc = torch.zeros(T, x_fp8.shape[1], dtype=torch.float32, device=x_fp8.device)
+    acc = torch.zeros(T, xf.shape[1], dtype=torch.float32, device=xf.device)
     dest = torch.where(ids >= 0, torch.div(ids, epr, rounding_mode="floor"), -1)
-    xf = x_fp8.float()
     for k in range(K):
         first = dest[:, k] >= 0
         for j in range(k):
             first &= dest[:, j] != dest[:, k]
         scale = 1.0 + dest[:, k].clamp(min=0).float() / 8.0
         contrib = (xf * scale[:, None]).to(torch.bfloat16).float()
+        if wire_fp8:
+            contrib = contrib.to(torch.float8_e4m3fn).float()
         acc += torch.where(first[:, None], contrib, torch.zeros_like(contrib))
     return acc.to(torch.bfloat16)
 
 
-def _worker(rank, world, port, shapes, tokens, routings, replays, result_q):
+def _worker(rank, world, port, cases, tokens, routings, replays, result_q):
     from aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op import (
         FlyDSLDispatchCombineConfig,
         FlyDSLDispatchCombineIntraNodeOp,
@@ -109,10 +143,14 @@ def _worker(rank, world, port, shapes, tokens, routings, replays, result_q):
     group = dist.new_group(list(range(world)), backend="gloo")
     failures = []
     fp8 = torch.float8_e4m3fn
+    fp4 = torch.float4_e2m1fn_x2
     try:
-        for hidden, E, K, max_tok in shapes:
+        for variant, (hidden, E, K, max_tok) in cases:
             epr = E // world
             sd = hidden // 32
+            d_dtype = fp4 if variant == "fp4" else fp8
+            wire_fp8 = variant == "fp8_direct_cast"
+            xb = hidden // 2 if variant == "fp4" else hidden  # row bytes
             op = FlyDSLDispatchCombineIntraNodeOp(
                 FlyDSLDispatchCombineConfig(
                     rank=rank,
@@ -121,8 +159,9 @@ def _worker(rank, world, port, shapes, tokens, routings, replays, result_q):
                     max_num_inp_token_per_rank=max_tok,
                     num_experts_per_rank=epr,
                     num_experts_per_token=K,
-                    dispatch_dtype=fp8,
+                    dispatch_dtype=d_dtype,
                     combine_dtype=torch.bfloat16,
+                    combine_quant_type="fp8_direct_cast" if wire_fp8 else "none",
                     scale_dim=sd,
                     scale_type_size=1,
                 ),
@@ -135,12 +174,20 @@ def _worker(rank, world, port, shapes, tokens, routings, replays, result_q):
                     ids_c = _make_ids(routing, T, K, E, epr, world, rank, g)
                     ids = ids_c.to(dev)
                     w = torch.rand(T, K, generator=g).to(dev)
-                    x = (
-                        (torch.randn(T, hidden, generator=g) * 8)
-                        .clamp(-448, 448)
-                        .to(fp8)
-                        .to(dev)
-                    )
+                    if variant == "fp4":
+                        x = (
+                            torch.randint(0, 256, (T, xb), generator=g)
+                            .to(torch.uint8)
+                            .view(fp4)
+                            .to(dev)
+                        )
+                    else:
+                        x = (
+                            (torch.randn(T, hidden, generator=g) * 8)
+                            .clamp(-448, 448)
+                            .to(fp8)
+                            .to(dev)
+                        )
                     sc = torch.randint(
                         100, 140, (T, sd), generator=g, dtype=torch.uint8
                     ).to(dev)
@@ -154,14 +201,17 @@ def _worker(rank, world, port, shapes, tokens, routings, replays, result_q):
 
                     def combine(out, op=op, ids=ids, n_in=n_in):
                         rows = min(out[0].shape[0], n_in)
-                        cin = (out[0][:rows].float() * (1.0 + rank / 8.0)).to(
+                        cin = (_as_float(out[0][:rows]) * (1.0 + rank / 8.0)).to(
                             torch.bfloat16
                         )
                         return op.combine(cin, None, ids)[0]
 
                     out = op.dispatch(x, w, sc, ids)
                     torch.cuda.synchronize()
-                    tag = f"rank{rank} hidden={hidden} E={E} K={K} {routing} T={T0}"
+                    tag = (
+                        f"rank{rank} {variant} hidden={hidden} E={E} K={K} "
+                        f"{routing} T={T0}"
+                    )
                     # dispatch (read before combine, which resets the count)
                     n = int(out[4].reshape(-1)[0].item())
                     src = op.get_dispatch_src_token_pos()[:n].long().cpu()
@@ -188,7 +238,7 @@ def _worker(rank, world, port, shapes, tokens, routings, replays, result_q):
                             out[3][:n].cpu(),
                         )
                         want = (
-                            _stacked(all_rows, t_max, 1, hidden, torch.uint8)[s_r, s_t],
+                            _stacked(all_rows, t_max, 1, xb, torch.uint8)[s_r, s_t],
                             _stacked(all_rows, t_max, 2, sd, torch.uint8)[s_r, s_t],
                             _stacked(all_rows, t_max, 3, K, torch.float32)[s_r, s_t],
                             _stacked(all_rows, t_max, 0, K, torch.int32)[s_r, s_t],
@@ -201,7 +251,7 @@ def _worker(rank, world, port, shapes, tokens, routings, replays, result_q):
                     # combine
                     res = combine(out)
                     torch.cuda.synchronize()
-                    ref = _reference(x, ids, epr)
+                    ref = _reference(_as_float(x), ids, epr, wire_fp8)
                     bad = _bitdiff(res[:T], ref) if T else 0
                     if bad:
                         failures.append(f"{tag}: combine {bad} elements differ")
@@ -230,7 +280,14 @@ def _worker(rank, world, port, shapes, tokens, routings, replays, result_q):
     dist.destroy_process_group()
 
 
-def run(world=None, shapes=None, tokens=None, routings=ROUTINGS, replays=3):
+def run(
+    world=None,
+    shapes=None,
+    tokens=None,
+    routings=ROUTINGS,
+    replays=3,
+    variants=VARIANTS,
+):
     from aiter.dist.utils import get_open_port
     from aiter.jit.utils.chip_info import get_gfx_runtime
 
@@ -246,13 +303,17 @@ def run(world=None, shapes=None, tokens=None, routings=ROUTINGS, replays=3):
     # (hidden, experts, top-k, max tokens per rank)
     shapes = shapes or [(5120, 48 * world, 6, 4096), (2048, 16 * world, 3, 1024)]
     tokens = tokens or [1, 7, 32, 192, 1000]
+    # fp8 runs every shape; the other variants run the last one
+    cases = [
+        (v, sh) for v in variants for sh in (shapes if v == "fp8" else shapes[-1:])
+    ]
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     port = get_open_port()
     procs = [
         ctx.Process(
             target=_worker,
-            args=(r, world, port, shapes, tokens, routings, replays, q),
+            args=(r, world, port, cases, tokens, routings, replays, q),
         )
         for r in range(world)
     ]
@@ -266,7 +327,8 @@ def run(world=None, shapes=None, tokens=None, routings=ROUTINGS, replays=3):
         print("FAIL", f)
     print(
         f"flydsl intranode EP: world={world} shapes={shapes} tokens={tokens} "
-        f"routings={list(routings)}: {'FAILED' if failures else 'passed'}"
+        f"routings={list(routings)} variants={list(variants)}: "
+        f"{'FAILED' if failures else 'passed'}"
     )
     return not failures
 
@@ -281,11 +343,13 @@ if __name__ == "__main__":
     ap.add_argument("--tokens", type=str, default=None, help="e.g. 1,32,192")
     ap.add_argument("--routings", type=str, default=",".join(ROUTINGS))
     ap.add_argument("--replays", type=int, default=3)
+    ap.add_argument("--variants", type=str, default=",".join(VARIANTS))
     a = ap.parse_args()
     ok = run(
         world=a.world,
         tokens=[int(t) for t in a.tokens.split(",")] if a.tokens else None,
         routings=a.routings.split(","),
         replays=a.replays,
+        variants=a.variants.split(","),
     )
     sys.exit(0 if ok else 1)
