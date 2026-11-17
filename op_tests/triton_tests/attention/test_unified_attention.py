@@ -1621,6 +1621,11 @@ def test_gfx1250_ua2d_register_store_gate() -> None:
     those shapes follow that entry.
     """
     b, f, e, u = torch.bfloat16, torch.float16, e4m3_dtype, torch.uint8
+    # The attn_2d table has an NS axis, so the lookup reads params.num_seqs. This
+    # test checks TILE_SIZE and USE_TDM_STORE, which the small-batch NS_LEQ_8
+    # entry leaves alone, so any count works. Use a wide launch, so the shapes
+    # keep landing on the generic entries.
+    num_seqs = 64
     # name, q head, v head, G, page, q, kv, out, q len, tdm, tile
     cases = [
         ("bf16", 64, 64, 8, 64, b, b, b, 1, False, 64),
@@ -1652,6 +1657,7 @@ def test_gfx1250_ua2d_register_store_gate() -> None:
             all_decode=q_len == 1,
             num_2d_prgms=1,
             num_sms=1,
+            num_seqs=num_seqs,
             out=SimpleNamespace(dtype=out_dtype),
         )
         config = get_unified_attention_config(
@@ -1683,6 +1689,7 @@ def test_gfx1250_ua2d_register_store_gate() -> None:
             all_decode=True,
             num_2d_prgms=1,
             num_sms=1,
+            num_seqs=num_seqs,
             out=SimpleNamespace(dtype=b),
         )
 
