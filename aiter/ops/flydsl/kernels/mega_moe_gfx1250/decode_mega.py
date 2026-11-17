@@ -169,7 +169,8 @@ GATE_STRIDE = 32
 PLAN_PK = 32
 #: Plan replicas: CTA c reads replica c % PLAN_REPS, so a line is read by
 #: G / PLAN_REPS CTAs, not by all of them (32 readers on a line cost ~10 us).
-#: A replica is the experts' row counts, 16 bits each.
+#: A replica is the experts' row counts: 16 bits each for small_m, whose slots
+#: cap an expert at 65535 rows; 32 for large_m, whose experts may receive more.
 PLAN_REPS = 128
 
 #: Words between two experts' slot counters: each on its own 128 B line, so
@@ -276,7 +277,7 @@ def dmk_ctl_layout(
     *, experts_per_rank: int, mt_cap: int, workers: int, npes: int = 0, compact=False
 ):
     """Word offsets of the local control block: the per-m-tile GEMM1 lines,
-    the plan replicas (per expert ``rows``, 16 bits each), one plan, one
+    the plan replicas (per expert ``rows``, 16 or 32 bits each), one plan, one
     combine and one send gate line per CTA, and on the compact layout the
     segment counters and the send-table replicas. No line is read or
     polled by more than a few CTAs: hundreds of CTAs on one uncached line
@@ -403,8 +404,8 @@ def make_decode_mega(
         raise ValueError("wire row must hold the payload and its e8m0 row")
     if CAP % TM:
         raise ValueError(f"cap={CAP} must be a multiple of tile_m={TM}")
-    if COMPACT and npes * int(max_tok_per_rank) > 0xFFFF:
-        raise ValueError("the compact plan holds an expert's rows in 16 bits")
+    if COMPACT and int(max_tok_per_rank) > 0xFFFF:
+        raise ValueError("X1 holds a source's rows of an expert in 16 bits")
     if G % WAVE or G % N_TICKET:
         raise ValueError(f"workers={G} must be a multiple of {WAVE} and {N_TICKET}")
     if npes > WAVE or E != npes * EPR:
@@ -431,8 +432,11 @@ def make_decode_mega(
     PLAN_W, PLAN_SLOT = _lay["plan"], _lay["plan_slot"]
     GATE_P, GATE_C, GATE_S = _lay["gate_p"], _lay["gate_c"], _lay["gate_s"]
     GATE_R = _lay["gate_r"]
-    if MT_CAP > 0xFFFF or (not COMPACT and CAP > 0xFFFF):
-        raise ValueError("the packed plan holds m-tile ends and rows in 16 bits")
+    if not COMPACT and CAP > 0xFFFF:
+        raise ValueError("small_m's plan replicas hold an expert's rows in 16 bits")
+    # Plan replica dwords per lane: small_m packs two 16-bit counts a dword,
+    # large_m stores one count a dword (an expert may receive past 65535 rows).
+    REP_W = EPR_CH if COMPACT else max(1, EPR_CH // 2)
     SEGS_PAD = dmk_segs_pad(npes=npes, experts_per_rank=EPR)
     if COMPACT:
         SEG_CNT_W, SREP_W = _lay["seg_cnt"], _lay["srep"]
@@ -492,6 +496,8 @@ def make_decode_mega(
         if COMPACT
         else int(os.environ.get("AITER_DMK_PLAN_TAG", "1" if TM <= 16 else "0"))
     )
+    if REP_W * WAVE * (2 if PLAN_TAG else 1) > PLAN_SLOT:
+        raise ValueError("a plan replica does not fit its slot")
     # AITER_DMK_DEFER_SCATTER (default 1): a GEMM2 item does not wait for its
     # EP-scatter stores; they retire under the next item, and the queue's end
     # drains them before the close counts the CTA's units. Its separate C stage
@@ -645,10 +651,11 @@ def make_decode_mega(
         if block != 4 * WAVE or block2 != block:
             raise ValueError(f"expected 4-wave GEMM blocks, got {block}/{block2}")
         ARENA = max(int(lay1["arena"]), int(lay2["arena"]))
-        # LDS beyond the GEMM arena: broadcast words, then the plan's per-expert
-        # inclusive m-tile ends and row counts.
+        # LDS beyond the GEMM arena: broadcast words, then per expert the
+        # plan's inclusive m-tile end, CTA 0's replica counts and the plan's
+        # row count, a dword each.
         BC_B = 64
-        PLAN_B = 2 * EPR_PAD * 4
+        PLAN_B = 3 * EPR_PAD * 4
         CTRL_B = BC_B + PLAN_B
         if COMPACT and lm_scratch_bytes(npes=npes, experts_per_rank=EPR) > ARENA:
             raise ValueError("the compact front end's LDS does not fit the GEMM arena")
@@ -703,6 +710,7 @@ def make_decode_mega(
             )
             lds_end = bc + fx.Int32(BC_B)
             lds_cnt = lds_end + fx.Int32(EPR_PAD * 4)
+            lds_rows = lds_cnt + fx.Int32(EPR_PAD * 4)
             # Compact front-end scratch in the GEMM arena (CTA 0's X1 matrix,
             # send table and receive counts), unused once GEMM items start.
             ar = fx.Int32(
@@ -876,9 +884,19 @@ def make_decode_mega(
 
             def lead_plan_lds(cnts):
                 """CTA 0, wave 0: its own LDS plan from the per-expert counts,
-                and the counts packed two per dword (dword w = cnt(2w) |
-                cnt(2w + 1) << 16, built by bpermute) for the replicas."""
+                and the counts for the replicas: large_m's one per dword
+                (dword e = cnt(e)), small_m's packed two per dword (dword w =
+                cnt(2w) | cnt(2w + 1) << 16, built by bpermute)."""
                 plan_from_counts(cnts)
+                if const_expr(COMPACT):
+                    for j in range_constexpr(EPR_CH):
+                        comm_ops.store_i32_lds(
+                            fx.Int64(
+                                lds_cnt + (lane + fx.Int32(j * WAVE)) * fx.Int32(4)
+                            ),
+                            cnts[j],
+                        )
+                    return
                 for j2 in range_constexpr(EPR_CH // 2 if EPR_CH > 1 else 1):
                     w_ = lane + fx.Int32(j2 * WAVE)
                     lo_e = w_ * fx.Int32(2)
@@ -909,9 +927,9 @@ def make_decode_mega(
 
             def lead_plan_replicas():
                 """CTA 0, every wave: a quarter of the plan replicas from the
-                packed counts in LDS (after a barrier past lead_plan_lds)."""
+                replica counts in LDS (after a barrier past lead_plan_lds)."""
                 pk = []
-                for j2 in range_constexpr(EPR_CH // 2 if EPR_CH > 1 else 1):
+                for j2 in range_constexpr(REP_W):
                     pk.append(
                         fx.Int32(
                             comm_ops.load_i32_lds(
@@ -984,10 +1002,22 @@ def make_decode_mega(
                     wait_gate(gate_w, GATE_STRIDE, site)
                     stamp(9)
                     pkw = []
-                    for j2 in range_constexpr(EPR_CH // 2 if EPR_CH > 1 else 1):
+                    for j2 in range_constexpr(REP_W):
                         pkw.append(
                             _load_i32_dev(rsrc_ctl, slot_w + fx.Int32(j2 * WAVE) + lane)
                         )
+                if const_expr(COMPACT):
+                    # One count per dword: expert e = lane + 32 j is dword e.
+                    cnts = [
+                        fx.Int32(
+                            (lane + fx.Int32(j * WAVE) < fx.Int32(EPR)).select(
+                                pkw[j], fx.Int32(0)
+                            )
+                        )
+                        for j in range_constexpr(EPR_CH)
+                    ]
+                    plan_from_counts(cnts)
+                    return
                 # Unpack: expert e = lane + 32 j sits in dword e / 2.
                 cnts = []
                 for j in range_constexpr(EPR_CH):
@@ -1014,10 +1044,8 @@ def make_decode_mega(
                     c_ = cnts[j]
                     mt = (c_ + fx.Int32(TM - 1)) // fx.Int32(TM)
                     incl = _wave32_inclusive_scan_i32(mt, lane) + carry
-                    comm_ops.store_i32_lds(
-                        fx.Int64(lds_end + e_ * fx.Int32(4)),
-                        (incl << fx.Int32(16)) | c_,
-                    )
+                    comm_ops.store_i32_lds(fx.Int64(lds_end + e_ * fx.Int32(4)), incl)
+                    comm_ops.store_i32_lds(fx.Int64(lds_rows + e_ * fx.Int32(4)), c_)
                     carry = _uniform(readlane(T.i32, arith.unwrap(incl), WAVE - 1))
                 if lane == fx.Int32(0):
                     comm_ops.store_i32_lds(fx.Int64(bc + fx.Int32(8)), carry)
@@ -1837,30 +1865,23 @@ def make_decode_mega(
                 e_ = fx.Int32(0)
                 for j in range_constexpr(EPR_CH):
                     e_j = lane + fx.Int32(j * WAVE)
-                    end_j = (
-                        fx.Int32(
-                            comm_ops.load_i32_lds(fx.Int64(lds_end + e_j * fx.Int32(4)))
-                        )
-                        >> fx.Int32(16)
-                    ) & fx.Int32(0xFFFF)
+                    end_j = fx.Int32(
+                        comm_ops.load_i32_lds(fx.Int64(lds_end + e_j * fx.Int32(4)))
+                    )
                     e_ = e_ + _popc_i32(
                         fx.Int32(ballot(T.i32, (e_j < fx.Int32(EPR)) & (end_j <= i)))
                     )
                 e_ = _uniform(e_)
                 e_prev = fx.Int32((e_ > fx.Int32(0)).select(e_ - fx.Int32(1), e_))
-                prev = (
-                    fx.Int32(
-                        comm_ops.load_i32_lds(fx.Int64(lds_end + e_prev * fx.Int32(4)))
-                    )
-                    >> fx.Int32(16)
-                ) & fx.Int32(0xFFFF)
+                prev = fx.Int32(
+                    comm_ops.load_i32_lds(fx.Int64(lds_end + e_prev * fx.Int32(4)))
+                )
                 prev = _uniform(fx.Int32((e_ > fx.Int32(0)).select(prev, fx.Int32(0))))
                 jt = i - prev
                 cnt = _uniform(
                     fx.Int32(
-                        comm_ops.load_i32_lds(fx.Int64(lds_end + e_ * fx.Int32(4)))
+                        comm_ops.load_i32_lds(fx.Int64(lds_rows + e_ * fx.Int32(4)))
                     )
-                    & fx.Int32(0xFFFF)
                 )
                 rows = cnt - jt * fx.Int32(TM)
                 rows = fx.Int32((rows > fx.Int32(TM)).select(fx.Int32(TM), rows))
@@ -2065,7 +2086,9 @@ def make_decode_mega(
             rocdl.s_barrier_signal(-1)
             rocdl.s_barrier_wait(-1)
             stamp(6)
-            rsrc_comb = create_buffer_resource_from_addr(peer_va(rank, off_comb_inp))
+            # Each token's top-k slots get their own resource from its 64-bit
+            # base: past ~14.6 k tokens x top-9 the region outgrows i32 offsets.
+            comb_base = peer_va(rank, off_comb_inp)
             rsrc_out = create_buffer_resource_from_addr(addr_out)
             n_red = tok * fx.Int32(RED_CH if PH & 8 else 0)
             for w in range(wave_gid, n_red, G * 4 * RED_UN):
@@ -2079,6 +2102,10 @@ def make_decode_mega(
                     w_u = fx.Int32(in_u.select(w_u, w))
                     t = w_u // fx.Int32(RED_CH)
                     ch = w_u - t * fx.Int32(RED_CH)
+                    rsrc_comb = create_buffer_resource_from_addr(
+                        comb_base
+                        + fx.Int64(t * fx.Int32(K)) * fx.Int64(comb_slot_stride)
+                    )
                     vals = []
                     for k in range_constexpr(K):
                         gid = fx.Int32(
@@ -2091,9 +2118,7 @@ def make_decode_mega(
                             )
                         )
                         valid = (gid >= fx.Int32(0)) & (gid < fx.Int32(E))
-                        slot_b = (t * fx.Int32(K) + fx.Int32(k)) * fx.Int32(
-                            comb_slot_stride
-                        )
+                        slot_b = fx.Int32(k * int(comb_slot_stride))
                         for j in range_constexpr(2):
                             raw = buffer_load(
                                 rsrc_comb,
@@ -2254,8 +2279,8 @@ def large_mega_reason(config) -> str | None:
     if not read_large_mega():
         return "AITER_MEGA_LARGE is off"
     geo = config.geometry
-    if config.world_size * geo.max_tokens_per_rank > 0xFFFF:
-        return "the compact plan holds an expert's rows in 16 bits"
+    if geo.max_tokens_per_rank > 0xFFFF:
+        return "X1 holds a source's rows of an expert in 16 bits"
     if geo.max_tokens_per_rank * config.topk > TALLY_MAX * TALLY_MAXR:
         return "more routes per rank than the tally CTAs count"
     npes, epr = config.world_size, config.experts_per_rank
