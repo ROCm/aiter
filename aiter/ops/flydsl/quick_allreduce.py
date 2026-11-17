@@ -306,9 +306,10 @@ class FlyQuickAllReduce:
     binary to this rank, so the JIT symbol carries an ``_r<n>_`` field.
 
     ``handshake`` is how a receiver learns that a packet has landed:
-    ``"flag"`` (default), a colour written after the drained payload, or
-    ``"lamport"``, the packet words themselves against a sentinel (see
-    ``allreduce_policy.HANDSHAKES``).
+    ``"flag"``, a colour written after the drained payload, or ``"lamport"``,
+    the packet words themselves against a sentinel (see
+    ``allreduce_policy.HANDSHAKES``). ``None`` (default) takes the ladder's
+    (``TwoShotRung.handshake``); a value replaces it on every rung.
     """
 
     def __init__(
@@ -325,10 +326,10 @@ class FlyQuickAllReduce:
         ag_codec: str | None = None,
         link: str | None = None,
         ladder: tuple[TwoShotRung, ...] | None = None,
-        handshake: str = "flag",
+        handshake: str | None = None,
     ):
         check_world_size(world_size)
-        if handshake not in HANDSHAKES:
+        if handshake is not None and handshake not in HANDSHAKES:
             raise ValueError(
                 f"handshake must be one of {HANDSHAKES}, got {handshake!r}"
             )
@@ -347,6 +348,14 @@ class FlyQuickAllReduce:
             ladder = algo.st_ladder(world_size=world_size, link=link, arch=arch)
         if not ladder:
             raise ValueError("ladder must have at least one rung")
+        if handshake is None:
+            named = {r.handshake for r in ladder}
+            if len(named) != 1:
+                raise ValueError(
+                    f"every rung of a ladder must name one handshake, got {named}"
+                )
+            (handshake,) = named
+        ladder = tuple(dataclasses.replace(r, handshake=handshake) for r in ladder)
         inbox_flags, resolved_inbox = resolve_inbox_flags(
             inbox_memory, world_size, link
         )

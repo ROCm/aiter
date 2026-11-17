@@ -84,6 +84,34 @@ After the all-gather, every rank holds the same bits. Each rank decodes every
 chunk from the packets that the lap sends, and the owner of a chunk decodes
 its own chunk from the packet that it sent.
 
+### Handshake: flag or Lamport
+
+The mesh and the ring tell a receiver that a packet has landed in one of two
+ways (`TwoShotRung.handshake`, or the `handshake` argument of
+`FlyQuickAllReduce`):
+
+* `flag`: the sender drains its payload stores (`vmcnt(0)`, a barrier, and on
+  a cacheable inbox an L2 writeback), then writes a colour into a 64 B sector
+  at the tail of the slot. The receiver spins on that sector.
+* `lamport`: no flag. An unwritten inbox dword holds a sentinel, all ones, and
+  the sender keeps its packets off that value (`lamport_fix` in
+  `quick_allreduce_codec.py`). Each thread polls the packet words that it
+  reads until none is the sentinel, then writes the sentinel back. This
+  removes the drain, the flag store and two barriers from each lap.
+
+Only one packet can hold the sentinel: an INT4 nibble word whose eight values
+are all at code 15. The sender moves one of them down one step. This needs
+eight values at -7/8 of their group's extremum, which sits in the neighbour
+thread, so it is rare; a crafted input that hits it in every word still gives
+29.6 dB. Every rank decodes the same moved packet, so the ranks still agree
+bit for bit.
+
+The Lamport mesh rotates three inbox buffers (1.5x the flag inbox): the
+reduce-scatter and all-gather of a tile are two rounds of one sequence, and a
+peer is at most one round ahead. The Lamport ring keeps two buffers per hop,
+by super-tile group parity (2x). gfx950/xGMI runs Lamport; the other platforms
+run flag until they are measured. Fused builds are flag only.
+
 ### Accuracy limits
 
 The kernels convert the bf16 payload to fp16 and do all arithmetic in packed

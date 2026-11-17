@@ -203,6 +203,9 @@ def test_ladders_are_well_formed(cell):
             assert r.super_tile in valid_st, (name, r)
             assert r.grid_cap >= 1, (name, r)
             assert r.block in SUPPORTED_BLOCKS, (name, r)
+            assert r.handshake in P.HANDSHAKES, (name, r)
+        # One FlyQuickAllReduce runs one handshake.
+        assert len({r.handshake for r in rungs}) == 1, name
 
     one = oneshot_ladder(**kw)
     assert one and one[0].min_bytes == 0

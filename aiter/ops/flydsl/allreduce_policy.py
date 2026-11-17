@@ -266,13 +266,16 @@ class TwoShotRung:
 
     ``super_tile`` is the number of tiles a block publishes at once, and
     ``block`` sets the tile. ``grid_cap`` bounds the block count, and with
-    ``super_tile`` it sets the size of the IPC inbox.
+    ``super_tile`` it sets the size of the IPC inbox. ``handshake`` is one of
+    ``HANDSHAKES``; every rung of one ladder names the same one, because one
+    ``FlyQuickAllReduce`` runs one handshake.
     """
 
     min_bytes: int
     super_tile: int
     grid_cap: int
     block: int
+    handshake: str = "flag"
 
 
 @dataclass(frozen=True)
@@ -654,10 +657,15 @@ ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
 #
 #   xGMI  gfx942: ST=1 everywhere, except TP4 below 4 MiB and TP8 from 6 MiB (ST=8).
 #           Block 512 from 4 MiB.
-#         gfx950: one b256 rung per TP.
-#           - TP2 ST=1 cap512
-#           - TP4 ST=1 cap1024
-#           - TP8 ST=8 cap384:
+#         gfx950: the Lamport handshake (``HANDSHAKES``), which has no
+#           publish to batch, so a super-tile pays only where it overlaps the
+#           fanout of several tiles (TP8 14-28 MiB).
+#           - TP2 ST=1: b128 cap512, b256 cap256 from 4 MiB
+#           - TP4 ST=1 cap1024: b128, b256 from 32 MiB
+#           - TP8 cap384: b128 ST=1, b256 ST=8 from 2 MiB (ST=1 until the
+#             tiles outnumber the grid, 12 MiB), b256 ST=1 from 48 MiB.
+#             Against the flag rung (ST=8 cap384 b256): 0.81-0.91x the time
+#             from 112 KiB to 224 MiB.
 #   PCIe  TP2 ST=1, then ST=8 from 4 MiB. TP4 ST=1, then ST=8 from 768 KiB.
 #         TP8 ST=8 everywhere.
 MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
@@ -677,13 +685,47 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     ),
     # --- gfx950 (MI355X) / xGMI ----------------------------------------------
     ("gfx950", "xgmi", 2): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=512, block=256),
+        TwoShotRung(
+            min_bytes=0, super_tile=1, grid_cap=512, block=128, handshake="lamport"
+        ),
+        TwoShotRung(
+            min_bytes=4 * MiB,
+            super_tile=1,
+            grid_cap=256,
+            block=256,
+            handshake="lamport",
+        ),
     ),
     ("gfx950", "xgmi", 4): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=1024, block=256),
+        TwoShotRung(
+            min_bytes=0, super_tile=1, grid_cap=1024, block=128, handshake="lamport"
+        ),
+        TwoShotRung(
+            min_bytes=32 * MiB,
+            super_tile=1,
+            grid_cap=1024,
+            block=256,
+            handshake="lamport",
+        ),
     ),
     ("gfx950", "xgmi", 8): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=384, block=256),
+        TwoShotRung(
+            min_bytes=0, super_tile=1, grid_cap=384, block=128, handshake="lamport"
+        ),
+        TwoShotRung(
+            min_bytes=2 * MiB,
+            super_tile=8,
+            grid_cap=384,
+            block=256,
+            handshake="lamport",
+        ),
+        TwoShotRung(
+            min_bytes=48 * MiB,
+            super_tile=1,
+            grid_cap=384,
+            block=256,
+            handshake="lamport",
+        ),
     ),
     # --- gfx950 (MI350P) / PCIe ----------------------------------------------
     ("gfx950", "pcie", 2): (
