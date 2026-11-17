@@ -292,6 +292,9 @@ def check_gemm_declines():
             )
             assert error in str(err), f"{case}: not rejected by the custom op"
             rows.append(_row(f"GEMM, {case}", calls, True))
+        err, calls = _custom_op_calls(lambda: _gemm(xq.to(BF16), wq, x_scale, w_scale))
+        assert "must match" in str(err), "BF16 XQ: not rejected by the custom op"
+        rows.append(_row("GEMM, BF16 XQ with an FP8 WQ", calls, True))
 
         ws = w_scale.clone().requires_grad_(True)
         _, calls = _custom_op_calls(lambda: _gemm(xq, wq, x_scale, ws))

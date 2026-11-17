@@ -980,29 +980,6 @@ def gemm_a8w8_bpreshuffle(
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
 ) -> Tensor:
-    """Per-token/per-channel FP8 or signed-INT8 preshuffled GEMM.
-
-    The gfx950 INT8 path uses the 4-wave FlyDSL kernel with INT32
-    accumulation, FP32 row/column scales, and BF16 output. Untuned supported
-    shapes use the same kernel through a conservative persistent/non-persistent
-    fallback policy.
-
-    INT8 requires ``bias=None``. A bias tensor is rejected before dispatch;
-    callers add bias to the BF16 output after the GEMM.
-
-    INT8 requires contiguous ``XQ[M,K]`` and ``WQ[N,K_w]`` tensors, with WQ
-    produced by ``shuffle_weight(..., layout=(16, 16))``. K and K_w are
-    multiples of 128, K >= 256, N is a multiple of 16, and K_w may be greater
-    than K. In that padded-weight case XQ is zero-padded and dispatch resolves
-    against the effective launch K_w. The kernel uses 32-bit offsets, so
-    ``M * N * 2``, ``M * K_w`` and ``N * K_w`` must each be below ``2**31``.
-    It accumulates in INT32, so K_w is at most 130944: K_w full-range products
-    of 128 * 128 must stay below ``2**31``.
-
-    AOT packaging covers only specializations reachable from tuned CSV rows.
-    An untuned fallback whose K, CU/XCD topology, or persistence variant is not
-    packaged requires JIT compilation and therefore fails in run-only mode.
-    """
     is_int8 = XQ.dtype == dtypes.i8 or WQ.dtype == dtypes.i8
     if is_int8:
         _check_int8_bpreshuffle_contract(XQ, WQ, x_scale, w_scale, bias, dtype)
@@ -1184,9 +1161,10 @@ def _a8w8_bpreshuffle_eager(
     kernel (a CK row of the tuned table, or no row at all), or None to leave
     the call to the custom op: under torch.compile or jit tracing, inside any
     dispatch mode, torch-function mode or functorch transform, for tensor
-    subclasses that intercept ops, inputs autograd would record, arguments the
-    op rejects or pads (bias, an unsupported dtype, a K-padded WQ, other
-    ranks), CKTile and FlyDSL rows, untuned shapes on gfx1250, and a rebound
+    subclasses that intercept ops, inputs autograd would record, operands
+    other than FP8 (INT8 runs FlyDSL kernels), arguments the op rejects or
+    pads (bias, an unsupported output dtype, a K-padded WQ, other ranks),
+    CKTile and FlyDSL rows, untuned shapes on gfx1250, and a rebound
     ``gemm_a8w8_bpreshuffle_ck``.
     ``get_GEMM_config_with_quant_type`` is called through the module attribute
     on every call, as `_gemm_a8w8_bpreshuffle_into` calls it.
@@ -1202,6 +1180,7 @@ def _a8w8_bpreshuffle_eager(
         or not plain_eager((XQ, WQ, x_scale, w_scale))
         or XQ.dim() != 2
         or WQ.dim() != 2
+        or XQ.dtype != dtypes.fp8
         or WQ.dtype != dtypes.fp8
     ):
         return None
@@ -1243,8 +1222,29 @@ def gemm_a8w8_bpreshuffle(
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
 ) -> Tensor:
-    """FP8 ``XQ @ WQ.T`` with per-token ``x_scale`` and per-channel ``w_scale``
-    for a preshuffled ``WQ``, in ``dtype``."""
+    """Per-token/per-channel FP8 or signed-INT8 preshuffled GEMM.
+
+    The gfx950 INT8 path uses the 4-wave FlyDSL kernel with INT32
+    accumulation, FP32 row/column scales, and BF16 output. Untuned supported
+    shapes use the same kernel through a conservative persistent/non-persistent
+    fallback policy.
+
+    INT8 requires ``bias=None``. A bias tensor is rejected before dispatch;
+    callers add bias to the BF16 output after the GEMM.
+
+    INT8 requires contiguous ``XQ[M,K]`` and ``WQ[N,K_w]`` tensors, with WQ
+    produced by ``shuffle_weight(..., layout=(16, 16))``. K and K_w are
+    multiples of 128, K >= 256, N is a multiple of 16, and K_w may be greater
+    than K. In that padded-weight case XQ is zero-padded and dispatch resolves
+    against the effective launch K_w. The kernel uses 32-bit offsets, so
+    ``M * N * 2``, ``M * K_w`` and ``N * K_w`` must each be below ``2**31``.
+    It accumulates in INT32, so K_w is at most 130944: K_w full-range products
+    of 128 * 128 must stay below ``2**31``.
+
+    AOT packaging covers only specializations reachable from tuned CSV rows.
+    An untuned fallback whose K, CU/XCD topology, or persistence variant is not
+    packaged requires JIT compilation and therefore fails in run-only mode.
+    """
     result = _a8w8_bpreshuffle_eager(XQ, WQ, x_scale, w_scale, bias, dtype)
     if result is not None:
         return result
