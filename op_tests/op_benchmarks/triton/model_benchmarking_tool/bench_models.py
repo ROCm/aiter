@@ -17,6 +17,7 @@ import pandas as pd
 from triton.runtime.errors import OutOfResources
 
 from aiter.ops.triton.utils._triton import arch_info
+from op_tests.op_benchmarks.triton.bench_attn_res import main as bench_attn_res_main
 from op_tests.op_benchmarks.triton.bench_batched_gemm_a8w8 import (
     main as bench_batched_gemm_a8w8_main,
 )
@@ -96,6 +97,7 @@ KERNEL_DICT: dict[str, Callable[[list[str]], None]] = {
     "mhc": bench_mhc_dsv4_main,
     "kda_attention_prefill": bench_chunk_kda_main,
     "kda_attention_decode": bench_kda_main,
+    "attn_res": bench_attn_res_main,
     "sparse_mqa": bench_pa_decode_sparse_main,
     "unified_attention": bench_unified_attention_main,
 }
@@ -687,6 +689,55 @@ class KdaAttentionKernelHandler(KernelHandler):
         }
 
 
+class AttnResKernelHandler(KernelHandler):
+    """Handler for Kimi attention-residual benchmarks."""
+
+    def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
+        return [shape.copy() for shape in shapes]
+
+    def build_args(self) -> str:
+        shape = self._shape
+        op = str(shape.get("op", "gate"))
+        args = (
+            f"-N {self._M} -D {shape['D']} -L {shape['L']} "
+            f"--op {op} --metric {self._metric} --dtype bf16"
+        )
+        if op == "fwd":
+            args += f" --layout {shape.get('layout', 'packed')}"
+        for field, flag in (
+            ("add_hidden", "--add-hidden"),
+            ("add_hidden2", "--add-hidden2"),
+            ("close_block", "--close-block"),
+            ("onorm", "--onorm"),
+        ):
+            if shape.get(field):
+                args += f" {flag}"
+        return args
+
+    def parse_stdout(self, stdout: str) -> float:
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        last_row_values = list(
+            map(float, re.findall(r"-?\d+(?:\.\d+)?", lines[-1]))
+        )
+        if not last_row_values:
+            raise ValueError(f"Unexpected attn_res bench output: {lines[-1]!r}")
+        return last_row_values[-1]
+
+    def build_result_row(self, bench_result: float | str) -> ResultRow:
+        shape = self._shape
+        return {
+            "Model": self._model,
+            "Kernel": self._kernel,
+            "batch_size": self._batch_size,
+            "seq_len": self._seq_len,
+            "M": self._M,
+            "D": shape["D"],
+            "L": shape["L"],
+            "attn_res_op": shape.get("op", "gate"),
+            self._metric: bench_result,
+        }
+
+
 class UnifiedAttnKernelHandler(KernelHandler):
     """Handler for unified attention benchmarks (bench_unified_attention.py)."""
 
@@ -755,6 +806,7 @@ _HANDLER_RULES: list[tuple[Callable[[str], bool], type[KernelHandler]]] = [
     (lambda k: k == "mla", MlaKernelHandler),
     (lambda k: k == "mhc", MhcKernelHandler),
     (lambda k: k.startswith("kda_attention_"), KdaAttentionKernelHandler),
+    (lambda k: k == "attn_res", AttnResKernelHandler),
     (lambda k: k == "sparse_mqa", SparseMqaKernelHandler),
     (lambda k: k == "unified_attention", UnifiedAttnKernelHandler),
 ]
@@ -958,6 +1010,13 @@ def run_benchmarks(
                         "use --metric time or bandwidth."
                     )
                     continue
+
+            if kernel == "attn_res" and metric == "throughput":
+                print(
+                    "Skipping attn_res: throughput is not supported; "
+                    "use --metric time or bandwidth."
+                )
+                continue
 
             # MLA only reports time (ms)
             run_metric = "time" if kernel == "mla" else metric
