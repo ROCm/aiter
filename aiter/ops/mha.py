@@ -3490,77 +3490,7 @@ def _flash_attn_varlen_forward(
         )
         return ret
 
-    def can_impl_fmha_v4_hd256_varlen():
-        # gfx950 BF16 hd256 self-attention over whole documents (mha_v4_varlen_fwd), causal or
-        # not: one cu_seqlens for Q and K, any Hq % Hkv, LSE [Hq, total_q].
-        # AITER_DISABLE_FMHA_V4_HD256=1 falls back to the paths below.
-        if int(os.environ.get("AITER_DISABLE_FMHA_V4_HD256", "0")) != 0:
-            return False
-        ret = get_gfx() == "gfx950"
-        ret = ret and hdim_q == 256 and hdim_v == 256
-        ret = ret and all(t.dtype == dtypes.bf16 for t in (q, k, v))
-        ret = ret and nhead_q % nhead_k == 0
-        ret = ret and window_size_left == -1
-        ret = ret and window_size_right in ((-1, 0) if causal else (-1,))
-        ret = ret and sink_size == 0 and sink_ptr is None
-        ret = ret and dropout_p == 0.0 and logits_soft_cap == 0.0
-        ret = ret and bias is None and alibi_slopes is None and block_table is None
-        ret = ret and q_descale is None and k_descale is None and v_descale is None
-        ret = ret and cu_seqlens_q_padded is None and cu_seqlens_k_padded is None
-        ret = ret and not return_softmax
-        ret = ret and max_seqlen_q == max_seqlen_k and max_seqlen_q > 0
-        ret = ret and q.size(0) == k.size(0) == v.size(0)
-        # Whole documents: the kernel reads one cu_seqlens for both sides. Comparing contents
-        # would synchronize, so only the same storage qualifies.
-        ret = ret and (
-            cu_seqlens_q is cu_seqlens_k
-            or (
-                cu_seqlens_q.data_ptr() == cu_seqlens_k.data_ptr()
-                and cu_seqlens_q.shape == cu_seqlens_k.shape
-            )
-        )
-        ret = ret and (
-            out is None
-            or (
-                out.dtype == dtypes.bf16
-                and out.shape == q.shape
-                and out.stride(-1) == 1
-            )
-        )
-        return ret
-
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    if can_impl_fmha_v4_hd256_varlen():
-        from .mha_v4 import mha_v4_varlen_fwd
-
-        if return_lse:
-            out, softmax_lse = mha_v4_varlen_fwd(
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                int(max_seqlen_q),
-                float(softmax_scale),
-                causal=bool(causal),
-                out=out,
-                return_lse=True,
-            )
-        else:
-            out = mha_v4_varlen_fwd(
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                int(max_seqlen_q),
-                float(softmax_scale),
-                causal=bool(causal),
-                out=out,
-            )
-            softmax_lse = torch.empty((0,), dtype=torch.float32, device=q.device)
-        S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
-        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
-        return out, softmax_lse, S_dmask, rng_state
-
     gfx1250_asm = 0
     if _IS_GFX1250_ASM_DEVICE:
         gfx1250_asm = _select_gfx1250_fmha_fwd_varlen_asm(
