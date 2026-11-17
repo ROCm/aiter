@@ -23,8 +23,6 @@ Usage:
 """
 
 import functools
-import sys
-
 import torch
 
 from aiter.ops.triton.gated_delta_net.fused_gdn_decode_qkvz import (
@@ -154,7 +152,7 @@ def bench_one(
     return bencher.bench(kernel_fn) * 1000.0  # ms -> us
 
 
-def main():
+def main(argv: list[str] | None = None) -> None:
     ap = get_parser(kernel_name="Fused GDN Decode QKVZ")
     ap.add_argument("--batch", default="1,2,4,8,16,32,64,128,256")
     ap.add_argument("--num-k-heads", type=int, default=4)
@@ -186,13 +184,13 @@ def main():
         default="fp32",
         help="recurrent state pool dtype (bf16 runs the ratio-generic kernel)",
     )
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     state_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16}[args.state_dtype]
 
     arch = get_arch()
     if arch != "gfx950":
         print(f"fused_gdn_decode_qkvz is gfx950-only; this is {arch}")
-        return 0
+        return
 
     quant_dtype = None if args.no_fp8 else torch.float8_e4m3fn
     peak = _PEAK_BW.get(arch)
@@ -231,8 +229,7 @@ def main():
         tbs = nbytes / (us * 1e-6) / 1e12
         pct = 100.0 * tbs * 1e12 / peak if peak else float("nan")
         print(f"{b:>7}{us:>10.2f}{nbytes / 1e9:>11.4f}{tbs:>9.2f}{pct:>8.1f}%")
-    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

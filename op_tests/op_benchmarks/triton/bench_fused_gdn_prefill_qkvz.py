@@ -20,8 +20,6 @@ default sweep hits all four tiles. Usage:
 """
 
 import functools
-import sys
-
 import torch
 
 from aiter.ops.triton.gated_delta_net.fused_gdn_prefill_qkvz import (
@@ -128,7 +126,7 @@ def bench_one(bencher, batch, seqlen, num_k_heads, head_dim):
     return bencher.bench(kernel_fn) * 1000.0  # ms -> us
 
 
-def main():
+def main(argv: list[str] | None = None) -> None:
     ap = get_parser(kernel_name="Fused GDN Prefill QKVZ")
     ap.add_argument(
         "--shapes",
@@ -144,12 +142,12 @@ def main():
         help="Unused: RotatingBufferBench.bench's replay count is a fixed "
         "constant, not an adaptive iters target. Kept for CLI compatibility.",
     )
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     arch = get_arch()
     if arch != "gfx950":
         print(f"fused_gdn_prefill_qkvz is gfx950-only; this is {arch}")
-        return 0
+        return
 
     peak = _PEAK_BW.get(arch)
     print(
@@ -177,8 +175,7 @@ def main():
         print(
             f"{b:>6}{s:>8}{m:>8}{tile:>20}{us:>10.2f}{mtoks:>9.2f}{tbs:>8.2f}{pct:>5.0f}%"
         )
-    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

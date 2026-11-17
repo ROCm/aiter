@@ -30,6 +30,12 @@ from op_tests.op_benchmarks.triton.bench_batched_gemm_afp4wfp4 import (
 from op_tests.op_benchmarks.triton.bench_chunk_kda import (
     main as bench_chunk_kda_main,
 )
+from op_tests.op_benchmarks.triton.bench_fused_gdn_decode_qkvz import (
+    main as bench_fused_gdn_decode_main,
+)
+from op_tests.op_benchmarks.triton.bench_fused_gdn_prefill_qkvz import (
+    main as bench_fused_gdn_prefill_main,
+)
 from op_tests.op_benchmarks.triton.bench_gemm_a8w8_blockscale import (
     main as bench_gemm_a8w8_blockscale_main,
 )
@@ -98,6 +104,8 @@ KERNEL_DICT: dict[str, Callable[[list[str]], None]] = {
     "kda_attention_prefill": bench_chunk_kda_main,
     "kda_attention_decode": bench_kda_main,
     "attn_res": bench_attn_res_main,
+    "gated_delta_net_prefill": bench_fused_gdn_prefill_main,
+    "gated_delta_net_decode": bench_fused_gdn_decode_main,
     "sparse_mqa": bench_pa_decode_sparse_main,
     "unified_attention": bench_unified_attention_main,
 }
@@ -738,6 +746,64 @@ class AttnResKernelHandler(KernelHandler):
         }
 
 
+class GatedDeltaNetKernelHandler(KernelHandler):
+    """Handler for fused Qwen Gated DeltaNet prefill and decode benchmarks."""
+
+    def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
+        result = []
+        for shape in shapes:
+            s = shape.copy()
+            self._shard_keys(s, ["hk"])
+            result.append(s)
+        return result
+
+    def build_args(self) -> str:
+        shape = self._shape
+        common = f"--num-k-heads {shape['hk']} --head-dim {shape['dqk']}"
+        if self._kernel == "gated_delta_net_prefill":
+            return f"--shapes {self._batch_size}x{self._seq_len} {common}"
+
+        args = (
+            f"--batch {self._batch_size} {common} "
+            f"--ratio {shape.get('ratio', 2)} "
+            f"--layout {shape.get('layout', 'flat')} "
+            f"--slots {shape.get('slots', 512)} "
+            f"--state-dtype {shape.get('state_dtype', 'fp32')}"
+        )
+        if not shape.get("fp8", False):
+            args += " --no-fp8"
+        return args
+
+    def parse_stdout(self, stdout: str) -> float:
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        values = lines[-1].split()
+        try:
+            if self._metric == "time":
+                return float(values[-4]) * 1e-3  # us -> ms
+            return float(values[-2]) * 1e3  # TB/s -> GB/s
+        except (IndexError, ValueError) as error:
+            raise ValueError(
+                f"Unexpected Gated DeltaNet bench output: {lines[-1]!r}"
+            ) from error
+
+    def build_result_row(self, bench_result: float | str) -> ResultRow:
+        shape = self._shape
+        ratio = int(shape.get("ratio", 2))
+        is_decode = self._kernel == "gated_delta_net_decode"
+        return {
+            "Model": self._model,
+            "Kernel": self._kernel,
+            "batch_size": self._batch_size,
+            "seq_len": 1 if is_decode else self._seq_len,
+            "hk": shape["hk"],
+            "hv": int(shape["hk"]) * ratio,
+            "dqk": shape["dqk"],
+            "dv": shape.get("dv", shape["dqk"]),
+            "layout": shape.get("layout", "flat"),
+            self._metric: bench_result,
+        }
+
+
 class UnifiedAttnKernelHandler(KernelHandler):
     """Handler for unified attention benchmarks (bench_unified_attention.py)."""
 
@@ -807,6 +873,7 @@ _HANDLER_RULES: list[tuple[Callable[[str], bool], type[KernelHandler]]] = [
     (lambda k: k == "mhc", MhcKernelHandler),
     (lambda k: k.startswith("kda_attention_"), KdaAttentionKernelHandler),
     (lambda k: k == "attn_res", AttnResKernelHandler),
+    (lambda k: k.startswith("gated_delta_net_"), GatedDeltaNetKernelHandler),
     (lambda k: k == "sparse_mqa", SparseMqaKernelHandler),
     (lambda k: k == "unified_attention", UnifiedAttnKernelHandler),
 ]
@@ -1018,6 +1085,20 @@ def run_benchmarks(
                 )
                 continue
 
+            if kernel.startswith("gated_delta_net_"):
+                if arch_info.get_arch() != "gfx950":
+                    print(
+                        "Fused Gated DeltaNet is not supported on this device. "
+                        f"Skipping {kernel}."
+                    )
+                    continue
+                if metric == "throughput":
+                    print(
+                        f"Skipping {kernel}: TFLOPS throughput is not supported; "
+                        "use --metric time or bandwidth."
+                    )
+                    continue
+
             # MLA only reports time (ms)
             run_metric = "time" if kernel == "mla" else metric
 
@@ -1028,11 +1109,10 @@ def run_benchmarks(
             tp_shapes = handler.get_tp_shapes(shapes)
             for shape in tp_shapes:
                 for batch_size in batch_sizes:
-                    # Sparse decode uses batch_size as token concurrency. Its
-                    # context lengths come from the two KV streams in the shape.
-                    kernel_seq_lens = (
-                        seq_lens[:1] if kernel == "sparse_mqa" else seq_lens
-                    )
+                    # These decode kernels use batch_size as token concurrency.
+                    # Their context or state size comes from the shape metadata.
+                    decode_only = kernel in ("sparse_mqa", "gated_delta_net_decode")
+                    kernel_seq_lens = seq_lens[:1] if decode_only else seq_lens
                     for seq_len in kernel_seq_lens:
                         handler.set_iteration(shape, batch_size, seq_len)
                         bench_result = call_function(bench_fn, handler)
