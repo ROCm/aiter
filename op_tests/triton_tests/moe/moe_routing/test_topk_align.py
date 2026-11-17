@@ -54,19 +54,32 @@ def _reference_block_pid_map(
     return expected
 
 
-def _assert_align_matches_reference(
+@pytest.fixture
+def isolated_scratch(monkeypatch):
+    scratch = {}
+    monkeypatch.setattr(topk_align, "_TOPK_ALIGN_SCRATCH", scratch)
+    yield scratch
+    torch.cuda.synchronize()
+
+
+def _make_topk_case(tokens: int, *, skewed: bool = False):
+    torch.manual_seed(2026 + tokens)
+    topk_ids = torch.randint(0, 256, (tokens, 8), dtype=torch.int32, device="cuda")
+    if skewed:
+        topk_ids = topk_ids.remainder(16).contiguous()
+    topk_weights = torch.rand((tokens, 8), dtype=torch.float32, device="cuda")
+    return topk_ids, topk_weights
+
+
+def _assert_align_result_matches_reference(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
+    result,
     *,
     num_experts: int,
     block_m: int,
 ):
-    routing_data, gather, inverse, sorted_weights = topk_align.align_topk_ids(
-        topk_ids,
-        topk_weights,
-        num_experts=num_experts,
-        block_m=block_m,
-    )
+    routing_data, gather, inverse, sorted_weights = result
     torch.cuda.synchronize()
 
     flat_ids = topk_ids.flatten()
@@ -113,6 +126,28 @@ def _assert_align_matches_reference(
     assert routing_data.gate_scal.data_ptr() == sorted_weights.data_ptr()
 
 
+def _assert_align_matches_reference(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    num_experts: int,
+    block_m: int,
+):
+    result = topk_align.align_topk_ids(
+        topk_ids,
+        topk_weights,
+        num_experts=num_experts,
+        block_m=block_m,
+    )
+    _assert_align_result_matches_reference(
+        topk_ids,
+        topk_weights,
+        result,
+        num_experts=num_experts,
+        block_m=block_m,
+    )
+
+
 def test_align_topk_ids_metadata_with_empty_and_uneven_experts():
     topk_ids = torch.tensor(
         [
@@ -136,8 +171,7 @@ def test_align_topk_ids_metadata_with_empty_and_uneven_experts():
     )
 
 
-def test_align_topk_ids_uses_exclusive_scratch_per_stream():
-    topk_align._TOPK_ALIGN_SCRATCH.clear()
+def test_align_topk_ids_uses_exclusive_scratch_per_stream(isolated_scratch):
     topk_ids = torch.tensor(
         [[0, 1, 1, 7], [7, 7, 3, 3]], dtype=torch.int32, device="cuda"
     )
@@ -166,3 +200,135 @@ def test_align_topk_ids_uses_exclusive_scratch_per_stream():
 
     assert first.expt_data.hist.data_ptr() != second.expt_data.hist.data_ptr()
     assert gather_first.data_ptr() != gather_second.data_ptr()
+
+
+def test_scratch_cache_bounded_across_large_m_policy(isolated_scratch):
+    device = torch.device("cuda")
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        for tokens in range(1024, 4097):
+            topk_align._scratch(device, tokens * 8, 256, 32)
+    stream.synchronize()
+
+    keys = [
+        key
+        for key in isolated_scratch
+        if key[0] == device and key[1] == stream.cuda_stream and key[3:] == (256, 32)
+    ]
+    assert len(keys) == 3
+    assert {key[2] for key in keys} == {8192, 16384, 32768}
+
+    expected_blocks = {8192: 504, 16384: 760, 32768: 1272}
+    for key in keys:
+        scratch = isolated_scratch[key]
+        capacity = key[2]
+        assert scratch["block_pid_map"].numel() == expected_blocks[capacity]
+        for name in ("sorted_routes", "sorted_weights", "inverse"):
+            assert scratch[name].numel() == capacity
+
+    bytes_retained = sum(
+        tensor.numel() * tensor.element_size()
+        for scratch in isolated_scratch.values()
+        for tensor in scratch.values()
+    )
+    assert bytes_retained == 710_596
+
+
+def test_scratch_bucket_reuse_and_exact_output_shapes(isolated_scratch):
+    device = torch.device("cuda")
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        scratch_a = topk_align._scratch(device, 1152 * 8, 256, 32)
+        scratch_b = topk_align._scratch(device, 1544 * 8, 256, 32)
+        scratch_c = topk_align._scratch(device, 2049 * 8, 256, 32)
+        assert scratch_a is scratch_b
+        assert scratch_a is not scratch_c
+        for name in ("block_pid_map", "sorted_routes", "sorted_weights", "inverse"):
+            assert scratch_a[name].data_ptr() == scratch_b[name].data_ptr()
+            assert scratch_a[name].data_ptr() != scratch_c[name].data_ptr()
+
+        ids, weights = _make_topk_case(1152)
+        routing_data, gather, inverse, sorted_weights = topk_align.align_topk_ids(
+            ids,
+            weights,
+            num_experts=256,
+            block_m=32,
+        )
+    stream.synchronize()
+
+    assert gather.numel() == 1152 * 8
+    assert inverse.numel() == 1152 * 8
+    assert sorted_weights.numel() == 1152 * 8
+    assert routing_data.expt_data.block_pid_map.numel() == topk_align._max_tiles(
+        1152 * 8, 256, 32
+    )
+    assert routing_data.gate_scal.data_ptr() == sorted_weights.data_ptr()
+
+
+@pytest.mark.parametrize(
+    "sequence",
+    [
+        (1152, 1544, 1152),
+        (1024, 1025, 1024),
+        (2048, 2049, 2048),
+        (3072, 4096, 3072),
+    ],
+)
+def test_align_topk_ids_alternating_m(sequence, isolated_scratch):
+    for index, tokens in enumerate(sequence):
+        ids, weights = _make_topk_case(tokens, skewed=index == 1)
+        _assert_align_matches_reference(
+            ids,
+            weights,
+            num_experts=256,
+            block_m=32,
+        )
+
+
+@pytest.mark.parametrize("m_a,m_b", [(1152, 1544), (2048, 2049)])
+def test_align_topk_ids_graph_replay_buckets(m_a, m_b, isolated_scratch):
+    if not hasattr(torch.cuda, "CUDAGraph"):
+        pytest.skip("CUDA/HIP graphs are not available in this torch build")
+
+    stream = torch.cuda.Stream()
+    ids_a, weights_a = _make_topk_case(m_a)
+    ids_b, weights_b = _make_topk_case(m_b, skewed=True)
+
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        topk_align.align_topk_ids(ids_a, weights_a, num_experts=256, block_m=32)
+        topk_align.align_topk_ids(ids_b, weights_b, num_experts=256, block_m=32)
+    stream.synchronize()
+
+    graph_a = graph_b = result_a = result_b = None
+    try:
+        graph_a = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph_a, stream=stream):
+            result_a = topk_align.align_topk_ids(
+                ids_a, weights_a, num_experts=256, block_m=32
+            )
+
+        graph_b = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph_b, stream=stream):
+            result_b = topk_align.align_topk_ids(
+                ids_b, weights_b, num_experts=256, block_m=32
+            )
+
+        for graph, ids, weights, result in (
+            (graph_a, ids_a, weights_a, result_a),
+            (graph_b, ids_b, weights_b, result_b),
+            (graph_a, ids_a, weights_a, result_a),
+        ):
+            with torch.cuda.stream(stream):
+                graph.replay()
+            stream.synchronize()
+            _assert_align_result_matches_reference(
+                ids,
+                weights,
+                result,
+                num_experts=256,
+                block_m=32,
+            )
+    finally:
+        torch.cuda.synchronize()
+        del graph_a, graph_b, result_a, result_b

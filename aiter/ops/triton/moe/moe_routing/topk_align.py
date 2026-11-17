@@ -23,18 +23,23 @@ def _max_tiles(route_count: int, num_experts: int, block_m: int) -> int:
     return triton.cdiv(max(route_count - num_experts + 1, 0), block_m) + num_experts - 1
 
 
+def _route_capacity(route_count: int) -> int:
+    return 1 if route_count <= 1 else 1 << (route_count - 1).bit_length()
+
+
 def get_topk_align_config():
     return dict(get_moe_dispatch("MOE-TOPK-ALIGN", get_arch(), "triton")["any"])
 
 
 def _scratch(device, route_count: int, num_experts: int, block_m: int):
     stream = torch.cuda.current_stream(device)
-    key = (device, stream.cuda_stream, route_count, num_experts, block_m)
+    route_capacity = _route_capacity(route_count)
+    key = (device, stream.cuda_stream, route_capacity, num_experts, block_m)
     scratch = _TOPK_ALIGN_SCRATCH.get(key)
     if scratch is not None:
         return scratch
 
-    max_blocks = _max_tiles(route_count, num_experts, block_m)
+    max_blocks = _max_tiles(route_capacity, num_experts, block_m)
     with persistent_alloc(device):
         scratch = {
             "hist": torch.empty(num_experts, dtype=torch.int32, device=device),
@@ -47,11 +52,13 @@ def _scratch(device, route_count: int, num_experts: int, block_m: int):
             "cursor": torch.empty(num_experts, dtype=torch.int32, device=device),
             "total_blocks": torch.empty(1, dtype=torch.int32, device=device),
             "block_pid_map": torch.empty(max_blocks, dtype=torch.int32, device=device),
-            "sorted_routes": torch.empty(route_count, dtype=torch.int32, device=device),
-            "sorted_weights": torch.empty(
-                route_count, dtype=torch.float32, device=device
+            "sorted_routes": torch.empty(
+                route_capacity, dtype=torch.int32, device=device
             ),
-            "inverse": torch.empty(route_count, dtype=torch.int32, device=device),
+            "sorted_weights": torch.empty(
+                route_capacity, dtype=torch.float32, device=device
+            ),
+            "inverse": torch.empty(route_capacity, dtype=torch.int32, device=device),
         }
     _TOPK_ALIGN_SCRATCH[key] = scratch
     return scratch
@@ -80,10 +87,10 @@ def align_topk_ids(
     cursor = scratch["cursor"]
     total_blocks = scratch["total_blocks"]
     max_blocks = _max_tiles(route_count, num_experts, block_m)
-    block_pid_map = scratch["block_pid_map"]
-    sorted_routes = scratch["sorted_routes"]
-    sorted_weights = scratch["sorted_weights"]
-    inverse = scratch["inverse"]
+    block_pid_map = scratch["block_pid_map"][:max_blocks]
+    sorted_routes = scratch["sorted_routes"][:route_count]
+    sorted_weights = scratch["sorted_weights"][:route_count]
+    inverse = scratch["inverse"][:route_count]
     hist.zero_()
 
     block = cfg["route_block"]
