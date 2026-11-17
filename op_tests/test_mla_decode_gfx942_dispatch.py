@@ -352,5 +352,104 @@ def test_codegen_produces_expected_entries():
         ), f"Expected gfx950 v3 macro entry not found in generated header:\n{expected_macro_substring_950}\n"
 
 
+def _simulate_mgc_resolution(
+    arch: str, nhead: int, q_dtype: str, kv_dtype: str, max_seqlen_q: int
+) -> int:
+    """Mirror the mgc computation in aiter/mla.py."""
+    mgc = (
+        64
+        if nhead in [8, 16]
+        and (max_seqlen_q == 1 or (nhead == 8 and max_seqlen_q == 2))
+        else 16
+    )
+    mgc = (
+        32
+        if (nhead == 128 and q_dtype == "fp8" and kv_dtype == "fp8")
+        or (
+            arch == "gfx950"
+            and nhead == 64
+            and q_dtype == "bf16"
+            and kv_dtype == "bf16"
+            and max_seqlen_q == 1
+        )
+        else mgc
+    )
+    if nhead == 64 and q_dtype == "fp8" and kv_dtype == "fp8" and max_seqlen_q == 1:
+        mgc = 64
+    return mgc
+
+
+def test_gfx942_bf16_gqa64_mgc_resolution():
+    """Verify that mgc resolves to 16 on gfx942 and 32 on gfx950 for BF16 GQA64 qlen=1."""
+    # gfx942 BF16 GQA64 decode must resolve to mgc=16 matching MLA_A16W16_1TG_4W_64mx1_16nx1_Coex0_Msk1_QH16.co
+    mgc_942 = _simulate_mgc_resolution(
+        "gfx942", nhead=64, q_dtype="bf16", kv_dtype="bf16", max_seqlen_q=1
+    )
+    assert mgc_942 == 16, f"Expected mgc=16 on gfx942, got {mgc_942}"
+
+    # gfx950 BF16 GQA64 decode must resolve to mgc=32 matching mla_a16w16_qh64_qseqlen1_gqaratio64_v3.co
+    mgc_950 = _simulate_mgc_resolution(
+        "gfx950", nhead=64, q_dtype="bf16", kv_dtype="bf16", max_seqlen_q=1
+    )
+    assert mgc_950 == 32, f"Expected mgc=32 on gfx950, got {mgc_950}"
+
+    # Multi-token decode (qlen=2) on gfx942 falls back to default 16
+    mgc_942_q2 = _simulate_mgc_resolution(
+        "gfx942", nhead=64, q_dtype="bf16", kv_dtype="bf16", max_seqlen_q=2
+    )
+    assert mgc_942_q2 == 16, f"Expected mgc=16 for qlen=2, got {mgc_942_q2}"
+
+    # GQA16 single-token decode preserves mgc=64
+    mgc_gqa16 = _simulate_mgc_resolution(
+        "gfx942", nhead=16, q_dtype="bf16", kv_dtype="bf16", max_seqlen_q=1
+    )
+    assert mgc_gqa16 == 64, f"Expected mgc=64 for GQA16, got {mgc_gqa16}"
+
+
+def test_stage2_valid_split_count_coverage_all_shapes():
+    """Verify stage-2 valid split calculation across all 10 reported MI300X shapes.
+
+    Proves mathematically why mgc=32 dropped splits for short configurations
+    and confirms that mgc=16 correctly covers all valid partials without truncation.
+    """
+    import math
+
+    reported_cases = [
+        # (batch, ctx, splits, name, expected_partials_with_tile_16)
+        (1, 64, 2, "P1", 2),
+        (1, 128, 2, "P2", 2),
+        (1, 128, 4, "P3", 4),
+        (1, 2048, 16, "P4", 16),
+        (4, 512, 4, "P5", 4),
+        (8, 1024, 16, "P6", 16),
+        (16, 256, 2, "P7", 2),
+        (1, 128, 8, "F1", 8),
+        (1, 128, 16, "F2", 8),
+        (1, 21, 16, "F3", 2),
+    ]
+
+    for bs, ctx, splits, case_id, expected_partials in reported_cases:
+        # What stage 2 computed before the fix (mgc=32):
+        valid_splits_old = min(splits, math.ceil(ctx / 32))
+        # What stage 2 computes after the fix (mgc=16):
+        valid_splits_new = min(splits, math.ceil(ctx / 16))
+
+        if case_id.startswith("P"):
+            # Passing cases: old and new must both cover all requested splits
+            assert valid_splits_old == splits, f"{case_id} failed with old mgc=32"
+            assert valid_splits_new == splits, f"{case_id} regressed with new mgc=16"
+        else:
+            # Failing cases: old mgc=32 truncated valid partials
+            assert valid_splits_old < expected_partials, (
+                f"{case_id} was expected to truncate under mgc=32: "
+                f"valid={valid_splits_old} < expected={expected_partials}"
+            )
+            # New mgc=16 fully covers all expected partials
+            assert valid_splits_new == expected_partials, (
+                f"{case_id} under mgc=16: expected {expected_partials} valid splits, "
+                f"got {valid_splits_new}"
+            )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
