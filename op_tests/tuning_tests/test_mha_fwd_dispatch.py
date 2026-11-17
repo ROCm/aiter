@@ -365,6 +365,39 @@ class TestMhaVarlenForward(unittest.TestCase):
             self._varlen_forward(selected_backend="opus")
         self.assertIn("max_seqlen_k=16, nhead_q=12, hdim_q=192", logs.output[0])
 
+    def test_an_opus_row_serves_hd128_only_where_opus_is_enabled(self):
+        q = torch.empty((8, 12, 128), dtype=torch.bfloat16)
+        k = torch.empty((16, 12, 128), dtype=torch.bfloat16)
+        v = torch.empty((16, 12, 128), dtype=torch.bfloat16)
+        cu_q = torch.tensor([0, 8], dtype=torch.int32)
+        cu_k = torch.tensor([0, 16], dtype=torch.int32)
+        for enabled, expected in (("1", "opus"), ("0", "asm_v3")):
+            mha.warn_declined_mha_fwd_row.cache_clear()
+            with self.subTest(AITER_ENABLE_FMHA_OPUS=enabled):
+                with (
+                    mock.patch.dict(os.environ, {"AITER_ENABLE_FMHA_OPUS": enabled}),
+                    mock.patch.object(mha, "get_gfx", return_value="gfx950"),
+                    mock.patch.object(
+                        mha, "fmha_fwd_bf16_opus_varlen_fwd", return_value=q
+                    ),
+                    mock.patch.object(
+                        mha,
+                        "fmha_v3_varlen_fwd",
+                        return_value=tuple(torch.empty(1) for _ in range(4)),
+                    ),
+                    (
+                        self.assertNoLogs("aiter", level="WARNING")
+                        if enabled == "1"
+                        else self.assertLogs("aiter", level="WARNING")
+                    ),
+                    _recorded_selections() as selections,
+                ):
+                    mha._flash_attn_varlen_forward(
+                        q, k, v, cu_q, cu_k, None, None, 8, 16, 0, 0.0, 0.125, False,
+                        selected_backend="opus",
+                    )  # fmt: skip
+                self.assertEqual(selections, [{"backend": expected}])
+
     def test_a_declined_row_warns_once_per_shape(self):
         mha.warn_declined_mha_fwd_row.cache_clear()
         with self.assertLogs("aiter", level="WARNING") as logs:
