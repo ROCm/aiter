@@ -494,7 +494,9 @@ namespace py = pybind11;
           py::arg("is_neox") = true,                                                \
           py::arg("compute_all_q_rope") = false,                                    \
           py::arg("q_scale_out") = std::nullopt,                                    \
-          py::arg("kv_cache_scale") = std::nullopt);                                \
+          py::arg("kv_cache_scale") = std::nullopt,                                 \
+          py::arg("scale_layout") = "flydsl",                                     \
+          py::arg("rope_dim") = 64);                                               \
     m.def("cp_gather_indexer_k_quant_cache",                                        \
           &aiter::cp_gather_indexer_k_quant_cache,                                  \
           py::arg("kv_cache"),                                                      \
@@ -582,6 +584,15 @@ namespace py = pybind11;
           py::arg("inp"),                                                            \
           py::arg("out"),                                                            \
           py::arg("dim"));                                                           \
+    m.def("all_gather_lastdim_add",                                                  \
+          &aiter::all_gather_lastdim_add,                                            \
+          py::arg("_fa"),                                                            \
+          py::arg("inp"),                                                            \
+          py::arg("out"),                                                            \
+          py::arg("add_b"),                                                          \
+          py::arg("add_c")     = std::nullopt,                                       \
+          py::arg("reg_ptr")   = 0,                                                  \
+          py::arg("reg_bytes") = 0);                                                 \
     m.def("all_gather_unreg",                                                        \
           &aiter::all_gather_unreg,                                                  \
           py::arg("_fa"),                                                            \
