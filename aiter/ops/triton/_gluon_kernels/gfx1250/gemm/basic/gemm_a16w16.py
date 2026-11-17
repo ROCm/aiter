@@ -130,7 +130,7 @@ def _gemm_a16w16_bandwidth_bound_kernel(
     pid_n = pid // num_pid_m
 
     # Descriptors start at this block's (M, N) offset by biasing the base
-    # pointer -- subsequent async_loads use [0, 0] and step only along K.
+    # pointer — subsequent async_loads use [0, 0] and step only along K.
     a_base = a_ptr + pid_m * BLOCK_M * stride_am
     b_base = b_ptr + pid_n * BLOCK_N * stride_bn
 
@@ -495,7 +495,7 @@ def _gemm_a16w16_compute_bound_kernel(
     pid_n = pid // num_pid_m
 
     # Descriptors start at this block's (M, N) offset by biasing the base
-    # pointer -- subsequent async_loads use [0, 0] and step only along K.
+    # pointer — subsequent async_loads use [0, 0] and step only along K.
     a_base = a_ptr + pid_m * BLOCK_M * stride_am
     b_base = b_ptr + pid_n * BLOCK_N * stride_bn
 
@@ -621,11 +621,11 @@ def _gemm_a16w16_compute_bound_kernel(
             OPERAND_LAYOUT_B,
         )
 
-    # Main pipeline loop -- first iteration peeled out below, then loop runs
+    # Main pipeline loop — first iteration peeled out below, then loop runs
     # for (num_k_tiles - (NUM_BUFFERS - 1) - 1) remaining iterations.
 
     # ---- Peeled first iteration ----
-    # WMMA for the current tile -- uses operands pre-loaded in the
+    # WMMA for the current tile — uses operands pre-loaded in the
     # *previous* iteration so no ds_read stall before the matrix op.
     accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
@@ -696,7 +696,7 @@ def _gemm_a16w16_compute_bound_kernel(
     # use the fast add_offsets path that leaves the OOB bound untouched.
     for _ in range(num_k_tiles - NUM_BUFFERS - 1):
 
-        # WMMA for the current tile -- uses operands pre-loaded in the
+        # WMMA for the current tile — uses operands pre-loaded in the
         # *previous* iteration so no ds_read stall before the matrix op.
         accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
@@ -905,7 +905,7 @@ def _gemm_a16w16_compute_bound_kernel(
             WMMA_LAYOUT,
         )
     else:
-        # TDM Store: accumulator -> shared memory -> global memory
+        # TDM Store: accumulator → shared memory → global memory
         SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             [[BLOCK_N, 8]], [BLOCK_M, BLOCK_N], [1, 0]
         )

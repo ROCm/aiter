@@ -155,18 +155,18 @@ inline MlaDecodeHeadPlan mla_decode_head_plan_v1_2(const std::string_view arch_i
     const bool flydsl_ps1_dtypes =
         (q_dtype == kv_dtype) && (q_is_fp8 || (q_dtype == AITER_DTYPE_bf16));
     const bool gfx1250_flydsl_ps1_heads =
-        flydsl_ps1 && ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) &&
-        flydsl_ps1_dtypes &&
+        flydsl_ps1 && ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) && flydsl_ps1_dtypes &&
         ((num_heads == 96) ||
-         (((num_heads == 32) || (num_heads == 64) || (num_heads == 128)) && (max_seqlen_qo == 1)) ||
+         (((num_heads == 32) || (num_heads == 64) || (num_heads == 128)) &&
+          (max_seqlen_qo == 1)) ||
          (((num_heads == 32) || (num_heads == 64)) && (max_seqlen_qo <= 4) &&
           (num_heads * max_seqlen_qo <= 128)));
 
     // gfx942 native QH64 FP8 only supports page_size=64; otherwise fold to QH16.
     const bool natively_supported =
         (num_heads == 16) || gfx1250_flydsl_ps1_heads ||
-        ((arch_id == "gfx950" || (arch_id == "gfx942" && page_size == 64)) && (num_heads == 64) &&
-         q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 1)) ||
+        ((arch_id == "gfx950" || (arch_id == "gfx942" && page_size == 64)) &&
+         (num_heads == 64) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 1)) ||
         ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8) ||
         ((arch_id == "gfx942") && (num_heads == 128) && q_is_fp8 && kv_is_fp8) ||
         ((arch_id == "gfx950") && q_is_fp8 && kv_is_fp8 &&
@@ -272,11 +272,11 @@ inline MlaBackendId mla_decode_backend(const std::string_view arch_id,
     const bool kv_is_bf16 = (kv_dtype == AITER_DTYPE_bf16);
 
     // FP8 Q/KV with per-tensor scales, or BF16 Q/KV (no scales read).
-    const bool ps1_is_fp8  = q_is_fp8 && kv_is_fp8 && has_scales;
-    const bool ps1_is_bf16 = q_is_bf16 && kv_is_bf16;
+    const bool ps1_is_fp8     = q_is_fp8 && kv_is_fp8 && has_scales;
+    const bool ps1_is_bf16    = q_is_bf16 && kv_is_bf16;
     const bool use_flydsl_ps1 =
-        flags.flydsl_ps1 && ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) &&
-        (page_size == 1) && (ps1_is_fp8 || ps1_is_bf16) &&
+        flags.flydsl_ps1 && ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) && (page_size == 1) &&
+        (ps1_is_fp8 || ps1_is_bf16) &&
         ((num_heads == 16) || (num_heads == 32) || (num_heads == 64) || (num_heads == 96) ||
          (num_heads == 128)) &&
         ((num_heads == 96) || (max_seqlen_qo == 1) ||

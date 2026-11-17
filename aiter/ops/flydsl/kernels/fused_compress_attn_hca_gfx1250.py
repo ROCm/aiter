@@ -1562,7 +1562,7 @@ def flydsl_hca_compress_attn_gfx1250(
     if kv_state.dtype != torch.float32 or score_state.dtype != torch.float32:
         raise TypeError("kv_state/score_state must be fp32")
     # Slot and ring strides are passed to the kernel and the descriptor is
-    # rebased per slot, so the states may be strided views -- a per-request
+    # rebased per slot, so the states may be strided views — a per-request
     # arena hands out a view whose slot stride is a whole entry. Only the
     # innermost dim must be unit stride: the kernel addresses it as
     # `col_off + lane`.

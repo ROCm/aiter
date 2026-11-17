@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025 FlyDSL Project Contributors
 """Fused Stage1 dispatch with FP8/FP4 activation and FP4-weight GEMM1."""
 
 import functools

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
 """Per-block forward pass: shared primitives, traits, and the kernel context."""

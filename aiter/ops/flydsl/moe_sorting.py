@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL MoE sorting kernel -- drop-in replacement for CK/Opus moe_sorting_fwd.
+"""FlyDSL MoE sorting kernel — drop-in replacement for CK/Opus moe_sorting_fwd.
 
 Provides `flydsl_moe_sorting_fwd()` with the same signature as
 `aiter.moe_sorting_fwd()` so it can be used as a direct dispatch target

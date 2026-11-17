@@ -130,7 +130,7 @@ def test_per_1x32_mxfp8_quant(M: int, K: int, dtype: torch.dtype):
     torch.testing.assert_close(s_kern, s_ref)
 
     # Quantized values: compare via the uint8 view (allow off-by-1 for any
-    # rounding-mode subtlety in the fp32->fp8 cast).
+    # rounding-mode subtlety in the fp32→fp8 cast).
     torch.testing.assert_close(
         y_kern.view(torch.uint8).to(torch.int32),
         y_ref.view(torch.uint8).to(torch.int32),

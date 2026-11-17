@@ -60,7 +60,7 @@ def _get_tuned_kernel_entry(
 ) -> tuple[str, dict | None]:
     """Internal cached lookup returning ``(config path, entry or None)``.
 
-    Do NOT use this directly -- the entry is the shared cached object, so
+    Do NOT use this directly — the entry is the shared cached object, so
     ``get_tuned_kernel_config()`` copies it before handing it out.
     """
     # Nested layout of configs/AGENTS.md: <arch>/<backend>/<op>/<d_type>/DEFAULT.json, or

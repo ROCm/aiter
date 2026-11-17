@@ -7,12 +7,12 @@ weights + optional FP8 group quant).
 Structure mirrors the other op_benchmarks/triton bench scripts (a
 ``triton.testing.Benchmark`` + ``perf_report`` shape sweep, ``--metric`` /
 ``--shape`` / ``-o`` / ``-print_vgpr``). Timing uses ``RotatingBufferBench.bench`` ( rotating buffers +
-CUDA graph replay) rather than ``do_bench`` to remove host launch overhead -- this op
+CUDA graph replay) rather than ``do_bench`` to remove host launch overhead — this op
 is a short, memory-bound elementwise pass where per-launch overhead would
 otherwise dominate. ``--backend {auto,triton,gluon}`` selects the wrapper's
 dispatch so the Triton and gfx1250 Gluon paths can be compared head-to-head.
 
-Correctness is not checked here -- see op_tests/test_fused_clamp_act_mul.py for
+Correctness is not checked here — see op_tests/test_fused_clamp_act_mul.py for
 the value/scale reference test.
 """
 

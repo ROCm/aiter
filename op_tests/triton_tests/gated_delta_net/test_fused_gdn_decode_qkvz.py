@@ -188,7 +188,7 @@ def make_inputs(
 
     Every live row gets a *distinct* slot. Duplicate slots would let two rows
     read-modify-write the same state concurrently, which is order-dependent in
-    the kernel and sequential in the reference -- a mismatch that says nothing
+    the kernel and sequential in the reference — a mismatch that says nothing
     about correctness. SGLang's own validator enforces distinct live slots.
     """
     torch.manual_seed(seed)

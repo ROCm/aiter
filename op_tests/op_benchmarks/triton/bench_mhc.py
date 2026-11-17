@@ -11,7 +11,7 @@ and bandwidth.
 Usage:
   python bench_mhc.py              # Benchmark mhc (pre-transformer)
   python bench_mhc.py --op post    # Benchmark mhc_post (post-transformer)
-  python bench_mhc.py --op e2e     # Benchmark full pipeline (mhc -> mhc_post)
+  python bench_mhc.py --op e2e     # Benchmark full pipeline (mhc → mhc_post)
 
 - `--with-hip`: adds the HIP kernel alongside the Triton kernel.
   When passed, a Triton-vs-HIP correctness check runs as the first step of

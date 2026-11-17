@@ -31,15 +31,11 @@ import time
 # up the sibling rather than any installed package of the same name.
 from watchdog import GitHub
 
-AVG_REVIEW_MINUTES = 50  # fallback when no completed review can be measured
-RECENT_REVIEWS = 8  # the estimate is the median of what the box actually did lately
-MAX_WAIT_HOURS = 8  # refuse beyond this rather than accept it; see below
-NO_RUNNER_MINUTES = (
-    30  # nothing moving for this long, with work waiting, means nobody is taking it
-)
-RECHECK_SECONDS = (
-    60  # before calling a box dead, see whether it was simply between reviews
-)
+AVG_REVIEW_MINUTES = 50      # fallback when no completed review can be measured
+RECENT_REVIEWS = 8            # the estimate is the median of what the box actually did lately
+MAX_WAIT_HOURS = 8           # refuse beyond this rather than accept it; see below
+NO_RUNNER_MINUTES = 30       # nothing moving for this long, with work waiting, means nobody is taking it
+RECHECK_SECONDS = 60         # before calling a box dead, see whether it was simply between reviews
 
 # The limit is a wait, not a queue length, because the constraint it answers is a wait: GitHub
 # cancels a job that has been queued for 24 h, silently. Eight hours leaves room for the estimate
@@ -48,8 +44,7 @@ RECHECK_SECONDS = (
 
 def _age_minutes(stamp, now):
     t = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=datetime.timezone.utc
-    )
+        tzinfo=datetime.timezone.utc)
     return (now - t).total_seconds() / 60.0
 
 
@@ -69,9 +64,7 @@ def tunable(env, name, default):
     except ValueError:
         value = float("nan")
     if not math.isfinite(value) or value <= 0:
-        print(
-            "::warning::%s=%r is not a usable number; using %s" % (name, raw, default)
-        )
+        print("::warning::%s=%r is not a usable number; using %s" % (name, raw, default))
         return default
     return value
 
@@ -79,8 +72,7 @@ def tunable(env, name, default):
 def survey(api, repo, own_run_id, now):
     """How many reviews are running, how long the ones past their gate have waited, and how many
     requests are still queued at their own gate -- a burst queues whole runs at the hosted
-    runner before any gate job runs, and those requests are as ahead of the requester as any.
-    """
+    runner before any gate job runs, and those requests are as ahead of the requester as any."""
     running, waiting, arriving = 0, [], 0
     for run in api.live_runs(repo):
         if run["id"] == own_run_id:
@@ -90,18 +82,11 @@ def survey(api, repo, own_run_id, now):
         gate = next((j for j in jobs if j["name"] == "gate"), None)
         if review is not None and review["status"] == "in_progress":
             running += 1
-        elif (
-            review is not None
-            and review["status"] == "queued"
-            and gate is not None
-            and gate["status"] == "completed"
-            and gate["conclusion"] == "success"
-        ):
+        elif review is not None and review["status"] == "queued" and gate is not None \
+                and gate["status"] == "completed" and gate["conclusion"] == "success":
             # past its gate and waiting for the box: the wait a dead runner would explain
             waiting.append(_age_minutes(run["created_at"], now))
-        elif run["status"] == "queued" or (
-            gate is not None and gate["status"] != "completed"
-        ):
+        elif run["status"] == "queued" or (gate is not None and gate["status"] != "completed"):
             # real, but still short of the box -- its own gate has not finished, which says
             # nothing about the box, so it counts toward the queue without ever paging anyone
             arriving += 1
@@ -133,28 +118,24 @@ def _hours(minutes):
 def message(verdict, ahead, eta, owner):
     if verdict == "no-runner":
         return (
-            "? **aiter-bot** -- %d review(s) have been waiting %s and none has "
+            "⚠️ **aiter-bot** — %d review(s) have been waiting %s and none has "
             "started, so the self-hosted runner is not picking up work. It is either down or "
             "wedged; both need the same thing, a look at the box.\n\n"
             "This request was **not queued**, because a job queued behind a stopped runner is "
             "cancelled after 24 h without a word.\n\n"
-            "@%s -- please check the runner, then re-comment `@aiter-bot review`.\n\n"
+            "@%s — please check the runner, then re-comment `@aiter-bot review`.\n\n"
             "<sub>See `.claude/skills/review-pr/RUNNER-SETUP.md` section 5.</sub>"
-            % (ahead, _hours(eta), owner)
-        )
+            % (ahead, _hours(eta), owner))
     if verdict == "too-deep":
         return (
-            "**aiter-bot** -- the box reviews one PR at a time and is **%d deep** right now "
+            "**aiter-bot** — the box reviews one PR at a time and is **%d deep** right now "
             "(roughly %s of work ahead).\n\n"
             "This request was **not queued**: a job that waits more than 24 h is cancelled "
             "silently, so saying no now is better than losing it later.\n\n"
             "Re-comment `@aiter-bot review` once the queue is shorter."
-            % (ahead, _hours(eta))
-        )
-    return (
-        "**aiter-bot** -- queued behind %d review(s); expect to start in about %s. "
-        "The box reviews one PR at a time." % (ahead, _hours(eta))
-    )
+            % (ahead, _hours(eta)))
+    return ("**aiter-bot** — queued behind %d review(s); expect to start in about %s. "
+            "The box reviews one PR at a time." % (ahead, _hours(eta)))
 
 
 def run(api, env, now=None, sleep=time.sleep):
@@ -165,9 +146,7 @@ def run(api, env, now=None, sleep=time.sleep):
         if out:
             with open(out, "a", encoding="utf-8") as fh:
                 fh.write("ok=%s\n" % ("true" if ok else "false"))
-        print(
-            "::notice::queue gate: %s -> %s" % (verdict, "run" if ok else "not queued")
-        )
+        print("::notice::queue gate: %s -> %s" % (verdict, "run" if ok else "not queued"))
         return ok, verdict
 
     # The authorization step owns that decision; this one only ever narrows it.
@@ -189,22 +168,16 @@ def run(api, env, now=None, sleep=time.sleep):
         try:
             done = api.recent_review_minutes(repo, RECENT_REVIEWS)
         except Exception as e:  # the ETA is a courtesy, not a gate
-            print(
-                "::warning::could not read recent review times (%s: %s); assuming %d min"
-                % (type(e).__name__, e, AVG_REVIEW_MINUTES)
-            )
+            print("::warning::could not read recent review times (%s: %s); assuming %d min"
+                  % (type(e).__name__, e, AVG_REVIEW_MINUTES))
             done = []
         typical = statistics.median(done) if done else AVG_REVIEW_MINUTES
         if done:
-            print(
-                "::notice::eta base: median %.0f min over the last %d review(s)"
-                % (typical, len(done))
-            )
-        cfg = {
-            "avg_minutes": tunable(env, "AVG_REVIEW_MINUTES", typical),
-            "max_wait_minutes": tunable(env, "MAX_WAIT_HOURS", MAX_WAIT_HOURS) * 60,
-            "no_runner_minutes": tunable(env, "NO_RUNNER_MINUTES", NO_RUNNER_MINUTES),
-        }
+            print("::notice::eta base: median %.0f min over the last %d review(s)"
+                  % (typical, len(done)))
+        cfg = {"avg_minutes": tunable(env, "AVG_REVIEW_MINUTES", typical),
+               "max_wait_minutes": tunable(env, "MAX_WAIT_HOURS", MAX_WAIT_HOURS) * 60,
+               "no_runner_minutes": tunable(env, "NO_RUNNER_MINUTES", NO_RUNNER_MINUTES)}
         running, waiting, arriving = survey(api, repo, own, now)
         verdict, ahead, eta = decide(running, waiting, arriving, cfg)
 
@@ -223,27 +196,22 @@ def run(api, env, now=None, sleep=time.sleep):
                 print("::notice::the box was between reviews, not stopped")
 
         if verdict == "idle":
-            return finish(True, verdict)  # starts at once; a comment would be noise
+            return finish(True, verdict)    # starts at once; a comment would be noise
 
         owner = (env.get("OWNER_OVERRIDE") or "").strip() or "zufayu"
         status = api.comment(repo, env["PR"], message(verdict, ahead, eta, owner))
         if not 200 <= status < 300:
             print("::warning::could not post the queue notice: %s" % status)
         return finish(verdict == "queued", verdict)
-    except Exception as e:  # noqa: BLE001 - degrade, not crash
-        print(
-            "::warning::the queue check failed (%s: %s); proceeding"
-            % (type(e).__name__, e)
-        )
+    except Exception as e:                                  # noqa: BLE001 - degrade, not crash
+        print("::warning::the queue check failed (%s: %s); proceeding" % (type(e).__name__, e))
         return finish(True, "unmeasured")
 
 
 def main():
     api = GitHub(os.environ["GH_TOKEN"], os.environ.get("AITER_BOT_TOKEN", ""))
     ok, _ = run(api, os.environ)
-    return (
-        0 if ok is not None else 1
-    )  # the gate's output carries the decision, not the exit
+    return 0 if ok is not None else 1      # the gate's output carries the decision, not the exit
 
 
 if __name__ == "__main__":

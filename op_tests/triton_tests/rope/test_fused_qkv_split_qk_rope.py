@@ -37,8 +37,8 @@ def generate_qkv_inputs(
         attn_output_gate: If True, append a per-query-head gate next to Q in ``qkv``.
         dtype: Tensor dtype (typically ``torch.bfloat16``).
         qkv_layout: When ``attn_output_gate`` is True, how Q and gate are packed:
-            ``"interleaved"`` -- ``[q_h0||g_h0||q_h1||g_h1||...]`` then K then V;
-            ``"blocked"`` -- ``[all Q flat][all gate flat]`` then K then V.
+            ``"interleaved"`` — ``[q_h0||g_h0||q_h1||g_h1||...]`` then K then V;
+            ``"blocked"`` — ``[all Q flat][all gate flat]`` then K then V.
     """
     QH = QH_PER_KH * KH
     kv_size = KH * D

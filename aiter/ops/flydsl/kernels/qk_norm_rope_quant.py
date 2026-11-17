@@ -170,7 +170,7 @@ def _scalar_store(base_i64, idx, val, fx_dt, copy_bits):
 
 
 def _store_bf16_tiled(vals_list, p_dst, copy, vec):
-    """Convert VEC fp32 -> bf16 and tiled-copy to ``p_dst``."""
+    """Convert VEC fp32 → bf16 and tiled-copy to ``p_dst``."""
     f32v = fx.Vector.from_elements(vals_list, dtype=fx.Float32)
     bf16v = f32v.truncf(T.vec(vec, T.bf16))
     frag = fx.make_fragment_like(p_dst)
@@ -179,7 +179,7 @@ def _store_bf16_tiled(vals_list, p_dst, copy, vec):
 
 
 def _store_bf16_vec(vals, out_rsrc, row_base_bytes, idx, vec, cache_modifier=0):
-    """Convert VEC fp32 -> bf16 dwords and raw buffer_store (split for VEC>8)."""
+    """Convert VEC fp32 → bf16 dwords and raw buffer_store (split for VEC>8)."""
     if isinstance(vals, (list, tuple)):
         vals = fx.Vector.from_elements(vals, dtype=fx.Float32)
     bf16v = vals.to(fx.BFloat16)
@@ -220,7 +220,7 @@ def _store_bf16_vec(vals, out_rsrc, row_base_bytes, idx, vec, cache_modifier=0):
 def _store_fp8_packed_w64(
     vals_list, out_base_i64, row_base_bytes, idx, vec, *, skip_fnuz_clamp=False
 ):
-    """Pack VEC fp32 -> fp8 and buffer-store 8 bytes (2 packed dwords) per thread."""
+    """Pack VEC fp32 → fp8 and buffer-store 8 bytes (2 packed dwords) per thread."""
     i32 = T.i32
 
     if skip_fnuz_clamp:
@@ -250,7 +250,7 @@ def _store_fp8_packed_w64(
 def _store_fp8_packed_w32(
     vals_list, out_rsrc, row_base_bytes, idx, vec, *, skip_fnuz_clamp=False
 ):
-    """Pack VEC fp32 -> fp8 and raw buffer_store (VEC in {8, 16})."""
+    """Pack VEC fp32 → fp8 and raw buffer_store (VEC in {8, 16})."""
     i32 = T.i32
 
     if skip_fnuz_clamp:

@@ -363,8 +363,9 @@ class QoState
     // (qk_batch_ratio > 1) addresses pseudo-batches, so a direct index walks
     // off that table. Rebuild the row range in the folded Q layout instead.
     // ratio == 1 keeps the original absolute indptr values.
-    __device__ void
-    dense_folded_range(const int32_t batch_idx, int32_t& folded_begin, int32_t& folded_end) const
+    __device__ void dense_folded_range(const int32_t batch_idx,
+                                       int32_t& folded_begin,
+                                       int32_t& folded_end) const
     {
         const int32_t ratio = qk_batch_ratio_;
         if(ratio <= 1)

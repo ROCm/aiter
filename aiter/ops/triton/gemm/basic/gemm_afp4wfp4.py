@@ -514,7 +514,7 @@ def gemm_afp4wfp4_preshuffle(
         w (torch.Tensor): FP4 E2M1 weight matrix with shape (N//16, K*16),
             preshuffled via aiter.ops.shuffle.shuffle_weight_gfx1250 (or
             equivalently shuffle_weight(layout=(16, 16)) reshaped to
-            (N//16, K*16) -- both produce the same bytes). Internally transposed.
+            (N//16, K*16) — both produce the same bytes). Internally transposed.
         x_scales (torch.Tensor): E8M0 per-group scale for x, one scale per 32
             elements in K. For M >= 32: preshuffled via
             aiter.ops.shuffle.shuffle_scale (identical layout on gfx950 and
@@ -547,7 +547,7 @@ def gemm_afp4wfp4_preshuffle(
     K_elems = 2 * K_bytes
 
     if config is None:
-        # _get_config doubles K itself (logical K = 2 * K_bytes) -- pass bytes,
+        # _get_config doubles K itself (logical K = 2 * K_bytes) — pass bytes,
         # matching the non-preshuffled path. The two backends take disjoint
         # params (gluon: NUM_BUFFERS, triton: NUM_KSPLIT/GROUP_SIZE_M/...), so
         # the config must come from the dir of the backend we actually launch.

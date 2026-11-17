@@ -209,7 +209,7 @@ def _build_compress_forward_kernel(
             # bf16 inputs are read as i32 dwords (unaligned bit-extract) -> i32 buf.
             kv_in_buf = ptr_buf_tensor(fx.get_iter(kv_in), fx.Int32)
             score_in_buf = ptr_buf_tensor(fx.get_iter(score_in), fx.Int32)
-            # Rebased onto this program's slot -- the 64-bit slot byte offset is
+            # Rebased onto this program's slot — the 64-bit slot byte offset is
             # folded into the descriptor base (see `state_slot_byte_offset`).
             kv_state_buf = ptr_buf_tensor(
                 _ptr_at_byte_off(
@@ -1096,7 +1096,7 @@ def flydsl_hca_compress_attn(
     if kv_state.dtype != torch.float32 or score_state.dtype != torch.float32:
         raise TypeError("kv_state/score_state must be fp32")
     # Slot and ring strides are passed to the kernel and the descriptor is
-    # rebased per slot, so the states may be strided views -- a per-request
+    # rebased per slot, so the states may be strided views — a per-request
     # arena hands out a view whose slot stride is a whole entry. Only the
     # innermost dim must be unit stride: the kernel addresses it as
     # `col_off + lane`.

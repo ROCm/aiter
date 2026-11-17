@@ -993,7 +993,7 @@ def flydsl_flash_attn_batch_fwd(
     """FlyDSL MHA forward, batched BSHD ``[B, S, H, D]`` layout.
 
     Routes gfx950 fp8 to the dual-wave kernel and gfx1250 bf16/f16 to the
-    dedicated BSHD m32x8 kernel (uniform ``seq_len``, no ``cu_seqlens`` --
+    dedicated BSHD m32x8 kernel (uniform ``seq_len``, no ``cu_seqlens`` —
     CUDA-graph safe). Returns the result if FlyDSL can handle this
     configuration, otherwise returns ``None`` so the caller falls through
     to Triton/CK.

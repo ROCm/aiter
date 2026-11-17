@@ -10,8 +10,8 @@
 // This replaces the former per-hd `fmha_fwd_hd128_bf16_opus_fwd`. The kernel/launch
 // logic for D=128 is unchanged (only moved under this shared entry point).
 #pragma once
-#include <optional>
 #include <torch/extension.h>
+#include <optional>
 
 // Dense (batch) & varlen (group) GQA/MHA scaled-dot-product attention, bf16, gfx950.
 //
@@ -24,7 +24,7 @@
 // group mode.
 //
 // `causal` selects the causal mask (bottom-right aligned when seqlen_q != seqlen_kv).
-// `softmax_scale` is applied to Q.K^T internally (pass <= 0 for the default 1/sqrt(D_QK)).
+// `softmax_scale` is applied to Q·K^T internally (pass <= 0 for the default 1/sqrt(D_QK)).
 //
 // `window_size_left` bounds the causal mask on the left: a query at KV-coordinate j sees
 // keys [j - window_size_left, j]. -1 (the default) is unbounded, i.e. plain causal. Needs

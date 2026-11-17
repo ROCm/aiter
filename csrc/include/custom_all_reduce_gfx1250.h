@@ -14,11 +14,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * gfx1250 (MI450) custom allreduce -- pointer-based API (no hipIpc).
+ * gfx1250 (MI450) custom allreduce — pointer-based API (no hipIpc).
  */
-#include "aiter_tensor.h"
 #include <cstdint>
 #include <vector>
+#include "aiter_tensor.h"
 
 using fptr_t = int64_t;
 
@@ -96,29 +96,55 @@ void allreduce_add_lamport(fptr_t _fa,
                            const aiter_tensor_t& inp,
                            const aiter_tensor_t& other,
                            const aiter_tensor_t& out);
+// Lamport all-reduce of inp on the init_lamport_ar_rms inbox: one-shot, or
+// with two_shot a reduce-scatter and an all-gather (fp16/bf16).
+void allreduce_lamport(fptr_t _fa,
+                       const aiter_tensor_t& inp,
+                       const aiter_tensor_t& out,
+                       bool two_shot);
+// Lamport one-shot all-gather on the init_lamport_ar_rms inbox. dim 0
+// concatenates the ranks' inputs, any other dim gathers along the last dim.
+// An input the kernel cannot read in place (unaligned, or overlapping out other
+// than as its own dim-0 slice) is copied into the registered buffer reg_inp_ptr
+// of reg_inp_bytes first. Bit for bit, except that a 0xffff half-word of an
+// fp16/bf16 input comes out 0x7fff (both NaN).
+void all_gather_lamport(fptr_t _fa,
+                        const aiter_tensor_t& inp,
+                        const aiter_tensor_t& out,
+                        int64_t dim,
+                        int64_t reg_inp_ptr,
+                        int64_t reg_inp_bytes);
 void p2p_bw_test(fptr_t _fa,
-                 const aiter_tensor_t& inp,
-                 const aiter_tensor_t& out,
-                 int64_t unroll,
-                 int64_t threads,
-                 int64_t blocks,
-                 int64_t reg_inp_ptr,
-                 int64_t reg_inp_bytes);
+                  const aiter_tensor_t& inp,
+                  const aiter_tensor_t& out,
+                  int64_t unroll,
+                  int64_t threads,
+                  int64_t blocks,
+                  int64_t reg_inp_ptr,
+                  int64_t reg_inp_bytes);
 void reduce_scatter(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
-                    int64_t m,
-                    int64_t n,
-                    int64_t k,
+                    int64_t m, int64_t n, int64_t k,
                     int64_t split_dim,
-                    int64_t reg_ptr,
-                    int64_t reg_bytes);
+                    int64_t reg_ptr, int64_t reg_bytes);
 void dispose(fptr_t _fa);
 int64_t meta_size(int64_t world_size);
 int64_t ll_ar_max_bytes(int64_t world_size);
+int64_t dcp_merge_max_rows(fptr_t _fa);
+void dcp_merge(fptr_t _fa,
+               const aiter_tensor_t& o,
+               const aiter_tensor_t& lse,
+               int64_t owned_ptr,
+               const aiter_tensor_t& out,
+               int64_t out_lse_ptr);
 // register_input/output_buffer receive direct device pointers per rank.
-void register_input_buffer(fptr_t _fa, int64_t self_ptr, const std::vector<int64_t>& all_ptrs);
-void register_output_buffer(fptr_t _fa, int64_t self_ptr, const std::vector<int64_t>& all_ptrs);
+void register_input_buffer(fptr_t _fa,
+                           int64_t self_ptr,
+                           const std::vector<int64_t>& all_ptrs);
+void register_output_buffer(fptr_t _fa,
+                            int64_t self_ptr,
+                            const std::vector<int64_t>& all_ptrs);
 // IPC transport variants (ROCm >= 7.15): peer buffers via handles+offsets.
 void register_input_buffer_ipc(fptr_t _fa,
                                int64_t self_ptr,
@@ -130,7 +156,8 @@ void register_output_buffer_ipc(fptr_t _fa,
                                 const std::vector<int64_t>& offsets);
 int64_t get_graph_buffer_count(fptr_t _fa);
 void get_graph_buffer_ptrs(fptr_t _fa, int64_t ptrs_out);
-void register_graph_buffers(fptr_t _fa, const std::vector<int64_t>& ptrs_per_rank);
+void register_graph_buffers(fptr_t _fa,
+                            const std::vector<int64_t>& ptrs_per_rank);
 // IPC transport variants (ROCm >= 7.15): captured buffers as handles+offsets.
 void get_graph_buffer_ipc_meta(fptr_t _fa, int64_t handle_out, int64_t offset_out);
 void register_graph_buffers_ipc(fptr_t _fa,

@@ -135,7 +135,7 @@ def _make_qkv(
         (1, 32768, 12, 128),
         # Smaller aligned shape (sanity).
         (2, 1024, 8, 128),
-        # Unaligned shape -- exercises the auto-padding path. 32760 -> 32768.
+        # Unaligned shape — exercises the auto-padding path. 32760 → 32768.
         (1, 32760, 12, 128),
         # Short Flux self-attention (128x32 tile).
         (1, 512, 24, 128),
@@ -317,7 +317,7 @@ def test_flydsl_fmha_bf16_v_ones_bias_is_bounded():
 
 @_gfx1201_only
 def test_flydsl_fmha_correctness_f16():
-    """f16 dtype coverage -- Wan2.1 1.3B-style shape, non-causal."""
+    """f16 dtype coverage — Wan2.1 1.3B-style shape, non-causal."""
     batch, seq_len, num_heads, head_dim = 1, 32768, 12, 128
     q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.float16)
     out = flydsl_flash_attn_func(q, k, v, causal=False)
@@ -337,7 +337,7 @@ def test_flydsl_fmha_correctness_f16():
 
 @_gfx1201_only
 def test_flydsl_fmha_correctness_causal_small():
-    """Causal masking coverage -- small bf16 shape."""
+    """Causal masking coverage — small bf16 shape."""
     batch, seq_len, num_heads, head_dim = 2, 4096, 8, 128
     q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
     out = flydsl_flash_attn_func(q, k, v, causal=True)
@@ -366,7 +366,7 @@ def test_flydsl_fmha_correctness_multi_device():
 
     If the underlying FlyDSL runtime pins to device 0 internally (a runtime
     limitation, not a wrapper bug), the subprocess will raise
-    ``hipErrorInvalidDevice`` and the test is marked xfail -- the wrapper code
+    ``hipErrorInvalidDevice`` and the test is marked xfail — the wrapper code
     path is still correct and the same-device guard test below still
     validates Copilot #6 directly.
     """
@@ -457,7 +457,7 @@ def test_flydsl_fmha_allows_tight_padding():
 
 @_gfx1201_only
 def test_flydsl_fmha_rejects_device_mismatch():
-    """Same-device check (#6) -- q on device 0, k/v on device 1 must raise."""
+    """Same-device check (#6) — q on device 0, k/v on device 1 must raise."""
     if torch.cuda.device_count() < 2:
         pytest.skip("requires >=2 visible GPUs")
 

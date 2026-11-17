@@ -757,10 +757,10 @@ def _emit_quant_one_k_group(c: SimpleNamespace, mx_group) -> None:
 def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
     """Prequantized full-row path: dwordx4 payload copy + dword-combined e8m0 scatter.
 
-    Replaces ``_emit_quant_block_loop`` for the noKS prequantized case -- the row
+    Replaces ``_emit_quant_block_loop`` for the noKS prequantized case — the row
     is already an MX payload so the per-block quant structure is pure overhead.
     Payload goes out as dwordx4 (16 B/lane); e8m0 as whole dwords (4 src bytes
-    already in destination byte order -> one i32 copy per 4 MX blocks).
+    already in destination byte order → one i32 copy per 4 MX blocks).
 
     Loads are clustered before stores to overlap payload and scale latencies.
     Overshoot lanes are OOB-checked by the buffer resource ``num_records``.

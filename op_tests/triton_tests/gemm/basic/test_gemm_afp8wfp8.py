@@ -67,11 +67,11 @@ def generate_inputs(
     ``x_scales`` is the logical ``(M, K // x_scale_group_size)`` scale the
     reference dequants with. ``x_scales_kernel`` is what the kernel is handed:
     the same tensor normally, or a byte-transposed buffer when
-    ``transpose_x_scale=True`` -- i.e. ``.shape`` still reads ``(M, Kg)`` but the
+    ``transpose_x_scale=True`` — i.e. ``.shape`` still reads ``(M, Kg)`` but the
     storage is column-major, which is what
     ``per_group_quant_hip(transpose_scale=True)`` produces.
     """
-    # Small random fp32 -> fp8 e4m3fn, kept inside e4m3 range so the cast is exact-ish.
+    # Small random fp32 → fp8 e4m3fn, kept inside e4m3 range so the cast is exact-ish.
     x_f32 = torch.randn((M, K), dtype=torch.float32, device="cuda")
     w_f32 = torch.randn((N, K), dtype=torch.float32, device="cuda")
     x_f32 = torch.clamp(x_f32, -FP8_MAX, FP8_MAX)

@@ -611,22 +611,22 @@ __device__ inline void attn_mask_causal_kv_tile(V& v_s,
 
 template <class Traits, class VQN, class VQR, class VO>
 __device__ void mla_decode_le2_tiles(opus_mla_decode_mxfp8_kargs kargs,
-                                     int page_idx_begin,
-                                     int valid_kv_len,
-                                     int tile_begin,
-                                     int tile_end,
-                                     char* smem_kv,
-                                     char* smem_kv_scale,
-                                     VQN& v_q_nope,
-                                     VQR& v_q_rope,
-                                     int scale_q,
-                                     VO& v_o,
-                                     typename Traits::D_ACC& m_row,
-                                     typename Traits::D_ACC& l_row,
-                                     float temperature_scale,
-                                     int causal_diagonal,
-                                     int nhead,
-                                     bool causal_multi)
+                                         int page_idx_begin,
+                                         int valid_kv_len,
+                                         int tile_begin,
+                                         int tile_end,
+                                         char* smem_kv,
+                                         char* smem_kv_scale,
+                                         VQN& v_q_nope,
+                                         VQR& v_q_rope,
+                                         int scale_q,
+                                         VO& v_o,
+                                         typename Traits::D_ACC& m_row,
+                                         typename Traits::D_ACC& l_row,
+                                         float temperature_scale,
+                                         int causal_diagonal,
+                                         int nhead,
+                                         bool causal_multi)
 {
     using namespace opus;
     using T      = opus::remove_cvref_t<Traits>;
@@ -845,22 +845,22 @@ __device__ void mla_decode_le2_tiles(opus_mla_decode_mxfp8_kargs kargs,
 
 template <class Traits, bool OddTail, class VQN, class VQR, class VO>
 __device__ void mla_decode_pipelined(opus_mla_decode_mxfp8_kargs kargs,
-                                     int page_idx_begin,
-                                     int valid_kv_len,
-                                     int tile_begin,
-                                     int tile_end,
-                                     char* smem_kv,
-                                     char* smem_kv_scale,
-                                     VQN& v_q_nope,
-                                     VQR& v_q_rope,
-                                     int scale_q,
-                                     VO& v_o,
-                                     typename Traits::D_ACC& m_row,
-                                     typename Traits::D_ACC& l_row,
-                                     float temperature_scale,
-                                     int causal_diagonal,
-                                     int nhead,
-                                     bool causal_multi)
+                                         int page_idx_begin,
+                                         int valid_kv_len,
+                                         int tile_begin,
+                                         int tile_end,
+                                         char* smem_kv,
+                                         char* smem_kv_scale,
+                                         VQN& v_q_nope,
+                                         VQR& v_q_rope,
+                                         int scale_q,
+                                         VO& v_o,
+                                         typename Traits::D_ACC& m_row,
+                                         typename Traits::D_ACC& l_row,
+                                         float temperature_scale,
+                                         int causal_diagonal,
+                                         int nhead,
+                                         bool causal_multi)
 {
     using namespace opus;
     using T      = opus::remove_cvref_t<Traits>;
@@ -1585,11 +1585,8 @@ __device__ void mla_decode_pipelined(opus_mla_decode_mxfp8_kargs kargs,
 }
 
 template <class Traits>
-__device__ void mla_decode_one_work(opus_mla_decode_mxfp8_kargs kargs,
-                                    int w,
-                                    char* smem_kv,
-                                    char* smem_kv_scale,
-                                    float temperature_scale)
+__device__ void mla_decode_one_work(
+    opus_mla_decode_mxfp8_kargs kargs, int w, char* smem_kv, char* smem_kv_scale, float temperature_scale)
 {
     using namespace opus;
     using T      = opus::remove_cvref_t<Traits>;
@@ -1603,13 +1600,13 @@ __device__ void mla_decode_one_work(opus_mla_decode_mxfp8_kargs kargs,
     const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
 
     const opus_mla_decode_work_info work_item = kargs.work_info_set[w];
-    const int batch_idx                       = work_item.batch_idx;
-    const int slot                            = work_item.partial_slot;
-    const int q_len_ptr_s                     = work_item.qo_start;
-    const int q_len_ptr_e                     = work_item.qo_end;
-    const int kv_ind_ptr_s                    = work_item.kv_start;
-    const int kv_ind_ptr_e                    = work_item.kv_end;
-    [[maybe_unused]] const int kv_offset      = work_item.kv_offset;
+    const int batch_idx                  = work_item.batch_idx;
+    const int slot                       = work_item.partial_slot;
+    const int q_len_ptr_s                = work_item.qo_start;
+    const int q_len_ptr_e                = work_item.qo_end;
+    const int kv_ind_ptr_s               = work_item.kv_start;
+    const int kv_ind_ptr_e               = work_item.kv_end;
+    [[maybe_unused]] const int kv_offset = work_item.kv_offset;
 
     const int q_len        = q_len_ptr_e - q_len_ptr_s;
     const int valid_kv_len = kv_ind_ptr_e - kv_ind_ptr_s;
@@ -1655,62 +1652,62 @@ __device__ void mla_decode_one_work(opus_mla_decode_mxfp8_kargs kargs,
     if(num_kv_tiles <= 2)
     {
         mla_decode_le2_tiles<Traits>(kargs,
-                                     kv_ind_ptr_s,
-                                     valid_kv_len,
-                                     0,
-                                     num_kv_tiles,
-                                     smem_kv,
-                                     smem_kv_scale,
-                                     v_q_nope,
-                                     v_q_rope,
-                                     scale_q,
-                                     v_o,
-                                     m_row,
-                                     l_row,
-                                     temperature_scale,
-                                     causal_diagonal,
-                                     nhead,
-                                     causal_multi);
+                                         kv_ind_ptr_s,
+                                         valid_kv_len,
+                                         0,
+                                         num_kv_tiles,
+                                         smem_kv,
+                                         smem_kv_scale,
+                                         v_q_nope,
+                                         v_q_rope,
+                                         scale_q,
+                                         v_o,
+                                         m_row,
+                                         l_row,
+                                         temperature_scale,
+                                         causal_diagonal,
+                                         nhead,
+                                         causal_multi);
     }
     else if(num_kv_tiles & 1)
     {
         mla_decode_pipelined<Traits, true>(kargs,
-                                           kv_ind_ptr_s,
-                                           valid_kv_len,
-                                           0,
-                                           num_kv_tiles,
-                                           smem_kv,
-                                           smem_kv_scale,
-                                           v_q_nope,
-                                           v_q_rope,
-                                           scale_q,
-                                           v_o,
-                                           m_row,
-                                           l_row,
-                                           temperature_scale,
-                                           causal_diagonal,
-                                           nhead,
-                                           causal_multi);
+                                               kv_ind_ptr_s,
+                                               valid_kv_len,
+                                               0,
+                                               num_kv_tiles,
+                                               smem_kv,
+                                               smem_kv_scale,
+                                               v_q_nope,
+                                               v_q_rope,
+                                               scale_q,
+                                               v_o,
+                                               m_row,
+                                               l_row,
+                                               temperature_scale,
+                                               causal_diagonal,
+                                               nhead,
+                                               causal_multi);
     }
     else
     {
         mla_decode_pipelined<Traits, false>(kargs,
-                                            kv_ind_ptr_s,
-                                            valid_kv_len,
-                                            0,
-                                            num_kv_tiles,
-                                            smem_kv,
-                                            smem_kv_scale,
-                                            v_q_nope,
-                                            v_q_rope,
-                                            scale_q,
-                                            v_o,
-                                            m_row,
-                                            l_row,
-                                            temperature_scale,
-                                            causal_diagonal,
-                                            nhead,
-                                            causal_multi);
+                                                kv_ind_ptr_s,
+                                                valid_kv_len,
+                                                0,
+                                                num_kv_tiles,
+                                                smem_kv,
+                                                smem_kv_scale,
+                                                v_q_nope,
+                                                v_q_rope,
+                                                scale_q,
+                                                v_o,
+                                                m_row,
+                                                l_row,
+                                                temperature_scale,
+                                                causal_diagonal,
+                                                nhead,
+                                                causal_multi);
     }
 
     D_ACC o_scale = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
@@ -1754,8 +1751,8 @@ __device__ void mla_decode_one_work(opus_mla_decode_mxfp8_kargs kargs,
 } // namespace opus_mla_decode_mxfp8_16mx8_32nx1
 
 template <class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_decode_mxfp8_16mx8_32nx1_kernel(
-    opus_mla_decode_mxfp8_kargs kargs)
+__global__ __launch_bounds__(Traits::BLOCK_SIZE,
+                             2) void opus_mla_decode_mxfp8_16mx8_32nx1_kernel(opus_mla_decode_mxfp8_kargs kargs)
 {
     using namespace opus;
     using namespace opus_mla_decode_mxfp8_16mx8_32nx1;

@@ -502,7 +502,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         pid_hq = pid // B
         pid_b = pid % B
 
-        # Issue ``pos`` first -- it's used immediately by the cos/sin TDM
+        # Issue ``pos`` first — it's used immediately by the cos/sin TDM
         # descriptors. pid_slot / k_scale are only consumed later in the
         # k-store path, so they sit behind pos in the issue stream.
         pos = gl.load(pos_ptr + pid_b * pos_stride_b)
@@ -525,7 +525,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         # contiguous (no d_cos_offs gather), so it streams through LDS like the
         # other inputs. Empirically faster than the buffer_load gather despite
         # adding 2 to the TDM-load FIFO depth (the [FIFO full] stall on the
-        # 6th issue is an overlap stall -- kernel keeps doing useful work).
+        # 6th issue is an overlap stall — kernel keeps doing useful work).
         cos_desc = _make_tdm_desc_1d(
             cos_ptr + pos * cos_stride_b, cos_stride_d, FREQ_W, SH
         )
@@ -660,7 +660,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
 
         # OUTPUT block at tail (after the kv-store path): both stores via
         # buffer_store. Empirically beats moving the block earlier or putting
-        # decode_q_pe on TDM async_store -- those alternatives lower per-WGP
+        # decode_q_pe on TDM async_store — those alternatives lower per-WGP
         # SIMD-instruction count but degrade IPC enough that wall-clock
         # dispatch time grows.
         # Gate on the token, not the pid: with the head-major mapping above,
@@ -820,7 +820,7 @@ def _get_kv_cache_offsets(
     """Pre-compute the per-token KV-cache / k_out offsets and masks for the
     2D BLOCK_T-wide store. Returns a tuple
     ``(cache_mask_2d, k_out_offs_2d, k_cache_offs, v_cache_offs,
-       k_scale_rcprl, v_scale_rcprl)`` -- all offsets are already ``int32``.
+       k_scale_rcprl, v_scale_rcprl)`` — all offsets are already ``int32``.
 
     * ``cache_mask_2d`` is broadcast to ``[BLOCK_T, BLOCK_D_pe]`` and folds in
       both the t-bounds mask and the ``slot_mapping >= 0`` mask, so it can be
@@ -1057,7 +1057,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     pid = gl.program_id(0)
     d_pe_offs = gl.arange(0, BLOCK_D_pe, layout=L_PE).to(gl.int64)
 
-    # 2D LDS staging buffers -- q/k/v are filled in one burst; cos/sin get
+    # 2D LDS staging buffers — q/k/v are filled in one burst; cos/sin get
     # ``BLOCK_T`` per-token 1D TDM writes (one row each).
     q_smem = gl.allocate_shared_memory(
         q_ptr.dtype.element_ty, [BLOCK_T, BLOCK_D_pe], SH_2D

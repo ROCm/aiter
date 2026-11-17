@@ -466,7 +466,7 @@ def fmha_fwd_bf16_opus_fwd(
     """Public wrapper for the OPUS gfx950 bf16 dense (batch) forward (D=128 and
     D_QK=192/D_V=128). q/k/v are dense bshd [B, S, H, D]; allocates `out`
     ([B, S, H_q, D_v]) if needed and forwards. The kernel applies `softmax_scale`
-    to Q.K^T internally and handles GQA fan-out.
+    to Q·K^T internally and handles GQA fan-out.
 
     `lse` is an output buffer for the log-sum-exp of the scaled scores ([B, H_q, S]
     float32, natural log; rows that see no keys get -inf), filled when supplied and
@@ -527,7 +527,7 @@ def fmha_fwd_bf16_opus_varlen_fwd(
     """Public wrapper for the OPUS gfx950 bf16 group/varlen forward (D=128 and
     D_QK=192/D_V=128). q/k/v are packed [total, H, D]; allocates `out`
     ([total_q, H_q, D_v]) if needed and forwards. The kernel applies `softmax_scale`
-    to Q.K^T internally and handles GQA fan-out.
+    to Q·K^T internally and handles GQA fan-out.
 
     `lse` is an output buffer for the log-sum-exp of the scaled scores ([H_q, total_q]
     float32, natural log), filled when supplied and allocated here when `return_lse` is
@@ -582,18 +582,18 @@ def fmha_fwd_bf16_opus_varlen_fwd(
 
 
 # ---------------------------------------------------------------------------
-# fmha_fwd_with_sink_asm (gfx1250) -- single-shot batched FMHA forward.
+# fmha_fwd_with_sink_asm (gfx1250) — single-shot batched FMHA forward.
 #
 # API contract: q/k/v are **bshd shape** ([batch, seq, head, dim]); strides are
 # read directly from the tensor so non-contiguous bshd-shaped views (e.g. of
 # sbhd / bhsd allocations) are accepted.  Only `tensor.stride(-1) == 1` is
 # required.  softmax_scale is forwarded to the kernel as-is (the kernel
-# applies it internally to Q.K^T before softmax).
+# applies it internally to Q·K^T before softmax).
 #
 # Memory-allocation policy: all GPU tensors (out, lse, sink) are allocated on
 # the Python side; the C++ entry point performs only pointer + stride
 # bookkeeping and kernel launch (no torch dependency).  The public wrapper
-# `fmha_fwd_with_sink_asm` below handles allocation and the AITER-post-scale ->
+# `fmha_fwd_with_sink_asm` below handles allocation and the AITER-post-scale →
 # kernel-pre-scale conversion for sink (multiply by sqrt(qk_head_dim)).
 # ---------------------------------------------------------------------------
 @compile_ops(
@@ -639,7 +639,7 @@ def fmha_fwd_with_sink_asm(
     the ctypes-backed kernel entry point.
 
     Contract details:
-      * `sink` is passed through verbatim -- it is the value the kernel
+      * `sink` is passed through verbatim — it is the value the kernel
         consumes directly (no host-side scaling). It is optional: pass `None`
         for no sink. Whether the kernel reads it is decided inside the `.co`
         (ENABLE_SINK); the D64 kernels always do, so for them `None` becomes
@@ -821,7 +821,7 @@ def _can_impl_fmha_varlen_asm_d192_strides(
 
 
 # ---------------------------------------------------------------------------
-# fmha_fwd_fp8_varlen_asm (gfx1250) -- FP8 (e4m3fn) per-tensor-descale varlen
+# fmha_fwd_fp8_varlen_asm (gfx1250) — FP8 (e4m3fn) per-tensor-descale varlen
 # forward, qk head dim 192 / v head dim 128, bf16 output.
 #
 # Separate from the bf16 varlen ASM path: its own kernarg ABI (136 B, the bf16
@@ -1071,12 +1071,12 @@ def _prefer_flydsl_over_gfx1250_bf16_varlen_asm(q: Tensor, causal: bool) -> bool
 
 
 # ---------------------------------------------------------------------------
-# fmha_fwd_mxfp8_asm (gfx1250) -- dedicated MXFP8 FMHA forward.
+# fmha_fwd_mxfp8_asm (gfx1250) — dedicated MXFP8 FMHA forward.
 #
 # This is an intentionally separate integration path from both the bf16
 # `fmha_fwd_with_sink_asm` and the shared `fmha_v3` paths.  The MXFP8 kernel
 # uses its own slot-padded kernarg ABI carrying q/k/v micro-scaling (e8m0)
-# descale pointers, expected to diverge further from the MI350 layout -- so it
+# descale pointers, expected to diverge further from the MI350 layout — so it
 # gets its own C++ translation unit (csrc/py_itfs_cu/asm_fmha_fwd_mxfp8.cu)
 # and its own Python entry point here.
 #
@@ -2492,7 +2492,7 @@ def _flash_attn_forward(
     if can_impl_fmha_fwd_with_sink_asm():
         # gfx1250 ASM bf16 path: q/k/v are bshd; kernel reads strides directly,
         # no API-side permute.  softmax_scale is forwarded as-is (kernel applies
-        # it internally to Q.K^T).  sink_ptr is passed through verbatim -- it is
+        # it internally to Q·K^T).  sink_ptr is passed through verbatim -- it is
         # the value the kernel consumes directly (no host-side scaling); whether
         # the kernel reads it is decided inside the .co.
         #
@@ -3548,8 +3548,8 @@ def _flash_attn_varlen_forward(
     elif gfx1250_asm == _GFX1250_VARLEN_ASM_BF16:
         # gfx1250 packed/varlen ASM bf16 path (THD; D192x128 / D256 take strided
         # views).  softmax_scale is forwarded as-is (the kernel applies it
-        # internally to Q.K^T).  sink_ptr is passed through verbatim; the gate
-        # already enforces the per-hdim (D128 / D192x128 / D256 -> no sink, D64 ->
+        # internally to Q·K^T).  sink_ptr is passed through verbatim; the gate
+        # already enforces the per-hdim (D128 / D192x128 / D256 → no sink, D64 →
         # sink) contract so we never feed a null sink to a D64 binary that
         # unconditionally reads it.
         out, lse_asm = fmha_fwd_with_sink_varlen_asm(

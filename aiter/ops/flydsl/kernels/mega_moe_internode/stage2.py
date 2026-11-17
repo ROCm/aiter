@@ -1775,8 +1775,8 @@ def compile_stage2_node_combine(
                   "partial_ready_off", "group_ready_off"):
         if int(locals()[_name]) < int(s2_window_off):
             raise ValueError(
-                f"{_name} ?? s2_window_off,???? region ????;"
-                "kernel2 ????? window local_ptr ???")
+                f"{_name} 小于 s2_window_off,看起来是 region 相对偏移;"
+                "kernel2 要的是相对 window local_ptr 的偏移")
     if int(num_qp) not in (1, 2, 4, 8):
         raise ValueError("num_qp must be one of 1,2,4,8")
     # The reference maps QP to wave. Extra waves idle when waves>QPs; otherwise
@@ -1787,13 +1787,13 @@ def compile_stage2_node_combine(
     _waves = THREADS // 64
     if int(num_qp) < _waves or int(num_qp) % _waves:
         raise ValueError(
-            f"num_qp({num_qp}) ??? wave ?({_waves}) ????")
+            f"num_qp({num_qp}) 必须是 wave 数({_waves}) 的整数倍")
     if int(consumed_off) < int(s2_window_off):
         raise ValueError(
-            "consumed_off ?? s2_window_off,???? region ????")
+            "consumed_off 小于 s2_window_off,看起来是 region 相对偏移")
     if int(arrival_off) < int(s2_window_off):
         raise ValueError(
-            "arrival_off ?? s2_window_off,???? region ????")
+            "arrival_off 小于 s2_window_off,看起来是 region 相对偏移")
     if return_chunk_tokens < 4:
         # return_group_ready has only max_tokens/4 slots; its granularity cannot be below four.
         raise ValueError("return_chunk_tokens must be >= 4")
@@ -1819,13 +1819,13 @@ def compile_stage2_node_combine(
     RAIL_FP8 = rail_quant == "fp8_blockwise_1x32"
     if RAIL_FP8:
         if HIDDEN % 32:
-            raise ValueError("fp8 rail ?? hidden ?? 32 ??(e8m0 ???)")
+            raise ValueError("fp8 rail 要求 hidden 能被 32 整除(e8m0 块大小)")
         # Quantization halves RECORD_BYTES per token for PUT/GET, reducing the rail's
         # measured 78us line-rate payload cost.
         RECORD_BYTES = HIDDEN + HIDDEN // 32
         if RECORD_BYTES % 8:
             raise ValueError(
-                f"rail ?? {RECORD_BYTES} ?? 8 ???,put ??????")
+                f"rail 行宽 {RECORD_BYTES} 不是 8 的倍数,put 源地址会错位")
     INBOX_ROW_BYTES = (HIDDEN * 2)
     # Inbox bytes per plane; use separate descriptors when the two-plane inbox is >=2GiB.
     INBOX_PLANE_BYTES = MAX_TOKENS * TOPK * INBOX_ROW_BYTES
@@ -1836,7 +1836,7 @@ def compile_stage2_node_combine(
     if INBOX_ROW_BYTES % 8:
         # VEC values per lane use one dwordx2/x4 load, requiring 8B-aligned row starts.
         raise ValueError(
-            f"inbox ?? {INBOX_ROW_BYTES} ?? 8 ???,??? load ???")
+            f"inbox 行宽 {INBOX_ROW_BYTES} 不是 8 的倍数,向量化 load 会错位")
     VEC = 8                                 # Eight BF16 values per lane = 16B.
     RED_BATCH = min(int(topk), 8)           # Outstanding top-k loads per reduction batch.
     RED_BATCHES = _ceil_div(int(topk), RED_BATCH)
@@ -1857,7 +1857,7 @@ def compile_stage2_node_combine(
     if (SCRATCH_CHUNK_DONE + 2 * MAX_CHUNKS > SCRATCH_P3_DONE
             or SCRATCH_P3_DONE + MAX_CHUNKS > SCRATCH_WORDS):
         raise ValueError(
-            f"scratch ??:?? {SCRATCH_CHUNK_DONE + 2 * MAX_CHUNKS} ? i32")
+            f"scratch 不够:需要 {SCRATCH_CHUNK_DONE + 2 * MAX_CHUNKS} 个 i32")
 
     node = int(rank) // int(gpus_per_node)
     remote_node = 1 - node

@@ -54,17 +54,17 @@
 // publishes it over IPC and merges what the peers sent. Takes the shard's
 // scores and the peer mapping, and emits the same page table in the same
 // numbering ``SPARSE_TOPK`` above does, so a mixed batch can share one buffer.
-#define SPARSE_TOPK_CP_PARAMS                                                                    \
+#define SPARSE_TOPK_CP_PARAMS                                                                   \
     const float *score, CpPeers peers, uint32_t *cp_gen, int *topk_idx, const int *seq_lens,     \
         const int *block_table, int *sparse_bt, int *sparse_ctx, int num_idx_heads, int total_q, \
         int cand_rows, int score_head_stride, int score_num_stride, int topk_head_stride,        \
         int topk_num_stride, int block_table_stride, int sparse_bt_stride, int num_kv_heads,     \
         int query_len, int init_blocks, int local_blocks, int rank, int world, hipStream_t stream
-#define SPARSE_TOPK_CP_ARGS                                                                      \
-    score, peers, cp_gen, topk_idx, seq_lens, block_table, sparse_bt, sparse_ctx, num_idx_heads, \
-        total_q, cand_rows, score_head_stride, score_num_stride, topk_head_stride,               \
-        topk_num_stride, block_table_stride, sparse_bt_stride, num_kv_heads, query_len,          \
-        init_blocks, local_blocks, rank, world, stream
+#define SPARSE_TOPK_CP_ARGS                                                                   \
+    score, peers, cp_gen, topk_idx, seq_lens, block_table, sparse_bt, sparse_ctx,              \
+        num_idx_heads, total_q, cand_rows, score_head_stride, score_num_stride,                \
+        topk_head_stride, topk_num_stride, block_table_stride, sparse_bt_stride, num_kv_heads, \
+        query_len, init_blocks, local_blocks, rank, world, stream
 
 // Lanes' slots the merge half needs. Held at one -- a world of 4 sends 64
 // candidates and a wave has 64 lanes -- because the merge rides the shard

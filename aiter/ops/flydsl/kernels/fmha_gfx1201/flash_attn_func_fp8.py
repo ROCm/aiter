@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025 FlyDSL Project Contributors
 
 """FP8-input Flash Attention kernel for gfx1201 (RDNA4).
 
@@ -467,7 +467,7 @@ def build_flash_attn_func_module(
                     _store_k_packed(lds_row, load_col_i32, v4)
 
         def _store_v_transposed_fp8(lds_row, load_col_base, v_bytes):
-            # fp8-input: V already fp8 bytes (v16i8) -- no convert, just scatter-store
+            # fp8-input: V already fp8 bytes (v16i8) — no convert, just scatter-store
             # TRANSPOSED (V_T[d][kv_row]). 16 d-values of this lane land in 16 d-rows
             # at the same kv column (stride V_T_STRIDE_BYTES). Makes GEMM2 load contiguous.
             # The strided scatter has no equivalent contiguous vector-store form.
@@ -543,7 +543,7 @@ def build_flash_attn_func_module(
         for ks in range_constexpr(K_STEPS_QK):
             q_col = fx.Uint64(ks * K_STEP_QK) + klane * fx.Uint64(WMMA_LANE_K)
             g_idx = global_idx(q_row_safe, q_col)
-            # fp8-input: Q already fp8 -- load 8 fp8 bytes as v2i32 WMMA-B frag direct.
+            # fp8-input: Q already fp8 — load 8 fp8 bytes as v2i32 WMMA-B frag direct.
             raw = _load_global_fp8(
                 q_buf,
                 g_idx,

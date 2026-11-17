@@ -1428,7 +1428,7 @@ def run_torch_qk_norm_rope_1way(
     k_by_head = rms_norm_diffusers_forward(
         k.view(batch_size, num_tokens, num_heads_k, head_size), w_k, eps
     )
-    # cos_sin must arrive as fp32 -- diffusers / qwen-image-edit reference
+    # cos_sin must arrive as fp32 — diffusers / qwen-image-edit reference
     # passes the complex freqs in fp32 to keep the rope multiply precision.
     assert (
         cos_sin.dtype == torch.float32

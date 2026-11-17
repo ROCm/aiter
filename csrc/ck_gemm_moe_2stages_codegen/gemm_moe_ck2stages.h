@@ -423,9 +423,9 @@ template <typename A0DataType,
           bool PerTensorQuant,
           bool MulRoutedWeight,
           int ActOP,
+          bool RuntimeSwigluLimit = false,
           // Pad N and K in CK, so the template is defined for shapes that no tile divides.
-          bool PadK               = false,
-          bool RuntimeSwigluLimit = false>
+          bool PadK = false>
 void ck_moe_stage1_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025-2026 FlyDSL Project Contributors
 
 """MXFP4/MXFP6/MXFP8 A x MXFP4/MXFP8 B preshuffle GEMM (gfx950): per-32 E8M0 scales folded
 into a scaled 16x16x128 fx.gemm; A streams global->LDS via double-buffered async DMA. Layout
@@ -1046,7 +1046,7 @@ def _launch_gemm_impl(
 
         def load_b(kt):
             # buffer_load_dwordx4 into i32[4] frags; fp8 B packs two K0 blocks (lo/hi, 64 K
-            # apart, f8f6f4 ABI) into i32[8] -- same shuffle as read_a's fp6/fp8 A path.
+            # apart, f8f6f4 ABI) into i32[8] — same shuffle as read_a's fp6/fp8 A path.
             ops = []
             for ni in range_constexpr(num_acc_n):
                 for kh in range_constexpr(k_halves):
@@ -1909,7 +1909,7 @@ def launch_gemm_fused(
     )
 
 
-# -- split-K reduce ------------------------------------------------------------
+# ── split-K reduce ────────────────────────────────────────────────────────────
 # The split-K path above writes fp32 partial slabs tmp[k_batch, M, N]; this kernel
 # sums the k_batch slabs elementwise in fp32 and casts to bf16/fp16 out in a single
 # fused pass (load slabs -> fp32 add -> cast -> store).

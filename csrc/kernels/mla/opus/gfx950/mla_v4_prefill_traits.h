@@ -9,8 +9,8 @@
 
 using bf16_t = opus::dtypes::bf16;
 // 8-bit float storage types, aliased to match opus's dtype registration.
-using fp8_t = _BitInt(8);
-using bf8_t = unsigned _BitInt(8);
+using fp8_t  = _BitInt(8);
+using bf8_t  = unsigned _BitInt(8);
 
 // SPLIT (every variant): the split-K kernel, see mla_prefill_split.h; without it the
 // kernel's arguments and code are the unsplit ones.
@@ -33,9 +33,9 @@ struct opus_mla_v4_prefill_a16w16_32mx4_32nx1_traits
     static constexpr int D_HEAD_SIZE  = D_TILE_SIZE;
     static constexpr int NUM_WARPS    = NUM_WARPS_;
     static constexpr bool SPLIT       = SPLIT_;
-    using kargs_type                  = std::conditional_t<SPLIT_,
-                                                           opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>,
-                                                           opus_mla_v4_prefill_kargs>;
+    using kargs_type = std::conditional_t<SPLIT_,
+                                          opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>,
+                                          opus_mla_v4_prefill_kargs>;
 
     static constexpr int WARP_SIZE  = 64;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
@@ -67,7 +67,7 @@ struct opus_mla_v4_prefill_a16w16_32mx4_32nx1_traits
     static constexpr int smem_d_rpt    = D_TILE_SIZE * sizeof(D_ATTN) / 128;
     static constexpr int smem_chunk    = smem_n_rpt * smem_brick;
     static constexpr int smem_kv_bytes = smem_d_rpt * smem_chunk;
-    static constexpr int KV_SLOTS      = 4; // DMA 2 tiles ahead; a tile's V reads outlive its stage
+    static constexpr int KV_SLOTS = 4; // DMA 2 tiles ahead; a tile's V reads outlive its stage
     // P and rescale factors exchanged between waves, double-buffered; output scales
     static constexpr int smem_x_bytes =
         (2 * (GEMM1_E_K * WARP_SIZE * 16 + WARP_SIZE * 4) + WARP_SIZE * 4) * NUM_WARPS;
@@ -91,9 +91,9 @@ struct opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits
     static constexpr int D_TILE_SIZE  = D_TILE_SIZE_;
     static constexpr int NUM_WARPS    = NUM_WARPS_;
     static constexpr bool SPLIT       = SPLIT_;
-    using kargs_type                  = std::conditional_t<SPLIT_,
-                                                           opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>,
-                                                           opus_mla_v4_prefill_kargs>;
+    using kargs_type = std::conditional_t<SPLIT_,
+                                          opus_mla_prefill_split_kargs<opus_mla_v4_prefill_kargs>,
+                                          opus_mla_v4_prefill_kargs>;
 
     static constexpr int WARP_SIZE  = 64; // AMD wavefront size
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
@@ -129,26 +129,23 @@ struct opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits
 
     static constexpr int D_128B_SIZE = 128 / sizeof(D_ATTN);
     static_assert(VEC_KV == 16 / sizeof(D_ATTN));
-    static constexpr int smem_linear_wave = WARP_SIZE * 16 / sizeof(D_ATTN);
-    static constexpr int smem_n_per_wave  = smem_linear_wave / D_128B_SIZE;
-    static constexpr int smem_n_rpt       = KV_TILE_SIZE / smem_n_per_wave;
-    static constexpr int smem_d_rpt       = D_TILE_SIZE / D_128B_SIZE;
-    static constexpr int smem_padding_32B = 32 / sizeof(D_ATTN);
-    static constexpr int smem_kv_tile_elems =
-        smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_32B);
+    static constexpr int smem_linear_wave   = WARP_SIZE * 16 / sizeof(D_ATTN);
+    static constexpr int smem_n_per_wave    = smem_linear_wave / D_128B_SIZE;
+    static constexpr int smem_n_rpt         = KV_TILE_SIZE / smem_n_per_wave;
+    static constexpr int smem_d_rpt         = D_TILE_SIZE / D_128B_SIZE;
+    static constexpr int smem_padding_32B   = 32 / sizeof(D_ATTN);
+    static constexpr int smem_kv_tile_elems = smem_n_rpt * smem_d_rpt * (smem_linear_wave + smem_padding_32B);
 
-    static constexpr int kv_buffer_load_insts =
-        (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
-    static constexpr int k_ds_read_insts =
-        (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
-    static constexpr int v_ds_read_insts =
-        (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_TR_V);
+    static constexpr int kv_buffer_load_insts = (KV_TILE_SIZE * D_TILE_SIZE) / (BLOCK_SIZE * VEC_KV);
+    static constexpr int k_ds_read_insts = (GEMM0_E_N * GEMM0_E_K * W_N * W_K) / (WARP_SIZE * VEC_KV);
+    static constexpr int v_ds_read_insts = (GEMM1_E_N * GEMM1_E_K * W_N * W_K) / (WARP_SIZE * VEC_TR_V);
 
     // Shared memory: the KV tile, the waves' row maxima and their fp32 P.
     static constexpr size_t smem_size_bytes()
     {
-        return smem_kv_tile_elems * sizeof(D_ATTN) + T_N * W_M * sizeof(D_ACC) +
-               T_N * W_M * W_N * sizeof(D_ACC);
+        return smem_kv_tile_elems * sizeof(D_ATTN)
+             + T_N * W_M * sizeof(D_ACC)
+             + T_N * W_M * W_N * sizeof(D_ACC);
     }
 };
 
@@ -295,9 +292,9 @@ struct opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits
     static constexpr int VEC_Q_ROPE  = 8;
     static constexpr int VEC_KV_NOPE = 16;
     static constexpr int VEC_KV_ROPE = 8;
-    static constexpr int VEC_P       = 4;
-    static constexpr int VEC_TR_V    = 4;
-    static constexpr int VEC_O       = 4;
+    static constexpr int VEC_P    = 4;
+    static constexpr int VEC_TR_V = 4;
+    static constexpr int VEC_O    = 4;
 
     // Per-token row stride for the bf16 KV tile staged in LDS.
     static constexpr int SMEM_KV_PAD = 8;
@@ -306,8 +303,9 @@ struct opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits
     // Shared memory: the KV tile, the waves' row maxima and their fp32 P.
     static constexpr size_t smem_size_bytes()
     {
-        return KV_TILE_SIZE * SMEM_KV_ROW * sizeof(D_ROPE) + T_N * W_M * sizeof(D_ACC) +
-               T_N * W_M * W_N * sizeof(D_ACC);
+        return KV_TILE_SIZE * SMEM_KV_ROW * sizeof(D_ROPE)
+             + T_N * W_M * sizeof(D_ACC)
+             + T_N * W_M * W_N * sizeof(D_ACC);
     }
 };
 

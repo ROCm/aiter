@@ -71,7 +71,7 @@ def build_pa_mqa_logits_fp4_module(
     N_TILES = block_k // MFMA_N
     assert (
         N_TILES % num_warps == 0
-    ), f"block_k={block_k} -> N_TILES={N_TILES} must be multiple of num_warps={num_warps}"
+    ), f"block_k={block_k} → N_TILES={N_TILES} must be multiple of num_warps={num_warps}"
     N_TILES_PER_WARP = N_TILES // num_warps
 
     assert kv_block_size % MFMA_N == 0, (
@@ -285,7 +285,7 @@ def build_pa_mqa_logits_fp4_module(
                 fx.copy(w_atom, fx.slice(tile_div, (None, lane_div_16)), r)
                 w_per_lane.append(fx.memref_load_vec(r).to(fx.Float32))
 
-            # -- Step 3: prologue + N-1 prefetch loop + epilogue --
+            # ── Step 3: prologue + N-1 prefetch loop + epilogue ──
             def _load_phys(c_i32_arg):
                 ni_base = warp_id * fx.Int32(N_TILES_PER_WARP)
                 token_global_base = (
@@ -448,15 +448,15 @@ def build_pa_mqa_logits_fp4_module(
                     else list(nt0_accs_in)
                 )
 
-                # nt=1 MFMA early -> its 16-cycle latency overlaps with nt=0 post-process
+                # nt=1 MFMA early → its 16-cycle latency overlaps with nt=0 post-process
                 accs_nt1 = _issue_nt_mfmas(kv_list_in, kvs_scales[1], 1)
                 _post_process_nt(accs_nt0, 0, c_i32_arg)
 
-                # nt=2 MFMA early -> overlaps with nt=1 post-process
+                # nt=2 MFMA early → overlaps with nt=1 post-process
                 accs_nt2 = _issue_nt_mfmas(kv_list_in, kvs_scales[2], 2)
                 _post_process_nt(accs_nt1, 1, c_i32_arg)
 
-                # nt=3 MFMA early -> overlaps with nt=2 post-process
+                # nt=3 MFMA early → overlaps with nt=2 post-process
                 accs_nt3 = _issue_nt_mfmas(kv_list_in, kvs_scales[3], 3)
                 _post_process_nt(accs_nt2, 2, c_i32_arg)
 
@@ -516,7 +516,7 @@ def build_pa_mqa_logits_fp4_module(
                 # Issue phys load for chunk c+2 last.
                 phys_next_next_list = _load_phys(c_next_next_i32)
 
-                # Pre-issue NEXT chunk's nt=0 mfmas -- its 16-cycle latency is
+                # Pre-issue NEXT chunk's nt=0 mfmas — its 16-cycle latency is
                 # hidden across the loop back-edge.
                 nt0_accs_next = _issue_nt_mfmas(
                     list(kv_next), _extract_kvs_scales(list(kvs_next))[0], 0
@@ -640,7 +640,7 @@ def flydsl_pa_mqa_logits_fp4(
 
     ``parallel_unit_num`` is the persistent-grid CTA count; when ``None`` it is
     selected by :func:`default_varctx_parallel_unit_num` from host-known shape
-    buckets (cudagraph-safe, no device->host sync). Pass an explicit value to
+    buckets (cudagraph-safe, no device→host sync). Pass an explicit value to
     override the tuned default.
 
     Ragged rows run ``pa_mqa_logits_fp4_rowgroup`` (8- or 64-row pages):

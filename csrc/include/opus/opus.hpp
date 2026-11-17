@@ -1766,7 +1766,7 @@ OPUS_D void llvm_amdgcn_raw_buffer_load_lds(i32x4_t r, OPUS_LDS_ADDR unsigned in
 #pragma clang diagnostic pop
 #endif
 
-// -- buffer atomic feature guards -----------------------------------------------
+// ── buffer atomic feature guards ───────────────────────────────────────────────
 // per BuiltinsAMDGPU.td / IntrinsicsAMDGPU.td:
 //   fadd.f32     : atomic-fadd-rtn-insts                 (gfx908+, incl. gfx942/gfx950/gfx1250)
 //   fadd.v2f16   : atomic-buffer-global-pk-add-f16-insts (gfx942/gfx950/gfx1250)
@@ -2424,13 +2424,13 @@ template<typename T> static constexpr bool tdm_elem_ok_v = tdm_elem<remove_cvref
 // TDM 1/3 -- tdm_traits: one tag per D# concern, plus the machinery resolving an unordered tag pack into one type per concern.
 namespace tdm_traits {
 
-// -- raw D# bits that are not policy --
+// ── raw D# bits that are not policy ──
 // Not inert: measured on gfx1250, setting all three breaks every example, so each needs its own programming worked out first.
 static constexpr bool atomic_barrier_enable   = false;   // [18]
 static constexpr bool iterate_enable          = false;   // [19]
 static constexpr bool multicast_early_timeout = false;   // [21]
 
-// -- cache policy --
+// ── cache policy ──
 // One 3-bit encoding, two enums (`th` is the hardware's field name): the assembler takes only TH_LOAD_* on loads, TH_STORE_* on stores, and encoding 3 splits again by scope -- LU/WB below sys, BYPASS at sys -- with the wrong spelling a hard error.
 enum class load_temporal_hint  : u8_t { regular=0, non_temporal=1, high_temporal=2, last_use=3, non_temporal_regular=4, regular_non_temporal=5, non_temporal_high_temporal=6 };                                 // 7 has no legal load spelling on gfx1250
 enum class store_temporal_hint : u8_t { regular=0, non_temporal=1, high_temporal=2, write_back=3, non_temporal_regular=4, regular_non_temporal=5, non_temporal_high_temporal=6, non_temporal_write_back=7 };   // 7 = TH_STORE_NT_WB, store-only
@@ -2441,7 +2441,7 @@ OPUS_H_D constexpr int make_cache_policy(load_temporal_hint th = load_temporal_h
 OPUS_H_D constexpr int make_cache_policy(store_temporal_hint th, scope sc = scope::dev, bool non_volatile = false) { return (int(th) & 0x7) | ((int(sc) & 0x3) << 3) | (non_volatile ? (1 << 5) : 0); }
 static constexpr int default_cache_policy = make_cache_policy();   // regular temporal hint, device scope
 
-// -- padding (LDS write side) --
+// ── padding (LDS write side) ──
 // "After every IntervalElements written, skip AmountElements of LDS", in ELEMENT counts (T only scales them to bytes); both D# fields are encoded, pad_interval [24:22] = 8 << enc bytes and pad_amount [31:25] = 4 * (enc + 1) bytes.
 // LOAD DIRECTION ONLY -- measured on gfx1250, a store ignores both fields even when programmed, so a padded tile stores a row at a time (tile_dim1 == 1); separately, a pad interval under 128 B demotes part of the transfer off the direct-copy path (perf, not correctness).
 template<typename T = u8_t, index_t IntervalElements = 0, index_t AmountElements = 0>
@@ -2478,7 +2478,7 @@ struct padding {
 template<typename T, index_t RowElements, index_t ReadVectorBytes = 16>
 using padding_auto = padding<T, RowElements, ReadVectorBytes / index_t(sizeof(T))>;
 
-// -- multicast (compile-time peer set) --
+// ── multicast (compile-time peer set) ──
 // The statically known peer set, stored as the finished workgroup_mask rather than the index list; the runtime mask still goes through set_workgroup_mask(), and multicast<> is the 0 the hardware reads as no multicast.
 // Folding a fan-out of <=1 to "no multicast" is SAFETY: a cluster-load opcode issued by a wave that is not in a cluster may hang or corrupt data. Not asserted, just pointless: GL1 merges at most 5 requests, so >5 peers buys nothing.
 template<index_t... Workgroups>
@@ -2520,7 +2520,7 @@ OPUS_D mask peers_along_x() {
     }
 }
 
-// -- gather/scatter (row-index list in D# groups 2/3) --
+// ── gather/scatter (row-index list in D# groups 2/3) ──
 template<index_t IndexBits = 0>
 struct gather {
     static_assert(IndexBits == 0 || IndexBits == 16 || IndexBits == 32,
@@ -2529,11 +2529,11 @@ struct gather {
     static constexpr u64_t index_size = (IndexBits == 32) ? 1 : 0;   // 16-bit -> 2 idx/dword, 32-bit -> 1
 };
 
-// -- cache --
+// ── cache ──
 // A wrapper because an unordered pack cannot hold a bare int; the member name is what is_cache keys on, so not `value`.
 template<int Policy> struct cache { static constexpr int cache_policy = Policy; };
 
-// -- resolving an unordered pack of the tags above --
+// ── resolving an unordered pack of the tags above ──
 // A tag's concern is read off the D# field it carries, so a new spelling of an existing one (padding_auto) classifies itself.
 template<typename T, typename = void> struct is_padding   : false_type {};
 template<typename T> struct is_padding  <T, std::void_t<decltype(T::encoded_interval)>> : true_type {};

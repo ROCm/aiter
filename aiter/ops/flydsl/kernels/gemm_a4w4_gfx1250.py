@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2026 FlyDSL Project Contributors
+# Copyright (c) 2026 FlyDSL Project Contributors
 # Vendored from FlyDSL kernels/gemm/gemm_a4w4_gfx1250.py (gfx1250/gemm-opt-0805); only the
 # imports, the LDS capacity check and the tile_k assertion (FlyDSL: 128/256/512; here also
 # 1024, whose A-row TDM padding interval of 128 dwords is still a legal encoding) differ

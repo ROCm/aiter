@@ -297,7 +297,7 @@ class PRSelfReviewSelftest(unittest.TestCase):
 
     def test_drafts_stay_silent_except_the_conversion_gray_out(self) -> None:
         note = gate.render_draft_note("b" * 40, "shadow")
-        self.assertIn("# DRAFT -- evaluation paused", note)
+        self.assertIn("# DRAFT — evaluation paused", note)
         self.assertIn("no verdict applies", note)
         self.assertIn(gate.MARKER, note)
 

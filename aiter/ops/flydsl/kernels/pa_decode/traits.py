@@ -1666,7 +1666,7 @@ class Gfx1250Traits:
     def use_tdm(self):
         # Packed FP8 tiles retain the cache layout for TDM transfers. Other
         # per-token D128+ tiles also benefit from scalar address generation.
-        # BF16 descriptors fit D64-512; row padding requires a power-of-two
+        # BF16 descriptors fit D64–512; row padding requires a power-of-two
         # interval <= 1024 bytes.
         return (
             (

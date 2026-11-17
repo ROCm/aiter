@@ -1016,10 +1016,10 @@ def _dynamic_mxfp8_quant_n32k4_mbn_kernel(
 # + per_1x32_mxfp8 quant) used in linear.py's MXFP8 fallback path for MLA wq_b
 # when q_norm emits the legacy fp8 fnuz + fp32 1x128 format.
 #
-# In: x_fp8_fnuz (M, N) -- fp8 e4m3fnuz bits (interpreted with bias 8 -> value)
-#     x_scale_fp32 (M, N//128) -- fp32 per-token-block scale
-# Out: y_fp8_fn (M, N) -- fp8 e4m3fn bits (NV format, bias 7)
-#      y_scale_e8m0 (M, N//32) -- uint8 e8m0 (1x32 MX scale)
+# In: x_fp8_fnuz (M, N) — fp8 e4m3fnuz bits (interpreted with bias 8 -> value)
+#     x_scale_fp32 (M, N//128) — fp32 per-token-block scale
+# Out: y_fp8_fn (M, N) — fp8 e4m3fn bits (NV format, bias 7)
+#      y_scale_e8m0 (M, N//32) — uint8 e8m0 (1x32 MX scale)
 
 
 _fp8_legacy_to_mxfp8_repr = make_kernel_repr(

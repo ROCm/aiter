@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
 """gfx1250 double-buffered implicit-GEMM conv3d (BF16, TDM im2col + WMMA).
@@ -186,7 +186,7 @@ def _dyn_hw_closure_key_gfx1250(grid, unit, out_ndhwc, has_bias, splitk):
 
 
 def _shape_agnostic_key_gfx1250(grid, unit, out_ndhwc, has_bias, splitk):
-    """Closure key with booleans blanked -- integers must not carry D/H/W."""
+    """Closure key with booleans blanked — integers must not carry D/H/W."""
 
     def _blank(value):
         if isinstance(value, bool):

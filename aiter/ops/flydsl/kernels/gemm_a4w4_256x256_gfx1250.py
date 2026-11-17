@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2026 FlyDSL Project Contributors
+# Copyright (c) 2026 FlyDSL Project Contributors
 # Vendored from FlyDSL kernels/gemm/gemm_a4w4_256x256_gfx1250.py.
 
 """A4W4 (MXFP4 E2M1 activation x MXFP4 E2M1 weight) 32x4-preshuffled MXscale GEMM for gfx1250."""

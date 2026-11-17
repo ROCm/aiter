@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
 """Host entry for the FlyDSL implicit-GEMM convolution (no DSL).
@@ -840,7 +840,7 @@ def _conv3d_impl(
                     p <= ext
                 ), f"circular padding {p} must be <= input extent {ext} on spatial axis {ax}"
 
-    # Tuned-table key: caller shape, before pad/channel rewrite. Asymmetric pad -> None.
+    # Tuned-table key: caller shape, before pad/channel rewrite. Asymmetric pad → None.
     tuned_key = (
         (
             n,
@@ -893,7 +893,7 @@ def _conv3d_impl(
         inline_pad = False
     pad_mode = padding_mode if inline_pad else "zeros"
 
-    # Same predicate the tuner/AOT skip. Post-normalisation pads, so "same"->0 lands here.
+    # Same predicate the tuner/AOT skip. Post-normalisation pads, so "same"→0 lands here.
     if _is_matmul_shape(
         groups=groups, kt=kt, kh=kh, kw=kw, st=st, sh=sh, sw=sw, pt=pt, ph=ph, pw=pw
     ):

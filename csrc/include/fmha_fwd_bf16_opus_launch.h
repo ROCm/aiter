@@ -110,10 +110,8 @@ inline float resolve_scale(float softmax_scale, int hdim_q)
 
 // Fill the d128 kargs fields that do not depend on the traits. Returns false if the
 // arguments are inconsistent.
-inline bool fill_d128_kargs(opus_gqa_kargs& kargs,
-                            const fmha_fwd_bf16_opus_args& a,
-                            bool& is_group,
-                            bool& is_local)
+inline bool fill_d128_kargs(opus_gqa_kargs& kargs, const fmha_fwd_bf16_opus_args& a,
+                            bool& is_group, bool& is_local)
 {
     kargs.ptr_q = a.q_ptr;
     kargs.ptr_k = a.k_ptr;
@@ -196,8 +194,9 @@ inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
         // Flat extent from the row count and this kernel's Q block; see
         // fmha_fwd_bf16_opus_args::total_q.
         constexpr int q_block = Traits::Q_TILE_SIZE * Traits::NUM_WARPS;
-        kargs.total_q_blocks =
-            !is_group ? 0 : (a.total_q > 0 ? a.total_q / q_block + a.batch : a.total_q_blocks);
+        kargs.total_q_blocks  = !is_group ? 0
+                                : (a.total_q > 0 ? a.total_q / q_block + a.batch
+                                                 : a.total_q_blocks);
         // Group mode has two groupings, see opus_gqa_kargs::total_q_blocks.
         //
         // Flat: y carries total_q / q_block + batch blocks, the spacing the kernel's

@@ -256,7 +256,7 @@ def _get_config(
     N: int,
     K: int,
 ):
-    # Use the same tuning portal as the unfused gemm_a16w16 -- the extra
+    # Use the same tuning portal as the unfused gemm_a16w16 — the extra
     # MXFP8 quant is assumed not to shift the optimal config.
     config, is_tunned = get_gemm_config("GEMM-A16W16", M, N, K)
     return compute_splitk_params(config, K), is_tunned

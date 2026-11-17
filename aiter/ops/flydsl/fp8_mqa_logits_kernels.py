@@ -225,7 +225,7 @@ def _mk_builder(
     each iteration issues one new DMA while waiting for the oldest in-flight tile.
     Defaults to 2. Variants with PD != 2 append ``_pd{PD}``
     to their tag so the cache and registry can hold both simultaneously.
-    Constraint: ``(PD-1) * NUM_ASYNC_LOADS <= 63`` (gfx9 vmcnt encoding limit).
+    Constraint: ``(PD-1) * NUM_ASYNC_LOADS ≤ 63`` (gfx9 vmcnt encoding limit).
 
     Also records ``mfma.MFMA_M`` in ``_VARIANT_MFMA_M`` so ``_resolve_variant``
     can reject a ``num_heads`` the chosen variant's atom cannot tile (the

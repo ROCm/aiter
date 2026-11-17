@@ -1,4 +1,4 @@
-# Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
 # MIT License
 #
@@ -412,7 +412,7 @@ def _make_dispatch_tdm(
             # weight, so the load belongs in FINALIZE.
             return tok, act, expert, slot_off, dest_pe, keep
 
-        # -- COUNT: block-local histogram of routes per destination peer --
+        # ── COUNT: block-local histogram of routes per destination peer ──
         if const_expr(not compact_plan):
             for tok_base in range(
                 global_warp_id * etpi, inp_cur_tok, warps_total * etpi
@@ -422,7 +422,7 @@ def _make_dispatch_tdm(
                     comm_ops.atomic_add_lds(s_n(dest_pe), arith.constant(1))
             fx.barrier()
 
-            # -- RESERVE: one remote atomic per (block, peer), not per route --
+            # ── RESERVE: one remote atomic per (block, peer), not per route ──
             if tid < npes:
                 n = comm_ops.load_i32_lds(s_n(tid))
                 base = arith.constant(0)
@@ -434,7 +434,7 @@ def _make_dispatch_tdm(
                 comm_ops.store_i32_lds(s_base(tid), base)
             fx.barrier()
 
-            # -- FINALIZE: hand out the reserved slots and gather the metadata --
+            # ── FINALIZE: hand out the reserved slots and gather the metadata ──
             # destTokId = s_base + block-local j; staging is peer-major destTokId
             # SoA, so a block's reserved run is already a contiguous TDM source.
             for tok_base in range(
@@ -502,7 +502,7 @@ def _make_dispatch_tdm(
             comm_ops.waitcnt_stores()
             fx.barrier()
 
-            # -- META: the staged runs leave as bulk cross-GPU writes --
+            # ── META: the staged runs leave as bulk cross-GPU writes ──
             def _copy_edge(src_rsrc, dst_rsrc, src_off, dst_off, head, body, total):
                 """Scalar-copy the leading and trailing elements the body misses."""
                 for i in range(lane, head, WAVE):
@@ -718,7 +718,7 @@ def _make_dispatch_tdm(
                                     dst * scale_dst_dw + i,
                                 )
 
-        # -- PAYLOAD: one TDM load per token, one TDM store per surviving route --
+        # ── PAYLOAD: one TDM load per token, one TDM store per surviving route ──
         # No barrier before this. The tile a warp is about to overwrite is the
         # one it just drained itself; the cross-warp state (staging, s_base) was
         # published by the barrier after FINALIZE.

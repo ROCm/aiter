@@ -389,6 +389,7 @@ __device__ __forceinline__ bool prefill_prologue(const int* __restrict__ block_t
     s.frag_rc      = s.lane % Cfg::kN;
     s.k_group      = s.lane / Cfg::kN;
 
+
     s.shard_rank  = 0;
     s.shard_world = 1;
 
@@ -663,8 +664,8 @@ __device__ __forceinline__ bool decode_prologue(const int* __restrict__ block_ta
     int req = (int)blockIdx.y;
     if constexpr(Cfg::kNvfp4)
         req ^= (int)(blockIdx.z >> kDecodeReqXorShift) & req_xor_mask;
-    s.qlen   = query_len;
-    s.q_base = req * query_len;
+    s.qlen        = query_len;
+    s.q_base      = req * query_len;
 
     s.tok0 = blockIdx.x * Cfg::kGroupToks;
     if(s.tok0 >= s.qlen)
@@ -867,7 +868,7 @@ __device__ __forceinline__ void decode_main_loop(const uint8_t* __restrict__ q_i
         const int blk      = s.global_blk(loc);
         const uint8_t* kp  = page_ptr(page);
         const int loc_next = loc + Cfg::kWaves;
-        page               = loc_next < s.b1 ? s.block_table_row[s.global_blk(loc_next)] : 0;
+        page = loc_next < s.b1 ? s.block_table_row[s.global_blk(loc_next)] : 0;
 
         const bool masked = blk >= s.full_blk;
 
@@ -1416,6 +1417,7 @@ __global__ __launch_bounds__(Waves* kWave) void pa_sparse_block_topk_kernel(
     }
 }
 
+
 // Lift the always-selected blocks above every scored one, in the two tiers the
 // score epilogue uses: the sink blocks outrank the sliding window and both
 // outrank any real score.
@@ -1435,6 +1437,7 @@ __device__ __forceinline__ float unpack_score_key(uint64_t key)
     const uint32_t u = (uint32_t)(key >> 32);
     return __uint_as_float((u & 0x80000000u) ? (u & 0x7FFFFFFFu) : ~u);
 }
+
 
 // One compare-exchange stage. `lower` lanes keep the max of the pair, so a
 // segment comes out descending.
@@ -1664,14 +1667,15 @@ __global__ __launch_bounds__(Waves* kWave) void pa_sparse_block_topk_cp_kernel(
     __shared__ uint64_t wave_best[Waves * TopK];
     __shared__ int sel[TopK];
 
-    const int owned      = num_idx_heads / world;
-    uint64_t* self_cand  = peers.cand[rank];
+
+    const int owned     = num_idx_heads / world;
+    uint64_t* self_cand = peers.cand[rank];
     const size_t cand_hn = (size_t)cand_rows * TopK;
     const size_t cand_gn = (size_t)world * owned * cand_hn;
-    const int h          = blockIdx.y;
-    const int slot       = blockIdx.x * gridDim.y + blockIdx.y;
-    const int owner      = h / owned;
-    const int ho         = h - owner * owned;
+    const int h    = blockIdx.y;
+    const int slot = blockIdx.x * gridDim.y + blockIdx.y;
+    const int owner = h / owned;
+    const int ho    = h - owner * owned;
 
     const float* score_h = score + (size_t)h * score_head_stride;
 
@@ -1712,7 +1716,8 @@ __global__ __launch_bounds__(Waves* kWave) void pa_sparse_block_topk_cp_kernel(
             const float v   = row[loc];
             const bool live = loc < scan;
             mykey[i] =
-                live ? pack_score_key(v == v ? v : -INFINITY, loc * world + rank + 1) : (uint64_t)0;
+                live ? pack_score_key(v == v ? v : -INFINITY, loc * world + rank + 1)
+                     : (uint64_t)0;
         }
 
         uint64_t best = wave_top<kSlotsPerThread>(mykey, lane);
@@ -1750,8 +1755,8 @@ __global__ __launch_bounds__(Waves* kWave) void pa_sparse_block_topk_cp_kernel(
         // it and an untagged word would read as the previous call's. An empty
         // one tags a zero id, which the merge drops.
         if(wave == 0 && lane < TopK)
-            cp_store_cand(peers.cand[owner] + cand_buf + ((size_t)(rank * owned + ho)) * cand_hn +
-                              (size_t)n * TopK + lane,
+            cp_store_cand(peers.cand[owner] + cand_buf +
+                              ((size_t)(rank * owned + ho)) * cand_hn + (size_t)n * TopK + lane,
                           best | tagbit);
     }
 
@@ -1783,7 +1788,7 @@ __global__ __launch_bounds__(Waves* kWave) void pa_sparse_block_topk_cp_kernel(
 #pragma unroll
             for(int i = 0; i < MergeSlots; ++i)
             {
-                const int c  = i * kWave + lane;
+                const int c = i * kWave + lane;
                 uint64_t key = 0;
                 if(c < ncand)
                 {
@@ -1807,8 +1812,8 @@ __global__ __launch_bounds__(Waves* kWave) void pa_sparse_block_topk_cp_kernel(
                 // keeps a forced block ahead of a real one that happens to
                 // score above the sentinel. Repacking is also what drops the
                 // tag, so it never reaches the order the winners come out in.
-                const float v =
-                    topk_force_score(unpack_score_key(key), blk, nblk, init_blocks, local_blocks);
+                const float v = topk_force_score(
+                    unpack_score_key(key), blk, nblk, init_blocks, local_blocks);
                 mykey[i] = live ? pack_score_key(v, blk + 1) : (uint64_t)0;
             }
 
@@ -1822,8 +1827,9 @@ __global__ __launch_bounds__(Waves* kWave) void pa_sparse_block_topk_cp_kernel(
             if(lane < TopK)
             {
                 const int blk = best != 0 ? (int)(uint32_t)best - 1 : -1;
-                topk_idx[(size_t)ho * topk_head_stride + (size_t)n * topk_num_stride + lane] = blk;
-                sel[lane]                                                                    = blk;
+                topk_idx[(size_t)ho * topk_head_stride + (size_t)n * topk_num_stride +
+                         lane] = blk;
+                sel[lane]      = blk;
             }
         }
 

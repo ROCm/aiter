@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 """
 All-Gather communication primitive using Iris.
@@ -52,7 +52,7 @@ def _all_gather_impl(
     """
     Shared all-gather implementation using push-based approach with iris.put. 1D persistent-style PID mapping
 
-    Each rank sends its (M_shard)xN to all other ranks at the appropriate offset.
+    Each rank sends its (M_shard)×N to all other ranks at the appropriate offset.
 
     Args:
         pid: Program ID,  1D persistent-style PID mapping

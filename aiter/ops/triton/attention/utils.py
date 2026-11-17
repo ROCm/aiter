@@ -159,7 +159,7 @@ def block_attn_mask_to_ragged_lut(
             batch, num_heads, num_q_blocks, num_kv_blocks
         )
 
-    # 4D: (batch, num_heads, num_q_blocks, num_kv_blocks) -- GPU vectorized path
+    # 4D: (batch, num_heads, num_q_blocks, num_kv_blocks) — GPU vectorized path
     batch, num_heads, num_q_blocks, num_kv_blocks = block_attn_mask.shape
     if return_none_if_dense and block_attn_mask.all():
         return None

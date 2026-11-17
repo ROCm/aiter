@@ -27,39 +27,30 @@ struct opus_mla_prefill_split_kargs
 
 template <class Kargs>
 __host__ __device__ inline const Kargs& opus_mla_prefill_base(const Kargs& kargs)
-{
-    return kargs;
-}
+{ return kargs; }
 
 template <class Kargs>
 __host__ __device__ inline const Kargs&
 opus_mla_prefill_base(const opus_mla_prefill_split_kargs<Kargs>& kargs)
-{
-    return kargs.base;
-}
+{ return kargs.base; }
 
 struct opus_mla_prefill_split_rows
-{
-    int prefix_begin, prefix_len, extend_begin, extend_len;
-};
+{ int prefix_begin, prefix_len, extend_begin, extend_len; };
 
 template <int KV_TILE>
 __device__ inline int opus_mla_prefill_split_chunk(int prefix_len, int extend_len, int num_splits)
-{
-    return ((prefix_len + extend_len + num_splits - 1) / num_splits + KV_TILE - 1) / KV_TILE *
-           KV_TILE;
-}
+{ return ((prefix_len + extend_len + num_splits - 1) / num_splits + KV_TILE - 1) / KV_TILE * KV_TILE; }
 
 template <int KV_TILE>
 __device__ inline opus_mla_prefill_split_rows
 opus_mla_prefill_split_rows_of(int prefix_len, int extend_len, int num_splits, int split)
 {
-    auto clamp      = [](int x, int hi) { return x < 0 ? 0 : (x > hi ? hi : x); };
+    auto clamp = [](int x, int hi) { return x < 0 ? 0 : (x > hi ? hi : x); };
     const int chunk = opus_mla_prefill_split_chunk<KV_TILE>(prefix_len, extend_len, num_splits);
-    const int lo    = split * chunk;
-    const int hi    = lo + chunk;
-    const int pb    = clamp(lo, prefix_len);
-    const int eb    = clamp(lo - prefix_len, extend_len);
+    const int lo = split * chunk;
+    const int hi = lo + chunk;
+    const int pb = clamp(lo, prefix_len);
+    const int eb = clamp(lo - prefix_len, extend_len);
     return {pb, clamp(hi, prefix_len) - pb, eb, clamp(hi - prefix_len, extend_len) - eb};
 }
 
@@ -73,15 +64,11 @@ __device__ inline int opus_mla_prefill_split_count(int prefix_len, int extend_le
 
 // Split counts a cluster folds in-kernel
 __host__ __device__ constexpr bool opus_mla_prefill_cluster_size_ok(int s)
-{
-    return s == 2 || s == 4 || s == 8 || s == 16;
-}
+{ return s == 2 || s == 4 || s == 8 || s == 16; }
 
 __device__ inline int64_t opus_mla_prefill_split_row(
     const opus_mla_prefill_split_args& split, int token, int split_idx, int H, int head)
-{
-    return (static_cast<int64_t>(token) * split.num_splits + split_idx) * H + head;
-}
+{ return (static_cast<int64_t>(token) * split.num_splits + split_idx) * H + head; }
 
 // m in log2 units, stored in natural ones. A split without keys stores -FLT_MAX: -inf would not
 // survive -ffast-math.

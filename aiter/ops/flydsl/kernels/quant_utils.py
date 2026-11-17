@@ -296,7 +296,7 @@ def emit_amax_e8m0_native_scale(
     second clamp per block.
 
     Returns:
-        ``(scale_f32, e8m0_byte)`` -- f32 forward scale and i8 E8M0 byte.
+        ``(scale_f32, e8m0_byte)`` — f32 forward scale and i8 E8M0 byte.
     """
     if not all_vals:
         raise ValueError("emit_amax_e8m0_native_scale needs at least one value")
@@ -342,7 +342,7 @@ def emit_cvt_scalef32_pk8_fp8_f32(src_v8f32, scale_f32, *, v2i32_ty, rocdl):
     ``src_v8f32`` is a ``vector<8, f32>`` ir.Value, ``scale_f32`` an f32 whose
     exponent is the e8m0 block scale (2^(e8m0-127)); the HW divides each input
     by it and RNE-packs 8 fp8 e4m3 bytes into a ``vector<2, i32>``.
-    No bf16 round-trip -- full f32 precision into the scaled conversion.
+    No bf16 round-trip — full f32 precision into the scaled conversion.
     """
     return rocdl.cvt_scalef32_pk8_fp8_f32(
         v2i32_ty,

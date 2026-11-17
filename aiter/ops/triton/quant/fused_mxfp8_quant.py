@@ -226,17 +226,17 @@ def _fused_dual_rmsnorm_mxfp8_quant_routed(
     rmsnorm2d_fwd_), eliminating the ~6us/layer launch-overhead regression.
 
     Args:
-        q: (M, KQ) bf16 or fp16 -- Q-side input (e.g. q_lora).
-        k: (M, KK) bf16 or fp16 -- K-side input (e.g. kv_pre).
-        q_weight: (KQ,) bf16 or fp16 -- Q RMSNorm weight.
-        k_weight: (KK,) bf16 or fp16 -- K RMSNorm weight.
+        q: (M, KQ) bf16 or fp16 — Q-side input (e.g. q_lora).
+        k: (M, KK) bf16 or fp16 — K-side input (e.g. kv_pre).
+        q_weight: (KQ,) bf16 or fp16 — Q RMSNorm weight.
+        k_weight: (KK,) bf16 or fp16 — K RMSNorm weight.
         eps_q: Q RMSNorm epsilon.
         eps_k: K RMSNorm epsilon; defaults to eps_q.
         amax_floor: floor of each Q group's amax (0: none).
 
     Returns:
         yq (M, KQ) fp8 e4m3fn, sq (M, KQ // 32) uint8 e8m0,
-        yk (M, KK) same dtype as `k` (bf16 or fp16) -- providers must match this.
+        yk (M, KK) same dtype as `k` (bf16 or fp16) — providers must match this.
     """
     return _fused_dual_rmsnorm_mxfp8_quant_native(
         q, k, q_weight, k_weight, eps_q, eps_k, None, None, None, amax_floor

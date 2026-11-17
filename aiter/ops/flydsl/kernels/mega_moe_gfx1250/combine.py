@@ -1,4 +1,4 @@
-# Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
 # MIT License
 #

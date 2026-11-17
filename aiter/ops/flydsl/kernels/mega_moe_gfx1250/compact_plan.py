@@ -1,4 +1,4 @@
-# Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
 #
 # MIT License
 """Send-side compact route plan for gfx1250 TDM dispatch.

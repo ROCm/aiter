@@ -1084,8 +1084,8 @@ __launch_bounds__(Traits::kNumThreads) __global__
     {
         live += (p_indptr[t] < last) ? 1 : 0;
     }
-    const int32_t live_tiles =
-        __builtin_amdgcn_readfirstlane(aiter::warpReduce<aiter::AddFunctor, int32_t, kWave>(live));
+    const int32_t live_tiles = __builtin_amdgcn_readfirstlane(
+        aiter::warpReduce<aiter::AddFunctor, int32_t, kWave>(live));
     if(live_tiles == 0)
     {
         return;

@@ -21,9 +21,9 @@
 
 namespace opus_logits::gfx1250 {
 
-template <class T, int SCHED>
-__global__ __launch_bounds__(T::BLOCK_SIZE, 1) void h32_kernel(mqa_logits_mxfp4_kargs k)
-{
+template<class T, int SCHED>
+__global__ __launch_bounds__(T::BLOCK_SIZE, 1)
+void h32_kernel(mqa_logits_mxfp4_kargs k) {
     using D_BYTE   = opus::u8_t;
     using D_SCALE  = typename T::D_SCALE;
     using D_WEIGHT = typename T::D_WEIGHT;
@@ -31,10 +31,10 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, 1) void h32_kernel(mqa_logits_mxfp4_
         opus::wmma<opus::fp4_t, opus::fp4_t, float, T::MMA_M, T::MMA_N, T::MMA_K, T::WAVE_SIZE>;
     Mma mma;
     constexpr int R      = T::ROWS_PER_WAVE;
-    constexpr int NT     = T::N_TILES; // 4
-    constexpr int EC     = T::C_FRAG;  // 16
+    constexpr int NT     = T::N_TILES;            // 4
+    constexpr int EC     = T::C_FRAG;             // 16
     constexpr int WAVE   = T::WAVE_SIZE;
-    constexpr int PACK_W = T::PACK_C; // 8 bf16 = one 16 B load
+    constexpr int PACK_W = T::PACK_C;             // 8 bf16 = one 16 B load
     constexpr int DW     = (int)sizeof(D_SCALE);
     constexpr int GRP_DW = T::KV_GRP_BYTES / DW;
     constexpr int TK     = T::KV_TILE_SIZE;
@@ -51,101 +51,79 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, 1) void h32_kernel(mqa_logits_mxfp4_
     const int lane_m0 = lane % T::GRPN_C;
     const int lane_g  = lane / T::GRPN_C;
 
-    int num_rows       = k.num_rows;
+    int num_rows = k.num_rows;
     float weight_scale = k.weight_scale;
-    int tpb_shift      = k.tpb_shift;
-    pin_sgpr(num_rows);
-    pin_sgpr(weight_scale);
-    pin_sgpr(tpb_shift);
+    int tpb_shift = k.tpb_shift;
+    pin_sgpr(num_rows); pin_sgpr(weight_scale); pin_sgpr(tpb_shift);
     // This CTA's group and tile range: a schedule record, or worked out here.
     mqa_work wk;
-    if(!mqa_assign<T::ROWS_PER_CTA, TK, T::GATHER, SCHED>(k, lane, wk))
-        return;                             // CTA-uniform
-    const int chunk_start = wk.chunk_start; // absolute tile index
+    if (!mqa_assign<T::ROWS_PER_CTA, TK, T::GATHER, SCHED>(k, lane, wk)) return;   // CTA-uniform
+    const int chunk_start = wk.chunk_start;                     // absolute tile index
     const int tile_count  = wk.chunk_count;
-    const int chunk_max   = wk.chunk_max; // the priority's scale
-    int batch_id          = wk.batch_id;
+    const int chunk_max   = wk.chunk_max;                       // the priority's scale
+    int batch_id = wk.batch_id;
     pin_sgpr(batch_id);
 
     // ---- the tile's 64 rows: block table -> plane row, TDM into the LDS ring ----
     // The table through the constant address space so its words come from s_load.
     using bt_scalar_ptr = const int __attribute__((address_space(4)))*;
-    auto bt_c           = reinterpret_cast<bt_scalar_ptr>(
+    auto bt_c = reinterpret_cast<bt_scalar_ptr>(
         reinterpret_cast<__UINTPTR_TYPE__>(k.ptr_block_tables + (size_t)batch_id * k.bt_stride));
     const int tpb_mask = (1 << tpb_shift) - 1;
     // What tile t's issue reads from the table: its entry, or (candidate rows) its 8 page ids --
     // one s_load_dwordx8, the row's table is wave-uniform.
     constexpr int BTW = T::GATHER ? T::TILE_PAGES : 1;
-    auto bt_words     = [&](int t, int(&wds)[BTW]) {
-        if constexpr(T::GATHER)
-            opus::static_for<BTW>(
-                [&](auto i) { wds[i.value] = bt_c[(chunk_start + t) * T::TILE_PAGES + i.value]; });
+    auto bt_words = [&](int t, int (&wds)[BTW]) {
+        if constexpr (T::GATHER)
+            opus::static_for<BTW>([&](auto i) {
+                wds[i.value] = bt_c[(chunk_start + t) * T::TILE_PAGES + i.value];
+            });
         else
             wds[0] = bt_c[(chunk_start + t) >> tpb_shift];
     };
 
     // CU scope, not opus's device default (which defeats the L2). Legal only because KV and
     // scales are read-only for the launch: nothing may write the KV cache during the launch.
-    using fp4x2             = opus::array<opus::fp4_t, 2>;
+    using fp4x2 = opus::array<opus::fp4_t, 2>;
     constexpr int TDM_CACHE = opus::tdm_traits::make_cache_policy(
         opus::tdm_traits::load_temporal_hint::regular, opus::tdm_traits::scope::cu);
     using Cache  = opus::tdm_traits::cache<TDM_CACHE>;
     using Pad    = opus::tdm_traits::padding<fp4x2, T::LDS_PAD_INTERVAL, T::LDS_PAD_AMOUNT>;
     using KvWin  = opus::tdm<fp4x2, opus::seq<T::TOKEN_BYTES, T::TDM_ROWS>, Pad, Cache>;
     using KvsWin = opus::tdm<opus::u8_t, opus::seq<T::SCALE_BYTES_PER_DWORD, T::TDM_ROWS>, Cache>;
-    constexpr opus::u32_t TDM_EXTENT = 1u << 30; // rows; the address moves, the extent clamps
-    const int tdm_piece              = wave;     // one piece of the 64-row tile a wave
-    const int kv_lds_base            = tdm_piece * T::LDS_PIECE_BYTES;
-    const int kvs_lds_base           = T::lds_scale_byte(tdm_piece * T::TDM_ROWS);
-    auto kv_win                      = opus::make_tdm<KvWin>((opus::u32_t)kv_lds_base,
-                                        reinterpret_cast<const D_BYTE*>(k.ptr_kv),
-                                        (opus::u32_t)T::TOKEN_BYTES,
-                                        TDM_EXTENT,
-                                        (opus::u64_t)T::TOKEN_BYTES,
-                                        0u,
-                                        0u);
-    auto kvs_win                     = opus::make_tdm<KvsWin>((opus::u32_t)kvs_lds_base,
-                                          reinterpret_cast<const D_BYTE*>(k.ptr_kv_scale),
-                                          (opus::u32_t)T::SCALE_BYTES_PER_DWORD,
-                                          TDM_EXTENT,
-                                          (opus::u64_t)T::SCALE_BYTES_PER_DWORD,
-                                          0u,
-                                          0u);
+    constexpr opus::u32_t TDM_EXTENT = 1u << 30;   // rows; the address moves, the extent clamps
+    const int tdm_piece    = wave;                 // one piece of the 64-row tile a wave
+    const int kv_lds_base  = tdm_piece * T::LDS_PIECE_BYTES;
+    const int kvs_lds_base = T::lds_scale_byte(tdm_piece * T::TDM_ROWS);
+    auto kv_win = opus::make_tdm<KvWin>(
+        (opus::u32_t)kv_lds_base, reinterpret_cast<const D_BYTE*>(k.ptr_kv),
+        (opus::u32_t)T::TOKEN_BYTES, TDM_EXTENT, (opus::u64_t)T::TOKEN_BYTES, 0u, 0u);
+    auto kvs_win = opus::make_tdm<KvsWin>(
+        (opus::u32_t)kvs_lds_base, reinterpret_cast<const D_BYTE*>(k.ptr_kv_scale),
+        (opus::u32_t)T::SCALE_BYTES_PER_DWORD, TDM_EXTENT,
+        (opus::u64_t)T::SCALE_BYTES_PER_DWORD, 0u, 0u);
     // Candidate layers: the planes as [num_pages][512 B] / [num_pages][32 B], one gather of the
     // tile's 8 page ids each. The pad runs on across gathered rows, so the LDS image is the
     // contiguous tile's byte for byte, and the ids need not be sorted.
-    constexpr int PAGE_VAL_BYTES = T::PAGE_ROWS * T::TOKEN_BYTES;           // 512
-    constexpr int PAGE_SCL_BYTES = T::PAGE_ROWS * T::SCALE_BYTES_PER_DWORD; // 32
-    using KvgWin                 = opus::tdm<fp4x2,
-                                             opus::seq<PAGE_VAL_BYTES, T::TILE_PAGES>,
-                                             Pad,
-                                             opus::tdm_traits::gather<32>,
-                                             Cache>;
-    using KvsgWin                = opus::tdm<opus::u8_t,
-                                             opus::seq<PAGE_SCL_BYTES, T::TILE_PAGES>,
-                                             opus::tdm_traits::gather<32>,
-                                             Cache>;
-    auto kvg_win                 = opus::make_tdm<KvgWin>((opus::u32_t)kv_lds_base,
-                                          reinterpret_cast<const D_BYTE*>(k.ptr_kv),
-                                          (opus::u32_t)PAGE_VAL_BYTES,
-                                          TDM_EXTENT,
-                                          (opus::u64_t)PAGE_VAL_BYTES,
-                                          0u,
-                                          0u);
-    auto kvsg_win                = opus::make_tdm<KvsgWin>((opus::u32_t)kvs_lds_base,
-                                            reinterpret_cast<const D_BYTE*>(k.ptr_kv_scale),
-                                            (opus::u32_t)PAGE_SCL_BYTES,
-                                            TDM_EXTENT,
-                                            (opus::u64_t)PAGE_SCL_BYTES,
-                                            0u,
-                                            0u);
+    constexpr int PAGE_VAL_BYTES = T::PAGE_ROWS * T::TOKEN_BYTES;                 // 512
+    constexpr int PAGE_SCL_BYTES = T::PAGE_ROWS * T::SCALE_BYTES_PER_DWORD;       // 32
+    using KvgWin  = opus::tdm<fp4x2, opus::seq<PAGE_VAL_BYTES, T::TILE_PAGES>, Pad,
+                              opus::tdm_traits::gather<32>, Cache>;
+    using KvsgWin = opus::tdm<opus::u8_t, opus::seq<PAGE_SCL_BYTES, T::TILE_PAGES>,
+                              opus::tdm_traits::gather<32>, Cache>;
+    auto kvg_win = opus::make_tdm<KvgWin>(
+        (opus::u32_t)kv_lds_base, reinterpret_cast<const D_BYTE*>(k.ptr_kv),
+        (opus::u32_t)PAGE_VAL_BYTES, TDM_EXTENT, (opus::u64_t)PAGE_VAL_BYTES, 0u, 0u);
+    auto kvsg_win = opus::make_tdm<KvsgWin>(
+        (opus::u32_t)kvs_lds_base, reinterpret_cast<const D_BYTE*>(k.ptr_kv_scale),
+        (opus::u32_t)PAGE_SCL_BYTES, TDM_EXTENT, (opus::u64_t)PAGE_SCL_BYTES, 0u, 0u);
     // Each window's D# at origin 0, built once; a tile's issue patches only what changes -- the
     // global address (or, gathering, the page ids) and the LDS stage.
-    const typename KvWin::descriptor kv_d0   = kv_win.make_descriptor();
+    const typename KvWin::descriptor  kv_d0  = kv_win.make_descriptor();
     const typename KvsWin::descriptor kvs_d0 = kvs_win.make_descriptor();
-    typename KvgWin::descriptor kvg_d0       = kvg_win.make_descriptor();
-    typename KvsgWin::descriptor kvsg_d0     = kvsg_win.make_descriptor();
-    kvg_d0.set_tile_dim1(T::TILE_PAGES); // gather mode: tile_dim1 = valid indices
+    typename KvgWin::descriptor  kvg_d0  = kvg_win.make_descriptor();
+    typename KvsgWin::descriptor kvsg_d0 = kvsg_win.make_descriptor();
+    kvg_d0.set_tile_dim1(T::TILE_PAGES);    // gather mode: tile_dim1 = valid indices
     kvsg_d0.set_tile_dim1(T::TILE_PAGES);
     // The pool's last whole 8-row page within a 32-bit row: every gathered id is clamped to it.
     [[maybe_unused]] const opus::u32_t last_page =
@@ -157,44 +135,45 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, 1) void h32_kernel(mqa_logits_mxfp4_
     // SCALE_TDM = 0 reads the tile's scales per lane into a register ring instead of a second TDM
     // op, which halves the tensor ops a tile costs a wave and so allows a deeper ring.
     int kvs_ring[STAGES][NT / 2];
-    auto issue_tile = [&](int t, auto slot_c, const int(&wds)[BTW]) {
+    auto issue_tile = [&](int t, auto slot_c, const int (&wds)[BTW]) {
         constexpr int slot = decltype(slot_c)::value;
-        if(t >= tile_count)
-            return;
+        if (t >= tile_count) return;
         const opus::u32_t stage = (opus::u32_t)(slot * T::LDS_STAGE_BYTES);
-        if constexpr(T::GATHER)
-        {
+        if constexpr (T::GATHER) {
             // The last tile's ids run past the row's window into slots the caller may have
             // padded with anything; clamped into the pool, each reads a real page, whose keys
             // are then never stored. Unsigned, so a negative id clamps too.
             int ids[T::TILE_PAGES];
             opus::static_for<T::TILE_PAGES>([&](auto i) {
                 const opus::u32_t id = (opus::u32_t)wds[i.value];
-                ids[i.value]         = (int)(id < last_page ? id : last_page);
+                ids[i.value] = (int)(id < last_page ? id : last_page);
             });
             auto gd = kvg_d0;
             gd.set_lds_addr((opus::u32_t)kv_lds_base + stage);
             gd.groups23.group2 = opus::impl::tdm_sgpr4{ids[0], ids[1], ids[2], ids[3]};
             gd.groups23.group3 = opus::impl::tdm_sgpr4{ids[4], ids[5], ids[6], ids[7]};
             KvgWin::async_load(gd);
-            if constexpr(T::SCALE_TDM)
-            {
+            if constexpr (T::SCALE_TDM) {
                 auto gs = kvsg_d0;
                 gs.set_lds_addr((opus::u32_t)kvs_lds_base + stage);
                 gs.groups23.group2 = opus::impl::tdm_sgpr4{ids[0], ids[1], ids[2], ids[3]};
                 gs.groups23.group3 = opus::impl::tdm_sgpr4{ids[4], ids[5], ids[6], ids[7]};
                 KvsgWin::async_load(gs);
-            }
-            else
-            {
+            } else {
                 // lane L, half u: key 32u + L, in page (32u + L) / 8 of the tile -- a select over
                 // the eight scalar ids, then the key's dword within that page's 32 B
                 opus::static_for<NT / 2>([&](auto uc) {
                     constexpr int u = uc.value;
-                    const int key   = u * 2 * T::MMA_N + lane;
-                    int pid         = ids[0];
-                    opus::static_for<T::TILE_PAGES>(
-                        [&](auto i) { pid = (key >> 3) == i.value ? ids[i.value] : pid; });
+                    const int key = u * 2 * T::MMA_N + lane;
+                    // Each id pinned before the select: picked straight from ids[], clang 24's
+                    // promote-alloca-to-vector makes this lambda's captures a vector of pointers
+                    // to pid and ids, which then stay on the stack (scratch, flat loads).
+                    int pid = ids[0];
+                    opus::static_for<T::TILE_PAGES>([&](auto i) {
+                        int id = ids[i.value];
+                        pin_sgpr(id);
+                        pid = (key >> 3) == i.value ? id : pid;
+                    });
                     kvs_ring[slot][u] = *reinterpret_cast<const int*>(
                         reinterpret_cast<const D_BYTE*>(k.ptr_kv_scale) +
                         (size_t)(opus::u32_t)pid * PAGE_SCL_BYTES +
@@ -212,18 +191,15 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, 1) void h32_kernel(mqa_logits_mxfp4_
             d.set_global_addr(kv_g + (opus::u64_t)origin * T::TOKEN_BYTES);
             KvWin::async_load(d);
         }
-        if constexpr(T::SCALE_TDM)
-        {
+        if constexpr (T::SCALE_TDM) {
             auto d = kvs_d0;
             d.set_lds_addr((opus::u32_t)kvs_lds_base + stage);
             d.set_global_addr(kvs_g + (opus::u64_t)origin * T::SCALE_BYTES_PER_DWORD);
             KvsWin::async_load(d);
-        }
-        else
-        {
+        } else {
             // lane L, half u: key 32u + L of the tile, i.e. n-tiles 2u (low lanes) and 2u+1 (high)
             opus::static_for<NT / 2>([&](auto uc) {
-                constexpr int u   = uc.value;
+                constexpr int u = uc.value;
                 kvs_ring[slot][u] = *reinterpret_cast<const int*>(
                     reinterpret_cast<const D_BYTE*>(k.ptr_kv_scale) +
                     ((size_t)(row0 + u * 2 * T::MMA_N + lane)) * T::SCALE_BYTES_PER_DWORD);
@@ -231,14 +207,14 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, 1) void h32_kernel(mqa_logits_mxfp4_
         }
     };
 
-    auto s_dw             = opus::make_smem(reinterpret_cast<D_SCALE*>(smem_buf));
+    auto s_dw = opus::make_smem(reinterpret_cast<D_SCALE*>(smem_buf));
     const int lds_lane_dw = T::lds_byte(lane_m0, lane_g) / DW;
-    auto read_kv          = [&](typename Mma::vtype_b(&kv)[NT], int(&kvs)[NT / 2], auto slot_c) {
+    auto read_kv = [&](typename Mma::vtype_b (&kv)[NT], int (&kvs)[NT / 2], auto slot_c) {
         constexpr int slot = decltype(slot_c)::value;
         const int stage_dw = slot * T::LDS_STAGE_BYTES / DW;
         opus::static_for<NT / 2>([&](auto uc) {
             constexpr int u = uc.value;
-            if constexpr(T::SCALE_TDM)
+            if constexpr (T::SCALE_TDM)
                 kvs[u] = opus::load<1>(
                     s_dw, stage_dw + T::lds_scale_byte(u * 2 * T::MMA_N) / DW + lane)[0];
             else
@@ -250,9 +226,9 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, 1) void h32_kernel(mqa_logits_mxfp4_
             opus::static_for<T::B_VGPR_GROUPS>([&](auto vc) {
                 constexpr int v   = vc.value;
                 constexpr int imm = v * 2 * T::LDS_BLOCK_BYTES / DW;
-                auto x            = opus::load<GRP_DW>(s_dw, stage_dw + base + imm + lds_lane_dw);
-                opus::set_slice(
-                    kv[nt], x, opus::number<v * GRP_DW>{}, opus::number<(v + 1) * GRP_DW>{});
+                auto x = opus::load<GRP_DW>(s_dw, stage_dw + base + imm + lds_lane_dw);
+                opus::set_slice(kv[nt], x, opus::number<v * GRP_DW>{},
+                                opus::number<(v + 1) * GRP_DW>{});
             });
         });
     };
@@ -270,28 +246,25 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, 1) void h32_kernel(mqa_logits_mxfp4_
             constexpr int p = pc.value;
             opus::vector_t<float, 2> wv{wr[2 * p], wr[2 * p + 1]};
             opus::vector_t<float, 2> rv{relu_num(c[2 * p]), relu_num(c[2 * p + 1])};
-            if constexpr(NAN_ELEM && p == 0)
-            {
+            if constexpr (NAN_ELEM && p == 0) {
                 float x = c[0];
                 asm volatile("v_maximum_f32 %0, %0, 0" : "+v"(x));
                 rv[0] = x;
             }
             s2[p % 2] = rv * wv + s2[p % 2];
         });
-        return s2[0] + s2[1]; // (even heads, odd heads): the pair finish adds the halves
+        return s2[0] + s2[1];   // (even heads, odd heads): the pair finish adds the halves
     };
-    constexpr int LEAD = STAGES - 1; // tiles in flight ahead of the one being computed
+    constexpr int LEAD = STAGES - 1;   // tiles in flight ahead of the one being computed
     opus::static_for<LEAD>([&](auto sc) {
-        if(sc.value < tile_count)
-        {
+        if (sc.value < tile_count) {
             int wds[BTW];
             bt_words(sc.value, wds);
             issue_tile(sc.value, sc, wds);
         }
     });
-    int pf[BTW]; // the words of the next tile to issue, read one tile ahead
-    if(LEAD < tile_count)
-        bt_words(LEAD, pf);
+    int pf[BTW];   // the words of the next tile to issue, read one tile ahead
+    if (LEAD < tile_count) bt_words(LEAD, pf);
     // ---- this wave's R rows: Q, its scales, the weights, and an out V# a row ----
     // Read after the first tiles' TDM is issued, so the two start-up latencies overlap.
     // A slot past the group's rows runs with its first row's operands and a zero-record V#, so it
@@ -299,17 +272,25 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, 1) void h32_kernel(mqa_logits_mxfp4_
     typename Mma::vtype_a q_a[R];
     int q_sc[R];
     opus::vector_t<float, EC> w[R];
-    float* out_ptr[R]; // each row's window: base and byte count, uniform (SGPR)
+    float* out_ptr[R];          // each row's window: base and byte count, uniform (SGPR)
     unsigned out_bytes[R];
-    unsigned q_nan_rows = 0; // bit r = row r's q scales hold a NaN (uniform)
+    unsigned q_nan_rows = 0;    // bit r = row r's q scales hold a NaN (uniform)
+    // A row's window and out offset through the constant address space, as the table: s_load.
+    // Plain loads here come after a TDM issue, which clang 24 counts as a store to any memory, so
+    // they would be global_loads, and the out V# built from them a waterfall loop around each store.
+    using row_scalar_ptr = const int __attribute__((address_space(4)))*;
+    const auto row_ends =
+        reinterpret_cast<row_scalar_ptr>(reinterpret_cast<__UINTPTR_TYPE__>(k.ptr_row_ends));
+    const auto out_offsets =
+        reinterpret_cast<row_scalar_ptr>(reinterpret_cast<__UINTPTR_TYPE__>(k.ptr_out_offsets));
     opus::static_for<R>([&](auto rc) {
         constexpr int r = rc.value;
-        const int slot  = wave * R + r;
+        const int  slot = wave * R + r;
         const bool ok   = slot < wk.group_rows && wk.row_id + slot < num_rows;
-        int row         = wk.row_id + (ok ? slot : 0);
+        int row = wk.row_id + (ok ? slot : 0);
         pin_sgpr(row);
-        int end = ok ? k.ptr_row_ends[row] : 0;
-        end     = __builtin_amdgcn_readfirstlane(end);
+        int end = ok ? row_ends[row] : 0;
+        end = __builtin_amdgcn_readfirstlane(end);
 
         auto g_q = opus::make_gmem(reinterpret_cast<const D_SCALE*>(
             reinterpret_cast<const D_BYTE*>(k.ptr_q) + (size_t)row * T::Q_ROW_BYTES));
@@ -317,63 +298,59 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, 1) void h32_kernel(mqa_logits_mxfp4_
             constexpr int v = vc.value;
             const int head  = lane_m0 + (v >= 2 ? 16 : 0);
             const int block = lane_g + (v % 2 ? 2 : 0);
-            auto x          = opus::load<GRP_DW>(g_q, T::q_byte(head, block) / DW);
-            opus::set_slice(
-                q_a[r], x, opus::number<v * GRP_DW>{}, opus::number<(v + 1) * GRP_DW>{});
+            auto x = opus::load<GRP_DW>(g_q, T::q_byte(head, block) / DW);
+            opus::set_slice(q_a[r], x, opus::number<v * GRP_DW>{},
+                            opus::number<(v + 1) * GRP_DW>{});
         });
         auto g_qs = opus::make_gmem(reinterpret_cast<const D_SCALE*>(k.ptr_q_scale) +
                                     (size_t)row * T::N_HEADS);
-        q_sc[r]   = opus::load<1>(g_qs, lane)[0];
-        auto g_w  = opus::make_gmem(reinterpret_cast<const D_WEIGHT*>(k.ptr_weights) +
+        q_sc[r] = opus::load<1>(g_qs, lane)[0];
+        auto g_w = opus::make_gmem(reinterpret_cast<const D_WEIGHT*>(k.ptr_weights) +
                                    (size_t)row * T::W_ROW_ELEMS);
         opus::static_for<T::REPT_C>([&](auto hc) {
             constexpr int h = hc.value;
-            auto wv         = opus::load<PACK_W>(g_w, (h ? 16 : 0) + lane_g * PACK_W);
-            opus::static_for<PACK_W>(
-                [&](auto jc) { w[r][h * PACK_W + jc.value] = (float)wv[jc.value] * weight_scale; });
+            auto wv = opus::load<PACK_W>(g_w, (h ? 16 : 0) + lane_g * PACK_W);
+            opus::static_for<PACK_W>([&](auto jc) {
+                w[r][h * PACK_W + jc.value] = (float)wv[jc.value] * weight_scale;
+            });
         });
         // An offset is >= 0: zero-extended, it needs no wait for its load here, as a sign would.
-        const long long base = k.ptr_out_offsets ? (long long)(unsigned)k.ptr_out_offsets[row]
+        const long long base = k.ptr_out_offsets ? (long long)(unsigned)out_offsets[row]
                                                  : (long long)row * k.out_stride;
-        out_ptr[r]           = k.ptr_out + base;
-        out_bytes[r]         = (unsigned)(end > 0 ? end : 0) * (unsigned)sizeof(float);
+        out_ptr[r]   = k.ptr_out + base;
+        out_bytes[r] = (unsigned)(end > 0 ? end : 0) * (unsigned)sizeof(float);
     });
 
     // Lane h holds head h's four block scales: a row's logits are all NaN if any is 0xFF. Tested
     // after every prologue load is out: tested per row as it loaded, the branch made each row's
     // loads wait for the previous row's scales.
     opus::static_for<R>([&](auto rc) {
-        if(__builtin_amdgcn_ballot_w32(e8m0x4_has_nan((unsigned)q_sc[rc.value])))
+        if (__builtin_amdgcn_ballot_w32(e8m0x4_has_nan((unsigned)q_sc[rc.value])))
             q_nan_rows |= 1u << rc.value;
     });
     typename Mma::vtype_b kv_b[NT];
     int kvs[NT / 2];
     // Unrolled by the ring depth so every slot index is a compile-time constant (a register ring
     // cannot be indexed at run time without going to scratch).
-    for(int tb = 0; tb < tile_count; tb += STAGES)
-    {
+    for (int tb = 0; tb < tile_count; tb += STAGES) {
         opus::static_for<STAGES>([&](auto sc) {
             constexpr int S = sc.value;
-            const int t     = tb + S;
-            if(t >= tile_count)
-                return; // CTA-uniform
+            const int t = tb + S;
+            if (t >= tile_count) return;   // CTA-uniform
             // Free and candidate rows (one-round-ish launches) only: in multi-round ones
             // (full-layer Table / Prefill) the age order is what retires CTAs early for the next
             // round. Remaining tiles against the launch's longest chunk, not this CTA's own: with
             // ragged contexts the split leaves many short tail chunks, which by their own count
             // would start at top priority and starve the long chunks that set the end.
-            if constexpr(SCHED == SCHED_FREE || T::GATHER)
+            if constexpr (SCHED == SCHED_FREE || T::GATHER)
                 set_prio_by_progress(tile_count - t, chunk_max);
             // Tile t has landed once at most the tiles issued after it are outstanding. Near the
             // end fewer were issued, and the constant would no longer cover t: drain instead.
-            if(tile_count - 1 - t >= LEAD - 1)
-                opus::s_wait_tensorcnt<T::TENSORCNT_KEEP>();
-            else
-                opus::s_wait_tensorcnt<0>();
+            if (tile_count - 1 - t >= LEAD - 1) opus::s_wait_tensorcnt<T::TENSORCNT_KEEP>();
+            else                                opus::s_wait_tensorcnt<0>();
             cta_sync();
             issue_tile(t + LEAD, opus::number<(S + LEAD) % STAGES>{}, pf);
-            if(t + LEAD + 1 < tile_count)
-                bt_words(t + LEAD + 1, pf);
+            if (t + LEAD + 1 < tile_count) bt_words(t + LEAD + 1, pf);
             read_kv(kv_b, kvs, sc);
             __builtin_amdgcn_sched_barrier(0);
 
@@ -387,18 +364,14 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, 1) void h32_kernel(mqa_logits_mxfp4_
             auto finish = [&](auto jc, opus::vector_t<float, 2> v) {
                 constexpr int j = decltype(jc)::value, nt = j / R, r = j % R;
                 part[r][nt] = v;
-                if constexpr(nt % 2 == 1)
+                if constexpr (nt % 2 == 1)
                     out[r][nt / 2] = pair_head_reduce(pair_sum<FIN_ASM>(part[r][nt - 1]),
                                                       pair_sum<FIN_ASM>(part[r][nt]));
             };
             constexpr int A = NT * R;
-            auto wmma_j     = [&](auto jc) {
+            auto wmma_j = [&](auto jc) {
                 constexpr int j = decltype(jc)::value, nt = j / R, r = j % R;
-                return mma(q_a[r],
-                           kv_b[nt],
-                           q_sc[r],
-                           kvs[nt / 2],
-                           opus::number<0>{},
+                return mma(q_a[r], kv_b[nt], q_sc[r], kvs[nt / 2], opus::number<0>{},
                            opus::number<nt % 2>{});
             };
             auto epilogue_j = [&](auto jc, const typename Mma::vtype_c& c) {
@@ -446,18 +419,14 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, 1) void h32_kernel(mqa_logits_mxfp4_
                         });
                     });
                 };
-                if constexpr(NAN_ELEM)
-                {
-                    if(q_nan_rows)
-                        restore();
-                }
-                else
-                {
+                if constexpr (NAN_ELEM) {
+                    if (q_nan_rows) restore();
+                } else {
                     unsigned kany = q_nan_rows;
-                    opus::static_for<NT / 2>(
-                        [&](auto uc) { kany |= __builtin_amdgcn_ballot_w32(kff[uc.value]); });
-                    if(kany)
-                        restore();
+                    opus::static_for<NT / 2>([&](auto uc) {
+                        kany |= __builtin_amdgcn_ballot_w32(kff[uc.value]);
+                    });
+                    if (kany) restore();
                 }
             }
             __builtin_amdgcn_sched_barrier(0);
@@ -475,4 +444,4 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, 1) void h32_kernel(mqa_logits_mxfp4_
     }
 }
 
-} // namespace opus_logits::gfx1250
+}  // namespace opus_logits::gfx1250

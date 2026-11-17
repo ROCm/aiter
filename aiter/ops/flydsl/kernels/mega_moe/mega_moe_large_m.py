@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025 FlyDSL Project Contributors
 # ruff: noqa: B023
 """MegaMoEV2 large-input path: dispatch, GEMM1, GEMM2 and combine fused into one persistent kernel.
 

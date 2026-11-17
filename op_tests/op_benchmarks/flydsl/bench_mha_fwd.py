@@ -3,7 +3,7 @@
 
 """Perf-only benchmark for the FlyDSL m32x8 MHA forward kernel on gfx1250.
 
-This is the performance companion to ``op_tests/test_flydsl_mha_fwd.py`` -- it drives
+This is the performance companion to ``op_tests/test_flydsl_mha_fwd.py`` — it drives
 the same public interface (``flash_attn_func`` / ``flash_attn_varlen_func`` in
 ``aiter/ops/mha.py``) but computes NO reference and checks NO correctness. It only
 times the kernel and reports latency / TFLOPS / TB-s.
@@ -20,11 +20,11 @@ another backend fails loudly rather than quietly timing the wrong kernel.
 
 Two modes:
 
-1. Detailed args -- drive one exact shape from the CLI:
+1. Detailed args — drive one exact shape from the CLI:
      AITER_ENABLE_EXPERIMENTAL=1 python op_tests/op_benchmarks/flydsl/bench_mha_fwd.py \\
          --layout thd -b 2 -sq 4095 -sk 4095 -nh 16 -nhkv 4 -c
 
-2. Predefined cases -- replay curated shapes by id:
+2. Predefined cases — replay curated shapes by id:
      AITER_ENABLE_EXPERIMENTAL=1 python op_tests/op_benchmarks/flydsl/bench_mha_fwd.py --case 0 4
      AITER_ENABLE_EXPERIMENTAL=1 python op_tests/op_benchmarks/flydsl/bench_mha_fwd.py --list   # show, don't run
 
@@ -52,7 +52,7 @@ import pandas as pd
 import torch
 
 # NOTE: aiter is imported lazily inside main()/run_perf so `--list` (and --help)
-# stay cheap -- importing aiter triggers the heavy JIT module build/load.
+# stay cheap — importing aiter triggers the heavy JIT module build/load.
 
 DEFAULT_HDIM_QK = 128
 DEFAULT_HDIM_V = 128
@@ -360,7 +360,7 @@ def run_perf(case, warmup, repeat, fix_init=None):
 
 
 # ============================================================================
-# Predefined cases -- seqlen spans tiny..2^17, with odd (non-power-of-two) lengths
+# Predefined cases — seqlen spans tiny..2^17, with odd (non-power-of-two) lengths
 # sprinkled in. Every base shape below is replayed at each (D_qk, D_v) pair.
 # ============================================================================
 
@@ -855,7 +855,7 @@ def main():
         _print_case_list()
         return
 
-    # Import aiter only now -- kept out of the module top so --list / --help don't
+    # Import aiter only now — kept out of the module top so --list / --help don't
     # pay the JIT module build/load cost.
     import aiter
     from aiter.jit.core import is_experimental_enabled

@@ -12,7 +12,7 @@ FP8   public API:  aiter.flash_attn_varlen_fp8_pertensor_func,
                    the FP8 section below; --dtype picks bf16 / fp8)
 
 Built to the aiter op-test standard (see .claude/skills/aiter-op-test): mirror
-test_quant.py -- @benchmark + run_perftest candidate loop, a torch reference,
+test_quant.py — @benchmark + run_perftest candidate loop, a torch reference,
 per-candidate us / TFLOPS / TB/s / err, a markdown summary table per test
 function, and a __main__ guard so the module is importable.
 
@@ -178,9 +178,9 @@ def run_kernel(
     """Return (out, lse) with lse shaped (total_q, nheads) to match run_torch.
     max_seqlen_k defaults to max_seqlen_q (equal q/k seqlens).
 
-    via="public" -> aiter.flash_attn_varlen_func (the model path); lse comes back
+    via="public" → aiter.flash_attn_varlen_func (the model path); lse comes back
                    (nheads, total_q) and is transposed here.
-    via="ops"    -> aiter.fmha_fwd_with_sink_varlen_asm; lse is (total_q, nheads, 1).
+    via="ops"    → aiter.fmha_fwd_with_sink_varlen_asm; lse is (total_q, nheads, 1).
     """
     if via == "public":
         r = aiter.flash_attn_varlen_func(
@@ -320,7 +320,7 @@ def test_fmha_fwd_with_sink_varlen_asm(
         seqlens, hq, hk, hdim_q, hdim_v, is_causal, total, q.element_size()
     )
 
-    # The model calls the public dispatcher (flash_attn_varlen_func) -> asm path.
+    # The model calls the public dispatcher (flash_attn_varlen_func) → asm path.
     # It sends D64 without a sink to another backend, so that case calls the ops.
     via = "public" if hdim_q != 64 or d64_sink else "ops"
     candidates = {

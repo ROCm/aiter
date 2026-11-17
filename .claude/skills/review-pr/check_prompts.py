@@ -33,17 +33,17 @@ def _skill_md():
 CHECKS = [
     (
         "prompts/refuter.md",
-        "## Step 7.7 -- Independent refutation",
-        "`rules.md` ? Refutation has why.",
+        "## Step 7.7 — Independent refutation",
+        "`rules.md` § Refutation has why.",
     ),
     (
         "prompts/worker.md",
         "**Output rules (strictly enforced):**",
-        '- `? The benchmark may not include setup cost` -- no "Author must" conclusion',
+        '- `⚠️ The benchmark may not include setup cost` — no "Author must" conclusion',
     ),
     (
         "prompts/worker.md",
-        "## Step 7.8 -- Design Assessment",
+        "## Step 7.8 — Design Assessment",
         "and an over-bar PR carries a split.",
     ),
 ]
@@ -73,25 +73,18 @@ def check_fail_classes():
     known = set(mod.CLASSES)
     unknown = emitted - known
     if unknown:
-        print(
-            f"\u274c run_one.sh emits fail classes unknown to _notify.py: {sorted(unknown)}"
-        )
+        print(f"\u274c run_one.sh emits fail classes unknown to _notify.py: {sorted(unknown)}")
         return 1
-    print(
-        f"\u2705 fail classes consistent: run_one {sorted(emitted)} \u2286 _notify.py {sorted(known)}"
-    )
+    print(f"\u2705 fail classes consistent: run_one {sorted(emitted)} \u2286 _notify.py {sorted(known)}")
     return 0
 
 
 WORKFLOW = HERE.parents[2] / ".github" / "workflows" / "aiter-review-bot.yml"
-GATE_WATCH_WORKFLOW = (
-    HERE.parents[2] / ".github" / "workflows" / "review-bot-gate-watch.yml"
-)
+GATE_WATCH_WORKFLOW = HERE.parents[2] / ".github" / "workflows" / "review-bot-gate-watch.yml"
 
 
 def _notify_mod():
     import importlib.util
-
     spec = importlib.util.spec_from_file_location("_notify", HERE / "_notify.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -111,9 +104,7 @@ def check_budget_fits():
         return 1
     budget, cap = int(m.group(1)), int(j.group(1)) * 60
     if budget >= cap:
-        print(
-            f"\u274c AITER_RUN_BUDGET={budget}s does not fit the review job's {cap}s cap"
-        )
+        print(f"\u274c AITER_RUN_BUDGET={budget}s does not fit the review job's {cap}s cap")
         return 1
     print(f"\u2705 run budget fits the job cap: {budget}s < {cap}s")
     return 0
@@ -125,34 +116,21 @@ def check_owner_fallbacks():
     and each carries its own copy of a handle, so they drift from the map in silence: the next
     owner updates _notify.py and still never hears that the runner is down, that a review
     vanished, or that the hosted runners starved. The gate watch lives in a different workflow
-    file from the other two, so each row names the workflow that must pass its variable.
-    """
+    file from the other two, so each row names the workflow that must pass its variable."""
     classes = _notify_mod().CLASSES
     rows = [
-        (
-            "watchdog.py",
-            "env",
-            r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"',
-            "aiter-review-bot.yml",
-        ),
-        (
-            "lost_review.py",
-            "flow",
-            r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"',
-            "aiter-review-bot.yml",
-        ),
-        (
-            "queue_gate.py",
-            "env",
-            r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"',
-            "aiter-review-bot.yml",
-        ),
-        (
-            "gate_watch.py",
-            "env",
-            r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"',
-            "review-bot-gate-watch.yml",
-        ),
+        ("watchdog.py", "env",
+         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"',
+         "aiter-review-bot.yml"),
+        ("lost_review.py", "flow",
+         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"',
+         "aiter-review-bot.yml"),
+        ("queue_gate.py", "env",
+         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"',
+         "aiter-review-bot.yml"),
+        ("gate_watch.py", "env",
+         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"',
+         "review-bot-gate-watch.yml"),
     ]
     bad = 0
     for filename, cls, pattern, wf_name in rows:
@@ -163,23 +141,17 @@ def check_owner_fallbacks():
             bad += 1
             continue
         if m.group(1) != default:
-            print(
-                f"\u274c {filename} pages '{m.group(1)}', but _notify.py's {cls} class is "
-                f"'{default}'"
-            )
+            print(f"\u274c {filename} pages '{m.group(1)}', but _notify.py's {cls} class is "
+                  f"'{default}'")
             bad += 1
             continue
         wf = (WORKFLOW.parent / wf_name).read_text(encoding="utf-8")
         if not re.search(r"OWNER_OVERRIDE: \$\{\{ vars\." + var + r" \}\}", wf):
-            print(
-                f"\u274c {filename} defaults to _notify.py's {cls} owner but {wf_name} does "
-                f"not pass {var}"
-            )
+            print(f"\u274c {filename} defaults to _notify.py's {cls} owner but {wf_name} does "
+                  f"not pass {var}")
             bad += 1
             continue
-        print(
-            f"\u2705 {filename} matches _notify.py's {cls} class: {default} via {var}"
-        )
+        print(f"\u2705 {filename} matches _notify.py's {cls} class: {default} via {var}")
     return 1 if bad else 0
 
 
@@ -194,17 +166,13 @@ def check_gate_watch_window():
     m = re.search(r"^WINDOW_MINUTES = (\d+)", gw, re.M)
     c = re.search(r'^\s*- cron: "\*/(\d+) \* \* \* \*"', wf, re.M)
     if not m or not c:
-        print(
-            "\u274c cannot read WINDOW_MINUTES from gate_watch.py or the cron interval from "
-            "review-bot-gate-watch.yml"
-        )
+        print("\u274c cannot read WINDOW_MINUTES from gate_watch.py or the cron interval from "
+              "review-bot-gate-watch.yml")
         return 1
     window, cron = int(m.group(1)), int(c.group(1))
     if window != cron:
-        print(
-            f"\u274c the gate watch polls every {cron} min but its page window is {window} min "
-            f"wide -- exactly-once paging needs the window to be one poll wide"
-        )
+        print(f"\u274c the gate watch polls every {cron} min but its page window is {window} min "
+              f"wide -- exactly-once paging needs the window to be one poll wide")
         return 1
     print(f"\u2705 gate watch page window is one poll wide: {window} min")
     return 0
@@ -217,10 +185,8 @@ def check_no_self_trigger():
     for. The guard is one line and leaves no trace when removed, so assert it."""
     wf = WORKFLOW.read_text(encoding="utf-8")
     if not re.search(r"github\.event\.comment\.user\.login != 'aiter-bot'", wf):
-        print(
-            "\u274c the gate does not exclude the bot's own comments; every notice it posts "
-            "will start a run that competes with real requests"
-        )
+        print("\u274c the gate does not exclude the bot's own comments; every notice it posts "
+              "will start a run that competes with real requests")
         return 1
     print("\u2705 the gate excludes the bot's own comments")
     return 0
@@ -236,22 +202,11 @@ def check_notified_handoff():
     notify = (HERE / "_notify.py").read_text(encoding="utf-8")
     links = [
         ("_notify.py writes the flag", 'fh.write("notified=true' in notify),
-        (
-            "the review job has a step to write it",
-            re.search(r"^\s+id: notify\s*$", wf, re.M),
-        ),
-        (
-            "the review job exports it",
-            re.search(
-                r"^\s+notified: \$\{\{ steps\.notify\.outputs\.notified \}\}", wf, re.M
-            ),
-        ),
-        (
-            "the report job reads it",
-            re.search(
-                r"^\s+NOTIFIED: \$\{\{ needs\.review\.outputs\.notified \}\}", wf, re.M
-            ),
-        ),
+        ("the review job has a step to write it", re.search(r"^\s+id: notify\s*$", wf, re.M)),
+        ("the review job exports it",
+         re.search(r"^\s+notified: \$\{\{ steps\.notify\.outputs\.notified \}\}", wf, re.M)),
+        ("the report job reads it",
+         re.search(r"^\s+NOTIFIED: \$\{\{ needs\.review\.outputs\.notified \}\}", wf, re.M)),
     ]
     broken = [name for name, found in links if not found]
     if broken:
@@ -271,16 +226,11 @@ def check_runner_label_exclusive():
         print("\u274c cannot read the review job's runner label")
         return 1
     label = m.group(1)
-    others = sorted(
-        q.name
-        for q in WORKFLOW.parent.glob("*.y*ml")
-        if q != WORKFLOW and label in q.read_text(encoding="utf-8")
-    )
+    others = sorted(q.name for q in WORKFLOW.parent.glob("*.y*ml")
+                    if q != WORKFLOW and label in q.read_text(encoding="utf-8"))
     if others:
-        print(
-            f"\u274c runner label '{label}' is also targeted by {others}; the watchdog's busy "
-            "check only sees aiter-review-bot runs and would page about a busy, healthy box"
-        )
+        print(f"\u274c runner label '{label}' is also targeted by {others}; the watchdog's busy "
+              "check only sees aiter-review-bot runs and would page about a busy, healthy box")
         return 1
     print(f"\u2705 runner label '{label}' is exclusive to aiter-review-bot.yml")
     return 0
@@ -299,29 +249,22 @@ def check_publish_needs_post_flag():
     wf = WORKFLOW.read_text(encoding="utf-8")
     run_one = (HERE / "run_one.sh").read_text(encoding="utf-8")
     granted = re.search(r"^\s*(issues|pull-requests):\s*write\s*$", wf, re.M)
-    invocations = re.findall(r"[^\n]*_publish\.py[^\n]*", wf) + re.findall(
-        r"[^\n]*_publish\.py[^\n]*", run_one
-    )
+    invocations = re.findall(r"[^\n]*_publish\.py[^\n]*", wf) \
+        + re.findall(r"[^\n]*_publish\.py[^\n]*", run_one)
     has_post = any("--post" in line for line in invocations)
     if granted and not has_post:
-        print(
-            f"\u274c aiter-review-bot.yml grants '{granted.group(0).strip()}' somewhere, "
-            f"but _publish.py is never invoked with --post -- GITHUB_TOKEN scoping is no "
-            f"longer the only thing standing between a job and a post, and _publish.py's "
-            f"missing-flag default (dry-run) must now be an explicit match, not an "
-            f"accident"
-        )
+        print(f"\u274c aiter-review-bot.yml grants '{granted.group(0).strip()}' somewhere, "
+              f"but _publish.py is never invoked with --post -- GITHUB_TOKEN scoping is no "
+              f"longer the only thing standing between a job and a post, and _publish.py's "
+              f"missing-flag default (dry-run) must now be an explicit match, not an "
+              f"accident")
         return 1
     if granted:
-        print(
-            "\u2705 aiter-review-bot.yml grants write, and _publish.py is invoked with "
-            "--post to match it"
-        )
+        print("\u2705 aiter-review-bot.yml grants write, and _publish.py is invoked with "
+              "--post to match it")
         return 0
-    print(
-        "\u2705 aiter-review-bot.yml grants no issues/pull-requests write anywhere; "
-        "_publish.py's missing --post is its only closure, as documented"
-    )
+    print("\u2705 aiter-review-bot.yml grants no issues/pull-requests write anywhere; "
+          "_publish.py's missing --post is its only closure, as documented")
     return 0
 
 
@@ -335,28 +278,22 @@ def check_publish_review_is_advisory():
     bad = 0
     for verdict in ("APPROVE", "REQUEST_CHANGES"):
         if f'"{verdict}"' in src or f"'{verdict}'" in src:
-            print(
-                f"\u274c _publish.py names {verdict}; this bot is advisory and must only ever "
-                f"send event COMMENT -- a review that gates merge changes what the "
-                f"workflow's permissions mean"
-            )
+            print(f"\u274c _publish.py names {verdict}; this bot is advisory and must only ever "
+                  f"send event COMMENT -- a review that gates merge changes what the "
+                  f"workflow's permissions mean")
             bad += 1
     posts = re.findall(r'_api\(\s*f?"([^"]+)"\s*,\s*method="POST"', src)
     if posts != ["pulls/{pr}/reviews"]:
-        print(
-            f"\u274c _publish.py's POST call sites are {posts}; expected exactly one, "
-            f"pulls/{{pr}}/reviews -- the card is published as a review with inline "
-            f"comments, not as a top-level issue comment"
-        )
+        print(f"\u274c _publish.py's POST call sites are {posts}; expected exactly one, "
+              f"pulls/{{pr}}/reviews -- the card is published as a review with inline "
+              f"comments, not as a top-level issue comment")
         bad += 1
     if '"event": "COMMENT"' not in src:
         print("\u274c _publish.py does not set event COMMENT on the review it builds")
         bad += 1
     if not bad:
-        print(
-            "\u2705 _publish.py posts exactly one review, event COMMENT, never APPROVE/"
-            "REQUEST_CHANGES"
-        )
+        print("\u2705 _publish.py posts exactly one review, event COMMENT, never APPROVE/"
+              "REQUEST_CHANGES")
     return bad
 
 
@@ -379,14 +316,10 @@ def check_anchoring_has_a_citation_check():
     if "citations.txt" not in lib:
         broken.append("_lib.py does not collect citations.txt into the report dir")
     if broken:
-        print(
-            "\u274c inline anchoring is wired to nothing: %s -- every finding would "
-            "silently fall back to the summary" % "; ".join(broken)
-        )
+        print("\u274c inline anchoring is wired to nothing: %s -- every finding would "
+              "silently fall back to the summary" % "; ".join(broken))
         return 1
-    print(
-        "\u2705 anchoring wired: run_one.sh -> citations.txt -> _lib.py OPTIONAL -> _publish.py"
-    )
+    print("\u2705 anchoring wired: run_one.sh -> citations.txt -> _lib.py OPTIONAL -> _publish.py")
     return 0
 
 
@@ -419,34 +352,22 @@ def check_range_anchor_shape():
     for c in cs:
         if "start_line" in c:
             if not c["start_line"] < c["line"]:
-                bad.append(
-                    f"start_line {c['start_line']} is not below line {c['line']}"
-                )
+                bad.append(f"start_line {c['start_line']} is not below line {c['line']}")
             if c.get("start_side") != c.get("side"):
-                bad.append(
-                    f"span on {c['path']} names side {c.get('side')!r} but "
-                    f"start_side {c.get('start_side')!r}"
-                )
+                bad.append(f"span on {c['path']} names side {c.get('side')!r} but "
+                           f"start_side {c.get('start_side')!r}")
         elif "start_side" in c:
             bad.append(f"{c['path']}:{c['line']} carries start_side with no start_line")
     spans = [c for c in cs if "start_line" in c]
-    if len(spans) != 1 or (
-        spans and (spans[0]["start_line"], spans[0]["line"]) != (11, 13)
-    ):
-        bad.append(
-            f"expected exactly the one in-hunk span 11-13, got "
-            f"{[(c['start_line'], c['line']) for c in spans]} -- a span across the "
-            f"gap between hunks is refused like any line outside the diff"
-        )
+    if len(spans) != 1 or (spans and (spans[0]["start_line"], spans[0]["line"]) != (11, 13)):
+        bad.append(f"expected exactly the one in-hunk span 11-13, got "
+                   f"{[(c['start_line'], c['line']) for c in spans]} -- a span across the "
+                   f"gap between hunks is refused like any line outside the diff")
     if bad:
-        print(
-            "\u274c _publish.py builds a span anchor GitHub will not take: %s"
-            % "; ".join(bad)
-        )
+        print("\u274c _publish.py builds a span anchor GitHub will not take: %s"
+              % "; ".join(bad))
         return 1
-    print(
-        "\u2705 span anchors well formed: start_line < line, matching sides, inside one hunk"
-    )
+    print("\u2705 span anchors well formed: start_line < line, matching sides, inside one hunk")
     return 0
 
 
@@ -477,14 +398,9 @@ def check_unanchorable_citations_are_linked():
     if "/blob/" in pub.build_review("1", card, diff, None, sha)["body"]:
         bad.append("a card the checker never ran on was still linked")
     if bad:
-        print(
-            "\u274c _publish.py's permalinks are not gated as anchors are: %s"
-            % "; ".join(bad)
-        )
+        print("\u274c _publish.py's permalinks are not gated as anchors are: %s" % "; ".join(bad))
         return 1
-    print(
-        "\u2705 out-of-diff citations linked to the head SHA, and only when the checker vouched"
-    )
+    print("\u2705 out-of-diff citations linked to the head SHA, and only when the checker vouched")
     return 0
 
 
@@ -495,16 +411,12 @@ def main():
         block = extract(skill, start, end)
         prompt_text = (HERE / prompt).read_text(encoding="utf-8")
         if block is None:
-            print(f"? {prompt}: SKILL.md anchors not found -- {start!r} .. {end!r}")
+            print(f"❌ {prompt}: SKILL.md anchors not found — {start!r} .. {end!r}")
             bad += 1
         elif block in prompt_text:
-            print(
-                f"? {prompt}: quoted block matches SKILL.md verbatim ({len(block)} chars)"
-            )
+            print(f"✅ {prompt}: quoted block matches SKILL.md verbatim ({len(block)} chars)")
         else:
-            print(
-                f"? {prompt}: quoted block DRIFTED from SKILL.md -- re-copy the section verbatim"
-            )
+            print(f"❌ {prompt}: quoted block DRIFTED from SKILL.md — re-copy the section verbatim")
             bad += 1
     bad += check_fail_classes()
     bad += check_budget_fits()

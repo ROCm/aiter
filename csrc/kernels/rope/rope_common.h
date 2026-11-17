@@ -3,8 +3,8 @@
 
 #pragma once
 
-#include "aiter_dispatch.h"
 #include "aiter_hip_common.h"
+#include "aiter_dispatch.h"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
 #include "hip_float8.h"
@@ -21,8 +21,7 @@
 // =====================================================================================================================
 //
 //   1c / 2c              Number of input-output tensor pairs.
-//                        1c = one input & one output channel;  2c = two inputs & two outputs
-//                        channels.
+//                        1c = one input & one output channel;  2c = two inputs & two outputs channels.
 //
 //   Cached / Uncached    How cos/sin values are obtained.
 //                        Cached  -- read pre-computed cos/sin from memory.
@@ -45,10 +44,9 @@
 #define ROTATE_STYLE_NEOX 0
 #define ROTATE_STYLE_GPTJ 1
 
-// When ENABLE_ROPE_POSITIONS_INT32 is non-zero at compile time (e.g.
-// -DENABLE_ROPE_POSITIONS_INT32=1), RoPE cached-indirect kernels are also built for int32 positions
-// tensors; dispatch switches on the positions dtype at runtime. When zero, only int64 (long)
-// positions are accepted.
+// When ENABLE_ROPE_POSITIONS_INT32 is non-zero at compile time (e.g. -DENABLE_ROPE_POSITIONS_INT32=1),
+// RoPE cached-indirect kernels are also built for int32 positions tensors; dispatch switches on
+// the positions dtype at runtime. When zero, only int64 (long) positions are accepted.
 
 namespace aiter {
 // =====================================================================================================================
@@ -1004,8 +1002,8 @@ struct OpUncachedFwd
             float output_0[VecPairs], output_1[VecPairs];
             opus::static_for<VecPairs>([&](auto _v) {
                 constexpr int32_t v = _v.value;
-                output_0[v]         = input_0[v] * cos_0[v] - input_1[v] * sin_0[v];
-                output_1[v]         = input_1[v] * cos_1[v] + input_0[v] * sin_1[v];
+                output_0[v] = input_0[v] * cos_0[v] - input_1[v] * sin_0[v];
+                output_1[v] = input_1[v] * cos_1[v] + input_0[v] * sin_1[v];
             });
 
             store_payload_vec<RotateStyle, VecPairs>(g_o,
@@ -1049,7 +1047,7 @@ struct OpUncachedFwd
               bool StrideDOutYEq1,
               bool StrideDInXEq1,
               bool StrideDInYEq1,
-              int32_t VecPairs  = 1,
+              int32_t VecPairs = 1,
               bool DoubleBuffer = true,
               typename scalar_t,
               typename scalar_f_t>
@@ -1108,132 +1106,72 @@ struct OpUncachedFwd
             for(; hid + 1 < size_min_h; hid += 2)
             {
                 float ix0_a[VecPairs], ix1_a[VecPairs], iy0_a[VecPairs], iy1_a[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ix0_a,
-                                                        ix1_a,
-                                                        g_ix,
-                                                        (offset_ix + hid * stride_ix_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
-                load_payload_vec<RotateStyle, VecPairs>(iy0_a,
-                                                        iy1_a,
-                                                        g_iy,
-                                                        (offset_iy + hid * stride_iy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ix0_a, ix1_a, g_ix, (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    iy0_a, iy1_a, g_iy, (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float ix0_b[VecPairs], ix1_b[VecPairs], iy0_b[VecPairs], iy1_b[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ix0_b,
-                                                        ix1_b,
-                                                        g_ix,
-                                                        (offset_ix + (hid + 1) * stride_ix_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
-                load_payload_vec<RotateStyle, VecPairs>(iy0_b,
-                                                        iy1_b,
-                                                        g_iy,
-                                                        (offset_iy + (hid + 1) * stride_iy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ix0_b, ix1_b, g_ix, (offset_ix + (hid + 1) * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    iy0_b, iy1_b, g_iy, (offset_iy + (hid + 1) * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v]              = ix0_a[v] * cos_0[v] - ix1_a[v] * sin_0[v];
-                    ox1[v]              = ix1_a[v] * cos_1[v] + ix0_a[v] * sin_1[v];
-                    oy0[v]              = iy0_a[v] * cos_0[v] - iy1_a[v] * sin_0[v];
-                    oy1[v]              = iy1_a[v] * cos_1[v] + iy0_a[v] * sin_1[v];
+                    ox0[v] = ix0_a[v] * cos_0[v] - ix1_a[v] * sin_0[v];
+                    ox1[v] = ix1_a[v] * cos_1[v] + ix0_a[v] * sin_1[v];
+                    oy0[v] = iy0_a[v] * cos_0[v] - iy1_a[v] * sin_0[v];
+                    oy1[v] = iy1_a[v] * cos_1[v] + iy0_a[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                         ox0,
-                                                         ox1,
-                                                         (offset_ox + hid * stride_ox_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
-                store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                         oy0,
-                                                         oy1,
-                                                         (offset_oy + hid * stride_oy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v]              = ix0_b[v] * cos_0[v] - ix1_b[v] * sin_0[v];
-                    ox1[v]              = ix1_b[v] * cos_1[v] + ix0_b[v] * sin_1[v];
-                    oy0[v]              = iy0_b[v] * cos_0[v] - iy1_b[v] * sin_0[v];
-                    oy1[v]              = iy1_b[v] * cos_1[v] + iy0_b[v] * sin_1[v];
+                    ox0[v] = ix0_b[v] * cos_0[v] - ix1_b[v] * sin_0[v];
+                    ox1[v] = ix1_b[v] * cos_1[v] + ix0_b[v] * sin_1[v];
+                    oy0[v] = iy0_b[v] * cos_0[v] - iy1_b[v] * sin_0[v];
+                    oy1[v] = iy1_b[v] * cos_1[v] + iy0_b[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                         ox0,
-                                                         ox1,
-                                                         (offset_ox + (hid + 1) * stride_ox_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
-                store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                         oy0,
-                                                         oy1,
-                                                         (offset_oy + (hid + 1) * stride_oy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + (hid + 1) * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + (hid + 1) * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
             if(hid < size_min_h)
             {
                 float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ix0,
-                                                        ix1,
-                                                        g_ix,
-                                                        (offset_ix + hid * stride_ix_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
-                load_payload_vec<RotateStyle, VecPairs>(iy0,
-                                                        iy1,
-                                                        g_iy,
-                                                        (offset_iy + hid * stride_iy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ix0, ix1, g_ix, (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    iy0, iy1, g_iy, (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v]              = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                    ox1[v]              = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
-                    oy0[v]              = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                    oy1[v]              = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                         ox0,
-                                                         ox1,
-                                                         (offset_ox + hid * stride_ox_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
-                store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                         oy0,
-                                                         oy1,
-                                                         (offset_oy + hid * stride_oy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
         else
@@ -1241,46 +1179,26 @@ struct OpUncachedFwd
             for(int32_t hid = 0; hid < size_min_h; hid++)
             {
                 float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ix0,
-                                                        ix1,
-                                                        g_ix,
-                                                        (offset_ix + hid * stride_ix_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
-                load_payload_vec<RotateStyle, VecPairs>(iy0,
-                                                        iy1,
-                                                        g_iy,
-                                                        (offset_iy + hid * stride_iy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ix0, ix1, g_ix, (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    iy0, iy1, g_iy, (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v]              = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                    ox1[v]              = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
-                    oy0[v]              = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                    oy1[v]              = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                         ox0,
-                                                         ox1,
-                                                         (offset_ox + hid * stride_ox_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
-                store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                         oy0,
-                                                         oy1,
-                                                         (offset_oy + hid * stride_oy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
 
@@ -1291,78 +1209,48 @@ struct OpUncachedFwd
             for(; hid + 1 < size_h_x; hid += 2)
             {
                 float a0[VecPairs], a1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(a0,
-                                                        a1,
-                                                        g_ix,
-                                                        (offset_ix + hid * stride_ix_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(a0, a1, g_ix,
+                    (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float b0[VecPairs], b1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(b0,
-                                                        b1,
-                                                        g_ix,
-                                                        (offset_ix + (hid + 1) * stride_ix_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(b0, b1, g_ix,
+                    (offset_ix + (hid + 1) * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 float ox0[VecPairs], ox1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v]              = a0[v] * cos_0[v] - a1[v] * sin_0[v];
-                    ox1[v]              = a1[v] * cos_1[v] + a0[v] * sin_1[v];
+                    ox0[v] = a0[v] * cos_0[v] - a1[v] * sin_0[v];
+                    ox1[v] = a1[v] * cos_1[v] + a0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                         ox0,
-                                                         ox1,
-                                                         (offset_ox + hid * stride_ox_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v]              = b0[v] * cos_0[v] - b1[v] * sin_0[v];
-                    ox1[v]              = b1[v] * cos_1[v] + b0[v] * sin_1[v];
+                    ox0[v] = b0[v] * cos_0[v] - b1[v] * sin_0[v];
+                    ox1[v] = b1[v] * cos_1[v] + b0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                         ox0,
-                                                         ox1,
-                                                         (offset_ox + (hid + 1) * stride_ox_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + (hid + 1) * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
             if(hid < size_h_x)
             {
                 float ix0[VecPairs], ix1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ix0,
-                                                        ix1,
-                                                        g_ix,
-                                                        (offset_ix + hid * stride_ix_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, g_ix,
+                    (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float ox0[VecPairs], ox1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v]              = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                    ox1[v]              = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                         ox0,
-                                                         ox1,
-                                                         (offset_ox + hid * stride_ox_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
         else
@@ -1370,28 +1258,18 @@ struct OpUncachedFwd
             for(int32_t hid = size_min_h; hid < size_h_x; hid++)
             {
                 float ix0[VecPairs], ix1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ix0,
-                                                        ix1,
-                                                        g_ix,
-                                                        (offset_ix + hid * stride_ix_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, g_ix,
+                    (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float ox0[VecPairs], ox1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v]              = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                    ox1[v]              = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                         ox0,
-                                                         ox1,
-                                                         (offset_ox + hid * stride_ox_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
 
@@ -1402,78 +1280,48 @@ struct OpUncachedFwd
             for(; hid + 1 < size_h_y; hid += 2)
             {
                 float a0[VecPairs], a1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(a0,
-                                                        a1,
-                                                        g_iy,
-                                                        (offset_iy + hid * stride_iy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(a0, a1, g_iy,
+                    (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float b0[VecPairs], b1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(b0,
-                                                        b1,
-                                                        g_iy,
-                                                        (offset_iy + (hid + 1) * stride_iy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(b0, b1, g_iy,
+                    (offset_iy + (hid + 1) * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 float oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    oy0[v]              = a0[v] * cos_0[v] - a1[v] * sin_0[v];
-                    oy1[v]              = a1[v] * cos_1[v] + a0[v] * sin_1[v];
+                    oy0[v] = a0[v] * cos_0[v] - a1[v] * sin_0[v];
+                    oy1[v] = a1[v] * cos_1[v] + a0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                         oy0,
-                                                         oy1,
-                                                         (offset_oy + hid * stride_oy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    oy0[v]              = b0[v] * cos_0[v] - b1[v] * sin_0[v];
-                    oy1[v]              = b1[v] * cos_1[v] + b0[v] * sin_1[v];
+                    oy0[v] = b0[v] * cos_0[v] - b1[v] * sin_0[v];
+                    oy1[v] = b1[v] * cos_1[v] + b0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                         oy0,
-                                                         oy1,
-                                                         (offset_oy + (hid + 1) * stride_oy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + (hid + 1) * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
             if(hid < size_h_y)
             {
                 float iy0[VecPairs], iy1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(iy0,
-                                                        iy1,
-                                                        g_iy,
-                                                        (offset_iy + hid * stride_iy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, g_iy,
+                    (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    oy0[v]              = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                    oy1[v]              = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                         oy0,
-                                                         oy1,
-                                                         (offset_oy + hid * stride_oy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
         else
@@ -1481,28 +1329,18 @@ struct OpUncachedFwd
             for(int32_t hid = size_min_h; hid < size_h_y; hid++)
             {
                 float iy0[VecPairs], iy1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(iy0,
-                                                        iy1,
-                                                        g_iy,
-                                                        (offset_iy + hid * stride_iy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, g_iy,
+                    (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    oy0[v]              = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                    oy1[v]              = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                         oy0,
-                                                         oy1,
-                                                         (offset_oy + hid * stride_oy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
 
@@ -1604,8 +1442,8 @@ struct OpUncachedBwd
             float ig0[VecPairs], ig1[VecPairs];
             opus::static_for<VecPairs>([&](auto _v) {
                 constexpr int32_t v = _v.value;
-                ig0[v]              = og0[v] * cos_0[v] + og1[v] * sin_0[v];
-                ig1[v]              = og1[v] * cos_1[v] - og0[v] * sin_1[v];
+                ig0[v] = og0[v] * cos_0[v] + og1[v] * sin_0[v];
+                ig1[v] = og1[v] * cos_1[v] - og0[v] * sin_1[v];
             });
 
             store_payload_vec<RotateStyle, VecPairs>(g_ig,
@@ -1649,7 +1487,7 @@ struct OpUncachedBwd
               bool StrideDInGradsYEq1,
               bool StrideDOutGradsXEq1,
               bool StrideDOutGradsYEq1,
-              int32_t VecPairs  = 1,
+              int32_t VecPairs = 1,
               bool DoubleBuffer = true,
               typename scalar_t,
               typename scalar_f_t>
@@ -1708,132 +1546,72 @@ struct OpUncachedBwd
             for(; hid + 1 < size_min_h; hid += 2)
             {
                 float ogx0_a[VecPairs], ogx1_a[VecPairs], ogy0_a[VecPairs], ogy1_a[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ogx0_a,
-                                                        ogx1_a,
-                                                        g_ogx,
-                                                        (offset_ogx + hid * stride_ox_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
-                load_payload_vec<RotateStyle, VecPairs>(ogy0_a,
-                                                        ogy1_a,
-                                                        g_ogy,
-                                                        (offset_ogy + hid * stride_oy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogx0_a, ogx1_a, g_ogx, (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogy0_a, ogy1_a, g_ogy, (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float ogx0_b[VecPairs], ogx1_b[VecPairs], ogy0_b[VecPairs], ogy1_b[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ogx0_b,
-                                                        ogx1_b,
-                                                        g_ogx,
-                                                        (offset_ogx + (hid + 1) * stride_ox_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
-                load_payload_vec<RotateStyle, VecPairs>(ogy0_b,
-                                                        ogy1_b,
-                                                        g_ogy,
-                                                        (offset_ogy + (hid + 1) * stride_oy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogx0_b, ogx1_b, g_ogx, (offset_ogx + (hid + 1) * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogy0_b, ogy1_b, g_ogy, (offset_ogy + (hid + 1) * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igx0[v]             = ogx0_a[v] * cos_0[v] + ogx1_a[v] * sin_0[v];
-                    igx1[v]             = ogx1_a[v] * cos_1[v] - ogx0_a[v] * sin_1[v];
-                    igy0[v]             = ogy0_a[v] * cos_0[v] + ogy1_a[v] * sin_0[v];
-                    igy1[v]             = ogy1_a[v] * cos_1[v] - ogy0_a[v] * sin_1[v];
+                    igx0[v] = ogx0_a[v] * cos_0[v] + ogx1_a[v] * sin_0[v];
+                    igx1[v] = ogx1_a[v] * cos_1[v] - ogx0_a[v] * sin_1[v];
+                    igy0[v] = ogy0_a[v] * cos_0[v] + ogy1_a[v] * sin_0[v];
+                    igy1[v] = ogy1_a[v] * cos_1[v] - ogy0_a[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                         igx0,
-                                                         igx1,
-                                                         (offset_igx + hid * stride_ix_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
-                store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                         igy0,
-                                                         igy1,
-                                                         (offset_igy + hid * stride_iy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igx0[v]             = ogx0_b[v] * cos_0[v] + ogx1_b[v] * sin_0[v];
-                    igx1[v]             = ogx1_b[v] * cos_1[v] - ogx0_b[v] * sin_1[v];
-                    igy0[v]             = ogy0_b[v] * cos_0[v] + ogy1_b[v] * sin_0[v];
-                    igy1[v]             = ogy1_b[v] * cos_1[v] - ogy0_b[v] * sin_1[v];
+                    igx0[v] = ogx0_b[v] * cos_0[v] + ogx1_b[v] * sin_0[v];
+                    igx1[v] = ogx1_b[v] * cos_1[v] - ogx0_b[v] * sin_1[v];
+                    igy0[v] = ogy0_b[v] * cos_0[v] + ogy1_b[v] * sin_0[v];
+                    igy1[v] = ogy1_b[v] * cos_1[v] - ogy0_b[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                         igx0,
-                                                         igx1,
-                                                         (offset_igx + (hid + 1) * stride_ix_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
-                store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                         igy0,
-                                                         igy1,
-                                                         (offset_igy + (hid + 1) * stride_iy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + (hid + 1) * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + (hid + 1) * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
             if(hid < size_min_h)
             {
                 float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ogx0,
-                                                        ogx1,
-                                                        g_ogx,
-                                                        (offset_ogx + hid * stride_ox_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
-                load_payload_vec<RotateStyle, VecPairs>(ogy0,
-                                                        ogy1,
-                                                        g_ogy,
-                                                        (offset_ogy + hid * stride_oy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogx0, ogx1, g_ogx, (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogy0, ogy1, g_ogy, (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igx0[v]             = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
-                    igx1[v]             = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
-                    igy0[v]             = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
-                    igy1[v]             = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                    igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                    igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                    igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                    igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                         igx0,
-                                                         igx1,
-                                                         (offset_igx + hid * stride_ix_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
-                store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                         igy0,
-                                                         igy1,
-                                                         (offset_igy + hid * stride_iy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
         else
@@ -1841,46 +1619,26 @@ struct OpUncachedBwd
             for(int32_t hid = 0; hid < size_min_h; hid++)
             {
                 float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ogx0,
-                                                        ogx1,
-                                                        g_ogx,
-                                                        (offset_ogx + hid * stride_ox_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
-                load_payload_vec<RotateStyle, VecPairs>(ogy0,
-                                                        ogy1,
-                                                        g_ogy,
-                                                        (offset_ogy + hid * stride_oy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogx0, ogx1, g_ogx, (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogy0, ogy1, g_ogy, (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igx0[v]             = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
-                    igx1[v]             = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
-                    igy0[v]             = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
-                    igy1[v]             = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                    igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                    igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                    igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                    igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                         igx0,
-                                                         igx1,
-                                                         (offset_igx + hid * stride_ix_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
-                store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                         igy0,
-                                                         igy1,
-                                                         (offset_igy + hid * stride_iy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
 
@@ -1891,78 +1649,48 @@ struct OpUncachedBwd
             for(; hid + 1 < size_h_x; hid += 2)
             {
                 float a0[VecPairs], a1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(a0,
-                                                        a1,
-                                                        g_ogx,
-                                                        (offset_ogx + hid * stride_ox_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(a0, a1, g_ogx,
+                    (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float b0[VecPairs], b1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(b0,
-                                                        b1,
-                                                        g_ogx,
-                                                        (offset_ogx + (hid + 1) * stride_ox_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(b0, b1, g_ogx,
+                    (offset_ogx + (hid + 1) * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 float igx0[VecPairs], igx1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igx0[v]             = a0[v] * cos_0[v] + a1[v] * sin_0[v];
-                    igx1[v]             = a1[v] * cos_1[v] - a0[v] * sin_1[v];
+                    igx0[v] = a0[v] * cos_0[v] + a1[v] * sin_0[v];
+                    igx1[v] = a1[v] * cos_1[v] - a0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                         igx0,
-                                                         igx1,
-                                                         (offset_igx + hid * stride_ix_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igx0[v]             = b0[v] * cos_0[v] + b1[v] * sin_0[v];
-                    igx1[v]             = b1[v] * cos_1[v] - b0[v] * sin_1[v];
+                    igx0[v] = b0[v] * cos_0[v] + b1[v] * sin_0[v];
+                    igx1[v] = b1[v] * cos_1[v] - b0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                         igx0,
-                                                         igx1,
-                                                         (offset_igx + (hid + 1) * stride_ix_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + (hid + 1) * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
             if(hid < size_h_x)
             {
                 float ogx0[VecPairs], ogx1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ogx0,
-                                                        ogx1,
-                                                        g_ogx,
-                                                        (offset_ogx + hid * stride_ox_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, g_ogx,
+                    (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float igx0[VecPairs], igx1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igx0[v]             = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
-                    igx1[v]             = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                    igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                    igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                         igx0,
-                                                         igx1,
-                                                         (offset_igx + hid * stride_ix_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
         else
@@ -1970,28 +1698,18 @@ struct OpUncachedBwd
             for(int32_t hid = size_min_h; hid < size_h_x; hid++)
             {
                 float ogx0[VecPairs], ogx1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ogx0,
-                                                        ogx1,
-                                                        g_ogx,
-                                                        (offset_ogx + hid * stride_ox_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, g_ogx,
+                    (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float igx0[VecPairs], igx1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igx0[v]             = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
-                    igx1[v]             = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                    igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                    igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                         igx0,
-                                                         igx1,
-                                                         (offset_igx + hid * stride_ix_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
 
@@ -2002,78 +1720,48 @@ struct OpUncachedBwd
             for(; hid + 1 < size_h_y; hid += 2)
             {
                 float a0[VecPairs], a1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(a0,
-                                                        a1,
-                                                        g_ogy,
-                                                        (offset_ogy + hid * stride_oy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(a0, a1, g_ogy,
+                    (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float b0[VecPairs], b1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(b0,
-                                                        b1,
-                                                        g_ogy,
-                                                        (offset_ogy + (hid + 1) * stride_oy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(b0, b1, g_ogy,
+                    (offset_ogy + (hid + 1) * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 float igy0[VecPairs], igy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igy0[v]             = a0[v] * cos_0[v] + a1[v] * sin_0[v];
-                    igy1[v]             = a1[v] * cos_1[v] - a0[v] * sin_1[v];
+                    igy0[v] = a0[v] * cos_0[v] + a1[v] * sin_0[v];
+                    igy1[v] = a1[v] * cos_1[v] - a0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                         igy0,
-                                                         igy1,
-                                                         (offset_igy + hid * stride_iy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igy0[v]             = b0[v] * cos_0[v] + b1[v] * sin_0[v];
-                    igy1[v]             = b1[v] * cos_1[v] - b0[v] * sin_1[v];
+                    igy0[v] = b0[v] * cos_0[v] + b1[v] * sin_0[v];
+                    igy1[v] = b1[v] * cos_1[v] - b0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                         igy0,
-                                                         igy1,
-                                                         (offset_igy + (hid + 1) * stride_iy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + (hid + 1) * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
             if(hid < size_h_y)
             {
                 float ogy0[VecPairs], ogy1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ogy0,
-                                                        ogy1,
-                                                        g_ogy,
-                                                        (offset_ogy + hid * stride_oy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, g_ogy,
+                    (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float igy0[VecPairs], igy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igy0[v]             = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
-                    igy1[v]             = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                    igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                    igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                         igy0,
-                                                         igy1,
-                                                         (offset_igy + hid * stride_iy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
         else
@@ -2081,28 +1769,18 @@ struct OpUncachedBwd
             for(int32_t hid = size_min_h; hid < size_h_y; hid++)
             {
                 float ogy0[VecPairs], ogy1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ogy0,
-                                                        ogy1,
-                                                        g_ogy,
-                                                        (offset_ogy + hid * stride_oy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, g_ogy,
+                    (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float igy0[VecPairs], igy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igy0[v]             = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
-                    igy1[v]             = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                    igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                    igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                         igy0,
-                                                         igy1,
-                                                         (offset_igy + hid * stride_iy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
 
@@ -2206,8 +1884,8 @@ struct OpCachedFwd
             float output_0[VecPairs], output_1[VecPairs];
             opus::static_for<VecPairs>([&](auto _v) {
                 constexpr int32_t v = _v.value;
-                output_0[v]         = input_0[v] * cos_0[v] - input_1[v] * sin_0[v];
-                output_1[v]         = input_1[v] * cos_1[v] + input_0[v] * sin_1[v];
+                output_0[v] = input_0[v] * cos_0[v] - input_1[v] * sin_0[v];
+                output_1[v] = input_1[v] * cos_1[v] + input_0[v] * sin_1[v];
             });
 
             store_payload_vec<RotateStyle, VecPairs>(g_o,
@@ -2251,7 +1929,7 @@ struct OpCachedFwd
               bool StrideDOutYEq1,
               bool StrideDInXEq1,
               bool StrideDInYEq1,
-              int32_t VecPairs  = 1,
+              int32_t VecPairs = 1,
               bool DoubleBuffer = true,
               typename scalar_t,
               typename scalar_f_t>
@@ -2312,132 +1990,72 @@ struct OpCachedFwd
             for(; hid + 1 < size_min_h; hid += 2)
             {
                 float ix0_a[VecPairs], ix1_a[VecPairs], iy0_a[VecPairs], iy1_a[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ix0_a,
-                                                        ix1_a,
-                                                        g_ix,
-                                                        (offset_ix + hid * stride_ix_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
-                load_payload_vec<RotateStyle, VecPairs>(iy0_a,
-                                                        iy1_a,
-                                                        g_iy,
-                                                        (offset_iy + hid * stride_iy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ix0_a, ix1_a, g_ix, (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    iy0_a, iy1_a, g_iy, (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float ix0_b[VecPairs], ix1_b[VecPairs], iy0_b[VecPairs], iy1_b[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ix0_b,
-                                                        ix1_b,
-                                                        g_ix,
-                                                        (offset_ix + (hid + 1) * stride_ix_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
-                load_payload_vec<RotateStyle, VecPairs>(iy0_b,
-                                                        iy1_b,
-                                                        g_iy,
-                                                        (offset_iy + (hid + 1) * stride_iy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ix0_b, ix1_b, g_ix, (offset_ix + (hid + 1) * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    iy0_b, iy1_b, g_iy, (offset_iy + (hid + 1) * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v]              = ix0_a[v] * cos_0[v] - ix1_a[v] * sin_0[v];
-                    ox1[v]              = ix1_a[v] * cos_1[v] + ix0_a[v] * sin_1[v];
-                    oy0[v]              = iy0_a[v] * cos_0[v] - iy1_a[v] * sin_0[v];
-                    oy1[v]              = iy1_a[v] * cos_1[v] + iy0_a[v] * sin_1[v];
+                    ox0[v] = ix0_a[v] * cos_0[v] - ix1_a[v] * sin_0[v];
+                    ox1[v] = ix1_a[v] * cos_1[v] + ix0_a[v] * sin_1[v];
+                    oy0[v] = iy0_a[v] * cos_0[v] - iy1_a[v] * sin_0[v];
+                    oy1[v] = iy1_a[v] * cos_1[v] + iy0_a[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                         ox0,
-                                                         ox1,
-                                                         (offset_ox + hid * stride_ox_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
-                store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                         oy0,
-                                                         oy1,
-                                                         (offset_oy + hid * stride_oy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v]              = ix0_b[v] * cos_0[v] - ix1_b[v] * sin_0[v];
-                    ox1[v]              = ix1_b[v] * cos_1[v] + ix0_b[v] * sin_1[v];
-                    oy0[v]              = iy0_b[v] * cos_0[v] - iy1_b[v] * sin_0[v];
-                    oy1[v]              = iy1_b[v] * cos_1[v] + iy0_b[v] * sin_1[v];
+                    ox0[v] = ix0_b[v] * cos_0[v] - ix1_b[v] * sin_0[v];
+                    ox1[v] = ix1_b[v] * cos_1[v] + ix0_b[v] * sin_1[v];
+                    oy0[v] = iy0_b[v] * cos_0[v] - iy1_b[v] * sin_0[v];
+                    oy1[v] = iy1_b[v] * cos_1[v] + iy0_b[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                         ox0,
-                                                         ox1,
-                                                         (offset_ox + (hid + 1) * stride_ox_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
-                store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                         oy0,
-                                                         oy1,
-                                                         (offset_oy + (hid + 1) * stride_oy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + (hid + 1) * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + (hid + 1) * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
             if(hid < size_min_h)
             {
                 float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ix0,
-                                                        ix1,
-                                                        g_ix,
-                                                        (offset_ix + hid * stride_ix_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
-                load_payload_vec<RotateStyle, VecPairs>(iy0,
-                                                        iy1,
-                                                        g_iy,
-                                                        (offset_iy + hid * stride_iy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ix0, ix1, g_ix, (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    iy0, iy1, g_iy, (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v]              = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                    ox1[v]              = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
-                    oy0[v]              = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                    oy1[v]              = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                         ox0,
-                                                         ox1,
-                                                         (offset_ox + hid * stride_ox_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
-                store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                         oy0,
-                                                         oy1,
-                                                         (offset_oy + hid * stride_oy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
         else
@@ -2445,46 +2063,26 @@ struct OpCachedFwd
             for(int32_t hid = 0; hid < size_min_h; hid++)
             {
                 float ix0[VecPairs], ix1[VecPairs], iy0[VecPairs], iy1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ix0,
-                                                        ix1,
-                                                        g_ix,
-                                                        (offset_ix + hid * stride_ix_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
-                load_payload_vec<RotateStyle, VecPairs>(iy0,
-                                                        iy1,
-                                                        g_iy,
-                                                        (offset_iy + hid * stride_iy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ix0, ix1, g_ix, (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    iy0, iy1, g_iy, (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float ox0[VecPairs], ox1[VecPairs], oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v]              = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                    ox1[v]              = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
-                    oy0[v]              = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                    oy1[v]              = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                         ox0,
-                                                         ox1,
-                                                         (offset_ox + hid * stride_ox_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
-                store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                         oy0,
-                                                         oy1,
-                                                         (offset_oy + hid * stride_oy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
 
@@ -2495,78 +2093,48 @@ struct OpCachedFwd
             for(; hid + 1 < size_h_x; hid += 2)
             {
                 float a0[VecPairs], a1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(a0,
-                                                        a1,
-                                                        g_ix,
-                                                        (offset_ix + hid * stride_ix_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(a0, a1, g_ix,
+                    (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float b0[VecPairs], b1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(b0,
-                                                        b1,
-                                                        g_ix,
-                                                        (offset_ix + (hid + 1) * stride_ix_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(b0, b1, g_ix,
+                    (offset_ix + (hid + 1) * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 float ox0[VecPairs], ox1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v]              = a0[v] * cos_0[v] - a1[v] * sin_0[v];
-                    ox1[v]              = a1[v] * cos_1[v] + a0[v] * sin_1[v];
+                    ox0[v] = a0[v] * cos_0[v] - a1[v] * sin_0[v];
+                    ox1[v] = a1[v] * cos_1[v] + a0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                         ox0,
-                                                         ox1,
-                                                         (offset_ox + hid * stride_ox_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v]              = b0[v] * cos_0[v] - b1[v] * sin_0[v];
-                    ox1[v]              = b1[v] * cos_1[v] + b0[v] * sin_1[v];
+                    ox0[v] = b0[v] * cos_0[v] - b1[v] * sin_0[v];
+                    ox1[v] = b1[v] * cos_1[v] + b0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                         ox0,
-                                                         ox1,
-                                                         (offset_ox + (hid + 1) * stride_ox_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + (hid + 1) * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
             if(hid < size_h_x)
             {
                 float ix0[VecPairs], ix1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ix0,
-                                                        ix1,
-                                                        g_ix,
-                                                        (offset_ix + hid * stride_ix_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, g_ix,
+                    (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float ox0[VecPairs], ox1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v]              = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                    ox1[v]              = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                         ox0,
-                                                         ox1,
-                                                         (offset_ox + hid * stride_ox_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
         else
@@ -2574,28 +2142,18 @@ struct OpCachedFwd
             for(int32_t hid = size_min_h; hid < size_h_x; hid++)
             {
                 float ix0[VecPairs], ix1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ix0,
-                                                        ix1,
-                                                        g_ix,
-                                                        (offset_ix + hid * stride_ix_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(ix0, ix1, g_ix,
+                    (offset_ix + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float ox0[VecPairs], ox1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    ox0[v]              = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
-                    ox1[v]              = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
+                    ox0[v] = ix0[v] * cos_0[v] - ix1[v] * sin_0[v];
+                    ox1[v] = ix1[v] * cos_1[v] + ix0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_ox,
-                                                         ox0,
-                                                         ox1,
-                                                         (offset_ox + hid * stride_ox_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_ox, ox0, ox1,
+                    (offset_ox + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
 
@@ -2606,78 +2164,48 @@ struct OpCachedFwd
             for(; hid + 1 < size_h_y; hid += 2)
             {
                 float a0[VecPairs], a1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(a0,
-                                                        a1,
-                                                        g_iy,
-                                                        (offset_iy + hid * stride_iy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(a0, a1, g_iy,
+                    (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float b0[VecPairs], b1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(b0,
-                                                        b1,
-                                                        g_iy,
-                                                        (offset_iy + (hid + 1) * stride_iy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(b0, b1, g_iy,
+                    (offset_iy + (hid + 1) * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 float oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    oy0[v]              = a0[v] * cos_0[v] - a1[v] * sin_0[v];
-                    oy1[v]              = a1[v] * cos_1[v] + a0[v] * sin_1[v];
+                    oy0[v] = a0[v] * cos_0[v] - a1[v] * sin_0[v];
+                    oy1[v] = a1[v] * cos_1[v] + a0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                         oy0,
-                                                         oy1,
-                                                         (offset_oy + hid * stride_oy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    oy0[v]              = b0[v] * cos_0[v] - b1[v] * sin_0[v];
-                    oy1[v]              = b1[v] * cos_1[v] + b0[v] * sin_1[v];
+                    oy0[v] = b0[v] * cos_0[v] - b1[v] * sin_0[v];
+                    oy1[v] = b1[v] * cos_1[v] + b0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                         oy0,
-                                                         oy1,
-                                                         (offset_oy + (hid + 1) * stride_oy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + (hid + 1) * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
             if(hid < size_h_y)
             {
                 float iy0[VecPairs], iy1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(iy0,
-                                                        iy1,
-                                                        g_iy,
-                                                        (offset_iy + hid * stride_iy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, g_iy,
+                    (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    oy0[v]              = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                    oy1[v]              = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                         oy0,
-                                                         oy1,
-                                                         (offset_oy + hid * stride_oy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
         else
@@ -2685,28 +2213,18 @@ struct OpCachedFwd
             for(int32_t hid = size_min_h; hid < size_h_y; hid++)
             {
                 float iy0[VecPairs], iy1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(iy0,
-                                                        iy1,
-                                                        g_iy,
-                                                        (offset_iy + hid * stride_iy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(iy0, iy1, g_iy,
+                    (offset_iy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float oy0[VecPairs], oy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    oy0[v]              = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
-                    oy1[v]              = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
+                    oy0[v] = iy0[v] * cos_0[v] - iy1[v] * sin_0[v];
+                    oy1[v] = iy1[v] * cos_1[v] + iy0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_oy,
-                                                         oy0,
-                                                         oy1,
-                                                         (offset_oy + hid * stride_oy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_oy, oy0, oy1,
+                    (offset_oy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
 
@@ -2810,8 +2328,8 @@ struct OpCachedBwd
             float ig0[VecPairs], ig1[VecPairs];
             opus::static_for<VecPairs>([&](auto _v) {
                 constexpr int32_t v = _v.value;
-                ig0[v]              = og0[v] * cos_0[v] + og1[v] * sin_0[v];
-                ig1[v]              = og1[v] * cos_1[v] - og0[v] * sin_1[v];
+                ig0[v] = og0[v] * cos_0[v] + og1[v] * sin_0[v];
+                ig1[v] = og1[v] * cos_1[v] - og0[v] * sin_1[v];
             });
 
             store_payload_vec<RotateStyle, VecPairs>(g_ig,
@@ -2855,7 +2373,7 @@ struct OpCachedBwd
               bool StrideDInGradsYEq1,
               bool StrideDOutGradsXEq1,
               bool StrideDOutGradsYEq1,
-              int32_t VecPairs  = 1,
+              int32_t VecPairs = 1,
               bool DoubleBuffer = true,
               typename scalar_t,
               typename scalar_f_t>
@@ -2916,132 +2434,72 @@ struct OpCachedBwd
             for(; hid + 1 < size_min_h; hid += 2)
             {
                 float ogx0_a[VecPairs], ogx1_a[VecPairs], ogy0_a[VecPairs], ogy1_a[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ogx0_a,
-                                                        ogx1_a,
-                                                        g_ogx,
-                                                        (offset_ogx + hid * stride_ox_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
-                load_payload_vec<RotateStyle, VecPairs>(ogy0_a,
-                                                        ogy1_a,
-                                                        g_ogy,
-                                                        (offset_ogy + hid * stride_oy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogx0_a, ogx1_a, g_ogx, (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogy0_a, ogy1_a, g_ogy, (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float ogx0_b[VecPairs], ogx1_b[VecPairs], ogy0_b[VecPairs], ogy1_b[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ogx0_b,
-                                                        ogx1_b,
-                                                        g_ogx,
-                                                        (offset_ogx + (hid + 1) * stride_ox_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
-                load_payload_vec<RotateStyle, VecPairs>(ogy0_b,
-                                                        ogy1_b,
-                                                        g_ogy,
-                                                        (offset_ogy + (hid + 1) * stride_oy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogx0_b, ogx1_b, g_ogx, (offset_ogx + (hid + 1) * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogy0_b, ogy1_b, g_ogy, (offset_ogy + (hid + 1) * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igx0[v]             = ogx0_a[v] * cos_0[v] + ogx1_a[v] * sin_0[v];
-                    igx1[v]             = ogx1_a[v] * cos_1[v] - ogx0_a[v] * sin_1[v];
-                    igy0[v]             = ogy0_a[v] * cos_0[v] + ogy1_a[v] * sin_0[v];
-                    igy1[v]             = ogy1_a[v] * cos_1[v] - ogy0_a[v] * sin_1[v];
+                    igx0[v] = ogx0_a[v] * cos_0[v] + ogx1_a[v] * sin_0[v];
+                    igx1[v] = ogx1_a[v] * cos_1[v] - ogx0_a[v] * sin_1[v];
+                    igy0[v] = ogy0_a[v] * cos_0[v] + ogy1_a[v] * sin_0[v];
+                    igy1[v] = ogy1_a[v] * cos_1[v] - ogy0_a[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                         igx0,
-                                                         igx1,
-                                                         (offset_igx + hid * stride_ix_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
-                store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                         igy0,
-                                                         igy1,
-                                                         (offset_igy + hid * stride_iy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igx0[v]             = ogx0_b[v] * cos_0[v] + ogx1_b[v] * sin_0[v];
-                    igx1[v]             = ogx1_b[v] * cos_1[v] - ogx0_b[v] * sin_1[v];
-                    igy0[v]             = ogy0_b[v] * cos_0[v] + ogy1_b[v] * sin_0[v];
-                    igy1[v]             = ogy1_b[v] * cos_1[v] - ogy0_b[v] * sin_1[v];
+                    igx0[v] = ogx0_b[v] * cos_0[v] + ogx1_b[v] * sin_0[v];
+                    igx1[v] = ogx1_b[v] * cos_1[v] - ogx0_b[v] * sin_1[v];
+                    igy0[v] = ogy0_b[v] * cos_0[v] + ogy1_b[v] * sin_0[v];
+                    igy1[v] = ogy1_b[v] * cos_1[v] - ogy0_b[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                         igx0,
-                                                         igx1,
-                                                         (offset_igx + (hid + 1) * stride_ix_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
-                store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                         igy0,
-                                                         igy1,
-                                                         (offset_igy + (hid + 1) * stride_iy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + (hid + 1) * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + (hid + 1) * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
             if(hid < size_min_h)
             {
                 float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ogx0,
-                                                        ogx1,
-                                                        g_ogx,
-                                                        (offset_ogx + hid * stride_ox_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
-                load_payload_vec<RotateStyle, VecPairs>(ogy0,
-                                                        ogy1,
-                                                        g_ogy,
-                                                        (offset_ogy + hid * stride_oy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogx0, ogx1, g_ogx, (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogy0, ogy1, g_ogy, (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igx0[v]             = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
-                    igx1[v]             = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
-                    igy0[v]             = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
-                    igy1[v]             = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                    igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                    igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                    igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                    igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                         igx0,
-                                                         igx1,
-                                                         (offset_igx + hid * stride_ix_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
-                store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                         igy0,
-                                                         igy1,
-                                                         (offset_igy + hid * stride_iy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
         else
@@ -3049,46 +2507,26 @@ struct OpCachedBwd
             for(int32_t hid = 0; hid < size_min_h; hid++)
             {
                 float ogx0[VecPairs], ogx1[VecPairs], ogy0[VecPairs], ogy1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ogx0,
-                                                        ogx1,
-                                                        g_ogx,
-                                                        (offset_ogx + hid * stride_ox_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
-                load_payload_vec<RotateStyle, VecPairs>(ogy0,
-                                                        ogy1,
-                                                        g_ogy,
-                                                        (offset_ogy + hid * stride_oy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogx0, ogx1, g_ogx, (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(
+                    ogy0, ogy1, g_ogy, (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float igx0[VecPairs], igx1[VecPairs], igy0[VecPairs], igy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igx0[v]             = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
-                    igx1[v]             = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
-                    igy0[v]             = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
-                    igy1[v]             = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                    igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                    igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                    igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                    igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                         igx0,
-                                                         igx1,
-                                                         (offset_igx + hid * stride_ix_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
-                store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                         igy0,
-                                                         igy1,
-                                                         (offset_igy + hid * stride_iy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
 
@@ -3099,78 +2537,48 @@ struct OpCachedBwd
             for(; hid + 1 < size_h_x; hid += 2)
             {
                 float a0[VecPairs], a1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(a0,
-                                                        a1,
-                                                        g_ogx,
-                                                        (offset_ogx + hid * stride_ox_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(a0, a1, g_ogx,
+                    (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float b0[VecPairs], b1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(b0,
-                                                        b1,
-                                                        g_ogx,
-                                                        (offset_ogx + (hid + 1) * stride_ox_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(b0, b1, g_ogx,
+                    (offset_ogx + (hid + 1) * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 float igx0[VecPairs], igx1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igx0[v]             = a0[v] * cos_0[v] + a1[v] * sin_0[v];
-                    igx1[v]             = a1[v] * cos_1[v] - a0[v] * sin_1[v];
+                    igx0[v] = a0[v] * cos_0[v] + a1[v] * sin_0[v];
+                    igx1[v] = a1[v] * cos_1[v] - a0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                         igx0,
-                                                         igx1,
-                                                         (offset_igx + hid * stride_ix_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igx0[v]             = b0[v] * cos_0[v] + b1[v] * sin_0[v];
-                    igx1[v]             = b1[v] * cos_1[v] - b0[v] * sin_1[v];
+                    igx0[v] = b0[v] * cos_0[v] + b1[v] * sin_0[v];
+                    igx1[v] = b1[v] * cos_1[v] - b0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                         igx0,
-                                                         igx1,
-                                                         (offset_igx + (hid + 1) * stride_ix_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + (hid + 1) * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
             if(hid < size_h_x)
             {
                 float ogx0[VecPairs], ogx1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ogx0,
-                                                        ogx1,
-                                                        g_ogx,
-                                                        (offset_ogx + hid * stride_ox_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, g_ogx,
+                    (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float igx0[VecPairs], igx1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igx0[v]             = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
-                    igx1[v]             = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                    igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                    igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                         igx0,
-                                                         igx1,
-                                                         (offset_igx + hid * stride_ix_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
         else
@@ -3178,28 +2586,18 @@ struct OpCachedBwd
             for(int32_t hid = size_min_h; hid < size_h_x; hid++)
             {
                 float ogx0[VecPairs], ogx1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ogx0,
-                                                        ogx1,
-                                                        g_ogx,
-                                                        (offset_ogx + hid * stride_ox_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(ogx0, ogx1, g_ogx,
+                    (offset_ogx + hid * stride_ox_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float igx0[VecPairs], igx1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igx0[v]             = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
-                    igx1[v]             = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
+                    igx0[v] = ogx0[v] * cos_0[v] + ogx1[v] * sin_0[v];
+                    igx1[v] = ogx1[v] * cos_1[v] - ogx0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igx,
-                                                         igx0,
-                                                         igx1,
-                                                         (offset_igx + hid * stride_ix_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igx, igx0, igx1,
+                    (offset_igx + hid * stride_ix_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
 
@@ -3210,78 +2608,48 @@ struct OpCachedBwd
             for(; hid + 1 < size_h_y; hid += 2)
             {
                 float a0[VecPairs], a1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(a0,
-                                                        a1,
-                                                        g_ogy,
-                                                        (offset_ogy + hid * stride_oy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(a0, a1, g_ogy,
+                    (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float b0[VecPairs], b1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(b0,
-                                                        b1,
-                                                        g_ogy,
-                                                        (offset_ogy + (hid + 1) * stride_oy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(b0, b1, g_ogy,
+                    (offset_ogy + (hid + 1) * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 float igy0[VecPairs], igy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igy0[v]             = a0[v] * cos_0[v] + a1[v] * sin_0[v];
-                    igy1[v]             = a1[v] * cos_1[v] - a0[v] * sin_1[v];
+                    igy0[v] = a0[v] * cos_0[v] + a1[v] * sin_0[v];
+                    igy1[v] = a1[v] * cos_1[v] - a0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                         igy0,
-                                                         igy1,
-                                                         (offset_igy + hid * stride_iy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
 
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igy0[v]             = b0[v] * cos_0[v] + b1[v] * sin_0[v];
-                    igy1[v]             = b1[v] * cos_1[v] - b0[v] * sin_1[v];
+                    igy0[v] = b0[v] * cos_0[v] + b1[v] * sin_0[v];
+                    igy1[v] = b1[v] * cos_1[v] - b0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                         igy0,
-                                                         igy1,
-                                                         (offset_igy + (hid + 1) * stride_iy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + (hid + 1) * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
             if(hid < size_h_y)
             {
                 float ogy0[VecPairs], ogy1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ogy0,
-                                                        ogy1,
-                                                        g_ogy,
-                                                        (offset_ogy + hid * stride_oy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, g_ogy,
+                    (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float igy0[VecPairs], igy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igy0[v]             = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
-                    igy1[v]             = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                    igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                    igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                         igy0,
-                                                         igy1,
-                                                         (offset_igy + hid * stride_iy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
         else
@@ -3289,28 +2657,18 @@ struct OpCachedBwd
             for(int32_t hid = size_min_h; hid < size_h_y; hid++)
             {
                 float ogy0[VecPairs], ogy1[VecPairs];
-                load_payload_vec<RotateStyle, VecPairs>(ogy0,
-                                                        ogy1,
-                                                        g_ogy,
-                                                        (offset_ogy + hid * stride_oy_h) *
-                                                            elem_bytes,
-                                                        did_pair,
-                                                        did_start,
-                                                        size_half_r);
+                load_payload_vec<RotateStyle, VecPairs>(ogy0, ogy1, g_ogy,
+                    (offset_ogy + hid * stride_oy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
                 float igy0[VecPairs], igy1[VecPairs];
                 opus::static_for<VecPairs>([&](auto _v) {
                     constexpr int32_t v = _v.value;
-                    igy0[v]             = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
-                    igy1[v]             = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
+                    igy0[v] = ogy0[v] * cos_0[v] + ogy1[v] * sin_0[v];
+                    igy1[v] = ogy1[v] * cos_1[v] - ogy0[v] * sin_1[v];
                 });
-                store_payload_vec<RotateStyle, VecPairs>(g_igy,
-                                                         igy0,
-                                                         igy1,
-                                                         (offset_igy + hid * stride_iy_h) *
-                                                             elem_bytes,
-                                                         did_pair,
-                                                         did_start,
-                                                         size_half_r);
+                store_payload_vec<RotateStyle, VecPairs>(g_igy, igy0, igy1,
+                    (offset_igy + hid * stride_iy_h) * elem_bytes,
+                    did_pair, did_start, size_half_r);
             }
         }
 
@@ -3481,7 +2839,7 @@ template <typename Op,
           bool StrideDOutYEq1,
           bool StrideDInXEq1,
           bool StrideDInYEq1,
-          int32_t VecPairs  = 1,
+          int32_t VecPairs = 1,
           bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t>
@@ -3539,29 +2897,29 @@ __launch_bounds__(256, 8) __global__
                           StrideDInYEq1,
                           VecPairs,
                           DoubleBuffer>(p_output_x,
-                                        p_output_y,
-                                        p_input_x,
-                                        p_input_y,
-                                        offset_ox,
-                                        offset_oy,
-                                        offset_ix,
-                                        offset_iy,
-                                        p_freqs,
-                                        (int32_t)offset_f,
-                                        size_h_x,
-                                        size_h_y,
-                                        size_d,
-                                        size_f,
-                                        stride_ix_h,
-                                        stride_ix_d,
-                                        stride_iy_h,
-                                        stride_iy_d,
-                                        stride_ox_h,
-                                        stride_ox_d,
-                                        stride_oy_h,
-                                        stride_oy_d,
-                                        d_chunk_idx,
-                                        threads_per_sb);
+                                    p_output_y,
+                                    p_input_x,
+                                    p_input_y,
+                                    offset_ox,
+                                    offset_oy,
+                                    offset_ix,
+                                    offset_iy,
+                                    p_freqs,
+                                    (int32_t)offset_f,
+                                    size_h_x,
+                                    size_h_y,
+                                    size_d,
+                                    size_f,
+                                    stride_ix_h,
+                                    stride_ix_d,
+                                    stride_iy_h,
+                                    stride_iy_d,
+                                    stride_ox_h,
+                                    stride_ox_d,
+                                    stride_oy_h,
+                                    stride_oy_d,
+                                    d_chunk_idx,
+                                    threads_per_sb);
 }
 
 template <typename Op,
@@ -3570,7 +2928,7 @@ template <typename Op,
           bool NopeFirst,
           bool StrideDXEq1,
           bool StrideDYEq1,
-          int32_t VecPairs  = 1,
+          int32_t VecPairs = 1,
           bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t>
@@ -3616,29 +2974,29 @@ __launch_bounds__(256, 8) __global__
                           StrideDYEq1,
                           VecPairs,
                           DoubleBuffer>(p_inout_x,
-                                        p_inout_y,
-                                        p_inout_x,
-                                        p_inout_y,
-                                        offset_x,
-                                        offset_y,
-                                        offset_x,
-                                        offset_y,
-                                        p_freqs,
-                                        (int32_t)offset_f,
-                                        size_h_x,
-                                        size_h_y,
-                                        size_d,
-                                        size_f,
-                                        stride_x_h,
-                                        stride_x_d,
-                                        stride_y_h,
-                                        stride_y_d,
-                                        stride_x_h,
-                                        stride_x_d,
-                                        stride_y_h,
-                                        stride_y_d,
-                                        d_chunk_idx,
-                                        threads_per_sb);
+                                    p_inout_y,
+                                    p_inout_x,
+                                    p_inout_y,
+                                    offset_x,
+                                    offset_y,
+                                    offset_x,
+                                    offset_y,
+                                    p_freqs,
+                                    (int32_t)offset_f,
+                                    size_h_x,
+                                    size_h_y,
+                                    size_d,
+                                    size_f,
+                                    stride_x_h,
+                                    stride_x_d,
+                                    stride_y_h,
+                                    stride_y_d,
+                                    stride_x_h,
+                                    stride_x_d,
+                                    stride_y_h,
+                                    stride_y_d,
+                                    d_chunk_idx,
+                                    threads_per_sb);
 }
 
 template <typename Op,
@@ -3772,7 +3130,7 @@ template <typename Op,
           bool StrideDOutYEq1,
           bool StrideDInXEq1,
           bool StrideDInYEq1,
-          int32_t VecPairs  = 1,
+          int32_t VecPairs = 1,
           bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t>
@@ -3831,30 +3189,30 @@ __launch_bounds__(256, 8) __global__
                           StrideDInYEq1,
                           VecPairs,
                           DoubleBuffer>(p_output_x,
-                                        p_output_y,
-                                        p_input_x,
-                                        p_input_y,
-                                        (int32_t)offset_ox,
-                                        (int32_t)offset_oy,
-                                        (int32_t)offset_ix,
-                                        (int32_t)offset_iy,
-                                        p_cos,
-                                        p_sin,
-                                        (int32_t)offset_f,
-                                        size_h_x,
-                                        size_h_y,
-                                        size_d,
-                                        size_f,
-                                        stride_ix_h,
-                                        stride_ix_d,
-                                        stride_iy_h,
-                                        stride_iy_d,
-                                        stride_ox_h,
-                                        stride_ox_d,
-                                        stride_oy_h,
-                                        stride_oy_d,
-                                        d_chunk_idx,
-                                        threads_per_sb);
+                                    p_output_y,
+                                    p_input_x,
+                                    p_input_y,
+                                    (int32_t)offset_ox,
+                                    (int32_t)offset_oy,
+                                    (int32_t)offset_ix,
+                                    (int32_t)offset_iy,
+                                    p_cos,
+                                    p_sin,
+                                    (int32_t)offset_f,
+                                    size_h_x,
+                                    size_h_y,
+                                    size_d,
+                                    size_f,
+                                    stride_ix_h,
+                                    stride_ix_d,
+                                    stride_iy_h,
+                                    stride_iy_d,
+                                    stride_ox_h,
+                                    stride_ox_d,
+                                    stride_oy_h,
+                                    stride_oy_d,
+                                    d_chunk_idx,
+                                    threads_per_sb);
 }
 
 template <typename Op,
@@ -3863,7 +3221,7 @@ template <typename Op,
           bool NopeFirst,
           bool StrideDXEq1,
           bool StrideDYEq1,
-          int32_t VecPairs  = 1,
+          int32_t VecPairs = 1,
           bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t>
@@ -3910,30 +3268,30 @@ __launch_bounds__(256, 8) __global__
                           StrideDYEq1,
                           VecPairs,
                           DoubleBuffer>(p_inout_x,
-                                        p_inout_y,
-                                        p_inout_x,
-                                        p_inout_y,
-                                        (int32_t)offset_x,
-                                        (int32_t)offset_y,
-                                        (int32_t)offset_x,
-                                        (int32_t)offset_y,
-                                        p_cos,
-                                        p_sin,
-                                        (int32_t)offset_f,
-                                        size_h_x,
-                                        size_h_y,
-                                        size_d,
-                                        size_f,
-                                        stride_x_h,
-                                        stride_x_d,
-                                        stride_y_h,
-                                        stride_y_d,
-                                        stride_x_h,
-                                        stride_x_d,
-                                        stride_y_h,
-                                        stride_y_d,
-                                        d_chunk_idx,
-                                        threads_per_sb);
+                                    p_inout_y,
+                                    p_inout_x,
+                                    p_inout_y,
+                                    (int32_t)offset_x,
+                                    (int32_t)offset_y,
+                                    (int32_t)offset_x,
+                                    (int32_t)offset_y,
+                                    p_cos,
+                                    p_sin,
+                                    (int32_t)offset_f,
+                                    size_h_x,
+                                    size_h_y,
+                                    size_d,
+                                    size_f,
+                                    stride_x_h,
+                                    stride_x_d,
+                                    stride_y_h,
+                                    stride_y_d,
+                                    stride_x_h,
+                                    stride_x_d,
+                                    stride_y_h,
+                                    stride_y_d,
+                                    d_chunk_idx,
+                                    threads_per_sb);
 }
 
 template <typename Op,
@@ -4018,7 +3376,7 @@ template <typename Op,
           bool StrideDOutYEq1,
           bool StrideDInXEq1,
           bool StrideDInYEq1,
-          int32_t VecPairs  = 1,
+          int32_t VecPairs = 1,
           bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t,
@@ -4084,31 +3442,31 @@ __launch_bounds__(256, 8) __global__
                               StrideDInXEq1,
                               StrideDInYEq1,
                               VecPairs,
-                              DoubleBuffer>(p_output_x,
-                                            p_output_y,
-                                            p_input_x,
-                                            p_input_y,
-                                            (int32_t)offset_ox,
-                                            (int32_t)offset_oy,
-                                            (int32_t)offset_ix,
-                                            (int32_t)offset_iy,
-                                            p_cos,
-                                            p_sin,
-                                            (int32_t)offset_f,
-                                            size_h_x,
-                                            size_h_y,
-                                            size_d,
-                                            size_f,
-                                            stride_ix_h,
-                                            stride_ix_d,
-                                            stride_iy_h,
-                                            stride_iy_d,
-                                            stride_ox_h,
-                                            stride_ox_d,
-                                            stride_oy_h,
-                                            stride_oy_d,
-                                            d_chunk_idx,
-                                            threads_per_sb);
+                          DoubleBuffer>(p_output_x,
+                                        p_output_y,
+                                        p_input_x,
+                                        p_input_y,
+                                        (int32_t)offset_ox,
+                                        (int32_t)offset_oy,
+                                        (int32_t)offset_ix,
+                                        (int32_t)offset_iy,
+                                        p_cos,
+                                        p_sin,
+                                        (int32_t)offset_f,
+                                        size_h_x,
+                                        size_h_y,
+                                        size_d,
+                                        size_f,
+                                        stride_ix_h,
+                                        stride_ix_d,
+                                        stride_iy_h,
+                                        stride_iy_d,
+                                        stride_ox_h,
+                                        stride_ox_d,
+                                        stride_oy_h,
+                                        stride_oy_d,
+                                        d_chunk_idx,
+                                        threads_per_sb);
     }
 }
 
@@ -4185,7 +3543,7 @@ template <typename Op,
           bool NopeFirst,
           bool StrideDXEq1,
           bool StrideDYEq1,
-          int32_t VecPairs  = 1,
+          int32_t VecPairs = 1,
           bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t,
@@ -4239,31 +3597,31 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect_inpla
                               StrideDXEq1,
                               StrideDYEq1,
                               VecPairs,
-                              DoubleBuffer>(p_inout_x,
-                                            p_inout_y,
-                                            p_inout_x,
-                                            p_inout_y,
-                                            (int32_t)offset_x,
-                                            (int32_t)offset_y,
-                                            (int32_t)offset_x,
-                                            (int32_t)offset_y,
-                                            p_cos,
-                                            p_sin,
-                                            (int32_t)offset_f,
-                                            size_h_x,
-                                            size_h_y,
-                                            size_d,
-                                            size_f,
-                                            stride_x_h,
-                                            stride_x_d,
-                                            stride_y_h,
-                                            stride_y_d,
-                                            stride_x_h,
-                                            stride_x_d,
-                                            stride_y_h,
-                                            stride_y_d,
-                                            d_chunk_idx,
-                                            threads_per_sb);
+                          DoubleBuffer>(p_inout_x,
+                                        p_inout_y,
+                                        p_inout_x,
+                                        p_inout_y,
+                                        (int32_t)offset_x,
+                                        (int32_t)offset_y,
+                                        (int32_t)offset_x,
+                                        (int32_t)offset_y,
+                                        p_cos,
+                                        p_sin,
+                                        (int32_t)offset_f,
+                                        size_h_x,
+                                        size_h_y,
+                                        size_d,
+                                        size_f,
+                                        stride_x_h,
+                                        stride_x_d,
+                                        stride_y_h,
+                                        stride_y_d,
+                                        stride_x_h,
+                                        stride_x_d,
+                                        stride_y_h,
+                                        stride_y_d,
+                                        d_chunk_idx,
+                                        threads_per_sb);
     }
 }
 
@@ -4350,7 +3708,7 @@ template <typename Op,
           bool StrideDOutYEq1,
           bool StrideDInXEq1,
           bool StrideDInYEq1,
-          int32_t VecPairs  = 1,
+          int32_t VecPairs = 1,
           bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t,
@@ -4417,31 +3775,31 @@ __launch_bounds__(256, 8) __global__
                               StrideDInXEq1,
                               StrideDInYEq1,
                               VecPairs,
-                              DoubleBuffer>(p_output_x,
-                                            p_output_y,
-                                            p_input_x,
-                                            p_input_y,
-                                            (int32_t)offset_ox,
-                                            (int32_t)offset_oy,
-                                            (int32_t)offset_ix,
-                                            (int32_t)offset_iy,
-                                            p_cos,
-                                            p_sin,
-                                            (int32_t)offset_f,
-                                            size_h_x,
-                                            size_h_y,
-                                            size_d,
-                                            size_f,
-                                            stride_ix_h,
-                                            stride_ix_d,
-                                            stride_iy_h,
-                                            stride_iy_d,
-                                            stride_ox_h,
-                                            stride_ox_d,
-                                            stride_oy_h,
-                                            stride_oy_d,
-                                            d_chunk_idx,
-                                            threads_per_sb);
+                          DoubleBuffer>(p_output_x,
+                                        p_output_y,
+                                        p_input_x,
+                                        p_input_y,
+                                        (int32_t)offset_ox,
+                                        (int32_t)offset_oy,
+                                        (int32_t)offset_ix,
+                                        (int32_t)offset_iy,
+                                        p_cos,
+                                        p_sin,
+                                        (int32_t)offset_f,
+                                        size_h_x,
+                                        size_h_y,
+                                        size_d,
+                                        size_f,
+                                        stride_ix_h,
+                                        stride_ix_d,
+                                        stride_iy_h,
+                                        stride_iy_d,
+                                        stride_ox_h,
+                                        stride_ox_d,
+                                        stride_oy_h,
+                                        stride_oy_d,
+                                        d_chunk_idx,
+                                        threads_per_sb);
     }
 }
 
@@ -4519,7 +3877,7 @@ template <typename Op,
           bool NopeFirst,
           bool StrideDXEq1,
           bool StrideDYEq1,
-          int32_t VecPairs  = 1,
+          int32_t VecPairs = 1,
           bool DoubleBuffer = true,
           typename scalar_t,
           typename scalar_f_t,
@@ -4574,31 +3932,31 @@ __launch_bounds__(256, 8) __global__ void kn_entry_2c_sbhd_cached_indirect2_inpl
                               StrideDXEq1,
                               StrideDYEq1,
                               VecPairs,
-                              DoubleBuffer>(p_inout_x,
-                                            p_inout_y,
-                                            p_inout_x,
-                                            p_inout_y,
-                                            (int32_t)offset_x,
-                                            (int32_t)offset_y,
-                                            (int32_t)offset_x,
-                                            (int32_t)offset_y,
-                                            p_cos,
-                                            p_sin,
-                                            (int32_t)offset_f,
-                                            size_h_x,
-                                            size_h_y,
-                                            size_d,
-                                            size_f,
-                                            stride_x_h,
-                                            stride_x_d,
-                                            stride_y_h,
-                                            stride_y_d,
-                                            stride_x_h,
-                                            stride_x_d,
-                                            stride_y_h,
-                                            stride_y_d,
-                                            d_chunk_idx,
-                                            threads_per_sb);
+                          DoubleBuffer>(p_inout_x,
+                                        p_inout_y,
+                                        p_inout_x,
+                                        p_inout_y,
+                                        (int32_t)offset_x,
+                                        (int32_t)offset_y,
+                                        (int32_t)offset_x,
+                                        (int32_t)offset_y,
+                                        p_cos,
+                                        p_sin,
+                                        (int32_t)offset_f,
+                                        size_h_x,
+                                        size_h_y,
+                                        size_d,
+                                        size_f,
+                                        stride_x_h,
+                                        stride_x_d,
+                                        stride_y_h,
+                                        stride_y_d,
+                                        stride_x_h,
+                                        stride_x_d,
+                                        stride_y_h,
+                                        stride_y_d,
+                                        d_chunk_idx,
+                                        threads_per_sb);
     }
 }
 
@@ -5097,7 +4455,10 @@ __launch_bounds__(256, 8) __global__
         }                                                      \
     }
 
-template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool Is2D, typename scalar_t>
+template <int32_t RotateStyle,
+          bool ReuseFreqsFrontPart,
+          bool Is2D,
+          typename scalar_t>
 std::tuple<dim3, dim3, int32_t, int32_t> get_grid_config(const int32_t size_s_h,
                                                          const int32_t size_s_w,
                                                          const int32_t size_b,
@@ -5363,27 +4724,59 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
     auto [grid, block, vec_pairs, threads_per_sb] =
         get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(
             size_s, 1, size_b, size_f, all_stride_d_eq_1);
-    const int32_t total_sb   = size_s * size_b;
+    const int32_t total_sb = size_s * size_b;
     const bool double_buffer = (min(size_h_x, size_h_y) <= 32);
 
     LAUNCH_KERNEL_VEC_PAIRS(
         vec_pairs,
         LAUNCH_KERNEL_DOUBLE_BUFFER(
             double_buffer,
-            if((p_output_x == p_input_x) && (p_output_y == p_input_y)) {
-                assert(stride_ix_s == stride_ox_s);
-                assert(stride_ix_b == stride_ox_b);
-                assert(stride_ix_h == stride_ox_h);
-                assert(stride_ix_d == stride_ox_d);
-                assert(stride_iy_s == stride_oy_s);
-                assert(stride_iy_b == stride_oy_b);
-                assert(stride_iy_h == stride_oy_h);
-                assert(stride_iy_d == stride_oy_d);
+        if((p_output_x == p_input_x) && (p_output_y == p_input_y)) {
+            assert(stride_ix_s == stride_ox_s);
+            assert(stride_ix_b == stride_ox_b);
+            assert(stride_ix_h == stride_ox_h);
+            assert(stride_ix_d == stride_ox_d);
+            assert(stride_iy_s == stride_oy_s);
+            assert(stride_iy_b == stride_oy_b);
+            assert(stride_iy_h == stride_oy_h);
+            assert(stride_iy_d == stride_oy_d);
 
-                if constexpr(AllStrideDEq1)
-                {
-                    constexpr bool Stride0Eq1 = true;
-                    constexpr bool Stride1Eq1 = true;
+            if constexpr(AllStrideDEq1)
+            {
+                constexpr bool Stride0Eq1 = true;
+                constexpr bool Stride1Eq1 = true;
+                kn_entry_2c_sbhd_uncached_inplace<Op,
+                                                  RotateStyle,
+                                                  ReuseFreqsFrontPart,
+                                                  NopeFirst,
+                                                  Stride0Eq1,
+                                                  Stride1Eq1,
+                                                  VP,
+                                                  DB><<<grid, block, 0, stream>>>(p_output_x,
+                                                                                  p_output_y,
+                                                                                  p_freqs,
+                                                                                  size_h_x,
+                                                                                  size_h_y,
+                                                                                  size_d,
+                                                                                  size_f,
+                                                                                  stride_ix_s,
+                                                                                  stride_ix_b,
+                                                                                  stride_ix_h,
+                                                                                  stride_ix_d,
+                                                                                  stride_iy_s,
+                                                                                  stride_iy_b,
+                                                                                  stride_iy_h,
+                                                                                  stride_iy_d,
+                                                                                  size_s,
+                                                                                  threads_per_sb,
+                                                                                  total_sb);
+            }
+            else
+            {
+                LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+                    RotateStyle,
+                    stride_ix_d,
+                    stride_iy_d,
                     kn_entry_2c_sbhd_uncached_inplace<Op,
                                                       RotateStyle,
                                                       ReuseFreqsFrontPart,
@@ -5392,65 +4785,78 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
                                                       Stride1Eq1,
                                                       VP,
                                                       DB>
-                        <<<grid, block, 0, stream>>>(p_output_x,
-                                                     p_output_y,
-                                                     p_freqs,
-                                                     size_h_x,
-                                                     size_h_y,
-                                                     size_d,
-                                                     size_f,
-                                                     stride_ix_s,
-                                                     stride_ix_b,
-                                                     stride_ix_h,
-                                                     stride_ix_d,
-                                                     stride_iy_s,
-                                                     stride_iy_b,
-                                                     stride_iy_h,
-                                                     stride_iy_d,
-                                                     size_s,
-                                                     threads_per_sb,
-                                                     total_sb);
-                }
-                else
-                {
-                    LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
-                        RotateStyle,
-                        stride_ix_d,
-                        stride_iy_d,
-                        kn_entry_2c_sbhd_uncached_inplace<Op,
-                                                          RotateStyle,
-                                                          ReuseFreqsFrontPart,
-                                                          NopeFirst,
-                                                          Stride0Eq1,
-                                                          Stride1Eq1,
-                                                          VP,
-                                                          DB>
-                        <<<grid, block, 0, stream>>>(p_output_x,
-                                                     p_output_y,
-                                                     p_freqs,
-                                                     size_h_x,
-                                                     size_h_y,
-                                                     size_d,
-                                                     size_f,
-                                                     stride_ix_s,
-                                                     stride_ix_b,
-                                                     stride_ix_h,
-                                                     stride_ix_d,
-                                                     stride_iy_s,
-                                                     stride_iy_b,
-                                                     stride_iy_h,
-                                                     stride_iy_d,
-                                                     size_s,
-                                                     threads_per_sb,
-                                                     total_sb););
-                }
-            } else {
-                if constexpr(AllStrideDEq1)
-                {
-                    constexpr bool Stride0Eq1 = true;
-                    constexpr bool Stride1Eq1 = true;
-                    constexpr bool Stride2Eq1 = true;
-                    constexpr bool Stride3Eq1 = true;
+                    <<<grid, block, 0, stream>>>(p_output_x,
+                                                 p_output_y,
+                                                 p_freqs,
+                                                 size_h_x,
+                                                 size_h_y,
+                                                 size_d,
+                                                 size_f,
+                                                 stride_ix_s,
+                                                 stride_ix_b,
+                                                 stride_ix_h,
+                                                 stride_ix_d,
+                                                 stride_iy_s,
+                                                 stride_iy_b,
+                                                 stride_iy_h,
+                                                 stride_iy_d,
+                                                 size_s,
+                                                 threads_per_sb,
+                                                 total_sb););
+            }
+        } else {
+            if constexpr(AllStrideDEq1)
+            {
+                constexpr bool Stride0Eq1 = true;
+                constexpr bool Stride1Eq1 = true;
+                constexpr bool Stride2Eq1 = true;
+                constexpr bool Stride3Eq1 = true;
+                kn_entry_2c_sbhd_uncached<Op,
+                                          RotateStyle,
+                                          ReuseFreqsFrontPart,
+                                          NopeFirst,
+                                          Stride0Eq1,
+                                          Stride1Eq1,
+                                          Stride2Eq1,
+                                          Stride3Eq1,
+                                          VP,
+                                          DB><<<grid, block, 0, stream>>>(p_output_x,
+                                                                          p_output_y,
+                                                                          p_input_x,
+                                                                          p_input_y,
+                                                                          p_freqs,
+                                                                          size_h_x,
+                                                                          size_h_y,
+                                                                          size_d,
+                                                                          size_f,
+                                                                          stride_ix_s,
+                                                                          stride_ix_b,
+                                                                          stride_ix_h,
+                                                                          stride_ix_d,
+                                                                          stride_iy_s,
+                                                                          stride_iy_b,
+                                                                          stride_iy_h,
+                                                                          stride_iy_d,
+                                                                          stride_ox_s,
+                                                                          stride_ox_b,
+                                                                          stride_ox_h,
+                                                                          stride_ox_d,
+                                                                          stride_oy_s,
+                                                                          stride_oy_b,
+                                                                          stride_oy_h,
+                                                                          stride_oy_d,
+                                                                          size_s,
+                                                                          threads_per_sb,
+                                                                          total_sb);
+            }
+            else
+            {
+                LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
+                    RotateStyle,
+                    stride_ox_d,
+                    stride_oy_d,
+                    stride_ix_d,
+                    stride_iy_d,
                     kn_entry_2c_sbhd_uncached<Op,
                                               RotateStyle,
                                               ReuseFreqsFrontPart,
@@ -5487,55 +4893,9 @@ void dispatch_2c_sbhd_uncached(scalar_t* __restrict__ p_output_x,
                                                                               stride_oy_d,
                                                                               size_s,
                                                                               threads_per_sb,
-                                                                              total_sb);
-                }
-                else
-                {
-                    LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
-                        RotateStyle,
-                        stride_ox_d,
-                        stride_oy_d,
-                        stride_ix_d,
-                        stride_iy_d,
-                        kn_entry_2c_sbhd_uncached<Op,
-                                                  RotateStyle,
-                                                  ReuseFreqsFrontPart,
-                                                  NopeFirst,
-                                                  Stride0Eq1,
-                                                  Stride1Eq1,
-                                                  Stride2Eq1,
-                                                  Stride3Eq1,
-                                                  VP,
-                                                  DB><<<grid, block, 0, stream>>>(p_output_x,
-                                                                                  p_output_y,
-                                                                                  p_input_x,
-                                                                                  p_input_y,
-                                                                                  p_freqs,
-                                                                                  size_h_x,
-                                                                                  size_h_y,
-                                                                                  size_d,
-                                                                                  size_f,
-                                                                                  stride_ix_s,
-                                                                                  stride_ix_b,
-                                                                                  stride_ix_h,
-                                                                                  stride_ix_d,
-                                                                                  stride_iy_s,
-                                                                                  stride_iy_b,
-                                                                                  stride_iy_h,
-                                                                                  stride_iy_d,
-                                                                                  stride_ox_s,
-                                                                                  stride_ox_b,
-                                                                                  stride_ox_h,
-                                                                                  stride_ox_d,
-                                                                                  stride_oy_s,
-                                                                                  stride_oy_b,
-                                                                                  stride_oy_h,
-                                                                                  stride_oy_d,
-                                                                                  size_s,
-                                                                                  threads_per_sb,
-                                                                                  total_sb););
-                }
-            }));
+                                                                              total_sb););
+            }
+        }));
 }
 
 template <typename Op,
@@ -5732,27 +5092,60 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
     auto [grid, block, vec_pairs, threads_per_sb] =
         get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(
             size_s, 1, size_b, size_f, all_stride_d_eq_1);
-    const int32_t total_sb   = size_s * size_b;
+    const int32_t total_sb = size_s * size_b;
     const bool double_buffer = (min(size_h_x, size_h_y) <= 32);
 
     LAUNCH_KERNEL_VEC_PAIRS(
         vec_pairs,
         LAUNCH_KERNEL_DOUBLE_BUFFER(
             double_buffer,
-            if((p_output_x == p_input_x) && (p_output_y == p_input_y)) {
-                assert(stride_ix_s == stride_ox_s);
-                assert(stride_ix_b == stride_ox_b);
-                assert(stride_ix_h == stride_ox_h);
-                assert(stride_ix_d == stride_ox_d);
-                assert(stride_iy_s == stride_oy_s);
-                assert(stride_iy_b == stride_oy_b);
-                assert(stride_iy_h == stride_oy_h);
-                assert(stride_iy_d == stride_oy_d);
+        if((p_output_x == p_input_x) && (p_output_y == p_input_y)) {
+            assert(stride_ix_s == stride_ox_s);
+            assert(stride_ix_b == stride_ox_b);
+            assert(stride_ix_h == stride_ox_h);
+            assert(stride_ix_d == stride_ox_d);
+            assert(stride_iy_s == stride_oy_s);
+            assert(stride_iy_b == stride_oy_b);
+            assert(stride_iy_h == stride_oy_h);
+            assert(stride_iy_d == stride_oy_d);
 
-                if constexpr(AllStrideDEq1)
-                {
-                    constexpr bool Stride0Eq1 = true;
-                    constexpr bool Stride1Eq1 = true;
+            if constexpr(AllStrideDEq1)
+            {
+                constexpr bool Stride0Eq1 = true;
+                constexpr bool Stride1Eq1 = true;
+                kn_entry_2c_sbhd_cached_inplace<Op,
+                                                RotateStyle,
+                                                ReuseFreqsFrontPart,
+                                                NopeFirst,
+                                                Stride0Eq1,
+                                                Stride1Eq1,
+                                                VP,
+                                                DB><<<grid, block, 0, stream>>>(p_output_x,
+                                                                                p_output_y,
+                                                                                p_cos,
+                                                                                p_sin,
+                                                                                size_h_x,
+                                                                                size_h_y,
+                                                                                size_d,
+                                                                                size_f,
+                                                                                stride_ix_s,
+                                                                                stride_ix_b,
+                                                                                stride_ix_h,
+                                                                                stride_ix_d,
+                                                                                stride_iy_s,
+                                                                                stride_iy_b,
+                                                                                stride_iy_h,
+                                                                                stride_iy_d,
+                                                                                size_s,
+                                                                                threads_per_sb,
+                                                                                total_sb);
+            }
+            else
+            {
+                LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+                    RotateStyle,
+                    stride_ix_d,
+                    stride_iy_d,
                     kn_entry_2c_sbhd_cached_inplace<Op,
                                                     RotateStyle,
                                                     ReuseFreqsFrontPart,
@@ -5778,136 +5171,102 @@ void dispatch_2c_sbhd_cached(scalar_t* __restrict__ p_output_x,
                                                                                     stride_iy_d,
                                                                                     size_s,
                                                                                     threads_per_sb,
-                                                                                    total_sb);
-                }
-                else
-                {
-                    LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
-                        RotateStyle,
-                        stride_ix_d,
-                        stride_iy_d,
-                        kn_entry_2c_sbhd_cached_inplace<Op,
-                                                        RotateStyle,
-                                                        ReuseFreqsFrontPart,
-                                                        NopeFirst,
-                                                        Stride0Eq1,
-                                                        Stride1Eq1,
-                                                        VP,
-                                                        DB>
-                        <<<grid, block, 0, stream>>>(p_output_x,
-                                                     p_output_y,
-                                                     p_cos,
-                                                     p_sin,
-                                                     size_h_x,
-                                                     size_h_y,
-                                                     size_d,
-                                                     size_f,
-                                                     stride_ix_s,
-                                                     stride_ix_b,
-                                                     stride_ix_h,
-                                                     stride_ix_d,
-                                                     stride_iy_s,
-                                                     stride_iy_b,
-                                                     stride_iy_h,
-                                                     stride_iy_d,
-                                                     size_s,
-                                                     threads_per_sb,
-                                                     total_sb););
-                }
-            } else {
-                if constexpr(AllStrideDEq1)
-                {
-                    constexpr bool Stride0Eq1 = true;
-                    constexpr bool Stride1Eq1 = true;
-                    constexpr bool Stride2Eq1 = true;
-                    constexpr bool Stride3Eq1 = true;
-                    kn_entry_2c_sbhd_cached<Op,
-                                            RotateStyle,
-                                            ReuseFreqsFrontPart,
-                                            NopeFirst,
-                                            Stride0Eq1,
-                                            Stride1Eq1,
-                                            Stride2Eq1,
-                                            Stride3Eq1,
-                                            VP,
-                                            DB><<<grid, block, 0, stream>>>(p_output_x,
-                                                                            p_output_y,
-                                                                            p_input_x,
-                                                                            p_input_y,
-                                                                            p_cos,
-                                                                            p_sin,
-                                                                            size_h_x,
-                                                                            size_h_y,
-                                                                            size_d,
-                                                                            size_f,
-                                                                            stride_ix_s,
-                                                                            stride_ix_b,
-                                                                            stride_ix_h,
-                                                                            stride_ix_d,
-                                                                            stride_iy_s,
-                                                                            stride_iy_b,
-                                                                            stride_iy_h,
-                                                                            stride_iy_d,
-                                                                            stride_ox_s,
-                                                                            stride_ox_b,
-                                                                            stride_ox_h,
-                                                                            stride_ox_d,
-                                                                            stride_oy_s,
-                                                                            stride_oy_b,
-                                                                            stride_oy_h,
-                                                                            stride_oy_d,
-                                                                            size_s,
-                                                                            threads_per_sb,
-                                                                            total_sb);
-                }
-                else
-                {
-                    LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
-                        RotateStyle,
-                        stride_ox_d,
-                        stride_oy_d,
-                        stride_ix_d,
-                        stride_iy_d,
-                        kn_entry_2c_sbhd_cached<Op,
-                                                RotateStyle,
-                                                ReuseFreqsFrontPart,
-                                                NopeFirst,
-                                                Stride0Eq1,
-                                                Stride1Eq1,
-                                                Stride2Eq1,
-                                                Stride3Eq1,
-                                                VP,
-                                                DB><<<grid, block, 0, stream>>>(p_output_x,
-                                                                                p_output_y,
-                                                                                p_input_x,
-                                                                                p_input_y,
-                                                                                p_cos,
-                                                                                p_sin,
-                                                                                size_h_x,
-                                                                                size_h_y,
-                                                                                size_d,
-                                                                                size_f,
-                                                                                stride_ix_s,
-                                                                                stride_ix_b,
-                                                                                stride_ix_h,
-                                                                                stride_ix_d,
-                                                                                stride_iy_s,
-                                                                                stride_iy_b,
-                                                                                stride_iy_h,
-                                                                                stride_iy_d,
-                                                                                stride_ox_s,
-                                                                                stride_ox_b,
-                                                                                stride_ox_h,
-                                                                                stride_ox_d,
-                                                                                stride_oy_s,
-                                                                                stride_oy_b,
-                                                                                stride_oy_h,
-                                                                                stride_oy_d,
-                                                                                size_s,
-                                                                                threads_per_sb,
-                                                                                total_sb););
-                }
-            }));
+                                                                                    total_sb););
+            }
+        } else {
+            if constexpr(AllStrideDEq1)
+            {
+                constexpr bool Stride0Eq1 = true;
+                constexpr bool Stride1Eq1 = true;
+                constexpr bool Stride2Eq1 = true;
+                constexpr bool Stride3Eq1 = true;
+                kn_entry_2c_sbhd_cached<Op,
+                                        RotateStyle,
+                                        ReuseFreqsFrontPart,
+                                        NopeFirst,
+                                        Stride0Eq1,
+                                        Stride1Eq1,
+                                        Stride2Eq1,
+                                        Stride3Eq1,
+                                        VP,
+                                        DB><<<grid, block, 0, stream>>>(p_output_x,
+                                                                        p_output_y,
+                                                                        p_input_x,
+                                                                        p_input_y,
+                                                                        p_cos,
+                                                                        p_sin,
+                                                                        size_h_x,
+                                                                        size_h_y,
+                                                                        size_d,
+                                                                        size_f,
+                                                                        stride_ix_s,
+                                                                        stride_ix_b,
+                                                                        stride_ix_h,
+                                                                        stride_ix_d,
+                                                                        stride_iy_s,
+                                                                        stride_iy_b,
+                                                                        stride_iy_h,
+                                                                        stride_iy_d,
+                                                                        stride_ox_s,
+                                                                        stride_ox_b,
+                                                                        stride_ox_h,
+                                                                        stride_ox_d,
+                                                                        stride_oy_s,
+                                                                        stride_oy_b,
+                                                                        stride_oy_h,
+                                                                        stride_oy_d,
+                                                                        size_s,
+                                                                        threads_per_sb,
+                                                                        total_sb);
+            }
+            else
+            {
+                LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(RotateStyle,
+                                                       stride_ox_d,
+                                                       stride_oy_d,
+                                                       stride_ix_d,
+                                                       stride_iy_d,
+                                                       kn_entry_2c_sbhd_cached<Op,
+                                                                               RotateStyle,
+                                                                               ReuseFreqsFrontPart,
+                                                                               NopeFirst,
+                                                                               Stride0Eq1,
+                                                                               Stride1Eq1,
+                                                                               Stride2Eq1,
+                                                                               Stride3Eq1,
+                                                                               VP,
+                                                                               DB>
+                                                       <<<grid, block, 0, stream>>>(p_output_x,
+                                                                                    p_output_y,
+                                                                                    p_input_x,
+                                                                                    p_input_y,
+                                                                                    p_cos,
+                                                                                    p_sin,
+                                                                                    size_h_x,
+                                                                                    size_h_y,
+                                                                                    size_d,
+                                                                                    size_f,
+                                                                                    stride_ix_s,
+                                                                                    stride_ix_b,
+                                                                                    stride_ix_h,
+                                                                                    stride_ix_d,
+                                                                                    stride_iy_s,
+                                                                                    stride_iy_b,
+                                                                                    stride_iy_h,
+                                                                                    stride_iy_d,
+                                                                                    stride_ox_s,
+                                                                                    stride_ox_b,
+                                                                                    stride_ox_h,
+                                                                                    stride_ox_d,
+                                                                                    stride_oy_s,
+                                                                                    stride_oy_b,
+                                                                                    stride_oy_h,
+                                                                                    stride_oy_d,
+                                                                                    size_s,
+                                                                                    threads_per_sb,
+                                                                                    total_sb););
+            }
+        }));
 }
 
 template <typename Op,
@@ -5963,21 +5322,21 @@ void dispatch_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
                                                          NopeFirst,
                                                          Stride0Eq1,
                                                          VP>
-                    <<<grid, block, 0, stream>>>(p_output,
-                                                 p_cos,
-                                                 p_sin,
-                                                 p_indirect_buffer,
-                                                 max_position,
-                                                 size_h,
-                                                 size_d,
-                                                 size_f,
-                                                 stride_i_s,
-                                                 stride_i_b,
-                                                 stride_i_h,
-                                                 stride_i_d,
-                                                 size_s,
-                                                 threads_per_sb,
-                                                 total_sb);
+                <<<grid, block, 0, stream>>>(p_output,
+                                             p_cos,
+                                             p_sin,
+                                             p_indirect_buffer,
+                                             max_position,
+                                             size_h,
+                                             size_d,
+                                             size_f,
+                                             stride_i_s,
+                                             stride_i_b,
+                                             stride_i_h,
+                                             stride_i_d,
+                                             size_s,
+                                             threads_per_sb,
+                                             total_sb);
             }
             else
             {
@@ -6050,27 +5409,26 @@ void dispatch_1c_sbhd_cached_indirect(scalar_t* __restrict__ p_output,
                                                      NopeFirst,
                                                      Stride0Eq1,
                                                      Stride1Eq1,
-                                                     VP>
-                    <<<grid, block, 0, stream>>>(p_output,
-                                                 p_input,
-                                                 p_cos,
-                                                 p_sin,
-                                                 p_indirect_buffer,
-                                                 max_position,
-                                                 size_h,
-                                                 size_d,
-                                                 size_f,
-                                                 stride_i_s,
-                                                 stride_i_b,
-                                                 stride_i_h,
-                                                 stride_i_d,
-                                                 stride_o_s,
-                                                 stride_o_b,
-                                                 stride_o_h,
-                                                 stride_o_d,
-                                                 size_s,
-                                                 threads_per_sb,
-                                                 total_sb););
+                                                     VP><<<grid, block, 0, stream>>>(p_output,
+                                                                                     p_input,
+                                                                                     p_cos,
+                                                                                     p_sin,
+                                                                                     p_indirect_buffer,
+                                                                                     max_position,
+                                                                                     size_h,
+                                                                                     size_d,
+                                                                                     size_f,
+                                                                                     stride_i_s,
+                                                                                     stride_i_b,
+                                                                                     stride_i_h,
+                                                                                     stride_i_d,
+                                                                                     stride_o_s,
+                                                                                     stride_o_b,
+                                                                                     stride_o_h,
+                                                                                     stride_o_d,
+                                                                                     size_s,
+                                                                                     threads_per_sb,
+                                                                                     total_sb););
             }
         });
 }
@@ -6121,27 +5479,63 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
     auto [grid, block, vec_pairs, threads_per_sb] =
         get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(
             size_s, 1, size_b, size_f, all_stride_d_eq_1);
-    const int32_t total_sb   = size_s * size_b;
+    const int32_t total_sb = size_s * size_b;
     const bool double_buffer = (min(size_h_x, size_h_y) <= 32);
 
     LAUNCH_KERNEL_VEC_PAIRS(
         vec_pairs,
         LAUNCH_KERNEL_DOUBLE_BUFFER(
             double_buffer,
-            if((p_output_x == p_input_x) && (p_output_y == p_input_y)) {
-                assert(stride_ix_s == stride_ox_s);
-                assert(stride_ix_b == stride_ox_b);
-                assert(stride_ix_h == stride_ox_h);
-                assert(stride_ix_d == stride_ox_d);
-                assert(stride_iy_s == stride_oy_s);
-                assert(stride_iy_b == stride_oy_b);
-                assert(stride_iy_h == stride_oy_h);
-                assert(stride_iy_d == stride_oy_d);
+        if((p_output_x == p_input_x) && (p_output_y == p_input_y)) {
+            assert(stride_ix_s == stride_ox_s);
+            assert(stride_ix_b == stride_ox_b);
+            assert(stride_ix_h == stride_ox_h);
+            assert(stride_ix_d == stride_ox_d);
+            assert(stride_iy_s == stride_oy_s);
+            assert(stride_iy_b == stride_oy_b);
+            assert(stride_iy_h == stride_oy_h);
+            assert(stride_iy_d == stride_oy_d);
 
-                if constexpr(AllStrideDEq1)
-                {
-                    constexpr bool Stride0Eq1 = true;
-                    constexpr bool Stride1Eq1 = true;
+            if constexpr(AllStrideDEq1)
+            {
+                constexpr bool Stride0Eq1 = true;
+                constexpr bool Stride1Eq1 = true;
+                kn_entry_2c_sbhd_cached_indirect_inplace<Op,
+                                                         RotateStyle,
+                                                         ReuseFreqsFrontPart,
+                                                         NopeFirst,
+                                                         Stride0Eq1,
+                                                         Stride1Eq1,
+                                                         VP,
+                                                         DB>
+                <<<grid, block, 0, stream>>>(p_output_x,
+                                             p_output_y,
+                                             p_cos,
+                                             p_sin,
+                                             p_indirect_buffer,
+                                             max_position,
+                                             size_h_x,
+                                             size_h_y,
+                                             size_d,
+                                             size_f,
+                                             stride_ix_s,
+                                             stride_ix_b,
+                                             stride_ix_h,
+                                             stride_ix_d,
+                                             stride_iy_s,
+                                             stride_iy_b,
+                                             stride_iy_h,
+                                             stride_iy_d,
+                                             size_s,
+                                             threads_per_sb,
+                                             total_sb);
+            }
+            else
+            {
+                LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+                    RotateStyle,
+                    stride_ix_d,
+                    stride_iy_d,
                     kn_entry_2c_sbhd_cached_indirect_inplace<Op,
                                                              RotateStyle,
                                                              ReuseFreqsFrontPart,
@@ -6150,71 +5544,84 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                              Stride1Eq1,
                                                              VP,
                                                              DB>
-                        <<<grid, block, 0, stream>>>(p_output_x,
-                                                     p_output_y,
-                                                     p_cos,
-                                                     p_sin,
-                                                     p_indirect_buffer,
-                                                     max_position,
-                                                     size_h_x,
-                                                     size_h_y,
-                                                     size_d,
-                                                     size_f,
-                                                     stride_ix_s,
-                                                     stride_ix_b,
-                                                     stride_ix_h,
-                                                     stride_ix_d,
-                                                     stride_iy_s,
-                                                     stride_iy_b,
-                                                     stride_iy_h,
-                                                     stride_iy_d,
-                                                     size_s,
-                                                     threads_per_sb,
-                                                     total_sb);
-                }
-                else
-                {
-                    LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
-                        RotateStyle,
-                        stride_ix_d,
-                        stride_iy_d,
-                        kn_entry_2c_sbhd_cached_indirect_inplace<Op,
-                                                                 RotateStyle,
-                                                                 ReuseFreqsFrontPart,
-                                                                 NopeFirst,
-                                                                 Stride0Eq1,
-                                                                 Stride1Eq1,
-                                                                 VP,
-                                                                 DB>
-                        <<<grid, block, 0, stream>>>(p_output_x,
-                                                     p_output_y,
-                                                     p_cos,
-                                                     p_sin,
-                                                     p_indirect_buffer,
-                                                     max_position,
-                                                     size_h_x,
-                                                     size_h_y,
-                                                     size_d,
-                                                     size_f,
-                                                     stride_ix_s,
-                                                     stride_ix_b,
-                                                     stride_ix_h,
-                                                     stride_ix_d,
-                                                     stride_iy_s,
-                                                     stride_iy_b,
-                                                     stride_iy_h,
-                                                     stride_iy_d,
-                                                     size_s,
-                                                     threads_per_sb,
-                                                     total_sb););
-                }
-            } else {
-                if constexpr(AllStrideDEq1)
-                {
-                    constexpr bool Stride0Eq1 = true;
-                    constexpr bool Stride1Eq1 = true;
-                    constexpr bool Stride2Eq1 = true;
-                    constexpr bool Stride3Eq1 = true;
+                    <<<grid, block, 0, stream>>>(p_output_x,
+                                                 p_output_y,
+                                                 p_cos,
+                                                 p_sin,
+                                                 p_indirect_buffer,
+                                                 max_position,
+                                                 size_h_x,
+                                                 size_h_y,
+                                                 size_d,
+                                                 size_f,
+                                                 stride_ix_s,
+                                                 stride_ix_b,
+                                                 stride_ix_h,
+                                                 stride_ix_d,
+                                                 stride_iy_s,
+                                                 stride_iy_b,
+                                                 stride_iy_h,
+                                                 stride_iy_d,
+                                                 size_s,
+                                                 threads_per_sb,
+                                                 total_sb););
+            }
+        } else {
+            if constexpr(AllStrideDEq1)
+            {
+                constexpr bool Stride0Eq1 = true;
+                constexpr bool Stride1Eq1 = true;
+                constexpr bool Stride2Eq1 = true;
+                constexpr bool Stride3Eq1 = true;
+                kn_entry_2c_sbhd_cached_indirect<Op,
+                                                 RotateStyle,
+                                                 ReuseFreqsFrontPart,
+                                                 NopeFirst,
+                                                 Stride0Eq1,
+                                                 Stride1Eq1,
+                                                 Stride2Eq1,
+                                                 Stride3Eq1,
+                                                 VP,
+                                                 DB><<<grid, block, 0, stream>>>(p_output_x,
+                                                                                 p_output_y,
+                                                                                 p_input_x,
+                                                                                 p_input_y,
+                                                                                 p_cos,
+                                                                                 p_sin,
+                                                                                 p_indirect_buffer,
+                                                                                 max_position,
+                                                                                 size_h_x,
+                                                                                 size_h_y,
+                                                                                 size_d,
+                                                                                 size_f,
+                                                                                 stride_ix_s,
+                                                                                 stride_ix_b,
+                                                                                 stride_ix_h,
+                                                                                 stride_ix_d,
+                                                                                 stride_iy_s,
+                                                                                 stride_iy_b,
+                                                                                 stride_iy_h,
+                                                                                 stride_iy_d,
+                                                                                 stride_ox_s,
+                                                                                 stride_ox_b,
+                                                                                 stride_ox_h,
+                                                                                 stride_ox_d,
+                                                                                 stride_oy_s,
+                                                                                 stride_oy_b,
+                                                                                 stride_oy_h,
+                                                                                 stride_oy_d,
+                                                                                 size_s,
+                                                                                 threads_per_sb,
+                                                                                 total_sb);
+            }
+            else
+            {
+                LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
+                    RotateStyle,
+                    stride_ox_d,
+                    stride_oy_d,
+                    stride_ix_d,
+                    stride_iy_d,
                     kn_entry_2c_sbhd_cached_indirect<Op,
                                                      RotateStyle,
                                                      ReuseFreqsFrontPart,
@@ -6224,90 +5631,39 @@ void dispatch_2c_sbhd_cached_indirect(scalar_t* __restrict__ p_output_x,
                                                      Stride2Eq1,
                                                      Stride3Eq1,
                                                      VP,
-                                                     DB>
-                        <<<grid, block, 0, stream>>>(p_output_x,
-                                                     p_output_y,
-                                                     p_input_x,
-                                                     p_input_y,
-                                                     p_cos,
-                                                     p_sin,
-                                                     p_indirect_buffer,
-                                                     max_position,
-                                                     size_h_x,
-                                                     size_h_y,
-                                                     size_d,
-                                                     size_f,
-                                                     stride_ix_s,
-                                                     stride_ix_b,
-                                                     stride_ix_h,
-                                                     stride_ix_d,
-                                                     stride_iy_s,
-                                                     stride_iy_b,
-                                                     stride_iy_h,
-                                                     stride_iy_d,
-                                                     stride_ox_s,
-                                                     stride_ox_b,
-                                                     stride_ox_h,
-                                                     stride_ox_d,
-                                                     stride_oy_s,
-                                                     stride_oy_b,
-                                                     stride_oy_h,
-                                                     stride_oy_d,
-                                                     size_s,
-                                                     threads_per_sb,
-                                                     total_sb);
-                }
-                else
-                {
-                    LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
-                        RotateStyle,
-                        stride_ox_d,
-                        stride_oy_d,
-                        stride_ix_d,
-                        stride_iy_d,
-                        kn_entry_2c_sbhd_cached_indirect<Op,
-                                                         RotateStyle,
-                                                         ReuseFreqsFrontPart,
-                                                         NopeFirst,
-                                                         Stride0Eq1,
-                                                         Stride1Eq1,
-                                                         Stride2Eq1,
-                                                         Stride3Eq1,
-                                                         VP,
-                                                         DB>
-                        <<<grid, block, 0, stream>>>(p_output_x,
-                                                     p_output_y,
-                                                     p_input_x,
-                                                     p_input_y,
-                                                     p_cos,
-                                                     p_sin,
-                                                     p_indirect_buffer,
-                                                     max_position,
-                                                     size_h_x,
-                                                     size_h_y,
-                                                     size_d,
-                                                     size_f,
-                                                     stride_ix_s,
-                                                     stride_ix_b,
-                                                     stride_ix_h,
-                                                     stride_ix_d,
-                                                     stride_iy_s,
-                                                     stride_iy_b,
-                                                     stride_iy_h,
-                                                     stride_iy_d,
-                                                     stride_ox_s,
-                                                     stride_ox_b,
-                                                     stride_ox_h,
-                                                     stride_ox_d,
-                                                     stride_oy_s,
-                                                     stride_oy_b,
-                                                     stride_oy_h,
-                                                     stride_oy_d,
-                                                     size_s,
-                                                     threads_per_sb,
-                                                     total_sb););
-                }
-            }));
+                                                     DB><<<grid, block, 0, stream>>>(p_output_x,
+                                                                                     p_output_y,
+                                                                                     p_input_x,
+                                                                                     p_input_y,
+                                                                                     p_cos,
+                                                                                     p_sin,
+                                                                                     p_indirect_buffer,
+                                                                                     max_position,
+                                                                                     size_h_x,
+                                                                                     size_h_y,
+                                                                                     size_d,
+                                                                                     size_f,
+                                                                                     stride_ix_s,
+                                                                                     stride_ix_b,
+                                                                                     stride_ix_h,
+                                                                                     stride_ix_d,
+                                                                                     stride_iy_s,
+                                                                                     stride_iy_b,
+                                                                                     stride_iy_h,
+                                                                                     stride_iy_d,
+                                                                                     stride_ox_s,
+                                                                                     stride_ox_b,
+                                                                                     stride_ox_h,
+                                                                                     stride_ox_d,
+                                                                                     stride_oy_s,
+                                                                                     stride_oy_b,
+                                                                                     stride_oy_h,
+                                                                                     stride_oy_d,
+                                                                                     size_s,
+                                                                                     threads_per_sb,
+                                                                                     total_sb););
+            }
+        }));
 }
 
 template <typename Op,
@@ -6364,22 +5720,22 @@ void dispatch_1c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output,
                                                           NopeFirst,
                                                           Stride0Eq1,
                                                           VP>
-                    <<<grid, block, 0, stream>>>(p_output,
-                                                 p_cos,
-                                                 p_sin,
-                                                 p_indirect_buffer_0,
-                                                 p_indirect_buffer_1,
-                                                 max_position,
-                                                 size_h,
-                                                 size_d,
-                                                 size_f,
-                                                 stride_i_s,
-                                                 stride_i_b,
-                                                 stride_i_h,
-                                                 stride_i_d,
-                                                 size_s,
-                                                 threads_per_sb,
-                                                 total_sb);
+                <<<grid, block, 0, stream>>>(p_output,
+                                             p_cos,
+                                             p_sin,
+                                             p_indirect_buffer_0,
+                                             p_indirect_buffer_1,
+                                             max_position,
+                                             size_h,
+                                             size_d,
+                                             size_f,
+                                             stride_i_s,
+                                             stride_i_b,
+                                             stride_i_h,
+                                             stride_i_d,
+                                             size_s,
+                                             threads_per_sb,
+                                             total_sb);
             }
             else
             {
@@ -6421,27 +5777,27 @@ void dispatch_1c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output,
                                                   Stride0Eq1,
                                                   Stride1Eq1,
                                                   VP>
-                    <<<grid, block, 0, stream>>>(p_output,
-                                                 p_input,
-                                                 p_cos,
-                                                 p_sin,
-                                                 p_indirect_buffer_0,
-                                                 p_indirect_buffer_1,
-                                                 max_position,
-                                                 size_h,
-                                                 size_d,
-                                                 size_f,
-                                                 stride_i_s,
-                                                 stride_i_b,
-                                                 stride_i_h,
-                                                 stride_i_d,
-                                                 stride_o_s,
-                                                 stride_o_b,
-                                                 stride_o_h,
-                                                 stride_o_d,
-                                                 size_s,
-                                                 threads_per_sb,
-                                                 total_sb);
+                <<<grid, block, 0, stream>>>(p_output,
+                                             p_input,
+                                             p_cos,
+                                             p_sin,
+                                             p_indirect_buffer_0,
+                                             p_indirect_buffer_1,
+                                             max_position,
+                                             size_h,
+                                             size_d,
+                                             size_f,
+                                             stride_i_s,
+                                             stride_i_b,
+                                             stride_i_h,
+                                             stride_i_d,
+                                             stride_o_s,
+                                             stride_o_b,
+                                             stride_o_h,
+                                             stride_o_d,
+                                             size_s,
+                                             threads_per_sb,
+                                             total_sb);
             }
             else
             {
@@ -6528,27 +5884,64 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
     auto [grid, block, vec_pairs, threads_per_sb] =
         get_grid_config<RotateStyle, ReuseFreqsFrontPart, false, scalar_t>(
             size_s, 1, size_b, size_f, all_stride_d_eq_1);
-    const int32_t total_sb   = size_s * size_b;
+    const int32_t total_sb = size_s * size_b;
     const bool double_buffer = (min(size_h_x, size_h_y) <= 32);
 
     LAUNCH_KERNEL_VEC_PAIRS(
         vec_pairs,
         LAUNCH_KERNEL_DOUBLE_BUFFER(
             double_buffer,
-            if((p_output_x == p_input_x) && (p_output_y == p_input_y)) {
-                assert(stride_ix_s == stride_ox_s);
-                assert(stride_ix_b == stride_ox_b);
-                assert(stride_ix_h == stride_ox_h);
-                assert(stride_ix_d == stride_ox_d);
-                assert(stride_iy_s == stride_oy_s);
-                assert(stride_iy_b == stride_oy_b);
-                assert(stride_iy_h == stride_oy_h);
-                assert(stride_iy_d == stride_oy_d);
+        if((p_output_x == p_input_x) && (p_output_y == p_input_y)) {
+            assert(stride_ix_s == stride_ox_s);
+            assert(stride_ix_b == stride_ox_b);
+            assert(stride_ix_h == stride_ox_h);
+            assert(stride_ix_d == stride_ox_d);
+            assert(stride_iy_s == stride_oy_s);
+            assert(stride_iy_b == stride_oy_b);
+            assert(stride_iy_h == stride_oy_h);
+            assert(stride_iy_d == stride_oy_d);
 
-                if constexpr(AllStrideDEq1)
-                {
-                    constexpr bool Stride0Eq1 = true;
-                    constexpr bool Stride1Eq1 = true;
+            if constexpr(AllStrideDEq1)
+            {
+                constexpr bool Stride0Eq1 = true;
+                constexpr bool Stride1Eq1 = true;
+                kn_entry_2c_sbhd_cached_indirect2_inplace<Op,
+                                                          RotateStyle,
+                                                          ReuseFreqsFrontPart,
+                                                          NopeFirst,
+                                                          Stride0Eq1,
+                                                          Stride1Eq1,
+                                                          VP,
+                                                          DB>
+                <<<grid, block, 0, stream>>>(p_output_x,
+                                             p_output_y,
+                                             p_cos,
+                                             p_sin,
+                                             p_indirect_buffer_0,
+                                             p_indirect_buffer_1,
+                                             max_position,
+                                             size_h_x,
+                                             size_h_y,
+                                             size_d,
+                                             size_f,
+                                             stride_ix_s,
+                                             stride_ix_b,
+                                             stride_ix_h,
+                                             stride_ix_d,
+                                             stride_iy_s,
+                                             stride_iy_b,
+                                             stride_iy_h,
+                                             stride_iy_d,
+                                             size_s,
+                                             threads_per_sb,
+                                             total_sb);
+            }
+            else
+            {
+                LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+                    RotateStyle,
+                    stride_ix_d,
+                    stride_iy_d,
                     kn_entry_2c_sbhd_cached_indirect2_inplace<Op,
                                                               RotateStyle,
                                                               ReuseFreqsFrontPart,
@@ -6557,73 +5950,87 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                                               Stride1Eq1,
                                                               VP,
                                                               DB>
-                        <<<grid, block, 0, stream>>>(p_output_x,
-                                                     p_output_y,
-                                                     p_cos,
-                                                     p_sin,
-                                                     p_indirect_buffer_0,
-                                                     p_indirect_buffer_1,
-                                                     max_position,
-                                                     size_h_x,
-                                                     size_h_y,
-                                                     size_d,
-                                                     size_f,
-                                                     stride_ix_s,
-                                                     stride_ix_b,
-                                                     stride_ix_h,
-                                                     stride_ix_d,
-                                                     stride_iy_s,
-                                                     stride_iy_b,
-                                                     stride_iy_h,
-                                                     stride_iy_d,
-                                                     size_s,
-                                                     threads_per_sb,
-                                                     total_sb);
-                }
-                else
-                {
-                    LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
-                        RotateStyle,
-                        stride_ix_d,
-                        stride_iy_d,
-                        kn_entry_2c_sbhd_cached_indirect2_inplace<Op,
-                                                                  RotateStyle,
-                                                                  ReuseFreqsFrontPart,
-                                                                  NopeFirst,
-                                                                  Stride0Eq1,
-                                                                  Stride1Eq1,
-                                                                  VP,
-                                                                  DB>
-                        <<<grid, block, 0, stream>>>(p_output_x,
-                                                     p_output_y,
-                                                     p_cos,
-                                                     p_sin,
-                                                     p_indirect_buffer_0,
-                                                     p_indirect_buffer_1,
-                                                     max_position,
-                                                     size_h_x,
-                                                     size_h_y,
-                                                     size_d,
-                                                     size_f,
-                                                     stride_ix_s,
-                                                     stride_ix_b,
-                                                     stride_ix_h,
-                                                     stride_ix_d,
-                                                     stride_iy_s,
-                                                     stride_iy_b,
-                                                     stride_iy_h,
-                                                     stride_iy_d,
-                                                     size_s,
-                                                     threads_per_sb,
-                                                     total_sb););
-                }
-            } else {
-                if constexpr(AllStrideDEq1)
-                {
-                    constexpr bool Stride0Eq1 = true;
-                    constexpr bool Stride1Eq1 = true;
-                    constexpr bool Stride2Eq1 = true;
-                    constexpr bool Stride3Eq1 = true;
+                    <<<grid, block, 0, stream>>>(p_output_x,
+                                                 p_output_y,
+                                                 p_cos,
+                                                 p_sin,
+                                                 p_indirect_buffer_0,
+                                                 p_indirect_buffer_1,
+                                                 max_position,
+                                                 size_h_x,
+                                                 size_h_y,
+                                                 size_d,
+                                                 size_f,
+                                                 stride_ix_s,
+                                                 stride_ix_b,
+                                                 stride_ix_h,
+                                                 stride_ix_d,
+                                                 stride_iy_s,
+                                                 stride_iy_b,
+                                                 stride_iy_h,
+                                                 stride_iy_d,
+                                                 size_s,
+                                                 threads_per_sb,
+                                                 total_sb););
+            }
+        } else {
+            if constexpr(AllStrideDEq1)
+            {
+                constexpr bool Stride0Eq1 = true;
+                constexpr bool Stride1Eq1 = true;
+                constexpr bool Stride2Eq1 = true;
+                constexpr bool Stride3Eq1 = true;
+                kn_entry_2c_sbhd_cached_indirect2<Op,
+                                                  RotateStyle,
+                                                  ReuseFreqsFrontPart,
+                                                  NopeFirst,
+                                                  Stride0Eq1,
+                                                  Stride1Eq1,
+                                                  Stride2Eq1,
+                                                  Stride3Eq1,
+                                                  VP,
+                                                  DB>
+                <<<grid, block, 0, stream>>>(p_output_x,
+                                             p_output_y,
+                                             p_input_x,
+                                             p_input_y,
+                                             p_cos,
+                                             p_sin,
+                                             p_indirect_buffer_0,
+                                             p_indirect_buffer_1,
+                                             max_position,
+                                             size_h_x,
+                                             size_h_y,
+                                             size_d,
+                                             size_f,
+                                             stride_ix_s,
+                                             stride_ix_b,
+                                             stride_ix_h,
+                                             stride_ix_d,
+                                             stride_iy_s,
+                                             stride_iy_b,
+                                             stride_iy_h,
+                                             stride_iy_d,
+                                             stride_ox_s,
+                                             stride_ox_b,
+                                             stride_ox_h,
+                                             stride_ox_d,
+                                             stride_oy_s,
+                                             stride_oy_b,
+                                             stride_oy_h,
+                                             stride_oy_d,
+                                             size_s,
+                                             threads_per_sb,
+                                             total_sb);
+            }
+            else
+            {
+                LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
+                    RotateStyle,
+                    stride_ox_d,
+                    stride_oy_d,
+                    stride_ix_d,
+                    stride_iy_d,
                     kn_entry_2c_sbhd_cached_indirect2<Op,
                                                       RotateStyle,
                                                       ReuseFreqsFrontPart,
@@ -6634,91 +6041,40 @@ void dispatch_2c_sbhd_cached_indirect2(scalar_t* __restrict__ p_output_x,
                                                       Stride3Eq1,
                                                       VP,
                                                       DB>
-                        <<<grid, block, 0, stream>>>(p_output_x,
-                                                     p_output_y,
-                                                     p_input_x,
-                                                     p_input_y,
-                                                     p_cos,
-                                                     p_sin,
-                                                     p_indirect_buffer_0,
-                                                     p_indirect_buffer_1,
-                                                     max_position,
-                                                     size_h_x,
-                                                     size_h_y,
-                                                     size_d,
-                                                     size_f,
-                                                     stride_ix_s,
-                                                     stride_ix_b,
-                                                     stride_ix_h,
-                                                     stride_ix_d,
-                                                     stride_iy_s,
-                                                     stride_iy_b,
-                                                     stride_iy_h,
-                                                     stride_iy_d,
-                                                     stride_ox_s,
-                                                     stride_ox_b,
-                                                     stride_ox_h,
-                                                     stride_ox_d,
-                                                     stride_oy_s,
-                                                     stride_oy_b,
-                                                     stride_oy_h,
-                                                     stride_oy_d,
-                                                     size_s,
-                                                     threads_per_sb,
-                                                     total_sb);
-                }
-                else
-                {
-                    LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
-                        RotateStyle,
-                        stride_ox_d,
-                        stride_oy_d,
-                        stride_ix_d,
-                        stride_iy_d,
-                        kn_entry_2c_sbhd_cached_indirect2<Op,
-                                                          RotateStyle,
-                                                          ReuseFreqsFrontPart,
-                                                          NopeFirst,
-                                                          Stride0Eq1,
-                                                          Stride1Eq1,
-                                                          Stride2Eq1,
-                                                          Stride3Eq1,
-                                                          VP,
-                                                          DB>
-                        <<<grid, block, 0, stream>>>(p_output_x,
-                                                     p_output_y,
-                                                     p_input_x,
-                                                     p_input_y,
-                                                     p_cos,
-                                                     p_sin,
-                                                     p_indirect_buffer_0,
-                                                     p_indirect_buffer_1,
-                                                     max_position,
-                                                     size_h_x,
-                                                     size_h_y,
-                                                     size_d,
-                                                     size_f,
-                                                     stride_ix_s,
-                                                     stride_ix_b,
-                                                     stride_ix_h,
-                                                     stride_ix_d,
-                                                     stride_iy_s,
-                                                     stride_iy_b,
-                                                     stride_iy_h,
-                                                     stride_iy_d,
-                                                     stride_ox_s,
-                                                     stride_ox_b,
-                                                     stride_ox_h,
-                                                     stride_ox_d,
-                                                     stride_oy_s,
-                                                     stride_oy_b,
-                                                     stride_oy_h,
-                                                     stride_oy_d,
-                                                     size_s,
-                                                     threads_per_sb,
-                                                     total_sb););
-                }
-            }));
+                    <<<grid, block, 0, stream>>>(p_output_x,
+                                                 p_output_y,
+                                                 p_input_x,
+                                                 p_input_y,
+                                                 p_cos,
+                                                 p_sin,
+                                                 p_indirect_buffer_0,
+                                                 p_indirect_buffer_1,
+                                                 max_position,
+                                                 size_h_x,
+                                                 size_h_y,
+                                                 size_d,
+                                                 size_f,
+                                                 stride_ix_s,
+                                                 stride_ix_b,
+                                                 stride_ix_h,
+                                                 stride_ix_d,
+                                                 stride_iy_s,
+                                                 stride_iy_b,
+                                                 stride_iy_h,
+                                                 stride_iy_d,
+                                                 stride_ox_s,
+                                                 stride_ox_b,
+                                                 stride_ox_h,
+                                                 stride_ox_d,
+                                                 stride_oy_s,
+                                                 stride_oy_b,
+                                                 stride_oy_h,
+                                                 stride_oy_d,
+                                                 size_s,
+                                                 threads_per_sb,
+                                                 total_sb););
+            }
+        }));
 }
 
 template <typename Op,
@@ -7027,829 +6383,839 @@ void dispatch_1c_2d_cached(scalar_t* __restrict__ p_output,
 
 // Call sites use the positions pointer (typed pos_t) inside __VA_ARGS__; pos_t is a local alias.
 #if ENABLE_ROPE_POSITIONS_INT32
-#define DISPATCH_ROPE_TYPES_PARAMS_WITH_POSITIONS(                                              \
-    TYPE0, TYPE1, POSITIONS_ST, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...)    \
-    if((POSITIONS_ST) == AITER_DTYPE_i32)                                                       \
-    {                                                                                           \
-        using pos_t = int32_t;                                                                  \
-        DISPATCH_ROPE_TYPES_PARAMS(                                                             \
-            TYPE0, TYPE1, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, __VA_ARGS__); \
-    }                                                                                           \
-    else                                                                                        \
-    {                                                                                           \
-        AITER_CHECK(                                                                            \
-            false,                                                                              \
-            NAME,                                                                               \
-            " does not support positions dtype ",                                               \
-            AiterDtype_to_str((POSITIONS_ST)),                                                  \
-            " (compile RoPE sources with -DENABLE_ROPE_POSITIONS_INT32=1 for int32 positions",  \
-            " and -DENABLE_ROPE_POSITIONS_INT32=0 for int64/Long positions).");                 \
+#define DISPATCH_ROPE_TYPES_PARAMS_WITH_POSITIONS(                                \
+    TYPE0, TYPE1, POSITIONS_ST, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...) \
+    if((POSITIONS_ST) == AITER_DTYPE_i32)                                      \
+    {                                                                             \
+        using pos_t = int32_t;                                                    \
+        DISPATCH_ROPE_TYPES_PARAMS(                                               \
+            TYPE0,                                                                \
+            TYPE1,                                                                \
+            ROTATE_STYLE,                                                         \
+            REUSE_FREQS_FRONT_PART,                                               \
+            NOPE_FIRST,                                                           \
+            NAME,                                                                 \
+            __VA_ARGS__);                                                         \
+    }                                                                             \
+    else                                                                          \
+    {                                                                             \
+        AITER_CHECK(false,                                                        \
+                    NAME,                                                         \
+                    " does not support positions dtype ",                         \
+                    AiterDtype_to_str((POSITIONS_ST)),                                     \
+                    " (compile RoPE sources with -DENABLE_ROPE_POSITIONS_INT32=1 for int32 positions", \
+                    " and -DENABLE_ROPE_POSITIONS_INT32=0 for int64/Long positions)."); \
     }
 #else
-#define DISPATCH_ROPE_TYPES_PARAMS_WITH_POSITIONS(                                              \
-    TYPE0, TYPE1, POSITIONS_ST, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...)    \
-    if((POSITIONS_ST) == AITER_DTYPE_i64)                                                       \
-    {                                                                                           \
-        using pos_t = int64_t;                                                                  \
-        DISPATCH_ROPE_TYPES_PARAMS(                                                             \
-            TYPE0, TYPE1, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, __VA_ARGS__); \
-    }                                                                                           \
-    else                                                                                        \
-    {                                                                                           \
-        AITER_CHECK(                                                                            \
-            false,                                                                              \
-            NAME,                                                                               \
-            " does not support positions dtype ",                                               \
-            AiterDtype_to_str((POSITIONS_ST)),                                                  \
-            " (compile RoPE sources with -DENABLE_ROPE_POSITIONS_INT32=1 for int32 positions",  \
-            " and -DENABLE_ROPE_POSITIONS_INT32=0 for int64/Long positions).");                 \
+#define DISPATCH_ROPE_TYPES_PARAMS_WITH_POSITIONS(                                \
+    TYPE0, TYPE1, POSITIONS_ST, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...) \
+    if((POSITIONS_ST) == AITER_DTYPE_i64)                                    \
+    {                                                                             \
+        using pos_t = int64_t;                                                    \
+        DISPATCH_ROPE_TYPES_PARAMS(                                               \
+            TYPE0,                                                                \
+            TYPE1,                                                                \
+            ROTATE_STYLE,                                                         \
+            REUSE_FREQS_FRONT_PART,                                               \
+            NOPE_FIRST,                                                           \
+            NAME,                                                                 \
+            __VA_ARGS__);                                                         \
+    }                                                                             \
+    else                                                                          \
+    {                                                                             \
+        AITER_CHECK(false,                                                        \
+                    NAME,                                                         \
+                    " does not support positions dtype ",                         \
+                    AiterDtype_to_str((POSITIONS_ST)),                                     \
+                    " (compile RoPE sources with -DENABLE_ROPE_POSITIONS_INT32=1 for int32 positions", \
+                    " and -DENABLE_ROPE_POSITIONS_INT32=0 for int64/Long positions)."); \
     }
 #endif
 
-#define DISPATCH_ROPE_TYPES_PARAMS(                                                        \
-    TYPE0, TYPE1, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...)             \
-    switch((TYPE0))                                                                        \
-    {                                                                                      \
-    case AITER_DTYPE_fp32: {                                                               \
-        using scalar_t_0 = float;                                                          \
-        switch((TYPE1))                                                                    \
-        {                                                                                  \
-        case AITER_DTYPE_fp32: {                                                           \
-            using scalar_t_1 = float;                                                      \
-            if((REUSE_FREQS_FRONT_PART))                                                   \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = true;                                 \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            else                                                                           \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = false;                                \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            break;                                                                         \
-        }                                                                                  \
-        case AITER_DTYPE_fp16: {                                                           \
-            using scalar_t_1 = __half;                                                     \
-            if((REUSE_FREQS_FRONT_PART))                                                   \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = true;                                 \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            else                                                                           \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = false;                                \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            break;                                                                         \
-        }                                                                                  \
-        case AITER_DTYPE_bf16: {                                                           \
-            using scalar_t_1 = hip_bfloat16;                                               \
-            if((REUSE_FREQS_FRONT_PART))                                                   \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = true;                                 \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            else                                                                           \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = false;                                \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            break;                                                                         \
-        }                                                                                  \
-        default:                                                                           \
-            AITER_CHECK(false,                                                             \
-                        NAME " does't support ",                                           \
+#define DISPATCH_ROPE_TYPES_PARAMS(                                               \
+    TYPE0, TYPE1, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...)    \
+    switch((TYPE0))                                                               \
+    {                                                                             \
+    case AITER_DTYPE_fp32: {                                                 \
+        using scalar_t_0 = float;                                                 \
+        switch((TYPE1))                                                           \
+        {                                                                         \
+        case AITER_DTYPE_fp32: {                                             \
+            using scalar_t_1 = float;                                             \
+            if((REUSE_FREQS_FRONT_PART))                                          \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = true;                        \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            else                                                                  \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = false;                       \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            break;                                                                \
+        }                                                                         \
+        case AITER_DTYPE_fp16: {                                              \
+            using scalar_t_1 = __half;                                          \
+            if((REUSE_FREQS_FRONT_PART))                                          \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = true;                        \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            else                                                                  \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = false;                       \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            break;                                                                \
+        }                                                                         \
+        case AITER_DTYPE_bf16: {                                          \
+            using scalar_t_1 = hip_bfloat16;                                      \
+            if((REUSE_FREQS_FRONT_PART))                                          \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = true;                        \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            else                                                                  \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = false;                       \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            break;                                                                \
+        }                                                                         \
+        default:                                                                  \
+            AITER_CHECK(false,                                                    \
+                        NAME " does't support ",                                  \
                         AiterDtype_to_str((TYPE0)),                                        \
-                        " with ",                                                          \
+                        " with ",                                                 \
                         AiterDtype_to_str((TYPE1)),                                        \
-                        ".");                                                              \
-        }                                                                                  \
-        break;                                                                             \
-    }                                                                                      \
-    case AITER_DTYPE_fp16: {                                                               \
-        using scalar_t_0 = __half;                                                         \
-        switch((TYPE1))                                                                    \
-        {                                                                                  \
-        case AITER_DTYPE_fp32: {                                                           \
-            using scalar_t_1 = float;                                                      \
-            if((REUSE_FREQS_FRONT_PART))                                                   \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = true;                                 \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            else                                                                           \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = false;                                \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            break;                                                                         \
-        }                                                                                  \
-        case AITER_DTYPE_fp16: {                                                           \
-            using scalar_t_1 = __half;                                                     \
-            if((REUSE_FREQS_FRONT_PART))                                                   \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = true;                                 \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            else                                                                           \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = false;                                \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            break;                                                                         \
-        }                                                                                  \
-        case AITER_DTYPE_bf16: {                                                           \
-            using scalar_t_1 = hip_bfloat16;                                               \
-            if((REUSE_FREQS_FRONT_PART))                                                   \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = true;                                 \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            else                                                                           \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = false;                                \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            break;                                                                         \
-        }                                                                                  \
-        default:                                                                           \
-            AITER_CHECK(false,                                                             \
-                        NAME " does't support ",                                           \
+                        ".");                                                     \
+        }                                                                         \
+        break;                                                                    \
+    }                                                                             \
+    case AITER_DTYPE_fp16: {                                                  \
+        using scalar_t_0 = __half;                                              \
+        switch((TYPE1))                                                           \
+        {                                                                         \
+        case AITER_DTYPE_fp32: {                                             \
+            using scalar_t_1 = float;                                             \
+            if((REUSE_FREQS_FRONT_PART))                                          \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = true;                        \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            else                                                                  \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = false;                       \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            break;                                                                \
+        }                                                                         \
+        case AITER_DTYPE_fp16: {                                              \
+            using scalar_t_1 = __half;                                          \
+            if((REUSE_FREQS_FRONT_PART))                                          \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = true;                        \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            else                                                                  \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = false;                       \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            break;                                                                \
+        }                                                                         \
+        case AITER_DTYPE_bf16: {                                          \
+            using scalar_t_1 = hip_bfloat16;                                      \
+            if((REUSE_FREQS_FRONT_PART))                                          \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = true;                        \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            else                                                                  \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = false;                       \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            break;                                                                \
+        }                                                                         \
+        default:                                                                  \
+            AITER_CHECK(false,                                                    \
+                        NAME " does't support ",                                  \
                         AiterDtype_to_str((TYPE0)),                                        \
-                        " with ",                                                          \
+                        " with ",                                                 \
                         AiterDtype_to_str((TYPE1)),                                        \
-                        ".");                                                              \
-        }                                                                                  \
-        break;                                                                             \
-    }                                                                                      \
-    case AITER_DTYPE_bf16: {                                                               \
-        using scalar_t_0 = hip_bfloat16;                                                   \
-        switch((TYPE1))                                                                    \
-        {                                                                                  \
-        case AITER_DTYPE_fp32: {                                                           \
-            using scalar_t_1 = float;                                                      \
-            if((REUSE_FREQS_FRONT_PART))                                                   \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = true;                                 \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            else                                                                           \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = false;                                \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            break;                                                                         \
-        }                                                                                  \
-        case AITER_DTYPE_fp16: {                                                           \
-            using scalar_t_1 = __half;                                                     \
-            if((REUSE_FREQS_FRONT_PART))                                                   \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = true;                                 \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            else                                                                           \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = false;                                \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            break;                                                                         \
-        }                                                                                  \
-        case AITER_DTYPE_bf16: {                                                           \
-            using scalar_t_1 = hip_bfloat16;                                               \
-            if((REUSE_FREQS_FRONT_PART))                                                   \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = true;                                 \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            else                                                                           \
-            {                                                                              \
-                constexpr bool ReuseFreqsFrontPart = false;                                \
-                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                    \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                               \
-                {                                                                          \
-                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                     \
-                    if((NOPE_FIRST))                                                       \
-                    {                                                                      \
-                        constexpr bool NopeFirst = true;                                   \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                    else                                                                   \
-                    {                                                                      \
-                        constexpr bool NopeFirst = false;                                  \
-                        __VA_ARGS__;                                                       \
-                    }                                                                      \
-                }                                                                          \
-                else                                                                       \
-                {                                                                          \
-                    AITER_CHECK(false,                                                     \
-                                NAME " does't support rotate type ",                       \
-                                std::to_string((ROTATE_STYLE)),                            \
-                                ".");                                                      \
-                }                                                                          \
-            }                                                                              \
-            break;                                                                         \
-        }                                                                                  \
-        default:                                                                           \
-            AITER_CHECK(false,                                                             \
-                        NAME " does't support ",                                           \
+                        ".");                                                     \
+        }                                                                         \
+        break;                                                                    \
+    }                                                                             \
+    case AITER_DTYPE_bf16: {                                              \
+        using scalar_t_0 = hip_bfloat16;                                          \
+        switch((TYPE1))                                                           \
+        {                                                                         \
+        case AITER_DTYPE_fp32: {                                             \
+            using scalar_t_1 = float;                                             \
+            if((REUSE_FREQS_FRONT_PART))                                          \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = true;                        \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            else                                                                  \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = false;                       \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            break;                                                                \
+        }                                                                         \
+        case AITER_DTYPE_fp16: {                                              \
+            using scalar_t_1 = __half;                                          \
+            if((REUSE_FREQS_FRONT_PART))                                          \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = true;                        \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            else                                                                  \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = false;                       \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            break;                                                                \
+        }                                                                         \
+        case AITER_DTYPE_bf16: {                                          \
+            using scalar_t_1 = hip_bfloat16;                                      \
+            if((REUSE_FREQS_FRONT_PART))                                          \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = true;                        \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            else                                                                  \
+            {                                                                     \
+                constexpr bool ReuseFreqsFrontPart = false;                       \
+                if((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                           \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else if((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                      \
+                {                                                                 \
+                    constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;            \
+                    if((NOPE_FIRST))                                              \
+                    {                                                             \
+                        constexpr bool NopeFirst = true;                          \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                    else                                                          \
+                    {                                                             \
+                        constexpr bool NopeFirst = false;                         \
+                        __VA_ARGS__;                                              \
+                    }                                                             \
+                }                                                                 \
+                else                                                              \
+                {                                                                 \
+                    AITER_CHECK(false,                                            \
+                                NAME " does't support rotate type ",              \
+                                std::to_string((ROTATE_STYLE)),                   \
+                                ".");                                             \
+                }                                                                 \
+            }                                                                     \
+            break;                                                                \
+        }                                                                         \
+        default:                                                                  \
+            AITER_CHECK(false,                                                    \
+                        NAME " does't support ",                                  \
                         AiterDtype_to_str((TYPE0)),                                        \
-                        " with ",                                                          \
+                        " with ",                                                 \
                         AiterDtype_to_str((TYPE1)),                                        \
-                        ".");                                                              \
-        }                                                                                  \
-        break;                                                                             \
-    }                                                                                      \
+                        ".");                                                     \
+        }                                                                         \
+        break;                                                                    \
+    }                                                                             \
     default: AITER_CHECK(false, NAME " does't support ", AiterDtype_to_str((TYPE0)), "."); \
     }
 
@@ -8045,10 +7411,12 @@ struct alignas(sizeof(T) * vec_size) vec_t
             {
                 const opus::fp32x2_t values{static_cast<float>(src[i]),
                                             static_cast<float>(src[i + 1])};
-                const auto converted  = aiter::scaled_cast<opus::fp8_t>(values, inverted_scale);
+                const auto converted =
+                    aiter::scaled_cast<opus::fp8_t>(values, inverted_scale);
                 const uint16_t packed = __builtin_bit_cast(uint16_t, converted);
-                data[i]               = T(static_cast<uint8_t>(packed), T::from_bits());
-                data[i + 1]           = T(static_cast<uint8_t>(packed >> 8), T::from_bits());
+                data[i] = T(static_cast<uint8_t>(packed), T::from_bits());
+                data[i + 1] =
+                    T(static_cast<uint8_t>(packed >> 8), T::from_bits());
             }
         }
 #endif
@@ -8096,7 +7464,8 @@ __inline__ __device__ vec_t<T, vec_size> warp_shfl_sync_vec(vec_t<T, vec_size>& 
 // -- pass-by-value slicing of the empty derived type to its empty base is a no-op.
 template <typename T, int vec_size, int XorOffset>
 __inline__ __device__ vec_t<T, vec_size>
-warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val, std::integral_constant<int, XorOffset> = {})
+warp_shfl_xor_sync_vec(vec_t<T, vec_size>& val,
+                       std::integral_constant<int, XorOffset> = {})
 {
     static_assert(XorOffset > 0 && XorOffset < 32,
                   "ds_swizzle XOR mask must be in [1, 31] within a 32-lane segment");
@@ -8156,8 +7525,9 @@ __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
     uint32_t a_bits               = __builtin_bit_cast(uint32_t, a);
     uint32_t b_bits               = __builtin_bit_cast(uint32_t, b);
     uint32_t result;
-#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx940__) || \
-    defined(__gfx941__) || defined(__gfx942__) || defined(__gfx950__)
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx950__)
     // CDNA path: v_cmp_u_f32 with explicit SGPR dest + v_add3 + v_and_or_b32
     // tmp scratch is read+written; nan_mask is an SGPR pair output of v_cmp_u_f32.
     // We declare them as early-clobber outputs so the compiler doesn't alias them
@@ -8167,17 +7537,17 @@ __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
     uint32_t tmp;
     asm volatile(
         // a-side: round + nan-replace, then put bf16 in low 16 bits of result
-        "v_cmp_u_f32 %[mask], %[a], %[a]\n\t"               // mask = isnan(a)
-        "v_bfe_u32 %[tmp], %[a], 16, 1\n\t"                 // tmp = (a >> 16) & 1
-        "v_add3_u32 %[tmp], %[a], %[tmp], %[bias]\n\t"      // tmp = a + bias + bit
+        "v_cmp_u_f32 %[mask], %[a], %[a]\n\t"            // mask = isnan(a)
+        "v_bfe_u32 %[tmp], %[a], 16, 1\n\t"              // tmp = (a >> 16) & 1
+        "v_add3_u32 %[tmp], %[a], %[tmp], %[bias]\n\t"   // tmp = a + bias + bit
         "v_cndmask_b32 %[res], %[tmp], %[nan], %[mask]\n\t" // if nan use canonical
-        "v_lshrrev_b32 %[res], 16, %[res]\n\t"              // result_low = bf16(a)
+        "v_lshrrev_b32 %[res], 16, %[res]\n\t"           // result_low = bf16(a)
         // b-side: round + nan-replace, then merge upper half with result
-        "v_cmp_u_f32 %[mask], %[b], %[b]\n\t"               // mask = isnan(b)
-        "v_bfe_u32 %[tmp], %[b], 16, 1\n\t"                 // tmp = (b >> 16) & 1
-        "v_add3_u32 %[tmp], %[b], %[tmp], %[bias]\n\t"      // tmp = b + bias + bit
+        "v_cmp_u_f32 %[mask], %[b], %[b]\n\t"            // mask = isnan(b)
+        "v_bfe_u32 %[tmp], %[b], 16, 1\n\t"              // tmp = (b >> 16) & 1
+        "v_add3_u32 %[tmp], %[b], %[tmp], %[bias]\n\t"   // tmp = b + bias + bit
         "v_cndmask_b32 %[tmp], %[tmp], %[nan], %[mask]\n\t" // if nan use canonical
-        "v_and_or_b32 %[res], %[tmp], %[mmsk], %[res]" // result = (tmp & 0xFFFF0000) | result_low
+        "v_and_or_b32 %[res], %[tmp], %[mmsk], %[res]"   // result = (tmp & 0xFFFF0000) | result_low
         : [mask] "=&s"(nan_mask), [tmp] "=&v"(tmp), [res] "=&v"(result)
         : [a] "v"(a_bits),
           [b] "v"(b_bits),
@@ -8189,16 +7559,16 @@ __device__ __forceinline__ uint32_t f32x2_to_bf16x2_rne(float a, float b)
     // and/or v_add3_u32. Implements the same RNE + NaN logic in C++.
     auto rne_f32_to_bf16 = [](uint32_t bits) -> uint32_t {
         // If NaN, return canonical BF16 NaN (0x7fff)
-        if(__builtin_expect((bits & 0x7f800000u) == 0x7f800000u && (bits & 0x007fffffu) != 0, 0))
+        if (__builtin_expect((bits & 0x7f800000u) == 0x7f800000u && (bits & 0x007fffffu) != 0, 0))
             return 0x7fffu;
         // Round-to-nearest-even: add bias + lsb of target
-        uint32_t lsb     = (bits >> 16) & 1u;
+        uint32_t lsb = (bits >> 16) & 1u;
         uint32_t rounded = bits + 0x7fffu + lsb;
         return rounded >> 16;
     };
     uint32_t lo = rne_f32_to_bf16(a_bits);
     uint32_t hi = rne_f32_to_bf16(b_bits);
-    result      = lo | (hi << 16);
+    result = lo | (hi << 16);
 #endif
     return result;
 }
@@ -8234,11 +7604,12 @@ __device__ __forceinline__ void pack_f32_to_vec_t(vec_t<T, N>& dst, const float 
 }
 
 template <typename T, int VEC_SIZE>
-__device__ __forceinline__ void warp_rms_norm_(vec_t<T, VEC_SIZE>& input,
-                                               vec_t<T, VEC_SIZE>& gamma,
-                                               float rms_dim,
-                                               float rms_eps,
-                                               bool gemma_norm = false)
+__device__ __forceinline__ void
+warp_rms_norm_(vec_t<T, VEC_SIZE>& input,
+               vec_t<T, VEC_SIZE>& gamma,
+               float rms_dim,
+               float rms_eps,
+               bool gemma_norm = false)
 {
     vec_t<T, VEC_SIZE> norm_out;
     float acc = 0.f;
@@ -8255,7 +7626,7 @@ __device__ __forceinline__ void warp_rms_norm_(vec_t<T, VEC_SIZE>& input,
     for(int i = 0; i < VEC_SIZE; ++i)
     {
         const float weight = gemma_norm ? (1.0f + (float)gamma[i]) : (float)gamma[i];
-        input[i]           = static_cast<T>((float)input[i] * s_val * weight);
+        input[i] = static_cast<T>((float)input[i] * s_val * weight);
     }
 }
 
@@ -8415,8 +7786,7 @@ __device__ __forceinline__ int64_t get_shuffle_layout_k_base(const int64_t slot_
     const int k_head_stride = HEAD_SIZE * block_size;
     const int64_t k_per_block =
         (k_block_stride != 0) ? k_block_stride : static_cast<int64_t>(num_heads_k) * k_head_stride;
-    const int64_t dst_base =
-        static_cast<int64_t>(block_id) * k_per_block + head_id_k * k_head_stride;
+    const int64_t dst_base = static_cast<int64_t>(block_id) * k_per_block + head_id_k * k_head_stride;
     // Pre-compute K base offset: since VEC_SIZE <= x, all elements are in the same
     // chunk
     const int chunk_id     = po2_div(access_id_in_head, x);
@@ -8441,8 +7811,7 @@ __device__ __forceinline__ int64_t get_shuffle_layout_v_base(const int64_t slot_
     const int v_head_stride = po2_div(block_size, x) * HEAD_SIZE * x;
     const int64_t v_per_block =
         (v_block_stride != 0) ? v_block_stride : static_cast<int64_t>(num_heads_v) * v_head_stride;
-    const int64_t dst_base =
-        static_cast<int64_t>(block_id) * v_per_block + head_id_v * v_head_stride;
+    const int64_t dst_base = static_cast<int64_t>(block_id) * v_per_block + head_id_v * v_head_stride;
     // Pre-compute V base offset (fixed for this token)
     const int v_slot_chunk    = po2_div(block_offset, x);
     const int v_slot_in_chunk = po2_mod(block_offset, x);
@@ -8477,25 +7846,25 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                                           KVT* k_cache,
                                           KVT* v_cache,
                                           const int64_t* slot_mapping,
-                                          float per_tensor_k_scale        = 1.0,
-                                          float per_tensor_v_scale        = 1.0,
-                                          KVT* k_out                      = nullptr,
-                                          KVT* v_out                      = nullptr,
-                                          bool use_shuffle_layout         = false,
-                                          int block_size                  = 0,
-                                          int x                           = 0,
-                                          int rotary_dim                  = 0,
-                                          int64_t k_block_stride          = 0,
-                                          int64_t v_block_stride          = 0,
-                                          bool gemma_norm                 = false,
-                                          int64_t k_token_stride          = 0,
-                                          int64_t k_head_stride           = 0,
-                                          int64_t v_token_stride          = 0,
-                                          int64_t v_head_stride           = 0,
-                                          bool v_norm                     = false,
-                                          KVT* q_out_fp8                  = nullptr,
+                                          float per_tensor_k_scale = 1.0,
+                                          float per_tensor_v_scale = 1.0,
+                                          KVT* k_out               = nullptr,
+                                          KVT* v_out               = nullptr,
+                                          bool use_shuffle_layout  = false,
+                                          int block_size           = 0,
+                                          int x                    = 0,
+                                          int rotary_dim           = 0,
+                                          int64_t k_block_stride   = 0,
+                                          int64_t v_block_stride   = 0,
+                                          bool gemma_norm          = false,
+                                          int64_t k_token_stride   = 0,
+                                          int64_t k_head_stride    = 0,
+                                          int64_t v_token_stride   = 0,
+                                          int64_t v_head_stride    = 0,
+                                          bool v_norm              = false,
+                                          KVT* q_out_fp8           = nullptr,
                                           const float* per_tensor_q_scale = nullptr,
-                                          T* k_out_unquantized            = nullptr)
+                                          T* k_out_unquantized     = nullptr)
 {
     constexpr int VEC_SIZE        = HEAD_SIZE / WARP_SIZE;
     constexpr int HALF_HEAD_SIZE  = HEAD_SIZE / 2;
@@ -8720,13 +8089,8 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
             const int head_id_k = head_id_in_token - num_heads_q;
             if(use_shuffle_layout)
             {
-                int64_t k_base = get_shuffle_layout_k_base<HEAD_SIZE>(slot_id,
-                                                                      block_size,
-                                                                      num_heads_k,
-                                                                      head_id_k,
-                                                                      access_id_in_head,
-                                                                      x,
-                                                                      k_block_stride);
+                int64_t k_base = get_shuffle_layout_k_base<HEAD_SIZE>(
+                    slot_id, block_size, num_heads_k, head_id_k, access_id_in_head, x, k_block_stride);
                 out_kv_vec.store(k_cache + k_base);
             }
             else
@@ -8736,9 +8100,9 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                 const int64_t slot_size = static_cast<int64_t>(num_heads_k) * HEAD_SIZE;
                 // Each stride 0 => contiguous fallback (num_heads*HEAD_SIZE,
                 // HEAD_SIZE); non-zero writes a strided view (e.g. #44455) in place.
-                const int64_t tok_stride = (k_token_stride != 0) ? k_token_stride : slot_size;
-                const int64_t head_stride =
-                    (k_head_stride != 0) ? k_head_stride : static_cast<int64_t>(HEAD_SIZE);
+                const int64_t tok_stride  = (k_token_stride != 0) ? k_token_stride : slot_size;
+                const int64_t head_stride = (k_head_stride != 0) ? k_head_stride
+                                                                  : static_cast<int64_t>(HEAD_SIZE);
                 int64_t offset;
                 if(block_size == 0)
                 {
@@ -8803,10 +8167,10 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
         {
             // Same stride-aware scheme as K (block/token/head; 0 => contiguous
             // fallback, non-zero writes a strided view such as the #44455 packed).
-            const int64_t slot_size  = static_cast<int64_t>(num_heads_v) * HEAD_SIZE;
-            const int64_t tok_stride = (v_token_stride != 0) ? v_token_stride : slot_size;
-            const int64_t head_stride =
-                (v_head_stride != 0) ? v_head_stride : static_cast<int64_t>(HEAD_SIZE);
+            const int64_t slot_size = static_cast<int64_t>(num_heads_v) * HEAD_SIZE;
+            const int64_t tok_stride  = (v_token_stride != 0) ? v_token_stride : slot_size;
+            const int64_t head_stride = (v_head_stride != 0) ? v_head_stride
+                                                             : static_cast<int64_t>(HEAD_SIZE);
             int64_t offset;
             if(block_size == 0)
             {
@@ -8819,7 +8183,7 @@ __global__ void fused_mrope_rms_kv_kernel(const T* qkv,
                 const int64_t block_stride = (v_block_stride != 0)
                                                  ? v_block_stride
                                                  : static_cast<int64_t>(block_size) * slot_size;
-                offset                     = block_id * block_stride + block_offset * tok_stride +
+                offset = block_id * block_stride + block_offset * tok_stride +
                          head_id_v * head_stride + access_id_in_head;
             }
             out_kv_vec.store(v_cache + offset);
@@ -8879,11 +8243,9 @@ void fused_mrope_rms_set_kv(const T* qkv,
     // powers of two. Every vLLM block_size and every x = 16 / sizeof(elem) satisfies
     // it, but check rather than corrupt the cache silently if that ever changes.
     AITER_CHECK(block_size == 0 || (block_size & (block_size - 1)) == 0,
-                "block_size must be a power of 2, got ",
-                block_size);
+                "block_size must be a power of 2, got ", block_size);
     AITER_CHECK(!use_shuffle_layout || (x > 0 && (x & (x - 1)) == 0),
-                "x must be a power of 2 when use_shuffle_layout is set, got ",
-                x);
+                "x must be a power of 2 when use_shuffle_layout is set, got ", x);
     auto dim           = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
     auto expected_half = rotary_dim > 0 ? rotary_dim / 2 : head_size / 2;
     AITER_CHECK(dim == expected_half,
@@ -9016,35 +8378,33 @@ void fused_rope_rms_set_kv(const T* qkv,
                            KVT* v_cache,
                            const int64_t* slot_mapping,
                            hipStream_t stream,
-                           float per_tensor_k_scale        = 1.0,
-                           float per_tensor_v_scale        = 1.0,
-                           KVT* k_out                      = nullptr,
-                           KVT* v_out                      = nullptr,
-                           bool use_shuffle_layout         = false,
-                           int64_t block_size              = 0,
-                           int64_t x                       = 0,
-                           int64_t rotary_dim              = 0,
-                           int64_t k_block_stride          = 0,
-                           int64_t v_block_stride          = 0,
-                           int64_t k_token_stride          = 0,
-                           int64_t k_head_stride           = 0,
-                           int64_t v_token_stride          = 0,
-                           int64_t v_head_stride           = 0,
-                           bool v_norm                     = false,
-                           KVT* q_out_fp8                  = nullptr,
+                           float per_tensor_k_scale = 1.0,
+                           float per_tensor_v_scale = 1.0,
+                           KVT* k_out               = nullptr,
+                           KVT* v_out               = nullptr,
+                           bool use_shuffle_layout  = false,
+                           int64_t block_size       = 0,
+                           int64_t x                = 0,
+                           int64_t rotary_dim       = 0,
+                           int64_t k_block_stride   = 0,
+                           int64_t v_block_stride   = 0,
+                           int64_t k_token_stride   = 0,
+                           int64_t k_head_stride    = 0,
+                           int64_t v_token_stride   = 0,
+                           int64_t v_head_stride    = 0,
+                           bool v_norm              = false,
+                           KVT* q_out_fp8           = nullptr,
                            const float* per_tensor_q_scale = nullptr,
-                           T* k_out_unquantized            = nullptr)
+                           T* k_out_unquantized     = nullptr)
 {
     AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256 || head_size == 512);
     // po2_div/po2_mod in the paged and shuffle-layout address math assume these are
     // powers of two. Every vLLM block_size and every x = 16 / sizeof(elem) satisfies
     // it, but check rather than corrupt the cache silently if that ever changes.
     AITER_CHECK(block_size == 0 || (block_size & (block_size - 1)) == 0,
-                "block_size must be a power of 2, got ",
-                block_size);
+                "block_size must be a power of 2, got ", block_size);
     AITER_CHECK(!use_shuffle_layout || (x > 0 && (x & (x - 1)) == 0),
-                "x must be a power of 2 when use_shuffle_layout is set, got ",
-                x);
+                "x must be a power of 2 when use_shuffle_layout is set, got ", x);
     // The shuffle-layout K write is a single contiguous vec_t store of
     // VEC_SIZE = head_size / WARP_SIZE elements, and get_shuffle_layout_k_base()
     // assumes all of them land in one x-wide chunk (VEC_SIZE <= x). For
@@ -9063,104 +8423,90 @@ void fused_rope_rms_set_kv(const T* qkv,
     dim3 numBlocks((total_warps + num_warps_per_block - 1) / num_warps_per_block);
     std::array<int64_t, 1> mrope_section = {0};
 
-#define DISPATCH_NEOX(HEAD_SIZE, HAS_Q_FP8, HAS_K_UNQUANT)                    \
-    if(is_neox_style)                                                         \
-    {                                                                         \
-        fused_mrope_rms_kv_kernel<T,                                          \
-                                  HEAD_SIZE,                                  \
-                                  true,                                       \
-                                  false,                                      \
-                                  false,                                      \
-                                  1,                                          \
-                                  KVT,                                        \
-                                  HAS_Q_FP8,                                  \
-                                  HAS_K_UNQUANT>                              \
-            <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                  \
-                                                        q_w,                  \
-                                                        k_w,                  \
-                                                        cos_sin,              \
-                                                        positions,            \
-                                                        positions_stride_0,   \
-                                                        positions_stride_1,   \
-                                                        num_heads_q,          \
-                                                        num_heads_k,          \
-                                                        num_heads_v,          \
-                                                        eps,                  \
-                                                        mrope_section,        \
-                                                        num_tokens,           \
-                                                        total_warps,          \
-                                                        q_out,                \
-                                                        k_cache,              \
-                                                        v_cache,              \
-                                                        slot_mapping,         \
-                                                        per_tensor_k_scale,   \
-                                                        per_tensor_v_scale,   \
-                                                        k_out,                \
-                                                        v_out,                \
-                                                        use_shuffle_layout,   \
-                                                        block_size,           \
-                                                        x,                    \
-                                                        (int)rotary_dim,      \
-                                                        k_block_stride,       \
-                                                        v_block_stride,       \
-                                                        /*gemma_norm=*/false, \
-                                                        k_token_stride,       \
-                                                        k_head_stride,        \
-                                                        v_token_stride,       \
-                                                        v_head_stride,        \
-                                                        v_norm,               \
-                                                        q_out_fp8,            \
-                                                        per_tensor_q_scale,   \
-                                                        k_out_unquantized);   \
-    }                                                                         \
-    else                                                                      \
-    {                                                                         \
-        fused_mrope_rms_kv_kernel<T,                                          \
-                                  HEAD_SIZE,                                  \
-                                  false,                                      \
-                                  false,                                      \
-                                  false,                                      \
-                                  1,                                          \
-                                  KVT,                                        \
-                                  HAS_Q_FP8,                                  \
-                                  HAS_K_UNQUANT>                              \
-            <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                  \
-                                                        q_w,                  \
-                                                        k_w,                  \
-                                                        cos_sin,              \
-                                                        positions,            \
-                                                        positions_stride_0,   \
-                                                        positions_stride_1,   \
-                                                        num_heads_q,          \
-                                                        num_heads_k,          \
-                                                        num_heads_v,          \
-                                                        eps,                  \
-                                                        mrope_section,        \
-                                                        num_tokens,           \
-                                                        total_warps,          \
-                                                        q_out,                \
-                                                        k_cache,              \
-                                                        v_cache,              \
-                                                        slot_mapping,         \
-                                                        per_tensor_k_scale,   \
-                                                        per_tensor_v_scale,   \
-                                                        k_out,                \
-                                                        v_out,                \
-                                                        use_shuffle_layout,   \
-                                                        block_size,           \
-                                                        x,                    \
-                                                        (int)rotary_dim,      \
-                                                        k_block_stride,       \
-                                                        v_block_stride,       \
-                                                        /*gemma_norm=*/false, \
-                                                        k_token_stride,       \
-                                                        k_head_stride,        \
-                                                        v_token_stride,       \
-                                                        v_head_stride,        \
-                                                        v_norm,               \
-                                                        q_out_fp8,            \
-                                                        per_tensor_q_scale,   \
-                                                        k_out_unquantized);   \
+#define DISPATCH_NEOX(HEAD_SIZE, HAS_Q_FP8, HAS_K_UNQUANT)                   \
+    if(is_neox_style)                                                        \
+    {                                                                        \
+        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, true, false, false, 1, KVT,  \
+                                  HAS_Q_FP8, HAS_K_UNQUANT>                  \
+            <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                 \
+                                                        q_w,                 \
+                                                        k_w,                 \
+                                                        cos_sin,             \
+                                                        positions,           \
+                                                        positions_stride_0,  \
+                                                        positions_stride_1,  \
+                                                        num_heads_q,         \
+                                                        num_heads_k,         \
+                                                        num_heads_v,         \
+                                                        eps,                 \
+                                                        mrope_section,       \
+                                                        num_tokens,          \
+                                                        total_warps,         \
+                                                        q_out,               \
+                                                        k_cache,             \
+                                                        v_cache,             \
+                                                        slot_mapping,        \
+                                                        per_tensor_k_scale,  \
+                                                        per_tensor_v_scale,  \
+                                                        k_out,               \
+                                                        v_out,               \
+                                                        use_shuffle_layout,  \
+                                                        block_size,          \
+                                                        x,                   \
+                                                        (int)rotary_dim,     \
+                                                        k_block_stride,      \
+                                                        v_block_stride,      \
+                                                        /*gemma_norm=*/false,\
+                                                        k_token_stride,      \
+                                                        k_head_stride,       \
+                                                        v_token_stride,      \
+                                                        v_head_stride,       \
+                                                        v_norm,              \
+                                                        q_out_fp8,           \
+                                                        per_tensor_q_scale,  \
+                                                        k_out_unquantized);  \
+    }                                                                        \
+    else                                                                     \
+    {                                                                        \
+        fused_mrope_rms_kv_kernel<T, HEAD_SIZE, false, false, false, 1, KVT, \
+                                  HAS_Q_FP8, HAS_K_UNQUANT>                  \
+            <<<numBlocks, threadsPerBlock, 0, stream>>>(qkv,                 \
+                                                        q_w,                 \
+                                                        k_w,                 \
+                                                        cos_sin,             \
+                                                        positions,           \
+                                                        positions_stride_0,  \
+                                                        positions_stride_1,  \
+                                                        num_heads_q,         \
+                                                        num_heads_k,         \
+                                                        num_heads_v,         \
+                                                        eps,                 \
+                                                        mrope_section,       \
+                                                        num_tokens,          \
+                                                        total_warps,         \
+                                                        q_out,               \
+                                                        k_cache,             \
+                                                        v_cache,             \
+                                                        slot_mapping,        \
+                                                        per_tensor_k_scale,  \
+                                                        per_tensor_v_scale,  \
+                                                        k_out,               \
+                                                        v_out,               \
+                                                        use_shuffle_layout,  \
+                                                        block_size,          \
+                                                        x,                   \
+                                                        (int)rotary_dim,     \
+                                                        k_block_stride,      \
+                                                        v_block_stride,      \
+                                                        /*gemma_norm=*/false,\
+                                                        k_token_stride,      \
+                                                        k_head_stride,       \
+                                                        v_token_stride,      \
+                                                        v_head_stride,       \
+                                                        v_norm,              \
+                                                        q_out_fp8,           \
+                                                        per_tensor_q_scale,  \
+                                                        k_out_unquantized);  \
     }
 
 #define DISPATCH_HEAD_SIZE(HAS_Q_FP8, HAS_K_UNQUANT)              \

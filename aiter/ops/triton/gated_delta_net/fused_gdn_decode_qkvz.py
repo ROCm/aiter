@@ -395,7 +395,7 @@ def fused_gdn_decode_qkvz(
         scale: query scaling, typically ``head_k_dim ** -0.5``.
         norm_eps: gated RMSNorm epsilon.
         quant_dtype: if given, also emit group-128 FP8 activations and scales.
-            ``None`` returns ``(out, None, None)`` -- use this when the consumer
+            ``None`` returns ``(out, None, None)`` — use this when the consumer
             is an unquantized Linear, which cannot accept a ``(fp8, scales)``
             tuple.
         pad_slot_id: sentinel marking padded CUDA-graph rows.

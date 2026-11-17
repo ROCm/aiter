@@ -19,15 +19,14 @@
 // bases, layouts, barriers and WMMA scheduling policy remain unchanged.
 #pragma once
 
-#include "../opus_gemm_utils.cuh" // opus.hpp + hip_minimal split, ceil_div
+#include "../opus_gemm_utils.cuh"   // opus.hpp + hip_minimal split, ceil_div
 #include "opus_gemm_traits_a16w16_gfx1250.cuh"
 #include "opus_named_vgpr_bank_gfx1250.cuh"
 
 #include <cstdint>
 
 #if !(defined(__gfx1250__) || defined(__gfx1250_strict__))
-#error \
-    "the 4wave_compute pipeline is gfx1250-only (WMMA 16x16x32 + TDM); build with --offload-arch=gfx1250"
+#error "the 4wave_compute pipeline is gfx1250-only (WMMA 16x16x32 + TDM); build with --offload-arch=gfx1250"
 #endif
 
 namespace gemm_4wave_compute_gfx1250 {
@@ -39,9 +38,8 @@ using opus::operator""_I;
 using opus_co_detail::named_vgpr_bank;
 
 // Kernel-internal derived traits: WMMA decomposition, N-subtiles, TDM windows.
-template <typename UT>
-struct kernel_traits
-{
+template<typename UT>
+struct kernel_traits {
     static constexpr int BLOCK_SIZE = UT::BLOCK_SIZE;
 
     using DataA   = typename UT::D_A;
@@ -59,9 +57,9 @@ struct kernel_traits
     // WMMA 16x16x32 (gfx1250 bf16).
     static constexpr int kWmmaM = 16, kWmmaN = 16, kWmmaK = 32;
 
-    static constexpr int kWarp = 32; // gfx1250 wave size
+    static constexpr int kWarp = 32;                       // gfx1250 wave size
     // 32 device / 64 host -- both passes must decompose to the same vtype_c.
-    static constexpr int kWarpRt   = opus::get_warp_size();
+    static constexpr int kWarpRt = opus::get_warp_size();
     static constexpr int kNumWaves = BLOCK_SIZE / kWarp;
     static_assert(kNumWaves == 4, "4wave_compute is locked to 4 waves");
 
@@ -86,7 +84,7 @@ struct kernel_traits
     static constexpr int kNumNSub    = kExpN / kExpNPerSub;
     static_assert(4 * kExpNPerSub <= 63, "a msb's ds_read count must fit the 6-bit DScnt");
 
-    static constexpr int kExpKHalf   = 2; // K-tiles per ds half
+    static constexpr int kExpKHalf   = 2;                        // K-tiles per ds half
     static constexpr int kKHalfElems = kWmmaK * kExpKHalf;
     static_assert(kBlockK % kKHalfElems == 0, "B_K must be a multiple of kWmmaK*kExpKHalf");
     static constexpr int kHalvesPerSlot = kBlockK / kKHalfElems;
@@ -97,24 +95,24 @@ struct kernel_traits
     static_assert(kHalvesPerSlot == 2,
                   "B_K must be 128: the A register buffer holds exactly two K-halves");
 
-    static constexpr int kTdmK      = kBlockK; // one TDM per B_K slot
+    static constexpr int kTdmK      = kBlockK;                   // one TDM per B_K slot
     static constexpr int kSmemPitch = UT::SMEM_PITCH;
 
     // Half-row TDM: w0+w1 split the A rows, w2+w3 split the B rows.
-    static constexpr int kTdmLoadPart   = 2;
-    static constexpr int kARowsTdm      = kBlockM / kTdmLoadPart;
-    static constexpr int kBRowsTdm      = kBlockN / kTdmLoadPart;
+    static constexpr int kTdmLoadPart = 2;
+    static constexpr int kARowsTdm    = kBlockM / kTdmLoadPart;
+    static constexpr int kBRowsTdm    = kBlockN / kTdmLoadPart;
     static constexpr int kSlotBytesTdmA = kARowsTdm * kSmemPitch * (int)sizeof(DataA);
     static constexpr int kSlotBytesTdmB = kBRowsTdm * kSmemPitch * (int)sizeof(DataB);
 
-    static constexpr int kSlotElemsA    = kBlockM * kSmemPitch;
-    static constexpr int kSlotElemsB    = kBlockN * kSmemPitch;
-    static constexpr int kSlotBytesA    = UT::SLOT_BYTES_A;
-    static constexpr int kSlotBytesB    = UT::SLOT_BYTES_B;
-    static constexpr int kSegBytesA     = UT::SEG_BYTES_A;
+    static constexpr int kSlotElemsA = kBlockM * kSmemPitch;
+    static constexpr int kSlotElemsB = kBlockN * kSmemPitch;
+    static constexpr int kSlotBytesA = UT::SLOT_BYTES_A;
+    static constexpr int kSlotBytesB = UT::SLOT_BYTES_B;
+    static constexpr int kSegBytesA  = UT::SEG_BYTES_A;
     static constexpr int kLdsTotalBytes = UT::LDS_BYTES;
 
-    static constexpr int kNumSlots = UT::NUM_SLOTS;
+    static constexpr int kNumSlots   = UT::NUM_SLOTS;
     // This pipeline's K loop is hand-unrolled three steps at a time.
     static_assert(kNumSlots == 3, "the unrolled K loop is written out for P == 3");
     static constexpr int kClusterWgM = UT::CLUSTER_WG_M;
@@ -128,100 +126,79 @@ struct kernel_traits
 
     // One b128 read vector of pad per row breaks the power-of-two bank conflict.
     using Padding = opus::tdm_traits::padding_auto<DataA, kBlockK>;
-    static_assert(
-        opus::is_same_v<Padding, opus::tdm_traits::padding<DataA, kBlockK, UT::PAD_ELEMS>>,
-        "tdm_traits::padding_auto must agree with the hand-written tier for this dtype and row "
-        "length");
+    static_assert(opus::is_same_v<Padding, opus::tdm_traits::padding<DataA, kBlockK, UT::PAD_ELEMS>>,
+                  "tdm_traits::padding_auto must agree with the hand-written tier for this dtype and row length");
     // gemm_defs sizes the segments from SMEM_PITCH, the D# is programmed from the
     // policy; they have to be the same number.
-    static_assert(Padding::pitch_elements == kSmemPitch,
-                  "LDS row pitch must match the padding policy");
+    static_assert(Padding::pitch_elements == kSmemPitch, "LDS row pitch must match the padding policy");
 
     // One window type for both operands; only tile_dim1 differs, and that is
     // patched into the D# at issue time.
-    using Window = opus::tdm<DataA, opus::seq<kTdmK, kARowsTdm>, Padding>;
+    using Window  = opus::tdm<DataA, opus::seq<kTdmK, kARowsTdm>, Padding>;
 };
 
 // kExpN-shadowed view of the traits so make_layout_rb builds the B read layout
 // for ONE msb (kExpNPerSub N-tiles) instead of the full N.
-template <typename T>
-struct sub_traits : T
-{
-    static constexpr int kExpN = T::kExpNPerSub;
-};
+template<typename T>
+struct sub_traits : T { static constexpr int kExpN = T::kExpNPerSub; };
 
 // A operand (M x K) smem read layout; wave_m selects this wave's M sub-tile.
-template <typename T>
-inline __device__ auto make_layout_ra(int lane_id, int wave_m)
-{
-    constexpr auto shape = opus::make_tuple(opus::number<T::kExpM>{},
-                                            opus::number<T::kTileM>{},
-                                            opus::number<T::kWmmaM>{},
-                                            opus::number<T::kExpKHalf>{},
-                                            opus::number<T::kTileK>{},
-                                            opus::number<T::kReptA>{},
-                                            opus::number<T::kGrpKA>{},
-                                            opus::number<T::kVecA>{});
-    constexpr auto dim   = opus::make_tuple(
+template<typename T>
+inline __device__ auto make_layout_ra(int lane_id, int wave_m) {
+    constexpr auto shape = opus::make_tuple(
+        opus::number<T::kExpM>{}, opus::number<T::kTileM>{}, opus::number<T::kWmmaM>{},
+        opus::number<T::kExpKHalf>{}, opus::number<T::kTileK>{},
+        opus::number<T::kReptA>{}, opus::number<T::kGrpKA>{}, opus::number<T::kVecA>{});
+    constexpr auto dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(
-            opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
     return opus::make_layout<0>(
         shape,
         opus::unfold_x_stride(dim, shape, opus::tuple{T::kSmemPitch, 1_I}),
-        opus::unfold_p_coord(dim,
-                             opus::tuple{wave_m, lane_id % T::kWmmaM, 0, lane_id / T::kWmmaM}));
+        opus::unfold_p_coord(dim, opus::tuple{wave_m, lane_id % T::kWmmaM, 0, lane_id / T::kWmmaM}));
 }
 
 // B operand (N x K) smem read layout. The N-dim order must be (kExpN outer,
 // kTileN inner, kWmmaN) to match the C-store layout.
-template <typename T>
-inline __device__ auto make_layout_rb(int lane_id, int wave_n)
-{
-    constexpr auto shape = opus::make_tuple(opus::number<T::kExpN>{},
-                                            opus::number<T::kTileN>{},
-                                            opus::number<T::kWmmaN>{},
-                                            opus::number<T::kExpKHalf>{},
-                                            opus::number<T::kTileK>{},
-                                            opus::number<T::kReptB>{},
-                                            opus::number<T::kGrpKB>{},
-                                            opus::number<T::kVecB>{});
-    constexpr auto dim   = opus::make_tuple(
+template<typename T>
+inline __device__ auto make_layout_rb(int lane_id, int wave_n) {
+    constexpr auto shape = opus::make_tuple(
+        opus::number<T::kExpN>{}, opus::number<T::kTileN>{}, opus::number<T::kWmmaN>{},
+        opus::number<T::kExpKHalf>{}, opus::number<T::kTileK>{},
+        opus::number<T::kReptB>{}, opus::number<T::kGrpKB>{}, opus::number<T::kVecB>{});
+    constexpr auto dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(
-            opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
     return opus::make_layout<0>(
         shape,
         opus::unfold_x_stride(dim, shape, opus::tuple{T::kSmemPitch, 1_I}),
-        opus::unfold_p_coord(dim,
-                             opus::tuple{wave_n, lane_id % T::kWmmaN, 0, lane_id / T::kWmmaN}));
+        opus::unfold_p_coord(dim, opus::tuple{wave_n, lane_id % T::kWmmaN, 0, lane_id / T::kWmmaN}));
 }
 
 // Everything the pipeline runs on: shapes derived from the block tile, the pinned
 // register placement, and the scheduling policy. The kernel body only reads these.
-template <typename T>
-struct pipeline_traits
-{
-    static constexpr int kSlots       = T::kNumSlots;      // K-step ring depth
-    static constexpr int kNSub        = T::kNumNSub;       // N sub-tiles (msb)
-    static constexpr int kHalves      = T::kHalvesPerSlot; // K-halves per slot
-    static constexpr int kTiles       = kHalves * kNSub;   // msb-tiles per K step
-    static constexpr int kExpM        = T::kExpM;
-    static constexpr int kExpN        = T::kExpNPerSub;
-    static constexpr int kExpK        = T::kExpKHalf;
-    static constexpr int kNSubN       = 2;                      // N-tiles per 32x32 sub-tile
-    static constexpr int kWmmaPerSub  = kExpM * kExpK * kNSubN; // WMMAs in one 32x32x64 sub-tile
+template<typename T>
+struct pipeline_traits {
+    static constexpr int kSlots  = T::kNumSlots;                   // K-step ring depth
+    static constexpr int kNSub   = T::kNumNSub;                    // N sub-tiles (msb)
+    static constexpr int kHalves = T::kHalvesPerSlot;               // K-halves per slot
+    static constexpr int kTiles  = kHalves * kNSub;                 // msb-tiles per K step
+    static constexpr int kExpM   = T::kExpM;
+    static constexpr int kExpN   = T::kExpNPerSub;
+    static constexpr int kExpK   = T::kExpKHalf;
+    static constexpr int kNSubN  = 2;                               // N-tiles per 32x32 sub-tile
+    static constexpr int kWmmaPerSub  = kExpM * kExpK * kNSubN;     // WMMAs in one 32x32x64 sub-tile
     static constexpr int kWmmaPerTile = kWmmaPerSub * kNSubN;
-    static constexpr int kElemA       = T::kWmmaM * T::kWmmaK / T::kWarp; // per-WMMA A elements
-    static constexpr int kElemC       = T::kWmmaM * T::kWmmaN / T::kWarp; // per-WMMA C elements
-    static constexpr int kSlice       = kExpM * kExpN;                    // C slices per msb
-    static constexpr int kNumAcc      = kNSub * kSlice;
-    static constexpr int kSubRows     = kExpN * T::kTileN * T::kWmmaN; // LDS rows per msb
-    static constexpr auto kKStep      = opus::number<T::kBlockK>{};
+    static constexpr int kElemA  = T::kWmmaM * T::kWmmaK / T::kWarp;  // per-WMMA A elements
+    static constexpr int kElemC  = T::kWmmaM * T::kWmmaN / T::kWarp;  // per-WMMA C elements
+    static constexpr int kSlice  = kExpM * kExpN;                   // C slices per msb
+    static constexpr int kNumAcc = kNSub * kSlice;
+    static constexpr int kSubRows = kExpN * T::kTileN * T::kWmmaN;  // LDS rows per msb
+    static constexpr auto kKStep = opus::number<T::kBlockK>{};
 
     // ds_read issue counts, from the same layouts the reads use.
-    using LayoutRA               = decltype(make_layout_ra<T>(0, 0));
-    using LayoutRB               = decltype(make_layout_rb<sub_traits<T>>(0, 0));
+    using LayoutRA = decltype(make_layout_ra<T>(0, 0));
+    using LayoutRB = decltype(make_layout_rb<sub_traits<T>>(0, 0));
     static constexpr int kRElemA = opus::layout_load_traits<LayoutRA, T::kVecA>::r_elem.value;
     static constexpr int kRElemB = opus::layout_load_traits<LayoutRB, T::kVecB>::r_elem.value;
 
@@ -230,11 +207,11 @@ struct pipeline_traits
     // VGPR_MSB. kBPinBase FOLLOWS the accumulator block rather than being a fixed
     // 512: pinned at 512, a tile with fewer accumulators still allocated the full
     // file and no smaller tile could ever cost fewer registers.
-    static constexpr int kAccVgpr   = kNumAcc * kElemC;
-    static constexpr int kBFrags    = kNSubN * kNSubN * kExpK; // Bt_get index space
+    static constexpr int kAccVgpr  = kNumAcc * kElemC;
+    static constexpr int kBFrags   = kNSubN * kNSubN * kExpK;  // Bt_get index space
     static constexpr int kBFragVgpr = 8;                       // bf16x16 = 8 VGPR
-    static constexpr int kAccBase   = 256;
-    static constexpr int kBPinBase  = kAccBase + kAccVgpr;
+    static constexpr int kAccBase  = 256;
+    static constexpr int kBPinBase = kAccBase + kAccVgpr;
     // The prefetch issues one load_B_sub per WMMA of a 32x32x64 sub-tile and must
     // land exactly on one buffer's fragment set. This is the real reason B_M is
     // 128: it resolves to kExpM == 2. Generalising B_M means kNSubN == kExpM.
@@ -248,14 +225,14 @@ struct pipeline_traits
     static_assert(kBPinBase + 2 * kBFrags * kBFragVgpr <= 1024,
                   "the pinned accumulator + B block overruns the VGPR file");
 
-    static constexpr int kBarrierAhead = 3; // WMMAs between barrier signal and wait
-    static constexpr int kTdmBuildW    = 4; // WMMA in the last tile that builds the D#
+    static constexpr int kBarrierAhead = 3;   // WMMAs between barrier signal and wait
+    static constexpr int kTdmBuildW    = 4;   // WMMA in the last tile that builds the D#
     // A group's count is a MAX, not a quota, so kIlSalu stays 1: any more lets the
     // solver pile scalars into one WMMA gap and leave its neighbours empty.
     static constexpr int kIlWmma = 1, kIlDs = 2, kIlSalu = 1;
     // sched_group_barrier masks (AMDGPUIGroupLP).
-    static constexpr unsigned kDsRead = 0x100u, kMfma = 0x08u, kSalu = 0x04u, kValu = 0x002u,
-                              kDsWrite = 0x200u;
+    static constexpr unsigned kDsRead = 0x100u, kMfma = 0x08u, kSalu = 0x04u,
+                              kValu = 0x002u, kDsWrite = 0x200u;
 
     // C staging: msb m is final once tile kNSub+m retires; the last one only on the
     // very last tile, so kNSub-1 is all the peeled step can fuse.
@@ -263,19 +240,19 @@ struct pipeline_traits
     static constexpr int kCRowsTdm = T::kBlockM / T::kNumWaves;
 };
 
-} // namespace gemm_4wave_compute_gfx1250
+}  // namespace gemm_4wave_compute_gfx1250
 
 // The pipeline body. __launch_bounds__ / amdgpu_num_vgpr / __cluster_dims__
 // describe the kernel ENTRY, not the body, so they live on the extern "C"
 // wrapper the offline stub TU emits (see gen_co/build_co.py) rather than here.
-template <typename UserTraits>
-__device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_kargs_gfx1250 kargs)
-{
+template<typename UserTraits>
+__device__ void gemm_a16w16_4wave_compute_body_gfx1250(
+    opus_gemm_4wave_compute_kargs_gfx1250 kargs) {
     using namespace opus;
     using namespace gemm_4wave_compute_gfx1250;
     using opus::operator""_I;
-    using T       = kernel_traits<opus::remove_cvref_t<UserTraits>>;
-    using PT      = pipeline_traits<T>;
+    using T  = kernel_traits<opus::remove_cvref_t<UserTraits>>;
+    using PT = pipeline_traits<T>;
     using DataA   = typename T::DataA;
     using DataB   = typename T::DataB;
     using DataC   = typename T::DataC;
@@ -307,19 +284,18 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
     const int stride_b = kargs.stride_b;
     const int stride_c = kargs.stride_c;
 
-    const DataA* base_a = reinterpret_cast<const DataA*>(kargs.ptr_a) +
-                          (size_t)batch_id * (size_t)kargs.stride_a_batch;
-    const DataB* base_b = reinterpret_cast<const DataB*>(kargs.ptr_b) +
-                          (size_t)batch_id * (size_t)kargs.stride_b_batch;
+    const DataA* base_a = reinterpret_cast<const DataA*>(kargs.ptr_a)
+                        + (size_t)batch_id * (size_t)kargs.stride_a_batch;
+    const DataB* base_b = reinterpret_cast<const DataB*>(kargs.ptr_b)
+                        + (size_t)batch_id * (size_t)kargs.stride_b_batch;
     // C's batch stride is derived rather than passed: it keeps kargs at 64 B,
     // and m * stride_c stays right for a row-padded C, which the host's old
     // M * N did not. 64-bit because it crosses 2^31 at 4 GiB of bf16.
-    DataC* base_c = reinterpret_cast<DataC*>(kargs.ptr_c) +
-                    (size_t)batch_id * (size_t)((int64_t)kargs.m * stride_c);
+    DataC*       base_c = reinterpret_cast<DataC*>(kargs.ptr_c)
+                        + (size_t)batch_id * (size_t)((int64_t)kargs.m * stride_c);
 
     const int k_steps = ceil_div(kargs.k, T::kBlockK);
-    if(k_steps <= 0)
-        return;
+    if (k_steps <= 0) return;
 
     __shared__ char lds_buf[T::kLdsTotalBytes];
     DataA* smem_a = reinterpret_cast<DataA*>(lds_buf);
@@ -339,7 +315,7 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
     //   w0/w1: A rows [0, kARowsTdm) / [kARowsTdm, B_M)
     //   w2/w3: B rows [0, kBRowsTdm) / [kBRowsTdm, B_N)
     const bool is_operand_a = (wave_id <= 1);
-    const int row_half_id   = wave_id & 1; // which half of the operand's rows this wave takes
+    const int  row_half_id  = wave_id & 1;       // which half of the operand's rows this wave takes
 
     // Build both and select once, not seven selects over their inputs. The extents
     // are the WHOLE tensor's, so the ragged last tile needs no handling.
@@ -371,20 +347,19 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
     // wraps on a runtime P * slot_elems is 16 fewer instructions but 0.5% slower,
     // because the add-compare-select then sits in series.
     int slot_index = 0, slot_offset = 0;
-    auto advance_slot = [&]() __attribute__((always_inline))
-    {
+    auto advance_slot = [&]() __attribute__((always_inline)) {
         const bool wrap = (slot_index + 1 == PT::kSlots);
         slot_offset += (wrap ? 1 - PT::kSlots : 1) * slot_elems;
-        slot_index = wrap ? 0 : slot_index + 1;
+        slot_index   = wrap ? 0 : slot_index + 1;
     };
 
     // WMMA setup: per-msb sub-tile mma, M-split with wave_m = wave_id.
-    auto mma  = make_tiled_mma<DataA, DataB, DataAcc>(seq<T::kExpM, T::kExpNPerSub, T::kExpKHalf>{},
-                                                     seq<T::kTileM, T::kTileN, T::kTileK>{},
-                                                     seq<T::kWmmaM, T::kWmmaN, T::kWmmaK>{},
-                                                     wmma_adaptor_swap_ab{});
-    auto u_ra = make_layout_ra<T>(lane_id, wave_id);       // A: wave's M rows
-    auto u_rb = make_layout_rb<sub_traits<T>>(lane_id, 0); // B: one msb
+    auto mma = make_tiled_mma<DataA, DataB, DataAcc>(
+        seq<T::kExpM, T::kExpNPerSub, T::kExpKHalf>{},
+        seq<T::kTileM, T::kTileN, T::kTileK>{},
+        seq<T::kWmmaM, T::kWmmaN, T::kWmmaK>{}, wmma_adaptor_swap_ab{});
+    auto u_ra = make_layout_ra<T>(lane_id, wave_id);              // A: wave's M rows
+    auto u_rb = make_layout_rb<sub_traits<T>>(lane_id, 0);        // B: one msb
 
     using VA = typename decltype(mma)::vtype_a;
     // Must lower through the builtin, not asm: asm plus a pinned physreg tuple hits
@@ -393,10 +368,10 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
 
     // opus::vector_t throughout: is_vector_v is what slice/set_slice/cast/store
     // dispatch on.
-    using bf16x16 = opus::vector_t<DataA, 16>;   // one WMMA's B operand
-    using f32x8   = opus::vector_t<DataAcc, 8>;  // one WMMA's C slice
-    using cx8     = opus::vector_t<DataC, 8>;    // one C store unit: 8 N, 16 B
-    using u32x4   = opus::vector_t<unsigned, 4>; // the same 16 B, as select-able DWORD
+    using bf16x16  = opus::vector_t<DataA, 16>;     // one WMMA's B operand
+    using f32x8    = opus::vector_t<DataAcc, 8>;    // one WMMA's C slice
+    using cx8      = opus::vector_t<DataC, 8>;      // one C store unit: 8 N, 16 B
+    using u32x4    = opus::vector_t<unsigned, 4>;   // the same 16 B, as select-able DWORD
     static_assert(sizeof(cx8) == sizeof(u32x4), "the C store unit must be a whole number of DWORD");
 
     // Both K-halves live at once; the allocator overlaps them, which is where the K
@@ -409,14 +384,12 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
     // tile-t WMMA has not read: a VA_VDST drain. The two buffers are one bank so
     // a single base covers both.
     named_vgpr_bank<bf16x16, PT::kBPinBase, PT::kBFragVgpr, 2 * PT::kBFrags> b_frag;
-    auto Bt_set = [&](auto bufN, auto ksubN, bf16x16 v) __attribute__((always_inline))
-    {
+    auto Bt_set = [&](auto bufN, auto ksubN, bf16x16 v) __attribute__((always_inline)) {
         constexpr int bi = decltype(bufN)::value, ki = decltype(ksubN)::value;
         static_assert(bi < 2 && ki < PT::kBFrags, "B sub-tile out of range");
         b_frag.template set<bi * PT::kBFrags + ki>(v);
     };
-    auto Bt_get = [&](auto bufN, auto ksubN) __attribute__((always_inline))->bf16x16
-    {
+    auto Bt_get = [&](auto bufN, auto ksubN) __attribute__((always_inline)) -> bf16x16 {
         constexpr int bi = decltype(bufN)::value, ki = decltype(ksubN)::value;
         return b_frag.template get<bi * PT::kBFrags + ki>();
     };
@@ -428,37 +401,29 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
     auto offs_b = opus::layout_to_offsets<T::kVecB>(u_rb);
 
     // One K-half of A into v_a[abuf].
-    auto load_A = [&](int s, int half, int abuf) __attribute__((always_inline))
-    {
+    auto load_A = [&](int s, int half, int abuf) __attribute__((always_inline)) {
         const int base_elem = s * T::kSlotElemsA + half * T::kKHalfElems;
-        auto sm             = make_smem(smem_a);
+        auto sm = make_smem(smem_a);
         VA r;
         opus::static_for<PT::kRElemA>([&](auto iN) __attribute__((always_inline)) {
             constexpr int i = iN.value;
-            opus::set_slice(r,
-                            sm.template load<T::kVecA>(base_elem + offs_a[i]),
-                            opus::number<i * T::kVecA>{},
-                            opus::number<(i + 1) * T::kVecA>{});
+            opus::set_slice(r, sm.template load<T::kVecA>(base_elem + offs_a[i]),
+                            opus::number<i * T::kVecA>{}, opus::number<(i + 1) * T::kVecA>{});
         });
         v_a[abuf] = r;
     };
 
     // One B sub-tile (bf16x16 = one WMMA's B = 2 ds_read) straight into its pinned
     // slot, so the K loop can interleave single prefetches with single WMMAs.
-    auto load_B_sub = [&](int s, int half, int msb, auto bufN, auto ksubN)
-        __attribute__((always_inline))
-    {
+    auto load_B_sub = [&](int s, int half, int msb, auto bufN, auto ksubN) __attribute__((always_inline)) {
         constexpr int ksub = decltype(ksubN)::value;
-        const int be =
-            s * T::kSlotElemsB + msb * PT::kSubRows * T::kSmemPitch + half * T::kKHalfElems;
+        const int be = s * T::kSlotElemsB + msb * PT::kSubRows * T::kSmemPitch + half * T::kKHalfElems;
         auto sm = make_smem(smem_b);
         bf16x16 sub;
         opus::static_for<2>([&](auto eN) __attribute__((always_inline)) {
             constexpr int e = eN.value;
-            opus::set_slice(sub,
-                            sm.template load<T::kVecB>(be + offs_b[2 * ksub + e]),
-                            opus::number<e * T::kVecB>{},
-                            opus::number<(e + 1) * T::kVecB>{});
+            opus::set_slice(sub, sm.template load<T::kVecB>(be + offs_b[2 * ksub + e]),
+                            opus::number<e * T::kVecB>{}, opus::number<(e + 1) * T::kVecB>{});
         });
         Bt_set(bufN, ksubN, sub);
     };
@@ -466,22 +431,20 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
     // Persistent accumulators, one named eight-VGPR tuple per WMMA C slice.
     // A whole-tile vector is too wide for the named-register backend lookup.
     named_vgpr_bank<f32x8, PT::kAccBase, PT::kElemC, PT::kNumAcc> acc;
-    auto acc_set = [&](auto aiN, f32x8 v) __attribute__((always_inline))
-    {
+    auto acc_set = [&](auto aiN, f32x8 v) __attribute__((always_inline)) {
         constexpr int ai = decltype(aiN)::value;
         static_assert(ai < PT::kNumAcc, "accumulator index out of range");
         acc.template set<ai>(v);
     };
-    auto acc_get = [&](auto aiN) __attribute__((always_inline))->f32x8
-    {
+    auto acc_get = [&](auto aiN) __attribute__((always_inline)) -> f32x8 {
         return acc.template get<decltype(aiN)::value>();
     };
 
     // C staging, hoisted above the K loop so the peeled step can fuse it. All of it
     // is lane identity; `smem_c` is the one runtime piece, aimed at an idle ring
     // slot just before the step that first writes it.
-    static_assert(T::kBlockM * T::kBlockN * (int)sizeof(DataC) <=
-                      T::kSlotElemsB * (int)sizeof(DataB),
+    static_assert(T::kBlockM * T::kBlockN * (int)sizeof(DataC)
+                      <= T::kSlotElemsB * (int)sizeof(DataB),
                   "the C tile must fit in the one B ring slot it stages through");
 
     // Row pitch 512 B is a multiple of 32 dwords, so M does not move the LDS bank
@@ -491,44 +454,41 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
     // swap_ab transposes the WMMA C layout: grpn_c walks M, grpm_c splits N.
     using mma_t = opus::remove_cvref_t<decltype(mma)>;
     static_assert(mma_t::grpn_c == T::kWmmaM, "swap_ab must put grpn_c on the M axis");
-    static_assert(mma_t::grpm_c * (T::kWmmaN / mma_t::grpm_c) == T::kWmmaN,
-                  "N must split evenly over grpm_c");
+    static_assert(mma_t::grpm_c * (T::kWmmaN / mma_t::grpm_c) == T::kWmmaN, "N must split evenly over grpm_c");
     static_assert((PT::kExpN & (PT::kExpN - 1)) == 0, "the group rotation masks with kExpN - 1");
-    static_assert(PT::kExpN * T::kWmmaN == PT::kSubRows,
-                  "a msb sub-tile is exactly kExpN groups of kWmmaN");
+    static_assert(PT::kExpN * T::kWmmaN == PT::kSubRows, "a msb sub-tile is exactly kExpN groups of kWmmaN");
 
-    const int lane_m = lane_id % mma_t::grpn_c; // this lane's row, 0..15
+    const int lane_m = lane_id % mma_t::grpn_c;                              // this lane's row, 0..15
     const int lane_n = (lane_id / mma_t::grpn_c) * (T::kWmmaN / mma_t::grpm_c);
     const int rot    = lane_m & (PT::kExpN - 1);
     const int c_base = (wave_id * T::kWmmaM + lane_m) * T::kBlockN + lane_n;
-    DataC* smem_c    = nullptr;
+    DataC* smem_c = nullptr;
 
     // Cast one msb to bf16 and stage it, rotated. Each store burst reads a register
     // the cvt just wrote, so it is fronted with a va_vdst(0) drain, 10 in all; both
     // ways of buying distance measured worse (-0.4 to -1.6% fragmenting the bursts,
     // -0.1 to -2.1% hoisting the casts).
-    auto store_msb = [&](auto mN) __attribute__((always_inline))
-    {
+    auto store_msb = [&](auto mN) __attribute__((always_inline)) {
         constexpr int msb = decltype(mN)::value;
-        auto s_c          = make_smem(smem_c + msb * PT::kSubRows);
+        auto s_c = make_smem(smem_c + msb * PT::kSubRows);
         opus::static_for<PT::kExpM>([&](auto imN) __attribute__((always_inline)) {
             constexpr int im = decltype(imN)::value;
             u32x4 g[PT::kExpN];
             opus::static_for<PT::kExpN>([&](auto inN) __attribute__((always_inline)) {
                 constexpr int in = decltype(inN)::value;
-                const cx8 v      = opus::cast<DataC>(
+                const cx8 v = opus::cast<DataC>(
                     acc_get(opus::number<msb * PT::kSlice + (im * PT::kExpN + in)>{}));
                 g[in] = __builtin_bit_cast(u32x4, v);
             });
             // Rotate the four groups left by `rot`, as two v_cndmask stages.
             u32x4 t[PT::kExpN], o[PT::kExpN];
-#pragma unroll
-            for(int q = 0; q < PT::kExpN; ++q)
-                for(int i = 0; i < 4; ++i)
+            #pragma unroll
+            for (int q = 0; q < PT::kExpN; ++q)
+                for (int i = 0; i < 4; ++i)
                     t[q][i] = (rot & 1) ? g[(q + 1) & (PT::kExpN - 1)][i] : g[q][i];
-#pragma unroll
-            for(int q = 0; q < PT::kExpN; ++q)
-                for(int i = 0; i < 4; ++i)
+            #pragma unroll
+            for (int q = 0; q < PT::kExpN; ++q)
+                for (int i = 0; i < 4; ++i)
                     o[q][i] = (rot & 2) ? t[(q + 2) & (PT::kExpN - 1)][i] : t[q][i];
             opus::static_for<PT::kExpN>([&](auto sN) __attribute__((always_inline)) {
                 constexpr int s = decltype(sN)::value;
@@ -546,8 +506,7 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
     // Cluster sync before the first multicast TDM, so peers arrive together and GL1
     // can merge their requests instead of releasing each on its timeout.
     __builtin_amdgcn_s_barrier();
-    if(wave_id == 0)
-    {
+    if (wave_id == 0) {
         __builtin_amdgcn_s_barrier_signal(-3);
         __builtin_amdgcn_s_barrier_wait(-3);
     }
@@ -557,22 +516,17 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
     // Tile-less workgroups leave here, not one line earlier: -3 counts one arrival
     // PER WORKGROUP, so skipping the barrier above hangs every peer. Survivors still
     // name the departed in their masks -- harmless, just a GL1 timeout.
-    if(tile_oob)
-        return;
+    if (tile_oob) return;
     // Unconditional prime: past K the D#'s tensor_dim0 saturates to 0, so a step
     // beyond the last is a zero-extent DMA that only bumps tensorcnt -- which is
     // what lets the hot loop wait tensorcnt(1) unguarded.
     opus::static_for<PT::kSlots>([&](auto iN) __attribute__((always_inline)) {
-        if constexpr(iN.value > 0)
-        {
-            tdm_window.move(PT::kKStep);
-            advance_slot();
-        }
+        if constexpr (iN.value > 0) { tdm_window.move(PT::kKStep); advance_slot(); }
         // Fused: the prologue has no WMMA stream to spread the descriptor across.
         tdm_window.async_load(slot_offset);
     });
-    __builtin_amdgcn_s_wait_tensorcnt(PT::kSlots - 1); // land step 0, rest stay in flight
-    __builtin_amdgcn_s_barrier_signal(-1);             // publish step 0
+    __builtin_amdgcn_s_wait_tensorcnt(PT::kSlots - 1);   // land step 0, rest stay in flight
+    __builtin_amdgcn_s_barrier_signal(-1);               // publish step 0
     __builtin_amdgcn_s_barrier_wait(-1);
 
     // Slot 0's tile-0 dependencies, the same set the last tile issues for the next
@@ -589,15 +543,14 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
     // `s * slot_elems` feeds a ds_read address through a VALU and earns an
     // s_wait_alu va_vdst(0) that drains the whole WMMA pipe.
     static_assert(PT::kSlots == 3, "the call sites below are written out for kSlots == 3");
-    const int n_body = k_steps - 1;                  // every step but the peeled last one
-    const int n_full = n_body - n_body % PT::kSlots; // those covered by whole kSlots groups
+    const int n_body = k_steps - 1;                     // every step but the peeled last one
+    const int n_full = n_body - n_body % PT::kSlots;    // those covered by whole kSlots groups
 
     // What one WMMA's gap may co-issue, in the order the solver must honour.
-    auto sched_wmma_gap = [](auto n_ds) __attribute__((always_inline))
-    {
+    auto sched_wmma_gap = [](auto n_ds) __attribute__((always_inline)) {
         __builtin_amdgcn_sched_group_barrier(PT::kSalu, PT::kIlSalu, 0);
         __builtin_amdgcn_sched_group_barrier(PT::kMfma, PT::kIlWmma, 0);
-        if constexpr(n_ds.value > 0)
+        if constexpr (n_ds.value > 0)
             __builtin_amdgcn_sched_group_barrier(PT::kDsRead, n_ds.value, 0);
     };
 
@@ -609,23 +562,21 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
     // Every tile but the last prefetches its successor's B; the last one instead
     // carries the barrier handshake, the next slot's tile-0 loads and the next
     // step's TDM, branch-free and spread over its WMMA gaps.
-    auto one_step = [&](auto cur_slot, auto next_slot) __attribute__((always_inline))
-    {
+    auto one_step = [&](auto cur_slot, auto next_slot) __attribute__((always_inline)) {
         constexpr int cur = cur_slot.value, next = next_slot.value;
         typename WindowU::descriptor tdm_payload;
         tdm_window.move(PT::kKStep);
         advance_slot();
         opus::static_for<PT::kTiles>([&](auto tileN) __attribute__((always_inline)) {
-            constexpr int tile     = tileN.value;
-            constexpr int k_half   = tile / PT::kNSub; // which half of the slot's K
-            constexpr int msb      = tile % PT::kNSub; // which N sub-tile
-            constexpr int b_buf    = tile & 1;         // B prefetch double buffer
-            constexpr bool is_last = (tile + 1 == PT::kTiles);
+            constexpr int tile      = tileN.value;
+            constexpr int k_half    = tile / PT::kNSub;   // which half of the slot's K
+            constexpr int msb       = tile % PT::kNSub;   // which N sub-tile
+            constexpr int b_buf     = tile & 1;           // B prefetch double buffer
+            constexpr bool is_last  = (tile + 1 == PT::kTiles);
             // Tile 0 is always (k-half 0, msb 0), and waits on the A ds_reads it was
             // front-loaded with; every other tile waits on its B prefetch.
-            opus::s_wait_dscnt(opus::number < tile == 0 ? PT::kRElemA : PT::kRElemB > {});
-            if constexpr(is_last)
-            {
+            opus::s_wait_dscnt(opus::number<tile == 0 ? PT::kRElemA : PT::kRElemB>{});
+            if constexpr (is_last) {
                 // Unguarded, and right for every shape: the prologue primed exactly
                 // kSlots and each step issues one. A guard would split the tile from
                 // the descriptor SALU below it.
@@ -643,13 +594,12 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
                 constexpr int n_idx   = (wmma / PT::kWmmaPerSub) * PT::kNSubN + in_sub % PT::kNSubN;
                 constexpr int acc_id  = msb * PT::kSlice + m_idx * PT::kExpN + n_idx;
                 constexpr int a_first = (m_idx * PT::kExpK + k_idx) * PT::kElemA;
-                acc_set(
-                    opus::number<acc_id>{},
-                    WMMA{}(opus::slice(v_a[k_half],
-                                       opus::number<a_first>{},
-                                       opus::number<a_first + PT::kElemA>{}),
-                           Bt_get(opus::number<b_buf>{}, opus::number<n_idx * PT::kExpK + k_idx>{}),
-                           acc_get(opus::number<acc_id>{})));
+                acc_set(opus::number<acc_id>{},
+                        WMMA{}(opus::slice(v_a[k_half], opus::number<a_first>{},
+                                           opus::number<a_first + PT::kElemA>{}),
+                               Bt_get(opus::number<b_buf>{},
+                                      opus::number<n_idx * PT::kExpK + k_idx>{}),
+                               acc_get(opus::number<acc_id>{})));
                 // At most one event per gap, in gap order. The prefetch feeds the
                 // next tile -- on the last one that wraps to the next slot's tile 0,
                 // the same eight loads, only placed after the handshake's gap.
@@ -658,8 +608,7 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
                 constexpr bool do_pf   = wmma >= pf_first && wmma < pf_first + PT::kWmmaPerSub;
                 constexpr bool do_hs   = is_last && wmma == PT::kBarrierAhead - 1;
 
-                if constexpr(do_hs)
-                {
+                if constexpr (do_hs) {
                     // Arrive and wait as one: split, a wave that is ahead signals the
                     // next step into this step's count.
                     __builtin_amdgcn_s_barrier();
@@ -668,32 +617,28 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
                 // All eight in this tile's first 32x32x64 sub-tile: spreading them
                 // over the whole tile cuts the counted s_wait_alu to 27 but measured
                 // -0.4 to -3.0%, by flattening load-to-use from 14-22 WMMAs to 14.
-                if constexpr(do_pf)
-                    load_B_sub(is_last ? next : cur,
-                               pf_tile / PT::kNSub,
-                               pf_tile % PT::kNSub,
-                               opus::number<pf_tile & 1>{},
-                               opus::number<wmma - pf_first>{});
-                if constexpr(is_last && wmma == PT::kWmmaPerSub + PT::kTdmBuildW)
-                {
+                if constexpr (do_pf)
+                    load_B_sub(is_last ? next : cur, pf_tile / PT::kNSub, pf_tile % PT::kNSub,
+                               opus::number<pf_tile & 1>{}, opus::number<wmma - pf_first>{});
+                if constexpr (is_last && wmma == PT::kWmmaPerSub + PT::kTdmBuildW) {
                     // Here, so the last WMMA runs ~18 cycles ahead of the DMA issue;
                     // the D#'s 12 SGPRs stay live until then, of ~36 in use.
                     tdm_payload = tdm_window.make_descriptor(slot_offset);
                     __builtin_amdgcn_sched_barrier(0);
                 }
-                if constexpr(is_last && wmma == PT::kWmmaPerTile - 1)
+                if constexpr (is_last && wmma == PT::kWmmaPerTile - 1)
                     WindowU::async_load(tdm_payload);
 
                 // The gaps ahead of the handshake carry the WMMA alone.
-                if constexpr(is_last && wmma < PT::kBarrierAhead - 1)
+                if constexpr (is_last && wmma < PT::kBarrierAhead - 1)
                     __builtin_amdgcn_sched_group_barrier(PT::kMfma, PT::kIlWmma, 0);
                 else
-                    sched_wmma_gap(opus::number < do_pf ? PT::kIlDs : do_hs ? PT::kRElemA : 0 > {});
+                    sched_wmma_gap(opus::number<do_pf ? PT::kIlDs
+                                              : do_hs ? PT::kRElemA : 0>{});
                 // Keeps a prefetch ds_read from sinking to its consumer in the next
                 // tile, which is what forced a per-WMMA dscnt(0) drain. Letting SALU
                 // cross this boundary instead is ~1.5% slower.
-                if constexpr(in_sub == PT::kWmmaPerSub - 1)
-                    __builtin_amdgcn_sched_barrier(0);
+                if constexpr (in_sub == PT::kWmmaPerSub - 1) __builtin_amdgcn_sched_barrier(0);
             });
         });
         __builtin_amdgcn_sched_barrier(0);
@@ -706,8 +651,7 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
         __builtin_amdgcn_sched_group_barrier(PT::kDsRead, PT::kRElemA, 0);
     };
 
-    for(int g = 0; g < n_full; g += PT::kSlots)
-    {
+    for (int g = 0; g < n_full; g += PT::kSlots) {
         one_step(0_I, 1_I);
         one_step(1_I, 2_I);
         one_step(2_I, 0_I);
@@ -717,18 +661,10 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
     // shape holds the main body's accumulators live across them, and only one range
     // can own the pinned tuple. Dispatched, all 640 WMMA stay pinned instead of 444,
     // at 129 fewer instructions. Each step leaves the ring one slot further on.
-    int peel_slot   = 0;
+    int peel_slot = 0;
     const int n_rem = n_body - n_full;
-    if(n_rem >= 1)
-    {
-        one_step(0_I, 1_I);
-        peel_slot = 1;
-    }
-    if(n_rem >= 2)
-    {
-        one_step(1_I, 2_I);
-        peel_slot = 2;
-    }
+    if (n_rem >= 1) { one_step(0_I, 1_I); peel_slot = 1; }
+    if (n_rem >= 2) { one_step(1_I, 2_I); peel_slot = 2; }
     // A step past the last is not a no-op: measured on gfx1250 it zero-fills its
     // whole LDS tile, and C stages in one such slot -- so drain before staging.
     __builtin_amdgcn_s_wait_tensorcnt(0);
@@ -743,8 +679,8 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
         constexpr int msb      = tile % PT::kNSub;
         constexpr int b_buf    = tile & 1;
         constexpr bool is_last = (tile + 1 == PT::kTiles);
-        constexpr int staged   = tile - PT::kNSub - 1; // the msb tile tile-1 completed
-        opus::s_wait_dscnt(opus::number < tile == 0 ? PT::kRElemA : PT::kRElemB > {});
+        constexpr int staged   = tile - PT::kNSub - 1;   // the msb tile tile-1 completed
+        opus::s_wait_dscnt(opus::number<tile == 0 ? PT::kRElemA : PT::kRElemB>{});
         opus::static_for<PT::kWmmaPerTile>([&](auto wmmaN) __attribute__((always_inline)) {
             constexpr int wmma    = wmmaN.value;
             constexpr int in_sub  = wmma % PT::kWmmaPerSub;
@@ -754,39 +690,29 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
             constexpr int acc_id  = msb * PT::kSlice + m_idx * PT::kExpN + n_idx;
             constexpr int a_first = (m_idx * PT::kExpK + k_idx) * PT::kElemA;
             acc_set(opus::number<acc_id>{},
-                    WMMA{}(opus::slice(v_a[k_half],
-                                       opus::number<a_first>{},
+                    WMMA{}(opus::slice(v_a[k_half], opus::number<a_first>{},
                                        opus::number<a_first + PT::kElemA>{}),
-                           Bt_get(opus::number<b_buf>{}, opus::number<n_idx * PT::kExpK + k_idx>{}),
+                           Bt_get(opus::number<b_buf>{},
+                                  opus::number<n_idx * PT::kExpK + k_idx>{}),
                            acc_get(opus::number<acc_id>{})));
-            if constexpr(wmma < PT::kWmmaPerSub && !is_last)
-            {
-                load_B_sub(peel_slot,
-                           (tile + 1) / PT::kNSub,
-                           (tile + 1) % PT::kNSub,
-                           opus::number<(tile + 1) & 1>{},
-                           opus::number<wmma>{});
+            if constexpr (wmma < PT::kWmmaPerSub && !is_last) {
+                load_B_sub(peel_slot, (tile + 1) / PT::kNSub, (tile + 1) % PT::kNSub,
+                           opus::number<(tile + 1) & 1>{}, opus::number<wmma>{});
                 __builtin_amdgcn_sched_group_barrier(PT::kMfma, PT::kIlWmma, 0);
                 __builtin_amdgcn_sched_group_barrier(PT::kDsRead, PT::kIlDs, 0);
-            }
-            else if constexpr(staged >= 0 && staged < PT::kFusedMsb)
-            {
+            } else if constexpr (staged >= 0 && staged < PT::kFusedMsb) {
                 // One msb is 32 cvt and 8 ds_store, spread over the slots this tile
                 // has left: kWmmaPerSub, or a whole tile on the last one, which has
                 // no prefetch to place.
                 constexpr int n_slot = is_last ? PT::kWmmaPerTile : PT::kWmmaPerSub;
-                if constexpr(wmma == PT::kWmmaPerTile - n_slot)
-                    store_msb(opus::number<staged>{});
+                if constexpr (wmma == PT::kWmmaPerTile - n_slot) store_msb(opus::number<staged>{});
                 __builtin_amdgcn_sched_group_barrier(PT::kValu, 32 / n_slot, 0);
                 __builtin_amdgcn_sched_group_barrier(PT::kMfma, PT::kIlWmma, 0);
                 __builtin_amdgcn_sched_group_barrier(PT::kDsWrite, 8 / n_slot, 0);
-            }
-            else
-            {
+            } else {
                 __builtin_amdgcn_sched_group_barrier(PT::kMfma, PT::kIlWmma, 0);
             }
-            if constexpr(in_sub == PT::kWmmaPerSub - 1)
-                __builtin_amdgcn_sched_barrier(0);
+            if constexpr (in_sub == PT::kWmmaPerSub - 1) __builtin_amdgcn_sched_barrier(0);
         });
     });
     // Epilogue: the B_M x B_N tile goes out through the A/B ring -- dead once the
@@ -812,8 +738,8 @@ __device__ void gemm_a16w16_4wave_compute_body_gfx1250(opus_gemm_4wave_compute_k
     // The store partitions M contiguously, unlike the compute partition, where a
     // wave's own accumulator rows are two strided 16-row chunks.
     auto window_c = opus::make_tdm<StoreWin>(
-        (uint32_t)(reinterpret_cast<uintptr_t>(smem_c) +
-                   (size_t)wave_id * PT::kCRowsTdm * T::kBlockN * sizeof(DataC)),
+        (uint32_t)(reinterpret_cast<uintptr_t>(smem_c)
+                   + (size_t)wave_id * PT::kCRowsTdm * T::kBlockN * sizeof(DataC)),
         (void*)base_c,
         opus::make_layout<-1>(
             opus::make_tuple((uint32_t)kargs.m, (uint32_t)kargs.n),

@@ -24,23 +24,23 @@ template <typename A0DataType,
           bool NT,
           bool RuntimeSwigluLimit>
 void ck_moe_stage1_gemm_nt(const hipStream_t& stream,
-                           int tokens,
-                           int sorted_size,
-                           int N,
-                           int K,
-                           int topk,
-                           void*& hidden_states, // [m, k], input token
-                           void*& w1, // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
-                           void*& w2, // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
-                           void*& sorted_token_ids,  // [max_num_tokens_padded]
-                           void*& sorted_expert_ids, // [max_num_m_blocks]
-                           void*& sorted_weights,
-                           void*& num_valid_ids,          // [1]
-                           void*& out,                    // [max_num_tokens_padded, inter_dim]
-                           std::optional<void*> w1_scale, // [e, 1, n], gate(up) scale
-                           std::optional<void*> a1_scale, // [m, 1], token scale
-                           std::optional<int> splitk,     // splitk
-                           [[maybe_unused]] float swiglu_limit)
+                        int tokens,
+                        int sorted_size,
+                        int N,
+                        int K,
+                        int topk,
+                        void*& hidden_states, // [m, k], input token
+                        void*& w1,            // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
+                        void*& w2, // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
+                        void*& sorted_token_ids,  // [max_num_tokens_padded]
+                        void*& sorted_expert_ids, // [max_num_m_blocks]
+                        void*& sorted_weights,
+                        void*& num_valid_ids,          // [1]
+                        void*& out,                    // [max_num_tokens_padded, inter_dim]
+                        std::optional<void*> w1_scale, // [e, 1, n], gate(up) scale
+                        std::optional<void*> a1_scale, // [m, 1], token scale
+                        std::optional<int> splitk,     // splitk
+                        [[maybe_unused]] float swiglu_limit)
 {
     const bool enabled = swiglu_limit > 0.0f && std::isfinite(swiglu_limit);
     TORCH_CHECK(enabled == RuntimeSwigluLimit,
@@ -209,8 +209,8 @@ template <typename A0DataType,
           bool PerTensorQuant,
           bool MulRoutedWeight,
           int ActOP,
-          bool PadK,
-          bool RuntimeSwigluLimit>
+          bool RuntimeSwigluLimit,
+          bool PadK>
 void ck_moe_stage1_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -237,78 +237,78 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
     if(nt.has_value() && nt.value())
     {
         ck_moe_stage1_gemm_nt<A0DataType,
-                              B0DataType,
-                              AccDataType,
-                              EDataType,
-                              CDEElementOp,
-                              PipelineVer,
-                              BLOCKSIZE,
-                              MPerBlock,
-                              NPerBlock,
-                              KPerBlock,
-                              MWaves,
-                              NWaves,
-                              Nswizzle,
-                              PerTensorQuant,
-                              MulRoutedWeight,
-                              ActOP,
-                              true,
-                              RuntimeSwigluLimit>(stream,
-                                                  tokens,
-                                                  sorted_size,
-                                                  N,
-                                                  K,
-                                                  topk,
-                                                  hidden_states,
-                                                  w1,
-                                                  w2,
-                                                  sorted_token_ids,
-                                                  sorted_expert_ids,
-                                                  sorted_weights,
-                                                  num_valid_ids,
-                                                  out,
-                                                  w1_scale,
-                                                  a1_scale,
-                                                  splitk,
-                                                  swiglu_limit);
+                           B0DataType,
+                           AccDataType,
+                           EDataType,
+                           CDEElementOp,
+                           PipelineVer,
+                           BLOCKSIZE,
+                           MPerBlock,
+                           NPerBlock,
+                           KPerBlock,
+                           MWaves,
+                           NWaves,
+                           Nswizzle,
+                           PerTensorQuant,
+                           MulRoutedWeight,
+                           ActOP,
+                           true,
+                           RuntimeSwigluLimit>(stream,
+                                               tokens,
+                                               sorted_size,
+                                               N,
+                                               K,
+                                               topk,
+                                               hidden_states,
+                                               w1,
+                                               w2,
+                                               sorted_token_ids,
+                                               sorted_expert_ids,
+                                               sorted_weights,
+                                               num_valid_ids,
+                                               out,
+                                               w1_scale,
+                                               a1_scale,
+                                               splitk,
+                                               swiglu_limit);
     }
     else
     {
         ck_moe_stage1_gemm_nt<A0DataType,
-                              B0DataType,
-                              AccDataType,
-                              EDataType,
-                              CDEElementOp,
-                              PipelineVer,
-                              BLOCKSIZE,
-                              MPerBlock,
-                              NPerBlock,
-                              KPerBlock,
-                              MWaves,
-                              NWaves,
-                              Nswizzle,
-                              PerTensorQuant,
-                              MulRoutedWeight,
-                              ActOP,
-                              false,
-                              RuntimeSwigluLimit>(stream,
-                                                  tokens,
-                                                  sorted_size,
-                                                  N,
-                                                  K,
-                                                  topk,
-                                                  hidden_states,
-                                                  w1,
-                                                  w2,
-                                                  sorted_token_ids,
-                                                  sorted_expert_ids,
-                                                  sorted_weights,
-                                                  num_valid_ids,
-                                                  out,
-                                                  w1_scale,
-                                                  a1_scale,
-                                                  splitk,
-                                                  swiglu_limit);
+                           B0DataType,
+                           AccDataType,
+                           EDataType,
+                           CDEElementOp,
+                           PipelineVer,
+                           BLOCKSIZE,
+                           MPerBlock,
+                           NPerBlock,
+                           KPerBlock,
+                           MWaves,
+                           NWaves,
+                           Nswizzle,
+                           PerTensorQuant,
+                           MulRoutedWeight,
+                           ActOP,
+                           false,
+                           RuntimeSwigluLimit>(stream,
+                                               tokens,
+                                               sorted_size,
+                                               N,
+                                               K,
+                                               topk,
+                                               hidden_states,
+                                               w1,
+                                               w2,
+                                               sorted_token_ids,
+                                               sorted_expert_ids,
+                                               sorted_weights,
+                                               num_valid_ids,
+                                               out,
+                                               w1_scale,
+                                               a1_scale,
+                                               splitk,
+                                               swiglu_limit);
     }
 }
 
@@ -330,7 +330,6 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                      PerTensorQuant,                          \
                                      MulRoutedWeight,                         \
                                      ActOP,                                   \
-                                     PadK,                                    \
                                      AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT>(      \
         const hipStream_t& stream,                                            \
         int tokens,                                                           \

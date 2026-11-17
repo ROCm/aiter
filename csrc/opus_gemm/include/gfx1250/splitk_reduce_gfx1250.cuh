@@ -11,7 +11,7 @@
 // The reduce path uses no WMMA -- on wave32 it is simply vectorized fp32
 // loads / adds / casts.
 //
-// -- Coalesced store, no cross-lane shuffle (triton-aligned) ----------------
+// ── Coalesced store, no cross-lane shuffle (triton-aligned) ────────────────
 // The launchers use VEC=8, so each lane owns exactly 8 bf16 = 16B = one
 // buffer_store_dwordx4. Lane l writes C[.. + l*8 .. +7], i.e. byte offset
 // l*16 at a 16B stride -> the 32 lanes of a wave write 32*16 = 512B FULLY
@@ -23,7 +23,7 @@
 // stride (vs VEC=16's 4 dwordx4 at 64B), so each 256B read transaction is
 // half- rather than quarter-utilized.
 //
-// -- Compile-time split-K (triton MAX_KSPLIT idiom) -------------------------
+// ── Compile-time split-K (triton MAX_KSPLIT idiom) ─────────────────────────
 // SPLIT_K_ template param: when > 0 the split-K accumulation loop bound is a
 // compile-time constant and is fully #pragma-unrolled (all workspace loads are
 // issued/scheduled up front, matching triton's `tl.arange(0, MAX_KSPLIT)` +
@@ -64,18 +64,17 @@ __global__ void splitk_reduce_kernel_gfx1250(const void* __restrict__ ws_ptr,
     // fp32 here. The main GEMM must write the workspace in the SAME dtype.
     using D_WS                         = D_WS_;
     const D_WS* __restrict__ workspace = reinterpret_cast<const D_WS*>(ws_ptr);
-    constexpr int VEC                  = VEC_;
-    constexpr int BLOCK                = BLOCK_;
-    constexpr bool HAS_BIAS            = HAS_BIAS_;
-    constexpr bool HAS_OOB             = HAS_OOB_;
-    using D_BIAS                       = D_BIAS_;
+    constexpr int VEC   = VEC_;
+    constexpr int BLOCK = BLOCK_;
+    constexpr bool HAS_BIAS = HAS_BIAS_;
+    constexpr bool HAS_OOB = HAS_OOB_;
+    using D_BIAS = D_BIAS_;
 
     constexpr int STEP = 16 / sizeof(D_OUT);
     static_assert(STEP * sizeof(D_OUT) == 16,
                   "D_OUT must divide a 128-bit store boundary cleanly (2B / 4B)");
-    static_assert(
-        VEC % STEP == 0,
-        "VEC must be a multiple of STEP so the fast path tiles into whole dwordx4 stores");
+    static_assert(VEC % STEP == 0,
+                  "VEC must be a multiple of STEP so the fast path tiles into whole dwordx4 stores");
     static_assert(VEC == 8 || VEC == 16,
                   "reduce tail decomposition is specialized for VEC=8 or VEC=16");
     static_assert(!HAS_BIAS || sizeof(D_BIAS) == 2 || sizeof(D_BIAS) == 4,
@@ -89,7 +88,7 @@ __global__ void splitk_reduce_kernel_gfx1250(const void* __restrict__ ws_ptr,
     const int b = bm_id / M;
     const int m = bm_id - b * M;
 
-    // -- Alternative layout: LOAD-contiguous (no permute, both sides coalesced) --
+    // ── Alternative layout: LOAD-contiguous (no permute, both sides coalesced) ──
     // Instead of "lane owns VEC contiguous N" (store-contig: 1 dwordx4 store fully
     // coalesced, but the fp32 loads are 16B @ VEC*4B stride), use a cyclic-by-4
     // layout: each lane reads a CONTIGUOUS dwordx4 of fp32 per group so the 32
@@ -173,34 +172,29 @@ __global__ void splitk_reduce_kernel_gfx1250(const void* __restrict__ ws_ptr,
     }
 
     opus::vector_t<float, VEC> bias_fp32;
-    if constexpr(HAS_BIAS)
-    {
-#pragma unroll
-        for(int t = 0; t < VEC; ++t)
-            bias_fp32[t] = 0.0f;
+    if constexpr (HAS_BIAS) {
+        #pragma unroll
+        for (int t = 0; t < VEC; ++t) bias_fp32[t] = 0.0f;
         const D_BIAS* bias_base_ptr = bias + b * bias_stride_batch;
-        auto g_bias                 = opus::make_gmem(
-            bias_base_ptr,
-            (unsigned int)((bias_stride_batch ? bias_stride_batch : N) * sizeof(D_BIAS)));
-#pragma unroll
-        for(int g = 0; g < VEC / 4; ++g)
-        {
+        auto g_bias = opus::make_gmem(bias_base_ptr,
+                        (unsigned int)((bias_stride_batch ? bias_stride_batch : N) * sizeof(D_BIAS)));
+        #pragma unroll
+        for (int g = 0; g < VEC / 4; ++g) {
             auto bv4 = g_bias.template load<4>(n_base + g * 4);
-#pragma unroll
-            for(int j = 0; j < 4; ++j)
+            #pragma unroll
+            for (int j = 0; j < 4; ++j)
                 bias_fp32[g * 4 + j] = static_cast<float>(bv4[j]);
         }
     }
 
-    const int ws_row_base   = b * padded_M * padded_N + m * padded_N + n_base;
+    const int  ws_row_base  = b * padded_M * padded_N + m * padded_N + n_base;
     const long split_stride = (long)batch * padded_M * padded_N;
 
     auto g_ws = opus::make_gmem(workspace, (unsigned int)(split_stride * split_k * sizeof(D_WS)));
 
     opus::vector_t<float, VEC> acc;
-#pragma unroll
-    for(int t = 0; t < VEC; ++t)
-        acc[t] = 0.0f;
+    #pragma unroll
+    for (int t = 0; t < VEC; ++t) acc[t] = 0.0f;
 
     // Accumulate one split-K slice into acc.
     auto accumulate = [&](int s) {
@@ -229,29 +223,23 @@ __global__ void splitk_reduce_kernel_gfx1250(const void* __restrict__ ws_ptr,
             accumulate(s);
     }
 
-    if constexpr(HAS_BIAS)
-    {
-#pragma unroll
-        for(int t = 0; t < VEC; ++t)
-            acc[t] += bias_fp32[t];
+    if constexpr (HAS_BIAS) {
+        #pragma unroll
+        for (int t = 0; t < VEC; ++t) acc[t] += bias_fp32[t];
     }
 
     opus::vector_t<D_OUT, VEC> out;
-#pragma unroll
-    for(int t = 0; t < VEC; ++t)
-        out[t] = static_cast<D_OUT>(acc[t]);
+    #pragma unroll
+    for (int t = 0; t < VEC; ++t) out[t] = static_cast<D_OUT>(acc[t]);
 
-    auto g_c        = opus::make_gmem(c_out, (unsigned int)((size_t)batch * M * N * sizeof(D_OUT)));
+    auto g_c = opus::make_gmem(c_out, (unsigned int)((size_t)batch * M * N * sizeof(D_OUT)));
     const int c_idx = b * M * N + m * N + n_base;
 
-    using opus::number;
     using opus::slice;
-#define OPUS_REDUCE_ST8(OFF) \
-    g_c.template store<8>(slice(out, number<OFF>{}, number<OFF + 8>{}), c_idx + (OFF))
-#define OPUS_REDUCE_ST4(OFF) \
-    g_c.template store<4>(slice(out, number<OFF>{}, number<OFF + 4>{}), c_idx + (OFF))
-#define OPUS_REDUCE_ST2(OFF) \
-    g_c.template store<2>(slice(out, number<OFF>{}, number<OFF + 2>{}), c_idx + (OFF))
+    using opus::number;
+#define OPUS_REDUCE_ST8(OFF) g_c.template store<8>(slice(out, number<OFF>{}, number<OFF+8>{}), c_idx + (OFF))
+#define OPUS_REDUCE_ST4(OFF) g_c.template store<4>(slice(out, number<OFF>{}, number<OFF+4>{}), c_idx + (OFF))
+#define OPUS_REDUCE_ST2(OFF) g_c.template store<2>(slice(out, number<OFF>{}, number<OFF+2>{}), c_idx + (OFF))
 #define OPUS_REDUCE_ST1(OFF) g_c.template store<1>(out[OFF], c_idx + (OFF))
 
     // Fast path: whole VEC chunk is in-row -> VEC/STEP contiguous dwordx4 stores.
@@ -265,19 +253,13 @@ __global__ void splitk_reduce_kernel_gfx1250(const void* __restrict__ ws_ptr,
         });
     };
 
-    if constexpr(!HAS_OOB)
-    {
+    if constexpr (!HAS_OOB) {
         if(n_base + VEC <= N)
             store_full();
-    }
-    else
-    {
-        if(n_base + VEC <= N)
-        {
+    } else {
+        if (n_base + VEC <= N) {
             store_full();
-        }
-        else if(n_base < N)
-        {
+        } else if (n_base < N) {
             // Tail path: decompose valid in [1, VEC-1] into descending
             // power-of-2 chunks -> dwordx4 / dwordx2 / dword / short.
             const int valid = N - n_base;
@@ -416,29 +398,19 @@ __global__ void splitk_reduce_kernel_gfx1250(const void* __restrict__ ws_ptr,
             }
             else
             { // VEC == 8: STEP=8 (bf16) or STEP=4 (fp32); valid in [1,7]
-                switch(valid)
-                {
-                case 1: OPUS_REDUCE_ST1(0); break;
-                case 2: OPUS_REDUCE_ST2(0); break;
-                case 3:
-                    OPUS_REDUCE_ST2(0);
-                    OPUS_REDUCE_ST1(2);
-                    break;
-                case 4: OPUS_REDUCE_ST4(0); break;
-                case 5:
-                    OPUS_REDUCE_ST4(0);
-                    OPUS_REDUCE_ST1(4);
-                    break;
-                case 6:
-                    OPUS_REDUCE_ST4(0);
-                    OPUS_REDUCE_ST2(4);
-                    break;
-                case 7:
-                    OPUS_REDUCE_ST4(0);
-                    OPUS_REDUCE_ST2(4);
-                    OPUS_REDUCE_ST1(6);
-                    break;
-                }
+                switch (valid) {
+                    case  1: OPUS_REDUCE_ST1( 0); break;
+                    case  2: OPUS_REDUCE_ST2( 0); break;
+                    case  3: OPUS_REDUCE_ST2( 0); OPUS_REDUCE_ST1( 2); break;
+                    case  4: OPUS_REDUCE_ST4( 0); break;
+                    case  5: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST1( 4); break;
+                    case  6: OPUS_REDUCE_ST4( 0); OPUS_REDUCE_ST2( 4); break;
+                    case 7:
+                        OPUS_REDUCE_ST4(0);
+                        OPUS_REDUCE_ST2(4);
+                        OPUS_REDUCE_ST1(6);
+                        break;
+                    }
             }
         }
         // else: whole VEC chunk is past N -> write nothing.
@@ -448,16 +420,8 @@ __global__ void splitk_reduce_kernel_gfx1250(const void* __restrict__ ws_ptr,
 #undef OPUS_REDUCE_ST2
 #undef OPUS_REDUCE_ST1
 #else
-    (void)ws_ptr;
-    (void)c_out;
-    (void)split_k;
-    (void)M;
-    (void)N;
-    (void)batch;
-    (void)padded_M;
-    (void)padded_N;
-    (void)bias;
-    (void)bias_stride_batch;
-#endif // __gfx1250__
-#endif // __HIP_DEVICE_COMPILE__
+    (void)ws_ptr; (void)c_out; (void)split_k; (void)M; (void)N; (void)batch;
+    (void)padded_M; (void)padded_N; (void)bias; (void)bias_stride_batch;
+#endif  // __gfx1250__
+#endif  // __HIP_DEVICE_COMPILE__
 }

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # mypy: allow-untyped-defs
 
@@ -133,7 +133,7 @@ def _get_tuned_fmoe_rows() -> list[dict]:
     tuned_paths = [configs_dir / "tuned_fmoe.csv"]
     # NOTE: "*tuned_fmoe*.csv" also matches "*untuned_fmoe*.csv" (substring).
     # Untuned CSVs list problem shapes to tune, not resolved kernels, and have
-    # no kernelName columns -- so the flydsl-skip in the prebuild enumerator does
+    # no kernelName columns — so the flydsl-skip in the prebuild enumerator does
     # not catch them and they get force-compiled as CK 2stages (e.g. GLM-5.2
     # MXFP8 Silu per_1x32, which has no working CK instance). Exclude untuned.
     tuned_paths.extend(
@@ -177,7 +177,7 @@ def get_moe_ck2stages_prebuild_variants(aiter_csrc_dir: str) -> list[dict]:
         runtime_swiglu_limit = (
             _has_runtime_swiglu_limit(row)
             and activation == "silu"
-            and quant_type == "per_1x128"
+            and quant_type in ("per_1x128", "per_token", "per_tensor")
             and a_dtype == "f8"
             and b_dtype == "f8"
         )
@@ -188,7 +188,7 @@ def get_moe_ck2stages_prebuild_variants(aiter_csrc_dir: str) -> list[dict]:
             continue
 
         # A16W4 per_1x32 (bf16 activation, int4 weight) is owned by FlyDSL,
-        # not CK 2stages. CK has no matching instance -- skip prebuild.
+        # not CK 2stages. CK has no matching instance — skip prebuild.
         if quant_type == "per_1x32" and a_dtype == "b16" and b_dtype == "torch.int4":
             continue
 

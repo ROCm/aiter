@@ -19,7 +19,7 @@ Shape mapping (decode indexer):
 ``test_fp8_paged_mqa_logits_probe1079`` is the production decode contract from
 the probe_1079 bs64 histogram: 44362-block KV pool, scattered 8 KiB pages,
 ``max_model_len=258048``, mean Nq=117. The 212-call histogram sweep stays in
-the WaveScope driver; this table is the mean-Nq next_n x ctx grid.
+the WaveScope driver; this table is the mean-Nq next_n × ctx grid.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ ARCH_KV_BLOCK_SIZES = {"gfx950": [64], "gfx1250": [8, 16, 64]}
 INDEX_DIM = HEAD_DIM + 4
 MAX_NN = 8
 WIDE_MAX_MODEL_LEN = 1 << 20
-# probe_1079 decode (bs64): 44362 x 64-token pages, output stride 258048.
+# probe_1079 decode (bs64): 44362 × 64-token pages, output stride 258048.
 PROBE_NUM_BLOCKS = 44362
 PROBE_MAX_MODEL_LEN = 258048
 PROBE_MEAN_NQ = 117

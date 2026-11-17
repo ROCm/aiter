@@ -83,7 +83,7 @@ def compute_prefill_schedule(
     s_max = max(1, (max_seq_len + block_k - 1) // block_k)
     plan = _row_plan(local_ends, block_k, P, s_max)
 
-    # -- map each fixed slot -> (row, split) + emit cta_info in ONE kernel --
+    # ── map each fixed slot → (row, split) + emit cta_info in ONE kernel ──
     if cta_info_out is None:
         cta_info = torch.empty(P, CTA_INFO_WIDTH, dtype=torch.int32, device=device)
     else:
@@ -203,7 +203,7 @@ def warmup_prefill_row_plan(device, block_k: int = 256) -> None:
 
 def _row_plan_torch(le, block_k, P, s_max) -> _RowPlan:
     """The row plan as ~25 torch ops. Reference for `_prefill_row_plan_kernel`."""
-    # chunk count per row = ceil(le / block_k); le<=0 -> 0 chunks.
+    # chunk count per row = ceil(le / block_k); le<=0 → 0 chunks.
     chunks_per_row = torch.clamp((le + (block_k - 1)) // block_k, min=0)  # [T]
 
     s_cand = torch.arange(1, s_max + 1, device=le.device, dtype=torch.int32)  # [s_max]
@@ -213,11 +213,11 @@ def _row_plan_torch(le, block_k, P, s_max) -> _RowPlan:
     total_ctas_s = ctas_per_r_s.sum(dim=1)  # [s_max]
     feasible = total_ctas_s <= P  # [s_max] bool, monotonic False..True
     max_chunks = torch.clamp(chunks_per_row.max(), min=1).to(torch.int32)
-    # smallest feasible s, via arithmetic (no tensor gather -> no capture sync).
+    # smallest feasible s, via arithmetic (no tensor gather → no capture sync).
     first_feasible_s = torch.clamp((~feasible).to(torch.int32).sum() + 1, max=s_max)
     safe = torch.where(feasible.any(), first_feasible_s, max_chunks).to(torch.int32)
 
-    # -- per-row number of CTAs (chunk-splits); 0 for empty rows --
+    # ── per-row number of CTAs (chunk-splits); 0 for empty rows ──
     ctas_r = (chunks_per_row + (safe - 1)) // safe  # [T]
     incl = torch.cumsum(ctas_r, dim=0, dtype=torch.int32)  # [T] inclusive prefix sum
     return _RowPlan(
@@ -544,7 +544,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
             # Q load (hoisted): per (k_tile, mi_idx) a thread loads its 16-byte FP4
             # chunk for head row mi_idx*16+lane_mod_16. Q: [total_tokens, H, D/2] uint8.
             # Scaled FP4 16x16x128 MMA; opsel_b selects the per-nt scale byte, so one
-            # atom per nt (opsel_a stays 0 -- Q scale is one byte per (k_tile, mi)).
+            # atom per nt (opsel_a stays 0 — Q scale is one byte per (k_tile, mi)).
             mfma_atoms = [
                 fx.make_mma_atom(
                     fx.rocdl.cdna4.MFMA_Scale(
@@ -619,7 +619,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 w_f32 = fx.Vector(fx.memref_load_vec(r).to(fx.Float32))
                 w_per_lane.append(w_f32 * ws_vec)
 
-            # -- prologue + N-1 prefetch loop + epilogue --
+            # ── prologue + N-1 prefetch loop + epilogue ──
 
             def _load_phys(c_i32_arg):
                 ni_base = warp_id * fx.Int32(N_TILES_PER_WARP)
@@ -1036,7 +1036,7 @@ def _varqlen_windows_kernel(
     n = r - cu_b
     qlen = cu_b1 - cu_b
     le = tl.maximum(ctx_b - qlen + n + 1, 0)
-    # Rows beyond the real total ? (cu[B]) are FLAT tail-padding -- force an empty
+    # Rows beyond the real total Σ (cu[B]) are FLAT tail-padding — force an empty
     # window so the mqa kernel / top_k skip them (used when `total_q` is the padded
     # count, e.g. the CUDAGraph decode path scores all padded rows in one shot).
     real_total = tl.load(cu_ptr + B)
@@ -1051,7 +1051,7 @@ def compute_varqlen_windows(cu_seq_q, context_lens, total_q, *, out=None):
     """Build ragged-row metadata for per-batch variable query length (MTP).
 
     Pass `out=(row_to_batch, local_starts, local_ends)` (fixed int32 buffers each
-    >= total_q long) to write into stable addresses -- the CUDAGraph decode path
+    >= total_q long) to write into stable addresses — the CUDAGraph decode path
     scores all padded rows, so top_k replays from these window pointers while
     `build()` refreshes their contents. Rows past the real total (cu[B]) get an
     empty window (local_ends == 0) so they are skipped.

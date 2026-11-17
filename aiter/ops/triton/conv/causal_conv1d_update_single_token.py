@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Copyright (C) 2024-2026, Tri Dao.
+# Copyright (c) 2024, Tri Dao.
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Launchers for **causal conv1d update** single-token paths.
@@ -173,10 +173,10 @@ def fused_reshape_causal_conv1d_update_single_token(
     """Fused reshape + causal-conv1d update for a packed GDN qkvz tensor.
 
     ``qkvz_layout`` selects the packing of the input ``x`` and ``ba`` tensors:
-      - ``"interleaved"`` (default) -- ``x`` packs each K-head as
+      - ``"interleaved"`` (default) — ``x`` packs each K-head as
         ``[q_chunk | k_chunk | v_chunk | z_chunk]`` and ``ba`` interleaves
         ``[b_g, a_g]`` per K-head group. (Used by Qwen3-Next.)
-      - ``"flat"`` -- ``x`` packs as ``[q_all | k_all | v_all | z_all]`` and
+      - ``"flat"`` — ``x`` packs as ``[q_all | k_all | v_all | z_all]`` and
         ``ba`` concatenates ``[b_all | a_all]``. (Used by Qwen3.5.)
     """
     assert qkvz_layout in (

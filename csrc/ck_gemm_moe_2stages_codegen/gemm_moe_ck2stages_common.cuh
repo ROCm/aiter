@@ -3,7 +3,9 @@
 #pragma once
 #include "ck/tensor_operation/gpu/device/impl/device_gemm_multiple_d_xdl_cshuffle_v3.hpp"
 #include "ck/tensor_operation/gpu/device/impl/device_moe_gemm.hpp"
+#include "ck/tensor_operation/gpu/element/moe_silu.hpp"
 #include "gemm_moe_ck2stages.h"
+#include <cmath>
 #include <iostream>
 
 template <typename A0DataType,
@@ -22,8 +24,8 @@ template <typename A0DataType,
           bool PerTensorQuant,
           bool MulRoutedWeight,
           int ActOP,
-          bool PadK,
-          bool RuntimeSwigluLimit>
+          bool RuntimeSwigluLimit,
+          bool PadK>
 void ck_moe_stage1_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -44,6 +46,15 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         std::optional<bool> nt,
                         [[maybe_unused]] float swiglu_limit)
 {
+    const bool enabled = swiglu_limit > 0.0f && std::isfinite(swiglu_limit);
+    TORCH_CHECK(enabled == RuntimeSwigluLimit,
+                "Runtime SwiGLU limit module does not match the requested clamp state");
+    if constexpr(RuntimeSwigluLimit)
+    {
+        TORCH_CHECK(ck::MoeSilu::ValidRuntimeLimit(swiglu_limit),
+                    "Runtime SwiGLU limit must be positive and finite");
+    }
+
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     ck::index_t StrideA = K;
     ck::index_t StrideB = K;
@@ -122,7 +133,7 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                S<K0_A, K0_M_A, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, AK1, AK1, 0,
                S<K0_B, K0_N_B, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, BK1, BK1, 0,
                CShuffleMXDLPerWave,    CShuffleNXDLPerWave,   S<1, CMLane, 1, CNLane>, S<EVec, D0Vec, D1Vec>,
-               ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, MulRoutedWeight, !PerTensorQuant, ck::index_t, A0DataType>;
+               ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, MulRoutedWeight, !PerTensorQuant, ck::index_t, A0DataType, A0DataType, A0DataType, A0DataType, RuntimeSwigluLimit>;
     // clang-format on
 
     auto a_element_op   = AElementOp{};
@@ -161,7 +172,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
         KBatch,
         a_element_op,
         b_element_op,
-        cde_element_op);
+        cde_element_op,
+        swiglu_limit);
 
     if(!device_op.IsSupportedArgument(argument))
     {
@@ -191,8 +203,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                      PerTensorQuant,                          \
                                      MulRoutedWeight,                         \
                                      ActOP,                                   \
-                                     PadK,                                    \
-                                     AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT>(      \
+                                     AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT,       \
+                                     PadK>(                                   \
         const hipStream_t& stream,                                            \
         int tokens,                                                           \
         int sorted_size,                                                      \

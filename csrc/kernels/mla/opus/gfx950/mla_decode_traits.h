@@ -1040,9 +1040,7 @@ struct opus_mla_decode_a16w16_32mx1_16nx4_traits
     static constexpr size_t smem_p_bytes  = 2 * (size_t)P_SLOT_ELEMS * sizeof(D_ATTN);
 
     static constexpr size_t smem_bytes()
-    {
-        return NUM_KV_BUFS * smem_kv_bytes + smem_ml_bytes + smem_p_bytes;
-    }
+    { return NUM_KV_BUFS * smem_kv_bytes + smem_ml_bytes + smem_p_bytes; }
 };
 
 template <int Q_TILE_SIZE_,

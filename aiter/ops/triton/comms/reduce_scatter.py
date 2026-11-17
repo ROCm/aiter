@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 """
 Reduce-Scatter communication primitive using Iris.
@@ -80,7 +80,7 @@ def _reduce_scatter_impl(
         pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
         pid_n = (tile_id % num_pid_in_group) // group_size_m
 
-        # Local indices in this rank's output shard (M_shard x N)
+        # Local indices in this rank's output shard (M_shard × N)
         rm_local = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
@@ -176,9 +176,9 @@ def reduce_scatter(
     Perform reduce-scatter along the M (row) dimension.
 
     This operation:
-    1. Sums the input_tensor across all ranks (MxN on each rank)
+    1. Sums the input_tensor across all ranks (M×N on each rank)
     2. Splits the result along the M dimension
-    3. Each rank receives (M/world_size)xN
+    3. Each rank receives (M/world_size)×N
 
     Args:
         input_tensor (Tensor): Input tensor of shape [M, N] in Iris shared memory

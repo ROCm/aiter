@@ -26,11 +26,11 @@ the archived record and the gates check its shape; the split is a presentation d
 at publish time.
 
 Rules (after run_one, given 7 green gates):
-  - Review line is ? HIGH RISK  -> POST too: the reviewer who triggered it must see the high-risk
+  - Review line is 🔴 HIGH RISK  → POST too: the reviewer who triggered it must see the high-risk
     findings (still advisory, not a merge gate); a warning annotation also flags it in the checks UI
-  - otherwise (? / ? / notes only) -> POST: post card.md as a PR review
-  - already posted (same head SHA, by marker) -> SKIP: do not repost
-  - PR already merged/closed         -> SKIP: a post-merge follow-up should not go as a PR review
+  - otherwise (✅ / ⚠️ / notes only) → POST: post card.md as a PR review
+  - already posted (same head SHA, by marker) → SKIP: do not repost
+  - PR already merged/closed         → SKIP: a post-merge follow-up should not go as a PR review
 Publishing identity = the owner of AITER_BOT_TOKEN(_FILE) (aiter-bot). Dry-run by default; --post actually posts.
 
 A marker line is embedded at the end of the review summary for followup/dedup:
@@ -130,10 +130,10 @@ def head_sha(pr):
 
 
 def severity(card):
-    """Severity of the Review line: 'high' | 'ok' (anything not ? is ok, i.e. postable)."""
+    """Severity of the Review line: 'high' | 'ok' (anything not 🔴 is ok, i.e. postable)."""
     for ln in card.splitlines():
         if ln.startswith("Review"):
-            if "?" in ln or "HIGH RISK" in ln.upper():
+            if "🔴" in ln or "HIGH RISK" in ln.upper():
                 return "high"
             return "ok"
     return "ok"
@@ -141,11 +141,11 @@ def severity(card):
 
 # ---------------------------------------------------------------- anchoring
 
-FINDING = re.compile(r"^(?|?|?)\s")
+FINDING = re.compile(r"^(🔴|⚠️|📝)\s")
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 # A citation that names a span: `path:1002-1012`. Deliberately tight -- an ASCII hyphen with
 # no whitespace around it. The loose form (spaces allowed, or an en/em dash) misreads ordinary
-# prose: a real card writes "flash_kda.py:381 -- 6 published tuning candidates", which a loose
+# prose: a real card writes "flash_kda.py:381 — 6 published tuning candidates", which a loose
 # pattern reads as the span 381..6 and would hand to GitHub as a backwards range, failing the
 # whole review including the summary. Counted over 221 real findings on this bot's own cards,
 # the tight form matched 25 spans with no false positive; the loose form added exactly that
@@ -415,12 +415,12 @@ def first_clause(finding, cite=""):
         # that leaves the index line opening with a bare "-569". Found on a real card the
         # first time this ran over one.
         s = re.sub(r"^`?" + re.escape(cite) + r"(?:-\d+)?`?[,:]?\s*", "", s)
-    for sep in (" -- ", " -- ", "; "):
+    for sep in (" — ", " -- ", "; "):
         if sep in s[: CLAUSE + 40]:
             s = s.split(sep, 1)[0]
             break
     if len(s) > CLAUSE:
-        s = s[:CLAUSE].rsplit(" ", 1)[0] + "..."
+        s = s[:CLAUSE].rsplit(" ", 1)[0] + "…"
     return s.strip()
 
 
@@ -456,7 +456,7 @@ def build_review(pr, card, diff_text, flagged, sha):
         if a:
             comments.append(comment_for(a[0], a[1], a[2], ln.strip()))
             cite = cite_text(*a)
-            index.append(f"- `{cite}` -- {first_clause(ln, cite)}")
+            index.append(f"- `{cite}` — {first_clause(ln, cite)}")
         else:
             links = permalinks_for(ln, cmap, flagged, sha)
             # Each URL alone on its own line. GitHub expands a bare blob permalink into the
@@ -543,9 +543,9 @@ def decide(pr):
     sha = head_sha(pr)
     if sha and already_posted(pr, sha):
         return "SKIP", f"same head {sha[:9]} already posted (marker hit)"
-    # Post the card for EVERY verdict, including ?: the reviewer who asked for the review must
-    # see it, and ? is exactly what they most need to see. It stays advisory (the Review line
-    # says so) and never gates merge; main() adds a warning annotation for the ? ones.
+    # Post the card for EVERY verdict, including 🔴: the reviewer who asked for the review must
+    # see it, and 🔴 is exactly what they most need to see. It stays advisory (the Review line
+    # says so) and never gates merge; main() adds a warning annotation for the 🔴 ones.
     return "POST", "postable"
 
 
@@ -579,8 +579,8 @@ def do_post(pr):
             payload["body"] = INDEX_BLOCK.sub("", payload["body"]).rstrip()
             payload["body"] = payload[
                 "body"
-            ] + "\n\n_The findings below could not be attached to their lines -- GitHub " "refused the anchored review, so they are inlined here instead._\n\n" + "\n\n".join(
-                f"`{anchor_label(c)}` -- {c['body']}" for c in payload["comments"]
+            ] + "\n\n_The findings below could not be attached to their lines — GitHub " "refused the anchored review, so they are inlined here instead._\n\n" + "\n\n".join(
+                f"`{anchor_label(c)}` — {c['body']}" for c in payload["comments"]
             )
             payload["comments"] = []
         r = _api(f"pulls/{pr}/reviews", method="POST", body=payload)
@@ -631,7 +631,7 @@ def main(argv):
         action, reason = decide(pr)
         if action == "POST" and a.post:
             ok, info = do_post(pr)
-            print(f'  #{pr}: POST -> {"? "+info if ok else "? "+info}')
+            print(f'  #{pr}: POST -> {"✅ "+info if ok else "❌ "+info}')
             (posted if ok else failed).append(pr)
             if (
                 ok
@@ -642,14 +642,14 @@ def main(argv):
             ):
                 # extra signal in the checks UI; the card itself is already posted as a comment
                 print(
-                    f"::warning title=aiter-bot HIGH RISK::PR #{pr} -- review flags HIGH RISK (advisory, not a merge gate)"
+                    f"::warning title=aiter-bot HIGH RISK::PR #{pr} — review flags HIGH RISK (advisory, not a merge gate)"
                 )
         else:
-            print(f"  #{pr}: {action} -- {reason}")
+            print(f"  #{pr}: {action} — {reason}")
         if a.payload and (REPORTS / f"PR-{pr}" / "card.md").is_file():
             print(json.dumps(review_payload(pr), indent=2, ensure_ascii=False))
     if failed:
-        print(f"  ? failed to post: {failed}")
+        print(f"  ❌ failed to post: {failed}")
         # Exit non-zero, or a review that was refused is indistinguishable from one
         # that went up. The refusal this most likely is -- a token that may post issue
         # comments but not create reviews -- would otherwise be invisible to the caller

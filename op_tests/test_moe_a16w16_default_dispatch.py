@@ -4,9 +4,9 @@
 """Default-dispatch regressions for CK MoE and a16w16 swiglu_limit.
 
 gfx942 A16W16 covers shards aligned to 64 but not 128 (for example 320).
-gfx950 fp8 stage2 covers shuffled inter_dim 384 (K=128), 512 (K=256), and
-sizes that 128 does not divide (padded K=128), and rejects plain fp8 weights
-unless both w1 and w2 are shuffled. That rejection follows the live GPU, not
+gfx950 fp8 stage2 covers shuffled inter_dim 384 (K=128) and 512 (K=256),
+rejects sizes that 128 does not divide, and rejects plain fp8 weights unless
+both w1 and w2 are shuffled. That rejection follows the live GPU, not
 GPU_ARCHS. gfx950 int8 uses that same stage2 K selection.
 
 A finite swiglu_limit on BF16 QuantType.No reroutes to FlyDSL a16wmix a16w16
@@ -221,12 +221,10 @@ def test_gfx950_fp8_stage2_k_alignment(inter_dim, block_m, quant_type):
 
 
 @pytest.mark.skipif(not _GFX950, reason="Exercises the gfx950 fp8 CK default dispatch")
-@pytest.mark.parametrize("inter_dim", [192, 320, 448])
-@pytest.mark.parametrize("block_m", [32, 64])
-def test_gfx950_fp8_stage2_pads_k(inter_dim, block_m):
-    # No K tile divides these sizes, so stage 2 uses the padded K=128 tile.
-    # per_Token runs the 1-stage ASM kernel for these sizes, not CK.
-    _check_gfx950_fp8(inter_dim, block_m, QuantType.per_Tensor)
+@pytest.mark.parametrize("inter_dim", [192, 320])
+def test_gfx950_fp8_stage2_rejects_non_128(inter_dim):
+    with pytest.raises(RuntimeError, match="multiple of"):
+        _check_gfx950_fp8(inter_dim, 32, QuantType.per_Tensor)
 
 
 @pytest.mark.skipif(not _GFX950, reason="Exercises the gfx950 fp8 CK default dispatch")
@@ -288,12 +286,11 @@ def test_gfx950_int8_stage2_k_alignment(inter_dim, block_m):
 
 
 @pytest.mark.skipif(not _GFX950, reason="Exercises the gfx950 int8 CK default dispatch")
-def test_gfx950_int8_stage2_rejects_non_16():
+def test_gfx950_int8_stage2_rejects_non_128():
     # Int8 fused_moe stage 1 is the ASM kernel, and every gfx950 int8 stage-1
-    # tile is 128 or 256, so width 184 fails there and never reaches stage 2.
-    # The padded K tile needs a multiple of 16, and the 8-element K vector
-    # instances are fp8 only, so the shared CK stage-2 dispatch rejects it.
-    inter_dim, model_dim, tokens, experts = 184, 128, 4, 1
+    # tile is 128 or 256, so width 192 fails there and never reaches stage 2.
+    # The K check added in this change lives in the shared CK stage-2 dispatch.
+    inter_dim, model_dim, tokens, experts = 192, 128, 4, 1
     inter = torch.empty((tokens, inter_dim), dtype=torch.int8, device="cuda")
     w1 = torch.empty(
         (experts, inter_dim * 2, model_dim), dtype=torch.int8, device="cuda"
@@ -303,7 +300,7 @@ def test_gfx950_int8_stage2_rejects_non_16():
     sorted_expert_ids = torch.zeros(4, dtype=torch.int32, device="cuda")
     num_valid = torch.zeros(1, dtype=torch.int32, device="cuda")
     out = torch.empty((tokens, model_dim), dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(RuntimeError, match="does not support this GEMM problem"):
+    with pytest.raises(RuntimeError, match="multiple of"):
         ck_moe_stage2_fwd(
             inter,
             w1,
@@ -465,7 +462,7 @@ def test_gfx950_stage2_selects_k_tile(inter_dim, block_m, quant_dtype):
 
 
 # ---------------------------------------------------------------------------
-# BF16 QuantType.No + finite swiglu_limit -> FlyDSL a16wmix a16w16
+# BF16 QuantType.No + finite swiglu_limit → FlyDSL a16wmix a16w16
 # ---------------------------------------------------------------------------
 
 _A16W16_S1 = "flydsl_moe1_abf16_wbf16_bf16_t16x128x128"

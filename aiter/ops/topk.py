@@ -631,7 +631,7 @@ def get_topk_scratch_workspace(device: torch.device, size: int) -> torch.Tensor:
     Unlike the multi-block buffer (get_topk_mb_workspace), these kernels do their
     own internal memset on each launch, so the buffer need not be zero-initialized
     and need not be a persistent, reused buffer. This mirrors how the C++ side
-    originally allocated it -- a plain, exactly-sized ``torch.empty`` per call --
+    originally allocated it — a plain, exactly-sized ``torch.empty`` per call —
     only moved to the Python side so the host code never allocates device scratch
     itself. torch's caching allocator reuses freed blocks, so no explicit cache
     (or size bucketing) is needed here."""

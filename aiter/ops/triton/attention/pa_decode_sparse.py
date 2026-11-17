@@ -180,10 +180,10 @@ def pa_decode_sparse(
     Args:
         q: ``[N, H, D]`` decode queries; dtype per arch, see Formats.
         unified_kv: the KV cache; shape and dtype per arch, see Formats.
-        kv_indices: ``[total_indices]`` int32 -- per-token slot lists, flat.
+        kv_indices: ``[total_indices]`` int32 — per-token slot lists, flat.
             Per-token entries live in ``kv_indices[kv_indptr[t] : kv_indptr[t+1]]``.
             ``-1`` entries are skipped (sentinel for unused tail).
-        kv_indptr: ``[N+1]`` int32 -- true prefix sum.
+        kv_indptr: ``[N+1]`` int32 — true prefix sum.
         attn_sink: ``[H]`` per-head learnable softmax-denom bias (fp32).
         softmax_scale: scalar softmax scale.
         kv_scales: gfx950 only -- ``[P, D // 64]`` fp32 scales for a flat fp8
@@ -246,7 +246,7 @@ def pa_decode_sparse(
             footprint.
         q_rope: ``[N, H, 64]`` bf16 RoPE plane for Q, required on the gfx1250
             fp8 path, where ``q`` is the packed fp8 ``[N, H, 512]`` Q.
-        inv_rope_positions/inv_rope_cos_sin_cache/out_mxfp8: gfx950 gluon only --
+        inv_rope_positions/inv_rope_cos_sin_cache/out_mxfp8: gfx950 gluon only —
             the output epilogue (see _pa_decode_sparse_gfx950_gluon). Rejected
             everywhere else.
 
@@ -258,10 +258,10 @@ def pa_decode_sparse(
         [N, KV_SPLITS, H_padded])`` (all fp32).
 
     Optimizations targeted:
-      (1) Wider ``BLOCK_H`` so all heads of a token are handled by one CTA ->
+      (1) Wider ``BLOCK_H`` so all heads of a token are handled by one CTA →
           eliminates MLA-style KV re-fetch across head-block programs.
       (2) ``num_stages`` on the K loop pipelines KV gather behind the dot.
-      (3) Split the K dimension across CTAs via a third grid axis ->
+      (3) Split the K dimension across CTAs via a third grid axis →
           fixes grid undersubscription on long-context decode.
     """
     if not q.is_cuda:
@@ -577,7 +577,7 @@ def pa_decode_sparse(
         # is responsible for the log-sum-exp combine + sink fold.
         return acc_partial, m_partial, l_partial
 
-    # One reduce CTA per head. For small per-rank H (TP=8 -> H ? {8, 16}) this
+    # One reduce CTA per head. For small per-rank H (TP=8 → H ∈ {8, 16}) this
     # multiplies the reduce-side CTA count by H, replacing the previous single
     # under-occupied CTA per token with a small fan-out that hides launch
     # latency. tl.arange(0, 1) is a valid power-of-2 range.

@@ -23,7 +23,7 @@
 #include <cstdint>
 #include <type_traits>
 
-// -- Consumer-wave tiling layout ---------------------------------------------
+// ── Consumer-wave tiling layout ─────────────────────────────────────────────
 // The 4-wave pipeline is fixed at 2 producers + 2 consumers; the 2 consumers
 // split ONE dimension of the B_M x B_N tile:
 //   TileN: consumers split along N (kTileM=1, kTileN=2) -- best for small M.
@@ -31,7 +31,7 @@
 namespace opus_gfx1250 {
 constexpr int kCtdmLayoutTileN = 0;
 constexpr int kCtdmLayoutTileM = 1;
-} // namespace opus_gfx1250
+}  // namespace opus_gfx1250
 
 #ifndef OPUS_GEMM_CLUSTER_TDM_WS_KARGS_GFX1250_DEFINED
 #define OPUS_GEMM_CLUSTER_TDM_WS_KARGS_GFX1250_DEFINED
@@ -39,27 +39,26 @@ constexpr int kCtdmLayoutTileM = 1;
 // pipeline. The main kernel writes D_WS partial sums into ptr_ws laid out as
 // [split_k, padded_M, padded_N]. The reduce kernel consumes them,
 // re-accumulates in fp32, folds bias once, casts to Y dtype, and writes C[M,N].
-struct opus_gemm_cluster_tdm_ws_kargs_gfx1250
-{
-    const void* __restrict__ ptr_a;    // bf16 [M, K]
-    const void* __restrict__ ptr_b;    // bf16 [N, K] (A @ B^T)
-    void* __restrict__ ptr_ws;         // D_WS [split_k, padded_M, padded_N]
-    void* __restrict__ ptr_c;          // bf16/fp32 [M, N] (filled by reduce kernel)
-    const void* __restrict__ ptr_bias; // consumed by reduce kernel only
+struct opus_gemm_cluster_tdm_ws_kargs_gfx1250 {
+    const void* __restrict__ ptr_a;          // bf16 [M, K]
+    const void* __restrict__ ptr_b;          // bf16 [N, K] (A @ B^T)
+    void*       __restrict__ ptr_ws;         // D_WS [split_k, padded_M, padded_N]
+    void*       __restrict__ ptr_c;          // bf16/fp32 [M, N] (filled by reduce kernel)
+    const void* __restrict__ ptr_bias;       // consumed by reduce kernel only
     int m;
     int n;
     int k;
-    int batch;             // = 1 per launch (host loops batch)
-    int split_k;           // runtime split factor (KBatch)
-    int stride_a;          // A row pitch (typically = K; > K if row-padded)
-    int stride_b;          // B row pitch (typically = K; > K if row-padded)
-    int stride_ws;         // = padded_N
-    int stride_c;          // = N
-    int stride_a_batch;    // A batch pitch (= M * stride_a)
-    int stride_b_batch;    // B batch pitch (= N * stride_b)
-    int stride_ws_batch;   // = padded_M * padded_N (one split slice)
-    int stride_c_batch;    // = M * N
-    int stride_bias_batch; // 0 (broadcast [N]) or N ([batch, N])
+    int batch;                               // = 1 per launch (host loops batch)
+    int split_k;                             // runtime split factor (KBatch)
+    int stride_a;                            // A row pitch (typically = K; > K if row-padded)
+    int stride_b;                            // B row pitch (typically = K; > K if row-padded)
+    int stride_ws;                           // = padded_N
+    int stride_c;                            // = N
+    int stride_a_batch;                      // A batch pitch (= M * stride_a)
+    int stride_b_batch;                      // B batch pitch (= N * stride_b)
+    int stride_ws_batch;                     // = padded_M * padded_N (one split slice)
+    int stride_c_batch;                      // = M * N
+    int stride_bias_batch;                   // 0 (broadcast [N]) or N ([batch, N])
 };
 #endif
 
@@ -73,9 +72,9 @@ struct opus_gemm_cluster_tdm_ws_kargs_gfx1250
 // cluster barrier replaces it).
 struct opus_gemm_splitk_fuse_kargs_gfx1250
 {
-    const void* __restrict__ ptr_a;    // bf16 [M, K]
-    const void* __restrict__ ptr_b;    // bf16 [N, K] (A @ B^T)
-    void* __restrict__ ptr_ws;         // DataWs partial workspace
+    const void* __restrict__ ptr_a;                      // bf16 [M, K]
+    const void* __restrict__ ptr_b;                      // bf16 [N, K] (A @ B^T)
+    void* __restrict__ ptr_ws;                           // DataWs partial workspace
     void* __restrict__ ptr_c;          // bf16/fp32 [M, N] (written by last split WG)
     const void* __restrict__ ptr_bias; // bf16 [N] or null (folded once by last WG)
     int m;
@@ -100,71 +99,66 @@ struct opus_gemm_splitk_fuse_kargs_gfx1250
 // Exact kernarg ABI baked into every pre-built 4wave CO image. Batch strides
 // are 64-bit element counts; grid.z carries the batch count and C's batch
 // stride is derived from m * stride_c in the device pipeline.
-struct opus_gemm_4wave_compute_kargs_gfx1250
-{
-    const void* __restrict__ ptr_a; //  0: bf16 [batch, M, K]
-    const void* __restrict__ ptr_b; //  8: bf16 [batch, N, K]
-    void* __restrict__ ptr_c;       // 16: bf16 [batch, M, N]
-    int64_t stride_a_batch;         // 24
-    int64_t stride_b_batch;         // 32
-    int m;                          // 40
-    int n;                          // 44
-    int k;                          // 48
-    int stride_a;                   // 52
-    int stride_b;                   // 56
-    int stride_c;                   // 60
+struct opus_gemm_4wave_compute_kargs_gfx1250 {
+    const void* __restrict__ ptr_a;   //  0: bf16 [batch, M, K]
+    const void* __restrict__ ptr_b;   //  8: bf16 [batch, N, K]
+    void*       __restrict__ ptr_c;   // 16: bf16 [batch, M, N]
+    int64_t stride_a_batch;           // 24
+    int64_t stride_b_batch;           // 32
+    int m;                            // 40
+    int n;                            // 44
+    int k;                            // 48
+    int stride_a;                     // 52
+    int stride_b;                     // 56
+    int stride_c;                     // 60
 };
 static_assert(sizeof(opus_gemm_4wave_compute_kargs_gfx1250) == 64,
               "the pre-built 4wave CO kernarg ABI must remain 64 bytes");
 #endif
 
 // Host-visible configuration shared with the offline 4wave device build.
-template <int BLOCK_SIZE_,
-          int B_M_,
-          int B_N_,
-          int B_K_,
-          int NUM_SLOTS_,
-          typename D_A_,
-          typename D_B_,
-          typename D_C_,
-          typename D_ACC_,
-          int CLUSTER_WG_M_ = 4,
-          int CLUSTER_WG_N_ = 4>
-struct opus_a16w16_4wave_compute_traits_gfx1250
-{
+template<int BLOCK_SIZE_,
+         int B_M_, int B_N_, int B_K_,
+         int NUM_SLOTS_,
+         typename D_A_, typename D_B_, typename D_C_, typename D_ACC_,
+         int CLUSTER_WG_M_ = 4,
+         int CLUSTER_WG_N_ = 4>
+struct opus_a16w16_4wave_compute_traits_gfx1250 {
     static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
-    static constexpr int B_M        = B_M_;
-    static constexpr int B_N        = B_N_;
-    static constexpr int B_K        = B_K_;
+    static constexpr int B_M = B_M_;
+    static constexpr int B_N = B_N_;
+    static constexpr int B_K = B_K_;
 
-    using D_A     = D_A_;
-    using D_B     = D_B_;
-    using D_C     = D_C_;
-    using D_ACC   = D_ACC_;
-    using DataA   = D_A;
-    using DataB   = D_B;
-    using DataC   = D_C;
+    using D_A = D_A_;
+    using D_B = D_B_;
+    using D_C = D_C_;
+    using D_ACC = D_ACC_;
+    using DataA = D_A;
+    using DataB = D_B;
+    using DataC = D_C;
     using DataAcc = D_ACC;
     static_assert(std::is_same<D_A, D_B>::value, "A/B dtype must match");
 
-    static constexpr int VEC_A     = 16 / (int)sizeof(D_A);
-    static constexpr int VEC_B     = 16 / (int)sizeof(D_B);
+    static constexpr int VEC_A = 16 / (int)sizeof(D_A);
+    static constexpr int VEC_B = 16 / (int)sizeof(D_B);
     static constexpr int NUM_SLOTS = NUM_SLOTS_;
     static_assert(NUM_SLOTS >= 2, "the LDS ring needs at least two slots");
 
     static constexpr int CLUSTER_WG_M = CLUSTER_WG_M_;
     static constexpr int CLUSTER_WG_N = CLUSTER_WG_N_;
-    static_assert(CLUSTER_WG_M >= 1 && CLUSTER_WG_N >= 1 && CLUSTER_WG_M <= 5 &&
-                      CLUSTER_WG_N <= 5 && CLUSTER_WG_M * CLUSTER_WG_N <= 16,
+    static_assert(CLUSTER_WG_M >= 1 && CLUSTER_WG_N >= 1 &&
+                  CLUSTER_WG_M <= 5 && CLUSTER_WG_N <= 5 &&
+                  CLUSTER_WG_M * CLUSTER_WG_N <= 16,
                   "cluster dims must be 1..5 per side and <= 16 WGs total");
 
-    static_assert((B_K & (B_K - 1)) == 0, "B_K must be a power of two for the TDM padding scheme");
-    static constexpr int PAD_ELEMS    = 16 / (int)sizeof(D_A);
-    static constexpr int SMEM_PITCH   = B_K + PAD_ELEMS;
+    static_assert((B_K & (B_K - 1)) == 0,
+                  "B_K must be a power of two for the TDM padding scheme");
+    static constexpr int PAD_ELEMS = 16 / (int)sizeof(D_A);
+    static constexpr int SMEM_PITCH = B_K + PAD_ELEMS;
     static constexpr int SLOT_BYTES_A = B_M * SMEM_PITCH * (int)sizeof(D_A);
     static constexpr int SLOT_BYTES_B = B_N * SMEM_PITCH * (int)sizeof(D_B);
-    static constexpr int SEG_BYTES_A  = NUM_SLOTS * SLOT_BYTES_A;
-    static constexpr int SEG_BYTES_B  = NUM_SLOTS * SLOT_BYTES_B;
+    static constexpr int SEG_BYTES_A = NUM_SLOTS * SLOT_BYTES_A;
+    static constexpr int SEG_BYTES_B = NUM_SLOTS * SLOT_BYTES_B;
     static constexpr int SEG_BYTES_AB = SEG_BYTES_A + SEG_BYTES_B;
 
     // Enforce the one-WG/CU occupancy used to validate the shipped images.
@@ -172,80 +166,63 @@ struct opus_a16w16_4wave_compute_traits_gfx1250
 #ifdef OPUS_CO_NO_1WG_PAD
     static constexpr int LDS_BYTES = SEG_BYTES_AB;
 #else
-    static constexpr int LDS_BYTES = (SEG_BYTES_AB <= kHalfLds) ? (kHalfLds + 1024) : SEG_BYTES_AB;
+    static constexpr int LDS_BYTES =
+        (SEG_BYTES_AB <= kHalfLds) ? (kHalfLds + 1024) : SEG_BYTES_AB;
 #endif
     static_assert(LDS_BYTES <= 320 * 1024, "LDS exceeds the 320KB/CU budget");
 
-    static constexpr int kBlockM        = B_M;
-    static constexpr int kBlockN        = B_N;
-    static constexpr int kBlockK        = B_K;
-    static constexpr int kNumSlots      = NUM_SLOTS;
-    static constexpr int kClusterWgM    = CLUSTER_WG_M;
-    static constexpr int kClusterWgN    = CLUSTER_WG_N;
+    static constexpr int kBlockM = B_M;
+    static constexpr int kBlockN = B_N;
+    static constexpr int kBlockK = B_K;
+    static constexpr int kNumSlots = NUM_SLOTS;
+    static constexpr int kClusterWgM = CLUSTER_WG_M;
+    static constexpr int kClusterWgN = CLUSTER_WG_N;
     static constexpr int kLdsTotalBytes = LDS_BYTES;
 };
 
-template <int BLOCK_SIZE_,
-          int B_M_,
-          int B_N_,
-          int B_K_,
-          int NUM_SLOTS_,
-          typename D_A_,
-          typename D_B_,
-          typename D_C_,
-          typename D_ACC_,
-          int CLUSTER_WG_M_ = 4,
-          int CLUSTER_WG_N_ = 4,
-          int TILE_M_       = 4,
-          int TILE_N_       = 1>
-struct opus_a16w16_4wave_wl_traits_gfx1250 : opus_a16w16_4wave_compute_traits_gfx1250<BLOCK_SIZE_,
-                                                                                      B_M_,
-                                                                                      B_N_,
-                                                                                      B_K_,
-                                                                                      NUM_SLOTS_,
-                                                                                      D_A_,
-                                                                                      D_B_,
-                                                                                      D_C_,
-                                                                                      D_ACC_,
-                                                                                      CLUSTER_WG_M_,
-                                                                                      CLUSTER_WG_N_>
-{
+template<int BLOCK_SIZE_,
+         int B_M_, int B_N_, int B_K_,
+         int NUM_SLOTS_,
+         typename D_A_, typename D_B_, typename D_C_, typename D_ACC_,
+         int CLUSTER_WG_M_ = 4,
+         int CLUSTER_WG_N_ = 4,
+         int TILE_M_ = 4,
+         int TILE_N_ = 1>
+struct opus_a16w16_4wave_wl_traits_gfx1250
+    : opus_a16w16_4wave_compute_traits_gfx1250<
+          BLOCK_SIZE_, B_M_, B_N_, B_K_, NUM_SLOTS_,
+          D_A_, D_B_, D_C_, D_ACC_, CLUSTER_WG_M_, CLUSTER_WG_N_> {
     static constexpr int TILE_M = TILE_M_;
     static constexpr int TILE_N = TILE_N_;
 };
 
-// -- User-facing traits = the SINGLE compile-time config the pipeline reads --
+// ── User-facing traits = the SINGLE compile-time config the pipeline reads ──
 //   D_A=D_B=bf16, D_ACC=float (WMMA fp32 acc), D_WS is bf16 or fp32.
 //   The main kernel casts its accumulator to D_WS and the reducer reads the
 //   same physical type before re-accumulating in fp32.
-template <int BLOCK_SIZE_,
-          int B_M_,
-          int B_N_,
-          int B_K_,
-          int LAYOUT_,
-          typename D_A_,
-          typename D_B_,
-          typename D_WS_,
-          typename D_ACC_,
-          bool ENABLE_BIAS_ = false,
-          int NUM_SLOTS_    = 3,
-          int WG_PER_CU_    = 2,
-          int CLUSTER_WG_M_ = 4, // cluster-launch variant: WGs per cluster in M
-          int CLUSTER_WG_N_ = 4> //                         WGs per cluster in N
-struct opus_cluster_tdm_splitk_ws_traits_gfx1250
-{
-    static constexpr int BLOCK_SIZE = BLOCK_SIZE_; // 128 (4 waves x 32)
-    static constexpr int B_M        = B_M_;
-    static constexpr int B_N        = B_N_;
-    static constexpr int B_K        = B_K_;
-    static constexpr int LAYOUT     = LAYOUT_;
+template<int BLOCK_SIZE_,
+         int B_M_, int B_N_, int B_K_,
+         int LAYOUT_,
+         typename D_A_, typename D_B_, typename D_WS_, typename D_ACC_,
+         bool ENABLE_BIAS_ = false,
+         int NUM_SLOTS_ = 3,
+         int WG_PER_CU_ = 2,
+         int CLUSTER_WG_M_ = 4,    // cluster-launch variant: WGs per cluster in M
+         int CLUSTER_WG_N_ = 4>    //                         WGs per cluster in N
+struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
+    static constexpr int BLOCK_SIZE = BLOCK_SIZE_;   // 128 (4 waves x 32)
+    static constexpr int B_M = B_M_;
+    static constexpr int B_N = B_N_;
+    static constexpr int B_K = B_K_;
+    static constexpr int LAYOUT = LAYOUT_;
 
     using D_A   = D_A_;
     using D_B   = D_B_;
     using D_WS  = D_WS_;
     using D_ACC = D_ACC_;
     static_assert(std::is_same<D_A, D_B>::value, "A/B dtype must match");
-    static_assert(std::is_same<D_WS, D_A>::value || std::is_same<D_WS, D_ACC>::value,
+    static_assert(std::is_same<D_WS, D_A>::value ||
+                      std::is_same<D_WS, D_ACC>::value,
                   "cluster_tdm_splitk_ws D_WS must be bf16 input storage or "
                   "fp32 accumulator storage");
 
@@ -255,12 +232,12 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250
     using DataWS  = D_WS;
     using DataAcc = D_ACC;
 
-    static constexpr int VEC_A        = 16 / (int)sizeof(D_A); // 8 for bf16
-    static constexpr int VEC_B        = 16 / (int)sizeof(D_B); // 8
-    static constexpr int VEC_C        = 8;
-    static constexpr int kVecA        = VEC_A;
-    static constexpr int kVecB        = VEC_B;
-    static constexpr int kVecC        = VEC_C;
+    static constexpr int VEC_A = 16 / (int)sizeof(D_A);   // 8 for bf16
+    static constexpr int VEC_B = 16 / (int)sizeof(D_B);   // 8
+    static constexpr int VEC_C = 8;
+    static constexpr int kVecA = VEC_A;
+    static constexpr int kVecB = VEC_B;
+    static constexpr int kVecC = VEC_C;
     static constexpr bool ENABLE_BIAS = ENABLE_BIAS_;
     static constexpr bool kEnableBias = ENABLE_BIAS_;
 
@@ -275,46 +252,46 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250
     static constexpr int kTileM = (LAYOUT == opus_gfx1250::kCtdmLayoutTileM) ? 2 : 1;
     static constexpr int kTileN = (LAYOUT == opus_gfx1250::kCtdmLayoutTileM) ? 1 : 2;
     static constexpr int kTileK = 1;
-    static constexpr int kExpM  = kBlockM / (kWmmaM * kTileM); // M-tiles / consumer wave
-    static constexpr int kExpN  = kBlockN / (kWmmaN * kTileN); // N-tiles / consumer wave
+    static constexpr int kExpM = kBlockM / (kWmmaM * kTileM);   // M-tiles / consumer wave
+    static constexpr int kExpN = kBlockN / (kWmmaN * kTileN);   // N-tiles / consumer wave
     static_assert(kExpM >= 1, "B_M too small for this layout (TileM needs B_M>=32)");
     static_assert(kExpN >= 1, "B_N too small for this layout (TileN needs B_N>=32)");
     static_assert(kExpM * (kWmmaM * kTileM) == kBlockM, "B_M must be a multiple of kWmmaM*kTileM");
     static_assert(kExpN * (kWmmaN * kTileN) == kBlockN, "B_N must be a multiple of kWmmaN*kTileN");
 
-    static constexpr int kExpKHalf   = 2;                  // K-tiles per ds-prefetch half
-    static constexpr int kKHalfElems = kWmmaK * kExpKHalf; // 64 (K elems per half)
+    static constexpr int kExpKHalf = 2;                          // K-tiles per ds-prefetch half
+    static constexpr int kKHalfElems = kWmmaK * kExpKHalf;       // 64 (K elems per half)
     static_assert(kBlockK % kKHalfElems == 0, "B_K must be a multiple of 64");
     static constexpr int kHalvesPerSlot = kBlockK / kKHalfElems; // 64-K ds-halves per slot
 
     // One TDM loads a whole B_K slot (tile_dim0 = B_K fits the 16-bit field).
-    static constexpr int kTdmK     = kBlockK;
-    static constexpr int kNumChunk = kBlockK / kTdmK; // 1
+    static constexpr int kTdmK = kBlockK;
+    static constexpr int kNumChunk = kBlockK / kTdmK;            // 1
     static_assert(kBlockK == kNumChunk * kTdmK, "B_K must equal kTdmK");
 
-    static constexpr int kWarp = 32; // gfx1250 wave size (fixed geometry)
+    static constexpr int kWarp = 32;                             // gfx1250 wave size (fixed geometry)
     // Runtime-pass warp (32 device / 64 host); the WMMA register decomposition
     // is derived from this so device + host passes agree on vtype_c.
-    static constexpr int kWarpRt           = opus::get_warp_size();
-    static constexpr int kNumWaves         = BLOCK_SIZE / kWarp; // 4
+    static constexpr int kWarpRt = opus::get_warp_size();
+    static constexpr int kNumWaves = BLOCK_SIZE / kWarp;         // 4
     static constexpr int kNumProducerWaves = 2;
     static constexpr int kNumConsumerWaves = 2;
     static_assert(kNumWaves == kNumProducerWaves + kNumConsumerWaves,
                   "pipeline is locked to 4 waves (2 producer + 2 consumer)");
-    static_assert(kTileM * kTileN == kNumConsumerWaves, "consumer waves must equal kTileM*kTileN");
+    static_assert(kTileM * kTileN == kNumConsumerWaves,
+                  "consumer waves must equal kTileM*kTileN");
 
-    // -- TDM LDS padding (all B_K-derived) ----------------------------------
+    // ── TDM LDS padding (all B_K-derived) ──────────────────────────────────
     // One +kPadElems(=8) bf16 pad per B_K row -> conflict-free 16-row b128 reads,
     // i.e. exactly one 16-byte ds_read vector of pad after every written row.
     // The D# encodes the interval as a power-of-two byte count, so B_K must be one.
-    static_assert((kBlockK & (kBlockK - 1)) == 0,
-                  "B_K must be a power of 2 (D# pad interval is 8 << enc bytes)");
-    static constexpr int kPadReadVecBytes = 16; // one b128 ds_read
-    static constexpr int kPadElems        = kPadReadVecBytes / (int)sizeof(DataA); // 8 bf16
-    static constexpr int kSmemPitch       = kBlockK + kPadElems; // padded row pitch
+    static_assert((kBlockK & (kBlockK - 1)) == 0, "B_K must be a power of 2 (D# pad interval is 8 << enc bytes)");
+    static constexpr int kPadReadVecBytes = 16;                  // one b128 ds_read
+    static constexpr int kPadElems   = kPadReadVecBytes / (int)sizeof(DataA);   // 8 bf16
+    static constexpr int kSmemPitch  = kBlockK + kPadElems;      // padded row pitch
 
-    static constexpr int kARows      = kBlockM; // w0 loads all A rows
-    static constexpr int kBRows      = kBlockN; // w1 loads all B rows
+    static constexpr int kARows = kBlockM;                       // w0 loads all A rows
+    static constexpr int kBRows = kBlockN;                       // w1 loads all B rows
     static constexpr int kSlotElemsA = kARows * kSmemPitch;
     static constexpr int kSlotElemsB = kBRows * kSmemPitch;
     // Prefetch depth P (number of LDS slots). The s_barrier producer issues the
@@ -325,8 +302,9 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250
     // which must stay under the hardware direct-copy limit (256 / SIMD-pair;
     // < 128 per operand for 2 WG/CU co-residency). The codegen picks P per tile
     // to satisfy this -- see _ctdm_pick_num_slots() in opus_gemm_common.py.
-    static constexpr int kNumSlots = NUM_SLOTS_; // prefetch depth P (2 or 3)
-    static_assert(kNumSlots == 2 || kNumSlots == 3, "kNumSlots (prefetch depth P) must be 2 or 3");
+    static constexpr int kNumSlots = NUM_SLOTS_;                 // prefetch depth P (2 or 3)
+    static_assert(kNumSlots == 2 || kNumSlots == 3,
+                  "kNumSlots (prefetch depth P) must be 2 or 3");
 
     // Target WG/CU co-residency. When the in-flight TDM request count
     // (rows * P * B_K*2/256 per operand) would exceed the 2-WG safe budget
@@ -348,8 +326,9 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250
     // kClusterWgN WGs of a column, B by the kClusterWgM WGs of a row, so neither
     // cluster dim may exceed 5. The total cluster WG count is also capped at 16
     // (the 16-bit per-cluster workgroup_mask).
-    static_assert(kClusterWgM >= 1 && kClusterWgN >= 1 && kClusterWgM <= 5 && kClusterWgN <= 5 &&
-                      kClusterWgM * kClusterWgN <= 16,
+    static_assert(kClusterWgM >= 1 && kClusterWgN >= 1 &&
+                  kClusterWgM <= 5 && kClusterWgN <= 5 &&
+                  kClusterWgM * kClusterWgN <= 16,
                   "cluster dims must be 1..5 per side (TDM multicast <= 5 WGs) "
                   "and kClusterWgM*kClusterWgN <= 16 (16-bit workgroup_mask)");
 
@@ -372,14 +351,14 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250
     // register partition for both bf16 and fp32 storage.
     static constexpr int kCVec = 4;
 
-    // -- Warp-derived WMMA register-decomposition constants -------------------
+    // ── Warp-derived WMMA register-decomposition constants ───────────────────
     // (computed from kWarpRt so device/host passes match)
     static constexpr int kReptA = kWmmaM * kWmmaK / kWarpRt / kVecA;
     static constexpr int kReptB = kWmmaN * kWmmaK / kWarpRt / kVecB;
     static constexpr int kGrpKA = kWarpRt / kWmmaM;
     static constexpr int kGrpKB = kWarpRt / kWmmaN;
 
-    // -- scheduler hints (sched_group_barrier counts per ds-prefetch half) ----
+    // ── scheduler hints (sched_group_barrier counts per ds-prefetch half) ────
     // These counts are NOT optional perf hints: they force ds_read-before-WMMA
     // ordering, so they MUST equal the real per-half instruction counts. They
     // scale with the consumer register expansion (kExpM for A, kExpN for B,
@@ -390,13 +369,12 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250
     //   ds_reads / half = (kExpM*kReptA + kExpN*kReptB) * kExpKHalf
     //   wmmas    / half =  kExpM*kExpN * kExpKHalf
     // Base (kExpM=kExpN=1, kReptA=kReptB=2, kExpKHalf=2): DS=8, WMMA=2.
-    static constexpr int kSchedDsMask    = 0x100; // DS_READ group
-    static constexpr int kSchedDsCount   = (kExpM * kReptA + kExpN * kReptB) * kExpKHalf;
-    static constexpr int kSchedWmmaMask  = 0x008; // WMMA group
+    static constexpr int kSchedDsMask   = 0x100;                 // DS_READ group
+    static constexpr int kSchedDsCount  = (kExpM * kReptA + kExpN * kReptB) * kExpKHalf;
+    static constexpr int kSchedWmmaMask = 0x008;                 // WMMA group
     static constexpr int kSchedWmmaCount = kExpM * kExpN * kExpKHalf;
 
-#if(defined(__gfx1250__) || defined(__gfx1250_strict__) || !defined(__HIP_DEVICE_COMPILE__)) && \
-    (__clang_major__ >= 22)
+#if (defined(__gfx1250__) || defined(__gfx1250_strict__) || !defined(__HIP_DEVICE_COMPILE__)) && (__clang_major__ >= 22)
     // The TDM window types live only where opus::tdm is available (gfx1250 device
     // pass + host pass, clang>=22). Non-gfx1250 device passes and clang-20
     // (ROCm 7.1) CI never reference them -- opus::tdm is gated identically.
@@ -416,23 +394,21 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250
 #endif
 };
 
-// -- smem -> register read layouts (device-only; host pass compiles them too
+// ── smem -> register read layouts (device-only; host pass compiles them too
 //    for vtype_c consistency). Reference each traits member; no local
-//    constexpr beyond loop-index helpers. ------------------------------------
+//    constexpr beyond loop-index helpers. ────────────────────────────────────
 #if defined(__gfx1250__) || defined(__gfx1250_strict__) || !defined(__HIP_DEVICE_COMPILE__)
 
 // smem TILE layout (what the TDM write produces, ra/rb read): row-major
 // [rows][K] with padded row pitch.
 template <typename T>
-__device__ inline auto make_layout_sa_ctdm()
-{
+__device__ inline auto make_layout_sa_ctdm() {
     return opus::make_layout<0>(
         opus::make_tuple(opus::number<T::kARows>{}, opus::number<T::kTdmK>{}),
         opus::make_tuple(opus::number<T::kSmemPitch>{}, 1_I));
 }
 template <typename T>
-__device__ inline auto make_layout_sb_ctdm()
-{
+__device__ inline auto make_layout_sb_ctdm() {
     return opus::make_layout<0>(
         opus::make_tuple(opus::number<T::kBRows>{}, opus::number<T::kTdmK>{}),
         opus::make_tuple(opus::number<T::kSmemPitch>{}, 1_I));
@@ -441,25 +417,18 @@ __device__ inline auto make_layout_sb_ctdm()
 // A operand (M x K) read layout. wave_m selects this consumer's M sub-tile
 // (TileM: 0..1; TileN: always 0).
 template <typename T>
-__device__ inline auto make_layout_ra_ctdm(int lane_id, int wave_m)
-{
-    constexpr auto shape = opus::make_tuple(opus::number<T::kExpM>{},
-                                            opus::number<T::kTileM>{},
-                                            opus::number<T::kWmmaM>{},
-                                            opus::number<T::kExpKHalf>{},
-                                            opus::number<T::kTileK>{},
-                                            opus::number<T::kReptA>{},
-                                            opus::number<T::kGrpKA>{},
-                                            opus::number<T::kVecA>{});
-    constexpr auto dim   = opus::make_tuple(
+__device__ inline auto make_layout_ra_ctdm(int lane_id, int wave_m) {
+    constexpr auto shape = opus::make_tuple(
+        opus::number<T::kExpM>{}, opus::number<T::kTileM>{}, opus::number<T::kWmmaM>{},
+        opus::number<T::kExpKHalf>{}, opus::number<T::kTileK>{},
+        opus::number<T::kReptA>{}, opus::number<T::kGrpKA>{}, opus::number<T::kVecA>{});
+    constexpr auto dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(
-            opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
     return opus::make_layout<0>(
         shape,
         opus::unfold_x_stride(dim, shape, opus::tuple{T::kSmemPitch, 1_I}),
-        opus::unfold_p_coord(dim,
-                             opus::tuple{wave_m, lane_id % T::kWmmaM, 0, lane_id / T::kWmmaM}));
+        opus::unfold_p_coord(dim, opus::tuple{wave_m, lane_id % T::kWmmaM, 0, lane_id / T::kWmmaM}));
 }
 
 // B operand (N x K) read layout. wave_n selects this consumer's N sub-tile
@@ -474,25 +443,18 @@ __device__ inline auto make_layout_ra_ctdm(int lane_id, int wave_m)
 // with B_N>32. (kExpN==1 or kTileN==1 hide the mismatch, which is why tileM
 // kExpN>1 and tileN B_N==32 were already correct.)
 template <typename T>
-__device__ inline auto make_layout_rb_ctdm(int lane_id, int wave_n)
-{
-    constexpr auto shape = opus::make_tuple(opus::number<T::kExpN>{},
-                                            opus::number<T::kTileN>{},
-                                            opus::number<T::kWmmaN>{},
-                                            opus::number<T::kExpKHalf>{},
-                                            opus::number<T::kTileK>{},
-                                            opus::number<T::kReptB>{},
-                                            opus::number<T::kGrpKB>{},
-                                            opus::number<T::kVecB>{});
-    constexpr auto dim   = opus::make_tuple(
+__device__ inline auto make_layout_rb_ctdm(int lane_id, int wave_n) {
+    constexpr auto shape = opus::make_tuple(
+        opus::number<T::kExpN>{}, opus::number<T::kTileN>{}, opus::number<T::kWmmaN>{},
+        opus::number<T::kExpKHalf>{}, opus::number<T::kTileK>{},
+        opus::number<T::kReptB>{}, opus::number<T::kGrpKB>{}, opus::number<T::kVecB>{});
+    constexpr auto dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(
-            opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
     return opus::make_layout<0>(
         shape,
         opus::unfold_x_stride(dim, shape, opus::tuple{T::kSmemPitch, 1_I}),
-        opus::unfold_p_coord(dim,
-                             opus::tuple{wave_n, lane_id % T::kWmmaN, 0, lane_id / T::kWmmaN}));
+        opus::unfold_p_coord(dim, opus::tuple{wave_n, lane_id % T::kWmmaN, 0, lane_id / T::kWmmaN}));
 }
 
-#endif // __gfx1250__ || !__HIP_DEVICE_COMPILE__
+#endif  // __gfx1250__ || !__HIP_DEVICE_COMPILE__

@@ -30,7 +30,7 @@ import re
 import sys
 
 PROXIMITY = 5  # lines; see module docstring
-FINDING = re.compile(r"^(?|?|?)")
+FINDING = re.compile(r"^(🔴|⚠️|📝)")
 # path/to/file.ext:1234 -- the extension keeps 'PR#2695:' and bare 'note:7' out
 CITATION = re.compile(r"\b([\w./-]+\.[A-Za-z]{1,6}):(\d+)\b")
 # What a finding says is at the cited line, in the two shapes cards use:
@@ -120,8 +120,7 @@ def check(card_text: str, trees, changed=()):
                 # or from the basename search (a path in merge-target/). Resolve against
                 # whichever tree actually holds it rather than assuming one of them.
                 f = next(
-                    (t / hits[0] for t in trees if (t / hits[0]).is_file()),
-                    tree / hits[0],
+                    (t / hits[0] for t in trees if (t / hits[0]).is_file()), tree / hits[0]
                 )
                 if not f.is_file():
                     yield "bad", f"{path}:{lineno} -- {hits[0]} is in the diff but not the tree"
@@ -171,7 +170,7 @@ def check(card_text: str, trees, changed=()):
                             break
                 yield "note", (
                     f"{path}:{lineno} -- none of {sorted(quoted)} within "
-                    f"+-{PROXIMITY} lines; {'; '.join(where)}"
+                    f"±{PROXIMITY} lines; {'; '.join(where)}"
                 )
 
 

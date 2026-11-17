@@ -275,8 +275,7 @@ static inline bool is_gfx1250_asm_a0_ok(const char* kernel_name)
     if(is_gfx1250_asm_supported() || is_gfx1250_asm_a0_ok(kernel_name))
         return;
     std::string msg = std::string(kernel_name ? kernel_name : "<unknown>") +
-                      " asm code object targets gfx1250 B0+; running device is MI450 A0 "
-                      "(gfx1250-strict, or gfx1250 asicRevision 0).";
+                      " asm code object targets gfx1250 B0+; running device is MI450 A0 (gfx1250-strict, or gfx1250 asicRevision 0).";
     std::cerr << "[AITER] " << msg << std::endl;
     throw std::runtime_error(std::move(msg));
 }
@@ -322,12 +321,10 @@ class AiterAsmKernelFast
         // we probe via hipGetFuncBySymbol -- if it returns null the runtime silently
         // rejected the kernel (e.g. resource limits, arch mismatch). This runs
         // once per kernel variant at init time, not on every launch.
-        hipFunction_t probe           = nullptr;
+        hipFunction_t probe = nullptr;
         const hipError_t probe_status = hipGetFuncBySymbol(&probe, reinterpret_cast<void*>(this));
         AITER_CHECK(probe_status == hipSuccess && probe != nullptr,
-                    "kernel registration failed for '",
-                    kernel_name,
-                    "': ",
+                    "kernel registration failed for '", kernel_name, "': ",
                     hipGetErrorString(probe_status));
         module = registration.release();
     }
@@ -380,22 +377,22 @@ class AiterAsmKernelFast
         {
 #ifdef AITER_ENABLE_CLUSTER_LAUNCH
             hipLaunchAttribute attrs[1];
-            attrs[0].id               = hipLaunchAttributeClusterDimension;
+            attrs[0].id              = hipLaunchAttributeClusterDimension;
             attrs[0].val.clusterDim.x = static_cast<unsigned int>(kargs.cluster_x);
             attrs[0].val.clusterDim.y = static_cast<unsigned int>(kargs.cluster_y);
             attrs[0].val.clusterDim.z = static_cast<unsigned int>(kargs.cluster_z);
 
             HIP_LAUNCH_CONFIG launch_config{};
-            launch_config.gridDimX       = static_cast<unsigned int>(kargs.gdx);
-            launch_config.gridDimY       = static_cast<unsigned int>(kargs.gdy);
-            launch_config.gridDimZ       = static_cast<unsigned int>(kargs.gdz);
-            launch_config.blockDimX      = static_cast<unsigned int>(kargs.bdx);
-            launch_config.blockDimY      = static_cast<unsigned int>(kargs.bdy);
-            launch_config.blockDimZ      = static_cast<unsigned int>(kargs.bdz);
+            launch_config.gridDimX      = static_cast<unsigned int>(kargs.gdx);
+            launch_config.gridDimY      = static_cast<unsigned int>(kargs.gdy);
+            launch_config.gridDimZ      = static_cast<unsigned int>(kargs.gdz);
+            launch_config.blockDimX     = static_cast<unsigned int>(kargs.bdx);
+            launch_config.blockDimY     = static_cast<unsigned int>(kargs.bdy);
+            launch_config.blockDimZ     = static_cast<unsigned int>(kargs.bdz);
             launch_config.sharedMemBytes = kargs.smem;
-            launch_config.hStream        = kargs.stream;
-            launch_config.attrs          = attrs;
-            launch_config.numAttrs       = 1;
+            launch_config.hStream       = kargs.stream;
+            launch_config.attrs         = attrs;
+            launch_config.numAttrs      = 1;
 
             HIP_CALL_LAUNCH(
                 hipDrvLaunchKernelEx(&launch_config, kernel_func, nullptr, (void**)&config));
@@ -407,11 +404,7 @@ class AiterAsmKernelFast
             // and produce wrong results for a cluster-aware kernel).
             AITER_CHECK(false,
                         "workgroup-cluster launch requested (cluster=",
-                        kargs.cluster_x,
-                        "x",
-                        kargs.cluster_y,
-                        "x",
-                        kargs.cluster_z,
+                        kargs.cluster_x, "x", kargs.cluster_y, "x", kargs.cluster_z,
                         ") but this build lacks cluster support; rebuild with "
                         "AITER_ENABLE_CLUSTER_LAUNCH on gfx1250+ / HIP >= 7.0");
 #endif

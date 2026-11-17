@@ -113,7 +113,7 @@ def _evict_weight(key, _ref):
 
 
 def _prep_weight(w, k, kt, kh, kw, wc, cgp):
-    """Pack (K, C, T, R, S) -> (K, T*R*S*cgp), memoized."""
+    """Pack (K, C, T, R, S) → (K, T*R*S*cgp), memoized."""
     anchor = w._base if w._base is not None else w
     key = (w.data_ptr(), cgp)
     stamp = (w._version, tuple(w.shape), w.stride(), w.dtype, cgp)

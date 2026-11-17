@@ -35,9 +35,8 @@ PAGE = 100
 def _minutes_between(start, end):
     """Minutes from one workflow timestamp to the one after it, for timing a completed job."""
     fmt = "%Y-%m-%dT%H:%M:%SZ"
-    return (
-        datetime.datetime.strptime(end, fmt) - datetime.datetime.strptime(start, fmt)
-    ).total_seconds() / 60.0
+    return ((datetime.datetime.strptime(end, fmt)
+             - datetime.datetime.strptime(start, fmt)).total_seconds() / 60.0)
 
 
 class GitHub:
@@ -58,11 +57,8 @@ class GitHub:
             self.API + path,
             method=method,
             data=json.dumps(body).encode() if body is not None else None,
-            headers={
-                "authorization": "token %s" % (token or self._token),
-                "accept": "application/vnd.github+json",
-            },
-        )
+            headers={"authorization": "token %s" % (token or self._token),
+                     "accept": "application/vnd.github+json"})
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 return r.status, json.load(r) if r.status != 204 else None
@@ -80,9 +76,7 @@ class GitHub:
         return status
 
     def jobs(self, repo, run_id):
-        return self._get(
-            "/repos/%s/actions/runs/%s/jobs?per_page=%d" % (repo, run_id, PAGE)
-        )["jobs"]
+        return self._get("/repos/%s/actions/runs/%s/jobs?per_page=%d" % (repo, run_id, PAGE))["jobs"]
 
     def _runs(self, repo, *statuses):
         """Every run of this workflow in the given statuses, not just the first page.
@@ -96,8 +90,7 @@ class GitHub:
             while True:
                 batch = self._get(
                     "/repos/%s/actions/workflows/%s/runs?status=%s&per_page=%d&page=%d"
-                    % (repo, WORKFLOW, status, PAGE, page)
-                )["workflow_runs"]
+                    % (repo, WORKFLOW, status, PAGE, page))["workflow_runs"]
                 out += batch
                 if len(batch) < PAGE:
                     break
@@ -128,31 +121,20 @@ class GitHub:
         box's pace.
         """
         out = []
-        runs = self._get(
-            "/repos/%s/actions/workflows/%s/runs?status=success&per_page=%d"
-            % (repo, WORKFLOW, PAGE)
-        )["workflow_runs"]
+        runs = self._get("/repos/%s/actions/workflows/%s/runs?status=success&per_page=%d"
+                         % (repo, WORKFLOW, PAGE))["workflow_runs"]
         for run in runs:
-            review = next(
-                (j for j in self.jobs(repo, run["id"]) if j["name"] == "review"), None
-            )
-            if (
-                review is not None
-                and review.get("started_at")
-                and review.get("completed_at")
-            ):
-                out.append(
-                    _minutes_between(review["started_at"], review["completed_at"])
-                )
+            review = next((j for j in self.jobs(repo, run["id"]) if j["name"] == "review"), None)
+            if review is not None and review.get("started_at") and review.get("completed_at"):
+                out.append(_minutes_between(review["started_at"], review["completed_at"]))
                 if len(out) >= want:
                     break
         return out
 
     def comment(self, repo, pr, body):
         # Post as aiter-bot, like every other message this workflow sends.
-        return self._post(
-            "/repos/%s/issues/%s/comments" % (repo, pr), {"body": body}, self._bot_token
-        )
+        return self._post("/repos/%s/issues/%s/comments" % (repo, pr),
+                          {"body": body}, self._bot_token)
 
 
 def box_busy(api, repo, own_run_id):
@@ -161,10 +143,8 @@ def box_busy(api, repo, own_run_id):
     for run in api.in_progress_runs(repo):
         if run["id"] == own_run_id:
             continue
-        if any(
-            j["name"] == "review" and j["status"] == "in_progress"
-            for j in api.jobs(repo, run["id"])
-        ):
+        if any(j["name"] == "review" and j["status"] == "in_progress"
+               for j in api.jobs(repo, run["id"])):
             return True
     return False
 
@@ -184,15 +164,14 @@ def failed(msg):
 
 def stuck_body(mins, owner):
     return (
-        "? **aiter-bot** -- no self-hosted runner claimed this review in "
+        "⚠️ **aiter-bot** — no self-hosted runner claimed this review in "
         "%s min, so it has not started. Nothing is wrong with this PR.\n\n"
         "A queued job never fails on its own, so this notice is the only signal: the runner "
-        "process is probably not running on the box -- see "
+        "process is probably not running on the box — see "
         "`.claude/skills/review-pr/RUNNER-SETUP.md` section 5.\n\n"
-        "@%s -- please check the runner.\n\n"
+        "@%s — please check the runner.\n\n"
         "<sub>A queued job expires after 24 h. Re-comment `@aiter-bot review` once it is "
-        "back.</sub>" % (mins, owner)
-    )
+        "back.</sub>" % (mins, owner))
 
 
 def run(api, env, sleep=time.sleep, clock=time.monotonic):
@@ -217,22 +196,18 @@ def run(api, env, sleep=time.sleep, clock=time.monotonic):
     saw_review = False
     while clock() < deadline:
         sleep(POLL_SECONDS)
-        review = next(
-            (j for j in api.jobs(repo, own_run_id) if j["name"] == "review"), None
-        )
+        review = next((j for j in api.jobs(repo, own_run_id) if j["name"] == "review"), None)
         if review is not None:
             saw_review = True
             if review["status"] != "queued":
-                return 0  # ours started
+                return 0                                    # ours started
 
     # The job this watchdog exists to watch was never in its own run's job list -- a rename, or
     # a matrix that suffixes job names. Treating that as "ours started" would report success
     # forever while watching nothing, so name the problem; it is a workflow-structure fault and
     # not a reason to page anyone about the box.
     if not saw_review:
-        return failed(
-            "this run has no job named 'review', so the watchdog is watching nothing"
-        )
+        return failed("this run has no job named 'review', so the watchdog is watching nothing")
 
     # Ask about the box only now. Asking inside the loop and returning on the first yes abandons
     # the PR: the runner can die a minute later with nobody left watching, and a queued job

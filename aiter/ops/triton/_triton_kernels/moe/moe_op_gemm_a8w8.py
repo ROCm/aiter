@@ -225,7 +225,7 @@ def _moe_gemm_a8w8(
     W_CACHE_MODIFIER: tl.constexpr,
     UPCAST_INDICES: tl.constexpr = False,
     # Use fnuz FP8 (float8_e4m3fnuz / gfx942) instead of OCP FP8 (float8e4nv / gfx950).
-    # When True, replaces tl.dot_scaled with manual E8M0->fp32 dequant + tl.dot.
+    # When True, replaces tl.dot_scaled with manual E8M0→fp32 dequant + tl.dot.
     USE_FNUZ: tl.constexpr = False,
 ):
     tl.assume(stride_y_k >= 0)

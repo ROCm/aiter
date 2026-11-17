@@ -249,10 +249,12 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
             ck_tile::MoeFlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>>;
 
         // TODO: support more act type.
-        using FusedAct = std::conditional_t<
-            ActivationOp == 2,
-            ck_tile::moe::Swiglu,
-            std::conditional_t<ActivationOp == 3, ck_tile::moe::MoeRelu2, ck_tile::moe::MoeSilu>>;
+        using FusedAct =
+            std::conditional_t<ActivationOp == 2,
+                                ck_tile::moe::Swiglu,
+                                std::conditional_t<ActivationOp == 3,
+                                                    ck_tile::moe::MoeRelu2,
+                                                    ck_tile::moe::MoeSilu>>;
 
         using Kernel = ck_tile::MoeFlatmmKernel<TilePartitioner,
                                                 CodegenFlatmmPipeline,
@@ -262,8 +264,8 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
 
         auto kargs = Kernel::MakeKernelArgs(args);
 
-        const dim3 grids  = Kernel::GridSize(kargs);
-        const dim3 blocks = Kernel::BlockSize();
+        const dim3 grids      = Kernel::GridSize(kargs);
+        const dim3 blocks     = Kernel::BlockSize();
 
         // if(!Kernel::IsSupportedArgument(kargs))
         // {

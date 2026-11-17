@@ -7,7 +7,8 @@
 namespace fused_q_norm {
 // Public BF16 Q views are aligned to 16 bytes, including storage offsets.
 // Keep the 16-element register fragment without requiring a 32-byte pointer.
-__device__ __forceinline__ opus::vector_t<opus::bf16_t, 16> load_bf16x16(const opus::bf16_t* ptr)
+__device__ __forceinline__ opus::vector_t<opus::bf16_t, 16>
+load_bf16x16(const opus::bf16_t* ptr)
 {
     opus::vector_t<opus::bf16_t, 16> result;
     opus::static_for<2>([&](auto half) {

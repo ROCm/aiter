@@ -22,8 +22,8 @@ template <typename A0DataType,
           bool PerTensorQuant,
           bool MulRoutedWeight,
           int ActOP,
-          bool PadK,
-          bool RuntimeSwigluLimit>
+          bool RuntimeSwigluLimit,
+          bool PadK>
 void ck_moe_stage1_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -184,7 +184,6 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                      PerTensorQuant,                          \
                                      MulRoutedWeight,                         \
                                      ActOP,                                   \
-                                     PadK,                                    \
                                      AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT>(      \
         const hipStream_t& stream,                                            \
         int tokens,                                                           \

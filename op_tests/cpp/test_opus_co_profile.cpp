@@ -8,47 +8,32 @@
 using namespace opus_gfx1250_co;
 namespace fs = std::filesystem;
 
-std::vector<char> elf(uint32_t processor)
-{
+std::vector<char> elf(uint32_t processor) {
     std::vector<char> bytes(64, 0);
-    bytes[0]  = 0x7f;
-    bytes[1]  = 'E';
-    bytes[2]  = 'L';
-    bytes[3]  = 'F';
-    bytes[4]  = 2;
-    bytes[5]  = 1;
+    bytes[0] = 0x7f; bytes[1] = 'E'; bytes[2] = 'L'; bytes[3] = 'F';
+    bytes[4] = 2; bytes[5] = 1;
     bytes[18] = static_cast<char>(224);
     bytes[48] = static_cast<char>(processor);
     bytes[49] = 2; // Higher feature bits must not affect the processor test.
     return bytes;
 }
 
-template <class F>
-void must_throw(F f)
-{
+template<class F> void must_throw(F f) {
     bool threw = false;
-    try
-    {
-        f();
-    }
-    catch(const std::runtime_error&)
-    {
-        threw = true;
-    }
+    try { f(); } catch(const std::runtime_error&) { threw = true; }
     assert(threw);
 }
 
-int main(int argc, char** argv)
-{
+int main(int argc, char** argv) {
     assert(argc == 2);
     const auto work = fs::absolute(argv[1]).lexically_normal();
     fs::create_directories(work / "combined" / "gfx1250-strict");
     fs::create_directories(work / "combined" / "gfx1250");
     fs::create_directories(work / "flat-a0");
-    const auto base          = work / "combined";
+    const auto base = work / "combined";
     const std::string symbol = "kid_496_same_symbol";
-    const auto a0            = select_image(base.string(), "gfx1250", 0, symbol);
-    const auto b0            = select_image(base.string(), "gfx1250", 1, symbol);
+    const auto a0 = select_image(base.string(), "gfx1250", 0, symbol);
+    const auto b0 = select_image(base.string(), "gfx1250", 1, symbol);
     assert(a0.path == (base / "gfx1250-strict" / (symbol + ".co")).string());
     assert(b0.path == (base / "gfx1250" / (symbol + ".co")).string());
     assert(fs::path(a0.path).filename() == fs::path(b0.path).filename());
@@ -109,8 +94,7 @@ int main(int argc, char** argv)
     const auto strict_fallback =
         select_regular_fallback(base.string(), "gfx1250-strict:sramecc+", symbol);
     assert(strict_fallback.has_value() && strict_fallback->path == fallback->path);
-    const auto leaf =
-        select_regular_fallback((base / "gfx1250-strict").string(), "gfx1250", symbol);
+    const auto leaf = select_regular_fallback((base / "gfx1250-strict").string(), "gfx1250", symbol);
     assert(leaf.has_value() && leaf->path == fallback->path);
     const auto strict_leaf =
         select_regular_fallback((base / "gfx1250-strict").string(), "gfx1250-strict", symbol);

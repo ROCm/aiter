@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MHA Forward Prefill kernel -- ``m32x8`` design, gfx1250 (MI400 / mi450).
+"""MHA Forward Prefill kernel — ``m32x8`` design, gfx1250 (MI400 / mi450).
 
 A clean FlyDSL kernel written in the high-level layout-algebra style
 (tiled copy / tiled MMA + ``SharedAllocator``).
@@ -11,14 +11,14 @@ owning a **32-row** Q span (2 adjacent 16-row WMMA tiles). gfx1250 runs wave32,
 so a threadgroup is ``8 * 32 = 256`` threads and ``BLOCK_M = 32 * 8 = 256`` Q
 rows. (The leading ``32`` is per-wave Q rows; ``16`` is the WMMA M dimension.)
 
-Layout support -- two device kernels over one shared compute core (option B):
-  - ``kn_fmha_fwd_prefill_a16w16_m32x8_thd``  -- varlen THD, driven by ``cu_seqlens``.
-  - ``kn_fmha_fwd_prefill_a16w16_m32x8_bshd`` -- batched BSHD, uniform ``seq_len`` scalar
-    (no ``cu_seqlens`` tensors -> nothing transient to bake into a CUDA graph).
+Layout support — two device kernels over one shared compute core (option B):
+  - ``kn_fmha_fwd_prefill_a16w16_m32x8_thd``  — varlen THD, driven by ``cu_seqlens``.
+  - ``kn_fmha_fwd_prefill_a16w16_m32x8_bshd`` — batched BSHD, uniform ``seq_len`` scalar
+    (no ``cu_seqlens`` tensors → nothing transient to bake into a CUDA graph).
 Both resolve their per-workgroup base offsets + sequence bounds, then call the
 layout-agnostic ``_core_attention`` helper.
 
-Scope -- v1 (this file is intentionally config-agnostic in its name):
+Scope — v1 (this file is intentionally config-agnostic in its name):
   - ``qk_hdim in {64, 128, 192, 256}`` (D_qk), ``v_hdim in {64, 128, 256}`` (D_v); they are
     independent. ``n_block`` is picked by ``pick_n_block`` (128 at qk_hdim <= 128,
     64 at 192/256). v_hdim 256 runs at BLOCK_M 128 only: the BLOCK_M 256 O tile
@@ -127,7 +127,7 @@ from .fmha_utils import (
 # ============================================================================
 
 
-# "m32x8": each wave owns WMMA_ROW_PER_WAVE adjacent 16-row (WMMA M) Q sub-tiles ->
+# "m32x8": each wave owns WMMA_ROW_PER_WAVE adjacent 16-row (WMMA M) Q sub-tiles →
 # BLOCK_M = 16 * 2 * 8 = 256 Q rows per threadgroup. Each wave's 2 tiles are
 # contiguous: warp i owns rows [i*32, i*32+32) = tiles 2i, 2i+1.
 WMMA_N = 16  # kv rows per WMMA tile (the S^T=K@Q^T output's n_block-direction axis)
@@ -204,7 +204,7 @@ N_KV_PP = 3
 # Softmax runs in log2 units: LOG2E is folded into Q by the Q loader's bf16 multiply, so
 # the inner loop is a plain exp2_fastmath(S' - m) and m/LSE live in the log2 domain.
 
-# Deferred oaccu rescale (FAv4, hk_mla spec ?9.1.1): corr == 1 when the running max does
+# Deferred oaccu rescale (FAv4, hk_mla spec §9.1.1): corr == 1 when the running max does
 # not move, so keep m STALE while the row max stays within RESCALE_THRESHOLD natural
 # logits of it and skip the full-width multiply. False (or threshold < 0) always rescales.
 ENABLE_DEFER_RESCALE = True
@@ -245,7 +245,7 @@ PVQK_LAG = 2
 PVQK_HEAD_CARRY = 20
 
 # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
-# granularity) live inside fmha_buffer_managers.py -- they are intrinsic to the
+# granularity) live inside fmha_buffer_managers.py — they are intrinsic to the
 # managers' LDS layouts, so the kernel no longer declares them here.
 
 
@@ -320,7 +320,7 @@ def _softmax(
     Returns ``(p, m_new, d_new, corr)`` plus ``rescale_masks``. p is num_kv_frags v8 **f32** P^T =
     exp(S^T - m_new), NOT narrowed to the wmma element type -- the caller places that with
     ``_convert_vectors``. m_new is STALE (== m_prev) when that row's ballot did not fire (FAv4
-    ?9.1.1), with corr == 1 and d_new = corr*d_prev + rowsum(p). ``rescale_masks`` is the num_q_tiles
+    §9.1.1), with corr == 1 and d_new = corr*d_prev + rowsum(p). ``rescale_masks`` is the num_q_tiles
     raw ballots (None when deferral is compiled out), for the caller to fold into its one
     branch condition at the use site.
     """
@@ -1252,7 +1252,7 @@ def _attention_core_multi_kv_tiles(
     # ---- Loop init: the online-softmax seed and the O accumulators, all iter_args.
     #
     # Seeding m=-inf, d=0, O=0 makes the first tile's corr = exp2_fastmath(m_prev-m_new) = 0 zero
-    # the (already-zero) O before its PV adds in -- the standard flash seed.
+    # the (already-zero) O before its PV adds in — the standard flash seed.
     #
     # Attention sink (compile-time) is one extra ``exp(sink)`` term in the softmax denom.
     # Fold it in by seeding m = sink[q_head]*LOG2E (m is log2-domain) and d = 1.0
@@ -2368,7 +2368,7 @@ def _zero_fill_attention(
 
 
 # ============================================================================
-# Builder -- one device kernel per (layout, config)
+# Builder — one device kernel per (layout, config)
 # ============================================================================
 
 
@@ -3381,7 +3381,7 @@ def flash_attn_varlen_m32x8(
     lse=None,
     num_q_tiles_per_wave=None,
 ):
-    """Host entry -- varlen THD, qk_hdim in {64,128,192,256} / v_hdim in {64,128,256}, bf16 or fp16.
+    """Host entry — varlen THD, qk_hdim in {64,128,192,256} / v_hdim in {64,128,256}, bf16 or fp16.
 
     ``window_size`` is ``(left, right)`` sliding-window bounds, ``-1`` meaning infinite
     on that side; ``causal`` forces ``right=0``. Only finiteness is baked into the kernel
@@ -3554,7 +3554,7 @@ def flash_attn_paged_m32x8(
     lse=None,
     num_q_tiles_per_wave=None,
 ):
-    """Host entry -- PAGED KV, qk_hdim in {64,128,192,256} / v_hdim in {64,128,256}, bf16 or fp16.
+    """Host entry — PAGED KV, qk_hdim in {64,128,192,256} / v_hdim in {64,128,256}, bf16 or fp16.
 
     ``k``/``v`` are the page pool, ``[num_blocks, page_size, nheads_k, hdim]`` (or
     ``[num_blocks, nheads_k, hdim]`` at page size 1). ``qo_indptr`` gives this batch's Q
@@ -3755,7 +3755,7 @@ def flash_attn_batch_m32x8(
     lse=None,
     num_q_tiles_per_wave=None,
 ):
-    """Host entry -- batched BSHD ``[B, S, H, D]``, qk_hdim in {64,128,192,256} / v_hdim in {64,128,256}, bf16 or fp16.
+    """Host entry — batched BSHD ``[B, S, H, D]``, qk_hdim in {64,128,192,256} / v_hdim in {64,128,256}, bf16 or fp16.
 
     Uses the dedicated BSHD kernel with a uniform ``seq_len`` scalar (no cu_seqlens), so
     there is nothing transient to bake into a CUDA graph. ``window_size``, ``causal``,
@@ -3826,7 +3826,7 @@ def flash_attn_batch_m32x8(
         stride_lse_head = 0
         stride_lse_batch = 0
 
-    # Empty tensor -- skip the launch (host-known dims, no device sync). No queries means
+    # Empty tensor — skip the launch (host-known dims, no device sync). No queries means
     # no rows to write; no keys means an empty softmax set, so O=0 and LSE=-inf, or
     # LSE=sink[head] with a sink, exp(sink) being the only surviving term.
     if seq_len_q == 0 or seq_len_k == 0:

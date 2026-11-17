@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-# Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
+# Copyright © Advanced Micro Devices, Inc. All rights reserved.
 # Adapted from AMD-AGI/AKLR BF16 decode kernels (MIT), revision 551613c81ea1f232cadb72e6f4647f96152e67d4.
 
 """BF16 decode band-stream policy for gfx950.

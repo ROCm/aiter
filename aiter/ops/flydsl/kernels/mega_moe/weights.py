@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2026 FlyDSL Project Contributors
+# Copyright (c) 2026 FlyDSL Project Contributors
 """Weight binding contract shared by MegaMoEV2 and its small- and large-input runtimes."""
 
 import torch

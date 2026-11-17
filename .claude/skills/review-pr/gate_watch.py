@@ -30,12 +30,8 @@ import sys
 
 from watchdog import GitHub, WORKFLOW, PAGE, notice, failed
 
-STUCK_MINUTES = (
-    30  # a queued run this old is not waiting for anything but a hosted runner
-)
-WINDOW_MINUTES = (
-    15  # one poll wide; must equal the cron interval in review-bot-gate-watch.yml
-)
+STUCK_MINUTES = 30    # a queued run this old is not waiting for anything but a hosted runner
+WINDOW_MINUTES = 15   # one poll wide; must equal the cron interval in review-bot-gate-watch.yml
 
 
 def _age_minutes(created_at, now):
@@ -53,10 +49,8 @@ def queued_runs(api, repo):
     last page."""
     out, page = [], 1
     while True:
-        batch = api._get(
-            "/repos/%s/actions/workflows/%s/runs?status=queued&per_page=%d&page=%d"
-            % (repo, WORKFLOW, PAGE, page)
-        )["workflow_runs"]
+        batch = api._get("/repos/%s/actions/workflows/%s/runs?status=queued&per_page=%d&page=%d"
+                         % (repo, WORKFLOW, PAGE, page))["workflow_runs"]
         out += batch
         if len(batch) < PAGE:
             return out
@@ -81,21 +75,17 @@ def run(api, env, now):
             if gate is not None and gate["status"] == "completed":
                 continue
             stuck.append((r, age))
-    except Exception as e:  # noqa: BLE001 - the watcher itself broke
+    except Exception as e:                              # noqa: BLE001 - the watcher itself broke
         return failed("cannot read the queued runs: %s: %s" % (type(e).__name__, e))
     if not stuck:
         if queued:
-            notice(
-                "%d run(s) queued, oldest %.0f min -- nothing newly stuck"
-                % (len(queued), max(_age_minutes(r["created_at"], now) for r in queued))
-            )
+            notice("%d run(s) queued, oldest %.0f min -- nothing newly stuck"
+                   % (len(queued), max(_age_minutes(r["created_at"], now) for r in queued)))
         return 0
     owner = (env.get("OWNER_OVERRIDE") or "").strip() or "zufayu"
-    msg = (
-        "%d review request(s) have waited up to %.0f min for a hosted runner -- the gate "
-        "job never started, so nothing in those runs can speak. @%s -- check the "
-        "hosted-runner quota." % (len(stuck), max(a for _, a in stuck), owner)
-    )
+    msg = ("%d review request(s) have waited up to %.0f min for a hosted runner -- the gate "
+           "job never started, so nothing in those runs can speak. @%s -- check the "
+           "hosted-runner quota." % (len(stuck), max(a for _, a in stuck), owner))
     for r, _ in stuck:
         print(r["html_url"])
     return failed(msg)

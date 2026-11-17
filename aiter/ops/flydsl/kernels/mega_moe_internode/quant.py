@@ -48,7 +48,7 @@ def build_rail_record_quant(
     if pad_tokens < 0:
         raise ValueError("pad_tokens must be nonnegative")
     scale_n = hidden // GROUP
-    assert scale_n >= 2 * topk, "ids/weights ?? token ? 2*topk ? group ?????"
+    assert scale_n >= 2 * topk, "ids/weights 由每 token 前 2*topk 个 group 线程顺带写"
     rec, off_q, off_s, off_i, off_w = rail_record_layout(hidden, topk, activation_dtype)
 
     inv_max_bits = (

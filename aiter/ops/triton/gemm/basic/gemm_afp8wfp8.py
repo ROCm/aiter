@@ -383,7 +383,7 @@ def gemm_afp8wfp8_preshuffle(
         dtype: Output dtype.
         y: Optional pre-allocated output (M, N).
         config: Optional kernel-tuning dict.
-        x_scale_group_size: K elements per activation scale -- 128 for blockscale
+        x_scale_group_size: K elements per activation scale — 128 for blockscale
             activations (default), 32 for MX activations.
         is_x_scale_transposed: x_scales bytes are column-major, i.e. logically
             (K // group, M). Default False (row-major).

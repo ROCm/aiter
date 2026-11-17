@@ -49,24 +49,24 @@ diff --git a/docs/notes.md b/docs/notes.md
  after
 """
 
-CARD = """## aiter PR #9999 -- a card
+CARD = """## aiter PR #9999 — a card
 
 **One-sentence summary that the review body does not need.**
 
-Review (advisory): ? NEEDS WORK
-Validation (deterministic): N/A -- no runtime surface changed
-Perf (advisory): NOT RUN -- no idle GPU on this box
+Review (advisory): ⚠️ NEEDS WORK
+Validation (deterministic): N/A — no runtime surface changed
+Perf (advisory): NOT RUN — no idle GPU on this box
 Size: 12 lines / 2 files
-Design (advisory): NONE -- a tooling-only change inside the existing skill layout
-Human: N/A -- no design decision to route
+Design (advisory): NONE — a tooling-only change inside the existing skill layout
+Human: N/A — no design decision to route
 
-? [verified] aiter/ops/shuffle.py:23 imports `_FLYDSL_USE_HERD` -- **Author must** pin it.
+⚠️ [verified] aiter/ops/shuffle.py:23 imports `_FLYDSL_USE_HERD` — **Author must** pin it.
 
-? [verified] `elsewhere.py:900` is nowhere near this diff; it is context code.
+📝 [verified] `elsewhere.py:900` is nowhere near this diff; it is context code.
 
-? shuffle.py:22 and helper.py:7 -- one of these citations was flagged.
+🔴 shuffle.py:22 and helper.py:7 — one of these citations was flagged.
 
-_Independent refutation: 3 judged, 0 killed, 3 defended -- cross-family._
+_Independent refutation: 3 judged, 0 killed, 3 defended — cross-family._
 """
 
 
@@ -225,9 +225,9 @@ def test_the_degraded_body_does_not_claim_anchors_it_no_longer_has(
     assert len(sent) == 2 and sent[1]["comments"] == []
     anchored, degraded = sent[0]["body"], sent[1]["body"]
     assert "posted inline, on the lines they are about" in anchored
-    assert (
-        "posted inline, on the lines they are about" not in degraded
-    ), "the degraded review still claims findings are inline"
+    assert "posted inline, on the lines they are about" not in degraded, (
+        "the degraded review still claims findings are inline"
+    )
     # and the findings themselves are still in it, exactly once
     assert "could not be attached to their lines" in degraded
 
@@ -241,7 +241,6 @@ def test_a_refused_post_exits_non_zero(report, monkeypatch, capsys):
     and if main() still returns 0, the step stays green while every card is lost.
     """
     monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
-
     # Only the review POST is refused. Stubbing every call would make the gate skip on
     # PR metadata instead, and a test that never reaches the code it names proves nothing.
     def _refuse_reviews(path, method="GET", body=None):
@@ -294,20 +293,17 @@ def test_summary_carries_every_status_line_aiter_cards_have(report, monkeypatch)
     one more finding instead of the judgment this review routed to a person."""
     monkeypatch.setattr(_publish, "_api_raw", lambda *a, **k: DIFF)
     body = _publish.review_payload("9999")["body"]
-    assert "Review (advisory): ? NEEDS WORK" in body
-    assert "Validation (deterministic): N/A -- no runtime surface changed" in body
-    assert "Perf (advisory): NOT RUN -- no idle GPU on this box" in body
+    assert "Review (advisory): ⚠️ NEEDS WORK" in body
+    assert "Validation (deterministic): N/A — no runtime surface changed" in body
+    assert "Perf (advisory): NOT RUN — no idle GPU on this box" in body
     assert "Size: 12 lines / 2 files" in body
-    assert "Design (advisory): NONE -- a tooling-only change" in body
-    assert "Human: N/A -- no design decision to route" in body
+    assert "Design (advisory): NONE — a tooling-only change" in body
+    assert "Human: N/A — no design decision to route" in body
     assert "aiter-bot review pr=9999 head=deadbeef" in body
     # and none of them may become an inline comment: they are status, not findings
     comments = _publish.review_payload("9999")["comments"]
-    assert not [
-        c
-        for c in comments
-        if c["body"].lstrip().startswith(("Size:", "Design", "Human:"))
-    ]
+    assert not [c for c in comments
+                if c["body"].lstrip().startswith(("Size:", "Design", "Human:"))]
 
 
 def test_card_md_is_not_rewritten(report, monkeypatch):
@@ -390,7 +386,7 @@ def test_a_refused_anchor_retries_the_same_review_without_anchors(
     assert sent[0]["comments"] and sent[1]["comments"] == []
     out = capsys.readouterr().out
     assert "ANCHORS REFUSED -- folded into summary" in out
-    assert "?" in out
+    assert "✅" in out
 
 
 def test_the_degraded_review_still_carries_the_findings_it_could_not_anchor(
@@ -445,8 +441,8 @@ RANGE_DIFF = """diff --git a/aiter/ops/layernorm.py b/aiter/ops/layernorm.py
 +    out = torch.empty_like(x)
 +    _launch(out, x, residual, weight, eps)
 +    return out
-
-
+ 
+ 
  def plain_rmsnorm(x, weight, eps):
 @@ -200,2 +200,3 @@
  context_at_200
@@ -454,17 +450,17 @@ RANGE_DIFF = """diff --git a/aiter/ops/layernorm.py b/aiter/ops/layernorm.py
  context_at_202
 """
 
-RANGE_CARD = """## aiter PR #8888 -- spans
+RANGE_CARD = """## aiter PR #8888 — spans
 
-Review (advisory): ? NEEDS WORK
+Review (advisory): ⚠️ NEEDS WORK
 
-? [verified] `aiter/ops/layernorm.py:101-104` allocates and launches without a `torch.cuda`
-? aiter/ops/layernorm.py:106-201 straddles the gap between the two hunks.
-? layernorm.py:5220 is real code this PR does not touch; `fused_add_rmsnorm` is nowhere near.
-? nosuchfile.py:12-20 names a file this diff never mentions.
-? [verified] layernorm.py:381 -- 6 published tuning candidates, written as prose.
+⚠️ [verified] `aiter/ops/layernorm.py:101-104` allocates and launches without a `torch.cuda`
+🔴 aiter/ops/layernorm.py:106-201 straddles the gap between the two hunks.
+📝 layernorm.py:5220 is real code this PR does not touch; `fused_add_rmsnorm` is nowhere near.
+📝 nosuchfile.py:12-20 names a file this diff never mentions.
+📝 [verified] layernorm.py:381 — 6 published tuning candidates, written as prose.
 
-_Independent refutation: 4 judged, 0 killed, 4 defended -- cross-family._
+_Independent refutation: 4 judged, 0 killed, 4 defended — cross-family._
 """
 
 
@@ -532,16 +528,16 @@ def test_the_summary_index_names_the_span(range_report):
 
 
 def test_a_span_in_prose_is_not_read_as_a_range(range_report):
-    """A real card wrote `flash_kda.py:381 -- 6 published tuning candidates`. Read loosely
+    """A real card wrote `flash_kda.py:381 — 6 published tuning candidates`. Read loosely
     that is the backwards span 381..6, which GitHub refuses -- and the refusal is not of
     that comment but of the whole review."""
-    cites = _publish.citations("? layernorm.py:381 -- 6 published tuning candidates.")
+    cites = _publish.citations("📝 layernorm.py:381 — 6 published tuning candidates.")
     assert ("layernorm.py", 381, 381) in cites
     assert not [c for c in cites if c[2] != c[1]]
 
 
 def test_a_span_is_not_also_counted_as_its_own_first_line(range_report):
-    assert _publish.citations("? a/b/c.py:10-20 and d.py:4") == [
+    assert _publish.citations("⚠️ a/b/c.py:10-20 and d.py:4") == [
         ("a/b/c.py", 10, 20),
         ("d.py", 4, 4),
     ]
@@ -628,4 +624,4 @@ def test_a_collapsed_span_leaves_no_dangling_tail_in_the_index(range_report):
     on a real ATOM card (`prefill_delayer.py:563-569`, anchored at 563) the first time this
     ran over one."""
     body = _publish.review_payload("8888")["body"]
-    assert "-- -201" not in body and "-- -" not in body
+    assert "— -201" not in body and "— -" not in body

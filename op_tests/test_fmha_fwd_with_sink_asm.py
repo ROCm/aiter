@@ -6,14 +6,14 @@ Public API:  aiter.flash_attn_func              (the path the model calls)
 Ops layer:   aiter.fmha_fwd_with_sink_asm       (low-level)
 
 Built to the aiter op-test standard (see .claude/skills/aiter-op-test): mirror
-test_quant.py -- @benchmark + run_perftest candidate loop, a torch reference,
+test_quant.py — @benchmark + run_perftest candidate loop, a torch reference,
 per-candidate us / TFLOPS / TB/s / err, a markdown summary table per test
 function, and a __main__ guard so the module is importable.
 
 Sink convention
 ---------------
 `sink` ([q_head_num] fp32) is a per-Q-head logit in the SAME scaled domain as
-Q.K^T * softmax_scale; it acts as a zero-value virtual KV column and is passed
+Q·K^T * softmax_scale; it acts as a zero-value virtual KV column and is passed
 to the kernel verbatim (no host-side scaling).  D64 kernels read it; D128 and
 D256 kernels ignore it (pass None).
 
@@ -54,7 +54,7 @@ SUPPORTED_GFX = ["gfx1250"]
 def run_torch(q, k, v, *, is_causal, sink=None):
     """bshd-in / bshd-out attention reference, sink optional.
 
-    scores = (Q.K^T) * scale,  scale = 1/sqrt(d);  lse returned in fp32.
+    scores = (Q·K^T) * scale,  scale = 1/sqrt(d);  lse returned in fp32.
     sink (optional): [hq] fp32 per-head logit in the scaled domain (a zero-value
     KV column appended to the scaled scores).
     """
@@ -133,7 +133,7 @@ def _d64_sink(hq):
 
 
 def run_kernel(q, k, v, *, scale, is_causal, sink=None, via="public"):
-    """via="public" -> aiter.flash_attn_func (the model path); "ops" -> low-level."""
+    """via="public" → aiter.flash_attn_func (the model path); "ops" → low-level."""
     if via == "public":
         r = aiter.flash_attn_func(
             q,
@@ -168,7 +168,7 @@ def _flops_bytes(batch, hq, hk, sq, sk, d, is_causal, esz):
 
 # Correctness shapes (torch reference is feasible here).  hq=64; hk=8 for D64
 # and hk=4 for D128 (GQA ratios 8 / 16).  Non-causal (mask=0) D64/D128 kernels
-# require sk % 256 == 0 -- non-aligned sk rows are causal-only for them (filtered
+# require sk % 256 == 0 — non-aligned sk rows are causal-only for them (filtered
 # in the sweep); D256 tiles KV by 128 with a border mask and takes any sk.
 # (head_dim, hq, hk, sq, sk, batch)
 _CORRECTNESS_SHAPES = [

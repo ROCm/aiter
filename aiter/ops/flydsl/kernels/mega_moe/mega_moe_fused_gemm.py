@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025 FlyDSL Project Contributors
 """GEMM1/GEMM2 tiles, buffer helpers and launch configs shared by the MegaMoEV2 small- and large-input kernels."""
 
 from bisect import bisect_left

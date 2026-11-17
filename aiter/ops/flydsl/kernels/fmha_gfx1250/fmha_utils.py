@@ -239,7 +239,7 @@ def _concat(parts):
 
 def _keepalive(vals):
     """Empty side-effecting inline asm: emits no instruction but counts as a USE, so the
-    operands stay live (VGPRs reserved) until this point. Load-bearing for the ring -- a
+    operands stay live (VGPRs reserved) until this point. Load-bearing for the ring — a
     slot holding no in-flight value looks dead to regalloc, which then reclaims the pair
     the wmma just read, collapsing the WAR distance to 0 (LLVM falls back to
     ``s_wait_alu depctr_va_vdst(0)`` and the VGPR saving evaporates)."""
@@ -301,7 +301,7 @@ def _load_seqlen_pair(ptr_tensor, idx):
 
 
 def _load_sink_logit(ptr_sink, q_head_idx, num_heads_q):
-    """Load this lane's per-head sink logit from the 1-D fp32 ``sink[num_heads_q]`` -- one
+    """Load this lane's per-head sink logit from the 1-D fp32 ``sink[num_heads_q]`` — one
     extra ``exp(sink)`` term in the softmax denominator, in the scaled-score domain."""
     del num_heads_q  # in-bounds by construction; no buffer bounds check needed
     return fx.Float32(fx.ptr_load(fx.get_iter(ptr_sink) + fx.Int64(q_head_idx)))

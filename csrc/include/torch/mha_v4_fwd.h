@@ -58,9 +58,8 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
 
 // Sol-Attn sibling (arXiv 2607.24027): the LUT above still drives an EXACT pass, and a second pass
 // then sweeps the pooled per-block K/V, masking off the blocks the LUT already covered via
-// block_bitmap, so the below-threshold blocks contribute their zeroth-order term instead of
-// nothing. Both passes share one online-softmax state, which is what normalizes the mix under a
-// single L.
+// block_bitmap, so the below-threshold blocks contribute their zeroth-order term instead of nothing.
+// Both passes share one online-softmax state, which is what normalizes the mix under a single L.
 //
 // mean_k / mean_v are K / V with seqlen -> num_kv_blocks in the SOURCE quantized dtype, so the
 // approximate pass reuses k_descale / v_descale unchanged; block_bitmap is uint32
@@ -127,8 +126,8 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
                      // tilt_plane_stride bytes apart, and a one- to eight-element int32 device
                      // tensor the kernel reads: the score and value GEMMs' E8M0 shifts, then the
                      // row's score multiplier and other plane strides (see fmha_v4_fwd_sol).
-                     int64_t tilt_rank                           = 0,
-                     int64_t tilt_plane_stride                   = 0,
+                     int64_t tilt_rank                              = 0,
+                     int64_t tilt_plane_stride                      = 0,
                      const std::optional<at::Tensor>& tilt_shift = std::nullopt);
 
 // The work table fmha_v4_fwd_sparse builds internally, exposed so its ordering can be tested.

@@ -11,7 +11,7 @@ def infer_rope_cache_triton_block_t(T: int, device: torch.device) -> int:
     """Pick Triton token tile ``BLOCK_T`` for :func:`fused_qkv_split_qk_norm_rope_cache`.
 
     Same heuristic as vLLM ``input_quant_fp8.calc_rows_per_block``: scale tile size with
-    sequence length and SM/CU count so the launch grid stays in a sensible range -- use
+    sequence length and SM/CU count so the launch grid stays in a sensible range — use
     ``ceil(T / (2 * sm_count))`` rounded up to the next power of two, then cap (the
     vLLM quant path caps at 4 rows; this kernel keeps a larger upper bound due to
     per-token work and ``tl.arange(0, BLOCK_T)`` register pressure).

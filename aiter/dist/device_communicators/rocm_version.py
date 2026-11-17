@@ -42,14 +42,14 @@ def _parse(s):
 def _candidate_roots():
     """ROCm install roots to probe, highest priority first."""
     roots = []
-    # Explicit env pointers win -- they name the ROCm the user actually wired up.
+    # Explicit env pointers win — they name the ROCm the user actually wired up.
     for env in ("ROCM_PATH", "ROCM_HOME", "HIP_PATH"):
         p = os.environ.get(env)
         if p:
             roots.append(p)
     # Default unversioned symlink.
     roots.append("/opt/rocm")
-    # Versioned installs -- probe the highest version first.
+    # Versioned installs — probe the highest version first.
     roots.extend(sorted(glob.glob("/opt/rocm-*"), reverse=True))
     # De-dup while preserving order.
     seen = set()
@@ -79,7 +79,7 @@ def _from_info_files():
 
 
 def _from_torch():
-    """``torch.version.hip`` -- HIP version torch was built against.
+    """``torch.version.hip`` — HIP version torch was built against.
 
     On modern ROCm (>= 6.0) the HIP major.minor tracks the ROCm release, so
     ``"7.15.xxxxx"`` -> ``(7, 15, xxxxx)``.

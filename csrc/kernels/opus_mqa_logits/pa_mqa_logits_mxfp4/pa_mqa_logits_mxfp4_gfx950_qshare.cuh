@@ -25,12 +25,11 @@
 
 namespace opus_logits::gfx950 {
 
-template <class T, int SCHED>
-__global__ __launch_bounds__(T::BLOCK_SIZE,
-                             MIN_WAVES_PER_EU) void qshare_kernel(mqa_logits_mxfp4_kargs k)
-{
-    using D_DATA   = opus::fp4_t; // MFMA A/B element (E2M1)
-    using D_BYTE   = uint8_t;     // fp4 is addressed in bytes
+template<class T, int SCHED>
+__global__ __launch_bounds__(T::BLOCK_SIZE, MIN_WAVES_PER_EU)
+void qshare_kernel(mqa_logits_mxfp4_kargs k) {
+    using D_DATA   = opus::fp4_t;   // MFMA A/B element (E2M1)
+    using D_BYTE   = uint8_t;       // fp4 is addressed in bytes
     using D_WEIGHT = typename T::D_WEIGHT;
     using D_SCALE  = typename T::D_SCALE;
     using D_ACC    = typename T::D_ACC;
@@ -54,24 +53,17 @@ __global__ __launch_bounds__(T::BLOCK_SIZE,
     const void* p_q_scale  = k.ptr_q_scale;
     const void* p_kv       = k.ptr_kv;
     const void* p_kv_scale = k.ptr_kv_scale;
-    const int* p_bt        = k.ptr_block_tables;
+    const int*  p_bt       = k.ptr_block_tables;
     const void* p_weights  = k.ptr_weights;
-    float* p_out           = k.ptr_out;
-    int stride_out         = k.out_stride;
-    float weight_scale     = k.weight_scale;
-    int bt_stride          = k.bt_stride;
+    float*      p_out      = k.ptr_out;
+    int   stride_out   = k.out_stride;
+    float weight_scale = k.weight_scale;
+    int   bt_stride    = k.bt_stride;
     mqa_sched_args sa(k);
     pin_sgpr(sa.num_rows);
-    pin_sgpr(p_q);
-    pin_sgpr(p_q_scale);
-    pin_sgpr(p_kv);
-    pin_sgpr(p_kv_scale);
-    pin_sgpr(p_bt);
-    pin_sgpr(p_weights);
-    pin_sgpr(p_out);
-    pin_sgpr(stride_out);
-    pin_sgpr(weight_scale);
-    pin_sgpr(bt_stride);
+    pin_sgpr(p_q); pin_sgpr(p_q_scale); pin_sgpr(p_kv); pin_sgpr(p_kv_scale);
+    pin_sgpr(p_bt); pin_sgpr(p_weights); pin_sgpr(p_out);
+    pin_sgpr(stride_out); pin_sgpr(weight_scale); pin_sgpr(bt_stride);
 
     const int tid = opus::thread_id_x();
     // readfirstlane, not a plain tid >> 6: the wave index is wave-uniform but divergent to LLVM,
@@ -79,26 +71,26 @@ __global__ __launch_bounds__(T::BLOCK_SIZE,
     // and this wave's row base pointers.
     const int wave    = __builtin_amdgcn_readfirstlane(tid >> 6);
     const int lane    = tid & (WAVE - 1);
-    const int lane_m0 = lane & (T::MMA_N - 1); // n column / m row within the tile
-    const int lane_g  = lane >> 5;             // 32-K block within the k-tile
+    const int lane_m0 = lane & (T::MMA_N - 1);   // n column / m row within the tile
+    const int lane_g  = lane >> 5;               // 32-K block within the k-tile
 
     // The group's union window (wk.local_end) sets the tile range; this wave's own window only
     // masks its stores. Every early return is CTA-uniform.
     mqa_work wk;
-    if(!mqa_assign<QPB, TK, SCHED>(sa, lane, wk))
-        return;
-    const int chunk_start = wk.chunk_start;
-    const int tile_count  = wk.chunk_count;
-    const int batch_id    = wk.batch_id;
+    if (!mqa_assign<QPB, TK, SCHED>(sa, lane, wk)) return;
+    const int  chunk_start = wk.chunk_start;
+    const int  tile_count  = wk.chunk_count;
+    const int  batch_id    = wk.batch_id;
     // Clamped, not branched: wave and group_rows are scalar, so the select is s_cselect and the
     // row's reads stay s_load.
-    const bool slot_ok = wave < wk.group_rows;
-    const int row_id   = wk.row_id + (slot_ok ? wave : 0);
-    const int row_end  = sa.row_ends[row_id];
-    const int own_end  = slot_ok ? row_end : 0;
+    const bool slot_ok     = wave < wk.group_rows;
+    const int  row_id      = wk.row_id + (slot_ok ? wave : 0);
+    const int  row_end     = sa.row_ends[row_id];
+    const int  own_end     = slot_ok ? row_end : 0;
 
     auto mma = opus::make_tiled_mma<D_DATA, D_DATA, D_ACC>(
-        opus::seq<MT, NT, KT>{}, opus::seq<1, 1, 1>{}, opus::seq<T::MMA_M, T::MMA_N, T::MMA_K>{});
+        opus::seq<MT, NT, KT>{}, opus::seq<1, 1, 1>{},
+        opus::seq<T::MMA_M, T::MMA_N, T::MMA_K>{});
     using Mma = typename decltype(mma)::MMA;
     Mma mma_op;
     static_assert(sizeof(typename Mma::vtype_a) == 2 * T::A_BYTES_PER_LANE,
@@ -106,14 +98,14 @@ __global__ __launch_bounds__(T::BLOCK_SIZE,
     static_assert(Mma::elem_c == EC, "traits C_FRAG must match the MFMA accumulator");
 
     // The row folded into the base pointers; row_id is wave-uniform.
-    const D_BYTE* q_base   = reinterpret_cast<const D_BYTE*>(p_q) + (size_t)row_id * T::Q_ROW_BYTES;
+    const D_BYTE* q_base = reinterpret_cast<const D_BYTE*>(p_q) + (size_t)row_id * T::Q_ROW_BYTES;
     const D_SCALE* qs_base = reinterpret_cast<const D_SCALE*>(p_q_scale) + (size_t)row_id * WAVE;
     const D_WEIGHT* w_base =
         reinterpret_cast<const D_WEIGHT*>(p_weights) + (size_t)row_id * T::W_ROW_ELEMS;
     const int* bt_base = p_bt + (size_t)batch_id * bt_stride;
     // This wave's window, not the union: the out V# spans exactly it, so the hardware's range
     // check is the whole store mask, and an empty window (a wave past the group) stores nothing.
-    D_OUT* out_base          = p_out + (size_t)row_id * stride_out;
+    D_OUT* out_base = p_out + (size_t)row_id * stride_out;
     const unsigned out_bytes = (unsigned)(own_end > 0 ? own_end : 0) * (unsigned)sizeof(D_OUT);
 
     auto g_q   = opus::make_gmem(q_base);
@@ -142,8 +134,8 @@ __global__ __launch_bounds__(T::BLOCK_SIZE,
     // loop's stores to `out` defeat the no-clobber proof. chunk_start is folded into the base and
     // the index is unsigned, which keeps the address arithmetic off the SALU.
     using bt_scalar_ptr = const int __attribute__((address_space(4)))*;
-    auto bt_c =
-        reinterpret_cast<bt_scalar_ptr>(reinterpret_cast<__UINTPTR_TYPE__>(bt_base + chunk_start));
+    auto bt_c = reinterpret_cast<bt_scalar_ptr>(
+        reinterpret_cast<__UINTPTR_TYPE__>(bt_base + chunk_start));
     auto load_page_id = [&](unsigned tile_idx) { return bt_c[tile_idx]; };
     // Unsigned result, signed compare (an unsigned compare costs more SALU in the loop).
     auto clamp_tile = [&](int t) { return (unsigned)(t < tile_count ? t : tile_count - 1); };
@@ -165,22 +157,19 @@ __global__ __launch_bounds__(T::BLOCK_SIZE,
     // arithmetic off the page id: the offsets stay inside the page, so no 32-bit offset bounds the
     // kv_cache.
     auto issue_async = [&](int tile, int page_id) {
-        if(T::ISSUE_WAVES == T::NUM_WAVES || wave < T::ISSUE_WAVES)
-        {
-            auto g_kv   = opus::make_gmem(reinterpret_cast<const D_BYTE*>(p_kv) +
+        if (T::ISSUE_WAVES == T::NUM_WAVES || wave < T::ISSUE_WAVES) {
+            auto g_kv = opus::make_gmem(reinterpret_cast<const D_BYTE*>(p_kv) +
                                         (size_t)(unsigned)page_id * T::KV_PAGE_BYTES);
             D_BYTE* dst = reinterpret_cast<D_BYTE*>(smem_buf) + stage_byte(tile) + async_wave_off;
             opus::static_for<T::ASYNC_ISSUES>([&](auto ic) {
                 constexpr int chunk = ic.value * T::ISSUE_WAVES * T::ASYNC_WAVE_BYTES;
-                opus::async_load<T::ASYNC_VEC_BYTES>(g_kv,
-                                                     reinterpret_cast<void*>(dst + chunk),
-                                                     async_lane_off,
-                                                     async_wave_off + chunk);
+                opus::async_load<T::ASYNC_VEC_BYTES>(g_kv, reinterpret_cast<void*>(dst + chunk),
+                                                     async_lane_off, async_wave_off + chunk);
             });
         }
         const D_SCALE* kvs_page = reinterpret_cast<const D_SCALE*>(p_kv_scale) +
                                   (size_t)(unsigned)page_id * (T::KVS_PAGE_BYTES / sizeof(D_SCALE));
-        auto g_kvs   = opus::make_gmem(kvs_page);
+        auto g_kvs = opus::make_gmem(kvs_page);
         D_BYTE* sdst = reinterpret_cast<D_BYTE*>(smem_buf) + scale_stage_byte(tile);
         opus::async_load<1>(g_kvs, reinterpret_cast<void*>(sdst), lane);
     };
@@ -190,7 +179,7 @@ __global__ __launch_bounds__(T::BLOCK_SIZE,
     auto read_kv_scale_lds = [&](int tile) {
         return opus::load<1>(s_kvs, scale_stage_byte(tile) / (int)sizeof(D_SCALE) + lane)[0];
     };
-    auto read_kv_lds = [&](kv_nt_t(&kv)[NT][KT], int stage_off) {
+    auto read_kv_lds = [&](kv_nt_t (&kv)[NT][KT], int stage_off) {
         opus::static_for<NT>([&](auto ntc) {
             constexpr int nt = ntc.value;
             opus::static_for<KT>([&](auto ktc) {
@@ -216,10 +205,10 @@ __global__ __launch_bounds__(T::BLOCK_SIZE,
 
     // Zero-initialized: fp4 fills only the low 16 B of each 256-bit operand.
     kv_nt_t kvA[NT][KT]{}, kvB[NT][KT]{};
-    int kvsA, kvsB;
-    sfrag accA[NT], accB[NT];
+    int     kvsA, kvsB;
+    sfrag   accA[NT], accB[NT];
     opus::vector_t<float, NT> outA, outB;
-    int pg_a; // the page id of tile t + ALEAD at entry to phase t
+    int     pg_a;   // the page id of tile t + ALEAD at entry to phase t
 
     // The prologue.
     // Q / q_scale / weights go out first, ahead of any copy, which is what makes the waits below
@@ -231,8 +220,9 @@ __global__ __launch_bounds__(T::BLOCK_SIZE,
     // Prime the pipe: tiles 0 .. STAGES - 1 into stages 0 .. STAGES - 1, page ids gathered first
     // so the copies issue back to back.
     int pg_pre[STAGES];
-    opus::static_for<STAGES>(
-        [&](auto sc) { pg_pre[sc.value] = load_page_id(clamp_tile(sc.value)); });
+    opus::static_for<STAGES>([&](auto sc) {
+        pg_pre[sc.value] = load_page_id(clamp_tile(sc.value));
+    });
     opus::static_for<STAGES>([&](auto sc) { issue_async(sc.value, pg_pre[sc.value]); });
 
     // Tile 0 has landed for this wave once its copies have retired; the barrier makes it true
@@ -250,7 +240,7 @@ __global__ __launch_bounds__(T::BLOCK_SIZE,
     opus::s_waitcnt_lgkmcnt(opus::number<0>{});
     opus::s_waitcnt_vmcnt(opus::number<T::PROLOGUE_KEEP1>{});
     cta_sync();
-    issue_async(STAGES, load_page_id(clamp_tile(STAGES))); // into the stage tile 0 vacated
+    issue_async(STAGES, load_page_id(clamp_tile(STAGES)));   // into the stage tile 0 vacated
     kvsB = read_kv_scale_lds(1);
     read_kv_lds(kvB, 1 * T::LDS_TILE_BYTES);
     pg_a = load_page_id(clamp_tile(ALEAD));
@@ -258,15 +248,9 @@ __global__ __launch_bounds__(T::BLOCK_SIZE,
 
     // One phase = one KV tile. At entry acc_c holds both n-tiles of tile t (made last phase), so
     // kv_c is free and refilled at the top from tile t + RLEAD; kv_p (tile t + 1) feeds the GEMMs.
-    auto compute_phase = [&](kv_nt_t(&kv_c)[NT][KT],
-                             int& kvs_c,
-                             sfrag(&acc_c)[NT],
-                             kv_nt_t(&kv_p)[NT][KT],
-                             int& kvs_p,
-                             sfrag(&acc_p)[NT],
-                             int t,
-                             opus::vector_t<float, NT>& out,
-                             auto keep_vmcnt) {
+    auto compute_phase = [&](kv_nt_t (&kv_c)[NT][KT], int& kvs_c, sfrag (&acc_c)[NT],
+                             kv_nt_t (&kv_p)[NT][KT], int& kvs_p, sfrag (&acc_p)[NT],
+                             int t, opus::vector_t<float, NT>& out, auto keep_vmcnt) {
         __builtin_amdgcn_sched_barrier(0);
         // lgkmcnt: the previous phase's ds_reads must be off the LDS before the copy below
         // recycles their stage. vmcnt: tile t + RLEAD must be resident before anyone reads it.
@@ -286,23 +270,20 @@ __global__ __launch_bounds__(T::BLOCK_SIZE,
     // same barriers.
     compute_phase(kvA, kvsA, accA, kvB, kvsB, accB, 0, outA, opus::number<T::KEEP_PEELED>{});
     store(outA, 0);
-    if(tile_count >= 2)
-    {
+    if (tile_count >= 2) {
         compute_phase(kvB, kvsB, accB, kvA, kvsA, accA, 1, outB, opus::number<T::KEEP_PEELED>{});
         store(outB, 1);
     }
 
-    int t               = 2;
+    int t = 2;
     constexpr auto KEEP = opus::number<T::KEEP_STEADY>{};
-    for(; t + 1 < tile_count; t += 2)
-    {
+    for (; t + 1 < tile_count; t += 2) {
         compute_phase(kvA, kvsA, accA, kvB, kvsB, accB, t, outA, KEEP);
         store(outA, t);
         compute_phase(kvB, kvsB, accB, kvA, kvsA, accA, t + 1, outB, KEEP);
         store(outB, t + 1);
     }
-    if(t < tile_count)
-    {
+    if (t < tile_count) {
         compute_phase(kvA, kvsA, accA, kvB, kvsB, accB, t, outA, KEEP);
         store(outA, t);
     }
@@ -310,4 +291,4 @@ __global__ __launch_bounds__(T::BLOCK_SIZE,
     // every counter before the CTA's LDS is released.
 }
 
-} // namespace opus_logits::gfx950
+}  // namespace opus_logits::gfx950

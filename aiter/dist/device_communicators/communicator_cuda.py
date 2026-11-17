@@ -309,6 +309,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
         torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
+    def dcp_lse_merge(
+        self,
+        o: torch.Tensor,
+        lse: torch.Tensor,
+        owned_counts: torch.Tensor | None = None,
+        return_lse: bool = False,
+    ):
+        """Merge decode context parallel partials with the custom kernel (see
+        CustomAllreduce.custom_dcp_merge), or return None when it does not take
+        them and the caller merges its own way."""
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is None
+            or ca_comm.disabled
+            or not ca_comm.should_custom_dcp_merge(o, lse)
+        ):
+            return None
+        return ca_comm.custom_dcp_merge(o, lse, owned_counts, return_lse)
+
     def fused_allreduce_rmsnorm(
         self,
         input_,
@@ -409,7 +428,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if self._ar_1stage_override is not None
             else (total_bytes <= total_bytes_limit)
         )
+
         qr_comm = self.qr_comm
+
+        # FlyDSL fused first when enabled. Try first the quantized kernels,
+        # then exact one-shot.
+        if (
+            not use_general_path
+            and x_pad_to_multiple == 0
+            and input_n == n
+            and not gemma_norm
+        ):
+            for comm in (qr_comm, ca_comm):
+                if (
+                    comm is not None
+                    and not comm.disabled
+                    and comm.should_fly_allreduce_rmsnorm(input_, res_inp_, weight_)
+                ):
+                    return comm.fly_allreduce_rmsnorm(input_, res_inp_, weight_, eps)
+
         if (
             not use_1stage
             and not use_general_path
@@ -662,7 +699,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from the raw ``weight_``; the ``+ 1`` happens in fp32 inside the kernel.
 
         When ``emit_bf16=False`` returns ``(fp8, residual_out, scale)``.
-        When ``emit_bf16=True`` returns ``(fp8, residual_out, scale, bf16)`` --
+        When ``emit_bf16=True`` returns ``(fp8, residual_out, scale, bf16)`` —
         used by GDN-style layers that have both an FP8 projection and a bf16
         gating projection consuming the same normed activation, so they can
         skip the separate per-group quant kernel entirely (see Qwen3.5).
@@ -880,7 +917,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if hadamard_rotate:
                 from aiter.ops.quant import per_1x32_f4_quant_hip
 
-                out_fp4, scale_out = per_1x32_f4_quant_hip(normed, hadamard_rotate=True)
+                out_fp4, scale_out = per_1x32_f4_quant_hip(
+                    normed, hadamard_rotate=True
+                )
             else:
                 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 

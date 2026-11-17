@@ -20,8 +20,7 @@
 namespace opus_co_detail {
 
 template <typename V, int Base, int Stride, int N>
-struct named_vgpr_bank
-{
+struct named_vgpr_bank {
     static_assert(N > 0 && Base >= 0 && Stride > 0, "invalid named VGPR bank");
     static_assert(sizeof(V) % 4 == 0, "a named tuple must fill whole VGPRs");
     static_assert(Stride >= static_cast<int>(sizeof(V) / 4), "named VGPR tuples must not overlap");
@@ -32,51 +31,38 @@ struct named_vgpr_bank
     named_vgpr_bank<V, Base + Stride, Stride, N - 1> tail;
 
     template <int I>
-    __device__ __attribute__((always_inline)) V get() const
-    {
+    __device__ __attribute__((always_inline)) V get() const {
         static_assert(I >= 0 && I < N, "named VGPR index out of range");
-        if constexpr(I == 0)
-            return head;
-        else
-            return tail.template get<I - 1>();
+        if constexpr (I == 0) return head;
+        else return tail.template get<I - 1>();
     }
 
     template <int I>
-    __device__ __attribute__((always_inline)) void set(V value)
-    {
+    __device__ __attribute__((always_inline)) void set(V value) {
         static_assert(I >= 0 && I < N, "named VGPR index out of range");
-        if constexpr(I == 0)
-        {
+        if constexpr (I == 0) {
 #if OPUS_NO_PIN
             head = value;
 #else
             __attribute__((amdgpu_pin_vgpr(Base))) V slot = value;
-            head                                          = slot;
+            head = slot;
 #endif
-        }
-        else
-            tail.template set<I - 1>(value);
+        } else tail.template set<I - 1>(value);
     }
 
-    __device__ __attribute__((always_inline)) void zero()
-    {
+    __device__ __attribute__((always_inline)) void zero() {
         set<0>(V{});
         tail.zero();
     }
 };
 
 template <typename V, int Base, int Stride>
-struct named_vgpr_bank<V, Base, Stride, 0>
-{
-    template <int I>
-    __device__ V get() const
-    {
+struct named_vgpr_bank<V, Base, Stride, 0> {
+    template <int I> __device__ V get() const {
         static_assert(I >= 0 && I < 0, "read from an empty named VGPR bank");
         return V{};
     }
-    template <int I>
-    __device__ void set(V)
-    {
+    template <int I> __device__ void set(V) {
         static_assert(I >= 0 && I < 0, "write to an empty named VGPR bank");
     }
     __device__ void zero() {}

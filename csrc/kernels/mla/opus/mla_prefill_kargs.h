@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Kernel argument ABI of the opus MLA sparse prefill kernels. The prebuilt code objects are
-// compiled against it, so a layout change requires rebuilding them.
+// Kernel argument ABI of the opus MLA sparse prefill kernels. The prebuilt code objects are compiled
+// against it, so a layout change requires rebuilding them.
 
 #pragma once
 
@@ -12,11 +12,11 @@
 
 struct opus_mla_v4_prefill_kargs
 {
-    const void* __restrict__ q_ptr;            // [N, H, D]
-    const void* __restrict__ unified_kv_ptr;   // [total_pages, D], prefix source
-    const void* __restrict__ kv_ptr;           // [total_tokens, D], extend source
-    const void* __restrict__ attn_sink_ptr;    // [H], softmax denominator sink, may be nullptr
-    void* __restrict__ out_ptr;                // [N, H, D]
+    const void* __restrict__ q_ptr;          // [N, H, D]
+    const void* __restrict__ unified_kv_ptr; // [total_pages, D], prefix source
+    const void* __restrict__ kv_ptr;         // [total_tokens, D], extend source
+    const void* __restrict__ attn_sink_ptr;  // [H], softmax denominator sink, may be nullptr
+    void* __restrict__ out_ptr;              // [N, H, D]
     const int* __restrict__ kv_indptr_prefix;  // [N+1]
     const int* __restrict__ kv_indices_prefix; // [nnz_prefix]
     const int* __restrict__ kv_indptr_extend;  // [N+1]
@@ -64,12 +64,10 @@ struct opus_mla_v4_prefill_fp8_kargs
 
 struct opus_mla_v41_prefill_kargs
 {
-    const void* __restrict__ q_ptr;          // [N, H, D] e4m3
-    const void* __restrict__ q_scale_ptr;    // [N, H, D / 32] e8m0
-    const void* __restrict__ unified_kv_ptr; // [total_pages, D] e4m3, or [total_pages, D / 2] e2m1
-                                             // pairs (a8w4)
-    const void* __restrict__ unified_kv_scale_ptr; // [total_pages, D / 32] e8m0, or [total_pages, D
-                                                   // / 16] e4m3 (a8w4)
+    const void* __restrict__ q_ptr;                // [N, H, D] e4m3
+    const void* __restrict__ q_scale_ptr;          // [N, H, D / 32] e8m0
+    const void* __restrict__ unified_kv_ptr;       // [total_pages, D] e4m3, or [total_pages, D / 2] e2m1 pairs (a8w4)
+    const void* __restrict__ unified_kv_scale_ptr; // [total_pages, D / 32] e8m0, or [total_pages, D / 16] e4m3 (a8w4)
     const void* __restrict__ kv_ptr;               // [total_tokens, D], extend source
     const void* __restrict__ kv_scale_ptr;         // [total_tokens, D / 32]
     const void* __restrict__ attn_sink_ptr;        // [H] fp32, may be nullptr

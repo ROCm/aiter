@@ -3,11 +3,11 @@
 In python rather than shell, for reliability: shell grep/wc/ls can be hijacked by a
 function or alias (grep here is wrapped by Claude Code as a function that silently returns
 bad output when its underlying binary is unavailable), and a check that silently returns
-an empty value is more dangerous than no check -- it makes everything look like it passed.
+an empty value is more dangerous than no check — it makes everything look like it passed.
 
 This does only ops: whether an artifact exists, whether the format is valid, whether a gate
 passed, what is missing. **It does not judge whether a finding is correct, nor touch
-severity** -- that is the review-pr skill's job.
+severity** — that is the review-pr skill's job.
 """
 
 import json
@@ -17,7 +17,7 @@ import re
 import subprocess
 import sys
 
-FINDING_RE = re.compile(r"^(?:?|?|?)\s")
+FINDING_RE = re.compile(r"^(?:🔴|⚠️|📝)\s")
 FIRE_RE = re.compile(r"^([A-Z0-9]+)\s+FIRE\s")
 
 # What a report is made of. A missing required file is a collection failure; a missing
@@ -173,7 +173,7 @@ def pr_state(pr, repo="ROCm/aiter"):
     The queue often comes from a stale review list: of 11 reviewed on 2026-09-15, 2 had
     already merged the same day, one of them carrying three reds confirmed by GPU runs. If a
     report does not state the status, the reader assumes it can still be stopped before merge
-    -- but those issues are already on main, changing them from "fix before merge" to
+    — but those issues are already on main, changing them from "fix before merge" to
     "follow-up fixes".
     """
     import json

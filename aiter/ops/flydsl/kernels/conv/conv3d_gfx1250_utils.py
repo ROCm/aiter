@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
 """gfx1250 pieces for FlyDSL implicit-GEMM conv3d (TDM + WMMA).
@@ -13,7 +13,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from .conv3d_gfx950_utils import (  # noqa: F401 -- re-export for callers
+from .conv3d_gfx950_utils import (  # noqa: F401 — re-export for callers
     BF16_BYTES,
     CONV_COMPILE_HINTS,
     MAX_DYN_DIVIDEND,
@@ -30,7 +30,7 @@ from .conv3d_gfx950_utils import (  # noqa: F401 -- re-export for callers
     static_divisor,
 )
 
-# gfx1250 WMMA bf16 -> f32
+# gfx1250 WMMA bf16 → f32
 WMMA_M = 16
 WMMA_N = 16
 WMMA_K = 32
@@ -243,7 +243,7 @@ def make_launch_grid_gfx1250(n, geom, cfg, groups, k, splitk=1):
 
 
 def decode_block_2d(grid, dyn=None):
-    """Device: decode (bid_x, bid_y[, bid_z]) -> coords + k_off.
+    """Device: decode (bid_x, bid_y[, bid_z]) → coords + k_off.
 
     ``dyn`` is a ``DynShapeArgs1250`` on the variable-resolution path; otherwise
     extents come from the compile-time ``grid``.

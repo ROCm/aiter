@@ -203,7 +203,7 @@ def strip_comments(text: str) -> str:
 def inline_code(value: str) -> str:
     value = value.replace("\r", r"\r").replace("\n", r"\n")
     if len(value) > MAX_RENDERED_INLINE_CHARS:
-        value = value[:MAX_RENDERED_INLINE_CHARS].rstrip() + "..."
+        value = value[:MAX_RENDERED_INLINE_CHARS].rstrip() + "…"
     longest = max((len(match) for match in re.findall(r"`+", value)), default=0)
     fence = "`" * max(1, longest + 1)
     return f"{fence} {value} {fence}"
@@ -291,7 +291,7 @@ def validate_author_answers(
     )
     limitation = bool(
         re.search(
-            r"\b(?:unverified|not tested|not run|not covered|remaining|limitation|none)\b|?(?:??|??|??)|??(?:??|??)",
+            r"\b(?:unverified|not tested|not run|not covered|remaining|limitation|none)\b|未(?:验证|测试|覆盖)|没有(?:验证|测试)",
             validation,
             re.IGNORECASE,
         )
@@ -564,10 +564,10 @@ def fenced_text(value: str) -> str:
 
 def append_findings(lines: list[str], level: str, findings: list[str]) -> None:
     for finding in findings[:MAX_RENDERED_FINDINGS]:
-        lines.append(f"- {level} -- {finding}")
+        lines.append(f"- {level} — {finding}")
     remaining = len(findings) - MAX_RENDERED_FINDINGS
     if remaining > 0:
-        lines.append(f"- {level} -- {remaining} additional finding(s) omitted")
+        lines.append(f"- {level} — {remaining} additional finding(s) omitted")
 
 
 def render(result: Result) -> str:
@@ -590,7 +590,7 @@ def render(result: Result) -> str:
         "",
         "## PR Self-Review",
         "",
-        f"Revision `{result.head_sha[:12]}` . mode `{result.mode}`",
+        f"Revision `{result.head_sha[:12]}` · mode `{result.mode}`",
     ]
     if result.author_issues:
         lines.extend(
@@ -619,7 +619,7 @@ def render(result: Result) -> str:
                 "",
                 "### Author answers",
                 "",
-                "- PASS -- current-SHA answers are present and structurally specific",
+                "- PASS — current-SHA answers are present and structurally specific",
                 "",
                 "<details>",
                 "<summary>Show the author's self-review answers</summary>",
@@ -641,9 +641,9 @@ def render(result: Result) -> str:
                 "",
                 "### PR state",
                 (
-                    "- WAIT -- pull request is still a draft"
+                    "- WAIT — pull request is still a draft"
                     if result.draft
-                    else "- PASS -- pull request is marked ready for review"
+                    else "- PASS — pull request is marked ready for review"
                 ),
             ]
         )
@@ -652,7 +652,7 @@ def render(result: Result) -> str:
             append_findings(lines, "FAIL", result.copilot_issues)
         else:
             lines.append(
-                "- PASS -- no active Copilot finding lacks a substantive author reply"
+                "- PASS — no active Copilot finding lacks a substantive author reply"
             )
         append_findings(lines, "ADVISORY", result.copilot_advisories)
 
@@ -660,15 +660,15 @@ def render(result: Result) -> str:
         if result.hygiene_issues:
             append_findings(lines, "FAIL", result.hygiene_issues)
         else:
-            lines.append("- PASS -- no committed artifact or conflict marker detected")
+            lines.append("- PASS — no committed artifact or conflict marker detected")
         append_findings(lines, "ADVISORY", result.hygiene_advisories)
 
         lines.extend(["", "### Required CI"])
         for name, state in result.ci.items():
-            lines.append(f"- {icon(state)} -- {name}: `{state}`")
+            lines.append(f"- {icon(state)} — {name}: `{state}`")
         if result.ci_unavailable:
             lines.append(
-                "- ADVISORY -- GitHub check runs could not be read; this PR remains not ready."
+                "- ADVISORY — GitHub check runs could not be read; this PR remains not ready."
             )
         if result.ci_pending:
             lines.append(
@@ -696,11 +696,11 @@ def render_draft_note(head_sha: str, mode: str) -> str:
     """Neutral gray-out posted once when a pull request converts to draft, so no
     stale verdict outlives the conversion while the author keeps working."""
     lines = [
-        "# DRAFT -- evaluation paused",
+        "# DRAFT — evaluation paused",
         "",
         "## PR Self-Review",
         "",
-        f"Revision `{head_sha[:12]}` . mode `{mode}`",
+        f"Revision `{head_sha[:12]}` · mode `{mode}`",
         "",
         (
             "This pull request is a draft, so readiness evaluation is paused and no"
