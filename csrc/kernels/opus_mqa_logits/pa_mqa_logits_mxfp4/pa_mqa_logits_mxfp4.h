@@ -187,8 +187,9 @@ void mqa_logits_mxfp4_build_schedule(aiter_tensor_t& query_start_loc,
 
 // One launch, from addresses and the scalars the kernels read: the Python wrapper checks the
 // tensors, since a tensor descriptor apiece costs more host time than the launch itself (it runs
-// once a layer). cta_info is read in Table mode only; out_offsets == 0 means a [rows, out_stride]
-// out. kv_bytes is the kv_cache's size; stream is the hipStream_t to launch on.
+// once a layer). cta_info is the Table schedule's records in Table mode; in Free / Prefill it is
+// the lane maxima out (fp32), or 0 for none. out_offsets == 0 means a [rows, out_stride] out.
+// kv_bytes is the kv_cache's size; stream is the hipStream_t to launch on.
 void mqa_logits_mxfp4_launch(int64_t q,
                              int64_t q_scale,
                              int64_t kv_cache,
