@@ -1184,19 +1184,19 @@ def lane_max_cuts(cfg, rows: Rows):
 def lane_max_shapes(model):
     """Rows for the lane maxima: ragged windows, long rows the schedule-free modes split across
     CTAs, prefill chunks whose windows end mid-group."""
-    if model == "v41":
+    if model == "v41-full":
         return [
             full_layer(
-                "v41 lm dec r2 ragged", [40000, 21000, 9000, 1500], [6, 4, 2, 1], 2
+                "v41-full lm dec r2 ragged", [40000, 21000, 9000, 1500], [6, 4, 2, 1], 2
             ),
-            full_layer("v41 lm dec r1 long", [70000, 3000], [2, 6], 1),
-            full_layer("v41 lm pre r1 chunk 300@20000", [20300], [300], 1),
-            full_layer("v41 lm pre r2 fresh 2000", [2000], [2000], 2),
+            full_layer("v41-full lm dec r1 long", [70000, 3000], [2, 6], 1),
+            full_layer("v41-full lm pre r1 chunk 300@20000", [20300], [300], 1),
+            full_layer("v41-full lm pre r2 fresh 2000", [2000], [2000], 2),
         ]
-    if model == "cand":
+    if model == "v41-cand":
         return [
-            candidate_layer("cand lm ragged", [40000, 18000, 70000], [6, 2, 1]),
-            candidate_layer("cand lm bs2", [20000, 17000], [6, 6]),
+            candidate_layer("v41-cand lm ragged", [40000, 18000, 70000], [6, 2, 1]),
+            candidate_layer("v41-cand lm bs2", [20000, 17000], [6, 6]),
         ]
     return []  # 64 heads: no instance writes them
 
