@@ -49,7 +49,8 @@ def check_pipelined_k_loop(
 ) -> bool:
     """Validate the ``pipelined`` constexpr of :func:`launch_gemm_a8w8`.
 
-    0 keeps the single-fence K loop. 1 (a kernelName ending in ``_pl``) takes
+    0 keeps the single-fence K loop. 1 (a kernelName ending in ``_pl``, or
+    the default_pipelined_k_loop pick of a name without a K-loop suffix) takes
     the software-pipelined K loop, which needs mxfp8_32, no scale preload, no
     cluster, split_k 1 and tile_k >= 256 (two 128-deep k-steps per K-tile);
     the runners already require K-tiles >= num_buffers. Anything else raises.

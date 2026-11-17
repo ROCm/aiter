@@ -38,6 +38,9 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_lds_capacity_byte
 
 from .mxfp8_bpreshuffle_gemm_gfx1250 import (
     BASE_NAME_SUFFIX_RE,
+    PIPELINED_BY_SUFFIX,
+    PIPELINED_DEFAULT,
+    default_pipelined_k_loop,
     is_compute_wmma_kernel_name,
     run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
 )
@@ -57,11 +60,11 @@ _BMM_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(BMM_WMMA_NAME_PREFIX)}_{_SUFFIX_RE}(?P<preload>_pre)?$"
 )
 # mxfp8_32 has no whole-K scale preload: its scale panels are 4x (A) and 32x
-# (n32k4 B) the mxfp8_128 ones. A trailing ``_pl`` selects the software-
-# pipelined K loop (see check_pipelined_k_loop); without it the kernel keeps
-# the single-fence loop.
+# (n32k4 B) the mxfp8_128 ones. A trailing ``_pl`` / ``_nopl`` selects the
+# software-pipelined / single-fence K loop (see check_pipelined_k_loop);
+# without either, default_pipelined_k_loop picks it.
 _BMM_MX32_KERNEL_NAME_RE = re.compile(
-    rf"^{re.escape(BMM_MX32_WMMA_NAME_PREFIX)}_{_SUFFIX_RE}(?P<pipelined>_pl)?$"
+    rf"^{re.escape(BMM_MX32_WMMA_NAME_PREFIX)}_{_SUFFIX_RE}(?P<pipelined>_pl|_nopl)?$"
 )
 
 _launch_gemm_a8w8 = None
@@ -106,10 +109,24 @@ def _parse_bmm_mx32_kernel_name_cached(name: str) -> dict[str, int] | None:
     if match is None:
         return None
     groups = match.groupdict()
-    pipelined = groups.pop("pipelined")
+    pipelined = PIPELINED_BY_SUFFIX[groups.pop("pipelined")]
     cfg = {key: int(value) for key, value in groups.items()}
     cfg["preload"] = 0
-    cfg["pipelined"] = int(pipelined is not None)
+    if pipelined == PIPELINED_DEFAULT:
+        # The batched path has no M-dependent config fix-up, so the K loop is
+        # final here.
+        pipelined = default_pipelined_k_loop(
+            mx32=True,
+            preload=False,
+            use_cluster=cfg["cluster_m"] > 1 or cfg["cluster_n"] > 1,
+            split_k=cfg["split_k"],
+            tile_m=cfg["tile_m"],
+            tile_n=cfg["tile_n"],
+            tile_k=cfg["tile_k"],
+            m_warp=cfg["m_warp"],
+            n_warp=cfg["n_warp"],
+        )
+    cfg["pipelined"] = pipelined
     return cfg
 
 

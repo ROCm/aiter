@@ -10,9 +10,10 @@
   -> gemm_a8w8_blockscale_bpreshuffle) returns what the registered torch.ops
   dispatch returns (torch_compile_guard's _eager_body), and a rebound module
   attribute still wins.
-* the mxfp8_32 kernelName suffix ``_pl`` (batched and 2-D) is the only switch
-  of the software-pipelined K loop, and the kernel rejects it, or any value
-  other than 0 / 1, where that loop does not apply.
+* the mxfp8_32 kernelName suffixes ``_pl`` / ``_nopl`` (batched and 2-D) pick
+  the software-pipelined / single-fence K loop, a name without either gets
+  default_pipelined_k_loop's pick, and the kernel rejects the pipelined loop,
+  or any value other than 0 / 1, where that loop does not apply.
 
 The first two, the ``_pl`` checks and the routing contract run on CPU; the
 numerical checks run on any GPU whose arch has the kernel and skip elsewhere.
@@ -107,26 +108,111 @@ def test_mx32_parse_cache_returns_private_copies():
 def test_mx32_pl_suffix_round_trip():
     from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as dense
 
-    name = bmm.bmm_mx32_kernel_name(192, 128, 256, 2, 2, 3)
-    plain = bmm.parse_bmm_mx32_kernel_name(name)
-    piped = bmm.parse_bmm_mx32_kernel_name(name + "_pl")
-    assert (plain.pop("pipelined"), piped.pop("pipelined")) == (0, 1)
-    assert plain == piped
-    assert bmm.parse_bmm_mx32_kernel_name(name + "_pl_pl") is None
+    # t192x128x256 mw2 nw2 meets the default rule, t192x256x256 mw2 nw2
+    # does not (VGPR estimate); the suffixes override it either way.
+    for tile_n, default in ((128, 1), (256, 0)):
+        name = bmm.bmm_mx32_kernel_name(192, tile_n, 256, 2, 2, 3)
+        plain = bmm.parse_bmm_mx32_kernel_name(name)
+        piped = bmm.parse_bmm_mx32_kernel_name(name + "_pl")
+        single = bmm.parse_bmm_mx32_kernel_name(name + "_nopl")
+        assert [c.pop("pipelined") for c in (plain, piped, single)] == [default, 1, 0]
+        assert plain == piped == single
+    for bad in ("_pl_pl", "_nopl_pl", "_pl_nopl"):
+        assert bmm.parse_bmm_mx32_kernel_name(name + bad) is None
 
     suffix = "t64x128x256_mw2_nw2_nb3_sk1_cm1_cn1"
     parse32 = dense.parse_mxfp8_32_wmma_kernel_name
     name = f"{dense.MX32_WMMA_NAME_PREFIX}_{suffix}"
     plain, piped = parse32(name), parse32(name + "_pl")
-    assert (plain.pop("pipelined"), piped.pop("pipelined")) == (0, 1)
-    assert plain == piped
+    single = parse32(name + "_nopl")
+    # The 2-D name leaves the default to the resolved launch config.
+    assert [c.pop("pipelined") for c in (plain, piped, single)] == [
+        dense.PIPELINED_DEFAULT,
+        1,
+        0,
+    ]
+    assert plain == piped == single
     aspre = parse32(name + "_aspre_pl")
     assert aspre["pipelined"] == 1 and aspre["a_scale_preshuffled"]
+    assert parse32(name + "_aspre_nopl")["pipelined"] == 0
     # Only the generic mxfp8_32 kernel has the pipelined loop.
-    assert parse32(f"{dense.MX32_COMPUTE_WMMA_NAME_PREFIX}_{suffix}_pl") is None
-    name128 = f"{dense.WMMA_NAME_PREFIX}_{suffix}"
-    assert dense.parse_wmma_kernel_name(name128 + "_pl") is None
+    for tail in ("_pl", "_nopl"):
+        assert parse32(f"{dense.MX32_COMPUTE_WMMA_NAME_PREFIX}_{suffix}{tail}") is None
+        name128 = f"{dense.WMMA_NAME_PREFIX}_{suffix}"
+        assert dense.parse_wmma_kernel_name(name128 + tail) is None
     assert dense.parse_wmma_kernel_name(name128)["pipelined"] == 0
+    compute = parse32(f"{dense.MX32_COMPUTE_WMMA_NAME_PREFIX}_{suffix}")
+    assert compute["pipelined"] == 0
+
+
+_DEFAULT_OK = {
+    "mx32": True,
+    "preload": False,
+    "use_cluster": False,
+    "split_k": 1,
+    "tile_m": 64,
+    "tile_n": 128,
+    "tile_k": 256,
+    "m_warp": 2,
+    "n_warp": 2,
+}
+
+
+def test_default_pipelined_k_loop():
+    from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
+        default_pipelined_k_loop as pick,
+    )
+
+    assert pick(**_DEFAULT_OK) == 1
+    assert pick(**{**_DEFAULT_OK, "tile_k": 512}) == 1
+    for key, value in (
+        ("tile_k", 128),  # one k-step per K-tile
+        ("mx32", False),
+        ("preload", True),
+        ("use_cluster", True),
+        ("split_k", 2),
+    ):
+        assert pick(**{**_DEFAULT_OK, key: value}) == 0, key
+    # VGPRs per lane: accumulators (8 each) plus two fragment sets
+    # (16 per WMMA row or column) must fit 512. 6x4 reps is exactly 512.
+    for tile_m, tile_n, m_warp, n_warp, want in (
+        (192, 128, 2, 2, 1),  # 6x4 reps: 192 + 320
+        (128, 128, 2, 2, 1),  # 4x4: 128 + 256
+        (128, 64, 4, 1, 1),  # 2x4: 64 + 192
+        (128, 256, 2, 2, 0),  # 4x8: 256 + 384
+        (192, 256, 2, 2, 0),  # 6x8: 384 + 448
+        (256, 256, 2, 2, 0),  # 8x8: 512 + 512
+    ):
+        cfg = {
+            **_DEFAULT_OK,
+            "tile_m": tile_m,
+            "tile_n": tile_n,
+            "m_warp": m_warp,
+            "n_warp": n_warp,
+        }
+        assert pick(**cfg) == want, cfg
+
+
+def test_mx32_2d_default_k_loop_after_cluster_fit():
+    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as dense
+
+    def resolved(name, m):
+        return dict(dense._resolved_wmma_config(name, m, True, True))["pipelined"]
+
+    prefix = dense.MX32_WMMA_NAME_PREFIX
+    assert resolved(f"{prefix}_t64x128x256_mw2_nw2_nb3_sk1_cm1_cn1", 64) == 1
+    assert resolved(f"{prefix}_t64x128x128_mw2_nw2_nb3_sk1_cm1_cn1", 64) == 0
+    assert resolved(f"{prefix}_t64x128x256_mw2_nw2_nb3_sk2_cm1_cn1", 64) == 0
+    assert resolved(f"{prefix}_t64x128x256_mw2_nw2_nb3_sk1_cm1_cn2", 64) == 0
+    assert resolved(f"{prefix}_t128x256x256_mw2_nw2_nb3_sk1_cm1_cn1", 128) == 0
+    # cluster_m is fitted to M first: one M tile drops cm2 to cm1.
+    clustered = f"{prefix}_t64x128x256_mw2_nw2_nb3_sk1_cm2_cn1"
+    assert resolved(clustered, 128) == 0
+    assert resolved(clustered, 64) == 1
+    # The suffixes are kept as asked.
+    plain = f"{prefix}_t64x128x256_mw2_nw2_nb3_sk1_cm1_cn1"
+    assert resolved(plain + "_nopl", 64) == 0
+    assert resolved(f"{prefix}_t128x256x256_mw2_nw2_nb3_sk1_cm1_cn1_pl", 128) == 1
 
 
 _PIPE_OK = {
