@@ -235,7 +235,14 @@ def _reduce_bf16_epilog(
         row_in_block = fx.Int32(mr * 8) + m_lane
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
         slot = packed[mr] >> fx.Int32(24)
-        if token_id < i32_M:
+        # A sort's pad entry is MOE_SORTING_MOCK_ID(tokens, topk): slot == TOPK.
+        # A LocalToken sort gives it token == the real count, which a padded M
+        # still exceeds, so at a real count of M - 1 its row
+        # token * TOPK + TOPK is M * TOPK: one past the [M * TOPK, N] buffer.
+        # Reject it by its slot, as mxmoe_gemm_v2's reduce store does.
+        valid = token_id < i32_M
+        valid = valid & (slot < fx.Int32(TOPK))
+        if valid:
             row_base_addr = (
                 (token_id * fx.Int32(TOPK) + slot) * fx.Int32(N_OUT)
                 + n_block_idx * fx.Int32(BN)

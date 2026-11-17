@@ -8,6 +8,9 @@ When the caller's M is padded (cudagraph), that id is still < M, so an atomic
 epilog bounded by ``token_id < M`` scatters every pad slot into row ``tokens``.
 ``use_valid_token_count`` bounds rows by ``min(cumsum[1], M)`` instead.
 
+The reduce epilog has no row bound and must reject the sentinel by its slot:
+with one pad row its ``token * topk + slot`` row is one past its buffer.
+
 The weights and activations are random bytes: only which rows get written is
 under test, and each valid row takes exactly one slot so on/off are bit-equal.
 
@@ -87,6 +90,60 @@ def test_a16w4_gemm2_honours_valid_token_count():
         return out
 
     _check(run)
+
+
+def test_a16w4_gemm2_reduce_skips_pad_slots_at_one_pad_row():
+    """The reduce epilog writes unique ``[token * topk + slot, N]`` rows and
+    must skip the sort's pad slots. A LocalToken sort's pad slot has token ==
+    the real count and slot == topk, so with one pad row (real count M - 1)
+    its row is ``M * topk``: one past the buffer. ``token_id < M`` does not
+    reject it. At production shapes the buffer can end on an allocation
+    boundary (Kimi-K3: ``M * 16 * 3584`` bf16 is a whole number of 2 MiB pages
+    for every M that is a multiple of 128), so the stray row faults or lands
+    in another tensor. A canary row past the buffer catches it here."""
+    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm2
+
+    m_pad = TOKENS + 1  # one pad row
+    sorted_ids, eids, cumsum, weights = _sorted_buffers()
+    torch.manual_seed(0)
+    a = torch.randn(sorted_ids.numel(), K, dtype=torch.bfloat16, device="cuda")
+    w = torch.randint(0, 256, (NE, N, K // 2), dtype=torch.uint8, device="cuda")
+    scale = torch.full((NE * N * K // 32,), 127, dtype=torch.uint8, device="cuda")
+
+    def run(epilog):
+        # The kernel owns the first m_pad * topk rows; the last is the canary.
+        out = torch.zeros(m_pad + 1, N, dtype=torch.bfloat16, device="cuda")
+        flydsl_a16w4_gemm2(
+            inter_sorted_bf16=a,
+            w2_u8=w,
+            w2_scale_u8=scale,
+            sorted_expert_ids=eids,
+            cumsum_tensor=cumsum,
+            sorted_token_ids=sorted_ids,
+            sorted_weights=weights,
+            flat_out=out.view(-1),
+            M_logical=m_pad,
+            max_sorted=sorted_ids.numel(),
+            NE=NE,
+            D_HIDDEN=N,
+            D_INTER=K,
+            topk=1,
+            tile_m=BM,
+            epilog=epilog,
+            use_valid_token_count=epilog == "atomic",
+        )
+        torch.cuda.synchronize()
+        return out
+
+    reduce, atomic = run("reduce"), run("atomic")
+    assert atomic[:TOKENS].abs().sum() > 0
+    # topk 1: each real token's one slot is its reduce row, bit-equal to atomic.
+    assert torch.equal(reduce[:TOKENS], atomic[:TOKENS])
+    written = (reduce[TOKENS:].abs().sum(dim=1) > 0).nonzero().flatten() + TOKENS
+    assert not written.numel(), (
+        f"rows {written.tolist()} written past the real rows; row {m_pad} is "
+        f"past the [M * topk = {m_pad}, N] buffer"
+    )
 
 
 def test_mxfp4_gemm2_honours_valid_token_count():
