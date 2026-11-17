@@ -820,7 +820,7 @@ def compile_gemm2_a16w4_port(
         sh_tiles = ((i32_M + fx.Int32(SH_BM - 1)) // fx.Int32(SH_BM)) * fx.Int32(SH_NB)
         total = sh_tiles + bound
 
-        _NXCD = 8
+        _NXCD = num_xcds
         _xq = _udiv(bound, _NXCD)
         _xr = _umod(bound, _NXCD)
         _SW = xcd_swizzle

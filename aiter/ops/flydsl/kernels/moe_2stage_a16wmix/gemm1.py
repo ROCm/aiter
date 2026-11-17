@@ -856,7 +856,7 @@ def compile_gemm1_a16w4_port(
         cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
         total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(NUM_N_BLOCKS)
-        _NXCD = 8
+        _NXCD = num_xcds
         _xq = _udiv(bound, _NXCD)
         _xr = _umod(bound, _NXCD)
         _SW = xcd_swizzle
