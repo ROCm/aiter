@@ -174,8 +174,34 @@ _paged_attn_decode_v1_w_dot_repr = make_kernel_repr(
         "HEAD_SZ",
         "QUERY_GRP_SZ",
         "KV_BLK_SZ",
+        "USE_TENSOR_DESC",
     ],
 )
+
+
+@triton.jit
+def _load_kv_page(
+    cache_ptr,
+    page_off,  # offset of this page and KV head
+    rows,  # int32 rows of the page that hold tokens
+    kv_blk_offs,
+    kv_mask,
+    stride_kb,
+    HEAD_SZ: tl.constexpr,
+    HEAD_SZ_POW2: tl.constexpr,
+    KV_BLK_SZ_POW2: tl.constexpr,
+    USE_TENSOR_DESC: tl.constexpr,
+):
+    """One K or V page as [KV_BLK_SZ_POW2, HEAD_SZ_POW2], zero outside the valid part."""
+    if USE_TENSOR_DESC:
+        desc = tl.make_tensor_descriptor(
+            cache_ptr + page_off,
+            shape=[rows, HEAD_SZ],
+            strides=[stride_kb, 1],
+            block_shape=[KV_BLK_SZ_POW2, HEAD_SZ_POW2],
+        )
+        return desc.load([0, 0])
+    return tl.load(cache_ptr + kv_blk_offs, mask=kv_mask, other=0.0)
 
 
 @triton.jit(repr=_paged_attn_decode_v1_w_dot_repr)
@@ -207,6 +233,7 @@ def _paged_attn_decode_v1_w_dot_kernel(
     QUERY_GRP_SZ_POW2: tl.constexpr,
     KV_BLK_SZ: tl.constexpr,
     KV_BLK_SZ_POW2: tl.constexpr,
+    USE_TENSOR_DESC: tl.constexpr = False,
 ):
     """
     #TODO: Add Doc
@@ -261,6 +288,8 @@ def _paged_attn_decode_v1_w_dot_kernel(
     for b in range(num_kv_blks):
         kv_blk_nums = tl.load(blk_tbl_start_ptr + b)
         kv_blk_offs = kv_blk_nums * stride_k_b + kv_offs
+        page_off = kv_blk_nums * stride_k_b + kv_head_idx * stride_k_nh
+        rows = tl.minimum(KV_BLK_SZ, seq_len - b * KV_BLK_SZ).to(tl.int32)
         blk_seq_offs = b * KV_BLK_SZ + blk_offs
         kv_mask = (
             (blk_seq_offs[:, None] < seq_len)
@@ -269,7 +298,10 @@ def _paged_attn_decode_v1_w_dot_kernel(
         )
 
         # load k[KV_BLK_SZ_POW2, HEAD_SZ_POW2]
-        k_0 = tl.load(k_cache_ptr + kv_blk_offs, mask=kv_mask, other=0.0)
+        k_0 = _load_kv_page(
+            k_cache_ptr, page_off, rows, kv_blk_offs, kv_mask, stride_k_kb,
+            HEAD_SZ, HEAD_SZ_POW2, KV_BLK_SZ_POW2, USE_TENSOR_DESC,
+        )  # fmt: skip
         k = k_0.to(tl.float32) * k_scale if k_0.dtype.is_fp8() else k_0
         k = k.to(compute_type)
 
@@ -299,7 +331,10 @@ def _paged_attn_decode_v1_w_dot_kernel(
         acc *= alpha[:, None]
 
         # v: [KV_BLK_SZ, HEAD_SZ]
-        v_0 = tl.load(v_cache_ptr + kv_blk_offs, mask=kv_mask, other=0.0)
+        v_0 = _load_kv_page(
+            v_cache_ptr, page_off, rows, kv_blk_offs, kv_mask, stride_k_kb,
+            HEAD_SZ, HEAD_SZ_POW2, KV_BLK_SZ_POW2, USE_TENSOR_DESC,
+        )  # fmt: skip
         v = v_0.to(tl.float32) * v_scale if v_0.dtype.is_fp8() else v_0
         v = v.to(compute_type)
 
@@ -583,6 +618,7 @@ _paged_attn_decode_v2_w_dot_repr = make_kernel_repr(
         "QUERY_GRP_SZ",
         "KV_BLK_SZ",
         "SEQ_PARTITION_SZ",
+        "USE_TENSOR_DESC",
     ],
 )
 
@@ -622,6 +658,7 @@ def _paged_attn_decode_v2_w_dot_kernel(
     KV_BLK_SZ: tl.constexpr,
     KV_BLK_SZ_POW2: tl.constexpr,
     SEQ_PARTITION_SZ: tl.constexpr,
+    USE_TENSOR_DESC: tl.constexpr = False,
 ):
     """
     #TODO: Add Doc
@@ -686,6 +723,8 @@ def _paged_attn_decode_v2_w_dot_kernel(
         kv_blk_nums = tl.load(blk_tables_start_ptr + kv_blk_idx)
 
         kv_blk_offs = kv_blk_nums * stride_k_b + kv_offs
+        page_off = kv_blk_nums * stride_k_b + kv_head_idx * stride_k_nh
+        rows = tl.minimum(KV_BLK_SZ, seq_len - kv_blk_idx * KV_BLK_SZ).to(tl.int32)
         blk_seq_offs = kv_blk_idx * KV_BLK_SZ + blk_offs
         kv_mask = (
             (blk_seq_offs[:, None] < seq_len)
@@ -694,7 +733,10 @@ def _paged_attn_decode_v2_w_dot_kernel(
         )
 
         # load k[KV_BLK_SZ_POW2, HEAD_SZ_POW2]
-        k_0 = tl.load(k_cache_ptr + kv_blk_offs, mask=kv_mask, other=0.0)
+        k_0 = _load_kv_page(
+            k_cache_ptr, page_off, rows, kv_blk_offs, kv_mask, stride_k_kb,
+            HEAD_SZ, HEAD_SZ_POW2, KV_BLK_SZ_POW2, USE_TENSOR_DESC,
+        )  # fmt: skip
         k = k_0.to(tl.float32) * k_scale if k_0.dtype.is_fp8() else k_0
         k = k.to(compute_type)
 
@@ -724,7 +766,10 @@ def _paged_attn_decode_v2_w_dot_kernel(
         acc *= alpha[:, None]
 
         # v: [KV_BLK_SZ_POW2, HEAD_SZ_POW2]
-        v_0 = tl.load(v_cache_ptr + kv_blk_offs, mask=kv_mask, other=0.0)
+        v_0 = _load_kv_page(
+            v_cache_ptr, page_off, rows, kv_blk_offs, kv_mask, stride_k_kb,
+            HEAD_SZ, HEAD_SZ_POW2, KV_BLK_SZ_POW2, USE_TENSOR_DESC,
+        )  # fmt: skip
         v = v_0.to(tl.float32) * v_scale if v_0.dtype.is_fp8() else v_0
         v = v.to(compute_type)
 
