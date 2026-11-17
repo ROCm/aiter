@@ -154,6 +154,7 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
     scaleM_pad,
     scaleN_pad: tl.constexpr,
     SHUFFLE: tl.constexpr,
+    ROUND_TO_INPUT_DTYPE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     start_n = tl.program_id(1) * NUM_ITER
@@ -187,10 +188,21 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
                 x_ptr + x_offs + stride_x_n * N, mask=x_mask, cache_modifier=".cg"
             ).to(tl.float32)
 
-        x = _apply_activation_from_str(a, ACTIVATION) * b
+        if ROUND_TO_INPUT_DTYPE:
+            # What an unfused act-and-mul writing x's dtype produces: act(a)
+            # and act(a) * b each rounded to that dtype.
+            dtype = x_ptr.dtype.element_ty
+            act = _apply_activation_from_str(a, ACTIVATION).to(dtype).to(tl.float32)
+            x = (act * b).to(dtype).to(tl.float32)
+        else:
+            x = _apply_activation_from_str(a, ACTIVATION) * b
 
         out_tensor, bs_e8m0 = _mxfp4_quant_op(
-            x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+            x,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_M,
+            MXFP4_QUANT_BLOCK_SIZE,
+            SCALING_MODE=SCALING_MODE,
         )
 
         out_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
