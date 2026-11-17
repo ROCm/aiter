@@ -35,9 +35,7 @@ def _get_compiled_mxfp4_gemm1_port(
     k_wave=1,
     ep32=False,
 ):
-    if ep32 and BM == 160:
-        from .kernels.mxfp4_gemm1_ep32_bm160 import compile_gemm1_ep32_bm160 as compile_gemm1
-    elif ep32:
+    if ep32:
         from .kernels.mxfp4_gemm1_ep32 import compile_gemm1_ep32 as compile_gemm1
     else:
         from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port as compile_gemm1

@@ -792,10 +792,7 @@ def get_g2(
 
 @functools.cache
 def get_g2_ep32(use_nt, HIDDEN_MAX, INTER_MAX, use_valid_token_count, grid_wgs, BM=64, B_NT=False, variant="base", REDUCE=False, topk=1, NATIVE_C=False, NATIVE_BF16=False):
-    if BM == 160:
-        from .mxfp4_gemm2_ep32_bm160 import compile_gemm2_ep32_bm160 as compile_gemm2_ep32
-    else:
-        from .mxfp4_gemm2_ep32 import compile_gemm2_ep32
+    from .mxfp4_gemm2_ep32 import compile_gemm2_ep32
 
     return compile_gemm2_ep32(
         use_nt=bool(use_nt),
