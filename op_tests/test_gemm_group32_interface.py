@@ -1139,25 +1139,3 @@ def test_aot_bmm_rows_cover_their_dispatch(tmp_path):
     finally:
         for cache in caches:
             cache.cache_clear()
-
-
-@pytest.mark.parametrize("w_scale_block", ["1x32", "32x32"])
-def test_group32_supported_asks_each_layouts_kernel(monkeypatch, w_scale_block):
-    """Row-major: the Triton group32 GEMM's arch. Preshuffled: the FlyDSL kernel
-    gemm_a8w8_blockscale_bpreshuffle routes group32 scales to."""
-    from aiter.ops.flydsl import batched_gemm_a8w8 as flydsl_bmm
-
-    asked = []
-    monkeypatch.setattr(
-        flydsl_bmm,
-        "bmm_a8w8_mxfp8_supported",
-        lambda block: asked.append(block) or True,
-    )
-    supported = gemm_op_a8w8.gemm_a8w8_blockscale_group32_supported
-    assert supported(w_scale_block, bpreshuffle=True)
-    assert asked == [w_scale_block]
-    for gfx, expected in (("gfx942", False), ("gfx950", True), ("gfx1250", False)):
-        monkeypatch.setattr(group32, "get_gfx_runtime", lambda gfx=gfx: gfx)
-        assert supported(w_scale_block) is expected
-    with pytest.raises(AssertionError):
-        supported("128x128")

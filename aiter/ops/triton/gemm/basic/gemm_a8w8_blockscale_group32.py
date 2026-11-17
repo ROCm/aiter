@@ -7,11 +7,6 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import gemm_afp8wfp8
 
 
-def gemm_a8w8_blockscale_group32_arch_supported() -> bool:
-    """Whether this arch runs `gemm_a8w8_blockscale_group32`."""
-    return get_gfx_runtime() == "gfx950"
-
-
 def gemm_a8w8_blockscale_group32(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -65,9 +60,7 @@ def gemm_a8w8_blockscale_group32(
         assert y.is_contiguous(), "Output must be contiguous"
     if M == 0:
         return y
-    assert (
-        gemm_a8w8_blockscale_group32_arch_supported()
-    ), "Group32 FP8 GEMM requires gfx950"
+    assert get_gfx_runtime() == "gfx950", "Group32 FP8 GEMM requires gfx950"
 
     return gemm_afp8wfp8(
         x,
