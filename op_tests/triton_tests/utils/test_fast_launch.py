@@ -61,6 +61,11 @@ def _offset_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
     tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask) + _OFFSET, mask=mask)
 
 
+# `JITFunction.run` puts this knob in the compile options only on the Triton
+# builds that have it.
+_FPSAN = "fpsan_homomorphic_casts" in knobs.compilation.knob_descriptors
+
+
 def _triton_key(kernel, args, kwargs):
     """`JITFunction.run`'s cache key for a launch, from Triton's own binder."""
     backend = make_backend(driver.active.get_current_target())
@@ -68,7 +73,8 @@ def _triton_key(kernel, args, kwargs):
     kwargs = dict(kwargs)
     kwargs["debug"] = kwargs.get("debug", kernel.debug) or knobs.runtime.debug
     kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
-    kwargs["fpsan_homomorphic_casts"] = knobs.compilation.fpsan_homomorphic_casts
+    if _FPSAN:
+        kwargs["fpsan_homomorphic_casts"] = knobs.compilation.fpsan_homomorphic_casts
     _, specialization, options = binder(*args, **kwargs)
     return compute_cache_key({}, specialization, options)
 
@@ -161,6 +167,8 @@ def test_key_tells_apart_what_triton_tells_apart(
     ],
 )
 def test_key_follows_the_knobs_in_tritons_key(monkeypatch, knob, env):
+    if env == "TRITON_FPSAN_HOMOMORPHIC_CASTS" and not _FPSAN:
+        pytest.skip("this Triton build has no fpsan_homomorphic_casts knob")
     monkeypatch.setenv("AMDGCN_USE_BUFFER_OPS", "1")
     monkeypatch.delenv("TRITON_FPSAN_HOMOMORPHIC_CASTS", raising=False)
     wrapped = fast_launch.fast_launch(_probe_kernel)

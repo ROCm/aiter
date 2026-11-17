@@ -18,8 +18,9 @@ The first launch of a key goes through ``kernel[grid]`` and keeps the compiled
 kernel. A later launch with the same key calls its launcher directly. The key
 holds the current device, the knobs that enter Triton's compile options or
 specialization (``runtime.debug``, ``compilation.instrumentation_mode``,
-``compilation.fpsan_homomorphic_casts``, ``amd.use_buffer_ops``), the number of
-positional arguments, the keyword names, and for each argument:
+``compilation.fpsan_homomorphic_casts`` on the Triton builds that have it,
+``amd.use_buffer_ops``), the number of positional arguments, the keyword names,
+and for each argument:
 
 * a tensor: its dtype, whether its data pointer is 16-byte aligned, and whether
   its storage fits in 2 GiB (``HIPBackend.get_tensor_specialization``); and,
@@ -67,6 +68,10 @@ _MISSES: list | None = None
 
 # Set while a test wants the ordinary path, to compare this one against.
 _BYPASS = False
+
+# Not every supported Triton build has this knob, and a build without it does
+# not key on it.
+_FPSAN = "fpsan_homomorphic_casts" in knobs.compilation.knob_descriptors
 
 _MISSING = object()
 _Tensor = torch.Tensor
@@ -215,7 +220,7 @@ class _FastLaunch:
             device,
             knobs.runtime.debug,
             knobs.compilation.instrumentation_mode,
-            knobs.compilation.fpsan_homomorphic_casts,
+            knobs.compilation.fpsan_homomorphic_casts if _FPSAN else None,
             buffer_ops,
             len(args),
             *kwargs,
