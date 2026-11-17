@@ -25,7 +25,10 @@ def _inputs(m, n1, n2, seed):
     if m >= 2:
         q[0, :128] = 0  # an all-zero group
         q[1, 128:256] *= 2.0**20
-    return q, r(n1).bfloat16(), (r(m, n2) * 3).bfloat16(), r(n2).bfloat16()
+    qw = r(n1).bfloat16()
+    if n1 > 128:
+        qw[-128:] = float("inf")  # an Inf group in every row: the 2^127 scale cap
+    return q, qw, (r(m, n2) * 3).bfloat16(), r(n2).bfloat16()
 
 
 def _fused_e8m0(q, qw, k, kw, transpose_scale, q_out_unquantized=None):
@@ -81,7 +84,10 @@ def test_fused_qk_rmsnorm_e8m0(n1, n2, m, transpose_scale):
         scale_type=dtypes.fp8_e8m0,
     )
     assert torch.equal(s, s_ref.view(torch.uint8))
-    assert torch.equal(q8, q8_ref.view(torch.uint8))
+    # the Inf group's fp8 is this kernel's conversion (0xFE, as with FP32 scales), where
+    # per_group_quant_hip writes NaN: compare the finite groups
+    fin = slice(None, n1 - 128 if n1 > 128 else n1)
+    assert torch.equal(q8[:, fin], q8_ref.view(torch.uint8)[:, fin])
 
     # the norms are within 1 bf16 ulp of the unquantized kernel's
     q_ref, k_ref = torch.empty_like(q), torch.empty_like(k)

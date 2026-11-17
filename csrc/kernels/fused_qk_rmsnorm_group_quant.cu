@@ -558,9 +558,10 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
 #define FUSED_RMSNORM_FP8_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
     FUSED_RMSNORM_GROUP_QUANT_RUNTIME_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V)
 
-// E8M0 scales: interleave off, as the group-quant variants.
+// E8M0 scales: interleave off, as the group-quant variants. No-quant never selects E8M0, so it
+// reuses the FP32 instantiation.
 #define FUSED_RMSNORM_FP8_E8M0_GROUP_QUANT_DISPATCH(BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V) \
-    FUSED_RMSNORM_QUANT_KERNEL_IMPL_(opus::fp8_t, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, false, false, true)
+    FUSED_RMSNORM_QUANT_KERNEL_IMPL_(opus::fp8_t, BlockSize, thread_data_size, ReduceThreadSize, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, NO_QUANT_V, false, false, !(NO_QUANT_V))
 
 #define FUSED_RMSNORM_FP8_PER_TOKEN_QUANT_DISPATCH(BlockSize, thread_data_size, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V) \
     FUSED_RMSNORM_QUANT_KERNEL_IMPL_(opus::fp8_t, BlockSize, thread_data_size, 1, ADD_RESIDUAL, OUTPUT_UNQUANT, GEMMA_NORM_V, false, true, true, false)
