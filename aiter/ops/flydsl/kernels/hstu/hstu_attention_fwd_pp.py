@@ -30,11 +30,11 @@ Tiles: (512,32,8,2) for d=64 without a window; (256,32,8,2) under a window or
 at d=128, where 512 spills. MI300X, bf16, B=1024 H=4 N=16384, against the
 fallback: 1.49x at d=64, 1.13x at d=64 W=512, 2.21x at d=128.
 
-Accuracy: not bitwise against the fallback -- alpha*-log2e is folded into the
-bf16 Q operand and sigmoid comes from a nearest-node table -- but the max error
-against the fp32 reference matches the fallback's (1.221e-04, 0.71% of peak,
-outputs scaled by N), and the two differ by at most ~1.2e-07, about 2 bf16 ULP
-of the output. Compiled with fast/unsafe FP math.
+Accuracy: the score stays fp32 from the MFMA to the gate; alpha*-log2e is folded
+into the sigmoid table's index constant and alpha/N into the epilogue. sigmoid
+comes from a nearest-node table (relative error < 4e-3, about bf16's rounding) that
+ends in an exact 0, so silu's negative tail vanishes as it should. Compiled
+with fast/unsafe FP math.
 """
 
 import functools
@@ -80,6 +80,75 @@ def phase_barrier():
     rocdl.sched_barrier(0)
     rocdl.s_barrier()
     rocdl.sched_barrier(0)
+
+
+def _bias_slot_map(max_attn_len: int, kv_subtiles: int):
+    """Layout of the window-bias table: v = U / 16 -> slot.
+
+    Returns (fold, jk, jt, br, n_slot, slot, vrep): `slot(v)` is v's slot,
+    `vrep(s)` a v whose pattern slot s holds. When the all-keep run
+    [kv_subtiles, jk] covers a whole KV tile it is folded into one slot.
+    """
+    W, KS = max_attn_len, kv_subtiles
+    jk = (W - 15) // 16  # last v whose block is entirely kept
+    jt = (W + 15) // 16  # last v whose block is not entirely dropped
+    fold = jk >= KS
+    if fold:
+        br = jt + KS - jk
+
+        def slot(v):
+            return min(max(v, -1), KS) + 1 + min(max(v - jk, 0), br)
+
+        def vrep(s):
+            return s - 1 if s <= KS + 1 else jk + s - KS - 1
+
+        return fold, jk, jt, br, KS + 2 + br, slot, vrep
+
+    def slot(v):
+        return min(max(v, -1), jt + KS) + 1
+
+    def vrep(s):
+        return s - 1
+
+    return fold, jk, jt, 0, jt + KS + 2, slot, vrep
+
+
+def _bias_pattern(v: int, max_attn_len: int) -> tuple:
+    """Drop mask of the 16x16 block at v = U / 16, row-major (kv a, query b)."""
+    return tuple(
+        (16 * v + b - a) < 0 or (16 * v + b - a) > max_attn_len
+        for a in range(MFMA_M)
+        for b in range(MFMA_N)
+    )
+
+
+def _bias_slot_check_range(max_attn_len: int, kv_subtiles: int):
+    """The v values where `_bias_slot_map` can disagree with the pattern.
+
+    Folded, every v in [kv_subtiles, jk] maps to the one all-keep slot and
+    every v - ng there is all-keep, so only the two edges need checking and the
+    cost no longer grows with max_attn_len.
+    """
+    fold, jk, jt, *_ = _bias_slot_map(max_attn_len, kv_subtiles)
+    full = range(-4, jt + kv_subtiles + 8)
+    if not fold:
+        return list(full)
+    lo = range(-4, kv_subtiles + 5)
+    hi = range(max(lo.stop, jk - kv_subtiles - 4), full.stop)
+    return list(lo) + list(hi)
+
+
+def _check_bias_slots(max_attn_len: int, kv_subtiles: int, vs) -> None:
+    """Assert that every v in `vs` maps to a slot holding its own pattern."""
+    _, _, _, _, n_slot, slot, vrep = _bias_slot_map(max_attn_len, kv_subtiles)
+    for v in vs:
+        s = slot(v)
+        assert 0 <= s < n_slot, (v, s)
+        assert all(
+            _bias_pattern(v - ng, max_attn_len)
+            == _bias_pattern(vrep(s) - ng, max_attn_len)
+            for ng in range(kv_subtiles)
+        ), (v, s)
 
 
 def validate_hstu_attention_fwd_pp(
@@ -281,9 +350,11 @@ def build_hstu_attention_fwd_pp(
     # Replaces exp2 -> add -> rcp with one ds_read. Nearest node, h = 0.01125,
     # keeps sigmoid's relative error under bf16's 2^-8. Below g = -8 sigmoid
     # rounds to 1 in bf16; above g = +16, p = g*sigmoid is below bf16's noise
-    # floor. 2135 entries, 8540 B. Below the range the clamped index gives
-    # sigmoid = 1, so p = g stays exact however negative g is; a table of p
-    # could not do that.
+    # floor. 2135 entries plus a final sigmoid = 0 that every g past the range
+    # clamps to, so silu's negative tail goes to 0 instead of growing with |s|
+    # (the dropped |p| is at most 16/(1+2^16) in g units, under the table's own
+    # error). Below the range the clamped index gives sigmoid = 1, so the gate
+    # stays exact however negative g is; a table of p could not do that.
     _LUT_GLO, _LUT_GHI = -8.0, 16.0
     _LUT_H = 0.01125
     _LUT_N = math.ceil((_LUT_GHI - _LUT_GLO) / _LUT_H) + 1
@@ -302,63 +373,26 @@ def build_hstu_attention_fwd_pp(
     # under the barrier. Target rows, whose window hangs off max_id rather than
     # the row, read the all-zero slot and are masked per element.
     BIAS_MASK = has_window and causal and not has_contextual
-    BIAS_HUGE = float(2.0**40)
+    # The accumulator holds the raw score s, and the table index grows with
+    # s*alpha*-log2e, so a dropped score is pushed the opposite way to alpha.
+    BIAS_HUGE = -math.copysign(2.0**40, alpha) if alpha != 0 else 0.0
     N_BINIT = KV_SUBTILES * Q_SUBTILES if BIAS_MASK else 0
     # The MFMA after which phase M starts the next tile's slot SALU; the first
     # QK MFMAs keep their shadows for their LDS reads. At (256,32), starting
     # after MFMA 2 measured 1.046x, after 4 or 8 1.065x.
     BIAS_SIDE_MFMA = 2 * Q_SUBTILES
     if BIAS_MASK:
-        _W = max_attn_len
         _KS = KV_SUBTILES
-        _JK = (_W - 15) // 16  # last v = U/16 whose block is entirely kept
-        _JT = (_W + 15) // 16  # last v whose block is not entirely dropped
-        # The all-keep run between the two edges collapses to one slot when it
-        # covers a whole KV tile; otherwise v is indexed directly.
-        BIAS_FOLD = _JK >= _KS
-        if BIAS_FOLD:
-            _BR = _JT + _KS - _JK
-
-            def _bias_slot(v):
-                return min(max(v, -1), _KS) + 1 + min(max(v - _JK, 0), _BR)
-
-            def _bias_vrep(s):
-                return s - 1 if s <= _KS + 1 else _JK + s - _KS - 1
-
-            N_BSLOT = _KS + 2 + _BR
-        else:
-            _BR = 0
-
-            def _bias_slot(v):
-                return min(max(v, -1), _JT + _KS) + 1
-
-            def _bias_vrep(s):
-                return s - 1
-
-            N_BSLOT = _JT + _KS + 2
-
-        def _bias_pat(v):
-            return tuple(
-                (16 * v + b - a) < 0 or (16 * v + b - a) > _W
-                for a in range(MFMA_M)
-                for b in range(MFMA_N)
-            )
-
-        for _v in range(-4, _JT + _KS + 8):
-            _s = _bias_slot(_v)
-            assert 0 <= _s < N_BSLOT, (_v, _s)
-            assert all(
-                _bias_pat(_v - ng) == _bias_pat(_bias_vrep(_s) - ng)
-                for ng in range(_KS)
-            ), (_v, _s)
+        BIAS_FOLD, _JK, _JT, _BR, N_BSLOT, _, _ = _bias_slot_map(max_attn_len, _KS)
+        _check_bias_slots(max_attn_len, _KS, _bias_slot_check_range(max_attn_len, _KS))
         # One extra all-zero slot for target q-blocks.
         BIAS_KEEP_SLOT = N_BSLOT
         N_BSLOT += 1
         BIAS_ROWS = N_BSLOT * _KS * WARP_SIZE
     else:
         BIAS_ROWS = 1
-    # The bias path needs one extra LUT entry, sigmoid = 0, at the top clamp.
-    _LUT_TAB = _LUT_N + 1 if BIAS_MASK else _LUT_N
+    # One extra entry, sigmoid = 0, at the top clamp.
+    _LUT_TAB = _LUT_N + 1
     _LUT_ROUNDS = (_LUT_TAB + BLOCK_THREADS - 1) // BLOCK_THREADS
 
     # Phase V issues a tile's LUT reads in two groups, the first GATE_SPLIT
@@ -707,11 +741,10 @@ def build_hstu_attention_fwd_pp(
             q_packs.append(per_qg)
 
         # ---- Score gate ----
-        # With g = s * (alpha * -log2e), sigmoid(alpha*s) = 1 / (1 + 2^g) and
-        # p = g * sigmoid(alpha*s) = -log2e * silu(alpha*s). The scale is
-        # folded into Q (`scale_q_pack`), so g is the raw GEMM1 output, and the
-        # -1/log2e is folded into the epilogue's 1/N.
-        c_alpha_neg_log2e = fx.Float32(alpha * -_LOG2E)
+        # With g = s * alpha * -log2e, sigmoid(alpha*s) = 1 / (1 + 2^g). The
+        # gate computes p = s * sigmoid(alpha*s) on the fp32 score s; g is only
+        # ever formed inside the table index FMA, and alpha rides the
+        # epilogue's 1/N, since silu(alpha*s) = alpha * p.
         c_one_f = fx.Float32(1.0)
         c_zero_f = fx.Float32(0.0)
         # Column id for a position past the end of the sequence: larger than
@@ -728,16 +761,17 @@ def build_hstu_attention_fwd_pp(
         # 3.998e-3, still under bf16's 7.812e-3.
         _LUT_MAGIC = float(2**21)
         _LUT_BIG = _LUT_MAGIC + round(_LUT_BIAS * 4.0) / 4.0
-        c_lut_scale = fx.Float32(_LUT_SCALE)
+        c_lut_scale = fx.Float32(_LUT_SCALE * alpha * -_LOG2E)
         c_lut_big = fx.Float32(_LUT_BIG)
         c_lut_lo = fx.Float32(_LUT_MAGIC)
-        # Under BIAS_MASK the top clamp lands on the extra sigmoid = 0 entry, so
-        # a dropped (biased) score gates to exactly 0.
+        # The top clamp lands on the sigmoid = 0 entry, so a score past the
+        # range, or one dropped by the window bias, gates to exactly 0.
         c_lut_hi = fx.Float32(_LUT_MAGIC + float(_LUT_TAB - 1))
 
-        def lut_index(gv):
-            """Table index of sigmoid(g) = 1/(1+2^g): three full-rate VALU ops."""
-            t = gv * c_lut_scale + c_lut_big
+        def lut_index(sv):
+            """Table index of sigmoid(alpha*s) for the raw score s: three
+            full-rate VALU ops (index FMA, clamp, bit extract)."""
+            t = sv * c_lut_scale + c_lut_big
             t = fx.Float32(
                 llvm.call_intrinsic(
                     fx.Float32.ir_type,
@@ -752,8 +786,8 @@ def build_hstu_attention_fwd_pp(
         def lut_load(idx):
             return Vec(lut_mem[idx, None].load())[0]
 
-        def lut_sigma(gv):
-            return lut_load(lut_index(gv))
+        def lut_sigma(sv):
+            return lut_load(lut_index(sv))
 
         def build_sigma_lut():
             """Fill the table once per workgroup (~5 rounds over BLOCK_THREADS)."""
@@ -764,15 +798,14 @@ def build_hstu_attention_fwd_pp(
                 _idx = (_idx < fx.Int32(_LUT_TAB)).select(_idx, fx.Int32(_LUT_TAB - 1))
                 _gv = _idx.to(fx.Float32) * fx.Float32(_LUT_H) + fx.Float32(_LUT_GLO)
                 _sg = _rcp(c_one_f + exp2_f32(_gv))
-                if const_expr(_LUT_TAB > _LUT_N):
-                    _sg = (_idx < fx.Int32(_LUT_N)).select(_sg, c_zero_f)
+                _sg = (_idx < fx.Int32(_LUT_N)).select(_sg, c_zero_f)
                 lut_mem[_idx, fx.Int32(0)] = _sg
 
-        def silu_scale_batch(g):
-            """p = g * sigmoid for already-scaled scores g. A zeroed (masked)
-            score gives p = 0 exactly."""
-            sig = [lut_sigma(gi) for gi in g]  # all reads before any multiply
-            return [gi * si for gi, si in zip(g, sig)]
+        def silu_scale_batch(s_list):
+            """p = s * sigmoid(alpha*s) for raw scores; a zeroed (masked) score
+            gives p = 0 exactly."""
+            sig = [lut_sigma(sv) for sv in s_list]  # all reads before any multiply
+            return [sv * si for sv, si in zip(s_list, sig)]
 
         def to_id(x):
             """Raw position -> masked id (contextual prefix shift, then target-tail clamp)."""
@@ -811,29 +844,6 @@ def build_hstu_attention_fwd_pp(
 
             pairs = [bf16_pair(vals[0], vals[1]), bf16_pair(vals[2], vals[3])]
             return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
-
-        def scale_q_pack(pack):
-            """Fold (alpha * -log2e) into one Q operand pack, once per workgroup
-            instead of once per gated element.
-
-            bf16 -> f32 is `word << 16` / `word & 0xFFFF0000`. The scaled value
-            is rounded back to bf16, so this is not bitwise equal to scaling
-            the f32 score (see the module docstring for the accuracy).
-            """
-            c16 = fx.Int32(16)
-            chi = fx.Int32(0xFFFF0000)
-            words = Vec(pack).bitcast(fx.Int32)
-            vals = []
-            for w in range_constexpr(MFMA_DIM_LANE_K // 2):
-                word = words[w]
-                vals.append((word << c16).bitcast(fx.Float32) * c_alpha_neg_log2e)
-                vals.append((word & chi).bitcast(fx.Float32) * c_alpha_neg_log2e)
-            return pack_p(vals)
-
-        q_packs = [
-            [scale_q_pack(q_packs[ks][qg]) for qg in range_constexpr(Q_SUBTILES)]
-            for ks in range_constexpr(K_STEPS)
-        ]
 
         q_row_ids = [to_id(q_rows[qg]) for qg in range_constexpr(Q_SUBTILES)]
 
@@ -1946,9 +1956,9 @@ def build_hstu_attention_fwd_pp(
         hz_per_group = (hz_total + fx.Int32(NUM_GRID_GROUPS - 1)) // c_ngg
         grid_blocks = num_q_tiles * hz_per_group * c_ngg
 
-        # Epilogue scale (1/N) * (-1/log2e): undoes the gate's -log2e and
-        # normalizes by the global max_seq_len, not the row's length.
-        inv_n = (fx.Float32(1.0) / max_seq_len) * fx.Float32(-1.0 / _LOG2E)
+        # Epilogue scale alpha/N: silu(alpha*s) = alpha * p, normalized by the
+        # global max_seq_len, not the row's length.
+        inv_n = (fx.Float32(1.0) / max_seq_len) * fx.Float32(alpha)
 
         hstu_attention_fwd_pp_kernel(
             q,

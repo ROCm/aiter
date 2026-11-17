@@ -10,6 +10,7 @@ kernel (gfx942, bf16, head_dim == hidden_dim in (64, 128)) and the fallback.
 import argparse
 import csv
 import itertools
+import math
 
 import pandas as pd
 import pytest
@@ -25,6 +26,10 @@ from aiter.ops.flydsl.hstu_attention import (
     fwd_pp_tiles,
 )
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_fwd_pp import (
+    _bias_slot_check_range,
+    _bias_slot_map,
+    _check_bias_slots,
+    build_hstu_attention_fwd_pp,
     validate_hstu_attention_fwd_pp,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -718,6 +723,111 @@ def test_flydsl_hstu_attention_pingpong_unsupported(
         flydsl_hstu_attention_fwd(*args, pingpong=True)
     _assert_matches_ref(flydsl_hstu_attention_fwd(*args), ref, args[0])
     assert builds == []
+
+
+def _ref_for(args):
+    max_seq_len, alpha, q, k, v, seq_offsets, causal, num_targets, w, ctx = args
+    return _load_torch_hstu_reference()(
+        max_seq_len, alpha, q, k, v, seq_offsets, causal, dropout_pr=0.0,
+        training=False, num_targets=num_targets, max_attn_len=w,
+        contextual_seq_len=ctx, min_full_attn_seq_len=0,
+    )  # fmt: skip
+
+
+@requires_pp
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("max_attn_len", [0, 512])
+@pytest.mark.parametrize("k_val", [-1.0, -16.0])
+def test_flydsl_hstu_attention_pingpong_large_negative_scores(
+    head_dim, max_attn_len, k_val
+):
+    """silu's negative tail must vanish: alpha*s far below the sigmoid table's
+    range gates to 0 (the table used to clamp to sigmoid(16) without a window,
+    so p grew linearly with |s|)."""
+    n, h = 2048, 2
+    seq_offsets = torch.tensor([0, n, n + 1500], dtype=torch.int64, device="cuda")
+    shape = (int(seq_offsets[-1]), h, head_dim)
+    q = torch.ones(shape, dtype=torch.bfloat16, device="cuda")
+    k = torch.full(shape, k_val, dtype=torch.bfloat16, device="cuda")
+    v = torch.ones(shape, dtype=torch.bfloat16, device="cuda")
+    args = (n, 1.0, q, k, v, seq_offsets, True, None, max_attn_len, 0)
+    out = flydsl_hstu_attention_fwd(*args, pingpong=True)
+    _assert_matches_ref(out, _ref_for(args), n)
+
+
+@requires_pp
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("block_m", [512, 256])
+def test_flydsl_hstu_attention_pingpong_exact_cancellation(head_dim, block_m):
+    """q.k == 0 exactly, so every output is 0. The score must stay fp32 until
+    the gate: rounding a prescaled Q to bf16 broke the cancellation (0.23)."""
+    n = 1024
+    seq_offsets = torch.tensor([0, n], dtype=torch.int64, device="cuda")
+    q = torch.zeros((n, 1, head_dim), dtype=torch.bfloat16, device="cuda")
+    k = torch.zeros_like(q)
+    q[:, 0, 0], q[:, 0, 1] = 1.0, 1.625
+    k[:, 0, 0], k[:, 0, 1] = 208.0, -128.0
+    v = torch.ones_like(q)
+    args = (n, 1.0, q, k, v, seq_offsets, True, None, 0, 0)
+    out = flydsl_hstu_attention_fwd(*args, block_m=block_m, block_n=32, pingpong=True)
+    _assert_matches_ref(out, _ref_for(args), n)
+
+
+@requires_pp
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("max_attn_len", [0, 512])
+def test_flydsl_hstu_attention_pingpong_unit_scale_inputs(head_dim, max_attn_len):
+    """N(0,1) q/k/v with alpha = 1/sqrt(d), so scores are O(1), unlike the
+    +-0.01 inputs elsewhere. The ping-pong's mean error must match the
+    fallback's; with Q prescaled in bf16 it was ~1.6x."""
+    n, h, b = 4096, 2, 4
+    g = torch.Generator(device="cuda").manual_seed(0)
+    lengths = torch.randint(1, n + 1, (b,), device="cuda", generator=g)
+    lengths = (lengths.float() * 0.95).long().clamp(min=1)
+    seq_offsets = torch.zeros(b + 1, dtype=torch.int64, device="cuda")
+    seq_offsets[1:] = torch.cumsum(lengths, 0)
+    shape = (int(seq_offsets[-1]), h, head_dim)
+    q, k, v = (
+        torch.randn(shape, device="cuda", generator=g).to(torch.bfloat16)
+        for _ in range(3)
+    )
+    args = (n, head_dim**-0.5, q, k, v, seq_offsets, True, None, max_attn_len, 0)
+    ref = _ref_for(args).float()
+    err = {
+        pp: (flydsl_hstu_attention_fwd(*args, pingpong=pp).float() - ref).abs()
+        for pp in (True, False)
+    }
+    assert float(err[True].mean()) <= 1.2 * float(err[False].mean()), (
+        float(err[True].mean()),
+        float(err[False].mean()),
+    )
+    # 1 bf16 ULP of the output's scale on top of the fallback's max error.
+    ulp = 2.0 ** (math.floor(math.log2(float(ref.abs().max()))) - 7)
+    assert float(err[True].max()) <= float(err[False].max()) + ulp
+
+
+@pytest.mark.parametrize("kv_subtiles", [2])
+def test_bias_slot_map_matches_patterns(kv_subtiles):
+    """The window-bias slot map, checked over the FULL v range for many
+    windows. The builder checks only the edge ranges, which this shows is
+    enough; checking everything there was O(max_attn_len) per build."""
+    for w in [*range(1, 1025), 2048, 4096, 16385]:
+        _, _, jt, *_ = _bias_slot_map(w, kv_subtiles)
+        _check_bias_slots(w, kv_subtiles, range(-4, jt + kv_subtiles + 8))
+    for w in (10**6, 10**9):
+        assert len(_bias_slot_check_range(w, kv_subtiles)) < 64
+
+
+@requires_pp
+def test_pingpong_build_huge_window():
+    """Building with a huge window must not walk the whole window (this used to
+    take ~1.5 h at max_attn_len=1e9). Build only; nothing is launched."""
+    build_hstu_attention_fwd_pp(
+        num_heads=2, head_dim=64, hidden_dim=64, causal=True,
+        max_attn_len=10**9, contextual_seq_len=0, has_targets=False,
+        alpha=1.0, dtype_str="bf16", block_m=256, block_n=32, num_waves=8,
+        waves_per_eu=2,
+    )  # fmt: skip
 
 
 # --------------------------------------------------------------------------- #
