@@ -212,3 +212,20 @@ try:
 except (ImportError, AttributeError):
     # Iris or triton not available, skip import
     IRIS_COMM_AVAILABLE = False
+
+
+def __getattr__(name: str):
+    """Resolve prepared paged-decode exports without eager GPU imports."""
+    if name in {
+        "PAContextStats",
+        "PADecodeShape",
+        "PADecodePlan",
+        "select_pa_decode_backend",
+        "prepare_pa_decode_plan",
+        "refresh_pa_decode_plan",
+        "pa_decode",
+    }:
+        from importlib import import_module
+
+        return getattr(import_module("aiter.ops.pa_decode"), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

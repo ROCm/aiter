@@ -4,6 +4,16 @@
 #include <cstddef>
 #include <limits>
 
+static int select_ps_reduce_waves(int requested_waves, int64_t output_rows, uint32_t num_cu)
+{
+    if(requested_waves != 0)
+        return requested_waves;
+    int waves = 1;
+    while(waves < 8 && output_rows * waves < num_cu)
+        waves *= 2;
+    return waves;
+}
+
 struct __attribute__((packed)) AttentionPsReduceArgs
 {
     void* output;
@@ -60,8 +70,9 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
                          int merge_waves,
                          hipStream_t stream)
 {
-    AITER_CHECK(merge_waves == 0 || merge_waves == 1 || merge_waves == 8,
-                __func__, ": merge_waves must be 0, 1, or 8");
+    AITER_CHECK(merge_waves == 0 || merge_waves == 1 || merge_waves == 2 ||
+                    merge_waves == 4 || merge_waves == 8,
+                __func__, ": merge_waves must be 0, 1, 2, 4, or 8");
     AITER_CHECK(partial_output && partial_lse && reduce_indptr && reduce_final_map &&
                     reduce_partial_map && final_output,
                 __func__, ": explicit reduction metadata and output tensors are required");
@@ -147,8 +158,9 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
     args.tile_stride = tile_groups;
     args.query_stride = query_groups;
 
-    const bool adaptive = merge_waves == 8 ||
-                          (merge_waves == 0 && num_heads * final_output->size(0) < num_cu);
+    const int selected_waves =
+        select_ps_reduce_waves(merge_waves, num_heads * final_output->size(0), num_cu);
+    const bool adaptive = selected_waves > 1;
     const std::string output_type =
         final_output->dtype() == AITER_DTYPE_fp16 ? "fp16" : "bf16";
     const reduceConfig* selected_config = nullptr;
@@ -156,7 +168,8 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
     {
         const auto& config = entry.second;
         if(config.arch == arch_id && config.oType == output_type &&
-           config.headDim == final_output->size(2) && config.adaptive == adaptive)
+              config.headDim == final_output->size(2) && config.adaptive == adaptive &&
+              config.waves == selected_waves)
         {
             selected_config = &config;
             break;
@@ -165,7 +178,7 @@ void attention_ps_reduce(aiter_tensor_t* partial_output,
     AITER_CHECK(selected_config != nullptr,
                 __func__, ": cannot get heuristic reduce kernel! arch:", arch_id,
                 " output_type:", output_type, " head_dim:", final_output->size(2),
-                " adaptive:", adaptive);
+                " adaptive:", adaptive, " waves:", selected_waves);
     const auto& config = *selected_config;
     static SynchronizedCache<std::string, AiterAsmKernel> implementations;
     auto* kernel = &implementations.get_or_create(arch_id + config.knl_name, [&]() {

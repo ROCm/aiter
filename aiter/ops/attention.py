@@ -585,7 +585,10 @@ def _attention_ps_reduce_asm(
     Output is BF16/FP16 [queries, heads,
     128]; optional final LSE is FP32. The producer must follow the same partial
     layout and LSE convention. No paged-KV or causal-mask inputs are consumed.
-    merge_waves is 0 for the existing heuristic, or 1/8 for an explicit choice.
+    merge_waves is 0 for the smallest 1/2/4/8-wave configuration whose output
+    rows times waves cover the CU count, capped at 8, or 1/2/4/8 explicitly.
+    Multi-wave variants use one active wave for at most eight splits while
+    retaining their configured workgroup size.
     """
 
 
@@ -636,9 +639,11 @@ def pa_persistent_fwd(
     Empty reduction maps skip the reducer; preallocated GPU maps are handled on
     device without reading metadata back to the host.
     reduce_waves selects the gfx950/page16/D128 ASM reducer: 0 applies a static
-    PA workload heuristic, while 1/8 explicitly overrides it. The Q4/GQA16
+    PA workload heuristic, while 1/2/4/8 explicitly overrides it. The Q4/GQA16
     policy expects packed kv_indices containing only used pages. Other paths
-    retain the original heuristic. No tuning or device-to-host readback occurs.
+    use the native output-row/CU heuristic. No tuning or device-to-host readback
+    occurs. The automatic wave choice is an occupancy heuristic, not a measured
+    performance optimum for every split distribution.
     return_lse=False skips final LSE allocation and computation and returns None
     for the second result. The default preserves the existing LSE output.
     Split work always uses FP32 partials and FP32 LSE. Metadata partial=-1
@@ -646,8 +651,8 @@ def pa_persistent_fwd(
     """
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
-    if reduce_waves not in (0, 1, 8):
-        raise ValueError("reduce_waves must be 0, 1, or 8")
+    if reduce_waves not in (0, 1, 2, 4, 8):
+        raise ValueError("reduce_waves must be 0, 1, 2, 4, or 8")
     use_asm_reduce = (
         K.shape[3] == 16
         and v_head_dim == 128
