@@ -75,7 +75,9 @@
         "BLOCK_K": 64,
         "NUM_BUFFERS": 4,
         "num_warps": 4,
-        "kernel_type": "compute_bound"
+        "kernel_type": "compute_bound",
+        "waves_per_eu": 0,
+        "REGISTER_STORE": 0
     },
     "M_LEQ_512": {
         "BLOCK_M": 256,
@@ -83,7 +85,9 @@
         "BLOCK_K": 64,
         "NUM_BUFFERS": 4,
         "num_warps": 4,
-        "kernel_type": "compute_bound"
+        "kernel_type": "compute_bound",
+        "waves_per_eu": 0,
+        "REGISTER_STORE": 0
     },
     "M_LEQ_1024": {
         "BLOCK_M": 256,
@@ -91,7 +95,9 @@
         "BLOCK_K": 64,
         "NUM_BUFFERS": 4,
         "num_warps": 4,
-        "kernel_type": "compute_bound"
+        "kernel_type": "compute_bound",
+        "waves_per_eu": 0,
+        "REGISTER_STORE": 0
     },
     "M_LEQ_2048": {
         "BLOCK_M": 256,
@@ -99,7 +105,9 @@
         "BLOCK_K": 64,
         "NUM_BUFFERS": 4,
         "num_warps": 4,
-        "kernel_type": "compute_bound"
+        "kernel_type": "compute_bound",
+        "waves_per_eu": 0,
+        "REGISTER_STORE": 0
     },
     "M_LEQ_4096": {
         "BLOCK_M": 256,
@@ -107,7 +115,9 @@
         "BLOCK_K": 64,
         "NUM_BUFFERS": 4,
         "num_warps": 4,
-        "kernel_type": "compute_bound"
+        "kernel_type": "compute_bound",
+        "waves_per_eu": 0,
+        "REGISTER_STORE": 0
     },
     "M_LEQ_8192": {
         "BLOCK_M": 256,
@@ -115,7 +125,9 @@
         "BLOCK_K": 64,
         "NUM_BUFFERS": 4,
         "num_warps": 4,
-        "kernel_type": "compute_bound"
+        "kernel_type": "compute_bound",
+        "waves_per_eu": 0,
+        "REGISTER_STORE": 0
     },
     "any": {
         "BLOCK_M": 256,
@@ -123,6 +135,8 @@
         "BLOCK_K": 64,
         "NUM_BUFFERS": 4,
         "num_warps": 4,
-        "kernel_type": "compute_bound"
+        "kernel_type": "compute_bound",
+        "waves_per_eu": 0,
+        "REGISTER_STORE": 0
     }
 }
