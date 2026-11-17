@@ -20,6 +20,7 @@ from op_tests.mqa_logits_mxfp4_lane_max_ref import (
     _ceil,
     chunk_cuts,
     slot_errors,
+    splits_a_group,
 )
 
 # Every tensor names its device: `pytest tests` runs this file in one process with files that
@@ -249,7 +250,10 @@ def test_kernel_stores_pass(name, reverse):
     errs = _row_errors(logits, ends, cuts, lm)
     assert all(not e for _, (e, _) in errs), errs
     split = sum(n for _, (_, n) in errs)
-    if all(not c or all(x % LANE_MAX_TILES == 0 for x in c) for c in cuts):
+    if any(splits_a_group(e, c) for e, c in zip(ends, cuts)):
+        # the op test fails a launch whose cuts split a group but that stores no chunk's share
+        assert split > 0
+    else:
         assert split == 0  # no group cut: every slot exact
 
 

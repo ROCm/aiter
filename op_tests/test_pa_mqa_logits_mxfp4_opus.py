@@ -59,11 +59,15 @@ from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 try:
-    from mqa_logits_mxfp4_lane_max_ref import chunk_cuts, slot_errors
+    from mqa_logits_mxfp4_lane_max_ref import chunk_cuts, slot_errors, splits_a_group
 except ModuleNotFoundError as e:
     if e.name != "mqa_logits_mxfp4_lane_max_ref":
         raise
-    from op_tests.mqa_logits_mxfp4_lane_max_ref import chunk_cuts, slot_errors
+    from op_tests.mqa_logits_mxfp4_lane_max_ref import (
+        chunk_cuts,
+        slot_errors,
+        splits_a_group,
+    )
 
 torch.set_default_device("cuda")
 
@@ -1154,17 +1158,30 @@ def lane_max_shapes(model):
     return []  # 64 heads: no instance writes them
 
 
+def writes_lane_max_here(model):
+    """Whether this arch has ways that write the model's lane maxima: the schedule-free gfx1250
+    H = 32 kernels. Stated here rather than read from the configs, so the check cannot pass
+    vacuously because no config says it writes them."""
+    return base_gfx_arch(get_gfx()) == M.GFX1250 and MODEL_HEADS[model] == 32
+
+
 def check_lane_max(model):
     """Every way that writes lane maxima (schedule-free gfx1250 H = 32): the logits equal those of
     the same call without ``lane_max`` bit for bit and the reference; every row's slots equal its
     keys' max, except in a slot group a CTA chunk boundary of the launch's split falls inside,
     where a slot may instead hold the max of one chunk's share of the group; nothing outside the
-    rows' slots is written. Plane, padded-stride and flat outputs."""
+    rows' slots is written. Plane, padded-stride and flat outputs. Where lane maxima are written
+    (``writes_lane_max_here``), a shape no way writes them for fails, and so does a way whose cuts
+    split a slot group of the shape but that stores no chunk's share on any layout: the partial
+    path has to run. Elsewhere (gfx950) there is nothing to check."""
+    expected = writes_lane_max_here(model)
     results = []
     for rows in lane_max_shapes(model):
         case = make_case(rows, MODEL_HEADS[model])
         lm_ways = {n: w for n, w in ways(case).items() if w[0].writes_lane_max}
         if not lm_ways:
+            if expected:
+                results.append((rows.label, ["no way writes lane maxima"]))
             continue
         refs = [run_torch(rows, case.data, r) for r in range(rows.rows)]
         ends = rows.row_ends.long()
@@ -1178,6 +1195,8 @@ def check_lane_max(model):
         }
         for name, (cfg, _) in lm_ways.items():
             cuts = lane_max_cuts(cfg, rows)
+            cut = any(splits_a_group(ref.numel(), c) for ref, c in zip(refs, cuts))
+            way_split = 0
             for layout, (stride, out_offsets) in layouts.items():
                 if out_offsets is not None and not cfg._instance.flat_out:
                     continue
@@ -1240,7 +1259,13 @@ def check_lane_max(model):
                     layout,
                     split,
                 )
+                way_split += split
                 results.append((f"{rows.label} {name} {layout}", bad))
+            if cut and not way_split:
+                why = "cuts split a slot group, yet no layout stored a chunk's share"
+                results.append((f"{rows.label} {name} split groups", [why]))
+    if expected and not results:
+        results.append((f"{model} lane_max", ["no shapes to check"]))
     return results
 
 
