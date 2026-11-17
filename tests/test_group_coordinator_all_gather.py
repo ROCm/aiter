@@ -2,7 +2,7 @@
 use it, and takes the custom kernel only where it has one for the group size.
 Its NCCL path, `reduce_scatter_tensor(use_custom=False)` and send/recv run on
 the device communicator's PyNccl when that is usable and carries the dtype,
-and on torch.distributed otherwise.
+and on torch.distributed otherwise and while dynamo traces.
 CPU only: the collectives, PyNccl and the custom op are stand-ins."""
 
 from types import SimpleNamespace
