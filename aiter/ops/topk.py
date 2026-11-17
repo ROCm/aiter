@@ -1286,7 +1286,7 @@ def _top_k_per_row_decode_fake(*args, **kwargs) -> None:
     return
 
 
-@_route(op="top_k_per_row_decode", version=1, fake=_top_k_per_row_decode_fake)
+@_route(op="top_k_per_row_decode", version=2, fake=_top_k_per_row_decode_fake)
 def top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
@@ -1303,8 +1303,9 @@ def top_k_per_row_decode(
     row_starts: torch.Tensor | None = None,
     plane_width: int | None = None,
 ) -> None:
-    """Per-row top-k (decode). Always uses the one-block kernel; the scratch
-    workspace is allocated + cached on the Python side and passed in, so the C++
+    """Per-row top-k (decode). `decode_backend_for_call` picks the kernel: the
+    one-block kernel, or a FlyDSL kernel on shapes where it is measured faster.
+    Scratch is allocated and cached on the Python side and passed in, so the C++
     side never allocates device scratch.
 
     When stable=True, the deterministic ascending-ordered, smallest-index
