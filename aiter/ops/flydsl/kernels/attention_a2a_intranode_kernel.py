@@ -579,6 +579,7 @@ def make_attention_a2a_kernel(
     partial_only=False,
     pc_reduce=False,
     spin_timeout_iters=0,
+    row_scaled=False,
 ):
     target_arch = flyc.get_backend().target.arch
     native_fp6 = (
@@ -1620,6 +1621,12 @@ def make_attention_a2a_kernel(
             scale_table = ptr_buf_tensor(addr_p2p_scale, fx.Int64)
             local_scale_base = buf_copy_load(scale_table, rank, fx.Int64)
             local_scales = ptr_buf_tensor(local_scale_base, fx.Float32)
+            if const_expr(row_scaled):
+                # Q/K launches carry no V partials; with row_scaled that slot holds the
+                # FP32 factor of each local row.
+                row_scales = ptr_buf_tensor(
+                    addr_p2p_partial, fx.Float32, num_records_bytes=seq_len * 4
+                )
             scale = fx.Float32(1.0)
             if const_expr(not v4_amax):
                 maximum = reduce_partial_amax(local_scales, dest_pe)
@@ -1670,6 +1677,7 @@ def make_attention_a2a_kernel(
                 seq0 = fx.Int32(seq0)
                 seqs = []
                 tiles = []
+                factors = []
                 # Preload the batch before compute to overlap load latency.
                 # sched_barrier(0) keeps the compiler from sinking loads into compute.
                 for load in range_constexpr(loads):
@@ -1703,11 +1711,17 @@ def make_attention_a2a_kernel(
                             )
                         ).to(fx.Float32)
                     )
+                    if const_expr(row_scaled):
+                        factors.append(buf_copy_load(row_scales, seq, fx.Float32))
                 fx.rocdl.sched_barrier(0)
                 current = state[0]
                 for load in range_constexpr(loads):
                     seq, valid = seqs[load]
                     values = tiles[load]
+                    if const_expr(row_scaled):
+                        values = values * fx.Vector.filled(
+                            vec, factors[load], fx.Float32
+                        )
                     if const_expr(codec == "e4m3" and hadamard):
                         # quantize_fp8_rotated materializes BF16 after normalized WHT;
                         # neither per-tensor recipe folds the MX Q multiplier.
@@ -2887,6 +2901,7 @@ def make_attention_a2a_jit(
     spin_timeout_iters=0,
     flush_l2=False,
     n_xcd=0,
+    row_scaled=False,
 ):
     split_v_exchange = needs_split_v_exchange(v_pack, seq_len)
     pc_partial = v4_output == "v" and codec == "e4m3_pc" and v4_amax
@@ -2908,6 +2923,7 @@ def make_attention_a2a_jit(
         "v4_amax": v4_amax,
         "fp8_fnuz": fp8_fnuz,
         "spin_timeout_iters": spin_timeout_iters,
+        "row_scaled": row_scaled,
     }
     # The partial launch precedes the payload launch so no payload block waits
     # on a block of its own launch.

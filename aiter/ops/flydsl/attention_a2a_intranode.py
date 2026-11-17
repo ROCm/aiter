@@ -127,6 +127,142 @@ def _scale_padding_size(role, codec, role_sequence, valid_kv_len, heads_local):
     return 0
 
 
+def _v4_amax_exchange(codecs, return_packed):
+    """Per role: whether its packed scale comes from a cross-rank amax exchange (FP32)."""
+    return tuple(
+        (return_packed and role == 2 and codec in ("e4m3", "e4m3_pc"))
+        or (return_packed and role in (0, 1) and codec in ("int8", "e4m3"))
+        for role, codec in enumerate(codecs)
+    )
+
+
+def _buffer_sizes(
+    codecs, quant, return_packed, world_size, shape, block_num, valid_kv_len
+):
+    """Payload, scale and scale-storage elements per role, and the role sequences."""
+    heads_local = shape[2] // world_size
+    seq_full = shape[1] * world_size
+    v4_amax_exchange = _v4_amax_exchange(codecs, return_packed)
+    role_sequences = (seq_full, valid_kv_len, valid_kv_len)
+    role_numels = tuple(
+        sequence * heads_local * shape[3] for sequence in role_sequences
+    )
+    kv_tiles = (valid_kv_len + 127) // 128
+    mxfp4_k_size = heads_local * kv_tiles * 8192
+    mxfp4_v_size = heads_local * kv_tiles * 128 * 64 + 64
+    fp6_k_payload_size = heads_local * kv_tiles * 17408 + 256
+    fp6_v_payload_size = mxfp6_v_raw_buffer_size(1, valid_kv_len, heads_local)
+    fp6_k_scale_size = valid_kv_len * heads_local * 4 + 64
+    if return_packed and any(codec == "mxfp4" for codec in codecs):
+        from aiter.ops.mha_v4_quant import (
+            mxfp4_k_raw_buffer_size,
+            mxfp4_v_raw_buffer_size,
+        )
+
+        mxfp4_k_size = mxfp4_k_raw_buffer_size(1, valid_kv_len, heads_local)
+        mxfp4_v_size = mxfp4_v_raw_buffer_size(1, valid_kv_len, heads_local)
+    if return_packed and any(codec == "mxfp6" for codec in codecs):
+        from aiter.ops.triton.quant.mxfp6_fmha_pack import fp6_k_raw_buffer_sizes
+
+        fp6_k_payload_size, fp6_k_scale_size = fp6_k_raw_buffer_sizes(
+            1, valid_kv_len, heads_local
+        )
+    payload_sizes = tuple(
+        _payload_size(
+            role,
+            codec,
+            return_packed,
+            quant,
+            role_numels[role],
+            mxfp4_k_size,
+            fp6_k_payload_size,
+            mxfp4_v_size,
+            fp6_v_payload_size,
+        )
+        for role, codec in enumerate(codecs)
+    )
+    scale_sizes = tuple(
+        _scale_size(
+            role,
+            codec,
+            per_tensor,
+            return_packed,
+            role_numels[role],
+            heads_local,
+            world_size,
+            block_num,
+            valid_kv_len,
+            fp6_k_scale_size,
+        )
+        for role, (codec, per_tensor) in enumerate(zip(codecs, v4_amax_exchange))
+    )
+    scale_storage_sizes = scale_sizes
+    if return_packed:
+        # Mirror mha_v4_quant's consumer-owned backing extent for speculative gathers.
+        padding_sizes = tuple(
+            _scale_padding_size(
+                role, codec, role_sequences[role], valid_kv_len, heads_local
+            )
+            for role, codec in enumerate(codecs)
+        )
+        scale_storage_sizes = tuple(
+            size + padding for size, padding in zip(scale_sizes, padding_sizes)
+        )
+    return payload_sizes, scale_sizes, scale_storage_sizes, role_sequences
+
+
+class PackedBufferSizes(NamedTuple):
+    """Bytes per role (Q, K, V) of the op's packed receive buffers on one rank."""
+
+    payload: tuple
+    # Scale storage, with the consumer's padding for speculative gathers.
+    scale_storage: tuple
+    # The part of the storage that the packed result exposes as the role's scale.
+    scale: tuple
+    # Tokens per role: the full sequence for Q, valid_kv_len for K and V.
+    sequence: tuple
+
+
+def packed_buffer_sizes(
+    codecs,
+    world_size,
+    seq_local,
+    heads,
+    valid_kv_len=None,
+    block_num=_DEFAULT_BLOCK_NUM,
+):
+    """Receive-buffer sizes of ``AttentionA2AIntraNodeOp(return_packed=True)``.
+
+    For producers of the same packed MHA-v4 buffers. ``codecs`` are the Q, K and V
+    codecs, ``seq_local`` the tokens per rank and ``heads`` the heads before the
+    exchange, of 128 channels each.
+    """
+    seq_full = seq_local * world_size
+    valid_kv_len = seq_full if valid_kv_len is None else valid_kv_len
+    payload, scale, storage, sequence = _buffer_sizes(
+        tuple(codecs),
+        True,
+        True,
+        world_size,
+        (1, seq_local, heads, 128),
+        block_num,
+        valid_kv_len,
+    )
+    per_tensor = _v4_amax_exchange(codecs, True)
+    heads_local = heads // world_size
+    return PackedBufferSizes(
+        payload=payload,
+        scale_storage=tuple(
+            size * (4 if fp32 else 1) for size, fp32 in zip(storage, per_tensor)
+        ),
+        scale=tuple(
+            heads_local * 128 * 4 if codec == "e4m3_pc" else 4 if fp32 else size
+            for codec, fp32, size in zip(codecs, per_tensor, scale)
+        ),
+        sequence=sequence,
+    )
+
+
 def _role_format(return_packed, role):
     return "qkv"[role] if return_packed else ""
 
@@ -248,10 +384,12 @@ class AttentionA2AIntraNodeOp:
         hadamard=None,
         valid_kv_len=None,
         inbox_memory="uncached",
+        row_scaled_qk=False,
         group,
     ):
         self._next_role = 0
         self._role_stream = None
+        self.row_scaled_qk = bool(row_scaled_qk)
         spin_timeout_iters = int(os.environ.get("AITER_A2A_SPIN_TIMEOUT_ITERS", "0"))
         if group is None:
             raise ValueError(
@@ -298,6 +436,10 @@ class AttentionA2AIntraNodeOp:
                 "mxfp6_p requires return_packed=True; BF16 return is unsupported"
             )
         self.return_packed = return_packed
+        if self.row_scaled_qk and not (
+            self.return_packed and self.codecs[0] in ("int8", "e4m3")
+        ):
+            raise ValueError("row_scaled_qk needs packed per-tensor int8 or e4m3 Q/K")
         self.v_pack = AttentionPack(v_pack)
         if self.codecs[2] == "mxfp6_p" and self.v_pack != AttentionPack.V_FOR_FP6_P:
             raise ValueError("mxfp6_p requires V_FOR_FP6_P")
@@ -384,11 +526,7 @@ class AttentionA2AIntraNodeOp:
         if numel % world_size != 0:
             raise ValueError("input numel must divide evenly across ranks")
         payload_dtype = torch.uint8 if self.quant else torch.bfloat16
-        v4_amax_exchange = tuple(
-            (self.return_packed and role == 2 and codec in ("e4m3", "e4m3_pc"))
-            or (self.return_packed and role in (0, 1) and codec in ("int8", "e4m3"))
-            for role, codec in enumerate(self.codecs)
-        )
+        v4_amax_exchange = _v4_amax_exchange(self.codecs, self.return_packed)
         split_v_exchange = needs_split_v_exchange(self.v_pack, shape[1])
         role_warp_counts = tuple(
             (
@@ -485,75 +623,17 @@ class AttentionA2AIntraNodeOp:
         # Every rank joins publish with its outcome instead, and all of them raise.
         error = None
         try:
-            role_sequences = (seq_full, valid_kv_len, valid_kv_len)
-            role_numels = tuple(
-                sequence * heads_local * shape[3] for sequence in role_sequences
-            )
-            kv_tiles = (valid_kv_len + 127) // 128
-            mxfp4_k_size = heads_local * kv_tiles * 8192
-            mxfp4_v_size = heads_local * kv_tiles * 128 * 64 + 64
-            fp6_k_payload_size = heads_local * kv_tiles * 17408 + 256
-            fp6_v_payload_size = mxfp6_v_raw_buffer_size(1, valid_kv_len, heads_local)
-            fp6_k_scale_size = valid_kv_len * heads_local * 4 + 64
-            if self.return_packed and any(codec == "mxfp4" for codec in self.codecs):
-                from aiter.ops.mha_v4_quant import (
-                    mxfp4_k_raw_buffer_size,
-                    mxfp4_v_raw_buffer_size,
-                )
-
-                mxfp4_k_size = mxfp4_k_raw_buffer_size(1, valid_kv_len, heads_local)
-                mxfp4_v_size = mxfp4_v_raw_buffer_size(1, valid_kv_len, heads_local)
-            if self.return_packed and any(codec == "mxfp6" for codec in self.codecs):
-                from aiter.ops.triton.quant.mxfp6_fmha_pack import (
-                    fp6_k_raw_buffer_sizes,
-                )
-
-                fp6_k_payload_size, fp6_k_scale_size = fp6_k_raw_buffer_sizes(
-                    1, valid_kv_len, heads_local
-                )
-            payload_sizes = tuple(
-                _payload_size(
-                    role,
-                    codec,
-                    self.return_packed,
+            payload_sizes, scale_sizes, scale_storage_sizes, role_sequences = (
+                _buffer_sizes(
+                    self.codecs,
                     self.quant,
-                    role_numels[role],
-                    mxfp4_k_size,
-                    fp6_k_payload_size,
-                    mxfp4_v_size,
-                    fp6_v_payload_size,
-                )
-                for role, codec in enumerate(self.codecs)
-            )
-            scale_sizes = tuple(
-                _scale_size(
-                    role,
-                    codec,
-                    per_tensor,
                     self.return_packed,
-                    role_numels[role],
-                    heads_local,
                     world_size,
+                    shape,
                     block_num,
                     valid_kv_len,
-                    fp6_k_scale_size,
-                )
-                for role, (codec, per_tensor) in enumerate(
-                    zip(self.codecs, v4_amax_exchange)
                 )
             )
-            scale_storage_sizes = scale_sizes
-            if self.return_packed:
-                # Mirror mha_v4_quant's consumer-owned backing extent for speculative gathers.
-                padding_sizes = tuple(
-                    _scale_padding_size(
-                        role, codec, role_sequences[role], valid_kv_len, heads_local
-                    )
-                    for role, codec in enumerate(self.codecs)
-                )
-                scale_storage_sizes = tuple(
-                    size + padding for size, padding in zip(scale_sizes, padding_sizes)
-                )
             for role, size in enumerate(payload_sizes):
                 _require_raw_buffer_extent(
                     f"{'qkv'[role]} output",
@@ -749,6 +829,7 @@ class AttentionA2AIntraNodeOp:
                 # any XCD; every XCD's L2 is written back before the flag.
                 "flush_l2": self.inbox_memory == "finegrained",
                 "n_xcd": self.n_xcd,
+                **({"row_scaled": True} if self.row_scaled_qk and i < 2 else {}),
             }
             for i in range(role_count)
         )
@@ -766,8 +847,11 @@ class AttentionA2AIntraNodeOp:
             for i, kwargs in enumerate(self._jit_kwargs)
         )
 
-    def submit_role(self, role, input, stream=None):
+    def submit_role(self, role, input, stream=None, row_scale=None):
         """Submit Q/K/V in order on one stream, retaining one parity for the trio.
+
+        With row_scaled_qk, Q and K take ``row_scale``, an FP32 [S_local] factor applied
+        to each local row before amax and quantization.
 
         Producers and prior consumers must be ordered before their side-stream
         reads/writes. The caller retains inputs until V completes on that stream.
@@ -785,6 +869,17 @@ class AttentionA2AIntraNodeOp:
             raise ValueError(f"expected {self.dtype} input with shape {self.shape}")
         if not input.is_cuda or not input.is_contiguous():
             raise ValueError("input must be a contiguous CUDA tensor")
+        if (row_scale is not None) != (self.row_scaled_qk and role < 2):
+            raise ValueError("row_scale goes with Q and K exactly when row_scaled_qk")
+        if row_scale is not None and (
+            row_scale.dtype != torch.float32
+            or tuple(row_scale.shape) != (self.shape[1],)
+            or not row_scale.is_contiguous()
+            or row_scale.device != input.device
+        ):
+            raise ValueError(
+                f"row_scale must be contiguous FP32 [{self.shape[1]}] on the input's device"
+            )
         torch_stream = torch.cuda.current_stream() if stream is None else stream
         if input.device != self.device or torch_stream.device != self.device:
             raise ValueError("input and stream must use the owning device")
@@ -824,7 +919,7 @@ class AttentionA2AIntraNodeOp:
                 else (
                     self.v_pc_partial.data_ptr()
                     if role == 2 and self.v_pc_partial is not None
-                    else 0
+                    else (0 if row_scale is None else row_scale.data_ptr())
                 )
             ),
             (
