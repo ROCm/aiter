@@ -94,7 +94,7 @@ def test_w_scale_layout(n=64, kb=16):
         ("gfx1250-strict", n32k4),
         ("gfx950", None),
     ):
-        with mock.patch.object(shuffle, "get_gfx", return_value=gfx):
+        with mock.patch.object(shuffle, "get_gfx_runtime", return_value=gfx):
             out = shuffle_mxfp8_bpreshuffle_scale(w_scale.view(dtypes.fp8_e8m0))
             for bad in ((48, 16), (64, 6)) if offset is not None else ():
                 try:

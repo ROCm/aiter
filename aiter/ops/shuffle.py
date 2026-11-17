@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from aiter.jit.utils.build_targets import is_gfx1250_family
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 
 
 def _moe_tile_shuffle(
@@ -71,10 +71,11 @@ def shuffle_mxfp8_bpreshuffle_scale(w_scale: torch.Tensor) -> torch.Tensor:
 
     The w_scale of ``gemm_a8w8_mxfp8_bpreshuffle`` (and of group32
     ``gemm_a8w8_blockscale(isBpreshuffled=True)``): 32x4 shuffled on the gfx1250
-    family (``shuffle_mxfp8fp4_scale`` bytes, same shape and dtype), row-major
-    and returned as is elsewhere (gfx950).
+    family (``shuffle_mxfp8fp4_scale`` bytes, same shape and dtype). On every
+    other arch (e.g. gfx950) it is row-major and the input is returned unchanged.
+    The arch is the running GPU's (``get_gfx_runtime()``), as in the GEMM dispatch.
     """
-    if not is_gfx1250_family(get_gfx()):
+    if not is_gfx1250_family(get_gfx_runtime()):
         return w_scale
     if w_scale.dim() != 2 or w_scale.shape[0] % 32 or w_scale.shape[1] % 4:
         raise ValueError(
