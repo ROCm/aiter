@@ -143,7 +143,8 @@ def test_all_reduce_rmsnorm_quant():
 
 
 # all_reduce_rmsnorm_per_token_quant: at hidden 6144 the bits of the split path,
-# other sizes within 1 bf16 ulp / 1 FP8 code of an fp32 reference.
+# other sizes within 1 bf16 ulp / 1 FP8 code of an fp32 reference. With quant, at
+# sizes that are multiples of 16, the bits of the HIP per-token quant of its own bf16 out.
 PT_HIDDEN = 6144
 PT_CASES = [(t, PT_HIDDEN) for t in (1, 3, 16, 64, 128, 341)]
 PT_CASES += [(t, h) for h in (2048, 6152, 16384) for t in (1, 64, (2 << 20) // h)]
@@ -193,7 +194,10 @@ def _pt_wrong(outs, xs, res, w, quant, rank, ar, gemma=True):
         y = (h * rstd * (w.float() + gemma)).bfloat16()
         bad = int((outs[1] != h.bfloat16()).sum())
         if quant:
-            scale = y.float().abs().amax(-1, keepdim=True) / 448.0
+            amax = y.float().abs().amax(-1, keepdim=True)
+            if res.shape[1] in (32, 64, 128):  # the HIP group path floors the amax
+                amax = amax.clamp_min(1e-10)
+            scale = amax / 448.0
             y = (y.float() / scale).clamp(-448, 448).to(outs[0].dtype)
             bad += int((~torch.isclose(outs[2], scale, rtol=2**-7, atol=0)).sum())
         bits = torch.int8 if quant else torch.int16
@@ -216,10 +220,20 @@ def _per_token_worker(rank, init_method):
 
     def check(name, tokens, hidden, seed, quant, edge=False, gemma=True):
         xs, res, w = _pt_inputs(tokens, hidden, seed, device, edge)
-        outs = all_reduce_rmsnorm_per_token_quant(
-            xs[rank], res, w, EPS, gemma, quant, *ar
-        )
-        if _pt_wrong(outs, xs, res, w, quant, rank, ar, gemma):
+        op = all_reduce_rmsnorm_per_token_quant
+        outs = op(xs[rank], res, w, EPS, gemma, quant, *ar)
+        bad = _pt_wrong(outs, xs, res, w, quant, rank, ar, gemma)
+        # The HIP per-token quant leaves the last 4 FP8 bytes of each row unwritten
+        # when hidden % 16 == 8 and hidden > 2048, so no bit check against it there.
+        if quant and hidden % 16 == 0:
+            y = op(xs[rank], res, w, EPS, gemma, False, *ar)[0]
+            q = aiter.get_hip_quant(aiter.QuantType.per_Token)
+            refs = q(y, quant_dtype=torch.float8_e4m3fn)  # out and scale
+            for o, r in zip((outs[0], outs[2]), refs):
+                bad += int(
+                    (o.view(torch.uint8) != r.view(o.shape).view(torch.uint8)).sum()
+                )
+        if bad:
             failures.append(f"rank {rank} {name} quant {quant}: wrong")
 
     try:
@@ -230,7 +244,10 @@ def _per_token_worker(rank, init_method):
         for quant in (True, False):
             for tokens, hidden in PT_CASES:
                 check(f"tokens {tokens} hidden {hidden}", tokens, hidden, tokens, quant)
-            check("edge rows", 16, PT_HIDDEN, 7, quant, edge=True)
+            for h in (PT_HIDDEN, 32, 64, 128):  # 32 to 128: the HIP group path
+                check(
+                    f"edge rows {h}", 16 if h == PT_HIDDEN else 256, h, 7, quant, True
+                )
             check("no gemma", 16, PT_HIDDEN, 8, quant, gemma=False)
         # After plain calls with a partial last chunk, the 2 chunks a wave receives
         # have other call numbers.

@@ -15,10 +15,11 @@ Candidates, all with the same (out, residual_out), and the scale with FP8 (-q 1)
                  route below 4 MiB before the Lamport kernel
   rccl+norm      RCCL allreduce + rmsnorm2d_fwd_with_add (+ per-token quant)
 
-Correctness: every candidate against a torch reference, and the Lamport kernel
-bit for bit against car_fused (two NaNs count as equal); with FP8 also
-lamport+quant, and the bf16/fp16 output of emit_bf16. A second table runs one
-mixed sequence per TP on the one shared inbox: row widths and row counts change
+Correctness: every candidate against a torch reference (an error ratio of 5%,
+checkAllclose's tol_err_ratio, fails), and the Lamport kernel bit for bit
+against car_fused (two NaNs count as equal); with FP8 also lamport+quant, and
+the bf16/fp16 output of emit_bf16. A second table runs one mixed sequence per TP
+on the one shared inbox: row widths and row counts change
 call to call (block a row and cluster shapes), bf16 and FP8 calls alternate,
 0xffff is injected now and then, the odd ranks hold the input, residual and
 weight off 16B alignment (every rank must still take the Lamport kernel), and a
@@ -427,8 +428,10 @@ def main():
                 pd.DataFrame(mixed).to_markdown(index=False),
             )
         bad += [r for r in rows if r["lamport bitdiff"] > 0]
+        # an error ratio at checkAllclose's tol_err_ratio fails, as it does there
+        bad += [r for r in rows if any(r[k] >= 0.05 for k in r if k.endswith(" err"))]
         bad += [r for r in mixed if r["max bitdiff"] > 0]
-    assert not bad, f"the Lamport kernel differs from car_fused: {bad}"
+    assert not bad, f"off the reference, or the Lamport kernel off car_fused: {bad}"
 
 
 if __name__ == "__main__":

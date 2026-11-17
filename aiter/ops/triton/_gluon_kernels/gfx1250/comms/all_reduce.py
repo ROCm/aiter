@@ -451,9 +451,17 @@ def _receive_norm(
         top = gl.maximum(top, gl.maximum(gl.abs(q[2]), gl.abs(q[3])))
         top = gl.maximum(top, gl.maximum(gl.abs(q[4]), gl.abs(q[5])))
         top = gl.maximum(gl.max(gl.max(top, axis=1), axis=0), 0.0)  # max is exact
+        # Hidden 32, 64 and 128 take the group path of dynamic_per_token_scaled_quant:
+        # amax floored at kAmaxFloor (1e-10) and an IEEE reciprocal of the scale.
+        GROUP: gl.constexpr = HIDDEN == 32 or HIDDEN == 64 or HIDDEN == 128
+        if GROUP:
+            top = gl.maximum(top, 1e-10)
         row_scale = top * (1.0 / 448.0)  # 448 is the fp8 maximum
         gl.store(scale + row, row_scale)
-        inv = _asm("v_rcp_f32", row_scale)
+        if GROUP:
+            inv = gl.div_rn(gl.full([], 1.0, gl.float32), row_scale)
+        else:
+            inv = _asm("v_rcp_f32", row_scale)
         for j in gl.static_range(6):
             v = gl.clamp(q[j] * inv, -448.0, 448.0).to(gl.float8e4nv)
             gl.amd.cdna5.buffer_store(v, out, at[j], mask=masks[j])
