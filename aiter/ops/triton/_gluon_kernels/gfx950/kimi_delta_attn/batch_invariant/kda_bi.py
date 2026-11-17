@@ -85,6 +85,22 @@ def _add(a, b):
     return a + b
 
 
+@constexpr_function
+def scan_layout(num_warps):
+    """[64, 128] with all 64 rows of a column in one thread: the in-chunk cumsum is a
+    sequential sum in row order."""
+    return gl.BlockedLayout([BT, 1], [1, 64], [1, num_warps], [0, 1])
+
+
+@gluon.jit
+def _gate_cumsum(gate, num_warps: gl.constexpr):
+    """In-chunk gate cumsum in log2 units, row by row: G_p = G_(p-1) + gate_p / ln 2 with
+    G_(-1) = 0, in fp32 (a decode step adds one row to the cached G_(p-1)). gate is a
+    [64, 128] tile in tile_layout; so is the result."""
+    g = gl.convert_layout(gate * RCP_LN2, scan_layout(num_warps))
+    return gl.convert_layout(gl.associative_scan(g, 0, _add), tile_layout(num_warps))
+
+
 @gluon.jit
 def _l2norm(x):
     """x / sqrt(sum(x^2) + eps) per row, rounded to bf16."""
@@ -366,7 +382,7 @@ def _intra_tile(
     x = x + gl.expand_dims(gl.load(DT_BIAS + cols).to(gl.float32), 0)
     gate = lower_bound / (1.0 + gl.exp(-(gl.exp(a_log) * x)))
     gate = gl.where(m, gate, 0.0)
-    gcum = gl.associative_scan(gate, 0, _add) * RCP_LN2
+    gcum = _gate_cumsum(gate, num_warps)
     g_last = gl.sum(gl.where(gl.expand_dims(rows == n - 1, 1), gcum, 0.0), axis=0)
     gl.store(GLAST + cols, g_last)
     off_o = r64 * s_out + c2

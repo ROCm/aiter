@@ -24,7 +24,7 @@ from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config
 __all__ = ["BI_CONTRACT_VERSION", "kda_bi_fwd"]
 
 # Bump when a change can change the output bits; callers compare it at startup.
-BI_CONTRACT_VERSION = 1
+BI_CONTRACT_VERSION = 2
 CHUNK = 64
 HEAD_DIM = 128
 _LAUNCH = ("num_warps",)

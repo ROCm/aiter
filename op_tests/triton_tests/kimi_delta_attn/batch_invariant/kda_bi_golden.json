@@ -1,17 +1,17 @@
 {
-  "contract_version": 1,
+  "contract_version": 2,
   "gfx950": {
     "T256": {
-      "o": "94ecad96384318f821fd1dcc9f31e269367db61c869eee2f8faf13bb6526f611",
-      "final_state": "0309a9c0f12833a5ae3e9dcb0b6f0881fd95f719d91559bff1ae1adf6575bada"
+      "o": "f7b433e12a960f5aa39b1ad598ac128a8a91a0d881ed026399947cb37e91a24a",
+      "final_state": "5644e25cb9ba5c870b0933470ae0599b12ffe0c50d5d294a1b589b3bc21998bb"
     },
     "packed": {
-      "o": "e720e78e81ac71de33bca12b50f9f260221f392eb2bcaed391b73faf17b497d0",
-      "final_state": "9af5296b2427ff7f8fd6246395b64c90c837d71e681fa3bf3fac0b9093188a1c"
+      "o": "e9c22a704443d14dd1889617c2274f9db525e76a918bff3a377a2732322a78e2",
+      "final_state": "49be90a5cac57b64e5ede786493e8001a2f08389e2eb00a69b47e224775a436b"
     },
     "init_state": {
-      "o": "8c3c160910f2e72a0318b1d022fca80286e43b965176c61a3ce12ca05a548adc",
-      "final_state": "f7d345cd9f90d31917891e7368861100af6fe742346fb659a70de7d0b1d6e248"
+      "o": "dc515796c4e80a34f42b6256be0a9b511d0da7648e95ab684c94f7f6d0dab0fa",
+      "final_state": "a63296c599674bedd4b4e023b16bf659eeb82c5e54c1b7f5467b2f90f24f9453"
     }
   }
 }
