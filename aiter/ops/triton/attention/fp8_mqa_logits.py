@@ -25,6 +25,7 @@ if TRITON_GE_36:
         elif arch in ("gfx1250", "gfx1250-strict"):
             from aiter.ops.triton._gluon_kernels.gfx1250.attention.fp8_mqa_logits import (
                 _gluon_fp8_mqa_logits_kernel,
+                _gluon_fp8_mqa_logits_rowgroup_kernel,
             )
     except Exception:  # noqa: BLE001
         _gluon_fp8_mqa_logits_kernel = None
@@ -101,6 +102,8 @@ def _gfx1250_launch_config(seq_len_kv: int) -> dict:
     configs/gfx1250/gluon/attention/fp8_mqa_logits/DEFAULT.json buckets by KV length
     (KV_LEQ_<n>, then "any"): the host only knows seq_len and seq_len_kv, not the
     per-row [start, end) ranges. Without the table, keep the previous fixed launch.
+    A row may carry a "rowgroup" entry (BLOCK_M, BLOCK_KV, NUM_WARPS, WARPS_M,
+    waves_per_eu): the row-group kernel, used when the chunk has >= BLOCK_M rows.
     """
     cfg = dict(
         BLOCK_KV=128,
@@ -377,6 +380,44 @@ def fp8_mqa_logits(
             grid = ((seq_len + block_m - 1) // block_m, num_kv_splits)
         else:
             cfg = _gfx1250_launch_config(seq_len_kv)
+            rg = cfg.get("rowgroup")
+            # The row-group kernel walks the union of a block's row ranges and writes
+            # it whole, so it needs clean_logits=False (out-of-window = unspecified).
+            if rg and seq_len >= rg["BLOCK_M"] and not clean_logits and not packed:
+                # Row-group kernel: BLOCK_M rows share each K tile (see the kernel).
+                _gluon_fp8_mqa_logits_rowgroup_kernel[
+                    (triton.cdiv(seq_len, rg["BLOCK_M"]),)
+                ](
+                    Q,
+                    KV,
+                    kv_scales,
+                    weights,
+                    cu_starts,
+                    cu_ends,
+                    logits,
+                    seq_len=seq_len,
+                    seq_len_kv=seq_len_kv,
+                    NUM_HEADS=num_heads,
+                    HEAD_SIZE=head_size,
+                    stride_q_s=stride_q_s,
+                    stride_q_h=stride_q_h,
+                    stride_q_d=stride_q_d,
+                    stride_kv_s=stride_kv_s,
+                    stride_kv_d=stride_kv_d,
+                    stride_w_s=stride_w_s,
+                    stride_w_h=stride_w_h,
+                    stride_logits_s=stride_logits_s,
+                    stride_logits_k=stride_logits_k,
+                    BLOCK_M=rg["BLOCK_M"],
+                    BLOCK_KV=rg["BLOCK_KV"],
+                    NUM_WARPS=rg["NUM_WARPS"],
+                    WARPS_M=rg["WARPS_M"],
+                    USE_BUFFER_LOAD=use_buffer_load,
+                    USE_BUFFER_STORE=use_buffer_store,
+                    num_warps=rg["NUM_WARPS"],
+                    waves_per_eu=rg["waves_per_eu"],
+                )
+                return logits
             loop_variant = cfg["LOOP_VARIANT"]
             waves_per_eu = cfg["waves_per_eu"]
             num_chains = cfg["NUM_CHAINS"] if USE_FOLDED_REDUCTION else 0
