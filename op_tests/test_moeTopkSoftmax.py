@@ -390,6 +390,7 @@ def test_grouped_topk_stable(
     bias_dtype=None,
     strided_input=False,
     ref_experts=None,
+    unaligned_input=False,
 ):
     mode_id = {"biased": 0, "sigmoid": 1, "softmax": 2}[mode]
     pattern_id = {
@@ -454,6 +455,12 @@ def test_grouped_topk_stable(
         run_gating.copy_(gating)
     if bias_dtype is not None:
         run_bias = bias.to(bias_dtype)
+    if unaligned_input:
+        # One element past an aligned base, with a pitch of whole quads.
+        flat = torch.empty(token * (expert + 4) + 1, dtype=dtype)
+        run_gating = flat[1:].view(token, expert + 4)[:, :expert]
+        run_gating.copy_(gating)
+        run_bias = torch.cat([run_bias.new_zeros(1), run_bias])[1:]
 
     def make_output(dtype):
         if strided_output:
@@ -1110,6 +1117,14 @@ ref260_cases = [
     (64, 128, 8, dtypes.bf16, "biased", True, "forty_way_tie", False),
     (64, 252, 8, dtypes.bf16, "softmax", True, "random", False),
 ]
+# Logits and bias one element past an aligned base still take the multi-wave
+# kernel, which reads them with unaligned vector loads; the last case takes its
+# fallback, which reloads the row.
+unaligned_cases = [
+    ((160, 896, 17, dtypes.bf16, "biased", True, "random", False), dtypes.fp32),
+    ((64, 512, 8, dtypes.bf16, "biased", True, "forty_way_tie", False), None),
+    ((1, 896, 17, dtypes.bf16, "biased", True, "sixteen_way_tie", False), None),
+]
 df = pd.DataFrame(
     [test_grouped_topk_stable(*case) for case in stable_cases]
     + [
@@ -1117,6 +1132,10 @@ df = pd.DataFrame(
         for case in fp32_bias_cases
     ]
     + [test_grouped_topk_stable(*case, ref_experts=260) for case in ref260_cases]
+    + [
+        test_grouped_topk_stable(*case, bias_dtype=bias_dtype, unaligned_input=True)
+        for case, bias_dtype in unaligned_cases
+    ]
 )
 aiter.logger.info(
     "moeTopkSoftmax_reg_stable summary (markdown):\n%s",

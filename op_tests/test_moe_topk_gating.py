@@ -410,7 +410,7 @@ def bench_biased_grouped_sigmoid(
     hip_ids = torch.empty_like(triton_ids)
 
     def run_triton():
-        # biased_grouped_topk sends aligned rows to the HIP kernel except at E=900.
+        # biased_grouped_topk sends these rows to the HIP kernel except at E=900.
         exact_sigmoid_biased_topk(
             gating_output,
             correction_bias,

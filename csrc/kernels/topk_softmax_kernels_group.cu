@@ -48,7 +48,7 @@
 // module_moe_asm device codegen; keep the shapes this path is meant to hit,
 // fall back to LDS for the rest. Both lists are instantiated for every target,
 // so the wave32 one reuses wave64 instantiations only: E=384, 768 and 896 would
-// need 12, 24 and 28 of their own, and aligned BF16 rows of E=768 and 896
+// need 12, 24 and 28 of their own, and BF16 rows of E=768 and 896 (pitch % 4 == 0)
 // take topk_reg_mw_kernel. Wave32 builds leave the EPLs only wave64 launches
 // empty. Override by defining AITER_TOPK_REG_LAUNCH_EPLS (wave64) or
 // AITER_TOPK_REG_LAUNCH_EPLS_W32 (wave32) before include.
@@ -1160,7 +1160,8 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
 // topk_reg_kernel runs a row per wave: at decode that is a few dozen waves on
 // a 256-CU part, each walking E / 32 experts per lane through long serial
 // chains. Here a row gets a workgroup of E / 128 waves and every lane owns
-// four consecutive experts (one vector load each for logits and bias):
+// four consecutive experts (one vector load each for logits and bias, at any
+// alignment):
 //
 //   1. sigmoid + bias for the lane's four experts, the lane maximum to LDS;
 //   2. barrier; group g is lane g of every wave (E / 32 experts), so every
@@ -1287,6 +1288,19 @@ __device__ __forceinline__ void wave32_rank_desc_dpp2(const uint64_t (&key)[2], 
     }
 }
 
+// Elements 4 * quad .. 4 * quad + 3 of p, with p aligned to one element only.
+// gfx1250 reads unaligned global memory (the compiler assumes the
+// unaligned-access mode ROCm sets), so this is still one global_load_b64 or
+// _b128, the instruction a vector-typed load of an aligned p gives.
+template <typename T>
+__device__ __forceinline__ opus::vector_t<typename aiter::hip2opus<T>::type, 4>
+load_quad(const T* p, int quad)
+{
+    opus::vector_t<typename aiter::hip2opus<T>::type, 4> v;
+    __builtin_memcpy(&v, p + 4 * quad, sizeof(v));
+    return v;
+}
+
 // Top-16 routing plus the extra candidate of HERD's top-(K + 1). The
 // renormalization reads this many lanes on every row.
 constexpr int kTopKRegMwMaxTopK = 17;
@@ -1337,8 +1351,8 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
     // Loads go out before the pad-row check so their latency overlaps its
     // scalar load; a pad row's slice is still allocated.
     const DTYPE_I* row = gating_output + token * stride_gating;
-    const vec_i g      = reinterpret_cast<const vec_i*>(row)[quad];
-    const vec_b b      = reinterpret_cast<const vec_b*>(correction_bias)[quad];
+    const vec_i g      = load_quad(row, quad);
+    const vec_b b      = load_quad(correction_bias, quad);
     if(__builtin_expect(is_pad_row(num_valid_rows, token), 0))
     {
         write_pad_row(topk_weights + token * stride_tk,
@@ -1483,8 +1497,8 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
         for(int r = 0; r < kWaves; ++r)
         {
             const int q    = r * W + lane;
-            const vec_i gr = reinterpret_cast<const vec_i*>(row)[q];
-            const vec_b br = reinterpret_cast<const vec_b*>(correction_bias)[q];
+            const vec_i gr = load_quad(row, q);
+            const vec_b br = load_quad(correction_bias, q);
 #pragma unroll
             for(int i = 0; i < 4; ++i)
             {
@@ -2354,7 +2368,7 @@ static bool topk_reg_w32_arch_ok()
 }
 
 // Shape and dtype contract of topk_reg_mw_kernel, for the current device. The
-// row pitch and the pointer alignment are the caller's to check.
+// row pitch is the caller's to check; any pointer alignment is fine.
 static bool
 topk_reg_mw_args_ok(int64_t num_experts, int64_t topk, int64_t gating_dtype, int64_t bias_dtype)
 {
@@ -2712,17 +2726,15 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
     }
 
     // wave32 without a group filter, E = 128 * waves: a row per workgroup,
-    // four experts per lane, read as naturally aligned four-element vectors
-    // from the BF16 logits and the BF16 or FP32 bias.
+    // four experts per lane, one vector load each from the BF16 logits and the
+    // BF16 or FP32 bias at any alignment. The pitch must be whole quads.
     // biased_grouped_topk in aiter/ops/topk.py asks topk_reg_mw_supports, the
-    // same topk_reg_mw_args_ok, and checks the pitch and alignment below itself.
+    // same topk_reg_mw_args_ok, and checks the pitch below itself.
     const int mw_waves      = num_experts / 128;
     const bool mw_bias_fp32 = correction_bias.dtype() == AITER_DTYPE_fp32;
     if(topk_grp == num_expert_group &&
        topk_reg_mw_args_ok(num_experts, topk, gating_output.dtype(), correction_bias.dtype()) &&
-       stride_gating % 4 == 0 &&
-       reinterpret_cast<uintptr_t>(gating_output.data_ptr()) % 8 == 0 &&
-       reinterpret_cast<uintptr_t>(correction_bias.data_ptr()) % (mw_bias_fp32 ? 16 : 8) == 0)
+       stride_gating % 4 == 0)
     {
         if(num_tokens == 0)
             return;

@@ -116,6 +116,30 @@ def _reg_mw_supports_cached(
     )
 
 
+@torch.compiler.assume_constant_result
+def _reg_mw_supports_const(
+    num_experts: int,
+    topk: int,
+    gating_dtype: torch.dtype,
+    bias_dtype: torch.dtype,
+    device: int,
+) -> bool:
+    """_reg_mw_supports_cached() as a constant of a traced graph. Dynamo would
+    otherwise trace through the cache into the op, whose fake returns no
+    answer, and so would send every compiled call to Triton."""
+    return _reg_mw_supports_cached(num_experts, topk, gating_dtype, bias_dtype, device)
+
+
+def _as_static(size, values) -> int:
+    """size as the Python int it equals in values, or -1. Under
+    torch.compile(dynamic=True) a size is a SymInt, which
+    assume_constant_result cannot take; each comparison here guards on it."""
+    for value in values:
+        if size == value:
+            return value
+    return -1
+
+
 def _gfx1250_reg_mw_fits(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -126,29 +150,20 @@ def _gfx1250_reg_mw_fits(
     multi-wave kernel of biased_grouped_topk_hip, which beats the Triton one.
 
     The shape and dtype terms come from topk_reg_mw_supports, the same test the
-    HIP entry applies; the pitch and alignment terms below are the rest of it.
-
-    Compiled calls stay on the Triton kernel: data_ptr() breaks a Dynamo graph.
-    So under torch.compile a traced call runs Triton and an eager call of the
-    same shape runs HIP. Their weights can differ by a few ULPs (the HERD-width
-    test in test_topk_gating.py allows 1e-6), and so, in principle, can a pick
-    between two scores that close. In rows with fewer
-    finite scores than topk, the slots past the finite ones differ too: Triton
-    fills them with the remaining experts in tie order, weighted by their own
-    sigmoid scores, and HIP with unused ids from 0..31 at weight 0."""
+    HIP entry applies; the pitch term below is the rest of it. The kernel's
+    loads take any pointer alignment, so the test reads no data_ptr(), and a
+    call traced by torch.compile picks the same kernel as an eager call of the
+    same tensors."""
     return (
-        not torch.compiler.is_compiling()
-        and _reg_mw_supports_cached(
-            gating_output.shape[1],
-            topk_ids.shape[1],
+        _reg_mw_supports_const(
+            _as_static(gating_output.shape[1], sorted(_GFX1250_SIGMOID_EXPERTS)),
+            _as_static(topk_ids.shape[1], sorted(_GFX1250_SIGMOID_TOPKS)),
             gating_output.dtype,
             correction_bias.dtype,
             gating_output.device.index,
         )
-        # Rows and bias are read as 4-element vectors.
+        # Every row is then aligned as the first one is.
         and gating_output.stride(0) % 4 == 0
-        and gating_output.data_ptr() % (4 * gating_output.element_size()) == 0
-        and correction_bias.data_ptr() % (4 * correction_bias.element_size()) == 0
         # The HIP op writes both outputs with the row stride of topk_ids.
         and topk_weights.stride(0) == topk_ids.stride(0)
     )
