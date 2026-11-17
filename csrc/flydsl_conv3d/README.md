@@ -127,7 +127,9 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.cs
    row's config timed on an MI350X (gfx950, 256 CU) the way the table's `us`
    was -- the kernel alone, operands prepared once, 100 warm-up launches, then
    the median of 6 groups of 40 back-to-back launches, median over rounds.
-   `us`, `tflops` and `bw` stay MI355X numbers. The column is a record only:
+   `us`, `tflops` and `bw` are MI350X numbers for the eight stride-1 rows (the
+   T=1 keys) and MI355X numbers for the three stride-2 downsampler rows. The
+   column is a record only:
    the lookup, the AOT pass and the tuner do not read it, and a re-tune keeps
    the old value, so re-measure it after one. The config merge carries it
    through and fills it with 0 for the other tables' rows.
