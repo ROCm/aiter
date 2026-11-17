@@ -240,7 +240,13 @@ jobs:
             fi
           fi
 
-          docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            GPU_FLAG="$(cat /etc/podinfo/gha-render-devices)"
+          else
+            GPU_FLAG="--device=/dev/kfd --device=/dev/dri --group-add video"
+          fi
+
+          docker run --rm ${GPU_FLAG} \
               --ulimit core=0:0 --ulimit memlock=-1:-1 --ulimit stack=67108864 --cap-add=SYS_PTRACE \
               --network=host --security-opt seccomp=unconfined --shm-size=16G \
               $MODEL_MOUNT \
