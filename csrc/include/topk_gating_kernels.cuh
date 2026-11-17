@@ -101,11 +101,15 @@ inline bool topk_gating_prefer_optn_e128()
 }
 
 // The single-wave kernel and its dispatch are measured on gfx1250 only; other
-// wave32 targets (gfx1201, ...) keep the multiwave / reg kernels.
+// wave32 targets (gfx1201, ...) keep the multiwave / reg kernels. Cached per
+// device: the kernel needs 32-lane waves, so a process driving gfx1250 and a
+// wave64 GPU must not reuse one device's answer for the other.
 inline bool topk_gating_vwave_arch()
 {
-    static const bool v = (get_gpu_arch() == "gfx1250");
-    return v;
+    static SynchronizedCache<int, bool> cache;
+    int device = -1;
+    HIP_CALL(hipGetDevice(&device));
+    return cache.get_or_create(device, []() { return get_gpu_arch() == "gfx1250"; });
 }
 
 // E=512 prefill_n is measured on gfx942 and gfx950. Other archs (gfx1201,
