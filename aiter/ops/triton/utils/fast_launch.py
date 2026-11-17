@@ -140,6 +140,11 @@ class _FastLaunch:
 
     def __getitem__(self, grid):
         def launch(*args, **kwargs):
+            # Before anything else: Dynamo traces this function, and branching
+            # on the hooks, the cache or any other state of this wrapper is an
+            # error under fullgraph=True.
+            if torch.compiler.is_compiling():
+                return self._kernel[grid](*args, **kwargs)
             if self._disabled or _BYPASS or not self._plain():
                 return self._kernel[grid](*args, **kwargs)
             device = driver.active.get_current_device()
@@ -193,7 +198,6 @@ class _FastLaunch:
             or knobs.runtime.add_stages_inspection_hook is not None
             or _hooked(knobs.runtime.launch_enter_hook)
             or _hooked(knobs.runtime.launch_exit_hook)
-            or torch.compiler.is_compiling()
         )
 
     def _globals_changed(self) -> bool:

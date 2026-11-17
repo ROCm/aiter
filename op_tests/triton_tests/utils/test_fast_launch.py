@@ -279,7 +279,7 @@ def test_a_launch_hook_sees_every_launch():
     assert seen == [1, 1, 1]
 
 
-@pytest.mark.parametrize("case", ["pre_run_hook", "stages_hook", "compiling"])
+@pytest.mark.parametrize("case", ["pre_run_hook", "stages_hook"])
 def test_launches_that_need_the_ordinary_path_take_it(monkeypatch, case):
     wrapped = fast_launch.fast_launch(_axpy_kernel)
     x, y, out = _axpy_inputs(256)
@@ -290,17 +290,40 @@ def test_launches_that_need_the_ordinary_path_take_it(monkeypatch, case):
         monkeypatch.setattr(
             _axpy_kernel, "pre_run_hooks", [lambda *a, **k: calls.append(1)]
         )
-    elif case == "stages_hook":
+    else:
         monkeypatch.setattr(
             knobs.runtime, "add_stages_inspection_hook", lambda: ("key", "hash")
         )
-    else:
-        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     assert not wrapped._plain()
     if case == "pre_run_hook":
         for _ in range(2):
             _axpy(wrapped, x, y, out)
         assert calls == [1, 1]
+
+
+@pytest.mark.parametrize("backend", ["eager", "inductor"])
+@pytest.mark.parametrize("by_specialization", [False, True])
+@pytest.mark.parametrize("style", ["positional", "mixed", "callable_grid"])
+def test_fullgraph_compile_takes_the_ordinary_path(backend, by_specialization, style):
+    """Under torch.compile the wrapper must hand the launch to Triton before it
+    reads any state Dynamo cannot branch on, even with an entry cached."""
+    torch._dynamo.reset()
+    wrapped = fast_launch.fast_launch(_axpy_kernel, by_specialization=by_specialization)
+    x, y, out = _axpy_inputs(1000, seed=1)
+    _axpy(wrapped, x, y, out, style=style)
+
+    def step(x, y):
+        out = _axpy(wrapped, x, y, torch.empty_like(x), style=style)
+        return out * 2.0
+
+    compiled = torch.compile(step, backend=backend, fullgraph=True)
+    with fast_launch.recording() as misses:
+        got = compiled(x, y)
+    assert misses == [], "a traced launch must not reach the cache"
+    with fast_launch.bypassed():
+        want = step(x, y)
+    assert torch.equal(got, want)
+    torch._dynamo.reset()
 
 
 def test_a_changed_global_raises_as_triton_does(monkeypatch):
