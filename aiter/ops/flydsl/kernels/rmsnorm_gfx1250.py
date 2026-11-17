@@ -18,6 +18,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, ReductionOp, T
 
 from .mega_moe_tp.common import bld, bst, lds_ld, lds_st, rsrc
+from .tensor_shim import _preload_compiled, _run_compiled
 
 _WAVE = 32
 _VEC = 8  # 8 BF16 values -=> one 128-bit load/store.
@@ -195,6 +196,25 @@ def build_rmsnorm_gfx1250(hidden: int, row_map: bool = False):
     return launch
 
 
+def preload_rmsnorm_gfx1250(hidden: int, row_map: bool = False):
+    """Compile and load the RMSNorm kernel for AOT."""
+    return _preload_compiled(
+        build_rmsnorm_gfx1250(hidden, row_map),
+        0,  # input_addr
+        0,  # output_addr
+        0,  # weight_addr
+        0,  # row_map_addr
+        0,  # num_valid_tokens_addr
+        1,  # rows
+        hidden,  # input_row_stride
+        hidden,  # output_row_stride
+        1,  # routes_per_token
+        1e-6,  # epsilon
+        0.0,  # gain_center
+        fx.Stream(None),
+    )
+
+
 def rmsnorm_flydsl_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -248,7 +268,8 @@ def rmsnorm_flydsl_out(
     if rows == 0:
         return
 
-    build_rmsnorm_gfx1250(hidden, row_map is not None)(
+    _run_compiled(
+        build_rmsnorm_gfx1250(hidden, row_map is not None),
         input.data_ptr(),
         out.data_ptr(),
         weight.data_ptr(),
