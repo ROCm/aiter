@@ -1914,8 +1914,19 @@ def test_unified_attn_split_reduce_oneshot_k4v8(
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
 
 
+def _fp4pt_v(inp):
+    """A8K4V4PT: make_inputs' value cache as an fp4pt V cache, its fp32 reference, and the
+    v_descale of 1 the kernels take with it."""
+    from op_tests.triton_tests.attention.test_unified_attention_k4v4pt import (
+        fp4pt_quant_v_cache,
+    )
+
+    v, v_ref = fp4pt_quant_v_cache(inp["value_cache"])
+    return v, v_ref, torch.ones(1, dtype=torch.float32, device="cuda")
+
+
 @pytest.mark.parametrize("num_heads", [(16, 2), (8, 2)])
-@pytest.mark.parametrize("kv", ["k4v8", "fp8", "bf16"])
+@pytest.mark.parametrize("kv", ["k4v8", "k4v4pt", "fp8", "bf16"])
 @pytest.mark.parametrize("token_split", [False, True])
 @pytest.mark.parametrize(
     "seq_lens",
@@ -1938,11 +1949,11 @@ def test_unified_attn_split_reduce_oneshot_k4v8(
 def test_unified_attn_qpack_gfx1250(
     seq_lens, token_split: bool, kv: str, num_heads: tuple[int, int], monkeypatch
 ) -> None:
-    """gfx1250 3D kernel, A8K4V8 / fp8 / bf16, GQA 8 / 4 (2 kv heads, d 256, page 128):
+    """gfx1250 3D kernel, A8K4V8 / A8K4V4PT / fp8 / bf16, GQA 8 / 4 (2 kv heads, d 256, page 128):
     a token-split speculative-decode verify of several query blocks a sequence runs them
     as the warps of one workgroup over one copy of each KV tile (_GFX12_3D_QPACK),
     bitwise the output of one block a workgroup (every warp runs the per-row
-    instructions of a block), and for A8K4V8 within the reference's bound; without the
+    instructions of a block), and for A8K4V8 / A8K4V4PT within the reference's bound; without the
     token split, and for a ragged batch, the launch is the tuned one."""
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("gfx1250 Gluon kernels")
@@ -1975,14 +1986,17 @@ def test_unified_attn_qpack_gfx1250(
         fp8_kv=kv != "bf16",
         fp8_output=False,
         out_scale_value=1.0,
-        nvfp4_kv=kv == "k4v8",
+        nvfp4_kv=kv in ("k4v8", "k4v4pt"),
         nvfp4_v=False,
     )
     if kv == "bf16":
         k_shuf, v_shuf = shuffle_kv_cache(inp["key_cache"], inp["value_cache"])
     else:
         k_shuf, v_shuf = shuffle_kv_cache(inp["k_fp8"], inp["v_fp8"])
-    key_cache = inp["k_nvfp4"] if kv == "k4v8" else k_shuf
+    value_ref, v_descale = inp["value_ref"], inp["v_descale"]
+    if kv == "k4v4pt":
+        v_shuf, value_ref, v_descale = _fp4pt_v(inp)
+    key_cache = inp["k_nvfp4"] if kv in ("k4v8", "k4v4pt") else k_shuf
     kv_lens = inp["kv_lens"].clone()
     pad = torch.tensor([k == 0 for _, k in seq_lens], device=kv_lens.device)
     kv_lens[pad] = 0
@@ -2030,7 +2044,7 @@ def test_unified_attn_qpack_gfx1250(
             softcap=0,
             q_descale=inp["q_descale"],
             k_descale=inp["k_descale"],
-            v_descale=inp["v_descale"],
+            v_descale=v_descale,
             shuffled_kv_cache=True,
             equal_seqlen_q=equal_q,
             split_reduce=equal_q,
@@ -2054,12 +2068,12 @@ def test_unified_attn_qpack_gfx1250(
         assert on == off, on
     assert not packed.isnan().any()
     assert torch.equal(packed.view(torch.int16), single.view(torch.int16))
-    if kv != "k4v8" or pad.any():
+    if kv not in ("k4v8", "k4v4pt") or pad.any():
         return
     ref = ref_paged_attn(
         query=inp["query_ref"],
         key_cache=inp["key_ref"],
-        value_cache=inp["value_ref"],
+        value_cache=value_ref,
         query_lens=inp["query_lens"],
         kv_lens=inp["kv_lens"],
         block_tables=inp["block_tables"],
@@ -2068,7 +2082,7 @@ def test_unified_attn_qpack_gfx1250(
         soft_cap=None,
         q_descale=None,
         k_descale=inp["k_descale"],
-        v_descale=inp["v_descale"],
+        v_descale=v_descale,
         output_scale=None,
         out_dtype=torch.bfloat16,
     ).float()
@@ -2091,9 +2105,10 @@ def test_unified_attn_qpack_gfx1250(
         [(17, 23456), (4, 9000), (4, 130), (4, 5)],  # a ragged verify over 16 rows
     ],
 )
+@pytest.mark.parametrize("kv", ["k4v8", "k4v4pt"])
 @torch.inference_mode()
-def test_unified_attn_prefill_split_gfx1250(seq_lens, monkeypatch) -> None:
-    """gfx1250 3D kernel, A8K4V8 (16 q / 2 kv heads, d 256, page 128), token split on:
+def test_unified_attn_prefill_split_gfx1250(seq_lens, kv, monkeypatch) -> None:
+    """gfx1250 3D kernel, A8K4V8 / A8K4V4PT (16 q / 2 kv heads, d 256, page 128), token split on:
     a prefill chunk that the attn_3d entry routes to the 3D split takes the entry's
     PREFILL_SPLIT_* workgroups and KV split (_gfx12_prefill_split), within the
     reference's bound, as the decode token split's launch is."""
@@ -2126,6 +2141,9 @@ def test_unified_attn_prefill_split_gfx1250(seq_lens, monkeypatch) -> None:
         nvfp4_v=False,
     )
     v_shuf = shuffle_kv_cache(inp["k_fp8"], inp["v_fp8"])[1]
+    value_ref, v_descale = inp["value_ref"], inp["v_descale"]
+    if kv == "k4v4pt":
+        v_shuf, value_ref, v_descale = _fp4pt_v(inp)
     splits = []
     split_fn = module._gfx12_prefill_split
 
@@ -2160,7 +2178,7 @@ def test_unified_attn_prefill_split_gfx1250(seq_lens, monkeypatch) -> None:
             softcap=0,
             q_descale=inp["q_descale"],
             k_descale=inp["k_descale"],
-            v_descale=inp["v_descale"],
+            v_descale=v_descale,
             shuffled_kv_cache=True,
             backend="gluon",
         )
@@ -2174,7 +2192,7 @@ def test_unified_attn_prefill_split_gfx1250(seq_lens, monkeypatch) -> None:
     ref = ref_paged_attn(
         query=inp["query_ref"],
         key_cache=inp["key_ref"],
-        value_cache=inp["value_ref"],
+        value_cache=value_ref,
         query_lens=inp["query_lens"],
         kv_lens=inp["kv_lens"],
         block_tables=inp["block_tables"],
@@ -2183,7 +2201,7 @@ def test_unified_attn_prefill_split_gfx1250(seq_lens, monkeypatch) -> None:
         soft_cap=None,
         q_descale=None,
         k_descale=inp["k_descale"],
-        v_descale=inp["v_descale"],
+        v_descale=v_descale,
         output_scale=None,
         out_dtype=torch.bfloat16,
     ).float()
@@ -2209,9 +2227,10 @@ def test_unified_attn_prefill_split_gfx1250(seq_lens, monkeypatch) -> None:
     ],
 )
 @pytest.mark.parametrize("gate", [False, True])
+@pytest.mark.parametrize("kv", ["k4v8", "k4v4pt"])
 @torch.inference_mode()
-def test_unified_attn_prefill_2d_split_gfx1250(seq_lens, splits, gate, monkeypatch) -> None:
-    """gfx1250 2D kernel, A8K4V8 (16 q / 2 kv heads, d 256, page 128): a prefill that
+def test_unified_attn_prefill_2d_split_gfx1250(seq_lens, splits, gate, kv, monkeypatch) -> None:
+    """gfx1250 2D kernel, A8K4V8 / A8K4V4PT (16 q / 2 kv heads, d 256, page 128): a prefill that
     the attn_2d entry's SPLIT_* keys split (_gfx12_2d_split) writes per-split partials
     that reduce_splits_heads merges (with the output gate), within the reference's
     bound; ``splits`` forces the split count."""
@@ -2251,6 +2270,9 @@ def test_unified_attn_prefill_2d_split_gfx1250(seq_lens, splits, gate, monkeypat
         nvfp4_v=False,
     )
     v_shuf = shuffle_kv_cache(inp["k_fp8"], inp["v_fp8"])[1]
+    value_ref, v_descale = inp["value_ref"], inp["v_descale"]
+    if kv == "k4v4pt":
+        v_shuf, value_ref, v_descale = _fp4pt_v(inp)
     num_tokens = inp["q_fp8"].shape[0]
     output_gate = (
         torch.randn((num_tokens, num_heads[0] * head_size), dtype=torch.bfloat16, device="cuda")
@@ -2277,7 +2299,7 @@ def test_unified_attn_prefill_2d_split_gfx1250(seq_lens, splits, gate, monkeypat
         softcap=0,
         q_descale=inp["q_descale"],
         k_descale=inp["k_descale"],
-        v_descale=inp["v_descale"],
+        v_descale=v_descale,
         shuffled_kv_cache=True,
         backend="gluon",
         output_gate=output_gate,
@@ -2287,7 +2309,7 @@ def test_unified_attn_prefill_2d_split_gfx1250(seq_lens, splits, gate, monkeypat
     ref = ref_paged_attn(
         query=inp["query_ref"],
         key_cache=inp["key_ref"],
-        value_cache=inp["value_ref"],
+        value_cache=value_ref,
         query_lens=inp["query_lens"],
         kv_lens=inp["kv_lens"],
         block_tables=inp["block_tables"],
@@ -2296,7 +2318,7 @@ def test_unified_attn_prefill_2d_split_gfx1250(seq_lens, splits, gate, monkeypat
         soft_cap=None,
         q_descale=None,
         k_descale=inp["k_descale"],
-        v_descale=inp["v_descale"],
+        v_descale=v_descale,
         output_scale=None,
         out_dtype=torch.bfloat16,
     ).float()
