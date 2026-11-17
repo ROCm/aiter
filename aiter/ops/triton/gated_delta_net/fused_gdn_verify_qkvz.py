@@ -103,14 +103,13 @@ def fused_gdn_verify_mx32_supported(
     seqs: int,
 ) -> bool:
     """Whether ``fused_gdn_verify_qkvz(..., out_scale=...)`` (the 1x32 MXFP8 output) takes
-    this shape: it runs on ``_fused_gdn_verify_chunk`` only (not the token loop, nor the
-    experimental compact / matrix forms). Host-side only; nothing is launched."""
+    this shape: it runs on the chunk-form kernel and on its matrix form (with the split
+    and unrolled variants), not on the token loop nor the experimental compact form.
+    Host-side only; nothing is launched."""
     _, v_heads, head_k_dim, head_v_dim = checkpoint.shape
     if head_v_dim % 32 or (v_heads * head_v_dim) % 128:
         return False
     if os.environ.get("AITER_GDN_VERIFY_COMPACT", "0") == "1":
-        return False
-    if os.environ.get("AITER_GDN_VERIFY_MATRIX", "0") == "1":
         return False
     if seqs == 0:
         return True
@@ -199,7 +198,7 @@ def fused_gdn_verify_qkvz(
             followed by the standalone quant (per_group_quant_hip(group_size=32,
             scale_type=fp8_e8m0, scale_layout_m32k4=True), or per_1x32_mx_quant_hip for
             ``R < 32``). Rows of padded sequences, rows past ``tokens`` and the n32k4 pad
-            rows are not written. Chunk-form kernel only: check
+            rows are not written. Chunk-form kernel and its matrix form only: check
             ``fused_gdn_verify_mx32_supported`` first.
 
     Returns:
@@ -320,12 +319,17 @@ def fused_gdn_verify_qkvz(
                 tile_args = {**tile_args, "SPLIT": split, "Tickets": tickets}
                 grid_split, num_warps = split, split_warps
     if mx32:
-        if kernel is not _fused_gdn_verify_chunk:
+        if kernel not in (_fused_gdn_verify_chunk, _fused_gdn_verify_chunk_mat):
             raise ValueError(
-                "the 1x32 MXFP8 out is implemented in the chunk-form kernel only "
-                "(fused_gdn_verify_mx32_supported)"
+                "the 1x32 MXFP8 out is implemented in the chunk-form kernel and its "
+                "matrix form only (fused_gdn_verify_mx32_supported)"
             )
-        tile_args = {"OUT_MX32": True, "N32K4": scale_rows >= 32, "OutScale": out_scale}
+        tile_args = {
+            **tile_args,
+            "OUT_MX32": True,
+            "N32K4": scale_rows >= 32,
+            "OutScale": out_scale,
+        }
     kernel[(seqs * k_heads * grid_split,)](
         query_start_loc,
         slot_idx,

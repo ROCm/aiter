@@ -52,6 +52,33 @@ MS = [
 ]
 
 
+@pytest.fixture(
+    params=["chunk", "matrix", "matrix_8_waves_unroll", "matrix_8_waves_split"]
+)
+def kernel_variant(request, monkeypatch):
+    """The chunk kernel, its matrix form (AITER_GDN_VERIFY_MATRIX), and the matrix form
+    at 8 waves with the head products unrolled (AITER_GDN_VERIFY_UNROLL) or with the
+    value heads of a key head over two programs (AITER_GDN_VERIFY_SPLIT=2, which
+    the config takes at up to 8 sequences). Each is checked against its own bf16 out."""
+    for name in (
+        "AITER_GDN_VERIFY_MATRIX",
+        "AITER_GDN_VERIFY_CHUNK_WARPS",
+        "AITER_GDN_VERIFY_UNROLL",
+        "AITER_GDN_VERIFY_SPLIT",
+        "AITER_GDN_VERIFY_COMPACT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    if request.param != "chunk":
+        monkeypatch.setenv("AITER_GDN_VERIFY_MATRIX", "1")
+    if request.param.startswith("matrix_8_waves"):
+        monkeypatch.setenv("AITER_GDN_VERIFY_CHUNK_WARPS", "8")
+    if request.param.endswith("_unroll"):
+        monkeypatch.setenv("AITER_GDN_VERIFY_UNROLL", "1")
+    if request.param.endswith("_split"):
+        monkeypatch.setenv("AITER_GDN_VERIFY_SPLIT", "2")
+    return request.param
+
+
 def _scale_bytes(rows, cols):
     return (rows + 31) // 32 * 32 * (cols // 32)
 
@@ -78,7 +105,7 @@ def _reference(y):
 
 @pytest.mark.parametrize("extra_rows", [0, 5])
 @pytest.mark.parametrize("m", MS)
-def test_fused_gdn_verify_mx32_out(m, extra_rows):
+def test_fused_gdn_verify_mx32_out(m, extra_rows, kernel_variant):
     _requires_gfx1250()
     kh, vh, window, cap = 16, 32, 4, 16  # Qwen3.5-35B-A3B with DP attention, MTP-3
     layer = make_layer(kh, vh, 0)

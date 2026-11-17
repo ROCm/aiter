@@ -1128,6 +1128,48 @@ def _flush_block(kt_b, uw_b, rows, decay, NW: gl.constexpr):
     rows.store(s0.to(rows.dtype))
 
 
+@gluon.constexpr_function
+def _mx32_layout(groups, num_warps):
+    """A ``[groups, 32]`` layout of the 1x32 scale groups: a group over ``lanes``
+    lanes of one wave (``32 // lanes`` columns a lane), the groups over the rest, as
+    few lanes as the groups allow without repeating rows."""
+    lanes = min(32, max(1, 32 * num_warps // groups))
+    return gl.BlockedLayout(
+        [1, 32 // lanes], [32 // lanes, lanes], [num_warps, 1], [1, 0]
+    )
+
+
+@gluon.jit
+def _mx32_store(
+    y, row, gcol, live, Output, OutScale, KG: gl.constexpr, N32K4: gl.constexpr
+):
+    """1x32 MXFP8 of bf16-valued ``y`` ``[groups, 32]``, each row one 32-column group
+    (row ``row``, group column ``gcol`` of the ``[rows, KG * 32]`` GEMM input), as
+    _fused_gdn_verify_chunk's OUT_MX32 epilogue: amax from the 1e-10 floor (capped at
+    448 * 2^119), RoundUp ceil_pow2(amax / 448) as the e8m0 byte e, RNE(x * 2^(127 - e))
+    to e4m3; the codes into Output and the byte into OutScale (n32k4 or row-major)."""
+    amax = gl.max(gl.abs(y), 1)
+    amax = gl.minimum(gl.maximum(amax, 1.0e-10), 448.0 * 6.646139978924579e35)
+    bits = (amax * (1.0 / 448.0)).to(gl.uint32, bitcast=True)
+    expo = ((bits >> 23) & 0xFF).to(gl.int32)
+    expo = expo + (((bits & 0x7FFFFF) != 0) & (expo < 0xFF)).to(gl.int32)
+    inv = ((254 - gl.minimum(expo, 253)).to(gl.uint32) << 23).to(
+        gl.float32, bitcast=True
+    )
+    q8 = gl.minimum(gl.maximum(y * inv[:, None], -448.0), 448.0)
+    col = gl.arange(0, 32, layout=gl.SliceLayout(0, y.type.layout))[None, :]
+    gl.store(
+        Output + row[:, None] * (KG * 32) + gcol[:, None] * 32 + col,
+        q8.to(Output.dtype.element_ty),
+        mask=live[:, None] & (col < 32),
+    )
+    if N32K4:
+        s_off = (row // 32) * (KG * 32) + (gcol // 4) * 128 + (row % 32) * 4 + gcol % 4
+    else:
+        s_off = row * KG + gcol
+    gl.store(OutScale + s_off, expo.to(gl.uint8), mask=live)
+
+
 _verify_chunk_mat_repr = make_kernel_repr(
     "_fused_gdn_verify_chunk_mat", ["RATIO", "T_MAX", "CAP", "NW"]
 )
@@ -1185,6 +1227,9 @@ def _fused_gdn_verify_chunk_mat(
     SPLIT: gl.constexpr = 1,
     Tickets=None,
     TICKET_SEM: gl.constexpr = "release",
+    OUT_MX32: gl.constexpr = False,
+    N32K4: gl.constexpr = False,
+    OutScale=None,
 ):
     """The verify step of _fused_gdn_verify_chunk with the window in matrix form.
 
@@ -1603,8 +1648,10 @@ def _fused_gdn_verify_chunk_mat(
     core = readout.to(gl.bfloat16).to(gl.float32)
     rms = gl.rsqrt(gl.sum(core * core, 2) / V + eps)
     normalized = core * rms[:, :, None] * weight * _silu_fast(z.to(gl.float32))
-    o_lds = gl.allocate_shared_memory(Output.dtype.element_ty, [T_P2, RATIO, V], flat3)
-    o_lds.permute([1, 0, 2]).store(normalized.to(Output.dtype.element_ty))
+    # OUT_MX32 keeps the bf16 output in LDS and quantizes it after the barrier below.
+    o_dtype: gl.constexpr = gl.bfloat16 if OUT_MX32 else Output.dtype.element_ty
+    o_lds = gl.allocate_shared_memory(o_dtype, [T_P2, RATIO, V], flat3)
+    o_lds.permute([1, 0, 2]).store(normalized.to(o_dtype))
     u_lds = gl.allocate_shared_memory(
         RecordU.dtype.element_ty,
         [RATIO, T_P2, V],
@@ -1615,18 +1662,39 @@ def _fused_gdn_verify_chunk_mat(
     # output and the records u and k go by TDM (rows past the tokens are out of
     # bounds), at positions first .. first + tokens.
     gl.barrier()
-    o_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=Output + bos * VH * V + group * RATIO * V,
-        shape=[tokens, RATIO * V],
-        strides=[VH * V, 1],
-        block_shape=[T_P2, RATIO * V],
-        layout=rows_shared,
-    )
-    gl.amd.gfx1250.tdm.async_store(
-        o_desc,
-        [0, 0],
-        o_lds.reinterpret(Output.dtype.element_ty, [T_P2, RATIO * V], rows_shared),
-    )
+    if OUT_MX32:
+        # 1x32 MXFP8 for the out projection, bit-identical to the bf16 output followed
+        # by the standalone 1x32 quant (see _fused_gdn_verify_chunk): the bf16 rows
+        # [t, RATIO * V] read back as [t * RATIO * V / 32, 32], one group a row.
+        gl.static_assert(V % 32 == 0, "whole 32-column groups per value head")
+        HG: gl.constexpr = RATIO * V // 32  # groups of the program in a row
+        G: gl.constexpr = T_P2 * HG
+        mx_layout: gl.constexpr = _mx32_layout(G, NW)
+        y = o_lds.reinterpret(gl.bfloat16, [G, 32], rows_shared).load(mx_layout)
+        r = gl.arange(0, G, layout=gl.SliceLayout(1, mx_layout))
+        _mx32_store(
+            y.to(gl.float32),
+            bos + r // HG,
+            group * HG + r % HG,
+            r // HG < tokens,
+            Output,
+            OutScale,
+            VH * V // 32,
+            N32K4,
+        )
+    else:
+        o_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=Output + bos * VH * V + group * RATIO * V,
+            shape=[tokens, RATIO * V],
+            strides=[VH * V, 1],
+            block_shape=[T_P2, RATIO * V],
+            layout=rows_shared,
+        )
+        gl.amd.gfx1250.tdm.async_store(
+            o_desc,
+            [0, 0],
+            o_lds.reinterpret(o_dtype, [T_P2, RATIO * V], rows_shared),
+        )
     u_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=RecordU
         + slot * ru_slot_stride
