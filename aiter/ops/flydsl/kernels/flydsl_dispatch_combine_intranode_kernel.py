@@ -271,6 +271,10 @@ def make_dispatch_kernel(
                     buffer_store(vec_a, rsrc_dst, chunk_i32_off)
 
         # Phase 2: publish per-peer token-count signal (recv_num[src_pe] on dest).
+        # The block arrival is a relaxed atomic and the block barrier does not
+        # wait for other waves' outstanding stores: every wave completes its
+        # Phase-1 P2P stores first (system release fence).
+        fence_system_release()
         fx.barrier()
         if tid == 0:
             atomic_add_global_at(addr_disp_bar, 1)
@@ -279,8 +283,8 @@ def make_dispatch_kernel(
         for dest_pe in range(lane, npes, 64):
             if global_warp_id == 0:
                 wait_i32_until_equals(addr_disp_bar, block_num)
-                # Acquire fence pairs with the per-block release atomic_add
-                # on ``addr_disp_bar``; makes Phase-1 P2P writes visible.
+                # Acquire fence pairs with the per-block release fence before
+                # the ``addr_disp_bar`` arrival; makes Phase-1 P2P writes visible.
                 fence_system_acquire()
                 buffer_store(fx.Int32(0), _r_disp_bar, 0)
                 # +1: 0 is the "unset" sentinel that consumers wait on.
@@ -309,6 +313,9 @@ def make_dispatch_kernel(
 
         # Phase 4: ConvertDispatchOutput (StdMoE).
         if const_expr(enable_std_moe):
+            # Same pattern for the grid barrier: release this block's stores
+            # before its relaxed ticket.
+            fence_system_release()
             fx.barrier()
             if tid == 0:
                 _bn_i64 = fx.Uint64(block_num)
@@ -319,7 +326,7 @@ def make_dispatch_kernel(
                     _ticket // _bn_i64 + _one_i64
                 ) * _bn_i64  # (epoch+1)*block_num
                 wait_i64_until_equals(addr_disp_grid_bar, _target)
-                # Acquire fence pairs with the release atomic_add tickets; makes
+                # Acquire fence pairs with the release fences before the tickets; makes
                 # total_recv / shmem_tok_id_to_src / shmem_idx visible.
                 fence_system_acquire()
             fx.barrier()
@@ -1173,8 +1180,8 @@ def make_combine_kernel(
 
         if grid_thread_id < npes:
             wait_i32_until_equals(addr_comb_bar, block_num)
-            # Acquire fence pairs with the per-block release atomic_add on
-            # ``addr_comb_bar``; makes Stage 1 P2P writes visible.
+            # Acquire fence pairs with the per-block release fence before the
+            # ``addr_comb_bar`` arrival; makes Stage 1 P2P writes visible.
             fence_system_acquire()
             buffer_store(fx.Int32(0), _r_comb_bar, 0)
             xdb_remote_addr = (
@@ -1564,40 +1571,26 @@ def make_dispatch_jit(
     """Build the dispatch JIT launcher. ``max_recv`` (per-rank receive-slot cap
     for sentinel encoding) must match make_combine_jit."""
     hidden_elem_size = torch.tensor([], dtype=data_type).element_size()
+    common = {
+        "rank": rank,
+        "npes": npes,
+        "experts_per_rank": experts_per_rank,
+        "experts_per_token": experts_per_token,
+        "hidden_dim": hidden_dim,
+        "hidden_elem_size": hidden_elem_size,
+        "max_tok_per_rank": max_tok_per_rank,
+        "block_num": block_num,
+        "warp_num_per_block": warp_num_per_block,
+        "scale_dim": scale_dim,
+        "scale_type_size": scale_type_size,
+        "data_type": data_type,
+        "max_recv": max_recv,
+    }
     if tokmajor:
         assert not enable_std_moe
-        kernel = make_dispatch_kernel_tokmajor(
-            rank=rank,
-            npes=npes,
-            experts_per_rank=experts_per_rank,
-            experts_per_token=experts_per_token,
-            hidden_dim=hidden_dim,
-            hidden_elem_size=hidden_elem_size,
-            max_tok_per_rank=max_tok_per_rank,
-            block_num=block_num,
-            warp_num_per_block=warp_num_per_block,
-            scale_dim=scale_dim,
-            scale_type_size=scale_type_size,
-            data_type=data_type,
-            max_recv=max_recv,
-        )
+        kernel = make_dispatch_kernel_tokmajor(**common)
     else:
-        kernel = make_dispatch_kernel(
-            rank=rank,
-            npes=npes,
-            experts_per_rank=experts_per_rank,
-            experts_per_token=experts_per_token,
-            hidden_dim=hidden_dim,
-            hidden_elem_size=hidden_elem_size,
-            max_tok_per_rank=max_tok_per_rank,
-            block_num=block_num,
-            warp_num_per_block=warp_num_per_block,
-            scale_dim=scale_dim,
-            scale_type_size=scale_type_size,
-            enable_std_moe=enable_std_moe,
-            data_type=data_type,
-            max_recv=max_recv,
-        )
+        kernel = make_dispatch_kernel(**common, enable_std_moe=enable_std_moe)
 
     @flyc.jit
     def dispatch_launch(

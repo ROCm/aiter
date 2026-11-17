@@ -586,11 +586,12 @@ def _check_lds_capacity(cfg, arch=None):
 
 class FlyDSLDispatchCombineIntraNodeOp:
     def __init__(self, config, group=None):
-        """``group``: process group of the intra-node EP ranks (a CPU/gloo group
-        is preferred). With a group, the symmetric buffers are HIP IPC
-        allocations exchanged over it and mori is not used. Without one they
-        come from mori's shmem heap, for callers whose own kernels share them
-        (e.g. MegaMoE v2)."""
+        """``group``: process group of the intra-node EP ranks; it must be a
+        CPU (gloo) group, since the allocation-size check and the IPC handle
+        exchange run CPU-tensor collectives on it. With a group, the symmetric
+        buffers are HIP IPC allocations exchanged over it and mori is not used.
+        Without one they come from mori's shmem heap, for callers whose own
+        kernels share them (e.g. MegaMoE v2)."""
         self.cfg = config
         self._check_config()
         if config.tuning_table is None:
