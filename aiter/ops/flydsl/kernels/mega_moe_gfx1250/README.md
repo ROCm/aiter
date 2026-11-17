@@ -163,8 +163,9 @@ inverse-map writes. Columns therefore do not sum to E2E.
 The earlier two-gather persistent change reduced shuffled dispatch by 10.0%
 and observed E2E by 2.0% versus original pull. Its dispatch was still 21.6%
 slower than push. The small E2E difference versus push is not sufficient to
-claim a stable win from one push run. No speedup is claimed for removing the
-persistent loop until a valid measurement completes.
+claim a stable win from one push run. Full-pipeline timing for the current
+non-persistent kernel remains unavailable; the isolated comparison below
+shows a large regression.
 
 Raw historical records and both historical sources are preserved on the
 development host in `/workspace/benchmarks/ds41_pull_inflight_20261115/`.
@@ -179,5 +180,23 @@ It checks exact valid-row bytes and requires eight real captured kernel
 nodes before accepting timing. This is isolated dispatch with producers
 already complete, not E2E or in-pipeline timing. The first attempt captured
 empty graphs; all those timings are invalid. Full-pipeline stalled attempts
-are also excluded. As of this submission, the corrected comparison is
-waiting for idle GPUs and has no accepted result.
+are also excluded.
+
+The corrected comparison completed on 2026-11-17 and was independently
+repeated in `/workspace/benchmarks/ds41_pull_dispatch_only_20261117_confirm/`
+against commit `51e9923e7`. All four GPUs passed the PyTorch health check and
+exact valid-row payload/scale comparison. Each captured graph contained the
+expected eight kernels with the correct grid and 128-thread workgroups.
+
+| Isolated dispatch variant | Grid TGs | Run 1 (us) | Run 2 (us) | Mean (us) |
+|---|---:|---:|---:|---:|
+| 128-thread persistent pull | 256 | 275.01 | 279.09 | 277.05 |
+| 128-thread non-persistent TDM pull | 6528 | 3315.61 | 3260.46 | 3288.04 |
+
+Each run reports the mean of four per-GPU medians over 32 interleaved trials.
+Removing persistence increases isolated dispatch latency by **11.87x**
+(1086.8% regression). This result does not include plan/quant or GEMMs and
+must not be compared directly with the historical in-pipeline push timings.
+The capacity grid repeats startup readiness and metadata work for every TG,
+including unused TGs; LDS remains 180608 bytes/TG. These are candidates for
+investigation, not an experimentally isolated root cause.
