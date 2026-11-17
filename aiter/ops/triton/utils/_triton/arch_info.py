@@ -28,15 +28,34 @@ def get_arch():
 
 
 def is_gluon_avail():
-    return get_arch() in ("gfx950", "gfx1250")
+    return get_arch() in ("gfx950", "gfx1250", "gfx1250-strict")
 
 
 def is_fp4_avail():
-    return get_arch() in ("gfx950", "gfx1250")
+    return get_arch() in ("gfx950", "gfx1250", "gfx1250-strict")
+
+
+def is_sw_emulated_fp4_avail():
+    # No native FP4 instructions: Triton lowers tl.dot_scaled by upcasting the
+    # operands to bf16. Only the Triton backend runs here, and each FP4 entry
+    # point opts in separately once it has configs and a passing test.
+    return get_arch() in ("gfx1101", "gfx1150", "gfx1151")
+
+
+def is_any_fp4_avail():
+    # FP4 through hardware or through software emulation.
+    return is_fp4_avail() or is_sw_emulated_fp4_avail()
 
 
 def is_fp8_avail():
-    return get_arch() in ("gfx942", "gfx950", "gfx1250", "gfx1200", "gfx1201")
+    return get_arch() in (
+        "gfx942",
+        "gfx950",
+        "gfx1250",
+        "gfx1250-strict",
+        "gfx1200",
+        "gfx1201",
+    )
 
 
 def is_sw_emulated_fp8_avail():
@@ -53,11 +72,15 @@ def is_any_fp8_avail():
 
 
 def is_mx_scale_preshuffling_avail():
-    return get_arch() in ("gfx950", "gfx1250")
+    return get_arch() in ("gfx950", "gfx1250", "gfx1250-strict")
 
 
 def is_tdm_avail():
-    return get_arch() in ("gfx1250",)
+    return get_arch() in ("gfx1250", "gfx1250-strict")
+
+
+def is_cdna4():
+    return get_arch() == "gfx950"
 
 
 _LDS_CAP_BYTES = {"gfx1250": 327680, "gfx950": 163840, "gfx942": 65536}

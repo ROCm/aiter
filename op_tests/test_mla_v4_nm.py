@@ -2986,6 +2986,12 @@ def test_v4_nm_ps_oob_guardpage():
     )
 
 
+# The script driver's full perf sweep (opt-in, see __main__).
+SWEEP_BATCHES = [1, 2, 3, 4, 8, 16, 32, 64, 128, 256]
+SWEEP_KV_SEQ_LENS = [100, 256, 300, 512, 700, 1024]
+SWEEP_Q_SEQ_LOGICAL = [4]
+
+
 if __name__ == "__main__":
     import argparse
     import itertools
@@ -3019,35 +3025,44 @@ if __name__ == "__main__":
         formatter_class=argparse.RawTextHelpFormatter,
         description=(
             "v4 nm MLA DIY driver: for each shape in the (batch x kv x q_seq)\n"
-            "cartesian product, run accuracy then perf. For the pytest smoke /\n"
-            "determinism / kernarg suite, invoke `pytest op_tests/test_mla_v4_nm.py`\n"
-            "directly."
+            "cartesian product, run accuracy then perf. Opt-in: runs only with\n"
+            "--full-sweep or an explicit -b / -c / -q; without them it exits 0,\n"
+            "so the standard CI run of this file skips the sweep. For the pytest\n"
+            "smoke / determinism / kernarg suite, invoke\n"
+            "`pytest op_tests/test_mla_v4_nm.py` directly."
         ),
+    )
+    parser.add_argument(
+        "--full-sweep",
+        action="store_true",
+        help="Run the whole default sweep (every -b x -c x -q default below).",
     )
     parser.add_argument(
         "-b",
         "--batch",
         type=int,
         nargs="*",
-        default=[1, 2, 3, 4, 8, 16, 32, 64, 128, 256],
-        help="Batch size(s). e.g. -b 1 2 4",
+        default=None,
+        help=f"Batch size(s), default {SWEEP_BATCHES}. e.g. -b 1 2 4",
     )
     parser.add_argument(
         "-c",
         "--kv-seq-lens",
         type=int,
         nargs="*",
-        default=[100, 256, 300, 512, 700, 1024],
-        help="KV tokens per sequence. e.g. -c 64 256 1024",
+        default=None,
+        help=f"KV tokens per sequence, default {SWEEP_KV_SEQ_LENS}. "
+        "e.g. -c 64 256 1024",
     )
     parser.add_argument(
         "-q",
         "--q-seq-logical",
         type=int,
         nargs="*",
-        default=[4],
-        help="Q tokens per sequence (pre-GQA-broadcast). Must be <=4 for the "
-        "shipped qseqlen4 variant. e.g. -q 1 2 4",
+        default=None,
+        help=f"Q tokens per sequence (pre-GQA-broadcast), default "
+        f"{SWEEP_Q_SEQ_LOGICAL}. Must be <=4 for the shipped qseqlen4 variant. "
+        "e.g. -q 1 2 4",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--iters", type=int, default=50, help="Perf timed iterations")
@@ -3088,6 +3103,20 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    shapes = (args.batch, args.kv_seq_lens, args.q_seq_logical)
+    if not args.full_sweep and all(s is None for s in shapes):
+        print(
+            "[v4 nm] perf sweep skipped: it is opt-in (--full-sweep, or "
+            "-b / -c / -q for a subset). Exiting 0."
+        )
+        sys.exit(0)
+    if args.batch is None:
+        args.batch = SWEEP_BATCHES
+    if args.kv_seq_lens is None:
+        args.kv_seq_lens = SWEEP_KV_SEQ_LENS
+    if args.q_seq_logical is None:
+        args.q_seq_logical = SWEEP_Q_SEQ_LOGICAL
+
     perf_rows = []
     failures = []
     for batch, kv_seq_lens, q_seq_logical in itertools.product(
@@ -3112,7 +3141,7 @@ if __name__ == "__main__":
             )
         except AssertionError as e:
             # Keep sweeping so one bad shape doesn't hide the rest; the exit
-            # code below is what fails CI (aiter_test.sh runs this as a script).
+            # code below is what fails the run.
             failures.append(((batch, kv_seq_lens, q_seq_logical), str(e)))
             continue
         perf_rows.append((batch, kv_seq_lens, q_seq_logical, us_asm, us_ref))

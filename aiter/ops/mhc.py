@@ -13,6 +13,7 @@ from aiter import dtypes
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
+from ..plugin import route as _route
 
 
 @compile_ops("module_mhc", develop=True)
@@ -38,7 +39,7 @@ def mhc_fn_kb(arch: str | None = None) -> int:
     """
     if arch is None:
         arch = get_gfx_runtime()
-    return 16 if arch == "gfx1250" else 8
+    return 16 if arch in ("gfx1250", "gfx1250-strict") else 8
 
 
 def mhc_shuffle_fn(fn: torch.Tensor, arch: str | None = None) -> torch.Tensor:
@@ -237,7 +238,7 @@ def mhc_res_shuffle_enabled(m: int, arch: str | None = None) -> bool:
     if arch is None:
         arch = get_gfx_runtime()
     fused_m_upper_bound = MHC_FUSED_POST_PRE_M_UPPER_BOUND.get(arch, 1024)
-    return arch == "gfx1250" and 0 < m < fused_m_upper_bound
+    return arch in ("gfx1250", "gfx1250-strict") and 0 < m < fused_m_upper_bound
 
 
 # Hidden sizes the gfx1250 Gluon mhc_post_pre kernels are tuned for (DSV4-Flash 4096,
@@ -281,7 +282,7 @@ def mhc_res_ks(
 
 
 def _check_mhc_res_preshuffle_arch(shuffled: bool, arch: str) -> None:
-    if shuffled and arch != "gfx1250":
+    if shuffled and arch not in ("gfx1250", "gfx1250-strict"):
         raise ValueError(
             f"res_preshuffle=1 is only supported on gfx1250, got {arch}; "
             "use res_preshuffle=0 (BF16 compute is controlled independently)"
@@ -365,7 +366,7 @@ def get_mhc_pre_splitk(
     prefill_tg_factor = (
         8
         if w_preshuffle_bf16
-        and arch == "gfx1250"
+        and arch in ("gfx1250", "gfx1250-strict")
         and num_cu == 256
         and m >= 2048
         and hc_hidden_size in (4 * 4096, 4 * 7168)
@@ -628,7 +629,7 @@ def get_mhc_fused_post_pre_config(
     if (
         w_preshuffle_bf16
         and res_preshuffle
-        and arch == "gfx1250"
+        and arch in ("gfx1250", "gfx1250-strict")
         and num_cu == 256
         and 1 <= m <= 1024
     ):
@@ -638,7 +639,12 @@ def get_mhc_fused_post_pre_config(
             tile_m = 16
         elif hidden_size == 4096 and 960 < m:
             split_k = 16
-    if w_preshuffle_bf16 and res_preshuffle and arch == "gfx1250" and num_cu == 256:
+    if (
+        w_preshuffle_bf16
+        and res_preshuffle
+        and arch in ("gfx1250", "gfx1250-strict")
+        and num_cu == 256
+    ):
         return _mhc_fused_bf16_shuffled_config_gfx1250_256(
             m, hidden_size, (split_k, tile_m, tile_n, tile_k)
         )
@@ -672,6 +678,7 @@ def mhc_pre_fake(
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=mhc_pre_fake)
+@_route(op="mhc_pre", version=1)
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -688,6 +695,18 @@ def mhc_pre(
     w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed BF16 hi/lo from mhc_shuffle_fn
     res_preshuffle: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The pre half of MHC: normalise, score the heads, and mix.
+
+    Returns ``(post_mix, comb_mix, layer_input)`` -- three newly allocated
+    tensors. Nothing is written through the arguments, which is what the
+    ``mutates_args=[]`` on the guard above already declares; a provider
+    serving this contract allocates its own outputs and returns them.
+
+    ``sinkhorn_repeat=0`` runs the pre step for the hc head only.
+    ``w_preshuffle_bf16`` and ``res_preshuffle`` say that ``fn`` and
+    ``residual`` already arrive packed, so a provider must read them as given
+    rather than assume row-major.
+    """
     if res_preshuffle and mhc_res_shuffle_enabled(residual.size(0)):
         residual = mhc_res_unshuffle(residual)
     m = residual.size(0)
@@ -780,6 +799,7 @@ def _mhc_post(
 
 
 @torch_compile_guard(mutates_args=["out"], gen_fake=lambda *args, **kwargs: None)
+@_route(op="mhc_post", version=1)
 def mhc_post(
     out: torch.Tensor,
     x: torch.Tensor,
@@ -789,6 +809,16 @@ def mhc_post(
     store_nt: int = -1,
     res_preshuffle: bool = False,
 ) -> None:
+    """The post half of MHC: combine the mixed heads back into ``out``.
+
+    Returns nothing. ``out`` is the result and is written in place, which the
+    ``mutates_args=["out"]`` on the guard above declares; a provider serving
+    this contract must leave it fully written, since a caller has no return
+    value to tell a skipped row from a correct one.
+
+    ``res_preshuffle`` says ``residual`` arrives packed; it is unshuffled here
+    when the row count makes that layout active.
+    """
     if res_preshuffle and mhc_res_shuffle_enabled(residual.size(0)):
         residual = mhc_res_unshuffle(residual)
     _mhc_post(out, x, residual, post_layer_mix, comb_res_mix, store_nt)
