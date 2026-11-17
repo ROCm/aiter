@@ -30,6 +30,7 @@ from aiter.dist.parallel_state import (
     set_custom_all_reduce,
 )
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
+from aiter.jit.utils.hip_runtime import load_hip_runtime
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -1113,8 +1114,6 @@ def _two_stage_barrier_case(rank, calls=64):
     rewrite each rank's staged shard right after peers read it. Every 4th call
     one rank, in turn, lags, so peers run ahead of it. Each call must still
     equal the one-stage path bit for bit, also once the barrier epochs wrap."""
-    from aiter.jit.utils.hip_runtime import load_hip_runtime
-
     ca = get_tp_group().device_communicator.ca_comm
     torch.manual_seed(100 + rank)
     xs = torch.randn(2, 4536, 6144, dtype=torch.bfloat16, device="cuda") * 0.1
@@ -1146,7 +1145,7 @@ def _two_stage_barrier_case(rank, calls=64):
             assert bad.item() == 0, f"{m=} {quant=} {near_wrap=}: {bad.item()} bytes"
 
 
-def _prefill_quant_worker(rank, shapes, distributed_init_method, barrier=False):
+def _prefill_quant_worker(rank, shapes, distributed_init_method):
     torch.cuda.set_device(rank)
     set_custom_all_reduce(True)
     init_distributed_environment(
@@ -1168,8 +1167,7 @@ def _prefill_quant_worker(rank, shapes, distributed_init_method, barrier=False):
             rank,
             pd.DataFrame(rows).to_markdown(index=False),
         )
-        if barrier:
-            _two_stage_barrier_case(rank)
+        _two_stage_barrier_case(rank)
         return rows
     finally:
         if dist.is_initialized():
@@ -1178,13 +1176,11 @@ def _prefill_quant_worker(rank, shapes, distributed_init_method, barrier=False):
             destroy_distributed_environment()
 
 
-def _run_prefill_quant_regression(shapes, barrier=False):
+def _run_prefill_quant_regression(shapes):
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     with Pool(processes=4) as pool:
         jobs = [
-            pool.apply_async(
-                _prefill_quant_worker, (rank, shapes, init_method, barrier)
-            )
+            pool.apply_async(_prefill_quant_worker, (rank, shapes, init_method))
             for rank in range(4)
         ]
         return [job.get() for job in jobs]
@@ -1214,8 +1210,7 @@ try:
                 (513, 6176),
                 (513, 6160),
                 (2048, 8192),
-            ],
-            barrier=True,
+            ]
         )
 
     @pytest.mark.parametrize(

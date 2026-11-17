@@ -136,7 +136,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         # Inboxes and call counters of the Gluon fused all-reduce + RMSNorm and of the
         # plain Gluon all-reduce (gfx1250, 4 ranks), one set for each op. They live as
-        # long as the process: destroy() runs after the groups are gone.
+        # long as the process: destroy() does not free them.
         self.gluon_ar = None
         self.gluon_ar_plain = None
         if (
