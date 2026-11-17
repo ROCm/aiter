@@ -242,7 +242,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     SUPPORTS_FAST_SCAN = True
     SUPPORTS_MXFP4_SEARCH_MODE = True
-    KERNEL_NAME_COLUMNS: ClassVar[tuple[str, ...]] = ("kernelName1", "kernelName2")
     TAG_ROWS_DROPPED: ClassVar[str] = "fallback"
 
     def _setup_specific_arguments(self):

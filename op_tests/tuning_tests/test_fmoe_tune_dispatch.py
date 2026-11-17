@@ -701,15 +701,17 @@ class TestFmoeTuneDispatch(unittest.TestCase):
             self.assertEqual(got["default_device"], "cuda")
         return got.get("tasks", [])
 
-    def pre_processed(self, tuner, untuned_rows, tuned_rows):
+    def pre_processed(self, tuner, untuned_rows, tuned_rows, **flags):
         """Untuned rows tuner.pre_process keeps when tuned_rows are on file."""
         with tempfile.TemporaryDirectory() as tmp:
             args = SimpleNamespace(
                 all=False,
                 last=False,
+                verbose=False,
                 untune_file=os.path.join(tmp, "untuned.csv"),
                 tune_file=os.path.join(tmp, "tuned.csv"),
             )
+            vars(args).update(flags)
             pd.DataFrame(untuned_rows).to_csv(args.untune_file, index=False)
             pd.DataFrame(tuned_rows).to_csv(args.tune_file, index=False)
             with (
@@ -721,6 +723,58 @@ class TestFmoeTuneDispatch(unittest.TestCase):
                 os.environ.pop("AITER_MXFP4_TUNE_SWIGLU_LIMIT", None)
                 tuner.pre_process(args)
         return tuner.untunedf
+
+    def test_fmoe_pre_process_requires_a_named_kernel_to_skip_a_shape(self):
+        m = self.gemm_moe_tune
+        grouped = m.GroupedFmoeTuner(
+            "groupedFmoe",
+            KEYS + ["gate_mode", "ep_fused"],
+            ["kernelName1", "kernelName2", "us"],
+            "grouped",
+        )
+        shape = {
+            **self.untuned().iloc[0].to_dict(),
+            "gate_mode": "GateMode.SEPARATED",
+            "ep_fused": 0,
+        }
+
+        def row(token, **result):
+            return {**shape, "token": token, **result}
+
+        for tuner in (self.tuner, grouped):
+            with self.subTest(tuner.name):
+                left = self.pre_processed(
+                    tuner,
+                    [row(t) for t in range(1, 11)],
+                    [
+                        row(1, kernelName1="", kernelName2=""),
+                        row(2, kernelName1=None, kernelName2=None),
+                        row(3, kernelName1=" \t", kernelName2="  "),
+                        row(4, kernelName1="k1", run_1stage=1),
+                        row(5, kernelName2="k2", us=-1),
+                        row(6, kernelName1="k1", kernelName2="k2", us=None),
+                        row(7),
+                        # No tuned row for token=8.
+                        row(9, kernelName1="", kernelName2=""),
+                        row(9, kernelName1="k1"),
+                        row(10, gfx="gfx942", cu_num=304, kernelName1="k1"),
+                    ],
+                )
+                self.assertEqual(list(left["token"]), [1, 2, 3, 7, 8, 10])
+
+    def test_fmoe_pre_process_retunes_rows_with_no_kernel_columns(self):
+        shape = self.untuned().iloc[0].to_dict()
+        left = self.pre_processed(self.tuner, [shape], [shape])
+        self.assertEqual(list(left["token"]), [shape["token"]])
+
+    def test_fmoe_pre_process_all_and_last_still_retune_named_rows(self):
+        shape = self.untuned().iloc[0].to_dict()
+        rows = [{**shape, "token": t} for t in (1, 2)]
+        tuned = [{**row, "kernelName1": "k1", "kernelName2": "k2"} for row in rows]
+        for flags, expected in (({"all": True}, [1, 2]), ({"last": True}, [2])):
+            with self.subTest(flags=flags):
+                left = self.pre_processed(self.tuner, rows, tuned, **flags)
+                self.assertEqual(list(left["token"]), expected)
 
     def test_grouped_pre_process_skips_shapes_tuned_for_the_same_gate_and_ep(self):
         m = self.gemm_moe_tune

@@ -236,6 +236,7 @@ class FmoeTuner(TunerCommon):
     SUPPORTS_POWER_SELECT = True
     swiglu_limit = None
     swiglu_limit_tag = ""
+    KERNEL_NAME_COLUMNS: ClassVar[tuple[str, ...]] = ("kernelName1", "kernelName2")
     TAG_ROWS_DROPPED: ClassVar[str] = "all"
 
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
