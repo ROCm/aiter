@@ -871,13 +871,12 @@ def compile_gemm1_a16w4_port(
                 ),
             ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
-        # SLP-vectorizing the SwiGLU/SiLU (clamped or not) epilogue reorders the fully
-        # unrolled K loop: the decode and MFMAs touch no memory and sink toward the
-        # epilogue, so the raw weights stay live across tiles and the kernel spills.
-        # SiTUv2 does not spill and is faster with SLP on some tuned tiles, so it keeps
-        # the default.
-        if act in ("swiglu", "silu", "silu_clamped"):
-            launch_gemm1_fp8.compile_hints["llvm_options"] = {"slp-threshold": 100000}
+        # SLP-vectorizing the epilogue reorders the fully unrolled K loop: the decode
+        # and MFMAs touch no memory and sink toward the epilogue, so the raw weights
+        # stay live across tiles. With FlyDSL 0.5.0 this also hits SiTUv2: the k_wave>1
+        # and TILE_K=256 tiles spill under a waves_per_eu cap (or take 1 wave/SIMD
+        # without one), so every activation builds with SLP off.
+        launch_gemm1_fp8.compile_hints["llvm_options"] = {"slp-threshold": 100000}
         return launch_gemm1_fp8
 
     @flyc.kernel(name=f"gemm1_a16w4_port_{name_suffix}", known_block_size=[256, 1, 1])
