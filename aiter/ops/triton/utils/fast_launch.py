@@ -38,8 +38,9 @@ These launches go through ``kernel[grid]`` and are not cached: launches with a
 launch-enter or launch-exit hook, a pre-run hook, or a stages-inspection hook;
 launches under torch.compile tracing; launches whose checked global values
 changed since the compile (Triton raises for them); launches of an autotuned
-config that has a ``pre_hook``; launches with an argument that cannot be
-hashed, after which the wrapper stays on the ordinary path.
+config that has a ``pre_hook``; launches with a tuple argument or with an
+argument that cannot be hashed, after which the wrapper stays on the ordinary
+path.
 """
 
 import contextlib
@@ -267,6 +268,11 @@ class _FastLaunch:
         """Launch the ordinary way, and keep what it worked out."""
         if _MISSES is not None:
             _MISSES.append((self._jit.__name__, key))
+        if any(isinstance(v, tuple) for v in (*args, *kwargs.values())):
+            # Triton specializes each item of a tuple, but the key holds the
+            # tuple by value, and (2,) == (2.0,).
+            self._disabled = True
+            return self._kernel[grid](*args, **kwargs)
 
         seen = []
 

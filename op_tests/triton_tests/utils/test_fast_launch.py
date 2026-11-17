@@ -51,6 +51,13 @@ def _axpy_kernel(x_ptr, y_ptr, out_ptr, n, alpha, BLOCK: tl.constexpr):
     tl.store(out_ptr + offs, x * alpha + y, mask=mask)
 
 
+@triton.jit
+def _scale_by_first_kernel(x_ptr, out_ptr, factors, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask) * factors[0], mask=mask)
+
+
 _OFFSET = tl.constexpr(2.0)
 
 
@@ -307,6 +314,20 @@ def test_launches_that_need_the_ordinary_path_take_it(monkeypatch, case):
         for _ in range(2):
             _axpy(wrapped, x, y, out)
         assert calls == [1, 1]
+
+
+@pytest.mark.parametrize("by_specialization", [False, True])
+def test_a_tuple_argument_takes_the_ordinary_path(by_specialization):
+    """Triton compiles (2,) and (2.0,) apart, but the two tuples are equal."""
+    wrapped = fast_launch.fast_launch(
+        _scale_by_first_kernel, by_specialization=by_specialization
+    )
+    x = torch.randn(256, device="cuda", dtype=torch.float32)
+    for factors in ((2,), (2.0,)):
+        out = torch.empty_like(x)
+        wrapped[(2,)](x, out, factors, 256, BLOCK=128)
+        torch.testing.assert_close(out, x * 2, rtol=0, atol=0)
+    assert not wrapped._cache
 
 
 @pytest.mark.parametrize("backend", ["eager", "inductor"])
