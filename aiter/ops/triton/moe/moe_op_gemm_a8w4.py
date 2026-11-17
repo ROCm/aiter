@@ -273,7 +273,11 @@ def m2bucket(m):
         return "medium2"
     if m <= 512:
         return "large"
-    return "xlarge"
+    if m <= 65536:
+        return "xlarge"
+    # Under EP, m counts every gate slot of the received rows (rows * topk), so
+    # decode steps already land in xlarge; prefill-size calls get their own bucket.
+    return "xxlarge"
 
 
 def get_gluon_a8w4_ctas_per_cga(m):
@@ -297,22 +301,24 @@ def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
     ctas_per_cga = get_gluon_a8w4_ctas_per_cga(m)
     num_ctas = ctas_per_cga[0] * ctas_per_cga[1]
     block_m = routing_data.block_m
-    num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
     split_k = 1
 
     bucket = m2bucket(m)
     tuned = get_moe_dispatch("A8W4", get_arch(), "gluon")
     key = f"bm{block_m}_n{n}_k{k}_{bucket}"
+    if key not in tuned and bucket == "xxlarge":
+        key = f"bm{block_m}_n{n}_k{k}_xlarge"
     if key not in tuned:
         key = f"bm{block_m}_any"
     cfg = tuned[key]
-    block_n, block_k, num_buffers, num_warps, persistent_iters = (
+    block_n, block_k, num_buffers, num_warps, persistent_iters, xcd_swizzle = (
         cfg["block_n"],
         cfg["block_k"],
         cfg["num_buffers"],
         cfg["num_warps"],
         cfg["persistent_iters"],
+        cfg["xcd_swizzle"],
     )
 
     num_buffers = min(num_buffers, triton.cdiv(k, block_k))
@@ -325,13 +331,16 @@ def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
         "block_k": block_k,
         "num_warps": num_warps,
         "num_buffers": num_buffers,
-        "xcd_swizzle": num_xcds,
+        "xcd_swizzle": xcd_swizzle,
         "split_k": split_k,
         "w_cache_modifier": w_cache_modifier,
         "waves_per_eu": 0,
         "persistent_iters": persistent_iters,
         "num_ctas": num_ctas,
         "ctas_per_cga": ctas_per_cga,
+        # optional warp layout of the prefill kernel (see _build_moe_a8w4_layouts)
+        "warps_m": cfg.get("warps_m", 0),
+        "npair": cfg.get("npair", 0),
     }
     return ret
 
@@ -382,6 +391,10 @@ def moe_gemm_a8w4(
     # rows than this GEMM produces skip a full-width copy. Requires a grouped
     # reduction to actually run, i.e. scatter_indx is not None or split_k > 1.
     y_out=None,
+    # With gate_valid: (1,) int32 live-row count. The grouped reduce may then leave
+    # the rows past it unwritten instead of zero (their gates are all dead). Only for
+    # consumers that never read those rows.
+    reduce_num_rows=None,
     # Expert-parallel combine: deliver the un-reduced rows to a combine staging
     # window instead of reducing them here (see EpCombineScatter). The peers'
     # rows for a token are missing at this point, so there is nothing to reduce;
@@ -452,8 +465,16 @@ def moe_gemm_a8w4(
     if use_gluon and x_has_mx:
         mx_scale_block_k = config["block_k"] // 32
         ASYNC_COPY_MIN_SCALE_WIDTH = 8
+        # gathered x scales by TDM: the async-copy wait lowers to asynccnt 0 and stalls every K step
         X_SCALE_TDM = (
-            mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH or K % config["block_k"] != 0
+            (
+                gather_indx is not None
+                and routing_data.block_m > 16
+                and config["block_k"] >= 512
+                and config["num_buffers"] > 1
+            )
+            or mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH
+            or K % config["block_k"] != 0
         )
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
@@ -573,38 +594,38 @@ def moe_gemm_a8w4(
     # launch kernel
     if use_gluon and config["persistent_iters"] > 1:
         _moe_gemm_a8w4_decode_persistent_gluon[(grid,)](
-            y,
-            y.stride(1),
-            y.stride(2),
-            x,
-            x.stride(0),
-            x.stride(1),
-            x_scales,
-            stride_x_mx_m,
-            stride_x_mx_k,
-            w,
-            w.stride(0),
-            w.stride(1),
-            w.stride(2),
-            w_scales,
-            w_scales.stride(0),
-            w_scales.stride(1),
-            w_scales.stride(2),
-            x_static_scale,
-            quant_static_scale,
-            bias,
-            stride_bias,
-            gammas,
-            num_tokens,
-            N,
-            K,
             gather_indx,
             expt_hist,
             expt_token_offs_raw,
             expt_hist_sum,
             expt_block_pid_map,
+            x,
+            x_scales,
+            w,
+            w_scales,
             grid_m,
             num_blocks_n,
+            num_tokens,
+            N,
+            K,
+            x.stride(0),
+            x.stride(1),
+            stride_x_mx_m,
+            stride_x_mx_k,
+            w.stride(0),
+            w.stride(2),
+            w.stride(1),
+            w_scales.stride(0),
+            w_scales.stride(2),
+            w_scales.stride(1),
+            x_static_scale,
+            quant_static_scale,
+            bias,
+            stride_bias,
+            gammas,
+            y,
+            y.stride(1),
+            y.stride(2),
             apply_swiglu_matmul,
             alpha,
             limit,
@@ -631,38 +652,38 @@ def moe_gemm_a8w4(
         )
     elif use_gluon and block_m == 16:
         _moe_gemm_a8w4_decode_gluon[(grid,)](
-            y_ptr,
-            stride_y_m,
-            stride_y_n,
-            x,
-            x.stride(0),
-            x.stride(1),
-            x_scales,
-            stride_x_mx_m,
-            stride_x_mx_k,
-            w,
-            w.stride(0),
-            w.stride(1),
-            w.stride(2),
-            w_scales,
-            w_scales.stride(0),
-            w_scales.stride(1),
-            w_scales.stride(2),
-            x_static_scale,
-            quant_static_scale,
-            bias,
-            stride_bias,
-            gammas,
-            num_tokens,
-            N,
-            K,
             gather_indx,
             expt_hist,
             expt_token_offs_raw,
             expt_hist_sum,
             expt_block_pid_map,
+            x,
+            x_scales,
+            w,
+            w_scales,
             grid_m,
             grid_n,
+            num_tokens,
+            N,
+            K,
+            x.stride(0),
+            x.stride(1),
+            stride_x_mx_m,
+            stride_x_mx_k,
+            w.stride(0),
+            w.stride(2),
+            w.stride(1),
+            w_scales.stride(0),
+            w_scales.stride(2),
+            w_scales.stride(1),
+            x_static_scale,
+            quant_static_scale,
+            bias,
+            stride_bias,
+            gammas,
+            y_ptr,
+            stride_y_m,
+            stride_y_n,
             apply_swiglu_matmul,
             alpha,
             limit,
@@ -706,40 +727,42 @@ def moe_gemm_a8w4(
             X_SCALE_TDM=X_SCALE_TDM,
             out_mx_quant=out_mx_quant,
             is_prefill=M >= 1024,
+            warps_m=config.get("warps_m", 0),
+            npair=config.get("npair", 0),
         )
         _moe_gemm_a8w4_prefill_gluon[(grid,)](
-            y_ptr,
-            stride_y_m,
-            stride_y_n,
-            x,
-            x.stride(0),
-            x.stride(1),
-            x_scales,
-            stride_x_mx_m,
-            stride_x_mx_k,
-            w,
-            w.stride(0),
-            w.stride(1),
-            w.stride(2),
-            w_scales,
-            w_scales.stride(0),
-            w_scales.stride(1),
-            w_scales.stride(2),
-            x_static_scale,
-            quant_static_scale,
-            bias,
-            stride_bias,
-            gammas,
-            num_tokens,
-            N,
-            K,
             gather_indx,
             expt_hist,
             expt_token_offs_raw,
             expt_hist_sum,
             expt_block_pid_map,
+            x,
+            x_scales,
+            w,
+            w_scales,
             grid_m,
             grid_n,
+            num_tokens,
+            N,
+            K,
+            x.stride(0),
+            x.stride(1),
+            stride_x_mx_m,
+            stride_x_mx_k,
+            w.stride(0),
+            w.stride(2),
+            w.stride(1),
+            w_scales.stride(0),
+            w_scales.stride(2),
+            w_scales.stride(1),
+            x_static_scale,
+            quant_static_scale,
+            bias,
+            stride_bias,
+            gammas,
+            y_ptr,
+            stride_y_m,
+            stride_y_n,
             apply_swiglu_matmul,
             alpha,
             limit,
@@ -763,6 +786,15 @@ def moe_gemm_a8w4(
             stride_y_mx_m=stride_y_mx_m,
             stride_y_mx_n=stride_y_mx_n,
             HAS_MX_OUT=out_mx_quant,
+            # TDM scale store only for wide scale rows (>= 64 B: many N tiles
+            # per row); it is slower at 16-32 B rows. TDM tile rows >= 4 B.
+            MX_SCALE_TDM=(
+                out_mx_quant
+                and config["block_n"] // reduction_n_matmul >= 128
+                and y_scale.stride(0) >= 64
+                and y_scale.stride(0) % 16 == 0
+                and y_scale.stride(1) == 1
+            ),
             DstRow=dst_row,
             EP_SCATTER=fused_ep_scatter,
             Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
@@ -866,6 +898,7 @@ def moe_gemm_a8w4(
         swiglu_add_residual=swiglu_add_residual,
         residual=residual,
         indx_valid=group_valid,
+        num_rows=reduce_num_rows if group_valid is not None else None,
     )
     return y_final
 
