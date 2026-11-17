@@ -10,32 +10,49 @@ CSV (AITER_CONFIG_MOE_NVFP4) naming a kernel outside the prebuilt module
 (per-kernel JIT), CSV rows whose kernels cannot run their shape, the fused_moe
 errors, weights / inputs / raw GEMM entry arguments that are not one layer, and a
 caller output buffer.
+
+python3 op_tests/test_moe_nvfp4.py: these tests, then the moe_nvfp4 / fused_moe
+benchmark sweep (main).
 """
 
+import argparse
+import itertools
 import os
 import subprocess
 import sys
 
+import pandas as pd
 import pytest
 import torch
 
+import aiter
 from aiter import ActivationType, NvFp4MoeWeights, dtypes, moe_nvfp4, uses_fallback
 from aiter.fused_moe import fused_moe
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.moe_nvfp4_common import reduce_twin
 from aiter.ops.shuffle import shuffle_scale_nvfp4_moe, shuffle_weight
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility.fp4_utils import mxfp4_to_f32
 
-pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a ROCm device"),
-    pytest.mark.skipif(get_gfx() != "gfx950", reason="NVFP4 MoE kernels need gfx950"),
-]
+
+def _is_gfx950() -> bool:
+    try:
+        return torch.cuda.is_available() and get_gfx_runtime() == "gfx950"
+    except (KeyError, RuntimeError):
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _is_gfx950(), reason="NVFP4 MoE kernels need a gfx950 GPU"
+)
 
 H, E, TOPK = 6144, 128, 4
 SHAPES = {"tp4": 768, "tp8": 384}
 TOKENS = [1, 8, 64, 1024, 2048]
 DTYPES = [torch.bfloat16, torch.float16]
-TOL = 1e-2
+# _check tolerance, 2x (bf16) / 5x (f16) the worst element of these shapes (0.019 /
+# 0.0008 of the row RMS; bf16: output rounding and bf16 top-k atomics)
+RTOL, ATOL = 1e-2, {torch.bfloat16: 4e-2, torch.float16: 4e-3}
 # Shipped TP4 main-path stage-1 kernel without _xcdremap: not in the prebuilt module
 JIT_S1 = "nvfp4_moe_s1_32x256_xdma_waves8_wbuf2x128_xbuf3_gs6"
 JIT_S2 = (
@@ -43,7 +60,7 @@ JIT_S2 = (
 )
 
 
-def _weights(I, seed=0, E=E):
+def _weights(I, seed=0, E=E, H=H):
     """Raw NVFP4 weights: packed E2M1 [E, N, K/2], E4M3 scale bits [E, N, K/16]
     (1.875 .. 448), fp32 1 / global scale [E, 2] and [E]."""
     g = torch.Generator(device="cuda").manual_seed(seed)
@@ -59,13 +76,11 @@ def _weights(I, seed=0, E=E):
     return w13, sc13, w2, sc2, g13, g2
 
 
-@pytest.fixture(scope="module", params=list(SHAPES))
-def shape(request):
-    I = SHAPES[request.param]
-    raw = _weights(I)
+def _fused_args(raw):
+    """fused_moe weight arguments of the raw weights."""
     w13, sc13, w2, sc2, g13, g2 = raw
     f8 = torch.float8_e4m3fn
-    fused = {
+    return {
         "w1": shuffle_weight(w13.view(dtypes.fp4x2), (16, 32)),
         "w2": shuffle_weight(w2.view(dtypes.fp4x2), (16, 32)),
         "w1_scale": shuffle_scale_nvfp4_moe(sc13.view(f8)),
@@ -73,7 +88,13 @@ def shape(request):
         "w1_global_scale": g13,
         "w2_global_scale": g2,
     }
-    return I, raw, NvFp4MoeWeights(*raw), fused
+
+
+@pytest.fixture(scope="module", params=list(SHAPES))
+def shape(request):
+    I = SHAPES[request.param]
+    raw = _weights(I)
+    return I, raw, NvFp4MoeWeights(*raw), _fused_args(raw)
 
 
 def _dequant(w, sc, gm):
@@ -90,7 +111,7 @@ def _reference(x, raw, tid, tw):
     w13, sc13, w2, sc2, g13, g2 = raw
     I = w13.shape[1] // 2
     xf = x.half().float()
-    out = torch.zeros(x.shape[0], H, device=x.device)
+    out = torch.zeros(x.shape[0], w2.shape[1], device=x.device)
     ids, wts, topk = tid.view(-1), tw.view(-1).float(), tid.shape[1]
     for e in ids.unique().tolist():
         rows = (ids == e).nonzero().view(-1)
@@ -104,7 +125,7 @@ def _reference(x, raw, tid, tw):
     return out
 
 
-def _inputs(T, dtype, seed, E=E, topk=TOPK):
+def _inputs(T, dtype, seed, E=E, topk=TOPK, H=H):
     g = torch.Generator(device="cuda").manual_seed(seed)
     x = torch.randn(T, H, generator=g, device="cuda").to(dtype)
     scores = torch.randn(T, E, generator=g, device="cuda").softmax(-1)
@@ -112,8 +133,17 @@ def _inputs(T, dtype, seed, E=E, topk=TOPK):
     return x, tid.to(torch.int32), tw.float()
 
 
-def _relf(a, b):
-    return ((a.float() - b).norm() / b.norm()).item()
+def _check(out, ref, msg):
+    """Asserts every element of out is within RTOL / ATOL of the reference, both
+    divided by the reference row RMS: the rounding error of a row grows with its
+    magnitude, and a single wrong element, row or expert fails (a global relative
+    norm can hide them). Returns the mismatch share (0)."""
+    rms = ref.pow(2).mean(-1, keepdim=True).sqrt()
+    err = checkAllclose(
+        ref / rms, out.float() / rms, rtol=RTOL, atol=ATOL[out.dtype], msg=msg
+    )
+    assert err == 0, f"{msg}: {err:.2%} of the elements off"
+    return err
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -130,8 +160,7 @@ def test_moe_nvfp4(shape, T, dtype):
     ):  # fmt: skip
         assert out.dtype == dtype and out.shape == (T, H), name
         assert torch.isfinite(out).all(), name
-        err = _relf(out, ref)
-        assert err < TOL, f"{name} I={I} T={T} {dtype}: relF {err:.2e}"
+        _check(out, ref, f"{name} I={I} T={T} {dtype}")
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -144,8 +173,7 @@ def test_out(shape, T, dtype):
     buf = torch.full((T, H), float("nan"), dtype=dtype, device="cuda")
     assert moe_nvfp4(W, x, tid, tw, out=buf) is buf
     assert torch.isfinite(buf).all()
-    err = _relf(buf, _reference(x, raw, tid, tw))
-    assert err < TOL, f"I={I} T={T} {dtype}: relF {err:.2e}"
+    _check(buf, _reference(x, raw, tid, tw), f"out I={I} T={T} {dtype}")
     strided = torch.empty(T, 2 * H, dtype=dtype, device="cuda")[:, ::2]
     for bad in (buf[:, :-1], strided, buf.float()):
         with pytest.raises(ValueError, match="out must be"):
@@ -161,8 +189,7 @@ def test_many_experts(dtype):
     assert uses_fallback(T, TOPK, E2)
     out = moe_nvfp4(NvFp4MoeWeights(*raw), x, tid, tw)
     assert out.dtype == dtype and torch.isfinite(out).all()
-    err = _relf(out, _reference(x, raw, tid, tw))
-    assert err < TOL, f"E={E2} T={T} {dtype}: relF {err:.2e}"
+    _check(out, _reference(x, raw, tid, tw), f"E={E2} T={T} {dtype}")
 
 
 @pytest.mark.parametrize("T", [1024, 2048])
@@ -183,8 +210,7 @@ def test_reduce_bf16(shape, T, monkeypatch):
     assert kernel2["reduce"] and kernel2["md"] == op.MD_NAME, kernel2["name"]
     x, tid, tw = _inputs(T, torch.bfloat16, seed=T)
     out = moe_nvfp4(W, x, tid, tw)
-    err = _relf(out, _reference(x, raw, tid, tw))
-    assert err < TOL, f"I={I} T={T}: relF {err:.2e}"
+    _check(out, _reference(x, raw, tid, tw), f"reduce I={I} T={T}")
     assert torch.equal(out, moe_nvfp4(W, x, tid, tw))
 
 
@@ -225,8 +251,7 @@ def _check_jit_csv():
     assert kernel1["name"] == JIT_S1 and kernel1["md"] != op.MD_NAME, kernel1["name"]
     assert kernel2["name"] == JIT_S2, kernel2["name"]
     x, tid, tw = _inputs(1000, torch.bfloat16, seed=1)
-    err = _relf(moe_nvfp4(W, x, tid, tw), _reference(x, raw, tid, tw))
-    assert err < TOL, f"JIT CSV kernel: relF {err:.2e}"
+    _check(moe_nvfp4(W, x, tid, tw), _reference(x, raw, tid, tw), "JIT CSV kernel")
 
 
 def test_jit_csv(tmp_path):
@@ -368,8 +393,111 @@ def test_fused_moe_errors(shape, case):
         fused_moe(x, w1, w2, tw, tid, **kw)
 
 
-if __name__ == "__main__":
+@benchmark()
+def test_moe_nvfp4_benchmark(dtype, token, model_dim, inter_dim, expert, topk):
+    """moe_nvfp4 (the vLLM call) and fused_moe on random routing, each checked by
+    _check. flops / bytes as test_moe_2stage: x, out and the NVFP4 weights and
+    scales of at most token * topk experts."""
+    raw = _weights(inter_dim, E=expert, H=model_dim)
+    W, fused = NvFp4MoeWeights(*raw), _fused_args(raw)
+    x, tid, tw = _inputs(token, dtype, seed=token, E=expert, topk=topk, H=model_dim)
+    ref = _reference(x, raw, tid, tw)
+    candidates = {
+        "moe_nvfp4": lambda: moe_nvfp4(W, x, tid, tw),
+        "fused_moe": lambda: fused_moe(x, topk_weight=tw, topk_ids=tid,
+                                       activation=ActivationType.Swiglu, **fused),
+    }  # fmt: skip
+    flops = 2 * 3 * token * topk * model_dim * inter_dim
+    w_vals = 3 * model_dim * inter_dim
+    nbytes = 2 * x.nbytes + min(expert, token * topk) * (w_vals // 2 + w_vals // 16)
+    ret = {"gfx": get_gfx_runtime()}
+    for name, fn in candidates.items():
+        out, us = run_perftest(fn)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = _check(out, ref, f"{name} T={token} I={inter_dim}")
+    return ret
+
+
+# Script-only benchmark (main); the tests above own the pytest coverage
+test_moe_nvfp4_benchmark.__test__ = False
+
+
+def main() -> int:
     if sys.argv[1:] == ["--jit-csv"]:
         _check_jit_csv()
-    else:
-        raise SystemExit(pytest.main([__file__, "-q"]))
+        return 0
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="NVFP4 MoE tests, then the moe_nvfp4 / fused_moe benchmark",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        choices=DTYPES,
+        nargs="*",
+        default=[torch.bfloat16],
+        metavar="{bf16, fp16}",
+        help="""Activation and output data type.
+    e.g.: -d bf16""",
+    )
+    parser.add_argument(
+        "-dim",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[(H, I) for I in SHAPES.values()],
+        help="""Model dimension and inter dimension (per TP rank).
+    e.g.: -dim 6144,768""",
+    )
+    parser.add_argument(
+        "-t",
+        "--tokenNum",
+        type=int,
+        nargs="*",
+        default=TOKENS,
+        help="""Number of tokens.
+    e.g.: -t 1024""",
+    )
+    parser.add_argument(
+        "-e",
+        "--expert",
+        type=int,
+        nargs="*",
+        default=[E],
+        help="""Number of experts.
+    e.g.: -e 128""",
+    )
+    parser.add_argument(
+        "-k",
+        "--topk",
+        type=int,
+        nargs="*",
+        default=[TOPK],
+        help="""Number of top experts.
+    e.g.: -k 4""",
+    )
+    args = parser.parse_args()
+
+    result = pytest.main([__file__, "-q"])
+    if result != pytest.ExitCode.OK:
+        return int(result)
+    if not _is_gfx950():
+        aiter.logger.warning("moe_nvfp4 benchmark needs a gfx950 GPU; skipping sweep")
+        return 0
+    rows = [
+        test_moe_nvfp4_benchmark(dtype, token, model_dim, inter_dim, expert, topk)
+        for dtype, (model_dim, inter_dim), token, expert, topk in itertools.product(
+            args.dtype, args.dim, args.tokenNum, args.expert, args.topk
+        )
+    ]
+    aiter.logger.info(
+        "moe_nvfp4 summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
