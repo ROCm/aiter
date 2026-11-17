@@ -4,7 +4,9 @@
 """`hipb_mm` keeps the hipBLASLt layouts, descriptor and algorithm of an
 unscaled GEMM with a given solution index, and rebuilds nothing on later calls
 but the bias pointer. A call served that way must give what a freshly built
-descriptor gives, bit for bit. The kept descriptors are per thread.
+descriptor gives, bit for bit wherever the kernel itself is reproducible; every
+result is also held to a float32 reference. The kept descriptors are per
+thread.
 
 Run:
     python op_tests/test_hipb_mm_reuse.py
@@ -19,13 +21,15 @@ import pytest
 import torch
 
 from aiter import dtypes, hipb_create_extension, hipb_destroy_extension, hipb_mm
-from aiter.ops.gradlib import hipb_findallsols
+from aiter.ops.gradlib import getHipblasltKernelName, hipb_findallsols
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs a GPU with hipBLASLt"
 )
 
 BF16, FP16 = dtypes.bf16, dtypes.fp16
+# Against the float32 reference: bf16 output keeps 8 significant bits.
+ATOL = RTOL = 1e-2
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -45,11 +49,18 @@ def _rand(*shape, dtype=BF16, scale=1.0):
     return torch.randn(*shape, device="cuda").mul_(scale).to(dtype)
 
 
+def _reference(x, w, bias=None, otype=None):
+    """``x @ w.t() + bias`` computed by torch in float32."""
+    out = x.float() @ w.float().t()
+    if bias is not None:
+        out += bias.float()
+    return out.to(otype or x.dtype)
+
+
 def _solution(x, wt, bias=None, otype=None, also=()):
-    """A solution whose result does not change between two freshly built
-    descriptors, for ``x`` and every input in ``also``. Some solutions (for
-    instance ones that split K across workgroups) are not deterministic run
-    to run, and comparing them bit for bit would test the kernel, not reuse."""
+    """The first of a few solutions whose results, for ``x`` and every input in
+    ``also``, agree between two freshly built descriptors, so that reuse can be
+    checked bit for bit; else the first solution."""
     sols = hipb_findallsols(x, wt, bias=bias, out_dtype=otype)
     if not sols:
         pytest.skip("no hipBLASLt solution for this problem")
@@ -61,7 +72,69 @@ def _solution(x, wt, bias=None, otype=None, also=()):
         torch.cuda.synchronize()
         if all(torch.equal(f, a) for f, a in zip(first, again)):
             return sol
-    pytest.skip("no run-to-run deterministic hipBLASLt solution for this problem")
+    return sols[0]
+
+
+def _kernel(sol):
+    try:
+        return getHipblasltKernelName(sol)
+    except RuntimeError:  # only names the kernel in a failure message
+        return "?"
+
+
+def _differences(a, b):
+    differ = a != b
+    delta = (a.float() - b.float()).abs().max().item()
+    return (
+        f"{int(differ.sum())} of {a.numel()} elements differ, "
+        f"max |diff| {delta:.3g}, first at {differ.nonzero()[:4].tolist()}"
+    )
+
+
+def _check_reuse(kept, call, ref, sol):
+    """``kept`` are results of ``call`` served by kept descriptors.
+
+    ``call`` is repeated on freshly built extensions. If those results agree
+    bit for bit, the kernel is reproducible for this input, and every kept
+    result must give the same bits: a reuse bug (a stale bias pointer, another
+    configuration's layouts) changes them. If they do not agree, the kernel
+    itself varies run to run (for instance it splits K with atomics), and kept
+    results are held to the float32 reference ``ref`` instead, which those bugs
+    still fail. Fresh results are always held to ``ref``."""
+    fresh = []
+
+    def reproducible(samples):
+        for _ in range(samples):
+            _fresh_extension()
+            fresh.append(call())
+        torch.cuda.synchronize()
+        return all(torch.equal(fresh[0], f) for f in fresh[1:])
+
+    def where():
+        return f"solution {sol} ({_kernel(sol)})"
+
+    exact = reproducible(2)
+    if exact and not all(torch.equal(k, fresh[0]) for k in kept):
+        # Two agreeing samples do not make a kernel reproducible.
+        exact = reproducible(4)
+    for f in fresh:
+        torch.testing.assert_close(
+            f, ref, atol=ATOL, rtol=RTOL, msg=lambda m: f"fresh, {where()}: {m}"
+        )
+    for i, k in enumerate(kept):
+        if exact:
+            assert torch.equal(k, fresh[0]), (
+                f"kept result {i} vs {len(fresh)} identical fresh ones, {where()}: "
+                + _differences(k, fresh[0])
+            )
+        else:
+            torch.testing.assert_close(
+                k,
+                ref,
+                atol=ATOL,
+                rtol=RTOL,
+                msg=lambda m, i=i: f"kept result {i}, fresh ones vary, {where()}: {m}",
+            )
 
 
 CASES = [
@@ -80,24 +153,24 @@ def test_kept_descriptors_match_fresh_ones(case):
     x, w = _rand(m, k, dtype=dtype), _rand(n, k, dtype=dtype, scale=k**-0.5)
     b1 = _rand(n, dtype=dtype) if has_bias else None
     sol = _solution(x, w.t(), b1, otype)
-    first = hipb_mm(x, w.t(), sol, bias=b1, out_dtype=otype)  # builds them
-    again = hipb_mm(x, w.t(), sol, bias=b1, out_dtype=otype)  # reuses them
-    torch.cuda.synchronize()
-    assert torch.equal(first, again)
+    # The second call, at least, reuses the descriptors.
+    kept = [hipb_mm(x, w.t(), sol, bias=b1, out_dtype=otype) for _ in range(2)]
     if has_bias:
         # Same configuration, another bias: only the pointer may change.
         b2 = _rand(n, dtype=dtype)
-        kept = hipb_mm(x, w.t(), sol, bias=b2, out_dtype=otype)
-        _fresh_extension()
-        fresh = hipb_mm(x, w.t(), sol, bias=b2, out_dtype=otype)
-        torch.cuda.synchronize()
-        assert torch.equal(kept, fresh)
-        assert not torch.equal(kept, first)
-    else:
-        _fresh_extension()
-        fresh = hipb_mm(x, w.t(), sol, out_dtype=otype)
-        torch.cuda.synchronize()
-        assert torch.equal(first, fresh)
+        other = hipb_mm(x, w.t(), sol, bias=b2, out_dtype=otype)
+        _check_reuse(
+            [other],
+            lambda: hipb_mm(x, w.t(), sol, bias=b2, out_dtype=otype),
+            _reference(x, w, b2, otype),
+            sol,
+        )
+    _check_reuse(
+        kept,
+        lambda: hipb_mm(x, w.t(), sol, bias=b1, out_dtype=otype),
+        _reference(x, w, b1, otype),
+        sol,
+    )
 
 
 def test_configurations_do_not_mix():
@@ -112,36 +185,41 @@ def test_configurations_do_not_mix():
     sol = _solution(x, w.t(), also=[x_strided, x[:128]])
     sol_b = _solution(x, w.t(), b)
     calls = [
-        lambda: hipb_mm(x, w.t(), sol),
-        lambda: hipb_mm(x_strided, w.t(), sol),
-        lambda: hipb_mm(x[:128], w.t(), sol),
-        lambda: hipb_mm(x, w.t(), sol_b, bias=b),
+        (lambda: hipb_mm(x, w.t(), sol), _reference(x, w), sol),
+        (lambda: hipb_mm(x_strided, w.t(), sol), _reference(x, w), sol),
+        (lambda: hipb_mm(x[:128], w.t(), sol), _reference(x[:128], w), sol),
+        (lambda: hipb_mm(x, w.t(), sol_b, bias=b), _reference(x, w, b), sol_b),
     ]
-    kept = [[f() for f in calls] for _ in range(2)]
-    _fresh_extension()
-    fresh = [f() for f in calls]
-    torch.cuda.synchronize()
-    for i in range(len(calls)):
-        assert torch.equal(kept[0][i], fresh[i]) and torch.equal(kept[1][i], fresh[i])
-    assert torch.equal(fresh[0], fresh[1])  # same values, lda differs
-    assert torch.equal(fresh[0][:128], fresh[2])
+    kept = [[call() for call, _, _ in calls] for _ in range(2)]
+    for i, (call, ref, s) in enumerate(calls):
+        _check_reuse([kept[0][i], kept[1][i]], call, ref, s)
 
 
 def test_many_configurations():
     """More configurations than are kept (one per leading dimension here): the
-    set is dropped and rebuilt, and every call still computes what a fresh
-    descriptor does."""
-    m, n, k, step, count = 64, 64, 64, 64, 1100
+    set is dropped and rebuilt. Calls before and after the drop, on kept or
+    rebuilt descriptors, compute what a fresh descriptor does."""
+    # K spans several unroll steps: at K = 64, one step, the hand-written gfx950
+    # kernel hipBLASLt lists first for this problem can read LDS before its loads
+    # land.
+    m, n, k, step, count = 64, 64, 512, 64, 1100
     w = _rand(n, k, scale=k**-0.5)
     buf = _rand(m * (k + step * count))
     views = [buf.as_strided((m, k), (k + step * i, 1)) for i in range(count)]
     checked = (0, 1, 511, 1023, 1024, 1099)
     sol = _solution(views[0], w.t(), also=[views[i] for i in checked[1:]])
     kept = [hipb_mm(x, w.t(), sol) for x in views]
-    _fresh_extension()
-    for i in checked:
-        assert torch.equal(kept[i], hipb_mm(views[i], w.t(), sol))
-        assert torch.equal(kept[i], hipb_mm(views[i].contiguous(), w.t(), sol))
+    # Past the drop, the last views still have their descriptors; the first
+    # ones are built again.
+    again = [hipb_mm(views[i], w.t(), sol) for i in checked]
+    for i, other in zip(checked, again):
+        x = views[i]
+        _check_reuse(
+            [kept[i], other],
+            lambda x=x: hipb_mm(x, w.t(), sol),
+            _reference(x, w),
+            sol,
+        )
 
 
 def test_graph_replay_after_reuse():
@@ -159,13 +237,14 @@ def test_graph_replay_after_reuse():
     x.copy_(_rand(m, k))
     graph.replay()
     torch.cuda.synchronize()
-    assert torch.equal(out, hipb_mm(x, w.t(), sol))
     graph.reset()
+    _check_reuse([out], lambda: hipb_mm(x, w.t(), sol), _reference(x, w), sol)
 
 
 def _thread_calls():
     """Interleaved configurations, including one configuration that every
-    thread calls with a bias of its own."""
+    thread calls with a bias of its own. Returns a table from a key to (call,
+    reference, solution), and the keys thread ``i`` calls."""
     k = 512
     x = _rand(256, k)
     w = _rand(384, k, scale=k**-0.5)
@@ -174,76 +253,89 @@ def _thread_calls():
     sol_b = _solution(x, w.t(), biases[0], also=[x[:128]])
     x2, w2 = _rand(96, 768), _rand(320, 768, scale=768**-0.5)
     sol2 = _solution(x2, w2.t())
+    table = {
+        "x": (lambda: hipb_mm(x, w.t(), sol), _reference(x, w), sol),
+        "x2": (lambda: hipb_mm(x2, w2.t(), sol2), _reference(x2, w2), sol2),
+    }
+    for j, b in enumerate(biases):
+        table["x+b", j] = (
+            lambda b=b: hipb_mm(x, w.t(), sol_b, bias=b),
+            _reference(x, w, b),
+            sol_b,
+        )
+        table["x[:128]+b", j] = (
+            lambda b=b: hipb_mm(x[:128], w.t(), sol_b, bias=b),
+            _reference(x[:128], w, b),
+            sol_b,
+        )
 
-    def calls(i):
-        b = biases[i % len(biases)]
-        return [
-            lambda: hipb_mm(x, w.t(), sol_b, bias=b),
-            lambda: hipb_mm(x, w.t(), sol),
-            lambda: hipb_mm(x2, w2.t(), sol2),
-            lambda: hipb_mm(x[:128], w.t(), sol_b, bias=b),
-        ]
+    def keys(i):
+        j = i % len(biases)
+        return [("x+b", j), "x", "x2", ("x[:128]+b", j)]
 
-    return calls
+    return table, keys
+
+
+def _run(table, keys):
+    return [(key, table[key][0]()) for key in keys]
+
+
+def _check_results(table, results):
+    """``results``: (key, output) pairs, each served by kept descriptors."""
+    kept = {}
+    for key, out in results:
+        kept.setdefault(key, []).append(out)
+    for key, outs in kept.items():
+        _check_reuse(outs, *table[key])
 
 
 def test_threads_keep_their_own_descriptors():
-    """Each thread builds and reuses its own descriptors; results match a
-    single thread bit for bit. The binding holds the GIL, so Python threads
-    take turns rather than calling hipb_mm at the same instant."""
-    calls = _thread_calls()
+    """Each thread builds and reuses its own descriptors; results match fresh
+    ones. The binding holds the GIL, so Python threads take turns rather than
+    calling hipb_mm at the same instant."""
+    table, keys = _thread_calls()
     threads = 4
-    expected = [[f() for f in calls(i)] for i in range(threads)]
-    torch.cuda.synchronize()
     barrier = threading.Barrier(threads)
 
     def work(i):
         barrier.wait()
-        rounds = [[f() for f in calls(i)] for _ in range(20)]
+        rounds = [r for _ in range(20) for r in _run(table, keys(i))]
         torch.cuda.synchronize()
         return rounds
 
     with ThreadPoolExecutor(threads) as pool:
         results = list(pool.map(work, range(threads)))
-    for i, rounds in enumerate(results):
-        for outs in rounds:
-            for got, want in zip(outs, expected[i]):
-                assert torch.equal(got, want)
+    _check_results(table, (r for rounds in results for r in rounds))
 
 
 def test_destroy_drops_other_threads_descriptors():
     """A thread that outlives an extension destroy/create rebuilds its
     descriptors for the new extension."""
-    calls = _thread_calls()
+    table, keys = _thread_calls()
     with ThreadPoolExecutor(1) as worker:
 
         def run():
-            outs = [f() for f in calls(1)]
+            outs = _run(table, keys(1))
             torch.cuda.synchronize()
             return outs
 
         before = worker.submit(run).result()
         _fresh_extension()
         after = worker.submit(run).result()
-    fresh = run()
-    for b, a, f in zip(before, after, fresh):
-        assert torch.equal(b, f) and torch.equal(a, f)
+    _check_results(table, before + after)
 
 
 def test_short_lived_threads():
     """Descriptors of a thread are released when it exits."""
-    calls = _thread_calls()
-    expected = [f() for f in calls(2)]
+    table, keys = _thread_calls()
     out = []
     for _ in range(16):
-        t = threading.Thread(target=lambda: out.append([f() for f in calls(2)]))
+        t = threading.Thread(target=lambda: out.append(_run(table, keys(2))))
         t.start()
         t.join()
     torch.cuda.synchronize()
     assert len(out) == 16
-    for outs in out:
-        for got, want in zip(outs, expected):
-            assert torch.equal(got, want)
+    _check_results(table, (r for outs in out for r in outs))
 
 
 def main():
