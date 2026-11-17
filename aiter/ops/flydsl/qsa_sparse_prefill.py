@@ -75,7 +75,7 @@ _arenas = weakref.WeakValueDictionary()
 
 
 class _Workspace:
-    def __init__(self, q, k, v, indices, query_lens, prefix_lens, scale, kv_slots=None):
+    def __init__(self, q, k, v, indices, query_lens, prefix_lens, kv_slots, invariant):
         topk = (indices.shape[1] - 3) // 4
         q_lens = np.asarray(query_lens, dtype=np.int64)
         lengths = q_lens + np.asarray(prefix_lens, dtype=np.int64)
@@ -87,7 +87,6 @@ class _Workspace:
         self.metadata = {
             "query_lens": query_lens,
             "prefix_lens": prefix_lens,
-            "scale": scale,
             "topk": topk,
             "query_positions": prepare.upload(positions, q.device),
             "max_seqlen_k": int(lengths.max(initial=0)),
@@ -105,9 +104,15 @@ class _Workspace:
             **self.metadata,
         )
         self.union = None
-        if q.shape[0] >= _union_min_rows(q.shape[1] // k.shape[1]):
+        minimum = _union_min_rows(q.shape[1] // k.shape[1])
+        # Batch-invariant layouts plan union tiles only for requests of at least minimum rows.
+        if (max(query_lens) if invariant else q.shape[0]) >= minimum:
             plan = prepare.allocate_plan(
-                inputs=inputs, query_tile=32, scratch=False, slotted=slotted
+                inputs=inputs,
+                query_tile=32,
+                scratch=False,
+                slotted=slotted,
+                min_request_rows=minimum if invariant else None,
             )
             # Union scratch grows with tiles x their block capacity.
             needed = sum(
@@ -162,7 +167,7 @@ class _Workspace:
             # Graph pointers must outlive arena growth.
             self.pinned = tuple(self.arena.buffers)
 
-    def bind(self, q, k, v, indices, kv_slots=None):
+    def bind(self, q, k, v, indices, kv_slots, scale_log2):
         self.attach()
         return SimpleNamespace(
             q=q,
@@ -171,6 +176,7 @@ class _Workspace:
             indices=indices,
             block_indices=self.block_indices,
             kv_slots=kv_slots,
+            scale_log2=scale_log2,
             **self.metadata,
         )
 
@@ -180,8 +186,8 @@ class _Hot:
     Building it performs the current call through the normal paths.
     """
 
-    def __init__(self, workspace, q, k, v, indices, out, kv_slots=None):
-        inputs = workspace.bind(q, k, v, indices, kv_slots)
+    def __init__(self, workspace, q, k, v, indices, out, kv_slots, scale_log2):
+        inputs = workspace.bind(q, k, v, indices, kv_slots, scale_log2)
         prepare.run(inputs=inputs, plan=workspace.union)
         self.prepare = prepare.launchers(inputs=inputs, plan=workspace.union)
         self.compute = []
@@ -202,9 +208,9 @@ class _Hot:
         for launch in rest:
             launch(kv_slots)
 
-    def compute_call(self, q, k, v, out, kv_slots):
+    def compute_call(self, q, k, v, out, kv_slots, scale_log2):
         # K/V stay 3-D: FlyDSL passes int32 dims and K/V may exceed 2**31 elements.
-        views = (q.view(-1), k, v, out.view(-1), kv_slots)
+        views = (q.view(-1), k, v, out.view(-1), kv_slots, scale_log2)
         for launch in self.compute:
             launch(*views)
 
@@ -225,6 +231,7 @@ def flydsl_qsa_sparse_prefill(
     softmax_scale=None,
     out=None,
     kv_slots=None,
+    batch_invariant=False,
 ):
     """Return QSA sparse attention for BF16 Q[M,H,256] and K/V[N,HK,256].
 
@@ -249,11 +256,28 @@ def flydsl_qsa_sparse_prefill(
     pool may exceed 4 GiB (raw direct then uses 64-bit loads); slot values are not
     validated. Hot calls rebuild the selection: per-layout plans share one private
     per-stream scratch arena. out is optional and must not overlap Q/K/V, indices or
-    kv_slots. Warm the same stream and layout before graph capture. Captured
+    kv_slots. softmax_scale is a kernel argument (FP32 softmax_scale * log2(e)): a new
+    scale compiles nothing and reuses the layout's workspace, also under graph capture.
+    Warm the same stream and layout before graph capture. Captured
     workspaces stay pinned for graph pointer lifetime and share their stream's
     scratch: do not replay them concurrently with each other or with that stream's
     calls. Each kernel variant compiles on its first use: a few seconds with empty
     FlyDSL caches. One GPU per process (TP uses separate workers).
+
+    Union tiles and the direct kernel round differently. By default the choice between
+    them spans the call: union tiles are planned by the call's row count, BQ21/BQ42
+    union tiles serve only a single full H6/H3 prefill, and a cost model over all
+    tiles routes them, so the low bits of a request's rows may change with the other
+    requests of the call. batch_invariant=True decides per request: only requests of
+    at least the union planning rows take union tiles, each request picks its own tile
+    rows and no tile is routed by the others, so a request gives the bits it gives
+    alone (with batch_invariant=True too; the modes may differ). Batches of short
+    requests then run more rows direct, which can be slower. In both modes, a layout
+    whose union scratch would exceed 4 GiB (millions of rows) runs direct only, so its
+    requests may differ from their runs alone. Whether direct reads packed or raw K/V
+    (a call-wide budget) does not change the bits. Tuning targets MI308X (gfx942,
+    80 CUs) only: other gfx942 parts log a warning and reuse the 80-CU MI308X
+    settings; plans and routes follow the CU count, performance may not be optimal.
     """
     global _device
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
@@ -265,6 +289,9 @@ def flydsl_qsa_sparse_prefill(
     scaled = scale * math.log2(math.e)
     if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:
         raise ValueError("softmax_scale * log2(e) must be finite and positive in FP32")
+    scale_log2 = float(np.float32(scaled))
+    if not isinstance(batch_invariant, bool):
+        raise TypeError("batch_invariant must be a bool")
     if kv_slots is not None and (
         not isinstance(kv_slots, torch.Tensor)
         or kv_slots.dtype != torch.int32
@@ -375,10 +402,10 @@ def flydsl_qsa_sparse_prefill(
             prefix_lens,
             q.shape[1],
             k.shape[1],
-            scale,
             topk,
             # Pool rows: they set the raw direct extent and the WIDE path.
             None if kv_slots is None else k.shape[0],
+            batch_invariant,
         )
         workspace = _workspaces.get(key)
         if workspace is None:
@@ -387,7 +414,7 @@ def flydsl_qsa_sparse_prefill(
                     "Warm attention on this stream and layout before graph capture"
                 )
             workspace = _Workspace(
-                q, k, v, indices, query_lens, prefix_lens, scale, kv_slots
+                q, k, v, indices, query_lens, prefix_lens, kv_slots, batch_invariant
             )
             _workspaces[key] = workspace
             for stale in list(_workspaces):
@@ -401,7 +428,7 @@ def flydsl_qsa_sparse_prefill(
         hot = workspace.hot
         if hot is not None:
             hot.prepare_call(indices, kv_slots)
-            hot.compute_call(q, k, v, out, kv_slots)
+            hot.compute_call(q, k, v, out, kv_slots, scale_log2)
         else:
-            workspace.hot = _Hot(workspace, q, k, v, indices, out, kv_slots)
+            workspace.hot = _Hot(workspace, q, k, v, indices, out, kv_slots, scale_log2)
     return out
