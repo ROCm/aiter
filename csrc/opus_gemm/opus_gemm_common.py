@@ -4117,21 +4117,14 @@ def kid_for_name(family: str, gfx: str, cu_num: int, name: str) -> int:
 
 
 def default_compiled_keys(gfx: str, cu_num: int) -> set[KernelKey]:
-    """Select the default compile set from the current CU table."""
+    """Select the A16W16 compile floor from the current CU table."""
     lookup_gfx = base_gfx_arch(gfx)
     defaults = DEFAULT_COMPILED_KIDS_BY_NAMESPACE.get((lookup_gfx, cu_num), ())
-    keys = {
+    return {
         KernelKey("a16w16", gfx, cu_num, kid)
         for kid in get_registry("a16w16", gfx, cu_num)
         if kid in defaults
     }
-    if gfx == "gfx950":
-        keys.update(
-            KernelKey("a8w8_blockscale_bpreshuffle", gfx, cu_num, kid)
-            for kid in get_registry("a8w8_blockscale_bpreshuffle", gfx, cu_num)
-            if kid == 0
-        )
-    return keys
 
 
 def _in_group(name, family, instance):
