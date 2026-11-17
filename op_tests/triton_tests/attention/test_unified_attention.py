@@ -2628,3 +2628,38 @@ def test_gluon_unified_attn_2d_sliding_window_loop_variants(
     torch.testing.assert_close(
         output.to(torch.float32), ref_output.to(torch.float32), atol=2e-2, rtol=1e-2
     )
+
+
+@pytest.mark.parametrize(
+    "seq_lens, key_bump",
+    [
+        ([(2048, 2048)], None),  # no cached prefix
+        ([(1024, 1024 + 114688)], None),  # after a 112K prefix
+        ([(1024, 9216), (1000, 9000), (17, 4113), (300, 1000)], None),  # mixed lengths
+        ([(5, 5), (64, 64), (130, 200), (300, 1000)], None),  # short chunks
+        # keys at the start of the reference's second tile, left of some rows' window
+        # start: those rows' sums underflow (exact rerun)
+        ([(2048, 10240)], (6208, 6212, 40.0)),
+        ([(2048, 10240)], (7000, 7500, 40.0)),  # scores far above the reference tiles
+        ([(1024, 6144), (2048, 10240)], (7000, 7100, 400.0)),  # inf L: exact rerun
+    ],
+)
+@pytest.mark.parametrize("sliding_window", [128, 2048])
+@torch.inference_mode()
+def test_gluon_unified_attn_2d_sliding_window_fixed_max(
+    seq_lens, key_bump, sliding_window
+):
+    """gfx1250 Gluon 2D loop variant 2 with a sliding window: the steady loop keeps a
+    fixed reference max per row from the window's first two tiles, and reruns a program
+    with the running max when a valid row's exp sum overflows or underflows."""
+    if DEVICE_ARCH != "gfx1250" or not _is_gluon_available():
+        pytest.skip("gfx1250 Gluon only")
+    launched, output, ref_output = _prefill_2d_run(
+        seq_lens, key_bump, sliding_window=sliding_window
+    )
+    if max(x[1] for x in seq_lens) >= 2048:
+        assert [x["LOOP_VARIANT"] for x in launched] == [2]
+    assert not torch.isnan(output).any()
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
+    )
