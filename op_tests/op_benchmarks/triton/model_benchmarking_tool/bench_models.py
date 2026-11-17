@@ -39,6 +39,7 @@ from op_tests.op_benchmarks.triton.bench_gemm_afp4wfp4 import (
     main as bench_gemm_afp4wfp4_main,
 )
 from op_tests.op_benchmarks.triton.bench_mha import main as bench_mha_main
+from op_tests.op_benchmarks.triton.bench_mhc_dsv4 import main as bench_mhc_dsv4_main
 from op_tests.op_benchmarks.triton.bench_mla_decode import main as bench_mla_main
 from op_tests.op_benchmarks.triton.bench_moe_gemm_a4w4 import (
     main as bench_moe_gemm_a4w4_main,
@@ -88,6 +89,7 @@ KERNEL_DICT: dict[str, Callable[[list[str]], None]] = {
     "rope": bench_rope_main,
     "mha": bench_mha_main,
     "mla": bench_mla_main,
+    "mhc": bench_mhc_dsv4_main,
     "sparse_mqa": bench_pa_decode_sparse_main,
     "unified_attention": bench_unified_attention_main,
 }
@@ -591,6 +593,43 @@ class SparseMqaKernelHandler(KernelHandler):
         }
 
 
+class MhcKernelHandler(KernelHandler):
+    """Handler for DeepSeek-V4 manifold-constrained hyper-connections."""
+
+    def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
+        return [shape.copy() for shape in shapes]
+
+    def build_args(self) -> str:
+        shape = self._shape
+        return (
+            f"-M {self._M} -n {shape['n']} -C {shape['C']} "
+            f"--op {shape['op']} --dtype bf16 --metric {self._metric}"
+        )
+
+    def parse_stdout(self, stdout: str) -> float:
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        last_row_values = list(
+            map(float, re.findall(r"-?\d+(?:\.\d+)?", lines[-1]))
+        )
+        if not last_row_values:
+            raise ValueError(f"Unexpected mhc bench output format: {lines[-1]!r}")
+        return last_row_values[-1]
+
+    def build_result_row(self, bench_result: float | str) -> ResultRow:
+        shape = self._shape
+        return {
+            "Model": self._model,
+            "Kernel": self._kernel,
+            "batch_size": self._batch_size,
+            "seq_len": self._seq_len,
+            "M": self._M,
+            "n": shape["n"],
+            "C": shape["C"],
+            "mhc_op": shape["op"],
+            self._metric: bench_result,
+        }
+
+
 class UnifiedAttnKernelHandler(KernelHandler):
     """Handler for unified attention benchmarks (bench_unified_attention.py)."""
 
@@ -657,6 +696,7 @@ _HANDLER_RULES: list[tuple[Callable[[str], bool], type[KernelHandler]]] = [
     (lambda k: k == "rope", RopeKernelHandler),
     (lambda k: k == "mha", MhaKernelHandler),
     (lambda k: k == "mla", MlaKernelHandler),
+    (lambda k: k == "mhc", MhcKernelHandler),
     (lambda k: k == "sparse_mqa", SparseMqaKernelHandler),
     (lambda k: k == "unified_attention", UnifiedAttnKernelHandler),
 ]
@@ -838,6 +878,13 @@ def run_benchmarks(
                 print(
                     f"Skipping mla for model '{model}': "
                     "bench_mla_decode.py has no config for this model."
+                )
+                continue
+
+            if kernel == "mhc" and metric == "throughput":
+                print(
+                    "Skipping mhc: throughput is not supported; "
+                    "use --metric time or bandwidth."
                 )
                 continue
 

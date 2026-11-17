@@ -72,7 +72,11 @@ def benchmark(args):
         {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
     )
 
-    x_vals = [(M, n, C) for M, n, C in _SHAPES]
+    x_vals = (
+        [(args.M, args.n, args.C)]
+        if args.M is not None and args.n is not None and args.C is not None
+        else _SHAPES
+    )
 
     config = triton.testing.Benchmark(
         x_names=["M", "n", "C"],
@@ -128,8 +132,11 @@ def benchmark(args):
     _run.run(save_path="." if args.o else None, print_data=True, show_plots=False)
 
 
-def parse_args():
+def parse_args(argv: list[str] | None = None):
     parser = get_parser(kernel_name="MHC DSV4 kernels")
+    parser.add_argument("-M", type=int, default=None, help="Number of tokens")
+    parser.add_argument("-n", type=int, default=None, help="Residual stream count")
+    parser.add_argument("-C", type=int, default=None, help="Hidden size per stream")
     parser.add_argument(
         "--op",
         choices=["pre", "post", "head"],
@@ -145,11 +152,15 @@ def parse_args():
         parser, action="--metric", choices=["time", "bandwidth"], default="time"
     )
     parser.add_argument("-o", action="store_true", default=False)
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    supplied_shape = (args.M is not None, args.n is not None, args.C is not None)
+    if any(supplied_shape) and not all(supplied_shape):
+        parser.error("-M, -n, and -C must be specified together")
+    return args
 
 
-def main():
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     torch.manual_seed(0)
     benchmark(args)
 
