@@ -1278,7 +1278,7 @@ def _mha_v4_fwd_sparse_launch_fake(
     del kv_block_indices, lut_start, lut_count, q_tile, kv_tile
 
 
-def _fmha_v4_fwd_varlen_fake(
+def _fmha_v4_fwd_thd_fake(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -1287,17 +1287,18 @@ def _fmha_v4_fwd_varlen_fake(
     max_seqlen: int,
     softmax_scale: float,
     causal: bool,
+    kv_splits: int = 1,
     lse: Optional[Tensor] = None,  # noqa: UP045
 ) -> None:
-    del q, k, v, out, cu_seqlens, max_seqlen, softmax_scale, causal, lse
+    del q, k, v, out, cu_seqlens, max_seqlen, softmax_scale, causal, kv_splits, lse
 
 
 @compile_ops(
     "module_fmha_v4_fwd",
-    fc_name="fmha_v4_fwd_varlen",
-    gen_fake=_fmha_v4_fwd_varlen_fake,
+    fc_name="fmha_v4_fwd_thd",
+    gen_fake=_fmha_v4_fwd_thd_fake,
 )
-def _fmha_v4_fwd_varlen(
+def _fmha_v4_fwd_thd(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -1306,12 +1307,13 @@ def _fmha_v4_fwd_varlen(
     max_seqlen: int,
     softmax_scale: float,
     causal: bool,
+    kv_splits: int = 1,
     lse: Optional[Tensor] = None,  # noqa: UP045
 ) -> None: ...
 
 
-@_launch_op("aiter::mha_v4_fwd_varlen_launch")
-def _mha_v4_fwd_varlen_launch(
+@_launch_op("aiter::mha_v4_fwd_thd_launch")
+def _mha_v4_fwd_thd_launch(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -1320,15 +1322,16 @@ def _mha_v4_fwd_varlen_launch(
     max_seqlen: int,
     softmax_scale: float,
     causal: bool,
+    kv_splits: int,
     lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
-    _fmha_v4_fwd_varlen(
-        q, k, v, out, cu_seqlens, max_seqlen, softmax_scale, causal, lse
+    _fmha_v4_fwd_thd(
+        q, k, v, out, cu_seqlens, max_seqlen, softmax_scale, causal, kv_splits, lse
     )
 
 
-@_mha_v4_fwd_varlen_launch.register_fake
-def _mha_v4_fwd_varlen_launch_fake(
+@_mha_v4_fwd_thd_launch.register_fake
+def _mha_v4_fwd_thd_launch_fake(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -1337,105 +1340,10 @@ def _mha_v4_fwd_varlen_launch_fake(
     max_seqlen: int,
     softmax_scale: float,
     causal: bool,
+    kv_splits: int,
     lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
-    del q, k, v, out, cu_seqlens, max_seqlen, softmax_scale, causal, lse
-
-
-def mha_v4_varlen_fwd(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    cu_seqlens: Tensor,
-    max_seqlen: int,
-    softmax_scale: Optional[float] = None,  # noqa: UP045
-    causal: bool = True,
-    out: Optional[Tensor] = None,  # noqa: UP045
-    return_lse: bool = False,
-    kv_splits: Union[int, str] = "auto",  # noqa: UP007
-) -> Union[Tensor, tuple[Tensor, Tensor]]:  # noqa: UP007
-    """Causal or non-causal BF16 attention over packed whole documents (gfx950).
-
-    q is [total_tokens, Hq, D], k and v [total_tokens, Hkv, D] with any Hq % Hkv == 0, documents
-    delimited by int32 cu_seqlens [batch + 1] (seqlen_q == seqlen_k per document), and max_seqlen
-    the longest document. Offsets are 64-bit, so packs past 4 GiB are fine. Returns out like q and,
-    with return_lse, the natural-log LSE as float32 [Hq, total_tokens].
-
-    kv_splits cuts each work-group's KV range into that many slices merged by their LSE; "auto"
-    (mha_v4_varlen_kv_splits) splits whenever the grid leaves CUs idle.
-    """
-    if kv_splits == "auto":
-        kv_splits = mha_v4_varlen_kv_splits(
-            cu_seqlens.numel() - 1, int(max_seqlen), q.shape[1], q.device, causal
-        )
-    if isinstance(kv_splits, bool) or not isinstance(kv_splits, int) or kv_splits < 1:
-        raise ValueError(
-            f'kv_splits must be a positive int or "auto", got {kv_splits!r}'
-        )
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** -0.5
-    if out is None:
-        out = torch.empty_like(q)
-    total, heads = q.shape[0], q.shape[1]
-    lse = (
-        torch.empty((heads, total), dtype=torch.float32, device=q.device)
-        if return_lse
-        else None
-    )
-    splits = kv_splits
-    if splits == 1:
-        _mha_v4_fwd_varlen_launch(
-            q, k, v, out, cu_seqlens, int(max_seqlen), float(softmax_scale), causal, lse
-        )
-        return (out, lse) if return_lse else out
-    partial_out = torch.empty((splits, *q.shape), dtype=q.dtype, device=q.device)
-    partial_lse = torch.empty(
-        (splits, heads, total), dtype=torch.float32, device=q.device
-    )
-    _mha_v4_fwd_varlen_launch(
-        q,
-        k,
-        v,
-        partial_out,
-        cu_seqlens,
-        int(max_seqlen),
-        float(softmax_scale),
-        causal,
-        partial_lse,
-    )
-    _merge_kv_splits(
-        partial_out,
-        partial_lse,
-        out.unsqueeze(0),
-        lse.unsqueeze(0) if lse is not None else None,
-    )
-    return (out, lse) if return_lse else out
-
-
-def mha_v4_varlen_kv_splits(
-    batch: int,
-    max_seqlen: int,
-    query_heads: int,
-    device: Optional[torch.device] = None,  # noqa: UP045
-    causal: bool = True,
-) -> int:
-    """The KV split count mha_v4_varlen_fwd(kv_splits="auto") uses for these shapes on `device`.
-
-    The causal grid is one work-group per (document, head, pair of Q tiles), and a CU holds one,
-    so a short pack with few heads leaves most CUs idle: 6/1 at 4K launches 48 of MI355X's 256.
-    This takes the most slices whose work-groups still fit on the CUs once each, since a second
-    slice on a CU reloads Q, and keeps every slice at least one Q tile of the (q_tiles + 1) * 256
-    keys a pair walks. On MI355X, 6/1 GPU time with the merge: 4K 0.170 -> 0.083 ms at 5 slices,
-    8K 0.311 -> 0.217 ms at 2; at 1K and 2K 6/1 and 12/2 still gained up to 8 slices.
-    Non-causal work-groups own one Q tile and walk all q_tiles * 256 keys.
-    """
-    q_tiles = -(-max_seqlen // _MHA_V4_Q_TILE)
-    q_groups, kv_tiles = (
-        ((q_tiles + 1) // 2, q_tiles + 1) if causal else (q_tiles, q_tiles)
-    )
-    work_groups = batch * query_heads * q_groups
-    cus = torch.cuda.get_device_properties(device).multi_processor_count
-    return max(1, min(cus // max(work_groups, 1), kv_tiles))
+    del q, k, v, out, cu_seqlens, max_seqlen, softmax_scale, causal, kv_splits, lse
 
 
 # (q_format, v_format) rows whose code object implements the LSE epilogue. The kernels branch on
@@ -2608,6 +2516,132 @@ def _validate_mha_v4_raw_inputs(
     return out
 
 
+def _resolve_thd_kv_splits(
+    kv_splits: Union[int, str],  # noqa: UP007
+    q: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+    causal: bool,
+    q_format: AttentionFormat,
+    v_format: AttentionFormat,
+) -> int:
+    """The KV slices a THD launch cuts each work-group's key walk into.
+
+    A causal work-group owns Q tile i and its mirror n - 1 - i, which together walk n + 1 tiles
+    of keys; a non-causal one owns one Q tile and walks all n. A slice keeps at least one Q tile
+    of that walk.
+
+    Not mha_v4_kv_splits(), whose rule is the dense fold's: this row slices inside the one
+    launch, so a count neither has to divide the keys nor costs a copy at any batch. "auto"
+    takes the most slices whose work-groups still fit on the CUs once, since a second slice on a
+    CU reloads Q: the causal grid is one work-group per (document, head, pair of Q tiles), so
+    6/1 heads at 4K launch 48 on MI355X's 256 CUs. There, 6/1 device time with the merge went
+    0.170 -> 0.083 ms at 4K (5 slices) and 0.311 -> 0.217 ms at 8K (2); at 1K and 2K, 6/1 and
+    12/2 still gained up to 8 slices.
+    """
+    q_tiles = -(-max_seqlen // _MHA_V4_Q_TILE)
+    q_groups, most = ((q_tiles + 1) // 2, q_tiles + 1) if causal else (q_tiles, q_tiles)
+    if kv_splits == "auto":
+        if _lse_unsupported(q_format, v_format) is not None:
+            return 1
+        work_groups = (cu_seqlens.numel() - 1) * q.shape[1] * q_groups
+        cus = torch.cuda.get_device_properties(q.device).multi_processor_count
+        return max(1, min(cus // max(work_groups, 1), most))
+    if isinstance(kv_splits, bool) or not isinstance(kv_splits, int) or kv_splits < 1:
+        raise ValueError(
+            f'kv_splits must be a positive int or "auto", got {kv_splits!r}'
+        )
+    if kv_splits == 1:
+        return 1
+    _check_lse_capable(q_format, v_format)
+    if kv_splits > most:
+        raise ValueError(
+            f"kv_splits={kv_splits} must leave every slice at least one {_MHA_V4_Q_TILE}-key "
+            f"tile: at most {most} for max_seqlen {max_seqlen}"
+            + (" under a causal mask" if causal else "")
+        )
+    return kv_splits
+
+
+def _mha_v4_thd(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    recipe: _RawRecipePlan,
+    q_format: AttentionFormat,
+    v_format: AttentionFormat,
+    cu_seqlens: Tensor,
+    max_seqlen: Optional[int],  # noqa: UP045
+    causal: bool,
+    softmax_scale: Optional[float],  # noqa: UP045
+    out: Optional[Tensor],  # noqa: UP045
+    return_lse: bool,
+    kv_splits: Union[int, str],  # noqa: UP007
+) -> Union[Tensor, tuple[Tensor, Tensor]]:  # noqa: UP007
+    """mha_v4 over THD operands; see its docstring. The launcher validates the tensors."""
+    if recipe.kind != _RawRecipeKind.BF16:
+        raise NotImplementedError(
+            "mha_v4 with cu_seqlens is implemented for all-BF16 operands only, got "
+            f"{q_format.name} Q/K with {v_format.name} V"
+        )
+    if max_seqlen is None:
+        raise ValueError(
+            "mha_v4 with cu_seqlens needs max_seqlen, its longest document"
+        )
+    if q.dim() != 3:
+        raise ValueError(
+            "mha_v4 with cu_seqlens expects THD [total_tokens, heads, head_dim] Q, K, and V"
+        )
+    _check_head_dim(q.shape[-1], q_format, v_format, False, "mha_v4", False)
+    if return_lse:
+        _check_lse_capable(q_format, v_format)
+    if out is None:
+        out = torch.empty_like(q)
+    elif out.shape != q.shape or out.dtype != q.dtype or out.device != q.device:
+        raise ValueError("out must match Q's shape/device and have BF16 dtype")
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    max_seqlen = int(max_seqlen)
+    splits = _resolve_thd_kv_splits(
+        kv_splits, q, cu_seqlens, max_seqlen, causal, q_format, v_format
+    )
+
+    # The launcher writes [splits, total, heads, head_dim] and [splits, heads, total]: the answer
+    # itself at one slice, and otherwise the partials lse_merge folds as one batch of `splits`.
+    total, heads = q.shape[0], q.shape[1]
+    sliced_out = (
+        out.unsqueeze(0)
+        if splits == 1
+        else torch.empty((splits, *q.shape), dtype=q.dtype, device=q.device)
+    )
+    sliced_lse = (
+        torch.empty((splits, heads, total), dtype=torch.float32, device=q.device)
+        if return_lse or splits > 1
+        else None
+    )
+    _mha_v4_fwd_thd_launch(
+        q,
+        k,
+        v,
+        sliced_out,
+        cu_seqlens,
+        max_seqlen,
+        float(softmax_scale),
+        causal,
+        splits,
+        sliced_lse,
+    )
+    if splits == 1:
+        return (out, sliced_lse[0]) if return_lse else out
+    lse = (
+        torch.empty((1, heads, total), dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
+    _merge_kv_splits(sliced_out, sliced_lse, out.unsqueeze(0), lse)
+    return (out, lse[0]) if return_lse else out
+
+
 def mha_v4(
     q: Tensor,
     k: Tensor,
@@ -2625,6 +2659,9 @@ def mha_v4(
     seqlens_k: Optional[Tensor] = None,  # noqa: UP045
     kv_splits: Union[int, str] = 1,  # noqa: UP007
     block_tile: Optional[tuple[int, int]] = None,  # noqa: UP045
+    cu_seqlens: Optional[Tensor] = None,  # noqa: UP045
+    max_seqlen: Optional[int] = None,  # noqa: UP045
+    causal: bool = False,
 ) -> Union[Tensor, tuple[Tensor, Tensor]]:  # noqa: UP007
     """Quantize BF16 BSHD operands and run non-causal MHA v4.
 
@@ -2667,7 +2704,52 @@ def mha_v4(
     merge's Triton launch, and at the short sequences it targets an eager call is already bound
     by host time: BF16/FP8 on MI355X at [1, 4352, 3, 128] took 40 us replayed at 4 splits
     against 61 us unsplit, but 105 us eager against 66 us.
+    ``cu_seqlens`` switches the operands to THD: whole documents concatenated along the token
+    axis, Q ``[total, Hq, D]`` and K/V ``[total, Hkv, D]`` for any ``Hq % Hkv == 0``, delimited
+    for Q and K alike by int32 ``cu_seqlens`` ``[batch + 1]``, with ``max_seqlen`` the longest
+    document. ``causal`` then keeps each query to its document's keys up to its own row. For
+    all-BF16 operands at head dimension 256 on gfx950, without ``block_mask`` or ``seqlens_k``.
+    ``out`` is shaped like Q and the LSE is ``[Hq, total]``. Token offsets are 64-bit, so a pack
+    may exceed 4 GiB. ``kv_splits`` here slices each work-group's key walk inside the one launch,
+    so a count has nothing to divide: a slice keeps at least 256 keys of the longest document's
+    walk, and the per-slice outputs hold a split pack's output under 4 GiB. ``"auto"`` takes the
+    most slices that still fit the grid on the CUs once.
     """
+    if cu_seqlens is not None:
+        if block_mask is not None or seqlens_k is not None:
+            raise NotImplementedError(
+                "mha_v4 with cu_seqlens attends over whole documents; it does not combine "
+                "with block_mask or seqlens_k"
+            )
+        return _mha_v4_thd(
+            q,
+            k,
+            v,
+            _resolve_raw_recipe(
+                q_format,
+                k_format,
+                v_format,
+                q_scale_mode,
+                k_scale_mode,
+                v_scale_mode,
+                sparse=False,
+            ),
+            q_format,
+            v_format,
+            cu_seqlens,
+            max_seqlen,
+            causal,
+            softmax_scale,
+            out,
+            return_lse,
+            kv_splits,
+        )
+    if causal:
+        raise NotImplementedError(
+            "mha_v4 masks causally over THD operands only; pass cu_seqlens and max_seqlen"
+        )
+    if max_seqlen is not None:
+        raise ValueError("max_seqlen is cu_seqlens' longest document; pass both")
     if return_lse:
         _check_lse_capable(q_format, v_format)
     # Checked before quantization so the MX paths fail here, not inside their own launcher.
