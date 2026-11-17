@@ -10,17 +10,14 @@ the flush broken: a group's first or last tile dropped, a flush every 8 tiles, o
 tile stored.
 """
 
-import sys
-from pathlib import Path
-
 import pytest
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "op_tests"))
-from mqa_logits_mxfp4_lane_max_ref import (
+from op_tests.mqa_logits_mxfp4_lane_max_ref import (
     LANE_MAX_KEYS,
     LANE_MAX_TILES,
     TILE,
+    _ceil,
     chunk_cuts,
     slot_errors,
 )
@@ -28,10 +25,6 @@ from mqa_logits_mxfp4_lane_max_ref import (
 # Every tensor names its device: `pytest tests` runs this file in one process with files that
 # import GPU scripts, and one of those sets torch's default device to cuda at import time.
 _CPU = torch.device("cpu")
-
-
-def _ceil(a, b):
-    return -(-a // b)
 
 
 # == mqa_assign, slot by slot =======================================================================
