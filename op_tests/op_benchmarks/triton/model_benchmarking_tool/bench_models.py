@@ -30,6 +30,8 @@ from op_tests.op_benchmarks.triton.bench_batched_gemm_afp4wfp4 import (
 )
 from op_tests.op_benchmarks.triton.bench_chunk_kda import (
     K3_HEAD_DIM as KDA_PREFILL_HEAD_DIM,
+)
+from op_tests.op_benchmarks.triton.bench_chunk_kda import (
     main as bench_chunk_kda_main,
 )
 from op_tests.op_benchmarks.triton.bench_fused_gdn_decode_qkvz import (
