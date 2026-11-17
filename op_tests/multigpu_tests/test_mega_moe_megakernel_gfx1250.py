@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""MegaMoEGfx1250's single-kernel paths on gfx1250: small_m (AITER_MEGA_DECODE)
-and large_m (AITER_MEGA_LARGE).
+"""MegaMoEGfx1250's single-kernel paths on gfx1250: slots (AITER_MEGAKERNEL_SLOTS_TOKENS)
+and compact (AITER_MEGAKERNEL_COMPACT).
 
-    python3 test_mega_moe_decode_gfx1250.py [--world N]
+    python3 test_mega_moe_megakernel_gfx1250.py [--world N]
 
 Spawns one rank per GPU (4 by default, 2 is the minimum). Anywhere else -- not
 gfx1250, fewer than two GPUs, no mori -- it prints why and exits 0, since CI's
@@ -15,13 +15,13 @@ combine, with and without a fused shared expert, for each megakernel:
   * the megakernel against the staged path of the same instance (its per-call
     switch), bit for bit and both ways round, at several token counts per
     rank, uneven across ranks;
-  * the path follows the step's receive bound: small_m runs the steps bounded
-    to AITER_MEGA_DECODE, large_m every larger one, and a compact plan started
-    for a step small_m serves is dropped;
+  * the path follows the step's receive bound: slots runs the steps bounded
+    to AITER_MEGAKERNEL_SLOTS_TOKENS, compact every larger one, and a compact plan started
+    for a step slots serves is dropped;
   * a captured graph's replay against the eager result, bit for bit.
 
-And large_m alone at a decode shape (96 experts a rank, up to 1024 tokens),
-one step on each of its kernels (LM_TILES): there its queue holds more items
+And compact alone at a decode shape (96 experts a rank, up to 1024 tokens),
+one step on each of its kernels (COMPACT_TILES): there its queue holds more items
 than CTAs, so a grid that is not resident at once deadlocks; it runs with
 timed-out waits counted instead of trapping.
 """
@@ -44,17 +44,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 HIDDEN, INTER, TOPK = 7168, 1024, 6
 EXPERTS_PER_RANK = 8
 # The instance's tokens per rank, and the steps the megakernel serves
-# (AITER_MEGA_DECODE): those whose receive bound is at most world * SMALL_TOKENS.
+# (AITER_MEGAKERNEL_SLOTS_TOKENS): those whose receive bound is at most world * SMALL_TOKENS.
 MAX_TOKENS = 64
 SMALL_TOKENS = 32
 # Tokens per rank of each step: rank r runs max(1, t - r), so the ranks differ.
 STEPS = (1, 7, 16, 32)
-# large_m's steps (unbounded, so past small_m): few tokens, then up to the
+# compact's steps (unbounded, so past slots): few tokens, then up to the
 # instance's MAX_TOKENS.
 LARGE_STEPS = (5, 33, 48, 64)
-# large_m's residency case: DSV4.1-Flash's expert shape and experts per rank,
+# compact's residency case: DSV4.1-Flash's expert shape and experts per rank,
 # and (tokens per rank, receive bound per rank or None) of its steps: one per
-# large_m kernel (LM_TILES' first row runs steps bounded to 512 tokens/rank).
+# compact kernel (COMPACT_TILES' first row runs steps bounded to 512 tokens/rank).
 RES_HIDDEN, RES_INTER, RES_EXPERTS_PER_RANK, RES_TOKENS = 5120, 2304, 96, 1024
 RES_STEPS = ((RES_TOKENS, None), (512, 512))
 
@@ -140,10 +140,14 @@ class _Case:
             max_tokens_per_rank=MAX_TOKENS,
         )
         self.mega = MegaMoEGfx1250.from_recipe(recipe, geometry, communicator=comm)
-        self.dmk = self.mega._ep.decode_mega
-        self.lmk = self.mega._ep.large_mega
-        assert self.dmk is not None, "AITER_MEGA_DECODE did not build small_m"
-        assert self.lmk is not None, "AITER_MEGA_LARGE did not build large_m"
+        self.slots = self.mega._ep.slots
+        self.compact = self.mega._ep.compact
+        assert (
+            self.slots is not None
+        ), "AITER_MEGAKERNEL_SLOTS_TOKENS did not build slots"
+        assert (
+            self.compact is not None
+        ), "AITER_MEGAKERNEL_COMPACT did not build compact"
 
     def step(self, tokens, seed):
         """(x, dispatch ids, weights, logical ids) of one step on this rank."""
@@ -170,10 +174,10 @@ class _Case:
 
     def layer(self, x, ids, wts, *, mega=True, bound="small", large=False):
         """One layer; ``bound`` is the step's recv_token_bound ("small": the
-        largest small_m serves). ``mega`` switches the megakernels on, large_m
+        largest slots serves). ``mega`` switches the megakernels on, compact
         only with ``large`` (otherwise larger steps run the staged path)."""
-        self.dmk.enabled = mega
-        self.lmk.enabled = mega and large
+        self.slots.enabled = mega
+        self.compact.enabled = mega and large
         w1, w2, w1s, w2s = self.weights
         y = self.mega(
             self.B._rmsnorm(x),
@@ -189,7 +193,7 @@ class _Case:
 
     def scramble(self, seed, tokens, **kw):
         """One staged step on other inputs: the regions the paths share
-        (comb_inp, and large_m's rows / rowmap) then hold none of the next
+        (comb_inp, and compact's rows / rowmap) then hold none of the next
         step's bytes, so a megakernel that skipped a write cannot pass on
         leftovers."""
         x, ids, wts, _, _ = self.step(max(1, tokens - self.rank), seed=seed)
@@ -200,7 +204,7 @@ class _Case:
 
 
 def _check_small(case, comm):
-    label = f"small_m, shared={case.n_shared}"
+    label = f"slots, shared={case.n_shared}"
     check = _Checks(label)
     B = case.B
     for i, t in enumerate(STEPS):
@@ -218,15 +222,15 @@ def _check_small(case, comm):
         diff = B._calc_diff(mega, ref)
         tol = B.default_logits_tol("a4w4_mxfp4", "none", 1)
         check(diff <= tol, f"{what}: diff {diff:.5f} > tol {tol:.5f}")
-        check(case.dmk.errors() == 0, f"{what}: expert slot overflow")
+        check(case.slots.errors() == 0, f"{what}: expert slot overflow")
         check.settle()
 
     # The path follows the bound: the megakernel serves only steps bounded to
     # world * SMALL_TOKENS, whatever the instance holds.
-    dmk = case.dmk
-    check(dmk.serves(case.small_bound), "small bound not served")
-    check(not dmk.serves(case.small_bound + 1), "bound past the slots served")
-    check(not dmk.serves(None), "unbounded step served (instance > small)")
+    slots = case.slots
+    check(slots.serves(case.small_bound), "small bound not served")
+    check(not slots.serves(case.small_bound + 1), "bound past the slots served")
+    check(not slots.serves(None), "unbounded step served (instance > small)")
     check.settle()
     x, ids, wts, _, _ = case.step(SMALL_TOKENS - case.rank, seed=71)
     small = case.layer(x, ids, wts).clone()
@@ -268,16 +272,19 @@ def _check_small(case, comm):
 
 
 def _check_large(case, comm):
-    label = f"large_m, shared={case.n_shared}"
+    label = f"compact, shared={case.n_shared}"
     check = _Checks(label)
     B = case.B
     ep = case.mega._ep
-    case.dmk.enabled = case.lmk.enabled = True
-    check(ep.mega_for(case.small_bound) is case.dmk, "small bound not on small_m")
-    check(ep.mega_for(case.small_bound + 1) is case.lmk, "larger bound not on large_m")
-    check(ep.mega_for(None) is case.lmk, "unbounded step not on large_m")
+    case.slots.enabled = case.compact.enabled = True
+    check(ep.megakernel_for(case.small_bound) is case.slots, "small bound not on slots")
+    check(
+        ep.megakernel_for(case.small_bound + 1) is case.compact,
+        "larger bound not on compact",
+    )
+    check(ep.megakernel_for(None) is case.compact, "unbounded step not on compact")
     check.settle()
-    # Unbounded steps, then one bounded between small_m's and the instance's.
+    # Unbounded steps, then one bounded between the slots megakernel's and the instance's.
     steps = [(t, None) for t in LARGE_STEPS] + [(40, case.world * 48)]
     for i, (t, bound) in enumerate(steps):
         tokens = max(1, t - case.rank)
@@ -288,8 +295,8 @@ def _check_large(case, comm):
         again = case.layer(x, ids, wts, bound=bound, large=True).clone()
         torch.cuda.synchronize()
         what = f"tokens={tokens} bound={bound}"
-        check(torch.equal(mega, staged), f"{what}: large_m != staged")
-        check(torch.equal(mega, again), f"{what}: large_m not deterministic")
+        check(torch.equal(mega, staged), f"{what}: compact != staged")
+        check(torch.equal(mega, again), f"{what}: compact not deterministic")
         ref = (x.float() + case.ref.layer(x.float(), l_ids, l_wts)).to(torch.bfloat16)
         diff = B._calc_diff(mega, ref)
         tol = B.default_logits_tol("a4w4_mxfp4", "none", 1)
@@ -320,7 +327,7 @@ def _check_large(case, comm):
 
 
 def _check_resident(rank, world, comm, device):
-    """large_m at a decode shape: bit for bit against the staged path, and no
+    """compact at a decode shape: bit for bit against the staged path, and no
     wait timed out. Built with AITER_DMK_NOTRAP and a short timeout, so a grid
     whose CTAs are not all resident shows up as counted timeouts, not a trap."""
     import bench_mega_moe as B
@@ -332,7 +339,7 @@ def _check_resident(rank, world, comm, device):
     )
 
     H, I, EPR = RES_HIDDEN, RES_INTER, RES_EXPERTS_PER_RANK
-    check = _Checks("large_m resident grid")
+    check = _Checks("compact resident grid")
     spec = B.resolve_spec("a4w4_mxfp4")
     g = torch.Generator(device=device).manual_seed(4049 + 7919 * rank)
     w1 = torch.randn(EPR, 2 * I, H, generator=g, device=device, dtype=torch.bfloat16)
@@ -359,16 +366,18 @@ def _check_resident(rank, world, comm, device):
         max_tokens_per_rank=RES_TOKENS,
     )
     mega = MegaMoEGfx1250.from_recipe(recipe, geometry, communicator=comm)
-    lmk = mega._ep.large_mega
+    compact = mega._ep.compact
     try:
-        assert lmk is not None, "AITER_MEGA_LARGE did not build large_m"
-        assert len(lmk.variants) >= len(RES_STEPS), "fewer large_m kernels than steps"
+        assert compact is not None, "AITER_MEGAKERNEL_COMPACT did not build compact"
+        assert len(compact.variants) >= len(
+            RES_STEPS
+        ), "fewer compact kernels than steps"
         for i, (t, per_rank) in enumerate(RES_STEPS):
             tokens = max(1, t - 3 * rank)
             bound = None if per_rank is None else world * per_rank
             check(
-                lmk.for_bound(bound) is lmk.variants[-1 - i],
-                f"tokens={tokens} bound={bound}: not on large_m kernel {-1 - i}",
+                compact.for_bound(bound) is compact.variants[-1 - i],
+                f"tokens={tokens} bound={bound}: not on compact kernel {-1 - i}",
             )
             ids, wts = B.make_routings(
                 1, tokens, EPR * world, TOPK, device, seed=31 * i + 100 * rank
@@ -378,7 +387,7 @@ def _check_resident(rank, world, comm, device):
             x = B._rmsnorm(x)
 
             def layer(on, x=x, ids=ids, wts=wts, bound=bound):
-                lmk.enabled = on
+                compact.enabled = on
                 return mega(
                     x,
                     wts,
@@ -393,9 +402,11 @@ def _check_resident(rank, world, comm, device):
             large, staged, again = layer(True), layer(False), layer(True)
             torch.cuda.synchronize()
             what = f"tokens={tokens} bound={bound}"
-            check(sum(lmk.fails()) == 0, f"{what}: timed-out waits {lmk.fails()}")
-            check(torch.equal(large, staged), f"{what}: large_m != staged")
-            check(torch.equal(large, again), f"{what}: large_m not deterministic")
+            check(
+                sum(compact.fails()) == 0, f"{what}: timed-out waits {compact.fails()}"
+            )
+            check(torch.equal(large, staged), f"{what}: compact != staged")
+            check(torch.equal(large, again), f"{what}: compact not deterministic")
             check.settle()
     finally:
         torch.cuda.synchronize()
@@ -412,8 +423,8 @@ def _worker(local_rank, world, port, failures):
         WORLD_SIZE=str(world),
         LOCAL_RANK=str(local_rank),
         AITER_FORCE_A8W4="0",
-        AITER_MEGA_DECODE=str(SMALL_TOKENS),
-        AITER_MEGA_LARGE="1",
+        AITER_MEGAKERNEL_SLOTS_TOKENS=str(SMALL_TOKENS),
+        AITER_MEGAKERNEL_COMPACT="1",
     )
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
@@ -447,9 +458,9 @@ def _worker(local_rank, world, port, failures):
             print(f"[{name}] {status}", flush=True)
         dist.barrier()
     # Read when the kernel is built: this case's kernels count timed-out waits
-    # (dmk.fails()) and go on, so a deadlocked grid fails the check, not the GPU.
+    # (slots.fails()) and go on, so a deadlocked grid fails the check, not the GPU.
     os.environ.update(AITER_DMK_NOTRAP="1", AITER_DMK_TIMEOUT_S="10")
-    name = "large_m resident grid"
+    name = "compact resident grid"
     try:
         _check_resident(local_rank, world, comm, device)
         status = "ok"
@@ -470,7 +481,7 @@ def main():
     args = parser.parse_args()
     reason = _skip_reason()
     if reason is not None:
-        print(f"SKIP test_mega_moe_decode_gfx1250: {reason}")
+        print(f"SKIP test_mega_moe_megakernel_gfx1250: {reason}")
         return 0
     world = min(args.world, torch.cuda.device_count())
     with socket.socket() as s:
@@ -479,7 +490,7 @@ def main():
     failures = mp.get_context("spawn").Manager().dict()
     mp.spawn(_worker, args=(world, port, failures), nprocs=world, join=True)
     bad = sum(failures.values())
-    print("test_mega_moe_decode_gfx1250:", "FAILED" if bad else "passed")
+    print("test_mega_moe_megakernel_gfx1250:", "FAILED" if bad else "passed")
     return 1 if bad else 0
 
 

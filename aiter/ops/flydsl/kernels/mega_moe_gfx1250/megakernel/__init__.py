@@ -11,7 +11,7 @@ gfx950 small-M MegaMoE (ROCm/aiter#6881). Every CTA of an all-resident grid of
 1. PRODUCE. One wave per local route (token, k). Lane 0 reserves a slot of the
    destination expert with one SCOPE_SYS buffer atomic on that rank's
    ``running[parity][expert]`` (expert ``e`` owns rows ``[e * cap, (e + 1) *
-   cap)`` of ``dmk_disp``; ``cap`` covers every token of every rank); the
+   cap)`` of ``slots_rows``; ``cap`` covers every token of every rank); the
    token's bf16 row, loaded first, is quantized to the fp4 wire in registers
    meanwhile (per-1x32 MX with the HIP quant's RoundUp scale and amax floor,
    so the bytes match the staged wire); the row and its ``(meta, w)`` rowmap
@@ -45,7 +45,7 @@ gfx950 small-M MegaMoE (ROCm/aiter#6881). Every CTA of an all-resident grid of
    then sums its tokens' top-k slots in k order in fp32, the staged reduce's
    arithmetic, so the output is bitwise the staged one.
 
-large_m (``layout="compact"``, AITER_MEGA_LARGE) replaces 1. with a count-first
+compact (``layout="compact"``, AITER_MEGAKERNEL_COMPACT) replaces 1. with a count-first
 front end on the staged compact layout (expert-major, each expert padded to
 ``tile_m``, sources in rank order inside it), so its rows, m-tiles and GEMMs
 are the staged path's, without per-expert slots sized for every token:
@@ -64,33 +64,33 @@ are the staged path's, without per-expert slots sized for every token:
     CTA's send gate and stores the row and its rowmap pair at each route's row.
     Then 2. to 5., the plan from the receive counts CTA 0 already holds.
 
-Forward progress: producers wait on nothing (large_m's on CTA 0's layout, which
+Forward progress: producers wait on nothing (compact's on CTA 0's layout, which
 waits only on the peers' tallies); the plan waits only on producers (all ranks
 run theirs first); a GEMM1 item waits on nothing; a GEMM2 item waits only on
 GEMM1 items already claimed; the reduce waits on the peers' closes, which
 depend only on the above. All CTAs must be resident at once (the grid is the CU
-count times ``DMK_CTAS_PER_CU`` for small_m, the ``LM_TILES`` row's CTAs per CU
-for a large_m kernel, and no other kernel may hold CUs). A wait
+count times ``SLOTS_CTAS_PER_CU`` for slots, the ``COMPACT_TILES`` row's CTAs per CU
+for a compact kernel, and no other kernel may hold CUs). A wait
 traps after ``TIMEOUT_S``: a peer's launch may start seconds late.
 
-Cross-launch reuse: rank s writes d's ``dmk_disp`` / ``dmk_rowmap`` /
+Cross-launch reuse: rank s writes d's ``slots_rows`` / ``slots_rowmap`` /
 ``running`` in launch L+1 only after s's launch L ended, which needed d's close
 of L, which comes after every read d made of them in L (and after CTA 0 reset
 the counters launch L+1 uses). Rows of ``comb_inp`` on s are written in L+1
-only for tokens s produced in L+1, i.e. after s's reduce of L. large_m sends to
+only for tokens s produced in L+1, i.e. after s's reduce of L. compact sends to
 d only once d's X1 row of the same launch arrived, i.e. once d's previous
-launch ended; that holds whichever path (large_m or staged, which share
+launch ended; that holds whichever path (compact or staged, which share
 ``disp_out``, ``ep_rowmap`` and ``comb_inp``) ran it, as the staged dispatch
 likewise waits for d's counts.
 
-Start handshake (off by default, ``AITER_DMK_NO_HS=0`` turns it on): small_m
+Start handshake (off by default, ``AITER_DMK_NO_HS=0`` turns it on): slots
 then sends only once every peer's ``started`` flag carries this launch's
 generation, which CTA 0 polls and passes on through each CTA's send gate. It
 was added when writes that reached a rank still between two launches came out
 corrupted now and then (about 1 in 400 calls had one token wrong). That no
 longer reproduces: without it, ~72k calls with up to 1 ms of random launch skew
 between ranks and staged calls interleaved matched the staged path bit for
-bit (4x gfx1250), and it costs ~5 us per launch. large_m needs no such step:
+bit (4x gfx1250), and it costs ~5 us per launch. compact needs no such step:
 its rows go out after every peer's X1.
 
 Generation and parity come from u64 entry tickets (``G`` per launch over
@@ -126,9 +126,9 @@ from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
 from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE as _MX_ROUND_UP
 from aiter.utility.mx_types import MxDtypeInt as _MxDtype
 
-from .compact_plan import _wave32_inclusive_scan_i32
-from .config import _WAVE_SIZE as WAVE
-from .s1f_stage1 import (
+from ..compact_plan import _wave32_inclusive_scan_i32
+from ..config import _WAVE_SIZE as WAVE
+from ..s1f_stage1 import (
     _OOB,
     GEN_MOD,
     SCOPE_DEV,
@@ -169,21 +169,21 @@ GATE_STRIDE = 32
 PLAN_PK = 32
 #: Plan replicas: CTA c reads replica c % PLAN_REPS, so a line is read by
 #: G / PLAN_REPS CTAs, not by all of them (32 readers on a line cost ~10 us).
-#: A replica is the experts' row counts: 16 bits each for small_m, whose slots
-#: cap an expert at 65535 rows; 32 for large_m, whose experts may receive more.
+#: A replica is the experts' row counts: 16 bits each for slots, whose slots
+#: cap an expert at 65535 rows; 32 for compact, whose experts may receive more.
 PLAN_REPS = 128
 
 #: Words between two experts' slot counters: each on its own 128 B line, so
 #: the peers' atomics on different experts do not serialize on one line.
 RUN_STRIDE = 32
 
-#: Arena control region (``dmk_ctl``), bytes. ``running[2][EPR_PAD]`` takes the
+#: Arena control region (``slots_ctl``), bytes. ``running[2][EPR_PAD]`` takes the
 #: peers' slot atomics; ``src_done`` / ``comb_flag`` one 256 B line per source,
 #: each array room for the most ranks the kernels admit (one wave of them).
 FLAG_STRIDE = 256
 FLAG_SPAN = WAVE * FLAG_STRIDE
 
-#: Compact layout (large_m): routes one tally CTA counts at most (its LDS route
+#: Compact layout: routes one tally CTA counts at most (its LDS route
 #: table), the most tally CTAs, the words between two segments' global
 #: counters, the send-table replicas, and the bits of a route slot's segment
 #: field.
@@ -199,16 +199,16 @@ N_SREP = 16
 SEG_BITS = 10
 #: LDS the compact front end may take out of the GEMM arena on the host's
 #: admission check (the kernel checks against the arena it actually builds;
-#: large_m's default GEMM arena is ~70 KB).
-LM_SCRATCH_MAX = 48 << 10
+#: compact's default GEMM arena is ~70 KB).
+COMPACT_SCRATCH_MAX = 48 << 10
 
 
-def lm_scratch_bytes(*, npes: int, experts_per_rank: int) -> int:
+def compact_scratch_bytes(*, npes: int, experts_per_rank: int) -> int:
     """LDS the compact front end uses in the GEMM arena: CTA 0's X1 matrix,
     send table and receive counts, or a tally CTA's histogram, bases and
     route table, whichever is larger."""
-    segs = dmk_segs_pad(npes=npes, experts_per_rank=experts_per_rank)
-    lead = (int(npes) + 1) * segs * 4 + dmk_epr_pad(experts_per_rank) * 4
+    segs = segs_pad(npes=npes, experts_per_rank=experts_per_rank)
+    lead = (int(npes) + 1) * segs * 4 + epr_pad(experts_per_rank) * 4
     tally = 2 * segs * 4 + TALLY_MAXR * 4
     return max(lead, tally)
 
@@ -244,14 +244,14 @@ PREF_DEPTH = 8
 RED_ELEMS = WAVE * 16
 
 
-def dmk_ctl_arena_bytes(*, npes: int, experts_per_rank: int) -> int:
-    """Bytes of the arena's ``dmk_ctl`` region: slot counters, then src_done,
+def ctl_arena_bytes(*, npes: int, experts_per_rank: int) -> int:
+    """Bytes of the arena's ``slots_ctl`` region: slot counters, then src_done,
     comb_flag (``FLAG_SPAN`` apart), started and reserved (one line per
     source each)."""
-    return dmk_src_off(experts_per_rank) + 2 * FLAG_SPAN + 2 * npes * FLAG_STRIDE
+    return src_off(experts_per_rank) + 2 * FLAG_SPAN + 2 * npes * FLAG_STRIDE
 
 
-def dmk_epr_pad(experts_per_rank: int) -> int:
+def epr_pad(experts_per_rank: int) -> int:
     """Experts rounded up to whole wave chunks, an even number of them past
     one (the plan packs two 16-bit counts per dword across chunk pairs)."""
     ch = (int(experts_per_rank) + WAVE - 1) // WAVE
@@ -260,20 +260,20 @@ def dmk_epr_pad(experts_per_rank: int) -> int:
     return ch * WAVE
 
 
-def dmk_src_off(experts_per_rank: int) -> int:
+def src_off(experts_per_rank: int) -> int:
     """The peer flags start 64 KB past the slot counters: CTA 0 polls them
     while the peers' slot atomics land on the counters."""
-    run_bytes = 2 * dmk_epr_pad(experts_per_rank) * RUN_STRIDE * 4
+    run_bytes = 2 * epr_pad(experts_per_rank) * RUN_STRIDE * 4
     return (run_bytes + (64 << 10) - 1) // (64 << 10) * (64 << 10)
 
 
-def dmk_segs_pad(*, npes: int, experts_per_rank: int) -> int:
+def segs_pad(*, npes: int, experts_per_rank: int) -> int:
     """Compact layout: (destination, local expert) segments, padded to 128 so
     one wave covers a row of them with a b128 per lane."""
     return (int(npes) * int(experts_per_rank) + 127) // 128 * 128
 
 
-def dmk_ctl_layout(
+def ctl_layout(
     *, experts_per_rank: int, mt_cap: int, workers: int, npes: int = 0, compact=False
 ):
     """Word offsets of the local control block: the per-m-tile GEMM1 lines,
@@ -282,11 +282,11 @@ def dmk_ctl_layout(
     segment counters and the send-table replicas. No line is read or
     polled by more than a few CTAs: hundreds of CTAs on one uncached line
     serialize at its DRAM bank."""
-    epr_pad = dmk_epr_pad(experts_per_rank)
+    pad = epr_pad(experts_per_rank)
     plan = CTL_G1 + int(mt_cap) * G1_STRIDE
     # A replica holds WAVE packed-count dwords per chunk pair (one pair at
     # least); the tagged replicas store each as a (counts, generation) i64.
-    plan_slot = 2 * WAVE * max(1, epr_pad // WAVE // 2)
+    plan_slot = 2 * WAVE * max(1, pad // WAVE // 2)
     gate_p = plan + PLAN_REPS * plan_slot
     gate_c = gate_p + int(workers) * GATE_STRIDE
     gate_s = gate_c + int(workers) * GATE_STRIDE
@@ -301,7 +301,7 @@ def dmk_ctl_layout(
         "gate_r": gate_r,
     }
     if compact:
-        segs = dmk_segs_pad(npes=npes, experts_per_rank=experts_per_rank)
+        segs = segs_pad(npes=npes, experts_per_rank=experts_per_rank)
         lay["seg_cnt"] = end
         lay["srep"] = end + segs * SEG_STRIDE
         end = lay["srep"] + N_SREP * segs
@@ -309,9 +309,9 @@ def dmk_ctl_layout(
     return lay
 
 
-def dmk_ctl_words(**kw) -> int:
+def ctl_words(**kw) -> int:
     """i32 words of the local control block."""
-    return dmk_ctl_layout(**kw)["words"]
+    return ctl_layout(**kw)["words"]
 
 
 def _load_i32_sys(rsrc, word, *, volatile=True):
@@ -339,7 +339,7 @@ def _load_i32_dev(rsrc, word):
     )
 
 
-def make_decode_mega(
+def make_megakernel(
     *,
     rank,
     npes,
@@ -370,11 +370,11 @@ def make_decode_mega(
     layout="slots",
     mt_cap=None,
 ):
-    """Build the decode megakernel; returns a ``@flyc.jit`` launcher.
+    """Build a megakernel; returns a ``@flyc.jit`` launcher.
 
-    ``layout="slots"`` (small_m): expert ``e`` owns rows ``[e*cap, (e+1)*cap)``
-    and a route reserves its slot with a remote atomic. ``layout="compact"``
-    (large_m): the staged compact layout (expert-major, each expert padded to
+    ``layout="slots"``: expert ``e`` owns rows ``[e*cap, (e+1)*cap)``
+    and a route reserves its slot with a remote atomic.
+    ``layout="compact"``: the staged compact layout (expert-major, each expert padded to
     ``tile_m``, sources in rank order inside it), laid out from one tagged
     count exchange (X1); ``mt_cap`` m-tiles at most.
 
@@ -390,7 +390,7 @@ def make_decode_mega(
     if layout not in ("slots", "compact"):
         raise ValueError(f"layout must be slots or compact, got {layout!r}")
     if WAVE != 32:
-        raise ValueError("the decode megakernel requires gfx1250 wave32")
+        raise ValueError("the megakernel requires gfx1250 wave32")
     H, I = int(model_dim), int(inter_dim)
     E, EPR, K = int(experts), int(experts_per_rank), int(topk)
     TM, G = int(tile_m), int(workers)
@@ -410,9 +410,9 @@ def make_decode_mega(
         raise ValueError(f"workers={G} must be a multiple of {WAVE} and {N_TICKET}")
     if npes > WAVE or E != npes * EPR:
         raise ValueError("experts must split evenly over at most 32 ranks")
-    EPR_PAD = dmk_epr_pad(EPR)
+    EPR_PAD = epr_pad(EPR)
     EPR_CH = EPR_PAD // WAVE
-    SRC_OFF = dmk_src_off(EPR)
+    SRC_OFF = src_off(EPR)
     CF_OFF = SRC_OFF + FLAG_SPAN
     ST_OFF = SRC_OFF + 2 * FLAG_SPAN
     RS_OFF = ST_OFF + npes * FLAG_STRIDE
@@ -425,7 +425,7 @@ def make_decode_mega(
         raise ValueError("tile_n / tile_n2 must divide 2*inter_dim / model_dim")
     DEST_STRIDE = int(max_tok_per_rank) * K
     RED_CH = H // RED_ELEMS
-    _lay = dmk_ctl_layout(
+    _lay = ctl_layout(
         experts_per_rank=EPR, mt_cap=MT_CAP, workers=G, npes=npes, compact=COMPACT
     )
     CTL_WORDS = _lay["words"]
@@ -433,14 +433,16 @@ def make_decode_mega(
     GATE_P, GATE_C, GATE_S = _lay["gate_p"], _lay["gate_c"], _lay["gate_s"]
     GATE_R = _lay["gate_r"]
     if not COMPACT and CAP > 0xFFFF:
-        raise ValueError("small_m's plan replicas hold an expert's rows in 16 bits")
-    # Plan replica dwords per lane: small_m packs two 16-bit counts a dword,
-    # large_m stores one count a dword (an expert may receive past 65535 rows).
+        raise ValueError(
+            "the slots layout's plan replicas hold an expert's rows in 16 bits"
+        )
+    # Plan replica dwords per lane: slots packs two 16-bit counts a dword,
+    # compact stores one count a dword (an expert may receive past 65535 rows).
     REP_W = EPR_CH if COMPACT else max(1, EPR_CH // 2)
-    SEGS_PAD = dmk_segs_pad(npes=npes, experts_per_rank=EPR)
+    SEGS_PAD = segs_pad(npes=npes, experts_per_rank=EPR)
     if COMPACT:
         SEG_CNT_W, SREP_W = _lay["seg_cnt"], _lay["srep"]
-        if npes * SEGS_PAD * 4 > dmk_src_off(EPR) or SEGS_PAD > (1 << SEG_BITS):
+        if npes * SEGS_PAD * 4 > src_off(EPR) or SEGS_PAD > (1 << SEG_BITS):
             raise ValueError("the X1 rows do not fit the control region")
         MAXR = int(max_tok_per_rank) * K
         T_MAX = min(TALLY_MAX, G - 1)
@@ -451,7 +453,7 @@ def make_decode_mega(
             raise ValueError(f"AITER_LM_TALLY_CHUNK must be in 1..{TALLY_MAXR}")
     TR_BASE = CTL_WORDS  # i64 stamps [G][TR_N] after the control words
     RT_BASE = TR_BASE + 2 * G * TR_N  # i64 [RT_N][4] per-route stamps
-    CTL_ARENA_B = dmk_ctl_arena_bytes(npes=npes, experts_per_rank=EPR)
+    CTL_ARENA_B = ctl_arena_bytes(npes=npes, experts_per_rank=EPR)
 
     from aiter.ops.flydsl.grouped_moe_gfx1250 import get_wmma_m_rep
 
@@ -481,7 +483,7 @@ def make_decode_mega(
     # Debug only: every wave idles this many us after its ticket (lets every
     # rank's launch start before anyone sends).
     DELAY_US = int(os.environ.get("AITER_DMK_DELAY_US", "0"))
-    # small_m's start handshake is off by default; AITER_DMK_NO_HS=0 restores it.
+    # The slots layout's start handshake is off by default; AITER_DMK_NO_HS=0 restores it.
     HS = not int(os.environ.get("AITER_DMK_NO_HS", "1"))
     TIMEOUT_TICKS = int(
         float(os.environ.get("AITER_DMK_TIMEOUT_S", TIMEOUT_S)) * NOW_HZ
@@ -522,10 +524,10 @@ def make_decode_mega(
     PREF_B = min(PREF_B, int(tile_n) * (H // 2))
     # Every CTA of the grid must be resident: a 4-wave CTA puts one wave on
     # each SIMD, so ctas_per_cu CTAs need that many waves per EU, which caps
-    # the VGPRs (large_m at 4 CTAs per CU: 128). AITER_DMK_WPE=0 drops the cap.
+    # the VGPRs (compact at 4 CTAs per CU: 128). AITER_DMK_WPE=0 drops the cap.
     WPE = int(os.environ.get("AITER_DMK_WPE", str(int(ctas_per_cu))))
     # AITER_DMK_RED_UNROLL: (token, chunk) items a reduce wave loads at once.
-    # Its passes wait out their loads; large_m's waves own up to ~5 items each
+    # Its passes wait out their loads; compact's waves own up to ~5 items each
     # (V4.1-Flash DEP4, 2048 tokens/rank: the reduce 19 -> 14 us at 2).
     RED_UN_DEF = 2 if COMPACT else 1
     RED_UN = int(os.environ.get("AITER_DMK_RED_UNROLL", str(RED_UN_DEF)))
@@ -657,14 +659,14 @@ def make_decode_mega(
         BC_B = 64
         PLAN_B = 3 * EPR_PAD * 4
         CTRL_B = BC_B + PLAN_B
-        if COMPACT and lm_scratch_bytes(npes=npes, experts_per_rank=EPR) > ARENA:
+        if COMPACT and compact_scratch_bytes(npes=npes, experts_per_rank=EPR) > ARENA:
             raise ValueError("the compact front end's LDS does not fit the GEMM arena")
         if int(ctas_per_cu) * (((ARENA + CTRL_B) + 2047) // 2048 * 2048) > 327680:
             raise ValueError(
                 f"{ctas_per_cu} CTAs of {ARENA + CTRL_B} B LDS do not fit one CU"
             )
         kname = (
-            ("large_mega" if COMPACT else "decode_mega")
+            ("mega_compact" if COMPACT else "mega_slots")
             + f"_w{G}_r{rank}of{npes}_c{CAP if not COMPACT else MT_CAP * TM}"
             + (f"_ph{PH}" if PH != 15 else "")
             + knob_sfx
@@ -823,7 +825,7 @@ def make_decode_mega(
                             * fx.Int32(RUN_STRIDE),
                             cache_modifier=SCOPE_SYS,
                         )
-                # Lane 3 resets the tally (large_m) or reserved (EARLY) count.
+                # Lane 3 resets the tally (compact) or reserved (EARLY) count.
                 if lane < fx.Int32(4 if (COMPACT or EARLY) else 3):
                     buffer_store(
                         fx.Int32(0),
@@ -884,8 +886,8 @@ def make_decode_mega(
 
             def lead_plan_lds(cnts):
                 """CTA 0, wave 0: its own LDS plan from the per-expert counts,
-                and the counts for the replicas: large_m's one per dword
-                (dword e = cnt(e)), small_m's packed two per dword (dword w =
+                and the counts for the replicas: compact's one per dword
+                (dword e = cnt(e)), slots' packed two per dword (dword w =
                 cnt(2w) | cnt(2w + 1) << 16, built by bpermute)."""
                 plan_from_counts(cnts)
                 if const_expr(COMPACT):
@@ -1051,7 +1053,7 @@ def make_decode_mega(
                     comm_ops.store_i32_lds(fx.Int64(bc + fx.Int32(8)), carry)
 
             if const_expr(not COMPACT and HS):  # noqa: SIM102 - preserve DSL staging
-                # ---- start handshake (small_m, AITER_DMK_NO_HS=0) ----
+                # ---- start handshake (slots, AITER_DMK_NO_HS=0) ----
                 # A peer writes this rank's counters, rows and rowmap only once
                 # this launch has started (see the module docstring).
                 if (bid == fx.Int32(0)) & (wave == fx.Int32(0)):
@@ -1072,7 +1074,7 @@ def make_decode_mega(
             n_mine = fx.Int32(0)
             n_routes = tok * fx.Int32(K)
             if const_expr(COMPACT):
-                # ======== 1. FRONT-END (compact layout, large_m) ========
+                # ======== 1. FRONT-END (compact layout, compact) ========
                 # LDS scratch in the GEMM arena (no GEMM item runs before the
                 # plan gate): a tally CTA's histogram, bases and route table;
                 # CTA 0's X1 matrix, send table and receive counts.
@@ -1798,8 +1800,8 @@ def make_decode_mega(
             # ======================== 2. PLAN ========================
             # CTA 0 alone polls the peers' src_done (hundreds of CTAs polling
             # the same uncached lines starve every access queued behind them).
-            # small_m: it then lays out the plan, publishes it to the local
-            # control block and opens each CTA's own gate line. large_m laid
+            # slots: it then lays out the plan, publishes it to the local
+            # control block and opens each CTA's own gate line. compact laid
             # the plan out from X1 and published it with the send gates: the
             # gate opened here only tells GEMM1's A owners the rows landed.
             if bid == fx.Int32(0):
@@ -2011,7 +2013,7 @@ def make_decode_mega(
                     e_, mt_idx, rows = decode_mtile(i)
                     if const_expr(COMPACT or EARLY):
                         # GEMM2's epilogue loads its rows' rowmap pairs before
-                        # a_ready, and large_m / EARLY start the queue before
+                        # a_ready, and compact / EARLY start the queue before
                         # the peers' rows land: every wave waits for them
                         # first. Once open, the gate costs one load per item.
                         wait_gate(GATE_P if COMPACT else GATE_R, GATE_STRIDE, 7)
@@ -2201,7 +2203,7 @@ def _popc_i32(x):
 #: slower here: its m-tiles finish later, and GEMM2 waits on them). The tile
 #: does not change the bits (each output element's K order is the same for
 #: every tile), so it is a pure speed choice.
-DMK_TILE = dict(  # noqa: C408 - the builder's keyword names
+SLOTS_TILE = dict(  # noqa: C408 - the builder's keyword names
     tile_m=16,
     tile_n=256,
     tile_k=256,
@@ -2212,20 +2214,20 @@ DMK_TILE = dict(  # noqa: C408 - the builder's keyword names
 )
 #: Past this many tokens per rank the 32-row tile wins (tpr 128: 303 vs
 #: 312 us/layer; tpr 64: 306 vs 301).
-DMK_TILE_M32_TOKENS = 64
+SLOTS_TILE_M32_TOKENS = 64
 #: Past this many the 64-row tile wins (V4.1-Flash DEP4, 97 experts a rank:
 #: tpr 512 172 vs 189 us/layer; tpr 256 158 vs 147).
-DMK_TILE_M64_TOKENS = 256
-DMK_CTAS_PER_CU = 2
+SLOTS_TILE_M64_TOKENS = 256
+SLOTS_CTAS_PER_CU = 2
 # Debug/tuning only: AITER_DMK_TILE="tm,tn,tk,nb,tn2,tk2,nb2" and
 # AITER_DMK_CTAS_PER_CU override the above.
-_DMK_TILE_ENV = os.environ.get("AITER_DMK_TILE")
+_SLOTS_TILE_ENV = os.environ.get("AITER_DMK_TILE")
 
 
-def dmk_tile(max_tokens_per_rank: int) -> dict:
+def slots_tile(max_tokens_per_rank: int) -> dict:
     """The decode tiles for an instance serving up to this many tokens."""
-    if _DMK_TILE_ENV:
-        v = [int(x) for x in _DMK_TILE_ENV.split(",")]
+    if _SLOTS_TILE_ENV:
+        v = [int(x) for x in _SLOTS_TILE_ENV.split(",")]
         return dict(
             zip(
                 (
@@ -2240,60 +2242,79 @@ def dmk_tile(max_tokens_per_rank: int) -> dict:
                 v,
             )
         )
-    tile = dict(DMK_TILE)
-    if int(max_tokens_per_rank) > DMK_TILE_M64_TOKENS:
+    tile = dict(SLOTS_TILE)
+    if int(max_tokens_per_rank) > SLOTS_TILE_M64_TOKENS:
         tile["tile_m"] = 64
-    elif int(max_tokens_per_rank) > DMK_TILE_M32_TOKENS:
+    elif int(max_tokens_per_rank) > SLOTS_TILE_M32_TOKENS:
         tile["tile_m"] = 32
     return tile
 
 
 if os.environ.get("AITER_DMK_CTAS_PER_CU"):
-    DMK_CTAS_PER_CU = int(os.environ["AITER_DMK_CTAS_PER_CU"])
+    SLOTS_CTAS_PER_CU = int(os.environ["AITER_DMK_CTAS_PER_CU"])
 
 
-def read_decode_mega_tokens() -> int:
-    """``AITER_MEGA_DECODE``: tokens per rank up to which a step runs the decode
-    megakernel (0 or unset: off). A step qualifies when its receive bound
-    (``recv_token_bound``, else ``world * max_tokens_per_rank``) is at most
-    ``world`` times this, so every rank picks the same path."""
-    v = os.environ.get("AITER_MEGA_DECODE", "")
+#: The user-facing switches' names before the megakernel rename, still read
+#: when the new name is unset.
+_ENV_ALIASES = {
+    "AITER_MEGAKERNEL_SLOTS_TOKENS": "AITER_MEGA_DECODE",
+    "AITER_MEGAKERNEL_COMPACT": "AITER_MEGA_LARGE",
+    "AITER_MEGAKERNEL_COMPACT_TILES": "AITER_LM_TILES",
+}
+
+
+def _env(name: str, default: str = "") -> str:
+    """The switch ``name``, else its pre-rename alias, else ``default``."""
+    v = os.environ.get(name)
+    if v is None:
+        v = os.environ.get(_ENV_ALIASES[name], default)
+    return v
+
+
+def read_slots_tokens() -> int:
+    """``AITER_MEGAKERNEL_SLOTS_TOKENS`` (formerly ``AITER_MEGA_DECODE``):
+    tokens per rank up to which a step runs the slots megakernel (0 or unset:
+    off). A step qualifies when its receive bound (``recv_token_bound``, else
+    ``world * max_tokens_per_rank``) is at most ``world`` times this, so every
+    rank picks the same path."""
+    v = _env("AITER_MEGAKERNEL_SLOTS_TOKENS")
     return int(v) if v.strip() else 0
 
 
-def decode_mega_reason(config) -> str | None:
-    """Why this MegaMoE cannot run the decode megakernel, or None if it can."""
-    if read_decode_mega_tokens() <= 0:
-        return "AITER_MEGA_DECODE is off"
-    return _mega_reason(config, dmk_tile(dmk_small_tokens(config)))
+def slots_reason(config) -> str | None:
+    """Why this MegaMoE cannot run the slots megakernel, or None if it can."""
+    if read_slots_tokens() <= 0:
+        return "AITER_MEGAKERNEL_SLOTS_TOKENS is off"
+    return _mega_reason(config, slots_tile(slots_tokens(config)))
 
 
-def read_large_mega() -> bool:
-    """``AITER_MEGA_LARGE=1``: steps the decode megakernel does not serve run
-    the compact-layout megakernel (large_m) instead of the staged path."""
-    return os.environ.get("AITER_MEGA_LARGE", "").strip() in ("1", "true", "True")
+def read_compact() -> bool:
+    """``AITER_MEGAKERNEL_COMPACT=1`` (formerly ``AITER_MEGA_LARGE``): steps the
+    slots megakernel does not serve run the compact megakernel instead of the
+    staged path."""
+    return _env("AITER_MEGAKERNEL_COMPACT").strip() in ("1", "true", "True")
 
 
-def large_mega_reason(config) -> str | None:
-    """Why this MegaMoE cannot run the large_m megakernel, or None if it can."""
-    if not read_large_mega():
-        return "AITER_MEGA_LARGE is off"
+def compact_reason(config) -> str | None:
+    """Why this MegaMoE cannot run the compact megakernel, or None if it can."""
+    if not read_compact():
+        return "AITER_MEGAKERNEL_COMPACT is off"
     geo = config.geometry
     if geo.max_tokens_per_rank > 0xFFFF:
         return "X1 holds a source's rows of an expert in 16 bits"
     if geo.max_tokens_per_rank * config.topk > TALLY_MAX * TALLY_MAXR:
         return "more routes per rank than the tally CTAs count"
     npes, epr = config.world_size, config.experts_per_rank
-    segs = dmk_segs_pad(npes=npes, experts_per_rank=epr)
+    segs = segs_pad(npes=npes, experts_per_rank=epr)
     if segs > (1 << SEG_BITS):
         return "too many (rank, expert) segments for a route slot"
-    if npes * segs * 4 > dmk_src_off(epr):
+    if npes * segs * 4 > src_off(epr):
         return "the X1 rows do not fit the control region"
-    if lm_scratch_bytes(npes=npes, experts_per_rank=epr) > LM_SCRATCH_MAX:
+    if compact_scratch_bytes(npes=npes, experts_per_rank=epr) > COMPACT_SCRATCH_MAX:
         return "the compact front end's LDS does not fit the GEMM arena"
-    variants = lm_variants(config)
+    variants = compact_variants(config)
     if not variants:
-        return "small_m serves every step of this instance"
+        return "slots serves every step of this instance"
     for _, _, tile, _ in variants:
         why = _mega_reason(config, tile)
         if why is not None:
@@ -2304,7 +2325,7 @@ def large_mega_reason(config) -> str | None:
 def _mega_reason(config, t) -> str | None:
     from aiter import ActivationType, QuantType
 
-    from .recipe import CombineKind, DispatchKind
+    from ..recipe import CombineKind, DispatchKind
 
     recipe, geo = config.recipe, config.geometry
     if recipe.dispatch is not DispatchKind.COMPACT or config.dispatch_wire != "fp4":
@@ -2328,23 +2349,23 @@ def _mega_reason(config, t) -> str | None:
     return None
 
 
-def dmk_small_tokens(config) -> int:
-    """Tokens per rank the megakernel serves: ``AITER_MEGA_DECODE``, at most the
+def slots_tokens(config) -> int:
+    """Tokens per rank the megakernel serves: ``AITER_MEGAKERNEL_SLOTS_TOKENS``, at most the
     instance's ``max_tokens_per_rank``."""
-    return min(read_decode_mega_tokens(), int(config.geometry.max_tokens_per_rank))
+    return min(read_slots_tokens(), int(config.geometry.max_tokens_per_rank))
 
 
-def dmk_recv_cap(config) -> int:
+def slots_recv_cap(config) -> int:
     """The largest receive bound (tokens) a step may have to run the megakernel."""
-    return config.world_size * dmk_small_tokens(config)
+    return config.world_size * slots_tokens(config)
 
 
-def dmk_cap(config) -> int:
+def slots_cap(config) -> int:
     """Rows each local expert reserves. A token's top-k experts are distinct, so
     an expert gets at most one row per token its rank receives, and a served
-    step receives at most ``dmk_recv_cap`` tokens."""
-    tm = dmk_tile(dmk_small_tokens(config))["tile_m"]
-    rows = dmk_recv_cap(config)
+    step receives at most ``slots_recv_cap`` tokens."""
+    tm = slots_tile(slots_tokens(config))["tile_m"]
+    rows = slots_recv_cap(config)
     return (rows + tm - 1) // tm * tm
 
 
@@ -2358,16 +2379,16 @@ _TILE_KEYS = (
     "num_buffers2",
 )
 
-#: large_m's GEMM tile by step size: (tokens per rank up to which a step runs
+#: compact's GEMM tile by step size: (tokens per rank up to which a step runs
 #: it, None for every larger step; the tile of both GEMMs; CTAs per CU). Each
 #: row is its own kernel with its own control block, covering the steps whose
-#: receive bound falls in its range (see lm_variants). DSR1, DSV4.1-Flash and
+#: receive bound falls in its range (see compact_variants). DSR1, DSV4.1-Flash and
 #: DSV4-Pro DEP4, us/layer (64x256x128 b3 at 4 CTAs per CU -> 128x256x256 b2
 #: at 2): at 512 tokens/rank 218 -> 207, 185 -> 204, 286 -> 345; at 1024
 #: 308 -> 290, 237 -> 226, 394 -> 385; at 16384 3365 -> 2797, 1805 -> 1534,
 #: 3601 -> 2832. The small tile's ~70 KB arena fits 4 CTAs per CU, the large
 #: one's 2 (3 at 128x256x128 spill: VGPRs capped at 170, 3.8x slower).
-LM_TILES = (
+COMPACT_TILES = (
     (
         512,
         dict(  # noqa: C408 - the builder's keyword names
@@ -2396,13 +2417,14 @@ LM_TILES = (
     ),
 )
 #: Rows a tile table may have: each kernel has its own arena control region
-#: (lm_ctl, lm_ctl1, ... in arena._ARENA_REGION_ORDER).
-LM_MAX_KERNELS = 4
+#: (compact_ctl, compact_ctl1, ... in arena._ARENA_REGION_ORDER).
+COMPACT_MAX_KERNELS = 4
 
 
-def lm_tile_table() -> tuple:
-    """LM_TILES, or its overrides. AITER_LM_TILES="UPTO:tm,tn,tk,nb,tn2,tk2,nb2:
-    CTAS;..." replaces the table (UPTO 0: every larger step). AITER_LM_TILE
+def compact_tile_table() -> tuple:
+    """COMPACT_TILES, or its overrides. AITER_MEGAKERNEL_COMPACT_TILES
+    (formerly AITER_LM_TILES) = "UPTO:tm,tn,tk,nb,tn2,tk2,nb2:CTAS;..."
+    replaces the table (UPTO 0: every larger step). AITER_LM_TILE
     ("tm,tn,tk,nb,tn2,tk2,nb2") and AITER_LM_CTAS_PER_CU run one tile for every
     step (the table's first by default)."""
     one = os.environ.get("AITER_LM_TILE")
@@ -2411,12 +2433,12 @@ def lm_tile_table() -> tuple:
         tile = (
             dict(zip(_TILE_KEYS, (int(x) for x in one.split(","))))
             if one
-            else dict(LM_TILES[0][1])
+            else dict(COMPACT_TILES[0][1])
         )
-        return ((None, tile, int(cpc) if cpc else LM_TILES[0][2]),)
-    table = os.environ.get("AITER_LM_TILES")
+        return ((None, tile, int(cpc) if cpc else COMPACT_TILES[0][2]),)
+    table = _env("AITER_MEGAKERNEL_COMPACT_TILES")
     if not table:
-        return LM_TILES
+        return COMPACT_TILES
     rows = []
     for entry in table.split(";"):
         upto, tile, ctas = entry.split(":")
@@ -2427,20 +2449,22 @@ def lm_tile_table() -> tuple:
                 int(ctas),
             )
         )
-    if len(rows) > LM_MAX_KERNELS:
-        raise ValueError(f"AITER_LM_TILES has more than {LM_MAX_KERNELS} rows")
+    if len(rows) > COMPACT_MAX_KERNELS:
+        raise ValueError(
+            f"AITER_MEGAKERNEL_COMPACT_TILES has more than {COMPACT_MAX_KERNELS} rows"
+        )
     return tuple(rows)
 
 
-def lm_variants(config) -> list:
-    """(recv_lo, recv_hi, tile, CTAs per CU) of each large_m kernel: the rows
-    of lm_tile_table() cut to the receive bounds large_m serves, from past
-    small_m's (or 0) to the instance's. A step runs the kernel whose (recv_lo,
+def compact_variants(config) -> list:
+    """(recv_lo, recv_hi, tile, CTAs per CU) of each compact kernel: the rows
+    of compact_tile_table() cut to the receive bounds compact serves, from past
+    the slots megakernel's (or 0) to the instance's. A step runs the kernel whose (recv_lo,
     recv_hi] holds its bound; every rank passes the same bound."""
-    lo = dmk_recv_cap(config) if decode_mega_reason(config) is None else 0
+    lo = slots_recv_cap(config) if slots_reason(config) is None else 0
     top = config.max_recv
     out = []
-    for upto, tile, ctas in lm_tile_table():
+    for upto, tile, ctas in compact_tile_table():
         if lo >= top:
             break
         hi = top if upto is None else min(top, config.world_size * int(upto))
@@ -2450,15 +2474,15 @@ def lm_variants(config) -> list:
     return out
 
 
-def lm_ctl_region(i: int) -> str:
-    """The arena control region of large_m's i-th kernel."""
-    return "lm_ctl" if i == 0 else f"lm_ctl{i}"
+def compact_ctl_region(i: int) -> str:
+    """The arena control region of compact's i-th kernel."""
+    return "compact_ctl" if i == 0 else f"compact_ctl{i}"
 
 
-def lm_caps(config, recv_bound: int, tile_m: int) -> int:
+def compact_caps(config, recv_bound: int, tile_m: int) -> int:
     """Compact rows a step with this receive bound may fill: the staged
-    plan's capacity at this large_m kernel's alignment."""
-    from .compact_plan import compact_row_capacity
+    plan's capacity at this compact kernel's alignment."""
+    from ..compact_plan import compact_row_capacity
 
     return compact_row_capacity(
         max_recv=int(recv_bound),
@@ -2468,62 +2492,62 @@ def lm_caps(config, recv_bound: int, tile_m: int) -> int:
     )
 
 
-def large_mega_regions(config) -> dict:
-    """The arena regions large_m needs ({} when it is off): a control region
+def compact_regions(config) -> dict:
+    """The arena regions compact needs ({} when it is off): a control region
     per kernel, and the staged compact rows / rowmap at least as large as the
     widest kernel's alignment needs (merged with the staged sizes)."""
-    if large_mega_reason(config) is not None:
+    if compact_reason(config) is not None:
         return {}
-    variants = lm_variants(config)
-    caps = max(lm_caps(config, hi, t["tile_m"]) for _, hi, t, _ in variants)
-    rows, rowmap = lm_row_regions()
-    regions = {rows: caps * dmk_wire_row(config), rowmap: (caps + 1) * 8}
+    variants = compact_variants(config)
+    caps = max(compact_caps(config, hi, t["tile_m"]) for _, hi, t, _ in variants)
+    rows, rowmap = compact_row_regions()
+    regions = {rows: caps * wire_row(config), rowmap: (caps + 1) * 8}
     for i in range(len(variants)):
-        regions[lm_ctl_region(i)] = dmk_ctl_arena_bytes(
+        regions[compact_ctl_region(i)] = ctl_arena_bytes(
             npes=config.world_size, experts_per_rank=config.experts_per_rank
         )
     return regions
 
 
-def lm_row_regions() -> tuple:
-    """large_m's wire rows and rowmap: the staged path's, or (debug,
+def compact_row_regions() -> tuple:
+    """compact's wire rows and rowmap: the staged path's, or (debug,
     AITER_LM_OWN_ROWS=1) regions of its own."""
     if os.environ.get("AITER_LM_OWN_ROWS", "0") == "1":
-        return "lm_disp", "lm_rowmap"
+        return "compact_rows", "compact_rowmap"
     return "disp_out", "ep_rowmap"
 
 
-def dmk_wire_row(config) -> int:
+def wire_row(config) -> int:
     h = config.hidden_dim
     return (h // 2 + h // 32 + 127) // 128 * 128
 
 
-def decode_mega_regions(config) -> dict:
-    """The arena regions the decode megakernel adds ({} when it is off)."""
-    if decode_mega_reason(config) is not None:
+def slots_regions(config) -> dict:
+    """The arena regions the slots megakernel adds ({} when it is off)."""
+    if slots_reason(config) is not None:
         return {}
-    epr, cap = config.experts_per_rank, dmk_cap(config)
+    epr, cap = config.experts_per_rank, slots_cap(config)
     return {
-        "dmk_disp": epr * cap * dmk_wire_row(config),
-        "dmk_rowmap": epr * cap * 8,
-        "dmk_ctl": dmk_ctl_arena_bytes(npes=config.world_size, experts_per_rank=epr),
+        "slots_rows": epr * cap * wire_row(config),
+        "slots_rowmap": epr * cap * 8,
+        "slots_ctl": ctl_arena_bytes(npes=config.world_size, experts_per_rank=epr),
     }
 
 
-class DecodeMega:
+class MegaKernel:
     """A single-kernel MegaMoE bound to one MegaMoE's arena and combine:
-    ``layout="slots"`` is small_m (fixed expert slots, AITER_MEGA_DECODE),
-    ``layout="compact"`` is large_m (the staged compact layout, AITER_MEGA_LARGE).
+    ``layout="slots"`` keeps fixed expert slots (AITER_MEGAKERNEL_SLOTS_TOKENS),
+    ``layout="compact"`` the staged compact layout (AITER_MEGAKERNEL_COMPACT).
     Each has its own control block, so they share no protocol state."""
 
     def __init__(self, config, res, device, layout="slots", variant=None, ctl=None):
-        """``variant``: large_m's (recv_lo, recv_hi, tile, CTAs per CU), one
-        of lm_variants(config); ``ctl``: its arena control region."""
+        """``variant``: compact's (recv_lo, recv_hi, tile, CTAs per CU), one
+        of compact_variants(config); ``ctl``: its arena control region."""
         import torch
 
         from aiter.jit.utils.chip_info import get_cu_num
 
-        from ..tensor_shim import _run_compiled  # noqa: F401  (import check)
+        from ...tensor_shim import _run_compiled  # noqa: F401  (import check)
 
         self.config = config
         self.res = res
@@ -2532,24 +2556,24 @@ class DecodeMega:
         geo = config.geometry
         arena = res.arena
         epr = config.experts_per_rank
-        self.row = dmk_wire_row(config)
+        self.row = wire_row(config)
         if compact:
-            self.recv_lo, self.recv_hi, t, lm_ctas = variant
+            self.recv_lo, self.recv_hi, t, compact_ctas = variant
             self.tile = t
-            rows = lm_caps(config, self.recv_hi, t["tile_m"])
+            rows = compact_caps(config, self.recv_hi, t["tile_m"])
             self.cap = rows
             self.mt_cap = rows // t["tile_m"]
-            self.regions = (*lm_row_regions(), ctl)
+            self.regions = (*compact_row_regions(), ctl)
             self.route = torch.empty(
                 geo.max_tokens_per_rank * config.topk, dtype=torch.int32, device=device
             )
         else:
-            cap = self.cap = dmk_cap(config)
-            t = self.tile = dmk_tile(dmk_small_tokens(config))
-            self.recv_cap = dmk_recv_cap(config)
+            cap = self.cap = slots_cap(config)
+            t = self.tile = slots_tile(slots_tokens(config))
+            self.recv_cap = slots_recv_cap(config)
             rows = epr * cap
             self.mt_cap = epr * (cap // t["tile_m"])
-            self.regions = ("dmk_disp", "dmk_rowmap", "dmk_ctl")
+            self.regions = ("slots_rows", "slots_rowmap", "slots_ctl")
             self.route = None
         self.rows = rows
         from aiter.ops.flydsl.grouped_moe_gfx1250 import get_wmma_m_rep
@@ -2565,12 +2589,12 @@ class DecodeMega:
         self.a2_scale = torch.empty(
             (rows // rep2, inter // 32 * rep2), dtype=torch.uint8, device=device
         )
-        self.ctas_per_cu = lm_ctas if compact else DMK_CTAS_PER_CU
+        self.ctas_per_cu = compact_ctas if compact else SLOTS_CTAS_PER_CU
         self.workers = int(get_cu_num()) * self.ctas_per_cu
         # Per-call switch for in-process A/B against the staged path. All
         # ranks must flip it together (the paths share no protocol state).
         self.enabled = True
-        self._ctl_words = dmk_ctl_words(
+        self._ctl_words = ctl_words(
             experts_per_rank=epr,
             mt_cap=self.mt_cap,
             workers=self.workers,
@@ -2606,7 +2630,7 @@ class DecodeMega:
         if self._launch is None or self._act_key != stage1_act:
             config, arena = self.config, self.res.arena
             geo = config.geometry
-            self._launch = make_decode_mega(
+            self._launch = make_megakernel(
                 rank=config.rank,
                 npes=config.world_size,
                 experts=geo.experts,
@@ -2652,7 +2676,7 @@ class DecodeMega:
         from aiter import ActivationType
         from aiter.ops.flydsl.grouped_moe_gfx1250 import _grouped_weight_uint8
 
-        from ..tensor_shim import _preload_compiled, _run_compiled
+        from ...tensor_shim import _preload_compiled, _run_compiled
 
         comp = self.config.recipe.compute
         swiglu = comp.activation == ActivationType.Swiglu
@@ -2683,7 +2707,7 @@ class DecodeMega:
             # The GEMMs see the rows this step's bound can fill; senders and
             # receiver drop anything past it alike.
             rows = min(
-                lm_caps(
+                compact_caps(
                     self.config, self._bound(recv_token_bound), self.tile["tile_m"]
                 ),
                 self.rows,
@@ -2838,20 +2862,35 @@ class DecodeMega:
         return self.ctl[CTL_FAIL : CTL_FAIL + 9].tolist()
 
 
-class LargeMega:
-    """large_m: one compact-layout DecodeMega per row of lm_tile_table(), each
-    over its own receive bounds (lm_variants) with its own control region; a
-    step runs the one its bound falls in. They share the staged path's rows,
-    rowmap and comb_inp the way large_m and the staged path do: a rank writes
-    a peer's copy only after a message from that peer's current launch.
+class SlotsMega(MegaKernel):
+    """The slots megakernel: fixed per-expert slots, for small steps."""
+
+    def __init__(self, config, res, device):
+        super().__init__(config, res, device, layout="slots")
+
+
+class CompactMega(MegaKernel):
+    """One compact megakernel: ``variant`` is a row of compact_variants(config),
+    ``ctl`` its arena control region."""
+
+    def __init__(self, config, res, device, variant, ctl):
+        super().__init__(
+            config, res, device, layout="compact", variant=variant, ctl=ctl
+        )
+
+
+class CompactMegaSet:
+    """One CompactMega per row of compact_tile_table(), each over its own
+    receive bounds (compact_variants) with its own control region; a step runs
+    the one its bound falls in. They share the staged path's rows, rowmap and
+    comb_inp the way compact and the staged path do: a rank writes a peer's
+    copy only after a message from that peer's current launch.
     Attributes not defined here are those of the kernel for the largest steps."""
 
     def __init__(self, config, res, device):
         self.variants = [
-            DecodeMega(
-                config, res, device, layout="compact", variant=v, ctl=lm_ctl_region(i)
-            )
-            for i, v in enumerate(lm_variants(config))
+            CompactMega(config, res, device, v, compact_ctl_region(i))
+            for i, v in enumerate(compact_variants(config))
         ]
 
     @property
@@ -2894,17 +2933,20 @@ class LargeMega:
 
 
 __all__ = [
-    "DecodeMega",
-    "LargeMega",
-    "decode_mega_reason",
-    "decode_mega_regions",
-    "dmk_ctl_arena_bytes",
-    "dmk_ctl_words",
-    "dmk_epr_pad",
-    "large_mega_reason",
-    "large_mega_regions",
-    "lm_tile_table",
-    "lm_variants",
-    "make_decode_mega",
-    "read_decode_mega_tokens",
+    "CompactMega",
+    "CompactMegaSet",
+    "MegaKernel",
+    "SlotsMega",
+    "compact_reason",
+    "compact_regions",
+    "compact_tile_table",
+    "compact_variants",
+    "ctl_arena_bytes",
+    "ctl_words",
+    "epr_pad",
+    "make_megakernel",
+    "read_compact",
+    "read_slots_tokens",
+    "slots_reason",
+    "slots_regions",
 ]

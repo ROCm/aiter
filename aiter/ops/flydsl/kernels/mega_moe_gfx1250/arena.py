@@ -86,21 +86,21 @@ _ARENA_REGION_ORDER = (
     # Stage-1 flag tiles. Last, so every other region's offset stays put when
     # AITER_MEGA_S1F is off and the region is absent.
     "tile_flag",
-    # The decode megakernel's fixed expert slots, their rowmap pairs and its
-    # control words (AITER_MEGA_DECODE); after the rest for the same reason.
-    "dmk_disp",
-    "dmk_rowmap",
-    "dmk_ctl",
-    # large_m's control regions (X1 rows, peer flags), one per kernel of its
-    # tile table (decode_mega.LM_TILES, at most LM_MAX_KERNELS); they share
+    # The slots megakernel's fixed expert slots, their rowmap pairs and its
+    # control words (AITER_MEGAKERNEL_SLOTS_TOKENS); after the rest for the same reason.
+    "slots_rows",
+    "slots_rowmap",
+    "slots_ctl",
+    # compact's control regions (X1 rows, peer flags), one per kernel of its
+    # tile table (megakernel.COMPACT_TILES, at most COMPACT_MAX_KERNELS); they share
     # the staged compact rows (disp_out / ep_rowmap) and comb_inp, unless
-    # AITER_LM_OWN_ROWS gives large_m its own (debug).
-    "lm_disp",
-    "lm_rowmap",
-    "lm_ctl",
-    "lm_ctl1",
-    "lm_ctl2",
-    "lm_ctl3",
+    # AITER_LM_OWN_ROWS gives compact its own (debug).
+    "compact_rows",
+    "compact_rowmap",
+    "compact_ctl",
+    "compact_ctl1",
+    "compact_ctl2",
+    "compact_ctl3",
 )
 # cco rounds each allocation up to its VMM granularity -- 2 MiB on the parts
 # MegaMoE runs on -- and, past 2 GiB, to 2 MiB again for the MR registration.

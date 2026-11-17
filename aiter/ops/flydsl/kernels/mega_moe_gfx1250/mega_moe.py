@@ -365,7 +365,7 @@ class MegaMoEGfx1250:
             hidden_states, topk_weights, topk_ids, w1, w2, w1_scale, w2_scale, a1_scale
         )
         ep = self._ep
-        mk = ep.mega_for(recv_token_bound)
+        mk = ep.megakernel_for(recv_token_bound)
         if mk is not None and not quant_bits and bias1 is None and bias2 is None:
             # Every rank passes the same bound, so the ranks agree on the path.
             # A plan an earlier staged layer started for this step is dropped.
@@ -629,7 +629,7 @@ class MegaMoEGfx1250:
         megakernel serves (a side-stream plan must not hold CUs while it runs;
         a step that falls back to the staged path plans in its own forward).
         """
-        if self._ep.mega_for(recv_token_bound) is not None:
+        if self._ep.megakernel_for(recv_token_bound) is not None:
             return
         self._ep.prefetch(topk_ids, recv_token_bound)
 
