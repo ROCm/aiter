@@ -119,7 +119,7 @@ COMPUTE_CASES = (
         5120,
         "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn1",
     ),
-    # 63 / 50 M-tiles: grid.x padded to whole cluster rows
+    # 63 / 50 M-tiles: cluster_m 4 shrinks to 1 / 2 at launch
     (
         1,
         15997,

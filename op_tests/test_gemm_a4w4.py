@@ -33,7 +33,8 @@ SUPPORTED_GFX = ["gfx950", "gfx1250"]
 # leave a partial M tile of a general kernel, 2049 one of the compute kernel. 129 and 255 are
 # below the 256-row compute tile of N=36864 and reach it through the padded M, as one partial
 # tile. Together they reach the masked-M stores and partial-tile cluster reduction of both
-# kernel families.
+# kernel families. The last three leave 19 / 33 / 19 M tiles on compute kernels with cluster_m
+# 2 / 4 / 2: cluster_m shrinks to the largest power-of-two divisor of the tile count (1 / 1 / 1).
 OFF_GRID_SHAPES = {
     (1, 7168, 16384): False,
     (17, 7168, 16384): False,
@@ -41,6 +42,9 @@ OFF_GRID_SHAPES = {
     (2049, 7168, 16384): True,
     (129, 36864, 7168): True,
     (255, 36864, 7168): True,
+    (4609, 3584, 7168): True,
+    (8321, 3584, 7168): True,
+    (4609, 7168, 3584): True,
 }
 # (M, N, K, kernelName, other kernelName): two compute kernels that do not fit the instruction cache
 # together. Each prefetches its own code, so it must run as fast right after the other as back to back:
