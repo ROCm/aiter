@@ -115,9 +115,7 @@ def _check_packed_arch(arch: str) -> None:
     calls this before launching the kernel below.
     """
     if arch not in PACKED_ARCHS:
-        if arch in FP8_ARCHS or (
-            arch in FP8_SCALAR_ARCHS and arch in FNUZ_DSV32_ARCHS
-        ):
+        if arch in FP8_ARCHS or (arch in FP8_SCALAR_ARCHS and arch in FNUZ_DSV32_ARCHS):
             flat = "bf16, fp8_scalar or fp8_dsv32_mla"
         elif arch in FP8_SCALAR_ARCHS:
             flat = "bf16 or fp8_scalar"
