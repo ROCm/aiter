@@ -1534,8 +1534,15 @@ def test_mha_v4_kv_splits_auto_shrinks_a_partial_last_round():
     with _patched_cu_count(256):
         # 3 heads x 86 query tiles is 258 work-groups: two rounds for 1.01 of work.
         assert mha_v4_kv_splits(1, 21890, 3, 21890) == 5
-        assert mha_v4_kv_splits(2, 21890, 3, 21890) == 5
         assert mha_v4_kv_splits(1, 16384, 5, 16384) == 4
+        assert mha_v4_kv_splits(1, 16400, 6, 16398) == 3
+        # A split costs more keys past batch 1, which copies the queries, and for 8-bit Q/K,
+        # whose rows walk a key faster, so both split less.
+        assert mha_v4_kv_splits(2, 21890, 3, 21890) == 2
+        assert mha_v4_kv_splits(1, 16400, 6, 16398, q_format=AttentionFormat.INT8) == 1
+        assert mha_v4_kv_splits(1, 21890, 3, 21890, ragged=True) == 5
+        fp8 = AttentionFormat.FP8
+        assert mha_v4_kv_splits(1, 21890, 3, 21890, ragged=True, q_format=fp8) == 4
         # Whole rounds gain nothing that pays for the merge.
         assert mha_v4_kv_splits(1, 16384, 4, 16384) == 1
         assert mha_v4_kv_splits(1, 8192, 48, 8192) == 1
@@ -2782,6 +2789,7 @@ def benchmark_mha_v4(
                 heads,
                 sequence_k,
                 ragged=mha_v4_module._varlen_capable(q_format, v_format),
+                q_format=q_format,
             )
         # Quantized recipes are expected to land well outside a bitwise bound; the err column is
         # what carries their accuracy, so compare loosely and let the number speak.

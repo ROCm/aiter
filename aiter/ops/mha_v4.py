@@ -360,6 +360,10 @@ _MHA_V4_MIN_KV_SPLIT_TOKENS = 512
 _MHA_V4_PARTIAL_ROUND_FLOOR = 0.40
 # The merge per split and output row of one head, in keys of a work-group's KV loop.
 _MHA_V4_MERGE_KEYS_PER_ROW = 0.00645
+# The 8-bit Q/K rows walk a key faster than BF16's, so the same merge is worth more of their keys.
+_MHA_V4_MERGE_SCALE_8BIT_QK = 1.5
+# Past batch 1 the queries are copied once per split, about a merge's traffic again.
+_MHA_V4_MERGE_SCALE_BATCHED = 2.0
 # The merge unrolls over the count, and no measured shape gained past 6.
 _MHA_V4_MAX_AUTO_KV_SPLITS = 16
 
@@ -2117,6 +2121,7 @@ def mha_v4_kv_splits(
     device: Optional[torch.device] = None,  # noqa: UP045
     *,
     ragged: bool = False,
+    q_format: AttentionFormat = AttentionFormat.BF16,
 ) -> int:
     """The KV split count mha_v4(kv_splits="auto") uses for these shapes on `device`.
 
@@ -2134,7 +2139,9 @@ def mha_v4_kv_splits(
     is 258 work-groups, two rounds for 1.01 rounds of work. Splitting shrinks that last round,
     so these grids take the n with the least modelled time: rounds (the last one at
     _MHA_V4_PARTIAL_ROUND_FLOOR plus its fill) times the keys of the longest range, plus the
-    merge. The same divisor and ragged rules decide which n are candidates.
+    merge. The merge is worth more keys for an 8-bit `q_format` (INT8/FP8 and FP8/FP8), whose
+    rows walk a key faster, and past batch 1, where each split also copies the queries. The
+    same divisor and ragged rules decide which n are candidates.
     """
     work_groups = max(batch * query_heads * -(-query_length // _MHA_V4_Q_TILE), 1)
     cus = torch.cuda.get_device_properties(device).multi_processor_count
@@ -2142,7 +2149,11 @@ def mha_v4_kv_splits(
         most = min(
             _MHA_V4_MAX_AUTO_KV_SPLITS, key_length // _MHA_V4_MIN_KV_SPLIT_TOKENS
         )
-        rows = batch * query_length * query_heads
+        merge = _MHA_V4_MERGE_KEYS_PER_ROW * batch * query_length * query_heads
+        if q_format != AttentionFormat.BF16:
+            merge *= _MHA_V4_MERGE_SCALE_8BIT_QK
+        if batch > 1:
+            merge *= _MHA_V4_MERGE_SCALE_BATCHED
         best, best_cost = 1, None
         # A plain loop: Dynamo cannot trace min() with a key function under fullgraph.
         for n in range(1, max(most, 1) + 1):
@@ -2155,8 +2166,7 @@ def mha_v4_kv_splits(
                     + (1 - _MHA_V4_PARTIAL_ROUND_FLOOR) * tail / cus
                 )
             longest = key_length - (n - 1) * (key_length // n)
-            merge = _MHA_V4_MERGE_KEYS_PER_ROW * n * rows if n > 1 else 0.0
-            cost = rounds * longest + merge
+            cost = rounds * longest + (merge * n if n > 1 else 0.0)
             if best_cost is None or cost < best_cost:
                 best, best_cost = n, cost
         return best
@@ -2207,6 +2217,7 @@ def _resolve_kv_splits(
             k.shape[1],
             q.device,
             ragged=_varlen_capable(q_format, v_format),
+            q_format=q_format,
         )
     if isinstance(kv_splits, bool) or not isinstance(kv_splits, int) or kv_splits < 1:
         raise ValueError(
@@ -2324,6 +2335,7 @@ def _split_kv_launch(
             k.shape[1],
             q.device,
             ragged=_varlen_capable(q_format, v_format),
+            q_format=q_format,
         )
     if splits == 1:
         mha_v4_packed(
