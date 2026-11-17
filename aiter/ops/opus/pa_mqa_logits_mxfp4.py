@@ -514,12 +514,7 @@ class MqaLogitsConfig:
     def writes_lane_max(self) -> bool:
         """Whether a launch without a schedule writes lane maxima: a schedule-free mode of the
         gfx1250 H = 32 kernels (``pa_mqa_logits_mxfp4.h``)."""
-        return (
-            self._mode is not None
-            and self._mode != TABLE
-            and self.arch == GFX1250
-            and self.heads == 32
-        )
+        return self._mode not in (None, TABLE) and _lane_max_arch(self.arch, self.heads)
 
     @property
     def _empty_f32(self) -> torch.Tensor:
@@ -1059,12 +1054,30 @@ _LANE_MAX_ROW_PAD = 64
 _LANE_MAX_ROW_ALIGN = 64
 
 
+def _lane_max_arch(arch: str, heads: int) -> bool:
+    """The one rule for which kernels write lane maxima in their schedule-free modes: gfx1250's
+    (gfx1250-strict runs them too) with 32 index heads."""
+    return base_gfx_arch(arch) == GFX1250 and heads == 32
+
+
+def mqa_logits_mxfp4_writes_lane_max(
+    device: torch.device | str | int, heads: int
+) -> bool:
+    """Whether schedule-free launches on ``device`` with ``heads`` index heads write lane
+    maxima, before any config exists: a caller sizes a ``lane_max`` buffer only where this
+    holds. A config agrees with it (:attr:`MqaLogitsConfig.writes_lane_max`) in its
+    schedule-free modes."""
+    return _lane_max_arch(_device_arch(device), heads)
+
+
 def mqa_logits_mxfp4_lane_max_elems(out_elems: int, rows: int) -> int:
     """Elements of a lane maxima buffer for ``rows`` rows of logits whose stores span
     ``out_elems`` elements from ``out``'s first one: ``out.numel()`` for a flat or contiguous
     ``out``, ``(rows - 1) * out.stride(0) + out.shape[1]`` for a row-strided one
-    (:func:`_lane_max_out_span`). Row r's slots start at (its row start / 16) + 64 r, so the
-    buffer follows the address span, not the element count."""
+    (:func:`_lane_max_out_span`). For a 2-D ``out`` that span equals ``out.numel()`` only when
+    ``rows == out.shape[0]`` (and the rows are contiguous); with fewer rows, or a padded row
+    stride, pass the span. Row r's slots start at (its row start / 16) + 64 r, so the buffer
+    follows the address span, not the element count."""
     return out_elems // _LANE_MAX_TILES + _LANE_MAX_ROW_PAD * (rows + 1)
 
 
@@ -1112,4 +1125,5 @@ __all__ = [
     "mqa_logits_mxfp4_config",
     "mqa_logits_mxfp4_lane_max_elems",
     "mqa_logits_mxfp4_schedule",
+    "mqa_logits_mxfp4_writes_lane_max",
 ]
