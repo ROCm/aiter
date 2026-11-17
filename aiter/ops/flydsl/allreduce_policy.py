@@ -45,8 +45,9 @@ Each algorithm has a tuning ladder per ``(arch, link, world_size)``:
 ``ONESHOT_LADDER``, ``MESH_ST_LADDER`` and ``RING_ST_LADDER``. A ladder is a
 tuple of rungs in ascending ``min_bytes`` order, and a payload runs on the last
 rung whose ``min_bytes`` is at most its size (``select_rung``). The host builds
-one engine per rung. The mesh algorithm's fused add+RMSNorm path has its own ladder,
-``MESH_NORM_LADDER``, and runs on the plain mesh ladder where that has no row.
+one engine per rung.
+
+**Fused all-reduce + RMSNorm**
 """
 
 from __future__ import annotations
@@ -54,18 +55,18 @@ from __future__ import annotations
 import dataclasses
 import enum
 import functools
+import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 
 logger = logging.getLogger("aiter")
 
-
 # Limits
 # ======
 #
-# What the FlyDSL all-reduce kernels and their hosts support. The other
-# modules import these instead of restating them.
+# What the FlyDSL all-reduce kernels and their hosts support.
 
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 SUPPORTED_WORLDS = (2, 4, 8)
@@ -73,13 +74,149 @@ SUPPORTED_WORLDS = (2, 4, 8)
 LINKS = ("pcie", "xgmi")
 # Threads per workgroup that every kernel can build. The block sets the tile.
 SUPPORTED_BLOCKS = (64, 128, 256, 512)
+# The fused schedules size a workgroup to one token row instead, on any
+# BLOCK_ALIGN multiple up to the hardware workgroup limit MAX_BLOCK.
+BLOCK_ALIGN = 128
+MAX_BLOCK = 1024
 # Payload and buffer address alignment, in bytes: one 16 B store per lane.
 PAYLOAD_ALIGN_BYTES = 16
 # Largest payload, in bytes: the window of a buffer descriptor.
 MAX_PAYLOAD_BYTES = 0xFFFFFFFF
+# Largest payload a padded fused build may address, in bytes: the 31-bit
+# byte-offset range. The host gates reject a padded fused payload above it.
+PAD_MASK_MAX_BYTES = 0x7FFFFFFF
+
+# Legal build values
+# ------------------
+#
+# One-shot algorithm.
+#
+# Atoms per thread per tile. More atoms means a bigger tile, hence fewer blocks
+# for a given payload, at the cost of coarser load balance on the last partial
+# tile.
+SUPPORTED_ATOMS = (1, 2, 4)
+
+# Workgroups one fused token row is split over. 1 is one workgroup per row, the
+# unsplit build. The rest are the counts that divide the shipped widths into
+# whole waves: 7168 = 14 waves at atoms=1 gives {2, 7, 14}; 4096/8192 give the
+# powers of two.
+SUPPORTED_SPLITS = (1, 2, 4, 7, 8, 14, 16)
+
+# Which axis of the (peer, atom) fanout runs fastest across consecutive stores.
+#
+# "peer": a thread pushes all its atoms to one destination before moving to the
+# next, so a wave hands each destination a contiguous ``block * 16`` B run.
+#
+# "atom": consecutive stores walk the peers of one atom. On xGMI the native
+# packet is 64 B and there is no per-destination run-length benefit to collect,
+# so spreading across links sooner can start more of them in parallel.
+FANOUT_ORDERS = ("peer", "atom")
+
+# Mesh algorithm.
+#
+# Super-tile values the mesh accepts.
+SUPER_TILES = (1, 8)
+
+# Wire formats the mesh can build.
+MESH_CODECS = ("int4", "int5", "int6", "fp16")
+
+# Ring algorithm.
+#
+# Super-tile values the ring accepts.
+#
+# The ring publishes 2(N-1) times per super-tile.
+# On a cacheable inbox every publish is a full L2 writeback. Publishes per rank
+# are ``num_tiles / ST * 2(N-1)``.
+RING_SUPER_TILES = (1, 8, 16, 32)
+
+# Wire formats accepted per lap.
+#
+# Both laps take the same set, but they are separate arguments because they are
+# separate decisions: the reduce-scatter lap requantizes ``N-1`` times, while
+# the all-gather lap forwards the bytes it received without touching them.
+RS_CODECS = ("int4", "int6", "fp16")
+AG_CODECS = ("int4", "int6", "fp16")
+
+# How the IPC inbox is allocated. ``"auto"`` resolves to one of the others. The
+# wire protocol is identical in every mode; only the memory type changes.
+INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained")
+
+# Defaults
+# ========
+
+# Mesh and ring algorithms.
+#
+# Floor on the block count of the mesh and the ring when they batch publishes
+# into super-tiles. Shrinking the grid trades parallelism for fewer release fences,
+# which is only a good trade once there are enough fences to matter.
+MIN_BATCH_BLOCKS = 32
+
+# World size from which the ring's reduce-scatter lap defaults to INT6, to
+# clear the 18 dB SQNR floor the schedules are held to. The ring requantizes
+# the running partial at every hop, and the partial's extremum grows with the
+# contributions folded in, so unlike the mesh its error grows with N. With the
+# E5M2 group scale an all-INT4 ring reaches 17.9 dB at TP4 (E4M3: 18.3), under
+# the floor, so INT6 starts at TP4. On PCIe that is up to 26/18 of the
+# reduce-scatter bytes at TP4; a precision-preserving scale (per-slice
+# E4M3/E5M2) would let it move back to TP8.
+RS_INT6_MIN_WORLD = 4
+
+# The codecs each two-shot algorithm can build, per lap, as ``(rs, ag)``.
+_TWO_SHOT_CODECS = {
+    "mesh": (MESH_CODECS, MESH_CODECS),
+    "ring": (RS_CODECS, AG_CODECS),
+}
 
 
-# Ladder rungs
+def default_codecs(algorithm: str, world_size: int) -> tuple[str, str]:
+    """The ``(rs_codec, ag_codec)`` of a two-shot *algorithm* at *world_size*.
+
+    Only the ring moves its reduce-scatter lap to INT6 (``RS_INT6_MIN_WORLD``).
+    The mesh stays on INT4 at every world size; its INT5 and INT6 are opt-in.
+    """
+    rs_codecs, ag_codecs = _TWO_SHOT_CODECS[algorithm]
+    ring_int6 = algorithm == "ring" and int(world_size) >= RS_INT6_MIN_WORLD
+    rs = "int6" if ring_int6 else "int4"
+    ag = "int4"
+    return (
+        rs if rs in rs_codecs else rs_codecs[0],
+        ag if ag in ag_codecs else ag_codecs[0],
+    )
+
+
+def default_inbox_memory(world_size: int, link: str) -> str:
+    """The memory type that ``inbox_memory="auto"`` resolves to.
+
+    ``uncached`` on xGMI and ``finegrained`` on PCIe, except at TP2, where it
+    is ``uncached`` on PCIe too.
+    """
+    if int(world_size) == 2 or link == "xgmi":
+        return "uncached"
+    return "finegrained"
+
+
+def quantized_floor(
+    *, world_size: int, link: str, arch: str | None = None, fused: bool = False
+) -> int:
+    """The default ``min_bytes`` of a mesh or ring host: the smallest payload
+    the policy routes to the mesh or the ring, which is where the quantized
+    windows start. 0 when the policy routes no payload to either.
+
+    Below the quantized windows the policy runs an exact all-reduce: the
+    quantized wire would cost accuracy for time that a smaller message does not
+    save.
+    """
+    resolve = resolve_fused_policy if fused else resolve_family_policy
+    policy = resolve(world_size=world_size, arch=arch, link=link)
+    mins = [
+        w.min
+        for alg in (AllReduceAlgorithm.TwoShotMesh, AllReduceAlgorithm.TwoShotRing)
+        if (w := policy.window(alg, quantized=True)) is not None
+    ]
+    return min(mins, default=0)
+
+
+# Rung records
 # ============
 #
 # A ladder is a tuple of rungs in ascending ``min_bytes`` order, and the first
@@ -95,7 +232,7 @@ class OneShotRung:
     ``atoms`` and ``block`` both scale the tile, and their product sets the
     block count. In addition, ``block`` also changes the workgroup size, and ``atoms``
     also changes how many stores one thread has in flight. ``grid_cap`` bounds
-    the block count. ``fanout`` selects the order of the stores to the peers.
+    the block count. ``fanout``selects the order of the stores to the peers.
     """
 
     min_bytes: int
@@ -126,6 +263,42 @@ class TwoShotRung:
     block: int
 
 
+@dataclass(frozen=True)
+class FusedOneShotRung:
+    """The fused (all-reduce + RMSNorm) one-shot configuration for payloads of
+    at least ``min_bytes``.
+
+    The fused tile is one token row, or one ``1/split`` slice of it, because
+    the RMSNorm reduces over the row. So ``atoms`` sets the block width
+    (``block = hidden / (split * 8 * atoms)``) instead of the tile, and there
+    is no ``block`` field. ``split`` spreads a row over that many workgroups.
+    """
+
+    min_bytes: int
+    atoms: int
+    grid_cap: int
+    fanout: str
+    split: int
+
+
+@dataclass(frozen=True)
+class FusedTwoShotRung:
+    """The fused mesh or ring configuration for payloads of at least
+    ``min_bytes``. Without ``block``: a fused build sizes
+    its workgroup to the token row (``FUSED_QR_ROW_ATOMS``).
+
+    ``low_latency`` picks the mesh's low-latency build: the residual is loaded
+    ahead of the exchanges, and two workgroups per CU stay resident instead of
+    one, so ``grid_cap`` may go up to twice the CU count. It needs
+    ``super_tile=1`` and a width whose block is ``BLOCK``.
+    """
+
+    min_bytes: int
+    super_tile: int
+    grid_cap: int
+    low_latency: bool = False
+
+
 def select_rung(ladder, nbytes: int):
     """The rung of *ladder* that runs a payload of *nbytes*."""
     chosen = ladder[0]
@@ -137,6 +310,8 @@ def select_rung(ladder, nbytes: int):
 
 # Dispatch policy records
 # =======================
+#
+# The tables below are made of these records.
 
 
 class AllReduceAlgorithm(enum.Enum):
@@ -194,23 +369,19 @@ def _fmt_bytes(nbytes: int | None) -> str:
 class FamilyPolicy:
     """Which algorithm runs which payload sizes, on one platform.
 
-    We have three families of all-reduce kernels: one-shot, mesh and ring.
+    Three families of all-reduce kernels: one-shot, mesh, and ring.
     Depending on the interconnect type (PCIe or xGMI), the one-shot is best for
     smaller messages, the mesh overtakes for bigger messages, and finally the
-    ring is the choice for very large messages. The message sizes at which the
-    transitions take place depend on the architecture, the world size and the
-    interconnect type, so a policy belongs to one ``(arch, link, world_size)``.
+    ring is the choice for very large messages on PCIe. The message sizes at
+    which the transitions take place depend on the architecture, the world size,
+    and the interconnect type. Hence, the policy is a function of ``(arch, link, world_size)``.
 
     Each algorithm has a ``Window`` of payload sizes. ``None`` or an empty
-    window disables the algorithm. A payload in no window goes to
-    ``cross_device_reduce`` or RCCL.
+    window disables the algorithm.
 
     The mesh and the ring are quantized, so they run only with quantization on
     (``AITER_QUICK_REDUCE_QUANTIZATION=INT4``), and their windows do not
-    overlap. The one-shot is exact and runs in both modes. ``QuickAllReduce``
-    serves the mesh and the ring before ``CustomAllreduce`` serves the
-    one-shot, and when enabled, the mesh and the ring take the payloads
-    of their windows first.
+    overlap. The one-shot is exact and runs in both modes.
     """
 
     arch: str
@@ -405,9 +576,28 @@ _POLICY_BY_KEY = _index(FAMILY_POLICIES)
 
 
 # One-shot, ``OneShotRung``.
+#
+#   PCIe
+#
+#     TP2  b256 a1 cap128 -- the 4 KiB tile to 384 KiB, then b512 a4 cap128,
+#                            the 32 KiB tile, over the rest of the exact-mode
+#                            window, which runs to 64 MiB.
+#     TP4  b128 a1 cap128 -- the 2 KiB tile to 96 KiB, then b512 a2 cap64, the
+#                            16 KiB tile, to the 896 KiB exact-mode ceiling.
+#     TP8  b64 a1 cap64   -- the 1 KiB tile, except b256 a1 cap64, the 4 KiB
+#                            tile, from 48 to 192 KiB.
+#
+#   xGMI
+#
+#     TP2  atoms=1 cap128 b128/b256 -- the 2 KiB tile to 256 KiB, the most it
+#                               covers in one round, then the 4 KiB tile.
+#     TP4  atoms=1 cap128 b256 -- one rung over the whole window
+#     TP8  atoms=1 cap128 b128 -- one rung over the whole window
+#
+#     The numbers above are gfx942. On gfx950 the rung is atoms=1 cap128 and
+#     one rung over the whole window: b256 for TP2, b128 for TP4 and TP8.
 ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
     # --- gfx942 (MI300X) / xGMI ----------------------------------------------
-    # TP2: 256 KiB is the most the 2 KiB tile covers in one round of 128 blocks.
     ("gfx942", "xgmi", 2): (
         OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
         OneShotRung(
@@ -449,6 +639,15 @@ ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
 }
 
 # Mesh, ``TwoShotRung``.
+#
+#   xGMI  gfx942: ST=1 everywhere, except TP4 below 4 MiB and TP8 from 6 MiB (ST=8).
+#           Block 512 from 4 MiB.
+#         gfx950: one b256 rung per TP.
+#           - TP2 ST=1 cap512
+#           - TP4 ST=1 cap1024
+#           - TP8 ST=8 cap384:
+#   PCIe  TP2 ST=1, then ST=8 from 4 MiB. TP4 ST=1, then ST=8 from 768 KiB.
+#         TP8 ST=8 everywhere.
 MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     # --- gfx942 (MI300X) / xGMI ----------------------------------------------
     ("gfx942", "xgmi", 2): (
@@ -485,21 +684,6 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     ),
     ("gfx950", "pcie", 8): (
         TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=512),
-    ),
-}
-
-# Mesh with the fused add+RMSNorm epilogue, ``TwoShotRung``. Every rank
-# normalises the whole payload in the all-gather lap.
-# A platform with no row runs on its mesh ladder.
-#
-#   xGMI  gfx950
-#           TP8: ST=1 b256 cap1024 over the whole window, at hidden 4096
-#           and 8192, with or without MXFP4. TP2 and TP4 have no row: their mesh
-#           rung is also the best fused one.
-MESH_NORM_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
-    # --- gfx950 (MI355X) / xGMI ----------------------------------------------
-    ("gfx950", "xgmi", 8): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=1024, block=256),
     ),
 }
 
@@ -564,53 +748,12 @@ def mesh_st_ladder(
     return _ladder(MESH_ST_LADDER, "mesh", arch, link, world_size)
 
 
-def mesh_norm_ladder(
-    *,
-    world_size: int,
-    link: str,
-    arch: str | None = None,
-    mesh: tuple[TwoShotRung, ...] | None = None,
-) -> tuple[TwoShotRung, ...]:
-    """The rungs of the mesh's fused add+RMSNorm for *(arch, link,
-    world_size)*: its row in ``MESH_NORM_LADDER``, or where there is none the
-    mesh ladder, *mesh* if given. *arch* defaults to this host's."""
-    arch = detect_arch() if arch is None else arch
-    rungs = MESH_NORM_LADDER.get((arch, link, int(world_size)))
-    if rungs is not None:
-        return rungs
-    if mesh is not None:
-        return mesh
-    return mesh_st_ladder(world_size=world_size, link=link, arch=arch)
-
-
 def ring_st_ladder(
     *, world_size: int, link: str, arch: str | None = None
 ) -> tuple[TwoShotRung, ...]:
     """The ring rungs for *(arch, link, world_size)*. *arch* defaults to this
     host's."""
     return _ladder(RING_ST_LADDER, "ring", arch, link, world_size)
-
-
-# Floor on the block count of the mesh and the ring when they batch publishes
-# into super-tiles. Shrinking the grid trades parallelism for fewer release fences,
-# which is only a good trade once there are enough fences to matter.
-MIN_BATCH_BLOCKS = 32
-
-# World size from which the ring's reduce-scatter lap defaults to INT6, to
-# clear the 18 dB SQNR floor the schedules are held to. The ring requantizes
-# the running partial at every hop, and the partial's extremum grows with the
-# contributions folded in, so unlike the mesh its error grows with N. With the
-# E5M2 group scale an all-INT4 ring reaches 17.9 dB at TP4 (E4M3: 18.3), under
-# the floor, so INT6 starts at TP4. On PCIe that is up to 26/18 of the
-# reduce-scatter bytes at TP4; a precision-preserving scale (per-slice
-# E4M3/E5M2) would let it move back to TP8.
-RS_INT6_MIN_WORLD = 4
-
-# Default ``min_bytes`` of a ``FlyQuickAllReduce`` built directly, outside the
-# dispatchers: the payload below which its ``allreduce`` refuses to run. The
-# dispatchers pass ``min_bytes=0`` and route by the ``FAMILY_POLICIES`` windows,
-# so this value never applies to them.
-QUANT_MIN_PAYLOAD_BYTES = 128 * KiB
 
 
 # Host and environment
@@ -672,8 +815,25 @@ def _override(window: Window | None, lo, hi) -> Window | None:
     return Window(base.min if lo is _UNSET else lo, base.max if hi is _UNSET else hi)
 
 
-def apply_env_overrides(policy: FamilyPolicy) -> FamilyPolicy:
-    """*policy* with the ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES`` overrides.
+def _has_ladder(alg: AllReduceAlgorithm, key: tuple, *, fused: bool) -> bool:
+    """Whether *alg* has a tuned ladder for ``(arch, link, world_size)``.
+
+    The fused tables are also keyed by the hidden size; any width counts.
+    """
+    if not fused:
+        return key in LADDERS[alg]
+    table = {
+        AllReduceAlgorithm.OneShot: FUSED_ONESHOT_LADDER,
+        AllReduceAlgorithm.TwoShotMesh: FUSED_MESH_ST_LADDER,
+        AllReduceAlgorithm.TwoShotRing: FUSED_RING_ST_LADDER,
+    }[alg]
+    return any(k[:3] == key for k in table)
+
+
+def apply_env_overrides(
+    policy: FamilyPolicy, prefix: str = "AITER_FLY_AR"
+) -> FamilyPolicy:
+    """*policy* with the ``<prefix>_<ALG>_{MIN,MAX}_BYTES`` overrides.
 
     An override can move a window and enable an algorithm, but only where
     the algorithm has a ladder for the platform. Elsewhere the override is
@@ -682,8 +842,8 @@ def apply_env_overrides(policy: FamilyPolicy) -> FamilyPolicy:
 
     bounds = {
         alg: (
-            _env_bound(f"AITER_FLY_AR_{infix}_MIN_BYTES", is_max=False),
-            _env_bound(f"AITER_FLY_AR_{infix}_MAX_BYTES", is_max=True),
+            _env_bound(f"{prefix}_{infix}_MIN_BYTES", is_max=False),
+            _env_bound(f"{prefix}_{infix}_MAX_BYTES", is_max=True),
         )
         for alg, infix in _WINDOW_ENV.items()
     }
@@ -695,9 +855,13 @@ def apply_env_overrides(policy: FamilyPolicy) -> FamilyPolicy:
         (AllReduceAlgorithm.TwoShotRing, "ring"),
     ):
         window = _override(getattr(policy, field), *bounds[alg])
-        if window is not None and not window.is_empty and key not in LADDERS[alg]:
+        if (
+            window is not None
+            and not window.is_empty
+            and not _has_ladder(alg, key, fused=prefix == FUSED_ENV_PREFIX)
+        ):
             logger.warning(
-                "AITER_FLY_AR_%s_{MIN,MAX}_BYTES ignored: the %s has no tuned "
+                f"{prefix}_%s_{{MIN,MAX}}_BYTES ignored: the %s has no tuned "
                 "configuration on %s/%s/TP%d.",
                 _WINDOW_ENV[alg],
                 alg.value,
@@ -813,3 +977,558 @@ def resolve_family_policy(
         world_size=world_size,
     )
     return apply_env_overrides(row)
+
+
+# Fused all-reduce + RMSNorm
+# ==========================
+#
+# The same two levels as the plain all-reduce, with tables of their own: the
+# fused kernels move the same bytes, but the epilogue changes where each
+# family pays, and the one-shot tile is pinned to the token row.
+
+
+# Level 1: algorithm boundaries
+#
+# The one-shot window is measured against what the caller would run instead,
+# the fused ``cross_device_reduce`` or RCCL plus a separate RMSNorm, and above
+# it the fused path declines. With quantization on
+# (``AITER_QUICK_REDUCE_QUANTIZATION=INT4``) the mesh and the ring take the
+# payloads of their windows first.
+FUSED_FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
+    # --- gfx942 (MI300X) / xGMI ----------------------------------------------
+    # Measured on MI325X. No ring: the mesh wins above the one-shot.
+    FamilyPolicy(
+        arch="gfx942",
+        link="xgmi",
+        world_size=2,
+        oneshot=Window(0, 32 * MiB),
+        mesh=Window(2 * MiB, None),
+        ring=None,
+    ),
+    FamilyPolicy(
+        arch="gfx942",
+        link="xgmi",
+        world_size=4,
+        oneshot=Window(0, 512 * KiB),
+        mesh=Window(1344 * KiB, None),
+        ring=None,
+    ),
+    FamilyPolicy(
+        arch="gfx942",
+        link="xgmi",
+        world_size=8,
+        oneshot=Window(0, 128 * KiB),
+        mesh=Window(448 * KiB, None),
+        ring=None,
+    ),
+    # --- gfx950 (MI355X) / xGMI ----------------------------------------------
+    FamilyPolicy(
+        arch="gfx950",
+        link="xgmi",
+        world_size=2,
+        oneshot=Window(0, 2688 * KiB),
+        mesh=None,
+        ring=Window(768 * KiB, None),
+    ),
+    FamilyPolicy(
+        arch="gfx950",
+        link="xgmi",
+        world_size=4,
+        oneshot=Window(0, 384 * KiB),
+        mesh=Window(1536 * KiB, None),
+        ring=None,
+    ),
+    FamilyPolicy(
+        arch="gfx950",
+        link="xgmi",
+        world_size=8,
+        oneshot=Window(0, 168 * KiB),
+        mesh=Window(2 * MiB, None),
+        ring=None,
+    ),
+    # --- gfx950 (MI350P) / PCIe ----------------------------------------------
+    FamilyPolicy(
+        arch="gfx950",
+        link="pcie",
+        world_size=2,
+        oneshot=Window(0, None),
+        mesh=None,
+        ring=Window(768 * KiB, None),
+    ),
+    FamilyPolicy(
+        arch="gfx950",
+        link="pcie",
+        world_size=4,
+        oneshot=Window(0, None),
+        mesh=Window(256 * KiB, 16 * MiB),
+        ring=Window(16 * MiB, None),
+    ),
+    FamilyPolicy(
+        arch="gfx950",
+        link="pcie",
+        world_size=8,
+        oneshot=Window(0, None),
+        mesh=Window(128 * KiB, None),
+        ring=None,
+    ),
+)
+
+_FUSED_POLICY_BY_KEY = _index(FUSED_FAMILY_POLICIES)
+
+
+# Level 2: configuration ladders
+#
+# The tables are keyed ``(arch, link, world_size, hidden)``, with
+# ``hidden=None`` for the default ladder; ``FUSED_QR_ROW_ATOMS`` by ``(arch,
+# link, world_size, algorithm, hidden)``.
+
+# The environment variable that names another ladder file.
+FUSED_LADDERS_ENV = "AITER_FLY_AR_FUSED_LADDERS"
+FUSED_LADDERS_JSON = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "configs",
+    "comm",
+    "fused_allreduce_ladders.json",
+)
+FUSED_LADDERS_SCHEMA_VERSION = 1
+
+# The quantized fused algorithms, whose entries carry ``atoms_per_row``.
+FUSED_QR_ALGORITHMS = ("mesh", "ring")
+
+_BYTES_RE = re.compile(r"^\s*(\d+)\s*(B|KiB|MiB)?\s*$")
+_BYTE_UNITS = {None: 1, "B": 1, "KiB": KiB, "MiB": MiB}
+
+
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _parse_bytes(value, where: str) -> int:
+    if _is_int(value) and value >= 0:
+        return value
+    m = _BYTES_RE.match(value) if isinstance(value, str) else None
+    if m is None:
+        raise ValueError(
+            f"{where}: expected a non-negative integer or '<n> KiB|MiB', "
+            f"got {value!r}"
+        )
+    return int(m[1]) * _BYTE_UNITS[m[2]]
+
+
+# A malformed ladder file raises ``ValueError`` whatever is wrong with it,
+# wrong JSON types included, so a caller handles one exception type.
+
+
+def _check_keys(obj, where: str, required, optional=()) -> None:
+    if not isinstance(obj, dict):
+        got = type(obj).__name__
+        raise ValueError(f"{where}: expected an object, got {got}")  # noqa: TRY004
+    keys = {k for k in obj if not k.startswith("_")}
+    missing = sorted(set(required) - keys)
+    unknown = sorted(keys - set(required) - set(optional))
+    if missing:
+        raise ValueError(f"{where}: missing {missing}")
+    if unknown:
+        raise ValueError(f"{where}: unknown {unknown}")
+
+
+def _check_in(value, legal, where: str) -> None:
+    if not _is_int(value) or value not in legal:
+        raise ValueError(f"{where}: must be one of {legal}, got {value!r}")
+
+
+def _check_grid_cap(rung, where: str) -> None:
+    if not _is_int(rung.grid_cap) or rung.grid_cap < 1:
+        raise ValueError(f"{where}.grid_cap: must be positive, got {rung.grid_cap!r}")
+
+
+def _check_oneshot_rung(rung: FusedOneShotRung, where: str) -> None:
+    _check_in(rung.atoms, SUPPORTED_ATOMS, f"{where}.atoms")
+    _check_in(rung.split, SUPPORTED_SPLITS, f"{where}.split")
+    _check_grid_cap(rung, where)
+    if rung.fanout not in FANOUT_ORDERS:
+        raise ValueError(
+            f"{where}.fanout: must be one of {FANOUT_ORDERS}, got {rung.fanout!r}"
+        )
+
+
+def _two_shot_check(super_tiles, *, low_latency: bool):
+    def check(rung: FusedTwoShotRung, where: str) -> None:
+        _check_in(rung.super_tile, super_tiles, f"{where}.super_tile")
+        _check_grid_cap(rung, where)
+        if not isinstance(rung.low_latency, bool):
+            msg = f"{where}.low_latency: must be true or false"
+            raise ValueError(msg)  # noqa: TRY004
+        if rung.low_latency and not (low_latency and rung.super_tile == 1):
+            raise ValueError(
+                f"{where}.low_latency: only a mesh rung with super_tile=1 can be a "
+                "low-latency build"
+            )
+
+    return check
+
+
+# The rung record and the rung check of each family in the file.
+_FUSED_FAMILIES = {
+    "oneshot": (FusedOneShotRung, _check_oneshot_rung),
+    "mesh": (FusedTwoShotRung, _two_shot_check(SUPER_TILES, low_latency=True)),
+    "ring": (FusedTwoShotRung, _two_shot_check(RING_SUPER_TILES, low_latency=False)),
+}
+
+
+def _parse_rungs(raw, cls, check, where: str) -> tuple:
+    if not isinstance(raw, list) or not raw:
+        raise ValueError(f"{where}.rungs: expected a non-empty list")
+    all_fields = dataclasses.fields(cls)
+    names = [f.name for f in all_fields if f.default is dataclasses.MISSING]
+    optional = {f.name: f.default for f in all_fields if f.name not in names}
+    rungs = []
+    for i, fields in enumerate(raw):
+        rw = f"{where}.rungs[{i}]"
+        _check_keys(fields, rw, names, optional)
+        values = {name: fields[name] for name in names}
+        values.update({k: fields.get(k, v) for k, v in optional.items()})
+        values["min_bytes"] = _parse_bytes(values["min_bytes"], f"{rw}.min_bytes")
+        rung = cls(**values)
+        check(rung, rw)
+        rungs.append(rung)
+    floors = [r.min_bytes for r in rungs]
+    if floors[0] != 0 or floors != sorted(set(floors)):
+        raise ValueError(
+            f"{where}: min_bytes must start at 0 and increase, got {floors}"
+        )
+    return tuple(rungs)
+
+
+def _parse_hidden(key: str, where: str) -> int:
+    if not key.isdigit() or int(key) <= 0 or str(int(key)) != key:
+        raise ValueError(f"{where}: a width is a positive integer, got {key!r}")
+    return int(key)
+
+
+def _no_duplicate_keys(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate key {key!r}")
+        out[key] = value
+    return out
+
+
+@dataclass(frozen=True)
+class FusedLadders:
+    """The fused ladders of one file, as ``load_fused_ladders`` reads them.
+
+    ``oneshot``, ``mesh`` and ``ring`` map ``(arch, link, world_size, hidden)``
+    to a ladder, ``hidden=None`` being the default. ``row_atoms`` maps ``(arch,
+    link, world_size, algorithm, hidden)`` to ``atoms_per_row`` for the entries
+    that set it.
+    """
+
+    oneshot: dict[tuple, tuple[FusedOneShotRung, ...]]
+    mesh: dict[tuple, tuple[FusedTwoShotRung, ...]]
+    ring: dict[tuple, tuple[FusedTwoShotRung, ...]]
+    row_atoms: dict[tuple, int | None]
+
+
+def load_fused_ladders(path: str) -> FusedLadders:
+    """Read and check the fused ladder file at *path*. Raises ``ValueError``,
+    naming the entry, on anything the engines could not build."""
+    with open(path) as f:
+        try:
+            doc = json.load(f, object_pairs_hook=_no_duplicate_keys)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(f"{path}: {exc}") from None
+    _check_keys(doc, path, ("schema_version", "platforms"))
+    if doc["schema_version"] != FUSED_LADDERS_SCHEMA_VERSION:
+        raise ValueError(
+            f"{path}: schema_version {doc['schema_version']!r}, expected "
+            f"{FUSED_LADDERS_SCHEMA_VERSION}"
+        )
+    if not isinstance(doc["platforms"], list):
+        raise ValueError(f"{path}: platforms must be a list")  # noqa: TRY004
+
+    tables = {family: {} for family in _FUSED_FAMILIES}
+    row_atoms = {}
+    for i, plat in enumerate(doc["platforms"]):
+        where = f"{path}: platforms[{i}]"
+        _check_keys(plat, where, ("arch", "link", "world_size", *_FUSED_FAMILIES))
+        arch, link, ws = plat["arch"], plat["link"], plat["world_size"]
+        if arch not in SUPPORTED_ARCHS:
+            raise ValueError(f"{where}.arch: must be one of {SUPPORTED_ARCHS}")
+        if not _is_int(ws):
+            raise ValueError(f"{where}.world_size: expected an integer, got {ws!r}")
+        try:
+            _check_platform(arch, link, ws)
+        except ValueError as exc:
+            raise ValueError(f"{where}: {exc}") from None
+        cell = (arch, link, ws)
+        if (*cell, None) in tables["oneshot"]:
+            raise ValueError(f"{where}: duplicate platform {arch}/{link}/TP{ws}")
+        where = f"{path}: {arch}/{link}/TP{ws}"
+
+        for family, (cls, check) in _FUSED_FAMILIES.items():
+            fw = f"{where}.{family}"
+            spec = plat[family]
+            _check_keys(spec, fw, ("default",), ("hidden",))
+            by_width = spec.get("hidden", {})
+            if not isinstance(by_width, dict):
+                raise ValueError(f"{fw}.hidden: expected an object")  # noqa: TRY004
+            entries = [(None, spec["default"], f"{fw}.default")]
+            entries += [
+                (_parse_hidden(key, f"{fw}.hidden"), entry, f"{fw}.hidden.{key}")
+                for key, entry in by_width.items()
+                if not key.startswith("_")
+            ]
+            qr = family in FUSED_QR_ALGORITHMS
+            for hidden, entry, ew in entries:
+                _check_keys(entry, ew, ("rungs",), ("atoms_per_row",) if qr else ())
+                rungs = _parse_rungs(entry["rungs"], cls, check, ew)
+                if link != "xgmi" and any(
+                    getattr(r, "low_latency", False) for r in rungs
+                ):
+                    raise ValueError(
+                        f"{ew}: a low-latency rung is only for xgmi: the build "
+                        "has not been measured on other links, where it ran "
+                        "slower than the default"
+                    )
+                if family == "oneshot" and hidden is None:
+                    splits = sorted({r.split for r in rungs} - {1})
+                    if splits:
+                        raise ValueError(
+                            f"{ew}: the default ladder runs at every width, so it "
+                            f"does not split (split=1), got split={splits}"
+                        )
+                tables[family][(*cell, hidden)] = rungs
+                if "atoms_per_row" in entry:
+                    apr = entry["atoms_per_row"]
+                    # The ring normalizes one reduce-scatter chunk at a time, so
+                    # its row fits in one; the mesh normalizes the gathered
+                    # tile, so its row may span a whole tile of 8 atoms.
+                    span = 8 if family == "mesh" else 8 // ws
+                    if apr is not None and (not _is_int(apr) or apr < 1 or span % apr):
+                        what = (
+                            "a tile's 8 atoms"
+                            if family == "mesh"
+                            else f"a rank's reduce-scatter chunk of {span} atoms"
+                        )
+                        raise ValueError(
+                            f"{ew}.atoms_per_row: must divide {what}, got {apr!r}"
+                        )
+                    row_atoms[(*cell, family, hidden)] = apr
+    return FusedLadders(row_atoms=row_atoms, **tables)
+
+
+def fused_ladders_path() -> str:
+    """The fused ladder file: ``AITER_FLY_AR_FUSED_LADDERS``, or the shipped
+    one when it is unset."""
+    return os.environ.get(FUSED_LADDERS_ENV, "").strip() or FUSED_LADDERS_JSON
+
+
+def _load_fused_ladders() -> FusedLadders:
+    path = fused_ladders_path()
+    if path != FUSED_LADDERS_JSON:
+        logger.info(
+            "FlyDSL all-reduce: fused ladders from %s=%s", FUSED_LADDERS_ENV, path
+        )
+    return load_fused_ladders(path)
+
+
+FUSED_LADDERS = _load_fused_ladders()
+FUSED_ONESHOT_LADDER = FUSED_LADDERS.oneshot
+FUSED_MESH_ST_LADDER = FUSED_LADDERS.mesh
+FUSED_RING_ST_LADDER = FUSED_LADDERS.ring
+FUSED_QR_ROW_ATOMS = FUSED_LADDERS.row_atoms
+
+
+def _fused_ladder(table: dict, name: str, arch, link: str, world_size: int, hidden):
+    """*hidden*'s ladder in *table*, or the platform's default ladder when the
+    width has none of its own or *hidden* is None."""
+    arch = detect_arch() if arch is None else arch
+    _check_platform(arch, link, int(world_size))
+    cell = (arch, link, int(world_size))
+    if hidden is not None:
+        rungs = table.get((*cell, int(hidden)))
+        if rungs is not None:
+            return rungs
+    rungs = table.get((*cell, None))
+    if rungs is None:
+        raise NoPolicyError(f"no {name} ladder for {arch}/{link}/TP{world_size}")
+    return rungs
+
+
+def fused_oneshot_ladder(
+    *, world_size: int, link: str, arch: str | None = None, hidden: int | None = None
+) -> tuple[FusedOneShotRung, ...]:
+    """The fused one-shot rungs for *(arch, link, world_size)* at *hidden*:
+    the width's own ladder, or the default one. *arch* defaults to this host's.
+
+    A split rung (``split > 1``) is returned as the same rung unsplit unless
+    ``AITER_FLY_AR_FUSED_SPLIT=1`` (``fused_split_enabled``): its atoms, grid cap
+    and fanout stay, so the unsplit build is the rung's own geometry with the
+    whole row on one workgroup.
+    """
+    rungs = _fused_ladder(
+        FUSED_ONESHOT_LADDER, "fused one-shot", arch, link, world_size, hidden
+    )
+    if fused_split_enabled():
+        return rungs
+    return tuple(dataclasses.replace(r, split=1) for r in rungs)
+
+
+def fused_mesh_st_ladder(
+    *, world_size: int, link: str, arch: str | None = None, hidden: int | None = None
+) -> tuple[FusedTwoShotRung, ...]:
+    """The fused mesh rungs for *(arch, link, world_size)* at *hidden*: the
+    width's own ladder, or the default one. *arch* defaults to this host's."""
+    return _fused_ladder(
+        FUSED_MESH_ST_LADDER, "fused mesh", arch, link, world_size, hidden
+    )
+
+
+def fused_ring_st_ladder(
+    *, world_size: int, link: str, arch: str | None = None, hidden: int | None = None
+) -> tuple[FusedTwoShotRung, ...]:
+    """The fused ring rungs for *(arch, link, world_size)* at *hidden*: the
+    width's own ladder, or the default one. *arch* defaults to this host's."""
+    return _fused_ladder(
+        FUSED_RING_ST_LADDER, "fused ring", arch, link, world_size, hidden
+    )
+
+
+def fused_qr_row_atoms(
+    *,
+    world_size: int,
+    algorithm: str,
+    link: str,
+    arch: str | None = None,
+    hidden: int | None = None,
+) -> int | None:
+    """``atoms_per_row`` of a fused *algorithm* build at *hidden*, or None for
+    the widest workgroup the row allows. A width whose entry does not set it
+    takes the default's."""
+    arch = detect_arch() if arch is None else arch
+    key = (arch, link, int(world_size), str(algorithm))
+    if hidden is not None and (*key, int(hidden)) in FUSED_QR_ROW_ATOMS:
+        return FUSED_QR_ROW_ATOMS[(*key, int(hidden))]
+    return FUSED_QR_ROW_ATOMS.get((*key, None))
+
+
+def fused_ladder_hiddens(
+    *, world_size: int, link: str, arch: str | None = None
+) -> tuple[int, ...]:
+    """The widths with a ladder of their own in any fused family, sorted."""
+    arch = detect_arch() if arch is None else arch
+    cell = (arch, link, int(world_size))
+    return tuple(
+        sorted(
+            {
+                key[3]
+                for table in (
+                    FUSED_ONESHOT_LADDER,
+                    FUSED_MESH_ST_LADDER,
+                    FUSED_RING_ST_LADDER,
+                )
+                for key in table
+                if key[:3] == cell and key[3] is not None
+            }
+        )
+    )
+
+
+def fused_platform_ladders(
+    *, world_size: int, link: str, arch: str | None = None
+) -> tuple:
+    """Fused ladders for this platform. Two ranks build the same
+    fused engines at every width exactly when this is equal on both."""
+    kw = {"world_size": world_size, "link": link, "arch": arch}
+    return tuple(
+        (
+            hidden,
+            fused_oneshot_ladder(**kw, hidden=hidden),
+            fused_mesh_st_ladder(**kw, hidden=hidden),
+            fused_ring_st_ladder(**kw, hidden=hidden),
+            *(
+                fused_qr_row_atoms(**kw, algorithm=alg, hidden=hidden)
+                for alg in FUSED_QR_ALGORITHMS
+            ),
+        )
+        for hidden in (None, *fused_ladder_hiddens(**kw))
+    )
+
+
+# Host and environment
+
+# Comma-separated hidden sizes to build the fused engines for at startup. The
+# fused wire layout depends on the width, so a width cannot be built until it
+# is known, and building inside a HIP graph capture is not possible.
+FUSED_HIDDENS_ENV = "AITER_FLY_AR_FUSED_HIDDENS"
+
+# The prefix of the fused window overrides, ``<prefix>_<ALG>_{MIN,MAX}_BYTES``.
+FUSED_ENV_PREFIX = "AITER_FLY_AR_FUSED"
+
+# ``1`` lets the fused one-shot ladder split a token row over several
+# workgroups (its ``split`` rungs). Opt-in: unset, ``0`` and anything else run
+# every rung unsplit, one workgroup per row.
+FUSED_SPLIT_ENV = "AITER_FLY_AR_FUSED_SPLIT"
+
+
+def fused_split_enabled() -> bool:
+    """Whether ``AITER_FLY_AR_FUSED_SPLIT=1`` allows split fused one-shot rows."""
+    return os.environ.get(FUSED_SPLIT_ENV, "").strip() == "1"
+
+
+def fused_hiddens(extra: tuple[int, ...] = ()) -> tuple[int, ...]:
+    """Widths to build the fused engines for up front, sorted and deduped.
+
+    ``AITER_FLY_AR_FUSED_HIDDENS`` plus *extra*. Sorted so every rank builds in
+    the same order: each build is a collective.
+    """
+    out = {int(h) for h in extra if int(h) > 0}
+    raw = os.environ.get(FUSED_HIDDENS_ENV, "")
+    for tok in raw.replace(" ", "").split(","):
+        if not tok:
+            continue
+        try:
+            val = int(tok)
+        except ValueError:
+            logger.warning(
+                "FlyDSL all-reduce: ignoring %r in %s, expected an integer",
+                tok,
+                FUSED_HIDDENS_ENV,
+            )
+            continue
+        if val > 0:
+            out.add(val)
+    return tuple(sorted(out))
+
+
+# Level 1: resolution
+
+
+def fused_family_policy(*, arch: str, link: str, world_size: int) -> FamilyPolicy:
+    """The fused table row for *(arch, link, world_size)*, without overrides."""
+    _check_platform(arch, link, int(world_size))
+    row = _FUSED_POLICY_BY_KEY.get((arch, link, int(world_size)))
+    if row is None:
+        raise NoPolicyError(
+            f"no FlyDSL fused all-reduce policy for {arch}/{link}/TP{world_size}"
+        )
+    return row
+
+
+def resolve_fused_policy(
+    *, world_size: int, arch: str | None = None, link: str | None = None
+) -> FamilyPolicy:
+    """The fused policy of this rank, with the
+    ``AITER_FLY_AR_FUSED_<ALG>_{MIN,MAX}_BYTES`` overrides applied.
+
+    Select with ``quantized=True`` when quantization is on
+    (``AITER_QUICK_REDUCE_QUANTIZATION=INT4``).
+    """
+    row = fused_family_policy(
+        arch=detect_arch() if arch is None else arch,
+        link=resolve_link(link),
+        world_size=world_size,
+    )
+    return apply_env_overrides(row, prefix=FUSED_ENV_PREFIX)
