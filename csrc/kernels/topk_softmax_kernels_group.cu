@@ -19,6 +19,7 @@
 #include "aiter_hip_common.h"
 #include "aiter_opus_plus.h"
 #include "aiter_stream.h"
+#include "gemm_dispatch_utils.h"
 #include "hip_reduce.h"
 #include "moe_op.h"
 #include "topk_pad_rows.h"
@@ -327,8 +328,8 @@ constexpr int kLegacyTopKLocalBits      = 5;
 constexpr int kTopKRegMaxExpertsPerLane = 1 << kLegacyTopKLocalBits;
 // Candidates the register path stages before its fallback: one slot per lane
 // on wave64, two on wave32. At topk 16, one per lane on wave32 would overflow
-// on up to ~0.16% of random rows (E=1024), and on MI455X each such row adds
-// 25-45 us to the whole launch (E = 512 and 1024).
+// on some random rows (E = 512 and 1024), and each such row takes the much
+// slower fallback below.
 constexpr int kTopKRegCandCap = 64;
 
 // Wave64 rank; its low five bits are the wave32 rank (permlanex16 for row_bcast).
@@ -1080,9 +1081,8 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
         return;
     }
 
-    // Fallback for more than kTopKRegCandCap candidates. Rare --
-    // a poison probe measured zero hits over 4096 rows of the benchmark
-    // distribution -- but correctness depends on it, so it stays. Still register
+    // Fallback for more than kTopKRegCandCap candidates. Rare on random rows,
+    // but correctness depends on it, so it stays. Still register
     // resident; it only gives up the pivot, not the VGPR-held scores.
     float sum                  = 0.0f;
     int topk_indice            = 0;
@@ -1169,8 +1169,10 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
 //   3. elements >= pivot go to LDS as candidate records, one LDS atomic per
 //      wave for the slot base (order is irrelevant: the key is unique);
 //   4. barrier; wave 0 ranks up to 64 records by lane rotations and
-//      renormalizes in rank order. More than 64 take topk wave arg-max
-//      rounds over the whole row.
+//      renormalizes in rank order. Rows with more than 64 records, or
+//      whose pivot is -inf or that have fewer than topk records (NaN or
+//      -inf scores), take topk wave arg-max rounds over the whole row
+//      instead.
 //
 // The groups only set the pivot. Ids and weights match topk_reg_kernel bit for
 // bit: the same score key and legacy tie rank order the picks, the sigmoid gives
@@ -2341,6 +2343,37 @@ biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [nu
 }
 } // namespace aiter
 
+// The wave32 register paths (topk_reg_kernel at wave32 and topk_reg_mw_kernel)
+// have run on gfx1250 only. RDNA GPUs are wave32 too and compile them, but
+// keep the LDS kernel until the paths are tested there. Per device, cached by
+// get_device_gfx; callers hold a HipDeviceGuard for the input's device.
+static bool topk_reg_w32_arch_ok()
+{
+    const std::string_view gfx = get_device_gfx();
+    return gfx == "gfx1250";
+}
+
+// Shape and dtype contract of topk_reg_mw_kernel, for the current device. The
+// row pitch and the pointer alignment are the caller's to check.
+static bool
+topk_reg_mw_args_ok(int64_t num_experts, int64_t topk, int64_t gating_dtype, int64_t bias_dtype)
+{
+    const int64_t waves = num_experts / 128;
+    return num_experts == 128 * waves && (waves == 4 || waves == 6 || waves == 7 || waves == 8) &&
+           topk >= 1 && topk <= aiter::kTopKRegMwMaxTopK && gating_dtype == AITER_DTYPE_bf16 &&
+           (bias_dtype == AITER_DTYPE_bf16 || bias_dtype == AITER_DTYPE_fp32) &&
+           topk_reg_w32_arch_ok();
+}
+
+bool topk_reg_mw_supports(
+    int64_t num_experts, int64_t topk, int64_t gating_dtype, int64_t bias_dtype, int64_t device_id)
+{
+    if(device_id < 0)
+        return topk_reg_mw_args_ok(num_experts, topk, gating_dtype, bias_dtype);
+    HipDeviceGuard device_guard(static_cast<int>(device_id));
+    return topk_reg_mw_args_ok(num_experts, topk, gating_dtype, bias_dtype);
+}
+
 #define LAUNCH_KERNEL()                                                        \
     LAUNCHER_TOPK_REG()                                                        \
     AITER_CHECK(!isBiased || correction_bias.dtype() == gating_output.dtype(), \
@@ -2380,6 +2413,7 @@ biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [nu
 
 /* Register-resident path, one token per wave (wave64 or wave32). Gates:
  * - no group filter: topk_grp == num_expert_group
+ * - wave64, or wave32 on gfx1250 (topk_reg_w32_arch_ok)
  * - num_experts % 4 == 0, so the legacy float4 tie order still describes it
  * - ceil(num_experts / wave size) in AITER_TOPK_REG_LAUNCH_EPLS (wave64) or
  *   AITER_TOPK_REG_LAUNCH_EPLS_W32 (wave32), else LDS; lanes past num_experts
@@ -2392,6 +2426,7 @@ biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [nu
         const int reg_lanes        = static_cast<int>(get_warp_size_func());         \
         const int experts_per_lane = (num_experts + reg_lanes - 1) / reg_lanes;      \
         if(topk_grp == num_expert_group &&                                           \
+           (reg_lanes == 64 || topk_reg_w32_arch_ok()) &&                            \
            (num_experts % 4) == 0 &&                                                 \
            experts_per_lane <= kMaxExpertsPerLane &&                                 \
            topk <= reg_lanes / 2 &&                                                  \
@@ -2679,17 +2714,13 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
     // wave32 without a group filter, E = 128 * waves: a row per workgroup,
     // four experts per lane, read as naturally aligned four-element vectors
     // from the BF16 logits and the BF16 or FP32 bias.
-    // biased_grouped_topk in aiter/ops/topk.py sends rows here when
-    // _gfx1250_reg_mw_fits passes, so keep the two gates in step: a row it
-    // admits and this gate rejects falls through to topk_reg_kernel (E = 512
-    // and 1024 at topk <= 16) or else to the LDS kernel, which aborts on an FP32 bias.
+    // biased_grouped_topk in aiter/ops/topk.py asks topk_reg_mw_supports, the
+    // same topk_reg_mw_args_ok, and checks the pitch and alignment below itself.
     const int mw_waves      = num_experts / 128;
     const bool mw_bias_fp32 = correction_bias.dtype() == AITER_DTYPE_fp32;
-    if(get_warp_size_func() == 32 && topk_grp == num_expert_group &&
-       num_experts == 128 * mw_waves &&
-       (mw_waves == 4 || mw_waves == 6 || mw_waves == 7 || mw_waves == 8) && topk >= 1 &&
-       topk <= aiter::kTopKRegMwMaxTopK && gating_output.dtype() == AITER_DTYPE_bf16 &&
-       (mw_bias_fp32 || correction_bias.dtype() == AITER_DTYPE_bf16) && stride_gating % 4 == 0 &&
+    if(topk_grp == num_expert_group &&
+       topk_reg_mw_args_ok(num_experts, topk, gating_output.dtype(), correction_bias.dtype()) &&
+       stride_gating % 4 == 0 &&
        reinterpret_cast<uintptr_t>(gating_output.data_ptr()) % 8 == 0 &&
        reinterpret_cast<uintptr_t>(correction_bias.data_ptr()) % (mw_bias_fp32 ? 16 : 8) == 0)
     {

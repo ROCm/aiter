@@ -242,3 +242,24 @@ def test_exact_sigmoid_topk_herd_widths(experts, topk, rows, need_renorm, bias_d
     assert torch.equal(weights, hip_weights)
     assert torch.all(ids_buf[:, topk:] == -7)
     assert torch.all(weights_buf[:, topk:] == -7.0)
+
+
+def test_exact_sigmoid_topk_compiled_call():
+    """A traced call keeps the Triton kernel and an eager one of the same shape
+    runs the HIP multi-wave kernel (see _gfx1250_reg_mw_fits): the two agree on
+    ids and to ULPs on weights."""
+    torch.manual_seed(0)
+    logits = torch.randn((64, 896), dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(896, device="cuda", dtype=torch.float32) * 0.1
+    eager_w = torch.empty((64, 17), dtype=torch.float32, device="cuda")
+    eager_ids = torch.empty((64, 17), dtype=torch.int32, device="cuda")
+    weights, ids = torch.empty_like(eager_w), torch.empty_like(eager_ids)
+
+    assert topk_ops._gfx1250_reg_mw_fits(logits, bias, eager_w, eager_ids)
+    topk_ops.biased_grouped_topk(logits, bias, eager_w, eager_ids, 1, 1, True, 2.5)
+    torch.compile(topk_ops.biased_grouped_topk)(
+        logits, bias, weights, ids, 1, 1, True, 2.5
+    )
+
+    assert torch.equal(ids, eager_ids)
+    torch.testing.assert_close(weights, eager_w, atol=1e-6, rtol=1e-6)

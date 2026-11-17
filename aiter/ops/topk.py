@@ -84,10 +84,36 @@ def _can_use_gfx1250_exact_sigmoid_topk(
     return get_gfx_runtime() in ("gfx1250", "gfx1250-strict")
 
 
-# E = 128 * waves and the topk bound of biased_grouped_topk_hip's wave32
-# multi-wave kernel.
-_GFX1250_REG_MW_EXPERTS = {512, 768, 896, 1024}
-_GFX1250_REG_MW_MAX_TOPK = 17
+@compile_ops("module_moe_asm")
+def topk_reg_mw_supports(
+    num_experts: int,
+    topk: int,
+    gating_dtype: int,
+    bias_dtype: int,
+    device_id: int = -1,
+) -> bool: ...
+
+
+@functools.lru_cache(maxsize=256)
+def _reg_mw_supports_cached(
+    num_experts: int,
+    topk: int,
+    gating_dtype: torch.dtype,
+    bias_dtype: torch.dtype,
+    device: int,
+) -> bool:
+    """topk_reg_mw_supports() memoised. Safe to cache: it is a pure function of
+    these arguments and of the device's architecture, and the device is in the
+    key."""
+    return bool(
+        topk_reg_mw_supports(
+            num_experts,
+            topk,
+            dtypes._aiter_dtype_id(gating_dtype),
+            dtypes._aiter_dtype_id(bias_dtype),
+            device,
+        )
+    )
 
 
 def _gfx1250_reg_mw_fits(
@@ -96,19 +122,29 @@ def _gfx1250_reg_mw_fits(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
 ) -> bool:
-    """Whether a call that passed _can_use_gfx1250_exact_sigmoid_topk fits the
+    """Whether a call that passed _can_use_gfx1250_exact_sigmoid_topk runs on the
     multi-wave kernel of biased_grouped_topk_hip, which beats the Triton one.
 
-    Mirrors the gate in front of topk_reg_mw_kernel in biased_grouped_topk
-    (csrc/kernels/topk_softmax_kernels_group.cu); keep the two in step. A call
-    admitted here and rejected there falls through to topk_reg_kernel (E = 512
-    and 1024 at topk <= 16) or else to the LDS kernel, which aborts on an FP32
-    bias."""
+    The shape and dtype terms come from topk_reg_mw_supports, the same test the
+    HIP entry applies; the pitch and alignment terms below are the rest of it.
+
+    Compiled calls stay on the Triton kernel: data_ptr() breaks a Dynamo graph.
+    So under torch.compile a traced call runs Triton and an eager call of the
+    same shape runs HIP. Their weights can differ by a few ULPs (the HERD-width
+    test in test_topk_gating.py allows 1e-6), and so, in principle, can a pick
+    between two scores that close. In rows with fewer
+    finite scores than topk, the slots past the finite ones differ too: Triton
+    fills them with the remaining experts in tie order, weighted by their own
+    sigmoid scores, and HIP with unused ids from 0..31 at weight 0."""
     return (
-        # data_ptr() breaks a Dynamo graph; compiled calls keep the Triton kernel.
         not torch.compiler.is_compiling()
-        and gating_output.shape[1] in _GFX1250_REG_MW_EXPERTS
-        and topk_ids.shape[1] <= _GFX1250_REG_MW_MAX_TOPK
+        and _reg_mw_supports_cached(
+            gating_output.shape[1],
+            topk_ids.shape[1],
+            gating_output.dtype,
+            correction_bias.dtype,
+            gating_output.device.index,
+        )
         # Rows and bias are read as 4-element vectors.
         and gating_output.stride(0) % 4 == 0
         and gating_output.data_ptr() % (4 * gating_output.element_size()) == 0

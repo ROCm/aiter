@@ -25,7 +25,8 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
-from aiter.ops.topk import _gfx1250_exact_sigmoid_topk, biased_grouped_topk_hip
+from aiter.ops.topk import biased_grouped_topk_hip
+from aiter.ops.triton.moe.moe_routing.topk_gating import exact_sigmoid_biased_topk
 from aiter.test_common import (
     benchmark,
     checkAllclose,
@@ -410,7 +411,7 @@ def bench_biased_grouped_sigmoid(
 
     def run_triton():
         # biased_grouped_topk sends aligned rows to the HIP kernel except at E=900.
-        _gfx1250_exact_sigmoid_topk(
+        exact_sigmoid_biased_topk(
             gating_output,
             correction_bias,
             triton_weights,
@@ -1067,7 +1068,7 @@ def main():
 
     # -- gfx1250 caller-owned biased sigmoid: Triton versus HIP -------------
     # The Triton kernel keeps the wave32 tie order, which wave64 HIP does not.
-    if "biased-sigmoid" in sections and not get_gfx_runtime().startswith("gfx1250"):
+    if "biased-sigmoid" in sections and get_gfx_runtime() != "gfx1250":
         aiter.logger.warning("biased-sigmoid needs gfx1250; skipping")
     elif "biased-sigmoid" in sections:
         biased_configs = list(
