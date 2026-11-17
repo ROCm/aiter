@@ -13,6 +13,7 @@ from __future__ import annotations
 import gc
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from inspect import signature
 from typing import Any, ClassVar
@@ -833,3 +834,185 @@ def test_the_routed_form_runs_inside_a_compiled_region():
             f"from eager {tuple(b.shape)}/{b.dtype} -- the fake is wrong"
         )
         assert torch.equal(a, b), f"output {i}: compiled value differs from eager"
+
+
+# ---------------------------------------------------------------------------
+# Measured selection, end to end: real kernels, measured here, no fixed numbers
+#
+# The unit tests for selection build candidates by hand. This one runs two real
+# implementations of one contract, times them on the machine the test is on,
+# reports those times, and checks that routing followed them. What it asserts
+# is the relationship -- the faster one serves, the one that reported losing
+# does not -- never a duration, because a duration is a property of the runner.
+# ---------------------------------------------------------------------------
+
+
+def _torch_rmsnorm(input, weight, epsilon, use_model_sensitive_rmsnorm=0):
+    scale = torch.rsqrt(input.float().pow(2).mean(-1, keepdim=True) + epsilon)
+    return (input.float() * scale * weight.float()).to(input.dtype)
+
+
+def _native_rmsnorm(input, weight, epsilon, use_model_sensitive_rmsnorm=0):
+    """AITER's kernel through the binding, NOT through the routed public name.
+
+    A provider's ``run`` must not call the spelling that routes to it: dispatch
+    would reach the provider again and recurse until the stack ends. Reaching
+    past the routed layer is what a real provider does anyway -- it has its own
+    kernel -- but a provider built by wrapping AITER, which is what a port
+    starts as, lands on this immediately.
+    """
+
+    from aiter.ops.rmsnorm import rms_norm_cu
+
+    out = torch.empty_like(input)
+    rms_norm_cu(out, input, weight, epsilon)
+    return out
+
+
+def _time_us(fn, rounds: int = 20) -> float:
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(rounds):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - start) / rounds * 1e6
+
+
+def _reporting(name, run, latency_us, baseline_us, baseline_path):
+    return plugin.KernelCandidate(
+        provider=name,
+        kernel_id=f"{name}-kernel",
+        artifact_digest="sha256:measured-in-test",
+        run=run,
+        latency_us=latency_us,
+        baseline_us=baseline_us,
+        baseline_path=baseline_path,
+        measured_under={"mode": "eager", "rounds": 20},
+        measurement_ref="tests/test_plugin_routed_ops.py",
+    )
+
+
+@requires_cuda
+def test_measured_selection_follows_real_timings(monkeypatch):
+    """Two real kernels, timed here, and the reports decide which one runs."""
+
+    big = torch.randn(2048, 4096, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(4096, device="cuda", dtype=torch.bfloat16)
+    native_us = _time_us(lambda: _native_rmsnorm(big, weight, 1e-6))
+    torch_us = _time_us(lambda: _torch_rmsnorm(big, weight, 1e-6))
+    assert native_us < torch_us, (
+        f"this test needs AITER's kernel to be the faster of the two on this "
+        f"machine; measured {native_us:.1f}us against {torch_us:.1f}us"
+    )
+
+    # "loser" reports the slow implementation against AITER's own: it measured
+    # itself and lost. "winner" reports AITER's kernel against the slow one.
+    loser = _Provider(
+        "loser",
+        _reporting("loser", _torch_rmsnorm, torch_us, native_us, "aiter native"),
+    )
+    loser.op_versions = {"rmsnorm": {2}}
+    winner = _Provider(
+        "winner",
+        _reporting("winner", _native_rmsnorm, native_us, torch_us, "torch rmsnorm"),
+    )
+    winner.op_versions = {"rmsnorm": {2}}
+
+    plugin.configure(enable=("loser", "winner"), source="test")
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("l", loser), _EntryPoint("w", winner)),
+    )
+
+    small = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    small_w = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+    explained = plugin.explain("rmsnorm", small, small_w, 1e-6, 0)
+    # Both were asked by the dry run; the real call asks them again, because
+    # explain() must not leave state behind that dispatch then relies on.
+    assert loser.select_calls == 1 and winner.select_calls == 1
+    result = aiter.rms_norm(small, small_w, 1e-6)
+    decision = plugin.last_decision()
+
+    # Second in the enable list, and selected anyway: the report outranked the
+    # order, which is the whole change.
+    assert decision.provider == "winner"
+    assert decision.reason == plugin.PROVIDER_FASTER
+    # Both were asked again for the real call: comparing needs every offer, so
+    # there is no asking the first and stopping.
+    assert loser.select_calls == 2 and winner.select_calls == 2
+    assert explained.decision.provider == decision.provider
+    assert explained.decision.reason == decision.reason
+    assert torch.allclose(result, _torch_rmsnorm(small, small_w, 1e-6), atol=2e-2)
+
+
+@requires_cuda
+def test_a_reporting_provider_that_lost_leaves_the_call_native(monkeypatch):
+    """Alone and reporting a loss: AITER serves, rather than the slower kernel."""
+
+    big = torch.randn(2048, 4096, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(4096, device="cuda", dtype=torch.bfloat16)
+    native_us = _time_us(lambda: _native_rmsnorm(big, weight, 1e-6))
+    torch_us = _time_us(lambda: _torch_rmsnorm(big, weight, 1e-6))
+
+    loser = _Provider(
+        "loser",
+        _reporting("loser", _torch_rmsnorm, torch_us, native_us, "aiter native"),
+    )
+    loser.op_versions = {"rmsnorm": {2}}
+    plugin.configure(enable=("loser",), source="test")
+    monkeypatch.setattr(plugin, "_entry_points", lambda: (_EntryPoint("l", loser),))
+
+    small = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    small_w = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+    aiter.rms_norm(small, small_w, 1e-6)
+
+    assert plugin.last_decision().route == "native"
+
+
+@requires_cuda
+def test_a_comparison_made_at_capture_is_the_one_every_replay_runs(monkeypatch):
+    """Replay executes no Python, so the comparison is made once, at capture.
+
+    `_choose` documents this; without a test it is a belief. The failure it
+    guards against is quiet by construction: a provider that retunes, or that
+    would report differently on later calls, cannot change a captured route,
+    and nothing in the replay says which call decided it.
+    """
+
+    slower = _Provider(
+        "slower", _reporting("slower", _torch_rmsnorm, 9.0, 10.0, "aiter native")
+    )
+    slower.op_versions = {"rmsnorm": {2}}
+    faster = _Provider(
+        "faster", _reporting("faster", _native_rmsnorm, 4.0, 10.0, "aiter native")
+    )
+    faster.op_versions = {"rmsnorm": {2}}
+
+    plugin.configure(enable=("slower", "faster"), source="test")
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("s", slower), _EntryPoint("f", faster)),
+    )
+
+    x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+    graph, captured = _capture(lambda: aiter.rms_norm(x, weight, 1e-6))
+
+    decision = plugin.last_decision()
+    assert decision.provider == "faster"
+    assert decision.reason == plugin.PROVIDER_FASTER
+    asked_at_capture = (slower.select_calls, faster.select_calls)
+
+    # The reports reverse: were the comparison live, "slower" would now win.
+    slower.selected = _reporting("slower", _torch_rmsnorm, 1.0, 10.0, "aiter native")
+    graph.replay()
+    torch.cuda.synchronize()
+
+    # Nobody was asked again, and the route did not move.
+    assert (slower.select_calls, faster.select_calls) == asked_at_capture
+    assert plugin.last_decision().provider == "faster"
+    assert torch.allclose(captured, _native_rmsnorm(x, weight, 1e-6), atol=2e-2)
