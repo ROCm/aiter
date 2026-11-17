@@ -144,6 +144,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     persistent_n_tiles: int = 1,
     fused_splitk: bool = True,
     scale_block: int = BLOCK_K,
+    a_scale_preload: bool | None = None,
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 / mxfp8_32 bpreshuffle GEMM.
 
@@ -152,8 +153,13 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
 
     ``scale_block=128``: x_scale ``(M, K//128)`` fp8_e8m0; when
     ``x_scale_transposed=True`` the backing storage is interpreted as
-    ``(K//128, M)`` without copying. w_scale ``(N//128, K//128)`` fp8_e8m0
-    dense row-major.
+    ``(K//128, M)`` without copying; ``x_scale_transposed=False`` takes a
+    row-major ``(M, K//128)`` x_scale (any row stride, unit column stride).
+    The compute-bound kernels read M-contiguous scales only, so they get a
+    column-major copy. ``a_scale_preload`` (row-major only, default: when it
+    fits) stages the whole-K A/B scale panels once per workgroup.
+
+    w_scale ``(N//128, K//128)`` fp8_e8m0 dense row-major.
 
     ``scale_block=32``: x_scale ``(M, K//32)`` row-major by default, or
     ``(ceil(M/32)*32, K//32)`` in 32x4 shuffled storage when
@@ -311,17 +317,36 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
                 "[FlyDSL gfx1250 mxfp8_32] x_scale/w_scale must be contiguous"
             )
         stride_ascale_k = k_blocks  # unused by the mx32 kernels
+        a_scale_m_major = False
     else:
-        if not x_scale_transposed:
-            raise RuntimeError(
-                "[FlyDSL gfx1250 mxfp8] x_scale_transposed=False is not "
-                "supported by the dedicated mxfp8_128 kernel (A-scale must be "
-                "M-contiguous)"
-            )
         k_blocks = K // BLOCK_K
         a_scale = _require_e8m0_scale(x_scale, (M, k_blocks), "x_scale")
         b_scale = _require_e8m0_scale(w_scale, (N // _BLOCK_N, k_blocks), "w_scale")
-        stride_ascale_k = a_scale.stride(1) if a_scale.stride(0) == 1 else M
+        a_scale_m_major = not x_scale_transposed
+        if a_scale_m_major and compute_bound:
+            a_scale = a_scale.t().contiguous().t()
+            a_scale_m_major = False
+        if a_scale_m_major:
+            if a_scale.stride(1) != 1:
+                raise RuntimeError(
+                    "[FlyDSL gfx1250 mxfp8] a row-major x_scale needs a unit "
+                    f"column stride, got strides={tuple(a_scale.stride())}"
+                )
+            stride_ascale_k = a_scale.stride(0)
+            if a_scale_preload is None:
+                a_scale_preload = _m_major_a_scale_preload_fits(
+                    tile_m,
+                    tile_n,
+                    tile_k,
+                    int(num_buffers),
+                    split_k,
+                    cluster_m,
+                    cluster_n,
+                    K,
+                )
+            preload_ks = k_blocks if a_scale_preload else 0
+        else:
+            stride_ascale_k = a_scale.stride(1) if a_scale.stride(0) == 1 else M
 
     lda = XQ.stride(0)
     ldc = Out.stride(0)
@@ -400,13 +425,16 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             specialization_key=specialization,
         )
     else:
+        if not a_scale_m_major:
+            preload_ks = 0
         specialization = constexpr_args + (
             scale_block,
             split_k,
             False,  # batched
-            0,  # preload_ks
+            preload_ks,
             a_preshuffle,
             a_scale_preshuffled,
+            a_scale_m_major,
         )
         _run_compiled(
             _launch_gemm_a8w8,
@@ -414,10 +442,13 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             scale_block,
             split_k,
             False,  # batched
-            0,  # preload_ks
+            preload_ks,
             1,  # batch (runtime)
             a_preshuffle,
             a_scale_preshuffled,
+            False,  # b_scale_32x32
+            False,  # k_tail
+            a_scale_m_major,
             specialization_key=specialization,
         )
     if partials is not None and not fused:
@@ -546,6 +577,66 @@ def is_compute_wmma_kernel_name(name: str) -> bool:
     )
 
 
+def _m_major_a_scale_preload_fits(
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    num_buffers: int,
+    split_k: int,
+    cluster_m: int,
+    cluster_n: int,
+    K: int,
+) -> bool:
+    """Whether a 2D (non compute-bound) mxfp8_128 config stages the whole-K
+    M-major A / B scale panels once per workgroup."""
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
+        _LDS_BYTES,
+        _PRELOAD_MIN_TILE_M,
+        preload_lds_bytes,
+    )
+
+    return (
+        split_k == 1
+        and cluster_m == 1
+        and cluster_n == 1
+        and tile_m >= _PRELOAD_MIN_TILE_M
+        and preload_lds_bytes(
+            {
+                "tile_m": tile_m,
+                "tile_n": tile_n,
+                "tile_k": tile_k,
+                "num_buffers": num_buffers,
+            },
+            K,
+        )
+        <= _LDS_BYTES
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def mxfp8_128_reads_row_major_x_scale_fast(kernel_name: str, M: int, K: int) -> bool:
+    """Whether ``kernel_name`` at (M, K) reads a row-major ``(M, K//128)``
+    x_scale natively with the whole-K scale panels preloaded -- the only case
+    measured not slower than the column-major default. Compute-bound kernels
+    take a transposed copy, and the 2D kernels without the preload re-read the
+    56-byte scale rows per K step, so both prefer column-major."""
+    if is_compute_wmma_kernel_name(kernel_name):
+        return False
+    cfg = dict(_resolved_wmma_config(kernel_name, M, True, False))
+    if cfg["a_preshuffle"]:
+        return False
+    return _m_major_a_scale_preload_fits(
+        cfg["tile_m"],
+        cfg["tile_n"],
+        cfg["tile_k"],
+        int(cfg["num_buffers"]),
+        cfg["split_k"],
+        cfg["cluster_m"],
+        cfg["cluster_n"],
+        K,
+    )
+
+
 @functools.lru_cache(maxsize=1024)
 def _resolved_wmma_config(
     kernel_name: str, true_m: int, allow_cluster_m_fallback: bool, mx32: bool
@@ -581,8 +672,13 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
     kernel_name: str,
     a_is_preshuffled: bool = False,
     allow_cluster_m_fallback: bool = True,
+    x_scale_transposed: bool = True,
+    a_scale_preload: bool | None = None,
 ) -> Tensor:
-    """Decode a tuned kernelName and dispatch its internal implementation."""
+    """Decode a tuned kernelName and dispatch its internal implementation.
+
+    x_scale bytes are column-major ``(K//128, M)`` by default; with
+    ``x_scale_transposed=False`` x_scale is a row-major ``(M, K//128)``."""
     # Out always carries true M; a preshuffled XQ may include one pad row.
     cfg = dict(
         _resolved_wmma_config(
@@ -614,10 +710,11 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         cluster_n=cfg["cluster_n"],
         m_warp=cfg["m_warp"],
         n_warp=cfg["n_warp"],
-        x_scale_transposed=True,
+        x_scale_transposed=x_scale_transposed,
         a_preshuffle=cfg["a_preshuffle"],
         fused_splitk=cfg["fused_splitk"],
         persistent_n_tiles=cfg["persistent_n_tiles"],
+        a_scale_preload=a_scale_preload,
     )
 
 
