@@ -65,6 +65,13 @@ def chunk_cuts(
     return out
 
 
+def splits_a_group(end, cuts):
+    """Whether one of a row's chunk cuts falls inside one of its slot groups, so a CTA may store
+    a chunk's share of that group (a row of ``end`` keys)."""
+    tiles = _ceil(end, LANE_MAX_KEYS) * LANE_MAX_TILES
+    return any(0 < c < tiles and c % LANE_MAX_TILES for c in cuts)
+
+
 def slot_maxima(row, cuts):
     """A row's logits [end] and its chunk cuts -> (full [slots], parts {slot group: [n, 64]}):
     each slot's max over its keys, and for a slot group a cut falls inside, the max over each
