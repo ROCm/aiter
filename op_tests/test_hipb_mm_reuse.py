@@ -7,35 +7,26 @@ but the bias pointer. A call served that way must give what a freshly built
 descriptor gives, bit for bit wherever the kernel itself is reproducible; every
 result is also held to a float32 reference. The kept descriptors are per
 thread.
-
-Run:
-    python op_tests/test_hipb_mm_reuse.py
-    pytest op_tests/test_hipb_mm_reuse.py -q
 """
 
-import sys
+import argparse
+import itertools
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-import pytest
+import pandas as pd
 import torch
 
+import aiter
 from aiter import dtypes, hipb_create_extension, hipb_destroy_extension, hipb_mm
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.gradlib import getHipblasltKernelName, hipb_findallsols
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="needs a GPU with hipBLASLt"
-)
-
-BF16, FP16 = dtypes.bf16, dtypes.fp16
+BF16, FP16, FP32 = dtypes.bf16, dtypes.fp16, dtypes.fp32
+SUPPORTED_GFX = ["gfx942", "gfx950"]
 # Against the float32 reference: bf16 output keeps 8 significant bits.
 ATOL = RTOL = 1e-2
-
-
-@pytest.fixture(scope="module", autouse=True)
-def extension():
-    hipb_create_extension()
-    yield
 
 
 def _fresh_extension():
@@ -62,8 +53,7 @@ def _solution(x, wt, bias=None, otype=None, also=()):
     ``also``, agree between two freshly built descriptors, so that reuse can be
     checked bit for bit; else the first solution."""
     sols = hipb_findallsols(x, wt, bias=bias, out_dtype=otype)
-    if not sols:
-        pytest.skip("no hipBLASLt solution for this problem")
+    assert sols, f"no hipBLASLt solution for {tuple(x.shape)} x {tuple(wt.shape)}"
     inputs = (x, *also)
     for sol in sols[:8]:
         first = [hipb_mm(a, wt, sol, bias=bias, out_dtype=otype) for a in inputs]
@@ -78,7 +68,7 @@ def _solution(x, wt, bias=None, otype=None, also=()):
 def _kernel(sol):
     try:
         return getHipblasltKernelName(sol)
-    except RuntimeError:  # only names the kernel in a failure message
+    except RuntimeError:  # only names the kernel in a report
         return "?"
 
 
@@ -91,6 +81,13 @@ def _differences(a, b):
     )
 
 
+def _assert_close(out, ref, what):
+    err = checkAllclose(
+        ref.float(), out.float(), rtol=RTOL, atol=ATOL, msg=what, printLog=False
+    )
+    assert err == 0, f"{what}: {err:.2%} of elements off the float32 reference"
+
+
 def _check_reuse(kept, call, ref, sol):
     """``kept`` are results of ``call`` served by kept descriptors.
 
@@ -100,7 +97,10 @@ def _check_reuse(kept, call, ref, sol):
     configuration's layouts) changes them. If they do not agree, the kernel
     itself varies run to run (for instance it splits K with atomics), and kept
     results are held to the float32 reference ``ref`` instead, which those bugs
-    still fail. Fresh results are always held to ``ref``."""
+    still fail. Fresh results are always held to ``ref``.
+
+    Returns whether the bits were compared, and how many fresh results it took.
+    """
     fresh = []
 
     def reproducible(samples):
@@ -110,70 +110,64 @@ def _check_reuse(kept, call, ref, sol):
         torch.cuda.synchronize()
         return all(torch.equal(fresh[0], f) for f in fresh[1:])
 
-    def where():
-        return f"solution {sol} ({_kernel(sol)})"
-
+    where = f"solution {sol} ({_kernel(sol)})"
     exact = reproducible(2)
     if exact and not all(torch.equal(k, fresh[0]) for k in kept):
         # Two agreeing samples do not make a kernel reproducible.
         exact = reproducible(4)
     for f in fresh:
-        torch.testing.assert_close(
-            f, ref, atol=ATOL, rtol=RTOL, msg=lambda m: f"fresh, {where()}: {m}"
-        )
+        _assert_close(f, ref, f"fresh, {where}")
     for i, k in enumerate(kept):
         if exact:
             assert torch.equal(k, fresh[0]), (
-                f"kept result {i} vs {len(fresh)} identical fresh ones, {where()}: "
+                f"kept result {i} vs {len(fresh)} identical fresh ones, {where}: "
                 + _differences(k, fresh[0])
             )
         else:
-            torch.testing.assert_close(
-                k,
-                ref,
-                atol=ATOL,
-                rtol=RTOL,
-                msg=lambda m, i=i: f"kept result {i}, fresh ones vary, {where()}: {m}",
-            )
+            _assert_close(k, ref, f"kept result {i}, fresh ones vary, {where}")
+    return exact, len(fresh)
 
 
-CASES = [
-    # m, n, k, dtype, otype, bias
-    (1056, 324, 10240, BF16, BF16, False),
-    (2112, 513, 2560, BF16, BF16, False),
-    (256, 512, 1024, BF16, BF16, True),
-    (96, 384, 768, FP16, FP16, True),
-    (128, 256, 512, BF16, dtypes.fp32, False),
-]
+def _row(case, sol, exact, samples):
+    return {"case": case, "solution": sol, "bitwise": exact, "fresh results": samples}
 
 
-@pytest.mark.parametrize("case", CASES, ids=str)
-def test_kept_descriptors_match_fresh_ones(case):
-    m, n, k, dtype, otype, has_bias = case
+@benchmark()
+def test_kept_descriptors(m, n, k, dtype, otype, bias):
+    """Calls served by kept descriptors against freshly built ones; with a bias,
+    also the same configuration with another bias, where only the pointer may
+    change."""
     x, w = _rand(m, k, dtype=dtype), _rand(n, k, dtype=dtype, scale=k**-0.5)
-    b1 = _rand(n, dtype=dtype) if has_bias else None
+    b1 = _rand(n, dtype=dtype) if bias else None
     sol = _solution(x, w.t(), b1, otype)
     # The second call, at least, reuses the descriptors.
     kept = [hipb_mm(x, w.t(), sol, bias=b1, out_dtype=otype) for _ in range(2)]
-    if has_bias:
-        # Same configuration, another bias: only the pointer may change.
+    ret = {"gfx": get_gfx_runtime(), "solution": sol}
+    if bias:
         b2 = _rand(n, dtype=dtype)
         other = hipb_mm(x, w.t(), sol, bias=b2, out_dtype=otype)
-        _check_reuse(
+        ret["new bias bitwise"], _ = _check_reuse(
             [other],
             lambda: hipb_mm(x, w.t(), sol, bias=b2, out_dtype=otype),
             _reference(x, w, b2, otype),
             sol,
         )
-    _check_reuse(
-        kept,
-        lambda: hipb_mm(x, w.t(), sol, bias=b1, out_dtype=otype),
-        _reference(x, w, b1, otype),
-        sol,
+    ref = _reference(x, w, b1, otype)
+    ret["bitwise"], ret["fresh results"] = _check_reuse(
+        kept, lambda: hipb_mm(x, w.t(), sol, bias=b1, out_dtype=otype), ref, sol
     )
+    out, us = run_perftest(lambda: hipb_mm(x, w.t(), sol, bias=b1, out_dtype=otype))
+    err = checkAllclose(ref.float(), out.float(), rtol=RTOL, atol=ATOL, msg="kept: ")
+    assert err == 0, f"kept: {err:.2%} of elements off the float32 reference"
+    ret["us"] = us
+    ret["TFLOPS"] = 2 * m * n * k / us / 1e6
+    nbytes = (m * k + n * k) * x.element_size() + m * n * out.element_size()
+    ret["TB/s"] = nbytes / us / 1e6
+    ret["err"] = err
+    return ret
 
 
-def test_configurations_do_not_mix():
+def check_configurations_do_not_mix():
     """Interleaved shapes, leading dimensions and bias on/off each keep their
     own descriptors."""
     k = 512
@@ -185,17 +179,20 @@ def test_configurations_do_not_mix():
     sol = _solution(x, w.t(), also=[x_strided, x[:128]])
     sol_b = _solution(x, w.t(), b)
     calls = [
-        (lambda: hipb_mm(x, w.t(), sol), _reference(x, w), sol),
-        (lambda: hipb_mm(x_strided, w.t(), sol), _reference(x, w), sol),
-        (lambda: hipb_mm(x[:128], w.t(), sol), _reference(x[:128], w), sol),
-        (lambda: hipb_mm(x, w.t(), sol_b, bias=b), _reference(x, w, b), sol_b),
+        ("lda k", lambda: hipb_mm(x, w.t(), sol), _reference(x, w), sol),
+        ("lda 2k", lambda: hipb_mm(x_strided, w.t(), sol), _reference(x, w), sol),
+        ("m 128", lambda: hipb_mm(x[:128], w.t(), sol), _reference(x[:128], w), sol),
+        ("bias", lambda: hipb_mm(x, w.t(), sol_b, bias=b), _reference(x, w, b), sol_b),
     ]
-    kept = [[call() for call, _, _ in calls] for _ in range(2)]
-    for i, (call, ref, s) in enumerate(calls):
-        _check_reuse([kept[0][i], kept[1][i]], call, ref, s)
+    kept = [[call() for _, call, _, _ in calls] for _ in range(2)]
+    rows = []
+    for i, (case, call, ref, s) in enumerate(calls):
+        exact, samples = _check_reuse([kept[0][i], kept[1][i]], call, ref, s)
+        rows.append(_row(f"interleaved, {case}", s, exact, samples))
+    return rows
 
 
-def test_many_configurations():
+def check_many_configurations():
     """More configurations than are kept (one per leading dimension here): the
     set is dropped and rebuilt. Calls before and after the drop, on kept or
     rebuilt descriptors, compute what a fresh descriptor does."""
@@ -212,17 +209,18 @@ def test_many_configurations():
     # Past the drop, the last views still have their descriptors; the first
     # ones are built again.
     again = [hipb_mm(views[i], w.t(), sol) for i in checked]
+    rows = []
     for i, other in zip(checked, again):
         x = views[i]
-        _check_reuse(
-            [kept[i], other],
-            lambda x=x: hipb_mm(x, w.t(), sol),
-            _reference(x, w),
-            sol,
+        exact, samples = _check_reuse(
+            [kept[i], other], lambda x=x: hipb_mm(x, w.t(), sol), _reference(x, w), sol
         )
+        rows.append(_row(f"{count} configurations, number {i}", sol, exact, samples))
+    return rows
 
 
-def test_graph_replay_after_reuse():
+def check_graph_replay():
+    """A call captured on kept descriptors replays what a fresh build gives."""
     m, n, k = 1056, 324, 10240
     x, w = _rand(m, k), _rand(n, k, scale=k**-0.5)
     sol = _solution(x, w.t())
@@ -238,7 +236,10 @@ def test_graph_replay_after_reuse():
     graph.replay()
     torch.cuda.synchronize()
     graph.reset()
-    _check_reuse([out], lambda: hipb_mm(x, w.t(), sol), _reference(x, w), sol)
+    exact, samples = _check_reuse(
+        [out], lambda: hipb_mm(x, w.t(), sol), _reference(x, w), sol
+    )
+    return [_row("CUDA graph replay", sol, exact, samples)]
 
 
 def _thread_calls():
@@ -280,16 +281,19 @@ def _run(table, keys):
     return [(key, table[key][0]()) for key in keys]
 
 
-def _check_results(table, results):
+def _check_results(case, table, results):
     """``results``: (key, output) pairs, each served by kept descriptors."""
     kept = {}
     for key, out in results:
         kept.setdefault(key, []).append(out)
+    rows = []
     for key, outs in kept.items():
-        _check_reuse(outs, *table[key])
+        exact, samples = _check_reuse(outs, *table[key])
+        rows.append(_row(f"{case}, {key}", table[key][2], exact, samples))
+    return rows
 
 
-def test_threads_keep_their_own_descriptors():
+def check_threads():
     """Each thread builds and reuses its own descriptors; results match fresh
     ones. The binding holds the GIL, so Python threads take turns rather than
     calling hipb_mm at the same instant."""
@@ -305,10 +309,10 @@ def test_threads_keep_their_own_descriptors():
 
     with ThreadPoolExecutor(threads) as pool:
         results = list(pool.map(work, range(threads)))
-    _check_results(table, (r for rounds in results for r in rounds))
+    return _check_results("4 threads", table, (r for rounds in results for r in rounds))
 
 
-def test_destroy_drops_other_threads_descriptors():
+def check_destroy_drops_other_threads():
     """A thread that outlives an extension destroy/create rebuilds its
     descriptors for the new extension."""
     table, keys = _thread_calls()
@@ -322,10 +326,10 @@ def test_destroy_drops_other_threads_descriptors():
         before = worker.submit(run).result()
         _fresh_extension()
         after = worker.submit(run).result()
-    _check_results(table, before + after)
+    return _check_results("thread across a destroy", table, before + after)
 
 
-def test_short_lived_threads():
+def check_short_lived_threads():
     """Descriptors of a thread are released when it exits."""
     table, keys = _thread_calls()
     out = []
@@ -335,13 +339,62 @@ def test_short_lived_threads():
         t.join()
     torch.cuda.synchronize()
     assert len(out) == 16
-    _check_results(table, (r for outs in out for r in outs))
+    return _check_results(
+        "16 short-lived threads", table, (r for outs in out for r in outs)
+    )
+
+
+def summarize(name, rows):
+    df = pd.DataFrame(rows)
+    aiter.logger.info("%s (markdown):\n%s", name, df.to_markdown(index=False))
 
 
 def main():
-    status = pytest.main([__file__, "-q", "-p", "no:cacheprovider"])
-    return 0 if status == pytest.ExitCode.OK else 1
+    gfx = get_gfx_runtime()
+    if gfx not in SUPPORTED_GFX:
+        aiter.logger.warning("hipb_mm descriptor reuse: %s not covered", gfx)
+        return
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="hipb_mm kept descriptors against freshly built ones",
+    )
+    parser.add_argument(
+        "-s",
+        "--mnk",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=None,
+        help="M,N,K shapes, each run in bf16 with and without bias. "
+        "e.g.: -s 1056,324,10240",
+    )
+    args = parser.parse_args()
+    cases = [
+        # m, n, k, dtype, otype, bias
+        (1056, 324, 10240, BF16, BF16, False),
+        (2112, 513, 2560, BF16, BF16, False),
+        (256, 512, 1024, BF16, BF16, True),
+        (96, 384, 768, FP16, FP16, True),
+        (128, 256, 512, BF16, FP32, False),
+    ]
+    if args.mnk:
+        cases = [
+            (*mnk, BF16, BF16, bias)
+            for mnk, bias in itertools.product(args.mnk, [False, True])
+        ]
+
+    hipb_create_extension()
+    summarize(
+        "hipb_mm kept descriptors vs fresh ones",
+        [test_kept_descriptors(*case) for case in cases],
+    )
+    rows = check_configurations_do_not_mix()
+    rows += check_many_configurations()
+    rows += check_graph_replay()
+    rows += check_threads()
+    rows += check_destroy_drops_other_threads()
+    rows += check_short_lived_threads()
+    summarize("hipb_mm descriptor reuse checks", rows)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

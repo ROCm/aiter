@@ -1,466 +1,383 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""The eager fast path of `tgemm.mm` / `gemm_a16w16` / `gemm_a16w16_out`.
+"""Eager fast path of `tgemm.mm`, `gemm_a16w16` and `gemm_a16w16_out`.
 
-An unscaled GEMM whose tuned config is hipBLASLt skips the custom ops outside
-torch.compile and calls the hipBLASLt entry directly. These tests hold it to
-the custom-op path bit for bit, check that it declines everything that path
-may treat differently, and that torch.compile and CUDA graphs see what they
-saw before.
+Outside torch.compile, an unscaled GEMM whose tuned config is hipBLASLt calls
+the hipBLASLt entry directly instead of the aiter::gemm_a16w16(_out) and
+aiter::_hipb_mm custom ops. It must give the custom ops' bits, and every call
+those ops may treat differently must still reach them. Which path ran is read
+from the profiler: each custom-op call is a dispatcher event, and the fast path
+records none.
 
-Run:
-    python op_tests/test_tuned_gemm_eager.py
-    pytest op_tests/test_tuned_gemm_eager.py -q
+Tensors are created with an explicit device: `torch.set_default_device` is a
+TorchFunctionMode, under which every call takes the custom ops.
 """
 
+import argparse
+import contextlib
+import gc
+import itertools
+import json
+import os
+import subprocess
 import sys
+import tempfile
+import time
+import weakref
 
 import pandas as pd
-import pytest
 import torch
 import torch.nn.functional as F
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+from torch.overrides import TorchFunctionMode
+from torch.profiler import ProfilerActivity, profile
+from torch.utils._python_dispatch import TorchDispatchMode
 
+import aiter
 import aiter.tuned_gemm as tuned
 from aiter import dtypes
-from aiter.jit.core import AITER_CONFIGS
-from aiter.ops.opus._arch import _device_arch_and_cu
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.tuned_gemm import tgemm
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="needs a GPU with hipBLASLt"
-)
-
 BF16, FP16, FP32 = dtypes.bf16, dtypes.fp16, dtypes.fp32
-# The real custom ops, taken before any test swaps the module attributes.
-OP = tuned._gemm_a16w16_op
-OP_OUT = tuned._gemm_a16w16_out_op
-
-
-def _gfx_cu():
-    return _device_arch_and_cu(torch.device("cuda", torch.cuda.current_device()))
-
-
-def _key(m, n, k, bias, dtype, otype, bpreshuffle=False):
-    gfx, cu = _gfx_cu()
-    return (gfx, cu, m, n, k, bias, str(dtype), str(otype), False, bpreshuffle)
-
-
-def _config(m, n, k, bias, dtype, otype, bpreshuffle=False):
-    gfx, cu = _gfx_cu()
-    return tuned.get_GEMM_A16W16_config(
-        M=m,
-        N=n,
-        K=k,
-        bias=bias,
-        dtype=str(dtype),
-        otype=str(otype),
-        scaleAB=False,
-        bpreshuffle=bpreshuffle,
-        gfx=gfx,
-        cu_num=cu,
-    )
-
-
-def _tuned_hipblaslt_rows(limit=6):
-    """Tuned hipBLASLt rows for this GPU from the BF16 CSV, unshuffled."""
-    gfx, cu = _gfx_cu()
-    df = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE)
-    df = df[
-        (df["gfx"] == gfx)
-        & (df["cu_num"] == cu)
-        & (df["libtype"] == "hipblaslt")
-        & df["dtype"].isin([str(BF16), str(FP16)])
-        & (~df["bpreshuffle"].astype(bool))
-        & (~df["scaleAB"].astype(bool))
-    ].drop_duplicates(["M", "N", "K", "bias", "dtype", "outdtype"])
-    rows = []
-    for r in df.head(limit).itertuples():
-        rows.append(
-            (
-                int(r.M),
-                int(r.N),
-                int(r.K),
-                bool(r.bias),
-                getattr(torch, r.dtype.removeprefix("torch.")),
-                getattr(torch, r.outdtype.removeprefix("torch.")),
-            )
-        )
-    return rows
+SUPPORTED_GFX = ["gfx942", "gfx950"]
+CUSTOM_OPS = ("aiter::gemm_a16w16", "aiter::gemm_a16w16_out")
+HIPBLASLT = {"libtype": "hipblaslt", "solidx": -1}
+OUT_KINDS = [None, "mm", "out_op"]
 
 
 def _rand(*shape, dtype=BF16, scale=1.0):
     return torch.randn(*shape, device="cuda").mul_(scale).to(dtype)
 
 
-def _equal_or_nondeterministic(fast, ref, ref_again):
-    """Bitwise equality, except where the solution itself is not deterministic
-    (split-K / Stream-K order): then the two op-path runs differ as well."""
-    if torch.equal(ref, ref_again):
-        assert torch.equal(fast, ref)
-    else:
-        torch.testing.assert_close(fast.float(), ref.float(), atol=1e-1, rtol=1e-2)
+def _key(m, n, k, bias, dtype, otype, bpreshuffle=False):
+    return (m, n, k, bias, str(dtype), str(otype), bpreshuffle)
 
 
-@pytest.fixture
-def fallbacks(monkeypatch):
-    """Calls that reached the custom ops, by op."""
-    calls = {"gemm_a16w16": 0, "gemm_a16w16_out": 0}
+@contextlib.contextmanager
+def _routed(rows):
+    """Serve the shapes of ``rows`` (`_key` -> config) from ``rows``.
 
-    def op(*args, **kwargs):
-        calls["gemm_a16w16"] += 1
-        return OP(*args, **kwargs)
+    Installed over `get_GEMM_A16W16_config`, which both paths call through the
+    module on every call; other shapes and scaled calls keep the tuned lookup.
+    """
+    real = tuned.get_GEMM_A16W16_config
 
-    def op_out(*args, **kwargs):
-        calls["gemm_a16w16_out"] += 1
-        return OP_OUT(*args, **kwargs)
+    def lookup(M, N, K, bias, dtype, otype, scaleAB=False, bpreshuffle=False, **kw):
+        row = rows.get((M, N, K, bias, dtype, otype, bpreshuffle))
+        if row is not None and not scaleAB:
+            return dict(row)
+        return real(
+            M=M,
+            N=N,
+            K=K,
+            bias=bias,
+            dtype=dtype,
+            otype=otype,
+            scaleAB=scaleAB,
+            bpreshuffle=bpreshuffle,
+            **kw,
+        )
 
-    monkeypatch.setattr(tuned, "_gemm_a16w16_op", op)
-    monkeypatch.setattr(tuned, "_gemm_a16w16_out_op", op_out)
-    return calls
+    tuned.get_GEMM_A16W16_config = lookup
+    try:
+        yield
+    finally:
+        tuned.get_GEMM_A16W16_config = real
 
 
-@pytest.fixture
-def table(monkeypatch):
-    """Install a tuned table of our own: ``table[key] = row``."""
-    rows = {}
-    monkeypatch.setattr(tuned, "get_GEMM_A16W16_config_", lambda: rows)
-    tuned.get_GEMM_A16W16_config.cache_clear()
-    yield rows
-    tuned.get_GEMM_A16W16_config.cache_clear()
+def _custom_op_calls(fn):
+    """``fn()``, and how many custom-op calls the dispatcher saw while it ran."""
+    with profile(activities=[ProfilerActivity.CPU]) as prof:
+        result = fn()
+    return result, sum(e.name in CUSTOM_OPS for e in prof.events())
 
 
-@pytest.fixture(scope="module", autouse=True)
-def hipblaslt_ready():
-    """The first hipBLASLt GEMM of a process creates the extension on the op
-    path; run one so every test starts with the fast path available."""
-    tuned.hipb_create_extension()
-    tuned.extensions_created = True
-    x, w = _rand(64, 256), _rand(128, 256)
-    OP(x, w)
+def _op(x, w, bias=None, otype=None, out=None):
+    """The custom-op path, called through the dispatcher."""
+    if out is None:
+        return torch.ops.aiter.gemm_a16w16(x, w, bias, otype, None, None, None)
+    torch.ops.aiter.gemm_a16w16_out(x, w, out, bias, otype, None, None, None)
+    return out
+
+
+def _reference(x, w, bias=None, otype=None):
+    """``x @ w.T + bias`` by torch in float32."""
+    out = x.float() @ w.float().t()
+    if bias is not None:
+        out += bias.float()
+    return out.to(otype or x.dtype)
+
+
+def _check_bits(y, op_call, ref, what):
+    """``y`` must be the custom op's bits wherever its kernel is reproducible.
+
+    The op is repeated: if its results vary, the kernel itself is not
+    reproducible for this input, and ``y`` is held to the float32 reference
+    ``ref`` only. Returns whether the bits were compared.
+    """
+    samples = [op_call().clone() for _ in range(2)]
+    if torch.equal(samples[0], samples[1]) and not torch.equal(y, samples[0]):
+        # Two agreeing samples do not make a kernel reproducible.
+        samples += [op_call().clone() for _ in range(4)]
+    exact = all(torch.equal(s, samples[0]) for s in samples[1:])
+    if exact:
+        differ = int((y != samples[0]).sum())
+        assert differ == 0, f"{what}: {differ} elements differ from the custom op"
+    err = checkAllclose(ref.float(), y.float(), msg=f"{what}: ")
+    assert err == 0, f"{what}: {err:.2%} of elements off the float32 reference"
+    return exact
+
+
+def _host_us(fn, iters=50):
+    """Host time of one call in us, over ``iters`` calls queued back to back."""
+    fn()
     torch.cuda.synchronize()
-
-
-def _check(fallbacks, x, w, bias, otype, out_kind, expect_fast):
-    """`tgemm.mm` against the custom op, for one call shape."""
-    shape = (*x.shape[:-1], w.shape[0])
-    ref = OP(x, w, bias, otype)
-    ref_again = OP(x, w, bias, otype)
-    before = dict(fallbacks)
-    if out_kind is None:
-        y = tgemm.mm(x, w, bias, otype=otype)
-    else:
-        out = torch.full(shape, float("nan"), dtype=otype or x.dtype, device="cuda")
-        if out_kind == "mm":
-            y = tgemm.mm(x, w, bias, otype=otype, out=out)
-        else:
-            assert tuned.gemm_a16w16_out(x, w, out, bias=bias, otype=otype) is None
-            y = out
-        assert y.data_ptr() == out.data_ptr()
+    start = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    elapsed = time.perf_counter() - start
     torch.cuda.synchronize()
-    took_op = sum(fallbacks.values()) - sum(before.values())
-    assert took_op == (0 if expect_fast else 1)
-    assert y.shape == shape and y.dtype == ref.dtype
-    _equal_or_nondeterministic(y, ref, ref_again)
+    return elapsed / iters * 1e6
 
 
-MODEL_SHAPES = [  # Qwen3.8-Flash-Next prefill BF16 GEMMs (TP2, SP shard)
-    (1056, 324, 10240),
-    (1056, 10240, 320),
-    (2112, 513, 2560),
-    (2112, 48, 2560),
-    (2112, 640, 2560),
-]
-
-
-@pytest.mark.parametrize("out_kind", [None, "mm", "out_op"])
-@pytest.mark.parametrize("mnk", MODEL_SHAPES)
-def test_model_shapes_match_custom_op(fallbacks, mnk, out_kind):
-    m, n, k = mnk
-    x, w = _rand(m, k), _rand(n, k, scale=k**-0.5)
-    hip = _config(m, n, k, False, BF16, BF16)["libtype"] == "hipblaslt"
-    _check(fallbacks, x, w, None, BF16, out_kind, expect_fast=hip)
-
-
-@pytest.mark.parametrize(
-    "row", _tuned_hipblaslt_rows() if torch.cuda.is_available() else [], ids=str
-)
-def test_tuned_rows_match_custom_op(fallbacks, row):
-    m, n, k, has_bias, dtype, otype = row
-    x, w = _rand(m, k, dtype=dtype), _rand(n, k, dtype=dtype, scale=k**-0.5)
-    bias = _rand(n, dtype=dtype) if has_bias else None
-    assert _config(m, n, k, has_bias, dtype, otype)["libtype"] == "hipblaslt"
-    _check(fallbacks, x, w, bias, otype, None, expect_fast=True)
-    _check(fallbacks, x, w, bias, otype, "mm", expect_fast=True)
-
-
-# hipBLASLt's own heuristic (solidx -1) through a tuned table of our own, so the
-# combinations below hit the fast path on any GPU.
-HEURISTIC_CASES = [
-    # m, n, k, bias, dtype, otype, input rank
-    (256, 512, 1024, False, BF16, BF16, 2),
-    (256, 512, 1024, True, BF16, BF16, 2),
-    (96, 384, 768, False, FP16, FP16, 2),
-    (96, 384, 768, True, FP16, FP16, 2),
-    (128, 256, 512, False, BF16, FP32, 2),
-    (2 * 64, 512, 1024, False, BF16, BF16, 3),
-    (2 * 64, 512, 1024, True, BF16, BF16, 3),
-]
-
-
-@pytest.mark.parametrize("out_kind", [None, "mm", "out_op"])
-@pytest.mark.parametrize("case", HEURISTIC_CASES, ids=str)
-def test_bias_otype_rank_match_custom_op(fallbacks, table, case, out_kind):
-    m, n, k, has_bias, dtype, otype, rank = case
-    table[_key(m, n, k, has_bias, dtype, otype)] = {
-        "libtype": "hipblaslt",
-        "solidx": -1,
-    }
+@benchmark()
+def test_eager(m, n, k, dtype, otype, bias, rank, out):
+    """The fast path against the custom op, for a shape routed to hipBLASLt."""
     x = _rand(m, k, dtype=dtype)
     if rank == 3:
         x = x.view(2, m // 2, k)
     w = _rand(n, k, dtype=dtype, scale=k**-0.5)
-    bias = _rand(n, dtype=dtype) if has_bias else None
-    _check(fallbacks, x, w, bias, otype, out_kind, expect_fast=True)
+    b = _rand(n, dtype=dtype) if bias else None
+    buf = None
+    if out is not None:
+        buf = torch.full(
+            (*x.shape[:-1], n), float("nan"), dtype=otype or dtype, device="cuda"
+        )
+
+    def eager():
+        if out is None:
+            return tgemm.mm(x, w, b, otype=otype)
+        if out == "mm":
+            return tgemm.mm(x, w, b, otype=otype, out=buf)
+        tuned.gemm_a16w16_out(x, w, buf, bias=b, otype=otype)
+        return buf
+
+    candidates = {"op": lambda: _op(x, w, b, otype, buf), "eager": eager}
+    ref = _reference(x, w, b, otype)
+    flops = 2 * m * n * k
+    nbytes = (m * k + n * k) * x.element_size() + m * n * ref.element_size()
+    ret = {"gfx": get_gfx_runtime()}
+    with _routed({_key(m, n, k, bias, dtype, otype or dtype): HIPBLASLT}):
+        y, calls = _custom_op_calls(eager)
+        assert calls == 0, f"{m}x{n}x{k}: the call reached the custom op"
+        assert y.shape == ref.shape and y.dtype == ref.dtype
+        assert buf is None or y.data_ptr() == buf.data_ptr()
+        ret["bitwise"] = _check_bits(y.clone(), candidates["op"], ref, "eager")
+        for name, fn in candidates.items():
+            result, us = run_perftest(fn)
+            err = checkAllclose(ref.float(), result.float(), msg=f"{name}: ")
+            assert err == 0, f"{name}: {err:.2%} of elements off the reference"
+            ret[f"{name} us"] = us
+            ret[f"{name} host us"] = _host_us(fn)
+            ret[f"{name} TFLOPS"] = flops / us / 1e6
+            ret[f"{name} TB/s"] = nbytes / us / 1e6
+            ret[f"{name} err"] = err
+    return ret
 
 
-def test_otype_defaults_to_input_dtype(fallbacks, table):
-    table[_key(64, 128, 256, False, BF16, BF16)] = {
-        "libtype": "hipblaslt",
-        "solidx": -1,
-    }
+def _row(case, calls, custom_op, bitwise=None):
+    """A row of the path table: the call reached the custom op iff ``custom_op``."""
+    path = "custom op" if calls else "fast path"
+    assert bool(calls) == custom_op, f"{case}: took the {path}"
+    return {"case": case, "path": path, "custom-op calls": calls, "bitwise": bitwise}
+
+
+def _fast_row(case, x, w):
+    """A row for a call that must take the fast path and give the op's bits."""
+    y, calls = _custom_op_calls(lambda: tgemm.mm(x, w))
+    exact = _check_bits(y, lambda: _op(x, w), _reference(x, w), case)
+    return _row(case, calls, False, exact)
+
+
+def check_first_calls():
+    """The first hipBLASLt GEMM of a process creates the extension on the
+    custom-op path; the calls after it take the fast path."""
     x, w = _rand(64, 256), _rand(128, 256)
-    y = tuned.gemm_a16w16(x, w)
-    assert fallbacks["gemm_a16w16"] == 0 and y.dtype == BF16
-    assert torch.equal(y, OP(x, w))
+    with _routed({_key(64, 128, 256, False, BF16, BF16): HIPBLASLT}):
+        calls = [_custom_op_calls(lambda: tgemm.mm(x, w))[1] for _ in range(3)]
+    return [_row(f"call {i} of the process", c, i == 1) for i, c in enumerate(calls, 1)]
 
 
-def test_preshuffled_weight_matches_custom_op(fallbacks):
-    from aiter.ops.shuffle import shuffle_weight
-
-    if _gfx_cu()[0] != "gfx942":
-        pytest.skip("BF16 preshuffled weights default to hipBLASLt on gfx942 only")
-    m, n, k = 128, 256, 512
-    x, w = _rand(m, k), shuffle_weight(_rand(n, k, scale=k**-0.5), layout=(16, 16))
-    assert (
-        _config(m, n, k, False, BF16, BF16, bpreshuffle=True)["libtype"] == "hipblaslt"
-    )
-    _check(fallbacks, x, w, None, BF16, None, expect_fast=True)
-
-
-def test_declines_configs_that_are_not_hipblaslt(fallbacks, table):
-    m, n, k = 64, 128, 256
-    table[_key(m, n, k, False, BF16, BF16)] = {"libtype": "torch", "solidx": 0}
-    x, w = _rand(m, k), _rand(n, k)
-    y = tgemm.mm(x, w)
-    assert fallbacks["gemm_a16w16"] == 1
-    torch.testing.assert_close(y, F.linear(x, w), atol=0, rtol=0)
-
-
-def test_replaced_config_function_is_called_every_call(fallbacks, monkeypatch):
-    """A wrapper installed over `get_GEMM_A16W16_config` (ATOM's SGLang plugin
-    does this, keyed on a flag it flips at run time) is asked on every call and
-    its answer is never cached."""
-    m, n, k = 1056, 324, 10240
-    if _config(m, n, k, False, BF16, BF16)["libtype"] != "hipblaslt":
-        pytest.skip("needs this shape tuned to hipBLASLt on this GPU")
-    original = tuned.get_GEMM_A16W16_config
-    state = {"bypass": False, "calls": 0}
-
-    def replacement(*args, **kwargs):
-        state["calls"] += 1
-        config = original(*args, **kwargs)
-        if state["bypass"] and config.get("libtype") == "hipblaslt":
-            return dict(config, libtype="torch", solidx=0)
-        return config
-
-    monkeypatch.setattr(tuned, "get_GEMM_A16W16_config", replacement)
-    x, w = _rand(m, k), _rand(n, k, scale=k**-0.5)
-    ref = OP(x, w)  # the op path, through the replacement
-    expect_ops = 0
-    for bypass in (False, True, False, True):
-        state["bypass"] = bypass
-        calls, ops = state["calls"], fallbacks["gemm_a16w16"]
-        y = tgemm.mm(x, w)
-        if bypass:
-            # asked by the fast path, then again by the op path it hands over to
-            assert state["calls"] - calls == 2 and fallbacks["gemm_a16w16"] == ops + 1
-            torch.testing.assert_close(y, F.linear(x, w), atol=0, rtol=0)
-            expect_ops += 1
-        else:
-            assert state["calls"] - calls == 1 and fallbacks["gemm_a16w16"] == ops
-            assert torch.equal(y, ref)
-    assert fallbacks["gemm_a16w16"] == expect_ops
-
-
-def test_scaled_calls_take_the_custom_op(monkeypatch):
-    seen = []
-    monkeypatch.setattr(tuned, "_hipblaslt_eager", lambda *a: seen.append(a))
-    monkeypatch.setattr(tuned, "_gemm_a16w16_op", lambda *a, **k: "op")
-    monkeypatch.setattr(tuned, "_gemm_a16w16_out_op", lambda *a, **k: None)
-    x, w, s = _rand(8, 16), _rand(8, 16), torch.ones(1, device="cuda")
-    assert tgemm.mm(x, w, scale_a=s, scale_b=s) == "op"
-    assert tgemm.mm(x, w, scale_c=s) == "op"
-    out = torch.empty(8, 8, dtype=BF16, device="cuda")
-    assert tgemm.mm(x, w, scale_a=s, out=out) is out
-    assert seen == []
-
-
-def test_declines_grad_tracked_inputs(fallbacks):
-    m, n, k = 1056, 324, 10240
-    if _config(m, n, k, False, BF16, BF16)["libtype"] != "hipblaslt":
-        pytest.skip("needs this shape tuned to hipBLASLt on this GPU")
-    x, w = _rand(m, k), _rand(n, k, scale=k**-0.5).requires_grad_(True)
-    y = tgemm.mm(x, w)  # grad mode on: autograd must see the op
-    assert fallbacks["gemm_a16w16"] == 1 and y.requires_grad
-    with torch.no_grad():
-        z = tgemm.mm(x, w)
-    assert fallbacks["gemm_a16w16"] == 1 and not z.requires_grad
-    assert torch.equal(y.detach(), z)
-
-
-def test_declines_under_fake_tensor_mode(fallbacks):
-    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
-
-    with FakeTensorMode():
-        x = torch.empty(1056, 10240, dtype=BF16, device="cuda")
-        w = torch.empty(324, 10240, dtype=BF16, device="cuda")
-        y = tgemm.mm(x, w)
-    assert isinstance(y, FakeTensor) and tuple(y.shape) == (1056, 324)
-    assert fallbacks["gemm_a16w16"] == 1
-    # A fake tensor outside its mode still has to reach the op's fake.
-    y2 = tgemm.mm(x, w)
-    assert isinstance(y2, FakeTensor) and fallbacks["gemm_a16w16"] == 2
-
-
-def test_dispatch_and_function_modes_see_the_op(fallbacks):
-    from torch.overrides import TorchFunctionMode
-    from torch.utils._python_dispatch import TorchDispatchMode
-
-    seen = []
-
-    class Record(TorchDispatchMode):
-        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-            seen.append(str(func))
-            return func(*args, **(kwargs or {}))
-
-    class Passthrough(TorchFunctionMode):
-        def __torch_function__(self, func, types, args=(), kwargs=None):
-            return func(*args, **(kwargs or {}))
-
-    x, w = _rand(1056, 10240), _rand(324, 10240, scale=0.01)
-    with Record():
-        tgemm.mm(x, w)
-    assert any("aiter.gemm_a16w16" in s for s in seen)
-    with Passthrough():
-        tgemm.mm(x, w)
-    assert fallbacks["gemm_a16w16"] == 2
-
-
-def test_tensor_subclasses():
-    class Plain(torch.nn.Parameter):
-        pass
-
-    from torch._subclasses.fake_tensor import FakeTensor
-
-    from aiter.jit.utils.eager_guard import plain_tensor_type
-
-    assert plain_tensor_type(torch.Tensor)
-    assert plain_tensor_type(torch.nn.Parameter)
-    assert plain_tensor_type(Plain)
-    assert not plain_tensor_type(FakeTensor)
-    assert not plain_tensor_type(int)
-
-
-def test_parameter_weights_take_the_fast_path(fallbacks):
-    m, n, k = 1056, 324, 10240
-    if _config(m, n, k, False, BF16, BF16)["libtype"] != "hipblaslt":
-        pytest.skip("needs this shape tuned to hipBLASLt on this GPU")
-    x = _rand(m, k)
-    w = torch.nn.Parameter(_rand(n, k, scale=k**-0.5), requires_grad=False)
-    y = tgemm.mm(x, w)
-    assert fallbacks["gemm_a16w16"] == 0 and torch.equal(y, OP(x, w))
-
-
-def test_unflattenable_input_takes_the_custom_op(fallbacks):
-    x = _rand(4, 64, 8192).transpose(0, 1)  # `view(-1, K)` refuses it
-    w = _rand(32, 8192, scale=8192**-0.5)
-    y = tgemm.mm(x, w)
-    assert fallbacks["gemm_a16w16"] == 1
-    torch.testing.assert_close(y, F.linear(x, w), atol=0, rtol=0)
-
-
-def test_shape_recording_keeps_the_custom_op(fallbacks, monkeypatch):
-    recorded = []
-    monkeypatch.setattr(tuned, "_record_gemm_shapes", lambda: True)
-    monkeypatch.setattr(tuned, "save_shapes", lambda *a: recorded.append(a))
-    monkeypatch.setattr(tuned, "_eager_hipb", None)  # resolve again
+def _record_shapes(csv):
+    """`check_shape_recording`'s child: three calls, shapes recorded to ``csv``."""
+    tuned.untune_path = csv
     x, w = _rand(64, 256), _rand(128, 256)
-    tgemm.mm(x, w)
-    tgemm.mm(x, w)
-    assert fallbacks["gemm_a16w16"] == 2 and len(recorded) == 2
-    assert tuned._eager_hipb is False
+    with _routed({_key(64, 128, 256, False, BF16, BF16): HIPBLASLT}):
+        calls = [_custom_op_calls(lambda: tgemm.mm(x, w))[1] for _ in range(3)]
+    print(json.dumps(calls))
 
 
-def test_weight_handles_follow_the_descriptor(fallbacks, table):
-    """The cached handle of a weight is keyed by its descriptor alone: a freed
-    weight whose memory a new one reuses, a view sharing the pointer with a
-    different shape, and a strided view all compute what the op path does."""
-    import gc
-    import weakref
-
-    m, n, k = 128, 256, 512
-    for nn, kk in ((n, k), (n // 2, k), (n, k // 2)):
-        table[_key(m, nn, kk, False, BF16, BF16)] = {
-            "libtype": "hipblaslt",
-            "solidx": -1,
-        }
-    x = _rand(m, k)
-    w1 = _rand(n, k, scale=k**-0.5)
-    assert torch.equal(tgemm.mm(x, w1), OP(x, w1))
-    ptr, alive = w1.data_ptr(), weakref.ref(w1)
-    del w1
-    gc.collect()
-    assert alive() is None  # the cache keeps no tensor alive
-    w2 = _rand(n, k, scale=k**-0.5)
-    if w2.data_ptr() == ptr:  # same descriptor as the freed weight
-        assert torch.equal(tgemm.mm(x, w2), OP(x, w2))
-    assert torch.equal(tgemm.mm(x, w2[: n // 2]), OP(x, w2[: n // 2]))
-    xs = x[:, : k // 2]
-    assert torch.equal(tgemm.mm(xs, w2[:, : k // 2]), OP(xs, w2[:, : k // 2]))
-    assert sum(fallbacks.values()) == 0
+def check_shape_recording():
+    """With AITER_TUNE_GEMM set at start, every call takes the custom op, which
+    records the shape for tuning."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    with tempfile.TemporaryDirectory() as tmp:
+        csv = os.path.join(tmp, "untuned.csv")
+        code = (
+            f"import sys; sys.path.insert(0, {here!r}); "
+            f"import test_tuned_gemm_eager as t; t._record_shapes({csv!r})"
+        )
+        child = subprocess.run(
+            [sys.executable, "-c", code],
+            env={**os.environ, "AITER_TUNE_GEMM": "1"},
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        assert child.returncode == 0, child.stderr[-4000:]
+        calls = json.loads(child.stdout.strip().splitlines()[-1])
+        shapes = pd.read_csv(csv)
+    assert ((shapes["M"] == 64) & (shapes["N"] == 128) & (shapes["K"] == 256)).any()
+    return [
+        _row(f"AITER_TUNE_GEMM=1, call {i}", c, True) for i, c in enumerate(calls, 1)
+    ]
 
 
-def test_weight_handles_are_bounded(monkeypatch, table):
-    monkeypatch.setattr(tuned, "_EAGER_WEIGHT_HANDLES_MAX", 4)
-    monkeypatch.setattr(tuned, "_eager_weight_handles", tuned.OrderedDict())
-    m, k = 64, 256
-    x = _rand(m, k)
-    keep = []
-    for n in range(16, 16 * 9, 16):
-        table[_key(m, n, k, False, BF16, BF16)] = {"libtype": "hipblaslt", "solidx": -1}
-        w = _rand(n, k)
-        keep.append(w)
-        assert torch.equal(tgemm.mm(x, w), OP(x, w))
-        assert len(tuned._eager_weight_handles) <= 4
-    assert torch.equal(tgemm.mm(x, keep[0]), OP(x, keep[0]))  # evicted, rebuilt
-
-
-def test_first_call_runs_the_custom_op(fallbacks, monkeypatch):
-    """Until the op path has created the hipBLASLt extension, it runs the call."""
-    monkeypatch.setattr(tuned, "extensions_created", False)
-    monkeypatch.setattr(tuned, "_eager_hipb", None)
-    m, n, k = 1056, 324, 10240
-    if _config(m, n, k, False, BF16, BF16)["libtype"] != "hipblaslt":
-        pytest.skip("needs this shape tuned to hipBLASLt on this GPU")
+def check_declines():
+    """Calls the custom op may treat differently reach it; the others do not."""
+    m, n, k = 1056, 324, 2560
     x, w = _rand(m, k), _rand(n, k, scale=k**-0.5)
-    first = tgemm.mm(x, w)
-    assert fallbacks["gemm_a16w16"] == 1 and tuned.extensions_created
-    second = tgemm.mm(x, w)
-    assert fallbacks["gemm_a16w16"] == 1 and torch.equal(first, second)
+    ref = _reference(x, w)
+    rows = []
+    with _routed({_key(m, n, k, False, BF16, BF16): HIPBLASLT}):
+        s = torch.ones(1, device="cuda")
+        _, calls = _custom_op_calls(lambda: tgemm.mm(x, w, scale_a=s, scale_b=s))
+        rows.append(_row("scale_a and scale_b", calls, True))
+
+        wg = w.clone().requires_grad_(True)
+        y, calls = _custom_op_calls(lambda: tgemm.mm(x, wg))
+        assert y.requires_grad
+        rows.append(_row("weight requires grad", calls, True))
+        with torch.no_grad():
+            y, calls = _custom_op_calls(lambda: tgemm.mm(x, wg))
+        exact = _check_bits(y, lambda: _op(x, w), ref, "no_grad")
+        rows.append(_row("weight requires grad, under no_grad", calls, False, exact))
+
+        wp = torch.nn.Parameter(w.clone(), requires_grad=False)
+        y, calls = _custom_op_calls(lambda: tgemm.mm(x, wp))
+        exact = _check_bits(y, lambda: _op(x, w), ref, "Parameter")
+        rows.append(_row("nn.Parameter weight", calls, False, exact))
+
+        seen = []
+
+        class Record(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                seen.append(str(func))
+                return func(*args, **(kwargs or {}))
+
+        class Passthrough(TorchFunctionMode):
+            def __torch_function__(self, func, types, args=(), kwargs=None):
+                return func(*args, **(kwargs or {}))
+
+        with Record():
+            tgemm.mm(x, w)
+        calls = sum(name.startswith("aiter.gemm_a16w16.") for name in seen)
+        rows.append(_row("TorchDispatchMode, ops it saw", calls, True))
+        with Passthrough():
+            _, calls = _custom_op_calls(lambda: tgemm.mm(x, w))
+        rows.append(_row("TorchFunctionMode", calls, True))
+        torch.set_default_device("cuda")
+        try:
+            _, calls = _custom_op_calls(lambda: tgemm.mm(x, w))
+        finally:
+            torch.set_default_device(None)
+        rows.append(_row("torch.set_default_device", calls, True))
+
+        with FakeTensorMode():
+            xf = torch.empty(m, k, dtype=BF16, device="cuda")
+            wf = torch.empty(n, k, dtype=BF16, device="cuda")
+            y, calls = _custom_op_calls(lambda: tgemm.mm(xf, wf))
+        assert isinstance(y, FakeTensor) and tuple(y.shape) == (m, n)
+        rows.append(_row("FakeTensorMode", calls, True))
+        # Fake tensors outside their mode still have to reach the op's fake.
+        y, calls = _custom_op_calls(lambda: tgemm.mm(xf, wf))
+        assert isinstance(y, FakeTensor)
+        rows.append(_row("fake tensors outside their mode", calls, True))
+
+    with _routed({_key(m, n, k, False, BF16, BF16): {"libtype": "torch", "solidx": 0}}):
+        y, calls = _custom_op_calls(lambda: tgemm.mm(x, w))
+    assert torch.equal(y, F.linear(x, w))
+    rows.append(_row("config is not hipBLASLt", calls, True))
+
+    xt = _rand(4, 64, k).transpose(0, 1)  # `view(-1, K)` refuses it
+    with _routed({_key(256, n, k, False, BF16, BF16): HIPBLASLT}):
+        y, calls = _custom_op_calls(lambda: tgemm.mm(xt, w))
+    assert torch.equal(y, F.linear(xt, w))
+    rows.append(_row("3-D input that view cannot flatten", calls, True))
+    return rows
 
 
-def test_compile_records_the_custom_ops():
+def check_replaced_lookup():
+    """A function installed over `get_GEMM_A16W16_config` whose answer flips at
+    run time is asked on every call, and its answer is never cached."""
+    m, n, k = 1056, 324, 2560
+    x, w = _rand(m, k), _rand(n, k, scale=k**-0.5)
+    rows = []
+    with _routed({_key(m, n, k, False, BF16, BF16): HIPBLASLT}):
+        routed = tuned.get_GEMM_A16W16_config
+        state = {"bypass": False, "asked": 0}
+
+        def replacement(**kw):
+            state["asked"] += 1
+            config = routed(**kw)
+            if state["bypass"] and config["libtype"] == "hipblaslt":
+                return dict(config, libtype="torch", solidx=0)
+            return config
+
+        tuned.get_GEMM_A16W16_config = replacement
+        try:
+            for bypass in (False, True, False, True):
+                state["bypass"], asked = bypass, state["asked"]
+                y, calls = _custom_op_calls(lambda: tgemm.mm(x, w))
+                # Bypassed: asked by the fast path, then by the op it hands over to.
+                assert state["asked"] - asked == (2 if bypass else 1)
+                if bypass:
+                    assert torch.equal(y, F.linear(x, w))
+                rows.append(_row(f"replaced lookup, bypass={bypass}", calls, bypass))
+        finally:
+            tuned.get_GEMM_A16W16_config = routed
+    return rows
+
+
+def check_weight_handles():
+    """The fast path keeps converted weights per tensor descriptor. A weight in
+    a freed one's memory, a view with the same pointer and another shape, and a
+    strided view compute what the custom op does, and no weight is kept alive."""
+    m, n, k = 128, 256, 512
+    x = _rand(m, k)
+    shapes = ((n, k), (n // 2, k), (n, k // 2))
+    with _routed({_key(m, nn, kk, False, BF16, BF16): HIPBLASLT for nn, kk in shapes}):
+        w1 = _rand(n, k, scale=k**-0.5)
+        rows = [_fast_row("weight", x, w1)]
+        ptr, alive = w1.data_ptr(), weakref.ref(w1)
+        del w1
+        gc.collect()
+        assert alive() is None, "the fast path keeps a weight alive"
+        w2 = _rand(n, k, scale=k**-0.5)
+        reused = "in the freed one's memory" if w2.data_ptr() == ptr else "elsewhere"
+        rows.append(_fast_row(f"new weight, {reused}", x, w2))
+        rows.append(_fast_row("weight view, same pointer", x, w2[: n // 2]))
+        rows.append(_fast_row("strided weight view", x[:, : k // 2], w2[:, : k // 2]))
+    return rows
+
+
+def check_compile():
+    """torch.compile records the custom ops and gives the eager bits."""
     m, n, k = 256, 512, 1024
     x, w, b = _rand(m, k), _rand(n, k, scale=k**-0.5), _rand(n)
     out = torch.empty(m, n, dtype=BF16, device="cuda")
@@ -476,43 +393,131 @@ def test_compile_records_the_custom_ops():
         return y
 
     torch._dynamo.reset()
-    y = torch.compile(fn, backend=backend, fullgraph=True)(x, w, b, out)
-    torch.cuda.synchronize()
-    assert "aiter.gemm_a16w16" in targets
-    assert "aiter.gemm_a16w16_out" in targets
-    assert torch.equal(y, OP(x, w, b))
-    assert torch.equal(out, OP(x, w))
+    rows = {_key(m, n, k, bias, BF16, BF16): HIPBLASLT for bias in (False, True)}
+    with _routed(rows):
+        y = torch.compile(fn, backend=backend, fullgraph=True)(x, w, b, out)
+        assert torch.equal(y, _op(x, w, b)) and torch.equal(out, _op(x, w))
+    ops = sum(t in ("aiter.gemm_a16w16", "aiter.gemm_a16w16_out") for t in targets)
+    assert ops == 2, f"the compiled graph holds {ops} of the 2 custom ops"
+    return [_row("torch.compile, custom ops in the graph", ops, True)]
 
 
-def test_cuda_graph_capture_and_replay(fallbacks):
-    m, n, k = 1056, 324, 10240
-    if _config(m, n, k, False, BF16, BF16)["libtype"] != "hipblaslt":
-        pytest.skip("needs this shape tuned to hipBLASLt on this GPU")
+def check_cuda_graph():
+    """The fast path captured in a CUDA graph replays to the custom op's bits."""
+    m, n, k = 1056, 324, 2560
     x, w = _rand(m, k), _rand(n, k, scale=k**-0.5)
     out = torch.empty(m, n, dtype=BF16, device="cuda")
-    tgemm.mm(x, w)  # warm up outside the capture
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        y = tgemm.mm(x, w)
-        tgemm.mm(x, w, out=out)
-    torch.cuda.current_stream().wait_stream(stream)
-    assert sum(fallbacks.values()) == 0
-    for _ in range(2):
-        x.copy_(_rand(m, k))
-        out.zero_()
-        graph.replay()
-        torch.cuda.synchronize()
-        ref = OP(x, w)
-        assert torch.equal(y, ref) and torch.equal(out, ref)
-    graph.reset()
+    rows = []
+    with _routed({_key(m, n, k, False, BF16, BF16): HIPBLASLT}):
+        tgemm.mm(x, w)  # build outside the capture
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+
+        def capture():
+            with torch.cuda.graph(graph, stream=stream):
+                y = tgemm.mm(x, w)
+                tgemm.mm(x, w, out=out)
+            return y
+
+        y, calls = _custom_op_calls(capture)
+        torch.cuda.current_stream().wait_stream(stream)
+        for i in range(2):
+            x.copy_(_rand(m, k))
+            out.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            ref = _reference(x, w)
+            exact = _check_bits(y.clone(), lambda: _op(x, w), ref, "replay")
+            exact &= _check_bits(out.clone(), lambda: _op(x, w), ref, "replay out=")
+            rows.append(_row(f"CUDA graph, replay {i}", calls, False, exact))
+        graph.reset()
+    return rows
+
+
+def check_preshuffled_weight():
+    """A preshuffled BF16 weight, which the default config sends to hipBLASLt on
+    gfx942, takes the fast path with bpreshuffle set."""
+    m, n, k = 128, 256, 512
+    config = tuned.get_GEMM_A16W16_config(
+        M=m, N=n, K=k, bias=False, dtype=str(BF16), otype=str(BF16), bpreshuffle=True
+    )
+    assert config["libtype"] == "hipblaslt", f"{m}x{n}x{k} now selects {config}"
+    x, w = _rand(m, k), _rand(n, k, scale=k**-0.5)
+    ws = shuffle_weight(w, layout=(16, 16))
+    y, calls = _custom_op_calls(lambda: tgemm.mm(x, ws))
+    exact = _check_bits(y, lambda: _op(x, ws), _reference(x, w), "preshuffled")
+    return [_row("preshuffled weight, default config", calls, False, exact)]
+
+
+def summarize(name, rows):
+    df = pd.DataFrame(rows)
+    aiter.logger.info("%s (markdown):\n%s", name, df.to_markdown(index=False))
 
 
 def main():
-    status = pytest.main([__file__, "-q", "-p", "no:cacheprovider"])
-    return 0 if status == pytest.ExitCode.OK else 1
+    gfx = get_gfx_runtime()
+    if gfx not in SUPPORTED_GFX:
+        aiter.logger.warning("tuned_gemm eager fast path: %s not covered", gfx)
+        return
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="eager fast path of tgemm.mm / gemm_a16w16 vs the custom ops",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default=[BF16, FP16],
+        help="Input dtypes. e.g.: -d bf16",
+    )
+    parser.add_argument(
+        "-s",
+        "--mnk",
+        type=dtypes.str2tuple,
+        nargs="*",
+        # Qwen3.8-Flash-Next prefill BF16 GEMMs at TP2 (2112 new tokens, 1056
+        # per sequence-parallel shard), then two small shapes.
+        default=[
+            (1056, 324, 10240),
+            (1056, 10240, 320),
+            (2112, 513, 2560),
+            (2112, 48, 2560),
+            (2112, 640, 2560),
+            (256, 512, 1024),
+            (96, 384, 768),
+        ],
+        help="M,N,K shapes. e.g.: -s 1056,324,10240",
+    )
+    args = parser.parse_args()
+
+    # First, while this process has not run a hipBLASLt GEMM yet.
+    paths = check_first_calls()
+
+    df = []
+    for (m, n, k), dtype, bias, out in itertools.product(
+        args.mnk, args.dtype, [False, True], OUT_KINDS
+    ):
+        df.append(test_eager(m, n, k, dtype, dtype, bias, 2, out))
+    m, n, k = args.mnk[0]
+    for otype, rank, out in itertools.product([None, FP32], [2, 3], OUT_KINDS):
+        df.append(test_eager(m - m % 2, n, k, BF16, otype, False, rank, out))
+    summarize("tuned_gemm eager fast path vs custom op", df)
+
+    paths += check_declines()
+    paths += check_replaced_lookup()
+    paths += check_weight_handles()
+    paths += check_compile()
+    paths += check_cuda_graph()
+    if gfx == "gfx942":
+        paths += check_preshuffled_weight()
+    else:
+        # Only on gfx942 does the default config send it to hipBLASLt.
+        aiter.logger.warning("%s: skipping the preshuffled-weight check", gfx)
+    paths += check_shape_recording()
+    summarize("tuned_gemm eager path checks", paths)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
