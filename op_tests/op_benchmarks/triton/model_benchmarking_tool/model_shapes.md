@@ -164,6 +164,23 @@ TFLOPS `throughput` metric.
 Attention-residual shapes are replicated and are not divided by TP. The
 benchmark supports the `time` and `bandwidth` metrics.
 
+### Gated DeltaNet (`gated_delta_net_prefill`, `gated_delta_net_decode`)
+
+| Field         | Type   | Description                                                     |
+|---------------|--------|-----------------------------------------------------------------|
+| `hk`          | int    | Total number of key heads. The tool divides this value by TP.   |
+| `dqk`         | int    | Query/key head dimension.                                       |
+| `dv`          | int    | Value head dimension.                                           |
+| `ratio`       | int    | Optional. Number of value heads per key head. The default is 2. |
+| `layout`      | string | Optional. Packed QKVZ layout. The default is `"flat"`.          |
+| `slots`       | int    | Optional. Decode state-pool size. The default is 512.           |
+| `state_dtype` | string | Optional. Decode state dtype: `"fp32"` or `"bf16"`.             |
+| `fp8`         | bool   | Optional. Enable the decode FP8 output. The default is false.   |
+
+The fused Gated DeltaNet benchmarks run on gfx950. Prefill uses `batch_size`
+and `seq_len`. Decode uses `batch_size` and runs only the first requested
+`seq_len` value. Both keys support the `time` and `bandwidth` metrics.
+
 ## Example
 
 ```json
