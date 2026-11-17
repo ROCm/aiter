@@ -2262,3 +2262,40 @@ def test_most_providers_declining_is_the_partitioned_case(monkeypatch):
     assert plugin.last_decision().provider == "owner"
     assert plugin.last_decision().reason == "selected"
     assert all(p.select_calls == 1 for p in declining)
+
+
+def test_explain_says_why_each_offer_was_not_taken(monkeypatch):
+    """A provider that offered and lost must not look like one that declined.
+
+    explain() exists to answer "why is this not running mine". Reporting only
+    the providers that returned nothing leaves the ones that offered and were
+    not chosen invisible -- installed, enabled, offering, not running, and no
+    line about it anywhere.
+    """
+
+    won = _Provider("won", _measured("won", 1, latency=3.0, baseline=10.0))
+    outbid = _Provider("outbid", _measured("outbid", 2, latency=6.0, baseline=10.0))
+    lost = _Provider("lost", _measured("lost", 3, latency=12.0, baseline=10.0))
+    partial = _Provider(
+        "partial",
+        plugin.KernelCandidate(
+            provider="partial",
+            kernel_id="k",
+            artifact_digest="sha",
+            run=lambda *a, **k: 4,
+            latency_us=1.0,  # no baseline: not comparable
+        ),
+    )
+    quiet = _Provider("quiet", None)  # declines outright
+    _enable(monkeypatch, won, outbid, lost, partial, quiet)
+
+    _route_add([])
+    explained = plugin.explain("test.add", 2, 3)
+
+    assert explained.decision.provider == "won"
+    assert "won" not in explained.declines
+    # Each of the other four gets a line, and the lines say different things.
+    assert "another candidate was faster" in explained.declines["outbid"]
+    assert "against its own baseline" in explained.declines["lost"]
+    assert "report is incomplete" in explained.declines["partial"]
+    assert explained.declines["quiet"] == "declined"

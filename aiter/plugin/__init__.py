@@ -818,13 +818,16 @@ def _collect(
 ) -> _Offers:
     """Ask the eligible providers, in preference order, and keep the offers.
 
-    A single eligible provider -- the shape of every deployment this interface
-    has had so far -- is asked once and returned, which is what happened before
-    comparison existed. More than one is asked in full: comparing requires
-    every offer in hand, and ``select()`` is specified to be cheap and pure, so
-    asking is affordable. A provider whose ``select()`` has side effects
-    violates that specification; it cannot deny service to a well-behaved one,
-    because ``_ask_provider`` isolates it.
+    Every eligible provider is asked. Comparing requires every offer in hand,
+    and whether a later provider reports a faster kernel is not knowable
+    without asking it, so there is no stopping at the first. With one eligible
+    provider -- the shape of every deployment this interface has had so far --
+    that is one call, exactly as before comparison existed.
+
+    ``select()`` is specified to be cheap and pure, so asking more of them is
+    affordable. A provider whose ``select()`` has side effects violates that
+    specification; it cannot deny service to a well-behaved one, because
+    ``_ask_provider`` isolates it.
     """
 
     candidates: list[KernelCandidate] = []
@@ -842,8 +845,6 @@ def _collect(
             declined = True
             continue
         candidates.append(candidate)
-        if len(records) == 1:
-            break
     return _Offers(tuple(candidates), declined, failure)
 
 
@@ -911,6 +912,22 @@ def _choose(
             f"{best.latency_us}us vs {best.baseline_path} {best.baseline_us}us"
         )
     return (unmeasured[0], None) if unmeasured else (None, None)
+
+
+def _not_taken(candidate: KernelCandidate) -> str:
+    """Why an offer that was made did not run."""
+
+    missing = check_report(candidate)
+    if missing:
+        return (
+            "offered; not compared, because the report is incomplete " f"({missing[0]})"
+        )
+    if cast(float, candidate.latency_us) >= cast(float, candidate.baseline_us):
+        return (
+            f"offered; reported {candidate.latency_us}us against its own "
+            f"baseline of {candidate.baseline_us}us, so it did not serve"
+        )
+    return f"offered at {candidate.latency_us}us; another candidate was faster"
 
 
 def _attribute(
@@ -1293,16 +1310,24 @@ def explain(op: str, *args: Any, **kwargs: Any) -> Explanation:
     # longer takes -- a diagnostic that disagrees with the thing it diagnoses
     # is worse than none.
     offers = _collect(operation, eligible.providers, canonical_args, readonly)
+    chosen, over = _choose(offers.candidates)
+    offered = {candidate.provider: candidate for candidate in offers.candidates}
     for record in eligible.providers:
-        if record.name not in declines and not any(
-            c.provider == record.name for c in offers.candidates
-        ):
+        if record.name in declines:
+            continue
+        candidate = offered.get(record.name)
+        if candidate is None:
             declines[record.name] = (
                 offers.failure[0]
                 if offers.failure and offers.failure[1] == record.name
                 else "declined"
             )
-    chosen, over = _choose(offers.candidates)
+        elif chosen is None or candidate is not chosen:
+            # It offered and was not taken. Saying nothing about it would make
+            # explain() silent on the only question it exists to answer: a
+            # provider that is installed, enabled, offering, and not running
+            # looks identical to one that declined.
+            declines[record.name] = _not_taken(candidate)
     if chosen is not None:
         return Explanation(
             _selected(operation, chosen, config, over), MappingProxyType(declines)
@@ -1903,6 +1928,7 @@ def _reset_for_testing() -> None:
 __all__ = [
     "API_VERSION",
     "ENTRY_POINT_GROUP",
+    "PROVIDER_FASTER",
     "SUPERSEDED_API_SPELLING",
     "SUPERSEDED_API_VERSIONS",
     "Decision",
@@ -1910,6 +1936,8 @@ __all__ = [
     "KernelCandidate",
     "KernelProvider",
     "Op",
+    "ProviderReport",
+    "check_report",
     "configure",
     "decision_counts",
     "explain",
@@ -1918,6 +1946,7 @@ __all__ = [
     "reload_config",
     "route",
     "status",
+    "validate",
 ]
 
 
