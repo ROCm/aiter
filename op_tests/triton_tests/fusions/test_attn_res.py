@@ -957,16 +957,17 @@ _GATE_TDM_VARIANTS = [
 
 
 @_requires_gate_tdm
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("variant", _GATE_TDM_VARIANTS)
 @pytest.mark.parametrize("D", [512, 7168])
 @pytest.mark.parametrize("N", [1, 37, 300])
 # B=1..3 is fewer rows than the kernel keeps in flight: pipeline start and drain.
 @pytest.mark.parametrize("B", [1, 2, 3, 8])
-def test_attn_res_gate_gluon_matches_reference(B, N, D, variant):
+def test_attn_res_gate_gluon_matches_reference(B, N, D, variant, dtype):
     """The gfx1250 Gluon TDM kernel against the fp32 torch reference."""
     add_count, onorm, quant = variant
     eps, out_eps, scale = 1e-6, 1e-5, 0.8
-    dtype, fp8_dtype = torch.bfloat16, get_fp8_e4m3_dtype()
+    fp8_dtype = get_fp8_e4m3_dtype()
     prefix, block_residual, score_weight, add_hidden, add_hidden2 = (
         generate_attn_res_gate_inputs(
             N, D, B, dtype, with_add=add_count > 0, with_add2=add_count > 1
@@ -1007,7 +1008,8 @@ def test_attn_res_gate_gluon_matches_reference(B, N, D, variant):
     torch.testing.assert_close(prefix_out.float(), prefix_ref.float(), atol=0, rtol=0)
     if quant:
         # Same bound as test_attn_res_gate_out_quant: one e4m3 step of the row's
-        # own bf16 result, plus one scale unit for the fp8-subnormal elements.
+        # own unquantized result, plus one scale unit for the fp8-subnormal
+        # elements.
         (y_fp8, y_scale), _ = gate(fp8_dtype)
         ref = y.float()
         err = (_dequant_per_token(y_fp8, y_scale) - ref).abs()
@@ -1020,29 +1022,81 @@ def test_attn_res_gate_gluon_matches_reference(B, N, D, variant):
         )
 
 
+def _record_gate_launches(monkeypatch):
+    """Replace both launchers of attn_res_gate; return the list of picks."""
+    used = []
+    monkeypatch.setattr(
+        attn_res_module,
+        "_launch_gate_tdm",
+        lambda *args, **kwargs: used.append("gluon"),
+    )
+    monkeypatch.setattr(
+        attn_res_module,
+        "_launch_gate_triton",
+        lambda *args, **kwargs: used.append("triton"),
+    )
+    return used
+
+
 @_requires_gate_tdm
-def test_attn_res_gate_gluon_rejects_unsupported_inputs():
-    """backend="gluon" fails on inputs the Gluon kernel does not take."""
-    prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
-        8, 256, 2, torch.float32, with_add=False
-    )
-    with pytest.raises(RuntimeError, match="Gluon backend"):
-        attn_res_gate(prefix, block_residual, score_weight, 1e-6, backend="gluon")
-    # The default falls back to the Triton kernel for the same inputs.
-    attn_res_gate(prefix, block_residual, score_weight, 1e-6)
-    # close_block always uses the Triton kernel.
-    prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
-        8, 256, 2, torch.bfloat16, with_add=False
-    )
-    with pytest.raises(RuntimeError, match="Gluon backend"):
+def test_attn_res_gate_gluon_rejects_unsupported_inputs(monkeypatch):
+    """Unsupported inputs raise with backend="gluon" and use the Triton kernel by
+    default, also above _ATTN_RES_PREFILL_T, where a supported input uses Gluon."""
+    N = attn_res_module._ATTN_RES_PREFILL_T + 44
+    fp32 = generate_attn_res_gate_inputs(N, 256, 2, torch.float32, with_add=False)
+    bf16 = generate_attn_res_gate_inputs(N, 256, 2, torch.bfloat16, with_add=False)
+    for (prefix, block_residual, score_weight, _, _), close_block in (
+        (fp32, False),
+        (bf16, True),
+    ):
+        with pytest.raises(RuntimeError, match="Gluon backend"):
+            attn_res_gate(
+                prefix,
+                block_residual,
+                score_weight,
+                1e-6,
+                close_block=close_block,
+                backend="gluon",
+            )
+        used = _record_gate_launches(monkeypatch)
         attn_res_gate(
-            prefix,
-            block_residual,
-            score_weight,
-            1e-6,
-            close_block=True,
-            backend="gluon",
+            prefix, block_residual, score_weight, 1e-6, close_block=close_block
         )
+        assert used == ["triton"]
+
+
+@_requires_gate_tdm
+def test_attn_res_gate_gluon_needs_the_tdm_api(monkeypatch):
+    """A Triton without the Gluon CDNA5 TDM API never selects the Gluon kernel."""
+    from triton.experimental.gluon.language.amd import cdna5
+
+    monkeypatch.delattr(cdna5, "tdm")
+    attn_res_module._gate_tdm_kernel.cache_clear()
+    try:
+        assert attn_res_module._gate_tdm_kernel() is None
+    finally:
+        monkeypatch.undo()
+        attn_res_module._gate_tdm_kernel.cache_clear()
+
+
+@_requires_gate_tdm
+def test_attn_res_gate_gluon_is_not_used_on_gfx1250_strict(monkeypatch):
+    """gfx1250-strict keeps the Triton kernel: the Gluon kernel and its config
+    are validated on gfx1250 only."""
+    N = attn_res_module._ATTN_RES_PREFILL_T + 44
+    prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
+        N, 256, 2, torch.bfloat16, with_add=False
+    )
+    monkeypatch.setattr(attn_res_module.arch_info, "get_arch", lambda: "gfx1250-strict")
+    attn_res_module._gate_tdm_kernel.cache_clear()
+    try:
+        assert attn_res_module._gate_tdm_kernel() is None
+        used = _record_gate_launches(monkeypatch)
+        attn_res_gate(prefix, block_residual, score_weight, 1e-6)
+        assert used == ["triton"]
+    finally:
+        monkeypatch.undo()
+        attn_res_module._gate_tdm_kernel.cache_clear()
 
 
 def test_attn_res_gate_rejects_unknown_backend():
@@ -1057,17 +1111,7 @@ def test_attn_res_gate_rejects_unknown_backend():
 @pytest.mark.parametrize("N", [256, 257])
 def test_attn_res_gate_default_backend_threshold(monkeypatch, N):
     """The default uses the Gluon kernel only above _ATTN_RES_PREFILL_T tokens."""
-    used = []
-    monkeypatch.setattr(
-        attn_res_module,
-        "_launch_gate_tdm",
-        lambda *args, **kwargs: used.append("gluon"),
-    )
-    monkeypatch.setattr(
-        attn_res_module,
-        "_launch_gate_triton",
-        lambda *args, **kwargs: used.append("triton"),
-    )
+    used = _record_gate_launches(monkeypatch)
     prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
         N, 256, 2, torch.bfloat16, with_add=False
     )

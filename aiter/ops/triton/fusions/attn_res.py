@@ -437,17 +437,34 @@ _GATE_TDM_ARG_ORDER = (
 )
 
 
+def _has_gluon_tdm() -> bool:
+    # The kernel module imports without these; Gluon resolves them only when it
+    # traces the kernel, so check them before the kernel is selected.
+    try:
+        from triton.experimental.gluon import language as gl
+    except ImportError:
+        return False
+    cdna5 = getattr(getattr(gl, "amd", None), "cdna5", None)
+    tdm = getattr(cdna5, "tdm", None)
+    return all(
+        callable(getattr(tdm, name, None))
+        for name in ("make_tensor_descriptor", "async_load", "async_wait")
+    ) and all(
+        callable(getattr(cdna5, name, None)) for name in ("buffer_load", "buffer_store")
+    )
+
+
 @functools.cache
 def _gate_tdm_kernel():
     """The gfx1250 Gluon TDM kernel of attn_res_gate, or None where it cannot run."""
-    if arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"):
+    # gfx1250 only: the kernel and its config are validated on gfx1250, not on
+    # gfx1250-strict (see docs/gfx1250-strict-enablement-plan.md).
+    if arch_info.get_arch() != "gfx1250" or not _has_gluon_tdm():
         return None
-    try:
-        from aiter.ops.triton._gluon_kernels.gfx1250.fusions.attn_res import (
-            attn_res_gate_tdm_kernel_gfx1250,
-        )
-    except ImportError:  # Triton without the Gluon CDNA5 TDM API
-        return None
+    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.attn_res import (
+        attn_res_gate_tdm_kernel_gfx1250,
+    )
+
     if tuple(attn_res_gate_tdm_kernel_gfx1250.arg_names) != _GATE_TDM_ARG_ORDER:
         raise RuntimeError("attn_res_gate_tdm_kernel_gfx1250 signature changed")
     return attn_res_gate_tdm_kernel_gfx1250
@@ -481,7 +498,8 @@ def _use_gate_tdm(
     )
     if backend == "gluon" and not supported:
         raise RuntimeError(
-            "The Gluon backend of attn_res_gate requires gfx1250, a bf16 or fp16 "
+            "The Gluon backend of attn_res_gate requires gfx1250 with the Gluon "
+            "CDNA5 TDM API, a bf16 or fp16 "
             "block_residual with B >= 1, D <= 8192 and 16-byte aligned rows, "
             "and close_block=False"
         )
