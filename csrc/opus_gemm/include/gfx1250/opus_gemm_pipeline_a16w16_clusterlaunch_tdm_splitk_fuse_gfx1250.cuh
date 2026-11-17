@@ -41,7 +41,9 @@ using opus::operator""_I;
 // traits header can see it).
 
 __host__ __device__ constexpr inline int opus_skfuse_ceil_div_i(int a, int b)
-{ return (a + b - 1) / b; }
+{
+    return (a + b - 1) / b;
+}
 __host__ __device__ constexpr inline int opus_skfuse_min_i(int a, int b) { return a < b ? a : b; }
 __host__ __device__ constexpr inline int opus_skfuse_max_i(int a, int b) { return a > b ? a : b; }
 
@@ -58,22 +60,22 @@ static constexpr int kFuseReduceRing = 3;
 // the cluster geometry from.
 template <typename UserTraits, int SplitK, typename DataWs, int MClusterWg, typename D_OUT>
 __global__ __launch_bounds__(128, 1)
-#if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__) || !defined(__HIP_DEVICE_COMPILE__)
     __cluster_dims__(SplitK, MClusterWg, 1)
 #endif
-    void gemm_a16w16_splitk_fuse_kernel_gfx1250(
-        opus_gemm_splitk_fuse_kargs_gfx1250 kargs)
+        void gemm_a16w16_splitk_fuse_kernel_gfx1250(opus_gemm_splitk_fuse_kargs_gfx1250 kargs)
 {
     static_assert(SplitK * MClusterWg <= 16, "cluster WG count (SplitK*MClusterWg) must be <= 16");
 #ifdef __HIP_DEVICE_COMPILE__
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
     using T       = remove_cvref_t<UserTraits>;
     using DataA   = typename T::DataA;
     using DataB   = typename T::DataB;
     using DataAcc = typename T::DataAcc;
     DECLARE_NAMED_BARRIERS(); // __nbar_1..__nbar_15 (GEMM uses 1..3*kNumSlots)
 
-    auto binit = [&](auto IdN, u32_t mc) __attribute__((always_inline)) {
+    auto binit = [&](auto IdN, u32_t mc) __attribute__((always_inline))
+    {
         constexpr int id = IdN.value;
         if constexpr(id == 1)
             s_barrier_init_ptr(&__nbar_1, mc);
@@ -94,7 +96,8 @@ __global__ __launch_bounds__(128, 1)
         else
             s_barrier_init_ptr(&__nbar_9, mc);
     };
-    auto bjs = [&](auto IdN) __attribute__((always_inline)) {
+    auto bjs = [&](auto IdN) __attribute__((always_inline))
+    {
         constexpr int id = IdN.value;
         if constexpr(id == 1)
         {
@@ -133,7 +136,8 @@ __global__ __launch_bounds__(128, 1)
             __builtin_amdgcn_s_barrier_signal(9);
         }
     };
-    auto bjsw = [&](auto IdN) __attribute__((always_inline)) {
+    auto bjsw = [&](auto IdN) __attribute__((always_inline))
+    {
         constexpr int id = IdN.value;
         if constexpr(id == 1)
         {
@@ -298,17 +302,20 @@ __global__ __launch_bounds__(128, 1)
         constexpr int slot_b_e = T::kSlotElemsB;
         constexpr auto KStep   = opus::number<T::kBlockK>{};
 
-        auto produce = [&](auto& w, int slot_elems, auto FreeBaseN) __attribute__((always_inline)) {
+        auto produce = [&](auto& w, int slot_elems, auto FreeBaseN) __attribute__((always_inline))
+        {
             constexpr int kFreeBase = FreeBaseN.value;
             // One K step into ring slot S. The window walks the global side only;
             // the ring slot is the per-issue LDS write offset, in elements.
             // Advance is off only for the very first issue.
-            auto load_slot = [&](auto SlotN, auto AdvanceN) __attribute__((always_inline)) {
+            auto load_slot = [&](auto SlotN, auto AdvanceN) __attribute__((always_inline))
+            {
                 if constexpr(AdvanceN.value)
                     w.move(KStep);
                 w.async_load((u32_t)(decltype(SlotN)::value * slot_elems));
             };
-            auto step_slot = [&](auto sN) __attribute__((always_inline)) {
+            auto step_slot = [&](auto sN) __attribute__((always_inline))
+            {
                 constexpr int s     = decltype(sN)::value;
                 constexpr int prev2 = (s - 2 + T::kNumSlots) % T::kNumSlots;
                 bjsw(opus::number<kFreeBase + s>{});
@@ -319,7 +326,7 @@ __global__ __launch_bounds__(128, 1)
             if(k_steps >= T::kNumSlots)
             {
                 opus::static_for<T::kNumSlots>([&](auto sN) __attribute__((always_inline)) {
-                    load_slot(sN, opus::number<(decltype(sN)::value > 0) ? 1 : 0>{});
+                    load_slot(sN, opus::number < (decltype(sN)::value > 0) ? 1 : 0 > {});
                 });
                 opus::static_for<T::kNumSlots - 2>([&](auto jN) __attribute__((always_inline)) {
                     constexpr int j = decltype(jN)::value;
@@ -351,7 +358,7 @@ __global__ __launch_bounds__(128, 1)
                 const int nload = k_steps;
                 opus::static_for<T::kNumSlots>([&](auto sN) __attribute__((always_inline)) {
                     if((int)decltype(sN)::value < nload)
-                        load_slot(sN, opus::number<(decltype(sN)::value > 0) ? 1 : 0>{});
+                        load_slot(sN, opus::number < (decltype(sN)::value > 0) ? 1 : 0 > {});
                 });
                 opus::s_wait_tensorcnt<0>();
                 opus::static_for<T::kNumSlots>([&](auto sN) __attribute__((always_inline)) {
@@ -392,11 +399,11 @@ __global__ __launch_bounds__(128, 1)
     }
     else
     {
-        // ── Consumers (w2,w3): WMMA accumulate. ──
+        // -- Consumers (w2,w3): WMMA accumulate. --
         auto mma  = make_tiled_mma<DataA, DataB, DataAcc>(seq<T::kExpM, T::kExpN, T::kExpKHalf>{},
-                                                          seq<T::kTileM, T::kTileN, T::kTileK>{},
-                                                          seq<T::kWmmaM, T::kWmmaN, T::kWmmaK>{},
-                                                          wmma_adaptor_swap_ab{});
+                                                         seq<T::kTileM, T::kTileN, T::kTileK>{},
+                                                         seq<T::kWmmaM, T::kWmmaN, T::kWmmaK>{},
+                                                         wmma_adaptor_swap_ab{});
         auto u_ra = make_layout_ra_ctdm<T>(lane_id, wave_m);
         auto u_rb = make_layout_rb_ctdm<T>(lane_id, wave_n);
 
@@ -405,14 +412,16 @@ __global__ __launch_bounds__(128, 1)
         typename decltype(mma)::vtype_c reg_c;
         clear(reg_c);
 
-        auto consume_slot = [&](auto Sn, auto AFirstN) __attribute__((always_inline)) {
+        auto consume_slot = [&](auto Sn, auto AFirstN) __attribute__((always_inline))
+        {
             constexpr int s       = Sn.value;
             constexpr bool AFirst = AFirstN.value;
             bjsw(opus::number<1 + s>{});
             asm volatile("" ::: "memory");
             constexpr int kDsPerRound = T::kSchedDsCount;
             constexpr bool kDsOverlap = (2 * kDsPerRound <= 56);
-            auto do_load              = [&](int half, int buf) __attribute__((always_inline)) {
+            auto do_load              = [&](int half, int buf) __attribute__((always_inline))
+            {
                 auto sa = make_smem(smem_a + s * slot_a + half * T::kKHalfElems);
                 auto sb = make_smem(smem_b + s * slot_b + half * T::kKHalfElems);
                 if constexpr(AFirst)
@@ -453,11 +462,13 @@ __global__ __launch_bounds__(128, 1)
             bjs(opus::number<1 + T::kNumSlots + s>{});
             bjs(opus::number<1 + 2 * T::kNumSlots + s>{});
         };
-        auto run = [&](auto AFirstN) __attribute__((always_inline)) {
+        auto run = [&](auto AFirstN) __attribute__((always_inline))
+        {
             int k = 0;
             for(; k + T::kNumSlots <= k_steps; k += T::kNumSlots)
-                opus::static_for<T::kNumSlots>(
-                    [&](auto sN) __attribute__((always_inline)) { consume_slot(sN, AFirstN); });
+                opus::static_for<T::kNumSlots>([&](auto sN) __attribute__((always_inline)) {
+                    consume_slot(sN, AFirstN);
+                });
             const int rem = k_steps - k;
             opus::static_for<T::kNumSlots>([&](auto sN) __attribute__((always_inline)) {
                 if((int)decltype(sN)::value < rem)
@@ -469,9 +480,9 @@ __global__ __launch_bounds__(128, 1)
         else
             run(opus::false_type{});
 
-        // ── Epilogue part A: non-last stores its partial to global ws (GL2-
+        // -- Epilogue part A: non-last stores its partial to global ws (GL2-
         //    resident); last folds bias into `acc`. reduce + C write are post the
-        //    converged cluster barrier below. ──
+        //    converged cluster barrier below. --
         auto p_coord_c =
             opus::make_tuple(wave_m, lane_id % mma.grpn_c, wave_n, lane_id / mma.grpn_c);
         const size_t tile_elems = (size_t)T::kBlockM * (size_t)T::kBlockN;
@@ -492,7 +503,7 @@ __global__ __launch_bounds__(128, 1)
             const size_t ws_base =
                 ((size_t)sem_idx * (size_t)(SplitK - 1) + (size_t)split_idx) * tile_elems;
             auto g_ws   = opus::make_gmem<DataWs>(ws_ptr + ws_base,
-                                                  (unsigned int)(tile_elems * sizeof(DataWs)));
+                                                (unsigned int)(tile_elems * sizeof(DataWs)));
             auto reg_ws = opus::cast<DataWs>(reg_c);
             // gfx12 CPOL TH_WB(3)|SCOPE_DEV(2<<3): keep the partial dirty-resident
             // in GL2 (no wr-rinse to DRAM), published device-wide -> the last WG's
@@ -529,26 +540,27 @@ __global__ __launch_bounds__(128, 1)
         }
     }
 
-    // ── CONVERGED cross-WG sync: WG s_barrier (wave-state) then cluster barrier
-    //    (-3) aligns all SplitK*MClusterWg WGs of this cluster. wave0 signals. ──
+    // -- CONVERGED cross-WG sync: WG s_barrier (wave-state) then cluster barrier
+    //    (-3) aligns all SplitK*MClusterWg WGs of this cluster. wave0 signals. --
     __builtin_amdgcn_s_barrier();
     if(wave_id == 0)
         __builtin_amdgcn_s_barrier_signal(-3);
     __builtin_amdgcn_s_barrier_wait(-3);
 
-    // ── Last split: reduce the SplitK-1 published partials into acc. Producer w0
+    // -- Last split: reduce the SplitK-1 published partials into acc. Producer w0
     //    TDM bulk-stages the partial tiles into LDS (coalesced global read, low
     //    latency); consumers then read their lane-contiguous slice from fast LDS as
     //    16B dwordx4 and fp32-accumulate. Small tiles stage ALL SplitK-1 at once
     //    behind a SINGLE WG barrier (max MLP, min sync); big tiles fall back to a
-    //    kFuseReduceRing-bounded chunked loop (2 barriers/chunk). ──
+    //    kFuseReduceRing-bounded chunked loop (2 barriers/chunk). --
     if(is_last && SplitK > 1)
     {
         DataWs* lds_ws             = reinterpret_cast<DataWs*>(lds_buf);
         constexpr int kWsTileElems = T::kBlockM * T::kBlockN;
         DataWs* ws_ptr             = reinterpret_cast<DataWs*>(kargs.ptr_ws);
         const int ws_lane_base     = (wave_split * (int)T::kWarp + lane_id) * NELEM;
-        auto stage                 = [&](int slot, int s) __attribute__((always_inline)) {
+        auto stage                 = [&](int slot, int s) __attribute__((always_inline))
+        {
             const size_t ws_base_s =
                 ((size_t)sem_idx * (size_t)(SplitK - 1) + (size_t)s) * (size_t)kWsTileElems;
             auto w = opus::make_tdm<WindowWs>((u32_t) reinterpret_cast<u64_t>(lds_ws),
@@ -558,7 +570,8 @@ __global__ __launch_bounds__(128, 1)
                                               (u64_t)T::kBlockN);
             w.async_load((u32_t)((size_t)slot * kWsTileElems));
         };
-        auto consume = [&](int slot) __attribute__((always_inline)) {
+        auto consume = [&](int slot) __attribute__((always_inline))
+        {
             auto s_ws = opus::make_smem(lds_ws + (size_t)slot * kWsTileElems);
             opus::static_for<NELEM / kWsChunk>([&](auto cN) __attribute__((always_inline)) {
                 constexpr int c = decltype(cN)::value;
@@ -568,8 +581,8 @@ __global__ __launch_bounds__(128, 1)
                     acc[c * kWsChunk + i] += (float)vp[i];
             });
         };
-        constexpr bool kStageAll   = (size_t)(SplitK - 1) * (size_t)kWsTileElems * sizeof(DataWs) <=
-                                     (size_t)T::kLdsTotalBytes;
+        constexpr bool kStageAll = (size_t)(SplitK - 1) * (size_t)kWsTileElems * sizeof(DataWs) <=
+                                   (size_t)T::kLdsTotalBytes;
         constexpr int kMaxInFlight = 3; // cap outstanding reduce TDMs (queue safety)
         if constexpr(kStageAll)
         {
@@ -617,7 +630,7 @@ __global__ __launch_bounds__(128, 1)
         }
     }
 
-    // ── Last split: consumer waves write the final C tile (bf16 or fp32). ──
+    // -- Last split: consumer waves write the final C tile (bf16 or fp32). --
     if(is_last && !is_producer)
     {
         auto mma = make_tiled_mma<DataA, DataB, DataAcc>(seq<T::kExpM, T::kExpN, T::kExpKHalf>{},

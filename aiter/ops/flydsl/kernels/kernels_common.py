@@ -236,3 +236,30 @@ def run_cached(
     if dispatch_after_wait:
         compiled(*dispatch_args)
     return compiled
+
+
+_SLP_VECTORIZE_ONCE_USED = "slp-vectorize-once-used"
+_slp_once_used_available = None
+
+
+def set_slp_vectorize_once_used(jit_fn, enabled):
+    """Set LLVM slp-vectorize-once-used on this JIT.
+
+    ``enabled`` is the value the kernel wants. flydsl 0.4.1 defaults the flag
+    on. flydsl 0.4.0 has no such option, and passing it would fail compilation,
+    so the hint is attached only when the cl::opt exists.
+    """
+    global _slp_once_used_available
+    if _slp_once_used_available is None:
+        try:
+            from flydsl._mlir._mlir_libs import _mlirDialectsFly as fly
+
+            previous = fly.set_llvm_option_bool(_SLP_VECTORIZE_ONCE_USED, False)
+            fly.set_llvm_option_bool(_SLP_VECTORIZE_ONCE_USED, previous)
+            _slp_once_used_available = True
+        except RuntimeError:
+            _slp_once_used_available = False
+    if _slp_once_used_available:
+        options = jit_fn.compile_hints.setdefault("llvm_options", {})
+        options[_SLP_VECTORIZE_ONCE_USED] = bool(enabled)
+    return jit_fn

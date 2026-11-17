@@ -128,8 +128,29 @@ def _store_mla_kv_cache(
     SCALE_K_WIDTH_ROPE: gl.constexpr,
     L_NOPE: gl.constexpr,
     L_PE: gl.constexpr,
+    SEG_PAGE_SIZE: gl.constexpr = 0,
 ):
-    if SHUFFLED_KV_CACHE:
+    if SEG_PAGE_SIZE > 0:
+        # Seg-packed pages of SEG_PAGE_SIZE tokens: all nope rows, then all
+        # rope rows. Single KV head, unit last-dim stride.
+        seg_page = pid_t_slot // SEG_PAGE_SIZE
+        seg_row = pid_t_slot % SEG_PAGE_SIZE
+        kv_cache_base = kv_cache_ptr + seg_page * SEG_PAGE_SIZE * kv_cache_stride_b
+        kv_cache_nope_offs = seg_row * BLOCK_D_nope + d_nope_offs
+        kv_cache_pe_offs = (
+            SEG_PAGE_SIZE * BLOCK_D_nope + seg_row * BLOCK_D_pe + d_pe_offs
+        )
+        gl.amd.cdna4.buffer_store(
+            k_nope.to(kv_cache_ptr.dtype.element_ty),
+            ptr=kv_cache_base,
+            offsets=kv_cache_nope_offs.to(gl.int32),
+        )
+        gl.amd.cdna4.buffer_store(
+            k_pe.to(kv_cache_ptr.dtype.element_ty),
+            ptr=kv_cache_base,
+            offsets=kv_cache_pe_offs.to(gl.int32),
+        )
+    elif SHUFFLED_KV_CACHE:
         if kv_cache_ptr.dtype.element_ty == gl.bfloat16:
             # BF16
             K_WIDTH: gl.constexpr = 8
@@ -420,6 +441,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     HAVE_K_SCALE: gl.constexpr = False,
     UPCAST_OPERAND: gl.constexpr = False,
     APPLY_ROPE: gl.constexpr = True,
+    SEG_PAGE_SIZE: gl.constexpr = 0,
 ):
     # Accepted only to keep the signature aligned with the Triton kernel; the
     # TDM cos/sin staging below has no NoPE variant.
@@ -480,7 +502,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         pid_hq = pid // B
         pid_b = pid % B
 
-        # Issue ``pos`` first — it's used immediately by the cos/sin TDM
+        # Issue ``pos`` first -- it's used immediately by the cos/sin TDM
         # descriptors. pid_slot / k_scale are only consumed later in the
         # k-store path, so they sit behind pos in the issue stream.
         pos = gl.load(pos_ptr + pid_b * pos_stride_b)
@@ -503,7 +525,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         # contiguous (no d_cos_offs gather), so it streams through LDS like the
         # other inputs. Empirically faster than the buffer_load gather despite
         # adding 2 to the TDM-load FIFO depth (the [FIFO full] stall on the
-        # 6th issue is an overlap stall — kernel keeps doing useful work).
+        # 6th issue is an overlap stall -- kernel keeps doing useful work).
         cos_desc = _make_tdm_desc_1d(
             cos_ptr + pos * cos_stride_b, cos_stride_d, FREQ_W, SH
         )
@@ -633,11 +655,12 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                 SCALE_K_WIDTH_ROPE,
                 L_NOPE,
                 L_PE,
+                SEG_PAGE_SIZE,
             )
 
         # OUTPUT block at tail (after the kv-store path): both stores via
         # buffer_store. Empirically beats moving the block earlier or putting
-        # decode_q_pe on TDM async_store — those alternatives lower per-WGP
+        # decode_q_pe on TDM async_store -- those alternatives lower per-WGP
         # SIMD-instruction count but degrade IPC enough that wall-clock
         # dispatch time grows.
         # Gate on the token, not the pid: with the head-major mapping above,
@@ -741,6 +764,7 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
                     SCALE_K_WIDTH_ROPE,
                     L_NOPE,
                     L_PE,
+                    SEG_PAGE_SIZE,
                 )
 
 
@@ -796,7 +820,7 @@ def _get_kv_cache_offsets(
     """Pre-compute the per-token KV-cache / k_out offsets and masks for the
     2D BLOCK_T-wide store. Returns a tuple
     ``(cache_mask_2d, k_out_offs_2d, k_cache_offs, v_cache_offs,
-       k_scale_rcprl, v_scale_rcprl)`` — all offsets are already ``int32``.
+       k_scale_rcprl, v_scale_rcprl)`` -- all offsets are already ``int32``.
 
     * ``cache_mask_2d`` is broadcast to ``[BLOCK_T, BLOCK_D_pe]`` and folds in
       both the t-bounds mask and the ``slot_mapping >= 0`` mask, so it can be
@@ -1033,7 +1057,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     pid = gl.program_id(0)
     d_pe_offs = gl.arange(0, BLOCK_D_pe, layout=L_PE).to(gl.int64)
 
-    # 2D LDS staging buffers — q/k/v are filled in one burst; cos/sin get
+    # 2D LDS staging buffers -- q/k/v are filled in one burst; cos/sin get
     # ``BLOCK_T`` per-token 1D TDM writes (one row each).
     q_smem = gl.allocate_shared_memory(
         q_ptr.dtype.element_ty, [BLOCK_T, BLOCK_D_pe], SH_2D
@@ -1590,6 +1614,7 @@ def _qpe_htile_kernel(
     SCALE_K_WIDTH_ROPE: gl.constexpr = 4,
     HAVE_K_SCALE: gl.constexpr = False,
     UPCAST_OPERAND: gl.constexpr = False,
+    SEG_PAGE_SIZE: gl.constexpr = 0,
 ):
     # 2D tile layout over [BLOCK_H heads, BLOCK_D_pe], and its 1D slices.
     L_T_PE: gl.constexpr = _tile_blocked_layout(BLOCK_H, BLOCK_D_pe)
@@ -1773,5 +1798,6 @@ def _qpe_htile_kernel(
                 SCALE_K_WIDTH_ROPE,
                 L_NOPE_1D,
                 L_PE_1D,
+                SEG_PAGE_SIZE,
             )
         gl.amd.gfx1250.tdm.async_wait(0)

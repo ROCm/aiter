@@ -5,7 +5,7 @@
 // dispatch lives in opus_gemm_arch_<arch>.cuh (included only by opus_gemm.cu).
 #pragma once
 
-#include "aiter_hip_common.h"  // AITER_CHECK + hip_runtime (torch-free)
+#include "aiter_hip_common.h" // AITER_CHECK + hip_runtime (torch-free)
 
 #include <string>
 #include <utility>
@@ -19,18 +19,18 @@ enum class OpusGfxArch
     // future: Gfx940, Gfx1100, ...
 };
 
-namespace opus_arch_detail
-{
+namespace opus_arch_detail {
 struct OpusArchInfo
 {
     OpusGfxArch arch;
-    std::string name;  // full gcnArchName, e.g. "gfx950:sramecc+:xnack-"
+    std::string name; // full gcnArchName, e.g. "gfx950:sramecc+:xnack-"
     int dev;
+    int cu_num;
 };
-}  // namespace opus_arch_detail
+} // namespace opus_arch_detail
 
 // One-shot probe of the active CUDA device (one-device-per-process model).
-inline const opus_arch_detail::OpusArchInfo &opus_get_arch_info()
+inline const opus_arch_detail::OpusArchInfo& opus_get_arch_info()
 {
     using namespace opus_arch_detail;
     static const OpusArchInfo info = []() {
@@ -41,24 +41,21 @@ inline const opus_arch_detail::OpusArchInfo &opus_get_arch_info()
                     "opus_gemm: hipGetDeviceProperties failed");
         std::string name(prop.gcnArchName);
         OpusGfxArch a = OpusGfxArch::Unknown;
-        if (name.rfind("gfx950", 0) == 0)
+        if(name.rfind("gfx950", 0) == 0)
         {
             a = OpusGfxArch::Gfx950;
         }
-        else if (name.rfind("gfx942", 0) == 0)
+        else if(name.rfind("gfx942", 0) == 0)
         {
             a = OpusGfxArch::Gfx942;
         }
-        else if (name.rfind("gfx1250", 0) == 0)
+        else if(name.rfind("gfx1250", 0) == 0)
         {
             a = OpusGfxArch::Gfx1250;
         }
-        return OpusArchInfo{a, std::move(name), dev};
+        return OpusArchInfo{a, std::move(name), dev, prop.multiProcessorCount};
     }();
     return info;
 }
 
-inline OpusGfxArch opus_get_gfx_arch()
-{
-    return opus_get_arch_info().arch;
-}
+inline OpusGfxArch opus_get_gfx_arch() { return opus_get_arch_info().arch; }

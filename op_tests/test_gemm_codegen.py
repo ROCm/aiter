@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """
-test_gemm_codegen.py — unit tests for gfx-aware GEMM build targeting and dispatch.
+test_gemm_codegen.py -- unit tests for gfx-aware GEMM build targeting and dispatch.
 
 Covers:
   - get_build_targets() build-time target selection (chip_info.py)
@@ -14,10 +14,10 @@ No GPU kernel execution or .so compilation required.  All tests run on CPU
 using only pandas and the chip_info / gemm_op_a8w8 Python layers.
 
 Scenarios:
-  1. get_build_targets() — env-driven target selection
-  2. gen_instances filter — CSV row selection per target GPU
-  3. write_lookup_header — C++ key format in generated lookup header
-  4. Runtime dispatch key selection — (gfx, cu_num, M, N, K) lookup
+  1. get_build_targets() -- env-driven target selection
+  2. gen_instances filter -- CSV row selection per target GPU
+  3. write_lookup_header -- C++ key format in generated lookup header
+  4. Runtime dispatch key selection -- (gfx, cu_num, M, N, K) lookup
 
 Usage:
     python op_tests/test_gemm_codegen.py
@@ -33,11 +33,11 @@ import textwrap
 # Ensure the repo-local aiter is imported, not any system/site-packages install.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
-# Import arch constants directly from build_targets — no torch dependency.
+# Import arch constants directly from build_targets -- no torch dependency.
 sys.path.insert(0, os.path.join(_REPO_ROOT, "aiter", "jit", "utils"))
 import pandas as pd
 from build_targets import (
-    GFX_CU_NUM_MAP,
+    GFX_CU_NUMS_MAP,
     filter_tune_df,
     get_build_targets_env,
 )
@@ -53,12 +53,14 @@ REPRO_BPRESHUFFLE_CSV = os.path.join(
     "gemm_codegen_gfx_filter_bpreshuffle.csv",
 )
 
-# GPU targets used throughout this test.  cu_num values match GFX_CU_NUM_MAP
-# in aiter/jit/utils/build_targets.py (re-exported via chip_info.py) — update
+# GPU targets used throughout this test.  cu_num values match GFX_CU_NUMS_MAP
+# in aiter/jit/utils/build_targets.py (re-exported via chip_info.py) -- update
 # here if that mapping changes.
 TARGET_A = ("gfx942", 304)  # MI300X
 TARGET_B = ("gfx950", 256)  # MI350
-TARGET_C = ("gfx942", 80)  # MI308X — gfx942 with CU_NUM override
+TARGET_C = ("gfx942", 80)  # MI308X -- gfx942 with CU_NUM override
+TARGETS_GFX942 = [TARGET_A, ("gfx942", 228), TARGET_C]
+TARGETS_GFX950 = [TARGET_B, ("gfx950", 128)]
 
 # ---------------------------------------------------------------------------
 # Minimal test harness (no external test framework required)
@@ -92,23 +94,25 @@ def _section(title: str) -> None:
 
 
 def test_get_build_targets():
-    _section("1. get_build_targets() — env-driven target selection")
+    _section("1. get_build_targets() -- env-driven target selection")
 
     orig_archs = os.environ.pop("GPU_ARCHS", None)
     orig_cu = os.environ.pop("CU_NUM", None)
 
     try:
-        # 1.1 Single known arch
+        # 1.1 Single known arch expands to every listed CU count
         os.environ["GPU_ARCHS"] = TARGET_A[0]
         t = get_build_targets_env()
-        _check(f"GPU_ARCHS={TARGET_A[0]} → [{TARGET_A}]", t == [TARGET_A], str(t))
+        _check(
+            f"GPU_ARCHS={TARGET_A[0]} -> {TARGETS_GFX942}", t == TARGETS_GFX942, str(t)
+        )
 
         # 1.2 CU_NUM override (MI308X: gfx942 but cu_num=80)
         os.environ["GPU_ARCHS"] = TARGET_C[0]
         os.environ["CU_NUM"] = str(TARGET_C[1])
         t = get_build_targets_env()
         _check(
-            f"GPU_ARCHS={TARGET_C[0]} + CU_NUM={TARGET_C[1]} → [{TARGET_C}]",
+            f"GPU_ARCHS={TARGET_C[0]} + CU_NUM={TARGET_C[1]} -> [{TARGET_C}]",
             t == [TARGET_C],
             str(t),
         )
@@ -117,14 +121,16 @@ def test_get_build_targets():
         # 1.3 Second known arch
         os.environ["GPU_ARCHS"] = TARGET_B[0]
         t = get_build_targets_env()
-        _check(f"GPU_ARCHS={TARGET_B[0]} → [{TARGET_B}]", t == [TARGET_B], str(t))
+        _check(
+            f"GPU_ARCHS={TARGET_B[0]} -> {TARGETS_GFX950}", t == TARGETS_GFX950, str(t)
+        )
 
         # 1.4 Multi-arch (semicolon-separated)
         os.environ["GPU_ARCHS"] = f"{TARGET_A[0]};{TARGET_B[0]}"
         t = get_build_targets_env()
         _check(
-            f"GPU_ARCHS={TARGET_A[0]};{TARGET_B[0]} → two targets",
-            t == [TARGET_A, TARGET_B],
+            f"GPU_ARCHS={TARGET_A[0]};{TARGET_B[0]} -> every listed pair of both",
+            t == [*TARGETS_GFX942, *TARGETS_GFX950],
             str(t),
         )
 
@@ -135,7 +141,7 @@ def test_get_build_targets():
             get_build_targets_env()
         except RuntimeError:
             raised = True
-        _check("GPU_ARCHS=gfx999 → RuntimeError", raised)
+        _check("GPU_ARCHS=gfx999 -> RuntimeError", raised)
 
         # 1.6 Separator-only GPU_ARCHS raises RuntimeError
         os.environ["GPU_ARCHS"] = " ; "
@@ -144,29 +150,39 @@ def test_get_build_targets():
             get_build_targets_env()
         except RuntimeError:
             raised = True
-        _check("GPU_ARCHS=' ; ' → RuntimeError", raised)
+        _check("GPU_ARCHS=' ; ' -> RuntimeError", raised)
 
-        # 1.7 GFX_CU_NUM_MAP covers at least the two known production targets
-        _check(
-            "GFX_CU_NUM_MAP contains gfx942 and gfx950",
-            "gfx942" in GFX_CU_NUM_MAP and "gfx950" in GFX_CU_NUM_MAP,
-        )
+        # 1.7 GFX_CU_NUMS_MAP lists every fixture target, full GPU first
+        for gfx, cu_num in (TARGET_A, TARGET_B, TARGET_C):
+            cu_nums = GFX_CU_NUMS_MAP.get(gfx, ())
+            _check(
+                f"GFX_CU_NUMS_MAP lists {gfx}/cu_num={cu_num}",
+                cu_num in cu_nums,
+                str(cu_nums),
+            )
+        for gfx, cu_num in (TARGET_A, TARGET_B):
+            cu_nums = GFX_CU_NUMS_MAP.get(gfx, ())
+            _check(
+                f"GFX_CU_NUMS_MAP lists {gfx}/cu_num={cu_num} first",
+                cu_nums[:1] == (cu_num,),
+                str(cu_nums),
+            )
 
-        # 1.8 Live GPU fallback — requires torch and a GPU; skipped otherwise
+        # 1.8 Live GPU fallback -- requires torch and a GPU; skipped otherwise
         del os.environ["GPU_ARCHS"]
         try:
             from aiter.jit.utils.chip_info import get_build_targets
 
             t = get_build_targets()
             _check(
-                "No GPU_ARCHS + live GPU → single (gfx, cu_num) pair",
+                "No GPU_ARCHS + live GPU -> single (gfx, cu_num) pair",
                 len(t) == 1 and isinstance(t[0], tuple) and len(t[0]) == 2,
                 str(t),
             )
         except (ImportError, ModuleNotFoundError):
             print("  SKIP  No GPU_ARCHS + live GPU (torch not available)")
         except RuntimeError:
-            print("  SKIP  No GPU_ARCHS + live GPU (no GPU detected — expected in CI)")
+            print("  SKIP  No GPU_ARCHS + live GPU (no GPU detected -- expected in CI)")
 
     finally:
         if orig_archs is not None:
@@ -180,7 +196,7 @@ def test_get_build_targets():
 
 
 # ---------------------------------------------------------------------------
-# Section 2: gen_instances filter — uses filter_tune_df from build_targets
+# Section 2: gen_instances filter -- uses filter_tune_df from build_targets
 # ---------------------------------------------------------------------------
 
 
@@ -193,7 +209,7 @@ def test_gen_instances_filter(
     pfx = f"[{label}] " if label else ""
 
     _section(
-        f"2. gen_instances filter — CSV row selection per target{' (' + label + ')' if label else ''}"
+        f"2. gen_instances filter -- CSV row selection per target{' (' + label + ')' if label else ''}"
     )
 
     if not os.path.exists(csv_path):
@@ -244,7 +260,17 @@ def test_gen_instances_filter(
         f"multi={n_multi}, {gfx_a}/{cu_a}={n_a}, {gfx_b}/{cu_b}={n_b}",
     )
 
-    # 2.6 All MNK shapes in the repro CSV have different kernelIds across gfx targets
+    # 2.6 Expanding an arch to its listed CU counts keeps every row of that arch
+    arch_targets = [(gfx_a, cu_num) for cu_num in GFX_CU_NUMS_MAP[gfx_a]]
+    filtered = filter_tune_df(df, arch_targets)
+    expected = df[df["gfx"] == gfx_a]
+    _check(
+        f"{pfx}{gfx_a}/listed cu_nums filter keeps every {gfx_a} row",
+        filtered.index.equals(expected.index),
+        f"rows={len(filtered)}, cu_num={sorted(filtered['cu_num'].unique().tolist())}",
+    )
+
+    # 2.7 All MNK shapes in the repro CSV have different kernelIds across gfx targets
     grp = df.groupby(["M", "N", "K"])["kernelId"].nunique()
     shapes_with_diff = grp[grp > 1]
     _check(
@@ -253,7 +279,7 @@ def test_gen_instances_filter(
         f"shapes with diverging kernelIds: {len(shapes_with_diff)}/{len(grp)}",
     )
 
-    # 2.7 Contamination: the two targets share MNK shapes with different kernelIds
+    # 2.8 Contamination: the two targets share MNK shapes with different kernelIds
     d_a = filter_tune_df(df, [target_a]).set_index(["M", "N", "K"])
     d_b = filter_tune_df(df, [target_b]).set_index(["M", "N", "K"])
     common = d_a.index.intersection(d_b.index)
@@ -290,7 +316,7 @@ def _make_temp_csv(content: str) -> str:
 
 
 def test_runtime_dispatch_key():
-    _section("4. Runtime dispatch — (gfx, cu_num, M, N, K) lookup key")
+    _section("4. Runtime dispatch -- (gfx, cu_num, M, N, K) lookup key")
 
     try:
         import aiter.ops.gemm_op_a8w8 as _mod
@@ -300,7 +326,7 @@ def test_runtime_dispatch_key():
         return
 
     # get_CKGEMM_config() uses get_gfx_runtime() which always detects the live GPU
-    # via rocminfo — GPU_ARCHS is intentionally ignored at runtime.  Derive the
+    # via rocminfo -- GPU_ARCHS is intentionally ignored at runtime.  Derive the
     # test CSV rows from the actual live GPU so the test is correct on any runner.
     try:
         from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
@@ -317,7 +343,7 @@ def test_runtime_dispatch_key():
 
     csv_with_gfx = wrong_gfx_csv = old_csv = None
     try:
-        # 3.1 New CSV schema (gfx column present) — correct target is found
+        # 3.1 New CSV schema (gfx column present) -- correct target is found
         csv_with_gfx = _make_temp_csv(f"""
             gfx,cu_num,M,N,K,kernelId,splitK,us,kernelName,tflops,bw,errRatio
             {gfx},{cu_num},128,1280,8192,42,0,10.0,correct_kernel,100.0,500.0,0.0
@@ -389,7 +415,7 @@ def test_runtime_dispatch_key():
 
 
 def test_write_name_keyed_lookup_header():
-    _section("5. write_name_keyed_lookup_header — name-keyed C++ key format")
+    _section("5. write_name_keyed_lookup_header -- name-keyed C++ key format")
 
     from chip_info import write_name_keyed_lookup_header
 
@@ -406,9 +432,9 @@ def test_write_name_keyed_lookup_header():
     k_default = _FakeKernel("default_heuristic")
     kernels_dict = {
         ("gfx942", 304, 128, 4096, 4096): k_a,
-        ("gfx942", 304, 256, 4096, 4096): k_a,  # duplicate name → must dedupe
+        ("gfx942", 304, 256, 4096, 4096): k_a,  # duplicate name -> must dedupe
         ("gfx942", 304, 512, 4096, 4096): k_b,
-        -1: k_default,  # default_dict entry — must be skipped
+        -1: k_default,  # default_dict entry -- must be skipped
     }
 
     LOOKUP_head = "#ifdef USE_ROCM\n#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE) {\\\n"
@@ -536,7 +562,7 @@ def test_blockscale_kernel_name_forwarding():
 
         m, n, k = 32, 128, 256
 
-        # 6.1 ck row → kernelName forwarded to gemm_a8w8_blockscale_ck
+        # 6.1 ck row -> kernelName forwarded to gemm_a8w8_blockscale_ck
         csv_ck = _make_temp_csv(f"""
             gfx,cu_num,M,N,K,kernelId,libtype,splitK,us,kernelName,tflops,bw,errRatio
             {gfx},{cu_num},{m},{n},{k},0,ck,2,10.0,my_tuned_ck_kernel,100.0,500.0,0.0
@@ -612,7 +638,7 @@ def test_blockscale_kernel_name_forwarding():
                 f"recorded kwargs={record.get('kwargs')}",
             )
 
-        # 6.3 cktile row → routed to gemm_a8w8_blockscale_cktile with kernelName
+        # 6.3 cktile row -> routed to gemm_a8w8_blockscale_cktile with kernelName
         csv_cktile = _make_temp_csv(f"""
             gfx,cu_num,M,N,K,kernelId,libtype,splitK,us,kernelName,tflops,bw,errRatio
             {gfx},{cu_num},{m},{n},{k},0,cktile,1,10.0,my_tuned_tile_kernel,100.0,500.0,0.0
@@ -637,7 +663,7 @@ def test_blockscale_kernel_name_forwarding():
                 f"recorded kwargs={record.get('kwargs')}",
             )
 
-        # 6.4 No tuned row for the shape → kernelName="" forwarded (default
+        # 6.4 No tuned row for the shape -> kernelName="" forwarded (default
         # heuristic kicks in inside C++).  This guards the empty-name fallback
         # path that's intentionally distinct from the wrong-name hard error.
         csv_empty = _make_temp_csv(
@@ -654,7 +680,7 @@ def test_blockscale_kernel_name_forwarding():
                 XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
             )
             # With no row matched, the dispatcher hits the "no config" fallback,
-            # which calls gemm_a8w8_blockscale_ck without kernelName= — Python's
+            # which calls gemm_a8w8_blockscale_ck without kernelName= -- Python's
             # default kwarg ("") then propagates to C++.
             _check(
                 "no tuned row: still routed to gemm_a8w8_blockscale_ck (default path)",
@@ -682,7 +708,7 @@ def test_blockscale_kernel_name_forwarding():
 
 
 def test_write_lookup_header():
-    _section("3. write_lookup_header — C++ key format")
+    _section("3. write_lookup_header -- C++ key format")
 
     from chip_info import write_lookup_header
 
@@ -699,7 +725,7 @@ def test_write_lookup_header():
             supports_m_padding=False,
             supports_k_padding=False,
         ),
-        -1: _FakeKernel("default_kernel"),  # default_dict entry — must be skipped
+        -1: _FakeKernel("default_kernel"),  # default_dict entry -- must be skipped
     }
 
     LOOKUP_head = "#ifdef USE_ROCM\n#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE) {\\\n"
@@ -765,7 +791,7 @@ def test_write_lookup_header():
 
 
 def test_build_tune_dict_strict_unknown_kernel():
-    _section("7. build_tune_dict — strict-fail on stale tuned-CSV rows")
+    _section("7. build_tune_dict -- strict-fail on stale tuned-CSV rows")
 
     from chip_info import build_tune_dict, build_tune_dict_batched
 
@@ -845,7 +871,7 @@ def test_build_tune_dict_strict_unknown_kernel():
             f"err={raised}",
         )
 
-        # 7.2 kernelName path: all rows good → returns dict, no raise.
+        # 7.2 kernelName path: all rows good -> returns dict, no raise.
         df_good = df.iloc[[0]].reset_index(drop=True)
         td = build_tune_dict(
             df_good,
@@ -865,7 +891,7 @@ def test_build_tune_dict_strict_unknown_kernel():
             f"td.keys={list(td.keys())}",
         )
 
-        # 7.3 kernelId fallback path: CSV has no kernelName column → uses kernelId.
+        # 7.3 kernelId fallback path: CSV has no kernelName column -> uses kernelId.
         df_id = pd.DataFrame(
             [
                 {

@@ -2050,7 +2050,8 @@ def _inv_rope(x, cs_row, ROPE_DIM: gl.constexpr):
         ptr=cs_row + ROPE_DIM // 2, offsets=k, mask=k >= 0, other=0.0
     )
     cos, sin = cos[None, :], sin[None, :]
-    return gl.reshape(gl.join(even * cos + odd * sin, odd * cos - even * sin), [M, D])
+    rot = gl.join(gl.fma(even, cos, odd * sin), gl.fma(odd, cos, -(even * sin)))
+    return gl.reshape(rot, [M, D])
 
 
 @gluon.jit
@@ -2107,15 +2108,14 @@ def _epilogue_store(
     if INV_ROPE:
         x = _inv_rope(x, cs_row, ROPE_DIM)
     if OUT_MXFP8:
-        x = _mxfp8(x, scale_ptr + row * scale_stride0, h0, num_heads)
+        x = _mxfp8(x, scale_ptr + row.to(gl.int64) * scale_stride0, h0, num_heads)
     hs = h0 + gl.arange(0, M, layout=gl.SliceLayout(1, x.type.layout))
     ds = gl.arange(0, D, layout=gl.SliceLayout(0, x.type.layout))
+    row_ptr = out_ptr + row.to(gl.int64) * out_stride0  # 32-bit offset would overflow
     gl.amd.cdna4.buffer_store(
         x.to(out_ptr.dtype.element_ty),
-        ptr=out_ptr,
-        offsets=(row * out_stride0 + hs[:, None] * out_stride1 + ds[None, :]).to(
-            gl.int32
-        ),
+        ptr=row_ptr,
+        offsets=(hs[:, None] * out_stride1 + ds[None, :]).to(gl.int32),
         mask=(hs < num_heads)[:, None],
     )
 
@@ -2733,14 +2733,11 @@ def _sparse_mla(
             )
         else:
             offs_d_o = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
-            o_off = (
-                query_idx * out_stride0
-                + h_pv[:, None] * out_stride1
-                + offs_d_o[None, :]
-            ).to(gl.int32)
+            o_row_ptr = out_ptr + query_idx.to(gl.int64) * out_stride0  # else overflows
+            o_off = (h_pv[:, None] * out_stride1 + offs_d_o[None, :]).to(gl.int32)
             gl.amd.cdna4.buffer_store(
                 out.to(out_ptr.dtype.element_ty),
-                ptr=out_ptr,
+                ptr=o_row_ptr,
                 offsets=o_off,
                 mask=head_mask_pv[:, None],
             )
@@ -2772,12 +2769,14 @@ def _sparse_mla(
             cache=PART_STORE_CACHE,
         )
         offs_d_a = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
-        a_base = query_idx * pa_stride0 + split_id * pa_stride_s
-        a_off = (a_base + h_pv[:, None] * pa_stride_h + offs_d_a[None, :]).to(gl.int32)
+        a_row_ptr = part_acc_ptr + query_idx.to(gl.int64) * pa_stride0  # else overflows
+        a_off = (
+            split_id * pa_stride_s + h_pv[:, None] * pa_stride_h + offs_d_a[None, :]
+        ).to(gl.int32)
         # Follow part_acc's own dtype: bf16 halves the partial HBM traffic.
         gl.amd.cdna4.buffer_store(
             acc.to(part_acc_ptr.dtype.element_ty),
-            ptr=part_acc_ptr,
+            ptr=a_row_ptr,
             offsets=a_off,
             mask=head_mask_pv[:, None],
             cache=PART_STORE_CACHE,
@@ -2861,25 +2860,26 @@ def _sparse_mla_reduce(
     EPI_L: gl.constexpr = gl.BlockedLayout(
         [1, max(2, HEAD_SIZE // (64 * NUM_WARPS))], [1, 64], [1, NUM_WARPS], [1, 0]
     )
+    query_idx64 = query_idx.to(gl.int64)  # 32-bit offset would overflow
+    pm_row_ptr = part_m_ptr + query_idx64 * pm_stride0
+    pl_row_ptr = part_l_ptr + query_idx64 * pm_stride0
+    pa_row_ptr = part_acc_ptr + query_idx64 * pa_stride0
     for mi in gl.static_range(BLOCK_M):
         h = pid_h * BLOCK_M + mi
         live = split_ok & (h < num_heads)
-        stat_off = query_idx * pm_stride0 + offs_s * pm_stride_s + h
+        stat_off = offs_s * pm_stride_s + h
         m_s = gl.amd.cdna4.buffer_load(
-            ptr=part_m_ptr, offsets=stat_off, mask=live, other=neg_inf, cache=".cg"
+            ptr=pm_row_ptr, offsets=stat_off, mask=live, other=neg_inf, cache=".cg"
         )
         l_s = gl.amd.cdna4.buffer_load(
-            ptr=part_l_ptr, offsets=stat_off, mask=live, other=0.0, cache=".cg"
+            ptr=pl_row_ptr, offsets=stat_off, mask=live, other=0.0, cache=".cg"
         )
         # Issued before the weights exist: nothing in the address depends on them.
-        a_off = (
-            query_idx * pa_stride0
-            + offs_s[:, None] * pa_stride_s
-            + h * pa_stride_h
-            + offs_d[None, :]
-        ).to(gl.int32)
+        a_off = (offs_s[:, None] * pa_stride_s + h * pa_stride_h + offs_d[None, :]).to(
+            gl.int32
+        )
         acc_s = gl.amd.cdna4.buffer_load(
-            ptr=part_acc_ptr,
+            ptr=pa_row_ptr,
             offsets=a_off,
             mask=live[:, None],
             other=0.0,
@@ -2902,12 +2902,13 @@ def _sparse_mla_reduce(
 
         if HAS_LSE:
             gl.store(
-                lse_ptr + query_idx * num_heads + h,
+                lse_ptr + query_idx64 * num_heads + h,
                 (m_final + gl.log2(l_final)) * LN2,
                 mask=h < num_heads,
             )
-        # One reciprocal per row instead of a per-element f32 divide.
-        out = acc * (1.0 / l_final)
+        # One reciprocal per row instead of a per-element f32 divide. A row with
+        # no key in any split (and no sink) has l = 0 and comes out 0, not NaN.
+        out = acc * gl.where(l_final > 0.0, 1.0 / l_final, 0.0)
         if INV_ROPE or OUT_MXFP8:
             _epilogue_store(
                 gl.expand_dims(out, 0),
@@ -2928,10 +2929,11 @@ def _sparse_mla_reduce(
                 OUT_MXFP8,
             )
         else:
-            o_off = (query_idx * out_stride0 + h * out_stride1 + offs_d).to(gl.int32)
+            o_row_ptr = out_ptr + query_idx.to(gl.int64) * out_stride0  # else overflows
+            o_off = (h * out_stride1 + offs_d).to(gl.int32)
             gl.amd.cdna4.buffer_store(
                 out.to(out_ptr.dtype.element_ty),
-                ptr=out_ptr,
+                ptr=o_row_ptr,
                 offsets=o_off,
                 mask=(offs_d < HEAD_SIZE) & (h < num_heads),
             )

@@ -27,6 +27,7 @@ from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.test_common import checkAllclose
+from aiter.utility.graph_alloc import capture_scoped_cache
 
 SCALE_GROUP_SIZE = 32  # A: 1x32 e8m0 scale group
 W_SCALE_K_GROUP = 128  # B: 128 in K direction
@@ -66,11 +67,11 @@ def generate_inputs(
     ``x_scales`` is the logical ``(M, K // x_scale_group_size)`` scale the
     reference dequants with. ``x_scales_kernel`` is what the kernel is handed:
     the same tensor normally, or a byte-transposed buffer when
-    ``transpose_x_scale=True`` — i.e. ``.shape`` still reads ``(M, Kg)`` but the
+    ``transpose_x_scale=True`` -- i.e. ``.shape`` still reads ``(M, Kg)`` but the
     storage is column-major, which is what
     ``per_group_quant_hip(transpose_scale=True)`` produces.
     """
-    # Small random fp32 → fp8 e4m3fn, kept inside e4m3 range so the cast is exact-ish.
+    # Small random fp32 -> fp8 e4m3fn, kept inside e4m3 range so the cast is exact-ish.
     x_f32 = torch.randn((M, K), dtype=torch.float32, device="cuda")
     w_f32 = torch.randn((N, K), dtype=torch.float32, device="cuda")
     x_f32 = torch.clamp(x_f32, -FP8_MAX, FP8_MAX)
@@ -1017,7 +1018,8 @@ def test_fused_split_k_graph_replay_on_warmed_stream(variant):
 def test_fused_split_k_first_use_inside_capture(variant, monkeypatch):
     # Isolate the counter cache so earlier tests cannot warm the capture stream.
     torch.cuda.synchronize()
-    monkeypatch.setattr(afp8wfp8_op, "_split_counters_by_stream", {})
+    fresh = capture_scoped_cache(afp8wfp8_op._split_counters_keyed.__wrapped__)
+    monkeypatch.setattr(afp8wfp8_op, "_split_counters_keyed", fresh)
     # Before torch 2.10 counters cannot be allocated mid-capture: runs unfused.
     x, w, xs, ws = generate_group32_inputs(6, 1152, 5120)
     graph = torch.cuda.CUDAGraph()

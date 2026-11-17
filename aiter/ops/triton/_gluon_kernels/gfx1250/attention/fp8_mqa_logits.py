@@ -311,7 +311,7 @@ def mqa_logits_loop_double_buf(
 #   pre_dot(t)  : ds_load K[t], buffer_load scales[t], async-prefetch K[t+2]
 #   dot(t)      : scores[t] = Q @ K[t]
 #   post_dot(t) : relu -> *w (sum) -> *scales[t] -> store
-# Iter i runs pre_dot(i+2), dot(i+1), post_dot(i) — stages share no values
+# Iter i runs pre_dot(i+2), dot(i+1), post_dot(i) -- stages share no values
 # in-iter, so DS_LOAD / VALU / MFMA / global-store can interleave freely.
 # Carried regs are named by the tile they hold relative to the upcoming iter i:
 #   mfma_k_next  = K[i+1]     scores_i    = scores[i]
@@ -400,7 +400,7 @@ def mqa_logits_loop_pipelined(
         BLOCK_KV,
         mfma_layout,
     )
-    # Body: 2-unrolled (sub-iter A → buf 0, sub-iter B → buf 1). Odd leftover
+    # Body: 2-unrolled (sub-iter A -> buf 0, sub-iter B -> buf 1). Odd leftover
     # runs in the post-loop block.
     end = max(0, num_full_tiles - 1)
     odd_peel = end % 2
@@ -571,6 +571,7 @@ def mqa_logits_loop_pipelined(
 _gluon_fp8_mqa_logits_kernel_repr = make_kernel_repr(
     "_gluon_fp8_mqa_logits_kernel",
     [
+        "PACKED",
         "NUM_HEADS",
         "HEAD_SIZE",
         "BLOCK_KV",
@@ -592,7 +593,8 @@ def _gluon_fp8_mqa_logits_kernel(
     weights_ptr,  # fp32   [seq_len, NUM_HEADS]
     cu_start_ptr,  # int32  [seq_len]
     cu_end_ptr,  # int32  [seq_len]
-    logits_ptr,  # fp32   [seq_len, seq_len_kv]
+    logits_ptr,  # fp32   [seq_len, seq_len_kv]; flat when PACKED
+    out_offsets_ptr,  # int32/int64 [seq_len]: each row's start when PACKED
     seq_len: gl.int32,
     seq_len_kv: gl.int32,
     NUM_HEADS: gl.constexpr,
@@ -613,6 +615,7 @@ def _gluon_fp8_mqa_logits_kernel(
     LOOP_VARIANT: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
+    PACKED: gl.constexpr = False,
 ):
 
     gl.static_assert(
@@ -704,7 +707,12 @@ def _gluon_fp8_mqa_logits_kernel(
 
     # Bake row + start offsets into the base pointers
     kv_scales_ptr_seg = kv_scales_ptr + start_ind
-    logits_ptr_row = logits_ptr + row_id * stride_logits_s + start_ind * stride_logits_k
+    if PACKED:
+        logits_ptr_row = logits_ptr + gl.load(out_offsets_ptr + row_id).to(gl.int64)
+    else:
+        logits_ptr_row = (
+            logits_ptr + row_id * stride_logits_s + start_ind * stride_logits_k
+        )
 
     if LOOP_VARIANT == 0:
         mqa_logits_loop_double_buf(

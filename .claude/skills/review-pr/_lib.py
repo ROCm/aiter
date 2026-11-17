@@ -3,11 +3,11 @@
 In python rather than shell, for reliability: shell grep/wc/ls can be hijacked by a
 function or alias (grep here is wrapped by Claude Code as a function that silently returns
 bad output when its underlying binary is unavailable), and a check that silently returns
-an empty value is more dangerous than no check — it makes everything look like it passed.
+an empty value is more dangerous than no check -- it makes everything look like it passed.
 
 This does only ops: whether an artifact exists, whether the format is valid, whether a gate
 passed, what is missing. **It does not judge whether a finding is correct, nor touch
-severity** — that is the review-pr skill's job.
+severity** -- that is the review-pr skill's job.
 """
 
 import json
@@ -17,7 +17,7 @@ import re
 import subprocess
 import sys
 
-FINDING_RE = re.compile(r"^(?:🔴|⚠️|📝)\s")
+FINDING_RE = re.compile(r"^(?:?|?|?)\s")
 FIRE_RE = re.compile(r"^([A-Z0-9]+)\s+FIRE\s")
 
 # What a report is made of. A missing required file is a collection failure; a missing
@@ -30,10 +30,19 @@ REQUIRED = [
     "core_files.txt",
     "refutations.txt",
     "independent.txt",
+    "design.txt",
     "rules.txt",
     "pr_meta.json",
 ]
-OPTIONAL = ["late_findings.txt"]
+# citations.txt rides here rather than in REQUIRED: it is advisory, and a run whose
+# worker died before writing a card has no citations to check -- absence is not a defect.
+# It must be collected, though: _publish.py reads it out of the report dir to decide what
+# may be anchored inline, and an uncollected verdict reads exactly like "never checked",
+# which anchors nothing.
+# reviewers.txt / size.txt ride here too: fetch.sh writes them when it can (roster from
+# the PR's reviews + git log, size from pr_meta.json), and their absence degrades the
+# design gate to "no roster to route to" rather than failing the run.
+OPTIONAL = ["late_findings.txt", "citations.txt", "reviewers.txt", "size.txt"]
 
 
 def read(p):
@@ -84,7 +93,7 @@ def pr_meta(work):
 
 
 def run_gates(work, proj):
-    """Run the seven gates, return [(name, exit_code, first_line, full)]. Trust no agent's self-report."""
+    """Run the eight gates, return [(name, exit_code, first_line, full)]. Trust no agent's self-report."""
     sk = os.path.join(proj, ".claude", "skills", "review-pr", "triage.py")
     W = lambda f: os.path.join(work, f)
     # A missing artifact should let the gate rule "this step was not done", not crash the script
@@ -99,6 +108,8 @@ def run_gates(work, proj):
     ]:
         pathlib.Path(W(f)).touch(exist_ok=True)
     pathlib.Path(W("card.md")).touch(exist_ok=True)
+    pathlib.Path(W("design.txt")).touch(exist_ok=True)
+    pathlib.Path(W("reviewers.txt")).touch(exist_ok=True)
     specs = [
         ("answers", ["answers", W("answers.txt")]),
         ("diagnostic", ["diagnostic", W("ai_diagnostic.txt")]),
@@ -121,6 +132,17 @@ def run_gates(work, proj):
             ["refutations", W("refutations.txt"), W("pr.diff"), W("card.md")],
         ),
         ("independent", ["independent", W("independent.txt"), W("card.md")]),
+        (
+            "design",
+            [
+                "design",
+                W("design.txt"),
+                W("card.md"),
+                W("reviewers.txt"),
+                W("pr_meta.json"),
+                W("pr.diff"),
+            ],
+        ),
     ]
     env = dict(os.environ, PYTHONUTF8="1")
     res = []
@@ -151,7 +173,7 @@ def pr_state(pr, repo="ROCm/aiter"):
     The queue often comes from a stale review list: of 11 reviewed on 2026-09-15, 2 had
     already merged the same day, one of them carrying three reds confirmed by GPU runs. If a
     report does not state the status, the reader assumes it can still be stopped before merge
-    — but those issues are already on main, changing them from "fix before merge" to
+    -- but those issues are already on main, changing them from "fix before merge" to
     "follow-up fixes".
     """
     import json

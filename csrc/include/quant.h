@@ -29,25 +29,25 @@ constexpr int64_t moe_quant_padded_rows_upper_bound(int64_t total_routes,
     return block_m * (active_experts + (total_routes - active_experts) / block_m);
 }
 
-static_assert(moe_quant_padded_rows_upper_bound(1, 7, 32) == 32);      // routes < experts
-static_assert(moe_quant_padded_rows_upper_bound(504, 7, 32) == 704);   // experts saturate
-static_assert(moe_quant_padded_rows_upper_bound(64, 64, 64) == 4096);  // one route per expert
+static_assert(moe_quant_padded_rows_upper_bound(1, 7, 32) == 32);     // routes < experts
+static_assert(moe_quant_padded_rows_upper_bound(504, 7, 32) == 704);  // experts saturate
+static_assert(moe_quant_padded_rows_upper_bound(64, 64, 64) == 4096); // one route per expert
 
 void static_per_tensor_quant(aiter_tensor_t& out,          // [..., d]
                              const aiter_tensor_t& input,  // [..., d]
                              const aiter_tensor_t& scale); // [1]
 
 void dynamic_per_tensor_quant(aiter_tensor_t& out,         // [..., d]
-                              const aiter_tensor_t& input,  // [..., d]
-                              aiter_tensor_t& scale);       // [1]
+                              const aiter_tensor_t& input, // [..., d]
+                              aiter_tensor_t& scale);      // [1]
 
 void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     const aiter_tensor_t& input, // [..., d]
                                     aiter_tensor_t& scales,
-                                    std::optional<aiter_tensor_t> scale_ub  = std::nullopt,
-                                    bool shuffle_scale                      = false,
-                                    std::optional<aiter_tensor_t> num_rows  = std::nullopt,
-                                    int num_rows_factor                     = 1);
+                                    std::optional<aiter_tensor_t> scale_ub = std::nullopt,
+                                    bool shuffle_scale                     = false,
+                                    std::optional<aiter_tensor_t> num_rows = std::nullopt,
+                                    int num_rows_factor                    = 1);
 
 // Canonical dtype-aware per-group dynamic quant. Accepts fp8 / i8 / fp4x2.
 // For fp4x2 it writes an e8m0 byte per group; for fp8/i8 it writes an
@@ -55,23 +55,26 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
 // scale_layout_m32k4: fp8 or fp4x2 + e8m0 + group_size 32 only. Writes the scale directly in
 // the gfx1250 ASM / FlyDSL GEMM A-scale layout (shuffle_mxfp8fp4_scale bytes); `scales` must hold
 // (pad32(M), K/32) bytes and the pad rows are written as 0x7F. shuffle_scale is ignored.
+// hadamard_rotate: fp4x2 + group_size 32 only. Rotates each group by the normalized
+// 32-point Sylvester Hadamard matrix before quantizing it.
 void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     const aiter_tensor_t& input, // [..., d]
                                     aiter_tensor_t& scales,
-                                    int group_size                             = 32,
-                                    bool shuffle_scale                         = true,
-                                    std::optional<aiter_tensor_t> num_rows     = std::nullopt,
-                                    int num_rows_factor                        = 1,
-                                    bool scale_layout_m32k4                    = false);
+                                    int group_size                         = 32,
+                                    bool shuffle_scale                     = true,
+                                    std::optional<aiter_tensor_t> num_rows = std::nullopt,
+                                    int num_rows_factor                    = 1,
+                                    bool scale_layout_m32k4                = false,
+                                    bool hadamard_rotate                   = false);
 
 // Backward-compat fp4-only entry; delegates to dynamic_per_group_scaled_quant.
 void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
                                         const aiter_tensor_t& input, // [..., d]
                                         aiter_tensor_t& scales,
-                                        int group_size                             = 32,
-                                        bool shuffle_scale                         = true,
-                                        std::optional<aiter_tensor_t> num_rows     = std::nullopt,
-                                        int num_rows_factor                        = 1);
+                                        int group_size                         = 32,
+                                        bool shuffle_scale                     = true,
+                                        std::optional<aiter_tensor_t> num_rows = std::nullopt,
+                                        int num_rows_factor                    = 1);
 
 void smooth_per_token_scaled_quant(
     aiter_tensor_t& out,         // [..., d]
@@ -110,20 +113,21 @@ void moe_smooth_per_token_scaled_quant_v2(aiter_tensor_t& out,         // [..., 
                                           bool shuffle_scale = false,
                                           bool transpose_out = false);
 
-void fused_dynamic_mx_quant_moe_sort_hip(aiter_tensor_t& out,         // [token_num * topk, d] for fp8 or [token_num * topk, d / 2] for fp4
-                                            aiter_tensor_t& scales,      // swizzled e8m0 bytes
-                                            const aiter_tensor_t& input, // [token_num * topk, d]
-                                            const aiter_tensor_t& sorted_ids,
-                                            const aiter_tensor_t& num_valid_ids,
-                                            int token_num,
-                                            int block_m,
-                                            int64_t total_routes, // token_num * routing top-k
-                                            int group_size = 32,
-                                            std::optional<aiter_tensor_t> sorted_weights = std::nullopt);
+void fused_dynamic_mx_quant_moe_sort_hip(
+    aiter_tensor_t& out,    // [token_num * topk, d] for fp8 or [token_num * topk, d / 2] for fp4
+    aiter_tensor_t& scales, // swizzled e8m0 bytes
+    const aiter_tensor_t& input, // [token_num * topk, d]
+    const aiter_tensor_t& sorted_ids,
+    const aiter_tensor_t& num_valid_ids,
+    int token_num,
+    int block_m,
+    int64_t total_routes, // token_num * routing top-k
+    int group_size                               = 32,
+    std::optional<aiter_tensor_t> sorted_weights = std::nullopt);
 
 void fused_dynamic_mx_quant_moe_sort_hip_bounded(
-    aiter_tensor_t& out,         // [token_num * topk, d] for fp8 or [token_num * topk, d / 2] for fp4
-    aiter_tensor_t& scales,      // swizzled e8m0 bytes
+    aiter_tensor_t& out,    // [token_num * topk, d] for fp8 or [token_num * topk, d / 2] for fp4
+    aiter_tensor_t& scales, // swizzled e8m0 bytes
     const aiter_tensor_t& input, // [token_num * topk, d]
     const aiter_tensor_t& sorted_ids,
     const aiter_tensor_t& num_valid_ids,
@@ -131,24 +135,24 @@ void fused_dynamic_mx_quant_moe_sort_hip_bounded(
     int block_m,
     int64_t total_routes,
     int64_t num_experts_upper_bound,
-    int group_size = 32,
+    int group_size                               = 32,
     std::optional<aiter_tensor_t> sorted_weights = std::nullopt);
 
 void mxfp4_moe_sort_hip(aiter_tensor_t& out_scale,
-                         const aiter_tensor_t& scale,
-                         const aiter_tensor_t& sorted_ids,
-                         const aiter_tensor_t& num_valid_ids,
-                         int token_num,
-                         int cols);
+                        const aiter_tensor_t& scale,
+                        const aiter_tensor_t& sorted_ids,
+                        const aiter_tensor_t& num_valid_ids,
+                        int token_num,
+                        int cols);
 void quant_mxfp4(const aiter_tensor_t& inp,
                  aiter_tensor_t& out_packed,
                  aiter_tensor_t& out_scale,
-                 int group_size          = 32,
-                 int round_mode          = 0,
-                 bool e8m0_shuffle       = false,
-                 bool a16w4_shuffle      = false,
-                 bool gate_up            = false,
-                 bool shuffle_weight     = false);
+                 int group_size      = 32,
+                 int round_mode      = 0,
+                 bool e8m0_shuffle   = false,
+                 bool a16w4_shuffle  = false,
+                 bool gate_up        = false,
+                 bool shuffle_weight = false);
 void quant_mxfp6_gemm_hip(const aiter_tensor_t& input,
                           aiter_tensor_t& packed,
                           aiter_tensor_t& packed_scale);

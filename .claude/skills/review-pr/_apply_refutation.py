@@ -1,4 +1,4 @@
-"""Drop the findings the independent refuter KILLED from the card, so the seven gates see only
+"""Drop the findings the independent refuter KILLED from the card, so the eight gates see only
 what survived. In the interactive review flow a human removes KILLED findings by hand before
 finalizing; run_one.sh calls this to do it headlessly -- without it, the very first review whose
 refuter kills a finding (its designed job) fails triage.py's independent gate and loses the whole
@@ -16,34 +16,43 @@ import pathlib
 import re
 import sys
 
-FIND_PREFIX = ("\U0001F534", "⚠", "\U0001F4DD")  # 🔴 ⚠️ 📝
+FIND_PREFIX = ("\U0001f534", "?", "\U0001f4dd")  # ? ? ?
 VERDICT = re.compile(r"^\s*(SURVIVED|KILLED)\b")
 
 
 def main():
     if len(sys.argv) < 3:
-        print("usage: _apply_refutation.py <card.md> <independent.txt>"); return 2
+        print("usage: _apply_refutation.py <card.md> <independent.txt>")
+        return 2
     card_p = pathlib.Path(sys.argv[1])
     indep = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
     verdicts = [m.group(1) for m in (VERDICT.match(l) for l in indep.splitlines()) if m]
 
     lines = card_p.read_text(encoding="utf-8").splitlines(keepends=True)
-    finding_lines = [i for i, l in enumerate(lines) if l.lstrip().startswith(FIND_PREFIX)]
+    finding_lines = [
+        i for i, l in enumerate(lines) if l.lstrip().startswith(FIND_PREFIX)
+    ]
 
     if not finding_lines or not verdicts:
-        print("nothing to apply (no findings or no verdicts)"); return 0
+        print("nothing to apply (no findings or no verdicts)")
+        return 0
     if len(verdicts) != len(finding_lines):
         # Ambiguous mapping -- do not guess which finding a verdict refers to. Leave the card as
         # is; the independent gate will report the count mismatch.
-        print(f"skip: {len(finding_lines)} card findings vs {len(verdicts)} verdicts -- mismatch")
+        print(
+            f"skip: {len(finding_lines)} card findings vs {len(verdicts)} verdicts -- mismatch"
+        )
         return 0
 
     drop = {finding_lines[i] for i, v in enumerate(verdicts) if v == "KILLED"}
     if not drop:
-        print("no KILLED findings; card unchanged"); return 0
+        print("no KILLED findings; card unchanged")
+        return 0
     kept = [l for i, l in enumerate(lines) if i not in drop]
     card_p.write_text("".join(kept), encoding="utf-8")
-    print(f"applied refutation: dropped {len(drop)} KILLED finding(s), kept {len(finding_lines) - len(drop)}")
+    print(
+        f"applied refutation: dropped {len(drop)} KILLED finding(s), kept {len(finding_lines) - len(drop)}"
+    )
     return 0
 
 

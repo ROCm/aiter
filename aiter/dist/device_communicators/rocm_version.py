@@ -23,7 +23,6 @@ Returns a ``(major, minor, patch)`` tuple that compares naturally against a
 threshold like ``(7, 15)``, or ``None`` if every source failed.
 """
 
-import ctypes
 import functools
 import glob
 import os
@@ -43,14 +42,14 @@ def _parse(s):
 def _candidate_roots():
     """ROCm install roots to probe, highest priority first."""
     roots = []
-    # Explicit env pointers win — they name the ROCm the user actually wired up.
+    # Explicit env pointers win -- they name the ROCm the user actually wired up.
     for env in ("ROCM_PATH", "ROCM_HOME", "HIP_PATH"):
         p = os.environ.get(env)
         if p:
             roots.append(p)
     # Default unversioned symlink.
     roots.append("/opt/rocm")
-    # Versioned installs — probe the highest version first.
+    # Versioned installs -- probe the highest version first.
     roots.extend(sorted(glob.glob("/opt/rocm-*"), reverse=True))
     # De-dup while preserving order.
     seen = set()
@@ -80,7 +79,7 @@ def _from_info_files():
 
 
 def _from_torch():
-    """``torch.version.hip`` — HIP version torch was built against.
+    """``torch.version.hip`` -- HIP version torch was built against.
 
     On modern ROCm (>= 6.0) the HIP major.minor tracks the ROCm release, so
     ``"7.15.xxxxx"`` -> ``(7, 15, xxxxx)``.
@@ -104,24 +103,11 @@ def _from_hip_runtime():
     *runtime* version; it aligns with the ROCm release from ROCm 6.0 onward,
     which is the range that matters for the IPC gate.
     """
-    hip = None
-    for name in ("libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"):
-        try:
-            hip = ctypes.CDLL(name)
-            break
-        except OSError:
-            continue
-    if hip is None:
-        return None
-    try:
-        raw = ctypes.c_int()
-        if hip.hipRuntimeGetVersion(ctypes.byref(raw)) != 0:
-            return None
-        val = raw.value
-    except Exception:  # noqa: BLE001
-        return None
-    v = (val // 10_000_000, (val // 100_000) % 100, val % 100_000)
-    logger.info("ROCm version %s from hipRuntimeGetVersion=%d", v, val)
+    from aiter.jit.utils.hip_runtime import get_hip_runtime_version
+
+    v = get_hip_runtime_version()
+    if v:
+        logger.info("ROCm version %s from hipRuntimeGetVersion", v)
     return v
 
 

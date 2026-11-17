@@ -91,7 +91,7 @@ def _run_exact_a16w16(
     split_k: int,
     use_graph: bool,
 ):
-    kwargs = {"kid": kid, "split_k": split_k}
+    kwargs = {"family": "a16w16", "kid": kid, "split_k": split_k}
     if not use_graph:
         return run_perftest(opus_bmm, A, B, Y, **kwargs)
 
@@ -303,7 +303,7 @@ def _assert_matches_golden(actual, A, B, bias=None):
 
 @pytest.mark.parametrize(
     ("kid", "M", "N", "K", "split_k"),
-    ((200, 64, 64, 512, 2), (1400, 192, 256, 128, 0)),
+    ((6, 64, 64, 512, 2), (92, 192, 256, 128, 0)),
 )
 def test_gfx950_logical_2d_gemm_matches_torch(kid, M, N, K, split_k):
     """The public GEMM adapter adds only a no-copy batch-one raw view."""
@@ -313,7 +313,7 @@ def test_gfx950_logical_2d_gemm_matches_torch(kid, M, N, K, split_k):
     A = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
     B = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
     Y = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
-    actual = opus_gemm(A, B, Y, kid=kid, split_k=split_k)
+    actual = opus_gemm(A, B, Y, family="a16w16", kid=kid, split_k=split_k)
     torch.cuda.synchronize()
     assert actual is Y
     _assert_matches_golden(actual, A, B)
@@ -327,7 +327,7 @@ def test_gfx950_batch_first_bmm_matches_torch():
     A = torch.randn((2, 192, 128), device="cuda", dtype=torch.bfloat16)
     B = torch.randn((2, 256, 128), device="cuda", dtype=torch.bfloat16)
     Y = torch.empty((2, 192, 256), device="cuda", dtype=torch.bfloat16)
-    actual = opus_bmm(A, B, Y, kid=1400)
+    actual = opus_bmm(A, B, Y, family="a16w16", kid=92)
     torch.cuda.synchronize()
     assert actual is Y
     _assert_matches_golden(actual, A, B)
@@ -336,12 +336,12 @@ def test_gfx950_batch_first_bmm_matches_torch():
 @pytest.mark.parametrize(
     ("arch", "kid", "M", "N", "K", "split_k", "out_dtype"),
     [
-        ("gfx950", 200, 64, 64, 512, 2, torch.bfloat16),
-        ("gfx950", 200, 64, 64, 512, 2, torch.float32),
-        ("gfx942", 10200, 128, 128, 512, 2, torch.float32),
-        ("gfx942", 10210, 128, 128, 512, 2, torch.bfloat16),
-        ("gfx1250", 20000, 16, 32, 512, 2, torch.bfloat16),
-        ("gfx1250", 20000, 16, 32, 512, 2, torch.float32),
+        ("gfx950", 6, 64, 64, 512, 2, torch.bfloat16),
+        ("gfx950", 6, 64, 64, 512, 2, torch.float32),
+        ("gfx942", 4, 128, 128, 512, 2, torch.float32),
+        ("gfx942", 9, 128, 128, 512, 2, torch.bfloat16),
+        ("gfx1250", 0, 16, 32, 512, 2, torch.bfloat16),
+        ("gfx1250", 0, 16, 32, 512, 2, torch.float32),
     ],
 )
 def test_split_k_matches_torch_golden(arch, kid, M, N, K, split_k, out_dtype):
@@ -355,6 +355,7 @@ def test_split_k_matches_torch_golden(arch, kid, M, N, K, split_k, out_dtype):
         A,
         B,
         Y,
+        family="a16w16",
         kid=kid,
         split_k=split_k,
     )
@@ -370,7 +371,7 @@ def test_gfx942_short_k_auto_split_matches_torch(workspace_splits):
     A = torch.randn((1, 128), device="cuda", dtype=torch.bfloat16)
     B = torch.randn((64, 128), device="cuda", dtype=torch.bfloat16)
     Y = torch.empty((1, 64), device="cuda", dtype=torch.bfloat16)
-    # kid 10201 uses FP32 workspace with 64x64 tiles. The short K launches
+    # kid 5 uses FP32 workspace with 64x64 tiles. The short K launches
     # one split; a caller may provide either one slice or a larger workspace.
     workspace = (
         None
@@ -379,12 +380,12 @@ def test_gfx942_short_k_auto_split_matches_torch(workspace_splits):
             (workspace_splits, 1, 64, 64), device="cuda", dtype=torch.float32
         )
     )
-    actual = opus_gemm(A, B, Y, kid=10201, split_k=0, workspace=workspace)
+    actual = opus_gemm(A, B, Y, family="a16w16", kid=5, split_k=0, workspace=workspace)
     torch.cuda.synchronize()
     _assert_matches_golden(actual, A, B)
 
 
-@pytest.mark.parametrize("kid", (1400, 6400))
+@pytest.mark.parametrize("kid", (92, 135))
 def test_gfx950_mono_fp32_overwrites_poisoned_output(kid):
     """Regress the ordinary and 4G-safe mono FP32 physical-store paths."""
     if _runtime_arch() != "gfx950":
@@ -399,6 +400,7 @@ def test_gfx950_mono_fp32_overwrites_poisoned_output(kid):
         A,
         B,
         out,
+        family="a16w16",
         kid=kid,
     )
     torch.cuda.synchronize()
@@ -419,7 +421,8 @@ def test_gfx950_bias_dtype_rules_and_numerics():
         A,
         B,
         Y,
-        kid=200,
+        family="a16w16",
+        kid=6,
         bias=bias,
         split_k=2,
     )
@@ -431,7 +434,8 @@ def test_gfx950_bias_dtype_rules_and_numerics():
             A,
             B,
             Y,
-            kid=200,
+            family="a16w16",
+            kid=6,
             bias=bias.float(),
             split_k=2,
         )
@@ -450,7 +454,8 @@ def test_gfx942_workspace_kid_rejects_bias_without_framework_fallback():
             A,
             B,
             Y,
-            kid=10201,
+            family="a16w16",
+            kid=5,
             bias=bias,
             split_k=2,
         )
@@ -467,7 +472,8 @@ def test_gfx1250_bf16_output_accepts_fp32_bias():
         A,
         B,
         Y,
-        kid=20000,
+        family="a16w16",
+        kid=0,
         bias=bias,
         split_k=2,
     )
@@ -478,10 +484,10 @@ def test_gfx1250_bf16_output_accepts_fp32_bias():
 @pytest.mark.parametrize(
     ("arch", "kid", "K", "split_k", "launch_split_k", "expected_shape"),
     (
-        ("gfx942", 10201, 128, 0, 1, (1, 1, 64, 64)),
-        ("gfx942", 10201, 128, 16, 1, (1, 1, 64, 64)),
-        ("gfx942", 10201, 512, 0, 4, (4, 1, 64, 64)),
-        ("gfx1250", 20000, 128, 2, 1, None),
+        ("gfx942", 5, 128, 0, 1, (1, 1, 64, 64)),
+        ("gfx942", 5, 128, 16, 1, (1, 1, 64, 64)),
+        ("gfx942", 5, 512, 0, 4, (4, 1, 64, 64)),
+        ("gfx1250", 0, 128, 2, 1, None),
     ),
 )
 def test_a16w16_split_k_plan_converges_before_workspace(
@@ -509,13 +515,14 @@ def test_a16w16_split_k_plan_converges_before_workspace(
 def test_gfx942_workspace_allocation_and_launch_split_k(
     monkeypatch, K, caller_splits, allocated_splits, launch_split_k
 ):
-    from aiter.ops.opus import gemm_op_a16w16
+    from aiter.ops.opus import dispatch, gemm_op_a16w16
 
     calls = []
 
     def capture(_A, _B, _Y, _bias, workspace, kid, split_k):
         calls.append((workspace, kid, split_k))
 
+    monkeypatch.setattr(dispatch, "_device_arch_and_cu", lambda _: ("gfx942", 80))
     monkeypatch.setattr(gemm_op_a16w16, "_device_arch_and_cu", lambda _: ("gfx942", 80))
     monkeypatch.setattr(gemm_op_a16w16, "_opus_gemm_a16w16_launch_raw", capture)
     A = torch.empty((1, K), device="meta", dtype=torch.bfloat16)
@@ -527,10 +534,12 @@ def test_gfx942_workspace_allocation_and_launch_split_k(
         else torch.empty((caller_splits, 1, 64, 64), device="meta", dtype=torch.float32)
     )
 
-    assert opus_gemm(A, B, Y, kid=10201, split_k=0, workspace=workspace) is Y
+    assert (
+        opus_gemm(A, B, Y, family="a16w16", kid=5, split_k=0, workspace=workspace) is Y
+    )
     assert len(calls) == 1
     actual_workspace, actual_kid, actual_split_k = calls[0]
-    assert (actual_kid, actual_split_k) == (10201, launch_split_k)
+    assert (actual_kid, actual_split_k) == (5, launch_split_k)
     assert actual_workspace.shape == (allocated_splits, 1, 64, 64)
     assert actual_workspace.dtype == torch.float32
     if workspace is not None:
@@ -540,9 +549,9 @@ def test_gfx942_workspace_allocation_and_launch_split_k(
 @pytest.mark.parametrize(
     ("arch", "kid", "K", "split_k", "error"),
     (
-        ("gfx942", 10201, 64, 0, "too small for gfx942"),
-        ("gfx942", 10201, 192, 0, "needs even loops per split"),
-        ("gfx950", 200, 128, 3, "too small for gfx950"),
+        ("gfx942", 5, 64, 0, "too small for gfx942"),
+        ("gfx942", 5, 192, 0, "needs even loops per split"),
+        ("gfx950", 6, 128, 3, "too small for gfx950"),
     ),
 )
 def test_a16w16_launch_plan_preserves_split_k_limits(arch, kid, K, split_k, error):
@@ -587,7 +596,7 @@ def test_global_a16_stale_opus_row_keeps_framework_fallback(monkeypatch):
         False,
         False,
     )
-    row = {"libtype": "opus", "solidx": 200, "splitK": 2, "kernelName": ""}
+    row = {"libtype": "opus", "solidx": 999999, "splitK": 2, "kernelName": ""}
     monkeypatch.setattr(tuned, "get_GEMM_A16W16_config_", lambda: {key: row})
     monkeypatch.setattr(tuned, "get_gfx", lambda: "gfx942")
     monkeypatch.setattr(tuned, "get_cu_num", lambda: 304)
@@ -619,7 +628,7 @@ def test_global_a16_stale_opus_row_keeps_framework_fallback(monkeypatch):
         if message.startswith("Ignoring invalid OPUS tuned row")
     ]
     assert len(stale_warnings) == 1
-    assert "kid=200, splitK=2" in stale_warnings[0]
+    assert "kid=999999, splitK=2" in stale_warnings[0]
 
 
 def _capture_shape_driven_opus_launch(monkeypatch, *, arch, tuned_config):
@@ -638,7 +647,7 @@ def _capture_shape_driven_opus_launch(monkeypatch, *, arch, tuned_config):
     monkeypatch.setattr(
         gemm_op_a16w16,
         "_device_arch_and_cu",
-        lambda _device: (arch, {"gfx950": 256, "gfx942": 304, "gfx1250": 80}[arch]),
+        lambda _device: (arch, {"gfx950": 256, "gfx942": 304, "gfx1250": 256}[arch]),
     )
     monkeypatch.setattr(
         policy,
@@ -657,7 +666,7 @@ def _a16_policy_args(arch, M, N, K):
         "N": N,
         "K": K,
         "batch": 1,
-        "cu_num": {"gfx950": 256, "gfx942": 304, "gfx1250": 80}[arch],
+        "cu_num": {"gfx950": 256, "gfx942": 304, "gfx1250": 256}[arch],
         "has_bias": False,
         "input_dtype": torch.bfloat16,
         "output_dtype": torch.bfloat16,
@@ -693,7 +702,7 @@ def test_a16w16_policy_loader_bad_csv_is_a_miss(monkeypatch, case):
     def read_csv(_path):
         if case in errors:
             raise errors[case]
-        return pd.DataFrame({"libtype": ["opus"], "solidx": [200]})
+        return pd.DataFrame({"libtype": ["opus"], "solidx": [6]})
 
     policy = _mock_a16w16_policy_csv(monkeypatch, read_csv)
     monkeypatch.setattr(
@@ -734,18 +743,16 @@ def test_a16w16_policy_loader_skips_malformed_kid_and_splitk_rows(monkeypatch):
     )
     rows = [
         (*key, "opus", "not-a-kid", 2, 1.0),
-        (*key, "opus", 200, "not-a-split", 1.5),
-        (*key, "opus", 200, -1, 1.75),
-        (*key, "opus", "200", "2", 2.0),
+        (*key, "opus", 6, "not-a-split", 1.5),
+        (*key, "opus", 6, -1, 1.75),
+        (*key, "opus", "6", "2", 2.0),
     ]
     policy = _mock_a16w16_policy_csv(
         monkeypatch, lambda _path: pd.DataFrame(rows, columns=columns)
     )
     try:
         configs = policy._load_a16w16_opus_tuned()
-        assert [(row["solidx"], row["splitK"]) for row in configs.values()] == [
-            (200, 2)
-        ]
+        assert [(row["solidx"], row["splitK"]) for row in configs.values()] == [(6, 2)]
     finally:
         policy._load_a16w16_opus_tuned.cache_clear()
 
@@ -762,9 +769,9 @@ def test_shape_driven_opus_selection_and_rank_route(monkeypatch):
     B = torch.empty((64, 512), device="meta", dtype=torch.bfloat16)
 
     opus.gemm_a16w16_opus(A, B)
-    tuned[0] = {"solidx": 200, "splitK": 2}
+    tuned[0] = {"solidx": 6, "splitK": 2}
     opus.gemm_a16w16_opus(A, B)
-    opus.gemm_a16w16_opus(A, B, kernelId=206, splitK=3)
+    opus.gemm_a16w16_opus(A, B, kernelId=12, splitK=3)
     tuned[0] = None
     opus.gemm_a16w16_opus(
         A.unsqueeze(0).expand(2, -1, -1).contiguous(),
@@ -772,10 +779,10 @@ def test_shape_driven_opus_selection_and_rank_route(monkeypatch):
     )
 
     assert [(op, args["kid"], args["split_k"]) for op, *_, args in calls] == [
-        ("gemm", 1200, 0),
-        ("gemm", 200, 2),
-        ("gemm", 206, 3),
-        ("bmm", 1200, 0),
+        ("gemm", 52, 0),
+        ("gemm", 6, 2),
+        ("gemm", 12, 3),
+        ("bmm", 52, 0),
     ]
     tuned[0] = {"solidx": -1, "splitK": 0}
     warnings = []
@@ -788,14 +795,14 @@ def test_shape_driven_opus_selection_and_rank_route(monkeypatch):
         gemm_op_a16w16._warn_invalid_a16w16_tuned_row.cache_clear()
 
     assert [(op, args["kid"], args["split_k"]) for op, *_, args in calls[-2:]] == [
-        ("gemm", 1200, 0),
-        ("gemm", 1200, 0),
+        ("gemm", 52, 0),
+        ("gemm", 52, 0),
     ]
     assert len(warnings) == 1
     assert "kid=-1, splitK=0" in warnings[0]
 
 
-@pytest.mark.parametrize("kid", (10210, 10213, 10216))
+@pytest.mark.parametrize("kid", (9, 10, 11))
 def test_gfx942_exact_plan_rejects_non_exact_n_bf16_workspace_kid(kid):
     with pytest.raises(ValueError, match=rf"gfx942 exact kid {kid} requires N"):
         _get_cached_a16w16_launch_plan(
@@ -815,7 +822,7 @@ def test_gfx942_exact_plan_rejects_non_exact_n_bf16_workspace_kid(kid):
 
 @pytest.mark.parametrize(
     ("selection", "requested_kid", "resolved_kid"),
-    (("explicit", 10210, 10200), ("tuned", 10213, 10203)),
+    (("explicit", 9, 4), ("tuned", 10, 6)),
 )
 def test_gfx942_compat_redirects_non_exact_n_bf16_workspace_kid(
     monkeypatch, selection, requested_kid, resolved_kid
@@ -851,8 +858,8 @@ def test_gfx942_compat_rejects_non_exact_n_bf16_workspace_kid_without_sibling(
     A = torch.empty((256, 4096), device="meta", dtype=torch.bfloat16)
     B = torch.empty((1000, 4096), device="meta", dtype=torch.bfloat16)
 
-    with pytest.raises(ValueError, match="gfx942 exact kid 10216 requires N"):
-        gemm_op_a16w16.gemm_a16w16_opus(A, B, kernelId=10216, splitK=2)
+    with pytest.raises(ValueError, match="gfx942 exact kid 11 requires N"):
+        gemm_op_a16w16.gemm_a16w16_opus(A, B, kernelId=11, splitK=2)
 
 
 def test_legacy_a16w16_tune_routes_to_family_executor(monkeypatch):
@@ -880,17 +887,17 @@ def test_legacy_a16w16_tune_routes_to_family_executor(monkeypatch):
     WQ = torch.empty((1, 32, 16), device="meta", dtype=torch.bfloat16)
     Y = torch.empty((1, 8, 32), device="meta", dtype=torch.bfloat16)
 
-    assert gemm_op_a16w16.opus_gemm_a16w16_tune(XQ, WQ, Y, 206, 3) is Y
-    assert gemm_op_a16w16.opus_gemm_a16w16_tune(XQ, WQ, Y, 207, splitK=4) is Y
+    assert gemm_op_a16w16.opus_gemm_a16w16_tune(XQ, WQ, Y, 12, 3) is Y
+    assert gemm_op_a16w16.opus_gemm_a16w16_tune(XQ, WQ, Y, 13, splitK=4) is Y
     with pytest.warns(DeprecationWarning, match="has moved"):
-        assert deepgemm.opus_gemm_a16w16_tune(XQ, WQ, Y, 208, 5) is Y
+        assert deepgemm.opus_gemm_a16w16_tune(XQ, WQ, Y, 14, 5) is Y
     assert [
         (tuple(xq.shape), tuple(wq.shape), tuple(y.shape), bias, kwargs)
         for xq, wq, y, bias, kwargs in calls
     ] == [
-        ((1, 8, 16), (1, 32, 16), (1, 8, 32), None, {"kid": 206, "split_k": 3}),
-        ((1, 8, 16), (1, 32, 16), (1, 8, 32), None, {"kid": 207, "split_k": 4}),
-        ((1, 8, 16), (1, 32, 16), (1, 8, 32), None, {"kid": 208, "split_k": 5}),
+        ((1, 8, 16), (1, 32, 16), (1, 8, 32), None, {"kid": 12, "split_k": 3}),
+        ((1, 8, 16), (1, 32, 16), (1, 8, 32), None, {"kid": 13, "split_k": 4}),
+        ((1, 8, 16), (1, 32, 16), (1, 8, 32), None, {"kid": 14, "split_k": 5}),
     ]
 
 
@@ -909,7 +916,7 @@ def test_gfx950_heuristic_does_not_try_secondary_kids(monkeypatch):
     monkeypatch.setattr(
         policy,
         "select_a16w16_heuristic_kid",
-        lambda **_kwargs: 1200,
+        lambda **_kwargs: 52,
     )
 
     def reject_candidate(**kwargs):
@@ -921,7 +928,7 @@ def test_gfx950_heuristic_does_not_try_secondary_kids(monkeypatch):
     )
 
     assert plan is None
-    assert attempted == [1200]
+    assert attempted == [52]
 
 
 if __name__ == "__main__":

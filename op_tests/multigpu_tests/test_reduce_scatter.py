@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
 import logging
@@ -46,7 +46,7 @@ def barrier_before_teardown():
 def _build_input(shape, dtype, tp_size, rand_seed):
     """Deterministic per-rank input: rand_seed[i] repeats over a chunk so
     each rank ends up with an identical tensor of shape `shape`. With all
-    ranks having identical input, sum_across_ranks = tp_size * input — that
+    ranks having identical input, sum_across_ranks = tp_size * input -- that
     gives us an analytic reference for any scatter dim (see _ref_output)."""
     n = 1
     for s in shape:
@@ -111,7 +111,7 @@ def reduce_scatter_sweep(
     returned rather than asserted here: every rank must walk the full case
     list so the collectives stay aligned across ranks.
 
-    force_fallback: set AITER_CUSTOM_AR_MAX_SIZE=0 so the custom kernel is
+    force_fallback: set AITER_CUSTOM_RS_MAX_SIZE=0 so the custom kernel is
     disabled and every reduce_scatter takes the pynccl fallback path in
     CudaCommunicator.reduce_scatter. This exercises the non-zero-dim fallback
     that used to mis-lay-out its result (movedim direction + discarded
@@ -120,7 +120,7 @@ def reduce_scatter_sweep(
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
     if force_fallback:
-        os.environ["AITER_CUSTOM_AR_MAX_SIZE"] = "0"
+        os.environ["AITER_CUSTOM_RS_MAX_SIZE"] = "0"
     logger.info(f"RANK: {rankID} {tp_size} init_process_group...")
     set_custom_all_reduce(True)
     init_distributed_environment(
@@ -156,7 +156,7 @@ def run_suite(cases, dtype, tp_size, force_fallback=False):
     force_fallback routes every reduce_scatter through the pynccl fallback
     (custom AR disabled) instead of the custom kernel.
 
-    No external-library comparison — other libs (torch.distributed /
+    No external-library comparison -- other libs (torch.distributed /
     pynccl) don't support scatter on non-zero dims, so latency-vs-them
     isn't meaningful for the new kernels."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -201,11 +201,11 @@ def build_cases(tp_size, dtype):
     last dimension with pack_size.
 
     Kernel branches:
-      first_dim_vec  : numel % (ngpus * pack_size) == 0  → split_first_dim
-      last_dim_vec   : last % (ngpus * pack_size) == 0   → split_lastdim (vec)
-      last_dim_naive : last % ngpus == 0 but % pack != 0 → split_lastdim_naive
-      mid_dim_vec    : k % pack_size == 0                → split_middim (vec)
-      mid_dim_naive  : k % pack_size != 0                → split_middim_naive
+      first_dim_vec  : numel % (ngpus * pack_size) == 0  -> split_first_dim
+      last_dim_vec   : last % (ngpus * pack_size) == 0   -> split_lastdim (vec)
+      last_dim_naive : last % ngpus == 0 but % pack != 0 -> split_lastdim_naive
+      mid_dim_vec    : k % pack_size == 0                -> split_middim (vec)
+      mid_dim_naive  : k % pack_size != 0                -> split_middim_naive
     """
     pack_size = 16 // dtype.itemsize
 

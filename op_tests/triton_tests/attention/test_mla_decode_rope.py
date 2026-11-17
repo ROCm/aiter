@@ -85,7 +85,11 @@ def input_helper(
 def ref_preprocess(kv_cache, kv_lora_rank):
     latent_cache = kv_cache
     v_input = latent_cache[..., :kv_lora_rank]
-    v_input = v_input.contiguous().unsqueeze(1)
+    # .contiguous() is a no-op (returns the same storage) when a leading dim has
+    # size 1, since PyTorch ignores strides on size-1 dims when checking
+    # contiguity. That aliases v_input with latent_cache, which then breaks the
+    # in-place write into k_input below. clone() always allocates fresh memory.
+    v_input = v_input.clone(memory_format=torch.contiguous_format).unsqueeze(1)
     k_input = latent_cache.unsqueeze(1)
     k_input[..., :kv_lora_rank] = v_input
     return k_input, v_input
@@ -247,7 +251,7 @@ def ref_compute_full_fwd(
 
 def get_config(dtype: torch.dtype):
     # _get_config() returns the shared cached dict and the launch helpers
-    # write derived fields into its sub-configs — work on a copy.
+    # write derived fields into its sub-configs -- work on a copy.
     config: dict[str, Any] = copy.deepcopy(_get_config())
     base_config_key: str = "fwd_grouped_kernel_stage1_rope"
     fp32_config_key: str = f"{base_config_key}_fp32"

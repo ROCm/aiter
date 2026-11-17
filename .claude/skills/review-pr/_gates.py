@@ -24,15 +24,15 @@ else:
         check=False,
     ).stdout.strip()
 
-print(f"======== SEVEN GATES ({W}) ========")
+print(f"======== EIGHT GATES ({W}) ========")
 res = _lib.run_gates(W, PROJ)
 npass = 0
 for name, rc, first, full in res:
     if rc == 0:
         npass += 1
-        print(f"  ✅ {name:<12} {first}")
+        print(f"  ? {name:<12} {first}")
     else:
-        print(f"  ❌ {name:<12} exit={rc}")
+        print(f"  ? {name:<12} exit={rc}")
         for l in full.split("\n"):
             print(f"       {l}")
 nfail = len(res) - npass

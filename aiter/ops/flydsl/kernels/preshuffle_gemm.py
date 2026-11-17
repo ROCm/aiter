@@ -21,17 +21,18 @@ from flydsl.expr.typing import (
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
+from .kernels_common import set_slp_vectorize_once_used
 from .mfma_preshuffle_pipeline import xcd_remap_bx_by
 from .splitk_epilogue import CPOL_COHERENT, splitk_reduce_epilogue
 
 # (dsrd_preload, dvmem_preload) per (tile_m, tile_n, tile_k).
 _TILE_PRELOAD_TABLE = {
-    # ── 2-wave tile_n = 32 ──
+    # -- 2-wave tile_n = 32 --
     (16, 32, 512): (4, 4),
     (16, 32, 1024): (4, 4),
     (32, 32, 512): (4, 4),
     (32, 32, 1024): (4, 4),
-    # ── tile_m = 16 ──
+    # -- tile_m = 16 --
     (16, 64, 256): (2, 2),
     (16, 64, 512): (4, 4),
     (16, 128, 256): (2, 2),
@@ -40,7 +41,7 @@ _TILE_PRELOAD_TABLE = {
     (16, 256, 256): (2, 2),
     (16, 256, 512): (2, 2),
     (16, 512, 256): (2, 2),
-    # ── tile_m = 32 ──
+    # -- tile_m = 32 --
     (32, 64, 128): (6, 6),
     (32, 64, 256): (6, 6),
     (32, 64, 512): (2, 2),
@@ -50,13 +51,13 @@ _TILE_PRELOAD_TABLE = {
     (32, 192, 256): (6, 6),
     (32, 256, 128): (6, 6),
     (32, 256, 256): (6, 6),
-    # ── tile_m = 48 ──
+    # -- tile_m = 48 --
     (48, 64, 128): (8, 8),
     (48, 64, 256): (2, 2),
     (48, 128, 256): (6, 6),
     (48, 192, 256): (6, 6),
     (48, 256, 256): (6, 6),
-    # ── tile_m = 64 ──
+    # -- tile_m = 64 --
     (64, 64, 128): (4, 4),
     (64, 64, 256): (4, 4),
     (64, 128, 128): (8, 8),
@@ -66,12 +67,12 @@ _TILE_PRELOAD_TABLE = {
     (64, 256, 64): (8, 8),
     (64, 256, 128): (8, 8),
     (64, 256, 256): (8, 8),
-    # ── tile_m = 80 ──
+    # -- tile_m = 80 --
     (80, 64, 256): (4, 4),
     (80, 128, 256): (8, 8),
     (80, 192, 256): (8, 8),
     (80, 256, 256): (8, 8),
-    # ── tile_m = 96 ──
+    # -- tile_m = 96 --
     (96, 64, 128): (6, 6),
     (96, 64, 256): (6, 6),
     (96, 128, 128): (8, 8),
@@ -80,12 +81,12 @@ _TILE_PRELOAD_TABLE = {
     (96, 192, 256): (8, 8),
     (96, 256, 128): (8, 8),
     (96, 256, 256): (8, 8),
-    # ── tile_m = 112 ──
+    # -- tile_m = 112 --
     (112, 64, 256): (8, 8),
     (112, 128, 256): (4, 4),
     (112, 192, 256): (8, 8),
     (112, 256, 256): (8, 8),
-    # ── tile_m = 128 ──
+    # -- tile_m = 128 --
     (128, 64, 128): (6, 6),
     (128, 64, 256): (8, 8),
     (128, 128, 64): (4, 4),
@@ -95,16 +96,16 @@ _TILE_PRELOAD_TABLE = {
     (128, 192, 256): (8, 8),
     (128, 256, 128): (6, 6),
     (128, 256, 256): (4, 4),
-    # ── tile_m = 160 ──
+    # -- tile_m = 160 --
     (160, 192, 128): (8, 8),
-    # ── tile_m = 192 ──
+    # -- tile_m = 192 --
     (192, 64, 128): (6, 6),
     (192, 128, 128): (6, 6),
-    # ── tile_m = 224 ──
+    # -- tile_m = 224 --
     (224, 64, 128): (4, 4),
     (224, 128, 128): (6, 6),
     (224, 192, 128): (6, 6),
-    # ── tile_m = 256 ──
+    # -- tile_m = 256 --
     (256, 64, 128): (4, 4),
     (256, 128, 128): (6, 6),
     (256, 192, 128): (6, 6),
@@ -243,7 +244,7 @@ def compile_preshuffle_gemm(
         if split_k > 1:
             split_flag: fx.Array[Int32, 1, 4]
 
-    # ── Kernel ────────────────────────────────────────────────────────
+    # -- Kernel --------------------------------------------------------
     @flyc.kernel
     def kernel_gemm(
         arg_c: fx.Tensor,
@@ -370,7 +371,7 @@ def compile_preshuffle_gemm(
         pA_s2r_stages = [thr_s2r.partition_S(s) for s in sA_stages]
         pB_g = thr_g2r_B.partition_S(tB)
 
-        # Fragments — 2 separate B fragments (split double buffer for VGPR lifetime)
+        # Fragments -- 2 separate B fragments (split double buffer for VGPR lifetime)
         frag_copy_A = fx.make_fragment_like(pA_s_stages[0][None, None, None])
         frag_A = thr_mma.make_fragment_A(sA_stages[0])
         frag_B_single_layout = thr_mma.partition_B(tB).layout(None, None, None, 0)
@@ -389,7 +390,7 @@ def compile_preshuffle_gemm(
         frag_C_out = fx.make_fragment_like(frag_C, out_elem_cls.ir_type)
         frag_C_retile = thr_r2g_C.retile(frag_C_out)
 
-        # ── Async gmem->LDS DMA (buffer_load_lds) for the A tile ──
+        # -- Async gmem->LDS DMA (buffer_load_lds) for the A tile --
         if const_expr(use_async_copy):
             dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
             # Bound to the real M extent (like the sync gA) so ragged-M blocks DMA-read
@@ -433,7 +434,7 @@ def compile_preshuffle_gemm(
                     src = fx.slice(gA_div, (None, fx.Int32(gmem_byte)))
                     fx.copy(dma_atom, src, dst)
 
-        # ── Scheduling hints (ported from old pipeline) ───────────
+        # -- Scheduling hints (ported from old pipeline) -----------
         def build_scheduler(numer: int, denom: int):
             if const_expr(denom <= 0):
                 return []
@@ -550,7 +551,7 @@ def compile_preshuffle_gemm(
 
             rocdl.sched_barrier(0)
 
-        # ── Pipeline stage (double-buffered B via split fragments) ─
+        # -- Pipeline stage (double-buffered B via split fragments) -
         def mma_kloop(a_stage, cur_frag_B):
             for ki in range_constexpr(k_iters):
                 fx.copy(
@@ -604,7 +605,7 @@ def compile_preshuffle_gemm(
             if const_expr(do_next):
                 gpu.barrier()
 
-        # ── Prologue ──────────────────────────────────────────────
+        # -- Prologue ----------------------------------------------
         acc_zero = (
             fx.full(acc_size, 0, Int32)
             if const_expr(is_int8)
@@ -624,7 +625,7 @@ def compile_preshuffle_gemm(
             gpu.barrier()
         rocdl.sched_barrier(0)
 
-        # ── Main tile loop ────────────────────────────────────────────
+        # -- Main tile loop --------------------------------------------
         if const_expr(lds_stage == 1 and num_tiles > 1):
             frag_Bc = frag_B_stages[0]
             frag_Bc_retile = frag_B_retile_stages[0]
@@ -678,7 +679,7 @@ def compile_preshuffle_gemm(
                     read_stage=(k_tail0 + j) % 2, next_k_val=fx.Int32(k_tail0 + j + 1)
                 )
 
-        # ── Epilogue-operand preloads (scale_a / scale_b / bias) ─────────
+        # -- Epilogue-operand preloads (scale_a / scale_b / bias) ---------
         bx_m = bid_x * tile_m
         by_n = bid_y * tile_n
         wave_id = gpu.thread_id("x") // 64
@@ -703,7 +704,7 @@ def compile_preshuffle_gemm(
         def load_epi_operands():
             s_a = s_b = bias = None
             if const_expr(is_8bit):
-                # Per-row(scale_a) × per-col(scale_b) scaling, applied in the epilogue.
+                # Per-row(scale_a) x per-col(scale_b) scaling, applied in the epilogue.
                 if const_expr(n_ragged):
                     sb_tiles = _epi_tiles(
                         arg_scale_b,
@@ -772,13 +773,13 @@ def compile_preshuffle_gemm(
         if const_expr(overlap_epi_load):
             s_a_vals, s_b_vals, bias_vals = load_epi_operands()
 
-        # Final MMA stage — overlaps the epilogue-operand loads when issued above.
+        # Final MMA stage -- overlaps the epilogue-operand loads when issued above.
         if const_expr(lds_stage == 1):
             mma_kloop(0, frag_B_stages[0])
         else:
             pipeline_2stage(read_stage=(num_tiles - 1) % 2, read_next=False)
 
-        # ── Epilogue ─────────────────────────────────────────────
+        # -- Epilogue ---------------------------------------------
         if const_expr(not is_8bit and not _has_epilogue):
             frag_C_out.store(Vec(frag_C.load()).to(out_elem_cls))
         else:
@@ -897,7 +898,7 @@ def compile_preshuffle_gemm(
                 split_k,
             )
 
-    # ── Host launcher ─────────────────────────────────────────────
+    # -- Host launcher ---------------------------------------------
     @flyc.jit
     def launch_gemm(
         arg_c: fx.Tensor,
@@ -914,7 +915,7 @@ def compile_preshuffle_gemm(
     ):
         CompilationContext.get_current()
 
-        # MMA atom — layout_elem carries the dtype (Float16/BFloat16/Float8E4M3FN/etc)
+        # MMA atom -- layout_elem carries the dtype (Float16/BFloat16/Float8E4M3FN/etc)
         if const_expr(use_mfma_k32):
             mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, layout_elem))
             k_perm = fx.make_layout((8, 4), (1, 8))
@@ -1011,4 +1012,6 @@ def compile_preshuffle_gemm(
     if const_expr(is_f16_or_bf16 and num_acc_n <= 2):
         launch_gemm.compile_hints["llvm_options"] = {"enable-post-misched": False}
 
+    # After the f16 assignment above: that one replaces llvm_options outright.
+    set_slp_vectorize_once_used(launch_gemm, False)
     return launch_gemm

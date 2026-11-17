@@ -48,8 +48,10 @@ struct mha_bwd_args
     void* dk_ptr;
     void* dv_ptr;
     void* dbias_ptr;
-    const void* sink_ptr   = nullptr; // sink scores [batch, nhead] log-space (LSEDataType=float); nullptr disables sink
-    void*       d_sink_ptr = nullptr; // sink gradient accumulator [nhead] (LSEDataType=float); nullptr disables sink grad
+    const void* sink_ptr =
+        nullptr; // sink scores [batch, nhead] log-space (LSEDataType=float); nullptr disables sink
+    void* d_sink_ptr = nullptr; // sink gradient accumulator [nhead] (LSEDataType=float); nullptr
+                                // disables sink grad
     // Usage notes for sequence length pointer parameters:
     //
     // [Note: Define "Group mode" vs "Batch mode" here if possible, e.g., "Group mode handles
@@ -307,8 +309,8 @@ struct __attribute__((packed)) fmha_bwd_odo_args
 };
 
 // dq_shuffle & dq_convert post process kernel args
-// The head/batch strides are 64-bit because gfx1250 loads them as such; the other archs read the
-// low 32 bits.
+// The head/batch strides are 64-bit because gfx1250 loads them as such, and gfx950 the dq_acc
+// ones; the other archs read the low 32 bits.
 struct __attribute__((packed)) fmha_bwd_post_kernel_args
 {
     void* ptr_dq_acc;

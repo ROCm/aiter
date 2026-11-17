@@ -5,30 +5,29 @@
 #include "aiter_tensor.h"
 #include <cstdint>
 #include <optional>
+#include <string>
 
 namespace aiter {
 
 void rotate_activation_fp4quant(aiter_tensor_t& out,
-                                        aiter_tensor_t& scale,
-                                        const aiter_tensor_t& input,
-                                        int32_t group_size = 32,
-                                        bool shuffle_scale = true);
+                                aiter_tensor_t& scale,
+                                const aiter_tensor_t& input,
+                                int32_t group_size = 32,
+                                bool shuffle_scale = true);
 
-
-void rotate_activation(aiter_tensor_t& out,
-                       const aiter_tensor_t& input);
+void rotate_activation(aiter_tensor_t& out, const aiter_tensor_t& input);
 
 void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
-                                            aiter_tensor_t& scale,
-                                            const aiter_tensor_t& input,
-                                            const aiter_tensor_t& cos,
-                                            const aiter_tensor_t& sin,
-                                            const aiter_tensor_t& positions,
-                                            int32_t rope_dim,
-                                            int32_t group_size = 32,
-                                            bool shuffle_scale = true,
-                                            bool do_rotate_act = true,
-                                            bool round_rope    = false);
+                                     aiter_tensor_t& scale,
+                                     const aiter_tensor_t& input,
+                                     const aiter_tensor_t& cos,
+                                     const aiter_tensor_t& sin,
+                                     const aiter_tensor_t& positions,
+                                     int32_t rope_dim,
+                                     int32_t group_size              = 32,
+                                     const std::string& scale_layout = "none",
+                                     bool do_rotate_act              = true,
+                                     bool round_rope                 = false);
 
 // rope+hadamard, bf16/fp16 in-place (out shares dtype/stride with input).
 void rope_rotate_activation(aiter_tensor_t& out,
@@ -63,8 +62,8 @@ void rmsnorm_rope_rotate_activation_fp4quant_kvcache(aiter_tensor_t& kvcache,
                                                      float epsilon,
                                                      int32_t rope_dim,
                                                      int32_t kv_block_size = 16,
-                                                     int32_t group_size = 32,
-                                                     bool shuffle_scale = true,
-                                                     bool do_rotate_act = false);
+                                                     int32_t group_size    = 32,
+                                                     bool shuffle_scale    = true,
+                                                     bool do_rotate_act    = false);
 
 } // namespace aiter

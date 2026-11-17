@@ -29,19 +29,20 @@ namespace aiter {
 // (the JIT-free int mirror used by FlyDSL AOT). The lazy loader in
 // ``mx_types.py::__getattr__`` asserts the int values match on first
 // pybind enum access.
-enum class MxScaleRoundMode : int {
+enum class MxScaleRoundMode : int
+{
     RoundDown = 0, // OCP / NV ROUND_DOWN / torchao FLOOR:
                    //   scale = floor_pow2(amax) / 2^target_max_pow2.
                    //   ~37% max clipping (FP4 default).
-    RoundUp   = 1, // NV / DSv4 Pro / FlashInfer / torchao RCEIL:
+    RoundUp = 1,   // NV / DSv4 Pro / FlashInfer / torchao RCEIL:
                    //   scale = ceil_pow2(amax / max_pos).
                    //   0% max clipping. (industry default)
-    Even      = 2, // Quark EVEN / torchao EVEN:
+    Even = 2,      // Quark EVEN / torchao EVEN:
                    //   scale = floor_pow2(round_pow2_special(amax)) /
                    //   2^target_max_pow2 with val_to_add =
                    //   1 << (23 - mbits - 1).
                    //   AMD Quark default for MXFP4/MXFP8.
-    Ceil      = 3, // torchao CEIL (no Quark / NV equivalent):
+    Ceil = 3,      // torchao CEIL (no Quark / NV equivalent):
                    //   scale = ceil_pow2(amax) / 2^target_max_pow2.
                    //   0% max clipping but coarser grid than RoundUp on
                    //   [2^k, 1.5*2^k).
@@ -60,7 +61,8 @@ constexpr MxScaleRoundMode kDefaultMxScaleRoundMode = MxScaleRoundMode::RoundUp;
 //                         exp_bias = 7, max_normal = 448.
 //   * ``FP8_E4M3_FNUZ`` = AMD gfx942 hardware FP8 (MI300 family).
 //                         exp_bias = 8, max_normal = 240.
-enum class MxDtype : int {
+enum class MxDtype : int
+{
     FP4_E2M1      = 0, // max_pos = 6.0,    target_max_pow2 = 2,  mbits = 1
     FP8_E4M3      = 1, // max_pos = 448.0,  target_max_pow2 = 8,  mbits = 3
     FP8_E4M3_FNUZ = 2, // max_pos = 240.0,  target_max_pow2 = 7,  mbits = 3
@@ -75,38 +77,54 @@ enum class MxDtype : int {
 //                      2^target_max_pow2).
 //   * mbits          : mantissa bits of the target dtype
 //                      (used by Even: val_to_add = 1 << (23 - mbits - 1)).
-template <MxDtype dtype> struct MxDtypeConfig;
+template <MxDtype dtype>
+struct MxDtypeConfig;
 
-template <> struct MxDtypeConfig<MxDtype::FP4_E2M1> {
-    static constexpr int      target_max_pow2 = 2;        // log2(4)
-    static constexpr float    max_pos         = 6.0f;
-    static constexpr float    inv_max_pos     = 1.0f / 6.0f;   // 0x3E2AAAAB
-    static constexpr float    inv_max_pow2    = 0.25f;         // 1/4
-    static constexpr int      mbits           = 1;
-    static constexpr uint32_t even_val_to_add = 0x00200000u;   // 1 << (23 - 1 - 1) = 1 << 21
+template <>
+struct MxDtypeConfig<MxDtype::FP4_E2M1>
+{
+    static constexpr int target_max_pow2      = 2; // log2(4)
+    static constexpr float max_pos            = 6.0f;
+    static constexpr float inv_max_pos        = 1.0f / 6.0f; // 0x3E2AAAAB
+    static constexpr float inv_max_pow2       = 0.25f;       // 1/4
+    static constexpr int mbits                = 1;
+    static constexpr uint32_t even_val_to_add = 0x00200000u; // 1 << (23 - 1 - 1) = 1 << 21
 };
 
-template <> struct MxDtypeConfig<MxDtype::FP8_E4M3> {
-    static constexpr int      target_max_pow2 = 8;              // log2(256), 256 <= 448
-    static constexpr float    max_pos         = 448.0f;
-    static constexpr float    inv_max_pos     = 1.0f / 448.0f;  // 0x3B124925
-    static constexpr float    inv_max_pow2    = 1.0f / 256.0f;  // 1/256 = 0x3B800000
-    static constexpr int      mbits           = 3;
-    static constexpr uint32_t even_val_to_add = 0x00080000u;    // 1 << (23 - 3 - 1) = 1 << 19
+template <>
+struct MxDtypeConfig<MxDtype::FP8_E4M3>
+{
+    static constexpr int target_max_pow2      = 8; // log2(256), 256 <= 448
+    static constexpr float max_pos            = 448.0f;
+    static constexpr float inv_max_pos        = 1.0f / 448.0f; // 0x3B124925
+    static constexpr float inv_max_pow2       = 1.0f / 256.0f; // 1/256 = 0x3B800000
+    static constexpr int mbits                = 3;
+    static constexpr uint32_t even_val_to_add = 0x00080000u; // 1 << (23 - 3 - 1) = 1 << 19
 };
 
 // AMD gfx942 hardware FP8 (e4m3fnuz): exp_bias = 8 (one bigger than the
 // OCP e4m3fn = 7), so max_normal = 240.0 (= 1.875 * 2^7) and the
 // largest pow-2 fitting under it is 128 = 2^7. Mantissa width is the
 // same 3 bits, so EVEN's val_to_add is identical to FP8_E4M3.
-template <> struct MxDtypeConfig<MxDtype::FP8_E4M3_FNUZ> {
-    static constexpr int      target_max_pow2 = 7;              // log2(128), 128 <= 240
-    static constexpr float    max_pos         = 240.0f;
-    static constexpr float    inv_max_pos     = 1.0f / 240.0f;  // 0x3B888889
-    static constexpr float    inv_max_pow2    = 1.0f / 128.0f;  // 1/128 = 0x3C000000
-    static constexpr int      mbits           = 3;
-    static constexpr uint32_t even_val_to_add = 0x00080000u;    // 1 << (23 - 3 - 1) = 1 << 19
+template <>
+struct MxDtypeConfig<MxDtype::FP8_E4M3_FNUZ>
+{
+    static constexpr int target_max_pow2      = 7; // log2(128), 128 <= 240
+    static constexpr float max_pos            = 240.0f;
+    static constexpr float inv_max_pos        = 1.0f / 240.0f; // 0x3B888889
+    static constexpr float inv_max_pow2       = 1.0f / 128.0f; // 1/128 = 0x3C000000
+    static constexpr int mbits                = 3;
+    static constexpr uint32_t even_val_to_add = 0x00080000u; // 1 << (23 - 3 - 1) = 1 << 19
 };
+
+// Biased exponent of ceil_pow2(|x|), with 0xFF (Inf/NaN) kept: adding the mantissa mask
+// carries into the exponent exactly when the mantissa is nonzero. Same result as
+// `e + (e < 0xFF && mantissa != 0)` for every input, without the compare pair.
+__device__ __forceinline__ uint32_t e8m0_ceil_exponent(uint32_t u32)
+{
+    const uint32_t exponent = ((u32 & 0x7FFFFFFFu) + 0x7FFFFFu) >> 23;
+    return exponent < 0xFFu ? exponent : 0xFFu;
+}
 
 // Generic E8M0 dequant scale computation.
 //
@@ -127,38 +145,31 @@ template <> struct MxDtypeConfig<MxDtype::FP8_E4M3_FNUZ> {
 //
 // NaN/Inf inputs preserve the f32 exponent (0xFF) which downstream consumers
 // interpret as E8M0 NaN.
-template <MxScaleRoundMode rmode = kDefaultMxScaleRoundMode,
-          MxDtype          dtype = MxDtype::FP4_E2M1>
+template <MxScaleRoundMode rmode = kDefaultMxScaleRoundMode, MxDtype dtype = MxDtype::FP4_E2M1>
 __device__ __forceinline__ float fp_f32_to_e8m0_scale(float amax)
 {
     using Cfg = MxDtypeConfig<dtype>;
 
-    if constexpr (rmode == MxScaleRoundMode::RoundUp)
+    if constexpr(rmode == MxScaleRoundMode::RoundUp)
     {
         // ceil_pow2(amax / max_pos): NV / DSv4 / FlashInfer / torchao RCEIL.
-        const uint32_t u32      = __builtin_bit_cast(uint32_t, amax * Cfg::inv_max_pos);
-        uint32_t       exponent = (u32 >> 23) & 0xFFu;
-        if(exponent < 0xFFu && (u32 & 0x7FFFFFu))
-            exponent += 1;
-        return __builtin_bit_cast(float, exponent << 23);
+        const uint32_t u32 = __builtin_bit_cast(uint32_t, amax * Cfg::inv_max_pos);
+        return __builtin_bit_cast(float, e8m0_ceil_exponent(u32) << 23);
     }
-    else if constexpr (rmode == MxScaleRoundMode::RoundDown)
+    else if constexpr(rmode == MxScaleRoundMode::RoundDown)
     {
         // floor_pow2(amax) / 2^target_max_pow2: OCP MX / torchao FLOOR.
         const uint32_t u32      = __builtin_bit_cast(uint32_t, amax * Cfg::inv_max_pow2);
         const uint32_t exponent = (u32 >> 23) & 0xFFu;
         return __builtin_bit_cast(float, exponent << 23);
     }
-    else if constexpr (rmode == MxScaleRoundMode::Ceil)
+    else if constexpr(rmode == MxScaleRoundMode::Ceil)
     {
         // ceil_pow2(amax) / 2^target_max_pow2: torchao CEIL.
-        const uint32_t u32      = __builtin_bit_cast(uint32_t, amax * Cfg::inv_max_pow2);
-        uint32_t       exponent = (u32 >> 23) & 0xFFu;
-        if(exponent < 0xFFu && (u32 & 0x7FFFFFu))
-            exponent += 1;
-        return __builtin_bit_cast(float, exponent << 23);
+        const uint32_t u32 = __builtin_bit_cast(uint32_t, amax * Cfg::inv_max_pow2);
+        return __builtin_bit_cast(float, e8m0_ceil_exponent(u32) << 23);
     }
-    else if constexpr (rmode == MxScaleRoundMode::Even)
+    else if constexpr(rmode == MxScaleRoundMode::Even)
     {
         // floor_pow2(round_pow2_special(amax)) / 2^target_max_pow2:
         // Quark EVEN / torchao EVEN. Add a half-step at the
@@ -178,9 +189,10 @@ __device__ __forceinline__ float fp_f32_to_e8m0_scale(float amax)
 // Block-scale result for an E8M0-quantised group: the stored 1-byte exponent plus
 // the f32 dequant scale (= 2^(byte-127)). Quantize data via ``* inv_scale()``;
 // store ``byte`` into the block-scale buffer.
-struct E8m0BlockScale {
+struct E8m0BlockScale
+{
     uint8_t byte;
-    float   dq_scale;
+    float dq_scale;
 
     // Reciprocal of the dequant scale. `v_rcp_f32` -- neither a true divide nor
     // an exponent flip:
@@ -199,22 +211,18 @@ struct E8m0BlockScale {
     // reciprocal is exactly representable and the hardware approximation lands
     // on it. Checked on gfx1250 against `1.0f / dq_scale` for all 256 bytes:
     // bit-identical except byte 254, where rcp flushes the subnormal to +0.
-    __device__ __forceinline__ float inv_scale() const
-    {
-        return __builtin_amdgcn_rcpf(dq_scale);
-    }
+    __device__ __forceinline__ float inv_scale() const { return __builtin_amdgcn_rcpf(dq_scale); }
 };
 
 // One-shot E8M0 block scale: computes BOTH the storage byte and the f32 dequant
 // scale from a group amax (same rounding as fp_f32_to_e8m0_scale). Saves callers
 // from re-deriving the exponent byte via ``(__float_as_uint(s) >> 23) & 0xFF``.
-template <MxScaleRoundMode rmode = kDefaultMxScaleRoundMode,
-          MxDtype          dtype = MxDtype::FP4_E2M1>
+template <MxScaleRoundMode rmode = kDefaultMxScaleRoundMode, MxDtype dtype = MxDtype::FP4_E2M1>
 __device__ __forceinline__ E8m0BlockScale fp_f32_to_e8m0_block_scale(float amax)
 {
     const float dq = fp_f32_to_e8m0_scale<rmode, dtype>(amax);
-    return E8m0BlockScale{
-        static_cast<uint8_t>((__builtin_bit_cast(uint32_t, dq) >> 23) & 0xFFu), dq};
+    return E8m0BlockScale{static_cast<uint8_t>((__builtin_bit_cast(uint32_t, dq) >> 23) & 0xFFu),
+                          dq};
 }
 
 // Default MXFP4 E8M0 scale helper: NV ROUND_UP / DSv4 / FlashInfer / torchao

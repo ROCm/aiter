@@ -6,12 +6,6 @@
 wave64 (gfx942/gfx950) and wave32 (gfx1250) in one file, dispatched by get_gfx().
 """
 
-# do NOT add `from __future__ import annotations`: PEP 563 stringifies
-# annotations, defeating flydsl's JitFunction._make_cache_key runtime detection
-# (is_runtime = hasattr(ann, "__get_c_pointers__")). Int32 params like
-# kv_in_row_stride / num_tokens would then be baked into the cache key per value,
-# forcing a fresh ~30-70ms JIT compile per batch size / KV stride.
-
 import math
 from functools import lru_cache
 
@@ -176,7 +170,7 @@ def _scalar_store(base_i64, idx, val, fx_dt, copy_bits):
 
 
 def _store_bf16_tiled(vals_list, p_dst, copy, vec):
-    """Convert VEC fp32 → bf16 and tiled-copy to ``p_dst``."""
+    """Convert VEC fp32 -> bf16 and tiled-copy to ``p_dst``."""
     f32v = fx.Vector.from_elements(vals_list, dtype=fx.Float32)
     bf16v = f32v.truncf(T.vec(vec, T.bf16))
     frag = fx.make_fragment_like(p_dst)
@@ -185,7 +179,7 @@ def _store_bf16_tiled(vals_list, p_dst, copy, vec):
 
 
 def _store_bf16_vec(vals, out_rsrc, row_base_bytes, idx, vec, cache_modifier=0):
-    """Convert VEC fp32 → bf16 dwords and raw buffer_store (split for VEC>8)."""
+    """Convert VEC fp32 -> bf16 dwords and raw buffer_store (split for VEC>8)."""
     if isinstance(vals, (list, tuple)):
         vals = fx.Vector.from_elements(vals, dtype=fx.Float32)
     bf16v = vals.to(fx.BFloat16)
@@ -226,7 +220,7 @@ def _store_bf16_vec(vals, out_rsrc, row_base_bytes, idx, vec, cache_modifier=0):
 def _store_fp8_packed_w64(
     vals_list, out_base_i64, row_base_bytes, idx, vec, *, skip_fnuz_clamp=False
 ):
-    """Pack VEC fp32 → fp8 and buffer-store 8 bytes (2 packed dwords) per thread."""
+    """Pack VEC fp32 -> fp8 and buffer-store 8 bytes (2 packed dwords) per thread."""
     i32 = T.i32
 
     if skip_fnuz_clamp:
@@ -256,7 +250,7 @@ def _store_fp8_packed_w64(
 def _store_fp8_packed_w32(
     vals_list, out_rsrc, row_base_bytes, idx, vec, *, skip_fnuz_clamp=False
 ):
-    """Pack VEC fp32 → fp8 and raw buffer_store (VEC in {8, 16})."""
+    """Pack VEC fp32 -> fp8 and raw buffer_store (VEC in {8, 16})."""
     i32 = T.i32
 
     if skip_fnuz_clamp:
@@ -1451,7 +1445,7 @@ def flydsl_qk_norm_rope_quant(
         raise ValueError("kv_write (swa_kv) is BF16 only; not supported with quant")
     from aiter.jit.utils.chip_info import get_gfx as _get_gfx
 
-    is_gfx1250 = _get_gfx() == "gfx1250"
+    is_gfx1250 = _get_gfx() in ("gfx1250", "gfx1250-strict")
 
     H = num_q_heads
     T_tok = q.shape[0]
@@ -2047,15 +2041,18 @@ def _build_kernel_w32_tdm(
 
             qw = _load_tensor_vec(q_weight, tid) if const_expr(q_weighted) else None
 
-            q_row0 = fx.Tensor(
-                fx.make_view(fx.get_iter(q_in), fx.make_layout((1, D), (D, 1)))
+            q_full = fx.Tensor(
+                fx.make_view(fx.get_iter(q_in), fx.make_layout((num_rows, D), (D, 1)))
             )
-            tdm_atom = fx.rocdl.make_tdm_atom(
-                q_row0,
-                [num_rows, None],
-                strides=[D, None],
+            q_tile = (1, D)
+            tdm_atom, q_coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                fx.rocdl.TensorLoad(),
+                q_full,
+                fx.make_layout(q_tile, (D, 1)),
+                q_tile,
                 num_warps=1,
             )
+            q_blk = fx.zipped_divide(q_coord, q_tile)[None, (None, 0)]
 
             def row_of(tile_idx):
                 return fx.min(tile_idx * RT + wave, nr_m1)
@@ -2064,15 +2061,13 @@ def _build_kernel_w32_tdm(
                 dst = fx.Tensor(
                     fx.make_view(
                         fx.inttoptr(lds_bf16_ptr_ty, lds_i32 + wave_lds_off + buf),
-                        fx.make_layout((1, D), (D, 1)),
+                        fx.make_layout((q_tile, 1), ((D, 1), D)),
                     )
                 )
-                fx.copy(
-                    tdm_atom,
-                    q_row0,
-                    dst,
-                    imm_offset=fx.Int64(row_of(tile_idx)) * (D * eb),
+                ts, tg = fx.rocdl.cdna5.tdm_partition(
+                    tdm_atom, 0, fx.make_layout(1, 1), dst, q_blk
                 )
+                fx.copy(tdm_atom, tg[None, row_of(tile_idx)], ts[None, 0])
 
             def compute_store(buf, tile_idx, cosv, sinv):
                 xv = _concat(

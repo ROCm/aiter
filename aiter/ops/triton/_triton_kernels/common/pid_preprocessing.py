@@ -7,7 +7,7 @@ import triton.language as tl
 
 @triton.jit
 def remap_xcd_chunked(
-    pid, GRID_MN, NUM_XCDS: tl.constexpr = 8, CHUNK_SIZE: tl.constexpr = 2
+    pid, GRID_MN, NUM_XCDS: tl.constexpr, CHUNK_SIZE: tl.constexpr = 2
 ):
     # Compute current XCD and local PID
     xcd = pid % NUM_XCDS
@@ -25,6 +25,8 @@ def remap_xcd_chunked(
 
 @triton.jit
 def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
+    # Legacy callers discard the result and rely on the default. Callers using
+    # the remapped PID must pass the device's XCD count.
     ## pid remapping on xcds
     # Number of pids per XCD in the new arrangement
     pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
@@ -107,7 +109,7 @@ def remap_workgroup_spatial(
     NUM_BLOCKS,
     BATCH,
     NUM_QUERIES_PER_KV: tl.constexpr,
-    NUM_XCDS: tl.constexpr = 8,
+    NUM_XCDS: tl.constexpr,
 ):
     """
     XCD-aware workgroup mapping for multi-head attention on AMD CDNA3/3.5 GPUs.
@@ -140,7 +142,7 @@ def remap_workgroup_spatial(
         NUM_BLOCKS        : number of sequence blocks along the Q dimension
         BATCH             : batch size
         NUM_QUERIES_PER_KV: Q heads per KV head (1 for MHA, >1 for GQA)
-        NUM_XCDS          : number of XCDs on the device (8 for MI3xx)
+        NUM_XCDS          : number of XCDs on the device
 
     Returns:
         off_q_head : Q head index for this workgroup
@@ -150,7 +152,7 @@ def remap_workgroup_spatial(
     xcd = wid % NUM_XCDS
     pos = wid // NUM_XCDS
 
-    # ── MHA path (spatial_mha) ────────────────────────────────────────────────
+    # -- MHA path (spatial_mha) ------------------------------------------------
     if NUM_QUERIES_PER_KV == 1:
         wgs_per_head = NUM_BLOCKS * BATCH
         local_head_idx = pos // wgs_per_head
@@ -165,7 +167,7 @@ def remap_workgroup_spatial(
             off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
         return off_q_head, start_m, off_z
 
-    # ── GQA path (spatial_gqa) ────────────────────────────────────────────────
+    # -- GQA path (spatial_gqa) ------------------------------------------------
     NUM_KV_HEADS: tl.constexpr = NUM_Q_HEADS // NUM_QUERIES_PER_KV
 
     if NUM_KV_HEADS >= NUM_XCDS:

@@ -53,7 +53,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 
 # fmt: off
 @gluon.jit
@@ -109,7 +109,7 @@ def _mla_gluon(
     HAS_ATTN_SINK: gl.constexpr,
 ):
     # Grid mapping: bh64 uses 3-D XCD-aware multi-batch; bh16bn64 and bh16bn128
-    # use 2-D (batch, split) — for batch_size=1 this is (1, NUM_KV_SPLITS).
+    # use 2-D (batch, split) -- for batch_size=1 this is (1, NUM_KV_SPLITS).
     # MTP: an extra q_pos axis carries the query position within QLEN. bh64 packs
     # it into grid axis 1 (after the head-block index); bh16 uses grid axis 2.
     # When QLEN==1, q_pos is always 0 and the layout below is identical to before.
@@ -141,7 +141,7 @@ def _mla_gluon(
         batch_page_start = gl.load(B_seq_len + cur_batch)
         cur_batch_seq_len = gl.load(B_seq_len + cur_batch + 1) - batch_page_start
 
-    # NUM_KV_SPLITS is a launch-time budget only. 
+    # NUM_KV_SPLITS is a launch-time budget only.
     # the partition is derived here from the runtime per-batch KV length.
     # kv_len_per_split = max(BLOCK_N, floor(seq / NUM_KV_SPLITS)):
     #   - the BLOCK_N floor keeps every split at >= 1 full block, so a short seq
@@ -837,7 +837,7 @@ def mla_gluon(
     has_pe=True,
     attn_sink=None,  # [nhead] fp32 per-head sink bias, None means no sink
 ):
-    """Unified Gluon MLA entry (gfx950 / CDNA4) — decode and DeepSeek V4 sparse prefill.
+    """Unified Gluon MLA entry (gfx950 / CDNA4) -- decode and DeepSeek V4 sparse prefill.
 
     `mla_gluon` supports the full decode (stage-1 + stage-2 reduce, or the stage-1-only
     fast path when NUM_KV_SPLITS==1) and writes the final attention into the
@@ -921,16 +921,21 @@ def mla_gluon(
     if REGIME == "bh64":
         BLOCK_H, BLOCK_N = 64, 64
         NUM_XCDS = get_num_xcds()
-        # Auto-pick NUM_KV_SPLITS so the launch fills ~256 workgroups (one wave on
-        # MI350). For the supported (batch, nhead) matrix the result is in {1, 2, 4}.
+        # Auto-pick NUM_KV_SPLITS so the launch fills about one wave of workgroups.
+        NUM_CUS = get_num_sms()
         base_grid = (
             NUM_XCDS * triton.cdiv(nhead, BLOCK_H) * qlen * (batch_size // NUM_XCDS)
         )
-        NUM_KV_SPLITS = max(1, triton.next_power_of_2(triton.cdiv(256, base_grid)))
+        NUM_KV_SPLITS = max(1, triton.next_power_of_2(triton.cdiv(NUM_CUS, base_grid)))
 
         assert (
             batch_size % 64 == 0
         ), f"mla_gluon[bh64] requires batch_size divisible by 64, got {batch_size}"
+        # cur_batch advances by NUM_XCDS; require complete batch groups.
+        assert batch_size % NUM_XCDS == 0, (
+            f"mla_gluon[bh64] requires batch_size divisible by the die count "
+            f"{NUM_XCDS}, got {batch_size}"
+        )
         # gl.assume(num_iter > 3) inside the kernel requires every split to have
         # > 3*BLOCK_N tokens. Smallest split (last) for batch length s is
         # s - (k-1)*ceil(s/k); a sufficient bound is min_kv_seq_len > k*(3*BLOCK_N + k).
@@ -949,12 +954,12 @@ def mla_gluon(
         BLOCK_N = 128 if REGIME == "bh16bn128" else 64
         kv_dtype = torch.float8_e4m3fn if REGIME == "bh16bn128" else torch.bfloat16
         NUM_XCDS = 1  # unused by 2-D split grid mapping
-        # Fixed ~256-WG launch budget, independent of sequence length so CUDA
+        # One-wave launch budget, independent of sequence length so CUDA
         # Graph capture cannot freeze it; the kernels derive the per-batch
         # partition from the runtime KV length. Head blocks and MTP qlen already
         # consume part of the wave, so the budget divides by them too.
         NUM_M_BLOCKS = triton.cdiv(nhead, BLOCK_H)
-        NUM_KV_SPLITS = max(1, 256 // (batch_size * qlen * NUM_M_BLOCKS))
+        NUM_KV_SPLITS = max(1, get_num_sms() // (batch_size * qlen * NUM_M_BLOCKS))
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
         ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"

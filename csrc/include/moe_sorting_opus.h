@@ -23,11 +23,11 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           int unit_size,
                           std::optional<aiter_tensor_t> local_expert_mask = std::nullopt,
                           std::optional<aiter_tensor_t> num_local_tokens  = std::nullopt,
-                          std::optional<aiter_tensor_t> workspace        = std::nullopt,
+                          std::optional<aiter_tensor_t> workspace         = std::nullopt,
                           int dispatch_policy                             = 0,
-                          std::optional<aiter_tensor_t> local_topk_ids   = std::nullopt,
-                          std::optional<aiter_tensor_t> m_indices        = std::nullopt,
-                          std::optional<aiter_tensor_t> reverse_sorted   = std::nullopt);
+                          std::optional<aiter_tensor_t> local_topk_ids    = std::nullopt,
+                          std::optional<aiter_tensor_t> m_indices         = std::nullopt,
+                          std::optional<aiter_tensor_t> reverse_sorted    = std::nullopt);
 
 // Narrow gfx950 decode helper. It fuses route sorting, BF16->MXFP4 activation
 // quantization and routed-output zeroing for H=4096, block_m=32 batches of
@@ -823,7 +823,7 @@ struct MoeSortingKernel
                             smem_tokens(curr_token_id, eid)++;
                     }
                 }
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
                 opus::s_wait_dscnt(opus::number<0>{});
 #else
                 opus::s_waitcnt_lgkmcnt(opus::number<0>{});
@@ -952,7 +952,7 @@ struct MoeSortingKernel
                     // NOTE: this waitcnt is a must, compiler will not generate waitcnt lgkmcnt()
                     // for above write however __syncthreads will cause barrier with waves other
                     // than 0(which is not we want)
-#if defined(__gfx1250__)
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
                     opus::s_wait_dscnt(opus::number<0>{});
 #else
                     opus::s_waitcnt_lgkmcnt(opus::number<0>{});
@@ -976,8 +976,7 @@ struct MoeSortingKernel
                 if constexpr(Problem::LocalExpertMasking)
                 {
                     bool valid_eid = eid >= 0 && eid < num_experts;
-                    local_id = valid_eid && local_expert_mask[eid] != 0 ? smem_cumdup(eid)
-                                                                         : -1;
+                    local_id = valid_eid && local_expert_mask[eid] != 0 ? smem_cumdup(eid) : -1;
                 }
                 p_local_topk_ids[i] = local_id;
             }
@@ -1045,7 +1044,7 @@ struct MoeSortingKernel
                     int i_t           = i_token + curr_token_id;
                     if(i_t < tokens)
                     {
-                        int eid                         = topk_id[i_t * topk + curr_topk_id];
+                        int eid = topk_id[i_t * topk + curr_topk_id];
                         if(eid >= 0 && eid < num_experts)
                             smem_tokens(curr_token_id, eid) = curr_topk_id + 1; // at least 1
                     }
@@ -1184,6 +1183,24 @@ struct MoeSortingKernel
 };
 
 namespace impl {
+
+// Vector `i` of a [tokens, topk] id tensor holding `numel` ids. Under a device-side
+// token count (LocalToken) the vector loops run to that count rounded up to the
+// vector width, which can pass the tensor's end when the count is its height; the
+// vector that would is read id by id, its ids past the end -1 (no expert).
+template <typename VecType, typename IndexType, int Vec>
+OPUS_D VecType moe_sorting_load_topk_vec(const VecType* p, opus::index_t i, opus::index_t numel)
+{
+    if((i + 1) * Vec <= numel)
+        return p[i];
+    const IndexType* ids = reinterpret_cast<const IndexType*>(p);
+    VecType x;
+    opus::static_for<Vec>([&](auto j) {
+        const opus::index_t idx = i * Vec + j.value;
+        x[j.value]              = idx < numel ? ids[idx] : static_cast<IndexType>(-1);
+    });
+    return x;
+}
 
 // [expert, padded_tokens]
 OPUS_H_D opus::index_t moe_sorting_mp_mesh_stride(opus::index_t tokens)
@@ -1443,8 +1460,7 @@ OPUS_H bool moe_sorting_device_is_gfx950(int device_id_ = -1)
         {
             hipDeviceProp_t dev_prop;
             OPUS_HIP_CHECK_ERROR(hipGetDeviceProperties(&dev_prop, device_id));
-            result[device_id] =
-                std::strncmp(dev_prop.gcnArchName, "gfx950", 6) == 0;
+            result[device_id] = std::strncmp(dev_prop.gcnArchName, "gfx950", 6) == 0;
         }
         return result;
     }();
@@ -1457,15 +1473,16 @@ OPUS_H bool moe_sorting_device_is_gfx950(int device_id_ = -1)
     return gfx950_by_device[dev] != 0;
 }
 
-OPUS_H bool
-moe_sorting_auto_is_oneshot(int tokens_, int num_experts_, int device_id_ = -1)
+OPUS_H bool moe_sorting_auto_is_oneshot(int tokens_, int num_experts_, int device_id_ = -1)
 {
     bool is_oneshot = moe_sorting_is_oneshot(tokens_, num_experts_);
     if(!is_oneshot)
         return false;
 
-    // gfx950 crossover measured with E=256/257 at M>=8 and E=385 at all M.
-    bool prefer_mp = num_experts_ >= 385 || (num_experts_ >= 256 && tokens_ >= 8);
+    // gfx950 crossover measured with E=128..255 at M>=17, E=256/257 at M>=8,
+    // E=384 at M<8 and E=385 at all M.
+    bool prefer_mp = num_experts_ >= 384 || (num_experts_ >= 256 && tokens_ >= 8) ||
+                     (num_experts_ >= 128 && tokens_ >= 17);
     return !(moe_sorting_device_is_gfx950(device_id_) && prefer_mp);
 }
 
@@ -1485,8 +1502,7 @@ OPUS_H opus::index_t moe_sorting_mp_get_workspace_size(int tokens_, int num_expe
 // return size in byte
 // dispatch_policy: 0-automatically pick up kerel. 1-always use single kernel, 2-always use mp
 // kernel
-OPUS_H opus::index_t
-moe_sorting_get_workspace_size(
+OPUS_H opus::index_t moe_sorting_get_workspace_size(
     int tokens_, int num_experts_, int topk_, int dispatch_policy_, int device_id_ = -1)
 {
 #if 1
@@ -1695,14 +1711,14 @@ struct MoeSortingMultiPhaseKernel_P0_v1
     OPUS_H static constexpr auto MakeKargs(const Hargs& h)
     {
         Kargs k;
-        k.p_topk_ids     = h.p_topk_ids;
-        k.p_local_tokens = h.p_local_tokens;
-        k.p_expert_mesh  = h.p_ws;
+        k.p_topk_ids       = h.p_topk_ids;
+        k.p_local_tokens   = h.p_local_tokens;
+        k.p_expert_mesh    = h.p_ws;
         k.p_reverse_sorted = h.p_reverse_sorted;
-        k.tokens         = h.tokens;
-        k.num_experts    = h.num_experts;
-        k.mesh_stride    = impl::moe_sorting_mp_mesh_stride(h.tokens);
-        k.topk_mdiv      = opus::mdiv{static_cast<uint32_t>(h.topk)};
+        k.tokens           = h.tokens;
+        k.num_experts      = h.num_experts;
+        k.mesh_stride      = impl::moe_sorting_mp_mesh_stride(h.tokens);
+        k.topk_mdiv        = opus::mdiv{static_cast<uint32_t>(h.topk)};
         return k;
     }
 
@@ -1757,7 +1773,8 @@ struct MoeSortingMultiPhaseKernel_P0_v1
         for(opus::index_t i = blockIdx.x * kBlockSize + threadIdx.x; i < total_elem;
             i += gridDim.x * kBlockSize)
         {
-            auto x = p_topk_ids[i];
+            auto x = impl::moe_sorting_load_topk_vec<topk_id_t, IndexType, Problem::SubTokenTile>(
+                p_topk_ids, i, kargs.tokens * kargs.topk_mdiv.divisor);
             opus::static_for<Problem::SubTokenTile>([&](auto j) {
                 IndexType eid = x[j.value]; // ext_vector_type must use int to []
                 uint32_t curr_token_id, curr_topk_id;
@@ -1912,7 +1929,8 @@ struct MoeSortingMultiPhaseKernel_P0_v2
 #pragma unroll index_pack
         for(opus::index_t i = threadIdx.x; i < total_elem; i += kBlockSize)
         {
-            auto x = p_topk_ids[i];
+            auto x = impl::moe_sorting_load_topk_vec<topk_id_t, IndexType, index_pack>(
+                p_topk_ids, i, kargs.tokens * kargs.topk_mdiv.divisor);
             opus::static_for<index_pack>([&](auto j) {
                 IndexType eid_x = x[j.value]; // ext_vector_type must use int to []
                 if(eid_x == eid)
@@ -2251,7 +2269,9 @@ struct MoeSortingMultiPhaseKernel_P01
             for(opus::index_t i = blockIdx.x * kBlockSize + threadIdx.x; i < total_elem;
                 i += kBlockSize * gridDim.x)
             {
-                auto x = p_topk_ids[i];
+                auto x =
+                    impl::moe_sorting_load_topk_vec<topk_id_t, IndexType, Problem::SubTokenTile>(
+                        p_topk_ids, i, kargs.tokens * kargs.topk_mdiv.divisor);
                 opus::static_for<Problem::SubTokenTile>([&](auto j) {
                     IndexType eid = x[j.value]; // ext_vector_type must use int to []
                     uint32_t curr_token_id, curr_topk_id;
@@ -2630,10 +2650,10 @@ struct MoeSortingMultiPhaseKernel_P3
             impl::moe_sorting_mp_mesh_smem_size(h.tokens, h.num_experts, h.topk));
         k.p_m_indices      = h.p_m_indices;
         k.p_reverse_sorted = h.p_reverse_sorted;
-        k.tokens      = h.tokens;
-        k.num_experts = h.num_experts;
-        k.topk_mdiv   = opus::mdiv{static_cast<uint32_t>(h.topk)};
-        k.mesh_stride = impl::moe_sorting_mp_mesh_stride(h.tokens);
+        k.tokens           = h.tokens;
+        k.num_experts      = h.num_experts;
+        k.topk_mdiv        = opus::mdiv{static_cast<uint32_t>(h.topk)};
+        k.mesh_stride      = impl::moe_sorting_mp_mesh_stride(h.tokens);
         return k;
     }
 
@@ -2764,8 +2784,8 @@ namespace impl {
 // we use dynamic LDS size here
 OPUS_H constexpr auto moe_sorting_get_smem_size_p23(int num_experts_, bool emit_local_topk_ids)
 {
-    constexpr opus::index_t kBlockSize     = 256; // hardcoded 256
-    const opus::index_t expert_cumsum_elem    = num_experts_ + 1;
+    constexpr opus::index_t kBlockSize       = 256; // hardcoded 256
+    const opus::index_t expert_cumsum_elem   = num_experts_ + 1;
     const opus::index_t local_expert_id_elem = emit_local_topk_ids ? num_experts_ : 0;
     return (4 + 2 * kBlockSize / opus::get_warp_size() + expert_cumsum_elem +
             local_expert_id_elem) *
@@ -2918,11 +2938,9 @@ struct MoeSortingMultiPhaseKernel_P23
 
             const IndexType* p_local_expert_mask =
                 static_cast<const IndexType*>(kargs.p_local_expert_mask);
-            IndexType* p_expert_cumsum = reinterpret_cast<IndexType*>(kargs.p_expert_cumsum);
-            IndexType* p_expert_cumsum_smem =
-                s + 4 + 2 * kBlockSize / opus::get_warp_size();
-            IndexType* p_expert_local_ids_smem =
-                p_expert_cumsum_smem + kargs.num_experts + 1;
+            IndexType* p_expert_cumsum      = reinterpret_cast<IndexType*>(kargs.p_expert_cumsum);
+            IndexType* p_expert_cumsum_smem = s + 4 + 2 * kBlockSize / opus::get_warp_size();
+            IndexType* p_expert_local_ids_smem = p_expert_cumsum_smem + kargs.num_experts + 1;
             IndexType* p_total_tokens_post_pad =
                 reinterpret_cast<IndexType*>(kargs.p_total_tokens_post_pad);
             IndexType* p_sorted_expert_ids =
@@ -3069,13 +3087,11 @@ struct MoeSortingMultiPhaseKernel_P23
         __syncthreads();
         if(kargs.p_local_topk_ids != nullptr && blockIdx.x == 0)
         {
-            const IndexType* p_topk_ids = static_cast<const IndexType*>(kargs.p_topk_ids);
-            IndexType* p_local_topk_ids = static_cast<IndexType*>(kargs.p_local_topk_ids);
-            IndexType* s                = reinterpret_cast<IndexType*>(smem);
-            IndexType* p_expert_cumsum_smem =
-                s + 4 + 2 * kBlockSize / opus::get_warp_size();
-            IndexType* p_expert_local_ids_smem =
-                p_expert_cumsum_smem + kargs.num_experts + 1;
+            const IndexType* p_topk_ids        = static_cast<const IndexType*>(kargs.p_topk_ids);
+            IndexType* p_local_topk_ids        = static_cast<IndexType*>(kargs.p_local_topk_ids);
+            IndexType* s                       = reinterpret_cast<IndexType*>(smem);
+            IndexType* p_expert_cumsum_smem    = s + 4 + 2 * kBlockSize / opus::get_warp_size();
+            IndexType* p_expert_local_ids_smem = p_expert_cumsum_smem + kargs.num_experts + 1;
             const opus::index_t total_topk_ids = tokens * kargs.topk_mdiv.divisor;
 
             for(opus::index_t i = threadIdx.x; i < total_topk_ids; i += kBlockSize)
@@ -3106,7 +3122,7 @@ struct MoeSortingMultiPhaseKernel_P23
             const WeightType* p_weights     = static_cast<const WeightType*>(kargs.p_weights);
             WeightType* p_sorted_weights    = reinterpret_cast<WeightType*>(kargs.p_sorted_weights);
             IndexType* p_m_indices          = reinterpret_cast<IndexType*>(kargs.p_m_indices);
-            IndexType* p_reverse_sorted = reinterpret_cast<IndexType*>(kargs.p_reverse_sorted);
+            IndexType* p_reverse_sorted     = reinterpret_cast<IndexType*>(kargs.p_reverse_sorted);
 
             int eid     = blockIdx.x;
             int wave_id = threadIdx.x / opus::get_warp_size();
@@ -3387,8 +3403,7 @@ struct moe_sorting_opus_args : public aiter::MoeSortingHostArgs
 {
 };
 
-int
-moe_sorting_opus_get_workspace_size(
+int moe_sorting_opus_get_workspace_size(
     int tokens, int num_experts, int topk, int dispatch_policy, int device_id)
 {
     return aiter::moe_sorting_get_workspace_size(
@@ -3700,9 +3715,8 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
 
         if(a.tokens < 2048)
         {
-            if(aiter::impl::moe_sorting_get_smem_size_p23(a.num_experts,
-                                                          a.p_local_topk_ids != nullptr) >
-               opus::get_smem_size())
+            if(aiter::impl::moe_sorting_get_smem_size_p23(
+                   a.num_experts, a.p_local_topk_ids != nullptr) > opus::get_smem_size())
             {
                 printf("opus moe_sorting: do not support large expert %d\n", a.num_experts);
                 return -1;
@@ -3735,9 +3749,8 @@ moe_sorting_opus_mp(moe_sorting_opus_trait t, moe_sorting_opus_args a, aiter::st
         }
         else
         {
-            if(aiter::impl::moe_sorting_get_smem_size_p23(a.num_experts,
-                                                          a.p_local_topk_ids != nullptr) >
-               opus::get_smem_size())
+            if(aiter::impl::moe_sorting_get_smem_size_p23(
+                   a.num_experts, a.p_local_topk_ids != nullptr) > opus::get_smem_size())
             {
                 printf("opus moe_sorting: do not support large expert %d\n", a.num_experts);
                 return -1;

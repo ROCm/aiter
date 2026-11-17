@@ -1,4 +1,4 @@
-# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
 #
 # MIT License
 #
@@ -157,6 +157,7 @@ def _make_dispatch_tdm(
     off_ep_rowmap=0,
     max_tok_slot_stride=0,
     route_parallel=False,
+    row_gather=False,
 ):
     """Build the TDM dispatch kernel. Returns a ``@flyc.jit`` launcher.
 
@@ -177,6 +178,9 @@ def _make_dispatch_tdm(
     compact_row_stride = int(compact_row_stride)
     off_ep_rowmap = int(off_ep_rowmap)
     max_tok_slot_stride = int(max_tok_slot_stride)
+    row_gather = bool(row_gather)
+    if row_gather and not compact_plan:
+        raise ValueError("row_gather requires compact_plan")
     if WAVE != 32:
         raise ValueError(
             f"TDM dispatch is gfx1250-only (wave32); wave size resolved to {WAVE}"
@@ -408,7 +412,7 @@ def _make_dispatch_tdm(
             # weight, so the load belongs in FINALIZE.
             return tok, act, expert, slot_off, dest_pe, keep
 
-        # ── COUNT: block-local histogram of routes per destination peer ──
+        # -- COUNT: block-local histogram of routes per destination peer --
         if const_expr(not compact_plan):
             for tok_base in range(
                 global_warp_id * etpi, inp_cur_tok, warps_total * etpi
@@ -418,7 +422,7 @@ def _make_dispatch_tdm(
                     comm_ops.atomic_add_lds(s_n(dest_pe), arith.constant(1))
             fx.barrier()
 
-            # ── RESERVE: one remote atomic per (block, peer), not per route ──
+            # -- RESERVE: one remote atomic per (block, peer), not per route --
             if tid < npes:
                 n = comm_ops.load_i32_lds(s_n(tid))
                 base = arith.constant(0)
@@ -430,7 +434,7 @@ def _make_dispatch_tdm(
                 comm_ops.store_i32_lds(s_base(tid), base)
             fx.barrier()
 
-            # ── FINALIZE: hand out the reserved slots and gather the metadata ──
+            # -- FINALIZE: hand out the reserved slots and gather the metadata --
             # destTokId = s_base + block-local j; staging is peer-major destTokId
             # SoA, so a block's reserved run is already a contiguous TDM source.
             for tok_base in range(
@@ -498,7 +502,7 @@ def _make_dispatch_tdm(
             comm_ops.waitcnt_stores()
             fx.barrier()
 
-            # ── META: the staged runs leave as bulk cross-GPU writes ──
+            # -- META: the staged runs leave as bulk cross-GPU writes --
             def _copy_edge(src_rsrc, dst_rsrc, src_off, dst_off, head, body, total):
                 """Scalar-copy the leading and trailing elements the body misses."""
                 for i in range(lane, head, WAVE):
@@ -714,7 +718,7 @@ def _make_dispatch_tdm(
                                     dst * scale_dst_dw + i,
                                 )
 
-        # ── PAYLOAD: one TDM load per token, one TDM store per surviving route ──
+        # -- PAYLOAD: one TDM load per token, one TDM store per surviving route --
         # No barrier before this. The tile a warp is about to overwrite is the
         # one it just drained itself; the cross-warp state (staging, s_base) was
         # published by the barrier after FINALIZE.
@@ -836,10 +840,79 @@ def _make_dispatch_tdm(
                                     )
                             fx.rocdl.s_wait_dscnt(0)
                         TDM.tdm_wait(0)
-                        if const_expr(compact_plan):
+                        if const_expr(row_gather):
+                            # One payload row per destination rank. GEMM1 gathers
+                            # it back to expert order through packed_meta in
+                            # ep_rowmap. `packed_meta // topk` is exactly this
+                            # token's payload slot, so a separate per-route
+                            # row_to_token write and its global clear barrier are
+                            # redundant.
+                            slot = fx.Int32(rank) * fx.Int32(max_tok_per_rank) + tok
+                            seen_peers = fx.Int32(0)
+                            owner = fx.Int32(1)
+                            if const_expr(route_parallel):
+                                my_flat = readlane(T.i32, flat, route_k)
+                                my_pe = my_flat & fx.Int32(compact_peer_mask)
+                                for j in range_constexpr(topk):
+                                    prev = readlane(T.i32, flat, j)
+                                    prev_pe = prev & fx.Int32(compact_peer_mask)
+                                    owner = arith.select(
+                                        (fx.Int32(j) < route_k)
+                                        & (prev >= 0)
+                                        & (prev_pe == my_pe),
+                                        fx.Int32(0),
+                                        owner,
+                                    )
+
+                            def ship_payload(dest_pe, slot):
+                                TDM.tdm_store(
+                                    TDM.tdm_group0(
+                                        my_tile,
+                                        fx.Int64(window.lsa_ptr(dest_pe, off_out_tok))
+                                        + fx.Int64(slot) * fx.Int64(row_stride),
+                                    ),
+                                    g_payload_store,
+                                )
+
                             # Unroll the live routes so each TDM descriptor is a
                             # distinct issue site. The ctpop walk serializes too
                             # many SGPR descriptor rebuilds through one loop.
+                            for k in range_constexpr(topk):
+                                bit = arith.constant(1 << k)
+                                live_k = (live_mask & bit) != 0
+                                flat_l = readlane(T.i32, flat, k)
+                                dest_pe = flat_l & compact_peer_mask
+                                dest_tok = flat_l >> compact_peer_bits
+                                peer_bit = fx.Int32(1) << dest_pe
+                                # Select, not an assignment inside the live
+                                # branch: the next unrolled route has to see it.
+                                if const_expr(not route_parallel):
+                                    first_peer = (seen_peers & peer_bit) == 0
+                                    seen_peers = arith.select(
+                                        live_k,
+                                        seen_peers | peer_bit,
+                                        seen_peers,
+                                    )
+                                if const_expr(route_parallel):
+                                    if live_k & (owner != 0):
+                                        ship_payload(dest_pe, slot)
+                                else:
+                                    if live_k & first_peer:
+                                        ship_payload(dest_pe, slot)
+                                if live_k & (lane == k):
+                                    buffer_store(
+                                        fx.Vector.from_elements(
+                                            [packed_meta, wt_bits],
+                                            dtype=fx.Int32,
+                                        ),
+                                        create_buffer_resource_from_addr(
+                                            fx.Int64(
+                                                window.lsa_ptr(dest_pe, off_ep_rowmap)
+                                            )
+                                        ),
+                                        dest_tok * 2,
+                                    )
+                        elif const_expr(compact_plan):
                             for k in range_constexpr(topk):
                                 bit = arith.constant(1 << k)
                                 if (live_mask & bit) != 0:
@@ -904,7 +977,12 @@ def _make_dispatch_tdm(
             is_last = (warp == 0) & (arrive_ticket == block_num - 1)
             if is_last:
                 if lane == 0:
-                    buffer_store(arith.constant(0), rsrc_disp_bar, 0)
+                    # Word 0 only. Word 2 and the sense are monotonic; clearing
+                    # either one drops the prologue wakeup on the next launch.
+                    comm_ops.store_i32_system(
+                        addr_disp_bar, arith.constant(0), arith.constant(0)
+                    )
+                    comm_ops.waitcnt_stores()
                 comm_ops.fence_system_release()
                 for dest_pe in range(lane, npes, WAVE):
                     recv_num_remote_addr = (

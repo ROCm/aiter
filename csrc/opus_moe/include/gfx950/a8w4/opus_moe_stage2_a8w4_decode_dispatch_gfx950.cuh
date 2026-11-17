@@ -2,23 +2,20 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
-#include "opus_moe_traits_stage2_a8w4_decode_gfx950.cuh"
 #include "opus_moe_stage2_a8w4_manifest.h"
+#include "opus_moe_traits_stage2_a8w4_decode_gfx950.cuh"
 
 #include "aiter_hip_common.h"
 
-template<typename Traits>
-__global__ void
-opus_moe_stage2_a8w4_decode_kernel_gfx950(
-    opus_moe_stage2_a8w4_kargs);
+template <typename Traits>
+__global__ void opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs);
 
-template<typename Traits>
-inline void opus_moe_stage2_a8w4_decode_launch_gfx950(
-    const opus_moe_stage2_a8w4_kargs& kargs,
-    hipStream_t stream)
+template <typename Traits>
+inline void opus_moe_stage2_a8w4_decode_launch_gfx950(const opus_moe_stage2_a8w4_kargs& kargs,
+                                                      hipStream_t stream)
 {
-    int route_blocks =
-        (kargs.sorted_blocks * kargs.sort_block_m + Traits::B_M - 1) / Traits::B_M;
+    int route_blocks = (kargs.sorted_blocks * kargs.sort_block_m + Traits::ROUTE_M_STRIDE - 1) /
+                       Traits::ROUTE_M_STRIDE;
     opus_moe_stage2_a8w4_kargs launch_kargs = kargs;
     if constexpr(Traits::DECODE_PACE_ROUTE_BLOCKS_TO_POW2)
     {
@@ -35,21 +32,17 @@ inline void opus_moe_stage2_a8w4_decode_launch_gfx950(
                 kargs.model_dim);
     const dim3 grid(kargs.model_dim / Traits::B_N, route_blocks);
     const dim3 block(Traits::BLOCK_SIZE);
-    opus_moe_stage2_a8w4_decode_kernel_gfx950<Traits>
-        <<<grid, block, 0, stream>>>(launch_kargs);
+    opus_moe_stage2_a8w4_decode_kernel_gfx950<Traits><<<grid, block, 0, stream>>>(launch_kargs);
 }
 
-inline void opus_moe_stage2_a8w4_decode_dispatch_gfx950(
-    int kid,
-    const opus_moe_stage2_a8w4_kargs& kargs,
-    hipStream_t stream)
+inline void opus_moe_stage2_a8w4_decode_dispatch_gfx950(int kid,
+                                                        const opus_moe_stage2_a8w4_kargs& kargs,
+                                                        hipStream_t stream)
 {
     switch(kid)
     {
-    GENERATE_OPUS_MOE_STAGE2_A8W4_DECODE_DISPATCH_CASES
+        GENERATE_OPUS_MOE_STAGE2_A8W4_DECODE_DISPATCH_CASES
     default: break;
     }
-    AITER_CHECK(false,
-                "unreachable A8W4 kernel dispatch for kid=",
-                kid);
+    AITER_CHECK(false, "unreachable A8W4 kernel dispatch for kid=", kid);
 }

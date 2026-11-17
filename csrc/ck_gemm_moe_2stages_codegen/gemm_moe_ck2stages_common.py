@@ -347,8 +347,8 @@ a8w8_gemm2_kernels_list_gfx950= {
     #  4: kernelInstanceGEMM2(       256,        64,       128,       256,     1,       4,         3,),
      5: kernelInstanceGEMM2(       256,       128,       128,       128,     1,       4,         3,),
      6: kernelInstanceGEMM2(       256,       256,       128,       128,     1,       4,         3,),
-    # KPerBlock 128 divides an inter_dim that is a multiple of 128 but not of 256, such as 384.
-    # These shapes need no padding.
+    # K=128 for the small row tiles. The gfx950 fp8 16x16 MFMA consumes 128
+    # K elements, so inter_dim such as 384 cannot use the K=256 tiles above.
      7: kernelInstanceGEMM2(       256,        32,       128,       128,     1,       4,         1,),
      8: kernelInstanceGEMM2(       256,        64,       128,       128,     1,       4,         1,),
     # NPerBlock 64 is for a model_dim that is not a multiple of 128.

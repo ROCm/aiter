@@ -388,7 +388,10 @@ def _build_compress_forward_kernel(
                 sc_padded = [
                     arith.select(is_pad, c_neg_inf, sc_list[i]) for i in range(VEC)
                 ]
-                return kv_list, sc_padded
+                # A padding row reads ring 0 of whatever the slot last held, and its
+                # zero weight does not cancel a NaN there (0 * NaN = NaN): zero the kv too.
+                kv_padded = [arith.select(is_pad, c_zero_f32, v) for v in kv_list]
+                return kv_padded, sc_padded
 
             def _softmax_step_padded(
                 m_old_list, kv_old_list, w_old_list, score_k_list, kv_k_list
@@ -501,6 +504,11 @@ def _build_compress_forward_kernel(
                         arith.AddFOp(p2_sc[i], p2_ape[i], fastmath=fm_fast).result,
                     )
                     for i in range(VEC)
+                ]
+                # A consumed row has weight 0, but 0 * NaN is NaN, and its in_row
+                # can belong to another request in the batch. Zero the value too.
+                p2_kv = [
+                    arith.select(is_consumed, c_zero_f32, p2_kv[i]) for i in range(VEC)
                 ]
                 m_lane, kv_lane, w_lane = _softmax_step_padded(
                     m_lane, kv_lane, w_lane, p2_score, p2_kv
@@ -1554,7 +1562,7 @@ def flydsl_hca_compress_attn_gfx1250(
     if kv_state.dtype != torch.float32 or score_state.dtype != torch.float32:
         raise TypeError("kv_state/score_state must be fp32")
     # Slot and ring strides are passed to the kernel and the descriptor is
-    # rebased per slot, so the states may be strided views — a per-request
+    # rebased per slot, so the states may be strided views -- a per-request
     # arena hands out a view whose slot stride is a whole entry. Only the
     # innermost dim must be unit stride: the kernel addresses it as
     # `col_off + lane`.

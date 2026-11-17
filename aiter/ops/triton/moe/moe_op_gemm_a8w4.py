@@ -29,7 +29,7 @@ from aiter.ops.triton.moe.reduce import (
     validate_reduce_out,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
@@ -105,14 +105,14 @@ def allocate_output(
 def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     block_m = routing_data.block_m
     group_m = 4
-    num_xcds = 8
+    num_xcds = get_num_xcds()
     xcd_swizzle = num_xcds
     w_cache_modifier = ".cg" if block_m <= 32 else None
     arch = get_arch()
     split_k = 1
 
     # Tuned dispatch: per-(block_m, N, K) winners from a sweep tuner.
-    # Entries carry BLOCK_SIZE_N, BLOCK_SIZE_K, num_warps, num_stages, … but
+    # Entries carry BLOCK_SIZE_N, BLOCK_SIZE_K, num_warps, num_stages, ... but
     # omit BLOCK_SIZE_M because block_m is the dispatch key, not a tunable
     # (routing decides block_m for the layer).
     tuned = get_moe_dispatch("A8W4", arch, "triton").get(f"bm{block_m}_n{n}_k{k}")
@@ -133,7 +133,7 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
         }
 
     # Fallback for shapes not in the tuned dispatch JSON.
-    # Look for a tuned entry with the same (N, K) but any block_m — the tile
+    # Look for a tuned entry with the same (N, K) but any block_m -- the tile
     # geometry and num_stages from that entry are a better starting point than
     # a generic default, and avoid regressing to num_stages=1 on gfx950.
     # Under CDNA4 swizzle, skip BLOCK_K<256 entries since unswizzle can't compile them.
@@ -228,7 +228,7 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
 
         else:
             # Cap by N: BN=512 wasted compute on small-N shapes (e.g. N=256
-            # → 50% pad, grid_n=1). Tuned shapes bypass this via JSON.
+            # -> 50% pad, grid_n=1). Tuned shapes bypass this via JSON.
             block_n = min(triton.next_power_of_2(n), 256)
             # routing caps block_m at 128; nw=4 wins ~2x at block_m=128 on gpt-oss
             # shapes (MI355X) but regresses ~7% at block_m=64, so 64 stays at 8.
@@ -278,7 +278,7 @@ def m2bucket(m):
 
 def get_gluon_a8w4_ctas_per_cga(m):
     num_ctas = 1
-    if num_ctas == 1 or get_arch() != "gfx1250":
+    if num_ctas == 1 or get_arch() not in ("gfx1250", "gfx1250-strict"):
         return [1, 1]
     # Decode: shard the cluster along N only.
     if m < 1024:
@@ -362,7 +362,7 @@ def moe_gemm_a8w4(
     preshuffled=False,
     unpadded_N=None,
     unpadded_K=None,
-    # Idea 1: emit (fp8 e4m3, ue8m0 per-1×32 scale) directly from the GEMM
+    # Idea 1: emit (fp8 e4m3, ue8m0 per-1x32 scale) directly from the GEMM
     # write-back. When out_mx_quant=True, returns (y_fp8, y_scale_ue8m0).
     # Requires SPLIT_K==1 and no scatter_indx (GEMM1-style).
     out_mx_quant: bool = False,
@@ -395,11 +395,12 @@ def moe_gemm_a8w4(
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
     if backend is None:
-        backend = "gluon" if get_arch() == "gfx1250" else "triton"
+        backend = "gluon" if get_arch() in ("gfx1250", "gfx1250-strict") else "triton"
     assert backend in ("triton", "gluon"), f"Invalid backend: {backend}"
     if backend == "gluon":
-        assert (
-            get_arch() == "gfx1250"
+        assert get_arch() in (
+            "gfx1250",
+            "gfx1250-strict",
         ), f"Gluon backend requires gfx1250, got {get_arch()}"
     use_gluon = backend == "gluon"
     if preshuffled:
@@ -425,7 +426,7 @@ def moe_gemm_a8w4(
         N = w.shape[-1] * 16
     # Output buffer must be sized to the PADDED N: the kernel writes full
     # block_n columns per tile (grid_n * block_n cols total), which can exceed
-    # unpadded_N when block_n doesn't divide it evenly → OOB on the y buffer.
+    # unpadded_N when block_n doesn't divide it evenly -> OOB on the y buffer.
     padded_N = N
     block_m = routing_data.block_m
     if unpadded_N and block_m == 16:

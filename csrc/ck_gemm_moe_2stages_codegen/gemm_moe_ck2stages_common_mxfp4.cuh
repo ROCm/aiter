@@ -23,7 +23,8 @@ template <typename A0DataType,
           bool PerTensorQuant,
           bool MulRoutedWeight,
           int ActOP,
-          bool PadK>
+          bool PadK,
+          bool RuntimeSwigluLimit>
 void ck_moe_stage1_gemm(const hipStream_t& stream,
                         int tokens,
                         int sorted_size,
@@ -41,7 +42,8 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                         std::optional<void*> w1_scale, // [e, 1, n], gate(up) scale
                         std::optional<void*> a1_scale, // [m, 1], token scale
                         std::optional<int> splitk,     // splitk
-                        std::optional<bool> nt)
+                        std::optional<bool> nt,
+                        [[maybe_unused]] float swiglu_limit)
 {
     static_assert(!PadK, "This kernel does not implement K padding.");
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
@@ -183,24 +185,28 @@ void ck_moe_stage1_gemm(const hipStream_t& stream,
                                      Nswizzle,                                \
                                      PerTensorQuant,                          \
                                      MulRoutedWeight,                         \
-                                     ActOP>(const hipStream_t& stream,        \
-                                            int tokens,                       \
-                                            int sorted_size,                  \
-                                            int N,                            \
-                                            int K,                            \
-                                            int topk,                         \
-                                            void*& hidden_states,             \
-                                            void*& w1,                        \
-                                            void*& w2,                        \
-                                            void*& sorted_token_ids,          \
-                                            void*& sorted_expert_ids,         \
-                                            void*& sorted_weights,            \
-                                            void*& num_valid_ids,             \
-                                            void*& out,                       \
-                                            std::optional<void*> w1_scale,    \
-                                            std::optional<void*> a1_scale,    \
-                                            std::optional<int> splitk,        \
-                                            std::optional<bool> nt);
+                                     ActOP,                                   \
+                                     PadK,                                    \
+                                     AITER_CK_MOE_RUNTIME_SWIGLU_LIMIT>(      \
+        const hipStream_t& stream,                                            \
+        int tokens,                                                           \
+        int sorted_size,                                                      \
+        int N,                                                                \
+        int K,                                                                \
+        int topk,                                                             \
+        void*& hidden_states,                                                 \
+        void*& w1,                                                            \
+        void*& w2,                                                            \
+        void*& sorted_token_ids,                                              \
+        void*& sorted_expert_ids,                                             \
+        void*& sorted_weights,                                                \
+        void*& num_valid_ids,                                                 \
+        void*& out,                                                           \
+        std::optional<void*> w1_scale,                                        \
+        std::optional<void*> a1_scale,                                        \
+        std::optional<int> splitk,                                            \
+        std::optional<bool> nt,                                               \
+        [[maybe_unused]] float swiglu_limit);
 
 template <typename A0DataType,
           typename B0DataType,
@@ -237,7 +243,8 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
                         std::optional<void*> w2_scale, // [e, 1, n], gate(up) scale
                         std::optional<void*> a2_scale, // [max_num_tokens_padded, 1], token scale
                         std::optional<int> splitk,     // splitk
-                        std::optional<bool> nt)
+                        std::optional<bool> nt,
+                        [[maybe_unused]] float swiglu_limit)
 {
     static_assert(!PadK && !KVec8, "This kernel does not implement K padding.");
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
@@ -377,4 +384,4 @@ void ck_moe_stage2_gemm(const hipStream_t& stream,
         std::optional<void *> w2_scale,                                                                                                                              \
         std::optional<void *> a2_scale,                                                                                                                              \
         std::optional<int>   splitk,                                                                                                                                 \
-        std::optional<bool>   nt);
+        std::optional<bool> nt, [[maybe_unused]] float swiglu_limit);

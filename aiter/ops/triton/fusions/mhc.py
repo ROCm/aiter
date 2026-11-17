@@ -554,7 +554,7 @@ def _mhc_post_pre_gluon_supported(
     h_post=None,
     h_res=None,
 ) -> bool:
-    if get_arch() != "gfx1250":
+    if get_arch() not in ("gfx1250", "gfx1250-strict"):
         return False
     C = layer_input.size(1)
     K = n * C
@@ -907,7 +907,7 @@ def mhc_post_pre(
     post_mix: torch.Tensor,  # (M, n) or (M, n, 1) fp32
     comb_mix: torch.Tensor,  # (M, n, n)     fp32
     phi: torch.Tensor,  # (n*C, N=n+n+n*n) bf16 / fp16
-    alphas: torch.Tensor,  # (3,) fp32 — [alpha_pre, alpha_post, alpha_res]
+    alphas: torch.Tensor,  # (3,) fp32 -- [alpha_pre, alpha_post, alpha_res]
     bias: torch.Tensor,  # (N,) fp32
     n: int,
     eps: float = 1e-6,
@@ -968,7 +968,7 @@ def mhc_post_pre(
         comb_mix:           (M, n, n) fp32, from preceding mhc_pre; [src, dst]
         phi:                (n*C, N) bf16 / fp16 / fp32, next pre's projection
                             matrix; N-contiguous or C-contiguous (``fn.T``)
-        alphas:             (3,) fp32 — ``[alpha_pre, alpha_post, alpha_res]``.
+        alphas:             (3,) fp32 -- ``[alpha_pre, alpha_post, alpha_res]``.
                             Loaded by the kernel via tl.load; pass the
                             ``hc_scale`` parameter tensor unchanged.
         bias:               (N,) fp32, next pre's bias
@@ -989,7 +989,7 @@ def mhc_post_pre(
         residual_out:       optional pre-allocated (M, n, C) output of dtype
                             ``layer_input.dtype``. Allocated if None.
         h_post:             optional pre-allocated post-stream output. Accepts
-                            either (M, n) or (M, n, 1). Any float dtype — the
+                            either (M, n) or (M, n, 1). Any float dtype -- the
                             kernel implicit-casts on store. Allocated as
                             (M, n, 1) in ``layer_input.dtype`` if None.
         h_res:              optional pre-allocated res-stream output of shape
@@ -999,7 +999,7 @@ def mhc_post_pre(
                             ``layer_input.dtype``. Allocated if None.
         config:             optional config dict; loaded from
                             get_mhc_config("MHC_FUSED", M, C, mode="sinkhorn")
-                            when None. NUM_KSPLIT is ignored — the split kernel's
+                            when None. NUM_KSPLIT is ignored -- the split kernel's
                             grid uses ``cdiv(C, BLOCK_C)`` K-splits.
         norm_weight:        optional (C,) bf16: fuse the next sub-layer's
                             RMSNorm into ``layer_input_out`` (``norm_eps``), as
@@ -1144,7 +1144,7 @@ def mhc_post_pre(
     config.pop("NUM_KSPLIT", None)
 
     assert BLOCK_K % n == 0, (
-        f"BLOCK_K ({BLOCK_K}) must be divisible by n ({n}) — each CTA owns "
+        f"BLOCK_K ({BLOCK_K}) must be divisible by n ({n}) -- each CTA owns "
         f"n contiguous BLOCK_K/n-wide C-slices of the next-pre GEMM"
     )
     # Per-CTA C-slice width (constexpr inside the split kernel).
@@ -1191,7 +1191,7 @@ def mhc_post_pre(
 
     # Split-K reduce-apply scratch. Write-before-read within this call (the
     # split kernel writes every entry the reduce kernel reads, masked the same
-    # way), so callers may pass persistent buffers — keeping `.data_ptr()`
+    # way), so callers may pass persistent buffers -- keeping `.data_ptr()`
     # stable lets CUDAGraph capture/replay work without surprise re-allocation.
     if acc_partial is None:
         acc_partial = torch.empty(
@@ -1263,7 +1263,7 @@ def mhc_post_pre(
     # --- Launch 2: reduce-apply kernel writes h_post and h_res directly.
     # Allocate any caller-omitted outputs in `layer_input.dtype`. Callers can
     # pre-allocate them in any float dtype (e.g. fp32) to skip a downstream
-    # cast — the kernel implicit-casts at the store.
+    # cast -- the kernel implicit-casts at the store.
     if h_post is None:
         h_post = torch.empty(M, n, 1, dtype=dtype, device=device)
     else:
@@ -1294,9 +1294,9 @@ def mhc_post_pre(
             f"got {tuple(layer_input_out.shape)}"
         )
 
-    # 2D (M, n) view for the kernel — h_post.ndim is 2 or 3, both OK after view.
+    # 2D (M, n) view for the kernel -- h_post.ndim is 2 or 3, both OK after view.
     h_post_2d = h_post.view(M, n)
-    # 2D (M, n*n) view for the kernel — h_res is contiguous (M, n, n).
+    # 2D (M, n*n) view for the kernel -- h_res is contiguous (M, n, n).
     h_res_2d = h_res.view(M, n_squared)
 
     # residual_out (M, n, C) is contiguous after `torch.empty`; flatten gives
@@ -1587,8 +1587,8 @@ def mhc_pre_dsv4(
     """Run DSV4 MHC pre-processing with a pure-Triton production forward.
 
     ``residual`` is ``[M,n,C]`` in fp16/bf16; ``fn`` is
-    ``[2n+n²,n*C]`` FP32; ``scale`` is ``[3]`` FP32; and ``base`` is
-    ``[2n+n²]`` FP32. Returns ``(post_mix, comb_mix, layer_input)`` with
+    ``[2n+n2,n*C]`` FP32; ``scale`` is ``[3]`` FP32; and ``base`` is
+    ``[2n+n2]`` FP32. Returns ``(post_mix, comb_mix, layer_input)`` with
     shapes ``[M,n,1]``, ``[M,n,n]``, and ``[M,C]``. The mixes are FP32.
     Backward is the documented ``pytorch_recompute`` correctness fallback.
     """

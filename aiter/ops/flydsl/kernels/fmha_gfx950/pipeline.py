@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
 """Per-block forward pass: shared primitives, traits, and the kernel context."""
@@ -403,34 +403,6 @@ class DualwaveSwpFp8Traits:
     NEG_INF_F32_BITS: int
     BATCH_INTERLEAVE_GROUP: int = 1
     RETURN_LSE: bool = False
-
-    @property
-    def cache_tag(self):
-        """The independent builder arguments, and nothing derived from them.
-
-        Every other trait is a pure function of these (verified by enumerating the
-        whole argument grid and checking this tuple stays injective), so adding one
-        cannot separate two builds that would otherwise share a binary.
-        """
-        return (
-            "fp8_e4m3_dualwave_swp",
-            self.NUM_HEADS_Q,
-            self.NUM_HEADS_KV,
-            self.HEAD_DIM,
-            self.HEAD_DIM_V,
-            self.BLOCK_M,
-            self.CAUSAL,
-            self.DAZ,
-            self.DUALWAVE_SWP_LAZY_RESCALE,
-            self.DUALWAVE_SWP_RESCALE_THRESHOLD,
-            self.DUALWAVE_SWP_SETPRIO,
-            self.DUALWAVE_SWP_ENABLE_STAGGER,
-            self.NUM_KV_SPLITS,
-            self.VARLEN,
-            self.CROSS_SEQLEN,
-            self.BATCH_INTERLEAVE_GROUP,
-            self.RETURN_LSE,
-        )
 
 
 def _make_dualwave_swp_fp8_traits(

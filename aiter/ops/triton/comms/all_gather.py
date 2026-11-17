@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """
 All-Gather communication primitive using Iris.
@@ -16,6 +16,8 @@ import torch
 import triton
 import triton.language as tl
 from torch import Tensor
+
+from aiter.ops.triton.utils.device_info import get_num_sms
 
 if TYPE_CHECKING:
     from aiter.ops.triton.comms.iris import IrisCommContext
@@ -50,7 +52,7 @@ def _all_gather_impl(
     """
     Shared all-gather implementation using push-based approach with iris.put. 1D persistent-style PID mapping
 
-    Each rank sends its (M_shard)×N to all other ranks at the appropriate offset.
+    Each rank sends its (M_shard)xN to all other ranks at the appropriate offset.
 
     Args:
         pid: Program ID,  1D persistent-style PID mapping
@@ -163,7 +165,7 @@ def all_gather(
     block_m: int = 64,
     block_n: int = 64,
     group_size_m: int = 8,
-    num_sms: int = 256,
+    num_sms: int | None = 256,
 ) -> Tensor:
     """
     Perform all-gather along the M (row) dimension.
@@ -179,7 +181,8 @@ def all_gather(
         block_m (int): Block size for M dimension. Default: 64
         block_n (int): Block size for N dimension. Default: 64
         group_size_m (int): Group size for swizzling. Default: 8
-        num_sms (int): Number of SMs to use (persistent kernel). Default: 256
+        num_sms (int | None): Persistent grid size. Default: 256.
+            None uses the current device's CU count.
 
     Returns:
         Tensor: Full tensor of shape [M, N] where M = M_shard * world_size
@@ -222,6 +225,8 @@ def all_gather(
     full_output = iris_ctx.zeros((M, N), dtype=input_shard.dtype)
 
     # Launch kernel
+    if num_sms is None:
+        num_sms = get_num_sms()
     grid = (num_sms,)
     _all_gather_kernel[grid](
         input_shard,

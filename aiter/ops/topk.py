@@ -9,9 +9,10 @@ import os
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
+from ..jit.utils.chip_info import get_gfx, get_gfx_runtime
+from ..plugin import route as _route
 from ..utility import dtypes
-from ..utility.graph_alloc import persistent_alloc
+from ..utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 
 # Raw binding: no argument validation, correction_bias must be a real tensor.
@@ -32,7 +33,8 @@ def topk_gating_fwd(
 
 _VALID_SCORE_FUNCS = {"sqrtsoftplus", "sigmoid", "softmax"}
 _GFX1250_SIGMOID_EXPERTS = {512, 768, 896, 900, 1024}
-_GFX1250_SIGMOID_TOPKS = {4, 8, 16}
+# Top-K and the Top-(K+1) candidates HERD routing hands to fused_moe(herd_topk=K).
+_GFX1250_SIGMOID_TOPKS = {4, 5, 8, 9, 16, 17}
 
 
 def _can_use_gfx1250_exact_sigmoid_topk(
@@ -59,9 +61,11 @@ def _can_use_gfx1250_exact_sigmoid_topk(
         and gating_output.stride(1) == 1
         and gating_output.stride(0) >= experts
     )
+    # An FP32 bias with BF16 logits has no wave32 HIP path: the HIP kernel
+    # takes a bias of another dtype only on its wave64 register top-k path.
     bias_ok = (
         correction_bias.shape == (experts,)
-        and correction_bias.dtype == torch.bfloat16
+        and correction_bias.dtype in (torch.bfloat16, torch.float32)
         and correction_bias.stride(0) == 1
     )
     outputs_ok = (
@@ -79,7 +83,7 @@ def _can_use_gfx1250_exact_sigmoid_topk(
     )
     if not input_ok or not bias_ok or not outputs_ok or not same_device:
         return False
-    return get_gfx_runtime() == "gfx1250"
+    return get_gfx_runtime() in ("gfx1250", "gfx1250-strict")
 
 
 def _gfx1250_exact_sigmoid_topk(
@@ -110,9 +114,10 @@ _FLYDSL_HERD_MIN_M = int(
         "AITER_FLYDSL_HERD_MIN_M", os.environ.get("AITER_TRITON_HERD_MIN_M", "16")
     )
 )
+# fused_moe(herd_topk) takes at most HERD_ROUTE_BLOCK (1024) tokens.
 _FLYDSL_HERD_MAX_M = int(
     os.environ.get(
-        "AITER_FLYDSL_HERD_MAX_M", os.environ.get("AITER_TRITON_HERD_MAX_M", "128")
+        "AITER_FLYDSL_HERD_MAX_M", os.environ.get("AITER_TRITON_HERD_MAX_M", "1024")
     )
 )
 
@@ -121,8 +126,9 @@ def _use_flydsl_herd(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
     gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
+    correction_bias: torch.Tensor | None,
     score_func: str,
+    need_renorm: bool = True,
 ) -> bool:
     """Whether this call matches an opt-in HERD model profile."""
     if not _FLYDSL_USE_HERD:
@@ -130,7 +136,7 @@ def _use_flydsl_herd(
     if gating_output.dim() != 2:
         return False
     tokens = gating_output.shape[0]
-    if get_gfx() not in ("gfx950", "gfx1250") or not (
+    if get_gfx() != "gfx950" or not (
         _FLYDSL_HERD_MIN_M <= tokens <= _FLYDSL_HERD_MAX_M
     ):
         return False
@@ -143,6 +149,7 @@ def _use_flydsl_herd(
         gating_output,
         correction_bias,
         score_func,
+        need_renorm,
     )
 
 
@@ -156,6 +163,15 @@ def _valid_bias_dtypes(gating_dtype: torch.dtype) -> tuple[torch.dtype, ...]:
     return (torch.float32, torch.bfloat16)
 
 
+def _topk_gating_fake(*args, **kwargs) -> None:
+    """Every result of this op is one of its in-place writes -- ``topk_weights``
+    and ``topk_indices`` -- so a trace of it produces nothing. The fake is what
+    lets `route` register the op, which keeps the plugin's dispatch out of a
+    caller's compiled graph."""
+    return
+
+
+@_route(op="topk_gating", version=1, fake=_topk_gating_fake)
 def topk_gating(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -205,8 +221,13 @@ def topk_gating(
             f"correction_bias dtype {correction_bias.dtype} is not supported for "
             f"{gating_output.dtype} gating_output, expected one of {valid}"
         )
-    if _use_flydsl_herd(
-        topk_weights, topk_indices, gating_output, correction_bias, score_func
+    if num_shared_experts == 0 and _use_flydsl_herd(
+        topk_weights,
+        topk_indices,
+        gating_output,
+        correction_bias,
+        score_func,
+        need_renorm,
     ):
         from .flydsl.herd_topk import herd_topk_gating
 
@@ -343,8 +364,6 @@ def biased_grouped_topk(
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
     num_valid_rows: torch.Tensor | None = None,  # see topk_gating
 ):
-    token_num = gating_output.shape[0]
-    num_experts = gating_output.shape[1]
     if (
         num_expert_group == 1
         and topk_group == 1
@@ -354,6 +373,7 @@ def biased_grouped_topk(
             gating_output,
             correction_bias,
             "sigmoid",
+            need_renorm,
         )
     ):
         from .flydsl.herd_topk import herd_topk_gating
@@ -388,34 +408,19 @@ def biased_grouped_topk(
             routed_scaling_factor,
             num_valid_rows,
         )
-    cu_num = get_cu_num()
-    if token_num <= cu_num * 212 or num_experts // num_expert_group > 32:
-        return biased_grouped_topk_hip(
-            gating_output,
-            correction_bias,
-            topk_weights,
-            topk_ids,
-            num_expert_group,
-            topk_group,
-            need_renorm,
-            routed_scaling_factor,
-            num_valid_rows,
-        )
-    else:
-        topk = topk_ids.shape[1]
-        assert need_renorm, "Renormalization is required for moe_fused_gate."
-        return moe_fused_gate(
-            gating_output,
-            correction_bias,
-            topk_weights,
-            topk_ids,
-            num_expert_group,
-            topk_group,
-            topk,
-            n_share_experts_fusion=0,
-            routed_scaling_factor=routed_scaling_factor,
-            num_valid_rows=num_valid_rows,
-        )
+    # Not moe_fused_gate: it leaves routed_scaling_factor to the caller, as in
+    # sglang, and measured slower than this kernel at every row count.
+    return biased_grouped_topk_hip(
+        gating_output,
+        correction_bias,
+        topk_weights,
+        topk_ids,
+        num_expert_group,
+        topk_group,
+        need_renorm,
+        routed_scaling_factor,
+        num_valid_rows,
+    )
 
 
 # this one copied from sglang
@@ -587,7 +592,7 @@ def _use_mulblocks(numRows: int, stride0: int) -> bool:
     )
 
 
-@functools.lru_cache(maxsize=16)
+@capture_scoped_cache
 def _get_topk_mb_workspace_keyed(
     device: torch.device, stream_id: int, size: int
 ) -> torch.Tensor:
@@ -626,7 +631,7 @@ def get_topk_scratch_workspace(device: torch.device, size: int) -> torch.Tensor:
     Unlike the multi-block buffer (get_topk_mb_workspace), these kernels do their
     own internal memset on each launch, so the buffer need not be zero-initialized
     and need not be a persistent, reused buffer. This mirrors how the C++ side
-    originally allocated it — a plain, exactly-sized ``torch.empty`` per call —
+    originally allocated it -- a plain, exactly-sized ``torch.empty`` per call --
     only moved to the Python side so the host code never allocates device scratch
     itself. torch's caching allocator reuses freed blocks, so no explicit cache
     (or size bucketing) is needed here."""
@@ -1207,7 +1212,7 @@ _FLYDSL_TOPK_DECODE_GATES = {
             (32_768, 65_535, 16),
             (65_536, 131072, 32),
             (131072, 200_000, 48),
-            (200_000, None, 64),
+            (200_000, None, 128),
         ),
         False: ((131_072, None, 32),),
     },
@@ -1313,6 +1318,15 @@ def _hip_top_k_per_row_decode(
     )
 
 
+def _top_k_per_row_decode_fake(*args, **kwargs) -> None:
+    """Every result of this op is one of its in-place writes -- ``indices``, and
+    ``values`` when given -- so a trace of it produces nothing. The fake is what
+    lets `route` register the op, which keeps the plugin's dispatch out of a
+    caller's compiled graph."""
+    return
+
+
+@_route(op="top_k_per_row_decode", version=1, fake=_top_k_per_row_decode_fake)
 def top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
@@ -1470,17 +1484,48 @@ def _top_k_per_row_decode_packed(
     # row of this view is the buffer itself, a row's start added in-kernel.
     view = flat.as_strided((num_rows, flat.numel()), (0, 1))
     if _should_use_flydsl_topk_decode(
-        view, next_n, seq_lens, indices, num_rows, 0, 1, k, stable, values,
+        view,
+        next_n,
+        seq_lens,
+        indices,
+        num_rows,
+        0,
+        1,
+        k,
+        stable,
+        values,
         width=plane_width,
-    ):  # fmt: skip
+    ):
         return flydsl_topk.flydsl_top_k_per_row_decode(
-            view, next_n, seq_lens, indices, num_rows, 0, 1, k, stable, values,
-            row_starts=row_starts, plane_width=plane_width,
-        )  # fmt: skip
+            view,
+            next_n,
+            seq_lens,
+            indices,
+            num_rows,
+            0,
+            1,
+            k,
+            stable,
+            values,
+            row_starts=row_starts,
+            plane_width=plane_width,
+        )
     return flydsl_topk.flydsl_radix_topk_one_block(
-        view, row_starts, seq_lens, indices, values, num_rows, 0, 1, k, stable,
-        is_decode=True, next_n=next_n, plane_width=plane_width, packed_rows=True,
-    )  # fmt: skip
+        view,
+        row_starts,
+        seq_lens,
+        indices,
+        values,
+        num_rows,
+        0,
+        1,
+        k,
+        stable,
+        is_decode=True,
+        next_n=next_n,
+        plane_width=plane_width,
+        packed_rows=True,
+    )
 
 
 def flydsl_dcp_topk_merge(

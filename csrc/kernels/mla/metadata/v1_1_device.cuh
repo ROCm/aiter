@@ -78,7 +78,7 @@ __host__ __device__ int32_t cal_workload_limit_global_v0(const int32_t cum_workl
     int32_t limit;
 
     const int32_t avg_workload_raw = integer_divide_ceil(cum_workload, num_clusters);
-    const int32_t avg_workload = (avg_workload_raw > 1) ? avg_workload_raw : 1;
+    const int32_t avg_workload     = (avg_workload_raw > 1) ? avg_workload_raw : 1;
     if(avg_workload <= 8)
         limit = 32;
     else if(avg_workload <= 16)
@@ -130,32 +130,32 @@ __host__ __device__ int32_t cal_workload_limit_global_v1(const MlaMetadataV11Coe
 
 template <typename Traits, bool kOnlyGatherWorkCount>
 __device__ void generate_work(const int32_t batch_idx,
-                                  const int32_t tile_idx,
-                                  const int32_t qo_len,
-                                  const int32_t kv_len,
-                                  const int32_t qo_tile_len,
-                                  const int32_t packed_qo_tile_len,
-                                  const int32_t qo_batch_start,
-                                  const int32_t kv_batch_start,
-                                  const int32_t kv_batch_end,
-                                  const int32_t workload_limit_global,
-                                  const int32_t num_clusters,
-                                  const int32_t kv_granularity,
-                                  const int32_t* p_work_indptr,
-                                  const int32_t* p_lds_num_qo_clusters_indptr,
-                                  int32_t* p_loc_partial_outputs,
-                                  int32_t* p_num_partial_outputs,
-                                  MlaWorkInfo* p_work_info_set,
-                                  MlaPartialTileInfo* p_reduce_final_map,
-                                  MlaPartialTileInfo* p_reduce_partial_map,
-                                  int32_t* p_cost_heap,
-                                  int32_t* p_cluster_work_counter)
+                              const int32_t tile_idx,
+                              const int32_t qo_len,
+                              const int32_t kv_len,
+                              const int32_t qo_tile_len,
+                              const int32_t packed_qo_tile_len,
+                              const int32_t qo_batch_start,
+                              const int32_t kv_batch_start,
+                              const int32_t kv_batch_end,
+                              const int32_t workload_limit_global,
+                              const int32_t num_clusters,
+                              const int32_t kv_granularity,
+                              const int32_t* p_work_indptr,
+                              const int32_t* p_lds_num_qo_clusters_indptr,
+                              int32_t* p_loc_partial_outputs,
+                              int32_t* p_num_partial_outputs,
+                              MlaWorkInfo* p_work_info_set,
+                              MlaPartialTileInfo* p_reduce_final_map,
+                              MlaPartialTileInfo* p_reduce_partial_map,
+                              int32_t* p_cost_heap,
+                              int32_t* p_cluster_work_counter)
 {
     int32_t remaining_kv_len = kv_len;
     int32_t kv_start_local   = 0;
 
-    const int32_t kv_len_limit_floor = integer_least_multiple(
-        integer_divide_ceil(kv_len, num_clusters), kv_granularity);
+    const int32_t kv_len_limit_floor =
+        integer_least_multiple(integer_divide_ceil(kv_len, num_clusters), kv_granularity);
     const auto [cid_top, accum_cost_top]   = get_cost_top(p_cost_heap, num_clusters);
     const int32_t remaining_capability_top = opus::max(
         cal_kv_len(workload_limit_global - accum_cost_top, packed_qo_tile_len), kv_len_limit_floor);
@@ -210,7 +210,7 @@ __device__ void generate_work(const int32_t batch_idx,
                     {
                         p_reduce_partial_map[global_cluster_q_idx].q_start = *p_loc_partial_outputs;
                         p_reduce_final_map[global_cluster_q_idx]           = {
-                                      {work_info.qo_start, work_info.qo_end}};
+                            {work_info.qo_start, work_info.qo_end}};
                     }
                     ++(*p_num_partial_outputs);
                     *p_loc_partial_outputs += (work_info.qo_end - work_info.qo_start);
@@ -275,17 +275,19 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
         p_lds_qo_lens[bid] =
             params.p_seqlens_qo_indptr[bid_ori + 1] - params.p_seqlens_qo_indptr[bid_ori];
     }
-    QoState<Traits> qo_state(
-        params.uni_seqlen_qo, params.ori_seqlen_qo, p_lds_qo_lens, params.p_seqlens_qo_indptr);
+    QoState<Traits> qo_state(params.uni_seqlen_qo,
+                             params.ori_seqlen_qo,
+                             params.qk_batch_ratio,
+                             p_lds_qo_lens,
+                             params.p_seqlens_qo_indptr);
 
     // Step.1. Calculate the size of cluster and some related information. The size is the number of
     // workgroups
     //         composing each cluster. The size is determined by average packed qo length.
     const int32_t sum_qo_len   = warp_sum(p_lds_qo_lens, params.num_batches);
     const int32_t cluster_size = [&]() {
-        const int32_t avg_qo_len = sum_qo_len / params.num_batches;
-        const int32_t cluster_size =
-            integer_divide_ceil(avg_qo_len, Traits::kPackedQoLenPerWg);
+        const int32_t avg_qo_len   = sum_qo_len / params.num_batches;
+        const int32_t cluster_size = integer_divide_ceil(avg_qo_len, Traits::kPackedQoLenPerWg);
         return opus::min(cluster_size, Traits::kMaxClusterSize);
     }();
     // assert((params.num_cu % cluster_size) == 0);
@@ -315,11 +317,11 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
 
         if(bid < params.num_batches)
         {
-            const int32_t kv_len        = p_lds_kv_lens[bid];
-            const int32_t qo_len        = qo_state.get_seqlen(bid);
-            const int32_t packed_qo_len = qo_len * params.num_heads;
-            num_qo_tiles        = integer_divide_ceil(packed_qo_len, cluster_len_q);
-            p_lds_qo_tiles[bid] = num_qo_tiles;
+            const int32_t kv_len             = p_lds_kv_lens[bid];
+            const int32_t qo_len             = qo_state.get_seqlen(bid);
+            const int32_t packed_qo_len      = qo_len * params.num_heads;
+            num_qo_tiles                     = integer_divide_ceil(packed_qo_len, cluster_len_q);
+            p_lds_qo_tiles[bid]              = num_qo_tiles;
             const int32_t packed_qo_tile_len = opus::min(packed_qo_len, cluster_len_q);
 
             for(int32_t tid = 0; tid < num_qo_tiles; ++tid)
@@ -408,12 +410,11 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
         const int32_t kv_len         = p_lds_kv_lens[bid];
         const int32_t kv_batch_start =
             Traits::kIsSparse ? bid_ori * params.topk : params.p_seqlens_kv_indptr[bid_ori];
-        const int32_t kv_batch_end  = kv_batch_start + kv_len;
-        const int32_t packed_qo_len = qo_len * params.num_heads;
-        const int32_t num_qo_tiles  = integer_divide_ceil(packed_qo_len, cluster_len_q);
+        const int32_t kv_batch_end       = kv_batch_start + kv_len;
+        const int32_t packed_qo_len      = qo_len * params.num_heads;
+        const int32_t num_qo_tiles       = integer_divide_ceil(packed_qo_len, cluster_len_q);
         const int32_t packed_qo_tile_len = opus::min(packed_qo_len, cluster_len_q);
-        const int32_t qo_tile_len =
-            integer_divide_ceil(packed_qo_tile_len, params.num_heads);
+        const int32_t qo_tile_len = integer_divide_ceil(packed_qo_tile_len, params.num_heads);
 
         for(int32_t tid = 0; tid < num_qo_tiles; ++tid)
         {
@@ -497,12 +498,11 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
         const int32_t kv_len         = p_lds_kv_lens[bid];
         const int32_t kv_batch_start =
             Traits::kIsSparse ? bid_ori * params.topk : params.p_seqlens_kv_indptr[bid_ori];
-        const int32_t kv_batch_end  = kv_batch_start + kv_len;
-        const int32_t packed_qo_len = qo_len * params.num_heads;
-        const int32_t num_qo_tiles  = integer_divide_ceil(packed_qo_len, cluster_len_q);
+        const int32_t kv_batch_end       = kv_batch_start + kv_len;
+        const int32_t packed_qo_len      = qo_len * params.num_heads;
+        const int32_t num_qo_tiles       = integer_divide_ceil(packed_qo_len, cluster_len_q);
         const int32_t packed_qo_tile_len = opus::min(packed_qo_len, cluster_len_q);
-        const int32_t qo_tile_len =
-            integer_divide_ceil(packed_qo_tile_len, params.num_heads);
+        const int32_t qo_tile_len = integer_divide_ceil(packed_qo_tile_len, params.num_heads);
 
 #if PRINT_DBG
         if(lane_idx == 0)
@@ -632,10 +632,10 @@ void dispatch_mla_metadata_v1_1_device(const MlaMetadataV1KernelParameter& param
                                        const int32_t lds_size)
 {
     using Traits    = MlaMetadataV11Traits<kPackedQoLenPerWg,
-                                        kMaxClusterSize,
-                                        kQoSplits,
-                                        kUniSeqlenQo,
-                                        kIsSparse>;
+                                           kMaxClusterSize,
+                                           kQoSplits,
+                                           kUniSeqlenQo,
+                                           kIsSparse>;
     const dim3 grid = dim3(1, 1, 1);
     kn_get_mla_metadata_v1_1<Traits><<<grid, warp_size, lds_size, stream>>>(params, coefs);
 }
@@ -695,11 +695,11 @@ void get_mla_metadata_v1_1_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
                 ": only supports #heads in [16, 128], or (#head, uni_seqlen_qo) = (16*N, 1) where "
                 "N is in [2, 8).");
 
-    const int32_t warp_size = dev_prop.warpSize;
+    const int32_t warp_size         = dev_prop.warpSize;
     const int32_t lds_size_in_bytes = [&]() {
         const int32_t max_sq = (max_seqlen_qo > 1) ? max_seqlen_qo : 1;
-        const int32_t qo_tile_per_batch = integer_divide_ceil(
-            max_sq * num_heads, kPackedQoLenPerWg);
+        const int32_t qo_tile_per_batch =
+            integer_divide_ceil(max_sq * num_heads, kPackedQoLenPerWg);
         const int32_t tot_qo_tiles = num_batches * qo_tile_per_batch;
         // this is maximun #clusters
         const int32_t num_clusters = dev_prop.multiProcessorCount;
@@ -714,9 +714,7 @@ void get_mla_metadata_v1_1_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
         const int32_t power_2_num_batches =
             (num_batches <= 1) ? num_batches : next_power_of_two(num_batches);
         const int32_t lds_sort_size =
-            lds_size +
-            integer_least_multiple(power_2_num_batches, warp_size) * 2 *
-                sizeof(int32_t);
+            lds_size + integer_least_multiple(power_2_num_batches, warp_size) * 2 * sizeof(int32_t);
         // Memory for cost. Its size should be the same as #clusters
         lds_size += num_clusters * sizeof(int32_t);
         // Memory for counter of #works for each cluster.
