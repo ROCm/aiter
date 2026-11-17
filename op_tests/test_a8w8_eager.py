@@ -1,355 +1,459 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""The eager fast paths of `gemm_a8w8_bpreshuffle` and `per_token_quant_hip`.
+"""Eager fast paths of `gemm_a8w8_bpreshuffle` and `per_token_quant_hip`.
 
-A bpreshuffle GEMM that runs a CK kernel and a dynamic per-token quant skip
-their custom ops outside torch.compile and call the pybind entries directly.
-These tests hold them to the custom-op path bit for bit, check that they
-decline everything that path may treat differently, and that torch.compile
-and CUDA graphs see what they saw before.
+Outside torch.compile, a bpreshuffle GEMM that runs a CK kernel and a dynamic
+per-token quant call their pybind entries directly instead of the
+aiter::gemm_a8w8_bpreshuffle(_ck) and aiter::per_token_quant_hip /
+dynamic_per_token_scaled_quant custom ops. They must give the custom ops' bits,
+and every call those ops may treat differently must still reach them. Which
+path ran is read from the profiler: each custom-op call is a dispatcher event,
+and the fast paths record none.
 
-Run:
-    python op_tests/test_a8w8_eager.py
-    pytest op_tests/test_a8w8_eager.py -q
+Tensors are created with an explicit device: `torch.set_default_device` is a
+TorchFunctionMode, under which every call takes the custom ops.
 """
 
+import argparse
+import contextlib
+import itertools
+import json
+import os
+import subprocess
 import sys
+import time
 
 import pandas as pd
-import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+from torch.overrides import TorchFunctionMode
+from torch.profiler import ProfilerActivity, profile
+from torch.utils._python_dispatch import TorchDispatchMode
 
 import aiter
-import aiter.jit.core as jit_core
 import aiter.ops.gemm_op_a8w8 as gop
 from aiter import dtypes
-from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_cu_num
-from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops import quant
 from aiter.ops.shuffle import shuffle_weight
-
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="needs a GPU with the CK a8w8 kernels"
-)
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 BF16, FP16, FP8, I8 = dtypes.bf16, dtypes.fp16, dtypes.fp8, dtypes.i8
-# The real custom ops, taken before any test swaps the module attributes.
-GEMM_OP = gop._gemm_a8w8_bpreshuffle_op
-QUANT_OP = quant._per_token_quant_hip_op
-gemm = gop.gemm_a8w8_bpreshuffle
-per_token_quant = quant.per_token_quant_hip
-
-# FP8 linear layers of a PTPC-FP8 checkpoint at TP2 (GDN in/out projections,
-# attention qkv/o), at a 2112-token prefill chunk and a few small batches, plus
-# shapes with no tuned row (the default CK kernel), e.g. 2112x3584x2560 on gfx942.
-MODEL_SHAPES = [
-    (2112, 8192, 2560),
-    (2112, 2560, 3072),
-    (2112, 6656, 2560),
-    (2112, 3584, 2560),
-    (1, 8192, 2560),
-    (33, 2560, 3072),
-]
-
-
-def _config(m, n, k):
-    return gop.get_GEMM_config_with_quant_type(
-        m, n, k, FP8, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
-    )
-
-
-def _runs_ck(m, n, k):
-    config = _config(m, n, k)
-    return config["libtype"] == "ck" if config is not None else True
-
-
-def _tuned_rows(libtype, limit=4):
-    df = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE)
-    df = df[
-        (df["gfx"] == get_gfx())
-        & (df["cu_num"] == get_cu_num())
-        & (df["libtype"] == libtype)
-        & (df["q_dtype_w"] == str(FP8))
-    ].drop_duplicates(["M", "N", "K"])
-    return [(int(r.M), int(r.N), int(r.K)) for r in df.head(limit).itertuples()]
+SUPPORTED_GFX = ["gfx942", "gfx950"]
+CUSTOM_OPS = ("aiter::gemm_a8w8_bpreshuffle", "aiter::per_token_quant_hip")
+CK = {"libtype": "ck", "splitK": 0}
+CONFIGS = {"ck row": CK, "no row": None}
 
 
 def _rand(*shape, dtype=BF16, scale=1.0):
     return torch.randn(*shape, device="cuda").mul_(scale).to(dtype)
 
 
+@contextlib.contextmanager
+def _routed(rows):
+    """Serve the (M, N, K) of ``rows`` from ``rows``, None meaning no tuned row.
+
+    Installed over `get_GEMM_config_with_quant_type`, which both paths call
+    through the module on every call; other shapes keep the tuned lookup.
+    """
+    real = gop.get_GEMM_config_with_quant_type
+
+    def lookup(M, N, K, q_dtype_w, tuned_file=None):
+        if (M, N, K) in rows:
+            row = rows[M, N, K]
+            return None if row is None else dict(row)
+        return real(M, N, K, q_dtype_w, tuned_file)
+
+    gop.get_GEMM_config_with_quant_type = lookup
+    try:
+        yield
+    finally:
+        gop.get_GEMM_config_with_quant_type = real
+
+
+def _custom_op_calls(fn):
+    """``fn()``, and how many custom-op calls the dispatcher saw while it ran;
+    an exception ``fn`` raises is returned in place of its result."""
+    with profile(activities=[ProfilerActivity.CPU]) as prof:
+        try:
+            result = fn()
+        except (AssertionError, RuntimeError, ValueError) as e:
+            result = e
+    return result, sum(e.name in CUSTOM_OPS for e in prof.events())
+
+
+def _gemm(xq, wq, x_scale, w_scale, **kwargs):
+    return gop.gemm_a8w8_bpreshuffle(xq, wq, x_scale, w_scale, **kwargs)
+
+
+def _gemm_op(xq, wq, x_scale, w_scale, dtype=BF16):
+    """The custom-op path, called through the dispatcher."""
+    return torch.ops.aiter.gemm_a8w8_bpreshuffle(
+        xq, wq, x_scale, w_scale, None, dtype, False
+    )
+
+
+def _quant(x, quant_dtype=FP8, **kwargs):
+    return quant.per_token_quant_hip(x, quant_dtype=quant_dtype, **kwargs)
+
+
+def _quant_op(x, quant_dtype=FP8, num_rows=None):
+    """The custom-op path, called through the dispatcher."""
+    return torch.ops.aiter.per_token_quant_hip(x, None, quant_dtype, num_rows, 1)
+
+
 def _weight(n, k):
+    """A preshuffled FP8 weight, its scales, and the weight unshuffled."""
     w, w_scale = aiter.pertoken_quant(_rand(n, k, scale=k**-0.5), quant_dtype=FP8)
-    return shuffle_weight(w, layout=(16, 16)), w_scale
+    return shuffle_weight(w, layout=(16, 16)), w_scale, w
 
 
 def _inputs(m, n, k):
-    xq, x_scale = QUANT_OP(_rand(m, k), quant_dtype=FP8)
-    wq, w_scale = _weight(n, k)
-    return xq, wq, x_scale, w_scale
+    xq, x_scale = _quant_op(_rand(m, k))
+    wq, w_scale, w = _weight(n, k)
+    return xq, wq, x_scale, w_scale, w
 
 
-@pytest.fixture
-def fallbacks(monkeypatch):
-    """Calls that reached the custom ops, by op."""
-    calls = {"gemm": 0, "quant": 0}
-
-    def gemm_op(*args, **kwargs):
-        calls["gemm"] += 1
-        return GEMM_OP(*args, **kwargs)
-
-    def quant_op(*args, **kwargs):
-        calls["quant"] += 1
-        return QUANT_OP(*args, **kwargs)
-
-    monkeypatch.setattr(gop, "_gemm_a8w8_bpreshuffle_op", gemm_op)
-    monkeypatch.setattr(quant, "_per_token_quant_hip_op", quant_op)
-    return calls
+def _gemm_reference(xq, w, x_scale, w_scale, dtype):
+    """The dequantized product by torch in float32."""
+    return ((xq.float() * x_scale) @ (w.float() * w_scale).t()).to(dtype)
 
 
-@pytest.fixture(scope="module", autouse=True)
-def fast_paths_ready():
-    """The first call of each runs the op path, which loads the module; run
-    one so every test starts with the fast paths available."""
-    xq, wq, x_scale, w_scale = _inputs(64, 256, 512)
-    gemm(xq, wq, x_scale, w_scale)
-    per_token_quant(_rand(64, 512), quant_dtype=FP8)
-    assert gop._eager_a8w8_ck and quant._eager_quant
+def _check_bits(y, op_call, what):
+    """``y`` must be the custom op's bits wherever its kernel is reproducible;
+    returns whether the bits were compared."""
+    samples = [op_call() for _ in range(2)]
+    if torch.equal(samples[0], samples[1]) and not torch.equal(y, samples[0]):
+        # Two agreeing samples do not make a kernel reproducible.
+        samples += [op_call() for _ in range(4)]
+    exact = all(torch.equal(s, samples[0]) for s in samples[1:])
+    if exact:
+        differ = int((y != samples[0]).sum())
+        assert differ == 0, f"{what}: {differ} elements differ from the custom op"
+    return exact
 
 
-def test_public_names_are_the_fast_paths():
-    assert aiter.gemm_a8w8_bpreshuffle is gemm
-    assert aiter.per_token_quant_hip is per_token_quant
-    assert quant.get_hip_quant(aiter.QuantType.per_Token) is per_token_quant
+def _same_quant(a, b):
+    (qa, sa), (qb, sb) = a, b
+    return torch.equal(qa.view(torch.uint8), qb.view(torch.uint8)) and torch.equal(
+        sa, sb
+    )
 
 
-@pytest.mark.parametrize("mnk", MODEL_SHAPES, ids=str)
-@pytest.mark.parametrize("dtype", [BF16, FP16], ids=str)
-def test_model_shapes_match_custom_ops(fallbacks, mnk, dtype):
-    m, n, k = mnk
-    if not _runs_ck(m, n, k):
-        pytest.skip("this shape is tuned to a non-CK kernel on this GPU")
-    x = _rand(m, k, dtype=dtype)
-    xq, x_scale = per_token_quant(x, quant_dtype=FP8)
-    xq_ref, x_scale_ref = QUANT_OP(x, quant_dtype=FP8)
-    assert torch.equal(xq.view(torch.uint8), xq_ref.view(torch.uint8))
-    assert torch.equal(x_scale, x_scale_ref)
-    wq, w_scale = _weight(n, k)
-    y = gemm(xq, wq, x_scale, w_scale, dtype=dtype)
-    ref = GEMM_OP(xq, wq, x_scale, w_scale, None, dtype)
-    assert fallbacks == {"gemm": 0, "quant": 0}
-    assert y.dtype == dtype and torch.equal(y, ref)
+def _check_quant(x, q, scale, what):
+    """``scale`` is the torch reference's, and every dequantized value is within
+    one quantization step of ``x``."""
+    _, ref_scale = aiter.pertoken_quant(x, quant_dtype=q.dtype)
+    err = checkAllclose(ref_scale, scale, rtol=1e-3, atol=1e-3, msg=f"{what}: ")
+    assert err == 0, f"{what}: {err:.2%} of the scales off the reference"
+    xf = x.float()
+    off = (q.float() * scale - xf).abs() > xf.abs() * 2**-3 + scale
+    assert not off.any(), f"{what}: {int(off.sum())} values more than a step off"
 
 
-@pytest.mark.parametrize("mnk", _tuned_rows("ck"), ids=str)
-def test_tuned_ck_rows_match_custom_op(fallbacks, mnk):
-    m, n, k = mnk
-    xq, wq, x_scale, w_scale = _inputs(m, n, k)
-    y = gemm(xq, wq, x_scale, w_scale)
-    assert fallbacks["gemm"] == 0
-    assert torch.equal(y, GEMM_OP(xq, wq, x_scale, w_scale))
+def _host_us(fn, iters=50):
+    """Host time of one call in us, over ``iters`` calls queued back to back."""
+    fn()
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    elapsed = time.perf_counter() - start
+    torch.cuda.synchronize()
+    return elapsed / iters * 1e6
 
 
-@pytest.mark.parametrize(
-    "mnk",
-    _tuned_rows("flydsl", 2) + _tuned_rows("cktile", 2) + _tuned_rows("asm", 2),
-    ids=str,
-)
-def test_declines_rows_that_are_not_ck(fallbacks, mnk):
-    m, n, k = mnk
-    xq, wq, x_scale, w_scale = _inputs(m, n, k)
-    y = gemm(xq, wq, x_scale, w_scale)
-    assert fallbacks["gemm"] == 1
-    assert torch.equal(y, GEMM_OP(xq, wq, x_scale, w_scale))
+def _row(case, calls, custom_op, bitwise=None):
+    """A row of the path table: the call reached a custom op iff ``custom_op``."""
+    path = "custom op" if calls else "fast path"
+    assert bool(calls) == custom_op, f"{case}: took the {path}"
+    return {"case": case, "path": path, "custom-op calls": calls, "bitwise": bitwise}
 
 
-def test_replaced_config_function_is_called_every_call(fallbacks, monkeypatch):
-    """A replacement of the module attribute is honoured on every call."""
-    seen = []
-
-    def lookup(m, n, k, q_dtype_w, tuned_file=None):
-        seen.append((m, n, k))
-        return {"libtype": "ck", "splitK": 0}
-
-    monkeypatch.setattr(gop, "get_GEMM_config_with_quant_type", lookup)
-    xq, wq, x_scale, w_scale = _inputs(128, 256, 1024)
-    y1 = gemm(xq, wq, x_scale, w_scale)
-    y2 = gemm(xq, wq, x_scale, w_scale)
-    assert seen == [(128, 256, 1024)] * 2 and fallbacks["gemm"] == 0
-    ref = GEMM_OP(xq, wq, x_scale, w_scale)  # the op path asks it too
-    assert len(seen) == 3
-    torch.testing.assert_close(y1, ref, atol=0, rtol=0)
-    torch.testing.assert_close(y2, ref, atol=0, rtol=0)
-
-
-def test_declines_arguments_the_op_rejects_or_pads(fallbacks):
-    m, n, k = 64, 256, 512
-    xq, wq, x_scale, w_scale = _inputs(m, n, k)
-    with pytest.raises(Exception, match="bias"):
-        gemm(xq, wq, x_scale, w_scale, bias=torch.zeros(n, device="cuda"))
-    with pytest.raises(Exception, match="not supported"):
-        gemm(xq, wq, x_scale, w_scale, dtype=torch.float32)
-    assert fallbacks["gemm"] == 2
-    # K-padded weight: the op zero-pads XQ to the weight's K.
-    wq_pad, w_scale_pad = _weight(n, k + 128)
-    y = gemm(xq, wq_pad, x_scale, w_scale_pad)
-    assert fallbacks["gemm"] == 3
-    assert torch.equal(y, GEMM_OP(xq, wq_pad, x_scale, w_scale_pad))
+@benchmark()
+def test_gemm(m, n, k, dtype, config):
+    """The GEMM fast path against the custom op, for a CK row or no row."""
+    xq, wq, x_scale, w_scale, w = _inputs(m, n, k)
+    candidates = {
+        "op": lambda: _gemm_op(xq, wq, x_scale, w_scale, dtype),
+        "eager": lambda: _gemm(xq, wq, x_scale, w_scale, dtype=dtype),
+    }
+    ref = _gemm_reference(xq, w, x_scale, w_scale, dtype)
+    flops = 2 * m * n * k
+    nbytes = (m * k + n * k) * xq.element_size() + m * n * ref.element_size()
+    ret = {"gfx": get_gfx_runtime()}
+    with _routed({(m, n, k): CONFIGS[config]}):
+        y, calls = _custom_op_calls(candidates["eager"])
+        assert calls == 0, f"{m}x{n}x{k}: the call reached the custom op"
+        assert y.dtype == dtype and y.shape == (m, n)
+        ret["bitwise"] = _check_bits(y, candidates["op"], f"GEMM {m}x{n}x{k}")
+        for name, fn in candidates.items():
+            result, us = run_perftest(fn)
+            err = checkAllclose(ref.float(), result.float(), msg=f"{name}: ")
+            assert err == 0, f"{name}: {err:.2%} of elements off the reference"
+            ret[f"{name} us"] = us
+            ret[f"{name} host us"] = _host_us(fn)
+            ret[f"{name} TFLOPS"] = flops / us / 1e6
+            ret[f"{name} TB/s"] = nbytes / us / 1e6
+            ret[f"{name} err"] = err
+    return ret
 
 
-def test_declines_grad_tracked_inputs(fallbacks):
-    xq, wq, x_scale, w_scale = _inputs(64, 256, 512)
-    w_scale.requires_grad_(True)
-    y = gemm(xq, wq, x_scale, w_scale)  # grad mode on: autograd must see the op
-    assert fallbacks["gemm"] == 1
-    with torch.no_grad():
-        z = gemm(xq, wq, x_scale, w_scale)
-    assert fallbacks["gemm"] == 1 and torch.equal(y.detach(), z)
-    x = _rand(64, 512).requires_grad_(True)
-    q, s = per_token_quant(x, quant_dtype=FP8)
-    assert fallbacks["quant"] == 1
-    with torch.no_grad():
-        q2, s2 = per_token_quant(x, quant_dtype=FP8)
-    assert fallbacks["quant"] == 1
-    assert torch.equal(q.view(torch.uint8), q2.view(torch.uint8))
-    assert torch.equal(s.detach(), s2)
+@benchmark()
+def test_quant(shape, in_dtype, quant_dtype):
+    """The quant fast path against the custom op."""
+    x = _rand(*shape, dtype=in_dtype, scale=3.0)
+    candidates = {
+        "op": lambda: _quant_op(x, quant_dtype),
+        "eager": lambda: _quant(x, quant_dtype=quant_dtype),
+    }
+    (q, scale), calls = _custom_op_calls(candidates["eager"])
+    assert calls == 0, f"{shape}: the call reached the custom op"
+    assert q.dtype == quant_dtype and q.shape == x.shape
+    assert scale.dtype == dtypes.fp32 and scale.shape == (*shape[:-1], 1)
+    assert _same_quant((q, scale), candidates["op"]()), "not the custom op's bits"
+    nbytes = x.numel() * (x.element_size() + q.element_size())
+    ret = {"gfx": get_gfx_runtime()}
+    for name, fn in candidates.items():
+        (q, scale), us = run_perftest(fn)
+        _check_quant(x, q, scale, name)
+        ret[f"{name} us"] = us
+        ret[f"{name} host us"] = _host_us(fn)
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+    return ret
 
 
-def test_declines_under_fake_tensor_mode(fallbacks):
-    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
-
-    with FakeTensorMode():
-        x = torch.empty(2112, 2560, dtype=BF16, device="cuda")
-        xq, x_scale = per_token_quant(x, quant_dtype=FP8)
-        wq = torch.empty(8192, 2560, dtype=FP8, device="cuda")
-        w_scale = torch.empty(8192, 1, dtype=torch.float32, device="cuda")
-        y = gemm(xq, wq, x_scale, w_scale)
-    assert isinstance(xq, FakeTensor) and isinstance(y, FakeTensor)
-    assert tuple(y.shape) == (2112, 8192) and tuple(x_scale.shape) == (2112, 1)
-    assert fallbacks == {"gemm": 1, "quant": 1}
-    # Fake tensors outside their mode still have to reach the ops' fakes.
-    y2 = gemm(xq, wq, x_scale, w_scale)
-    assert isinstance(y2, FakeTensor) and fallbacks["gemm"] == 2
-
-
-def test_dispatch_and_function_modes_see_the_ops(fallbacks):
-    from torch.overrides import TorchFunctionMode
-    from torch.utils._python_dispatch import TorchDispatchMode
-
-    seen = []
-
-    class Record(TorchDispatchMode):
-        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-            seen.append(str(func))
-            return func(*args, **(kwargs or {}))
-
-    class Passthrough(TorchFunctionMode):
-        def __torch_function__(self, func, types, args=(), kwargs=None):
-            return func(*args, **(kwargs or {}))
-
+def check_first_calls():
+    """The first call of each op in a process runs the custom op, which loads
+    its module; the calls after it take the fast path."""
+    xq, wq, x_scale, w_scale, _ = _inputs(64, 256, 512)
     x = _rand(64, 512)
-    wq, w_scale = _weight(256, 512)
-    with Record():
-        xq, x_scale = per_token_quant(x, quant_dtype=FP8)
-        gemm(xq, wq, x_scale, w_scale)
-    assert any("aiter.per_token_quant_hip" in s for s in seen)
-    assert any("aiter.gemm_a8w8_bpreshuffle" in s for s in seen)
-    with Passthrough():
-        xq, x_scale = per_token_quant(x, quant_dtype=FP8)
-        gemm(xq, wq, x_scale, w_scale)
-    assert fallbacks == {"gemm": 2, "quant": 2}
+    rows = []
+    with _routed({(64, 256, 512): CK}):
+        for i in range(1, 4):
+            _, calls = _custom_op_calls(lambda: _gemm(xq, wq, x_scale, w_scale))
+            rows.append(_row(f"GEMM, call {i} of the process", calls, i == 1))
+    for i in range(1, 4):
+        _, calls = _custom_op_calls(lambda: _quant(x))
+        rows.append(_row(f"quant, call {i} of the process", calls, i == 1))
+    return rows
 
 
-def test_rebound_ops_take_the_custom_op(fallbacks, monkeypatch):
-    """A replaced inner op is what the op path calls, so the fast path, which
-    would stand in for it, declines."""
+def _logged_calls():
+    """`check_argument_logging`'s child: a quant and a GEMM, three times."""
+    xq, wq, x_scale, w_scale, _ = _inputs(64, 256, 512)
+    x = _rand(64, 512)
     calls = []
+    with _routed({(64, 256, 512): CK}):
+        for _ in range(3):
+            calls.append(_custom_op_calls(lambda: _quant(x))[1])
+            calls.append(_custom_op_calls(lambda: _gemm(xq, wq, x_scale, w_scale))[1])
+    print(json.dumps(calls))
+
+
+def check_argument_logging():
+    """With AITER_LOG_MORE=2 set at start, which logs every op's arguments, each
+    call takes the custom op."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    code = (
+        f"import sys; sys.path.insert(0, {here!r}); "
+        "import test_a8w8_eager as t; t._logged_calls()"
+    )
+    child = subprocess.run(
+        [sys.executable, "-c", code],
+        env={**os.environ, "AITER_LOG_MORE": "2"},
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    assert child.returncode == 0, child.stderr[-4000:]
+    calls = json.loads(child.stdout.strip().splitlines()[-1])
+    return [
+        _row(f"AITER_LOG_MORE=2, {('quant', 'GEMM')[i % 2]} call {i // 2 + 1}", c, True)
+        for i, c in enumerate(calls)
+    ]
+
+
+def check_gemm_declines():
+    """GEMM calls the custom op treats differently reach it."""
+    m, n, k = 64, 256, 512
+    xq, wq, x_scale, w_scale, _ = _inputs(m, n, k)
+    rows = []
+    with _routed({(m, n, k): CK}):
+        bias = torch.zeros(n, device="cuda")
+        for case, kwargs, error in (
+            ("bias", {"bias": bias}, "bias"),
+            ("float32 output", {"dtype": torch.float32}, "not supported"),
+        ):
+            err, calls = _custom_op_calls(
+                lambda kwargs=kwargs: _gemm(xq, wq, x_scale, w_scale, **kwargs)
+            )
+            assert error in str(err), f"{case}: not rejected by the custom op"
+            rows.append(_row(f"GEMM, {case}", calls, True))
+
+        ws = w_scale.clone().requires_grad_(True)
+        _, calls = _custom_op_calls(lambda: _gemm(xq, wq, x_scale, ws))
+        rows.append(_row("GEMM, w_scale requires grad", calls, True))
+        with torch.no_grad():
+            y, calls = _custom_op_calls(lambda: _gemm(xq, wq, x_scale, ws))
+        exact = _check_bits(y, lambda: _gemm_op(xq, wq, x_scale, w_scale), "no_grad")
+        rows.append(_row("GEMM, under no_grad", calls, False, exact))
+
+    # The custom op zero-pads XQ to a K-padded weight's K.
+    wq_pad, w_scale_pad, _ = _weight(n, k + 128)
+    with _routed({(m, n, k): CK}):
+        y, calls = _custom_op_calls(lambda: _gemm(xq, wq_pad, x_scale, w_scale_pad))
+    padded = _gemm_op(xq, wq_pad, x_scale, w_scale_pad)
+    assert torch.equal(y, padded), "K-padded weight: not the custom op's bits"
+    rows.append(_row("GEMM, K-padded weight", calls, True))
+
+    m, n, k = 2112, 2560, 3072
+    xq, wq, x_scale, w_scale, _ = _inputs(m, n, k)
+    with _routed({(m, n, k): {"libtype": "cktile", "splitK": 0}}):
+        y, calls = _custom_op_calls(lambda: _gemm(xq, wq, x_scale, w_scale))
+        cktile = _gemm_op(xq, wq, x_scale, w_scale)
+    assert torch.equal(y, cktile), "CKTile row: not the custom op's bits"
+    rows.append(_row("GEMM, CKTile row", calls, True))
+    return rows
+
+
+def check_quant_declines():
+    """Quant calls the custom op treats differently reach it."""
+    x = _rand(64, 512)
+    err, calls = _custom_op_calls(lambda: _quant(x, scale=torch.ones(1, device="cuda")))
+    assert "static per token quant" in str(err), "static scale not rejected"
+    rows = [_row("quant, static scale", calls, True)]
+    xg = x.clone().requires_grad_(True)
+    _, calls = _custom_op_calls(lambda: _quant(xg))
+    rows.append(_row("quant, x requires grad", calls, True))
+    with torch.no_grad():
+        out, calls = _custom_op_calls(lambda: _quant(xg))
+    assert _same_quant(out, _quant_op(x)), "under no_grad: not the custom op's bits"
+    rows.append(_row("quant, under no_grad", calls, False, True))
+
+    num_rows = torch.tensor([100], dtype=torch.int32, device="cuda")
+    x = _rand(256, 2560)
+    (q, s), calls = _custom_op_calls(lambda: _quant(x, num_rows=num_rows))
+    q_op, s_op = _quant_op(x, num_rows=num_rows)
+    assert _same_quant((q[:100], s[:100]), (q_op[:100], s_op[:100]))
+    rows.append(_row("quant, num_rows", calls, False, True))
+    return rows
+
+
+def check_modes():
+    """Under dispatch or function modes and fake tensors both ops reach their
+    custom ops."""
+    m, n, k = 64, 256, 512
+    xq, wq, x_scale, w_scale, _ = _inputs(m, n, k)
+    x = _rand(m, k)
+    rows = []
+    with _routed({(m, n, k): CK}):
+        seen = []
+
+        class Record(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                seen.append(str(func))
+                return func(*args, **(kwargs or {}))
+
+        class Passthrough(TorchFunctionMode):
+            def __torch_function__(self, func, types, args=(), kwargs=None):
+                return func(*args, **(kwargs or {}))
+
+        with Record():
+            _quant(x)
+            _gemm(xq, wq, x_scale, w_scale)
+        for op in ("per_token_quant_hip", "gemm_a8w8_bpreshuffle"):
+            calls = sum(name.startswith(f"aiter.{op}.") for name in seen)
+            rows.append(_row(f"TorchDispatchMode, {op}", calls, True))
+        with Passthrough():
+            _, calls = _custom_op_calls(lambda: _quant(x))
+            rows.append(_row("TorchFunctionMode, quant", calls, True))
+            _, calls = _custom_op_calls(lambda: _gemm(xq, wq, x_scale, w_scale))
+            rows.append(_row("TorchFunctionMode, GEMM", calls, True))
+
+        with FakeTensorMode():
+            xf = torch.empty(m, k, dtype=BF16, device="cuda")
+            (qf, sf), calls = _custom_op_calls(lambda: _quant(xf))
+            rows.append(_row("FakeTensorMode, quant", calls, True))
+            wf = torch.empty(n, k, dtype=FP8, device="cuda")
+            wsf = torch.empty(n, 1, dtype=dtypes.fp32, device="cuda")
+            yf, calls = _custom_op_calls(lambda: _gemm(qf, wf, sf, wsf))
+            rows.append(_row("FakeTensorMode, GEMM", calls, True))
+        assert isinstance(qf, FakeTensor) and tuple(sf.shape) == (m, 1)
+        assert isinstance(yf, FakeTensor) and tuple(yf.shape) == (m, n)
+        # Fake tensors outside their mode still have to reach the ops' fakes.
+        yf, calls = _custom_op_calls(lambda: _gemm(qf, wf, sf, wsf))
+        assert isinstance(yf, FakeTensor)
+        rows.append(_row("fake tensors outside their mode, GEMM", calls, True))
+    return rows
+
+
+def check_replaced_lookup():
+    """A function installed over `get_GEMM_config_with_quant_type` is asked on
+    every call, and its answer is never cached."""
+    m, n, k = 128, 256, 1024
+    xq, wq, x_scale, w_scale, _ = _inputs(m, n, k)
+    asked = []
+
+    def lookup(M, N, K, q_dtype_w, tuned_file=None):
+        asked.append((M, N, K))
+        return dict(CK)
+
+    real = gop.get_GEMM_config_with_quant_type
+    gop.get_GEMM_config_with_quant_type = lookup
+    try:
+        rows = []
+        for i in range(1, 3):
+            y, calls = _custom_op_calls(lambda: _gemm(xq, wq, x_scale, w_scale))
+            assert asked == [(m, n, k)] * i
+            rows.append(_row(f"replaced lookup, call {i}", calls, False))
+        assert torch.equal(y, _gemm_op(xq, wq, x_scale, w_scale))
+        assert len(asked) == 3, "the custom op asks the replaced lookup too"
+    finally:
+        gop.get_GEMM_config_with_quant_type = real
+    return rows
+
+
+def check_rebound_ops():
+    """With an inner op replaced, the outer custom op calls the replacement, so
+    the fast path, which would stand in for the original, declines."""
+    m, n, k = 64, 256, 512
+    xq, wq, x_scale, w_scale, _ = _inputs(m, n, k)
+    x = _rand(m, k)
     ck, dq = gop.gemm_a8w8_bpreshuffle_ck, quant.dynamic_per_token_scaled_quant
+    called = []
 
     def ck_spy(*args, **kwargs):
-        calls.append("ck")
+        called.append("ck")
         return ck(*args, **kwargs)
 
     def dq_spy(*args, **kwargs):
-        calls.append("quant")
+        called.append("quant")
         return dq(*args, **kwargs)
 
-    monkeypatch.setattr(gop, "gemm_a8w8_bpreshuffle_ck", ck_spy)
-    monkeypatch.setattr(quant, "dynamic_per_token_scaled_quant", dq_spy)
-    m, n, k = 2112, 2560, 3072
-    if not _runs_ck(m, n, k):
-        pytest.skip("this shape is tuned to a non-CK kernel on this GPU")
-    xq, x_scale = per_token_quant(_rand(m, k), quant_dtype=FP8)
-    wq, w_scale = _weight(n, k)
-    gemm(xq, wq, x_scale, w_scale)
-    assert fallbacks == {"gemm": 1, "quant": 1} and calls == ["quant", "ck"]
+    gop.gemm_a8w8_bpreshuffle_ck = ck_spy
+    quant.dynamic_per_token_scaled_quant = dq_spy
+    try:
+        with _routed({(m, n, k): CK}):
+            _, quant_calls = _custom_op_calls(lambda: _quant(x))
+            _, gemm_calls = _custom_op_calls(lambda: _gemm(xq, wq, x_scale, w_scale))
+    finally:
+        gop.gemm_a8w8_bpreshuffle_ck = ck
+        quant.dynamic_per_token_scaled_quant = dq
+    assert called == ["quant", "ck"], called
+    return [
+        _row("quant, inner op replaced", quant_calls, True),
+        _row("GEMM, inner op replaced", gemm_calls, True),
+    ]
 
 
-def test_first_call_runs_the_custom_op(fallbacks, monkeypatch):
-    monkeypatch.setattr(gop, "_eager_a8w8_ck", None)
-    monkeypatch.setattr(quant, "_eager_quant", None)
-    x = _rand(64, 512)
-    wq, w_scale = _weight(256, 512)
-    for _ in range(2):
-        xq, x_scale = per_token_quant(x, quant_dtype=FP8)
-        gemm(xq, wq, x_scale, w_scale)
-    assert fallbacks == {"gemm": 1, "quant": 1}
-    assert gop._eager_a8w8_ck and quant._eager_quant
-
-
-def test_argument_logging_keeps_the_custom_op(fallbacks, monkeypatch):
-    monkeypatch.setattr(jit_core, "AITER_LOG_MORE", 2)
-    monkeypatch.setattr(gop, "_eager_a8w8_ck", None)
-    monkeypatch.setattr(quant, "_eager_quant", None)
-    monkeypatch.setattr(
-        "aiter.test_common.log_args", lambda *a, **k: None, raising=False
-    )
-    x = _rand(64, 512)
-    wq, w_scale = _weight(256, 512)
-    for _ in range(2):
-        xq, x_scale = per_token_quant(x, quant_dtype=FP8)
-        gemm(xq, wq, x_scale, w_scale)
-    assert fallbacks == {"gemm": 2, "quant": 2}
-    assert gop._eager_a8w8_ck is False and quant._eager_quant is False
-
-
-@pytest.mark.parametrize("shape", [(2112, 2560), (1, 3072), (4, 33, 2560)], ids=str)
-@pytest.mark.parametrize("in_dtype", [BF16, FP16], ids=str)
-@pytest.mark.parametrize("quant_dtype", [FP8, I8], ids=str)
-def test_quant_matches_custom_op(fallbacks, shape, in_dtype, quant_dtype):
-    x = _rand(*shape, dtype=in_dtype, scale=3.0)
-    q, s = per_token_quant(x, quant_dtype=quant_dtype)
-    q_ref, s_ref = QUANT_OP(x, quant_dtype=quant_dtype)
-    assert fallbacks["quant"] == 0
-    assert q.dtype == quant_dtype and q.shape == x.shape
-    assert s.dtype == torch.float32 and s.shape == (*shape[:-1], 1)
-    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
-    assert torch.equal(s, s_ref)
-
-
-def test_quant_num_rows(fallbacks):
-    x = _rand(256, 2560)
-    num_rows = torch.tensor([100], dtype=torch.int32, device="cuda")
-    q, s = per_token_quant(x, quant_dtype=FP8, num_rows=num_rows)
-    q_ref, s_ref = QUANT_OP(x, quant_dtype=FP8, num_rows=num_rows)
-    assert torch.equal(q[:100].view(torch.uint8), q_ref[:100].view(torch.uint8))
-    assert torch.equal(s[:100], s_ref[:100])
-    assert fallbacks["quant"] == 0
-
-
-def test_static_quant_scale_takes_the_custom_op(fallbacks):
-    x = _rand(64, 512)
-    with pytest.raises(Exception, match="static per token quant"):
-        per_token_quant(x, scale=torch.ones(1, device="cuda"), quant_dtype=FP8)
-    assert fallbacks["quant"] == 1
-
-
-def test_compile_records_the_custom_ops():
+def check_compile():
+    """torch.compile records both custom ops and gives the eager bits."""
     m, n, k = 256, 512, 1024
     x = _rand(m, k)
-    wq, w_scale = _weight(n, k)
+    wq, w_scale, _ = _weight(n, k)
     targets = []
 
     def backend(gm, example_inputs):
@@ -357,48 +461,125 @@ def test_compile_records_the_custom_ops():
         return gm.forward
 
     def fn(x, wq, w_scale):
-        xq, x_scale = per_token_quant(x, quant_dtype=FP8)
-        return gemm(xq, wq, x_scale, w_scale)
+        xq, x_scale = _quant(x)
+        return _gemm(xq, wq, x_scale, w_scale)
 
     torch._dynamo.reset()
-    y = torch.compile(fn, backend=backend, fullgraph=True)(x, wq, w_scale)
-    torch.cuda.synchronize()
-    assert "aiter.per_token_quant_hip" in targets
-    assert "aiter.gemm_a8w8_bpreshuffle" in targets
-    xq, x_scale = QUANT_OP(x, quant_dtype=FP8)
-    assert torch.equal(y, GEMM_OP(xq, wq, x_scale, w_scale))
+    with _routed({(m, n, k): CK}):
+        y = torch.compile(fn, backend=backend, fullgraph=True)(x, wq, w_scale)
+        xq, x_scale = _quant_op(x)
+        assert torch.equal(y, _gemm_op(xq, wq, x_scale, w_scale))
+    ops = sum(
+        t in ("aiter.per_token_quant_hip", "aiter.gemm_a8w8_bpreshuffle")
+        for t in targets
+    )
+    assert ops == 2, f"the compiled graph holds {ops} of the 2 custom ops"
+    return [_row("torch.compile, custom ops in the graph", ops, True)]
 
 
-def test_cuda_graph_capture_and_replay(fallbacks):
+def check_cuda_graph():
+    """Both fast paths captured in a CUDA graph replay to the custom ops' bits."""
     m, n, k = 2112, 8192, 2560
-    if not _runs_ck(m, n, k):
-        pytest.skip("this shape is tuned to a non-CK kernel on this GPU")
     x = _rand(m, k)
-    wq, w_scale = _weight(n, k)
-    xq, x_scale = per_token_quant(x, quant_dtype=FP8)  # warm up outside the capture
-    gemm(xq, wq, x_scale, w_scale)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        xq, x_scale = per_token_quant(x, quant_dtype=FP8)
-        y = gemm(xq, wq, x_scale, w_scale)
-    torch.cuda.current_stream().wait_stream(stream)
-    assert fallbacks == {"gemm": 0, "quant": 0}
-    for _ in range(2):
-        x.copy_(_rand(m, k))
-        graph.replay()
-        torch.cuda.synchronize()
-        xq_ref, x_scale_ref = QUANT_OP(x, quant_dtype=FP8)
-        assert torch.equal(xq.view(torch.uint8), xq_ref.view(torch.uint8))
-        assert torch.equal(y, GEMM_OP(xq_ref, wq, x_scale_ref, w_scale))
-    graph.reset()
+    wq, w_scale, _ = _weight(n, k)
+    rows = []
+    with _routed({(m, n, k): CK}):
+        xq, x_scale = _quant(x)  # load both modules outside the capture
+        _gemm(xq, wq, x_scale, w_scale)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+
+        def capture():
+            with torch.cuda.graph(graph, stream=stream):
+                q, s = _quant(x)
+                return q, s, _gemm(q, wq, s, w_scale)
+
+        (q, s, y), calls = _custom_op_calls(capture)
+        torch.cuda.current_stream().wait_stream(stream)
+        for i in range(2):
+            x.copy_(_rand(m, k))
+            graph.replay()
+            torch.cuda.synchronize()
+            q_op, s_op = _quant_op(x)
+            assert _same_quant((q, s), (q_op, s_op)), "replay: quant differs"
+            exact = _check_bits(
+                y, lambda q=q_op, s=s_op: _gemm_op(q, wq, s, w_scale), "replay"
+            )
+            rows.append(_row(f"CUDA graph, replay {i}", calls, False, exact))
+        graph.reset()
+    return rows
+
+
+def summarize(name, rows):
+    df = pd.DataFrame(rows)
+    aiter.logger.info("%s (markdown):\n%s", name, df.to_markdown(index=False))
 
 
 def main():
-    status = pytest.main([__file__, "-q", "-p", "no:cacheprovider"])
-    return 0 if status == pytest.ExitCode.OK else 1
+    gfx = get_gfx_runtime()
+    if gfx not in SUPPORTED_GFX:
+        aiter.logger.warning("a8w8 eager fast paths: %s not covered", gfx)
+        return
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="eager fast paths of gemm_a8w8_bpreshuffle and "
+        "per_token_quant_hip vs the custom ops",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default=[BF16, FP16],
+        help="GEMM output and quant input dtypes. e.g.: -d bf16",
+    )
+    parser.add_argument(
+        "-s",
+        "--mnk",
+        type=dtypes.str2tuple,
+        nargs="*",
+        # FP8 linear layers of Qwen3.8-Flash-Next PTPC FP8 at TP2 (GDN in/out
+        # projections, attention qkv/o) for a 2112-token prefill chunk, and
+        # small batches.
+        default=[
+            (2112, 8192, 2560),
+            (2112, 2560, 3072),
+            (2112, 6656, 2560),
+            (2112, 3584, 2560),
+            (1, 8192, 2560),
+            (33, 2560, 3072),
+        ],
+        help="GEMM M,N,K shapes. e.g.: -s 2112,8192,2560",
+    )
+    args = parser.parse_args()
+
+    # First, while this process has run neither op yet.
+    paths = check_first_calls()
+
+    df = [
+        test_gemm(m, n, k, dtype, config)
+        for (m, n, k), dtype, config in itertools.product(args.mnk, args.dtype, CONFIGS)
+    ]
+    summarize("gemm_a8w8_bpreshuffle eager fast path vs custom op", df)
+    df = [
+        test_quant(shape, in_dtype, quant_dtype)
+        for shape, in_dtype, quant_dtype in itertools.product(
+            [(2112, 2560), (1, 3072), (4, 33, 2560)], args.dtype, [FP8, I8]
+        )
+    ]
+    summarize("per_token_quant_hip eager fast path vs custom op", df)
+
+    paths += check_gemm_declines()
+    paths += check_quant_declines()
+    paths += check_modes()
+    paths += check_replaced_lookup()
+    paths += check_rebound_ops()
+    paths += check_compile()
+    paths += check_cuda_graph()
+    paths += check_argument_logging()
+    summarize("a8w8 eager path checks", paths)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
