@@ -3223,6 +3223,13 @@ def _unified_attention_gluon_kernel_2d(
     SPLITS_IN_AXIS1: gl.constexpr = False,
     # > 0 (LOOP_VARIANT 3): grid axis 1 holds SEQ_Q_BLOCKS q blocks per sequence (see the index setup)
     SEQ_Q_BLOCKS: gl.constexpr = 0,
+    # split-KV: split 0 writes the neutral M / L of the empty splits (False: the merge derives each row's split count
+    # from seq_lens itself and reads only the live splits)
+    SPLIT_NEUTRAL_ML: gl.constexpr = True,
+    # SEQ_Q_BLOCKS > 0: issue the seq_len load together with the cu_seqlens loads (before the q-block exit) and a
+    # one-lane load of the sequence's block-table row start, so the block-table entry load that follows seq_len finds
+    # its translation and line warm
+    EARLY_SEQ_LOADS: gl.constexpr = False,
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     kv_head_idx = gl.program_id(0)
@@ -3293,6 +3300,15 @@ def _unified_attention_gluon_kernel_2d(
         # query length exit below.
         seq_idx = q_block_global_idx // SEQ_Q_BLOCKS
         q_block_local_idx = q_block_global_idx % SEQ_Q_BLOCKS
+        if EARLY_SEQ_LOADS:
+            seq_len_early = gl.load(seq_lens_ptr + seq_idx)
+            bt_warm_layout: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
+            bt_warm_offs = gl.arange(0, 32 * NUM_WARPS, layout=bt_warm_layout)
+            bt_row_warm = gl.load(
+                block_tables_ptr + seq_idx * block_table_stride + bt_warm_offs * 0,
+                mask=bt_warm_offs == 0,
+                other=0,
+            )
         cur_batch_in_all_start_index = gl.load(query_start_len_ptr + seq_idx)
         cur_batch_in_all_stop_index = gl.load(query_start_len_ptr + seq_idx + 1)
         cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
@@ -3434,7 +3450,10 @@ def _unified_attention_gluon_kernel_2d(
     else:
         q_scales = None
 
-    seq_len = gl.load(seq_lens_ptr + seq_idx)
+    if EARLY_SEQ_LOADS and SEQ_Q_BLOCKS > 0:
+        seq_len = seq_len_early
+    else:
+        seq_len = gl.load(seq_lens_ptr + seq_idx)
     if LOOP_VARIANT == 3:
         # seq_lens may be int64: keep the ring's tile and LDS slot arithmetic in int32.
         seq_len = seq_len.to(gl.int32)
@@ -3805,24 +3824,53 @@ def _unified_attention_gluon_kernel_2d(
             win_mask_end,
         )
 
+    if EARLY_SEQ_LOADS and SEQ_Q_BLOCKS > 0:
+        # keeps the block-table row load alive; an asm before the loop would turn the ring's scalar block-table loads
+        # into vector loads
+        gl.inline_asm_elementwise(
+            "; bt row warm keep-alive $0 $1",
+            "=v,v",
+            [bt_row_warm],
+            dtype=gl.int32,
+            is_pure=False,
+            pack=1,
+        )
+
     if NUM_SPLITS > 1:
         # Split-KV: emit un-reduced partials; the reduction happens separately.
         # The stores touch no LDS, so the ring's tail drain follows them.
-        pgm.store_partial(
-            M,
-            L,
-            acc,
-            partial_m_ptr,
-            partial_l_ptr,
-            partial_acc_ptr,
-            split_idx,
-            q_block_local_idx,
-            cur_batch_in_all_start_index,
-            kv_head_idx,
-            cur_batch_query_len,
-            NUM_SPLITS,
-            pgm.num_splits_eff,
-        )
+        if SPLIT_NEUTRAL_ML:
+            pgm.store_partial(
+                M,
+                L,
+                acc,
+                partial_m_ptr,
+                partial_l_ptr,
+                partial_acc_ptr,
+                split_idx,
+                q_block_local_idx,
+                cur_batch_in_all_start_index,
+                kv_head_idx,
+                cur_batch_query_len,
+                NUM_SPLITS,
+                pgm.num_splits_eff,
+            )
+        else:
+            pgm.store_partial(
+                M,
+                L,
+                acc,
+                partial_m_ptr,
+                partial_l_ptr,
+                partial_acc_ptr,
+                split_idx,
+                q_block_local_idx,
+                cur_batch_in_all_start_index,
+                kv_head_idx,
+                cur_batch_query_len,
+                NUM_SPLITS,
+                None,
+            )
         if BT_WARM:
             # keep the block-table warm loads alive in the split build too (otherwise dead-code eliminated)
             gl.inline_asm_elementwise(

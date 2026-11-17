@@ -15,6 +15,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_3d,
     merge_kv_ring_splits,
     merge_kv_ring_splits_full,
+    merge_kv_ring_splits_seqlen,
     reduce_segments,
     unified_attention_3d_split_rebalance_kernel,
 )
@@ -145,6 +146,45 @@ _KV_RING_MERGE_HEADS = 8
 # fewer heads per merge program until the merge grid has about 2 programs per CU
 _KV_RING_MERGE_PROGRAMS = 192
 _KV_RING_MERGE_TILE = 64  # heads x splits per merge loop step
+# Long-context short-query batches of a few sequences (see _gfx1250_ring_split_config):
+# the split count follows the CU count instead of the batch size. The grid follows
+# max_seqlen_k, which a CUDA-graph caller may set far above the real lengths; each
+# program carves its sequence's real length (seqused_k) into the live splits, the
+# other splits exit, and for full attention merge_kv_ring_splits_seqlen reads only
+# the live splits of each row. AITER_GFX1250_2D_KV_RING_SPLIT=0 turns this off.
+_GFX1250_2D_KV_RING_SPLIT = (
+    os.environ.get("AITER_GFX1250_2D_KV_RING_SPLIT", "1") == "1"
+    and os.environ.get("AITER_GFX1250_2D_KV_RING", "1") == "1"
+)
+_GFX1250_RING_SPLIT_FULL = {
+    "BLOCK_M": 64,
+    "num_warps": 2,
+    "waves_per_eu": 2,
+    "LOOP_VARIANT": 3,
+    "NUM_BUFFERS": 2,
+    "RING_D": 6,
+    "TILE_SIZE": 64,
+}
+_GFX1250_RING_SPLIT_SW = {
+    "BLOCK_M": 32,
+    "num_warps": 2,
+    "waves_per_eu": 2,
+    "LOOP_VARIANT": 3,
+    "NUM_BUFFERS": 2,
+    "RING_D": 5,
+    "TILE_SIZE": 64,
+}
+_GFX1250_RING_SPLIT_FULL_SEQS = (1, 16)
+_GFX1250_RING_SPLIT_SW_SEQS = (4, 8)
+_GFX1250_RING_SPLIT_MAX_SPLITS = 96  # 1 sequence
+_GFX1250_RING_SPLIT_MAX_SPLITS_MULTI = 32  # 2-16 sequences
+# split index in grid axis 2 up to this many sequences, so the live splits of all
+# sequences get consecutive program ids
+_GFX1250_RING_SPLIT_AXIS2_MAX_SEQS = 4
+_GFX1250_RING_SPLIT_SW_MAX_SPLITS = 8
+_GFX1250_RING_SPLIT_SW_MIN_SEQLEN_K = 1792
+# shortest max_seqlen_k for the full-attention split, per sequence count (6 and up: 2048)
+_GFX1250_RING_SPLIT_MIN_SEQLEN_K = {1: 24576, 2: 12288, 3: 8192, 4: 6144, 5: 3072}
 
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -378,6 +418,8 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
             return True
         if params.all_decode:
             return False
+        if _gfx1250_ring_split_config(params, backend) is not None:
+            return True
         if _gfx1250_kv_ring_2d(params, backend):
             # short queries at small batches: the 2D loop variant 3 splits the KV
             # walk itself (see _unified_attention_2d_gfx1250)
@@ -1294,6 +1336,54 @@ def _gfx1250_kv_ring_2d(params: _UAParams, backend: str) -> bool:
     )
 
 
+def _gfx1250_ring_split_config(params: _UAParams, backend: str):
+    """The 2D loop variant 3 config for long-context short-query batches of a few
+    sequences (see _GFX1250_2D_KV_RING_SPLIT), or None. Shuffled bf16 KV, page 64,
+    head 64, GQA group 8, 2-8 query tokens a sequence, no sinks, bf16 output; full
+    attention up to 16 sequences from a max_seqlen_k floor, sliding window 4-8."""
+    if not (
+        _GFX1250_2D_KV_RING_SPLIT
+        and backend == "gluon"
+        and IS_DEVICE_ARCH_GFX12
+        and _unified_attention_kernel_2d_gfx1250 is not None
+        and params.shuffled_kv_cache
+        and params.q_dtype == torch.bfloat16
+        and params.kv_cache_dtype == torch.bfloat16
+        and params.out.dtype == torch.bfloat16
+        and not params.all_decode
+        and 2 <= int(params.max_seqlen_q) <= 8
+        and params.block_size == 64
+        and params.head_size == 64
+        and params.head_size_v == 64
+        and params.num_queries_per_kv == 8
+        and params.softcap == 0
+        and params.sinks is None
+        and params.alibi_slopes is None
+        and params.qq_bias is None
+        and params.output_scale is None
+        and params.q_descale is None
+        and params.k_descale is None
+        and params.v_descale is None
+    ):
+        return None
+    if params.sliding_window > 0:
+        lo, hi = _GFX1250_RING_SPLIT_SW_SEQS
+        config = _GFX1250_RING_SPLIT_SW
+    else:
+        lo, hi = _GFX1250_RING_SPLIT_FULL_SEQS
+        config = _GFX1250_RING_SPLIT_FULL
+    if not lo <= params.num_seqs <= hi:
+        return None
+    if params.sliding_window == 0 and int(
+        params.max_seqlen_k
+    ) < _GFX1250_RING_SPLIT_MIN_SEQLEN_K.get(params.num_seqs, 2048):
+        return None
+    # the 2D wrapper drops to loop variant 0 when the query rows fit a smaller block
+    if triton.next_power_of_2(int(params.max_seqlen_q) * 8) < config["BLOCK_M"]:
+        return None
+    return dict(config)
+
+
 def _gfx1250_kv_ring_window_qsplit(params: _UAParams, loop_variant: int) -> bool:
     """Sliding-window batches of 17-32 sequences: BLOCK_M 32 on 2 warps."""
     return (
@@ -1339,7 +1429,11 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     """
     assert params.softcap == 0, "Softcap is not supported"
 
-    config = get_unified_attention_config("attn_2d", params, backend="gluon")
+    ring_split = _gfx1250_ring_split_config(params, "gluon")
+    if ring_split is not None:
+        config = ring_split
+    else:
+        config = get_unified_attention_config("attn_2d", params, backend="gluon")
     # TDM stores of LDS-staged output can corrupt some gfx1250 decode rows.
     # Those shapes set USE_TDM_STORE false; every other shape keeps TDM stores.
     USE_TDM_STORE = config.pop("USE_TDM_STORE", True)
@@ -1439,6 +1533,28 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     num_splits, ring_d, long_w64, splits_in_axis1 = _gfx1250_kv_ring_split(
         params, loop_variant, config.get("RING_D", 2)
     )
+    if ring_split is not None and loop_variant == 3:
+        work = total_query_blocks * params.num_kv_heads
+        if params.sliding_window > 0:
+            max_splits = (
+                1
+                if params.num_seqs >= 5
+                and int(params.max_seqlen_k) < _GFX1250_RING_SPLIT_SW_MIN_SEQLEN_K
+                else _GFX1250_RING_SPLIT_SW_MAX_SPLITS
+            )
+        elif params.num_seqs == 1:
+            max_splits = _GFX1250_RING_SPLIT_MAX_SPLITS
+        else:
+            max_splits = _GFX1250_RING_SPLIT_MAX_SPLITS_MULTI
+        max_splits = min(
+            max_splits, max(1, triton.cdiv(int(params.max_seqlen_k), TILE_SIZE) // 3)
+        )
+        num_splits = max(1, min(max_splits, 2 * params.num_sms // work))
+        ring_d, long_w64 = config["RING_D"], 0
+        splits_in_axis1 = params.num_seqs > _GFX1250_RING_SPLIT_AXIS2_MAX_SEQS
+    seqlen_merge = (
+        ring_split is not None and num_splits > 1 and params.sliding_window == 0
+    )
     if num_splits > 1:
         partial_acc = torch.empty(
             (params.num_tokens, params.num_query_heads, num_splits, params.head_size),
@@ -1451,7 +1567,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
             device=params.q.device,
         )
         partial_l = torch.empty_like(partial_m)
-        if params.sliding_window == 0 and params.num_seqs > 32:
+        if params.sliding_window == 0 and params.num_seqs > 32 and ring_split is None:
             waves_per_eu = _KV_RING_FULL_SPLIT_WAVES_PER_EU
     else:
         partial_acc = partial_m = partial_l = None
@@ -1535,9 +1651,42 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         LONG_W64=long_w64,
         SPLITS_IN_AXIS1=splits_in_axis1,
         SEQ_Q_BLOCKS=seq_q_blocks,
+        SPLIT_NEUTRAL_ML=not seqlen_merge,
+        EARLY_SEQ_LOADS=(
+            ring_split is not None and params.sliding_window > 0 and seq_q_blocks > 0
+        ),
         enable_fp_fusion=True,
     )
-    if num_splits > 1:
+    if seqlen_merge:
+        hb, sb, merge_warps = _kv_ring_merge_launch(
+            params.num_tokens, params.num_query_heads, num_splits
+        )
+        merge_kv_ring_splits_seqlen[(params.num_tokens, params.num_query_heads // hb)](
+            partial_acc,
+            partial_m,
+            partial_l,
+            params.out,
+            params.out.stride(0),
+            params.out.stride(1),
+            params.cu_seqlens_q,
+            params.seqused_k,
+            NUM_SEQS,
+            params.softmax_scale * 1.4426950408889634,
+            NUM_SPLITS=num_splits,
+            SB=sb,
+            SB0=sb if num_splits <= 16 else min(sb, 8),
+            H=params.num_query_heads,
+            HB=hb,
+            D=params.head_size,
+            SEQS_PADDED=triton.next_power_of_2(NUM_SEQS),
+            BLOCK_Q=BLOCK_Q,
+            BLOCK_M=BLOCK_M,
+            NUM_QUERIES_PER_KV=params.num_queries_per_kv,
+            TILE_SIZE=TILE_SIZE,
+            CAUSAL=params.causal,
+            num_warps=merge_warps,
+        )
+    elif num_splits > 1:
         hb, sb, merge_warps = _kv_ring_merge_launch(
             params.num_tokens, params.num_query_heads, num_splits
         )

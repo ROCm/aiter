@@ -2636,6 +2636,7 @@ def test_gluon_unified_attn_kv_ring_many_splits(
             (num_splits, ring_d, 0, True) if lv == 3 else (1, ring_d, 0, False)
         ),
     )
+    monkeypatch.setattr(ua_mod, "_GFX1250_2D_KV_RING_SPLIT", False)
     # 312 / 78 / 5 tiles: all, some and almost no splits get tiles
     seq_lens = [(8, 20000), (8, 5000), (7, 300)]
     launched, output, ref_output = _kv_ring_run(seq_lens, sliding_window)
@@ -2734,3 +2735,36 @@ def test_gluon_unified_attn_kv_ring_equal_seqlen_q(sliding_window, batch, num_pa
     assert not output.isnan().any()
     torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
     assert (out_buf[num_tokens:] == sentinel).all(), "wrote past the real tokens"
+
+
+@pytest.mark.parametrize(
+    "num_seqs, ctx",
+    [(1, 30000), (2, 20000), (4, 60000), (5, 3500), (8, 131000), (16, 12000)],
+)
+@pytest.mark.parametrize("q_len", [7, 8])
+@pytest.mark.parametrize("sliding_window", [None, 2048])
+@pytest.mark.parametrize("long_max_seqlen_k", [False, True])
+@torch.inference_mode()
+def test_gluon_unified_attn_kv_ring_long_ctx(
+    num_seqs, ctx, q_len, sliding_window, long_max_seqlen_k
+):
+    """Loop variant 3 split-KV for long contexts and a few sequences: the split count
+    follows the CU count, the grid follows max_seqlen_k (also 131072 with shorter
+    real lengths), and full attention merges only each row's live splits."""
+    if DEVICE_ARCH != "gfx1250" or not _is_gluon_available():
+        pytest.skip("gfx1250 Gluon only")
+    seq_lens = [(q_len, ctx - (977 * i) % (ctx // 2)) for i in range(num_seqs)]
+    max_k = max(k for _, k in seq_lens)
+    launched, output, ref_output = _kv_ring_run(
+        seq_lens,
+        sliding_window,
+        long_max_seqlen_k=long_max_seqlen_k,
+        num_blocks=num_seqs * (max_k // 64 + 1) + 64,
+    )
+    assert launched and launched[0]["LOOP_VARIANT"] == 3
+    if not sliding_window or 4 <= num_seqs <= 8:
+        assert launched[0]["NUM_SPLITS"] > 1
+    assert not torch.isnan(output).any()
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
+    )

@@ -1416,3 +1416,114 @@ def merge_kv_ring_splits_full(
         output_ptr + tok * output_stride_0 + h[:, None] * output_stride_1 + d[None, :],
         o.to(output_ptr.dtype.element_ty),
     )
+
+
+_merge_kv_ring_splits_seqlen_repr = make_kernel_repr(
+    "merge_kv_ring_splits_seqlen", ["NUM_SPLITS", "SB", "SB0", "H", "HB", "D"]
+)
+
+
+@triton.jit(repr=_merge_kv_ring_splits_seqlen_repr)
+def merge_kv_ring_splits_seqlen(
+    partial_acc_ptr,  # [num_tokens, H, NUM_SPLITS, D] fp32: each split's normalized output acc / L
+    partial_m_ptr,  # [num_tokens, H, NUM_SPLITS] fp32 raw row max
+    partial_l_ptr,  # [num_tokens, H, NUM_SPLITS] fp32 exp sum
+    output_ptr,
+    output_stride_0,
+    output_stride_1,
+    query_start_len_ptr,  # [num_seqs + 1]
+    seq_lens_ptr,  # [num_seqs]
+    num_seqs,
+    QK_SCALE,  # softmax scale * log2(e)
+    NUM_SPLITS: tl.constexpr,
+    SB: tl.constexpr,  # splits per loop step (power of 2)
+    SB0: tl.constexpr,  # splits loaded before S_eff is known (power of 2, <= SB)
+    H: tl.constexpr,
+    HB: tl.constexpr,  # heads per program (power of 2, divides H)
+    D: tl.constexpr,
+    SEQS_PADDED: tl.constexpr,  # power of 2 >= num_seqs
+    BLOCK_Q: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    NUM_QUERIES_PER_KV: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    CAUSAL: tl.constexpr,
+):
+    """Merge the gfx1250 Gluon 2D loop variant 3 split-KV partials (full attention) of one query token and HB heads
+    (grid: tokens x H / HB) when the kernel ran with SPLIT_NEUTRAL_ML=False. The grid's NUM_SPLITS follows the host's
+    max_seqlen_k, but a row's live split count S_eff = min(NUM_SPLITS, max(tiles // 3, 1)) follows its sequence's real
+    length; it is recomputed here from seq_lens with the kernel's carving (AttentionProgram.initialize), and only
+    splits < S_eff are read (the other slots hold stale data)."""
+    tok = tl.program_id(0)
+    h = tl.program_id(1) * HB + tl.arange(0, HB)
+    d = tl.arange(0, D)
+    row = tok * (H * NUM_SPLITS) + h * NUM_SPLITS
+    # the first SB0 splits are loaded before S_eff is known (it needs a dependent chain of loads); slots >= S_eff are
+    # selected away (never multiplied: they may hold NaN)
+    s = tl.arange(0, SB0)
+    ml = row[:, None] + s[None, :]
+    in_grid = (s < NUM_SPLITS)[None, :]
+    m_s = tl.load(partial_m_ptr + ml, mask=in_grid, other=float("-inf"))
+    l_s = tl.load(partial_l_ptr + ml, mask=in_grid, other=0.0)
+    a = tl.load(
+        partial_acc_ptr + ml[:, :, None] * D + d[None, None, :],
+        mask=in_grid[:, :, None],
+        other=0.0,
+    )
+
+    i = tl.arange(0, SEQS_PADDED)
+    ends = tl.load(query_start_len_ptr + 1 + i, mask=i < num_seqs, other=2147483647)
+    seq = tl.sum((ends <= tok).to(tl.int32), axis=0)
+    q_start = tl.load(query_start_len_ptr + seq)
+    q_len = tl.load(query_start_len_ptr + seq + 1) - q_start
+    seq_len = tl.load(seq_lens_ptr + seq).to(tl.int32)
+    context_len = seq_len - q_len
+    q_block = (tok - q_start) // BLOCK_Q
+    if CAUSAL:
+        prefix = tl.maximum(
+            1,
+            tl.minimum(
+                context_len
+                + q_block * BLOCK_Q
+                + (BLOCK_M - 1) // NUM_QUERIES_PER_KV
+                + 1,
+                seq_len,
+            ),
+        )
+    else:
+        prefix = seq_len
+    num_tiles = (prefix + TILE_SIZE - 1) // TILE_SIZE
+    s_eff = tl.maximum(tl.minimum(num_tiles // 3, NUM_SPLITS), 1)
+
+    live = (s < s_eff)[None, :]
+    m_s = tl.where(live, m_s, float("-inf"))
+    m_run = tl.max(
+        m_s, axis=1
+    )  # split 0 is always live and every row has a key: finite
+    wl = tl.where(live, tl.exp2((m_s - m_run[:, None]) * QK_SCALE) * l_s, 0.0)
+    l_run = tl.sum(wl, axis=1)
+    o = tl.sum(tl.where(live[:, :, None], a, 0.0) * wl[:, :, None], axis=1)
+    if NUM_SPLITS > SB0:
+        for s0 in range(SB0, s_eff, SB):
+            sk = s0 + tl.arange(0, SB)
+            live_k = (sk < s_eff)[None, :]
+            ml_k = row[:, None] + sk[None, :]
+            m_k = tl.load(partial_m_ptr + ml_k, mask=live_k, other=float("-inf"))
+            l_k = tl.load(partial_l_ptr + ml_k, mask=live_k, other=0.0)
+            a_k = tl.load(
+                partial_acc_ptr + ml_k[:, :, None] * D + d[None, None, :],
+                mask=live_k[:, :, None],
+                other=0.0,
+            )
+            m_new = tl.maximum(m_run, tl.max(m_k, axis=1))
+            alpha = tl.exp2((m_run - m_new) * QK_SCALE)
+            wl_k = tl.where(
+                live_k, tl.exp2((m_k - m_new[:, None]) * QK_SCALE) * l_k, 0.0
+            )
+            l_run = l_run * alpha + tl.sum(wl_k, axis=1)
+            o = o * alpha[:, None] + tl.sum(a_k * wl_k[:, :, None], axis=1)
+            m_run = m_new
+    o = o / l_run[:, None]
+    tl.store(
+        output_ptr + tok * output_stride_0 + h[:, None] * output_stride_1 + d[None, :],
+        o.to(output_ptr.dtype.element_ty),
+    )
