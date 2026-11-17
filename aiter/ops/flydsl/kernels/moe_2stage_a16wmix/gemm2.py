@@ -49,7 +49,10 @@ def _atomic_bf16_epilog(
     N_OUT,
     BN,
     is_gfx942=False,
+    dense=False,
 ):
+    # dense (the shared-expert prologue): row m_row + r is the token and the weight is
+    # 1.0. The sorted ids and weights are not read.
     _kMChunks = BM // 16
     M_REPS = BM // 8
     # 4 waves split the BN(=TILE_N) tile (generic over BN, e.g. int4 tile_n=128).
@@ -95,8 +98,12 @@ def _atomic_bf16_epilog(
     weight = []
     for mr in range_constexpr(M_REPS):
         sorted_pos = m_row + fx.Int32(mr * 8) + m_lane
-        packed.append(load_scalar(load_i32, stids, sorted_pos, fx.Int32))
-        weight.append(load_scalar(load_f32, sweights, sorted_pos, fx.Float32))
+        if const_expr(dense):
+            packed.append(sorted_pos)
+            weight.append(fx.Float32(1.0))
+        else:
+            packed.append(load_scalar(load_i32, stids, sorted_pos, fx.Int32))
+            weight.append(load_scalar(load_f32, sweights, sorted_pos, fx.Float32))
 
     for i in range_constexpr(_kMChunks):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
@@ -276,11 +283,17 @@ def _gemm2_body_a16w4(
     rocm_arch="",
     use_reduce=False,
     topk=1,
+    dense=False,
+    a_rows=None,
 ):
     """a16w4/a16wi4/a16w16 stage2 body. K=inter_dim (contraction), N=model_dim (N_OUT).
 
     A = bf16 stage1 intermediate by SORTED position. W2 = mxfp4/int4/bf16 (see gemm1).
     Output = bf16 atomic-fadd (routing-weighted) scatter to [tokens, model_dim].
+
+    ``dense=True`` is the shared-expert prologue. A is the shared bf16
+    ``[a_rows, inter_dim]`` intermediate by token (a row past ``a_rows`` reads 0).
+    ``arg_bq`` is the W2 of that expert. Each row adds into its token at weight 1.0.
     """
     _is_gfx942 = str(rocm_arch).startswith("gfx942")
     elem_bytes = 2
@@ -301,7 +314,13 @@ def _gemm2_body_a16w4(
 
     m_block_idx = bx_i32 // fx.Int32(_num_n_blocks)
     n_block_idx = bx_i32 % fx.Int32(_num_n_blocks)
-    e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
+    if const_expr(dense):
+        assert (
+            not use_reduce
+        ), "the dense shared-expert prologue needs the atomic epilog"
+        e = fx.Int32(0)
+    else:
+        e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
     m_row = m_block_idx * fx.Int32(BM)  # first sorted row of this m-block
     by_n = n_block_idx * fx.Int32(TILE_N)
 
@@ -339,7 +358,11 @@ def _gemm2_body_a16w4(
         lane_mod_16=lane_mod_16,
         swizzle=True,
         a_ptr=arg_a,
-        a_num_bytes=fx.Int64(0xFFFFFFFF),
+        a_num_bytes=(
+            fx.Int64(a_rows) * fx.Int64(c_k_div4) * 4
+            if const_expr(dense)
+            else fx.Int64(0xFFFFFFFF)
+        ),
         a_load_threads=256,
         row_base_dwords=lambda row_local: (m_row + row_local) * fx.Int32(c_k_div4),
         dma_cache_mod=b_cache_mod,
@@ -426,17 +449,19 @@ def _gemm2_body_a16w4(
             N_OUT,
             TILE_N,
             _is_gfx942,
+            dense,
         )
 
 
-def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False):
+def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False, shared_tiles=0):
     """Flattened launch grid for a16w4 gemm2.
 
     Non-persistent (default): one CTA per (m-block x n-block) tile over padded
     ``max_m_blocks``. Persistent: cap to ``min(total_work, NUM_CU)`` CTAs (only when
     padded work > ``NUM_CU*4``); each CTA loops over its real work-tiles.
+    ``shared_tiles`` adds the shared-expert tiles (``a16w4_shared_tiles``).
     """
-    total_work = int(max_m_blocks) * (N_OUT // TILE_N)
+    total_work = int(max_m_blocks) * (N_OUT // TILE_N) + int(shared_tiles)
     if persist and total_work > NUM_CU * 4:
         return min(total_work, NUM_CU)
     return total_work
@@ -461,6 +486,10 @@ def compile_gemm2_a16w4_port(
     topk=1,
     reuse_lds=False,
     use_valid_token_count=False,
+    shared_tile_n=None,
+    shared_tile_m=None,
+    shared_tile_k=None,
+    shared_w_dtype="bf16",
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
 
@@ -474,6 +503,19 @@ def compile_gemm2_a16w4_port(
     ``xcd_swizzle`` (>0) bijectively round-robins the launch index across the 8 XCDs to
     balance per-XCD/HBM traffic (gemm2 is HBM-bound), + optional M-group swizzle for
     per-XCD L2 locality (group = xcd_swizzle m-blocks).
+
+    ``shared_tile_n`` adds the optional shared-expert prologue (atomic epilog only).
+    ``None`` (the default) keeps the kernel, its name and its launch signature. With a
+    value, the launch takes three more pointers: ``arg_sh_a`` is the bf16 ``[M, D_INTER]``
+    shared intermediate from gemm1, ``arg_sh_w`` the shared W2 ``[N_OUT, D_INTER]`` in
+    the ``shuffle_weight`` (16, 16) layout and ``arg_sh_ws`` its scales:
+    ``shared_w_dtype="bf16"`` (raw bf16 W2, ``arg_sh_ws`` not read) or ``"fp8"`` (MXFP8:
+    fp8 e4m3 codes + ``shuffle_scale`` e8m0 scales, scaled to bf16 in registers; the
+    output is bitwise that of the bf16 W2 upcast), as in gemm1. The first
+    ``a16w4_shared_tiles`` program ids (work indices when persistent) add the shared
+    output into every token at weight 1.0. The routed tiles follow in their usual
+    order. The shared tile is ``shared_tile_m x shared_tile_n x shared_tile_k``; an
+    unset value uses the routed BM or TILE_K. The LDS size is the larger of the two.
     """
     assert w_dtype in (
         "fp4",
@@ -537,6 +579,30 @@ def compile_gemm2_a16w4_port(
                 f"exceeding {rocm_arch} capacity {lds_capacity}"
             )
 
+    if shared_tile_n is not None:
+        assert not _use_reduce, "the shared-expert prologue needs epilog='atomic'"
+        if reuse_lds:
+            raise NotImplementedError("the shared-expert prologue has no reuse_lds")
+        assert (
+            shared_tile_n % 64 == 0 and N_OUT % shared_tile_n == 0
+        ), f"shared_tile_n must divide N_OUT and be a multiple of 64, got {shared_tile_n}"
+        SH_BM = shared_tile_m or BM
+        SH_TK = shared_tile_k or TILE_K
+        assert shared_w_dtype in (
+            "bf16",
+            "fp8",
+        ), f"shared_w_dtype must be 'bf16' or 'fp8', got {shared_w_dtype!r}"
+        assert (
+            shared_w_dtype == "bf16" or SH_TK % 128 == 0
+        ), f"an fp8 shared_tile_k must be a multiple of 128, got {SH_TK}"
+        # The A-LDS XOR swizzle masks the row with (TILE_K*2/16 - 1).
+        assert (
+            SH_TK & (SH_TK - 1) == 0
+        ), f"shared_tile_k must be a power of two, got {SH_TK}"
+        assert SH_BM % 16 == 0, f"shared_tile_m must be a multiple of 16, got {SH_BM}"
+        assert (
+            D_INTER % SH_TK == 0
+        ), f"D_INTER must be a multiple of shared_tile_k, got {D_INTER}"
     _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
     _name = f"gemm2_a16w4{_wd_tag}_port_ne{NE}_h{N_OUT}_i{_K}_bm{BM}_tn{TILE_N}"
     if reuse_lds and not _use_reduce:
@@ -686,4 +752,190 @@ def compile_gemm2_a16w4_port(
             value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
-    return launch_gemm2
+    if shared_tile_n is None:
+        return launch_gemm2
+
+    SH_TN = shared_tile_n
+    SH_NB = N_OUT // SH_TN
+    _sh_tag = "_mxfp8" if shared_w_dtype == "fp8" else ""
+    _lds_bytes_sh = max(_lds_bytes, SH_BM * SH_TK * 2 + SH_BM * SH_TN * 4)
+    from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+
+    lds_capacity = get_lds_capacity_bytes(str(rocm_arch))
+    if _lds_bytes_sh > lds_capacity:
+        raise NotImplementedError(
+            f"a16w4 gemm2 with the shared expert requires {_lds_bytes_sh} LDS bytes, "
+            f"exceeding {rocm_arch} capacity {lds_capacity}"
+        )
+
+    @fx.struct
+    class SharedStorageSh:
+        raw: fx.Array[fx.Uint8, _lds_bytes_sh, 16]
+
+    @flyc.kernel(
+        name=f"{_name}_sh{SH_BM}x{SH_TN}x{SH_TK}{_sh_tag}", known_block_size=[256, 1, 1]
+    )
+    def gemm2_kernel_shared(
+        arg_a: fx.Int64,
+        arg_bq: fx.Int64,
+        arg_bscale: fx.Int64,
+        arg_eids: fx.Int64,
+        arg_cumsum: fx.Int64,
+        arg_stids: fx.Int64,
+        arg_sweights: fx.Int64,
+        i32_M: fx.Int32,
+        i32_max_m_blocks: fx.Int32,
+        arg_out: fx.Int64,
+        arg_sh_a: fx.Int64,
+        arg_sh_w: fx.Int64,
+        arg_sh_ws: fx.Int64,
+    ):
+        lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorageSh).peek().raw.ptr
+        tx_i32 = fx.Int32(gpu.thread_id("x"))
+        bx_i32 = fx.Int32(gpu.block_id("x"))
+        lane = tx_i32 % 64
+        wave = rocdl.readfirstlane(T.i32, tx_i32 // 64)
+        cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
+        total_m_blocks = cumsum0 // fx.Int32(BM)
+        bound = total_m_blocks * fx.Int32(_num_n_blocks)
+        row_limit = i32_M
+        if const_expr(use_valid_token_count):
+            valid_tokens = _global_i32_at(arg_cumsum, fx.Int32(1))
+            row_limit = (valid_tokens < i32_M).select(valid_tokens, i32_M)
+        # Work indices [0, sh_tiles) are the shared tiles. The routed tiles
+        # [sh_tiles, sh_tiles + bound) follow in their usual (swizzled) order.
+        sh_tiles = ((i32_M + fx.Int32(SH_BM - 1)) // fx.Int32(SH_BM)) * fx.Int32(SH_NB)
+        total = sh_tiles + bound
+
+        _NXCD = 8
+        _xq = _udiv(bound, _NXCD)
+        _xr = _umod(bound, _NXCD)
+        _SW = xcd_swizzle
+
+        def _xcd_np(pid):
+            xc = _umod(pid, _NXCD)
+            wgid = xc * _xq + fx.min(xc, _xr) + _udiv(pid, _NXCD)
+            if const_expr(_SW <= 0):
+                return wgid
+            _ng = fx.Int32(_SW * _num_n_blocks)
+            group_id = wgid // _ng
+            first_pid_m = group_id * fx.Int32(_SW)
+            remaining_m = total_m_blocks - first_pid_m
+            group_size_m = fx.min(remaining_m, fx.Int32(_SW))
+            wig = wgid % _ng
+            m_block = first_pid_m + (wig % group_size_m)
+            n_block = wig // group_size_m
+            return m_block * fx.Int32(_num_n_blocks) + n_block
+
+        def _run_shared(tile):
+            _gemm2_body_a16w4(
+                lds_raw_ptr,
+                arg_sh_a,
+                arg_sh_w,
+                arg_sh_ws,
+                arg_eids,
+                arg_stids,
+                arg_sweights,
+                arg_out,
+                tile,
+                lane,
+                wave,
+                row_limit,
+                BM=SH_BM,
+                TILE_N=SH_TN,
+                TILE_K=SH_TK,
+                N_OUT=N_OUT,
+                INTER=_K,
+                NE=1,
+                b_cache_mod=b_cache_mod,
+                w_dtype=shared_w_dtype,
+                rocm_arch=rocm_arch,
+                dense=True,
+                a_rows=i32_M,
+            )
+
+        def _run_tile(tile):
+            _gemm2_body_a16w4(
+                lds_raw_ptr,
+                arg_a,
+                arg_bq,
+                arg_bscale,
+                arg_eids,
+                arg_stids,
+                arg_sweights,
+                arg_out,
+                tile,
+                lane,
+                wave,
+                row_limit,
+                BM=BM,
+                TILE_N=TILE_N,
+                TILE_K=TILE_K,
+                N_OUT=N_OUT,
+                INTER=_K,
+                NE=NE,
+                b_cache_mod=b_cache_mod,
+                w_dtype=w_dtype,
+                rocm_arch=rocm_arch,
+                use_reduce=_use_reduce,
+                topk=_topk,
+            )
+
+        if const_expr(persist):
+            grid_nb = fx.Int32(gpu.grid_dim.x)
+            if bx_i32 < sh_tiles:
+                _run_shared(bx_i32)
+            else:
+                if bx_i32 < total:
+                    _run_tile(_xcd_np(bx_i32 - sh_tiles))
+            for iv in range(bx_i32 + grid_nb, total, gpu.grid_dim.x):
+                gpu.barrier()
+                ivi = fx.Int32(iv)
+                if ivi < sh_tiles:
+                    _run_shared(ivi)
+                else:
+                    _run_tile(_xcd_np(ivi - sh_tiles))
+        else:
+            if bx_i32 < sh_tiles:
+                _run_shared(bx_i32)
+            else:
+                if bx_i32 < total:
+                    _run_tile(_xcd_np(bx_i32 - sh_tiles))
+
+    @flyc.jit
+    def launch_gemm2_shared(
+        arg_a: fx.Int64,
+        arg_bq: fx.Int64,
+        arg_bscale: fx.Int64,
+        arg_eids: fx.Int64,
+        arg_cumsum: fx.Int64,
+        arg_stids: fx.Int64,
+        arg_sweights: fx.Int64,
+        i32_M: fx.Int32,
+        i32_max_m_blocks: fx.Int32,
+        i32_grid: fx.Int32,
+        arg_out: fx.Int64,
+        arg_sh_a: fx.Int64,
+        arg_sh_w: fx.Int64,
+        arg_sh_ws: fx.Int64,
+        stream: fx.Stream,
+    ):
+        grid_x = fx.Int64(i32_grid)
+        gemm2_kernel_shared(
+            arg_a,
+            arg_bq,
+            arg_bscale,
+            arg_eids,
+            arg_cumsum,
+            arg_stids,
+            arg_sweights,
+            i32_M,
+            i32_max_m_blocks,
+            arg_out,
+            arg_sh_a,
+            arg_sh_w,
+            arg_sh_ws,
+            value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
+        ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+
+    return launch_gemm2_shared
