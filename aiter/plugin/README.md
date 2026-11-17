@@ -87,8 +87,18 @@ environment variable.
 
 - **Return, do not raise.** Raising is isolated and recorded, but it costs the
   call. `None` is the supported way to say no.
-- **Be pure.** `explain()` calls `select()` without running anything, so a
-  `select()` with side effects makes the dry run a lie.
+- **Be pure, and expect to be asked even when somebody else serves.** `explain()`
+  calls `select()` without running anything, so a `select()` with side effects
+  makes the dry run a lie. With more than one provider enabled, every one of
+  them is asked on every call: selection compares what they report, and whether
+  a later provider offers a faster kernel cannot be known without asking it.
+- **`run` must not call the public name that routes to it.** A provider wrapping
+  an AITER kernel reaches for the obvious spelling — `aiter.rms_norm` — and that
+  is the spelling dispatch came through, so the call re-enters routing, reaches
+  the provider again, and recurses until the stack ends. Call the binding below
+  the routed layer instead (`aiter.ops.rmsnorm.rms_norm_cu` for that example).
+  A provider shipping its own kernel never meets this; one built by wrapping
+  AITER, which is what a port tends to start as, meets it on the first call.
 - **Take the contract exactly.** AITER checks your `run` against the contract's
   arity before handing it the call, and refuses the candidate with
   `reason="contract-mismatch"` if it does not fit. That check compares argument
