@@ -51,6 +51,8 @@ def _no_role(role, index, start, end):
 def _worker(
     *, rank, world_size, init_method, shapes, recipes, warmup, iterations, inbox
 ):
+    """One rank. *shapes* maps a case name to its requested global
+    ``(B, S, H, D)``; S is padded as ``bench_attention_a2a`` pads it."""
     os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "12G")
     import torch
     import torch.distributed as dist
@@ -91,8 +93,7 @@ def _worker(
         timer = FnTimer("eager", _eager_trio)
         rccl = RcclBaseline(device=device, group=group, rotations=a2a._ROTATIONS)
         records = []
-        for shape_name in shapes:
-            requested = a2a._SHAPES[shape_name]
+        for shape_name, requested in shapes.items():
             shape = a2a._local_shape(requested, world_size)
             inputs = [
                 tuple(
@@ -193,7 +194,7 @@ def main(argv=None) -> int:
         _worker,
         args.world_size,
         init_method=get_distributed_init_method(get_ip(), get_open_port()),
-        shapes=tuple(args.shapes),
+        shapes={name: a2a._SHAPES[name] for name in args.shapes},
         recipes=recipes,
         warmup=args.warmup,
         iterations=args.iterations,

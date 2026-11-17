@@ -661,3 +661,33 @@ if __name__ == "__main__":
                 failed += 1
                 print(f"FAIL {name}: {e}")
     sys.exit(1 if failed else 0)
+
+
+def test_grouped_patterns_reach_the_group_and_the_partner():
+    """``PUSH_GROUP`` writes to the other ranks of the writer's group and
+    ``PUSH_PARTNER`` to the same position of the other group, so a
+    hierarchical all-reduce sends ``2(G-1)/G + 1/G`` of a one-codec payload."""
+    groups = ((0, 2, 4, 6), (1, 3, 5, 7))
+    lap = Phase(Pattern.PUSH_GROUP, 1000, False, 1, PeerMem.FINE, 8, 4, groups)
+    x = Phase(Pattern.PUSH_PARTNER, 1000, False, 1, PeerMem.FINE, 8, 4, groups)
+    dsts = {}
+    for _src, exe, dst in patterns.transfers(lap, 8):
+        dsts.setdefault(exe, []).append(dst)
+    assert dsts["G0"] == ["F2", "F4", "F6"]
+    assert dsts["G3"] == ["F1", "F5", "F7"]
+    assert [(e, d) for _s, e, d in patterns.transfers(x, 8)][:3] == [
+        ("G0", "F1"),
+        ("G1", "F0"),
+        ("G2", "F3"),
+    ]
+    t = Traffic(8, "all_reduce", 8000, (lap, x, lap), (RcclCall("all_reduce", 8000),))
+    assert patterns.fabric_bytes_per_rank(t) == 3 * 1000 + 1000 + 3 * 1000
+
+
+def test_grouped_patterns_need_groups():
+    import pytest
+
+    with pytest.raises(ValueError):
+        Phase(Pattern.PUSH_GROUP, 1000, False, 1, PeerMem.FINE, 8, 4)
+    with pytest.raises(ValueError):
+        Phase(Pattern.PUSH_ALL, 1000, False, 1, PeerMem.FINE, 8, 4, ((0, 1), (2, 3)))

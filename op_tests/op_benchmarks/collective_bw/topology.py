@@ -35,14 +35,9 @@ IOLINK_TYPE_XGMI = 11
 
 
 def _props(path: Path) -> dict[str, int]:
-    out = {}
-    for line in path.read_text().splitlines():
-        key, _, value = line.partition(" ")
-        try:
-            out[key] = int(value)
-        except ValueError:
-            continue
-    return out
+    from aiter.ops.flydsl.comm_collectives_host_shared import kfd_props
+
+    return kfd_props(path)
 
 
 def _is_gpu(node: Path) -> bool:

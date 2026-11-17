@@ -95,15 +95,22 @@ def transfers(phase: Phase, world_size: int) -> list[tuple[str, str, str]]:
     mem = TB_MEM[phase.peer_mem]
     n = world_size
     out = []
+    group_of = {r: g for g in (phase.groups or ()) for r in g}
     for i in range(n):
         if phase.pattern in (Pattern.PUSH_ALL, Pattern.PULL_ALL):
             peers = [j for j in range(n) if j != i or phase.include_self]
         elif phase.pattern == Pattern.PUSH_NEXT:
             peers = [(i + 1) % n]
+        elif phase.pattern == Pattern.PUSH_GROUP:
+            peers = [j for j in group_of[i] if j != i]
+        elif phase.pattern == Pattern.PUSH_PARTNER:
+            mine = group_of[i]
+            other = next(g for g in phase.groups if g is not mine)
+            peers = [other[mine.index(i)]]
         else:
             peers = [(i - 1) % n]
         for j in peers:
-            if phase.pattern in (Pattern.PUSH_ALL, Pattern.PUSH_NEXT):
+            if phase.pattern != Pattern.PULL_ALL and phase.pattern != Pattern.PULL_PREV:
                 out.append((f"G{i}", f"G{i}", f"{mem}{j}"))
             else:
                 out.append((f"{mem}{j}", f"G{i}", f"G{i}"))
@@ -126,10 +133,27 @@ def _fused_flows(traffic: Traffic) -> list[Flow]:
     return [(*k, v) for k, v in merged.items()]
 
 
+def whole_workgroups(waves: int, block_waves: int) -> int:
+    """*waves* rounded down to whole workgroups of *block_waves*, at least one.
+
+    TransferBench 1.71 faults (GPU memory access fault, the whole run aborts)
+    on a transfer whose waves do not fill its last workgroup, once another
+    test has run before it in the same invocation: an all-pairs test at 256
+    waves followed by a 24-transfer test at 85 waves with 8-wave workgroups
+    faults, and so does 84, 86, 21, 42 or 63; 64, 80, 88 and 96 do not, and
+    each line alone passes.
+    """
+    return max(block_waves, int(waves) // block_waves * block_waves)
+
+
 def waves_per_transfer(phase: Phase, world_size: int) -> int:
-    """The phase's own waves split evenly over the transfers each GPU executes."""
+    """The phase's own waves split evenly over the transfers each GPU
+    executes, in whole workgroups (``whole_workgroups``)."""
     per_gpu = len(transfers(phase, world_size)) // world_size
-    return max(1, phase.workgroups * phase.waves_per_workgroup // per_gpu)
+    return whole_workgroups(
+        phase.workgroups * phase.waves_per_workgroup // per_gpu,
+        phase.waves_per_workgroup,
+    )
 
 
 def env(block_waves: int, settings: RoofSettings = DEFAULT) -> tuple:
@@ -190,7 +214,7 @@ def _candidates(
             fw = w
             if fw is None:
                 total = phases[0].workgroups * phases[0].waves_per_workgroup
-                fw = max(1, total * n // len(fused))
+                fw = whole_workgroups(total * n // len(fused), block)
             fused_test = _test(fused, fw, block, 1, settings)
             out.append(Candidate(f"fused {name}{tag}", (fused_test,)))
     return out

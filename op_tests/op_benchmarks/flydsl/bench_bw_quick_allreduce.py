@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Bandwidth roofline: FlyDSL quick all-reduce (mesh, ring) and RCCL.
+"""Bandwidth roofline: FlyDSL quick all-reduce (mesh, ring, hier) and RCCL.
+
+``hier`` runs only where the GPUs split into two socket groups (or
+``AITER_FLY_AR_GROUPS`` names them) and the policy has its ladder.
 
     HIP_VISIBLE_DEVICES=4,5,6,7 python3 \\
         op_tests/op_benchmarks/flydsl/bench_bw_quick_allreduce.py -tp 4
@@ -37,7 +40,7 @@ import report
 
 DEFAULT_TOKENS = (64, 256, 1024, 4096, 8192)
 HIDDEN = 7168
-ALGORITHMS = ("mesh", "ring")
+ALGORITHMS = ("mesh", "ring", "hier")
 
 
 def _worker(
@@ -46,9 +49,10 @@ def _worker(
     import flydsl_allreduce_bench as fab
     import test_flydsl_quick_allreduce as qt
     import torch
-    from aiter.ops.flydsl.allreduce_policy import NoPolicyError
     from measure import FnTimer, gather, measure
     from rccl import RcclBaseline
+
+    from aiter.ops.flydsl.allreduce_policy import NoPolicyError
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -62,7 +66,9 @@ def _worker(
             engines[f"fly_{a}"] = qt._engine(
                 rank, world_size, gloo, device, {"algorithm": a}
             )
-        except NoPolicyError as e:
+        except (NoPolicyError, ValueError) as e:
+            # ValueError: hier on GPUs that do not split into two groups. The
+            # topology is the same on every rank, so every rank skips it.
             if rank == 0:
                 print(f"skipping {a}: {e}", flush=True)
     if not engines:
