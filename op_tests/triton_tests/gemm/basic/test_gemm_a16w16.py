@@ -97,6 +97,40 @@ def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
 
 
+# A caller-supplied config never went through the config file, so it has no
+# SPLITK_BLOCK_SIZE and no BLOCK_SIZE_K / NUM_KSPLIT clamp. The wrapper derives
+# both, so an explicit config works like the config-file path.
+@pytest.mark.parametrize("M, N, K", [(1024, 1024, 1024), (2048, 5120, 2880)])
+@pytest.mark.parametrize("num_ksplit", [1, 4])
+def test_gemm_a16_w16_explicit_config(M: int, N: int, K: int, num_ksplit):
+    _skip_if_triton_on_gfx1250("triton")
+
+    x, w, _, _out_dtype, _y = generate_gemm_a16w16_inputs(
+        M,
+        N,
+        K,
+        dtype=torch.bfloat16,
+        output=False,
+    )
+    config = {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": None,
+        "NUM_KSPLIT": num_ksplit,
+    }
+
+    out = gemm_a16w16(x, w, dtype=torch.bfloat16, config=dict(config), backend="triton")
+
+    torch.testing.assert_close(out, F.linear(x, w), atol=1e-1, rtol=1e-2)
+    assert "SPLITK_BLOCK_SIZE" not in config, "the caller's config must not be mutated"
+
+
 # Output larger than 2**31 bytes (Wan2.2 FFN up-projection at 720p x 193 frames).
 @pytest.mark.parametrize("M, N, K", [(90000, 13824, 5120)])
 def test_gemm_a16_w16_large_output(M: int, N: int, K: int):

@@ -521,6 +521,12 @@ def gemm_a16w16_(
 
     if config is None:
         config, _ = _get_triton_config(M, N, K)
+    else:
+        # A caller-supplied config did not come from the config file, so it has
+        # no SPLITK_BLOCK_SIZE and no BLOCK_SIZE_K / NUM_KSPLIT clamp yet. The
+        # kernel takes SPLITK_BLOCK_SIZE as an argument, so derive both here
+        # exactly like the config-file path. Work on a copy, the caller owns it.
+        config = compute_splitk_params(dict(config), K)
 
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
