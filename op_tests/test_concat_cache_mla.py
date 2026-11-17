@@ -676,6 +676,97 @@ def test_fused_rope_concat_and_cache_mla(
     return ret
 
 
+def _sentinel_bytes(storage: torch.Tensor) -> torch.Tensor:
+    raw = storage.view(torch.uint8)
+    raw.fill_(0xA5)
+    return raw.clone()
+
+
+def _assert_unchanged(storage: torch.Tensor, before: torch.Tensor, what: str) -> None:
+    after = storage.view(torch.uint8)
+    if torch.equal(after, before):
+        return
+    n_changed = int((after != before).sum().item())
+    raise AssertionError(f"{what} changed in {n_changed} bytes")
+
+
+def check_lat_hpt_all_negative_sentinel(
+    num_tokens: int,
+    num_heads: int,
+    device: str,
+    expected_hpt: int,
+) -> None:
+    """LAT HPT=2/4 with every slot negative must not store Q or KV.
+
+    q_out has a gap after each head and after each token. Positions are stale
+    (negative, or far past the one-row cos/sin cache). Both outputs are filled
+    with 0xA5 first, including those gaps, and must stay byte-identical.
+    """
+    kv_lora_rank = 512
+    pe_dim = 64
+    head_dim = kv_lora_rank + pe_dim
+    # 64 elements past the logical row, 128 past the last head. The HPT
+    # launcher accepts these because both strides are multiples of 8.
+    head_stride = head_dim + 64
+    token_stride = num_heads * head_stride + 128
+    dtype = torch.bfloat16
+    out_dtype = dtypes.fp8
+
+    q_storage = torch.empty(num_tokens * token_stride, dtype=out_dtype, device=device)
+    q_before = _sentinel_bytes(q_storage)
+    q_out = torch.as_strided(
+        q_storage,
+        (num_tokens, num_heads, head_dim),
+        (token_stride, head_stride, 1),
+    )
+    assert q_out.stride(1) == head_stride and not q_out.is_contiguous()
+    kv_cache = torch.empty(num_tokens, 1, head_dim, dtype=out_dtype, device=device)
+    kv_before = _sentinel_bytes(kv_cache)
+
+    q_nope = torch.zeros(
+        num_tokens, num_heads, kv_lora_rank, dtype=dtype, device=device
+    )
+    q_pe = torch.zeros(num_tokens, num_heads, pe_dim, dtype=dtype, device=device)
+    kv_c = torch.zeros(num_tokens, kv_lora_rank, dtype=dtype, device=device)
+    k_pe = torch.zeros(num_tokens, pe_dim, dtype=dtype, device=device)
+    slot_mapping = torch.full((num_tokens,), -1, dtype=torch.long, device=device)
+    # Even tokens are negative. Odd tokens sit past the one-row cache and
+    # would overflow an int32 byte offset if the clamp were skipped.
+    positions = torch.full((num_tokens,), 1 << 31, dtype=torch.long, device=device)
+    positions[::2] = -1
+    cos_cache, sin_cache = compute_cache(1, pe_dim // 2, dtype)
+    cos_cache = cos_cache.to(device)
+    sin_cache = sin_cache.to(device)
+    scale = torch.tensor(0.5, dtype=torch.float32, device=device)
+    q_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+
+    aiter.fused_qk_rope_concat_and_cache_mla(
+        q_nope,
+        q_pe,
+        kv_c,
+        k_pe,
+        kv_cache,
+        q_out,
+        slot_mapping,
+        scale,
+        q_scale,
+        positions,
+        cos_cache,
+        sin_cache,
+        True,
+        True,
+        compute_all_q_rope=False,
+    )
+    torch.cuda.synchronize()
+    tag = (
+        f"LAT HPT={expected_hpt} T={num_tokens} "
+        f"q_out_stride={tuple(q_out.stride())}"
+    )
+    _assert_unchanged(q_storage, q_before, f"q_out storage ({tag})")
+    _assert_unchanged(kv_cache, kv_before, f"kv_cache ({tag})")
+    aiter.logger.info("%s left Q and KV unchanged", tag)
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -921,9 +1012,8 @@ if "fused_qk" in args.case:
                                     # Pair padding with compute_all_q_rope: only
                                     # run (full, non-DCP) and (padded, DCP
                                     # compute-all). Skip the redundant
-                                    # (full, compute-all). The padded
-                                    # early-return has targeted HPT=2/4
-                                    # sentinel cases below.
+                                    # (full, compute-all). Padded early-return
+                                    # coverage is the HPT=2/4 cases below.
                                     if compute_all_q_rope != (valid_frac < 1.0):
                                         continue
                                     # Only the decode kernels clamp positions.
@@ -983,6 +1073,15 @@ if "fused_qk" in args.case:
             )
             ret["sentinel_hpt"] = expected_hpt
             df.append(ret)
+            # Every slot negative, stale positions, and a padded q_out stride.
+            # Valid tokens above still write; this is the launch where both
+            # outputs must stay at the sentinel, gaps included.
+            check_lat_hpt_all_negative_sentinel(
+                num_token,
+                num_heads,
+                args.device,
+                expected_hpt,
+            )
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("fused_rope_concat_and_cache_mla summary (markdown):\n%s", df_md)
