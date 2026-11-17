@@ -255,18 +255,36 @@ for file in "${sharded_files[@]}"; do
             test_cmd=(timeout 60m python3 "$file")
             ;;
         op_tests/test_moe_2stage.py)
-            {
-                echo "Running $file with the standard MoE CI profile: representative token sweep (CSV/FlyDSL validation still runs)"
-            } | tee -a latest_test.log
-            test_cmd=(timeout 60m env AITER_MOE_2STAGE_CI_PROFILE=standard python3 "$file")
+            if [[ "${AITER_MOE_2STAGE_FULL_MATRIX:-false}" == "true" ]]; then
+                {
+                    echo "Running $file with the FULL MoE CI profile (nightly/on-demand): entire dtype/quant/token/activation sweep"
+                } | tee -a latest_test.log
+                test_cmd=(timeout 75m env AITER_MOE_2STAGE_CI_PROFILE=full python3 "$file")
+            else
+                {
+                    echo "Running $file with the standard MoE CI profile: representative token sweep (CSV/FlyDSL validation still runs)"
+                } | tee -a latest_test.log
+                test_cmd=(timeout 60m env AITER_MOE_2STAGE_CI_PROFILE=standard python3 "$file")
+            fi
             ;;
     esac
+    tee_targets=("latest_test.log")
+    if [[ "$file" == "op_tests/test_moe_2stage.py" && "${AITER_MOE_2STAGE_FULL_MATRIX:-false}" == "true" ]]; then
+        tee_targets+=("full_matrix.log")
+    fi
     # Capture start time (nanoseconds since epoch)
     start_time_ns=$(date +%s%N)
-    if ! "${test_cmd[@]}" 2>&1 | tee -a latest_test.log; then
+    if ! "${test_cmd[@]}" 2>&1 | tee -a "${tee_targets[@]}"; then
         status="❌ Test failed"
         testFailed=true
         failedFiles+=("$file")
+    elif [[ "$file" == "op_tests/test_moe_2stage.py" && "${AITER_MOE_2STAGE_FULL_MATRIX:-false}" == "true" ]] \
+         && ! python3 .github/scripts/check_moe_2stage_nonstrict_gate.py \
+             --log full_matrix.log \
+             --allowlist .github/scripts/moe_2stage_known_nonstrict_failures.csv; then
+        status="❌ Test failed (unexpected non-strict accuracy failures not in known allowlist)"
+        testFailed=true
+        failedFiles+=("$file (non-strict accuracy gate)")
     else
         status="✅ Test passed"
     fi
