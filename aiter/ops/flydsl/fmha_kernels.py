@@ -140,8 +140,8 @@ def _validate_gfx1201_launch_limits(
     *,
     batch: int,
     seq_len: int,
-    seq_len_kv_real: int,
     seq_len_kv: int,
+    block_n: int,
     num_heads: int,
     head_dim: int,
     fp8: bool,
@@ -149,7 +149,6 @@ def _validate_gfx1201_launch_limits(
     """Validate integer arguments and signed-Int32 V# buffer indices."""
     for name, value in (
         ("query sequence length", seq_len),
-        ("real KV sequence length", seq_len_kv_real),
         ("KV sequence length", seq_len_kv),
     ):
         if value > _GFX1201_KERNEL_INT32_MAX:
@@ -157,14 +156,19 @@ def _validate_gfx1201_launch_limits(
                 f"{name}={value} exceeds the gfx1201 kernel Int32 limit "
                 f"({_GFX1201_KERNEL_INT32_MAX})"
             )
-    if not fp8:
-        v_batch_bytes = seq_len_kv * num_heads * head_dim * 2
-        if v_batch_bytes >= _GFX1201_BUFFER_MAX_BYTES:
-            raise ValueError(
-                f"one BF16/F16 V batch requires {v_batch_bytes} bytes, but the "
-                "gfx1201 buffer descriptor requires a byte count below 2^32"
-            )
-    else:
+    # Partial-tile K/V loads address whole BLOCK_N tiles. Their 32-bit byte
+    # offsets must not wrap back into the batch buffer, or OOB rows load
+    # in-bounds data instead of zero-filling.
+    seq_len_kv_tiled = -(-seq_len_kv // block_n) * block_n
+    kv_tiled_batch_bytes = seq_len_kv_tiled * num_heads * head_dim * (1 if fp8 else 2)
+    if kv_tiled_batch_bytes >= _GFX1201_BUFFER_MAX_BYTES:
+        kind = "FP8" if fp8 else "BF16/F16"
+        raise ValueError(
+            f"one {kind} K/V batch tile span requires {kv_tiled_batch_bytes} "
+            "bytes, but the gfx1201 buffer descriptor requires a 32-bit byte "
+            "offset below 2^32"
+        )
+    if fp8:
         # The FP8 kernel's typed V# helpers narrow flattened Q/K/V/O element
         # offsets to Int32. Bound the tensors before materializing them
         # so a large batch cannot wrap those buffer indices.
@@ -427,8 +431,8 @@ def flydsl_flash_attn_func(
     _validate_gfx1201_launch_limits(
         batch=batch,
         seq_len=seq_len_real,
-        seq_len_kv_real=seq_len_kv_real,
         seq_len_kv=seq_len_kv_real,
+        block_n=block_n,
         num_heads=num_heads,
         head_dim=head_dim,
         fp8=is_fp8,

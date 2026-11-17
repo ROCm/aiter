@@ -404,11 +404,12 @@ def build_flash_attn_func_module(
             )
 
         def kv_global_idx(token_idx, col):
-            token = batch_idx * seq_len_kv_v + token_idx
-            index = token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
             if const_expr(TAIL_MASK):
-                index = token_idx * STRIDE_TOKEN + head_idx * HEAD_DIM + col
-            return index
+                # K/V are rebased on this batch's bounded descriptors.
+                token = token_idx
+            else:
+                token = batch_idx * seq_len_kv_v + token_idx
+            return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
 
         def _store_output_vec(base_idx, val):
             buf_copy_store(

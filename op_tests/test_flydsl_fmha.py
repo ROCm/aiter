@@ -135,7 +135,7 @@ def _make_qkv(
         (1, 32768, 12, 128),
         # Smaller aligned shape (sanity).
         (2, 1024, 8, 128),
-        # Unaligned shape — exercises the auto-padding path. 32760 → 32768.
+        # Unaligned shape — exercises in-kernel sequence-tail handling.
         (1, 32760, 12, 128),
         # Short Flux self-attention (128x32 tile).
         (1, 512, 24, 128),
@@ -183,20 +183,37 @@ def _check_gfx1201_launch_limits_allow_large_bf16_batch():
     _validate_gfx1201_launch_limits(
         batch=16,
         seq_len=32768,
-        seq_len_kv_real=32768,
         seq_len_kv=32768,
+        block_n=64,
         num_heads=32,
         head_dim=128,
         fp8=False,
     )
+    # A partial final KV tile whose BLOCK_N-rounded span reaches 2^32 bytes
+    # would wrap 32-bit buffer offsets, although the raw batch is small.
+    for fp8, num_heads in ((False, 532_611), (True, 1_065_222)):
+        with pytest.raises(ValueError, match="tile span"):
+            _validate_gfx1201_launch_limits(
+                batch=1,
+                seq_len=1,
+                seq_len_kv=1,
+                block_n=64,
+                num_heads=num_heads,
+                head_dim=64,
+                fp8=fp8,
+            )
 
 
 def test_gfx1201_launch_limits_allow_large_bf16_batch():
     _check_gfx1201_launch_limits_allow_large_bf16_batch()
 
 
-def _check_bf16_launch_preserves_tensor_args(dtype=torch.bfloat16, seq_len=128):
-    q = torch.ones((1, seq_len, 1, 64), dtype=dtype, device="cuda")
+def _check_gfx1201_launch_preserves_tensor_args(dtype=torch.bfloat16):
+    # Unaligned cross-attention with distinct tensors checks Q and K/V padding
+    # removal, in-place output and argument order without input aliasing.
+    q = torch.ones((1, 97, 1, 64), dtype=dtype, device="cuda")
+    k = torch.ones((1, 65, 1, 64), dtype=dtype, device="cuda")
+    v = torch.ones_like(k)
     is_fp8 = dtype == torch.float8_e4m3fn
     out = torch.empty_like(q, dtype=torch.bfloat16 if is_fp8 else dtype)
     scales = (
@@ -214,13 +231,13 @@ def _check_bf16_launch_preserves_tensor_args(dtype=torch.bfloat16, seq_len=128):
 
     kernel = "_get_fp8_gfx1201_kernel" if is_fp8 else "_get_kernel"
     with patch.object(flydsl_fmha_kernels, kernel, lambda **kwargs: fake_kernel):
-        result = flydsl_flash_attn_func(q, q, q, out=out, **scales)
+        result = flydsl_flash_attn_func(q, k, v, out=out, **scales)
 
     assert result.data_ptr() == out.data_ptr()
     # FP8 uses flattened views. All four arguments must retain the caller's
     # storage, including unaligned lengths and a caller-provided output.
     assert len(captured) == 4
-    for actual, expected in zip(captured, (q, q, q, out)):
+    for actual, expected in zip(captured, (q, k, v, out)):
         assert actual.data_ptr() == expected.data_ptr()
         assert actual.numel() == expected.numel()
         if not is_fp8:
@@ -229,9 +246,8 @@ def _check_bf16_launch_preserves_tensor_args(dtype=torch.bfloat16, seq_len=128):
 
 @_gfx1201_only
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("seq_len", [128, 97])
-def test_flydsl_fmha_bf16_launch_preserves_tensor_args(dtype, seq_len):
-    _check_bf16_launch_preserves_tensor_args(dtype, seq_len)
+def test_flydsl_fmha_gfx1201_launch_preserves_tensor_args(dtype):
+    _check_gfx1201_launch_preserves_tensor_args(dtype)
 
 
 def _check_zero_q_descale_produces_uniform_attention():
@@ -450,9 +466,9 @@ def test_flydsl_fmha_correctness_multi_device():
 
 @_gfx1201_only
 def test_flydsl_fmha_allows_tight_padding():
-    """Wan2.1 production case (S_real=32760 -> S_pad=32768) must produce
-    SDPA-equivalent output. The kernel bounds the non-causal KV loop at the
-    real length and masks the straddling final tile exactly.
+    """Wan2.1 production case (S=32760, not a multiple of the tile size) must
+    produce SDPA-equivalent output without host padding. The kernel bounds the
+    non-causal KV loop at the real length and masks the straddling final tile.
     """
     batch, seq_len, num_heads, head_dim = 1, 32760, 12, 128
     q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
@@ -2059,6 +2075,9 @@ _GFX1201_TAIL_CASES = [
     (129, 129, 128, True),
     (65, 33, 224, False),
     (33, 65, 128, False),
+    # Partial Q with aligned KV (TAIL_MASK=False): unpadded Q/O on that path.
+    (96, 96, 128, True),
+    (97, 64, 128, False),
 ]
 
 
@@ -2116,9 +2135,9 @@ _GFX1201_OPTEST_SHAPES = [
     ("d64_256", 1, 256, 256, 8, 64, False),
     ("d128_cross_tail", 1, 2048, 1400, 8, 128, False),
     ("causal_d128", 1, 512, 512, 8, 128, True),
-    # Captured Qwen-Image: 4096 image tokens plus 30/47 text tokens, H=24/D=128.
+    # Captured Qwen-Image: 4096 image tokens plus 30 text tokens, H=24/D=128.
+    # The 47-token case uses the same kernel; bench_fmha_gfx1201.py keeps it.
     ("qwen_4126", 1, 4126, 4126, 24, 128, False),
-    ("qwen_4143", 1, 4143, 4143, 24, 128, False),
     ("qwen_aligned", 1, 4096, 4096, 24, 128, False),
 ]
 
@@ -2180,10 +2199,8 @@ def _optest_assert_gfx1201_quality(
 def _optest_gfx1201_contracts():
     """Check durable public-wrapper boundaries outside timed benchmark rows."""
     _check_gfx1201_launch_limits_allow_large_bf16_batch()
-    for dtype, seq_len in itertools.product(
-        (torch.bfloat16, torch.float16, torch.float8_e4m3fn), (128, 97)
-    ):
-        _check_bf16_launch_preserves_tensor_args(dtype, seq_len)
+    for dtype in (torch.bfloat16, torch.float16, torch.float8_e4m3fn):
+        _check_gfx1201_launch_preserves_tensor_args(dtype)
     for dtype, config in itertools.product(
         (torch.bfloat16, torch.float16, torch.float8_e4m3fn), _GFX1201_TAIL_CASES
     ):
