@@ -153,6 +153,10 @@ _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", 
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 # Opt-in gfx950 ASM stage 2 for one MXFP4 a4w4 shape (aiter/ops/asm/moe_stage2_mxfp4_t1.py).
 _MXFP4_MOE_STAGE2_T1 = os.environ.get("AITER_MXFP4_MOE_STAGE2_T1", "0") == "1"
+if _MXFP4_MOE_STAGE2_T1:
+    from aiter.ops.asm.moe_stage2_mxfp4_t1 import check_installed
+
+    check_installed()
 # (num_experts, topk) pairs the HIP kernel is instantiated for; must stay in
 # sync with AITER_MXFP4_SORT_QUANT_ROUTES in moe_sorting_opus_kernels.cu.
 _FUSED_DECODE_SORT_QUANT_ROUTES = {(512, 10), (513, 11)}
