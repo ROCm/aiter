@@ -129,7 +129,7 @@ def test_send_recv_run_on_pynccl(monkeypatch):
     group = _group(2, SimpleNamespace(ca_comm=None, pynccl_comm=pynccl))
     group.send(torch.ones(3, 2).t())
     received = group.recv(torch.Size([3]), torch.float32)
-    assert torch.equal(received, torch.full((3,), 7.0))
+    assert torch.equal(received, torch.full((3,), 7.0, device=group.device))
     assert pynccl.calls == [("send", 1), ("recv", 1)] and paths == []
 
 
