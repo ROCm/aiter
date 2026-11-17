@@ -241,7 +241,11 @@ def _gfx950_gluon_supported(params: _UAParams):
         and triton.next_power_of_2(params.head_size) == params.head_size
         and params.head_size_v == params.head_size
         and params.q_dtype in (e4m3_dtype, torch.bfloat16)
-        and params.q_dtype == params.kv_cache_dtype
+        and params.kv_cache_dtype in (params.q_dtype, e4m3_dtype)
+        and params.v_cache_dtype == params.kv_cache_dtype
+        # bf16 query over an fp8 cache: the dot stays bf16 and K, V are cast
+        # up after the LDS read; the shuffled layout's K width is not checked
+        and not (params.q_dtype != params.kv_cache_dtype and params.shuffled_kv_cache)
     )
 
 
