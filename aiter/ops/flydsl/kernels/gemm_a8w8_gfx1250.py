@@ -1012,9 +1012,9 @@ def launch_gemm_a8w8(
             # boundaries too, so LDS reads, WMMAs and the TDM refill overlap.
             # The fence before tile kt+1 is split: a wave signals once it has
             # drained its LDS reads of tile kt and its own TDM of tile kt+1 has
-            # landed, issues half of the last k-step's WMMAs, then waits, reads
-            # the first fragments of tile kt+1, refills the stage tile kt held
-            # with tile kt+num_buffers and issues the other half. Every
+            # landed, issues half of the last k-step's WMMAs, then waits,
+            # refills the stage tile kt held with tile kt+num_buffers, reads
+            # the first fragments of tile kt+1 and issues the other half. Every
             # accumulator still sees its k-steps in the same order with the
             # same operands, so the result is bit-identical to the loop above.
             _MMA_ORDER = [
