@@ -835,9 +835,6 @@ def parse_args(argv=None):
 def main(argv=None):
     if not torch.cuda.is_available():
         raise SystemExit("pa_decode_sparse benchmark requires a CUDA/HIP device")
-    import aiter
-
-    print(f"aiter: {os.path.dirname(aiter.__file__)}")
     run_benchmark(parse_args(argv))
 
 
