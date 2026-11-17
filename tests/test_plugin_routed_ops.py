@@ -677,3 +677,159 @@ def test_turning_a_provider_off_does_not_reach_an_already_captured_graph(
     expect = (value.float() * scale * weight.float()).to(out.dtype)
     torch.testing.assert_close(out, expect)
     assert plugin.last_decision() is None, "the switch is off for anything new"
+
+
+# ---------------------------------------------------------------------------
+# fused_dual_rmsnorm_mxfp8_quant: the out-buffer bypass
+#
+# This op's public name has two paths -- naming any of `yq`, `sq`, `yk`
+# bypasses routing, because the buffered form RETURNS the buffers it was
+# given while a custom op's schema declares its results do not alias its
+# inputs. The split is deliberate and documented; what it needs is proof
+# that each side is the side it claims to be.
+#
+# The risk is one-directional. Landing on the buffered path by naming a
+# buffer gets AITER's own kernel, which is what naming it asked for. The
+# failure that matters is the reverse: a call that looks routed quietly
+# not being routed. So every test below pins WHICH path ran, not just that
+# the call returned something.
+# ---------------------------------------------------------------------------
+
+
+def _dual_rmsnorm_args(device="cpu", dtype=torch.bfloat16):
+    """The seven parameters of the routed contract -- no output buffers."""
+
+    m, kq, kk = 4, 64, 32
+    return {
+        "q": torch.randn(m, kq, device=device, dtype=dtype),
+        "k": torch.randn(m, kk, device=device, dtype=dtype),
+        "q_weight": torch.randn(kq, device=device, dtype=dtype),
+        "k_weight": torch.randn(kk, device=device, dtype=dtype),
+        "eps_q": 1e-6,
+    }
+
+
+def _serve_dual_rmsnorm(monkeypatch, served):
+    """Enable a provider for this contract and hand back its spy object."""
+
+    provider = _Provider("aklr", _candidate("aklr", served))
+    provider.op_versions = {"fused_dual_rmsnorm_mxfp8_quant": {1}}
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    return provider
+
+
+def test_the_allocating_form_is_what_a_provider_serves(monkeypatch):
+    """No buffers named, so the call is routed and a provider can take it."""
+
+    from aiter.ops.triton.quant.fused_mxfp8_quant import (
+        fused_dual_rmsnorm_mxfp8_quant,
+    )
+
+    served = (torch.zeros(4, 64), torch.zeros(4, 2), torch.zeros(4, 32))
+    provider = _serve_dual_rmsnorm(monkeypatch, served)
+
+    result = fused_dual_rmsnorm_mxfp8_quant(**_dual_rmsnorm_args())
+
+    decision = plugin.last_decision()
+    assert (decision.route, decision.provider) == ("provider", "aklr")
+    assert provider.select_calls == 1
+    assert all(torch.equal(a, b) for a, b in zip(result, served))
+
+
+@pytest.mark.parametrize("buffer_name", ["yq", "sq", "yk"])
+def test_naming_any_one_output_buffer_bypasses_routing(monkeypatch, buffer_name):
+    """Each buffer on its own is enough to leave the routed path.
+
+    Parametrised per buffer rather than testing them together: the branch
+    reads all three, so a test that passes them at once would still pass if
+    two of the three conditions were dropped.
+
+    The native body is replaced here so this runs without a device -- what is
+    under test is which branch the public name picks, not what the kernel
+    computes. The provider is enabled and must come out untouched.
+    """
+
+    from aiter.ops.triton.quant import fused_mxfp8_quant as module
+
+    provider = _serve_dual_rmsnorm(monkeypatch, (None, None, None))
+    sentinel = ("native-ran", None, None)
+    monkeypatch.setattr(
+        module,
+        "_fused_dual_rmsnorm_mxfp8_quant_native",
+        lambda *args, **kwargs: sentinel,
+    )
+
+    args = _dual_rmsnorm_args()
+    args[buffer_name] = torch.zeros(4, 64)
+    result = module.fused_dual_rmsnorm_mxfp8_quant(**args)
+
+    assert result is sentinel, f"naming {buffer_name} did not reach the native body"
+    assert provider.select_calls == 0, (
+        f"naming {buffer_name} still asked a provider to select; the buffered "
+        f"form must not reach routing at all"
+    )
+
+
+@requires_cuda
+def test_the_buffered_form_writes_and_returns_the_caller_s_buffers():
+    """Buffer identity, not just equal values.
+
+    A fake that allocates compiles fine and returns the right value while
+    leaving the caller's buffer unwritten -- correct return, stale buffer,
+    no error. Comparing values alone cannot see that. These assertions are
+    on `data_ptr`, so they fail if the returned tensor is a different
+    allocation that merely holds the right numbers.
+    """
+
+    from aiter.ops.triton.quant.fused_mxfp8_quant import (
+        fused_dual_rmsnorm_mxfp8_quant,
+    )
+
+    args = _dual_rmsnorm_args(device="cuda")
+    expected = fused_dual_rmsnorm_mxfp8_quant(**args)
+
+    buffers = {
+        "yq": torch.empty_like(expected[0]),
+        "sq": torch.empty_like(expected[1]),
+        "yk": torch.empty_like(expected[2]),
+    }
+    got = fused_dual_rmsnorm_mxfp8_quant(**args, **buffers)
+
+    for name, returned, want in zip(buffers, got, expected):
+        assert returned.data_ptr() == buffers[name].data_ptr(), (
+            f"{name}: the buffered form returned a different allocation, so a "
+            f"caller reading its own buffer afterwards would read stale data"
+        )
+        assert torch.equal(
+            returned, want
+        ), f"{name}: buffered value differs from routed"
+
+
+@requires_cuda
+def test_the_routed_form_runs_inside_a_compiled_region():
+    """The allocating form is the one a compiled caller reaches.
+
+    Registration exists so the dispatch stays out of the caller's graph; a
+    compiled call that returns something other than the eager one would mean
+    the fake's metadata disagrees with the kernel.
+    """
+
+    from aiter.ops.triton.quant.fused_mxfp8_quant import (
+        fused_dual_rmsnorm_mxfp8_quant,
+    )
+
+    args = _dual_rmsnorm_args(device="cuda")
+    eager = fused_dual_rmsnorm_mxfp8_quant(**args)
+
+    compiled = torch.compile(fused_dual_rmsnorm_mxfp8_quant, dynamic=False)
+    got = compiled(**args)
+
+    for i, (a, b) in enumerate(zip(got, eager)):
+        assert a.shape == b.shape and a.dtype == b.dtype, (
+            f"output {i}: compiled metadata {tuple(a.shape)}/{a.dtype} differs "
+            f"from eager {tuple(b.shape)}/{b.dtype} -- the fake is wrong"
+        )
+        assert torch.equal(a, b), f"output {i}: compiled value differs from eager"
