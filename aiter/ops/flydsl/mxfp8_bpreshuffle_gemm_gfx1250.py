@@ -6,9 +6,9 @@
 mxfp8_128: fp8 e4m3 activations/weights with fp8_e8m0 block scales over a
 128-element block (distinct from the fp32-scale blockscale GEMM).
 
-mxfp8_32: the same kernels with 1x32 fp8_e8m0 scales in the shuffled
-m32k4 (A) / n32k4 (B) layout of ``shuffle_mxfp8fp4_scale`` -- the layout the
-gfx1250 ASM MXFP8 GEMM consumes, so both backends share one set of inputs.
+mxfp8_32: A scales are row-major ``(M, K//32)`` by default, optionally
+32x4 shuffled; B scales are 32x4 shuffled ``(N, K//32)``, or row-major
+``(N//32, K//32)`` with ``w_scale_32x32``.
 """
 
 from __future__ import annotations
@@ -141,9 +141,12 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     split_k: int = 1,
     x_scale_transposed: bool = True,
     a_preshuffle: bool = False,
+    a_scale_preshuffled: bool = False,
     persistent_n_tiles: int = 1,
     fused_splitk: bool = True,
     scale_block: int = BLOCK_K,
+    w_scale_32x32: bool = False,
+    batch: int = 1,
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 / mxfp8_32 bpreshuffle GEMM.
 
@@ -155,16 +158,36 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     ``(K//128, M)`` without copying. w_scale ``(N//128, K//128)`` fp8_e8m0
     dense row-major.
 
-    ``scale_block=32``: x_scale ``(pad32(M), K//32)`` and w_scale
-    ``(N, K//32)`` fp8_e8m0, both in the shuffled m32k4 / n32k4 layout.
+    ``scale_block=32``: x_scale ``(M, K//32)`` row-major by default, or
+    ``(ceil(M/32)*32, K//32)`` in 32x4 shuffled storage when
+    ``a_scale_preshuffled=True``. w_scale ``(N, K//32)`` is 32x4 shuffled, or
+    ``(N//32, K//32)`` row-major with ``w_scale_32x32``. Both scales are fp8_e8m0.
+
+    ``batch > 1`` (compute mxfp8_32, split_k 1): the operands are batch 0 of
+    ``[M, batch, K]`` XQ / x_scale, ``[batch, N, K]`` WQ / w_scale and
+    ``[M, batch, N]`` Out.
     """
-    _lazy_import()
     compute_bound = is_compute_wmma_kernel_name(kernel_name)
     mx32 = scale_block == MX32_BLOCK_K
     if not mx32 and scale_block != BLOCK_K:
         raise RuntimeError(
             f"[FlyDSL gfx1250 mxfp8] scale_block must be {BLOCK_K} or "
             f"{MX32_BLOCK_K}, got {scale_block}"
+        )
+    if a_scale_preshuffled and not mx32:
+        raise RuntimeError("a_scale_preshuffled is supported only for mxfp8_32")
+    if w_scale_32x32 and not mx32:
+        raise RuntimeError("w_scale_32x32 is supported only for mxfp8_32")
+    if batch > 1 and not (
+        compute_bound
+        and mx32
+        and int(split_k) == 1
+        and not a_preshuffle
+        and not a_scale_preshuffled
+    ):
+        raise RuntimeError(
+            "[FlyDSL gfx1250 mxfp8] batch > 1 needs a compute mxfp8_32 kernel "
+            "with split_k=1 and row-major A and A scale"
         )
 
     if XQ.dim() != 2 or WQ.dim() != 2:
@@ -182,9 +205,15 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
         raise RuntimeError(
             f"[FlyDSL gfx1250 mxfp8] K mismatch: A.K={K} vs B.K={WQ.shape[1]}"
         )
-    split_k = max(1, int(split_k))
-    cluster_m = max(1, int(cluster_m))
-    cluster_n = max(1, int(cluster_n))
+    split_k = int(split_k)
+    cluster_m = int(cluster_m)
+    cluster_n = int(cluster_n)
+    if split_k < 1 or not (1 <= cluster_m < 16 and 1 <= cluster_n < 16):
+        raise RuntimeError(
+            "split_k must be positive and cluster dimensions must be 1..15"
+        )
+    if min(M, N, K, tile_m, tile_n, tile_k) < 1:
+        raise RuntimeError("GEMM dimensions and tiles must be positive")
 
     if N % _BLOCK_N != 0 or K % BLOCK_K != 0:
         raise RuntimeError(
@@ -238,9 +267,12 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             f"split_k*tile_k={split_k}*{tile_k}={split_k * tile_k}"
         )
     num_k_tiles = (K // split_k) // tile_k
-    if num_k_tiles < nb:
+    # Generic K=128 with two buffers uses only the prologue and drain.
+    # Other configurations, including compute-bound kernels, keep their limits.
+    min_k_tiles = 1 if not compute_bound and nb == 2 and K == tile_k == 128 else nb
+    if num_k_tiles < min_k_tiles:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 mxfp8] {nb}-buffer pipeline needs >= {nb} "
+            f"[FlyDSL gfx1250 mxfp8] {nb}-buffer pipeline needs >= {min_k_tiles} "
             f"K-tiles per split-k chunk, got {num_k_tiles}"
         )
     if compute_bound:
@@ -250,11 +282,6 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
                 f"[FlyDSL gfx1250 mxfp8 compute] each split needs at least "
                 f"512 K elements and a whole K-pair; got K={K}, split_k={split_k}, "
                 f"tile_k={tile_k}, K-pair={k_pair}"
-            )
-        if cluster_m * cluster_n < 2:
-            raise RuntimeError(
-                f"[FlyDSL gfx1250 mxfp8 compute] needs a real cluster, got "
-                f"{cluster_m}x{cluster_n}"
             )
     if split_k > 1:
         if Out.stride(1) != 1:
@@ -278,7 +305,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     if mx32 and tile_n % 32 != 0:
         raise RuntimeError(
             f"[FlyDSL gfx1250 mxfp8_32] tile_n={tile_n} must be a multiple of 32 "
-            "(one n32k4 scale super-row per 32 columns)"
+            "(one WMMA scale lane group per 32 columns)"
         )
 
     if a_preshuffle and a_rows != M + (M & 1):
@@ -290,18 +317,21 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
         )
 
     if mx32:
-        # The kernel reads whole 32-row scale super-rows (bounded by
-        # ceil(M/32)), so A-scale is allocated to pad32(M) rows.
         k_blocks = K // MX32_BLOCK_K
-        a_scale = _require_e8m0_scale(
-            x_scale, ((M + 31) // 32 * 32, k_blocks), "x_scale"
+        a_rows = ((M + 31) // 32) * 32 if a_scale_preshuffled else M
+        a_scale = _require_e8m0_scale(x_scale, (a_rows, k_blocks), "x_scale")
+        b_rows = N // 32 if w_scale_32x32 else N
+        b_scale = _require_e8m0_scale(w_scale, (b_rows, k_blocks), "w_scale")
+        a_dense = (
+            a_scale.is_contiguous()
+            if batch == 1
+            else a_scale.stride() == (batch * k_blocks, 1)
         )
-        b_scale = _require_e8m0_scale(w_scale, (N, k_blocks), "w_scale")
-        if not (a_scale.is_contiguous() and b_scale.is_contiguous()):
+        if not (a_dense and b_scale.is_contiguous()):
             raise RuntimeError(
                 "[FlyDSL gfx1250 mxfp8_32] x_scale/w_scale must be contiguous"
             )
-        stride_ascale_k = k_blocks  # unused by the mx32 kernels
+        stride_ascale_k = batch * k_blocks
     else:
         if not x_scale_transposed:
             raise RuntimeError(
@@ -314,8 +344,16 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
         b_scale = _require_e8m0_scale(w_scale, (N // _BLOCK_N, k_blocks), "w_scale")
         stride_ascale_k = a_scale.stride(1) if a_scale.stride(0) == 1 else M
 
+    if batch > 1 and (XQ.stride() != (batch * K, 1) or Out.stride() != (batch * N, 1)):
+        raise RuntimeError(
+            f"[FlyDSL gfx1250 mxfp8] batch > 1 needs XQ strides ({batch * K}, 1) "
+            f"and Out strides ({batch * N}, 1), got {tuple(XQ.stride())} and "
+            f"{tuple(Out.stride())}"
+        )
+
     lda = XQ.stride(0)
     ldc = Out.stride(0)
+    _lazy_import()
     torch_stream = torch.cuda.current_stream(device=XQ.device)
     stream = _fx.Stream(torch_stream)
     fused = fused_splitk and _fused_splitk_ok(
@@ -339,7 +377,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     partials = (
         None
         if partial_shape is None
-        else torch.empty(partial_shape, dtype=Out.dtype, device=Out.device)
+        else torch.empty(partial_shape, dtype=torch.float32, device=Out.device)
     )
     gemm_out = Out if partials is None else partials
     out_is_f16 = 1 if out_dtype == "f16" else 0
@@ -379,12 +417,17 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             persistent_n_tiles,
             fused,
             bounded_m,
+            a_scale_preshuffled,
+            compute_kernel_k_tiles_class(num_k_tiles),
+            w_scale_32x32,
+            batch > 1,
         )
         _run_compiled(
             _launch_gemm_a8w8_compute_bound,
             *runtime_args,
             _ptr_arg(Out),
             *specialization,
+            batch,
             specialization_key=specialization,
         )
     else:
@@ -394,6 +437,8 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             False,  # batched
             0,  # preload_ks
             a_preshuffle,
+            a_scale_preshuffled,
+            w_scale_32x32,
         )
         _run_compiled(
             _launch_gemm_a8w8,
@@ -404,18 +449,24 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             0,  # preload_ks
             1,  # batch (runtime)
             a_preshuffle,
+            a_scale_preshuffled,
+            w_scale_32x32,  # b_scale_32x32
+            False,  # k_tail
+            _ptr_arg(Out),  # arg_scale_out
             specialization_key=specialization,
         )
     if partials is not None and not fused:
         dense = ldc == N
         _run_compiled(
-            _compile_splitk_reduce(split_k=split_k, out_dtype_str=out_dtype),
+            _compile_splitk_reduce(
+                split_k=split_k, out_dtype_str=out_dtype, partial_dtype_str="f32"
+            ),
             _ptr_arg(partials),
             _ptr_arg(Out),
             M * N if dense else N,
             1 if dense else M,
             ldc,
-            M * ldc * Out.element_size(),
+            M * ldc * partials.element_size(),
             stream,
         )
     return Out
@@ -430,17 +481,18 @@ BASE_NAME_SUFFIX_RE = (
 NAME_SUFFIX_RE = (
     BASE_NAME_SUFFIX_RE + r"(?P<fused_splitk>_fsk)?"
     r"(?P<a_preshuffle>_apre)?"
-    r"(?:_ps(?P<persistent_n_tiles>\d+))?$"
+    r"(?:_ps(?P<persistent_n_tiles>\d+))?"
 )
+MX32_NAME_SUFFIX_RE = NAME_SUFFIX_RE + r"(?P<a_scale_preshuffled>_aspre)?"
 _KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}")
 _COMPUTE_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(COMPUTE_WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}"
 )
 _MX32_KERNEL_NAME_RE = re.compile(
-    rf"^{re.escape(MX32_WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}"
+    rf"^{re.escape(MX32_WMMA_NAME_PREFIX)}_{MX32_NAME_SUFFIX_RE}"
 )
 _MX32_COMPUTE_KERNEL_NAME_RE = re.compile(
-    rf"^{re.escape(MX32_COMPUTE_WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}"
+    rf"^{re.escape(MX32_COMPUTE_WMMA_NAME_PREFIX)}_{MX32_NAME_SUFFIX_RE}"
 )
 
 
@@ -449,10 +501,12 @@ def _parse_name(match):
         return None
     groups = match.groupdict()
     a_preshuffle = groups.pop("a_preshuffle", None) is not None
+    a_scale_preshuffled = groups.pop("a_scale_preshuffled", None) is not None
     fused_splitk = groups.pop("fused_splitk", None) is not None
     persistent_n_tiles = groups.pop("persistent_n_tiles", None)
     cfg = {key: int(value) for key, value in groups.items()}
     cfg["a_preshuffle"] = a_preshuffle
+    cfg["a_scale_preshuffled"] = a_scale_preshuffled
     cfg["fused_splitk"] = fused_splitk
     cfg["persistent_n_tiles"] = int(persistent_n_tiles) if persistent_n_tiles else 1
     return cfg
@@ -478,6 +532,12 @@ def compute_kernel_k_pair(num_buffers: int, tile_n: int) -> int:
     return 1 if num_buffers == 4 and tile_n == 256 else 2
 
 
+def compute_kernel_k_tiles_class(num_k_tiles: int) -> int:
+    """K-loop length bucket of the compute-bound kernel: 0 for <= 16 K-tiles
+    per split, 1 for <= 64, 2 above."""
+    return 0 if num_k_tiles <= 16 else (1 if num_k_tiles <= 64 else 2)
+
+
 def cluster_m_grid_ok(M: int, tile_m: int, cluster_m: int) -> bool:
     """Whether ``M`` fills every cluster row of the launch grid."""
     if M <= 0 or tile_m <= 0 or cluster_m < 1:
@@ -486,31 +546,11 @@ def cluster_m_grid_ok(M: int, tile_m: int, cluster_m: int) -> bool:
     return m_blocks % cluster_m == 0
 
 
-def resolve_cluster_m(
-    M: int,
-    tile_m: int,
-    cluster_m: int,
-    cluster_n: int,
-    compute_bound: bool,
-) -> int | None:
+def resolve_cluster_m(M: int, tile_m: int, cluster_m: int) -> int | None:
     for cm in range(max(1, int(cluster_m)), 0, -1):
-        if not cluster_m_grid_ok(M, tile_m, cm):
-            continue
-        # A compute-bound cluster must hold at least two workgroups.
-        if compute_bound and cm * cluster_n < 2:
-            continue
-        return cm
+        if cluster_m_grid_ok(M, tile_m, cm):
+            return cm
     return None
-
-
-def cluster_m_fallback_values(
-    cluster_m: int, cluster_n: int, compute_bound: bool
-) -> list[int]:
-    return [
-        cm
-        for cm in range(1, max(1, int(cluster_m)) + 1)
-        if not compute_bound or cm * cluster_n >= 2
-    ]
 
 
 def is_compute_wmma_kernel_name(name: str) -> bool:
@@ -535,13 +575,7 @@ def _resolved_wmma_config(
         )
     if allow_cluster_m_fallback:
         cfg["cluster_m"] = (
-            resolve_cluster_m(
-                true_m,
-                cfg["tile_m"],
-                cfg["cluster_m"],
-                cfg["cluster_n"],
-                is_compute_wmma_kernel_name(kernel_name),
-            )
+            resolve_cluster_m(true_m, cfg["tile_m"], cfg["cluster_m"])
             or cfg["cluster_m"]
         )
     return tuple(cfg.items())
@@ -603,17 +637,25 @@ def run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
     w_scale: Tensor,
     Out: Tensor,
     kernel_name: str,
+    a_scale_preshuffled: bool = False,
+    w_scale_32x32: bool = False,
+    batch: int = 1,
 ) -> Tensor:
     """Decode a tuned mxfp8_32 kernelName and run it.
 
-    x_scale ``(pad32(M), K//32)`` m32k4 and w_scale ``(N, K//32)`` n32k4
-    fp8_e8m0 (``shuffle_mxfp8fp4_scale`` layout); WQ is 16x16 preshuffled.
+    x_scale is row-major by default, or 32x4 shuffled with
+    ``a_scale_preshuffled=True`` and an ``_aspre`` kernelName suffix.
+    w_scale is 32x4 shuffled, or row-major 32x32 blocks with
+    ``w_scale_32x32``; WQ is 16x16 preshuffled. ``batch``: see
+    ``_run_mxfp8_bpreshuffle_gemm_a8_gfx1250``.
     """
     cfg = dict(_resolved_wmma_config(kernel_name, Out.shape[0], True, True))
     if cfg["a_preshuffle"]:
         raise ValueError(
             f"[FlyDSL gfx1250 mxfp8_32] a_preshuffle is not supported: {kernel_name!r}"
         )
+    if cfg["a_scale_preshuffled"] != a_scale_preshuffled:
+        raise ValueError("a_scale_preshuffled must match the kernelName _aspre suffix")
     return _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
         XQ,
         WQ,
@@ -633,4 +675,7 @@ def run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
         fused_splitk=cfg["fused_splitk"],
         persistent_n_tiles=cfg["persistent_n_tiles"],
         scale_block=MX32_BLOCK_K,
+        a_scale_preshuffled=a_scale_preshuffled,
+        w_scale_32x32=w_scale_32x32,
+        batch=batch,
     )

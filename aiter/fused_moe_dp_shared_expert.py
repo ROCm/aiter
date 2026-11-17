@@ -13,7 +13,7 @@ from aiter import ActivationType, QuantType, dtypes, logger
 
 # from aiter import get_torch_quant as get_quant
 from aiter import get_hip_quant as get_quant
-from aiter.fused_moe import moe_sorting
+from aiter.fused_moe import moe_sorting, swiglu
 from aiter.jit.core import (
     AITER_CSRC_DIR,
     AITER_ROOT_DIR,
@@ -762,7 +762,12 @@ def fused_moe_2stages(
     return moe_out
 
 
-def torch_moe_act(act_input, torch_act, inter_dim):
+def torch_moe_act(act_input, torch_act, inter_dim, activation=None):
+    if activation == ActivationType.Swiglu:
+        if act_input.shape[-1] != 2 * inter_dim:
+            raise NotImplementedError("ActivationType.Swiglu requires g1u1 weights")
+        gate, up = act_input.split([inter_dim, inter_dim], dim=-1)
+        return swiglu(gate, up)
     if act_input.shape[-1] == inter_dim:
         return torch_act(act_input)
     else:
@@ -896,7 +901,9 @@ def torch_moe(
 
             act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
             act_out = (
-                torch_moe_act(act_input, torch_act, inter_dim).to(dtype).to(computeType)
+                torch_moe_act(act_input, torch_act, inter_dim, activation=activation)
+                .to(dtype)
+                .to(computeType)
             )
             if fc2_smooth_scale is not None:
                 act_out = act_out * (fc2_smooth_scale[E_id])

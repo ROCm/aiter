@@ -97,6 +97,29 @@ def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
 
 
+# Output larger than 2**31 bytes (Wan2.2 FFN up-projection at 720p x 193 frames).
+@pytest.mark.parametrize("M, N, K", [(90000, 13824, 5120)])
+def test_gemm_a16_w16_large_output(M: int, N: int, K: int):
+    if not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+    assert M * N * 2 > 2**31
+
+    x, w, _, _, _ = generate_gemm_a16w16_inputs(
+        M, N, K, dtype=torch.bfloat16, output=False
+    )
+    # NaN-fill so any row the kernel never writes fails the comparison.
+    y = torch.full((M, N), float("nan"), dtype=torch.bfloat16, device="cuda")
+    gemm_a16w16(x, w, y=y, backend="gluon")
+
+    boundary_row = 2**31 // (N * 2)
+    for rows in (
+        slice(0, 1024),
+        slice(boundary_row - 512, boundary_row + 512),
+        slice(M - 1024, M),
+    ):
+        torch.testing.assert_close(y[rows], F.linear(x[rows], w), atol=1e-1, rtol=1e-2)
+
+
 # Smaller set for testing activations, setting the output tensor and dtype
 def get_fewer_x_vals():
     x_vals = [(16, 1024, 1024)]
@@ -262,3 +285,119 @@ def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, layout, output, b
         )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+# gfx1250 gluon compute_bound epilogues (REGISTER_STORE): 0 = LDS + TDM store, 1 = register store from the WMMA
+# layout, 2 = coalesced register store.  Shapes cover the gpt-oss bucket edges (1024/1025, 2048/2049, 3072/3073) and
+# M/N tails that a 256x256 or 128x128 tile leaves partial.
+_STORE_CONFIG = {
+    "BLOCK_M": 128,
+    "BLOCK_N": 128,
+    "BLOCK_K": 64,
+    "NUM_BUFFERS": 4,
+    "num_warps": 4,
+    "waves_per_eu": 1,
+    "kernel_type": "compute_bound",
+}
+
+
+@pytest.mark.parametrize(
+    "M, N, K",
+    [
+        (1, 128, 2880),
+        (97, 2880, 4096),
+        (1025, 5120, 2880),
+        (2049, 2560, 2880),
+        (3073, 2880, 2048),
+        (300, 200, 2880),
+    ],
+)
+@pytest.mark.parametrize("register_store", [0, 1, 2])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("bias", [False, True])
+def test_gemm_a16w16_gfx1250_register_store(M, N, K, register_store, dtype, bias):
+    if not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+    torch.manual_seed(0)
+    x = torch.randn((M, K), dtype=dtype, device="cuda")
+    w = torch.randn((N, K), dtype=dtype, device="cuda") / K**0.5
+    b = torch.randn((N,), dtype=dtype, device="cuda") if bias else None
+    config = dict(_STORE_CONFIG, REGISTER_STORE=register_store)
+    out = gemm_a16w16(x, w, bias=b, dtype=dtype, config=config, backend="gluon")
+    torch.testing.assert_close(out, F.linear(x, w, bias=b), atol=1e-1, rtol=1e-2)
+
+
+def test_gemm_a16w16_gfx1250_store_env_override(monkeypatch):
+    """AITER_GFX1250_A16W16_STORE overrides the entry's REGISTER_STORE (A/B only) and rejects other values."""
+    if not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+    torch.manual_seed(0)
+    x = torch.randn((257, 2880), dtype=torch.bfloat16, device="cuda")
+    w = torch.randn((640, 2880), dtype=torch.bfloat16, device="cuda") / 2880**0.5
+    ref = F.linear(x, w)
+    for mode in ("0", "1", "2"):
+        monkeypatch.setenv("AITER_GFX1250_A16W16_STORE", mode)
+        out = gemm_a16w16(
+            x, w, config=dict(_STORE_CONFIG, REGISTER_STORE=0), backend="gluon"
+        )
+        torch.testing.assert_close(out, ref, atol=1e-1, rtol=1e-2)
+    monkeypatch.setenv("AITER_GFX1250_A16W16_STORE", "3")
+    with pytest.raises(ValueError):
+        gemm_a16w16(x, w, config=dict(_STORE_CONFIG), backend="gluon")
+    monkeypatch.delenv("AITER_GFX1250_A16W16_STORE")
+    with pytest.raises(ValueError):
+        gemm_a16w16(x, w, config=dict(_STORE_CONFIG, REGISTER_STORE=5), backend="gluon")
+
+
+# The gpt-oss entries are tuned on a 96-CU DPX partition and live in configs/gfx1250/96cu/: a 96-CU device must pick
+# them (not the 96cu DEFAULT's bandwidth_bound rows), and every bucket they select must compute the right result.
+_GPTOSS_SHAPES = [
+    (5120, 2880),  # TP1 QKV
+    (2880, 4096),  # TP1 O
+    (128, 2880),  # router
+    (2560, 2880),  # TP2 QKV
+    (2880, 2048),  # TP2 O
+    (201088, 2880),  # LM head, TP1
+    (100544, 2880),  # LM head, TP2 (partial last N tile)
+]
+
+
+@pytest.mark.parametrize(
+    "N, K", _GPTOSS_SHAPES[:5]
+)  # the LM heads are tuned for decode M only
+def test_gemm_a16w16_gfx1250_gptoss_96cu_lookup(N, K, monkeypatch):
+    """Read configs/gfx1250/96cu. The arch is pinned because this only reads
+    JSON: on an MI35X runner get_arch() is gfx950 and the gluon default there
+    does not exist."""
+    from aiter.ops.triton.utils import gemm_config_utils
+    from aiter.ops.triton.utils._triton import arch_info
+
+    monkeypatch.setattr(arch_info, "get_arch", lambda: "gfx1250")
+    # The loader cache key does not include the arch.
+    gemm_config_utils._get_gemm_config_cached.cache_clear()
+    try:
+        for M in (4096, 8192, 16384, 32768):
+            config, tuned = gemm_config_utils.get_gemm_config(
+                "GEMM-A16W16", M, N, K, backend="gluon", cu_num=96
+            )
+            assert tuned and config["kernel_type"] == "compute_bound", (
+                M,
+                N,
+                K,
+                config,
+            )
+    finally:
+        gemm_config_utils._get_gemm_config_cached.cache_clear()
+
+
+@pytest.mark.parametrize("N, K", _GPTOSS_SHAPES)
+@pytest.mark.parametrize("M", [1, 64, 1000, 2049, 3073, 8192])
+def test_gemm_a16w16_gfx1250_gptoss_tuned(M, N, K):
+    if not is_gluon_supported():
+        pytest.skip("Gluon not supported on this architecture")
+    torch.manual_seed(0)
+    x = torch.randn((M, K), dtype=torch.bfloat16, device="cuda")
+    w = torch.randn((N, K), dtype=torch.bfloat16, device="cuda") / K**0.5
+    torch.testing.assert_close(
+        gemm_a16w16(x, w, backend="gluon"), F.linear(x, w), atol=1e-1, rtol=1e-2
+    )

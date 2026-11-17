@@ -8,12 +8,14 @@ from __future__ import annotations
 import collections
 import functools
 
+import flydsl.expr as fx
 import torch
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.triton.utils.device_info import get_num_sms
 
+from .kernels.gdn_decode_verify import create_gdn_decode_verify_kernel
 from .kernels.gdr_decode import (
     MTP_MODE_CHAIN,
     MTP_MODE_SNAPSHOT,
@@ -23,6 +25,7 @@ from .kernels.gdr_decode import (
 from .kernels.tensor_shim import _run_compiled, get_dtype_str
 
 __all__ = [
+    "flydsl_gdn_decode_varlen",
     "flydsl_gdr_decode",
     "flydsl_gdr_mtp",
     "flydsl_gdr_mtp_sglang",
@@ -1067,3 +1070,237 @@ def flydsl_gdr_mtp_sglang(
         disable_state_update=disable_state_update,
         stream=stream,
     )
+
+
+# Swept on MI355X (Qwen3.8 TP1, batch 1-128, 1-5 tokens per sequence, KSPLIT
+# 2-16, BLOCK 64-512): KSPLIT=16 won every shape, and the widest VITER that
+# still leaves three blocks per CU was within 6% of the best config at each;
+# a narrower VITER only adds blocks that re-load q/k and redo their norms.
+_GDN_VARLEN_MIN_BLOCKS_PER_CU = 3
+
+
+def _gdn_varlen_viter(n, num_v_heads, head_v_dim, ksplit, block):
+    """Widest v-iteration that keeps the grid at three blocks per CU.
+
+    A VITER that does not divide the head width is skipped rather than rounded,
+    since the kernel would refuse it.
+    """
+    vlanes = block // ksplit
+    min_blocks = _GDN_VARLEN_MIN_BLOCKS_PER_CU * get_num_sms()
+    for viter in (4, 2):
+        vtile = vlanes * viter
+        if head_v_dim % vtile:
+            continue
+        if n * num_v_heads * (head_v_dim // vtile) >= min_blocks:
+            return viter
+    return 1
+
+
+def flydsl_gdn_decode_varlen(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale: float | None = None,
+    softplus_beta: float = 1.0,
+    softplus_threshold: float = 20.0,
+    disable_state_update: bool = False,
+    intermediate_states: torch.Tensor | None = None,
+    intermediate_state_indices: torch.Tensor | None = None,
+    ksplit: int = 16,
+    block: int = 256,
+    viter: int | None = None,
+    validate_data: bool = False,
+) -> torch.Tensor:
+    """Gated Delta Net decode recurrence over a packed (varlen) batch.
+
+    Unlike :func:`flydsl_gdr_decode` this takes the layout a serving stack hands
+    over during speculative decoding: ``q``/``k``/``v`` packed as ``[1, T, H, D]``
+    with ``cu_seqlens``, optional per-draft-step state snapshots, and an optional
+    suppressed final write-back (EAGLE target-verify commits the accepted prefix
+    itself).
+
+    Every sequence must hold the same ``T // n`` tokens, so ``cu_seqlens`` must
+    equal ``[0, T/n, 2T/n, ..., T]``. Only ``T % n`` is checked by default;
+    ``validate_data=True`` also checks the offsets themselves (a host sync, so
+    not graph safe).
+
+    Returns ``out`` shaped ``[1, T, num_v_heads, head_v_dim]``.
+    """
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("q, k and v must be [1, T, heads, head_dim]")
+    B, T, Hg, K = k.shape
+    HV, V = v.shape[-2:]
+    if B != 1:
+        raise ValueError(f"packed decode expects B=1, got {B}")
+    if K != 128:
+        raise ValueError(f"head_k_dim must be 128, got {K}")
+    if HV % Hg:
+        raise ValueError(f"num_v_heads {HV} must be a multiple of num_k_heads {Hg}")
+    if q.shape != k.shape:
+        raise ValueError(f"q {tuple(q.shape)} and k {tuple(k.shape)} must match")
+    if v.shape[:2] != (1, T):
+        raise ValueError(f"v must be [1, {T}, HV, V], got {tuple(v.shape)}")
+    tensors = (
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        state_indices,
+        cu_seqlens,
+        intermediate_states,
+        intermediate_state_indices,
+    )
+    if any(t is not None and t.device != q.device for t in tensors):
+        raise ValueError(f"all tensors must be on {q.device}")
+
+    for name, t_, dim in (("q", q, K), ("k", k, K), ("v", v, V)):
+        if t_.dtype != torch.bfloat16:
+            raise ValueError(f"{name} must be bf16, got {t_.dtype}")
+        if t_.stride()[-1] != 1 or t_.stride()[-2] != dim:
+            raise ValueError(
+                f"{name} must be head-major contiguous within a token "
+                f"(stride[-2:] == ({dim}, 1)), got {t_.stride()[-2:]}"
+            )
+    for name, t_ in (("a", a), ("b", b), ("A_log", A_log), ("dt_bias", dt_bias)):
+        if t_.dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError(f"{name} must be fp32 or bf16, got {t_.dtype}")
+        if not t_.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    for name, t_ in (("a", a), ("b", b)):
+        if t_.ndim not in (2, 3) or t_.shape[-1] != HV or t_.numel() != T * HV:
+            raise ValueError(
+                f"{name} must be [{T}, {HV}] or [1, {T}, {HV}], got {tuple(t_.shape)}"
+            )
+    for name, t_ in (("A_log", A_log), ("dt_bias", dt_bias)):
+        if t_.shape != (HV,):
+            raise ValueError(f"{name} must be [{HV}], got {tuple(t_.shape)}")
+    if state.dtype != torch.bfloat16:
+        raise ValueError("state pool must be bf16")
+    if state.ndim != 4 or tuple(state.shape[1:]) != (HV, V, K):
+        raise ValueError(
+            f"state pool must be [slots, {HV}, {V}, {K}], got {tuple(state.shape)}"
+        )
+    if state.stride()[1:] != (V * K, K, 1):
+        raise ValueError("state pool inner dims must be contiguous [HV, V, K]")
+
+    if cu_seqlens.ndim != 1 or not cu_seqlens.is_contiguous():
+        raise ValueError("cu_seqlens must be contiguous [n + 1]")
+    n = cu_seqlens.numel() - 1
+    if n <= 0 or T % n:
+        raise ValueError(f"ragged batch: T={T} is not divisible by n={n}")
+    tokens_per_seq = T // n
+
+    cache_states = intermediate_states is not None
+    index_tensors = [("cu_seqlens", cu_seqlens), ("state_indices", state_indices)]
+    if cache_states:
+        if intermediate_state_indices is None:
+            raise ValueError("intermediate_states needs intermediate_state_indices")
+        if intermediate_states.dtype != state.dtype:
+            raise ValueError("intermediate_states dtype must match the state pool")
+        if not intermediate_states.is_contiguous():
+            raise ValueError("intermediate_states must be contiguous")
+        if tuple(intermediate_states.shape[2:]) != (HV, V, K):
+            raise ValueError(
+                f"intermediate_states must be [slots, steps, {HV}, {V}, {K}], "
+                f"got {tuple(intermediate_states.shape)}"
+            )
+        cache_steps = intermediate_states.shape[1]
+        # The snapshot buffer has no bounds check: a missing step would land
+        # in the next slot's snapshots.
+        if cache_steps < tokens_per_seq:
+            raise ValueError(
+                f"intermediate_states holds {cache_steps} steps per slot, "
+                f"but each sequence has {tokens_per_seq} tokens"
+            )
+        index_tensors.append(("intermediate_state_indices", intermediate_state_indices))
+    else:
+        cache_steps = 0
+    for name, t_ in index_tensors:
+        if t_.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"{name} must be int32 or int64, got {t_.dtype}")
+    for name, t_ in index_tensors[1:]:
+        if t_.shape != (n,) or not t_.is_contiguous():
+            raise ValueError(f"{name} must be contiguous [{n}], got {tuple(t_.shape)}")
+    if validate_data and cu_seqlens.tolist() != list(range(0, T + 1, tokens_per_seq)):
+        raise ValueError(
+            f"cu_seqlens must give every sequence {tokens_per_seq} tokens, "
+            f"got {cu_seqlens.tolist()}"
+        )
+
+    out = q.new_empty(1, T, HV, V)
+    launch_tensors = (
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        state_indices,
+        out,
+        cu_seqlens,
+        intermediate_states if cache_states else state,
+        intermediate_state_indices if cache_states else state_indices,
+    )
+
+    # The jit compiles on first call, not on build, so the hint has to still be
+    # in scope at the launch.
+    fastmath = CompilationContext.compile_hints({"fastmath": "fast"})
+    with fastmath, torch.cuda.device(q.device.index):
+        launch = create_gdn_decode_verify_kernel(
+            HV,
+            Hg,
+            V,
+            tokens_per_seq,
+            state.stride(0),
+            q.stride()[1],
+            k.stride()[1],
+            v.stride()[1],
+            a.stride()[1] if a.ndim == 3 else a.stride()[-2],
+            b.stride()[1] if b.ndim == 3 else b.stride()[-2],
+            float(K**-0.5) if scale is None else float(scale),
+            float(softplus_beta),
+            float(softplus_threshold),
+            not disable_state_update,
+            cache_states,
+            int(cache_steps),
+            str(a.dtype),
+            str(b.dtype),
+            ksplit,
+            block,
+            (
+                _gdn_varlen_viter(n, HV, V, ksplit, block)
+                if viter is None
+                else int(viter)
+            ),
+        )
+        # The factory key fixes the geometry; the operand dtypes it leaves open
+        # (A_log, dt_bias, the index tensors) pick the compiled specialization.
+        # FlyDSL specializes tensors on dtype, rank, and the first unit-stride
+        # axis; sizes and the other strides stay dynamic.
+        key = (
+            q.device.index,
+            tuple((t.dtype, t.ndim, t.stride().index(1)) for t in launch_tensors),
+        )
+        _run_compiled(
+            launch,
+            *launch_tensors,
+            fx.Int64(out.numel() * out.element_size()),
+            fx.Int32(n),
+            fx.Stream(torch.cuda.current_stream(q.device)),
+            specialization_key=key,
+        )
+    return out

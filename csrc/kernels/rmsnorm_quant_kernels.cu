@@ -11,6 +11,7 @@
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
 #include "mx_quant_utils.h"
+#include "quant_amax_floor.h"
 #include "rocprim/rocprim.hpp"
 
 namespace aiter {
@@ -217,7 +218,7 @@ __global__ void add_rmsnorm_quant_kernel(
 
             if constexpr(FUSE_QUANT)
             {
-                float thread_max = 1e-10f;
+                float thread_max = aiter::kAmaxFloor;
                 if constexpr(thread_data_size % 2 == 0)
                 {
                     for(int i = 0; i < thread_data_size; i += 2)

@@ -19,7 +19,6 @@ import functools
 import math as host_math
 
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
@@ -106,19 +105,13 @@ def lds_cap_bytes(arch: str | None = None) -> int:
 
 
 def exp2_f32(x):
-    """Base-2 exponential of an fp32 lane via the raw ``llvm.amdgcn.exp2.f32``
-    intrinsic (lowers to ``v_exp_f32``).
+    """Base-2 exponential of an fp32 lane via fast approximate ``fx.exp2``.
 
     Shared by the forward SiLU gate and both backward SiLU/derivative gates. The
-    raw intrinsic is used on purpose rather than the stable ``fx.math.exp2``,
-    which does not reach ``v_exp_f32`` performance even under a fastmath context.
-    Callers supply their own ``arith.fastmath`` / compile-hint scope.
+    ``afn`` flag lowers to ``v_exp_f32`` rather than a libcall with a denormal
+    rescale guard. Callers supply their own compile-hint scope for other math.
     """
-    return fx.Float32(
-        llvm.call_intrinsic(
-            fx.Float32.ir_type, "llvm.amdgcn.exp2.f32", [x.ir_value()], [], []
-        )
-    )
+    return fx.exp2(x, fastmath="afn")
 
 
 def make_mfma_acc(mfma_k: int, lane_k: int, elem_dtype, c_rmem):

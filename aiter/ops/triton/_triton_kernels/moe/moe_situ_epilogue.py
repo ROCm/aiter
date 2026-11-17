@@ -6,7 +6,7 @@
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.activation import _tanh
+from aiter.ops.triton._triton_kernels.common.activation import _tanh
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _moe_situ_epilogue_repr = make_kernel_repr(

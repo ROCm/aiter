@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import argparse
 import sys
 from functools import partial
 
@@ -9,12 +8,19 @@ import torch
 import triton
 
 from aiter.ops.triton.quant import dynamic_mxfp4_quant, dynamic_mxfp8_quant
-from aiter.test_common import run_perftest
 from aiter.utility.fp4_utils import dynamic_mxfp4_quant as fp4_utils_dynamic_mxfp4_quant
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_do_bench_graph_kwargs,
+    get_parser,
+    get_rot_bufs_kwargs,
+    override_parser_action,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_available_models,
     get_caller_name_no_ext,
     get_model_configs,
+)
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
 )
 
 
@@ -81,6 +87,27 @@ def parse_shape_args(args) -> list[tuple[str, int, int]]:
     return [("default", M, N) for M, N in shapes]
 
 
+def _generate_quant_pool_entry(dtype, M, N):
+    return (torch.randn((M, N), dtype=dtype, device="cuda"),)
+
+
+_QUANT_POOL_FIELDS = ["x"]
+
+
+def _make_quant_kernel_fn(quant_fn, use_sr):
+    if use_sr:
+
+        def kernel_fn(x, **_):
+            quant_fn(x, use_sr=True, philox_seed=1234)
+
+    else:
+
+        def kernel_fn(x, **_):
+            quant_fn(x)
+
+    return kernel_fn
+
+
 def run_benchmark(args):
     if args.shape is not None and args.model is not None:
         raise ValueError("Use either --shape or --model, not both")
@@ -100,6 +127,10 @@ def run_benchmark(args):
         ylabel = "Bandwidth (GB/s)"
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
+
+    bencher = RotatingBufferBench.from_dict(
+        {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
+    )
 
     colors = ["green", "blue", "red", "orange", "purple"]
     benchmark = triton.testing.Benchmark(
@@ -122,18 +153,16 @@ def run_benchmark(args):
     ):
         fmt, provider = provider.split("-", 1)
         dtype = get_dtype(dtype)
-        x = torch.randn((M, N), dtype=dtype, device="cuda")
         quant_fn = get_provider(fmt, provider)
 
-        # run_perftest rotates input copies beyond L2 size and times device kernels only.
-        if use_sr:
-            _, us = run_perftest(quant_fn, x, use_sr=True, philox_seed=1234)
-        else:
-            _, us = run_perftest(quant_fn, x)
-        ms = us * 1e-3
+        pool_gen = partial(_generate_quant_pool_entry, dtype, M, N)
+        rot_bufs = bencher.build_pool([pool_gen], [_QUANT_POOL_FIELDS])
+        kernel_fn = _make_quant_kernel_fn(quant_fn, use_sr)
+
+        ms = bencher.bench(kernel_fn)
 
         # Read x and write quantized output + block scales.
-        x_bytes = x.numel() * x.element_size()
+        x_bytes = M * N * rot_bufs[0]["x"].element_size()
         x_quant_bytes = M * (N // 2) if fmt == "mxfp4" else M * N
         x_scale_bytes = M * ((N + 31) // 32)
         total_bytes = x_bytes + x_quant_bytes + x_scale_bytes
@@ -148,10 +177,7 @@ def run_benchmark(args):
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark MX Quant",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="MX Quant")
     parser.add_argument(
         "--format",
         type=str,
@@ -165,19 +191,6 @@ def parse_args(args: list[str] | None = None):
         metavar=("M", "N"),
         help="Single shape to benchmark.",
     )
-    available_models = get_available_models()
-    model_help = (
-        "Model name to benchmark. Select from: ["
-        + ", ".join(available_models)
-        + "]. Use 'all' to benchmark all models."
-    )
-    parser.add_argument(
-        "--model-configs",
-        type=str,
-        default="utils/model_configs.json",
-        help="Model config json file.",
-    )
-    parser.add_argument("--model", type=str, help=model_help)
     parser.add_argument(
         "-M",
         type=int,
@@ -204,12 +217,8 @@ def parse_args(args: list[str] | None = None):
         action="store_true",
         help="Benchmark gfx950 stochastic rounding with a fixed Philox seed.",
     )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        choices=["time", "bandwidth"],
-        default="bandwidth",
-        help="Metric to plot.",
+    override_parser_action(
+        parser, action="--metric", choices=["time", "bandwidth"], default="bandwidth"
     )
     parser.add_argument(
         "-o",

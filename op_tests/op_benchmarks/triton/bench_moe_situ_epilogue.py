@@ -11,6 +11,7 @@ import triton
 from aiter.ops.triton.moe.moe_situ_epilogue import (
     moe_situ_epilogue,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
@@ -83,10 +84,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="Benchmark merged MoE SiTU epilogue",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="merged MoE SiTU epilogue")
     parser.add_argument("--m", type=int, default=None)
     parser.add_argument("--shared-intermediate-size", type=int, default=768)
     parser.add_argument("--num-experts", type=int, default=896)

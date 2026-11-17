@@ -371,10 +371,30 @@ class TestMixedMxfpCandidates(unittest.TestCase):
             "swizzle_max_m": 131072,
             "swizzle_max_n": 16384,
             "swizzle_max_k": 6144,
+            "exact_m": 0,
+            "exact_n": 0,
+            "exact_k": 0,
         }
         self.assertTrue(candidate_supports_shape(bounded, 9450, 13824, 5120))
         self.assertFalse(candidate_supports_shape(bounded, 9450, 55296, 5120))
         self.assertTrue(candidate_supports_shape(bounded, 9450, 55296, 13824))
+
+    def test_candidate_exact_physical_shape(self):
+        exact = {
+            "kernel_id": 0,
+            "kernel_name": "exact",
+            "tile_m": 256,
+            "tile_n": 256,
+            "swizzle_max_m": 0,
+            "swizzle_max_n": 0,
+            "swizzle_max_k": 0,
+            "exact_m": 9472,
+            "exact_n": 5120,
+            "exact_k": 5120,
+        }
+        self.assertTrue(candidate_supports_shape(exact, 9450, 5120, 5120))
+        self.assertFalse(candidate_supports_shape(exact, 9473, 5120, 5120))
+        self.assertFalse(candidate_supports_shape(exact, 9450, 13824, 5120))
 
 
 class TestMixedMxfpMinimumGainGuard(unittest.TestCase):

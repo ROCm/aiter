@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import random
 
 import pandas as pd
@@ -334,6 +335,8 @@ def test_fused_rope_concat_and_cache_mla(
     q_nope_layout: str = "contiguous",
     valid_frac: float = 1.0,
     compute_all_q_rope: bool = False,
+    is_nope_first: bool = True,
+    max_position: int = 0,
 ):
     ret = {}
     torch.set_default_device(device)
@@ -370,7 +373,9 @@ def test_fused_rope_concat_and_cache_mla(
         num_tokens, num_heads, qk_rope_head_dim, dtype=dtype, device=device
     )
     entry_size = kv_lora_rank + qk_rope_head_dim
-    cos_cache, sin_cache = compute_cache(num_tokens, qk_rope_head_dim // 2, dtype)
+    # A cos/sin cache shorter than the positions tests that the kernel clamps them.
+    max_position = max_position or num_tokens
+    cos_cache, sin_cache = compute_cache(max_position, qk_rope_head_dim // 2, dtype)
     cos_cache = cos_cache.to(device)
     sin_cache = sin_cache.to(device)
 
@@ -392,7 +397,6 @@ def test_fused_rope_concat_and_cache_mla(
         dtype=q_out_dtype,  # cache_dtype,
         device=q_nope.device,
     )
-    is_nope_first = True
 
     ref_q_out = torch.empty(
         (num_tokens, num_heads, qk_rope_head_dim + kv_lora_rank),
@@ -411,7 +415,7 @@ def test_fused_rope_concat_and_cache_mla(
         kv_cache_dtype,
         scale,
         q_scale,
-        pos,
+        pos.clamp(max=max_position - 1),
         cos_cache,
         sin_cache,
         is_neox,
@@ -556,16 +560,16 @@ def test_fused_rope_concat_and_cache_mla(
     # With compute_all_q_rope=False (default) padded-token q_out is left
     # uninitialized (early-return), so only check the owned (valid-slot) tokens.
     n_chk = num_tokens if compute_all_q_rope else num_valid
-    q_out_chk = q_out[:n_chk]
-    ref_q_out_chk = ref_q_out[:n_chk]
-    q_nope_delta = (
-        q_out_chk[..., :kv_lora_rank].to(torch.float32)
-        - ref_q_out_chk[..., :kv_lora_rank].to(torch.float32)
-    ).abs()
-    q_rope_delta = (
-        q_out_chk[..., kv_lora_rank:].to(torch.float32)
-        - ref_q_out_chk[..., kv_lora_rank:].to(torch.float32)
-    ).abs()
+    q_out_chk = q_out[:n_chk].to(torch.float32)
+    ref_q_out_chk = ref_q_out[:n_chk].to(torch.float32)
+    if is_nope_first:
+        nope_cols = slice(0, kv_lora_rank)
+        rope_cols = slice(kv_lora_rank, None)
+    else:
+        nope_cols = slice(qk_rope_head_dim, None)
+        rope_cols = slice(0, qk_rope_head_dim)
+    q_nope_delta = (q_out_chk[..., nope_cols] - ref_q_out_chk[..., nope_cols]).abs()
+    q_rope_delta = (q_out_chk[..., rope_cols] - ref_q_out_chk[..., rope_cols]).abs()
     q_nope_max_abs = float(q_nope_delta.max().item())
     q_rope_max_abs = float(q_rope_delta.max().item())
     if q_nope_max_abs != 0.0:
@@ -574,10 +578,18 @@ def test_fused_rope_concat_and_cache_mla(
             f"layout={q_nope_layout}, stride={tuple(q_nope.stride())}, "
             f"max_abs={q_nope_max_abs}"
         )
+    # Positions past a short cos/sin cache must use its last row.
+    if max_position < num_tokens and max(err_kv, err_q_out) > 0.05:
+        raise AssertionError(
+            f"positions not clamped to a {max_position}-row cos/sin cache: "
+            f"kv_err={err_kv}, q_err={err_q_out}"
+        )
     ret["fused_qk_us"] = avg_us
     ret["num_valid"] = num_valid
     ret["padded"] = num_tokens - num_valid
     ret["compute_all_q_rope"] = compute_all_q_rope
+    ret["is_nope_first"] = is_nope_first
+    ret["max_position"] = max_position
     # ret["unfused_us"] = ref_us
     ret["hip_kv_err"] = err_kv
     ret["hip_q_err"] = err_q_out
@@ -750,6 +762,27 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "-nf",
+    "--is_nope_first",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True, False],
+    help="""q_out / kv_cache entry layout: true = [nope | pe], false = [pe | nope].
+    e.g.: -nf true""",
+)
+
+parser.add_argument(
+    "-mp",
+    "--max_position",
+    type=int,
+    nargs="*",
+    default=[0, 1],
+    help="""rows in the cos/sin cache. 0 means one row per token.
+    A shorter cache tests that positions past it are clamped.
+    e.g.: -mp 0 1""",
+)
+
+parser.add_argument(
     "-c",
     "--case",
     type=str,
@@ -793,55 +826,71 @@ if "fused_qk" in args.case:
                     for is_neox in args.is_neox:
                         for q_dtype in args.q_dtype:
                             for q_nope_layout in args.q_nope_layout:
-                                for valid_frac in args.valid_frac:
-                                    for compute_all_q_rope in args.compute_all_q_rope:
-                                        if q_dtype == "fp8" and kv_cache_dtype != "fp8":
-                                            continue
-                                        if num_kv_heads > num_heads:
-                                            continue
-                                        # compute_all_q_rope (DCP: RoPE all queries
-                                        # incl. padded slot=-1) is implemented only in
-                                        # the per-head and opt MLA *decode* kernels
-                                        # (num_kv_heads==1). It is absent from the
-                                        # general decode kernel (num_tokens>=256 and
-                                        # kv_lora_rank*num_heads<2048, e.g. num_heads=2)
-                                        # and from the GQA prefill kernels
-                                        # (num_kv_heads>1). Production DCP always hits
-                                        # per-head/opt (num_kv_heads==1, num_heads>=16),
-                                        # so restrict the sweep to those. Constants
-                                        # mirror the host dispatch (MAX_TOKENS_PER_HEAD
-                                        # =256, MIN_SIZE_FOR_OPT=2048).
-                                        hits_flag_kernel = num_kv_heads == 1 and (
-                                            num_token < 256
-                                            or args.kv_lora_rank * num_heads >= 2048
+                                for (
+                                    valid_frac,
+                                    compute_all_q_rope,
+                                    is_nope_first,
+                                    max_position,
+                                ) in itertools.product(
+                                    args.valid_frac,
+                                    args.compute_all_q_rope,
+                                    args.is_nope_first,
+                                    args.max_position,
+                                ):
+                                    if q_dtype == "fp8" and kv_cache_dtype != "fp8":
+                                        continue
+                                    if num_kv_heads > num_heads:
+                                        continue
+                                    # compute_all_q_rope (DCP: RoPE all queries
+                                    # incl. padded slot=-1) is implemented in the
+                                    # MLA *decode* kernels (num_kv_heads==1): the
+                                    # head-grouped kernel (kv_lora_rank=512,
+                                    # rope 64) and the per-head/opt fallbacks. It
+                                    # is absent from the general decode kernel and
+                                    # the GQA prefill kernels (num_kv_heads>1).
+                                    # Constants mirror the host dispatch
+                                    # (MAX_TOKENS_PER_HEAD=256, MIN_SIZE_FOR_OPT
+                                    # =2048).
+                                    hits_flag_kernel = num_kv_heads == 1 and (
+                                        (
+                                            args.kv_lora_rank == 512
+                                            and args.qk_rope_head_dim == 64
                                         )
-                                        if compute_all_q_rope and not hits_flag_kernel:
-                                            continue
-                                        # Pair padding with compute_all_q_rope: only
-                                        # run (full, non-DCP) and (padded, DCP
-                                        # compute-all). Skip the redundant
-                                        # (full, compute-all) and the
-                                        # uninteresting (padded, early-return).
-                                        if compute_all_q_rope != (valid_frac < 1.0):
-                                            continue
-                                        ret = test_fused_rope_concat_and_cache_mla(
-                                            args.kv_lora_rank,
-                                            args.qk_rope_head_dim,
-                                            num_token,
-                                            args.block_size,
-                                            num_blocks,
-                                            num_heads,
-                                            num_kv_heads,
-                                            args.dtype,
-                                            args.device,
-                                            kv_cache_dtype,
-                                            q_dtype,
-                                            is_neox,
-                                            q_nope_layout,
-                                            valid_frac,
-                                            compute_all_q_rope,
-                                        )
-                                        df.append(ret)
+                                        or (num_token < 256 and is_nope_first)
+                                        or args.kv_lora_rank * num_heads >= 2048
+                                    )
+                                    if compute_all_q_rope and not hits_flag_kernel:
+                                        continue
+                                    # Pair padding with compute_all_q_rope: only
+                                    # run (full, non-DCP) and (padded, DCP
+                                    # compute-all). Skip the redundant
+                                    # (full, compute-all) and the
+                                    # uninteresting (padded, early-return).
+                                    if compute_all_q_rope != (valid_frac < 1.0):
+                                        continue
+                                    # Only the decode kernels clamp positions.
+                                    if max_position and num_kv_heads != 1:
+                                        continue
+                                    ret = test_fused_rope_concat_and_cache_mla(
+                                        args.kv_lora_rank,
+                                        args.qk_rope_head_dim,
+                                        num_token,
+                                        args.block_size,
+                                        num_blocks,
+                                        num_heads,
+                                        num_kv_heads,
+                                        args.dtype,
+                                        args.device,
+                                        kv_cache_dtype,
+                                        q_dtype,
+                                        is_neox,
+                                        q_nope_layout,
+                                        valid_frac,
+                                        compute_all_q_rope,
+                                        is_nope_first,
+                                        max_position,
+                                    )
+                                    df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("fused_rope_concat_and_cache_mla summary (markdown):\n%s", df_md)
