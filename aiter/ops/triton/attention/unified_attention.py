@@ -1,5 +1,6 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import math
 import os
 from typing import NamedTuple
 
@@ -12,6 +13,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_2d,
     kernel_unified_attention_3d,
     reduce_segments,
+    reduce_splits_heads,
 )
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.utils._triton import arch_info
@@ -72,6 +74,29 @@ _GLUON_REDUCE_MAX_SEGMENTS = 8
 # 8 segments 2.2x faster, 4 segments 18-27% faster, 2 segments 1.5x slower.
 _GFX12_3D_MAX_SEQLEN_Q = 16
 _GFX12_3D_MIN_SEGMENTS = 4
+# gfx1250 3D kernel, a speculative-decode verify (equal_seqlen_q) wider than one query
+# block of the tuned attn_3d BLOCK_M, under the token split: one workgroup takes up to
+# _GFX12_3D_QPACK_ROWS query rows (token x head) of a sequence, split over warps of 32
+# rows (16 while a segment has at most 4 such workgroups), against one copy of each
+# KV tile in LDS, where every block was a workgroup streaming the same KV. A sequence
+# still spanning several workgroups has them on one XCD (one L2). A single sequence of
+# at most 3 blocks keeps its blocks as workgroups (packed it measured slower) and only
+# takes the XCD placement. Bitwise the same output (each warp runs a block's per-row
+# instructions). Qwen3.6 A8K4V8 (16 q / 2 kv heads, d 256, page 128), 78k-145k-token
+# contexts, token split MIN/MAX_TILES 16/128, us/call with the reduce, bs 1/3/6:
+# Q8 27.4/61.1/120.7 -> 23.8/40.4/72.4, Q6 22.7/55.6/89.4 -> 20.9/39.6/70.5,
+# Q16 44.6/99.3/189.8 -> 27.7/64.1/120.2 (Q4, one block: 23.3/35.7/64.3).
+# A ragged verify (equal_seqlen_q=False) keeps its blocks: packing its short sequences'
+# blocks with a long one's masked warps measured slower. Off: AITER_UA3D_QPACK=0.
+_GFX12_3D_QPACK = os.environ.get("AITER_UA3D_QPACK", "1") == "1"
+_GFX12_3D_QPACK_ROWS = 64
+# gfx1250 3D kernel, a prefill chunk that the attn_3d entry routes to the 3D split: the
+# entry's PREFILL_SPLIT_* keys size its workgroups and KV split (_gfx12_prefill_split)
+# in place of the decode token split. Off: AITER_UA3D_PREFILL_SPLIT=0.
+_GFX12_3D_PREFILL_SPLIT = os.environ.get("AITER_UA3D_PREFILL_SPLIT", "1") == "1"
+# gfx1250 2D kernel, a prefill whose grid leaves CUs idle: split the KV range when the
+# attn_2d entry has SPLIT_* keys (_gfx12_2d_split). Off: AITER_UA2D_PREFILL_SPLIT=0.
+_GFX12_2D_PREFILL_SPLIT = os.environ.get("AITER_UA2D_PREFILL_SPLIT", "1") == "1"
 # Opt-in floor on the gfx1250 gluon 3d KV split (decode and spec-decode verify).
 # The split is sized from the launch's program count, so a CUDA graph captured
 # at a batch wider than the live sequences (DP padding) splits too few ways.
@@ -182,12 +207,18 @@ def gfx12_token_split_constants(v_cache_dtype=None):
 # attn_3d config keys that steer use_2d_kernel on gfx1250 rather than the launch:
 # MAX_QUERY_ROWS_PER_CU sets the short-query bound above, and
 # PREFILL_MAX_2D_PRGMS / PREFILL_MIN_KV / PREFILL_MIN_KV_PER_PRGM opt an entry
-# into the 3D split for prefill over a long cached prefix (see use_2d_kernel).
+# into the 3D split for prefill over a long cached prefix, up to PREFILL_MAX_KV
+# (see use_2d_kernel).
 _GFX12_ROUTING_KEYS = (
     "MAX_QUERY_ROWS_PER_CU",
     "PREFILL_MAX_2D_PRGMS",
     "PREFILL_MIN_KV",
     "PREFILL_MIN_KV_PER_PRGM",
+    "PREFILL_MAX_KV",
+    "PREFILL_SPLIT_ROWS",
+    "PREFILL_SPLIT_WARPS",
+    "PREFILL_SPLIT_PROGRAMS",
+    "PREFILL_SPLIT_MAX_SEGMENTS",
 )
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -494,7 +525,7 @@ def _gfx12_prefill_2d(params: _UAParams, route: dict):
     range instead. It pays while each of those programs has a long run of keys
     to split, i.e. the prefix dominates the chunk."""
     max_prgms = route.get("PREFILL_MAX_2D_PRGMS", 0)
-    if max_prgms == 0:
+    if max_prgms == 0 or params.max_seqlen_k >= route.get("PREFILL_MAX_KV", math.inf):
         return True
     prgms = _gfx12_2d_prgms(params)
     min_kv = max(
@@ -502,6 +533,56 @@ def _gfx12_prefill_2d(params: _UAParams, route: dict):
         route.get("PREFILL_MIN_KV_PER_PRGM", 0) * prgms,
     )
     return prgms >= max_prgms or params.max_seqlen_k < min_kv
+
+
+def _gfx12_3d_prefill(params: _UAParams, route: dict):
+    """Whether a gfx1250 3D launch is a prefill chunk that takes the attn_3d entry's
+    PREFILL_SPLIT_* split instead of the decode token split."""
+    return (
+        _GFX12_3D_PREFILL_SPLIT
+        and _GFX12_TOKEN_SPLIT
+        and "PREFILL_SPLIT_ROWS" in route
+        and not params.all_decode
+        and not params.spec_decode
+        and params.max_seqlen_q > _GFX12_3D_MAX_SEQLEN_Q
+        # PV_WARPS_M: NVFP4 V lays its scales out over the warps of the head dim
+        and params.v_cache_dtype != torch.uint8
+    )
+
+
+def _gfx12_prefill_split(params: _UAParams, route: dict, tile_size: int):
+    """(NUM_SEGMENTS, segm_tiles) of a prefill chunk. The token split sizes its
+    segments for one query block a sequence; a chunk has many, so it would launch
+    thousands of small workgroups and reduce up to 128 segments. Here: the power of 2
+    of segments that brings the grid of PREFILL_SPLIT_ROWS-row query blocks nearest
+    PREFILL_SPLIT_PROGRAMS workgroups, each an even share of the longest context."""
+    block_q = route["PREFILL_SPLIT_ROWS"] // params.num_queries_per_kv
+    q_blocks = params.num_tokens // block_q + params.num_seqs
+    want = route["PREFILL_SPLIT_PROGRAMS"] / (q_blocks * params.num_kv_heads)
+    tiles = triton.cdiv(int(params.max_seqlen_k), tile_size)
+    segments = 2 ** max(1, round(math.log2(max(want, 1.0))))
+    segments = min(
+        segments,
+        route["PREFILL_SPLIT_MAX_SEGMENTS"],
+        triton.next_power_of_2(tiles),
+    )
+    # cdiv(sum of the contexts' tiles, segments) on the device: covers the longest
+    # context, and a Triton launch keeps the call replayable (AITER_UA_FAST_LAUNCH)
+    segm_tiles = torch.empty(1, dtype=torch.int32, device=params.q.device)
+    gfx12_token_split_tiles[(1,)](
+        params.seqused_k,
+        segm_tiles,
+        params.num_seqs,
+        params.seqused_k.stride(0),
+        params.num_kv_heads,
+        TILE_SIZE=tile_size,
+        PROGRAMS=segments * params.num_kv_heads,
+        MIN_TILES=1,
+        MAX_TILES=1 << 30,
+        BLOCK=min(1024, max(64, triton.next_power_of_2(params.num_seqs))),
+        num_warps=4,
+    )
+    return segments, segm_tiles
 
 
 def use_2d_kernel(params: _UAParams, backend: str = "triton"):
@@ -853,9 +934,15 @@ def unified_attention(
             )
         segm_tiles = None
         if _GFX12_TOKEN_SPLIT and use_gluon_3d and DEVICE_ARCH == "gfx1250":
-            NUM_SEGMENTS, segm_tiles = _gfx12_token_split(
-                params, CONFIG_TILE_SIZE, gfx12_token_split_tiles
-            )
+            route = get_unified_attention_config("attn_3d", params, backend="gluon")
+            if _gfx12_3d_prefill(params, route):
+                NUM_SEGMENTS, segm_tiles = _gfx12_prefill_split(
+                    params, route, CONFIG_TILE_SIZE
+                )
+            else:
+                NUM_SEGMENTS, segm_tiles = _gfx12_token_split(
+                    params, CONFIG_TILE_SIZE, gfx12_token_split_tiles
+                )
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
         # and keeps its tuned tile.
@@ -1393,6 +1480,48 @@ _reduce_segments_{arch}(
 """
 
 
+def _gfx12_2d_split(params: _UAParams, config: dict):
+    """(KV splits, config) of a gfx1250 2D prefill launch. An attn_2d entry with
+    SPLIT_* keys splits a prefill over a context of at least SPLIT_MIN_KV into the
+    largest power of 2 of KV ranges that keeps the grid of SPLIT_BLOCK_M-row query
+    blocks within SPLIT_PROGRAMS workgroups (at most SPLIT_MAX, at least
+    SPLIT_MIN_TILES tiles a range), and launches the SPLIT_* shape; one split and the
+    entry's own shape otherwise."""
+    target = config.get("SPLIT_PROGRAMS")
+    if (
+        not (_GFX12_2D_PREFILL_SPLIT and target)
+        or params.all_decode
+        or params.spec_decode
+        or params.sliding_window > 0
+        or int(params.max_seqlen_k) < config["SPLIT_MIN_KV"]
+        or params.head_size != params.head_size_v
+        # reduce_splits_heads: power-of-2 head blocks and head size
+        or params.num_query_heads & (params.num_query_heads - 1)
+        or params.head_size & (params.head_size - 1)
+    ):
+        return 1, config
+    block_q = config["SPLIT_BLOCK_M"] // params.num_queries_per_kv
+    query_blocks = params.num_tokens // block_q + params.num_seqs
+    want = target / (params.num_kv_heads * query_blocks)
+    if want < 2:
+        return 1, config
+    tiles = triton.cdiv(int(params.max_seqlen_k), config["SPLIT_TILE_SIZE"])
+    splits = min(
+        2 ** int(math.log2(want)),
+        config["SPLIT_MAX"],
+        triton.next_power_of_2(max(1, tiles // config["SPLIT_MIN_TILES"])),
+    )
+    if splits < 2:
+        return 1, config
+    return splits, dict(
+        config,
+        BLOCK_M=config["SPLIT_BLOCK_M"],
+        num_warps=config["SPLIT_NUM_WARPS"],
+        TILE_SIZE=config["SPLIT_TILE_SIZE"],
+        LOOP_VARIANT=config["SPLIT_LOOP_VARIANT"],
+    )
+
+
 def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     """
     Internal wrapper for the gfx1250 gluon kernel.
@@ -1405,6 +1534,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     assert params.softcap == 0, "Softcap is not supported"
 
     config = get_unified_attention_config("attn_2d", params, backend="gluon")
+    num_splits, config = _gfx12_2d_split(params, config)
     NUM_SEQS = params.num_seqs
     TILE_SIZE = config["TILE_SIZE"]
     BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
@@ -1473,6 +1603,28 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     else:
         total_query_blocks = params.num_tokens // BLOCK_Q + NUM_SEQS
 
+    if num_splits > 1:
+        # fp32 partials in the reduce_segments layout; the reduce applies the output
+        # scale and the gate
+        segm_output = torch.empty(
+            (params.num_tokens, params.num_query_heads, num_splits, params.head_size),
+            dtype=torch.float32,
+            device=params.q.device,
+        )
+        segm_max = torch.empty(
+            (params.num_tokens, params.num_query_heads, num_splits),
+            dtype=torch.float32,
+            device=params.q.device,
+        )
+        segm_expsum = torch.empty(
+            (params.num_tokens, params.num_query_heads, num_splits),
+            dtype=torch.float32,
+            device=params.q.device,
+        )
+        reduce_gate, output_gate = output_gate, None
+    else:
+        segm_output = segm_max = segm_expsum = None
+
     # buffer ops need the tensor to fit a 32-bit offset; gfx1250 loads through TDM
     MAX_INT32 = 2**31 - 1
     USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
@@ -1480,7 +1632,9 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     v_cache = params.v.view(torch.uint8) if v_fp4pt else params.v
     if v_fp4pt:
         _fp4pt_log("2d", _fp4pt_pv_mode(), v=tuple(params.v.shape), tile=TILE_SIZE, block_m=BLOCK_M)
-    _unified_attention_kernel_2d_gfx1250[(params.num_kv_heads, total_query_blocks)](
+    _unified_attention_kernel_2d_gfx1250[
+        (params.num_kv_heads, total_query_blocks, num_splits)
+    ](
         query_ptr=params.q,
         key_cache_ptr=params.k,
         value_cache_ptr=v_cache,
@@ -1496,7 +1650,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         k_descale_ptr=params.k_descale,
         v_descale_ptr=params.v_descale,
         q_descale_ptr=params.q_descale,
-        out_scale_ptr=params.output_scale,
+        out_scale_ptr=params.output_scale if num_splits == 1 else None,
         USE_SINKS=(params.sinks is not None),
         SLIDING_WINDOW=params.sliding_window,
         num_blocks=params.num_blocks,
@@ -1543,8 +1697,67 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         gate_ptr=output_gate,
         gate_stride_0=output_gate.stride(0) if output_gate is not None else 0,
         GATE=output_gate is not None,
+        NUM_SPLITS=num_splits,
+        partial_m_ptr=segm_max,
+        partial_l_ptr=segm_expsum,
+        partial_acc_ptr=segm_output,
         enable_fp_fusion=True,
     )
+    if num_splits > 1:
+        # all heads of a token in few programs (~16 x 256 x 4 splits a program)
+        block_h = min(params.num_query_heads, max(1, 64 // num_splits))
+        reduce_splits_heads[
+            (params.num_tokens, triton.cdiv(params.num_query_heads, block_h))
+        ](
+            params.out,
+            segm_output,
+            segm_max,
+            segm_expsum,
+            params.output_scale,
+            reduce_gate,
+            reduce_gate.stride(0) if reduce_gate is not None else 0,
+            params.out.stride(0),
+            params.out.stride(1),
+            NUM_QUERY_HEADS=params.num_query_heads,
+            NUM_SPLITS=num_splits,
+            HEAD_SIZE=params.head_size,
+            BLOCK_H=block_h,
+            num_warps=4,
+        )
+
+
+def _gfx12_3d_qpack(params: _UAParams, config, token_split: bool):
+    """(BLOCK_M, num_warps, XCD_REMAP) of a gfx1250 3d launch, from the tuned attn_3d
+    entry's BLOCK_M / num_warps (see _GFX12_3D_QPACK); the entry's own, without the
+    XCD placement, outside a token-split spec-decode verify of several blocks."""
+    block_m, num_warps = config["BLOCK_M"], config.get("num_warps", 1)
+    unchanged = (block_m, num_warps, False)
+    G = params.num_queries_per_kv
+    if (
+        not (_GFX12_3D_QPACK and token_split and params.spec_decode)
+        or num_warps != 1
+        # NVFP4 V lays its scales out over the warps of the head dim
+        or params.v_cache_dtype == torch.uint8
+        or block_m % G
+        or block_m < 16
+    ):
+        return unchanged
+    seqlen_q = int(params.max_seqlen_q)
+    blocks = triton.cdiv(seqlen_q, block_m // G)
+    if blocks == 1:
+        return unchanged
+    live_seqs = min(params.num_seqs, params.num_tokens // seqlen_q)
+    if live_seqs <= 1 and blocks <= 3:
+        return block_m, 1, True
+    rows = max(
+        block_m, min(triton.next_power_of_2(blocks * block_m), _GFX12_3D_QPACK_ROWS)
+    )
+    wgs_per_seq = triton.cdiv(seqlen_q, rows // G)
+    # few workgroups a segment: shorter warps cut each KV tile's latency; more: 32-row
+    # warps read each tile from LDS half as often a row
+    warp_rows = 16 if live_seqs * params.num_kv_heads * wgs_per_seq <= 4 else 32
+    warp_rows = min(max(warp_rows, block_m), rows)
+    return rows, rows // warp_rows, wgs_per_seq > 1
 
 
 def _unified_attention_3d_gfx1250(
@@ -1566,6 +1779,9 @@ def _unified_attention_3d_gfx1250(
         else ""
     )
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
+    prefill = segm_tiles is not None and _gfx12_3d_prefill(params, config)
+    if prefill:
+        prefill_pack = (config["PREFILL_SPLIT_ROWS"], config["PREFILL_SPLIT_WARPS"])
     for key in _GFX12_ROUTING_KEYS:
         config.pop(key, None)
     config["BLOCK_M"] = max(
@@ -1580,6 +1796,19 @@ def _unified_attention_3d_gfx1250(
         v_cache = v_cache.view(torch.uint8)
         V_PT_MODE = _fp4pt_pv_mode()
         _fp4pt_log("3d", V_PT_MODE, v=tuple(params.v.shape), block_m=config["BLOCK_M"])
+    tuned_warps = config.get("num_warps", 1)
+    if prefill:
+        # a prefill chunk's workgroups (see _gfx12_prefill_split), warps of whole rows
+        assert tuned_warps == 1 and prefill_pack[0] % params.num_queries_per_kv == 0
+        config["BLOCK_M"], config["num_warps"] = prefill_pack
+        xcd_remap = False
+    else:
+        config["BLOCK_M"], config["num_warps"], xcd_remap = _gfx12_3d_qpack(
+            params, config, segm_tiles is not None
+        )
+    config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
+    # a packed workgroup's warps own query rows in PV too, not head-dim columns
+    pv_warps_m = config["num_warps"] > tuned_warps
 
     # spec decode launches the exact block count, so the kernel needs no search
     SEQLEN_Q = int(params.max_seqlen_q) if params.spec_decode else 1
@@ -1660,6 +1889,8 @@ def _unified_attention_3d_gfx1250(
         and params.v_cache_dtype == torch.uint8,
         V_CACHE_DTYPE=V_CACHE_DTYPE,
         V_PT_MODE=V_PT_MODE,
+        PV_WARPS_M=pv_warps_m,
+        XCD_REMAP=xcd_remap,
         USE_STORE_TDM=True,
         # experiment knob: NVFP4 KV + BF16 PV processed in 2 head-dim halves
         HEAD_SIZE_SPLIT=(

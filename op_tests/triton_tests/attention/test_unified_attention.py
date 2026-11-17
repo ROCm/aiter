@@ -1912,3 +1912,397 @@ def test_unified_attn_split_reduce_oneshot_k4v8(
     )
     assert not new[live].isnan().any()
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
+
+
+@pytest.mark.parametrize("num_heads", [(16, 2), (8, 2)])
+@pytest.mark.parametrize("kv", ["k4v8", "fp8", "bf16"])
+@pytest.mark.parametrize("token_split", [False, True])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # verifies wider than one query block (BLOCK_M 16: 2 tokens a block at GQA 8)
+        [(5, 3000), (5, 129), (5, 7000)] * 2,  # 3 blocks, 2 warps x 32 rows
+        [(6, 41000), (6, 2049), (6, 130)],
+        [(8, 23456), (8, 300), (8, 9001), (8, 9)],  # 4 blocks
+        [(8, 30000), (8, 77)],  # a small batch: 4 warps x 16 rows
+        [(12, 9000), (12, 77)],  # 2 packed workgroups a sequence, on one XCD
+        [(16, 20011), (16, 129), (16, 5000)],
+        [(6, 50000)],  # one sequence of 3 blocks: blocks as workgroups, on one XCD
+        [(8, 50000)],
+        [(16, 2049)] * 2 + [(16, 0)],  # a trailing pad sequence without rows
+        # ragged verifies keep their launch
+        [(17, 23456), (4, 9000), (4, 130), (4, 5)],
+    ],
+)
+@torch.inference_mode()
+def test_unified_attn_qpack_gfx1250(
+    seq_lens, token_split: bool, kv: str, num_heads: tuple[int, int], monkeypatch
+) -> None:
+    """gfx1250 3D kernel, A8K4V8 / fp8 / bf16, GQA 8 / 4 (2 kv heads, d 256, page 128):
+    a token-split speculative-decode verify of several query blocks a sequence runs them
+    as the warps of one workgroup over one copy of each KV tile (_GFX12_3D_QPACK),
+    bitwise the output of one block a workgroup (every warp runs the per-row
+    instructions of a block), and for A8K4V8 within the reference's bound; without the
+    token split, and for a ragged batch, the launch is the tuned one."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Gluon kernels")
+    from aiter.ops.triton.utils import unified_attention_utils as ua_utils
+    from op_tests.op_benchmarks.triton import bench_unified_attention as bench
+
+    module = sys.modules[unified_attention.__module__]
+    monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT", token_split)
+    monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT_MIN_TILES", 16)
+    monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT_MAX_TILES", 128)
+    monkeypatch.setattr(module, "use_2d_kernel", lambda params, backend="triton": False)
+    # a ragged verify longer than 16 rows takes the prefill split (its own test)
+    monkeypatch.setattr(module, "_GFX12_3D_PREFILL_SPLIT", False)
+    torch.manual_seed(0)
+    block_size, head_size = 128, 256
+    # make_inputs draws the block tables from a permutation of num_seqs x the longest
+    # context's pages
+    num_blocks = (
+        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
+        + 16
+    )
+    inp = bench.make_inputs(
+        seq_lens=[(q, max(k, 1)) for q, k in seq_lens],
+        num_heads=num_heads,
+        head_size_qk=head_size,
+        head_size_v=head_size,
+        block_size=block_size,
+        num_blocks=num_blocks,
+        fp8_q=kv != "bf16",
+        fp8_kv=kv != "bf16",
+        fp8_output=False,
+        out_scale_value=1.0,
+        nvfp4_kv=kv == "k4v8",
+        nvfp4_v=False,
+    )
+    if kv == "bf16":
+        k_shuf, v_shuf = shuffle_kv_cache(inp["key_cache"], inp["value_cache"])
+    else:
+        k_shuf, v_shuf = shuffle_kv_cache(inp["k_fp8"], inp["v_fp8"])
+    key_cache = inp["k_nvfp4"] if kv == "k4v8" else k_shuf
+    kv_lens = inp["kv_lens"].clone()
+    pad = torch.tensor([k == 0 for _, k in seq_lens], device=kv_lens.device)
+    kv_lens[pad] = 0
+    q_lens = [q for q, _ in seq_lens]
+    equal_q = len(set(q_lens)) == 1
+    query = inp["query"] if kv == "bf16" else inp["q_fp8"]
+    if pad.any():
+        # pad sequences have no query rows behind them
+        query = query[: sum(q for (q, k) in seq_lens if k > 0)]
+    launches = []
+    qpack_fn = module._gfx12_3d_qpack
+
+    def spy(params, config, split):
+        launches.append(
+            (config["BLOCK_M"], config["num_warps"], qpack_fn(params, config, split))
+        )
+        return launches[-1][2]
+
+    monkeypatch.setattr(module, "_gfx12_3d_qpack", spy)
+
+    def run(qpack):
+        monkeypatch.setattr(module, "_GFX12_3D_QPACK", qpack)
+        # _GFX12_3D_QPACK is read at import in production and is not part of the
+        # fast-launch key: drop the recorded plans, so this call takes the launch path
+        ua_utils._plans.clear()
+        out = torch.full(
+            (query.shape[0], num_heads[0], head_size),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=v_shuf,
+            out=out,
+            cu_seqlens_q=inp["cu_query_lens"],
+            seqused_k=kv_lens,
+            max_seqlen_q=max(q_lens),
+            max_seqlen_k=inp["max_kv_len"],
+            softmax_scale=inp["scale"],
+            causal=True,
+            window_size=(-1, -1),
+            block_table=inp["block_tables"],
+            softcap=0,
+            q_descale=inp["q_descale"],
+            k_descale=inp["k_descale"],
+            v_descale=inp["v_descale"],
+            shuffled_kv_cache=True,
+            equal_seqlen_q=equal_q,
+            split_reduce=equal_q,
+            split_reduce_oneshot=equal_q,
+            backend="gluon",
+        )
+        return out
+
+    single = run(False)
+    packed = run(True)
+    assert len(launches) == 2
+    (tuned_m, tuned_w, off), (_, _, on) = launches
+    assert off == (tuned_m, tuned_w, False)
+    if (
+        token_split
+        and equal_q
+        and max(q_lens) > tuned_m // (num_heads[0] // num_heads[1])
+    ):
+        assert on != off, on  # packed, or the XCD placement
+    else:
+        assert on == off, on
+    assert not packed.isnan().any()
+    assert torch.equal(packed.view(torch.int16), single.view(torch.int16))
+    if kv != "k4v8" or pad.any():
+        return
+    ref = ref_paged_attn(
+        query=inp["query_ref"],
+        key_cache=inp["key_ref"],
+        value_cache=inp["value_ref"],
+        query_lens=inp["query_lens"],
+        kv_lens=inp["kv_lens"],
+        block_tables=inp["block_tables"],
+        scale=inp["scale"],
+        sliding_window=None,
+        soft_cap=None,
+        q_descale=None,
+        k_descale=inp["k_descale"],
+        v_descale=inp["v_descale"],
+        output_scale=None,
+        out_dtype=torch.bfloat16,
+    ).float()
+    out = packed.float()
+    rel = ((out - ref).norm() / ref.norm()).item()
+    assert rel < 0.04, f"relative L2 error {rel:.4f}"
+    assert (out - ref).abs().max().item() < 0.15
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(256, 30000)],
+        [(455, 114000)],
+        [(128, 200000)],
+        [(64, 9000)],
+        [(512, 20000)],
+        [(128, 50000), (300, 20000)],
+        [(200, 4000), (40, 60000), (17, 3000)],
+        [(17, 23456), (4, 9000), (4, 130), (4, 5)],  # a ragged verify over 16 rows
+    ],
+)
+@torch.inference_mode()
+def test_unified_attn_prefill_split_gfx1250(seq_lens, monkeypatch) -> None:
+    """gfx1250 3D kernel, A8K4V8 (16 q / 2 kv heads, d 256, page 128), token split on:
+    a prefill chunk that the attn_3d entry routes to the 3D split takes the entry's
+    PREFILL_SPLIT_* workgroups and KV split (_gfx12_prefill_split), within the
+    reference's bound, as the decode token split's launch is."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Gluon kernels")
+    from aiter.ops.triton.utils import unified_attention_utils as ua_utils
+    from op_tests.op_benchmarks.triton import bench_unified_attention as bench
+
+    module = sys.modules[unified_attention.__module__]
+    monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT", True)
+    monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT_MIN_TILES", 16)
+    monkeypatch.setattr(module, "_GFX12_TOKEN_SPLIT_MAX_TILES", 128)
+    monkeypatch.setattr(module, "use_2d_kernel", lambda params, backend="triton": False)
+    torch.manual_seed(0)
+    block_size, head_size, num_heads = 128, 256, (16, 2)
+    kv_total = [q + k for q, k in seq_lens]
+    num_blocks = len(seq_lens) * max(triton.cdiv(k, block_size) for k in kv_total) + 16
+    inp = bench.make_inputs(
+        seq_lens=[(q, q + k) for q, k in seq_lens],
+        num_heads=num_heads,
+        head_size_qk=head_size,
+        head_size_v=head_size,
+        block_size=block_size,
+        num_blocks=num_blocks,
+        fp8_q=True,
+        fp8_kv=True,
+        fp8_output=False,
+        out_scale_value=1.0,
+        nvfp4_kv=True,
+        nvfp4_v=False,
+    )
+    v_shuf = shuffle_kv_cache(inp["k_fp8"], inp["v_fp8"])[1]
+    splits = []
+    split_fn = module._gfx12_prefill_split
+
+    def spy(params, route, tile_size):
+        splits.append(split_fn(params, route, tile_size)[0])
+        return split_fn(params, route, tile_size)
+
+    monkeypatch.setattr(module, "_gfx12_prefill_split", spy)
+
+    def run(prefill_split):
+        monkeypatch.setattr(module, "_GFX12_3D_PREFILL_SPLIT", prefill_split)
+        ua_utils._plans.clear()
+        out = torch.full(
+            (inp["q_fp8"].shape[0], num_heads[0], head_size),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        unified_attention(
+            q=inp["q_fp8"],
+            k=inp["k_nvfp4"],
+            v=v_shuf,
+            out=out,
+            cu_seqlens_q=inp["cu_query_lens"],
+            seqused_k=inp["kv_lens"],
+            max_seqlen_q=max(q for q, _ in seq_lens),
+            max_seqlen_k=inp["max_kv_len"],
+            softmax_scale=inp["scale"],
+            causal=True,
+            window_size=(-1, -1),
+            block_table=inp["block_tables"],
+            softcap=0,
+            q_descale=inp["q_descale"],
+            k_descale=inp["k_descale"],
+            v_descale=inp["v_descale"],
+            shuffled_kv_cache=True,
+            backend="gluon",
+        )
+        return out.float()
+
+    token_split = run(False)
+    assert not splits
+    prefill = run(True)
+    assert len(splits) == 1 and 2 <= splits[0] <= 32, splits
+    assert not prefill.isnan().any()
+    ref = ref_paged_attn(
+        query=inp["query_ref"],
+        key_cache=inp["key_ref"],
+        value_cache=inp["value_ref"],
+        query_lens=inp["query_lens"],
+        kv_lens=inp["kv_lens"],
+        block_tables=inp["block_tables"],
+        scale=inp["scale"],
+        sliding_window=None,
+        soft_cap=None,
+        q_descale=None,
+        k_descale=inp["k_descale"],
+        v_descale=inp["v_descale"],
+        output_scale=None,
+        out_dtype=torch.bfloat16,
+    ).float()
+    for out in (token_split, prefill):
+        rel = ((out - ref).norm() / ref.norm()).item()
+        assert rel < 0.04, f"relative L2 error {rel:.4f}"
+        assert (out - ref).abs().max().item() < 0.15
+
+
+@pytest.mark.parametrize(
+    "seq_lens, splits",
+    [
+        ([(128, 30000)], None),
+        ([(455, 114000)], None),
+        ([(1024, 30000)], None),
+        ([(768, 20000)], None),
+        ([(300, 20000), (64, 50000)], None),
+        # few tiles a split: ranges of 3+ tiles, a short tail joins the split before
+        ([(128, 5000)], 16),
+        ([(455, 5000)], 32),
+        ([(64, 2500)], 8),
+        ([(1024, 30000)], 32),
+    ],
+)
+@pytest.mark.parametrize("gate", [False, True])
+@torch.inference_mode()
+def test_unified_attn_prefill_2d_split_gfx1250(seq_lens, splits, gate, monkeypatch) -> None:
+    """gfx1250 2D kernel, A8K4V8 (16 q / 2 kv heads, d 256, page 128): a prefill that
+    the attn_2d entry's SPLIT_* keys split (_gfx12_2d_split) writes per-split partials
+    that reduce_splits_heads merges (with the output gate), within the reference's
+    bound; ``splits`` forces the split count."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Gluon kernels")
+    from aiter.ops.triton.utils import unified_attention_utils as ua_utils
+    from op_tests.op_benchmarks.triton import bench_unified_attention as bench
+
+    module = sys.modules[unified_attention.__module__]
+    monkeypatch.setattr(module, "use_2d_kernel", lambda params, backend="triton": True)
+    chosen = []
+    split_fn = module._gfx12_2d_split
+
+    def spy(params, config):
+        n, cfg = split_fn(params, dict(config, SPLIT_MIN_KV=0) if splits else config)
+        if splits:
+            n, cfg = splits, split_fn(params, dict(config, SPLIT_MIN_KV=0, SPLIT_PROGRAMS=1 << 20, SPLIT_MAX=splits, SPLIT_MIN_TILES=1))[1]
+        chosen.append(n)
+        return n, cfg
+
+    monkeypatch.setattr(module, "_gfx12_2d_split", spy)
+    torch.manual_seed(0)
+    block_size, head_size, num_heads = 128, 256, (16, 2)
+    num_blocks = len(seq_lens) * max(triton.cdiv(q + k, block_size) for q, k in seq_lens) + 16
+    inp = bench.make_inputs(
+        seq_lens=[(q, q + k) for q, k in seq_lens],
+        num_heads=num_heads,
+        head_size_qk=head_size,
+        head_size_v=head_size,
+        block_size=block_size,
+        num_blocks=num_blocks,
+        fp8_q=True,
+        fp8_kv=True,
+        fp8_output=False,
+        out_scale_value=1.0,
+        nvfp4_kv=True,
+        nvfp4_v=False,
+    )
+    v_shuf = shuffle_kv_cache(inp["k_fp8"], inp["v_fp8"])[1]
+    num_tokens = inp["q_fp8"].shape[0]
+    output_gate = (
+        torch.randn((num_tokens, num_heads[0] * head_size), dtype=torch.bfloat16, device="cuda")
+        if gate
+        else None
+    )
+    ua_utils._plans.clear()
+    out = torch.full(
+        (num_tokens, num_heads[0], head_size), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    unified_attention(
+        q=inp["q_fp8"],
+        k=inp["k_nvfp4"],
+        v=v_shuf,
+        out=out,
+        cu_seqlens_q=inp["cu_query_lens"],
+        seqused_k=inp["kv_lens"],
+        max_seqlen_q=max(q for q, _ in seq_lens),
+        max_seqlen_k=inp["max_kv_len"],
+        softmax_scale=inp["scale"],
+        causal=True,
+        window_size=(-1, -1),
+        block_table=inp["block_tables"],
+        softcap=0,
+        q_descale=inp["q_descale"],
+        k_descale=inp["k_descale"],
+        v_descale=inp["v_descale"],
+        shuffled_kv_cache=True,
+        backend="gluon",
+        output_gate=output_gate,
+    )
+    assert chosen and chosen[0] >= 2, chosen
+    assert not out.isnan().any()
+    ref = ref_paged_attn(
+        query=inp["query_ref"],
+        key_cache=inp["key_ref"],
+        value_cache=inp["value_ref"],
+        query_lens=inp["query_lens"],
+        kv_lens=inp["kv_lens"],
+        block_tables=inp["block_tables"],
+        scale=inp["scale"],
+        sliding_window=None,
+        soft_cap=None,
+        q_descale=None,
+        k_descale=inp["k_descale"],
+        v_descale=inp["v_descale"],
+        output_scale=None,
+        out_dtype=torch.bfloat16,
+    ).float()
+    if gate:
+        g = torch.sigmoid(output_gate.float()).view(num_tokens, num_heads[0], head_size)
+        ref = (ref.to(torch.bfloat16).float() * g)
+    rel = ((out.float() - ref).norm() / ref.norm()).item()
+    assert rel < 0.04, f"relative L2 error {rel:.4f}"
+    assert (out.float() - ref).abs().max().item() < 0.15

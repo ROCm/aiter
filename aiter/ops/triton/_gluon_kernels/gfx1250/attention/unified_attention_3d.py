@@ -168,6 +168,7 @@ class AttentionConfig:
         HEAD_SIZE_SPLIT=1,
         V_CACHE_DTYPE="",
         V_PT_MODE=V_PT_PV_FP8FP4,
+        PV_WARPS_M=False,
     ):
         # Constants
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
@@ -247,6 +248,11 @@ class AttentionConfig:
         elif NUM_WARPS == 4:
             warp_bases_qk = [(1, 0), (2, 0)]
             warp_bases_pv = [(0, 1), (0, 2)]
+        if PV_WARPS_M:
+            # every warp owns whole query rows in PV too: P, alpha and the accumulator stay in the warp
+            # that computed them, and each warp reads the whole (shared) V tile from LDS
+            assert V_CACHE_DTYPE != "nvfp4"
+            warp_bases_pv = warp_bases_qk
 
         """
             A16W16:
@@ -2206,6 +2212,8 @@ _unified_attention_gluon_kernel_3d_base_repr = make_kernel_repr(
         "V_CACHE_DTYPE",
         "HEAD_SIZE_SPLIT",
         "USE_STORE_TDM",
+        "BLOCK_M",
+        "PV_WARPS_M",
     ],
 )
 
@@ -2294,6 +2302,8 @@ def _unified_attention_gluon_kernel_3d(
     HEAD_SIZE_SPLIT: gl.constexpr = 1,  # int, NVFP4 KV + BF16 PV only: V in head-dim pieces
     V_CACHE_DTYPE: gl.constexpr = "",  # V cache dtype when it differs from KV_CACHE_DTYPE (the K's): A8K4V8, A8K4V4PT
     V_PT_MODE: gl.constexpr = 2,  # A8K4V4PT (V_CACHE_DTYPE "fp4pt") PV variant: 1 SCALE_ON_P, 2 PV_FP8FP4
+    PV_WARPS_M: gl.constexpr = False,  # bool, warps split the query rows in PV as in QK (not the head dim)
+    XCD_REMAP: gl.constexpr = False,  # bool, spec decode: the query blocks of a seq on one XCD
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -2332,6 +2342,7 @@ def _unified_attention_gluon_kernel_3d(
         HEAD_SIZE_SPLIT,
         V_CACHE_DTYPE,
         V_PT_MODE,
+        PV_WARPS_M,
     )
     V_NVFP4: gl.constexpr = cfg.V_CACHE_DTYPE == "nvfp4"
     # TDM loads per page: data, plus the scales of an NVFP4 cache. A wait lets the loads issued after the awaited
@@ -2356,6 +2367,26 @@ def _unified_attention_gluon_kernel_3d(
         # Q_BLOCKS_PER_SEQ blocks per seq and the program id alone locates the
         # seq and the query block: no binary search, and no empty blocks.
         Q_BLOCKS_PER_SEQ: gl.constexpr = (SEQLEN_Q + BLOCK_Q - 1) // BLOCK_Q
+        if XCD_REMAP and Q_BLOCKS_PER_SEQ > 1:
+            # Workgroups go round robin over the 8 XCDs in dispatch order (x fastest), so the blocks of one
+            # (seq, kv head, segment), consecutive in x, each pulled the same KV into another XCD's L2.
+            # Renumber the grid so that they are 8 dispatch slots apart: one XCD, dispatched together.
+            nx = gl.num_programs(0)
+            ny = gl.num_programs(1)
+            nz = gl.num_programs(2)
+            lin = q_block_global_idx + nx * (kv_head_idx + ny * segm_idx)
+            nseq = nx // Q_BLOCKS_PER_SEQ
+            num_groups = nseq * ny * nz
+            chunk = lin // (8 * Q_BLOCKS_PER_SEQ)
+            r = lin % (8 * Q_BLOCKS_PER_SEQ)
+            width = gl.minimum(num_groups - chunk * 8, 8)
+            grp = chunk * 8 + r % width
+            q_blk = r // width
+            seq_r = grp % nseq
+            hz = grp // nseq
+            kv_head_idx = hz % ny
+            segm_idx = hz // ny
+            q_block_global_idx = seq_r * Q_BLOCKS_PER_SEQ + q_blk
         if Q_BLOCKS_PER_SEQ == 1:
             seq_idx = q_block_global_idx
             q_block_local_idx: gl.int32 = 0

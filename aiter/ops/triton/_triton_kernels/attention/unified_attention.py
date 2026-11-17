@@ -1179,6 +1179,65 @@ def reduce_segments(
     )
 
 
+_reduce_splits_heads_repr = make_kernel_repr(
+    "reduce_splits_heads", ["NUM_SPLITS", "HEAD_SIZE", "BLOCK_H"]
+)
+
+
+@triton.jit(repr=_reduce_splits_heads_repr)
+def reduce_splits_heads(
+    output_ptr,  # [num_tokens, num_query_heads, head_size]
+    partial_acc_ptr,  # [num_tokens, num_query_heads, NUM_SPLITS, head_size] fp32
+    partial_m_ptr,  # [num_tokens, num_query_heads, NUM_SPLITS] fp32, exp2 domain
+    partial_l_ptr,  # [num_tokens, num_query_heads, NUM_SPLITS] fp32
+    out_scale_ptr,  # [1] fp32 or None
+    gate_ptr,  # [num_tokens, num_query_heads * head_size] or None
+    gate_stride_0: tl.int64,
+    output_stride_0: tl.int64,
+    output_stride_1: tl.int64,
+    NUM_QUERY_HEADS: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    FP8_MIN: tl.constexpr = float8_info.min,
+    FP8_MAX: tl.constexpr = float8_info.max,
+):
+    """Merge the KV-split partials of BLOCK_H query heads of one token. Every split
+    slot holds a partial (M=-inf, L=0, acc=0 when the split had no keys), so all
+    NUM_SPLITS are read and no sequence lookup is needed."""
+    token = tl.program_id(0).to(tl.int64)
+    offs_h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    offs_s = tl.arange(0, NUM_SPLITS)
+    offs_d = tl.arange(0, HEAD_SIZE)
+    ml = (token * NUM_QUERY_HEADS + offs_h[:, None]) * NUM_SPLITS + offs_s[None, :]
+    m = tl.load(partial_m_ptr + ml)
+    m_max = tl.max(m, 1)
+    m_max = tl.where(m_max == float("-inf"), 0.0, m_max)
+    w = tl.math.exp2(m - m_max[:, None])
+    expsum = tl.sum(w * tl.load(partial_l_ptr + ml), 1)
+    acc = tl.load(partial_acc_ptr + ml[:, :, None] * HEAD_SIZE + offs_d[None, None, :])
+    acc = tl.sum(acc * w[:, :, None], 1)
+    acc = tl.where(expsum[:, None] == 0.0, 0.0, acc / expsum[:, None])
+    if out_scale_ptr is not None:
+        acc = acc / tl.load(out_scale_ptr)
+    if output_ptr.type.element_ty.is_fp8():
+        acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
+    result = acc.to(output_ptr.type.element_ty)
+    if gate_ptr is not None:
+        gate = tl.load(
+            gate_ptr + token * gate_stride_0 + offs_h[:, None] * HEAD_SIZE + offs_d[None, :]
+        )
+        gate = tl.sigmoid(gate.to(tl.float32)).to(gate.dtype).to(tl.float32)
+        result = (result.to(tl.float32) * gate).to(output_ptr.type.element_ty)
+    tl.store(
+        output_ptr
+        + token * output_stride_0
+        + offs_h[:, None] * output_stride_1
+        + offs_d[None, :],
+        result,
+    )
+
+
 @triton.jit
 def attention_output_gate_rows(
     out_ptr,  # [num_rows, width]

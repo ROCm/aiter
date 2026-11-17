@@ -384,7 +384,15 @@
       "LOOP_VARIANT": 1,
       "NUM_BUFFERS": 2,
       "TILE_SIZE_MIN": 128,
-      "TILE_SIZE_MAX": 128
+      "TILE_SIZE_MAX": 128,
+      "SPLIT_BLOCK_M": 128,
+      "SPLIT_NUM_WARPS": 4,
+      "SPLIT_TILE_SIZE": 128,
+      "SPLIT_LOOP_VARIANT": 1,
+      "SPLIT_PROGRAMS": 288,
+      "SPLIT_MAX": 32,
+      "SPLIT_MIN_TILES": 8,
+      "SPLIT_MIN_KV": 8192
     },
     "D_GEQ_256.G_EQ_8.DT_fp8_nvfp4_fp4pt": {
       "BLOCK_M": 64,
@@ -420,7 +428,15 @@
       "LOOP_VARIANT": 2,
       "NUM_BUFFERS": 2,
       "TILE_SIZE_MIN": 256,
-      "TILE_SIZE_MAX": 256
+      "TILE_SIZE_MAX": 256,
+      "SPLIT_BLOCK_M": 128,
+      "SPLIT_NUM_WARPS": 4,
+      "SPLIT_TILE_SIZE": 128,
+      "SPLIT_LOOP_VARIANT": 1,
+      "SPLIT_PROGRAMS": 288,
+      "SPLIT_MAX": 32,
+      "SPLIT_MIN_TILES": 8,
+      "SPLIT_MIN_KV": 8192
     },
     "D_GEQ_256.G_EQ_8.Q_LEQ_1024.DT_fp8_nvfp4_fp4pt": {
       "BLOCK_M": 32,
@@ -674,7 +690,12 @@
       "waves_per_eu": 1,
       "PREFILL_MAX_2D_PRGMS": 160,
       "PREFILL_MIN_KV": 2048,
-      "PREFILL_MIN_KV_PER_PRGM": 124
+      "PREFILL_MIN_KV_PER_PRGM": 124,
+      "PREFILL_SPLIT_ROWS": 64,
+      "PREFILL_SPLIT_WARPS": 2,
+      "PREFILL_SPLIT_PROGRAMS": 512,
+      "PREFILL_SPLIT_MAX_SEGMENTS": 32,
+      "PREFILL_MAX_KV": 8192
     },
     "D_GEQ_256.G_EQ_8.Q_LEQ_512.SHUF.DT_fp8_nvfp4_fp4pt": {
       "BLOCK_M": 32,

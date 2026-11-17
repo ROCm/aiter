@@ -1523,9 +1523,18 @@ class AttentionProgram:
         # split_idx==0 / NUM_SPLITS==1 is a no-op
         if NUM_SPLITS > 1:
             active_tiles = tile_end - tile_start
-            tiles_per_split = (active_tiles + NUM_SPLITS - 1) // NUM_SPLITS
+            # the reordered loop variants run a prologue tile and two epilogue tiles,
+            # so a range past tile 0 needs at least 3: 3 tiles a split at least, and
+            # a tail of 1-2 tiles joins the split before it (the next one is empty)
+            tiles_per_split = gl.maximum(
+                (active_tiles + NUM_SPLITS - 1) // NUM_SPLITS, 3
+            )
             split_start = tile_start + split_idx * tiles_per_split
-            tile_end = gl.minimum(split_start + tiles_per_split, tile_end)
+            split_end = gl.minimum(split_start + tiles_per_split, tile_end)
+            split_end = gl.where(tile_end - split_end < 3, tile_end, split_end)
+            tail = (split_idx > 0) & (tile_end - split_start < 3)
+            split_start = gl.where(tail, tile_end, split_start)
+            tile_end = split_end
             tile_start = split_start
 
         safe_tile_end = gl.minimum(safe_tile_end, tile_end - 1)
@@ -1967,9 +1976,10 @@ class AttentionProgram:
         cur_batch_query_len,
         NUM_SPLITS: gl.constexpr,
     ):
-        """Split-KV partials: store the *un-reduced* M (raw row max), L (exp sum)
-        and acc (un-normalized PV accumulator) for this split. The cross-split
-        reduction (flash rescale by exp2((M_s - max_s M)*QK_scale)) is done later.
+        """Split-KV partials in the reduce_segments format: M (row max, scaled to
+        the exp2 domain by QK_scale), L (exp sum) and acc (un-normalized PV
+        accumulator, times out_scale: the V descale when the launch passes no
+        out_scale, as reduce_segments applies the output scale).
 
         Buffers are contiguous:
             partial_acc : [num_tokens, NUM_QUERY_HEADS, NUM_SPLITS, HEAD_SIZE]
@@ -1997,12 +2007,12 @@ class AttentionProgram:
             + split_idx * cfg.HEAD_SIZE
             + offs_d[None, :]
         )
-        gl.store(partial_acc_ptr + acc_offs, acc, mask=row_mask[:, None])
+        gl.store(partial_acc_ptr + acc_offs, acc * self.out_scale, mask=row_mask[:, None])
 
         # M, L: [BLOCK_M]
         ml_stride_0: gl.constexpr = cfg.NUM_QUERY_HEADS * NUM_SPLITS
         ml_offs = query_offset_0 * ml_stride_0 + query_offset_1 * NUM_SPLITS + split_idx
-        gl.store(partial_m_ptr + ml_offs, M, mask=row_mask)
+        gl.store(partial_m_ptr + ml_offs, M * self.QK_scale, mask=row_mask)
         gl.store(partial_l_ptr + ml_offs, L, mask=row_mask)
 
     @gluon.jit
@@ -3194,10 +3204,23 @@ def _unified_attention_gluon_kernel_2d(
             cur_batch_query_len,
         )
 
-    # This split owns no tiles (more splits than active tiles). The partial
-    # buffers are pre-filled with neutral values (M=-inf, L=0, acc=0) so the
-    # later reduction simply ignores it.
+    # This split owns no tiles (more splits than active tiles): store neutral
+    # partials (M=-inf, L=0, acc=0), which the reduction ignores.
     if NUM_SPLITS > 1 and pgm.tile_start >= pgm.tile_end:
+        pgm.store_partial(
+            gl.full([BLOCK_M], float("-inf"), gl.float32, gl.SliceLayout(1, cfg.pv_layout)),
+            gl.zeros([BLOCK_M], gl.float32, gl.SliceLayout(1, cfg.pv_layout)),
+            gl.zeros([BLOCK_M, HEAD_SIZE], gl.float32, cfg.pv_layout),
+            partial_m_ptr,
+            partial_l_ptr,
+            partial_acc_ptr,
+            split_idx,
+            q_block_local_idx,
+            cur_batch_in_all_start_index,
+            kv_head_idx,
+            cur_batch_query_len,
+            NUM_SPLITS,
+        )
         return
 
     # Pick the KV loader based on TILE_SIZE and LOOP_VARIANT
