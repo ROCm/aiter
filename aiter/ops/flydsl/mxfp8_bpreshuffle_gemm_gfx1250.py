@@ -334,8 +334,14 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             stride_ascale_k = a_scale.stride(0)
             if a_scale_preload is None:
                 a_scale_preload = _m_major_a_scale_preload_fits(
-                    tile_m, tile_n, tile_k, int(num_buffers), split_k,
-                    cluster_m, cluster_n, K,
+                    tile_m,
+                    tile_n,
+                    tile_k,
+                    int(num_buffers),
+                    split_k,
+                    cluster_m,
+                    cluster_n,
+                    K,
                 )
             preload_ks = k_blocks if a_scale_preload else 0
         else:
@@ -596,9 +602,12 @@ def _m_major_a_scale_preload_fits(
         and cluster_n == 1
         and tile_m >= _PRELOAD_MIN_TILE_M
         and preload_lds_bytes(
-            dict(
-                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, num_buffers=num_buffers
-            ),
+            {
+                "tile_m": tile_m,
+                "tile_n": tile_n,
+                "tile_k": tile_k,
+                "num_buffers": num_buffers,
+            },
             K,
         )
         <= _LDS_BYTES

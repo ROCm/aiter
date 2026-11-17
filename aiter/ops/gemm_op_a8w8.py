@@ -1603,9 +1603,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
         and w_scale.dtype == dtypes.fp8_e8m0
         and tuple(x_scale.shape) == (m, k // 128)
     )
-    if not x_scale_transposed and not (
-        mxscale_128 and is_gfx1250_family(get_gfx())
-    ):
+    if not x_scale_transposed and not (mxscale_128 and is_gfx1250_family(get_gfx())):
         x_scale = x_scale.t().contiguous().view(x_scale.shape)
         x_scale_transposed = True
 
@@ -1670,7 +1668,12 @@ def gemm_a8w8_blockscale_bpreshuffle(
             )
         if config is not None and config["libtype"] == "flydsl":
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
-                XQ, WQ, x_scale, w_scale, Y, config,
+                XQ,
+                WQ,
+                x_scale,
+                w_scale,
+                Y,
+                config,
                 x_scale_transposed=x_scale_transposed,
             )
 
@@ -1681,7 +1684,12 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 f"M={m}, N={n}, K={k}; falling back to flydsl kernel '{ki.name}'."
             )
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
-                XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name},
+                XQ,
+                WQ,
+                x_scale,
+                w_scale,
+                Y,
+                {"kernelName": ki.name},
                 x_scale_transposed=x_scale_transposed,
             )
 
