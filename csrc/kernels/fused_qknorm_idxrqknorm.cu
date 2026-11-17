@@ -12,6 +12,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <stdexcept>
 #include <type_traits>
 
 #include "aiter_dispatch.h"
@@ -1622,6 +1623,8 @@ static void fused_qknorm_idxrqknorm_impl(
     using namespace fused_qknorm_idxrqknorm_ops;
 
     AITER_CHECK(qkv.is_gpu() && qkv.is_contiguous(), "qkv must be contiguous CUDA");
+    AITER_CHECK(qkv.dtype() == AITER_DTYPE_bf16 || qkv.dtype() == AITER_DTYPE_fp16,
+                "qkv must be bf16 or fp16");
     AITER_CHECK(positions.is_gpu() && positions.is_contiguous() &&
                     positions.dtype() == AITER_DTYPE_i64,
                 "positions must be contiguous int64 CUDA");
@@ -1646,7 +1649,8 @@ static void fused_qknorm_idxrqknorm_impl(
     const int nq = static_cast<int>(num_heads);
     const int nkv = static_cast<int>(num_kv_heads);
     const int niq = static_cast<int>(num_index_heads);
-    AITER_CHECK(nq > 0 && nkv > 0 && niq >= 0, "num_heads/num_kv_heads must be positive");
+    AITER_CHECK(nq > 0 && nkv > 0 && niq >= 0,
+                "num_heads/num_kv_heads must be positive, num_index_heads non-negative");
     const bool has_index = niq > 0;
     AITER_CHECK(!skip_index_branch || has_index,
                 "skip_index_branch requires num_index_heads > 0");
@@ -2457,36 +2461,50 @@ void fused_qknorm_idxrqknorm(
     std::optional<aiter_tensor_t> qkv_partials,
     bool check_only)
 {
-    // A refused argument raises (RuntimeError in Python) before anything launches.
-    aiter_detail::AiterThrowGuard throw_guard;
-    fused_qknorm_idxrqknorm_impl(qkv,
-                                                q_norm_weight,
-                                                k_norm_weight,
-                                                cos_sin_cache,
-                                                positions,
-                                                num_heads,
-                                                num_kv_heads,
-                                                rotary_dim,
-                                                eps,
-                                                index_q_norm_weight,
-                                                index_k_norm_weight,
-                                                num_index_heads,
-                                                slot_mapping,
-                                                kv_cache_k,
-                                                kv_cache_v,
-                                                index_cache,
-                                                block_size,
-                                                q_out,
-                                                index_q_out,
-                                                index_slot_mapping,
-                                                kv_cache_dtype,
-                                                index_cache_dtype,
-                                                k_scale,
-                                                v_scale,
-                                                asm_layout,
-                                                skip_index_branch,
-                                                qkv_partials,
-                                                check_only);
+    // A refused argument raises (RuntimeError in Python) before anything launches. Under
+    // check_only a refusal is the answer, not an error: it is not printed, and it raises
+    // std::invalid_argument (ValueError) so that the query can tell it from a build or
+    // load failure. check_only runs the checks only, so any error here is a refusal.
+    aiter_detail::AiterThrowGuard throw_guard(/*quiet=*/check_only);
+    try
+    {
+        fused_qknorm_idxrqknorm_impl(qkv,
+                                     q_norm_weight,
+                                     k_norm_weight,
+                                     cos_sin_cache,
+                                     positions,
+                                     num_heads,
+                                     num_kv_heads,
+                                     rotary_dim,
+                                     eps,
+                                     index_q_norm_weight,
+                                     index_k_norm_weight,
+                                     num_index_heads,
+                                     slot_mapping,
+                                     kv_cache_k,
+                                     kv_cache_v,
+                                     index_cache,
+                                     block_size,
+                                     q_out,
+                                     index_q_out,
+                                     index_slot_mapping,
+                                     kv_cache_dtype,
+                                     index_cache_dtype,
+                                     k_scale,
+                                     v_scale,
+                                     asm_layout,
+                                     skip_index_branch,
+                                     qkv_partials,
+                                     check_only);
+    }
+    catch(const std::runtime_error& e)
+    {
+        if(!check_only)
+        {
+            throw;
+        }
+        throw std::invalid_argument(e.what());
+    }
 }
 
 } // namespace aiter

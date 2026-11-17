@@ -4,6 +4,8 @@
 import argparse
 import itertools
 import math
+import os
+import tempfile
 from functools import partial
 from unittest import mock
 
@@ -13,6 +15,7 @@ import torch
 import aiter
 import aiter.ops.fused_qknorm_idxrqknorm as op
 from aiter import dtypes
+from aiter.jit.utils.build_targets import base_gfx_arch
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
@@ -2126,16 +2129,35 @@ def call_edited(call, edits: dict, kwargs: dict, copy: bool = False):
     return [t for t in (*args, *kwargs.values()) if isinstance(t, torch.Tensor)]
 
 
+def stderr_of(fn):
+    """fn() and what it wrote to file descriptor 2 (the C++ side's std::cerr)."""
+    with tempfile.TemporaryFile() as f:
+        saved = os.dup(2)
+        os.dup2(f.fileno(), 2)
+        try:
+            ret = fn()
+        finally:
+            os.dup2(saved, 2)
+            os.close(saved)
+        f.seek(0)
+        return ret, f.read()
+
+
 def check_rejects(cases: dict):
     """name -> (op call, {positional index: replacement}, kwargs, expected message): each
     call must raise RuntimeError with that message, before launching anything (None: must
-    succeed), and fused_qknorm_idxrqknorm_supports must say so beforehand."""
+    succeed), and fused_qknorm_idxrqknorm_supports must say so beforehand, quietly."""
     for name, (call, edits, kwargs, msg) in cases.items():
         args = [edits.get(i, a) for i, a in enumerate(call.args)]
-        supported = aiter.fused_qknorm_idxrqknorm_supports(
-            *args, **{**call.keywords, **kwargs}
+        supported, err = stderr_of(
+            partial(
+                aiter.fused_qknorm_idxrqknorm_supports,
+                *args,
+                **{**call.keywords, **kwargs},
+            )
         )
         assert supported == (msg is None), f"{name}: supports() said {supported}"
+        assert not err, f"{name}: supports() wrote {err!r}"
         try:
             call_edited(call, edits, kwargs)
         except RuntimeError as e:
@@ -2530,8 +2552,19 @@ def check_arg_rejects():
         "positions_2d": ({4: pos.view(-1, 1)}, "positions must be 1D"),
         "cache_4d": ({13: kc.flatten(-2)}, "kv_cache_k must be [num_blocks"),
         "cache_dtype": ({13: kc.half(), 14: call.args[14].half()}, "dtype must match"),
+        "qkv_fp32": ({0: qkv.float()}, "qkv must be bf16 or fp16"),
     }
     check_rejects({k: (call, e, {}, msg) for k, (e, msg) in cases.items()})
+    # Only a refusal answers False: a build or load failure of the module raises.
+    with mock.patch.object(
+        op, "_fused_qknorm_idxrqknorm_hip", side_effect=RuntimeError("load failed")
+    ):
+        try:
+            aiter.fused_qknorm_idxrqknorm_supports(*call.args, **call.keywords)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("supports() hid a load failure")
     for gfx, msg in (("gfx1100", "requires one of"), ("gfx1250-strict", None)):
         with mock.patch.object(op, "get_gfx_runtime", return_value=gfx):
             check_rejects({gfx: (fp8, {}, {}, msg)})
@@ -2589,6 +2622,17 @@ DEFAULT_CASES += [
     ("mxfp4_scale_rule", "bf16", 4096, 128, 64, 1),
     ("mxfp4_reject", "bf16", 32, 16, 64, 1),
 ]
+# gfx1250 runs 4 rows per warp from 128 rows per CU on: a launch above that, with a row
+# count (num_tokens * 29 slots in insert mode, 16 q / 4 kv / 4 index heads) not a multiple
+# of 4, so the last warp has tail rows.
+if base_gfx_arch(get_gfx_runtime()) == "gfx1250":
+    multi_row_tokens = (
+        128 * torch.cuda.get_device_properties(0).multi_processor_count + 28
+    ) // 29 | 1
+    DEFAULT_CASES += [
+        (mode, "bf16", multi_row_tokens, 16, 64, 4)
+        for mode in ("insert", "asm_layout_fp8_pertoken")
+    ]
 # the live GPU, not GPU_ARCHS (CI exports "gfx942;gfx950" and get_gfx() takes the last one)
 if get_gfx_runtime() != "gfx950":
     aiter.logger.warning(
