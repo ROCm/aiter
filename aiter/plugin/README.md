@@ -24,7 +24,7 @@ that cannot drift from what dispatch actually hands you:
 | `rmsnorm_with_add` | 1 |
 | `pertoken_quant` | 1 |
 | `gemm_a8w8_blockscale` | 1 |
-| `gemm_a8w8_blockscale_bpreshuffle` | 1 |
+| `gemm_a8w8_blockscale_bpreshuffle` | 2 |
 
 If your op is not in that file it is not routed — there is nothing to serve,
 and `plugin.status()['routed_ops']` says the same at runtime.
