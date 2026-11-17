@@ -371,6 +371,27 @@ def _head_split(params: _UAParams):
     return 128, 64
 
 
+_VERIFY_3D_MAX_Q = 16
+
+
+def _keep_3d_for_verify(params: _UAParams):
+    """Short multi-token queries (spec-decode verify) under the head-192 split keep
+    the 3D kernel at any batch size.
+
+    The 2D grid gives every query block its own walk over the whole context, and its
+    attn_2d entry packs one query per block at 16 query heads per KV head, so a verify
+    of 8 tokens reads the context 8 times; the 3D attn_3d entry packs 4 per block.
+    Past the 4-programs-per-CU switch (about 114 sequences of 8 tokens) the 2D kernel
+    measured 2.0-3.2x slower than 3D on MI355X, at 8K to 128K context.
+    """
+    return (
+        not params.all_decode
+        and params.max_seqlen_q <= _VERIFY_3D_MAX_Q
+        and params.max_seqlen_k > 512
+        and _head_split(params) != (0, 0)
+    )
+
+
 def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     # if IS_DEVICE_ARCH_GFX12, use 3D for decode, and for short (spec-decode verify)
     # queries while their rows are too few to fill the 2D grid; 2D otherwise, unless
@@ -426,6 +447,9 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
 
     if params.head_size >= 512 and not get_arch().is_rdna and not params.all_decode:
         return True
+
+    if _keep_3d_for_verify(params):
+        return False
 
     gate = params.target_num_prgms
     if DEVICE_ARCH == "gfx1100":
