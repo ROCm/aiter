@@ -1711,6 +1711,9 @@ def test_clamp_shared_preserves_existing_positional_argument_order():
         "herd_topk",
         "herd_routed_scaling_factor",
         "deterministic",
+        "post_gemm2_rms_weight",
+        "post_gemm2_rms_eps",
+        "post_gemm2_rms_zero_centered",
     ]
     assert list(inspect.signature(fhmoe_module.fhmoe_fake).parameters)[-2:] == [
         "output",

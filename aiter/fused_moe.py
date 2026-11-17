@@ -1239,12 +1239,12 @@ def fused_moe(
     quant_dtype_a2: torch.dtype | None = None,
     # False explicitly selects unclamped shared-expert SiLU semantics.
     clamp_shared: bool = True,
-    post_gemm2_rms_weight: torch.Tensor | None = None,
-    post_gemm2_rms_eps: float = 1e-6,
-    post_gemm2_rms_zero_centered: bool = False,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
     deterministic: bool = False,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
 ):
     """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
 
@@ -1472,12 +1472,12 @@ def fused_moe_fake(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
-    post_gemm2_rms_weight: torch.Tensor | None = None,
-    post_gemm2_rms_eps: float = 1e-6,
-    post_gemm2_rms_zero_centered: bool = False,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
     deterministic: bool = False,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1684,12 +1684,12 @@ def fused_moe_(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
-    post_gemm2_rms_weight: torch.Tensor | None = None,
-    post_gemm2_rms_eps: float = 1e-6,
-    post_gemm2_rms_zero_centered: bool = False,
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
     deterministic: bool = False,
+    post_gemm2_rms_weight: torch.Tensor | None = None,
+    post_gemm2_rms_eps: float = 1e-6,
+    post_gemm2_rms_zero_centered: bool = False,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
