@@ -4,10 +4,9 @@
 """Launch a Triton kernel without redoing the part that only depends on shapes.
 
 ``JITFunction.run`` binds the arguments, specializes each one, builds a cache
-key and looks the kernel up, and it does all of that on every call. On the
-flash_kda pipeline that is several times the cost of the launch itself, which
-is enough to decide a design question the wrong way: an eager caller waits on
-the host, and a faster pipeline of more launches measures as the slower one.
+key and looks the kernel up, and it does all of that on every call. For a
+short kernel that can cost more host time than the launch itself, and an eager
+caller then waits on the host.
 
 Wrap a kernel once and call it as before::
 
@@ -49,6 +48,7 @@ from collections import ChainMap, OrderedDict
 import torch
 from triton import knobs
 from triton.compiler import CompiledKernel
+from triton.knobs import HookChain
 from triton.runtime import driver
 from triton.runtime.autotuner import Autotuner
 from triton.runtime.jit import JITFunction
@@ -102,10 +102,9 @@ def recording():
 
 def _hooked(hook) -> bool:
     """Whether a launch hook would run. An empty ``HookChain`` does not."""
-    if hook is None:
-        return False
-    calls = getattr(hook, "calls", None)
-    return calls is None or len(calls) > 0
+    if isinstance(hook, HookChain):
+        return len(hook.calls) > 0
+    return hook is not None
 
 
 def _wide_int_spec(v: int) -> str:
