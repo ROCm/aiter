@@ -3,7 +3,7 @@
 
 # Q/K Gemma RMSNorm and interleaved MRoPE, and the K/V write into the paged KV cache
 # (bf16, or fp8 with one per-tensor scale and Q emitted in fp8: row kernel only; or A8K4V8, NVFP4 K + that fp8
-# V and Q: the row kernel, and fused_qk_norm_mrope_k4v8_gfx1250 for large prefills)
+# V and Q: the row kernel, and fused_qk_norm_mrope_block16_kv_fp4_gfx1250 for large prefills)
 
 import functools
 
@@ -69,6 +69,55 @@ def _nvfp4_quant(x, N: gl.constexpr, BLOCK_M: gl.constexpr):
     evens, odds = gl.split(e2m1)
     packed = evens | (odds << 4)
     return gl.reshape(packed, [BLOCK_M, N // 2]), scale
+
+
+@gluon.jit
+def _fp4pt_quant(v, R: gl.constexpr):
+    """A8K4V4PT V rows v [R, HEAD_DIM] (any float dtype, any layout) -> (e2m1 pairs [R, HEAD_DIM // 2] uint8, low
+    nibble = even element; s [R] fp32). s = amax(|v|) * fp32(1/6) (what torch's amax / 6.0 computes), e2m1 =
+    round-to-nearest-even of v / s (div_rn; s = 0 stores zeros), saturating at 6: bit-exact with
+    fp4pt_quant_v_cache (the reference). 8 consecutive values a lane, rows over the waves."""
+    L: gl.constexpr = gl.BlockedLayout([1, 8], [1, 32], [gl.num_warps(), 1], [1, 0])
+    x = gl.convert_layout(v, L).to(gl.float32)
+    amax = gl.max(gl.abs(x), axis=1)
+    s = amax * 0.1666666716337204
+    s_div = gl.where(s > 0, s, 1.0)
+    qv = gl.div_rn(x, gl.zeros_like(x) + s_div[:, None])
+    mag = gl.abs(qv)
+    # the code is the number of e2m1 midpoints below |v / s|; a tie at an odd code's upper midpoint goes up
+    code = (
+        (mag > 0.25).to(gl.int32)
+        + (mag > 0.75).to(gl.int32)
+        + (mag > 1.25).to(gl.int32)
+        + (mag > 1.75).to(gl.int32)
+        + (mag > 2.5).to(gl.int32)
+        + (mag > 3.5).to(gl.int32)
+        + (mag > 5.0).to(gl.int32)
+    )
+    code = code + ((mag == 0.75) | (mag == 1.75) | (mag == 3.5)).to(gl.int32)
+    code = code | ((qv < 0).to(gl.int32) << 3)
+    code = gl.reshape(code, [R, HEAD_DIM // 2, 2])
+    lo, hi = gl.split(code)
+    return (lo | (hi << 4)).to(gl.uint8), s
+
+
+@gluon.jit
+def _store_v_fp4pt_rows(v_cache_ptr, packed, s, page, offset, write, BLOCK_SIZE: gl.constexpr):
+    """Rows of an A8K4V4PT V page, row by row (masked): packed [R, HEAD_DIM // 2] e2m1 pairs at the NVFP4 V data
+    offsets ((offset // 16) * D/2 * 16 + (offset % 16) * 16 + (byte // 16) * 256 + byte % 16 of the (block, head)
+    row at byte `page`), s as fp32 at byte page + BLOCK_SIZE * D/2 + 4 * offset. page / offset / write: [R]."""
+    D_BYTES: gl.constexpr = HEAD_DIM // 2
+    SL: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [gl.num_warps(), 1], [1, 0])
+    packed = gl.convert_layout(packed, SL)
+    rows: gl.constexpr = gl.SliceLayout(1, SL)
+    page = gl.convert_layout(page, rows)
+    offset = gl.convert_layout(offset, rows)
+    write = gl.convert_layout(write, rows)
+    j = gl.arange(0, D_BYTES, layout=gl.SliceLayout(0, SL))
+    dst = (page + (offset // 16) * (D_BYTES * 16) + (offset % 16) * 16)[:, None] + ((j // 16) * 256 + j % 16)[None, :]
+    gl.store(v_cache_ptr + dst, packed, mask=write[:, None])
+    s_ptr = (v_cache_ptr + page + BLOCK_SIZE * D_BYTES + 4 * offset).to(gl.pointer_type(gl.float32))
+    gl.store(s_ptr, gl.convert_layout(s, rows), mask=write)
 
 
 @gluon.jit
@@ -217,6 +266,10 @@ def fused_qk_norm_mrope_gfx1250(
     rope_layout: gl.constexpr,
     K_NVFP4: gl.constexpr = False,
     SCALE_PRESHUFFLE: gl.constexpr = 128,
+    # K_NVFP4 with V_STORE False: no fp8 V store (A8K4V4PT, whose fp4pt V the V_FP4PT path below writes)
+    V_STORE: gl.constexpr = True,
+    # A8K4V4PT with its V fused (V_STORE False): each K row also quantizes its V row into the fp4pt V page
+    V_FP4PT: gl.constexpr = False,
 ):
     # 16 for an fp8 cache and for A8K4V8's uint8 NVFP4 K (whose fp8 V has that layout)
     X: gl.constexpr = 128 // k_cache_ptr.dtype.element_ty.primitive_bitwidth
@@ -363,9 +416,15 @@ def fused_qk_norm_mrope_gfx1250(
             # mostly Q heads: only one with a K row to write quantizes and stores.
             write_k = slot >= 0
             if gl.max(write_k.to(gl.int32), axis=0) > 0:
-                v_c = gl.minimum(gl.maximum(v.to(gl.float32) * kv_inv_scale, -FP8_MAX), FP8_MAX)
-                v_c = v_c.to(v_cache_ptr.dtype.element_ty)
-                gl.store(v_cache_ptr + v_dst[:, None] + offs_v[None, :] * X, v_c, mask=write)
+                if V_STORE:
+                    v_c = gl.minimum(gl.maximum(v.to(gl.float32) * kv_inv_scale, -FP8_MAX), FP8_MAX)
+                    v_c = v_c.to(v_cache_ptr.dtype.element_ty)
+                    gl.store(v_cache_ptr + v_dst[:, None] + offs_v[None, :] * X, v_c, mask=write)
+                if V_FP4PT:
+                    V_ROW: gl.constexpr = HEAD_DIM // 2 + 4
+                    v_page = (block * K_HEADS + head_r - Q_HEADS) * (BLOCK_SIZE * V_ROW)
+                    v_packed, v_s = _fp4pt_quant(v, BLOCK_M)
+                    _store_v_fp4pt_rows(v_cache_ptr, v_packed, v_s, v_page, offset, write_k, BLOCK_SIZE)
                 K_ROW: gl.constexpr = HEAD_DIM // 2 + HEAD_DIM // NVFP4_GROUP
                 page = (block * K_HEADS + head_r - Q_HEADS) * (BLOCK_SIZE * K_ROW)
                 _store_k_nvfp4(
@@ -600,12 +659,12 @@ def fused_qk_norm_mrope_tdm_gfx1250(
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# A8K4V8 prefill: Q, K and V in separate CTAs (fused_qk_norm_mrope_k4v8_gfx1250)
+# A8K4V8 prefill: Q, K and V in separate CTAs (fused_qk_norm_mrope_block16_kv_fp4_gfx1250)
 # ----------------------------------------------------------------------------------------------------------------
 
 SUB = gl.constexpr(16)  # tokens a block: one 16-row tile of the shuffled NVFP4 data / of the fp8 V page
 
-_k4v8_repr = make_kernel_repr("fused_qk_norm_mrope_k4v8_gfx1250", ["Q_HEADS", "K_HEADS", "BLOCK_SIZE"])
+_block16_kv_fp4_repr = make_kernel_repr("fused_qk_norm_mrope_block16_kv_fp4_gfx1250", ["Q_HEADS", "K_HEADS", "BLOCK_SIZE"])
 
 
 @gluon.jit
@@ -693,8 +752,8 @@ def _tile_seg_start(slot_mapping_ptr, t, n_tok, n_valid):
     return (t < n_tok) & ~cont, cur
 
 
-@gluon.jit(repr=_k4v8_repr)
-def fused_qk_norm_mrope_k4v8_gfx1250(
+@gluon.jit(repr=_block16_kv_fp4_repr)
+def fused_qk_norm_mrope_block16_kv_fp4_gfx1250(
     q_ptr,
     k_ptr,
     v_ptr,
@@ -728,6 +787,10 @@ def fused_qk_norm_mrope_k4v8_gfx1250(
     QH_PER: gl.constexpr,
     BLOCK_M_Q: gl.constexpr,
     BLOCK_M_V: gl.constexpr,
+    # A8K4V4PT: the V CTAs write the fp4pt V page instead (K_HEADS * cdiv(T, 16) of them, the K CTAs' token
+    # windows); V_TDM: a full 16-token tile's 2 KB e2m1 image goes out with one TDM store, else row by row
+    V_FP4PT: gl.constexpr = False,
+    V_TDM: gl.constexpr = True,
 ):
     """A8K4V8 Q/K norm + MRoPE and KV-cache write of a prefill batch, byte-identical to
     fused_qk_norm_mrope_gfx1250(CACHE, FP8, K_NVFP4). Grid = K + Q + V blocks, in that program-id order, 16 tokens
@@ -914,6 +977,71 @@ def fused_qk_norm_mrope_k4v8_gfx1250(
                 gl.minimum(gl.maximum(rope_hi.to(gl.float32), -FP8_MAX), FP8_MAX).to(fp8_ty),
                 row_layout, rope_layout,
             )
+    elif V_FP4PT:
+        # ---- V (A8K4V4PT): the tile segments starting in token window [16 w, 16 w + 16) of V head h, as the K CTAs
+        # split them: a full tile (16 tokens in slots 16 i .. 16 i + 15 of one page) is quantized, its 2 KB e2m1
+        # image built in LDS and TDM-stored through a descriptor that is exactly that tile; the other rows (a
+        # sequence's mid-tile head and tail, page-straddling or short runs, pads) are stored row by row, masked.
+        # The 16 scales of a tile are 64 contiguous bytes: plain stores.
+        V_ROW: gl.constexpr = D_BYTES + 4
+        vb = pid - num_k_blocks - num_q_blocks
+        h = vb % K_HEADS
+        w = vb // K_HEADS
+        qlay: gl.constexpr = gl.BlockedLayout([1, 8], [1, 32], [NW, 1], [1, 0])
+        sub_q = gl.arange(0, SUB, layout=gl.SliceLayout(1, qlay))
+        win = w * SUB + sub_r
+        st0, slot0 = _tile_seg_start(slot_mapping_ptr, win, num_tokens, n_valid)
+        st1, _ = _tile_seg_start(slot_mapping_ptr, win + SUB, num_tokens, n_valid)
+        a = gl.min(gl.where(st0, win, num_tokens), axis=0)
+        b = gl.min(gl.where(st1, win + SUB, num_tokens), axis=0)
+        f = gl.max(gl.where(st0, win, -1), axis=0)
+        slot_f = gl.max(gl.where(win == f, slot0, -1), axis=0)
+        full = (f >= 0) & (slot_f >= 0) & (slot_f % SUB == 0) & (b - f == SUB) & (f + SUB <= n_valid)
+        if not V_TDM:
+            full = full & False
+        end = gl.where(full, f, b)
+        v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=v_ptr, shape=(num_tokens, K_HEADS * HEAD_DIM), strides=(stride_v, 1),
+            block_shape=(SUB, HEAD_DIM), layout=SH,
+        )
+        v_smem = gl.allocate_shared_memory(v_ptr.dtype.element_ty, [SUB, HEAD_DIM], SH)
+        d_smem = gl.allocate_shared_memory(gl.uint8, [D_BYTES // 16, SUB, 16], SH3)
+        for c in gl.static_range(2):
+            r0 = a + c * SUB
+            if r0 < end:
+                gl.barrier()  # every wave is done with v_smem
+                gl.amd.gfx1250.tdm.async_load(v_desc, [r0, h * HEAD_DIM], v_smem)
+                tok = r0 + sub_q
+                own = tok < end
+                slot = gl.load(slot_mapping_ptr + tok, mask=own & (tok < n_valid), other=-1).to(gl.int64)
+                gl.amd.gfx1250.tdm.async_wait(0)
+                gl.barrier()
+                write = own & (slot >= 0)
+                if gl.max(write.to(gl.int32), axis=0) > 0:
+                    packed, s = _fp4pt_quant(v_smem.load(qlay), SUB)
+                    page = ((slot // P) * K_HEADS + h) * (P * V_ROW)
+                    _store_v_fp4pt_rows(v_cache_ptr, packed, s, page, slot % P, write, P)
+        if full:
+            gl.barrier()
+            gl.amd.gfx1250.tdm.async_load(v_desc, [f, h * HEAD_DIM], v_smem)
+            gl.amd.gfx1250.tdm.async_wait(0)
+            gl.barrier()
+            packed, s = _fp4pt_quant(v_smem.load(qlay), SUB)
+            o0 = slot_f % P  # the tile's first row in the page
+            page_f = ((slot_f // P) * K_HEADS + h) * (P * V_ROW)
+            # LDS image in global order: [byte // 16, row, byte % 16]
+            d_smem.permute([1, 0, 2]).store(gl.reshape(packed, [SUB, D_BYTES // 16, 16]))
+            gl.barrier()
+            d_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=v_cache_ptr + page_f + (o0 // SUB) * (D_BYTES * SUB),
+                shape=(D_BYTES // 16, SUB, 16), strides=(256, 16, 1),
+                block_shape=(D_BYTES // 16, SUB, 16), layout=SH3,
+            )
+            gl.amd.gfx1250.tdm.async_store(d_desc, [0, 0, 0], d_smem)
+            s_rows: gl.constexpr = gl.SliceLayout(1, qlay)
+            s_ptr = (v_cache_ptr + page_f + P * D_BYTES + 4 * (o0 + sub_q)).to(gl.pointer_type(gl.float32))
+            gl.store(s_ptr, gl.convert_layout(s, s_rows))
+            gl.amd.gfx1250.tdm.async_wait(0)
     else:
         # ---- V: 16 tokens of V head h into the shuffled fp8 V cache (16 tokens of a page are 16 adjacent bytes)
         vb = pid - num_k_blocks - num_q_blocks
