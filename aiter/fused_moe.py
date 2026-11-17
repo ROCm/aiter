@@ -43,6 +43,26 @@ from aiter.jit.utils.chip_info import (
     gfx_from_cu_num,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.moev2 import paths as moev2_paths
+from aiter.moev2.policy import (  # noqa: F401
+    _SWIGLU_MXFP4_BF16_BOUND,
+    _bound_split,
+    quant_remap,
+    resolve_activation_dtype,
+)
+from aiter.moev2.reference.torch_moe import (  # noqa: F401
+    _clamp_swiglu_gate_up,
+    _int4_per_1x32_weight_expert_to_f32,
+    _mxfp4_per_1x32_weight_expert_to_f32,
+    situv2,
+    swiglu,
+    torch_moe,
+    torch_moe_act,
+    torch_moe_stage1,
+    torch_moe_stage2,
+)
+from aiter.moev2.routing.topk import fused_topk  # noqa: F401
+from aiter.moev2.shapes import get_inter_dim
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
@@ -149,7 +169,6 @@ def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
 
 
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
-_SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 # (num_experts, topk) pairs the HIP kernel is instantiated for; must stay in
 # sync with AITER_MXFP4_SORT_QUANT_ROUTES in moe_sorting_opus_kernels.cu.
@@ -1090,111 +1109,6 @@ def _validate_flydsl_route_output_nbytes(route_output_nbytes: int) -> None:
         )
 
 
-# Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
-# We can use torch.compile(dynamic=False) to avoid
-@functools.lru_cache(maxsize=2048)
-def get_inter_dim(w1_shape, w2_shape):
-    E, _, model_dim = w1_shape
-    E, model_dim, inter_dim = w2_shape
-
-    int4_war = model_dim // w1_shape[-1]
-    inter_dim *= int4_war
-    return E, model_dim, inter_dim
-
-
-def _bound_split(M, bound, below, at_or_above):
-    """`below if M < bound else at_or_above`, deferring when M is unknown."""
-    if M is not None:
-        return below if M < bound else at_or_above
-    # M >= 0, so a non-positive bound settles the branch without it.
-    return at_or_above if bound <= 0 else None
-
-
-def resolve_activation_dtype(
-    quant_type: QuantType | int,
-    q_dtype_w: torch.dtype,
-    *,
-    activation: ActivationType | int = ActivationType.Silu,
-    gate_mode: GateMode | str = GateMode.SEPARATED,
-    M: int | None = None,
-    hidden_dtype: torch.dtype | None = None,
-    has_a1_scale: bool = False,
-    gfx: str | None = None,
-    gate_up_interleave: bool | None = None,
-) -> torch.dtype | None:
-    """The activation dtype fused_moe() quantizes its input to.
-
-    Lets a caller that produces the activations itself -- an all-to-all
-    dispatch, a fused epilogue -- emit that dtype directly rather than one
-    fused_moe() converts.
-
-    `M` is the token count. Omit it when the dtype has to be chosen before any
-    token exists: the result is then None wherever the answer would have needed
-    M, and the caller should fall back to bf16, which fused_moe() accepts from
-    any path.
-
-    `q_dtype_w` is `w1.dtype`; `hidden_dtype` / `has_a1_scale` only matter for
-    the per_1x128 fp8 passthrough.
-    """
-    quant_type = QuantType(quant_type)
-    quant_type = quant_remap.get(quant_type, quant_type)
-    activation = ActivationType(activation)
-    gate_mode = GateMode(gate_mode)
-    gfx = get_gfx_runtime() if gfx is None else gfx
-
-    q_dtype_a = q_dtype_w if q_dtype_w != torch.uint32 else dtypes.fp8
-    # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
-    # use FP8 as activation dtype to skip redundant re-quantization
-    if (
-        quant_type == QuantType.per_1x128
-        and hidden_dtype == dtypes.fp8
-        and has_a1_scale
-    ):
-        q_dtype_a = dtypes.fp8
-    bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
-    if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
-        # a16wi4: bf16 activations, int4 weights with groupwise scale
-        q_dtype_a = dtypes.bf16
-    elif quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp8:
-        # mxfp8: both activation and weight are fp8 (per-1x32 e8m0 microscale).
-        q_dtype_a = dtypes.fp8
-    elif quant_type == QuantType.per_1x32:
-        if activation == ActivationType.Situv2:
-            # SiTUv2 defaults to a16w4 (bf16 activation x mxfp4 weight) on the
-            # mixed_moe kernels. AITER_SITUV2_A8W4 / AITER_SITUV2_A4W4 select the
-            # fp8 / fp4 activation instead; each has its own tuned config
-            # (kimik3_{a8w4,a4w4}_tuned_fmoe.csv). Tested before the INTERLEAVE
-            # branch below, which would otherwise claim SiTUv2 and pick the
-            # activation dtype itself.
-            if os.environ.get("AITER_SITUV2_A8W4", "0") == "1":
-                q_dtype_a = dtypes.fp8
-            elif os.environ.get("AITER_SITUV2_A4W4", "0") == "1":
-                q_dtype_a = dtypes.fp4x2
-            else:
-                q_dtype_a = dtypes.bf16
-        elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
-            q_dtype_a = _bound_split(
-                M, _SWIGLU_MXFP4_BF16_BOUND, dtypes.bf16, dtypes.fp4x2
-            )
-        elif activation == ActivationType.Relu2:
-            q_dtype_a = dtypes.bf16
-        elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
-            if gfx != "gfx950" or gate_up_interleave is False:
-                q_dtype_a = dtypes.bf16
-            else:
-                q_dtype_a = _bound_split(M, bf16_fp8_bound, dtypes.bf16, dtypes.fp8)
-        else:
-            q_dtype_a = dtypes.fp4x2
-
-    if gfx in ("gfx1250", "gfx1250-strict"):
-        if os.environ.get("AITER_FORCE_A8W4", "0") in ("1"):
-            q_dtype_a = dtypes.fp8
-        else:
-            q_dtype_a = dtypes.fp4x2
-
-    return q_dtype_a
-
-
 @drop_presort_after
 def fused_moe(
     hidden_states,
@@ -1280,6 +1194,11 @@ def fused_moe(
     """
     if herd_topk and (w1_global_scale is not None or w2_global_scale is not None):
         raise ValueError("herd_topk does not support NVFP4 global scales")
+    if moev2_paths.any_active():
+        call = dict(locals())
+        v2_path = moev2_paths.route_to_v2(call)
+        if v2_path is not None:
+            return v2_path.run(call)
     has_shared_expert = (
         any(
             tensor is not None
@@ -1954,6 +1873,7 @@ def _fused_moe_impl(
         M=config_M,
         hidden_dtype=hidden_states.dtype,
         has_a1_scale=a1_scale is not None,
+        gfx=get_gfx_runtime(),
         gate_up_interleave=getattr(w1, "gate_up_interleave", None),
     )
 
@@ -3387,8 +3307,6 @@ fused_moe_1stage_dict = {
 }
 # fmt: on
 
-quant_remap = {QuantType.per_128x128: QuantType.per_1x128}
-
 
 def _normalize_moe_dispatch_contract(
     quant_type, activation, swiglu_limit, quant_type_a=None
@@ -3399,24 +3317,6 @@ def _normalize_moe_dispatch_contract(
     if activation == ActivationType.Silu:
         swiglu_limit = normalize_swiglu_limit(swiglu_limit)
     return quant_type, quant_type_a, swiglu_limit
-
-
-def _mxfp4_per_1x32_weight_expert_to_f32(weight, scale, expert_id, rows, cols):
-    from aiter.utility import fp4_utils
-
-    weight_e = fp4_utils.mxfp4_to_f32(weight[expert_id])
-    scale_e = scale.reshape(weight.shape[0], rows, cols // 32)[expert_id]
-    return (
-        weight_e.view(rows, cols // 32, 32) * scale_e.view(rows, cols // 32, 1)
-    ).view(rows, cols)
-
-
-def _int4_per_1x32_weight_expert_to_f32(weight, scale, expert_id, rows, cols):
-    scale_e = scale.reshape(weight.shape[0], cols // 32, rows)[expert_id]
-    return (
-        weight[expert_id].to(dtypes.fp32).reshape(rows, cols // 32, 32)
-        * scale_e.permute(1, 0).unsqueeze(-1)
-    ).reshape(rows, cols)
 
 
 def nextPow2(n):
@@ -7294,21 +7194,6 @@ def fused_moe_2stages(
     return moe_out if _stage2_override is None else stage2_output
 
 
-def torch_moe_act(act_input, torch_act, inter_dim, activation=None):
-    # OAI SwiGLU is a gated (g1u1) activation with its own formula; it has no
-    # single-input torch_act, so it must never reach torch_act below.
-    if activation == ActivationType.Swiglu:
-        if act_input.shape[-1] != 2 * inter_dim:
-            raise NotImplementedError("ActivationType.Swiglu requires g1u1 weights")
-        gate, up = act_input.split([inter_dim, inter_dim], dim=-1)
-        return swiglu(gate, up)
-    if act_input.shape[-1] == inter_dim:
-        return torch_act(act_input)
-    else:
-        gate, up = act_input.split([inter_dim, inter_dim], dim=-1)
-        return torch_act(gate) * up
-
-
 def asm_stage1(
     input,
     w1,
@@ -7392,386 +7277,6 @@ def asm_stage1(
                 f"Unsupported activation for split-k post-activation: {activation}"
             )
     return out
-
-
-def torch_moe(
-    hidden_states,
-    w1,
-    w2,
-    topk_weight,
-    topk_ids,
-    # following for int8 quant
-    fc1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
-    fc2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
-    fc1_smooth_scale=None,  # [expert(local_expert:EP), 1, model_dim]
-    fc2_smooth_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
-    expert_mask=None,
-    activation=ActivationType.Silu,
-):
-    computeType = dtypes.fp32
-    dtype = hidden_states.dtype
-    torch_act = aiter.get_torch_act(activation)
-    hidden_states = hidden_states.to(computeType)
-    w1 = w1.to(computeType)
-    w2 = w2.to(computeType)
-    B, D = hidden_states.shape
-    topk = topk_weight.shape[1]
-    if expert_mask is not None:
-        local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32) - 1
-        local_expert_hash[expert_mask == 0] = -1
-        topk_ids = local_expert_hash[topk_ids]
-
-    hidden_states = hidden_states.view(B, -1, D).repeat(1, topk, 1)
-    out = torch.zeros(
-        (B, topk, D),
-        dtype=computeType,
-        device=hidden_states.device,
-    )
-
-    inter_dim = w2.shape[2]
-
-    if fc1_scale is not None:
-        # gose to quant D_w8a8/w8a8
-        expert = w1.shape[0]
-        w2D = w2.shape[-1]
-        w1 = (w1.view(-1, D) * fc1_scale.view(-1, 1)).view(expert, -1, D)
-        w2 = (w2.view(-1, w2D) * fc2_scale.view(-1, 1)).view(expert, -1, w2D)
-
-    if fc1_smooth_scale is not None:
-        expert = fc1_smooth_scale.shape[0]
-        fc1_smooth_scale = fc1_smooth_scale.view(expert, -1)
-        fc2_smooth_scale = fc2_smooth_scale.view(expert, -1)
-
-    for E_id in range(w1.shape[0]):
-        mask = topk_ids == E_id
-        if mask.sum():
-            sub_tokens = hidden_states[mask]
-            if fc1_smooth_scale is not None:
-                sub_tokens = sub_tokens * (fc1_smooth_scale[E_id])
-
-            act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
-            act_out = torch_moe_act(
-                act_input, torch_act, inter_dim, activation=activation
-            )
-            if fc2_smooth_scale is not None:
-                act_out = act_out * (fc2_smooth_scale[E_id])
-            out[mask] = act_out @ (w2[E_id].transpose(0, 1))
-
-    return (out * topk_weight.view(B, -1, 1)).sum(dim=1).to(dtype)
-
-
-# temp workaround for swiglu
-def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: float | None = 7.0):
-    if limit is None:
-        limit = 7.0
-    # Clamp the input values
-    x_glu = x_glu.clamp(min=None, max=limit)
-    x_linear = x_linear.clamp(min=-limit, max=limit)
-    out_glu = x_glu * torch.sigmoid(alpha * x_glu)
-    # Note we add an extra bias of 1 to the linear layer
-    return out_glu * (x_linear + 1)
-
-
-def situv2(
-    gate: torch.Tensor,
-    up: torch.Tensor,
-    beta: float = 4.0,
-    linear_beta: float = 25.0,
-) -> torch.Tensor:
-    situ_gate = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
-    up_scaled = linear_beta * torch.tanh(up / linear_beta)
-    return situ_gate * up_scaled
-
-
-def torch_moe_stage1(
-    hidden_states,
-    w1,  # E, inter_dim*2, model_dim
-    w2,  # E, model_dim, inter_dim
-    topk_weight,
-    topk_ids,
-    dtype=dtypes.fp16,
-    activation=ActivationType.Silu,
-    quant_type=QuantType.No,
-    # following for quant
-    a1_scale=None,  # [token, 1]
-    w1_scale=None,  # [expert, inter_dim, 1]
-    w1_bias=None,  # [expert, inter_dim, 1]
-    doweight=False,
-    swiglu_limit=None,
-    situ_beta: float = 4.0,
-    situ_linear_beta: float = 25.0,
-):
-    quant_type = quant_remap.get(quant_type, quant_type)
-    if (
-        quant_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
-        and activation == ActivationType.Silu
-    ):
-        swiglu_limit = normalize_swiglu_limit(swiglu_limit)
-    ctype = dtypes.fp32  # compute type
-    B, _D = hidden_states.shape
-    topk = topk_weight.shape[1]
-    N = w1.shape[1]
-    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    lazy_w1_int4_dequant = False
-    lazy_w1_mxfp4_dequant = False
-    if quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
-        # a16wi4: int4 weights viewed as int8 for compute
-        hidden_states = hidden_states.to(ctype)
-        w1 = w1.view(dtypes.i8)
-        lazy_w1_int4_dequant = True
-    elif quant_type == QuantType.per_1x32:
-        from aiter.utility import fp4_utils
-
-        if w1.dtype == dtypes.fp8:  # mxfp8 weight
-            w1 = w1.to(ctype)
-        else:
-            lazy_w1_mxfp4_dequant = True
-        w1_scale = fp4_utils.e8m0_to_f32(w1_scale)
-        if a1_scale is not None:  # skip a16w4 / mxfp8-bf16-activation ref
-            if hidden_states.dtype == dtypes.fp8:  # a8w4 mxfp8 activation
-                hidden_states = hidden_states.to(ctype)
-            else:
-                hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
-            a1_scale = fp4_utils.e8m0_to_f32(a1_scale)
-        else:  # a16w4 / mxfp8 (bf16 reference activation)
-            hidden_states = hidden_states.to(ctype)
-    else:
-        hidden_states = hidden_states.to(ctype)
-        w1 = w1.to(ctype)
-
-    if quant_type in [QuantType.per_Token, QuantType.per_Tensor]:
-        w1 = w1 * w1_scale.view(w1_scale.shape[0], -1, 1)
-        hidden_states = hidden_states * a1_scale
-    # per_128x128
-    elif quant_type in [QuantType.per_128x128, QuantType.per_1x128]:
-        w1_shape = w1.shape
-        w1 = w1.view(
-            w1.shape[0], w1.shape[1] // 128, 128, w1.shape[2] // 128, 128
-        ) * w1_scale.view(
-            w1_scale.shape[0], w1.shape[1] // 128, 1, w1.shape[2] // 128, 1
-        )
-        w1 = w1.view(w1_shape)
-
-        a1_scale = a1_scale.view(hidden_states.shape[0], -1, 1)
-        a1_scale = a1_scale.repeat(
-            1, 1, hidden_states.shape[-1] // a1_scale.shape[1]
-        ).view(hidden_states.shape[0], -1)
-        hidden_states = hidden_states * a1_scale
-    elif quant_type == QuantType.No:
-        pass
-    elif (
-        quant_type == QuantType.per_1x32
-        and w1_scale is not None
-        and w1_scale.dtype == dtypes.bf16
-    ):
-        # a16wi4: groupwise dequant int4 weights with scale [E, K//32, N]
-        group_size = 32
-        num_groups = model_dim // group_size
-        if not lazy_w1_int4_dequant:
-            w1_shape = w1.shape
-            # w1: [E, N, K] -> apply scale per group of K
-            w1 = w1.reshape(E, N, num_groups, group_size)
-            w1.mul_(w1_scale.reshape(E, num_groups, N).permute(0, 2, 1).unsqueeze(-1))
-            w1 = w1.reshape(w1_shape)
-        # activations are bf16, no scaling needed
-    elif quant_type == QuantType.per_1x32:
-        if not lazy_w1_mxfp4_dequant:
-            w1_shape = w1.shape
-            w1 = w1.view(E, N, model_dim // 32, 32) * w1_scale.view(
-                E, N, model_dim // 32, 1
-            )
-            w1 = w1.view(w1_shape)
-
-        a1_shape = hidden_states.shape
-        hidden_states = hidden_states.view(a1_shape[0], a1_shape[1] // 32, 32)
-        if a1_scale is not None:
-            a1_scale = a1_scale[: a1_shape[0]]
-            hidden_states = hidden_states * a1_scale.view(
-                a1_shape[0], a1_shape[1] // 32, 1
-            )
-        hidden_states = hidden_states.view(a1_shape)
-    else:
-        assert False, f"Unsupported quant_type: {quant_type}"
-
-    hidden_states = hidden_states.view(B, -1, model_dim).repeat(1, topk, 1)
-
-    out = torch.zeros(
-        (B, topk, N),
-        dtype=ctype,
-        device=hidden_states.device,
-    )
-    for E_id in range(w1.shape[0]):
-        mask = topk_ids == E_id
-        if mask.sum():
-            sub_tokens = hidden_states[mask]
-            if lazy_w1_int4_dequant:
-                w1_e = _int4_per_1x32_weight_expert_to_f32(
-                    w1, w1_scale, E_id, N, model_dim
-                )
-            elif lazy_w1_mxfp4_dequant:
-                w1_e = _mxfp4_per_1x32_weight_expert_to_f32(
-                    w1, w1_scale, E_id, N, model_dim
-                )
-            else:
-                w1_e = w1[E_id]
-            act_input = sub_tokens @ (w1_e.transpose(0, 1))
-            if doweight:
-                act_input = act_input * topk_weight[mask].view(-1, 1)
-            out[mask] = act_input
-            if w1_bias is not None:
-                out[mask] = out[mask] + w1_bias[E_id].view(1, -1)
-    use_g1u1 = w1.shape[1] == (2 * inter_dim)
-    use_swiglu = activation == aiter.ActivationType.Swiglu
-    use_situv2 = activation == aiter.ActivationType.Situv2
-    torch_act = aiter.get_torch_act(activation)
-    if use_g1u1:
-        gate, up = out.split([inter_dim, inter_dim], dim=-1)
-        if use_swiglu:
-            out = swiglu(gate, up, limit=swiglu_limit)
-        elif use_situv2:
-            out = situv2(gate, up, beta=situ_beta, linear_beta=situ_linear_beta)
-        else:
-            if swiglu_limit:
-                gate, up = _clamp_swiglu_gate_up(gate, up, swiglu_limit)
-            out = torch_act(gate) * up
-    else:
-        out = torch_act(out)
-    return out.to(dtype)
-
-
-def _clamp_swiglu_gate_up(gate: torch.Tensor, up: torch.Tensor, limit: float):
-    limit = min(limit, torch.finfo(gate.dtype).max)
-    return gate.clamp(max=limit), up.clamp(min=-limit, max=limit)
-
-
-def torch_moe_stage2(
-    hidden_states,
-    w1,  # E, inter_dim*2, model_dim
-    w2,  # E, model_dim, inter_dim
-    topk_weights,
-    topk_ids,
-    dtype=dtypes.fp16,
-    quant_type=QuantType.No,
-    w2_scale=None,  # [1]
-    a2_scale=None,  # [expert]]'
-    w2_bias=None,
-    doweight=True,
-):
-    ctype = dtypes.fp32  # compute type
-    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    lazy_w2_int4_dequant = False
-    lazy_w2_mxfp4_dequant = False
-    if quant_type == QuantType.per_1x32 and w2.dtype == dtypes.i4x2:
-        # a16wi4: int4 weights viewed as int8 for compute
-        hidden_states = hidden_states.to(ctype)
-        w2 = w2.view(dtypes.i8)
-        lazy_w2_int4_dequant = True
-    elif quant_type == QuantType.per_1x32:
-        from aiter.utility import fp4_utils
-
-        if w2.dtype == dtypes.fp8:  # mxfp8 weight
-            w2 = w2.to(ctype)
-        else:
-            lazy_w2_mxfp4_dequant = True
-        w2_scale = fp4_utils.e8m0_to_f32(w2_scale)
-        if a2_scale is not None:
-            if hidden_states.dtype == dtypes.fp8:  # a8w4 mxfp8 activation
-                hidden_states = hidden_states.to(ctype)
-            else:
-                hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
-            a2_scale = fp4_utils.e8m0_to_f32(a2_scale)
-        else:  # a16w4 / mxfp8 (bf16 reference activation)
-            hidden_states = hidden_states.to(ctype)
-    else:
-        hidden_states = hidden_states.to(ctype)
-        w2 = w2.to(ctype)
-
-    token_num, topk = topk_ids.shape
-    hidden_states = hidden_states.view(token_num, topk, inter_dim)
-
-    if quant_type in [QuantType.per_Token, QuantType.per_Tensor]:
-        hidden_states = hidden_states * a2_scale.view(a2_scale.shape[0], -1, 1)
-        w2 = w2 * w2_scale.view(w2_scale.shape[0], -1, 1)
-    elif quant_type in [QuantType.per_128x128, QuantType.per_1x128]:
-        a2_scale = a2_scale.view(hidden_states.shape[0], topk, -1, 1)
-        a2_scale = a2_scale.repeat(1, 1, 1, 128).view(hidden_states.shape[0], topk, -1)
-        hidden_states = hidden_states * a2_scale
-
-        w2_shape = w2.shape
-        w2 = w2.view(
-            w2.shape[0], w2.shape[1] // 128, 128, w2.shape[2] // 128, 128
-        ) * w2_scale.view(
-            w2_scale.shape[0], w2.shape[1] // 128, 1, w2.shape[2] // 128, 1
-        )
-        w2 = w2.view(w2_shape)
-    elif (
-        quant_type == QuantType.per_1x32
-        and w2_scale is not None
-        and w2_scale.dtype == dtypes.bf16
-    ):
-        # a16wi4: groupwise dequant int4 weights with scale
-        # w2: [E, model_dim, inter_dim], w2_scale is [E, inter_dim//32, model_dim]
-        group_size = 32
-        num_groups = inter_dim // group_size
-        if not lazy_w2_int4_dequant:
-            w2_shape = w2.shape
-            # w2: [E, model_dim, inter_dim] -> apply scale per group of inter_dim
-            w2 = w2.reshape(E, model_dim, num_groups, group_size)
-            w2.mul_(
-                w2_scale.reshape(E, num_groups, model_dim)
-                .permute(0, 2, 1)
-                .unsqueeze(-1)
-            )
-            w2 = w2.reshape(w2_shape)
-        # activations are bf16, no scaling
-    elif quant_type == QuantType.per_1x32:
-        a2_shape = hidden_states.shape
-        if a2_scale is not None:
-            a2_scale = a2_scale[: a2_shape[0] * topk]
-            a2_scale = a2_scale.view(token_num, topk, inter_dim // 32, 1)
-            hidden_states = (
-                hidden_states.view(token_num, topk, inter_dim // 32, 32) * a2_scale
-            )
-        hidden_states = hidden_states.view(a2_shape)
-
-        if not lazy_w2_mxfp4_dequant:
-            w2_shape = w2.shape
-            w2 = w2.view(E, model_dim, inter_dim // 32, 32) * w2_scale.view(
-                E, model_dim, inter_dim // 32, 1
-            )
-            w2 = w2.view(w2_shape)
-
-    out = torch.zeros(
-        (token_num, topk, model_dim),
-        dtype=ctype,
-        device=hidden_states.device,
-    )
-    for E_id in range(w1.shape[0]):
-        mask = topk_ids == E_id
-        if mask.sum():
-            sub_tokens = hidden_states[mask]
-            if lazy_w2_int4_dequant:
-                w2_e = _int4_per_1x32_weight_expert_to_f32(
-                    w2, w2_scale, E_id, model_dim, inter_dim
-                )
-            elif lazy_w2_mxfp4_dequant:
-                w2_e = _mxfp4_per_1x32_weight_expert_to_f32(
-                    w2, w2_scale, E_id, model_dim, inter_dim
-                )
-            else:
-                w2_e = w2[E_id]
-            act_input = sub_tokens @ (w2_e.transpose(0, 1))
-            out[mask] = act_input
-            if w2_bias is not None:
-                out[mask] = out[mask] + w2_bias[E_id].view(1, -1)
-    if doweight:
-        # In-place: out and topk_weights are both fp32 (ctype), so this is
-        # numerically identical to `out = out * ...` but avoids allocating a
-        # second full (token_num, topk, model_dim) fp32 tensor. That transient
-        # is the largest single allocation in the stage-2 reference (tens of GiB
-        # for large-token FP4 shapes) and was the site of the CI OOM.
-        out.mul_(topk_weights.view(token_num, -1, 1))
-    return out.sum(1).to(dtype)
 
 
 def ck_moe_stage1(
@@ -8101,81 +7606,3 @@ def cktile_moe_stage2(
         kernel_name=kernel_name,
     )
     return out
-
-
-def fused_topk(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    topk_ids: torch.Tensor | None = None,
-    topk_weights: torch.Tensor | None = None,
-    num_valid_rows: torch.Tensor | None = None,  # see aiter.topk_gating
-):
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
-
-    M, _ = hidden_states.shape
-    expert = gating_output.shape[1]
-
-    token_expert_indicies = torch.empty(
-        M, topk, dtype=dtypes.i32, device=hidden_states.device
-    )
-
-    # The asm kernel takes no pad-row count.
-    if (
-        num_valid_rows is None
-        and get_gfx() in ["gfx942", "gfx950"]
-        and (expert, topk)
-        in [
-            (128, 4),
-            (128, 6),
-            (128, 8),
-            (256, 6),
-            (256, 8),
-            (384, 8),
-            (640, 8),
-        ]
-        and gating_output.dtype in [dtypes.bf16, dtypes.fp32]
-        and gating_output.is_contiguous()
-    ):
-        if topk_weights is None:
-            topk_weights = torch.empty(
-                (M + 3) // 4 * 4, topk, dtype=dtypes.fp32, device=hidden_states.device
-            )
-        if topk_ids is None:
-            topk_ids = torch.empty(
-                (M + 3) // 4 * 4, topk, dtype=dtypes.i32, device=hidden_states.device
-            )
-        aiter.topk_softmax_asm(
-            topk_weights,
-            topk_ids,
-            token_expert_indicies,
-            gating_output,
-            renormalize,
-        )
-        topk_weights = topk_weights[:M, :]
-        topk_ids = topk_ids[:M, :]
-    else:
-        if topk_weights is None:
-            topk_weights = torch.empty(
-                M, topk, dtype=dtypes.fp32, device=hidden_states.device
-            )
-        if topk_ids is None:
-            topk_ids = torch.empty(
-                M, topk, dtype=dtypes.i32, device=hidden_states.device
-            )
-        aiter.topk_softmax(
-            topk_weights,
-            topk_ids,
-            token_expert_indicies,
-            gating_output,
-            renormalize,
-            num_valid_rows=num_valid_rows,
-        )
-
-    del token_expert_indicies  # Not used. Will be used in the future.
-
-    # if renormalize:
-    #     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-
-    return topk_weights, topk_ids
