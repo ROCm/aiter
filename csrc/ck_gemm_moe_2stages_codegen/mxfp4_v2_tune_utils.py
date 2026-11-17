@@ -47,6 +47,37 @@ def balanced_score(token, E, topk, dtype):
     return score
 
 
+def fused_shared_experts(E, topk):
+    """Number of fused shared experts, from TUNE_MOE_FUSED_SHARED_EXPERTS.
+
+    They are the last expert ids and every token routes to them after its
+    routed top-k, the layout topk_gating uses for num_shared_experts.
+    """
+    n = int(os.environ.get("TUNE_MOE_FUSED_SHARED_EXPERTS", "0"))
+    if not 0 <= n < min(E, topk):
+        raise ValueError(
+            f"TUNE_MOE_FUSED_SHARED_EXPERTS={n} must be below expert={E} and topk={topk}"
+        )
+    return n
+
+
+def append_shared_experts(topk_weights, topk_ids, E, n_shared):
+    """Route every token to the last ``n_shared`` of ``E`` experts at weight 1."""
+    if n_shared == 0:
+        return topk_weights, topk_ids
+    token = topk_ids.shape[0]
+    shared_ids = torch.arange(
+        E - n_shared, E, dtype=topk_ids.dtype, device=topk_ids.device
+    ).expand(token, n_shared)
+    shared_weights = torch.ones(
+        (token, n_shared), dtype=topk_weights.dtype, device=topk_weights.device
+    )
+    return (
+        torch.cat([topk_weights, shared_weights], dim=1).contiguous(),
+        torch.cat([topk_ids, shared_ids], dim=1).contiguous(),
+    )
+
+
 def quant_a_fp8(x):
     return per_1x32_f8_scale_f8_quant(
         x, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
@@ -267,11 +298,14 @@ def gen(
     # TUNE_MOE_EXPERT_BALANCE=true. Balanced routing gives every expert exactly
     # token * topk / E rows, which at a power-of-two token count fills a
     # block_m of that size with no padding tile and so favours it.
+    n_shared = fused_shared_experts(E, topk)
+    e_routed, k_routed = E - n_shared, topk - n_shared
     if os.environ.get("TUNE_MOE_EXPERT_BALANCE", "False").lower() == "true":
-        score = balanced_score(token, E, topk, dtypes.bf16)
+        score = balanced_score(token, e_routed, k_routed, dtypes.bf16)
     else:
-        score = torch.randn((token, E), dtype=dtypes.bf16)
-    topk_weights, topk_ids = fused_topk(inp, score, topk, True)
+        score = torch.randn((token, e_routed), dtype=dtypes.bf16)
+    topk_weights, topk_ids = fused_topk(inp, score, k_routed, True)
+    topk_weights, topk_ids = append_shared_experts(topk_weights, topk_ids, E, n_shared)
 
     w1_qt, w1_scale = quant_w(w1, b_dtype)
     w2_qt, w2_scale = quant_w(w2, b_dtype)

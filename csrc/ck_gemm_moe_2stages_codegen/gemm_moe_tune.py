@@ -115,6 +115,10 @@ from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import (
     select_reference_producer,
 )
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+    append_shared_experts,
+    fused_shared_experts,
+)
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     build_v2_inputs as _v2_build_inputs,
 )
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
@@ -1922,20 +1926,25 @@ class FmoeTuner(TunerCommon):
         else:
             w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
             w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+        n_shared = fused_shared_experts(expert, topk)
+        e_routed, k_routed = expert - n_shared, topk - n_shared
         if TUNE_MOE_EXPERT_BALANCE:
-            score = torch.zeros((token, expert), dtype=dtype)
+            score = torch.zeros((token, e_routed), dtype=dtype)
             start_col = 0
-            end_col = topk
+            end_col = k_routed
             for token_id in range(token):
                 score[token_id, start_col:end_col] = 1.0
-                start_col = end_col % expert
-                end_col = start_col + topk
+                start_col = end_col % e_routed
+                end_col = start_col + k_routed
         else:
             routing_seed = os.environ.get("TUNE_MOE_ROUTING_SEED")
             if routing_seed is not None:
                 torch.manual_seed(int(routing_seed))
-            score = torch.randn((token, expert), dtype=dtype)
-        topk_weights, topk_ids = fused_topk(input, score, topk, True)
+            score = torch.randn((token, e_routed), dtype=dtype)
+        topk_weights, topk_ids = fused_topk(input, score, k_routed, True)
+        topk_weights, topk_ids = append_shared_experts(
+            topk_weights, topk_ids, expert, n_shared
+        )
         if q_type == QuantType.per_1x128:
             a1_qt, a1_scale = aiter.pertoken_quant(
                 input.view(token, -1, 128), quant_dtype=q_dtype_a
