@@ -4,10 +4,6 @@
 import argparse
 import itertools
 import math
-import os
-import subprocess
-import sys
-import tempfile
 from functools import partial
 from unittest import mock
 
@@ -1900,6 +1896,8 @@ def test_fused_qknorm_idxrqknorm(
         return check_qkv_partials(mode, dtype, num_tokens, block_size, rotary_dim)
     if mode == "qkv_partials_reject":
         return {"err": check_qkv_partials_reject()}
+    if mode == "arg_reject":
+        return {"err": check_arg_rejects()}
 
     case = make_case(
         dtype=dtype,
@@ -2110,28 +2108,35 @@ MXFP4_MODES = {
 }
 MXFP4 = [*MXFP4_MODES, "mxfp4_scale_rule", "mxfp4_reject"]
 ROW_BYTES = {"auto": 2 * HEAD_DIM, "fp8": HEAD_DIM, "mxfp4": 68}
-# AITER_CHECK aborts the process instead of raising: a contract violation runs in a child
-REJECT_CHILD = (
-    "import sys, torch, aiter; a, kw = torch.load(sys.argv[1]); "
-    "aiter.fused_qknorm_idxrqknorm(*a, **kw); torch.cuda.synchronize()"
-)
+
+
+def call_edited(call, edits: dict, kwargs: dict, copy: bool = False):
+    """``call`` (an op call, a partial) with {positional index: replacement} and kwargs
+    applied; with ``copy`` on copies of its tensors, which it returns."""
+    args = [edits.get(i, a) for i, a in enumerate(call.args)]
+    kwargs = {**call.keywords, **kwargs}
+    if copy:
+        args = [a.clone() if isinstance(a, torch.Tensor) else a for a in args]
+        kwargs = {
+            k: v.clone() if isinstance(v, torch.Tensor) else v
+            for k, v in kwargs.items()
+        }
+    call.func(*args, **kwargs)
+    torch.cuda.synchronize()
+    return [t for t in (*args, *kwargs.values()) if isinstance(t, torch.Tensor)]
 
 
 def check_rejects(cases: dict):
     """name -> (op call, {positional index: replacement}, kwargs, expected message): each
-    call runs in a child and must fail with that message (None: must succeed)."""
-    with tempfile.TemporaryDirectory() as tmp:
-        for name, (call, edits, kwargs, msg) in cases.items():
-            args = [edits.get(i, a) for i, a in enumerate(call.args)]
-            path = os.path.join(tmp, name)
-            torch.save((args, {**call.keywords, **kwargs}), path)
-            cmd = [sys.executable, "-c", REJECT_CHILD, path]
-            r = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if msg is None:
-                assert r.returncode == 0, r.stderr[-500:]
-            else:
-                assert r.returncode != 0, name
-                assert msg in r.stderr, f"{name}: {r.stderr[-500:]}"
+    call must raise RuntimeError with that message, before launching anything (None: must
+    succeed)."""
+    for name, (call, edits, kwargs, msg) in cases.items():
+        try:
+            call_edited(call, edits, kwargs)
+        except RuntimeError as e:
+            assert msg is not None and msg in str(e), f"{name}: {e}"
+        else:
+            assert msg is None, f"{name}: accepted"
 
 
 def check_bytes(actual, expected, msg: str):
@@ -2355,7 +2360,7 @@ def check_mxfp4_reject():
         (page16, "gfx942", "gfx950"),
         (kv, "gfx942", "gfx950"),
         (kv_only, "gfx942", "gfx950"),  # an mxfp4 main K/V alone is refused too
-        (q8, "gfx1100", "fp8 q_out"),
+        (q8, "gfx1100", "requires one of"),
     ):
         with mock.patch.object(op, "get_gfx_runtime", return_value=gfx):
             try:
@@ -2459,20 +2464,35 @@ def check_qkv_partials(mode, dtype, num_tokens, block_size, rotary_dim):
 
 
 def check_qkv_partials_reject():
-    """The calls with no partials instance, and partials the kernel cannot read, are
-    refused ("good" shows the harness is sound)."""
+    """A call whose mode does not sum the partials in the op's own pass (no insert, the
+    index branch skipped, an e4m3 q_out) reduces them first: every output matches the call
+    on the reduced qkv bit for bit. Partials the op cannot read are refused ("good" shows
+    the harness is sound)."""
     case = make_case(
         dtype=torch.bfloat16, num_tokens=4, num_kv_heads=1, num_index_heads=1
     )
     p = make_partials(2, 4, case["qkv"].shape[1])
+    case["qkv"] = reduce_partials(p)
     run = partial(run_fused_qknorm_idxrqknorm, use_index_slot_mapping=True)
     call = run(case, mode="asm_layout", use_fp8_kv_cache=False, qkv_partials=p)[0][-1]
     fp8_q = torch.zeros(4, 16 * HEAD_DIM, dtype=dtypes.fp8, device="cuda")
-    unaligned = torch.zeros(p.numel() + 1, device="cuda")[1:].view(p.shape)
-    bad = {
+    unfused = {
         "not_insert": ({13: None, 14: None, 15: None}, {}),
         "skip_index_branch": ({15: None}, {"skip_index_branch": True}),
         "fp8_q_out": ({17: fp8_q}, {}),
+    }
+    for name, (edits, kw) in unfused.items():
+        nan_qkv = torch.full_like(case["qkv"], float("nan"))
+        got = call_edited(call, {**edits, 0: nan_qkv}, kw, copy=True)
+        want = call_edited(
+            call, {**edits, 0: case["qkv"]}, {**kw, "qkv_partials": None}, copy=True
+        )
+        for i, (g, w) in enumerate(
+            zip(got, want)
+        ):  # got's last, the partials, unpaired
+            assert torch.equal(bits(g), bits(w)), f"{name}: output {i}"
+    unaligned = torch.zeros(p.numel() + 1, device="cuda")[1:].view(p.shape)
+    bad = {
         "3_splits": ({}, {"qkv_partials": p[[0, 1, 1]]}),
         "fp16_partials": ({}, {"qkv_partials": p.half()}),
         "short_rows": ({}, {"qkv_partials": p[:, :3]}),
@@ -2480,6 +2500,36 @@ def check_qkv_partials_reject():
     }
     cases = {k: (call, e, kw, "qkv_partials") for k, (e, kw) in bad.items()}
     check_rejects({"good": (call, {}, {}, None), **cases})
+    return 0
+
+
+def check_arg_rejects():
+    """Arguments the op refuses raise before launching, so a caller need not pre-check
+    them: head_dim, rotary_dim, qkv / positions / cache layout and dtype, and the arch
+    (faked) for fp8 stores; gfx1250-strict counts as gfx1250."""
+    case = make_case(
+        dtype=torch.bfloat16, num_tokens=4, num_kv_heads=1, num_index_heads=1
+    )
+    run = partial(run_fused_qknorm_idxrqknorm, case, use_index_slot_mapping=True)
+    call = run(mode="asm_layout", use_fp8_kv_cache=False)[0][-1]
+    fp8 = run(mode="asm_layout_fp8_pertoken", use_fp8_kv_cache=True)[0][-1]
+    qkv, w, pos, kc = call.args[0], call.args[1], call.args[4], call.args[13]
+    wide = torch.zeros(qkv.shape[0], qkv.shape[1] + HEAD_DIM, dtype=qkv.dtype).cuda()
+    cos12 = call.args[3][:, :12].contiguous()
+    cases = {
+        "good": ({}, None),
+        "head_dim_64": ({1: w[:64], 2: w[:64]}, "must have 128 elements"),
+        "rotary_dim_12": ({3: cos12, 7: 12}, "rotary_dim must be a positive multiple"),
+        "qkv_strided": ({0: wide[:, : qkv.shape[1]]}, "qkv must be contiguous"),
+        "positions_int32": ({4: pos.int()}, "positions must be contiguous int64"),
+        "positions_2d": ({4: pos.view(-1, 1)}, "positions must be 1D"),
+        "cache_4d": ({13: kc.flatten(-2)}, "kv_cache_k must be [num_blocks"),
+        "cache_dtype": ({13: kc.half(), 14: call.args[14].half()}, "dtype must match"),
+    }
+    check_rejects({k: (call, e, {}, msg) for k, (e, msg) in cases.items()})
+    for gfx, msg in (("gfx1100", "requires one of"), ("gfx1250-strict", None)):
+        with mock.patch.object(op, "get_gfx_runtime", return_value=gfx):
+            check_rejects({gfx: (fp8, {}, {}, msg)})
     return 0
 
 
@@ -2523,6 +2573,7 @@ DEFAULT_CASES += [
     ("qkv_partials_bf16", "bf16", 17, 16, 128, 1),
     ("qkv_partials_page128", "bf16", 33, 128, 96, 1),
     ("qkv_partials_reject", "bf16", 4, 16, 64, 1),
+    ("arg_reject", "bf16", 4, 16, 64, 1),
 ]
 DEFAULT_CASES += [
     (mode, dtype_name, num_tokens, 16 if mode.startswith("asm_layout") else 128, 64, 1)
@@ -2556,6 +2607,7 @@ l_mode = [
     *MXFP4,
     *PARTIALS_MODES,
     "qkv_partials_reject",
+    "arg_reject",
 ]
 l_dtype = ["fp16", "bf16"]
 

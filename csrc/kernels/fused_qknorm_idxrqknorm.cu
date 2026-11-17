@@ -322,6 +322,23 @@ __device__ __forceinline__ void reduceRawElems(hip_bfloat16* __restrict__ row,
     *reinterpret_cast<uint2*>(row) = packRawElems(raw);
 }
 
+// A call whose mode does not sum the partials in its own pass (see
+// fused_qknorm_idxrqknorm_impl) reduces them into qkv with this kernel first, the same
+// sum, and then runs as on a reduced qkv. qkv is dense [num_tokens, row], the partials
+// rows have the same stride.
+__global__ void reduceQkvPartialsKernel(hip_bfloat16* __restrict__ qkv,
+                                        QkvPartials partials,
+                                        int64_t num_elems)
+{
+    const int64_t off =
+        (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) * kElemsPerLane;
+    if(off < num_elems)
+    {
+        hip_bfloat16 raw[kElemsPerLane];
+        reduceRawElems(qkv + off, partials, off, raw);
+    }
+}
+
 // The lane's kElemsPerLane elements are contiguous in dst: one store.
 template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
 __device__ __forceinline__ void storeCacheElems(cache_t* __restrict__ dst,
@@ -1454,8 +1471,8 @@ void launchFusedQKNormIdxrQKNorm(
 
 // The e4m3 q_out store is compiled in only where it can run (insert mode), so the other
 // instantiations are unchanged. So is the split-K partials load: bf16 insert modes that
-// cover every qkv column, one row per warp (the host checks a call for partials against
-// the same).
+// cover every qkv column, one row per warp (the host reduces the partials of any other
+// call first).
 #define LAUNCH(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE)               \
     do                                                                                       \
     {                                                                                        \
@@ -2017,13 +2034,7 @@ static void fused_qknorm_idxrqknorm_impl(
     QkvPartials partials{};
     if(qkv_partials.has_value())
     {
-        // Every qkv column must belong to a slot, so the kernel writes the whole
-        // reduced row back: insert mode, and the index branch when qkv has one.
-        AITER_CHECK(insert_kv && (!has_index || process_index),
-                    "qkv_partials requires the insert mode with every qkv slot processed");
         AITER_CHECK(qkv.dtype() == AITER_DTYPE_bf16, "qkv_partials requires a bf16 qkv");
-        AITER_CHECK(!fp4_kv_cache && !fp4_index_cache && !q_is_fp8,
-                    "qkv_partials does not support fp4 caches or an fp8 q_out");
         const aiter_tensor_t& qp = *qkv_partials;
         AITER_CHECK(qp.is_gpu() && qp.dtype() == AITER_DTYPE_fp32 && qp.dim() == 3,
                     "qkv_partials must be a float32 CUDA [num_splits, rows, row] tensor");
@@ -2044,6 +2055,26 @@ static void fused_qknorm_idxrqknorm_impl(
 
     HipDeviceGuard device_guard(qkv.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
+
+    // The main kernel sums the partials as it reads qkv where it writes every qkv column
+    // back: the insert mode with every slot processed, no fp4 cache and no e4m3 q. Any
+    // other call reduces them into qkv first.
+    const bool fuse_partials = insert_kv && (!has_index || process_index) &&
+                               !fp4_kv_cache && !fp4_index_cache && !q_is_fp8;
+    if(partials.num_splits > 0 && !fuse_partials)
+    {
+        // expected_row is a multiple of 128: whole lanes of kElemsPerLane elements
+        const int64_t num_elems = static_cast<int64_t>(num_tokens) * expected_row;
+        constexpr int kReduceBlock = 256;
+        const int blocks = static_cast<int>(
+            (num_elems / kElemsPerLane + kReduceBlock - 1) / kReduceBlock);
+        if(blocks > 0)
+        {
+            reduceQkvPartialsKernel<<<blocks, kReduceBlock, 0, stream>>>(
+                reinterpret_cast<hip_bfloat16*>(qkv.data_ptr()), partials, num_elems);
+        }
+        partials = {};
+    }
 
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(qkv.dtype(), "fused_qknorm_idxrqknorm", [&] {
         using T = scalar_t;
@@ -2418,6 +2449,8 @@ void fused_qknorm_idxrqknorm(
     bool skip_index_branch,
     std::optional<aiter_tensor_t> qkv_partials)
 {
+    // A refused argument raises (RuntimeError in Python) before anything launches.
+    aiter_detail::AiterThrowGuard throw_guard;
     fused_qknorm_idxrqknorm_impl(qkv,
                                                 q_norm_weight,
                                                 k_norm_weight,

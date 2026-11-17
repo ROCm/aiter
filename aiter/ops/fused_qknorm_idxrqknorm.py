@@ -6,12 +6,11 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
+from ..jit.utils.build_targets import base_gfx_arch
 from ..jit.utils.chip_info import get_gfx_runtime
 
 FUSED_QKNORM_IDXRQKNORM_SUPPORTS_PACKED_SHUFFLE = True
 FUSED_QKNORM_IDXRQKNORM_SUPPORTS_FP8_INDEX_Q = True
-# A layer without index heads (num_index_heads 0) can insert into an fp8 KV cache.
-FUSED_QKNORM_IDXRQKNORM_SUPPORTS_INDEXLESS_FP8 = True
 
 _FP8_E4M3_DTYPES = tuple(
     dt
@@ -121,10 +120,12 @@ def fused_qknorm_idxrqknorm(
     # q_out may be an e4m3 tensor (fp8 or uint8, insert mode): unit-scale e4m3 cast, saturating
     #   (+-inf too; NaN stays NaN), written instead of the bf16 q (as index_q_out).
     # qkv_partials: the FP32 [num_splits (2, 4 or 8), >= num_tokens, row] split-K partials of
-    #   a bf16 qkv its GEMM left unreduced. The kernel sums them as the gfx1250 split-K
-    #   GEMM's reduce kernel does (FP32, split order, one round to nearest even), writes the
-    #   reduced row back into qkv and goes on from it; insert mode with every qkv slot
-    #   processed (no skip_index_branch), no fp4 cache or fp8 q_out.
+    #   a bf16 qkv its GEMM left unreduced, any mode. They are summed as the gfx1250 split-K
+    #   GEMM's reduce kernel does (FP32, split order, one round to nearest even) and the
+    #   reduced row is written back into qkv: in the op's own pass in insert mode with every
+    #   qkv slot processed (no skip_index_branch), no fp4 cache and no fp8 q_out; by a
+    #   reduce kernel launched first otherwise.
+    # Refused arguments raise RuntimeError before anything is launched.
     if index_cache_dtype is None:
         index_cache_dtype = (
             "fp8"
@@ -135,14 +136,18 @@ def fused_qknorm_idxrqknorm(
     # opus has no fp4 conversion off gfx950 and no fp8 conversion on gfx1100/gfx115x: the
     # stores would silently write zeros.
     fp4_dtypes = {"mxfp4", "nvfp4"} & {kv_cache_dtype, index_cache_dtype}
-    if fp4_dtypes and get_gfx_runtime() != "gfx950":
+    gfx = base_gfx_arch(get_gfx_runtime())
+    if fp4_dtypes and gfx != "gfx950":
         raise RuntimeError("fused_qknorm_idxrqknorm mxfp4/nvfp4 caches require gfx950")
-    if (
-        q_out is not None
-        and q_out.dtype != qkv.dtype
-        and get_gfx_runtime() not in _FP8_CVT_GFX
-    ):
-        raise RuntimeError(f"an fp8 q_out requires one of {_FP8_CVT_GFX}")
+    fp8_stores = (
+        (kv_cache_k is not None and kv_cache_dtype.startswith("fp8"))
+        or index_cache_dtype.startswith("fp8")
+        or any(t is not None and t.dtype != qkv.dtype for t in (q_out, index_q_out))
+    )
+    if fp8_stores and gfx not in _FP8_CVT_GFX:
+        raise RuntimeError(
+            f"an fp8 cache, q_out or index_q_out requires one of {_FP8_CVT_GFX}"
+        )
 
     use_fp8_kv_cache = (
         kv_cache_k is not None
