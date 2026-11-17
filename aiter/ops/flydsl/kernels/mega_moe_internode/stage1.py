@@ -279,6 +279,11 @@ def _compile_stage1(
     node = rank // GPUS_PER_NODE
     NODES = WORLD // GPUS_PER_NODE
     REMOTE_NODES = tuple(peer for peer in range(NODES) if peer != node)
+    # Rotated rail order: node s posts its i-th transfer to s+1+i, so receiver r's
+    # i-th arrival comes from r-1-i. Consuming in that order lets each receiver
+    # start on the earliest-posted transfer instead of all receivers favoring node 0.
+    SEND_ORDER = tuple((node + 1 + i) % NODES for i in range(NODES - 1))
+    RECV_ORDER = tuple((node - 1 - i) % NODES for i in range(NODES - 1))
     stage2_window_offset = int(stage2_window_offset)
     # rail_soa layout shared by dispatch_staging[p] and remote_dispatch_rx[p].
     from .quant import rail_record_layout as _rail_record_layout
@@ -384,6 +389,17 @@ def _compile_stage1(
         layout.region("grouped_input_q").nbytes // layout.parity_depth >= 1 << 31
     )
 
+    # A resident non-fanout CTA seals while T0 returns rail credits. The
+    # existing sealer EOS acquire is unchanged; no credit or CQ owner moves.
+    SEALER_SPARE = max(SEND_END, ESSENTIAL_CTAS, COMPUTE_FIRST + 1)
+    SEPARATE_SEALER = (
+        G == 3
+        and not split_local
+        and not data_send_ctas
+        and local_rank == CCO_TICKET
+        and SEALER_SPARE < worker_blocks - 1
+    )
+
     # Compile-time region helpers.  CCO offsets are relative to the physical
     # window; local addresses add arena_ptr at runtime.
     def off(name):
@@ -447,13 +463,15 @@ def _compile_stage1(
         )
         + ("_a8w4" if A_DTYPE == "fp8" else "")
         # Distinguish the restored M16 helper from prior M32 compiled handles.
-        + ("_am16" if A_DTYPE == "fp8" and GBM == 128 else "")
+        + ("_am16_tailpair" if A_DTYPE == "fp8" and GBM in (96, 128) else "")
         + (f"_ep{WORLD}_gpn{GPUS_PER_NODE}" if NODES != 2 else "")
         + (
             ""
             if swiglu_limit is None
             else f"_swl{float(swiglu_limit):g}".replace(".", "p")
         )
+        + ("_independent_sealer" if SEPARATE_SEALER else "")
+        + "_rord_bsdefer"
         + f"_r{rank}_h{HIDDEN}_i{INTER}_e{EXPERTS}_k{TOPK}"
         f"_mt{MAX_TOKENS}_rpc{layout.max_routes_per_token_per_rank}"
         + f"_cf{COMPUTE_FIRST}"
@@ -463,7 +481,7 @@ def _compile_stage1(
         + (f"_ds{data_send_ctas}_wtpub" if data_send_ctas else "")
         + ("_slg" if split_local else "_nsl")
         + (f"_w{WAVES}" if WAVES != 4 else "")
-        + ("_gr" if group_ready else "")
+        + ("_gr_sg" if group_ready else "")
         + ("_c1" if buffer_regions else "")
         + (
             f"_vl{gda_peer_stride}l{gda_peer_lane}b{lsa_peer_base}"
@@ -492,6 +510,8 @@ def _compile_stage1(
         ntokens: fx.Int32,
         lds_raw=None,
     ):
+        # Single fused kernel (group_ready, caller's LDS): Stage1 hands generation to Stage2.
+        gen_lds = group_ready and lds_raw is not None
         if const_expr(lds_raw is None):
             lds_raw = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         # cco_lsa_ptr(w, peer, off) = winBase + peer*(stride4G<<32) + off.
@@ -621,7 +641,7 @@ def _compile_stage1(
             T0 has already waited for all credits outside this helper.
             """
             for remote_index in range_constexpr(NODES - 1):
-                remote_node = REMOTE_NODES[remote_index]
+                remote_node = SEND_ORDER[remote_index]
                 src_base = fx.Int64(off("dispatch_staging"))
                 if const_expr(bool(buffer_regions)):
                     src_base = region_window_address(
@@ -885,7 +905,7 @@ def _compile_stage1(
             qp = wave % fx.Int32(layout.num_qp) if WAVES > layout.num_qp else wave
 
             for remote_index in range_constexpr(NODES - 1):
-                remote_node = REMOTE_NODES[remote_index]
+                remote_node = RECV_ORDER[remote_index]
                 # credit_async waits here for the peer's generation g-2 consumption credit,
                 # just before overwriting the same remote_dispatch_rx parity plane.
                 # Do not wait at kernel exit, which would require all peer fan2 work to finish.
@@ -978,7 +998,9 @@ def _compile_stage1(
         # into destination expert tiles; there is no rank inbox/sort.
         is_finisher = is_comm & (ticket == fx.Int32(local_rank))
 
-        is_sealer = is_finisher
+        is_sealer = (
+            (ticket == fx.Int32(SEALER_SPARE)) if SEPARATE_SEALER else is_finisher
+        )
 
         def _peer_addr(dest, name):
             if const_expr(bool(buffer_regions)):
@@ -2264,7 +2286,7 @@ def _compile_stage1(
                 if ticket == fx.Int32(GPUS_PER_NODE * _SEG1_SHARD + local_rank):
                     _seal_seg1()
             for remote_index in range_constexpr(NODES - 1):
-                remote_node = REMOTE_NODES[remote_index]
+                remote_node = RECV_ORDER[remote_index]
                 # One flush publishes all dispatch chunks together; wait once per CTA.
                 if (tx < fx.Int32(layout.num_qp)) & (
                     fan_wshard < fx.Int32(F2S if F2S else 1 << 20)
@@ -2297,13 +2319,13 @@ def _compile_stage1(
                         remote=True,
                         resv_last=(
                             token + f2_stride * fx.Int32(_GB_NB) >= f2_end
-                            if tile_ready and remote_node == REMOTE_NODES[-1]
+                            if tile_ready and remote_node == RECV_ORDER[-1]
                             else None
                         ),
                         resv_n=fan_stride,
                     )
                 if const_expr(  # noqa: SIM102
-                    tile_ready and remote_node == REMOTE_NODES[-1]
+                    tile_ready and remote_node == RECV_ORDER[-1]
                 ):
                     # Fan CTAs with no batch, including posting CTAs, must still report once to reach fan_stride.
                     if (fan_wshard >= f2_end) & (tx == fx.Int32(0)):
@@ -2316,7 +2338,7 @@ def _compile_stage1(
                 if wave == fx.Int32(0):
                     post_qp = ticket - fx.Int32(1)
                     for remote_index in range_constexpr(NODES - 1):
-                        remote_node = REMOTE_NODES[remote_index]
+                        remote_node = SEND_ORDER[remote_index]
                         post_req = fx.Int64(
                             comm.load_i64_global(
                                 peer_local_addr("remote_chunk_request", remote_node)
@@ -2782,6 +2804,17 @@ def _compile_stage1(
                     local_addr("h1_queue_eos"), generation, 127
                 )
             _cta_acquire()
+        if const_expr(gen_lds):
+            # Compute CTAs passed the EOS spin above.
+            eos_seen = is_compute.select(fx.Int64(1), fx.Int64(0))
+            # Single fused kernel: hand generation and EOS-passed to Stage2
+            # through LDS words 0/1; reloading the global words there cost
+            # ~12us per CTA.
+            if tx == fx.Int32(0):
+                fx.ptr_store(
+                    Vec.from_elements([generation, eos_seen], fx.Int64),
+                    fx.recast_iter(fx.Int64, lds_raw),
+                )
 
     @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
     def kernel(
@@ -2866,6 +2899,7 @@ def _compile_stage1(
         else None
     )
     launch_stage1.epoch_off = int(off("epoch_gate"))
+    launch_stage1.xcd_inv_off = int(off("xcd_l2_inv"))
     launch_stage1.buffer_regions = buffer_regions
     launch_stage1.group_sync_tail = 4 * GR_N
     return launch_stage1
