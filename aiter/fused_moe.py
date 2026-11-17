@@ -70,10 +70,11 @@ from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
 )
-from aiter.presorted_moe import (  # noqa: F401  register_presorted_moe, plain_sort_block_m are public
+from aiter.presorted_moe import (  # noqa: F401  register_presorted_moe, plain_sort_block_m, forget_ep_mask are public
     aux_sort_capacity,
     bytes_overlap,
     drop_presort_on_error,
+    forget_ep_mask,
     is_plain_presort,
     match_plain_presorted_moe,
     match_presorted_moe,
@@ -2039,7 +2040,11 @@ def _fused_moe_impl(
             f"{metadata.block_m}; moe_sorting and both gemm tiles share this size"
         )
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
-    if presorted_aux and not metadata.output_aux and not is_plain_presort(presorted_aux):
+    if (
+        presorted_aux
+        and not metadata.output_aux
+        and not is_plain_presort(presorted_aux)
+    ):
         presorted_moe_ignored("the selected MoE pipeline takes no BM=16 aux sort")
     asm_mode = AsmMoeMode(metadata.flat)
     if metadata.full_impl is not None:

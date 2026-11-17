@@ -8,6 +8,7 @@ rather than in fused_moe.py, which the other two can only import lazily.
 
 import functools
 import threading
+import weakref
 
 import torch
 
@@ -231,7 +232,8 @@ _PLAIN_SORT_KEYS = (
     "sorted_expert_ids",
     "num_valid_ids",
 )
-# (mask data_ptr, numel, ep_layout) -> whether the mask equals that layout.
+# id(mask) -> (weakref to the mask, (version, data_ptr, numel, ep_layout) when
+# checked, whether it matched). An entry is dropped when its mask is freed.
 _EP_MASK_CHECKED = {}
 # (M, num_experts, topk) -> block_m of the last general-path sort for that shape.
 _PLAIN_SORT_BLOCK_M = {}
@@ -261,23 +263,65 @@ def is_plain_presort(aux):
     return bool(aux) and aux.get("layout") == PRESORTED_MOE_LAYOUT_PLAIN
 
 
+def forget_ep_mask(expert_mask=None):
+    """Drop the cached EP-mask check of ``expert_mask``, or of every mask if None.
+
+    Updates through torch ops on the mask (or a view of it) and a new mask tensor
+    are detected without this. Call it after writing a mask's memory any other
+    way: a raw-pointer kernel, a write through ``.data``, or a peer's IPC handle.
+    """
+    if expert_mask is None:
+        _EP_MASK_CHECKED.clear()
+        return
+    entry = _EP_MASK_CHECKED.get(id(expert_mask))
+    if entry is not None and entry[0]() is expert_mask:
+        del _EP_MASK_CHECKED[id(expert_mask)]
+
+
+def _forget_freed_mask(ref, key):
+    entry = _EP_MASK_CHECKED.get(key)
+    if entry is not None and entry[0] is ref:
+        del _EP_MASK_CHECKED[key]
+
+
+def _tensor_version(t):
+    try:
+        return t._version
+    except RuntimeError:  # inference tensors have no version counter
+        return None
+
+
 def _ep_mask_matches(expert_mask, num_experts, ep_layout):
     """Whether expert_mask selects exactly the experts ep_layout describes.
 
     ep_layout = (routed_begin, num_routed, shared_begin, num_shared): the rank
     owns global experts [routed_begin, routed_begin + num_routed) and
     [shared_begin, shared_begin + num_shared), shared after routed, so local ids
-    are g - routed_begin and num_routed + g - shared_begin. The comparison reads
-    the mask back once per buffer; a mask first seen under graph capture, where
-    that copy cannot run, is not trusted.
+    are g - routed_begin and num_routed + g - shared_begin.
+
+    The comparison reads the mask back to the host, so its result is cached per
+    mask tensor and reused while the tensor is alive and its version counter,
+    data_ptr and numel are unchanged. Writes that bypass the version counter
+    need forget_ep_mask(). An inference tensor has no version counter, so its
+    mask is compared on every eager call. Under graph capture, where the
+    read-back cannot run, a mask with no valid cached result returns None (not
+    checked). A captured graph keeps the decision made at capture.
     """
-    key = (expert_mask.data_ptr(), expert_mask.numel(), tuple(int(v) for v in ep_layout))
-    hit = _EP_MASK_CHECKED.get(key)
-    if hit is not None:
-        return hit
+    layout = tuple(int(v) for v in ep_layout)
+    version = _tensor_version(expert_mask)
+    state = (version, expert_mask.data_ptr(), expert_mask.numel(), layout)
+    key = id(expert_mask)
+    entry = _EP_MASK_CHECKED.get(key)
+    if (
+        version is not None
+        and entry is not None
+        and entry[0]() is expert_mask
+        and entry[1] == state
+    ):
+        return entry[2]
     if torch.cuda.is_current_stream_capturing():
-        return False
-    routed_begin, num_routed, shared_begin, num_shared = key[2]
+        return None
+    routed_begin, num_routed, shared_begin, num_shared = layout
     ok = (
         expert_mask.numel() == num_experts
         and 0 <= routed_begin
@@ -285,11 +329,13 @@ def _ep_mask_matches(expert_mask, num_experts, ep_layout):
         and shared_begin + num_shared <= num_experts
     )
     if ok:
-        want = torch.zeros(num_experts, dtype=torch.int32)
+        want = torch.zeros(num_experts, dtype=torch.int32, device="cpu")
         want[routed_begin : routed_begin + num_routed] = 1
         want[shared_begin : shared_begin + num_shared] = 1
         ok = torch.equal(expert_mask.detach().to("cpu", torch.int32), want)
-    _EP_MASK_CHECKED[key] = ok
+    if version is not None:
+        ref = weakref.ref(expert_mask, lambda r, k=key: _forget_freed_mask(r, k))
+        _EP_MASK_CHECKED[key] = (ref, state, ok)
     return ok
 
 
@@ -339,11 +385,17 @@ def match_plain_presorted_moe(
     if (expert_mask is None) != (ep_layout is None):
         presorted_moe_ignored("expert_mask and the sort's ep_layout disagree")
         return None
-    if expert_mask is not None and not _ep_mask_matches(
-        expert_mask, num_experts, ep_layout
-    ):
-        presorted_moe_ignored("expert_mask does not match the sort's ep_layout")
-        return None
+    if expert_mask is not None:
+        matches = _ep_mask_matches(expert_mask, num_experts, ep_layout)
+        if matches is None:
+            presorted_moe_ignored(
+                "expert_mask was not checked before graph capture (new, updated "
+                "or inference tensor)"
+            )
+            return None
+        if not matches:
+            presorted_moe_ignored("expert_mask does not match the sort's ep_layout")
+            return None
     try:
         ids, weights, experts, num_valid = (aux[k] for k in _PLAIN_SORT_KEYS)
     except KeyError:
