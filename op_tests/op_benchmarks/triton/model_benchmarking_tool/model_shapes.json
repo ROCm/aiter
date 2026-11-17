@@ -1476,8 +1476,7 @@
                 "hk": 16,
                 "dqk": 128,
                 "dv": 128,
-                "ratio": 2,
-                "layout": "flat"
+                "ratio": 2
             }
         ],
         "gated_delta_net_decode": [
