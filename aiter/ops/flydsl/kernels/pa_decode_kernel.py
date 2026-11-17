@@ -37,13 +37,13 @@ Logical layouts (not preshuffled):
 
 * ``query``        [num_seqs * query_length, num_q_heads, head_dim]  f16/bf16
 * ``key_cache``    [num_blocks, num_kv_heads, head_dim//x, block_size, x]
-* ``value_cache``  [num_blocks, num_kv_heads, block_size//x, head_dim, x] (trans_v)
-                   or [num_blocks, num_kv_heads, head_dim, block_size] (FP8 plain)
+* ``value_cache``  [num_blocks, num_kv_heads, block_size//x, value_dim, x] (trans_v)
+                   or [num_blocks, num_kv_heads, value_dim, block_size] (FP8 plain)
                    where x=16 for FP8 and x=8 for BF16
 * ``block_tables`` [num_seqs, max_blocks_per_seq]  int32
 * ``work_info``    [capacity, 4]  int32 sequence/tile bounds/context length
 * ``pmax``, ``psum`` [num_kv_heads, capacity, query_length * query_group_size] f32
-* ``pout``         [num_kv_heads, capacity, query_length * query_group_size, head_dim]
+* ``pout``         [num_kv_heads, capacity, query_length * query_group_size, value_dim]
                    same dtype as query; normalized partition output
 * K/V scales      [1] per-tensor or [num_blocks, num_kv_heads, block_size] per-token
 
@@ -62,6 +62,7 @@ import torch
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
+from flydsl.runtime.device import check_smem_capacity
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
@@ -170,6 +171,7 @@ def compile_pa_decode_tile(
     *,
     architecture: str | None = None,
     head_dim: int,
+    value_dim: int | None = None,
     query_group_size: int,
     block_size: int,
     num_seqs: int,
@@ -262,6 +264,8 @@ def compile_pa_decode_tile(
         raise NotImplementedError("Non-transposed key cache is not implemented")
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture in ("gfx1250", "gfx1250-strict"):
+        if value_dim not in (None, head_dim):
+            raise NotImplementedError("asymmetric value width requires gfx942/gfx950")
         kv_fx, query_fx = pa_fx_dtypes(kv_dtype, query_dtype)
         if query_fx not in (fx.Float16, fx.BFloat16) or kv_fx not in (
             fx.Float8E4M3FN,
@@ -303,6 +307,7 @@ def compile_pa_decode_tile(
         raise NotImplementedError("cluster_merge requires gfx1250")
     schedule = PaDecodeSchedule.select(
         head_dim=head_dim,
+        value_dim=value_dim,
         query_group_size=query_group_size,
         block_size=block_size,
         num_seqs=num_seqs,
@@ -330,34 +335,27 @@ def compile_pa_decode_tile(
         return cached
 
     traits = PaDecodeTraits.create(schedule)
-    # As in fmha_gfx950, expose scalar specialization data to FlyDSL's closure
-    # cache walker: it cannot inspect the fields of a captured traits object.
+    shared_bytes = (
+        max(
+            2 * traits.GROUP_LDS_BYTES,
+            # Dual-group merge: (O, m, l) per group-1 lane.
+            traits.BLOCK_THREADS * (traits.VHE_CHUNKS * traits.OP_ELEMS + 2) * 4,
+        )
+        if traits.DUAL_GROUP
+        else traits.total_bytes
+    )
+    check_smem_capacity(shared_bytes, architecture)
 
     @fx.struct
     class SharedStorage:
-        buf: fx.Array[
-            fx.Int32,
-            (
-                max(
-                    2 * traits.GROUP_LDS_BYTES,
-                    # Dual-group merge: (O, m, l) per group-1 lane.
-                    traits.BLOCK_THREADS
-                    * (traits.VHE_CHUNKS * traits.OP_ELEMS + 2)
-                    * 4,
-                )
-                if traits.DUAL_GROUP
-                else traits.total_bytes
-            )
-            // 4,
-            16,
-        ]
+        buf: fx.Array[fx.Int32, shared_bytes // 4, 16]
 
     @flyc.jit
     def _pa_decode_tile_task(
         # Packed partials: [KV heads, capacity, query rows].
         pmax_ptr: fx.Pointer,  # Natural-log row max.
         psum_ptr: fx.Pointer,  # Row sum.
-        pout_ptr: fx.Pointer,  # Adds head_dim; OUT_DTYPE normalized O_p/l_p.
+        pout_ptr: fx.Pointer,  # Adds value_dim; OUT_DTYPE normalized O_p/l_p.
         query_ptr: fx.Pointer,
         key_cache_ptr: fx.Pointer,
         value_cache_ptr: fx.Pointer,
