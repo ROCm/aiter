@@ -496,9 +496,12 @@ def _fused_quant_tuned_kernel(
 ) -> str | None:
     """The kernelName of the preshuffle table's flydsl row for this shape, the
     row the bf16 entry runs, so both entries share the tuned tile. None (the
-    runner's own choice) when there is no row or the row is not a flydsl one.
-    The name is passed through as is: a name the flydsl runner does not accept
-    raises there, as it does for the bf16 entry."""
+    runner's own choice) when there is no row, the row is not a flydsl one, or
+    it names a compute kernel (no fused quant epilogue; the runner rejects it
+    with ``y_scale_out``). Any other name is passed through as is: a name the
+    flydsl runner does not accept raises there, as it does for the bf16 entry."""
+    from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import is_compute_wmma_kernel_name
+
     cfg = lookup_mxscale_bmm_config(
         g,
         m,
@@ -511,7 +514,8 @@ def _fused_quant_tuned_kernel(
     )
     if cfg is None or cfg["libtype"] != "flydsl":
         return None
-    return cfg["kernelName"]
+    name = cfg["kernelName"]
+    return None if is_compute_wmma_kernel_name(name) else name
 
 
 def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
