@@ -37,6 +37,9 @@ from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
 from .allreduce_policy import (
     AG_CODECS,
+    HIER_CODECS,
+    HIER_SUPER_TILES,
+    HIER_X_CODEC,
     MESH_CODECS,
     MIN_BATCH_BLOCKS,
     PAD_MASK_MAX_BYTES,
@@ -44,11 +47,13 @@ from .allreduce_policy import (
     RS_CODECS,
     SUPER_TILES,
     FusedTwoShotRung,
+    NoPolicyError,
     TwoShotRung,
     default_codecs,
     fused_mesh_st_ladder,
     fused_qr_row_atoms,
     fused_ring_st_ladder,
+    hier_st_ladder,
     mesh_st_ladder,
     quantized_floor,
     resolve_link,
@@ -67,6 +72,7 @@ from .comm_collectives_host_shared import (
     kernel_symbol,
     payload_probes,
     preload_launcher,
+    probe_peer_topology,
     require_arch,
     resolve_inbox_flags,
 )
@@ -78,6 +84,11 @@ from .kernels.comm.quick_allreduce_fusions import (
     quick_reduce_row_block_at,
     quick_reduce_row_block_for,
     quick_reduce_row_block_options,
+)
+from .kernels.comm.quick_allreduce_hier import (
+    check_groups,
+    hier_lds_bytes,
+    make_quick_allreduce_hier_kernel,
 )
 from .kernels.comm.quick_allreduce_mesh import (
     DEFAULT_DIVISOR,
@@ -149,6 +160,9 @@ class _Algorithm:
     # bound the persistent grid by LDS residency as well as by VGPRs; None
     # when the VGPR table is the tighter bound for every codec.
     lds_bytes: Callable[[int, int, str], int] | None = None
+    # Whether the schedule needs the host split into socket groups (the
+    # hierarchical one): its build then takes ``groups`` and ``x_codec``.
+    hierarchical: bool = False
 
 
 def _build_mesh(
@@ -188,6 +202,10 @@ def _build_mesh(
     )
 
 
+def _no_fused_ladder(*, world_size, link, arch=None, hidden=None):
+    raise NoPolicyError("the hierarchical all-reduce has no fused build")
+
+
 ALGORITHMS = {
     "mesh": _Algorithm(
         name="mesh",
@@ -210,6 +228,16 @@ ALGORITHMS = {
         ag_codecs=AG_CODECS,
         st_ladder=ring_st_ladder,
         fused_st_ladder=fused_ring_st_ladder,
+    ),
+    "hier": _Algorithm(
+        name="hier",
+        build=make_quick_allreduce_hier_kernel,
+        super_tiles=HIER_SUPER_TILES,
+        rs_codecs=HIER_CODECS,
+        ag_codecs=HIER_CODECS,
+        st_ladder=hier_st_ladder,
+        fused_st_ladder=_no_fused_ladder,
+        hierarchical=True,
     ),
 }
 
@@ -278,6 +306,13 @@ class FlyQuickAllReduce:
     * ``"ring"``: ``2(N-1)`` hops, each a single contiguous run into exactly
       one peer's inbox. Same wire volume (``2(N-1)/N`` of the payload), traded
       for per-destination locality. Optimal for large messages on PCIe.
+    * ``"hier"``: for hosts whose ranks split into two uniform groups (the
+      CPU sockets of a two-socket PCIe host). A mesh reduce-scatter inside each
+      group, an exchange between partner ranks of the two groups, and a mesh
+      all-gather inside each group; only the exchange crosses groups.
+      ``groups`` gives the split; by default it is detected from the KFD
+      topology (``probe_peer_topology``), and a host that does not split
+      raises. ``x_codec`` is the wire format of the exchange.
 
     ``rs_codec`` and ``ag_codec`` are the wire formats of the ring's two laps.
     The reduce-scatter lap requantizes ``N-1`` times and it defaults to ``"int6"``
@@ -319,6 +354,8 @@ class FlyQuickAllReduce:
         ag_codec: str | None = None,
         link: str | None = None,
         ladder: tuple[TwoShotRung, ...] | None = None,
+        x_codec: str | None = None,
+        groups=None,
     ):
         check_world_size(world_size)
         if algorithm not in ALGORITHMS:
@@ -328,10 +365,42 @@ class FlyQuickAllReduce:
         algo = ALGORITHMS[algorithm]
         link = resolve_link(link)
         rs_codec, ag_codec = _resolve_codecs(algo, int(world_size), rs_codec, ag_codec)
+        if not algo.hierarchical and (x_codec is not None or groups is not None):
+            raise ValueError("x_codec and groups are for algorithm='hier' only")
         _validate_ipc_process_group(
             group, rank=int(rank), world_size=world_size, owner="FlyQuickAllReduce"
         )
         arch = require_arch(owner="FlyQuickAllReduce")
+        self._device_index = _cuda_index(device, owner="FlyQuickAllReduce")
+        # The hierarchical schedule's extra build arguments.
+        build_kw = {}
+        self.x_codec = None
+        self.groups = None
+        if algo.hierarchical:
+            if x_codec is None:
+                x_codec = HIER_X_CODEC
+            if x_codec not in HIER_CODECS:
+                raise ValueError(
+                    f"x_codec must be one of {HIER_CODECS}, got {x_codec!r}"
+                )
+            if groups is None:
+                topo = probe_peer_topology(
+                    group,
+                    rank=int(rank),
+                    world_size=int(world_size),
+                    device_index=self._device_index,
+                )
+                if len(topo.groups) != 2:
+                    raise ValueError(
+                        f"algorithm='hier' needs the ranks to split into two "
+                        f"uniform groups; the topology ({topo.source}) gives "
+                        f"{topo.groups}"
+                    )
+                groups = topo.groups
+            groups = check_groups(groups, int(world_size))
+            self.x_codec = x_codec
+            self.groups = groups
+            build_kw = {"groups": groups, "x_codec": x_codec}
         if ladder is None:
             ladder = algo.st_ladder(world_size=world_size, link=link, arch=arch)
         if not ladder:
@@ -339,7 +408,6 @@ class FlyQuickAllReduce:
         inbox_flags, resolved_inbox = resolve_inbox_flags(
             inbox_memory, world_size, link
         )
-        self._device_index = _cuda_index(device, owner="FlyQuickAllReduce")
         self.group = group
         self.device = torch.device("cuda", self._device_index)
         self.rank = int(rank)
@@ -400,11 +468,22 @@ class FlyQuickAllReduce:
                     grid = clamp_grid_cap(
                         caps[key],
                         arch=arch,
-                        world_size=self.world_size,
+                        # The hierarchical kernel's registers are those of a
+                        # mesh over one group.
+                        world_size=(
+                            len(self.groups[0])
+                            if algo.hierarchical
+                            else self.world_size
+                        ),
                         super_tile=st,
                         cu_count=cu_count,
                         block=b,
                     )
+                    if algo.hierarchical:
+                        wg_lds = hier_lds_bytes(
+                            b, len(self.groups[0]), rs_codec, x_codec, ag_codec
+                        )
+                        grid = min(grid, max(1, lds_capacity // wg_lds) * cu_count)
                     if algo.lds_bytes is not None:
                         # The VGPR table assumes INT4's rank-tile; a wider
                         # codec can run out of LDS first.
@@ -421,6 +500,7 @@ class FlyQuickAllReduce:
                         rs_codec=rs_codec,
                         ag_codec=ag_codec,
                         block=b,
+                        **build_kw,
                     )
                     if spec["lds_bytes"] > lds_capacity:
                         raise ValueError(
@@ -638,6 +718,8 @@ class FlyQuickAllReduce:
         cfg, num_tiles = self._pick_cfg(int(nbytes))
         eng = self._by_cfg[cfg]
         codecs = codecs_for_block(eng.block)
+        if self._algo.hierarchical:
+            return self._hier_traffic(int(nbytes), eng, num_tiles, codecs)
         per_pair_tiles = num_tiles * (ATOMS // self.world_size)
         ring = self.algorithm == "ring"
 
@@ -658,6 +740,37 @@ class FlyQuickAllReduce:
             logical_bytes=int(nbytes),
             phases=(lap(self.rs_codec), lap(self.ag_codec)),
             rccl=(RcclCall("all_reduce", int(nbytes), "bf16"),),
+            pipelined=True,
+        )
+
+    def _hier_traffic(self, nbytes: int, eng, num_tiles: int, codecs) -> Traffic:
+        """The hierarchical schedule's three laps: ``ATOMS / G`` rank-tiles per
+        tile to every other rank of the group, the same to the partner in the
+        exchange codec, and the all-gather like the first lap."""
+        per_pair_tiles = num_tiles * (ATOMS // len(self.groups[0]))
+
+        def lap(pattern: Pattern, codec: str) -> Phase:
+            return Phase(
+                pattern=pattern,
+                chunk_bytes=per_pair_tiles * codecs[codec].rank_tile_bytes,
+                include_self=False,
+                repeat=1,
+                peer_mem=PeerMem(self.inbox_memory),
+                workgroups=self._grid_x(num_tiles, eng.super_tile, eng.grid),
+                waves_per_workgroup=eng.block // WAVE,
+                groups=self.groups,
+            )
+
+        return Traffic(
+            world_size=self.world_size,
+            collective="all_reduce",
+            logical_bytes=nbytes,
+            phases=(
+                lap(Pattern.PUSH_GROUP, self.rs_codec),
+                lap(Pattern.PUSH_PARTNER, self.x_codec),
+                lap(Pattern.PUSH_GROUP, self.ag_codec),
+            ),
+            rccl=(RcclCall("all_reduce", nbytes, "bf16"),),
             pipelined=True,
         )
 
@@ -823,6 +936,11 @@ class FlyQuickAllReduceRMSNorm:
                 f"algorithm must be one of {tuple(ALGORITHMS)}, got {algorithm!r}"
             )
         algo = ALGORITHMS[algorithm]
+        if algo.hierarchical:
+            raise ValueError(
+                f"FlyQuickAllReduceRMSNorm has no {algorithm!r} build; use "
+                "'mesh' or 'ring'"
+            )
         if super_tile is not None and super_tile not in algo.super_tiles:
             raise ValueError(
                 f"super_tile must be one of {algo.super_tiles} for "

@@ -176,6 +176,7 @@ from aiter.ops.flydsl.allreduce_policy import (
     SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
     TwoShotRung,
+    hier_st_ladder,
     mesh_st_ladder,
     ring_st_ladder,
 )
@@ -193,7 +194,9 @@ from aiter.ops.flydsl.quick_allreduce import (
 )
 
 ARCH = get_gfx()
-ALGORITHMS = ("mesh", "ring")
+ALGORITHMS = ("mesh", "ring", "hier")
+# The schedules that have a fused all-reduce + RMSNorm build.
+FUSED_ALGORITHMS = ("mesh", "ring")
 
 # One SQNR floor for both schedules, in their shipping configuration.
 #
@@ -297,6 +300,8 @@ EDGE_CASES = (
     (2, "mesh", 16, 1024, "zeros"),
     (2, "mesh", 512, 5120, "degenerate"),
     (8, "ring", 512, 5120, "degenerate"),
+    (8, "hier", 512, 5120, "large_every_rank"),
+    (8, "hier", 512, 5120, "degenerate"),
 )
 
 # (tp, algorithm, tokens, hidden, rs_codec, ag_codec). ``--extended`` only:
@@ -464,15 +469,42 @@ def _num_tiles(nbytes: int, block: int) -> int:
 def _ladder(algorithm: str, world_size: int, link: str) -> tuple:
     if algorithm == "mesh":
         return mesh_st_ladder(world_size=world_size, link=link)
+    if algorithm == "hier":
+        return hier_st_ladder(world_size=world_size, link=link)
     return ring_st_ladder(world_size=world_size, link=link)
+
+
+def _host_groups(world_size: int):
+    """The two socket groups the first *world_size* GPUs split into, as
+    production dispatch would find them (``AITER_FLY_AR_GROUPS`` first), or
+    None when they do not split into two."""
+    from aiter.ops.flydsl import comm_collectives_host_shared as H
+
+    text = os.environ.get(H.GROUPS_ENV, "").strip()
+    if text:
+        groups = H.parse_groups_env(text, world_size)
+    else:
+        nodes = [H.kfd_node_of_device(i) for i in range(int(world_size))]
+        weights = None if None in nodes else H.kfd_link_weights(nodes)
+        groups = None if weights is None else H.socket_groups(weights)
+    return groups if groups is not None and len(groups) == 2 else None
+
+
+def _policy(world_size: int, link: str):
+    """The plain policy production dispatch runs on this host: the table row
+    with its overrides, and the hierarchical window on when the GPUs split."""
+    policy = fly_policy.resolve_family_policy(world_size=world_size, link=link)
+    return policy.with_topology(hierarchical=_host_groups(world_size) is not None)
 
 
 def _ships(world_size: int, algorithm: str, link: str) -> bool:
     """Whether production has a ladder for algorithm at world_size on this
     host. A schedule without one is never built, so nothing that runs the
     shipped ladder sweeps it. The pinned-ladder transport cases still run its
-    kernel."""
+    kernel. The hierarchical schedule also needs the GPUs to split."""
     table = fly_policy.LADDERS[fly_policy.AllReduceAlgorithm(algorithm)]
+    if algorithm == "hier" and _host_groups(world_size) is None:
+        return False
     return (ARCH, link, int(world_size)) in table
 
 
@@ -605,7 +637,7 @@ def _ship_payloads(
     at ``TOP_PAYLOAD_BYTES``) for a production-scale timing row. The window
     comes back so the run can check that kernel list against the engine's own.
     """
-    policy = fly_policy.resolve_family_policy(world_size=world_size, link=link)
+    policy = _policy(world_size, link)
     window = policy.window(fly_policy.AllReduceAlgorithm(algorithm), quantized=True)
     if window is not None:
         lo, hi = window.inclusive_range()
@@ -620,6 +652,7 @@ def _ship_payloads(
         for alg in (
             fly_policy.AllReduceAlgorithm.TwoShotMesh,
             fly_policy.AllReduceAlgorithm.TwoShotRing,
+            fly_policy.AllReduceAlgorithm.TwoShotHierarchical,
         )
         if (w := policy.window(alg, quantized=True)) is not None
     ]
@@ -1504,6 +1537,8 @@ def _transport_key(
     """The fp16-wire engine: the schedule's own ladder when *super_tile* is
     None, otherwise that geometry pinned at ``TRANSPORT_GRID_CAP``."""
     kw = {"algorithm": algorithm, "rs_codec": "fp16", "ag_codec": "fp16"}
+    if algorithm == "hier":
+        kw["x_codec"] = "fp16"
     if super_tile is not None:
         kw.update(
             super_tile=super_tile,
@@ -3924,6 +3959,7 @@ def _verify(args, tps, algos, dts, link) -> None:
 def _verify_fused(tps, algos, extended: bool) -> None:
     """The fused (all-reduce + residual add + RMSNorm) verify sweeps. The
     mesh-only rows need the mesh among the requested schedules."""
+    algos = [a for a in algos if a in FUSED_ALGORITHMS]
     pad = [c for c in _FUSED_PAD_CASES if c[0] in tps]
     pad_exact = [c for c in _FUSED_PAD_EXACT_CASES if c[0] in tps]
     mesh = "mesh" in algos
@@ -4499,6 +4535,7 @@ def bench_quick_allreduce_rmsnorm(
 
 
 def _bench_fused(args, tps, algos, link) -> None:
+    algos = tuple(a for a in algos if a in FUSED_ALGORITHMS)
     extra = _candidates(args, "ar_rmsnorm", algos)
     mxfp4 = args.mxfp4
     if mxfp4 and ARCH != "gfx950":
@@ -4723,7 +4760,7 @@ def _bench(args, tps, algos, link) -> None:
         else:
             payloads = {n for a in shipped for n in _ship_payloads(tp, a, link)[0]}
             shapes = [(n // _ROW_BYTES, HIDDEN) for n in sorted(payloads)]
-        policy = fly_policy.resolve_family_policy(world_size=tp, link=link)
+        policy = _policy(tp, link)
         for grid_cap, block in itertools.product(args.grid_cap, args.block):
             # Every case of a spawn is registered before its first result.
             for shape in shapes:

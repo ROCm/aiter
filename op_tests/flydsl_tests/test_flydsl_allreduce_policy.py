@@ -65,6 +65,7 @@ CELLS = [
 ONESHOT = AllReduceAlgorithm.OneShot
 MESH = AllReduceAlgorithm.TwoShotMesh
 RING = AllReduceAlgorithm.TwoShotRing
+HIER = AllReduceAlgorithm.TwoShotHierarchical
 
 
 def _row(link, ws, arch):
@@ -176,7 +177,13 @@ def test_ladders_match_the_windows(alg):
     windowed = sorted(
         (arch, link, ws)
         for link, ws, arch in CELLS
-        if _row(link, ws, arch).window(alg, quantized=True) is not None
+        if any(
+            row.window(alg, quantized=True) is not None
+            for row in (
+                _row(link, ws, arch),
+                _row(link, ws, arch).with_topology(hierarchical=True),
+            )
+        )
     )
     assert sorted(P.LADDERS[alg]) == windowed
 
@@ -344,10 +351,6 @@ def test_window_overrides():
         p = _resolve()
         assert p.window(MESH, quantized=True).max is None
         assert p.window(RING, quantized=True) is None
-    # gfx950/PCIe TP8 has a ring: an unbounded mesh would overlap it.
-    with _env(AITER_FLY_AR_MESH_MAX_BYTES="None", AITER_FLY_AR_RING_MAX_BYTES="0"):
-        p = _resolve(ws=8)
-        assert p.window(MESH, quantized=True).max is None
 
 
 def test_link_variable_backs_up_an_unreadable_probe():
@@ -409,6 +412,30 @@ def test_override_cannot_enable_an_algorithm_without_a_ladder(cell):
     assert p.select(1 << 30, quantized=True) is None
     warning.assert_called_once()
     assert warning.call_args.args[1] == "RING"
+
+
+def test_mesh_is_the_fallback_of_a_host_that_does_not_split():
+    """PCIe TP8 runs the mesh unless the host splits into two groups. The mesh
+    variables move that fallback, and on a split host they are ignored with a
+    warning."""
+    var = "AITER_FLY_AR_MESH_MIN_BYTES"
+    flat = _resolve(ws=8)
+    assert flat.window(MESH, quantized=True) == Window(96 << 10, 24 << 20)
+    assert (
+        flat.with_topology(hierarchical=False).select(1 << 20, quantized=True) == MESH
+    )
+    with mock.patch.object(P.logger, "warning") as w:
+        split = flat.with_topology(hierarchical=True)
+    w.assert_not_called()
+    assert split.window(MESH, quantized=True) is None
+    with _env(**{var: str(256 << 10)}):
+        flat = _resolve(ws=8)
+        assert flat.window(MESH, quantized=True) == Window(256 << 10, 24 << 20)
+        with mock.patch.object(P.logger, "warning") as w:
+            split = flat.with_topology(hierarchical=True)
+    w.assert_called_once()
+    assert var in w.call_args.args[1]
+    assert split.window(MESH, quantized=True) is None
 
 
 def test_equal_bounds_disable():
@@ -1307,3 +1334,122 @@ def test_old_ipc_module_name_still_imports():
     from aiter.ops.flydsl.quick_allreduce_int4_ipc import UncachedIpcHeap as Old
 
     assert Old is UncachedIpcHeap
+
+
+# The hierarchical schedule
+# =========================
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_flat_host_never_selects_hier(cell):
+    """A table row is the policy of a host that does not split: the
+    hierarchical window stays off until ``with_topology`` turns it on."""
+    for row in (_row(*cell), _row(*cell).with_topology(hierarchical=False)):
+        assert row.window(HIER, quantized=True) is None
+        assert HIER not in row.algorithms(quantized=True)
+        for k in range(4, 33):
+            assert row.select(1 << k, quantized=True) != HIER
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_hier_takes_its_window_first_on_a_split_host(cell):
+    """On a split host every payload of the hier window runs hier and the rest
+    runs what the flat host runs, so the mesh window lies inside the hier one."""
+    flat = _row(*cell)
+    split = flat.with_topology(hierarchical=True)
+    hier = flat.hier
+    if hier is None:
+        assert split == dataclasses.replace(flat, hierarchical=False)
+        return
+    assert split.mesh is None
+    for k in range(4, 33):
+        n = 1 << k
+        if hier.contains(n):
+            assert split.select(n, quantized=True) == HIER
+        else:
+            assert split.select(n, quantized=True) == flat.select(n, quantized=True)
+
+
+def _weights(n, group_of, near=40, far=72):
+    return [
+        [
+            0 if i == j else (near if group_of(i) == group_of(j) else far)
+            for j in range(n)
+        ]
+        for i in range(n)
+    ]
+
+
+@pytest.mark.parametrize(
+    "weights, want",
+    [
+        # The MI350P host: two sockets of four.
+        (_weights(8, lambda r: r // 4), ((0, 1, 2, 3), (4, 5, 6, 7))),
+        # Interleaved rank order.
+        (_weights(8, lambda r: r % 2), ((0, 2, 4, 6), (1, 3, 5, 7))),
+        # TP4 across the sockets (GPUs 0, 1, 4, 5).
+        (_weights(4, lambda r: r // 2), ((0, 1), (2, 3))),
+        # A uniform xGMI mesh is flat.
+        (_weights(8, lambda r: 0, near=15), ((0, 1, 2, 3, 4, 5, 6, 7),)),
+        # Unequal groups are flat.
+        (_weights(8, lambda r: r < 5), ((0, 1, 2, 3, 4, 5, 6, 7),)),
+        # Singleton groups are flat.
+        (_weights(4, lambda r: r), ((0, 1, 2, 3),)),
+    ],
+)
+def test_socket_groups(weights, want):
+    assert H.socket_groups(weights) == want
+
+
+def test_socket_groups_needs_one_far_weight():
+    """Two different cross-group weights are not a uniform split."""
+    w = _weights(8, lambda r: r // 4)
+    w[0][4] = w[4][0] = 80
+    assert H.socket_groups(w) == (tuple(range(8)),)
+
+
+def test_peer_topology_partner():
+    topo = H.PeerTopology(groups=((0, 2, 4, 6), (1, 3, 5, 7)))
+    assert topo.is_hierarchical
+    assert [topo.partner(r) for r in range(8)] == [1, 0, 3, 2, 5, 4, 7, 6]
+    assert topo.local_index(5) == 2
+    assert not H.PeerTopology(groups=(tuple(range(8)),)).is_hierarchical
+
+
+@pytest.mark.parametrize(
+    "text, want",
+    [
+        ("0,1,2,3;4,5,6,7", ((0, 1, 2, 3), (4, 5, 6, 7))),
+        (" 2,3 ; 0,1 ", ((0, 1), (2, 3))),
+    ],
+)
+def test_parse_groups_env(text, want):
+    assert H.parse_groups_env(text, len([r for g in want for r in g])) == want
+
+
+@pytest.mark.parametrize("text", ["0,1;2", "0,1;1,2,3", "a,b;c,d"])
+def test_parse_groups_env_rejects(text):
+    with pytest.raises(ValueError):
+        H.parse_groups_env(text, 4)
+
+
+def test_kfd_link_weights_from_a_fake_tree(tmp_path):
+    """Weights come from ``io_links`` and ``p2p_links`` alike."""
+    for node, links in {
+        2: [("io_links", 0, 20), ("p2p_links", 3, 40), ("p2p_links", 4, 72)],
+        3: [("p2p_links", 2, 40), ("p2p_links", 4, 72)],
+        4: [("io_links", 2, 72), ("p2p_links", 3, 72)],
+    }.items():
+        for k, (sub, to, weight) in enumerate(links):
+            d = tmp_path / str(node) / sub / str(k)
+            d.mkdir(parents=True)
+            (d / "properties").write_text(
+                f"type 2\nnode_from {node}\nnode_to {to}\nweight {weight}\n"
+            )
+    assert H.kfd_link_weights([2, 3, 4], root=tmp_path) == [
+        [0, 40, 72],
+        [40, 0, 72],
+        [72, 72, 0],
+    ]
+    # A pair with no link at all: unknown.
+    assert H.kfd_link_weights([2, 3, 5], root=tmp_path) is None

@@ -43,6 +43,11 @@ class Pattern(str, Enum):
     PULL_ALL = "pull_all"  # rank i reads a chunk from every rank j's buffer
     PUSH_NEXT = "push_next"  # rank i writes a chunk into rank (i + 1) % N
     PULL_PREV = "pull_prev"  # rank i reads a chunk from rank (i - 1) % N
+    # With ``Phase.groups``: rank i writes a chunk into every other rank of
+    # its own group, or into its partner, the rank at the same position of
+    # the other group (two groups).
+    PUSH_GROUP = "push_group"
+    PUSH_PARTNER = "push_partner"
 
 
 @dataclass(frozen=True)
@@ -54,7 +59,8 @@ class Phase:
     adds the chunk a rank moves into its own buffer, as an all-to-all does.
     ``repeat`` counts identical steps in a row, such as the ``N - 1`` hops of
     a ring lap. ``workgroups`` and ``waves_per_workgroup`` are the launch
-    geometry of the kernel running this phase.
+    geometry of the kernel running this phase. ``groups`` splits the ranks
+    for the ``PUSH_GROUP`` and ``PUSH_PARTNER`` patterns, which need it.
     """
 
     pattern: Pattern
@@ -64,11 +70,21 @@ class Phase:
     peer_mem: PeerMem
     workgroups: int
     waves_per_workgroup: int
+    groups: tuple[tuple[int, ...], ...] | None = None
 
     def __post_init__(self):
         for name in ("chunk_bytes", "repeat", "workgroups", "waves_per_workgroup"):
             if int(getattr(self, name)) < 1:
                 raise ValueError(f"Phase.{name} must be positive, got {self}")
+        grouped = self.pattern in (Pattern.PUSH_GROUP, Pattern.PUSH_PARTNER)
+        if grouped != (self.groups is not None):
+            raise ValueError(
+                f"groups goes with the *_GROUP/*_PARTNER patterns, got {self}"
+            )
+        if self.pattern == Pattern.PUSH_PARTNER and (
+            len(self.groups) != 2 or len(self.groups[0]) != len(self.groups[1])
+        ):
+            raise ValueError(f"PUSH_PARTNER needs two groups of one size, got {self}")
         if self.include_self and self.pattern not in (
             Pattern.PUSH_ALL,
             Pattern.PULL_ALL,
@@ -116,7 +132,8 @@ class Traffic:
             raise ValueError(f"collective must be one of {COLLECTIVES}, got {self}")
         if self.world_size < 2 or not self.phases:
             raise ValueError(f"Traffic needs world_size >= 2 and phases, got {self}")
-        if self.pipelined and len(
-            {(p.workgroups, p.waves_per_workgroup) for p in self.phases}
-        ) != 1:
+        if (
+            self.pipelined
+            and len({(p.workgroups, p.waves_per_workgroup) for p in self.phases}) != 1
+        ):
             raise ValueError(f"pipelined phases share one launch grid, got {self}")
