@@ -423,8 +423,8 @@ RMS_EPS = 1e-6
 CANDIDATE_KNOBS = {
     ("oneshot", "ar"): ("atoms", "grid_cap", "fanout", "block"),
     ("oneshot", "ar_rmsnorm"): ("atoms", "grid_cap", "fanout", "block", "split"),
-    ("mesh", "ar"): ("super_tile", "grid_cap", "block"),
-    ("ring", "ar"): ("super_tile", "grid_cap", "block"),
+    ("mesh", "ar"): ("super_tile", "grid_cap", "block", "handshake"),
+    ("ring", "ar"): ("super_tile", "grid_cap", "block", "handshake"),
     ("mesh", "ar_rmsnorm"): (
         "super_tile",
         "grid_cap",
@@ -446,10 +446,11 @@ _CANDIDATE_COLUMNS = (
     "super_tile",
     "atoms_per_row",
     "low_latency",
+    "handshake",
     "sets",
 )
 # Columns a candidate file may leave out; a missing one is empty on every row.
-_OPTIONAL_CANDIDATE_COLUMNS = ("low_latency",)
+_OPTIONAL_CANDIDATE_COLUMNS = ("low_latency", "handshake")
 
 
 @dataclass(frozen=True)
@@ -474,7 +475,8 @@ def load_candidates(
 
     A candidate file is a CSV with the columns ``name, operation, algorithm``,
     one column per knob (``atoms, grid_cap, fanout, block, split, super_tile,
-    atoms_per_row``, and the optional ``low_latency``, 0 or 1) and ``sets``. ``operation`` is ``ar`` or ``ar_rmsnorm``,
+    atoms_per_row``, the optional ``low_latency``, 0 or 1, and the optional
+    ``handshake``, ``flag`` or ``lamport``) and ``sets``. ``operation`` is ``ar`` or ``ar_rmsnorm``,
     ``algorithm`` is ``oneshot``, ``mesh`` or ``ring``. A knob cell is empty
     when the row leaves it to the engine, and a row may only pin the knobs of
     its algorithm and operation (``CANDIDATE_KNOBS``). ``sets`` is a list of
@@ -508,7 +510,7 @@ def load_candidates(
                     f"{path} row {i} ({row['name']}): {col} is not a knob of "
                     f"{key[0]} {key[1]}"
                 )
-            if col == "fanout":
+            if col in ("fanout", "handshake"):
                 knobs[col] = cell
             elif col == "low_latency":
                 if cell not in ("0", "1"):

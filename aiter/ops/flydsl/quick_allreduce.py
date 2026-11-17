@@ -37,6 +37,7 @@ from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
 from .allreduce_policy import (
     AG_CODECS,
+    HANDSHAKES,
     MESH_CODECS,
     MIN_BATCH_BLOCKS,
     PAD_MASK_MAX_BYTES,
@@ -164,6 +165,7 @@ def _build_mesh(
     h_pad=None,
     mxfp4=False,
     low_latency=False,
+    handshake="flag",
 ):
     if rs_codec != ag_codec:
         raise ValueError(
@@ -183,6 +185,7 @@ def _build_mesh(
         h_pad=h_pad,
         mxfp4=mxfp4,
         low_latency=low_latency,
+        handshake=handshake,
     )
 
 
@@ -301,6 +304,11 @@ class FlyQuickAllReduce:
     when not given. ``ladder`` replaces the tuning ladder of the policy, for
     tests that run other configurations. Both schedules specialise their
     binary to this rank, so the JIT symbol carries an ``_r<n>_`` field.
+
+    ``handshake`` is how a receiver learns that a packet has landed:
+    ``"flag"`` (default), a colour written after the drained payload, or
+    ``"lamport"``, the packet words themselves against a sentinel (see
+    ``allreduce_policy.HANDSHAKES``).
     """
 
     def __init__(
@@ -317,8 +325,13 @@ class FlyQuickAllReduce:
         ag_codec: str | None = None,
         link: str | None = None,
         ladder: tuple[TwoShotRung, ...] | None = None,
+        handshake: str = "flag",
     ):
         check_world_size(world_size)
+        if handshake not in HANDSHAKES:
+            raise ValueError(
+                f"handshake must be one of {HANDSHAKES}, got {handshake!r}"
+            )
         if algorithm not in ALGORITHMS:
             raise ValueError(
                 f"algorithm must be one of {tuple(ALGORITHMS)}, got {algorithm!r}"
@@ -345,6 +358,7 @@ class FlyQuickAllReduce:
         self.link = link
         self.inbox_memory = resolved_inbox
         self.algorithm = algorithm
+        self.handshake = handshake
         self.rs_codec = rs_codec
         self.ag_codec = ag_codec
         self._algo = algo
@@ -419,6 +433,7 @@ class FlyQuickAllReduce:
                         rs_codec=rs_codec,
                         ag_codec=ag_codec,
                         block=b,
+                        handshake=handshake,
                     )
                     if spec["lds_bytes"] > lds_capacity:
                         raise ValueError(
