@@ -461,7 +461,8 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
     otherwise so a caller can fall back to the bf16 GEMM + ``quantize_fp8``.
     On gfx950 the shape's flydsl tuned row, the one the bf16 entry runs,
     picks the tile; an opus row or none leaves the choice to the runner, as
-    does every other arch.
+    does every other arch. A gfx950 row the fused epilogue would run slower
+    (``_fused_quant_falls_back``) runs as bf16 plus the same quant instead.
     """
     from .flydsl.batched_gemm_a8w8 import (
         bmm_a8w8_mxfp8_fused_quant_supported,
@@ -476,18 +477,33 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
             f"fused output quant unsupported for a {w_scale_block} w_scale on "
             f"{get_gfx()}; use batched_gemm_a8w8_mxscale_bpreshuffle + quantize_fp8"
         )
-    y8 = torch.empty((m, g, n), dtype=dtypes.fp8, device=x.device)
-    y_scale = torch.empty((m, g * n // 32), dtype=torch.float8_e8m0fnu, device=x.device)
     from .opus._arch import _device_arch_and_cu
 
     gfx, cu_num = _device_arch_and_cu(x.device)
+    kernel_name = _fused_quant_tuned_kernel(g, m, n, k, w_scale_block, gfx, cu_num)
+    if kernel_name is not None and gfx == "gfx950":
+        from .flydsl.batched_gemm_a8w8_gfx950 import _fused_quant_falls_back
+
+        if _fused_quant_falls_back(kernel_name):
+            # The row's split-K bf16 kernel, then the group-32 quant the
+            # epilogue applies (byte-identical), returned without a copy.
+            from .quant import per_1x32_mx_quant_hip
+
+            y = torch.empty((m, g, n), dtype=dtypes.bf16, device=x.device)
+            run_bmm_a8w8_mxfp8(x, wo_a, x_scale, w_scale, y, kernel_name=kernel_name)
+            q, s = per_1x32_mx_quant_hip(
+                y.view(m, g * n), quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+            )
+            return q.view(m, g, n), s
+    y8 = torch.empty((m, g, n), dtype=dtypes.fp8, device=x.device)
+    y_scale = torch.empty((m, g * n // 32), dtype=torch.float8_e8m0fnu, device=x.device)
     run_bmm_a8w8_mxfp8(
         x,
         wo_a,
         x_scale,
         w_scale,
         y8,
-        kernel_name=_fused_quant_tuned_kernel(g, m, n, k, w_scale_block, gfx, cu_num),
+        kernel_name=kernel_name,
         y_scale_out=y_scale.view(torch.uint8),
     )
     return y8, y_scale

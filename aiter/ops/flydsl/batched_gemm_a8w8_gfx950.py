@@ -450,8 +450,16 @@ def run_bmm_a8w8_mxfp8_gfx950(
     )
     return Out
 
+
 _FUSED_LARGE_M = 1024
 _FUSED_LARGE_M_KERNEL = BMM_MFMA_NAME_PREFIX + "_t128x256x128_w1x4_nb3_sk1_bd2_xcd"
+
+
+def _fused_quant_falls_back(name: str) -> bool:
+    cfg = _launch_config(name)
+    return (
+        cfg is not None and cfg["splits"] >= 4 and cfg["tile_m"] * cfg["tile_n"] >= 2048
+    )
 
 
 @functools.lru_cache(maxsize=1024)
