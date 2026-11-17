@@ -44,6 +44,8 @@ path.
 
 import contextlib
 from collections import ChainMap, OrderedDict
+from operator import itemgetter
+from typing import Any, NamedTuple
 
 import torch
 from triton import knobs
@@ -118,6 +120,35 @@ def _wide_int_spec(v: int) -> str:
     return width if v & 15 else width + "D"
 
 
+def _tensor_spec(v) -> tuple:
+    """What `HIPBackend.get_tensor_specialization` reads off a tensor."""
+    return (v.dtype, v.data_ptr() % 16 == 0, v.untyped_storage().nbytes() <= _MAX_INT32)
+
+
+def _picker(positions):
+    """`values -> tuple(values[i] for i in positions)`."""
+    if len(positions) > 1:
+        return itemgetter(*positions)
+    if positions:
+        (i,) = positions
+        return lambda values: (values[i],)
+    return lambda values: ()
+
+
+class _Entry(NamedTuple):
+    """What a launch with a key it has seen needs."""
+
+    compiled: CompiledKernel
+    names: tuple
+    # The parameters the call site leaves out (defaults, autotuner choices).
+    frozen: dict
+    run: Any
+    function: Any
+    metadata: Any
+    # The parameters after the call site's positional arguments.
+    rest: tuple
+
+
 class _FastLaunch:
     """A kernel that remembers what it compiled for a given key."""
 
@@ -141,7 +172,16 @@ class _FastLaunch:
         runtime = [not p.is_constexpr for p in jit.params]
         self._runtime_at = tuple(runtime)
         self._runtime_named = {p.name: r for p, r in zip(jit.params, runtime)}
+        # (number of positional arguments, *keyword names) -> `_pickers`.
+        self._layouts = {}
+        # Types of the constexpr arguments of a launch, seen without a tensor.
+        self._tensorless = set()
         self._disabled = False
+        # Bound on the first launch, which assumes the active driver is not
+        # swapped afterwards. The device and the stream are still asked for on
+        # every launch.
+        self._get_device = None
+        self._get_stream = None
 
     def __getitem__(self, grid):
         def launch(*args, **kwargs):
@@ -152,7 +192,11 @@ class _FastLaunch:
                 return self._kernel[grid](*args, **kwargs)
             if self._disabled or _BYPASS or not self._plain():
                 return self._kernel[grid](*args, **kwargs)
-            device = driver.active.get_current_device()
+            get_device = self._get_device
+            if get_device is None:
+                get_device = self._get_device = driver.active.get_current_device
+                self._get_stream = driver.active.get_current_stream
+            device = get_device()
             try:
                 key = self._key(device, args, kwargs)
                 entry = self._cache.get(key)
@@ -163,29 +207,29 @@ class _FastLaunch:
                 self._disabled = True
                 return self._kernel[grid](*args, **kwargs)
 
-            if entry is None or self._globals_changed():
+            if entry is None or (
+                self._jit.used_global_vals and self._globals_changed()
+            ):
                 return self._capture(grid, args, kwargs, key)
             self._cache.move_to_end(key)
 
-            compiled, names, frozen = entry
-            rest = names[len(args) :]
+            compiled, names, frozen, run, function, metadata, rest = entry
             # Rebuilt per call rather than captured: keeping the bound arguments
             # pinned every tensor of the call that created the entry, and handed
             # a shape-dependent grid the extents of a call already returned.
-            if callable(grid):
+            if type(grid) is not tuple and callable(grid):
                 g = grid(ChainMap(dict(zip(names, args)), kwargs, frozen))
             else:
                 g = grid
-            # Not hoisted: capture redirects work onto its own stream, so the
-            # answer changes under torch.cuda.graph.
-            stream = driver.active.get_current_stream(device)
-            compiled.run(
+            run(
                 g[0],
                 g[1] if len(g) > 1 else 1,
                 g[2] if len(g) > 2 else 1,
-                stream,
-                compiled.function,
-                compiled.packed_metadata,
+                # Not hoisted: capture redirects work onto its own stream, so
+                # the answer changes under torch.cuda.graph.
+                self._get_stream(device),
+                function,
+                metadata,
                 None,
                 None,
                 None,
@@ -214,46 +258,85 @@ class _FastLaunch:
 
     def _key(self, device, args, kwargs) -> tuple:
         """Flat: a tensor adds three or five items, any other argument two (a
-        type and a value or class), so the layout is unambiguous."""
-        buffer_ops = knobs.amd.use_buffer_ops
+        type and a value or class), so the layout is unambiguous. With
+        by_specialization the constexpr arguments come right after the header,
+        as one tuple of values (a tensor's `_tensor_spec` in place of the
+        tensor) and one of their types; the runtime arguments follow."""
+        n_args = len(args)
         key = [
             device,
             knobs.runtime.debug,
             knobs.compilation.instrumentation_mode,
             knobs.compilation.fpsan_homomorphic_casts if _FPSAN else None,
-            buffer_ops,
-            len(args),
+            knobs.amd.use_buffer_ops,
+            n_args,
             *kwargs,
         ]
         append = key.append
-        wrapped = self._wrapped
-        runtime = self._runtime(len(args), kwargs) if self._by_spec else None
-        for i, v in enumerate(args + tuple(kwargs.values()) if kwargs else args):
+        values = (*args, *kwargs.values()) if kwargs else args
+        if not self._by_spec:
+            wrapped = self._wrapped
+            for v in values:
+                if isinstance(v, _Tensor):
+                    append(v.dtype)
+                    append(v.data_ptr() % 16 == 0)
+                    append(v.untyped_storage().nbytes() <= _MAX_INT32)
+                    if wrapped:
+                        append(tuple(v.shape))
+                        append(v.stride())
+                    continue
+                append(type(v))
+                append(v)
+            return tuple(key)
+
+        layout = (n_args, *kwargs)
+        pickers = self._layouts.get(layout)
+        if pickers is None:
+            pickers = self._layouts[layout] = self._pickers(n_args, kwargs)
+        pick_runtime, pick_constexpr = pickers
+        constexprs = pick_constexpr(values)
+        types = tuple(map(type, constexprs))
+        if types not in self._tensorless:
+            if any(issubclass(t, _Tensor) for t in types):
+                # By value a tensor would key on its identity and stay alive in
+                # the cache.
+                constexprs = tuple(
+                    _tensor_spec(v) if isinstance(v, _Tensor) else v for v in constexprs
+                )
+            else:
+                self._tensorless.add(types)
+        append(constexprs)
+        append(types)
+        for v in pick_runtime(values):
             if isinstance(v, _Tensor):
                 append(v.dtype)
                 append(v.data_ptr() % 16 == 0)
                 append(v.untyped_storage().nbytes() <= _MAX_INT32)
-                if wrapped:
-                    append(tuple(v.shape))
-                    append(v.stride())
                 continue
             cls = type(v)
             append(cls)
-            if runtime is not None and runtime[i]:
-                if cls is int:
-                    # The common i32 case inline: is it 1, else is it aligned.
-                    if v == 1:
-                        append("1")
-                    elif _MIN_INT32 <= v <= _MAX_INT32:
-                        append(not v & 15)
-                    else:
-                        append(_wide_int_spec(v))
-                    continue
-                if cls is float or cls is bool:
-                    append(None)
-                    continue
-            append(v)
+            if cls is int:
+                # The common i32 case inline: is it 1, else is it aligned.
+                if v == 1:
+                    append("1")
+                elif _MIN_INT32 <= v <= _MAX_INT32:
+                    append(not v & 15)
+                else:
+                    append(_wide_int_spec(v))
+            elif cls is float or cls is bool:
+                append(None)
+            else:
+                append(v)
         return tuple(key)
+
+    def _pickers(self, n_args: int, kwargs) -> tuple:
+        """For a call-site layout, a picker of its runtime arguments and one of
+        its constexpr arguments."""
+        runtime = self._runtime(n_args, kwargs)
+        return (
+            _picker([i for i, r in enumerate(runtime) if r]),
+            _picker([i for i, r in enumerate(runtime) if not r]),
+        )
 
     def _runtime(self, n_args: int, kwargs) -> tuple:
         """Per argument of a launch, whether it is a non-constexpr parameter."""
@@ -302,7 +385,15 @@ class _FastLaunch:
         frozen = {
             n: v for n, v in list(bound_args.items())[len(args) :] if n not in kwargs
         }
-        self._cache[key] = (compiled, names, frozen)
+        self._cache[key] = _Entry(
+            compiled,
+            names,
+            frozen,
+            compiled.run,
+            compiled.function,
+            compiled.packed_metadata,
+            names[len(args) :],
+        )
         while len(self._cache) > _MAX_ENTRIES:
             self._cache.popitem(last=False)
         return compiled

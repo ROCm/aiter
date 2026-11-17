@@ -156,7 +156,7 @@ def test_entries_do_not_pin_their_inputs():
     for wrapper in _wrapped():
         for entry in wrapper._cache.values():
             entries += 1
-            held = [v for part in entry[2:] for v in part.values()]
+            held = [*entry, *entry.frozen.values()]
             tensors = [v for v in held if isinstance(v, torch.Tensor)]
             assert not tensors, f"entry holds {len(tensors)} tensors"
     assert entries, "nothing was cached, so nothing was tested"

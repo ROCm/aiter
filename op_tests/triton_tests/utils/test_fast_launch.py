@@ -212,15 +212,48 @@ def test_key_tells_apart_devices_and_argument_layouts():
     assert len(keys) == 4
 
 
-def test_true_one_and_one_point_zero_do_not_share_an_entry():
+@pytest.mark.parametrize("by_specialization", [False, True])
+def test_true_one_and_one_point_zero_do_not_share_an_entry(by_specialization):
     """They are equal and hash the same, but Triton specializes them apart."""
-    wrapped = fast_launch.fast_launch(_probe_kernel)
+    wrapped = fast_launch.fast_launch(
+        _probe_kernel, by_specialization=by_specialization
+    )
     keys = set()
     for value in (1, True, 1.0):
         args = _probe_args()
         args[8] = value
         keys.add(wrapped._key(0, tuple(args), {}))
     assert len(keys) == 3
+
+
+def test_by_specialization_keys_each_keyword_order_by_its_own_parameters():
+    """Reordered keywords put a constexpr where a runtime int was before."""
+    wrapped = fast_launch.fast_launch(_axpy_kernel, by_specialization=True)
+    x, y, out = _axpy_inputs(256)
+    wrapped._key(0, (x, y, out), {"n": 256, "alpha": 0.5, "BLOCK": 128})
+    keys = {
+        wrapped._key(0, (x, y, out), {"BLOCK": block, "alpha": 0.5, "n": 256})
+        for block in (64, 128)
+    }
+    assert len(keys) == 2
+
+
+@pytest.mark.parametrize("by_specialization", [False, True])
+def test_a_tensor_for_a_constexpr_is_keyed_as_a_tensor(by_specialization):
+    """Not by identity: that keeps every such tensor alive in the cache."""
+    wrapped = fast_launch.fast_launch(
+        _probe_kernel, by_specialization=by_specialization
+    )
+    keys = set()
+    for misaligned in (False, False, True):
+        args = _probe_args()
+        args[7] = _tensor(16, misaligned=misaligned)
+        keys.add(wrapped._key(0, tuple(args), {}))
+    assert len(keys) == 2
+    flat = [
+        v for k in keys for item in k for v in (item if type(item) is tuple else [item])
+    ]
+    assert not any(isinstance(v, torch.Tensor) for v in flat)
 
 
 def test_by_specialization_needs_a_plain_kernel():
@@ -394,7 +427,7 @@ def test_a_heuristic_on_a_tensor_shape_is_keyed():
             wrapped[grid](x, y, out, 64, 0.5)
         assert misses, "a new shape has to miss on a wrapped kernel"
         torch.testing.assert_close(out[:64], x[:64] * 0.5 + y[:64], rtol=0, atol=0)
-    blocks = sorted(frozen["BLOCK"] for _, _, frozen in wrapped._cache.values())
+    blocks = sorted(entry.frozen["BLOCK"] for entry in wrapped._cache.values())
     assert blocks == [32, 128]
 
 
