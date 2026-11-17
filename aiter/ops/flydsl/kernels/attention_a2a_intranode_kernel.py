@@ -38,7 +38,6 @@ from .quant_utils import (
 )
 from .tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
-_JIT_CACHE_TAG = "attention_a2a_intranode"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 # Rows of one e4m3_pc partial-maximum tile. The tile count sets both the
@@ -133,8 +132,6 @@ def make_attention_a2a_reuse_jit(*, rank, npes, spin_timeout_iters=0):
                     syncscope=fx.rocdl.SyncScope.OneAs,
                 )
 
-    key = (rank, npes, _JIT_CACHE_TAG)
-
     @flyc.jit
     def launch(
         addr_ready_mem: fx.Int64,
@@ -142,7 +139,6 @@ def make_attention_a2a_reuse_jit(*, rank, npes, spin_timeout_iters=0):
         addr_ready_flag: fx.Int64,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        _ = key
         for publish in range_constexpr(2):
             attention_a2a_reuse_barrier(
                 addr_ready_mem, addr_p2p_ready_mem, addr_ready_flag, publish == 0
@@ -2915,28 +2911,6 @@ def make_attention_a2a_jit(
     # rank is compile-time so rank-dependent ownership (split frame, k_own_tiles,
     # last-rank padding, odd-rank scales, sender dword selection) folds; the cache
     # therefore grows with world size.
-    key = (
-        rank,
-        npes,
-        heads,
-        seq_len,
-        head_dim,
-        block_num,
-        warp_num_per_block,
-        quant,
-        codec,
-        hadamard,
-        v4_output,
-        valid_kv_len,
-        v_pack,
-        q_multiplier,
-        v4_amax,
-        fp8_fnuz,
-        spin_timeout_iters,
-        current_target().arch,
-        os.environ.get("AITER_A2A_FP6_FORCE_SOFTWARE", "0") == "1",
-        _JIT_CACHE_TAG,
-    )
 
     @flyc.jit
     def launch(
@@ -2950,7 +2924,6 @@ def make_attention_a2a_jit(
         addr_p2p_partial_ready: fx.Int64,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        _ = key
         for index in range_constexpr(len(payload_kernels)):
             payload_kernels[index](
                 addr_input,
@@ -2976,7 +2949,6 @@ def make_attention_a2a_dequant_jit(*, numel, codec="e4m3", fp8_fnuz=False):
     block_threads = 256
     vec = 8
     codecs = (codec,) * 3 if isinstance(codec, str) else codec
-    key = (numel, codecs, fp8_fnuz, _JIT_CACHE_TAG)
 
     @flyc.jit
     def dequant_one(
@@ -3102,7 +3074,6 @@ def make_attention_a2a_dequant_jit(*, numel, codec="e4m3", fp8_fnuz=False):
         addr_out_v: fx.Int64,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        _ = key
         attention_a2a_dequant(
             addr_q,
             addr_k,
