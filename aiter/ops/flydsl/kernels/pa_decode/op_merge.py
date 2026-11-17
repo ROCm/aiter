@@ -23,8 +23,6 @@ s_barrier -3, global_inv SCOPE_SE) publish them to the cluster without an L2
 writeback; each CTA then writes its share of the sequence's rows.
 """
 
-import math
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
@@ -433,7 +431,7 @@ class Gfx1250OutputQuant:
         self.t = t
         self.quantized = fx.recast_iter(fx.Uint8, quantized_output)
         self.scales = fx.recast_iter(fx.Float32, output_scale)
-        self.unit = math.gcd(t.query_group_size, 16)
+        self.unit = t.quant_unit
 
     def _lanes_max(self, value, unit=16):
         """Max over the lanes that differ from this one in bit 4 (the other

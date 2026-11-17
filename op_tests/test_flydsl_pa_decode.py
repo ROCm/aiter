@@ -1589,6 +1589,10 @@ _INVALID_CASES = [
         ValueError,
         "quantized_pad_rows requires quantized_output",
     ),
+    ("fp8-missing-pad-row", ValueError, "quantized_output shape must be"),
+    ("bf16-quantized-output", TypeError, "quantized_output must use OCP FP8"),
+    ("rows-output-scale", ValueError, "output_scale shape"),
+    ("fp16-output-scale", TypeError, "output_scale must be float32"),
 ]
 # FP8-output arguments pa_decode refuses before any kernel compiles.
 _QUANT_ARG_ERRORS = {
@@ -1596,6 +1600,13 @@ _QUANT_ARG_ERRORS = {
     "negative-pad-rows": {"quantized_pad_rows": -1},
     "bool-pad-rows": {"quantized_pad_rows": True},
     "pad-rows-without-fp8": {"quantized_pad_rows": 1},
+}
+# gfx1250 FP8-output operands (one pad row) with one wrong shape or dtype.
+_QUANT_OPERAND_ERRORS = {
+    "fp8-missing-pad-row": {"pad": 0},
+    "bf16-quantized-output": {"fp8": torch.bfloat16},
+    "rows-output-scale": {"scale_tail": ()},
+    "fp16-output-scale": {"scale": torch.float16},
 }
 _MXFP4_INVALID_CASES = [
     ("fp16-output", TypeError, "bf16 output"),
@@ -1678,6 +1689,21 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
         options["quantized_output"] = torch.empty_like(query, dtype=dtypes.fp8)
     elif invalid in _QUANT_ARG_ERRORS:
         options.update(_QUANT_ARG_ERRORS[invalid])
+    elif invalid in _QUANT_OPERAND_ERRORS:
+        bad, rows = _QUANT_OPERAND_ERRORS[invalid], query.shape[0]
+        options.update(
+            quantized_pad_rows=1,
+            quantized_output=torch.empty(
+                (rows + bad.get("pad", 1), *query.shape[1:]),
+                dtype=bad.get("fp8", dtypes.fp8),
+                device=query.device,
+            ),
+            output_scale=torch.empty(
+                (rows + 1, *bad.get("scale_tail", (1,))),
+                dtype=bad.get("scale", torch.float32),
+                device=query.device,
+            ),
+        )
 
     def unexpected_compile(**_):
         pytest.fail("invalid BF16 inputs reached kernel compilation")
@@ -2011,6 +2037,8 @@ def _run_pa_decode_case(case, device, monkeypatch):
     if case["max_partitions"] is not None and case["max_partitions"] > num_cu:
         pytest.skip(f"plan_pa_decode caps max_partitions at {num_cu} CUs")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    if arch != "gfx1250" and case.get("invalid_input") in _QUANT_OPERAND_ERRORS:
+        pytest.skip("quantized PA output requires gfx1250")
     if get_gfx_runtime() == "gfx1250":
         if case["invalid_kind"] == "bf16" and case.get("invalid_input") in (
             "fp16-query",

@@ -1671,8 +1671,13 @@ class Gfx1250Traits:
         return self.stats_offset + 576
 
     @property
+    def quant_unit(self):
+        # Rows sharing one FP8 output scale group; sizes the LDS maxima above.
+        return math.gcd(self.query_group_size, 16)
+
+    @property
     def total_bytes(self):
-        units = self.m_tiles * 16 // math.gcd(self.query_group_size, 16)
+        units = self.m_tiles * 16 // self.quant_unit
         return self.quant_offset + (units * self.NWARP * 4 if self.quant_output else 0)
 
     @property
