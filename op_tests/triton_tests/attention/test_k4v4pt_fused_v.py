@@ -114,9 +114,12 @@ def run_case(t, q_heads, k_heads, layout, v_contig, path, tdm, extra_slots=0):
     vc_a = torch.zeros(num_blocks, k_heads, BS // 16, D, 16, dtype=e4m3_dtype, device="cuda")
     qa, ka = fused_qk_norm_mrope_cache(q, k, v, qw, kw, 1e-6, pos, cos, sin, sec, kc_a, vc_a, slots, kv_scale=1.0)
     # the fused k4v4pt call, with the path forced
-    old = (fm._K4V4PT_PAGE_MIN_TOKENS, fm._K4V4PT_V_TDM)
+    old = (fm._K4V4PT_PAGE_MIN_TOKENS, fm._K4V4PT_V_TDM, fm._K4V8_ROWS_MIN_Q_HEADS)
     fm._K4V4PT_PAGE_MIN_TOKENS = 1 if path == "kqv" else 10**9
     fm._K4V4PT_V_TDM = tdm
+    # the K / Q / V kernel at any head count (by default the row kernel runs every call from 16 Q heads)
+    if path == "kqv":
+        fm._K4V8_ROWS_MIN_Q_HEADS = 0
     try:
         kc_b = torch.zeros_like(kc_a)
         vc_b = torch.full((num_blocks, k_heads, BS, D // 2 + 4), 0xCD, dtype=torch.uint8, device="cuda")
@@ -126,7 +129,7 @@ def run_case(t, q_heads, k_heads, layout, v_contig, path, tdm, extra_slots=0):
         )
         torch.cuda.synchronize()
     finally:
-        fm._K4V4PT_PAGE_MIN_TOKENS, fm._K4V4PT_V_TDM = old
+        fm._K4V4PT_PAGE_MIN_TOKENS, fm._K4V4PT_V_TDM, fm._K4V8_ROWS_MIN_Q_HEADS = old
     assert torch.equal(qa.view(torch.uint8), qb.view(torch.uint8)), "Q differs from A8K4V8"
     assert torch.equal(ka, kb), "k_out differs"
     assert torch.equal(kc_a, kc_b), "K cache differs"
@@ -179,9 +182,9 @@ def test_fused_v_contig_v_and_long_slot_table(t, path):
 
 @pytest.mark.parametrize("t", TOKENS)
 def test_fused_v_default_selection(t):
-    # the shipped crossover (_K4V4PT_PAGE_MIN_TOKENS) as is
-    old = fm._K4V4PT_PAGE_MIN_TOKENS
-    path = "kqv" if t >= old else "row"
+    # the shipped selection (_k4v4pt_min_tokens: the row kernel at every size from 16 Q heads) as is
+    min_tokens = fm._k4v4pt_min_tokens(16)
+    path = "kqv" if 0 < min_tokens <= t else "row"
     run_case(t, 16, 2, "packed", v_contig=False, path=path, tdm=fm._K4V4PT_V_TDM)
 
 

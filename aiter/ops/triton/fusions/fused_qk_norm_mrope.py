@@ -51,6 +51,16 @@ def _k4v8_min_tokens(q_heads: int) -> int:
     return _K4V8_PAGE_MIN_TOKENS
 
 
+def _k4v4pt_min_tokens(q_heads: int) -> int:
+    """Tokens from which the K / Q / V kernel runs an A8K4V4PT call (0: never). From _K4V8_ROWS_MIN_Q_HEADS Q heads
+    the row kernel runs every call, as for A8K4V8: with 16 Q / 2 K heads it is 1.06-1.10x the A8K4V8 row kernel and
+    beats the K / Q / V kernel at every size (2048 tokens 19.8 -> 15.8 us, 4096 33.0 -> 24.4, 16384 110.3 -> 84.5;
+    CUDA-graph GPU time on MI455X). Fewer heads keep _K4V4PT_PAGE_MIN_TOKENS."""
+    if _K4V8_ROWS_MIN_Q_HEADS and q_heads >= _K4V8_ROWS_MIN_Q_HEADS:
+        return 0
+    return _K4V4PT_PAGE_MIN_TOKENS
+
+
 def _k4v8_config(num_tokens: int, q_heads: int) -> dict:
     if _K4V8_CONFIG is not None:
         cfg = dict(_K4V8_CONFIG)
@@ -140,7 +150,7 @@ def _launch(
         fp8,
     )
 
-    min_tokens = _K4V4PT_PAGE_MIN_TOKENS if v_fp4pt else _k4v8_min_tokens(q_heads)
+    min_tokens = _k4v4pt_min_tokens(q_heads) if v_fp4pt else _k4v8_min_tokens(q_heads)
     if k_nvfp4 and 0 < min_tokens <= num_tokens:
         page_block = k_cache.shape[2]
         cfg = _k4v8_config(num_tokens, q_heads)
