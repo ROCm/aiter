@@ -1149,6 +1149,25 @@ def _group32_w_scale_block(XQ, WQ, x_scale, w_scale) -> str | None:
     return None
 
 
+def gemm_a8w8_blockscale_group32_supported(
+    w_scale_block: str, bpreshuffle: bool = False
+) -> bool:
+    """Whether this arch has a group32 GEMM (E8M0 scales, ``w_scale_block``
+    "1x32" or "32x32") for the weight's layout: the Triton one
+    `gemm_a8w8_blockscale` runs for a row-major weight, the FlyDSL one
+    `gemm_a8w8_blockscale_bpreshuffle` runs for a (16, 16)-preshuffled one."""
+    assert w_scale_block in ("1x32", "32x32"), f"{w_scale_block=} is not group32"
+    if bpreshuffle:
+        from .flydsl.batched_gemm_a8w8 import bmm_a8w8_mxfp8_supported
+
+        return bmm_a8w8_mxfp8_supported(w_scale_block)
+    from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_group32 import (
+        gemm_a8w8_blockscale_group32_arch_supported,
+    )
+
+    return gemm_a8w8_blockscale_group32_arch_supported()
+
+
 _MXSCALE_BPRESHUFFLE_KEYS = ["gfx", "cu_num", "M", "N", "K", "w_scale_block"]
 
 MXSCALE_BMM_KERNEL_ID = "bmm"
