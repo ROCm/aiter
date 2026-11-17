@@ -460,9 +460,6 @@ def test_fp8_mqa_logits_rejects_malformed_packed_output(bad, message):
         )
 
 
-# 32 heads x head size 128 (the Kimi-K3.1 DSA indexer): >= 2048 rows run the gfx1250
-# row-group kernel. Every call mode (allocated, out=, packed, clean_logits) must
-# return the same bits, and match a reference.
 def _modes_case(rows, keys, seed):
     g = torch.Generator(device="cuda").manual_seed(seed)
     q = torch.randn(rows, 32, 128, device="cuda", generator=g).to(e4m3_type)

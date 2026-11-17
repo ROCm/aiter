@@ -8,7 +8,11 @@ from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
     _fp8_mqa_logits_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
 
 TRITON_VERSION = Version(triton.__version__)
 TRITON_GE_36 = TRITON_VERSION >= Version("3.6.0")
@@ -96,42 +100,11 @@ def _gfx942_tile_fits_lds(
     return lds_bytes <= 0.9 * _GFX942_CU_LDS_BYTES
 
 
-# The row-group kernel runs seq_len // BLOCK_M workgroups. Below 2048 rows (~2 per CU
-# on gfx1250's 256 CUs) one workgroup per row is as fast or faster for every row
-# layout measured (1024 rows: 0.64x-1.18x for the row-group), so it starts there.
-_ROWGROUP_MIN_ROWS = 2048
-
-
 def _gfx1250_launch_config(seq_len_kv: int, num_heads: int, head_size: int) -> dict:
-    """gfx1250 launch parameters for this call, from the tuned table.
-
-    configs/gfx1250/gluon/attention/fp8_mqa_logits/DEFAULT.json buckets by KV length
-    (KV_LEQ_<n>, then "any"): the host only knows seq_len and seq_len_kv, not the
-    per-row [start, end) ranges. Without the table, keep the previous fixed launch.
-    A row may carry a "rowgroup" entry (BLOCK_M, BLOCK_KV, NUM_WARPS, WARPS_M,
-    waves_per_eu): the row-group kernel, used when the chunk has >= BLOCK_M rows.
-    The table was tuned for 32 heads x head size 128 (the Kimi-K3.1 DSA indexer); other
-    shapes keep the fixed launch.
-    """
-    cfg = {
-        "BLOCK_KV": 128,
-        "NUM_WARPS": 4,
-        "LOOP_VARIANT": 1,
-        "NUM_CHAINS": 8,
-        "waves_per_eu": 1,
-    }
     cfg_dir = resolve_config_dir("attention", "FP8_MQA_LOGITS", backend="gluon")
-    table = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
-    if table and (num_heads, head_size) == (32, 128):
-        keyed = sorted(
-            (int(k.split("_")[-1]), v)
-            for k, v in table.items()
-            if k.startswith("KV_LEQ_")
-        )
-        row = next((v for bound, v in keyed if seq_len_kv <= bound), table.get("any"))
-        if row:
-            cfg.update(row)
-    return cfg
+    table = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    shape = table.get(f"H{num_heads}_D{head_size}", table["any"])
+    return select_leq_config(shape, seq_len_kv, prefix="KV_LEQ_")
 
 
 def fp8_mqa_logits(
@@ -390,11 +363,7 @@ def fp8_mqa_logits(
         else:
             cfg = _gfx1250_launch_config(seq_len_kv, num_heads, head_size)
             rg = cfg.get("rowgroup")
-            # The row-group kernel serves every call mode of a shape (so all modes
-            # return the same bits); exact per-row stores for clean_logits / packed,
-            # the union of a block's row ranges otherwise (out-of-window unspecified).
-            if rg and seq_len >= max(rg["BLOCK_M"], _ROWGROUP_MIN_ROWS):
-                # Row-group kernel: BLOCK_M rows share each K tile (see the kernel).
+            if rg and seq_len >= max(rg["BLOCK_M"], rg["MIN_ROWS"]):
                 _gluon_fp8_mqa_logits_rowgroup_kernel[
                     (triton.cdiv(seq_len, rg["BLOCK_M"]),)
                 ](
@@ -428,9 +397,8 @@ def fp8_mqa_logits(
                     EXACT_ROWS=clean_logits or packed,
                     PACKED=packed,
                     num_warps=rg["NUM_WARPS"],
-                    # the per-row masks need registers; keep exact-row variants unspilled
                     waves_per_eu=(
-                        min(rg["waves_per_eu"], 2)
+                        rg["waves_per_eu_exact"]
                         if (clean_logits or packed)
                         else rg["waves_per_eu"]
                     ),

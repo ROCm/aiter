@@ -566,7 +566,6 @@ def mqa_logits_loop_pipelined(
     _store_logits_block(
         logits_ptr, store_offsets, scores_next, USE_BUFFER_STORE, mask=mask
     )
-    # Drain outstanding TDM loads before the kernel exits.
     kv_loader.wait(0)
 
 
@@ -596,7 +595,7 @@ def _gluon_fp8_mqa_logits_kernel(
     cu_start_ptr,  # int32  [seq_len]
     cu_end_ptr,  # int32  [seq_len]
     logits_ptr,  # fp32   [seq_len, seq_len_kv]; flat when PACKED
-    out_offsets_ptr,  # int32/int64 [seq_len]: each row's start when PACKED
+    out_offsets_ptr,
     seq_len: gl.int32,
     seq_len_kv: gl.int32,
     NUM_HEADS: gl.constexpr,
@@ -758,24 +757,6 @@ def _gluon_fp8_mqa_logits_kernel(
         )
 
 
-# ---------------------------------------------------------------------------
-# Row-group variant: BLOCK_M query rows per program share every K tile.
-#
-# The single-row kernel above streams a row's whole key range through TDM, so a
-# prefill chunk of R rows reads the same keys R times (for the Kimi-K3.1 indexer,
-# ~8.6 GB of K per call at [5461, 24576]). Here one WMMA tile has
-# M = BLOCK_M rows x NUM_HEADS heads (as FlyDSL's row-group MQA kernels:
-# "a tile's rows read each key once rather than once a row"; gfx950's kernel does
-# BLOCK_M=2 with per-row tuples). Warps split over rows (WARPS_M) and keys, with a
-# row's head tiles repeating in registers, so a warp holds only its own rows' Q:
-# 264 VGPRs at BLOCK_M=4 vs ~440 for per-row Q tuples, which is what lets
-# occupancy (latency hiding) rise with BLOCK_M. The head sum of each row is a
-# reshape [BLOCK_M, NUM_HEADS, BLOCK_KV] + sum. The loop walks the union of the
-# rows' key ranges; with clean_logits=False positions outside a row's own window
-# are unspecified, so only the union's end masks the store. The last block is
-# shifted back to seq_len - BLOCK_M (shared rows are recomputed identically).
-# Measured on gfx1250 (32 heads, [5461 x 24576] spread rows): 337 -> 201 us.
-# ---------------------------------------------------------------------------
 _gluon_fp8_mqa_logits_rowgroup_kernel_repr = make_kernel_repr(
     "_gluon_fp8_mqa_logits_rowgroup_kernel",
     [
@@ -802,7 +783,7 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
     cu_start_ptr,
     cu_end_ptr,
     logits_ptr,
-    out_offsets_ptr,  # int32/int64 [seq_len]: each row's start when PACKED
+    out_offsets_ptr,
     seq_len: gl.int32,
     seq_len_kv: gl.int32,
     NUM_HEADS: gl.constexpr,
@@ -825,9 +806,6 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
     EXACT_ROWS: gl.constexpr = False,
     PACKED: gl.constexpr = False,
 ):
-    # Without EXACT_ROWS a block writes the union of its rows' key ranges; with it
-    # (clean_logits, packed) each row writes only its own [start, end). The values
-    # are the same either way, so every call mode returns identical bits.
     block_id = gl.num_programs(0) - gl.program_id(axis=0) - 1
     row0 = gl.minimum(block_id * BLOCK_M, seq_len - BLOCK_M)
     if not USE_BUFFER_STORE:
@@ -836,8 +814,6 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
     WARP_SIZE: gl.constexpr = 32
     WARPS_N: gl.constexpr = NUM_WARPS // WARPS_M
     BM_ROWS: gl.constexpr = BLOCK_M * NUM_HEADS
-    # warp bases in WMMA-tile units: first along keys, then along rows (one row =
-    # NUM_HEADS // 16 tiles of M), so a row's heads stay inside one warp.
     WB_N: gl.constexpr = [[0, 1], [0, 2], [0, 4]]
     WB_M: gl.constexpr = [
         [NUM_HEADS // 16, 0],
@@ -865,7 +841,6 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
             warp_bases: gl.constexpr = [WB_N[0], WB_N[1]]
         else:
             warp_bases: gl.constexpr = [WB_N[0], WB_N[1], WB_M[0]]
-    # the head tiles of one row (NUM_HEADS // 16 of them) repeat in registers
     if NUM_HEADS == 32:
         reg_bases: gl.constexpr = [[1, 0]]
     elif NUM_HEADS == 64:
@@ -949,8 +924,6 @@ def _gluon_fp8_mqa_logits_rowgroup_kernel(
         row_start = gl.maximum(gl.load(cu_start_ptr + row0 + rows_st), 0)
         row_end = gl.minimum(gl.load(cu_end_ptr + row0 + rows_st), seq_len_kv)
     if PACKED:
-        # column c of row r goes to out_offsets[r] + c - start(r); 32-bit buffer-store
-        # offsets whenever the whole buffer fits (the wrapper sets USE_BUFFER_STORE so)
         packed_base = gl.load(out_offsets_ptr + row0 + rows_st)
         if USE_BUFFER_STORE:
             packed_base = packed_base.to(gl.int32) - row_start
