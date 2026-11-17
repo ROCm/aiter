@@ -1,0 +1,26 @@
+name: FileBaton regression tests
+
+on:
+  pull_request:
+    paths:
+      - "aiter/jit/utils/file_baton.py"
+      - "op_tests/test_file_baton.py"
+      - ".github/workflows/file-baton.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  file-baton:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test lock completion, recovery, and platform compatibility
+        run: python op_tests/test_file_baton.py
