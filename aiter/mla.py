@@ -1079,10 +1079,12 @@ def mla_decode_fwd(
     even when return_lse=False. No planner, split-K, CP or implicit conversion.
 
     Output: the attention is written in place into ``o``, and ``o`` is the
-    result. The call returns ``(logits, lse)``. ``logits`` is the
-    implementation's scratch -- the per-split partial results, or a view of
-    ``o`` when nothing was split -- so callers read ``o``, never it, and a
-    provider may return ``o`` there. ``lse`` is the natural-log FP32 final LSE
+    result. The call returns ``(logits, lse)``. With ``return_logits=False``,
+    ``logits`` is the implementation's scratch -- the per-split partial
+    results, or a view of ``o`` when nothing was split -- so callers read
+    ``o``, never it, and a provider may return ``o`` there. With
+    ``return_logits=True`` the caller reads the per-split partial results: a
+    provider must return them or decline. ``lse`` is the natural-log FP32 final LSE
     ``[total_q, nhead]`` when ``return_lse`` is set; without it the second
     element is unspecified (None or scratch).
     """

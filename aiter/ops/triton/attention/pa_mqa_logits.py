@@ -664,7 +664,9 @@ def deepgemm_fp8_paged_mqa_logits(
 ):
     """Compute paged FP8 decode logits, optionally using a persistent CTA table.
 
-    Writes the logits into ``out_logits`` in place and returns None.
+    Writes the logits into ``out_logits`` in place. Returns the cache key of
+    the compiled Triton kernel, which only AOT tools read. A kernel plugin
+    that serves the call has no such key and returns None.
 
     Build ``PersistentSchedule`` with the same query geometry, context lengths,
     ``max_model_len`` and ``ChunkK`` using the persistent schedule helper above.

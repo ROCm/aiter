@@ -654,9 +654,11 @@ _NOT_REGISTERED = {
         "unannotated contract, and an out-buffer in it (`o`, which the first "
         "result may be a view of)"
     ),
-    "mla_paged_decode": "out-buffer in the contract (`o`, returned first)",
     "mla_sparse_prefill_v4": "out-buffer in the contract (`out`)",
-    "fp8_paged_mqa_logits": "unannotated contract (`kv_cache`)",
+    "fp8_paged_mqa_logits": (
+        "it returns the Triton cache key, a str, which a custom op cannot "
+        "return (bench_deepgemm_attention.py reads it)"
+    ),
     "sp_qkv_fused": "unannotated contract",
     "pertoken_quant": (
         "unannotated contract; and its body is pure torch, which inductor "

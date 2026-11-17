@@ -74,7 +74,7 @@ from aiter.plugin import route as _route
 from aiter.presorted_moe import (  # noqa: F401  register_presorted_moe is public
     aux_sort_capacity,
     bytes_overlap,
-    drop_presort_on_error,
+    drop_presort_after,
     match_presorted_moe,
     pop_presorted_moe,
     presorted_moe_ignored,
@@ -1194,7 +1194,7 @@ def resolve_activation_dtype(
     return q_dtype_a
 
 
-@drop_presort_on_error
+@drop_presort_after
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -1713,10 +1713,9 @@ def fused_moe_(
 
     A caller may hand the next call on its thread a precomputed sort with
     ``register_presorted_moe``. The registration is consumed below this route,
-    on every native call. A provider serving a call must consume it as well --
-    ``aiter.presorted_moe.pop_presorted_moe()`` -- or decline: left in place it
-    applies to the next native call, which often reuses the same routing
-    buffers and then runs on a stale sort without any error.
+    on every native call, and the public ``fused_moe`` clears it when the call
+    ends, so a call that a provider serves leaves none behind. A provider may
+    ignore it. A caller of this layer directly gets no such clean-up.
     """
     stage2_scatter = None
     if ep_source_token_map is not None:

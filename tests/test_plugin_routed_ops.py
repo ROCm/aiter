@@ -1207,11 +1207,12 @@ def _route_cases():
             30.0,
             (out, None),
         ),
+        # The provider returns lse alone: an empty tensor when return_lse is False.
         "mla_paged_decode": (
             lambda: mla_gluon.mla_gluon(**_gluon_args(), kv_scale=2.0),
             "kv_scale",
             2.0,
-            (out, None),
+            _z(0),
         ),
         "fp8_paged_mqa_logits": (
             lambda: pa_mqa_logits.deepgemm_fp8_paged_mqa_logits(
@@ -1314,7 +1315,9 @@ def test_the_public_name_hands_a_provider_the_whole_contract(monkeypatch, case):
     assert (
         args[positional.index(name)] == value
     ), f"{op}: {name} did not arrive in its place in the contract"
-    if isinstance(served, torch.Tensor):
+    if case == "mla_paged_decode":
+        assert result[1] is None, "return_lse=False must give no lse"
+    elif isinstance(served, torch.Tensor):
         assert torch.equal(result, served)
 
 
@@ -1461,3 +1464,71 @@ def test_gemm_a16w16_out_takes_a_result_written_into_out(monkeypatch):
     out = _z(2, 3)
     gemm_a16w16_out(_z(2, 4), _z(3, 4), out)
     assert torch.equal(out, torch.ones(2, 3))
+
+
+def test_mla_gluon_returns_the_lse_a_provider_computed(monkeypatch):
+    """The routed layer returns lse alone; mla_gluon puts o back in front."""
+
+    from aiter.ops.triton.gluon import mla_gluon
+
+    lse = torch.ones(2, 1, 4)
+    _serve(monkeypatch, "mla_paged_decode", _candidate("aklr", lse))
+    args = _gluon_args()
+    o, got = mla_gluon.mla_gluon(**args, return_lse=True)
+    assert o is args["o"]
+    assert torch.equal(got, lse)
+
+
+def test_fused_moe_leaves_no_presort_behind_a_served_call(monkeypatch):
+    """A served call returns before the native path consumes the registration.
+
+    Left in place, it would apply to the next native call on the same routing
+    buffers. The public fused_moe clears it when the call ends.
+    """
+
+    from aiter import presorted_moe
+    from aiter.fused_moe import fused_moe
+
+    _serve(monkeypatch, "fused_moe", _candidate("aklr", _z(2, 8, dtype=torch.bfloat16)))
+    presorted_moe.register_presorted_moe({"M": 2})
+    fused_moe(
+        _z(2, 8, dtype=torch.bfloat16),
+        _z(2, 16, 8, dtype=torch.bfloat16),
+        _z(2, 8, 8, dtype=torch.bfloat16),
+        _z(2, 1),
+        _z(2, 1, dtype=torch.int32),
+    )
+    assert plugin.last_decision().route == "provider"
+    assert presorted_moe.pop_presorted_moe() is None, "the presort survived the call"
+
+
+@pytest.mark.parametrize("op", ["gemm_a16w16_activation", "gemm_a8w8_blockscale_out"])
+def test_a_triton_gemm_refuses_a_result_that_is_not_y(monkeypatch, op):
+    """With y given, the caller may read only y, so the result must be y."""
+
+    from aiter.ops.triton.gemm.basic import gemm_a8w8_blockscale as triton_blockscale
+    from aiter.ops.triton.gemm.basic import gemm_a16w16 as triton_a16w16
+
+    if op == "gemm_a16w16_activation":
+        y_index, args = 4, (_z(2, 4), _z(3, 4))
+        call = triton_a16w16.gemm_a16w16
+    else:
+        y_index, args = 5, (_z(2, 128), _z(3, 128), _z(2, 1), _z(1, 1))
+        call = triton_blockscale.gemm_a8w8_blockscale
+
+    _serve(monkeypatch, op, _candidate("aklr", _z(2, 3, dtype=torch.bfloat16)))
+    with pytest.raises(RuntimeError, match="not written into y"):
+        call(*args, y=_z(2, 3, dtype=torch.bfloat16))
+
+    plugin._reset_for_testing()
+    in_place = plugin.KernelCandidate(
+        provider="aklr",
+        kernel_id="kernel-1",
+        artifact_digest="sha256:abc",
+        qualification="experimental",
+        run=lambda *a, **k: a[y_index].fill_(1.0),
+    )
+    _serve(monkeypatch, op, in_place)
+    y = _z(2, 3, dtype=torch.bfloat16)
+    assert call(*args, y=y) is y
+    assert torch.equal(y, torch.ones(2, 3, dtype=torch.bfloat16))

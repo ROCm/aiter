@@ -115,7 +115,7 @@ def gemm_a16w16_(
     """
     # A call that sets backend gets that backend. Other calls go to the routed op.
     if backend is None:
-        return _gemm_a16w16_routed(
+        result = _gemm_a16w16_routed(
             x,
             w,
             bias,
@@ -127,6 +127,11 @@ def gemm_a16w16_(
             kernel_type,
             persistent,
         )
+        # A kernel plugin must return y itself when y is given, as the native
+        # path does. Identity, not data_ptr: this runs under torch.compile too.
+        if y is not None and result.dim() == y.dim() and result is not y:
+            raise RuntimeError("gemm_a16w16: the result was not written into y=")
+        return result
     return _gemm_a16w16_native(
         x,
         w,
