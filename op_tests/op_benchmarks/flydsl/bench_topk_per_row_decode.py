@@ -17,9 +17,10 @@ Each cell runs on every seed in --seeds; decide on the median over seeds.
 
 Slices (rows 1..512, k 256..4096, stable 0/1 unless noted):
   A1  every row as wide as the buffer, 10 widths
-  A2  buffer 128K/256K/1M, every row 4K, 16K, 48K, W/8, W/4 or W/2 long
-  A3  buffer 128K/256K/1M, 25/50/80% of rows full, the rest 4K
-  A4  buffer 128K/256K/1M, each row uniform in [4K, W]
+  A2  buffer 32K..1M, every row 4K, 16K, 48K, W/8, W/4 or W/2 long (if below W)
+  A3  buffer 32K..1M, 25/50/80% of rows full, the rest 4K
+  A4  buffer 32K..1M, each row uniform in [4K, W]
+  R   buffer 128K..1M, one row full, the rest 4K, rows 8..512
   B   the cases #6329 published, k=2048
 
 --bound sets the adaptive arm's max_row_len: `width` (default) is the buffer
@@ -47,11 +48,13 @@ from pathlib import Path
 
 import torch
 
-HARNESS_VERSION = 3
+HARNESS_VERSION = 4
 ROWS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 KS = (256, 512, 1024, 2048, 4096)
 DIAG_WIDTHS = (4096, 8192, 16384, 20000, 32768, 65536, 131072, 262144, 524288, 1048576)
-PADDED_WIDTHS = (131072, 262144, 1048576)
+PADDED_WIDTHS = (32768, 65536, 131072, 262144, 1048576)
+RAGGED_WIDTHS = (131072, 262144, 524288, 1048576)
+RAGGED_ROWS = (8, 16, 32, 64, 128, 256, 512)
 SHORT = 4096
 # Past every live length, so a kernel that reads padding selects it and fails.
 POISON = 1.0e30
@@ -114,11 +117,13 @@ def _profiles(s: str, w: int, r: int) -> list[str]:
     if s == "A1":
         return ["full"]
     if s == "A2":
-        ps = [f"u{n}" for n in (4096, 16384, 49152, w // 8, w // 4, w // 2)]
+        ps = [f"u{n}" for n in (4096, 16384, 49152, w // 8, w // 4, w // 2) if n < w]
     elif s == "A3":
         ps = [_mixed(r, w, p) for p in (25, 50, 80)]
     elif s == "A4":
         return ["spread"]
+    elif s == "R":
+        return [f"b1x{w}+{r - 1}x{SHORT}"]
     else:
         raise ValueError(f"unknown slice {s!r}")
     # W/8 can equal a fixed length, and few rows round two shares to one count.
@@ -140,9 +145,13 @@ def cells(slices, rows=None, ks=KS, stables=(0, 1), widths=None):
                     ):
                         yield Cell("B", w, r, 2048, stable, p)
             continue
-        ws = DIAG_WIDTHS if s == "A1" else PADDED_WIDTHS
+        ws = {"A1": DIAG_WIDTHS, "R": RAGGED_WIDTHS}.get(s, PADDED_WIDTHS)
+        if s == "R":
+            rs = [r for r in RAGGED_ROWS if rows is None or r in rows]
+        else:
+            rs = ROWS if rows is None else rows
         for w in ws if widths is None else [w for w in ws if w in widths]:
-            for r in ROWS if rows is None else rows:
+            for r in rs:
                 for p in _profiles(s, w, r):
                     for k in ks:
                         for stable in stables:
@@ -438,7 +447,7 @@ def run_cell(
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--slice", nargs="+", default=["A1", "A2", "A3", "A4", "B"])
+    ap.add_argument("--slice", nargs="+", default=["A1", "A2", "A3", "A4", "R", "B"])
     ap.add_argument("--rows", type=int, nargs="+", default=None)
     ap.add_argument("--k", type=int, nargs="+", default=list(KS))
     ap.add_argument("--stable", type=int, nargs="+", default=[0, 1], choices=(0, 1))
