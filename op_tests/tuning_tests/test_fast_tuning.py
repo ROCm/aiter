@@ -941,12 +941,37 @@ class TestV2FusedMoeRerank(unittest.TestCase):
         self.assertEqual(len(finalists), gemm_moe_tune.V2_E2E_MAX_FINALISTS)
         self.assertEqual(finalists, [15, 14, 13, 12])
 
-    def test_only_losers_beyond_the_noise_are_dropped(self):
+    def test_scores_leave_out_kernels_every_finalist_shares(self):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
-        e2e_us = {10: 2280.0, 11: 2263.0, 12: 2380.0}
-        # 2280 is within 1% of 2263, so the stage-sum order decides it.
-        self.assertEqual(gemm_moe_tune._v2_e2e_losers(e2e_us), [12])
+        kernel_us = {
+            10: {"sort": 35.0, "moe1_t64": 577.0, "moe2_sbm64": 941.0, "reduce": 640.0},
+            11: {
+                "sort": 35.0,
+                "moe1_t128": 677.0,
+                "moe2_sbm128": 862.0,
+                "reduce": 575.0,
+            },
+            12: {
+                "sort": 35.0,
+                "moe1_t128": 677.0,
+                "moe2_sbm64": 941.0,
+                "reduce": 600.0,
+            },
+        }
+        # sort and reduce are shared by all three; moe1_t128 is not, so it counts.
+        self.assertEqual(
+            gemm_moe_tune._v2_e2e_scores(kernel_us),
+            {10: 1518.0, 11: 1539.0, 12: 1618.0},
+        )
+
+    def test_rerank_is_on_unless_disabled_on_the_command_line(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.FmoeTuner("testFmoe", [], [], "test parser")
+        for flags, disabled in (([], False), (["--no_fused_moe_rerank"], True)):
+            with mock.patch.object(sys, "argv", ["gemm_moe_tune.py", *flags]):
+                self.assertIs(tuner.parse_args().no_fused_moe_rerank, disabled)
 
     def test_config_switch_is_scoped_and_kept_out_of_shared_tmp(self):
         import tempfile

@@ -115,11 +115,6 @@ from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import (
     select_reference_producer,
 )
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
-    append_shared_experts,
-    fused_shared_experts,
-    tuning_routing,
-)
-from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     build_v2_inputs as _v2_build_inputs,
 )
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
@@ -127,6 +122,9 @@ from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
 )
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     populate_v2_intermediate_from_ref as _v2_populate_stage2,
+)
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+    tuning_routing,
 )
 
 if TYPE_CHECKING:
@@ -531,11 +529,9 @@ def rank_moe_pairs(profile_df, policy):
 # how a kernel runs after its neighbours in fused_moe: a block_m 128 stage 1
 # measured 6-9% slower there than alone, enough to win a near tie it loses in
 # production. FlyDSL v2 pairs this close to the best stage sum are re-timed
-# through fused_moe.
+# through fused_moe and only the fastest is kept.
 V2_E2E_FINALIST_GATE = 0.05
 V2_E2E_MAX_FINALISTS = 4
-# fused_moe run-to-run spread at prefill sizes is about 1%.
-V2_E2E_NOISE = 0.01
 
 
 def _v2_e2e_finalists(pairs):
@@ -548,10 +544,19 @@ def _v2_e2e_finalists(pairs):
     return list(total[close].sort_values().index[:V2_E2E_MAX_FINALISTS])
 
 
-def _v2_e2e_losers(e2e_us):
-    """Finalists slower in fused_moe than the fastest beyond the noise."""
-    fastest = min(e2e_us.values())
-    return [i for i, us in e2e_us.items() if us > fastest * (1 + V2_E2E_NOISE)]
+def _v2_e2e_scores(kernel_us):
+    """fused_moe time of each finalist over the kernels it does not share.
+
+    ``kernel_us`` maps finalist -> {kernel name: median us per call}. A kernel
+    every finalist launches under the same name is left out: the reduce's time
+    swings by about 30 us with the output buffer the allocator hands it, which
+    is more than the gap between near-tied pairs.
+    """
+    shared = set.intersection(*(set(k) for k in kernel_us.values()))
+    return {
+        i: sum(us for name, us in kernels.items() if name not in shared)
+        for i, kernels in kernel_us.items()
+    }
 
 
 def _select_mxfp4_accuracy_promotion(candidates, performance_finalists):
@@ -800,13 +805,15 @@ class FmoeTuner(TunerCommon):
             jit_core.AITER_CONFIGS.get_config_file.cache_clear()
             self._clear_op_caches()
 
-    def _time_pairs_in_fused_moe(self, key, pairs, rounds=2):
-        """fused_moe latency of each row of ``pairs`` as the only tuned config.
+    def _time_pairs_in_fused_moe(self, key, pairs, rounds=2, iters=20):
+        """Median us per call of each kernel fused_moe launches with each row of
+        ``pairs`` as the only tuned config, keyed by row.
 
-        Rounds interleave the pairs and each keeps its fastest round, so a
-        slow spell of the GPU does not land on one pair alone.
+        Rounds interleave the pairs, so a slow spell of the GPU does not land
+        on one pair alone.
         """
-        from aiter.test_common import run_perftest
+        from torch.autograd import DeviceType
+        from torch.profiler import ProfilerActivity, profile
 
         (
             _,
@@ -855,7 +862,7 @@ class FmoeTuner(TunerCommon):
                 dtype=dtype,
             )
 
-        e2e_us = {}
+        launches = {i: {} for i in pairs.index}
         with tempfile.TemporaryDirectory(prefix="fmoe_e2e_") as tmp:
             config_files = {}
             for i, pair in pairs.iterrows():
@@ -869,9 +876,24 @@ class FmoeTuner(TunerCommon):
                 for i, config_file in config_files.items():
                     with self._fused_moe_config(config_file):
                         call()
-                        _, us = run_perftest(call)
-                    e2e_us[i] = min(us, e2e_us.get(i, float("inf")))
-        return e2e_us
+                        torch.cuda.synchronize()
+                        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                            for _ in range(iters):
+                                call()
+                            torch.cuda.synchronize()
+                    for event in prof.events():
+                        if event.device_type == DeviceType.CUDA:
+                            launches[i].setdefault(event.name, []).append(
+                                event.time_range.elapsed_us()
+                            )
+        calls = rounds * iters
+        return {
+            i: {
+                name: float(torch.tensor(us).median()) * len(us) / calls
+                for name, us in kernels.items()
+            }
+            for i, kernels in launches.items()
+        }
 
     def _setup_specific_arguments(self):
 
@@ -914,6 +936,13 @@ class FmoeTuner(TunerCommon):
             help="Tune FP8 per_1x128 SiLU MoE with this gate/up clamp. Only CK "
             "2-stage candidates can clamp; results are tagged in a _tag column "
             "and must go to a separate tuned file (-o).",
+        )
+        self.parser.add_argument(
+            "--no_fused_moe_rerank",
+            action="store_true",
+            help="Rank FlyDSL v2 pairs by their summed stage times only. By "
+            "default, pairs within 5%% of the best sum are re-timed through "
+            "fused_moe and all but the fastest dropped.",
         )
 
     def parse_args(self) -> argparse.Namespace:
@@ -2051,25 +2080,20 @@ class FmoeTuner(TunerCommon):
         else:
             w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
             w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
-        n_shared = fused_shared_experts(expert, topk)
-        e_routed, k_routed = expert - n_shared, topk - n_shared
         if TUNE_MOE_EXPERT_BALANCE:
-            score = torch.zeros((token, e_routed), dtype=dtype)
+            score = torch.zeros((token, expert), dtype=dtype)
             start_col = 0
-            end_col = k_routed
+            end_col = topk
             for token_id in range(token):
                 score[token_id, start_col:end_col] = 1.0
-                start_col = end_col % e_routed
-                end_col = start_col + k_routed
+                start_col = end_col % expert
+                end_col = start_col + topk
         else:
             routing_seed = os.environ.get("TUNE_MOE_ROUTING_SEED")
             if routing_seed is not None:
                 torch.manual_seed(int(routing_seed))
-            score = torch.randn((token, e_routed), dtype=dtype)
-        topk_weights, topk_ids = fused_topk(input, score, k_routed, True)
-        topk_weights, topk_ids = append_shared_experts(
-            topk_weights, topk_ids, expert, n_shared
-        )
+            score = torch.randn((token, expert), dtype=dtype)
+        topk_weights, topk_ids = fused_topk(input, score, topk, True)
         if q_type == QuantType.per_1x128:
             a1_qt, a1_scale = aiter.pertoken_quant(
                 input.view(token, -1, 128), quant_dtype=q_dtype_a
@@ -5336,7 +5360,7 @@ class FmoeTuner(TunerCommon):
         }
 
     def run_config(self, args, target_fused_moe=None, config_string=""):
-        from aiter.fused_moe import fused_moe
+        from aiter.fused_moe import fused_moe, fused_topk
         from aiter.test_common import checkAllclose, run_perftest
 
         if target_fused_moe is None:
@@ -5407,7 +5431,8 @@ class FmoeTuner(TunerCommon):
                 w1_scale_fmoe = inputs["w1_scale_fmoe"]
                 w2_scale_fmoe = inputs["w2_scale_fmoe"]
 
-                topk_weights, topk_ids = tuning_routing(hidden, expert, topk)
+                score = torch.randn((token, expert), dtype=dtype, device="cuda")
+                topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
                 if q_type == QuantType.per_1x128:
                     a1_qt, a1_scale = aiter.pertoken_quant(
                         hidden.view(token, -1, 128), quant_dtype=q_dtype_a
@@ -6553,25 +6578,26 @@ class FmoeTuner(TunerCommon):
                 "v2" in profileDF.columns
                 and not policy.measures_power
                 and not self.swiglu_limit_tag
-                and os.environ.get("TUNE_MOE_V2_E2E", "1") != "0"
+                and not getattr(args, "no_fused_moe_rerank", False)
             ):
                 finalists = _v2_e2e_finalists(profileDF)
                 if len(finalists) > 1:
                     try:
-                        e2e_us = self._time_pairs_in_fused_moe(
-                            key, profileDF.loc[finalists]
+                        scores = _v2_e2e_scores(
+                            self._time_pairs_in_fused_moe(key, profileDF.loc[finalists])
                         )
                     except Exception as err:  # noqa: BLE001
                         print(f"  fused_moe re-rank skipped ({err})", flush=True)
                     else:
-                        losers = _v2_e2e_losers(e2e_us)
+                        fastest = min(scores, key=scores.get)
+                        losers = [i for i in finalists if i != fastest]
                         for i in finalists:
                             pair = profileDF.loc[i]
                             print(
                                 f"  fused_moe re-rank: block_m={pair['block_m']} "
                                 f"{pair['kernelName1']} / {pair['kernelName2']}: "
                                 f"stage sum {pair['us1'] + pair['us2']:.1f} us, "
-                                f"fused_moe {e2e_us[i]:.1f} us"
+                                f"fused_moe unshared kernels {scores[i]:.1f} us"
                                 + (" (dropped)" if i in losers else ""),
                                 flush=True,
                             )
