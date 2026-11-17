@@ -123,6 +123,15 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.cs
    exception: its fp32 staging buffer is converted outside the kernel, so it is
    timed through the entry point.
 
+   `wan22_vae_bf16_tuned_conv3d.csv` has one more column, `us_mi350x`: each
+   row's config timed on an MI350X (gfx950, 256 CU) the way the table's `us`
+   was -- the kernel alone, operands prepared once, 100 warm-up launches, then
+   the median of 6 groups of 40 back-to-back launches, median over rounds.
+   `us`, `tflops` and `bw` stay MI355X numbers. The column is a record only:
+   the lookup, the AOT pass and the tuner do not read it, and a re-tune keeps
+   the old value, so re-measure it after one. The config merge carries it
+   through and fills it with 0 for the other tables' rows.
+
    gfx1250 rows also carry `block_r` (output rows of the R x C block),
    `num_buffers` (LDS ring depth, i.e. prefetch distance),
    `main_loop_unroll` (two K tiles per `scf.for` trip), `tile_k` (channels
