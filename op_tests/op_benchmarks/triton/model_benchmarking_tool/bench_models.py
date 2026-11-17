@@ -126,6 +126,10 @@ ROPE_METRIC_NOTE = (
 
 MLA_METRIC_NOTE = "Note: MLA benchmark only reports time (ms)."
 
+# Decode kernels that use batch_size as token concurrency and take their
+# context or state size from the shape, so only the first seq_len runs.
+DECODE_ONLY_KERNELS = ("sparse_mqa", "gated_delta_net_decode", "kda_attention_decode")
+
 # model_shapes.json model name -> bench_mla_decode.py --model value
 # (<family>-<size> from utils/model_configs.json). The MLA benchmark is skipped
 # for models that aren't in this mapping.
@@ -662,10 +666,16 @@ class KdaAttentionKernelHandler(KernelHandler):
             result.append(s)
         return result
 
+    def _tokens(self) -> int:
+        """Prefill sequence length, or decode tokens per sequence per step."""
+        if self._kernel == "kda_attention_prefill":
+            return self._seq_len
+        return int(self._shape.get("tokens_per_seq", 1))
+
     def build_args(self) -> str:
         shape = self._shape
         common = (
-            f"--batch_sizes {self._batch_size} --seq_lens {self._seq_len} "
+            f"--batch_sizes {self._batch_size} --seq_lens {self._tokens()} "
             f"--num_heads {shape['hq']} --backends gluon"
         )
         if self._kernel == "kda_attention_prefill":
@@ -694,7 +704,7 @@ class KdaAttentionKernelHandler(KernelHandler):
             "Model": self._model,
             "Kernel": self._kernel,
             "batch_size": self._batch_size,
-            "seq_len": self._seq_len,
+            "seq_len": self._tokens(),
             "hq": shape["hq"],
             "dqk": shape["dqk"],
             "dv": shape["dv"],
@@ -1151,16 +1161,15 @@ def run_benchmarks(
 
             handler.set_run(model, kernel, run_metric, gemm_layout, mha_layout, TP)
             tp_shapes = handler.get_tp_shapes(shapes)
+            kernel_seq_lens = (
+                seq_lens[:1] if kernel in DECODE_ONLY_KERNELS else seq_lens
+            )
             for shape in tp_shapes:
                 reason = handler.unsupported_reason(shape)
                 if reason is not None:
                     print(f"Skipping {kernel} for model '{model}': {reason}.")
                     continue
                 for batch_size in batch_sizes:
-                    # These decode kernels use batch_size as token concurrency.
-                    # Their context or state size comes from the shape metadata.
-                    decode_only = kernel in ("sparse_mqa", "gated_delta_net_decode")
-                    kernel_seq_lens = seq_lens[:1] if decode_only else seq_lens
                     for seq_len in kernel_seq_lens:
                         handler.set_iteration(shape, batch_size, seq_len)
                         bench_result = call_function(bench_fn, handler)
