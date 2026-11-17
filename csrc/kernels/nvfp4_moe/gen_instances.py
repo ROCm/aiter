@@ -18,7 +18,7 @@ AITER_DIR = (
     if os.path.exists(os.path.abspath(f"{this_dir}/../../../../aiter_meta"))
     else os.path.abspath(f"{this_dir}/../../../aiter")
 )
-DISPATCH_CSV = f"{AITER_DIR}/configs/moe_nvfp4_dispatch.csv"
+DISPATCH_CSV = f"{AITER_DIR}/configs/tuned_moe_nvfp4.csv"
 sys.path.insert(0, f"{AITER_DIR}/jit/utils")
 from moe_nvfp4_common import CFG_DEFAULTS, parse_kernel
 

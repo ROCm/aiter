@@ -229,7 +229,7 @@ def _check_jit_csv():
 
 
 def test_jit_csv(tmp_path):
-    path = tmp_path / "moe_nvfp4_dispatch.csv"
+    path = tmp_path / "tuned_moe_nvfp4.csv"
     path.write_text(
         "cu_num,token,model_dim,inter_dim,expert,topk,dtype,kernelName1,kernelName2\n"
         f"{get_cu_num()},1024,{H},768,{E},{TOPK},torch.bfloat16,{JIT_S1},{JIT_S2}\n"

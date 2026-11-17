@@ -4,7 +4,7 @@
 kernel rule and the tuned CSV. No torch import (gen_instances.py loads this file by
 path to build every default and CSV kernel into module_moe_nvfp4).
 
-Tuned CSV (aiter/configs/moe_nvfp4_dispatch.csv, AITER_CONFIG_MOE_NVFP4), the
+Tuned CSV (aiter/configs/tuned_moe_nvfp4.csv, AITER_CONFIG_MOE_NVFP4), the
 tuned_fmoe.csv column names:
     cu_num,token,model_dim,inter_dim,expert,topk,dtype,us1,kernelName1,err1,
     us2,kernelName2,err2,us,tflops,bw

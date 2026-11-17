@@ -137,7 +137,7 @@ constexpr Instance instance(const char* name)
 
 // The kernel table of a module: generated instance files (gen_instances.py) define the
 // Instance arrays and the registry functions. The name is the configuration (kernel_name); the
-// host selects kernels by name (aiter/ops/moe_nvfp4.py, aiter/configs/moe_nvfp4_dispatch.csv).
+// host selects kernels by name (aiter/ops/moe_nvfp4.py, aiter/configs/tuned_moe_nvfp4.csv).
 extern "C" int moe_nvfp4_kernels_num_cfgs();
 extern "C" const char* moe_nvfp4_kernels_cfg_name(int i);
 // out: CfgField order (moe_nvfp4_entry.h)
