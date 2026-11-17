@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Plan executor, quant strategies and route-reduce helpers."""
