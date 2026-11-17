@@ -970,3 +970,49 @@ def test_a_reporting_provider_that_lost_leaves_the_call_native(monkeypatch):
     aiter.rms_norm(small, small_w, 1e-6)
 
     assert plugin.last_decision().route == "native"
+
+
+@requires_cuda
+def test_a_comparison_made_at_capture_is_the_one_every_replay_runs(monkeypatch):
+    """Replay executes no Python, so the comparison is made once, at capture.
+
+    `_choose` documents this; without a test it is a belief. The failure it
+    guards against is quiet by construction: a provider that retunes, or that
+    would report differently on later calls, cannot change a captured route,
+    and nothing in the replay says which call decided it.
+    """
+
+    slower = _Provider(
+        "slower", _reporting("slower", _torch_rmsnorm, 9.0, 10.0, "aiter native")
+    )
+    slower.op_versions = {"rmsnorm": {2}}
+    faster = _Provider(
+        "faster", _reporting("faster", _native_rmsnorm, 4.0, 10.0, "aiter native")
+    )
+    faster.op_versions = {"rmsnorm": {2}}
+
+    plugin.configure(enable=("slower", "faster"), source="test")
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("s", slower), _EntryPoint("f", faster)),
+    )
+
+    x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+    graph, captured = _capture(lambda: aiter.rms_norm(x, weight, 1e-6))
+
+    decision = plugin.last_decision()
+    assert decision.provider == "faster"
+    assert decision.reason == plugin.PROVIDER_FASTER
+    asked_at_capture = (slower.select_calls, faster.select_calls)
+
+    # The reports reverse: were the comparison live, "slower" would now win.
+    slower.selected = _reporting("slower", _torch_rmsnorm, 1.0, 10.0, "aiter native")
+    graph.replay()
+    torch.cuda.synchronize()
+
+    # Nobody was asked again, and the route did not move.
+    assert (slower.select_calls, faster.select_calls) == asked_at_capture
+    assert plugin.last_decision().provider == "faster"
+    assert torch.allclose(captured, _native_rmsnorm(x, weight, 1e-6), atol=2e-2)
