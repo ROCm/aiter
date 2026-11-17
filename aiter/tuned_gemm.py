@@ -427,7 +427,6 @@ _eager_ops_are_ours = all(
 # whenever that path may do something else.
 _eager_hipb = None  # pybind entry points once resolved; False: off for the run
 _eager_gfx_cu: dict[int, tuple[str, int]] = {}
-_eager_dtype_str: dict[torch.dtype, str] = {}
 _eager_tensor_types: dict[type, bool] = {torch.Tensor: True, torch.nn.Parameter: True}
 _eager_weight_handles: OrderedDict = OrderedDict()
 _EAGER_WEIGHT_HANDLES_MAX = 1024
@@ -447,21 +446,6 @@ def _eager_tensor_type(cls: type) -> bool:
         )
         _eager_tensor_types[cls] = ok
     return ok
-
-
-def _eager_device_gfx_cu(index: int) -> tuple[str, int]:
-    """The (gfx, cu_num) `_gemm_a16w16` looks configs up with, once per device."""
-    from aiter.ops.opus._arch import SUPPORTED_OPUS_ARCHES, _device_arch_and_cu
-
-    gfx, cu_num = _device_arch_and_cu(torch.device("cuda", index))
-    if gfx not in SUPPORTED_OPUS_ARCHES:
-        gfx, cu_num = get_gfx(), get_cu_num()
-    _eager_gfx_cu[index] = (gfx, cu_num)
-    return gfx, cu_num
-
-
-def _eager_dtype_name(dtype: torch.dtype) -> str:
-    return _eager_dtype_str.setdefault(dtype, str(dtype))
 
 
 def _eager_weight_t_handle(B: Tensor, convert):
@@ -493,25 +477,15 @@ def _resolve_eager_hipb():
     None until the custom-op path has created the hipBLASLt extension: the first
     hipBLASLt GEMM of a process always runs there. False, for the rest of the
     run, when that path has per-call side effects someone asked for (shape
-    recording, per-op argument logging), when this torch lacks a probe the
-    guards need, or when an op runs a body other than the one registered here.
+    recording, per-op argument logging) or when an op runs a body other than
+    the one registered here.
     """
     global _eager_hipb
     if not extensions_created:
         return None
     from aiter.jit.core import _pybind_develop_hooks, get_module
 
-    dispatch_modes = getattr(torch._C, "_len_torch_dispatch_stack", None)
-    functorch_active = getattr(torch._C, "_are_functorch_transforms_active", None)
-    jit_tracing = getattr(torch._C, "_is_tracing", None)
-    if (
-        not _eager_ops_are_ours
-        or _record_gemm_shapes()
-        or AITER_LOG_MORE >= 2
-        or dispatch_modes is None
-        or functorch_active is None
-        or jit_tracing is None
-    ):
+    if not _eager_ops_are_ours or _record_gemm_shapes() or AITER_LOG_MORE >= 2:
         _eager_hipb = False
         return False
     convert, _, raw_stream, current_device = _pybind_develop_hooks()
@@ -522,9 +496,6 @@ def _resolve_eager_hipb():
         convert,
         raw_stream,
         current_device,
-        dispatch_modes,
-        functorch_active,
-        jit_tracing,
     )
     return _eager_hipb
 
@@ -555,21 +526,12 @@ def _hipblaslt_eager(
         hipb = _resolve_eager_hipb()
     if not hipb:
         return None
-    (
-        set_stream,
-        hipb_mm_op,
-        convert,
-        raw_stream,
-        current_device,
-        dispatch_modes,
-        functorch_active,
-        jit_tracing,
-    ) = hipb
+    set_stream, hipb_mm_op, convert, raw_stream, current_device = hipb
     known = _eager_tensor_types.get
     if (
-        dispatch_modes()
-        or functorch_active()
-        or jit_tracing()
+        torch._C._len_torch_dispatch_stack()
+        or torch._C._are_functorch_transforms_active()
+        or torch._C._is_tracing()
         or torch._C._has_torch_function((A, B, bias, out))
         or not (known(type(A)) or _eager_tensor_type(type(A)))
         or not (known(type(B)) or _eager_tensor_type(type(B)))
@@ -608,14 +570,16 @@ def _hipblaslt_eager(
     if out is not None and out.dtype != otype:
         return None
     bpreshuffle = getattr(B, "is_shuffled", None) is True
-    gfx, cu_num = _eager_gfx_cu.get(index) or _eager_device_gfx_cu(index)
+    gfx, cu_num = _eager_gfx_cu.get(index) or _eager_gfx_cu.setdefault(
+        index, _gemm_gfx_cu(inp.device)
+    )
     config = get_GEMM_A16W16_config(
         M=m,
         N=n,
         K=k,
         bias=bias is not None,
-        dtype=_eager_dtype_str.get(inp.dtype) or _eager_dtype_name(inp.dtype),
-        otype=_eager_dtype_str.get(otype) or _eager_dtype_name(otype),
+        dtype=str(inp.dtype),
+        otype=str(otype),
         scaleAB=False,
         bpreshuffle=bpreshuffle,
         gfx=gfx,
@@ -690,6 +654,16 @@ def gemm_a16w16_out(
     _gemm_a16w16_out_op(A, B, out, bias, otype, scale_a, scale_b, scale_c)
 
 
+def _gemm_gfx_cu(device: torch.device) -> tuple[str, int]:
+    """The (gfx, cu_num) a GEMM on ``device`` looks its tuned config up with."""
+    from aiter.ops.opus._arch import SUPPORTED_OPUS_ARCHES, _device_arch_and_cu
+
+    gfx, cu_num = _device_arch_and_cu(device)
+    if gfx not in SUPPORTED_OPUS_ARCHES:
+        gfx, cu_num = get_gfx(), get_cu_num()
+    return gfx, cu_num
+
+
 def _gemm_a16w16(
     A: Tensor,
     B: Tensor,
@@ -718,11 +692,7 @@ def _gemm_a16w16(
     otype = otype if otype is not None else inp_view.dtype
     if out is not None and out.dtype != otype:
         raise ValueError(f"gemm_a16w16: out is {out.dtype} but otype is {otype}")
-    from aiter.ops.opus._arch import SUPPORTED_OPUS_ARCHES, _device_arch_and_cu
-
-    gfx, cu_num = _device_arch_and_cu(inp_view.device)
-    if gfx not in SUPPORTED_OPUS_ARCHES:
-        gfx, cu_num = get_gfx(), get_cu_num()
+    gfx, cu_num = _gemm_gfx_cu(inp_view.device)
     config = get_GEMM_A16W16_config(
         M=m,
         N=n,
