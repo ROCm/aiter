@@ -2516,6 +2516,9 @@ def _validate_mha_v4_raw_inputs(
     return out
 
 
+_MHA_V4_THD_MAX_SPLITS = 4
+
+
 def _resolve_thd_kv_splits(
     kv_splits: Union[int, str],  # noqa: UP007
     q: Tensor,
@@ -2533,11 +2536,11 @@ def _resolve_thd_kv_splits(
 
     Not mha_v4_kv_splits(), whose rule is the dense fold's: this row slices inside the one
     launch, so a count neither has to divide the keys nor costs a copy at any batch. "auto"
-    takes the most slices whose work-groups still fit on the CUs once, since a second slice on a
-    CU reloads Q: the causal grid is one work-group per (document, head, pair of Q tiles), so
-    6/1 heads at 4K launch 48 on MI355X's 256 CUs. There, 6/1 device time with the merge went
-    0.170 -> 0.083 ms at 4K (5 slices) and 0.311 -> 0.217 ms at 8K (2); at 1K and 2K, 6/1 and
-    12/2 still gained up to 8 slices.
+    takes the most slices, up to _MHA_V4_THD_MAX_SPLITS, whose work-groups still fit on the CUs
+    once, since a second slice on a CU reloads Q: the causal grid is one work-group per
+    (document, head, pair of Q tiles), so 6/1 heads at 4K launch 48 on MI355X's 256 CUs. There,
+    6/1 causal device time with the merge is 141 -> 83 us at 4K (4 slices) and 258 -> 209 us at
+    8K (2). Partials are FP32, so the merged error stays below CK's at any count.
     """
     q_tiles = -(-max_seqlen // _MHA_V4_Q_TILE)
     q_groups, most = ((q_tiles + 1) // 2, q_tiles + 1) if causal else (q_tiles, q_tiles)
@@ -2546,7 +2549,7 @@ def _resolve_thd_kv_splits(
             return 1
         work_groups = (cu_seqlens.numel() - 1) * q.shape[1] * q_groups
         cus = torch.cuda.get_device_properties(q.device).multi_processor_count
-        return max(1, min(cus // max(work_groups, 1), most))
+        return max(1, min(_MHA_V4_THD_MAX_SPLITS, cus // max(work_groups, 1), most))
     if isinstance(kv_splits, bool) or not isinstance(kv_splits, int) or kv_splits < 1:
         raise ValueError(
             f'kv_splits must be a positive int or "auto", got {kv_splits!r}'
@@ -2607,12 +2610,13 @@ def _mha_v4_thd(
     )
 
     # The launcher writes [splits, total, heads, head_dim] and [splits, heads, total]: the answer
-    # itself at one slice, and otherwise the partials lse_merge folds as one batch of `splits`.
+    # itself at one slice, and otherwise the FP32 partials lse_merge folds as one batch of
+    # `splits`.
     total, heads = q.shape[0], q.shape[1]
     sliced_out = (
         out.unsqueeze(0)
         if splits == 1
-        else torch.empty((splits, *q.shape), dtype=q.dtype, device=q.device)
+        else torch.empty((splits, *q.shape), dtype=torch.float32, device=q.device)
     )
     sliced_lse = (
         torch.empty((splits, heads, total), dtype=torch.float32, device=q.device)

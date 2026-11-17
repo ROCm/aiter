@@ -1545,7 +1545,9 @@ void fmha_v4_fwd_thd(const at::Tensor& q,
     check_format_tensor(q, recipe.q_format, "Q");
     check_format_tensor(k, recipe.k_format, "K");
     check_format_tensor(v, recipe.v_format, "V");
-    TORCH_CHECK(out.scalar_type() == at::ScalarType::BFloat16, "THD MHA v4 out must be BF16");
+    // Slices write FP32 partials: BF16 ones cost ~7% rel L2 against CK once merged.
+    TORCH_CHECK(out.scalar_type() == (kv_splits == 1 ? at::ScalarType::BFloat16 : at::kFloat),
+                "THD MHA v4 out must be BF16, or FP32 partials when kv_splits > 1");
     for(const at::Tensor* t : std::initializer_list<const at::Tensor*>{&q, &k, &v, &out})
     {
         TORCH_CHECK(t->is_cuda() && t->get_device() == q.get_device(),
@@ -1617,9 +1619,22 @@ void fmha_v4_fwd_thd(const at::Tensor& q,
     }
 
     // A causal work-group owns Q tile i and its mirror n - 1 - i, so x covers half the tiles.
-    const int64_t q_tiles  = (max_seqlen + cfg.ts_qo - 1) / cfg.ts_qo;
-    const int64_t q_groups = causal ? (q_tiles + 1) / 2 : q_tiles;
-    launch_row(arch, cfg, &args, sizeof(args), q_groups * kv_splits, nhead_q, batch);
+    // With 2-5 slices a causal pair runs on kv_splits + 1 work-groups when its document has 4+
+    // Q tiles and nhead_q * pairs * (kv_splits + 1) <= 256 (the kernel decides this per document
+    // against 256 CUs). Work-groups past a document's need exit at once, so a pack sizes x by its
+    // longest document whenever its smallest such pair count, 2, could qualify.
+    const int64_t q_tiles    = (max_seqlen + cfg.ts_qo - 1) / cfg.ts_qo;
+    const int64_t q_groups   = causal ? (q_tiles + 1) / 2 : q_tiles;
+    const int64_t fit_groups = batch == 1 ? q_groups : 2;
+    const bool pair_extra    = causal && kv_splits >= 2 && kv_splits <= 5 && q_tiles >= 4 &&
+                            nhead_q * fit_groups * (kv_splits + 1) <= 256;
+    launch_row(arch,
+               cfg,
+               &args,
+               sizeof(args),
+               q_groups * (pair_extra ? kv_splits + 1 : kv_splits),
+               nhead_q,
+               batch);
 }
 
 void fmha_v4_fwd_sparse(const at::Tensor& q,

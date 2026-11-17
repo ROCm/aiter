@@ -2692,14 +2692,16 @@ def test_mha_v4_thd_rejects_what_it_cannot_run(kwargs, error, match):
 @skipif(get_gfx() != "gfx950", reason="gfx950 hd256 BF16 THD validation")
 def test_mha_v4_thd_launcher_refuses_slices_it_cannot_merge():
     """The slice count is the launcher's argument, not read off a tensor rank: it has to match
-    `out`, and more than one slice needs the LSE they are merged by."""
+    `out`, more than one slice writes FP32 partials, and they need the LSE they are merged by."""
     q, k, v = _thd_pack([512], 2, 2, seed=54)
     cu_seqlens = _cu_seqlens([512])
     launch = mha_v4_module._fmha_v4_fwd_thd
-    sliced = torch.empty((2, *q.shape), device="cuda", dtype=torch.bfloat16)
+    sliced = torch.empty((2, *q.shape), device="cuda", dtype=torch.float32)
 
     with expect_raises(RuntimeError, match="out must be \\[kv_splits, total_tokens"):
         launch(q, k, v, sliced, cu_seqlens, 512, 256**-0.5, True, 1)
+    with expect_raises(RuntimeError, match="FP32 partials when kv_splits > 1"):
+        launch(q, k, v, sliced.bfloat16(), cu_seqlens, 512, 256**-0.5, True, 2)
     with expect_raises(RuntimeError, match="merged by their LSE"):
         launch(q, k, v, sliced, cu_seqlens, 512, 256**-0.5, True, 2)
     wrong = torch.empty((1, 2, 512), device="cuda", dtype=torch.float32)
