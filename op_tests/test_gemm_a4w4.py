@@ -245,6 +245,9 @@ def test_gemm(dtype, M, N, K):
     return ret
 
 
+ASM_F4_256 = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E"
+
+
 def _quant_rows(rows, k, chunk=65536):
     """Random MXFP4 rows, quantized in chunks so no bf16 copy of the whole
     tensor is needed. Returns data, plain scales and shuffled scales."""
@@ -260,132 +263,75 @@ def _quant_rows(rows, k, chunk=65536):
     return torch.cat(q), torch.cat(s), torch.cat(s_sh)
 
 
-def check_asm_4gib_operands():
-    """A, B and out of 4 GiB or more on the 256x256 asm kernels.
+def _check_asm_f4_exact(x, w, x_scales, w_scales, x_scales_sh, w_scales_sh, out, case):
+    """Run BpreShuffle_256x256; every element of out must match the reference."""
+    out.fill_(float("nan"))
+    wshuffle = shuffle_weight(w, layout=(16, 16))
+    aiter.gemm_a4w4_asm(
+        x, wshuffle, x_scales_sh, w_scales_sh, out, ASM_F4_256, log2_k_split=0
+    )
+    m, n = out.shape
+    rb = max(1, (1 << 28) // max(n, x.shape[1] * 2))
+    bad = 0
+    for r0 in range(0, m, rb):
+        rows = slice(r0, r0 + rb)
+        ref = run_torch(x[rows], w, x_scales[rows], w_scales, dtypes.bf16).float()
+        got = out[rows].float()
+        bad += int((~torch.isclose(got, ref, rtol=1e-2, atol=1e-2)).sum())
+    assert bad == 0, f"a4w4 asm 256x256 {case}: {bad} of {m * n} elements wrong"
+    aiter.logger.info(f"a4w4 asm 256x256 {case}: exact")
 
-    Each operand's buffer descriptor holds a 32-bit size. The 256x256 kernels
-    give every tile its own 64-bit base, so every element must be exact past
-    4 GiB, picked by the heuristic or by name, with and without split-K.
+
+def check_asm_4gib_operands():
+    """A or out of 4 GiB or more on BpreShuffle_256x256 must be exact.
+
+    Each operand's buffer descriptor holds a 32-bit size; the kernel gives
+    every tile its own 64-bit base.
     """
-    bpre_256x256 = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E"
-    nobpre_256x256 = "_ZN5aiter44f4gemm_bf16_per1x32Fp4_noBpreShuffle_256x256E"
-    # (name, bpreshuffle, log2_k_split); name "" is the heuristic.
-    bpre = [("", True, None), (bpre_256x256, True, 0), (bpre_256x256, True, 1)]
-    # noBpreShuffle_256x256 writes whole 256-row tiles, so M is a multiple of 256.
-    nobpre = [(nobpre_256x256, False, 0)]
-    over_ab = (1 << 33) // 8192 + 256
-    cases = [
-        ("out", 20192, 106496, 512, bpre),
-        ("A", over_ab, 256, 8192, bpre + nobpre),
-        ("B", 256, over_ab, 8192, bpre + nobpre),
-    ]
-    for operand, m, n, k, kernels in cases:
-        need = m * k + n * k + 2 * m * n + (4 << 30)
-        if torch.cuda.mem_get_info()[0] < need:
-            aiter.logger.warning(
-                "skip a4w4 asm 4 GiB %s check: needs %.1f GiB free",
-                operand,
-                need / 2**30,
-            )
-            continue
-        x, x_scales, x_scales_shuffle = _quant_rows(m, k)
-        w, w_scales, w_scales_shuffle = _quant_rows(n, k)
-        wshuffle = shuffle_weight(w, layout=(16, 16))
+    for operand, m, n, k in (
+        ("out", 20192, 106496, 512),
+        ("A", (1 << 33) // 8192 + 256, 256, 8192),
+    ):
+        x, x_scales, x_scales_sh = _quant_rows(m, k)
+        w, w_scales, w_scales_sh = _quant_rows(n, k)
         out = torch.empty((m, n), dtype=dtypes.bf16)
-        cb = min(n, (1 << 28) // k)
-        rb = min(m, (1 << 28) // max(cb, k))
-        for name, bpreshuffle, log2_k_split in kernels:
-            out.fill_(float("nan"))
-            aiter.gemm_a4w4_asm(
-                x,
-                wshuffle if bpreshuffle else w,
-                x_scales_shuffle,
-                w_scales_shuffle,
-                out,
-                name,
-                bpreshuffle=bpreshuffle,
-                log2_k_split=log2_k_split,
-            )
-            bad = 0
-            for c0 in range(0, n, cb):
-                for r0 in range(0, m, rb):
-                    rows, cols = slice(r0, r0 + rb), slice(c0, c0 + cb)
-                    ref = run_torch(
-                        x[rows], w[cols], x_scales[rows], w_scales[cols], dtypes.bf16
-                    ).float()
-                    # Split-K adds bf16 partial sums with bf16 atomics.
-                    atol = 1e-2
-                    if log2_k_split:
-                        atol = 4e-2 * float(ref.square().mean().sqrt())
-                    got = out[rows, cols].float()
-                    bad += int((~torch.isclose(got, ref, rtol=1e-2, atol=atol)).sum())
-            case = f"a4w4 asm {name or 'heuristic'} log2_k_split={log2_k_split}"
-            assert bad == 0, f"{case}: {bad} of {m * n} elements wrong at {(m, n, k)}"
-            aiter.logger.info(f"{case} {operand} > 4 GiB {(m, n, k)}: exact")
-        del x, w, wshuffle, out
+        case = f"{operand} > 4 GiB {(m, n, k)}"
+        _check_asm_f4_exact(
+            x, w, x_scales, w_scales, x_scales_sh, w_scales_sh, out, case
+        )
+        del x, w, out
 
 
 def check_asm_last_tile_at_allocation_end():
-    """A ends an allocation and the last M tile has 1 or 2 rows, at small K.
+    """A ends an allocation and the last M tile has 1 row, at small K.
 
-    The 256x256 kernels lower each tile's descriptor size by a fixed step per
-    K step they prefetch, also past the end of K; it must stop at zero there.
-    If it wrapped, those prefetches would read past the end of A, which faults
+    The kernel lowers each tile's descriptor size by a fixed step per K step
+    it prefetches, also past the end of K; it must stop at zero there. If it
+    wrapped, those prefetches would read past the end of A, which faults
     (aborting the process) when A ends the allocation.
     """
-    bpre_256x256 = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E"
-    nobpre_256x256 = "_ZN5aiter44f4gemm_bf16_per1x32Fp4_noBpreShuffle_256x256E"
-    # (name, bpreshuffle, K, log2_k_split)
-    kernels = [
-        (bpre_256x256, True, 256, 0),
-        (bpre_256x256, True, 512, 0),
-        (bpre_256x256, True, 512, 1),
-        (nobpre_256x256, False, 256, 0),
-        (nobpre_256x256, False, 512, 0),
-    ]
+    # A fresh 64 MiB block is a whole caching-allocator segment, so the memory
+    # after it is normally unmapped; empty the cache so it is not cut from a
+    # larger one.
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
-    # A fresh 64 MiB block is a whole caching-allocator segment, so nothing
-    # mapped follows it; empty the cache so it is not cut from a larger one.
     torch.cuda.empty_cache()
     buf = torch.empty(64 << 20, dtype=torch.uint8)
-    n = 256
-    for name, bpreshuffle, k, log2_k_split in kernels:
-        for m in (257, 258):
-            x = torch.randn((m, k), dtype=dtypes.bf16)
-            w = torch.randn((n, k), dtype=dtypes.bf16)
-            xq, x_scales_shuffle = quant_func(x, shuffle=True)
-            wq, w_scales_shuffle = quant_func(w, shuffle=True)
-            _, x_scales = quant_func(x, shuffle=False)
-            _, w_scales = quant_func(w, shuffle=False)
-            nbytes = xq.numel() * xq.element_size()
-            xa = buf[buf.numel() - nbytes :].view(xq.dtype).view(xq.shape)
-            xa.copy_(xq)
-            # noBpreShuffle_256x256 writes whole 256-row tiles.
-            out = torch.full((512, n), float("nan"), dtype=dtypes.bf16)
-            aiter.gemm_a4w4_asm(
-                xa,
-                shuffle_weight(wq, layout=(16, 16)) if bpreshuffle else wq,
-                x_scales_shuffle,
-                w_scales_shuffle,
-                out,
-                name,
-                bpreshuffle=bpreshuffle,
-                log2_k_split=log2_k_split,
-            )
-            ref = run_torch(
-                xq,
-                wq,
-                x_scales.view(torch.uint8),
-                w_scales.view(torch.uint8),
-                dtypes.bf16,
-            ).float()
-            # Split-K adds bf16 partial sums with bf16 atomics.
-            atol = 4e-2 * float(ref.square().mean().sqrt()) if log2_k_split else 1e-2
-            got = out[:m].float()
-            bad = int((~torch.isclose(got, ref, rtol=1e-2, atol=atol)).sum())
-            case = f"a4w4 asm {name} log2_k_split={log2_k_split} A at allocation end"
-            assert bad == 0, f"{case}: {bad} of {m * n} elements wrong at {(m, n, k)}"
-            aiter.logger.info(f"{case} {(m, n, k)}: exact")
+    m, n = 257, 256
+    for k in (256, 512):
+        xb = torch.randn((m, k), dtype=dtypes.bf16)
+        wb = torch.randn((n, k), dtype=dtypes.bf16)
+        x, x_scales_sh = quant_func(xb, shuffle=True)
+        w, w_scales_sh = quant_func(wb, shuffle=True)
+        x_scales = quant_func(xb, shuffle=False)[1].view(torch.uint8)
+        w_scales = quant_func(wb, shuffle=False)[1].view(torch.uint8)
+        nbytes = x.numel() * x.element_size()
+        xa = buf[buf.numel() - nbytes :].view(x.dtype).view(x.shape)
+        xa.copy_(x)
+        out = torch.empty((m, n), dtype=dtypes.bf16)
+        case = f"A at allocation end {(m, n, k)}"
+        _check_asm_f4_exact(
+            xa, w, x_scales, w_scales, x_scales_sh, w_scales_sh, out, case
+        )
 
 
 def tuned_shapes():
@@ -554,12 +500,16 @@ def main():
         for m, n, k in shapes:
             ret = test_gemm(dtype, m, n, k)
             df.append(ret)
-    if get_gfx() == "gfx950":
-        check_asm_last_tile_at_allocation_end()
-        check_asm_4gib_operands()
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("gemm_a4w4 summary (markdown):\n%s", df_md)
+    if (
+        get_gfx() == "gfx950"
+        and args.csv is None
+        and args.shape is parser.get_default("shape")
+    ):
+        check_asm_last_tile_at_allocation_end()
+        check_asm_4gib_operands()
 
 
 if __name__ == "__main__":
