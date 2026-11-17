@@ -124,6 +124,17 @@ The sparse MQA benchmark uses `batch_size` as decode token concurrency. It
 gets the context length from `kv_len` and `extra_len`, so the tool runs only
 the first requested `seq_len` value for this kernel.
 
+### Manifold-constrained hyper-connections (`mhc`)
+
+| Field | Type   | Description                                     |
+|-------|--------|-------------------------------------------------|
+| `n`   | int    | Number of residual streams.                     |
+| `C`   | int    | Hidden size per residual stream.                |
+| `op`  | string | DSV4 operation: `"pre"`, `"post"`, or `"head"`. |
+
+MHC shapes are replicated and are not divided by TP. The benchmark supports
+the `time` and `bandwidth` metrics.
+
 ## Example
 
 ```json
