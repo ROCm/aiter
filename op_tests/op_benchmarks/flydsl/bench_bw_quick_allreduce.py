@@ -3,7 +3,12 @@
 """Bandwidth roofline: FlyDSL quick all-reduce (mesh, ring, hier) and RCCL.
 
 ``hier`` runs only where the GPUs split into two socket groups (or
-``AITER_FLY_AR_GROUPS`` names them) and the policy has its ladder.
+``AITER_FLY_AR_GROUPS`` names them) and the policy has its ladder. It takes
+its local schedules from the ladder; ``hier_<rs><ag>`` pins them on every rung,
+``m`` for the mesh and ``r`` for the ring (``hier_rr``: both local laps on the
+ring). ``--hier-super-tile`` replaces the ladder of every hierarchical
+variant by one rung at that super-tile, and ``--hier-codecs`` pins their
+wire formats, for tuning ``HIER_ST_LADDER``.
 
     HIP_VISIBLE_DEVICES=4,5,6,7 python3 \\
         op_tests/op_benchmarks/flydsl/bench_bw_quick_allreduce.py -tp 4
@@ -40,11 +45,29 @@ import report
 
 DEFAULT_TOKENS = (64, 256, 1024, 4096, 8192)
 HIDDEN = 7168
-ALGORITHMS = ("mesh", "ring", "hier")
+# The hierarchical schedule with both local laps pinned, as
+# ``(local_rs, local_ag)``.
+HIER_VARIANTS = {
+    f"hier_{rs[0]}{ag[0]}": (rs, ag)
+    for rs in ("mesh", "ring")
+    for ag in ("mesh", "ring")
+}
+ALGORITHMS = ("mesh", "ring", "hier", *HIER_VARIANTS)
+DEFAULT_ALGORITHMS = ("mesh", "ring", "hier")
 
 
 def _worker(
-    *, rank, world_size, init_method, algorithms, cases, reps, rounds, rccl_backend
+    *,
+    rank,
+    world_size,
+    init_method,
+    algorithms,
+    cases,
+    reps,
+    rounds,
+    rccl_backend,
+    hier_super_tile=None,
+    hier_codecs=None,
 ):
     import flydsl_allreduce_bench as fab
     import test_flydsl_quick_allreduce as qt
@@ -62,10 +85,16 @@ def _worker(
     # The policy lookup is deterministic, so every rank skips the same algorithms.
     engines = {}
     for a in algorithms:
+        kw = {"algorithm": a}
+        if a in HIER_VARIANTS:
+            kw = {"algorithm": "hier"}
+            kw["local_rs"], kw["local_ag"] = HIER_VARIANTS[a]
+        if kw["algorithm"] == "hier" and hier_super_tile is not None:
+            kw.update(super_tile=hier_super_tile, block=512, grid_cap=128)
+        if kw["algorithm"] == "hier" and hier_codecs is not None:
+            kw["rs_codec"], kw["x_codec"], kw["ag_codec"] = hier_codecs
         try:
-            engines[f"fly_{a}"] = qt._engine(
-                rank, world_size, gloo, device, {"algorithm": a}
-            )
+            engines[f"fly_{a}"] = qt._engine(rank, world_size, gloo, device, kw)
         except (NoPolicyError, ValueError) as e:
             # ValueError: hier on GPUs that do not split into two groups. The
             # topology is the same on every rank, so every rank skips it.
@@ -140,7 +169,23 @@ def main(argv=None) -> int:
     )
     p.add_argument("--hidden", type=int, default=HIDDEN)
     p.add_argument(
-        "--algorithms", nargs="+", choices=ALGORITHMS, default=list(ALGORITHMS)
+        "--algorithms",
+        nargs="+",
+        choices=ALGORITHMS,
+        default=list(DEFAULT_ALGORITHMS),
+    )
+    p.add_argument(
+        "--hier-super-tile",
+        type=int,
+        default=None,
+        help="run every hier variant on one rung: this super-tile, block 512",
+    )
+    p.add_argument(
+        "--hier-codecs",
+        type=lambda v: tuple(v.split(",")),
+        default=None,
+        metavar="RS,X,AG",
+        help="pin every hier variant's wire formats, e.g. int5,int5,int4",
     )
     p.add_argument(
         "--reps", type=int, default=None, help="default: flydsl_allreduce_bench's"
@@ -178,6 +223,8 @@ def main(argv=None) -> int:
         reps=reps,
         rounds=rounds,
         rccl_backend=args.rccl_backend,
+        hier_super_tile=args.hier_super_tile,
+        hier_codecs=args.hier_codecs,
     )
     header = [
         f"- device: {torch.cuda.get_device_name(0)}",

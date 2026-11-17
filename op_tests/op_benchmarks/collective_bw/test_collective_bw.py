@@ -691,3 +691,28 @@ def test_grouped_patterns_need_groups():
         Phase(Pattern.PUSH_GROUP, 1000, False, 1, PeerMem.FINE, 8, 4)
     with pytest.raises(ValueError):
         Phase(Pattern.PUSH_ALL, 1000, False, 1, PeerMem.FINE, 8, 4, ((0, 1), (2, 3)))
+
+
+def test_grouped_ring_reaches_the_next_rank_of_the_group():
+    """``PUSH_GROUP_NEXT`` writes to the next rank of the writer's group,
+    wrapping inside the group, so a hierarchical all-reduce whose local laps
+    run the ring sends ``G - 1`` chunks per lap to one destination."""
+    groups = ((0, 2, 4, 6), (1, 3, 5, 7))
+    ring = Phase(Pattern.PUSH_GROUP_NEXT, 1000, False, 3, PeerMem.FINE, 8, 4, groups)
+    x = Phase(Pattern.PUSH_PARTNER, 1000, False, 1, PeerMem.FINE, 8, 4, groups)
+    assert [(e, d) for _s, e, d in patterns.transfers(ring, 8)] == [
+        ("G0", "F2"),
+        ("G1", "F3"),
+        ("G2", "F4"),
+        ("G3", "F5"),
+        ("G4", "F6"),
+        ("G5", "F7"),
+        ("G6", "F0"),
+        ("G7", "F1"),
+    ]
+    t = Traffic(8, "all_reduce", 8000, (ring, x, ring), (RcclCall("all_reduce", 8000),))
+    assert patterns.fabric_bytes_per_rank(t) == 3 * 1000 + 1000 + 3 * 1000
+    import pytest
+
+    with pytest.raises(ValueError):
+        Phase(Pattern.PUSH_GROUP_NEXT, 1000, False, 1, PeerMem.FINE, 8, 4)

@@ -103,6 +103,9 @@ def transfers(phase: Phase, world_size: int) -> list[tuple[str, str, str]]:
             peers = [(i + 1) % n]
         elif phase.pattern == Pattern.PUSH_GROUP:
             peers = [j for j in group_of[i] if j != i]
+        elif phase.pattern == Pattern.PUSH_GROUP_NEXT:
+            mine = group_of[i]
+            peers = [mine[(mine.index(i) + 1) % len(mine)]]
         elif phase.pattern == Pattern.PUSH_PARTNER:
             mine = group_of[i]
             other = next(g for g in phase.groups if g is not mine)
