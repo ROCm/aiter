@@ -49,6 +49,7 @@ _LAZY_IMPORTS = {
         ".gemm_a16wfp4",
         "PreshuffledA16WFP4Weight",
     ),
+    "PreshuffledA4W4Weight": (".gemm_a4w4", "PreshuffledA4W4Weight"),
     "compute_varqlen_windows": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
@@ -85,6 +86,7 @@ _LAZY_IMPORTS = {
         "flydsl_fp8_paged_mqa_logits_gfx1250",
     ),
     "flydsl_gemm_a16wfp4": (".gemm_a16wfp4", "flydsl_gemm_a16wfp4"),
+    "flydsl_gemm_a4w4": (".gemm_a4w4", "flydsl_gemm_a4w4"),
     "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
     "flydsl_hstu_attention": (
         ".hstu_attention",
@@ -150,6 +152,7 @@ _LAZY_IMPORTS = {
         ".gemm_a16wfp4",
         "prepare_gemm_a16wfp4_weight",
     ),
+    "prepare_gemm_a4w4_weight": (".gemm_a4w4", "prepare_gemm_a4w4_weight"),
     "gather_kv_b_proj_flydsl_fp8_supported": (
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_fp8_supported",
@@ -236,6 +239,7 @@ __all__ = [
     "GateMode",
     "GatherWorkspace",
     "OneShotAllReduce",
+    "PreshuffledA4W4Weight",
     "PreshuffledA16WFP4Weight",
     "QuickAllReduceInt4",
     "a16wfp4_shape_supported",
@@ -252,6 +256,7 @@ __all__ = [
     "flydsl_fp8_paged_mqa_logits_gfx950",
     "flydsl_fp8_paged_mqa_logits_gfx1250",
     "flydsl_fp8_quant",
+    "flydsl_gemm_a4w4",
     "flydsl_gemm_a16wfp4",
     "flydsl_hgemm",
     "flydsl_hstu_attention",
@@ -286,6 +291,7 @@ __all__ = [
     "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
     "pa_decode",
+    "prepare_gemm_a4w4_weight",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
     "sparse_pa_nvfp4_decode",
