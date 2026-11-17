@@ -658,7 +658,7 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
 
 int64_t lamport_ar_rms_buffer_size(int64_t world_size, int64_t max_bytes)
 {
-    return aiter::lamport_ar_rms_buffer_bytes((int)world_size, max_bytes / 16);
+    return aiter::lamport_buffer_bytes((int)world_size, max_bytes / 16);
 }
 
 void init_lamport_ar_rms(fptr_t _fa, const std::vector<int64_t>& all_ptrs, int64_t max_bytes)
@@ -744,6 +744,58 @@ void allreduce_add_lamport(fptr_t _fa,
 #undef RUN_LAMPORT_ADD
 }
 
+void all_gather_lamport(fptr_t _fa,
+                        const aiter_tensor_t& inp,
+                        const aiter_tensor_t& out,
+                        int64_t dim,
+                        int64_t reg_inp_ptr,
+                        int64_t reg_inp_bytes)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    if(!inp.is_contiguous() || !out.is_contiguous() || out.dtype() != inp.dtype() ||
+       out.device_id != inp.device_id ||
+       out.numel() != inp.numel() * (size_t)fa->world_size_)
+        throw std::runtime_error("all_gather_lamport requires a contiguous input and a "
+                                 "contiguous out of world_size times its numel");
+    if(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16)
+        throw std::runtime_error("all_gather_lamport requires a 16B aligned out");
+    const int64_t bytes     = inp.numel() * inp.element_size();
+    const int64_t row_bytes = dim != 0 ? inp.size(-1) * inp.element_size() : bytes;
+    // The kernel loads whole 16B packs of the input, each before it writes any
+    // output, so it reads in place an aligned input clear of the output or its
+    // own slice of a dim-0 gather. Any other input is copied into the
+    // registered pool first: a rank-local choice, the protocol is the same, so
+    // ranks whose inputs differ in alignment still meet.
+    const void* input = inp.data_ptr();
+    if(reinterpret_cast<uintptr_t>(input) % 16 != 0 ||
+       !fa->ll_ag_reads_in_place(input, out.data_ptr(), bytes, row_bytes))
+    {
+        if(reg_inp_ptr == 0 || bytes > reg_inp_bytes)
+            throw std::runtime_error("all_gather_lamport: an unaligned or overlapping input "
+                                     "needs a registered buffer that holds it");
+        HIP_CALL(hipMemcpyAsync(
+            (void*)reg_inp_ptr, input, bytes, hipMemcpyDeviceToDevice, stream));
+        input = (const void*)reg_inp_ptr;
+    }
+    // The codec is picked from the dtype enum, not from a C++ type: with clang
+    // < 20 opus::bf16_t is unsigned short, the same type as a uint16 tensor's.
+    // The 0xffff half-word sentinel only where 0xffff is a NaN, so that
+    // rewriting it to 0x7fff keeps the value; every other dtype bit for bit.
+    switch(inp.dtype())
+    {
+    case AITER_DTYPE_fp16:
+    case AITER_DTYPE_bf16:
+        fa->allgather_lamport<aiter::LamportAgHalfSentinel>(
+            stream, input, out.data_ptr(), bytes, row_bytes);
+        break;
+    default:
+        fa->allgather_lamport<aiter::LamportAgEscape>(
+            stream, input, out.data_ptr(), bytes, row_bytes);
+    }
+}
+
 void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    const aiter_tensor_t& inp,
                                    const aiter_tensor_t& res_inp,
@@ -812,6 +864,49 @@ void two_sync_latency(fptr_t _fa, int64_t blocks)
         fa->sg_, fa->self_sg_, fa->rank_)
     DISPATCH_AG_NGPUS_1250(ws, LAUNCH_TWO_SYNC);
 #undef LAUNCH_TWO_SYNC
+}
+
+// ---- DCP merge (see dcp_merge_ll_gfx1250) ----
+
+int64_t dcp_merge_max_rows(fptr_t _fa)
+{
+    return reinterpret_cast<aiter::CustomAllreduce*>(_fa)->dcp_merge_max_rows();
+}
+
+void dcp_merge(fptr_t _fa,
+               const aiter_tensor_t& o,
+               const aiter_tensor_t& lse,
+               int64_t owned_ptr,
+               const aiter_tensor_t& out,
+               int64_t out_lse_ptr)
+{
+    HipDeviceGuard device_guard(o.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa            = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    if(o.dim() != 3 || o.dtype() != AITER_DTYPE_bf16 || o.size(2) != 128 || o.stride(2) != 1 ||
+       o.stride(0) % 4 != 0 || o.stride(1) % 4 != 0 || reinterpret_cast<uintptr_t>(o.data_ptr()) % 8 != 0)
+        throw std::invalid_argument("gfx1250 DCP merge: o must be [B, H, 128] bf16 with 8-byte aligned rows");
+    const int64_t B = o.size(0), H = o.size(1);
+    if(lse.dim() != 2 || lse.dtype() != AITER_DTYPE_fp32 || lse.size(0) != B || lse.size(1) != H)
+        throw std::invalid_argument("gfx1250 DCP merge: lse must be [B, H] fp32");
+    const int64_t ws = fa->world_size_;
+    if(H % ws != 0 || B * (H / ws) > fa->dcp_merge_max_rows())
+        throw std::invalid_argument("gfx1250 DCP merge: " + std::to_string(B) + " x " + std::to_string(H) +
+                                    " heads do not fit world size " + std::to_string(ws));
+    if(out.dtype() != AITER_DTYPE_bf16 || (int64_t)out.numel() != B * (H / ws) * 128 || !out.is_contiguous())
+        throw std::invalid_argument("gfx1250 DCP merge: out must be a contiguous [B, H / world_size, 128] bf16");
+    fa->dcp_merge(stream,
+                  o.data_ptr(),
+                  reinterpret_cast<const float*>(lse.data_ptr()),
+                  reinterpret_cast<const int*>(owned_ptr),
+                  out.data_ptr(),
+                  reinterpret_cast<float*>(out_lse_ptr),
+                  (int)B,
+                  (int)H,
+                  o.stride(0),
+                  o.stride(1),
+                  lse.stride(0),
+                  lse.stride(1));
 }
 
 } // namespace aiter
