@@ -129,6 +129,62 @@ class TestGfx1250StrictOpusRow(unittest.TestCase):
         self.assertEqual(config["libtype"], "triton")
 
 
+class TestOpusRowOperandLayout(unittest.TestCase):
+    """The OPUS launcher only reads K-contiguous A/B, so other layouts take the
+    backend the GEMM would use without the OPUS row (Triton on gfx1250)."""
+
+    M, N, K = 16, 4096, 512
+
+    def _backend_for(self, A, B):
+        opus_row = {"libtype": "opus", "solidx": 710, "splitK": 0, "kernelName": ""}
+        calls = []
+
+        def backend(name):
+            def run(inp, weights, *args, **kwargs):
+                calls.append(name)
+                return torch.zeros(inp.shape[0], weights.shape[0], dtype=inp.dtype)
+
+            return run
+
+        with (
+            mock.patch.object(tuned, "get_GEMM_A16W16_config", lambda **_: opus_row),
+            mock.patch(
+                "aiter.ops.opus._arch._device_arch_and_cu",
+                lambda _device: ("gfx1250", 96),
+            ),
+            mock.patch.dict(
+                tuned.solMap, {name: backend(name) for name in ("opus", "triton")}
+            ),
+        ):
+            tuned._gemm_a16w16(A, B)
+        return calls
+
+    def _launcher_accepts(self, A, B):
+        from aiter.ops.opus.gemm_op_a16w16 import _check_a16w16_launch_layout
+
+        Y = torch.empty(1, A.shape[0], B.shape[0], dtype=A.dtype)
+        try:
+            _check_a16w16_launch_layout(A.unsqueeze(0), B.unsqueeze(0), Y)
+        except NotImplementedError:
+            return False
+        return True
+
+    def test_backend_matches_the_launcher_layout_contract(self):
+        A = torch.randn(self.M, self.K, dtype=torch.bfloat16)
+        W = torch.randn(self.N, self.K, dtype=torch.bfloat16)
+        wide = torch.randn(self.M, 2 * self.K, dtype=torch.bfloat16)
+        cases = {
+            "contiguous": (A, W, "opus"),
+            "A with padded rows": (wide[:, : self.K], W, "opus"),
+            "B transposed": (A, W.t().contiguous().t(), "triton"),
+            "A transposed": (A.t().contiguous().t(), W, "triton"),
+        }
+        for name, (a, b, expected) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self._launcher_accepts(a, b), expected == "opus")
+                self.assertEqual(self._backend_for(a, b), [expected])
+
+
 class TestGfx1250FlydslCandidates(unittest.TestCase):
     """GemmA16W16Tuner's FlyDSL candidates on gfx1250, with the device mocked."""
 

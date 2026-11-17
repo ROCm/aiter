@@ -419,6 +419,12 @@ def gemm_a16w16_out(
     _gemm_a16w16(A, B, bias, otype, scale_a, scale_b, scale_c, out)
 
 
+def _opus_reads_layout(operand: Tensor, k: int) -> bool:
+    """Whether the OPUS launcher accepts this 2D operand: K-contiguous rows
+    with an optional padded leading dimension. It raises on any other layout."""
+    return operand.stride(-1) == 1 and operand.stride(0) >= k
+
+
 def _gemm_a16w16(
     A: Tensor,
     B: Tensor,
@@ -468,6 +474,15 @@ def _gemm_a16w16(
         gfx=gfx,
         cu_num=cu_num,
     )
+    if config["libtype"] == "opus" and not (
+        _opus_reads_layout(inp_view, k) and _opus_reads_layout(B, k)
+    ):
+        # Both backends read arbitrary strides, and an OPUS row implies no
+        # scales and no bpreshuffle, which is all Triton requires.
+        config = {
+            "libtype": "triton" if gfx in ("gfx1250", "gfx1250-strict") else "torch",
+            "solidx": 0,
+        }
     libtype = config["libtype"]
     solution_idx = config["solidx"]
     solfunc = solMap[libtype]
