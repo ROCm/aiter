@@ -316,7 +316,7 @@ def test_lse(kv_splits, H, invalid):
     if invalid:
         indices[indptr[3] : indptr[4]] = -1
     ref, ref_lse, mag = ref_case(q, cache, indptr, indices)
-    kw = dict(kv_splits=kv_splits, has_invalid=invalid > 0)
+    kw = {"kv_splits": kv_splits, "has_invalid": invalid > 0}
     out, lse = run_lse(q, cache, indptr, indices, **kw)
     assert_lse_close(lse, ref_lse, mag)
     assert_attn_close(out, ref)
@@ -360,7 +360,7 @@ def test_lse_merges_two_shards(kv_splits, H, invalid):
         len(lens), H, lens, invalid=invalid, seed=51
     )
     shards = split_shards(indptr, indices, seed=52, empty_b=(1, 4), empty_both=(5,))
-    kw = dict(has_invalid=invalid > 0)
+    kw = {"has_invalid": invalid > 0}
     parts = [
         run_lse(q, cache, ip, ix, kv_splits=kv_splits, keys_per_row=1024, **kw)
         for ip, ix in shards

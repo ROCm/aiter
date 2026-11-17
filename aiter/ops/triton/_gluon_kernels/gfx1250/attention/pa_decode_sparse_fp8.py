@@ -70,7 +70,6 @@ def _slot_layout(block_k, num_warps, split, cga):
     )
 
 
-
 @gluon.jit
 def _v4_dequant_lora_mx(
     kv_smem,
@@ -1121,7 +1120,9 @@ def _pa_decode_sparse_fp8(
     kv_bf16.index(1).store(
         gl.zeros([BLOCK_K, BLOCK_D], gl.bfloat16, layout=QDQ_BLOCKED_LAYOUT)
     )
-    s_prev = gl.full([BLOCK_H, BLOCK_K], float("-inf"), gl.float32, layout=QK_WMMA_LAYOUT)
+    s_prev = gl.full(
+        [BLOCK_H, BLOCK_K], float("-inf"), gl.float32, layout=QK_WMMA_LAYOUT
+    )
     for i in tl.range(0, num_iters):
         if CTAS_H > 1:
             gl.amd.gfx1250.cluster.arrive()

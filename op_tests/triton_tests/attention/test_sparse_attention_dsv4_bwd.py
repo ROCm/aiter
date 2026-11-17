@@ -54,7 +54,7 @@ def test_sparse_mla_bwd_dsv4(T, H, topk, npool, has_sink, r_chunk):
     sink = (torch.randn(H, device=dev, dtype=torch.float32) * 0.1) if has_sink else None
 
     indices = torch.randint(0, num_kv, (T, topk), dtype=torch.int32, device=dev)
-    invalid = torch.rand(T, topk, device=dev) < 0.1
+    invalid = torch.rand(T, topk, device=dev, dtype=torch.float32) < 0.1
     indices = torch.where(invalid, torch.full_like(indices, -1), indices).contiguous()
 
     qg = q.float().clone().requires_grad_(True)

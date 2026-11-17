@@ -88,8 +88,8 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
                 lds_typed_ptr(weight_off + row_byte_off, T.f32, align=4)
             )
         )
-        token = packed & fx.Int32(0x00FFFFFF)
-        slot = packed.shrui(fx.Int32(24)) & fx.Int32(0xFF)
+        token = packed & 0x00FFFFFF
+        slot = packed.shrui(fx.Int32(24)) & 0xFF
         dest_pe = token >> fx.Int32(log2_max_tok)
         dest_lid = token & fx.Int32(mask_max_tok)
         valid = (
@@ -129,7 +129,7 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
             )
         )
         values = [
-            fx.Float32(values_raw[q]) * fx.Float32(weight)
+            fx.Float32(values_raw[q]) * weight
             for q in range_constexpr(ALIGNED_PAIR_SCATTER_VEC)
         ]
         local_max = fabs_f32(values[0])
@@ -160,11 +160,11 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
                 leader_e8m0,
             )
         )
-        block_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
+        block_scale = (e8m0 << 23).bitcast(fx.Float32)
         packed_ty = T.vec(2, T.i16)
         packed_words = []
         for word in range_constexpr(ALIGNED_PAIR_SCATTER_VEC // 4):
-            packed_word = fx.Vector.filled(2, 0, fx.Int16).ir_value()
+            packed_word = fx.full(2, 0, fx.Int16).ir_value()
             for pair in range_constexpr(2):
                 value = word * 4 + pair * 2
                 packed_word = rocdl.cvt_scalef32_pk_fp8_f32(
@@ -222,7 +222,8 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
     recv_cap: int, comb_inp_nbytes: int, BM: int = 32,
     SBM: int = 128, BN: int = 256, BK: int = 256, INTER_MAX: int = 8192,
     use_nt: bool = False, cu_num: int = 722, g2_bhoist=True,
-    g2_ascale_pf=True):
+    g2_b2stage: bool = False, g2_ascale_pf=True,
+    g2_deep_a_pipeline: bool = False, a_dtype: str = "fp8"):
 # fmt: on
     """Compile the production two-expert common-row Stage2 kernel."""
     arch = str(get_rocm_arch() or "")
@@ -244,8 +245,14 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
         raise ValueError(
             f"aligned-pair BN must be divisible by {ALIGNED_PAIR_SCATTER_VEC}"
         )
-    a_stages = kStages + 1
-    compute_lds_bytes = _stage2_lds_bytes(BM, BN, BK, "fp8", a_stages)
+    if a_dtype not in ("fp4", "fp8"):
+        raise ValueError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
+    if g2_deep_a_pipeline and not g2_b2stage:
+        raise ValueError("g2_deep_a_pipeline requires g2_b2stage=True")
+    is_f8 = a_dtype == "fp8"
+    a_pack = 1 if is_f8 else 2
+    a_stages = 4 if g2_deep_a_pipeline else kStages + 1
+    compute_lds_bytes = _stage2_lds_bytes(BM, BN, BK, a_dtype, a_stages)
     second_compute_off = compute_lds_bytes
     lds_packed_a_off = compute_lds_bytes * 2
     lds_packed_b_off = lds_packed_a_off + BM * 4
@@ -265,8 +272,8 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
     expert_offset = rank * experts
     total_experts = npes * experts
     total_segments = total_experts + npes
-    k_bytes = inter_dim
-    kh_tile_a = BK
+    k_bytes = inter_dim // a_pack
+    kh_tile_a = BK // a_pack
     g2_bhoist, g2_ascale_pf, _, _, _, _ = _resolve_g2_knobs(
         g2_bhoist,
         g2_ascale_pf,
@@ -282,7 +289,8 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
     kernel_name = (
         f"megamoe_stage2_aligned_pair_runtime_t{BM}x{BN}x{BK}_cu{cu_num}"
         f"_seqacc4_sv{ALIGNED_PAIR_SCATTER_VEC}_ms1"
-        f"_nt{int(use_nt)}_bh{int(g2_bhoist)}apf{int(g2_ascale_pf)}"
+        f"_a{a_dtype}_nt{int(use_nt)}_bh{int(g2_bhoist)}b2{int(g2_b2stage)}"
+        f"apf{int(g2_ascale_pf)}da{int(g2_deep_a_pipeline)}"
         "_rtv3_rq2_hw1"
     )
 
@@ -311,7 +319,7 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
         packed_pair = pair_config[
             active_parity * fx.Int32(npes) + fx.Int32(rank)
         ]
-        fx.rocdl.s_waitcnt(0)
+        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         # Every lane loads the same entry; broadcasting a lane-0 SSA value
         # after divergent control flow can select the wrong experts.
         pair_a_lane = packed_pair & fx.Int32(0xFF)
@@ -330,18 +338,18 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
         group_b_lane = fx.Int32(0)
         group_rows_lane = fx.Int32(0)
         if lane == fx.Int32(0):
-            safe_prev_a = (pair_a_rt > fx.Int32(0)).select(
-                pair_a_rt - fx.Int32(1), fx.Int32(0)
+            safe_prev_a = (pair_a_rt > 0).select(
+                pair_a_rt - 1, fx.Int32(0)
             )
-            safe_prev_b = (pair_b_rt > fx.Int32(0)).select(
-                pair_b_rt - fx.Int32(1), fx.Int32(0)
+            safe_prev_b = (pair_b_rt > 0).select(
+                pair_b_rt - 1, fx.Int32(0)
             )
             prev_a = expert_tile_end[safe_prev_a] * fx.Int32(SBM)
             prev_b = expert_tile_end[safe_prev_b] * fx.Int32(SBM)
-            group_a_lane = (pair_a_rt > fx.Int32(0)).select(
+            group_a_lane = (pair_a_rt > 0).select(
                 prev_a, fx.Int32(0)
             )
-            group_b_lane = (pair_b_rt > fx.Int32(0)).select(
+            group_b_lane = (pair_b_rt > 0).select(
                 prev_b, fx.Int32(0)
             )
             group_count = fx.Int32(0)
@@ -390,7 +398,7 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
                     m_row,
                     wave,
                     lane,
-                    True,
+                    is_f8,
                     kh_tile_a,
                     fx.Int32(k_bytes),
                     BM=BM,
@@ -447,8 +455,9 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
                 lds_compute, arg_ascale, arg_bq, arg_bscale, fx.Int64(0), arg_aq,
                 i32_max_m_blocks, fx.Int32(0), lane, wave, i32_inter, i32_hidden,
                 fx.Int32(0), fx.Int32(0), BM=BM, BN=BN, BK=BK, use_nt=use_nt,
-                INTER_MAX=INTER_MAX, aStages=a_stages, a_dtype="fp8", SBM=BM,
-                g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
+                INTER_MAX=INTER_MAX, aStages=a_stages, a_dtype=a_dtype, SBM=BM,
+                g2_bhoist=g2_bhoist, g2_b2stage=g2_b2stage,
+                g2_ascale_pf=g2_ascale_pf, g2_deep_a_pipeline=g2_deep_a_pipeline,
                 expert_offset=expert_offset, explicit_m_row=m_row_a,
                 explicit_n_block=n_block, explicit_expert=global_a)
             # fmt: on
@@ -463,8 +472,9 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
                 lds_compute_b, arg_ascale, arg_bq, arg_bscale, fx.Int64(0), arg_aq,
                 i32_max_m_blocks, fx.Int32(0), lane, wave, i32_inter, i32_hidden,
                 fx.Int32(0), fx.Int32(0), BM=BM, BN=BN, BK=BK, use_nt=use_nt,
-                INTER_MAX=INTER_MAX, aStages=a_stages, a_dtype="fp8", SBM=BM,
-                g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
+                INTER_MAX=INTER_MAX, aStages=a_stages, a_dtype=a_dtype, SBM=BM,
+                g2_bhoist=g2_bhoist, g2_b2stage=g2_b2stage,
+                g2_ascale_pf=g2_ascale_pf, g2_deep_a_pipeline=g2_deep_a_pipeline,
                 expert_offset=expert_offset, explicit_m_row=m_row_b,
                 explicit_n_block=n_block, explicit_expert=global_b)
             _store_accumulator_tile(
@@ -488,15 +498,15 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
             # coprime to M. Pick a small prime which does not divide the
             # runtime group size; this spreads initially resident CTAs across
             # all source-rank row bands without changing coverage.
-            factor = (total_m_blocks % fx.Int32(17) != fx.Int32(0)).select(
+            factor = (total_m_blocks % 17 != 0).select(
                 fx.Int32(17),
-                (total_m_blocks % fx.Int32(13) != fx.Int32(0)).select(
+                (total_m_blocks % 13 != 0).select(
                     fx.Int32(13),
-                    (total_m_blocks % fx.Int32(11) != fx.Int32(0)).select(
+                    (total_m_blocks % 11 != 0).select(
                         fx.Int32(11),
-                        (total_m_blocks % fx.Int32(7) != fx.Int32(0)).select(
+                        (total_m_blocks % 7 != 0).select(
                             fx.Int32(7),
-                            (total_m_blocks % fx.Int32(5) != fx.Int32(0)).select(
+                            (total_m_blocks % 5 != 0).select(
                                 fx.Int32(5), fx.Int32(1)
                             ),
                         ),

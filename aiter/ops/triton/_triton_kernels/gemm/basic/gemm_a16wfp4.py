@@ -4,9 +4,9 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _gemm_a16wfp4_repr = make_kernel_repr(
@@ -31,8 +31,6 @@ _gemm_a16wfp4_repr = make_kernel_repr(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_gemm_a16wfp4_repr)
@@ -65,7 +63,6 @@ def _gemm_a16wfp4_kernel(
     num_stages: tl.constexpr,
     waves_per_eu: tl.constexpr,
     matrix_instr_nonkdim: tl.constexpr,
-    GRID_MN: tl.constexpr,
     ATOMIC_ADD: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
@@ -176,7 +173,7 @@ def _gemm_a16wfp4_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         if ATOMIC_ADD:
@@ -207,8 +204,6 @@ _gemm_a16wfp4_preshuffle_repr = make_kernel_repr(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_gemm_a16wfp4_preshuffle_repr)
@@ -241,7 +236,6 @@ def _gemm_a16wfp4_preshuffle_kernel(
     num_stages: tl.constexpr,
     waves_per_eu: tl.constexpr,
     matrix_instr_nonkdim: tl.constexpr,
-    GRID_MN: tl.constexpr,
     PREQUANT: tl.constexpr,
     cache_modifier: tl.constexpr,
 ):
@@ -374,7 +368,7 @@ def _gemm_a16wfp4_preshuffle_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + pid_k.to(tl.int64) * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)

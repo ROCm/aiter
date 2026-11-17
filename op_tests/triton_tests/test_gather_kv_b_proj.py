@@ -173,15 +173,12 @@ def _make_kv_test_data(
     k_scale = torch.randn(1, device=device, dtype=torch.float32).abs()
 
     var_ratio = 0.2
-    context_lens = (
-        torch.randint(
-            int((1 - var_ratio) * avg_kv_length),
-            int(((1 + var_ratio)) * avg_kv_length) + 1,
-            (batch_size,),
-        )
-        .cuda()
-        .to(torch.int32)
-    )
+    context_lens = torch.randint(
+        int((1 - var_ratio) * avg_kv_length),
+        int(((1 + var_ratio)) * avg_kv_length) + 1,
+        (batch_size,),
+        device="cuda",
+    ).to(torch.int32)
     context_blocks = torch.div(
         context_lens + block_size - 1, block_size, rounding_mode="trunc"
     )
@@ -250,15 +247,12 @@ def test_gather_kv_b_proj(
 
     # Generate random kv_indptr and kv_indices
     var_ratio = 0.2
-    context_lens = (
-        torch.randint(
-            int((1 - var_ratio) * avg_kv_length),
-            int(((1 + var_ratio)) * avg_kv_length) + 1,
-            (batch_size,),
-        )
-        .cuda()
-        .to(torch.int32)
-    )
+    context_lens = torch.randint(
+        int((1 - var_ratio) * avg_kv_length),
+        int(((1 + var_ratio)) * avg_kv_length) + 1,
+        (batch_size,),
+        device="cuda",
+    ).to(torch.int32)
     context_blocks = torch.div(
         context_lens + block_size - 1, block_size, rounding_mode="trunc"
     )
@@ -405,15 +399,12 @@ def test_gather_kv_b_proj_per_row_scale(
     k_scale = torch.randn(1, device=device, dtype=torch.float32).abs()
 
     var_ratio = 0.2
-    context_lens = (
-        torch.randint(
-            int((1 - var_ratio) * avg_kv_length),
-            int(((1 + var_ratio)) * avg_kv_length) + 1,
-            (batch_size,),
-        )
-        .cuda()
-        .to(torch.int32)
-    )
+    context_lens = torch.randint(
+        int((1 - var_ratio) * avg_kv_length),
+        int(((1 + var_ratio)) * avg_kv_length) + 1,
+        (batch_size,),
+        device="cuda",
+    ).to(torch.int32)
     context_blocks = torch.div(
         context_lens + block_size - 1, block_size, rounding_mode="trunc"
     )
@@ -565,15 +556,12 @@ def test_gather_kv_b_proj_bf16_weight(
     k_scale = torch.randn(1, device=device, dtype=torch.float32).abs()
 
     var_ratio = 0.2
-    context_lens = (
-        torch.randint(
-            int((1 - var_ratio) * avg_kv_length),
-            int(((1 + var_ratio)) * avg_kv_length) + 1,
-            (batch_size,),
-        )
-        .cuda()
-        .to(torch.int32)
-    )
+    context_lens = torch.randint(
+        int((1 - var_ratio) * avg_kv_length),
+        int(((1 + var_ratio)) * avg_kv_length) + 1,
+        (batch_size,),
+        device="cuda",
+    ).to(torch.int32)
     context_blocks = torch.div(
         context_lens + block_size - 1, block_size, rounding_mode="trunc"
     )
@@ -1044,15 +1032,12 @@ def test_gather_kv_b_proj_shuffled_kv(
     k_scale = torch.randn(1, device=device, dtype=torch.float32).abs()
 
     var_ratio = 0.2
-    context_lens = (
-        torch.randint(
-            int((1 - var_ratio) * avg_kv_length),
-            int(((1 + var_ratio)) * avg_kv_length) + 1,
-            (batch_size,),
-        )
-        .cuda()
-        .to(torch.int32)
-    )
+    context_lens = torch.randint(
+        int((1 - var_ratio) * avg_kv_length),
+        int(((1 + var_ratio)) * avg_kv_length) + 1,
+        (batch_size,),
+        device="cuda",
+    ).to(torch.int32)
     context_blocks = torch.div(
         context_lens + block_size - 1, block_size, rounding_mode="trunc"
     )

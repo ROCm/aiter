@@ -157,6 +157,7 @@ def _make_dispatch_tdm(
     off_ep_rowmap=0,
     max_tok_slot_stride=0,
     route_parallel=False,
+    row_gather=False,
 ):
     """Build the TDM dispatch kernel. Returns a ``@flyc.jit`` launcher.
 
@@ -177,6 +178,9 @@ def _make_dispatch_tdm(
     compact_row_stride = int(compact_row_stride)
     off_ep_rowmap = int(off_ep_rowmap)
     max_tok_slot_stride = int(max_tok_slot_stride)
+    row_gather = bool(row_gather)
+    if row_gather and not compact_plan:
+        raise ValueError("row_gather requires compact_plan")
     if WAVE != 32:
         raise ValueError(
             f"TDM dispatch is gfx1250-only (wave32); wave size resolved to {WAVE}"
@@ -326,13 +330,13 @@ def _make_dispatch_tdm(
         ctl = fx.Int64(fx.ptrtoint(ctl_ptr))
 
         def s_n(p):
-            return ctl + fx.Int64(p) * fx.Int64(4)
+            return ctl + fx.Int64(p) * 4
 
         def s_base(p):
-            return ctl + (fx.Int64(p) + fx.Int64(npes)) * fx.Int64(4)
+            return ctl + (fx.Int64(p) + fx.Int64(npes)) * 4
 
         def s_run(p):
-            return ctl + (fx.Int64(p) + fx.Int64(2 * npes)) * fx.Int64(4)
+            return ctl + (fx.Int64(p) + fx.Int64(2 * npes)) * 4
 
         # Tokens a warp takes per iteration. A fixed quota of `tpi` only fills the
         # grid once there are `warps_total * tpi` tokens to go round: below that
@@ -426,9 +430,7 @@ def _make_dispatch_tdm(
                     base = comm_ops.atomic_add_system(
                         fx.Int64(window.lsa_ptr(tid, off_tok_off)), n
                     )
-                    comm_ops.atomic_add_system(
-                        fx.Int64(addr_dest_pe_ctr) + fx.Int64(tid) * fx.Int64(4), n
-                    )
+                    comm_ops.atomic_add_system(addr_dest_pe_ctr + fx.Int64(tid) * 4, n)
                 comm_ops.store_i32_lds(s_base(tid), base)
             fx.barrier()
 
@@ -531,14 +533,14 @@ def _make_dispatch_tdm(
                 n_kv = n_tok * topk
                 kv_bytes = fx.Int64(src_tok) * fx.Int64(topk * 4)
                 kv_dbytes = fx.Int64(dst_tok) * fx.Int64(topk * 4)
-                s_idx = fx.Int64(addr_stg_idx) + kv_bytes
+                s_idx = addr_stg_idx + kv_bytes
                 d_idx = fx.Int64(window.lsa_ptr(peer_id, off_out_idx)) + kv_dbytes
-                s_wt = fx.Int64(addr_stg_wt) + kv_bytes
+                s_wt = addr_stg_wt + kv_bytes
                 d_wt = fx.Int64(window.lsa_ptr(peer_id, off_out_wts)) + kv_dbytes
-                s_src = fx.Int64(addr_stg_src) + fx.Int64(src_tok) * fx.Int64(4)
-                d_src = fx.Int64(window.lsa_ptr(peer_id, off_tis)) + fx.Int64(
-                    dst_tok
-                ) * fx.Int64(4)
+                s_src = addr_stg_src + fx.Int64(src_tok) * 4
+                d_src = (
+                    fx.Int64(window.lsa_ptr(peer_id, off_tis)) + fx.Int64(dst_tok) * 4
+                )
                 h_idx, r_idx = TDM.tdm_plan_xfer_4b(s_idx, d_idx, n_kv)
                 h_wt, r_wt = TDM.tdm_plan_xfer_4b(s_wt, d_wt, n_kv)
                 h_src, r_src = TDM.tdm_plan_xfer_4b(s_src, d_src, n_tok)
@@ -550,24 +552,22 @@ def _make_dispatch_tdm(
                 l_src = l_wt + b_wt * 4
                 if r_idx > 0:
                     TDM.tdm_load(
-                        TDM.tdm_group0(l_idx, s_idx + fx.Int64(h_idx) * fx.Int64(4)),
+                        TDM.tdm_group0(l_idx, s_idx + fx.Int64(h_idx) * 4),
                         TDM.tdm_group1_rows_4b(r_idx),
                     )
                 if r_wt > 0:
                     TDM.tdm_load(
-                        TDM.tdm_group0(l_wt, s_wt + fx.Int64(h_wt) * fx.Int64(4)),
+                        TDM.tdm_group0(l_wt, s_wt + fx.Int64(h_wt) * 4),
                         TDM.tdm_group1_rows_4b(r_wt),
                     )
                 if r_src > 0:
                     TDM.tdm_load(
-                        TDM.tdm_group0(l_src, s_src + fx.Int64(h_src) * fx.Int64(4)),
+                        TDM.tdm_group0(l_src, s_src + fx.Int64(h_src) * 4),
                         TDM.tdm_group1_rows_4b(r_src),
                     )
                 if const_expr(scale_bytes > 0):
                     n_sc = n_tok * scale_dst_dw
-                    s_sc = fx.Int64(addr_stg_scale) + fx.Int64(src_tok) * fx.Int64(
-                        scale_stride
-                    )
+                    s_sc = addr_stg_scale + fx.Int64(src_tok) * fx.Int64(scale_stride)
                     d_sc = fx.Int64(window.lsa_ptr(peer_id, off_out_scales)) + fx.Int64(
                         dst_tok
                     ) * fx.Int64(scale_stride)
@@ -576,7 +576,7 @@ def _make_dispatch_tdm(
                     l_sc = l_src + b_src * 4
                     if r_sc > 0:
                         TDM.tdm_load(
-                            TDM.tdm_group0(l_sc, s_sc + fx.Int64(h_sc) * fx.Int64(4)),
+                            TDM.tdm_group0(l_sc, s_sc + fx.Int64(h_sc) * 4),
                             TDM.tdm_group1_rows_4b(r_sc),
                         )
                 # The edges are global-to-global and owe the tile nothing, so they
@@ -607,22 +607,22 @@ def _make_dispatch_tdm(
                 TDM.tdm_wait(0)
                 if r_idx > 0:
                     TDM.tdm_store(
-                        TDM.tdm_group0(l_idx, d_idx + fx.Int64(h_idx) * fx.Int64(4)),
+                        TDM.tdm_group0(l_idx, d_idx + fx.Int64(h_idx) * 4),
                         TDM.tdm_group1_rows_4b(r_idx),
                     )
                 if r_wt > 0:
                     TDM.tdm_store(
-                        TDM.tdm_group0(l_wt, d_wt + fx.Int64(h_wt) * fx.Int64(4)),
+                        TDM.tdm_group0(l_wt, d_wt + fx.Int64(h_wt) * 4),
                         TDM.tdm_group1_rows_4b(r_wt),
                     )
                 if r_src > 0:
                     TDM.tdm_store(
-                        TDM.tdm_group0(l_src, d_src + fx.Int64(h_src) * fx.Int64(4)),
+                        TDM.tdm_group0(l_src, d_src + fx.Int64(h_src) * 4),
                         TDM.tdm_group1_rows_4b(r_src),
                     )
                 if const_expr(scale_bytes > 0) and r_sc > 0:
                     TDM.tdm_store(
-                        TDM.tdm_group0(l_sc, d_sc + fx.Int64(h_sc) * fx.Int64(4)),
+                        TDM.tdm_group0(l_sc, d_sc + fx.Int64(h_sc) * 4),
                         TDM.tdm_group1_rows_4b(r_sc),
                     )
                 TDM.tdm_wait(0)
@@ -803,8 +803,7 @@ def _make_dispatch_tdm(
                         TDM.tdm_load(
                             TDM.tdm_group0(
                                 my_tile,
-                                fx.Int64(addr_inp_tok)
-                                + fx.Int64(tok) * fx.Int64(nbytes),
+                                addr_inp_tok + fx.Int64(tok) * fx.Int64(nbytes),
                             ),
                             g_payload_load,
                         )
@@ -827,24 +826,93 @@ def _make_dispatch_tdm(
                                 )
                                 if const_expr(scale_vec == 2):
                                     comm_ops.store_i32_lds(
-                                        scale_lds + fx.Int64(si) * fx.Int64(4),
+                                        scale_lds + fx.Int64(si) * 4,
                                         val[0],
                                     )
                                     comm_ops.store_i32_lds(
-                                        scale_lds + fx.Int64(si + 1) * fx.Int64(4),
+                                        scale_lds + fx.Int64(si + 1) * 4,
                                         val[1],
                                     )
                                 else:
                                     comm_ops.store_i32_lds(
-                                        scale_lds + fx.Int64(si) * fx.Int64(4),
+                                        scale_lds + fx.Int64(si) * 4,
                                         val,
                                     )
                             fx.rocdl.s_wait_dscnt(0)
                         TDM.tdm_wait(0)
-                        if const_expr(compact_plan):
+                        if const_expr(row_gather):
+                            # One payload row per destination rank. GEMM1 gathers
+                            # it back to expert order through packed_meta in
+                            # ep_rowmap. `packed_meta // topk` is exactly this
+                            # token's payload slot, so a separate per-route
+                            # row_to_token write and its global clear barrier are
+                            # redundant.
+                            slot = fx.Int32(rank) * fx.Int32(max_tok_per_rank) + tok
+                            seen_peers = fx.Int32(0)
+                            owner = fx.Int32(1)
+                            if const_expr(route_parallel):
+                                my_flat = readlane(T.i32, flat, route_k)
+                                my_pe = my_flat & fx.Int32(compact_peer_mask)
+                                for j in range_constexpr(topk):
+                                    prev = readlane(T.i32, flat, j)
+                                    prev_pe = prev & fx.Int32(compact_peer_mask)
+                                    owner = arith.select(
+                                        (fx.Int32(j) < route_k)
+                                        & (prev >= 0)
+                                        & (prev_pe == my_pe),
+                                        fx.Int32(0),
+                                        owner,
+                                    )
+
+                            def ship_payload(dest_pe, slot):
+                                TDM.tdm_store(
+                                    TDM.tdm_group0(
+                                        my_tile,
+                                        fx.Int64(window.lsa_ptr(dest_pe, off_out_tok))
+                                        + fx.Int64(slot) * fx.Int64(row_stride),
+                                    ),
+                                    g_payload_store,
+                                )
+
                             # Unroll the live routes so each TDM descriptor is a
                             # distinct issue site. The ctpop walk serializes too
                             # many SGPR descriptor rebuilds through one loop.
+                            for k in range_constexpr(topk):
+                                bit = arith.constant(1 << k)
+                                live_k = (live_mask & bit) != 0
+                                flat_l = readlane(T.i32, flat, k)
+                                dest_pe = flat_l & compact_peer_mask
+                                dest_tok = flat_l >> compact_peer_bits
+                                peer_bit = fx.Int32(1) << dest_pe
+                                # Select, not an assignment inside the live
+                                # branch: the next unrolled route has to see it.
+                                if const_expr(not route_parallel):
+                                    first_peer = (seen_peers & peer_bit) == 0
+                                    seen_peers = arith.select(
+                                        live_k,
+                                        seen_peers | peer_bit,
+                                        seen_peers,
+                                    )
+                                if const_expr(route_parallel):
+                                    if live_k & (owner != 0):
+                                        ship_payload(dest_pe, slot)
+                                else:
+                                    if live_k & first_peer:
+                                        ship_payload(dest_pe, slot)
+                                if live_k & (lane == k):
+                                    buffer_store(
+                                        fx.Vector.from_elements(
+                                            [packed_meta, wt_bits],
+                                            dtype=fx.Int32,
+                                        ),
+                                        create_buffer_resource_from_addr(
+                                            fx.Int64(
+                                                window.lsa_ptr(dest_pe, off_ep_rowmap)
+                                            )
+                                        ),
+                                        dest_tok * 2,
+                                    )
+                        elif const_expr(compact_plan):
                             for k in range_constexpr(topk):
                                 bit = arith.constant(1 << k)
                                 if (live_mask & bit) != 0:
@@ -902,19 +970,25 @@ def _make_dispatch_tdm(
             arrive_ticket = arith.constant(-1)
             if tid == 0:
                 arrive_ticket = comm_ops.atomic_add_system(
-                    fx.Int64(addr_disp_bar), arith.constant(1)
+                    addr_disp_bar, arith.constant(1)
                 )
             if warp == 0:
                 arrive_ticket = readlane(T.i32, arrive_ticket, 0)
             is_last = (warp == 0) & (arrive_ticket == block_num - 1)
             if is_last:
                 if lane == 0:
-                    buffer_store(arith.constant(0), rsrc_disp_bar, 0)
+                    # Word 0 only. Word 2 and the sense are monotonic; clearing
+                    # either one drops the prologue wakeup on the next launch.
+                    comm_ops.store_i32_system(
+                        addr_disp_bar, arith.constant(0), arith.constant(0)
+                    )
+                    comm_ops.waitcnt_stores()
                 comm_ops.fence_system_release()
                 for dest_pe in range(lane, npes, WAVE):
-                    recv_num_remote_addr = fx.Int64(
-                        window.lsa_ptr(dest_pe, off_recv_num)
-                    ) + fx.Int64(rank) * fx.Int64(4)
+                    recv_num_remote_addr = (
+                        fx.Int64(window.lsa_ptr(dest_pe, off_recv_num))
+                        + fx.Int64(rank) * 4
+                    )
                     comm_ops.store_i32_system(
                         recv_num_remote_addr, arith.constant(0), arith.constant(1)
                     )
@@ -922,7 +996,7 @@ def _make_dispatch_tdm(
 
                 local_recv_num = fx.Int64(window.lsa_ptr(my_lsa_rank, off_recv_num))
                 for src_pe in range(lane, npes, WAVE):
-                    recv_num_src_addr = local_recv_num + fx.Int64(src_pe) * fx.Int64(4)
+                    recv_num_src_addr = local_recv_num + fx.Int64(src_pe) * 4
                     comm_ops.spin_until_gt_i32(recv_num_src_addr, 0)
                     comm_ops.store_i32_system(
                         recv_num_src_addr, arith.constant(0), arith.constant(0)
@@ -951,7 +1025,7 @@ def _make_dispatch_tdm(
             arrive_ticket = arith.constant(no_ticket)
             if tid == 0:
                 arrive_ticket = comm_ops.atomic_add_system(
-                    fx.Int64(addr_disp_bar), arith.constant(1)
+                    addr_disp_bar, arith.constant(1)
                 )
             if warp == 0:
                 arrive_ticket = readlane(T.i32, arrive_ticket, 0)
@@ -963,13 +1037,13 @@ def _make_dispatch_tdm(
                 for dest_pe in range(lane, npes, WAVE):
                     comm_ops.spin_until_eq_i32(
                         fx.Int64(window.lsa_ptr(dest_pe, off_recv_num))
-                        + fx.Int64(rank) * fx.Int64(4),
+                        + fx.Int64(rank) * 4,
                         0,
                     )
                 comm_ops.waitcnt_stores()
                 if lane == 0:
                     drain_ticket = comm_ops.atomic_add_system(
-                        fx.Int64(addr_disp_bar), arith.constant(1)
+                        addr_disp_bar, arith.constant(1)
                     )
                 drain_ticket = readlane(T.i32, drain_ticket, 0)
 
@@ -992,9 +1066,10 @@ def _make_dispatch_tdm(
                     for expert in range(lane, experts_per_rank, WAVE):
                         buffer_store(arith.constant(0), rsrc_route_counter, expert)
                 for dest_pe in range(lane, npes, WAVE):
-                    recv_num_remote_addr = fx.Int64(
-                        window.lsa_ptr(dest_pe, off_recv_num)
-                    ) + fx.Int64(rank) * fx.Int64(4)
+                    recv_num_remote_addr = (
+                        fx.Int64(window.lsa_ptr(dest_pe, off_recv_num))
+                        + fx.Int64(rank) * 4
+                    )
                     signal_value = (
                         buffer_load(rsrc_dest_ctr, dest_pe, vec_width=1, dtype=T.i32)
                         + 1
@@ -1015,7 +1090,7 @@ def _make_dispatch_tdm(
             if is_first:
                 if lane == 0:
                     comm_ops.store_i32_system(
-                        fx.Int64(addr_total_recv),
+                        addr_total_recv,
                         arith.constant(0),
                         arith.constant(0),
                     )
@@ -1023,14 +1098,12 @@ def _make_dispatch_tdm(
                 # program order; the wait is what makes it ahead in memory too.
                 comm_ops.waitcnt_stores()
                 for src_pe in range(lane, npes, WAVE):
-                    recv_num_src_addr = local_recv_num + fx.Int64(src_pe) * fx.Int64(4)
+                    recv_num_src_addr = local_recv_num + fx.Int64(src_pe) * 4
                     signal_value = comm_ops.spin_until_gt_i32(recv_num_src_addr, 0)
                     comm_ops.store_i32_system(
                         recv_num_src_addr, arith.constant(0), arith.constant(0)
                     )
-                    comm_ops.atomic_add_system(
-                        fx.Int64(addr_total_recv), signal_value - 1
-                    )
+                    comm_ops.atomic_add_system(addr_total_recv, signal_value - 1)
                 if lane == 0:
                     local_tok_off = fx.Int64(window.lsa_ptr(my_lsa_rank, off_tok_off))
                     comm_ops.store_i32_system(
