@@ -108,18 +108,5 @@ unused tail V/scales. The default mask keeps such inputs on FlyDSL. Supplying
 finite padding is a caller contract when opting into ASM, not something inferred
 from the host length hints. This interface does not return final LSE.
 
-## Verification
-
-From the AITER repository root, the policy and prepared-entry dispatch tests run
-without Torch, FlyDSL, or a GPU:
-
-```bash
-python -m unittest op_tests.test_pa_decode_dispatch.DispatchContractTests op_tests.test_pa_decode_dispatch.PreparedDispatchTests -v
-```
-
-The prepared-entry tests call the actual prepare, refresh, and decode functions
-with mocked GPU tensors and launchers. They verify both sides of the CSR/table
-thresholds, selected-backend-only execution, CSR conversion costs, and the safe
-defaults. They do not validate kernel correctness or measure GPU performance.
 The new multi-entry reducer CO and wave selection still need GPU revalidation
 before these historical crossover thresholds can be considered recalibrated.
