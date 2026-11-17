@@ -274,9 +274,11 @@ void h32_kernel(mqa_logits_mxfp4_kargs k) {
     opus::vector_t<float, EC> w[R];
     float* out_ptr[R];          // each row's window: base and byte count, uniform (SGPR)
     unsigned out_bytes[R];
-    // Lane maxima (pa_mqa_logits_mxfp4.h): never in Table, where the field holds the records.
-    float* const lane_max = SCHED == SCHED_TABLE ? nullptr : k.ptr_lane_max;
-    float* lm_ptr[R];           // each row's first slot (SGPR)
+    // Lane maxima (pa_mqa_logits_mxfp4.h): never in Table, where the field holds the records, and
+    // compiled out of it, so a Table code object is the same as without lane maxima.
+    constexpr bool LANE_MAX = SCHED != SCHED_TABLE;
+    [[maybe_unused]] float* const lane_max = LANE_MAX ? k.ptr_lane_max : nullptr;
+    [[maybe_unused]] float* lm_ptr[R];   // each row's first slot (SGPR)
     unsigned q_nan_rows = 0;    // bit r = row r's q scales hold a NaN (uniform)
     // A row's window and out offset through the constant address space, as the table: s_load.
     // Plain loads here come after a TDM issue, which clang 24 counts as a store to any memory, so
@@ -322,28 +324,31 @@ void h32_kernel(mqa_logits_mxfp4_kargs k) {
                                                  : (long long)row * k.out_stride;
         out_ptr[r]   = k.ptr_out + base;
         out_bytes[r] = (unsigned)(end > 0 ? end : 0) * (unsigned)sizeof(float);
-        lm_ptr[r]    = lane_max ? lane_max + base / LANE_MAX_TILES + (long long)row * LANE_MAX_ROW_PAD
-                                : nullptr;
+        if constexpr (LANE_MAX)
+            lm_ptr[r] = lane_max ? lane_max + base / LANE_MAX_TILES + (long long)row * LANE_MAX_ROW_PAD
+                                 : nullptr;
     });
     // A slot's running maximum, a lane a row and a pair of n-tiles (out[r][u] below). Two tile
     // indices keep the per-tile work to two scalar compares: from lm_mask_t on some row's window
     // ends inside the tile (masking then), and lm_flush_t is the next store (a 16-tile group's
     // last tile, or the chunk's).
-    float lmax[R][NT / 2];
-    int lm_mask_t = -1, lm_flush_t = -1;   // without lane_max: neither is ever reached
-    if (lane_max != nullptr) {   // uniform
-        int end_min = 0x7fffffff;
+    [[maybe_unused]] float lmax[R][NT / 2];
+    [[maybe_unused]] int lm_mask_t = -1, lm_flush_t = -1;   // without lane_max: neither is reached
+    if constexpr (LANE_MAX) {
+        if (lane_max != nullptr) {   // uniform
+            int end_min = 0x7fffffff;
+            opus::static_for<R>([&](auto rc) {
+                const int end = (int)(out_bytes[rc.value] / sizeof(float));
+                if (end > 0 && end < end_min) end_min = end;
+            });
+            lm_mask_t = end_min / TK - chunk_start;
+            lm_flush_t = LANE_MAX_TILES - 1 - chunk_start % LANE_MAX_TILES;
+            if (lm_flush_t > tile_count - 1) lm_flush_t = tile_count - 1;
+        }
         opus::static_for<R>([&](auto rc) {
-            const int end = (int)(out_bytes[rc.value] / sizeof(float));
-            if (end > 0 && end < end_min) end_min = end;
+            opus::static_for<NT / 2>([&](auto uc) { lmax[rc.value][uc.value] = -__builtin_inff(); });
         });
-        lm_mask_t = end_min / TK - chunk_start;
-        lm_flush_t = LANE_MAX_TILES - 1 - chunk_start % LANE_MAX_TILES;
-        if (lm_flush_t > tile_count - 1) lm_flush_t = tile_count - 1;
     }
-    opus::static_for<R>([&](auto rc) {
-        opus::static_for<NT / 2>([&](auto uc) { lmax[rc.value][uc.value] = -__builtin_inff(); });
-    });
 
     // Lane h holds head h's four block scales: a row's logits are all NaN if any is 0xFF. Tested
     // after every prologue load is out: tested per row as it loaded, the branch made each row's
@@ -453,40 +458,43 @@ void h32_kernel(mqa_logits_mxfp4_kargs k) {
                     if (kany) restore();
                 }
             }
-            // Lane maxima: one v_max a value (keys past a row's window masked in its last tiles);
-            // a slot is stored at its 16-tile group's end or the chunk's (a slot two CTAs share
-            // gets either store). Without lane_max both indices stay -1, which no tile reaches.
-            if (t < lm_mask_t) {   // uniform
-                opus::static_for<R>([&](auto rc) {
-                    opus::static_for<NT / 2>([&](auto uc) {
-                        lmax[rc.value][uc.value] =
-                            __builtin_fmaxf(lmax[rc.value][uc.value], out[rc.value][uc.value]);
+            if constexpr (LANE_MAX) {
+                // Lane maxima: one v_max a value (keys past a row's window masked in its last
+                // tiles); a slot is stored at its 16-tile group's end or the chunk's (a slot two
+                // CTAs share gets either store). Without lane_max both indices stay -1, which no
+                // tile reaches.
+                if (t < lm_mask_t) {   // uniform
+                    opus::static_for<R>([&](auto rc) {
+                        opus::static_for<NT / 2>([&](auto uc) {
+                            lmax[rc.value][uc.value] =
+                                __builtin_fmaxf(lmax[rc.value][uc.value], out[rc.value][uc.value]);
+                        });
                     });
-                });
-            } else if (lane_max != nullptr) {   // uniform
-                opus::static_for<R>([&](auto rc) {
-                    constexpr int r = rc.value;
-                    const int end = (int)(out_bytes[r] / sizeof(float));
-                    opus::static_for<NT / 2>([&](auto uc) {
-                        constexpr int u = uc.value;
-                        const float v = tile_off + u * 2 * T::MMA_N < end ? out[r][u] : -__builtin_inff();
-                        lmax[r][u] = __builtin_fmaxf(lmax[r][u], v);
-                    });
-                });
-            }
-            if (t == lm_flush_t) {   // uniform
-                const int g = (chunk_start + t) / LANE_MAX_TILES;
-                opus::static_for<R>([&](auto rc) {
-                    constexpr int r = rc.value;
-                    if (g * LANE_MAX_TILES * TK < (int)(out_bytes[r] / sizeof(float))) {
+                } else if (lane_max != nullptr) {   // uniform
+                    opus::static_for<R>([&](auto rc) {
+                        constexpr int r = rc.value;
+                        const int end = (int)(out_bytes[r] / sizeof(float));
                         opus::static_for<NT / 2>([&](auto uc) {
                             constexpr int u = uc.value;
-                            lm_ptr[r][g * 2 * WAVE + u * WAVE + lane] = lmax[r][u];
+                            const float v = tile_off + u * 2 * T::MMA_N < end ? out[r][u] : -__builtin_inff();
+                            lmax[r][u] = __builtin_fmaxf(lmax[r][u], v);
                         });
-                    }
-                    opus::static_for<NT / 2>([&](auto uc) { lmax[r][uc.value] = -__builtin_inff(); });
-                });
-                lm_flush_t = t + LANE_MAX_TILES < tile_count - 1 ? t + LANE_MAX_TILES : tile_count - 1;
+                    });
+                }
+                if (t == lm_flush_t) {   // uniform
+                    const int g = (chunk_start + t) / LANE_MAX_TILES;
+                    opus::static_for<R>([&](auto rc) {
+                        constexpr int r = rc.value;
+                        if (g * LANE_MAX_TILES * TK < (int)(out_bytes[r] / sizeof(float))) {
+                            opus::static_for<NT / 2>([&](auto uc) {
+                                constexpr int u = uc.value;
+                                lm_ptr[r][g * 2 * WAVE + u * WAVE + lane] = lmax[r][u];
+                            });
+                        }
+                        opus::static_for<NT / 2>([&](auto uc) { lmax[r][uc.value] = -__builtin_inff(); });
+                    });
+                    lm_flush_t = t + LANE_MAX_TILES < tile_count - 1 ? t + LANE_MAX_TILES : tile_count - 1;
+                }
             }
             __builtin_amdgcn_sched_barrier(0);
             opus::static_for<R>([&](auto rc) {
