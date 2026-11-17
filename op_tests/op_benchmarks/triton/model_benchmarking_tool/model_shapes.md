@@ -140,16 +140,23 @@ the `time` and `bandwidth` metrics.
 
 ### Kimi Delta Attention (`kda_attention_prefill`, `kda_attention_decode`)
 
-| Field | Type | Description                                                   |
-|-------|------|---------------------------------------------------------------|
-| `hq`  | int  | Total number of KDA heads. The tool divides this value by TP. |
-| `dqk` | int  | Query/key head dimension.                                     |
-| `dv`  | int  | Value head dimension.                                         |
+| Field            | Type | Description                                                      |
+|------------------|------|------------------------------------------------------------------|
+| `hq`             | int  | Total number of KDA heads. The tool divides this value by TP.    |
+| `dqk`            | int  | Query/key head dimension.                                        |
+| `dv`             | int  | Value head dimension.                                            |
+| `tokens_per_seq` | int  | Optional. Decode tokens per sequence per step. The default is 1. |
 
 Prefill uses `bench_chunk_kda.py`. Decode uses `bench_kda.py`. Both keys
 support the `time` and `bandwidth` metrics on gfx950 and gfx1250. The
 benchmarks report memory throughput, so the tool does not run them for the
 TFLOPS `throughput` metric.
+
+Prefill uses `batch_size` and `seq_len`. Decode keeps a fixed-size recurrent
+state, so its cost does not depend on the context length. Decode uses
+`batch_size` as the number of sequences, runs only the first requested
+`seq_len` value, and reports `tokens_per_seq` in the `seq_len` column. Set
+`tokens_per_seq` above 1 to model speculative decoding.
 
 ### Attention residuals (`attn_res`)
 
