@@ -15,7 +15,7 @@ from collections.abc import Callable
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, gpu, ptrtoint, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, T
 
 from aiter.ops.flydsl.kernels import buffer_ops, tensor_shim
@@ -215,6 +215,188 @@ def build_moe_apre_quant_module(
     return launch_quant
 
 
+def make_apre_payload_ops(
+    feat_dim: int, *, lds_row_stride_bytes: int = 0, output_preshuffled: bool = True
+):
+    """Share the existing M16 payload shuffle between local and peer gathers.
+
+    Returns the LDS size in dwords and two device functions: asynchronous
+    source-row-to-LDS copy, then LDS-to-preshuffled-output store. Each wave
+    supplies one source row address. Callers use 512 threads and wait for the
+    asynchronous copies followed by a workgroup barrier before storing.
+
+    A nonzero lds_row_stride_bytes selects row-major LDS input, as produced by
+    TDM gather. The output address mapping is shared with the original path.
+    With row-major LDS, output_preshuffled=False selects a row-major output
+    control using the same vector load/store operations.
+    """
+    validate_apre_k(feat_dim)
+    if not output_preshuffled and not lds_row_stride_bytes:
+        raise ValueError("row-major output requires a row-major LDS stride")
+    if lds_row_stride_bytes and (
+        lds_row_stride_bytes < feat_dim // 2 or lds_row_stride_bytes % 16
+    ):
+        raise ValueError("LDS row stride must cover the payload and align to 16B")
+    wave_size = 32
+    num_k_slices = feat_dim // _K_SLICE_SIZE
+    payload_dwords_per_row = feat_dim // _FP4_VALUES_PER_BYTE // _DWORD_BYTES
+    payload_slice_row_dwords = payload_dwords_per_row // num_k_slices
+    output_k256_dwords = _M_TILE_ROWS * _PAYLOAD_K256_ROW_DWORDS
+    output_k32_dwords = _M_TILE_ROWS * _PAYLOAD_VECTOR_DWORDS
+
+    @flyc.jit
+    def copy_payload_to_lds(
+        payload_lds: fx.Pointer, source_row_address: fx.Int64
+    ):
+        thread_id = fx.Uint32(fx.thread_idx.x)
+        row_in_m16 = thread_id // fx.Uint32(wave_size)
+        lane_id = thread_id % fx.Uint32(wave_size)
+        payload_lds_base_bytes = fx.Index(fx.ptrtoint(payload_lds))
+
+        def copy_payload_from_gmem_to_lds(slice_id):
+            """Direct asynchronous b128 copy; no payload VGPR staging."""
+            k256_in_slice = lane_id // fx.Uint32(_K32_PER_K256)
+            k32_in_k256 = lane_id % fx.Uint32(_K32_PER_K256)
+            swizzled_k32 = (
+                k32_in_k256 + row_in_m16 // fx.Uint32(_ROWS_PER_SWIZZLE_GROUP)
+            ) % fx.Uint32(_K32_PER_K256)
+            dst_dword = (
+                fx.Uint32(slice_id * _PAYLOAD_LDS_SLICE_DWORDS)
+                + k256_in_slice * fx.Uint32(_PAYLOAD_LDS_K256_DWORDS)
+                + row_in_m16 * fx.Uint32(_PAYLOAD_LDS_ROW_DWORDS)
+                + swizzled_k32 * fx.Uint32(_PAYLOAD_VECTOR_DWORDS)
+            )
+            src_dword = (
+                fx.Uint32(slice_id * payload_slice_row_dwords)
+                + lane_id * fx.Uint32(_PAYLOAD_VECTOR_DWORDS)
+            )
+            if const_expr(lds_row_stride_bytes > 0):
+                dst_dword = (
+                    row_in_m16 * fx.Uint32(lds_row_stride_bytes // _DWORD_BYTES)
+                    + src_dword
+                )
+            gptr = create_llvm_ptr(
+                source_row_address
+                + fx.Int64(src_dword) * _DWORD_BYTES,
+                address_space=1,
+            )
+            lptr = create_llvm_ptr(
+                fx.Int32(payload_lds_base_bytes) + fx.Int32(dst_dword) * _DWORD_BYTES,
+                address_space=3,
+            )
+            rocdl.global_load_async_to_lds_b128(gptr, lptr, 0)
+
+        for slice_id in range_constexpr(num_k_slices):
+            copy_payload_from_gmem_to_lds(slice_id)
+
+    @flyc.jit
+    def store_payload_from_lds(
+        payload_lds: fx.Pointer,
+        grouped_payload_address: fx.Int64,
+        m16_tile_id: fx.Uint32,
+    ):
+        lds_load_b128, _ = gemm_common.make_lds_copy_ops(128)
+        thread_id = fx.Uint32(fx.thread_idx.x)
+        payload_lds_base_bytes = fx.Index(fx.ptrtoint(payload_lds))
+        output_payload_resource = buffer_ops.create_buffer_resource_from_addr(
+            grouped_payload_address,
+            num_records_bytes=route_quant._SCALE_RSRC_MAX_BYTES,
+        )
+
+        def load_payload_from_lds(slice_id):
+            """Read a 16-byte payload vector in destination order."""
+            output_slice_offset_dwords = thread_id * fx.Uint32(_PAYLOAD_VECTOR_DWORDS)
+            output_k256_in_slice = output_slice_offset_dwords // fx.Uint32(
+                output_k256_dwords
+            )
+            output_k256_offset_dwords = (
+                output_slice_offset_dwords
+                - output_k256_in_slice * fx.Uint32(output_k256_dwords)
+            )
+            output_k32_in_k256 = output_k256_offset_dwords // fx.Uint32(
+                output_k32_dwords
+            )
+            output_k32_offset_dwords = (
+                output_k256_offset_dwords
+                - output_k32_in_k256 * fx.Uint32(output_k32_dwords)
+            )
+            output_row_in_m16 = output_k32_offset_dwords // fx.Uint32(
+                _PAYLOAD_VECTOR_DWORDS
+            )
+            output_swizzled_k32 = (
+                output_k32_in_k256
+                + output_row_in_m16 // fx.Uint32(_ROWS_PER_SWIZZLE_GROUP)
+            ) % fx.Uint32(_K32_PER_K256)
+            read_payload_lds_offset_dwords = (
+                output_k256_in_slice * fx.Uint32(_PAYLOAD_LDS_K256_DWORDS)
+                + output_row_in_m16 * fx.Uint32(_PAYLOAD_LDS_ROW_DWORDS)
+                + output_swizzled_k32 * fx.Uint32(_PAYLOAD_VECTOR_DWORDS)
+            )
+            slice_base_bytes = slice_id * _PAYLOAD_LDS_SLICE_DWORDS * _DWORD_BYTES
+            if const_expr(lds_row_stride_bytes > 0):
+                if const_expr(not output_preshuffled):
+                    output_row_in_m16 = thread_id // fx.Uint32(wave_size)
+                    output_k256_in_slice = (
+                        thread_id % fx.Uint32(wave_size)
+                    ) // fx.Uint32(_K32_PER_K256)
+                    output_k32_in_k256 = thread_id % fx.Uint32(_K32_PER_K256)
+                read_payload_lds_offset_dwords = (
+                    output_row_in_m16
+                    * fx.Uint32(lds_row_stride_bytes // _DWORD_BYTES)
+                    + fx.Uint32(slice_id * payload_slice_row_dwords)
+                    + output_k256_in_slice * fx.Uint32(_PAYLOAD_K256_ROW_DWORDS)
+                    + output_k32_in_k256 * fx.Uint32(_PAYLOAD_VECTOR_DWORDS)
+                )
+                slice_base_bytes = 0
+            output_payload_vec = lds_load_b128(
+                payload_lds_base_bytes
+                + fx.Index(slice_base_bytes),
+                fx.Index(read_payload_lds_offset_dwords * fx.Uint32(_DWORD_BYTES)),
+            )
+
+            return output_payload_vec
+
+        def store_payload_to_gmem(k256_offset, output_payload_vec, m16_tile_id):
+            """Store a 16-byte vector at its contiguous A-preshuffled address."""
+            output_offset = (
+                m16_tile_id * fx.Uint32(_M_TILE_ROWS * payload_dwords_per_row)
+                + k256_offset * fx.Uint32(output_k256_dwords)
+                + thread_id * fx.Uint32(_PAYLOAD_VECTOR_DWORDS)
+            )
+            if const_expr(not output_preshuffled):
+                output_offset = (
+                    (m16_tile_id * fx.Uint32(_M_TILE_ROWS)
+                     + thread_id // fx.Uint32(wave_size))
+                    * fx.Uint32(payload_dwords_per_row)
+                    + k256_offset * fx.Uint32(_PAYLOAD_K256_ROW_DWORDS)
+                    + (thread_id % fx.Uint32(wave_size))
+                    * fx.Uint32(_PAYLOAD_VECTOR_DWORDS)
+                )
+            buffer_ops.buffer_store(
+                output_payload_vec,
+                output_payload_resource,
+                output_offset,
+            )
+
+        for slice_id in range_constexpr(num_k_slices):
+            output_payload_vec = load_payload_from_lds(slice_id)
+            store_payload_to_gmem(
+                fx.Uint32(slice_id * _K256_PER_SLICE),
+                output_payload_vec,
+                m16_tile_id,
+            )
+
+    return (
+        (
+            _M_TILE_ROWS * lds_row_stride_bytes // _DWORD_BYTES
+            if lds_row_stride_bytes
+            else num_k_slices * _PAYLOAD_LDS_SLICE_DWORDS
+        ),
+        copy_payload_to_lds,
+        store_payload_from_lds,
+    )
+
+
 def build_moe_apre_scatter_module(
     feat_dim: int,
     wmma_rep: int,
@@ -256,7 +438,6 @@ def build_moe_apre_scatter_module(
     threads_per_block = _M_TILE_ROWS * wave_size
     num_k_slices = feat_dim // _K_SLICE_SIZE
     payload_bytes_per_row = quant_layout.payload_bytes_per_row
-    payload_dwords_per_row = payload_bytes_per_row // _DWORD_BYTES
     scale_dwords_per_row = quant_layout.mx_blocks_per_row // _DWORD_BYTES
     src_scale_stride_bytes = src_scale_stride_bytes or quant_layout.mx_blocks_per_row
     if (
@@ -266,14 +447,12 @@ def build_moe_apre_scatter_module(
         raise ValueError("input scale stride must cover the row and be dword aligned")
     source_scale_stride_dwords = src_scale_stride_bytes // _DWORD_BYTES
     scale_load_rounds = (scale_dwords_per_row + wave_size - 1) // wave_size
-    payload_slice_row_dwords = payload_dwords_per_row // num_k_slices
-    output_k256_dwords = _M_TILE_ROWS * _PAYLOAD_K256_ROW_DWORDS
-    output_k32_dwords = _M_TILE_ROWS * _PAYLOAD_VECTOR_DWORDS
+    payload_lds_dwords, copy_payload, store_payload = make_apre_payload_ops(feat_dim)
 
     @fx.struct
     class ScatterLds:
         payload: fx.Array[
-            fx.Int32, num_k_slices * _PAYLOAD_LDS_SLICE_DWORDS, _PAYLOAD_VECTOR_BYTES
+            fx.Int32, payload_lds_dwords, _PAYLOAD_VECTOR_BYTES
         ]
         scale: fx.Array[
             fx.Int32, num_k_slices * _SCALE_LDS_SLICE_DWORDS, _PAYLOAD_VECTOR_BYTES
@@ -298,8 +477,6 @@ def build_moe_apre_scatter_module(
         num_output_rows: Int32,
         num_workgroups: Int32,
     ):
-        lds_load_b128, _ = gemm_common.make_lds_copy_ops(128)
-
         thread_id = fx.Uint32(fx.thread_idx.x)
         block_id = fx.Uint32(fx.block_idx.x)
         wave_id = thread_id // fx.Uint32(wave_size)
@@ -308,12 +485,7 @@ def build_moe_apre_scatter_module(
         shared_allocator = fx.SharedAllocator()
         storage = shared_allocator.allocate(ScatterLds).peek()
         payload_lds = storage.payload.ptr
-        payload_lds_base_bytes = fx.Index(fx.ptrtoint(payload_lds))
         scale_lds = storage.scale.ptr
-        output_payload_resource = buffer_ops.create_buffer_resource_from_addr(
-            fx.Int64(ptrtoint(grouped_payload)),
-            num_records_bytes=route_quant._SCALE_RSRC_MAX_BYTES,
-        )
         output_scale_size_dwords = fx.Uint32(num_output_rows) * fx.Uint32(
             scale_dwords_per_row
         )
@@ -324,43 +496,6 @@ def build_moe_apre_scatter_module(
         row_to_token_buffer = tensor_shim.ptr_buf_tensor(row_to_token)
 
         row_in_m16 = wave_id
-
-        def load_payload_from_lds(slice_id):
-            """Read a 16-byte payload vector in destination order."""
-            output_slice_offset_dwords = thread_id * fx.Uint32(_PAYLOAD_VECTOR_DWORDS)
-            output_k256_in_slice = output_slice_offset_dwords // fx.Uint32(
-                output_k256_dwords
-            )
-            output_k256_offset_dwords = (
-                output_slice_offset_dwords
-                - output_k256_in_slice * fx.Uint32(output_k256_dwords)
-            )
-            output_k32_in_k256 = output_k256_offset_dwords // fx.Uint32(
-                output_k32_dwords
-            )
-            output_k32_offset_dwords = (
-                output_k256_offset_dwords
-                - output_k32_in_k256 * fx.Uint32(output_k32_dwords)
-            )
-            output_row_in_m16 = output_k32_offset_dwords // fx.Uint32(
-                _PAYLOAD_VECTOR_DWORDS
-            )
-            output_swizzled_k32 = (
-                output_k32_in_k256
-                + output_row_in_m16 // fx.Uint32(_ROWS_PER_SWIZZLE_GROUP)
-            ) % fx.Uint32(_K32_PER_K256)
-            read_payload_lds_offset_dwords = (
-                output_k256_in_slice * fx.Uint32(_PAYLOAD_LDS_K256_DWORDS)
-                + output_row_in_m16 * fx.Uint32(_PAYLOAD_LDS_ROW_DWORDS)
-                + output_swizzled_k32 * fx.Uint32(_PAYLOAD_VECTOR_DWORDS)
-            )
-            output_payload_vec = lds_load_b128(
-                payload_lds_base_bytes
-                + fx.Index(slice_id * _PAYLOAD_LDS_SLICE_DWORDS * _DWORD_BYTES),
-                fx.Index(read_payload_lds_offset_dwords * fx.Uint32(_DWORD_BYTES)),
-            )
-
-            return output_payload_vec
 
         def load_scale_from_lds(slice_id):
             """Read a scale dword in destination order."""
@@ -419,45 +554,6 @@ def build_moe_apre_scatter_module(
                     offset_is_bytes=True,
                 )
 
-        def store_payload_to_gmem(k256_offset, output_payload_vec, m16_tile_id):
-            """Store a 16-byte vector at its contiguous A-preshuffled address."""
-            buffer_ops.buffer_store(
-                output_payload_vec,
-                output_payload_resource,
-                m16_tile_id * fx.Uint32(_M_TILE_ROWS * payload_dwords_per_row)
-                + k256_offset * fx.Uint32(output_k256_dwords)
-                + thread_id * fx.Uint32(_PAYLOAD_VECTOR_DWORDS),
-            )
-
-        def copy_payload_from_gmem_to_lds(slice_id, source_row):
-            """Direct asynchronous b128 copy; no payload VGPR staging."""
-            k256_in_slice = lane_id // fx.Uint32(_K32_PER_K256)
-            k32_in_k256 = lane_id % fx.Uint32(_K32_PER_K256)
-            swizzled_k32 = (
-                k32_in_k256 + row_in_m16 // fx.Uint32(_ROWS_PER_SWIZZLE_GROUP)
-            ) % fx.Uint32(_K32_PER_K256)
-            dst_dword = (
-                fx.Uint32(slice_id * _PAYLOAD_LDS_SLICE_DWORDS)
-                + k256_in_slice * fx.Uint32(_PAYLOAD_LDS_K256_DWORDS)
-                + row_in_m16 * fx.Uint32(_PAYLOAD_LDS_ROW_DWORDS)
-                + swizzled_k32 * fx.Uint32(_PAYLOAD_VECTOR_DWORDS)
-            )
-            src_dword = (
-                source_row * fx.Uint32(payload_dwords_per_row)
-                + fx.Uint32(slice_id * payload_slice_row_dwords)
-                + lane_id * fx.Uint32(_PAYLOAD_VECTOR_DWORDS)
-            )
-            gptr = create_llvm_ptr(
-                fx.Int64(ptrtoint(compact_payload))
-                + fx.Int64(src_dword) * _DWORD_BYTES,
-                address_space=1,
-            )
-            lptr = create_llvm_ptr(
-                fx.Int32(payload_lds_base_bytes) + fx.Int32(dst_dword) * _DWORD_BYTES,
-                address_space=3,
-            )
-            rocdl.global_load_async_to_lds_b128(gptr, lptr, 0)
-
         def copy_scale_from_gmem_to_lds(source_row, dst_scale_lds):
             """Copy the row scales in wave-sized rounds, masking the final tail."""
             for scale_round in range_constexpr(scale_load_rounds):
@@ -505,17 +601,21 @@ def build_moe_apre_scatter_module(
             source_row = fx.Uint32(fx.max(mapped_token, fx.Int32(0)))
 
             copy_scale_from_gmem_to_lds(source_row, scale_lds)
-            for slice_id in range_constexpr(num_k_slices):
-                copy_payload_from_gmem_to_lds(slice_id, source_row)
+            copy_payload(
+                payload_lds,
+                fx.Int64(ptrtoint(compact_payload))
+                + fx.Int64(source_row) * payload_bytes_per_row,
+            )
             rocdl.s_wait_asynccnt(0)
             gpu.barrier()
 
             for slice_id in range_constexpr(num_k_slices):
                 k256_offset = fx.Uint32(slice_id * _K256_PER_SLICE)
                 output_scale_dword = load_scale_from_lds(slice_id)
-                output_payload_vec = load_payload_from_lds(slice_id)
                 store_scale_to_gmem(k256_offset, output_scale_dword, m16_tile_id)
-                store_payload_to_gmem(k256_offset, output_payload_vec, m16_tile_id)
+            store_payload(
+                payload_lds, fx.Int64(ptrtoint(grouped_payload)), m16_tile_id
+            )
 
     @flyc.jit
     def launch_scatter(

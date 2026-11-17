@@ -84,6 +84,7 @@ class Stage2ScatterContext:
     world_size: int
     source_token_map: torch.Tensor
     compact_layout: bool = False
+    compact_a_preshuffled: bool = False
     compact_masked_m: torch.Tensor | None = None
     compact_psum: torch.Tensor | None = None
     compact_ep_rowmap: torch.Tensor | None = None

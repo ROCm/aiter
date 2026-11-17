@@ -235,12 +235,15 @@ class _CompactDispatch(_Dispatch):
         self._plan_pending = False
         self._pending_align = None  # the alignment the pending plan writes
         self._plan_launches = {}
+        self._pull = None
         self.fusion = _Stage1Fusion(self)
 
     @classmethod
     def check(cls, config: MegaMoEConfig) -> None:
         from ..compact_plan import compact_plan_waves
+        from . import pull
 
+        pull.check(config)
         segs = config.world_size * config.experts_per_rank
         if segs > _MAX_PLAN_SEGMENTS:
             raise ValueError(
@@ -290,6 +293,9 @@ class _CompactDispatch(_Dispatch):
             "compact_hist": 2 * geo.hist_stride * 4,
             "compact_done": compact_done_nbytes(),
         }
+        from . import pull
+
+        regions.update(pull.regions(config, geo))
         if s1f is None:
             s1f = allocates_flags(config)
         if s1f:
@@ -389,6 +395,9 @@ class _CompactDispatch(_Dispatch):
         self._ep_rowmap = _from_gpu_ptr(
             arena.local_ptr("ep_rowmap"), (geo.cap + 1, 2), torch.int32
         )
+        from . import pull
+
+        self._pull = pull.PullDispatch(self) if pull.enabled(config) else None
 
     def _build_kernels(self) -> dict:
         """The TDM dispatch kernels, keyed by (block, warp, route_parallel) spec."""
@@ -505,6 +514,8 @@ class _CompactDispatch(_Dispatch):
                 f"recv_token_bound={recv_token_bound} needs {self._step.align_m}; "
                 "pass the bound the plan was started with"
             )
+        if self._pull is not None and not s1f and not self.fusion.should_probe():
+            return self._pull.run(hidden_states, topk_weights, topk_ids)
         overlap_next = (
             next_topk_ids is not None
             and int(next_topk_ids.shape[0]) > 0
@@ -614,6 +625,8 @@ class _CompactDispatch(_Dispatch):
         _check_recv_token_bound(self.config, "recv_token_bound", recv_token_bound)
         token_count = int(topk_ids.shape[0])
         self._step = self._step_for(self._recv_bound(recv_token_bound))
+        if self._pull is not None and not self.fusion.step_will_run():
+            return
         self._launch_plan(
             topk_ids,
             token_count,

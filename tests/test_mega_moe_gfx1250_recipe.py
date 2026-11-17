@@ -140,6 +140,9 @@ def _install_mori(monkeypatch, describe=True):
 @pytest.fixture
 def mori(monkeypatch):
     _install_mori(monkeypatch)
+    # The reference layout below describes the ordinary push arena.
+    monkeypatch.setenv("AITER_MEGA_S1F", "0")
+    monkeypatch.setenv("AITER_MEGA_DISPATCH_PULL", "0")
     monkeypatch.setenv("AITER_TDM_TILE_M", str(COMPACT_TILE))
     monkeypatch.delenv("AITER_TDM_TILE_M2", raising=False)
     yield mori_caps._mori_capabilities()
@@ -522,3 +525,45 @@ def test_compact_refuses_a_plan_started_for_another_alignment(mori):
     wts = torch.zeros(4, 8, dtype=torch.float32)
     with pytest.raises(ValueError, match="the compact plan already started"):
         stage.dispatch(x, wts, ids, recv_token_bound=8)
+
+
+@pytest.mark.parametrize("wire", ["fp4", "fp8"])
+def test_pull_regions_and_wire_gate(mori, monkeypatch, wire):
+    """Pull storage is opt-in and its packed layout accepts only FP4."""
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.stages import pull
+
+    config = _config(D.COMPACT, C.FUSED_SCATTER, wire, ("bf16",),
+                     4, 7168, 8, 16, 8)
+    stage_cls = recipe._stage_classes(config.recipe)[0]
+    monkeypatch.setenv("AITER_MEGA_DISPATCH_PULL", "0")
+    before = stage_cls.regions(config)
+    assert "pull_wire" not in before
+    monkeypatch.setenv("AITER_MEGA_DISPATCH_PULL", "1")
+    if wire == "fp8":
+        with pytest.raises(ValueError, match="FP4 dispatch"):
+            pull.check(config)
+    else:
+        pull.check(config)
+        after = stage_cls.regions(config)
+        assert after["pull_wire"] == config.max_tokens_per_rank * _push_wire(7168)
+        assert after["pull_ready"] == 4
+        assert all(after[name] == size for name, size in before.items())
+
+
+def test_preshuffled_grouping_reaches_scatter_context():
+    """A pull batch must carry its layout through to the GEMM context."""
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.stages.base import ExpertGrouping
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
+
+    counts = torch.tensor([3, 0], dtype=torch.int32)
+    grouping = ExpertGrouping(
+        counts, counts, torch.zeros(17, 2, dtype=torch.int32),
+        0, 4, 16, 16, a_preshuffled=True,
+    )
+    context = Stage2ScatterContext(
+        0, 0, 128, 4, 4, torch.zeros(4, dtype=torch.int32),
+        **grouping.scatter_fields(),
+    )
+    assert context.compact_a_preshuffled
+    assert context.compact_wire_row_stride == 0
+    assert context.compact_psum is counts

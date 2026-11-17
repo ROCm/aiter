@@ -31,6 +31,7 @@ import socket
 import sys
 import traceback
 import warnings
+from unittest import mock
 
 import torch
 import torch.distributed as dist
@@ -547,7 +548,154 @@ def _check_vmm_bound(ctx):
         check.settle()
 
 
+
+def _check_pull(ctx, *, a_preshuffled=True):
+    """Validate remote FP4 bytes, inverse maps, and changing graph inputs."""
+    from aiter.test_common import checkAllclose
+
+    fields = _fields("compact", "fused_scatter", "fp4", "bf16")
+    check = _Checks("compact pull/preshuffle")
+    saved_ids, saved_x = ctx.ids.clone(), ctx.x.clone()
+    saved_weights = ctx.wts.clone()
+    push = pull = None
+    try:
+        with mock.patch.dict(os.environ, {
+            "AITER_MEGA_S1F": "0", "AITER_MEGA_DISPATCH_PULL": "0",
+        }):
+            push = ctx.build(**fields)
+        with mock.patch.dict(os.environ, {
+            "AITER_MEGA_S1F": "0", "AITER_MEGA_DISPATCH_PULL": "1",
+        }):
+            pull = ctx.build(**fields)
+        check(pull._ep._dispatch._pull is not None, "pull was not selected")
+        check.settle()
+        # Warm the same addresses used in capture. The input contents change
+        # afterward, exercising generations and stale padding/empty experts.
+        ctx.layer(push, "bf16")
+        ctx.layer(pull, "bf16")
+        torch.cuda.synchronize()
+        ctx.comm.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = ctx.layer(pull, "bf16")
+        for iteration in range(4):
+            if iteration % 2:
+                hot = torch.arange(TOPK, device=ctx.device, dtype=torch.int32)
+                ctx.ids.copy_(hot.expand_as(ctx.ids))
+            else:
+                ctx.ids.copy_(saved_ids)
+            ctx.x.copy_(torch.roll(saved_x, iteration * 17, dims=1))
+            ctx.wts.copy_(torch.roll(saved_weights, iteration, dims=1))
+            expected = ctx.layer(push, "bf16").clone()
+            graph.replay()
+            torch.cuda.synchronize()
+            err = checkAllclose(
+                expected.float(), captured.float(), rtol=1e-2, atol=1e-2,
+                msg=f"pull vs push iteration {iteration}",
+            )
+            check(err == 0, f"pull output mismatch {err}")
+
+            stage = pull._ep._dispatch
+            helper = stage._pull
+            quant, _ = stage._quantize(ctx.B._rmsnorm(ctx.x), TOKENS)
+            torch.cuda.synchronize()
+            local = (
+                quant.view(torch.uint8).cpu(),
+                stage._quant_scales.view(torch.uint8).cpu(),
+                ctx.wts.view(torch.int32).cpu().reshape(-1),
+            )
+            sources = [None] * ctx.world
+            dist.all_gather_object(sources, local)
+            counts = helper.masked_m.cpu().tolist()
+            ends = helper.psum.cpu().tolist()
+            valid = torch.cat([
+                torch.arange(end - count, end) for count, end in zip(counts, ends)
+            ]).long()
+            rowmap = stage._ep_rowmap.cpu()[valid]
+            if a_preshuffled:
+                packed = helper.payload.cpu().reshape(-1, HIDDEN // 32, 16, 16)
+                plain = packed.permute(0, 2, 1, 3).reshape(-1, HIDDEN // 2)
+            else:
+                plain = helper.payload.cpu().reshape(-1, HIDDEN // 2)
+            actual_payload = plain[valid]
+            actual_scales = helper.scales.cpu()[valid]
+            for source in range(ctx.world):
+                mask = rowmap[:, 0] // (TOKENS * TOPK) == source
+                routes = rowmap[mask, 0] % (TOKENS * TOPK)
+                tokens = routes // TOPK
+                check(torch.equal(actual_payload[mask], sources[source][0][tokens]),
+                      f"source {source}: pulled FP4 payload differs")
+                check(torch.equal(actual_scales[mask], sources[source][1][tokens]),
+                      f"source {source}: pulled scales differ")
+                check(torch.equal(rowmap[mask, 1], sources[source][2][routes]),
+                      f"source {source}: routing weight bits differ")
+            if iteration == 0:
+                # The original single-GPU entry point must keep working after
+                # its payload operations are shared with remote pull dispatch.
+                import flydsl.expr as fx
+
+                from aiter.ops.flydsl.kernels.moe_apreshuffled_quant_scatter import (
+                    build_moe_apre_scatter_module,
+                )
+                from aiter.ops.flydsl.kernels.tensor_shim import (
+                    _run_compiled,
+                    ptr_arg,
+                )
+
+                rows = stage._step.rows
+                source_payload = torch.cat([s[0] for s in sources]).to(ctx.device)
+                source_scales = torch.cat([s[1] for s in sources]).to(ctx.device)
+                local_map = torch.full(
+                    (rows,), -1, dtype=torch.int32, device=ctx.device
+                )
+                local_map[valid.to(ctx.device)] = (
+                    rowmap[:, 0] // TOPK
+                ).to(ctx.device)
+                local_payload = torch.empty_like(helper.payload[:rows])
+                local_scales = torch.empty_like(helper.scales[:rows])
+                _run_compiled(
+                    build_moe_apre_scatter_module(HIDDEN, 1),
+                    ptr_arg(source_payload.reshape(-1)),
+                    ptr_arg(source_scales.reshape(-1)),
+                    ptr_arg(local_payload.reshape(-1)),
+                    ptr_arg(local_scales.reshape(-1)),
+                    ptr_arg(local_map),
+                    TOKENS * ctx.world,
+                    rows,
+                    rows // 16,
+                    fx.Stream(torch.cuda.current_stream()),
+                )
+                local_plain = local_payload.cpu().reshape(
+                    -1, HIDDEN // 32, 16, 16
+                )
+                local_plain = local_plain.permute(0, 2, 1, 3).reshape(
+                    -1, HIDDEN // 2
+                )
+                local_scale_plain = local_scales.cpu().reshape(
+                    -1, HIDDEN // 128, 16, 4
+                )
+                local_scale_plain = local_scale_plain.permute(0, 2, 1, 3).reshape(
+                    -1, HIDDEN // 32
+                )
+                check(torch.equal(local_plain[valid], actual_payload),
+                      "original local preshuffle payload differs from pull")
+                check(torch.equal(local_scale_plain[valid], actual_scales),
+                      "original local preshuffle scales differ from pull")
+            check.settle()
+        del graph
+    finally:
+        ctx.ids.copy_(saved_ids)
+        ctx.x.copy_(saved_x)
+        ctx.wts.copy_(saved_weights)
+        torch.cuda.synchronize()
+        ctx.comm.barrier()
+        for mega in (pull, push):
+            if mega is not None:
+                mega.close()
+        ctx.comm.barrier()
+
 CHECKS = (
+    _check_pull,
     _check_pairings,
     _check_rejected_before_alloc,
     _check_unwind,

@@ -724,7 +724,10 @@ def _grouped_a8w4_tdm_moe(
     if _compact:
         stage2_scatter = _compact_ctx
     _a_preshuffle_requested = data_format == "fp4" and bool(a_preshuffle)
-    a_preshuffled = bool(_a_preshuffle_requested and not _compact)
+    _compact_apre = bool(
+        _compact and getattr(_compact_ctx, "compact_a_preshuffled", False)
+    )
+    a_preshuffled = _compact_apre or bool(_a_preshuffle_requested and not _compact)
     if tile_m2 is None:
         tile_m2 = tile_m
     if tile_n2 is None:

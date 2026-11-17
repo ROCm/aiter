@@ -118,10 +118,13 @@ class ExpertGrouping:
     align_m: int  # per-expert row alignment the plan wrote
     rows: int  # row upper bound, bounding the GEMM grid
 
+    a_preshuffled: bool = False
+
     def scatter_fields(self) -> dict:
         """As ``Stage2ScatterContext``'s compact_* fields."""
         return {
             "compact_layout": True,
+            "compact_a_preshuffled": self.a_preshuffled,
             "compact_masked_m": self.masked_m,
             "compact_psum": self.psum,
             "compact_ep_rowmap": self.ep_rowmap,

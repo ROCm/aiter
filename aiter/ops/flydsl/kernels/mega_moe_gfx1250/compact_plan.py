@@ -278,6 +278,8 @@ def compile_tdm_compact_plan(
     s1f: bool = False,
     write_tok_map: bool = True,
     align_m: int | None = None,
+    pull: bool = False,
+    off_pull_map: int = 0,
 ):
     """Compile the compact-plan kernel. ``hist_stride`` is ``npes * row_dwords``.
 
@@ -337,6 +339,13 @@ def compile_tdm_compact_plan(
     ``align_m`` keeps its producers' ``tile_m``-row pieces and reads ``align_m
     // tile_m`` tile_info words (and flags) per GEMM1 m-tile.
 
+    ``pull`` adds non-S1F input quantization and publishes inverse routing
+    into ``off_pull_map``: each destination row gets the same packed source
+    route and weight bits the push dispatch writes into ep_rowmap. The pull
+    entry point appends hidden, symmetric wire, and route-weight pointers.
+    Its quant workgroups run beside the histogram exchange. The following
+    pull dispatch publishes readiness only after this entire kernel completes.
+
     """
     if WAVE != 32:
         raise ValueError("compact plan requires gfx1250 wave32")
@@ -367,8 +376,8 @@ def compile_tdm_compact_plan(
         kernel_name += f"_b{plan_blocks}"
     quant_blocks = int(quant_blocks)
     if quant_blocks:
-        if not (s1f and quant_model_dim and quant_row_stride):
-            raise ValueError("fused quant needs s1f and the wire geometry")
+        if not ((s1f or pull) and quant_model_dim and quant_row_stride):
+            raise ValueError("fused quant needs s1f or pull and the wire geometry")
         if quant_model_dim % 32:
             raise ValueError(f"model_dim {quant_model_dim} is not 32-aligned")
         kernel_name += f"_q{quant_blocks}"
@@ -376,6 +385,10 @@ def compile_tdm_compact_plan(
         kernel_name += f"_w{plan_waves}"
     if align_m != tile_m:
         kernel_name += f"_a{align_m}"
+    if pull:
+        if s1f or not quant_blocks:
+            raise ValueError("pull plan requires quantization and excludes S1F")
+        kernel_name += "_pull"
     s1f = bool(s1f)
     emit_runs = bool(emit_runs) or s1f
     if s1f and (epr > 255 or tile_m > 0xFFFF):
@@ -515,8 +528,8 @@ def compile_tdm_compact_plan(
         last = rest - full * fx.Int32(tile_m)
         return _rceil(first) + full * fx.Int32(per_tile) + _rceil(last)
 
-    # One body, three kernel signatures: the default plan keeps its exact
-    # argument list, dispatch v2 and S1F append their outputs.
+    # One routing body; ordinary, runs, S1F, and pull entry points preserve
+    # their own argument lists and only request the outputs they consume.
     @flyc.jit
     def plan_body(
         arena,
@@ -532,6 +545,7 @@ def compile_tdm_compact_plan(
         addr_send_list,
         addr_runs,
         addr_tile_src,
+        addr_route_weights,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -1423,6 +1437,29 @@ def compile_tdm_compact_plan(
                 )
                 dest_row = send_base + intra
                 in_cap = dest_row < compact_cap
+                if const_expr(pull):  # noqa: SIM102
+                    if valid & in_cap:
+                        weights = create_buffer_resource_from_addr(
+                            addr_route_weights
+                        )
+                        weight = buffer_load(
+                            weights, route, vec_width=1, dtype=T.i32
+                        )
+                        # Peers differ across lanes. A global pointer avoids
+                        # serializing divergent buffer-resource descriptors.
+                        reverse = (
+                            lsa(dest_pe, off_pull_map) + fx.Int64(dest_row) * 8
+                        )
+                        source_route = fx.Uint64(
+                            fx.Int32(rank * max_routes) + route
+                        )
+                        metadata = source_route | (fx.Uint64(weight) << 32)
+                        pointer_type = fx.PointerType.get(
+                            fx.Uint64.ir_type, fx.AddressSpace.Global, 8
+                        )
+                        fx.generic_store(
+                            fx.inttoptr(pointer_type, reverse), metadata
+                        )
                 if const_expr(write_tok_map):
                     flat = (dest_row << fx.Int32(peer_bits)) | (
                         dest_pe & fx.Int32(peer_mask)
@@ -1441,6 +1478,133 @@ def compile_tdm_compact_plan(
                             comm_ops.load_i32_lds(_lds_at(lds_sendpos, segment))
                             + intra,
                         )
+
+    @flyc.jit
+    def _wire_quant(qid, inp_cur_tok, addr_hidden, addr_wire):
+        """Per-1x32 MX-FP4 quant of the dispatch payload, on the CUs
+        the plan leaves idle.
+
+        Same work the standalone HIP ``dynamic_per_group_scaled_quant``
+        did, moved inside the plan's launch: one kernel boundary fewer,
+        and it hides under the plan's own cross-rank wait.
+
+        A lane owns one whole 32-column group -- 64 B in, one e8m0 byte
+        and 16 B of packed FP4 out -- so no cross-lane amax reduction is
+        needed, and consecutive lanes take consecutive groups, so a wave
+        reads 2 KB contiguous.
+
+        The scale stays bit-identical to the HIP kernel (both RoundUp,
+        csrc/include/mx_quant_utils.h), or stage 1 would read a
+        different payload.
+        """
+        groups_per_row = quant_model_dim // 32
+        rsrc_in = create_buffer_resource_from_addr(addr_hidden)
+        rsrc_out = create_buffer_resource_from_addr(addr_wire)
+        stride = fx.Int32(quant_blocks * plan_threads)
+        total = fx.Int32(inp_cur_tok) * fx.Int32(groups_per_row)
+        g = qid * fx.Int32(plan_threads) + fx.Int32(fx.thread_idx.x)
+        while g < total:
+            row = g // fx.Int32(groups_per_row)
+            grp = g - row * fx.Int32(groups_per_row)
+            # buffer_load / buffer_store index in ELEMENTS of their
+            # dtype: dwords for the b128 loads and the packed stores,
+            # bytes for the e8m0 scale.
+            in_dw = row * fx.Int32(quant_model_dim // 2) + grp * fx.Int32(16)
+            out_dw = row * fx.Int32(quant_row_stride // 4) + grp * fx.Int32(4)
+            sc_b = (
+                row * fx.Int32(quant_row_stride)
+                + fx.Int32(quant_payload_bytes)
+                + grp
+            )
+            amax = fx.Float32(0.0)
+            chunks = []
+            for c in range_constexpr(4):
+                raw = buffer_load(
+                    rsrc_in,
+                    in_dw + fx.Int32(4 * c),
+                    vec_width=4,
+                    dtype=T.i32,
+                )
+                bf = fx.Vector(raw).bitcast(fx.BFloat16)
+                chunks.append(bf)
+                f32x8 = bf.to(fx.Float32)
+                for j in range_constexpr(8):
+                    amax = fx.max(amax, abs(f32x8[j]))
+            e8m0 = emit_mx_e8m0_scale(
+                amax, mode=_MX_ROUND_UP, dtype=_MX_FP4_E2M1
+            )
+            scale_f32 = (fx.Int32(e8m0) << fx.Int32(23)).bitcast(fx.Float32)
+            for c in range_constexpr(4):
+                packed = emit_cvt_scalef32_pk8_fp4_bf16(
+                    chunks[c], scale_f32, i32_ty=T.i32
+                )
+                buffer_store(fx.Int32(packed), rsrc_out, out_dw + fx.Int32(c))
+            buffer_store(
+                fx.Int8(fx.Int32(e8m0) & fx.Int32(0xFF)), rsrc_out, sc_b
+            )
+            g = g + stride
+
+    if pull:
+
+        @flyc.kernel(name=kernel_name, known_block_size=[plan_threads, 1, 1])
+        def pull_plan_kernel(
+            arena: Int64,
+            addr_inp_idx: Int64,
+            addr_tok_map: Int64,
+            addr_block_hist: Int64,
+            addr_send_base: Int64,
+            addr_masked_m: Int64,
+            addr_psum: Int64,
+            addr_barrier: Int64,
+            my_lsa_rank: Int32,
+            inp_cur_tok: Int32,
+            addr_hidden: Int64,
+            addr_wire: Int64,
+            addr_route_weights: Int64,
+        ):
+            qid = fx.block_idx.x - fx.Int32(plan_blocks)
+            if qid >= 0:
+                _wire_quant(qid, inp_cur_tok, addr_hidden, addr_wire)
+            else:
+                plan_body(
+                    arena, addr_inp_idx, addr_tok_map, addr_block_hist,
+                    addr_send_base, addr_masked_m, addr_psum, addr_barrier,
+                    my_lsa_rank, inp_cur_tok, fx.Int64(0), fx.Int64(0),
+                    fx.Int64(0), addr_route_weights,
+                )
+            comm_ops.waitcnt_stores()
+            fx.barrier()
+            if fx.thread_idx.x == 0:
+                comm_ops.fence_system_release()
+
+        @flyc.jit
+        def launch_pull_plan(
+            arena: Int64,
+            addr_inp_idx: Int64,
+            addr_tok_map: Int64,
+            addr_block_hist: Int64,
+            addr_send_base: Int64,
+            addr_masked_m: Int64,
+            addr_psum: Int64,
+            addr_barrier: Int64,
+            my_lsa_rank: Int32,
+            inp_cur_tok: Int32,
+            addr_hidden: Int64,
+            addr_wire: Int64,
+            addr_route_weights: Int64,
+            stream=fx.Stream(None),  # noqa: B008
+        ):
+            pull_plan_kernel(
+                arena, addr_inp_idx, addr_tok_map, addr_block_hist,
+                addr_send_base, addr_masked_m, addr_psum, addr_barrier,
+                my_lsa_rank, inp_cur_tok, addr_hidden, addr_wire,
+                addr_route_weights,
+            ).launch(
+                grid=(plan_blocks + quant_blocks, 1, 1),
+                block=(plan_threads, 1, 1), stream=stream,
+            )
+
+        return launch_pull_plan
 
     if s1f:
 
@@ -1466,70 +1630,6 @@ def compile_tdm_compact_plan(
             # CUs are idle for the plan's whole run, and the cross-block
             # barrier below counts exactly plan_blocks arrivals, so a quant
             # block must never enter plan_body.
-            def _wire_quant(qid):
-                """Per-1x32 MX-FP4 quant of the dispatch payload, on the CUs
-                the plan leaves idle.
-
-                Same work the standalone HIP ``dynamic_per_group_scaled_quant``
-                did, moved inside the plan's launch: one kernel boundary fewer,
-                and it hides under the plan's own cross-rank wait.
-
-                A lane owns one whole 32-column group -- 64 B in, one e8m0 byte
-                and 16 B of packed FP4 out -- so no cross-lane amax reduction is
-                needed, and consecutive lanes take consecutive groups, so a wave
-                reads 2 KB contiguous.
-
-                The scale stays bit-identical to the HIP kernel (both RoundUp,
-                csrc/include/mx_quant_utils.h), or stage 1 would read a
-                different payload.
-                """
-                groups_per_row = quant_model_dim // 32
-                rsrc_in = create_buffer_resource_from_addr(addr_hidden)
-                rsrc_out = create_buffer_resource_from_addr(addr_wire)
-                stride = fx.Int32(quant_blocks * plan_threads)
-                total = fx.Int32(inp_cur_tok) * fx.Int32(groups_per_row)
-                g = qid * fx.Int32(plan_threads) + fx.Int32(fx.thread_idx.x)
-                while g < total:
-                    row = g // fx.Int32(groups_per_row)
-                    grp = g - row * fx.Int32(groups_per_row)
-                    # buffer_load / buffer_store index in ELEMENTS of their
-                    # dtype: dwords for the b128 loads and the packed stores,
-                    # bytes for the e8m0 scale.
-                    in_dw = row * fx.Int32(quant_model_dim // 2) + grp * fx.Int32(16)
-                    out_dw = row * fx.Int32(quant_row_stride // 4) + grp * fx.Int32(4)
-                    sc_b = (
-                        row * fx.Int32(quant_row_stride)
-                        + fx.Int32(quant_payload_bytes)
-                        + grp
-                    )
-                    amax = fx.Float32(0.0)
-                    chunks = []
-                    for c in range_constexpr(4):
-                        raw = buffer_load(
-                            rsrc_in,
-                            in_dw + fx.Int32(4 * c),
-                            vec_width=4,
-                            dtype=T.i32,
-                        )
-                        bf = fx.Vector(raw).bitcast(fx.BFloat16)
-                        chunks.append(bf)
-                        f32x8 = bf.to(fx.Float32)
-                        for j in range_constexpr(8):
-                            amax = fx.max(amax, abs(f32x8[j]))
-                    e8m0 = emit_mx_e8m0_scale(
-                        amax, mode=_MX_ROUND_UP, dtype=_MX_FP4_E2M1
-                    )
-                    scale_f32 = (fx.Int32(e8m0) << fx.Int32(23)).bitcast(fx.Float32)
-                    for c in range_constexpr(4):
-                        packed = emit_cvt_scalef32_pk8_fp4_bf16(
-                            chunks[c], scale_f32, i32_ty=T.i32
-                        )
-                        buffer_store(fx.Int32(packed), rsrc_out, out_dw + fx.Int32(c))
-                    buffer_store(
-                        fx.Int8(fx.Int32(e8m0) & fx.Int32(0xFF)), rsrc_out, sc_b
-                    )
-                    g = g + stride
-
             def _plan():
                 plan_body(
                     arena,
@@ -1545,6 +1645,7 @@ def compile_tdm_compact_plan(
                     addr_send_list,
                     addr_runs,
                     addr_tile_src,
+                    fx.Int64(0),
                 )
 
             # The plan owns blocks [0, plan_blocks); the rest quantize. Those
@@ -1554,7 +1655,7 @@ def compile_tdm_compact_plan(
             if const_expr(quant_blocks > 0):
                 qid = fx.Int32(fx.block_idx.x) - fx.Int32(plan_blocks)
                 if qid >= fx.Int32(0):
-                    _wire_quant(qid)
+                    _wire_quant(qid, inp_cur_tok, addr_hidden, addr_wire)
                 else:
                     _plan()
             else:
@@ -1634,6 +1735,7 @@ def compile_tdm_compact_plan(
                 addr_send_list,
                 addr_runs,
                 None,
+                fx.Int64(0),
             )
 
         @flyc.jit
@@ -1700,6 +1802,7 @@ def compile_tdm_compact_plan(
             None,
             None,
             None,
+            fx.Int64(0),
         )
 
     @flyc.jit
