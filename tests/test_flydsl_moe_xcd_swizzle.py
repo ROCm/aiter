@@ -19,15 +19,16 @@ from op_tests.flydsl_tests.test_flydsl_moe import (
 
 
 def test_flydsl_moe_xcd_swizzle_uneven_grid():
-    """xcd_swizzle on a 2 x 18 grid in both stages: 36 workgroups, not a multiple
-    of the 8 XCDs. Every sorted block holds a routed row, so a tile the remap
+    """xcd_swizzle on a 2 x 21 grid in both stages: 42 workgroups, not a multiple
+    of 4 or 8 XCDs. Every sorted block holds a routed row, so a tile the remap
     skips leaves NaN in stage 1 and a tile it runs twice doubles a stage-2 sum."""
     # The running GPU, not GPU_ARCHS: get_gfx() takes the last GPU_ARCHS entry.
     if get_gfx_runtime() != "gfx950":
         pytest.skip("gfx950 FlyDSL required")
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 
-    token, model_dim, inter_dim, E, topk, block_m = 9, 512, 256, 32, 2, 32
+    # 42 is a multiple of 6, but no gfx950 part has 6 XCDs.
+    token, model_dim, inter_dim, E, topk, block_m = 7, 512, 256, 32, 3, 32
     data = _generate_a8w4_gui_data(
         token, model_dim, inter_dim, E, topk, block_m, distinct_experts=True
     )
