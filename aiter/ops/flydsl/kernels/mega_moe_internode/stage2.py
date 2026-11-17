@@ -38,6 +38,9 @@ from flydsl.expr.typing import BFloat16, Float32, Int8, T
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.communication_ops_utils import (
+    invalidate_l1 as _invalidate_l1,
+)
 
 from .. import dpp_utils
 from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
@@ -53,6 +56,7 @@ from .buffer_addressing import (
 from .communication import RailGda
 from .communication import ccqe_enabled as _rail_ccqe
 from .gemm import gemm2_compute_v2, issue_a_load_lds_dt, kStages
+from .gemm2_pipe import gemm2_compute_pipe
 from .layout import MAX_FUSED_MODEL_DIM
 from .mega_moe_internode_config import GEMM2_BNS
 
@@ -256,6 +260,8 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
 # Cover the largest supported hidden dimension at the smallest allowed BN.
 # The host allocation and the specialization guard use this shared bound.
 K1_CLAIM_WORDS = MAX_FUSED_MODEL_DIM // min(GEMM2_BNS) + 2
+# Single fused kernel: ready-word poll back-off (s_sleep units) of GEMM2's group waits.
+SK_POLL = int(__import__("os").environ.get("SK_POLL_SLEEP") or 32)
 # Kernel1 CTAs resident per CU (91 VGPRs, 4 waves -> 5 per CU); the dynamic
 # claim launches at most this many per CU.
 K1_CTAS_PER_CU = 5
@@ -306,7 +312,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     sdma_put_bytes: int = 4 << 20, sdma_arrival_woff: int = 0, sdma_arrival_plane: int = 0,
     sdma_max_chunks: int = 0, gemm2_bm: int = 32, sdma_ramp_chunks: int = 0, waves: int = 4,
     sdma_remote_only: bool = False, token_ready: bool = False, a_dtype: str = "fp4",
-    buffer_regions: tuple = (), group_sync_tail: int = 0):
+    buffer_regions: tuple = (), group_sync_tail: int = 0, gemm2_bk: int = 256):
 # fmt: on
     """Compile the persistent GEMM2 + node push kernel (stage2 kernel1).
 
@@ -338,6 +344,13 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     parity 0 plus the per-parity step.  ``experts`` is the local expert count:
     Stage1 already stores local expert ids.
     """
+    # Unrolled GEMM2 K pipeline (gemm2_pipe); fp8 A without the BM128 A stream.
+    # Four B stages and three A stages measured best at BM32 (EP32 TPR128).
+    G2_PIPE = a_dtype == "fp8" and int(gemm2_bm) != 128
+    G2_BSTAGES = 4
+    BK = int(gemm2_bk)
+    if BK != 256:
+        raise NotImplementedError(f"gemm2_bk {BK}: GEMM2 K tile 256 only (one E8M0 word per K tile)")
     epoch_planes = tuple(int(v) for v in epoch_planes)
     region_indices = {(stage, name): index for stage, name, index in buffer_regions}
     if buffer_regions and token_ready:
@@ -364,7 +377,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     GBM = int(gemm2_bm)
     GS = GBM // BM
     if GBM % BM or not 1 <= GS <= 4:
-        raise ValueError(f"gemm2_bm must be 32, 64 or 128, got {GBM}")
+        raise ValueError(f"gemm2_bm must be 32, 64, 96 or 128, got {GBM}")
     if GS > 1 and int(tile_group) % GS:
         raise ValueError(f"gemm2_bm {GBM} needs GS | tile_group")
 
@@ -373,7 +386,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     log2_max_tok = max_tok.bit_length() - 1
     mask_max_tok = max_tok - 1
     N_OUT = model_dim
-    aStages = kStages + 1
+    aStages = 3 if G2_PIPE else kStages + 1
     KH_TILE_A = BK // a_pack
     # The f32 CShuffle slab and the A stages share one LDS union.
     WAVES = int(waves)
@@ -580,6 +593,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         + (f"_sd{SD_CTB}r{SD_ROWS}q{SD_FQ}p{SD_PUT_B >> 10}" if sdma else "")
         + ("ro" if SD_RO else "") + ("_trpub" if TRK else "")
         + (f"s{SD_S}n{SD_NS}" if sdma and SD_NS else "")
+        + (f"_g2p{G2_BSTAGES}a{aStages}" if G2_PIPE else "")
         + "_de_" + "_".join(str(v) for v in epoch_planes)
         # Symbols cannot contain '-'; encode negative strides with an m prefix.
         + f"_ad{'m' if arrival_delta_step < 0 else ''}{abs(arrival_delta_step)}"
@@ -600,7 +614,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         arg_expert_count=None, boundary_hook=None, dev_comm=None, arg_sd_send=None,
         arg_sd_tb=None, arg_sd_plan=None, arg_sd_cdone=None, arena_win=None, arena_ptr=None,
         lds_ptr=None, grp_sync=None, boundary_probe=None, arg_tr_mcnt=None,
-        unit_hook=None, tail_hook=None, arg_tr_sdprog=None):
+        unit_hook=None, tail_hook=None, arg_tr_sdprog=None, gen_value=None):
     # fmt: on
         # grp_sync (single fused kernel): (window offset of Stage1's per-group
         # h1 ready words, their parity plane, Stage1 tile group); each unit
@@ -614,9 +628,13 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         # Stage1 wrote epoch_gate earlier on this stream; the kernel boundary provides
         # visibility, so use a relaxed agent-scope load. A system acquire adds
         # buffer_inv at every CTA entry, disrupting GEMM2's L2 weight reuse (+97us measured).
-        i64_generation = fx.Int64(rocdl.readfirstlane(
-            T.i64,
-            fx.Int64(comm.load_i64_global_agent_relaxed(i64_generation)).ir_value()))
+        if const_expr(gen_value is None):
+            i64_generation = fx.Int64(rocdl.readfirstlane(
+                T.i64,
+                fx.Int64(comm.load_i64_global_agent_relaxed(i64_generation)).ir_value()))
+        else:
+            # Single fused kernel: Stage1 handed the generation over in registers.
+            i64_generation = gen_value
         _par = i64_generation & fx.Int64(1)
         arg_aq = arg_aq + _par * fx.Int64(epoch_planes[0])
         arg_ascale = arg_ascale + _par * fx.Int64(epoch_planes[1])
@@ -655,12 +673,13 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         A_NW = min(WAVES, GBM // (4 if a_dtype == "fp8" else 8))
 
         def issue_all_a_loads(m_row0):
-            if const_expr(A_NW < WAVES):
+            # With G2_PIPE, gemm2_compute_pipe issues its own scoped A DMA.
+            if const_expr(A_NW < WAVES and not G2_PIPE):  # noqa: SIM102 (static path, runtime wave owner)
                 if wave < fx.Int32(A_NW):
                     for slot in range_constexpr(kStages):
                         issue_a_load_lds_dt(arg_aq, lds_base_i32, slot, slot, m_row0, wave, lane,
                             KH_TILE_A, k_bytes, BM=GBM, NW=A_NW, a_dtype=a_dtype)
-            else:
+            if const_expr(A_NW >= WAVES and not G2_PIPE):
                 for slot in range_constexpr(kStages):
                     issue_a_load_lds_dt(arg_aq, lds_base_i32, slot, slot, m_row0, wave, lane,
                         KH_TILE_A, k_bytes, BM=GBM, NW=WAVES, a_dtype=a_dtype)
@@ -766,11 +785,18 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             if const_expr(PAIR):
                 unit_bx = unit_bx + wave // fx.Int32(4)  # waves 4-7: the pair's second n_block
             # fmt: off
-            accm_vecs, _m_row, n_block_idx, _n_out_rt = gemm2_compute_v2(lds_base_i32, arg_ascale, arg_bq,
-                arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter, i32_hidden,
-                BM=GBM, BN=BN, BK=BK, INTER_MAX=inter_dim, aStages=aStages, explicit_a_row=a_row,
-                eids_stride=GS, NW=WAVES, a_dtype=a_dtype)
-            p2p_scatter_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, NW=WAVES, N_OUT=N_OUT,
+            if const_expr(G2_PIPE):
+                accm_vecs, _m_row, n_block_idx, _n_out_rt = gemm2_compute_pipe(lds_base_i32, arg_ascale,
+                    arg_bq, arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter,
+                    i32_hidden, BM=GBM, BN=BN, BK=BK, INTER_MAX=inter_dim, aStages=aStages,
+                    explicit_a_row=a_row, eids_stride=GS, NW=WAVES, a_dtype=a_dtype, b_stages=G2_BSTAGES)
+            else:
+                accm_vecs, _m_row, n_block_idx, _n_out_rt = gemm2_compute_v2(lds_base_i32, arg_ascale, arg_bq,
+                    arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter, i32_hidden,
+                    BM=GBM, BN=BN, BK=BK, INTER_MAX=inter_dim, aStages=aStages, explicit_a_row=a_row,
+                    eids_stride=GS, NW=WAVES, a_dtype=a_dtype)
+            p2p_scatter_epilog(lds_base_i32, accm_vecs,
+                n_block_idx, wave, lane, NW=WAVES, N_OUT=N_OUT,
                 BM=GBM, BN=BN, npes=npes, topk=topk,
                 log2_max_tok=log2_max_tok, mask_max_tok=mask_max_tok, recv_cap=recv_cap,
                 comb_inp_nbytes=comb_inp_nbytes, lds_packed_off=lds_packed_off,
@@ -791,7 +817,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                     gaddr = gs_ready + fx.Int64(a_row // fx.Int32(32 * int(grp_sync[2]))) * fx.Int64(4)
                     gv = fx.Int32(comm.load_i32_global_system_relaxed(gaddr))
                     while gv != gs_gen:
-                        fx.rocdl.s_sleep(1)
+                        fx.rocdl.s_sleep(SK_POLL)
                         gv = fx.Int32(comm.load_i32_global_system_relaxed(gaddr))
                 fx.barrier()
 
@@ -1936,9 +1962,26 @@ def compile_stage2_node_combine(
     RX_PEER_BYTES = int(rx_bytes) // (NODES - 1)
     GROUP_PEER_BYTES = parity_planes[5] // (NODES - 1)
 
+    # Deferred credits: a generation sends its return_consumed acknowledgements
+    # at the end but does not wait for the peers'; a sender instead checks the
+    # peer's g-2 credit (same parity slot) right before overwriting that slot.
+    CREDIT_ASYNC = not token_ready
+    # AITER_MEGAMOE_STAGE2_STRICT=1 restores the conservative ordering below.
+    import os
+    _strict = os.environ.get("AITER_MEGAMOE_STAGE2_STRICT", "0") == "1"
+    # Phase1 / Phase3 entry acquires drop only L1: within a launch no CU reads an
+    # inbox, rail or accumulator line before its ready flag, and the launch acquire
+    # already dropped older L2 lines, so a whole-L2 buffer_inv per CTA / chunk only
+    # costs (Phase1 30->25us, Phase3 49->37us in the single kernel).
+    LIGHT_ACQ = not _strict
+    # With CREDIT_ASYNC the kernel no longer waits for its own credit puts to land:
+    # the next generation's Phase1 posts and Phase2 reap on the same ordered QP
+    # (ctx 0 -> peer) drain their completions.
+    CREDIT_NOWAIT = CREDIT_ASYNC and not _strict
     kernel_name = (
         f"megamoe_k2_h{HIDDEN}_t{MAX_TOKENS}_k{TOPK}"
-        f"_qp{NUM_QP}_c{CHUNK}_w{WAVES}"
+        + ("_cra" if CREDIT_ASYNC else "") + ("_la" if LIGHT_ACQ else "") + ("_cnw" if CREDIT_NOWAIT else "")
+        + f"_qp{NUM_QP}_c{CHUNK}_w{WAVES}"
         # Include rail CQ CCQE polling mode in the kernel name, which is the FlyDSL cache key.
         + ("_ccqe" if _rail_ccqe() else "")
         + ("_qr8" if RAIL_FP8 else "")
@@ -1990,6 +2033,7 @@ def compile_stage2_node_combine(
         bx: fx.Int32,
         grid: fx.Int32,
         part=0,
+        gen_value=None,
     ):
         if const_expr(sdma and part not in (1, 2)):
             raise ValueError("sdma kernel2 runs only as the fused parts 1 and 2")
@@ -2002,10 +2046,14 @@ def compile_stage2_node_combine(
         epoch_ptr = arena_ptr + fx.Int64(epoch_off)
         if const_expr(bool(buffer_regions)):
             epoch_ptr = region_local_address(arena_ptr, region_indices[1, "epoch_gate"], fx.Int64(0))
-        generation = fx.Int64(rocdl.readfirstlane(
-            T.i64,
-            fx.Int64(comm.load_i64_global_agent_relaxed(
-                epoch_ptr)).ir_value()))
+        if const_expr(gen_value is None):
+            generation = fx.Int64(rocdl.readfirstlane(
+                T.i64,
+                fx.Int64(comm.load_i64_global_agent_relaxed(
+                    epoch_ptr)).ir_value()))
+        else:
+            # Single fused kernel: Stage1 handed the generation over in registers.
+            generation = gen_value
         _par = generation & fx.Int64(1)
         _inbox_off = fx.Int64(inbox_off) + _par * fx.Int64(parity_planes[0])
         _slot_mask_off = fx.Int64(slot_mask_off) + _par * fx.Int64(parity_planes[1])
@@ -2139,7 +2187,10 @@ def compile_stage2_node_combine(
                         _wait_ready_relaxed(
                             fx.Int64(_sd.signal_slot(fx.Int32(_p), fx.Int32(0))), _want)
         gpu.barrier()
-        comm.fence_system_acquire()
+        if const_expr(LIGHT_ACQ):
+            _invalidate_l1()
+        else:
+            comm.fence_system_acquire()
         return_generation = generation
         if const_expr(RECV_STATUS):
             return_generation = generation * fx.Int64(2)
@@ -2347,6 +2398,14 @@ def compile_stage2_node_combine(
                               + fx.Int64(fx.Int32(plane * MAX_TOKENS) + ck_first)
                               * fx.Int64(8), generation)
                       if const_expr(plane != local_plane):
+                          if const_expr(CREDIT_ASYNC):  # noqa: SIM102 (static protocol, runtime lane owner)
+                              # The peer must have consumed generation g-2 from this
+                              # parity slot before this put overwrites it.
+                              if lane == fx.Int32(0):
+                                  _cp = credit_ptr + fx.Int64(peer_index * 8)
+                                  _cv = fx.Int64(comm.load_i64_global_system(_cp))
+                                  while _cv < generation - fx.Int64(2):
+                                      _cv = fx.Int64(comm.load_i64_global_system(_cp))
                           _qp = ck % fx.Int32(NUM_QP)
                           _rail.put(dev_comm, _qp, fx.Int32(plane),
                               rx_win,
@@ -2467,7 +2526,10 @@ def compile_stage2_node_combine(
                         group_ready_ptr + fx.Int64(_peer_index * GROUP_PEER_BYTES)
                         + fx.Int64(ck) * fx.Int64(8), return_generation)
             gpu.barrier()
-            comm.fence_system_acquire()
+            if const_expr(LIGHT_ACQ):
+                _invalidate_l1()
+            else:
+                comm.fence_system_acquire()
             if const_expr(RECV_STATUS):  # noqa: SIM102
                 if (bx == fx.Int32(0)) & (tx == fx.Int32(0)):
                     overflow = _node_recv_overflow()
@@ -2622,12 +2684,14 @@ def compile_stage2_node_combine(
                     _consumed_requests.append(_rail.flush_async(
                         dev_comm, fx.Int32(0), fx.Int32(_peer_node)))
                 for _peer_index in range_constexpr(NODES - 1):
-                    if lane == fx.Int32(0):
-                        _credit_ptr = credit_ptr + fx.Int64(_peer_index * 8)
-                        _credit = fx.Int64(comm.load_i64_global_system(_credit_ptr))
-                        while _credit < generation:
+                    if const_expr(not CREDIT_ASYNC):  # noqa: SIM102 (static protocol, runtime lane owner)
+                        if lane == fx.Int32(0):
+                            _credit_ptr = credit_ptr + fx.Int64(_peer_index * 8)
                             _credit = fx.Int64(comm.load_i64_global_system(_credit_ptr))
-                    _rail.wait(dev_comm, fx.Int32(0), _consumed_requests[_peer_index])
+                            while _credit < generation:
+                                _credit = fx.Int64(comm.load_i64_global_system(_credit_ptr))
+                    if const_expr(not CREDIT_NOWAIT):
+                        _rail.wait(dev_comm, fx.Int32(0), _consumed_requests[_peer_index])
 
     @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])
     def kernel(
@@ -3317,6 +3381,8 @@ def compile_stage2_fused(k1_kw: dict, k2_kw: dict, k2_ctas: int):
     grid_ctas = pipeline.grid
     k1_occ = int(k1.ctas_per_cu)
     kernel_name = "megamoe_s2f_" + k1.kernel_name[len("megamoe_"):] + "__" + k2.kernel_name[len("megamoe_"):]
+    if pipeline.k2_ctas != grid_ctas:
+        kernel_name += f"_k2c{pipeline.k2_ctas}"
     threads = pipeline.threads
     # 4 waves: keep kernel1's occupancy (the grid assumes k1_occ CTAs per CU);
     # 8 waves: one CTA per CU, two waves per SIMD.

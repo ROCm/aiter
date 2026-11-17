@@ -53,6 +53,7 @@ from .mega_moe_internode_config import (
     STAGE2_SDMA_SEND_ROWS_PER_ROUTE,
     STAGE2_TOKEN_READY,
     lookup_tune,
+    select_gemm2_bk,
     select_gemm2_bm,
     select_gemm2_bn,
     select_gemm2_grid,
@@ -76,6 +77,10 @@ from .stage2 import (
     peer_table_launcher,
     stage2_scratch_layout,
 )
+
+# Kernel2 (node reduce / rail / combine) CTAs: 96 measured best or tied from EP16 TPR32 to
+# EP16 TPR512 and EP32 TPR128 (64-112 is a plateau; 256 is slower).
+DEFAULT_K2_CTAS = 96
 
 __all__ = ["MegaMoEInternode", "build_window_layout"]
 
@@ -429,6 +434,7 @@ class MegaMoEInternode:
         self._gemm2_bm, _ = select_gemm2_bm(
             self._s2_tuned, tile_group=int(self._s1_tile["tile_group"]),
             fused=remote_first, sdma=self._stage2_sdma)
+        self._gemm2_bk, _ = select_gemm2_bk(self._s2_tuned)
         # Without a table row: one chunk per rail queue is the balanced
         # point (measured TPR 512 -> 64 and TPR 1024 -> 128 exactly).
         # Capped at 512 (the TPR 4096 value): k2 unrolls one ready store per chunk
@@ -853,6 +859,7 @@ class MegaMoEInternode:
             "local_experts": self.epr, "tile_group": int(self._s1_tile["tile_group"]),
             "expert_count_plane": s1.region("expert_count").nbytes // 2,
             "gemm2_bm": self._gemm2_bm,
+            "gemm2_bk": self._gemm2_bk,
             "buffer_regions": self._buffer_regions,
             "group_sync_tail": self._stage1.group_sync_tail,
         }
@@ -965,12 +972,12 @@ class MegaMoEInternode:
         }
         if self._single_kernel:
             self._launchers["single"] = compile_single_kernel(
-                self._stage1, self._k1_compile, self._k2_compile, WORKER_BLOCKS
+                self._stage1, self._k1_compile, self._k2_compile, DEFAULT_K2_CTAS
             )
         else:
             self._launchers["stage1"] = self._stage1
             self._launchers["stage2"] = compile_stage2_fused(
-                self._k1_compile, self._k2_compile, WORKER_BLOCKS
+                self._k1_compile, self._k2_compile, DEFAULT_K2_CTAS
             )
 
     def _compile_launcher(self, name, args) -> None:

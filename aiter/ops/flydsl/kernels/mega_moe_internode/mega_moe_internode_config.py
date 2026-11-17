@@ -36,6 +36,7 @@ Stage2 parameters:
   back to the xGMI tile. An explicit tile above 32 may also be used without
   the Stage1 local/remote split; it must divide 32*tile_group.
 * ``gemm2_bn``: GEMM2 N tile, 128 or 256.
+* ``gemm2_bk``: GEMM2 K tile; 0 or empty selects 256 (one E8M0 word per K tile).
 * ``gemm2_cu``: persistent grid; 0 uses the operator's worker_blocks.
 * ``return_chunk_tokens``: token granularity of rail chunks/readiness signals.
 * ``intra_comm``: xgmi or sdma; SDMA requires the fused remote-first split path.
@@ -183,7 +184,8 @@ def _chip() -> tuple[str, int]:
 
 
 # Stage1
-TILE_GROUPS = (1, 2, 4)
+TILE_GROUPS = (1, 2, 3, 4)
+_DEFAULT_TILE_GROUPS = (1, 2, 4)
 _ARENA_BM = 32
 # Between the measured 36.6 (G=1 best) and 73 (G=4 best) rows per expert.
 _G1_MAX_ROWS = 48
@@ -234,7 +236,10 @@ def default_tile_group(token: int, expert: int, split_local: int = 1) -> int:
     """
     rows = int(token) / max(1, int(expert))
     if not split_local:
-        return next((g for g in TILE_GROUPS if _ARENA_BM * g >= rows), max(TILE_GROUPS))
+        return next(
+            (g for g in _DEFAULT_TILE_GROUPS if _ARENA_BM * g >= rows),
+            max(_DEFAULT_TILE_GROUPS),
+        )
     return 1 if rows <= _G1_MAX_ROWS else 4
 
 
@@ -337,8 +342,10 @@ STAGE2_FUSED_WAVES = 8
 
 
 # Stage1 and the fused Stage2 in one kernel (see single_kernel.py) whenever
-# both run 8-wave CTAs; otherwise the separate launches.
-SINGLE_KERNEL = False
+# both run 8-wave CTAs; otherwise the separate launches. Measured faster than
+# the two launches from EP16 TPR32 to TPR512 and at EP32 TPR128;
+# AITER_MEGAMOE_SINGLE_KERNEL=0 restores the two launches.
+SINGLE_KERNEL = os.environ.get("AITER_MEGAMOE_SINGLE_KERNEL", "1") == "1"
 
 
 def use_single_kernel(stage1_waves: int, stage2_waves: int) -> bool:
@@ -356,7 +363,9 @@ def select_stage2_waves(n_blocks: int) -> int:
 # Stage2
 NUM_QP = 8
 GEMM2_BNS = (128, 256)
-GEMM2_BMS = (32, 64, 128)
+GEMM2_BMS = (32, 64, 96, 128)
+GEMM2_BKS = (256,)
+DEFAULT_GEMM2_BK = 256
 # Default GEMM2 M tile of the fused stage2 per intra-node path (46+50, K3 and
 # DSv4.1, TPR 1024..16384): xGMI 64 (-1.4~-10% vs 32; 128 stalls for ms at TPR
 # >= 4096), SDMA 128 (2048: 128 < 64 < 32 monotonically).
@@ -421,6 +430,9 @@ def _validate_stage2(row: dict, where: str) -> None:
     bm = row["gemm2_bm"]
     if bm and bm not in GEMM2_BMS:
         raise ValueError(f"{where}: gemm2_bm must be one of {GEMM2_BMS} (got {bm})")
+    bk = row["gemm2_bk"]
+    if bk and bk not in GEMM2_BKS:
+        raise ValueError(f"{where}: gemm2_bk must be one of {GEMM2_BKS} (got {bk})")
     comm = row["intra_comm"]
     if comm and comm not in STAGE2_INTRA_COMMS:
         raise ValueError(
@@ -444,6 +456,7 @@ TUNE_TABLE = _TuneTable(
         ("fanout_ctas_per_dest", 0),
         ("data_send_ctas", 0),
         ("gemm2_bm", 0),
+        ("gemm2_bk", 0),
         ("intra_comm", ""),
     ),
 )
@@ -483,6 +496,16 @@ def lookup_tune(
     if row is not None and row["split_local"] != default_split_local(token, topk):
         return None
     return row
+
+
+def select_gemm2_bk(tuned: dict | None) -> tuple[int, str]:
+    """GEMM2 K tile and its source: table > default."""
+    bk = int((tuned or {}).get("gemm2_bk", 0))
+    if not bk:
+        return DEFAULT_GEMM2_BK, "default"
+    if bk not in GEMM2_BKS:
+        raise ValueError(f"gemm2_bk must be one of {GEMM2_BKS} (got {bk}, from table)")
+    return bk, "table"
 
 
 def select_gemm2_bn(tuned: dict | None) -> tuple[int, str]:

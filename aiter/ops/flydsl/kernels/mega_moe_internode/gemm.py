@@ -222,7 +222,8 @@ def _gemm1_body_m16(
     # Four 16-column N subtiles per wave: two each for gate and up.
     NJ = BN // 64
     assert BN == 256, f"GMM1 BN must be 256, got {BN}"
-    assert BM in (32, 64, 128), f"GMM1 BM must be 32, 64 or 128, got {BM}"
+    assert BM in (32, 64, 96, 128), f"unsupported GMM1 BM: {BM}"
+    assert BM != 96 or is_f8_a, "GMM1 BM96 requires FP8 activation"
     # NW = waves per CTA.  4: each wave computes all BM rows of a 64-column
     # slice (32 gate + 32 up columns).  8 (PR6881 layout, two waves per SIMD at
     # <= 256 registers): each wave takes all BM rows of a 32-column slice
@@ -601,9 +602,14 @@ def _gemm1_body_m16(
                 soffset=s_off // fx.Int32(4),
             )
             bs_slot[mw] = r.load()[0]
-            if const_expr(W8):
-                # For the odd n0 in the pair, move bytes 1/3 to 0/2; in_b is always 0.
-                bs_slot[mw] = fx.Int32(bs_slot[mw]) >> bs_shift
+
+    def _bs_use(bs_slot):
+        # W8 odd waves move bytes 1/3 to 0/2 (in_b is always 0). Shifting at the
+        # consuming K step, not at load, keeps the compiler from draining the B
+        # prefetch with vmcnt(0) right after the step barrier.
+        if const_expr(W8):
+            return [fx.Int32(bs_slot[mw]) >> bs_shift for mw in range_constexpr(2)]
+        return bs_slot
 
     mfma_ty = T.f32x4
     zero4 = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -752,7 +758,45 @@ def _gemm1_body_m16(
             rocdl.sched_barrier(0)
             issue_a_load_lds((kt + kStages) % 3, kt + kStages)
             rocdl.sched_barrier(0)
-        if const_expr(is_f8_a and BM == 128):
+        bs_cur = _bs_use(b_scale_v[slot_b])
+        if const_expr(is_f8_a and BM == 96 and W8):
+            asc_cur = issue_a_scale_ds_read(kt)
+            # Keep the first four M16 slices streamed as in production.
+            for first_m in range_constexpr(kMChunks - 2):
+                rocdl.sched_barrier(0)
+                a_cur = issue_a_ds_read(kt % 3, first_m, 1)
+                for J in range_constexpr(NJW):
+                    mfma_row(
+                        b[slot_b],
+                        a_cur,
+                        asc_cur,
+                        bs_cur,
+                        J,
+                        first_m,
+                        init=(kt == 0),
+                    )
+                    rocdl.sched_barrier(0)
+            # Keep only the last two M16 A fragments live across J0/J1.
+            # J0 can then refill B without duplicating A LDS reads. Existing
+            # scheduling barriers enforce the measured producer/consumer order;
+            # no stable high-level copy operation expresses that compiler fence.
+            a_tail = issue_a_ds_read(kt % 3, kMChunks - 2, 2)
+            for J in range_constexpr(NJW):
+                for first_m in range_constexpr(kMChunks - 2, kMChunks):
+                    mfma_row(
+                        b[slot_b],
+                        a_tail,
+                        asc_cur,
+                        bs_cur,
+                        J,
+                        first_m,
+                        init=(kt == 0),
+                    )
+                    rocdl.sched_barrier(0)
+                if const_expr(refill):
+                    issue_b_load_j(b[slot_b], kt + kStages, J)
+                rocdl.sched_barrier(0)
+        elif const_expr(is_f8_a and BM in (96, 128)):
             asc_cur = issue_a_scale_ds_read(kt)
             # Retain every B operand until both M halves consume it. No A
             # fragment survives across halves; B prefetch happens only once.
@@ -764,7 +808,7 @@ def _gemm1_body_m16(
                         b[slot_b],
                         a_cur,
                         asc_cur,
-                        b_scale_v[slot_b],
+                        bs_cur,
                         J,
                         first_m,
                         init=(kt == 0),
@@ -784,9 +828,7 @@ def _gemm1_body_m16(
                 if const_expr(BM != 128):
                     rocdl.sched_barrier(0)
                     rocdl.s_setprio(1)
-                mfma_cluster(
-                    b[slot_b], a_cur, asc_cur, b_scale_v[slot_b], J, init=(kt == 0)
-                )
+                mfma_cluster(b[slot_b], a_cur, asc_cur, bs_cur, J, init=(kt == 0))
                 if const_expr(BM != 128):
                     rocdl.s_setprio(0)
                 rocdl.sched_barrier(0)
@@ -800,7 +842,7 @@ def _gemm1_body_m16(
 
     gpu.barrier()
 
-    if const_expr(is_f8_a and BM == 128):
+    if const_expr(is_f8_a and BM in (96, 128)):
         # Reconstruct physical wave lanes after the MFMA chain. The explicit
         # hardware count avoids keeping epilogue lane coordinates live across
         # GEMM. Counting an all-ones mask returns lane0..63 independently of
@@ -860,7 +902,7 @@ def _gemm1_body_m16(
 
     gpu.barrier()
 
-    if const_expr(is_f8_a and BM == 128):
+    if const_expr(is_f8_a and BM in (96, 128)):
         quant_lane = fx.Int32(
             llvm.inline_asm(
                 T.i32,
@@ -1040,6 +1082,16 @@ def _gemm1_body_m16(
             s_hi = _epi_row(sub * fx.Int32(32) + fx.Int32(16) + m_lane)
             if kk == fx.Int32(0):
                 _store_scale_pair(sub, s_lo, s_hi)
+
+        if const_expr(kSubBlocks % 2):  # noqa: SIM102 (static tail, runtime wave owner)
+            # An odd final BM32 sub-block belongs to the first four waves.
+            # No CTA barrier occurs inside _epi_row or _store_scale_pair.
+            if tx_i32 < fx.Int32(256):
+                sub = fx.Int32(kSubBlocks - 1)
+                s_lo = _epi_row(sub * fx.Int32(32) + m_lane)
+                s_hi = _epi_row(sub * fx.Int32(32) + fx.Int32(16) + m_lane)
+                if kk == fx.Int32(0):
+                    _store_scale_pair(sub, s_lo, s_hi)
 
 
 # Preserve the private import spelling used by the fused wrappers while making

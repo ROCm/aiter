@@ -7,7 +7,7 @@ push, then kernel2's node reduce / rail return / combine on the first
 
 Hand-off instead of the old kernel boundary: a CTA leaving Stage1 waits for
 Stage1's tables-final gate (h1_queue_eos == this generation: expert counts,
-tile maps, row metadata are published), drops stale L1/L2 lines once, and
+tile maps, row metadata are published), drops stale L1 lines (L2 once per XCD), and
 starts claiming GEMM2 units.  GMM1 runs with ``group_ready``: h1 is stored
 write-through and the last of a tile group's GMM1 jobs writes the generation
 into that group's ready word, which each GEMM2 unit polls before loading its
@@ -19,12 +19,17 @@ been claimed, so every awaited group is in progress).
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, rocdl
+from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 
 from .. import communication_ops_utils as comm
 from . import communication as comm2
 from .buffer_addressing import region_local_address
 from .mega_moe_internode_config import STAGE2_PART1_PROBE
 from .stage2_pipeline import compile_stage2_pipeline
+
+# Ready-word poll back-off (s_sleep units) of the hand-off and GEMM2 group waits.
+SK_POLL = int(__import__("os").environ.get("SK_POLL_SLEEP") or 32)
 
 _CACHE = {}
 
@@ -46,7 +51,7 @@ def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int)
         raise ValueError(
             "the single kernel needs Stage1 compiled with group_ready=True"
         )
-    epoch_off = int(stage1_launch.epoch_off)
+    xcd_inv_off = int(stage1_launch.xcd_inv_off)
     buffer_regions = stage1_launch.buffer_regions
     region_indices = {(stage, name): index for stage, name, index in buffer_regions}
     remote_first = pipeline.remote_first
@@ -60,7 +65,9 @@ def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int)
         + k1.kernel_name[len("megamoe_") :]
         + "__"
         + k2.kernel_name[len("megamoe_") :]
+        + f"_k2c{pipeline.k2_ctas}"
         + ("_p1q" if remote_first and STAGE2_PART1_PROBE else "")
+        + f"_ps{SK_POLL}_xi"
     )
 
     @fx.struct
@@ -84,32 +91,45 @@ def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         s1_body(dev_comm, arena_win, arena_ptr, x_q, input_scale, route_weights,
                 topk_ids, w1q, w1scale, ntokens, lds_raw=lds)
-        # This generation: Stage1 published it in epoch_gate before any CTA
-        # left its entry (every CTA spun on it there).
-        epoch_ptr = arena_ptr + fx.Int64(epoch_off)
-        if const_expr(bool(buffer_regions)):
-            epoch_ptr = region_local_address(arena_ptr, region_indices[1, "epoch_gate"], fx.Int64(0))
-        gen = fx.Int64(comm2.load_i64_global_system(epoch_ptr))
-        # Hand-off (see the module docstring): wait until Stage1's tables are
-        # final, drop stale lines once, then GEMM2 waits per tile group.
-        if fx.Int32(gpu.thread_id("x")) == fx.Int32(0):
-            eos = (arena_ptr + fx.Int64(gsync["eos_off"])
-                   + (gen & fx.Int64(1)) * fx.Int64(gsync["eos_plane"]))
-            if const_expr(bool(buffer_regions)):
-                eos = region_local_address(arena_ptr, region_indices[1, "h1_queue_eos"], gen & fx.Int64(1))
-            ev = fx.Int64(comm2.load_i64_global_system(eos))
-            while ev < gen:
-                rocdl.s_sleep(1)
-                ev = fx.Int64(comm2.load_i64_global_system(eos))
+        # Stage1 left (generation, EOS passed) in LDS words 0/1. Reloading the
+        # global epoch/EOS words here queued behind other traffic for ~12us.
         gpu.barrier()
-        comm.fence_agent_acquire()
+        gl = Vec(fx.make_view(fx.recast_iter(fx.Int64, lds), fx.make_layout(2, 1)).load())
+        gen = fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(gl[0]).ir_value()))
+        eos_seen = fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(gl[1]).ir_value()))
+        if fx.Int32(gpu.thread_id("x")) == fx.Int32(0):
+            # Hand-off (see the module docstring): CTAs that did not pass
+            # Stage1's EOS spin wait until its tables are final.
+            if eos_seen == fx.Int64(0):
+                eos = (arena_ptr + fx.Int64(gsync["eos_off"])
+                       + (gen & fx.Int64(1)) * fx.Int64(gsync["eos_plane"]))
+                if const_expr(bool(buffer_regions)):
+                    eos = region_local_address(arena_ptr, region_indices[1, "h1_queue_eos"], gen & fx.Int64(1))
+                ev = fx.Int64(comm2.load_i64_global_system(eos))
+                while ev < gen:
+                    rocdl.s_sleep(SK_POLL)
+                    ev = fx.Int64(comm2.load_i64_global_system(eos))
+            # One L2 invalidate per XCD and generation (MegaMoEV2 style): a
+            # per-CTA buffer_inv sc1 wipes the XCD's shared L2 32 times and
+            # stalls this CTA's first load ~7-12us behind it. The word holds
+            # the generation once an invalidate issued after EOS completed.
+            xa = arena_ptr + fx.Int64(xcd_inv_off)
+            if const_expr(bool(buffer_regions)):
+                xa = region_local_address(arena_ptr, region_indices[1, "xcd_l2_inv"], fx.Int64(0))
+            xa = xa + fx.Int64(fx.Int32(comm.hw_xcc_id()) & fx.Int32(7)) * fx.Int64(4)
+            xv = fx.Int32(comm2.load_i32_global_system_relaxed(xa))
+            if xv != fx.Int32(gen):
+                comm.fence_agent_acquire()
+                comm2.store_i32_global_system_relaxed(xa, fx.Int32(gen))
+            comm.invalidate_l1()
+        gpu.barrier()
         pipeline.body(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum,
                       arg_stids, arg_sweights, arg_trb, arg_p2p_comb_inp, i32_max_m_blocks,
                       i32_inter, i32_hidden, arg_arrival_count, i64_generation, arg_a_tile_map,
                       i32_local_rank, dev_comm, arena_win, arena_ptr, arg_output_bf16,
                       arg_scratch, local_tokens, arg_expert_count, arg_sd_send, arg_sd_tb,
                       arg_sd_plan, arg_sd_cdone, arg_tr_mcnt, arg_tr_sdprog,
-                      lds_ptr=lds,
+                      lds_ptr=lds, gen_value=gen,
                       grp_sync=(gsync["sync_off"], gsync["sync_plane"], gsync["tile_group"]))
 
     # fmt: off

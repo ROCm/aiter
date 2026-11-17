@@ -368,8 +368,12 @@ class Stage1ArenaLayout:
         )
         if not 1 <= topk <= 16:
             raise ValueError("topk must be in [1, 16] for the rank-slot ABI")
-        if tile_group not in (1, 2, 4):
-            raise ValueError("tile_group must be 1, 2 or 4")
+        if tile_group not in (1, 2, 3, 4):
+            raise ValueError("tile_group must be 1, 2, 3 or 4")
+        if tile_group == 3 and (activation_dtype != "fp8" or block_m != 32):
+            raise ValueError(
+                "tile_group=3 requires FP8 activation and BM32 arena tiles"
+            )
         if (block_n, parity_depth, num_qp) != (256, 2, 4) or block_m not in (
             32,
             64,
@@ -623,6 +627,9 @@ class Stage1ArenaLayout:
                 64,
             )
         )
+        # Single fused kernel: per XCD, the generation whose Stage2 hand-off
+        # already invalidated that XCD's L2 (one buffer_inv per XCD, not per CTA).
+        specs.append(("xcd_l2_inv", (8,), torch.int32, 64))
 
         # Split-path GMM1 ready queue: (generation << 32) | physical group ID.
         # generation marks validity, avoiding per-generation clearing. An atomic on
