@@ -9,8 +9,12 @@ modules directly.
 """
 
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from aiter.ops.qsa_indexer import qsa_decode_indexer, qsa_prefill_indexer
 
 from aiter.ops.topk import top_k_per_row_prefill
 from aiter.ops.triton.attention.qsa import (
@@ -136,10 +140,21 @@ def qsa_select_paged_tokens(
     allow_flydsl: bool = False,
     compressed_k_scale: torch.Tensor | None = None,
     stacked_decode: bool = False,
+    *,
+    query_lens: Sequence[int] | None = None,
+    prefix_lens: Sequence[int] | None = None,
 ) -> torch.Tensor:
-    """Score, select and expand in one call."""
+    """Score, select and expand prepared Q and compressed K in one call.
+
+    With allow_flydsl, gfx942 BF16 D128/top-512 also uses the migrated exact
+    selector. Optional host query_lens/prefix_lens describe packed prefill;
+    decode metadata stays on GPU. This operation does not update cache state.
+    Other configurations retain the existing scorer and selection paths.
+    """
     if compress_ratio <= 0 or token_topk <= 0 or token_topk % compress_ratio:
         raise ValueError("token_topk must be positive and divisible by compress_ratio")
+    if (query_lens is None) != (prefix_lens is None):
+        raise ValueError("query_lens and prefix_lens must be supplied together")
     rows = q.shape[0]
 
     columns = page_table.shape[1] * compressed_k_cache.shape[1]
@@ -161,6 +176,32 @@ def qsa_select_paged_tokens(
         out = out[:, :output_width]
     if rows == 0:
         return out
+
+    if (
+        allow_flydsl
+        and _HAS_FLYDSL
+        and compressed_k_scale is None
+        and not stacked_decode
+        and token_topk == 2048
+        and compress_ratio == 4
+    ):
+        from aiter.ops.flydsl.qsa_indexer import try_select_paged_tokens
+
+        selected = try_select_paged_tokens(
+            q,
+            compressed_k_cache,
+            page_table,
+            token_to_request,
+            query_positions,
+            context_lens,
+            columns,
+            out,
+            query_lens=query_lens,
+            prefix_lens=prefix_lens,
+            logits_workspace_bytes=logits_workspace_bytes,
+        )
+        if selected is not None:
+            return selected
 
     rows_per_chunk = max(1, logits_workspace_bytes // max(columns * 4, 1))
     for row_start in range(0, rows, rows_per_chunk):
@@ -249,10 +290,23 @@ __all__ = [
     "FP8_DTYPE",
     "FP8_MAX",
     "qsa_cache_row_layout",
+    "qsa_decode_indexer",
     "qsa_expand_block_indices",
     "qsa_paged_mqa_logits",
+    "qsa_prefill_indexer",
     "qsa_select_paged_tokens",
     "qsa_sparse_paged_gqa",
     "qsa_sparse_prefill",
     "qsa_store_quantized_rows",
 ]
+
+
+def __getattr__(name):
+    # Keep the other QSA operators importable without the FlyDSL indexer.
+    if name in ("qsa_prefill_indexer", "qsa_decode_indexer"):
+        from aiter.ops import qsa_indexer
+
+        op = getattr(qsa_indexer, name)
+        globals()[name] = op
+        return op
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
