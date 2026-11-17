@@ -6,10 +6,14 @@
         "min_split_tiles": 16
     },
     "topk": {
-        "block": 2048,
-        "res": 4096,
-        "dbits": 4,
-        "num_warps": 16
+        "res": 8192,
+        "num_warps": 16,
+        "chunk_min": 2048,
+        "chunk_max": 16384,
+        "chunk_warps": 4,
+        "target_programs": 8192,
+        "write_block": 2048,
+        "max_chunks": 16
     },
     "indexer": {
         "workspace_bytes": 1073741824

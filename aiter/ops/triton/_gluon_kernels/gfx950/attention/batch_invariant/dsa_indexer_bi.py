@@ -303,25 +303,20 @@ def _dsa_indexer_bi_logits_kernel(
     gl.amd.cdna4.async_copy.wait_group(0)
 
 
+# Top-k: MSB-first radix select with 8-bit digits (4 rounds) finds the unique
+# cutoff key. All counts are exact integers, so the result does not depend on
+# how a row is split into chunks or programs.
+DIGIT_BITS = gl.constexpr(8)
+NUM_BINS = gl.constexpr(256)
+NUM_ROUNDS = gl.constexpr(4)
+
+
 @gluon.jit
 def _ordered_key(x):
     # fp32 bits -> uint32 in the total order of the bit patterns (-0.0 < +0.0).
     bits = x.to(gl.int32, bitcast=True)
     u = bits.to(gl.uint32, bitcast=True)
     return gl.where(bits < 0, ~u, u | 0x80000000)
-
-
-@gluon.jit
-def _digit_ge(u, m, thr, shift, DBITS: gl.constexpr, layout2d: gl.constexpr):
-    # ge[i, d] = m[i] and u[i] >= thr | d << shift; its column sums fall as d grows.
-    d = gl.arange(0, 1 << DBITS, layout=gl.SliceLayout(0, layout2d)).to(gl.uint32)
-    cand = thr | (d << shift)
-    return (m[:, None] & (u[:, None] >= cand[None, :])).to(gl.int32)
-
-
-@gluon.jit
-def _digit_counts(u, m, thr, shift, DBITS: gl.constexpr, layout2d: gl.constexpr):
-    return gl.sum(_digit_ge(u, m, thr, shift, DBITS, layout2d), axis=0)
 
 
 @gluon.jit
@@ -338,99 +333,72 @@ def _cumsum(x, flat: gl.constexpr):
 
 @gluon.constexpr_function
 def _flat_layout(n, num_warps):
-    return gl.BlockedLayout([n // (64 * num_warps)], [64], [num_warps], [0])
+    # 4 contiguous elements per thread, repeated: coalesced 16-byte loads.
+    return gl.BlockedLayout(
+        [max(1, min(4, n // (64 * num_warps)))], [64], [num_warps], [0]
+    )
 
 
 @gluon.jit
-def _topk_resident(
-    row_ptr,
-    out_row,
-    n,
-    sel,
-    RES: gl.constexpr,
-    DBITS: gl.constexpr,
-    layout: gl.constexpr,
-    NW: gl.constexpr,
-):
-    flat: gl.constexpr = _flat_layout(RES, NW)
-    # Row of at most RES columns: one load, the select in registers.
-    cols = gl.arange(0, RES, layout=gl.SliceLayout(1, layout))
-    m = cols < n
-    u = _ordered_key(gl.load(row_ptr + cols, mask=m, other=0.0))
-    thr = (n * 0).to(gl.uint32)
-    for r in gl.static_range(32 // DBITS):
-        shift = 32 - DBITS * (r + 1)
-        cnt = _digit_counts(u, m, thr, shift, DBITS, layout)
-        nd = gl.sum((cnt >= sel).to(gl.int32), axis=0)
-        thr = thr | ((nd - 1).to(gl.uint32) << shift)
-    gt = m & (u > thr)
-    eq = m & (u == thr)
-    n_gt = gl.sum(gt.to(gl.int32), axis=0)
-    n_eq = gl.sum(eq.to(gl.int32), axis=0)
-    # Of the n_eq tied columns take the (sel - n_gt) largest.
-    skip_eq = n_eq - (sel - n_gt)
-    eq_rank = _cumsum(eq.to(gl.int32), flat) - 1
-    take = gt | (eq & (eq_rank >= skip_eq))
-    pos = _cumsum(take.to(gl.int32), flat) - 1
-    gl.store(out_row + pos, cols, mask=take)
+def _excl_prefix(v, tri: gl.constexpr):
+    # Exclusive prefix sum of a short vector: a triangular masked sum.
+    vc = gl.convert_layout(v, gl.SliceLayout(0, tri))
+    i = gl.arange(0, v.shape[0], layout=gl.SliceLayout(1, tri))
+    j = gl.arange(0, v.shape[0], layout=gl.SliceLayout(0, tri))
+    s = gl.sum(gl.where(j[None, :] < i[:, None], vc[None, :], 0), axis=1)
+    return gl.convert_layout(s, v.type.layout)
 
 
 @gluon.jit
-def _topk_streamed(
-    row_ptr,
-    out_row,
-    n,
-    sel,
-    BLOCK: gl.constexpr,
-    DBITS: gl.constexpr,
-    layout: gl.constexpr,
-    NW: gl.constexpr,
-):
-    flat: gl.constexpr = _flat_layout(BLOCK, NW)
-    # Longer row: every radix round and the final passes stream BLOCK tiles.
-    # Counts stay per thread across the tiles and are reduced once per pass.
-    jb = gl.arange(0, BLOCK, layout=gl.SliceLayout(1, layout))
-    thr = (n * 0).to(gl.uint32)
-    for r in gl.static_range(32 // DBITS):
-        shift = 32 - DBITS * (r + 1)
-        acc = gl.zeros([BLOCK, 1 << DBITS], dtype=gl.int32, layout=layout)
-        for c0 in range(0, n, BLOCK):
-            cols = c0 + jb
-            m = cols < n
-            u = _ordered_key(gl.load(row_ptr + cols, mask=m, other=0.0))
-            acc += _digit_ge(u, m, thr, shift, DBITS, layout)
-        cnt = gl.sum(acc, axis=0)
-        nd = gl.sum((cnt >= sel).to(gl.int32), axis=0)
-        thr = thr | ((nd - 1).to(gl.uint32) << shift)
-    jf = gl.arange(0, BLOCK, layout=flat)
-    gt_acc = gl.zeros([BLOCK], dtype=gl.int32, layout=flat)
-    eq_acc = gl.zeros([BLOCK], dtype=gl.int32, layout=flat)
-    for c0 in range(0, n, BLOCK):
-        cols = c0 + jf
-        m = cols < n
-        u = _ordered_key(gl.load(row_ptr + cols, mask=m, other=0.0))
-        gt_acc += (m & (u > thr)).to(gl.int32)
-        eq_acc += (m & (u == thr)).to(gl.int32)
-    n_gt = gl.sum(gt_acc, axis=0)
-    n_eq = gl.sum(eq_acc, axis=0)
-    skip_eq = n_eq - (sel - n_gt)
-    eq_seen = n * 0
-    written = n * 0
-    for c0 in range(0, n, BLOCK):
-        cols = c0 + jf
-        m = cols < n
-        u = _ordered_key(gl.load(row_ptr + cols, mask=m, other=0.0))
-        eq = (m & (u == thr)).to(gl.int32)
-        eq_rank = eq_seen + gl.associative_scan(eq, 0, _add) - 1
-        take = (m & (u > thr)) | ((eq != 0) & (eq_rank >= skip_eq))
-        pos_in = gl.associative_scan(take.to(gl.int32), 0, _add)
-        gl.store(out_row + written + pos_in - 1, cols, mask=take)
-        eq_seen += gl.sum(eq, axis=0)
-        written += gl.sum(take.to(gl.int32), axis=0)
+def _round_hist(u, m, thr, ROUND: gl.constexpr, hist_layout: gl.constexpr):
+    # Histogram of digit ROUND of the keys whose higher digits equal thr's.
+    shift: gl.constexpr = 32 - DIGIT_BITS * (ROUND + 1)
+    if ROUND > 0:
+        m = m & ((u >> (shift + DIGIT_BITS)) == (thr >> (shift + DIGIT_BITS)))
+    digit = ((u >> shift) & (NUM_BINS - 1)).to(gl.int32)
+    # Integer adds in LDS: the counts do not depend on the order of the adds.
+    smem = gl.allocate_shared_memory(
+        gl.int32, [NUM_BINS], layout=gl.SwizzledSharedLayout(1, 1, 1, [0])
+    )
+    smem.store(gl.zeros([NUM_BINS], dtype=gl.int32, layout=hist_layout))
+    gl.barrier()
+    ones = gl.full(digit.shape, 1, dtype=gl.int32, layout=digit.type.layout)
+    smem.atomic_scatter_add(ones, digit, 0, mask=m)
+    gl.barrier()
+    return smem.load(hist_layout)
+
+
+@gluon.jit
+def _pick_digit(total, need, hist_layout: gl.constexpr):
+    # Largest digit d with count(digit >= d) >= need; also count(digit > d).
+    ge = gl.sum(total, axis=0) - _cumsum(total, hist_layout) + total
+    d = gl.sum((ge >= need).to(gl.int32), axis=0) - 1
+    bins = gl.arange(0, NUM_BINS, layout=hist_layout)
+    n_gt = gl.sum(gl.where(bins > d, total, 0), axis=0)
+    return d, n_gt
+
+
+@gluon.jit
+def _take_and_store(u, cols, m, thr, skip_eq, eq_before, base, out_row, flat):
+    # Keys above thr, and the tied keys of global tie rank >= skip_eq. One scan
+    # of packed (above, tied) counts; a tile has fewer than 2**16 columns.
+    gt = (m & (u > thr)).to(gl.int32)
+    eq = (m & (u == thr)).to(gl.int32)
+    packed = gt + (eq << 16)
+    excl = _cumsum(packed, flat) - packed
+    eq_x = eq_before + (excl >> 16)
+    taken_before = gl.maximum(eq_x - skip_eq, 0) - gl.maximum(eq_before - skip_eq, 0)
+    take = (gt != 0) | ((eq != 0) & (eq_x >= skip_eq))
+    gl.store(out_row + base + (excl & 0xFFFF) + taken_before, cols, mask=take)
+    n_eq = gl.sum(eq, axis=0)
+    taken = gl.maximum(eq_before + n_eq - skip_eq, 0) - gl.maximum(
+        eq_before - skip_eq, 0
+    )
+    return gl.sum(gt, axis=0) + taken, n_eq
 
 
 _topk_repr = make_kernel_repr(
-    "_dsa_indexer_bi_topk_kernel", ["TOPK", "BLOCK", "RES", "DBITS", "NUM_WARPS"]
+    "_dsa_indexer_bi_topk_kernel", ["TOPK", "RES", "NUM_WARPS"]
 )
 
 
@@ -443,43 +411,217 @@ def _dsa_indexer_bi_topk_kernel(
     stride_o_s,
     max_len,
     TOPK: gl.constexpr,
-    BLOCK: gl.constexpr,
     RES: gl.constexpr,
-    DBITS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    """Exact top-k of logits[t, 0:len[t]]: by the key order, ties to the larger column.
+    """Exact top-k of rows of at most RES columns, one program per row.
 
-    Writes the selected columns ascending, then -1 to TOPK. An MSB-first radix
-    select finds the unique cutoff key; rows of at most RES columns stay in
-    registers, longer rows stream BLOCK tiles. The result is the same for any
-    BLOCK, RES or DBITS.
+    Order: the key order, ties to the larger column. Writes the selected columns
+    ascending, then -1 to TOPK. Rows longer than RES are left to the chunked kernels.
     """
-    l_res: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[RES // (64 * NUM_WARPS), 1 << DBITS],
-        threads_per_warp=[64, 1],
-        warps_per_cta=[NUM_WARPS, 1],
-        order=[1, 0],
-    )
-    l_blk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[BLOCK // (64 * NUM_WARPS), 1 << DBITS],
-        threads_per_warp=[64, 1],
-        warps_per_cta=[NUM_WARPS, 1],
-        order=[1, 0],
-    )
+    flat: gl.constexpr = _flat_layout(RES, NUM_WARPS)
+    hist_layout: gl.constexpr = _flat_layout(NUM_BINS, NUM_WARPS)
     row = gl.program_id(0)
     n = gl.minimum(gl.maximum(gl.load(len_ptr + row), 0), max_len)
     sel = gl.minimum(n, TOPK)
     row_ptr = logits_ptr + row.to(gl.int64) * stride_l_s
     out_row = out_ptr + row.to(gl.int64) * stride_o_s
-    if n > TOPK:
-        if n <= RES:
-            _topk_resident(row_ptr, out_row, n, sel, RES, DBITS, l_res, NUM_WARPS)
+    if (n > TOPK) & (n <= RES):
+        cols = gl.arange(0, RES, layout=flat)
+        m = cols < n
+        u = _ordered_key(gl.load(row_ptr + cols, mask=m, other=0.0))
+        thr = (n * 0).to(gl.uint32)
+        need = sel
+        for r in gl.static_range(NUM_ROUNDS):
+            h = _round_hist(u, m, thr, r, hist_layout)
+            d, n_gt = _pick_digit(h, need, hist_layout)
+            need = need - n_gt
+            thr = thr | (d.to(gl.uint32) << (32 - DIGIT_BITS * (r + 1)))
+        n_eq = gl.sum((m & (u == thr)).to(gl.int32), axis=0)
+        _take_and_store(u, cols, m, thr, n_eq - need, 0, 0, out_row, flat)
+    j = gl.arange(0, TOPK, layout=_flat_layout(TOPK, NUM_WARPS))
+    # Rows of at most TOPK columns take them all; then the -1 tail.
+    gl.store(out_row + j, gl.where(j < sel, j, -1), mask=(j >= sel) | (n <= TOPK))
+
+
+_hist_repr = make_kernel_repr(
+    "_dsa_indexer_bi_topk_hist_kernel", ["ROUND", "RES", "CHUNK", "NUM_WARPS"]
+)
+
+
+@gluon.jit(repr=_hist_repr, do_not_specialize=["max_len", "stride_h_s", "stride_h_r"])
+def _dsa_indexer_bi_topk_hist_kernel(
+    logits_ptr,  # fp32 [T, >= max_len]
+    stride_l_s,
+    len_ptr,  # int32 [T]
+    state_ptr,  # int32 [T, 4]: thr, need, skip_eq
+    hist_ptr,  # int32 [T, NUM_ROUNDS, chunks, NUM_BINS]
+    stride_h_s,
+    stride_h_r,
+    max_len,
+    ROUND: gl.constexpr,
+    RES: gl.constexpr,
+    CHUNK: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Digit histogram of one CHUNK of a row longer than RES, for radix round ROUND."""
+    flat: gl.constexpr = _flat_layout(CHUNK, NUM_WARPS)
+    hist_layout: gl.constexpr = _flat_layout(NUM_BINS, NUM_WARPS)
+    row = gl.program_id(0)
+    chunk = gl.program_id(1)
+    c0 = chunk * CHUNK
+    n = gl.minimum(gl.maximum(gl.load(len_ptr + row), 0), max_len)
+    if (n > RES) & (c0 < n):
+        cols = c0 + gl.arange(0, CHUNK, layout=flat)
+        m = cols < n
+        x = gl.load(
+            logits_ptr + row.to(gl.int64) * stride_l_s + cols, mask=m, other=0.0
+        )
+        thr = gl.load(state_ptr + row * 4).to(gl.uint32, bitcast=True)
+        h = _round_hist(_ordered_key(x), m, thr, ROUND, hist_layout)
+        bins = gl.arange(0, NUM_BINS, layout=hist_layout)
+        h_row = hist_ptr + row.to(gl.int64) * stride_h_s + ROUND * stride_h_r
+        gl.store(h_row + chunk * NUM_BINS + bins, h)
+
+
+_select_repr = make_kernel_repr(
+    "_dsa_indexer_bi_topk_select_kernel", ["ROUND", "TOPK", "RES", "CHUNK"]
+)
+
+
+@gluon.jit
+def _hist_tile(h_ptr, c, nc, bins):
+    return gl.load(
+        h_ptr + c[:, None] * NUM_BINS + bins[None, :], mask=(c < nc)[:, None], other=0
+    )
+
+
+@gluon.jit(
+    repr=_select_repr,
+    do_not_specialize=["max_len", "stride_h_s", "stride_h_r", "stride_a_s"],
+)
+def _dsa_indexer_bi_topk_select_kernel(
+    len_ptr,  # int32 [T]
+    state_ptr,  # int32 [T, 4]
+    hist_ptr,  # int32 [T, NUM_ROUNDS, chunks, NUM_BINS]
+    stride_h_s,
+    stride_h_r,
+    aux_ptr,  # int32 [T, 2, chunks]: output offset, then tie offset, of each chunk
+    stride_a_s,
+    max_len,
+    ROUND: gl.constexpr,
+    TOPK: gl.constexpr,
+    RES: gl.constexpr,
+    CHUNK: gl.constexpr,
+):
+    """Sum the chunk histograms of a row and pick the digit of ROUND.
+
+    After the last round, it computes each chunk's output offset and tie offset
+    from the histograms of all rounds, in chunk order.
+    """
+    NW: gl.constexpr = 4
+    CB: gl.constexpr = 16
+    # Chunks on the warps, bins on the lanes: per-chunk sums stay in a warp.
+    tile: gl.constexpr = gl.BlockedLayout([1, 4], [1, 64], [NW, 1], [1, 0])
+    tri: gl.constexpr = gl.BlockedLayout([1, 1], [16, 4], [1, NW], [1, 0])
+    flat_b: gl.constexpr = gl.BlockedLayout([1], [64], [NW], [0])
+    shift: gl.constexpr = 32 - DIGIT_BITS * (ROUND + 1)
+    row = gl.program_id(0)
+    n = gl.minimum(gl.maximum(gl.load(len_ptr + row), 0), max_len)
+    if n > RES:
+        nc = (n + CHUNK - 1) // CHUNK
+        h_row = hist_ptr + row.to(gl.int64) * stride_h_s
+        bins = gl.arange(0, NUM_BINS, layout=gl.SliceLayout(0, tile))
+        ci = gl.arange(0, CB, layout=gl.SliceLayout(1, tile))
+        if ROUND == 0:
+            thr = (n * 0).to(gl.uint32)
+            need = n * 0 + TOPK
         else:
-            _topk_streamed(row_ptr, out_row, n, sel, BLOCK, DBITS, l_blk, NUM_WARPS)
-    jb = gl.arange(0, BLOCK, layout=gl.SliceLayout(1, l_blk))
-    for c0 in range(0, TOPK, BLOCK):
-        j = c0 + jb
-        # Rows of at most TOPK columns take them all; then the -1 tail.
-        val = gl.where(j < sel, j, -1)
-        gl.store(out_row + j, val, mask=(j >= sel) | (n <= TOPK))
+            thr = gl.load(state_ptr + row * 4).to(gl.uint32, bitcast=True)
+            need = gl.load(state_ptr + row * 4 + 1)
+        acc = gl.zeros([CB, NUM_BINS], dtype=gl.int32, layout=tile)
+        for cb in range(0, nc, CB):
+            acc += _hist_tile(h_row + ROUND * stride_h_r, cb + ci, nc, bins)
+        total = gl.convert_layout(gl.sum(acc, 0), flat_b)
+        d, n_gt = _pick_digit(total, need, flat_b)
+        need = need - n_gt
+        thr = thr | (d.to(gl.uint32) << shift)
+        gl.store(state_ptr + row * 4, thr.to(gl.int32, bitcast=True))
+        gl.store(state_ptr + row * 4 + 1, need)
+        if ROUND == NUM_ROUNDS - 1:
+            n_eq = gl.sum(
+                gl.where(gl.arange(0, NUM_BINS, layout=flat_b) == d, total, 0), 0
+            )
+            skip_eq = n_eq - need
+            gl.store(state_ptr + row * 4 + 2, skip_eq)
+            a_row = aux_ptr + row.to(gl.int64) * stride_a_s
+            gt_done = n * 0
+            eq_done = n * 0
+            for cb in range(0, nc, CB):
+                c = cb + ci
+                # Keys above thr: a higher digit in some round, equal before it.
+                gt = gl.zeros([CB], dtype=gl.int32, layout=gl.SliceLayout(1, tile))
+                for r in gl.static_range(NUM_ROUNDS - 1):
+                    dr = ((thr >> (32 - DIGIT_BITS * (r + 1))) & (NUM_BINS - 1)).to(
+                        gl.int32
+                    )
+                    t = _hist_tile(h_row + r * stride_h_r, c, nc, bins)
+                    gt += gl.sum(gl.where(bins[None, :] > dr, t, 0), 1)
+                t = _hist_tile(h_row + ROUND * stride_h_r, c, nc, bins)
+                gt += gl.sum(gl.where(bins[None, :] > d, t, 0), 1)
+                eq = gl.sum(gl.where(bins[None, :] == d, t, 0), 1)
+                eq_before = eq_done + _excl_prefix(eq, tri)
+                take = gt + gl.maximum(gl.minimum(eq, eq_before + eq - skip_eq), 0)
+                base = gt_done + _excl_prefix(take, tri)
+                cm = c < nc
+                gl.store(a_row + c, base, mask=cm)
+                gl.store(a_row + stride_a_s // 2 + c, eq_before, mask=cm)
+                gt_done += gl.sum(take, axis=0)
+                eq_done += gl.sum(eq, axis=0)
+
+
+_write_repr = make_kernel_repr(
+    "_dsa_indexer_bi_topk_write_kernel", ["RES", "CHUNK", "BLOCK", "NUM_WARPS"]
+)
+
+
+@gluon.jit(repr=_write_repr, do_not_specialize=["max_len", "stride_a_s"])
+def _dsa_indexer_bi_topk_write_kernel(
+    logits_ptr,  # fp32 [T, >= max_len]
+    stride_l_s,
+    len_ptr,  # int32 [T]
+    state_ptr,  # int32 [T, 4]
+    aux_ptr,  # int32 [T, 2, chunks]
+    stride_a_s,
+    out_ptr,  # int32 [T, >= TOPK]
+    stride_o_s,
+    max_len,
+    RES: gl.constexpr,
+    CHUNK: gl.constexpr,
+    BLOCK: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Write the selected columns of one CHUNK of a row longer than RES, BLOCK at a time."""
+    flat: gl.constexpr = _flat_layout(BLOCK, NUM_WARPS)
+    row = gl.program_id(0)
+    chunk = gl.program_id(1)
+    c0 = chunk * CHUNK
+    n = gl.minimum(gl.maximum(gl.load(len_ptr + row), 0), max_len)
+    if (n > RES) & (c0 < n):
+        thr = gl.load(state_ptr + row * 4).to(gl.uint32, bitcast=True)
+        skip_eq = gl.load(state_ptr + row * 4 + 2)
+        a_row = aux_ptr + row.to(gl.int64) * stride_a_s
+        base = gl.load(a_row + chunk)
+        eq_before = gl.load(a_row + stride_a_s // 2 + chunk)
+        row_ptr = logits_ptr + row.to(gl.int64) * stride_l_s
+        out_row = out_ptr + row.to(gl.int64) * stride_o_s
+        jb = gl.arange(0, BLOCK, layout=flat)
+        for b0 in range(c0, gl.minimum(c0 + CHUNK, n), BLOCK):
+            cols = b0 + jb
+            m = cols < n
+            u = _ordered_key(gl.load(row_ptr + cols, mask=m, other=0.0))
+            taken, n_eq = _take_and_store(
+                u, cols, m, thr, skip_eq, eq_before, base, out_row, flat
+            )
+            base += taken
+            eq_before += n_eq

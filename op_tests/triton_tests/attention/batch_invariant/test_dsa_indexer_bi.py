@@ -168,11 +168,10 @@ def ref_topk(logits, ln, k):
         n = int(ln[t])
         if n == 0:
             continue
-        key = ordered_key(logits[t, :n].cpu())
+        # by key, ties to the larger column: (key, col) is unique and exact in int64
         col = torch.arange(n)
-        # by key, ties to the larger column: sort on (key, col), both descending
-        order = sorted(range(n), key=lambda c: (-int(key[c]), -c))[:k]
-        sel = torch.sort(col[order]).values
+        comp = ordered_key(logits[t, :n].cpu()) * (1 << 31) + col
+        sel = torch.sort(col[torch.topk(comp, min(k, n)).indices]).values
         out[t, : sel.numel()] = sel.to(torch.int32)
     return out
 
@@ -240,6 +239,23 @@ def test_topk_row_depends_only_on_its_row():
     wide = torch.full((9, 12000), 1e30, dtype=torch.float32, device="cuda")
     wide[:, :9000] = x
     assert torch.equal(dsa_topk_bi(wide, ln, TOPK), full)
+
+
+def test_topk_long_rows_any_chunking():
+    # Long tie-heavy rows; the launch splits them in other chunks for other T and W.
+    g = torch.Generator(device="cpu").manual_seed(5)
+    W = 1 << 22
+    x = (torch.randint(0, 3000, (6, W), generator=g).float() / 16 - 90).cuda()
+    x[1, 100:200000] = 0.0
+    x[1, 300000:400000] = -0.0
+    lens = [W, 3000000, 8192, 8193, 200001, 1000003]
+    ln = torch.tensor(lens, dtype=torch.int32).cuda()
+    full = dsa_topk_bi(x, ln, TOPK)
+    assert torch.equal(full.cpu(), ref_topk(x, ln, TOPK))
+    for t in range(x.shape[0]):
+        n = lens[t]
+        alone = dsa_topk_bi(x[t : t + 1, :n].clone(), ln[t : t + 1].clone(), TOPK)
+        assert torch.equal(alone[0], full[t]), t
 
 
 @pytest.mark.parametrize("H", [32, 64])

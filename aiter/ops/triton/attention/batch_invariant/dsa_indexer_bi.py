@@ -10,7 +10,10 @@ import triton
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.batch_invariant.dsa_indexer_bi import (
     _dsa_indexer_bi_logits_kernel,
+    _dsa_indexer_bi_topk_hist_kernel,
     _dsa_indexer_bi_topk_kernel,
+    _dsa_indexer_bi_topk_select_kernel,
+    _dsa_indexer_bi_topk_write_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
@@ -167,6 +170,7 @@ def _launch_topk(logits, row_len, topk, max_len, out):
     if T == 0:
         return
     cfg = _config("topk")
+    res = cfg["res"]
     _dsa_indexer_bi_topk_kernel[(T,)](
         logits,
         logits.stride(0),
@@ -175,11 +179,71 @@ def _launch_topk(logits, row_len, topk, max_len, out):
         out.stride(0),
         max_len,
         TOPK=topk,
-        BLOCK=cfg["block"],
-        RES=cfg["res"],
-        DBITS=cfg["dbits"],
+        RES=res,
         NUM_WARPS=cfg["num_warps"],
         num_warps=cfg["num_warps"],
+    )
+    if max_len <= res:
+        return
+    # Longer rows: chunk histograms, one select per round, then the write.
+    # Counts are exact, so the chunk size only changes the launch.
+    want = max(
+        triton.cdiv(T * max_len, cfg["target_programs"]),
+        triton.cdiv(max_len, cfg["max_chunks"]),
+    )
+    chunk = min(cfg["chunk_max"], max(cfg["chunk_min"], triton.next_power_of_2(want)))
+    chunks = triton.cdiv(max_len, chunk)
+    dev = logits.device
+    state = torch.empty((T, 4), dtype=torch.int32, device=dev)
+    hist = torch.empty((T, 4 * chunks * 256), dtype=torch.int32, device=dev)
+    aux = torch.empty((T, 2 * chunks), dtype=torch.int32, device=dev)
+    nw = cfg["chunk_warps"]
+    for rnd in range(4):
+        _dsa_indexer_bi_topk_hist_kernel[(T, chunks)](
+            logits,
+            logits.stride(0),
+            row_len,
+            state,
+            hist,
+            hist.stride(0),
+            chunks * 256,
+            max_len,
+            ROUND=rnd,
+            RES=res,
+            CHUNK=chunk,
+            NUM_WARPS=nw,
+            num_warps=nw,
+        )
+        _dsa_indexer_bi_topk_select_kernel[(T,)](
+            row_len,
+            state,
+            hist,
+            hist.stride(0),
+            chunks * 256,
+            aux,
+            aux.stride(0),
+            max_len,
+            ROUND=rnd,
+            TOPK=topk,
+            RES=res,
+            CHUNK=chunk,
+            num_warps=4,
+        )
+    _dsa_indexer_bi_topk_write_kernel[(T, chunks)](
+        logits,
+        logits.stride(0),
+        row_len,
+        state,
+        aux,
+        aux.stride(0),
+        out,
+        out.stride(0),
+        max_len,
+        RES=res,
+        CHUNK=chunk,
+        BLOCK=min(chunk, cfg["write_block"]),
+        NUM_WARPS=nw,
+        num_warps=nw,
     )
 
 
