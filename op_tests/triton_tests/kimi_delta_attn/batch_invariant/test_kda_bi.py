@@ -180,6 +180,19 @@ def test_state_block_size_same_bits(bv, monkeypatch):
         assert torch.equal(a, b)
 
 
+@pytest.mark.parametrize("fuse", [False, True])
+def test_fused_output_same_bits(fuse, monkeypatch):
+    # the output is computed in the state pass for wide grids; the bits must not depend on it
+    lens = [150, 90, 1, 64, 200]
+    x, h0 = make_inputs(sum(lens), 15, n_seq=len(lens), with_state=True)
+    monkeypatch.setattr(kda_bi_mod, "_fuse_out", lambda n: not fuse)
+    ref = _run(x, lens, h0=h0, final=True, boundary=True)
+    monkeypatch.setattr(kda_bi_mod, "_fuse_out", lambda n: fuse)
+    out = _run(x, lens, h0=h0, final=True, boundary=True)
+    for a, b in zip(out, ref):
+        assert torch.equal(a, b)
+
+
 def test_boundary_state():
     # the state after each sequence's last complete chunk; the initial state if there is none
     lens = [200, 64, 30, 0, 128]

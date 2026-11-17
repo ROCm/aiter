@@ -54,6 +54,12 @@ def _state_bv(n_seq_heads: int) -> int:
     return fits[-1] if fits else choices[0]
 
 
+def _fuse_out(n_seq_heads: int) -> bool:
+    """Compute the output inside the state pass (no bf16 state copies, one launch less)
+    when the state grid is wide enough; the bits are the same either way."""
+    return n_seq_heads >= _config("state_grid")["FUSE_OUT_MIN_SEQ_HEADS"]
+
+
 def kda_bi_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -144,10 +150,16 @@ def kda_bi_fwd(
         qg, kg, w, u = (torch.empty_like(q) for _ in range(4))
         aqk = torch.empty(1, T, H, CHUNK, dtype=torch.bfloat16, device=dev)
         glast = torch.empty(n_chunks, H, HEAD_DIM, dtype=torch.float32, device=dev)
-        hs = torch.empty(
-            n_chunks, H, HEAD_DIM, HEAD_DIM, dtype=torch.bfloat16, device=dev
+        fuse = _fuse_out(N * H)
+        # per-chunk bf16 states and v_new only feed the separate out kernel
+        hs = (
+            torch.empty(
+                n_chunks, H, HEAD_DIM, HEAD_DIM, dtype=torch.bfloat16, device=dev
+            )
+            if not fuse
+            else aqk
         )
-        vn = torch.empty_like(v)
+        vn = torch.empty_like(v) if not fuse else v
         ci, cs, co = _config("intra"), _config("state"), _config("out")
         _kda_bi_intra_kernel[(n_chunks, H)](
             q,
@@ -184,26 +196,32 @@ def kda_bi_fwd(
             dummy if bound is None else bound,
             hs,
             vn,
+            qg,
+            aqk,
+            o,
+            scale,
             H,
             n_chunks,
             HAS_H0=h0 is not None,
             STORE_HT=final is not None,
             STORE_HB=bound is not None,
+            FUSE_OUT=fuse,
             **cs,
             enable_fp_fusion=False,
         )
-        _kda_bi_out_kernel[(n_chunks, H, HEAD_DIM // co["BV"])](
-            qg,
-            aqk,
-            vn,
-            hs,
-            o,
-            chunks,
-            scale,
-            H,
-            **co,
-            enable_fp_fusion=False,
-        )
+        if not fuse:
+            _kda_bi_out_kernel[(n_chunks, H, HEAD_DIM // co["BV"])](
+                qg,
+                aqk,
+                vn,
+                hs,
+                o,
+                chunks,
+                scale,
+                H,
+                **co,
+                enable_fp_fusion=False,
+            )
     else:
         for t in (final, bound):
             if t is not None:

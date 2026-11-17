@@ -604,6 +604,50 @@ def _kda_bi_intra_kernel(
     )
 
 
+@gluon.jit
+def _out_vn(
+    QG,
+    AQK,
+    vn,
+    hb,
+    O,
+    n,
+    scale,
+    s_out,
+    s_a,
+    s_o,
+    BV: gl.constexpr,
+    num_warps: gl.constexpr,
+):
+    """_out_tile with v_new given in registers (bf16 [64, BV] in the MFMA layout): the
+    same operations, so the same bits."""
+    MF: gl.constexpr = mfma_layout(num_warps)
+    RM: gl.constexpr = row_major_layout(num_warps)
+    qg = gl.convert_layout(
+        _load_rows(QG, s_out, n, BT, D, RM), gl.DotOperandLayout(0, MF, 8)
+    )
+    acc = gl.amd.cdna4.mfma(
+        qg,
+        gl.convert_layout(hb, gl.DotOperandLayout(1, MF, 8)),
+        gl.zeros([BT, BV], gl.float32, MF),
+    )
+    acc = acc * scale
+    a = gl.convert_layout(
+        _load_rows(AQK, s_a, n, BT, BT, RM), gl.DotOperandLayout(0, MF, 8)
+    )
+    acc = gl.amd.cdna4.mfma(
+        a, gl.convert_layout(vn, gl.DotOperandLayout(1, MF, 8)), acc
+    )
+    r = gl.arange(0, BT, layout=gl.SliceLayout(1, MF))
+    c = gl.arange(0, BV, layout=gl.SliceLayout(0, MF))
+    off = gl.expand_dims(r.to(gl.int64) * s_o, 1) + gl.expand_dims(c, 0)
+    gl.store(
+        O + off,
+        acc.to(gl.bfloat16),
+        mask=gl.expand_dims(r < n, 1) & gl.expand_dims(c < BV, 0),
+    )
+
+
 _state_repr = make_kernel_repr("_kda_bi_state_kernel", ["BV"])
 
 
@@ -629,17 +673,24 @@ def _kda_bi_state_kernel(
     HB,
     HS,
     VN,
+    QG,
+    AQK,
+    O,
+    scale,
     H,
     n_chunks,
     HAS_H0: gl.constexpr,
     STORE_HT: gl.constexpr,
     STORE_HB: gl.constexpr,
+    FUSE_OUT: gl.constexpr,
     BV: gl.constexpr,
     num_warps: gl.constexpr,
 ):
     """Program (sequence s, head h, V block): walks the sequence's chunks in order, loading
     chunk c + 1 while chunk c computes. Per chunk: bf16(h) to HS, v_new, the FP32 state step.
-    HT gets the final state, HB the state after the last complete chunk."""
+    HT gets the final state, HB the state after the last complete chunk. With FUSE_OUT the
+    output of each chunk is computed here too (_out_vn), instead of HS + the out kernel.
+    """
     MF: gl.constexpr = mfma_layout(num_warps)
     s = gl.program_id(0)
     h = gl.program_id(1)
@@ -654,6 +705,7 @@ def _kda_bi_state_kernel(
     sx = H * D
     cc, r0, n = _chunk_at(CHUNKS, c0, c1, n_chunks)
     base = (r0.to(gl.int64) * H + h) * D
+    abase = (r0.to(gl.int64) * H + h) * BT
     w, u, kg, g_last = _load_chunk(
         W + base,
         U + base + v0,
@@ -678,17 +730,37 @@ def _kda_bi_state_kernel(
             num_warps,
         )
         hb = hs.to(gl.bfloat16)
-        gl.store(
-            _state_ptrs(HS + (c.to(gl.int64) * H + h) * D * D + v0, D, BV, num_warps),
-            hb,
-        )
+        if not FUSE_OUT:
+            gl.store(
+                _state_ptrs(
+                    HS + (c.to(gl.int64) * H + h) * D * D + v0, D, BV, num_warps
+                ),
+                hb,
+            )
         if STORE_HB:
             # an open chunk: the state so far is the boundary state
             gl.store(_state_ptrs(HB + st, D, BV, num_warps), hs, mask=n < BT)
         vn = _vnew(w, u, hb, n, BV, num_warps)
-        _store_vn(VN + base + v0, vn, n, sx, BV, num_warps)
+        if FUSE_OUT:
+            _out_vn(
+                QG + base,
+                AQK + abase,
+                vn,
+                hb,
+                O + base + v0,
+                n,
+                scale,
+                sx,
+                H * BT,
+                sx,
+                BV,
+                num_warps,
+            )
+        else:
+            _store_vn(VN + base + v0, vn, n, sx, BV, num_warps)
         hs = _state_step(hs, kg, g_last, vn, num_warps)
         w, u, kg, g_last, n, base = w2, u2, kg2, g2, nn, bn
+        abase = (r0n.to(gl.int64) * H + h) * BT
     if STORE_HT:
         gl.store(_state_ptrs(HT + st, D, BV, num_warps), hs)
     if STORE_HB:
