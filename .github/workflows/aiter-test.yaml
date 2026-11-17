@@ -1043,7 +1043,6 @@ jobs:
           AITER_MOE_2STAGE_FULL_MATRIX: >-
             ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
               && matrix.label == 'MI35X'
-              && matrix.shard_idx == 0
               && 'true' || 'false' }}
         run: |
           set -ex
@@ -1075,8 +1074,7 @@ jobs:
         if: >-
           always() &&
           (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
-          matrix.label == 'MI35X' &&
-          matrix.shard_idx == 0
+          matrix.label == 'MI35X'
         uses: actions/upload-artifact@v4
         with:
           name: moe-2stage-full-matrix-log-${{ github.run_id }}
