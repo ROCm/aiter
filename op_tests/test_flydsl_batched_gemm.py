@@ -24,10 +24,10 @@ On gfx1250 this file also checks the mxfp8_32 GEMM's fused quant epilogue:
 ``y_scale_out`` must be byte-identical to quantize_fp8 of the unfused bf16
 output, on the heuristic tile and on tuned tiles that pin each epilogue
 branch (FUSED_QUANT_TILES: one LDS-staged tile and two accumulator tiles, one
-of them also with the pipelined K loop). gfx1250-strict runs that check and
-the compute kernelName cases alone. gfx1250 also checks that the pipelined K
-loop (kernelName suffix ``_pl``) writes the single-fence loop's output bit for
-bit (PIPELINED_CASES).
+of them with each K loop). gfx1250-strict runs that check and the compute
+kernelName cases alone. gfx1250 also checks that the pipelined K loop
+(kernelName suffix ``_pl``) writes the single-fence loop's (``_nopl``) output
+bit for bit (PIPELINED_CASES).
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
@@ -131,12 +131,13 @@ _FP8_MAX = 448.0
 # Tuned DSv4.1 tiles that pin both fused-quant epilogue branches: one
 # LDS-staged tile and two accumulator tiles. One 16-column WMMA tile per warp
 # (t16x64 nw4) keeps the LDS-staged quant; an even count (t32x64 nw2, t128x128
-# nw2) quantizes from the accumulators. The last entry is t128x128 again with
-# the pipelined K loop (_pl).
+# nw2) quantizes from the accumulators. t128x128 runs once with the
+# single-fence K loop (_nopl) and once with the pipelined one (_pl); the other
+# tiles take the default K loop of their name.
 FUSED_QUANT_TILES = (
     "flydsl_bmm_mxfp8_32_wmma_t16x64x512_mw1_nw4_nb4_sk1_cm1_cn1",
     "flydsl_bmm_mxfp8_32_wmma_t32x64x512_mw2_nw2_nb4_sk1_cm1_cn1",
-    "flydsl_bmm_mxfp8_32_wmma_t128x128x256_mw2_nw2_nb4_sk1_cm1_cn1",
+    "flydsl_bmm_mxfp8_32_wmma_t128x128x256_mw2_nw2_nb4_sk1_cm1_cn1_nopl",
     "flydsl_bmm_mxfp8_32_wmma_t128x128x256_mw2_nw2_nb4_sk1_cm1_cn1_pl",
 )
 # M = 200 is ragged for every tile above; M = 48 is ragged for all but the
@@ -144,8 +145,9 @@ FUSED_QUANT_TILES = (
 # wo_a N, K.
 FUSED_QUANT_TILE_SHAPES = ((8, 48, 1024, 4096), (8, 200, 1024, 4096))
 # The pipelined K loop (kernelName suffix _pl) must give the single-fence
-# loop's output bit for bit: (b, m, n, k, kernelName without _pl) for a ragged
-# K (k_tail), for a shipped DSv4.1 _pl row (b=1, as the 2-D table runs it), and
+# loop's (_nopl) output bit for bit: (b, m, n, k, kernelName without a K-loop
+# suffix) for a ragged K (k_tail), for a shipped DSv4.1 _pl row (b=1, as the
+# 2-D table runs it), and
 # for three- and four-buffer tiles on the DSv4.1 N=5120, K=8192 GEMM, where the
 # tail fences wait on fewer outstanding tiles than the steady loop (with two
 # buffers the tail fence count is always 0).
@@ -584,9 +586,9 @@ def test_woa_fused_quant_epilogue(b, m, n, k, kernel_name=None):
 
 
 def test_pipelined_k_loop(b, m, n, k, kernel_name):
-    """``kernel_name`` and ``kernel_name + "_pl"`` must write the same bf16
-    output bit for bit (32x32 weight scale, which a ragged K needs). Returns
-    the number of mismatched elements."""
+    """``kernel_name + "_nopl"`` and ``kernel_name + "_pl"`` must write the
+    same bf16 output bit for bit (32x32 weight scale, which a ragged K needs).
+    Returns the number of mismatched elements."""
     from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
         run_bmm_a8w8_mxfp8_32_gfx1250,
     )
@@ -598,7 +600,7 @@ def test_pipelined_k_loop(b, m, n, k, kernel_name):
     w8, ws8 = quant_weight_e8m0(w_bnk, 32, 32)
     w_shuf = shuffle_weight(w8)
     outs = []
-    for name in (kernel_name, kernel_name + "_pl"):
+    for name in (kernel_name + "_nopl", kernel_name + "_pl"):
         y = torch.empty(m, b, n, dtype=dtypes.bf16)
         run_bmm_a8w8_mxfp8_32_gfx1250(
             x8, w_shuf, xs8, ws8, y, kernel_name=name, w_scale_32x32=True
