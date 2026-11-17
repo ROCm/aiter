@@ -22,9 +22,9 @@ last k-tile); DeepSeek-V4.1's shared-expert down projection has K = 576 at TP4.
 
 On gfx1250 this file also checks the mxfp8_32 GEMM's fused quant epilogue:
 ``y_scale_out`` must be byte-identical to quantize_fp8 of the unfused bf16
-output, on the heuristic tile and on one tuned tile per epilogue branch
-(FUSED_QUANT_TILES). gfx1250-strict runs that check and the compute kernelName
-cases alone.
+output, on the heuristic tile and on tuned tiles that pin each epilogue
+branch (FUSED_QUANT_TILES: one LDS-staged tile and two accumulator tiles).
+gfx1250-strict runs that check and the compute kernelName cases alone.
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
@@ -125,9 +125,10 @@ COMPUTE_CASES = (
 
 # ATOM quantize_fp8's fp8 finite bound. The fused epilogue must match it.
 _FP8_MAX = 448.0
-# One tuned DSv4.1 tile per fused-quant epilogue branch: one 16-column WMMA
-# tile per warp (t16x64 nw4) keeps the LDS-staged quant, an even count (t32x64
-# nw2, t128x128 nw2) quantizes from the accumulators.
+# Tuned DSv4.1 tiles that pin both fused-quant epilogue branches: one
+# LDS-staged tile and two accumulator tiles. One 16-column WMMA tile per warp
+# (t16x64 nw4) keeps the LDS-staged quant; an even count (t32x64 nw2, t128x128
+# nw2) quantizes from the accumulators.
 FUSED_QUANT_TILES = (
     "flydsl_bmm_mxfp8_32_wmma_t16x64x512_mw1_nw4_nb4_sk1_cm1_cn1",
     "flydsl_bmm_mxfp8_32_wmma_t32x64x512_mw2_nw2_nb4_sk1_cm1_cn1",
