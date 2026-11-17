@@ -138,38 +138,38 @@ def unshuffle_weight_gfx1250(w_buffer_slice, BLOCK_N, NATIVE_BLOCK_K_W):
     repr=_moe_gemm_a8w4_decode_persistent_repr,
 )
 def _moe_gemm_a8w4_decode_persistent(
-    GatherIndx,
-    ExptHist,
-    ExptOffs,
-    ExptOffsSum,
-    ExptData,
+    Y,
+    stride_y_m,
+    stride_y_n,
     X,
-    XMxScale,
-    W,
-    WMxScale,
-    grid_m,
-    num_blocks_n,
-    num_tokens,
-    N,
-    K,
     stride_x_m,
     stride_x_k,
+    XMxScale,
     stride_x_mx_m,
     stride_x_mx_k,
+    W,
     stride_w_e,
-    stride_w_k,
     stride_w_n,
+    stride_w_k,
+    WMxScale,
     stride_w_mx_e,
-    stride_w_mx_k,
     stride_w_mx_n,
+    stride_w_mx_k,
     X_static_scale,
     Quant_static_scale,
     B,
     stride_b_e,
     Gammas,
-    Y,
-    stride_y_m,
-    stride_y_n,
+    num_tokens,
+    N,
+    K,
+    GatherIndx,
+    ExptHist,
+    ExptOffs,
+    ExptOffsSum,
+    ExptData,
+    grid_m,
+    num_blocks_n,
     APPLY_SWIGLU: gl.constexpr,
     alpha: gl.constexpr,
     limit: gl.constexpr,
@@ -900,38 +900,40 @@ def _moe_gemm_a8w4_decode_persistent(
     repr=_moe_gemm_a8w4_decode_repr,
 )
 def _moe_gemm_a8w4_decode(
-    GatherIndx,
-    ExptHist,
-    ExptOffs,
-    ExptOffsSum,
-    ExptData,
+    Y,
+    stride_y_m,
+    stride_y_n,
     X,
-    XMxScale,
-    W,
-    WMxScale,
-    grid_m,
-    grid_n,
-    num_tokens,
-    N,
-    K,  # shapes
     stride_x_m,
     stride_x_k,
+    XMxScale,
     stride_x_mx_m,
     stride_x_mx_k,
+    W,
     stride_w_e,
-    stride_w_k,
     stride_w_n,
+    stride_w_k,
+    WMxScale,
     stride_w_mx_e,
-    stride_w_mx_k,
     stride_w_mx_n,
+    stride_w_mx_k,
     X_static_scale,
     Quant_static_scale,
     B,
     stride_b_e,  # Bias
     Gammas,
-    Y,
-    stride_y_m,
-    stride_y_n,
+    num_tokens,
+    N,
+    K,  # shapes
+    # expt data
+    GatherIndx,
+    ExptHist,
+    ExptOffs,
+    ExptOffsSum,
+    ExptData,
+    # true grid size
+    grid_m,
+    grid_n,
     # fused activation function
     APPLY_SWIGLU: gl.constexpr,
     alpha: gl.constexpr,
@@ -1768,8 +1770,6 @@ def get_moe_a8w4_layouts(
     X_SCALE_TDM=False,
     out_mx_quant=False,
     is_prefill=True,
-    warps_m=0,
-    npair=0,
 ):
     # Building the layouts costs ~1 ms of Python per call. ctas_per_cga is a
     # list and GatherIndx is a tensor; both are normalized before the cache key.
@@ -1791,8 +1791,6 @@ def get_moe_a8w4_layouts(
             X_SCALE_TDM,
             out_mx_quant,
             is_prefill,
-            warps_m,
-            npair,
         )
     )
 
@@ -1814,8 +1812,6 @@ def _build_moe_a8w4_layouts(
     X_SCALE_TDM=False,
     out_mx_quant=False,
     is_prefill=True,
-    WARPS_M=0,
-    NPAIR=0,
 ):
     OUT_BLOCK_N = BLOCK_N // ACTIVATION_REDUCTION_N
     NATIVE_BLOCK_K_W = BLOCK_K // 2
@@ -1847,17 +1843,6 @@ def _build_moe_a8w4_layouts(
             [[1, 0], [0, 1], [0, 2]] if is_prefill else [[0, 1], [0, 2], [0, 4]]
         )
         reg_bases = []
-    if WARPS_M:
-        # WARPS_M warps along M, num_warps // WARPS_M along N (N bits first).
-        warp_bases = [
-            [0, 1 << i] for i in range((num_warps // WARPS_M).bit_length() - 1)
-        ] + [[1 << i, 0] for i in range(WARPS_M.bit_length() - 1)]
-    if NPAIR:
-        wm_ = WARPS_M if WARPS_M else 1
-        reg_bases = [[0, 1]]
-        warp_bases = [
-            [0, 2 << i] for i in range((num_warps // wm_).bit_length() - 1)
-        ] + [[1 << i, 0] for i in range(wm_.bit_length() - 1)]
 
     WMMA_LAYOUT = gl.amd.AMDWMMALayout(
         3,
@@ -1901,7 +1886,7 @@ def _build_moe_a8w4_layouts(
         3,
         transposed=True,
         warp_bases=warp_bases,
-        reg_bases=reg_bases,
+        reg_bases=[],
         instr_shape=[16, 16, 64],
         cga_layout=CGA_B_NMAJOR,
     )
@@ -1964,7 +1949,7 @@ def _build_moe_a8w4_layouts(
             3,
             transposed=True,
             warp_bases=warp_bases,
-            reg_bases=reg_bases,
+            reg_bases=[],
             instr_shape=[16, 16, 128],
             cga_layout=CGA_A,
         )
@@ -1972,11 +1957,7 @@ def _build_moe_a8w4_layouts(
             gl.DotOperandLayout(0, WMMA_X_SCALE, k_width=16),
             [BLOCK_M, MX_SCALE_BLOCK_K],
         )
-        if is_prefill and X_SCALE_TDM and MX_SCALE_BLOCK_K < 8:
-            layouts["SHARED_LAYOUT_X_SCALES"] = gl.SwizzledSharedLayout(
-                vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=CGA_A
-            )
-        elif is_prefill:
+        if is_prefill:
             XS_PAD_INTERVAL = MX_SCALE_BLOCK_K if X_SCALE_TDM else 256
             layouts["SHARED_LAYOUT_X_SCALES"] = gl.PaddedSharedLayout.with_identity_for(
                 [[XS_PAD_INTERVAL, 16]], [BLOCK_M, MX_SCALE_BLOCK_K], [1, 0], CGA_A
@@ -1993,38 +1974,40 @@ def _build_moe_a8w4_layouts(
 
 @gluon.jit(launch_metadata=matmul_launch_metadata, repr=_moe_gemm_a8w4_prefill_repr)
 def _moe_gemm_a8w4_prefill(
-    GatherIndx,
-    ExptHist,
-    ExptOffs,
-    ExptOffsSum,
-    ExptData,
+    Y,
+    stride_y_m,
+    stride_y_n,
     X,
-    XMxScale,
-    W,
-    WMxScale,
-    grid_m,
-    grid_n,
-    num_tokens,
-    N,
-    K,  # shapes
     stride_x_m,
     stride_x_k,
+    XMxScale,
     stride_x_mx_m,
     stride_x_mx_k,
+    W,
     stride_w_e,
-    stride_w_k,
     stride_w_n,
+    stride_w_k,
+    WMxScale,
     stride_w_mx_e,
-    stride_w_mx_k,
     stride_w_mx_n,
+    stride_w_mx_k,
     X_static_scale,
     Quant_static_scale,
     B,
     stride_b_e,  # Bias
     Gammas,
-    Y,
-    stride_y_m,
-    stride_y_n,
+    num_tokens,
+    N,
+    K,  # shapes
+    # expt data
+    GatherIndx,
+    ExptHist,
+    ExptOffs,
+    ExptOffsSum,
+    ExptData,
+    # true grid size
+    grid_m,
+    grid_n,
     # fused activation function
     APPLY_SWIGLU: gl.constexpr,
     alpha: gl.constexpr,
@@ -2060,7 +2043,6 @@ def _moe_gemm_a8w4_prefill(
     stride_y_mx_m=0,
     stride_y_mx_n=0,
     HAS_MX_OUT: gl.constexpr = False,
-    MX_SCALE_TDM: gl.constexpr = False,
     X_GATHER_IDX_LAYOUT: gl.constexpr = None,
     DOT_LAYOUT_X_SCALES: gl.constexpr = None,
     SHARED_LAYOUT_X_SCALES: gl.constexpr = None,
@@ -2610,30 +2592,19 @@ def _moe_gemm_a8w4_prefill(
         scale_e8m0, quant_scale = _mxfp8_quant_op(out_3d, QUANT_AXIS=2)
         out = tl.reshape(out_3d * quant_scale, [BLOCK_M, OUT_BLOCK_N]).to(tl.float8e4nv)
         scale_exp_2d = tl.reshape(scale_e8m0, [BLOCK_M, NUM_QB])
-        if MX_SCALE_TDM:
-            # Scales go to LDS here and leave with one TDM store next to the
-            # payload's (it clips the M tail): one write per byte instead of
-            # lane-replicated byte stores.
-            ys_buffer = gl.allocate_shared_memory(
-                gl.uint8,
-                shape=[BLOCK_M, NUM_QB],
-                layout=gl.SwizzledSharedLayout(1, 1, 1, [1, 0]),
-            )
-            ys_buffer.store(scale_exp_2d)
-        else:
-            offs_m_s = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
-            mask_m_s = offs_m_s < M
-            offs_n_s = NUM_QB * pid_n + gl.arange(0, NUM_QB)
-            mask_n_s = offs_n_s < tl.cdiv(yN, 32)
-            offs_y_mx = (start_m + offs_m_s)[:, None] * stride_y_mx_m + offs_n_s[
-                None, :
-            ] * stride_y_mx_n
-            gl.amd.gfx1250.buffer_store(
-                scale_exp_2d,
-                YMxScale,
-                offs_y_mx,
-                mask=mask_m_s[:, None] & mask_n_s[None, :],
-            )
+        offs_m_s = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
+        mask_m_s = offs_m_s < M
+        offs_n_s = NUM_QB * pid_n + gl.arange(0, NUM_QB)
+        mask_n_s = offs_n_s < tl.cdiv(yN, 32)
+        offs_y_mx = (start_m + offs_m_s)[:, None] * stride_y_mx_m + offs_n_s[
+            None, :
+        ] * stride_y_mx_n
+        gl.amd.gfx1250.buffer_store(
+            scale_exp_2d,
+            YMxScale,
+            offs_y_mx,
+            mask=mask_m_s[:, None] & mask_n_s[None, :],
+        )
     elif Quant_static_scale is not None:
         out = _compute_static_fp8_quant(out, gl.load(Quant_static_scale))
     else:
@@ -2712,18 +2683,6 @@ def _moe_gemm_a8w4_prefill(
             layout=SHARED_LAYOUT_Y,
         )
         y_buffer.store(out)
-        if MX_SCALE_TDM:
-            # Built after the payload left the registers.
-            ys_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-                base=YMxScale + start_m.to(index_type) * stride_y_mx_m,
-                shape=(M, tl.cdiv(yN, 32)),
-                strides=(stride_y_mx_m, stride_y_mx_n),
-                block_shape=(BLOCK_M, NUM_QB),
-                layout=gl.SwizzledSharedLayout(1, 1, 1, [1, 0]),
-            )
-            gl.amd.gfx1250.tdm.async_store(
-                ys_desc, [block_id * BLOCK_M, pid_n * NUM_QB], ys_buffer
-            )
         gl.amd.gfx1250.tdm.async_store(
             y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
         )
