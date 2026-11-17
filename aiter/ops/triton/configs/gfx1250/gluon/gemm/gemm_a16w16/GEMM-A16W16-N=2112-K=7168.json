@@ -82,9 +82,9 @@
     },
     "M_LEQ_2048": {
         "BLOCK_M": 128,
-        "BLOCK_N": 256,
+        "BLOCK_N": 128,
         "BLOCK_K": 128,
-        "NUM_BUFFERS": 3,
+        "NUM_BUFFERS": 4,
         "num_warps": 4,
         "kernel_type": "compute_bound"
     },

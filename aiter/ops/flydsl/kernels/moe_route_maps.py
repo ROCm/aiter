@@ -534,6 +534,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
         topk: Int32,
         ep_rowmap: fx.Pointer,  # (cap,2) i32 or null; sentinel-filled here
         ep_rowmap_cap: Int32,  # cap_rows_plus1; 0 when ep_rowmap is null
+        row_to_token: fx.Pointer,  # (rows,) i32 or null; -1-filled here
+        row_to_token_len: Int32,  # 0 when row_to_token is null
     ):
         w_fx = fx.BFloat16 if weight_dtype == "bf16" else fx.Float16
         c0 = fx.Int32(0)
@@ -583,6 +585,19 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
             )
             for i in range(route, n_fill, grid_threads):
                 ep_i64[i] = sentinel
+        # The A-preshuffle scatter's grouped-row -> token map takes -1 for
+        # padding; the psum remap that follows overwrites every kept row.
+        has_r2t = fx.Int64(ptrtoint(row_to_token)) != 0
+        if has_r2t:
+            r2t_p = ptr_buf_tensor(row_to_token)
+            n_r2t = fx.Uint32(row_to_token_len)
+            r2t_stride = (
+                (fx.Uint32(numel) + fx.Uint32(BLOCK_THREADS - 1))
+                // fx.Uint32(BLOCK_THREADS)
+                * fx.Uint32(BLOCK_THREADS)
+            )
+            for i in range(route, n_r2t, r2t_stride):
+                r2t_p[i] = fx.Int32(-1)
 
         gpu.barrier()
 
@@ -675,6 +690,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
         grid_blocks,
         ep_rowmap,
         ep_rowmap_cap,
+        row_to_token,
+        row_to_token_len,
         stream,
     ):
         route_kernel(
@@ -692,6 +709,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
             topk,
             ep_rowmap,
             ep_rowmap_cap,
+            row_to_token,
+            row_to_token_len,
         ).launch(
             grid=(fx.Int64(grid_blocks), 1, 1),
             block=(BLOCK_THREADS, 1, 1),
@@ -717,6 +736,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
             grid_blocks: fx.Int32,
             ep_rowmap: fx.Pointer,
             ep_rowmap_cap: fx.Int32,
+            row_to_token: fx.Pointer,
+            row_to_token_len: fx.Int32,
             stream: fx.Stream = fx.Stream(None),  # noqa: B008
         ):
             _launch(
@@ -735,6 +756,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
                 grid_blocks,
                 ep_rowmap,
                 ep_rowmap_cap,
+                row_to_token,
+                row_to_token_len,
                 stream,
             )
 
@@ -755,6 +778,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
             grid_blocks: fx.Int32,
             ep_rowmap: fx.Pointer,
             ep_rowmap_cap: fx.Int32,
+            row_to_token: fx.Pointer,
+            row_to_token_len: fx.Int32,
             stream: fx.Stream = fx.Stream(None),  # noqa: B008
         ):
             # These two operands compile away when direct_mask=False. Reusing an
@@ -776,6 +801,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
                 grid_blocks,
                 ep_rowmap,
                 ep_rowmap_cap,
+                row_to_token,
+                row_to_token_len,
                 stream,
             )
 

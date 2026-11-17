@@ -2641,6 +2641,18 @@ namespace py = pybind11;
           py::arg("weight"),                 \
           py::arg("epsilon"),                \
           py::arg("gemma_norm") = false);    \
+    m.def("qkv_a_rmsnorm_fp4",               \
+          &aiter::qkv_a_rmsnorm_fp4,         \
+          py::arg("q_out"),                  \
+          py::arg("q_scale"),                \
+          py::arg("kv_out"),                 \
+          py::arg("q_in"),                   \
+          py::arg("kv_in"),                  \
+          py::arg("q_weight"),               \
+          py::arg("kv_weight"),              \
+          py::arg("q_eps"),                  \
+          py::arg("kv_eps"),                 \
+          py::arg("gemma_norm") = false);    \
 
 #define GATED_RMSNORM_QUANT_PYBIND                         \
     m.def("gated_rmsnorm_fp8_group_quant",                 \

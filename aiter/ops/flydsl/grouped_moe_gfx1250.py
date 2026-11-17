@@ -451,15 +451,17 @@ _G2L_COUNTER_CACHE: dict[tuple[int, str], torch.Tensor] = {}
 _G2L_FUSED_CACHE: dict[tuple[int, str], torch.Tensor] = {}
 
 
-def route_counter_buffer(E: int, device) -> torch.Tensor:
+def route_counter_buffer(E: int, device, apre_fold: bool = False) -> torch.Tensor:
     """Return the persistent ``(E,)`` per-expert route counter.
 
     Its stable address lets the preceding TDM dispatch clear it at the tail of
     the existing launch. The route kernel therefore starts from zero without a
     separate launch or a grid-wide barrier. Allocation is zeroed as well so the
     first invocation is safe before a dispatch variant owns the reset.
+    ``apre_fold`` selects a separate counter that the A-preshuffle scatter
+    clears after each use.
     """
-    key = (int(E), str(device))
+    key = (int(E), str(device), bool(apre_fold))
     buf = _G2L_COUNTER_CACHE.get(key)
     if buf is None:
         buf = torch.zeros(int(E), dtype=torch.int32, device=device)
@@ -852,6 +854,32 @@ def _grouped_a8w4_tdm_moe(
         and token_num * topk <= _FUSED_ROUTE_PSUM_MAX_NUMEL
         and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
     )
+    # MegaMoE A-preshuffle EP path: the LDS route kernel -1-fills row_to_token
+    # (no fill launch), routes on MegaMoE's aligned per-rank expert slice (no
+    # g2l-LUT launch), and the apre scatter zeroes the route counter after the
+    # psum remap, its last reader.
+    from aiter.ops.flydsl.kernels.moe_route_maps import (
+        MAX_ROUTE_BUCKETS as _ROUTE_LDS_MAX_BUCKETS,
+    )
+
+    _apre_route_fold = (
+        _is_ep
+        and enable_ep_scatter
+        and a_preshuffled
+        and not _compact
+        and int(E) <= _ROUTE_LDS_MAX_BUCKETS
+        and num_local_tokens is not None
+        and os.environ.get("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
+        and os.environ.get("AITER_TDM_APRE_ROUTE_FOLD", "1") in ("1", "true", "True")
+    )
+    if a_preshuffled:
+        _apre_row_to_token = (
+            torch.empty((int(contiguous_m),), dtype=torch.int32, device=device)
+            if _apre_route_fold
+            else torch.full((int(contiguous_m),), -1, dtype=torch.int32, device=device)
+        )
+    else:
+        _apre_row_to_token = None
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
         topids_to_rows = None
@@ -868,9 +896,9 @@ def _grouped_a8w4_tdm_moe(
             # device=cuda) would allocate a CPU tensor and cudaMemcpy it, which
             # capture rejects unless pinned.
             _ep_nvt = torch.full((1,), int(token_num), dtype=torch.int32, device=device)
-        _direct_ep_mask = _flydsl_dispatch_context() is not None and os.environ.get(
-            "AITER_TDM_DIRECT_EP_MASK", "1"
-        ) in (
+        _direct_ep_mask = (
+            _flydsl_dispatch_context() is not None or _apre_route_fold
+        ) and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1") in (
             "1",
             "true",
             "True",
@@ -904,7 +932,13 @@ def _grouped_a8w4_tdm_moe(
                 .reshape(-1)
                 .contiguous()
             )
-            _g2l_counter = route_counter_buffer(E, device)
+            # The apre fold keeps its own counter: it relies on the counter
+            # being zero on entry, and the LUT path leaves the shared one dirty.
+            _g2l_counter = (
+                route_counter_buffer(E, device, apre_fold=True)
+                if _apre_route_fold
+                else route_counter_buffer(E, device)
+            )
             _ep_nvr = torch.empty(1, dtype=torch.int32, device=device)
         else:
             _g2l_lut, _g2l_counter, _g2l_nvr = _build_g2l_lut(
@@ -935,6 +969,7 @@ def _grouped_a8w4_tdm_moe(
                 num_valid_routes=_ep_nvr,
                 ep_rowmap=ep_rowmap,
                 contiguous_expert_mask=_direct_ep_mask,
+                row_to_token=_apre_row_to_token if _apre_route_fold else None,
             )
     elif not _fused_tp_route:
         _fuse_ep_route_quant = False
@@ -977,11 +1012,6 @@ def _grouped_a8w4_tdm_moe(
                 "max_tok": int(stage2_scatter.max_tokens_per_rank),
                 "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
             }
-    _apre_row_to_token = (
-        torch.full((int(contiguous_m),), -1, dtype=torch.int32, device=device)
-        if a_preshuffled
-        else None
-    )
     _fuse_psum_quant = (
         _is_ep
         and enable_ep_scatter
@@ -1220,6 +1250,9 @@ def _grouped_a8w4_tdm_moe(
             ep_psum_params=ep_psum_params,
             row_major_scale=_row_major_a1,
             payload_preshuffled=a_preshuffled,
+            clear_counter=(
+                _g2l_counter if _apre_route_fold and _direct_ep_mask else None
+            ),
         )
         if _compact_ascale:
             a1_scale = flydsl_moe_scatter_preshuffle_scale(
@@ -1960,6 +1993,25 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["n_warp"] = _base_nw
             _tdm_kw["m_warp2"] = _ov_mw2 if _ov_mw2 is not None else _base_mw
             _tdm_kw["n_warp2"] = _ov_nw2 if _ov_nw2 is not None else _base_nw
+        # A weight placed by moe_shuffle_weight_iod is readable only by its
+        # layout tiling and the one with tile_n halved, four waves, two waves
+        # per TDM tensor; each GEMM keeps the tuned tile_n when it is one of
+        # them, and the tuned four-wave grid and cluster for the tuned tile,
+        # else 1 x 4 waves and no cluster.
+        from .iod_locality import pin_tile
+
+        for _w, _sfx in ((w1, ""), (w2, "2")):
+            _tile = pin_tile(_w, _tdm_kw.get(f"tile_n{_sfx}"))
+            if _tile is None:
+                continue
+            _grid = (_tdm_kw.get(f"m_warp{_sfx}"), _tdm_kw.get(f"n_warp{_sfx}"))
+            _tuned = (_tdm_kw.get(f"tile_n{_sfx}"), _tdm_kw.get(f"tile_k{_sfx}"))
+            if _tile != _tuned or None in _grid or _grid[0] * _grid[1] != 4:
+                _grid = (1, 4)
+                _tdm_kw[f"cluster_m{_sfx}"] = _tdm_kw[f"cluster_n{_sfx}"] = 1
+            _tdm_kw[f"tile_n{_sfx}"], _tdm_kw[f"tile_k{_sfx}"] = _tile
+            _tdm_kw[f"m_warp{_sfx}"], _tdm_kw[f"n_warp{_sfx}"] = _grid
+            _tdm_kw[f"waves_per_tensor_tdm{_sfx}"] = 2
         # A tile from the CSV row or an AITER_TDM_* override must fit as given;
         # only the built-in default may be narrowed (see _grouped_a8w4_tdm_moe).
         _tdm_kw["tiles_configured"] = any(
