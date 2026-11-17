@@ -2542,3 +2542,29 @@ def test_gluon_unified_attn_2d_fixed_max(seq_lens, key_bump, long_max_seqlen_k):
     torch.testing.assert_close(
         output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
     )
+
+
+@pytest.mark.parametrize("multi_seq", [False, True])
+@torch.inference_mode()
+def test_gluon_unified_attn_2d_tail_split(multi_seq):
+    """gfx1250 Gluon 2D, full attention over a long cached prefix: the q blocks of the
+    last, partial dispatch wave run in a second launch with their key range split in
+    3 pieces, and a merge kernel writes their rows."""
+    if DEVICE_ARCH != "gfx1250" or not _is_gluon_available():
+        pytest.skip("gfx1250 Gluon only")
+    from aiter.ops.triton.utils.device_info import get_num_sms
+
+    # attn_2d default: BLOCK_M 128 (16 q rows per block), 4 warps, 2 waves per EU, so
+    # 2 * num_sms resident programs; 37 q blocks per kv head go to the tail launch
+    q_len = 16 * (get_num_sms() + 37) - 5
+    if multi_seq:
+        seq_lens = [(q_len // 2, 40000 + q_len // 2), (q_len - q_len // 2, 36000)]
+    else:
+        seq_lens = [(q_len, 40000 + q_len)]
+    launched, output, ref_output = _prefill_2d_run(seq_lens)
+    assert [x["NUM_SPLITS"] or 1 for x in launched] == [1, 3]
+    assert launched[0]["q_block_offset"] > 0
+    assert not torch.isnan(output).any()
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
+    )

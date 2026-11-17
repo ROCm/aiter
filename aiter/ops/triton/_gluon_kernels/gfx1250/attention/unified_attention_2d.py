@@ -1343,8 +1343,18 @@ class AttentionProgram:
         if NUM_SPLITS > 1:
             active_tiles = tile_end - tile_start
             tiles_per_split = (active_tiles + NUM_SPLITS - 1) // NUM_SPLITS
-            split_start = tile_start + split_idx * tiles_per_split
-            tile_end = gl.minimum(split_start + tiles_per_split, tile_end)
+            # Only split when every piece gets >= 12 tiles: the pipelined loops always run >= 3 tiles from
+            # tile_start, so a shorter piece would score keys of the next piece. Otherwise split 0 keeps the
+            # whole range and the other splits are empty.
+            do_split = active_tiles >= 12 * NUM_SPLITS
+            split_start = gl.where(
+                do_split,
+                tile_start + split_idx * tiles_per_split,
+                gl.where(split_idx == 0, tile_start, tile_end),
+            )
+            tile_end = gl.where(
+                do_split, gl.minimum(split_start + tiles_per_split, tile_end), tile_end
+            )
             tile_start = split_start
 
         safe_tile_end = gl.minimum(safe_tile_end, tile_end - 1)
@@ -2797,11 +2807,12 @@ def _unified_attention_gluon_kernel_2d(
     gate_ptr=None,
     gate_stride_0=None,
     GATE: gl.constexpr = False,
+    q_block_offset=0,  # this launch covers q blocks [q_block_offset, q_block_offset + num_programs(1))
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     kv_head_idx = gl.program_id(0)
     # q_block_global_idx = gl.program_id(1)
-    q_block_global_idx = gl.num_programs(1) - 1 - gl.program_id(1)
+    q_block_global_idx = q_block_offset + gl.num_programs(1) - 1 - gl.program_id(1)
     # program_id(2) is 0 for a 2d grid (NUM_SPLITS==1), so this is always safe.
     split_idx = gl.program_id(2)
     Q_FP8: gl.constexpr = query_ptr.dtype.is_fp8()
@@ -3014,10 +3025,30 @@ def _unified_attention_gluon_kernel_2d(
             cur_batch_query_len,
         )
 
-    # This split owns no tiles (more splits than active tiles). The partial
-    # buffers are pre-filled with neutral values (M=-inf, L=0, acc=0) so the
-    # later reduction simply ignores it.
+    # This split owns no tiles. Store a neutral partial (M=-inf, L=0, acc=0):
+    # the partial buffers are not pre-filled.
     if NUM_SPLITS > 1 and pgm.tile_start >= pgm.tile_end:
+        pgm.store_partial(
+            gl.full(
+                [BLOCK_M],
+                float("-inf"),
+                dtype=gl.float32,
+                layout=gl.SliceLayout(1, cfg.pv_layout),
+            ),
+            gl.zeros(
+                [BLOCK_M], dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
+            ),
+            gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout),
+            partial_m_ptr,
+            partial_l_ptr,
+            partial_acc_ptr,
+            split_idx,
+            q_block_local_idx,
+            cur_batch_in_all_start_index,
+            kv_head_idx,
+            cur_batch_query_len,
+            NUM_SPLITS,
+        )
         return
 
     # Pick the KV loader based on TILE_SIZE and LOOP_VARIANT
@@ -3112,9 +3143,7 @@ def _unified_attention_gluon_kernel_2d(
         )
         # Full attention: run the fixed-reference-max loop first. Rerun the program with the exact running
         # max only if some row overflowed (its max grew by more than 100 log2 units past the reference max).
-        FIXED_MAX: gl.constexpr = (
-            SLIDING_WINDOW == 0 and not USE_SINKS and NUM_SPLITS == 1 and not KV_NVFP4
-        )
+        FIXED_MAX: gl.constexpr = SLIDING_WINDOW == 0 and not USE_SINKS and not KV_NVFP4
         M_init = M
         L_init = L
         M, L, acc = attention_loop_tensor_subtile_split(
