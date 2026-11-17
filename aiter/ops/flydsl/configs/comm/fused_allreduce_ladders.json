@@ -183,7 +183,7 @@
       "arch": "gfx950",
       "link": "xgmi",
       "world_size": 2,
-      "_comment": "Tuned on MI355X (gfx950, xGMI). The mesh is not dispatched at TP2 and keeps the gfx942 ladders.",
+      "_comment": "Tuned on MI355X (gfx950, xGMI). The mesh rungs (and at TP2 the ring, which TP2 dispatches) run the Lamport handshake. The mesh is not dispatched at TP2 and keeps the gfx942 ladders.",
       "oneshot": {
         "default": {
           "rungs": [
@@ -195,7 +195,7 @@
         "default": {
           "atoms_per_row": null,
           "rungs": [
-            {"min_bytes": 0, "super_tile": 1, "grid_cap": 128}
+            {"min_bytes": 0, "super_tile": 1, "grid_cap": 128, "handshake": "lamport"}
           ]
         }
       },
@@ -203,7 +203,7 @@
         "default": {
           "atoms_per_row": 4,
           "rungs": [
-            {"min_bytes": 0, "super_tile": 1, "grid_cap": 256}
+            {"min_bytes": 0, "super_tile": 1, "grid_cap": 256, "handshake": "lamport"}
           ]
         }
       }
@@ -212,7 +212,7 @@
       "arch": "gfx950",
       "link": "xgmi",
       "world_size": 4,
-      "_comment": "Tuned on MI355X (gfx950, xGMI). The ring is not dispatched at TP4 and keeps the gfx942 ladders.",
+      "_comment": "Tuned on MI355X (gfx950, xGMI). The mesh rungs (and at TP2 the ring, which TP2 dispatches) run the Lamport handshake. The ring is not dispatched at TP4 and keeps the gfx942 ladders.",
       "oneshot": {
         "default": {
           "rungs": [
@@ -237,26 +237,26 @@
         "default": {
           "atoms_per_row": 4,
           "rungs": [
-            {"min_bytes": 0, "super_tile": 8, "grid_cap": 256}
+            {"min_bytes": 0, "super_tile": 8, "grid_cap": 256, "handshake": "lamport"}
           ]
         },
         "hidden": {
           "4096": {
             "atoms_per_row": 2,
             "rungs": [
-              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true}
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true, "handshake": "lamport"}
             ]
           },
           "6144": {
             "atoms_per_row": 2,
             "rungs": [
-              {"min_bytes": 0, "super_tile": 1, "grid_cap": 256}
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 256, "handshake": "lamport"}
             ]
           },
           "8192": {
             "atoms_per_row": 4,
             "rungs": [
-              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true}
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true, "handshake": "lamport"}
             ]
           }
         }
@@ -276,7 +276,7 @@
       "arch": "gfx950",
       "link": "xgmi",
       "world_size": 8,
-      "_comment": "Tuned on MI355X (gfx950, xGMI). The ring is not dispatched at TP8 and keeps the gfx942 ladders.",
+      "_comment": "Tuned on MI355X (gfx950, xGMI). The mesh rungs (and at TP2 the ring, which TP2 dispatches) run the Lamport handshake. The ring is not dispatched at TP8 and keeps the gfx942 ladders.",
       "oneshot": {
         "default": {
           "rungs": [
@@ -306,26 +306,26 @@
         "default": {
           "atoms_per_row": 4,
           "rungs": [
-            {"min_bytes": 0, "super_tile": 8, "grid_cap": 256}
+            {"min_bytes": 0, "super_tile": 8, "grid_cap": 256, "handshake": "lamport"}
           ]
         },
         "hidden": {
           "2048": {
             "atoms_per_row": 1,
             "rungs": [
-              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true}
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true, "handshake": "lamport"}
             ]
           },
           "4096": {
             "atoms_per_row": 2,
             "rungs": [
-              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true}
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true, "handshake": "lamport"}
             ]
           },
           "8192": {
             "atoms_per_row": 4,
             "rungs": [
-              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true}
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true, "handshake": "lamport"}
             ]
           }
         }

@@ -150,8 +150,6 @@ def make_quick_allreduce_ring_kernel(
     if handshake not in HANDSHAKES:
         raise ValueError(f"handshake must be one of {HANDSHAKES}, got {handshake!r}")
     lamport = handshake == "lamport"
-    if lamport and fusion != "none":
-        raise ValueError("the lamport handshake has no fused build yet")
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"

@@ -109,8 +109,10 @@ bit for bit.
 The Lamport mesh rotates three inbox buffers (1.5x the flag inbox): the
 reduce-scatter and all-gather of a tile are two rounds of one sequence, and a
 peer is at most one round ahead. The Lamport ring keeps two buffers per hop,
-by super-tile group parity (2x). gfx950/xGMI runs Lamport; the other platforms
-run flag until they are measured. Fused builds are flag only.
+by super-tile group parity (2x). The fused builds take the same handshake
+(`FusedTwoShotRung.handshake`, an optional `"handshake"` key on a rung of the
+ladder file); their epilogue hooks are unchanged. gfx950/xGMI runs Lamport,
+plain and fused; the other platforms run flag until they are measured.
 
 ### Accuracy limits
 

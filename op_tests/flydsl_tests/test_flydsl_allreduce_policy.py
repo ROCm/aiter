@@ -734,6 +734,9 @@ def test_fused_ladders_are_well_formed(cell):
             for r in rungs:
                 assert r.super_tile in valid_st, (name, hidden, r)
                 assert r.grid_cap >= 1, (name, hidden, r)
+                assert r.handshake in P.HANDSHAKES, (name, hidden, r)
+            # One engine set per width runs one handshake.
+            assert len({r.handshake for r in rungs}) == 1, (name, hidden)
 
         one = fused_oneshot_ladder(**kw)
         assert one and one[0].min_bytes == 0, hidden
@@ -959,6 +962,7 @@ _MESH = ("mesh", "default")
         (_set(("ring", "default", "rungs", 0, "block"), 256), "unknown"),
         (_set(("ring", "default", "rungs", 0, "grid_cap"), _DROP), "missing"),
         (_set(("ring", "default", "rungs", 0, "grid_cap"), 0), "grid_cap"),
+        (_set(("ring", "default", "rungs", 0, "handshake"), "ll"), "handshake"),
         (_set(("oneshot", "hidden", "7168", "rungs", 0, "split"), 3), "split"),
         (_set((*_D1, "atoms"), 3), "atoms"),
         (_set((*_D1, "fanout"), "ring"), "fanout"),

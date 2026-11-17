@@ -431,8 +431,9 @@ CANDIDATE_KNOBS = {
         "block",
         "atoms_per_row",
         "low_latency",
+        "handshake",
     ),
-    ("ring", "ar_rmsnorm"): ("super_tile", "grid_cap", "atoms_per_row"),
+    ("ring", "ar_rmsnorm"): ("super_tile", "grid_cap", "atoms_per_row", "handshake"),
 }
 _CANDIDATE_COLUMNS = (
     "name",

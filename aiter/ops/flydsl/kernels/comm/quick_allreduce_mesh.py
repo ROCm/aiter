@@ -140,6 +140,7 @@ def clamp_grid_cap(
     super_tile: int,
     cu_count: int,
     block: int = BLOCK,
+    handshake: str = "flag",
 ) -> int:
     """Clamp a requested persistent grid to what actually fits on the device.
 
@@ -161,6 +162,12 @@ def clamp_grid_cap(
     slowdown -- so a fused build must not rely on it alone. The host bounds
     those launches at one workgroup per CU as well; see
     ``FlyQuickAllReduceRMSNorm``.
+
+    The table is measured on the flag handshake. The Lamport build keeps a
+    sub-tile's polled packets live across its reduce, ~120 VGPRs at every
+    super-tile on gfx950 TP8 (flag ST=8: 88), so a super-tile does not buy it
+    the residency the flag ST=8 row measures: it takes the smallest
+    measurement for the world size.
     """
     if requested < 1 or cu_count < 1:
         raise ValueError("grid_cap and cu_count must be positive")
@@ -171,7 +178,7 @@ def clamp_grid_cap(
             f"quick_allreduce_mesh has no residency measurement for {arch!r}"
         )
     key = (int(world_size), int(super_tile))
-    resident = _RESIDENT_WGS_PER_CU.get(key)
+    resident = None if handshake == "lamport" else _RESIDENT_WGS_PER_CU.get(key)
     if resident is None:
         for_world = [v for (w, _st), v in _RESIDENT_WGS_PER_CU.items() if w == key[0]]
         if not for_world:
@@ -237,8 +244,6 @@ def make_quick_allreduce_mesh_kernel(
     if handshake not in HANDSHAKES:
         raise ValueError(f"handshake must be one of {HANDSHAKES}, got {handshake!r}")
     lamport = handshake == "lamport"
-    if lamport and fusion != "none":
-        raise ValueError("the lamport handshake has no fused build yet")
     if low_latency and (fusion == "none" or super_tile != 1):
         raise ValueError("low_latency needs a fused build with super_tile=1")
     if world_size not in SUPPORTED_WORLDS:
