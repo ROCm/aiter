@@ -1129,8 +1129,8 @@ def launch_bmm_a8w8_mxscale(
                 row's 32 contiguous columns, so the group amax needs no cross-lane
                 reduction (tile_n % 32 == 0 keeps a group inside the tile). Writes
                 e4m3 codes to arg_c ([M, B, N]) and the e8m0 byte to arg_partials
-                (row-major [M, B * N // 32]), bit-matching quantize_fp8 of the
-                bf16 output: amax floored at 1e-10, scale ceil_pow2(amax / 448),
+                (row-major [M, B * N // 32]), bit-matching quantize_fp8 of this
+                tile's bf16 values: amax floored at 1e-10, scale ceil_pow2(amax / 448),
                 each bf16 divided by it and rounded to nearest even e4m3."""
                 rows_left = i32_m - blk_m
                 rows_left = (rows_left < tile_m).select(rows_left, fx.Int32(tile_m))

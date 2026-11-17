@@ -463,6 +463,10 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant(
     picks the tile; an opus row or none leaves the choice to the runner, as
     does every other arch. A gfx950 row the fused epilogue would run slower
     (``_fused_quant_falls_back``) runs as bf16 plus the same quant instead.
+    The quant is exact for the bf16 output of the kernel the fused call runs.
+    Where that kernel or its K split differs from the bf16 entry's (an opus
+    row, a split-K row run unsplit, the runner's own tile), the GEMM may
+    differ from the bf16 entry's by an fp32 rounding, on gfx1250 as well.
     """
     from .flydsl.batched_gemm_a8w8 import (
         bmm_a8w8_mxfp8_fused_quant_supported,

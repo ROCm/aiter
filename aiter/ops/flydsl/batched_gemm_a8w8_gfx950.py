@@ -354,9 +354,10 @@ def run_bmm_a8w8_mxfp8_gfx950(
     [M, 1, K / 128] shape; a single row takes the row-major kernel.
     ``y_scale_out`` fuses the output's group-32 MXFP8 quant into the epilogue:
     ``Out`` is then e4m3 and ``y_scale_out`` receives the row-major
-    [M, B * N // 32] e8m0 scale bytes, as quantize_fp8 of the bf16 output
-    would. The fused kernel runs one split, so a split-K kernelName runs
-    unsplit."""
+    [M, B * N // 32] e8m0 scale bytes, as quantize_fp8 of the kernel's bf16
+    output would. The fused kernel runs one split, so a split-K kernelName
+    runs unsplit; its bf16 values may then differ from the split-K kernel's
+    by an fp32 rounding (another reduction order)."""
     if get_gfx() != "gfx950":
         raise RuntimeError(
             f"[FlyDSL gfx950 bmm] batched mxfp8 requires gfx950, got {get_gfx()}"
@@ -381,6 +382,11 @@ def run_bmm_a8w8_mxfp8_gfx950(
             raise RuntimeError(
                 f"[FlyDSL gfx950 bmm] a fused quant Out must be 1-byte e4m3, "
                 f"got {Out.dtype}"
+            )
+        if y_scale_out.device.type != "cuda" or y_scale_out.device != XQ.device:
+            raise RuntimeError(
+                f"[FlyDSL gfx950 bmm] y_scale_out must be on the launch GPU "
+                f"{XQ.device}, got {y_scale_out.device}"
             )
         if (
             n % 32
