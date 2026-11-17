@@ -116,7 +116,11 @@ def _bench_graph(fn, graph_ms, n_replays):
 
 def benchmark(args):
     state_dtype = torch.bfloat16 if args.state_dtype == "bf16" else torch.float32
-    lines = ["gluon", "gluon_prepare"] + [f"gluon_walk:{c}" for c in args.walk_configs]
+    lines = ["gluon"]
+    if not args.forward_only:
+        lines += ["gluon_prepare"] + [
+            f"gluon_walk:{c}" for c in args.walk_configs
+        ]
     if "triton" in args.backends:
         lines.append("triton")
     configs = [
@@ -224,7 +228,7 @@ def benchmark(args):
     )
 
 
-def parse_args():
+def parse_args(argv: list[str] | None = None):
     parser = get_parser(kernel_name="chunked KDA prefill")
     override_parser_action(
         parser, action="--metric", choices=["time", "throughput"], default="time"
@@ -240,6 +244,11 @@ def parse_args():
         help="walk BV,num_warps points to time on their own",
     )
     parser.add_argument("--backends", nargs="+", default=["gluon", "triton"])
+    parser.add_argument(
+        "--forward-only",
+        action="store_true",
+        help="Report only the complete Gluon forward operation.",
+    )
     parser.add_argument(
         "--config",
         type=json.loads,
@@ -257,13 +266,13 @@ def parse_args():
     parser.add_argument(
         "-o", action="store_true", default=False, help="Write CSV results"
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main():
+def main(argv: list[str] | None = None) -> None:
     if arch_info.get_arch() not in ("gfx1250", "gfx950"):
         sys.exit(f"chunk KDA gluon needs gfx1250 or gfx950, got {arch_info.get_arch()}")
-    args = parse_args()
+    args = parse_args(argv)
     if args.walk_configs is None:
         # BV 128 with KS 2 needs more LDS than gfx950 has.
         args.walk_configs = ["32,2", "64,4"]

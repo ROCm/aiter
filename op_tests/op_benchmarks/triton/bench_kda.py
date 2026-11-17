@@ -482,7 +482,8 @@ def benchmark(args):
         return mem / ms * 1e-9, mem / hi * 1e-9, mem / lo * 1e-9
 
     bench_kda.run(save_path="." if args.o else None, print_data=True, show_plots=False)
-    report_spread(spread, line_vals, line_names, args)
+    if not args.no_spread:
+        report_spread(spread, line_vals, line_names, args)
 
 
 def report_spread(spread, line_vals, line_names, args):
@@ -513,7 +514,7 @@ def report_spread(spread, line_vals, line_names, args):
         )
 
 
-def parse_args():
+def parse_args(argv: list[str] | None = None):
     parser = get_parser(kernel_name="KDA decode")
     parser.add_argument("--batch_sizes", type=int, nargs="+", default=[4, 16, 64, 256])
     parser.add_argument("--seq_lens", type=int, nargs="+", default=[1, 4, 8])
@@ -628,6 +629,11 @@ def parse_args():
         default="median",
         help="which of the --runs measurements lands in the main table",
     )
+    parser.add_argument(
+        "--no-spread",
+        action="store_true",
+        help="Do not print the run-to-run variability table.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "-metric",
@@ -643,7 +649,7 @@ def parse_args():
         default=False,
         help="Write performance results to CSV file",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _check_case_shapes(args):
@@ -681,8 +687,8 @@ def run_bench(args):
         benchmark(args)
 
 
-def main():
-    run_bench(parse_args())
+def main(argv: list[str] | None = None) -> None:
+    run_bench(parse_args(argv))
 
 
 if __name__ == "__main__":

@@ -135,6 +135,19 @@ the first requested `seq_len` value for this kernel.
 MHC shapes are replicated and are not divided by TP. The benchmark supports
 the `time` and `bandwidth` metrics.
 
+### Kimi Delta Attention (`kda_attention_prefill`, `kda_attention_decode`)
+
+| Field | Type | Description                                                   |
+|-------|------|---------------------------------------------------------------|
+| `hq`  | int  | Total number of KDA heads. The tool divides this value by TP. |
+| `dqk` | int  | Query/key head dimension.                                     |
+| `dv`  | int  | Value head dimension.                                         |
+
+Prefill uses `bench_chunk_kda.py`. Decode uses `bench_kda.py`. Both keys
+support the `time` and `bandwidth` metrics on gfx950 and gfx1250. The
+benchmarks report memory throughput, so the tool does not run them for the
+TFLOPS `throughput` metric.
+
 ## Example
 
 ```json

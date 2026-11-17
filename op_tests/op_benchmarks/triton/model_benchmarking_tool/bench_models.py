@@ -26,6 +26,9 @@ from op_tests.op_benchmarks.triton.bench_batched_gemm_a16wfp4 import (
 from op_tests.op_benchmarks.triton.bench_batched_gemm_afp4wfp4 import (
     main as bench_batched_gemm_afp4wfp4_main,
 )
+from op_tests.op_benchmarks.triton.bench_chunk_kda import (
+    main as bench_chunk_kda_main,
+)
 from op_tests.op_benchmarks.triton.bench_gemm_a8w8_blockscale import (
     main as bench_gemm_a8w8_blockscale_main,
 )
@@ -38,6 +41,7 @@ from op_tests.op_benchmarks.triton.bench_gemm_a16w16 import (
 from op_tests.op_benchmarks.triton.bench_gemm_afp4wfp4 import (
     main as bench_gemm_afp4wfp4_main,
 )
+from op_tests.op_benchmarks.triton.bench_kda import main as bench_kda_main
 from op_tests.op_benchmarks.triton.bench_mha import main as bench_mha_main
 from op_tests.op_benchmarks.triton.bench_mhc_dsv4 import main as bench_mhc_dsv4_main
 from op_tests.op_benchmarks.triton.bench_mla_decode import main as bench_mla_main
@@ -90,6 +94,8 @@ KERNEL_DICT: dict[str, Callable[[list[str]], None]] = {
     "mha": bench_mha_main,
     "mla": bench_mla_main,
     "mhc": bench_mhc_dsv4_main,
+    "kda_attention_prefill": bench_chunk_kda_main,
+    "kda_attention_decode": bench_kda_main,
     "sparse_mqa": bench_pa_decode_sparse_main,
     "unified_attention": bench_unified_attention_main,
 }
@@ -630,6 +636,57 @@ class MhcKernelHandler(KernelHandler):
         }
 
 
+class KdaAttentionKernelHandler(KernelHandler):
+    """Handler for Kimi Delta Attention prefill and decode benchmarks."""
+
+    def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
+        result = []
+        for shape in shapes:
+            s = shape.copy()
+            self._shard_keys(s, ["hq"])
+            result.append(s)
+        return result
+
+    def build_args(self) -> str:
+        shape = self._shape
+        common = (
+            f"--batch_sizes {self._batch_size} --seq_lens {self._seq_len} "
+            f"--num_heads {shape['hq']} --backends gluon"
+        )
+        if self._kernel == "kda_attention_prefill":
+            metric = "throughput" if self._metric == "bandwidth" else self._metric
+            return f"{common} --metric {metric} --forward-only"
+        return (
+            f"{common} --head_dim {shape['dqk']} -metric {self._metric} "
+            "--gate --paged --state_dtype fp32 --dtype bf16 --no-spread"
+        )
+
+    def parse_stdout(self, stdout: str) -> float:
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        last_row_values = list(
+            map(float, re.findall(r"-?\d+(?:\.\d+)?", lines[-1]))
+        )
+        if not last_row_values:
+            raise ValueError(f"Unexpected KDA bench output format: {lines[-1]!r}")
+        result = last_row_values[-1]
+        if self._metric == "time":
+            return result * 1e-3  # us -> ms
+        return result * 1e3  # TB/s -> GB/s
+
+    def build_result_row(self, bench_result: float | str) -> ResultRow:
+        shape = self._shape
+        return {
+            "Model": self._model,
+            "Kernel": self._kernel,
+            "batch_size": self._batch_size,
+            "seq_len": self._seq_len,
+            "hq": shape["hq"],
+            "dqk": shape["dqk"],
+            "dv": shape["dv"],
+            self._metric: bench_result,
+        }
+
+
 class UnifiedAttnKernelHandler(KernelHandler):
     """Handler for unified attention benchmarks (bench_unified_attention.py)."""
 
@@ -697,6 +754,7 @@ _HANDLER_RULES: list[tuple[Callable[[str], bool], type[KernelHandler]]] = [
     (lambda k: k == "mha", MhaKernelHandler),
     (lambda k: k == "mla", MlaKernelHandler),
     (lambda k: k == "mhc", MhcKernelHandler),
+    (lambda k: k.startswith("kda_attention_"), KdaAttentionKernelHandler),
     (lambda k: k == "sparse_mqa", SparseMqaKernelHandler),
     (lambda k: k == "unified_attention", UnifiedAttnKernelHandler),
 ]
@@ -887,6 +945,19 @@ def run_benchmarks(
                     "use --metric time or bandwidth."
                 )
                 continue
+
+            if kernel.startswith("kda_attention_"):
+                if arch_info.get_arch() not in ("gfx950", "gfx1250"):
+                    print(
+                        f"KDA is not supported on this device. Skipping {kernel}."
+                    )
+                    continue
+                if metric == "throughput":
+                    print(
+                        f"Skipping {kernel}: TFLOPS throughput is not supported; "
+                        "use --metric time or bandwidth."
+                    )
+                    continue
 
             # MLA only reports time (ms)
             run_metric = "time" if kernel == "mla" else metric
