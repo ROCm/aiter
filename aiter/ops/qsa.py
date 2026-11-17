@@ -39,7 +39,13 @@ except ImportError:
     _HAS_FLYDSL = False
 
 try:
-    from aiter.ops.flydsl.qsa_sparse_prefill import flydsl_qsa_sparse_prefill
+    from aiter.ops.flydsl.qsa_sparse_prefill import (
+        SELECTION_WIDTHS as _FLYDSL_PREFILL_WIDTHS,
+    )
+    from aiter.ops.flydsl.qsa_sparse_prefill import (
+        flydsl_qsa_sparse_prefill,
+        flydsl_qsa_sparse_prefill_supports_selection,
+    )
 
     _HAS_FLYDSL_PREFILL = True
 except ImportError:
@@ -211,6 +217,22 @@ def qsa_select_paged_tokens(
     return out
 
 
+def qsa_sparse_prefill_widths() -> tuple[int, ...]:
+    """Selection widths (4T + 3 int32 columns) ``qsa_sparse_prefill`` accepts, in
+    increasing order; empty where it is not available (no FlyDSL)."""
+    return _FLYDSL_PREFILL_WIDTHS if _HAS_FLYDSL_PREFILL else ()
+
+
+def qsa_sparse_prefill_supports_selection(rows: int, width: int) -> bool:
+    """Whether ``qsa_sparse_prefill`` takes an int32 [rows, width] selection: the
+    width is one of ``qsa_sparse_prefill_widths()`` and the selection spans fewer
+    than 2**31 bytes. Lets a caller pick its path before building the selection;
+    the remaining inputs and the GPU are still checked by the call."""
+    return _HAS_FLYDSL_PREFILL and flydsl_qsa_sparse_prefill_supports_selection(
+        rows, width
+    )
+
+
 def qsa_sparse_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -254,5 +276,7 @@ __all__ = [
     "qsa_select_paged_tokens",
     "qsa_sparse_paged_gqa",
     "qsa_sparse_prefill",
+    "qsa_sparse_prefill_supports_selection",
+    "qsa_sparse_prefill_widths",
     "qsa_store_quantized_rows",
 ]
