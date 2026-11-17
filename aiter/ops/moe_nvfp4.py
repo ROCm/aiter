@@ -295,6 +295,37 @@ def _check_shape(H: int, I: int) -> None:
         raise ValueError(f"NVFP4 MoE: I={I}: odd I / 128 is supported for 3 only")
 
 
+def _check_layer(w13, sc13, w2, sc2, g13, g2, shuffled: bool) -> None:
+    """Raises ValueError unless the tensors are the NvFp4MoeWeights of one layer on
+    the w13 device (the kernels index all of them by expert id)."""
+    if w13.dim() != 3:
+        raise ValueError(f"NVFP4 MoE: w13 must be [E, 2I, H/2], got {list(w13.shape)}")
+    E, N13, H2 = w13.shape
+    I, H = N13 // 2, H2 * 2
+    for name, t, shape in (
+        ("w13", w13, (E, 2 * I, H // 2)),
+        ("sc13", sc13, (E, 2 * I, H // 16)),
+        ("w2", w2, (E, H, I // 2)),
+        ("sc2", sc2, (E, H, I // 16)),
+        ("g13", g13, (E, 2)),
+        ("g2", g2, (E,)),
+    ):
+        kind = "float" if name[0] == "g" else "1-byte"
+        ok = t.is_floating_point() if name[0] == "g" else t.element_size() == 1
+        if shuffled and name[:2] == "sc":
+            # the shuffle_scale_nvfp4_moe layout of shape (K / 16 padded to 16)
+            kind += " shuffle_scale_nvfp4_moe layout of"
+            ok &= t.dim() > 0 and t.shape[0] == E
+            ok &= t.numel() == E * shape[1] * ((shape[2] + 15) // 16 * 16)
+        else:
+            ok &= tuple(t.shape) == shape
+        if not ok or t.device != w13.device:
+            raise ValueError(
+                f"NVFP4 MoE: {name} must be {kind} {list(shape)} on {w13.device},"
+                f" got {t.dtype} {list(t.shape)} on {t.device}"
+            )
+
+
 def _check_row(key: tuple, t: int, kernel1: dict, kernel2: dict) -> None:
     """Raises ValueError for a tuned CSV row whose kernels cannot run its shape:
     another BM per stage (one sort serves both), a scale group size other than
@@ -392,12 +423,15 @@ class NvFp4MoeWeights:
             scales in the shuffle_scale_nvfp4_moe layout (wrapped, no copy).
 
     Raises:
-        ValueError: a shape without kernels (_check_shape): H or I not a
+        ValueError: tensors that are not one layer of these shapes, 1-byte
+            weights and scales, float g13 / g2, all on the w13 device
+            (_check_layer); a shape without kernels (_check_shape): H or I not a
             multiple of 128, H / 128 odd, or I / 128 odd and not 3.
     """
 
     def __init__(self, w13, sc13, w2, sc2, g13, g2, shuffled=False):
         prepare(w13.device)
+        _check_layer(w13, sc13, w2, sc2, g13, g2, shuffled)
         self.E, N13, H2 = w13.shape
         self.I, self.H = N13 // 2, H2 * 2
         _check_shape(self.H, self.I)
@@ -440,23 +474,15 @@ def _fused_moe_nvfp4(req) -> Tensor:
         unsupported = f"output dtype {req.dtype} != {req.hidden_states.dtype}"
     if unsupported is not None:
         raise ValueError(f"NVFP4 fused_moe: {unsupported} is not supported")
-    if req.w1_global_scale is None or req.w2_global_scale is None:
-        raise ValueError("NVFP4 fused_moe needs w1_global_scale and w2_global_scale")
-    E = req.w1.shape[0]
-    for name, w, sc in (("w1", req.w1, req.w1_scale), ("w2", req.w2, req.w2_scale)):
-        N, K = w.shape[1], w.shape[2] * 2
+    if any(
+        t is None
+        for t in (req.w1_scale, req.w2_scale, req.w1_global_scale, req.w2_global_scale)
+    ):
+        raise ValueError("NVFP4 fused_moe needs w1/w2_scale and w1/w2_global_scale")
+    for name, w in (("w1", req.w1), ("w2", req.w2)):
         if not getattr(w, "is_shuffled", False):
             raise ValueError(f"NVFP4 fused_moe: {name} is not shuffled (is_shuffled)")
-        if (
-            sc is None
-            or sc.element_size() != 1
-            or sc.shape[0] != E
-            or sc.numel() != E * N * ((K // 16 + 15) // 16 * 16)
-        ):
-            raise ValueError(
-                f"NVFP4 fused_moe: {name}_scale is not 1-byte E4M3 in the"
-                f" shuffle_scale_nvfp4_moe layout of [{E}, {N}, {K // 16}]"
-            )
+    # shapes, dtypes and devices: NvFp4MoeWeights (w13 = w1, sc13 = w1_scale, ...)
     W = NvFp4MoeWeights(
         req.w1,
         req.w1_scale,
@@ -504,20 +530,32 @@ def moe_nvfp4(
 
     Raises:
         ValueError: out not a contiguous [T, H] tensor of the x dtype and
-            device, x not bf16 or f16 [T, W.H], topk above 127 (the slot field
+            device, x not bf16 or f16 [T, W.H], x, topk_ids or topk_w of another
+            shape or off the weights device, topk above 127 (the slot field
             of the sorted ids), fallback=False for a shape the fused sort cannot
             take, a shape without default-rule kernels, or a shape over the
             kernel limits (32-bit byte offsets: T * H and T * topk * I
             below 2^30, T * H below 2^29 for f16 x with stage-2 atomics; at
             most MAX_GRID_Y sorted blocks).
     """
-    T, H = x.shape
-    topk = topk_ids.shape[1]
     bf16 = x.dtype == torch.bfloat16
-    if not (bf16 or x.dtype == torch.float16) or H != W.H:
+    if not (bf16 or x.dtype == torch.float16) or x.dim() != 2 or x.shape[1] != W.H:
         raise ValueError(
-            f"NVFP4 MoE: x must be bf16 or f16 [T, {W.H}], got {x.dtype} {H}"
+            f"NVFP4 MoE: x must be bf16 or f16 [T, {W.H}], got {x.dtype}"
+            f" {list(x.shape)}"
         )
+    T, H = x.shape
+    if (
+        topk_ids.dim() != 2
+        or topk_ids.shape[0] != T
+        or topk_w.shape != topk_ids.shape
+        or any(t.device != W.w13.device for t in (x, topk_ids, topk_w))
+    ):
+        raise ValueError(
+            f"NVFP4 MoE: x [T, H], topk_ids and topk_w [T, topk] must be on the"
+            f" weights device {W.w13.device}"
+        )
+    topk = topk_ids.shape[1]
     if topk > 127:
         raise ValueError(f"NVFP4 MoE: topk={topk} above 127")
     if fallback is None:

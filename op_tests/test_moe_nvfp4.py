@@ -8,7 +8,8 @@ bf16 and f16 activations, the stage-2 top-k sum by atomics and by the reduce
 kernel (_reduce), expert contributions that cancel beyond the f16 range, a dispatch
 CSV (AITER_CONFIG_MOE_NVFP4) naming a kernel outside the prebuilt module
 (per-kernel JIT), CSV rows whose kernels cannot run their shape, the fused_moe
-errors and a caller output buffer.
+errors, weights / inputs / raw GEMM entry arguments that are not one layer, and a
+caller output buffer.
 """
 
 import os
@@ -258,10 +259,85 @@ def test_bad_csv_row(monkeypatch):
             op._tables(*key)
 
 
+# NvFp4MoeWeights inputs that are not one layer, from the raw (or shuffled) tensors
+BAD_LAYERS = {
+    "w13 2D": lambda r: {0: r[0][0]},
+    "w13 odd N": lambda r: {0: r[0][:, 1:]},
+    "w2 experts": lambda r: {2: r[2][1:]},
+    "sc13 K": lambda r: {1: r[1][:, :, 16:]},
+    "sc2 dtype": lambda r: {3: r[3].view(torch.int16)},
+    "g13 one element": lambda r: {4: r[4][:1, :1]},
+    "g13 [E]": lambda r: {4: r[4][:, 0]},
+    "g2 one element": lambda r: {5: r[5][:1]},
+    "g2 int": lambda r: {5: r[5].int()},
+    "g13 cpu": lambda r: {4: r[4].cpu()},
+    "g2 cpu": lambda r: {5: r[5].cpu()},
+    "sc2 cpu": lambda r: {3: r[3].cpu()},
+}
+
+
+@pytest.mark.parametrize("shuffled", [False, True])
+@pytest.mark.parametrize("case", list(BAD_LAYERS))
+def test_bad_layer(case, shuffled):
+    """NvFp4MoeWeights raises ValueError (no launch) unless its tensors are one layer
+    on one device; a shuffled scale must have its shuffled size."""
+    raw = list(_weights(SHAPES["tp8"], E=8))
+    for i in (1, 3) if shuffled else ():
+        raw[i] = shuffle_scale_nvfp4_moe(raw[i])
+    NvFp4MoeWeights(*raw, shuffled=shuffled)
+    for i, t in BAD_LAYERS[case](raw).items():
+        raw[i] = t
+    with pytest.raises(ValueError, match="must be"):
+        NvFp4MoeWeights(*raw, shuffled=shuffled)
+
+
+def test_bad_inputs():
+    """moe_nvfp4 raises ValueError (no launch) for x, topk_ids or topk_w of another
+    shape or off the weights device."""
+    W = NvFp4MoeWeights(*_weights(SHAPES["tp8"], E=8))
+    x, tid, tw = _inputs(8, torch.bfloat16, seed=0, E=8)
+    for args in (
+        (x.cpu(), tid, tw), (x, tid.cpu(), tw), (x, tid, tw.cpu()),
+        (x[:4], tid, tw), (x, tid[:, :2], tw), (x, tid.view(-1), tw),
+    ):  # fmt: skip
+        with pytest.raises(ValueError, match="must be"):
+            moe_nvfp4(W, *args)
+
+
+def test_gemm_entry_errors():
+    """The raw GEMM entry (_moe_nvfp4_gemm) rejects tensors that do not match its
+    kernel and shape before the launch: wrong-stage weights or scales, inv_gs not
+    [E, 2], x / out of other sizes, a CPU tensor."""
+    from aiter.ops import moe_nvfp4 as op
+
+    I, E2, T = SHAPES["tp8"], 8, 8
+    W = NvFp4MoeWeights(*_weights(I, E=E2))
+    kernel1 = op._pick(W, T, TOPK, "f16", False)[0]
+    sort = tuple(torch.zeros(64, dtype=torch.int32, device="cuda") for _ in range(4))
+    x = torch.zeros(T, H, dtype=torch.float16, device="cuda")
+    out = torch.empty(T * TOPK, I, dtype=torch.float16, device="cuda")
+    good = {"x": x, "w": W.w13, "w_sc": W.s13, "inv_gs": W.g13, "out": out}
+    for match, bad in (
+        ("w must be", {"w": W.w2}),
+        ("w_sc must be", {"w_sc": W.s2}),
+        ("inv_gs must be", {"inv_gs": W.g13[:1, :1]}),
+        ("inv_gs must be", {"inv_gs": W.g2}),
+        ("x or out size", {"x": x[:1]}),
+        ("x or out size", {"out": out[:T]}),
+        ("one GPU", {"inv_gs": W.g13.cpu()}),
+    ):
+        a = dict(good, **bad)
+        with pytest.raises(RuntimeError, match=match):
+            op._gemm(kernel1, sort, T, TOPK, E2, a["x"], a["w"], a["w_sc"],
+                     a["inv_gs"], a["out"], K=H, ntiles=2 * I // 16, n_out=I)  # fmt: skip
+
+
 # fused_moe arguments the NVFP4 path rejects (8 tokens), from its fused_moe inputs
 ERRORS = {
     "expert_mask": lambda f: {"expert_mask": torch.ones(E, device="cuda").int()},
     "one global scale": lambda f: {"w2_global_scale": None},
+    "global scale shape": lambda f: {"w1_global_scale": f["w1_global_scale"][:1]},
+    "global scale cpu": lambda f: {"w2_global_scale": f["w2_global_scale"].cpu()},
     "fp8 w1": lambda f: {"w1": f["w1"].view(dtypes.fp8)},
     "unshuffled w1": lambda f: {"w1": f["w1"].view(torch.uint8).view(dtypes.fp4x2)},
     "scale layout": lambda f: {"w1_scale": f["w1_scale"].reshape(-1)[:1024]},

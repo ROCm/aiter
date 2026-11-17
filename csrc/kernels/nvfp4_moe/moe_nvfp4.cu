@@ -10,12 +10,21 @@
 #include "aiter_hip_common.h"
 #include "moe_nvfp4_entry.h"
 #include <cstring>
+#include <initializer_list>
 
 AITER_CTYPES_ERROR_DEF
 
 static void check_kernel(int64_t i)
 {
     AITER_CHECK(i >= 0 && i < moe_nvfp4_entry_num_cfgs(), "kernel index out of range");
+}
+
+// All tensors on the GPU of the first one (a CPU tensor has device_id -1)
+static void check_same_gpu(std::initializer_list<const aiter_tensor_t*> ts)
+{
+    const int dev = (*ts.begin())->device_id;
+    for(const aiter_tensor_t* t : ts)
+        AITER_CHECK(dev >= 0 && t->device_id == dev, "all tensors must be on one GPU");
 }
 
 static int cfg_field(int64_t i, int k)
@@ -103,6 +112,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(moe_nvfp4_sort,
                     sorted_w->numel() >= (size_t)(nblk * block_m) &&
                     sorted_eids->numel() >= (size_t)nblk && num_valid->numel() >= 1,
                 "sort buffers too small");
+    check_same_gpu({x, x_f16, out, topk_ids, topk_w, sorted_ids, sorted_w, sorted_eids, num_valid});
     HipDeviceGuard device_guard(x->device_id);
     const int rc = moe_nvfp4_entry_sort(x->data_ptr(),
                                         x_f16->numel() ? x_f16->data_ptr() : nullptr,
@@ -136,6 +146,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(ws->dtype() == AITER_DTYPE_fp32 && ws->is_contiguous() && topk > 0 &&
                     ws->numel() == out->numel() * (size_t)topk,
                 "ws must be contiguous fp32 [T * topk, H]");
+    check_same_gpu({ws, out});
     HipDeviceGuard device_guard(out->device_id);
     const int rc = moe_nvfp4_entry_reduce(ws->data_ptr(),
                                           out->data_ptr(),
@@ -189,11 +200,29 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(moe_nvfp4_gemm,
     AITER_CHECK(x->is_contiguous() && w->is_contiguous() && w_sc->is_contiguous() &&
                     out->is_contiguous(),
                 "x, w, w_sc and out must be contiguous");
-    AITER_CHECK(inv_gs->dtype() == AITER_DTYPE_fp32 && inv_gs->is_contiguous(),
-                "inv_gs must be contiguous fp32");
+    const bool s1 = cfg_field(kernel, CFG_S1) != 0;
+    // The kernels index w, w_sc and inv_gs by expert id: w [E, ntiles * 16, K / 2], w_sc
+    // its shuffle_scale_nvfp4_moe layout (K / 16 padded to 16), inv_gs [E, 2] (stage 1:
+    // gate, up) or [E]
+    AITER_CHECK(w->dim() == 3 && w->element_size() == 1 && w->size(1) == ntiles * 16 &&
+                    w->size(2) * 2 == K,
+                "w must be 1-byte [E, ntiles * 16, K / 2]");
+    const size_t E = w->size(0);
+    AITER_CHECK(w_sc->element_size() == 1 &&
+                    w_sc->numel() == E * ntiles * 16 * ((K / 16 + 15) / 16 * 16),
+                "w_sc must be the 1-byte shuffle_scale_nvfp4_moe layout of [E, N, K / 16]");
+    AITER_CHECK(inv_gs->dtype() == AITER_DTYPE_fp32 && inv_gs->is_contiguous() &&
+                    inv_gs->numel() == E * (s1 ? 2 : 1),
+                "inv_gs must be contiguous fp32 [E, 2] (stage 1) or [E] (stage 2)");
+    // stage 1: x [T, K] -> out [T * topk, n_out]; stage 2: x [T * topk, K] -> out
+    // [T * topk, n_out] (_reduce) or [T, n_out]
+    const bool reduce = cfg_field(kernel, CFG_REDUCE) != 0;
+    AITER_CHECK(x->numel() == (size_t)((s1 ? T : T * topk) * K) &&
+                    out->numel() == (size_t)((s1 || reduce ? T * topk : T) * n_out),
+                "x or out size does not match T, topk, K and n_out");
+    check_same_gpu({x, w, w_sc, inv_gs, sorted_ids, sorted_w, sorted_eids, num_valid, out});
     // stage 1 reads bf16 x iff _inbf16 (else f16), stage 2 writes bf16 out iff _outbf16 (else
     // f32: the workspace of f16 output, or the [T * topk, H] rows of _reduce)
-    const bool s1            = cfg_field(kernel, CFG_S1) != 0;
     const aiter_tensor_t* io = s1 ? x : out;
     const bool io_bf16       = cfg_field(kernel, s1 ? CFG_INBF16 : CFG_OUTBF16) != 0;
     const auto io_other      = s1 ? AITER_DTYPE_fp16 : AITER_DTYPE_fp32;
