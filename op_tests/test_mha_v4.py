@@ -2426,6 +2426,24 @@ def test_mha_v4_bf16_hd256_seqlens_k(lengths):
     assert lse_error < 0.01, lse_error
 
 
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 BF16 key splits")
+@parametrize("splits", [2, 3])
+def test_mha_v4_bf16_hd256_kv_splits_match_the_unsplit_call(splits):
+    """BF16 is the only hd256 recipe that splits its keys. Three ranges do not divide the keys,
+    so the shorter ones end through seqlens_k."""
+    torch.manual_seed(48)
+    q = torch.randn((1, 300, 3, 256), device="cuda", dtype=torch.bfloat16)
+    ramp = torch.linspace(1.0, 4.0, 1024, device="cuda").view(1, -1, 1, 1)
+    k = (torch.randn((1, 1024, 3, 256), device="cuda") * ramp).to(torch.bfloat16)
+    v = torch.randn_like(k)
+
+    unsplit = _bf16_hd256_check(q, k, v)
+    split = _bf16_hd256_check(q, k, v, kv_splits=splits)
+
+    assert split[0] < unsplit[0] * 1.1 + 1e-3, (split, unsplit)
+    assert split[1] < unsplit[1] * 1.1 + 2e-2, (split, unsplit)
+
+
 @parametrize(
     ("qk_format", "v_format"),
     [
