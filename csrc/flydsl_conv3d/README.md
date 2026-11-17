@@ -135,22 +135,17 @@ python3 csrc/flydsl_conv3d/conv3d_tune.py -i $M/wan21_vae_bf16_untuned_conv3d.cs
    these columns, or with empty cells, run 2 buffers, no unroll, `tile_k=32`
    and no patch.
 
-   `splitK` is **not** swept: `_resolve_splitk` derives it per candidate and the
-   tuner pins that value so the column records what ran. Every row of both VAE
-   tables is `splitK=1`, and structurally so rather than by default -- a split
-   only buys occupancy where the M/N grid alone cannot fill the device, and 75
-   of the 76 rows are already at or above the heuristic's own 3/4*CU block bar,
-   where a split can do nothing but add an fp32 staging buffer and an atomic
-   reduce. The exception is Wan's `conv_out` at 368x544 (98 blocks), which
-   `_resolve_splitk` declines on `npq < 4096`.
+   `splitK` is **not** swept. On gfx950 it is always 1: neither the tuner nor
+   the runtime picks a split on its own, so every gfx950 row is `splitK=1` and a
+   split only runs when the caller passes `splitk=` or a row asks for one. On
+   gfx1250 `_resolve_splitk_gfx1250` derives it per candidate and the tuner pins
+   that value so the column records what ran.
 
    Note that split-K cannot currently be combined with a tile that leaves a
    tail: the masked element is dropped by routing the store to the OOB
    sentinel, which needs a buffer descriptor, and the split-K atomic has none.
-   `make_output_scatter_plan` asserts on it. The heuristic cannot reach that
-   combination (it requires `npq % tile_m == 0` and `kg % tile_n == 0` before
-   splitting), so it is only reachable through an explicit `splitk=` or a
-   hand-written row.
+   `make_output_scatter_plan` asserts on it. It is only reachable through an
+   explicit `splitk=` or a hand-written row.
 
    `libtype` names the implementation the rest of the row configures, as it does
    in the GEMM tables. It is a result rather than part of the key: where a tuner
@@ -182,9 +177,9 @@ python3 -m pytest op_tests/tuning_tests/test_config_shape_collision.py
    Both the AOT pass and the runtime build the compile key through
    `conv_kernels._implicit_param_from_problem`, so channel padding and field
    order cannot drift between them. `splitK` is the remaining coupling: the
-   runtime freezes the tuned row's value instead of re-deriving it, so a row
-   written without that column falls back to the CU-count heuristic and can miss
-   the AOT cache. `aiter.aot.flydsl.common.run_only_env()` makes FlyDSL raise on
+   runtime freezes the tuned row's value instead of re-deriving it; a gfx950
+   row without that column runs `splitK=1`, and a gfx1250 one falls back to the
+   CU-count heuristic and can miss the AOT cache. `aiter.aot.flydsl.common.run_only_env()` makes FlyDSL raise on
    a JIT rather than fall back, which is how to verify a row by hand after
    changing the padding, channel-padding or split-K rules.
 

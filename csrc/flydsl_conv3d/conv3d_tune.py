@@ -669,7 +669,7 @@ class Conv3dTuner(TunerCommon):
         ``(tile_m, tile_n, wave_m, wave_n, block_rows)``, replaces the policy's
         tile candidates (see ``--tiles_from``).
         """
-        from aiter.ops.flydsl.conv_kernels import _borrow_tuned_tile, _resolve_splitk
+        from aiter.ops.flydsl.conv_kernels import _borrow_tuned_tile
 
         kv = dict(zip(self.keys, keys))
         n, c, d, h, w = (int(kv[x]) for x in ("N", "C", "D", "H", "W"))
@@ -709,9 +709,8 @@ class Conv3dTuner(TunerCommon):
                     out_dhw[2],
                     num_cu=self.get_cu_num(),
                 )
-            return _resolve_splitk(
-                None, m_gemm, crs, k, None, tile, groups, num_cu=self.get_cu_num()
-            )
+            # gfx950 does not split K automatically (the runtime never does either).
+            return 1
 
         def plan_for(tile, block_rows):
             param = _implicit_param_from_problem(

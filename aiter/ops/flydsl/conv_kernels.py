@@ -1011,7 +1011,8 @@ def _conv3d_impl(
 
     def _run(the_tile, the_wgm=1, tuned_splitk=None, the_block_rows=1):
         # Caller splitk= wins; else freeze the CSV value so AOT and runtime share a key.
-        sk_arg = splitk if splitk is not None else tuned_splitk
+        # gfx950 never picks a split on its own: no value means splitK=1.
+        sk_arg = splitk if splitk is not None else (tuned_splitk or 1)
         sk = _resolve_splitk(sk_arg, npq, crs, k, x.device, the_tile, groups)
         if sk > 1:
             y = torch.zeros((npq, k), device=x.device, dtype=torch.float32)
