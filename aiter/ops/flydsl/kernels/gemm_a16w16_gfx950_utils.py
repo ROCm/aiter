@@ -17,6 +17,7 @@ GFX950_DMA_BYTES = 16
 GFX950_WAVE_SIZE = 64
 # Keep fixed buffers stable across graph captures and cover larger split-K grids.
 SPLIT_K_SEMAPHORE_MAX_LEN = 2048
+GFX950_FLAT_BUFFER_LIMIT_BYTES = 1 << 32
 
 
 def wait_vmcnt_and_barrier(vmcnt=0):
