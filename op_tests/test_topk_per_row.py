@@ -1,6 +1,7 @@
 import argparse
 import contextlib
 import ctypes
+import faulthandler
 import itertools
 import os
 from unittest import mock
@@ -17,7 +18,7 @@ from aiter.ops import topk as T
 from aiter.ops import topk_decode_gate as G
 from aiter.ops import topk_select as S
 from aiter.ops.asm.asm_utils import load_hip
-from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, wave_size_of
 from aiter.ops.flydsl.kernels.topk import (
     topk_per_row_decode_adaptive as adaptive_kernel,
 )
@@ -1324,7 +1325,7 @@ def test_adaptive_control_per_capture(card):
     )
 
 
-def test_adaptive_control_concurrent_replays(card):
+def test_adaptive_control_concurrent_replays(card, stable):
     """Graphs replayed at once, and a replay beside eager launches on its capture
     stream, never share control slots: every row stays exact. With one buffer per
     stream these returned wrong rows, and the uncapped waits never finished."""
@@ -1349,7 +1350,7 @@ def test_adaptive_control_concurrent_replays(card):
             width,
             1,
             top_k,
-            False,
+            stable,
             None,
             topk.BACKEND_ADAPTIVE,
             width,
@@ -1358,6 +1359,9 @@ def test_adaptive_control_concurrent_replays(card):
     def check(cases, what):
         torch.cuda.synchronize()
         for logits, seq_lens, out in cases:
+            if stable:
+                assert torch.equal(out.long(), stable_reference(logits, top_k)), what
+                continue
             assert compare_topk_results(
                 logits,
                 out.long(),
@@ -1414,9 +1418,65 @@ def test_adaptive_control_concurrent_replays(card):
     control = flydsl_decode_host._adaptive_control[(device, home.cuda_stream)]
     assert not control.any(), "eager control left dirty"
     print(
-        f"[adaptive_control_concurrent_replays] PASS: width {width}, k {top_k}, "
-        f"{calls} calls per graph, {rounds} rounds per case"
+        f"[adaptive_control_concurrent_replays] PASS: stable {stable}, width {width}, "
+        f"k {top_k}, {calls} calls per graph, {rounds} rounds per case"
     )
+
+
+def test_adaptive_forced_takeover(card):
+    """Parts past a narrowed grid never start, so the running workgroups must take
+    them over: every row stays exact, ordered or not, down to one workgroup."""
+    device = torch.cuda.current_device()
+    cells = (
+        (1, 1 << 16, 2048, True),
+        (1, 1 << 20, 2048, True),
+        (1, 1 << 16, 2048, False),
+        (4, 1 << 20, 2048, False),
+    )
+    n = 0
+    for rows, width, top_k, stable in cells:
+        launcher, scratch_slots, launch = flydsl_decode_host._adaptive_plan(
+            rows, width, top_k, stable, card[1], False, device
+        )
+        grid, parts = launch[:2]
+        assert parts > 2 and grid >= parts, (rows, width, top_k, stable, launch)
+        torch.manual_seed(rows + width)
+        logits = torch.randn(rows, width, device="cuda")
+        seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+        for narrow in (parts - 1, parts // 2, 1):
+            # Parts that never start leave their row's control set, so each launch
+            # takes buffers of its own rather than the stream's.
+            control = torch.zeros(
+                adaptive_kernel.decode_control_slots(rows),
+                dtype=torch.int32,
+                device="cuda",
+            )
+            scratch = (
+                torch.zeros(scratch_slots, dtype=torch.int32, device="cuda")
+                if scratch_slots
+                else control
+            )
+            out = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
+            _run_compiled(
+                launcher, logits, 1, seq_lens, seq_lens, out, control, scratch,
+                rows, width, width, 1, narrow, *launch[1:],
+                torch.cuda.current_stream(),
+            )  # fmt: skip
+            torch.cuda.synchronize()
+            what = f"{rows} x {width}, k {top_k}, stable {stable}, grid {narrow}"
+            if stable:
+                assert torch.equal(out.long(), stable_reference(logits, top_k)), what
+            else:
+                assert compare_topk_results(
+                    logits,
+                    out.long(),
+                    logits.topk(top_k, dim=-1)[1],
+                    torch.zeros_like(seq_lens),
+                    seq_lens,
+                    top_k,
+                ), what
+            n += 1
+    print(f"[adaptive_forced_takeover] PASS: {n} launches")
 
 
 def _scratch_harness(width, top_k):
@@ -2778,6 +2838,10 @@ def run_decode(args):
     assert df["all_close"].all(), f"topk_per_row_decode mismatch:\n{df_md}"
 
 
+# Several cold runs of the section, and well inside CI's own job timeout.
+_ADAPTIVE_TIMEOUT_S = 900
+
+
 def run_adaptive():
     test_decode_bound_gate()
     test_decode_mixed_node()
@@ -2870,7 +2934,9 @@ def run_adaptive():
     test_decode_bound_entry_points(card)
     test_adaptive_control_stays_zero(card)
     test_adaptive_control_per_capture(card)
-    test_adaptive_control_concurrent_replays(card)
+    test_adaptive_control_concurrent_replays(card, stable=False)
+    test_adaptive_control_concurrent_replays(card, stable=True)
+    test_adaptive_forced_takeover(card)
     test_adaptive_scratch_reused(card)
     test_adaptive_scratch_poisoned(card)
     test_adaptive_scratch_two_streams(card)
@@ -2897,7 +2963,12 @@ def main():
     if "decode" in args.sections:
         run_decode(args)
     if "adaptive" in args.sections:
-        run_adaptive()
+        # A broken row barrier hangs rather than fails: dump where, then exit.
+        faulthandler.dump_traceback_later(_ADAPTIVE_TIMEOUT_S, exit=True)
+        try:
+            run_adaptive()
+        finally:
+            faulthandler.cancel_dump_traceback_later()
 
 
 if __name__ == "__main__":
