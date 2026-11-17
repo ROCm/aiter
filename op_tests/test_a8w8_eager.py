@@ -308,17 +308,17 @@ def check_gemm_declines():
     wq_pad, w_scale_pad, _ = _weight(n, k + 128)
     with _routed({(m, n, k): CK}):
         y, calls = _custom_op_calls(lambda: _gemm(xq, wq_pad, x_scale, w_scale_pad))
-    padded = _gemm_op(xq, wq_pad, x_scale, w_scale_pad)
-    assert torch.equal(y, padded), "K-padded weight: not the custom op's bits"
-    rows.append(_row("GEMM, K-padded weight", calls, True))
+        exact = _check_bits(
+            y, lambda: _gemm_op(xq, wq_pad, x_scale, w_scale_pad), "K-padded weight"
+        )
+    rows.append(_row("GEMM, K-padded weight", calls, True, exact))
 
     m, n, k = 2112, 2560, 3072
     xq, wq, x_scale, w_scale, _ = _inputs(m, n, k)
     with _routed({(m, n, k): {"libtype": "cktile", "splitK": 0}}):
         y, calls = _custom_op_calls(lambda: _gemm(xq, wq, x_scale, w_scale))
-        cktile = _gemm_op(xq, wq, x_scale, w_scale)
-    assert torch.equal(y, cktile), "CKTile row: not the custom op's bits"
-    rows.append(_row("GEMM, CKTile row", calls, True))
+        exact = _check_bits(y, lambda: _gemm_op(xq, wq, x_scale, w_scale), "CKTile")
+    rows.append(_row("GEMM, CKTile row", calls, True, exact))
     return rows
 
 
