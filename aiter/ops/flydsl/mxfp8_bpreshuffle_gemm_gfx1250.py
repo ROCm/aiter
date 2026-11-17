@@ -157,8 +157,9 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     row-major ``(M, K//128)`` x_scale (any row stride, unit column stride).
     The compute-bound kernels read M-contiguous scales only, so they get a
     column-major copy. ``a_scale_preload`` (row-major only, default: when it
-    fits) stages the whole-K A/B scale panels once per workgroup. w_scale ``(N//128, K//128)`` fp8_e8m0
-    dense row-major.
+    fits) stages the whole-K A/B scale panels once per workgroup.
+
+    w_scale ``(N//128, K//128)`` fp8_e8m0 dense row-major.
 
     ``scale_block=32``: x_scale ``(M, K//32)`` row-major by default, or
     ``(ceil(M/32)*32, K//32)`` in 32x4 shuffled storage when

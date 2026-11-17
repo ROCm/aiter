@@ -1475,6 +1475,22 @@ def _flydsl_mxfp8_fallback_kernel(
     return min(fits, key=lambda x: (abs(x.tile_m - want_tm), -x.tile_n, -x.tile_k))
 
 
+def _mxfp8_128_bpreshuffle_config(
+    m: int, n: int, k: int, w_scale_block: str
+) -> dict | None:
+    """The row ``gemm_a8w8_blockscale_bpreshuffle`` runs a gfx1250 mxfp8_128
+    GEMM with: the tuned triton or flydsl row, else a flydsl row naming the
+    FlyDSL fallback kernel (``"fallback": True``), else None. A triton row is
+    returned without importing FlyDSL."""
+    config = get_mxscale_bpreshuffle_config(m, n, k, w_scale_block)
+    if config is not None and config["libtype"] in ("triton", "flydsl"):
+        return config
+    ki = _flydsl_mxfp8_fallback_kernel(m, n, k)
+    if ki is None:
+        return None
+    return {"libtype": "flydsl", "kernelName": ki.name, "fallback": True}
+
+
 @functools.lru_cache(maxsize=4096)
 def gemm_a8w8_blockscale_bpreshuffle_prefers_row_major_x_scale(
     m: int, n: int, k: int, w_scale_block: str = "128x128"
@@ -1488,21 +1504,14 @@ def gemm_a8w8_blockscale_bpreshuffle_prefers_row_major_x_scale(
     asks this per M and passes the answer as ``x_scale_transposed``."""
     if not is_gfx1250_family(get_gfx()):
         return False
-    config = get_mxscale_bpreshuffle_config(m, n, k, w_scale_block)
-    if config is not None:
-        if config["libtype"] != "flydsl":
-            return False
-        kernel_name = str(config.get("kernelName", ""))
-    else:
-        ki = _flydsl_mxfp8_fallback_kernel(m, n, k)
-        if ki is None:
-            return False
-        kernel_name = ki.name
+    config = _mxfp8_128_bpreshuffle_config(m, n, k, w_scale_block)
+    if config is None or config["libtype"] != "flydsl":
+        return False
     from .flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
         mxfp8_128_reads_row_major_x_scale_fast,
     )
 
-    return mxfp8_128_reads_row_major_x_scale_fast(kernel_name, m, k)
+    return mxfp8_128_reads_row_major_x_scale_fast(str(config["kernelName"]), m, k)
 
 
 def gemm_a8w8_blockscale_bpreshuffle_fake(
@@ -1605,15 +1614,6 @@ def gemm_a8w8_blockscale_bpreshuffle(
     else:
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
-    mxscale_128 = (
-        x_scale.dtype == dtypes.fp8_e8m0
-        and w_scale.dtype == dtypes.fp8_e8m0
-        and tuple(x_scale.shape) == (m, k // 128)
-    )
-    if not x_scale_transposed and not (mxscale_128 and is_gfx1250_family(get_gfx())):
-        x_scale = x_scale.t().contiguous().view(x_scale.shape)
-        x_scale_transposed = True
-
     if (
         x_scale.dtype == dtypes.fp8_e8m0
         and w_scale.dtype == dtypes.fp8_e8m0
@@ -1633,7 +1633,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
         and w_scale.dtype == dtypes.fp8_e8m0
     )
     if use_gfx1250_flydsl_or_triton_mxfp8_128:
-        config = get_mxscale_bpreshuffle_config(
+        config = _mxfp8_128_bpreshuffle_config(
             m, n, k, mxscale_w_scale_block(tuple(w_scale.shape), n, k)
         )
         # A tuned triton/gluon row wins over flydsl on the SAME mxfp8_128
@@ -1664,16 +1664,23 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 y=Y,  # honor caller out= (zero-copy); Y = out or fresh empty
                 x_scale_group_size=128,
                 # The mxfp8_128 contract, not a guess: x_scale bytes are
-                # column-major (K // 128, M) -- what per_group_quant_hip(
-                # transpose_scale=True) emits, and what the flydsl runner
-                # hard-codes as x_scale_transposed=True. It is NOT inferable from
-                # strides here: that buffer is a contiguous (M, K // 128) tensor
-                # whose *bytes* are transposed, so the stride(0) != 1 probe the
-                # fp32 branches use would read it as row-major.
+                # column-major (K // 128, M) by default -- what
+                # per_group_quant_hip(transpose_scale=True) emits -- and a
+                # row-major (M, K // 128) with x_scale_transposed=False. It is NOT
+                # inferable from strides here: the column-major buffer is a
+                # contiguous (M, K // 128) tensor whose *bytes* are transposed, so
+                # the stride(0) != 1 probe the fp32 branches use would read it as
+                # row-major.
                 is_x_scale_transposed=x_scale_transposed,
                 backend=backend,
             )
-        if config is not None and config["libtype"] == "flydsl":
+        if config is not None:
+            if config.get("fallback"):
+                logger.warning(
+                    f"[gfx1250] gemm_a8w8_blockscale_bpreshuffle untuned "
+                    f"M={m}, N={n}, K={k}; falling back to flydsl kernel "
+                    f"'{config['kernelName']}'."
+                )
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ,
                 WQ,
@@ -1684,22 +1691,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 x_scale_transposed=x_scale_transposed,
             )
 
-        ki = _flydsl_mxfp8_fallback_kernel(m, n, k)
-        if ki is not None:
-            logger.warning(
-                f"[gfx1250] gemm_a8w8_blockscale_bpreshuffle untuned "
-                f"M={m}, N={n}, K={k}; falling back to flydsl kernel '{ki.name}'."
-            )
-            return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
-                XQ,
-                WQ,
-                x_scale,
-                w_scale,
-                Y,
-                {"kernelName": ki.name},
-                x_scale_transposed=x_scale_transposed,
-            )
-
+    # Only the gfx1250 mxfp8_128 kernels above read a row-major x_scale.
     if not x_scale_transposed:
         x_scale = x_scale.t().contiguous().view(x_scale.shape)
 
