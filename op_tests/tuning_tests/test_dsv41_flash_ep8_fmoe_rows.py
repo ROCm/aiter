@@ -65,8 +65,8 @@ EXPECTED = {
     ),
     (48, 6, 16384): (
         128,
-        "flydsl_moe1_afp4_wfp4_bf16_t128x128x256_fp4",
-        "flydsl_moe2_afp4_wfp4_bf16_t64x128x256_atomic_bnt2_sbm128",
+        "flydsl_moe1_afp4_wfp4_bf16_t128x128x256_bnt0_fp4",
+        "flydsl_moe2_layout_afp4_wfp4_bf16_t64x128x256_atomic_persist_sbm128",
     ),
     (48, 6, 32768): (
         128,
@@ -85,8 +85,8 @@ EXPECTED = {
     ),
     (16, 3, 1024): (
         32,
-        "flydsl_moe1_afp4_wfp4_bf16_t32x32x256_w3_bnt0_kw4_fp4",
-        "flydsl_moe2_layout_afp4_wfp4_bf16_t32x128x256_atomic_persist_sbm32",
+        "flydsl_moe1_afp4_wfp4_bf16_t32x64x256_w3_bnt0_kw2_fp4",
+        "flydsl_moe2_layout_afp4_wfp4_bf16_t32x128x256_atomic_nt_sbm32",
     ),
     (16, 3, 2048): (
         64,
