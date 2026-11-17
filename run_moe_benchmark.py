@@ -7,6 +7,8 @@ Routing defaults to non-balanced; --bln selects balanced routing. Add
 total experts and topk by one. --tokens selects one or more token counts;
 omitting it runs all seventeen default counts. Use --container dsr1_ep4 to
 override the default hyg_fyd1 container.
+Docker access is detected automatically; sudo -n is used when direct Docker
+access is denied.
 
 Pin is requested as 1 for three fresh processes, each calling the canonical
 op test directly with all token counts after --tokens. APRE, tiles, and clusters use
@@ -218,6 +220,27 @@ def checked(command, repo):
     return result.stdout.strip()
 
 
+def detect_docker_command(repo):
+    probe = ["info", "--format", "{{.ServerVersion}}"]
+    command = ["docker"]
+    result = capture(command + probe, repo)
+    if result.returncode == 0:
+        return command
+    if "permission denied" not in result.stdout.lower():
+        raise RuntimeError(f"Cannot access Docker: {result.stdout.strip()}")
+    if not shutil.which("sudo"):
+        raise RuntimeError("Docker access requires sudo, but sudo is unavailable.")
+    command = ["sudo", "-n", "docker"]
+    result = capture(command + probe, repo)
+    if result.returncode:
+        raise RuntimeError(
+            "Non-interactive sudo could not access Docker. If a password is "
+            "required, run sudo -v before rerunning this script.\n"
+            f"{result.stdout.strip()}"
+        )
+    return command
+
+
 def test_args(
     tokens, experts, *, topk=8, shared_experts=0, model_dim=7168, inter_dim=2048
 ):
@@ -279,7 +302,7 @@ def make_plan(
     ]
 
 
-def stop_own_worker(repo, container, task, process):
+def stop_own_worker(repo, container, task, process, docker_command):
     # The unique result path must still occur in this PID's command line.
     # Never use a broad pkill or terminate another user's GPU process.
     pid_file = Path(task["pid_file"])
@@ -293,7 +316,7 @@ def stop_own_worker(repo, container, task, process):
         try:
             capture(
                 [
-                    "docker",
+                    *docker_command,
                     "exec",
                     container,
                     "python3",
@@ -736,9 +759,13 @@ def main():
             f"Log directory: {root}; group={args.group}; {len(plan)} direct canonical processes, {len(args.tokens)} token cases per process; "
             f"{len(args.tokens) * len(plan)} case samples in total."
         )
+        docker_command = detect_docker_command(repo)
+        state["docker_command_prefix"] = docker_command
+        log(f"Docker command: {' '.join(docker_command)}")
+        save()
         inspection = checked(
             [
-                "docker",
+                *docker_command,
                 "inspect",
                 "--format",
                 '{"id":{{json .Id}},"image":{{json .Config.Image}},"running":{{json .State.Running}}}',
@@ -764,7 +791,7 @@ def main():
         )
         checked(
             [
-                "docker",
+                *docker_command,
                 "exec",
                 args.container,
                 "python3",
@@ -776,7 +803,8 @@ def main():
             repo,
         )
         checked(
-            ["docker", "exec", args.container, "chmod", "-R", "a+rwX", str(root)], repo
+            [*docker_command, "exec", args.container, "chmod", "-R", "a+rwX", str(root)],
+            repo,
         )
         container_environment = json.loads(
             (root / "container_environment.json").read_text(encoding="utf-8")
@@ -804,7 +832,7 @@ def main():
                 "pid_file": str(root / f"{label}.pid"),
             }
             command = [
-                "docker",
+                *docker_command,
                 "exec",
                 "-w",
                 str(repo),
@@ -837,20 +865,28 @@ def main():
                 try:
                     rc = process.wait(timeout=state["test_timeout_seconds"])
                 except subprocess.TimeoutExpired:
-                    stop_own_worker(repo, args.container, task, process)
+                    stop_own_worker(repo, args.container, task, process, docker_command)
                     raise RuntimeError(
                         f"{label} exceeded {state['test_timeout_seconds']} seconds; its own worker was stopped"
                     )
                 except BaseException:
-                    stop_own_worker(repo, args.container, task, process)
+                    stop_own_worker(repo, args.container, task, process, docker_command)
                     raise
             if rc:
-                stop_own_worker(repo, args.container, task, process)
+                stop_own_worker(repo, args.container, task, process, docker_command)
                 raise RuntimeError(
                     f"{label} failed or timed out (returncode={rc}); see {label}.log"
                 )
             checked(
-                ["docker", "exec", args.container, "chmod", "-R", "a+rwX", str(root)],
+                [
+                    *docker_command,
+                    "exec",
+                    args.container,
+                    "chmod",
+                    "-R",
+                    "a+rwX",
+                    str(root),
+                ],
                 repo,
             )
             results = json.loads(Path(task["result"]).read_text(encoding="utf-8"))
