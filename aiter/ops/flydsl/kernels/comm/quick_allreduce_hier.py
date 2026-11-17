@@ -70,15 +70,20 @@ from .quick_allreduce_codec import (
 )
 from .quick_allreduce_epilogue import QuickReducePlainEpilogue
 from .transport import (
+    _CM_SC0,
+    _CM_SC1,
     _INBOX_POLICY,
+    _RECV_POLICY,
     ATOMS,
     FLAG_I32_PER_LANE,
     FLAG_LANES,
     QUAD_LANES,
     QUADS_PER_WAVE,
+    WAVE,
     _acquire_inbox,
     _buffer_load,
     _buffer_ptr,
+    _buffer_store,
     _color_io,
     _i32_to_bytes,
     _load_flag,
@@ -92,6 +97,59 @@ from .transport import (
 
 # The one 64 B handshake sector at the tail of every slot, in i32.
 _FLAG_SECTOR_I32 = 16
+
+# Cross-slot buffers, rotated by the colour. The flag exchange needs two (the
+# module docstring); the mover's pipelined schedule lets the partner run up to
+# three groups ahead of our read, so it needs four.
+_X_BUFFERS_FLAG = 2
+_X_BUFFERS_MOVER = 4
+
+# The mover's Lamport sentinel: every dword of an unwritten cross slot. The
+# inbox is filled with it (``inbox_fill``) and a reader re-arms what it read.
+X_SENTINEL_FILL_BYTE = 0xFF
+_X_SENTINEL = -1
+
+# Mover copy: 16 B per lane, this many loads in flight per lane.
+_MOVER_UNROLL = 8
+
+
+def _lamport_fix(codec, words, tid):
+    """*words* of one cross packet, with no dword equal to the sentinel.
+
+    The reader takes a dword as landed once it is not ``0xFFFFFFFF``, so the
+    producer must never write that value. Per plane:
+
+    * Scale: four signed E5M2 bytes of fp16 extrema, exponent field at most
+      28, so no byte is ``0xFF``. Never the sentinel.
+    * INT6 extra plane: the dword is one scale group (a lane pair). The group's
+      extremum maps to ``q <= 0``, code ``<= 32``, extra field ``<= 2``; all
+      sixteen fields 3 cannot happen.
+    * INT5 extra plane: the dword is two scale groups (a lane quartet), one bit
+      per value. All ones means both groups quantize to ``q = 0`` (every code
+      16), so the four threads' nibble words are 0. The quartet's leader moves
+      its value 0 from code 16 to 15 (``q = -1``): one step of a scale that is
+      0, or the INT5 floor ``2**-11`` when the extremum is below ``2**-16``.
+    * Nibble plane: all eight low nibbles 15 can happen. Flip bit 0, one code
+      step on value 0 of this thread.
+    * FP16 passthrough: two NaN halves ``0xFFFF``; becomes ``0x7FFF`` NaN.
+
+    Both partners decode the same fixed bytes, so the sums stay identical.
+    """
+    sentinel = fx.Int32(_X_SENTINEL)
+    if not codec.has_scale:
+        return tuple(
+            (w == sentinel).select(fx.Int32(0x7FFF7FFF), w) for w in words
+        )
+    nib = words[0]
+    rest = tuple(words[1:])
+    if codec.hi2_i32_off is not None and codec.hi_bits == 1:
+        hi = words[1]
+        hit = hi == sentinel
+        leader = (tid & fx.Int32(codec.hi_share - 1)) == fx.Int32(0)
+        nib = hit.select(leader.select(nib | fx.Int32(0xF), nib), nib)
+        rest = (hit.select(hi & fx.Int32(-2), hi),)
+    nib = (nib == sentinel).select(nib ^ fx.Int32(1), nib)
+    return (nib, *rest)
 
 
 def check_groups(groups, world_size: int) -> tuple[tuple[int, ...], ...]:
@@ -179,6 +237,8 @@ def make_quick_allreduce_hier_kernel(
     block: int,
     local_rs: str = "mesh",
     local_ag: str = "mesh",
+    x_mover: bool = False,
+    x_mover_wt: bool = True,
 ):
     """Build the hierarchical kernel for one *rank*.
 
@@ -187,6 +247,26 @@ def make_quick_allreduce_hier_kernel(
     all trace-time constants, so this is one binary per rank. *local_rs* and
     *local_ag* pick the schedule of the two local laps, ``"mesh"`` or
     ``"ring"``.
+
+    *x_mover* moves the cross exchange off the compute workgroups (PROTOTYPE).
+    The launch adds ``ceil(n_blocks / waves)`` mover workgroups after the
+    ``n_blocks`` compute ones; mover wave ``w`` serves compute block ``w``.
+
+    * The schedule is pipelined: a block runs lap 1 and 2 of group ``g``, then
+      lap 3 of group ``g - 1``. Lap 2 writes only our own cross slot, drains,
+      and colours a ready flag in it.
+    * The mover wave waits for that flag and copies the slot, verbatim, into
+      the partner's inbox. Its stores are outside the compute waves'
+      ``vmcnt`` and fences, so the exchange stays in flight under the next
+      group's laps. *x_mover_wt* stores them write-through (``sc0 sc1``);
+      otherwise ``nt`` and a release fence per slot.
+    * No flag goes with the data (a Lamport exchange): an unwritten slot holds
+      the sentinel in every dword (``_lamport_fix`` keeps the producer off
+      it), lap 3 polls the partner's packet until no dword is the sentinel,
+      and re-arms what it read, write-through.
+    * Four cross buffers (``_X_BUFFERS_MOVER``), and the colour wraps to 4.
+      Mover wave ``w`` keeps its own copy of block ``w``'s colour at
+      ``colors[grid + w]`` (``color_slots``).
     """
     groups = check_groups(groups, world_size)
     if not 0 <= int(rank) < world_size:
@@ -267,11 +347,16 @@ def make_quick_allreduce_hier_kernel(
     # on the ring one per hop, each written only by the ring predecessor.
     rs_n = G - 1 if rs_ring else G
     ag_n = G - 1 if ag_ring else G
-    # LOCAL_RS [grid][rs_n], CROSS [2 parity][grid][2 groups],
+    # LOCAL_RS [grid][rs_n], CROSS [x_buffers][grid][2 groups],
     # LOCAL_AG [grid][ag_n].
+    x_buffers = _X_BUFFERS_MOVER if x_mover else _X_BUFFERS_FLAG
+    # The colour skips 0 (unset); wrapping to the buffer count keeps
+    # ``color % x_buffers`` rotating through 0xFFFFFFFF.
+    color_wrap = x_buffers
+    waves = block // WAVE
     rs_base = 0
     x_base = rs_base + grid * rs_n * rs_slot
-    ag_base = x_base + 2 * grid * 2 * x_slot
+    ag_base = x_base + x_buffers * grid * 2 * x_slot
     inbox_i32 = ag_base + grid * ag_n * ag_slot
 
     lds_bytes = hier_lds_bytes(
@@ -358,10 +443,13 @@ def make_quick_allreduce_hier_kernel(
         def _ag_slot(idx, sub):
             return _local_slot(ag_base, ag_slot, ag_payload, ag_n, idx, sub)
 
-        def _x_slot(parity, grp, sub):
+        def _x_slot(parity, grp, sub, blk=None):
+            """*parity* is the buffer: ``color % x_buffers``. *blk* is the
+            compute block that owns the slot (the mover serves another one)."""
+            blk = bid if blk is None else blk
             return (
                 fx.Int32(x_base)
-                + ((parity * fx.Int32(grid) + bid) * fx.Int32(2) + fx.Int32(grp))
+                + ((parity * fx.Int32(grid) + blk) * fx.Int32(2) + fx.Int32(grp))
                 * fx.Int32(x_slot)
                 + sub * fx.Int32(x_payload)
             )
@@ -681,55 +769,122 @@ def make_quick_allreduce_hier_kernel(
                 else:
                     pass
 
-        n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
-        color = _load_color()
-        st_i = fx.Int32(super_tile)
-        for i in range(fx.Int32(0), n_block_tiles, st_i):
-            remain = n_block_tiles - i
-            n_this = (remain < st_i).select(remain, st_i)
-            parity = color & fx.Int32(1)
+        # ---- The mover schedule (x_mover); see the builder's docstring. ----
 
-            # Lap 1: local reduce-scatter.
-            if const_expr(rs_ring):
-                _rs_ring(i, n_this, color)
-            else:
-                _rs_mesh(i, n_this, color)
+        def _x_buf(color):
+            return color & fx.Int32(x_buffers - 1)
 
-            # Lap 2: our group's partial of our own chunk, sent to the partner
-            # and to our own cross slot.
+        def _next_color(color):
+            color = color + fx.Int32(1)
+            return (color == fx.Int32(0)).select(fx.Int32(color_wrap), color)
+
+        def _x_lap2_self(i, n_this, color):
+            """Lap 2 on the mover schedule: our group's partial of our own
+            chunk into our own cross slot only, then a drain and the ready
+            flag (in that slot's tail) that our mover wave waits for."""
+            buf = _x_buf(color)
             for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                 tile = bid + (i + s) * n_blocks
                 for k in range_constexpr(rank_atoms):
                     acc = _group_partial(tile, s, k)
                     words, scale, is_leader = _codec_quant(xc, acc, lane, tid)
+                    words = _lamport_fix(xc, words, tid)
                     _lds_write_packet(xc, fx.Int32(k), words, scale, is_leader)
                 gpu.barrier()
-                _store_rows(xc, partner_base, _x_slot(parity, my_group, s))
-                _store_rows(xc, self_base, _x_slot(parity, my_group, s))
+                _store_rows(xc, self_base, _x_slot(buf, my_group, s))
                 _next_subtile(s, n_this)
             _publish_one(
-                partner_base,
-                _x_slot(parity, my_group, fx.Int32(0)) + fx.Int32(x_release),
-                color,
-            )
-            _wait_one(
-                _x_slot(parity, 1 - my_group, fx.Int32(0)) + fx.Int32(x_release),
+                self_base,
+                _x_slot(buf, my_group, fx.Int32(0)) + fx.Int32(x_release),
                 color,
             )
 
-            # Lap 3: the final sum, group 0's packet first on both partners,
-            # quantized once. Our own chunk is decoded from the same packet
-            # and stored now. The packet goes to every local peer (mesh) or to
-            # the successor as the all-gather's first hop (ring).
+        def _any_sentinel(vec):
+            hit = fx.Int32(0)
+            for e in range_constexpr(vec.numel):
+                hit = hit | (vec[e] == fx.Int32(_X_SENTINEL)).select(
+                    fx.Int32(1), fx.Int32(0)
+                )
+            return hit != fx.Int32(0)
+
+        def _x_poll(buf, s):
+            """The partner's packets of sub-tile *s*, ``[(words, scale_word)]``
+            per rank-tile, once no dword this thread reads is the sentinel.
+
+            Every dword is re-read on each pass, together, as in the one-shot's
+            poll; the relaxed system-scope loads (``_load_flag``) go past L1
+            and L2 and keep the spin alive. Then the dwords are re-armed,
+            write-through (an ``nt`` store could sit dirty in our L2 and
+            overwrite the partner's next packet on eviction). A shared dword
+            (extra plane, scale) is read by lanes of one wave, which all leave
+            the spin before any of them re-arms; its owner re-arms it.
+            """
+            scale_owner = (tid % fx.Int32(GROUP)) == fx.Int32(0)
+            offs = []
+            for k in range_constexpr(rank_atoms):
+                base = _x_slot(buf, 1 - my_group, s) + fx.Int32(k * xc.rank_tile_i32)
+                for off, pred in xc.plane_slots(tid):
+                    offs.append((base + off, pred))
+                if const_expr(xc.has_scale):
+                    offs.append(
+                        (base + fx.Int32(xc.scale_i32_off) + scale_slot, scale_owner)
+                    )
+            addrs = [self_base + _i32_to_bytes(o) for o, _pred in offs]
+
+            def _load_all():
+                return fx.Vector.from_elements(
+                    [_load_flag(a) for a in addrs], fx.Int32
+                )
+
+            got = _load_all()
+            while _any_sentinel(got):
+                got = _load_all()
+            armed = fx.Vector.from_elements([fx.Int32(_X_SENTINEL)], fx.Int32)
+            for o, pred in offs:
+                if pred:
+                    _buffer_store(inbox, o, armed, _CM_SC0 | _CM_SC1)
+            per = xc.n_words_per_thread + (1 if xc.has_scale else 0)
+            out = []
+            for k in range_constexpr(rank_atoms):
+                words = tuple(
+                    got[k * per + w] for w in range_constexpr(xc.n_words_per_thread)
+                )
+                word = got[k * per + per - 1] if xc.has_scale else None
+                out.append((words, word))
+            return out
+
+        def _recv_own(c, base):
+            """A packet of our own, written by this block: read past L1/L2."""
+
+            def _get(off):
+                return _buffer_load(inbox, base + off, 1, fx.Int32, _RECV_POLICY)[0]
+
+            return _codec_load(c, _get, tid, scale_slot)
+
+        def _x_lap3(i, n_this, color):
+            """Lap 3 and the all-gather on the mover schedule: as the flag
+            schedule's, with the partner's packet polled (``_x_poll``)."""
+            buf = _x_buf(color)
             for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                 tile = bid + (i + s) * n_blocks
+                theirs = _x_poll(buf, s)
                 for k in range_constexpr(rank_atoms):
                     acc = None
                     for g in range_constexpr(2):
-                        words, scale = _recv(
-                            xc, _x_slot(parity, g, s) + fx.Int32(k * xc.rank_tile_i32)
+                        if const_expr(g == my_group):
+                            words, word = _recv_own(
+                                xc,
+                                _x_slot(buf, g, s) + fx.Int32(k * xc.rank_tile_i32),
+                            )
+                        else:
+                            words, word = theirs[k]
+                        acc = _codec_dequant(
+                            xc,
+                            words,
+                            _scale_from_word(xc, word, pair_in_slot),
+                            tid,
+                            acc,
                         )
-                        acc = _codec_dequant(xc, words, scale, tid, acc)
                     words, scale, is_leader = _codec_quant(ag, acc, lane, tid)
                     for j in range_constexpr(_local_rows(local_ag, G)):
                         _lds_write_packet(
@@ -753,14 +908,174 @@ def make_quick_allreduce_hier_kernel(
             else:
                 _ag_mesh(i, n_this, color)
 
-            color = color + fx.Int32(1)
-            # 0 is the unset sentinel. Wrap to 2, not 1, so that the parity
-            # keeps alternating and the cross slots stay double-buffered.
-            if color == fx.Int32(0):
-                color = fx.Int32(2)
-        if tid == 0:
-            _store_color(color)
-        gpu.barrier()
+        def _compute_pipelined():
+            """A compute block: laps 1-2 of group ``g``, then lap 3 of
+            ``g - 1``; the last group's lap 3 after the loop."""
+            n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
+            st_i = fx.Int32(super_tile)
+            color = _load_color()
+            pcolor = color
+            for i in range(fx.Int32(0), n_block_tiles, st_i):
+                remain = n_block_tiles - i
+                n_this = (remain < st_i).select(remain, st_i)
+                if const_expr(rs_ring):
+                    _rs_ring(i, n_this, color)
+                else:
+                    _rs_mesh(i, n_this, color)
+                _x_lap2_self(i, n_this, color)
+                if i > fx.Int32(0):
+                    # Every group before the last is a whole super-tile.
+                    _x_lap3(i - st_i, st_i, pcolor)
+                pcolor = color
+                color = _next_color(color)
+            last_i = ((n_block_tiles - fx.Int32(1)) // st_i) * st_i
+            _x_lap3(last_i, n_block_tiles - last_i, pcolor)
+            if tid == 0:
+                _store_color(color)
+            gpu.barrier()
+
+        def _mover():
+            """A mover block: wave ``w`` copies compute block ``w``'s cross
+            slot of every group to the partner, as each becomes ready."""
+            served = (bid - n_blocks) * fx.Int32(waves) + wave
+            if served < n_blocks:
+                n_block_tiles = (
+                    num_tiles - served + n_blocks - fx.Int32(1)
+                ) // n_blocks
+                st_i = fx.Int32(super_tile)
+                load_mc, store_mc = _color_io(colors_ptr, fx.Int32(grid) + served)
+                mcolor = load_mc()
+                partner_buf = _buffer_ptr(_to_sgpr_i64(partner_base), T.i32, 4)
+                step = WAVE * _MOVER_UNROLL
+                for i in range(fx.Int32(0), n_block_tiles, st_i):
+                    remain = n_block_tiles - i
+                    n_this = (remain < st_i).select(remain, st_i)
+                    src = _x_slot(_x_buf(mcolor), my_group, fx.Int32(0), served)
+                    if lane == fx.Int32(0):
+                        _spin(src + fx.Int32(x_release), mcolor)
+                    # The copy's loads go past L1/L2 (sc0 sc1) and issue after
+                    # the spin returns, so this is only a compiler barrier: a
+                    # system-scope acquire would invalidate the XCD's L2 under
+                    # the compute blocks.
+                    _acquire_inbox(rocdl.SyncScope.WorkgroupOneAs)
+                    n_vec = n_this * fx.Int32(x_payload // 4)
+                    last = n_vec - fx.Int32(1)
+                    for v0 in range(fx.Int32(0), n_vec, fx.Int32(step)):
+                        # A lane past the end copies the last vector again:
+                        # the same bytes to the same place, and no branch for
+                        # the compiler to sink a load into. Never past the end:
+                        # stale bytes there would read as landed later.
+                        offs = []
+                        for u in range_constexpr(_MOVER_UNROLL):
+                            x = v0 + lane + fx.Int32(u * WAVE)
+                            offs.append(src + (x < n_vec).select(x, last) * fx.Int32(4))
+                        data = [
+                            _buffer_load(inbox, o, 4, fx.Int32, _CM_SC0 | _CM_SC1)
+                            for o in offs
+                        ]
+                        for u in range_constexpr(_MOVER_UNROLL):
+                            if const_expr(x_mover_wt):
+                                _buffer_store(
+                                    partner_buf, offs[u], data[u], _CM_SC0 | _CM_SC1
+                                )
+                            else:
+                                _store_v4i32_peer(
+                                    partner_base + _i32_to_bytes(offs[u]),
+                                    data[u],
+                                    payload_policy,
+                                )
+                    if const_expr(not x_mover_wt and release_scope is not None):
+                        _release_inbox(release_scope)
+                    mcolor = _next_color(mcolor)
+                if lane == fx.Int32(0):
+                    store_mc(mcolor)
+
+        if const_expr(x_mover):
+            if bid < n_blocks:
+                _compute_pipelined()
+            else:
+                _mover()
+        else:
+            n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
+            color = _load_color()
+            st_i = fx.Int32(super_tile)
+            for i in range(fx.Int32(0), n_block_tiles, st_i):
+                remain = n_block_tiles - i
+                n_this = (remain < st_i).select(remain, st_i)
+                parity = color & fx.Int32(1)
+
+                # Lap 1: local reduce-scatter.
+                if const_expr(rs_ring):
+                    _rs_ring(i, n_this, color)
+                else:
+                    _rs_mesh(i, n_this, color)
+
+                # Lap 2: our group's partial of our own chunk, sent to the partner
+                # and to our own cross slot.
+                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                    tile = bid + (i + s) * n_blocks
+                    for k in range_constexpr(rank_atoms):
+                        acc = _group_partial(tile, s, k)
+                        words, scale, is_leader = _codec_quant(xc, acc, lane, tid)
+                        _lds_write_packet(xc, fx.Int32(k), words, scale, is_leader)
+                    gpu.barrier()
+                    _store_rows(xc, partner_base, _x_slot(parity, my_group, s))
+                    _store_rows(xc, self_base, _x_slot(parity, my_group, s))
+                    _next_subtile(s, n_this)
+                _publish_one(
+                    partner_base,
+                    _x_slot(parity, my_group, fx.Int32(0)) + fx.Int32(x_release),
+                    color,
+                )
+                _wait_one(
+                    _x_slot(parity, 1 - my_group, fx.Int32(0)) + fx.Int32(x_release),
+                    color,
+                )
+
+                # Lap 3: the final sum, group 0's packet first on both partners,
+                # quantized once. Our own chunk is decoded from the same packet
+                # and stored now. The packet goes to every local peer (mesh) or to
+                # the successor as the all-gather's first hop (ring).
+                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                    tile = bid + (i + s) * n_blocks
+                    for k in range_constexpr(rank_atoms):
+                        acc = None
+                        for g in range_constexpr(2):
+                            words, scale = _recv(
+                                xc, _x_slot(parity, g, s) + fx.Int32(k * xc.rank_tile_i32)
+                            )
+                            acc = _codec_dequant(xc, words, scale, tid, acc)
+                        words, scale, is_leader = _codec_quant(ag, acc, lane, tid)
+                        for j in range_constexpr(_local_rows(local_ag, G)):
+                            _lds_write_packet(
+                                ag, fx.Int32(j * rank_atoms + k), words, scale, is_leader
+                            )
+                        _stash_own(
+                            tile,
+                            li * rank_atoms + k,
+                            _codec_dequant(
+                                ag, words, _scale_from_word(ag, scale, pair_in_slot), tid
+                            ),
+                        )
+                    gpu.barrier()
+                    if const_expr(ag_ring):
+                        _store_rows(ag, next_base, _ag_slot(fx.Int32(0), s))
+                    else:
+                        _fanout_local(ag, _ag_slot(fx.Int32(li), s))
+                    _next_subtile(s, n_this)
+                if const_expr(ag_ring):
+                    _ag_ring(i, n_this, color)
+                else:
+                    _ag_mesh(i, n_this, color)
+
+                color = color + fx.Int32(1)
+                # 0 is the unset sentinel. Wrap to 2, not 1, so that the parity
+                # keeps alternating and the cross slots stay double-buffered.
+                if color == fx.Int32(0):
+                    color = fx.Int32(2)
+            if tid == 0:
+                _store_color(color)
+            gpu.barrier()
 
     flat_wg = f"{block},{block}"
 
@@ -787,7 +1102,14 @@ def make_quick_allreduce_hier_kernel(
             grid_x,
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
         ).launch(
-            grid=(grid_x, 1, 1),
+            # The mover blocks follow the compute blocks, one wave per block.
+            grid=(
+                (grid_x + (grid_x + fx.Int32(waves - 1)) // fx.Int32(waves))
+                if x_mover
+                else grid_x,
+                1,
+                1,
+            ),
             block=(block, 1, 1),
             stream=stream,
         )
@@ -798,6 +1120,7 @@ def make_quick_allreduce_hier_kernel(
         f"{SCALE_CODEC_TAG}_ws{world_size}_g{gtag}_r{self_rank}_st{super_tile}"
         f"_g{grid}_{inbox_memory}_{rs_codec}_{x_codec}_{ag_codec}_b{block}"
         f"_{local_rs}_{local_ag}"
+        + (f"_xm{'wt' if x_mover_wt else 'nt'}" if x_mover else "")
     )
     launch_quick_allreduce_hier.func.__name__ = f"launch_quick_allreduce_hier_{tag}"
     try:
@@ -832,5 +1155,11 @@ def make_quick_allreduce_hier_kernel(
         "grid": grid,
         "block": block,
         "rank": self_rank,
+        "x_mover": bool(x_mover),
+        # Mover blocks launched per compute block (see the launch).
+        "mover_waves": waves if x_mover else 0,
+        # colors[grid + w]: mover wave w's copy of block w's colour.
+        "color_slots": 2 if x_mover else 1,
+        **({"inbox_fill": X_SENTINEL_FILL_BYTE} if x_mover else {}),
         **epilogue.spec(),
     }

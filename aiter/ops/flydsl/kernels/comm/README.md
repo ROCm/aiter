@@ -12,7 +12,7 @@ node.
 | `one_shot_allreduce_rmsnorm.py` | The one-shot's residual-add + RMSNorm epilogue, its row geometry (`fused_*`) and the split-row exchange. |
 | `quick_allreduce_mesh.py` | The quantized two-shot **mesh** kernel. |
 | `quick_allreduce_ring.py` | The quantized two-shot **ring** kernel. |
-| `quick_allreduce_hier.py` | The quantized **hierarchical** kernel, for ranks that split into two groups (the CPU sockets of a PCIe host): a mesh reduce-scatter in each group, an exchange between partner ranks, a mesh all-gather. |
+| `quick_allreduce_hier.py` | The quantized **hierarchical** kernel, for ranks that split into two groups (the CPU sockets of a PCIe host): a reduce-scatter in each group, an exchange between partner ranks, an all-gather in each group. Each local lap runs the mesh or the ring. |
 | `quick_allreduce_epilogue.py` | The plain epilogue of the mesh and the ring, and the hooks every mesh or ring epilogue implements. |
 | `quick_allreduce_rmsnorm.py` | The residual-add + RMSNorm epilogues of the mesh and the ring. |
 | `quick_allreduce_codec.py` | The INT4, INT5, INT6 and FP16 wire codecs. The mesh and the ring use them. |
@@ -45,7 +45,7 @@ The dispatchers are in `aiter/dist/device_communicators/`:
 | One-shot | 1 | `(N-1)*S` | Exact: fp32 accumulate, one bf16 rounding | Small payloads (decode) |
 | Mesh | 2 | `2(N-1)/N*S` | INT4, INT5, INT6 or FP16 on the wire | Medium and large payloads |
 | Ring | `2(N-1)` | `2(N-1)/N*S` | INT4, INT6 or FP16 on the wire, per lap | Large payloads, mostly on PCIe |
-| Hierarchical | 3 | `2(G-1)/G*S` inside the group, `S/G` to the partner | INT4, INT5, INT6 or FP16 on the wire, per lap | Medium payloads on a two-socket PCIe host |
+| Hierarchical | 3 (mesh laps) to `2G-1` (ring laps) | `2(G-1)/G*S` inside the group, `S/G` to the partner | INT4, INT5, INT6 or FP16 on the wire, per lap | Medium and large payloads on a two-socket PCIe host |
 
 ### One-shot
 
@@ -72,14 +72,32 @@ This is better on PCIe, where each GPU has one shared x16 uplink.
 
 For hosts whose GPUs split into two uniform groups of `G`, such as the two CPU
 sockets of the MI350P host (GPUs 0-3 and 4-7). Ranks at the same position in
-the two groups are partners. Three laps: a mesh reduce-scatter inside each
-group, an exchange of each rank's partial sum with its partner, and a mesh
-all-gather inside each group. Only the exchange crosses the groups, on `G`
-concurrent pair streams; the mesh pushes to every remote peer, and the ring
-sends all of its bytes over one crossing stream. Every value is quantized
-three times, once per lap. The default codecs are INT4, INT6 for the
+the two groups are partners. Three laps: a reduce-scatter inside each group,
+an exchange of each rank's partial sum with its partner, and an all-gather
+inside each group. Only the exchange crosses the groups, on `G` concurrent
+pair streams; the mesh pushes to every remote peer, and the ring sends all of
+its bytes over one crossing stream. The default codecs are INT4, INT6 for the
 exchange, and INT4: INT4 on the exchange too costs about 1.8 dB, which puts it
 under the mesh.
+
+Each local lap runs one of two schedules inside the group, picked per rung of
+`HIER_ST_LADDER` (`HierRung.local_rs`, `HierRung.local_ag`), or pinned with
+`FlyQuickAllReduce(local_rs=..., local_ag=...)`:
+
+* `mesh`: one hop to all `G-1` other ranks of the group.
+* `ring`: `G-1` hops to the next rank of the group, each one contiguous run
+  into one inbox. The reduce-scatter quantizes the running partial sum again
+  at each hop, so a ring reduce-scatter left to its default codec runs INT6,
+  as a TP`G` ring does. The all-gather forwards the bytes it received.
+
+On the MI350P (PCIe TP8) every rung is held to the TP8 mesh's accuracy
+(19.1 dB), the lowest a TP8 payload runs at, and takes the smallest codecs
+that reach it, on normal, outlier-channel and rank-skewed inputs alike. Up to
+24 MiB both local laps run the mesh at INT4 with an INT6 exchange (19.2 dB).
+From 24 MiB both run the ring at ST 32, with INT5 on the reduce-scatter and the
+exchange and INT4 on the all-gather (19.5 dB). That is 1.09-1.23x faster than
+the TP8 ring up to 224 MiB, so on a host that splits `hier` takes every
+quantized payload and the ring does not run.
 
 Each rank also writes its own exchange packet into its own inbox, so both
 partners add the same two packets in the same order and every rank ends with
@@ -166,8 +184,10 @@ levels:
    for each arch, link type and world size. A policy has one payload-size
    window for each algorithm (`AllReduceAlgorithm`): `oneshot`, `mesh`,
    `ring` and `hier`. The `hier` window applies only on a host that splits
-   (`FamilyPolicy.with_topology`); there it comes first and drops the mesh,
-   which is only the fallback for a host that does not split. A window includes its minimum and excludes its maximum, and a
+   (`FamilyPolicy.with_topology`); there it comes first, drops the mesh,
+   which is only the fallback for a host that does not split, and moves the
+   start of the ring's window to its own end (on PCIe TP8 `hier` is
+   unbounded, so the ring does not run there). A window includes its minimum and excludes its maximum, and a
    maximum of `None` means no upper limit. A missing or empty window disables
    the algorithm. A payload that is in no window goes to `cross_device_reduce`
    or RCCL. `FamilyPolicy.select()` gives the algorithm for a payload size.
