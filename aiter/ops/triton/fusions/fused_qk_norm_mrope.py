@@ -5,7 +5,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_qk_norm_mrope import 
     HEAD_DIM,
     ROPE_HALF,
     fused_qk_norm_mrope_gfx1250,
-    fused_qk_norm_mrope_k4v8_gfx1250,
+    fused_qk_norm_mrope_block16_kv_fp4_gfx1250,
     fused_qk_norm_mrope_tdm_gfx1250,
     get_fused_qk_norm_mrope_layouts,
 )
@@ -21,14 +21,22 @@ _LOGGER = AiterTritonLogger()
 # One config per op: the cache write keeps the row kernel faster up to a larger row count.
 _CONFIG_NAME = "FUSED_QK_NORM_MROPE"
 _CACHE_CONFIG_NAME = "FUSED_QK_NORM_MROPE_CACHE"
-# A8K4V8: from this many tokens on, fused_qk_norm_mrope_k4v8_gfx1250 (K, Q and V in separate CTAs, whole
+# A8K4V8: from this many tokens on, fused_qk_norm_mrope_block16_kv_fp4_gfx1250 (K, Q and V in separate CTAs, whole
 # 16-token K tiles written with TDM stores) runs the whole call; below it (and for decode) the row kernel.
 _K4V8_PAGE_MIN_TOKENS = 4096
-# fused_qk_norm_mrope_k4v8_gfx1250's launch: warps (one launch, so shared by the K / Q / V sections), Q heads a Q
+# fused_qk_norm_mrope_block16_kv_fp4_gfx1250's launch: warps (one launch, so shared by the K / Q / V sections), Q heads a Q
 # CTA (QH_PER), tokens a Q / V CTA (BLOCK_M_Q / _V; a K CTA is one 16-row NVFP4 tile). From the sweep of num_warps
 # {4, 8, 16} x BLOCK_M_Q / BLOCK_M_V {16, 32, 64, 128} on Qwen3.5 EP4 (16 / 2 heads) and TP4 (4 / 1), pages 64 and
 # 128: 16 warps (one row a wave), except TP4 prefills of 8192+ tokens: 8 warps.
 _K4V8_CONFIG = None  # tests / sweeps: a fixed launch config instead of the selection
+# A8K4V4PT with the fp4pt V fused (fused_qk_norm_mrope_cache_k4v4pt with v / v_cache): from this many tokens
+# on the K / Q / V kernel (V in 16-token windows, full tiles TDM-stored when _K4V4PT_V_TDM), below it the row
+# kernel (one token a V row). Picked with the 2026-11-16 microbench (CUDA-graph GPU time, Qwen 16/2 and 4/1 heads,
+# decode- and prefill-like slots; k4v4pt_writer/RESULTS.md): the row kernel wins up to 1024 tokens, the K / Q / V
+# kernel from 2048 on. The full-tile TDM store measured no faster than the masked row stores (equal within ~2%), so
+# it is off by default; it is tested bit-exact either way.
+_K4V4PT_PAGE_MIN_TOKENS = 2048
+_K4V4PT_V_TDM = False
 
 
 def _k4v8_config(num_tokens: int, q_heads: int) -> dict:
@@ -70,6 +78,8 @@ def _launch(
     slot_mapping,
     cache,
     kv_scale=None,
+    v_store=True,
+    v_fp4pt=False,
 ):
     assert arch_info.get_arch() == "gfx1250"
     num_tokens = q.shape[0]
@@ -88,6 +98,12 @@ def _launch(
     # A8K4V8: uint8 NVFP4 K, fp8 V; Q goes out in V's fp8
     k_nvfp4 = cache and k_cache.dtype == torch.uint8
     cache_dtype = v_cache.dtype if k_nvfp4 else k_cache.dtype
+    if v_fp4pt:
+        # A8K4V4PT: Q goes out in fp8 (the V cache is the uint8 fp4pt page)
+        from aiter.ops.triton.utils.types import e4m3_dtype
+
+        assert k_nvfp4 and not v_store and fp8
+        cache_dtype = e4m3_dtype
     q_out = torch.empty(
         (num_tokens, q.shape[1]),
         dtype=cache_dtype if fp8 else q.dtype,
@@ -106,16 +122,20 @@ def _launch(
         fp8,
     )
 
-    if k_nvfp4 and 0 < _K4V8_PAGE_MIN_TOKENS <= num_tokens:
+    min_tokens = _K4V4PT_PAGE_MIN_TOKENS if v_fp4pt else _K4V8_PAGE_MIN_TOKENS
+    if k_nvfp4 and 0 < min_tokens <= num_tokens:
         page_block = k_cache.shape[2]
         cfg = _k4v8_config(num_tokens, q_heads)
         qh_per, bm_q, bm_v = cfg["QH_PER"], cfg["BLOCK_M_Q"], cfg["BLOCK_M_V"]
         grid = (
             triton.cdiv(num_tokens, 16)
             + (q_heads // qh_per) * triton.cdiv(num_tokens, bm_q)
-            + k_heads * triton.cdiv(num_tokens, bm_v),
+            # fp8 V CTAs (none for A8K4V4PT, v_store False: its fp4pt V CTAs are below)
+            + (k_heads * triton.cdiv(num_tokens, bm_v) if v_store else 0)
+            # A8K4V4PT fused V: one CTA per V head and 16-token window
+            + (k_heads * triton.cdiv(num_tokens, 16) if v_fp4pt else 0),
         )
-        fused_qk_norm_mrope_k4v8_gfx1250[grid](
+        fused_qk_norm_mrope_block16_kv_fp4_gfx1250[grid](
             q,
             k,
             v,
@@ -149,6 +169,7 @@ def _launch(
             QH_PER=qh_per,
             BLOCK_M_Q=bm_q,
             BLOCK_M_V=bm_v,
+            **({"V_FP4PT": True, "V_TDM": _K4V4PT_V_TDM} if v_fp4pt else {}),
             num_warps=cfg["num_warps"],
         )
         return q_out, k_out
@@ -173,6 +194,12 @@ def _launch(
             "K_NVFP4": k_nvfp4,
             "SCALE_PRESHUFFLE": min(128, k_cache.shape[2]) if k_nvfp4 else 128,
         }
+        if not v_store:
+            # only A8K4V4PT, whose fp4pt V the V_FP4PT path writes
+            assert k_nvfp4 and v_fp4pt
+            fp8_kwargs["V_STORE"] = False
+        if v_fp4pt:
+            fp8_kwargs["V_FP4PT"] = True
     kernel[(triton.cdiv(num, block_m),)](
         *args,
         num,
@@ -293,7 +320,7 @@ def fused_qk_norm_mrope_cache(
     (16, 16)-byte tiles, then the e4m3 per-16 scales preshuffled in min(128, block)-row groups), v_cache fp8
     as above (x = 16), kv_scale required; block 64, 128 or a multiple of 128. K is quantized without a scale
     (k_descale = 1), V as for an fp8 cache, Q returned in fp8. Written by the row kernel, or from
-    _K4V8_PAGE_MIN_TOKENS tokens on by fused_qk_norm_mrope_k4v8_gfx1250 (the same bytes).
+    _K4V8_PAGE_MIN_TOKENS tokens on by fused_qk_norm_mrope_block16_kv_fp4_gfx1250 (the same bytes).
     """
     if k_cache.dtype == torch.uint8:
         # A8K4V8: NVFP4 K [blocks, Hk, block, 256 // 2 + 256 // 16] (e2m1 bytes in (16, 16) tiles, then
@@ -338,4 +365,39 @@ def fused_qk_norm_mrope_cache(
         slot_mapping,
         True,
         kv_scale,
+    )
+
+
+def fused_qk_norm_mrope_cache_k4v4pt(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    positions: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    mrope_section: list[int],
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_scale: float,
+    v: torch.Tensor,
+    v_cache: torch.Tensor,
+):
+    """A8K4V4PT cache write: Q out in fp8, the NVFP4 K into k_cache (byte-identical to the A8K4V8 call) and the fp4pt
+    V into v_cache (bit-exact with fp4pt_quant_v_cache). k_cache uint8 [blocks, Hk, block, 256 // 2 + 256 // 16];
+    v [T, Hk * 256]; v_cache the fp4pt V cache, [blocks, Hk, 128, 256 // 2 + 4] float4_e2m1fn_x2 or uint8."""
+    assert k_cache.dtype == torch.uint8 and k_cache.dim() == 4 and k_cache.is_contiguous()
+    num_blocks, k_heads, block, k_row = k_cache.shape
+    assert k_row == HEAD_DIM.value // 2 + HEAD_DIM.value // 16, k_cache.shape
+    assert block >= 64 and (block <= 128 or block % 128 == 0), block
+    assert kv_scale is not None and kv_scale > 0 and slot_mapping.dim() == 1
+    assert k.stride(1) == 1
+    vc = v_cache.view(torch.uint8)
+    assert vc.shape == (num_blocks, k_heads, block, HEAD_DIM.value // 2 + 4), vc.shape
+    assert vc.is_contiguous() and block == 128
+    assert v.shape == k.shape and v.stride(1) == 1 and v.stride(0) % 8 == 0
+    return _launch(
+        q, k, v, q_weight, k_weight, eps, positions, cos, sin, mrope_section,
+        k_cache, vc, slot_mapping, True, kv_scale, v_store=False, v_fp4pt=True,
     )
