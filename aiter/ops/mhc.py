@@ -1050,6 +1050,152 @@ def _mhc_fused_post_pre_gluon(
     )
 
 
+@compile_ops("module_mhc", develop=True)
+def mhc_post_project_gfx950(
+    projection: Tensor,
+    sq: Tensor,
+    next_residual: Tensor,
+    x: Tensor,
+    residual: Tensor,
+    packed_fn: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+) -> None: ...
+
+
+@compile_ops("module_mhc", develop=True)
+def mhc_finalize_gfx950(
+    post: Tensor,
+    comb: Tensor,
+    out: Tensor,
+    projection: Tensor,
+    sq: Tensor,
+    scale: Tensor,
+    base: Tensor,
+    residual: Tensor,
+    weight: Tensor,
+    rms_eps: float,
+    pre_eps: float,
+    sink_eps: float,
+    norm_eps: float,
+    post_mult: float,
+    repeats: int,
+) -> None: ...
+
+
+# Row counts of the gfx950 two-kernel prefill route (hidden size 7168, fused
+# RMSNorm). Below 4096 rows the fused GEMM path of mhc_fused_post_pre is as fast;
+# 16384 is the largest row count the route is validated for.
+MHC_GFX950_PREFILL_M_MIN = 4096
+MHC_GFX950_PREFILL_M_MAX = 16384
+
+
+def _mhc_post_pre_gfx950_supported(
+    layer_input: Tensor,
+    residual: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    fn: Tensor,
+    scale: Tensor,
+    base: Tensor,
+    norm_weight: Tensor | None,
+    w_preshuffle_bf16: bool = False,
+) -> bool:
+    # The row count comes first, as in the caller.
+    m = layer_input.shape[0]
+    if not (
+        w_preshuffle_bf16 and MHC_GFX950_PREFILL_M_MIN <= m <= MHC_GFX950_PREFILL_M_MAX
+    ):
+        return False
+    # Fixed launch tuning is qualified only for an unmasked 256-CU device.
+    if (
+        norm_weight is None
+        or get_cu_num() != 256
+        or any(
+            os.environ.get(name) is not None
+            for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+        )
+    ):
+        return False
+    # Other shapes, dtypes and views keep the existing dispatch.
+    expected = (
+        (layer_input, (m, 7168), torch.bfloat16),
+        (residual, (m, 4, 7168), torch.bfloat16),
+        (post_mix, (m, 4, 1) if post_mix.ndim == 3 else (m, 4), torch.float32),
+        (comb_mix, (m, 4, 4), torch.float32),
+        (fn, (24, 28672), torch.int32),
+        (scale, (3,), torch.float32),
+        (base, (24,), torch.float32),
+        (norm_weight, (7168,), torch.bfloat16),
+    )
+    device = layer_input.device
+    return device.type == "cuda" and all(
+        tensor.device == device
+        and tensor.shape == shape
+        and tensor.dtype == dtype
+        and tensor.is_contiguous()
+        and tensor.data_ptr() % 16 == 0
+        for tensor, shape, dtype in expected
+    )
+
+
+def _mhc_post_pre_gfx950(
+    layer_input: Tensor,
+    residual: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    fn: Tensor,
+    scale: Tensor,
+    base: Tensor,
+    rms_eps: float,
+    pre_eps: float,
+    sink_eps: float,
+    post_mult: float,
+    repeats: int,
+    norm_weight: Tensor,
+    norm_eps: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    m = layer_input.shape[0]
+    splits = 4
+    device = layer_input.device
+    projection_pad = torch.empty((splits, m, 32), dtype=torch.float32, device=device)
+    sq = torch.empty((splits, m), dtype=torch.float32, device=device)
+    next_residual = torch.empty_like(residual)
+    # Consume the caller's explicit mhc_shuffle_fn layout on every call.
+    mhc_post_project_gfx950(
+        projection_pad,
+        sq,
+        next_residual,
+        layer_input,
+        residual,
+        fn,
+        post_mix.reshape(m, 4),
+        comb_mix,
+    )
+    # The finalizer's outputs are allocated while the producer runs.
+    post = torch.empty((m, 4, 1), dtype=torch.float32, device=device)
+    comb = torch.empty((m, 4, 4), dtype=torch.float32, device=device)
+    out = torch.empty_like(layer_input)
+    mhc_finalize_gfx950(
+        post,
+        comb,
+        out,
+        projection_pad,
+        sq,
+        scale,
+        base,
+        next_residual,
+        norm_weight,
+        rms_eps,
+        pre_eps,
+        sink_eps,
+        norm_eps,
+        post_mult,
+        repeats,
+    )
+    return post, comb, out, next_residual
+
+
 def _mhc_fused_prefill_gfx950(
     layer_input: torch.Tensor,
     residual_in: torch.Tensor,
@@ -1142,6 +1288,15 @@ def mhc_fused_post_pre(
     ``w_preshuffle_bf16=True, res_preshuffle=False``.
 
     Both flags are boolean, default to False, and are controlled independently.
+
+    On unmasked 256-CU gfx950 devices, BF16 plain-layout prefill calls with
+    hidden size 7168, four residual streams, RMSNorm, explicit
+    w_preshuffle_bf16=True and fn from mhc_shuffle_fn fuse post with projection
+    and finalize whole rows. This applies when M is between
+    ``MHC_GFX950_PREFILL_M_MIN`` and ``MHC_GFX950_PREFILL_M_MAX``. Other row
+    counts, default FP32 projection and explicit force_fused requests keep the
+    other paths. Unsupported tensor layouts and dtypes keep the existing
+    implementation.
 
     A shuffled residual (gfx1250, 0 < m < the fused bound) of a hidden size in
     ``MHC_GLUON_POST_PRE_HIDDEN_SIZES`` runs the gfx1250 Gluon kernels
@@ -1327,6 +1482,45 @@ def _mhc_fused_post_pre_native(
     _check_mhc_res_preshuffle_arch(res_preshuffle, arch)
     res_preshuffle = res_preshuffle and mhc_res_shuffle_enabled(m, arch)
     fused_m_upper_bound = MHC_FUSED_POST_PRE_M_UPPER_BOUND.get(arch, 1024)
+
+    # The row test comes first: decode and FP32 calls leave after one or two
+    # comparisons.
+    if (
+        w_preshuffle_bf16
+        and MHC_GFX950_PREFILL_M_MIN <= m <= MHC_GFX950_PREFILL_M_MAX
+        and arch == "gfx950"
+        and backend in (None, "hip")
+        and not force_fused
+        and not res_preshuffle
+        and sinkhorn_repeat > 0
+        and _mhc_post_pre_gfx950_supported(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            w_preshuffle_bf16,
+        )
+    ):
+        return _mhc_post_pre_gfx950(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
+        )
 
     # At the shared bound the input is already in ordinary layout.
     if (
