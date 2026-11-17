@@ -2415,11 +2415,20 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
 
 
-def _prefill_2d_run(seq_lens, key_bump=None, long_max_seqlen_k=False, num_blocks=8192):
-    """Run unified_attention (gluon, shuffled KV, page 64, 16 / 2 heads, head 64, full
-    causal attention) and return (2D kernel launches, output, reference).
+def _prefill_2d_run(
+    seq_lens,
+    key_bump=None,
+    long_max_seqlen_k=False,
+    num_blocks=8192,
+    sliding_window=None,
+    attn_2d_config=None,
+):
+    """Run unified_attention (gluon, shuffled KV, page 64, 16 / 2 heads, head 64, causal
+    attention, full or with a sliding window) and return (2D kernel launches, output,
+    reference).
     key_bump = (start, stop, amplitude): keys of sequence 0 at positions [start, stop)
-    and every query get a shared direction, so those keys score far above the others."""
+    and every query get a shared direction, so those keys score far above the others.
+    attn_2d_config: entries that replace the attn_2d table's config."""
     from aiter.ops.triton.attention import unified_attention as ua_mod
 
     (
@@ -2444,6 +2453,7 @@ def _prefill_2d_run(seq_lens, key_bump=None, long_max_seqlen_k=False, num_blocks
         block_size=64,
         head_size=64,
         num_heads=(16, 2),
+        sliding_window=sliding_window,
         shuffled_kv_cache=False,
         device="cuda",
     )
@@ -2475,7 +2485,16 @@ def _prefill_2d_run(seq_lens, key_bump=None, long_max_seqlen_k=False, num_blocks
             {k: kwargs.get(k) for k in ("LOOP_VARIANT", "NUM_SPLITS", "q_block_offset")}
         )
 
+    table_config = ua_mod.get_unified_attention_config
+
+    def forced_config(op, params, backend="triton", arch=None):
+        config = table_config(op, params, backend=backend, arch=arch)
+        if op == "attn_2d" and attn_2d_config is not None:
+            config.update(attn_2d_config)
+        return config
+
     kernel_2d.add_pre_run_hook(hook)
+    ua_mod.get_unified_attention_config = forced_config
     try:
         unified_attention(
             q=query,
@@ -2499,6 +2518,7 @@ def _prefill_2d_run(seq_lens, key_bump=None, long_max_seqlen_k=False, num_blocks
             backend="gluon",
         )
     finally:
+        ua_mod.get_unified_attention_config = table_config
         kernel_2d.pre_run_hooks.remove(hook)
     ref_output = ref_paged_attn(
         query=query,
@@ -2509,6 +2529,7 @@ def _prefill_2d_run(seq_lens, key_bump=None, long_max_seqlen_k=False, num_blocks
         block_tables=block_tables,
         scale=scale,
         out_dtype=torch.bfloat16,
+        sliding_window=sliding_window,
     )
     return launched, output, ref_output
 
@@ -2567,4 +2588,43 @@ def test_gluon_unified_attn_2d_tail_split(multi_seq):
     assert not torch.isnan(output).any()
     torch.testing.assert_close(
         output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
+    )
+
+
+@pytest.mark.parametrize(
+    "loop_variant, block_m, num_buffers",
+    [(0, 64, 2), (0, 128, 2), (2, 64, 2), (2, 128, 2), (2, 128, 3), (None, 128, 2)],
+)
+@pytest.mark.parametrize("sliding_window", [64, 100, 256, 2048])
+@torch.inference_mode()
+def test_gluon_unified_attn_2d_sliding_window_loop_variants(
+    loop_variant, block_m, num_buffers, sliding_window
+):
+    """gfx1250 Gluon 2D kernel with a sliding window on loop variants 0 and 2. Only the
+    key tiles that cut through a row's window start get the window mask. The cases cover
+    windows shorter than 3 tiles or not aligned to the tile, query blocks whose rows start
+    their window in different tiles, and chunked prefill. loop_variant None keeps the
+    attn_2d table entry, which runs loop variant 2 for this shape (head 64, GQA group 8,
+    page 64, bf16)."""
+    if DEVICE_ARCH != "gfx1250" or not _is_gluon_available():
+        pytest.skip("gfx1250 Gluon only")
+    config = None
+    if loop_variant is not None:
+        config = {
+            "BLOCK_M": block_m,
+            "num_warps": 4,
+            "waves_per_eu": 2,
+            "LOOP_VARIANT": loop_variant,
+            "NUM_BUFFERS": num_buffers,
+        }
+    seq_lens = [(1024, 1024), (700, 1500), (333, 3000), (257, 900), (77, 4100)]
+    launched, output, ref_output = _prefill_2d_run(
+        seq_lens, sliding_window=sliding_window, attn_2d_config=config
+    )
+    assert [x["LOOP_VARIANT"] for x in launched] == [
+        2 if loop_variant is None else loop_variant
+    ]
+    assert not torch.isnan(output).any()
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=2e-2, rtol=1e-2
     )

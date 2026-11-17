@@ -1238,6 +1238,7 @@ class AttentionProgram:
     tile_start: gl.tensor
     tile_end: gl.tensor
     safe_tile_end: gl.tensor
+    window_mask_tile_end: gl.tensor
     query_mask_qk: gl.tensor
     context_len_q_pos_qk: gl.tensor
     QK_scale: gl.tensor
@@ -1254,6 +1255,7 @@ class AttentionProgram:
         tile_start,
         tile_end,
         safe_tile_end,
+        window_mask_tile_end,
         query_mask_qk,
         context_len_q_pos_qk,
         QK_scale,
@@ -1269,6 +1271,7 @@ class AttentionProgram:
         self.tile_start = tile_start
         self.tile_end = tile_end
         self.safe_tile_end = safe_tile_end
+        self.window_mask_tile_end = window_mask_tile_end
         self.query_mask_qk = query_mask_qk
         self.context_len_q_pos_qk = context_len_q_pos_qk
         self.QK_scale = QK_scale
@@ -1302,6 +1305,8 @@ class AttentionProgram:
         num_tiles = (max_seq_prefix_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
         tile_start = 0
         tile_end = num_tiles
+        # tiles below window_mask_tile_end cut through the window start of some row of the block
+        window_mask_tile_end = 0
         if cfg.CAUSAL:
             if cfg.SLIDING_WINDOW > 0:
                 qpos_lo = q_block_local_idx * cfg.BLOCK_Q
@@ -1315,6 +1320,12 @@ class AttentionProgram:
                 tile_end = gl.minimum(
                     (last_allowed_key // cfg.TILE_SIZE) + 1, num_tiles
                 )
+                last_first_allowed_key = gl.maximum(
+                    context_len + qpos_hi - cfg.SLIDING_WINDOW + 1, 0
+                )
+                window_mask_tile_end = (
+                    last_first_allowed_key + cfg.TILE_SIZE - 1
+                ) // cfg.TILE_SIZE
 
             query_pos_qk = gl.convert_layout(
                 query_pos, gl.SliceLayout(1, cfg.qk_layout)
@@ -1383,6 +1394,7 @@ class AttentionProgram:
             tile_start,
             tile_end,
             safe_tile_end,
+            window_mask_tile_end,
             query_mask_qk,
             context_len_q_pos_qk,
             QK_scale,
@@ -1824,6 +1836,16 @@ class AttentionProgram:
         return S
 
     @gluon.jit
+    def apply_window_mask_qk_subtiles(self, qk0, qk1, j):
+        # Sliding window: only the tiles that cut through a row's window start need the window mask; the tiles
+        # before the causal diagonal are mask-free otherwise.
+        if self.cfg.SLIDING_WINDOW > 0:  # noqa: SIM102
+            if j < self.window_mask_tile_end:
+                qk0 = self.apply_mask_qk_subtile(qk0, j, 0)
+                qk1 = self.apply_mask_qk_subtile(qk1, j, 1)
+        return qk0, qk1
+
+    @gluon.jit
     def split_subtile(self, x):
         """Contiguous register split along the last dim: [A, B] -> two [A, B//2].
 
@@ -2252,6 +2274,7 @@ def attention_loop_tensor_subtile_split(
     if cfg.CAUSAL and pgm.tile_start >= pgm.safe_tile_end:
         qk0 = pgm.apply_mask_qk_subtile(qk0, pgm.tile_start, 0)
         qk1 = pgm.apply_mask_qk_subtile(qk1, pgm.tile_start, 1)
+    qk0, qk1 = pgm.apply_window_mask_qk_subtiles(qk0, qk1, pgm.tile_start)
 
     # FP8: qk_layout (K from HEAD_SIZE) and pv_layout (K from TILE_SIZE) can carry
     # different WMMA instr_shape K dims. Relabel QK to pv_layout (trivial no-op)
@@ -2262,7 +2285,12 @@ def attention_loop_tensor_subtile_split(
     if FIXED_MAX and PEEK_RECENT:
         m = elementwise_max_prop_nan(m, m_peek)
     m_ij = elementwise_max_prop_nan(M, m)
-    m_ij_scaled = m_ij * QK_scale
+    if cfg.SLIDING_WINDOW > 0:
+        # a row whose window starts in the next tile is all -inf here: shift it by 0 so that p and alpha are 0
+        # instead of NaN, and keep M at -inf
+        m_ij_scaled = gl.where(m_ij > float("-inf"), m_ij, 0.0) * QK_scale
+    else:
+        m_ij_scaled = m_ij * QK_scale
     m_diff_scaled = M * QK_scale - m_ij_scaled
     M = m_ij
     alpha = gl.exp2(m_diff_scaled)
@@ -2281,7 +2309,11 @@ def attention_loop_tensor_subtile_split(
     # Loop carry from prev iter / prologue: p0, qk1_shifted, alpha, M, k (full K of tile j+1).
     # At iter j entry 3 TDMs outstanding: V_j, K_{j+2}, V_{j+1}.
     # Merged: one async_wait(1) drains V_j + K_{j+2}; V_{j+1} stays pending into next iter.
-    tile_end = gl.maximum(3, pgm.tile_end)
+    if cfg.SLIDING_WINDOW > 0:
+        # a window starts at tile_start > 0; the extra tiles lie past the causal diagonal and are masked
+        tile_end = gl.maximum(pgm.tile_start + 3, pgm.tile_end)
+    else:
+        tile_end = gl.maximum(3, pgm.tile_end)
     if FIXED_MAX:
         # apply the prologue's alpha now; the loop keeps M (and so alpha == 1) fixed
         acc0 = acc0 * alpha[:, None]
@@ -2372,6 +2404,7 @@ def attention_loop_tensor_subtile_split(
 
         # --- S3: PV sub 0 + SM0-A ---
         acc0 = pgm.compute_pv(p, v0_s, acc0)
+        qk0, qk1 = pgm.apply_window_mask_qk_subtiles(qk0, qk1, j + 1)
         if FIXED_MAX:
             m_ij_scaled = m_fixed_scaled
         else:
@@ -2486,6 +2519,7 @@ def attention_loop_tensor_subtile_split(
         qk1 = pgm.compute_qk_subtile(k1_s)
     if cfg.CAUSAL and epilogue_t_2 >= pgm.safe_tile_end:
         qk1 = pgm.apply_mask_qk_subtile(qk1, epilogue_t_2, 1)
+    qk0, qk1 = pgm.apply_window_mask_qk_subtiles(qk0, qk1, epilogue_t_2)
     p = pgm.concat_subtile(p0, p1)
     l_ij = gl.sum(p, 1)
     if FIXED_MAX:
