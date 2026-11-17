@@ -292,11 +292,6 @@ def mla_decode_fwd(
     skip_reduce: bool = False,
     pages_per_block: int = 1,
 ):
-    """pages_per_block > 1: kv_buffer is [num_blocks, block_size, num_kv_heads,
-    head_dim] whose blocks may sit at any stride(0) (e.g. a strided view into a
-    packed allocation) and block_tables holds page ids
-    block * pages_per_block + i of block_size // pages_per_block-token pages.
-    Non-shuffled gfx1250 cache only."""
     assert causal, "Only causal attention is supported"
     q_dtype = q.dtype
     kv_buffer_dtype = kv_buffer.dtype
