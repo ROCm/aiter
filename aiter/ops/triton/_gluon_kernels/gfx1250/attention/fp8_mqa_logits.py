@@ -566,6 +566,8 @@ def mqa_logits_loop_pipelined(
     _store_logits_block(
         logits_ptr, store_offsets, scores_next, USE_BUFFER_STORE, mask=mask
     )
+    # Drain outstanding TDM loads before the kernel exits.
+    kv_loader.wait(0)
 
 
 _gluon_fp8_mqa_logits_kernel_repr = make_kernel_repr(
