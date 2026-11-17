@@ -15,43 +15,51 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
+QK_DIM = 576
+V_DIM = 512
+INFO_COLS = 8
 
-def _buffer(ptr, count, dtype, vec=1):
-    view = fx.make_view(fx.recast_iter(dtype, ptr), fx.make_layout((1 << 31), 1))
-    buf = fx.rocdl.make_buffer_tensor(
-        view, num_records_bytes=fx.Int64(count) * (dtype.width // 8)
-    )
+# A 576-wide Q/K row as (elem, lg, half, dc). Lane group lg reads 16 contiguous
+# columns per dc, so one 16-byte load feeds two MFMA K steps (ds_read_b128).
+# The permuted reduction order cancels in the dot product only if Q follows the
+# same layout; the Q loads spell it out as offsets.
+QK_COLS = ((8, 4, 2, 9), (1, 16, 8, 64))
+
+
+def _buffer(ptr, layout, count, dtype):
+    # Scalar buffers end in a unit mode: copy atoms need one unsliced mode.
+    view = fx.make_view(fx.recast_iter(dtype, ptr), layout)
     return fx.Tensor(
-        fx.make_view(
-            fx.get_iter(buf), fx.make_layout(((1 << 31) // vec, vec), (vec, 1))
+        fx.rocdl.make_buffer_tensor(
+            view, num_records_bytes=fx.Int64(count) * (dtype.width // 8)
         )
     )
 
 
-def _ld(buf, index, dtype, vec=1):
+def _ld(buf, coord, dtype, vec=1):
     frag = fx.make_rmem_tensor(fx.make_layout(vec, 1), dtype)
     atom = fx.make_copy_atom(fx.rocdl.BufferCopy(dtype.width * vec), dtype)
-    fx.copy_atom_call(atom, fx.slice(buf, (index, None)), frag)
+    fx.copy_atom_call(atom, fx.slice(buf, coord), frag)
     return frag.load() if vec != 1 else frag.load()[0]
 
 
-def _st(buf, index, value, dtype):
+def _st(buf, coord, value, dtype):
     frag = fx.make_rmem_tensor(fx.make_layout(1, 1), dtype)
     frag.store(fx.Vector.from_elements([value], dtype=dtype))
     fx.copy_atom_call(
         fx.make_copy_atom(fx.rocdl.BufferCopy(dtype.width), dtype),
         frag,
-        fx.slice(buf, (index, None)),
+        fx.slice(buf, coord),
     )
 
 
-def _stv(buf, index, value, dtype, vec=4):
+def _stv(buf, coord, value, dtype, vec=4):
     frag = fx.make_rmem_tensor(fx.make_layout(vec, 1), dtype)
     frag.store(value)
     fx.copy_atom_call(
         fx.make_copy_atom(fx.rocdl.BufferCopy(dtype.width * vec), dtype),
         frag,
-        fx.slice(buf, (index, None)),
+        fx.slice(buf, coord),
     )
 
 
@@ -127,7 +135,14 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
     LD = 584
     LP = N + 8
     GATHER_BYTES = 48
-    GATHER_LANES = 576 // GATHER_BYTES
+    GATHER_LANES = QK_DIM // GATHER_BYTES
+    # KV tokens of a tile in MFMA C-row order (i, lg, kn): the P tile and V^T.
+    TOKENS = ((4, 4, N // 16), (1, 4, 16))
+    # Wave-owned PV output columns: V^T rows (wave, cd, lr) and the matching
+    # accumulator columns (wave, cd, lg, i).
+    V_COLS = ((W, CD, 16), (V_DIM // W, 16, 1))
+    OUT_COLS = ((W, CD, 4, 4), (V_DIM // W, 16, 4, 1))
+    STAT_ALPHA, STAT_MAX, STAT_SUM = range(3)
 
     @fx.struct
     class Shared:
@@ -167,47 +182,113 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
         lg = lane // 16
         wave = _uniform(tid // 64)
         cu = fx.block_idx.x
-        gq = _buffer(q, fx.Int64(total_q) * H * 576, fx.BFloat16, 8)
-        gp = _buffer(pages, num_indices, fx.Int32)
-        gi = _buffer(indptr, num_cus + 1, fx.Int32)
-        gw = _buffer(info, fx.Int64(num_work) * 8, fx.Int32)
-        gr = _buffer(partial, fx.Int64(num_partial) * H * 512, fx.Float32, 4)
-        gl = _buffer(partial_lse, fx.Int64(num_partial) * H, fx.Float32)
-        go = _buffer(output, fx.Int64(total_q) * H * 512, fx.BFloat16, 4)
-        gol = _buffer(output_lse, fx.Int64(total_q) * H, fx.Float32)
+        q_rows = total_q * H
+        p_rows = num_partial * H
+        gq = _buffer(
+            q,
+            fx.make_layout((q_rows * (QK_DIM // 8), 8), (8, 1)),
+            fx.Int64(total_q) * H * QK_DIM,
+            fx.BFloat16,
+        )
+        gp = _buffer(
+            pages, fx.make_layout((num_indices, 1), (1, 1)), num_indices, fx.Int32
+        )
+        gi = _buffer(
+            indptr, fx.make_layout((num_cus + 1, 1), (1, 1)), num_cus + 1, fx.Int32
+        )
+        gw = _buffer(
+            info,
+            fx.make_layout((num_work, INFO_COLS, 1), (INFO_COLS, 1, 1)),
+            fx.Int64(num_work) * INFO_COLS,
+            fx.Int32,
+        )
+        gr = _buffer(
+            partial,
+            fx.make_layout((p_rows, OUT_COLS[0]), (V_DIM, OUT_COLS[1])),
+            fx.Int64(num_partial) * H * V_DIM,
+            fx.Float32,
+        )
+        gl = _buffer(
+            partial_lse,
+            fx.make_layout((p_rows, 1), (1, 1)),
+            fx.Int64(num_partial) * H,
+            fx.Float32,
+        )
+        go = _buffer(
+            output,
+            fx.make_layout((q_rows, OUT_COLS[0]), (V_DIM, OUT_COLS[1])),
+            fx.Int64(total_q) * H * V_DIM,
+            fx.BFloat16,
+        )
+        gol = _buffer(
+            output_lse,
+            fx.make_layout((q_rows, 1), (1, 1)),
+            fx.Int64(total_q) * H,
+            fx.Float32,
+        )
+        g_scale = _buffer(kv_scale, fx.make_layout((1, 1), (1, 1)), 1, fx.Float32)
         descale = _uniform(
-            _ld(_buffer(kv_scale, 1, fx.Float32), 0, fx.Float32).bitcast(fx.Int32)
+            _ld(g_scale, (0, None), fx.Float32).bitcast(fx.Int32)
         ).bitcast(fx.Float32)
         score_scale = scale * descale * fx.Float32(1.4426950408889634)
         shared = fx.SharedAllocator().allocate(Shared).peek()
+        # One padded KV slab, viewed per access pattern: K operand rows, the
+        # gather's (8 BF16, part, chunk, gather lane) stores, and V^T columns.
+        kv_k = fx.Tensor(
+            shared.kv.view(fx.make_layout((N, QK_COLS[0]), (LD, QK_COLS[1])))
+        )
+        kv_gather = fx.Tensor(
+            shared.kv.view(
+                fx.make_layout(
+                    (N, (8, GATHER_LANES, 3, 2)), (LD, (1, GATHER_BYTES, 16, 8))
+                )
+            )
+        )
+        kv_v = fx.Tensor(
+            shared.kv.view(
+                fx.make_layout(
+                    (TOKENS[0], V_COLS[0]),
+                    (tuple(s * LD for s in TOKENS[1]), V_COLS[1]),
+                )
+            )
+        )
+        p_lds = fx.Tensor(
+            shared.p.view(fx.make_layout((NT * 16, TOKENS[0]), (LP, TOKENS[1])))
+        )
+        stats = fx.Tensor(shared.stats.view(fx.make_layout((NT * 16, 3), (3, 1))))
+        s_pages = fx.Tensor(shared.pages.view(fx.make_layout(N, 1)))
         sk = shared.kv.ptr
-        sp = shared.p.ptr
-        ss = shared.stats.ptr
-        s_pages = shared.pages.ptr
-        begin = _uniform(_ld(gi, cu, fx.Int32))
-        end = _uniform(_ld(gi, cu + 1, fx.Int32))
+        begin = _uniform(_ld(gi, (cu, None), fx.Int32))
+        end = _uniform(_ld(gi, (cu + 1, None), fx.Int32))
         for wi in range(begin, end, 1):
-            row = fx.Int64(wi) * 8
-            pr = _uniform(_ld(gw, row + 1, fx.Int32))
-            qs = _uniform(_ld(gw, row + 2, fx.Int32))
-            qe = _uniform(_ld(gw, row + 3, fx.Int32))
-            ks = _uniform(_ld(gw, row + 4, fx.Int32))
-            ke = _uniform(_ld(gw, row + 5, fx.Int32))
-            ko = _uniform(_ld(gw, row + 6, fx.Int32))
+            work = fx.Int64(wi)
+            pr = _uniform(_ld(gw, (work, 1, None), fx.Int32))
+            qs = _uniform(_ld(gw, (work, 2, None), fx.Int32))
+            qe = _uniform(_ld(gw, (work, 3, None), fx.Int32))
+            ks = _uniform(_ld(gw, (work, 4, None), fx.Int32))
+            ke = _uniform(_ld(gw, (work, 5, None), fx.Int32))
+            ko = _uniform(_ld(gw, (work, 6, None), fx.Int32))
             qlen = qe - qs
             M = qlen * H
-            # Permute reduction dimensions: four consecutive MFMA steps cover
-            # each lane group's contiguous 16 values, enabling ds_read_b128.
             qregs = []
             for rt in range_constexpr(OWN):
                 r = (wave + rt * W) * 16 + lr
                 for dc in range_constexpr(9):
                     for half in range_constexpr(2):
-                        off = (
-                            (fx.Int64(qs) * H + r) * 576 + dc * 64 + lg * 16 + half * 8
+                        # QK_COLS at (lg, half, dc), in 8-element units. Rows past
+                        # M point one past the end, so the load returns zero.
+                        # A QK_COLS view masking the row instead changes the KV
+                        # loop's register allocation.
+                        q_off = (
+                            (fx.Int64(qs) * H + r) * QK_DIM
+                            + dc * 64
+                            + lg * 16
+                            + half * 8
                         ) // 8
-                        off = (r < M).select(off, fx.Int64(total_q) * H * 72)
-                        qregs.append(_ld(gq, off, fx.BFloat16, 8))
+                        q_off = (r < M).select(
+                            q_off, fx.Int64(total_q) * H * (QK_DIM // 8)
+                        )
+                        qregs.append(_ld(gq, (q_off, None), fx.BFloat16, 8))
             init = [fx.Float32(float("-inf")) for _ in range_constexpr(OWN)]
             init += [fx.Float32(0.0) for _ in range_constexpr(OWN)]
             init += [fx.full(4, 0.0, fx.Float32) for _ in range_constexpr(NT * CD)]
@@ -219,8 +300,8 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
                     tok0 = (tid % (N * GATHER_LANES)) // GATHER_LANES
                     dc0 = tid % GATHER_LANES
                     idx0 = (ks + tok0 < ke).select(ks + tok0, ke - 1)
-                    page0 = _ld(gp, idx0, fx.Int32)
-                    base0 = kv + fx.Int64(page0) * 576
+                    page0 = _ld(gp, (idx0, None), fx.Int32)
+                    base0 = kv + fx.Int64(page0) * QK_DIM
                     for chunk in range_constexpr(3):
                         raw[chunk] = fx.ptr_load(
                             base0 + dc0 * GATHER_BYTES + chunk * 16,
@@ -237,21 +318,18 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
                     idx = (kb + lookahead + tid < ke).select(
                         kb + lookahead + tid, ke - 1
                     )
-                    page = _ld(gp, idx, fx.Int32)
-                    fx.ptr_store(
-                        fx.ptrtoint(kv + fx.Int64(page) * 576).to(fx.Uint64),
-                        s_pages + tid,
+                    page = _ld(gp, (idx, None), fx.Int32)
+                    fx.memref_store(
+                        fx.ptrtoint(kv + fx.Int64(page) * QK_DIM).to(fx.Uint64),
+                        s_pages,
+                        tid,
                     )
                 fx.barrier()
                 gather_tid = _unhoisted(tid) if NT >= 7 else tid
                 if wave < 6:
                     tok = gather_tid // GATHER_LANES
                     dc = gather_tid % GATHER_LANES
-                    page_base = (
-                        fx.inttoptr(kv.type, fx.ptr_load(s_pages + tok))
-                        if NT == W
-                        else kv
-                    )
+                    page_base = fx.inttoptr(kv.type, s_pages[tok]) if NT == W else kv
                     # Swap adjacent 16B BF16 writes in alternating four-lane
                     # groups. All eight 16B bank slots occur once per lane octet.
                     swap = (dc // 4) % 2
@@ -282,9 +360,8 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
                                     )
                                     pair = _pack_exact(v)
                                     vals += [pair[0], pair[1]]
-                            fx.ptr_store(
-                                fx.Vector.from_elements(vals, dtype=fx.BFloat16),
-                                sk + tok * LD + d + part * 8,
+                            kv_gather[(tok, (None, dc, chunk, part))].store(
+                                fx.Vector.from_elements(vals, dtype=fx.BFloat16)
                             )
                 fx.barrier()
                 next_max = []
@@ -302,29 +379,17 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
                         if const_expr(NT <= 4):
                             # One K pair ahead (NT<=4 only: neutral at NT 5-6); fences bound live operands to two sets.
                             kvals = [
-                                fx.ptr_load(
-                                    sk + kn * 16 * LD + lr * LD + lg * 16,
-                                    result_type=fx.Vector.make_type(8, fx.BFloat16),
-                                )
+                                kv_k[(kn * 16 + lr, (None, lg, 0, 0))].load()
                                 for kn in range_constexpr(N // 16)
                             ]
                             fx.rocdl.sched_barrier(0)
                             for step in range_constexpr(18):
                                 if const_expr(step + 1 < 18):
                                     ns = step + 1
-                                    kbase = (
-                                        lr * LD
-                                        + (ns // 2) * 64
-                                        + lg * 16
-                                        + (ns % 2) * 8
-                                    )
                                     next_k = [
-                                        fx.ptr_load(
-                                            sk + kn * 16 * LD + kbase,
-                                            result_type=fx.Vector.make_type(
-                                                8, fx.BFloat16
-                                            ),
-                                        )
+                                        kv_k[
+                                            (kn * 16 + lr, (None, lg, ns % 2, ns // 2))
+                                        ].load()
                                         for kn in range_constexpr(N // 16)
                                     ]
                                 fx.rocdl.sched_barrier(0)
@@ -345,18 +410,22 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
                                     # Prevent full-K CSE/hoisting across row tiles:
                                     # retaining the full slab alongside Q/O spills.
                                     kbase = _unhoisted(
-                                        lr * LD + dc * 64 + lg * 16 + half * 8
-                                    )
-                                    kvals = []
-                                    for kn in range_constexpr(N // 16):
-                                        kvals.append(
-                                            fx.ptr_load(
-                                                sk + kn * 16 * LD + kbase,
-                                                result_type=fx.Vector.make_type(
-                                                    8, fx.BFloat16
-                                                ),
+                                        fx.get_scalar(
+                                            fx.crd2idx(
+                                                (lr, (0, lg, half, dc)), kv_k.layout
                                             )
                                         )
+                                    )
+                                    k_step = fx.Tensor(
+                                        fx.make_view(
+                                            sk + kbase,
+                                            fx.make_layout((N // 16, 8), (16 * LD, 1)),
+                                        )
+                                    )
+                                    kvals = [
+                                        k_step[(kn, None)].load()
+                                        for kn in range_constexpr(N // 16)
+                                    ]
                                     qv = qregs[rt * 18 + dc * 2 + half]
                                     for sub in range_constexpr(2):
                                         for kn in range_constexpr(N // 16):
@@ -405,14 +474,13 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
                         sm = state[OWN + rt] * alpha + sm
                         for kn in range_constexpr(N // 16):
                             for i in range_constexpr(4):
-                                fx.ptr_store(
-                                    _rne(probs[kn * 4 + i]),
-                                    sp + r * LP + kn * 16 + lg * 4 + i,
+                                fx.memref_store(
+                                    _rne(probs[kn * 4 + i]), p_lds, (r, (i, lg, kn))
                                 )
                         if lg == 0:
-                            fx.ptr_store(alpha, ss + r * 3)
-                            fx.ptr_store(nm, ss + r * 3 + 1)
-                            fx.ptr_store(sm, ss + r * 3 + 2)
+                            fx.memref_store(alpha, stats, (r, STAT_ALPHA))
+                            fx.memref_store(nm, stats, (r, STAT_MAX))
+                            fx.memref_store(sm, stats, (r, STAT_SUM))
                     else:
                         nm = state[rt]
                         sm = state[OWN + rt]
@@ -425,7 +493,7 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
                     pre_tid = _unhoisted(tid)
                     pre_tok = (pre_tid % (N * GATHER_LANES)) // GATHER_LANES
                     pre_dc = pre_tid % GATHER_LANES
-                    pre_base = fx.inttoptr(kv.type, fx.ptr_load(s_pages + pre_tok))
+                    pre_base = fx.inttoptr(kv.type, s_pages[pre_tok])
                     for chunk in range_constexpr(3):
                         next_raw.append(
                             fx.ptr_load(
@@ -439,24 +507,15 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
                 # PV: A=V^T, B=P^T. All rows, disjoint column slices per wave.
                 for rt in range_constexpr(NT):
                     r = rt * 16 + lr
-                    alpha = fx.ptr_load(ss + r * 3)
+                    alpha = stats[(r, STAT_ALPHA)]
                     for cd in range_constexpr(CD):
                         old = state[2 * OWN + rt * CD + cd]
                         acc = old * alpha
                         for kn in range_constexpr(N // 16):
-                            pv = fx.ptr_load(
-                                sp + r * LP + kn * 16 + lg * 4,
-                                result_type=fx.Vector.make_type(4, fx.BFloat16),
-                            )
+                            pv = p_lds[(r, (None, lg, kn))].load()
                             vv = fx.Vector.from_elements(
                                 [
-                                    fx.ptr_load(
-                                        sk
-                                        + (kn * 16 + lg * 4 + i) * LD
-                                        + wave * (512 // W)
-                                        + cd * 16
-                                        + lr
-                                    )
+                                    kv_v[((i, lg, kn), (wave, cd, lr))]
                                     for i in range_constexpr(4)
                                 ],
                                 dtype=fx.BFloat16,
@@ -479,8 +538,8 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
                     mass = fx.Float32(0.0)
                     mx = fx.Float32(float("-inf"))
                     if ke > ks:
-                        mass = fx.ptr_load(ss + r * 3 + 2)
-                        mx = fx.ptr_load(ss + r * 3 + 1)
+                        mass = stats[(r, STAT_SUM)]
+                        mx = stats[(r, STAT_MAX)]
                     denom = (mass > 0).select(mass, fx.Float32(1.0))
                     factor = descale / denom
                     lse = (mass > 0).select(
@@ -493,25 +552,24 @@ def _build(H, QLEN, CAUSAL, WRITE_LSE):
                         out_row = fx.Int64(pr + qpos) * H + h
                         for cd in range_constexpr(CD):
                             acc = result[2 * OWN + rt * CD + cd]
-                            d = store_wave * (512 // W) + cd * 16 + store_lg * 4
-                            value = acc * factor
-                            _stv(gr, (out_row * 512 + d) // 4, value, fx.Float32)
+                            cols = (store_wave, cd, store_lg, None)
+                            _stv(gr, (out_row, cols), acc * factor, fx.Float32)
                         if (store_wave == 0) & (store_lg == 0):
-                            _st(gl, out_row, lse, fx.Float32)
+                            _st(gl, (out_row, None), lse, fx.Float32)
                     else:
                         out_row = fx.Int64(qs + qpos) * H + h
                         for cd in range_constexpr(CD):
                             acc = result[2 * OWN + rt * CD + cd]
-                            d = store_wave * (512 // W) + cd * 16 + store_lg * 4
+                            cols = (store_wave, cd, store_lg, None)
                             value = fx.Vector.from_elements(
                                 [_rne(acc[i] * factor) for i in range_constexpr(4)],
                                 dtype=fx.BFloat16,
                             )
-                            _stv(go, (out_row * 512 + d) // 4, value, fx.BFloat16)
+                            _stv(go, (out_row, cols), value, fx.BFloat16)
                         # Trace-time flag around a device test: they must not be merged.
                         if WRITE_LSE:  # noqa: SIM102
                             if (store_wave == 0) & (store_lg == 0):
-                                _st(gol, out_row, lse, fx.Float32)
+                                _st(gol, (out_row, None), lse, fx.Float32)
 
     return stage1
 
