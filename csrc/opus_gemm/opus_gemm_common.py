@@ -27,7 +27,9 @@ _A16W16_CO_TAGS = frozenset(
 # gfx950 MXFP4 x MXFP4 NT (a4w4 family): the 2x2 pipeline is pre-compiled
 # (.co, gen_co/gfx950/a4w4_bpreshuffle/), the 1x4 small-tile pipeline is built by the JIT.
 _A4W4_BPRESHUFFLE_CO_TAGS = frozenset({"a4w4_mxfp4_nt_bpreshuffle_co"})
-A4W4_BPRESHUFFLE_TAGS = frozenset({*_A4W4_BPRESHUFFLE_CO_TAGS, "a4w4_mxfp4_nt_bpreshuffle_small"})
+A4W4_BPRESHUFFLE_TAGS = frozenset(
+    {*_A4W4_BPRESHUFFLE_CO_TAGS, "a4w4_mxfp4_nt_bpreshuffle_small"}
+)
 
 # Legacy cache policy = traits default for split-barrier & persistent a16w16 (see
 # opus_gemm_traits_a16w16_gfx950.cuh).

@@ -3405,8 +3405,12 @@ register_emit("gfx950", "a8w8", gen_noscale_instance_gfx950)
 register_emit("gfx950", "a16w16_mono_tile", gen_mono_tile_instance)
 register_emit("gfx950", "a16w16_flatmm", gen_flatmm_instance)
 register_emit("gfx950", "a16w16_flatmm_splitk", gen_flatmm_splitk_instance)
-register_emit("gfx950", "a4w4_mxfp4_nt_bpreshuffle_co", gen_a4w4_bpreshuffle_co_instance)
-register_emit("gfx950", "a4w4_mxfp4_nt_bpreshuffle_small", gen_a4w4_bpreshuffle_small_instance)
+register_emit(
+    "gfx950", "a4w4_mxfp4_nt_bpreshuffle_co", gen_a4w4_bpreshuffle_co_instance
+)
+register_emit(
+    "gfx950", "a4w4_mxfp4_nt_bpreshuffle_small", gen_a4w4_bpreshuffle_small_instance
+)
 
 
 def _register_bmm_emit(kernel_tag, fn, launcher_tile_mult):

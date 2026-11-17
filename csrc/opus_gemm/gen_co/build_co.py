@@ -734,7 +734,9 @@ def build_one_gfx950(k, args, llvm_bin, workdir):
     return {
         "symbol": symbol,
         "co_sha256": co_sha256,
-        "kid": next(kid for kid, v in a4w4_bpreshuffle_co_kernels_declared.items() if v is k),
+        "kid": next(
+            kid for kid, v in a4w4_bpreshuffle_co_kernels_declared.items() if v is k
+        ),
         "tile": [k.B_M, k.B_N, k.B_K],
         "variant": k.co_variant,
         "launch_bounds": [k.BLOCK_SIZE, k.co_min_waves_per_eu],
