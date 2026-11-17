@@ -173,9 +173,14 @@ def selection_rank(us, watts, select_power: bool, power_sample=None):
     """Sort key. Latency mode is lowest us.
 
     Power mode is us*watts in three tiers: graph-sampled candidates, then
-    eager-sampled ones (they read low, so a cheap eager reading must not beat
-    a graph reading), then unmeasured ones by us. ``power_sample`` defaults to
-    the one ``watts`` carries as a ``PowerReading``.
+    every other measured candidate (they read low, so a cheap reading must not
+    beat a graph reading), then unmeasured ones by us. ``power_sample``
+    defaults to the one ``watts`` carries as a ``PowerReading``.
+
+    Only an explicit ``graph`` tag earns the first tier. Power rows written
+    before ``power_sample`` existed were eager-sampled and carry no tag, or the
+    0 the config merge fills in, so an untagged reading ranks with the eager
+    ones.
     """
     try:
         us_f = float(us)
@@ -186,9 +191,9 @@ def selection_rank(us, watts, select_power: bool, power_sample=None):
     cost = efficiency_cost(us_f, watts)
     if math.isinf(cost):
         return (2, us_f)
-    if power_sample_of(watts, power_sample) == EAGER_SAMPLE:
-        return (1, cost)
-    return (0, cost)
+    if power_sample_of(watts, power_sample).strip().lower() == GRAPH_SAMPLE:
+        return (0, cost)
+    return (1, cost)
 
 
 def power_columns(result, tflops):

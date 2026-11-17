@@ -1597,6 +1597,66 @@ class TestPowerTableSeparation(unittest.TestCase):
             ["graph", "eager", "none"],
         )
 
+    def test_untagged_readings_rank_behind_graph_readings(self):
+        from aiter.utility.selection_policy import POWER
+
+        graph = POWER.rank(10.0, 900.0, "graph")
+        self.assertEqual(graph[0], 0)
+        self.assertEqual(POWER.rank(10.0, 900.0, " Graph ")[0], 0)
+        # Pre-power_sample rows carry no tag, or the 0 the config merge fills in.
+        for legacy in (None, "", "0", 0, float("nan")):
+            with self.subTest(power_sample=legacy):
+                self.assertEqual(POWER.rank(10.0, 100.0, legacy)[0], 1)
+                self.assertLess(graph, POWER.rank(10.0, 100.0, legacy))
+
+    def test_legacy_power_csv_merge_keeps_the_new_graph_row(self):
+        import tempfile
+
+        import pandas as pd
+
+        from aiter.jit import core
+        from aiter.jit.core import AITER_CONFIG, AITER_CONFIGS
+
+        conditions = {
+            "select": "power",
+            "perf_level": "auto",
+            "power_cap_w": "1400",
+            "sclk_max_mhz": "2400",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy_file = f"{tmp}/legacy_tuned_demo.csv"
+            graph_file = f"{tmp}/graph_tuned_demo.csv"
+            # Written before power_sample existed: eager-sampled and untagged.
+            pd.DataFrame(
+                [{"M": 1, "us": 10.0, "watts": 100.0, "kernel": "legacy", **conditions}]
+            ).to_csv(legacy_file, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "M": 1,
+                        "us": 10.0,
+                        "watts": 900.0,
+                        "power_sample": "graph",
+                        "kernel": "graph",
+                        **conditions,
+                    }
+                ]
+            ).to_csv(graph_file, index=False)
+            with (
+                mock.patch.object(
+                    AITER_CONFIG, "_shape_dedup_keys", return_value=["M"]
+                ),
+                mock.patch.object(core, "_runtime_power_selection", return_value=True),
+                self.assertRaises(RuntimeError),
+            ):
+                AITER_CONFIGS.update_config_files(
+                    os.pathsep.join([legacy_file, graph_file]), "tuned_demo"
+                )
+            legacy = pd.read_csv(legacy_file)
+            graph = pd.read_csv(graph_file)
+        self.assertTrue(legacy.empty)
+        self.assertEqual(list(graph["kernel"]), ["graph"])
+
     def test_record_keeps_the_sample_next_to_watts(self):
         from aiter.utility.selection_policy import POWER
         from aiter.utility.tune_result import PowerReading
