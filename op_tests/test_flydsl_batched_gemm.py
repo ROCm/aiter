@@ -633,7 +633,7 @@ def test_compute_switch_penalty(
         f"{us_a:.1f} + {us_b:.1f} us back to back"
     )
     return {
-        "gfx": get_gfx(),
+        "gfx": get_gfx_runtime(),
         "compute us": us_a,
         "compute TFLOPS": 2 * b * m * n * k / us_a / 1e6,
         "other compute us": us_b,
