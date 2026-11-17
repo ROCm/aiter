@@ -21,7 +21,7 @@ import torch
 from aiter import ActivationType, NvFp4MoeWeights, dtypes, moe_nvfp4, uses_fallback
 from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-from aiter.jit.utils.moe_nvfp4_common import reduce_twin
+from aiter.ops.moe_nvfp4_common import reduce_twin
 from aiter.ops.shuffle import shuffle_scale_nvfp4_moe, shuffle_weight
 from aiter.utility.fp4_utils import mxfp4_to_f32
 

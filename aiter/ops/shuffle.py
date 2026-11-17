@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.jit.utils.moe_nvfp4_common import scale_gs
+from aiter.ops.moe_nvfp4_common import scale_gs
 
 
 def _moe_tile_shuffle(

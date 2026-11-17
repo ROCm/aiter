@@ -58,7 +58,7 @@ from ..jit.core import (
     get_user_jit_dir,
 )
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
-from ..jit.utils.moe_nvfp4_common import (
+from .moe_nvfp4_common import (
     MAX_SORT_EXPERTS,
     MAX_SORT_ROWS,
     parse_kernel,

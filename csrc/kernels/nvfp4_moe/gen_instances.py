@@ -19,15 +19,22 @@ AITER_DIR = (
     else os.path.abspath(f"{this_dir}/../../../aiter")
 )
 DISPATCH_CSV = f"{AITER_DIR}/configs/tuned_moe_nvfp4.csv"
-sys.path.insert(0, f"{AITER_DIR}/jit/utils")
-from moe_nvfp4_common import CFG_DEFAULTS, parse_kernel
 
-# The dispatch policy (default rule, CSV) lives with the op; torch-free, by path
-_spec = importlib.util.spec_from_file_location(
-    "moe_nvfp4_dispatch", f"{AITER_DIR}/ops/moe_nvfp4_dispatch.py"
-)
-dispatch = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(dispatch)
+
+def load_op_module(name):
+    """aiter/ops/<name>.py by path (torch-free, aiter not imported). Not via
+    sys.path: aiter/ops/triton would shadow the triton package."""
+    spec = importlib.util.spec_from_file_location(name, f"{AITER_DIR}/ops/{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+# The dispatch policy (default rule, CSV) lives with the op; it imports common
+common = load_op_module("moe_nvfp4_common")
+dispatch = load_op_module("moe_nvfp4_dispatch")
+CFG_DEFAULTS, parse_kernel = common.CFG_DEFAULTS, common.parse_kernel
 
 X_ENUM = {"xreg": "X_REG", "xstream": "X_STREAM", "xres": "X_RESIDENT", "xdma": "X_DMA"}
 

@@ -13,7 +13,7 @@ tuned_fmoe.csv column names:
   model_dim, inter_dim, expert, topk, dtype) key and path (uses_fallback of the
   row token) with T <= token; above the last row or without rows, default_rows.
 - kernelName1 / kernelName2: stage-1 / stage-2 kernel (kernel_name in
-  aiter/jit/utils/moe_nvfp4_common.py; _inbf16 stage 1 iff bf16 x on the fallback
+  aiter/ops/moe_nvfp4_common.py; _inbf16 stage 1 iff bf16 x on the fallback
   path; stage 2: _reduce (any output dtype), else _outbf16 iff bf16 output). A
   kernel outside module_moe_nvfp4 is JIT-built in its own module.
 - us: the whole moe_nvfp4 call at T = token in a CUDA graph (sort + cast +
@@ -28,7 +28,7 @@ tuned_fmoe.csv column names:
 import csv
 
 try:
-    from ..jit.utils.moe_nvfp4_common import (
+    from .moe_nvfp4_common import (
         GS_SFX,
         MAX_SORT_EXPERTS,
         MAX_SORT_ROWS,
@@ -38,7 +38,7 @@ try:
         reduce_twin,
         scale_gs,
     )
-except ImportError:  # loaded by path (gen_instances.py, aiter/jit/utils on sys.path)
+except ImportError:  # loaded by path (gen_instances.py registers moe_nvfp4_common)
     from moe_nvfp4_common import (
         GS_SFX,
         MAX_SORT_EXPERTS,

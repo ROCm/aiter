@@ -12,7 +12,7 @@
 // Weight scale layout (GS layout, GS = 2 GPS K-tiles per group, GS 2 .. 8): [E][NTILE][KTP /
 // GPS][64 lanes][4 GPS B], KTP = ceil(KT / 2) K-tile pairs (odd KT: the last half zero); the
 // dword of pair p is dword p % GPS of group p / GPS. GS 2 is the pair layout, GS 6 the SG
-// layout. One layout per weight tensor (scale_gs, aiter/jit/utils/moe_nvfp4_common.py).
+// layout. One layout per weight tensor (scale_gs, aiter/ops/moe_nvfp4_common.py).
 #pragma once
 #include <hip/hip_runtime.h>
 #include <stdint.h>
@@ -60,7 +60,7 @@ enum XPlace
     X_DMA
 };
 
-// One kernel instance. Its name is the config (kernel_name in aiter/jit/utils/moe_nvfp4_common.py);
+// One kernel instance. Its name is the config (kernel_name in aiter/ops/moe_nvfp4_common.py);
 // gen_instances.py writes the Cfg literal of each name.
 struct Cfg
 {
@@ -86,7 +86,7 @@ struct Cfg
 };
 
 // Field combinations the kernels implement. Names are checked by parse_kernel
-// (aiter/jit/utils/moe_nvfp4_common.py); this also covers a Cfg written by hand.
+// (aiter/ops/moe_nvfp4_common.py); this also covers a Cfg written by hand.
 constexpr bool cfg_valid(const Cfg& c)
 {
     // tile sizes: at least one 16-row m tile, one weight tile per wave, one K-tile per chunk
