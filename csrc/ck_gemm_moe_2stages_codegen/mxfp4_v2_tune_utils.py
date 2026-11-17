@@ -78,6 +78,24 @@ def append_shared_experts(topk_weights, topk_ids, E, n_shared):
     )
 
 
+def tuning_routing(inp, E, topk):
+    """Top-k routing for ``inp``, as the tuner times candidates.
+
+    Random unless TUNE_MOE_EXPERT_BALANCE=true. Balanced routing gives every
+    expert exactly token * topk / E rows, which at a power-of-two token count
+    fills a block_m of that size with no padding tile and so favours it.
+    """
+    token = inp.shape[0]
+    n_shared = fused_shared_experts(E, topk)
+    e_routed, k_routed = E - n_shared, topk - n_shared
+    if os.environ.get("TUNE_MOE_EXPERT_BALANCE", "False").lower() == "true":
+        score = balanced_score(token, e_routed, k_routed, dtypes.bf16)
+    else:
+        score = torch.randn((token, e_routed), dtype=dtypes.bf16)
+    topk_weights, topk_ids = fused_topk(inp, score.to(inp.device), k_routed, True)
+    return append_shared_experts(topk_weights, topk_ids, E, n_shared)
+
+
 def quant_a_fp8(x):
     return per_1x32_f8_scale_f8_quant(
         x, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
@@ -294,18 +312,7 @@ def gen(
     inp = torch.randn((token, model_dim), dtype=dtypes.bf16) / 10
     w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtypes.bf16) / 10
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtypes.bf16) / 10
-    # Same routing as FmoeTuner.generate_data: random unless
-    # TUNE_MOE_EXPERT_BALANCE=true. Balanced routing gives every expert exactly
-    # token * topk / E rows, which at a power-of-two token count fills a
-    # block_m of that size with no padding tile and so favours it.
-    n_shared = fused_shared_experts(E, topk)
-    e_routed, k_routed = E - n_shared, topk - n_shared
-    if os.environ.get("TUNE_MOE_EXPERT_BALANCE", "False").lower() == "true":
-        score = balanced_score(token, e_routed, k_routed, dtypes.bf16)
-    else:
-        score = torch.randn((token, e_routed), dtype=dtypes.bf16)
-    topk_weights, topk_ids = fused_topk(inp, score, k_routed, True)
-    topk_weights, topk_ids = append_shared_experts(topk_weights, topk_ids, E, n_shared)
+    topk_weights, topk_ids = tuning_routing(inp, E, topk)
 
     w1_qt, w1_scale = quant_w(w1, b_dtype)
     w2_qt, w2_scale = quant_w(w2, b_dtype)

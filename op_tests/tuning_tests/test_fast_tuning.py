@@ -905,6 +905,74 @@ class TestParallelMxfp4Precompile(unittest.TestCase):
         self.assertNotIn("swiglu_limit", precompiled[2])
 
 
+class TestV2FusedMoeRerank(unittest.TestCase):
+    @staticmethod
+    def _pairs(rows):
+        import pandas as pd
+
+        return pd.DataFrame(
+            [
+                {"us1": us1, "us2": us2, "v2": v2, "run_1stage": one_stage}
+                for us1, us2, v2, one_stage in rows
+            ],
+            index=[10 + i for i in range(len(rows))],
+        )
+
+    def test_finalists_are_v2_pairs_near_the_best_stage_sum(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        pairs = self._pairs(
+            [
+                (60.0, 43.0, 1, 0),  # 103: inside the 5% gate of 100
+                (40.0, 60.0, 0, 0),  # 100: best, but not a v2 pair
+                (50.0, 51.0, 1, 0),  # 101
+                (102.0, 0.0, 1, 1),  # 102 but 1-stage
+                (50.0, 56.0, 1, 0),  # 106: outside the gate
+                (101.0, float("nan"), float("nan"), 1),  # 101, asm 1-stage row
+            ]
+        )
+        self.assertEqual(gemm_moe_tune._v2_e2e_finalists(pairs), [12, 10])
+
+    def test_finalist_count_is_capped_by_stage_sum(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        pairs = self._pairs([(50.0, 50.0 + i * 0.5, 1, 0) for i in range(6)][::-1])
+        finalists = gemm_moe_tune._v2_e2e_finalists(pairs)
+        self.assertEqual(len(finalists), gemm_moe_tune.V2_E2E_MAX_FINALISTS)
+        self.assertEqual(finalists, [15, 14, 13, 12])
+
+    def test_only_losers_beyond_the_noise_are_dropped(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        e2e_us = {10: 2280.0, 11: 2263.0, 12: 2380.0}
+        # 2280 is within 1% of 2263, so the stage-sum order decides it.
+        self.assertEqual(gemm_moe_tune._v2_e2e_losers(e2e_us), [12])
+
+    def test_config_switch_is_scoped_and_kept_out_of_shared_tmp(self):
+        import tempfile
+
+        from aiter.jit import core as jit_core
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.FmoeTuner.__new__(gemm_moe_tune.FmoeTuner)
+        fixture = REPO_ROOT / "aiter" / "configs" / "tuned_fmoe.csv"
+        old_tempdir = tempfile.tempdir
+        old_env = os.environ.get("AITER_CONFIG_FMOE")
+        with tempfile.TemporaryDirectory() as tmp:
+            config_file = Path(tmp) / "tuned_fmoe.csv"
+            config_file.write_text(fixture.read_text().splitlines()[0] + "\n")
+            with (
+                mock.patch.object(tuner, "_clear_op_caches") as clear,
+                tuner._fused_moe_config(str(config_file)),
+            ):
+                self.assertEqual(os.environ["AITER_CONFIG_FMOE"], str(config_file))
+                merged = jit_core.AITER_CONFIGS.AITER_CONFIG_FMOE_FILE
+                self.assertTrue(merged.startswith(tmp), merged)
+            self.assertEqual(clear.call_count, 2)
+        self.assertIs(tempfile.tempdir, old_tempdir)
+        self.assertEqual(os.environ.get("AITER_CONFIG_FMOE"), old_env)
+
+
 class TestMoePowerRanking(unittest.TestCase):
     def test_power_rank_orders_pairs_by_stage_energy(self):
         import pandas as pd
