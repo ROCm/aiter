@@ -567,6 +567,7 @@ def launch_gemm_a8w4_tdm(
         if shared_b
         else ""
     )
+    _rm_scale = "_rmscale2" if row_major_ascale == 2 else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -576,7 +577,7 @@ def launch_gemm_a8w4_tdm(
         f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
-        f"{_interleaved_lds_load}{_persistent}{_drain}{_shared}"
+        f"{_interleaved_lds_load}{_persistent}{_drain}{_shared}{_rm_scale}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -1076,11 +1077,16 @@ def launch_gemm_a8w4_tdm(
             elif const_expr(row_major_ascale):
                 # Compact dispatch lands e8m0 row-major at the wire pitch. The
                 # rotating path keeps one tile_k slice in each pipeline buffer.
+                # row_major_ascale == 2: rows past the expert's are unwritten
+                # (tile padding), so they read as zero like the A rows.
+                sa_oob = None
+                if const_expr(row_major_ascale == 2):
+                    sa_oob = mn_oob
                 add_tdm_loads(
                     gSA_base,
                     blk_m64 * SA_GROW,
                     SA_GROW,
-                    None,
+                    sa_oob,
                     SA_KDW,
                     tile_m,
                     on_i32=True,

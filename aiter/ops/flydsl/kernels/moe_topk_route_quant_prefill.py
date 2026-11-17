@@ -139,6 +139,7 @@ def build_moe_topk_route_quant_prefill_module(
     waves: int = 32,
     quant_mode: str = "fp4",
     shared: bool = False,
+    row_major_scale: bool = False,
 ):
     """JIT launcher ``(logits, hidden, num_valid_rows, topk_weights, topk_ids,
     topids_to_rows, masked_m, psum, payload, compact_scale, row_to_token,
@@ -158,6 +159,12 @@ def build_moe_topk_route_quant_prefill_module(
     ``masked_m`` / ``psum`` get the shared entry last. The shared rows are not
     quantized (no payload, no compact e8m0 row, no ``row_to_token``): the
     FHMoE GEMM reads the shared expert's activations from ``hidden``.
+
+    ``row_major_scale``: ``compact_scale`` is instead the grouped rows' e8m0,
+    row-major ((contiguous_m, feat_dim // 32), each route's row written like
+    its payload) for a MoE1 that reads row-major scales; no preshuffle pass,
+    and ``row_to_token`` is not written. Tile padding rows stay unwritten
+    (MoE1 bounds its scale loads by the expert's rows).
     """
     if experts != 256:
         raise NotImplementedError(
@@ -210,6 +217,7 @@ def build_moe_topk_route_quant_prefill_module(
         f"moe_topk_route_quant_prefill_e{experts}_k{topk}_fd{feat_dim}"
         f"_a{align_m}_s{slots}_w{waves}_{quant_mode}_{L.native_tag}"
         f"{'_sh' if shared else ''}"
+        f"{'_rms' if row_major_scale else ''}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[block, 1, 1])
@@ -441,10 +449,17 @@ def build_moe_topk_route_quant_prefill_module(
         c_lanes_per_block = fx.Int32(L.lanes_per_mx_block)
         block_in_wave = lane // fx.Uint32(c_lanes_per_block)
         lane_in_block = lane - block_in_wave * c_lanes_per_block
-        cs_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            fx.Int64(ptrtoint(compact_scale)),
-            num_records_bytes=fx.Int32(n_tok * fx.Uint32(sd_per_row * 4)),
-        )
+        # Row-major grouped scales: every route row is below contiguous_m by
+        # construction (the kernel does not know it), so no record bound.
+        if const_expr(row_major_scale):
+            cs_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                fx.Int64(ptrtoint(compact_scale))
+            )
+        else:
+            cs_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                fx.Int64(ptrtoint(compact_scale)),
+                num_records_bytes=fx.Int32(n_tok * fx.Uint32(sd_per_row * 4)),
+            )
 
         def _qc(row, preloaded):
             return SimpleNamespace(
@@ -487,6 +502,7 @@ def build_moe_topk_route_quant_prefill_module(
             )
 
         quant = []
+        scale_rows = []  # row_major_scale: each slot's e8m0 row (lanes 0..15)
         it_of = lane >> fx.Uint32(1)
         hi_of = (lane & fx.Uint32(1)) == fx.Uint32(1)
         for i in range_constexpr(slots):
@@ -518,12 +534,15 @@ def build_moe_topk_route_quant_prefill_module(
                 lo = fx.Int32(rocdl.readlane(i32, packed, 0))
                 hi = fx.Int32(rocdl.readlane(i32, packed, 16))
                 sel = (it_of == fx.Uint32(it)).select(hi_of.select(hi, lo), sel)
-            if (rows[i] < valid_end) & (lane < fx.Uint32(sd_per_row)):
-                buffer_ops.buffer_store(
-                    sel,
-                    cs_rsrc,
-                    fx.Int32(rows[i]) * fx.Int32(sd_per_row) + fx.Int32(lane),
-                )
+            if const_expr(row_major_scale):
+                scale_rows.append(sel)
+            else:
+                if (rows[i] < valid_end) & (lane < fx.Uint32(sd_per_row)):
+                    buffer_ops.buffer_store(
+                        sel,
+                        cs_rsrc,
+                        fx.Int32(rows[i]) * fx.Int32(sd_per_row) + fx.Int32(lane),
+                    )
 
         # ---- B: claim the runs, wait for every workgroup's counts --------
         _lds_barrier()
@@ -610,15 +629,18 @@ def build_moe_topk_route_quant_prefill_module(
                     rows_t[fx.Int32(row) * fx.Int32(n_out) + fx.Int32(g)] = fx.Int32(
                         lds_misc[1]
                     ) + fx.Int32(row)
-            if l_valid:
-                r2t_t[l_row] = fx.Int32(row)
+            if const_expr(not row_major_scale):  # noqa: SIM102 - preserve DSL staging
+                if l_valid:
+                    r2t_t[l_row] = fx.Int32(row)
             # From the registers, a grouped row at a time (whole 1 KB runs).
             # Every route's descriptor first: rebuilding one in the SGPRs the
             # previous row's stores read makes each row wait (s_wait_xcnt).
             qc, results = quant[i]
             rsrcs = []
+            route_rows = []
             for k in range_constexpr(topk):
                 r_k = live.select(fx.Int32(rocdl.readlane(i32, l_row, k)), c0_i32)
+                route_rows.append(r_k)
                 rsrcs.append(
                     buffer_ops.create_buffer_resource_from_addr(
                         pay_base + fx.Uint64(fx.Uint32(r_k)) * L.payload_bytes_per_row,
@@ -630,22 +652,32 @@ def build_moe_topk_route_quant_prefill_module(
             for rsrc in rsrcs:
                 for mx_block, payload_val, _ in results:
                     _emit_payload_stores(qc, [rsrc], payload_val, mx_block)
+            if const_expr(row_major_scale):  # noqa: SIM102 - preserve DSL staging
+                # The token's 64 B e8m0 row to each route's grouped row.
+                if live & (lane < fx.Uint32(sd_per_row)):
+                    for k in range_constexpr(topk):
+                        buffer_ops.buffer_store(
+                            scale_rows[i],
+                            cs_rsrc,
+                            route_rows[k] * fx.Int32(sd_per_row) + fx.Int32(lane),
+                        )
 
-        # row_to_token -1 on each expert's tile padding rows: workgroup w
-        # takes items [w * chunk, (w + 1) * chunk) of experts x align_m.
-        # (Rows past the last expert stay unwritten: the preshuffle bounds
-        # them by psum.)
-        for idx in range(
-            fx.Int32(bid) * fx.Int32(block) + fx.Int32(tid),
-            fx.Int32(n_pad_items),
-            fx.Int32(n_wg) * fx.Int32(block),
-        ):
-            e_p = idx >> fx.Int32(align_m.bit_length() - 1)
-            p = idx & fx.Int32(align_m - 1)
-            cnt_e = fx.Int32(lds_tot[e_p])
-            pad_e = (cnt_e + fx.Int32(align_m - 1)) & fx.Int32(-align_m)
-            if cnt_e + p < pad_e:
-                r2t_t[fx.Int32(lds_start[e_p]) + cnt_e + p] = fx.Int32(-1)
+        if const_expr(not row_major_scale):
+            # row_to_token -1 on each expert's tile padding rows: workgroup w
+            # takes items [w * chunk, (w + 1) * chunk) of experts x align_m.
+            # (Rows past the last expert stay unwritten: the preshuffle
+            # bounds them by psum.)
+            for idx in range(
+                fx.Int32(bid) * fx.Int32(block) + fx.Int32(tid),
+                fx.Int32(n_pad_items),
+                fx.Int32(n_wg) * fx.Int32(block),
+            ):
+                e_p = idx >> fx.Int32(align_m.bit_length() - 1)
+                p = idx & fx.Int32(align_m - 1)
+                cnt_e = fx.Int32(lds_tot[e_p])
+                pad_e = (cnt_e + fx.Int32(align_m - 1)) & fx.Int32(-align_m)
+                if cnt_e + p < pad_e:
+                    r2t_t[fx.Int32(lds_start[e_p]) + cnt_e + p] = fx.Int32(-1)
 
         # The last workgroup out zeroes the status for the next launch.
         if tid == fx.Uint32(0):

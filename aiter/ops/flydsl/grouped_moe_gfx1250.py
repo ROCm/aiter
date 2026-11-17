@@ -715,6 +715,8 @@ def _grouped_a8w4_tdm_moe(
     # surplus tiles fall past ``psum`` and exit early. The TDM batched GEMMs
     # themselves are EP-agnostic: they operate on the routed contiguous layout.
     _is_ep = expert_mask is not None
+    # The prefill route/quant wrote MoE1's A scales row-major (no preshuffle).
+    _prepared_row_major = False
     _g2l_lut = None
     _g2l_counter = None
     _gather_w_buf = None
@@ -867,7 +869,8 @@ def _grouped_a8w4_tdm_moe(
                 )
             ):
                 # Prefill sizes: the same outputs from two launches in place of
-                # the eight of the split path below.
+                # the eight of the split path below (one with row-major scales).
+                _prepared_row_major = topk_route_quant_prefill_row_major_scale()
                 _prepared_a1 = fused_topk_route_quant_prefill(
                     _deferred.gating_output,
                     hidden_states,
@@ -879,6 +882,7 @@ def _grouped_a8w4_tdm_moe(
                     topk_weights=topk_weight,
                     topk_ids=topk_ids,
                     shared=_fused_sh,
+                    row_major_scale=_prepared_row_major,
                 )
             else:
                 _deferred.resolve()
@@ -1082,6 +1086,9 @@ def _grouped_a8w4_tdm_moe(
         and os.environ.get("AITER_TDM_ROW_MAJOR_A1_SCALE", "1") in ("1", "true", "True")
     )
     _row_major_ascale = (_compact and _prequantized) or _row_major_a1
+    # 2: row-major and bounded by the expert's rows (the prefill route/quant
+    # leaves tile padding rows unwritten).
+    _row_major_ascale = 2 if _prepared_row_major else int(_row_major_ascale)
     # Local quant instead writes one compact row-major row per token and rebuilds
     # the interleaved layout gemm1 reads in a second pass, so neither write lands
     # 4 B per cache line. A compact plan drives the GEMM off recv rows and passes
@@ -1165,6 +1172,13 @@ def _grouped_a8w4_tdm_moe(
                 wmma_rep=wmma_rep,
                 scale_k_per_tile=tile_k // 32,
             )
+
+    # The routing and the activation quant are launched: a caller's hook
+    # (``after_routing_launched``) may fork work onto another stream here, so it
+    # runs beside the expert GEMMs and not beside the routing.
+    _routing_hook = _take_routing_hook()
+    if _routing_hook is not None:
+        _routing_hook()
 
     # Fuse gemm1 activation + MX quantization + scale preshuffle into the
     # kernel epilogue, eliminating the standalone
@@ -1254,7 +1268,7 @@ def _grouped_a8w4_tdm_moe(
             tdm_b_th=tdm_b_th,
             lds_soa_load_interleave=lds_soa_load_interleave,
             rolled_drain=rolled_drain,
-            row_major_ascale=int(_row_major_ascale),
+            row_major_ascale=_row_major_ascale,
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
             **_situ_kw,
@@ -1294,7 +1308,7 @@ def _grouped_a8w4_tdm_moe(
             tdm_b_th=tdm_b_th,
             lds_soa_load_interleave=lds_soa_load_interleave,
             rolled_drain=rolled_drain,
-            row_major_ascale=int(_row_major_ascale),
+            row_major_ascale=_row_major_ascale,
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
             **_situ_kw,
@@ -1425,7 +1439,7 @@ def _grouped_a8w4_tdm_moe(
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
                         lds_soa_load_interleave=lds_soa_load_interleave,
-                        row_major_ascale=int(_row_major_ascale),
+                        row_major_ascale=_row_major_ascale,
                         rolled_drain=rolled_drain,
                         **_situ_kw,
                     ),
@@ -1467,7 +1481,7 @@ def _grouped_a8w4_tdm_moe(
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
                         lds_soa_load_interleave=lds_soa_load_interleave,
-                        row_major_ascale=int(_row_major_ascale),
+                        row_major_ascale=_row_major_ascale,
                         rolled_drain=rolled_drain,
                         **_situ_kw,
                     ),
@@ -2283,6 +2297,39 @@ class defer_gather_reduce:  # a context manager, named as one
         _gather_defer_state.req = self.prev
 
 
+_routing_hook_state = threading.local()
+
+
+class after_routing_launched:  # a context manager, named as one
+    """Call ``fn()`` once, on the host, inside the next grouped MoE call on this
+    thread: after its routing / activation-quant launches, before its first
+    expert GEMM. A caller forks a side stream there (e.g. the shared expert),
+    so the side work overlaps the expert GEMMs. Paths that never reach the
+    GEMMs leave the hook uncalled; the caller checks ``called``."""
+
+    def __init__(self, fn):
+        self.fn = fn
+        self.called = False
+
+    def _run(self):
+        self.called = True
+        self.fn()
+
+    def __enter__(self):
+        self.prev = getattr(_routing_hook_state, "hook", None)
+        _routing_hook_state.hook = self._run
+        return self
+
+    def __exit__(self, *exc):
+        _routing_hook_state.hook = self.prev
+
+
+def _take_routing_hook():
+    hook = getattr(_routing_hook_state, "hook", None)
+    _routing_hook_state.hook = None
+    return hook
+
+
 def _take_gather_defer_request() -> GatherReduceDeferral | None:
     """The scope's untaken deferral, if any."""
     req = getattr(_gather_defer_state, "req", None)
@@ -2319,6 +2366,17 @@ def _get_compiled_topk_route_quant(
     )
 
 
+@functools.cache
+def topk_route_quant_decode_max_rows() -> int:
+    """Rows up to which the one-launch decode kernel serves the fused top-k /
+    route / quant; larger steps take the prefill kernel. Default its
+    ``MAX_ROWS``; AITER_TOPK_ROUTE_QUANT_DECODE_MAX_ROWS lowers it."""
+    from aiter.ops.flydsl.kernels.moe_topk_route_quant import MAX_ROWS
+
+    raw = os.environ.get("AITER_TOPK_ROUTE_QUANT_DECODE_MAX_ROWS", "")
+    return min(MAX_ROWS, int(raw)) if raw.strip() else MAX_ROWS
+
+
 def fused_topk_route_quant_supported(
     gating_output: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -2327,9 +2385,10 @@ def fused_topk_route_quant_supported(
     shared: bool = False,
 ) -> bool:
     """Whether ``fused_topk_route_quant`` serves this call (gfx1250, bf16, 256
-    routed experts, renormalized top-k, at most ``MAX_ROWS`` rows; ``shared``:
-    the logits end in one shared expert's gate column)."""
-    from aiter.ops.flydsl.kernels.moe_topk_route_quant import MAX_ROWS
+    routed experts, renormalized top-k, at most
+    ``topk_route_quant_decode_max_rows()`` rows; ``shared``: the logits end in
+    one shared expert's gate column)."""
+    MAX_ROWS = topk_route_quant_decode_max_rows()
 
     return (
         renormalize
@@ -2482,6 +2541,7 @@ def _get_compiled_topk_route_quant_prefill(
     waves: int,
     quant_mode: str,
     shared: bool = False,
+    row_major_scale: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_topk_route_quant_prefill import (
         build_moe_topk_route_quant_prefill_module,
@@ -2496,6 +2556,17 @@ def _get_compiled_topk_route_quant_prefill(
         waves=waves,
         quant_mode=quant_mode,
         shared=shared,
+        row_major_scale=row_major_scale,
+    )
+
+
+@functools.cache
+def topk_route_quant_prefill_row_major_scale() -> bool:
+    """AITER_TOPK_ROUTE_QUANT_PREFILL_ROW_MAJOR_SCALE=1: the prefill top-k /
+    route / quant writes each route's e8m0 row row-major next to its payload
+    and MoE1 reads the scales row-major: no scale preshuffle launch."""
+    return os.environ.get("AITER_TOPK_ROUTE_QUANT_PREFILL_ROW_MAJOR_SCALE", "0") in (
+        _TRUTHY_ENV
     )
 
 
@@ -2554,7 +2625,12 @@ def _prefill_geometry(token_num: int, device) -> tuple[int, int, int, int]:
 
     idx = device.index if device.index is not None else torch.cuda.current_device()
     grid = max(1, min(_num_cus(idx), int(token_num)))
-    tpw = -(-int(token_num) // grid)
+    # AITER_TOPK_ROUTE_QUANT_PREFILL_MIN_TOKENS_PER_WG: fewer, fuller workgroups
+    # (fewer arrivals at the all-workgroup wait) for small steps.
+    tpw = max(
+        -(-int(token_num) // grid),
+        int(os.environ.get("AITER_TOPK_ROUTE_QUANT_PREFILL_MIN_TOKENS_PER_WG", "1")),
+    )
     grid = -(-int(token_num) // tpw)
     waves = next((w for w in WAVE_CHOICES if w >= tpw), WAVE_CHOICES[-1])
     return grid, tpw, -(-tpw // waves), waves
@@ -2568,9 +2644,8 @@ def fused_topk_route_quant_prefill_supported(
     shared: bool = False,
 ) -> bool:
     """Whether ``fused_topk_route_quant_prefill`` serves this call: the decode
-    kernel's operand rules, more than its ``MAX_ROWS`` rows and at most
-    ``MAX_SLOTS * 32`` a CU."""
-    from aiter.ops.flydsl.kernels.moe_topk_route_quant import MAX_ROWS
+    kernel's operand rules, more than ``topk_route_quant_decode_max_rows()``
+    rows and at most ``MAX_SLOTS * 32`` a CU."""
     from aiter.ops.flydsl.kernels.moe_topk_route_quant_prefill import (
         MAX_SLOTS,
         WAVE_CHOICES,
@@ -2597,7 +2672,11 @@ def fused_topk_route_quant_prefill_supported(
     idx = hidden_states.device.index
     if idx is None:
         idx = torch.cuda.current_device()
-    return MAX_ROWS < m <= _num_cus(idx) * MAX_SLOTS * WAVE_CHOICES[-1]
+    return (
+        topk_route_quant_decode_max_rows()
+        < m
+        <= _num_cus(idx) * MAX_SLOTS * WAVE_CHOICES[-1]
+    )
 
 
 def fused_topk_route_quant_prefill(
@@ -2613,6 +2692,7 @@ def fused_topk_route_quant_prefill(
     topk_weights: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
     shared: bool = False,
+    row_major_scale: bool = False,
 ):
     """Two launches for the prefill front end of the grouped MoE, in place of
     eight: ``topk_softmax(renormalize)`` + the route/psum/remap + the
@@ -2622,6 +2702,10 @@ def fused_topk_route_quant_prefill(
     returns and layouts as ``fused_topk_route_quant`` (rows inside an expert in
     another order). fp4 only (the a8w4 / fp4 MoE's activation format).
     ``shared`` as for ``fused_topk_route_quant``.
+
+    ``row_major_scale``: one launch; the scale comes back row-major
+    (1, contiguous_m, feat_dim // 32) for MoE1's ``row_major_ascale`` (tile
+    padding rows unwritten: MoE1 bounds them by the expert's rows).
     """
     if quant_mode != "fp4":
         raise NotImplementedError("the prefill route/quant writes MXFP4 only")
@@ -2648,8 +2732,16 @@ def fused_topk_route_quant_prefill(
     # The kernel writes row_to_token for every route row and -1 on each
     # expert's tile padding; the preshuffle bounds the rest by psum, so
     # neither buffer needs a fill.
-    compact = torch.empty((token_num, feat_dim // 32), dtype=torch.uint8, device=device)
-    row_to_token = torch.empty(int(contiguous_m), dtype=torch.int32, device=device)
+    if row_major_scale:
+        compact = torch.empty(
+            (1, int(contiguous_m), feat_dim // 32), dtype=torch.uint8, device=device
+        )
+        row_to_token = compact  # not written
+    else:
+        compact = torch.empty(
+            (token_num, feat_dim // 32), dtype=torch.uint8, device=device
+        )
+        row_to_token = torch.empty(int(contiguous_m), dtype=torch.int32, device=device)
     if num_valid_rows is None:
         nvr = torch.empty(0, dtype=torch.int32, device=device)
     else:
@@ -2664,6 +2756,7 @@ def fused_topk_route_quant_prefill(
         waves,
         quant_mode,
         bool(shared),
+        bool(row_major_scale),
     )(
         ptr_arg(gating_output),
         ptr_arg(hidden_states),
@@ -2683,6 +2776,16 @@ def fused_topk_route_quant_prefill(
         int(grid),
         stream=torch.cuda.current_stream(),
     )
+    if row_major_scale:
+        return (
+            topk_weights,
+            topk_ids,
+            masked_m,
+            topids_to_rows.view(token_num, topk),
+            psum,
+            payload,
+            compact,
+        )
     scale_w = feat_dim // 32
     scale = torch.empty(
         (1, contiguous_m // wmma_rep, scale_w * wmma_rep),
