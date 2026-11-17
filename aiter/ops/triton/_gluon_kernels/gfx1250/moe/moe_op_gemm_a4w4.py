@@ -13,6 +13,7 @@ from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
     remap_xcd,
 )
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _MOE_GEMM_A4W4_REPR_KEYS = [
@@ -99,6 +100,12 @@ def matmul_launch_metadata(grid, kernel, args):
 
 
 @functools.lru_cache(maxsize=None)  # noqa: UP033
+def _fp4_wmma_m():
+    # gfx1250-strict (MI450 A0) has no v_wmma_scale{,16}_f32_32x16x128_f4, so use the 16x16x128 scaled WMMA
+    # there (v_wmma_scale_f32_16x16x128_f8f6f4 with e2m1 operands). gfx1250 keeps the 32x16x128 instruction.
+    return 16 if get_arch() == "gfx1250-strict" else 32
+
+
 def get_moe_a4w4_layouts_prefill(
     BLOCK_M,
     BLOCK_N,
@@ -168,7 +175,7 @@ def get_moe_a4w4_layouts_prefill(
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[32, 16, 128],
+        instr_shape=[_fp4_wmma_m(), 16, 128],
         cga_layout=cga_layout_c,
     )
     WMMA_LAYOUT_PACKED = gl.amd.AMDWMMALayout(
@@ -176,7 +183,7 @@ def get_moe_a4w4_layouts_prefill(
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[32, 16, 64],
+        instr_shape=[_fp4_wmma_m(), 16, 64],
         cga_layout=cga_layout_c,
     )
     DOT_LAYOUT_X = gl.DotOperandLayout(
@@ -391,14 +398,14 @@ def get_moe_a4w4_layouts_decode(
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[32, 16, 128],
+        instr_shape=[_fp4_wmma_m(), 16, 128],
     )
     WMMA_LAYOUT_PACKED = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[32, 16, 64],
+        instr_shape=[_fp4_wmma_m(), 16, 64],
     )
     DOT_LAYOUT_X = gl.DotOperandLayout(
         operand_index=0,

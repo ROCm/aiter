@@ -6,6 +6,7 @@ import math
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.extra.hip import libdevice
+from triton.language.target_info import current_target
 
 from aiter.ops.triton._triton_kernels.rope.rope import _get_gptj_rotated_x
 
@@ -14,6 +15,37 @@ from aiter.ops.triton._triton_kernels.rope.rope import _get_gptj_rotated_x
 # only _reinterpret. Kernels call reinterpret; give older Tritons that name too.
 if not hasattr(gl.shared_memory_descriptor, "reinterpret"):
     gl.shared_memory_descriptor.reinterpret = gl.shared_memory_descriptor._reinterpret
+
+
+@gluon.constexpr_function
+def _use_scaled_fp8_wmma(a_dtype, b_dtype, acc_layout):
+    # gfx1250-strict (MI450 A0) has no working unscaled fp8/bf8 16x16x128 WMMA: Triton and LLVM reject
+    # v_wmma_{f32,f16}_16x16x128_{fp8,bf8}_{fp8,bf8} for it, and those instructions give wrong results on
+    # A0 hardware. The scaled form v_wmma_scale_f32_16x16x128_f8f6f4 works there (triton-lang/triton#12474).
+    target = current_target()
+    if target is None or target.backend != "hip" or target.arch != "gfx1250-strict":
+        return False
+    if not (a_dtype.is_fp8() and b_dtype.is_fp8()):
+        return False
+    return list(getattr(acc_layout, "instr_shape", [])) == [16, 16, 128]
+
+
+@gluon.constexpr_function
+def _fp8_wmma_format(dtype):
+    return "e5m2" if dtype == gl.float8e5 else "e4m3"
+
+
+@gluon.jit
+def wmma_compat(a, b, acc):
+    """gl.amd.gfx1250.wmma, except fp8/bf8 16x16x128 on gfx1250-strict uses the scaled WMMA with unit
+    scales (same product). Every other arch, dtype and shape is unchanged."""
+    if _use_scaled_fp8_wmma(a.dtype, b.dtype, acc.type.layout):
+        res = gl.amd.gfx1250.wmma_scaled(
+            a, None, _fp8_wmma_format(a.dtype), b, None, _fp8_wmma_format(b.dtype), acc
+        )
+    else:
+        res = gl.amd.gfx1250.wmma(a, b, acc)
+    return res
 
 
 @gluon.jit

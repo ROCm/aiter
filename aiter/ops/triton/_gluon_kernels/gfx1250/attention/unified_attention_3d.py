@@ -9,6 +9,8 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.language.core import _aggregate as aggregate
 
+from aiter.ops.triton._gluon_kernels.common.utils import wmma_compat
+
 # tdm.async_gather with whichever signature this Triton has (see unified_attention_2d.py)
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_2d import (
     _tdm_gather,
@@ -1468,7 +1470,7 @@ class AttentionProgram:
         else:
             # A16W16 / A16W8 / A8A8
             k = k.to(self.q.dtype)  # no-op for A16W16 and A8W8
-            return gl.amd.gfx1250.wmma(self.q, k, S)
+            return wmma_compat(self.q, k, S)
 
     @gluon.jit
     def apply_causal_mask_tile(self, S, j):
@@ -1595,7 +1597,7 @@ class AttentionProgram:
             p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
 
         p = gl.convert_layout(p, self.cfg.P_DOT_LAYOUT)
-        return gl.amd.gfx1250.wmma(p, v, acc)
+        return wmma_compat(p, v, acc)
 
     @gluon.jit
     def tdm_shared_load_and_compute_pv_split_head(
@@ -1677,9 +1679,9 @@ class AttentionProgram:
             v = gl.convert_layout(v, self.cfg.V_DOT_LAYOUT, assert_trivial=True)
 
             if static_idx == 0:
-                acc0 = gl.amd.gfx1250.wmma(p, v, acc0)
+                acc0 = wmma_compat(p, v, acc0)
             else:
-                acc1 = gl.amd.gfx1250.wmma(p, v, acc1)
+                acc1 = wmma_compat(p, v, acc1)
         return acc0, acc1
 
     @gluon.jit
