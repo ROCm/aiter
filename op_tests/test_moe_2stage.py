@@ -1011,18 +1011,6 @@ def _iter_csv_cases():
                 e,
             )
             continue
-        # Expert-parallel rows key on the local expert count, which can be below
-        # topk; this non-EP harness cannot route a token to topk distinct experts.
-        if kwargs["topk"] > kwargs["E"]:
-            aiter.logger.info(
-                "skip row token=%s dim=(%s,%s): topk=%s exceeds expert=%s",
-                row.get("token"),
-                row.get("model_dim"),
-                row.get("inter_dim"),
-                kwargs["topk"],
-                kwargs["E"],
-            )
-            continue
         if kwargs["actType"] == aiter.ActivationType.Situv2:
             kwargs["beta"] = 4.0 if args.beta is None else float(args.beta)
             kwargs["linear_beta"] = (
