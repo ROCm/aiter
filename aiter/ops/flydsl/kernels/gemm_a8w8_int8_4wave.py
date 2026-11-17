@@ -23,6 +23,8 @@ gfx950 serves a ds_read_b128 in four phases of 16 lanes: lane groups
 layouts give each phase 16 distinct 16-byte bank groups.
 """
 
+from dataclasses import dataclass
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
@@ -32,19 +34,25 @@ import flydsl.expr as fx
 # boundary.
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import math as fmath
+from flydsl.expr.rocdl import update_dpp
+from flydsl.expr.typing import ReductionOp
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.jit.utils.chip_info import get_cdna4_num_xcds
+from aiter.ops.flydsl.kernels.communication_ops_utils import spin_until_ge_i32_agent
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
     S2RLoader,
     StoreC,
     _xcd_swizzle_any,
 )
+from aiter.ops.flydsl.kernels.gemm_hooks import GemmHooks
 from aiter.ops.flydsl.kernels.kernels_common import (
     ceildiv,
     set_slp_vectorize_once_used,
 )
 from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import split_row_major_2d
+from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_store, ptr_buf_tensor
 
 BLOCK_M = 256
 BLOCK_N = 256
@@ -62,6 +70,135 @@ B_BLOCK_STRIDE = A_BLOCK_STRIDE + 16  # shifts block b by b bank groups
 A_REGION_BYTES = ROW_BLOCKS * A_BLOCK_STRIDE
 B_REGION_BYTES = ROW_BLOCKS * B_BLOCK_STRIDE
 LOADS_PER_REGION = BLOCK_M * BLOCK_K // (N_WAVES * 1024)
+
+
+# DPP moves within a 16-lane row and the lane bit that orders each pair: quad_perm
+# [1,0,3,2] and [2,3,0,1] pair lanes i ^ 1 and i ^ 2, row_half_mirror i ^ 7 and
+# row_ror:8 i ^ 8. The four masks span the row's lane bits, so a butterfly over them
+# is a Hadamard transform, with rows in a different order than Sylvester's.
+_ROW_BUTTERFLY = ((0xB1, 1), (0x4E, 2), (0x141, 4), (0x128, 8))
+_ROW_ROR8 = 0x128  # lane i of a 16-lane row reads lane i ^ 8
+
+
+@dataclass(frozen=True)
+class PrepSpec:
+    """The Q/K prep of ``compile_int8_gemm_4w``'s epilogue, fixed at compile time.
+
+    ``norm``:
+      - ``"rms_across_heads"`` (Wan): RMSNorm over every head of a row. The epilogue applies
+        the norm weight and stores per-head sums of squares; the caller scales each row by
+        ``rsqrt(sum / N + eps)``.
+      - ``"rms_per_head"``: RMSNorm over each 128-wide head, applied in the epilogue.
+      - ``"none"``: no norm and no norm weights.
+
+    ``rope``: ``"interleaved"`` (Wan) rotates channel pairs (2i, 2i + 1) of each head,
+    ``"rotate_half"`` pairs i and i + 64, ``"none"`` skips RoPE. The cos and sin tables hold
+    one value per token and rotation pair, ``[M, 64]``, the same for every head.
+
+    ``bias``: a per-column bias before the norm.
+
+    ``hadamard``: the per-head Hadamard after RoPE.
+    """
+
+    norm: str = "rms_across_heads"
+    rope: str = "interleaved"
+    bias: bool = True
+    hadamard: bool = True
+
+    def __post_init__(self):
+        if self.norm not in ("none", "rms_per_head", "rms_across_heads"):
+            raise ValueError(f"unknown PrepSpec norm {self.norm!r}")
+        if self.rope not in ("none", "interleaved", "rotate_half"):
+            raise ValueError(f"unknown PrepSpec rope {self.rope!r}")
+
+    @property
+    def gammas(self):
+        """Whether B_scale holds norm weights."""
+        return self.norm != "none"
+
+    @property
+    def suffix(self):
+        """Kernel-name suffix after ``_prep``. Wan's prep keeps the names it had."""
+        suffix = "" if self.hadamard else "_nohadamard"
+        if self.norm != "rms_across_heads":
+            suffix += "_n" + ("head" if self.norm == "rms_per_head" else "none")
+        if self.rope != "interleaved":
+            suffix += "_r" + ("half" if self.rope == "rotate_half" else "none")
+        return suffix
+
+
+def _row_move(value, ctrl):
+    # Every lane of the row has a source under these controls, so zero fill never
+    # shows; it lets LLVM fold the move into the instruction that consumes it.
+    return fx.Float32(
+        update_dpp(
+            fx.Float32.ir_type, value.ir_value(), value.ir_value(), ctrl, 0xF, 0xF, True
+        )
+    )
+
+
+def _butterfly_signs(lane):
+    """Per stage of _ROW_BUTTERFLY: +1 in the lane that keeps the sum, -1 in its partner."""
+    return [
+        ((lane & bit) == 0).select(fx.Float32(1.0), fx.Float32(-1.0))
+        for _, bit in _ROW_BUTTERFLY
+    ]
+
+
+def _row_sum(value):
+    """Sum over the 16 lanes of a DPP row, in every lane of it."""
+    for ctrl, _ in _ROW_BUTTERFLY:
+        value = value + _row_move(value, ctrl)
+    return value
+
+
+def _row_max(value):
+    """Maximum over the 16 lanes of a DPP row, in every lane of it."""
+    for ctrl, _ in _ROW_BUTTERFLY:
+        value = value.maximumf(_row_move(value, ctrl))
+    return value
+
+
+def _max_abs(values):
+    """Largest magnitude among the 8 values of a vector."""
+    result = fx.Float32(0.0)
+    for k in range(8):
+        result = result.maximumf(values[k].maximumf(-values[k]))
+    return result
+
+
+def _global_ptr(address, dtype):
+    return fx.inttoptr(
+        fx.PointerType.get(dtype.ir_type, fx.AddressSpace.Global, 4), fx.Int64(address)
+    )
+
+
+def _load_f32x4(view, index, atom, reg):
+    """Four FP32 values of ``view`` from element ``index``."""
+    fx.copy(atom, fx.slice(view, (None, fx.Int32(index))), reg)
+    return Vec(fx.memref_load_vec(reg))
+
+
+def _hadamard128(values, signs):
+    """Unnormalized Hadamard over one 128-wide head held as 8 values in each of 16 lanes.
+
+    Q and K go through the same transform, so their attention scores are unchanged.
+    ``signs`` comes from _butterfly_signs.
+    """
+    result = list(values)
+    for stage in range(3):
+        shift = 1 << stage
+        result = [
+            (
+                result[i ^ shift] - result[i]
+                if i & shift
+                else result[i] + result[i ^ shift]
+            )
+            for i in range(8)
+        ]
+    for (ctrl, _), sign in zip(_ROW_BUTTERFLY, signs):
+        result = [_row_move(value, ctrl) + sign * value for value in result]
+    return result
 
 
 def _a_chunk_swizzle(row):
@@ -218,16 +355,59 @@ class StoreCInt8Rows(StoreC):
     """
 
     SCALE_LOADS = WAVE_TILES + 2
+    # B_scale holds the N column scales, then with a bias N FP32 biases, then with a
+    # normalizing prep N FP32 RMSNorm weights.
+    BIAS_LOADS = 2
+    GAMMA_LOADS = 2
 
-    def __init__(self, A_scale, B_scale, C, c_rows, c_cols, *args):
+    def __init__(
+        self,
+        A_scale,
+        B_scale,
+        C,
+        c_rows,
+        c_cols,
+        *args,
+        has_bias=False,
+        prep=None,
+        prep_spec=None,
+        eps=1e-6,
+        amax_partials=None,
+        planar_cols=0,
+    ):
         super().__init__(A_scale, B_scale, C, c_rows, c_cols, *args)
+        self.has_bias = has_bias
+        self.planar_cols = planar_cols
+        self.prep = prep is not None
+        self.spec = prep_spec
+        self.has_gamma = self.prep and prep_spec.gammas
+        # Index of the first norm-weight load in scale_load_ops' result.
+        self.gamma_index = WAVE_TILES + 2 + (self.BIAS_LOADS if has_bias else 0)
+        self.eps = eps
+        self.amax = self.prep or amax_partials is not None
+        if self.amax and not self.prep:
+            self._init_partials(c_rows, c_cols, amax_partials)
+        if self.prep:
+            cos, sin, partials = prep
+            freq_bytes = fx.Int64(c_rows) * 64 * 4
+            self.cos_div, self.sin_div = (
+                fx.logical_divide(
+                    fx.rocdl.make_buffer_tensor(
+                        table, max_size=False, num_records_bytes=freq_bytes
+                    ),
+                    fx.make_layout(1, 1),
+                )
+                for table in (cos, sin)
+            )
+            self._init_partials(c_rows, c_cols, partials)
         self.out_atom_8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
         self.reg_bf16_8 = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
         sa_tensor = fx.rocdl.make_buffer_tensor(
             A_scale, num_records_bytes=fx.Int64(c_rows) * 4
         )
         sb_tensor = fx.rocdl.make_buffer_tensor(
-            B_scale, num_records_bytes=fx.Int64(c_cols) * 4
+            B_scale,
+            num_records_bytes=fx.Int64(c_cols) * 4 * (1 + has_bias + self.has_gamma),
         )
         self.sa_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(sa_tensor))
         self.sb_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(sb_tensor))
@@ -238,10 +418,14 @@ class StoreCInt8Rows(StoreC):
         # loads must be ordered beside opaque LDS-DMA loads that LLVM cannot
         # count. Retain the scheduled raw load until both operations share one
         # stable dependency model.
+        # LLVM inserts no hazard wait states before inline asm. Under SGPR
+        # pressure it restores the resource with v_readlane right before the
+        # load, and a VALU SGPR write needs five wait states before a VMEM
+        # instruction reads that SGPR.
         return _llvm.inline_asm(
             res=fx.Vector.make_type(4, fx.Float32),
             operands_=[fx.Int32(byte_offset).ir_value(), rsrc],
-            asm_string="buffer_load_dwordx4 $0, $1, $2, 0 offen",
+            asm_string="s_nop 4\nbuffer_load_dwordx4 $0, $1, $2, 0 offen",
             constraints="=v,v,s",
             has_side_effects=True,
         )
@@ -263,9 +447,15 @@ class StoreCInt8Rows(StoreC):
         def col(half):
             return col_base + (self.lane_id % 16) * 8 + half * 4
 
-        return [op(self.sa_rsrc, lambda i=i: row(i)) for i in range(WAVE_TILES)] + [
+        ops = [op(self.sa_rsrc, lambda i=i: row(i)) for i in range(WAVE_TILES)] + [
             op(self.sb_rsrc, lambda h=h: col(h)) for h in (0, 1)
         ]
+        if self.has_bias:
+            ops += [op(self.sb_rsrc, lambda h=h: self.c_cols + col(h)) for h in (0, 1)]
+        if self.has_gamma:
+            gamma_cols = (1 + self.has_bias) * self.c_cols
+            ops += [op(self.sb_rsrc, lambda h=h: gamma_cols + col(h)) for h in (0, 1)]
+        return ops
 
     def _store_bf16x8(self, values, c_index):
         fx.memref_store_vec(values, self.reg_bf16_8)
@@ -275,26 +465,219 @@ class StoreCInt8Rows(StoreC):
             fx.slice(self.c_div, (None, fx.Int32(c_index))),
         )
 
-    def store_tiles(self, accs, row_base, col_base, scales):
-        """``scales`` comes from ``scale_load_ops`` and must have landed."""
+    def _init_partials(self, c_rows, c_cols, partials):
+        """[2, M, N // 128] FP32: per-head sums of squares, then per-head maxima."""
+        self.heads = c_cols // 128
+        self.maxima_base = fx.Int32(c_rows * self.heads)
+        self.partials_oob = fx.Int32(c_rows * self.heads * 2)
+        self.partials_div = fx.logical_divide(
+            fx.rocdl.make_buffer_tensor(
+                partials,
+                max_size=False,
+                num_records_bytes=fx.Int64(c_rows) * self.heads * 8,
+            ),
+            fx.make_layout(1, 1),
+        )
+
+    def _store_row_max(self, values, row, col_base):
+        """Store the largest magnitude of this row's head, as it will be stored in BF16."""
+        stored = values.to(fx.BFloat16).to(fx.Float32)
+        maximum = _row_max(_max_abs(stored))
+        store = (row < self.c_rows) & ((self.lane_id % 16) == 0)
+        index = self.maxima_base + row * self.heads + col_base // 128
+        self._store_f32(maximum, store.select(index, self.partials_oob))
+
+    def _load_freq4(self, div, index):
+        fx.copy(
+            self.scale_atom_4, fx.slice(div, (None, fx.Int32(index))), self.reg_f32_4
+        )
+        return Vec(fx.memref_load_vec(self.reg_f32_4))
+
+    def _store_f32(self, value, index):
+        fx.memref_store_vec(fx.full(1, value, fx.Float32), self.reg_f32_1)
+        fx.copy(
+            self.scale_atom_1,
+            self.reg_f32_1,
+            fx.slice(self.partials_div, (None, fx.Int32(index))),
+        )
+
+    def _load_freqs(self, row):
+        """cos and sin of the rotation pairs this lane's 8 channels of ``row`` take part in.
+
+        Interleaved: the 4 pairs the lane holds. Rotate-half: lanes l and l ^ 8 hold the two
+        halves of 8 pairs, so both read the same 8 values.
+        """
+        row = (row < self.c_rows).select(row, fx.Int32(0))
+        if const_expr(self.spec.rope == "rotate_half"):
+            index = row * 64 + (self.lane_id % 8) * 8
+            return tuple(
+                [
+                    v[k]
+                    for v in (
+                        self._load_freq4(div, index),
+                        self._load_freq4(div, index + 4),
+                    )
+                    for k in range(4)
+                ]
+                for div in (self.cos_div, self.sin_div)
+            )
+        index = row * 64 + (self.lane_id % 16) * 4
+        return self._load_freq4(self.cos_div, index), self._load_freq4(
+            self.sin_div, index
+        )
+
+    def _prep_row(self, x, gammas, freqs, signs, row, col_base):
+        """The spec's Q/K prep of the 8 channels this lane holds of one row.
+
+        A norm across heads is left to the caller: its factor is one scalar per row, and
+        RoPE and the Hadamard are linear, so the caller applies it later from the per-head
+        sums of squares stored here.
+        """
+        spec = self.spec
+        store = (row < self.c_rows) & ((self.lane_id % 16) == 0)
+        if const_expr(spec.gammas):
+            sq = _row_sum(fx.Float32((x * x).reduce(ReductionOp.ADD)))
+        if const_expr(spec.norm == "rms_per_head"):
+            x = x * Vec.filled(8, fmath.rsqrt(sq * (1.0 / 128) + self.eps), fx.Float32)
+        y = x * gammas if const_expr(spec.gammas) else x
+        if const_expr(spec.rope == "interleaved"):
+            cos, sin = freqs
+            rotated = []
+            for k in range_constexpr(4):
+                even, odd = y[2 * k], y[2 * k + 1]
+                rotated += [even * cos[k] - odd * sin[k], odd * cos[k] + even * sin[k]]
+        elif const_expr(spec.rope == "rotate_half"):
+            cos, sin = freqs
+            # Channel c < 64 takes -x[c + 64] sin, channel c >= 64 takes +x[c - 64] sin.
+            low = (self.lane_id % 16) < 8
+            rotated = []
+            for k in range_constexpr(8):
+                partner = _row_move(y[k], _ROW_ROR8)
+                rotated.append(y[k] * cos[k] + low.select(-partner, partner) * sin[k])
+        else:
+            rotated = [y[k] for k in range(8)]
+        if const_expr(spec.norm == "rms_across_heads"):
+            p_index = row * self.heads + col_base // 128
+            self._store_f32(sq, store.select(p_index, self.partials_oob))
+        if const_expr(spec.hadamard):
+            rotated = _hadamard128(rotated, signs)
+        result = Vec.from_elements(rotated, fx.Float32)
+        self._store_row_max(result, row, col_base)
+        return result
+
+    def store_tiles(self, accs, row_base, col_base, scales, prep=None, col_max=None):
+        """``scales`` comes from ``scale_load_ops`` and must have landed.
+
+        ``prep=False`` stores a prep-built instance's tile with maxima only (V).
+        ``col_max`` (an address) also stores each column's largest magnitude over the
+        wave's 128 rows, as stored in BF16: FP32 at [row // 128][column within its plane].
+        """
+        prep = self.prep if prep is None else prep
+        if const_expr(self.has_gamma and not prep):
+            # Norm-weight loads went out for this tile too; their registers stay claimed
+            # until here, past the wait that lands them.
+            _llvm.inline_asm(
+                res=None,
+                operands_=[Vec(s).ir_value() for s in scales[self.gamma_index :]],
+                asm_string="",
+                constraints="v,v",
+                has_side_effects=True,
+            )
         row0 = row_base + (self.lane_id // 16) * 4
         col = col_base + (self.lane_id % 16) * 8
         a_scales = [Vec(s) for s in scales[:WAVE_TILES]]
-        b_lo, b_hi = (Vec(s) for s in scales[WAVE_TILES:])
+        b_lo, b_hi = (Vec(s) for s in scales[WAVE_TILES : WAVE_TILES + 2])
         b_scales = Vec.from_elements(
             [b_lo[j] for j in range(4)] + [b_hi[j] for j in range(4)], fx.Float32
         )
+        if const_expr(self.has_bias):
+            bias_lo, bias_hi = (Vec(s) for s in scales[WAVE_TILES + 2 : WAVE_TILES + 4])
+            biases = Vec.from_elements(
+                [bias_lo[j] for j in range(4)] + [bias_hi[j] for j in range(4)],
+                fx.Float32,
+            )
+        gammas = None
+        if const_expr(prep and self.has_gamma):
+            gamma_lo, gamma_hi = (Vec(s) for s in scales[self.gamma_index :])
+            gammas = Vec.from_elements(
+                [gamma_lo[j] for j in range(4)] + [gamma_hi[j] for j in range(4)],
+                fx.Float32,
+            )
         oob = fx.Int32(self.c_rows * self.c_cols)
         col_valid = col < self.c_cols
+        signs = None
+        if const_expr(prep and self.spec.hadamard):
+            signs = _butterfly_signs(self.lane_id)
+        peaks = [fx.Float32(0.0) for _ in range(8)]
+        rope = prep and self.spec.rope != "none"
         for i in range_constexpr(WAVE_TILES):
+            tile_freqs = [None] * 4
+            if const_expr(rope):
+                # One wait for the tile's four rows rather than one per row.
+                tile_freqs = [self._load_freqs(row0 + i * TILE + r) for r in range(4)]
             for r in range_constexpr(4):
                 acc = Vec.from_elements(
                     [Vec(accs[i][j])[r] for j in range(WAVE_TILES)], fx.Int32
                 )
                 a_scale = Vec.filled(WAVE_TILES, a_scales[i][r], fx.Float32)
-                scaled = (acc.to(fx.Float32) * (a_scale * b_scales)).to(fx.BFloat16)
-                c_index = (row0 + i * TILE + r) * self.c_cols + col
+                scaled = acc.to(fx.Float32) * (a_scale * b_scales)
+                if const_expr(self.has_bias):
+                    scaled = scaled + biases
+                row = row0 + i * TILE + r
+                if const_expr(prep):
+                    scaled = self._prep_row(
+                        scaled, gammas, tile_freqs[r], signs, row, col_base
+                    )
+                elif const_expr(self.amax):
+                    self._store_row_max(scaled, row, col_base)
+                scaled = scaled.to(fx.BFloat16)
+                if const_expr(col_max is not None):
+                    stored = scaled.to(fx.Float32)
+                    row_valid = row < self.c_rows
+                    peaks = [
+                        peaks[k].maximumf(
+                            row_valid.select(
+                                stored[k].maximumf(-stored[k]), fx.Float32(0.0)
+                            )
+                        )
+                        for k in range(8)
+                    ]
+                if const_expr(self.planar_cols):
+                    width = self.planar_cols
+                    c_index = (
+                        (col // width) * (self.c_rows * width)
+                        + row * width
+                        + col % width
+                    )
+                else:
+                    c_index = row * self.c_cols + col
                 self._store_bf16x8(scaled, col_valid.select(c_index, oob))
+        if const_expr(col_max is not None):
+            # Lanes l, l + 16, l + 32 and l + 48 hold the same columns of different rows.
+            for shift in (16, 32):
+                peaks = [peak.maximumf(peak.shuffle_xor(shift, 64)) for peak in peaks]
+            width = self.planar_cols if self.planar_cols else self.c_cols
+            entries = (self.c_rows + WAVE_ROWS - 1) // WAVE_ROWS * width
+            table = ptr_buf_tensor(
+                col_max,
+                fx.Float32,
+                unit_elems=4,
+                unit_stride=1,
+                num_records_bytes=fx.Int64(entries) * 4,
+            )
+            # One lane group stores; the others' stores fall past the table and are dropped.
+            index = (row_base // WAVE_ROWS) * width + col % width
+            index = ((self.lane_id < 16) & col_valid).select(index, entries)
+            buf_copy_store(
+                table, index, Vec.from_elements(peaks[:4], fx.Float32), fx.Float32, 4
+            )
+            buf_copy_store(
+                table,
+                index + 4,
+                Vec.from_elements(peaks[4:], fx.Float32),
+                fx.Float32,
+                4,
+            )
 
 
 def _mfma_i8(a, b, c):
@@ -359,8 +742,53 @@ def compile_int8_gemm_4w(
     xcd_swizzle: int = 8,
     num_cu: int = 0,
     num_xcds: int | None = None,
+    bias: bool = False,
+    prep: "bool | PrepSpec" = False,
+    prep_hadamard: bool = True,
+    amax: bool = False,
+    roles: int = 1,
+    role_cols: int = 0,
+    consumers: int = 0,
+    eps: float = 1e-6,
+    hooks: GemmHooks | None = None,
+    role_hook=None,
+    hook_key: str = "",
+    first_block_hook=None,
+    tile_hook=None,
+    col_amax_offset: int | None = None,
 ):
     """``num_cu > 0`` makes the kernel persistent over that many workgroups.
+
+    ``bias`` adds a per-column FP32 bias in the epilogue. B_scale then holds the
+    N column scales followed by the N biases.
+
+    ``prep`` applies a Q/K prep in the epilogue: a ``PrepSpec``, whose ``bias`` replaces
+    ``bias``, or True for Wan's (``PrepSpec(bias=bias, hadamard=prep_hadamard)``: RMSNorm
+    across heads, interleaved RoPE and the per-head Hadamard, without the RMS factor). With
+    a norm, B_scale also holds the N norm weights after the scales and biases, multiplied
+    by 128 ** -0.5 when the Hadamard is applied here. The launcher takes FP32 ``[M, 64]``
+    cos and sin tables (one value per rotation pair) and writes FP32 ``[2, M, N // 128]``:
+    per-head sums of squares of the projection (for a norm across heads), then per-head
+    maxima of the stored output. For a norm across heads the caller scales each row by
+    ``rsqrt(sum / N + eps)``. All three are flat: FlyDSL indexes a 2-D tensor argument
+    column-major.
+
+    ``amax`` (without ``prep``) writes only the maxima half of that buffer, for a
+    projection the consumer quantizes as it is, such as V.
+
+    ``roles > 1`` (with ``prep`` and ``num_cu``) runs a fused weight of ``roles`` blocks of
+    ``role_cols`` columns, Q/K/V for 3, and stores C planar, ``[roles, M, role_cols]``. The
+    prep applies to every role but the last. ``aux`` starts with an Int32 tile counter per
+    role (``gemm_hooks``). Without hooks, the last ``consumers`` workgroups write the RMS
+    factors of the prep roles to ``aux + 64``, FP32 ``[roles - 1, M]``, for a norm across
+    heads.
+
+    ``hooks`` (with ``roles > 1``) are ``GemmHooks``, code run inside the GEMM under the
+    contract in ``gemm_hooks``; with hooks, ``consumers`` may be 0. ``role_hook``,
+    ``hook_key``, ``first_block_hook`` and ``tile_hook`` are the same, one by one.
+    ``col_amax_offset`` (with ``roles > 1``) makes the last role's epilogue also write FP32
+    ``[M / 128, role_cols]`` per-column maxima of its stored output to ``aux`` plus that many
+    bytes, one row per 128 rows of C; they land before the tile is counted.
 
     A persistent workgroup loads the first two K tiles of its next output
     block during the last two of the current one, so the next block's K loop
@@ -368,6 +796,34 @@ def compile_int8_gemm_4w(
     the next block's first tile lands in LDS buffer 0; otherwise each
     workgroup takes one block.
     """
+    if hooks is not None:
+        if (
+            role_hook is not None
+            or first_block_hook is not None
+            or tile_hook is not None
+        ):
+            raise ValueError(
+                "pass hooks or role_hook, first_block_hook and tile_hook, not both"
+            )
+        role_hook, first_block_hook, tile_hook = (
+            hooks.role,
+            hooks.first_block,
+            hooks.tile,
+        )
+        hook_key = hooks.key
+    if prep is True:
+        prep_spec = PrepSpec(bias=bias, hadamard=prep_hadamard)
+    elif prep is False or prep is None:
+        prep_spec = None
+    elif isinstance(prep, PrepSpec):
+        if bias and not prep.bias:
+            raise ValueError("bias=True conflicts with a PrepSpec without bias")
+        prep_spec = prep
+    else:
+        raise TypeError(f"prep must be a bool or a PrepSpec, got {prep!r}")
+    prep = prep_spec is not None
+    if prep:
+        bias = prep_spec.bias
     assert K % BLOCK_K == 0 and K >= 2 * BLOCK_K
     if num_xcds is None:
         num_xcds = get_cdna4_num_xcds() if xcd_swizzle > 0 else 8
@@ -380,7 +836,20 @@ def compile_int8_gemm_4w(
     if num_cu > 0 and K_ITERS % 2:
         raise ValueError(f"persistent mode requires an even K128 tile count, got K={K}")
     persistent = num_cu > 0
-    assert not persistent or num_cu == num_xcds * 32
+    assert not persistent or num_cu % num_xcds == 0
+    producers = num_cu - consumers
+    if roles > 1 and (
+        not (prep and persistent)
+        or role_cols % BLOCK_N
+        or (consumers < 1 and role_hook is None)
+        or producers <= 0
+        or producers % num_xcds
+        or xcd_swizzle <= 0
+    ):
+        raise ValueError(
+            "roles needs prep, a persistent swizzled grid, role_cols % 256 == 0 "
+            "and 0 < consumers < num_cu with producers a multiple of the XCDs"
+        )
 
     # Quadrants of the wave's tile grid by (A half, B half).
     def quadrant(a_half, b_half):
@@ -421,7 +890,14 @@ def compile_int8_gemm_4w(
     # the next block's LDS-DMA loads, and add to that tile's phase 3 wait.
     # Tile K_ITERS - 1's phase 3 wait, or with no next block tile
     # K_ITERS - 2's wait for everything, then covers them.
-    SCALE_LOADS = StoreCInt8Rows.SCALE_LOADS
+    SCALE_LOADS = (
+        StoreCInt8Rows.SCALE_LOADS
+        + (StoreCInt8Rows.BIAS_LOADS if bias else 0)
+        + (StoreCInt8Rows.GAMMA_LOADS if prep and prep_spec.gammas else 0)
+    )
+    # Only a norm across heads leaves a per-row factor to the consumers.
+    ACROSS_HEADS = prep and prep_spec.norm == "rms_across_heads"
+    FIRST_BLOCK = first_block_hook is not None
     assert P3_VMCNT_TILE0 + SCALE_LOADS <= 63
     # Phase 1's last A-hi reads and phase 2's last B-hi reads must land
     # before the phase's barrier. Phase 2's A loads do not count against that
@@ -434,7 +910,18 @@ def compile_int8_gemm_4w(
         f"1x{xcd_swizzle}_k{K}"
         + (f"_p{num_cu}" if persistent else "")
         + (f"_xcd{num_xcds}" if num_xcds != 8 else "")
+        + ("_bias" if bias else "")
+        + ("_prep" + prep_spec.suffix if prep else "")
+        + (f"_eps{eps:g}" if (prep or consumers) and eps != 1e-6 else "")
+        + ("_amax" if amax and not prep else "")
+        + (f"_roles{roles}x{role_cols}c{consumers}" if roles > 1 else "")
+        + (f"_hook{hook_key}" if role_hook is not None else "")
+        + ("_fb" if first_block_hook is not None else "")
+        + ("_th" if tile_hook is not None else "")
+        + (f"_cmax{col_amax_offset}" if col_amax_offset is not None else "")
     )
+    if col_amax_offset is not None and roles < 2:
+        raise ValueError("col_amax_offset needs roles > 1")
 
     @fx.struct
     class SharedStorage:
@@ -450,8 +937,18 @@ def compile_int8_gemm_4w(
         C: fx.Tensor,
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
+        Cos: fx.Tensor,
+        Sin: fx.Tensor,
+        Partials: fx.Tensor,
         c_m: fx.Int32,
         c_n: fx.Int32,
+        aux: fx.Int64,
+        h0: fx.Int64,
+        h1: fx.Int64,
+        h2: fx.Int64,
+        h3: fx.Int64,
+        h4: fx.Int64,
+        h5: fx.Int64,
     ):
         m_blocks = ceildiv(c_m, BLOCK_M)
         n_blocks = ceildiv(c_n, BLOCK_N)
@@ -466,9 +963,15 @@ def compile_int8_gemm_4w(
         wave_m = wave_id // 2
         wave_n = wave_id % 2
 
-        def block_coords(block):
+        def block_coords(block, role=0):
             # A persistent grid is a multiple of num_xcds workgroups or
             # covers all blocks, so block b stays on its workgroup's XCD.
+            if const_expr(roles > 1):
+                # ``block`` counts within the role, so it keeps that property.
+                m, n = _xcd_swizzle_any(
+                    m_blocks, role_cols // BLOCK_N, xcd_swizzle, block, num_xcds
+                )
+                return m, n + role * (role_cols // BLOCK_N)
             if const_expr(xcd_swizzle > 0):
                 return _xcd_swizzle_any(
                     m_blocks,
@@ -878,229 +1381,175 @@ def compile_int8_gemm_4w(
             return acc_values, a_values, b_values
 
         store_c = StoreCInt8Rows(
-            A_scale, B_scale, C, c_m, c_n, None, WAVE_TILES, WAVE_TILES
+            A_scale,
+            B_scale,
+            C,
+            c_m,
+            c_n,
+            None,
+            WAVE_TILES,
+            WAVE_TILES,
+            has_bias=bias,
+            prep=(Cos, Sin, Partials) if prep else None,
+            prep_spec=prep_spec,
+            eps=eps,
+            amax_partials=Partials if amax and not prep else None,
+            planar_cols=role_cols if roles > 1 else 0,
         )
 
-        # Prologue: the first block's K tiles 0 and 1 in flight, wait for
-        # tile 0, read its lo operands. Tile 0's phase 3 wait in a persistent
-        # workgroup counts on an epilogue before it, so the first block also
-        # waits for tile 1 here.
-        block0 = fx.Int32(fx.block_idx.x)
-        coords = list(block_coords(block0))
-        voffsets = ([], [])
-        for _, operand, emit in voffset_ops():
-            voffsets[operand].append(emit(coords))
-        for t in range_constexpr(2):
-            a_loads, b_loads = tile_loads(voffsets, t)
-            for g2s, loads in ((a_g2s, a_loads), (b_g2s, b_loads)):
-                g2s.set_m0(t)
-                for op in loads:
-                    op()
-        fx.rocdl.s_waitcnt(vmcnt=0 if persistent else 2 * LOADS_PER_REGION)
-        fx.rocdl.s_barrier()
-        for read in lo_reads(0):
-            a_ops, b_ops = apply_read(a_ops, b_ops, read)
+        for role in range_constexpr(roles):
+            if const_expr(roles > 1):
+                block_end = m_blocks * (role_cols // BLOCK_N)
+            else:
+                block_end = num_blocks
+            # Prologue: the first block's K tiles 0 and 1 in flight, wait for
+            # tile 0, read its lo operands. Tile 0's phase 3 wait in a persistent
+            # workgroup counts on an epilogue before it, so the first block also
+            # waits for tile 1 here.
+            block0 = fx.Int32(fx.block_idx.x)
+            if const_expr(roles > 1):
+                # Consumer workgroups run no output blocks.
+                block0 = (block0 < producers).select(block0, block_end)
+            coords = list(block_coords(block0, role))
+            voffsets = ([], [])
+            for _, operand, emit in voffset_ops():
+                voffsets[operand].append(emit(coords))
+            for t in range_constexpr(2):
+                a_loads, b_loads = tile_loads(voffsets, t)
+                for g2s, loads in ((a_g2s, a_loads), (b_g2s, b_loads)):
+                    g2s.set_m0(t)
+                    for op in loads:
+                        op()
+            fx.rocdl.s_waitcnt(vmcnt=0 if persistent else 2 * LOADS_PER_REGION)
+            fx.rocdl.s_barrier()
+            for read in lo_reads(0):
+                a_ops, b_ops = apply_read(a_ops, b_ops, read)
 
-        # Values live across an output block boundary: its coordinates and
-        # offsets, and the lo operands of its first K tile.
-        def block_state(coord_values, offset_values, a_values, b_values):
-            return (
-                coord_values
-                + offset_values[0]
-                + offset_values[1]
-                + lo_state(a_values, b_values)
-            )
+            # Values live across an output block boundary: its coordinates and
+            # offsets, and the lo operands of its first K tile.
+            def block_state(coord_values, offset_values, a_values, b_values):
+                return (
+                    coord_values
+                    + offset_values[0]
+                    + offset_values[1]
+                    + lo_state(a_values, b_values)
+                )
 
-        def unpack_block_state(values, a_values, b_values):
-            values = list(values)
-            coord_values = [values.pop(0) for _ in range(2)]
-            offset_values = (
-                [values.pop(0) for _ in range(LOADS_PER_REGION)],
-                [values.pop(0) for _ in range(LOADS_PER_REGION)],
-            )
-            a_values, b_values = unpack_lo_state(values, a_values, b_values)
-            return coord_values, offset_values, a_values, b_values
+            def unpack_block_state(values, a_values, b_values):
+                values = list(values)
+                coord_values = [values.pop(0) for _ in range(2)]
+                offset_values = (
+                    [values.pop(0) for _ in range(LOADS_PER_REGION)],
+                    [values.pop(0) for _ in range(LOADS_PER_REGION)],
+                )
+                a_values, b_values = unpack_lo_state(values, a_values, b_values)
+                return coord_values, offset_values, a_values, b_values
 
-        def static_tile(
-            acc_values,
-            a_values,
-            b_values,
-            scale_values,
-            next_coord_values,
-            next_offset_values,
-            t,
-            next_voffsets,
-            next_ops,
-            scale_ops,
-        ):
-            """K tile ``t`` of a block, outside the runtime K loop.
-
-            The last two refill from the next block at ``next_voffsets``;
-            tile 0 spreads ``next_ops`` over phase 3 and tile K_ITERS - 2
-            issues ``scale_ops``.
-            """
-            refill = None
-            if const_expr(t + 2 < K_ITERS):
-                refill = (voffsets, t + 2)
-            elif const_expr(persistent):
-                refill = (next_voffsets, t + 2 - K_ITERS)
-            p3_vmcnt = P3_VMCNT_TILE0 if t == 0 else P3_VMCNT
-            p1_ops = []
-            if const_expr(t == K_ITERS - 2):
-                p1_ops = scale_ops
-                p3_vmcnt += SCALE_LOADS
-            has_next = t + 1 < K_ITERS or persistent
-            p3_ops = next_ops if t == 0 else ()
-            return k_tile(
+            def static_tile(
                 acc_values,
                 a_values,
                 b_values,
                 scale_values,
                 next_coord_values,
                 next_offset_values,
-                t % 2,
-                refill,
-                has_next,
-                p3_vmcnt,
-                p1_ops,
-                p3_ops,
-            )
-
-        n_pairs = max(0, (K_ITERS - 4) // 2)
-        grid = fx.Int32(fx.grid_dim.x)
-        for block, bstate in range(
-            block0,
-            num_blocks,
-            grid,
-            init=block_state(coords, voffsets, a_ops, b_ops),
-        ):
-            coords, voffsets, a_ops, b_ops = unpack_block_state(bstate, a_ops, b_ops)
-            accs = [[None] * WAVE_TILES for _ in range(WAVE_TILES)]
-
-            # The next block's coordinates and offsets, computed during tile
-            # 0's phase 3 unless tile 0 already loads that block. The last
-            # block reloads itself; nothing reads those loads.
-            next_coords, next_voffsets, next_ops = [], ([], []), []
-            scales = []
-            if const_expr(persistent):
-                this_block = fx.Int32(block)
-
-                def next_coords_op(this_block=this_block):
-                    nxt = this_block + grid
-                    nxt = (nxt < num_blocks).select(nxt, this_block)
-                    return list(block_coords(nxt))
-
-                next_ops = [("coords", next_coords_op)] + voffset_ops()
-                if const_expr(K_ITERS == 2):
-                    for op in next_ops:
-                        (
-                            a_ops,
-                            b_ops,
-                            scales,
-                            next_coords,
-                            next_voffsets,
-                        ) = apply_scheduled_op(
-                            a_ops,
-                            b_ops,
-                            scales,
-                            next_coords,
-                            next_voffsets,
-                            op,
-                        )
-                    next_ops = []
-
-            row_base = coords[0] * BLOCK_M + wave_m * WAVE_ROWS
-            col_base = coords[1] * BLOCK_N + wave_n * WAVE_ROWS
-            scale_ops = [
-                ("scale", op) for op in store_c.scale_load_ops(row_base, col_base)
-            ]
-            # Tiles 0 and 1 start the accumulators. A runtime loop then takes
-            # the tiles that refill from this block, two per trip so the
-            # buffer parity is static; a fully unrolled K loop overflows the
-            # instruction cache.
-            (
-                accs,
-                a_ops,
-                b_ops,
-                scales,
-                next_coords,
-                next_voffsets,
-            ) = static_tile(
-                accs,
-                a_ops,
-                b_ops,
-                scales,
-                next_coords,
-                next_voffsets,
-                0,
+                t,
                 next_voffsets,
                 next_ops,
                 scale_ops,
-            )
-            (
-                accs,
-                a_ops,
-                b_ops,
-                scales,
-                next_coords,
-                next_voffsets,
-            ) = static_tile(
-                accs,
-                a_ops,
-                b_ops,
-                scales,
-                next_coords,
-                next_voffsets,
-                1,
-                next_voffsets,
-                next_ops,
-                scale_ops,
-            )
-            if const_expr(n_pairs > 0):
-                for pair, state in range(
-                    0, n_pairs, 1, init=live_state(accs, a_ops, b_ops)
-                ):
-                    accs, a_ops, b_ops = unpack_state(state, a_ops, b_ops)
-                    t0 = fx.Int32(pair) * 2 + 2
-                    (
-                        accs,
-                        a_ops,
-                        b_ops,
-                        scales,
-                        next_coords,
-                        next_voffsets,
-                    ) = k_tile(
-                        accs,
-                        a_ops,
-                        b_ops,
-                        scales,
-                        next_coords,
-                        next_voffsets,
-                        0,
-                        (voffsets, t0 + 2),
-                        True,
-                    )
-                    (
-                        accs,
-                        a_ops,
-                        b_ops,
-                        scales,
-                        next_coords,
-                        next_voffsets,
-                    ) = k_tile(
-                        accs,
-                        a_ops,
-                        b_ops,
-                        scales,
-                        next_coords,
-                        next_voffsets,
-                        1,
-                        (voffsets, t0 + 3),
-                        True,
-                    )
-                    results = yield live_state(accs, a_ops, b_ops)
-                accs, a_ops, b_ops = unpack_state(results, a_ops, b_ops)
-            for t in range_constexpr(2 + 2 * n_pairs, K_ITERS):
+            ):
+                """K tile ``t`` of a block, outside the runtime K loop.
+
+                The last two refill from the next block at ``next_voffsets``;
+                tile 0 spreads ``next_ops`` over phase 3 and tile K_ITERS - 2
+                issues ``scale_ops``.
+                """
+                refill = None
+                if const_expr(t + 2 < K_ITERS):
+                    # The current block's offsets, read when the tile is traced.
+                    refill = (voffsets, t + 2)  # noqa: B023
+                elif const_expr(persistent):
+                    refill = (next_voffsets, t + 2 - K_ITERS)
+                p3_vmcnt = P3_VMCNT_TILE0 if t == 0 else P3_VMCNT
+                p1_ops = []
+                if const_expr(t == K_ITERS - 2):
+                    p1_ops = scale_ops
+                    p3_vmcnt += SCALE_LOADS
+                has_next = t + 1 < K_ITERS or persistent
+                p3_ops = next_ops if t == 0 else ()
+                return k_tile(
+                    acc_values,
+                    a_values,
+                    b_values,
+                    scale_values,
+                    next_coord_values,
+                    next_offset_values,
+                    t % 2,
+                    refill,
+                    has_next,
+                    p3_vmcnt,
+                    p1_ops,
+                    p3_ops,
+                )
+
+            n_pairs = max(0, (K_ITERS - 4) // 2)
+            if const_expr(roles > 1):
+                grid = fx.Int32(producers)
+            else:
+                grid = fx.Int32(fx.grid_dim.x)
+            for block, bstate in range(
+                block0,
+                block_end,
+                grid,
+                init=block_state(coords, voffsets, a_ops, b_ops),
+            ):
+                coords, voffsets, a_ops, b_ops = unpack_block_state(
+                    bstate, a_ops, b_ops
+                )
+                accs = [[None] * WAVE_TILES for _ in range(WAVE_TILES)]
+
+                # The next block's coordinates and offsets, computed during tile
+                # 0's phase 3 unless tile 0 already loads that block. The last
+                # block reloads itself; nothing reads those loads.
+                next_coords, next_voffsets, next_ops = [], ([], []), []
+                scales = []
+                if const_expr(persistent):
+                    this_block = fx.Int32(block)
+
+                    def next_coords_op(
+                        this_block=this_block, grid=grid, block_end=block_end, role=role
+                    ):
+                        nxt = this_block + grid
+                        nxt = (nxt < block_end).select(nxt, this_block)
+                        return list(block_coords(nxt, role))
+
+                    next_ops = [("coords", next_coords_op)] + voffset_ops()
+                    if const_expr(K_ITERS == 2):
+                        for op in next_ops:
+                            (
+                                a_ops,
+                                b_ops,
+                                scales,
+                                next_coords,
+                                next_voffsets,
+                            ) = apply_scheduled_op(
+                                a_ops,
+                                b_ops,
+                                scales,
+                                next_coords,
+                                next_voffsets,
+                                op,
+                            )
+                        next_ops = []
+
+                row_base = coords[0] * BLOCK_M + wave_m * WAVE_ROWS
+                col_base = coords[1] * BLOCK_N + wave_n * WAVE_ROWS
+                scale_ops = [
+                    ("scale", op) for op in store_c.scale_load_ops(row_base, col_base)
+                ]
+                # Tiles 0 and 1 start the accumulators. A runtime loop then takes
+                # the tiles that refill from this block, two per trip so the
+                # buffer parity is static; a fully unrolled K loop overflows the
+                # instruction cache.
                 (
                     accs,
                     a_ops,
@@ -1115,24 +1564,222 @@ def compile_int8_gemm_4w(
                     scales,
                     next_coords,
                     next_voffsets,
-                    t,
+                    0,
                     next_voffsets,
                     next_ops,
                     scale_ops,
                 )
-
-            store_c.store_tiles(_mfma_drain(accs), row_base, col_base, scales)
-            if const_expr(persistent):
-                coords = list(next_coords)
-                voffsets = (
-                    list(next_voffsets[0]),
-                    list(next_voffsets[1]),
+                (
+                    accs,
+                    a_ops,
+                    b_ops,
+                    scales,
+                    next_coords,
+                    next_voffsets,
+                ) = static_tile(
+                    accs,
+                    a_ops,
+                    b_ops,
+                    scales,
+                    next_coords,
+                    next_voffsets,
+                    1,
+                    next_voffsets,
+                    next_ops,
+                    scale_ops,
                 )
-            _ = yield block_state(coords, voffsets, a_ops, b_ops)
+                if const_expr(n_pairs > 0):
+                    for pair, state in range(
+                        0, n_pairs, 1, init=live_state(accs, a_ops, b_ops)
+                    ):
+                        accs, a_ops, b_ops = unpack_state(state, a_ops, b_ops)
+                        t0 = fx.Int32(pair) * 2 + 2
+                        (
+                            accs,
+                            a_ops,
+                            b_ops,
+                            scales,
+                            next_coords,
+                            next_voffsets,
+                        ) = k_tile(
+                            accs,
+                            a_ops,
+                            b_ops,
+                            scales,
+                            next_coords,
+                            next_voffsets,
+                            0,
+                            (voffsets, t0 + 2),
+                            True,
+                        )
+                        (
+                            accs,
+                            a_ops,
+                            b_ops,
+                            scales,
+                            next_coords,
+                            next_voffsets,
+                        ) = k_tile(
+                            accs,
+                            a_ops,
+                            b_ops,
+                            scales,
+                            next_coords,
+                            next_voffsets,
+                            1,
+                            (voffsets, t0 + 3),
+                            True,
+                        )
+                        results = yield live_state(accs, a_ops, b_ops)
+                    accs, a_ops, b_ops = unpack_state(results, a_ops, b_ops)
+                for t in range_constexpr(2 + 2 * n_pairs, K_ITERS):
+                    (
+                        accs,
+                        a_ops,
+                        b_ops,
+                        scales,
+                        next_coords,
+                        next_voffsets,
+                    ) = static_tile(
+                        accs,
+                        a_ops,
+                        b_ops,
+                        scales,
+                        next_coords,
+                        next_voffsets,
+                        t,
+                        next_voffsets,
+                        next_ops,
+                        scale_ops,
+                    )
 
-        if const_expr(persistent):
-            # LDS-DMA must not land in LDS that a later workgroup owns.
-            fx.rocdl.s_waitcnt(vmcnt=0)
+                if const_expr(roles > 1):
+                    col_max = None
+                    if const_expr(col_amax_offset is not None and role == roles - 1):
+                        col_max = aux + col_amax_offset
+                    store_c.store_tiles(
+                        _mfma_drain(accs),
+                        row_base,
+                        col_base,
+                        scales,
+                        prep=role < roles - 1,
+                        col_max=col_max,
+                    )
+                    # Every wave's stores of the tile land before the tile is counted.
+                    fx.rocdl.s_waitcnt(vmcnt=0)
+                    fx.barrier()
+                    if const_expr(tile_hook is not None):
+                        tile_hook(
+                            role, aux, (h0, h1, h2, h3, h4, h5), c_m, row_base, col_base
+                        )
+                    if fx.thread_idx.x == 0:
+                        fx.atomic_add(
+                            _global_ptr(aux + role * 4, fx.Int32),
+                            fx.Int32(1),
+                            syncscope=fx.rocdl.SyncScope.Agent,
+                            ordering=fx.AtomicOrdering.Release,
+                        )
+                    # A trace-time branch around a runtime one; they do not merge.
+                    if const_expr(FIRST_BLOCK and role > 0):  # noqa: SIM102
+                        if fx.Int32(block) == block0:
+                            first_block_hook(role, aux, (h0, h1, h2, h3, h4, h5), c_m)
+                else:
+                    store_c.store_tiles(_mfma_drain(accs), row_base, col_base, scales)
+                if const_expr(persistent):
+                    coords = list(next_coords)
+                    voffsets = (
+                        list(next_voffsets[0]),
+                        list(next_voffsets[1]),
+                    )
+                _ = yield block_state(coords, voffsets, a_ops, b_ops)
+
+            if const_expr(persistent):
+                # LDS-DMA must not land in LDS that a later workgroup owns.
+                fx.rocdl.s_waitcnt(vmcnt=0)
+            if const_expr(role_hook is not None):
+                role_hook(role, aux, (h0, h1, h2, h3, h4, h5), c_m)
+
+        if const_expr(roles > 1 and consumers > 0):
+            partials_view = store_c.partials_div
+            maxima_base = store_c.maxima_base
+            load_atom = store_c.scale_atom_4
+            load_reg = store_c.reg_f32_4
+            if fx.Int32(fx.block_idx.x) >= producers:
+                tid = fx.Int32(fx.thread_idx.x)
+                worker = (fx.Int32(fx.block_idx.x) - producers) * (N_WAVES * 64) + tid
+                heads = c_n // 128
+                tiles_per_role = m_blocks * (role_cols // BLOCK_N)
+                factors_out = ptr_buf_tensor(
+                    aux + 64, fx.Float32, num_records_bytes=c_m * 4 * (roles - 1)
+                )
+                for role in range_constexpr(roles):
+                    if tid == 0:
+                        spin_until_ge_i32_agent(aux + role * 4, tiles_per_role)
+                    fx.barrier()
+                    fx.memory_fence(
+                        ordering=fx.AtomicOrdering.Acquire,
+                        syncscope=fx.rocdl.SyncScope.Agent,
+                    )
+                    for row, state in range(
+                        worker,
+                        c_m,
+                        fx.Int32(consumers * N_WAVES * 64),
+                        init=[fx.Float32(0.0)],
+                    ):
+                        row = fx.Int32(row)
+                        current = state[0]
+                        sq = fx.Float32(0.0)
+                        peak = fx.Float32(0.0)
+                        for quad in range_constexpr(role_cols // 512):
+                            head = role * (role_cols // 128) + quad * 4
+                            maxima = _load_f32x4(
+                                partials_view,
+                                maxima_base + row * heads + head,
+                                load_atom,
+                                load_reg,
+                            )
+                            for k in range_constexpr(4):
+                                peak = peak.maximumf(maxima[k])
+                            if const_expr(role < roles - 1 and ACROSS_HEADS):
+                                sums = _load_f32x4(
+                                    partials_view,
+                                    row * heads + head,
+                                    load_atom,
+                                    load_reg,
+                                )
+                                for k in range_constexpr(4):
+                                    sq = sq + sums[k]
+                        if const_expr(role < roles - 1 and ACROSS_HEADS):
+                            factor = fmath.rsqrt(sq * (1.0 / role_cols) + eps)
+                            buf_copy_store(
+                                factors_out, role * c_m + row, factor, fx.Float32
+                            )
+                            peak = peak * factor
+                        elif const_expr(role < roles - 1):
+                            # The epilogue already normalized (or there is no norm).
+                            buf_copy_store(
+                                factors_out,
+                                role * c_m + row,
+                                fx.Float32(1.0),
+                                fx.Float32,
+                            )
+                        current = current.maximumf(peak)
+                        result = yield [current]
+                    local = fx.Float32(result)
+                    for shift in (32, 16, 8, 4, 2, 1):
+                        local = local.maximumf(local.shuffle_xor(shift, 64))
+                    if tid % 64 == 0:
+                        fx.atomic_fmax(
+                            _global_ptr(aux + 16 + role * 4, fx.Float32),
+                            local,
+                            is_positive=True,
+                            syncscope=fx.rocdl.SyncScope.Agent,
+                        )
+
+    value_attrs = {
+        "rocdl.waves_per_eu": 1,
+        "rocdl.flat_work_group_size": f"{N_WAVES * 64},{N_WAVES * 64}",
+    }
 
     @flyc.jit
     def launch_gemm(
@@ -1148,18 +1795,189 @@ def compile_int8_gemm_4w(
         grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
         if const_expr(persistent):
             grid_x = (grid_x > num_cu).select(fx.Int32(num_cu), grid_x)
+        # Without prep the kernel never reads its cos, sin and partials arguments.
         kernel_gemm(
             A,
             B_T,
             C,
             A_scale,
             B_scale,
+            A_scale,
+            A_scale,
+            A_scale,
             c_m,
             c_n,
-            value_attrs={
-                "rocdl.waves_per_eu": 1,
-                "rocdl.flat_work_group_size": f"{N_WAVES * 64},{N_WAVES * 64}",
-            },
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            value_attrs=value_attrs,
         ).launch(grid=(grid_x, 1, 1), block=(N_WAVES * 64, 1, 1), stream=stream)
 
-    return set_slp_vectorize_once_used(launch_gemm, False)
+    @flyc.jit
+    def launch_gemm_prep(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+        Cos: fx.Tensor,
+        Sin: fx.Tensor,
+        Partials: fx.Tensor,
+        c_m: fx.Int32,
+        c_n: fx.Int32,
+        stream: fx.Stream,
+    ):
+        grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
+        if const_expr(persistent):
+            grid_x = (grid_x > num_cu).select(fx.Int32(num_cu), grid_x)
+        kernel_gemm(
+            A,
+            B_T,
+            C,
+            A_scale,
+            B_scale,
+            Cos,
+            Sin,
+            Partials,
+            c_m,
+            c_n,
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            value_attrs=value_attrs,
+        ).launch(grid=(grid_x, 1, 1), block=(N_WAVES * 64, 1, 1), stream=stream)
+
+    @flyc.jit
+    def launch_gemm_amax(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+        Partials: fx.Tensor,
+        c_m: fx.Int32,
+        c_n: fx.Int32,
+        stream: fx.Stream,
+    ):
+        grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
+        if const_expr(persistent):
+            grid_x = (grid_x > num_cu).select(fx.Int32(num_cu), grid_x)
+        # Without prep the kernel never reads its cos and sin arguments.
+        kernel_gemm(
+            A,
+            B_T,
+            C,
+            A_scale,
+            B_scale,
+            A_scale,
+            A_scale,
+            Partials,
+            c_m,
+            c_n,
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            value_attrs=value_attrs,
+        ).launch(grid=(grid_x, 1, 1), block=(N_WAVES * 64, 1, 1), stream=stream)
+
+    @flyc.jit
+    def launch_gemm_roles(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+        Cos: fx.Tensor,
+        Sin: fx.Tensor,
+        Partials: fx.Tensor,
+        aux: fx.Int64,
+        c_m: fx.Int32,
+        c_n: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel_gemm(
+            A,
+            B_T,
+            C,
+            A_scale,
+            B_scale,
+            Cos,
+            Sin,
+            Partials,
+            c_m,
+            c_n,
+            aux,
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            fx.Int64(0),
+            value_attrs=value_attrs,
+        ).launch(grid=(num_cu, 1, 1), block=(N_WAVES * 64, 1, 1), stream=stream)
+
+    @flyc.jit
+    def launch_gemm_roles_hook(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+        Cos: fx.Tensor,
+        Sin: fx.Tensor,
+        Partials: fx.Tensor,
+        aux: fx.Int64,
+        h0: fx.Int64,
+        h1: fx.Int64,
+        h2: fx.Int64,
+        h3: fx.Int64,
+        h4: fx.Int64,
+        h5: fx.Int64,
+        c_m: fx.Int32,
+        c_n: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel_gemm(
+            A,
+            B_T,
+            C,
+            A_scale,
+            B_scale,
+            Cos,
+            Sin,
+            Partials,
+            c_m,
+            c_n,
+            aux,
+            h0,
+            h1,
+            h2,
+            h3,
+            h4,
+            h5,
+            value_attrs=value_attrs,
+        ).launch(grid=(num_cu, 1, 1), block=(N_WAVES * 64, 1, 1), stream=stream)
+
+    if roles > 1 and role_hook is not None:
+        launcher = launch_gemm_roles_hook
+    elif roles > 1:
+        launcher = launch_gemm_roles
+    elif prep:
+        launcher = launch_gemm_prep
+    elif amax:
+        launcher = launch_gemm_amax
+    else:
+        launcher = launch_gemm
+    return set_slp_vectorize_once_used(launcher, False)
