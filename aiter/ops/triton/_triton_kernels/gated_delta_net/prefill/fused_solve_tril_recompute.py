@@ -132,7 +132,11 @@ def _bp_st2d(
     key=["H", "K", "V", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=["T"])
+# Metadata can be slices of one packed tensor; their alignment changes per batch.
+@triton.jit(
+    do_not_specialize=["T"],
+    do_not_specialize_on_alignment=["cu_seqlens", "sequence_ids", "chunk_ids"],
+)
 def fused_solve_tril_recompute_w_u_kernel(
     A_raw,
     k,
@@ -494,7 +498,11 @@ _RECOMPUTE_WU_HM_DEFAULT_CONFIG = triton.Config(
     key=["H", "Hg", "K", "V", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=["T"])
+# Metadata can be slices of one packed tensor; their alignment changes per batch.
+@triton.jit(
+    do_not_specialize=["T"],
+    do_not_specialize_on_alignment=["cu_seqlens", "sequence_ids", "chunk_ids"],
+)
 def recompute_w_u_head_major_kernel(
     k,
     v,

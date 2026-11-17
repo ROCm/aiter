@@ -4,6 +4,7 @@ import argparse
 import importlib
 import itertools
 import os
+from collections import defaultdict
 
 os.environ.setdefault("AITER_TRITON_ONLY", "1")
 os.environ.setdefault("AITER_USE_SYSTEM_TRITON", "1")
@@ -13,6 +14,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from triton.runtime import JITFunction, driver
 
 import aiter
 from aiter.ops.chunk_gated_delta_rule_fwd_h import (
@@ -25,6 +27,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_net.decode.fused_sigmoid_gatin
     fused_sigmoid_gating_delta_rule_update,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_net.gated_delta_rule_utils import (
+    GATED_DELTA_RULE_TRITON_AUTOTUNE,
     IS_AMD,
     IS_INTEL_ALCHEMIST,
     assert_close,
@@ -37,6 +40,18 @@ from aiter.ops.triton._triton_kernels.gated_delta_net.prefill import (
 )
 from aiter.ops.triton._triton_kernels.gated_delta_net.prefill import (
     fused_solve_tril_recompute as fused_solve_module,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_kernel_h_opt_vk,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.chunk_o import (
+    chunk_fwd_kernel_o_opt_vk,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.fused_cumsum_kkt import (
+    fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_net.utils.solve_tril import (
+    merge_16x16_to_64x64_inverse_kernel,
 )
 from aiter.ops.triton.gated_delta_net import (
     chunk_gated_delta_rule,
@@ -1603,6 +1618,90 @@ def test_chunk_opt_vk_varlen(
     assert_close("o", ref, tri, 0.005)
     # ref_ht is [N, H, K, V], tri_ht is [N, H, V, K]
     assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
+
+
+def _jit_function(kernel) -> JITFunction:
+    """Unwrap ``@triton.heuristics`` and ``@triton.autotune`` to the JITFunction."""
+    jit = kernel
+    while not isinstance(jit, JITFunction):
+        if not hasattr(jit, "fn"):
+            raise TypeError(f"{kernel!r} does not wrap a triton JITFunction")
+        jit = jit.fn
+    return jit
+
+
+@pytest.mark.skipif(
+    GATED_DELTA_RULE_TRITON_AUTOTUNE,
+    reason="autotuning compiles one variant per candidate config",
+)
+@torch.inference_mode()
+def test_chunk_opt_vk_prefill_metadata_does_not_add_specializations(monkeypatch):
+    # The default dispatch: up to 32 chunks run the fused solve kernel, more run
+    # solve_tril and the head-major recompute.
+    monkeypatch.setattr(fused_solve_module, "_SOLVE_TRIL_RECOMPUTE_FORCE", "")
+    monkeypatch.setattr(fused_solve_module, "_SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX", 32)
+    monkeypatch.setattr(
+        fused_solve_module, "_SOLVE_TRIL_RECOMPUTE_VARLEN_USE_SPLIT", None
+    )
+    current_device = driver.active.get_current_device()
+    caches = {}
+    for kernel in (
+        fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel,
+        fused_solve_module.fused_solve_tril_recompute_w_u_kernel,
+        fused_solve_module.recompute_w_u_head_major_kernel,
+        merge_16x16_to_64x64_inverse_kernel,
+        chunk_gated_delta_rule_fwd_kernel_h_opt_vk,
+        chunk_fwd_kernel_o_opt_vk,
+    ):
+        jit = _jit_function(kernel)
+        monkeypatch.setattr(jit, "device_caches", defaultdict(jit.create_binder))
+        caches[jit.fn.__name__] = jit.device_caches[current_device][0]
+    # The metadata builder packs its index arrays into one tensor. (Total chunks,
+    # sequences) = (1, 1), (2, 1), (3, 2), (4, 1) and (4, 4) slice it at four
+    # 16-byte alignment patterns; (33, 1) and (34, 1) take the split path at two.
+    checked = ([10], [100], [64, 100], [200], [64] * 4)
+    split_path = ([2112], [2176])
+    H, D, dtype = 4, 64, torch.bfloat16
+    for seq_lens in checked + split_path:
+        torch.manual_seed(0)
+        bounds = [0, *itertools.accumulate(seq_lens)]
+        T, N = bounds[-1], len(seq_lens)
+        q = torch.randn(1, T, H, D, dtype=dtype, device=device)
+        k = F.normalize(torch.randn(1, T, H, D, device=device), p=2, dim=-1).to(dtype)
+        v = torch.randn(1, T, H, D, dtype=dtype, device=device)
+        g = F.logsigmoid(torch.rand(1, T, H, dtype=dtype, device=device))
+        beta = torch.rand(1, T, H, dtype=dtype, device=device).sigmoid()
+        h0 = torch.randn(N, H, D, D, dtype=dtype, device=device)
+        tri, tri_ht = chunk_gated_delta_rule_opt_vk(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=h0.transpose(-1, -2).contiguous(),
+            output_final_state=True,
+            cu_seqlens=torch.tensor(bounds, dtype=torch.int32, device=device),
+            seq_lens_cpu=seq_lens,
+        )
+        if seq_lens in split_path:
+            continue  # compiled variants only
+        refs = [
+            recurrent_gated_delta_rule_ref(
+                q=q[:, start:end],
+                k=k[:, start:end],
+                v=v[:, start:end],
+                beta=beta[:, start:end],
+                g=g[:, start:end],
+                initial_state=h0[i],
+                output_final_state=True,
+            )
+            for i, (start, end) in enumerate(itertools.pairwise(bounds))
+        ]
+        assert_close("o", torch.cat([o for o, _ in refs], 1), tri, 0.005)
+        ref_ht = torch.cat([ht for _, ht in refs], 0)
+        assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
+    variants = {name: len(cache) for name, cache in caches.items()}
+    assert variants == dict.fromkeys(variants, 1)
 
 
 def _free_gib() -> float:
