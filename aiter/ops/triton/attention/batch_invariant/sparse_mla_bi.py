@@ -114,6 +114,7 @@ def sparse_mla_bi_fwd(
     return_lse: bool = False,
     attn_sink: torch.Tensor | None = None,
     _mode: str | None = None,
+    _addr64: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sparse (top-k gathered) MLA attention with batch-invariant bits.
 
@@ -164,6 +165,8 @@ def sparse_mla_bi_fwd(
         raise ValueError(f"kv_buffer is on {kv_buffer.device}, q is on {q.device}")
     fp8, kv, kv16, kv32, block_size, page_stride = _cache_args(kv_buffer, kv_scale, d_qk)
     num_slots = kv_buffer.shape[0] * block_size
+    # Buffer loads take 32-bit byte offsets; a larger cache (or _addr64) uses 64-bit pointers.
+    buf = not _addr64 and kv.shape[0] * kv.stride(0) * kv.element_size() < 2**31
     if num_slots >= 2**31:
         raise ValueError(f"the cache has {num_slots} slots; slot ids are int32")
     kv_indptr = _int32_1d(kv_indptr, "kv_indptr", q.device)
@@ -203,12 +206,12 @@ def sparse_mla_bi_fwd(
     # Head tiles hold 16 heads per warp row; the bits do not depend on the tile.
     big = cfg["fused"] if H > cfg["fused_small_max_heads"] else cfg["fused_small"]
     if _mode is None:
-        fused = C * triton.cdiv(H, big["block_h"]) >= cfg["fused_min_programs"]
+        # Split mode wins while the fused grid cannot fill the GPU.
+        fused = C * H >= cfg["fused_min_row_heads"]
     else:
         fused = _mode == "fused"
     tile = big if fused else cfg["split"]
     block_h, num_warps = tile["block_h"], tile["num_warps"]
-    prefetch = tile["prefetch"]
     heads_blocks = triton.cdiv(H, block_h)
     scale_log2 = float(softmax_scale) * math.log2(math.e)
     common = dict(
@@ -218,8 +221,9 @@ def sparse_mla_bi_fwd(
         D=KV_LORA_RANK,
         R=ROPE_DIM,
         NUM_SPLITS=NUM_SPLITS,
-        PREFETCH=prefetch,
+        BUF=buf,
         num_warps=num_warps,
+        waves_per_eu=tile.get("waves_per_eu", 0),
         enable_fp_fusion=False,
     )
     if fused:
@@ -272,7 +276,8 @@ def sparse_mla_bi_fwd(
         H,
         **common,
     )
-    _sparse_mla_bi_combine_kernel[(C, heads_blocks)](
+    comb = cfg["combine"]
+    _sparse_mla_bi_combine_kernel[(C, triton.cdiv(H, comb["block_h"]))](
         part_acc,
         part_m,
         part_l,
@@ -284,10 +289,10 @@ def sparse_mla_bi_fwd(
         H,
         HAS_SINK=has_sink,
         HAS_LSE=return_lse,
-        BLOCK_H=block_h,
+        BLOCK_H=comb["block_h"],
         D=KV_LORA_RANK,
         NUM_SPLITS=NUM_SPLITS,
-        num_warps=num_warps,
+        num_warps=comb["num_warps"],
         enable_fp_fusion=False,
     )
     return out, (lse if return_lse else None)

@@ -74,6 +74,16 @@ def _load_q(q_ptr, q_base, q_s1, h0, num_heads, BLOCK_H, D, R, NUM_WARPS):
 
 
 @gluon.jit
+def _ld(base, off, mask, other, BUF: gl.constexpr):
+    # Masked lanes issue no read.
+    if BUF:
+        y = gl.amd.cdna4.buffer_load(base, off, mask=mask, other=other)
+    else:
+        y = gl.load(base + off, mask=mask, other=other)
+    return y
+
+
+@gluon.jit
 def _gather_tile(
     kv_ptr,
     kv_bf16_ptr,
@@ -90,6 +100,7 @@ def _gather_tile(
     D: gl.constexpr,
     R: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    BUF: gl.constexpr,
 ):
     """Load key tile [k0, k0 + KEY_TILE) of the row into registers: four 128-column
     latent chunks, their scales (fp8_dsv32_mla), the rope and the key mask. Keys
@@ -104,30 +115,32 @@ def _gather_tile(
     # -1 sentinels and ids outside the cache are masked out, never read.
     valid = (slot >= 0) & (slot < num_slots)
     slot = gl.where(valid, slot, 0)
-    # Row start: bytes (fp8_dsv32_mla) or bf16 elements (bf16), 64-bit.
+    # Row start: bytes (fp8_dsv32_mla) or bf16 elements (bf16). BUF: the cache is
+    # under 2 GiB, so 32-bit buffer offsets; else 64-bit pointers.
     ROW: gl.constexpr = (D + 4 * (D // 128) + 2 * R) if FP8 else (D + R)
-    row = (slot // block_size).to(gl.int64) * page_stride + (slot % block_size).to(
-        gl.int64
-    ) * ROW
+    if BUF:
+        row = (slot // block_size) * page_stride + (slot % block_size) * ROW
+    else:
+        row = (slot // block_size).to(gl.int64) * page_stride + (
+            slot % block_size
+        ).to(gl.int64) * ROW
     cols = gl.arange(0, G, layout=gl.SliceLayout(0, lg))
     m2 = valid[:, None]
     if FP8:
-        base = kv_ptr + row[:, None] + cols[None, :]
-        x0 = gl.load(base, mask=m2, other=0)
-        x1 = gl.load(base + G, mask=m2, other=0)
-        x2 = gl.load(base + 2 * G, mask=m2, other=0)
-        x3 = gl.load(base + 3 * G, mask=m2, other=0)
-        sp = kv_f32_ptr + (row // 4 + D // 4)
-        s0 = gl.load(sp, mask=valid, other=0.0)
-        s1 = gl.load(sp + 1, mask=valid, other=0.0)
-        s2 = gl.load(sp + 2, mask=valid, other=0.0)
-        s3 = gl.load(sp + 3, mask=valid, other=0.0)
+        x0 = _ld(kv_ptr, row[:, None] + cols[None, :], m2, 0, BUF)
+        x1 = _ld(kv_ptr, row[:, None] + (cols + G)[None, :], m2, 0, BUF)
+        x2 = _ld(kv_ptr, row[:, None] + (cols + 2 * G)[None, :], m2, 0, BUF)
+        x3 = _ld(kv_ptr, row[:, None] + (cols + 3 * G)[None, :], m2, 0, BUF)
+        so = row // 4 + D // 4
+        s0 = _ld(kv_f32_ptr, so, valid, 0.0, BUF)
+        s1 = _ld(kv_f32_ptr, so + 1, valid, 0.0, BUF)
+        s2 = _ld(kv_f32_ptr, so + 2, valid, 0.0, BUF)
+        s3 = _ld(kv_f32_ptr, so + 3, valid, 0.0, BUF)
     else:
-        base = kv_bf16_ptr + row[:, None] + cols[None, :]
-        x0 = gl.load(base, mask=m2, other=0.0)
-        x1 = gl.load(base + G, mask=m2, other=0.0)
-        x2 = gl.load(base + 2 * G, mask=m2, other=0.0)
-        x3 = gl.load(base + 3 * G, mask=m2, other=0.0)
+        x0 = _ld(kv_bf16_ptr, row[:, None] + cols[None, :], m2, 0.0, BUF)
+        x1 = _ld(kv_bf16_ptr, row[:, None] + (cols + G)[None, :], m2, 0.0, BUF)
+        x2 = _ld(kv_bf16_ptr, row[:, None] + (cols + 2 * G)[None, :], m2, 0.0, BUF)
+        x3 = _ld(kv_bf16_ptr, row[:, None] + (cols + 3 * G)[None, :], m2, 0.0, BUF)
         s0 = gl.zeros([KEY_TILE], gl.float32, layout=gl.SliceLayout(1, lg))
         s1 = s0
         s2 = s0
@@ -139,9 +152,7 @@ def _gather_tile(
     else:
         rope0 = rowr + D
     dr = gl.arange(0, R, layout=gl.SliceLayout(0, lr))
-    rope = gl.load(
-        kv_bf16_ptr + rope0[:, None] + dr[None, :], mask=validr[:, None], other=0.0
-    )
+    rope = _ld(kv_bf16_ptr, rope0[:, None] + dr[None, :], validr[:, None], 0.0, BUF)
     return x0, x1, x2, x3, s0, s1, s2, s3, rope, valid
 
 
@@ -238,185 +249,25 @@ def _split_state(
     R: gl.constexpr,
     NUM_SPLITS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    PREFETCH: gl.constexpr,
+    BUF: gl.constexpr,
 ):
     """(m, l, acc) of split s: FP32 online softmax over tiles s, s + NUM_SPLITS, ...
-    in increasing order. m is in the log2 domain (scores * scale * log2 e).
-    PREFETCH issues the next tile's loads before this tile's dots (same bits)."""
+    in increasing order. m is in the log2 domain (scores * scale * log2 e)."""
     mfma: gl.constexpr = _mfma_layout(NUM_WARPS, BLOCK_H)
     row_l: gl.constexpr = gl.SliceLayout(1, mfma)
     m = gl.full([BLOCK_H], float("-inf"), gl.float32, layout=row_l)
     l = gl.zeros([BLOCK_H], gl.float32, layout=row_l)
     acc = gl.zeros([BLOCK_H, D], gl.float32, layout=mfma)
     n_tiles = (n + KEY_TILE - 1) // KEY_TILE
-    if PREFETCH:
-        x0, x1, x2, x3, s0, s1, s2, s3, rope, _v = _gather_tile(
-            kv_ptr,
-            kv_bf16_ptr,
-            kv_f32_ptr,
-            idx_ptr,
-            beg,
-            s * KEY_TILE,
-            n,
-            block_size,
-            page_stride,
-            num_slots,
-            FP8,
-            KEY_TILE,
-            D,
-            R,
-            NUM_WARPS,
-        )
-        for t in range(s, n_tiles, NUM_SPLITS):
-            k0 = t * KEY_TILE
-            _store_tile(x0, x1, x2, x3, s0, s1, s2, s3, rope, kv_smem, rope_smem, FP8)
-            x0, x1, x2, x3, s0, s1, s2, s3, rope, _v = _gather_tile(
-                kv_ptr,
-                kv_bf16_ptr,
-                kv_f32_ptr,
-                idx_ptr,
-                beg,
-                k0 + NUM_SPLITS * KEY_TILE,
-                n,
-                block_size,
-                page_stride,
-                num_slots,
-                FP8,
-                KEY_TILE,
-                D,
-                R,
-                NUM_WARPS,
-            )
-            m, l, acc = _tile_update(
-                q_dot,
-                qr_dot,
-                idx_ptr,
-                beg,
-                k0,
-                n,
-                num_slots,
-                scale_log2,
-                m,
-                l,
-                acc,
-                kv_smem,
-                rope_smem,
-                BLOCK_H,
-                KEY_TILE,
-                NUM_WARPS,
-            )
-    else:
-        for t in range(s, n_tiles, NUM_SPLITS):
-            k0 = t * KEY_TILE
-            x0, x1, x2, x3, s0, s1, s2, s3, rope, _v = _gather_tile(
-                kv_ptr,
-                kv_bf16_ptr,
-                kv_f32_ptr,
-                idx_ptr,
-                beg,
-                k0,
-                n,
-                block_size,
-                page_stride,
-                num_slots,
-                FP8,
-                KEY_TILE,
-                D,
-                R,
-                NUM_WARPS,
-            )
-            _store_tile(x0, x1, x2, x3, s0, s1, s2, s3, rope, kv_smem, rope_smem, FP8)
-            m, l, acc = _tile_update(
-                q_dot,
-                qr_dot,
-                idx_ptr,
-                beg,
-                k0,
-                n,
-                num_slots,
-                scale_log2,
-                m,
-                l,
-                acc,
-                kv_smem,
-                rope_smem,
-                BLOCK_H,
-                KEY_TILE,
-                NUM_WARPS,
-            )
-    return m, l, acc
-
-
-@gluon.jit
-def _fused_walk(
-    q_dot,
-    qr_dot,
-    kv_ptr,
-    kv_bf16_ptr,
-    kv_f32_ptr,
-    idx_ptr,
-    beg,
-    n,
-    scale_log2,
-    block_size,
-    page_stride,
-    num_slots,
-    kv_smem,
-    rope_smem,
-    M,
-    L,
-    O,
-    FP8: gl.constexpr,
-    BLOCK_H: gl.constexpr,
-    KEY_TILE: gl.constexpr,
-    D: gl.constexpr,
-    R: gl.constexpr,
-    NUM_SPLITS: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
-):
-    """All splits in one tile loop (split 0's tiles, then split 1's, ...), so the
-    prefetch also covers the first tile of the next split. Each split is merged when
-    its last tile is done: the same arithmetic as _split_state + _merge."""
-    mfma: gl.constexpr = _mfma_layout(NUM_WARPS, BLOCK_H)
-    row_l: gl.constexpr = gl.SliceLayout(1, mfma)
-    m = gl.full([BLOCK_H], float("-inf"), gl.float32, layout=row_l)
-    l = gl.zeros([BLOCK_H], gl.float32, layout=row_l)
-    acc = gl.zeros([BLOCK_H, D], gl.float32, layout=mfma)
-    n_tiles = (n + KEY_TILE - 1) // KEY_TILE
-    s = 0
-    t = 0
-    x0, x1, x2, x3, s0, s1, s2, s3, rope, _v = _gather_tile(
-        kv_ptr,
-        kv_bf16_ptr,
-        kv_f32_ptr,
-        idx_ptr,
-        beg,
-        0,
-        n,
-        block_size,
-        page_stride,
-        num_slots,
-        FP8,
-        KEY_TILE,
-        D,
-        R,
-        NUM_WARPS,
-    )
-    for _ in range(n_tiles):
+    for t in range(s, n_tiles, NUM_SPLITS):
         k0 = t * KEY_TILE
-        _store_tile(x0, x1, x2, x3, s0, s1, s2, s3, rope, kv_smem, rope_smem, FP8)
-        # Next tile: t + NUM_SPLITS in this split, else the first tile of split s + 1.
-        t_next = t + NUM_SPLITS
-        done = t_next >= n_tiles
-        s_next = gl.where(done, s + 1, s)
-        t_next = gl.where(done, s_next, t_next)
         x0, x1, x2, x3, s0, s1, s2, s3, rope, _v = _gather_tile(
             kv_ptr,
             kv_bf16_ptr,
             kv_f32_ptr,
             idx_ptr,
             beg,
-            t_next * KEY_TILE,
+            k0,
             n,
             block_size,
             page_stride,
@@ -426,7 +277,9 @@ def _fused_walk(
             D,
             R,
             NUM_WARPS,
+            BUF,
         )
+        _store_tile(x0, x1, x2, x3, s0, s1, s2, s3, rope, kv_smem, rope_smem, FP8)
         m, l, acc = _tile_update(
             q_dot,
             qr_dot,
@@ -445,14 +298,7 @@ def _fused_walk(
             KEY_TILE,
             NUM_WARPS,
         )
-        if done:
-            M, L, O = _merge(M, L, O, m, l, acc)
-            m = gl.full([BLOCK_H], float("-inf"), gl.float32, layout=row_l)
-            l = gl.zeros([BLOCK_H], gl.float32, layout=row_l)
-            acc = gl.zeros([BLOCK_H, D], gl.float32, layout=mfma)
-        s = s_next
-        t = t_next
-    return M, L, O
+    return m, l, acc
 
 
 @gluon.jit
@@ -485,10 +331,11 @@ def _finish(
     HAS_LSE: gl.constexpr,
     BLOCK_H: gl.constexpr,
     D: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
+    LAYOUT: gl.constexpr,
 ):
-    """Sink as a last virtual split, then out = O / L (0 for an empty row)."""
-    mfma: gl.constexpr = _mfma_layout(NUM_WARPS, BLOCK_H)
+    """Sink as a last virtual split, then out = O / L (0 for an empty row). O has
+    LAYOUT; every step is per element, so the layout does not change the bits."""
+    mfma: gl.constexpr = LAYOUT
     row_l: gl.constexpr = gl.SliceLayout(1, mfma)
     h = h0 + gl.arange(0, BLOCK_H, layout=row_l)
     hm = h < num_heads
@@ -517,7 +364,7 @@ def _finish(
 
 _split_repr = make_kernel_repr(
     "_sparse_mla_bi_split_kernel",
-    ["FP8", "BLOCK_H", "KEY_TILE", "NUM_SPLITS", "PREFETCH"],
+    ["FP8", "BLOCK_H", "KEY_TILE", "NUM_SPLITS", "BUF"],
 )
 
 
@@ -545,7 +392,7 @@ def _sparse_mla_bi_split_kernel(
     D: gl.constexpr,
     R: gl.constexpr,
     NUM_SPLITS: gl.constexpr,
-    PREFETCH: gl.constexpr,
+    BUF: gl.constexpr,
 ):
     """Grid (rows, NUM_SPLITS, head tiles): one split state -> FP32 partials
     [rows, NUM_SPLITS, H, D] and m, l [rows, NUM_SPLITS, H]."""
@@ -587,7 +434,7 @@ def _sparse_mla_bi_split_kernel(
         R,
         NUM_SPLITS,
         NUM_WARPS,
-        PREFETCH,
+        BUF,
     )
     mfma: gl.constexpr = _mfma_layout(NUM_WARPS, BLOCK_H)
     h = h0 + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma))
@@ -625,18 +472,24 @@ def _sparse_mla_bi_combine_kernel(
     D: gl.constexpr,
     NUM_SPLITS: gl.constexpr,
 ):
-    """Grid (rows, head tiles): merge the split partials in order 0 .. NUM_SPLITS - 1."""
+    """Grid (rows, head tiles): merge the split partials in order 0 .. NUM_SPLITS - 1.
+    The merge is per element, so this layout gives the bits of the fused kernel."""
     NUM_WARPS: gl.constexpr = gl.num_warps()
-    mfma: gl.constexpr = _mfma_layout(NUM_WARPS, BLOCK_H)
-    row_l: gl.constexpr = gl.SliceLayout(1, mfma)
+    lay: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 4],
+        threads_per_warp=[1, 64],
+        warps_per_cta=[NUM_WARPS, 1],
+        order=[1, 0],
+    )
+    row_l: gl.constexpr = gl.SliceLayout(1, lay)
     r = gl.program_id(0)
     h0 = gl.program_id(1) * BLOCK_H
     h = h0 + gl.arange(0, BLOCK_H, layout=row_l)
     hm = h < num_heads
-    d = gl.arange(0, D, layout=gl.SliceLayout(0, mfma))
+    d = gl.arange(0, D, layout=gl.SliceLayout(0, lay))
     M = gl.full([BLOCK_H], float("-inf"), gl.float32, layout=row_l)
     L = gl.zeros([BLOCK_H], gl.float32, layout=row_l)
-    O = gl.zeros([BLOCK_H, D], gl.float32, layout=mfma)
+    O = gl.zeros([BLOCK_H, D], gl.float32, layout=lay)
     for s in range(NUM_SPLITS):
         base = (r.to(gl.int64) * NUM_SPLITS + s) * num_heads
         m = gl.load(part_m_ptr + base + h, mask=hm, other=float("-inf"))
@@ -663,13 +516,13 @@ def _sparse_mla_bi_combine_kernel(
         HAS_LSE,
         BLOCK_H,
         D,
-        NUM_WARPS,
+        lay,
     )
 
 
 _fused_repr = make_kernel_repr(
     "_sparse_mla_bi_fused_kernel",
-    ["FP8", "HAS_SINK", "HAS_LSE", "BLOCK_H", "KEY_TILE", "NUM_SPLITS", "PREFETCH"],
+    ["FP8", "HAS_SINK", "HAS_LSE", "BLOCK_H", "KEY_TILE", "NUM_SPLITS", "BUF"],
 )
 
 
@@ -701,7 +554,7 @@ def _sparse_mla_bi_fused_kernel(
     D: gl.constexpr,
     R: gl.constexpr,
     NUM_SPLITS: gl.constexpr,
-    PREFETCH: gl.constexpr,
+    BUF: gl.constexpr,
 ):
     """Grid (rows, head tiles): the splits one after the other, merged in order."""
     NUM_WARPS: gl.constexpr = gl.num_warps()
@@ -723,8 +576,8 @@ def _sparse_mla_bi_fused_kernel(
     M = gl.full([BLOCK_H], float("-inf"), gl.float32, layout=row_l)
     L = gl.zeros([BLOCK_H], gl.float32, layout=row_l)
     O = gl.zeros([BLOCK_H, D], gl.float32, layout=mfma)
-    if PREFETCH:
-        M, L, O = _fused_walk(
+    for s in range(NUM_SPLITS):
+        m, l, acc = _split_state(
             q_dot,
             qr_dot,
             kv_ptr,
@@ -733,15 +586,13 @@ def _sparse_mla_bi_fused_kernel(
             idx_ptr,
             beg,
             n,
+            s,
             scale_log2,
             block_size,
             page_stride,
             num_slots,
             kv_smem,
             rope_smem,
-            M,
-            L,
-            O,
             FP8,
             BLOCK_H,
             KEY_TILE,
@@ -749,35 +600,9 @@ def _sparse_mla_bi_fused_kernel(
             R,
             NUM_SPLITS,
             NUM_WARPS,
+                BUF,
         )
-    else:
-        for s in range(NUM_SPLITS):
-            m, l, acc = _split_state(
-                q_dot,
-                qr_dot,
-                kv_ptr,
-                kv_bf16_ptr,
-                kv_f32_ptr,
-                idx_ptr,
-                beg,
-                n,
-                s,
-                scale_log2,
-                block_size,
-                page_stride,
-                num_slots,
-                kv_smem,
-                rope_smem,
-                FP8,
-                BLOCK_H,
-                KEY_TILE,
-                D,
-                R,
-                NUM_SPLITS,
-                NUM_WARPS,
-                PREFETCH,
-            )
-            M, L, O = _merge(M, L, O, m, l, acc)
+        M, L, O = _merge(M, L, O, m, l, acc)
     _finish(
         M,
         L,
@@ -794,5 +619,5 @@ def _sparse_mla_bi_fused_kernel(
         HAS_LSE,
         BLOCK_H,
         D,
-        NUM_WARPS,
+        mfma,
     )

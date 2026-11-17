@@ -153,12 +153,14 @@ def test_against_sparse_mla_fwd(H):
 @pytest.mark.parametrize("fp8", [True, False])
 @pytest.mark.parametrize("H", [12, 16, 96, 128])
 def test_modes_same_bits(fp8, H):
-    """Split + combine and fused give the same bits."""
+    """Split + combine and fused, with buffer loads or 64-bit pointers, give the
+    same bits."""
     inp = make_inputs(LENS, H, 4096, fp8=fp8)
     a, la = run(inp, _mode="split", return_lse=True)
-    b, lb = run(inp, _mode="fused", return_lse=True)
-    assert torch.equal(a, b)
-    assert torch.equal(la, lb)
+    for mode, addr64 in (("fused", False), ("split", True), ("fused", True)):
+        b, lb = run(inp, _mode=mode, _addr64=addr64, return_lse=True)
+        assert torch.equal(a, b), (mode, addr64)
+        assert torch.equal(la, lb), (mode, addr64)
 
 
 @pytest.mark.parametrize("fp8", [True, False])
