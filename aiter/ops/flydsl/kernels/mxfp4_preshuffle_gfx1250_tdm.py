@@ -357,6 +357,9 @@ def build_gemm_a8w4_tdm_task(
     next_stage_on = 1 if (next_stage_prefetch and num_buffers >= 2) else 0
     assert rolled_drain in (0, 1), "rolled_drain must be 0 or 1"
     rolled_drain = bool(rolled_drain)
+    # full_cluster is derived from the unpadded tile map, so a tile m_align
+    # skips would leave its M peers waiting in cluster_sync().
+    assert not (m_align and cluster_m > 1), "m_align requires cluster_m=1"
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
     wmma_m_rep = warp_tile_m // WMMA_M
@@ -2009,11 +2012,13 @@ def build_gemm_a8w4_tdm_task(
                             issue(s, kt + num_buffers, my_jobs)
 
                     dispatch_wave_job(steady_post)
+                    if const_expr(item_hooks is not None):
+                        item_hooks[0]["drain_start"]()
                     for j in range_constexpr(num_buffers):
                         kt = n_steady + j
                         buf = kt % num_buffers
                         has_next = next_stage_on and j + 1 < num_buffers
-                        pipeline_fence(
+                        stage_fence(
                             outstanding=TDM_PER
                             * max(0, num_buffers - 1 - j - (1 if has_next else 0))
                         )
