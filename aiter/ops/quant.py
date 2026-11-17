@@ -15,6 +15,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..plugin import route as _route
 from ..utility import dtypes, fp4_utils
 from ..utility import mx_types as _mx_types
 from ..utility.mx_types import (
@@ -61,6 +62,7 @@ def get_dtype_max(dtype):
     return dtypeMax
 
 
+@_route(op="pertoken_quant", version=1)
 def pertoken_quant(
     x,
     scale=None,
@@ -69,6 +71,35 @@ def pertoken_quant(
     quant_dtype=dtypes.i8,
     dtypeMax=None,
 ):
+    """Symmetric per-token quantization: one scale per row of ``x``.
+
+    The reduction is over the LAST axis, so "token" means a row however many
+    leading axes ``x`` has -- ``per_block_quant_wrapper`` relies on that,
+    reshaping ``[m, n]`` to ``[-1, blk_n]`` and calling this to get
+    ``per_1x128`` and friends out of the same body.
+
+    Args:
+        x: input of any shape; quantized along the last axis.
+        scale: a precomputed per-token scale ``[..., 1]``. Given, it is used
+            as-is and nothing is reduced -- a caller that already knows the
+            scale (static quant, or a scale shared across a step) skips the
+            amax pass. ``None`` derives it from ``x``.
+        x_scale: optional smoothquant scale multiplied into ``x`` BEFORE the
+            amax. Not the output scale, and not a second name for ``scale``.
+        scale_dtype: dtype the returned scale is cast to.
+        quant_dtype: output dtype; also fixes ``dtypeMax`` when that is None.
+        dtypeMax: the magnitude ``quant_dtype`` is scaled to. Pass it to
+            quantize against a bound other than the dtype's own maximum.
+
+    Returns:
+        ``(y, y_scale)`` -- a new ``quant_dtype`` tensor shaped like ``x``,
+        and the ``scale_dtype`` scale of shape ``[..., 1]``. Nothing is
+        written in place.
+
+    A row whose amax is zero would give a zero scale and a division by it, so
+    that scale is forced to 1: an all-zero row quantizes to zeros rather than
+    to NaN.
+    """
     x = x.to(dtypes.fp32)
     if x_scale is None:
         hidden_states = x
@@ -443,8 +474,12 @@ def per_token_quant_hip(
 SCALE_LAYOUT_M32K4_SUPPORTED = True
 
 
-@torch_compile_guard()
-def per_group_quant_hip(
+# Routed on a neutrally named layer, not on the public spelling: a route's
+# contract is the decorated function's whole signature, so decorating
+# `per_group_quant_hip` would put a backend-named function into a contract
+# providers implement against. `rmsnorm` sits the same way, below its two
+# public names.
+def _per_group_quant_fake(
     x: Tensor,
     scale: Tensor | None = None,
     quant_dtype: torch.dtype = dtypes.i8,
@@ -455,6 +490,57 @@ def per_group_quant_hip(
     scale_type: torch.dtype = dtypes.fp32,
     scale_layout_m32k4: bool = False,
 ) -> "tuple[Tensor, Tensor]":
+    """Shapes only -- both results are freshly allocated here, so neither
+    aliases an argument and registration has nothing to declare about them.
+
+    ``transpose_scale`` shuffles the scale's contents inside the kernel and
+    does not move its shape, so it does not appear below; the scale is
+    allocated to the same shape either way.
+    """
+    shape = x.shape
+    y = torch.empty(shape, dtype=quant_dtype, device=x.device)
+    if scale_layout_m32k4:
+        m = x.numel() // shape[-1]
+        return y, torch.empty(
+            ((m + 31) // 32 * 32, shape[-1] // 32), dtype=scale_type, device=x.device
+        )
+    return y, torch.empty(
+        (*shape[:-1], shape[-1] // group_size), dtype=scale_type, device=x.device
+    )
+
+
+@_route(op="per_group_quant", version=1, fake=_per_group_quant_fake)
+def _per_group_quant_routed(
+    x: Tensor,
+    scale: Tensor | None = None,
+    quant_dtype: torch.dtype = dtypes.i8,
+    group_size: int = 128,
+    transpose_scale: bool = False,
+    num_rows: "torch.Tensor | None" = None,
+    num_rows_factor: int = 1,
+    scale_type: torch.dtype = dtypes.fp32,
+    scale_layout_m32k4: bool = False,
+) -> "tuple[Tensor, Tensor]":
+    """Quantize ``x`` in groups along its last axis, one scale per group.
+
+    Returns ``(y, scale)`` -- a new ``quant_dtype`` tensor shaped like ``x``
+    and its ``scale_type`` scales. Nothing is written through the arguments.
+
+    Args:
+        x: input; the last axis is split into ``group_size``-wide groups.
+        scale: must be None -- a precomputed scale raises rather than being
+            silently ignored.
+        quant_dtype: output dtype.
+        group_size: elements per group; 32, 64 or 128.
+        transpose_scale: emit scales in the shuffled layout the ASM GEMMs
+            read, rather than row-major.
+        num_rows, num_rows_factor: quantize only the leading rows a device
+            tensor names, for a batch whose real height the host does not know.
+        scale_type: dtype of the returned scales.
+        scale_layout_m32k4: MXFP8 1x32 with the scale in the gfx1250 ASM
+            A-scale layout; needs fp8 output, ``group_size=32``, an e8m0
+            ``scale_type`` and ``scale=None``.
+    """
     shape = x.shape
     device = x.device
     if scale_layout_m32k4:
@@ -507,6 +593,37 @@ def per_group_quant_hip(
             num_rows_factor=num_rows_factor,
         )
     return y, scale
+
+
+@torch_compile_guard()
+def per_group_quant_hip(
+    x: Tensor,
+    scale: Tensor | None = None,
+    quant_dtype: torch.dtype = dtypes.i8,
+    group_size: int = 128,
+    transpose_scale: bool = False,
+    num_rows: "torch.Tensor | None" = None,
+    num_rows_factor: int = 1,
+    scale_type: torch.dtype = dtypes.fp32,
+    scale_layout_m32k4: bool = False,
+) -> "tuple[Tensor, Tensor]":
+    """The historical spelling of ``per_group_quant``.
+
+    The name predates a neutral one, so an ordinary call routes and a
+    provider serves callers of this name without any of them changing.
+    Returns ``(y, scale)``; nothing is written through the arguments.
+    """
+    return _per_group_quant_routed(
+        x,
+        scale,
+        quant_dtype,
+        group_size,
+        transpose_scale,
+        num_rows,
+        num_rows_factor,
+        scale_type,
+        scale_layout_m32k4,
+    )
 
 
 def per_1x32_mx_quant_hip(
@@ -850,6 +967,10 @@ def dynamic_per_group_scaled_quant(
     scale-load swizzle when ``group_size == 32``, and a plain transpose
     (``(rows, scaleN) -> (scaleN, rows)`` byte layout) for other group
     sizes.
+
+    For MXFP8 (fp8 output, e8m0 scales), NaN elements stay NaN and do not
+    affect the scale. A group holding an Inf gets scale 2^127 (0xFE): its Inf
+    becomes an FP8 NaN and its finite elements are scaled as usual.
 
     Only ``group_size`` in {32, 64, 128} is supported.
 
@@ -1398,7 +1519,7 @@ def _rope_rotate_activation_fp4quant(
     positions: torch.Tensor,
     rope_dim: int,
     group_size: int = 32,
-    shuffle_scale: bool = True,
+    scale_layout: str = "none",
     do_rotate_act: bool = True,
     round_rope: bool = False,
 ) -> None:
@@ -1448,17 +1569,24 @@ def rope_rotate_activation(
     rope_dim: int,
     out_scale: torch.Tensor | None = None,
     group_size: int | None = None,
-    shuffle_scale: bool = True,
+    scale_layout: str | bool | None = None,
     do_rotate_act: bool = True,
     round_rope: bool = False,
+    *,
+    shuffle_scale: bool | None = None,
 ) -> None:
     """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then
     Hadamard-rotate, dispatching on ``out.dtype``:
 
     - bf16/fp16 ``out``: plain rope+hadamard in place (``scale`` ignored).
     - ``fp4x2`` ``out``: FP4-quantize into packed ``out`` + e8m0 ``scale``
-      (``scale`` required; ``group_size`` defaults to 32). ``shuffle_scale``
-      selects the dsv4 preshuffled scale layout.
+      (``scale`` required; ``group_size`` defaults to 32). ``scale_layout``
+      selects ``"none"`` (natural rows), ``"flydsl"`` (dsv4 preshuffle), or
+      ``"opus"`` (gfx950 scales [T, 2, 32, H/16], requiring H=32 or 64,
+      D=128, group_size=32). Omitting it preserves the legacy FlyDSL layout.
+      The legacy ``shuffle_scale`` keyword and positional bool are accepted:
+      True selects ``"flydsl"``, False selects ``"none"``. Do not supply both
+      ``scale_layout`` and ``shuffle_scale``.
     - ``fp8`` ``out``: per-(row, 1xGROUP) fp8-quantize into ``out`` + fp32
       ``scale`` (``scale`` required; ``group_size`` defaults to 128).
 
@@ -1469,6 +1597,20 @@ def rope_rotate_activation(
     """
     if out.dtype == dtypes.fp4x2:
         assert out_scale is not None, "fp4 rope_rotate_activation requires `out_scale`"
+        if shuffle_scale is not None:
+            if scale_layout is not None:
+                raise ValueError("pass only one of scale_layout and shuffle_scale")
+            if not isinstance(shuffle_scale, bool):
+                raise TypeError("shuffle_scale must be a bool")
+            scale_layout = shuffle_scale
+        if scale_layout is None:
+            scale_layout = "flydsl"
+        elif isinstance(scale_layout, bool):
+            scale_layout = "flydsl" if scale_layout else "none"
+        if scale_layout not in ("none", "flydsl", "opus"):
+            raise ValueError(
+                f"scale_layout must be none|flydsl|opus, got {scale_layout!r}"
+            )
         _rope_rotate_activation_fp4quant(
             out,
             out_scale,
@@ -1478,7 +1620,7 @@ def rope_rotate_activation(
             positions,
             rope_dim,
             group_size=32 if group_size is None else group_size,
-            shuffle_scale=shuffle_scale,
+            scale_layout=scale_layout,
             do_rotate_act=do_rotate_act,
             round_rope=round_rope,
         )

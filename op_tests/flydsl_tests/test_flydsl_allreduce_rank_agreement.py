@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Rank agreement in the FlyDSL init of ``CustomAllreduce`` and
-``QuickAllReduce``.
+``QuickAllReduce``: the exact one-shot, the quantized mesh/ring and the exact
+fused all-reduce + RMSNorm.
 
 Each rank decides locally (environment, arch, link) whether to build FlyDSL
 engines, and the engine constructors are collectives. A rank that declines
 alone must not leave its peers waiting in one: the init votes on every rank's
 plan first, and builds only if all of them match.
+
+The fused backend also makes each hidden size ready later, at startup or on
+first use, and a compile or module load can fail on one rank alone. Every rank
+must then decline that width, not leave its peers waiting in the fused kernel.
 """
 
 from __future__ import annotations
@@ -48,10 +53,17 @@ QUICK_SKEWS = {
     "window": ({"AITER_FLY_AR_MESH_MIN_BYTES": str(1 << 20)}, {}),
     "quantization": ({"AITER_QUICK_REDUCE_QUANTIZATION": "INT6"}, {}),
 }
+FUSED_SKEWS = {
+    **COMMON_SKEWS,
+    "window": ({"AITER_FLY_AR_FUSED_ONESHOT_MAX_BYTES": str(32 << 10)}, {}),
+}
+SKEWS = {"oneshot": ONESHOT_SKEWS, "quick": QUICK_SKEWS, "fused": FUSED_SKEWS}
+OWNERS = list(SKEWS)
 
 
 class _FakeEngine:
-    """Stand-in for ``OneShotAllReduce`` and ``QuickAllReduceInt4``.
+    """Stand-in for ``OneShotAllReduce``, ``FlyQuickAllReduce`` and
+    ``OneShotAllReduceRMSNorm``.
 
     Its constructor is a collective, like the real IPC handle exchange, and it
     raises unless every rank builds the same engine (the constructor kwargs,
@@ -70,11 +82,29 @@ class _FakeEngine:
         if any(e != mine for e in everyone):
             raise RuntimeError(f"ranks build different engines: {everyone}")
 
-    def preload(self, *, payload_range=None):
+    def preload(self, *args, payload_range=None):
         pass
 
     def close(self):
         pass
+
+
+class _FakeFusedEngine(_FakeEngine):
+    """Stand-in for ``OneShotAllReduceRMSNorm`` that serves every width. Its
+    ``preload`` fails on a rank whose ``_FAIL_PRELOAD`` is set."""
+
+    def supports_hidden(self, hidden):
+        return True
+
+    def pads_hidden(self, hidden):
+        return hidden
+
+    def preload(self, hidden, *, payload_range=None):
+        if os.environ.get("_FAIL_PRELOAD"):
+            raise RuntimeError("injected preload failure")
+
+    def allreduce_rmsnorm(self, inp, residual, weight, eps, **kw):
+        return inp, residual
 
 
 class _Disagreements(logging.Handler):
@@ -115,6 +145,19 @@ def _build(owner: str, group, rank: int):
         ca._init_fly_oneshot()
         return ca._fly_oneshot is not None
 
+    if owner == "fused":
+        from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
+
+        ca = CustomAllreduce.__new__(CustomAllreduce)
+        ca.disabled = False
+        ca.group = group
+        ca.rank = rank
+        ca.world_size = WORLD
+        ca.device = torch.device("cpu")
+        ca._fly_rms = None
+        ca._init_fly_rms()
+        return ca._fly_rms is not None
+
     from aiter.dist.device_communicators.quick_all_reduce import (
         QuickAllReduce,
         QuickReduceRegime,
@@ -125,11 +168,11 @@ def _build(owner: str, group, rank: int):
     qr.rank = rank
     qr.world_size = WORLD
     qr.device = torch.device("cpu")
-    qr._fly_engines = {}
-    qr._fly_policy = None
+    qr._fly_ar = None
+    qr._fly_rms = None
     qr.qr_quant_level = QuickReduceRegime[os.environ["AITER_QUICK_REDUCE_QUANTIZATION"]]
     qr._init_fly_backend()
-    return qr._fly_policy is not None
+    return qr._fly_ar is not None
 
 
 def _rank(rank: int, port: int, owner: str, env: dict, patches: dict) -> dict:
@@ -141,7 +184,7 @@ def _rank(rank: int, port: int, owner: str, env: dict, patches: dict) -> dict:
     import torch.distributed as dist
 
     from aiter.dist.device_communicators import custom_all_reduce as car
-    from aiter.dist.device_communicators import quick_all_reduce as qar
+    from aiter.dist.device_communicators import flydsl_backends as backends
     from aiter.ops.flydsl import allreduce_policy as fly_policy
 
     dist.init_process_group(
@@ -152,8 +195,12 @@ def _rank(rank: int, port: int, owner: str, env: dict, patches: dict) -> dict:
         timeout=timedelta(seconds=GLOO_TIMEOUT_S),
     )
     group = dist.group.WORLD
-    module = car if owner == "oneshot" else qar
-    engine = "OneShotAllReduce" if owner == "oneshot" else "QuickAllReduceInt4"
+    # The module that imports flydsl for this owner, and the engine it builds.
+    module, engine = {
+        "oneshot": (car, "OneShotAllReduce"),
+        "quick": (backends, "FlyQuickAllReduce"),
+        "fused": (backends, "OneShotAllReduceRMSNorm"),
+    }[owner]
     disagreements = _Disagreements()
     logging.getLogger("aiter").addHandler(disagreements)
     try:
@@ -164,6 +211,9 @@ def _rank(rank: int, port: int, owner: str, env: dict, patches: dict) -> dict:
             ),
             mock.patch.object(module, engine, _FakeEngine),
             mock.patch.object(module, "_FLY_IMPORT_OK", patches.get("import_ok", True)),
+            # The one-shot's plan reads its own module's flag, the fused
+            # backend's reads the backends module's; the skew covers both.
+            mock.patch.object(car, "_FLY_IMPORT_OK", patches.get("import_ok", True)),
         ):
             built = _build(owner, group, rank)
         # A rank still inside an engine collective pairs up with this gather
@@ -205,7 +255,134 @@ def _spawn(owner: str, skew: tuple[dict, dict] | None, everyone: dict | None = N
     return reports
 
 
-@pytest.mark.parametrize("owner", ["oneshot", "quick"])
+# The fused width the preparation tests use, and a token count whose payload
+# the exact fused one-shot serves on the stand-in host.
+HIDDEN = 4096
+TOKENS = 1
+
+
+def _prepare_rank(rank: int, port: int, how: str, fail: bool) -> dict:
+    """One rank: build the exact fused backend, then make HIDDEN ready,
+    twice. Reports what each attempt returned or raised.
+
+    ``predicate`` asks :meth:`should_fly_fused_ar_rms`, as the dispatcher does.
+    ``startup`` builds HIDDEN at construction, then asks the predicate.
+    ``prime`` calls :meth:`prime`. ``call`` calls the fused op without asking
+    the predicate first.
+    """
+    os.environ["AITER_FLY_AR"] = "1"
+    if how == "startup":
+        os.environ["AITER_FLY_AR_FUSED_HIDDENS"] = str(HIDDEN)
+    if fail:
+        os.environ["_FAIL_PRELOAD"] = "1"
+
+    import torch
+    import torch.distributed as dist
+
+    from aiter.dist.device_communicators import flydsl_backends as backends
+    from aiter.ops.flydsl import allreduce_policy as fly_policy
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=WORLD,
+        timeout=timedelta(seconds=GLOO_TIMEOUT_S),
+    )
+    group = dist.group.WORLD
+    inp = torch.zeros(TOKENS, HIDDEN, dtype=torch.bfloat16)
+    weight = torch.ones(HIDDEN, dtype=torch.bfloat16)
+    try:
+        with (
+            mock.patch("aiter.jit.utils.chip_info.get_gfx_runtime", return_value=ARCH),
+            mock.patch.object(fly_policy, "detect_link", return_value=LINK),
+            mock.patch.object(backends, "OneShotAllReduceRMSNorm", _FakeFusedEngine),
+            mock.patch.object(backends, "_FLY_IMPORT_OK", True),
+            mock.patch("torch.cuda.is_current_stream_capturing", return_value=False),
+        ):
+            b = backends.FlyDSLAllReduceRMSNorm(
+                group, torch.device("cpu"), quantized=False
+            )
+            assert not b.disabled
+            attempts = []
+            for _ in range(2):
+                try:
+                    if how == "prime":
+                        attempts.append(b.prime(HIDDEN))
+                    elif how == "call":
+                        b.fly_fused_ar_rms(inp, inp.clone(), weight, 1e-6)
+                        attempts.append(True)
+                    else:
+                        attempts.append(
+                            b.should_fly_fused_ar_rms(inp, inp.clone(), weight)
+                        )
+                except RuntimeError as e:
+                    attempts.append(str(e))
+            accepts = b.should_fly_fused_ar_rms(inp, inp.clone(), weight)
+        # A rank still inside a collective pairs up with this gather and
+        # raises there.
+        everyone = [None] * WORLD
+        dist.all_gather_object(everyone, "done", group=group)
+        if any(e != "done" for e in everyone):
+            raise RuntimeError(f"ranks left the preparation out of step: {everyone}")
+        return {"attempts": attempts, "accepts": accepts, "failed": sorted(b._failed)}
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}"}
+    finally:
+        dist.destroy_process_group()
+
+
+def _spawn_prepare(how: str, fail_last: bool) -> list[dict]:
+    port = _free_port()
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(processes=WORLD) as pool:
+        results = [
+            pool.apply_async(
+                _prepare_rank, (rank, port, how, fail_last and rank == WORLD - 1)
+            )
+            for rank in range(WORLD)
+        ]
+        reports = [r.get(timeout=RANK_TIMEOUT_S) for r in results]
+    errors = [f"rank {r}: {p['error']}" for r, p in enumerate(reports) if "error" in p]
+    assert not errors, "; ".join(errors)
+    return reports
+
+
+PREPARE_PATHS = ["predicate", "startup", "prime", "call"]
+
+
+@pytest.mark.parametrize("how", PREPARE_PATHS)
+def test_prepared_width_serves(how):
+    """The stand-in setup is valid: with no failure, every attempt succeeds."""
+    for r in _spawn_prepare(how, fail_last=False):
+        assert r["attempts"] == [True, True]
+        assert r["accepts"] and not r["failed"]
+
+
+@pytest.mark.parametrize("how", ["predicate", "startup", "prime"])
+def test_one_failed_rank_declines_on_every_rank(how):
+    """The last rank fails to preload HIDDEN. Every rank marks the width
+    failed and declines it on both attempts, so the dispatcher's next backend
+    serves the call."""
+    for r in _spawn_prepare(how, fail_last=True):
+        assert r["attempts"] == [False, False]
+        assert not r["accepts"]
+        assert r["failed"] == [("oneshot", HIDDEN)]
+
+
+def test_one_failed_rank_raises_in_a_direct_call():
+    """A caller that skips the predicate cannot be declined: every rank raises
+    the same error, on both attempts."""
+    reports = _spawn_prepare("call", fail_last=True)
+    first = reports[0]["attempts"][0]
+    assert isinstance(first, str) and f"hidden={HIDDEN}" in first
+    for r in reports:
+        assert r["attempts"] == [first, first]
+        assert not r["accepts"]
+        assert r["failed"] == [("oneshot", HIDDEN)]
+
+
+@pytest.mark.parametrize("owner", OWNERS)
 def test_matching_ranks_build(owner):
     """The stand-in setup is valid: with nothing skewed, every rank builds."""
     reports = _spawn(owner, None)
@@ -213,7 +390,7 @@ def test_matching_ranks_build(owner):
     assert not any(r["disagreements"] for r in reports)
 
 
-@pytest.mark.parametrize("owner", ["oneshot", "quick"])
+@pytest.mark.parametrize("owner", OWNERS)
 def test_flydsl_off_everywhere_is_silent(owner):
     """``AITER_FLY_AR`` unset on every rank, the default: nothing is built,
     and the vote logs no disagreement."""
@@ -224,13 +401,12 @@ def test_flydsl_off_everywhere_is_silent(owner):
 
 @pytest.mark.parametrize(
     "owner,skew",
-    [("oneshot", s) for s in ONESHOT_SKEWS] + [("quick", s) for s in QUICK_SKEWS],
+    [(owner, s) for owner in OWNERS for s in SKEWS[owner]],
 )
 def test_one_skewed_rank_disables_every_rank(owner, skew):
     """One rank's plan differs: the init returns on every rank without
     building, and every rank logs why."""
-    skews = ONESHOT_SKEWS if owner == "oneshot" else QUICK_SKEWS
-    reports = _spawn(owner, skews[skew])
+    reports = _spawn(owner, SKEWS[owner][skew])
     assert not any(r["built"] for r in reports)
     assert all(r["disagreements"] for r in reports)
 
