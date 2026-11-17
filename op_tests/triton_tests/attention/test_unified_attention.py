@@ -2413,3 +2413,132 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     )
     assert not new[live].isnan().any()
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
+
+
+def _prefill_2d_run(seq_lens, key_bump=None, long_max_seqlen_k=False, num_blocks=8192):
+    """Run unified_attention (gluon, shuffled KV, page 64, 16 / 2 heads, head 64, full
+    causal attention) and return (2D kernel launches, output, reference).
+    key_bump = (start, stop, amplitude): keys of sequence 0 at positions [start, stop)
+    and every query get a shared direction, so those keys score far above the others."""
+    from aiter.ops.triton.attention import unified_attention as ua_mod
+
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        _,
+        _,
+        _,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=num_blocks,
+        block_size=64,
+        head_size=64,
+        num_heads=(16, 2),
+        shuffled_kv_cache=False,
+        device="cuda",
+    )
+    if key_bump is not None:
+        start, stop, amplitude = key_bump
+        u = torch.full((64,), 0.125, device="cuda")
+        pos = torch.arange(start, stop, device="cuda")
+        blocks = block_tables[0, pos // 64].long()
+        k = key_cache_orig.float()
+        k[blocks, pos % 64] += amplitude * u
+        key_cache_orig = k.to(torch.bfloat16)
+        query = (query.float() + amplitude * u).to(torch.bfloat16)
+    key_cache, value_cache = shuffle_kv_cache(key_cache_orig, value_cache_orig)
+    block_table = block_tables
+    max_seqlen_k = max_kv_len
+    if long_max_seqlen_k:
+        max_seqlen_k = 131072
+        block_table = torch.zeros(
+            (len(seq_lens), max_seqlen_k // 64 + 1),
+            dtype=block_tables.dtype,
+            device=block_tables.device,
+        )
+        block_table[:, : block_tables.shape[1]] = block_tables
+    launched = []
+    kernel_2d = ua_mod._unified_attention_kernel_2d_gfx1250
+
+    def hook(*args, **kwargs):
+        launched.append(
+            {k: kwargs.get(k) for k in ("LOOP_VARIANT", "NUM_SPLITS", "q_block_offset")}
+        )
+
+    kernel_2d.add_pre_run_hook(hook)
+    try:
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=output,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_table,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            sinks=None,
+            shuffled_kv_cache=True,
+            backend="gluon",
+        )
+    finally:
+        kernel_2d.pre_run_hooks.remove(hook)
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=[x[1] for x in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+    )
+    return launched, output, ref_output
+
+
+@pytest.mark.parametrize(
+    "seq_lens, key_bump",
+    [
+        ([(4096, 4096)], None),
+        ([(1024, 9216), (1000, 9000), (17, 4113)], None),
+        ([(5, 5), (64, 64), (130, 200), (300, 1000)], None),  # short chunks
+        ([(2048, 10240)], (3000, 3500, 40.0)),  # scores far above the first tile
+        ([(2048, 10240)], (0, 64, 40.0)),  # the first tile holds the maximum
+        ([(1024, 6144), (2048, 10240)], (5000, 5100, 400.0)),  # inf L: exact rerun
+    ],
+)
+@pytest.mark.parametrize("long_max_seqlen_k", [False, True])
+@torch.inference_mode()
+def test_gluon_unified_attn_2d_fixed_max(seq_lens, key_bump, long_max_seqlen_k):
+    """gfx1250 Gluon 2D loop variant 2, full attention: the steady loop keeps a fixed
+    reference max per row and reruns a program with the running max when a row's
+    exp sum overflows. key_bump puts the largest scores away from the reference tiles.
+    """
+    if DEVICE_ARCH != "gfx1250" or not _is_gluon_available():
+        pytest.skip("gfx1250 Gluon only")
+    launched, output, ref_output = _prefill_2d_run(
+        seq_lens, key_bump, long_max_seqlen_k
+    )
+    if max(x[0] for x in seq_lens) >= 1024:
+        assert any(x["LOOP_VARIANT"] == 2 for x in launched)
+    assert not torch.isnan(output).any()
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
+    )
