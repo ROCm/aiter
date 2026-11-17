@@ -6,6 +6,10 @@ import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
+from aiter.ops.triton._triton_kernels.rope.rope import (
+    _get_gptj_rotated_x,
+    _get_neox_rotated_x,
+)
 from aiter.ops.triton.rope.rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
@@ -1429,12 +1433,9 @@ def _fused_fp8_bmm_rope_prefill_kernel(
             d_cos_offs = d_pe_offs
 
         if IS_NEOX:
-            d_swap_offs = tl.where(
-                d_pe_offs < BLOCK_D_HALF_pe,
-                d_pe_offs + BLOCK_D_HALF_pe,
-                d_pe_offs - BLOCK_D_HALF_pe,
-            ).to(d_pe_offs.dtype)
-            neg_mask = d_pe_offs < BLOCK_D_HALF_pe
+            rot_mask = (d_pe_offs < BLOCK_D_HALF_pe)[None, :]
+        else:
+            rot_mask = (d_pe_offs % 2 == 0)[None, :]
 
         pos = tl.load(pos_ptr + offs_t64 * pos_stride_b, mask=t_mask, other=0)
         pid_slot = tl.load(slot_mapping_ptr + offs_t64, mask=t_mask, other=-1).to(
@@ -1479,18 +1480,17 @@ def _fused_fp8_bmm_rope_prefill_kernel(
             sin_ptr + cos_offs, mask=t_mask[:, None], other=0.0, cache_modifier=".cg"
         )
 
+        QROWS: tl.constexpr = ROPE_BLOCK_T * BLOCK_QH
+        x2 = tl.reshape(x, (QROWS, BLOCK_D_pe))
         if IS_NEOX:
-            x_sw = tl.load(
-                q_base + d_swap_offs[None, None, :] * q_pe_stride_d,
-                mask=q_mask,
-                other=0.0,
+            x_rot = _get_neox_rotated_x(
+                x2, rot_mask, QROWS, BLOCK_D_pe, BLOCK_D_HALF_pe
             )
-            x_rot = tl.where(neg_mask[None, None, :], -x_sw, x_sw)
         else:
-            xe, xo = tl.split(
-                tl.reshape(x, (ROPE_BLOCK_T, BLOCK_QH, BLOCK_D_HALF_pe, 2))
+            x_rot = _get_gptj_rotated_x(
+                x2, rot_mask, QROWS, BLOCK_D_pe, BLOCK_D_HALF_pe
             )
-            x_rot = tl.reshape(tl.join(-xo, xe), (ROPE_BLOCK_T, BLOCK_QH, BLOCK_D_pe))
+        x_rot = tl.reshape(x_rot, (ROPE_BLOCK_T, BLOCK_QH, BLOCK_D_pe))
         q_pe = x * cos[:, None, :] + x_rot * sin[:, None, :]
 
         q_out_ptrs = (
@@ -1503,15 +1503,13 @@ def _fused_fp8_bmm_rope_prefill_kernel(
 
         kv_mask = (t_mask & (pid_slot >= 0))[:, None]
         if IS_NEOX:
-            kx_sw = tl.load(
-                k_pe_base + d_swap_offs[None, :] * k_pe_stride_d,
-                mask=kv_mask,
-                other=0.0,
+            kx_rot = _get_neox_rotated_x(
+                kx, rot_mask, ROPE_BLOCK_T, BLOCK_D_pe, BLOCK_D_HALF_pe
             )
-            kx_rot = tl.where(neg_mask[None, :], -kx_sw, kx_sw)
         else:
-            ke, ko = tl.split(tl.reshape(kx, (ROPE_BLOCK_T, BLOCK_D_HALF_pe, 2)))
-            kx_rot = tl.reshape(tl.join(-ko, ke), (ROPE_BLOCK_T, BLOCK_D_pe))
+            kx_rot = _get_gptj_rotated_x(
+                kx, rot_mask, ROPE_BLOCK_T, BLOCK_D_pe, BLOCK_D_HALF_pe
+            )
         k_pe = kx * cos + kx_rot * sin
 
         tl.store(
