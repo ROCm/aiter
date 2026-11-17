@@ -1014,20 +1014,22 @@ def gemm_a8w8_bpreshuffle(
     return _gemm_a8w8_bpreshuffle_into(XQ, WQ, x_scale, w_scale, Y)
 
 
-def _gemm_a8w8_bpreshuffle_into(
-    XQ: Tensor, WQ: Tensor, x_scale: Tensor, w_scale: Tensor, Y: Tensor
-) -> Tensor:
-    """Run the tuned (or default) bpreshuffle kernel into the dense [M, N] ``Y``.
-    Shared by gemm_a8w8_bpreshuffle and gemm_a8w8_bpreshuffle_out so both pick
-    the same kernel."""
-    m = XQ.shape[0]
-    n = WQ.shape[0]
-    k = XQ.shape[-1]
-    w_k = WQ.shape[-1]
-    dtype = Y.dtype
-    is_int8 = XQ.dtype == dtypes.i8
+def _bpreshuffle_kernel(
+    m: int, n: int, k: int, w_k: int, q_dtype: torch.dtype
+) -> tuple[dict | None, str | None]:
+    """The kernel a bpreshuffle GEMM of this shape runs, as (row, fallback):
 
-    q_dtype = dtypes.i8 if is_int8 else dtypes.fp8
+    - a CK, CKTile or FlyDSL row of the tuned table runs that libtype with the
+      row's splitK, and there is no fallback;
+    - otherwise ``fallback`` names the FlyDSL kernel it falls back to: the
+      default 4-wave kernel for INT8, the closest one that fits on gfx1250;
+    - with neither, the default CK kernel (CKTile for a K-padded WQ) runs
+      without split-K.
+
+    ``row`` is the tuned row, or None. The custom op and its eager fast path
+    both route through here, so they pick the same kernel.
+    """
+    is_int8 = q_dtype == dtypes.i8
     # INT8 kernel names encode the physical K specialization, so padded
     # weights must resolve against the effective launch K. Preserve the
     # historical logical-first lookup for FP8.
@@ -1049,6 +1051,47 @@ def _gemm_a8w8_bpreshuffle_into(
         )
     if is_int8 and config is not None and not _int8_row_runs_on_flydsl(config, m, w_k):
         config = None
+    if config is not None and config["libtype"] in ("ck", "cktile", "flydsl"):
+        return config, None
+
+    if is_int8:
+        from .flydsl.gemm_a8w8_bpreshuffle_4wave import (
+            default_4wave_kernel_name,
+        )
+
+        return config, default_4wave_kernel_name(m, n, w_k)
+
+    if is_gfx1250_family(get_gfx()):
+        from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
+            kernel_fits_shape,
+            kernels_list,
+        )
+
+        fits = [ki for ki in kernels_list.values() if kernel_fits_shape(ki, m, n, k)]
+        if fits:
+            want_tm = min(256, max(16, 1 << (m - 1).bit_length()))
+            ki = min(
+                fits, key=lambda x: (abs(x.tile_m - want_tm), -x.tile_n, -x.tile_k)
+            )
+            return config, ki.name
+    return config, None
+
+
+def _gemm_a8w8_bpreshuffle_into(
+    XQ: Tensor, WQ: Tensor, x_scale: Tensor, w_scale: Tensor, Y: Tensor
+) -> Tensor:
+    """Run the tuned (or default) bpreshuffle kernel into the dense [M, N] ``Y``.
+    Shared by gemm_a8w8_bpreshuffle and gemm_a8w8_bpreshuffle_out so both pick
+    the same kernel."""
+    m = XQ.shape[0]
+    n = WQ.shape[0]
+    k = XQ.shape[-1]
+    w_k = WQ.shape[-1]
+    dtype = Y.dtype
+    is_int8 = XQ.dtype == dtypes.i8
+    config, fallback = _bpreshuffle_kernel(
+        m, n, k, w_k, dtypes.i8 if is_int8 else dtypes.fp8
+    )
     # A K-padded WQ is preshuffled in blocks laid out over K_w, and every
     # kernel takes a single K for both operands, so run all of them at K_w
     # with XQ zero-padded to match.
@@ -1063,42 +1106,17 @@ def _gemm_a8w8_bpreshuffle_into(
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "flydsl":
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
-
-    if is_int8:
-        from .flydsl.gemm_a8w8_bpreshuffle_4wave import (
-            default_4wave_kernel_name,
-        )
-
-        kernel_name = default_4wave_kernel_name(m, n, w_k)
-        _warn_untuned_int8_fallback(get_gfx(), m, n, w_k, kernel_name)
-        return gemm_a8w8_bpreshuffle_flydsl(
-            XQ,
-            WQ,
-            x_scale,
-            w_scale,
-            Y,
-            {"kernelName": kernel_name},
-        )
-
-    if is_gfx1250_family(get_gfx()):
-        from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
-            kernel_fits_shape,
-            kernels_list,
-        )
-
-        fits = [ki for ki in kernels_list.values() if kernel_fits_shape(ki, m, n, k)]
-        if fits:
-            want_tm = min(256, max(16, 1 << (m - 1).bit_length()))
-            ki = min(
-                fits, key=lambda x: (abs(x.tile_m - want_tm), -x.tile_n, -x.tile_k)
-            )
+    if fallback is not None:
+        if is_int8:
+            _warn_untuned_int8_fallback(get_gfx(), m, n, w_k, fallback)
+        else:
             logger.warning(
                 f"[gfx1250] gemm_a8w8_bpreshuffle untuned M={m}, N={n}, K={k}; "
-                f"falling back to flydsl kernel '{ki.name}'."
+                f"falling back to flydsl kernel '{fallback}'."
             )
-            return gemm_a8w8_bpreshuffle_flydsl(
-                XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
-            )
+        return gemm_a8w8_bpreshuffle_flydsl(
+            XQ, WQ, x_scale, w_scale, Y, {"kernelName": fallback}
+        )
     try:
         if w_k > k:
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, 0)
@@ -1124,9 +1142,9 @@ _eager_a8w8_ops_are_ours = all(
 # Eager fast path. Outside torch.compile a CK bpreshuffle GEMM goes
 # through two torch.ops dispatches (aiter::gemm_a8w8_bpreshuffle, then
 # aiter::gemm_a8w8_bpreshuffle_ck) and the compile_ops wrapper before the
-# pybind call. `_a8w8_bpreshuffle_eager` makes that call directly, after the
-# same config lookup, and declines (None) whenever the op path may do
-# something else.
+# pybind call. `_a8w8_bpreshuffle_eager` makes that call directly when
+# `_bpreshuffle_kernel` picks CK, and declines (None) whenever the op path may
+# do something else.
 _eager_a8w8_ck = None  # pybind entry once resolved; False: off for the run
 
 
@@ -1164,10 +1182,10 @@ def _a8w8_bpreshuffle_eager(
     subclasses that intercept ops, inputs autograd would record, operands
     other than FP8 (INT8 runs FlyDSL kernels), arguments the op rejects or
     pads (bias, an unsupported output dtype, a K-padded WQ, other ranks),
-    CKTile and FlyDSL rows, untuned shapes on gfx1250, and a rebound
-    ``gemm_a8w8_bpreshuffle_ck``.
+    shapes whose kernel is not CK, and a rebound ``gemm_a8w8_bpreshuffle_ck``.
+    The kernel comes from `_bpreshuffle_kernel`, as on the op path, so
     ``get_GEMM_config_with_quant_type`` is called through the module attribute
-    on every call, as `_gemm_a8w8_bpreshuffle_into` calls it.
+    on every call.
     """
     if torch.compiler.is_compiling():
         return None
@@ -1188,20 +1206,13 @@ def _a8w8_bpreshuffle_eager(
     n, w_k = WQ.shape
     if w_k != k:
         return None
-    config = get_GEMM_config_with_quant_type(
-        m,
-        n,
-        k,
-        dtypes.fp8,
-        AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
-    )
+    config, fallback = _bpreshuffle_kernel(m, n, k, k, dtypes.fp8)
     if config is not None:
         if config["libtype"] != "ck":
             return None
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
         return ck(XQ, WQ, x_scale, w_scale, Y, int(config["splitK"]))
-    # Untuned: the default CK kernel, except where gfx1250 picks a FlyDSL one.
-    if is_gfx1250_family(get_gfx()):
+    if fallback is not None:
         return None
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     try:
