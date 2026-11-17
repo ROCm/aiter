@@ -490,7 +490,7 @@ def _sparse_mla_bi_combine_kernel(
     M = gl.full([BLOCK_H], float("-inf"), gl.float32, layout=row_l)
     L = gl.zeros([BLOCK_H], gl.float32, layout=row_l)
     O = gl.zeros([BLOCK_H, D], gl.float32, layout=lay)
-    for s in range(NUM_SPLITS):
+    for s in gl.static_range(NUM_SPLITS):  # unrolled: all loads in flight
         base = (r.to(gl.int64) * NUM_SPLITS + s) * num_heads
         m = gl.load(part_m_ptr + base + h, mask=hm, other=float("-inf"))
         l = gl.load(part_l_ptr + base + h, mask=hm, other=0.0)
@@ -522,7 +522,16 @@ def _sparse_mla_bi_combine_kernel(
 
 _fused_repr = make_kernel_repr(
     "_sparse_mla_bi_fused_kernel",
-    ["FP8", "HAS_SINK", "HAS_LSE", "BLOCK_H", "KEY_TILE", "NUM_SPLITS", "BUF"],
+    [
+        "FP8",
+        "HAS_SINK",
+        "HAS_LSE",
+        "BLOCK_H",
+        "KEY_TILE",
+        "NUM_SPLITS",
+        "BUF",
+        "NUM_XCDS",
+    ],
 )
 
 
@@ -546,6 +555,8 @@ def _sparse_mla_bi_fused_kernel(
     page_stride,
     num_slots,
     num_heads,
+    num_rows,
+    head_blocks,
     FP8: gl.constexpr,
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
@@ -555,13 +566,20 @@ def _sparse_mla_bi_fused_kernel(
     R: gl.constexpr,
     NUM_SPLITS: gl.constexpr,
     BUF: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
 ):
-    """Grid (rows, head tiles): the splits one after the other, merged in order."""
+    """1-D grid over (rows padded to NUM_XCDS) x head tiles: the splits one after
+    the other, merged in order. The head tiles of a row run back to back on one
+    XCD, so the later tiles find the row's keys in its L2."""
     NUM_WARPS: gl.constexpr = gl.num_warps()
     mfma: gl.constexpr = _mfma_layout(NUM_WARPS, BLOCK_H)
     row_l: gl.constexpr = gl.SliceLayout(1, mfma)
-    r = gl.program_id(0)
-    h0 = gl.program_id(1) * BLOCK_H
+    pid = gl.program_id(0)
+    k = pid // NUM_XCDS
+    r = (k // head_blocks) * NUM_XCDS + pid % NUM_XCDS
+    h0 = (k % head_blocks) * BLOCK_H
+    if r >= num_rows:
+        return
     beg = gl.load(indptr_ptr + r)
     n = gl.load(indptr_ptr + r + 1) - beg
     q_dot, qr_dot = _load_q(

@@ -14,6 +14,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.batch_invariant.sparse_mla
     _sparse_mla_bi_split_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 __all__ = ["BI_CONTRACT_VERSION", "sparse_mla_bi_fwd"]
@@ -227,7 +228,9 @@ def sparse_mla_bi_fwd(
         enable_fp_fusion=False,
     )
     if fused:
-        _sparse_mla_bi_fused_kernel[(C, heads_blocks)](
+        xcds = get_num_xcds()
+        grid = (triton.cdiv(C, xcds) * xcds * heads_blocks,)
+        _sparse_mla_bi_fused_kernel[grid](
             q,
             kv,
             kv16,
@@ -246,8 +249,11 @@ def sparse_mla_bi_fwd(
             page_stride,
             num_slots,
             H,
+            C,
+            heads_blocks,
             HAS_SINK=has_sink,
             HAS_LSE=return_lse,
+            NUM_XCDS=xcds,
             **common,
         )
         return out, (lse if return_lse else None)
