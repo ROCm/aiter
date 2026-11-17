@@ -5291,6 +5291,11 @@ def get_2stage_cfgs(
             ksplit,
             full_impl=full_impl,
         )
+    if activation == ActivationType.SwigluStep:
+        raise NotImplementedError(
+            "fused_moe: SwigluStep is only implemented by the gfx942 FlyDSL backend "
+            f"and needs a matching flydsl_gfx942 tuned row; none is usable for {keys}"
+        )
     if config_file is not None and (cfg is None or bypass_tuned_config):
         raise NotImplementedError(
             "The dedicated FHMoE path requires an exact tuned config row for "
@@ -6898,12 +6903,16 @@ def situv2(
     return situ_gate * up_scaled
 
 
-def _dequant_block_128x128(w, scale):
-    """FP32 weights [E, N, K] times block scales [E, ceil(N / 128), ceil(K / 128)]."""
+def _dequant_block_128x128(w, scale, parts=1):
+    """FP32 weights [E, N, K] times block scales [E, parts * ceil(N / parts / 128),
+    ceil(K / 128)]: with parts=2 (gate and up) each half of the rows has its own
+    blocks, as checkpoints store w13 when inter_dim % 128 != 0."""
     experts, n, k = w.shape
-    scale = scale.view(experts, -(-n // 128), -(-k // 128))
+    rows = n // parts
+    scale = scale.view(experts, parts * -(-rows // 128), -(-k // 128))
     scale = scale.repeat_interleave(128, dim=1).repeat_interleave(128, dim=2)
-    return w * scale[:, :n, :k]
+    scale = scale.view(experts, parts, -1, scale.shape[-1])[:, :, :rows, :k]
+    return w * scale.reshape(experts, n, k)
 
 
 def torch_moe_stage1(
@@ -6967,7 +6976,14 @@ def torch_moe_stage1(
         hidden_states = hidden_states * a1_scale
     # per_128x128
     elif quant_type in [QuantType.per_128x128, QuantType.per_1x128]:
-        w1 = _dequant_block_128x128(w1, w1_scale)
+        # Checkpoints block gate and up separately, [E, 2 * ceil(inter_dim / 128),
+        # ...]. With inter_dim % 128 == 0 that equals blocking w1 whole; with
+        # inter_dim % 128 in (0, 64] (FlyDSL's other case) the block counts tell
+        # the layouts apart; otherwise the checkpoint layout is assumed.
+        separate = N == 2 * inter_dim and w1_scale.numel() == (
+            E * 2 * -(-inter_dim // 128) * -(-w1.shape[2] // 128)
+        )
+        w1 = _dequant_block_128x128(w1, w1_scale, 2 if separate else 1)
 
         a1_scale = a1_scale.view(hidden_states.shape[0], -1, 1)
         a1_scale = a1_scale.repeat(

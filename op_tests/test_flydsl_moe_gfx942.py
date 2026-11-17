@@ -9,7 +9,6 @@ CU counts, and checks the padded sorted reduction.
 """
 
 import argparse
-import copy
 import dataclasses
 import functools
 import itertools
@@ -25,6 +24,7 @@ import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import (
     AUX_SORT_OPUS,
+    _dequant_block_128x128,
     fused_moe,
     fused_topk,
     get_2stage_cfgs,
@@ -43,10 +43,8 @@ from aiter.ops.flydsl.fused_moe_gfx942 import (
     Config,
     _describe,
     _gateup_output,
-    _kernel_block_scale,
     _Problem,
     block_scale_groups,
-    flydsl_block_weight_scale,
     get_tune_space,
     run_flydsl_moe_gfx942,
 )
@@ -293,13 +291,14 @@ def test_config_strings():
 
 
 def test_block_scales():
-    """Checkpoint block scales are validated, expanded once and cached."""
+    """Checkpoint block scales are validated; gate and up are blocked separately."""
     experts, model_dim, inter_dim = 2, 512, 192
     w1 = torch.empty((experts, 2 * inter_dim, model_dim), dtype=dtypes.fp8)
     w2 = torch.empty((experts, model_dim, inter_dim), dtype=dtypes.fp8)
     hidden = torch.empty((4, model_dim), dtype=dtypes.bf16)
     topk_ids = torch.zeros((4, 2), dtype=torch.int32)
-    w1_scale = torch.rand((experts, 3, 4)) + 0.5
+    # 128x128 blocks: gate and up 2 blocks each (vLLM's w13_weight_scale_inv).
+    w1_scale = torch.rand((experts, 4, 4)) + 0.5
     w2_scale = torch.rand((experts, 4, 2)) + 0.5
 
     def problem(s1, s2, quant_type=QuantType.per_128x128):
@@ -307,14 +306,18 @@ def test_block_scales():
 
     for quant_type in (QuantType.per_128x128, QuantType.per_1x128):
         block = problem(w1_scale, w2_scale, quant_type)
-        assert (block.quant_type, block.scale_k1, block.scale_k2) == ("block", 64, 64)
+        assert (block.quant_type, block.scale_k1, block.scale_k2) == (
+            "block",
+            128,
+            64,
+        )
+        assert (block.scale_block1, block.scale_block2) == ((128, 128), (128, 128))
     for s1, s2 in (
-        # The former kernel layout [E, K // g, N] is rejected, not misread.
-        (
-            flydsl_block_weight_scale(w1_scale, 2 * inter_dim, model_dim, 64),
-            flydsl_block_weight_scale(w2_scale, model_dim, inter_dim, 64),
-        ),
-        (w1_scale.transpose(1, 2), w2_scale),
+        # w1 blocked as one tensor: its middle block straddles gate and up.
+        (torch.rand((experts, 3, 4)) + 0.5, w2_scale),
+        # The former kernel layout [E, K // 64, N] is rejected, not misread.
+        (torch.rand((experts, 8, 2 * inter_dim)), torch.rand((experts, 3, model_dim))),
+        (w1_scale, w2_scale.transpose(1, 2)),
         (w1_scale, w2_scale[:, :, :1]),
         (w1_scale.bfloat16(), w2_scale),
         (w1_scale, None),
@@ -327,34 +330,17 @@ def test_block_scales():
             continue
         raise AssertionError(f"accepted scales {_describe(s1)}, {_describe(s2)}")
 
-    # Each kernel row and 64-wide K group reads its checkpoint block.
-    kernel = _kernel_block_scale(w2_scale, model_dim, inter_dim, 64)
-    rows = torch.arange(model_dim) // 128
-    groups = torch.arange(inter_dim // 64) * 64 // 128
-    expected = w2_scale[:, rows][:, :, groups].transpose(1, 2)
-    assert torch.equal(kernel, expected)
-    # Later calls, including on copies of the scales, reuse the expansion.
-    assert _kernel_block_scale(w2_scale, model_dim, inter_dim, 64) is kernel
-    copied = copy.deepcopy(w2_scale)
-    assert torch.equal(_kernel_block_scale(copied, model_dim, inter_dim, 64), kernel)
-    # New scales of the same shape get their own expansion.
-    other = _kernel_block_scale(2 * w2_scale, model_dim, inter_dim, 64)
-    assert torch.equal(other, 2 * expected)
-    # A graph capture uses the expansion but does not keep it.
-    fresh = w2_scale.clone()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        _kernel_block_scale(fresh, model_dim, inter_dim, 64)
-    assert not hasattr(fresh, "_flydsl_kernel_scales")
+    # The torch reference dequantizes gate and up with their own blocks.
+    w1_q, w1_ref, w1_scale = block_quant(
+        torch.randn((experts, 2 * inter_dim, model_dim)), parts=2
+    )
+    assert w1_scale.shape == (experts, 4, 4)
+    assert torch.equal(_dequant_block_128x128(w1_q.float(), w1_scale, 2), w1_ref)
 
-    # 64x64 blocks (vLLM's TP refinement) give 64-wide groups reading their block.
-    w1_scale64 = torch.rand((experts, 6, 8)) + 0.5
-    w2_scale64 = torch.rand((experts, 8, 3)) + 0.5
-    block = problem(w1_scale64, w2_scale64)
+    # 64x64 blocks (vLLM's TP refinement).
+    block = problem(torch.rand((experts, 6, 8)), torch.rand((experts, 8, 3)))
     assert (block.scale_k1, block.scale_k2) == (64, 64)
-    kernel = _kernel_block_scale(w2_scale64, model_dim, inter_dim, 64)
-    expected = w2_scale64[:, torch.arange(model_dim) // 64].transpose(1, 2)
-    assert torch.equal(kernel, expected)
+    assert (block.scale_block1, block.scale_block2) == ((64, 64), (64, 64))
     # With inter_dim % 128 == 0, 64-wide Down blocks leave only decode configs.
     w1 = torch.empty((experts, 512, model_dim), dtype=dtypes.fp8)
     w2 = torch.empty((experts, model_dim, 256), dtype=dtypes.fp8)
@@ -364,6 +350,69 @@ def test_block_scales():
     prefill = Config.from_string("64_128_128_True:1x4_64x256:128")
     assert decode.unsupported_reason(block) is None
     assert prefill.unsupported_reason(block)
+
+
+def test_block_scale_updates():
+    """The kernels read the scale tensors on every call, so in-place updates
+    (weight reload, RL weight sync) take effect, on every algorithm."""
+    torch.manual_seed(0)
+    experts, topk, model_dim, inter_dim = 8, 2, 512, 192
+    act = ActivationType.SwigluStep
+    w1_q, _, w1_scale = block_quant(
+        torch.randn((experts, 2 * inter_dim, model_dim), dtype=dtypes.bf16), parts=2
+    )
+    w2_q, _, w2_scale = block_quant(
+        torch.randn((experts, model_dim, inter_dim), dtype=dtypes.bf16)
+    )
+    w1 = shuffle_weight(w1_q, layout=(16, 16))
+    w2 = shuffle_weight(w2_q, layout=(16, 16))
+    for token, config in (
+        (1, "16_16_16_False:default:0"),
+        (4, "16_16_16_False_True:default:0"),
+        (16, "16_128_64_False:default:0"),
+        (256, "64_128_128_True:1x4_64x256:128"),
+    ):
+        hidden = torch.randn((token, model_dim), dtype=dtypes.bf16)
+        weights, ids = fused_topk(
+            hidden, torch.randn((token, experts), dtype=hidden.dtype), topk, True
+        )
+        args = (hidden, w1, w2, weights, ids, act, QuantType.per_128x128)
+        tail = (None, None, 0, config, SWIGLU_STEP_LIMIT)
+
+        def run(s1, s2, args=args, tail=tail):
+            return run_flydsl_moe_gfx942(*args, s1, s2, *tail).float()
+
+        s1, s2 = w1_scale.clone(), w2_scale.clone()
+        base = run(s1, s2)
+        s2.mul_(2)
+        ratio = float(run(s1, s2).norm() / base.norm())
+        assert abs(ratio - 2) < 1e-2, f"{config}: w2_scale.mul_(2) gave {ratio=}"
+        # Writes through .data do not bump the version counter.
+        s2.data.copy_(w2_scale)
+        assert float((run(s1, s2) - base).norm() / base.norm()) < 1e-2, config
+        s1.data.copy_(2 * w1_scale)
+        updated = run(s1, s2)
+        diff = float((updated - run(2 * w1_scale, s2)).norm() / base.norm())
+        moved = float((updated - base).norm() / base.norm())
+        assert diff < 1e-2 and moved > 0.1, f"{config}: {diff=} {moved=}"
+
+
+def test_swiglustep_needs_flydsl_row():
+    """SwigluStep has no CK fallback: without a usable FlyDSL row dispatch says
+    so instead of trying to build a CK module that cannot exist."""
+    get_2stage_cfgs.cache_clear()
+    try:
+        get_2stage_cfgs(
+            32, 1024, 192, 7, 3, dtypes.bf16, dtypes.fp8, dtypes.fp8,
+            QuantType.per_1x128, True, ActivationType.SwigluStep, False, 0, 0,
+            swiglu_limit=SWIGLU_STEP_LIMIT,
+        )  # fmt: skip
+    except NotImplementedError as error:
+        assert "SwigluStep" in str(error), error
+    else:
+        raise AssertionError("an untuned SwigluStep shape did not raise")
+    finally:
+        get_2stage_cfgs.cache_clear()
 
 
 def test_num_local_tokens_dispatch():
@@ -462,12 +511,16 @@ def stale_gateup_output(hidden_states, problem):
     return _gateup_output(hidden_states, problem).fill_(float("inf"))
 
 
-def block_quant(w, block=128):
+def block_quant(w, block=128, parts=1):
     """FP8 weights with 128x128 block scales (partial edge blocks allowed).
 
     Returns the FP8 weights, their exact FP32 dequantization and the checkpoint
-    scales [E, ceil(N / 128), ceil(K / 128)].
+    scales [E, ceil(N / 128), ceil(K / 128)]. With parts=2 (w1) gate and up are
+    blocked separately, as checkpoints store them: [E, 2 * ceil(N / 256), ...].
     """
+    if parts > 1:
+        quantized = [block_quant(part, block) for part in w.chunk(parts, dim=1)]
+        return tuple(torch.cat(t, dim=1) for t in zip(*quantized))
     experts, n, k = w.shape
     n_blocks, k_blocks = -(-n // block), -(-k // block)
     padded = torch.nn.functional.pad(
@@ -569,7 +622,7 @@ def test_tp_block_scales(full_inter, tp=2):
                 act,
                 SWIGLU_STEP_LIMIT,
                 (
-                    block_scale_groups(inter, block)
+                    block_scale_groups(inter, model_dim, block, block)
                     if Config.from_string(config).use_prefill
                     else None
                 ),
@@ -634,7 +687,7 @@ def make_case(
     local = token - min(65, (token + 1) // 2) if routing == "local_tokens" else token
     local_hidden = torch.cat((hidden[:local], hidden[local:] * 0))
     if q_type == QuantType.per_128x128:
-        w1_q, w1_ref, w1_scale = block_quant(w1)
+        w1_q, w1_ref, w1_scale = block_quant(w1, parts=2)
         w2_q, w2_ref, w2_scale = block_quant(w2)
 
         def torch_reference(limit):
@@ -646,7 +699,11 @@ def make_case(
                 topk_ids,
                 act_type,
                 limit,
-                block_scale_groups(inter_dim) if quantize_activations else None,
+                (
+                    block_scale_groups(inter_dim, model_dim)
+                    if quantize_activations
+                    else None
+                ),
             )
 
     else:
@@ -1101,6 +1158,8 @@ def main():
 
     test_config_strings()
     test_block_scales()
+    test_block_scale_updates()
+    test_swiglustep_needs_flydsl_row()
     test_num_local_tokens_dispatch()
     summarize(
         "Compact task table",

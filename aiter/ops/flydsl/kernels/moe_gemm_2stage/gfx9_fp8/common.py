@@ -433,12 +433,9 @@ def _as_ptr(p, dtype=None):
     return ptr
 
 
-def issue_f32x4(ptr):
-    """Start a 128-bit load of four FP32 values; call ``.load()`` on the result to use them."""
-    src = fx.make_view(ptr, fx.make_layout(4, 1))
-    dst = fx.make_fragment_like(src)
-    fx.copy(fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32), src, dst)
-    return dst
+def load_f32(ptr):
+    """Load one FP32 value (a block scale); the load is issued here."""
+    return fx.make_view(ptr, fx.make_layout(1, 1))[0]
 
 
 def scaled_accumulate(acc, part, scale_at):
@@ -945,9 +942,9 @@ def make_gemm_helpers(K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK):
         a_with_index=True,
         k_scale=None,
     ):
-        """``k_scale(k_idx)`` issues the loads of this wave's per-row scales for
-        K tile ``k_idx`` and returns one 4-row Vec per M16 repeat; each tile is
-        then accumulated separately and scaled in FP32 (block-scaled weights)."""
+        """``k_scale(k_idx)`` loads this wave's weight scales for K tile ``k_idx``
+        and returns one FP32 scale per M16 repeat; each tile is then accumulated
+        separately and scaled in FP32 (block-scaled weights)."""
         tid = gpu.thread_idx.x
 
         tile_k_per_wg = TILE_K * splitk_waves
@@ -1031,7 +1028,6 @@ def make_gemm_helpers(K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK):
         if const_expr(k_scale is not None):
             c_part = tiled_mma.make_fragment_C(c_fake_tensor)
             c_part.fill(0)
-            part_m = fx.size(fx.get_shape(c_part)[1]).to_py_value()
 
         def _mma(b, a, scales):
             if const_expr(k_scale is None):
@@ -1039,8 +1035,7 @@ def make_gemm_helpers(K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK):
             else:
                 c_part.fill(0)
                 fx.gemm(tiled_mma, c_part, b, a, c_part)
-                row_scales = [scales[m].load() for m in range_constexpr(part_m)]
-                scaled_accumulate(c_frag, c_part, lambda v, m, n: row_scales[m][v])
+                scaled_accumulate(c_frag, c_part, lambda v, m, n: scales[m])
 
         def _issue_scales(k_idx):
             return None if const_expr(k_scale is None) else k_scale(k_idx)

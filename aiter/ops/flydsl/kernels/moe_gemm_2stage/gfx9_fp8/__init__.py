@@ -41,9 +41,12 @@ def compile_gemm(
     down_output_padding_bytes=0,
     fused_down_clear=False,
     scale_k=None,
+    scale_block=None,
     has_num_local_tokens=False,
 ):
-    scale_kwargs = {} if scale_k is None else {"scale_k": scale_k}
+    scale_kwargs = {}
+    if scale_k is not None:
+        scale_kwargs = {"scale_k": scale_k, "scale_block": scale_block}
     if stage == "gateup":
         if down_path != "default" or down_output_padding_bytes != 0:
             raise ValueError("Down-specific options cannot be used for Gate/Up")

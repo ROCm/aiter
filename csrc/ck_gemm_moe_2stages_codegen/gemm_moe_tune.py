@@ -841,8 +841,16 @@ class FmoeTuner(TunerCommon):
         weight,
         qType,
         quant_dtype,
+        parts=1,
     ):
         E, dim1, dim2 = weight.shape
+        if qType == QuantType.per_1x128 and parts > 1:
+            # Block each part (gate, up) of w1 separately, as checkpoints do.
+            quantized = [
+                FmoeTuner.weight_quant(part.contiguous(), qType, quant_dtype)
+                for part in weight.chunk(parts, dim=1)
+            ]
+            return tuple(torch.cat(t, dim=1) for t in zip(*quantized))
         if qType == aiter.QuantType.per_Tensor and quant_dtype != torch.int4:
             weight_qt, weight_scale = aiter.pertoken_quant(
                 weight.view(E, -1), quant_dtype=quant_dtype
@@ -1914,7 +1922,9 @@ class FmoeTuner(TunerCommon):
         else:
             w1 = torch.randn((expert, inter_dim, model_dim), dtype=dtype) / 10
         w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtype)
-        w1_qt, w1_scale = FmoeTuner.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
+        w1_qt, w1_scale = FmoeTuner.weight_quant(
+            w1, q_type, quant_dtype=q_dtype_w, parts=2 if use_g1u1 else 1
+        )
         w2_qt, w2_scale = FmoeTuner.weight_quant(w2, q_type, quant_dtype=q_dtype_w)
         if q_dtype_w is not dtypes.fp4x2:
             w1_qt = w1_qt.view(w1.shape)
@@ -5127,7 +5137,9 @@ class FmoeTuner(TunerCommon):
                 w2 = torch.randn(
                     (expert, model_dim, inter_dim), dtype=dtype, device="cuda"
                 )
-                w1_qt, w1_scale = self.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
+                w1_qt, w1_scale = self.weight_quant(
+                    w1, q_type, quant_dtype=q_dtype_w, parts=2 if use_g1u1 else 1
+                )
                 w2_qt, w2_scale = self.weight_quant(w2, q_type, quant_dtype=q_dtype_w)
                 if q_dtype_w is not dtypes.fp4x2:
                     w1_qt = w1_qt.view(w1.shape)
@@ -5290,38 +5302,34 @@ class FmoeTuner(TunerCommon):
                     torch_quant = aiter.get_torch_quant(q_type)
                     a1_qt, a1_scale = torch_quant(hidden, quant_dtype=eff_q_dtype_a)
 
-                moe_kwargs = {
-                    "activation": act_type,
-                    "quant_type": q_type,
-                    "doweight_stage1": doweight_stage1,
+                out, us = run_perftest(
+                    target_fused_moe,
+                    hidden,
+                    w1_qt_fmoe,
+                    w2_qt_fmoe,
+                    topk_weights,
+                    topk_ids,
+                    activation=act_type,
+                    quant_type=q_type,
+                    doweight_stage1=doweight_stage1,
                     # The torch reference runs SiTUv2 with the model's betas;
                     # fused_moe defaults to 1.0. Without this every Situv2 shape
                     # reports logits_diff ~0.14 (out_norm/ref_norm ~0.61)
                     # regardless of which kernel it dispatched.
-                    "beta": (
+                    beta=(
                         DEFAULT_SITUV2_BETA
                         if act_type == ActivationType.Situv2
                         else None
                     ),
-                    "linear_beta": (
+                    linear_beta=(
                         DEFAULT_SITUV2_LINEAR_BETA
                         if act_type == ActivationType.Situv2
                         else None
                     ),
-                    "swiglu_limit": swiglu_limit,
-                    "w1_scale": w1_scale_fmoe,
-                    "w2_scale": w2_scale_fmoe,
-                    "dtype": dtype,
-                }
-                moe_args = (hidden, w1_qt_fmoe, w2_qt_fmoe, topk_weights, topk_ids)
-                if q_type == QuantType.per_1x128:
-                    # FlyDSL expands block scales once and keeps the result on the
-                    # scale tensors; do it before run_perftest copies them.
-                    target_fused_moe(*moe_args, **moe_kwargs)
-                out, us = run_perftest(
-                    target_fused_moe,
-                    *moe_args,
-                    **moe_kwargs,
+                    swiglu_limit=swiglu_limit,
+                    w1_scale=w1_scale_fmoe,
+                    w2_scale=w2_scale_fmoe,
+                    dtype=dtype,
                     num_warmup=args.warmup,
                     num_iters=args.iters,
                 )
@@ -6641,7 +6649,7 @@ class FmoeTuner(TunerCommon):
         def problem(row):
             quant_type = quant_names.get(row["q_type"], "")
             scale_k1, scale_k2 = (
-                block_scale_groups(int(row["inter_dim"]))
+                block_scale_groups(int(row["inter_dim"]), int(row["model_dim"]))
                 if quant_type == "block"
                 else (0, 0)
             )

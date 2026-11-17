@@ -11,6 +11,8 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
+from aiter.ops.flydsl.kernels.act import sigmoid_f32
+
 from . import common as fxh
 from .common import (
     _f32_to_bf16,
@@ -36,6 +38,7 @@ def compile_moe_gemm1(
     swiglu_limit=None,
     fused_down_clear=False,
     scale_k=128,
+    scale_block=(128, 128),
     has_num_local_tokens=False,
 ):
     TILE_K = 64
@@ -135,12 +138,18 @@ def compile_moe_gemm1(
         )
 
     is_block = weight_quant_type == "block"
+    block_n, block_k = scale_block
     if is_block:
         # Each split-K wave step and each prefill MFMA pair covers 64 contiguous K.
         assert scale_k in (64, 128) and K % scale_k == 0, f"scale_k={scale_k}, K={K}"
+        assert block_n in (64, 128) and block_k % scale_k == 0, (scale_block, scale_k)
         if alg == "prefill_1x4" and TILE_K % scale_k != 0:
             raise ValueError(f"TILE_K={TILE_K} must be a multiple of scale_k={scale_k}")
     K_GROUPS = K // scale_k
+    # Checkpoint weight scales [E, 2 * ceil(N / 2 / block_n), ceil(K / block_k)]:
+    # gate blocks, then up blocks.
+    GATE_BLOCKS = fxh.div_up(N // 2, block_n)
+    K_BLOCKS = fxh.div_up(K, block_k)
 
     if weight_dtype == "bf16":
         weight_dtype = fx.BFloat16
@@ -152,23 +161,25 @@ def compile_moe_gemm1(
     )
 
     def _splitk_block_scale(tid, p_w_scale, expert_id, blk_n, contiguous_n, tile_n):
-        """Row scales [E, K/scale_k, N] for one split-K wave step (64 K per wave)."""
+        """Weight scales of one split-K wave step (64 K per wave), one per M16
+        repeat. A tile's gate rows, and its up rows, lie in one scale block."""
         if const_expr(not is_block):
             return None
-        lane_group = (tid % 64) // 16
+        # contiguous_n divides block_n, so the tile's gate rows share one block.
+        gate_ptr = (
+            fxh._as_ptr(p_w_scale)
+            + expert_id * (2 * GATE_BLOCKS * K_BLOCKS)
+            + (blk_n * contiguous_n) // block_n * K_BLOCKS
+        )
         wave = tid // 64
-        row_base = fxh._as_ptr(p_w_scale) + blk_n * contiguous_n + lane_group * 4
 
         def issue(k_idx):
-            group = (k_idx * (TILE_K * 4) + wave * TILE_K) // scale_k
-            base = row_base + (expert_id * K_GROUPS + group) * N
+            k_block = (k_idx * (TILE_K * 4) + wave * TILE_K) // block_k
+            gate = fxh.load_f32(gate_ptr + k_block)
+            up = fxh.load_f32(gate_ptr + GATE_BLOCKS * K_BLOCKS + k_block)
             # Tile rows [0, contiguous_n) are gate rows, the rest the matching up rows.
             return [
-                fxh.issue_f32x4(
-                    base
-                    + (m * 16) % contiguous_n
-                    + (N // 2) * ((m * 16) // contiguous_n)
-                )
+                gate if m * 16 < contiguous_n else up
                 for m in range_constexpr(tile_n // 16)
             ]
 
@@ -187,8 +198,7 @@ def compile_moe_gemm1(
         return (gate * rocdl.rcp(T.f32, 1.0 + tmp)) * (up + 1.0)
 
     def _swiglu_step(gate, up):
-        tmp = rocdl.exp2(T.f32, _raw(gate * -1.4426950408889634))
-        gate, up = _clamp_gateup(gate * rocdl.rcp(T.f32, 1.0 + tmp), up)
+        gate, up = _clamp_gateup(gate * sigmoid_f32(gate), up)
         return gate * up
 
     def _gated_act(gate, up):
@@ -505,13 +515,11 @@ def compile_moe_gemm1(
 
         def apply_group_scales(group_scales):
             gate_scales, up_scales, token_scales = group_scales
-            sg = [gate_scales[m].load() for m in range_constexpr(_m_reps)]
-            su = [up_scales[m].load() for m in range_constexpr(_m_reps)]
             fxh.scaled_accumulate(
-                c_gate, p_gate, lambda v, m, n: sg[m][v] * token_scales[n]
+                c_gate, p_gate, lambda v, m, n: gate_scales[m] * token_scales[n]
             )
             fxh.scaled_accumulate(
-                c_up, p_up, lambda v, m, n: su[m][v] * token_scales[n]
+                c_up, p_up, lambda v, m, n: up_scales[m] * token_scales[n]
             )
 
         def hot_loop_scheduler():
@@ -1039,7 +1047,7 @@ def compile_moe_gemm1(
 
             block_k_scale = None
             if const_expr(is_block):
-                # w scales [E, K/scale_k, N] fp32, a scales [M, K/scale_k] fp32.
+                # a scales [M, K/scale_k] fp32; weight scales in checkpoint blocks.
                 a_scale_tensor = fx.rocdl.make_buffer_tensor(
                     fx.make_view(
                         fx.recast_iter(fx.Float32, fxh._as_ptr(p_a_scale)),
@@ -1052,27 +1060,25 @@ def compile_moe_gemm1(
                     (asc_idx[0, n] & 0xFFFFFF) * K_GROUPS
                     for n in range_constexpr(n_tok)
                 ]
-                lane_group = (tid % 64) // 16
-                w_row_base = (
+                # M repeat m of every wave covers gate rows
+                # [blk_n * contiguous_n + 64 * m, +64), inside one scale block.
+                gate_rows = [
                     fxh._as_ptr(p_w_scale)
-                    + blk_n * contiguous_n
-                    + (tid // 64) * 16
-                    + lane_group * 4
-                )
+                    + expert_id * (2 * GATE_BLOCKS * K_BLOCKS)
+                    + (blk_n * contiguous_n + m * 64) // block_n * K_BLOCKS
+                    for m in range_constexpr(contiguous_n // 64)
+                ]
                 groups_per_tile = TILE_K // scale_k
 
                 def block_k_scale(k_tile):
                     out = []
                     for j in range_constexpr(groups_per_tile):
                         group = k_tile * groups_per_tile + j
-                        base = w_row_base + (expert_id * K_GROUPS + group) * N
-                        gate = [
-                            fxh.issue_f32x4(base + m * 64)
-                            for m in range_constexpr(contiguous_n // 64)
-                        ]
+                        k_block = group * scale_k // block_k
+                        gate = [fxh.load_f32(row + k_block) for row in gate_rows]
                         up = [
-                            fxh.issue_f32x4(base + N // 2 + m * 64)
-                            for m in range_constexpr(contiguous_n // 64)
+                            fxh.load_f32(row + GATE_BLOCKS * K_BLOCKS + k_block)
+                            for row in gate_rows
                         ]
                         tok = [
                             a_scale_tensor[tok_base[n] + group]

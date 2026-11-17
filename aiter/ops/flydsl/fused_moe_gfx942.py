@@ -26,13 +26,14 @@ _ACTIVATIONS = {
     ActivationType.SwigluStep: "swiglustep",
 }
 
-# Block-scaled FP8 takes FP32 scales [E, ceil(N / b), ceil(K / b)] per weight,
-# b in {128, 64} per dim: checkpoint 128x128 blocks, or the 64x64 blocks vLLM
-# refines them to when a TP shard starts mid-block. The kernels read one scale
-# per (output row, K group) in [E, K // scale_k, N], and prefill quantizes
-# activations per (token, K group).
+# Block-scaled FP8 takes the checkpoint's FP32 block scales, b in {128, 64} per
+# dim (64 when vLLM refines 128x128 blocks for a TP shard that starts mid-block):
+# w1 [E, 2 * ceil(inter_dim / b), ceil(model_dim / b)] with gate and up blocked
+# separately, w2 [E, ceil(model_dim / b), ceil(inter_dim / b)]. The kernels read
+# them as they are on every call, and prefill quantizes activations per (token,
+# K group).
 _BLOCK_QUANT_TYPES = (QuantType.per_1x128, QuantType.per_128x128)
-# A dim of at most 64 is one block either way and expands the same; it reads as 128.
+# A dim of at most 64 is one block either way; it reads as 128.
 _BLOCK_SIZES = (128, 64)
 
 
@@ -40,9 +41,10 @@ def _blocks(n, block):
     return -(-n // block)
 
 
-def _scale_blocks(scale, experts, rows, k):
-    """(block_n, block_k) of FP32 scales [experts, ceil(rows / block_n),
-    ceil(k / block_k)] with supported block sizes, else None."""
+def _scale_blocks(scale, experts, rows, k, parts=1):
+    """(block_n, block_k) of FP32 scales [experts, parts * ceil(rows / parts /
+    block_n), ceil(k / block_k)] with supported block sizes, else None. With
+    parts=2 the two row halves (gate, up) are blocked separately."""
     if (
         scale is None
         or scale.dtype != torch.float32
@@ -51,14 +53,20 @@ def _scale_blocks(scale, experts, rows, k):
     ):
         return None
     sizes = tuple(
-        next((b for b in _BLOCK_SIZES if _blocks(dim, b) == count), None)
-        for count, dim in ((scale.shape[1], rows), (scale.shape[2], k))
+        next((b for b in _BLOCK_SIZES if n * _blocks(dim, b) == count), None)
+        for count, dim, n in (
+            (scale.shape[1], rows // parts, parts),
+            (scale.shape[2], k, 1),
+        )
     )
     return None if None in sizes else sizes
 
 
-def _accepted_shape(experts, rows, k):
-    dims = ("|".join(str(_blocks(d, b)) for b in _BLOCK_SIZES) for d in (rows, k))
+def _accepted_shape(experts, rows, k, parts=1):
+    dims = (
+        "|".join(str(n * _blocks(d, b)) for b in _BLOCK_SIZES)
+        for d, n in ((rows // parts, parts), (k, 1))
+    )
     return f"[{experts}, {', '.join(dims)}]"
 
 
@@ -68,54 +76,18 @@ def _describe(scale):
     return f"{scale.dtype} {list(scale.shape)}"
 
 
-def block_scale_groups(inter_dim, w2_block_k=128):
-    """K groups (Gate/Up, Down) of the kernel scale layout.
+def block_scale_groups(inter_dim, hidden_dim, w1_block_k=128, w2_block_k=128):
+    """K groups (Gate/Up, Down) the prefill kernels scale and quantize
+    activations by.
 
-    Gate/Up uses 64 so one group fits every K tile and every scale block. The
-    prefill Down reads one group per K core, 128 wide unless inter_dim ends in
-    a half block. Groups never straddle w2 scale blocks, so 64-wide blocks get
-    64-wide Down groups; with inter_dim % 128 == 0 that leaves only decode.
+    Gate/Up uses the w1 scale block width when it divides hidden_dim, so each
+    checkpoint block is scaled once, and 64 otherwise. The prefill Down reads one group per K core, 128 wide unless inter_dim
+    ends in a half block. Groups never straddle w2 scale blocks, so 64-wide
+    blocks get 64-wide Down groups; with inter_dim % 128 == 0 that leaves only
+    decode.
     """
-    return 64, min(128 if inter_dim % 128 == 0 else 64, w2_block_k)
-
-
-def flydsl_block_weight_scale(block_scale, rows, k, scale_k, block_n=128, block_k=128):
-    """Expand block scales [E, ceil(rows/block_n), ceil(k/block_k)] to the
-    FlyDSL kernel layout [E, k // scale_k, rows]. Values are copied, never
-    requantized, so the scale_k groups must not straddle checkpoint K blocks."""
-    if block_k % scale_k != 0 or k % scale_k != 0:
-        raise ValueError(
-            f"scale_k={scale_k} must divide both block_k={block_k} and k={k}"
-        )
-    expanded = block_scale.float().repeat_interleave(block_n, dim=1)[:, :rows]
-    expanded = expanded.repeat_interleave(block_k // scale_k, dim=2)[
-        :, :, : k // scale_k
-    ]
-    return expanded.transpose(1, 2).contiguous()
-
-
-# Expanding takes 0.1-0.2 ms per layer at Step-5 shapes (longer than a decode
-# MoE), so the kernel-layout copy is kept on the scale tensor itself: it is freed
-# with the tensor and follows copies of it. Like preshuffled weights, scales are
-# treated as constant once used; replace the tensor rather than update it in place.
-_KERNEL_SCALES_ATTR = "_flydsl_kernel_scales"
-
-
-def _kernel_block_scale(block_scale, rows, k, scale_k):
-    block_n, block_k = _scale_blocks(block_scale, block_scale.shape[0], rows, k)
-    cache = getattr(block_scale, _KERNEL_SCALES_ATTR, None)
-    key = (rows, k, scale_k, block_n, block_k)
-    if cache is not None and key in cache:
-        return cache[key]
-    scale = flydsl_block_weight_scale(block_scale, rows, k, scale_k, block_n, block_k)
-    # A capture records the expansion without running it, so the result is not
-    # reusable outside the graph. A warmup call before capture fills the cache.
-    if not torch.cuda.is_current_stream_capturing():
-        if cache is None:
-            cache = {}
-            setattr(block_scale, _KERNEL_SCALES_ATTR, cache)
-        cache[key] = scale
-    return scale
+    gateup = w1_block_k if hidden_dim % w1_block_k == 0 else 64
+    return gateup, min(128 if inter_dim % 128 == 0 else 64, w2_block_k)
 
 
 @dataclass
@@ -209,10 +181,9 @@ class Config:
         if problem.quant_type == "block" and self.use_prefill:
             if self.down_path != "1x4_64x256":
                 return "block-scaled prefill requires the 1x4_64x256 Down path"
-            # The prefill kernel tiles K in groups of 64 (TILE_K); the scale group
-            # must divide evenly into TILE_K so each MFMA pair uses one group.
-            if 64 % problem.scale_k1 != 0:
-                return "block-scaled Gate/Up scale group must divide the 64-wide K tile"
+            # Each Gate/Up K tile must hold whole scale groups.
+            if self.BLOCK_K % problem.scale_k1 != 0:
+                return "block-scaled Gate/Up scale group must divide BLOCK_K"
             if problem.scale_k2 != (128 if problem.inter_dim % 128 == 0 else 64):
                 return (
                     "block-scaled Down needs one scale group per 1x4_64x256 K core; "
@@ -260,6 +231,9 @@ class _Problem:
     quant_type: str
     scale_k1: int = 0
     scale_k2: int = 0
+    # Checkpoint (block_n, block_k) of the w1 and w2 block scales.
+    scale_block1: tuple[int, int] | None = None
+    scale_block2: tuple[int, int] | None = None
 
     @classmethod
     def from_inputs(
@@ -276,14 +250,17 @@ class _Problem:
         model_dim, inter_dim = w2.shape[1], w2.shape[2]
         assert gateup_dim == 2 * inter_dim
         scale_k1 = scale_k2 = 0
+        w1_blocks = w2_blocks = None
         if quant_type in _BLOCK_QUANT_TYPES:
-            w1_blocks = _scale_blocks(w1_scale, experts, gateup_dim, hidden_dim)
+            # Gate and up rows are blocked separately, as checkpoints store them.
+            w1_blocks = _scale_blocks(w1_scale, experts, gateup_dim, hidden_dim, 2)
             w2_blocks = _scale_blocks(w2_scale, experts, model_dim, inter_dim)
             if w1_blocks is None or w2_blocks is None:
                 raise ValueError(
-                    "block-scaled FP8 needs FP32 [E, ceil(N / b), ceil(K / b)] "
-                    f"block scales, b in {{128, 64}}: w1 "
-                    f"{_accepted_shape(experts, gateup_dim, hidden_dim)} and w2 "
+                    "block-scaled FP8 needs FP32 checkpoint block scales, b in "
+                    "{128, 64}: w1 [E, 2 * ceil(inter_dim / b), ceil(model_dim / b)] "
+                    f"= {_accepted_shape(experts, gateup_dim, hidden_dim, 2)} and "
+                    "w2 [E, ceil(model_dim / b), ceil(inter_dim / b)] = "
                     f"{_accepted_shape(experts, model_dim, inter_dim)}, got "
                     f"{_describe(w1_scale)} and {_describe(w2_scale)}"
                 )
@@ -292,7 +269,9 @@ class _Problem:
                     f"block-scaled FP8 needs K dims divisible by 64, got "
                     f"{hidden_dim=} {inter_dim=}"
                 )
-            scale_k1, scale_k2 = block_scale_groups(inter_dim, w2_blocks[1])
+            scale_k1, scale_k2 = block_scale_groups(
+                inter_dim, hidden_dim, w1_blocks[1], w2_blocks[1]
+            )
         return cls(
             batch=int(hidden_states.shape[0]),
             experts=experts,
@@ -310,6 +289,8 @@ class _Problem:
             }[quant_type],
             scale_k1=scale_k1,
             scale_k2=scale_k2,
+            scale_block1=w1_blocks,
+            scale_block2=w2_blocks,
         )
 
 
@@ -364,6 +345,7 @@ def _get_compiled_kernel(
     down_output_padding_bytes=0,
     fused_down_clear=False,
     scale_k=None,
+    scale_block=None,
     has_num_local_tokens=False,
 ):
     from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import compile_gemm
@@ -388,14 +370,18 @@ def _get_compiled_kernel(
         down_output_padding_bytes=down_output_padding_bytes,
         fused_down_clear=fused_down_clear,
         scale_k=scale_k,
+        scale_block=scale_block,
         has_num_local_tokens=has_num_local_tokens,
     )
 
 
-def _scale_k(problem: _Problem, stage: str):
+def _scale_kwargs(problem: _Problem, stage: str):
+    """K group and checkpoint (block_n, block_k) of a block-scaled stage."""
     if problem.quant_type != "block":
-        return None
-    return problem.scale_k1 if stage == "gateup" else problem.scale_k2
+        return {}
+    if stage == "gateup":
+        return {"scale_k": problem.scale_k1, "scale_block": problem.scale_block1}
+    return {"scale_k": problem.scale_k2, "scale_block": problem.scale_block2}
 
 
 def _launch(kernel_fn, *args):
@@ -494,7 +480,7 @@ def _run_prefill(
     def group_kwargs(stage):
         if problem.quant_type != "block":
             return {}
-        return {"group_size": _scale_k(problem, stage)}
+        return {"group_size": _scale_kwargs(problem, stage)["scale_k"]}
 
     if weight_dtype_str == "fp8":
         gateup_in, a_scale = quant_func(
@@ -524,7 +510,7 @@ def _run_prefill(
         BLOCK_TILE_SIZE_N=config.BLOCK_N,
         BLOCK_TILE_SIZE_K=config.BLOCK_K,
         stage="gateup",
-        scale_k=_scale_k(problem, "gateup"),
+        **_scale_kwargs(problem, "gateup"),
         alg="prefill_1x4",
         E=problem.experts,
         act_quant_type_str=act_quant_type_str,
@@ -582,7 +568,7 @@ def _run_prefill(
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
         BLOCK_TILE_SIZE_N=128,
         stage="down",
-        scale_k=_scale_k(problem, "down"),
+        **_scale_kwargs(problem, "down"),
         alg="prefill_1x4",
         E=problem.experts,
         act_quant_type_str=act_quant_type_str,
@@ -674,7 +660,7 @@ def _run_batch1(
         BLOCK_TILE_SIZE_M=16,
         BLOCK_TILE_SIZE_N=32,
         stage="gateup",
-        scale_k=_scale_k(problem, "gateup"),
+        **_scale_kwargs(problem, "gateup"),
         alg="batch1",
         E=None,
         activation_str=activation_str,
@@ -703,7 +689,7 @@ def _run_batch1(
         BLOCK_TILE_SIZE_M=16,
         BLOCK_TILE_SIZE_N=64,
         stage="down",
-        scale_k=_scale_k(problem, "down"),
+        **_scale_kwargs(problem, "down"),
         alg="batch1",
         E=None,
         has_num_local_tokens=has_num_local_tokens,
@@ -765,7 +751,7 @@ def _run_decode(
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
         BLOCK_TILE_SIZE_N=block_n,
         stage="gateup",
-        scale_k=_scale_k(problem, "gateup"),
+        **_scale_kwargs(problem, "gateup"),
         alg="splitk",
         E=problem.experts,
         activation_str=activation_str,
@@ -794,7 +780,7 @@ def _run_decode(
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
         BLOCK_TILE_SIZE_N=block_n,
         stage="down",
-        scale_k=_scale_k(problem, "down"),
+        **_scale_kwargs(problem, "down"),
         alg="splitk",
         E=problem.experts,
     )
@@ -832,12 +818,12 @@ def run_flydsl_moe_gfx942(
 ) -> torch.Tensor:
     """Whole MoE (sort, Gate/Up, activation, Down, reduction) with FlyDSL on gfx942.
 
-    Block-scaled FP8 (per_128x128 or per_1x128) takes FP32 block scales
-    w1_scale [E, ceil(2 * inter_dim / b), ceil(model_dim / b)] and
-    w2_scale [E, ceil(model_dim / b), ceil(inter_dim / b)], b in {128, 64} per dim
-    (64 when vLLM refines checkpoint blocks for a TP shard). They are expanded
-    to the kernel layout once per scale tensor and cached; call once outside CUDA
-    graph capture (any warmup does) so the captured graph reads the cached copy.
+    Block-scaled FP8 (per_128x128 or per_1x128) takes the checkpoint's FP32
+    block scales w1_scale [E, 2 * ceil(inter_dim / b), ceil(model_dim / b)]
+    (gate blocks, then up blocks) and w2_scale [E, ceil(model_dim / b),
+    ceil(inter_dim / b)], b in {128, 64} per dim (64 when vLLM refines checkpoint
+    blocks for a TP shard). The kernels read them directly on every call, so
+    in-place updates (weight reload) take effect without any conversion step.
     """
     # num_local_tokens: rows at and past it (CUDA-graph padding) run no route
     # and their output rows are unspecified, as in fused_moe. The sorted paths
@@ -901,13 +887,6 @@ def run_flydsl_moe_gfx942(
         raise RuntimeError(
             f"Unsupported gfx942 FlyDSL MoE config {config_string!r}: "
             f"{unsupported_reason}"
-        )
-    if problem.quant_type == "block":
-        w1_scale = _kernel_block_scale(
-            w1_scale, problem.gateup_dim, problem.hidden_dim, problem.scale_k1
-        )
-        w2_scale = _kernel_block_scale(
-            w2_scale, problem.model_dim, problem.inter_dim, problem.scale_k2
         )
     if config.use_prefill:
         return _run_prefill(

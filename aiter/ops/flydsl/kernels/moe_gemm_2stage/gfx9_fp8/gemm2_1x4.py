@@ -194,16 +194,21 @@ def _build_moe_gemm2_1x4_n256(
     padding,
     _task_table=False,
     scale_k=None,
+    scale_block=(128, 128),
 ):
     assert padding in (0, 32, 64, 128)
     is_block = weight_quant_type == "block"
     if is_block:
-        # One K core per scale group: w scales [E, K/scale_k, N], a scales [M*TOPK, K/scale_k].
+        # One K core per scale group: a scales [M*TOPK, K/scale_k]; weight scales
+        # [E, ceil(N / block_n), ceil(K / block_k)] as in the checkpoint.
         assert act_quant_type == "block"
         assert scale_k == (
             128 if K % 128 == 0 else 64
         ), f"block Down needs scale_k equal to the K core ({K=}, {scale_k=})"
+        assert scale_block[0] in (64, 128) and scale_block[1] % scale_k == 0
         k_groups = K // scale_k
+        n_blocks = fxh.div_up(N, scale_block[0])
+        k_blocks = fxh.div_up(K, scale_block[1])
     _, generic_xcd_count = get_down_device_config()
     block_m_per_4wave_group = 64
     activation_bytes = block_m_per_4wave_group * K
@@ -464,23 +469,24 @@ def _build_moe_gemm2_1x4_n256(
                     block_token_scales.append(
                         [a_scale_rows[row + g] for g in range_constexpr(k_groups)]
                     )
-                lane_id = fx.Int32(fx.thread_idx.x % 64)
                 wave_id = fx.Int32(fx.thread_idx.x // 64)
-                # C row (m, v) of this lane is channel 64*wave + 16*lane_group + 4*m + v.
-                block_w_scale_base = (
-                    fxh._as_ptr(p_w_scale)
-                    + expert_id * (k_groups * N)
-                    + wave_id * WAVE_N
-                    + (lane_id // 16) * 16
+                # This wave's C rows are channels 64 * wave + [0, 64) of the N
+                # tile, inside one checkpoint scale block.
+                block_w_scale_base = fxh._as_ptr(p_w_scale) + expert_id * (
+                    n_blocks * k_blocks
                 )
 
             def issue_block_w_scales(block_n):
-                base = block_w_scale_base + fx.Int32(block_n) * BLOCK_N
+                row = (
+                    block_w_scale_base
+                    + (
+                        (fx.Int32(block_n) * BLOCK_N + wave_id * WAVE_N)
+                        // scale_block[0]
+                    )
+                    * k_blocks
+                )
                 return [
-                    [
-                        fxh.issue_f32x4(base + g * N + m * 4)
-                        for m in range_constexpr(BLOCK_N // 64)
-                    ]
+                    fxh.load_f32(row + g * scale_k // scale_block[1])
                     for g in range_constexpr(k_groups)
                 ]
 
@@ -653,14 +659,11 @@ def _build_moe_gemm2_1x4_n256(
                     fx.gemm(mm, fragC, frag_weight_slots[current_slot], frag_act, fragC)
                 _set_priority(0)
                 if const_expr(is_block):
-                    w_sc = [
-                        block_w_scales[k_core][m].load()
-                        for m in range_constexpr(BLOCK_N // 64)
-                    ]
+                    w_sc = block_w_scales[k_core]
                     fxh.scaled_accumulate(
                         fragC,
                         fragC_part,
-                        lambda v, m, n: w_sc[m][v] * block_token_scales[n][k_core],
+                        lambda v, m, n: w_sc * block_token_scales[n][k_core],
                     )
                 if const_expr(k_core + 1 == nBK and weight_quant_type == "ptpc"):
                     commit_scale_block_lds(next_scale_vec, next_frag_pc_scale)
