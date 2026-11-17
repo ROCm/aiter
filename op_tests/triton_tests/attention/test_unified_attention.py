@@ -1420,10 +1420,17 @@ def test_unified_attn_padded_block_table_gfx950(
     actual = actual.to(torch.float32)
     if dtype.itemsize == 1:
         # As test_triton_unified_attn: fp8 with descales allows 0.5% of elements out.
-        mismatch = torch.abs(actual - ref_output) > 1.5e-1 + 1.5e-1 * torch.abs(
-            ref_output
+        assert (
+            checkAllclose(
+                actual,
+                ref_output,
+                atol=1.5e-1,
+                rtol=1.5e-1,
+                tol_err_ratio=0.005,
+                msg="unified_attn padded block table",
+            )
+            < 0.005
         )
-        assert mismatch.float().mean().item() < 0.005
     else:
         torch.testing.assert_close(actual, ref_output, atol=1.5e-2, rtol=1e-2)
 
