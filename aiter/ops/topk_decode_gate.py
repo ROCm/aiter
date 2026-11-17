@@ -76,8 +76,8 @@ BACKEND_ADAPTIVE = "adaptive"
 # 1.05x faster than the kernel the gate would pick without it, on a full buffer
 # and on a padded one bounded at its live length; with the bound at the buffer
 # width, as under graph capture, it must not be slower than that kernel. The
-# gate cannot tell these apart. The gfx942 304 CU entry was fitted without the
-# buffer-width case. Every entry assumes the caller declares `max_row_len`.
+# gate cannot tell these apart. Every entry assumes the caller declares
+# `max_row_len`.
 _ADAPTIVE_BANDS_BY_K_GROUP = {
     ("gfx942", 80): {
         True: {
@@ -186,52 +186,6 @@ _ADAPTIVE_BANDS_BY_K_GROUP = {
                 (16_384, 20_000, 64, 512),
                 (524_288, 524_288, 1, 64),
                 (1_048_576, 1_048_576, 1, 16),
-            ),
-        },
-    },
-    ("gfx942", 304): {
-        True: {
-            (256,): (
-                (8_192, 8_192, 1, 2),
-                (16_384, 20_000, 1, 128),
-                (65_536, 65_536, 1, 16),
-                (131_072, 131_072, 1, 32),
-                (262_144, 262_144, 1, 16),
-                (524_288, 524_288, 1, 8),
-                (1_048_576, 1_048_576, 1, 4),
-            ),
-            (512, 1024, 2048): (
-                (16_384, 20_000, 1, 128),
-                (32_768, 32_768, 1, 2),
-                (65_536, 65_536, 1, 16),
-                (131_072, 131_072, 1, 32),
-                (262_144, 262_144, 1, 16),
-                (524_288, 524_288, 1, 8),
-                (1_048_576, 1_048_576, 1, 4),
-            ),
-            (4096,): (
-                (16_384, 32_768, 1, 128),
-                (65_536, 1_048_576, 1, 512),
-            ),
-        },
-        False: {
-            (256,): (
-                (65_536, 65_536, 1, 32),
-                (131_072, 131_072, 1, 16),
-                (262_144, 524_288, 1, 8),
-                (1_048_576, 1_048_576, 1, 4),
-            ),
-            (512, 1024, 2048): (
-                (32_768, 32_768, 1, 4),
-                (65_536, 131_072, 1, 32),
-                (262_144, 524_288, 1, 16),
-                (1_048_576, 1_048_576, 1, 4),
-            ),
-            (4096,): (
-                (32_768, 32_768, 1, 16),
-                (65_536, 131_072, 1, 64),
-                (262_144, 524_288, 1, 128),
-                (1_048_576, 1_048_576, 1, 64),
             ),
         },
     },
