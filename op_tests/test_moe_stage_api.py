@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""fused_moe_stage1 / fused_moe_stage2 against fused_moe on MXFP4 experts."""
+"""fused_moe_prepare_stage2 / fused_moe_run_stage2 against fused_moe on MXFP4
+experts."""
+
+import dataclasses
+import inspect
 
 import pytest
 import torch
@@ -9,8 +13,8 @@ import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import (
     fused_moe,
-    fused_moe_stage1,
-    fused_moe_stage2,
+    fused_moe_prepare_stage2,
+    fused_moe_run_stage2,
     fused_topk,
     get_2stage_cfgs,
     get_padded_M,
@@ -25,8 +29,8 @@ pytestmark = pytest.mark.skipif(
     reason="MXFP4 MoE requires gfx950",
 )
 
-# One TP8 rank of a 256-expert top-8 model with hidden 4096: a shape with
-# tuned two-stage FlyDSL rows for the repeated-input call (topk 1).
+# One TP8 rank of a 256-expert top-8 model, hidden 4096. The repeated-input
+# call (topk 1) has tuned FlyDSL rows for this shape.
 E, TOPK, MODEL_DIM, INTER_DIM = 256, 8, 4096, 512
 
 
@@ -111,15 +115,35 @@ def test_staged_matches_fused_moe(experts, token):
     x, topk_weights, topk_ids = _routes(token)
     kwargs = _kwargs(experts)
     try:
-        inputs = fused_moe_stage1(
+        inputs = fused_moe_prepare_stage2(
             x, topk_weight=topk_weights, topk_ids=topk_ids, **kwargs
         )
     except RuntimeError:
-        pytest.skip("selected config has no separate stage 2")
+        pytest.skip("selected config has no separate stage2")
+    staged = fused_moe_run_stage2(inputs)
     _check(
         fused_moe(x, topk_weight=topk_weights, topk_ids=topk_ids, **kwargs),
-        fused_moe_stage2(inputs),
+        staged,
     )
+    # The sorting's buffer holds the result: a second summed run needs `out`.
+    with pytest.raises(RuntimeError):
+        fused_moe_run_stage2(inputs)
+    _check(staged, fused_moe_run_stage2(inputs, out=torch.empty_like(staged)))
+
+
+def test_prepare_takes_fused_moe_arguments():
+    """fused_moe_prepare_stage2 has fused_moe's parameters (order and
+    defaults) up to gate_mode."""
+    prepare = list(inspect.signature(fused_moe_prepare_stage2).parameters.values())
+    fused = list(inspect.signature(fused_moe).parameters.values())
+    n = [p.name for p in fused].index("gate_mode") + 1
+    assert [(p.name, p.default) for p in prepare[:n]] == [
+        (p.name, p.default) for p in fused[:n]
+    ]
+    for name in ("quant_type_a", "quant_dtype_a", "quant_dtype_a2", "deterministic"):
+        assert inspect.signature(fused_moe_prepare_stage2).parameters[name].default == (
+            inspect.signature(fused_moe).parameters[name].default
+        )
 
 
 @pytest.mark.parametrize("token", [256, 2048])
@@ -129,14 +153,14 @@ def test_per_slot_matches_repeated_input(experts, token):
     x, _, topk_ids = _routes(token)
     kwargs = _kwargs(experts)
     ones = torch.ones(token, TOPK, dtype=dtypes.fp32, device="cuda")
-    inputs = fused_moe_stage1(
+    inputs = fused_moe_prepare_stage2(
         x,
         topk_weight=ones,
         topk_ids=topk_ids,
         config_shape=(token * TOPK, 1),
         **kwargs,
     )
-    per_slot = fused_moe_stage2(inputs, per_slot=True)
+    per_slot = fused_moe_run_stage2(inputs, per_slot=True)
     assert per_slot.shape == (token, TOPK, MODEL_DIM)
     # Each route of the repeated input is a top-1 route of weight one.
     ref = fused_moe(
@@ -148,6 +172,22 @@ def test_per_slot_matches_repeated_input(experts, token):
     _check(ref.view(token, TOPK, MODEL_DIM), per_slot)
 
 
+@pytest.mark.parametrize("token", [256, 2048])
+def test_per_slot_sums_to_default(experts, token):
+    """On the default top-8 config (v1 FlyDSL stage2 on gfx950), the
+    per-slot rows sum to the default output."""
+    x, topk_weights, topk_ids = _routes(token)
+    inputs = fused_moe_prepare_stage2(
+        x, topk_weight=topk_weights, topk_ids=topk_ids, **_kwargs(experts)
+    )
+    try:
+        per_slot = fused_moe_run_stage2(inputs, per_slot=True)
+    except NotImplementedError:
+        pytest.skip("selected stage2 has no per-slot output")
+    assert per_slot.shape == (token, TOPK, MODEL_DIM)
+    _check(fused_moe_run_stage2(inputs), per_slot.float().sum(dim=1))
+
+
 @pytest.mark.parametrize("per_slot", [False, True])
 def test_replaced_w2_rows(experts, per_slot):
     token = 2048
@@ -157,17 +197,21 @@ def test_replaced_w2_rows(experts, per_slot):
     kwargs = _kwargs(experts)
 
     def stage2_on(w2=None, w2_scale=None):
-        inputs = fused_moe_stage1(
+        inputs = fused_moe_prepare_stage2(
             x,
             topk_weight=topk_weights,
             topk_ids=topk_ids,
             config_shape=(token * TOPK, 1),
             **kwargs,
         )
-        return fused_moe_stage2(inputs, per_slot=per_slot, w2=w2, w2_scale=w2_scale)
+        return fused_moe_run_stage2(inputs, per_slot=per_slot, w2=w2, w2_scale=w2_scale)
 
     full = stage2_on()
-    halves = [stage2_on(w2, scale) for w2, scale in experts["w2_rows"]]
+    # vLLM passes the shuffled scale viewed as [E, rows, groups].
+    halves = [
+        stage2_on(w2, scale.view(E, w2.shape[1], -1))
+        for w2, scale in experts["w2_rows"]
+    ]
     _check(full, torch.cat(halves, dim=-1), exact=per_slot)
 
 
@@ -176,7 +220,7 @@ def test_replaced_a2(experts):
     if not supports_stage2_overrides(_repeated_input_config(token)):
         pytest.skip("no FlyDSL MXFP4 stage2 for this shape")
     x, topk_weights, topk_ids = _routes(token)
-    inputs = fused_moe_stage1(
+    inputs = fused_moe_prepare_stage2(
         x,
         topk_weight=topk_weights,
         topk_ids=topk_ids,
@@ -184,18 +228,18 @@ def test_replaced_a2(experts):
         **_kwargs(experts),
     )
     zeros = torch.zeros_like(inputs.a2.view(torch.uint8)).view(inputs.a2.dtype)
-    out = fused_moe_stage2(inputs, per_slot=True, a2=zeros)
+    out = fused_moe_run_stage2(inputs, per_slot=True, a2=zeros)
     assert not out.any()
 
 
 def test_rejected_operand_mismatch(experts):
-    """Replacing operands whose rows, dtype or widths do not fit stage 1's
-    raise ValueError before any kernel runs."""
+    """Mismatched replacing operands raise ValueError before any kernel
+    runs."""
     token = 2048
     if not supports_stage2_overrides(_repeated_input_config(token)):
         pytest.skip("no FlyDSL MXFP4 stage2 for this shape")
     x, topk_weights, topk_ids = _routes(token)
-    inputs = fused_moe_stage1(
+    inputs = fused_moe_prepare_stage2(
         x,
         topk_weight=topk_weights,
         topk_ids=topk_ids,
@@ -206,18 +250,67 @@ def test_rejected_operand_mismatch(experts):
     (w2, w2_scale), _ = experts["w2_rows"]
     a2_u8 = a2.view(torch.uint8)
     wide_a2 = torch.cat((a2_u8, a2_u8), dim=-1).view(a2.dtype)
+    w2_u8 = w2.view(torch.uint8)
+    wide_w2 = torch.cat((w2_u8, w2_u8), dim=-1).view(w2.dtype)
     cases = {
+        "a2 device": {"a2": a2.cpu()},
         "a2 rows": {"a2": a2[:-1]},
         "a2 dtype": {"a2": a2.view(torch.int8)},
         "a2 width without a2_scale": {"a2": wide_a2},
+        "a2_scale device": {"a2_scale": a2_scale.cpu()},
         "a2_scale rows": {"a2_scale": a2_scale[:-32]},
+        "a2_scale dtype": {"a2_scale": a2_scale.view(torch.int16)},
         "w2 experts": {"w2": w2[:-1], "w2_scale": w2_scale},
         "w2 without w2_scale": {"w2": w2},
-        "w2 and a2 widths": {"w2": w2[..., :-16], "w2_scale": w2_scale},
+        "w2 and a2 widths": {"w2": w2[..., :-16].contiguous(), "w2_scale": w2_scale},
+        "w2 not contiguous": {
+            "w2": experts["w2"][0][:, : MODEL_DIM // 2],
+            "w2_scale": w2_scale,
+        },
+        "w2_scale rows": {"w2": w2, "w2_scale": w2_scale[:256]},
+        "w2_scale groups": {"w2": w2, "w2_scale": w2_scale[:, :8].contiguous()},
+        "a2_scale groups": {
+            "a2": wide_a2,
+            "a2_scale": a2_scale,
+            "w2": wide_w2,
+            "w2_scale": torch.cat((w2_scale, w2_scale), dim=-1),
+        },
+        "w2_scale alone of another shape": {"w2_scale": w2_scale},
+        "out overlapping a2": {"out": a2},
     }
     for name, overrides in cases.items():
         with pytest.raises(ValueError):
-            fused_moe_stage2(inputs, per_slot=True, **overrides)
+            fused_moe_run_stage2(inputs, per_slot=True, **overrides)
+            pytest.fail(f"{name}: accepted")
+
+
+def test_rejected_unsupported_capture(experts):
+    """Like supports_stage2_overrides, a captured stage2 after split-K
+    (no a2_scale), with bias2 or after the aux sort refuses the overrides."""
+    token = 2048
+    if not supports_stage2_overrides(_repeated_input_config(token)):
+        pytest.skip("no FlyDSL MXFP4 stage2 for this shape")
+    x, topk_weights, topk_ids = _routes(token)
+    inputs = fused_moe_prepare_stage2(
+        x,
+        topk_weight=topk_weights,
+        topk_ids=topk_ids,
+        config_shape=(token * TOPK, 1),
+        **_kwargs(experts),
+    )
+    marker = torch.zeros(1, device="cuda")
+    cases = {
+        "split-K": dataclasses.replace(inputs, a2_scale=None),
+        "bias2": dataclasses.replace(
+            inputs, _kwargs={**inputs._kwargs, "bias2": marker}
+        ),
+        "aux sort": dataclasses.replace(
+            inputs, _kwargs={**inputs._kwargs, "reverse_sorted": marker}
+        ),
+    }
+    for name, captured in cases.items():
+        with pytest.raises(NotImplementedError):
+            fused_moe_run_stage2(captured, per_slot=True)
             pytest.fail(f"{name}: accepted")
 
 
@@ -231,9 +324,9 @@ def _cat_scale_columns(scales: list[torch.Tensor]) -> torch.Tensor:
 
 @pytest.mark.parametrize("token", [256, 2048])
 def test_split_intermediate_gather(token):
-    """Two ranks hold halves of the intermediate dim. Stage 2 on the gathered
-    intermediate and on one half of the w2 rows gives the summed per-route
-    outputs of both ranks on those rows."""
+    """Two ranks each hold half of the intermediate dim. Stage2 on the
+    gathered a2 and half of the w2 rows equals the sum of both ranks'
+    per-slot outputs on those rows."""
     if not supports_stage2_overrides(_repeated_input_config(token)):
         pytest.skip("no FlyDSL MXFP4 stage2 for this shape")
     torch.manual_seed(1)
@@ -251,7 +344,7 @@ def test_split_intermediate_gather(token):
             w2[..., cols].contiguous()
         )
         ranks.append(
-            fused_moe_stage1(
+            fused_moe_prepare_stage2(
                 x,
                 w1q,
                 w2q,
@@ -264,11 +357,11 @@ def test_split_intermediate_gather(token):
                 config_shape=(token * TOPK, 1),
             )
         )
-    ref = sum(fused_moe_stage2(inputs, per_slot=True).float() for inputs in ranks)
+    ref = sum(fused_moe_run_stage2(inputs, per_slot=True).float() for inputs in ranks)
     a2 = torch.cat([inputs.a2.view(torch.uint8) for inputs in ranks], dim=-1)
     a2_scale = _cat_scale_columns([inputs.a2_scale for inputs in ranks])
     w2_rows, w2_rows_scale = _quant(w2[:, :half].contiguous())
-    out = fused_moe_stage2(
+    out = fused_moe_run_stage2(
         ranks[0],
         per_slot=True,
         w2=w2_rows,
@@ -284,7 +377,7 @@ def test_split_intermediate_gather(token):
 
 @pytest.mark.parametrize("token", [32, 512])
 def test_bf16_default_and_rejected_overrides(token):
-    """A non-FlyDSL (bf16) config: the default stage 2 still equals fused_moe;
+    """On a bf16 (non-FlyDSL) config the default stage2 equals fused_moe and
     the overrides are refused."""
     torch.manual_seed(token)
     e, model_dim, inter_dim, topk = 32, 1024, 512, 4
@@ -295,9 +388,9 @@ def test_bf16_default_and_rejected_overrides(token):
     score = torch.randn(token, e, dtype=dtypes.bf16, device="cuda")
     topk_weights, topk_ids = fused_topk(x, score, topk, True)
     try:
-        inputs = fused_moe_stage1(x, w1, w2, topk_weights, topk_ids)
+        inputs = fused_moe_prepare_stage2(x, w1, w2, topk_weights, topk_ids)
     except RuntimeError:
-        pytest.skip("selected config has no separate stage 2")
+        pytest.skip("selected config has no separate stage2")
     with pytest.raises(NotImplementedError):
-        fused_moe_stage2(inputs, per_slot=True)
-    _check(fused_moe(x, w1, w2, topk_weights, topk_ids), fused_moe_stage2(inputs))
+        fused_moe_run_stage2(inputs, per_slot=True)
+    _check(fused_moe(x, w1, w2, topk_weights, topk_ids), fused_moe_run_stage2(inputs))

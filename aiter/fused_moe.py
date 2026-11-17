@@ -2606,26 +2606,24 @@ def _fused_moe_impl(
 
 @dataclass
 class MoeStage2Inputs:
-    """What :func:`fused_moe_stage1` leaves for :func:`fused_moe_stage2`, which
-    runs the stage2 that ``fused_moe`` would. Only the stage-1 output is
-    public; the selected stage2 and its sorted routes are private."""
+    """Returned by ``fused_moe_prepare_stage2`` for ``fused_moe_run_stage2``.
+    Only the stage1 output ``a2`` / ``a2_scale`` is public."""
 
+    # One row per route or per sorted slot; the last dim is the intermediate.
     a2: torch.Tensor
-    """Stage-1 output in the selected stage2's input layout (one row per
-    route, or per sorted slot); the last dim is the intermediate."""
     a2_scale: torch.Tensor | None
     _stage2: Callable
+    # (w1, w2, sorted_ids, sorted_expert_ids, num_valid_ids, moe_out, topk);
+    # moe_out is the [token_num, model_dim] output prepared by the sorting.
     _args: tuple
-    """``(w1, w2, sorted_ids, sorted_expert_ids, num_valid_ids, moe_out,
-    topk)``; ``moe_out`` is the ``[token_num, model_dim]`` output, prepared
-    (zeroed for accumulating stage2 kernels) by the sorting."""
     _kwargs: dict
+    # Set once stage2 has written moe_out.
+    _moe_out_written: bool = False
 
 
 def _stage2_override_kind(stage2: Callable) -> str | None:
-    """The FlyDSL MXFP4 stage2 family ("v1" or "v2") of ``stage2``, if it
-    sizes its GEMM from the operands and can write one row per route; else
-    None."""
+    """Return "v1" or "v2" if ``stage2`` is a FlyDSL MXFP4 kernel that
+    supports per-slot output and replaced operands, else None."""
     func = getattr(stage2, "func", stage2)
     kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
     if func is _flydsl_stage2_wrapper:
@@ -2640,25 +2638,36 @@ def _stage2_override_kind(stage2: Callable) -> str | None:
 
 
 def supports_stage2_overrides(metadata: "MOEMetadata") -> bool:
-    """Whether :func:`fused_moe_stage2` accepts ``per_slot=True`` and replaced
-    ``w2`` / ``a2`` operands for a call that selects ``metadata`` (see
-    :func:`get_2stage_cfgs`). A config lookup; nothing is compiled or run."""
+    """Whether ``fused_moe_run_stage2`` supports ``per_slot`` and replaced
+    operands for ``metadata`` (from ``get_2stage_cfgs``). Nothing is run."""
     if (
         metadata.run_1stage
         or metadata.full_impl is not None
         or metadata.stage2 is None
         or metadata.output_aux
         or metadata.stage2_has_bias
-        # Split-K stage1 hands stage2 an unquantized intermediate.
+        # Split-K stage1 leaves the intermediate unquantized.
         or metadata.ksplit > 1
     ):
         return False
     return _stage2_override_kind(metadata.stage2) is not None
 
 
+def _captured_stage2_supports_overrides(inputs: "MoeStage2Inputs") -> bool:
+    """``supports_stage2_overrides`` for a captured stage2: split-K leaves
+    ``a2_scale`` None, and a stage2 bias or the aux sort is in the kwargs."""
+    kwargs = inputs._kwargs
+    return (
+        _stage2_override_kind(inputs._stage2) is not None
+        and inputs.a2_scale is not None
+        and kwargs.get("bias2") is None
+        and kwargs.get("reverse_sorted") is None
+    )
+
+
 def _scaled_dim(dim: int, cols: int, ref_cols: int) -> int:
-    """The logical width of a tensor of ``cols`` stored columns, given that
-    ``ref_cols`` stored columns of the same dtype hold ``dim`` elements."""
+    """Logical width of ``cols`` stored columns, if ``ref_cols`` stored
+    columns hold ``dim`` elements."""
     if (dim * cols) % ref_cols:
         raise ValueError(
             f"{cols} stored columns do not hold whole elements "
@@ -2674,19 +2683,33 @@ def _check_stage2_operands(
     a2: torch.Tensor | None,
     a2_scale: torch.Tensor | None,
 ) -> None:
-    """Raise ``ValueError`` unless the replacing stage 2 operands have the
-    dtype and rows of the ones they replace: ``a2`` the same routes (or sorted
-    slots), ``w2`` the same experts, and a GEMM reduction dim that matches.
-    Only the scales' row counts are checked: the shuffled E8M0 layout pads
-    rows and groups."""
+    """Raise ``ValueError`` if a replacing stage2 operand does not fit the
+    one it replaces (see ``fused_moe_run_stage2``). Shuffled E8M0 scales pad
+    rows and groups, so only their minimum size is checked."""
     old_a2, old_a2_scale = inputs.a2, inputs.a2_scale
     old_w2 = inputs._args[1]
+    old_w2_scale = inputs._kwargs.get("w2_scale")
     new_a2 = old_a2 if a2 is None else a2
     new_w2 = old_w2 if w2 is None else w2
 
     def fail(msg: str) -> None:
-        raise ValueError(f"fused_moe_stage2: {msg}")
+        raise ValueError(f"fused_moe_run_stage2: {msg}")
 
+    for name, new in (
+        ("w2", w2),
+        ("w2_scale", w2_scale),
+        ("a2", a2),
+        ("a2_scale", a2_scale),
+    ):
+        if new is None:
+            continue
+        if new.device != old_a2.device:
+            fail(f"{name} is on {new.device}, stage1 ran on {old_a2.device}")
+        if not new.is_contiguous():
+            fail(f"{name} is not contiguous")
+    for name, new in (("w2_scale", w2_scale), ("a2_scale", a2_scale)):
+        if new is not None and new.element_size() != 1:
+            fail(f"{name} is a {new.dtype} tensor, not E8M0")
     for name, new, old in (("a2", a2, old_a2), ("w2", w2, old_w2)):
         if new is not None and (new.dtype != old.dtype or new.dim() != old.dim()):
             fail(
@@ -2695,69 +2718,113 @@ def _check_stage2_operands(
             )
     if a2 is not None and a2.shape[:-1] != old_a2.shape[:-1]:
         fail(
-            f"a2 has rows {tuple(a2.shape[:-1])}, stage 1 produced "
+            f"a2 has rows {tuple(a2.shape[:-1])}, stage1 produced "
             f"{tuple(old_a2.shape[:-1])}"
         )
     if w2 is not None and w2.shape[0] != old_w2.shape[0]:
-        fail(f"w2 has {w2.shape[0]} experts, stage 1 ran {old_w2.shape[0]}")
-    # w2's last dim and a2's are the GEMM's reduction dim, each in its dtype's
-    # packing: they must grow or shrink together.
+        fail(f"w2 has {w2.shape[0]} experts, stage1 ran {old_w2.shape[0]}")
+    # The last dims of w2 and a2 are both the reduction dim (K).
     if new_w2.shape[-1] * old_a2.shape[-1] != new_a2.shape[-1] * old_w2.shape[-1]:
         fail(
             f"w2 last dim {new_w2.shape[-1]} does not match a2 last dim "
-            f"{new_a2.shape[-1]} (stage 1: {old_w2.shape[-1]} and "
+            f"{new_a2.shape[-1]} (stage1: {old_w2.shape[-1]} and "
             f"{old_a2.shape[-1]})"
         )
     if a2 is not None and a2.shape[-1] != old_a2.shape[-1] and a2_scale is None:
         fail("an a2 of another width needs its a2_scale")
     if w2 is not None and w2.shape != old_w2.shape and w2_scale is None:
         fail("a w2 of another shape needs its w2_scale")
+    if w2_scale is not None:
+        if w2 is None and (
+            old_w2_scale is None or w2_scale.shape != old_w2_scale.shape
+        ):
+            fail(
+                f"w2_scale has shape {tuple(w2_scale.shape)}, the one it "
+                f"replaces {None if old_w2_scale is None else tuple(old_w2_scale.shape)}"
+            )
+        # [E * model_dim, groups] or [E, model_dim, groups], rows padded.
+        scale_rows = math.prod(w2_scale.shape[:-1])
+        if scale_rows < new_w2.shape[0] * new_w2.shape[1]:
+            fail(
+                f"w2_scale has {scale_rows} rows, w2 needs at least "
+                f"{new_w2.shape[0] * new_w2.shape[1]}"
+            )
     if a2_scale is not None and (
         old_a2_scale is None or a2_scale.shape[0] != old_a2_scale.shape[0]
     ):
         fail(
-            f"a2_scale has {a2_scale.shape[0]} rows, stage 1 produced "
+            f"a2_scale has {a2_scale.shape[0]} rows, stage1 produced "
             f"{None if old_a2_scale is None else old_a2_scale.shape[0]}"
         )
-
-
-def _capture_stage2(*, ordinary_stage2, stage2_args, stage2_kwargs):
-    return ordinary_stage2, stage2_args, stage2_kwargs
+    # One E8M0 scale per 32 FP4 values (2 per byte) of K.
+    groups = -(-new_a2.shape[-1] * 2 // 32)
+    for name, new in (("w2_scale", w2_scale), ("a2_scale", a2_scale)):
+        if new is not None and new.shape[-1] < groups:
+            fail(
+                f"{name} has {new.shape[-1]} groups, the reduction dim needs "
+                f"{groups}"
+            )
 
 
 @drop_presort_on_error
-def fused_moe_stage1(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    topk_weight: torch.Tensor,
-    topk_ids: torch.Tensor,
+def fused_moe_prepare_stage2(
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
     expert_mask: torch.Tensor | None = None,
-    activation: ActivationType = ActivationType.Silu,
-    quant_type: QuantType = QuantType.No,
-    doweight_stage1: bool = False,
+    activation=ActivationType.Silu,
+    quant_type=QuantType.No,
+    doweight_stage1=False,
     w1_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
     a1_scale: torch.Tensor | None = None,
     a2_scale: torch.Tensor | None = None,
+    block_size_M=None,
     num_local_tokens: torch.Tensor | None = None,
-    moe_sorting_dispatch_policy: int = 0,
-    dtype: torch.dtype | None = None,
-    swiglu_limit: float | None = None,
+    moe_sorting_dispatch_policy=0,
+    dtype=None,
+    hidden_pad=0,
+    intermediate_pad=0,
+    bias1=None,
+    bias2=None,
+    splitk=0,
+    swiglu_limit=None,
+    beta=None,
+    linear_beta=None,
+    gate_mode: str | None = GateMode.SEPARATED.value,
     *,
+    quant_type_a: QuantType | None = None,
+    quant_dtype_a: torch.dtype | None = None,
+    quant_dtype_a2: torch.dtype | None = None,
+    deterministic: bool = False,
     config_shape: tuple[int, int] | None = None,
 ) -> MoeStage2Inputs:
-    """Run the sorting and stage 1 of :func:`fused_moe` and return what its
-    stage 2 consumes, so the caller can act between the stages (e.g. gather the
-    intermediate across ranks) and run stage 2 with :func:`fused_moe_stage2`.
+    """Run the sorting and stage1 of ``fused_moe`` and return the stage2
+    inputs, so the caller can work on them (e.g. gather ``a2`` across ranks)
+    before ``fused_moe_run_stage2``. Not related to ``fused_moe_1stage``.
 
-    Same arguments as :func:`fused_moe`. ``config_shape=(token_num, topk)``
-    selects the kernels and tuned config as for a call with that many tokens
-    and routes per token instead of ``topk_ids.shape`` (e.g. the rows tuned for
-    an equivalent call on a repeated input). Raises ``RuntimeError`` for
-    configs without a separate stage 2 (one-stage and fused implementations).
+    Takes the arguments of ``fused_moe`` up to ``gate_mode`` (same order and
+    defaults), plus keyword-only ``quant_type_a``, ``quant_dtype_a``,
+    ``quant_dtype_a2`` and ``deterministic``. Shared experts (FHMoE),
+    ``stage2_scatter``, ``herd_topk`` and ``output`` are not supported; pass
+    ``out`` to ``fused_moe_run_stage2`` instead of ``output``.
+
+    ``config_shape=(token_num, topk)`` selects kernels and tuned config as if
+    ``topk_ids`` had that shape, e.g. the config of the same routes as a
+    repeated input with top-1.
+
+    Raises ``RuntimeError`` if the selected pipeline has no separate stage2
+    (1-stage, full or direct implementations); for some of them the MoE has
+    already run by then.
     """
-    captured = _fused_moe_impl(
+    captured = []
+
+    def capture_stage2(*, ordinary_stage2, stage2_args, stage2_kwargs):
+        captured.append((ordinary_stage2, stage2_args, stage2_kwargs))
+
+    _fused_moe_impl(
         hidden_states,
         w1,
         w2,
@@ -2771,16 +2838,32 @@ def fused_moe_stage1(
         w2_scale=w2_scale,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
+        block_size_M=block_size_M or -1,
         num_local_tokens=num_local_tokens,
         moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
         dtype=dtype,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        bias1=bias1,
+        bias2=bias2,
+        splitk=splitk,
         swiglu_limit=swiglu_limit,
-        _stage2_override=_capture_stage2,
+        beta=beta,
+        linear_beta=linear_beta,
+        gate_mode=gate_mode,
+        quant_type_a=None if quant_type_a is None else QuantType(quant_type_a).value,
+        quant_dtype_a=quant_dtype_a,
+        quant_dtype_a2=quant_dtype_a2,
+        deterministic=deterministic,
+        _stage2_override=capture_stage2,
         _config_shape=config_shape,
     )
-    # Every path that does not reach stage 2 raises before returning.
-    assert isinstance(captured, tuple)
-    stage2, args, kwargs = captured
+    if not captured:
+        raise RuntimeError(
+            "fused_moe_prepare_stage2: the selected MoE pipeline has no "
+            "separate stage2"
+        )
+    ((stage2, args, kwargs),) = captured
     kwargs = dict(kwargs)
     return MoeStage2Inputs(
         a2=args[0],
@@ -2791,7 +2874,7 @@ def fused_moe_stage1(
     )
 
 
-def fused_moe_stage2(
+def fused_moe_run_stage2(
     inputs: MoeStage2Inputs,
     *,
     out: torch.Tensor | None = None,
@@ -2801,27 +2884,31 @@ def fused_moe_stage2(
     a2: torch.Tensor | None = None,
     a2_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run stage 2 on :func:`fused_moe_stage1`'s output.
+    """Run the stage2 of ``fused_moe`` on ``inputs`` from
+    ``fused_moe_prepare_stage2``. Returns the ``[token_num, model_dim]``
+    output (``out`` if given).
 
-    By default this is the stage 2 of :func:`fused_moe` and returns its
-    ``[token_num, model_dim]`` output (in the buffer the sorting prepared, or
-    in ``out``).
+    Options, if ``supports_stage2_overrides`` is true for the config (else
+    ``NotImplementedError``):
 
-    The options below require :func:`supports_stage2_overrides`:
+    * ``per_slot``: write each route's weighted output to its own row of
+      ``out[token_num, topk, model_dim]`` instead of summing. Under EP, rows
+      of masked experts are zero if ``out`` is allocated here, and untouched
+      in a caller's ``out``.
+    * ``w2`` / ``w2_scale``: use these down weights (same layout and experts,
+      any ``model_dim``).
+    * ``a2`` / ``a2_scale``: use this intermediate (same layout and rows, any
+      width), e.g. ``inputs.a2`` gathered across ranks.
 
-    * ``per_slot``: write every route's output, weighted as ``fused_moe``
-      weights it, to its own row of ``out[token_num, topk, model_dim]``
-      instead of summing the routes. Under EP, rows of routes to experts
-      masked out by ``expert_mask`` are left unwritten.
-    * ``w2`` / ``w2_scale``: run the GEMM on these expert down weights (same
-      layout, any number of output rows ``model_dim``) instead.
-    * ``a2`` / ``a2_scale``: run it on this intermediate (same layout and
-      rows, any width) instead, e.g. ``inputs.a2`` gathered across ranks.
+    Replacing operands must be contiguous, on the same device, of the same
+    dtype, with matching K for ``w2`` and ``a2``, E8M0 scales with enough
+    rows and groups, and a new scale if the shape changes; else
+    ``ValueError``.
 
-    A replacing operand must have the dtype and rows of the one it replaces
-    (``a2`` the same routes or sorted slots, ``w2`` the same experts), the
-    last dims of ``w2`` and ``a2`` must still match, and an operand of another
-    shape needs its scale; otherwise this raises ``ValueError``.
+    ``inputs`` can be run several times (e.g. with different ``w2`` rows).
+    Without ``out``, the summed output is the sorting's buffer, so it can
+    only be returned once per ``inputs``. ``out`` must be contiguous and must
+    not overlap ``a2``.
     """
     stage2 = inputs._stage2
     w1, w2_, sorted_ids, sorted_expert_ids, num_valid_ids, moe_buf, topk = inputs._args
@@ -2830,7 +2917,7 @@ def fused_moe_stage2(
     kwargs = dict(inputs._kwargs)
     kwargs["a2_scale"] = inputs.a2_scale if a2_scale is None else a2_scale
     if per_slot or any(t is not None for t in (w2, w2_scale, a2, a2_scale)):
-        if _stage2_override_kind(stage2) is None:
+        if not _captured_stage2_supports_overrides(inputs):
             raise NotImplementedError(
                 f"stage2 {stage2} does not support per_slot or replaced "
                 "operands; see supports_stage2_overrides"
@@ -2838,8 +2925,7 @@ def fused_moe_stage2(
         _check_stage2_operands(inputs, w2, w2_scale, a2, a2_scale)
         if w2_scale is not None:
             kwargs["w2_scale"] = w2_scale.view(dtypes.fp8_e8m0)
-        # The v2 kernel takes the GEMM shape from its config; v1 from the
-        # operands.
+        # v2 takes the GEMM shape from its config, v1 from the operands.
         config = getattr(stage2, "keywords", {})
         if w2 is not None and "model_dim" in config:
             kwargs["model_dim"] = w2.shape[1]
@@ -2849,14 +2935,21 @@ def fused_moe_stage2(
             )
     token_num, dtype, device = moe_buf.shape[0], moe_buf.dtype, moe_buf.device
     model_dim = w2_.shape[1]
+    if out is not None and bytes_overlap(out, a2_):
+        raise ValueError("fused_moe_run_stage2: out overlaps a2")
     if per_slot:
         shape = (token_num, topk, model_dim)
         if out is None:
-            out = torch.empty(shape, dtype=dtype, device=device)
+            out = torch.zeros(shape, dtype=dtype, device=device)
         _validate_output_buffer_metadata(out, shape, dtype, device)
         moe_out = moe_buf
         kwargs["per_slot_out"] = out
     elif out is None and w2 is None:
+        if inputs._moe_out_written:
+            raise RuntimeError(
+                "fused_moe_run_stage2: the summed output of these inputs was "
+                "already returned; pass out= to run stage2 again"
+            )
         moe_out = out = moe_buf
     else:
         if out is None:
@@ -2877,6 +2970,8 @@ def fused_moe_stage2(
         topk,
         **kwargs,
     )
+    if moe_out is moe_buf and not per_slot:
+        inputs._moe_out_written = True
     return out
 
 
