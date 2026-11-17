@@ -268,10 +268,13 @@ def make_a_loader(
                              splits the block into per-k-group loader sets).
       * ``dma_via_vgpr``     gfx942 staging fallback, see below.
       * ``a_dtype``          ``"bf16"``, or ``"fp8"`` (gfx942 e4m3fnuz, 1 B/elem): same
-                             element layout and K order, every byte offset halves, and
-                             ``load`` returns 8 fp8 elements (one ds_read_b64).
+                             element layout, every byte offset halves, and ``load``
+                             returns 8 fp8 elements (one ds_read_b64). Each 8-byte K
+                             group is stored as [K0,K2,K4,K6,K1,K3,K5,K7], the order of
+                             the fp8 B fragment (``_fp4_nibble_to_fp8x8``).
     """
     _is_fp8 = a_dtype == "fp8"
+    assert not _is_fp8 or dma_via_vgpr, "the fp8 A K order is applied in VGPR staging"
     elem_bytes = 1 if _is_fp8 else 2
     _a_elem = fx.Float8E4M3FNUZ if _is_fp8 else fx.BFloat16
     # Per-thread A gather: each thread moves 16 B per pass. An fp8 tile can leave a
@@ -335,6 +338,18 @@ def make_a_loader(
     row_a_lds = lane_mod_16
     col_base_bytes_L = lane_div_16 * fx.Int32(32 * elem_bytes)  # 32 elems per lane
 
+    def _fp8_kperm_regs(r):
+        # Every staged chunk (16 B or 8 B, aligned) starts on an 8-byte K group, and the
+        # gemm2 swizzle flips only bits >= 4, so the groups stay whole in LDS.
+        v = fx.Vector(fx.memref_load_vec(r))
+        out = []
+        for j in range_constexpr(0, chunk_i32, 2):
+            e, o = _fp8_kperm_dwords(fx.Int32(v[j]), fx.Int32(v[j + 1]))
+            out += [_raw(e), _raw(o)]
+        rp = fx.make_rmem_tensor(fx.make_layout(chunk_i32, 1), fx.Int32)
+        rp.store(fx.Vector.from_elements(out, fx.Int32))
+        return rp
+
     def store_a_tile(base_k, slot=0):
         base_k_div4 = (base_k * fx.Int32(elem_bytes)) // fx.Int32(4)
         if k_grp_base_bytes is None:
@@ -360,6 +375,8 @@ def make_a_loader(
             if const_expr(dma_via_vgpr):
                 r = fx.make_rmem_tensor(fx.make_layout(chunk_i32, 1), fx.Int32)
                 fx.copy(x_dma_atom, src, r)
+                if const_expr(_is_fp8):
+                    r = _fp8_kperm_regs(r)
                 fx.copy(lds_atom, r, dst)
             else:
                 fx.copy(x_dma_atom, src, dst)
@@ -392,6 +409,7 @@ def make_a_loader(
 
     def issue_a_tile(base_k):
         assert dma_via_vgpr, "issue_tile is the gfx942 VGPR staging path"
+        assert not _is_fp8, "issue_tile/commit_tile do not apply the fp8 A K order"
         base_k_div4 = (base_k * fx.Int32(elem_bytes)) // fx.Int32(4)
         regs = []
         for i in range_constexpr(num_x_loads):
@@ -552,12 +570,27 @@ def _fp4_fp8_residual_table(t_i32):
     return lo, hi
 
 
-def _fp4_nibble_to_fp8x8(raw_i32, table):
-    """FP4 (E2M1) -> 8 E4M3FNUZ bytes for one MFMA K32 step, K order unchanged.
+# fp8 operand K order within one 8-byte MFMA fragment: [K0,K2,K4,K6, K1,K3,K5,K7].
+# The B decode produces it without an interleave; the fp8 A loader stores A in the
+# same order, so every K32 step multiplies the same (A, B) pairs.
+_FP8_KPERM_SEL_EVEN = 0x06040200
+_FP8_KPERM_SEL_ODD = 0x07050301
 
-    Nibble i (bits ``[4*i : 4*i+4)``) becomes byte i, the order the bf16 path uses.
-    All eight magnitudes fit one ``v_perm_b32`` pool; the sign is bit 7 of the
-    nibble's byte, which is where E4M3 keeps it.
+
+def _fp8_kperm_dwords(lo_i32, hi_i32):
+    """8 A bytes [K0..K3], [K4..K7] -> [K0,K2,K4,K6], [K1,K3,K5,K7]."""
+    e = rocdl.perm_b32(_raw(hi_i32), _raw(lo_i32), _raw(fx.Int32(_FP8_KPERM_SEL_EVEN)))
+    o = rocdl.perm_b32(_raw(hi_i32), _raw(lo_i32), _raw(fx.Int32(_FP8_KPERM_SEL_ODD)))
+    return fx.Int32(e), fx.Int32(o)
+
+
+def _fp4_nibble_to_fp8x8(raw_i32, table):
+    """FP4 (E2M1) -> 8 E4M3FNUZ bytes for one MFMA K32 step, in the fp8 K order.
+
+    Nibble i (bits ``[4*i : 4*i+4)``) is K_i. All eight magnitudes fit one
+    ``v_perm_b32`` pool; the sign is bit 7 of the nibble's byte, which is where E4M3
+    keeps it. The bytes come out as [K0,K2,K4,K6, K1,K3,K5,K7], the order the fp8 A
+    loader stores (``make_a_loader(a_dtype="fp8")``).
     """
     tab_lo, tab_hi = table
     raw = fx.Int32(raw_i32)
@@ -567,10 +600,7 @@ def _fp4_nibble_to_fp8x8(raw_i32, table):
     mag_o = fx.Int32(rocdl.perm_b32(_raw(tab_hi), _raw(tab_lo), _raw(odd)))
     mag_e = mag_e | ((raw & fx.Int32(0x08080808)) << fx.Int32(4))
     mag_o = mag_o | (raw & fx.Int32(0x80808080))
-    # mag_e = [K0,K2,K4,K6], mag_o = [K1,K3,K5,K7]; interleave back to K order.
-    d0 = fx.Int32(rocdl.perm_b32(_raw(mag_o), _raw(mag_e), _raw(fx.Int32(0x05010400))))
-    d1 = fx.Int32(rocdl.perm_b32(_raw(mag_o), _raw(mag_e), _raw(fx.Int32(0x07030602))))
-    v2i32 = fx.Vector.from_elements([_raw(d0), _raw(d1)], fx.Int32)
+    v2i32 = fx.Vector.from_elements([_raw(mag_e), _raw(mag_o)], fx.Int32)
     return v2i32.bitcast(fx.Float8E4M3FNUZ)  # v8 fp8
 
 
