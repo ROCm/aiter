@@ -44,7 +44,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
@@ -468,7 +467,8 @@ def build_hstu_attention_fwd_pp(
         lane_div_16 = lane // fx.Int32(MFMA_N)
 
         # Wave-uniform group predicate; `readfirstlane` lets the divergence
-        # analysis see that, so the duty branch is a scalar branch.
+        # analysis see that, so the duty branch is a scalar branch. Raw rocdl:
+        # FlyDSL 0.5.0 has no typed uniformity API.
         tid_u = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, tid))
         is_g0 = tid_u < fx.Int32(GRP_THREADS)
         grp_tid = tid - is_g0.select(fx.Int32(0), fx.Int32(GRP_THREADS))
@@ -772,15 +772,7 @@ def build_hstu_attention_fwd_pp(
             """Table index of sigmoid(alpha*s) for the raw score s: three
             full-rate VALU ops (index FMA, clamp, bit extract)."""
             t = sv * c_lut_scale + c_lut_big
-            t = fx.Float32(
-                llvm.call_intrinsic(
-                    fx.Float32.ir_type,
-                    "llvm.amdgcn.fmed3.f32",
-                    [t.ir_value(), c_lut_lo.ir_value(), c_lut_hi.ir_value()],
-                    [],
-                    [],
-                )
-            )
+            t = fx.clampf(t, c_lut_lo, c_lut_hi)  # v_med3_f32
             return (t.bitcast(fx.Int32) >> fx.Int32(2)) & fx.Int32(0x1FFFFF)
 
         def lut_load(idx):
@@ -822,23 +814,15 @@ def build_hstu_attention_fwd_pp(
 
             Truncation is a byte selection (the high half of each f32), so one
             `v_perm_b32` packs a pair; the shift/and/or spelling costs two VALU.
-            Raw intrinsic: gfx942 has no `v_cvt_pk_bf16_f32`.
+            Not a convert: gfx942 has no `v_cvt_pk_bf16_f32`.
             """
             # Bytes 7,6 of src0 (hi) and 3,2 of src1 (lo): the two high halves.
             sel = fx.Int32(0x07060302)
 
             def bf16_pair(lo_f32, hi_f32):
                 return fx.Int32(
-                    llvm.call_intrinsic(
-                        fx.Int32.ir_type,
-                        "llvm.amdgcn.perm",
-                        [
-                            hi_f32.bitcast(fx.Int32).ir_value(),
-                            lo_f32.bitcast(fx.Int32).ir_value(),
-                            sel.ir_value(),
-                        ],
-                        [],
-                        [],
+                    rocdl.perm_b32(
+                        hi_f32.bitcast(fx.Int32), lo_f32.bitcast(fx.Int32), sel
                     )
                 )
 
@@ -880,9 +864,10 @@ def build_hstu_attention_fwd_pp(
 
         # Wave-uniform q-block bounds for `gate_tile_split`'s per-sub-block
         # branches. Pinned through readfirstlane, since the divergence analysis
-        # treats wave_id as per-lane; used only in the predicates.
+        # treats wave_id as per-lane; used only in the predicates. Raw rocdl:
+        # no typed uniformity API in FlyDSL 0.5.0.
         def _sgpr32(x):
-            return fx.Int32(rocdl.readfirstlane(T.i32, x.ir_value()))
+            return fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, x.ir_value()))
 
         q_blk_lo = [_sgpr32(q_blk_base(qg)) for qg in range_constexpr(Q_SUBTILES)]
         q_blk_hi = [x + fx.Int32(MFMA_M - 1) for x in q_blk_lo]
@@ -941,34 +926,15 @@ def build_hstu_attention_fwd_pp(
                         vals.append(drop.select(c_bias_huge, c_zero_f))
                     mbias_mem[row, None].store(Vec.from_elements(vals, fx.Float32))
 
+            # The bounds are i32 bits; the unsigned forms reinterpret them.
             def _smax(a, b):
-                return fx.Int32(
-                    llvm.call_intrinsic(
-                        T.i32,
-                        "llvm.smax.i32",
-                        [a.ir_value(), fx.Int32(b).ir_value()],
-                        [],
-                        [],
-                    )
-                )
+                return fx.max(a, fx.Int32(b))
 
             def _umin(a, b):
-                return fx.Int32(
-                    llvm.call_intrinsic(
-                        T.i32,
-                        "llvm.umin.i32",
-                        [a.ir_value(), fx.Int32(b).ir_value()],
-                        [],
-                        [],
-                    )
-                )
+                return fx.Int32(fx.min(fx.Uint32(a), fx.Uint32(b)))
 
             def _umax(a, b):
-                return fx.Int32(
-                    llvm.call_intrinsic(
-                        T.i32, "llvm.umax.i32", [a.ir_value(), b.ir_value()], [], []
-                    )
-                )
+                return fx.Int32(fx.max(fx.Uint32(a), fx.Uint32(b)))
 
             def bias_row_pieces(kv_start_fn):
                 """The slot-row computation as small SALU pieces that phase M runs
@@ -1285,7 +1251,8 @@ def build_hstu_attention_fwd_pp(
                         if const_expr(j == len(_side_pieces) - 1):
                             rows = _side_st["rows"]
                             # Pin the result here; machine sinking would move
-                            # it into phase V next to its first use.
+                            # it into phase V next to its first use. Inline
+                            # asm: no value-pin API in FlyDSL 0.5.0.
                             llvm.inline_asm(
                                 res=None,
                                 operands_=[x.ir_value() for x in rows],
@@ -1552,6 +1519,7 @@ def build_hstu_attention_fwd_pp(
             """Phase M: both GEMMs, their LDS operand reads, and this group's
             staging. `u` is the sub-trip position the LDS slots are keyed on."""
             # Priority over the SIMD partner (in phase V) for the MFMA burst.
+            # Raw rocdl: FlyDSL 0.5.0 has no wave-priority API.
             rocdl.s_setprio(1)
             k_cur = u % K_SLOTS
             k_fill = (u + 1) % K_SLOTS
