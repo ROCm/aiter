@@ -2883,6 +2883,9 @@ def _flydsl_stage1_wrapper(
     model_dim_pad: int = 0,
     out_dtype: str | None = None,
     v2_output_layout: bool = False,
+    fused_shared_w1=None,
+    fused_shared_w1_scale=None,
+    shared_inter_bf16=None,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -2938,6 +2941,10 @@ def _flydsl_stage1_wrapper(
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
+        fused_shared_w1=fused_shared_w1,
+        fused_shared_w1_scale=fused_shared_w1_scale,
+        shared_inter_bf16=shared_inter_bf16,
+        shared_tile=moe_kernels.a16w4_shared_tile_from_params(parsed),
     )
 
 
@@ -2962,6 +2969,9 @@ def _flydsl_stage2_wrapper(
     topk_ids=None,
     skip_dropped_routes: bool = False,
     use_valid_token_count=False,
+    fused_shared_w2=None,
+    fused_shared_w2_scale=None,
+    shared_inter_bf16=None,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -3021,6 +3031,10 @@ def _flydsl_stage2_wrapper(
         topk_ids=topk_ids,
         skip_dropped_routes=skip_dropped_routes,
         use_valid_token_count=use_valid_token_count,
+        fused_shared_w2=fused_shared_w2,
+        fused_shared_w2_scale=fused_shared_w2_scale,
+        shared_inter_bf16=shared_inter_bf16,
+        shared_tile=moe_kernels.a16w4_shared_tile_from_params(parsed),
     )
 
 
