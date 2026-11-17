@@ -812,6 +812,8 @@ class UnifiedAttnKernelHandler(KernelHandler):
         )
         if sliding_window is not None:
             args += f" -sliding_window {sliding_window}"
+        if shape.get("output_gate", False):
+            args += " -output_gate"
         return args
 
     def parse_stdout(self, stdout: str) -> float:
@@ -837,6 +839,7 @@ class UnifiedAttnKernelHandler(KernelHandler):
             "dqk": shape["dqk"],
             "dv": shape["dv"],
             "sliding_window": shape.get("sliding_window", None),
+            "output_gate": shape.get("output_gate", False),
             self._metric: bench_result,
         }
 

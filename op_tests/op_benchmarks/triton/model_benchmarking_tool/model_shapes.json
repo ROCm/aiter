@@ -1467,7 +1467,8 @@
                 "hq": 16,
                 "hkv": 2,
                 "dqk": 256,
-                "dv": 256
+                "dv": 256,
+                "output_gate": true
             }
         ],
         "gated_delta_net_prefill": [

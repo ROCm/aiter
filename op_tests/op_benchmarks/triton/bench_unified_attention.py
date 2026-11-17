@@ -259,6 +259,8 @@ def _mode_label(args):
         parts.append("fp8out")
     if args.shuffled_kv_cache:
         parts.append("shuffled")
+    if args.output_gate:
+        parts.append("output_gate")
     return "_".join(parts) + "_fwd"
 
 
@@ -381,6 +383,16 @@ def run_benchmark(custom, args):
             nvfp4_ref=args.test,
             nvfp4_v=not args.k4v8,
         )
+        output_gate = (
+            torch.randn(
+                inputs["output"].shape[0],
+                HQ * D_HEAD_V,
+                dtype=inputs["output"].dtype,
+                device="cuda",
+            )
+            if args.output_gate
+            else None
+        )
 
         q_tensor = inputs["q_fp8"] if args.fp8 else inputs["query"]
         k_tensor = inputs["k_fp8"] if (args.fp8 or args.fp8_kv) else inputs["key_cache"]
@@ -437,6 +449,7 @@ def run_benchmark(custom, args):
                 shuffled_kv_cache=args.shuffled_kv_cache,
                 equal_seqlen_q=args.equal_seqlen_q,
                 backend=args.backend,
+                output_gate=output_gate,
             )
 
         if args.equal_seqlen_q:
@@ -483,6 +496,11 @@ def run_benchmark(custom, args):
                 output_scale=inputs["out_scale"],
                 out_dtype=inputs["output"].dtype,
             )
+            if output_gate is not None:
+                ref_output = (
+                    ref_output.reshape(output_gate.shape)
+                    * torch.sigmoid(output_gate)
+                ).reshape_as(ref_output)
             if any_fp8:
                 atol, rtol = 1.5e-1, 1.5e-1
             else:
@@ -549,7 +567,12 @@ def run_benchmark(custom, args):
             )
         )
         o_bytes = total_q * HQ * D_HEAD_V * inputs["output"].element_size()
-        mem = q_bytes + k_bytes + v_bytes + o_bytes
+        gate_bytes = (
+            output_gate.numel() * output_gate.element_size()
+            if output_gate is not None
+            else 0
+        )
+        mem = q_bytes + k_bytes + v_bytes + o_bytes + gate_bytes
 
         if args.metric == "time":
             return ms
@@ -672,6 +695,12 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Sliding window size (default: disabled)",
     )
+    parser.add_argument(
+        "-output_gate",
+        action="store_true",
+        default=False,
+        help="Apply the Qwen3.5 sigmoid output gate",
+    )
 
     parser.add_argument(
         "--shuffled_kv_cache",
@@ -695,6 +724,8 @@ def main(args: list[str] | None = None) -> None:
         raise ValueError(
             "-fp8_pv applies to an NVFP4 KV cache only (-nvfp4 / -nvfp4_kv)."
         )
+    if args.output_gate and args.fp8_output:
+        raise ValueError("-output_gate requires a BF16 output tensor.")
     if args.k4v8:
         if args.nvfp4 or args.nvfp4_kv or args.fp8_pv:
             raise ValueError(
