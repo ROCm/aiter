@@ -459,6 +459,28 @@ def async_load_to_lds(
             lds_ptr = lds_ptr + block_threads * async_load_vec_size
 
 
+def make_tile_views(t, tile_offset):
+    """``t`` from element ``tile_offset`` (Int64) on, as a global view and as a
+    buffer view. A workgroup addresses its tiles from these bases, so in-tile
+    offsets stay 32-bit however large the tensor is."""
+    tile = fx.Tensor(
+        fx.make_view(fx.add_offset(fx.get_iter(t), tile_offset), fx.get_layout(t))
+    )
+    return tile, fx.rocdl.make_buffer_tensor(tile, max_size=True)
+
+
+def operand_tile_shift(block_offset, rows, leading_stride, row_major, in_bytes):
+    """Rows (Int32) that a workgroup's A or B view skips, and the matching Int64
+    element offset. Only a row-major operand of 4 GiB or more moves to the
+    tile's first row: a view based at the tensor ran the same K loop up to 4%
+    faster on gfx950. A K-major operand stays at the tensor and must fit."""
+    if const_expr(not row_major):
+        return fx.Int32(0), fx.Int64(0)
+    span = fx.Int64(rows) * fx.Int64(leading_stride)
+    shift = (span >= fx.Int64((1 << 32) // in_bytes)).select(block_offset, fx.Int32(0))
+    return shift, fx.Int64(shift) * fx.Int64(leading_stride)
+
+
 @flyc.jit
 def write_cshuffle_vec_to_global(
     out,
@@ -612,8 +634,25 @@ def gemm_a16w16_gfx950_kernel(
     smem_b = storage.ab.b.peek().ptr
     smem_c = storage.c.peek().ptr
 
-    a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
-    b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
+    a_shift, a_tile_offset = operand_tile_shift(
+        block_m_offset,
+        m,
+        a_leading_stride,
+        not param.a_is_transposed,
+        param.in_data_bytes,
+    )
+    b_shift, b_tile_offset = operand_tile_shift(
+        block_n_offset,
+        n,
+        b_leading_stride,
+        param.b_is_transposed,
+        param.in_data_bytes,
+    )
+    _, a_buf = make_tile_views(a, a_tile_offset)
+    _, b_buf = make_tile_views(b, b_tile_offset)
+    out_tile, out_tile_buf = make_tile_views(
+        out, fx.Int64(block_m_offset) * fx.Int64(n)
+    )
     out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
     if const_expr(param.has_bias):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
@@ -710,8 +749,8 @@ def gemm_a16w16_gfx950_kernel(
                 src_base=fx.get_iter(a_buf),
                 lds_layout=a_lds_layout,
                 outer_tile_size=block_m,
-                outer_bound=m,
-                global_outer_offset=block_m_offset,
+                outer_bound=m - a_shift,
+                global_outer_offset=block_m_offset - a_shift,
                 leading_stride=a_leading_stride,
                 k_tile=k_tile,
             ),
@@ -731,8 +770,8 @@ def gemm_a16w16_gfx950_kernel(
                 non_temporal=param.b_non_temporal,
                 lds_layout=b_lds_layout,
                 outer_tile_size=block_n,
-                outer_bound=n,
-                global_outer_offset=block_n_offset,
+                outer_bound=n - b_shift,
+                global_outer_offset=block_n_offset - b_shift,
                 leading_stride=b_leading_stride,
                 k_tile=k_tile,
             ),
@@ -861,9 +900,9 @@ def gemm_a16w16_gfx950_kernel(
                                 ),
                             )
                         write_cshuffle_vec_to_global(
-                            out,
-                            out_buf,
-                            global_row * n + global_col,
+                            out_tile,
+                            out_tile_buf,
+                            local_row * n + global_col,
                             c_val,
                             is_split_k,
                             param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
@@ -893,11 +932,10 @@ def gemm_a16w16_gfx950_kernel(
                         ),
                     )
                     c_vec = c_vec + peer_c_vec
-                global_offset = global_row * n + global_col
                 write_cshuffle_vec_to_global(
-                    out,
-                    out_buf,
-                    global_offset,
+                    out_tile,
+                    out_tile_buf,
+                    local_row * n + global_col,
                     c_vec,
                     is_split_k,
                     param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
@@ -989,8 +1027,25 @@ def gemm_a16w16_hti_gfx950_kernel(
     smem_b = storage.ab.b.peek().ptr
     smem_c = storage.c.peek().ptr
 
-    a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
-    b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
+    a_shift, a_tile_offset = operand_tile_shift(
+        block_m_offset,
+        m,
+        a_leading_stride,
+        not param.a_is_transposed,
+        param.in_data_bytes,
+    )
+    b_shift, b_tile_offset = operand_tile_shift(
+        block_n_offset,
+        n,
+        b_leading_stride,
+        param.b_is_transposed,
+        param.in_data_bytes,
+    )
+    _, a_buf = make_tile_views(a, a_tile_offset)
+    _, b_buf = make_tile_views(b, b_tile_offset)
+    out_tile, out_tile_buf = make_tile_views(
+        out, fx.Int64(block_m_offset) * fx.Int64(n)
+    )
     out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
     if const_expr(param.has_bias):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
@@ -1054,8 +1109,8 @@ def gemm_a16w16_hti_gfx950_kernel(
                 src_base=fx.get_iter(a_buf),
                 lds_layout=a_lds_layout,
                 outer_tile_size=half_block_m,
-                outer_bound=m,
-                global_outer_offset=block_m_offset + m_part * half_block_m,
+                outer_bound=m - a_shift,
+                global_outer_offset=block_m_offset - a_shift + m_part * half_block_m,
                 leading_stride=a_leading_stride,
                 k_tile=k_tile,
             ),
@@ -1075,8 +1130,8 @@ def gemm_a16w16_hti_gfx950_kernel(
                 non_temporal=param.b_non_temporal,
                 lds_layout=b_lds_layout,
                 outer_tile_size=half_block_n,
-                outer_bound=n,
-                global_outer_offset=block_n_offset + n_part * half_block_n,
+                outer_bound=n - b_shift,
+                global_outer_offset=block_n_offset - b_shift + n_part * half_block_n,
                 leading_stride=b_leading_stride,
                 k_tile=k_tile,
             ),
@@ -1173,11 +1228,10 @@ def gemm_a16w16_hti_gfx950_kernel(
                             cshuffle_r2g_vec_size, global_output_dtype
                         ),
                     )
-                    global_offset = global_row * n + global_col
                     write_cshuffle_vec_to_global(
-                        out,
-                        out_buf,
-                        global_offset,
+                        out_tile,
+                        out_tile_buf,
+                        (m_part * half_block_m + local_row) * n + global_col,
                         c_vec,
                         is_split_k,
                         param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
@@ -1447,11 +1501,38 @@ def _gemm_a16w16_gfx950_param_for(items):
     return make_gemm_a16w16_gfx950_param(**dict(items))
 
 
+# A workgroup addresses A, B and C with 32-bit offsets from 64-bit bases
+# (make_tile_views), so what one base spans must stay below 4 GiB: block_m rows
+# of C and of a row-major A, block_n rows of a row-major B (both based at the
+# tile once the operand reaches 4 GiB), and all of a K-major operand (any layout
+# but "nt"), which stays based at the tensor.
+TILE_SPAN_LIMIT_BYTES = 1 << 32
+
+
+def _tile_span_bytes(m, n, k, param, a_stride=None, b_stride=None):
+    in_bytes = param.in_data_bytes
+    if param.a_is_transposed:
+        a_span = k * (a_stride or m)
+    else:
+        a_span = min(m, param.block_m) * (a_stride or k)
+    if param.b_is_transposed:
+        b_span = min(n, param.block_n) * (b_stride or k)
+    else:
+        b_span = k * (b_stride or n)
+    return {
+        "A": a_span * in_bytes,
+        "B": b_span * in_bytes,
+        "C": min(m, param.block_m) * n * param.out_data_bytes,
+    }
+
+
 def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):
     result = None
     try:
         result = _gemm_a16w16_gfx950_param_for(tuple(sorted(kwargs.items())))
     except Exception:  # noqa: BLE001 - invalid policies are filtered here
+        return None
+    if max(_tile_span_bytes(m, n, k, result).values()) >= TILE_SPAN_LIMIT_BYTES:
         return None
     split_k = kwargs.get("split_k", 1)
     try:
@@ -1687,6 +1768,30 @@ def gemm_a16w16(
         assert bias.shape[0] == n
         assert bias.dtype == a.dtype
 
+    try:
+        config = _gemm_a16w16_gfx950_param_for(tuple(sorted(kwargs.items())))
+    except Exception:  # noqa: BLE001 - the assert below reports invalid configs
+        config = None
+    oversized = config and {
+        name: size
+        for name, size in _tile_span_bytes(
+            m,
+            n,
+            k,
+            config,
+            a.stride(1) if a_is_transposed else a.stride(0),
+            b.stride(1) if b_is_transposed else b.stride(0),
+        ).items()
+        if size >= TILE_SPAN_LIMIT_BYTES
+    }
+    if oversized:
+        raise ValueError(
+            "gemm_a16w16_gfx950 addresses each tile with 32-bit offsets, so the "
+            "block_m (block_n) rows of a row-major operand or C, and all of a "
+            "K-major operand, must span less than 4 GiB; got "
+            + ", ".join(f"{name}={size} bytes" for name, size in oversized.items())
+            + f" for M={m}, N={n}, K={k}, layout={layout!r}"
+        )
     param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
     semaphore, signal = get_split_k_buffers(stream, device, split_k)

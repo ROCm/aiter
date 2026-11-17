@@ -80,6 +80,67 @@ def test_gemm(m, n, k, dtype=dtypes.bf16):
     }
 
 
+def check_large_a():
+    """gfx950's FlyDSL kernel past 4 GiB of A (and of C) stays exact.
+
+    Each workgroup reads A from its own first row through a 64-bit base;
+    unfixed, 91% of the output was wrong at a 4 GiB A. Inputs in {-1, 0, 1}
+    with unit scales make every fp32 sum exact, so the bf16 output must equal
+    the rounded reference bit for bit; M leaves a partial last tile. The split-K fp32 workspace is still read
+    whole and must stay below 4 GiB.
+    """
+    from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
+        run_gemm_a8w8_mxfp8_gfx950,
+    )
+
+    limit, n, k = 1 << 32, 128, 512
+    free, _ = torch.cuda.mem_get_info()
+    if free < 3 * limit:
+        aiter.logger.info(
+            "skipping the past-4 GiB A check: %.1f GiB free", free / 2**30
+        )
+        return
+    m = limit // k + 100
+    step = 1 << 20
+
+    def ints(rows):
+        return torch.randint(-1, 2, (rows, k), dtype=torch.int8).to(dtypes.bf16)
+
+    torch.manual_seed(0)
+    xq = torch.empty((m, k), dtype=dtypes.fp8)
+    for i in range(0, m, step):
+        xq[i : i + step] = ints(min(step, m - i)).to(dtypes.fp8)
+    w = ints(n).to(dtypes.fp8)
+    x_scale = torch.full((m, k // 32), 127, dtype=torch.uint8).view(dtypes.fp8_e8m0)
+    w_scale = torch.full((n, k // 32), 127, dtype=torch.uint8).view(dtypes.fp8_e8m0)
+    wsh = shuffle_weight(w, layout=(16, 16))
+    for name in (None, "flydsl_mxpsh_16x32x256_F8_F8_B16_w2_x0_sk1_pf_nt"):
+        out = torch.empty((m, n), dtype=dtypes.bf16)
+        run_gemm_a8w8_mxfp8_gfx950(xq, wsh, x_scale, w_scale, out, kernel_name=name)
+        for i in range(0, m, step):
+            ref = (xq[i : i + step].float() @ w.float().t()).to(dtypes.bf16)
+            assert torch.equal(out[i : i + step], ref), f"{name}: rows {i}+ differ"
+        del out
+    del xq, x_scale
+    torch.cuda.empty_cache()
+
+    m, n, k = 262244, 2048, 512
+    try:
+        run_gemm_a8w8_mxfp8_gfx950(
+            torch.zeros((m, k), dtype=dtypes.fp8),
+            shuffle_weight(torch.zeros((n, k), dtype=dtypes.fp8), layout=(16, 16)),
+            torch.full((m, k // 32), 127, dtype=torch.uint8).view(dtypes.fp8_e8m0),
+            torch.full((n, k // 32), 127, dtype=torch.uint8).view(dtypes.fp8_e8m0),
+            torch.empty((m, n), dtype=dtypes.bf16),
+            kernel_name="flydsl_mxpsh_128x256x128_F8_F8_B16_w0_x4_sk2",
+        )
+    except ValueError as e:
+        assert "workspace" in str(e), e
+    else:
+        raise AssertionError("a 4 GiB split-K workspace was launched")
+    aiter.logger.info("check_large_a: A and C past 4 GiB exact; workspace limit kept")
+
+
 def tuned_shapes():
     table = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE)
     table = table[(table["gfx"] == get_gfx()) & (table["cu_num"] == get_cu_num())]
@@ -109,3 +170,5 @@ if __name__ == "__main__":
     else:
         df = pd.DataFrame([test_gemm(*mnk) for mnk in args.mnk or tuned_shapes()])
         aiter.logger.info(f"gemm_a8w8_mxfp8_bpreshuffle summary:\n{df.to_markdown()}")
+        if get_gfx() == "gfx950":
+            check_large_a()
