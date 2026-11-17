@@ -173,11 +173,8 @@ def _gemm_a16_w16_kernel(
             b_ptrs += BLOCK_SIZE_K * stride_bk
 
         if use_activation and NUM_KSPLIT == 1:
-            # The cast to the 16-bit output type keeps the accumulator in packed
-            # registers and removes the spills of the wide gfx1151 tiles.
-            # The bound takes only a finite value below the lowest value of
-            # that type, so a real -inf keeps the NaN that an fp32 epilogue
-            # makes from it.
+            # Cast to the 16-bit output type to reduce the gfx1151 epilogue spills.
+            # Bound only finite values below the type minimum; -inf still gives NaN.
             if ROUND_BEFORE_ACT and (
                 c_ptr.type.element_ty == tl.float16
                 or c_ptr.type.element_ty == tl.bfloat16
