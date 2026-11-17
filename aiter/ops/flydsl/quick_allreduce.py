@@ -425,6 +425,7 @@ class FlyQuickAllReduce:
                         super_tile=st,
                         cu_count=cu_count,
                         block=b,
+                        handshake=handshake,
                     )
                     if algo.lds_bytes is not None:
                         # The VGPR table assumes INT4's rank-tile; a wider
@@ -800,8 +801,13 @@ class FlyQuickAllReduceRMSNorm:
         hiddens: tuple[int, ...] = (),
         link: str | None = None,
         low_latency: bool | None = None,
+        handshake: str | None = None,
     ):
         check_world_size(world_size)
+        if handshake is not None and handshake not in HANDSHAKES:
+            raise ValueError(
+                f"handshake must be one of {HANDSHAKES}, got {handshake!r}"
+            )
         link = resolve_link(link)
         if algorithm not in ALGORITHMS:
             raise ValueError(
@@ -888,6 +894,9 @@ class FlyQuickAllReduceRMSNorm:
             self._pins["low_latency"] = bool(low_latency)
             if low_latency:
                 self._pins["super_tile"] = 1
+        # ``handshake`` replaces the ladder's on every rung; None keeps it.
+        if handshake is not None:
+            self._pins["handshake"] = handshake
         # hidden -> (that width's ladder, its grid cap per (super-tile, low_latency)).
         self._ladders: dict[int, tuple[tuple, dict[tuple[int, bool], int]]] = {}
 
@@ -1081,6 +1090,12 @@ class FlyQuickAllReduceRMSNorm:
                     hidden=hidden,
                 )
             )
+            named = {r.handshake for r in rungs}
+            if len(named) != 1:
+                raise ValueError(
+                    f"every rung of the hidden={hidden} ladder must name one "
+                    f"handshake, got {named}"
+                )
             by_cap = {}
             for r in rungs:
                 by_cap.setdefault((r.super_tile, r.low_latency), r.grid_cap)
@@ -1103,7 +1118,7 @@ class FlyQuickAllReduceRMSNorm:
                 hidden, self.world_size, self.block, wide_rows=self._wide_rows(hidden)
             )
         block, _atoms_per_row, h_pad = self._geom_for(hidden)
-        _rungs, by_cap = self._ladder(hidden)
+        rungs, by_cap = self._ladder(hidden)
         for (st, low_latency), rung_cap in by_cap.items():
             key = (hidden, st, bool(mxfp4), low_latency)
             if key in self._by_cfg:
@@ -1122,6 +1137,7 @@ class FlyQuickAllReduceRMSNorm:
                 block=block,
                 h_pad=h_pad,
                 mxfp4=bool(mxfp4),
+                handshake=rungs[0].handshake,
                 **({"low_latency": True} if low_latency else {}),
             )
             if spec["lds_bytes"] * (2 if low_latency else 1) > self._lds_capacity:

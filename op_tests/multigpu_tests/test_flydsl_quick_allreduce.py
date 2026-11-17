@@ -553,6 +553,7 @@ def _rung_grids(world_size: int, ladder: tuple) -> dict[tuple, int]:
                 super_tile=rung.super_tile,
                 cu_count=cu_count,
                 block=rung.block,
+                handshake=rung.handshake,
             ),
         )
     return grids

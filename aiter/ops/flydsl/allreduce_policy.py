@@ -305,13 +305,16 @@ class FusedTwoShotRung:
     ``low_latency`` picks the mesh's low-latency build: the residual is loaded
     ahead of the exchanges, and two workgroups per CU stay resident instead of
     one, so ``grid_cap`` may go up to twice the CU count. It needs
-    ``super_tile=1`` and a width whose block is ``BLOCK``.
+    ``super_tile=1`` and a width whose block is ``BLOCK``. ``handshake`` is as
+    on ``TwoShotRung``: one of ``HANDSHAKES``, the same on every rung of a
+    width's ladder.
     """
 
     min_bytes: int
     super_tile: int
     grid_cap: int
     low_latency: bool = False
+    handshake: str = "flag"
 
 
 def select_rung(ladder, nbytes: int):
@@ -1217,6 +1220,11 @@ def _two_shot_check(super_tiles, *, low_latency: bool):
             raise ValueError(
                 f"{where}.low_latency: only a mesh rung with super_tile=1 can be a "
                 "low-latency build"
+            )
+        if rung.handshake not in HANDSHAKES:
+            raise ValueError(
+                f"{where}.handshake: must be one of {HANDSHAKES}, got "
+                f"{rung.handshake!r}"
             )
 
     return check
