@@ -47,7 +47,9 @@ def try_kda_gating(
     tables are int32. The kernel needs q/k L2 normalization and
     ``inplace_final_state``. A 1D slot table has one slot for each sequence,
     so each sequence has 0 or 1 tokens. Spec verify needs a 2D slot table and
-    int32 ``num_accepted_tokens``.
+    int32 ``num_accepted_tokens``. The slot tables have a row for each
+    sequence, a 2D table at least one column, and ``num_accepted_tokens`` an
+    entry for each sequence. Every tensor is on ``q``'s CUDA device.
 
     Returns:
         The output tensor, or None, without a launch, when the kernel does not
@@ -119,6 +121,29 @@ def try_kda_gating(
         and num_accepted_tokens.is_contiguous()
     ):
         return None
+    n_seq = cu_seqlens.numel() - 1
+    if not (
+        write.shape[0] >= n_seq
+        and (not multi_token or write.shape[1] > 0)
+        and (not spec or num_accepted_tokens.numel() >= n_seq)
+    ):
+        return None
+    tensors = (
+        A_log,
+        a,
+        b,
+        dt_bias,
+        k,
+        v,
+        o,
+        state,
+        cu_seqlens,
+        write,
+        read,
+        num_accepted_tokens,
+    )
+    if not (q.is_cuda and all(x is None or x.device == q.device for x in tensors)):
+        return None
     if o is None:
         o = torch.empty_like(v)
         stride_o_tok = o.stride(1)
@@ -130,7 +155,6 @@ def try_kda_gating(
         stride_o_tok = o.stride(0)
     else:
         return None
-    n_seq = cu_seqlens.numel() - 1
     if n_seq <= 0:
         return o
     if scale is None:

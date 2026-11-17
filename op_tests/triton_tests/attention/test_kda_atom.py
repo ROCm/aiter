@@ -70,6 +70,8 @@ def _gating_case(mode, lens, seed, heads=H, value_heads=None, dtype=torch.bfloat
             accepted = torch.randint(
                 1, width + 1, (sequences,), dtype=torch.int32, device="cuda"
             )
+            # An empty sequence may have no accepted token.
+            accepted[cu[1:] == cu[:-1]] = 0
     else:
         indices = perm[:sequences].contiguous()
         if mode == "decode":
@@ -426,6 +428,25 @@ def _unsupported(case, inputs, indices):
         },
         "read_table_shape": {"ssm_state_indices_in": indices[:0]},
         "accepted_with_1d_slots": {"num_accepted_tokens": torch.ones_like(indices)},
+        "short_slot_table": {
+            "ssm_state_indices": indices[:3],
+            "ssm_state_indices_in": None,
+        },
+        "zero_width_slot_table": {
+            "ssm_state_indices": indices.new_empty((4, 0)),
+            "ssm_state_indices_in": None,
+        },
+        "short_accepted": {
+            "ssm_state_indices": indices.view(4, 1),
+            "ssm_state_indices_in": None,
+            "num_accepted_tokens": torch.ones(3, dtype=torch.int32, device="cuda"),
+        },
+        "cpu_slot_table": {
+            "ssm_state_indices": torch.tensor(
+                [1, 0, 4, 2], dtype=torch.int32, device="cpu"
+            ),
+            "ssm_state_indices_in": None,
+        },
     }[case]
 
 
@@ -440,6 +461,10 @@ def _unsupported(case, inputs, indices):
         "int64_slots",
         "read_table_shape",
         "accepted_with_1d_slots",
+        "short_slot_table",
+        "zero_width_slot_table",
+        "short_accepted",
+        "cpu_slot_table",
     ],
 )
 def test_unsupported_inputs_return_none_without_writes(case):

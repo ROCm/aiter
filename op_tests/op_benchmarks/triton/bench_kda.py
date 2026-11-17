@@ -155,7 +155,7 @@ def traffic_bytes(
     return B * slab + writes + B * T * per_tok
 
 
-def make_atom_case(B, T, H, provider):
+def make_atom_case(B, T, H, provider, device):
     """Arguments of ATOM's gating entry in Kimi-K3's layouts.
 
     beta is a view of the fused in_proj row ``[q | k | v | g | beta | f_a]``.
@@ -166,13 +166,14 @@ def make_atom_case(B, T, H, provider):
     """
     D = K3_HEAD_DIM
     tokens = B * T
-    act = {"dtype": torch.bfloat16, "device": "cuda"}
+    act = {"dtype": torch.bfloat16, "device": device}
+    fp32 = {"dtype": torch.float32, "device": device}
     q, k, v, a = (torch.randn((1, tokens, H, D), **act) for _ in range(4))
     in_proj = torch.randn((tokens, 4 * H * D + H + D), **act)
     # Only the slots that the call reads or writes, so that a rotating pool
     # spans the memory that it measures.
     slots = {"atom_fork": 2 * B, "atom_spec": tokens}.get(provider, B)
-    perm = torch.randperm(slots, device="cuda").to(torch.int32)
+    perm = torch.randperm(slots, device=device).to(torch.int32)
     write = perm[:B]
     read = None
     accepted = None
@@ -184,18 +185,18 @@ def make_atom_case(B, T, H, provider):
         read = perm[B : 2 * B]
     else:
         write = perm[:tokens].view(B, T)
-        accepted = torch.randint(1, T + 1, (B,), dtype=torch.int32, device="cuda")
+        accepted = torch.randint(1, T + 1, (B,), dtype=torch.int32, device=device)
     return {
-        "A_log": torch.randn(H, device="cuda") * 0.5,
+        "A_log": torch.randn(H, **fp32) * 0.5,
         "a": a,
         "b": in_proj[:, 4 * H * D : 4 * H * D + H].unsqueeze(0),
-        "dt_bias": torch.randn(H * D, device="cuda") * 2.0,
+        "dt_bias": torch.randn(H * D, **fp32) * 2.0,
         "q": q,
         "k": k,
         "v": v,
         "o": torch.empty((tokens, H, D), **act),
-        "initial_state": torch.randn((slots, H, D, D), device="cuda"),
-        "cu_seqlens": torch.arange(0, tokens + 1, T, dtype=torch.int32, device="cuda"),
+        "initial_state": torch.randn((slots, H, D, D), **fp32),
+        "cu_seqlens": torch.arange(0, tokens + 1, T, dtype=torch.int32, device=device),
         "ssm_state_indices": write,
         "ssm_state_indices_in": read,
         "num_accepted_tokens": accepted,
@@ -338,7 +339,7 @@ def benchmark(args):
                 return float("nan"), float("nan"), float("nan")
 
             def make():
-                return make_atom_case(B, T, H, provider)
+                return make_atom_case(B, T, H, provider, args.device)
 
             return _record_case(H, B, T, provider, make, run_atom_case, atom_bytes)
 
@@ -636,7 +637,9 @@ def run_bench(args):
         print("fla not importable -- dropping the upstream backend.")
         print("  PYTHONPATH=/path/to/flash-linear-attention to enable it")
     torch.manual_seed(0)
-    benchmark(args)
+    # Launches, streams, events and graphs use the current device.
+    with torch.cuda.device(args.device):
+        benchmark(args)
 
 
 def main():

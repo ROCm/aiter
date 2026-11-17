@@ -478,7 +478,8 @@ def kda_gating_kernel(
     idx_row = seq.to(gl.int64) * stride_idx_seq
     if IS_SPEC:
         col = gl.load(accepted_ptr + seq) - 1
-        slot_in = gl.load(read_ptr + idx_row + col)
+        # An empty sequence may have no accepted token, which is column -1.
+        slot_in = gl.load(read_ptr + idx_row + col, mask=eos > bos, other=-1)
     else:
         slot_in = gl.load(read_ptr + idx_row)
         # Load the write slot with the read slot: the in-place test needs both.
