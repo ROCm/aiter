@@ -668,6 +668,7 @@ def _kda_bi_state_kernel(
     GLAST,
     CHUNKS,
     SEQ_CHUNKS,
+    SEQ_ORDER,
     H0,
     HT,
     HB,
@@ -683,18 +684,26 @@ def _kda_bi_state_kernel(
     STORE_HT: gl.constexpr,
     STORE_HB: gl.constexpr,
     FUSE_OUT: gl.constexpr,
+    ORDERED: gl.constexpr,
     BV: gl.constexpr,
     num_warps: gl.constexpr,
 ):
-    """Program (sequence s, head h, V block): walks the sequence's chunks in order, loading
+    """Program (sequence, head h, V block): walks the sequence's chunks in order, loading
     chunk c + 1 while chunk c computes. Per chunk: bf16(h) to HS, v_new, the FP32 state step.
     HT gets the final state, HB the state after the last complete chunk. With FUSE_OUT the
     output of each chunk is computed here too (_out_vn), instead of HS + the out kernel.
     """
     MF: gl.constexpr = mfma_layout(num_warps)
-    s = gl.program_id(0)
-    h = gl.program_id(1)
-    v0 = gl.program_id(2) * BV
+    NV: gl.constexpr = D // BV
+    # flat grid, heads fastest: the programs of SEQ_ORDER[0] first, then SEQ_ORDER[1], ...
+    # (longest sequences first, so the longest serial chains start first)
+    pid = gl.program_id(0)
+    h = pid % H
+    v0 = ((pid // H) % NV) * BV
+    if ORDERED:
+        s = gl.load(SEQ_ORDER + pid // (NV * H))
+    else:
+        s = pid // (NV * H)
     st = (s.to(gl.int64) * H + h) * D * D + v0
     if HAS_H0:
         hs = gl.load(_state_ptrs(H0 + st, D, BV, num_warps))
@@ -873,3 +882,35 @@ def _kda_bi_chunk_table_kernel(
     end = gl.minimum(start + BT, gl.load(CU + lo + 1, mask=m, other=0))
     gl.store(CHUNKS + 2 * c, start.to(gl.int32), mask=m)
     gl.store(CHUNKS + 2 * c + 1, end.to(gl.int32), mask=m)
+
+
+_seq_order_repr = make_kernel_repr("_kda_bi_seq_order_kernel", ["BLOCK"])
+
+
+@gluon.jit(repr=_seq_order_repr)
+def _kda_bi_seq_order_kernel(
+    SEQ_CHUNKS, SEQ_ORDER, n_seq, BLOCK: gl.constexpr, num_warps: gl.constexpr
+):
+    """SEQ_ORDER = sequences by chunk count, most first, ties by index: the rank of s is
+    the number of sequences before it in that order."""
+    L2: gl.constexpr = gl.BlockedLayout([1, 4], [8, 8], [num_warps, 1], [1, 0])
+    s = gl.program_id(0) * BLOCK + gl.arange(0, BLOCK, layout=gl.SliceLayout(1, L2))
+    ms = s < n_seq
+    ns = gl.load(SEQ_CHUNKS + s + 1, mask=ms, other=0) - gl.load(
+        SEQ_CHUNKS + s, mask=ms, other=0
+    )
+    rank = gl.zeros([BLOCK], gl.int32, gl.SliceLayout(1, L2))
+    for t0 in range(0, n_seq, BLOCK):
+        t = t0 + gl.arange(0, BLOCK, layout=gl.SliceLayout(0, L2))
+        mt = t < n_seq
+        nt = gl.load(SEQ_CHUNKS + t + 1, mask=mt, other=0) - gl.load(
+            SEQ_CHUNKS + t, mask=mt, other=0
+        )
+        ns2 = gl.expand_dims(ns, 1)
+        nt2 = gl.expand_dims(nt, 0)
+        before = (nt2 > ns2) | (
+            (nt2 == ns2) & (gl.expand_dims(t, 0) < gl.expand_dims(s, 1))
+        )
+        before = before & gl.expand_dims(mt, 0)
+        rank += gl.sum(before.to(gl.int32), axis=1)
+    gl.store(SEQ_ORDER + rank, s, mask=ms)

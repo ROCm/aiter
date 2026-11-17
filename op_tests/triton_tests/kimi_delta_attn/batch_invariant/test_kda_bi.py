@@ -193,6 +193,21 @@ def test_fused_output_same_bits(fuse, monkeypatch):
         assert torch.equal(a, b)
 
 
+def test_many_sequences_with_equal_lengths():
+    # the state pass runs sequences longest first; ties and empty sequences included
+    lens = [64, 1, 0, 128, 64, 65, 1, 128, 0, 63, 64, 200, 1, 65] * 3
+    x = make_inputs(sum(lens), 16)
+    o, ht = _run(x, lens, final=True)
+    offs = _cu(lens).tolist()
+    for i, n in enumerate(lens):
+        if n == 0:
+            assert torch.equal(ht[i], torch.zeros_like(ht[i]))
+            continue
+        oi, hi = _run(_cut(x, offs[i], offs[i] + n), [n], final=True)
+        assert torch.equal(o[:, offs[i] : offs[i] + n], oi)
+        assert torch.equal(ht[i], hi[0])
+
+
 def test_boundary_state():
     # the state after each sequence's last complete chunk; the initial state if there is none
     lens = [200, 64, 30, 0, 128]

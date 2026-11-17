@@ -17,6 +17,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn.batch_invariant.kda_
     _kda_bi_intra_kernel,
     _kda_bi_out_kernel,
     _kda_bi_seq_chunks_kernel,
+    _kda_bi_seq_order_kernel,
     _kda_bi_state_kernel,
 )
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
@@ -184,13 +185,22 @@ def kda_bi_fwd(
         )
         dummy = glast
         cs = {**cs, "BV": _state_bv(N * H)}
-        _kda_bi_state_kernel[(N, H, HEAD_DIM // cs["BV"])](
+        # longest sequences first (device-side, no sync)
+        seq_order = seq_chunks
+        if N > 1:
+            seq_order = torch.empty(N, dtype=torch.int32, device=dev)
+            c_ord = _config("seq_order")
+            _kda_bi_seq_order_kernel[(triton.cdiv(N, c_ord["BLOCK"]),)](
+                seq_chunks, seq_order, N, **c_ord
+            )
+        _kda_bi_state_kernel[(N * H * (HEAD_DIM // cs["BV"]),)](
             w,
             u,
             kg,
             glast,
             chunks,
             seq_chunks,
+            seq_order,
             dummy if h0 is None else h0,
             dummy if final is None else final,
             dummy if bound is None else bound,
@@ -206,6 +216,7 @@ def kda_bi_fwd(
             STORE_HT=final is not None,
             STORE_HB=bound is not None,
             FUSE_OUT=fuse,
+            ORDERED=N > 1,
             **cs,
             enable_fp_fusion=False,
         )
