@@ -19,9 +19,9 @@ MFMA / epilogue idioms, XCD-dealt work order) follows Teemu Virolainen's MoE dow
 Served variants (the launcher picks one by M = moe_out.shape[0]):
   v2n   v2 with nontemporal output stores: unweighted bf16 rows into flat [max_sorted, H], then
         aiter.mxfp4_moe_scatter_reduce;
-  v2ao  v2 with a bf16 atomic epilogue into moe_out (zeroed by AITER's sort for an atomic kernelName2), walking
-        AITER's gemm2 tile order so a token's adds land in about AITER's order;
   v4g8  dense groups of up to 8 blocks of 128 rows in LPT order, the W2 slice reused over the group.
+Not built (SERVED below): v2ao, v2 with a bf16 atomic epilogue into moe_out, walking AITER's gemm2 tile order. It
+measured no faster than AITER's own atomic gemm2 at the shapes it could serve (M 1024 to 2285), so no launcher picks it.
 
 Usage (CPU only; clang and ld.lld from ROCm's LLVM: --llvm-bin, else the _rocm_sdk_devel wheel, $ROCM_PATH/llvm/bin
 or /opt/rocm/llvm/bin):
@@ -1209,15 +1209,10 @@ SOURCES = {
     "v2ao": lambda BM=128: v2_source(BM, tag="v2ao", atomic=True, order="spart"),
     "v4g8": lambda BM=128: v2_source(BM, tag="v4g8", G=8, dense=True),
 }
-# The (variant, block_m) pairs the launcher can pick: v2ao at block_m 64 and 128
-# (where its atomic epilogue was checked), v4g8 at block_m >= 64.
+# The (variant, block_m) pairs the launcher can pick: v2n and v4g8 at block_m 128,
+# the only block_m of AITER's FlyDSL scatter epilogue.
 SERVED = (
-    ("v2ao", 64),
-    ("v2ao", 128),
-    ("v2n", 32),
-    ("v2n", 64),
     ("v2n", 128),
-    ("v4g8", 64),
     ("v4g8", 128),
 )
 CSV_NAME = "moe_stage2_mxfp4_t1.csv"

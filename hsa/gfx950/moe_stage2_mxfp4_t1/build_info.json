@@ -6,29 +6,9 @@
     "ld.lld -shared <name>.o -o <name>.co"
   ],
   "kernels": {
-    "t1g2_v2ao_bm64": {
-      "source_sha1": "70bb2ad77cc139b4a26680376d7e3b325c03337d",
-      "co_sha256": "5732720b647feab0e1540631ae76e4d4993b7b6fcc9d095d46c809d9b782c0af"
-    },
-    "t1g2_v2ao_bm128": {
-      "source_sha1": "98d491c3e0f5bfdfb87b7e096a9d5c2531f2204a",
-      "co_sha256": "1829693d133b4a798f414a5760f2e1a72b953dc54b83af4e71c40db33e55d575"
-    },
-    "t1g2_v2n_bm32": {
-      "source_sha1": "e209befe2f2ce6420882554e21464c51701bccaa",
-      "co_sha256": "11605e1d1e1c20cd14947d99901af46d4fc2d565620f13215023a45cb36cf7ea"
-    },
-    "t1g2_v2n_bm64": {
-      "source_sha1": "04af178470ec40689598f5a63fc13b10e4323c7c",
-      "co_sha256": "30a1f2d4a069310437668f4c1684f04a4ae5d2474dc0c64be29ce874880757dc"
-    },
     "t1g2_v2n_bm128": {
       "source_sha1": "03c4fcc03c6e969c6022cbaf49b4941daeffd52c",
       "co_sha256": "6c7a6b67a23c631edefa8b02e0817088f658f320850ae985aa6667e09d09db01"
-    },
-    "t1g2_v4g8_bm64": {
-      "source_sha1": "22f73558571ab7f566dad2a3d695c0c2ba757352",
-      "co_sha256": "5cb9807f3b1b3427aee43529ae5ca601cade01159915d4b170c15a19f55d51c1"
     },
     "t1g2_v4g8_bm128": {
       "source_sha1": "34005548c54f8074a1352a530326a198f8ec800a",
