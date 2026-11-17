@@ -974,6 +974,21 @@ def _reject_nvfp4_kv_on_triton(params: _UAParams):
         )
 
 
+def _gfx942_one_q_block(params: _UAParams, block_q: int) -> bool:
+    """One program per sequence when the query fits in one Triton block.
+
+    gfx942 only. The padded grid is ``num_tokens // BLOCK_Q + num_seqs``, and
+    the prologue index ``start // BLOCK_Q + seq`` assumes those empty slots.
+    q=1 is already one block through ``ALL_DECODE``. The constexpr stays off
+    on every other arch, including the gfx950 gluon kernel.
+    """
+    return (
+        DEVICE_ARCH == "gfx942"
+        and not params.all_decode
+        and int(params.max_seqlen_q) <= int(block_q)
+    )
+
+
 def _unified_attention_2d_triton(params: _UAParams):
     _reject_nvfp4_kv_on_triton(params)
     if params.shuffled_kv_cache and (
@@ -991,7 +1006,8 @@ def _unified_attention_2d_triton(params: _UAParams):
     assert config["BLOCK_Q"] >= 1
     if params.shuffled_kv_cache:
         config["TILE_SIZE"] = params.block_size
-    if params.all_decode:
+    one_q_block = _gfx942_one_q_block(params, config["BLOCK_Q"])
+    if params.all_decode or one_q_block:
         total_num_q_blocks = params.num_seqs
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
@@ -1046,6 +1062,7 @@ def _unified_attention_2d_triton(params: _UAParams):
         query_start_len_ptr=params.cu_seqlens_q,
         num_seqs=params.num_seqs,
         ALL_DECODE=params.all_decode,
+        ONE_Q_BLOCK=one_q_block,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
         **config,
@@ -1069,7 +1086,8 @@ def _unified_attention_3d_triton(
     config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
     assert config["BLOCK_Q"] >= 1
 
-    if params.all_decode:
+    one_q_block = _gfx942_one_q_block(params, config["BLOCK_Q"])
+    if params.all_decode or one_q_block:
         total_num_q_blocks = params.num_seqs
     else:
         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
@@ -1125,6 +1143,7 @@ def _unified_attention_3d_triton(
         query_start_len_ptr=params.cu_seqlens_q,
         num_seqs=params.num_seqs,
         ALL_DECODE=params.all_decode,
+        ONE_Q_BLOCK=one_q_block,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
         IS_Q_FP8=(params.q_dtype == e4m3_dtype),
