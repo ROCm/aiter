@@ -432,6 +432,7 @@ def _as_custom_op(
     native: Callable[..., Any],
     routed: Callable[..., Any],
     fake: Callable[..., Any] | None,
+    mutates_args: list[str] | str = "unknown",
 ) -> Callable[..., Any] | None:
     """Register ``routed`` as a torch custom op, or return None to stay as is.
 
@@ -448,6 +449,16 @@ def _as_custom_op(
     and quiet. "unknown" says every argument may be written, which is never
     wrong about any op, only conservative about all of them: it costs
     optimisation, not correctness.
+
+    There is one measured exception to "only costs optimisation": inductor
+    wraps an op with any mutable argument in an ``auto_functionalized_v2``
+    node, and torch 2.10's post-grad decompose can fail to remove it,
+    asserting the graph still holds the wrapper. An op whose semantics are
+    provably pure may pass an explicit ``mutates_args`` list (identical to
+    ``torch_compile_guard``'s knob) so the schema is functional and that
+    wrapping never happens. The declaration must be true for the op as
+    written, not for what the caller intended -- an under-declared list is
+    the undefined behaviour above.
 
     Honesty about what was measured: an op that writes through an argument
     gives the same answer under inductor whether it declares "unknown" or
@@ -476,7 +487,7 @@ def _as_custom_op(
         return None
 
     try:
-        schema = infer_schema(native, mutates_args="unknown")
+        schema = infer_schema(native, mutates_args=mutates_args)
     except Exception as error:  # noqa: BLE001 -- degrade on anything
         logger.debug("plugin: %s stays traced, no schema: %s", op, error)
         return None
@@ -506,6 +517,7 @@ def route(
     version: int = 1,
     supersedes: Mapping[int, str] = MappingProxyType({}),
     fake: Callable[..., Any] | None = None,
+    mutates_args: list[str] | str = "unknown",
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
     """Route an AITER op through a compatible provider before its native path.
 
@@ -518,6 +530,13 @@ def route(
     AITER can say that a provider written against the older version is still
     acceptable for calls on this one; declaring it here makes that assertion
     explicit and dated rather than implied.
+
+    ``mutates_args`` overrides the conservative default only for ops whose
+    mutation semantics are actually known. See ``_as_custom_op``: the default
+    "unknown" costs nothing worse than an ``auto_functionalized_v2`` wrap that
+    inductor may fail to decompose, while a declared list that lies is
+    undefined behaviour -- so pass ``[]`` only when the op genuinely writes
+    through no argument.
     """
 
     operation = Op(op, version)
@@ -540,7 +559,7 @@ def route(
             return _dispatch(operation, canonicalize, native, args, kwargs)
 
         routed.__aiter_plugin_op__ = operation
-        opaque = _as_custom_op(op, native, routed, fake)
+        opaque = _as_custom_op(op, native, routed, fake, mutates_args)
         return opaque if opaque is not None else routed
 
     return decorate
