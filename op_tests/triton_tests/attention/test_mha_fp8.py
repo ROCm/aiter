@@ -148,6 +148,34 @@ def test_mha_fp8_strided_qkv(SEQLEN: int, HEAD_SZ: int, CAUSAL: bool):
     torch.testing.assert_close(strided_out, contiguous_out, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("PACKED", [True, False])
+@pytest.mark.parametrize("HEAD_SZ_V", [128, 64])
+def test_fp8_to_fp16_kv(PACKED: bool, HEAD_SZ_V: int):
+    # The conversion of the software-emulated fp8 path must be exact, also on
+    # the strided halves of a packed kv tensor and with a seqlen that is not a
+    # multiple of the block.
+    BATCH, SEQLEN, NUM_K_HEADS, HEAD_SZ = 2, 300, 3, 128
+    torch.manual_seed(20)
+    if PACKED and HEAD_SZ_V == HEAD_SZ:
+        kv = (
+            torch.randn((BATCH, SEQLEN, 2, NUM_K_HEADS, HEAD_SZ), device="cuda") * 64
+        ).to(get_fp8_e4m3_dtype())
+        k, v = kv[:, :, 0], kv[:, :, 1]
+    elif PACKED:
+        pytest.skip("a packed kv tensor has one head size")
+    else:
+        k, v = (
+            (torch.randn((BATCH, SEQLEN, NUM_K_HEADS, d), device="cuda") * 64).to(
+                get_fp8_e4m3_dtype()
+            )
+            for d in (HEAD_SZ, HEAD_SZ_V)
+        )
+    k16, v16 = fwd_prefill._fp8_to_fp16_kv(k, v)
+    assert k16.dtype == v16.dtype == torch.float16
+    torch.testing.assert_close(k16, k.to(torch.float16), atol=0, rtol=0)
+    torch.testing.assert_close(v16, v.to(torch.float16), atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("DESCALE", ["fp32", "fp16_large"])
 @pytest.mark.parametrize("CAUSAL", [True, False])
 def test_mha_fp8_sw_emulated_path(monkeypatch, DESCALE: str, CAUSAL: bool):
@@ -158,9 +186,11 @@ def test_mha_fp8_sw_emulated_path(monkeypatch, DESCALE: str, CAUSAL: bool):
         GpuArch, "supports_sw_emulated_fp8", property(lambda self: True)
     )
     calls = []
-    to_fp16 = fwd_prefill._fp8_to_fp16
+    to_fp16 = fwd_prefill._fp8_to_fp16_kv
     monkeypatch.setattr(
-        fwd_prefill, "_fp8_to_fp16", lambda x: calls.append(x) or to_fp16(x)
+        fwd_prefill,
+        "_fp8_to_fp16_kv",
+        lambda k, v: calls.append((k, v)) or to_fp16(k, v),
     )
 
     BATCH, SEQLEN, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ = 2, 300, 8, 2, 128
@@ -200,7 +230,7 @@ def test_mha_fp8_sw_emulated_path(monkeypatch, DESCALE: str, CAUSAL: bool):
         k_descale=k_descale,
         v_descale=v_descale,
     )
-    assert len(calls) == 2, "the software-emulated fp8 path did not run"
+    assert len(calls) == 1, "the software-emulated fp8 path did not run"
 
     group = NUM_Q_HEADS // NUM_K_HEADS
     q_ref = q.float() * q_descale.float().repeat_interleave(group, 1)[:, None, :, None]

@@ -945,8 +945,8 @@ def attn_fwd(
         seqlen_q = MAX_SEQLENS_Q
         seqlen_k = MAX_SEQLENS_K
 
-    # Load scale factors if IS_FP8.
-    if IS_FP8:
+    # Load scale factors if IS_FP8 or FP8_AS_FP16.
+    if IS_FP8 or FP8_AS_FP16:
         # For MQA/GQA (GROUP_SIZE != 1), q_descale uses the same indexing as k/v (off_h_k)
         # For MHA (GROUP_SIZE == 1), q_descale uses off_h_q (same as off_h_k)
         if GROUP_SIZE != 1:
@@ -963,17 +963,9 @@ def attn_fwd(
         q_descale, k_descale, v_descale = 1.0, 1.0, 1.0
     if FP8_AS_FP16:
         # q, k and v reach the dot as fp16 without descale: q_descale * k_descale
-        # joins the SM_SCALE multiply, v_descale scales the output. Same descale
-        # indexing as the IS_FP8 branch. The product is taken in fp32, as the
-        # IS_FP8 branch does, so fp16 descales do not overflow.
-        if GROUP_SIZE != 1:
-            q_scale = tl.load(Q_Descale + off_z * stride_q_descale_z + off_h_k)
-        else:
-            q_scale = tl.load(Q_Descale + off_z * stride_q_descale_z + off_h_q)
-        k_scale = tl.load(K_Descale + off_z * stride_k_descale_z + off_h_k)
-        q_scale = q_scale.to(tl.float32) * k_scale.to(tl.float32)
-        v_scale = tl.load(V_Descale + off_z * stride_v_descale_z + off_h_k)
-        q_descale = q_scale
+        # joins the SM_SCALE multiply, v_descale scales the output. The product is
+        # taken in fp32, as the IS_FP8 branch does, so fp16 descales do not overflow.
+        q_descale = q_descale.to(tl.float32) * k_descale.to(tl.float32)
 
     # figure out masking pattern
     (
@@ -1316,7 +1308,7 @@ def attn_fwd(
     l_recip = 1 / l_i_safe[:, None]
     acc = acc * l_recip
     if FP8_AS_FP16:
-        acc = acc * v_scale
+        acc = acc * v_descale
 
     if ENABLE_DROPOUT:
         dropout_scale = 1 / (1 - dropout_p)
@@ -1367,11 +1359,13 @@ def attn_fwd(
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=o_ptrs_mask)
 
 
-_fp8_to_fp16_bshd_repr = make_kernel_repr("_fp8_to_fp16_bshd", ["BLOCK_S", "BLOCK_D"])
+_fp8_to_fp16_kv_bshd_repr = make_kernel_repr(
+    "_fp8_to_fp16_kv_bshd", ["BLOCK_S", "BLOCK_D"]
+)
 
 
-@triton.jit(repr=_fp8_to_fp16_bshd_repr)
-def _fp8_to_fp16_bshd(
+@triton.jit
+def _fp8_to_fp16_tile(
     X,
     Y,
     stride_xb,
@@ -1381,15 +1375,13 @@ def _fp8_to_fp16_bshd(
     stride_yb,
     stride_ys,
     stride_yh,
+    off_z,
+    off_h,
+    off_s,
     seqlen,
     head_dim,
-    BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    # int64: s * nheads * head_dim can exceed 2**31 elements
-    off_s = tl.program_id(0).to(tl.int64) * BLOCK_S + tl.arange(0, BLOCK_S)
-    off_h = tl.program_id(1).to(tl.int64)
-    off_z = tl.program_id(2).to(tl.int64)
     offs_d = tl.arange(0, BLOCK_D).to(tl.int64)
     mask = (off_s[:, None] < seqlen) & (offs_d[None, :] < head_dim)
     x = tl.load(
@@ -1412,24 +1404,144 @@ def _fp8_to_fp16_bshd(
     )
 
 
-def _fp8_to_fp16(x: torch.Tensor) -> torch.Tensor:
-    batch, seqlen, nheads, head_dim = x.shape
-    y = torch.empty(
-        (batch, seqlen, nheads, head_dim), dtype=torch.float16, device=x.device
+@triton.jit(repr=_fp8_to_fp16_kv_bshd_repr)
+def _fp8_to_fp16_kv_bshd(
+    K,
+    KO,
+    V,
+    VO,
+    stride_kb,
+    stride_ks,
+    stride_kh,
+    stride_kd,
+    stride_kob,
+    stride_kos,
+    stride_koh,
+    stride_vb,
+    stride_vs,
+    stride_vh,
+    stride_vd,
+    stride_vob,
+    stride_vos,
+    stride_voh,
+    seqlen,
+    head_dim_k,
+    head_dim_v,
+    batch,
+    BLOCK_S: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # Heads are the first grid axis: programs that run at the same time read
+    # neighbouring heads of the same rows. With seqlen blocks first they read
+    # head_dim-sized pieces strided by nheads * head_dim.
+    # int64: s * nheads * head_dim can exceed 2**31 elements
+    off_h = tl.program_id(0).to(tl.int64)
+    off_s = tl.program_id(1).to(tl.int64) * BLOCK_S + tl.arange(0, BLOCK_S)
+    pid_z = tl.program_id(2)
+    if pid_z < batch:
+        _fp8_to_fp16_tile(
+            K,
+            KO,
+            stride_kb,
+            stride_ks,
+            stride_kh,
+            stride_kd,
+            stride_kob,
+            stride_kos,
+            stride_koh,
+            pid_z.to(tl.int64),
+            off_h,
+            off_s,
+            seqlen,
+            head_dim_k,
+            BLOCK_D,
+        )
+    else:
+        _fp8_to_fp16_tile(
+            V,
+            VO,
+            stride_vb,
+            stride_vs,
+            stride_vh,
+            stride_vd,
+            stride_vob,
+            stride_vos,
+            stride_voh,
+            (pid_z - batch).to(tl.int64),
+            off_h,
+            off_s,
+            seqlen,
+            head_dim_v,
+            BLOCK_D,
+        )
+
+
+def _fp8_to_fp16_kv(
+    k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert fp8 k and v in bshd layout to fp16 with one launch."""
+    batch, seqlen, nheads, head_dim_k = k.shape
+    head_dim_v = v.shape[3]
+    assert v.shape[:3] == k.shape[:3], f"k {tuple(k.shape)} and v {tuple(v.shape)}"
+    ko = torch.empty(
+        (batch, seqlen, nheads, head_dim_k), dtype=torch.float16, device=k.device
+    )
+    vo = torch.empty(
+        (batch, seqlen, nheads, head_dim_v), dtype=torch.float16, device=v.device
     )
     BLOCK_S = 64
-    grid = (triton.cdiv(seqlen, BLOCK_S), nheads, batch)
-    _fp8_to_fp16_bshd[grid](
-        x,
-        y,
-        *x.stride(),
-        *y.stride()[:3],
+    grid = (nheads, triton.cdiv(seqlen, BLOCK_S), 2 * batch)
+    _fp8_to_fp16_kv_bshd[grid](
+        k,
+        ko,
+        v,
+        vo,
+        *k.stride(),
+        *ko.stride()[:3],
+        *v.stride(),
+        *vo.stride()[:3],
         seqlen,
-        head_dim,
+        head_dim_k,
+        head_dim_v,
+        batch,
         BLOCK_S=BLOCK_S,
-        BLOCK_D=triton.next_power_of_2(head_dim),
+        BLOCK_D=triton.next_power_of_2(max(head_dim_k, head_dim_v)),
     )
-    return y
+    return ko, vo
+
+
+def _fp8_descales(
+    o: torch.Tensor,
+    q_descale: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+    batch: int,
+    nheads_k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Check the fp8 arguments; a missing descale becomes 1.0.
+
+    attn_fwd reads every descale at (batch, nheads_k), q's too, also for MQA/GQA.
+    """
+    if (q_descale is None) or (k_descale is None) or (v_descale is None):
+        warnings.warn(
+            "FP8 tensors detected but descale factors not provided. Using default scale of 1.0",
+            UserWarning,
+        )
+    shape = (batch, nheads_k)
+    descales = []
+    for name, descale in (("q", q_descale), ("k", k_descale), ("v", v_descale)):
+        if descale is None:
+            descale = torch.ones(shape, dtype=torch.float32, device=o.device)
+        assert (
+            tuple(descale.shape) == shape
+        ), f"{name}_descale expected shape {shape} got {tuple(descale.shape)}"
+        descales.append(descale)
+    assert o.dtype in [
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ], f"Output tensor o must be fp16, bf16, or fp32 when using fp8, got {o.dtype}"
+    return descales[0], descales[1], descales[2]
 
 
 def attention_forward_prefill_triton_impl(
@@ -1495,29 +1607,10 @@ def attention_forward_prefill_triton_impl(
         layout == "bshd" and is_fp8([q, k, v]) and get_arch().supports_sw_emulated_fp8
     )
     if PRE_DEQUANT:
-        if (q_descale is None) or (k_descale is None) or (v_descale is None):
-            warnings.warn(
-                "FP8 tensors detected but descale factors not provided. Using default scale of 1.0",
-                UserWarning,
-            )
-            ones = torch.ones(
-                q.shape[0], k.shape[2], dtype=torch.float32, device=q.device
-            )
-            q_descale = ones if q_descale is None else q_descale
-            k_descale = ones if k_descale is None else k_descale
-            v_descale = ones if v_descale is None else v_descale
-        descale_shape = (q.shape[0], k.shape[2])
-        for name, descale in (("q", q_descale), ("k", k_descale), ("v", v_descale)):
-            assert (
-                tuple(descale.shape) == descale_shape
-            ), f"{name}_descale expected shape {descale_shape} got {tuple(descale.shape)}"
-        assert o.dtype in [
-            torch.float16,
-            torch.bfloat16,
-            torch.float32,
-        ], f"Output tensor o must be fp16, bf16, or fp32 when using fp8, got {o.dtype}"
-        k = _fp8_to_fp16(k)
-        v = _fp8_to_fp16(v)
+        q_descale, k_descale, v_descale = _fp8_descales(
+            o, q_descale, k_descale, v_descale, q.shape[0], k.shape[2]
+        )
+        k, v = _fp8_to_fp16_kv(k, v)
 
     # get shapes and strides
     if IS_VARLEN:
@@ -1728,70 +1821,27 @@ def attention_forward_prefill_triton_impl(
                 UserWarning,
             )
 
-        if (q_descale is None) or (k_descale is None) or (v_descale is None):
-            warnings.warn(
-                "FP8 tensors detected but descale factors not provided. Using default scale of 1.0",
-                UserWarning,
-            )
-            # Create default descale tensors if not provided
-            if q_descale is None:
-                q_descale = torch.ones(
-                    batch, nheads_q, dtype=torch.float32, device=q.device
-                )
-            if k_descale is None:
-                k_descale = torch.ones(
-                    batch, nheads_k, dtype=torch.float32, device=q.device
-                )
-            if v_descale is None:
-                v_descale = torch.ones(
-                    batch, nheads_k, dtype=torch.float32, device=q.device
-                )
-        else:
-            # Enforce exact expected shapes; no reshaping or normalization.
-            assert (
-                q_descale.dim() == 2
-                and q_descale.shape[0] == batch
-                and q_descale.shape[1] == nheads_k
-            ), f"q_descale expected shape ({batch}, {nheads_k}) got {tuple(q_descale.shape)}"
-            assert (
-                k_descale.dim() == 2
-                and k_descale.shape[0] == batch
-                and k_descale.shape[1] == nheads_k
-            ), f"k_descale expected shape ({batch}, {nheads_k}) got {tuple(k_descale.shape)}"
-            assert (
-                v_descale.dim() == 2
-                and v_descale.shape[0] == batch
-                and v_descale.shape[1] == nheads_k
-            ), f"v_descale expected shape ({batch}, {nheads_k}) got {tuple(v_descale.shape)}"
-
-        # o should be fp32 or fp16/bf16
-        assert o.dtype in [
-            torch.float16,
-            torch.bfloat16,
-            torch.float32,
-        ], f"Output tensor o must be fp16, bf16, or fp32 when using fp8, got {o.dtype}"
-
-        stride_q_descale_z = q_descale.stride(0) if q_descale is not None else 0
-        stride_k_descale_z = k_descale.stride(0) if k_descale is not None else 0
-        stride_v_descale_z = v_descale.stride(0) if v_descale is not None else 0
-
+        q_descale, k_descale, v_descale = _fp8_descales(
+            o, q_descale, k_descale, v_descale, batch, nheads_k
+        )
         if DEBUG:
             print("FP8 path triggered in fwd_prefill.py")
     else:
         FP8_MAX = None
-        if PRE_DEQUANT:
-            stride_q_descale_z = q_descale.stride(0)
-            stride_k_descale_z = k_descale.stride(0)
-            stride_v_descale_z = v_descale.stride(0)
-        else:
+        if not PRE_DEQUANT:
             q_descale = k_descale = v_descale = None
-            stride_q_descale_z = stride_k_descale_z = stride_v_descale_z = None
 
         # check output dtype matches input dtype when not using fp8
         assert (
             o.dtype == q.dtype or PRE_DEQUANT
         ), f"Output dtype {o.dtype} must match input dtype {q.dtype} when not using fp8"
 
+    if q_descale is not None:
+        stride_q_descale_z = q_descale.stride(0)
+        stride_k_descale_z = k_descale.stride(0)
+        stride_v_descale_z = v_descale.stride(0)
+    else:
+        stride_q_descale_z = stride_k_descale_z = stride_v_descale_z = None
     # check features
     use_sliding_window = window_size_left != -1 or window_size_right != -1
     # Either edge may be unbounded and is handled uniformly: WINDOW_SIZE_LEFT < 0
