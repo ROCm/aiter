@@ -142,6 +142,16 @@ MLA_BENCH_MODELS: dict[str, str] = {
 }
 
 
+def _last_number(stdout: str, label: str) -> float:
+    """Return the last number on the last non-empty line of a bench's stdout."""
+    lines = [line for line in stdout.splitlines() if line.strip()]
+    values = re.findall(r"-?\d+(?:\.\d+)?", lines[-1]) if lines else []
+    if not values:
+        last_line = lines[-1] if lines else ""
+        raise ValueError(f"Unexpected {label} bench output format: {last_line!r}")
+    return float(values[-1])
+
+
 class KernelHandler(ABC):
     """Base class for kernel-specific benchmark logic and result building."""
 
@@ -351,12 +361,7 @@ class RmsnormKernelHandler(KernelHandler):
         return f"--shape {M} {N} --metric {self._metric}"
 
     def parse_stdout(self, stdout: str) -> float:
-        lines = [line for line in stdout.splitlines() if line.strip()]
-        data_line = lines[-1]
-        last_row_values = list(map(float, re.findall(r"-?\d+(?:\.\d+)?", data_line)))
-        if not last_row_values:
-            raise ValueError(f"Unexpected RMSNorm bench output format: {data_line}")
-        return last_row_values[-1]
+        return _last_number(stdout, "RMSNorm")
 
     def build_result_row(self, bench_result: float | str) -> ResultRow:
         shape = self._shape
@@ -598,13 +603,7 @@ class SparseMqaKernelHandler(KernelHandler):
         )
 
     def parse_stdout(self, stdout: str) -> float:
-        lines = [line for line in stdout.splitlines() if line.strip()]
-        last_row_values = list(map(float, re.findall(r"-?\d+(?:\.\d+)?", lines[-1])))
-        if not last_row_values:
-            raise ValueError(
-                f"Unexpected sparse_mqa bench output format: {lines[-1]!r}"
-            )
-        result = last_row_values[-1]
+        result = _last_number(stdout, "sparse_mqa")
         if self._metric == "time":
             return result * 1e-3  # us -> ms
         if self._metric == "bandwidth":
@@ -644,11 +643,7 @@ class MhcKernelHandler(KernelHandler):
         )
 
     def parse_stdout(self, stdout: str) -> float:
-        lines = [line for line in stdout.splitlines() if line.strip()]
-        last_row_values = list(map(float, re.findall(r"-?\d+(?:\.\d+)?", lines[-1])))
-        if not last_row_values:
-            raise ValueError(f"Unexpected mhc bench output format: {lines[-1]!r}")
-        return last_row_values[-1]
+        return _last_number(stdout, "mhc")
 
     def build_result_row(self, bench_result: float | str) -> ResultRow:
         shape = self._shape
@@ -714,11 +709,7 @@ class KdaAttentionKernelHandler(KernelHandler):
         )
 
     def parse_stdout(self, stdout: str) -> float:
-        lines = [line for line in stdout.splitlines() if line.strip()]
-        last_row_values = list(map(float, re.findall(r"-?\d+(?:\.\d+)?", lines[-1])))
-        if not last_row_values:
-            raise ValueError(f"Unexpected KDA bench output format: {lines[-1]!r}")
-        result = last_row_values[-1]
+        result = _last_number(stdout, "KDA")
         if self._metric == "time":
             return result * 1e-3  # us -> ms
         return result * 1e3  # TB/s -> GB/s
@@ -763,11 +754,7 @@ class AttnResKernelHandler(KernelHandler):
         return args
 
     def parse_stdout(self, stdout: str) -> float:
-        lines = [line for line in stdout.splitlines() if line.strip()]
-        last_row_values = list(map(float, re.findall(r"-?\d+(?:\.\d+)?", lines[-1])))
-        if not last_row_values:
-            raise ValueError(f"Unexpected attn_res bench output: {lines[-1]!r}")
-        return last_row_values[-1]
+        return _last_number(stdout, "attn_res")
 
     def build_result_row(self, bench_result: float | str) -> ResultRow:
         shape = self._shape
