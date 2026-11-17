@@ -3518,6 +3518,8 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     DQ += bid * stride_dqb + q_start * stride_dqm
     M += bid * stride_lse_b + q_start * stride_lse_m
     Delta += bid * stride_delta_b + q_start * stride_delta_m
+    if USE_ALIBI:
+        Alibi_slopes += bid * stride_az
 
     delta_qk = seqlen_q - seqlen_k
     if DEBUG_TRITON:
@@ -3628,8 +3630,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             M_ptr = M + adj_m
 
             if USE_ALIBI:
-                alibi_offset = bid * stride_az + hqid * stride_ah
-                alibi_slope = tl.load(Alibi_slopes + alibi_offset)
+                alibi_slope = tl.load(Alibi_slopes + hqid * stride_ah)
             else:
                 alibi_slope = None
 
@@ -3845,8 +3846,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             M_ptr = M + adj_m
 
             if USE_ALIBI:
-                alibi_offset = bid * stride_az + hqid * stride_ah
-                alibi_slope = tl.load(Alibi_slopes + alibi_offset)
+                alibi_slope = tl.load(Alibi_slopes + hqid * stride_ah)
             else:
                 alibi_slope = None
 
