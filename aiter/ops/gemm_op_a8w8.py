@@ -1764,9 +1764,8 @@ def _warn_blockscale_asm_row_not_bf16(n: int, k: int, dtype: torch.dtype):
 # independent: gemm_a8w8_blockscale with isBpreshuffled delegates to this one's
 # E8M0 route. Whether they should converge is #7150's question, not this one's;
 # routing them as they are keeps this pilot out of a public API change.
-@_route(op="gemm_a8w8_blockscale_bpreshuffle")
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
-def gemm_a8w8_blockscale_bpreshuffle(
+def _gemm_a8w8_blockscale_bpreshuffle_native(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -2041,6 +2040,92 @@ def gemm_a8w8_blockscale_bpreshuffle(
             f"gemm_a8w8_blockscale_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
             f"{dtype=}, config={config}: {e}"
         ) from e
+
+
+def _gemm_a8w8_blockscale_bpreshuffle_fake(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    """The tensor the routed form returns, shaped but not filled.
+
+    Allocating rather than handing back an argument is the whole reason the
+    routed contract carries no output buffer: see
+    :func:`gemm_a8w8_blockscale_bpreshuffle`.
+    """
+    return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+
+
+@_route(
+    op="gemm_a8w8_blockscale_bpreshuffle",
+    version=2,
+    supersedes={1: "a later aiter release"},
+    fake=_gemm_a8w8_blockscale_bpreshuffle_fake,
+)
+def _gemm_a8w8_blockscale_bpreshuffle_routed(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    """Block-scaled A8W8 GEMM on a preshuffled weight -- the routed contract.
+
+    v2 drops the ``out=`` buffer v1 carried, which is what lets this op be
+    registered as a custom op at all. Everything else is unchanged; the math
+    is :func:`_gemm_a8w8_blockscale_bpreshuffle_native`.
+
+    Returns a newly allocated ``[M, N]`` tensor of ``dtype``. It writes
+    through none of its arguments: a provider serving this contract must
+    allocate its result too, and a caller that wants the result in a buffer
+    it owns calls :func:`gemm_a8w8_blockscale_bpreshuffle` with ``out=``,
+    which does not route.
+    """
+    return _gemm_a8w8_blockscale_bpreshuffle_native(
+        XQ, WQ, x_scale, w_scale, dtype, None
+    )
+
+
+def gemm_a8w8_blockscale_bpreshuffle(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+    out: Tensor | None = None,
+) -> Tensor:
+    """Block-scaled A8W8 GEMM whose weight is already in MFMA-fragment order.
+
+    Arguments and output are those of the routed contract; see
+    :func:`_gemm_a8w8_blockscale_bpreshuffle_routed`.
+
+    ``out`` is a pre-allocated output buffer, and passing it bypasses
+    routing. The reason is a schema one rather than a policy one: with a
+    buffer this function RETURNS the tensor it was given, while the schema a
+    custom op is registered under declares that its results do not alias its
+    inputs. `opcheck` reports the contradiction, and under compile both ways
+    of resolving it are wrong. Measured: a fake that allocates leaves the
+    caller's buffer UNWRITTEN while still returning the right value -- no
+    error, stale buffer, and nothing says so. A fake that hands the argument
+    back happens to work, but only by asserting the aliasing its own schema
+    denies.
+
+    Leaving the buffer out of the contract removes the contradiction instead
+    of picking a side of it: the tensor the routed form returns is one it
+    allocated.
+
+    A provider therefore serves the allocating form only. The buffered form
+    runs AITER's own kernel, which is what naming the buffer asked for -- and
+    what pins the result to a FIXED address, so this GEMM's consumer can be
+    captured into a cudagraph without a per-step input copy.
+    """
+    if out is None:
+        return _gemm_a8w8_blockscale_bpreshuffle_routed(XQ, WQ, x_scale, w_scale, dtype)
+    return _gemm_a8w8_blockscale_bpreshuffle_native(
+        XQ, WQ, x_scale, w_scale, dtype, out
+    )
 
 
 def _abpreshuffle_config_from_bpreshuffle(m: int, n: int, k: int, w_scale) -> dict:
