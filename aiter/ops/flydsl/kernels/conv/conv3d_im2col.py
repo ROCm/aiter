@@ -161,9 +161,13 @@ def make_im2col_plan(param, geom, cfg):
     # What both reuse paths need of the layer; AITER_CONV3D_KW_REUSE=0 turns
     # off every LDS-reuse path.
     reuse_ok = bool(
-        param.kw_reuse and scalar_k and pad_mode == "zeros" and groups == 1
+        param.kw_reuse
+        and scalar_k
+        and pad_mode == "zeros"
+        and groups == 1
+        and param.splitk <= 1
     )
-    kw_layer_ok = reuse_ok and param.splitk <= 1 and kw > 1 and sw == 1
+    kw_layer_ok = reuse_ok and kw > 1 and sw == 1
     strip_halo = (kw - 1) * dw if kw_layer_ok else 0
     strip_rows = tile_m + 2 * strip_halo if kw_layer_ok else 0
     strip_vecs = strip_rows * (tile_k // LDG_VEC)
@@ -178,13 +182,11 @@ def make_im2col_plan(param, geom, cfg):
 
     # kH x kW reuse. cols % 16 keeps every MFMA atom's 16 rows inside one
     # image row of the patch. The epilogue masks the H/W tails through the
-    # output descriptor, which BIG_OUT does not have. Split-K divides the
-    # channel blocks between the splits, each walking whole patches.
+    # output descriptor, which BIG_OUT does not have.
     rows = param.block_rows
     cols = tile_m // rows if rows > 0 and tile_m % rows == 0 else 0
     kh_layer_ok = (
         reuse_ok
-        and (param.splitk <= 1 or (geom.cgp // tile_k) % param.splitk == 0)
         and rows > 1
         and cols > 0
         and cols % 16 == 0
