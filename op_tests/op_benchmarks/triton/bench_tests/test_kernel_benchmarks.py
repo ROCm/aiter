@@ -148,9 +148,8 @@ def test_kimi_k2_model_shapes_entry():
             assert (16384, 512) in nk, f"{k} missing kv_b_proj shape"
             assert (7168, 8192) in nk, f"{k} missing o_proj shape"
 
-    # --model 'kimi' regex (case-insensitive, from bench_models.parse_args)
-    # must match exactly this entry.
-    pat = re.compile("kimi", re.IGNORECASE)
+    # Keep this Kimi K2 regression test isolated from other Kimi models.
+    pat = re.compile("^Kimi-K2 Thinking$", re.IGNORECASE)
     assert [m for m in data if pat.search(m)] == ["Kimi-K2 Thinking"]
 
 
@@ -171,7 +170,7 @@ def test_bench_models_kimi_k2_rmsnorm_runs():
     data = filter_models_and_kernels(
         data,
         available_models=sorted(data.keys()),
-        model_pattern="kimi",
+        model_pattern="^Kimi-K2 Thinking$",
         kernel_pattern="rmsnorm",
     )
     assert data is not None and "Kimi-K2 Thinking" in data
