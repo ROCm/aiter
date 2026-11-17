@@ -1322,7 +1322,9 @@ def _mha_v4_fwd_varlen_launch(
     causal: bool,
     lse: Optional[Tensor],  # noqa: UP045
 ) -> None:
-    _fmha_v4_fwd_varlen(q, k, v, out, cu_seqlens, max_seqlen, softmax_scale, causal, lse)
+    _fmha_v4_fwd_varlen(
+        q, k, v, out, cu_seqlens, max_seqlen, softmax_scale, causal, lse
+    )
 
 
 @_mha_v4_fwd_varlen_launch.register_fake
@@ -1367,7 +1369,9 @@ def mha_v4_varlen_fwd(
             cu_seqlens.numel() - 1, int(max_seqlen), q.shape[1], q.device, causal
         )
     if isinstance(kv_splits, bool) or not isinstance(kv_splits, int) or kv_splits < 1:
-        raise ValueError(f'kv_splits must be a positive int or "auto", got {kv_splits!r}')
+        raise ValueError(
+            f'kv_splits must be a positive int or "auto", got {kv_splits!r}'
+        )
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
     if out is None:
@@ -1426,7 +1430,9 @@ def mha_v4_varlen_kv_splits(
     Non-causal work-groups own one Q tile and walk all q_tiles * 256 keys.
     """
     q_tiles = -(-max_seqlen // _MHA_V4_Q_TILE)
-    q_groups, kv_tiles = ((q_tiles + 1) // 2, q_tiles + 1) if causal else (q_tiles, q_tiles)
+    q_groups, kv_tiles = (
+        ((q_tiles + 1) // 2, q_tiles + 1) if causal else (q_tiles, q_tiles)
+    )
     work_groups = batch * query_heads * q_groups
     cus = torch.cuda.get_device_properties(device).multi_processor_count
     return max(1, min(cus // max(work_groups, 1), kv_tiles))

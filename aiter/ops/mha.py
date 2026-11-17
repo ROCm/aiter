@@ -3521,7 +3521,11 @@ def _flash_attn_varlen_forward(
         )
         ret = ret and (
             out is None
-            or (out.dtype == dtypes.bf16 and out.shape == q.shape and out.stride(-1) == 1)
+            or (
+                out.dtype == dtypes.bf16
+                and out.shape == q.shape
+                and out.stride(-1) == 1
+            )
         )
         return ret
 
@@ -3531,13 +3535,26 @@ def _flash_attn_varlen_forward(
 
         if return_lse:
             out, softmax_lse = mha_v4_varlen_fwd(
-                q, k, v, cu_seqlens_q, int(max_seqlen_q), float(softmax_scale),
-                causal=bool(causal), out=out, return_lse=True,
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                int(max_seqlen_q),
+                float(softmax_scale),
+                causal=bool(causal),
+                out=out,
+                return_lse=True,
             )
         else:
             out = mha_v4_varlen_fwd(
-                q, k, v, cu_seqlens_q, int(max_seqlen_q), float(softmax_scale),
-                causal=bool(causal), out=out,
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                int(max_seqlen_q),
+                float(softmax_scale),
+                causal=bool(causal),
+                out=out,
             )
             softmax_lse = torch.empty((0,), dtype=torch.float32, device=q.device)
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)

@@ -12,7 +12,6 @@ error of rounding that reference to BF16 (the floor for any BF16-output kernel);
 """
 
 import argparse
-import math
 
 import pandas as pd
 import torch
@@ -67,19 +66,25 @@ def check(q, k, v, cu, out, lse, causal, sample_rows=0):
         L = s1 - s0
         rows = None
         if sample_rows and sample_rows < L:
-            edge = torch.cat([torch.arange(min(L, 256)), torch.arange(max(0, L - 256), L)])
+            edge = torch.cat(
+                [torch.arange(min(L, 256)), torch.arange(max(0, L - 256), L)]
+            )
             rows = torch.unique(torch.cat([edge, torch.randint(0, L, (sample_rows,))]))
         ro, rl = reference_doc(q[s0:s1], k[s0:s1], v[s0:s1], scale, causal, rows)
         ko = out[s0:s1] if rows is None else out[s0:s1][rows]
         kl = lse[:, s0:s1] if rows is None else lse[:, s0:s1][:, rows]
-        o_err = max(o_err, (ko.float() - ro).abs().nan_to_num(float("inf")).max().item())
+        o_err = max(
+            o_err, (ko.float() - ro).abs().nan_to_num(float("inf")).max().item()
+        )
         rne = max(rne, (ro.to(torch.bfloat16).float() - ro).abs().max().item())
         lse_err = max(lse_err, (kl - rl).abs().nan_to_num(float("inf")).max().item())
     return o_err, rne, lse_err
 
 
 def attention_flops(seqlens, hq, causal):
-    return sum(4.0 * hq * HEAD_DIM * L * ((L + 1) / 2 if causal else L) for L in seqlens)
+    return sum(
+        4.0 * hq * HEAD_DIM * L * ((L + 1) / 2 if causal else L) for L in seqlens
+    )
 
 
 @benchmark()
@@ -104,8 +109,15 @@ def test_mha_v4_varlen(hq, hk, seqlens, causal=True, sample_rows=0, perf=True):
     }
     if perf:
         _, us = run_perftest(
-            mha_v4_varlen_fwd, q, k, v, cu, max_seqlen, causal=causal,
-            num_iters=10, num_warmup=2,
+            mha_v4_varlen_fwd,
+            q,
+            k,
+            v,
+            cu,
+            max_seqlen,
+            causal=causal,
+            num_iters=10,
+            num_warmup=2,
         )
         ret["us"] = us
         ret["TFLOPS"] = attention_flops(seqlens, hq, causal) / us / 1e6
@@ -115,10 +127,17 @@ def test_mha_v4_varlen(hq, hk, seqlens, causal=True, sample_rows=0, perf=True):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
-        "--heads", type=str, nargs="*", default=["24,4", "12,2", "6,1"], help="Hq,Hkv pairs"
+        "--heads",
+        type=str,
+        nargs="*",
+        default=["24,4", "12,2", "6,1"],
+        help="Hq,Hkv pairs",
     )
     parser.add_argument(
-        "--mask", choices=["causal", "none", "both"], default="both", help="which kernels"
+        "--mask",
+        choices=["causal", "none", "both"],
+        default="both",
+        help="which kernels",
     )
     parser.add_argument("--large", action="store_true", help="add >4 GiB packs (slow)")
     args = parser.parse_args()
@@ -134,14 +153,26 @@ def main():
     for causal in causals:
         for pair in args.heads:
             hq, hk = map(int, pair.split(","))
-            for seqlens in ([1024], [2048], [4096], [8192], [300, 4096], mixed, random_docs):
+            for seqlens in (
+                [1024],
+                [2048],
+                [4096],
+                [8192],
+                [300, 4096],
+                mixed,
+                random_docs,
+            ):
                 rows.append(test_mha_v4_varlen(hq, hk, seqlens, causal))
         if args.large:
             rows.append(
-                test_mha_v4_varlen(24, 4, [100000, 262144, 50000], causal, sample_rows=512)
+                test_mha_v4_varlen(
+                    24, 4, [100000, 262144, 50000], causal, sample_rows=512
+                )
             )
             rows.append(
-                test_mha_v4_varlen(6, 1, [262144] * 3 + [131072], causal, sample_rows=512)
+                test_mha_v4_varlen(
+                    6, 1, [262144] * 3 + [131072], causal, sample_rows=512
+                )
             )
     df = pd.DataFrame(rows)
     df["seqlens"] = df["seqlens"].map(lambda s: s if len(s) <= 4 else f"{len(s)} docs")
