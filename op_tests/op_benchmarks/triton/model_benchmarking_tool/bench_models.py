@@ -29,6 +29,7 @@ from op_tests.op_benchmarks.triton.bench_batched_gemm_afp4wfp4 import (
     main as bench_batched_gemm_afp4wfp4_main,
 )
 from op_tests.op_benchmarks.triton.bench_chunk_kda import (
+    K3_HEAD_DIM as KDA_PREFILL_HEAD_DIM,
     main as bench_chunk_kda_main,
 )
 from op_tests.op_benchmarks.triton.bench_fused_gdn_decode_qkvz import (
@@ -573,6 +574,17 @@ class SparseMqaKernelHandler(KernelHandler):
             result.append(s)
         return result
 
+    def unsupported_reason(self, shape: ShapeDict) -> str | None:
+        hkv = int(shape.get("hkv", 1))
+        dqk = int(shape["dqk"])
+        dv = int(shape.get("dv", dqk))
+        if hkv != 1 or dv != dqk:
+            return (
+                "the sparse MQA bench runs one shared KV head with one head "
+                f"dimension; this shape has hkv={hkv}, dqk={dqk}, dv={dv}"
+            )
+        return None
+
     def build_args(self) -> str:
         shape = self._shape
         return (
@@ -665,6 +677,23 @@ class KdaAttentionKernelHandler(KernelHandler):
             self._shard_keys(s, ["hq"])
             result.append(s)
         return result
+
+    def unsupported_reason(self, shape: ShapeDict) -> str | None:
+        dqk = int(shape["dqk"])
+        dv = int(shape["dv"])
+        if self._kernel == "kda_attention_prefill":
+            if dqk == dv == KDA_PREFILL_HEAD_DIM:
+                return None
+            return (
+                "the KDA prefill bench supports only "
+                f"dqk=dv={KDA_PREFILL_HEAD_DIM}; this shape has dqk={dqk}, dv={dv}"
+            )
+        if dv != dqk:
+            return (
+                "the KDA decode bench uses one head dimension for keys and "
+                f"values; this shape has dqk={dqk}, dv={dv}"
+            )
+        return None
 
     def _tokens(self) -> int:
         """Prefill sequence length, or decode tokens per sequence per step."""
@@ -773,12 +802,17 @@ class GatedDeltaNetKernelHandler(KernelHandler):
         return result
 
     def unsupported_reason(self, shape: ShapeDict) -> str | None:
-        if self._kernel != "gated_delta_net_prefill":
-            return None
         hk = int(shape["hk"])
         hv = hk * int(shape.get("ratio", 2))
         dqk = int(shape["dqk"])
         dv = int(shape.get("dv", dqk))
+        if self._kernel == "gated_delta_net_decode":
+            if dv == dqk:
+                return None
+            return (
+                "the decode bench uses one head dimension for keys and values; "
+                f"this shape has dqk={dqk}, dv={dv}"
+            )
         supported = (
             gdn_prefill._K_HEADS,
             gdn_prefill._V_HEADS,

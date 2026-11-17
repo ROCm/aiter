@@ -127,6 +127,9 @@ The sparse MQA benchmark uses `batch_size` as decode token concurrency. It
 gets the context length from `kv_len` and `extra_len`, so the tool runs only
 the first requested `seq_len` value for this kernel.
 
+The benchmark runs one shared KV head with one head dimension, so the tool
+skips shapes with `hkv` other than 1 or `dv` other than `dqk`.
+
 For DeepSeek-V4, `kv_len` is the 128-key sliding window. On CSA layers,
 `extra_len` is the indexer top-k (`index_topk` in the model config). On HCA
 layers, all compressed keys are read, so `extra_len` is the context length
@@ -163,6 +166,9 @@ state, so its cost does not depend on the context length. Decode uses
 `batch_size` as the number of sequences, runs only the first requested
 `seq_len` value, and reports `tokens_per_seq` in the `seq_len` column. Set
 `tokens_per_seq` above 1 to model speculative decoding.
+
+Prefill supports only `dqk` = `dv` = 128. Decode needs `dv` = `dqk`. The tool
+skips shapes that do not match.
 
 ### Attention residuals (`attn_res`)
 
@@ -202,7 +208,7 @@ and head dimension 128 per GPU, with the interleaved (Qwen3-Next) QKVZ layout.
 The tool skips prefill shapes that do not match it after the TP split. For
 example, Qwen3.5-35B-A3B (16 key heads) runs only with `--TP 4`. The kernel
 also needs 1024 to 16384 tokens (`batch_size` x `seq_len`) and `batch_size`
-<= 64. Other combinations report `N/A`.
+<= 64. Other combinations report `N/A`. Decode needs `dv` = `dqk`.
 
 ## Example
 
