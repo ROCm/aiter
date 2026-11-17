@@ -78,14 +78,15 @@ def _cache_pointers(fmt, kv, d_qk, kv_scale):
 
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
-# The kernel reads fp8 in the arch's native encoding: e4m3fnuz on gfx942 (what its
-# fp8 matrix core and vLLM's fp8 KV cache use), OCP e4m3 on gfx950.
+# The kernel reads fp8 in the arch's native encoding: e4m3fnuz on gfx942,
+# OCP e4m3 on gfx950.
 FNUZ_ARCHS = ("gfx942",)
 
-# fp8 q and the per-128 fp8_dsv32_mla cache are gfx950-only. The per-tensor
-# fp8_scalar cache, and the fp8 dots that run on it, also run on gfx942.
+# fp8 q is gfx950-only. gfx942 takes fp8_scalar (either dot precision) and
+# fp8_dsv32_mla (bf16 dots). Callers probe FNUZ_DSV32_ARCHS for the latter.
 FP8_ARCHS = ("gfx950",)
 FP8_SCALAR_ARCHS = ("gfx942", "gfx950")
+FNUZ_DSV32_ARCHS = ("gfx942",)
 
 # The packed caches (fp8_dsv4_mla, fp8_g64) and the SWA+top-k two-loop do not
 # run outside PACKED_ARCHS. An fp8_scalar two-loop would launch the kernel below
@@ -114,10 +115,16 @@ def _check_packed_arch(arch: str) -> None:
     calls this before launching the kernel below.
     """
     if arch not in PACKED_ARCHS:
-        if arch in FP8_ARCHS:
+        if arch in FP8_ARCHS or (
+            arch in FP8_SCALAR_ARCHS and arch in FNUZ_DSV32_ARCHS
+        ):
             flat = "bf16, fp8_scalar or fp8_dsv32_mla"
+        elif arch in FP8_SCALAR_ARCHS:
+            flat = "bf16 or fp8_scalar"
+        elif arch in FNUZ_DSV32_ARCHS:
+            flat = "bf16 or fp8_dsv32_mla"
         else:
-            flat = "bf16 or fp8_scalar" if arch in FP8_SCALAR_ARCHS else "bf16"
+            flat = "bf16"
         raise ValueError(
             f"the fp8_dsv4_mla and fp8_g64 caches and the SWA+top-k two-loop are "
             f"{'/'.join(PACKED_ARCHS)}-only and have no implementation on {arch}. "
@@ -133,7 +140,11 @@ def _check_fp8_arch(arch: str, fmt: str, q_dtype: torch.dtype) -> None:
     """
     if arch in FP8_ARCHS:
         return
-    caches = ("bf16", "fp8_scalar") if arch in FP8_SCALAR_ARCHS else ("bf16",)
+    caches = ["bf16"]
+    if arch in FP8_SCALAR_ARCHS:
+        caches.append("fp8_scalar")
+    if arch in FNUZ_DSV32_ARCHS:
+        caches.append("fp8_dsv32_mla")
     got = [
         what
         for what, is_fp8 in (
@@ -743,9 +754,9 @@ def sparse_mla_fwd(
     Supported KV cache formats. The format is inferred from kv_buffer's shape,
     dtype and kv_scale; each row gives what the caller has to pass. R is the
     QK width, kv_lora_rank + qk_rope_head_dim. fp8 is read in the arch's native
-    encoding: e4m3fnuz on gfx942, OCP e4m3 on gfx950. gfx942 takes the
-    fp8_scalar cache under either dot precision; the other fp8 formats, like
-    fp8 q, are gfx950-only.
+    encoding: e4m3fnuz on gfx942, OCP e4m3 on gfx950. gfx942 takes fp8_scalar
+    under either dot precision and fp8_dsv32_mla under bf16 dots. fp8 q and the
+    other fp8 formats are gfx950-only.
 
         format         kv_buffer                     kv_scale        geometry args
         bf16           [slots, R], [nb, block, R],   None            as the model
@@ -804,8 +815,8 @@ def sparse_mla_fwd(
 
             "bf16" (default): the KV tile is dequantized to bf16 on its way
                 into LDS and both dots are bf16. Works with every cache format
-                the arch takes: all of them on gfx950, bf16 and fp8_scalar on
-                gfx942.
+                the arch takes: all of them on gfx950, and bf16, fp8_scalar and
+                fp8_dsv32_mla on gfx942.
             "fp8": the cache's own code points go to the fp8 matrix core with no
                 dequant, and the per-tensor scale folds outside the tile loop.
                 tensor scale fp8 kv cache only; gfx942 and gfx950.
