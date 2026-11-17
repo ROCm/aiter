@@ -17,10 +17,5 @@
 //   kernarg_size : bytes of the packed kernarg
 //
 knl_name,co_name,BM,atomic,dense,Gb,NSL,NE,TOPK,D_HIDDEN,D_INTER,kernarg_size
-t1g2_v2ao_bm64,t1g2_v2ao_bm64.co,64,1,0,0,24,128,4,6144,1536,96
-t1g2_v2ao_bm128,t1g2_v2ao_bm128.co,128,1,0,0,24,128,4,6144,1536,96
-t1g2_v2n_bm32,t1g2_v2n_bm32.co,32,0,0,0,24,128,4,6144,1536,88
-t1g2_v2n_bm64,t1g2_v2n_bm64.co,64,0,0,0,24,128,4,6144,1536,88
 t1g2_v2n_bm128,t1g2_v2n_bm128.co,128,0,0,0,24,128,4,6144,1536,88
-t1g2_v4g8_bm64,t1g2_v4g8_bm64.co,64,0,1,16,24,128,4,6144,1536,88
 t1g2_v4g8_bm128,t1g2_v4g8_bm128.co,128,0,1,8,24,128,4,6144,1536,88
