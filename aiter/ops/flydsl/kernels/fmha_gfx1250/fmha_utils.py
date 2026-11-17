@@ -36,23 +36,28 @@ import functools
 import flydsl.expr as fx
 import torch
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import gpu, rocdl
+from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
 from aiter.jit.utils.chip_info import get_cu_num, get_lds_capacity_bytes
+from aiter.ops.flydsl.kernels import buffer_ops
 
 from .fmha_buffer_managers import (
-    OManager16bV1,
-    OManager16bV2,
-    OManager16bV3,
+    OManagerV1,
+    OManagerV2,
+    OManagerV3,
     _ir,
+    _lds_ptr_b128,
 )
 
 # m32x8 geometry. Defined here rather than in each sibling so ``_block_m`` cannot
 # drift from the kernel that calls it.
+WAVE_SIZE = 32  # gfx1250 kernels run wave32
 NUM_WAVES = 8  # "m32x8" -- 8 waves per threadgroup
+BLOCK_SIZE = WAVE_SIZE * NUM_WAVES  # 256 threads
 WMMA_M = 16  # query rows per WMMA tile (the "m16" in m32x8)
 
 
@@ -78,6 +83,116 @@ def _alloc_lds():
     SharedAllocator flydsl permits; K/V, Q and the O epilogue all carve this base."""
     smem = fx.SharedAllocator().allocate(get_lds_capacity_bytes("gfx1250"))
     return fx.Int32(fx.ptrtoint(smem.peek().ptr))
+
+
+def _zero_slot(base, size, num_splits, split_stride, tid):
+    """Zero one K|V LDS slot: all ``num_splits`` halves, ``split_stride`` bytes apart.
+
+    ``size`` is the whole slot in bytes. Whole rounds share one address and ride
+    ds_store's immediate offset. The partial round wraps surplus lanes with ``tid % rem``
+    rather than branching -- callers are module-level, where a runtime if would need its
+    own ``@flyc.jit`` -- which is safe because re-zeroing is idempotent and keeps the LDS
+    conflict 2-way instead of one address per wave. ``tid`` is the caller's
+    workgroup-wide thread index.
+    """
+    half = size // num_splits
+    assert half % 16 == 0, f"slot half {half}B is not a b128 multiple"
+    full, rem = divmod(half // 16, BLOCK_SIZE)
+    zero = fx.Vector.filled(4, 0, fx.Int32)
+    for seg in range(0, num_splits * split_stride, split_stride):
+        seg_base = base + fx.Int32(seg)
+        ptr = _lds_ptr_b128(seg_base + tid * fx.Int32(16))
+        for i in range(full):
+            fx.ptr_store(_ir(zero), fx.add_offset(ptr, i * BLOCK_SIZE * 16))
+        if rem:
+            tail = (
+                seg_base
+                + fx.Int32(full * BLOCK_SIZE * 16)
+                + (tid % fx.Int32(rem)) * fx.Int32(16)
+            )
+            fx.ptr_store(_ir(zero), _lds_ptr_b128(tail))
+
+
+_S_BUFFER_WIDTHS = (16, 8, 4, 1)  # words one is_scalar buffer_load can take
+
+
+def s_buffer_load(ptr, offset, size, dtype=fx.Int32, *, num_records_bytes=None):
+    """``size`` ``dtype`` elements from ``ptr[offset]``, landing in SGPRs.
+
+    Mind the units: ``offset`` (runtime) and ``size`` (compile-time) count ELEMENTS,
+    ``num_records_bytes`` counts BYTES, so an N-entry ``Int32`` table bounds at ``N * 4``.
+    That bound is the descriptor's: an access at or past it reads 0 instead of faulting.
+    Pass it when ``offset`` can run off the table; ``None`` leaves it unbounded.
+
+    One issue carries 1/4/8/16 words, so ``size`` is cut greedily into pieces that FIT --
+    nothing past it is read. LLVM spends one ``s_add_co_i32`` per extra piece rather than
+    using the SMEM immediate field (``soffset_bytes`` would ask for it, but ``is_scalar``
+    rejects it). Returns a python list, indexable at trace time.
+    """
+    assert size >= 1, f"size must be positive, got {size}"
+    assert (
+        dtype.width == 32
+    ), f"s_buffer_load handles 4-byte elements, got {dtype.width}"
+    # kernel tensor args arrive as memrefs; get_iter is the pointer behind one.
+    base = ptr if isinstance(ptr, fx.Pointer) else fx.get_iter(ptr)
+    rsrc = buffer_ops.create_buffer_resource_from_addr(
+        fx.Int64(fx.ptrtoint(base)), num_records_bytes=num_records_bytes
+    )
+    base = fx.Int32(offset)
+    out, taken = [], 0
+    while taken < size:
+        width = next(w for w in _S_BUFFER_WIDTHS if w <= size - taken)
+        word = buffer_ops.buffer_load(
+            rsrc, base + taken, vec_width=width, is_scalar=True
+        )
+        raw = [word] if width == 1 else [Vec(word)[i] for i in range(width)]
+        out += raw if dtype is fx.Int32 else [v.bitcast(dtype) for v in raw]
+        taken += width
+    return out
+
+
+# ============================================================================
+# Float helpers for the softmax hot path. Shared by the a16w16 and a8w8 cores,
+# which ran identical private copies.
+# ============================================================================
+
+_FASTMATH = arith.FastMathFlags.fast
+# fast-math WITHOUT reassoc: LLVM's Reassociate pass otherwise re-linearizes the sum
+# tree back into a serial chain (max survives -- Reassociate ignores maxnum).
+_NO_REASSOC = (
+    arith.FastMathFlags.nnan
+    | arith.FastMathFlags.ninf
+    | arith.FastMathFlags.nsz
+    | arith.FastMathFlags.arcp
+    | arith.FastMathFlags.contract
+    | arith.FastMathFlags.afn
+)
+
+
+def fmax_fastmath(a, b):
+    return fx.maxnumf(a, b, fastmath=_FASTMATH)
+
+
+def fadd_fastmath(a, b):
+    return a.addf(b, fastmath=_FASTMATH)
+
+
+def fadd_no_reassoc(a, b):
+    return a.addf(b, fastmath=_NO_REASSOC)
+
+
+def fsub_fastmath(a, b):
+    with arith.fastmath(_FASTMATH):
+        return a - b
+
+
+def fmul_fastmath(a, b):
+    with arith.fastmath(_FASTMATH):
+        return a * b
+
+
+def exp2_fastmath(x):
+    return fx.exp2(x, fastmath="afn")
 
 
 def _bare_barrier():
@@ -131,6 +246,15 @@ def _keepalive(vals):
     ops = [_ir(v) for v in vals]
     llvm_dialect.inline_asm(
         None, ops, "", ",".join("v" for _ in ops), has_side_effects=True
+    )
+
+
+def _keepalive_sgpr(vals):
+    """``_keepalive`` for uniform values. The wait the SMEM result needs lands HERE, not
+    at the load, so placing this late is what buys the issue-to-wait distance."""
+    ops = [_ir(v) for v in vals]
+    llvm_dialect.inline_asm(
+        None, ops, "", ",".join("s" for _ in ops), has_side_effects=True
     )
 
 
@@ -197,7 +321,9 @@ def _ring_num_prefetch(num_ld, ring, ring_lag):
     return ring - 2 * ring_lag
 
 
-def _ring_drive(*, widths, emit, consume, ring, ring_lag, head=None, dies=None):
+def _ring_drive(
+    *, widths, emit, consume, ring, ring_lag, head=None, dies=None, tap=None
+):
     """Drive a fully-unrolled LDS->VGPR ring feeding a WMMA stream.
 
     ``widths[i]`` is how many ds_loads fragment ``i`` is built from -- 2 where one load
@@ -208,6 +334,10 @@ def _ring_drive(*, widths, emit, consume, ring, ring_lag, head=None, dies=None):
     fragments ago -- trading pipeline depth for WAR distance at fixed VGPR cost. Refills
     are hoisted ABOVE the wmma, which is what keeps the ring from reintroducing the
     wmma->ds_load issue bubble a burst-everything prefetch avoids.
+
+    ``tap(i)`` is called at the head of fragment ``i`` for a caller that wants its own
+    copies spread through the ring instead of clumped ahead of it. Placement is by source
+    order, so it costs the ring no fence or wait depth.
 
     ``head`` optionally adopts an already-issued NP-deep prefetch (the PV case hoists it
     above softmax so the LDS latency hides under the softmax VALU). A tile of at most
@@ -281,6 +411,8 @@ def _ring_drive(*, widths, emit, consume, ring, ring_lag, head=None, dies=None):
         held.append(tuple(vals) if vals else None)
 
     for i in range(num_frag):
+        if tap is not None:
+            tap(i)
         # The wait is placed before the refill, so it is measured against what is already
         # outstanding: everything issued past the end of this fragment may still be in
         # flight, and the refill below only adds younger loads.
@@ -386,9 +518,7 @@ def _o_manager(*, v_hdim, gqa_ratio, num_q_tiles_per_wave, elem_dtype):
     Two waves share a chunk at 0 and LDS_QO_BYTES, and the upper one must stop short of
     the next chunk -- that clearance is what keeps O off the V rows a dead carried ring
     head may still be reading."""
-    _o_manager_cls = {"v1": OManager16bV1, "v2": OManager16bV2, "v3": OManager16bV3}[
-        O_VARIANT
-    ]
+    _o_manager_cls = {"v1": OManagerV1, "v2": OManagerV2, "v3": OManagerV3}[O_VARIANT]
     o_mgr = _o_manager_cls(
         v_hdim=v_hdim,
         gqa_ratio=gqa_ratio,
@@ -508,3 +638,173 @@ def _wg_kv_span(
     else:
         kv_len_wg = kv_len
     return m_tile_idx, causal_off, kv_len_wg, fx.ceildiv(kv_len_wg, fx.Int32(n_block))
+
+
+# ============================================================================
+# KV addressing policies -- where a tile's rows come from. Dtype-agnostic, so the
+# a16w16 and a8w8 cores share them.
+# ============================================================================
+
+
+class PagedSpec:
+    """The paged KV pool as the entry sees it; ``page_size`` compile-time, rest runtime."""
+
+    __slots__ = (
+        "num_page_entries",
+        "num_pool_rows",
+        "page_base",
+        "page_size",
+        "ptr_page_indices",
+    )
+
+    def __init__(
+        self, *, ptr_page_indices, num_page_entries, page_base, page_size, num_pool_rows
+    ):
+        self.ptr_page_indices = ptr_page_indices
+        self.num_page_entries = num_page_entries
+        self.page_base = page_base
+        self.page_size = page_size
+        self.num_pool_rows = num_pool_rows
+
+
+class _ContiguousKVPolicy:
+    """Tile index -> K/V descriptor for a dense band. The core reads tile positions
+    through this so paging can swap it out; softmax positions, masking and the slot
+    rotation stay addressing-agnostic."""
+
+    def __init__(self, *, tile_row0, kv_valid, row_base):
+        self.tile_row0 = tile_row0
+        self.kv_valid = kv_valid
+        self.row_base = row_base
+
+    num_state_slots = 0
+
+    def indices(self, carried):
+        return None
+
+    def advance(self, tile_idx):
+        return []
+
+    def indices_for(self, tile_idx):
+        return None
+
+    def init_state(self, first_tile_idx):
+        return []
+
+    def desc_kwargs(self, page_indices):
+        return {}
+
+
+class _PagedKVPolicy:
+    """Tile index -> K/V descriptor for a PAGED pool. ``row_base`` is 0: positions stay
+    sequence-relative and the page table supplies the pool row. ``prepare`` is the one
+    memory op (the SGPR load of this band's pages); the descriptor build stays pure."""
+
+    def __init__(
+        self,
+        *,
+        tile_row0,
+        kv_valid,
+        ptr_page_indices,
+        num_page_entries,
+        page_base,
+        page_size,
+        num_pool_rows,
+        producer_warp,
+        num_producer_warps,
+        n_block,
+    ):
+        self.tile_row0 = tile_row0
+        self.kv_valid = kv_valid
+        # sequence-relative: the page table supplies the pool row
+        self.row_base = fx.Int32(0)
+        self._ptr_page_indices = ptr_page_indices
+        self._num_page_entries = num_page_entries
+        self._page_base = page_base
+        self._page_size = page_size
+        self._num_pool_rows = num_pool_rows
+        self._producer_warp = producer_warp
+        num_rows = n_block // num_producer_warps
+        assert page_size & (page_size - 1) == 0, "page_size must be a power of two"
+        self._num_rows = num_rows
+        self._log2_page = page_size.bit_length() - 1
+        # bands start at a multiple of num_rows, so this keeps them from straddling
+        assert (
+            num_rows % page_size == 0 or page_size % num_rows == 0
+        ), f"band of {num_rows} rows and page_size {page_size}: one must divide the other"
+        self._num_pages = max(1, num_rows // page_size)
+        # Distance-2 index prefetch. The descriptor BUILD consumes these and is hoisted
+        # above the drain, so loading them in the same body would put s_wait_kmcnt right
+        # on the dependency. Carrying widens a live range instead of adding one -- a
+        # band's indices die at its build -- so it stays affordable at the widest case,
+        # num_rows of them at page_size 1.
+        self.num_state_slots = self._num_pages
+        # Sentinel for dead rows: the sequence's first token, whose page is referenced
+        # by construction (pool row 0's may not be, and NaN there reaches O).
+        self._sentinel_row = s_buffer_load(
+            ptr_page_indices, page_base, 1, num_records_bytes=num_page_entries * 4
+        )[0] * fx.Int32(page_size)
+
+    def _load(self, tile_idx):
+        band_tok0 = self.tile_row0(tile_idx) + self._producer_warp * fx.Int32(
+            self._num_rows
+        )
+        slot0 = self._page_base + (band_tok0 >> fx.Int32(self._log2_page))
+        return s_buffer_load(
+            self._ptr_page_indices,
+            slot0,
+            self._num_pages,
+            num_records_bytes=self._num_page_entries * 4,
+        )
+
+    def indices(self, carried):
+        """This tile's page indices, loaded a body ago."""
+        return [fx.Int32(c) for c in carried]
+
+    def advance(self, tile_idx):
+        """Start the next body's load. Nothing in THIS body consumes it, so the caller
+        places it wherever the kmcnt wait is cheapest."""
+        return self._load(tile_idx + fx.Int32(1))
+
+    def indices_for(self, tile_idx):
+        """Direct load, for the prologue's own start descriptor -- there is no earlier
+        body to have carried it."""
+        return self._load(tile_idx)
+
+    def init_state(self, first_tile_idx):
+        return self._load(first_tile_idx)
+
+    def desc_kwargs(self, page_indices):
+        return {
+            "page_indices": page_indices,
+            "page_size": self._page_size,
+            "num_pool_rows": self._num_pool_rows,
+            "sentinel_row": self._sentinel_row,
+        }
+
+
+def _is_paged_layout_supported(k, v, kv_indptr, kv_page_indices, kv_last_page_lens):
+    """The page pool and its metadata, as the gather loader needs them."""
+    if k.dim() != v.dim() or k.dim() not in (3, 4):
+        return False
+    # Launch geometry and the pool row count come from K alone, and the V view is built
+    # with K's row count, so a V pool with fewer blocks, a smaller page or fewer heads
+    # reads the wrong rows and runs off the end. hdim may still differ between them.
+    if k.shape[:-1] != v.shape[:-1]:
+        return False
+    meta = (kv_indptr, kv_page_indices, kv_last_page_lens)
+    if any(t is None for t in meta) or any(t.dtype != torch.int32 for t in meta):
+        return False
+    if kv_page_indices.stride(-1) != 1:
+        return False
+    page_size = 1 if k.dim() == 3 else k.shape[1]
+    if page_size & (page_size - 1):
+        return False
+    # the token-row view the gather addresses only exists when pages are contiguous
+    if k.stride(0) != page_size * k.stride(-3) or v.stride(0) != page_size * v.stride(
+        -3
+    ):
+        return False
+    if k.stride(-1) != 1 or v.stride(-1) != 1:
+        return False
+    return k.shape[0] * page_size < 2**31

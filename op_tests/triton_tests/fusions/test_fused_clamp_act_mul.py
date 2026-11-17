@@ -686,3 +686,26 @@ def test_fused_clamp_act_mul_partial_last_group(M, n_half, quant_block_size, bac
     # E4M3 keeps 3 mantissa bits: a correct value sits within 2 ** -4 of its
     # group's amax; a scale taken over the wrong columns is far outside it.
     assert ((deq - y).abs() <= group_amax * 2.0**-4 + 1e-6).all()
+
+
+@pytest.mark.parametrize("M", [8])
+@pytest.mark.parametrize("n_half", [32, 64])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_quant_group_wider_than_tile_raises(M, n_half, backend):
+    """A quant group wider than the compute tile (n_half <= quant_block_size / 2)
+    must raise a clean AssertionError on both backends rather than reach the
+    kernel with NUM_QUANT_BLOCKS = BLOCK_SIZE_N // QUANT_BLOCK_SIZE == 0. The
+    Triton path, whose tile is exactly next_power_of_2(n_half), lost this guard
+    when the whole-group requirement was relaxed; the Gluon path always had it."""
+    _check_backend(backend)
+    torch.manual_seed(n_half + M)
+    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="must be a multiple of"):
+        fused_clamp_act_mul(
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=aiter.dtypes.fp8,
+            quant_block_size=128,
+            backend=backend,
+        )
