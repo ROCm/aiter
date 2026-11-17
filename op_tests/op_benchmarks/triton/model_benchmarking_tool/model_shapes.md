@@ -175,7 +175,7 @@ benchmark supports the `time` and `bandwidth` metrics.
 | `dqk`         | int    | Query/key head dimension.                                       |
 | `dv`          | int    | Value head dimension.                                           |
 | `ratio`       | int    | Optional. Number of value heads per key head. The default is 2. |
-| `layout`      | string | Optional. Packed QKVZ layout. The default is `"flat"`.          |
+| `layout`      | string | Optional. Decode packed QKVZ layout. The default is `"flat"`.   |
 | `slots`       | int    | Optional. Decode state-pool size. The default is 512.           |
 | `state_dtype` | string | Optional. Decode state dtype: `"fp32"` or `"bf16"`.             |
 | `fp8`         | bool   | Optional. Enable the decode FP8 output. The default is false.   |
@@ -183,6 +183,13 @@ benchmark supports the `time` and `bandwidth` metrics.
 The fused Gated DeltaNet benchmarks run on gfx950. Prefill uses `batch_size`
 and `seq_len`. Decode uses `batch_size` and runs only the first requested
 `seq_len` value. Both keys support the `time` and `bandwidth` metrics.
+
+The fused prefill kernel has one fixed topology: 4 key heads, 8 value heads
+and head dimension 128 per GPU, with the interleaved (Qwen3-Next) QKVZ layout.
+The tool skips prefill shapes that do not match it after the TP split. For
+example, Qwen3.5-35B-A3B (16 key heads) runs only with `--TP 4`. The kernel
+also needs 1024 to 16384 tokens (`batch_size` x `seq_len`) and `batch_size`
+<= 64. Other combinations report `N/A`.
 
 ## Example
 

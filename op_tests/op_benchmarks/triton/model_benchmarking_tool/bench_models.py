@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from triton.runtime.errors import OutOfResources
 
+from aiter.ops.triton.gated_delta_net import fused_gdn_prefill_qkvz as gdn_prefill
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.bench_attn_res import main as bench_attn_res_main
 from op_tests.op_benchmarks.triton.bench_batched_gemm_a8w8 import (
@@ -198,6 +199,10 @@ class KernelHandler(ABC):
     def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
         """Return shapes adjusted for tensor parallelism."""
         ...
+
+    def unsupported_reason(self, shape: ShapeDict) -> str | None:
+        """Return why the bench can't run this TP-adjusted shape, or None."""
+        return None
 
     @abstractmethod
     def build_args(self) -> str:
@@ -757,6 +762,27 @@ class GatedDeltaNetKernelHandler(KernelHandler):
             result.append(s)
         return result
 
+    def unsupported_reason(self, shape: ShapeDict) -> str | None:
+        if self._kernel != "gated_delta_net_prefill":
+            return None
+        hk = int(shape["hk"])
+        hv = hk * int(shape.get("ratio", 2))
+        dqk = int(shape["dqk"])
+        dv = int(shape.get("dv", dqk))
+        supported = (
+            gdn_prefill._K_HEADS,
+            gdn_prefill._V_HEADS,
+            gdn_prefill._HEAD_DIM,
+            gdn_prefill._HEAD_DIM,
+        )
+        if (hk, hv, dqk, dv) == supported:
+            return None
+        return (
+            "the fused prefill kernel supports only "
+            f"hk={supported[0]}, hv={supported[1]}, dqk=dv={supported[2]} per GPU; "
+            f"this shape has hk={hk}, hv={hv}, dqk={dqk}, dv={dv} at TP={self._tp}"
+        )
+
     def build_args(self) -> str:
         shape = self._shape
         common = f"--num-k-heads {shape['hk']} --head-dim {shape['dqk']}"
@@ -776,7 +802,19 @@ class GatedDeltaNetKernelHandler(KernelHandler):
 
     def parse_stdout(self, stdout: str) -> float:
         lines = [line for line in stdout.splitlines() if line.strip()]
+        is_prefill = self._kernel == "gated_delta_net_prefill"
+        if is_prefill and "(uncovered)" in lines[-1]:
+            raise ValueError(
+                "The fused prefill kernel has no tile for "
+                f"batch={self._batch_size}, tokens={self._M}. It covers "
+                f"{gdn_prefill._MIN_TOKENS}-{gdn_prefill._MAX_TOKENS} tokens "
+                f"and batch <= {gdn_prefill._MAX_BATCH}."
+            )
         values = lines[-1].split()
+        # Prefill rows: batch, seqlen, tokens, tile, us, Mtok/s, TB/s, %peak.
+        # Decode rows: batch, us, GB moved, TB/s, %peak.
+        if len(values) != (8 if is_prefill else 5):
+            raise ValueError(f"Unexpected Gated DeltaNet bench output: {lines[-1]!r}")
         try:
             if self._metric == "time":
                 return float(values[-4]) * 1e-3  # us -> ms
@@ -790,7 +828,7 @@ class GatedDeltaNetKernelHandler(KernelHandler):
         shape = self._shape
         ratio = int(shape.get("ratio", 2))
         is_decode = self._kernel == "gated_delta_net_decode"
-        return {
+        row: ResultRow = {
             "Model": self._model,
             "Kernel": self._kernel,
             "batch_size": self._batch_size,
@@ -799,9 +837,12 @@ class GatedDeltaNetKernelHandler(KernelHandler):
             "hv": int(shape["hk"]) * ratio,
             "dqk": shape["dqk"],
             "dv": shape.get("dv", shape["dqk"]),
-            "layout": shape.get("layout", "flat"),
-            self._metric: bench_result,
         }
+        # The prefill kernel has one fixed (interleaved) QKVZ layout.
+        if is_decode:
+            row["layout"] = shape.get("layout", "flat")
+        row[self._metric] = bench_result
+        return row
 
 
 class UnifiedAttnKernelHandler(KernelHandler):
@@ -1111,6 +1152,10 @@ def run_benchmarks(
             handler.set_run(model, kernel, run_metric, gemm_layout, mha_layout, TP)
             tp_shapes = handler.get_tp_shapes(shapes)
             for shape in tp_shapes:
+                reason = handler.unsupported_reason(shape)
+                if reason is not None:
+                    print(f"Skipping {kernel} for model '{model}': {reason}.")
+                    continue
                 for batch_size in batch_sizes:
                     # These decode kernels use batch_size as token concurrency.
                     # Their context or state size comes from the shape metadata.
