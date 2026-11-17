@@ -31,6 +31,17 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("softmax_scale"),
           py::arg("seqlens_k") = std::nullopt,
           py::arg("lse")       = std::nullopt);
+    m.def("fmha_v4_fwd_varlen",
+          &aiter::torch_itfs::fmha_v4_fwd_varlen,
+          py::arg("q"),
+          py::arg("k"),
+          py::arg("v"),
+          py::arg("out"),
+          py::arg("cu_seqlens"),
+          py::arg("max_seqlen"),
+          py::arg("softmax_scale"),
+          py::arg("causal"),
+          py::arg("lse") = std::nullopt);
     m.def("fmha_v4_fwd_sparse",
           &aiter::torch_itfs::fmha_v4_fwd_sparse,
           py::arg("q"),

@@ -1278,6 +1278,160 @@ def _mha_v4_fwd_sparse_launch_fake(
     del kv_block_indices, lut_start, lut_count, q_tile, kv_tile
 
 
+def _fmha_v4_fwd_varlen_fake(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+    softmax_scale: float,
+    causal: bool,
+    lse: Optional[Tensor] = None,  # noqa: UP045
+) -> None:
+    del q, k, v, out, cu_seqlens, max_seqlen, softmax_scale, causal, lse
+
+
+@compile_ops(
+    "module_fmha_v4_fwd",
+    fc_name="fmha_v4_fwd_varlen",
+    gen_fake=_fmha_v4_fwd_varlen_fake,
+)
+def _fmha_v4_fwd_varlen(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+    softmax_scale: float,
+    causal: bool,
+    lse: Optional[Tensor] = None,  # noqa: UP045
+) -> None: ...
+
+
+@_launch_op("aiter::mha_v4_fwd_varlen_launch")
+def _mha_v4_fwd_varlen_launch(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+    softmax_scale: float,
+    causal: bool,
+    lse: Optional[Tensor],  # noqa: UP045
+) -> None:
+    _fmha_v4_fwd_varlen(q, k, v, out, cu_seqlens, max_seqlen, softmax_scale, causal, lse)
+
+
+@_mha_v4_fwd_varlen_launch.register_fake
+def _mha_v4_fwd_varlen_launch_fake(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+    softmax_scale: float,
+    causal: bool,
+    lse: Optional[Tensor],  # noqa: UP045
+) -> None:
+    del q, k, v, out, cu_seqlens, max_seqlen, softmax_scale, causal, lse
+
+
+def mha_v4_varlen_fwd(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+    softmax_scale: Optional[float] = None,  # noqa: UP045
+    causal: bool = True,
+    out: Optional[Tensor] = None,  # noqa: UP045
+    return_lse: bool = False,
+    kv_splits: Union[int, str] = "auto",  # noqa: UP007
+) -> Union[Tensor, tuple[Tensor, Tensor]]:  # noqa: UP007
+    """Causal or non-causal BF16 attention over packed whole documents (gfx950).
+
+    q is [total_tokens, Hq, D], k and v [total_tokens, Hkv, D] with any Hq % Hkv == 0, documents
+    delimited by int32 cu_seqlens [batch + 1] (seqlen_q == seqlen_k per document), and max_seqlen
+    the longest document. Offsets are 64-bit, so packs past 4 GiB are fine. Returns out like q and,
+    with return_lse, the natural-log LSE as float32 [Hq, total_tokens].
+
+    kv_splits cuts each work-group's KV range into that many slices merged by their LSE; "auto"
+    (mha_v4_varlen_kv_splits) splits whenever the grid leaves CUs idle.
+    """
+    if kv_splits == "auto":
+        kv_splits = mha_v4_varlen_kv_splits(
+            cu_seqlens.numel() - 1, int(max_seqlen), q.shape[1], q.device, causal
+        )
+    if isinstance(kv_splits, bool) or not isinstance(kv_splits, int) or kv_splits < 1:
+        raise ValueError(f'kv_splits must be a positive int or "auto", got {kv_splits!r}')
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    if out is None:
+        out = torch.empty_like(q)
+    total, heads = q.shape[0], q.shape[1]
+    lse = (
+        torch.empty((heads, total), dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
+    splits = kv_splits
+    if splits == 1:
+        _mha_v4_fwd_varlen_launch(
+            q, k, v, out, cu_seqlens, int(max_seqlen), float(softmax_scale), causal, lse
+        )
+        return (out, lse) if return_lse else out
+    partial_out = torch.empty((splits, *q.shape), dtype=q.dtype, device=q.device)
+    partial_lse = torch.empty(
+        (splits, heads, total), dtype=torch.float32, device=q.device
+    )
+    _mha_v4_fwd_varlen_launch(
+        q,
+        k,
+        v,
+        partial_out,
+        cu_seqlens,
+        int(max_seqlen),
+        float(softmax_scale),
+        causal,
+        partial_lse,
+    )
+    _merge_kv_splits(
+        partial_out,
+        partial_lse,
+        out.unsqueeze(0),
+        lse.unsqueeze(0) if lse is not None else None,
+    )
+    return (out, lse) if return_lse else out
+
+
+def mha_v4_varlen_kv_splits(
+    batch: int,
+    max_seqlen: int,
+    query_heads: int,
+    device: Optional[torch.device] = None,  # noqa: UP045
+    causal: bool = True,
+) -> int:
+    """The KV split count mha_v4_varlen_fwd(kv_splits="auto") uses for these shapes on `device`.
+
+    The causal grid is one work-group per (document, head, pair of Q tiles), and a CU holds one,
+    so a short pack with few heads leaves most CUs idle: 6/1 at 4K launches 48 of MI355X's 256.
+    This takes the most slices whose work-groups still fit on the CUs once each, since a second
+    slice on a CU reloads Q, and keeps every slice at least one Q tile of the (q_tiles + 1) * 256
+    keys a pair walks. On MI355X, 6/1 GPU time with the merge: 4K 0.170 -> 0.083 ms at 5 slices,
+    8K 0.311 -> 0.217 ms at 2; at 1K and 2K 6/1 and 12/2 still gained up to 8 slices.
+    Non-causal work-groups own one Q tile and walk all q_tiles * 256 keys.
+    """
+    q_tiles = -(-max_seqlen // _MHA_V4_Q_TILE)
+    q_groups, kv_tiles = ((q_tiles + 1) // 2, q_tiles + 1) if causal else (q_tiles, q_tiles)
+    work_groups = batch * query_heads * q_groups
+    cus = torch.cuda.get_device_properties(device).multi_processor_count
+    return max(1, min(cus // max(work_groups, 1), kv_tiles))
+
+
 # (q_format, v_format) rows whose code object implements the LSE epilogue. The kernels branch on
 # the s_lse kernarg, so an object without the epilogue would silently leave the buffer untouched
 # instead of failing. Keyed on the pair because one Q format spans several rows (FP8 Q reaches both

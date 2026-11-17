@@ -147,6 +147,7 @@ static_assert(offsetof(FmhaV4Kernarg, ptr_q) == 0x010);
 static_assert(offsetof(FmhaV4Kernarg, ptr_k) == 0x020);
 static_assert(offsetof(FmhaV4Kernarg, ptr_v) == 0x030);
 static_assert(offsetof(FmhaV4Kernarg, scalar) == 0x050);
+static_assert(offsetof(FmhaV4Kernarg, ptr_qseq_padding) == 0x1E0);
 static_assert(offsetof(FmhaV4Kernarg, ptr_q_descale) == 0x200);
 static_assert(offsetof(FmhaV4Kernarg, ptr_k_descale) == 0x210);
 static_assert(offsetof(FmhaV4Kernarg, ptr_v_descale) == 0x220);
@@ -351,12 +352,13 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
                                      int64_t mode,
                                      int64_t head_dim,
                                      int64_t ts_qo,
-                                     int64_t ts_kv)
+                                     int64_t ts_kv,
+                                     int64_t mask = 0)
 {
     // cfg_fmha_v4_fwd is an unordered_map, so "first row that matches" is only well defined when at
     // most one row can match. That holds for dense, but gfx950 now has two block-sparse FP8 rows
     // per mode, so leaving the geometry unnamed there would pick a tile by hash order.
-    TORCH_CHECK(mode == 0 || (ts_qo != 0 && ts_kv != 0),
+    TORCH_CHECK(mode == 0 || mode == 3 || (ts_qo != 0 && ts_kv != 0),
                 "block-sparse MHA v4 (mode=",
                 mode,
                 ") requires an explicit q_tile/kv_tile: several tile geometries can serve one "
@@ -370,7 +372,7 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
            cfg.k_scale_mode == recipe.k_scale_mode && cfg.v_scale_mode == recipe.v_scale_mode &&
            cfg.o_format == format_id(AttentionFormat::Bf16) &&
            cfg.o_scale_mode == scale_mode_id(AttentionScaleMode::None) && cfg.hdim_q == head_dim &&
-           cfg.hdim_v == head_dim && cfg.mask == 0 && cfg.mode == mode &&
+           cfg.hdim_v == head_dim && cfg.mask == mask && cfg.mode == mode &&
            (ts_qo == 0 || cfg.ts_qo == ts_qo) && (ts_kv == 0 || cfg.ts_kv == ts_kv))
             return cfg;
     }
@@ -395,7 +397,9 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
                 head_dim,
                 ", mode=",
                 mode,
-                " (0=dense, 1=sorted-sparse, 2=sol-attn), tile=",
+                " (0=dense, 1=sorted-sparse, 2=sol-attn, 3=varlen), mask=",
+                mask,
+                " (0=none, 1=causal), tile=",
                 ts_qo,
                 "x",
                 ts_kv);
@@ -1446,6 +1450,132 @@ void fmha_v4_fwd(const at::Tensor& q,
     const int gdx            = (shapes.seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
     const int gdy            = shapes.nhead_q;
     const int gdz            = shapes.batch;
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    kernel.launch_kernel({&args, &arg_size, gdx, gdy, gdz, workgroup_size_for(cfg), 1, 1, stream});
+}
+
+void fmha_v4_fwd_varlen(const at::Tensor& q,
+                        const at::Tensor& k,
+                        const at::Tensor& v,
+                        at::Tensor out,
+                        const at::Tensor& cu_seqlens,
+                        int64_t max_seqlen,
+                        double softmax_scale,
+                        bool causal,
+                        std::optional<at::Tensor> lse)
+{
+    // A 4-D out [kv_splits, total_tokens, heads, head_dim] splits each Q tile's KV range into
+    // kv_splits slices; slice i writes its normalized O to out[i] and its LSE to lse[i], and the
+    // caller merges them by LSE.
+    const bool split_kv     = out.dim() == 4;
+    const int64_t kv_splits = split_kv ? out.size(0) : 1;
+    const at::Tensor out0   = split_kv ? out.select(0, 0) : out;
+    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && out0.dim() == 3,
+                "varlen MHA v4 takes packed [total_tokens, heads, head_dim] Q/K/V/out");
+    TORCH_CHECK(kv_splits >= 1, "varlen MHA v4 needs kv_splits >= 1");
+    for(const at::Tensor* t : {&q, &k, &v, &out0})
+    {
+        TORCH_CHECK(t->is_cuda() && t->get_device() == q.get_device(),
+                    "varlen MHA v4 operands must be GPU tensors on one device");
+        TORCH_CHECK(t->scalar_type() == at::ScalarType::BFloat16, "varlen MHA v4 is BF16 only");
+        TORCH_CHECK(t->stride(2) == 1, "varlen MHA v4 needs unit-stride head_dim");
+    }
+    const int64_t total    = q.size(0);
+    const int64_t nhead_q  = q.size(1);
+    const int64_t nhead_k  = k.size(1);
+    const int64_t head_dim = q.size(2);
+    TORCH_CHECK(k.size(0) == total && v.size(0) == total && out0.sizes() == q.sizes(),
+                "varlen MHA v4 needs whole documents: Q/K/V/out share total_tokens");
+    TORCH_CHECK(v.size(1) == nhead_k && k.size(2) == head_dim && v.size(2) == head_dim,
+                "varlen MHA v4 K/V must share heads and head_dim with Q");
+    TORCH_CHECK(nhead_k > 0 && nhead_q % nhead_k == 0,
+                "varlen MHA v4 query heads must be a multiple of KV heads");
+    TORCH_CHECK(cu_seqlens.is_cuda() && cu_seqlens.get_device() == q.get_device() &&
+                    cu_seqlens.scalar_type() == at::kInt && cu_seqlens.dim() == 1 &&
+                    cu_seqlens.is_contiguous() && cu_seqlens.numel() >= 2,
+                "varlen MHA v4 cu_seqlens must be a contiguous int32 GPU tensor [batch + 1]");
+    // Contents stay the caller's contract: bounding them on the host would synchronize the launch.
+    TORCH_CHECK(max_seqlen > 0, "varlen MHA v4 needs max_seqlen > 0");
+    const int64_t batch = cu_seqlens.numel() - 1;
+
+    const HipDeviceGuard device_guard{q.get_device()};
+    const auto arch = get_gpu_arch();
+    const MhaV4Recipe recipe{format_id(AttentionFormat::Bf16),
+                             format_id(AttentionFormat::Bf16),
+                             format_id(AttentionFormat::Bf16),
+                             pack_id(AttentionPack::Default),
+                             scale_mode_id(AttentionScaleMode::None),
+                             scale_mode_id(AttentionScaleMode::None),
+                             scale_mode_id(AttentionScaleMode::None)};
+    const auto& cfg = find_config(arch, recipe, /*mode=*/3, head_dim, 0, 0, /*mask=*/causal ? 1 : 0);
+
+    // Token offsets are 64-bit products inside the kernel; only per-token strides must fit u32.
+    FmhaV4Kernarg args{};
+    args.ptr_o.value = out.data_ptr();
+    args.ptr_q.value = q.data_ptr();
+    args.ptr_k.value = k.data_ptr();
+    args.ptr_v.value = v.data_ptr();
+    const float scale = static_cast<float>(softmax_scale);
+    std::memcpy(&args.scalar.value, &scale, sizeof(scale));
+    args.s_seq_len.value     = fit_u32(max_seqlen, "max_seqlen");
+    args.s_kv_seq_len.value  = args.s_seq_len.value;
+    args.s_Seqs.value        = byte_stride(q, 0, "Q token stride");
+    args.s_Hs.value          = byte_stride(q, 1, "Q head stride");
+    args.s_gqa.value         = fit_u32(nhead_q / nhead_k, "GQA ratio");
+    args.s_k_Seqs.value      = byte_stride(k, 0, "K token stride");
+    args.s_k_Hs.value        = byte_stride(k, 1, "K head stride");
+    args.s_qk_head_dim.value = head_dim;
+    args.s_v_head_dim.value  = head_dim;
+    args.s_q_head_num.value  = nhead_q;
+    args.s_v_Seqs.value      = byte_stride(v, 0, "V token stride");
+    args.s_v_Hs.value        = byte_stride(v, 1, "V head stride");
+    args.s_o_Seqs.value      = byte_stride(out0, 0, "output token stride");
+    args.s_o_Hs.value        = byte_stride(out0, 1, "output head stride");
+    args.ptr_qseq.value      = cu_seqlens.data_ptr();
+    args.ptr_kseq.value      = cu_seqlens.data_ptr();
+    TORCH_CHECK(!split_kv || lse.has_value(), "varlen MHA v4 KV splits need an LSE per split");
+    if(lse.has_value())
+    {
+        const at::Tensor& t = lse.value();
+        TORCH_CHECK(cfg.lse != 0, "varlen MHA v4 row ", cfg.knl_name, " has no LSE store");
+        const at::Tensor t0 = split_kv && t.dim() == 3 ? t.select(0, 0) : t;
+        TORCH_CHECK(t.is_cuda() && t.get_device() == q.get_device() &&
+                        t.scalar_type() == at::kFloat && t.dim() == (split_kv ? 3 : 2) &&
+                        (!split_kv || t.size(0) == kv_splits) && t0.size(0) == nhead_q &&
+                        t0.size(1) == total && t.is_contiguous(),
+                    "varlen MHA v4 LSE must be a contiguous float32 [",
+                    split_kv ? "kv_splits, " : "",
+                    "nhead_q, total_tokens], got ",
+                    t.sizes());
+        args.ptr_lse.value  = t.data_ptr();
+        args.s_lse.value    = 1;
+        args.s_lse_Hs.value = byte_stride(t0, 0, "LSE head stride");
+        if(split_kv)
+        {
+            // The varlen row reads its split count and per-split O / LSE byte strides as u32 at
+            // 0x1E0 / 0x1E4 / 0x1E8, inside the ptr_qseq_padding slot whole documents never use.
+            const uint32_t split_args[3] = {
+                fit_u32(kv_splits, "kv_splits"),
+                byte_stride(out, 0, "per-split output stride"),
+                byte_stride(t, 0, "per-split LSE stride")};
+            std::memcpy(reinterpret_cast<char*>(&args) + offsetof(FmhaV4Kernarg, ptr_qseq_padding),
+                        split_args,
+                        sizeof(split_args));
+        }
+    }
+
+    static SynchronizedCache<std::string, AiterAsmKernel> kernels;
+    const std::string cache_key = arch + "|" + cfg.knl_name + "|" + cfg.co_name;
+    auto& kernel                = kernels.get_or_create(
+        cache_key, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
+
+    // Causal rows pair Q tile i with tile n-1-i in one workgroup, so x covers half the tiles.
+    size_t arg_size          = sizeof(args);
+    const int64_t q_tiles    = (max_seqlen + cfg.ts_qo - 1) / cfg.ts_qo;
+    const int64_t q_groups   = causal ? (q_tiles + 1) / 2 : q_tiles;
+    const int gdx            = static_cast<int>(q_groups * kv_splits);
+    const int gdy            = static_cast<int>(nhead_q);
+    const int gdz            = static_cast<int>(batch);
     const hipStream_t stream = at::hip::getCurrentHIPStream();
     kernel.launch_kernel({&args, &arg_size, gdx, gdy, gdz, workgroup_size_for(cfg), 1, 1, stream});
 }

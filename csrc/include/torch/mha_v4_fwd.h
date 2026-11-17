@@ -28,6 +28,18 @@ void fmha_v4_fwd(const at::Tensor& q,
                  // nullopt to write none. Only rows whose manifest lse column is 1 can fill it.
                  std::optional<at::Tensor> lse = std::nullopt);
 
+// Packed whole-document (cu_seqlens) BF16 attention: Q/K/V/out [total_tokens, heads, head_dim],
+// cu_seqlens int32 [batch + 1], LSE float32 [nhead_q, total_tokens].
+void fmha_v4_fwd_varlen(const at::Tensor& q,
+                        const at::Tensor& k,
+                        const at::Tensor& v,
+                        at::Tensor out,
+                        const at::Tensor& cu_seqlens,
+                        int64_t max_seqlen,
+                        double softmax_scale,
+                        bool causal,
+                        std::optional<at::Tensor> lse = std::nullopt);
+
 // Sorted block-sparse sibling. Same packed operands as fmha_v4_fwd, plus a ragged LUT.
 // Builds the work table internally: longest LUT first unless AITER_MHA_V4_WORK_ORDER says
 // otherwise, and raster order when lut_count is uniform.
