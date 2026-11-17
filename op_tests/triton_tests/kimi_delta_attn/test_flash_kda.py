@@ -1336,6 +1336,7 @@ def test_positional_call_keeps_skipped_storage(monkeypatch):
         "checkpoint_state": None,
         "checkpoint_offsets": None,
         "checkpoint_state_indices": None,
+        "cu_seqlens_cpu": None,
     }
     params = inspect.signature(flash_kda_fwd).parameters
     assert by_name.keys() == params.keys()
@@ -1603,3 +1604,45 @@ def test_strided_beta_matches_packed(norm):
     chunk_kimi_delta_attn(**{**kw, "beta": beta})
     assert torch.equal(kw["out"], o_packed)
     assert torch.equal(kw["state_cache"], s_packed)
+
+
+@pytest.mark.parametrize("norm", [False, True])
+@pytest.mark.parametrize("lens", [[1112] * 7, [2136, 4608, 300], [6272] + [128] * 15])
+def test_cu_seqlens_cpu_matches_device_plan(lens, norm):
+    """Planning from a CPU copy of cu_seqlens gives the same result as reading
+    it back from the device."""
+    _, kw, _ = _checkpoint_call(lens, norm=norm)
+    cache0 = kw["state_cache"].clone()
+    chunk_kimi_delta_attn(**kw)
+    o_dev, s_dev = kw["out"].clone(), kw["state_cache"].clone()
+    kw["state_cache"].copy_(cache0)
+    chunk_kimi_delta_attn(**kw, cu_seqlens_cpu=kw["cu_seqlens"].cpu())
+    assert torch.equal(kw["out"], o_dev)
+    assert torch.equal(kw["state_cache"], s_dev)
+
+
+@pytest.mark.parametrize("checkpoints", [False, True])
+def test_cu_seqlens_cpu_call_does_not_sync(checkpoints):
+    """With cu_seqlens_cpu the gfx950 Gluon path never waits on the device."""
+    _skip_unless_gfx950_gluon()
+    lens = [2136, 4608, 300]
+    _, kw, _ = _checkpoint_call(lens, norm=True)
+    kw["cu_seqlens_cpu"] = kw["cu_seqlens"].cpu()
+    if checkpoints:
+        kw.update(
+            checkpoint_state=torch.zeros(3, 12, K_DIM, K_DIM, device=device),
+            checkpoint_offsets=torch.tensor([1536, 3072, 0], device=device).int(),
+        )
+    chunk_kimi_delta_attn(**kw)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        chunk_kimi_delta_attn(**kw)
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+
+
+def test_warmup_runs():
+    from aiter.ops.triton.kimi_delta_attn import warmup_chunk_kimi_delta_attn
+
+    warmup_chunk_kimi_delta_attn(beta_token_stride=12 * 3, state_row_stride=None)

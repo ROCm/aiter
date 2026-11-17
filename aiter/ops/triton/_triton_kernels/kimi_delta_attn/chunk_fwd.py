@@ -78,6 +78,7 @@ def chunk_delta_attn_fwd(
     checkpoint_state: torch.Tensor | None = None,
     checkpoint_offsets: torch.Tensor | None = None,
     checkpoint_state_indices: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
 ) -> tuple:
     """
     Forward pass for chunk_delta_attn.
@@ -161,7 +162,8 @@ def chunk_delta_attn_fwd(
             f"`chunk_size` must be either 32 or 64 for chunk_delta_attn, got {chunk_size}."
         )
 
-    if chunk_indices is None and cu_seqlens is not None:
+    host_plan = use_flash_kda and cu_seqlens_cpu is not None
+    if chunk_indices is None and cu_seqlens is not None and not host_plan:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
 
     if state_cache is not None and not use_flash_kda:
@@ -205,6 +207,7 @@ def chunk_delta_attn_fwd(
             checkpoint_state=checkpoint_state,
             checkpoint_offsets=checkpoint_offsets,
             checkpoint_state_indices=checkpoint_state_indices,
+            cu_seqlens_cpu=cu_seqlens_cpu,
         )
         return o, final_state, None, None, None, None, None, None, None
 

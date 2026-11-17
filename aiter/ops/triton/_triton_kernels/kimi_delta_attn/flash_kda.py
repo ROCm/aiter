@@ -48,6 +48,7 @@ Restrictions (the caller is expected to check these and fall back):
       each slot is dense ``[H, V, K]`` while ``stride(0)`` may be padded.
 """
 
+import ctypes
 import functools
 import math
 import os
@@ -1163,11 +1164,41 @@ def _check_checkpoints(state, offsets, indices, N, H, V, K):
             raise ValueError(f"{name} must be a contiguous integer [{N}] tensor")
 
 
-def _upload(rows, device):
+def _upload(rows, device, dtype=torch.int32):
     # Pinned and non-blocking: a pageable copy would wait for the GPU queue.
-    return torch.tensor(rows, dtype=torch.int32, pin_memory=True).to(
+    return torch.tensor(rows, dtype=dtype, pin_memory=True).to(
         device, non_blocking=True
     )
+
+
+_WORKSPACES = {}
+_C_INTS = {torch.int32: ctypes.c_int32, torch.int64: ctypes.c_int64}
+
+
+def _workspace(name, shape, dtype, device):
+    key = (name, str(device), torch.cuda.current_stream(device).cuda_stream)
+    buf, views = _WORKSPACES.get(key, (None, None))
+    view = None if views is None else views.get((shape, dtype))
+    if view is not None:
+        return view
+    n = math.prod(shape) * dtype.itemsize
+    if buf is None or buf.numel() < n:
+        buf, views = torch.empty(n, dtype=torch.uint8, device=device), {}
+        _WORKSPACES[key] = (buf, views)
+    if len(views) > 64:
+        views.clear()
+    views[(shape, dtype)] = view = buf[:n].view(dtype).view(shape)
+    return view
+
+
+@functools.lru_cache(maxsize=64)
+def _host_tiles(seqs, C, dtype, device):
+    ci, tiles = [], []
+    for n, (bos, eos) in enumerate(seqs):
+        for c in range(triton.cdiv(eos - bos, C)):
+            ci.append([n, c])
+            tiles.append([bos + c * C, min(C, eos - bos - c * C)])
+    return _upload(ci, device, dtype), _upload(tiles, device)
 
 
 @functools.lru_cache(maxsize=64)
@@ -1317,12 +1348,9 @@ def _build_segments(
         seq_seg_off.append(len(chunk_base))
         g_chunk += nch
 
-    desc = torch.tensor(
-        [chunk_base, nchunks, tok_base, tok_end, seq_id, is_last],
-        dtype=torch.int32,
-        device=device,
-    )
-    off = torch.tensor(seq_seg_off, dtype=torch.int32, device=device)
+    desc = _upload([chunk_base, nchunks, tok_base, tok_end, seq_id, is_last], device)
+    desc = tuple(desc.unbind(0))
+    off = _upload(seq_seg_off, device)
     max_per_seq = max(
         seq_seg_off[i + 1] - seq_seg_off[i] for i in range(len(seq_seg_off) - 1)
     )
@@ -1381,6 +1409,7 @@ def _check_paged_state_cache(
         "checkpoint_state",
         "checkpoint_offsets",
         "checkpoint_state_indices",
+        "cu_seqlens_cpu",
     )
 )
 def flash_kda_fwd(
@@ -1409,6 +1438,7 @@ def flash_kda_fwd(
     checkpoint_state: torch.Tensor | None = None,
     checkpoint_offsets: torch.Tensor | None = None,
     checkpoint_state_indices: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Two-kernel KDA forward, with an optional segmented (context parallel) scan.
@@ -1462,6 +1492,8 @@ def flash_kda_fwd(
                             sequence length writes nothing. gfx950 Gluon only.
         checkpoint_state_indices: Integer ``[N]`` destination row per sequence
                             (default: row ``n``); a negative row writes nothing.
+        cu_seqlens_cpu:     CPU copy of ``cu_seqlens``: the plan is built from it,
+                            with no device read-back.
 
     Returns:
         ``(o, final_state)`` with ``o`` shaped like ``v``. ``final_state`` is
@@ -1497,7 +1529,6 @@ def flash_kda_fwd(
 
     norm = out_gate is not None
     if norm:
-        norm_weight = norm_weight.to(torch.float32).contiguous()
         # The gate tiles are copied 16 B per lane: a token stride or base that is
         # not 16 B aligned takes a packed copy.
         if (
@@ -1545,12 +1576,29 @@ def flash_kda_fwd(
         g, stride_g = _tdm_operand(g, tdm and use_gluon_k1)
         v, stride_v = _tdm_operand(v, tdm and use_gluon_k2)
 
+    host_tiles = None
     if cu_seqlens is not None:
         if B != 1:
             raise ValueError(f"Varlen mode requires B=1, got {B}.")
+        N = cu_seqlens.numel() - 1
+        if cu_seqlens_cpu is not None:
+            c_int = _C_INTS.get(cu_seqlens_cpu.dtype)
+            if (
+                c_int is None
+                or cu_seqlens_cpu.device.type != "cpu"
+                or cu_seqlens_cpu.numel() != N + 1
+                or not cu_seqlens_cpu.is_contiguous()
+            ):
+                raise ValueError(
+                    f"cu_seqlens_cpu must be a contiguous int32/int64 CPU tensor of {N + 1}"
+                )
+            bounds = list((c_int * (N + 1)).from_address(cu_seqlens_cpu.data_ptr()))
+            host_seqs = tuple(zip(bounds[:-1], bounds[1:]))
+            host_tiles = _host_tiles(host_seqs, C, cu_seqlens.dtype, dev)
+            if chunk_indices is None:
+                chunk_indices = host_tiles[0]
         if chunk_indices is None:
             chunk_indices = prepare_chunk_indices(cu_seqlens, C)
-        N = cu_seqlens.numel() - 1
         NT = 0
         total_tiles = chunk_indices.shape[0]
     else:
@@ -1573,7 +1621,9 @@ def flash_kda_fwd(
             K=K,
         )
 
-    if cu_seqlens is not None:
+    if host_tiles is not None:
+        seqs = host_seqs
+    elif cu_seqlens is not None:
         seqs = _seq_bounds(cu_seqlens)
     else:
         seqs = tuple((b * T, b * T + T) for b in range(B))
@@ -1603,10 +1653,17 @@ def flash_kda_fwd(
     CM_OUT_STORE = "" if segmented else ".cs"
 
     ws_shape = (H * total_tiles, C, K)
-    ws_kd = torch.empty(ws_shape, dtype=torch.bfloat16, device=dev)
-    ws_qd = torch.empty(ws_shape, dtype=torch.bfloat16, device=dev)
-    ws_kr = torch.empty(ws_shape, dtype=torch.bfloat16, device=dev)
-    ws_gt = torch.empty(H * total_tiles, K, dtype=torch.float32, device=dev)
+    alloc = _workspace if gluon_pipeline else None
+
+    def scratch(name, shape, dtype):
+        if alloc is None:
+            return torch.empty(shape, dtype=dtype, device=dev)
+        return alloc(name, tuple(shape), dtype, dev)
+
+    ws_kd = scratch("kd", ws_shape, torch.bfloat16)
+    ws_qd = scratch("qd", ws_shape, torch.bfloat16)
+    ws_kr = scratch("kr", ws_shape, torch.bfloat16)
+    ws_gt = scratch("gt", (H * total_tiles, K), torch.float32)
     # fp16 rather than bf16, for the mantissa and not the range: the inverse the
     # prepare kernel writes here is bounded by 1, and K2 walks it through a
     # recurrence as long as the sequence, so the 8 mantissa bits of bf16 are what
@@ -1616,7 +1673,7 @@ def flash_kda_fwd(
     # it by 5x. Both are two bytes, and fp32 would cost 1.3-1.5x, since this is
     # read twice per chunk on K2's serial path. The CUTLASS FlashKDA picks fp16
     # here for the same reason.
-    ws_inv_mqk = torch.empty(H * total_tiles, 2 * C, C, dtype=torch.float16, device=dev)
+    ws_inv_mqk = scratch("inv", (H * total_tiles, 2 * C, C), torch.float16)
 
     # Only a segmented shape has a pass A. On gfx950, pass C's route is final
     # here when unsegmented; segmented, it is settled once the segment count is
@@ -1668,7 +1725,11 @@ def flash_kda_fwd(
             chunk_indices=(
                 chunk_indices
                 if cu_seqlens is None or not gluon_pipeline
-                else _tile_table(cu_seqlens, chunk_indices, C)
+                else (
+                    host_tiles[1]
+                    if host_tiles is not None
+                    else _tile_table(cu_seqlens, chunk_indices, C)
+                )
             ),
             scale=scale,
             lower_bound=lower_bound,
@@ -1778,7 +1839,15 @@ def flash_kda_fwd(
     }
     paged_args = {
         "state_cache": state_cache,
-        "state_indices": None if not paged else state_indices.to(torch.int32),
+        "state_indices": (
+            None
+            if not paged
+            else (
+                state_indices
+                if state_indices.dtype == torch.int32
+                else state_indices.to(torch.int32)
+            )
+        ),
         "has_initial_state": has_initial_state,
         "cache_stride": cache_stride,
     }
@@ -1811,8 +1880,8 @@ def flash_kda_fwd(
         # The Gluon scan takes bf16 b and fp8 A.
         b_ty = torch.bfloat16 if gluon_pipeline else torch.float32
         A_ty = torch.float8_e4m3fn if gluon_pipeline else torch.bfloat16
-        b_seg = torch.empty(num_segs, H, K, V, dtype=b_ty, device=dev)
-        A_seg = torch.empty(num_segs, H, K, K, dtype=A_ty, device=dev)
+        b_seg = scratch("b_seg", (num_segs, H, K, V), b_ty)
+        A_seg = scratch("A_seg", (num_segs, H, K, K), A_ty)
         if use_gluon_k2a and DEVICE_ARCH == "gfx1250":
             sched = _k2_gluon_schedule(V, num_segs, H)
             _g2.gluon_k2_ab_fused(
@@ -1948,9 +2017,7 @@ def flash_kda_fwd(
                     tab, rmax, nscan = _scf_table(nsegs, H, V // bv, dev)
                 n_fl = rmax * (num_segs + N) * H * (V // bv) * sched.num_warps
                 sflags, ep = _epoch_buf("scf", dev, n_fl, torch.int32)
-                h_in = torch.empty(
-                    rmax, num_segs, H, K, V, dtype=torch.bfloat16, device=dev
-                )
+                h_in = scratch("h_in", (rmax, num_segs, H, K, V), torch.bfloat16)
                 arch_args["scf"] = dict(
                     tab=tab,
                     RMAX=rmax,

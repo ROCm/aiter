@@ -1111,7 +1111,9 @@ def k2_c_gluon(
     if NORM:
         gl.static_assert(BW == V)
         s_ss = gl.allocate_shared_memory(gl.float32, [NUM_WARPS, C], SH_PLAIN)
-        w_n = gl.amd.cdna4.buffer_load(ptr=norm_w, offsets=o_w_t.to(gl.int32))
+        w_n = gl.amd.cdna4.buffer_load(ptr=norm_w, offsets=o_w_t.to(gl.int32)).to(
+            gl.float32
+        )
         o_p = gl.zeros([C, BW], gl.float32, MT)
         g_p = gl.zeros([C, BW], gate.dtype.element_ty, MT)
         t_p = tok_base
