@@ -40,9 +40,7 @@ _LAZY_IMPORTS = {
         "KERNEL_VARIANTS",
     ),
     "FlyQuickAllReduce": (".quick_allreduce", "FlyQuickAllReduce"),
-    # Old name of FlyQuickAllReduce, kept for vLLM's _aiter_ops.py. Remove it
-    # once vLLM imports FlyQuickAllReduce.
-    "QuickAllReduceInt4": (".quick_allreduce", "FlyQuickAllReduce"),
+    "QuickAllReduceInt4": (".quick_allreduce", "QuickAllReduceInt4"),
     "OneShotAllReduce": (".one_shot_allreduce", "OneShotAllReduce"),
     "DenseGemmConfig": (".gemm_a16wfp4", "DenseGemmConfig"),
     "PreshuffledA16WFP4Weight": (
@@ -131,6 +129,16 @@ _LAZY_IMPORTS = {
         ".kernels.qk_norm_rope_quant",
         "flydsl_qk_norm_rope_quant",
     ),
+    "CombineWorkspace": (".dcp_mailbox", "CombineWorkspace"),
+    "GatherWorkspace": (".dcp_mailbox", "GatherWorkspace"),
+    "dcp_lse_combine": (".dcp_mailbox", "dcp_lse_combine"),
+    "dcp_quant_query_gather": (".dcp_mailbox", "dcp_quant_query_gather"),
+    "dcp_query_gather": (".dcp_mailbox", "dcp_query_gather"),
+    "flydsl_rot_quant": (".kernels.rot_quant", "flydsl_rot_quant"),
+    "flydsl_rot_quant_moe_sort": (
+        ".kernels.rot_quant",
+        "flydsl_rot_quant_moe_sort",
+    ),
     "gather_kv_b_proj_flydsl": (
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl",
@@ -181,9 +189,21 @@ _LAZY_IMPORTS = {
         ".kernels.minimax_m3_index_score",
         "index_score_supported_fp4",
     ),
+    "minimax_m3_index_score_nvfp4_flydsl": (
+        ".kernels.minimax_m3_index_score",
+        "score_flydsl_nvfp4",
+    ),
+    "minimax_m3_index_score_nvfp4_flydsl_supported": (
+        ".kernels.minimax_m3_index_score",
+        "index_score_supported_nvfp4",
+    ),
     "minimax_m3_index_score_prefill_flydsl": (
         ".kernels.minimax_m3_index_score_prefill",
         "score_prefill_flydsl",
+    ),
+    "minimax_m3_index_score_prefill_nvfp4_flydsl": (
+        ".kernels.minimax_m3_index_score_prefill",
+        "score_prefill_flydsl_nvfp4",
     ),
     "minimax_m3_index_score_prefill_fp4_flydsl": (
         ".kernels.minimax_m3_index_score_prefill",
@@ -195,20 +215,37 @@ _LAZY_IMPORTS = {
         ".kernels.minimax_m3_index_score_prefill",
         "alloc_score",
     ),
+    "sparse_pa_nvfp4_decode": (
+        ".kernels.sparse_pa_nvfp4_decode",
+        "sparse_pa_nvfp4_decode",
+    ),
+    "sparse_pa_nvfp4_decode_alloc": (
+        ".kernels.sparse_pa_nvfp4_decode",
+        "sparse_pa_nvfp4_decode_alloc",
+    ),
+    "sparse_pa_nvfp4_prefill": (
+        ".kernels.sparse_pa_nvfp4_prefill",
+        "sparse_pa_nvfp4_prefill",
+    ),
 }
 
 __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
+    "CombineWorkspace",
     "DenseGemmConfig",
     "FlyQuickAllReduce",
     "Fp4MqaPlan",
     "GateMode",
+    "GatherWorkspace",
     "OneShotAllReduce",
     "PreshuffledA16WFP4Weight",
     "QuickAllReduceInt4",
     "a16wfp4_shape_supported",
     "compute_varqlen_windows",
+    "dcp_lse_combine",
+    "dcp_quant_query_gather",
+    "dcp_query_gather",
     "flydsl_conv_implicit",
     "flydsl_flash_attn_fp8_func",
     "flydsl_flash_attn_fp8_supported",
@@ -233,6 +270,8 @@ __all__ = [
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
+    "flydsl_rot_quant",
+    "flydsl_rot_quant_moe_sort",
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
@@ -242,15 +281,21 @@ __all__ = [
     "minimax_m3_index_score_flydsl_supported",
     "minimax_m3_index_score_fp4_flydsl",
     "minimax_m3_index_score_fp4_flydsl_supported",
+    "minimax_m3_index_score_nvfp4_flydsl",
+    "minimax_m3_index_score_nvfp4_flydsl_supported",
     "minimax_m3_index_score_prefill_alloc",
     "minimax_m3_index_score_prefill_flydsl",
     "minimax_m3_index_score_prefill_fp4_flydsl",
+    "minimax_m3_index_score_prefill_nvfp4_flydsl",
     "minimax_m3_index_score_work_map",
     "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
     "pa_decode",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
+    "sparse_pa_nvfp4_decode",
+    "sparse_pa_nvfp4_decode_alloc",
+    "sparse_pa_nvfp4_prefill",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
