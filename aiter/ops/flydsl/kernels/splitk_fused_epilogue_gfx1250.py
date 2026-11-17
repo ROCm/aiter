@@ -36,7 +36,6 @@ def emit_fused_splitk_epilogue(
     split_idx,
     mn_oob,
     flat_tile,
-    bounded_m=False,
     n_oob=None,
 ):
     """Reduce disjoint row ranges using all of a tile's split-K workgroups.
@@ -110,7 +109,8 @@ def emit_fused_splitk_epilogue(
     )
     remaining = mn_oob - reduce_row
     valid_rows = (remaining > 0).select(remaining, fx.Int32(0))
-    if const_expr(lean and bounded_m and n_oob is None):
+    if const_expr(lean and n_oob is None):
+        # The descriptor's record count drops the stores of rows past M, tail tile or not.
         output_buffer = ptr_buf_tensor(
             output_base,
             elem,
@@ -213,7 +213,7 @@ def emit_fused_splitk_epilogue(
                                     acc[j].to(elem),
                                     output_base + row * ldc64 + col + j,
                                 )
-            elif const_expr(bounded_m):
+            else:
                 buf_copy_store(
                     output_buffer,
                     row * fx.Int32(ldc64 // vec) + col // vec,
@@ -221,8 +221,6 @@ def emit_fused_splitk_epilogue(
                     elem,
                     vec,
                 )
-            else:
-                fx.ptr_store(acc.to(elem), output_base + row * ldc64 + col)
 
     if const_expr(not lean):
         workgroup_barrier(use_cluster=False)
