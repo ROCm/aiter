@@ -22,8 +22,6 @@ higher number. The sequence layout runs a two-pass kernel and therefore reads
 the residual twice; its real HBM throughput is about 2x the reported value.
 """
 
-import sys
-
 import torch
 import triton
 
@@ -162,7 +160,7 @@ def run_benchmark(args):
     bench_fn.run(save_path="." if args.o else None, print_data=True)
 
 
-def parse_args():
+def parse_args(argv: list[str] | None = None):
     parser = get_parser(kernel_name="attention-residual")
     parser.add_argument("-N", type=int, default=None, help="Number of tokens")
     parser.add_argument("-D", type=int, default=None, help="Hidden size")
@@ -242,18 +240,17 @@ def parse_args():
     parser.add_argument(
         "-o", action="store_true", default=False, help="Write results to a CSV file"
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main():
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     if args.print_vgpr:
         print("Retrieving VGPR usage for attn_res Triton kernels...")
         print_vgpr(lambda: run_benchmark(args), get_caller_name_no_ext())
-        return 0
+        return
     run_benchmark(args)
-    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

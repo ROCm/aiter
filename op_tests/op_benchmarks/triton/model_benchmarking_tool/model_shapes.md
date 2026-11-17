@@ -148,6 +148,22 @@ support the `time` and `bandwidth` metrics on gfx950 and gfx1250. The
 benchmarks report memory throughput, so the tool does not run them for the
 TFLOPS `throughput` metric.
 
+### Attention residuals (`attn_res`)
+
+| Field         | Type   | Description                                                           |
+|---------------|--------|-----------------------------------------------------------------------|
+| `D`           | int    | Hidden size.                                                          |
+| `L`           | int    | Number of residual candidates, including the prefix.                  |
+| `op`          | string | Optional. `"gate"` for inference or `"fwd"`. The default is `"gate"`. |
+| `layout`      | string | Optional. Layout for `"fwd"`: `"packed"` or `"sequence"`.             |
+| `add_hidden`  | bool   | Optional. Fuse the first hidden-state add.                            |
+| `add_hidden2` | bool   | Optional. Fuse a second hidden-state add.                             |
+| `close_block` | bool   | Optional. Fuse the block close operation.                             |
+| `onorm`       | bool   | Optional. Enable output RMSNorm.                                      |
+
+Attention-residual shapes are replicated and are not divided by TP. The
+benchmark supports the `time` and `bandwidth` metrics.
+
 ## Example
 
 ```json
