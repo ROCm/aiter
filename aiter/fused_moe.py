@@ -666,9 +666,10 @@ def _moe_sort_scratch(device, num_sorted, num_blocks, ws_size):
     """`(sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids,
     workspace)` for a sort whose outputs fused_moe consumes before it returns.
 
-    The next call on the same stream is ordered after that, so it can take the
-    same memory: the sort writes every element the stages read, and the Opus
-    API clears its workspace itself. Kept per stream, so calls on two streams
+    The next call on the same stream is ordered after that (threads sharing a
+    stream must not interleave inside fused_moe), so it can take the same
+    memory: the sort writes every element the stages read, and the Opus API
+    clears its workspace itself. Kept per stream, so calls on two streams
     never share it. The caller allocates instead while a CUDA graph captures,
     so no graph records these addresses.
     """
@@ -719,6 +720,7 @@ def _moe_sorting_impl(
     accumulate=True,
     output_aux=False,
     output=None,
+    *,
     scratch=False,
 ):
     device = topk_ids.device
@@ -960,6 +962,7 @@ def moe_sorting(
     flat: AsmMoeMode | int = AsmMoeMode.SORTED,
     output_aux=False,
     output=None,
+    *,
     _scratch=False,
 ):
     """``_scratch``: the caller consumes the sort outputs before it returns, so
@@ -1613,6 +1616,7 @@ def fused_moe_g1u1_bf16_small_m_direct(
     return output
 
 
+_BF16_G1U1_SMALL_M_DIRECT_GFX = "gfx1201"
 _BF16_G1U1_SMALL_M_DIRECT_SHUFFLE_LAYOUT = (16, 16)
 _BF16_G1U1_SMALL_M_DIRECT_ALLOWED_M = (1, 2, 3, 4, 8, 16)
 _BF16_G1U1_SMALL_M_DIRECT_MODEL_DIM = 2048
@@ -1665,7 +1669,7 @@ def _can_use_bf16_g1u1_small_m_direct(
     topk = topk_ids.shape[1]
     inter_dim = w2.shape[2]
     return (
-        get_gfx_runtime() == "gfx1201"
+        get_gfx_runtime() == _BF16_G1U1_SMALL_M_DIRECT_GFX
         and quant_type == QuantType.No
         and activation == ActivationType.Silu
         and dtype == dtypes.bf16
@@ -2537,15 +2541,17 @@ def _fused_moe_impl(
         need_local_topk_ids,
     )
     # Kept only where the plan is a function of plan_key: one plain config
-    # lookup, and none of the paths that decide per call -- the gfx1250 grouped
-    # path, the MXFP4 / gfx1250 activation dtype (read from the environment),
-    # and the MXMOE / inline-sort checks on the tensors.
+    # lookup, and none of the paths that decide per call -- the gfx1201
+    # small-M direct path (on arguments the key leaves out), the gfx1250
+    # grouped path, the MXFP4 / gfx1250 activation dtype (read from the
+    # environment), and the MXMOE / inline-sort checks on the tensors.
     if (
         plan_key is not None
         and cfg_lookups == 1
         and gate_mode != GateMode.INTERLEAVE
         and quant_type != QuantType.per_1x32
-        and get_gfx_runtime() not in ("gfx1250", "gfx1250-strict")
+        and get_gfx_runtime()
+        not in (_BF16_G1U1_SMALL_M_DIRECT_GFX, "gfx1250", "gfx1250-strict")
         and not _is_mxmoe_opus_metadata(metadata)
         and not _is_mxfp4_inline_sort(metadata)
     ):
