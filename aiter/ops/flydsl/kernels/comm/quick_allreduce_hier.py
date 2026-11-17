@@ -9,32 +9,43 @@ two groups are *partners*. One super-tile group of tiles takes three laps:
 
 1. **Local reduce-scatter.** A tile's ``ATOMS`` atoms split into ``G`` chunks
    of ``ATOMS / G`` atoms; chunk ``l`` belongs to local index ``l``. Each rank
-   pushes every other chunk to its owner in the group, mesh style, and adds
-   the ``G - 1`` it receives to its own chunk, which stays in registers.
+   ends the lap with its group's partial sum of its own chunk.
 2. **Cross exchange.** Each rank quantizes its group's partial sum and sends
    it to its partner, a one-shot between two ranks, and also into its own
    inbox. Both partners then evaluate ``dq(P_group0) + dq(P_group1)`` from the
    same two packets in the same order, so they hold bit-identical sums.
-3. **Local all-gather.** Each rank quantizes the sum once and pushes it to
-   the ``G - 1`` other ranks of its group, mesh style, and decodes its own
-   chunk from the same packet. All ``N`` ranks end with the same bits.
+3. **Local all-gather.** Each rank quantizes the sum once, decodes its own
+   chunk from that packet, and the group passes the packets around. All ``N``
+   ranks decode the same packets, so they end with the same bits.
+
+Each local lap runs one of two schedules inside the group (``local_rs``,
+``local_ag``):
+
+* ``"mesh"``: one hop. Each rank pushes every chunk it does not own straight
+  to its owner (reduce-scatter), or its own chunk to every other rank of the
+  group (all-gather). Every value is quantized once on the lap.
+* ``"ring"``: ``G - 1`` hops to the next rank of the group, each a single
+  contiguous run into one inbox, as in the ring kernel. The reduce-scatter
+  requantizes the running partial at every hop; the all-gather forwards the
+  bytes it received untouched, so it adds one quantization, as the mesh does.
 
 Only lap 2 crosses between groups: ``1/G`` of a tile per rank, on ``G``
 concurrent pair streams, instead of the mesh's fanout to every remote peer or
 the ring's single crossing stream. Laps 1 and 3 move the bytes of a TP``G``
-mesh inside each group. Every value is quantized three times, once per lap,
-each lap with its own codec.
+mesh or ring inside each group. Each lap has its own codec.
 
-Handshakes are per lap and per super-tile group, in a 64 B sector at the tail
+Handshakes are per hop and per super-tile group, in a 64 B sector at the tail
 of each inbox slot, as in the ring. The mesh's single-colour argument -- a
 peer cannot write group ``i + 1`` into a slot before we have read group ``i``
--- holds for the two local laps, whose next write needs a send of ours that
-comes after our read. It does not hold for the cross slot: once our partner
-has our group ``i`` packet it can finish group ``i`` and run group ``i + 1``'s
-local reduce-scatter inside its own group without us, and send its next cross
-packet. The cross slots are therefore double-buffered by the parity of the
-colour; group ``i + 2`` cannot arrive before we have sent ``i + 1``, which is
-after we read ``i``.
+-- holds for the local laps of either schedule: every local slot's next write
+needs a send of ours that comes after our read (a group's all-gather needs
+every rank's chunk, and its reduce-scatter every rank's contribution). It
+does not hold for the cross slot: once our partner has our group ``i`` packet
+it can finish group ``i`` and run group ``i + 1``'s local reduce-scatter
+inside its own group without us, and send its next cross packet. The cross
+slots are therefore double-buffered by the parity of the colour; group
+``i + 2`` cannot arrive before we have sent ``i + 1``, which is after we read
+``i``.
 """
 
 import flydsl.compiler as flyc
@@ -42,8 +53,9 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from ...allreduce_policy import HIER_CODECS, HIER_SUPER_TILES
+from ...allreduce_policy import HIER_CODECS, HIER_LOCAL_SCHEDULES, HIER_SUPER_TILES
 from .quick_allreduce_codec import (
+    GROUP,
     SCALE_CODEC_TAG,
     _clamp_fp16_overflow,
     _codec_dequant,
@@ -103,9 +115,26 @@ def check_groups(groups, world_size: int) -> tuple[tuple[int, ...], ...]:
     return groups
 
 
+def check_local_schedule(label: str, schedule: str) -> str:
+    """*schedule* if a local lap can run it, or raise."""
+    if schedule not in HIER_LOCAL_SCHEDULES:
+        raise ValueError(
+            f"{label} must be one of {HIER_LOCAL_SCHEDULES}, got {schedule!r}"
+        )
+    return schedule
+
+
+def _local_rows(schedule: str, group_size: int) -> int:
+    """Pack rows of a local lap, in units of ``ATOMS / G`` rank-tiles: one
+    destination per hop on the ring, ``G - 1`` at once on the mesh."""
+    return int(group_size) - 1 if schedule == "mesh" else 1
+
+
 def hier_fanout_quads(block: int, group_size: int, codecs) -> tuple[int, int]:
-    """``(quads the block has, quads the local fanout needs)``. A block with
-    fewer would drop the sectors past the end."""
+    """``(quads the block has, quads the local fanout needs)``, for the
+    *codecs* of the laps that run the mesh. A block with fewer would drop the
+    sectors past the end. The ring's one destination stores in rounds, so it
+    fits any block."""
     have = int(block) // QUAD_LANES
     need = 0
     for name in codecs:
@@ -114,16 +143,26 @@ def hier_fanout_quads(block: int, group_size: int, codecs) -> tuple[int, int]:
     return have, need
 
 
-def hier_lds_bytes(block: int, group_size: int, rs_codec, x_codec, ag_codec) -> int:
-    """LDS of one workgroup: the larger of the local laps' ``(G - 1)``
-    destinations and the cross lap's one, ``ATOMS / G`` rank-tiles each."""
+def hier_lds_bytes(
+    block: int,
+    group_size: int,
+    rs_codec,
+    x_codec,
+    ag_codec,
+    local_rs: str = "mesh",
+    local_ag: str = "mesh",
+) -> int:
+    """LDS of one workgroup: the largest of the laps' staging, ``ATOMS / G``
+    rank-tiles per destination. A mesh lap stages ``G - 1`` destinations, a
+    ring hop and the cross lap one."""
     cs = codecs_for_block(int(block))
     rank_atoms = ATOMS // int(group_size)
-    local = (int(group_size) - 1) * rank_atoms
-    return 4 * max(
-        local * max(cs[rs_codec].rank_tile_i32, cs[ag_codec].rank_tile_i32),
-        rank_atoms * cs[x_codec].rank_tile_i32,
+    widest = max(
+        _local_rows(local_rs, group_size) * cs[rs_codec].rank_tile_i32,
+        cs[x_codec].rank_tile_i32,
+        _local_rows(local_ag, group_size) * cs[ag_codec].rank_tile_i32,
     )
+    return 4 * rank_atoms * widest
 
 
 def make_quick_allreduce_hier_kernel(
@@ -138,12 +177,16 @@ def make_quick_allreduce_hier_kernel(
     x_codec: str,
     ag_codec: str,
     block: int,
+    local_rs: str = "mesh",
+    local_ag: str = "mesh",
 ):
     """Build the hierarchical kernel for one *rank*.
 
     *groups* is two tuples of ranks; partners sit at the same position of the
     sorted groups. The rank, its group, its local peers and its partner are
-    all trace-time constants, so this is one binary per rank.
+    all trace-time constants, so this is one binary per rank. *local_rs* and
+    *local_ag* pick the schedule of the two local laps, ``"mesh"`` or
+    ``"ring"``.
     """
     groups = check_groups(groups, world_size)
     if not 0 <= int(rank) < world_size:
@@ -163,6 +206,10 @@ def make_quick_allreduce_hier_kernel(
         )
     if grid < 1:
         raise ValueError(f"grid must be positive, got {grid}")
+    check_local_schedule("local_rs", local_rs)
+    check_local_schedule("local_ag", local_ag)
+    rs_ring = local_rs == "ring"
+    ag_ring = local_ag == "ring"
 
     epilogue = QuickReducePlainEpilogue(block=block, world_size=len(groups[0]))
     block = epilogue.block
@@ -175,6 +222,8 @@ def make_quick_allreduce_hier_kernel(
     G = len(local)
     li = local.index(self_rank)
     partner = groups[1 - my_group][li]
+    # The ring successor inside the group, for the local laps that run the ring.
+    nxt = local[(li + 1) % G]
     # Local peers in local-index order; every per-destination structure of a
     # local lap -- pack rows, fanout quads, flag lanes -- is indexed by
     # position in this list.
@@ -183,7 +232,10 @@ def make_quick_allreduce_hier_kernel(
     n_push = len(push_ranks)
     rank_atoms = ATOMS // G
 
-    have, need = hier_fanout_quads(block, G, (rs_codec, ag_codec))
+    mesh_codecs = [
+        c for c, ring in ((rs_codec, rs_ring), (ag_codec, ag_ring)) if not ring
+    ]
+    have, need = hier_fanout_quads(block, G, mesh_codecs)
     if have < need:
         raise ValueError(
             f"block={block} has {have} quads, under the {need} the local fanout "
@@ -211,14 +263,20 @@ def make_quick_allreduce_hier_kernel(
     rs_payload, rs_release, rs_slot = _slot(rs)
     x_payload, x_release, x_slot = _slot(xc)
     ag_payload, ag_release, ag_slot = _slot(ag)
-    # LOCAL_RS [grid][G src], CROSS [2 parity][grid][2 groups],
-    # LOCAL_AG [grid][G src].
+    # A local lap's slots per block: on the mesh one per source local index,
+    # on the ring one per hop, each written only by the ring predecessor.
+    rs_n = G - 1 if rs_ring else G
+    ag_n = G - 1 if ag_ring else G
+    # LOCAL_RS [grid][rs_n], CROSS [2 parity][grid][2 groups],
+    # LOCAL_AG [grid][ag_n].
     rs_base = 0
-    x_base = rs_base + grid * G * rs_slot
+    x_base = rs_base + grid * rs_n * rs_slot
     ag_base = x_base + 2 * grid * 2 * x_slot
-    inbox_i32 = ag_base + grid * G * ag_slot
+    inbox_i32 = ag_base + grid * ag_n * ag_slot
 
-    lds_bytes = hier_lds_bytes(block, G, rs_codec, x_codec, ag_codec)
+    lds_bytes = hier_lds_bytes(
+        block, G, rs_codec, x_codec, ag_codec, local_rs, local_ag
+    )
     PackStorage = make_pack_storage(lds_bytes // 4)
 
     @flyc.kernel(known_block_size=[block, 1, 1])
@@ -259,6 +317,7 @@ def make_quick_allreduce_hier_kernel(
         peers = _load_peers(peer_ptrs, world_size)
         self_base = peers[self_rank]
         partner_base = peers[partner]
+        next_base = peers[nxt]
         inbox = _buffer_ptr(_to_sgpr_i64(self_base), T.i32, 4)
 
         ep = epilogue.bind(
@@ -271,6 +330,7 @@ def make_quick_allreduce_hier_kernel(
         # Bare names, not ``ep.<hook>(...)``; see the mesh kernel.
         _load_atom = ep.load_atom
         _stash_own = ep.stash_own
+        _complete = ep.complete
         _unstash_own = ep.unstash_own
         _finish_tile = ep.finish_tile
         _load_color, _store_color = _color_io(colors_ptr, bid)
@@ -284,18 +344,19 @@ def make_quick_allreduce_hier_kernel(
 
         # Slot offsets, by arithmetic rather than a layout: at G = 4 or 8 a
         # unit mode would not survive coalescing (see the ring kernel).
-        def _local_slot(base, slot, payload, src, sub):
+        def _local_slot(base, slot, payload, n, idx, sub):
             return (
                 fx.Int32(base)
-                + (bid * fx.Int32(G) + src) * fx.Int32(slot)
+                + (bid * fx.Int32(n) + idx) * fx.Int32(slot)
                 + sub * fx.Int32(payload)
             )
 
-        def _rs_slot(src, sub):
-            return _local_slot(rs_base, rs_slot, rs_payload, src, sub)
+        def _rs_slot(idx, sub):
+            """Mesh: *idx* is the source local index. Ring: the hop."""
+            return _local_slot(rs_base, rs_slot, rs_payload, rs_n, idx, sub)
 
-        def _ag_slot(src, sub):
-            return _local_slot(ag_base, ag_slot, ag_payload, src, sub)
+        def _ag_slot(idx, sub):
+            return _local_slot(ag_base, ag_slot, ag_payload, ag_n, idx, sub)
 
         def _x_slot(parity, grp, sub):
             return (
@@ -316,13 +377,18 @@ def make_quick_allreduce_hier_kernel(
                         scale, pack, (row, fx.Int32(c.scale_i32_off) + scale_slot)
                     )
 
-        def _recv(c, base):
-            """One packet of codec *c* from our inbox at i32 offset *base*."""
+        def _recv_raw(c, base):
+            """One packet of codec *c* from our inbox at i32 offset *base*,
+            undecoded, as the ring's all-gather forwards it."""
 
             def _get(off):
                 return _buffer_load(inbox, base + off, 1, fx.Int32, recv_policy)[0]
 
-            words, word = _codec_load(c, _get, tid, scale_slot)
+            return _codec_load(c, _get, tid, scale_slot)
+
+        def _recv(c, base):
+            """One packet of codec *c* from our inbox at i32 offset *base*."""
+            words, word = _recv_raw(c, base)
             return words, _scale_from_word(c, word, pair_in_slot)
 
         def _fanout_local(c, slot_i32):
@@ -404,11 +470,13 @@ def make_quick_allreduce_hier_kernel(
                     _push_base(safe) + _i32_to_bytes(elem), color, flag_policy
                 )
 
-        def _publish_partner(flag_i32, color):
+        def _publish_one(dest_base, flag_i32, color):
+            """Colour the flag at *flag_i32* in one destination: the partner,
+            or the ring successor."""
             _drain()
             if tid < fx.Int32(FLAG_LANES):
                 elem = flag_i32 + tid * fx.Int32(FLAG_I32_PER_LANE)
-                _store_flag_peer(partner_base + _i32_to_bytes(elem), color, flag_policy)
+                _store_flag_peer(dest_base + _i32_to_bytes(elem), color, flag_policy)
 
         def _spin(flag_i32, color):
             flag = self_base + _i32_to_bytes(flag_i32)
@@ -420,6 +488,12 @@ def make_quick_allreduce_hier_kernel(
             # After the join, for every wave; see the mesh's _wait_release.
             gpu.barrier()
             _acquire_inbox(acquire_scope)
+
+        def _wait_one(flag_i32, color):
+            """One source: thread 0 spins on the flag at *flag_i32*."""
+            if tid == fx.Int32(0):
+                _spin(flag_i32, color)
+            _acquire()
 
         def _wait_local(slot_fn, release_i32, color):
             """Lane ``t`` spins on the ``t``-th local source's flag."""
@@ -440,16 +514,9 @@ def make_quick_allreduce_hier_kernel(
                 fx.Int32,
             )
 
-        n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
-        color = _load_color()
-        st_i = fx.Int32(super_tile)
-        for i in range(fx.Int32(0), n_block_tiles, st_i):
-            remain = n_block_tiles - i
-            n_this = (remain < st_i).select(remain, st_i)
-            parity = color & fx.Int32(1)
-
-            # Lap 1: local reduce-scatter. Quantize each local peer's chunk
-            # and push it; our own chunk is reloaded in lap 2.
+        def _rs_mesh(i, n_this, color):
+            """Lap 1 on the mesh: quantize each local peer's chunk and push
+            it; our own chunk is reloaded in lap 2."""
             for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                 tile = bid + (i + s) * n_blocks
                 for j in range_constexpr(n_push):
@@ -467,75 +534,82 @@ def make_quick_allreduce_hier_kernel(
             )
             _wait_local(_rs_slot, rs_release, color)
 
-            # Lap 2: sum the group's chunk in local-index order, then send the
-            # partial to the partner and to our own cross slot.
-            for s in range(fx.Int32(0), n_this, fx.Int32(1)):
-                tile = bid + (i + s) * n_blocks
-                for k in range_constexpr(rank_atoms):
-                    acc = None
-                    for m in range_constexpr(G):
-                        if const_expr(m == li):
-                            own = _own_share(tile, k)
-                            if const_expr(acc is None):
-                                acc = own
-                            else:
-                                acc = _add_f16(own, acc)
-                        else:
+        def _rs_ring(i, n_this, color):
+            """Lap 1 on the ring: hops ``1 .. G-1``. Hop ``h`` adds our share
+            of chunk ``li - h`` to the partial that came in on hop ``h - 1``
+            (hop 1 starts from our share alone) and sends it into slot
+            ``h - 1`` of the successor. The last hop into us carries the
+            partial of our own chunk, which lap 2 completes."""
+            for _h in range_constexpr(G - 1):
+                h = _h + 1
+                chunk = (li - h) % G
+                if const_expr(h >= 2):
+                    _wait_one(
+                        _rs_slot(fx.Int32(h - 2), fx.Int32(0)) + fx.Int32(rs_release),
+                        color,
+                    )
+                else:
+                    pass  # hop 1 is a pure send
+                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                    tile = bid + (i + s) * n_blocks
+                    for k in range_constexpr(rank_atoms):
+                        acc = _load_atom(tile, chunk * rank_atoms + k)
+                        if const_expr(h >= 2):
                             words, scale = _recv(
                                 rs,
-                                _rs_slot(fx.Int32(m), s)
+                                _rs_slot(fx.Int32(h - 2), s)
                                 + fx.Int32(k * rs.rank_tile_i32),
                             )
                             acc = _codec_dequant(rs, words, scale, tid, acc)
-                    words, scale, is_leader = _codec_quant(xc, acc, lane, tid)
-                    _lds_write_packet(xc, fx.Int32(k), words, scale, is_leader)
-                gpu.barrier()
-                _store_rows(xc, partner_base, _x_slot(parity, my_group, s))
-                _store_rows(xc, self_base, _x_slot(parity, my_group, s))
-                _next_subtile(s, n_this)
-            _publish_partner(
-                _x_slot(parity, my_group, fx.Int32(0)) + fx.Int32(x_release), color
-            )
-            if tid == fx.Int32(0):
-                _spin(
-                    _x_slot(parity, 1 - my_group, fx.Int32(0)) + fx.Int32(x_release),
+                        else:
+                            pass
+                        words, scale, is_leader = _codec_quant(rs, acc, lane, tid)
+                        _lds_write_packet(rs, fx.Int32(k), words, scale, is_leader)
+                    gpu.barrier()
+                    _store_rows(rs, next_base, _rs_slot(fx.Int32(h - 1), s))
+                    _next_subtile(s, n_this)
+                _publish_one(
+                    next_base,
+                    _rs_slot(fx.Int32(h - 1), fx.Int32(0)) + fx.Int32(rs_release),
                     color,
                 )
-            _acquire()
+            _wait_one(
+                _rs_slot(fx.Int32(G - 2), fx.Int32(0)) + fx.Int32(rs_release), color
+            )
 
-            # Lap 3: the final sum, group 0's packet first on both partners,
-            # quantized once and pushed to every local peer. Our own chunk is
-            # decoded from the same packet and stored now.
-            for s in range(fx.Int32(0), n_this, fx.Int32(1)):
-                tile = bid + (i + s) * n_blocks
-                for k in range_constexpr(rank_atoms):
-                    acc = None
-                    for g in range_constexpr(2):
+        def _group_partial(tile, s, k):
+            """Our group's partial sum of atom *k* of our own chunk."""
+            if const_expr(rs_ring):
+                # The ring's last hop: the other G - 1 contributions, plus ours.
+                words, scale = _recv(
+                    rs, _rs_slot(fx.Int32(G - 2), s) + fx.Int32(k * rs.rank_tile_i32)
+                )
+                acc = _codec_dequant(rs, words, scale, tid, _own_share(tile, k))
+            else:
+                # In local-index order.
+                acc = None
+                for m in range_constexpr(G):
+                    if const_expr(m == li):
+                        own = _own_share(tile, k)
+                        if const_expr(acc is None):
+                            acc = own
+                        else:
+                            acc = _add_f16(own, acc)
+                    else:
                         words, scale = _recv(
-                            xc, _x_slot(parity, g, s) + fx.Int32(k * xc.rank_tile_i32)
+                            rs,
+                            _rs_slot(fx.Int32(m), s) + fx.Int32(k * rs.rank_tile_i32),
                         )
-                        acc = _codec_dequant(xc, words, scale, tid, acc)
-                    words, scale, is_leader = _codec_quant(ag, acc, lane, tid)
-                    for j in range_constexpr(n_push):
-                        _lds_write_packet(
-                            ag, fx.Int32(j * rank_atoms + k), words, scale, is_leader
-                        )
-                    _stash_own(
-                        tile,
-                        li * rank_atoms + k,
-                        _codec_dequant(
-                            ag, words, _scale_from_word(ag, scale, pair_in_slot), tid
-                        ),
-                    )
-                gpu.barrier()
-                _fanout_local(ag, _ag_slot(fx.Int32(li), s))
-                _next_subtile(s, n_this)
+                        acc = _codec_dequant(rs, words, scale, tid, acc)
+            return acc
+
+        def _ag_mesh(i, n_this, color):
+            """Lap 3's handshake and the gather on the mesh: our packet is
+            already in every local peer's inbox."""
             _publish_local(
                 _ag_slot(fx.Int32(li), fx.Int32(0)) + fx.Int32(ag_release), color
             )
             _wait_local(_ag_slot, ag_release, color)
-
-            # Gather the other chunks of the group.
             for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                 tile = bid + (i + s) * n_blocks
                 gathered = []
@@ -551,6 +625,133 @@ def make_quick_allreduce_hier_kernel(
                             )
                             gathered.append(_codec_dequant(ag, words, scale, tid))
                 _finish_tile(tile, gathered, None)
+
+        def _ag_ring(i, n_this, color):
+            """Lap 3's handshake and hops ``2 .. G`` on the ring: our packet
+            went into slot 0 of the successor as hop 1. Hop ``h`` brings
+            chunk ``li - h + 1`` into slot ``h - 2``: decode it into the
+            output and forward the bytes untouched into slot ``h - 1`` of
+            the successor, except on the last hop, whose chunk the successor
+            owns."""
+            _publish_one(
+                next_base,
+                _ag_slot(fx.Int32(0), fx.Int32(0)) + fx.Int32(ag_release),
+                color,
+            )
+            is_leader = (tid % fx.Int32(GROUP)) == fx.Int32(0)
+            for _h in range_constexpr(G - 1):
+                h = _h + 2
+                chunk = (li - h + 1) % G
+                _wait_one(
+                    _ag_slot(fx.Int32(h - 2), fx.Int32(0)) + fx.Int32(ag_release),
+                    color,
+                )
+                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                    tile = bid + (i + s) * n_blocks
+                    for k in range_constexpr(rank_atoms):
+                        words, word = _recv_raw(
+                            ag,
+                            _ag_slot(fx.Int32(h - 2), s)
+                            + fx.Int32(k * ag.rank_tile_i32),
+                        )
+                        _complete(
+                            tile,
+                            chunk * rank_atoms + k,
+                            _codec_dequant(
+                                ag, words, _scale_from_word(ag, word, pair_in_slot), tid
+                            ),
+                            None,
+                        )
+                        if const_expr(h < G):
+                            _lds_write_packet(ag, fx.Int32(k), words, word, is_leader)
+                        else:
+                            pass
+                    if const_expr(h < G):
+                        gpu.barrier()
+                        _store_rows(ag, next_base, _ag_slot(fx.Int32(h - 1), s))
+                        _next_subtile(s, n_this)
+                    else:
+                        pass  # the last hop receives only
+                if const_expr(h < G):
+                    _publish_one(
+                        next_base,
+                        _ag_slot(fx.Int32(h - 1), fx.Int32(0)) + fx.Int32(ag_release),
+                        color,
+                    )
+                else:
+                    pass
+
+        n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
+        color = _load_color()
+        st_i = fx.Int32(super_tile)
+        for i in range(fx.Int32(0), n_block_tiles, st_i):
+            remain = n_block_tiles - i
+            n_this = (remain < st_i).select(remain, st_i)
+            parity = color & fx.Int32(1)
+
+            # Lap 1: local reduce-scatter.
+            if const_expr(rs_ring):
+                _rs_ring(i, n_this, color)
+            else:
+                _rs_mesh(i, n_this, color)
+
+            # Lap 2: our group's partial of our own chunk, sent to the partner
+            # and to our own cross slot.
+            for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                tile = bid + (i + s) * n_blocks
+                for k in range_constexpr(rank_atoms):
+                    acc = _group_partial(tile, s, k)
+                    words, scale, is_leader = _codec_quant(xc, acc, lane, tid)
+                    _lds_write_packet(xc, fx.Int32(k), words, scale, is_leader)
+                gpu.barrier()
+                _store_rows(xc, partner_base, _x_slot(parity, my_group, s))
+                _store_rows(xc, self_base, _x_slot(parity, my_group, s))
+                _next_subtile(s, n_this)
+            _publish_one(
+                partner_base,
+                _x_slot(parity, my_group, fx.Int32(0)) + fx.Int32(x_release),
+                color,
+            )
+            _wait_one(
+                _x_slot(parity, 1 - my_group, fx.Int32(0)) + fx.Int32(x_release),
+                color,
+            )
+
+            # Lap 3: the final sum, group 0's packet first on both partners,
+            # quantized once. Our own chunk is decoded from the same packet
+            # and stored now. The packet goes to every local peer (mesh) or to
+            # the successor as the all-gather's first hop (ring).
+            for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                tile = bid + (i + s) * n_blocks
+                for k in range_constexpr(rank_atoms):
+                    acc = None
+                    for g in range_constexpr(2):
+                        words, scale = _recv(
+                            xc, _x_slot(parity, g, s) + fx.Int32(k * xc.rank_tile_i32)
+                        )
+                        acc = _codec_dequant(xc, words, scale, tid, acc)
+                    words, scale, is_leader = _codec_quant(ag, acc, lane, tid)
+                    for j in range_constexpr(_local_rows(local_ag, G)):
+                        _lds_write_packet(
+                            ag, fx.Int32(j * rank_atoms + k), words, scale, is_leader
+                        )
+                    _stash_own(
+                        tile,
+                        li * rank_atoms + k,
+                        _codec_dequant(
+                            ag, words, _scale_from_word(ag, scale, pair_in_slot), tid
+                        ),
+                    )
+                gpu.barrier()
+                if const_expr(ag_ring):
+                    _store_rows(ag, next_base, _ag_slot(fx.Int32(0), s))
+                else:
+                    _fanout_local(ag, _ag_slot(fx.Int32(li), s))
+                _next_subtile(s, n_this)
+            if const_expr(ag_ring):
+                _ag_ring(i, n_this, color)
+            else:
+                _ag_mesh(i, n_this, color)
 
             color = color + fx.Int32(1)
             # 0 is the unset sentinel. Wrap to 2, not 1, so that the parity
@@ -596,6 +797,7 @@ def make_quick_allreduce_hier_kernel(
     tag = (
         f"{SCALE_CODEC_TAG}_ws{world_size}_g{gtag}_r{self_rank}_st{super_tile}"
         f"_g{grid}_{inbox_memory}_{rs_codec}_{x_codec}_{ag_codec}_b{block}"
+        f"_{local_rs}_{local_ag}"
     )
     launch_quick_allreduce_hier.func.__name__ = f"launch_quick_allreduce_hier_{tag}"
     try:
@@ -621,6 +823,8 @@ def make_quick_allreduce_hier_kernel(
         "rs_codec": rs_codec,
         "x_codec": x_codec,
         "ag_codec": ag_codec,
+        "local_rs": local_rs,
+        "local_ag": local_ag,
         "payload_policy": payload_policy,
         "flag_policy": flag_policy,
         "release_scope": release_scope,

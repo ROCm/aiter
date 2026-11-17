@@ -209,6 +209,10 @@ FUSED_ALGORITHMS = ("mesh", "ring")
 # schedule.
 SQNR_MIN_DB = 18.0
 
+# The hierarchical schedule is held to the TP8 mesh's accuracy (19.1 dB on the
+# normal fill). The floor sits just under it.
+HIER_SQNR_MIN_DB = 19.0
+
 # INT4 at TP8 on the ring is still a supported configuration -- pinning both
 # laps reaches it -- and is held to what it actually delivers, not to the
 # shipping floor.
@@ -365,6 +369,22 @@ TRANSPORT_CASES = (
 )
 TRANSPORT_GRID_CAP = 64
 
+# The hierarchical schedule's local laps, ``(local_rs, local_ag)``, each pinned
+# on every rung. Whatever the ladder picks, every pairing runs where the GPUs
+# split into two groups: on the fp16 wire through each geometry of
+# ``HIER_LOCAL_TRANSPORT``, on its default codecs at ``HIER_LOCAL_SHAPES``
+# through the shipping ladder, and back to back under rank skew.
+HIER_LOCAL_PAIRS = tuple((rs, ag) for rs in ("mesh", "ring") for ag in ("mesh", "ring"))
+# (tokens, hidden, super_tile, block): under one tile, a partial tile at ST 1,
+# a partial super-tile group at ST 8, and several groups per block at ST 32.
+HIER_LOCAL_TRANSPORT = (
+    (8, 1024, 1, 256),
+    (333, 7168, 1, 256),
+    (1031, 7168, 8, 512),
+    (4097, 7168, 32, 512),
+)
+HIER_LOCAL_SHAPES = ((64, 7168), (1024, 7168), (8192, 7168))
+
 # (tp, algorithm, tokens, hidden, block): the shipping INT4 ladder with
 # ``block`` overridden on every rung. ``--extended`` only: no production rung
 # uses most of these widths.
@@ -515,8 +535,9 @@ def _expected_cfg(
     batched: bool,
     grid_by_cfg: dict[tuple, int],
     block: int | None = None,
-) -> tuple[int, int]:
-    """Mirror of ``FlyQuickAllReduce._pick_cfg``: the ``(super_tile, block)``
+) -> tuple:
+    """Mirror of ``FlyQuickAllReduce._pick_cfg``: the engine key,
+    ``(super_tile, block)`` plus a hierarchical rung's local schedules, of the
     kernel an engine with no super-tile pinned runs *nbytes* on. *block* is the
     override the engine was built with, ``None`` for the rung's own.
 
@@ -531,17 +552,19 @@ def _expected_cfg(
     caps: the host reduces them to the measured resident workgroups per CU,
     and the clamped value is what the selection compares against.
     """
-    want, b = 1, None
+    key = ladder[0].engine_key
     for rung in ladder:
         if nbytes >= rung.min_bytes:
-            want, b = rung.super_tile, rung.block
-    b = b if block is None else block
+            key = rung.engine_key
+    if block is not None:
+        key = (key[0], block, *key[2:])
+    want, b = key[0], key[1]
     if want == 1:
-        return 1, b
+        return key
     tiles = _num_tiles(nbytes, b)
     if batched:
-        return (want if tiles >= want else 1), b
-    return (want if tiles > grid_by_cfg[(want, b)] else 1), b
+        return (want if tiles >= want else 1, *key[1:])
+    return (want if tiles > grid_by_cfg[key] else 1, *key[1:])
 
 
 def _expected_st(
@@ -577,7 +600,7 @@ def _rung_grids(world_size: int, ladder: tuple) -> dict[tuple, int]:
     grids = {}
     for rung in ladder:
         grids.setdefault(
-            (rung.super_tile, rung.block),
+            rung.engine_key,
             clamp_grid_cap(
                 rung.grid_cap,
                 arch=ARCH,
@@ -594,7 +617,7 @@ def _kernel_payloads(
     world_size: int, algorithm: str, link: str, lo: int, hi: int
 ) -> dict[tuple, int]:
     """Smallest whole-row payload in ``lo..hi`` bytes (inclusive) that selects
-    each ``(super_tile, block)`` kernel the shipping engine can run there.
+    each kernel (engine key) the shipping engine can run there.
 
     Within one rung the choice is a fixed kernel, or the rung's super-tile
     once the tile count crosses a threshold and its ST=1 fallback below it, so
@@ -614,7 +637,7 @@ def _kernel_payloads(
         if st > 1:
             # The first payload with a whole super-tile when batched, and with
             # more tiles than blocks when not.
-            tiles = st - 1 if batched else grids[(st, b)]
+            tiles = st - 1 if batched else grids[rung.engine_key]
             probes.append(tiles * _tile_bytes(b) + 1)
         for probe in probes:
             nbytes = -(-max(probe, start) // _ROW_BYTES) * _ROW_BYTES
@@ -659,7 +682,7 @@ def _ship_payloads(
     lo = min((w.min for w in quant), default=0)
     by_cfg = _kernel_payloads(world_size, algorithm, link, lo, MAX_PAYLOAD_BYTES)
     first = _ladder(algorithm, world_size, link)[0]
-    return [by_cfg.get((first.super_tile, first.block), min(by_cfg.values()))], None
+    return [by_cfg.get(first.engine_key, min(by_cfg.values()))], None
 
 
 def _run_ahead_shape(window: tuple[int, int] | None) -> tuple[int, int]:
@@ -939,7 +962,7 @@ def _run_rank(
     fly = _engine(rank, tp, gloo, device, engine_kw)
     production_cfgs = None
     if window is not None:
-        production_cfgs = [(int(st), int(b)) for st, b in fly.cfgs_for(*window)]
+        production_cfgs = [tuple(cfg) for cfg in fly.cfgs_for(*window)]
     reps, rounds = timing
 
     rows = []
@@ -990,7 +1013,8 @@ def _run_rank(
                 ]
                 del g
 
-            st_used, block_used = cfg_used
+            st_used, block_used = cfg_used[0], cfg_used[1]
+            spec = fly._by_cfg[cfg_used].spec
             rows.append(
                 {
                     **m,
@@ -999,8 +1023,16 @@ def _run_rank(
                     # Resolved, not requested: these come from the
                     # per-world-size default unless the caller pinned a lap,
                     # and a regression should name the codec that produced it.
-                    "rs_codec": fly.rs_codec,
-                    "ag_codec": fly.ag_codec,
+                    # Those of the engine that ran: a hierarchical engine
+                    # resolves them per rung (the mesh's spec has one codec).
+                    "rs_codec": spec.get("rs_codec", fly.rs_codec),
+                    "ag_codec": spec.get("ag_codec", fly.ag_codec),
+                    "local": (
+                        f"{spec['local_rs']}/{spec['local_ag']}"
+                        if "local_rs" in spec
+                        else None
+                    ),
+                    "cfg_used": tuple(cfg_used),
                     "st_used": int(st_used),
                     "block_used": int(block_used),
                     "grid_by_cfg": {cfg: int(e.grid) for cfg, e in fly._by_cfg.items()},
@@ -1506,6 +1538,7 @@ def _summary(rows: list[dict]) -> dict:
         "inbox_memory": rows[0]["inbox_memory"],
         "rs_codec": rows[0]["rs_codec"],
         "ag_codec": rows[0]["ag_codec"],
+        "local": rows[0]["local"],
         "st_used": rows[0]["st_used"],
         "block_used": rows[0]["block_used"],
         "lanes_differing": max(r["lanes_differing"] for r in rows),
@@ -1567,7 +1600,7 @@ def test_quick_allreduce(
     _check_sqnr(
         f"tp={tp} {algorithm} {tokens}x{hidden} block={block}",
         rows,
-        floor=SQNR_MIN_DB,
+        floor=HIER_SQNR_MIN_DB if algorithm == "hier" else SQNR_MIN_DB,
         expected_st=_shipping_st(rows, nbytes, algorithm, tp, block),
         algorithm=algorithm,
     )
@@ -1791,10 +1824,80 @@ def test_quick_allreduce_transport(tokens, hidden, tp, algorithm, super_tile, bl
     }
 
 
+def _hier_local_key(tp: int, local_rs: str, local_ag: str, super_tile=None, block=None):
+    """The hierarchical engine with both local laps pinned: on the shipping
+    ladder and codecs when *super_tile* is None, else on the fp16 wire with
+    that geometry pinned at ``TRANSPORT_GRID_CAP``."""
+    kw = {"algorithm": "hier", "local_rs": local_rs, "local_ag": local_ag}
+    if super_tile is not None:
+        kw.update(
+            rs_codec="fp16",
+            x_codec="fp16",
+            ag_codec="fp16",
+            super_tile=super_tile,
+            grid_cap=TRANSPORT_GRID_CAP,
+            block=block,
+        )
+    return _key(tp, **kw)
+
+
 @benchmark()
-def test_quick_allreduce_run_ahead(tokens, hidden, tp, algorithm):
-    """Back-to-back calls with new inputs, under rank skew; correctness only."""
-    rows = _result(_ship_key(tp, algorithm, None), (tokens, hidden, "run_ahead", False))
+def test_quick_allreduce_hier_local(
+    tokens, hidden, tp, local_rs, local_ag, check, super_tile=None, block=None
+):
+    """The hierarchical schedule with its local laps pinned; correctness only.
+
+    *check* is ``exact`` (the fp16 wire on an exact-grid input, bit-identical
+    to the fp32 reference, at the pinned geometry), ``normal`` (the default
+    codecs on the shipping ladder, held to the SQNR floor) or ``run_ahead``.
+    """
+    label = (
+        f"tp={tp} hier {local_rs}/{local_ag} {tokens}x{hidden} {check} "
+        f"st={super_tile} block={block}"
+    )
+    key = _hier_local_key(tp, local_rs, local_ag, super_tile, block)
+    if check == "exact":
+        rows = _result(key, (tokens, hidden, "exact", False))
+        fails = [
+            f"rank {rank}: {row['n_mismatch']} mismatched elements, "
+            f"max |err| {row['max_abs_err']:.3e}, "
+            f"first bad flat index {row['first_bad']}"
+            for rank, row in enumerate(rows)
+            if row["n_mismatch"]
+        ]
+        fails += [
+            f"rank {rank}: ran {row['local']}"
+            for rank, row in enumerate(rows)
+            if row["local"] != f"{local_rs}/{local_ag}"
+        ]
+        _check(label, fails)
+    elif check == "normal":
+        rows = _result(key, (tokens, hidden, "normal", False))
+        _check_sqnr(
+            label,
+            rows,
+            floor=SQNR_MIN_DB,
+            expected_st=_shipping_st(rows, tokens * hidden * 2, "hier", tp),
+            algorithm="hier",
+        )
+    else:
+        rows = _result(key, (tokens, hidden, "run_ahead", False))
+        _check(label, _run_ahead_fails(rows, "hier"))
+    return {
+        "gfx": ARCH,
+        "local": f"{local_rs}/{local_ag}",
+        "rs_codec": rows[0].get("rs_codec"),
+        "ag_codec": rows[0].get("ag_codec"),
+        "st_used": rows[0].get("st_used"),
+        "lanes_differing": max(r["lanes_differing"] for r in rows),
+        "sqnr_db": min(r["sqnr_db"] for r in rows),
+        "n_mismatch": (
+            max(r["n_mismatch"] for r in rows) if check == "exact" else None
+        ),
+    }
+
+
+def _run_ahead_fails(rows: list[dict], algorithm: str) -> list[str]:
     fails = _identity_fails(rows, algorithm)
     fails += [
         f"rank {rank}: SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB} over "
@@ -1802,6 +1905,14 @@ def test_quick_allreduce_run_ahead(tokens, hidden, tp, algorithm):
         for rank, row in enumerate(rows)
         if row["sqnr_db"] < SQNR_MIN_DB
     ]
+    return fails
+
+
+@benchmark()
+def test_quick_allreduce_run_ahead(tokens, hidden, tp, algorithm):
+    """Back-to-back calls with new inputs, under rank skew; correctness only."""
+    rows = _result(_ship_key(tp, algorithm, None), (tokens, hidden, "run_ahead", False))
+    fails = _run_ahead_fails(rows, algorithm)
     _check(f"tp={tp} {algorithm} run-ahead", fails)
     return {
         "gfx": ARCH,
@@ -1824,7 +1935,7 @@ def test_quick_allreduce_coverage(tp, algorithm, window):
     by_case = {c: _result(key, c) for c in _CASES[key]}
     production = set(next(iter(by_case.values()))[0]["production_cfgs"])
     ran = {
-        (rows[0]["st_used"], rows[0]["block_used"])
+        tuple(rows[0]["cfg_used"])
         for case, rows in by_case.items()
         if case[2] == "normal"
     }
@@ -3870,6 +3981,30 @@ def _verify(args, tps, algos, dts, link) -> None:
             _transport_key(tp, algorithm, st, block),
             (tokens, hidden, "exact", False),
         )
+    # Every pairing of the hierarchical schedule's local laps, where the GPUs
+    # split into two groups.
+    hier_local = []
+    if "hier" in algos:
+        for tp in tps:
+            if _host_groups(tp) is None:
+                continue
+            for rs, ag in HIER_LOCAL_PAIRS:
+                hier_local += [
+                    (tokens, hidden, tp, rs, ag, "exact", st, block)
+                    for tokens, hidden, st, block in HIER_LOCAL_TRANSPORT
+                ]
+                hier_local += [
+                    (tokens, hidden, tp, rs, ag, "normal", None, None)
+                    for tokens, hidden in HIER_LOCAL_SHAPES
+                ]
+                hier_local.append(
+                    (*RUN_AHEAD_SHAPE, tp, rs, ag, "run_ahead", None, None)
+                )
+    for tokens, hidden, tp, rs, ag, check, st, block in hier_local:
+        _register(
+            _hier_local_key(tp, rs, ag, st, block),
+            (tokens, hidden, check, False),
+        )
 
     def _rows(cases):
         return [
@@ -3939,6 +4074,10 @@ def _verify(args, tps, algos, dts, link) -> None:
             test_quick_allreduce_transport(tokens, hidden, tp, algorithm, st, block)
             for tp, algorithm, tokens, hidden, st, block in transport
         ],
+    )
+    _summarize(
+        "flydsl quick allreduce hier local schedules",
+        [test_quick_allreduce_hier_local(*case) for case in hier_local],
     )
     os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = HIP_QR_REGIME
     aiter.qr_max_size()

@@ -201,6 +201,10 @@ def test_ladders_are_well_formed(cell):
     two_shot = [("mesh", mesh_st_ladder(**kw), SUPER_TILES)]
     if _row(*cell).window(RING, quantized=True) is not None:
         two_shot.append(("ring", ring_st_ladder(**kw), RING_SUPER_TILES))
+    if _row(*cell).hier is not None:
+        hier = P.hier_st_ladder(**kw)
+        assert all(isinstance(r, P.HierRung) for r in hier)
+        two_shot.append(("hier", hier, P.HIER_SUPER_TILES))
     for name, rungs, valid_st in two_shot:
         assert rungs, name
         assert rungs[0].min_bytes == 0, name
@@ -438,6 +442,29 @@ def test_mesh_is_the_fallback_of_a_host_that_does_not_split():
     assert split.window(MESH, quantized=True) is None
 
 
+def test_split_host_runs_hier_over_the_ring_window():
+    """On a split PCIe TP8 host ``hier`` takes every quantized payload and the
+    ring does not run; the mesh-lap rungs end where the policy's mesh window
+    ends, and the rungs above run the ring inside each group. A bounded
+    ``hier`` hands the rest to the ring."""
+    flat = _resolve(ws=8)
+    split = flat.with_topology(hierarchical=True)
+    assert split.window(HIER, quantized=True) == Window(96 << 10, None)
+    assert split.window(RING, quantized=True) is None
+    assert split.select(1 << 31, quantized=True) == HIER
+    assert flat.with_topology(hierarchical=False).window(RING, quantized=True) == (
+        Window(24 << 20, None)
+    )
+    mesh_max = flat.window(MESH, quantized=True).max
+    for rung in P.hier_st_ladder(world_size=8, link="pcie", arch="gfx950"):
+        expect = ("mesh", "mesh") if rung.min_bytes < mesh_max else ("ring", "ring")
+        assert (rung.local_rs, rung.local_ag) == expect, rung
+    with _env(AITER_FLY_AR_HIER_MAX_BYTES=str(64 << 20)):
+        split = _resolve(ws=8).with_topology(hierarchical=True)
+        assert split.window(RING, quantized=True) == Window(64 << 20, None)
+        assert split.select(64 << 20, quantized=True) == RING
+
+
 def test_equal_bounds_disable():
     with _env(
         AITER_FLY_AR_RING_MIN_BYTES=str(1 << 30),
@@ -493,6 +520,73 @@ def test_default_codecs(ws):
     ):
         got_rs, got_ag = P.default_codecs(algorithm, ws)
         assert got_rs in rs_codecs and got_ag in ag_codecs
+
+
+def test_hier_rungs_name_their_local_schedules():
+    """A ``HierRung`` runs the mesh on both local laps unless it names the
+    ring, and its schedules are part of the engine key, so two rungs that
+    differ only there build two engines."""
+    rung = P.HierRung(min_bytes=0, super_tile=8, grid_cap=128, block=512)
+    assert (rung.local_rs, rung.local_ag) == ("mesh", "mesh")
+    assert rung.engine_key == (8, 512, "mesh", "mesh", None, None, None)
+    ring = dataclasses.replace(rung, local_rs="ring", local_ag="ring", x_codec="int5")
+    assert ring.engine_key == (8, 512, "ring", "ring", None, "int5", None)
+    assert P.TwoShotRung(0, 8, 128, 512).engine_key == (8, 512)
+    with pytest.raises(ValueError, match="local_rs"):
+        P.HierRung(0, 8, 128, 512, local_rs="tree")
+    with pytest.raises(ValueError, match="local_ag"):
+        P.HierRung(0, 8, 128, 512, local_ag="tree")
+    with pytest.raises(ValueError, match="rs_codec"):
+        P.HierRung(0, 8, 128, 512, rs_codec="int3")
+
+
+def test_hier_engines_resolve_their_rungs():
+    """The host turns any rung into a ``HierRung`` and pins the requested
+    local schedules on it, keeping its codecs. An engine's codecs are the
+    caller's, else the rung's, else ``HIER_X_CODEC`` on the exchange and that
+    of a TP``G`` schedule like its own on a local lap."""
+    from aiter.ops.flydsl.quick_allreduce import _as_hier_rung, _hier_codecs
+
+    plain = P.TwoShotRung(0, 8, 128, 512)
+    assert _as_hier_rung(plain, None, None) == P.HierRung(0, 8, 128, 512)
+    ring_rs = P.HierRung(0, 8, 128, 512, local_rs="ring", rs_codec="int5")
+    pinned = _as_hier_rung(ring_rs, None, "ring")
+    assert (pinned.local_rs, pinned.local_ag, pinned.rs_codec) == (
+        "ring",
+        "ring",
+        "int5",
+    )
+    assert _as_hier_rung(ring_rs, "mesh", None).local_rs == "mesh"
+    none = (None, None, None)
+    x = P.HIER_X_CODEC
+    mesh = P.HierRung(0, 8, 128, 512)
+    ring = dataclasses.replace(mesh, local_rs="ring", local_ag="ring")
+    assert _hier_codecs(none, mesh, 4) == ("int4", x, "int4")
+    assert _hier_codecs(none, ring, 4) == ("int6", x, "int4")
+    assert _hier_codecs(none, ring, 2) == ("int4", x, "int4")
+    assert _hier_codecs(none, ring_rs, 4) == ("int5", x, "int4")
+    assert _hier_codecs(("fp16", "fp16", None), ring_rs, 4) == ("fp16", "fp16", "int4")
+
+
+def test_hier_lds_follows_the_local_schedules():
+    """A mesh lap stages ``G - 1`` destinations, a ring hop and the exchange
+    one. Block 512, G = 4: two rank-tiles per destination, INT4 576 i32,
+    INT6 832 i32."""
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_hier import (
+        hier_fanout_quads,
+        hier_lds_bytes,
+    )
+
+    assert hier_lds_bytes(512, 4, "int4", "int6", "int4") == 4 * 3 * 2 * 576
+    assert hier_lds_bytes(512, 4, "int6", "int6", "int4", "ring", "ring") == (
+        4 * 2 * 832
+    )
+    assert hier_lds_bytes(512, 4, "int6", "int6", "int4", "ring", "mesh") == (
+        4 * 3 * 2 * 576
+    )
+    # Only a mesh lap needs a quad per (destination, sector) of a stripe.
+    assert hier_fanout_quads(512, 4, ()) == (128, 0)
+    assert hier_fanout_quads(512, 4, ("int4",)) == (128, 3 * 8)
 
 
 def test_default_inbox_memory():
