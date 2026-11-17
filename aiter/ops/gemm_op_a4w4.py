@@ -142,6 +142,9 @@ def get_GEMM_config(M: int, N: int, K: int):
         config = get_GEMM_config.gemm_dict.get(key, None)
         if config is not None:
             # New backends are qualified at exact M; keep the old bucket choice.
+            # OPUS rows are exempt on purpose: every OPUS kid bounds M (a nob row
+            # runs its bounded twin, see _gemm_a4w4_opus), so the row tuned at the
+            # padded M also serves this M.
             if padded_M != M and str(config["kernelName"]).startswith(
                 ("triton_", "flydsl_")
             ):

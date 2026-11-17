@@ -156,9 +156,9 @@ struct opus_gemm_a4w4_mxfp4_nt_traits_gfx950 {
 template<int BM, int BN, int MODE = 0, bool BOUNDARY = true>
 using opus_mxfp4_nt_traits = opus_gemm_a4w4_mxfp4_nt_traits_gfx950<256, opus::seq<BM, BN, 256>,
     opus::tuple<opus::fp4_t, opus::fp4_t, opus::bf16_t, opus::fp32_t, opus::e8m0_t>, opus::seq<16, 16, 4>, opus::seq<1, 1, 32>, MODE, BOUNDARY>;
-// Split-K workspace: a fixed 4 KB counter block (one int per tile, at most 1024 tiles; zeroed once, each tile's last block
-// resets its counter) followed by tiles * S partial tiles of B_M * B_N fp32.  The fixed size keeps the counters in place
-// whatever the shape, so a reused workspace never needs re-zeroing.
+// Split-K workspace: a fixed 4 KB counter block (one int per tile, at most 1024 tiles) followed by tiles * S partial
+// tiles of B_M * B_N fp32.  The launcher zeroes the counter block before every split-K launch (the workspace may be a
+// fresh torch.empty); each tile's last block also resets its own counter after the reduction.
 constexpr int OPUS_MXFP4_SK_MAX_TILES = 1024;
 __host__ __device__ inline long opus_mxfp4_sk_counter_bytes(int /*tiles*/) { return OPUS_MXFP4_SK_MAX_TILES * 4; }
 __host__ __device__ inline long opus_mxfp4_sk_ws_bytes(int tiles, int split_k, int b_m, int b_n) {

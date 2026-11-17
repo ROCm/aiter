@@ -134,9 +134,13 @@ def opus_candidates(M, N, K):
     if N % 16 or K % 256:
         return {}
     gfx, cu_num = _device_arch_and_cu(torch.cuda.current_device())
+    try:
+        registry = get_registry("a4w4", gfx, cu_num)
+    except ValueError:  # no OPUS a4w4 table for this CU count (e.g. a CPX partition)
+        return {}
     return {
         inst.name: kid
-        for kid, inst in sorted(get_registry("a4w4", gfx, cu_num).items())
+        for kid, inst in sorted(registry.items())
         if inst.co_variant != "nob" or (M % inst.B_M == 0 and N % inst.B_N == 0)
     }
 
