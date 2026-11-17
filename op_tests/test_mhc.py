@@ -1394,8 +1394,10 @@ def test_mhc_post_pre_prefill_dispatch(
 
     Inside the row range of ``aiter.ops.mhc`` (MHC_FUSED_PREFILL_*_GFX950) the call
     must launch the fused GEMM once, with 32-row, 64-wide tiles; outside it must not
-    launch it. Weights and mixes are random, so a projection or a mix read from the
-    wrong row fails the comparison with the reference.
+    launch it. For hidden size 7168 the two-kernel route takes the row counts from
+    MHC_GFX950_PREFILL_M_MIN to MHC_GFX950_PREFILL_M_MAX instead. Weights and mixes
+    are random, so a projection or a mix read from the wrong row fails the comparison
+    with the reference.
     """
     from aiter.ops import mhc as mhc_ops
 
@@ -1429,14 +1431,23 @@ def test_mhc_post_pre_prefill_dispatch(
     )
 
     launches = []
+    routed = []
     fused_gemm = mhc_ops.mhc_fused_post_pre_gemm_sqrsum
+    post_project = mhc_ops.mhc_post_project_gfx950
 
     def record(*args, **kwargs):
         # (split_k, tile_m, tile_n, tile_k) of the launch
         launches.append((args[1].size(0), *args[8:11]))
         return fused_gemm(*args, **kwargs)
 
-    with patch.object(mhc_ops, "mhc_fused_post_pre_gemm_sqrsum", record):
+    def record_route(*args, **kwargs):
+        routed.append(args[3].size(0))
+        return post_project(*args, **kwargs)
+
+    with (
+        patch.object(mhc_ops, "mhc_fused_post_pre_gemm_sqrsum", record),
+        patch.object(mhc_ops, "mhc_post_project_gfx950", record_route),
+    ):
         outs = aiter.mhc_fused_post_pre(
             layer_input,
             residual_in,
@@ -1454,11 +1465,21 @@ def test_mhc_post_pre_prefill_dispatch(
         <= m
         <= mhc_ops.MHC_FUSED_PREFILL_M_MAX_GFX950
     )
-    if in_range:
+    two_kernel = (
+        hidden_size == 7168
+        and mhc_ops.MHC_GFX950_PREFILL_M_MIN <= m <= mhc_ops.MHC_GFX950_PREFILL_M_MAX
+    )
+    if two_kernel:
+        assert routed == [m] and not launches, (routed, launches)
+    elif in_range:
+        assert not routed, routed
         assert len(launches) == 1 and launches[0][1:] == (32, 32, 64), launches
     else:
-        assert not launches, launches
-    ret = {"fused_gemm": str(launches[0]) if launches else "not launched"}
+        assert not routed and not launches, (routed, launches)
+    ret = {
+        "fused_gemm": str(launches[0]) if launches else "not launched",
+        "two_kernel": "launched" if routed else "not launched",
+    }
     for what, ref, out in zip(
         ("post_mix", "comb_mix", "layer_input", "next_residual"), refs, outs
     ):
@@ -1752,14 +1773,16 @@ if not args.hc_head:
             name in os.environ for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
         )
     ):
-        # Just below the range, its first row count (odd, partial row tile), a
-        # partial row tile at the other split count, and a full grid.
+        # Just below the range, its first row count (odd, partial row tile), the
+        # row counts around the two-kernel route of hidden size 7168 (4095 and
+        # 16385 outside, 4099 with a partial row tile and an odd last row inside),
+        # and a full grid.
         df = [
             test_mhc_post_pre_prefill_dispatch(
                 m=m, hidden_size=hidden_size, hc_mult=4, seed=args.seed
             )
             for hidden_size, m in itertools.product(
-                args.hidden_size, (2048, 2049, 4099, 8192)
+                args.hidden_size, (2048, 2049, 4095, 4099, 8192, 16385)
             )
         ]
         print_json_table("mhc_post_pre prefill dispatch summary", df)
