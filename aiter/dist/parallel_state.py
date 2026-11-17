@@ -38,6 +38,7 @@ import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
 from aiter import logger, torch_compile_guard
+from aiter.dist.device_communicators.pynccl_wrapper import ncclDataTypeEnum
 from aiter.dist.utils import env_flag
 
 
@@ -556,7 +557,6 @@ class GroupCoordinator:
     use_pynccl: bool  # a hint of whether to use PyNccl
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
     # communicators are only created for world size > 1
-    pynccl_comm: Any | None  # PyNccl communicator
     ca_comm: Any | None  # Custom allreduce communicator
     qr_comm: Any | None  # Quick allreduce communicator
     mq_broadcaster: Any | None  # shared memory broadcaster
@@ -1219,6 +1219,33 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.reduce_scatter(input_, output_, dim)
 
+    def _pynccl_comm(self, dtype: torch.dtype) -> Any | None:
+        """The PyNccl communicator for an NCCL collective on `dtype`, or None
+        to issue it through torch.distributed: while dynamo traces (it traces
+        torch.distributed collectives but not PyNccl's ctypes calls), when the
+        group has no usable PyNccl communicator, or for a dtype PyNccl does
+        not carry. Ranks pass the same dtype and so take the same path; ranks
+        on different paths would hang."""
+        if torch.compiler.is_compiling() or self.device_communicator is None:
+            return None
+        pynccl_comm = self.device_communicator.pynccl_comm
+        if (
+            pynccl_comm is None
+            or pynccl_comm.disabled
+            or not ncclDataTypeEnum.supports(dtype)
+        ):
+            return None
+        return pynccl_comm
+
+    def _nccl_reduce_scatter(self, output_: torch.Tensor, input_: torch.Tensor):
+        pynccl_comm = self._pynccl_comm(input_.dtype)
+        if pynccl_comm is not None:
+            pynccl_comm.reduce_scatter(output_, input_.contiguous())
+        else:
+            torch.distributed.reduce_scatter_tensor(
+                output_, input_, group=self.device_group
+            )
+
     def reduce_scatter_tensor(
         self,
         input_: torch.Tensor,
@@ -1248,7 +1275,7 @@ class GroupCoordinator:
             + input_.shape[dim + 1 :]
         )
 
-        output_ = torch.empty(out_shape, dtype=input_.dtype, device=input_.device)
+        output_ = input_.new_empty(out_shape)
         if use_custom:
             outplace_reduce_scatter(
                 input_, output_, group_name=self.unique_name, dim=dim
@@ -1260,14 +1287,10 @@ class GroupCoordinator:
                 tmp_output = torch.empty(
                     tmp_out_shape, dtype=input_.dtype, device=input_.device
                 )
-                torch.distributed.reduce_scatter_tensor(
-                    tmp_output, input_, group=self.device_group
-                )
+                self._nccl_reduce_scatter(tmp_output, input_)
                 output_ = tmp_output.movedim(0, dim).contiguous()
             else:
-                torch.distributed.reduce_scatter_tensor(
-                    output_, input_, group=self.device_group
-                )
+                self._nccl_reduce_scatter(output_, input_)
         return output_
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = 0) -> torch.Tensor:
@@ -1309,17 +1332,22 @@ class GroupCoordinator:
         if can_use_custom:
             return outplace_all_gather(input_, group_name=self.unique_name, dim=dim)
 
-        # NCCL path
-        output_tensor = torch.empty(
-            (world_size,) + input_size, dtype=input_.dtype, device=input_.device
-        )
-        torch.distributed.all_gather_into_tensor(
-            output_tensor, input_, group=self.device_group
-        )
-        output_tensor = output_tensor.movedim(0, dim)
-        output_tensor = output_tensor.reshape(
-            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
-        )
+        # NCCL path: the ranks' inputs land one after another along dim 0.
+        output_tensor = input_.new_empty((world_size * input_size[0],) + input_size[1:])
+        pynccl_comm = self._pynccl_comm(input_.dtype)
+        if pynccl_comm is not None:
+            pynccl_comm.all_gather(output_tensor, input_.contiguous())
+        else:
+            torch.distributed.all_gather_into_tensor(
+                output_tensor, input_, group=self.device_group
+            )
+        if dim != 0:
+            output_tensor = output_tensor.view((world_size,) + input_size)
+            output_tensor = output_tensor.movedim(0, dim).reshape(
+                input_size[:dim]
+                + (world_size * input_size[dim],)
+                + input_size[dim + 1 :]
+            )
         return output_tensor
 
     def gather(
@@ -1684,9 +1712,9 @@ class GroupCoordinator:
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
 
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
-            pynccl_comm.send(tensor, dst)
+        pynccl_comm = self._pynccl_comm(tensor.dtype)
+        if pynccl_comm is not None:
+            pynccl_comm.send(tensor.contiguous(), dst)
         else:
             torch.distributed.send(tensor, self.ranks[dst], self.device_group)
 
@@ -1699,8 +1727,8 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
 
         tensor = torch.empty(size, dtype=dtype, device=self.device)
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
+        pynccl_comm = self._pynccl_comm(dtype)
+        if pynccl_comm is not None:
             pynccl_comm.recv(tensor, src)
         else:
             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
