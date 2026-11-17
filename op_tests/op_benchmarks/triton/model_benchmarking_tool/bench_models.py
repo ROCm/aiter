@@ -583,9 +583,7 @@ class SparseMqaKernelHandler(KernelHandler):
 
     def parse_stdout(self, stdout: str) -> float:
         lines = [line for line in stdout.splitlines() if line.strip()]
-        last_row_values = list(
-            map(float, re.findall(r"-?\d+(?:\.\d+)?", lines[-1]))
-        )
+        last_row_values = list(map(float, re.findall(r"-?\d+(?:\.\d+)?", lines[-1])))
         if not last_row_values:
             raise ValueError(
                 f"Unexpected sparse_mqa bench output format: {lines[-1]!r}"
@@ -631,9 +629,7 @@ class MhcKernelHandler(KernelHandler):
 
     def parse_stdout(self, stdout: str) -> float:
         lines = [line for line in stdout.splitlines() if line.strip()]
-        last_row_values = list(
-            map(float, re.findall(r"-?\d+(?:\.\d+)?", lines[-1]))
-        )
+        last_row_values = list(map(float, re.findall(r"-?\d+(?:\.\d+)?", lines[-1])))
         if not last_row_values:
             raise ValueError(f"Unexpected mhc bench output format: {lines[-1]!r}")
         return last_row_values[-1]
@@ -703,9 +699,7 @@ class KdaAttentionKernelHandler(KernelHandler):
 
     def parse_stdout(self, stdout: str) -> float:
         lines = [line for line in stdout.splitlines() if line.strip()]
-        last_row_values = list(
-            map(float, re.findall(r"-?\d+(?:\.\d+)?", lines[-1]))
-        )
+        last_row_values = list(map(float, re.findall(r"-?\d+(?:\.\d+)?", lines[-1])))
         if not last_row_values:
             raise ValueError(f"Unexpected KDA bench output format: {lines[-1]!r}")
         result = last_row_values[-1]
@@ -754,9 +748,7 @@ class AttnResKernelHandler(KernelHandler):
 
     def parse_stdout(self, stdout: str) -> float:
         lines = [line for line in stdout.splitlines() if line.strip()]
-        last_row_values = list(
-            map(float, re.findall(r"-?\d+(?:\.\d+)?", lines[-1]))
-        )
+        last_row_values = list(map(float, re.findall(r"-?\d+(?:\.\d+)?", lines[-1])))
         if not last_row_values:
             raise ValueError(f"Unexpected attn_res bench output: {lines[-1]!r}")
         return last_row_values[-1]
@@ -1134,9 +1126,7 @@ def run_benchmarks(
 
             if kernel.startswith("kda_attention_"):
                 if arch_info.get_arch() not in ("gfx950", "gfx1250"):
-                    print(
-                        f"KDA is not supported on this device. Skipping {kernel}."
-                    )
+                    print(f"KDA is not supported on this device. Skipping {kernel}.")
                     continue
                 if metric == "throughput":
                     print(

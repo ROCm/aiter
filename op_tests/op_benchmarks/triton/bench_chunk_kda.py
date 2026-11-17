@@ -118,9 +118,7 @@ def benchmark(args):
     state_dtype = torch.bfloat16 if args.state_dtype == "bf16" else torch.float32
     lines = ["gluon"]
     if not args.forward_only:
-        lines += ["gluon_prepare"] + [
-            f"gluon_walk:{c}" for c in args.walk_configs
-        ]
+        lines += ["gluon_prepare"] + [f"gluon_walk:{c}" for c in args.walk_configs]
     if "triton" in args.backends:
         lines.append("triton")
     configs = [

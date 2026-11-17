@@ -498,8 +498,7 @@ def run_benchmark(custom, args):
             )
             if output_gate is not None:
                 ref_output = (
-                    ref_output.reshape(output_gate.shape)
-                    * torch.sigmoid(output_gate)
+                    ref_output.reshape(output_gate.shape) * torch.sigmoid(output_gate)
                 ).reshape_as(ref_output)
             if any_fp8:
                 atol, rtol = 1.5e-1, 1.5e-1
