@@ -455,12 +455,18 @@ def main():
     # Every gfx942, MI300X CI runners included: kernel numerics covering each
     # distinct tile family in kimik3_a8w4_tuned_fmoe.csv, and dispatch by name.
     # _qi (small M, x quantised in-kernel), moe_sort, bnt0, BM=32 and TILE_K=256.
-    test_stage1_kernel(1,  "flydsl_moe1_afp8_wfp4_bf16_t16x32x256_g942_kw2_qi")  # _qi TILE_K=256
-    test_stage1_kernel(16, "flydsl_moe1_afp8_wfp4_bf16_t16x64x128_g942_kw2")     # moe_sort
-    test_stage1_kernel(16, "flydsl_moe1_afp8_wfp4_bf16_t16x128x256_g942")         # TILE_K=256
-    test_stage1_kernel(128, "flydsl_moe1_afp8_wfp4_bf16_t16x128x128_g942_bnt0_kw2")  # bnt0
-    test_stage1_kernel(128, "flydsl_moe1_afp8_wfp4_bf16_t32x128x128_g942")        # BM=32
-    test_stage1_kernel(128, "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_g942_bnt0")   # BM=32 TILE_K=256
+    test_stage1_kernel(
+        1, "flydsl_moe1_afp8_wfp4_bf16_t16x32x256_g942_kw2_qi"
+    )  # _qi TILE_K=256
+    test_stage1_kernel(16, "flydsl_moe1_afp8_wfp4_bf16_t16x64x128_g942_kw2")  # moe_sort
+    test_stage1_kernel(16, "flydsl_moe1_afp8_wfp4_bf16_t16x128x256_g942")  # TILE_K=256
+    test_stage1_kernel(
+        128, "flydsl_moe1_afp8_wfp4_bf16_t16x128x128_g942_bnt0_kw2"
+    )  # bnt0
+    test_stage1_kernel(128, "flydsl_moe1_afp8_wfp4_bf16_t32x128x128_g942")  # BM=32
+    test_stage1_kernel(
+        128, "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_g942_bnt0"
+    )  # BM=32 TILE_K=256
     test_stage1_dispatch_by_name()
     if not a8w4_gfx942_supported():
         test_gate_off_mi325x()
