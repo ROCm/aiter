@@ -108,6 +108,38 @@ environment variable.
   retrying could repeat side effects or hide a broken kernel behind a correct
   result.
 
+## Check your provider before shipping it
+
+```python
+report = plugin.validate("mylib")
+if not report:
+    print(report.problems)   # and report.ops, per declared op
+```
+
+It runs no kernel. It answers the questions that have static answers: were you
+discovered and did you load, is your `api_versions` one this AITER accepts, is
+every name in `op_versions` an op AITER actually routes, is each declared
+version one that contract still accepts, is `select` callable. A name AITER
+does not route is the typo you cannot otherwise see — nothing raises, nothing
+is served, and the call looks exactly like a provider correctly declining.
+
+For the measurement fields:
+
+```python
+assert plugin.check_report(candidate) == ()
+```
+
+Empty means the four comparison fields are present and the candidate takes part
+in selection. Anything else is a list of what is missing, in a form you can read
+— assert on it in your own tests, because the alternative is finding out at
+runtime that your report was ignored, which looks like not being selected for
+any other reason.
+
+**What a passing report does not claim:** that `run` is correct, that `run`
+takes the contract (its arity is checked when a candidate is offered, since the
+callable is only known then), that a measurement is honest, or that `run` avoids
+calling the public name that routes to it.
+
 ## "I installed it and nothing happens"
 
 Four questions, four answers, none of which require running a kernel:

@@ -2000,3 +2000,108 @@ def test_status_lists_the_exclusions_in_the_form_configure_accepts(monkeypatch):
 
     plugin.configure(enable=("p",), source="test", exclude=("p:test.add",))
     assert plugin.status()["excluded"] == ("p:test.add",)
+
+
+# ---------------------------------------------------------------------------
+# validate() / check_report(): what a provider author can check before shipping
+#
+# Without these, the first sign that a provider is wired up wrongly is a
+# routing decision that quietly went native, which looks the same as a
+# provider correctly declining.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_passes_a_correctly_declared_provider(monkeypatch):
+    good = _Provider("good", _candidate("good"))
+    good.op_versions = {"test.add": {1}}
+    _installed(monkeypatch, good)
+    _route_add([])  # registering the op is what makes the name known
+
+    report = plugin.validate("good")
+    assert report.installed and report.problems == ()
+    assert report.ops == {"test.add": "ok"}
+    assert bool(report) is True
+
+
+def test_validate_names_an_op_aiter_does_not_route(monkeypatch):
+    """The typo a provider author cannot otherwise see: nothing happens."""
+
+    wrong = _Provider("wrong", _candidate("wrong"))
+    wrong.op_versions = {"test.addd": {1}}
+    _installed(monkeypatch, wrong)
+    _route_add([])
+
+    report = plugin.validate("wrong")
+    assert not report
+    assert "not an op AITER routes" in report.ops["test.addd"]
+    # The message carries what the names actually are, so the fix does not
+    # require reading AITER's source.
+    assert "test.add" in report.ops["test.addd"]
+
+
+def test_validate_catches_a_version_the_contract_does_not_accept(monkeypatch):
+    stale = _Provider("stale", _candidate("stale"))
+    stale.op_versions = {"test.add": {99}}
+    _installed(monkeypatch, stale)
+    _route_add([])
+
+    report = plugin.validate("stale")
+    assert not report
+    assert "does not accept" in report.ops["test.add"]
+
+
+def test_validate_reports_an_uninstalled_provider_rather_than_raising(monkeypatch):
+    _installed(monkeypatch)
+    report = plugin.validate("absent")
+    assert not report.installed
+    assert "not discovered" in report.problems[0]
+
+
+def test_validate_says_why_a_provider_was_skipped_at_discovery(monkeypatch):
+    """Discovery reads op_versions, so a provider that throws never arrives.
+
+    Without this the author sees an installed wheel and no routing, with
+    nothing connecting the two: status() lists it under skipped_providers, but
+    only for somebody who already suspects discovery is where to look.
+    """
+
+    class Hostile:
+        name = "hostile"
+        api_versions: ClassVar[set] = {plugin.API_VERSION}
+
+        @property
+        def op_versions(self):
+            raise RuntimeError("backend gone")
+
+        def select(self, op, args, kwargs):
+            return None
+
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("hostile-ep", Hostile()),)
+    )
+    report = plugin.validate("hostile")
+    assert not report.installed
+    # The reason discovery rejected it, not a generic "not found".
+    assert any("backend gone" in problem for problem in report.problems)
+
+
+def test_check_report_says_exactly_what_a_measurement_is_missing():
+    complete = _measured("p", 1, latency=4.0, baseline=10.0)
+    assert plugin.check_report(complete) == ()
+
+    silent = _candidate("p")
+    assert plugin.check_report(silent) == (
+        "latency_us is not reported, so nothing is compared",
+    )
+
+    partial = plugin.KernelCandidate(
+        provider="p",
+        kernel_id="k",
+        artifact_digest="sha",
+        run=lambda *a, **k: None,
+        latency_us=4.0,
+    )
+    missing = plugin.check_report(partial)
+    assert len(missing) == 4
+    assert any("baseline_us" in item for item in missing)
+    assert any("measurement_ref" in item for item in missing)

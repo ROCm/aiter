@@ -321,6 +321,26 @@ class Explanation:
     declines: Mapping[str, str]
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderReport:
+    """What ``validate()`` could check about one provider, without running it.
+
+    ``problems`` empty means every check here passed. It does not mean the
+    provider works: nothing below executes a kernel, and the checks it cannot
+    perform are listed in ``validate``'s docstring rather than implied by
+    silence.
+    """
+
+    provider: str
+    installed: bool
+    api_version: int | None
+    ops: Mapping[str, str]
+    problems: tuple[str, ...]
+
+    def __bool__(self) -> bool:
+        return self.installed and not self.problems
+
+
 _routed_ops: dict[str, _RoutedOp] = {}
 # Ops routed by importing aiter belong to the process, not to whichever test
 # runs first; see _reset_for_testing.
@@ -1106,6 +1126,140 @@ def status() -> Mapping[str, Any]:
             ),
             "decision_callback_errors": _callback_errors,
         }
+    )
+
+
+def check_report(candidate: KernelCandidate) -> tuple[str, ...]:
+    """What is missing before this candidate's measurement can be compared.
+
+    An empty result means the four comparison fields are present and usable, so
+    this candidate participates in selection. Written for a provider to assert
+    on in its own tests -- ``assert plugin.check_report(c) == ()`` -- because
+    the alternative is discovering at runtime that a report was silently
+    ignored, which looks exactly like not being selected for any other reason.
+    """
+
+    if candidate.latency_us is None:
+        return ("latency_us is not reported, so nothing is compared",)
+    missing = []
+    if candidate.baseline_us is None:
+        missing.append(
+            "baseline_us: what AITER's own path took, under the same conditions"
+        )
+    if not candidate.baseline_path:
+        missing.append("baseline_path: which AITER path that was")
+    if candidate.measured_under is None:
+        missing.append("measured_under: the conditions it was measured under")
+    if not candidate.measurement_ref:
+        missing.append("measurement_ref: how to reproduce it")
+    return tuple(missing)
+
+
+def validate(provider: str) -> ProviderReport:
+    """Check an installed provider against this AITER, without running it.
+
+    A provider author otherwise learns what is wrong from a routing decision
+    that quietly went native. This answers the questions that have static
+    answers:
+
+    * is the provider discovered at all, and does it load;
+    * is the provider API version one this AITER accepts;
+    * is every name in ``op_versions`` an op AITER actually routes;
+    * is each declared version one that op's contract accepts, directly or
+      through ``supersedes``;
+    * is ``select`` present and callable.
+
+    **What it cannot check, and a passing report does not claim:** that ``run``
+    computes the right answer, that ``run`` takes the contract (arity is
+    checked when a candidate is offered, since the callable is only known
+    then), that a measurement is honest, or that ``run`` avoids calling the
+    public name that routes to it -- the re-entrancy a provider wrapping AITER
+    meets first. For the measurement fields, ``check_report`` answers the part
+    that has a static answer.
+    """
+
+    records = [record for record in _providers() if record.name == provider]
+    if not records:
+        skipped = tuple(
+            f"{item.entry_point}: {item.reason}"
+            for item in _skipped_providers
+            if provider in item.entry_point
+        )
+        return ProviderReport(
+            provider=provider,
+            installed=False,
+            api_version=None,
+            ops=MappingProxyType({}),
+            problems=skipped
+            or (
+                (
+                    "not discovered: no entry point in group "
+                    f"{ENTRY_POINT_GROUP!r} loaded under this name"
+                ),
+            ),
+        )
+
+    record = records[0]
+    problems: list[str] = []
+    ops: dict[str, str] = {}
+
+    if record.api_version in SUPERSEDED_API_VERSIONS:
+        problems.append(
+            f"provider API version {record.api_version} is accepted but "
+            f"removed in {SUPERSEDED_API_VERSIONS[record.api_version]}"
+        )
+
+    if not callable(getattr(record.provider, "select", None)):
+        problems.append("select is missing or not callable")
+
+    try:
+        declared = record.provider.op_versions
+        pairs = (
+            declared.items()
+            if isinstance(declared, Mapping)
+            else ((name, ()) for name in declared)
+        )
+    except Exception as error:  # noqa: BLE001 - providers are an isolation boundary
+        return ProviderReport(
+            provider=provider,
+            installed=True,
+            api_version=record.api_version,
+            ops=MappingProxyType({}),
+            problems=(*problems, f"op_versions is unreadable: {error}"),
+        )
+
+    for name, versions in pairs:
+        routed = _routed_ops.get(name)
+        if routed is None:
+            known = ", ".join(sorted(_routed_ops)) or "none"
+            ops[name] = f"not an op AITER routes; routed ops are: {known}"
+            continue
+        wanted = frozenset(versions) or frozenset({routed.op.version})
+        accepted = {routed.op.version, *routed.superseded}
+        unusable = sorted(wanted - accepted)
+        if unusable:
+            ops[name] = (
+                f"declares version(s) {unusable} that this contract does not "
+                f"accept; it is at version {routed.op.version}"
+            )
+        elif wanted == {routed.op.version}:
+            ops[name] = "ok"
+        else:
+            deprecated = sorted(wanted & set(routed.superseded))
+            ops[name] = (
+                f"ok on superseded version(s) {deprecated}; "
+                f"the contract is at {routed.op.version}"
+            )
+
+    problems.extend(
+        f"{name}: {state}" for name, state in ops.items() if not state.startswith("ok")
+    )
+    return ProviderReport(
+        provider=provider,
+        installed=True,
+        api_version=record.api_version,
+        ops=MappingProxyType(ops),
+        problems=tuple(problems),
     )
 
 
