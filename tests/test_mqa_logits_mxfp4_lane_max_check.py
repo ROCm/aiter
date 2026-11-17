@@ -50,7 +50,8 @@ def _part_point(part, tiles, parts):
 
 
 def _assign_free(qsl, ends, qpb, cta_target):
-    """[(first row, rows, start, count)] a CTA, as SCHED_FREE assigns slots 0 .. grid - 1."""
+    """Every chunk of the grid as (first row, rows, start, count), in the order
+    SCHED_FREE assigns slots 0 .. grid - 1 (one chunk per CTA)."""
     groups = _seq_groups(qsl, ends, qpb)
     total = sum(t for *_, t in groups)
     g = sum(t > 0 for *_, t in groups)
@@ -68,7 +69,8 @@ def _assign_free(qsl, ends, qpb, cta_target):
 
 
 def _assign_prefill(qsl, ends, qpb, parts, gather):
-    """[(first row, rows, start, count)] a CTA, as SCHED_PREFILL assigns them."""
+    """Every non-empty chunk of the grid as (first row, rows, start, count), in the
+    order SCHED_PREFILL assigns them (one chunk per CTA)."""
     if gather:
         groups = [
             (None, r, 1, _ceil(ends[r], TILE) if ends[r] > 0 else 0)
