@@ -123,8 +123,8 @@ def generate_gemm_a16w8_blockscale_inputs(
     ],
 )
 @pytest.mark.parametrize("shuffle", [True, False])
-def test_gemm(dtype, M, N, K, output, shuffle):
-    prequant = False
+@pytest.mark.parametrize("prequant", [False, True])
+def test_gemm(dtype, M, N, K, output, shuffle, prequant):
     block_shape_n, block_shape_k = block_shape
 
     if shuffle and (N % 16 > 0 or K % 32 > 0):
