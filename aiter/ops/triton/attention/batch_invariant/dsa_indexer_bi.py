@@ -217,7 +217,7 @@ def dsa_mqa_logits_bi(
     Args:
         q: float8_e4m3fn [T, H, 128], H in (32, 64), contiguous in D.
         weights: float32 [T, H] head weights.
-        index_cache: uint8 [blocks, BS, 132], block-flat NORMAL layout
+        index_cache: uint8 [blocks, BS, 132], block-flat layout
             (BS * 128 fp8 key bytes, then BS fp32 scales), BS a multiple of 64.
         block_table: int32 [R, max_blocks].
         row_req: int32 [T], the block-table row of each query row.

@@ -26,7 +26,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 D = 128
-TOPK = 2048  # Kimi K3.1 and DeepSeek V3.2 index_topk
+TOPK = 2048  # DeepSeek V3.2 index_topk
 FP8 = torch.float8_e4m3fn
 GOLDEN = os.path.join(os.path.dirname(__file__), "dsa_indexer_bi_golden.json")
 
@@ -416,18 +416,3 @@ def test_golden_bits(H):
     )
     want = golden["gfx950"][f"H{H}"]
     assert list(got) == [want["logits"], want["indices"]], f"H{H}: {got}"
-
-
-def test_matches_triton_plugin():
-    """Bit parity with the Triton reference of the Kimi K3.1 rollout (k31dsabi)."""
-    ix = pytest.importorskip("k31dsabi.indexer")
-    c = Case([3000], seed=23)
-    q, w, req, ln = c.rows([(0, 1), (0, 700), (0, 2900), (0, 3000), (0, 64)], seed=24)
-    k, s = c.keys[0]
-    ks = torch.zeros_like(ln)
-    ref = ix._bi_fp8_mqa_logits(q, (k, s), w, ks, ln)
-    got = c.logits(q, w, req, ln)
-    assert all(torch.equal(a, b) for a, b in zip(valid(got, ln), valid(ref, ln)))
-    ref_i = torch.empty((q.shape[0], TOPK), dtype=torch.int32, device="cuda")
-    ix.dsv4_det_topk_per_row(ref, ks, ln, ref_i, q.shape[0], TOPK)
-    assert torch.equal(c.indexer(q, w, req, ln), ref_i)
