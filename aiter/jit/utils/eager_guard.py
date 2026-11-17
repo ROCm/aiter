@@ -15,14 +15,8 @@ import torch
 
 _tensor_types: dict[type, bool] = {torch.Tensor: True, torch.nn.Parameter: True}
 
-# Private probes; without any of them nothing is plain.
-_dispatch_modes = getattr(torch._C, "_len_torch_dispatch_stack", None)
-_functorch_active = getattr(torch._C, "_are_functorch_transforms_active", None)
-_jit_tracing = getattr(torch._C, "_is_tracing", None)
-probes_available = None not in (_dispatch_modes, _functorch_active, _jit_tracing)
 
-
-def plain_tensor_type(cls: type) -> bool:
+def _plain_tensor_type(cls: type) -> bool:
     """Whether tensors of type ``cls`` may skip the dispatcher.
 
     A subclass that takes over ``__torch_dispatch__`` (FakeTensor, functional
@@ -43,10 +37,9 @@ def plain_eager(tensors: tuple) -> bool:
     custom op's own implementation would, so that implementation may be called
     directly."""
     if (
-        not probes_available
-        or _dispatch_modes()
-        or _functorch_active()
-        or _jit_tracing()
+        torch._C._len_torch_dispatch_stack()
+        or torch._C._are_functorch_transforms_active()
+        or torch._C._is_tracing()
         or torch._C._has_torch_function(tensors)
     ):
         return False
@@ -55,7 +48,7 @@ def plain_eager(tensors: tuple) -> bool:
     for t in tensors:
         if t is None:
             continue
-        if not (known(type(t)) or plain_tensor_type(type(t))):
+        if not (known(type(t)) or _plain_tensor_type(type(t))):
             return False
         if grad and t.requires_grad:
             return False

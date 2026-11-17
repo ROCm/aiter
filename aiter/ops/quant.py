@@ -12,7 +12,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from aiter.jit.utils.eager_guard import plain_eager
-from aiter.jit.utils.eager_guard import probes_available as eager_probes_available
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
@@ -966,8 +965,8 @@ _eager_quant = None  # pybind entry points once resolved; False: off for the run
 def _resolve_eager_quant() -> None:
     """Look the entry points up once the op path has run (and so loaded or
     built the module). Off for the run under per-op argument logging, a forced
-    rebuild, a torch without the probes the guards need, an op running a body
-    other than the one registered here, or a module that cannot be loaded."""
+    rebuild, an op running a body other than the one registered here, or a
+    module that cannot be loaded."""
     global _eager_quant
     from ..jit.core import (
         AITER_LOG_MORE,
@@ -977,12 +976,7 @@ def _resolve_eager_quant() -> None:
     )
 
     _eager_quant = False
-    if (
-        not _eager_quant_ops_are_ours
-        or AITER_LOG_MORE >= 2
-        or AITER_REBUILD
-        or not eager_probes_available
-    ):
+    if not _eager_quant_ops_are_ours or AITER_LOG_MORE >= 2 or AITER_REBUILD:
         return
     try:
         module = get_module("module_quant")

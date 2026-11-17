@@ -24,7 +24,6 @@ from ..jit.utils.build_targets import base_gfx_arch, is_gfx1250_family
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.eager_guard import plain_eager
-from ..jit.utils.eager_guard import probes_available as eager_probes_available
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import (
     find_padded_m_row,
@@ -977,18 +976,13 @@ _eager_a8w8_ck = None  # pybind entry once resolved; False: off for the run
 def _resolve_eager_a8w8_ck() -> None:
     """Look the CK entry up once the op path has run (and so loaded or built
     the module). Off for the run under per-op argument logging, a forced
-    rebuild, a torch without the probes the guards need, an op running a body
-    other than the one registered here, or a module that cannot be loaded."""
+    rebuild, an op running a body other than the one registered here, or a
+    module that cannot be loaded."""
     global _eager_a8w8_ck
     from ..jit.core import AITER_LOG_MORE, AITER_REBUILD, get_module
 
     _eager_a8w8_ck = False
-    if (
-        not _eager_a8w8_ops_are_ours
-        or AITER_LOG_MORE >= 2
-        or AITER_REBUILD
-        or not eager_probes_available
-    ):
+    if not _eager_a8w8_ops_are_ours or AITER_LOG_MORE >= 2 or AITER_REBUILD:
         return
     try:
         _eager_a8w8_ck = get_module(
