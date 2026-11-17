@@ -305,7 +305,8 @@ def opus_a4w4_kid_sweep(dtype=dtypes.bf16):
         wshuffle = shuffle_weight(w, layout=(16, 16))
         splits = (
             (0, 2)
-            if inst.kernel_tag == "a4w4_mxfp4_nt_small" or inst.co_variant == "sk"
+            if inst.kernel_tag == "a4w4_mxfp4_nt_bpreshuffle_small"
+            or inst.co_variant == "sk"
             else (0,)
         )
         for split_k in splits:
@@ -339,6 +340,49 @@ def opus_a4w4_kid_sweep(dtype=dtypes.bf16):
                 }
             )
     return rows
+
+
+def check_bpreshuffle_large_offset(kids=(0, 10, 30), M=65792, N=32768, K=256):
+    """Pre-compiled bpreshuffle kids on a Y of > 2^31 elements: (M - 256) * N = 2^31,
+    so the last tile row's offset overflows 32-bit arithmetic. Only the first and
+    last rows are compared against the reference (the full one would need 8 GiB)."""
+    from aiter.ops.opus import opus_gemm
+
+    dtype = dtypes.bf16
+    quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+    x = torch.randn((M, K), dtype=dtype)
+    w = torch.randn((N, K), dtype=dtype)
+    _, x_scales = quant_func(x, shuffle=False)
+    _, w_scales = quant_func(w, shuffle=False)
+    x, x_scales_shuffle = quant_func(x, shuffle=True)
+    w, w_scales_shuffle = quant_func(w, shuffle=True)
+    wshuffle = shuffle_weight(w, layout=(16, 16))
+    x_scales, w_scales = x_scales.view(torch.uint8), w_scales.view(torch.uint8)
+    rows_ref = [
+        (rows, run_torch(x[rows], w, x_scales[rows], w_scales, dtype))
+        for rows in (slice(0, 4), slice(M - 4, M))
+    ]
+    y = torch.empty((M, N), dtype=dtype)
+    for kid in kids:
+        y.fill_(float("nan"))
+        opus_gemm(
+            x.view(dtypes.fp4x2),
+            wshuffle.view(dtypes.fp4x2),
+            y,
+            kid=kid,
+            family="a4w4",
+            layout="bpreshuffle",
+            x_scale=x_scales_shuffle,
+            w_scale=w_scales_shuffle,
+        )
+        for rows, ref in rows_ref:
+            checkAllclose(
+                ref.float(),
+                y[rows].float(),
+                msg=f"opus a4w4 kid {kid} rows {rows.start}:{rows.stop} of M={M}",
+                catastrophic_check=True,
+            )
+    del y
 
 
 def main():
@@ -497,6 +541,7 @@ def main():
     df_md = df.to_markdown(index=False)
     aiter.logger.info("gemm_a4w4 summary (markdown):\n%s", df_md)
     if get_gfx() == "gfx950" and args.shape is parser.get_default("shape"):
+        check_bpreshuffle_large_offset()
         sweep = pd.DataFrame(opus_a4w4_kid_sweep())
         if not sweep.empty:
             aiter.logger.info(

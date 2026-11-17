@@ -341,10 +341,10 @@ namespace py = pybind11;
           py::arg("Y"),                                     \
           py::arg("kid"));
 
-#define OPUS_GEMM_A4W4_LAUNCH_PYBIND     \
-    m.def("opus_gemm_a4w4_launch",       \
-          &opus_gemm_a4w4_launch,        \
-          "opus_gemm_a4w4_launch",       \
+#define OPUS_GEMM_A4W4_BPRESHUFFLE_LAUNCH_PYBIND     \
+    m.def("opus_gemm_a4w4_bpreshuffle_launch",       \
+          &opus_gemm_a4w4_bpreshuffle_launch,        \
+          "opus_gemm_a4w4_bpreshuffle_launch",       \
           py::arg("XQ"),                 \
           py::arg("WQ"),                 \
           py::arg("Y"),                  \

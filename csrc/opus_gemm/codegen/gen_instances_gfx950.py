@@ -17,8 +17,8 @@ from codegen.common import (
 # ---------------- gfx950 arch-override maps ----------------
 
 PIPELINE_HEADER_MAP = {
-    "a4w4_mxfp4_nt_co": "gfx950/opus_gemm_pipeline_a4w4_mxfp4_nt_gfx950.cuh",
-    "a4w4_mxfp4_nt_small": "gfx950/opus_gemm_pipeline_a4w4_mxfp4_nt_small_gfx950.cuh",
+    "a4w4_mxfp4_nt_bpreshuffle_co": "gfx950/opus_gemm_pipeline_a4w4_mxfp4_nt_bpreshuffle_gfx950.cuh",
+    "a4w4_mxfp4_nt_bpreshuffle_small": "gfx950/opus_gemm_pipeline_a4w4_mxfp4_nt_bpreshuffle_small_gfx950.cuh",
     "a8w8_mxscale_bmm_bpreshuffle_compact": "gfx950/opus_bmm_pipeline_mxscale_compact_gfx950.cuh",
     "a8w8_scale": "gfx950/opus_bmm_pipeline_a8w8_mxscale_gfx950.cuh",
     "a8w8_mxscale": "gfx950/opus_bmm_pipeline_a8w8_mxscale_gfx950.cuh",
@@ -57,8 +57,8 @@ PIPELINE_HEADER_MAP_4G_SAFE = {
 }
 
 TRAITS_HEADER_MAP = {
-    "a4w4_mxfp4_nt_co": "gfx950/opus_gemm_traits_a4w4_mxfp4_nt_gfx950.cuh",
-    "a4w4_mxfp4_nt_small": "gfx950/opus_gemm_traits_a4w4_mxfp4_nt_small_gfx950.cuh",
+    "a4w4_mxfp4_nt_bpreshuffle_co": "gfx950/opus_gemm_traits_a4w4_mxfp4_nt_bpreshuffle_gfx950.cuh",
+    "a4w4_mxfp4_nt_bpreshuffle_small": "gfx950/opus_gemm_traits_a4w4_mxfp4_nt_bpreshuffle_small_gfx950.cuh",
     "a8w8_mxscale_bmm_bpreshuffle_compact": "gfx950/opus_bmm_traits_mxscale_compact_gfx950.cuh",
     "a8w8_scale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
@@ -88,9 +88,9 @@ TRAITS_HEADER_MAP = {
 }
 
 KERNEL_FUNC_MAP = {
-    # a4w4_mxfp4_nt_co: the __device__ body the gen_co stub wraps (build_co.py).
-    "a4w4_mxfp4_nt_co": "gemm_a4w4_mxfp4_nt_body",
-    "a4w4_mxfp4_nt_small": "gemm_a4w4_mxfp4_nt_small_kernel",
+    # a4w4_mxfp4_nt_bpreshuffle_co: the __device__ body the gen_co stub wraps (build_co.py).
+    "a4w4_mxfp4_nt_bpreshuffle_co": "gemm_a4w4_mxfp4_nt_bpreshuffle_body",
+    "a4w4_mxfp4_nt_bpreshuffle_small": "gemm_a4w4_mxfp4_nt_bpreshuffle_small_kernel",
     "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_mxscale_compact_kernel",
     "a8w8_scale": "gemm_a8w8_scale_kernel",
     "a8w8_mxscale": "gemm_a8w8_scale_kernel",
@@ -127,8 +127,8 @@ KERNEL_FUNC_MAP_4G_SAFE = {
 }
 
 TRAITS_NAME_MAP = {
-    "a4w4_mxfp4_nt_co": "opus_mxfp4_nt_traits",
-    "a4w4_mxfp4_nt_small": "opus_gemm_a4w4_mxfp4_nt_small_traits_gfx950",
+    "a4w4_mxfp4_nt_bpreshuffle_co": "opus_mxfp4_nt_bpreshuffle_traits",
+    "a4w4_mxfp4_nt_bpreshuffle_small": "opus_gemm_a4w4_mxfp4_nt_bpreshuffle_small_traits_gfx950",
     "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_mxscale_compact_traits_gfx950",
     "a8w8_scale": "opus_gemm_a8w8_scale_traits_gfx950",
     "a8w8_mxscale": "opus_gemm_a8w8_scale_traits_gfx950",
@@ -158,8 +158,8 @@ TRAITS_NAME_MAP = {
 }
 
 KARGS_NAME_MAP = {
-    "a4w4_mxfp4_nt_co": "opus_gemm_mxfp4_scale_kargs_gfx950",
-    "a4w4_mxfp4_nt_small": "opus_gemm_mxfp4_small_kargs_gfx950",
+    "a4w4_mxfp4_nt_bpreshuffle_co": "opus_gemm_mxfp4_bpreshuffle_kargs_gfx950",
+    "a4w4_mxfp4_nt_bpreshuffle_small": "opus_gemm_mxfp4_bpreshuffle_small_kargs_gfx950",
     "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_compact_kargs_gfx950",
     "a8w8_scale": "opus_gemm_scale_kargs_gfx950",
     "a8w8_mxscale": "opus_gemm_scale_kargs_gfx950",
@@ -3185,14 +3185,14 @@ def gen_bmm_mxscale_fused_instance(
 # row-major, WQ [batch, N, K/2] fp4x2 in shuffle_weight(w, layout=(16, 16)),
 # x_scale / w_scale e8m0 in the e8m0_shuffle layout (2D [batch * rows, cols] or
 # 3D [batch, rows, cols]; rows >= M / N padded to 32, cols = K/32 padded to 8),
-# Y [batch, M, N] bf16. opus_gemm_a4w4_launch (opus_gemm.cu) checks the shapes.
+# Y [batch, M, N] bf16. opus_gemm_a4w4_bpreshuffle_launch (opus_gemm.cu) checks the shapes.
 
-_A4W4_HOST_EXTRA = (
+_A4W4_BPRESHUFFLE_HOST_EXTRA = (
     ",\n    aiter_tensor_t &x_scale,\n    aiter_tensor_t &w_scale,"
     "\n    std::optional<aiter_tensor_t> workspace,\n    int splitK"
 )
 
-_A4W4_SIGNATURE = """template <typename D_C>
+_A4W4_BPRESHUFFLE_SIGNATURE = """template <typename D_C>
 void
 {name}(
     aiter_tensor_t &XQ,
@@ -3204,7 +3204,7 @@ void
     int splitK)"""
 
 # Shape and scale geometry shared by both a4w4 launchers.
-_A4W4_KARGS = """
+_A4W4_BPRESHUFFLE_KARGS = """
     static_assert(std::is_same<D_C, bf16_t>::value, "a4w4 writes bf16");
     const int batch = XQ.size(0);
     const int M = XQ.size(1);
@@ -3226,17 +3226,17 @@ _A4W4_KARGS = """
     kargs.batch = batch;
     kargs.stride_a = K / 2;  // bytes
     kargs.stride_c = N;
-    kargs.stride_a_batch = M * (K / 2);
-    kargs.stride_b_batch = N * (K / 2);
-    kargs.stride_c_batch = M * N;
+    kargs.stride_a_batch = static_cast<long long>(M) * (K / 2);
+    kargs.stride_b_batch = static_cast<long long>(N) * (K / 2);
+    kargs.stride_c_batch = static_cast<long long>(M) * N;
     kargs.stride_sfa = 32 * sf_cols_a;  // bytes of one 32-row e8m0_shuffle block
     kargs.stride_sfb = 32 * sf_cols_b;
-    kargs.stride_sfa_batch = sf_rows_a * sf_cols_a;
-    kargs.stride_sfb_batch = sf_rows_b * sf_cols_b;
+    kargs.stride_sfa_batch = static_cast<long long>(sf_rows_a) * sf_cols_a;
+    kargs.stride_sfb_batch = static_cast<long long>(sf_rows_b) * sf_cols_b;
     auto stream = aiter::getCurrentHIPStream();"""
 
 
-def _record_a4w4_host(cg, k):
+def _record_a4w4_bpreshuffle_host(cg, k):
     for CDtype in k.output_dtypes:
         cg._host_instantiations.append(
             {
@@ -3244,13 +3244,13 @@ def _record_a4w4_host(cg, k):
                 "dtype": CDtype,
                 "host_decl": (
                     f"template void\n{k.name}<{CDtype}>(\n    aiter_tensor_t &XQ,\n"
-                    f"    aiter_tensor_t &WQ,\n    aiter_tensor_t &Y{_A4W4_HOST_EXTRA});\n"
+                    f"    aiter_tensor_t &WQ,\n    aiter_tensor_t &Y{_A4W4_BPRESHUFFLE_HOST_EXTRA});\n"
                 ),
             }
         )
 
 
-def gen_a4w4_co_instance(
+def gen_a4w4_bpreshuffle_co_instance(
     cg, k, traits_header, kargs_name, instance_impl_preamble, **_unused
 ):
     """Host launcher of one pre-compiled a4w4 kid.
@@ -3259,26 +3259,26 @@ def gen_a4w4_co_instance(
     loaded at runtime by opus_co_launch_gfx950.cuh; no device TU.
     Split-K (variant "sk"): splitK = S segments of K, resolved by the caller
     (aiter/ops/opus/gemm_op_a4w4.py); S > 1 needs a caller-owned fp32 workspace
-    of opus_mxfp4_sk_ws_bytes() whose tile-counter block is zeroed here.
+    of opus_mxfp4_bpreshuffle_sk_ws_bytes() whose tile-counter block is zeroed here.
     """
-    from opus_gemm_common import A4W4_CO_DIR, A4W4_CO_MODE
+    from opus_gemm_common import A4W4_BPRESHUFFLE_CO_DIR, A4W4_BPRESHUFFLE_CO_MODE
 
     variant = k.co_variant
-    mode = A4W4_CO_MODE[variant]
+    mode = A4W4_BPRESHUFFLE_CO_MODE[variant]
     if mode == 2:
         mode_code = f"""const int S = splitK < 1 ? 1 : splitK;
     AITER_CHECK(K % (S * {k.B_K}) == 0, "{k.name}: K=", K, " is not a multiple of splitK * {k.B_K} (splitK=", S, ")");
     kargs.split_k = S;
     grid_x = tiles * S;
     if (S > 1) {{
-        AITER_CHECK(tiles <= OPUS_MXFP4_SK_MAX_TILES, "{k.name}: split-K supports at most ",
-                    OPUS_MXFP4_SK_MAX_TILES, " tiles (got ", tiles, ")");
+        AITER_CHECK(tiles <= OPUS_MXFP4_BPRESHUFFLE_SK_MAX_TILES, "{k.name}: split-K supports at most ",
+                    OPUS_MXFP4_BPRESHUFFLE_SK_MAX_TILES, " tiles (got ", tiles, ")");
         AITER_CHECK(workspace.has_value(), "{k.name}: splitK > 1 requires a workspace");
-        const size_t ws_bytes = opus_mxfp4_sk_ws_bytes(tiles, S, {k.B_M}, {k.B_N});
+        const size_t ws_bytes = opus_mxfp4_bpreshuffle_sk_ws_bytes(tiles, S, {k.B_M}, {k.B_N});
         void* ws = opus_validate_workspace(workspace.value(), XQ, AITER_DTYPE_fp32,
                                           (ws_bytes + 3) / 4, 256, "{k.name}");
         // Per-tile arrival counters: the last block of a tile reduces the partials.
-        HIP_CALL(hipMemsetAsync(ws, 0, opus_mxfp4_sk_counter_bytes(tiles), stream));
+        HIP_CALL(hipMemsetAsync(ws, 0, opus_mxfp4_bpreshuffle_sk_counter_bytes(tiles), stream));
         kargs.ptr_ws = ws;
     }}"""
     else:
@@ -3289,8 +3289,8 @@ def gen_a4w4_co_instance(
             mode_code += f"""
     AITER_CHECK(M % {k.B_M} == 0 && N % {k.B_N} == 0,
                 "{k.name} needs M % {k.B_M} == 0 and N % {k.B_N} == 0 (M=", M, " N=", N, ")");"""
-    kargs_code = _A4W4_KARGS.format(kargs_name=kargs_name)
-    signature = _A4W4_SIGNATURE.format(name=k.name)
+    kargs_code = _A4W4_BPRESHUFFLE_KARGS.format(kargs_name=kargs_name)
+    signature = _A4W4_BPRESHUFFLE_SIGNATURE.format(name=k.name)
     INSTANCE_IMPL = f"""{instance_impl_preamble()}
 #include "{traits_header}"
 #if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
@@ -3307,16 +3307,16 @@ def gen_a4w4_co_instance(
     kargs.ptr_ws = nullptr;
     {mode_code}
     kargs.grid_blocks = grid_x;
-    static AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel("{k.name}", "{A4W4_CO_DIR}");
+    static AiterAsmKernelFast& kernel = opus_gfx950_co::co_kernel("{k.name}", "{A4W4_BPRESHUFFLE_CO_DIR}");
     opus_co_launch_gfx950(kernel, dim3(grid_x), dim3({k.BLOCK_SIZE}), kargs, stream);
 }}
 #endif // launcher only on regular host pass
 """
     write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
-    _record_a4w4_host(cg, k)
+    _record_a4w4_bpreshuffle_host(cg, k)
 
 
-def gen_a4w4_small_instance(
+def gen_a4w4_bpreshuffle_small_instance(
     cg,
     k,
     traits_header,
@@ -3334,12 +3334,12 @@ def gen_a4w4_small_instance(
     [256 B: opus_splitk_ws_handle][S][batch][padded_M][padded_N] partials; the
     handle the kernel reads the partials pointer from is written in stream order.
     """
-    from opus_gemm_common import A4W4_SMALL_CFG_OF
+    from opus_gemm_common import A4W4_BPRESHUFFLE_SMALL_CFG_OF
 
-    bm, bn, d, ks = A4W4_SMALL_CFG_OF[k.name]
+    bm, bn, d, ks = A4W4_BPRESHUFFLE_SMALL_CFG_OF[k.name]
     traits = f"{traits_name}<{bm}, {bn}, {d}, {ks}>"
-    kargs_code = _A4W4_KARGS.format(kargs_name=kargs_name)
-    signature = _A4W4_SIGNATURE.format(name=k.name)
+    kargs_code = _A4W4_BPRESHUFFLE_KARGS.format(kargs_name=kargs_name)
+    signature = _A4W4_BPRESHUFFLE_SIGNATURE.format(name=k.name)
     INSTANCE_IMPL = f"""{instance_impl_preamble()}
 #ifdef OPUS_FUSED_HOST_TU
 #include "{traits_header}"
@@ -3383,7 +3383,7 @@ __global__ __launch_bounds__(256, 1) void {kernel_func}({kargs_name} kargs);
 #endif // launcher only on regular host pass
 """
     write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
-    _record_a4w4_host(cg, k)
+    _record_a4w4_bpreshuffle_host(cg, k)
     for CDtype in k.output_dtypes:
         cg._device_instantiations.append(
             {
@@ -3405,8 +3405,8 @@ register_emit("gfx950", "a8w8", gen_noscale_instance_gfx950)
 register_emit("gfx950", "a16w16_mono_tile", gen_mono_tile_instance)
 register_emit("gfx950", "a16w16_flatmm", gen_flatmm_instance)
 register_emit("gfx950", "a16w16_flatmm_splitk", gen_flatmm_splitk_instance)
-register_emit("gfx950", "a4w4_mxfp4_nt_co", gen_a4w4_co_instance)
-register_emit("gfx950", "a4w4_mxfp4_nt_small", gen_a4w4_small_instance)
+register_emit("gfx950", "a4w4_mxfp4_nt_bpreshuffle_co", gen_a4w4_bpreshuffle_co_instance)
+register_emit("gfx950", "a4w4_mxfp4_nt_bpreshuffle_small", gen_a4w4_bpreshuffle_small_instance)
 
 
 def _register_bmm_emit(kernel_tag, fn, launcher_tile_mult):

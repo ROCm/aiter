@@ -25,7 +25,7 @@ from codegen.common import (
     write_if_changed,
 )
 from opus_gemm_common import (
-    A4W4_TAGS,
+    A4W4_BPRESHUFFLE_TAGS,
     KERNEL_REGISTRY,
     KernelKey,
     OpusGemmInstance,
@@ -271,8 +271,8 @@ INPUT_DTYPE_MAP = {
     "a8w8_mxscale_bmm_wave4m2_selfload": ("fp8_t", "fp8_t"),
     "a8w8": ("fp8_t", "fp8_t"),
     "a8w8_blockscale_bpreshuffle_singlebuf": ("fp8_t", "fp8_t"),
-    "a4w4_mxfp4_nt_co": ("fp4_t", "fp4_t"),
-    "a4w4_mxfp4_nt_small": ("fp4_t", "fp4_t"),
+    "a4w4_mxfp4_nt_bpreshuffle_co": ("fp4_t", "fp4_t"),
+    "a4w4_mxfp4_nt_bpreshuffle_small": ("fp4_t", "fp4_t"),
     **{tag: ("bf16_t", "bf16_t") for tag in _A16W16_TAGS},
 }
 
@@ -1006,7 +1006,7 @@ void
             # A4W4 launchers take the same arguments as the MXFP8 BMM ones.
             if (
                 k.kernel_tag.startswith("a8w8_mxscale_bmm_")
-                or k.kernel_tag in A4W4_TAGS
+                or k.kernel_tag in A4W4_BPRESHUFFLE_TAGS
             ):
                 parts.append(MANIFEST_BMM_MXSCALE.format(kernel_name=k.name))
             elif k.kernel_tag in SPLITK_TAGS:

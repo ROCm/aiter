@@ -11,7 +11,7 @@
   "hip_clang_path": "/root/toolchains/yuyzhang512-amdgpu-pin-op-dst-build/bin",
   "kernels": [
     {
-      "co_sha256": "a8fce4c2fa95835f76180d6bfa403643b94e25a0aa8590ea68582d3348c67f91",
+      "co_sha256": "9052ed805bd6c1c1e6a981fb901c86a5b9cd440b853111a8f95da11fe68e74ae",
       "device_flags": [
         "-ffast-math"
       ],
@@ -19,7 +19,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 163840,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 0,
       "launch_bounds": [
         256,
@@ -27,8 +27,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 21,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_256x256x256",
+      "sgpr_spill_count": 27,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x256x256",
       "tile": [
         256,
         256,
@@ -41,7 +41,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "2717885d63561b8fae43f460d0c5cc28bcdf298a7151f18da9cb32e6f7f3405f",
+      "co_sha256": "8a36f050cbae7e80f4202956e122d9de6091612cf18c2afa5ba858746f46a18e",
       "device_flags": [
         "-ffast-math"
       ],
@@ -49,7 +49,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 122880,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 1,
       "launch_bounds": [
         256,
@@ -57,8 +57,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 23,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_256x128x256",
+      "sgpr_spill_count": 29,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x128x256",
       "tile": [
         256,
         128,
@@ -71,7 +71,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "e662f72afc4e3a38131faf32f69802ebfff5e82b32eb1241203d13c29c36be61",
+      "co_sha256": "63e9c842bba58d004953432d90a84efb7851ef2338db172056e78cc5af0f0750",
       "device_flags": [
         "-ffast-math"
       ],
@@ -79,7 +79,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 122880,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 2,
       "launch_bounds": [
         256,
@@ -87,8 +87,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 20,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_128x256x256",
+      "sgpr_spill_count": 27,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_128x256x256",
       "tile": [
         128,
         256,
@@ -101,7 +101,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "cb584edbf4009b20b77c7e70df4552e00cb90f13eeed69b1b99f87d1106e4bd9",
+      "co_sha256": "6a96da2f0b2b1be0bef10a76cad1bb2f47d688d8a083368324b21bc130b08f21",
       "device_flags": [
         "-ffast-math"
       ],
@@ -109,7 +109,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 81920,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 3,
       "launch_bounds": [
         256,
@@ -117,8 +117,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 18,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_128x128x256",
+      "sgpr_spill_count": 25,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_128x128x256",
       "tile": [
         128,
         128,
@@ -131,7 +131,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "45602709bc8304f3f61f16a2bbf334a501fe91c9c95684ef99af823dff1607f3",
+      "co_sha256": "33eeca8549e3eb5ab831c67c1d5eba5b124e2b0be1e540efeb253463f394ddce",
       "device_flags": [
         "-ffast-math"
       ],
@@ -139,7 +139,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 143360,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 4,
       "launch_bounds": [
         256,
@@ -147,8 +147,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 23,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_192x256x256",
+      "sgpr_spill_count": 29,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_192x256x256",
       "tile": [
         192,
         256,
@@ -161,7 +161,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "15c48511b489772f5ca562318e92dc7c15cdc88ca464319ef510a3a175fbfed6",
+      "co_sha256": "b7667c023b6615997e1158277318bfb784f07783a96b1b2d94a6dfe29dfaea43",
       "device_flags": [
         "-ffast-math"
       ],
@@ -169,7 +169,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 143360,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 5,
       "launch_bounds": [
         256,
@@ -177,8 +177,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 25,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_256x192x256",
+      "sgpr_spill_count": 30,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x192x256",
       "tile": [
         256,
         192,
@@ -191,7 +191,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "d4185566dd6439c751eb16847176e940eacdfa88290fb9da1324af774950e476",
+      "co_sha256": "449fd9a7a56e1af320ef82ecd1e44cea96a005d8ce65c5092837f7c6ae79ecbc",
       "device_flags": [
         "-ffast-math"
       ],
@@ -199,7 +199,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 163840,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 10,
       "launch_bounds": [
         256,
@@ -207,8 +207,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 14,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_256x256x256_np",
+      "sgpr_spill_count": 21,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x256x256_np",
       "tile": [
         256,
         256,
@@ -221,7 +221,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "a20e107770ef3f4e2745def3e773c841e5ba66bb32f485587c97ba5acda04148",
+      "co_sha256": "86feaa217e07d25d49d16024436d7f2a5ca9358758148832998bef49e003907b",
       "device_flags": [
         "-ffast-math"
       ],
@@ -229,7 +229,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 122880,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 11,
       "launch_bounds": [
         256,
@@ -237,8 +237,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 16,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_256x128x256_np",
+      "sgpr_spill_count": 24,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x128x256_np",
       "tile": [
         256,
         128,
@@ -251,7 +251,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "eab30ee734639a3365ab47cc5bda3c7625c30ac521328f81249a4816f6fcca80",
+      "co_sha256": "259e9db835390bfdb83a5c712a97937a77fea39584a82793389c212ac19257cf",
       "device_flags": [
         "-ffast-math"
       ],
@@ -259,7 +259,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 122880,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 12,
       "launch_bounds": [
         256,
@@ -267,8 +267,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 13,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_128x256x256_np",
+      "sgpr_spill_count": 20,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_128x256x256_np",
       "tile": [
         128,
         256,
@@ -281,7 +281,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "6b3a56d47057b26f5001eb4bbafc8d2b4ed14848cd07485f085c9517e831a1d3",
+      "co_sha256": "a2c27c157eddb55a8f9c9c771e5d74b89dd5ec855c7769327d9995dd1c6a7dae",
       "device_flags": [
         "-ffast-math"
       ],
@@ -289,7 +289,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 81920,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 13,
       "launch_bounds": [
         256,
@@ -297,8 +297,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 9,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_128x128x256_np",
+      "sgpr_spill_count": 17,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_128x128x256_np",
       "tile": [
         128,
         128,
@@ -311,7 +311,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "6a6244fd0c2c63f0dabf9bdd6563e1889e210b2371384782fd25f9bd1737bc65",
+      "co_sha256": "22ddf0f9ca8751548dcdcdd2ef0345fae55698cc9a7f52f24da1a7d216e0d232",
       "device_flags": [
         "-ffast-math"
       ],
@@ -319,7 +319,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 143360,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 14,
       "launch_bounds": [
         256,
@@ -327,8 +327,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 11,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_192x256x256_np",
+      "sgpr_spill_count": 19,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_192x256x256_np",
       "tile": [
         192,
         256,
@@ -341,7 +341,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "945c3ddb28015878408e691f0f6a689187f4f870ded3a09b1ee4a2865cfd40de",
+      "co_sha256": "7db2d13d49639dce7fcbed1646fec1e37b4de6711df7215897901421ca4b246e",
       "device_flags": [
         "-ffast-math"
       ],
@@ -349,7 +349,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 143360,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 15,
       "launch_bounds": [
         256,
@@ -357,8 +357,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 16,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_256x192x256_np",
+      "sgpr_spill_count": 24,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x192x256_np",
       "tile": [
         256,
         192,
@@ -371,7 +371,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "0f70bfd8ed7ad89e66942f16acb004781ba11752ffe30cacc5b9806d8b8ab4d7",
+      "co_sha256": "de97dd3df54e01d7ef4c09a3cdf18c558ee4f0e180e993265129dd8dde2490c1",
       "device_flags": [
         "-ffast-math"
       ],
@@ -379,7 +379,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 122880,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 21,
       "launch_bounds": [
         256,
@@ -387,8 +387,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 47,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_256x128x256_sk",
+      "sgpr_spill_count": 52,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x128x256_sk",
       "tile": [
         256,
         128,
@@ -401,7 +401,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "c6b2d9b3ab009561d964b3554e36320ce7636284e6024d5cf2d7aa48c2744fc8",
+      "co_sha256": "b74930be8f5d08675b0bbfee7454767e30ad5e6c2ccbae1f897bf001e45e2f3f",
       "device_flags": [
         "-ffast-math"
       ],
@@ -409,7 +409,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 122880,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 22,
       "launch_bounds": [
         256,
@@ -417,8 +417,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 41,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_128x256x256_sk",
+      "sgpr_spill_count": 46,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_128x256x256_sk",
       "tile": [
         128,
         256,
@@ -431,7 +431,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "69460db8da187f36e06c1df36ff237d6fa344cc05184a61f12e968d365bee779",
+      "co_sha256": "df6bdfdd77da3deb92b6de1c5ec3616f221cef524e7dfe31245c12f9d7c35082",
       "device_flags": [
         "-ffast-math"
       ],
@@ -439,7 +439,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 81920,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 23,
       "launch_bounds": [
         256,
@@ -447,8 +447,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 44,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_128x128x256_sk",
+      "sgpr_spill_count": 49,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_128x128x256_sk",
       "tile": [
         128,
         128,
@@ -461,7 +461,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "4b2514fefd9c1a572c52e3082ed310da53f679b6cce9e4938831efb59d9c770f",
+      "co_sha256": "3e611045def20422fea7ef332ee6126921d987a54d8bbfb21e215ffef529f3f3",
       "device_flags": [
         "-ffast-math"
       ],
@@ -469,7 +469,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 143360,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 24,
       "launch_bounds": [
         256,
@@ -477,8 +477,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 40,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_192x256x256_sk",
+      "sgpr_spill_count": 46,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_192x256x256_sk",
       "tile": [
         192,
         256,
@@ -491,7 +491,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "5a6da4dbd781a841003460b5ce9a457bf8bb8d5013ab1d114e91f31f20603e50",
+      "co_sha256": "dbe8fef127855e68b9b350fac1409cf35e60e9455345cda2994bc50c31560ce4",
       "device_flags": [
         "-ffast-math"
       ],
@@ -499,7 +499,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 143360,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 25,
       "launch_bounds": [
         256,
@@ -507,8 +507,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 45,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_256x192x256_sk",
+      "sgpr_spill_count": 53,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x192x256_sk",
       "tile": [
         256,
         192,
@@ -521,7 +521,7 @@
       "vgpr_spill_count": 0
     },
     {
-      "co_sha256": "4c75021fd31d2bc30a158ffd497a49160fd94a0eae0c38a7847b79e4c52083b8",
+      "co_sha256": "b5cc27ab608aa23d814091f5bd3a7d98372b3e2620d1124adab2cf8c6c666003",
       "device_flags": [
         "-ffast-math"
       ],
@@ -529,7 +529,7 @@
       "elf_machine": 224,
       "elf_processor_id": 79,
       "group_segment_fixed_size": 163840,
-      "kernarg_segment_size": 112,
+      "kernarg_segment_size": 136,
       "kid": 30,
       "launch_bounds": [
         256,
@@ -537,8 +537,8 @@
       ],
       "offload_arch": "gfx950",
       "sgpr_count": 106,
-      "sgpr_spill_count": 17,
-      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_co_256x256x256_nob",
+      "sgpr_spill_count": 31,
+      "symbol": "opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_256x256x256_nob",
       "tile": [
         256,
         256,

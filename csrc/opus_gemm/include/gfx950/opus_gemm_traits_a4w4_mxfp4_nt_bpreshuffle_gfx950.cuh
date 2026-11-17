@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Traits and kargs for the a4w4_mxfp4_nt pipeline (MXFP4 x MXFP4, 1x32 UE8M0 scales, NT, 2x2 4-wave, persistent).
+// Traits and kargs for the a4w4_mxfp4_nt_bpreshuffle pipeline (MXFP4 x MXFP4, 1x32 UE8M0 scales, NT, 2x2 4-wave, persistent).
 #pragma once
 
 // Only opus is needed (not opus_gemm_utils.cuh): the kernel is built offline with the pin toolchain into a .co, and
@@ -16,8 +16,10 @@
 // shuffle_weight(w, layout=(16, 16)) layout (stride_b stays K/2, the row-major row stride).  SFA/SFB are UE8M0 in
 // the aiter gfx950 e8m0_shuffle / shuffle_scale layout (rows padded to 32,
 // K/32 padded to 8, [rows/32][K/256][k_lane 4][row 16][kk 2][row-pair 2]);
-// stride_sfa/sfb is the byte stride of one 32-row block (32 * K/32 padded to 8).
-struct opus_gemm_mxfp4_scale_kargs_gfx950 {
+// stride_sfa/sfb is the byte stride of one 32-row block (32 * K/32 padded to 8).  Tile base offsets are 64-bit (batch
+// strides are long long, row / column offsets are widened) and the buffer ranges span one tile, so an operand may
+// exceed 2^31 elements.
+struct opus_gemm_mxfp4_bpreshuffle_kargs_gfx950 {
     const void* __restrict__ ptr_a;
     const void* __restrict__ ptr_b;
     void* __restrict__ ptr_c;
@@ -28,21 +30,22 @@ struct opus_gemm_mxfp4_scale_kargs_gfx950 {
     int stride_a;
     int stride_b;
     int stride_c;
-    int stride_a_batch;
-    int stride_b_batch;
-    int stride_c_batch;
+    long long stride_a_batch;
+    long long stride_b_batch;
+    long long stride_c_batch;
     const void* __restrict__ ptr_sfa;
     const void* __restrict__ ptr_sfb;
     int stride_sfa;
     int stride_sfb;
-    int stride_sfa_batch;
-    int stride_sfb_batch;
+    long long stride_sfa_batch;
+    long long stride_sfb_batch;
     int grid_blocks;          // persistent kernel: number of launched blocks (avoids reading the dispatch packet)
     int split_k;              // MODE 2 (split-K): number of K segments S (grid = tiles * S); otherwise unused
     void* __restrict__ ptr_ws;   // MODE 2: workspace = [tile counters (int, padded to 256 B)][tiles][S][B_M * B_N] fp32 partials
 };
 
-__host__ __device__ inline int opus_mxfp4_ceil_div(int a, int b) { return (a + b - 1) / b; }
+__host__ __device__ inline int opus_mxfp4_bpreshuffle_ceil_div(int a, int b) { return (a + b - 1) / b; }
+__host__ __device__ inline int opus_mxfp4_bpreshuffle_min(int a, int b) { return a < b ? a : b; }
 
 // MXFP4 x MXFP4 NT, 4 waves (2x2), tile 256x256x256 (elements), 1x32 UE8M0.
 // K tile = 256 fp4 = 128 bytes per row: the gmem/LDS geometry of the fp8
@@ -56,7 +59,7 @@ __host__ __device__ inline int opus_mxfp4_ceil_div(int a, int b) { return (a + b
 //        per block, fp32 partials in a workspace, the last-arriving block of a tile reduces them and writes C.
 // BOUNDARY_: false drops the M / N boundary handling (M % B_M == 0 and N % B_N == 0 required).
 template<int BLOCK_SIZE_, typename BLOCK_, typename DTYPE_, typename VEC_, typename GROUP_, int MODE_ = 0, bool BOUNDARY_ = true>
-struct opus_gemm_a4w4_mxfp4_nt_traits_gfx950 {
+struct opus_gemm_a4w4_mxfp4_nt_bpreshuffle_traits_gfx950 {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
     using VEC   = opus::remove_cvref_t<VEC_>;
@@ -152,15 +155,15 @@ struct opus_gemm_a4w4_mxfp4_nt_traits_gfx950 {
     static constexpr int LDS_BYTES = SMEM_A_BYTES + SMEM_B_BYTES + SCALE_PANEL_BUFFERS * (SFA_PANEL_BYTES + SFB_PANEL_BYTES);
     static_assert(LDS_BYTES <= 163840);   // s1: padding 64 -> exactly 160 KB
 };
-// Shorthand used by the dev harness: opus_mxfp4_nt_traits<B_M, B_N>.
+// Shorthand used by the dev harness: opus_mxfp4_nt_bpreshuffle_traits<B_M, B_N>.
 template<int BM, int BN, int MODE = 0, bool BOUNDARY = true>
-using opus_mxfp4_nt_traits = opus_gemm_a4w4_mxfp4_nt_traits_gfx950<256, opus::seq<BM, BN, 256>,
+using opus_mxfp4_nt_bpreshuffle_traits = opus_gemm_a4w4_mxfp4_nt_bpreshuffle_traits_gfx950<256, opus::seq<BM, BN, 256>,
     opus::tuple<opus::fp4_t, opus::fp4_t, opus::bf16_t, opus::fp32_t, opus::e8m0_t>, opus::seq<16, 16, 4>, opus::seq<1, 1, 32>, MODE, BOUNDARY>;
 // Split-K workspace: a fixed 4 KB counter block (one int per tile, at most 1024 tiles) followed by tiles * S partial
 // tiles of B_M * B_N fp32.  The launcher zeroes the counter block before every split-K launch (the workspace may be a
 // fresh torch.empty); each tile's last block also resets its own counter after the reduction.
-constexpr int OPUS_MXFP4_SK_MAX_TILES = 1024;
-__host__ __device__ inline long opus_mxfp4_sk_counter_bytes(int /*tiles*/) { return OPUS_MXFP4_SK_MAX_TILES * 4; }
-__host__ __device__ inline long opus_mxfp4_sk_ws_bytes(int tiles, int split_k, int b_m, int b_n) {
-    return opus_mxfp4_sk_counter_bytes(tiles) + static_cast<long>(tiles) * split_k * b_m * b_n * 4;
+constexpr int OPUS_MXFP4_BPRESHUFFLE_SK_MAX_TILES = 1024;
+__host__ __device__ inline long opus_mxfp4_bpreshuffle_sk_counter_bytes(int /*tiles*/) { return OPUS_MXFP4_BPRESHUFFLE_SK_MAX_TILES * 4; }
+__host__ __device__ inline long opus_mxfp4_bpreshuffle_sk_ws_bytes(int tiles, int split_k, int b_m, int b_n) {
+    return opus_mxfp4_bpreshuffle_sk_counter_bytes(tiles) + static_cast<long>(tiles) * split_k * b_m * b_n * 4;
 }

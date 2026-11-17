@@ -3,7 +3,7 @@
 //
 // Small-tile MXFP4 x MXFP4 NT GEMM (gfx950), shuffle layout (aiter gemm_a4w4(bpreshuffle=True)): A [M, K/2] fp4x2
 // row-major, B shuffle_weight(16, 16), scales e8m0_shuffle (1x32 UE8M0), C [M, N] bf16.  M <= ~512.  opus, standard
-// ROCm toolchain (no pin attributes).  Traits / kargs: opus_gemm_traits_a4w4_mxfp4_nt_small_gfx950.cuh.
+// ROCm toolchain (no pin attributes).  Traits / kargs: opus_gemm_traits_a4w4_mxfp4_nt_bpreshuffle_small_gfx950.cuh.
 //
 // 1x4 waves (T_M = 1, T_N = 4): the 4 waves split the tile along N and share A.
 //   A: global -> LDS by LDS-DMA into a STAGES-deep ring (one __shared__ object per stage), ds_read one step ahead;
@@ -18,9 +18,9 @@
 // Split-K (split_k = S > 1): each block writes its fp32 partial tile to the workspace, splitk_reduce_kernel
 //   (splitk_reduce_gfx950.cuh) sums the S partials into C.
 #pragma once
-#include "opus_gemm_traits_a4w4_mxfp4_nt_small_gfx950.cuh"
+#include "opus_gemm_traits_a4w4_mxfp4_nt_bpreshuffle_small_gfx950.cuh"
 
-namespace opus_mxfp4_small {
+namespace opus_mxfp4_bpreshuffle_small {
 using opus::operator""_I;
 using fp4x32_t = opus::vector_t<opus::i32_t, 4>;   // one fp4 MFMA operand: 32 fp4 = 16 bytes per lane
 using i32x8_t = opus::vector_t<opus::i32_t, 8>;
@@ -202,7 +202,7 @@ __device__ __forceinline__ void mma_scale_one(CF& c, const fp4x32_t& b, const fp
 // Kernel body
 // ===========================================================================
 template<class Traits>
-__device__ __forceinline__ void gemm_a4w4_mxfp4_nt_small_body(const opus_gemm_mxfp4_small_kargs_gfx950& kargs) {
+__device__ __forceinline__ void gemm_a4w4_mxfp4_nt_bpreshuffle_small_body(const opus_gemm_mxfp4_bpreshuffle_small_kargs_gfx950& kargs) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_AB = opus::u8_t;     // fp4x2 bytes
@@ -370,12 +370,12 @@ __device__ __forceinline__ void gemm_a4w4_mxfp4_nt_small_body(const opus_gemm_mx
     }); });
 }
 
-}   // namespace opus_mxfp4_small
+}   // namespace opus_mxfp4_bpreshuffle_small
 
 // grid = ((N + B_N - 1) / B_N, (M + B_M - 1) / B_M, batch * split_k), block = 256.
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a4w4_mxfp4_nt_small_kernel(opus_gemm_mxfp4_small_kargs_gfx950 kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 1) void gemm_a4w4_mxfp4_nt_bpreshuffle_small_kernel(opus_gemm_mxfp4_bpreshuffle_small_kargs_gfx950 kargs) {
 #if defined(__gfx950__)
-    opus_mxfp4_small::gemm_a4w4_mxfp4_nt_small_body<Traits>(kargs);
+    opus_mxfp4_bpreshuffle_small::gemm_a4w4_mxfp4_nt_bpreshuffle_small_body<Traits>(kargs);
 #endif   // __gfx950__
 }

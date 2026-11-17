@@ -3,7 +3,7 @@
 #include <opus/hip_minimal.hpp>
 #include <opus/opus.hpp>
 
-#include "opus_gemm_traits_a4w4_mxfp4_nt_gfx950.cuh"
+#include "opus_gemm_traits_a4w4_mxfp4_nt_bpreshuffle_gfx950.cuh"
 
 #ifndef AB_AUX   // cache policy of the A / B LDS-DMA loads
 #define AB_AUX 0
@@ -330,7 +330,7 @@ constexpr int c_reg() {
 // Kernel body as a device function: it backs the template __global__ below and the extern "C" entry points of the
 // pre-compiled .co images (gen_co/build_co_gfx950.py).
 template<class Traits>
-__device__ __forceinline__ void gemm_a4w4_mxfp4_nt_body(opus_gemm_mxfp4_scale_kargs_gfx950 kargs) {
+__device__ __forceinline__ void gemm_a4w4_mxfp4_nt_bpreshuffle_body(opus_gemm_mxfp4_bpreshuffle_kargs_gfx950 kargs) {
 #if defined(__gfx950__)
     using namespace opus;
 
@@ -343,9 +343,9 @@ __device__ __forceinline__ void gemm_a4w4_mxfp4_nt_body(opus_gemm_mxfp4_scale_ka
     using D_SF = opus::e8m0_t;
     using D_SF_PACK = opus::u32_t;
 
-    const int num_tiles_n = opus_mxfp4_ceil_div(kargs.n, T::B_N);
+    const int num_tiles_n = opus_mxfp4_bpreshuffle_ceil_div(kargs.n, T::B_N);
     const int wave_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
-    const int tiles_per_batch = opus_mxfp4_ceil_div(kargs.m, T::B_M) * num_tiles_n;
+    const int tiles_per_batch = opus_mxfp4_bpreshuffle_ceil_div(kargs.m, T::B_M) * num_tiles_n;
     const int total_tiles = tiles_per_batch * kargs.batch;
     // Persistent: block b runs tiles b, b + grid_blocks, ...; one tile (split-K: tile x K segment) per block otherwise.
     const int split_k = T::SPLITK ? (kargs.split_k < 0 ? -kargs.split_k : kargs.split_k) : 1;
@@ -406,19 +406,21 @@ __device__ __forceinline__ void gemm_a4w4_mxfp4_nt_body(opus_gemm_mxfp4_scale_ka
     const int wave_id_n = wave_id / T::T_M;
 
     // M / N boundary: rows of A / B / C past the matrix are outside the buffer range (loads return 0, stores are
-    // dropped); C columns past N are masked per 16 B copy.
-    const int rows_in = T::BOUNDARY ? kargs.m - row : T::B_M, cols_in = T::BOUNDARY ? kargs.n - col : T::B_N;
+    // dropped); C columns past N are masked per 16 B copy.  The tile base is 64-bit and every range spans this tile
+    // only (rows_in <= B_M, cols_in <= B_N), so neither the base nor a 32-bit range overflows on a > 4 GiB operand.
+    const int rows_in = T::BOUNDARY ? opus_mxfp4_bpreshuffle_min(kargs.m - row, T::B_M) : T::B_M;
+    const int cols_in = T::BOUNDARY ? opus_mxfp4_bpreshuffle_min(kargs.n - col, T::B_N) : T::B_N;
     const int a_k0 = kt0 * T::B_K_BYTES, b_k0 = kt0 * T::B_K_BYTES * T::W_N, sf_k0 = kt0 * 256;
-    auto g_a = make_gmem(reinterpret_cast<const D_AB*>(kargs.ptr_a) + batch_id * kargs.stride_a_batch + row * kargs.stride_a + a_k0,
+    auto g_a = make_gmem(reinterpret_cast<const D_AB*>(kargs.ptr_a) + batch_id * kargs.stride_a_batch + static_cast<long long>(row) * kargs.stride_a + a_k0,
                          T::BOUNDARY ? static_cast<unsigned int>(rows_in) * static_cast<unsigned int>(kargs.stride_a) - a_k0 : 0xffffffffu);
-    auto g_b = make_gmem(reinterpret_cast<const D_AB*>(kargs.ptr_b) + batch_id * kargs.stride_b_batch + col * kargs.stride_b + b_k0,
+    auto g_b = make_gmem(reinterpret_cast<const D_AB*>(kargs.ptr_b) + batch_id * kargs.stride_b_batch + static_cast<long long>(col) * kargs.stride_b + b_k0,
                          T::BOUNDARY ? static_cast<unsigned int>(cols_in) * static_cast<unsigned int>(kargs.stride_b) - b_k0 : 0xffffffffu);
-    auto g_c = make_gmem(reinterpret_cast<D_C*>(kargs.ptr_c) + batch_id * kargs.stride_c_batch + row * kargs.stride_c + col,
+    auto g_c = make_gmem(reinterpret_cast<D_C*>(kargs.ptr_c) + batch_id * kargs.stride_c_batch + static_cast<long long>(row) * kargs.stride_c + col,
                          T::BOUNDARY ? static_cast<unsigned int>(rows_in) * static_cast<unsigned int>(kargs.stride_c) * 2u : 0xffffffffu);
-    auto g_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa) + batch_id * kargs.stride_sfa_batch + (row / 32) * kargs.stride_sfa + sf_k0,
-                           static_cast<unsigned int>(opus_mxfp4_ceil_div(kargs.m - row, 32) * kargs.stride_sfa - sf_k0));
-    auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb) + batch_id * kargs.stride_sfb_batch + (col / 32) * kargs.stride_sfb + sf_k0,
-                           static_cast<unsigned int>(opus_mxfp4_ceil_div(kargs.n - col, 32) * kargs.stride_sfb - sf_k0));
+    auto g_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa) + batch_id * kargs.stride_sfa_batch + static_cast<long long>(row / 32) * kargs.stride_sfa + sf_k0,
+                           static_cast<unsigned int>(opus_mxfp4_bpreshuffle_ceil_div(rows_in, 32) * kargs.stride_sfa - sf_k0));
+    auto g_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb) + batch_id * kargs.stride_sfb_batch + static_cast<long long>(col / 32) * kargs.stride_sfb + sf_k0,
+                           static_cast<unsigned int>(opus_mxfp4_bpreshuffle_ceil_div(cols_in, 32) * kargs.stride_sfb - sf_k0));
 
     const auto u_ga = make_layout_ga<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_a);
     const auto u_gb = make_layout_gb<T>(lane_id, wave_id_m, wave_id_n, kargs.stride_b);
@@ -942,14 +944,16 @@ __device__ __forceinline__ void gemm_a4w4_mxfp4_nt_body(opus_gemm_mxfp4_scale_ka
         const int n_in_batch = nid % tiles_per_batch;
         const int n_row = (n_in_batch / num_tiles_n) * T::B_M;
         const int n_col = (n_in_batch % num_tiles_n) * T::B_N;
-        auto ng_a = make_gmem(reinterpret_cast<const D_AB*>(kargs.ptr_a) + n_batch * kargs.stride_a_batch + n_row * kargs.stride_a,
-                              has_next ? static_cast<unsigned int>(kargs.m - n_row) * static_cast<unsigned int>(kargs.stride_a) : 0u);
-        auto ng_b = make_gmem(reinterpret_cast<const D_AB*>(kargs.ptr_b) + n_batch * kargs.stride_b_batch + n_col * kargs.stride_b,
-                              has_next ? static_cast<unsigned int>(kargs.n - n_col) * static_cast<unsigned int>(kargs.stride_b) : 0u);
-        auto ng_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa) + n_batch * kargs.stride_sfa_batch + (n_row / 32) * kargs.stride_sfa,
-                                has_next ? static_cast<unsigned int>(opus_mxfp4_ceil_div(kargs.m - n_row, 32) * kargs.stride_sfa) : 0u);
-        auto ng_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb) + n_batch * kargs.stride_sfb_batch + (n_col / 32) * kargs.stride_sfb,
-                                has_next ? static_cast<unsigned int>(opus_mxfp4_ceil_div(kargs.n - n_col, 32) * kargs.stride_sfb) : 0u);
+        const int n_rows_in = opus_mxfp4_bpreshuffle_min(kargs.m - n_row, T::B_M);
+        const int n_cols_in = opus_mxfp4_bpreshuffle_min(kargs.n - n_col, T::B_N);
+        auto ng_a = make_gmem(reinterpret_cast<const D_AB*>(kargs.ptr_a) + n_batch * kargs.stride_a_batch + static_cast<long long>(n_row) * kargs.stride_a,
+                              has_next ? static_cast<unsigned int>(n_rows_in) * static_cast<unsigned int>(kargs.stride_a) : 0u);
+        auto ng_b = make_gmem(reinterpret_cast<const D_AB*>(kargs.ptr_b) + n_batch * kargs.stride_b_batch + static_cast<long long>(n_col) * kargs.stride_b,
+                              has_next ? static_cast<unsigned int>(n_cols_in) * static_cast<unsigned int>(kargs.stride_b) : 0u);
+        auto ng_sfa = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfa) + n_batch * kargs.stride_sfa_batch + static_cast<long long>(n_row / 32) * kargs.stride_sfa,
+                                has_next ? static_cast<unsigned int>(opus_mxfp4_bpreshuffle_ceil_div(n_rows_in, 32) * kargs.stride_sfa) : 0u);
+        auto ng_sfb = make_gmem(reinterpret_cast<const D_SF*>(kargs.ptr_sfb) + n_batch * kargs.stride_sfb_batch + static_cast<long long>(n_col / 32) * kargs.stride_sfb,
+                                has_next ? static_cast<unsigned int>(opus_mxfp4_bpreshuffle_ceil_div(n_cols_in, 32) * kargs.stride_sfb) : 0u);
         prefetched = T::PERSIST ? has_next : false;
 
         s_waitcnt_lgkmcnt(0_I);
@@ -995,13 +999,13 @@ __device__ __forceinline__ void gemm_a4w4_mxfp4_nt_body(opus_gemm_mxfp4_scale_ka
 
     // Split-K, S > 1: store this segment's fp32 partial tile (C fragment layout, row stride B_N) to the workspace; the
     // last block to arrive for this tile (atomic counter, reset by that block) adds the other S - 1 partials and writes
-    // C below.  kargs.split_k < 0: partials only, gemm_a4w4_mxfp4_nt_sk_reduce sums them.
+    // C below.  kargs.split_k < 0: partials only, gemm_a4w4_mxfp4_nt_bpreshuffle_sk_reduce sums them.
     if constexpr (T::SPLITK) {
         int* const sk_last_p = reinterpret_cast<int*>(smem_sfa);   // broadcast flag (scale panels are no longer read)
         const bool sk_separate = kargs.split_k < 0;
         if (split_k > 1 || sk_separate) {
             const long tile_elems = static_cast<long>(T::B_M) * T::B_N;
-            float* const ws_tiles = reinterpret_cast<float*>(reinterpret_cast<char*>(kargs.ptr_ws) + opus_mxfp4_sk_counter_bytes(total_tiles));
+            float* const ws_tiles = reinterpret_cast<float*>(reinterpret_cast<char*>(kargs.ptr_ws) + opus_mxfp4_bpreshuffle_sk_counter_bytes(total_tiles));
             int* const counters = reinterpret_cast<int*>(kargs.ptr_ws);
             auto u_wc = partition_layout_c<T::VEC_C>(mma, opus::make_tuple(opus::number<T::B_N>{}, 1_I), p_coord_c);
             auto part = [&](int s_) { return make_gmem(ws_tiles + (static_cast<long>(tile_id) * split_k + s_) * tile_elems,
@@ -1066,7 +1070,7 @@ __device__ __forceinline__ void gemm_a4w4_mxfp4_nt_body(opus_gemm_mxfp4_scale_ka
                 v_pend_c[i.value] = c_unswz(load<VEC_OUT>(s_c, (linear / T::B_N) * c_lds_stride + linear % T::B_N), i);
             }
         });
-        pend_c_ptr = reinterpret_cast<D_C*>(kargs.ptr_c) + batch_id * kargs.stride_c_batch + row * kargs.stride_c + col;
+        pend_c_ptr = reinterpret_cast<D_C*>(kargs.ptr_c) + batch_id * kargs.stride_c_batch + static_cast<long long>(row) * kargs.stride_c + col;
         pend_c = 1;
         pend_rows = rows_in;
         pend_cols = cols_in;
@@ -1088,19 +1092,19 @@ __device__ __forceinline__ void gemm_a4w4_mxfp4_nt_body(opus_gemm_mxfp4_scale_ka
 
 template<class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1)
-void gemm_a4w4_mxfp4_nt_kernel(opus_gemm_mxfp4_scale_kargs_gfx950 kargs) {
-    gemm_a4w4_mxfp4_nt_body<Traits>(kargs);
+void gemm_a4w4_mxfp4_nt_bpreshuffle_kernel(opus_gemm_mxfp4_bpreshuffle_kargs_gfx950 kargs) {
+    gemm_a4w4_mxfp4_nt_bpreshuffle_body<Traits>(kargs);
 }
 
 // Split-K reduce for kargs.split_k < 0: C[tile] = bf16(sum_s partial[tile][s]) with the M / N boundary.  One block of 256
 // threads per (tile, row slab); each thread owns 8 consecutive columns of one row and loads 2 x 16 B per segment.
 template<class Traits>
-__device__ __forceinline__ void gemm_a4w4_mxfp4_nt_sk_reduce_body(opus_gemm_mxfp4_scale_kargs_gfx950 kargs) {
+__device__ __forceinline__ void gemm_a4w4_mxfp4_nt_bpreshuffle_sk_reduce_body(opus_gemm_mxfp4_bpreshuffle_kargs_gfx950 kargs) {
 #if defined(__gfx950__)
     using T = opus::remove_cvref_t<Traits>;
     const int S = kargs.split_k < 0 ? -kargs.split_k : kargs.split_k;
-    const int num_tiles_n = opus_mxfp4_ceil_div(kargs.n, T::B_N);
-    const int tiles_per_batch = opus_mxfp4_ceil_div(kargs.m, T::B_M) * num_tiles_n;
+    const int num_tiles_n = opus_mxfp4_bpreshuffle_ceil_div(kargs.n, T::B_N);
+    const int tiles_per_batch = opus_mxfp4_bpreshuffle_ceil_div(kargs.m, T::B_M) * num_tiles_n;
     const int total_tiles = tiles_per_batch * kargs.batch;
     constexpr int COLS8 = T::B_N / 8;                         // threads per row
     constexpr int ROWS = T::BLOCK_SIZE / COLS8;               // rows per block (B_N 256: 8, 192: 10 with 240 threads, 128: 16)
@@ -1111,11 +1115,12 @@ __device__ __forceinline__ void gemm_a4w4_mxfp4_nt_sk_reduce_body(opus_gemm_mxfp
     const int r = slab * ROWS + tid / COLS8, c = (tid % COLS8) * 8;
     if (tid >= ROWS * COLS8 || r >= T::B_M || tile_id >= total_tiles) return;
     const int batch_id = tile_id / tiles_per_batch, tib = tile_id % tiles_per_batch;
-    const int row = (tib / num_tiles_n) * T::B_M + r, col = (tib % num_tiles_n) * T::B_N + c;
+    const int row0 = (tib / num_tiles_n) * T::B_M;
+    const int row = row0 + r, col = (tib % num_tiles_n) * T::B_N + c;
     if (row >= kargs.m || col >= kargs.n) return;
     const long tile_elems = static_cast<long>(T::B_M) * T::B_N;
     // Buffer base per tile (wave-uniform: a lane-dependent base would turn every load into a readfirstlane waterfall loop).
-    const float* ws = reinterpret_cast<const float*>(reinterpret_cast<const char*>(kargs.ptr_ws) + opus_mxfp4_sk_counter_bytes(total_tiles))
+    const float* ws = reinterpret_cast<const float*>(reinterpret_cast<const char*>(kargs.ptr_ws) + opus_mxfp4_bpreshuffle_sk_counter_bytes(total_tiles))
                       + static_cast<long>(tile_id) * S * tile_elems;
     auto g = opus::make_gmem(ws, static_cast<unsigned int>(S * tile_elems * 4));
     const int lane_off = r * T::B_N + c;
@@ -1128,13 +1133,13 @@ __device__ __forceinline__ void gemm_a4w4_mxfp4_nt_sk_reduce_body(opus_gemm_mxfp
     }
     opus::vector_t<opus::bf16_t, 8> out;
     opus::static_for<8>([&](auto j) { out[j.value] = static_cast<opus::bf16_t>(acc[j.value]); });
-    auto gc = opus::make_gmem(reinterpret_cast<opus::bf16_t*>(kargs.ptr_c) + batch_id * kargs.stride_c_batch);
-    opus::store<8>(gc, out, row * kargs.stride_c + col);
+    auto gc = opus::make_gmem(reinterpret_cast<opus::bf16_t*>(kargs.ptr_c) + batch_id * kargs.stride_c_batch + static_cast<long long>(row0) * kargs.stride_c);
+    opus::store<8>(gc, out, r * kargs.stride_c + col);
 #endif
 }
 
 template<class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 1)
-void gemm_a4w4_mxfp4_nt_sk_reduce(opus_gemm_mxfp4_scale_kargs_gfx950 kargs) {
-    gemm_a4w4_mxfp4_nt_sk_reduce_body<Traits>(kargs);
+void gemm_a4w4_mxfp4_nt_bpreshuffle_sk_reduce(opus_gemm_mxfp4_bpreshuffle_kargs_gfx950 kargs) {
+    gemm_a4w4_mxfp4_nt_bpreshuffle_sk_reduce_body<Traits>(kargs);
 }

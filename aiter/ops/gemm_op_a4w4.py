@@ -345,56 +345,36 @@ def gemm_a4w4_fake(
     return torch.empty((*A.shape[:-1], n), dtype=dtype, device=A.device)
 
 
-# gfx950 OPUS MXFP4 kernels: tuned rows whose kernelName is an OPUS instance
-# name of family a4w4 (kernelId = its local kid) launch through opus_gemm.
-OPUS_A4W4_PREFIX = "opus_gemm_gfx950_a4w4_"
-_A4W4_PRESHUFFLE_PREFIXES = ("triton_", "flydsl_", OPUS_A4W4_PREFIX)
+# gfx950 OPUS MXFP4 kernels: tuned rows whose kernelName is an OPUS a4w4 instance
+# name launch through opus_gemm (shape/scale checks are in its C++ launcher).
+_A4W4_PRESHUFFLE_PREFIXES = ("triton_", "flydsl_", "opus_")
 
 
 @functools.cache
-def _opus_a4w4_kids(gfx, cu_num):
+def _opus_a4w4_kid(name, gfx, cu_num):
     from csrc.opus_gemm.opus_gemm_common import get_registry
 
-    return {
-        inst.name: (kid, inst)
-        for kid, inst in get_registry("a4w4", gfx, cu_num).items()
-    }
+    for kid, inst in get_registry("a4w4", gfx, cu_num).items():
+        if inst.name == name:
+            return kid, inst
+    raise ValueError(f"Invalid tuned OPUS a4w4 kernel {name!r}")
 
 
-def _gemm_a4w4_opus(A, B, A_scale, B_scale, out, kernel_name, kernel_id=None):
-    m, n, k = A.numel() // A.shape[-1], B.shape[0], A.shape[-1] * 2
-    kids = _opus_a4w4_kids(get_gfx(), get_cu_num())
-    kid, inst = kids.get(kernel_name, (None, None))
-    if kid is None or (kernel_id is not None and int(kernel_id) != kid):
-        raise ValueError(f"Invalid tuned OPUS kernel {kernel_id} {kernel_name}")
+def _gemm_a4w4_opus(A, B, A_scale, B_scale, out, name):
+    if out.dtype != dtypes.bf16:
+        return None
+    m, n = A.numel() // A.shape[-1], B.shape[0]
+    gfx, cu_num = get_gfx(), get_cu_num()
+    kid, inst = _opus_a4w4_kid(name, gfx, cu_num)
     # A row tuned at a padded M also serves the smaller M that pad up to it; a
     # no-bounds-check (nob) tile only fits whole tiles, so run its bounded twin.
     if inst.co_variant == "nob" and (m % inst.B_M or n % inst.B_N):
-        kid, inst = kids.get(kernel_name.removesuffix("_nob"), (None, None))
-        if kid is None:
-            return None
-    if not (
-        n % 16 == 0
-        and k % 256 == 0
-        and out.dtype == dtypes.bf16
-        and all(
-            t.is_contiguous() and t.element_size() == 1
-            for t in (A, B, A_scale, B_scale)
-        )
-        and A_scale.ndim == 2
-        and B_scale.ndim == 2
-        and A_scale.shape[-1] == B_scale.shape[-1] == (k // 32 + 7) // 8 * 8
-        and A_scale.shape[0] % 32 == 0
-        and B_scale.shape[0] % 32 == 0
-        and A_scale.shape[0] >= m
-        and B_scale.shape[0] >= n
-    ):
-        return None
+        kid, _ = _opus_a4w4_kid(name.removesuffix("_nob"), gfx, cu_num)
     from .opus import opus_gemm
 
-    # No row padding needed: write the first m rows of the padded output.
+    # out is padded to 32 rows; the kernel writes the first m.
     opus_gemm(
-        A.view(m, k // 2).view(dtypes.fp4x2),
+        A.view(m, -1).view(dtypes.fp4x2),
         B.view(dtypes.fp4x2),
         out[:m],
         kid=kid,
@@ -406,15 +386,15 @@ def _gemm_a4w4_opus(A, B, A_scale, B_scale, out, kernel_name, kernel_id=None):
     return out[:m].view(*A.shape[:-1], n)
 
 
-def _gemm_a4w4_preshuffle(A, B, A_scale, B_scale, out, kernel_name, kernel_id=None):
+def _gemm_a4w4_preshuffle(A, B, A_scale, B_scale, out, kernel_name):
     """CSV/tuner adapter for gfx950 MXFP4 with default shuffled 1x32 scales.
 
     Only views change; no quantization or layout conversion. None means the
     call is unsupported. Compilation and kernel errors propagate.
     """
     name = str(kernel_name)
-    if name.startswith(OPUS_A4W4_PREFIX):
-        return _gemm_a4w4_opus(A, B, A_scale, B_scale, out, name, kernel_id)
+    if name.startswith("opus_"):
+        return _gemm_a4w4_opus(A, B, A_scale, B_scale, out, name)
     if name.startswith("triton_"):
         params = dict(_parse_triton_a4w4_kernel(name))
         output_dtype = dtypes.bf16
@@ -593,13 +573,7 @@ def gemm_a4w4(
             and beta in (None, 0.0)
         ):
             result = _gemm_a4w4_preshuffle(
-                A,
-                B,
-                A_scale,
-                B_scale,
-                out,
-                ck_config["kernelName"],
-                ck_config.get("kernelId"),
+                A, B, A_scale, B_scale, out, ck_config["kernelName"]
             )
             if result is not None:
                 return result

@@ -387,7 +387,8 @@ static void opus_check_a8_family_tensors(
     const char* entry,
     const aiter_tensor_t &XQ,
     const aiter_tensor_t &WQ,
-    const aiter_tensor_t &Y)
+    const aiter_tensor_t &Y,
+    AiterDtype ab_dtype = AITER_DTYPE_fp8)
 {
   AITER_CHECK(XQ.is_gpu() && WQ.is_gpu() && Y.is_gpu(),
               entry, ": XQ, WQ, and Y must be GPU tensors");
@@ -399,8 +400,8 @@ static void opus_check_a8_family_tensors(
   AITER_CHECK(current_device == XQ.device_id,
               entry, ": current HIP device ", current_device,
               " does not match tensor device ", XQ.device_id);
-  AITER_CHECK(XQ.dtype() == AITER_DTYPE_fp8 && WQ.dtype() == AITER_DTYPE_fp8,
-              entry, ": expected fp8 XQ/WQ, got ",
+  AITER_CHECK(XQ.dtype() == ab_dtype && WQ.dtype() == ab_dtype,
+              entry, ": expected ", AiterDtype_to_str(ab_dtype), " XQ/WQ, got ",
               AiterDtype_to_str(XQ.dtype()), "/",
               AiterDtype_to_str(WQ.dtype()));
 }
@@ -487,12 +488,12 @@ void opus_gemm_a8w8_blockscale_bpreshuffle_launch(
   }
 }
 
-// MXFP4 x MXFP4 NT (gfx950), inputs as aiter gemm_a4w4(bpreshuffle=True).
+// MXFP4 x MXFP4 NT (gfx950), layout="bpreshuffle": inputs as aiter gemm_a4w4(bpreshuffle=True).
 // Shapes: XQ [batch, M, K/2], WQ [batch, N, K/2] (fp4x2, WQ in the
 // shuffle_weight(16, 16) layout), Y [batch, M, N] bf16; N % 16, K % 256.
 // Scales: e8m0_shuffle layout, 2D [batch * rows, cols] or 3D [batch, rows, cols]
 // with rows >= M / N padded to 32 (a multiple of 32) and cols = K/32 padded to 8.
-void opus_gemm_a4w4_launch(
+void opus_gemm_a4w4_bpreshuffle_launch(
     aiter_tensor_t &XQ,
     aiter_tensor_t &WQ,
     aiter_tensor_t &Y,
@@ -503,21 +504,9 @@ void opus_gemm_a4w4_launch(
     int split_k)
 {
   aiter_detail::g_aiter_can_throw = true;
-  constexpr const char* entry = "opus_gemm_a4w4_launch";
-  AITER_CHECK(XQ.is_gpu() && WQ.is_gpu() && Y.is_gpu(),
-              entry, ": XQ, WQ, and Y must be GPU tensors");
-  AITER_CHECK(XQ.device_id == WQ.device_id && XQ.device_id == Y.device_id,
-              entry, ": XQ/WQ/Y device ids must match (got ",
-              XQ.device_id, "/", WQ.device_id, "/", Y.device_id, ")");
-  int current_device = -1;
-  HIP_CALL(hipGetDevice(&current_device));
-  AITER_CHECK(current_device == XQ.device_id,
-              entry, ": current HIP device ", current_device,
-              " does not match tensor device ", XQ.device_id);
+  constexpr const char* entry = "opus_gemm_a4w4_bpreshuffle_launch";
+  opus_check_a8_family_tensors(entry, XQ, WQ, Y, AITER_DTYPE_fp4x2);
   opus_check_a8_scale_devices(entry, XQ, x_scale, w_scale);
-  AITER_CHECK(XQ.dtype() == AITER_DTYPE_fp4x2 && WQ.dtype() == AITER_DTYPE_fp4x2,
-              entry, ": expected fp4x2 XQ/WQ, got ",
-              AiterDtype_to_str(XQ.dtype()), "/", AiterDtype_to_str(WQ.dtype()));
   AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,
               entry, ": expected bf16 Y, got ", AiterDtype_to_str(Y.dtype()));
   AITER_CHECK(XQ.dim() == 3 && WQ.dim() == 3 && Y.dim() == 3,
@@ -567,7 +556,7 @@ void opus_gemm_a4w4_launch(
                 info.dev);
 #endif
   }
-  AITER_CHECK(false, "no registered kernel for OPUS a4w4 on device ", info.dev,
+  AITER_CHECK(false, "no registered kernel for OPUS a4w4 bpreshuffle on device ", info.dev,
               " with gcnArchName='", info.name, "'");
 }
 

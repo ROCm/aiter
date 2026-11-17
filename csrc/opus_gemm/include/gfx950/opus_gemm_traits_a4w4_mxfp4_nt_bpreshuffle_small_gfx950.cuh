@@ -2,7 +2,7 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // Traits and kargs of the shuffle small-tile MXFP4 x MXFP4 NT pipeline (gfx950):
-// opus_gemm_pipeline_a4w4_mxfp4_nt_small_gfx950.cuh (1x4 waves).  Inputs as aiter gemm_a4w4(bpreshuffle=True):
+// opus_gemm_pipeline_a4w4_mxfp4_nt_bpreshuffle_small_gfx950.cuh (1x4 waves).  Inputs as aiter gemm_a4w4(bpreshuffle=True):
 //   A [batch, M, K/2] fp4x2 row-major;  B shuffle_weight(16, 16);  scaleA / scaleB e8m0_shuffle (1x32 UE8M0);
 //   C [batch, M, N] bf16.  Any M, N % 16 == 0, K % 256 == 0.  Non-persistent: grid = (N/B_N, M/B_M, batch * split_k).
 #pragma once
@@ -26,7 +26,7 @@ struct opus_splitk_ws_handle {
 // split_k = S > 1: block z = batch * S + k split writes its fp32 partial tile to ws_handle->ptr, laid out as
 // [S][batch][padded_M][padded_N] (padded_M / padded_N = M / N rounded up to B_M / B_N), and splitk_reduce_kernel
 // (splitk_reduce_gfx950.cuh) sums the S partials into C.  S = 1: C is written directly, ws_handle is not read.
-struct opus_gemm_mxfp4_small_kargs_gfx950 {
+struct opus_gemm_mxfp4_bpreshuffle_small_kargs_gfx950 {
     const void* ptr_a; const void* ptr_b; void* ptr_c; const void* ptr_sfa; const void* ptr_sfb;
     int m, n, k, batch;
     int stride_a, stride_c;                 // bytes per A row (K/2); elements per C row
@@ -41,7 +41,7 @@ struct opus_gemm_mxfp4_small_kargs_gfx950 {
 // the waves split KS ways along K and 4/KS ways along N (tiles too narrow to give every wave 16 columns), and their
 // partial tiles are summed through LDS once at the end.
 template<int BM_, int BN_, int D_, int KS_>
-struct opus_gemm_a4w4_mxfp4_nt_small_traits_gfx950 {
+struct opus_gemm_a4w4_mxfp4_nt_bpreshuffle_small_traits_gfx950 {
     static constexpr int WARP_SIZE = 64;
     static constexpr int BLOCK_SIZE = 256;
     static constexpr int NUM_WAVES = BLOCK_SIZE / WARP_SIZE;   // 4

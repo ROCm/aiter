@@ -4,18 +4,18 @@
     "gen_co/gfx950/a4w4_bpreshuffle/. READ BY BOTH: opus_gemm_common.py (kid table)",
     "and gen_co/build_co.py --arch gfx950 (builds the .co).",
     "",
-    "gfx950 entries (tag a4w4_mxfp4_nt_co: MXFP4 x MXFP4 NT, 1x32 e8m0 scales, 2x2 waves):",
+    "gfx950 entries (tag a4w4_mxfp4_nt_bpreshuffle_co: MXFP4 x MXFP4 NT, 1x32 e8m0 scales, 2x2 waves):",
     "  kid            local to the a4w4/gfx950/CU namespace.",
     "  wave_layout    [T_M, T_N] (2x2).",
     "  variant        \"\" persistent, \"np\" one tile per block, \"sk\" split-K, \"nob\"",
     "                 persistent without M/N boundary handling; also the name suffix:",
-    "                 opus_gemm_gfx950_a4w4_mxfp4_nt_co_{B_M}x{B_N}x{B_K}[_{variant}].",
+    "                 opus_gemm_gfx950_a4w4_mxfp4_nt_bpreshuffle_co_{B_M}x{B_N}x{B_K}[_{variant}].",
     "  block_size, tile, launch_bounds and device_flags as in co_kernels.json."
   ],
   "gfx950": [
     {
       "kid": 0,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         256,
@@ -37,7 +37,7 @@
     },
     {
       "kid": 1,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         256,
@@ -59,7 +59,7 @@
     },
     {
       "kid": 2,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         128,
@@ -81,7 +81,7 @@
     },
     {
       "kid": 3,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         128,
@@ -103,7 +103,7 @@
     },
     {
       "kid": 4,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         192,
@@ -125,7 +125,7 @@
     },
     {
       "kid": 5,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         256,
@@ -147,7 +147,7 @@
     },
     {
       "kid": 10,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         256,
@@ -169,7 +169,7 @@
     },
     {
       "kid": 11,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         256,
@@ -191,7 +191,7 @@
     },
     {
       "kid": 12,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         128,
@@ -213,7 +213,7 @@
     },
     {
       "kid": 13,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         128,
@@ -235,7 +235,7 @@
     },
     {
       "kid": 14,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         192,
@@ -257,7 +257,7 @@
     },
     {
       "kid": 15,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         256,
@@ -279,7 +279,7 @@
     },
     {
       "kid": 21,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         256,
@@ -301,7 +301,7 @@
     },
     {
       "kid": 22,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         128,
@@ -323,7 +323,7 @@
     },
     {
       "kid": 23,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         128,
@@ -345,7 +345,7 @@
     },
     {
       "kid": 24,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         192,
@@ -367,7 +367,7 @@
     },
     {
       "kid": 25,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         256,
@@ -389,7 +389,7 @@
     },
     {
       "kid": 30,
-      "tag": "a4w4_mxfp4_nt_co",
+      "tag": "a4w4_mxfp4_nt_bpreshuffle_co",
       "block_size": 256,
       "tile": [
         256,
