@@ -314,7 +314,10 @@ def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     # @flyc.kernel bodies, so old bf16-rounding fp32 binaries are never reused.
     out_suffix = "_fp32c" if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else ""
     name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
-    name += "_kst4" if param.is_split_k else "_ks1"
+    if param.is_split_k:
+        name += "_kst4" if param.use_half_tile_interleaved else "_kst5"
+    else:
+        name += "_ks1"
     name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
     name += f"_gm{param.group_m}"
     name += f"_stg{param.k_stagger}" if param.k_stagger else ""
@@ -578,6 +581,15 @@ def gemm_a16w16_gfx950_kernel(
     ks_end = ks_begin + working_k
     ks_end = (ks_end < k).select(ks_end, k)
     k_tiles = (ks_end - ks_begin) // block_k
+    if working_k % block_k != 0:
+        # Previously unsupported FT splits distribute whole K tiles. Preserve
+        # the existing partition boundaries for every already-valid config.
+        total_tiles = k // block_k
+        tiles = total_tiles // split_k
+        extra = total_tiles % split_k
+        prefix = (ks_idx < extra).select(ks_idx, extra)
+        ks_begin = (ks_idx * tiles + prefix) * block_k
+        k_tiles = tiles + (ks_idx < extra).select(fx.Int32(1), fx.Int32(0))
     if const_expr(param.k_stagger > 0):
         # Rotate only the global K loads, never the LDS ring index. The
         # actual partition length also handles a shorter final split.
@@ -1480,6 +1492,12 @@ def assert_no_k_tail(k: int, kwargs: dict):
         // async_load_vec_size
         * async_load_vec_size
     )
+    if not use_half_tile_interleaved and working_k % block_k != 0:
+        assert k % block_k == 0, "FT balanced splits require complete K tiles"
+        assert (
+            k // block_k // split_k >= stages - 1
+        ), "FT balanced splits need at least stages-1 tiles per partition"
+        return
     last_working_k = k - (split_k - 1) * working_k
     assert working_k % block_k == 0, (
         "K-tail is unsupported: aligned split-K partition size "

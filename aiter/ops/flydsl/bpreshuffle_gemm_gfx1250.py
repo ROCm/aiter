@@ -204,6 +204,7 @@ def run_preshuffle_gemm_a8_gfx1250(
         *gemm_spec[:14],
         1,  # batch (runtime)
         *gemm_spec[14:],
+        _ptr_arg(Out),  # arg_scale_out
         specialization_key=gemm_spec,
     )
     if partials is not None:
