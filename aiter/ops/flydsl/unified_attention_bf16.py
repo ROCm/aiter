@@ -7,7 +7,7 @@ Validated route: BF16 paged attention on gfx950 with the linear
 ``[blocks, page, kv_heads, dim]`` KV cache, the MiMo V2.6 global attention
 geometry (Q/K 192, V/output 128, 16 query heads per KV head), page sizes 64 and
 128 and causal full attention. A uniform query length of 1 to 8 tokens per
-sequence runs through ``pa_decode``. Other query lengths (prefill and mixed
+sequence, with or without sinks, runs through ``pa_decode``. Other query lengths (prefill and mixed
 batches, without sinks) split each sequence's queries into blocks of 16 that
 run as pseudo-sequences of the same kernels. Causal sliding windows, with or
 without sinks, take any query lengths: one CTA per query block and KV head
@@ -700,11 +700,13 @@ def _unified_attention_uniform(
     max_seqlen_k,
     softmax_scale,
     block_table,
+    sinks,
     explicit,
     query_length,
 ):
     """Sequence s owns query rows [s * query_length, (s + 1) * query_length):
-    the plan reads ``seqused_k`` directly and no query map is built."""
+    the plan reads ``seqused_k`` directly and no query map is built. The
+    reducer folds in ``sinks``."""
     import flydsl.compiler as flyc
     import flydsl.expr as fx
 
@@ -806,7 +808,7 @@ def _unified_attention_uniform(
             psum,
             pmax,
             pout,
-            None,
+            sinks,
             *output.stride()[:4],
             pmax.stride(0),
             pmax.stride(1),
@@ -1062,9 +1064,12 @@ def unified_attention_flydsl(
         )
     # pa_decode takes the vectorized rank-5 K/V layout, not this linear cache, so
     # uniform batches launch the ping-pong kernel here. With one task per
-    # sequence the varlen launch writes out directly instead.
+    # sequence the varlen launch writes out directly instead; it takes no sinks.
     num_seqs = seqused_k.numel()
-    if _plan_capacity(num_seqs, k.shape[2], _num_cu(q.device.index)) == num_seqs:
+    if (
+        sinks is None
+        and _plan_capacity(num_seqs, k.shape[2], _num_cu(q.device.index)) == num_seqs
+    ):
         return _unified_attention_varlen(
             q,
             k,
@@ -1087,6 +1092,7 @@ def unified_attention_flydsl(
         max_seqlen_k,
         softmax_scale,
         block_table,
+        sinks,
         explicit,
         int(max_seqlen_q),
     )

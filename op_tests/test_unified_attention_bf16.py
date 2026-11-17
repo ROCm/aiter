@@ -312,6 +312,30 @@ def test_sliding_window_matches_reference(
     _check(out, ref)
 
 
+@pytest.mark.parametrize(
+    "sinks",
+    [torch.float32, torch.bfloat16, torch.float16],
+    ids=["fp32", "bf16", "fp16"],
+)
+@pytest.mark.parametrize("hkv", [1, 4])
+@pytest.mark.parametrize("qlen", [1, 8])
+@pytest.mark.parametrize(
+    "lengths",
+    [
+        pytest.param((523, 37, 2011), id="one-task-per-seq"),
+        pytest.param((300, 129, 4097, 64) * 16, id="partitioned"),
+    ],
+)
+def test_full_attention_sinks_matches_reference(sinks, hkv, qlen, lengths, route_spy):
+    q, k, v, out, cu, used, table = _ragged_inputs(
+        (qlen,) * len(lengths), lengths, 64, hkv=hkv
+    )
+    sink = (torch.randn(HQ * hkv, device="cuda") * 2).to(sinks)
+    _call(q, k, v, out, cu, used, table, qlen=qlen, backend="flydsl", sinks=sink)
+    assert route_spy == ["uniform"]
+    _check(out, _reference(q, k, v, used, table, cu_seqlens_q=cu.cpu(), sinks=sink))
+
+
 def test_sliding_window_two_kv_heads(route_spy):
     query_lengths, lengths = (40, 1, 300, 7), (16384, 4097, 300, 2048)
     q, k, v, out, cu, used, table = _ragged_inputs(query_lengths, lengths, 64, hkv=2)
