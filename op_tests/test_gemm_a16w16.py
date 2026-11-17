@@ -14,10 +14,13 @@ from aiter import dtypes, hipb_create_extension, hipb_mm
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.ops.flydsl.gemm_a16w16_ring import gemm_a16w16_ring
+from aiter.ops.flydsl.gemm_kernels import get_flydsl_hgemm_kernel_params
 from aiter.ops.gemm_op_a16w16 import _SEMA_SHAPE, get_semaphore_workspace
 from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 from aiter.tuned_gemm import (
+    flydsl_gemm,
     get_GEMM_A16W16_config,
     hipb_gemm,
     skinny_gemm,
@@ -687,6 +690,96 @@ def test_gemm_compile_packed_params(m=256, n=512, k=1024, layers=3):
     return rows
 
 
+# The FlyDSL ring kernel on gfx950: the DeepSeek-V4.1 MoE router (torch.mm(x, W.t()), prefill
+# chunk of 16384 tokens), a partial M tile, partial M and N tiles, the shortest K its four-stage
+# ring accepts (five K tiles), and FP16.
+RING_CASES = [
+    (dtypes.bf16, 16384, 384, 5120),
+    (dtypes.bf16, 300, 384, 5120),
+    (dtypes.bf16, 129, 200, 1024),
+    (dtypes.bf16, 256, 384, 320),
+    (dtypes.fp16, 300, 384, 5120),
+]
+RING_KERNEL = (
+    "flydsl_hgemm_a{d}_w{d}_{d}_t128x192x64x4_ks1_w2x2x1_bias0_ktail0_gm1_prg_gfx950"
+)
+
+
+def test_flydsl_ring():
+    """The ring kernel through the tuned FlyDSL dispatch, its tuned row injected.
+
+    Each case writes into a NaN-filled `out`, so an unwritten tile fails, and runs on two inputs:
+    random, against the fp32 reference, and a permutation (A[i, j] = 1 where j = i % K, so
+    out[i, :] = W[:, i % K] exactly) that a misplaced row, column or K tile changes.
+    """
+    if get_gfx() != "gfx950":
+        aiter.logger.warning(
+            "FlyDSL ring GEMM is gfx950 only; skipping on %s", get_gfx()
+        )
+        return []
+    rows = []
+    for dtype, m, n, k in RING_CASES:
+        name = RING_KERNEL.format(d="bf16" if dtype == dtypes.bf16 else "fp16")
+        x = torch.randn(m, k, dtype=dtype, device="cuda")
+        w = torch.randn(n, k, dtype=dtype, device="cuda")
+        perm = torch.zeros(m, k, dtype=dtype, device="cuda")
+        perm[torch.arange(m), torch.arange(m) % k] = 1
+        out = torch.full((m, n), float("nan"), dtype=dtype, device="cuda")
+
+        def run(a, w=w, dtype=dtype, name=name, out=out):
+            return flydsl_gemm(
+                a, w, 0, otype=dtype, config={"kernelName": name}, out=out
+            )
+
+        res, us = run_perftest(run, x)
+        err = checkAllclose(
+            (x.float() @ w.float().t()).to(dtype),
+            res,
+            msg=f"ring {m}x{n}x{k} {dtype}: ",
+        )
+        assert res.data_ptr() == out.data_ptr() and err == 0, (m, n, k, dtype, err)
+        out.fill_(float("nan"))
+        err_perm = checkAllclose(
+            w.t()[torch.arange(m) % k],
+            run(perm),
+            rtol=0,
+            atol=0,
+            msg="ring permutation: ",
+        )
+        assert err_perm == 0, (m, n, k, dtype, err_perm)
+        rows.append(
+            {
+                "case": "flydsl ring",
+                "dtype": dtype,
+                "m": m,
+                "n": n,
+                "k": k,
+                "us": us,
+                "TFLOPS": 2 * m * n * k / us / 1e6,
+                "TB/s": (m * k + n * k + m * n) * x.element_size() / us / 1e6,
+                "err": err,
+            }
+        )
+    # The name parser and the launcher decline what the kernel does not implement.
+    name = RING_KERNEL.format(d="bf16")
+    for bad in (
+        ("ks1", "ks2"),
+        ("bias0", "bias1"),
+        ("x64x4_", "x128x2_"),
+        ("bf16_t", "fp32_t"),
+    ):
+        assert get_flydsl_hgemm_kernel_params(name.replace(*bad)) is None, bad
+    try:
+        gemm_a16w16_ring(
+            *(torch.randn(s, 1000, device="cuda").bfloat16() for s in (128, 192))
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("gemm_a16w16_ring accepted K=1000, not a multiple of 64")
+    return rows
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of a16w16_gemm_test",
@@ -696,13 +789,14 @@ parser.add_argument(
     "--test",
     type=str,
     nargs="*",
-    choices=["normal", "skinny", "out", "compile"],
-    default=["normal"],
+    choices=["normal", "skinny", "out", "compile", "ring"],
+    default=["normal", "ring"],
     help="""Select test to run.
-    e.g.: -t normal    # default
+    e.g.: -t normal ring    # default
           or -t skinny
           or -t out    # tgemm.mm(out=) on every backend
-          or -t compile    # torch.compile with weights/biases in one storage""",
+          or -t compile    # torch.compile with weights/biases in one storage
+          or -t ring    # the gfx950 FlyDSL ring kernel through its tuned dispatch""",
 )
 parser.add_argument(
     "-d",
@@ -792,8 +886,16 @@ for test in args.test:
         df += test_gemm_out()
     elif test == "compile":
         df += test_gemm_compile_packed_params()
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("gemm_a16w16 summary (markdown):\n%s", df_md)
+    elif test == "ring":
+        ring_rows = test_flydsl_ring()
+        if ring_rows:
+            aiter.logger.info(
+                "FlyDSL ring summary (markdown):\n%s",
+                pd.DataFrame(ring_rows).to_markdown(index=False),
+            )
+if df:
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("gemm_a16w16 summary (markdown):\n%s", df_md)
 if args.graph:
     aiter.logger.info("all graph capture/replay checks passed")
