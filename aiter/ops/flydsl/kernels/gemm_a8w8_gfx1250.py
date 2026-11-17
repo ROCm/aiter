@@ -990,6 +990,17 @@ def launch_gemm_a8w8(
             sbase_blk = (
                 bz64 * n32_64 if const_expr(batched) else fx.Int64(0)
             ) + blk_n64 // 32
+
+            def _group_scale(amax):
+                # A 32-column group's amax -> (e8m0 ceil scale byte, its f32).
+                amax = fx.maxnumf(amax, fx.Float32(1e-10))
+                e8 = emit_mx_e8m0_scale(
+                    amax,
+                    mode=MxScaleRoundModeInt.RoundUp,
+                    dtype=MxDtypeInt.FP8_E4M3,
+                )
+                return e8, (fx.Int32(e8) << 23).bitcast(fx.Float32)
+
         if const_expr(not fuse_quant_out):
             _stage_c_tile()
             c_off_rt = blk_m64 * ldc64 + blk_n64
@@ -1044,13 +1055,7 @@ def launch_gemm_a8w8(
                     for t in range_constexpr(8):
                         amax = fx.maxnumf(amax, abs(h1[t]))
                     amax = fx.maxnumf(amax, fx.Float32(amax).shuffle_xor(16, WAVE))
-                    amax = fx.maxnumf(amax, fx.Float32(1e-10))
-                    e8 = emit_mx_e8m0_scale(
-                        amax,
-                        mode=MxScaleRoundModeInt.RoundUp,
-                        dtype=MxDtypeInt.FP8_E4M3,
-                    )
-                    scale_f32 = (fx.Int32(e8) << 23).bitcast(fx.Float32)
+                    e8, scale_f32 = _group_scale(amax)
                     p0 = emit_cvt_scalef32_pk8_fp8_f32(
                         h0.ir_value(), scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
                     )
@@ -1136,13 +1141,7 @@ def launch_gemm_a8w8(
                     amax = abs(vals[0])
                     for e in range_constexpr(1, 32):
                         amax = fx.maxnumf(amax, abs(vals[e]))
-                    amax = fx.maxnumf(amax, fx.Float32(1e-10))
-                    e8 = emit_mx_e8m0_scale(
-                        amax,
-                        mode=MxScaleRoundModeInt.RoundUp,
-                        dtype=MxDtypeInt.FP8_E4M3,
-                    )
-                    scale_f32 = (fx.Int32(e8) << 23).bitcast(fx.Float32)
+                    e8, scale_f32 = _group_scale(amax)
                     row64 = blk_m64 + fx.Int64(r)
                     c_off = row64 * ldc64 + cbase_blk + fx.Int64(j) * 32
                     for q in range_constexpr(4):
