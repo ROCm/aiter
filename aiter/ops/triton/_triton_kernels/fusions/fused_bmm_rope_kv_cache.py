@@ -1069,14 +1069,6 @@ _fused_fp8_bmm_rope_prefill_repr = make_kernel_repr(
 
 
 @triton.jit
-def _fp8_load_pin(x):
-    # Keep the group quantization after the loads that come before it.
-    return tl.inline_asm_elementwise(
-        "; fp8 load pin", "=v,0", [x], dtype=x.dtype, is_pure=False, pack=2
-    )
-
-
-@triton.jit
 def _fp8_quant_group(x, DTYPE_MAX: tl.constexpr, b_ptr):
     """Quantize each row of one K group to FP8. Return the values and the row scales."""
     one_over_DTYPE_MAX = 1.0 / DTYPE_MAX
@@ -1383,8 +1375,6 @@ def _fused_fp8_bmm_rope_prefill_kernel(
             a0 = tl.load(a0_ptrs, cache_modifier=".cg")
             a1 = tl.load(a1_ptrs, cache_modifier=".cg")
             b_scale = tl.load(b_scale_ptr)
-            a0 = _fp8_load_pin(a0)
-            a1 = _fp8_load_pin(a1)
             a0q, s0 = _fp8_quant_group(a0, DTYPE_MAX, b_ptr)
             a1q, s1 = _fp8_quant_group(a1, DTYPE_MAX, b_ptr)
             for n_i in tl.static_range(N_INNER):
