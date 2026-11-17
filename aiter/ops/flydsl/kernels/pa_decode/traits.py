@@ -172,6 +172,7 @@ class PaDecodeCacheKey(NamedTuple):
     sparse_grid: bool
     busy_grid: bool
     two_per_cu: bool
+    stream_busy: bool
     split_major: bool
     D256_PIPE: bool
     stage_pages: int
@@ -477,6 +478,14 @@ class PaDecodeSchedule:
         two_per_cu = (
             busy_grid and split_workgroups * query_splits >= 2 * num_compute_units
         )
+        # gfx942: a sliding window bounds every task to a few tiles, so
+        # streaming them only pays from three CTAs per CU (BF16 MTP4 windows
+        # at 1.2-2.4 per CU ran 0.83-0.91x, from 3.6 per CU 1.15-1.27x).
+        stream_busy = busy_grid and (
+            sliding_window == 0
+            or "gfx94" not in arch
+            or split_workgroups * query_splits > 3 * num_compute_units
+        )
         # gfx942 one-partition decode on sparse grids walks each task in two
         # tile groups per CTA (DUAL_GROUP, mirrored from create()).
         gfx942_dual_group = (
@@ -605,6 +614,7 @@ class PaDecodeSchedule:
             sparse_grid=split_workgroups * query_splits <= num_compute_units,
             busy_grid=busy_grid,
             two_per_cu=two_per_cu,
+            stream_busy=stream_busy,
             split_major=split_major,
             D256_PIPE=D256_PIPE,
             stage_pages=stage_pages,
@@ -772,8 +782,8 @@ class PaDecodeTraits:
         mask_unowned_kv = cache_key.mask_unowned_kv
         DIRECT = cache_key.direct_output
         SPARSE_GRID = cache_key.sparse_grid
-        busy_grid = cache_key.busy_grid
         two_per_cu = cache_key.two_per_cu
+        stream_busy = cache_key.stream_busy
         SPLIT_MAJOR = cache_key.split_major
         D256_PIPE = cache_key.D256_PIPE
         stage_page_capacity = cache_key.stage_pages
@@ -996,10 +1006,12 @@ class PaDecodeTraits:
             and not prefetch_v
             and (
                 kv_row_bytes >= STREAM_KV_MTILES_ROW_BYTES
-                or (M_TILES == 1 and busy_grid and kv_row_bytes >= STREAM_KV_ROW_BYTES)
+                or (
+                    M_TILES == 1 and stream_busy and kv_row_bytes >= STREAM_KV_ROW_BYTES
+                )
                 or (
                     M_TILES == 2
-                    and busy_grid
+                    and stream_busy
                     and kv_row_bytes >= STREAM_KV_TWO_MTILE_ROW_BYTES
                 )
             )
