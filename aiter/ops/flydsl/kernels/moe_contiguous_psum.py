@@ -347,7 +347,7 @@ def build_moe_contiguous_psum_remap_module(packed_expert_map: bool = False):
         # Use map to find experts instead of binary search
         expert_map_is_set = fx.Int64(ptrtoint(expert_tile_map)) != 0
         if expert_map_is_set & is_blk0:
-            # Process in chunks instead of one block, or 
+            # Process in chunks instead of one block, or
             # some experts get left behind and tests fail
             for base in range(0, experts, MAX_EXPERTS_PER_BLOCK):
                 e = fx.Uint32(base) + tid
@@ -366,7 +366,9 @@ def build_moe_contiguous_psum_remap_module(packed_expert_map: bool = False):
                                 # bit 31 flags that this expert's weights are
                                 # reusable (reuse_resident_b policy).
                                 expert_bits = expert_bits | fx.Int64(1 << 31)
-                            packed = (fx.Int64(expert_end) << fx.Int64(32)) | expert_bits
+                            packed = (
+                                fx.Int64(expert_end) << fx.Int64(32)
+                            ) | expert_bits
                             expert_map_p[map_start + fx.Uint32(local_tile)] = packed
                         else:
                             expert_map_p[map_start + fx.Uint32(local_tile)] = fx.Int32(
