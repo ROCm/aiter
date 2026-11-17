@@ -4,6 +4,7 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.mx_scales import load_e8m0_scales_k_tail
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -140,14 +141,10 @@ def _gemm_a16wfp4_kernel(
                 a_bf16 = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
-                # The scale groups past K belong to whatever follows the tensor, and
-                # 0xFF there is the e8m0 NaN. Read them as 127, a scale of 2^0.
-                b_scales = tl.load(
+                b_scales = load_e8m0_scales_k_tail(
                     b_scale_ptrs,
-                    mask=offs_scale_k[None, :]
-                    < 2 * K // SCALE_GROUP_SIZE
-                    - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE),
-                    other=127,
+                    offs_scale_k,
+                    2 * K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE),
                 )
                 a_bf16 = tl.load(
                     a_ptrs,

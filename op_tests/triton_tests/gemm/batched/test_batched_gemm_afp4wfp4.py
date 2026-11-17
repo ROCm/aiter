@@ -3,6 +3,7 @@ import torch
 
 from aiter.ops.triton.gemm.batched.batched_gemm_afp4wfp4 import batched_gemm_afp4wfp4
 from aiter.ops.triton.utils._triton import arch_info
+from op_tests.triton_tests.utils.scale_tail import scales_with_tail
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -208,16 +209,6 @@ def test_batched_gemm_afp4_wfp4(B: int, M: int, N: int, K: int, dtype, layout):
     torch.testing.assert_close(torch_out, out)
 
 
-def _scales_with_tail(scales: torch.Tensor, tail: int) -> torch.Tensor:
-    """The same [B, rows, K // 32] scales, followed in memory by a full block of
-    `tail` bytes, so a read past K // 32 sees a known value."""
-    b, rows, groups = scales.shape
-    pad = 512 // SCALE_GROUP_SIZE
-    buf = torch.full((b, groups + pad, rows), tail, dtype=torch.uint8, device="cuda")
-    buf[:, :groups, :] = scales.transpose(1, 2)
-    return buf[:, :groups, :].transpose(1, 2)
-
-
 @pytest.mark.parametrize("scale_tail", ["x", "w"])
 @pytest.mark.parametrize("K", [2112, 2048])
 def test_batched_gemm_afp4_wfp4_ragged_k_scales(K: int, scale_tail: str):
@@ -232,9 +223,9 @@ def test_batched_gemm_afp4_wfp4_ragged_k_scales(K: int, scale_tail: str):
     )
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
     if scale_tail == "x":
-        x_scales = _scales_with_tail(x_scales, 255)
+        x_scales = scales_with_tail(x_scales, 255)
     else:
-        w_scales = _scales_with_tail(w_scales, 255)
+        w_scales = scales_with_tail(w_scales, 255)
     # With the BLOCK_SIZE_K of 256 that the gfx950 and gfx1250 tables give for
     # M = 32, K = 2112 leaves a partial last block and K = 2048 does not.
     batched_gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out)

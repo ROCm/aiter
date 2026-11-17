@@ -4,6 +4,7 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.mx_scales import load_e8m0_scales_k_tail
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
     pid_grid,
     remap_xcd,
@@ -190,13 +191,11 @@ def _batched_gemm_a16wfp4_kernel(
                 a_bf16 = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
-                # OOB scale bytes are not guaranteed to be zero, and 0xFF is NaN
-                # in e8m0, which dot_scaled propagates even where the masked-off
-                # data is zero. Read those groups as 127, a scale of 2^0.
-                scale_mask = offs_scale_k[None, :] < (
-                    2 * K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                b_scales = load_e8m0_scales_k_tail(
+                    b_scale_ptrs,
+                    offs_scale_k,
+                    2 * K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE),
                 )
-                b_scales = tl.load(b_scale_ptrs, mask=scale_mask, other=127)
                 a_bf16 = tl.load(
                     a_ptrs,
                     mask=offs_k_bf16[None, :] < 2 * K - k * BLOCK_SIZE_K,

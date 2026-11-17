@@ -8,6 +8,7 @@ from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
+from op_tests.triton_tests.utils.scale_tail import scales_with_tail
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -213,16 +214,6 @@ def test_gemm_a16wfp4(
     torch.testing.assert_close(torch_out, y)
 
 
-def _scales_with_tail(scales: torch.Tensor, tail: int) -> torch.Tensor:
-    """The same [N, K // 32] scales, followed in memory by a full block of
-    `tail` bytes, so a read past K // 32 sees a known value."""
-    rows, groups = scales.shape
-    pad = 512 // SCALE_GROUP_SIZE
-    buf = torch.full((groups + pad, rows), tail, dtype=torch.uint8, device="cuda")
-    buf[:groups, :] = scales.T
-    return buf[:groups, :].T
-
-
 @pytest.mark.parametrize("K", [2080, 2048])
 def test_gemm_a16wfp4_ragged_k_scales(K: int):
     """With K not a multiple of BLOCK_SIZE_K, the last K block must not read the
@@ -238,7 +229,7 @@ def test_gemm_a16wfp4_ragged_k_scales(K: int):
     # K = 2080 leaves a partial last block for every BLOCK_SIZE_K from 64 to 2048,
     # K = 2048 leaves none.
     y = gemm_a16wfp4(
-        x, w, _scales_with_tail(w_scales, 255), atomic_add=False, dtype=dtype, y=y
+        x, w, scales_with_tail(w_scales, 255), atomic_add=False, dtype=dtype, y=y
     ).to(dtype)
 
     torch.testing.assert_close(torch_out, y)
