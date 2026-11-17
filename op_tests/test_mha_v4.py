@@ -2445,6 +2445,268 @@ def test_mha_v4_bf16_hd256_kv_splits_match_the_unsplit_call(splits):
     assert split[1] < unsplit[1] * 1.1 + 2e-2, (split, unsplit)
 
 
+def _cu_seqlens(seqlens):
+    return torch.tensor(
+        [0, *itertools.accumulate(seqlens)], device="cuda", dtype=torch.int32
+    )
+
+
+def _thd_pack(seqlens, heads_q, heads_kv, seed):
+    """Random hd256 BF16 Q, K and V for documents of `seqlens` tokens, in THD."""
+    torch.manual_seed(seed)
+    total = sum(seqlens)
+    q = torch.randn((total, heads_q, 256), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((total, heads_kv, 256), device="cuda", dtype=torch.bfloat16)
+    return q, k, torch.randn_like(k)
+
+
+def _bf16_hd256_thd_check(q, k, v, seqlens, causal, documents=None, **kwargs):
+    """_bf16_hd256_check for THD operands, asserting its tolerance: each of `documents` (default
+    all) against float32 attention over its own keys.
+
+    O is judged on its worst row rather than the pack's norm, which one wrong row of a long
+    document would vanish in; a row measures 0.003. The LSE measures 2e-6, so its bound is the
+    1e-3 the BF16 scores are documented at.
+    """
+    softmax_scale = 256**-0.5
+    out, lse = mha_v4(
+        q,
+        k,
+        v,
+        *(AttentionFormat.BF16,) * 3,
+        softmax_scale=softmax_scale,
+        return_lse=True,
+        cu_seqlens=_cu_seqlens(seqlens),
+        max_seqlen=max(seqlens),
+        causal=causal,
+        **kwargs,
+    )
+    torch.cuda.synchronize()
+    assert out.shape == q.shape and lse.shape == (q.shape[1], q.shape[0])
+    ratio = q.shape[1] // k.shape[1]
+    bounds = [0, *itertools.accumulate(seqlens)]
+    o_errors, lse_errors = [], []
+    for index in range(len(seqlens)) if documents is None else documents:
+        document = slice(bounds[index], bounds[index + 1])
+        assert torch.isfinite(out[document]).all()
+        assert torch.isfinite(lse[:, document]).all()
+        qd = q[document].float().transpose(0, 1)
+        kd = k[document].float().repeat_interleave(ratio, dim=1).transpose(0, 1)
+        vd = v[document].float().repeat_interleave(ratio, dim=1).transpose(0, 1)
+        scores = qd @ kd.transpose(1, 2) * softmax_scale
+        if causal:
+            future = torch.ones(scores.shape[1:], dtype=torch.bool, device="cuda")
+            scores.masked_fill_(future.triu(1), float("-inf"))
+        reference = (torch.softmax(scores, dim=-1) @ vd).transpose(0, 1)
+        row_error = (out[document].float() - reference).norm(dim=-1)
+        o_errors.append((row_error / reference.norm(dim=-1)).max().item())
+        lse_ref = torch.logsumexp(scores, dim=-1)
+        lse_errors.append((lse[:, document] - lse_ref).abs().max().item())
+    assert max(o_errors) < 0.01, o_errors
+    assert max(lse_errors) < 1e-3, lse_errors
+
+
+# Documents shorter than a KV tile, either side of a Q tile, and several Q tiles long, so a pack
+# mixes work-groups that own one tile, a mirrored pair and an odd middle tile.
+_THD_PACKS = [
+    param([1024], id="aligned"),
+    param([300], id="one_ragged"),
+    param([513, 2048], id="two"),
+    param([1, 31, 33, 255, 256, 257, 1000, 3000], id="mixed"),
+]
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 BF16 THD validation")
+@parametrize(("heads_q", "heads_kv"), [(24, 4), (12, 2), (6, 1), (4, 4)])
+@parametrize("seqlens", _THD_PACKS)
+@parametrize("causal", [False, True])
+def test_mha_v4_bf16_hd256_thd_matches_attention(heads_q, heads_kv, seqlens, causal):
+    q, k, v = _thd_pack(seqlens, heads_q, heads_kv, seed=49)
+
+    _bf16_hd256_thd_check(q, k, v, seqlens, causal)
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 BF16 THD key slices")
+@parametrize("causal", [False, True])
+@parametrize("splits", [2, 3, "most"])
+def test_mha_v4_bf16_hd256_thd_kv_splits_match_attention(causal, splits):
+    """Slices are of the longest document's key walk, so the short documents of this pack leave
+    some of theirs empty; "most" is one 256-key tile per slice."""
+    seqlens = [300, 2048, 1, 777]
+    q, k, v = _thd_pack(seqlens, 6, 1, seed=50)
+    if splits == "most":
+        splits = 2048 // 256 + causal
+
+    _bf16_hd256_thd_check(q, k, v, seqlens, causal, kv_splits=splits)
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 BF16 THD key slices")
+@parametrize("causal", [False, True])
+def test_mha_v4_bf16_hd256_thd_kv_splits_auto_fills_idle_cus(causal):
+    """One 1K document of 6 heads launches 12 causal work-groups, so auto slices it. 16 documents
+    of 24 heads at 4K fill any GPU, and auto leaves them whole; the count reads only the grid, so
+    that pack is not allocated."""
+    formats = (AttentionFormat.BF16, AttentionFormat.BF16)
+    resolve = mha_v4_module._resolve_thd_kv_splits
+    seqlens = [1024]
+    q, k, v = _thd_pack(seqlens, 6, 1, seed=51)
+    picked = resolve("auto", q, _cu_seqlens(seqlens), 1024, causal, *formats)
+    assert 1 < picked <= 1024 // 256 + causal, picked
+
+    _bf16_hd256_thd_check(q, k, v, seqlens, causal, kv_splits="auto")
+
+    q = torch.empty((1, 24, 256), device="cuda", dtype=torch.bfloat16)
+    full = resolve("auto", q, _cu_seqlens([4096] * 16), 4096, causal, *formats)
+    assert full == 1, full
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 BF16 THD validation")
+@parametrize("causal", [False, True])
+def test_mha_v4_bf16_hd256_thd_addresses_documents_past_4gib(causal):
+    """Q, K, V and O are each over 4 GiB, so the last documents sit past any 32-bit byte offset.
+    Checked on the first document, the one straddling 4 GiB and the last."""
+    heads, length = 16, 997
+    documents = 2**32 // (heads * 256 * 2 * length) + 10
+    seqlens = [length] * documents
+    q, k, v = _thd_pack(seqlens, heads, heads, seed=52)
+    assert q.nbytes > 2**32
+
+    _bf16_hd256_thd_check(
+        q, k, v, seqlens, causal, documents=(0, documents - 10, documents - 1)
+    )
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 BF16 THD validation")
+@parametrize("causal", [False, True])
+def test_mha_v4_bf16_hd256_thd_compile_parity(causal):
+    torch._dynamo.reset()
+    seqlens = [300, 1024]
+    q, k, v = _thd_pack(seqlens, 6, 1, seed=53)
+    kwargs = {
+        "cu_seqlens": _cu_seqlens(seqlens),
+        "max_seqlen": 1024,
+        "causal": causal,
+        "return_lse": True,
+    }
+    formats = (AttentionFormat.BF16,) * 3
+
+    for kv_splits in (1, 2):
+        eager = mha_v4(q, k, v, *formats, kv_splits=kv_splits, **kwargs)
+        compiled = torch.compile(mha_v4, fullgraph=True)(
+            q, k, v, *formats, kv_splits=kv_splits, **kwargs
+        )
+        torch.cuda.synchronize()
+
+        assert torch.equal(eager[0], compiled[0])
+        assert torch.equal(eager[1], compiled[1])
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 BF16 THD validation")
+@parametrize(
+    "kwargs,error,match",
+    [
+        param(
+            {"cu_seqlens": None}, NotImplementedError, "THD operands only", id="bshd"
+        ),
+        param(
+            {"cu_seqlens": None, "causal": False},
+            ValueError,
+            "longest document",
+            id="max-seqlen-alone",
+        ),
+        param({"max_seqlen": None}, ValueError, "needs max_seqlen", id="no-max-seqlen"),
+        param(
+            {"seqlens_k": torch.tensor([512], dtype=torch.int32)},
+            NotImplementedError,
+            "does not combine",
+            id="seqlens-k",
+        ),
+        param(
+            {"block_mask": torch.ones((1, 2, 8), dtype=torch.bool)},
+            NotImplementedError,
+            "does not combine",
+            id="block-mask",
+        ),
+        param(
+            {
+                "formats": (
+                    AttentionFormat.BF16,
+                    AttentionFormat.BF16,
+                    AttentionFormat.FP8,
+                )
+            },
+            NotImplementedError,
+            "all-BF16 operands only",
+            id="bf16-fp8",
+        ),
+        param(
+            {"formats": (AttentionFormat.MXFP4,) * 3},
+            NotImplementedError,
+            "all-BF16 operands only",
+            id="mxfp4",
+        ),
+        param({"layout": "bshd"}, ValueError, "expects THD", id="bshd-operands"),
+        param({"head_dim": 128}, RuntimeError, "no MHA v4 kernel", id="hd128"),
+        param({"head_dim": 64}, ValueError, "head dimension 128 or 256", id="hd64"),
+        param({"kv_splits": 0}, ValueError, "positive int", id="zero-slices"),
+        param(
+            {"kv_splits": 4},
+            ValueError,
+            "at most 3 for max_seqlen 512 under a causal mask",
+            id="slice-under-a-tile",
+        ),
+        param(
+            {"kv_splits": 3, "causal": False},
+            ValueError,
+            "at most 2 for max_seqlen 512$",
+            id="non-causal-slice-under-a-tile",
+        ),
+        param(
+            {"out": torch.empty((511, 2, 256), dtype=torch.bfloat16)},
+            ValueError,
+            "out must match",
+            id="out-shape",
+        ),
+    ],
+)
+def test_mha_v4_thd_rejects_what_it_cannot_run(kwargs, error, match):
+    kwargs = dict(kwargs)
+    shape = (512, 2, kwargs.pop("head_dim", 256))
+    if kwargs.pop("layout", "thd") == "bshd":
+        shape = (1, *shape)
+    q = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    formats = kwargs.pop("formats", (AttentionFormat.BF16,) * 3)
+    call = {
+        "cu_seqlens": _cu_seqlens([512]),
+        "max_seqlen": 512,
+        "causal": True,
+        **kwargs,
+    }
+    for name in ("seqlens_k", "block_mask", "out"):
+        if name in call:
+            call[name] = call[name].cuda()
+    with expect_raises(error, match=match):
+        mha_v4(q, q, q, *formats, **call)
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 BF16 THD validation")
+def test_mha_v4_thd_launcher_refuses_slices_it_cannot_merge():
+    """The slice count is the launcher's argument, not read off a tensor rank: it has to match
+    `out`, and more than one slice needs the LSE they are merged by."""
+    q, k, v = _thd_pack([512], 2, 2, seed=54)
+    cu_seqlens = _cu_seqlens([512])
+    launch = mha_v4_module._fmha_v4_fwd_thd
+    sliced = torch.empty((2, *q.shape), device="cuda", dtype=torch.bfloat16)
+
+    with expect_raises(RuntimeError, match="out must be \\[kv_splits, total_tokens"):
+        launch(q, k, v, sliced, cu_seqlens, 512, 256**-0.5, True, 1)
+    with expect_raises(RuntimeError, match="merged by their LSE"):
+        launch(q, k, v, sliced, cu_seqlens, 512, 256**-0.5, True, 2)
+    wrong = torch.empty((1, 2, 512), device="cuda", dtype=torch.float32)
+    with expect_raises(RuntimeError, match="\\[kv_splits, nhead_q, total_tokens\\]"):
+        launch(q, k, v, sliced, cu_seqlens, 512, 256**-0.5, True, 2, wrong)
+
+
 @parametrize(
     ("qk_format", "v_format"),
     [
