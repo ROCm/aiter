@@ -311,14 +311,14 @@ def check_declines():
 
     with _routed({_key(m, n, k, False, BF16, BF16): {"libtype": "torch", "solidx": 0}}):
         y, calls = _custom_op_calls(lambda: tgemm.mm(x, w))
-    assert torch.equal(y, F.linear(x, w))
-    rows.append(_row("config is not hipBLASLt", calls, True))
+    exact = _check_bits(y, lambda: F.linear(x, w), ref, "torch config")
+    rows.append(_row("config is not hipBLASLt", calls, True, exact))
 
     xt = _rand(4, 64, k).transpose(0, 1)  # `view(-1, K)` refuses it
     with _routed({_key(256, n, k, False, BF16, BF16): HIPBLASLT}):
         y, calls = _custom_op_calls(lambda: tgemm.mm(xt, w))
-    assert torch.equal(y, F.linear(xt, w))
-    rows.append(_row("3-D input that view cannot flatten", calls, True))
+    exact = _check_bits(y, lambda: F.linear(xt, w), _reference(xt, w), "3-D input")
+    rows.append(_row("3-D input that view cannot flatten", calls, True, exact))
     return rows
 
 
@@ -346,9 +346,11 @@ def check_replaced_lookup():
                 y, calls = _custom_op_calls(lambda: tgemm.mm(x, w))
                 # Bypassed: asked by the fast path, then by the op it hands over to.
                 assert state["asked"] - asked == (2 if bypass else 1)
-                if bypass:
-                    assert torch.equal(y, F.linear(x, w))
-                rows.append(_row(f"replaced lookup, bypass={bypass}", calls, bypass))
+                torch_path = (lambda: F.linear(x, w)) if bypass else (lambda: _op(x, w))
+                exact = _check_bits(y, torch_path, _reference(x, w), "replaced")
+                rows.append(
+                    _row(f"replaced lookup, bypass={bypass}", calls, bypass, exact)
+                )
         finally:
             tuned.get_GEMM_A16W16_config = routed
     return rows
@@ -396,10 +398,11 @@ def check_compile():
     rows = {_key(m, n, k, bias, BF16, BF16): HIPBLASLT for bias in (False, True)}
     with _routed(rows):
         y = torch.compile(fn, backend=backend, fullgraph=True)(x, w, b, out)
-        assert torch.equal(y, _op(x, w, b)) and torch.equal(out, _op(x, w))
+        exact = _check_bits(y, lambda: _op(x, w, b), _reference(x, w, b), "compile")
+        exact &= _check_bits(out, lambda: _op(x, w), _reference(x, w), "compile out=")
     ops = sum(t in ("aiter.gemm_a16w16", "aiter.gemm_a16w16_out") for t in targets)
     assert ops == 2, f"the compiled graph holds {ops} of the 2 custom ops"
-    return [_row("torch.compile, custom ops in the graph", ops, True)]
+    return [_row("torch.compile, custom ops in the graph", ops, True, exact)]
 
 
 def check_cuda_graph():
