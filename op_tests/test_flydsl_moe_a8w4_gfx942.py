@@ -210,11 +210,24 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
             atol=2e-2 * ref.abs().max().item(),
             msg=f"{name}: fused_moe vs torch",
         )
+        assert err == 0, (name, err)
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
         ret[f"{name} cos"] = cos_diff(ref, out)
+    # Self-check: the tolerance above must catch a localized error. Zero one output
+    # row and confirm err > 0, so a silent wrong-output bug would not pass the loop above.
+    _probe = outs["a8w4"].clone()
+    _probe[0] = 0
+    _probe_err = checkAllclose(
+        ref_mxfp8.to(dtypes.fp32),
+        _probe.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=2e-2 * ref_mxfp8.abs().max().item(),
+        printLog=False,
+    )
+    assert _probe_err > 0, "self-check: zeroing one output row was not caught"
     # Pre-quantised x (MXFP8 + a1_scale, as from an MXFP8 dispatch): the moe_sort rows
     # read it as is and must give the a8w4 output of bf16 x (up to the run-to-run
     # order of the stage-2 sums, cos diff ~1e-5); the `_qi` rows (M <= 8) quantise x
@@ -238,8 +251,6 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
             raise AssertionError(f"a8w4={a8w4} ran on the other W1 layout")
     # the precision cost of the opt-in path: a8w4 vs the bf16-activation reference
     ret["a8w4 bf16 cos"] = cos_diff(ref_bf16, outs["a8w4"])
-    assert ret["a16w4 cos"] < 1e-2, ret
-    assert ret["a8w4 cos"] < 1e-3, ret
     assert ret["a8w4 bf16 cos"] < 1e-2, ret
     return ret
 
