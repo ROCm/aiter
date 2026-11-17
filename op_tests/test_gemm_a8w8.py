@@ -8,12 +8,19 @@ import torch
 import torch.nn.functional as F
 
 import aiter
-from aiter import dtypes, hipb_create_extension, hipb_findallsols, hipb_mm
-from aiter.jit.core import AITER_CONFIGS
+from aiter import (
+    HipblasLtMatmulScaleMode,
+    dtypes,
+    hipb_create_extension,
+    hipb_findallsols,
+    hipb_mm,
+)
+from aiter.jit.core import AITER_CONFIGS, get_module
 from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+from aiter.test_common import assertAllclose, benchmark, checkAllclose, run_perftest
+from aiter.utility.fp4_utils import e8m0_to_f32
 
 try:
     from tuned_op_bench_utils import append_tuned_op_bench_rows
@@ -22,14 +29,32 @@ except ModuleNotFoundError as e:
         raise
     from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
 import argparse
-from functools import lru_cache
+from functools import lru_cache, wraps
 
 import pandas as pd
 
 # pd.set_option('display.max_rows', 200)
 # pd.set_option('display.max_columns', 100)
 # pd.set_option('display.width', 1000)
-TEST_NUM_ITERS = 100
+# Direct performance runs keep the original repetition count. Standard CI
+# overrides this for correctness sweeps in .github/scripts/aiter_test.sh.
+TEST_NUM_ITERS = int(os.environ.get("AITER_GEMM_TEST_ITERS", "100"))
+if TEST_NUM_ITERS < 1:
+    raise ValueError("AITER_GEMM_TEST_ITERS must be at least 1")
+aiter.logger.info("gemm_a8w8 benchmark iterations: %d", TEST_NUM_ITERS)
+
+
+def gemm_perftest(func):
+    """One iteration checks correctness; larger budgets retain profiler timing."""
+
+    @wraps(func)
+    def wrapper(*args, benchmark_iters=None, **kwargs):
+        num_iters = TEST_NUM_ITERS if benchmark_iters is None else benchmark_iters
+        if num_iters == 1:
+            return func(*args, **kwargs), None
+        return run_perftest(func, *args, num_iters=num_iters, **kwargs)
+
+    return wrapper
 
 
 _TUNED_SHAPES_CACHE = None
@@ -65,8 +90,13 @@ def is_shape_tuned(
     return (m, n, k, str(q_dtype_w)) in _TUNED_SHAPES_CACHE[tuned_file]
 
 
-@perftest(num_iters=TEST_NUM_ITERS)
-def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
+def reference_gemm(
+    x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16, quant_mode="per-token"
+):
+    # MXFP8 reference scales are unswizzled E8M0, one per 32 elements along K.
+    if quant_mode in ("mxfp8-unswizzled", "mxfp8-swizzled"):
+        x_scale = e8m0_to_f32(x_scale).repeat_interleave(32, dim=1)
+        w_scale = e8m0_to_f32(w_scale).repeat_interleave(32, dim=1)
     x = x.to(dtypes.fp32) * x_scale
     weight = weight.to(dtypes.fp32) * w_scale
     out = F.linear(x, weight)
@@ -75,18 +105,35 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     return out.to(dtype)
 
 
-@perftest(num_iters=TEST_NUM_ITERS)
-def run_aiter_hip_bpreshuffle(
+@gemm_perftest
+def run_torch(
+    x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16, quant_mode="per-token"
+):
+    # Skinny tests report a torch baseline latency.
+    return reference_gemm(x, weight, x_scale, w_scale, bias, dtype, quant_mode)
+
+
+@gemm_perftest
+def run_aiter_hip(
     inp,
     weights,
     scaleA,
     scaleB,
     dtype,
+    quant_mode,
     bias=None,
     use_gelu=False,
     solution_index=-1,
+    bpreshuffle=None,
 ):
-    if scaleB is not None:
+    scale_mode = {
+        "mxfp8-unswizzled": HipblasLtMatmulScaleMode.VEC32_UE8M0,
+        "mxfp8-swizzled": HipblasLtMatmulScaleMode.BLK32_UE8M0_32_8_EXT,
+        # Scale mode can be inferred for these cases.
+        "per-token": None,
+        "per-tensor": None,
+    }[quant_mode]
+    if scaleB is not None and quant_mode == "per-token":
         scaleB = scaleB.t()
     return hipb_mm(
         inp,
@@ -97,8 +144,10 @@ def run_aiter_hip_bpreshuffle(
         scaleA=scaleA,
         scaleB=scaleB,
         scaleOut=None,
-        bpreshuffle=True,
+        bpreshuffle=bpreshuffle,
         use_gelu=use_gelu,
+        scaleA_mode=scale_mode,
+        scaleB_mode=scale_mode,
     )
 
 
@@ -111,22 +160,22 @@ def should_test_hipb_gelu(dtype, m, n, k, quantDtype):
     )
 
 
-@perftest(num_iters=TEST_NUM_ITERS)
+@gemm_perftest
 def run_gemm_ck(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_CK(x, weight, x_scale, w_scale, bias, dtype)
 
 
-@perftest()
+@gemm_perftest
 def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, None, dtype)
 
 
-@perftest()
+@gemm_perftest
 def run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_ASM(x, weightshuffle, x_scale, w_scale, bias)
 
 
-@perftest(num_iters=TEST_NUM_ITERS)
+@gemm_perftest
 def run_gemm_skinny(
     x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16, cu_count=1
 ):
@@ -140,14 +189,48 @@ def run_gemm_skinny(
 @lru_cache(maxsize=1)
 def init_hipblas():
     hipb_create_extension()
+    return get_module("module_hipbsolgemm").hipblaslt_build_version
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
+def test_gemm(
+    dtype,
+    m,
+    n,
+    k,
+    quantDtype=dtypes.i8,
+    pad_a=128,
+    skip_ck=False,
+    quant_mode="per-token",
+    test_hipb=True,
+    bpreshuffle_iters=None,
+):
     x = torch.randn((m, k), dtype=dtype, device="cuda")
     weight = torch.randn((n, k), dtype=dtype, device="cuda")
-    x, x_scale = aiter.pertoken_quant(x, quant_dtype=quantDtype)
-    weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=quantDtype)
+    if quant_mode == "per-token":
+        x, x_scale = aiter.pertoken_quant(x, quant_dtype=quantDtype)
+        weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=quantDtype)
+    elif quant_mode == "per-tensor":
+        # Different non-unit scales for the two operands.
+        x, x_scale = aiter.per_tensor_quant(x * 0.25, quant_dtype=quantDtype)
+        weight, w_scale = aiter.per_tensor_quant(weight * 2, quant_dtype=quantDtype)
+    else:
+        assert quant_mode in ("mxfp8-unswizzled", "mxfp8-swizzled")
+        assert k % 32 == 0
+        quantized: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for operand in (x, weight):
+            # Vary magnitudes across rows and K blocks to expose layout mistakes.
+            factors = torch.exp2(
+                torch.randint(-2, 3, (operand.size(0), k // 32), device="cuda").float()
+            )
+            operand = (operand.float() * factors.repeat_interleave(32, dim=1)).to(dtype)
+            values = torch.empty_like(operand, dtype=quantDtype)
+            scales = torch.empty_like(factors, dtype=dtypes.fp8_e8m0)
+            aiter.dynamic_per_group_scaled_quant(
+                values, operand, scales, group_size=32, shuffle_scale=False
+            )
+            quantized.append((values, scales))
+        (x, x_scale), (weight, w_scale) = quantized
     weightshuffle = shuffle_weight(weight, layout=(16, 16))
     pad_k = max(pad_a, 0)
     if pad_k > 0:
@@ -170,9 +253,11 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
     # x_pad, _ = F.pad(x,(0,128), "constant", 0).split([x.shape[1], 128],dim=1)
     # print(f"{x_pad.shape=}{x_pad.stride()}")
 
-    a, _avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
-    # skip_ck bypasses gemm_a8w8_CK (module_gemm_a8w8) only; run_gemm_ck_bpreshuffle is unaffected (gated by quantDtype below)
-    if skip_ck:
+    # Correctness sweeps need one reference output, not a reference benchmark.
+    a = reference_gemm(x, weight, x_scale, w_scale, bias, dtype, quant_mode=quant_mode)
+    # skip_ck bypasses gemm_a8w8_CK (module_gemm_a8w8) only.
+    # run_gemm_ck_bpreshuffle is gated by quantDtype/quant_mode below.
+    if skip_ck or quant_mode != "per-token":
         avg_b = err_b = None
     else:
         b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
@@ -193,8 +278,15 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
             err_b = checkAllclose(
                 a, b, msg="ck: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
             )
-    if quantDtype != dtypes.i8:
-        c, avg_c = run_gemm_ck_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
+    if quantDtype != dtypes.i8 and quant_mode == "per-token":
+        c, avg_c = run_gemm_ck_bpreshuffle(
+            x,
+            weightshuffle,
+            x_scale,
+            w_scale,
+            dtype,
+            benchmark_iters=bpreshuffle_iters,
+        )
         # c = c + bias
         err_c = checkAllclose(
             a, c, msg="ck bpreshuffle: ", rtol=1e-2, atol=1e-2, catastrophic_check=True
@@ -208,6 +300,7 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
     if (
         dtype == dtypes.bf16
         and quantDtype == dtypes.i8
+        and quant_mode == "per-token"
         and bias is not None
         and get_gfx() == "gfx942"
     ):
@@ -220,14 +313,56 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
         else:
             avg_d = None
 
+    avg_hipb = err_hipb = None
+    if (
+        test_hipb
+        and quantDtype == dtypes.fp8
+        and (dtype == dtypes.bf16 or quant_mode != "per-token")
+    ):
+        init_hipblas()
+        hipb_x_scale, hipb_w_scale = x_scale, w_scale
+        if quant_mode == "mxfp8-swizzled":
+            hipb_x_scale = shuffle_scale(x_scale)
+            hipb_w_scale = shuffle_scale(w_scale)
+        hipb, avg_hipb = run_aiter_hip(
+            x,
+            weight,
+            hipb_x_scale,
+            hipb_w_scale,
+            dtype,
+            quant_mode=quant_mode,
+            bpreshuffle=False,
+        )
+        err_hipb = assertAllclose(
+            a,
+            hipb,
+            msg=f"hipmm {quant_mode}: ",
+            rtol=1e-2,
+            atol=1e-2,
+            catastrophic_check=True,
+        )
+
     avg_gelu = None
     err_gelu = None
     avg_gelu_sol = None
     err_gelu_sol = None
-    if quantDtype == dtypes.fp8 and get_gfx() == "gfx942" and dtype == dtypes.bf16:
+    if (
+        test_hipb
+        and quantDtype == dtypes.fp8
+        and get_gfx() == "gfx942"
+        and dtype == dtypes.bf16
+    ):
         # hipb_mm bpreshuffle only supports bfloat16 as output type
         init_hipblas()
-        e, avg_e = run_aiter_hip_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype)
+        e, avg_e = run_aiter_hip(
+            x,
+            weightshuffle,
+            x_scale,
+            w_scale,
+            dtype,
+            quant_mode=quant_mode,
+            bpreshuffle=True,
+        )
         # e = e + bias
         err_e = checkAllclose(
             a,
@@ -240,11 +375,18 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
 
         if should_test_hipb_gelu(dtype, m, n, k, quantDtype):
             hipb_bias = torch.rand([n], dtype=dtype, device="cuda") * 10
-            base, _ = run_aiter_hip_bpreshuffle(
-                x, weightshuffle, x_scale, w_scale, dtype, bias=hipb_bias
+            base, _ = run_aiter_hip(
+                x,
+                weightshuffle,
+                x_scale,
+                w_scale,
+                dtype,
+                bias=hipb_bias,
+                quant_mode=quant_mode,
+                bpreshuffle=True,
             )
             ref = F.gelu(base.float()).to(dtype)
-            gelu, avg_gelu = run_aiter_hip_bpreshuffle(
+            gelu, avg_gelu = run_aiter_hip(
                 x,
                 weightshuffle,
                 x_scale,
@@ -252,6 +394,8 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
                 dtype,
                 bias=hipb_bias,
                 use_gelu=True,
+                quant_mode=quant_mode,
+                bpreshuffle=True,
             )
             err_gelu = checkAllclose(
                 ref,
@@ -278,7 +422,7 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
                 raise RuntimeError(
                     "hipb_findallsols(use_gelu=True) returned no solutions"
                 )
-            gelu_sol, avg_gelu_sol = run_aiter_hip_bpreshuffle(
+            gelu_sol, avg_gelu_sol = run_aiter_hip(
                 x,
                 weightshuffle,
                 x_scale,
@@ -287,6 +431,8 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
                 bias=hipb_bias,
                 use_gelu=True,
                 solution_index=sols[0],
+                quant_mode=quant_mode,
+                bpreshuffle=True,
             )
             err_gelu_sol = checkAllclose(
                 ref,
@@ -345,6 +491,8 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
         "ck bpreshuffle err": err_c,
         "asm us": avg_d,
         "asm err": err_d,
+        "hipmm us": avg_hipb,
+        "hipmm err": err_hipb,
         "hipmm bpreshuffle us": avg_e,
         "hipmm bpreshuffle err": err_e,
         "hipmm gelu_bias us": avg_gelu,
@@ -362,13 +510,17 @@ def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
     weight, w_scale = aiter.per_tensor_quant(weight, quant_dtype=quantDtype)
     bias = None
 
-    a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
+    a, avg_a = run_torch(
+        x, weight, x_scale, w_scale, bias, dtype, quant_mode="per-tensor"
+    )
     if m <= 2:
         b, avg_b = run_gemm_skinny(x, weight, x_scale, w_scale, None, dtype, cu_count)
     else:
         b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
 
-    msg = f"[perf] dim: {dim!s:<20} dtype: {dtype}, quantDtype: {quantDtype}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    msg = f"dim: {dim!s:<20} dtype: {dtype}, quantDtype: {quantDtype}"
+    if avg_a is not None and avg_b is not None:
+        msg = f"[perf] {msg}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(
         a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01, catastrophic_check=True
     )
@@ -481,8 +633,8 @@ def calculate_total_valid_points(cu_count, aligned_k):
     return total
 
 
-def test_normal_gemm_a8w8_pertoken_quant(
-    l_dtype, l_quantDtype, l_mnk, pad_a=128, skip_ck=False
+def test_normal_gemm_a8w8(
+    l_dtype, l_quantDtype, l_mnk, pad_a=128, skip_ck=False, quant_modes=("per-token",)
 ):
     is_gfx1250 = get_gfx() == "gfx1250"
     if is_gfx1250 and not skip_ck:
@@ -497,10 +649,41 @@ def test_normal_gemm_a8w8_pertoken_quant(
                 )
                 continue
             for m, n, k in l_mnk:
-                ret = test_gemm(
-                    dtype, m, n, k, quantDtype, pad_a=pad_a, skip_ck=skip_ck
-                )
-                df.append(ret)
+                for quant_mode in quant_modes:
+                    if quant_mode != "per-token" and quantDtype != dtypes.fp8:
+                        aiter.logger.warning(
+                            "%s GEMM cases require FP8 operands; skipping.", quant_mode
+                        )
+                        continue
+                    if (
+                        quant_mode in ("mxfp8-unswizzled", "mxfp8-swizzled")
+                        and get_gfx() != "gfx950"
+                    ):
+                        aiter.logger.warning(
+                            "MXFP8 hipb_mm cases require gfx950; skipping."
+                        )
+                        continue
+                    if quant_mode == "mxfp8-unswizzled" and m == 1:
+                        aiter.logger.warning(
+                            "Skipping unswizzled MXFP8 with hipBLASLt N=1 (test m=1)."
+                        )
+                        continue
+                    if quant_mode == "mxfp8-swizzled" and init_hipblas() < (1, 3, 0):
+                        aiter.logger.warning(
+                            "Swizzled MXFP8 requires hipBLASLt >=1.3; skipping."
+                        )
+                        continue
+                    ret = test_gemm(
+                        dtype,
+                        m,
+                        n,
+                        k,
+                        quantDtype,
+                        pad_a=pad_a,
+                        skip_ck=skip_ck,
+                        quant_mode=quant_mode,
+                    )
+                    df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("gemm_a8w8 summary (markdown):\n%s", df_md)
@@ -564,7 +747,7 @@ def test_skinny_gemm_a8w8_pertoken_quant():
                     test_skinny_gemm(dtype, m, n, k, quant_dtype, cu_count)
 
 
-def _iter_flydsl_csv_cases():
+def _iter_flydsl_csv_cases(compare_hipblaslt=False):
     """Yield (test_gemm kwargs, bench metadata) for flydsl tuned CSV rows."""
     gfx, cu = get_gfx(), get_cu_num()
     merged_csv = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
@@ -577,8 +760,16 @@ def _iter_flydsl_csv_cases():
         cu,
         os.path.basename(merged_csv),
     )
+    profiled_kernels = set()
     for _, row in rows.iterrows():
         q_dtype = dtypes.fp8 if "float8" in str(row["q_dtype_w"]) else dtypes.i8
+        kernel = (str(row["kernelName"]), str(row["q_dtype_w"]))
+        bpreshuffle_iters = TEST_NUM_ITERS
+        if TEST_NUM_ITERS == 1 and kernel not in profiled_kernels:
+            # Preserve a latency sample for every configuration while checking
+            # all remaining shapes once, without profiler/rotating-buffer work.
+            bpreshuffle_iters = 10
+            profiled_kernels.add(kernel)
         yield (
             {
                 "dtype": dtypes.bf16,
@@ -586,8 +777,13 @@ def _iter_flydsl_csv_cases():
                 "n": int(row["N"]),
                 "k": int(row["K"]),
                 "quantDtype": q_dtype,
+                "quant_mode": "per-token",
                 "pad_a": 128,
                 "skip_ck": True,
+                # This sweep validates FlyDSL dispatch for every tuned shape.
+                # The legacy sweep and test_hipb_mm.py cover ordinary hipb_mm.
+                "test_hipb": compare_hipblaslt,
+                "bpreshuffle_iters": bpreshuffle_iters,
             },
             {
                 "source": "flydsl_csv",
@@ -623,6 +819,16 @@ parser.add_argument(
     default=[dtypes.d_dtypes["i8"], dtypes.d_dtypes["fp8"]],
     help="""Data type of quantization.
     e.g.: -q fp8""",
+)
+parser.add_argument(
+    "--quant-mode",
+    choices=["per-token", "per-tensor", "mxfp8-unswizzled", "mxfp8-swizzled"],
+    nargs="+",
+    default=["per-token"],
+    help="""Quantization mode.
+    Default: per-token. Other modes have focused coverage in test_hipb_mm.py.
+    per-token/per-tensor use FP32 scales; MXFP8 uses one E8M0 scale per 32 elements.
+    e.g.: --quant-mode mxfp8-unswizzled mxfp8-swizzled""",
 )
 parser.add_argument(
     "--pad_a",
@@ -716,6 +922,11 @@ parser.add_argument(
     help="Skip validating flydsl shapes from tuned bpreshuffle CSVs.",
 )
 parser.add_argument(
+    "--compare-hipblaslt",
+    action="store_true",
+    help="Also run hipBLASLt comparisons for every FlyDSL CSV shape (legacy comparisons always run).",
+)
+parser.add_argument(
     "--no-legacy",
     action="store_true",
     help="Skip the original hardcoded shape sweep and skinny tests.",
@@ -726,20 +937,21 @@ args = parser.parse_args()
 
 if not args.no_flydsl_csv:
     bench_csv = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
-    for kwargs, extras in _iter_flydsl_csv_cases():
+    bench_rows = []
+    for kwargs, extras in _iter_flydsl_csv_cases(args.compare_hipblaslt):
         ret = test_gemm(**kwargs)
+        # Execution controls must not change the historical benchmark join key.
+        ret.pop("test_hipb", None)
+        ret.pop("bpreshuffle_iters", None)
         ret.update(extras)
-        written = append_tuned_op_bench_rows(
+        bench_rows.append(ret)
+    written = append_tuned_op_bench_rows(bench_csv, bench_rows, op_name="gemm_a8w8")
+    if written:
+        aiter.logger.info(
+            "gemm_a8w8: appended %d tuned op bench row(s) to %s",
+            written,
             bench_csv,
-            [ret],
-            op_name="gemm_a8w8",
         )
-        if written:
-            aiter.logger.info(
-                "gemm_a8w8: appended %d tuned op bench row(s) to %s",
-                written,
-                bench_csv,
-            )
 
 if not args.no_legacy:
     if args.csv is not None:
@@ -755,8 +967,8 @@ if not args.no_legacy:
             )
         )
 
-    df = test_normal_gemm_a8w8_pertoken_quant(
-        args.dtype, args.quantDtype, args.mnk, args.pad_a
+    df = test_normal_gemm_a8w8(
+        args.dtype, args.quantDtype, args.mnk, args.pad_a, quant_modes=args.quant_mode
     )
     if get_gfx() != "gfx1250":
         test_skinny_gemm_a8w8_pertoken_quant()
@@ -790,8 +1002,13 @@ if not args.no_legacy:
                 bpre_df["K"].tolist(),
             )
         )
-        df_bpre = test_normal_gemm_a8w8_pertoken_quant(
-            args.dtype, args.quantDtype, bpre_mnk, args.pad_a, skip_ck=True
+        df_bpre = test_normal_gemm_a8w8(
+            args.dtype,
+            args.quantDtype,
+            bpre_mnk,
+            args.pad_a,
+            skip_ck=True,
+            quant_modes=args.quant_mode,
         )
         if args.output and df_bpre is not None:
             bpre_filename = os.path.basename(args.bpreshuffle_csv).replace(

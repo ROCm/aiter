@@ -6,16 +6,20 @@ Unit tests for mp_tuner polling loop logic.
 Simulates async_result behavior without GPU/multiprocessing to verify:
 1. consecutive_timeouts tracks correctly and resets on success
 2. half-GPU threshold triggers break at the right time
-3. KeyError tasks stay in remaining_tasks and get retried after root-cause restart
+3. PID mapping errors are deferred until other tasks expose the root failure
 
 Run: python3 -m unittest op_tests.test_mp_tuner_logic -v
 """
 
 import importlib
 import multiprocessing as mp
+import os
+import subprocess
+import sys
 import time
 import unittest
 from multiprocessing import TimeoutError as MPTimeoutError
+from unittest.mock import patch
 
 
 def _wait_for_release(release, value):
@@ -45,7 +49,13 @@ class FakeAsyncResult:
             raise type("AcceleratorError", (Exception,), {})("GPU fault")
 
 
-def simulate_poll_round(remaining_tasks, task_start_times, mp_num, timeout):
+def simulate_poll_round(
+    remaining_tasks,
+    task_start_times,
+    mp_num,
+    timeout,
+    mapping_error_tasks=None,
+):
     """
     Simulate one round of the mp_tuner polling loop.
     Returns (completed, dummy_failed, pool_restart_needed, broke_early)
@@ -56,6 +66,8 @@ def simulate_poll_round(remaining_tasks, task_start_times, mp_num, timeout):
     half_gpu = max(1, (mp_num + 1) // 2)
     pool_restart_needed = False
     broke_early = False
+    if mapping_error_tasks is None:
+        mapping_error_tasks = set()
 
     for k, async_result in remaining_tasks:
         try:
@@ -89,7 +101,7 @@ def simulate_poll_round(remaining_tasks, task_start_times, mp_num, timeout):
             is_mapping_error = error_type == "KeyError"
 
             if is_mapping_error:
-                dummy_failed_tasks.append((k, "mapping error"))
+                mapping_error_tasks.add(k)
             elif error_type == "AcceleratorError":
                 completed_this_round.append((k, async_result))
                 pool_restart_needed = True
@@ -97,6 +109,12 @@ def simulate_poll_round(remaining_tasks, task_start_times, mp_num, timeout):
                 break
             else:
                 completed_this_round.append((k, async_result))
+
+    completed_indices = {k for k, _ in completed_this_round}
+    remaining_indices = {k for k, _ in remaining_tasks if k not in completed_indices}
+    mapping_error_tasks.intersection_update(remaining_indices)
+    if remaining_indices and remaining_indices.issubset(mapping_error_tasks):
+        pool_restart_needed = True
 
     return completed_this_round, dummy_failed_tasks, pool_restart_needed, broke_early
 
@@ -207,10 +225,9 @@ class TestConsecutiveTimeouts(unittest.TestCase):
         self.assertEqual(len(completed), 2)
 
 
-class TestKeyErrorHandling(unittest.TestCase):
+class TestMappingErrorRecovery(unittest.TestCase):
 
-    def test_keyerror_stays_in_remaining(self):
-        """KeyError tasks should NOT be in completed_this_round."""
+    def test_mapping_error_does_not_interrupt_successful_task(self):
         mp_num = 4
         timeout = 0.0
         now = time.time()
@@ -225,52 +242,96 @@ class TestKeyErrorHandling(unittest.TestCase):
         )
         completed_ids = {k for k, _ in completed}
         self.assertNotIn(0, completed_ids, "KeyError task should NOT be completed")
-        self.assertIn(1, completed_ids, "OK task should be completed")
-        self.assertEqual(len(dummy), 1, "KeyError task should be in dummy_failed")
-        self.assertFalse(restart, "KeyError alone should NOT trigger restart")
+        self.assertIn(1, completed_ids, "Polling must continue to the next task")
+        self.assertEqual(dummy, [], "Mapping errors must not discard candidates")
+        self.assertTrue(restart, "Only the stale-mapping task remains")
+        self.assertFalse(_broke, "Mapping errors must not stop polling")
 
-    def test_keyerror_with_timeout_gets_resubmitted(self):
-        """KeyError tasks wait for root-cause timeout to trigger restart."""
-        mp_num = 2
-        timeout = 0.0
+    def test_timeout_is_processed_before_mapping_restart(self):
+        mp_num = 4
         now = time.time()
+        mapping_errors = set()
         remaining = [
             (0, FakeAsyncResult("keyerror")),
-            (1, FakeAsyncResult("timeout_expired")),
+            (1, FakeAsyncResult("timeout_pending")),
         ]
-        start_times = {k: now - 10 for k, _ in remaining}
+        start_times = {0: now, 1: now}
 
-        completed, _dummy, restart, _broke = simulate_poll_round(
-            remaining, start_times, mp_num, timeout
+        completed, _dummy, restart, broke = simulate_poll_round(
+            remaining,
+            start_times,
+            mp_num,
+            timeout=100.0,
+            mapping_error_tasks=mapping_errors,
         )
-        completed_ids = {k for k, _ in completed}
-        self.assertNotIn(0, completed_ids, "KeyError task stays for resubmit")
-        self.assertIn(1, completed_ids, "Root-cause timeout is completed")
-        self.assertTrue(restart, "Timeout should trigger restart")
+        self.assertEqual(completed, [])
+        self.assertFalse(restart)
+        self.assertFalse(broke)
+        self.assertEqual(mapping_errors, {0})
 
-        new_remaining = [(k, ar) for k, ar in remaining if k not in completed_ids]
-        self.assertEqual(len(new_remaining), 1)
-        self.assertEqual(
-            new_remaining[0][0], 0, "Only KeyError task remains for resubmit"
+        remaining[1] = (1, FakeAsyncResult("timeout_expired"))
+        start_times[1] = now - 10
+        completed, _dummy, restart, broke = simulate_poll_round(
+            remaining,
+            start_times,
+            mp_num,
+            timeout=0.0,
+            mapping_error_tasks=mapping_errors,
         )
+        self.assertEqual({k for k, _ in completed}, {1})
+        self.assertTrue(restart)
+        self.assertFalse(broke)
 
-    def test_keyerror_no_restart_without_root_cause(self):
-        """If only KeyError tasks remain, no restart, they keep polling."""
-        mp_num = 4
-        timeout = 100.0
+    def test_pool_restarts_when_only_mapping_error_tasks_remain(self):
         now = time.time()
         remaining = [
             (0, FakeAsyncResult("keyerror")),
             (1, FakeAsyncResult("keyerror")),
         ]
-        start_times = {k: now for k, _ in remaining}
-
-        completed, dummy, restart, _broke = simulate_poll_round(
-            remaining, start_times, mp_num, timeout
+        completed, _dummy, restart, broke = simulate_poll_round(
+            remaining,
+            {0: now, 1: now},
+            mp_num=4,
+            timeout=100.0,
         )
-        self.assertFalse(restart, "No restart without root cause")
-        self.assertEqual(len(completed), 0, "Nothing completed")
-        self.assertEqual(len(dummy), 2, "Both are mapping errors")
+
+        self.assertEqual(completed, [])
+        self.assertTrue(restart)
+        self.assertFalse(broke)
+
+    def test_mapping_error_candidates_are_rerun_after_restart(self):
+        now = time.time()
+        remaining = [
+            (0, FakeAsyncResult("keyerror")),
+            (1, FakeAsyncResult("ok", [("info", 1.0, 0.0)])),
+        ]
+        mapping_errors = set()
+        completed, dummy, restart, _broke = simulate_poll_round(
+            remaining,
+            {0: now, 1: now},
+            mp_num=4,
+            timeout=100.0,
+            mapping_error_tasks=mapping_errors,
+        )
+
+        completed_indices = {k for k, _ in completed}
+        resubmitted_indices = [k for k, _ in remaining if k not in completed_indices]
+        self.assertEqual(dummy, [])
+        self.assertTrue(restart)
+        self.assertEqual(resubmitted_indices, [0])
+
+        mapping_errors.clear()
+        rerun = [(0, FakeAsyncResult("ok", [("info", 2.0, 0.0)]))]
+        completed, _dummy, restart, _broke = simulate_poll_round(
+            rerun,
+            {0: now},
+            mp_num=4,
+            timeout=100.0,
+            mapping_error_tasks=mapping_errors,
+        )
+        self.assertEqual({k for k, _ in completed}, {0})
+        self.assertFalse(restart)
+        self.assertEqual(mapping_errors, set())
 
 
 class TestAcceleratorError(unittest.TestCase):
@@ -368,6 +429,68 @@ class TestTaskStartTimeReset(unittest.TestCase):
         slots = [11.0, 22.0, 33.0]
         reset_start_times(slots, [0, 2])
         self.assertEqual(list(slots), [0, 22.0, 0])
+
+    def test_reset_clears_worker_pids(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        slots, pids = [11.0, 22.0], [101, 202]
+        tuner._reset_task_start_times(slots, [1], pids)
+        self.assertEqual(pids, [101, 0])
+
+
+class TestTaskWorkerExit(unittest.TestCase):
+
+    def test_exited_worker_is_detected(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        worker_exited = getattr(tuner, "_task_worker_exited", None)
+        self.assertIsNotNone(
+            worker_exited,
+            "a task whose worker died (e.g. GPU fault) must not wait for the timeout",
+        )
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        self.assertTrue(worker_exited([proc.pid], 0))
+        self.assertFalse(worker_exited([os.getpid()], 0))
+        self.assertFalse(worker_exited([0], 0), "a queued task has no worker yet")
+
+    def test_worker_pid_recorded_when_task_starts(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        ctx = mp.get_context("spawn")
+        start_times = ctx.RawArray("d", 1)
+        pids = ctx.RawArray("i", 1)
+        pool = ctx.Pool(
+            1,
+            initializer=tuner._init_task_start_times,
+            initargs=(start_times, pids),
+        )
+        try:
+            worker_pid = pool.apply_async(
+                tuner._run_with_start_tracking, (0, os.getpid, ())
+            ).get(timeout=60)
+            self.assertEqual(pids[0], worker_pid)
+            self.assertGreater(start_times[0], 0)
+        finally:
+            pool.terminate()
+            pool.join()
+
+
+class TestZeroTiming(unittest.TestCase):
+
+    def test_zero_after_retries_is_marked_failed(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        measured_result = object()
+
+        with (
+            patch(
+                "aiter.test_common.run_perftest",
+                return_value=(measured_result, 0),
+            ) as run_perftest,
+            patch.object(tuner.torch.cuda, "set_device"),
+            patch.object(tuner.torch.cuda, "synchronize"),
+        ):
+            result = tuner.worker(0, "candidate", lambda: None, [], {})
+
+        self.assertEqual(run_perftest.call_count, 4)
+        self.assertEqual(result, ("candidate", -1, 1.0))
 
 
 class TestWorkerErrorRatio(unittest.TestCase):

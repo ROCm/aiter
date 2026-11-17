@@ -44,13 +44,13 @@ Everything except the GEMMs -- gating, routing, and the activation quantization
 that feeds each layer -- is built once outside the timed region, so the numbers
 cover the two projections and nothing else.
 
-Unlike moe_gemm_a4w4 there is no backend switch: moe_gemm_a8w4 runs the gluon
-kernels on gfx1250 and the triton kernel everywhere else. On gfx1250 the
-variant follows routing's block_m *and* the projection's K -- persistent decode
-for block_m == 16 with K <= 768, plain decode for the rest of block_m == 16,
-prefill otherwise -- so the two projections can land on different kernels and
-the `kernel` column is per layer. --preshuffle enables the gluon-only gfx1250
-WMMA weight preshuffle.
+moe_gemm_a8w4 defaults to the gluon kernels on gfx1250 and the triton kernel
+everywhere else; --backend pins one instead (gluon needs gfx1250). Under gluon
+the variant follows routing's block_m *and* the projection's K -- persistent
+decode for block_m == 16 with K <= 768, plain decode for the rest of
+block_m == 16, prefill otherwise -- so the two projections can land on different
+kernels and the `kernel` column is per layer. --preshuffle enables the
+gluon-only gfx1250 WMMA weight preshuffle.
 """
 
 import argparse
@@ -69,6 +69,7 @@ from aiter.ops.triton.moe.moe_routing.routing import _USE_HERD, routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, downcast_to_static_fp8
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 # measurable layers, in report order; see the module docstring
 LAYERS = ("moe1", "moe2", "total")
@@ -245,7 +246,7 @@ def pin_routed_experts(logits, n_routed, n_expts_act):
     pool = torch.randperm(n_expts_tot, device=dev)[:n_pinned]
 
     slot = torch.arange(n_pinned, device=dev)
-    score = torch.rand((n_tokens, n_pinned), device=dev)
+    score = torch.rand((n_tokens, n_pinned), dtype=torch.float32, device=dev)
     score[slot % n_tokens, slot] += 1.0
     keep = pool[score.topk(n_expts_act, dim=-1).indices]
 
@@ -254,14 +255,20 @@ def pin_routed_experts(logits, n_routed, n_expts_act):
     return masked, n_pinned
 
 
-def kernel_variant(block_m, K):
+def backend_name(backend=None):
+    """Backend moe_gemm_a8w4 runs, resolving None the way the op does."""
+    if backend is not None:
+        return backend
+    return "gluon" if get_arch() == "gfx1250" else "triton"
+
+
+def kernel_variant(block_m, K, backend=None):
     """Compiled kernel moe_gemm_a8w4 dispatches to for a K-deep projection.
 
-    There is no backend argument: the op takes the gluon path iff the arch is
-    gfx1250. Within gluon, get_kernel_config_gluon() turns on the persistent
-    decode variant for shallow K, so moe1 and moe2 can differ.
+    Within gluon, get_kernel_config_gluon() turns on the persistent decode
+    variant for shallow K, so moe1 and moe2 can differ.
     """
-    if get_arch() != "gfx1250":
+    if backend_name(backend) != "gluon":
         return "_moe_gemm_a8w4"
     if block_m != 16:
         return "_moe_gemm_a8w4_prefill"
@@ -278,6 +285,9 @@ def bench_mlp_single_weight_init(
     w_dtype,
     TP,
     preshuffle,
+    bias,
+    activation,
+    backend,
     routed_experts,
     rep,
     layers=LAYERS,
@@ -292,6 +302,9 @@ def bench_mlp_single_weight_init(
         assert (
             get_arch() == "gfx1250"
         ), f"--preshuffle needs the gfx1250 gluon kernel, got {get_arch()}"
+        assert (
+            backend_name(backend) == "gluon"
+        ), "--preshuffle needs the gluon kernel, which --backend triton excludes"
     if routed_experts is not None:
         # every token needs n_expts_act distinct experts, so the pool can't be smaller
         assert n_expts_act <= routed_experts <= n_expts_tot, (
@@ -309,13 +322,27 @@ def bench_mlp_single_weight_init(
 
     # -- init data --
     # weights
-    wg = torch.randn((dim1, n_expts_tot), device=dev)
-    w1 = torch.randn((n_expts_tot, dim1, dim2 // TP), device=dev)
-    w2 = torch.randn((n_expts_tot, dim2 // TP // 2, dim1), device=dev)
+    wg = torch.randn((dim1, n_expts_tot), dtype=torch.float32, device=dev)
+    w1 = torch.randn((n_expts_tot, dim1, dim2 // TP), dtype=torch.float32, device=dev)
+    w2 = torch.randn(
+        (n_expts_tot, dim2 // TP // 2, dim1), dtype=torch.float32, device=dev
+    )
     # biases
-    bg = torch.randn((n_expts_tot,), device=dev)
-    b1 = torch.randn((n_expts_tot, dim2 // TP), device=dev)
-    b2 = torch.randn((n_expts_tot, dim1), device=dev)
+    bg = torch.randn((n_expts_tot,), dtype=torch.float32, device=dev)
+    if bias:
+        b1 = torch.randn((n_expts_tot, dim2 // TP), dtype=torch.float32, device=dev)
+        b2 = torch.randn((n_expts_tot, dim1), dtype=torch.float32, device=dev)
+    else:
+        b1 = b2 = None
+    # activation
+    if activation == "silu":
+        alpha = 1.0
+        limit = None
+        swiglu_add_residual = False
+    else:
+        alpha = 1.7
+        limit = 7.0
+        swiglu_add_residual = True
 
     # -- numerics --
     wg, _ = quantize(wg, "bf16")
@@ -360,7 +387,11 @@ def bench_mlp_single_weight_init(
             swizzle_mx_scale=swizzle_mx_scale1,
             out_dtype=out_dtype,
             apply_swiglu=True,
+            alpha=alpha,
+            limit=limit,
+            swiglu_add_residual=swiglu_add_residual,
             preshuffled=preshuffle,
+            backend=backend,
         )
 
     if static_fp8:
@@ -404,6 +435,7 @@ def bench_mlp_single_weight_init(
             scatter_indx=scatter_indx,
             swizzle_mx_scale=swizzle_mx_scale2,
             preshuffled=preshuffle,
+            backend=backend,
         )
 
     y2 = layer2()
@@ -429,21 +461,35 @@ def bench_mlp_single_weight_init(
     def w_bytes(w):
         return (w.numel() * w.element_size() // n_expts_tot) * routed
 
+    def w_scale_bytes(w):
+        return (w.numel() * w.element_size() * 2 // 32 // n_expts_tot) * routed
+
     moe1_flops = 2 * n_tokens * (dim2 // TP) * dim1  # N = dim2 // TP, K = dim1
-    moe1_bytes = x1.numel() * x1.element_size() + w_bytes(w1) + y1_bytes
+    moe1_bytes = (
+        x1.numel() * x1.element_size() + w_bytes(w1) + w_scale_bytes(w1) + y1_bytes
+    )
+    if not static_fp8:
+        moe1_bytes += x1.numel() // 32
+    if bias:
+        moe1_bytes += (b1.numel() * b1.element_size() // n_expts_tot) * routed
     moe2_flops = 2 * n_tokens * dim1 * (dim2 // TP // 2)  # N = dim1, K = dim2/TP/2
     # y2 is the scatter-compressed [batch, dim1] result; the GEMM writes the
     # uncompressed [n_tokens, dim1] rows the reduction then combines.
     moe2_bytes = (
         x2.numel() * x2.element_size()
         + w_bytes(w2)
+        + w_scale_bytes(w2)
         + n_tokens * dim1 * y2.element_size()
     )
+    if not static_fp8:
+        moe2_bytes += x2.numel() // 32
+    if bias:
+        moe2_bytes += (b2.numel() * b2.element_size() // n_expts_tot) * routed
 
     # the two projections have the same block_m but different K, so they can
     # land on different gluon variants
-    kernel1 = kernel_variant(rdata.block_m, dim1)
-    kernel2 = kernel_variant(rdata.block_m, dim2 // TP // 2)
+    kernel1 = kernel_variant(rdata.block_m, dim1, backend)
+    kernel2 = kernel_variant(rdata.block_m, dim2 // TP // 2, backend)
     kernels = {
         "moe1": kernel1,
         "moe2": kernel2,
@@ -487,6 +533,9 @@ def bench_mlp(
     w_dtype,
     TP,
     preshuffle,
+    bias,
+    activation,
+    backend,
     routed_experts,
     rep,
     layers=LAYERS,
@@ -504,6 +553,9 @@ def bench_mlp(
             w_dtype,
             TP,
             preshuffle,
+            bias,
+            activation,
+            backend,
             routed_experts,
             rep,
             layers,
@@ -542,6 +594,9 @@ def roofline_mlp(
     w_dtype,
     TP,
     preshuffle,
+    bias,
+    activation,
+    backend,
     routed_experts,
     rep,
     layers=LAYERS,
@@ -560,6 +615,7 @@ def roofline_mlp(
     )
     if routed_experts is not None:
         stem += f"-routed={routed_experts}"
+    stem += f"-{backend_name(backend)}"
     if preshuffle:
         stem += "-preshuffled"
     if tuple(layers) != LAYERS:
@@ -576,6 +632,9 @@ def roofline_mlp(
         w_dtype,
         TP,
         preshuffle,
+        bias,
+        activation,
+        backend,
         routed_experts,
         rep,  # fixed args
         layers,
@@ -588,7 +647,7 @@ def roofline_mlp(
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(prog="Benchmark MoE")
+    parser = get_parser(kernel_name="MoE")
 
     parser.add_argument(
         "--M",
@@ -636,6 +695,18 @@ def parse_args(args: list[str] | None = None):
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Preshuffle the mxfp4 weights for the gfx1250 gluon kernel (default: False).",
+    )
+    parser.add_argument(
+        "--bias",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add bias to result of MOE gemm (default: False).",
+    )
+    parser.add_argument(
+        "--activation",
+        choices=["silu", "swiglu"],
+        default="silu",
+        help="Activation function applied to MOE layer 1 (default: silu).",
     )
     parser.add_argument(
         "--routed-experts",
@@ -705,6 +776,9 @@ def main(args: list[str] | None = None) -> None:
         quantized_dtypes[1],
         TP=1,
         preshuffle=parsed_args.preshuffle,
+        bias=parsed_args.bias,
+        activation=parsed_args.activation,
+        backend=parsed_args.backend,
         routed_experts=parsed_args.routed_experts,
         rep=parsed_args.rep,
         # dedupe, keeping the canonical report order rather than argv order

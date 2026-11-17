@@ -18,6 +18,7 @@ from aiter.ops.triton.moe.moe_routing.routing import _USE_HERD, routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, downcast_to_static_fp8
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 
 def parse_profile(profile_path, useful_op_regex, reps):
@@ -213,7 +214,7 @@ def pin_routed_experts_mask(n_tokens, n_expts_tot, n_routed, n_expts_act, dev):
     pool = torch.randperm(n_expts_tot, device=dev)[:n_pinned]
 
     slot = torch.arange(n_pinned, device=dev)
-    score = torch.rand((n_tokens, n_pinned), device=dev)
+    score = torch.rand((n_tokens, n_pinned), dtype=torch.float32, device=dev)
     score[slot % n_tokens, slot] += 1.0
     keep = pool[score.topk(n_expts_act, dim=-1).indices]
 
@@ -234,6 +235,7 @@ def bench_mlp_single_weight_init(
     op_regex,
     routed_experts=None,
     preshuffle=False,
+    backend=None,
 ):
     rank = 0
     dev = f"cuda:{rank}"
@@ -254,13 +256,15 @@ def bench_mlp_single_weight_init(
 
     # -- init data --
     # weights
-    wg = torch.randn((dim1, n_expts_tot), device=dev)
-    w1 = torch.randn((n_expts_tot, dim1, dim2 // TP), device=dev)
-    w2 = torch.randn((n_expts_tot, dim2 // TP // 2, dim1), device=dev)
+    wg = torch.randn((dim1, n_expts_tot), dtype=torch.float32, device=dev)
+    w1 = torch.randn((n_expts_tot, dim1, dim2 // TP), dtype=torch.float32, device=dev)
+    w2 = torch.randn(
+        (n_expts_tot, dim2 // TP // 2, dim1), dtype=torch.float32, device=dev
+    )
     # biases
-    bg = torch.randn((n_expts_tot,), device=dev)
-    b1 = torch.randn((n_expts_tot, dim2 // TP), device=dev)
-    b2 = torch.randn((n_expts_tot, dim1), device=dev)
+    bg = torch.randn((n_expts_tot,), dtype=torch.float32, device=dev)
+    b1 = torch.randn((n_expts_tot, dim2 // TP), dtype=torch.float32, device=dev)
+    b2 = torch.randn((n_expts_tot, dim1), dtype=torch.float32, device=dev)
 
     # -- numerics --
     wg, _ = quantize(wg, "bf16")
@@ -285,7 +289,7 @@ def bench_mlp_single_weight_init(
     x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
     xg = x
     if x_dtype_str == "fp8":
-        static_scale = torch.tensor(1e-4, device=dev)
+        static_scale = torch.tensor(1e-4, dtype=torch.float32, device=dev)
     pin_mask = None
     if routed_experts is not None:
         pin_mask, n_pinned = pin_routed_experts_mask(
@@ -321,6 +325,7 @@ def bench_mlp_single_weight_init(
                 out_dtype=x_dtype,
                 apply_swiglu=True,
                 preshuffled=preshuffle,
+                backend=backend,
             )
             x = moe_gemm_a8w4(
                 x,
@@ -334,6 +339,7 @@ def bench_mlp_single_weight_init(
                 scatter_indx=scatter_indx,
                 swizzle_mx_scale=swizzle_mx_scale2,
                 preshuffled=preshuffle,
+                backend=backend,
             )
         else:
             assert x_dtype_str == "mx8"
@@ -351,6 +357,7 @@ def bench_mlp_single_weight_init(
                 swizzle_mx_scale=swizzle_mx_scale1,
                 apply_swiglu=True,
                 preshuffled=preshuffle,
+                backend=backend,
             )
             x, x_scale = quantize(x, x_dtype_str)
             x = moe_gemm_a8w4(
@@ -365,6 +372,7 @@ def bench_mlp_single_weight_init(
                 scatter_indx=scatter_indx,
                 swizzle_mx_scale=swizzle_mx_scale2,
                 preshuffled=preshuffle,
+                backend=backend,
             )
     proton.finalize()
     return parse_profile(
@@ -385,6 +393,7 @@ def bench_mlp(
     routed_experts=None,
     num_weight_inits=1,
     preshuffle=False,
+    backend=None,
 ):
     all_results = []
     for _ in range(num_weight_inits):
@@ -400,6 +409,7 @@ def bench_mlp(
             op_regex,
             routed_experts=routed_experts,
             preshuffle=preshuffle,
+            backend=backend,
         )
         all_results.append(result)
 
@@ -429,6 +439,7 @@ def roofline_mlp(
     name="",
     num_weight_inits=1,
     preshuffle=False,
+    backend=None,
 ):
     # Avoid creating an empty directory named like the output CSV stem.
     out_dir = Path("logs") / name
@@ -448,6 +459,7 @@ def roofline_mlp(
         routed_experts,  # fixed args
         num_weight_inits,
         preshuffle,
+        backend,
         bench_fn=bench_mlp,  # function to benchmark
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
@@ -456,7 +468,7 @@ def roofline_mlp(
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(prog="Benchmark MoE")
+    parser = get_parser(kernel_name="MoE")
 
     parser.add_argument(
         "--M",
@@ -554,6 +566,7 @@ def main(args: list[str] | None = None) -> None:
         name="gpt-oss-x2",
         num_weight_inits=parsed_args.num_weight_inits,
         preshuffle=parsed_args.preshuffle,
+        backend=parsed_args.backend,
     )
 
 

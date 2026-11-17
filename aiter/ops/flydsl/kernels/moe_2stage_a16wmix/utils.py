@@ -11,7 +11,7 @@ Used by both stage1 (:mod:`gemm1`) and stage2 (:mod:`gemm2`):
                            and the upconvert, all specialized for ``w_dtype`` so the
                            stages carry no weight-dtype branches.
   * leaf helpers           pointer casts, byte GEPs, groupwise-scale unpack,
-                           int4->bf16 upconvert, index math.
+                           int4/fp4->bf16 upconvert, index math.
 """
 
 from collections.abc import Callable
@@ -19,11 +19,17 @@ from typing import NamedTuple
 
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.layout_utils import crd2idx
+from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
+    _e8m0_byte_to_f32,
+    _global_i32_buffer_tiles,
+    _global_i32_buffer_view,
+    global_typed_ptr,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 
 # a16wi4 (int4 W) groupwise scale: group_size = 32 == one MFMA K32 step (one ku per
@@ -32,44 +38,15 @@ A16WI4_GROUP_SIZE = 32
 
 
 def _udiv(a, c):
-    cc = fx.Int32(c) if isinstance(c, int) else c
-    return fx.Int32(arith.divui(_raw(a), _raw(cc)))
+    return fx.Int32(fx.Uint32(a) // fx.Uint32(c))
 
 
 def _umod(a, c):
-    cc = fx.Int32(c) if isinstance(c, int) else c
-    return fx.Int32(arith.remui(_raw(a), _raw(cc)))
-
-
-def _global_i32_ptr(addr_i64):
-    ptr_ty = fx.PointerType.get(
-        T.i32, address_space=fx.AddressSpace.Global, alignment=4
-    )
-    return fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
+    return fx.Int32(fx.Uint32(a) % fx.Uint32(c))
 
 
 def _global_i32_at(addr_i64, idx):
-    return _global_i32_ptr(addr_i64)[idx]
-
-
-def _global_i32_buffer_view(addr_i64, num_bytes):
-    # fx.copy BufferCopy atoms take soffset as an element count (not bytes); the
-    # make_layout dynamic-shape leaf must be i32/i64, not fx.Index.
-    num_bytes_i64 = fx.Int64(num_bytes)
-    view = fx.Tensor(
-        fx.make_view(
-            _global_i32_ptr(addr_i64), fx.make_layout(num_bytes_i64 // fx.Int64(4), 1)
-        )
-    )
-    return fx.rocdl.make_buffer_tensor(
-        view, max_size=False, num_records_bytes=num_bytes_i64
-    )
-
-
-def _global_i32_buffer_tiles(addr_i64, num_bytes, tile_elems):
-    return fx.logical_divide(
-        _global_i32_buffer_view(addr_i64, num_bytes), fx.make_layout(tile_elems, 1)
-    )
+    return global_typed_ptr(addr_i64, T.i32)[idx]
 
 
 def _buffer_i32_scalar_read(tiles1, idx, atom):
@@ -79,7 +56,7 @@ def _buffer_i32_scalar_read(tiles1, idx, atom):
     """
     r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
     fx.copy(atom, fx.slice(tiles1, (None, idx)), r)
-    return fx.Int32(fx.Vector(fx.memref_load_vec(r))[0])
+    return fx.memref_load_vec(r)[0]
 
 
 def _int_to_llvm_ptr(addr, address_space):
@@ -116,12 +93,13 @@ def _cvt_pk_bf16_f32_se(src_a_f32, src_b_f32):
     )
 
 
-def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False, old_pack=False):
+def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, is_gfx942=False, old_pack=False):
     """int4 (signed) -> bf16 upconvert for one MFMA K32 step (8 nibbles -> v8bf16).
 
     ``raw_i32`` holds 8 signed-int4 nibbles. ``v_cvt_off_f32_i4`` reads the nibble
     unsigned, subtracts 8, and scales the mantissa by 16, so the x16 is folded into
-    eff = scale*16. ``use_k16`` (gfx942): v_cvt_pk_bf16_f32 is gfx950-only -> scalar.
+    ``eff = scale*16``. ``is_gfx942``: pack two f32 high-16s into a bf16
+    pair with lshr-16 (no ``v_cvt_pk_bf16_f32`` on this arch).
 
     ``old_pack`` (a16wi4 consuming the OLD FlyDSL kernel's weight preshuffle,
     ``pack_int8_to_packed_int4``): byte j packs K_j (low nibble) and K_{j+4} (high
@@ -134,20 +112,25 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False, old_pack=False)
     eff = scale_f32 * fx.Float32(16.0)
     raw_even = fx.Int32(raw_i32)
     raw_odd = raw_even.shrui(fx.Int32(4))
-    if use_k16:
-        # gfx942 fallback: scalar f32 -> bf16 truncation (no v_cvt_pk_bf16_f32).
+    if is_gfx942:
+        # gfx942: pack two f32 high-16s into a bf16 pair. Exact for scaled int4.
         los = []
         his = []
         for j in range_constexpr(4):
             f_lo = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_even), byte_sel=j)) * eff
             f_hi = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_odd), byte_sel=j)) * eff
-            los.append(f_lo.to(fx.BFloat16))
-            his.append(f_hi.to(fx.BFloat16))
-        if old_pack:
-            bf16s = los + his  # K0..K3 (los), K4..K7 (his)
-        else:
-            bf16s = [x for pair in zip(los, his) for x in pair]  # K0,K1,...,K7
-        return fx.Vector.from_elements([_raw(x) for x in bf16s], fx.BFloat16)  # v8bf16
+            los.append(f_lo)
+            his.append(f_hi)
+        f32s = (los + his) if old_pack else [x for pair in zip(los, his) for x in pair]
+        c16 = fx.Int32(16)
+        hi16 = fx.Int32(0xFFFF0000)
+        i32s = []
+        for i in range_constexpr(4):
+            b0 = f32s[2 * i].bitcast(fx.Int32)
+            b1 = f32s[2 * i + 1].bitcast(fx.Int32)
+            i32s.append(b0.shrui(c16) | (b1 & hi16))
+        v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
+        return v4i32.bitcast(fx.BFloat16)  # v8bf16
     # byte_sel loads (1 shift total); side-effecting pk-convert.
     los = []
     his = []
@@ -169,12 +152,6 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False, old_pack=False)
         ]
     v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
     return v4i32.bitcast(fx.BFloat16)  # v8bf16
-
-
-def _e8m0_byte_to_f32(packed_i32, byte_pos):
-    shift = byte_pos * fx.Int32(8)
-    b = packed_i32.shrui(shift) & fx.Int32(0xFF)
-    return (b << fx.Int32(23)).bitcast(fx.Float32)
 
 
 def _a16w4_swizzle_xor16(row, col_bytes, k_blocks16, *, enable=False):
@@ -205,9 +182,9 @@ def _bf16_frag4(v8, half):
     return t
 
 
-def _mma_bf16(mma_atom, use_k16, acc, a8, b8):
-    """One K32 MFMA from v8bf16 A/B fragments; gfx942 (use_k16) splits it into 2x K16."""
-    if const_expr(use_k16):
+def _mma_bf16(mma_atom, is_gfx942, acc, a8, b8):
+    """One K32 MFMA from v8bf16 A/B fragments; gfx942 splits it into 2x K16."""
+    if const_expr(is_gfx942):
         for h in range_constexpr(2):
             fx.gemm(mma_atom, acc, _bf16_frag4(a8, h), _bf16_frag4(b8, h), acc)
     else:
@@ -226,6 +203,11 @@ class _ALoader(NamedTuple):
 
     load: Callable  # load(mi, ku, slot=0) -> v8bf16 A MMA fragment
     store_tile: Callable  # store_tile(base_k, slot=0): global -> A-LDS, one K tile
+    # gfx942 VGPR staging split in two so a pipelined caller can keep several
+    # A tiles in flight: issue_tile(base_k) -> gmem->VGPR loads,
+    # commit_tile(regs, slot=0) -> VGPR->LDS writes of those registers.
+    issue_tile: Callable | None = None
+    commit_tile: Callable | None = None
 
 
 def make_a_loader(
@@ -274,7 +256,7 @@ def make_a_loader(
                              entirely -- stage2 has a single, unslotted A region.
       * ``a_load_threads``   threads cooperating on one tile (< 256 when k_wave > 1
                              splits the block into per-k-group loader sets).
-      * ``dma_via_vgpr``     gfx942 (use_k16) staging fallback, see below.
+      * ``dma_via_vgpr``     gfx942 staging fallback, see below.
     """
     elem_bytes = 2  # bf16
     # Per-thread A gather: each thread moves 16 B (v8bf16) per pass.
@@ -375,9 +357,51 @@ def make_a_loader(
         fx.copy_atom_call(
             lds_atom, fx.slice(tiles, (None, byte_off // fx.Int32(16))), r
         )
-        return fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16)  # v8bf16
+        return fx.memref_load_vec(r).bitcast(fx.BFloat16)  # v8bf16
 
-    return _ALoader(load=lds_load_a, store_tile=store_a_tile)
+    def issue_a_tile(base_k):
+        assert dma_via_vgpr, "issue_tile is the gfx942 VGPR staging path"
+        base_k_div4 = (base_k * fx.Int32(elem_bytes)) // fx.Int32(4)
+        regs = []
+        for i in range_constexpr(num_x_loads):
+            col_bytes = x_col_dw[i] * fx.Int32(4)
+            col_sw = _a16w4_swizzle_xor16(
+                x_row_local[i], col_bytes, fx.Int32(k_blocks16), enable=swizzle
+            )
+            row_k_dw = x_row_base_div4[i] + base_k_div4
+            global_byte = row_k_dw * fx.Int32(4) + col_sw
+            r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+            fx.copy(
+                x_dma_atom,
+                fx.slice(x_dma_tiles4, (None, global_byte // fx.Int32(16))),
+                r,
+            )
+            regs.append(r)
+        return regs
+
+    def commit_a_tile(regs, slot=0):
+        if k_grp_base_bytes is None:
+            slot_byte = None
+        else:
+            slot_byte = k_grp_base_bytes + fx.Int32(slot * A_SLOT_BYTES)
+        for i in range_constexpr(num_x_loads):
+            col_bytes = x_col_dw[i] * fx.Int32(4)
+            if const_expr(slot_byte is None):
+                lds_byte = x_row_local[i] * fx.Int32(KH_TILE_BYTES) + col_bytes
+            else:
+                lds_byte = (
+                    slot_byte + x_row_local[i] * fx.Int32(KH_TILE_BYTES) + col_bytes
+                )
+            fx.copy(
+                lds_atom, regs[i], fx.slice(tiles, (None, lds_byte // fx.Int32(16)))
+            )
+
+    return _ALoader(
+        load=lds_load_a,
+        store_tile=store_a_tile,
+        issue_tile=issue_a_tile,
+        commit_tile=commit_a_tile,
+    )
 
 
 class _BCol(NamedTuple):
@@ -406,6 +430,74 @@ class _BLoader(NamedTuple):
     load_raw: Callable  # load_raw(base_k, col) -> per-K-step raw fragments
     load_scale: Callable  # load_scale(base_k, col) -> per-K-step f32 scales
     upconvert: Callable  # upconvert(raw, ku, scale) -> v8bf16 MMA operand
+    # mxfp4 deferred scales: load_scale_raw(base_k, col) issues only the e8m0
+    # dword loads; convert_scale(base_k, col, raw) later decodes them into the
+    # same per-K-step f32 scales that load_scale returns.
+    load_scale_raw: Callable | None = None
+    convert_scale: Callable | None = None
+
+
+# gfx942 MXFP4: E2M1 mag 0..7 as E4M3FNUZ fp8 bytes for one v_perm_b32.
+# byte[i] = {0x00, 0x38, 0x40, 0x44, 0x48, 0x4C, 0x50, 0x54}[mag.byte(i)]
+_FP4_E2M1_FP8_LUT_LO = 0x44403800  # mag 0..3
+_FP4_E2M1_FP8_LUT_HI = 0x54504C48  # mag 4..7
+
+
+def _fp4x4_e2m1_to_f32x4(nib_i32):
+    """4 E2M1 nibbles (low nibble of each byte) -> 4 unscaled f32.
+
+    One ``v_perm_b32`` gathers E4M3FNUZ fp8 codes, then ``cvt_pk_f32_fp8``.
+    Sign is forced off when mag==0 so E2M1 -0.0 does not become FNUZ NaN (0x80).
+    """
+    mag = nib_i32 & fx.Int32(0x07070707)
+    magbyte = fx.Int32(
+        rocdl.perm_b32(
+            _raw(fx.Int32(_FP4_E2M1_FP8_LUT_HI)),
+            _raw(fx.Int32(_FP4_E2M1_FP8_LUT_LO)),
+            _raw(mag),
+        )
+    )
+    nz = ((mag + fx.Int32(0x7F7F7F7F)).shrui(fx.Int32(7))) & fx.Int32(0x01010101)
+    signbit = (nib_i32 & fx.Int32(0x08080808)) << fx.Int32(4)
+    signmask = nz << fx.Int32(7)
+    fp8_i32 = magbyte | (signbit & signmask)
+    lo = fx.Vector(rocdl.cvt_pk_f32_fp8(T.f32x2, _raw(fp8_i32), False))
+    hi = fx.Vector(rocdl.cvt_pk_f32_fp8(T.f32x2, _raw(fp8_i32), True))
+    return (
+        fx.Float32(lo[0]),
+        fx.Float32(lo[1]),
+        fx.Float32(hi[0]),
+        fx.Float32(hi[1]),
+    )
+
+
+def _fp4_nibble_to_bf16x8(raw_i32, scale_f32):
+    """FP4 (E2M1) -> v8bf16 for one MFMA K32 step, with the groupwise scale applied.
+
+    gfx942 substitute for ``v_cvt_scalef32_pk_bf16_fp4``. Nibble i is bits
+    ``[4*i : 4*i+4)``, matching gfx950 cvt sel order (sel 0 = byte0 = K0,K1).
+    E8M0 is a power of two; scale is applied on f32, then packed with the same
+    lshr-16 used by gfx942 int4.
+    """
+    packed = fx.Int32(raw_i32)
+    even = packed & 0x0F0F0F0F  # K0,K2,K4,K6
+    odd = packed.shrui(fx.Int32(4)) & 0x0F0F0F0F  # K1,K3,K5,K7
+    fe = _fp4x4_e2m1_to_f32x4(even)
+    fo = _fp4x4_e2m1_to_f32x4(odd)
+    scale = fx.Float32(scale_f32)
+    f32s = []
+    for i in range_constexpr(4):
+        f32s.append(fe[i] * scale)
+        f32s.append(fo[i] * scale)
+    c16 = fx.Int32(16)
+    hi16 = fx.Int32(0xFFFF0000)
+    i32s = []
+    for i in range_constexpr(4):
+        b0 = f32s[2 * i].bitcast(fx.Int32)
+        b1 = f32s[2 * i + 1].bitcast(fx.Int32)
+        i32s.append(b0.shrui(c16) | (b1 & hi16))
+    v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
+    return v4i32.bitcast(fx.BFloat16)
 
 
 def make_b_loader(
@@ -421,7 +513,7 @@ def make_b_loader(
     TILE_K,
     w_dtype,
     b_cache_mod,
-    use_k16,
+    rocm_arch,
 ):
     """Build the shared B (weight) operand path for gemm1 and gemm2.
 
@@ -436,15 +528,30 @@ def make_b_loader(
       ``"int4"`` OLD-kernel packed int4 W + (E, G//2, N, 2) bf16 groupwise scale
       ``"bf16"`` raw bf16 W (no scale, no upconvert; ``load_scale`` yields all-None and
                  ``upconvert`` returns the loaded fragment unchanged)
+      ``"fp8"``  MXFP8: fp8 e4m3 W in the ``shuffle_weight`` (16, 16) layout + the
+                 mxfp4 e8m0 per-1x32 scale layout (``shuffle_scale``); gfx950 only.
+                 ``upconvert`` scales the codes to bf16 exactly (e4m3 x 2^k fits bf16),
+                 so the MMA operand equals the bf16 upcast of the weight.
 
     ``expert_off``/``inter``-style N arithmetic stays with the caller: it hands ``col``
     the 16-wide N block base and gets back everything the loaders need.
 
     Returns a :class:`_BLoader`. The closures emit no IR until called, so building them
     here rather than inline in the kernel body does not perturb instruction order.
+
+    Cache-key note: FlyDSL hashes this factory's source (not nested helpers).
+    On gfx942 the a16wi4 W upconvert is the lshr-16 bf16 pack in
+    ``_int4_nibble_to_bf16x8``; a16wfp4 uses ``_fp4_nibble_to_bf16x8`` (fp8 LUT
+    + ``cvt_pk_f32_fp8``) instead of ``v_cvt_scalef32_pk_bf16_fp4``.
     """
     _is_int4 = w_dtype == "int4"
     _is_bf16 = w_dtype == "bf16"
+    _is_fp8 = w_dtype == "fp8"
+    _is_gfx942 = str(rocm_arch).startswith("gfx942")
+    assert not (_is_fp8 and _is_gfx942), "fp8 (MXFP8) W needs gfx950 cvt_scalef32"
+    assert not _is_fp8 or TILE_K % 128 == 0, "fp8 W needs TILE_K % 128 == 0"
+    # W tensors whose per-expert base is folded into the buffer resource address.
+    _w_per_expert_base = _is_bf16 or _is_fp8
     # Emitted before the layouts/resources below: this is where the stages used to
     # compute it, and the ISA is sensitive to the order operands are materialized in.
     expert_off = e * fx.Int32(N_OUT)
@@ -487,6 +594,16 @@ def make_b_loader(
         (N_OUT // 16, bfl_k0, 4, 16, 8),
         (bfl_stride_n0, bfl_stride_k0, bfl_stride_klane, 8, 1),
     )
+    # W (fp8 e4m3) preshuffle layout (N-major == shuffle_weight (16,16) on 1-byte
+    # elements), byte units: shape (N_OUT/16, K/32, 2, 16, 16). A 32-K group of a
+    # 16-row block is [K half][row][16 codes], so a lane's 32 codes of the group are
+    # two dwordx4 loads 256 B apart, and every load instruction of a wave reads four
+    # contiguous 256 B runs (whole cache lines), as the bf16 layout does.
+    if const_expr(_is_fp8):
+        f8l_k0 = K // 32
+        layout_b_fp8 = fx.make_layout(
+            (N_OUT // 16, f8l_k0, 2, 16, 16), (f8l_k0 * 512, 512, 256, 16, 1)
+        )
     # B-scale preshuffle layout (make_preshuffle_scale_layout, e8m0 u8, per-1x32):
     #   K padded to 256 mult. shape (N_OUT/32, c_k1, 4, 16), strides below.
     scale_k_padded = ((K + 255) // 256) * 256
@@ -500,9 +617,10 @@ def make_b_loader(
     # ---- buffer resources -----------------------------------------------------
     # bf16 W [E, N_OUT, K] whole-tensor extent overflows the 32-bit num_records/i32
     # byte-offset at large E (E896: 6.6GB): fold the per-expert base into the i64
-    # resource addr and index within the expert. mxfp4/int4 keep the whole-tensor path.
-    if const_expr(_is_bf16):
-        _w_per_expert_bytes = N_OUT * (K * 2)
+    # resource addr and index within the expert (fp8 W too). mxfp4/int4 keep the
+    # whole-tensor path.
+    if const_expr(_w_per_expert_base):
+        _w_per_expert_bytes = N_OUT * (K * (2 if _is_bf16 else 1))
         w_base_i64 = fx.Int64(arg_bq) + fx.Int64(e) * fx.Int64(_w_per_expert_bytes)
         w_tiles = _global_i32_buffer_tiles(
             w_base_i64, min(_w_per_expert_bytes, 0xFFFFFFFF), 4
@@ -572,8 +690,8 @@ def make_b_loader(
     def col(*n_terms):
         """Address one 16-wide N block; this lane owns row ``sum(n_terms) + lane``."""
         col_g = _sum(n_terms[0], n_terms[1:]) + lane_mod_16
-        # bf16 W folds the expert into the resource base (above); mxfp4/int4 index it.
-        _row_expert_off = fx.Int32(0) if const_expr(_is_bf16) else expert_off
+        # bf16/fp8 W fold the expert into the resource base (above); mxfp4/int4 index it.
+        _row_expert_off = fx.Int32(0) if const_expr(_w_per_expert_base) else expert_off
         row = _row_expert_off + col_g
         n_blk = row // fx.Int32(16)
         n_intra = row % fx.Int32(16)
@@ -583,7 +701,7 @@ def make_b_loader(
     def col_pair(*n_terms, shift):
         """Address a gate|up pair: one block, and the one ``shift`` further along N."""
         col_g = _sum(n_terms[0], n_terms[1:]) + lane_mod_16
-        _row_expert_off = fx.Int32(0) if const_expr(_is_bf16) else expert_off
+        _row_expert_off = fx.Int32(0) if const_expr(_w_per_expert_base) else expert_off
         row_g = _row_expert_off + col_g
         row_u = row_g + shift
         blk_g, intra_g = row_g // fx.Int32(16), row_g % fx.Int32(16)
@@ -615,9 +733,9 @@ def make_b_loader(
             )
             # idx_pack is a fp4-byte offset; dwordx4 tile index = (idx_pack/4 dwords)/4.
             r = fx.make_rmem_tensor(w_reg_lay, fx.Int32)
-            fx.copy(w_copy_atom, fx.slice(w_tiles, (None, idx_pack // fx.Int32(16))), r)
+            fx.copy(w_copy_atom, fx.slice(w_tiles, (None, idx_pack // 16)), r)
             v4 = fx.Vector(fx.memref_load_vec(r))
-            raw.append([fx.Int32(v4[j]) for j in range(4)])
+            raw.append([v4[j] for j in range(4)])
         return raw
 
     def load_b_raw_int4(base_k, n_blk, n_intra):
@@ -647,12 +765,10 @@ def make_b_loader(
                 )
                 # idx is an int4-nibble byte offset; dwordx2 tile index = (idx bytes)/8.
                 r = fx.make_rmem_tensor(w_reg_lay2, fx.Int32)
-                fx.copy(
-                    w_copy_atom64, fx.slice(w_tiles8, (None, idx // fx.Int32(8))), r
-                )
+                fx.copy(w_copy_atom64, fx.slice(w_tiles8, (None, idx // 8)), r)
                 v2 = fx.Vector(fx.memref_load_vec(r))
-                four.append(fx.Int32(v2[0]))
-                four.append(fx.Int32(v2[1]))
+                four.append(v2[0])
+                four.append(v2[1])
             raw.append(four)
         return raw
 
@@ -680,8 +796,37 @@ def make_b_loader(
             )
             # elem_idx is a bf16-elem offset; dword index = elem_idx*2/4, tile idx = /4.
             r = fx.make_rmem_tensor(w_reg_lay, fx.Int32)
-            fx.copy(w_copy_atom, fx.slice(w_tiles, (None, elem_idx // fx.Int32(8))), r)
+            fx.copy(w_copy_atom, fx.slice(w_tiles, (None, elem_idx // 8)), r)
             raw.append(fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16))  # v8bf16
+        return raw
+
+    def load_b_raw_fp8(base_k, n_blk, n_intra):
+        # fp8 W: raw[k0][2*j + {0, 1}] = the 8 codes (2 i32, K order) of K micro-step
+        # k0*4 + j. This lane's 32 codes of 128-K block k0 sit in 32-K group
+        # base_k//32 + k0*4 + lane_div_16 (the bf16 K map), K halves h = 0, 1.
+        raw = []
+        for k0i in range_constexpr(_k0_count):
+            kb32 = (base_k + fx.Int32(k0i * 128)) // fx.Int32(32) + lane_div_16
+            codes = []
+            for h in range_constexpr(2):
+                idx = fx.Int32(
+                    crd2idx(
+                        [
+                            fx.Int64(n_blk),
+                            fx.Int64(kb32),
+                            fx.Int64(h),
+                            fx.Int64(n_intra),
+                            fx.Int64(0),
+                        ],
+                        layout_b_fp8,
+                    )
+                )
+                # idx is a byte offset; dwordx4 tile index = idx/16.
+                r = fx.make_rmem_tensor(w_reg_lay, fx.Int32)
+                fx.copy(w_copy_atom, fx.slice(w_tiles, (None, idx // 16)), r)
+                v4 = fx.Vector(fx.memref_load_vec(r))
+                codes.extend(v4[j] for j in range(4))
+            raw.append(codes)
         return raw
 
     def load_b_scale(base_k, mni, n_pack):
@@ -733,23 +878,42 @@ def make_b_loader(
         if const_expr(_is_bf16):
             # raw[ku] is already the v8bf16 MMA operand (no scale, no upconvert).
             return raw[ku]
+        if const_expr(_is_fp8):
+            # 8 e4m3 codes (2 i32, low byte = lowest K) -> 4 scaled pk converts (low /
+            # high code pair of each i32) -> v8bf16. Raw rocdl: FlyDSL has no typed
+            # scaled fp8 -> bf16 convert. A power-of-two scale makes it exact.
+            j = ku % 4
+            s_raw = _raw(scale_f32)
+            i32s = []
+            for w in range_constexpr(2):
+                src = _raw(raw[ku // 4][2 * j + w])
+                for hi in (False, True):
+                    p = rocdl.cvt_scalef32_pk_bf16_fp8(vec2_bf16, src, s_raw, hi)
+                    i32s.append(fx.Vector(p).bitcast(fx.Int32)[0])
+            v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
+            return v4i32.bitcast(fx.BFloat16)  # v8bf16
         i32_val = _raw(raw[ku // 4][ku % 4])
         if const_expr(_is_int4):
             return _int4_nibble_to_bf16x8(
-                fx.Int32(i32_val), scale_f32, use_k16=use_k16, old_pack=True
+                fx.Int32(i32_val), scale_f32, is_gfx942=_is_gfx942, old_pack=True
             )
+        if const_expr(_is_gfx942):
+            # gfx942: no v_cvt_scalef32_pk_bf16_fp4; fp8-LUT + cvt_pk_f32_fp8.
+            return _fp4_nibble_to_bf16x8(fx.Int32(i32_val), scale_f32)
         # raw[ku//4][ku%4] i32 holds 8 fp4 -> 4x cvt (v2bf16, sel 0..3) -> v8bf16.
         s_raw = _raw(scale_f32)
         i32s = []
         for sel in range_constexpr(4):
             p = rocdl.cvt_scalef32_pk_bf16_fp4(vec2_bf16, i32_val, s_raw, sel)
-            i32s.append(fx.Int32(fx.Vector(p).bitcast(fx.Int32)[0]))
+            i32s.append(fx.Vector(p).bitcast(fx.Int32)[0])
         v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
         return v4i32.bitcast(fx.BFloat16)  # v8bf16
 
     # ---- dtype-selected surface: the stages only ever see these ----------------
     if const_expr(_is_bf16):
         _load_raw = load_b_raw_bf16
+    elif const_expr(_is_fp8):
+        _load_raw = load_b_raw_fp8
     elif const_expr(_is_int4):
         _load_raw = load_b_raw_int4
     else:
@@ -766,10 +930,51 @@ def make_b_loader(
             return load_b_scale_int4(base_k, col.sc_n)
         return load_b_scale(base_k, col.sc_blk, col.sc_pack)
 
+    def load_b_scale_raw(base_k, mni):
+        # load_b_scale's dword gathers only (one per 128-K block), no decode.
+        raws = {}
+        for ku in range_constexpr(k_unroll):
+            _k0_blk = ku // 4
+            if _k0_blk not in raws:
+                adj_ku = base_k // fx.Int32(32) + fx.Int32(_k0_blk * 4) + lane_div_16
+                s_ku = adj_ku // fx.Int32(8)
+                idx = (
+                    mni * fx.Int32(sc_stride_n0)
+                    + s_ku * fx.Int32(sc_stride_k0)
+                    + lane_div_16 * fx.Int32(sc_stride_klane)
+                    + lane_mod_16
+                )
+                raws[_k0_blk] = _buffer_i32_scalar_read(sw_tiles, idx, sw_read_atom)
+        return raws
+
+    def convert_b_scale(base_k, n_pack, raws):
+        # load_b_scale's decode of the gathered dwords, same arithmetic per ku.
+        scales = []
+        for ku in range_constexpr(k_unroll):
+            _k0_blk = ku // 4
+            adj_ku = base_k // fx.Int32(32) + fx.Int32(_k0_blk * 4) + lane_div_16
+            k_pack_sub = (adj_ku // fx.Int32(4)) % fx.Int32(2)
+            packed = raws[_k0_blk]
+            byte_even = k_pack_sub * fx.Int32(2)
+            byte_odd = byte_even + fx.Int32(1)
+            se = _e8m0_byte_to_f32(packed, byte_even)
+            so = _e8m0_byte_to_f32(packed, byte_odd)
+            scales.append((n_pack == fx.Int32(0)).select(se, so))
+        return scales
+
+    def load_scale_raw(base_k, col):
+        assert not _is_int4 and not _is_bf16, "deferred scales are mxfp4-only"
+        return load_b_scale_raw(base_k, col.sc_blk)
+
+    def convert_scale(base_k, col, raws):
+        return convert_b_scale(base_k, col.sc_pack, raws)
+
     return _BLoader(
         col=col,
         col_pair=col_pair,
         load_raw=load_raw,
         load_scale=load_scale,
         upconvert=upconvert_b,
+        load_scale_raw=load_scale_raw,
+        convert_scale=convert_scale,
     )

@@ -94,7 +94,7 @@ def pod_attention(
             matching respective query tensors.
     """
     _LOGGER.info(
-        f"POD_ATTENTION: q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
+        "POD_ATTENTION: q=%s k=%s v=%s", tuple(q.shape), tuple(k.shape), tuple(v.shape)
     )
     # shape constraints
     HEAD_DIM_Q, HEAD_DIM_K, HEAD_DIM_V = q.shape[-1], k.shape[-1], v.shape[-1]
@@ -111,8 +111,8 @@ def pod_attention(
     qk_scale = sm_scale * 1.44269504
 
     # We assume the kernel functions fused by pod attention are persistent kernel functions
-    # For gfx942, we launch total 608 WGs. Each CU will get 2 WG --- one WG will be doing decode and one prefill
-    # For different decode:prefill ratios, assign (decode+prefill)*304 number of WGs
+    # The launch has two WGs per CU (decode and prefill); use the CU count
+    # to fold program IDs.
     total_wgs = total_programs // 2
 
     (
@@ -280,6 +280,7 @@ def pod_attention(
         prefill_ratio=prefill_ratio,
         decode_ratio=decode_ratio,
         max_output_tile_cnt=max_output_tile_cnt,
+        num_cus=total_wgs,
     )
     # torch.cuda.synchronize()
     print(

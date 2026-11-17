@@ -1,4 +1,14 @@
-from . import interface_v2 as flash_attn_2
-from . import interface_v3 as flash_attn_3
+"""Compatibility imports for FlashAttention consumers using the former Dao-AI path."""
 
-__all__ = ["flash_attn_2", "flash_attn_3"]
+import sys
+
+from aiter.ops.triton._triton_kernels.attention.dao_ai import (
+    flash_attn_2,
+    flash_attn_3,
+    utils,
+)
+
+# FlashAttention main imports the utilities as a submodule, not a package attribute.
+sys.modules[__name__ + ".utils"] = utils
+
+__all__ = ["flash_attn_2", "flash_attn_3", "utils"]

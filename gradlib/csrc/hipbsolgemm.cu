@@ -8,8 +8,39 @@
 // __HIP_NO_HALF_CONVERSIONS__ #endif
 
 #include "hipbsolgemm.cuh"
-#include <ATen/hip/HIPContext.h>
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include "aiter_hip_common.h"  // HipDeviceGuard, get_gpu_arch
+#include "rocm_ops.hpp"        // pybind11 + namespace py + aiter_tensor_t caster
+#include <array>
+#include <fcntl.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <io.h>
+#include <windows.h>
+
+#define LOCK_EX 2
+#define LOCK_UN 8
+
+// No flock() on Windows.
+static int flock(int fd, int operation)
+{
+    HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+    OVERLAPPED ov{};
+    BOOL ok = operation == LOCK_EX
+                  ? LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &ov)
+                  : UnlockFileEx(h, 0, MAXDWORD, MAXDWORD, &ov);
+    return ok ? 0 : -1;
+}
+#else
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 
 // #include <rocblas/rocblas.h>
 
@@ -67,6 +98,8 @@ hipblasLtMatmulPreference_t preference;
 size_t workspace_size = 2 * 128 * 1024 * 1024;
 // uint64_t workspace_size = 0;
 void* d_workspace;
+// One resource set per module. Lifecycle calls retain the Python GIL.
+int extension_device  = -1;
 int request_solutions = 1;
 int returnedAlgoCount = 0;
 
@@ -96,20 +129,27 @@ int warmup_iters{1};
 
 bool cout_print = false;
 
-torch::Tensor dTensor;
+// AiterDtype -> hipDataType. fp8 is intentionally absent: aiter_tensor_t collapses
+// both e4m3 variants into AITER_DTYPE_fp8, so the fnuz/fn choice is resolved by the
+// running arch in aiter_to_hip_dtype() below (matches the arch-pinned aiter.dtypes.fp8).
+std::map<AiterDtype, hipDataType> dtype_map{{AITER_DTYPE_fp16, HIP_R_16F},
+                                            {AITER_DTYPE_bf16, HIP_R_16BF},
+                                            {AITER_DTYPE_fp32, HIP_R_32F},
+                                            {AITER_DTYPE_i8, HIP_R_8I},
+                                            {AITER_DTYPE_i16, HIP_R_16I},
+                                            {AITER_DTYPE_i32, HIP_R_32I}};
 
-std::map<at::ScalarType, hipDataType> dtype_map{{at::kHalf, HIP_R_16F},
-                                                {at::kBFloat16, HIP_R_16BF},
-                                                {at::kFloat, HIP_R_32F},
-                                                {at::kChar, HIP_R_8I},
-                                                {at::kShort, HIP_R_16I},
-                                                {at::kInt, HIP_R_32I}
-#ifdef ENABLE_TORCH_FP8
-                                                ,
-                                                {at::kFloat8_e4m3fnuz, HIP_R_8F_E4M3_FNUZ},
-                                                {at::kFloat8_e4m3fn, HIP_R_8F_E4M3}
-#endif
-};
+static hipDataType aiter_to_hip_dtype(AiterDtype dt)
+{
+    if(dt == AITER_DTYPE_fp8)
+    {
+        // MI300 (gfx94x) uses OCP-FNUZ fp8; gfx95x+/RDNA use OCP-FN. Mirrors the
+        // per-arch aiter.dtypes.fp8 the Python side already selected.
+        const std::string arch = get_gpu_arch();
+        return (arch.rfind("gfx94", 0) == 0) ? HIP_R_8F_E4M3_FNUZ : HIP_R_8F_E4M3;
+    }
+    return dtype_map.at(dt);
+}
 
 // std::vector<hipblasLtMatmulHeuristicResult_t> heuristicResult;
 } // namespace
@@ -136,9 +176,10 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(hipblasLtHandle_t handle,
                                                      const void* scaleB,
                                                      const void* scaleC,
                                                      hipStream_t& stream,
-                                                     bool use_rowwise = false,
-                                                     bool bpreshuffle = false,
-                                                     bool use_gelu    = false)
+                                                     bool bpreshuffle,
+                                                     bool use_gelu,
+                                                     hipblasLtMatmulMatrixScale_t scaleA_mode,
+                                                     hipblasLtMatmulMatrixScale_t scaleB_mode)
 {
     int flag{0};
     hipblasLtMatrixLayout_t matA, matB, matC;
@@ -201,12 +242,11 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(hipblasLtHandle_t handle,
         CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
             matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scaleA, sizeof(scaleA)));
 #if (HIPBLASLT_VERSION_MAJOR >= 1)
-        if(use_rowwise)
-        {
-            auto scale_mode_a = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
-            CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
-                matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scale_mode_a, sizeof(scale_mode_a)));
-        }
+        CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+            matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scaleA_mode, sizeof(scaleA_mode)));
+#else
+        AITER_CHECK(scaleA_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F,
+                    "AITER only supports per-tensor scaling with hipBLASLt < 1.0");
 #endif
     }
     if(scaleB != nullptr)
@@ -214,17 +254,13 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(hipblasLtHandle_t handle,
         CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
             matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scaleB, sizeof(scaleB)));
 #if (HIPBLASLT_VERSION_MAJOR >= 1)
-        if(use_rowwise)
-        {
-            auto scale_mode_b = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
-            CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
-                matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scale_mode_b, sizeof(scale_mode_b)));
-        }
+        CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+            matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scaleB_mode, sizeof(scaleB_mode)));
+#else
+        AITER_CHECK(scaleB_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F,
+                    "AITER only supports per-tensor scaling with hipBLASLt < 1.0");
 #endif
     }
-#if (HIPBLASLT_VERSION_MAJOR < 1)
-    TORCH_CHECK(!(use_rowwise), "Rowwise scaling requires hipBLASLt >= 1.0");
-#endif
     if(scaleC != nullptr)
     {
         CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
@@ -331,13 +367,21 @@ inline void post_gpu_time(hipEvent_t&  event_gpu_time_start,
 */
 int get_algoIdx_hip_tuning_csv(
   const std::string filename, hipblasLtHandle_t handle,
-  const bool bpreshuffle, const bool use_rowwise,
+  const bool bpreshuffle,
   const hipblasOperation_t trans_a, const hipblasOperation_t trans_b,
   const int32_t m, const int32_t n, const int32_t k,
   const hipDataType A_data_type, const int32_t lda, const int64_t stride_a,
   const hipDataType B_data_type, const int32_t ldb, const int64_t stride_b,
   const hipDataType C_data_type, const int32_t ldc, const int64_t stride_c,
-  const hipblasComputeType_t compute_type, const int32_t batch_count) {
+  const hipblasComputeType_t compute_type, const int32_t batch_count,
+  hipblasLtMatmulMatrixScale_t scaleA_mode, hipblasLtMatmulMatrixScale_t scaleB_mode) {
+  const bool use_rowwise = scaleA_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F &&
+                           scaleB_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
+  const auto expected_mode = use_rowwise ? HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F
+                                         : HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+  AITER_CHECK(scaleA_mode == expected_mode && scaleB_mode == expected_mode,
+              "HIP_ONLINE_TUNING only supports per-tensor or per-row scaling modes, with the "
+              "same mode for both operands");
   
   std::ifstream file(filename);
   if (!file.is_open())
@@ -479,12 +523,20 @@ int get_algoIdx_hip_tuning_csv(
 */
 void append_hip_tuning_csv(
   hipblasLtMatmulAlgo_t& algo, const std::string filename,
-  bool bpreshuffle, bool use_rowwise,
+  bool bpreshuffle,
   hipblasOperation_t trans_a, hipblasOperation_t trans_b,int m, int n, int k,
   hipDataType A_data_type, int32_t lda, int64_t stride_a,
   hipDataType B_data_type, int32_t ldb, int64_t stride_b,
   hipDataType C_data_type, int32_t ldc, int64_t stride_c,
-  hipblasComputeType_t compute_type, int32_t batch_count, bool write_header_if_missing) {
+  hipblasComputeType_t compute_type, int32_t batch_count, bool write_header_if_missing,
+  hipblasLtMatmulMatrixScale_t scaleA_mode, hipblasLtMatmulMatrixScale_t scaleB_mode) {
+  const bool use_rowwise = scaleA_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F &&
+                           scaleB_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
+  const auto expected_mode = use_rowwise ? HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F
+                                         : HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+  AITER_CHECK(scaleA_mode == expected_mode && scaleB_mode == expected_mode,
+              "HIP_ONLINE_TUNING only supports per-tensor or per-row scaling modes, with the "
+              "same mode for both operands");
     
     int fd = open(filename.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd < 0) return;
@@ -716,10 +768,11 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
                                             hipDataType intype,
                                             hipDataType outtype,
                                             const hipStream_t& stream,
-                                            int solution_index = -1,
-                                            bool bpreshuffle   = false,
-                                            bool use_rowwise   = false,
-                                            bool use_gelu      = false)
+                                            int solution_index,
+                                            bool bpreshuffle,
+                                            bool use_gelu,
+                                            hipblasLtMatmulMatrixScale_t scaleA_mode,
+                                            hipblasLtMatmulMatrixScale_t scaleB_mode)
 {
     // TODO: flag is not supported for hipblasLt yet
     int flag{0};
@@ -728,6 +781,37 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
     //  https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
     // flag = rocblas_gemm_flags_fp16_alt_impl;
     //}
+
+    // Max value of N dimension for decode GEMM
+    int decode_max_n = 512;
+    // The CSV's use_rowwise key cannot represent mixed or MXFP8 scale modes.
+    bool tuning_mode_supported = scaleA_mode == scaleB_mode &&
+        (scaleA_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F ||
+         scaleA_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F);
+
+    // load tuning cache file and check if the gemm has been already tuned
+    const char* env = std::getenv("HIP_ONLINE_TUNING");
+    bool online_tuning = env && (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0);
+    // check if there is enough memory left for online tuning
+    if (online_tuning) {
+        size_t freeMem, totalMem;
+        hipMemGetInfo(&freeMem, &totalMem);
+        if (freeMem <= 128*1024*1024) {
+            std::cout << "No space left for hipBLASLt online tuning." << std::endl;
+            online_tuning = false;
+        }
+    }
+
+    if (online_tuning && n <= decode_max_n && tuning_mode_supported) {
+      solution_index = get_algoIdx_hip_tuning_csv("./hip_online_tuning_res.csv", handle,
+                                                  bpreshuffle,
+                                                  op_A, op_B, m, n, k,
+                                                  intype, lda, 0,
+                                                  intype, ldb, 0,
+                                                  outtype, ldc, 0,
+                                                  HIPBLAS_COMPUTE_32F, 1,
+                                                  scaleA_mode, scaleB_mode);
+    }
 
     // nvtxRangePushA("hipBLASLt variables creation");
     hipblasLtMatrixLayout_t matA, matB, matC;
@@ -783,13 +867,11 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
         CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
             matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scaleA, sizeof(scaleA)));
 #if (HIPBLASLT_VERSION_MAJOR >= 1)
-        if(use_rowwise)
-        {
-            // Set the scale mode to OUTER_VEC for rowwise scaling on A
-            auto scale_mode_a = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
-            CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
-                matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scale_mode_a, sizeof(scale_mode_a)));
-        }
+        CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+            matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &scaleA_mode, sizeof(scaleA_mode)));
+#else
+        AITER_CHECK(scaleA_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F,
+                    "AITER only supports per-tensor scaling with hipBLASLt < 1.0");
 #endif
     }
     if(scaleB != nullptr)
@@ -797,18 +879,13 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
         CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
             matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scaleB, sizeof(scaleB)));
 #if (HIPBLASLT_VERSION_MAJOR >= 1)
-        if(use_rowwise)
-        {
-            // Set the scale mode to OUTER_VEC for rowwise scaling on B
-            auto scale_mode_b = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
-            CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
-                matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scale_mode_b, sizeof(scale_mode_b)));
-        }
+        CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+            matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_MODE, &scaleB_mode, sizeof(scaleB_mode)));
+#else
+        AITER_CHECK(scaleB_mode == HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F,
+                    "AITER only supports per-tensor scaling with hipBLASLt < 1.0");
 #endif
     }
-#if (HIPBLASLT_VERSION_MAJOR < 1)
-    TORCH_CHECK(!(use_rowwise), "Rowwise scaling requires hipBLASLt >= 1.0");
-#endif
 
     if(scaleC != nullptr)
     {
@@ -829,37 +906,11 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
     // auto gemm_key { MatMulConfig { op_A, op_B, m, n, k, dtype } };
     // if (heuristic_map.count(gemm_key) <= 0) {
     
-    // Max value of N dimension for decode GEMM
-    int decode_max_n = 512;
-
-    // load tuning cache file and check if the gemm has been already tuned
-    const char* env = std::getenv("HIP_ONLINE_TUNING");
-    bool online_tuning = env && (std::strcmp(env, "1") == 0 || std::strcmp(env, "true") == 0);
-    // check if there is enough memory left for online tuning
-    if (online_tuning) {
-        size_t freeMem, totalMem;
-        hipMemGetInfo(&freeMem, &totalMem);
-        if (freeMem <= 128*1024*1024) {
-            std::cout << "No space left for hipBLASLt online tuning." << std::endl;
-            online_tuning = false;
-        }
-    }
-
-    if (online_tuning && n <= decode_max_n) { 
-      solution_index = get_algoIdx_hip_tuning_csv("./hip_online_tuning_res.csv", handle,
-                                                  bpreshuffle, use_rowwise,
-                                                  op_A, op_B, m, n, k,
-                                                  intype, lda, 0,
-                                                  intype, ldb, 0,
-                                                  outtype, ldc, 0,
-                                                  HIPBLAS_COMPUTE_32F, 1);
-    }
-
     std::vector<hipblasLtMatmulHeuristicResult_t> heuristicResult(1);
     if(solution_index < 0)
     {
       // if enable hipblaslt online tuning, check the cache file and tune the gemm
-      if (online_tuning && n <= decode_max_n) {
+      if (online_tuning && n <= decode_max_n && tuning_mode_supported) {
         std::cout << "Tuning hip GEMM (" << m << ", " << n << ", " << k << ")\n";
         
         // calculate for rotating buffer
@@ -884,12 +935,13 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
       
         append_hip_tuning_csv(
             heuristicResult[0].algo, "./hip_online_tuning_res.csv",
-            bpreshuffle, use_rowwise,
+            bpreshuffle,
             op_A, op_B, m, n, k,
             intype, lda, 0,
             intype, ldb, 0,
             outtype, ldc, 0,
-            HIPBLAS_COMPUTE_32F, 1, true);
+            HIPBLAS_COMPUTE_32F, 1, true,
+            scaleA_mode, scaleB_mode);
       }
       else
       {      
@@ -920,14 +972,14 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
             CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(matA));
             CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(matB));
             CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutDestroy(matC));
-            TORCH_CHECK(
+            AITER_CHECK(
                 false,
                 "hipblasLtMatmulAlgoGetHeuristic found 0 valid solutions for ",
                 (op_A == HIPBLAS_OP_N ? "N" : "T"),
                 (op_B == HIPBLAS_OP_N ? "N" : "T"),
                 " (", m, ", ", n, ", ", k, "), intype: ", intype,
                 ", outtype: ", outtype,
-                ", use_rowwise: ", use_rowwise,
+                ", scaleA_mode: ", scaleA_mode, ", scaleB_mode: ", scaleB_mode,
                 ", bpreshuffle: ", bpreshuffle,
                 ", request_solutions: ", request_solutions);
         }
@@ -979,13 +1031,13 @@ enum class ScalingType
 };
 
 // Helper function to determine scaling type
-static ScalingType get_scaling_type(const torch::Tensor& scale_a,
-                                    const torch::Tensor& scale_b,
+static ScalingType get_scaling_type(const aiter_tensor_t& scale_a,
+                                    const aiter_tensor_t& scale_b,
                                     int64_t dim_m,
                                     int64_t dim_n)
 {
     // Both Per-Tensor and Row-wise scaling expect fp32 tensors
-    TORCH_CHECK(scale_a.scalar_type() == at::kFloat && scale_b.scalar_type() == at::kFloat,
+    AITER_CHECK(scale_a.dtype() == AITER_DTYPE_fp32 && scale_b.dtype() == AITER_DTYPE_fp32,
                 "Both scale_a and scale_b must be float (fp32) tensors.");
 
     // Check if scales are scalars (per-tensor)
@@ -999,7 +1051,7 @@ static ScalingType get_scaling_type(const torch::Tensor& scale_a,
     }
 
     // For non-scalar scaling, enforce 2D input tensors
-    TORCH_CHECK(scale_a.dim() == 2 && scale_b.dim() == 2,
+    AITER_CHECK(scale_a.dim() == 2 && scale_b.dim() == 2,
                 "For non-TensorWise scaling, scale tensors must be 2-dimensional, "
                 "but got scale_a.dim()=",
                 scale_a.dim(),
@@ -1015,7 +1067,7 @@ static ScalingType get_scaling_type(const torch::Tensor& scale_a,
     // Case 2: Both rowwise
     if(scale_a_is_rowwise && scale_b_is_rowwise)
     {
-        TORCH_CHECK(scale_a.is_contiguous() && scale_b.is_contiguous(),
+        AITER_CHECK(scale_a.is_contiguous() && scale_b.is_contiguous(),
                     "Both scale_a and scale_b must be contiguous for RowWise scaling.");
         return ScalingType::RowWise;
     }
@@ -1023,13 +1075,13 @@ static ScalingType get_scaling_type(const torch::Tensor& scale_a,
     // Older hipBLASLt versions don't support rowwise
     if(scale_a_is_rowwise || scale_b_is_rowwise)
     {
-        TORCH_CHECK(false, "Per-row scaling is not supported for this hipBLASLt version!");
+        AITER_CHECK(false, "Per-row scaling is not supported for this hipBLASLt version!");
         return ScalingType::Error;
     }
 #endif
 
     // If we reach here, the input doesn't match any valid scaling type
-    TORCH_CHECK(false,
+    AITER_CHECK(false,
                 "Invalid scaling configuration. Supported modes:\n"
                 "  - TensorWise: both scales are scalars (1 element) of shape (1,1)\n"
                 "  - RowWise: scale_a=(",
@@ -1051,45 +1103,104 @@ static ScalingType get_scaling_type(const torch::Tensor& scale_a,
     return ScalingType::Error;
 }
 
-torch::Tensor hipb_mm(const torch::Tensor& mat1,
-                      const torch::Tensor& mat2,
-                      const int solution_index,
-                      std::optional<torch::Tensor> bias,
-                      std::optional<c10::ScalarType> out_dtype,
-                      std::optional<torch::Tensor> scaleA,
-                      std::optional<torch::Tensor> scaleB,
-                      std::optional<torch::Tensor> scaleOut,
-                      std::optional<bool> bpreshuffle,
-                      std::optional<bool> use_gelu)
+static void validate_hipb_operand_scale(const aiter_tensor_t& scale,
+                                        hipblasLtMatmulMatrixScale_t mode,
+                                        int64_t operand_rows,
+                                        int64_t operand_k,
+                                        int device_id,
+                                        const char* name)
 {
+    int64_t scale_rows = operand_rows;
+    int64_t scale_k    = (operand_k + 31) / 32;
+    switch(mode)
+    {
+#if HIPBLASLT_VERSION_MAJOR > 1 || (HIPBLASLT_VERSION_MAJOR == 1 && HIPBLASLT_VERSION_MINOR >= 3)
+    case HIPBLASLT_MATMUL_MATRIX_SCALE_BLK32_UE8M0_32_8_EXT:
+        scale_rows = (scale_rows + 31) / 32 * 32;
+        scale_k    = (scale_k + 7) / 8 * 8;
+        [[fallthrough]];
+#endif
+#if HIPBLASLT_VERSION_MAJOR >= 1
+    case HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0:
+        AITER_CHECK(scale.is_gpu() && scale.device_id == device_id,
+                    name,
+                    " must be a GPU tensor on the operand device");
+        AITER_CHECK(scale.is_contiguous(), name, " must be contiguous");
+        AITER_CHECK(scale.dtype() == AITER_DTYPE_u8 || scale.dtype() == AITER_DTYPE_fp8_e8m0,
+                    name,
+                    " must have dtype uint8 or fp8_e8m0");
+        AITER_CHECK(scale.dim() == 2 && scale.size(0) >= scale_rows && scale.size(1) == scale_k,
+                    name,
+                    " must have shape [at least ",
+                    scale_rows,
+                    ", ",
+                    scale_k,
+                    "]");
+        break;
+#endif
+    case HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F:
+        AITER_CHECK(scale.dtype() == AITER_DTYPE_fp32,
+                    name,
+                    " must have dtype float32 for rowwise scaling");
+        AITER_CHECK(scale.is_contiguous(), name, " must be contiguous");
+        AITER_CHECK(scale.dim() == 2 && scale.numel() == operand_rows &&
+                        (scale.size(0) == 1 || scale.size(1) == 1),
+                    name,
+                    " must be a row or column vector with ",
+                    operand_rows,
+                    " elements");
+        break;
+    case HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F:
+        AITER_CHECK(
+            scale.dtype() == AITER_DTYPE_fp32, name, " must have dtype float32 for scalar scaling");
+        AITER_CHECK(
+            scale.numel() == 1, name, " must contain exactly one element for scalar scaling");
+        break;
+    default: AITER_CHECK(false, name, " has unsupported scale mode ", mode);
+    }
+}
+
+// Torch-free: `result` is pre-allocated Python-side (aiter/ops/gradlib.py) with the
+// requested out dtype/shape; this writes into it. outDtype is read from result.dtype().
+void hipb_mm(const aiter_tensor_t& mat1,
+             const aiter_tensor_t& mat2,
+             const int solution_index,
+             aiter_tensor_t& result,
+             std::optional<aiter_tensor_t> bias,
+             std::optional<aiter_tensor_t> scaleA,
+             std::optional<aiter_tensor_t> scaleB,
+             std::optional<aiter_tensor_t> scaleOut,
+             std::optional<bool> bpreshuffle,
+             std::optional<bool> use_gelu,
+             std::optional<int64_t> scaleA_mode,
+             std::optional<int64_t> scaleB_mode)
+{
+    // pybind path: make AITER_CHECK failures throw (-> Python RuntimeError) instead
+    // of abort(). g_aiter_can_throw is otherwise only set by the ctypes ABI wrapper.
+    aiter_detail::g_aiter_can_throw = true;
     bool bpreshuffle_flag = bpreshuffle.value_or(false);
     bool use_gelu_flag    = use_gelu.value_or(false);
 
-    TORCH_CHECK(!use_gelu_flag || bias.has_value(),
+    AITER_CHECK(!use_gelu_flag || bias.has_value(),
                 "hipb_mm(use_gelu=True) currently requires bias for GELU_BIAS epilogue");
 
     int version;
     hipblasLtGetVersion(hipblaslt_handle, &version);
-    TORCH_CHECK(!bpreshuffle_flag || version >= 1500,
+    AITER_CHECK(!bpreshuffle_flag || version >= 1500,
                 " to use bpreshuffle feature, hipblaslt version should be at least 1500.");
 
-    auto mat1_strides{mat1.strides()};
-    auto mat2_strides{mat2.strides()};
-    auto mat1_sizes{mat1.sizes()};
-    auto mat2_sizes{mat2.sizes()};
+    std::array<int64_t, 2> mat1_strides{mat1.stride(0), mat1.stride(1)};
+    std::array<int64_t, 2> mat2_strides{mat2.stride(0), mat2.stride(1)};
+    std::array<int64_t, 2> mat1_sizes{mat1.size(0), mat1.size(1)};
+    std::array<int64_t, 2> mat2_sizes{mat2.size(0), mat2.size(1)};
 
-    TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
-    TORCH_CHECK(mat1.dtype() == mat2.dtype(),
-                "expected mat1 and mat2 to have the same dtype, but got: ",
-                mat1.dtype(),
-                " != ",
-                mat2.dtype());
-    TORCH_CHECK(mat1_sizes[1] == mat2_sizes[0], "mat1 dim 1 must match mat2 dim 0");
+    AITER_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
+    AITER_CHECK(mat1.dtype() == mat2.dtype(),
+                "expected mat1 and mat2 to have the same dtype");
+    AITER_CHECK(mat1_sizes[1] == mat2_sizes[0], "mat1 dim 1 must match mat2 dim 0");
 
-    auto inDtype{mat1.options().dtype().toScalarType()};
-    auto outDtype{out_dtype.has_value() ? out_dtype.value() : inDtype};
-    auto options{at::TensorOptions().dtype(outDtype).device(at::kCUDA)};
-    auto result{torch::empty({mat1_sizes[0], mat2_sizes[1]}, options)};
+    auto inDtype  = mat1.dtype();
+    auto outDtype = result.dtype();  // caller-allocated result carries the out dtype
 
     bool transpose_result = true;
     bool transpose_mat1;
@@ -1124,10 +1235,10 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
         bool tmp       = transpose_mat1;
         transpose_mat1 = !transpose_mat2;
         transpose_mat2 = !tmp;
-        mat1_strides   = mat2.strides();
-        mat2_strides   = mat1.strides();
-        mat1_sizes     = mat2.sizes();
-        mat2_sizes     = mat1.sizes();
+        mat1_strides   = {mat2.stride(0), mat2.stride(1)};
+        mat2_strides   = {mat1.stride(0), mat1.stride(1)};
+        mat1_sizes     = {mat2.size(0), mat2.size(1)};
+        mat2_sizes     = {mat1.size(0), mat1.size(1)};
     }
 
     float one{1.0f};
@@ -1140,77 +1251,84 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
     int64_t result_ld = result.stride(transpose_result ? 0 : 1);
 
     void *d_scaleA = nullptr, *d_scaleB = nullptr, *d_scaleOut = nullptr;
-    bool use_rowwise = false;
-
-    // Determine scaling type if scales are provided
-    // The API expects scaleA for mat1 and scaleB for mat2 in the original orientation
-    if(scaleA.has_value() && scaleB.has_value())
+    AITER_CHECK(!scaleA_mode.has_value() || scaleA.has_value(),
+                "scaleA mode requires a scale tensor");
+    AITER_CHECK(!scaleB_mode.has_value() || scaleB.has_value(),
+                "scaleB mode requires a scale tensor");
+    // Resolve omitted modes, inferring from both scale tensors when available.
+    if(!scaleA_mode.has_value() || !scaleB_mode.has_value())
     {
-        // Determine scaling type based on original input dimensions (before transpose_result)
-        // The scales should match mat1 (m_orig x k) and mat2 (k x n_orig)
-        int64_t m_orig = mat1.sizes()[0];
-        int64_t n_orig = mat2.sizes()[1];
-        int64_t k_orig = mat1.sizes()[1];
+        auto inferred_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+        // Determine scaling type if scales are provided, based on original input dimensions
+        // (before transpose_result). The API expects scaleA for mat1 and scaleB for mat2 in the
+        // original orientation. The scales should match mat1 (m_orig x k) and mat2 (k x n_orig).
+        int64_t m_orig = mat1.size(0);
+        int64_t n_orig = mat2.size(1);
+        int64_t k_orig = mat1.size(1);
 
-        // Determine scaling type - will throw error for unsupported configurations
-        ScalingType scaling_type = get_scaling_type(scaleA.value(), scaleB.value(), m_orig, n_orig);
-
-        // Enable rowwise scaling based on detected scaling type
-        // Note: hipBLASLt only supports uniform scaling modes (both per-tensor OR both rowwise)
-        if(scaling_type == ScalingType::RowWise)
+        // Determine scaling type (will throw error for unsupported configurations) and enable
+        // rowwise scaling based on detected scaling type. Note: inference selects uniform scaling
+        // modes (both per-tensor OR both rowwise)
+        if(scaleA.has_value() && scaleB.has_value() &&
+           get_scaling_type(scaleA.value(), scaleB.value(), m_orig, n_orig) == ScalingType::RowWise)
         {
+            inferred_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
             // Both matrices use rowwise scaling
             // Rowwise scaling is only supported for FP8 input with BFloat16 output
             // For bpreshuffle (swizzled layout), proper alignment is required
             // Note: m can be any value >= 1, but n should be >= 16 and aligned
-            TORCH_CHECK(outDtype == at::kBFloat16,
-                        "hipblaslt rowwise scaled_mm only supports BFloat16 output but got ",
-                        outDtype);
-            TORCH_CHECK(inDtype == at::kFloat8_e4m3fn || inDtype == at::kFloat8_e4m3fnuz,
-                        "hipblaslt rowwise scaled_mm only supports FP8 input but got ",
-                        inDtype);
-            TORCH_CHECK(n_orig >= 16, "hipblaslt rowwise scaled_mm requires n >= 16");
-            TORCH_CHECK(n_orig % 16 == 0,
+            AITER_CHECK(outDtype == AITER_DTYPE_bf16,
+                        "hipblaslt rowwise scaled_mm only supports BFloat16 output");
+            AITER_CHECK(inDtype == AITER_DTYPE_fp8,
+                        "hipblaslt rowwise scaled_mm only supports FP8 input");
+            AITER_CHECK(n_orig >= 16, "hipblaslt rowwise scaled_mm requires n >= 16");
+            AITER_CHECK(n_orig % 16 == 0,
                         "hipblaslt rowwise scaled_mm requires n to be divisible by 16");
-            // TORCH_CHECK(m_orig % 16 == 0 || m_orig < 16, "hipblaslt rowwise scaled_mm requires m
-            // to be divisible by 16 or less than 16, but got ", m_orig);
-            TORCH_CHECK(k_orig % 16 == 0,
+            AITER_CHECK(k_orig % 16 == 0,
                         "hipblaslt rowwise scaled_mm requires k to be divisible by 16");
-
-            use_rowwise = true;
         }
-
-        d_scaleA = static_cast<void*>(scaleA.value().data_ptr());
-        d_scaleB = static_cast<void*>(scaleB.value().data_ptr());
+        AITER_CHECK(!scaleA_mode.has_value() || scaleA_mode.value() == inferred_mode,
+                    "scaleA_mode disagrees with inferred scale mode ",
+                    inferred_mode);
+        AITER_CHECK(!scaleB_mode.has_value() || scaleB_mode.value() == inferred_mode,
+                    "scaleB_mode disagrees with inferred scale mode ",
+                    inferred_mode);
+        scaleA_mode = scaleB_mode = inferred_mode;
     }
-    else
+    auto modeA = static_cast<hipblasLtMatmulMatrixScale_t>(scaleA_mode.value());
+    auto modeB = static_cast<hipblasLtMatmulMatrixScale_t>(scaleB_mode.value());
+    if(scaleA.has_value())
     {
-        if(scaleA.has_value())
-        {
-            d_scaleA = static_cast<void*>(scaleA.value().data_ptr());
-        }
-        if(scaleB.has_value())
-        {
-            d_scaleB = static_cast<void*>(scaleB.value().data_ptr());
-        }
+        validate_hipb_operand_scale(
+            scaleA.value(), modeA, mat1.size(0), mat1.size(1), mat1.device_id, "scaleA");
+        d_scaleA = scaleA.value().data_ptr();
+    }
+    if(scaleB.has_value())
+    {
+        validate_hipb_operand_scale(
+            scaleB.value(), modeB, mat2.size(1), mat1.size(1), mat1.device_id, "scaleB");
+        d_scaleB = scaleB.value().data_ptr();
     }
 
     if(scaleOut.has_value())
     {
-        d_scaleOut = static_cast<void*>(scaleOut.value().data_ptr());
+        d_scaleOut = scaleOut.value().data_ptr();
     }
 
-    auto hipblasInType  = dtype_map.at(inDtype);
-    auto hipblasOutType = dtype_map.at(outDtype);
+    auto hipblasInType  = aiter_to_hip_dtype(inDtype);
+    auto hipblasOutType = aiter_to_hip_dtype(outDtype);
 
-    void* ptrA{static_cast<void*>((transpose_result ? mat2 : mat1).data_ptr())};
-    void* ptrB{static_cast<void*>((transpose_result ? mat1 : mat2).data_ptr())};
-    void* ptrC{static_cast<void*>(result.data_ptr())};
+    void* ptrA{(transpose_result ? mat2 : mat1).data_ptr()};
+    void* ptrB{(transpose_result ? mat1 : mat2).data_ptr()};
+    void* ptrC{result.data_ptr()};
     if(transpose_result)
+    {
         std::swap(d_scaleA, d_scaleB);
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(mat1));
-    const hipStream_t current_stream = at::hip::getCurrentHIPStream();
-    void* bias_ptr = bias.has_value() ? static_cast<void*>(bias.value().data_ptr()) : nullptr;
+        std::swap(modeA, modeB);
+    }
+    HipDeviceGuard device_guard(mat1.device_id);
+    const hipStream_t current_stream = aiter::getCurrentHIPStream();
+    void* bias_ptr = bias.has_value() ? bias.value().data_ptr() : nullptr;
 
     CHECK_HIPBLAS_ERROR(hipblasLtMatmul_sol_wrapper(hipblaslt_handle,
                                                     transpose_mat1 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
@@ -1235,42 +1353,40 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
                                                     current_stream,
                                                     solution_index,
                                                     bpreshuffle_flag,
-                                                    use_rowwise,
-                                                    use_gelu_flag));
-
-    return result;
+                                                    use_gelu_flag,
+                                                    modeA,
+                                                    modeB));
 }
 
 // find all hipblas solutions and return them to python land
-std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
-                                  const torch::Tensor& mat2,
-                                  std::optional<torch::Tensor> bias,
-                                  std::optional<c10::ScalarType> out_dtype,
-                                  std::optional<torch::Tensor> scaleA,
-                                  std::optional<torch::Tensor> scaleB,
-                                  std::optional<torch::Tensor> scaleC,
+// Torch-free: `result` is a caller-allocated scratch matrix (aiter/ops/gradlib.py)
+// used only to shape the heuristic search; its dtype carries the requested out type.
+std::vector<int> hipb_findallsols(const aiter_tensor_t& mat1,
+                                  const aiter_tensor_t& mat2,
+                                  aiter_tensor_t& result,
+                                  std::optional<aiter_tensor_t> bias,
+                                  std::optional<aiter_tensor_t> scaleA,
+                                  std::optional<aiter_tensor_t> scaleB,
+                                  std::optional<aiter_tensor_t> scaleC,
                                   bool bpreshuffle,
-                                  bool use_gelu)
+                                  bool use_gelu,
+                                  std::optional<int64_t> scaleA_mode,
+                                  std::optional<int64_t> scaleB_mode)
 {
-    auto mat1_strides{mat1.strides()};
-    auto mat2_strides{mat2.strides()};
-    auto mat1_sizes{mat1.sizes()};
-    auto mat2_sizes{mat2.sizes()};
-    TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
-    TORCH_CHECK(mat1.dtype() == mat2.dtype(),
-                "expected mat1 and mat2 to have the same dtype, but got: ",
-                mat1.dtype(),
-                " != ",
-                mat2.dtype());
-    TORCH_CHECK(mat1_sizes[1] == mat2_sizes[0], "mat1 dim 1 must match mat2 dim 0");
-    TORCH_CHECK(!use_gelu || bias.has_value(),
+    aiter_detail::g_aiter_can_throw = true;  // throw (not abort) on AITER_CHECK; see hipb_mm
+    std::array<int64_t, 2> mat1_strides{mat1.stride(0), mat1.stride(1)};
+    std::array<int64_t, 2> mat2_strides{mat2.stride(0), mat2.stride(1)};
+    std::array<int64_t, 2> mat1_sizes{mat1.size(0), mat1.size(1)};
+    std::array<int64_t, 2> mat2_sizes{mat2.size(0), mat2.size(1)};
+    AITER_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
+    AITER_CHECK(mat1.dtype() == mat2.dtype(),
+                "expected mat1 and mat2 to have the same dtype");
+    AITER_CHECK(mat1_sizes[1] == mat2_sizes[0], "mat1 dim 1 must match mat2 dim 0");
+    AITER_CHECK(!use_gelu || bias.has_value(),
                 "hipb_findallsols(use_gelu=True) currently requires bias for GELU_BIAS epilogue");
 
-    auto inType{mat1.options().dtype().toScalarType()};
-    auto outType{out_dtype.has_value() ? out_dtype.value() : inType};
-
-    auto options{at::TensorOptions().dtype(outType).device(at::kCUDA)};
-    auto result{torch::empty({mat1_sizes[0], mat2_sizes[1]}, options)};
+    auto inType  = mat1.dtype();
+    auto outType = result.dtype();
     bool transpose_result = true;
     bool transpose_mat1;
     bool transpose_mat2;
@@ -1303,10 +1419,10 @@ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
         bool tmp       = transpose_mat1;
         transpose_mat1 = !transpose_mat2;
         transpose_mat2 = !tmp;
-        mat1_strides   = mat2.strides();
-        mat2_strides   = mat1.strides();
-        mat1_sizes     = mat2.sizes();
-        mat2_sizes     = mat1.sizes();
+        mat1_strides   = {mat2.stride(0), mat2.stride(1)};
+        mat2_strides   = {mat1.stride(0), mat1.stride(1)};
+        mat1_sizes     = {mat2.size(0), mat2.size(1)};
+        mat2_sizes     = {mat1.size(0), mat1.size(1)};
     }
     float one{1.0f};
     float zero{0.0f};
@@ -1316,34 +1432,55 @@ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
     int64_t mat1_ld            = mat1_strides[(transpose_mat1 == transpose_result) ? 1 : 0];
     int64_t mat2_ld            = mat2_strides[(transpose_mat2 == transpose_result) ? 1 : 0];
     int64_t result_ld          = result.stride(transpose_result ? 0 : 1);
-    hipDataType hipblasInType  = dtype_map.at(inType);
-    hipDataType hipblasOutType = dtype_map.at(outType);
+    hipDataType hipblasInType  = aiter_to_hip_dtype(inType);
+    hipDataType hipblasOutType = aiter_to_hip_dtype(outType);
 
-    void* ptrA{static_cast<void*>((transpose_result ? mat2 : mat1).data_ptr())};
-    void* ptrB{static_cast<void*>((transpose_result ? mat1 : mat2).data_ptr())};
-    void* ptrC{static_cast<void*>(result.data_ptr())};
-    auto current_stream{torch::hip::getCurrentHIPStream().stream()};
+    void* ptrA{(transpose_result ? mat2 : mat1).data_ptr()};
+    void* ptrB{(transpose_result ? mat1 : mat2).data_ptr()};
+    void* ptrC{result.data_ptr()};
+    HipDeviceGuard device_guard(mat1.device_id);
+    auto current_stream{aiter::getCurrentHIPStream()};
 
-    auto bias_ptr = bias.has_value() ? static_cast<void*>(bias.value().data_ptr()) : nullptr;
+    auto bias_ptr = bias.has_value() ? bias.value().data_ptr() : nullptr;
 
-    auto scaleA_ptr = scaleA.has_value() ? static_cast<void*>(scaleA.value().data_ptr()) : nullptr;
+    auto scaleA_ptr = scaleA.has_value() ? scaleA.value().data_ptr() : nullptr;
 
-    auto scaleB_ptr = scaleB.has_value() ? static_cast<void*>(scaleB.value().data_ptr()) : nullptr;
+    auto scaleB_ptr = scaleB.has_value() ? scaleB.value().data_ptr() : nullptr;
 
-    auto scaleC_ptr = scaleC.has_value() ? static_cast<void*>(scaleC.value().data_ptr()) : nullptr;
+    auto scaleC_ptr = scaleC.has_value() ? scaleC.value().data_ptr() : nullptr;
 
-    bool use_rowwise = false;
-    if(scaleA.has_value() && scaleB.has_value())
+    AITER_CHECK(!scaleA_mode.has_value() || scaleA.has_value(),
+                "scaleA mode requires a scale tensor");
+    AITER_CHECK(!scaleB_mode.has_value() || scaleB.has_value(),
+                "scaleB mode requires a scale tensor");
+    if(!scaleA_mode.has_value() || !scaleB_mode.has_value())
     {
-        int64_t m_orig = mat1.sizes()[0];
-        int64_t n_orig = mat2.sizes()[1];
+        auto inferred_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F;
+        if(scaleA.has_value() && scaleB.has_value() &&
+           get_scaling_type(scaleA.value(), scaleB.value(), mat1.size(0), mat2.size(1)) ==
+               ScalingType::RowWise)
+            inferred_mode = HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F;
+        AITER_CHECK(!scaleA_mode.has_value() || scaleA_mode.value() == inferred_mode,
+                    "scaleA_mode disagrees with inferred scale mode ",
+                    inferred_mode);
+        AITER_CHECK(!scaleB_mode.has_value() || scaleB_mode.value() == inferred_mode,
+                    "scaleB_mode disagrees with inferred scale mode ",
+                    inferred_mode);
+        scaleA_mode = scaleB_mode = inferred_mode;
+    }
+    auto modeA = static_cast<hipblasLtMatmulMatrixScale_t>(scaleA_mode.value());
+    auto modeB = static_cast<hipblasLtMatmulMatrixScale_t>(scaleB_mode.value());
+    if(scaleA.has_value())
+        validate_hipb_operand_scale(
+            scaleA.value(), modeA, mat1.size(0), mat1.size(1), mat1.device_id, "scaleA");
+    if(scaleB.has_value())
+        validate_hipb_operand_scale(
+            scaleB.value(), modeB, mat2.size(1), mat1.size(1), mat1.device_id, "scaleB");
 
-        ScalingType scaling_type = get_scaling_type(scaleA.value(), scaleB.value(), m_orig, n_orig);
-
-        if(scaling_type == ScalingType::RowWise)
-        {
-            use_rowwise = true;
-        }
+    if(transpose_result)
+    {
+        std::swap(scaleA_ptr, scaleB_ptr);
+        std::swap(modeA, modeB);
     }
 
     return hipblasLtMatmul_findallsols_wrapper(hipblaslt_handle,
@@ -1367,14 +1504,27 @@ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
                                                scaleB_ptr,
                                                scaleC_ptr,
                                                current_stream,
-                                               use_rowwise,
                                                bpreshuffle,
-                                               use_gelu);
+                                               use_gelu,
+                                               modeA,
+                                               modeB);
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void hipb_create_extension()
 {
+    aiter_detail::g_aiter_can_throw = true;
+    int device;
+    HIP_CALL(hipGetDevice(&device));
+    if(extension_device != -1)
+    {
+        AITER_CHECK(extension_device == device,
+                    "hipBLASLt extension is already initialized on device ",
+                    extension_device,
+                    "; destroy it before initializing on another device");
+        return;
+    }
+
     // CHECK_HIP_ERROR(hipStreamCreate(&weight_stream));
     // CHECK_HIP_ERROR(hipEventCreateWithFlags(&event, cudaEventDisableTiming));
 
@@ -1388,6 +1538,8 @@ void hipb_create_extension()
                                               &workspace_size,
                                               sizeof(workspace_size)));
 
+    extension_device = device;
+
     // CHECK_HIP_ERROR(hipEventCreate(&start));
     // CHECK_HIP_ERROR(hipEventCreate(&stop));
 }
@@ -1396,6 +1548,11 @@ void hipb_create_extension()
 
 void hipb_destroy_extension()
 {
+    if(extension_device == -1)
+        return;
+
+    // Release resources on their owning device, preserving the caller's device.
+    HipDeviceGuard device_guard(extension_device);
     // CHECK_HIP_ERROR(hipStreamDestroy(weight_stream));
     // CHECK_HIP_ERROR(hipEventDestroy(event));
 
@@ -1403,6 +1560,11 @@ void hipb_destroy_extension()
     CHECK_HIPBLAS_ERROR(hipblasLtDestroy(hipblaslt_handle));
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceDestroy(preference));
     CHECK_HIP_ERROR(hipFree(d_workspace));
+
+    hipblaslt_handle = nullptr;
+    preference       = nullptr;
+    d_workspace      = nullptr;
+    extension_device = -1;
 
     // CHECK_HIP_ERROR(hipEventDestroy(start));
     // CHECK_HIP_ERROR(hipEventDestroy(stop));
@@ -1420,8 +1582,11 @@ std::string getHipblasltKernelName(int solution_index)
     return hipblaslt_ext::getKernelNameFromAlgo(hipblaslt_handle, heuristicResult[0].algo);
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
+    AITER_SET_STREAM_PYBIND;
+    m.attr("hipblaslt_build_version") =
+        py::make_tuple(HIPBLASLT_VERSION_MAJOR, HIPBLASLT_VERSION_MINOR, HIPBLASLT_VERSION_PATCH);
     m.def("hipb_create_extension", &hipb_create_extension, "create_extension");
     m.def("hipb_destroy_extension", &hipb_destroy_extension, "destroy_extension");
     m.def("hipb_mm",
@@ -1430,27 +1595,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("mat1"),
           py::arg("mat2"),
           py::arg("solution_index"),
+          py::arg("result"),
           py::arg("bias")        = std::nullopt,
-          py::arg("out_dtype")   = std::nullopt,
           py::arg("scaleA")      = std::nullopt,
           py::arg("scaleB")      = std::nullopt,
           py::arg("scaleOut")    = std::nullopt,
           py::arg("bpreshuffle") = std::nullopt,
-          py::arg("use_gelu")    = std::nullopt);
+          py::arg("use_gelu")    = std::nullopt,
+          py::arg("scaleA_mode") = std::nullopt,
+          py::arg("scaleB_mode") = std::nullopt);
     m.def("hipb_findallsols",
           &hipb_findallsols,
           "hipb_findallsols",
           py::arg("mat1"),
           py::arg("mat2"),
+          py::arg("result"),
           py::arg("bias")        = std::nullopt,
-          py::arg("out_dtype")   = std::nullopt,
           py::arg("scaleA")      = std::nullopt,
           py::arg("scaleB")      = std::nullopt,
           py::arg("scaleC")      = std::nullopt,
           py::arg("bpreshuffle") = false,
-          py::arg("use_gelu")    = false);
+          py::arg("use_gelu")    = false,
+          py::arg("scaleA_mode") = std::nullopt,
+          py::arg("scaleB_mode") = std::nullopt);
     m.def("getHipblasltKernelName", &getHipblasltKernelName);
 }
-
-
-

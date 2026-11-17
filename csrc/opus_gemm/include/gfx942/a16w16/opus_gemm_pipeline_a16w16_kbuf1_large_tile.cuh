@@ -256,7 +256,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void gemm_a16w16_kbuf1_large
 
     const bool full_tile = (row + T::B_M <= kargs.m) && (col + T::B_N <= kargs.n);
 
-    if (full_tile) {
+    // The LDS coalescing buffers alias the BF16 A/B allocation. They are large
+    // enough for BF16 output, but not for two FP32 half tiles. FP32 already has
+    // a naturally coalesced direct-store path through do_store_if.
+    if (full_tile && !std::is_same_v<D_C, D_ACC>) {
         using LT_C = layout_load_traits<decltype(u_gc), T::VEC_C>;
         constexpr auto r_elem_c = LT_C::r_elem;
         constexpr index_t acc_chunk = T::VEC_C * vector_traits<D_ACC>::size();

@@ -529,12 +529,11 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     using namespace opus;
     using namespace gqa_d128;
     using T = opus::remove_cvref_t<Traits>;
+    static_assert(!T::LOCAL, "the sliding window runs on gqa_d128_swa_kernel");
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
 
     const int workgroup_x = block_id_x();
-    const int q_block_idx = block_id_y();
-    const int b = block_id_z();
     int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
     int lane_id = thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id));
@@ -544,10 +543,81 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     const int h = (workgroup_x % kargs.H_KV) * group_size + (workgroup_x / kargs.H_KV);
     const int h_kv = h / group_size;
     const int q_block_size = T::NUM_WARPS * T::Q_TILE_SIZE;
+
+    // Per-workgroup seqlens and base ROW offsets. GROUP_MODE reads both from the seqstart
+    // prefix sums; batch mode keeps the uniform batch-stride form. Everything after this
+    // uses seqlen_q / seqlen_kv, never kargs.N / kargs.N_KV.
+    int seqlen_q, seqlen_kv;
+    int64_t q_batch_base, o_batch_base, k_batch_base, v_batch_base, lse_batch_base;
+    int q_block_idx;
+    if constexpr (T::GROUP_MODE) {
+        auto sc = [](int x) { return __builtin_amdgcn_readfirstlane(x); };
+        // Two groupings of the same work, chosen by the host.
+        //
+        // Rectangular (total_q_blocks == 0): rotated axes (head=x, group=y, Q-block=z),
+        // Q-block on the slowest axis so the shorter groups' empty tail blocks
+        // short-circuit together. Every group gets ceil(max_seqlen / q_block) of them.
+        //
+        // Flat (total_q_blocks > 0): y lays the groups' blocks end to end, at most one
+        // surplus block per group, and each block finds its group in seqstart_q.
+        int g;
+        if (kargs.total_q_blocks > 0) {
+            const int i = sc(block_id_y());
+            // Place group g at the flat index seqstart_q[g] / q_block + g, which is
+            // strictly increasing in g and reaches total_q / q_block + batch at g == B --
+            // the extent the host sized the grid to. So the mapping inverts straight out
+            // of seqstart_q, with neither the exact block count nor anything
+            // precomputed. Same shape as the Triton unified_attention kernels'
+            // find_seq_idx.
+            //
+            // The spacing gives group g one more block than ceil(seqlen_q[g] / q_block)
+            // whenever its length is not a multiple of q_block; that one lands past the
+            // group's real rows and retires on the seqlen check below, which is the same
+            // slack the grid's upper bound already carries.
+            int lo = 0, hi = kargs.B;             // invariant: answer in [lo, hi)
+            while (hi - lo > 1) {
+                const int mid = (lo + hi) >> 1;
+                const int at  = sc(kargs.ptr_seqstart_q[mid]) / q_block_size + mid;
+                if (at <= i) lo = mid; else hi = mid;
+            }
+            g           = lo;
+            q_block_idx = i - (sc(kargs.ptr_seqstart_q[lo]) / q_block_size + lo);
+        } else {
+            g           = sc(block_id_y());
+            q_block_idx = block_id_z();
+        }
+        const int q0 = sc(kargs.ptr_seqstart_q[g]);
+        const int k0 = sc(kargs.ptr_seqstart_k[g]);
+        seqlen_q  = sc(kargs.ptr_seqstart_q[g + 1]) - q0;
+        seqlen_kv = sc(kargs.ptr_seqstart_k[g + 1]) - k0;
+        const int64_t qpad = sc(kargs.ptr_seqstart_q_pad[g]);
+        const int64_t kpad = sc(kargs.ptr_seqstart_k_pad[g]);
+        q_batch_base   = qpad * kargs.stride_q_n;
+        o_batch_base   = qpad * kargs.stride_o_n;
+        k_batch_base   = kpad * kargs.stride_k_n;
+        v_batch_base   = kpad * kargs.stride_v_n;
+        lse_batch_base = qpad;
+        // The rectangular grid gives every group the longest group's block count, and a
+        // flat grid sized from an upper bound overshoots by at most one block per group;
+        // either way the surplus is dropped here.
+        if (q_block_idx >= ceil_div(seqlen_q, q_block_size)) return;
+    } else {
+        const int b    = block_id_z();
+        seqlen_q       = kargs.N;
+        seqlen_kv      = kargs.N_KV;
+        q_batch_base   = (int64_t)b * kargs.stride_q_b;
+        o_batch_base   = (int64_t)b * kargs.stride_o_b;
+        k_batch_base   = (int64_t)b * kargs.stride_k_b;
+        v_batch_base   = (int64_t)b * kargs.stride_v_b;
+        lse_batch_base = (int64_t)b * kargs.stride_lse_b;
+        q_block_idx    = block_id_y();
+    }
     const int q_block_start = q_block_idx * q_block_size;
     // int64 offsets: B*N*H*D can exceed INT_MAX at large shapes.
-    const int64_t qo_gmem_offset = (int64_t)b * kargs.stride_q_b + (int64_t)q_block_start * kargs.stride_q_n + (int64_t)h * kargs.stride_q_h;
-    const int64_t kv_gmem_offset = (int64_t)b * kargs.stride_kv_b + (int64_t)h_kv * kargs.stride_kv_h;
+    const int64_t q_gmem_offset = q_batch_base + (int64_t)q_block_start * kargs.stride_q_n + (int64_t)h * kargs.stride_q_h;
+    const int64_t o_gmem_offset = o_batch_base + (int64_t)q_block_start * kargs.stride_o_n + (int64_t)h * kargs.stride_o_h;
+    const int64_t k_gmem_offset = k_batch_base + (int64_t)h_kv * kargs.stride_k_h;
+    const int64_t v_gmem_offset = v_batch_base + (int64_t)h_kv * kargs.stride_v_h;
 
     // num_records (bytes) bounds each descriptor to its valid rows so an out-of-bounds
     // read (partial last KV tile / partial last Q block, arbitrary seqlen) returns 0 with
@@ -557,14 +627,19 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
         const int64_t bytes = elems * (int64_t)sizeof(D_ATTN);
         return bytes >= (int64_t)0xffffffffu ? 0xffffffffu : (unsigned int)bytes;
     };
-    const unsigned int kv_num_records = rec_bytes((int64_t)kargs.N_KV * kargs.stride_kv_n);
-    const unsigned int qo_num_records = rec_bytes((int64_t)(kargs.N - q_block_start) * kargs.stride_q_n);
+    const unsigned int k_num_records = rec_bytes((int64_t)seqlen_kv * kargs.stride_k_n);
+    const unsigned int v_num_records = rec_bytes((int64_t)seqlen_kv * kargs.stride_v_n);
+    const unsigned int q_num_records = rec_bytes((int64_t)(seqlen_q - q_block_start) * kargs.stride_q_n);
+    const unsigned int o_num_records = rec_bytes((int64_t)(seqlen_q - q_block_start) * kargs.stride_o_n);
+    // Same bound for the fp32 LSE buffer (different element size than D_ATTN).
+    const unsigned int lse_num_records =
+        (unsigned int)((int64_t)(seqlen_q - q_block_start) * (int64_t)sizeof(D_ACC));
 
     // Global memory tensors
-    auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_q) + qo_gmem_offset, qo_num_records);
-    auto g_k = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_k) + kv_gmem_offset, kv_num_records);
-    auto g_v = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_v) + kv_gmem_offset, kv_num_records);
-    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.ptr_o) + qo_gmem_offset, qo_num_records);
+    auto g_q = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_q) + q_gmem_offset, q_num_records);
+    auto g_k = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_k) + k_gmem_offset, k_num_records);
+    auto g_v = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_v) + v_gmem_offset, v_num_records);
+    auto g_o = make_gmem(reinterpret_cast<D_ATTN*>(kargs.ptr_o) + o_gmem_offset, o_num_records);
 
     // Shared memory: K double-buffered contiguously (2*K), then a shared region that the
     // prologue uses for Q and the main loop reuses for the double-buffered V (s_q aliases
@@ -619,7 +694,7 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     auto u_gq = make_layout_gq<T, T::Q_TOTAL_TILE_SIZE>(warp_id, lane_id, kargs.stride_q_n);
     auto u_sq = make_layout_sq<T, T::smem_d_rpt, T::smem_padding_16B>(warp_id);
     auto u_rq = make_layout_rq<T>(warp_id, lane_id);
-    auto u_gk = make_layout_gk_gv<T>(warp_id, lane_id, kargs.stride_kv_n);
+    auto u_gk = make_layout_gk_gv<T>(warp_id, lane_id, kargs.stride_k_n);
     auto u_sk = make_layout_sk_sv<T, T::smem_padding_16B>(warp_id);
     auto u_rk = make_layout_rk<T>(lane_id);
     // Separate rk layout for the pong phase, built from an OPAQUE copy of lane_id so the
@@ -629,7 +704,7 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     int lane_id_pong = lane_id;
     asm volatile("" : "+v"(lane_id_pong));
     auto u_rk2 = make_layout_rk<T>(lane_id_pong);
-    auto u_gv = make_layout_gk_gv<T>(warp_id, lane_id, kargs.stride_kv_n);
+    auto u_gv = make_layout_gk_gv<T>(warp_id, lane_id, kargs.stride_v_n);
     auto u_sv = make_layout_sk_sv<T, T::smem_padding_64B>(warp_id);
     auto u_rv = make_layout_rv<T>(lane_id);
 
@@ -650,11 +725,12 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
 
     // Tile traversal helpers. KV traversal is driven by seqlen_kv (N_KV), which may
     // differ from seqlen_q (N) for cross-attention.
-    const int kv_tile_stride = T::KV_TILE_SIZE * kargs.stride_kv_n;
-    const int num_kv_tiles = ceil_div(kargs.N_KV, T::KV_TILE_SIZE);
+    const int k_tile_stride = T::KV_TILE_SIZE * kargs.stride_k_n;
+    const int v_tile_stride = T::KV_TILE_SIZE * kargs.stride_v_n;
+    const int num_kv_tiles = ceil_div(seqlen_kv, T::KV_TILE_SIZE);
     // causal bottom-right alignment: query at global pos q_pos attends to keys with
     // k_pos <= q_pos + causal_offset. offset==0 for self-attention (N_KV==N).
-    [[maybe_unused]] const int causal_offset = kargs.N_KV - kargs.N;
+    [[maybe_unused]] const int causal_offset = seqlen_kv - seqlen_q;
     int max_num_tiles = num_kv_tiles;
     if constexpr (T::CAUSAL) {
         const int q_block_end = q_block_start + q_block_size;
@@ -665,7 +741,8 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
         // also keeps every tile index non-negative (no OOB kv_tile offset).
         if (max_num_tiles < 1) max_num_tiles = 1;
     }
-    auto kv_tile = [&](int tile_idx) { return tile_idx * kv_tile_stride; };
+    auto k_tile = [&](int tile_idx) { return tile_idx * k_tile_stride; };
+    auto v_tile = [&](int tile_idx) { return tile_idx * v_tile_stride; };
     // Clamp a (possibly out-of-range) prefetch tile index to the last valid tile so K is
     // always prefetched (constant in-flight vmem → uniform rolling vmcnt, no tail branch;
     // the extra re-read of the last tile is harmless — it is never consumed).
@@ -676,6 +753,60 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     [[maybe_unused]] const int q_start_pos = q_block_start + warp_id * T::Q_TILE_SIZE;
     [[maybe_unused]] const int q_start_pos_c = q_start_pos + causal_offset;
     [[maybe_unused]] const opus::u32_t neg_inf_v = std::bit_cast<opus::u32_t>(-opus::numeric_limits<D_ACC>::infinity());
+
+    // Result store, in its own lambda so the no-keys exit below can jump straight here,
+    // mirroring the production asm's `s_cmp_le_u32 s_KV_seq_len, 0 / s_cbranch_scc1
+    // label_write_out`. The stagger balancing barrier stays outside it: the no-keys path
+    // runs no prologue, so neither wave group owes the other one.
+    auto store_result = [&]() {
+        if (kargs.ptr_lse != nullptr && lane_id < T::W_M) {
+            constexpr D_ACC LN2 = D_ACC(0.69314718055994531f);   // 1 / log2(e)
+            const D_ACC lse = (l_row > D_ACC(0.0f))
+                                  ? ((m_row + __builtin_amdgcn_logf(l_row)) * LN2)
+                                  : -opus::numeric_limits<D_ACC>::infinity();
+            auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.ptr_lse) +
+                                       lse_batch_base +
+                                       (int64_t)h * kargs.stride_lse_h + q_block_start,
+                                   lse_num_records);
+            g_lse.store(lse, warp_id * T::Q_TILE_SIZE + lane_id);
+        }
+
+        D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
+        static_for<o_len>([&](auto i) { v_o[i.value] *= l_inv; });
+
+        // Widened store: each dwordx4 (VEC_O_X4) group is packed and stored one group at a
+        // time so store(g) overlaps the cvt/permlane of group g+1 (a monolithic pack would
+        // serialize that). group g owns v_o elements [g*VEC_O_X4, (g+1)*VEC_O_X4).
+        constexpr index_t VEC_X4    = T::VEC_O_X4;                                  // bf16 / dwordx4
+        constexpr index_t NUM_GROUP = o_len / VEC_X4;                               // store groups / lane
+        constexpr index_t GRP_U32   = VEC_X4 * sizeof(D_ATTN) / sizeof(u32_t);      // u32 regs / group
+        constexpr index_t GRP_HALF  = GRP_U32 / 2;                                  // permlane swap pairs
+        auto u_o   = make_layout_o_x4<T>(warp_id, lane_id, kargs.stride_o_n);
+        auto offs  = opus::layout_to_offsets<VEC_X4>(u_o);
+        opus::static_for<NUM_GROUP>([&](auto g) {
+            auto grp_f  = slice(v_o, number<g.value * VEC_X4>{}, number<g.value * VEC_X4 + VEC_X4>{});
+            auto grp_bf = opus::cast<D_ATTN>(grp_f);
+            auto gu = __builtin_bit_cast(opus::vector_t<u32_t, GRP_U32>, grp_bf);
+            // Swap this lane's high head_dim half [GRP_HALF, GRP_U32) with the lane±32
+            // partner's low half so each half ends up holding VEC_O contiguous head_dim →
+            // together VEC_O_X4 contiguous per lane.
+            opus::static_for<GRP_HALF>([&](auto i) {
+                opus::vector_t<u32_t, 2> s =
+                    __builtin_amdgcn_permlane32_swap(gu[i.value], gu[i.value + GRP_HALF], false, true);
+                gu[i.value] = s.x; gu[i.value + GRP_HALF] = s.y;
+            });
+            auto out = __builtin_bit_cast(opus::vector_t<D_ATTN, VEC_X4>, gu);
+            store<VEC_X4>(g_o, out, offs[g.value]);
+        });
+    };
+
+    // No keys at all: nothing to accumulate, and v_o is already cleared with l_row == 0,
+    // so the store emits lse = -inf and O = 0. N_KV is workgroup-uniform, so both wave
+    // groups exit together.
+    if (num_kv_tiles == 0) {
+        store_result();
+        return;
+    }
 
     auto stage_end = [&]() {
         __builtin_amdgcn_sched_barrier(0);
@@ -695,7 +826,7 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
             opus::static_for<K_SPLIT_NOP>([&](auto) { asm volatile("s_nop 15"); });
         }
         v_kv.k = load<T::VEC_KV>(s_k[cur], u_rk_p);
-        async_load<T::VEC_KV>(g_v, s_v[cur].ptr, u_gv, u_sv, kv_tile(t));
+        async_load<T::VEC_KV>(g_v, s_v[cur].ptr, u_gv, u_sv, v_tile(t));
         s_waitcnt_lgkmcnt(0_I);
         s_waitcnt_vmcnt(number<T::KEEP_VMCNT>{});
         stage_end();
@@ -728,7 +859,7 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
             asm volatile("s_nop 5");
         }
         v_kv.v = tr_load<T::VEC_TR_V>(s_v[prev], u_rv);
-        async_load<T::VEC_KV>(g_k, s_k[cur].ptr, u_gk, u_sk, kv_tile(clamp_tile(t + 2)));
+        async_load<T::VEC_KV>(g_k, s_k[cur].ptr, u_gk, u_sk, k_tile(clamp_tile(t + 2)));
         if constexpr (T::CAUSAL) {
             const int kv_end_pos = (t + 1) * T::KV_TILE_SIZE;
             if (q_start_pos_c < kv_end_pos) {
@@ -737,8 +868,8 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
         } else {
             // Non-causal: mask padded columns (global KV idx >= seqlen_kv) of the last KV
             // tile when seqlen_kv is not a multiple of KV_TILE (arbitrary seqlen).
-            if ((kargs.N_KV % T::KV_TILE_SIZE) != 0 && t == max_num_tiles - 1) {
-                attn_mask_border_tile<T>(vs_cur.s, kargs.N_KV, t, neg_inf_v, lane_id);
+            if ((seqlen_kv % T::KV_TILE_SIZE) != 0 && t == max_num_tiles - 1) {
+                attn_mask_border_tile<T>(vs_cur.s, seqlen_kv, t, neg_inf_v, lane_id);
             }
         }
         s_waitcnt_lgkmcnt(0_I);
@@ -805,12 +936,12 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     // barrier is needed before each warp reads its 32 contiguous rows back; and s_q must
     // be fully read before V0 (which aliases s_q) overwrites it.
     async_load<T::VEC_Q>(g_q, s_q.ptr, u_gq, u_sq, 0);
-    async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gk, u_sk, kv_tile(0));
+    async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gk, u_sk, k_tile(0));
     s_waitcnt_vmcnt(number<T::k_buffer_load_insts>{}); // wait vmem-Q
     stage_end();
 
     v_q = load<T::VEC_Q>(s_q, u_rq);
-    async_load<T::VEC_KV>(g_k, s_k[1].ptr, u_gk, u_sk, kv_tile(clamp_tile(1)));
+    async_load<T::VEC_KV>(g_k, s_k[1].ptr, u_gk, u_sk, k_tile(clamp_tile(1)));
     s_waitcnt_lgkmcnt(0_I);                      // Q read from LDS done → s_q free
     s_waitcnt_vmcnt(number<T::k_buffer_load_insts>{}); // wait vmem-K.blk[0]
     stage_end();
@@ -820,7 +951,7 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     if (stagger) { stage_end(); }
 
     v_kv.k = load<T::VEC_KV>(s_k[0], u_rk);
-    async_load<T::VEC_KV>(g_v, s_v[0].ptr, u_gv, u_sv, kv_tile(0));   // V0 aliases s_q (now safe)
+    async_load<T::VEC_KV>(g_v, s_v[0].ptr, u_gv, u_sv, v_tile(0));   // V0 aliases s_q (now safe)
     auto v_q_f32 = opus::cast<float>(v_q);
     static_for<q_len>([&](auto i) { v_q_f32[i.value] *= temperature_scale; });
     v_q = opus::cast<D_ATTN>(v_q_f32);
@@ -837,8 +968,8 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     } else {
         // Non-causal: border-mask tile 0 only when it is also the last tile (tiny seqlen,
         // num_kv_tiles==1) and seqlen_kv is not KV_TILE-aligned.
-        if ((kargs.N_KV % T::KV_TILE_SIZE) != 0 && max_num_tiles == 1) {
-            attn_mask_border_tile<T>(v_s0.s, kargs.N_KV, 0, neg_inf_v, lane_id);
+        if ((seqlen_kv % T::KV_TILE_SIZE) != 0 && max_num_tiles == 1) {
+            attn_mask_border_tile<T>(v_s0.s, seqlen_kv, 0, neg_inf_v, lane_id);
         }
     }
     m_row = attn_row_max<T>(v_s0.s);
@@ -853,7 +984,7 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
 
     stage_end();
 
-    async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gk, u_sk, kv_tile(clamp_tile(2)));
+    async_load<T::VEC_KV>(g_k, s_k[0].ptr, u_gk, u_sk, k_tile(clamp_tile(2)));
     if constexpr(!STAGGER) {
         __builtin_amdgcn_s_setprio(1);
     }
@@ -888,39 +1019,12 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     else                          do_epilogue(v_s0, 0);
     __builtin_amdgcn_sched_barrier(0);
 
-
-    // ──── Normalize O and store to gmem ────
-    D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
-    static_for<o_len>([&](auto i) { v_o[i.value] *= l_inv; });
-
+    // Stagger: the group that skipped the prologue barrier does its extra one here.
     if (!stagger) {
         __builtin_amdgcn_s_barrier();
     }
 
-    // Widened store: each dwordx4 (VEC_O_X4) group is packed and stored one group at a
-    // time so store(g) overlaps the cvt/permlane of group g+1 (a monolithic pack would
-    // serialize that). group g owns v_o elements [g*VEC_O_X4, (g+1)*VEC_O_X4).
-    constexpr index_t VEC_X4    = T::VEC_O_X4;                                  // bf16 / dwordx4
-    constexpr index_t NUM_GROUP = o_len / VEC_X4;                               // store groups / lane
-    constexpr index_t GRP_U32   = VEC_X4 * sizeof(D_ATTN) / sizeof(u32_t);      // u32 regs / group
-    constexpr index_t GRP_HALF  = GRP_U32 / 2;                                  // permlane swap pairs
-    auto u_o   = make_layout_o_x4<T>(warp_id, lane_id, kargs.stride_q_n);
-    auto offs  = opus::layout_to_offsets<VEC_X4>(u_o);
-    opus::static_for<NUM_GROUP>([&](auto g) {
-        auto grp_f  = slice(v_o, number<g.value * VEC_X4>{}, number<g.value * VEC_X4 + VEC_X4>{});
-        auto grp_bf = opus::cast<D_ATTN>(grp_f);
-        auto gu = __builtin_bit_cast(opus::vector_t<u32_t, GRP_U32>, grp_bf);
-        // Swap this lane's high head_dim half [GRP_HALF, GRP_U32) with the lane±32
-        // partner's low half so each half ends up holding VEC_O contiguous head_dim →
-        // together VEC_O_X4 contiguous per lane.
-        opus::static_for<GRP_HALF>([&](auto i) {
-            opus::vector_t<u32_t, 2> s =
-                __builtin_amdgcn_permlane32_swap(gu[i.value], gu[i.value + GRP_HALF], false, true);
-            gu[i.value] = s.x; gu[i.value + GRP_HALF] = s.y;
-        });
-        auto out = __builtin_bit_cast(opus::vector_t<D_ATTN, VEC_X4>, gu);
-        store<VEC_X4>(g_o, out, offs[g.value]);
-    });
+    store_result();
 }
 
 // Outer dispatcher: pick the stagger / non-stagger specialization per wave group.

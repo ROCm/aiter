@@ -1,8 +1,20 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-@triton.jit
+_fp8_mqa_logits_kernel_repr = make_kernel_repr(
+    "_fp8_mqa_logits_kernel",
+    [
+        "NUM_HEADS",
+        "HEAD_SIZE",
+        "BLOCK_KV",
+        "PACKED",
+    ],
+)
+
+
+@triton.jit(repr=_fp8_mqa_logits_kernel_repr)
 def _fp8_mqa_logits_kernel(
     Q_ptr,  # fp8e4m3 [seq_len, H, D]
     KV_ptr,  # fp8e4m3 [seq_len_kv, D]
@@ -10,7 +22,8 @@ def _fp8_mqa_logits_kernel(
     weights_ptr,  # fp32 [seq_len, H]
     cu_start_ptr,  # int32 [seq_len]
     cu_end_ptr,  # int32 [seq_len]
-    logits_ptr,  # fp32 [seq_len, seq_len_kv]
+    logits_ptr,  # fp32 [seq_len, seq_len_kv]; flat when PACKED
+    out_offsets_ptr,  # int32/int64 [seq_len]: each row's start when PACKED
     seq_len,
     seq_len_kv,
     NUM_HEADS: tl.constexpr,
@@ -27,6 +40,7 @@ def _fp8_mqa_logits_kernel(
     stride_logits_k: tl.int64,
     # block sizes
     BLOCK_KV: tl.constexpr,
+    PACKED: tl.constexpr = False,
 ):
     row_id = tl.program_id(0)
     # go from larger to smaller in terms of work
@@ -40,8 +54,6 @@ def _fp8_mqa_logits_kernel(
     tl.assume(stride_kv_d > 0)
     tl.assume(stride_w_s > 0)
     tl.assume(stride_w_h > 0)
-
-    logits_row_ptrs = logits_ptr + row_id * stride_logits_s
 
     h_inds = tl.arange(0, NUM_HEADS)[:, None]
     d_inds = tl.arange(0, HEAD_SIZE)
@@ -61,6 +73,11 @@ def _fp8_mqa_logits_kernel(
 
     start_ind = tl.maximum(start_ind, 0)
     end_ind = tl.minimum(end_ind, seq_len_kv)
+    if PACKED:
+        row_base = tl.load(out_offsets_ptr + row_id).to(tl.int64) - start_ind
+    else:
+        row_base = row_id * stride_logits_s
+    logits_row_ptrs = logits_ptr + row_base
     shifted_end = end_ind - start_ind
     shifted_unmasked_end = shifted_end // BLOCK_KV * BLOCK_KV
 

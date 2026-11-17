@@ -1309,6 +1309,115 @@ def vectorize_kv_cache(
     return k_cache, v_cache
 
 
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,qo_len,kv_len,num_qo_heads,num_kv_heads,randomize_lengths",
+    [
+        (1, 512, 512, 8, 1, False),
+        (1, 128, 1024, 8, 1, False),
+        (2, 512, 768, 8, 1, True),
+        (2, 256, 256, 16, 2, False),
+    ],
+)
+def test_batch_prefill_hd256_fp8_page64_asm(
+    causal,
+    batch_size,
+    qo_len,
+    kv_len,
+    num_qo_heads,
+    num_kv_heads,
+    randomize_lengths,
+):
+    """LINEAR FP8 hd256 page_size=64 -- asm PAGED_VARLEN (packed Q/O + varlen)."""
+    if skip_test_if(
+        get_gpu_arch() != "gfx950",
+        "hd256 FP8 page_size=64 asm is gfx950-only",
+    ):
+        return
+    torch.manual_seed(19378)
+    page_size = 64
+    head_dim = 256
+    dtype = torch.bfloat16
+    k_vector_size_fp8 = get_vector_size(dtypes.fp8)
+
+    qo_lens = build_qo_lens(batch_size, qo_len, randomize=randomize_lengths)
+    q_indptr_cpu = convert_lens_to_indptr(qo_lens)
+    q = build_q_tensor_for_test(
+        qo_lens, batch_size, qo_len, num_qo_heads, head_dim, dtype, -10, 10, True
+    )
+    kv_lens = build_kv_lens(batch_size, kv_len, qo_lens, randomize=randomize_lengths)
+    kv_cache = build_paged_kv_cache(
+        batch_size,
+        kv_len,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        kv_lens,
+        None,
+        None,
+        dtype,
+        use_uniform=True,
+        contiguous_kv=True,
+    )
+    q_indptr_gpu = q_indptr_cpu.to(0)
+    kv_indptr_gpu = kv_cache["kv_indptr_cpu"].to(0)
+    kv_indices_gpu = kv_cache["kv_indices_cpu"].to(0)
+    kv_last_page_len_gpu = kv_cache["kv_last_page_len_cpu"].to(0)
+    k_cache_ref, v_cache_ref = extract_kv_caches(kv_cache, True)
+
+    o_ref = build_reference_output(
+        q,
+        q_indptr_cpu,
+        kv_cache["kv_data_fp32"],
+        kv_cache["kv_indices_cpu"],
+        kv_cache["kv_indptr_cpu"],
+        kv_cache["kv_last_page_len_cpu"],
+        num_kv_heads,
+        head_dim,
+        dtype,
+        causal,
+        0.0,
+        return_lse=False,
+    )
+
+    q_quant, q_descale = per_tensor_quant(q, quant_dtype=dtypes.fp8)
+    k_cache_quant, k_descale = per_tensor_quant(
+        k_cache_ref.to(dtype), quant_dtype=dtypes.fp8
+    )
+    v_cache_quant, v_descale = per_tensor_quant(
+        v_cache_ref.to(dtype), quant_dtype=dtypes.fp8
+    )
+    k_cache_quant, v_cache_quant = apply_kv_layout(
+        k_cache_quant,
+        v_cache_quant,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        k_vector_size_fp8,
+        "linear",
+    )
+
+    out_fp8 = aiter.mha_batch_prefill_func(
+        q_quant,
+        k_cache_quant,
+        v_cache_quant,
+        q_indptr_gpu,
+        kv_indptr_gpu,
+        kv_indices_gpu,
+        int(qo_lens.max().item()),
+        int(kv_lens.max().item()),
+        causal=causal,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        kv_last_page_lens=kv_last_page_len_gpu,
+    )
+    fp8_threshold = 0.06 if causal and kv_len < qo_len else 0.055
+    if head_dim > 128:
+        fp8_threshold = max(fp8_threshold, 0.06)
+    verify_fp8_output(out_fp8, o_ref, threshold=fp8_threshold)
+
+
 @pytest.mark.parametrize("table_layout", ["sglang", "vllm"])
 @pytest.mark.parametrize("input_dtype", ["bf16", "fp8"])
 @pytest.mark.parametrize("batch_size", [1, 3])
@@ -2593,7 +2702,7 @@ parser.add_argument(
     "--pagesize",
     type=int,
     const=None,
-    choices=[1, 16, 1024],
+    choices=[1, 16, 64, 1024],
     default=[1, 16, 1024],
     nargs="*",
     help="""page size.
@@ -2825,6 +2934,7 @@ def ref_masked_attention_with_sink(
     window_left,
     sink_size,
     sink_ptr_value,
+    window_right=0,
 ):
     """
     Reference attention with StreamLLM sink semantics.
@@ -2834,6 +2944,7 @@ def ref_masked_attention_with_sink(
         key:            [seqlen_k, num_heads, head_dim]
         value:          [seqlen_k, num_heads, head_dim]
         window_left:    left window size (-1 = infinite)
+        window_right:   right window size (-1 = infinite, 0 = causal)
         sink_size:      number of KV tokens at start always attended
         sink_ptr_value: per-head float tensor [num_heads] or None.
                         When not None, a virtual sink token with this scaled
@@ -2843,7 +2954,8 @@ def ref_masked_attention_with_sink(
     Valid KV range for query at absolute position abs_q = seqlen_k - seqlen_q + i_q:
         k < sink_size   (sink region, always valid)
         OR
-        abs_q - window_left <= k <= abs_q   (window region, window_left=-1 means k >= 0)
+        abs_q - window_left <= k <= abs_q + window_right
+        (negative window bounds are unlimited)
     """
     head_dim = query.shape[2]
     seqlen_q = query.shape[0]
@@ -2859,7 +2971,7 @@ def ref_masked_attention_with_sink(
     i_q = torch.arange(seqlen_q, device=query.device).unsqueeze(1)  # [sq, 1]
     i_k = torch.arange(seqlen_k, device=query.device).unsqueeze(0)  # [1, sk]
     abs_q = seqlen_k - seqlen_q + i_q  # [sq, 1]
-    k_end = abs_q  # causal boundary
+    k_end = seqlen_k - 1 if window_right < 0 else abs_q + window_right
     if window_left < 0:
         k_start_window = torch.zeros_like(abs_q)
     else:
@@ -3772,6 +3884,129 @@ def test_batch_prefill_sink(
     )
 
 
+_VIRTUAL_SINK_CASES = [
+    (1, -1, True),
+    (1, 8, True),
+    (1, 1, True),
+    (2, -1, True),
+    (1, -1, False),
+]
+
+
+@pytest.mark.parametrize("qo_len,window_left,with_sink", _VIRTUAL_SINK_CASES)
+def test_batch_prefill_virtual_sink(qo_len, window_left, with_sink):
+    torch.manual_seed(42)
+    kv_lens, num_heads, num_kv_heads, head_dim = (4, 7), 8, 2, 128
+    q = torch.randn(
+        (len(kv_lens) * qo_len, num_heads, head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k = torch.randn(
+        (sum(kv_lens), num_kv_heads, head_dim), dtype=q.dtype, device=q.device
+    )
+    v = torch.randn_like(k)
+    sink = (
+        torch.linspace(-1.0, 3.0, num_heads, dtype=torch.float32, device=q.device)
+        if with_sink
+        else None
+    )
+    kv_indices = torch.randperm(sum(kv_lens), device=q.device).to(torch.int32)
+    out = aiter.mha_batch_prefill_func(
+        q,
+        k,
+        v,
+        torch.tensor([0, qo_len, 2 * qo_len], dtype=torch.int32, device=q.device),
+        torch.tensor([0, kv_lens[0], sum(kv_lens)], dtype=torch.int32, device=q.device),
+        kv_indices,
+        max_seqlen_q=qo_len,
+        max_seqlen_k=max(kv_lens),
+        causal=True,
+        window_size=(window_left, -1),
+        sink_ptr=sink,
+    )
+    expected = []
+    offset = 0
+    for i, kv_len in enumerate(kv_lens):
+        indices = kv_indices[offset : offset + kv_len].long()
+        expected.append(
+            ref_masked_attention_with_sink(
+                q[i * qo_len : (i + 1) * qo_len],
+                k[indices].repeat_interleave(num_heads // num_kv_heads, dim=1),
+                v[indices].repeat_interleave(num_heads // num_kv_heads, dim=1),
+                window_left,
+                0,
+                sink,
+            )
+        )
+        offset += kv_len
+    rtol, atol = get_tolerances(q.dtype)
+    torch.testing.assert_close(out, torch.cat(expected), rtol=rtol, atol=atol)
+
+
+_FULL_ATTENTION_CASES = [
+    (False, (-1, -1)),
+    (False, (100, -1)),
+    (False, (-1, 100)),
+    (False, (100, 100)),
+    (True, (-1, -1)),
+    (True, (2, -1)),
+]
+
+
+@pytest.mark.parametrize("qo_len", [1, 4])
+@pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("causal,window", _FULL_ATTENTION_CASES)
+def test_batch_prefill_full_attention(qo_len, with_sink, causal, window):
+    torch.manual_seed(42)
+    kv_lens, num_heads, num_kv_heads, head_dim = (37, 100), 8, 2, 128
+    q = torch.randn(
+        (2 * qo_len, num_heads, head_dim), dtype=torch.bfloat16, device="cuda"
+    )
+    k = torch.randn(
+        (sum(kv_lens), num_kv_heads, head_dim), dtype=q.dtype, device=q.device
+    )
+    v = torch.randn_like(k)
+    sink = (
+        torch.linspace(-1.0, 3.0, num_heads, dtype=torch.float32, device=q.device)
+        if with_sink
+        else None
+    )
+    indices = torch.randperm(sum(kv_lens), device=q.device).to(torch.int32)
+    out = aiter.mha_batch_prefill_func(
+        q,
+        k,
+        v,
+        torch.tensor([0, qo_len, 2 * qo_len], dtype=torch.int32, device=q.device),
+        torch.tensor([0, kv_lens[0], sum(kv_lens)], dtype=torch.int32, device=q.device),
+        indices,
+        max_seqlen_q=qo_len,
+        max_seqlen_k=max(kv_lens),
+        causal=causal,
+        window_size=window,
+        sink_size=2,
+        sink_ptr=sink,
+    )
+    expected = []
+    offset = 0
+    for i, kv_len in enumerate(kv_lens):
+        pages = indices[offset : offset + kv_len].long()
+        expected.append(
+            ref_masked_attention_with_sink(
+                q[i * qo_len : (i + 1) * qo_len],
+                k[pages].repeat_interleave(num_heads // num_kv_heads, dim=1),
+                v[pages].repeat_interleave(num_heads // num_kv_heads, dim=1),
+                window[0],
+                2,
+                sink,
+                window_right=0 if causal else window[1],
+            )
+        )
+        offset += kv_len
+    rtol, atol = get_tolerances(q.dtype)
+    torch.testing.assert_close(out, torch.cat(expected), rtol=rtol, atol=atol)
+
+
 # CI runs `python3 test_batch_prefill.py` (no pytest), so the __main__ block
 # above only executes the non-sink scenarios. Add a small representative sweep
 # of the StreamLLM sink scenarios here so they actually exercise in CI.
@@ -3799,3 +4034,11 @@ if __name__ == "__main__":
             dtype=dtype,
             seed=42,
         )
+
+    for case in _VIRTUAL_SINK_CASES:
+        test_batch_prefill_virtual_sink(*case)
+
+    for qo_len, with_sink, (causal, window) in itertools.product(
+        [1, 4], [False, True], _FULL_ATTENTION_CASES
+    ):
+        test_batch_prefill_full_attention(qo_len, with_sink, causal, window)

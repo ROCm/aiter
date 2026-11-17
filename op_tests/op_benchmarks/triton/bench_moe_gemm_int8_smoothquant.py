@@ -1,7 +1,6 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
 
-import argparse
 import csv
 import inspect
 import tempfile
@@ -21,6 +20,7 @@ from aiter.ops.triton.moe.quant_moe import (
     quantize_weights_int8,
     smoothquant_quantize,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 
 def parse_profile(profile_path, useful_op_regex, reps):
@@ -190,7 +190,7 @@ def bench_mlp_single_weight_init(
             out_dtype=torch.float32,
             apply_activation=True,
             limit=None,
-            add_residual=False,
+            swiglu_add_residual=False,
         )
         x, x_scale = smoothquant_quantize(x, fc2_smooth_scale)
         x = moe_gemm_int8_smoothquant(
@@ -205,7 +205,7 @@ def bench_mlp_single_weight_init(
             preshuffled=preshuffled,
             out_dtype=torch.bfloat16,
             apply_activation=False,
-            add_residual=False,
+            swiglu_add_residual=False,
         )
 
     proton.finalize()
@@ -294,7 +294,7 @@ def roofline_mlp(
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(prog="Benchmark MoE Int8 SmoothQuant GEMM")
+    parser = get_parser(kernel_name="MoE Int8 SmoothQuant GEMM")
     parser.add_argument(
         "--shape",
         type=int,
