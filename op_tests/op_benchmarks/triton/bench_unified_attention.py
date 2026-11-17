@@ -218,6 +218,7 @@ def _make_ua_rotating_inputs(
     fp8_output,
     out_scale_value,
     nvfp4_q=False,
+    output_gate=False,
 ):
     """Per-pool-entry inputs: query and everything shaped by this entry's
     (possibly varlen) sequence lengths. The paged KV cache itself is fixed
@@ -277,6 +278,17 @@ def _make_ua_rotating_inputs(
         dtype=out_dtype,
         device="cuda",
     )
+    # Sigmoid output gate (Qwen3.5 full attention), one row per query token.
+    gate = (
+        torch.randn(
+            output.shape[0],
+            num_query_heads * head_size_v,
+            dtype=output.dtype,
+            device="cuda",
+        )
+        if output_gate
+        else None
+    )
 
     return (
         q,
@@ -290,6 +302,7 @@ def _make_ua_rotating_inputs(
         out_scale,
         max_query_len,
         max_kv_len,
+        gate,
     )
 
 
@@ -336,6 +349,7 @@ def _generate_ua_pool_inputs(
     fp8_output,
     out_scale_value,
     nvfp4_q=False,
+    output_gate=False,
 ):
     """Build one rotating-buffer pool entry: query, block_tables and the
     per-sequence length tensors for the given seqlens_q/seqlens_k. The paged
@@ -361,6 +375,7 @@ def _generate_ua_pool_inputs(
         fp8_output=fp8_output,
         out_scale_value=out_scale_value,
         nvfp4_q=nvfp4_q,
+        output_gate=output_gate,
     )
 
 
@@ -376,6 +391,7 @@ _UA_POOL_FIELDS = [
     "output_scale",
     "max_seqlen_q",
     "max_seqlen_k",
+    "output_gate",
 ]
 
 
@@ -404,6 +420,7 @@ def _make_unified_attention_fn(
         max_seqlen_q,
         max_seqlen_k,
         softmax_scale,
+        output_gate=None,
         **_,
     ):
         unified_attention(
@@ -429,6 +446,7 @@ def _make_unified_attention_fn(
             shuffled_kv_cache=shuffled_kv_cache,
             equal_seqlen_q=equal_seqlen_q,
             backend=backend,
+            output_gate=output_gate,
         )
 
     return kernel_fn
@@ -454,6 +472,8 @@ def _mode_label(args):
         parts.append("fp8out")
     if args.shuffled_kv_cache:
         parts.append("shuffled")
+    if args.output_gate:
+        parts.append("output_gate")
     return "_".join(parts) + "_fwd"
 
 
@@ -572,6 +592,7 @@ def run_benchmark(custom, args):
             args.fp8_output,
             args.out_scale,
             args.nvfp4,
+            output_gate=args.output_gate,
         )
         fixed_gen = functools.partial(
             _make_ua_cache,
@@ -641,6 +662,11 @@ def run_benchmark(custom, args):
                 output_scale=sample["output_scale"],
                 out_dtype=sample["output"].dtype,
             )
+            if sample["output_gate"] is not None:
+                gate = sample["output_gate"]
+                ref_output = (
+                    ref_output.reshape(gate.shape) * torch.sigmoid(gate)
+                ).reshape_as(ref_output)
             if any_fp8:
                 atol, rtol = 1.5e-1, 1.5e-1
             else:
@@ -718,7 +744,9 @@ def run_benchmark(custom, args):
                 )
             )
             o_bytes = total_q * HQ * D_HEAD_V * entry["output"].element_size()
-            return flops, q_bytes + k_bytes + v_bytes + o_bytes
+            gate = entry["output_gate"]
+            gate_bytes = gate.numel() * gate.element_size() if gate is not None else 0
+            return flops, q_bytes + k_bytes + v_bytes + o_bytes + gate_bytes
 
         # Every pool entry shares the same sequence lengths, so each carries
         # the same work; entry 0's FLOPs/bytes stand for every captured call.
@@ -845,6 +873,12 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Sliding window size (default: disabled)",
     )
+    parser.add_argument(
+        "-output_gate",
+        action="store_true",
+        default=False,
+        help="Apply the Qwen3.5 sigmoid output gate",
+    )
 
     parser.add_argument(
         "--shuffled_kv_cache",
@@ -869,6 +903,8 @@ def main(args: list[str] | None = None) -> None:
         raise ValueError(
             "-fp8_pv applies to an NVFP4 KV cache only (-nvfp4 / -nvfp4_kv)."
         )
+    if args.output_gate and args.fp8_output:
+        raise ValueError("-output_gate requires a BF16 output tensor.")
     if args.k4v8:
         if args.nvfp4 or args.nvfp4_kv or args.fp8_pv:
             raise ValueError(

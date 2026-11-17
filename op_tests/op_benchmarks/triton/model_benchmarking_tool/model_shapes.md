@@ -107,6 +107,9 @@ count reported by the benchmark against `hq`.
 | `block_size`     | int         | Optional. KV cache block size. Omit the key to use `DEFAULT_BLOCK_SIZE` from `bench_unified_attention.py`. |
 | `sliding_window` | int \| null | Optional. Sliding-window size for unified attention; omit when not used.                                   |
 
+Set the optional boolean `output_gate` field to benchmark the Qwen3.5
+`output * sigmoid(gate)` attention epilogue.
+
 ### Sparse MQA decode (`sparse_mqa`)
 
 | Field        | Type | Description                                                     |

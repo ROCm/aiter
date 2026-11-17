@@ -829,6 +829,8 @@ class UnifiedAttnKernelHandler(KernelHandler):
             args += f" -block_size {int(block_size)}"
         if sliding_window is not None:
             args += f" -sliding_window {sliding_window}"
+        if shape.get("output_gate", False):
+            args += " -output_gate"
         return args
 
     def parse_stdout(self, stdout: str) -> float:
@@ -858,6 +860,7 @@ class UnifiedAttnKernelHandler(KernelHandler):
             "block_size": (
                 int(block_size) if block_size is not None else DEFAULT_BLOCK_SIZE
             ),
+            "output_gate": shape.get("output_gate", False),
             self._metric: bench_result,
         }
 
