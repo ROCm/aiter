@@ -52,6 +52,9 @@ from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8 import (
 from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8_blockscale import (
     main as bench_moe_gemm_a8w8_blockscale_main,
 )
+from op_tests.op_benchmarks.triton.bench_pa_decode_sparse import (
+    main as bench_pa_decode_sparse_main,
+)
 from op_tests.op_benchmarks.triton.bench_rmsnorm import main as bench_rmsnorm_main
 from op_tests.op_benchmarks.triton.bench_rope import main as bench_rope_main
 from op_tests.op_benchmarks.triton.bench_unified_attention import DEFAULT_BLOCK_SIZE
@@ -85,6 +88,7 @@ KERNEL_DICT: dict[str, Callable[[list[str]], None]] = {
     "rope": bench_rope_main,
     "mha": bench_mha_main,
     "mla": bench_mla_main,
+    "sparse_mqa": bench_pa_decode_sparse_main,
     "unified_attention": bench_unified_attention_main,
 }
 
@@ -531,6 +535,62 @@ class MlaKernelHandler(KernelHandler):
         }
 
 
+class SparseMqaKernelHandler(KernelHandler):
+    """Handler for DeepSeek-V4 sparse MQA decode benchmarks."""
+
+    def get_tp_shapes(self, shapes: list[ShapeDict]) -> list[ShapeDict]:
+        result = []
+        for shape in shapes:
+            s = shape.copy()
+            self._shard_keys(s, ["hq"])
+            result.append(s)
+        return result
+
+    def build_args(self) -> str:
+        shape = self._shape
+        return (
+            f"--shape {self._batch_size} {shape['hq']} {shape['dqk']} {shape['kv_len']} "
+            "--providers v4_a8w8 --pool paged "
+            f"--page {shape.get('page', 64)} --extra-len {shape['extra_len']} "
+            f"--extra-page {shape.get('extra_page', 64)} "
+            f"--metric {self._metric} --timer profiler"
+        )
+
+    def parse_stdout(self, stdout: str) -> float:
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        last_row_values = list(
+            map(float, re.findall(r"-?\d+(?:\.\d+)?", lines[-1]))
+        )
+        if not last_row_values:
+            raise ValueError(
+                f"Unexpected sparse_mqa bench output format: {lines[-1]!r}"
+            )
+        result = last_row_values[-1]
+        if self._metric == "time":
+            return result * 1e-3  # us -> ms
+        if self._metric == "bandwidth":
+            return result * 1e3  # TB/s -> GB/s
+        return result
+
+    def build_result_row(self, bench_result: float | str) -> ResultRow:
+        shape = self._shape
+        return {
+            "Model": self._model,
+            "Kernel": self._kernel,
+            "batch_size": self._batch_size,
+            "seq_len": int(shape["kv_len"]) + int(shape["extra_len"]),
+            "hq": shape["hq"],
+            "hkv": shape.get("hkv", 1),
+            "dqk": shape["dqk"],
+            "dv": shape.get("dv", shape["dqk"]),
+            "kv_len": shape["kv_len"],
+            "extra_len": shape["extra_len"],
+            "page": shape.get("page", 64),
+            "extra_page": shape.get("extra_page", 64),
+            self._metric: bench_result,
+        }
+
+
 class UnifiedAttnKernelHandler(KernelHandler):
     """Handler for unified attention benchmarks (bench_unified_attention.py)."""
 
@@ -597,6 +657,7 @@ _HANDLER_RULES: list[tuple[Callable[[str], bool], type[KernelHandler]]] = [
     (lambda k: k == "rope", RopeKernelHandler),
     (lambda k: k == "mha", MhaKernelHandler),
     (lambda k: k == "mla", MlaKernelHandler),
+    (lambda k: k == "sparse_mqa", SparseMqaKernelHandler),
     (lambda k: k == "unified_attention", UnifiedAttnKernelHandler),
 ]
 
@@ -790,7 +851,12 @@ def run_benchmarks(
             tp_shapes = handler.get_tp_shapes(shapes)
             for shape in tp_shapes:
                 for batch_size in batch_sizes:
-                    for seq_len in seq_lens:
+                    # Sparse decode uses batch_size as token concurrency. Its
+                    # context lengths come from the two KV streams in the shape.
+                    kernel_seq_lens = (
+                        seq_lens[:1] if kernel == "sparse_mqa" else seq_lens
+                    )
+                    for seq_len in kernel_seq_lens:
                         handler.set_iteration(shape, batch_size, seq_len)
                         bench_result = call_function(bench_fn, handler)
                         results.append(handler.build_result_row(bench_result))

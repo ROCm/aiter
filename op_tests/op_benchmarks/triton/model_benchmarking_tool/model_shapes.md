@@ -107,6 +107,23 @@ count reported by the benchmark against `hq`.
 | `block_size`     | int         | Optional. KV cache block size. Omit the key to use `DEFAULT_BLOCK_SIZE` from `bench_unified_attention.py`. |
 | `sliding_window` | int \| null | Optional. Sliding-window size for unified attention; omit when not used.                                   |
 
+### Sparse MQA decode (`sparse_mqa`)
+
+| Field        | Type | Description                                                     |
+|--------------|------|-----------------------------------------------------------------|
+| `hq`         | int  | Total number of query heads. The tool divides this value by TP. |
+| `hkv`        | int  | Number of key/value heads.                                      |
+| `dqk`        | int  | Query/key head dimension.                                       |
+| `dv`         | int  | Value head dimension.                                           |
+| `kv_len`     | int  | Number of keys in the main sliding-window cache.                |
+| `extra_len`  | int  | Number of keys in the compressed cache.                         |
+| `page`       | int  | Optional. Page size of the main cache. The default is 64.       |
+| `extra_page` | int  | Optional. Page size of the compressed cache. The default is 64. |
+
+The sparse MQA benchmark uses `batch_size` as decode token concurrency. It
+gets the context length from `kv_len` and `extra_len`, so the tool runs only
+the first requested `seq_len` value for this kernel.
+
 ## Example
 
 ```json
