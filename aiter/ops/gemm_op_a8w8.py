@@ -1535,7 +1535,14 @@ def _warn_blockscale_asm_row_not_bf16(n: int, k: int, dtype: torch.dtype):
 # independent: gemm_a8w8_blockscale with isBpreshuffled delegates to this one's
 # E8M0 route. Whether they should converge is #7150's question, not this one's;
 # routing them as they are keeps this pilot out of a public API change.
-@_route(op="gemm_a8w8_blockscale_bpreshuffle")
+# Version 2 appends `x_scale_transposed`. A v2 call with the default (True) is a
+# v1 call, so v1 is superseded; a v1 provider takes six arguments and is turned
+# away by the arity check before it can see a row-major scale.
+@_route(
+    op="gemm_a8w8_blockscale_bpreshuffle",
+    version=2,
+    supersedes={1: "a later aiter release"},
+)
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
 def gemm_a8w8_blockscale_bpreshuffle(
     XQ: Tensor,
