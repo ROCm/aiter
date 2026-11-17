@@ -2114,6 +2114,10 @@ def _check_nhd_contracts(pa, output, arguments, options, plan, check):
         (view(key, key.stride(), offset=1), "16-byte"),
         (view(key, (block, token - 8, head, 1)), "16-byte"),
         (view(key, (block, 128, head, 1)), "overlap"),
+        (
+            view(key, (-block, token, head, 1), offset=(key.shape[0] - 1) * block),
+            "non-negative",
+        ),
     ]:
         with pytest.raises(ValueError, match=message):
             run(torch.empty_like(query), invalid, value)

@@ -171,7 +171,9 @@ def _nhd_strides(view: torch.Tensor) -> tuple[int, int, int]:
 def _view_span(view: torch.Tensor) -> int:
     """Elements from the view's first element through its last, inclusive."""
     return 1 + sum(
-        (size - 1) * stride for size, stride in zip(view.shape, view.stride())
+        (size - 1) * stride
+        for size, stride in zip(view.shape, view.stride())
+        if size > 1
     )
 
 
@@ -578,7 +580,7 @@ def pa_decode(
 
     A 4D ``key_cache`` selects the NHD layout: K and V are equally shaped
     [num_blocks, 64, num_kv_heads, 256] views with a contiguous head axis and
-    arbitrary other strides, e.g. both halves of one 512-byte token row. NHD
+    non-negative other strides, e.g. both halves of one 512-byte token row. NHD
     requires gfx950, FP8 KV, head 256, page 64, and a uniform query_length
     whose rows (query_length times the GQA group size) fit two 16-row M-tiles,
     e.g. query_length 1-4 at GQA 8. Both scale modes and positive sliding
@@ -887,6 +889,11 @@ def pa_decode(
             ("key_cache", key_cache, nhd_strides[:3]),
             ("value_cache", value_cache, nhd_strides[3:]),
         ):
+            if any(stride < 0 for stride in strides):
+                raise ValueError(
+                    f"NHD {name} stepped strides must be non-negative, got "
+                    f"{view.stride()}"
+                )
             # K loads and V LDS-DMAs move 16-byte chunks.
             if view.data_ptr() % 16 or any(stride % 16 for stride in strides):
                 raise ValueError(
