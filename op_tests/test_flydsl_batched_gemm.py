@@ -134,7 +134,9 @@ FUSED_QUANT_TILES = (
     "flydsl_bmm_mxfp8_32_wmma_t32x64x512_mw2_nw2_nb4_sk1_cm1_cn1",
     "flydsl_bmm_mxfp8_32_wmma_t128x128x256_mw2_nw2_nb4_sk1_cm1_cn1",
 )
-# Ragged M for every tile above, at the DSv4.1 wo_a N, K.
+# M = 200 is ragged for all three tiles above; M = 48 is ragged for the two
+# accumulator tiles but a whole number of t16x64 tiles. Both use the DSv4.1
+# wo_a N, K.
 FUSED_QUANT_TILE_SHAPES = ((8, 48, 1024, 4096), (8, 200, 1024, 4096))
 
 
