@@ -143,6 +143,85 @@ def dynamic_nvfp4_quant_kv_cache(
     return key_cache_quant_and_shuffled, value_cache_quant_and_shuffled
 
 
+# e2m1 magnitudes by code (bit 3 is the sign), and the round-to-nearest-even boundaries between them
+_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_E2M1_BOUNDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+
+
+def _e2m1_rne_codes(x: torch.Tensor) -> torch.Tensor:
+    """fp32 -> e2m1 codes (uint8, 0..15), round to nearest even, saturating at 6."""
+    mag = x.abs().contiguous()
+    bounds = torch.tensor(_E2M1_BOUNDS, dtype=x.dtype, device=x.device)
+    # ties go to the lower code; a tie on an odd code's upper bound goes up, to the even code
+    code = torch.bucketize(mag, bounds, right=False)
+    tie = mag == bounds[code.clamp(max=len(_E2M1_BOUNDS) - 1)]
+    code = code + (tie & (code % 2 == 1)).to(code.dtype)
+    return (code | ((x < 0).to(code.dtype) << 3)).to(torch.uint8)
+
+
+def fp4pt_quant_v_cache(value_cache: torch.Tensor, ref: bool = True):
+    """A8K4V4PT's V cache (the reference writer for the fp4pt page layout).
+
+    value_cache [num_blocks, block_size, num_kv_heads, head_size] (bf16/fp32) ->
+      v: [num_blocks, num_kv_heads, block_size, head_size // 2 + 4] torch.float4_e2m1fn_x2, one
+         (block, kv head) row = [block_size * head_size / 2 B e2m1, shuffled exactly as the NVFP4 V data
+         (shuffle_weight, 16 x 16 B tiles) | block_size fp32 scales, token order]
+      v_ref: the values the kernel reads, e2m1 * scale, fp32 [num_blocks, block_size, num_kv_heads,
+         head_size] (None unless ref)
+    Per (token, kv head): s = amax(|v|) / 6, e2m1 = rne(v / s) (s = 0 stores zeros).
+    """
+    num_blocks, block_size, num_kv_heads, head_size = value_cache.shape
+    x = value_cache.permute(0, 2, 1, 3).to(torch.float32)  # [nb, kh, bs, d]
+    scale = x.abs().amax(dim=-1, keepdim=True) / 6.0
+    codes = _e2m1_rne_codes(x / torch.where(scale > 0, scale, 1.0))
+    packed = codes[..., 0::2] | (codes[..., 1::2] << 4)  # low nibble = even element
+    data = shuffle_weight(packed, arch="gfx950").reshape(
+        num_blocks, num_kv_heads, block_size * head_size // 2
+    )
+    tail = scale.reshape(num_blocks, num_kv_heads, block_size).contiguous()
+    v = (
+        torch.cat([data.view(torch.uint8), tail.view(torch.uint8)], dim=-1)
+        .contiguous()
+        .view(num_blocks, num_kv_heads, block_size, head_size // 2 + 4)
+        .view(torch.float4_e2m1fn_x2)
+    )
+    v_ref = None
+    if ref:
+        values = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=x.device)
+        deq = values[(codes & 7).long()] * torch.where(codes >= 8, -1.0, 1.0) * scale
+        v_ref = deq.permute(0, 2, 1, 3).contiguous()
+    return v, v_ref
+
+
+def fp4pt_dequant_v_cache(v: torch.Tensor) -> torch.Tensor:
+    """Reads an fp4pt V cache back (inverse of fp4pt_quant_v_cache's layout): fp32 [num_blocks, block_size,
+    num_kv_heads, head_size]. For checking a writer against the layout."""
+    num_blocks, num_kv_heads, block_size, row = v.shape
+    head_size = (row - 4) * 2
+    raw = v.view(torch.uint8).reshape(num_blocks, num_kv_heads, -1)
+    data = raw[..., : block_size * head_size // 2]
+    scale = (
+        raw[..., block_size * head_size // 2 :]
+        .contiguous()
+        .view(torch.float32)
+        .reshape(num_blocks, num_kv_heads, block_size, 1)
+    )
+    # undo shuffle_weight's (16, 16) tiling of [block_size, head_size // 2] bytes
+    packed = (
+        data.reshape(
+            num_blocks, num_kv_heads, block_size // 16, head_size // 2 // 32, 2, 16, 16
+        )
+        .permute(0, 1, 2, 5, 3, 4, 6)
+        .reshape(num_blocks, num_kv_heads, block_size, head_size // 2)
+    )
+    codes = torch.stack([packed & 0xF, packed >> 4], dim=-1).reshape(
+        num_blocks, num_kv_heads, block_size, head_size
+    )
+    values = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=v.device)
+    deq = values[(codes & 7).long()] * torch.where(codes >= 8, -1.0, 1.0) * scale
+    return deq.permute(0, 2, 1, 3).contiguous()
+
+
 def uniform_random(shape, start=0, end=1, dtype=torch.float32, device="cuda"):
     return (end - start) * torch.rand(shape, dtype=dtype, device=device) + start
 
@@ -1837,6 +1916,81 @@ def test_gfx1250_gluon_ua2d_decode_register_store(
         assert torch.equal(graph_out, eager), f"graph replay {replay} differs"
 
 
+def _ua_kv_inputs(
+    seq_lens,
+    num_heads,
+    head_size,
+    block_size,
+    num_blocks,
+    kv_format="k4v8",
+    ref=True,
+):
+    """fp8 Q and an NVFP4 K cache with an fp8 V (kv_format "k4v8", A8K4V8) or an fp4pt V ("k4v4pt",
+    A8K4V4PT), built by the benchmark's _make_ua_cache / _make_ua_rotating_inputs (they replaced the
+    old bench.make_inputs in #6839). Keys as make_inputs gave them; value_cache is the V the kernels read
+    (shuffled fp8, or fp4pt). ref: fp32 dequantized K (and fp4pt V) for the reference; the fp8 V reference
+    is the fp8 cache with v_descale."""
+    from op_tests.op_benchmarks.triton import bench_unified_attention as bench
+
+    assert kv_format in ("k4v8", "k4v4pt")
+    k4v4pt = kv_format == "k4v4pt"
+    k, v, k_ref, v_ref, k_descale, v_descale, scale = bench._make_ua_cache(
+        num_heads[1],
+        head_size,
+        head_size,
+        block_size,
+        num_blocks,
+        fp8_kv=not k4v4pt,
+        shuffled_kv_cache=True,
+        nvfp4_kv=True,
+        nvfp4_ref=ref,
+        nvfp4_v=False,
+        v_fp4pt=k4v4pt,
+    )
+    (
+        q,
+        output,
+        cu_query_lens,
+        kv_lens,
+        query_lens,
+        block_tables,
+        q_descale,
+        _q_scales,
+        _out_scale,
+        max_query_len,
+        max_kv_len,
+    ) = bench._make_ua_rotating_inputs(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        head_size_qk=head_size,
+        head_size_v=head_size,
+        block_size=block_size,
+        num_blocks=num_blocks,
+        fp8_q=True,
+        fp8_output=False,
+        out_scale_value=1.0,
+    )
+    return {
+        "q_fp8": q,
+        "k_nvfp4": k,
+        "value_cache": v,
+        "query_ref": q.to(torch.float32) * q_descale,
+        "key_ref": k_ref,
+        "value_ref": v_ref,
+        "q_descale": q_descale,
+        "k_descale": k_descale,
+        "v_descale": v_descale,
+        "output": output,
+        "cu_query_lens": cu_query_lens,
+        "kv_lens": kv_lens,
+        "query_lens": query_lens,
+        "block_tables": block_tables,
+        "max_query_len": max_query_len,
+        "max_kv_len": max_kv_len,
+        "scale": scale,
+    }
+
+
 @pytest.mark.parametrize("path", ["2d", "3d", "auto"])
 @pytest.mark.parametrize("block_size", [64, 128])
 @pytest.mark.parametrize("head_size", [128, 256])
@@ -1864,8 +2018,6 @@ def test_triton_unified_attn_k4v8(
     """
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
-    from op_tests.op_benchmarks.triton import bench_unified_attention as bench
-
     if path != "auto":
         monkeypatch.setattr(
             sys.modules[unified_attention.__module__],
@@ -1877,21 +2029,8 @@ def test_triton_unified_attn_k4v8(
         len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
         + 16
     )
-    inp = bench.make_inputs(
-        seq_lens=seq_lens,
-        num_heads=num_heads,
-        head_size_qk=head_size,
-        head_size_v=head_size,
-        block_size=block_size,
-        num_blocks=num_blocks,
-        fp8_q=True,
-        fp8_kv=True,
-        fp8_output=False,
-        out_scale_value=1.0,
-        nvfp4_kv=True,
-        nvfp4_v=False,
-    )
-    value_cache = shuffle_kv_cache(inp["k_fp8"], inp["v_fp8"])[1]
+    inp = _ua_kv_inputs(seq_lens, num_heads, head_size, block_size, num_blocks)
+    value_cache = inp["value_cache"]
     output = torch.full_like(inp["output"], float("nan"))
     unified_attention(
         q=inp["q_fp8"],
@@ -1936,6 +2075,261 @@ def test_triton_unified_attn_k4v8(
     assert (out - ref).abs().max().item() < 0.15
 
 
+# A8K4V4PT PV variants (AITER_UA_FP4PT_PV_MODE) and their bounds on (relative L2, max abs) against the fp32
+# reference over the dequantized K / V. The reference sees exactly the e2m1 * scale values the kernel reads, so
+# the per-token fp4 quantization error is not in the bound, only the kernel's own roundings:
+#   "p": P * s rounded to bf16 (rtz; A8K4V8's P is fp8): ~2^-8 relative per term, so half of A8K4V8's bound.
+#   "fp8": P * s / 2^E in fp8 e4m3, like A8K4V8's fp8 P: A8K4V8's bound (rel L2 0.04, max abs 0.15).
+_K4V4PT_TOL = {"p": (0.02, 0.075), "fp8": (0.04, 0.15)}
+
+
+@pytest.mark.parametrize("pv_mode", ["p", "fp8"])
+@pytest.mark.parametrize("head_size", [128, 256])
+@pytest.mark.parametrize("num_heads", [(16, 2), (4, 1)])
+@pytest.mark.parametrize(
+    "seq_lens, equal_seqlen_q",
+    [
+        # decode: ALL_DECODE, one page short of a tile through 8k; a sequence shorter than one page
+        ([(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)], True),
+        # spec-decode verify (SPEC_DECODE), the Qwen MTP-3 shape
+        ([(4, 3000)] * 8, True),
+        # verify rows on the cu_seqlens_q search path, uneven contexts, a last page with 1 live slot
+        ([(4, 1329), (4, 128), (4, 4097), (4, 640)], False),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_k4v4pt(
+    pv_mode: str,
+    head_size: int,
+    num_heads: tuple[int, int],
+    seq_lens: list[tuple[int, int]],
+    equal_seqlen_q: bool,
+    monkeypatch,
+) -> None:
+    """A8K4V4PT on gfx1250 (3D kernel, 128-token pages): fp8 Q, NVFP4 K (as A8K4V8) and an fp4pt V (e2m1 in the
+    NVFP4-V layout + one fp32 scale per token and KV head at the page row's tail), for each PV variant. The
+    reference is fp32 attention over the dequantized K and V (e2m1 * scale)."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V4PT runs on the gfx1250 Gluon 3D kernel")
+    monkeypatch.setenv("AITER_UA_FP4PT_PV_MODE", pv_mode)
+    torch.manual_seed(0)
+    block_size = 128
+    num_blocks = (
+        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
+        + 16
+    )
+    inp = _ua_kv_inputs(
+        seq_lens, num_heads, head_size, block_size, num_blocks, kv_format="k4v4pt"
+    )
+    assert inp["value_cache"].dtype == torch.float4_e2m1fn_x2
+    output = torch.full_like(inp["output"], float("nan"))
+    unified_attention(
+        q=inp["q_fp8"],
+        k=inp["k_nvfp4"],
+        v=inp["value_cache"],
+        out=output,
+        cu_seqlens_q=inp["cu_query_lens"],
+        seqused_k=inp["kv_lens"],
+        max_seqlen_q=inp["max_query_len"],
+        max_seqlen_k=inp["max_kv_len"],
+        softmax_scale=inp["scale"],
+        causal=True,
+        window_size=(-1, -1),
+        block_table=inp["block_tables"],
+        softcap=0,
+        q_descale=inp["q_descale"],
+        k_descale=inp["k_descale"],
+        v_descale=inp["v_descale"],
+        shuffled_kv_cache=True,
+        equal_seqlen_q=equal_seqlen_q,
+        backend="gluon",
+    )
+    ref = ref_paged_attn(
+        query=inp["query_ref"],
+        key_cache=inp["key_ref"],
+        value_cache=inp["value_ref"],
+        query_lens=inp["query_lens"],
+        kv_lens=inp["kv_lens"],
+        block_tables=inp["block_tables"],
+        scale=inp["scale"],
+        sliding_window=None,
+        soft_cap=None,
+        q_descale=None,
+        k_descale=inp["k_descale"],
+        v_descale=inp["v_descale"],
+        output_scale=None,
+        out_dtype=torch.float32,
+    )
+    out = output.float()
+    assert not out.isnan().any()
+    rel_max, abs_max = _K4V4PT_TOL[pv_mode]
+    rel = ((out - ref).norm() / ref.norm()).item()
+    err = (out - ref).abs().max().item()
+    assert rel < rel_max, f"relative L2 error {rel:.4f} (bound {rel_max})"
+    assert err < abs_max, f"max abs error {err:.4f} (bound {abs_max})"
+
+
+# A8K4V4PT prefill: no prefix, a cached prefix, and a long prefix (4096 new tokens over 20000 cached, the
+# Qwen3.5 chunked-prefill shape whose 2D output gate is fused at any setting); a mixed batch on the
+# cu_seqlens_q search path with partial last pages
+_K4V4PT_PREFILL = [
+    [(478, 478)],
+    [(600, 3600)],
+    [(1500, 1500)],
+    [(4096, 4096 + 20000)],
+    [(478, 478), (600, 3600), (37, 1500), (1500, 1500)],
+]
+
+
+@pytest.mark.parametrize("pv_mode", ["p", "fp8"])
+@pytest.mark.parametrize("path", ["2d", "3d", "auto"])
+@pytest.mark.parametrize("num_heads", [(16, 2), (4, 1)])
+@pytest.mark.parametrize("gate", [False, True])
+@pytest.mark.parametrize("seq_lens", _K4V4PT_PREFILL)
+@torch.inference_mode()
+def test_triton_unified_attn_k4v4pt_prefill(
+    pv_mode: str,
+    path: str,
+    num_heads: tuple[int, int],
+    gate: bool,
+    seq_lens: list[tuple[int, int]],
+    monkeypatch,
+) -> None:
+    """A8K4V4PT prefill on gfx1250 (d 256, 128-token pages): the 2D kernel (loop variants 1 / 2 at the configs these
+    shapes select, tiles of one or two pages), the 3D kernel (prefill over a cached prefix, the PREFILL_MAX_2D_PRGMS
+    route), and the router's choice, for each PV variant. The reference is fp32 attention over the dequantized K
+    and V (e2m1 * scale), with the A8K4V4PT decode bounds (_K4V4PT_TOL): the per-element roundings are the same
+    (P in fp8 or bf16), and the longer key sums only average them down.
+    gate: the output gate (out * sigmoid(gate)), fused in the 2D kernel's epilogue at any context here, must be
+    bitwise the ungated output followed by the unfused sigmoid-mul."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V4PT runs on the gfx1250 Gluon kernels")
+    monkeypatch.setenv("AITER_UA_FP4PT_PV_MODE", pv_mode)
+    module = sys.modules[unified_attention.__module__]
+    if path != "auto":
+        monkeypatch.setattr(
+            module, "use_2d_kernel", lambda params, backend="triton": path == "2d"
+        )
+    if gate:
+        monkeypatch.setattr(module, "_UA2D_FUSED_EPILOGUE_MIN_KV", 0)
+    torch.manual_seed(0)
+    block_size, head_size = 128, 256
+    num_blocks = (
+        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
+        + 16
+    )
+    inp = _ua_kv_inputs(
+        seq_lens, num_heads, head_size, block_size, num_blocks, kv_format="k4v4pt"
+    )
+
+    def run(out, **kw):
+        return unified_attention(
+            q=inp["q_fp8"],
+            k=inp["k_nvfp4"],
+            v=inp["value_cache"],
+            out=out,
+            cu_seqlens_q=inp["cu_query_lens"],
+            seqused_k=inp["kv_lens"],
+            max_seqlen_q=inp["max_query_len"],
+            max_seqlen_k=inp["max_kv_len"],
+            softmax_scale=inp["scale"],
+            causal=True,
+            window_size=(-1, -1),
+            block_table=inp["block_tables"],
+            softcap=0,
+            q_descale=inp["q_descale"],
+            k_descale=inp["k_descale"],
+            v_descale=inp["v_descale"],
+            shuffled_kv_cache=True,
+            backend="gluon",
+            **kw,
+        )
+
+    output = run(torch.full_like(inp["output"], float("nan")))
+    ref = ref_paged_attn(
+        query=inp["query_ref"],
+        key_cache=inp["key_ref"],
+        value_cache=inp["value_ref"],
+        query_lens=inp["query_lens"],
+        kv_lens=inp["kv_lens"],
+        block_tables=inp["block_tables"],
+        scale=inp["scale"],
+        sliding_window=None,
+        soft_cap=None,
+        q_descale=None,
+        k_descale=inp["k_descale"],
+        v_descale=inp["v_descale"],
+        output_scale=None,
+        out_dtype=torch.float32,
+    )
+    out = output.float()
+    assert not out.isnan().any()
+    rel_max, abs_max = _K4V4PT_TOL[pv_mode]
+    rel = ((out - ref).norm() / ref.norm()).item()
+    err = (out - ref).abs().max().item()
+    assert rel < rel_max, f"relative L2 error {rel:.4f} (bound {rel_max})"
+    assert err < abs_max, f"max abs error {err:.4f} (bound {abs_max})"
+
+    if gate:
+        tokens = inp["q_fp8"].shape[0]
+        width = num_heads[0] * head_size
+        # the gate is a column slice of the QKV-gate projection's output
+        qkvg = 3 * torch.randn(
+            tokens, 2 * width + 1024, dtype=torch.bfloat16, device="cuda"
+        )
+        g = qkvg[:, :width]
+        gated_ref = _sigmoid_mul_ref(output, g)
+        gated = run(torch.full_like(inp["output"], float("nan")), output_gate=g)
+        assert torch.equal(gated.reshape(gated_ref.shape), gated_ref)
+
+
+@torch.inference_mode()
+def test_unified_attn_k4v4pt_guards() -> None:
+    """A8K4V4PT runs only on the gfx1250 Gluon kernels: a sliding window or the Triton backend raises
+    NotImplementedError, and a plain uint8 V of the fp4pt shape is not taken for fp4pt (it is an NVFP4 V, whose
+    page size differs)."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V4PT runs on the gfx1250 Gluon kernels")
+    torch.manual_seed(0)
+    seq_lens = [(32, 512), (17, 300)]
+    block_size, head_size, num_heads = 128, 256, (16, 2)
+    num_blocks = len(seq_lens) * 4 + 16
+    inp = _ua_kv_inputs(
+        seq_lens,
+        num_heads,
+        head_size,
+        block_size,
+        num_blocks,
+        kv_format="k4v4pt",
+        ref=False,
+    )
+    kw = {
+        "q": inp["q_fp8"],
+        "k": inp["k_nvfp4"],
+        "out": inp["output"],
+        "cu_seqlens_q": inp["cu_query_lens"],
+        "seqused_k": inp["kv_lens"],
+        "max_seqlen_q": inp["max_query_len"],
+        "max_seqlen_k": inp["max_kv_len"],
+        "softmax_scale": inp["scale"],
+        "causal": True,
+        "window_size": (-1, -1),
+        "block_table": inp["block_tables"],
+        "softcap": 0,
+        "q_descale": inp["q_descale"],
+        "k_descale": inp["k_descale"],
+        "v_descale": inp["v_descale"],
+        "shuffled_kv_cache": True,
+        "backend": "gluon",
+    }
+    with pytest.raises(NotImplementedError, match="sliding window"):
+        unified_attention(v=inp["value_cache"], **{**kw, "window_size": (127, 0)})
+    with pytest.raises(NotImplementedError, match="A8K4V4PT"):
+        unified_attention(v=inp["value_cache"], **{**kw, "backend": "triton"})
+    with pytest.raises(AssertionError):
+        unified_attention(v=inp["value_cache"].view(torch.uint8), **kw)
+
+
 @triton.jit
 def _sigmoid_mul_ref_kernel(x_ptr, g_ptr, out_ptr, stride_g, WIDTH: tl.constexpr):
     """x * sigmoid(gate) rounded as the unfused Qwen3.5 output gate (ATOM's
@@ -1954,28 +2348,14 @@ def _k4v8_gate_inputs(
     """A8K4V8 inputs (fp8 Q, NVFP4 K, shuffled fp8 V) and a run(out, **kw) launcher.
     equal_seqlen_q=None: on when every seq has the same query length (spec-decode
     verify / decode), as ATOM launches them."""
-    from op_tests.op_benchmarks.triton import bench_unified_attention as bench
-
     num_blocks = (
         len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
         + 16
     )
-    inp = bench.make_inputs(
-        seq_lens=seq_lens,
-        num_heads=num_heads,
-        head_size_qk=head_size,
-        head_size_v=head_size,
-        block_size=block_size,
-        num_blocks=num_blocks,
-        fp8_q=True,
-        fp8_kv=True,
-        fp8_output=False,
-        out_scale_value=1.0,
-        nvfp4_kv=True,
-        nvfp4_ref=False,
-        nvfp4_v=False,
+    inp = _ua_kv_inputs(
+        seq_lens, num_heads, head_size, block_size, num_blocks, ref=False
     )
-    value_cache = shuffle_kv_cache(inp["k_fp8"], inp["v_fp8"])[1]
+    value_cache = inp["value_cache"]
     equal_q = equal_seqlen_q
     if equal_q is None:
         equal_q = len({q for q, _ in seq_lens}) == 1
@@ -2183,34 +2563,21 @@ def test_unified_attn_split_rebalance_reduce_k4v8(
     epilogue applied to the new reduce."""
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
-    from op_tests.op_benchmarks.triton import bench_unified_attention as bench
-
     module = sys.modules[unified_attention.__module__]
     monkeypatch.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_MIN_TILES", 16)
     monkeypatch.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_MAX_TILES", 128)
     monkeypatch.setattr(module, "use_2d_kernel", lambda params, backend="triton": False)
     torch.manual_seed(0)
     block_size, head_size, num_heads = 128, 256, (16, 2)
-    # make_inputs draws page ids from len(seq_lens) x the longest sequence's pages
+    # _ua_kv_inputs draws page ids from len(seq_lens) x the longest sequence's pages
     num_blocks = (
         len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
         + 16
     )
-    inp = bench.make_inputs(
-        seq_lens=seq_lens,
-        num_heads=num_heads,
-        head_size_qk=head_size,
-        head_size_v=head_size,
-        block_size=block_size,
-        num_blocks=num_blocks,
-        fp8_q=True,
-        fp8_kv=True,
-        fp8_output=False,
-        out_scale_value=1.0,
-        nvfp4_kv=True,
-        nvfp4_v=False,
+    inp = _ua_kv_inputs(
+        seq_lens, num_heads, head_size, block_size, num_blocks, ref=False
     )
-    value_cache = shuffle_kv_cache(inp["k_fp8"], inp["v_fp8"])[1]
+    value_cache = inp["value_cache"]
     tokens = inp["q_fp8"].shape[0]
     width = num_heads[0] * head_size
     kw = {}
@@ -2311,35 +2678,21 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     not, over one or several LDS passes."""
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
-    from op_tests.op_benchmarks.triton import bench_unified_attention as bench
-
     module = sys.modules[unified_attention.__module__]
     monkeypatch.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_MIN_TILES", 16)
     monkeypatch.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_MAX_TILES", 128)
     monkeypatch.setattr(module, "use_2d_kernel", lambda params, backend="triton": False)
     torch.manual_seed(0)
     block_size, head_size, num_heads = 128, 256, (16, 2)
-    # make_inputs draws page ids from len(seq_lens) x the longest sequence's pages
+    # _ua_kv_inputs draws page ids from len(seq_lens) x the longest sequence's pages
     num_blocks = (
         len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
         + 16
     )
-    inp = bench.make_inputs(
-        seq_lens=seq_lens,
-        num_heads=num_heads,
-        head_size_qk=head_size,
-        head_size_v=head_size,
-        block_size=block_size,
-        num_blocks=num_blocks,
-        fp8_q=True,
-        fp8_kv=True,
-        fp8_output=False,
-        out_scale_value=1.0,
-        nvfp4_kv=True,
-        nvfp4_ref=False,
-        nvfp4_v=False,
+    inp = _ua_kv_inputs(
+        seq_lens, num_heads, head_size, block_size, num_blocks, ref=False
     )
-    value_cache = shuffle_kv_cache(inp["k_fp8"], inp["v_fp8"])[1]
+    value_cache = inp["value_cache"]
     tokens = inp["q_fp8"].shape[0]
     width = num_heads[0] * head_size
     kw = {}

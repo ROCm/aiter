@@ -1,6 +1,7 @@
 import argparse
 import functools
 import itertools
+import os
 import sys
 
 import torch
@@ -19,6 +20,7 @@ from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
 )
 from op_tests.triton_tests.attention.test_unified_attention import (
     dynamic_nvfp4_quant_kv_cache,
+    fp4pt_quant_v_cache,
     ref_paged_attn,
     shuffle_kv_cache,
 )
@@ -110,6 +112,30 @@ def nvfp4_quant_kv_cache_chunked(key_cache, value_cache, blocks_per_chunk=16384)
     return outs[0], outs[1]
 
 
+def fp4pt_quant_v_cache_chunked(value_cache, ref, blocks_per_chunk=8192):
+    """A8K4V4PT's fp4pt V cache (fp4pt_quant_v_cache: e2m1 in the NVFP4-V layout + one fp32 scale per token
+    and KV head at each page row's tail) over chunks of blocks, so the fp32 temporaries stay bounded on large
+    caches; with ref, also the fp32 dequantized copy (e2m1 * scale) for the reference.
+    """
+    num_blocks = value_cache.shape[0]
+    v = v_ref = None
+    for b0 in range(0, num_blocks, blocks_per_chunk):
+        vq, vr = fp4pt_quant_v_cache(value_cache[b0 : b0 + blocks_per_chunk], ref=ref)
+        if v is None:
+            v = torch.empty(
+                (num_blocks,) + vq.shape[1:], dtype=torch.uint8, device=vq.device
+            )
+            if ref:
+                v_ref = torch.empty(
+                    (num_blocks,) + vr.shape[1:], dtype=vr.dtype, device=vr.device
+                )
+        v[b0 : b0 + vq.shape[0]] = vq.view(torch.uint8)
+        if ref:
+            v_ref[b0 : b0 + vr.shape[0]] = vr
+        del vq, vr
+    return v.view(torch.float4_e2m1fn_x2), v_ref
+
+
 def nvfp4_dequant(packed, scales):
     """fp32 values of an already-packed NVFP4 tensor (``(..., D // 2)`` e2m1
     pairs, ``(..., D // 16)`` e4m3 scales), e.g. a pool entry's Q, for the
@@ -133,8 +159,12 @@ def _make_ua_cache(
     nvfp4_kv=False,
     nvfp4_ref=True,
     nvfp4_v=True,
+    v_fp4pt=False,
 ):
     """Paged KV cache: key_cache/value_cache at num_blocks capacity.
+
+    nvfp4_kv: K in NVFP4; V in NVFP4 (nvfp4_v), fp8 (A8K4V8, needs fp8_kv) or fp4pt (v_fp4pt, A8K4V4PT:
+    e2m1 + one fp32 scale per token and KV head, the V cache passed as torch.float4_e2m1fn_x2).
 
     unified_attention reads this through block_table, which for most
     sequences in a batch only ever indexes a handful of the num_blocks rows.
@@ -176,7 +206,12 @@ def _make_ua_cache(
         # for a correctness check (nvfp4_ref).
         k, v = nvfp4_quant_kv_cache_chunked(key_cache, value_cache)
         k_descale = torch.ones(1, dtype=torch.float32, device="cuda")
-        if nvfp4_v:
+        if v_fp4pt:
+            # A8K4V4PT: the reference reads e2m1 * scale (fp32); v_descale stays 1 (the kernel folds it into
+            # the output scale)
+            v, v_ref = fp4pt_quant_v_cache_chunked(value_cache, ref=nvfp4_ref)
+            v_descale = torch.ones(1, dtype=torch.float32, device="cuda")
+        elif nvfp4_v:
             v_ref = nvfp4_quant_dequant(value_cache) if nvfp4_ref else None
             v_descale = torch.ones(1, dtype=torch.float32, device="cuda")
         else:
@@ -434,6 +469,8 @@ def _mode_label(args):
     parts = []
     if args.nvfp4:
         parts.append("a4w4_nvfp4")
+    elif args.k4v4pt:
+        parts.append(f"a8k4v4pt_pv{args.k4v4pt_mode}")
     elif args.k4v8:
         parts.append("a8k4v8")
     elif args.nvfp4_kv:
@@ -583,7 +620,8 @@ def run_benchmark(custom, args):
             nvfp4_kv=any_nvfp4,
             # fp32 dequantized cache copies: only for a correctness check
             nvfp4_ref=args.test,
-            nvfp4_v=not args.k4v8,
+            nvfp4_v=not (args.k4v8 or args.k4v4pt),
+            v_fp4pt=args.k4v4pt,
         )
         rot_bufs = bencher.build_pool(
             [pool_gen],
@@ -704,15 +742,20 @@ def run_benchmark(custom, args):
                     else D_HEAD * entry["k"].element_size()
                 )
             )
-            v_bytes = (
-                total_k
-                * HK
-                * (
-                    nvfp4_bytes(D_HEAD_V)
-                    if any_nvfp4 and not args.k4v8
-                    else D_HEAD_V * entry["v"].element_size()
+            # A8K4V4PT's fp4pt V: half a byte per value plus one fp32 scale per token-head
+            fp4pt_bytes = lambda d: d // 2 + 4
+            if args.k4v4pt:
+                v_bytes = total_k * HK * fp4pt_bytes(D_HEAD_V)
+            else:
+                v_bytes = (
+                    total_k
+                    * HK
+                    * (
+                        nvfp4_bytes(D_HEAD_V)
+                        if any_nvfp4 and not args.k4v8
+                        else D_HEAD_V * entry["v"].element_size()
+                    )
                 )
-            )
             o_bytes = total_q * HQ * D_HEAD_V * entry["output"].element_size()
             return flops, q_bytes + k_bytes + v_bytes + o_bytes
 
@@ -803,6 +846,20 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         help="A8K4V8: Q in FP8, K in NVFP4, V in FP8 (shuffled); needs -block_size 128",
     )
     parser.add_argument(
+        "-k4v4pt",
+        action="store_true",
+        default=False,
+        help="A8K4V4PT: Q in FP8, K in NVFP4 (as -k4v8), V in fp4pt (e2m1 + one fp32 scale per token and KV "
+        "head at the page tail); gfx1250 Gluon 2D / 3D kernels (decode, verify, prefill); needs -block_size 128",
+    )
+    parser.add_argument(
+        "-k4v4pt_mode",
+        choices=["p", "fp8"],
+        default=None,
+        help="With -k4v4pt: the PV variant (AITER_UA_FP4PT_PV_MODE): p = scale on P (bf16 PV), "
+        "fp8 = fp8 P x e2m1 V scaled WMMA; default: the kernel's default (fp8)",
+    )
+    parser.add_argument(
         "-nvfp4",
         action="store_true",
         default=False,
@@ -865,6 +922,24 @@ def main(args: list[str] | None = None) -> None:
         raise ValueError(
             "-fp8_pv applies to an NVFP4 KV cache only (-nvfp4 / -nvfp4_kv)."
         )
+    if args.k4v4pt:
+        if args.k4v8 or args.nvfp4 or args.nvfp4_kv or args.fp8_pv:
+            raise ValueError(
+                "-k4v4pt is its own KV format; drop -k4v8 / -nvfp4 / -nvfp4_kv / -fp8_pv."
+            )
+        if args.block_size != 128:
+            raise ValueError("-k4v4pt needs -block_size 128.")
+        if args.k4v4pt_mode is not None:
+            os.environ["AITER_UA_FP4PT_PV_MODE"] = args.k4v4pt_mode
+        else:
+            from aiter.ops.triton.attention import unified_attention as _ua
+
+            args.k4v4pt_mode = os.environ.get(
+                "AITER_UA_FP4PT_PV_MODE", _ua._FP4PT_PV_MODE_DEFAULT
+            )
+        args.nvfp4_kv = True
+    elif args.k4v4pt_mode is not None:
+        raise ValueError("-k4v4pt_mode needs -k4v4pt.")
     if args.k4v8:
         if args.nvfp4 or args.nvfp4_kv or args.fp8_pv:
             raise ValueError(

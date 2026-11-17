@@ -26,8 +26,8 @@ that exists: an exact EQ first, then LEQ bounds ascending, then GEQ
 descending, then "any". So the leftmost axis wins: D before Q is what makes
 head_size outrank max_seqlen_q.
 Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any". The second dtype is the K
-cache's; a V cache of another dtype (A8K4V8: NVFP4 K, fp8 V) first tries DT_<q>_<k>_<v>, e.g.
-DT_fp8_nvfp4_fp8, then that same chain.
+cache's; a V cache of another dtype (A8K4V8: NVFP4 K, fp8 V; A8K4V4PT: NVFP4 K, fp4pt V) first tries
+DT_<q>_<k>_<v>, e.g. DT_fp8_nvfp4_fp8 or DT_fp8_nvfp4_fp4pt, then that same chain.
 SW is the keys a row can see, min(window, max_seqlen_k), and 0 with no window:
 SW_GEQ_<n> targets a window size, a bare SW matches any window, and a table
 may not mix SW_LEQ and SW_GEQ keys.
@@ -82,6 +82,9 @@ _AXIS_KIND = {
 def get_dtype_str(dtype: torch.dtype) -> str:
     if dtype == torch.uint8:
         return "nvfp4"
+    if dtype == torch.float4_e2m1fn_x2:
+        # A8K4V4PT's V cache: e2m1 with one fp32 scale per token (see unified_attention.FP4PT_V_DTYPE)
+        return "fp4pt"
     if dtype == e4m3_dtype:
         return "fp8"
     if dtype in (torch.bfloat16, torch.float16):
