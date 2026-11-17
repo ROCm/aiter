@@ -118,3 +118,35 @@ Full wheel kernel prebuild, the full GPU suite, other GPU architectures,
 power-mode GPU measurements, and end-to-end training were not run. GitHub baseline
 workflows required maintainer approval when this supplement was prepared;
 local results do not establish a green GitHub CI run.
+
+
+## Prebuild bootstrap follow-up (2026-11-17)
+
+The config property previously imported `aiter.utility` while setup.py was
+expanding build arguments, before `module_aiter_core` was registered. The fix
+loads the stdlib resolver by file path only while `aiter` is absent from
+`sys.modules`. This standalone module is cached to retain freeze-on-first-use;
+normal runtime calls use the public resolver and its configured state.
+
+On alola3 (CPU login node, Python 3.12), the two new stdlib tests failed before
+the fix and passed afterwards. `python3 op_tests/test_mxfp4_tuning_config.py`
+passes all 23 tests. These tests expand the production JSON blob command while
+rejecting every `aiter` import, and check standalone freezing plus transition
+to the public configured module. They complement resolver data tests because
+they exercise the JIT config property boundary.
+
+Using `/scratch/users/xdai/aiter-gpu-venv/bin/python` with `PYTHONPATH=.`, the
+config/collision/CSV pytest command above returned 42 passed, 34 skipped and
+53 subtests passed. All collision tests were skipped because this environment
+has flydsl 0.3.4.1 but the current checkout requires >=0.5.0. The historical
+73-test and GPU results above belong to the earlier validation revision.
+
+The actual setup-style `from jit import core` path was also checked by putting
+`aiter/` on `sys.path` and installing an import guard that raises on `aiter` or
+`aiter.*`. `core.get_args_of_build("module_gemm_a4w4")` produced the CK generator
+command with an existing resolved CSV, and `core.get_args_of_build("all")`
+expanded 130 modules; `aiter` remained absent from `sys.modules`. The checkout
+has no CK submodule, so the all-modules call applies its normal CK exclusions;
+the separate A4W4 call explicitly exercises the affected CK parameter path.
+This validates parameter expansion only, not compilation of a prebuilt wheel.
+Full GPU kernel prebuild remains unverified.

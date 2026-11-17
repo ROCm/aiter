@@ -2,15 +2,20 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Stdlib-only tests of the public tuning module (no AITER device bootstrap)."""
 
+import ast
+import builtins
 import contextlib
 import csv
+import functools
 import hashlib
 import importlib.util
 import io
+import json
 import os
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
@@ -351,6 +356,93 @@ class TestMXFP4TuningConfig(unittest.TestCase):
             )
         finally:
             sys.argv = argv
+
+
+class TestMXFP4PrebuildConfig(unittest.TestCase):
+    def setUp(self):
+        TestMXFP4TuningConfig.setUp(self)
+        # Execute only the stdlib config boundary, without native JIT dependencies.
+        source = _MODULE.parents[1] / "jit/core.py"
+        tree = ast.parse(source.read_text())
+        nodes = [
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+            and node.name in {"_prebuild_mxfp4_tuning", "AITER_CONFIG"}
+        ]
+        self.core = {
+            "functools": functools,
+            "importlib": importlib,
+            "os": os,
+            "sys": sys,
+            "AITER_ROOT_DIR": str(_MODULE.parents[2]),
+        }
+        exec(  # noqa: S102 - trusted repository AST
+            compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"),
+            self.core,
+        )
+        self.config = self.core["AITER_CONFIG"]()
+        self.modules = patch.dict(sys.modules)
+        self.modules.start()
+        self.addCleanup(self.modules.stop)
+        sys.modules.pop("aiter", None)
+
+    table = TestMXFP4TuningConfig.table
+
+    def test_prebuild_expands_blob_command_without_package_import(self):
+        original_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "aiter" or name.startswith("aiter."):
+                raise AssertionError("prebuild must not bootstrap aiter")
+            return original_import(name, *args, **kwargs)
+
+        table = self.table("prebuild.csv", "gfx950,256,1,2,3,first,0,1\n")
+        os.environ["AITER_CONFIG_GEMM_A4W4"] = str(table)
+        config_file = _MODULE.parents[1] / "jit/optCompilerConfig.json"
+        entries = json.loads(config_file.read_text())
+        commands = [
+            entry["blob_gen_cmd"]
+            for entry in entries.values()
+            if "AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE"
+            in entry.get("blob_gen_cmd", "")
+        ]
+        self.assertTrue(commands)
+        with patch("builtins.__import__", side_effect=guarded_import):
+            for command in commands:
+                expanded = eval(
+                    command, {"AITER_CONFIGS": self.config, "AITER_CSRC_DIR": "csrc"}
+                )
+                self.assertIn(self.config.AITER_CONFIG_GEMM_A4W4_FILE, expanded)
+                with open(self.config.AITER_CONFIG_GEMM_A4W4_FILE) as stream:
+                    self.assertEqual(
+                        next(csv.DictReader(stream))["kernelName"], "first"
+                    )
+        self.assertNotIn("aiter", sys.modules)
+
+    def test_prebuild_freezes_once_and_runtime_uses_public_state(self):
+        first = self.table("first.csv", "gfx950,256,1,2,3,first,0,1\n")
+        second = self.table("second.csv", "gfx950,256,1,2,3,second,0,1\n")
+        os.environ["AITER_CONFIG_GEMM_A4W4"] = str(first)
+        first_path = self.config.AITER_CONFIG_GEMM_A4W4_FILE
+        with open(first_path) as stream:
+            self.assertEqual(next(csv.DictReader(stream))["kernelName"], "first")
+        os.environ["AITER_CONFIG_GEMM_A4W4"] = str(second)
+        self.assertEqual(self.config.AITER_CONFIG_GEMM_A4W4_FILE, first_path)
+        os.environ.pop("AITER_CONFIG_GEMM_A4W4")
+        self.api.configure_mxfp4_tuning(tuned_config=[str(second)], merge_default=False)
+        package = types.ModuleType("aiter")
+        utility = types.ModuleType("aiter.utility")
+        utility.mxfp4_tuning = self.api
+        package.utility = utility
+        sys.modules["aiter"] = package
+        sys.modules["aiter.utility"] = utility
+        sys.modules["aiter.utility.mxfp4_tuning"] = self.api
+        self.assertEqual(
+            self.config.AITER_CONFIG_GEMM_A4W4_FILE, self.api.get_mxfp4_config_file()
+        )
+        with open(self.config.AITER_CONFIG_GEMM_A4W4_FILE) as stream:
+            self.assertEqual(next(csv.DictReader(stream))["kernelName"], "second")
 
 
 if __name__ == "__main__":
