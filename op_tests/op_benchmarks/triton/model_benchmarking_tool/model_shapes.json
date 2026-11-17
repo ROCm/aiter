@@ -890,7 +890,7 @@
             }
         ]
     },
-    "DSv4 Flash": {
+    "DeepSeek-V4-Flash": {
         "gemm_a8w8_blockscale": [
             {
                 "N": 1536,
@@ -1035,7 +1035,7 @@
             }
         ]
     },
-    "DSv4 Pro": {
+    "DeepSeek-V4-Pro": {
         "gemm_a8w8_blockscale": [
             {
                 "N": 1536,
@@ -1190,7 +1190,7 @@
             }
         ]
     },
-    "DSv4.1 Flash": {
+    "DeepSeek-V4.1-Flash": {
         "gemm_a16w16": [
             {
                 "N": 32,
@@ -1248,7 +1248,7 @@
             }
         ]
     },
-    "Kimi K3": {
+    "Kimi-K3": {
         "gemm_a16w16": [
             {
                 "N": 96,
@@ -1392,7 +1392,7 @@
             }
         ]
     },
-    "amd/Qwen3.5-35B-A3B-MXFP4": {
+    "Qwen3.5-35B-A3B-MXFP4": {
         "gemm_a16w16": [
             {
                 "N": 9216,
