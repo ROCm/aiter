@@ -10,6 +10,7 @@ import torch
 from .arena import SymmetricArena, _ArenaLayout
 from .decode_mega import (
     DecodeMega,
+    LargeMega,
     decode_mega_reason,
     decode_mega_regions,
     large_mega_reason,
@@ -85,9 +86,7 @@ class _EpDispatcher:
             if decode_mega_reason(config) is None:
                 self.decode_mega = DecodeMega(config, self.res, self.device)
             if large_mega_reason(config) is None:
-                self.large_mega = DecodeMega(
-                    config, self.res, self.device, layout="compact"
-                )
+                self.large_mega = LargeMega(config, self.res, self.device)
         except BaseException:
             self.close()
             raise

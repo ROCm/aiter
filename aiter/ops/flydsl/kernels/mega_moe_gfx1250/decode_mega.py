@@ -69,8 +69,8 @@ waits only on the peers' tallies); the plan waits only on producers (all ranks
 run theirs first); a GEMM1 item waits on nothing; a GEMM2 item waits only on
 GEMM1 items already claimed; the reduce waits on the peers' closes, which
 depend only on the above. All CTAs must be resident at once (the grid is the CU
-count times ``DMK_CTAS_PER_CU`` for small_m, ``LM_CTAS_PER_CU`` for large_m, and
-no other kernel may hold CUs). A wait
+count times ``DMK_CTAS_PER_CU`` for small_m, the ``LM_TILES`` row's CTAs per CU
+for a large_m kernel, and no other kernel may hold CUs). A wait
 traps after ``TIMEOUT_S``: a peer's launch may start seconds late.
 
 Cross-launch reuse: rank s writes d's ``dmk_disp`` / ``dmk_rowmap`` /
@@ -2291,7 +2291,14 @@ def large_mega_reason(config) -> str | None:
         return "the X1 rows do not fit the control region"
     if lm_scratch_bytes(npes=npes, experts_per_rank=epr) > LM_SCRATCH_MAX:
         return "the compact front end's LDS does not fit the GEMM arena"
-    return _mega_reason(config, lm_tile())
+    variants = lm_variants(config)
+    if not variants:
+        return "small_m serves every step of this instance"
+    for _, _, tile, _ in variants:
+        why = _mega_reason(config, tile)
+        if why is not None:
+            return why
+    return None
 
 
 def _mega_reason(config, t) -> str | None:
@@ -2341,75 +2348,141 @@ def dmk_cap(config) -> int:
     return (rows + tm - 1) // tm * tm
 
 
-#: large_m GEMM tiles: 64x256x128 with 3 buffers for both GEMMs, the staged
-#: GEMMs' tile. Its ~70 KB arena lets 4 CTAs share a CU (LM_CTAS_PER_CU): the
-#: weight-bound GEMMs need that occupancy. At 2 CTAs per CU with the 64x256x256
-#: tile (134 KB) the GEMM phase ran ~85-115 us slower at 2048 tokens/rank.
-#: AITER_LM_TILE="tm,tn,tk,nb,tn2,tk2,nb2" and AITER_LM_CTAS_PER_CU override.
-LM_TILE = dict(  # noqa: C408 - the builder's keyword names
-    tile_m=64,
-    tile_n=256,
-    tile_k=128,
-    num_buffers=3,
-    tile_n2=256,
-    tile_k2=128,
-    num_buffers2=3,
+_TILE_KEYS = (
+    "tile_m",
+    "tile_n",
+    "tile_k",
+    "num_buffers",
+    "tile_n2",
+    "tile_k2",
+    "num_buffers2",
 )
-LM_CTAS_PER_CU = 4
+
+#: large_m's GEMM tile by step size: (tokens per rank up to which a step runs
+#: it, None for every larger step; the tile of both GEMMs; CTAs per CU). Each
+#: row is its own kernel with its own control block, covering the steps whose
+#: receive bound falls in its range (see lm_variants). DSR1, DSV4.1-Flash and
+#: DSV4-Pro DEP4, us/layer (64x256x128 b3 at 4 CTAs per CU -> 128x256x256 b2
+#: at 2): at 512 tokens/rank 218 -> 207, 185 -> 204, 286 -> 345; at 1024
+#: 308 -> 290, 237 -> 226, 394 -> 385; at 16384 3365 -> 2797, 1805 -> 1534,
+#: 3601 -> 2832. The small tile's ~70 KB arena fits 4 CTAs per CU, the large
+#: one's 2 (3 at 128x256x128 spill: VGPRs capped at 170, 3.8x slower).
+LM_TILES = (
+    (
+        512,
+        dict(  # noqa: C408 - the builder's keyword names
+            tile_m=64,
+            tile_n=256,
+            tile_k=128,
+            num_buffers=3,
+            tile_n2=256,
+            tile_k2=128,
+            num_buffers2=3,
+        ),
+        4,
+    ),
+    (
+        None,
+        dict(  # noqa: C408 - the builder's keyword names
+            tile_m=128,
+            tile_n=256,
+            tile_k=256,
+            num_buffers=2,
+            tile_n2=256,
+            tile_k2=256,
+            num_buffers2=2,
+        ),
+        2,
+    ),
+)
+#: Rows a tile table may have: each kernel has its own arena control region
+#: (lm_ctl, lm_ctl1, ... in arena._ARENA_REGION_ORDER).
+LM_MAX_KERNELS = 4
 
 
-def lm_ctas_per_cu() -> int:
-    return int(os.environ.get("AITER_LM_CTAS_PER_CU", LM_CTAS_PER_CU))
-
-
-def lm_tile() -> dict:
-    v = os.environ.get("AITER_LM_TILE")
-    if v:
-        return dict(
-            zip(
-                (
-                    "tile_m",
-                    "tile_n",
-                    "tile_k",
-                    "num_buffers",
-                    "tile_n2",
-                    "tile_k2",
-                    "num_buffers2",
-                ),
-                (int(x) for x in v.split(",")),
+def lm_tile_table() -> tuple:
+    """LM_TILES, or its overrides. AITER_LM_TILES="UPTO:tm,tn,tk,nb,tn2,tk2,nb2:
+    CTAS;..." replaces the table (UPTO 0: every larger step). AITER_LM_TILE
+    ("tm,tn,tk,nb,tn2,tk2,nb2") and AITER_LM_CTAS_PER_CU run one tile for every
+    step (the table's first by default)."""
+    one = os.environ.get("AITER_LM_TILE")
+    cpc = os.environ.get("AITER_LM_CTAS_PER_CU")
+    if one or cpc:
+        tile = (
+            dict(zip(_TILE_KEYS, (int(x) for x in one.split(","))))
+            if one
+            else dict(LM_TILES[0][1])
+        )
+        return ((None, tile, int(cpc) if cpc else LM_TILES[0][2]),)
+    table = os.environ.get("AITER_LM_TILES")
+    if not table:
+        return LM_TILES
+    rows = []
+    for entry in table.split(";"):
+        upto, tile, ctas = entry.split(":")
+        rows.append(
+            (
+                int(upto) or None,
+                dict(zip(_TILE_KEYS, (int(x) for x in tile.split(",")))),
+                int(ctas),
             )
         )
-    return dict(LM_TILE)
+    if len(rows) > LM_MAX_KERNELS:
+        raise ValueError(f"AITER_LM_TILES has more than {LM_MAX_KERNELS} rows")
+    return tuple(rows)
 
 
-def lm_caps(config, recv_bound: int) -> int:
+def lm_variants(config) -> list:
+    """(recv_lo, recv_hi, tile, CTAs per CU) of each large_m kernel: the rows
+    of lm_tile_table() cut to the receive bounds large_m serves, from past
+    small_m's (or 0) to the instance's. A step runs the kernel whose (recv_lo,
+    recv_hi] holds its bound; every rank passes the same bound."""
+    lo = dmk_recv_cap(config) if decode_mega_reason(config) is None else 0
+    top = config.max_recv
+    out = []
+    for upto, tile, ctas in lm_tile_table():
+        if lo >= top:
+            break
+        hi = top if upto is None else min(top, config.world_size * int(upto))
+        if hi > lo:
+            out.append((lo, hi, dict(tile), int(ctas)))
+            lo = hi
+    return out
+
+
+def lm_ctl_region(i: int) -> str:
+    """The arena control region of large_m's i-th kernel."""
+    return "lm_ctl" if i == 0 else f"lm_ctl{i}"
+
+
+def lm_caps(config, recv_bound: int, tile_m: int) -> int:
     """Compact rows a step with this receive bound may fill: the staged
-    plan's capacity at large_m's alignment."""
+    plan's capacity at this large_m kernel's alignment."""
     from .compact_plan import compact_row_capacity
 
     return compact_row_capacity(
         max_recv=int(recv_bound),
         topk=config.topk,
         experts_per_rank=config.experts_per_rank,
-        tile_m=lm_tile()["tile_m"],
+        tile_m=int(tile_m),
     )
 
 
 def large_mega_regions(config) -> dict:
-    """The arena regions large_m needs ({} when it is off): its control
-    region, and the staged compact rows / rowmap at least as large as its
-    alignment needs (merged with the staged sizes)."""
+    """The arena regions large_m needs ({} when it is off): a control region
+    per kernel, and the staged compact rows / rowmap at least as large as the
+    widest kernel's alignment needs (merged with the staged sizes)."""
     if large_mega_reason(config) is not None:
         return {}
-    caps = lm_caps(config, config.max_recv)
+    variants = lm_variants(config)
+    caps = max(lm_caps(config, hi, t["tile_m"]) for _, hi, t, _ in variants)
     rows, rowmap = lm_row_regions()
-    return {
-        rows: caps * dmk_wire_row(config),
-        rowmap: (caps + 1) * 8,
-        "lm_ctl": dmk_ctl_arena_bytes(
+    regions = {rows: caps * dmk_wire_row(config), rowmap: (caps + 1) * 8}
+    for i in range(len(variants)):
+        regions[lm_ctl_region(i)] = dmk_ctl_arena_bytes(
             npes=config.world_size, experts_per_rank=config.experts_per_rank
-        ),
-    }
+        )
+    return regions
 
 
 def lm_row_regions() -> tuple:
@@ -2443,7 +2516,9 @@ class DecodeMega:
     ``layout="compact"`` is large_m (the staged compact layout, AITER_MEGA_LARGE).
     Each has its own control block, so they share no protocol state."""
 
-    def __init__(self, config, res, device, layout="slots"):
+    def __init__(self, config, res, device, layout="slots", variant=None, ctl=None):
+        """``variant``: large_m's (recv_lo, recv_hi, tile, CTAs per CU), one
+        of lm_variants(config); ``ctl``: its arena control region."""
         import torch
 
         from aiter.jit.utils.chip_info import get_cu_num
@@ -2459,15 +2534,12 @@ class DecodeMega:
         epr = config.experts_per_rank
         self.row = dmk_wire_row(config)
         if compact:
-            t = self.tile = lm_tile()
-            rows = lm_caps(config, config.max_recv)
+            self.recv_lo, self.recv_hi, t, lm_ctas = variant
+            self.tile = t
+            rows = lm_caps(config, self.recv_hi, t["tile_m"])
             self.cap = rows
             self.mt_cap = rows // t["tile_m"]
-            # Steps above what small_m serves (all of them without it).
-            self.recv_lo = (
-                dmk_recv_cap(config) if decode_mega_reason(config) is None else 0
-            )
-            self.regions = (*lm_row_regions(), "lm_ctl")
+            self.regions = (*lm_row_regions(), ctl)
             self.route = torch.empty(
                 geo.max_tokens_per_rank * config.topk, dtype=torch.int32, device=device
             )
@@ -2493,7 +2565,7 @@ class DecodeMega:
         self.a2_scale = torch.empty(
             (rows // rep2, inter // 32 * rep2), dtype=torch.uint8, device=device
         )
-        self.ctas_per_cu = lm_ctas_per_cu() if compact else DMK_CTAS_PER_CU
+        self.ctas_per_cu = lm_ctas if compact else DMK_CTAS_PER_CU
         self.workers = int(get_cu_num()) * self.ctas_per_cu
         # Per-call switch for in-process A/B against the staged path. All
         # ranks must flip it together (the paths share no protocol state).
@@ -2522,7 +2594,7 @@ class DecodeMega:
             return False
         bound = self._bound(recv_token_bound)
         if self.layout == "compact":
-            return self.recv_lo < bound
+            return self.recv_lo < bound <= self.recv_hi
         return bound <= self.recv_cap
 
     def _bound(self, recv_token_bound) -> int:
@@ -2610,7 +2682,12 @@ class DecodeMega:
         if self.layout == "compact":
             # The GEMMs see the rows this step's bound can fill; senders and
             # receiver drop anything past it alike.
-            rows = min(lm_caps(self.config, self._bound(recv_token_bound)), self.rows)
+            rows = min(
+                lm_caps(
+                    self.config, self._bound(recv_token_bound), self.tile["tile_m"]
+                ),
+                self.rows,
+            )
             route = self.route.data_ptr()
         else:
             rows, route = self.rows, 0
@@ -2761,8 +2838,64 @@ class DecodeMega:
         return self.ctl[CTL_FAIL : CTL_FAIL + 9].tolist()
 
 
+class LargeMega:
+    """large_m: one compact-layout DecodeMega per row of lm_tile_table(), each
+    over its own receive bounds (lm_variants) with its own control region; a
+    step runs the one its bound falls in. They share the staged path's rows,
+    rowmap and comb_inp the way large_m and the staged path do: a rank writes
+    a peer's copy only after a message from that peer's current launch.
+    Attributes not defined here are those of the kernel for the largest steps."""
+
+    def __init__(self, config, res, device):
+        self.variants = [
+            DecodeMega(
+                config, res, device, layout="compact", variant=v, ctl=lm_ctl_region(i)
+            )
+            for i, v in enumerate(lm_variants(config))
+        ]
+
+    @property
+    def enabled(self) -> bool:
+        return all(v.enabled for v in self.variants)
+
+    @enabled.setter
+    def enabled(self, on: bool) -> None:
+        for v in self.variants:
+            v.enabled = on
+
+    def for_bound(self, recv_token_bound):
+        """The kernel that runs a step with this receive bound, or None."""
+        for v in self.variants:
+            if v.serves(recv_token_bound):
+                return v
+        return None
+
+    def serves(self, recv_token_bound) -> bool:
+        return self.for_bound(recv_token_bound) is not None
+
+    def forward(self, hidden_states, topk_weights, topk_ids, **kw):
+        mk = self.for_bound(kw.get("recv_token_bound"))
+        return mk.forward(hidden_states, topk_weights, topk_ids, **kw)
+
+    def errors(self) -> int:
+        return sum(v.errors() for v in self.variants)
+
+    def fails(self) -> list:
+        return [sum(site) for site in zip(*(v.fails() for v in self.variants))]
+
+    def report(self):
+        for v in self.variants:
+            v.report()
+
+    def __getattr__(self, name):
+        if name == "variants":
+            raise AttributeError(name)
+        return getattr(self.variants[-1], name)
+
+
 __all__ = [
     "DecodeMega",
+    "LargeMega",
     "decode_mega_reason",
     "decode_mega_regions",
     "dmk_ctl_arena_bytes",
@@ -2770,6 +2903,8 @@ __all__ = [
     "dmk_epr_pad",
     "large_mega_reason",
     "large_mega_regions",
+    "lm_tile_table",
+    "lm_variants",
     "make_decode_mega",
     "read_decode_mega_tokens",
 ]

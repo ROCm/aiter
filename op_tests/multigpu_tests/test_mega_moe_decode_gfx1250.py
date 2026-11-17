@@ -20,9 +20,10 @@ combine, with and without a fused shared expert, for each megakernel:
     for a step small_m serves is dropped;
   * a captured graph's replay against the eager result, bit for bit.
 
-And large_m alone at a decode shape (96 experts a rank, hundreds of tokens):
-there its queue holds more items than CTAs, so a grid that is not resident at
-once deadlocks; it runs with timed-out waits counted instead of trapping.
+And large_m alone at a decode shape (96 experts a rank, up to 1024 tokens),
+one step on each of its kernels (LM_TILES): there its queue holds more items
+than CTAs, so a grid that is not resident at once deadlocks; it runs with
+timed-out waits counted instead of trapping.
 """
 
 from __future__ import annotations
@@ -51,8 +52,11 @@ STEPS = (1, 7, 16, 32)
 # large_m's steps (unbounded, so past small_m): few tokens, then up to the
 # instance's MAX_TOKENS.
 LARGE_STEPS = (5, 33, 48, 64)
-# large_m's residency case: DSV4.1-Flash's expert shape and experts per rank.
-RES_HIDDEN, RES_INTER, RES_EXPERTS_PER_RANK, RES_TOKENS = 5120, 2304, 96, 256
+# large_m's residency case: DSV4.1-Flash's expert shape and experts per rank,
+# and (tokens per rank, receive bound per rank or None) of its steps: one per
+# large_m kernel (LM_TILES' first row runs steps bounded to 512 tokens/rank).
+RES_HIDDEN, RES_INTER, RES_EXPERTS_PER_RANK, RES_TOKENS = 5120, 2304, 96, 1024
+RES_STEPS = ((RES_TOKENS, None), (512, 512))
 
 
 def _skip_reason() -> str | None:
@@ -358,8 +362,14 @@ def _check_resident(rank, world, comm, device):
     lmk = mega._ep.large_mega
     try:
         assert lmk is not None, "AITER_MEGA_LARGE did not build large_m"
-        for i, t in enumerate((RES_TOKENS, RES_TOKENS // 2)):
+        assert len(lmk.variants) >= len(RES_STEPS), "fewer large_m kernels than steps"
+        for i, (t, per_rank) in enumerate(RES_STEPS):
             tokens = max(1, t - 3 * rank)
+            bound = None if per_rank is None else world * per_rank
+            check(
+                lmk.for_bound(bound) is lmk.variants[-1 - i],
+                f"tokens={tokens} bound={bound}: not on large_m kernel {-1 - i}",
+            )
             ids, wts = B.make_routings(
                 1, tokens, EPR * world, TOPK, device, seed=31 * i + 100 * rank
             )[0]
@@ -367,7 +377,7 @@ def _check_resident(rank, world, comm, device):
             x = torch.randn(tokens, H, generator=gen).to(torch.bfloat16).to(device)
             x = B._rmsnorm(x)
 
-            def layer(on, x=x, ids=ids, wts=wts):
+            def layer(on, x=x, ids=ids, wts=wts, bound=bound):
                 lmk.enabled = on
                 return mega(
                     x,
@@ -377,12 +387,12 @@ def _check_resident(rank, world, comm, device):
                     w2=w2,
                     w1_scale=w1s,
                     w2_scale=w2s,
-                    recv_token_bound=None,
+                    recv_token_bound=bound,
                 ).clone()
 
             large, staged, again = layer(True), layer(False), layer(True)
             torch.cuda.synchronize()
-            what = f"tokens={tokens}"
+            what = f"tokens={tokens} bound={bound}"
             check(sum(lmk.fails()) == 0, f"{what}: timed-out waits {lmk.fails()}")
             check(torch.equal(large, staged), f"{what}: large_m != staged")
             check(torch.equal(large, again), f"{what}: large_m not deterministic")
