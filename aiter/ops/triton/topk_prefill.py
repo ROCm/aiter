@@ -30,6 +30,7 @@ def top_k_per_row_prefill(
     assert indices.dtype == torch.int32 and indices.stride(1) == 1
     assert k & (k - 1) == 0 and k <= _CAP, "k must be a power of two <= 4096"
     rows, width = logits.shape
+    assert width < 1 << 18, "rows longer than 2**18 - 1 entries are not supported"
     if rows == 0:
         return indices
     lanes = triton.next_power_of_2(max(1, triton.cdiv(width, _VPT)))
@@ -40,6 +41,7 @@ def top_k_per_row_prefill(
         logits.stride(0), logits.stride(1), indices.stride(0),
         K=k, VPT=_VPT, NUM_CHUNKS=triton.cdiv(width, block), CAP=_CAP,
         BUF=triton.next_power_of_2(2 * k + _CAP), SAMPLE_MIN=4 * block,
-        SAMPLE_BLOCKS=_SAMPLE_BLOCKS, HI_NUM=_HI_NUM, LO_NUM=_LO_NUM, num_warps=num_warps,
+        CONTIG=logits.stride(1) == 1, SAMPLE_BLOCKS=_SAMPLE_BLOCKS, HI_NUM=_HI_NUM,
+        LO_NUM=_LO_NUM, num_warps=num_warps,
     )
     return indices

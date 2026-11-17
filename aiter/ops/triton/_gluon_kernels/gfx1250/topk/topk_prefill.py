@@ -23,6 +23,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 _MAXKEY = gl.constexpr(0xFFFFFFFF)
+_IDX_MASK = gl.constexpr((1 << 18) - 1)  # list entries: (bin - lo) << 18 | index
 
 
 @gluon.jit
@@ -39,33 +40,34 @@ def _to_key(x):
 
 
 @gluon.jit
-def _load_keys(row_ptr, ks, L, base, pos, stride1):
+def _load_keys(row_ptr, ks, L, base, pos, stride1, CONTIG: gl.constexpr = False):
+    """Keys of row entries base + pos (and the valid mask). Contiguous rows load each lane's
+    4-key groups as 16-byte vectors; full tiles skip the mask so the loads stay vectorized."""
     idx = base + pos
     valid = idx < L
-    x = gl.load(row_ptr + (ks + idx).to(gl.int64) * stride1, mask=valid, other=0.0)
+    if CONTIG:
+        # ks is not known to be a multiple of 4; gfx1250 global loads tolerate the
+        # resulting 4-byte-aligned 16-byte access.
+        ptr = row_ptr + gl.multiple_of(ks, 4)
+        off = gl.max_contiguous(gl.multiple_of(idx, [1, 4]), [1, 4])
+        if base + pos.numel <= L:
+            x = gl.load(ptr + off)
+        else:
+            x = gl.load(ptr + off, mask=valid, other=0.0)
+    else:
+        x = gl.load(row_ptr + (ks + idx).to(gl.int64) * stride1, mask=valid, other=0.0)
     return gl.where(valid, _to_key(x), 0), valid
 
 
 @gluon.jit
 def _tile(key_reg, row_ptr, ks, L, ch, pos, stride1, BLOCK: gl.constexpr,
-          ONE_TILE: gl.constexpr):
+          ONE_TILE: gl.constexpr, CONTIG: gl.constexpr):
     """Keys and valid mask of tile `ch`: kept in registers for a one-tile row, otherwise
     re-read (from cache) -- holding long rows in LDS measured slower (fewer rows per CU)."""
     if ONE_TILE:
         return key_reg, pos < L
     else:
-        return _load_keys(row_ptr, ks, L, ch * BLOCK, pos, stride1)
-
-
-@gluon.jit
-def _pass1_tile(hist, key_reg, row_ptr, ks, L, ch, pos, first, stride1, BLOCK: gl.constexpr,
-                ONE_TILE: gl.constexpr):
-    key, valid = _load_keys(row_ptr, ks, L, ch * BLOCK, pos, stride1)
-    _hist_add(hist, key, valid, first, 20, 4096)
-    if ONE_TILE:
-        return key
-    else:
-        return key_reg
+        return _load_keys(row_ptr, ks, L, ch * BLOCK, pos, stride1, CONTIG)
 
 
 @gluon.jit
@@ -136,9 +138,10 @@ def _select_out(out_row, key, idx, sel, t, n_gt, need, base_slot, gt_base, eq_ba
 
 
 @gluon.jit
-def _classify(key_reg, buf, row_ptr, ks, L, pos, stride1, lo, hi,
+def _classify(key_reg, buf, row_ptr, ks, L, pos, stride1, lo, hi, nkey, nvalid,
               K: gl.constexpr, CAP: gl.constexpr, BUF: gl.constexpr, BLOCK: gl.constexpr,
-              NUM_CHUNKS: gl.constexpr, ONE_TILE: gl.constexpr, L2D: gl.constexpr,
+              NUM_CHUNKS: gl.constexpr, ONE_TILE: gl.constexpr, CONTIG: gl.constexpr,
+              L2D: gl.constexpr,
               LANES: gl.constexpr):
     """One pass over the row: keys whose top-12-bit bin is above `hi` are winners (indices to
     buf[0, K)); bins in [lo, hi] are the bracket (its first CAP entries, in rank order, to
@@ -148,8 +151,16 @@ def _classify(key_reg, buf, row_ptr, ks, L, pos, stride1, lo, hi,
     nwin = gl.zeros([pos.shape[0]], gl.int32, gl.SliceLayout(1, L2D))
     ncand = gl.zeros([pos.shape[0]], gl.int32, gl.SliceLayout(1, L2D))
     base = 0 * L
+    # Software prefetch: tile ch + 1 is in flight while tile ch is classified (one past the
+    # last tile is fully masked, so it reads nothing).
+    if ONE_TILE:
+        nkey = key_reg
+        nvalid = pos < L
     for ch in range(NUM_CHUNKS):
-        key, valid = _tile(key_reg, row_ptr, ks, L, ch, pos, stride1, BLOCK, ONE_TILE)
+        key = nkey
+        valid = nvalid
+        if not ONE_TILE:
+            nkey, nvalid = _load_keys(row_ptr, ks, L, (ch + 1) * BLOCK, pos, stride1, CONTIG)
         d = key >> 20
         win = valid & (d > hi)
         cand = valid & (d >= lo) & (d <= hi)
@@ -163,7 +174,10 @@ def _classify(key_reg, buf, row_ptr, ks, L, pos, stride1, lo, hi,
         dst = gl.where(win & (wslot < K), wslot,
                        gl.where(cand & (crank < CAP), K + crank,
                                 K + CAP + (idx & (BUF - K - CAP - 1))))
-        buf.scatter(gl.reshape(idx, [BLOCK]), gl.reshape(dst, [BLOCK]), 0)
+        # Bracket entries carry their bin (relative to lo) above the index, so the list's first
+        # radix pass needs no keys: (bin - lo) << 18 | index.
+        val = gl.where(cand, ((d - lo).to(gl.int32) << 18) | idx, idx)
+        buf.scatter(gl.reshape(val, [BLOCK]), gl.reshape(dst, [BLOCK]), 0)
         kmin = gl.minimum(kmin, gl.min(gl.where(cand, key, _MAXKEY), axis=1))
         kmax = gl.maximum(kmax, gl.max(gl.where(cand, key, 0), axis=1))
         nwin = nwin + gl.sum(win.to(gl.int32), axis=1)
@@ -177,7 +191,7 @@ def _classify(key_reg, buf, row_ptr, ks, L, pos, stride1, lo, hi,
 def _topk_prefill_kernel(
     logits_ptr, ks_ptr, ke_ptr, out_ptr, stride0, stride1, out_stride0,
     K: gl.constexpr, VPT: gl.constexpr, NUM_CHUNKS: gl.constexpr, CAP: gl.constexpr,
-    BUF: gl.constexpr, SAMPLE_MIN: gl.constexpr,
+    BUF: gl.constexpr, SAMPLE_MIN: gl.constexpr, CONTIG: gl.constexpr,
     SAMPLE_BLOCKS: gl.constexpr, HI_NUM: gl.constexpr, LO_NUM: gl.constexpr,
     num_warps: gl.constexpr,
 ):
@@ -225,6 +239,7 @@ def _topk_prefill_kernel(
         #    exact 12-bit histogram of the whole row, bracket [b1, b1].
         key_reg = gl.zeros([ROWS, VPT], gl.uint32, L2D)
         b1x = (0 * L).to(gl.uint32)
+        blo = (0 * L).to(gl.uint32)
         above = 0 * L
         inbin = 0 * L
         tied = L < 0
@@ -232,6 +247,8 @@ def _topk_prefill_kernel(
         if L > SAMPLE_MIN:
             sidx = (L // SAMPLE_BLOCKS) * (pos // (BLOCK // SAMPLE_BLOCKS)) + \
                 pos % (BLOCK // SAMPLE_BLOCKS)
+            # Tile 0 of the classify pass is loaded under the sample stage.
+            t0key, t0valid = _load_keys(row_ptr, ks, L, 0, pos, stride1, CONTIG)
             skey, _ = _load_keys(row_ptr, ks, L, 0, sidx, stride1)
             _hist_add(hist_s, skey, sidx >= 0, first, 20, 4096)
             gl.barrier()
@@ -243,22 +260,33 @@ def _topk_prefill_kernel(
             gl.barrier()  # every warp has read the sample histogram
             hist_s.store(gl.zeros([4096], gl.int32, H1))
             gl.barrier()
+            blo = lo.to(gl.uint32)
             above, inbin, tied = _classify(key_reg, buf, row_ptr, ks, L, pos, stride1,
-                                           lo.to(gl.uint32), hi.to(gl.uint32), K, CAP, BUF, BLOCK,
-                                           NUM_CHUNKS, ONE_TILE, L2D, LANES)
+                                           lo.to(gl.uint32), hi.to(gl.uint32), t0key, t0valid,
+                                           K, CAP, BUF, BLOCK,
+                                           NUM_CHUNKS, ONE_TILE, CONTIG, L2D, LANES)
             ok = (above < K) & (above + inbin >= K) & ((inbin <= CAP) | tied)
         if ok == 0:
+            nkey, nvalid = _load_keys(row_ptr, ks, L, 0, pos, stride1, CONTIG)
             for ch in range(NUM_CHUNKS):
-                key_reg = _pass1_tile(hist_s, key_reg, row_ptr, ks, L, ch, pos, first, stride1,
-                                      BLOCK, ONE_TILE)
+                key = nkey
+                valid = nvalid
+                nkey, nvalid = _load_keys(row_ptr, ks, L, (ch + 1) * BLOCK, pos, stride1, CONTIG)
+                _hist_add(hist_s, key, valid, first, 20, 4096)
+                if ONE_TILE:
+                    key_reg = key
             gl.barrier()
             b1, _, _ = _pick_bin(hist_s, K, 4096, H1)
             b1u = b1.to(gl.uint32)
             b1x = b1u
+            blo = b1u
             gl.barrier()  # every warp has read hist_s; clear it for the list pass
             hist_s.store(gl.zeros([4096], gl.int32, H1))
+            t0key, t0valid = _load_keys(row_ptr, ks, L, 0, pos, stride1, CONTIG)
             above, inbin, tied = _classify(key_reg, buf, row_ptr, ks, L, pos, stride1, b1u, b1u,
-                                           K, CAP, BUF, BLOCK, NUM_CHUNKS, ONE_TILE, L2D, LANES)
+                                           t0key, t0valid,
+                                           K, CAP, BUF, BLOCK, NUM_CHUNKS, ONE_TILE, CONTIG, L2D,
+                                           LANES)
         need = K - above
 
         # 2. Slots [0, above) are the winners. The list holds the first min(inbin, CAP)
@@ -268,7 +296,7 @@ def _topk_prefill_kernel(
         copy_fill = (inbin == need) | tied
         j = gl.arange(0, K, layout=OL)
         src = gl.where(j < above, j, K + j - above)
-        gl.store(out_row + j, buf.gather(src, 0), mask=(j < above) | copy_fill)
+        gl.store(out_row + j, buf.gather(src, 0) & _IDX_MASK, mask=(j < above) | copy_fill)
         if copy_fill == 0:
             if inbin <= CAP:
                 # 3. Exact threshold among the list (12 + 10 + 10 bits), then its winners.
@@ -277,18 +305,24 @@ def _topk_prefill_kernel(
                 lpos = lr[:, None] * (CAP // ROWS) + lc[None, :]
                 lflat = gl.reshape(lpos, [CAP])
                 lsel = lpos < inbin
-                lidx = gl.where(lsel, gl.reshape(buf.gather(K + lflat, 0), [ROWS, CAP // ROWS]), 0)
-                lkey, _ = _load_keys(row_ptr, ks, L, 0, lidx, stride1)
+                lval = gl.where(lsel, gl.reshape(buf.gather(K + lflat, 0), [ROWS, CAP // ROWS]), 0)
+                lidx = lval & _IDX_MASK
+                lbin = (lval >> 18).to(gl.uint32) + blo
                 lfirst = (lc == 0)[None, :] & (lpos >= 0)
-                _hist_add(hist_s, lkey, lsel, lfirst, 20, 4096)
+                # 12-bit pass from the stored bins; only bin c1's entries load their keys.
+                _hist_add(hist_s, lbin << 20, lsel, lfirst, 20, 4096)
                 gl.barrier()
                 c1, a1, _ = _pick_bin(hist_s, need, 4096, H1)
                 p1 = c1.to(gl.uint32)
-                _hist_add(hist2, lkey, lsel & ((lkey >> 20) == p1), lfirst, 10, 1024)
+                in1 = lsel & (lbin == p1)
+                k1, _ = _load_keys(row_ptr, ks, L, 0, gl.where(in1, lidx, 0), stride1)
+                # Bins above c1 are winners (key > t), below are out (key < t).
+                lkey = gl.where(in1, k1, gl.where(lsel & (lbin > p1), _MAXKEY, 0))
+                _hist_add(hist2, lkey, in1, lfirst, 10, 1024)
                 gl.barrier()
                 b2, a2, _ = _pick_bin(hist2, need - a1, 1024, H2)
                 p2 = (p1 << 10) | b2.to(gl.uint32)
-                _hist_add(hist3, lkey, lsel & ((lkey >> 10) == p2), lfirst, 0, 1024)
+                _hist_add(hist3, lkey, in1 & ((lkey >> 10) == p2), lfirst, 0, 1024)
                 gl.barrier()
                 b3, a3, _ = _pick_bin(hist3, need - a1 - a2, 1024, H2)
                 t = (p2 << 10) | b3.to(gl.uint32)
@@ -299,14 +333,14 @@ def _topk_prefill_kernel(
                 b1u = b1x
                 for ch in range(NUM_CHUNKS):
                     key, valid = _tile(key_reg, row_ptr, ks, L, ch, pos, stride1, BLOCK,
-                                       ONE_TILE)
+                                       ONE_TILE, CONTIG)
                     _hist_add(hist2, key, valid & ((key >> 20) == b1u), first, 10, 1024)
                 gl.barrier()
                 b2, a2, _ = _pick_bin(hist2, need, 1024, H2)
                 p2 = (b1u << 10) | b2.to(gl.uint32)
                 for ch in range(NUM_CHUNKS):
                     key, valid = _tile(key_reg, row_ptr, ks, L, ch, pos, stride1, BLOCK,
-                                       ONE_TILE)
+                                       ONE_TILE, CONTIG)
                     _hist_add(hist3, key, valid & ((key >> 10) == p2), first, 0, 1024)
                 gl.barrier()
                 b3, a3, _ = _pick_bin(hist3, need - a2, 1024, H2)
@@ -315,7 +349,7 @@ def _topk_prefill_kernel(
                 eq_base = 0 * L
                 for ch in range(NUM_CHUNKS):
                     key, valid = _tile(key_reg, row_ptr, ks, L, ch, pos, stride1, BLOCK,
-                                       ONE_TILE)
+                                       ONE_TILE, CONTIG)
                     gt_base, eq_base = _select_out(out_row, key, ch * BLOCK + pos,
                                                    valid & ((key >> 20) == b1u), t, a2 + a3,
                                                    need - a2 - a3, above, gt_base, eq_base,
