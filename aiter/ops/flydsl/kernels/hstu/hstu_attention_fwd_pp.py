@@ -42,7 +42,6 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
@@ -1249,18 +1248,14 @@ def build_hstu_attention_fwd_pp(
                         rocdl.sched_barrier(0)
                         _side_pieces[j]()
                         if const_expr(j == len(_side_pieces) - 1):
-                            rows = _side_st["rows"]
-                            # Pin the result here; machine sinking would move
-                            # it into phase V next to its first use. Inline
-                            # asm: no value-pin API in FlyDSL 0.5.0.
-                            llvm.inline_asm(
-                                res=None,
-                                operands_=[x.ir_value() for x in rows],
-                                asm_string="",
-                                constraints=",".join("s" for _ in rows),
-                                has_side_effects=True,
-                            )
-                            _side_res[0] = rows
+                            # Pin the rows here: without a use in phase M,
+                            # machine sinking moves the pieces into phase V
+                            # next to `bias_init`. readfirstlane is that use;
+                            # it folds away on an SGPR value, so the ISA is
+                            # that of an empty inline-asm pin. No value-pin API
+                            # in FlyDSL 0.5.0; `disable-machine-sink` instead
+                            # grows the d=128 spills.
+                            _side_res[0] = [_sgpr32(x) for x in _side_st["rows"]]
                         rocdl.sched_barrier(0)
                 if const_expr(tail_store is None or m < _first):
                     return
