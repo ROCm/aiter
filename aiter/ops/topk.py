@@ -35,6 +35,9 @@ _VALID_SCORE_FUNCS = {"sqrtsoftplus", "sigmoid", "softmax"}
 _GFX1250_SIGMOID_EXPERTS = {512, 768, 896, 900, 1024}
 # Top-K and the Top-(K+1) candidates HERD routing hands to fused_moe(herd_topk=K).
 _GFX1250_SIGMOID_TOPKS = {4, 5, 8, 9, 16, 17}
+# The same sizes in order, for _as_static.
+_GFX1250_SIGMOID_EXPERTS_SORTED = tuple(sorted(_GFX1250_SIGMOID_EXPERTS))
+_GFX1250_SIGMOID_TOPKS_SORTED = tuple(sorted(_GFX1250_SIGMOID_TOPKS))
 
 
 def _can_use_gfx1250_exact_sigmoid_topk(
@@ -147,17 +150,17 @@ def _gfx1250_reg_mw_fits(
     topk_ids: torch.Tensor,
 ) -> bool:
     """Whether a call that passed _can_use_gfx1250_exact_sigmoid_topk runs on the
-    multi-wave kernel of biased_grouped_topk_hip, which beats the Triton one.
+    multi-wave kernel of biased_grouped_topk_hip instead of the Triton one.
 
     The shape and dtype terms come from topk_reg_mw_supports, the same test the
-    HIP entry applies; the pitch term below is the rest of it. The kernel's
-    loads take any pointer alignment, so the test reads no data_ptr(), and a
-    call traced by torch.compile picks the same kernel as an eager call of the
-    same tensors."""
+    HIP entry applies; the two terms below, the pitch and the equal output
+    strides, are the rest of it. The kernel's loads take any pointer
+    alignment, so the test reads no data_ptr(), and a call traced by
+    torch.compile picks the same kernel as an eager call of the same tensors."""
     return (
         _reg_mw_supports_const(
-            _as_static(gating_output.shape[1], sorted(_GFX1250_SIGMOID_EXPERTS)),
-            _as_static(topk_ids.shape[1], sorted(_GFX1250_SIGMOID_TOPKS)),
+            _as_static(gating_output.shape[1], _GFX1250_SIGMOID_EXPERTS_SORTED),
+            _as_static(topk_ids.shape[1], _GFX1250_SIGMOID_TOPKS_SORTED),
             gating_output.dtype,
             correction_bias.dtype,
             gating_output.device.index,

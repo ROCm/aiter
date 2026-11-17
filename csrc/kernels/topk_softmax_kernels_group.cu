@@ -1155,7 +1155,7 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
 }
 
 // Multi-wave register top-k on wave32 (gfx1250), biased sigmoid scores only.
-// Aimed at decode; it also beats topk_reg_kernel at 8192 tokens (E = 512, 1024).
+// Aimed at decode, but it runs for every row count.
 //
 // topk_reg_kernel runs a row per wave: at decode that is a few dozen waves on
 // a 256-CU part, each walking E / 32 experts per lane through long serial
@@ -1238,45 +1238,32 @@ __device__ __forceinline__ uint32_t wave32_sort_desc_u32(uint32_t v, int lane)
     return v;
 }
 
-// warp_rank_desc over all 32 lanes from lane rotations, without the scalar
-// round trip of a readlane per lane: row_ror covers the other lanes of a
-// 16-lane row, and the same rotations of the row-swapped key the other row.
-__device__ __forceinline__ int wave32_rank_desc_dpp(uint64_t key)
+// warp_rank_desc over all 32 * kSlots keys of a wave32, slot s of lane l
+// holding key l + 32 * s, from lane rotations, without the scalar round trip
+// of a readlane per lane: row_ror covers the other lanes of a 16-lane row, and
+// the same rotations of the row-swapped key the other row. Every rotation of
+// every slot meets all of the lane's keys; the unrotated slots count too, as a
+// key never outranks itself.
+template <int kSlots>
+__device__ __forceinline__ void wave32_rank_desc_dpp(const uint64_t (&key)[kSlots],
+                                                     int (&rank)[kSlots])
 {
-    const uint32_t hi = uint32_t(key >> 32), lo = uint32_t(key);
-    const uint32_t xhi = warp_permlanex16(hi), xlo = warp_permlanex16(lo);
-    int rank   = 0;
+#pragma unroll
+    for(int t = 0; t < kSlots; ++t)
+        rank[t] = 0;
     auto count = [&](uint32_t o_hi, uint32_t o_lo) {
-        rank += ((uint64_t(o_hi) << 32) | o_lo) > key ? 1 : 0;
-    };
-    count(xhi, xlo);
-    opus::static_for<15>([&](auto d) {
-        constexpr int kRowRor = 0x121 + decltype(d)::value; // row_ror:d+1
-        count(aiter_dpp::move_dpp<uint32_t, kRowRor>(hi),
-              aiter_dpp::move_dpp<uint32_t, kRowRor>(lo));
-        count(aiter_dpp::move_dpp<uint32_t, kRowRor>(xhi),
-              aiter_dpp::move_dpp<uint32_t, kRowRor>(xlo));
-    });
-    return rank;
-}
-
-// wave32_rank_desc_dpp for two keys per lane, slot s of lane l being key
-// l + 32 * s: every rotation of either slot meets both of the lane's keys. The
-// unrotated other slot counts too; a key never outranks itself.
-__device__ __forceinline__ void wave32_rank_desc_dpp2(const uint64_t (&key)[2], int (&rank)[2])
-{
-    rank[0] = rank[1] = 0;
-    auto count        = [&](uint32_t o_hi, uint32_t o_lo) {
         const uint64_t o = (uint64_t(o_hi) << 32) | o_lo;
-        rank[0] += o > key[0] ? 1 : 0;
-        rank[1] += o > key[1] ? 1 : 0;
+#pragma unroll
+        for(int t = 0; t < kSlots; ++t)
+            rank[t] += o > key[t] ? 1 : 0;
     };
 #pragma unroll
-    for(int s = 0; s < 2; ++s)
+    for(int s = 0; s < kSlots; ++s)
     {
         const uint32_t hi = uint32_t(key[s] >> 32), lo = uint32_t(key[s]);
         const uint32_t xhi = warp_permlanex16(hi), xlo = warp_permlanex16(lo);
-        count(hi, lo);
+        if constexpr(kSlots > 1)
+            count(hi, lo);
         count(xhi, xlo);
         opus::static_for<15>([&](auto d) {
             constexpr int kRowRor = 0x121 + decltype(d)::value; // row_ror:d+1
@@ -1404,9 +1391,9 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
     // Slots are lane-major: a lane's candidates follow those of the lanes
     // below it, counted by mbcnt. Counts, slots and stores all stay on the
     // VALU with the full exec mask; on gfx1250 a scalar op that consumes a
-    // fresh compare stalls ~25 cycles, and a conditional store pays that
-    // for its exec mask. Every lane joins the atomic so its address is
-    // divergent and the atomic optimizer leaves it alone.
+    // fresh compare stalls, and a conditional store pays that for its exec
+    // mask. Every lane joins the atomic so its address is divergent and the
+    // atomic optimizer leaves it alone.
     bool hit[4];
     int below = 0;
     int mine  = 0;
@@ -1454,10 +1441,12 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
     {
         // Live keys are unique, so ranks 0..n_cand-1 go to distinct lanes;
         // dead lanes all rank n_cand, a lane past topk.
-        const uint64_t k64 = (uint64_t(c0.x) << 32) | c0.y;
-        const int dst      = wave32_rank_desc_dpp(k64) * 4;
-        w                  = __builtin_bit_cast(float, __builtin_amdgcn_ds_permute(dst, int(c0.z)));
-        id                 = __builtin_amdgcn_ds_permute(dst, int(c0.y & 0xffffu));
+        const uint64_t k64[1] = {(uint64_t(c0.x) << 32) | c0.y};
+        int rank[1];
+        wave32_rank_desc_dpp(k64, rank);
+        const int dst = rank[0] * 4;
+        w             = __builtin_bit_cast(float, __builtin_amdgcn_ds_permute(dst, int(c0.z)));
+        id            = __builtin_amdgcn_ds_permute(dst, int(c0.y & 0xffffu));
     }
     else if(fast && n_cand <= kTopKRegCandCap)
     {
@@ -1472,7 +1461,7 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
         auto rank_and_push = [&] {
             const uint64_t k64[2] = {(uint64_t(c0.x) << 32) | c0.y, (uint64_t(c1.x) << 32) | c1.y};
             int rank[2];
-            wave32_rank_desc_dpp2(k64, rank);
+            wave32_rank_desc_dpp(k64, rank);
             const int d0 = umin32(rank[0], W - 1) * 4, d1 = umin32(rank[1], W - 1) * 4;
             w   = __builtin_bit_cast(float,
                                    __builtin_amdgcn_ds_permute(d0, int(c0.z)) |
@@ -1489,8 +1478,8 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
         // keyed as the candidate records are. Every pick is a branch-free wave
         // arg-max, the score words first and then the tie words of the scores
         // that reach their maximum: v_max_u64 issues at 1/32 rate on gfx1250,
-        // and topk_reg_kernel's scan through topk_candidate_better takes
-        // ~40 us for a row of ties.
+        // and topk_reg_kernel's scan through topk_candidate_better is slow
+        // for a row of ties.
         uint32_t fhi[kWaves * 4]; // score key, 0 once taken or for -inf / NaN
         uint32_t flo[kWaves * 4]; // ~tie rank << 16 | id
 #pragma unroll
@@ -1548,8 +1537,8 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
         // host's topk bound so the readlanes issue ahead of the adds; past
         // topk the sum adds +0, which leaves a non-negative total as is.
         // The per-lane +0 seed (w is a finite sigmoid or 0) keeps the adds on
-        // the VALU: a scalar add of a readlane result stalls ~29 cycles a
-        // step on gfx1250, a vector add ~6.
+        // the VALU: a scalar add of a readlane result stalls far longer a
+        // step on gfx1250 than a vector add.
         const int wm = __builtin_bit_cast(int, lane < topk ? w : 0.0f);
         float total  = w * 0.0f;
 #pragma unroll
@@ -2364,7 +2353,7 @@ biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [nu
 static bool topk_reg_w32_arch_ok()
 {
     const std::string_view gfx = get_device_gfx();
-    return gfx == "gfx1250";
+    return gfx == "gfx1250" || gfx == "gfx1250-strict";
 }
 
 // Shape and dtype contract of topk_reg_mw_kernel, for the current device. The
@@ -2376,7 +2365,7 @@ topk_reg_mw_args_ok(int64_t num_experts, int64_t topk, int64_t gating_dtype, int
     return num_experts == 128 * waves && (waves == 4 || waves == 6 || waves == 7 || waves == 8) &&
            topk >= 1 && topk <= aiter::kTopKRegMwMaxTopK && gating_dtype == AITER_DTYPE_bf16 &&
            (bias_dtype == AITER_DTYPE_bf16 || bias_dtype == AITER_DTYPE_fp32) &&
-           topk_reg_w32_arch_ok();
+           get_warp_size_func() == 32 && topk_reg_w32_arch_ok();
 }
 
 bool topk_reg_mw_supports(
@@ -2767,7 +2756,8 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
         case 4: launch_bias(opus::number<4>{}); break;
         case 6: launch_bias(opus::number<6>{}); break;
         case 7: launch_bias(opus::number<7>{}); break;
-        default: launch_bias(opus::number<8>{}); break;
+        case 8: launch_bias(opus::number<8>{}); break;
+        default: AITER_CHECK(false, "topk_reg_mw_kernel: unsupported waves ", mw_waves); break;
         }
         return;
     }

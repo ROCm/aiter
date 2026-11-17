@@ -1068,7 +1068,10 @@ def main():
 
     # -- gfx1250 caller-owned biased sigmoid: Triton versus HIP -------------
     # The Triton kernel keeps the wave32 tie order, which wave64 HIP does not.
-    if "biased-sigmoid" in sections and get_gfx_runtime() != "gfx1250":
+    if "biased-sigmoid" in sections and get_gfx_runtime() not in (
+        "gfx1250",
+        "gfx1250-strict",
+    ):
         aiter.logger.warning("biased-sigmoid needs gfx1250; skipping")
     elif "biased-sigmoid" in sections:
         biased_configs = list(
