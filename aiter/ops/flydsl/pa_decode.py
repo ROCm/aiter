@@ -522,7 +522,7 @@ def pa_decode(
     (``cluster_seqs == 1``). Every other plan writes the BF16/FP16 output and
     then runs the standalone per-token quant, with identical bytes: several KV
     heads, the last-arriver direct merge, clusters shared by several sequences
-    (more than 15 sequences per 16 CUs), the reducer (sinks included) and the
+    (more than 15 sequence-KV-head pairs per 16 CUs), the reducer (sinks included) and the
     query-split BF16 D1024/G16/MTP4 page128 tile. Calls that omit both tensors
     retain the existing output and dispatch unchanged.
     With the quantized output, ``store_output=False`` skips the BF16/FP16
