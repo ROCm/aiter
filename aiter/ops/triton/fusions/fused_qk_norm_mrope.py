@@ -37,6 +37,18 @@ _K4V8_CONFIG = None  # tests / sweeps: a fixed launch config instead of the sele
 # it is off by default; it is tested bit-exact either way.
 _K4V4PT_PAGE_MIN_TOKENS = 2048
 _K4V4PT_V_TDM = False
+# From this many Q heads the row kernel runs every A8K4V8 call: with 16 Q / 2 K heads (Qwen3.6-35B-A3B on
+# MI455X, instruction prefetch on) it beats the k4v8 kernel at every size measured, 4096 tokens 48 -> 25 us,
+# 8192 91 -> 47, 16384 177 -> 95 (the k4v8 kernel's 78 KB of code does not fit the instruction cache).
+# Fewer heads keep _K4V8_PAGE_MIN_TOKENS.
+_K4V8_ROWS_MIN_Q_HEADS = 16
+
+
+def _k4v8_min_tokens(q_heads: int) -> int:
+    """Tokens from which the k4v8 kernel runs the call (0: never)."""
+    if _K4V8_ROWS_MIN_Q_HEADS and q_heads >= _K4V8_ROWS_MIN_Q_HEADS:
+        return 0
+    return _K4V8_PAGE_MIN_TOKENS
 
 
 def _k4v8_config(num_tokens: int, q_heads: int) -> dict:
@@ -80,15 +92,19 @@ def _launch(
     kv_scale=None,
     v_store=True,
     v_fp4pt=False,
+    num_tokens=None,
 ):
     assert arch_info.get_arch() == "gfx1250"
-    num_tokens = q.shape[0]
+    rows = q.shape[0]
+    # Only the first num_tokens rows are computed (the rest are a graph bucket's pad rows); the outputs
+    # keep all the rows, the pad ones unwritten.
+    num_tokens = rows if num_tokens is None else max(0, min(int(num_tokens), rows))
     q_heads = q.shape[1] // HEAD_DIM.value
     k_heads = k.shape[1] // HEAD_DIM.value
     assert q.shape[1] == q_heads * HEAD_DIM.value
-    assert k.shape == (num_tokens, k_heads * HEAD_DIM.value)
+    assert k.shape == (rows, k_heads * HEAD_DIM.value)
     assert q.stride(1) == 1 and k.stride(1) == 1
-    assert positions.shape == (3, num_tokens) and positions.stride(1) == 1
+    assert positions.shape == (3, rows) and positions.stride(1) == 1
     assert cos.shape[1] == ROPE_HALF.value and cos.stride(1) == 1
     assert sin.stride() == cos.stride()
     num_rows = num_tokens * (q_heads + k_heads)
@@ -105,11 +121,13 @@ def _launch(
         assert k_nvfp4 and not v_store and fp8
         cache_dtype = e4m3_dtype
     q_out = torch.empty(
-        (num_tokens, q.shape[1]),
+        (rows, q.shape[1]),
         dtype=cache_dtype if fp8 else q.dtype,
         device=q.device,
     )
-    k_out = torch.empty((num_tokens, k.shape[1]), dtype=k.dtype, device=k.device)
+    k_out = torch.empty((rows, k.shape[1]), dtype=k.dtype, device=k.device)
+    if num_tokens == 0:
+        return q_out, k_out
     # Only the row kernel writes an fp8 cache (and so an A8K4V8 one, which is always fp8).
     tdm = config["TDM"] and not fp8
     _LOGGER.info(
@@ -122,7 +140,7 @@ def _launch(
         fp8,
     )
 
-    min_tokens = _K4V4PT_PAGE_MIN_TOKENS if v_fp4pt else _K4V8_PAGE_MIN_TOKENS
+    min_tokens = _K4V4PT_PAGE_MIN_TOKENS if v_fp4pt else _k4v8_min_tokens(q_heads)
     if k_nvfp4 and 0 < min_tokens <= num_tokens:
         page_block = k_cache.shape[2]
         cfg = _k4v8_config(num_tokens, q_heads)
@@ -173,7 +191,15 @@ def _launch(
             num_warps=cfg["num_warps"],
         )
         return q_out, k_out
-    num_warps = config["num_warps"]
+    # ROW_NUM_WARPS: the row kernel's waves a program where the config's num_warps sizes the TDM kernel
+    num_warps = (
+        config["num_warps"] if tdm else config.get("ROW_NUM_WARPS", config["num_warps"])
+    )
+    if cache and slot_mapping.shape[0] == 0:
+        # the row kernel reads slot_mapping[min(token, num_slots - 1)]: one pad slot, no token past it
+        slot_mapping = torch.full(
+            (1,), -1, dtype=slot_mapping.dtype, device=slot_mapping.device
+        )
     args = (q, k, q_weight, k_weight, positions, cos, sin, q_out, k_out)
     strides = (q.stride(0), k.stride(0), positions.stride(0), cos.stride(0))
     cache_args = (v, slot_mapping, v.stride(0), slot_mapping.shape[0], k_cache, v_cache)
@@ -185,8 +211,10 @@ def _launch(
         kernel, num = fused_qk_norm_mrope_tdm_gfx1250, num_tokens
         block_m = max(1, num_warps // k_heads)
     else:
-        # One row per wave. The rows of token t are its Q heads, then its K heads.
-        kernel, num, block_m = fused_qk_norm_mrope_gfx1250, num_rows, num_warps
+        # ROWS_PER_WAVE rows a wave (the layouts repeat over the block): the rows' loads are in flight
+        # together. The rows of token t are its Q heads, then its K heads.
+        kernel, num = fused_qk_norm_mrope_gfx1250, num_rows
+        block_m = num_warps * config.get("ROWS_PER_WAVE", 1)
         cache_args += (1.0 / kv_scale if fp8 else 1.0,)
         fp8_kwargs = {
             "FP8": fp8,
@@ -287,6 +315,7 @@ def fused_qk_norm_mrope_cache(
     v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     kv_scale: float | None = None,
+    num_tokens: int | None = None,
 ):
     """``fused_qk_norm_mrope``, and the K and V rows into the paged KV cache.
 
@@ -306,6 +335,9 @@ def fused_qk_norm_mrope_cache(
             value / kv_scale clamped to the fp8 range, as ``reshape_and_cache(kv_cache_dtype="fp8")``
             stores them after the caller's clamp, and Q is returned in the cache dtype,
             clamped, without a scale. None for a cache in the dtype of q.
+
+        num_tokens: when given, only the first num_tokens rows are computed and written (q_out / k_out rows
+            past it are left unwritten): a graph bucket's pad rows that no sequence owns.
 
     Returns:
         q_out [T, Hq * 256] (fp8 when kv_scale is given) and k_out [T, Hk * 256] in the
@@ -365,6 +397,7 @@ def fused_qk_norm_mrope_cache(
         slot_mapping,
         True,
         kv_scale,
+        num_tokens=num_tokens,
     )
 
 

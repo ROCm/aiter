@@ -1,10 +1,19 @@
 {
+    "ROWS_LEQ_4608": {
+        "TDM": false,
+        "num_warps": 1
+    },
+    "ROWS_LEQ_9216": {
+        "TDM": false,
+        "num_warps": 2
+    },
     "ROWS_LEQ_32768": {
         "TDM": false,
-        "num_warps": 4
+        "num_warps": 1
     },
     "any": {
         "TDM": true,
-        "num_warps": 4
+        "num_warps": 4,
+        "ROW_NUM_WARPS": 1
     }
 }

@@ -330,14 +330,15 @@ def test_fused_qk_norm_mrope_cache_k4v8_pages(scenario, block, q_heads, k_heads)
     v_cache0 = torch.randn((num_blocks, k_heads, block // 16, HEAD_DIM, 16), device="cuda").to(fp8)
 
     def run(min_tokens):
-        old = mod._K4V8_PAGE_MIN_TOKENS
-        mod._K4V8_PAGE_MIN_TOKENS = min_tokens
+        old = mod._K4V8_PAGE_MIN_TOKENS, mod._K4V8_ROWS_MIN_Q_HEADS
+        # the page path for every head count (16 Q heads otherwise always take the row kernel)
+        mod._K4V8_PAGE_MIN_TOKENS, mod._K4V8_ROWS_MIN_Q_HEADS = min_tokens, 0
         try:
             inp = dict(inputs, k_cache=k_cache0.clone(), v_cache=v_cache0.clone())
             q_out, k_out = fused_qk_norm_mrope_cache(**inp, kv_scale=kv_scale)
             return q_out, k_out, inp["k_cache"], inp["v_cache"]
         finally:
-            mod._K4V8_PAGE_MIN_TOKENS = old
+            mod._K4V8_PAGE_MIN_TOKENS, mod._K4V8_ROWS_MIN_Q_HEADS = old
 
     q_p, k_p, kc_p, vc_p = run(1)  # the page path on
     q_r, k_r, kc_r, vc_r = run(0)  # rows only
@@ -365,3 +366,45 @@ def test_fused_qk_norm_mrope_cache_k4v8_pages(scenario, block, q_heads, k_heads)
     )
     assert torch.equal(vc_p.view(torch.uint8), vc_ref.view(torch.uint8)), "V cache != reference"
     assert torch.equal(kc_p, kc_ref), "K cache != reference"
+
+
+@pytest.mark.parametrize("num_tokens", [1, 37, 300, 1100])
+@pytest.mark.parametrize("q_heads, k_heads", [(16, 2), (4, 1)])
+@pytest.mark.parametrize("launch", [(1, 4), (2, 2), (4, 2), (4, 4), (8, 1)])
+def test_fused_qk_norm_mrope_cache_k4v8_rows_per_wave(num_tokens, q_heads, k_heads, launch):
+    """The row kernel with several rows a wave (config ROWS_PER_WAVE) and other wave counts writes the same
+    bytes (Q, K out, NVFP4 K cache, fp8 V cache) as the default launch."""
+    import aiter
+    import aiter.ops.triton.fusions.fused_qk_norm_mrope as mod
+
+    fp8 = aiter.dtypes.fp8
+    block = 128
+    inputs = make_inputs(num_tokens, q_heads, k_heads)
+    num_blocks = num_tokens // block + 4
+    inputs["v"] = torch.randn(
+        (num_tokens, 2 * k_heads * HEAD_DIM), dtype=torch.bfloat16, device="cuda"
+    )[:, : k_heads * HEAD_DIM]
+    slots = torch.randperm(num_blocks * block, device="cuda")[:num_tokens]
+    slots[2::7] = -1
+    inputs["slot_mapping"] = slots[: max(1, num_tokens - 2)] if num_tokens > 3 else slots
+    k_row = HEAD_DIM // 2 + HEAD_DIM // 16
+    torch.manual_seed(5)
+    k_cache0 = torch.randint(0, 256, (num_blocks, k_heads, block, k_row), dtype=torch.uint8, device="cuda")
+    v_cache0 = torch.randn((num_blocks, k_heads, block // 16, HEAD_DIM, 16), device="cuda").to(fp8)
+
+    def run(cfg):
+        orig = mod._get_config
+        if cfg is not None:
+            nw, rpw = cfg
+            mod._get_config = lambda name, rows: dict(
+                orig(name, rows), num_warps=nw, ROW_NUM_WARPS=nw, ROWS_PER_WAVE=rpw, TDM=False
+            )
+        try:
+            inp = dict(inputs, k_cache=k_cache0.clone(), v_cache=v_cache0.clone())
+            q_out, k_out = fused_qk_norm_mrope_cache(**inp, kv_scale=0.5)
+            return q_out.view(torch.uint8), k_out, inp["k_cache"], inp["v_cache"].view(torch.uint8)
+        finally:
+            mod._get_config = orig
+
+    for got, ref in zip(run(launch), run(None)):
+        assert torch.equal(got, ref)

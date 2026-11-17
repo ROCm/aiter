@@ -324,11 +324,16 @@ def fused_qk_norm_mrope_gfx1250(
     if CACHE:
         # The slot and the V row of each K row. Tokens past the slot table are padding.
         # Lane l holds V values l, l + 32, ...: the cache keeps the V values of a token 16 bytes apart.
+        # The slot is wave-uniform (it moves to scalar registers, and that waits for its load and every
+        # load before it): an unmasked load of a clamped index lets the compiler issue it with the cos /
+        # sin loads, after the V loads (a masked one is a branch whose result copy waits right there).
+        # The launcher guarantees num_slots >= 1.
         is_k_r = mask_r & (head_r >= Q_HEADS) & (token_r < num_slots)
-        slot = gl.load(slot_mapping_ptr + token_r, mask=is_k_r, other=-1).to(gl.int64)
         offs_v = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, rope_layout))
         v_row = v_ptr + token_r * stride_v + (head_r - Q_HEADS) * HEAD_DIM
         v = gl.load(v_row[:, None] + offs_v[None, :], mask=is_k_r[:, None], other=0.0)
+        slot_raw = gl.load(slot_mapping_ptr + gl.minimum(token_r, num_slots - 1))
+        slot = gl.where(is_k_r, slot_raw.to(gl.int64), -1)
     w_lo = gl.where(
         is_q_r[:, None],
         gl.load(q_weight_ptr + offs_r)[None, :],
@@ -348,13 +353,10 @@ def fused_qk_norm_mrope_gfx1250(
         pos_h[:, None],
         gl.where(use_w[None, :], pos_w[:, None], pos_t[:, None]),
     )
-    # The mask keeps these loads before the norm: the compiler moves an unmasked load next to its use.
-    cos = gl.load(
-        cos_ptr + pos * stride_cos + offs_r[None, :], mask=mask_r[:, None], other=0.0
-    )
-    sin = gl.load(
-        sin_ptr + pos * stride_cos + offs_r[None, :], mask=mask_r[:, None], other=0.0
-    )
+    # Unmasked (a masked row's positions load as 0, a valid row): a masked load of these wave-uniform rows
+    # becomes a branch whose result copy waits for it, which would put sin a round trip after cos.
+    cos = gl.load(cos_ptr + pos * stride_cos + offs_r[None, :])
+    sin = gl.load(sin_ptr + pos * stride_cos + offs_r[None, :])
 
     # Gemma RMSNorm: x / rms(x) * (1 + w). Columns [64, 256) are done. K keeps the input
     # dtype; so does Q unless it goes out in fp8.
