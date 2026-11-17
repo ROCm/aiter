@@ -35,6 +35,7 @@ from .kernels.qsa.sparse_prefill_common import (
 __all__ = [
     "SELECTION_WIDTHS",
     "flydsl_qsa_sparse_prefill",
+    "flydsl_qsa_sparse_prefill_available",
     "flydsl_qsa_sparse_prefill_supports_selection",
 ]
 
@@ -48,11 +49,17 @@ SELECTION_WIDTHS = tuple(4 * topk + 3 for topk in (256, 512, 768, 1024))
 _MAX_SELECTION_BYTES = 2**31 - 1
 
 
-def flydsl_qsa_sparse_prefill_supports_selection(rows, width):
+def flydsl_qsa_sparse_prefill_available() -> bool:
+    """Whether ``flydsl_qsa_sparse_prefill`` runs on the live GPU (gfx942 only)."""
+    return get_gfx_runtime() == "gfx942"
+
+
+def flydsl_qsa_sparse_prefill_supports_selection(rows: int, width: int) -> bool:
     """Whether ``flydsl_qsa_sparse_prefill`` takes an int32 [rows, width] selection:
     width is one of ``SELECTION_WIDTHS`` and the selection spans fewer than 2**31
-    bytes. Only the selection's shape is answered; Q/K/V, kv_slots, the lengths and
-    the GPU are checked by the call itself.
+    bytes. Only the selection's shape is answered; the GPU is answered by
+    ``flydsl_qsa_sparse_prefill_available`` and Q/K/V, kv_slots and the lengths
+    are checked by the call itself.
     """
     return width in SELECTION_WIDTHS and 0 <= rows * width * 4 <= _MAX_SELECTION_BYTES
 
@@ -345,7 +352,7 @@ def flydsl_qsa_sparse_prefill(
     span = q.numel() if kv_slots is not None else max(q.numel(), tokens * k.stride(0))
     if span * q.element_size() > _MAX_SPAN:
         raise ValueError("Q and each request's K/V require byte spans <= 2**32 - 2**20")
-    if get_gfx_runtime() != "gfx942":
+    if not flydsl_qsa_sparse_prefill_available():
         raise ValueError("QSA sparse attention requires gfx942")
     if (
         indices.ndim != 2
