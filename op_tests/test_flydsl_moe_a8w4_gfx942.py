@@ -264,9 +264,10 @@ def test_stage1_kernel(token, kernel_name, model_dim=1536, inter_dim=512):
     compile time grows with it); like 3584 it leaves k_wave 4 an odd number of K tiles
     per wave (3 vs 7), so the odd-tail path is still covered.
     """
-    E, topk, tile_m = 8, 4, 16
+    E, topk = 8, 4
     p = get_flydsl_kernel_params(kernel_name)
-    assert is_a8w4_gfx942_kernel(p) and p["tile_m"] == tile_m, kernel_name
+    tile_m = p["tile_m"]
+    assert is_a8w4_gfx942_kernel(p), kernel_name
     torch.manual_seed(0)
     x = torch.randn((token, model_dim), dtype=dtypes.bf16)
     # / 8 keeps every output below SiTUv2's saturation at 100 (~1 % of them reach it
@@ -451,10 +452,15 @@ def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("a8w4 gfx942 MoE unsupported on %s; skipping", get_gfx())
         return
-    # Every gfx942, MI300X CI runners included: the kernel's numerics (one kernel per
-    # x_layout, the CSV's M = 1 and M = 16 picks) and the stage-1 dispatch by name.
-    test_stage1_kernel(1, "flydsl_moe1_afp8_wfp4_bf16_t16x32x128_g942_kw4_qi")
-    test_stage1_kernel(16, "flydsl_moe1_afp8_wfp4_bf16_t16x64x128_g942_kw2")
+    # Every gfx942, MI300X CI runners included: kernel numerics covering each
+    # distinct tile family in kimik3_a8w4_tuned_fmoe.csv, and dispatch by name.
+    # _qi (small M, x quantised in-kernel), moe_sort, bnt0, BM=32 and TILE_K=256.
+    test_stage1_kernel(1,  "flydsl_moe1_afp8_wfp4_bf16_t16x32x256_g942_kw2_qi")  # _qi TILE_K=256
+    test_stage1_kernel(16, "flydsl_moe1_afp8_wfp4_bf16_t16x64x128_g942_kw2")     # moe_sort
+    test_stage1_kernel(16, "flydsl_moe1_afp8_wfp4_bf16_t16x128x256_g942")         # TILE_K=256
+    test_stage1_kernel(128, "flydsl_moe1_afp8_wfp4_bf16_t16x128x128_g942_bnt0_kw2")  # bnt0
+    test_stage1_kernel(128, "flydsl_moe1_afp8_wfp4_bf16_t32x128x128_g942")        # BM=32
+    test_stage1_kernel(128, "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_g942_bnt0")   # BM=32 TILE_K=256
     test_stage1_dispatch_by_name()
     if not a8w4_gfx942_supported():
         test_gate_off_mi325x()
