@@ -75,7 +75,7 @@ def _rsrc(addr_i64):
 @functools.lru_cache(maxsize=None)
 def compile_gg6e(N: int, K: int, a_fmt: str, b_fmt: str, epi: str, gather: bool,
                  FM: int = 8, FN: int = 8, WGM: int = 2, WGN: int = 2, NSTAGE: int = 3, ablate: str = "",
-                 GM: int = 0, dev: int = 0):
+                 GM: int = 0, dev: int = 0, HB: int = 1):
     BM_, BN_ = 16 * FM * WGM, 16 * FN * WGN
     NW = WGM * WGN
     NT = 64 * NW
@@ -101,6 +101,7 @@ def compile_gg6e(N: int, K: int, a_fmt: str, b_fmt: str, epi: str, gather: bool,
     IA, IB = A_BYTES // 1024, B_BYTES // 1024  # DMA instructions per step (block)
     assert A_BYTES % 1024 == 0 and B_BYTES % 1024 == 0 and IA % NW == 0 and IB % NW == 0
     IAW, IBW = IA // NW, IB // NW
+    NSA = BM_ // 64  # 16-B A-scale DMA instructions per quad (one per 64 rows; waves >= NSA issue none)
     STAGE = A_BYTES + B_BYTES
     SC_A, SC_B = BM_ * 16, BF * 256  # one quad of scales: A [rows][4 b] dwords, B [frags][64 lanes]
     SLOT = SC_A + SC_B
@@ -114,7 +115,7 @@ def compile_gg6e(N: int, K: int, a_fmt: str, b_fmt: str, epi: str, gather: bool,
     ISA_, ISB_ = SC_A // 256, SC_B // (64 * SBP)  # scale DMA instrs (4-B A pieces, SBP-B B pieces)
     assert ISA_ % NW == 0 and ISB_ % NW == 0, (ISA_, ISB_, NW)
     ISAW, ISBW = ISA_ // NW, ISB_ // NW
-    name = (f"gg6e_{a_fmt}_{b_fmt}_{epi}_g{int(gather)}_n{N}_k{K}_f{FM}x{FN}_w{WGM}x{WGN}_s{NSTAGE}"
+    name = (f"gg6e_{a_fmt}_{b_fmt}_{epi}_g{int(gather)}_n{N}_k{K}_f{FM}x{FN}_w{WGM}x{WGN}_s{NSTAGE}_hb{HB}"
             + (f"_x{ablate}" if ablate else "") + (f"_gm{GM}" if GM else ""))
     GX = N // BN_
 
@@ -172,24 +173,21 @@ def compile_gg6e(N: int, K: int, a_fmt: str, b_fmt: str, epi: str, gather: bool,
             bs_rsrc = _rsrc(bs_base)
             nfb = nb * fx.Int32(BF)
 
+            # A data (row-major in LDS, [BM rows][RB]): a lane's 16-B piece P -> row P // PPR; consecutive lanes
+            # read one row's contiguous bytes (coalesced). A piece-major per-wave layout (one row offset per lane)
+            # coalesced poorly and was 36% slower.
             a_src = []
             for t in range_constexpr(IAW):
                 P = (wave + fx.Int32(t * NW)) * fx.Int32(64) + lane
                 m = mb * fx.Int32(BM_) + P // fx.Int32(PPR)
                 row = ridx[m] if const_expr(gather) else m
                 a_src.append(row * fx.Int32(a_row_bytes) + (P % fx.Int32(PPR)) * fx.Int32(16))
-            b_src = []
-            for t in range_constexpr(IBW):
-                P = (wave + fx.Int32(t * NW)) * fx.Int32(64) + lane
-                f = P // fx.Int32(96)
-                b_src.append((nfb + f) * fx.Int32(KS * b_frag_bytes) + (P % fx.Int32(96)) * fx.Int32(16))
-
-            sa_src = []
-            for t in range_constexpr(ISAW):
-                D = (wave + fx.Int32(t * NW)) * fx.Int32(64) + lane
-                m = mb * fx.Int32(BM_) + D // fx.Int32(4)
-                row = ridx[m] if const_expr(gather) else m
-                sa_src.append(((row * fx.Int32(4) + D % fx.Int32(4)) * fx.Int32(KQ)) * fx.Int32(4))
+            # B: weights preshuffled [E][N/BN][KS][BF][1536]: the block's K-step slab is contiguous
+            b_src0 = nb * fx.Int32(KS * BF * b_frag_bytes) + wave * fx.Int32(1024) + lane * fx.Int32(16)
+            # A scales [R][KQ][4 b] dwords: one 16-B piece per (row, quad); lane -> row wave * 64 + lane
+            m_s = mb * fx.Int32(BM_) + (wave % fx.Int32(NSA)) * fx.Int32(64) + lane
+            row_s = ridx[m_s] if const_expr(gather) else m_s
+            sa_src0 = row_s * fx.Int32(KQ * 16)
             sb_src = []
             for t in range_constexpr(ISBW):
                 tt = wave + fx.Int32(t * NW)
@@ -198,10 +196,10 @@ def compile_gg6e(N: int, K: int, a_fmt: str, b_fmt: str, epi: str, gather: bool,
                 sb_src.append((nfb + f) * fx.Int32(KQ * 256) + (lane % fx.Int32(LPF)) * fx.Int32(SBP))
 
             def dma_scales(q_clamped, slot_off):
-                for t in range_constexpr(ISAW):
-                    dst = slot_off + (wave + fx.Int32(t * NW)) * fx.Int32(256)
-                    rocdl.raw_ptr_buffer_load_async_lds(
-                        as_rsrc, _lds_ptr3(lds_i32, dst), _v(4), _v(sa_src[t] + q_clamped * fx.Int32(4)), _v(0), _v(0))
+                # no branch in the K loop: waves >= NSA repeat wave (w % NSA)'s DMA (same bytes, same place)
+                rocdl.raw_ptr_buffer_load_async_lds(
+                    as_rsrc, _lds_ptr3(lds_i32, slot_off + (wave % fx.Int32(NSA)) * fx.Int32(1024)), _v(16),
+                    _v(sa_src0 + q_clamped * fx.Int32(16)), _v(0), _v(0))
                 for t in range_constexpr(ISBW):
                     dst = slot_off + fx.Int32(SC_A) + (wave + fx.Int32(t * NW)) * fx.Int32(64 * SBP)
                     rocdl.raw_ptr_buffer_load_async_lds(
@@ -214,15 +212,21 @@ def compile_gg6e(N: int, K: int, a_fmt: str, b_fmt: str, epi: str, gather: bool,
             # buffer-tensor view) were measured on MI355X, FlyDSL 0.5.0: same results, but the K loop grew
             # from ~2.8k to ~5.1k instructions, the kernel spilled 12 VGPRs (scratch reloads in the K loop
             # wait on vmcnt and drain the DMAs) and perf_s / perf_m lost 8-12% (perf_m 32k 12.74 -> 14.27 ms).
+            def dma_a(t, s_cl, buf_off):
+                rocdl.raw_ptr_buffer_load_async_lds(
+                    a_rsrc, _lds_ptr3(lds_i32, buf_off + (wave + fx.Int32(t * NW)) * fx.Int32(1024)), _v(16),
+                    _v(a_src[t] + s_cl * fx.Int32(RB)), _v(0), _v(0))
+
+            def dma_b(t, s_cl, buf_off):
+                rocdl.raw_ptr_buffer_load_async_lds(
+                    b_rsrc, _lds_ptr3(lds_i32, buf_off + fx.Int32(A_BYTES) + (wave + fx.Int32(t * NW)) * fx.Int32(1024)),
+                    _v(16), _v(b_src0 + s_cl * fx.Int32(BF * b_frag_bytes) + fx.Int32(t * NW * 1024)), _v(0), _v(0))
+
             def dma(s_clamped, buf_off):
                 for t in range_constexpr(IAW):
-                    dst = buf_off + (wave + fx.Int32(t * NW)) * fx.Int32(1024)
-                    rocdl.raw_ptr_buffer_load_async_lds(
-                        a_rsrc, _lds_ptr3(lds_i32, dst), _v(16), _v(a_src[t] + s_clamped * fx.Int32(RB)), _v(0), _v(0))
+                    dma_a(t, s_clamped, buf_off)
                 for t in range_constexpr(IBW):
-                    dst = buf_off + fx.Int32(A_BYTES) + (wave + fx.Int32(t * NW)) * fx.Int32(1024)
-                    rocdl.raw_ptr_buffer_load_async_lds(
-                        b_rsrc, _lds_ptr3(lds_i32, dst), _v(16), _v(b_src[t] + s_clamped * fx.Int32(b_frag_bytes)), _v(0), _v(0))
+                    dma_b(t, s_clamped, buf_off)
 
             def l_frag(off_q, q):
                 vals = [fx.ptr_load(fx.add_offset(lds64, off_q + fx.Int32(qq))) for qq in range_constexpr(q)]
@@ -238,9 +242,17 @@ def compile_gg6e(N: int, K: int, a_fmt: str, b_fmt: str, epi: str, gather: bool,
                 return f
 
             # per-fragment LDS offsets as one base + compile-time constants (fold into ds_read immediates)
-            a_lds0 = ((wm * fx.Int32(16 * FM) + r) * fx.Int32(RB) + g * fx.Int32(UA)) // fx.Int32(8)
+            # A fragment mi: row (wm*FM + mi)*16 + r, bytes [g*UA, g*UA + UA) of the row-major stage
+            a_lp = [(r * fx.Int32(RB) + g * fx.Int32(UA) + fx.Int32(8 * k)) // fx.Int32(8) for k in range_constexpr(UA // 8)]
+            a_wm = wm * fx.Int32(16 * FM * RB // 8)
+
+            def a_frag(cur8, mi):
+                c = mi * 16 * RB // 8
+                vals = [fx.ptr_load(fx.add_offset(lds64, cur8 + a_wm + a_lp[k] + fx.Int32(c)))
+                        for k in range_constexpr(UA // 8)]
+                return fx.Vector.from_elements(vals, fx.Int64).bitcast(fx.Int32)
+
             b_lds0 = wn * fx.Int32(FN * 192) + lane * fx.Int32(3)
-            a_lds = [a_lds0 + fx.Int32(mi * 16 * RB // 8) for mi in range_constexpr(FM)]
             b_lds = [b_lds0 + fx.Int32(A_BYTES // 8 + ni * 192) for ni in range_constexpr(FN)]
 
             l32 = fx.recast_iter(fx.Int32, lds_raw)
@@ -275,13 +287,9 @@ def compile_gg6e(N: int, K: int, a_fmt: str, b_fmt: str, epi: str, gather: bool,
                 thunks = []
                 if const_expr("dma" not in ablate):
                     for t in range_constexpr(IAW):
-                        thunks.append(lambda t=t: rocdl.raw_ptr_buffer_load_async_lds(
-                            a_rsrc, _lds_ptr3(lds_i32, nbuf + (wave + fx.Int32(t * NW)) * fx.Int32(1024)), _v(16),
-                            _v(a_src[t] + nxt * fx.Int32(RB)), _v(0), _v(0)))
+                        thunks.append(lambda t=t: dma_a(t, nxt, nbuf))
                     for t in range_constexpr(IBW):
-                        thunks.append(lambda t=t: rocdl.raw_ptr_buffer_load_async_lds(
-                            b_rsrc, _lds_ptr3(lds_i32, nbuf + fx.Int32(A_BYTES) + (wave + fx.Int32(t * NW)) * fx.Int32(1024)),
-                            _v(16), _v(b_src[t] + nxt * fx.Int32(b_frag_bytes)), _v(0), _v(0)))
+                        thunks.append(lambda t=t: dma_b(t, nxt, nbuf))
                     if const_expr((j + NSTAGE - 1) % 4 == 0):
                         def _sc():
                             qn = (s + fx.Int32(NSTAGE - 1)) // fx.Int32(4)
@@ -297,23 +305,29 @@ def compile_gg6e(N: int, K: int, a_fmt: str, b_fmt: str, epi: str, gather: bool,
                     sc = load_scales(s // fx.Int32(4))
                 a_sc, b_sc = sc
                 cur = stage_off(s) // fx.Int32(8)
-                bv = [_frag(l_frag(cur + b_lds[ni], 3), 6) for ni in range_constexpr(FN)]
                 out = list(accs)
-                av_next = _frag(l_frag(cur + a_lds[0], UA // 8), abits)
                 nth = len(thunks)
-                for mi in range_constexpr(FM):
-                    av = av_next
-                    if const_expr(IL):
-                        rocdl.sched_barrier(0)
-                        for th in thunks[mi * nth // FM:(mi + 1) * nth // FM]:
-                            th()
-                    if const_expr(mi + 1 < FM):
-                        av_next = _frag(l_frag(cur + a_lds[mi + 1], UA // 8), abits)
-                    for ni in range_constexpr(FN):
-                        cf = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
-                        cf.store(accs[mi * FN + ni])
-                        fx.gemm(mma_atoms[j], cf, av, bv[ni], cf, scale_a=a_sc[mi], scale_b=b_sc[ni])
-                        out[mi * FN + ni] = cf.load()
+                # HB > 1: N fragments in HB halves (fewer live B operand registers; A re-read per half)
+                NG = FM * HB
+                FNH = FN // HB
+                for hb in range_constexpr(HB):
+                    bv = [_frag(l_frag(cur + b_lds[hb * FNH + nq], 3), 6) for nq in range_constexpr(FNH)]
+                    av_next = _frag(a_frag(cur, 0), abits)
+                    for mi in range_constexpr(FM):
+                        gi = hb * FM + mi
+                        av = av_next
+                        if const_expr(IL):
+                            rocdl.sched_barrier(0)
+                            for th in thunks[gi * nth // NG:(gi + 1) * nth // NG]:
+                                th()
+                        if const_expr(mi + 1 < FM):
+                            av_next = _frag(a_frag(cur, mi + 1), abits)
+                        for nq in range_constexpr(FNH):
+                            ni = hb * FNH + nq
+                            cf = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+                            cf.store(accs[mi * FN + ni])
+                            fx.gemm(mma_atoms[j], cf, av, bv[nq], cf, scale_a=a_sc[mi], scale_b=b_sc[ni])
+                            out[mi * FN + ni] = cf.load()
                 if const_expr(IL):
                     rocdl.sched_barrier(0)
                     rocdl.asyncmark()
@@ -405,12 +419,12 @@ def compile_gg6e(N: int, K: int, a_fmt: str, b_fmt: str, epi: str, gather: bool,
 
 
 def run_gg6e(a_rows, a_scales, ridx, texp, b_frags, b_scales, out, *, N, K, a_fmt, b_fmt="e2m3",
-             epi="store", gather=True, cfg=(8, 8, 2, 2), nstage=3, ablate="", gm=0, out_scales=None):
+             epi="store", gather=True, cfg=(8, 8, 2, 2), nstage=3, ablate="", gm=0, out_scales=None, hb=1):
     """Launch compile_gg6e. texp: [m_tiles + 1] int32, tile -> expert (-1 unused), texp[m_tiles] = used tiles.
 
     All tensors must be contiguous and on one device; the launcher cache is keyed by the device index."""
     dev = out.device.index if out.device.index is not None else torch.cuda.current_device()
-    exe = compile_gg6e(N, K, a_fmt, b_fmt, epi, gather, *cfg, NSTAGE=nstage, ablate=ablate, GM=gm, dev=dev)
+    exe = compile_gg6e(N, K, a_fmt, b_fmt, epi, gather, *cfg, NSTAGE=nstage, ablate=ablate, GM=gm, dev=dev, HB=hb)
     _run_compiled(exe, _ptr(a_rows), _ptr(a_scales), _ptr(ridx), _ptr(texp), _ptr(b_frags), _ptr(b_scales),
                   _ptr(out), _ptr(out_scales if out_scales is not None else out), texp.numel() - 1,
                   torch.cuda.current_stream(out.device))

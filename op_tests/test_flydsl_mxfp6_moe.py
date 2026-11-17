@@ -204,8 +204,7 @@ def test_quant_rows(rows, k, fmt):
     (codes, scales), us = run_perftest(ak.quant_rows, x, fmt)
     ks = k // 128
     err = checkAllclose(ref_codes.int(), codes.int(), rtol=0, atol=0, tol_err_ratio=0.0, msg=f"codes {fmt}: ")
-    err_s = checkAllclose(ref_scales.view(torch.uint8).reshape(rows, 4, -1)[:, :, :ks].int(),
-                          scales.view(torch.uint8).reshape(rows, 4, -1)[:, :, :ks].int(),
+    err_s = checkAllclose(q.unpack_a_scales(ref_scales, ks).int(), q.unpack_a_scales(scales, ks).int(),
                           rtol=0, atol=0, tol_err_ratio=0.0, msg=f"scales {fmt}: ")
     assert err == 0 and err_s == 0
     nbytes = rows * k * 2 + codes.numel() + scales.numel() * 4

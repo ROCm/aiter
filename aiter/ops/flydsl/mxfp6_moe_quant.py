@@ -15,8 +15,8 @@ Storage formats produced here (K = reduction dim, KS = K/128 steps, KQ = ceil(KS
         (FP6: identical to plain packing; FP8: each 128-block permuted to the split-half order)
         so lane (r, g) loads 24 (FP6) / 32 (FP8) contiguous bytes at 128-step s:
         offset s * 16 * bits + g * 4 * bits.
-  A scales: [R, 4, KQ] int32, byte j of dword (row, b, q) = E8M0 of block 4*(4q+j)+b.
-  "B" weights (FP6, preshuffled): [E, N/16, KS, 64 lanes, 24 B] (each fragment = 1536 B
+  A scales: [R, KQ, 4] int32, byte j of dword (row, q, b) = E8M0 of block 4*(4q+j)+b.
+  "B" weights (FP6, preshuffled): [E, N/BN, KS, BN/16, 64 lanes, 24 B] (each fragment = 1536 B
         contiguous); N-fragment order optionally gate/up interleaved for the SwiGLU epilogue.
   B scales: [E, N/16, KQ, 64] int32, byte j of lane (16b + r) = block 4*(4q+j)+b of row r.
 """
@@ -115,17 +115,25 @@ def kq(K: int) -> int:
 
 
 def pack_a_scales(sexp: torch.Tensor) -> torch.Tensor:
-    """sexp [R, K/32] uint8 -> [R, 4, KQ] int32 (byte j = block 4*(4q+j)+b)."""
+    """sexp [R, K/32] uint8 -> [R, KQ, 4] int32: dword (q, b) byte j = E8M0 of block 4*(4q+j)+b, so one row's
+    scales for a 4-step quad are 16 contiguous bytes (a single 16-B DMA per row and quad)."""
     R, nb = sexp.shape
     KS = nb // 4
     KQ = (KS + 3) // 4
     s = torch.full((R, KQ * 4, 4), 127, dtype=torch.uint8, device=sexp.device)
     s[:, :KS, :] = sexp.reshape(R, KS, 4)  # [R, step, b]
-    s = s.reshape(R, KQ, 4, 4).permute(0, 3, 1, 2).contiguous()  # [R, b, q, j]
-    return s.view(torch.int32).reshape(R, 4, KQ)
+    s = s.reshape(R, KQ, 4, 4).permute(0, 1, 3, 2).contiguous()  # [R, q, b, j]
+    return s.view(torch.int32).reshape(R, KQ, 4)
 
 
-def preshuffle_b(codes6: torch.Tensor, sexp: torch.Tensor, interleave_gate_up: bool = False):
+def unpack_a_scales(packed: torch.Tensor, KS: int) -> torch.Tensor:
+    """Inverse of pack_a_scales for the KS valid steps: [R, KQ, 4] int32 -> [R, KS, 4 b] uint8."""
+    R, KQ = packed.shape[0], packed.shape[1]
+    s = packed.contiguous().view(torch.uint8).reshape(R, KQ, 4, 4).permute(0, 1, 3, 2)  # [R, q, j, b]
+    return s.reshape(R, KQ * 4, 4)[:, :KS, :]
+
+
+def preshuffle_b(codes6: torch.Tensor, sexp: torch.Tensor, interleave_gate_up: bool = False, bn: int | None = None):
     """Weights [E, N, K] (6-bit codes) + scales [E, N, K/32] -> (frags uint8, scales int32).
 
     interleave_gate_up: N = 2*I with gate rows first; reorder 16-row fragments as
@@ -143,6 +151,9 @@ def preshuffle_b(codes6: torch.Tensor, sexp: torch.Tensor, interleave_gate_up: b
     p = pack6(codes6)  # [E, N, K*3/4]
     p = p.reshape(E, N // 16, 16, KS, 4, 24).permute(0, 1, 3, 4, 2, 5).contiguous()
     frags = p.reshape(E, N // 16, KS, 64 * 24)
+    if bn is not None:
+        # N-block-major [E, N/bn, KS, bn/16, 1536]: a block's fragments for one K step are contiguous
+        frags = frags.reshape(E, N // bn, bn // 16, KS, 64 * 24).permute(0, 1, 3, 2, 4).contiguous()
     s = torch.full((E, N, KQ * 4, 4), 127, dtype=torch.uint8, device=codes6.device)
     s[:, :, :KS, :] = sexp.reshape(E, N, KS, 4)  # [E, n, step, b]
     s = s.reshape(E, N // 16, 16, KQ, 4, 4)  # [E, nf, r, q, j, b]

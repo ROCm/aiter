@@ -1,7 +1,7 @@
 """FlyDSL helper kernels for the MXFP6 MoE (gfx950): MX row quantization, routing (one-block and
 multi-block counting sort) and the deterministic combine.
 
-quant_rows: bf16 [R, K] -> "A" rows (mxfp6_moe_quant storage, MFMA K order) + [R, 4, KQ] int32 scales.
+quant_rows: bf16 [R, K] -> "A" rows (mxfp6_moe_quant storage, MFMA K order) + [R, KQ, 4] int32 scales.
   One thread per 32-block, one wave per (row, 64 blocks); row bases are 64-bit (rebased
   descriptors), so R * K may exceed 2^31 bytes. Numerics = mxfp6_moe_quant.quant_mx (scale
   2^ceil(log2(amax/max)), RNE onto the grid, clamp), computed with integer bit arithmetic.
@@ -46,7 +46,7 @@ def _i2f(v):
 def mx_quant_store(vals, fmt, y_base, y_row_off, kb, s_base, s_row_off, KQ):
     """Quantize one 32-element block (vals: 32 Float32, already bf16-exact) of a row to MX `fmt` and
     store it in the "A" layout of mxfp6_moe_quant: codes at byte y_row_off + (block kb position) of the
-    i64 address y_base, E8M0 byte into the [4, KQ] int32 scale row at byte s_row_off of s_base.
+    i64 address y_base, E8M0 byte into the [KQ, 4] int32 scale row at byte s_row_off of s_base.
     Numerics = mxfp6_moe_quant.quant_mx: scale 2^ceil(log2(amax/max)), RNE onto the grid, clamp (bit arithmetic)."""
     vmax, mbits, minexp, cmax, bits = QFMT[fmt]
     amax = fx.Float32(0.0)
@@ -100,10 +100,10 @@ def mx_quant_store(vals, fmt, y_base, y_row_off, kb, s_base, s_row_off, KQ):
         y4 = ptr_buf_tensor(y_base, fx.Int32, unit_elems=4, unit_stride=1)
         buf_copy_store(y4, p0 // fx.Int32(4), fx.Vector.from_elements(words[:4], fx.Int32), fx.Int32, 4)
         buf_copy_store(y4, (p0 + fx.Int32(32)) // fx.Int32(4), fx.Vector.from_elements(words[4:], fx.Int32), fx.Int32, 4)
-    # scale byte j of dword (b, q): step s = 4q + j
+    # scale byte j of dword (q, b): step s = 4q + j
     s = kb // fx.Int32(4)
     b = kb % fx.Int32(4)
-    boff = s_row_off + (b * fx.Int32(KQ) + s // fx.Int32(4)) * fx.Int32(4) + s % fx.Int32(4)
+    boff = s_row_off + ((s // fx.Int32(4)) * fx.Int32(4) + b) * fx.Int32(4) + s % fx.Int32(4)  # [R][KQ][4 b][4 j]
     buf_copy_store(ptr_buf_tensor(s_base, fx.Int8), boff, fx.Int8(sbyte), fx.Int8, 1)
 
 
@@ -200,7 +200,7 @@ def quant_rows(x: torch.Tensor, fmt: str):
     bits = QFMT[fmt][4]
     KQ = (K // 128 + 3) // 4
     y = torch.empty(R, K * bits // 8, dtype=torch.uint8, device=x.device)
-    s = torch.empty(R, 4, KQ, dtype=torch.int32, device=x.device)
+    s = torch.empty(R, KQ, 4, dtype=torch.int32, device=x.device)
     _call(compile_quant_rows(K, fmt, _dev(x)), (_ptr(x), _ptr(y), _ptr(s), R, torch.cuda.current_stream(x.device)))
     return y, s
 

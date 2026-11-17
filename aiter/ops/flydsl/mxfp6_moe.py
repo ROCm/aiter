@@ -38,16 +38,16 @@ def pick_bm(rows_per_expert: float) -> int:
     return 128 if rows_per_expert <= 160 else 256
 
 
+def stage_bn(N: int, a_fmt: str) -> int:
+    """N tile of a stage. Fixed per stage at prepare time: the weights are preshuffled N-block-major for it.
+    128 when N % 256 != 0 (hidden a multiple of 128 only) or for FP8 activations (256 x 256 with FP8 A rows
+    does not fit three LDS stages), else 256."""
+    return 128 if (N % 256 != 0 or a_fmt == "e4m3") else 256
+
+
 def gemm_cfg(N: int, a_fmt: str, bm: int = 256):
-    """gg6e (FM, FN, WGM, WGN), always 4 waves.
-    BM 256: A6 256 x 256 (waves 128x128); N % 256 != 0 (hidden a multiple of 128 only) or A8
-    (FP8 A rows 128 B/step: 256 x 256 does not fit 3 stages) -> 256 x 128 (waves 128x64).
-    BM 128: 128 x 256 (waves 64x128) or 128 x 128 (waves 64x64)."""
-    if bm == 128:
-        return (4, 8, 2, 2) if N % 256 == 0 else (4, 4, 2, 2)
-    if a_fmt == "e4m3" or N % 256 != 0:
-        return (8, 4, 2, 2)
-    return (8, 8, 2, 2)
+    """gg6e (FM, FN, WGM, WGN), always 4 waves (2 x 2); block BM x stage_bn(N): wave tile (BM/2) x (BN/2)."""
+    return (bm // 32, stage_bn(N, a_fmt) // 32, 2, 2)
 
 
 A_FMT = os.environ.get("MX6_AFMT", "e2m3")
@@ -60,15 +60,16 @@ def prepare(layer: dict) -> dict:
     I = w2.shape[2]
     assert N1 == 2 * I and H % 128 == 0 and I % 128 == 0, "hidden and inter must be multiples of 128"
     dev = w1.device
-    b1 = torch.empty(E, N1 // 16, H // 128, 64 * 24, dtype=torch.uint8, device=dev)
+    bn1, bn2 = stage_bn(N1, A_FMT), stage_bn(H, A_FMT)
+    b1 = torch.empty(E, N1 // bn1, H // 128, bn1 // 16, 64 * 24, dtype=torch.uint8, device=dev)
     s1 = torch.empty(E, N1 // 16, q.kq(H), 64, dtype=torch.int32, device=dev)
-    b2 = torch.empty(E, H // 16, I // 128, 64 * 24, dtype=torch.uint8, device=dev)
+    b2 = torch.empty(E, H // bn2, I // 128, bn2 // 16, 64 * 24, dtype=torch.uint8, device=dev)
     s2 = torch.empty(E, H // 16, q.kq(I), 64, dtype=torch.int32, device=dev)
     for e in range(E):  # per expert: the fp32 working copy of all experts does not fit
         c, s = q.quant_mx(w1[e : e + 1], W_FMT)
-        b1[e : e + 1], s1[e : e + 1] = q.preshuffle_b(c, s, interleave_gate_up=True)
+        b1[e : e + 1], s1[e : e + 1] = q.preshuffle_b(c, s, interleave_gate_up=True, bn=bn1)
         c, s = q.quant_mx(w2[e : e + 1], W_FMT)
-        b2[e : e + 1], s2[e : e + 1] = q.preshuffle_b(c, s)
+        b2[e : e + 1], s2[e : e + 1] = q.preshuffle_b(c, s, bn=bn2)
     return {"E": E, "H": H, "I": I, "b1": b1, "s1": s1, "b2": b2, "s2": s2, "a_fmt": A_FMT, "w_fmt": W_FMT}
 
 
@@ -91,9 +92,9 @@ def forward(inp: dict, st: dict) -> torch.Tensor:
     bm = pick_bm(T * K / E)
     ridx, pos, texp, M = route(ids, E, bm)
     xa, xs = quant_rows(x, af)
-    # stage 1 writes h already MX-quantized (stage-2 A rows + [M, 4, KQ] scales)
+    # stage 1 writes h already MX-quantized (stage-2 A rows + [M, KQ, 4] scales)
     ha = torch.empty(M, I * q.FORMATS[af][3] // 8, dtype=torch.uint8, device=x.device)
-    hs = torch.empty(M, 4, q.kq(I), dtype=torch.int32, device=x.device)
+    hs = torch.empty(M, q.kq(I), 4, dtype=torch.int32, device=x.device)
     run_gg6e(xa, xs, ridx, texp, st["b1"], st["s1"], ha, N=2 * I, K=H, a_fmt=af, b_fmt=st["w_fmt"], epi="swiglu_q", gather=True, gm=8,
              cfg=gemm_cfg(2 * I, af, bm), out_scales=hs)
     o = torch.empty(M, H, dtype=torch.bfloat16, device=x.device)

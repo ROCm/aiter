@@ -36,7 +36,12 @@ shared MX quantizer). Tests and benchmark: `python3 op_tests/test_flydsl_mxfp6_m
   16-31 = K[64+16g,+16)); scale of (row r, K-block b) in lane 16b + r.
 - 4 waves; wave tile 128x128 (8x8 fragments) -> block 256x256. 256x128 when N % 256 != 0 or for FP8
   activations (LDS budget); 128-row tiles when experts average <= 160 rows.
-- Weights preshuffled once into 1536-B MFMA fragments (64 lanes x 24 B); activation rows gathered by DMA.
+- Weights preshuffled once into 1536-B MFMA fragments (64 lanes x 24 B), N-block-major
+  (`[E][N/BN][K/128][BN/16][1536]`), so one block's K-slab is contiguous and each wave needs a single
+  base offset; activation rows gathered by DMA (row-major in LDS, coalesced 16-B pieces).
+- Activation scales stored `[rows][K/512][4]` (four 128-K steps per 16 B), so a wave DMAs 64 rows' scales
+  with one 16-B load per quad. Fewer live address registers cut the accumulator AGPR<->VGPR moves in the
+  K loop (268 -> 234 reads per K step) and gained 4-5% on every layer.
 - 3-stage LDS ring (48 KB/stage at 256x256) filled by **async** buffer->LDS DMA in 16-B pieces
   (`raw_ptr_buffer_load_async_lds` + `asyncmark` / `wait_asyncmark`; the synchronous variant made LLVM put
   `vmcnt(0)` before every LDS read). Scales are DMA'd per 4 K-steps into two LDS slots (LDS total 160 KB).
@@ -55,12 +60,15 @@ combine); TFLOP/s counts the useful 6*T*k*H*I flops:
 
 | Layer (H, I, E, k) | 4k tokens | 32k tokens |
 |---|---|---|
-| W6A6 s (6144, 2048, 64, 4) | 0.777 ms / 1592 TF/s | 4.560 ms / 2170 TF/s |
-| W6A6 m (8192, 4608, 64, 4) | 1.896 ms / 1957 TF/s | 12.810 ms / 2317 TF/s |
-| W6A6 l (10496, 3072, 64, 4) | 1.704 ms / 1860 TF/s | 10.753 ms / 2358 TF/s |
+| W6A6 s (6144, 2048, 64, 4) | 0.742 ms / 1666 TF/s | 4.349 ms / 2275 TF/s |
+| W6A6 m (8192, 4608, 64, 4) | 1.808 ms / 2053 TF/s | 12.201 ms / 2433 TF/s |
+| W6A6 l (10496, 3072, 64, 4) | 1.616 ms / 1961 TF/s | 10.241 ms / 2476 TF/s |
+| W6A8 s | 0.868 ms / 1425 TF/s | 6.205 ms / 1595 TF/s |
+| W6A8 m | 2.171 ms / 1710 TF/s | 15.243 ms / 1948 TF/s |
+| W6A8 l | 1.907 ms / 1662 TF/s | 13.203 ms / 1921 TF/s |
 
-On the previous FlyDSL (0.3.4.1) the same op measured top-8 m 24.4 ms at 32k (2433 TF/s) and W6A8
-1.40-1.88 PF/s; the migration to FlyDSL 0.5.0 / tensor_shim buffer views is within 0-2% of it.
+The GPU runs at its power cap here (~1350 W, ~2040-2140 MHz); about half of the K-loop VALU issue is
+accumulator AGPR<->VGPR traffic forced by the 256 fp32 accumulators per lane of the 128x128 wave tile.
 
 rel L2 vs bf16: W6A6 E2M3 0.074, W6A8 0.068 (E3M2: 0.107-0.130, format-inherent). Against a torch reference
 with identical MX numerics the plugin agrees to 1.6e-5 (E2M3) .. 1.6e-3 (with E4M3/E3M2), see
@@ -74,6 +82,8 @@ hidden 8192 x inter 4096 (both weight tensors > 4 GiB packed), hidden 10496 at 2
 - The global->LDS DMA stays a raw `rocdl.raw_ptr_buffer_load_async_lds`: `BufferLoadAsyncLDS128b/32b` copy
   atoms gave identical results but grew the K loop from ~2.8k to ~5.1k instructions, spilled 12 VGPRs
   (scratch reloads wait on vmcnt and drain the async DMAs) and cost 8-12% on the s/m layers (FlyDSL 0.5.0).
+- Register pressure: the MFMA AGPR-destination form (`-amdgpu-mfma-vgpr-form=false`), 8 waves, and a
+  piece-major A layout all spilled or coalesced worse (15-23 ms vs 12.2 ms on m 32k).
 - Stage 2 (short K) carries ~5 us fixed cost per tile (pipeline fill + epilogue). Tried and not adopted:
   a persistent variant overlapping the next tile's prologue with the epilogue (correct, but spills; 1.67
   vs 2.12 PF/s on the stage-2 shape) and smaller 128x128 / 128x256 tiles for two blocks per CU (12-22% /
