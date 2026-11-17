@@ -189,7 +189,10 @@ For more details, see [docs/triton_comms.md](docs/triton_comms.md).
 ## Contributing
 
 See [CONTRIBUTE.md](CONTRIBUTE.md) for setup, code style, testing and the PR
-process. One rule up front: **a pull request changes one kernel backend**:
+process. To find who to contact for a pull request, see [CONTACTS.md](CONTACTS.md);
+to help review, see [REVIEWERS.md](REVIEWERS.md).
+
+One rule up front: **a pull request changes one kernel backend**:
 Triton/Gluon (Triton and Gluon count as one), HIP, ASM, CK, OPUS or FlyDSL.
 Work that spans two backends is two PRs; when one cannot land without the
 other, open them as

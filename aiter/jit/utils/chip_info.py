@@ -95,29 +95,17 @@ def get_gfx():
     return GFX_MAP.get(gfx_num, "unknown")
 
 
-_LDS_CAPACITY_BYTES = {
-    "gfx90a": 64 * 1024,
-    "gfx942": 64 * 1024,
-    "gfx950": 160 * 1024,
-    "gfx1100": 64 * 1024,
-    "gfx1101": 64 * 1024,
-    "gfx1102": 64 * 1024,
-    "gfx1150": 64 * 1024,
-    "gfx1151": 64 * 1024,
-    "gfx1200": 64 * 1024,
-    "gfx1201": 64 * 1024,
-    "gfx1250": 320 * 1024,
-    "gfx1250-strict": 320 * 1024,
-}
+if __package__:
+    from . import lds_capacity as _lds_capacity
+else:
+    import lds_capacity as _lds_capacity
+
+_LDS_CAPACITY_BYTES = _lds_capacity._LDS_CAPACITY_BYTES
 
 
 def get_lds_capacity_bytes(gfx: str | None = None) -> int:
     """Return the architectural LDS capacity for one workgroup."""
-    arch = (gfx or get_gfx()).split(":", 1)[0].lower()
-    try:
-        return _LDS_CAPACITY_BYTES[arch]
-    except KeyError as exc:
-        raise ValueError(f"Unknown LDS capacity for architecture {arch!r}") from exc
+    return _lds_capacity.get_lds_capacity_bytes(gfx or get_gfx())
 
 
 @functools.lru_cache(maxsize=1)
@@ -641,6 +629,8 @@ def _get_pci_chip_id(device_id=None):
 
 
 MI308_CHIP_IDS = {0x74A2, 0x74A8, 0x74B6, 0x74BC}
+# MI300A is the gfx942 APU: 228 CUs and 6 XCCs, against MI300X's 304 and 8.
+MI300A_CHIP_IDS = {0x74A0}
 
 
 def get_device_name():
@@ -666,6 +656,8 @@ def _get_device_name(device_id: int) -> str:
         chip_id = _get_pci_chip_id(device_id)
         if chip_id in MI308_CHIP_IDS:
             return "MI308"
+        if chip_id in MI300A_CHIP_IDS:
+            return "MI300A"
         return "MI300"
     elif gfx == "gfx950":
         num_xcds = _num_xcds_for_device(device_id)
