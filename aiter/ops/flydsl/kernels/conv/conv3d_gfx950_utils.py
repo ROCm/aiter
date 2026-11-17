@@ -12,8 +12,6 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from aiter.jit.utils.chip_info import get_num_xcds
-
 # One MFMA instruction's output tile, and how many accumulator values of it a
 # lane holds. gfx950's bf16 MFMA is 16x16x16 with 4 values per lane.
 MFMA_M = 16
@@ -867,7 +865,7 @@ class LaunchGrid(NamedTuple):
     use_splitk: bool
 
 
-def make_launch_grid(param, geom, cfg, out_block=None):
+def make_launch_grid(param, geom, cfg, out_block=None, *, num_xcds):
     """The LaunchGrid for one problem and launch config, or an assertion.
 
     ``out_block``: ``Im2colPlan.out_block`` -- (rows, cols) of the 2D output
@@ -928,7 +926,7 @@ def make_launch_grid(param, geom, cfg, out_block=None):
         # Chunked M already uses z, so a swizzle over x/y would reorder blocks
         # that are no longer adjacent in M. WGM only applies to the flat case.
         wgm=1 if m_chunks > 1 else max(1, int(param.wgm)),
-        num_xcds=get_num_xcds(),
+        num_xcds=num_xcds,
         out_block=out_block,
         tile_n=tile_n,
         tiles_per_group=tiles_per_group,

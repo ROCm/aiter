@@ -771,7 +771,8 @@ def _assert_host_path(case, param):
     cfg = make_tile_config(param.tile)
     geom = make_conv_geometry(param)
     plan = make_im2col_plan(param, geom, cfg)
-    grid = make_launch_grid(param, geom, cfg, plan.out_block)
+    # Any die count works here: the checks below do not depend on it.
+    grid = make_launch_grid(param, geom, cfg, plan.out_block, num_xcds=8)
     if case == "2d_splitk2":
         assert (
             param.splitk == 2 and grid.use_splitk and grid.splitk == 2
