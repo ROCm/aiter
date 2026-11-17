@@ -13,6 +13,7 @@ from aiter import dtypes
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
+from ..plugin import route as _route
 
 
 @compile_ops("module_mhc", develop=True)
@@ -677,6 +678,7 @@ def mhc_pre_fake(
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=mhc_pre_fake)
+@_route(op="mhc_pre", version=1)
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -693,6 +695,18 @@ def mhc_pre(
     w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed BF16 hi/lo from mhc_shuffle_fn
     res_preshuffle: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The pre half of MHC: normalise, score the heads, and mix.
+
+    Returns ``(post_mix, comb_mix, layer_input)`` -- three newly allocated
+    tensors. Nothing is written through the arguments, which is what the
+    ``mutates_args=[]`` on the guard above already declares; a provider
+    serving this contract allocates its own outputs and returns them.
+
+    ``sinkhorn_repeat=0`` runs the pre step for the hc head only.
+    ``w_preshuffle_bf16`` and ``res_preshuffle`` say that ``fn`` and
+    ``residual`` already arrive packed, so a provider must read them as given
+    rather than assume row-major.
+    """
     if res_preshuffle and mhc_res_shuffle_enabled(residual.size(0)):
         residual = mhc_res_unshuffle(residual)
     m = residual.size(0)
@@ -785,6 +799,7 @@ def _mhc_post(
 
 
 @torch_compile_guard(mutates_args=["out"], gen_fake=lambda *args, **kwargs: None)
+@_route(op="mhc_post", version=1)
 def mhc_post(
     out: torch.Tensor,
     x: torch.Tensor,
@@ -794,6 +809,16 @@ def mhc_post(
     store_nt: int = -1,
     res_preshuffle: bool = False,
 ) -> None:
+    """The post half of MHC: combine the mixed heads back into ``out``.
+
+    Returns nothing. ``out`` is the result and is written in place, which the
+    ``mutates_args=["out"]`` on the guard above declares; a provider serving
+    this contract must leave it fully written, since a caller has no return
+    value to tell a skipped row from a correct one.
+
+    ``res_preshuffle`` says ``residual`` arrives packed; it is unshuffled here
+    when the row count makes that layout active.
+    """
     if res_preshuffle and mhc_res_shuffle_enabled(residual.size(0)):
         residual = mhc_res_unshuffle(residual)
     _mhc_post(out, x, residual, post_layer_mix, comb_res_mix, store_nt)
@@ -1253,17 +1278,26 @@ MHC_SEAM_HIDDEN_SIZE = 5120
 # and token: post, collapse and the pre GEMM partials); from it the persistent fused
 # kernel (512-column chunks, ~11 us fixed cost). Every wave of the few-token kernel reads
 # its fn slice, so its time grows with T; on MI300X / MI325X (304 CUs) the two cross at
-# about 60 tokens. Both are followed by the ASM gates. This switch and the fused kernel's
-# grid (CUs / 10 token ranges) were timed on 304-CU parts only; on gfx942 parts or
-# partitions with fewer CUs the results are the same, the speed is not tuned.
+# about 60 tokens. Both are followed by the ASM gates. The fused kernel's fixed time does
+# not depend on the CU count while the few-token kernel's time per CU does, so with fewer
+# CUs the switch moves down with them: on 80-CU MI308X the two cross between 16 and 17
+# tokens (see _mhc_seam_small_max_t). The fused grid (CUs / 10 token ranges, one
+# workgroup per CU) is fastest on both: more token ranges each reload their fn chunk.
 MHC_SEAM_SMALL_MAX_T = 60
 MHC_SEAM_SMALL_SLICE = 128
 MHC_SEAM_FUSED_CHUNK = 512
 # From this many tokens the new residual no longer fits in the 256 MB MALL, and
-# nontemporal stores are about 1 % faster.
+# nontemporal stores are about 1 % faster. With fewer than 304 CUs (MI308X) they are
+# never slower and up to 3 % faster from 40 to 512 tokens, so they are always used.
 MHC_SEAM_STORE_NT_MIN_T = 8192
 # Tokens per launch: keeps every tensor under 4 GiB (the kernels use 32-bit offsets).
 MHC_SEAM_MAX_T_PER_LAUNCH = 65536
+
+
+def _mhc_seam_small_max_t(num_cu: int) -> int:
+    """Tokens per launch below which the few-token kernel runs: MHC_SEAM_SMALL_MAX_T on
+    304-CU parts, about one token per 5 CUs with fewer (17 on 80-CU MI308X)."""
+    return MHC_SEAM_SMALL_MAX_T if num_cu >= 304 else num_cu // 5 + 1
 
 
 @compile_ops("module_mhc_seam_asm", fc_name="mhc_seam_fused_asm", ffi_type="ctypes")
@@ -1427,7 +1461,7 @@ def mhc_fused_post_pre_delayed(
 
     Runs the ASM kernels of hsa/gfx942/mhc_seam in two launches: one kernel for the
     post, the collapse and the split-K partials of the pre GEMM (below
-    MHC_SEAM_SMALL_MAX_T tokens one short wave per 128-column slice and token, from it a
+    _mhc_seam_small_max_t tokens one short wave per 128-column slice and token, from it a
     persistent kernel over 512-column chunks), then the gates from the partials.
 
     Supported only on gfx942 with 4 residual streams and hidden_size 5120
@@ -1436,7 +1470,7 @@ def mhc_fused_post_pre_delayed(
     configurations: ``mhc_fused_post_pre_delayed_rmsnorm`` (Triton, folds the RMSNorm)
     or ``mhc_post`` + ``mhc_pre``. Tensors with another shape or device raise
     ValueError, another dtype TypeError; inputs need not be contiguous. The kernel
-    switch and grid were timed on 304-CU parts (MI300X, MI325X).
+    switch and grid were timed on 304-CU parts (MI300X, MI325X) and 80-CU MI308X.
 
     Args:
         residual: (T, 4, H) bf16 residual streams entering the seam.
@@ -1504,6 +1538,59 @@ def mhc_fused_post_pre_delayed(
     post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
     comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
     next_pre_mix = torch.empty(m, hc_mult, dtype=dtypes.fp32, device=device)
+    _mhc_seam_asm_launch(
+        residual_out,
+        layer_input,
+        post_mix,
+        comb_mix,
+        next_pre_mix,
+        residual,
+        sublayer_out,
+        post_2d,
+        comb_3d,
+        pre_2d,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+    return residual_out, post_mix, comb_mix, layer_input, next_pre_mix
+
+
+def _mhc_seam_asm_launch(
+    residual_out: Tensor,
+    layer_input: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    next_pre_mix: Tensor,
+    residual: Tensor,
+    sublayer_out: Tensor,
+    post_2d: Tensor,
+    comb_3d: Tensor,
+    pre_2d: Optional[Tensor],  # noqa: UP045
+    fn: Tensor,
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> None:
+    """Launch the gfx942 ASM seam kernels into preallocated outputs.
+
+    Callers check support (mhc_fused_post_pre_delayed_asm_supported) and that all
+    tensors are contiguous on one device: post_2d (T, 4), comb_3d (T, 4, 4), pre_2d
+    (T, 4) or None for the identity gate, outputs as mhc_fused_post_pre_delayed.
+    """
+    m, hc_mult, hidden_size = residual.shape
+    device = residual.device
+    num_cu = get_cu_num()
+    small_max = _mhc_seam_small_max_t(num_cu)
     gate_args = (
         hc_scale,
         hc_base,
@@ -1512,9 +1599,8 @@ def mhc_fused_post_pre_delayed(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
-        hc_hidden_size,
+        hc_mult * hidden_size,
     )
-
     for t0 in range(0, m, MHC_SEAM_MAX_T_PER_LAUNCH):
         t1 = min(m, t0 + MHC_SEAM_MAX_T_PER_LAUNCH)
         n = t1 - t0
@@ -1528,14 +1614,13 @@ def mhc_fused_post_pre_delayed(
         gates_out = (post_mix[t0:t1], comb_mix[t0:t1], next_pre_mix[t0:t1])
         # part[s, t, 0:24]: the mixes of column slice s, part[s, t, 24]: its sum of
         # squares; slices of 128 columns (few-token kernel) or 512 (fused kernel)
-        small = n < MHC_SEAM_SMALL_MAX_T
+        small = n < small_max
         sl = MHC_SEAM_SMALL_SLICE if small else MHC_SEAM_FUSED_CHUNK
         part = torch.empty(hidden_size // sl, n, 32, dtype=dtypes.fp32, device=device)
         seam_out = (residual_out[t0:t1], layer_input[t0:t1], part)
         if small:
             mhc_seam_small_asm(*seam_out, *seam_in, fn)
         else:
-            mhc_seam_fused_asm(*seam_out, *seam_in, fn, 0, n >= MHC_SEAM_STORE_NT_MIN_T)
+            store_nt = n >= MHC_SEAM_STORE_NT_MIN_T or num_cu < 304
+            mhc_seam_fused_asm(*seam_out, *seam_in, fn, 0, store_nt)
         mhc_seam_gates_asm(*gates_out, part, *gate_args)
-
-    return residual_out, post_mix, comb_mix, layer_input, next_pre_mix

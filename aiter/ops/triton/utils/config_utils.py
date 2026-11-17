@@ -153,34 +153,6 @@ def get_config_cu_num() -> int | None:
     return _CU_NUM
 
 
-@functools.cache
-def _tuned_tree_arch(dev: str, family: str) -> str:
-    """The arch whose config tree a kernel running on ``dev`` reads for ``family``.
-
-    Tuned configs stay keyed by the exact arch: ``dev`` is returned whenever
-    ``configs/<dev>/<family>`` exists. configs/gfx1250-strict (MI450 A0) ships
-    untuned any-only tables for M-bucketed families; families it lacks (keyed
-    by kernel variant or shape, with no generic entry) read the base family
-    tree, with a one-time warning that the values are not tuned for ``dev``.
-    Explicit tuning scopes (a ``cu_num`` argument) never take this path, so a
-    tuner creating the variant tree is not redirected onto the base one.
-    """
-    if os.path.isdir(f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{family}"):
-        return dev
-    try:
-        from aiter.jit.utils.build_targets import base_gfx_arch
-    except ImportError:  # standalone use without the aiter package
-        return dev
-    base = base_gfx_arch(dev)
-    if base != dev and os.path.isdir(f"{AITER_TRITON_CONFIGS_PATH}/{base}/{family}"):
-        logger.warning(
-            f"no {dev} configs for {family}; using the {base} table, "
-            f"which is NOT tuned for {dev}"
-        )
-        return base
-    return dev
-
-
 def resolve_config_dir(
     op: str,
     config_name: str,
@@ -273,8 +245,6 @@ def resolve_config_dir(
         dev
     ), f"arch_info.get_arch() returned a path-unsafe architecture: {dev!r}"
     family = f"{backend}/{op}/{_dtype_dir(config_name)}"
-    if cu_num is DEVICE_CU_NUM:
-        dev = _tuned_tree_arch(dev, family)
     plain = f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{family}"
     if cu_num is DEVICE_CU_NUM:
         cu_num = get_config_cu_num()

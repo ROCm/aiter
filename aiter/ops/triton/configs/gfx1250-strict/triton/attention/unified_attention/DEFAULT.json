@@ -1,0 +1,62 @@
+{
+    "schema": {
+        "attn_2d": [
+            "D",
+            "Q",
+            "DT"
+        ],
+        "attn_3d": [
+            "D",
+            "SHUF",
+            "DT",
+            "BS"
+        ],
+        "reduce": [
+            "D",
+            "SHUF",
+            "DT",
+            "BS"
+        ],
+        "kv_split": [
+            "D",
+            "SHUF",
+            "DT",
+            "BS"
+        ]
+    },
+    "attn_2d": {
+        "any": {
+            "BLOCK_M": 16,
+            "num_warps": 2,
+            "num_stages": 1,
+            "waves_per_eu": 2,
+            "TILE_SIZE_MIN": 64,
+            "TILE_SIZE_MAX": 64
+        }
+    },
+    "attn_3d": {
+        "any": {
+            "BLOCK_M": 16,
+            "num_warps": 1,
+            "num_stages": 2,
+            "waves_per_eu": 1
+        }
+    },
+    "reduce": {
+        "any": {
+            "num_stages": 1,
+            "waves_per_eu": 2,
+            "num_warps": 1,
+            "SEGMENT_BLOCK": 64,
+            "BLOCK_D": 64
+        }
+    },
+    "kv_split": {
+        "any": {
+            "MIN_SEGMENTS": 1,
+            "SEGMENTS_PER_CU": 4,
+            "TILE_SIZE_MIN": 1,
+            "TILE_SIZE_MAX": 4096
+        }
+    }
+}

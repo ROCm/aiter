@@ -464,3 +464,272 @@ def test_the_documentation_gate_is_not_vacuous():
         "the docstring scan and the contract baseline disagree about which "
         "ops are routed"
     )
+
+
+# The suffixes #7150 inventories as backend markers. A contract named with one
+# would say "serve the asm kernel" to a provider whose kernel is by definition
+# not that one -- the thing the first routed ops were chosen to avoid.
+_BACKEND_SUFFIXES = ("_asm", "_ck", "_opus", "_hip", "_triton", "_tuned", "_gfx1250")
+
+
+def test_no_routed_op_name_carries_a_backend_suffix():
+    """The contract names the OPERATION; the function may name a backend.
+
+    `@route(op=...)` takes the contract name as a string, independent of the
+    Python name it decorates -- which is what lets a backend-named public
+    entry point be routed without renaming it and without touching a single
+    downstream caller. `pa_fwd_asm` is routed as `pa_fwd`, `rmsnorm` sits on
+    `_rms_norm_fwd_dispatch`.
+
+    The freedom cuts both ways, so this pins the direction that matters: a
+    provider implements against the op name, and an op name carrying `_asm`
+    or `_opus` asks it to be a backend it is not.
+    """
+
+    named = sorted(
+        op for op in json.loads(_BASELINE.read_text()) if op.endswith(_BACKEND_SUFFIXES)
+    )
+    assert not named, (
+        "routed contracts whose name carries a backend: "
+        + ", ".join(named)
+        + " -- route the operation under a neutral op= and leave the "
+        "function name alone"
+    )
+
+
+def _routed_function_names(root: Path) -> dict[str, str]:
+    """Op name -> the Python function the route decorates."""
+
+    found: dict[str, str] = {}
+    for path in sorted(root.glob("aiter/**/*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        spellings = _route_spellings(tree)
+        if not spellings:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            for decorator in node.decorator_list:
+                if _is_route(decorator, spellings):
+                    keywords = {k.arg: k.value for k in decorator.keywords}
+                    found[ast.literal_eval(keywords["op"])] = node.name
+    return found
+
+
+def test_the_backend_suffix_gate_is_not_vacuous():
+    """A neutral op name is not enough if the function under it is not.
+
+    Routing a backend-named function makes its entire signature the contract,
+    pins and all -- that is how `kernelName` reached `pa_fwd`'s contract
+    while its name looked clean. So the rule is checked at both ends: the op
+    name carries no backend (above), and neither does the function the route
+    decorates (here).
+    """
+
+    routed = _routed_function_names(_REPO)
+    assert routed, "no routed ops found; the scanner has gone stale"
+    assert set(routed) == set(json.loads(_BASELINE.read_text())), (
+        "the route scan and the contract baseline disagree about which ops "
+        "are routed"
+    )
+    offenders = sorted(f for f in routed.values() if f.endswith(_BACKEND_SUFFIXES))
+    assert not offenders, (
+        "a route sits directly on a backend-named function: "
+        + ", ".join(offenders)
+        + " -- that function's whole signature becomes the contract, which is "
+        "how `kernelName` first leaked into `pa_fwd`. Route the layer beneath "
+        "the pins instead"
+    )
+
+
+# Parameters that name something AITER has and a provider does not. The test
+# is not "does this string look backend-ish" but "could a provider honour it":
+# `backend` picks among AITER's implementations, `kernelName` picks one asm
+# kernel. A provider has its own kernel and no way to satisfy either, so a
+# contract carrying one would make it decline every call that passes it.
+_UNHONOURABLE_PARAMS = ("backend", "kernelName")
+
+
+def test_no_routed_contract_carries_a_parameter_a_provider_cannot_honour():
+    """The suffix gate checks the op's NAME; a backend also leaks through its
+    ARGUMENTS, and that leak is quieter.
+
+    `pa_fwd` was first routed on `pa_fwd_asm`, which carried `kernelName`
+    straight into the contract: a neutral name with an asm-only knob inside
+    it. Both pins now sit above the routed layer, where passing one bypasses
+    routing instead of asking a provider for a kernel it does not have.
+    """
+
+    named = {
+        op: [p for p in _UNHONOURABLE_PARAMS if p + ":" in entry["signature"]]
+        for op, entry in json.loads(_BASELINE.read_text()).items()
+    }
+    named = {op: ps for op, ps in named.items() if ps}
+    assert not named, (
+        "routed contracts carrying a parameter no provider can honour: "
+        + "; ".join(f"{op} ({', '.join(ps)})" for op, ps in sorted(named.items()))
+        + " -- keep the pin above the routed layer, where it bypasses routing"
+    )
+
+
+def test_the_parameter_gate_matches_the_names_it_claims_to_guard():
+    """The gate is a substring list, so it is only as live as that list.
+
+    Pin that each guarded name still appears in the tree as a real parameter;
+    otherwise the list has drifted into guarding nothing and would pass while
+    a live pin leaks through.
+    """
+
+    seen = set()
+    for path in (_REPO / "aiter").rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for name in _UNHONOURABLE_PARAMS:
+            if f"{name}: str | None" in text or f"{name}=None" in text:
+                seen.add(name)
+    missing = sorted(set(_UNHONOURABLE_PARAMS) - seen)
+    assert not missing, (
+        "guarded parameter names no longer appear in the tree: "
+        + ", ".join(missing)
+        + " -- the gate above is guarding a name nothing uses"
+    )
+
+
+# Registration is what keeps a routed op out of a caller's compiled graph. It
+# is opt-in per op (`route(..., fake=...)`, #7850), so "not registered" is the
+# default -- and the default is the state that breaks the day a provider is
+# enabled, which is the configuration this interface exists for. The gate
+# below makes that state cost a written sentence instead of nothing.
+#
+# An op is accounted for in exactly one of three ways:
+#   * it passes `fake=`;
+#   * a `torch_compile_guard` sits OUTSIDE its `@route`, so the caller already
+#     reaches an opaque op and the plugin's dispatch is behind it (detected
+#     from the decorator order, never listed, so it cannot go stale);
+#   * it is named below with the reason it is not registered.
+#
+# Three reasons recur, and each is a measurement rather than a preference:
+#
+# "out-buffer in the contract" -- the op takes an optional output tensor and
+# returns it. Registered, that is an op returning one of its own arguments.
+# Measured: `opcheck` rejects it ("Argument out is not defined to alias output
+# but was aliasing"), and -- worse, because it is silent -- a compiled region
+# that passes the buffer gets a correct RETURN VALUE while the buffer itself
+# is left unwritten. A caller reading its own buffer afterwards reads stale
+# data and nothing reports it. Registering such an op therefore has to wait
+# for the contract to drop the buffer, which moves the signature and so needs
+# an op_version bump; `fused_dual_rmsnorm_mxfp8_quant` shows the shape of the
+# fix for a contract new enough not to need one.
+#
+# "unannotated contract" -- the contract renders without types (`x:positional`
+# rather than `x:positional:Tensor`) because the function has no annotations.
+# `infer_schema` needs them, and adding them moves the rendered signature and
+# so the fingerprint: an annotation-only change is indistinguishable here from
+# a real contract change, so it needs the same op_version decision.
+#
+# "no schema can express it" -- a parameter whose type is AITER's own.
+_NOT_REGISTERED = {
+    "gemm_a8w8_blockscale_bpreshuffle": "out-buffer in the contract (`out`)",
+    "inverse_rope_group_quant": "out-buffer in the contract (`x_fp8`, `x_scale`)",
+    "mla_sparse_prefill": "out-buffer in the contract (`out`)",
+    "mla_sparse_prefill_v41": "out-buffer in the contract (`out`)",
+    "pa_decode_bf16": "out-buffer in the contract (`out`)",
+    "pa_fwd": "out-buffer in the contract (`out_`)",
+    "mla_decode_fwd_v4_nm": "unannotated contract, and an out-buffer in it",
+    "mla_decode_fwd_v4_nm_ps": "unannotated contract, and an out-buffer in it",
+    "sp_qkv_fused": "unannotated contract",
+    "pertoken_quant": (
+        "unannotated contract; and its body is pure torch, which inductor "
+        "fuses with its neighbours today -- measured, one reduction kernel "
+        "for silu + amax + divide + the consumer. Registering it trades that "
+        "fusion away for every compiling caller, including those with no "
+        "provider, because registration happens at import and AITER_PLUGINS=0 "
+        "does not undo it (measured). Worth paying when a provider serves it, "
+        "not before."
+    ),
+    "rmsnorm": "unannotated contract; pure-torch body, as `pertoken_quant`",
+    "pa_persistent_fwd": "no schema can express it (`QuantType` parameter)",
+}
+
+
+def _routed_registration(root: Path) -> dict[str, tuple[bool, bool]]:
+    """Per routed op: whether it passes ``fake=``, and whether an outer
+    ``torch_compile_guard`` already makes it opaque to a caller."""
+
+    found: dict[str, tuple[bool, bool]] = {}
+    for path in sorted(root.glob("aiter/**/*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        spellings = _route_spellings(tree)
+        if not spellings:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            decorators = node.decorator_list
+            route_at = [i for i, d in enumerate(decorators) if _is_route(d, spellings)]
+            if not route_at:
+                continue
+            decorator = decorators[route_at[0]]
+            keywords = {k.arg: k.value for k in decorator.keywords}
+            op = ast.literal_eval(keywords["op"])
+            outer = decorators[: route_at[0]]
+            shielded = any(
+                (
+                    getattr(d.func if isinstance(d, ast.Call) else d, "id", None)
+                    or getattr(d.func if isinstance(d, ast.Call) else d, "attr", None)
+                )
+                == "torch_compile_guard"
+                for d in outer
+            )
+            found[op] = ("fake" in keywords, shielded)
+    return found
+
+
+def test_every_routed_op_is_registered_or_says_why_not():
+    """The default -- no ``fake=`` -- is the state that breaks under a provider.
+
+    Registration is per op and silent when absent: an op added without
+    ``fake=`` works exactly as before and starts splitting a caller's graph
+    only once someone enables a provider for it, which is far from where the
+    omission happened. This gate turns that silence into a failing test unless
+    the omission is written down.
+    """
+
+    accounted = _NOT_REGISTERED.keys()
+    unexplained = sorted(
+        op
+        for op, (has_fake, shielded) in _routed_registration(_REPO).items()
+        if not has_fake and not shielded and op not in accounted
+    )
+    assert not unexplained, (
+        "routed ops that are neither registered nor explained: "
+        + ", ".join(unexplained)
+        + " -- pass fake= to route(), or add the op to _NOT_REGISTERED with "
+        "the reason it cannot be registered"
+    )
+
+
+def test_the_registration_gate_is_not_vacuous():
+    """The gate passes trivially if nothing is routed, if every op is listed
+    as an exception, or if an exception outlives the problem it names."""
+
+    registration = _routed_registration(_REPO)
+    assert registration, "the scanner found no routed ops"
+    assert any(
+        has_fake for has_fake, _ in registration.values()
+    ), "no routed op passes fake=; the gate would be satisfied by exceptions alone"
+
+    stale = sorted(
+        op for op in _NOT_REGISTERED if op in registration and registration[op][0]
+    )
+    assert not stale, (
+        "ops listed as not registered that now pass fake=: "
+        + ", ".join(stale)
+        + " -- remove them from _NOT_REGISTERED"
+    )
+    unknown = sorted(set(_NOT_REGISTERED) - set(registration))
+    assert not unknown, "_NOT_REGISTERED names ops that are not routed: " + ", ".join(
+        unknown
+    )
+    assert all(
+        reason.strip() for reason in _NOT_REGISTERED.values()
+    ), "every entry in _NOT_REGISTERED needs a reason, not an empty string"
