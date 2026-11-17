@@ -289,9 +289,11 @@ def test_rows_are_batch_invariant(H):
     assert torch.equal(c.indexer(q, w, req, ln), ref_i)
 
 
-def test_decode_row_equals_prefill_row():
-    """A decode row (one token on the cached keys) equals that token's prefill row."""
-    c = Case([5000], seed=5)
+@pytest.mark.parametrize("H", [32, 64])
+def test_decode_row_equals_prefill_row(H):
+    """A decode row (one token on the cached keys) equals that token's prefill row,
+    also when the batch starts one row later (other row groups)."""
+    c = Case([5000], seed=5, H=H)
     L = 5000
     prefill = [(0, t + 1) for t in range(0, L, 7)] + [(0, L)]
     q, w, req, ln = c.rows(prefill, seed=6)
@@ -302,6 +304,11 @@ def test_decode_row_equals_prefill_row():
         args = (q[sl].clone(), w[sl].clone(), req[sl].clone(), ln[sl].clone())
         assert torch.equal(c.indexer(*args, max_len=131072)[0], pre[t])
         assert torch.equal(valid(c.logits(*args, max_len=131072), args[3])[0], pre_l[t])
+    sh = (q[1:], w[1:], req[1:], ln[1:])
+    assert torch.equal(c.indexer(*sh), pre[1:])
+    assert all(
+        torch.equal(a, b) for a, b in zip(valid(c.logits(*sh), sh[3]), pre_l[1:])
+    )
 
 
 def test_long_decode_rows():

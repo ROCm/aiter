@@ -126,16 +126,18 @@ def _launch_logits(q, weights, k8, s32, block_table, row_req, row_len, max_len, 
     cfg = _config("logits")
     max_tiles = triton.cdiv(max_len, _TILE)
     # The split only partitions columns, so it may follow the launch shape.
+    rows = cfg["rows_by_heads"][str(H)]
+    # Splits count the row pairs: in prefill one program of a pair does the work.
     splits = max(
         1,
         min(
-            cfg["target_programs"] // T,
+            cfg["target_programs"] // triton.cdiv(T, rows),
             triton.cdiv(max_tiles, cfg["min_split_tiles"]),
         ),
     )
     tiles_per_split = triton.cdiv(max_tiles, splits)
     splits = triton.cdiv(max_tiles, tiles_per_split)
-    _dsa_indexer_bi_logits_kernel[(T, splits)](
+    _dsa_indexer_bi_logits_kernel[(triton.cdiv(T, rows), splits, rows)](
         q,
         weights,
         k8,
@@ -152,12 +154,14 @@ def _launch_logits(q, weights, k8, s32, block_table, row_req, row_len, max_len, 
         s32.stride(0),
         block_table.stride(0),
         out.stride(0),
+        T,
         tiles_per_split,
         max_len,
         NUM_HEADS=H,
         HEAD_SIZE=D,
         CACHE_BS=k8.shape[1] // (D + 4),
         BLOCK_KV=_TILE,
+        ROWS=rows,
         NUM_WARPS=cfg["num_warps"],
         PADDED_LDS=_padded_lds(),
         num_warps=cfg["num_warps"],

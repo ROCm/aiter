@@ -129,25 +129,16 @@ def _fold_heads(s, w_col, acc, HAS_ACC: gl.constexpr, mfma_layout: gl.constexpr)
     return acc
 
 
-_logits_repr = make_kernel_repr(
-    "_dsa_indexer_bi_logits_kernel",
-    ["NUM_HEADS", "HEAD_SIZE", "CACHE_BS", "BLOCK_KV", "NUM_WARPS", "PADDED_LDS"],
-)
-
-
-@gluon.jit(
-    repr=_logits_repr,
-    do_not_specialize=["tiles_per_split", "max_len"],
-)
-def _dsa_indexer_bi_logits_kernel(
-    q_ptr,  # fp8 e4m3 [T, H, D]
-    w_ptr,  # fp32 [T, H]
-    k_ptr,  # fp8 view of the index cache, block-flat [NB, CACHE_BS * (D + 4)]
-    s_ptr,  # fp32 view of the same bytes
-    bt_ptr,  # int32 [R, max_blocks]
-    req_ptr,  # int32 [T]: block-table row of each query row
-    len_ptr,  # int32 [T]: keys [0, len) of each row
-    out_ptr,  # fp32 [T, >= max_len]
+@gluon.jit
+def _logits_rows(
+    q_ptr,
+    w_ptr,
+    k_ptr,
+    s_ptr,
+    bt_ptr,
+    req_ptr,
+    len_ptr,
+    out_ptr,
     stride_q_s,
     stride_q_h,
     stride_w_s,
@@ -158,6 +149,9 @@ def _dsa_indexer_bi_logits_kernel(
     stride_out_s,
     tiles_per_split,
     max_len,
+    row0,
+    split,
+    NR: gl.constexpr,
     NUM_HEADS: gl.constexpr,
     HEAD_SIZE: gl.constexpr,
     CACHE_BS: gl.constexpr,
@@ -165,26 +159,10 @@ def _dsa_indexer_bi_logits_kernel(
     NUM_WARPS: gl.constexpr,
     PADDED_LDS: gl.constexpr,
 ):
-    """logits[t, j] = k_scale[j] * sum_h w[t, h] * relu(q[t, h] . k[j]), j < len[t].
-
-    Grid (T, splits). A split walks a fixed range of BLOCK_KV-key tiles; the tile,
-    split and block placement only partition the columns.
-    """
-    gl.static_assert(CACHE_BS % BLOCK_KV == 0, "cache block must hold whole tiles")
-    gl.static_assert(NUM_HEADS % HEAD_CHUNK == 0, "heads come in chunks of 32")
+    # Rows row0 .. row0 + NR - 1 of one block-table row: each K tile is loaded
+    # once and used by all NR rows. Each row's arithmetic is the one-row arithmetic.
     NCHUNK: gl.constexpr = NUM_HEADS // HEAD_CHUNK
     SCALE_OFF: gl.constexpr = CACHE_BS * HEAD_SIZE // 4
-
-    row = gl.program_id(0)
-    split = gl.program_id(1)
-    n = gl.minimum(gl.load(len_ptr + row), max_len)
-    n_tiles = (n + BLOCK_KV - 1) // BLOCK_KV
-    tile_lo = split * tiles_per_split
-    if tile_lo >= n_tiles:
-        return
-    tile_hi = gl.minimum(tile_lo + tiles_per_split, n_tiles)
-    col_hi = gl.minimum(n, tile_hi * BLOCK_KV)
-
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=[32, 32, 64],
@@ -206,101 +184,277 @@ def _dsa_indexer_bi_logits_kernel(
     )
     col_layout: gl.constexpr = gl.SliceLayout(0, mfma_layout)
 
-    # Q and the head weights of this row, per 32-head chunk.
-    q_row = q_ptr + row.to(gl.int64) * stride_q_s
-    w_row = w_ptr + row.to(gl.int64) * stride_w_s
-    hq = gl.arange(0, HEAD_CHUNK, layout=gl.SliceLayout(1, layout_q))
-    dq = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, layout_q))
-    hw = gl.arange(0, HEAD_CHUNK, layout=gl.SliceLayout(1, mfma_layout))
-    qs = ()
-    ws = ()
-    for c in gl.static_range(0, NCHUNK):
-        qc = gl.amd.cdna4.buffer_load(
-            ptr=q_row,
-            offsets=((hq + c * HEAD_CHUNK) * stride_q_h)[:, None] + dq[None, :],
-        )
-        wc = gl.amd.cdna4.buffer_load(
-            ptr=w_row, offsets=((hw + c * HEAD_CHUNK) * stride_w_h)[:, None]
-        )
-        qs = qs + (gl.convert_layout(qc, dot_a),)
-        ws = ws + (wc,)
+    lens = ()
+    n = 0
+    for r in gl.static_range(0, NR):
+        n_r = gl.minimum(gl.load(len_ptr + row0 + r), max_len)
+        lens = lens + (n_r,)
+        n = gl.maximum(n, n_r)
+    n_tiles = (n + BLOCK_KV - 1) // BLOCK_KV
+    tile_lo = split * tiles_per_split
+    if tile_lo < n_tiles:
+        tile_hi = gl.minimum(tile_lo + tiles_per_split, n_tiles)
+        col_hi = gl.minimum(n, tile_hi * BLOCK_KV)
 
-    # Double-buffered K tiles: global -> LDS by async copy.
-    blocked: gl.constexpr = _k_tile_layouts(HEAD_SIZE, BLOCK_KV, NUM_WARPS, PADDED_LDS)[
-        0
-    ]
-    shared: gl.constexpr = _k_tile_layouts(HEAD_SIZE, BLOCK_KV, NUM_WARPS, PADDED_LDS)[
-        1
-    ]
-    k_lds = gl.allocate_shared_memory(
-        k_ptr.type.element_ty, [2, HEAD_SIZE, BLOCK_KV], layout=shared
-    )
-    offs_d = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(1, blocked))[:, None]
-    offs_n = gl.arange(0, BLOCK_KV, layout=gl.SliceLayout(0, blocked))[None, :]
-    k_offsets = offs_d + offs_n * HEAD_SIZE
-    bt_row = bt_ptr + gl.load(req_ptr + row).to(gl.int64) * stride_bt
-    cols = gl.arange(0, BLOCK_KV, layout=col_layout)
-    out_row = out_ptr + row.to(gl.int64) * stride_out_s
-    last = tile_hi - 1
+        # Q and the head weights of each row, per 32-head chunk.
+        hq = gl.arange(0, HEAD_CHUNK, layout=gl.SliceLayout(1, layout_q))
+        dq = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, layout_q))
+        hw = gl.arange(0, HEAD_CHUNK, layout=gl.SliceLayout(1, mfma_layout))
+        qs = ()
+        ws = ()
+        for r in gl.static_range(0, NR):
+            q_row = q_ptr + (row0 + r).to(gl.int64) * stride_q_s
+            w_row = w_ptr + (row0 + r).to(gl.int64) * stride_w_s
+            for c in gl.static_range(0, NCHUNK):
+                qc = gl.amd.cdna4.buffer_load(
+                    ptr=q_row,
+                    offsets=((hq + c * HEAD_CHUNK) * stride_q_h)[:, None] + dq[None, :],
+                )
+                wc = gl.amd.cdna4.buffer_load(
+                    ptr=w_row, offsets=((hw + c * HEAD_CHUNK) * stride_w_h)[:, None]
+                )
+                qs = qs + (gl.convert_layout(qc, dot_a),)
+                ws = ws + (wc,)
 
-    for p in gl.static_range(0, 2):
-        t = gl.minimum(tile_lo + p, last)
-        blk = gl.load(bt_row + (t * BLOCK_KV) // CACHE_BS).to(gl.int64)
-        off = (t * BLOCK_KV) % CACHE_BS
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            k_lds.index(p),
-            k_ptr + blk * stride_k_blk + off * HEAD_SIZE,
-            k_offsets,
-            mask=offs_n < (col_hi - (tile_lo + p) * BLOCK_KV),
+        # Double-buffered K tiles: global -> LDS by async copy.
+        blocked: gl.constexpr = _k_tile_layouts(
+            HEAD_SIZE, BLOCK_KV, NUM_WARPS, PADDED_LDS
+        )[0]
+        shared: gl.constexpr = _k_tile_layouts(
+            HEAD_SIZE, BLOCK_KV, NUM_WARPS, PADDED_LDS
+        )[1]
+        k_lds = gl.allocate_shared_memory(
+            k_ptr.type.element_ty, [2, HEAD_SIZE, BLOCK_KV], layout=shared
         )
-        gl.amd.cdna4.async_copy.commit_group()
+        offs_d = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(1, blocked))[:, None]
+        offs_n = gl.arange(0, BLOCK_KV, layout=gl.SliceLayout(0, blocked))[None, :]
+        k_offsets = offs_d + offs_n * HEAD_SIZE
+        bt_row = bt_ptr + gl.load(req_ptr + row0).to(gl.int64) * stride_bt
+        cols = gl.arange(0, BLOCK_KV, layout=col_layout)
+        last = tile_hi - 1
 
-    for i in range(tile_lo, tile_hi):
-        buf = (i - tile_lo) % 2
-        c0 = i * BLOCK_KV
-        blk = gl.load(bt_row + c0 // CACHE_BS).to(gl.int64)
-        off = c0 % CACHE_BS
-        scales = gl.amd.cdna4.buffer_load(
-            ptr=s_ptr + blk * stride_s_blk + SCALE_OFF + off,
-            offsets=cols,
-            mask=cols < (col_hi - c0),
-        )
-        gl.amd.cdna4.async_copy.wait_group(1)
-        kt = k_lds.index(buf).load(layout=dot_b)
-        # Prefetch tile i + 2 into the buffer just read (masked past the split).
-        tn = gl.minimum(i + 2, last)
-        nblk = gl.load(bt_row + (tn * BLOCK_KV) // CACHE_BS).to(gl.int64)
-        noff = (tn * BLOCK_KV) % CACHE_BS
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            k_lds.index(buf),
-            k_ptr + nblk * stride_k_blk + noff * HEAD_SIZE,
-            k_offsets,
-            mask=offs_n < (col_hi - (i + 2) * BLOCK_KV),
-        )
-        gl.amd.cdna4.async_copy.commit_group()
-
-        acc = None
-        for c in gl.static_range(0, NCHUNK):
-            sc = gl.amd.cdna4.mfma_scaled(
-                a=qs[c],
-                a_scale=None,
-                a_format="e4m3",
-                b=kt,
-                b_scale=None,
-                b_format="e4m3",
-                acc=gl.zeros(
-                    [HEAD_CHUNK, BLOCK_KV], dtype=gl.float32, layout=mfma_layout
-                ),
+        for p in gl.static_range(0, 2):
+            t = gl.minimum(tile_lo + p, last)
+            blk = gl.load(bt_row + (t * BLOCK_KV) // CACHE_BS).to(gl.int64)
+            off = (t * BLOCK_KV) % CACHE_BS
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                k_lds.index(p),
+                k_ptr + blk * stride_k_blk + off * HEAD_SIZE,
+                k_offsets,
+                mask=offs_n < (col_hi - (tile_lo + p) * BLOCK_KV),
             )
-            sc = gl.maximum(sc, 0, propagate_nan=_PROPAGATE_NAN_ALL)
-            acc = _fold_heads(sc, ws[c], acc, c > 0, mfma_layout)
-        acc = gl.sum(acc, axis=2)
-        acc = gl.sum(acc, axis=0)
-        logit = gl.convert_layout(acc, col_layout) * scales
-        gl.amd.cdna4.buffer_store(
-            logit, ptr=out_row + c0, offsets=cols, mask=cols < (col_hi - c0)
+            gl.amd.cdna4.async_copy.commit_group()
+
+        for i in range(tile_lo, tile_hi):
+            buf = (i - tile_lo) % 2
+            c0 = i * BLOCK_KV
+            blk = gl.load(bt_row + c0 // CACHE_BS).to(gl.int64)
+            off = c0 % CACHE_BS
+            scales = gl.amd.cdna4.buffer_load(
+                ptr=s_ptr + blk * stride_s_blk + SCALE_OFF + off,
+                offsets=cols,
+                mask=cols < (col_hi - c0),
+            )
+            gl.amd.cdna4.async_copy.wait_group(1)
+            kt = k_lds.index(buf).load(layout=dot_b)
+            # Prefetch tile i + 2 into the buffer just read (masked past the split).
+            tn = gl.minimum(i + 2, last)
+            nblk = gl.load(bt_row + (tn * BLOCK_KV) // CACHE_BS).to(gl.int64)
+            noff = (tn * BLOCK_KV) % CACHE_BS
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                k_lds.index(buf),
+                k_ptr + nblk * stride_k_blk + noff * HEAD_SIZE,
+                k_offsets,
+                mask=offs_n < (col_hi - (i + 2) * BLOCK_KV),
+            )
+            gl.amd.cdna4.async_copy.commit_group()
+
+            for r in gl.static_range(0, NR):
+                acc = None
+                for c in gl.static_range(0, NCHUNK):
+                    sc = gl.amd.cdna4.mfma_scaled(
+                        a=qs[r * NCHUNK + c],
+                        a_scale=None,
+                        a_format="e4m3",
+                        b=kt,
+                        b_scale=None,
+                        b_format="e4m3",
+                        acc=gl.zeros(
+                            [HEAD_CHUNK, BLOCK_KV], dtype=gl.float32, layout=mfma_layout
+                        ),
+                    )
+                    sc = gl.maximum(sc, 0, propagate_nan=_PROPAGATE_NAN_ALL)
+                    acc = _fold_heads(sc, ws[r * NCHUNK + c], acc, c > 0, mfma_layout)
+                acc = gl.sum(acc, axis=2)
+                acc = gl.sum(acc, axis=0)
+                logit = gl.convert_layout(acc, col_layout) * scales
+                hi_r = gl.minimum(lens[r], tile_hi * BLOCK_KV)
+                gl.amd.cdna4.buffer_store(
+                    logit,
+                    ptr=out_ptr + (row0 + r).to(gl.int64) * stride_out_s + c0,
+                    offsets=cols,
+                    mask=cols < (hi_r - c0),
+                )
+        gl.amd.cdna4.async_copy.wait_group(0)
+
+
+_logits_repr = make_kernel_repr(
+    "_dsa_indexer_bi_logits_kernel",
+    [
+        "NUM_HEADS",
+        "HEAD_SIZE",
+        "CACHE_BS",
+        "BLOCK_KV",
+        "ROWS",
+        "NUM_WARPS",
+        "PADDED_LDS",
+    ],
+)
+
+
+@gluon.jit(
+    repr=_logits_repr,
+    do_not_specialize=["num_rows", "tiles_per_split", "max_len"],
+)
+def _dsa_indexer_bi_logits_kernel(
+    q_ptr,  # fp8 e4m3 [T, H, D]
+    w_ptr,  # fp32 [T, H]
+    k_ptr,  # fp8 view of the index cache, block-flat [NB, CACHE_BS * (D + 4)]
+    s_ptr,  # fp32 view of the same bytes
+    bt_ptr,  # int32 [R, max_blocks]
+    req_ptr,  # int32 [T]: block-table row of each query row
+    len_ptr,  # int32 [T]: keys [0, len) of each row
+    out_ptr,  # fp32 [T, >= max_len]
+    stride_q_s,
+    stride_q_h,
+    stride_w_s,
+    stride_w_h,
+    stride_k_blk,
+    stride_s_blk,
+    stride_bt,
+    stride_out_s,
+    num_rows,
+    tiles_per_split,
+    max_len,
+    NUM_HEADS: gl.constexpr,
+    HEAD_SIZE: gl.constexpr,
+    CACHE_BS: gl.constexpr,
+    BLOCK_KV: gl.constexpr,
+    ROWS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    PADDED_LDS: gl.constexpr,
+):
+    """logits[t, j] = k_scale[j] * sum_h w[t, h] * relu(q[t, h] . k[j]), j < len[t].
+
+    Grid (cdiv(T, ROWS), splits, ROWS). A group of ROWS rows of one block-table
+    row runs in the z = 0 program, which loads each K tile once; the others exit.
+    Rows of other groups run alone, row ROWS * i + z.
+    A split walks a fixed range of BLOCK_KV-key tiles. Rows, tiles, splits and
+    block placement only partition the work.
+    """
+    gl.static_assert(CACHE_BS % BLOCK_KV == 0, "cache block must hold whole tiles")
+    gl.static_assert(NUM_HEADS % HEAD_CHUNK == 0, "heads come in chunks of 32")
+    gl.static_assert(ROWS == 1 or ROWS == 2 or ROWS == 4, "1, 2 or 4 rows per program")
+    lead = gl.program_id(0) * ROWS
+    split = gl.program_id(1)
+    row = lead + gl.program_id(2)
+    if ROWS > 1:
+        req0 = gl.load(req_ptr + lead)
+        group = lead + ROWS <= num_rows
+        for r in gl.static_range(1, ROWS):
+            nxt = gl.minimum(lead + r, num_rows - 1)
+            group = group & (gl.load(req_ptr + nxt) == req0)
+        if group:
+            if row == lead:
+                _logits_rows(
+                    q_ptr,
+                    w_ptr,
+                    k_ptr,
+                    s_ptr,
+                    bt_ptr,
+                    req_ptr,
+                    len_ptr,
+                    out_ptr,
+                    stride_q_s,
+                    stride_q_h,
+                    stride_w_s,
+                    stride_w_h,
+                    stride_k_blk,
+                    stride_s_blk,
+                    stride_bt,
+                    stride_out_s,
+                    tiles_per_split,
+                    max_len,
+                    lead,
+                    split,
+                    ROWS,
+                    NUM_HEADS,
+                    HEAD_SIZE,
+                    CACHE_BS,
+                    BLOCK_KV,
+                    NUM_WARPS,
+                    PADDED_LDS,
+                )
+        elif row < num_rows:
+            _logits_rows(
+                q_ptr,
+                w_ptr,
+                k_ptr,
+                s_ptr,
+                bt_ptr,
+                req_ptr,
+                len_ptr,
+                out_ptr,
+                stride_q_s,
+                stride_q_h,
+                stride_w_s,
+                stride_w_h,
+                stride_k_blk,
+                stride_s_blk,
+                stride_bt,
+                stride_out_s,
+                tiles_per_split,
+                max_len,
+                row,
+                split,
+                1,
+                NUM_HEADS,
+                HEAD_SIZE,
+                CACHE_BS,
+                BLOCK_KV,
+                NUM_WARPS,
+                PADDED_LDS,
+            )
+    else:
+        _logits_rows(
+            q_ptr,
+            w_ptr,
+            k_ptr,
+            s_ptr,
+            bt_ptr,
+            req_ptr,
+            len_ptr,
+            out_ptr,
+            stride_q_s,
+            stride_q_h,
+            stride_w_s,
+            stride_w_h,
+            stride_k_blk,
+            stride_s_blk,
+            stride_bt,
+            stride_out_s,
+            tiles_per_split,
+            max_len,
+            row,
+            split,
+            1,
+            NUM_HEADS,
+            HEAD_SIZE,
+            CACHE_BS,
+            BLOCK_KV,
+            NUM_WARPS,
+            PADDED_LDS,
         )
-    gl.amd.cdna4.async_copy.wait_group(0)
 
 
 # Top-k: MSB-first radix select with 8-bit digits (4 rounds) finds the unique

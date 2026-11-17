@@ -1,5 +1,9 @@
 {
     "logits": {
+        "rows_by_heads": {
+            "32": 4,
+            "64": 2
+        },
         "num_warps": 2,
         "waves_per_eu": 2,
         "target_programs": 4096,
