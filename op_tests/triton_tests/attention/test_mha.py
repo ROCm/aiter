@@ -21,7 +21,7 @@ from aiter.ops.triton.attention.mha import (
     mha_set_use_int64_strides,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch, is_fp8_avail
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+from aiter.ops.triton.utils.types import get_fp8_dtypes, get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref,
     attention_ref_with_tol,
@@ -1536,7 +1536,6 @@ def test_mha_fwd_fp8_large_head_selection(
         load_config_json,
         resolve_config_dir,
     )
-    from aiter.ops.triton.utils.types import get_fp8_dtypes
 
     fwd_cfg = load_config_json(
         f"{resolve_config_dir('attention', 'MHA', backend='triton')}/DEFAULT.json"
@@ -1550,15 +1549,18 @@ def test_mha_fwd_fp8_large_head_selection(
     assert cfg == fwd_cfg[expected]
 
 
+@pytest.mark.parametrize("FP8_FMT", ["e5m2", "e4m3"])
 @pytest.mark.parametrize("CAUSAL", [True, False])
-def test_mha_varlen_fp8_large_head(CAUSAL: bool, dtype=torch.bfloat16):
+def test_mha_varlen_fp8_large_head(CAUSAL: bool, FP8_FMT: str, dtype=torch.bfloat16):
     """Compile fp8_large_head at d256; checks against attention_ref, including non-causal."""
     # flash_attn_varlen_func forwards descales only on backend="gluon".
     if get_arch() != "gfx942":
         pytest.skip("fp8_large_head is only defined for gfx942")
 
     HEAD_SZ = 256
-    x = make_varlen_fp8_inputs(2, 512, 1024, 8, 2, HEAD_SZ, dtype)
+    e5m2_dtype, e4m3_dtype = get_fp8_dtypes()
+    fp8_dtype = e4m3_dtype if FP8_FMT == "e4m3" else e5m2_dtype
+    x = make_varlen_fp8_inputs(2, 512, 1024, 8, 2, HEAD_SZ, dtype, fp8_dtype)
     triton_out = _flash_attn_forward(
         x.q_fp8,
         x.k_fp8,

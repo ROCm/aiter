@@ -89,6 +89,7 @@ def make_varlen_fp8_inputs(
     num_k_heads: int,
     head_sz: int,
     dtype=torch.bfloat16,
+    fp8_dtype=None,
 ):
     """Random padded varlen q/k/v, plus their per-(batch, head) fp8 quantization."""
     torch.manual_seed(20)
@@ -120,7 +121,7 @@ def make_varlen_fp8_inputs(
 
     # generate_qkv returns grad-tracking tensors; detach so the quantization below
     # doesn't build an autograd graph for this forward-only kernel.
-    fp8_dtype = get_fp8_e4m3_dtype()
+    fp8_dtype = fp8_dtype or get_fp8_e4m3_dtype()
     q_fp8, q_descale = quantize_fp8_per_bh(q_unpad.detach(), fp8_dtype, cu_seqlens_q)
     k_fp8, k_descale = quantize_fp8_per_bh(k_unpad.detach(), fp8_dtype, cu_seqlens_k)
     v_fp8, v_descale = quantize_fp8_per_bh(v_unpad.detach(), fp8_dtype, cu_seqlens_k)
