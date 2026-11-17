@@ -1,0 +1,2768 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+
+import random
+import sys
+from types import SimpleNamespace
+
+import pytest
+import torch
+import triton
+import triton.language as tl
+
+from aiter.ops.triton.attention.unified_attention import (
+    _is_gluon_available,
+    is_2d_gluon_available,
+    unified_attention,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
+from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton.utils.unified_attention_utils import (
+    get_unified_attention_config,
+)
+from aiter.test_common import checkAllclose
+from op_tests.triton_tests.quant.test_quant_mxfp4 import (
+    torch_dynamic_mxfp4_quant,
+)
+
+DEVICE_ARCH = arch_info.get_arch()
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+
+
+def shuffle_kv_cache(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+):
+    """
+    Shuffle key and value cache layout for optimized memory access.
+
+        layout: (num_lanes, num_elements_per_thread)
+            gfx1250: (16, 8) for BF16 and FP8.
+            gfx950: (16, 8) for BF16 and (16, 16) for FP8.
+
+        WMMA/MFMA instruction shape:
+            BF16: 16x16x32
+            FP8: 16x16x64
+    """
+    dtype = key_cache.dtype
+    assert value_cache.dtype == dtype
+    assert dtype in (torch.bfloat16, e4m3_dtype)
+
+    num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
+    num_blocks_v, block_size_v, num_kv_heads_v, head_size_v = value_cache.shape
+    assert block_size >= 16
+    assert num_blocks == num_blocks_v
+    assert num_kv_heads == num_kv_heads_v
+    assert head_size == head_size_v
+    assert block_size == block_size_v
+
+    k_width = 16 // key_cache.element_size()
+    key_cache_shuffled = key_cache.view(
+        -1, block_size, num_kv_heads, head_size
+    ).permute(0, 2, 3, 1)
+    key_cache_shuffled = key_cache_shuffled.view(
+        -1,
+        num_kv_heads,
+        head_size // k_width,
+        k_width,
+        block_size,
+    )
+    key_cache_shuffled = key_cache_shuffled.permute(0, 1, 2, 4, 3).contiguous()
+
+    value_cache_shuffled = value_cache.view(
+        -1, block_size, num_kv_heads, head_size
+    ).permute(0, 2, 1, 3)
+    value_cache_shuffled = value_cache_shuffled.view(
+        -1,
+        num_kv_heads,
+        block_size // k_width,
+        k_width,
+        head_size,
+    )
+    value_cache_shuffled = value_cache_shuffled.permute(0, 1, 2, 4, 3).contiguous()
+
+    return key_cache_shuffled, value_cache_shuffled
+
+
+def dynamic_nvfp4_quant_kv_cache(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+):
+    dtype = key_cache.dtype
+    assert value_cache.dtype == dtype
+    assert dtype == torch.bfloat16
+
+    num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
+    num_blocks_v, block_size_v, num_kv_heads_v, head_size_v = value_cache.shape
+    assert block_size >= 128
+    assert num_blocks == num_blocks_v
+    assert num_kv_heads == num_kv_heads_v
+    assert head_size == head_size_v
+    assert block_size == block_size_v
+
+    key_cache_shuffled = key_cache.view(
+        -1, block_size, num_kv_heads, head_size
+    ).permute(0, 2, 1, 3)
+    value_cache_shuffled = value_cache.view(
+        -1, block_size, num_kv_heads, head_size
+    ).permute(0, 2, 1, 3)
+
+    quant_head_size = head_size // 2
+    scale_width = head_size // 16
+
+    def quant_and_shuffle(key_or_value_cache):
+        cache_shuffled, cache_shuffled_scale = torch_dynamic_mxfp4_quant(
+            key_or_value_cache, is_nvfp4=True
+        )
+        cache_shuffled_scale = cache_shuffled_scale.view(
+            -1, num_kv_heads, block_size, scale_width
+        )
+        cache_shuffled = shuffle_weight(cache_shuffled, arch="gfx950").view(
+            -1, num_kv_heads, block_size * quant_head_size
+        )
+        cache_shuffled_scale = shuffle_scale_batched(cache_shuffled_scale).view(
+            -1, num_kv_heads, block_size * scale_width
+        )
+        cache_shuffled = torch.cat(
+            [
+                cache_shuffled.view(torch.uint8),
+                cache_shuffled_scale.view(torch.uint8),
+            ],
+            dim=-1,
+        ).contiguous()
+        cache_shuffled = cache_shuffled.view(
+            -1, num_kv_heads, block_size, quant_head_size + scale_width
+        )
+        return cache_shuffled
+
+    key_cache_quant_and_shuffled = quant_and_shuffle(key_cache_shuffled)
+    value_cache_quant_and_shuffled = quant_and_shuffle(value_cache_shuffled)
+
+    return key_cache_quant_and_shuffled, value_cache_quant_and_shuffled
+
+
+# e2m1 magnitudes by code (bit 3 is the sign), and the round-to-nearest-even boundaries between them
+_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_E2M1_BOUNDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+
+
+def _e2m1_rne_codes(x: torch.Tensor) -> torch.Tensor:
+    """fp32 -> e2m1 codes (uint8, 0..15), round to nearest even, saturating at 6."""
+    mag = x.abs().contiguous()
+    bounds = torch.tensor(_E2M1_BOUNDS, dtype=x.dtype, device=x.device)
+    # ties go to the lower code; a tie on an odd code's upper bound goes up, to the even code
+    code = torch.bucketize(mag, bounds, right=False)
+    tie = mag == bounds[code.clamp(max=len(_E2M1_BOUNDS) - 1)]
+    code = code + (tie & (code % 2 == 1)).to(code.dtype)
+    return (code | ((x < 0).to(code.dtype) << 3)).to(torch.uint8)
+
+
+def fp4pt_quant_v_cache(value_cache: torch.Tensor, ref: bool = True):
+    """A8K4V4PT's V cache (the reference writer for the fp4pt page layout).
+
+    value_cache [num_blocks, block_size, num_kv_heads, head_size] (bf16/fp32) ->
+      v: [num_blocks, num_kv_heads, block_size, head_size // 2 + 4] torch.float4_e2m1fn_x2, one
+         (block, kv head) row = [block_size * head_size / 2 B e2m1, shuffled exactly as the NVFP4 V data
+         (shuffle_weight, 16 x 16 B tiles) | block_size fp32 scales, token order]
+      v_ref: the values the kernel reads, e2m1 * scale, fp32 [num_blocks, block_size, num_kv_heads,
+         head_size] (None unless ref)
+    Per (token, kv head): s = amax(|v|) / 6, e2m1 = rne(v / s) (s = 0 stores zeros).
+    """
+    num_blocks, block_size, num_kv_heads, head_size = value_cache.shape
+    x = value_cache.permute(0, 2, 1, 3).to(torch.float32)  # [nb, kh, bs, d]
+    scale = x.abs().amax(dim=-1, keepdim=True) / 6.0
+    codes = _e2m1_rne_codes(x / torch.where(scale > 0, scale, 1.0))
+    packed = codes[..., 0::2] | (codes[..., 1::2] << 4)  # low nibble = even element
+    data = shuffle_weight(packed, arch="gfx950").reshape(
+        num_blocks, num_kv_heads, block_size * head_size // 2
+    )
+    tail = scale.reshape(num_blocks, num_kv_heads, block_size).contiguous()
+    v = (
+        torch.cat([data.view(torch.uint8), tail.view(torch.uint8)], dim=-1)
+        .contiguous()
+        .view(num_blocks, num_kv_heads, block_size, head_size // 2 + 4)
+        .view(torch.float4_e2m1fn_x2)
+    )
+    v_ref = None
+    if ref:
+        values = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=x.device)
+        deq = values[(codes & 7).long()] * torch.where(codes >= 8, -1.0, 1.0) * scale
+        v_ref = deq.permute(0, 2, 1, 3).contiguous()
+    return v, v_ref
+
+
+def fp4pt_dequant_v_cache(v: torch.Tensor) -> torch.Tensor:
+    """Reads an fp4pt V cache back (inverse of fp4pt_quant_v_cache's layout): fp32 [num_blocks, block_size,
+    num_kv_heads, head_size]. For checking a writer against the layout."""
+    num_blocks, num_kv_heads, block_size, row = v.shape
+    head_size = (row - 4) * 2
+    raw = v.view(torch.uint8).reshape(num_blocks, num_kv_heads, -1)
+    data = raw[..., : block_size * head_size // 2]
+    scale = (
+        raw[..., block_size * head_size // 2 :]
+        .contiguous()
+        .view(torch.float32)
+        .reshape(num_blocks, num_kv_heads, block_size, 1)
+    )
+    # undo shuffle_weight's (16, 16) tiling of [block_size, head_size // 2] bytes
+    packed = (
+        data.reshape(
+            num_blocks, num_kv_heads, block_size // 16, head_size // 2 // 32, 2, 16, 16
+        )
+        .permute(0, 1, 2, 5, 3, 4, 6)
+        .reshape(num_blocks, num_kv_heads, block_size, head_size // 2)
+    )
+    codes = torch.stack([packed & 0xF, packed >> 4], dim=-1).reshape(
+        num_blocks, num_kv_heads, block_size, head_size
+    )
+    values = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=v.device)
+    deq = values[(codes & 7).long()] * torch.where(codes >= 8, -1.0, 1.0) * scale
+    return deq.permute(0, 2, 1, 3).contiguous()
+
+
+def uniform_random(shape, start=0, end=1, dtype=torch.float32, device="cuda"):
+    return (end - start) * torch.rand(shape, dtype=dtype, device=device) + start
+
+
+def generate_data(
+    seq_lens,
+    num_blocks=32768,
+    block_size=32,
+    head_size=64,
+    v_head_size=None,
+    num_heads=(16, 2),
+    sliding_window=None,
+    q_dtype=torch.bfloat16,
+    kv_dtype=torch.bfloat16,
+    out_dtype=torch.bfloat16,
+    shuffled_kv_cache=False,
+    use_q_descale=None,
+    use_kv_descale=None,
+    use_out_scale=False,
+    device="cuda",
+):
+    torch.manual_seed(0)
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    num_query_heads = num_heads[0]
+    num_kv_heads = num_heads[1]
+    assert num_query_heads % num_kv_heads == 0
+    if v_head_size is None:
+        v_head_size = head_size
+    max_query_len = max(query_lens)
+    max_kv_len = max(kv_lens)
+    if sliding_window is not None and sliding_window > 0:
+        window_size = (sliding_window - 1, 0)
+    else:
+        window_size = (-1, -1)
+    scale = head_size**-0.5
+
+    # Descales default to "on for any non-bf16 input" unless the caller overrides.
+    if use_q_descale is None:
+        use_q_descale = q_dtype != torch.bfloat16
+    if use_kv_descale is None:
+        use_kv_descale = kv_dtype != torch.bfloat16
+
+    # ---- query ----
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=torch.float32, device=device
+    )
+    query_scales = None
+    if q_dtype == torch.uint8:
+        query = query / 10
+        maybe_quant_query = query.view(-1, head_size)
+        maybe_quant_query, query_scales = torch_dynamic_mxfp4_quant(
+            maybe_quant_query, is_nvfp4=True
+        )
+        maybe_quant_query = maybe_quant_query.view(-1, num_query_heads, head_size // 2)
+        query_scales = query_scales.view(-1, num_query_heads, head_size // 16)
+        query = query.to(e4m3_dtype)
+    else:
+        query = query.to(q_dtype)
+        maybe_quant_query = query
+
+    # ---- kv cache ----
+    key_cache = torch.randn(
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_size,
+        dtype=torch.float32,
+        device=device,
+    )
+    value_cache = torch.randn(
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        v_head_size,
+        dtype=torch.float32,
+        device=device,
+    )
+    if kv_dtype == torch.uint8:
+        key_cache_orig = key_cache.to(e4m3_dtype)
+        value_cache_orig = value_cache.to(e4m3_dtype)
+        key_cache, value_cache = dynamic_nvfp4_quant_kv_cache(
+            key_cache.to(torch.bfloat16), value_cache.to(torch.bfloat16)
+        )
+    else:
+        key_cache_orig = key_cache.to(kv_dtype)
+        value_cache_orig = value_cache.to(kv_dtype)
+        if shuffled_kv_cache:
+            key_cache, value_cache = shuffle_kv_cache(key_cache_orig, value_cache_orig)
+        else:
+            key_cache, value_cache = key_cache_orig, value_cache_orig
+
+    cu_query_lens = torch.tensor(
+        [0] + query_lens, dtype=torch.int32, device=device
+    ).cumsum(dim=0, dtype=torch.int32)
+    kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    max_num_blocks_per_seq = (
+        min(max_num_blocks_per_seq * num_seqs, num_blocks) // num_seqs
+    )
+    total_ind_count = num_seqs * max_num_blocks_per_seq
+    values = torch.arange(0, total_ind_count, dtype=torch.int, device=device)
+    values = values[torch.randperm(total_ind_count, device=device)]
+    block_tables = values.view(num_seqs, max_num_blocks_per_seq).contiguous()
+
+    sinks = torch.randn(num_query_heads, dtype=torch.float32, device=device)
+
+    output = torch.empty(
+        sum(query_lens), num_query_heads, v_head_size, dtype=out_dtype, device=device
+    )
+
+    # ---- descales / output scale ----
+    q_descale = None
+    k_descale = None
+    v_descale = None
+    output_scale = None
+    if use_q_descale:
+        q_descale = uniform_random(
+            1, start=1e-4, end=1.0, dtype=torch.float32, device=device
+        )
+    if use_kv_descale:
+        k_descale = uniform_random(
+            1, start=1e-4, end=1.0, dtype=torch.float32, device=device
+        )
+        v_descale = uniform_random(
+            1, start=1e-4, end=1.0, dtype=torch.float32, device=device
+        )
+    if use_out_scale:
+        output_scale = 1.0 / uniform_random(
+            1, start=1e-4, end=1.0, dtype=torch.float32, device=device
+        )
+
+    return (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        maybe_quant_query,
+        query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    )
+
+
+def ref_paged_attn(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    query_lens: list[int],
+    kv_lens: list[int],
+    block_tables: torch.Tensor,
+    scale: float,
+    out_dtype: torch.dtype,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    sinks: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    output_scale: torch.Tensor | None = None,
+    causal: int = 1,
+    qq_bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    num_seqs = len(query_lens)
+    _, block_size, num_kv_heads, head_size = key_cache.shape
+    v_head_size = value_cache.shape[-1]
+    outputs: list[torch.Tensor] = []
+    start_idx = 0
+    query = query.to(torch.float32)
+    key_cache = key_cache.to(torch.float32)
+    value_cache = value_cache.to(torch.float32)
+    if q_descale is not None:
+        query = query * q_descale
+    if k_descale is not None:
+        key_cache = key_cache * k_descale
+    if v_descale is not None:
+        value_cache = value_cache * v_descale
+    for i in range(num_seqs):
+        query_len = query_lens[i]
+        kv_len = kv_lens[i]
+        q = query[start_idx : start_idx + query_len]
+        q *= scale
+
+        num_kv_blocks = (kv_len + block_size - 1) // block_size
+        block_indices = block_tables[i, :num_kv_blocks]
+
+        k = key_cache[block_indices].view(-1, num_kv_heads, head_size)
+        k = k[:kv_len]
+        v = value_cache[block_indices].view(-1, num_kv_heads, v_head_size)
+        v = v[:kv_len]
+
+        if q.shape[1] != k.shape[1]:
+            k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
+            v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
+        attn = torch.einsum("qhd,khd->hqk", q, k).float()
+        empty_mask = torch.ones(query_len, kv_len, device=q.device, dtype=torch.float32)
+        mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
+        if sliding_window is not None:
+            sliding_window_mask = (
+                torch.triu(
+                    empty_mask, diagonal=kv_len - (query_len + sliding_window) + 1
+                )
+                .bool()
+                .logical_not()
+            )
+            mask |= sliding_window_mask
+        if soft_cap is not None and soft_cap > 0:
+            attn = soft_cap * torch.tanh(attn / soft_cap)
+        if qq_bias is not None:
+            attn[:, :, kv_len - query_len :] += qq_bias[:query_len, :query_len]
+        if causal:
+            attn.masked_fill_(mask, float("-inf"))
+        if sinks is not None:
+            s_aux = sinks[:, None, None].repeat_interleave(attn.shape[-2], dim=-2)
+            attn = torch.cat((attn, s_aux), dim=-1)
+        attn = torch.softmax(attn, dim=-1).to(v.dtype)
+        if sinks is not None:
+            attn = attn[..., :-1]
+        out = torch.einsum("hqk,khd->qhd", attn, v)
+        outputs.append(out)
+        start_idx += query_len
+
+    out = torch.cat(outputs, dim=0)
+    if output_scale is not None:
+        out = out / output_scale
+
+    return out.to(out_dtype)
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(1, 1328)],
+        [(1, 8192)] * 32,
+        [(1, 523), (1, 37), (1, 2011)],
+        [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],
+        [(2, 8704), (7, 8704)],
+        [(8, 8704)] * 32,
+    ],
+)
+@pytest.mark.parametrize("num_heads", [(64, 8), (8, 1)])
+@pytest.mark.parametrize("head_size", [64])
+@pytest.mark.parametrize("sliding_window", [None, 2048])
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype, o_dtype, block_size, use_out_scale",
+    [
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, 64, False),
+        (torch.bfloat16, e4m3_dtype, torch.bfloat16, 128, False),
+        (e4m3_dtype, e4m3_dtype, torch.bfloat16, 128, False),
+        (e4m3_dtype, e4m3_dtype, e4m3_dtype, 128, True),
+        (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
+        (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
+    ],
+)
+@pytest.mark.parametrize("soft_cap", [None])
+@pytest.mark.parametrize("num_blocks", [32768])
+@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
+@pytest.mark.parametrize("force_fp8_pv", [False, True])
+@torch.inference_mode()
+def test_triton_unified_attn_3d(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    sliding_window: int | None,
+    block_size: int,
+    soft_cap: float | None,
+    num_blocks: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    o_dtype: torch.dtype,
+    shuffled_kv_cache: bool,
+    use_out_scale: bool,
+    force_fp8_pv: bool,
+) -> None:
+    torch.cuda.empty_cache()
+
+    if DEVICE_ARCH not in (
+        "gfx950",
+        "gfx1250",
+    ):
+        # gfx1250 -> Gluon
+        # gfx950 -> Gluon
+        pytest.skip(f"skip {DEVICE_ARCH}")
+
+    if force_fp8_pv and kv_dtype != torch.uint8:
+        pytest.skip("force_fp8_pv_on_fp4_kv_cache only applies to an NVFP4 KV cache")
+    if kv_dtype == torch.uint8:
+        if DEVICE_ARCH not in ("gfx1250",):
+            pytest.skip(f"NVFP4 KV cache requires {DEVICE_ARCH}")
+        if not shuffled_kv_cache:
+            pytest.skip("NVFP4 KV cache requires shuffled KV cache")
+
+    if shuffled_kv_cache:
+        if q_dtype == e4m3_dtype and kv_dtype == e4m3_dtype and block_size < 32:
+            pytest.skip(
+                "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
+            )
+
+        num_stage_assume = 2
+        kv_cache_shared_mem_size = (
+            2 * num_stage_assume * block_size * head_size * kv_dtype.itemsize
+        )
+        LDS_limit = 327680 if IS_DEVICE_ARCH_GFX12 else 262144
+        if kv_cache_shared_mem_size > LDS_limit:
+            pytest.skip(
+                f"Skipping test for KV cache LDS required memory = {kv_cache_shared_mem_size / 1024} kB > 320 kB"
+            )
+
+    # TODO: Uncomment after pytorch adds support for manual_seed
+    torch.manual_seed(0)
+    query_lens = [x[0] for x in seq_lens]
+
+    (
+        query,
+        key_cache,
+        value_cache,
+        maybe_shuffled_key_cache,
+        maybe_shuffled_value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        maybe_quant_query,
+        query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        sliding_window=sliding_window,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        out_dtype=o_dtype,
+        shuffled_kv_cache=shuffled_kv_cache,
+        use_out_scale=use_out_scale,
+        device="cuda",
+    )
+
+    unified_attention(
+        q=maybe_quant_query,
+        k=maybe_shuffled_key_cache,
+        v=maybe_shuffled_value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=soft_cap if soft_cap is not None else 0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        q_scales=query_scales,
+        output_scale=output_scale,
+        sinks=sinks,
+        shuffled_kv_cache=shuffled_kv_cache,
+        force_fp8_pv_on_fp4_kv_cache=force_fp8_pv,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=query_lens,
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=o_dtype,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        output_scale=output_scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        sinks=sinks,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+    if q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16:
+        atol, rtol = 1.5e-1, 1.5e-1
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            output.to(torch.bfloat16),
+            ref_output.to(torch.bfloat16),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=tol_err_ratio,
+            msg="unified_attn_3d output",
+        )
+        <= tol_err_ratio
+    )
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(512, 512)],
+        [
+            (1, 15),
+            (12, 133),
+            (12, 87),
+            (1, 133),
+            (2, 343),
+            (567, 275),
+            (34, 345),
+            (777, 777),
+            (454, 345),
+            (1, 134),
+        ],
+    ],
+)
+@pytest.mark.parametrize("num_heads", [(8, 8), (8, 1)])
+@pytest.mark.parametrize("head_size", [64, 128, 256, 512])
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("sliding_window", [None, 256])
+@pytest.mark.parametrize(
+    "soft_cap",
+    [None, 50.0],
+)
+@pytest.mark.parametrize(
+    "num_blocks",
+    [2048, 32768],
+)
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype, out_dtype, use_q_descale, use_kv_descale, use_out_scale",
+    [
+        (torch.bfloat16, torch.bfloat16, torch.bfloat16, False, False, False),
+        (torch.bfloat16, e4m3_dtype, torch.bfloat16, False, True, False),
+        (e4m3_dtype, e4m3_dtype, torch.bfloat16, True, True, False),
+        (torch.float16, torch.float16, torch.float16, False, False, False),
+    ],
+)
+@pytest.mark.parametrize(
+    "shuffled_kv_cache",
+    [
+        True,
+        False,
+    ],
+)
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@torch.inference_mode()
+def test_triton_unified_attn(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    sliding_window: int | None,
+    block_size: int,
+    soft_cap: float | None,
+    num_blocks: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    use_q_descale: bool,
+    use_kv_descale: bool,
+    use_out_scale: bool,
+    shuffled_kv_cache: bool,
+    backend: str,  # "triton" | "gluon"
+) -> None:
+    if backend == "gluon" and not _is_gluon_available():
+        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    use_gluon_2d = is_2d_gluon_available(
+        SimpleNamespace(
+            q_dtype=q_dtype,
+            kv_cache_dtype=kv_dtype,
+            softcap=soft_cap,
+            use_qq_bias=False,
+            use_alibi_slopes=False,
+            head_size=head_size,
+            head_size_v=head_size,
+            shuffled_kv_cache=shuffled_kv_cache,
+            block_size=block_size,
+            k_width=16 // kv_dtype.itemsize,
+        ),
+        backend,
+    )
+    torch.manual_seed(0)
+    # shuffling only supported for gfx1250 gluon kernels
+    if shuffled_kv_cache and not use_gluon_2d:
+        pytest.skip("skip shuffled_kv_cache, 2d gluon not available")
+    # shuffle_kv_cache only defines the bf16 and fp8 layouts
+    if shuffled_kv_cache and kv_dtype == torch.float16:
+        pytest.skip("skip shuffled_kv_cache, fp16 shuffled layout not supported")
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        sliding_window=sliding_window,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        out_dtype=out_dtype,
+        shuffled_kv_cache=shuffled_kv_cache,
+        use_q_descale=use_q_descale,
+        use_kv_descale=use_kv_descale,
+        use_out_scale=use_out_scale,
+        device="cuda",
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=soft_cap if soft_cap is not None else 0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        output_scale=output_scale,
+        shuffled_kv_cache=shuffled_kv_cache,
+        backend=backend,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=out_dtype,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        sinks=sinks,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        output_scale=output_scale,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+    is_fp8 = kv_dtype.itemsize == 1 or q_dtype.itemsize == 1
+    if is_fp8:
+        atol, rtol = 1.5e-1, 1.5e-1
+    output = output.to(torch.float32)
+    ref_output = ref_output.to(torch.float32)
+    if is_fp8 and use_gluon_2d and (use_kv_descale or use_q_descale):
+        # For fp8 allow up to 1% of elements to fall outside tolerance.
+        # NOTE: fp8 + q/kv scaling causes around 0.1% mismatch with gluon kernel
+        # Might be related to softmax trick to use pk_fma
+        mismatch = torch.abs(output - ref_output) > atol + rtol * torch.abs(ref_output)
+        mismatch_fraction = mismatch.float().mean().item()
+        assert mismatch_fraction < 0.005, (
+            f"fp8 mismatch fraction {mismatch_fraction:.4%} exceeds 0.5% "
+            f"(max abs diff {torch.max(torch.abs(output - ref_output))})"
+        )
+    else:
+        (
+            torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
+            f"{torch.max(torch.abs(output - ref_output))}",
+        )
+
+
+# Query lengths that leave padded rows in the last query block (BLOCK_Q of 2/4/8),
+# on the 3D split-KV path (long KV) and the 2D path (KV <= 512).
+@pytest.mark.parametrize(
+    "num_heads, query_len, kv_len",
+    [
+        ((32, 8), 3, 4096),
+        ((32, 8), 4, 4096),
+        ((16, 1), 3, 4096),
+        ((32, 8), 3, 256),
+        ((32, 8), 5, 256),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_qq_bias_padded_query_rows(
+    num_heads: tuple[int, int], query_len: int, kv_len: int
+) -> None:
+    if DEVICE_ARCH == "gfx1250":
+        pytest.skip("gfx1250 Gluon kernel does not mask padded qq_bias rows")
+    seq_lens = [(query_len, kv_len)] * 2
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=2048,
+        block_size=16,
+        head_size=128,
+        num_heads=num_heads,
+        device="cuda",
+    )
+    qq_bias = torch.randn(query_len, query_len, dtype=torch.float32, device="cuda")
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        qq_bias=qq_bias,
+        backend="triton",
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[x[0] for x in seq_lens],
+        kv_lens=[x[1] for x in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=output.dtype,
+        qq_bias=qq_bias,
+    )
+    torch.testing.assert_close(
+        output.to(torch.float32), ref_output.to(torch.float32), atol=1.5e-2, rtol=1e-2
+    )
+
+
+@pytest.mark.parametrize("seq_lens", [[(448, 1344)], [(400, 1200)]])
+@torch.inference_mode()
+def test_triton_unified_attn_3d_padded_query_rows_deterministic(
+    seq_lens: list[tuple[int, int]],
+) -> None:
+    """Split-KV prefill gives the same output on each run. With 3 query heads
+    for each KV head, BLOCK_M has rows past BLOCK_Q tokens. These rows must not
+    store the segment stats of the next q block."""
+    (
+        query,
+        _key_cache_orig,
+        _value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=64,
+        block_size=64,
+        head_size=64,
+        num_heads=(12, 4),
+        device="cuda",
+    )
+
+    def run() -> torch.Tensor:
+        out = torch.empty_like(output)
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            backend="triton",
+        )
+        return out
+
+    expected = run()
+    for _ in range(20):
+        assert torch.equal(run(), expected)
+
+
+@pytest.mark.parametrize(
+    "seq_lens, num_heads, block_size, sliding_window",
+    [
+        ([(4, 3000), (8, 40000), (1, 9000)], (16, 2), 16, 2048),
+        ([(8, 8704)], (16, 2), 128, 2048),
+        ([(8, 582), (1, 582)], (16, 2), 64, 512),
+        ([(1, 8704)] * 4, (16, 2), 16, 2048),
+        ([(128, 1100)], (32, 32), 64, 1024),
+        ([(17, 1100)], (32, 32), 64, 1024),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_sw_verify_split(
+    seq_lens, num_heads, block_size, sliding_window
+):
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon split dispatch")
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    max_q = max(query_lens)
+    q, k, v, _, _, sinks, out, cu_q, kv_lens_t, _, max_k, scale, window, table = (
+        generate_data(
+            seq_lens,
+            num_blocks=len(seq_lens) * -(-max(kv_lens) // block_size),
+            block_size=block_size,
+            num_heads=num_heads,
+            sliding_window=sliding_window,
+        )[:14]
+    )
+    sinks = sinks + 8.0
+    ref = ref_paged_attn(
+        q,
+        k,
+        v,
+        query_lens,
+        kv_lens,
+        table,
+        scale,
+        torch.bfloat16,
+        sliding_window,
+        sinks=sinks,
+    ).float()
+
+    first = [max(0, kv - ql - sliding_window + 1) // block_size for ql, kv in seq_lens]
+    width = (sliding_window + max_q + block_size - 2) // block_size + 1
+    index = torch.tensor(first, device="cuda")[:, None] + torch.arange(
+        width, device="cuda"
+    )
+    trimmed_lens = [kv - fb * block_size for kv, fb in zip(kv_lens, first)]
+    assert max(trimmed_lens) <= sliding_window + max_q + block_size - 2
+
+    for block_table, lens, max_seqlen_k in [
+        (table, kv_lens_t, max_k),
+        (
+            table.gather(1, index.clamp(max=table.shape[1] - 1)),
+            torch.tensor(trimmed_lens, dtype=torch.int32, device="cuda"),
+            max(trimmed_lens),
+        ),
+    ]:
+        out = torch.empty_like(out)
+        unified_attention(
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            cu_seqlens_q=cu_q,
+            max_seqlen_q=max_q,
+            seqused_k=lens,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window,
+            block_table=block_table,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            sinks=sinks,
+        )
+        torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "seq_lens, num_heads, block_size",
+    [
+        ([(8, 10246)], (16, 2), 8192),
+        ([(8, 6150), (1, 6150)], (8, 1), 4096),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_sw_split_no_sinks(seq_lens, num_heads, block_size):
+    # a page much longer than a tile leaves 32+ empty leading segments, a whole
+    # reduce chunk at head 256, which without sinks has no finite max
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon split dispatch")
+
+    sliding_window = 2048
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    q, k, v, _, _, _, out, cu_q, kv_lens_t, max_q, max_k, scale, window, table = (
+        generate_data(
+            seq_lens,
+            num_blocks=len(seq_lens) * -(-max(kv_lens) // block_size),
+            block_size=block_size,
+            head_size=256,
+            num_heads=num_heads,
+            sliding_window=sliding_window,
+        )[:14]
+    )
+    ref = ref_paged_attn(
+        q, k, v, query_lens, kv_lens, table, scale, torch.bfloat16, sliding_window
+    ).float()
+
+    unified_attention(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=max_q,
+        seqused_k=kv_lens_t,
+        max_seqlen_k=max_k,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window,
+        block_table=table,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+    )
+    torch.testing.assert_close(out.float(), ref, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(1, 1328)],
+        [(1, 523), (1, 37), (1, 2011)],
+        [(256, 256)],
+        [(1, 137), (5, 1024), (1, 19)],
+    ],
+)
+@pytest.mark.parametrize("num_heads", [(64, 8), (8, 1)])
+@pytest.mark.parametrize(
+    "head_size, v_head_size",
+    [
+        # MiMo decode: qk head wider than the value head
+        (192, 128),
+        # symmetric, must stay identical to the single-mask path
+        (128, 128),
+        # value head wider than qk, the reverse ordering
+        (128, 192),
+    ],
+)
+@pytest.mark.parametrize("block_size", [16, 64])
+# fp8 prefill takes the SPLIT_UNMASKED_LOOP path on gfx950
+@pytest.mark.parametrize(
+    "q_dtype, kv_dtype",
+    [(torch.bfloat16, torch.bfloat16), (e4m3_dtype, e4m3_dtype)],
+)
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@torch.inference_mode()
+def test_triton_unified_attn_asym_head(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    v_head_size: int,
+    block_size: int,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    backend: str,
+) -> None:
+    if backend == "gluon" and not _is_gluon_available():
+        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    torch.manual_seed(0)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        block_size=block_size,
+        head_size=head_size,
+        v_head_size=v_head_size,
+        num_heads=num_heads,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        device="cuda",
+    )
+
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        output_scale=output_scale,
+        backend=backend,
+    )
+
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sinks=sinks,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    atol, rtol = 1.5e-2, 1e-2
+    if q_dtype != torch.bfloat16 or kv_dtype != torch.bfloat16:
+        atol, rtol = 1.5e-1, 1.5e-1
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            output.to(torch.bfloat16),
+            ref_output.to(torch.bfloat16),
+            atol=atol,
+            rtol=rtol,
+            tol_err_ratio=tol_err_ratio,
+            msg=f"unified_attn asym head qk={head_size} v={v_head_size}",
+        )
+        <= tol_err_ratio
+    )
+
+
+@pytest.mark.parametrize("case", ["shuffled_kv_cache", "out_qk_width"])
+@torch.inference_mode()
+def test_triton_unified_attn_asym_head_guards(case: str) -> None:
+    head_size, v_head_size = 192, 128
+    (
+        query,
+        _key_cache_orig,
+        _value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        _q_descale,
+        _k_descale,
+        _v_descale,
+        _output_scale,
+    ) = generate_data(
+        seq_lens=[(1, 523)],
+        num_blocks=64,
+        block_size=64,
+        head_size=head_size,
+        v_head_size=v_head_size,
+        num_heads=(8, 1),
+        device="cuda",
+    )
+    shuffled = case == "shuffled_kv_cache"
+    if shuffled:
+        # shuffle_kv_cache wants matching heads, so shuffle k and v on their own
+        key_cache = shuffle_kv_cache(key_cache, key_cache)[0]
+        value_cache = shuffle_kv_cache(value_cache, value_cache)[1]
+    else:
+        # the old convention: out sized by the qk head
+        output = output.new_empty((*output.shape[:-1], head_size))
+
+    with pytest.raises(AssertionError, match="value head size"):
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=output,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            sinks=sinks,
+            shuffled_kv_cache=shuffled,
+            backend="triton",
+        )
+
+
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@torch.inference_mode()
+def test_triton_unified_attn_packed_kv_over_2gib(backend: str) -> None:
+    # vLLM passes k and v as strided views of one cache that packs k and v in
+    # the last dim. Each view has fewer than 2 GiB of elements, but the view
+    # spans more than 2 GiB, so blocks at the end need 64-bit offsets.
+    if backend == "gluon" and not _is_gluon_available():
+        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
+    torch.manual_seed(0)
+    num_blocks, block_size, num_kv_heads, head_size = 40000, 16, 8, 128
+    num_query_heads = 64
+    dtype = torch.bfloat16
+    kv_cache = torch.empty(
+        num_blocks, num_kv_heads, block_size, 2 * head_size, dtype=dtype, device="cuda"
+    )
+    kv_cache.uniform_(-1, 1)
+    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_size, dim=-1)
+    assert key_cache.nelement() * key_cache.element_size() < 2**31
+    assert key_cache[-1].data_ptr() - kv_cache.data_ptr() >= 2**31
+
+    seq_lens = [(1, 1328), (4, 2011), (1, 37), (16, 523)]
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens_list = [x[1] for x in seq_lens]
+    max_blocks = max((kv + block_size - 1) // block_size for kv in kv_lens_list)
+    # The blocks past 2 GiB, at the end of the cache.
+    block_tables = torch.arange(
+        num_blocks - len(seq_lens) * max_blocks,
+        num_blocks,
+        dtype=torch.int32,
+        device="cuda",
+    ).view(len(seq_lens), max_blocks)
+
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=dtype, device="cuda"
+    )
+    output = torch.empty_like(query)
+    cu_query_lens = torch.tensor(
+        [0] + query_lens, dtype=torch.int32, device="cuda"
+    ).cumsum(dim=0, dtype=torch.int32)
+    kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
+    scale = head_size**-0.5
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=max(kv_lens_list),
+        softmax_scale=scale,
+        causal=True,
+        window_size=(-1, -1),
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        backend=backend,
+    )
+
+    # Give the reference only the blocks in use.
+    used = block_tables.flatten().long()
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache[used].contiguous(),
+        value_cache=value_cache[used].contiguous(),
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=torch.arange(used.numel(), device=block_tables.device).view(
+            block_tables.shape
+        ),
+        scale=scale,
+        out_dtype=dtype,
+    )
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+def _spec_verify_seq_lens(batch: int, max_query_len: int, seed: int):
+    """Verify-step batch: mixed query lengths up to 1 + num_spec, mixed contexts."""
+    rng = random.Random(seed)
+    return [
+        (rng.randint(1, max_query_len), rng.randint(max_query_len + 1, 3000))
+        for _ in range(batch)
+    ]
+
+
+@pytest.mark.parametrize(
+    "path, sliding_window", [("3d", None), ("2d", None), ("2d", 256), ("auto", None)]
+)
+@pytest.mark.parametrize("batch, seed", [(7, 0), (31, 1), (61, 2), (128, 3)])
+@pytest.mark.parametrize("max_query_len", [4, 8])
+@pytest.mark.parametrize("num_heads", [(16, 2), (16, 4), (16, 8), (16, 16)])
+@pytest.mark.parametrize("head_size", [128, 256])
+@torch.inference_mode()
+def test_unified_attn_spec_verify_gfx1250(
+    path: str,
+    sliding_window: int | None,
+    batch: int,
+    seed: int,
+    max_query_len: int,
+    num_heads: tuple[int, int],
+    head_size: int,
+    monkeypatch,
+) -> None:
+    """Short multi-token queries (speculative-decode verify) on gfx1250: the 3D
+    split-KV kernel, where query rows of one block have different causal horizons
+    so a split segment can be partly or wholly past a row's horizon, and the 2D
+    kernel with a BLOCK_M sized to the query rows."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Gluon kernels")
+    if path != "auto":
+        monkeypatch.setattr(
+            sys.modules[unified_attention.__module__],
+            "use_2d_kernel",
+            lambda params, backend="triton": path == "2d",
+        )
+    torch.manual_seed(seed)
+    seq_lens = _spec_verify_seq_lens(batch, max_query_len, seed)
+    block_size = 16
+    (
+        query,
+        key_cache,
+        value_cache,
+        shuffled_key_cache,
+        shuffled_value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=batch * (3000 // block_size + 1) + 64,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        sliding_window=sliding_window,
+        shuffled_kv_cache=True,
+        device="cuda",
+    )
+    unified_attention(
+        q=query,
+        k=shuffled_key_cache,
+        v=shuffled_value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=None,
+        shuffled_kv_cache=True,
+    )
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=kv_lens,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=sliding_window,
+        soft_cap=None,
+        sinks=None,
+    )
+    assert not output.isnan().any()
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("path", ["3d", "2d", "auto"])
+@pytest.mark.parametrize("shuffled_kv_cache", [True, False])
+@pytest.mark.parametrize("query_len", [4, 16, 32])
+@pytest.mark.parametrize("num_heads", [(16, 2), (4, 1)])
+@pytest.mark.parametrize("head_size", [128, 256])
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("batch, num_pad", [(5, 0), (37, 3)])
+@torch.inference_mode()
+def test_unified_attn_equal_seqlen_q_gfx1250(
+    path: str,
+    shuffled_kv_cache: bool,
+    query_len: int,
+    num_heads: tuple[int, int],
+    head_size: int,
+    block_size: int,
+    batch: int,
+    num_pad: int,
+    monkeypatch,
+) -> None:
+    """equal_seqlen_q=True on gfx1250: the kernels index seq i's queries at rows
+    [i, i + 1) * max_seqlen_q instead of searching cu_seqlens_q. Covers one and
+    several query blocks a sequence (query_len * num_queries_per_kv against
+    BLOCK_M), both KV layouts, and trailing pad seqs as a DP-padded batch has
+    them: no query rows behind them and seqused_k == 0, which must neither
+    shift the real seqs' rows nor write past them."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Gluon kernels")
+    if path == "3d" and not shuffled_kv_cache:
+        pytest.skip("the gfx1250 3D Gluon kernel needs the shuffled KV cache")
+    if path == "auto" and not shuffled_kv_cache:
+        # short queries route to 3D, which without the shuffled cache is the Triton
+        # 3D kernel; it misses the reference here with or without equal_seqlen_q
+        pytest.skip("unshuffled short queries route to the Triton 3D kernel")
+    if path != "auto":
+        monkeypatch.setattr(
+            sys.modules[unified_attention.__module__],
+            "use_2d_kernel",
+            lambda params, backend="triton": path == "2d",
+        )
+    rng = random.Random(batch * 1000 + query_len)
+    seq_lens = [(query_len, rng.randint(query_len, 3000)) for _ in range(batch)]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        _output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=batch * (3000 // block_size + 1) + 64,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        shuffled_kv_cache=shuffled_kv_cache,
+        device="cuda",
+    )
+    num_tokens = batch * query_len
+    # Trailing pad seqs: cu_seqlens_q repeats the last offset, no KV, any block table.
+    cu_seqlens_q = torch.cat([cu_query_lens, cu_query_lens[-1:].repeat(num_pad)])
+    seqused_k = torch.cat(
+        [kv_lens, torch.zeros(num_pad, dtype=kv_lens.dtype, device=kv_lens.device)]
+    )
+    block_table = torch.cat([block_tables, block_tables[:1].repeat(num_pad, 1)])
+    # out is a view into a larger buffer: rows past the real tokens must stay intact.
+    sentinel = 7.0
+    out_buf = torch.full(
+        (num_tokens + (num_pad + 1) * query_len, num_heads[0], head_size),
+        sentinel,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    output = out_buf[:num_tokens]
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seqused_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_table,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=None,
+        shuffled_kv_cache=shuffled_kv_cache,
+        equal_seqlen_q=True,
+    )
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=[k for _, k in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+    )
+    assert not output.isnan().any()
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+    assert (out_buf[num_tokens:] == sentinel).all(), "wrote past the real tokens"
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # uneven: a big chunk over a short context next to a few tokens over a long one
+        # -> 3D above the program cap, with the split widened
+        [(3000, 6000), (8, 20000)],
+        # even and long: two 4000-token chunks over 20k contexts -> 2D, wider block/tile
+        [(4000, 20000), (4000, 20000)],
+        # fresh prompts: untouched by the hint
+        [(2048, 2048), (1024, 1024)],
+    ],
+)
+@pytest.mark.parametrize("with_hint", [True, False])
+@torch.inference_mode()
+def test_unified_attn_attn_work_gfx1250(seq_lens, with_hint: bool) -> None:
+    """The optional attn_work hint (sum of q x (k - q / 2)) only steers the gfx1250
+    prefill routing and config; the output must match the reference either way."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("gfx1250 Gluon kernels")
+    block_size, head_size, num_heads = 64, 256, (4, 1)
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_seqlen_q,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * (max(k for _, k in seq_lens) // block_size + 1) + 64,
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        shuffled_kv_cache=True,
+        device="cuda",
+    )
+    attn_work = int(sum(q * (k - q / 2) for q, k in seq_lens)) if with_hint else None
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        sinks=None,
+        shuffled_kv_cache=True,
+        attn_work=attn_work,
+    )
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=[k for _, k in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+    )
+    assert not output.isnan().any()
+    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+def test_gfx1250_ua2d_register_store_gate() -> None:
+    """The config flag is the register-store switch. Check it on any machine.
+
+    The lookup uses the wider head, and the output dtype is not an axis, so
+    those shapes follow that entry.
+    """
+    b, f, e, u = torch.bfloat16, torch.float16, e4m3_dtype, torch.uint8
+    # name, q head, v head, G, page, q, kv, out, q len, tdm, tile
+    cases = [
+        ("bf16", 64, 64, 8, 64, b, b, b, 1, False, 64),
+        ("fp16 q/kv", 64, 64, 8, 64, f, f, b, 1, False, 64),
+        ("fp8 q/kv", 64, 64, 8, 64, e, e, b, 1, False, 128),
+        ("bf16 q fp8 kv", 64, 64, 8, 64, b, e, b, 1, False, 64),
+        ("nvfp4 kv", 64, 64, 8, 64, b, u, b, 1, False, 64),
+        ("q head 64 v 32", 64, 32, 8, 64, b, b, b, 1, False, 64),
+        ("q head 32 v 64", 32, 64, 8, 64, b, b, b, 1, False, 64),
+        ("fp8 asymmetric", 64, 32, 8, 64, e, e, b, 1, False, 128),
+        ("fp16 out", 64, 64, 8, 64, b, b, f, 1, False, 64),
+        ("tp2", 64, 64, 4, 64, b, b, b, 1, True, 64),
+        ("page 16", 64, 64, 8, 16, b, b, b, 1, True, 64),
+        ("extend", 64, 64, 8, 64, b, b, b, 128, True, 64),
+    ]
+    for case in cases:
+        name, hq, hv, group, page, q_dtype, kv_dtype, out_dtype, q_len, tdm, tile = case
+        params = SimpleNamespace(
+            head_size=hq,
+            head_size_v=hv,
+            max_seqlen_q=q_len,
+            max_seqlen_k=4096,
+            sliding_window=0,
+            shuffled_kv_cache=True,
+            q_dtype=q_dtype,
+            kv_cache_dtype=kv_dtype,
+            block_size=page,
+            num_queries_per_kv=group,
+            all_decode=q_len == 1,
+            num_2d_prgms=1,
+            num_sms=1,
+            out=SimpleNamespace(dtype=out_dtype),
+        )
+        config = get_unified_attention_config(
+            "attn_2d", params, backend="gluon", arch="gfx1250"
+        )
+        assert config["TILE_SIZE"] == tile, name
+        assert config.pop("USE_TDM_STORE", True) is tdm, name
+
+    rows = [
+        ("bf16", b, b, 64),
+        ("fp16 q/kv", f, f, 64),
+        ("fp8 q/kv", e, e, 128),
+        ("bf16 q fp8 kv", b, e, 64),
+        ("nvfp4 kv", b, u, 64),
+    ]
+
+    def params(group, q_dtype, kv_dtype, window=0, seq_k=4096, shuffled=True):
+        return SimpleNamespace(
+            head_size=64,
+            head_size_v=64,
+            max_seqlen_q=1,
+            max_seqlen_k=seq_k,
+            sliding_window=window,
+            shuffled_kv_cache=shuffled,
+            q_dtype=q_dtype,
+            kv_cache_dtype=kv_dtype,
+            block_size=64,
+            num_queries_per_kv=group,
+            all_decode=True,
+            num_2d_prgms=1,
+            num_sms=1,
+            out=SimpleNamespace(dtype=b),
+        )
+
+    def lookup(p):
+        return get_unified_attention_config(
+            "attn_2d", p, backend="gluon", arch="gfx1250"
+        )
+
+    # The store flag must survive changes to window, KV length, and shuffle axes.
+    for name, qd, kd, tile in rows:
+        for window in (0, 128):
+            for seq_k in (1024, 4096):
+                for shuffled in (False, True):
+                    tag = f"{name} sw={window} sk={seq_k} shuffled={shuffled}"
+                    p = params(8, qd, kd, window, seq_k, shuffled)
+                    cfg = lookup(p)
+                    assert cfg.pop("USE_TDM_STORE", True) is False, tag
+                    assert cfg["TILE_SIZE"] == tile, tag
+
+    # The flagged entries copy the tuning of the entries they replace. The G=4
+    # shape resolves to those entries, so a retune of one of them shows up here.
+    for name, qd, kd, _tile in rows:
+        flagged = lookup(params(8, qd, kd))
+        original = lookup(params(4, qd, kd))
+        assert flagged.pop("USE_TDM_STORE", True) is False, name
+        assert "USE_TDM_STORE" not in original, name
+        assert flagged == original, name
+
+
+@pytest.mark.parametrize("num_seqs", [4, 64])
+@pytest.mark.parametrize(
+    "dtype, shuffled",
+    [
+        (torch.bfloat16, False),
+        (torch.bfloat16, True),
+        (torch.float16, False),
+        (e4m3_dtype, False),
+    ],
+)
+@torch.inference_mode()
+def test_gfx1250_gluon_ua2d_decode_register_store(
+    num_seqs: int, dtype: torch.dtype, shuffled: bool, monkeypatch
+) -> None:
+    """Check public decode routing, both store flags, and numerical results.
+
+    Graph replays must match the eager output bitwise.
+    """
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip(f"gfx1250 Gluon 2D kernel only, not {DEVICE_ARCH}")
+
+    random.seed(0)
+    seq_lens = [(1, random.randint(1, 4096)) for _ in range(num_seqs)]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_rest,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=num_seqs * 64 + 64,
+        block_size=64,
+        head_size=64,
+        num_heads=(64, 8),
+        sliding_window=128,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        shuffled_kv_cache=shuffled,
+        use_q_descale=False,
+        use_kv_descale=False,
+        device="cuda",
+    )
+
+    module = sys.modules[unified_attention.__module__]
+    kernel = module._unified_attention_kernel_2d_gfx1250
+    launches = []
+
+    class CheckedLaunch:
+        def __getitem__(self, grid):
+            launch = kernel[grid]
+
+            def checked(**kwargs):
+                assert kwargs["USE_TDM_STORE"] is False
+                assert kwargs["USE_STORE_BUFFER_OP"] is False
+                launches.append(grid)
+                return launch(**kwargs)
+
+            return checked
+
+    monkeypatch.setattr(module, "_unified_attention_kernel_2d_gfx1250", CheckedLaunch())
+
+    def run(out):
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=max_query_len,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            sinks=None,
+            shuffled_kv_cache=shuffled,
+            backend="gluon",
+        )
+
+    eager = torch.empty_like(output)
+    run(eager)
+    assert launches, "public wrapper did not launch the gfx1250 Gluon 2D kernel"
+    ref_output = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=[q for q, _ in seq_lens],
+        kv_lens=[k for _, k in seq_lens],
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        sliding_window=128,
+        soft_cap=None,
+        sinks=None,
+    )
+    atol, rtol = (1.5e-1, 1.5e-1) if dtype == e4m3_dtype else (1.5e-2, 1e-2)
+    torch.testing.assert_close(eager, ref_output, atol=atol, rtol=rtol)
+
+    graph_out = torch.empty_like(output)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(graph_out)
+    for replay in range(32):
+        graph_out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(graph_out, eager), f"graph replay {replay} differs"
+
+
+def _ua_kv_inputs(
+    seq_lens,
+    num_heads,
+    head_size,
+    block_size,
+    num_blocks,
+    kv_format="k4v8",
+    ref=True,
+):
+    """fp8 Q and an NVFP4 K cache with an fp8 V (kv_format "k4v8", A8K4V8) or an fp4pt V ("k4v4pt",
+    A8K4V4PT), built by the benchmark's _make_ua_cache / _make_ua_rotating_inputs (they replaced the
+    old bench.make_inputs in #6839). Keys as make_inputs gave them; value_cache is the V the kernels read
+    (shuffled fp8, or fp4pt). ref: fp32 dequantized K (and fp4pt V) for the reference; the fp8 V reference
+    is the fp8 cache with v_descale."""
+    from op_tests.op_benchmarks.triton import bench_unified_attention_k4v4pt as bench
+
+    assert kv_format in ("k4v8", "k4v4pt")
+    k4v4pt = kv_format == "k4v4pt"
+    k, v, k_ref, v_ref, k_descale, v_descale, scale = bench._make_ua_cache(
+        num_heads[1],
+        head_size,
+        head_size,
+        block_size,
+        num_blocks,
+        fp8_kv=not k4v4pt,
+        shuffled_kv_cache=True,
+        nvfp4_kv=True,
+        nvfp4_ref=ref,
+        nvfp4_v=False,
+        v_fp4pt=k4v4pt,
+    )
+    (
+        q,
+        output,
+        cu_query_lens,
+        kv_lens,
+        query_lens,
+        block_tables,
+        q_descale,
+        _q_scales,
+        _out_scale,
+        max_query_len,
+        max_kv_len,
+    ) = bench._make_ua_rotating_inputs(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        head_size_qk=head_size,
+        head_size_v=head_size,
+        block_size=block_size,
+        num_blocks=num_blocks,
+        fp8_q=True,
+        fp8_output=False,
+        out_scale_value=1.0,
+    )
+    return {
+        "q_fp8": q,
+        "k_nvfp4": k,
+        "value_cache": v,
+        "query_ref": q.to(torch.float32) * q_descale,
+        "key_ref": k_ref,
+        "value_ref": v_ref,
+        "q_descale": q_descale,
+        "k_descale": k_descale,
+        "v_descale": v_descale,
+        "output": output,
+        "cu_query_lens": cu_query_lens,
+        "kv_lens": kv_lens,
+        "query_lens": query_lens,
+        "block_tables": block_tables,
+        "max_query_len": max_query_len,
+        "max_kv_len": max_kv_len,
+        "scale": scale,
+    }
+
+
+@pytest.mark.parametrize("path", ["2d", "3d", "auto"])
+@pytest.mark.parametrize("block_size", [64, 128])
+@pytest.mark.parametrize("head_size", [128, 256])
+@pytest.mark.parametrize("num_heads", [(4, 1), (16, 2)])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)],  # decode
+        [(4, 3000)] * 8,  # spec-decode verify
+        [(512, 512), (1024, 2048), (37, 1500)],  # prefill, with a cached prefix
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_k4v8(
+    path: str,
+    block_size: int,
+    head_size: int,
+    num_heads: tuple[int, int],
+    seq_lens: list[tuple[int, int]],
+    monkeypatch,
+) -> None:
+    """A8K4V8 on gfx1250: fp8 Q, NVFP4 K (e2m1 values, one e4m3 scale per 16, shuffled; scales preshuffled per
+    min(128, page) rows) and fp8 V (shuffled), through the 2D and 3D kernels. The reference reads the dequantized
+    K and the fp8 V with its descale; P is fp8 in the PV WMMA, as for A8W8, so the bound is on the relative L2.
+    """
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
+    if path != "auto":
+        monkeypatch.setattr(
+            sys.modules[unified_attention.__module__],
+            "use_2d_kernel",
+            lambda params, backend="triton": path == "2d",
+        )
+    torch.manual_seed(0)
+    num_blocks = (
+        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
+        + 16
+    )
+    inp = _ua_kv_inputs(seq_lens, num_heads, head_size, block_size, num_blocks)
+    value_cache = inp["value_cache"]
+    output = torch.full_like(inp["output"], float("nan"))
+    unified_attention(
+        q=inp["q_fp8"],
+        k=inp["k_nvfp4"],
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=inp["cu_query_lens"],
+        seqused_k=inp["kv_lens"],
+        max_seqlen_q=inp["max_query_len"],
+        max_seqlen_k=inp["max_kv_len"],
+        softmax_scale=inp["scale"],
+        causal=True,
+        window_size=(-1, -1),
+        block_table=inp["block_tables"],
+        softcap=0,
+        q_descale=inp["q_descale"],
+        k_descale=inp["k_descale"],
+        v_descale=inp["v_descale"],
+        shuffled_kv_cache=True,
+        backend="gluon",
+    )
+    ref = ref_paged_attn(
+        query=inp["query_ref"],
+        key_cache=inp["key_ref"],
+        value_cache=inp["value_ref"],
+        query_lens=inp["query_lens"],
+        kv_lens=inp["kv_lens"],
+        block_tables=inp["block_tables"],
+        scale=inp["scale"],
+        sliding_window=None,
+        soft_cap=None,
+        q_descale=None,
+        k_descale=inp["k_descale"],
+        v_descale=inp["v_descale"],
+        output_scale=None,
+        out_dtype=torch.bfloat16,
+    ).float()
+    out = output.float()
+    assert not out.isnan().any()
+    rel = ((out - ref).norm() / ref.norm()).item()
+    assert rel < 0.04, f"relative L2 error {rel:.4f}"
+    assert (out - ref).abs().max().item() < 0.15
+
+
+# A8K4V4PT PV variants (AITER_UA_FP4PT_PV_MODE) and their bounds on (relative L2, max abs) against the fp32
+# reference over the dequantized K / V. The reference sees exactly the e2m1 * scale values the kernel reads, so
+# the per-token fp4 quantization error is not in the bound, only the kernel's own roundings:
+#   "p": P * s rounded to bf16 (rtz; A8K4V8's P is fp8): ~2^-8 relative per term, so half of A8K4V8's bound.
+#   "fp8": P * s / 2^E in fp8 e4m3, like A8K4V8's fp8 P: A8K4V8's bound (rel L2 0.04, max abs 0.15).
+_K4V4PT_TOL = {"p": (0.02, 0.075), "fp8": (0.04, 0.15)}
+
+
+@pytest.mark.parametrize("pv_mode", ["p", "fp8"])
+@pytest.mark.parametrize("head_size", [128, 256])
+@pytest.mark.parametrize("num_heads", [(16, 2), (4, 1)])
+@pytest.mark.parametrize(
+    "seq_lens, equal_seqlen_q",
+    [
+        # decode: ALL_DECODE, one page short of a tile through 8k; a sequence shorter than one page
+        ([(1, 1328), (1, 523), (1, 37), (1, 2011), (1, 8192)], True),
+        # spec-decode verify (SPEC_DECODE), the Qwen MTP-3 shape
+        ([(4, 3000)] * 8, True),
+        # verify rows on the cu_seqlens_q search path, uneven contexts, a last page with 1 live slot
+        ([(4, 1329), (4, 128), (4, 4097), (4, 640)], False),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_k4v4pt(
+    pv_mode: str,
+    head_size: int,
+    num_heads: tuple[int, int],
+    seq_lens: list[tuple[int, int]],
+    equal_seqlen_q: bool,
+    monkeypatch,
+) -> None:
+    """A8K4V4PT on gfx1250 (3D kernel, 128-token pages): fp8 Q, NVFP4 K (as A8K4V8) and an fp4pt V (e2m1 in the
+    NVFP4-V layout + one fp32 scale per token and KV head at the page row's tail), for each PV variant. The
+    reference is fp32 attention over the dequantized K and V (e2m1 * scale)."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V4PT runs on the gfx1250 Gluon 3D kernel")
+    monkeypatch.setenv("AITER_UA_FP4PT_PV_MODE", pv_mode)
+    torch.manual_seed(0)
+    block_size = 128
+    num_blocks = (
+        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
+        + 16
+    )
+    inp = _ua_kv_inputs(
+        seq_lens, num_heads, head_size, block_size, num_blocks, kv_format="k4v4pt"
+    )
+    assert inp["value_cache"].dtype == torch.float4_e2m1fn_x2
+    output = torch.full_like(inp["output"], float("nan"))
+    unified_attention(
+        q=inp["q_fp8"],
+        k=inp["k_nvfp4"],
+        v=inp["value_cache"],
+        out=output,
+        cu_seqlens_q=inp["cu_query_lens"],
+        seqused_k=inp["kv_lens"],
+        max_seqlen_q=inp["max_query_len"],
+        max_seqlen_k=inp["max_kv_len"],
+        softmax_scale=inp["scale"],
+        causal=True,
+        window_size=(-1, -1),
+        block_table=inp["block_tables"],
+        softcap=0,
+        q_descale=inp["q_descale"],
+        k_descale=inp["k_descale"],
+        v_descale=inp["v_descale"],
+        shuffled_kv_cache=True,
+        equal_seqlen_q=equal_seqlen_q,
+        backend="gluon",
+    )
+    ref = ref_paged_attn(
+        query=inp["query_ref"],
+        key_cache=inp["key_ref"],
+        value_cache=inp["value_ref"],
+        query_lens=inp["query_lens"],
+        kv_lens=inp["kv_lens"],
+        block_tables=inp["block_tables"],
+        scale=inp["scale"],
+        sliding_window=None,
+        soft_cap=None,
+        q_descale=None,
+        k_descale=inp["k_descale"],
+        v_descale=inp["v_descale"],
+        output_scale=None,
+        out_dtype=torch.float32,
+    )
+    out = output.float()
+    assert not out.isnan().any()
+    rel_max, abs_max = _K4V4PT_TOL[pv_mode]
+    rel = ((out - ref).norm() / ref.norm()).item()
+    err = (out - ref).abs().max().item()
+    assert rel < rel_max, f"relative L2 error {rel:.4f} (bound {rel_max})"
+    assert err < abs_max, f"max abs error {err:.4f} (bound {abs_max})"
+
+
+# A8K4V4PT prefill: no prefix, a cached prefix, and a long prefix (4096 new tokens over 20000 cached, the
+# Qwen3.5 chunked-prefill shape whose 2D output gate is fused at any setting); a mixed batch on the
+# cu_seqlens_q search path with partial last pages
+_K4V4PT_PREFILL = [
+    [(478, 478)],
+    [(600, 3600)],
+    [(1500, 1500)],
+    [(4096, 4096 + 20000)],
+    [(478, 478), (600, 3600), (37, 1500), (1500, 1500)],
+]
+
+
+@pytest.mark.parametrize("pv_mode", ["p", "fp8"])
+@pytest.mark.parametrize("path", ["2d", "3d", "auto"])
+@pytest.mark.parametrize("num_heads", [(16, 2), (4, 1)])
+@pytest.mark.parametrize("gate", [False, True])
+@pytest.mark.parametrize("seq_lens", _K4V4PT_PREFILL)
+@torch.inference_mode()
+def test_triton_unified_attn_k4v4pt_prefill(
+    pv_mode: str,
+    path: str,
+    num_heads: tuple[int, int],
+    gate: bool,
+    seq_lens: list[tuple[int, int]],
+    monkeypatch,
+) -> None:
+    """A8K4V4PT prefill on gfx1250 (d 256, 128-token pages): the 2D kernel (loop variants 1 / 2 at the configs these
+    shapes select, tiles of one or two pages), the 3D kernel (prefill over a cached prefix, the PREFILL_MAX_2D_PRGMS
+    route), and the router's choice, for each PV variant. The reference is fp32 attention over the dequantized K
+    and V (e2m1 * scale), with the A8K4V4PT decode bounds (_K4V4PT_TOL): the per-element roundings are the same
+    (P in fp8 or bf16), and the longer key sums only average them down.
+    gate: the output gate (out * sigmoid(gate)), fused in the 2D kernel's epilogue at any context here, must be
+    bitwise the ungated output followed by the unfused sigmoid-mul."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V4PT runs on the gfx1250 Gluon kernels")
+    monkeypatch.setenv("AITER_UA_FP4PT_PV_MODE", pv_mode)
+    module = sys.modules[unified_attention.__module__]
+    if path != "auto":
+        monkeypatch.setattr(
+            module, "use_2d_kernel", lambda params, backend="triton": path == "2d"
+        )
+    if gate:
+        monkeypatch.setattr(module, "_UA2D_FUSED_EPILOGUE_MIN_KV", 0)
+    torch.manual_seed(0)
+    block_size, head_size = 128, 256
+    num_blocks = (
+        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
+        + 16
+    )
+    inp = _ua_kv_inputs(
+        seq_lens, num_heads, head_size, block_size, num_blocks, kv_format="k4v4pt"
+    )
+
+    def run(out, **kw):
+        return unified_attention(
+            q=inp["q_fp8"],
+            k=inp["k_nvfp4"],
+            v=inp["value_cache"],
+            out=out,
+            cu_seqlens_q=inp["cu_query_lens"],
+            seqused_k=inp["kv_lens"],
+            max_seqlen_q=inp["max_query_len"],
+            max_seqlen_k=inp["max_kv_len"],
+            softmax_scale=inp["scale"],
+            causal=True,
+            window_size=(-1, -1),
+            block_table=inp["block_tables"],
+            softcap=0,
+            q_descale=inp["q_descale"],
+            k_descale=inp["k_descale"],
+            v_descale=inp["v_descale"],
+            shuffled_kv_cache=True,
+            backend="gluon",
+            **kw,
+        )
+
+    output = run(torch.full_like(inp["output"], float("nan")))
+    ref = ref_paged_attn(
+        query=inp["query_ref"],
+        key_cache=inp["key_ref"],
+        value_cache=inp["value_ref"],
+        query_lens=inp["query_lens"],
+        kv_lens=inp["kv_lens"],
+        block_tables=inp["block_tables"],
+        scale=inp["scale"],
+        sliding_window=None,
+        soft_cap=None,
+        q_descale=None,
+        k_descale=inp["k_descale"],
+        v_descale=inp["v_descale"],
+        output_scale=None,
+        out_dtype=torch.float32,
+    )
+    out = output.float()
+    assert not out.isnan().any()
+    rel_max, abs_max = _K4V4PT_TOL[pv_mode]
+    rel = ((out - ref).norm() / ref.norm()).item()
+    err = (out - ref).abs().max().item()
+    assert rel < rel_max, f"relative L2 error {rel:.4f} (bound {rel_max})"
+    assert err < abs_max, f"max abs error {err:.4f} (bound {abs_max})"
+
+    if gate:
+        tokens = inp["q_fp8"].shape[0]
+        width = num_heads[0] * head_size
+        # the gate is a column slice of the QKV-gate projection's output
+        qkvg = 3 * torch.randn(
+            tokens, 2 * width + 1024, dtype=torch.bfloat16, device="cuda"
+        )
+        g = qkvg[:, :width]
+        gated_ref = _sigmoid_mul_ref(output, g)
+        gated = run(torch.full_like(inp["output"], float("nan")), output_gate=g)
+        assert torch.equal(gated.reshape(gated_ref.shape), gated_ref)
+
+
+@torch.inference_mode()
+def test_unified_attn_k4v4pt_guards() -> None:
+    """A8K4V4PT runs only on the gfx1250 Gluon kernels: a sliding window or the Triton backend raises
+    NotImplementedError, and a plain uint8 V of the fp4pt shape is not taken for fp4pt (it is an NVFP4 V, whose
+    page size differs)."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V4PT runs on the gfx1250 Gluon kernels")
+    torch.manual_seed(0)
+    seq_lens = [(32, 512), (17, 300)]
+    block_size, head_size, num_heads = 128, 256, (16, 2)
+    num_blocks = len(seq_lens) * 4 + 16
+    inp = _ua_kv_inputs(
+        seq_lens,
+        num_heads,
+        head_size,
+        block_size,
+        num_blocks,
+        kv_format="k4v4pt",
+        ref=False,
+    )
+    kw = {
+        "q": inp["q_fp8"],
+        "k": inp["k_nvfp4"],
+        "out": inp["output"],
+        "cu_seqlens_q": inp["cu_query_lens"],
+        "seqused_k": inp["kv_lens"],
+        "max_seqlen_q": inp["max_query_len"],
+        "max_seqlen_k": inp["max_kv_len"],
+        "softmax_scale": inp["scale"],
+        "causal": True,
+        "window_size": (-1, -1),
+        "block_table": inp["block_tables"],
+        "softcap": 0,
+        "q_descale": inp["q_descale"],
+        "k_descale": inp["k_descale"],
+        "v_descale": inp["v_descale"],
+        "shuffled_kv_cache": True,
+        "backend": "gluon",
+    }
+    with pytest.raises(NotImplementedError, match="sliding window"):
+        unified_attention(v=inp["value_cache"], **{**kw, "window_size": (127, 0)})
+    with pytest.raises(NotImplementedError, match="A8K4V4PT"):
+        unified_attention(v=inp["value_cache"], **{**kw, "backend": "triton"})
+    with pytest.raises(AssertionError):
+        unified_attention(v=inp["value_cache"].view(torch.uint8), **kw)
+
+
+@triton.jit
+def _sigmoid_mul_ref_kernel(x_ptr, g_ptr, out_ptr, stride_g, WIDTH: tl.constexpr):
+    """x * sigmoid(gate) rounded as the unfused Qwen3.5 output gate (ATOM's
+    sigmoid_mul): the sigmoid to the gate dtype, then the product to bf16."""
+    row = tl.program_id(0)
+    cols = tl.arange(0, WIDTH)
+    x = tl.load(x_ptr + row * WIDTH + cols).to(tl.float32)
+    g = tl.load(g_ptr + row * stride_g + cols)
+    g = tl.sigmoid(g.to(tl.float32)).to(g.dtype).to(tl.float32)
+    tl.store(out_ptr + row * WIDTH + cols, (x * g).to(tl.bfloat16))
+
+
+def _k4v8_gate_inputs(
+    seq_lens, num_heads, block_size, head_size=256, equal_seqlen_q=None
+):
+    """A8K4V8 inputs (fp8 Q, NVFP4 K, shuffled fp8 V) and a run(out, **kw) launcher.
+    equal_seqlen_q=None: on when every seq has the same query length (spec-decode
+    verify / decode), as ATOM launches them."""
+    num_blocks = (
+        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
+        + 16
+    )
+    inp = _ua_kv_inputs(
+        seq_lens, num_heads, head_size, block_size, num_blocks, ref=False
+    )
+    value_cache = inp["value_cache"]
+    equal_q = equal_seqlen_q
+    if equal_q is None:
+        equal_q = len({q for q, _ in seq_lens}) == 1
+
+    def run(out, **kw):
+        return unified_attention(
+            q=inp["q_fp8"],
+            k=inp["k_nvfp4"],
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=inp["cu_query_lens"],
+            seqused_k=inp["kv_lens"],
+            max_seqlen_q=inp["max_query_len"],
+            max_seqlen_k=inp["max_kv_len"],
+            softmax_scale=inp["scale"],
+            causal=True,
+            window_size=(-1, -1),
+            block_table=inp["block_tables"],
+            softcap=0,
+            q_descale=inp["q_descale"],
+            k_descale=inp["k_descale"],
+            v_descale=inp["v_descale"],
+            shuffled_kv_cache=True,
+            equal_seqlen_q=equal_q,
+            backend="gluon",
+            **kw,
+        )
+
+    return inp, run
+
+
+def _sigmoid_mul_ref(plain, gate):
+    tokens, width = gate.shape
+    ref = torch.empty(tokens, width, dtype=torch.bfloat16, device="cuda")
+    _sigmoid_mul_ref_kernel[(tokens,)](
+        plain.reshape(tokens, width),
+        gate,
+        ref,
+        gate.stride(0),
+        WIDTH=width,
+        enable_fp_fusion=False,
+    )
+    return ref
+
+
+_K4V8_GATE_MTP_VERIFY = [(4, 1328), (4, 523), (4, 37), (4, 20011), (4, 8192)] * 3
+_K4V8_GATE_DECODE = [(1, 1328), (1, 523), (1, 9000)] * 4
+# prefill, with and without a prefix
+_K4V8_GATE_PREFILL = [(478, 478), (600, 3600), (1500, 1500)]
+
+
+@pytest.mark.parametrize("path", ["2d", "3d", "auto"])
+@pytest.mark.parametrize("block_size", [64, 128])
+@pytest.mark.parametrize("num_heads", [(16, 2), (4, 1)])
+@pytest.mark.parametrize(
+    "seq_lens, select",
+    [
+        (_K4V8_GATE_MTP_VERIFY, False),
+        (_K4V8_GATE_DECODE, False),
+        (_K4V8_GATE_PREFILL, False),
+        (_K4V8_GATE_MTP_VERIFY, True),
+        (_K4V8_GATE_DECODE, True),
+    ],
+)
+@torch.inference_mode()
+def test_unified_attn_output_gate_k4v8(
+    path: str,
+    block_size: int,
+    num_heads: tuple[int, int],
+    seq_lens: list[tuple[int, int]],
+    select: bool,
+    monkeypatch,
+) -> None:
+    """The output gate (Qwen3.5: out * sigmoid(gate)) is bitwise the unfused attention
+    followed by the sigmoid-mul, on every path the attention can end on.
+    select=False: the gate inside the kernels -- the gfx1250 2D kernel's epilogue (forced
+    here at any context) and the 3D reduce_segments.
+    select=True: only each sequence's last row (as the MTP drafter keeps), which the 2D
+    kernel never fuses, so it runs the output epilogue; on the cu_seqlens_q search path.
+    """
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
+    module = sys.modules[unified_attention.__module__]
+    if path != "auto":
+        monkeypatch.setattr(
+            module, "use_2d_kernel", lambda params, backend="triton": path == "2d"
+        )
+    if not select:
+        monkeypatch.setattr(module, "_UA2D_FUSED_EPILOGUE_MIN_KV", 0)
+    torch.manual_seed(0)
+    head_size = 256
+    inp, run = _k4v8_gate_inputs(
+        seq_lens,
+        num_heads,
+        block_size,
+        head_size,
+        equal_seqlen_q=False if select else None,
+    )
+    tokens = inp["q_fp8"].shape[0]
+    width = num_heads[0] * head_size
+    # The gate is a column slice of the QKV-gate projection's output.
+    qkvg = 3 * torch.randn(
+        tokens, 2 * width + 1024, dtype=torch.bfloat16, device="cuda"
+    )
+    gate = qkvg[:, :width]
+    rows = (inp["cu_query_lens"][1:] - 1).to(torch.int64) if select else None
+
+    plain = run(
+        torch.empty(
+            tokens, num_heads[0], head_size, dtype=torch.bfloat16, device="cuda"
+        )
+    )
+    ref = _sigmoid_mul_ref(plain, gate)
+    if rows is not None:
+        ref = ref[rows]
+    out = torch.full(
+        (ref.shape[0], num_heads[0], head_size),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    fused = run(out, output_gate=gate, output_rows=rows)
+    assert fused.data_ptr() == out.data_ptr()
+    assert torch.equal(out.reshape(ref.shape), ref)
+
+
+def _gfx12_split_rebalance_tiles_torch(
+    seqused_k: torch.Tensor, num_kv_heads: int, tile_size: int
+) -> torch.Tensor:
+    """Reference for _gfx12_split_rebalance_tiles: the same integer arithmetic as plain
+    torch ops (nine kernels), [1] int32."""
+    from aiter.ops.triton.attention import unified_attention as ua
+
+    tiles = (seqused_k + (tile_size - 1)) // tile_size
+    want = tiles.sum() * num_kv_heads
+    want = (want + (ua._GFX12_UA_SPLIT_REBALANCE - 1)) // ua._GFX12_UA_SPLIT_REBALANCE
+    return (
+        want.clamp(
+            ua._GFX12_UA_SPLIT_REBALANCE_MIN_TILES,
+            ua._GFX12_UA_SPLIT_REBALANCE_MAX_TILES,
+        )
+        .to(torch.int32)
+        .reshape(1)
+    )
+
+
+@pytest.mark.parametrize("num_seqs", [1, 8, 112, 160, 1025])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("num_kv_heads", [1, 2, 8])
+@pytest.mark.parametrize("tile_size", [16, 64, 128])
+def test_gfx12_split_rebalance_tiles(num_seqs, dtype, num_kv_heads, tile_size):
+    """_gfx12_split_rebalance_tiles (one Triton program) gives bitwise the nine
+    torch ops' segm_tiles, eagerly and on CUDA-graph replay with live lengths."""
+    from aiter.ops.triton.attention import unified_attention as ua
+
+    gen = torch.Generator().manual_seed(num_seqs * 31 + tile_size)
+    for hi in (1, 4096, 190_000, 2_000_000):
+        lens = torch.randint(0, hi + 1, (num_seqs,), generator=gen).to(dtype)
+        lens[torch.rand(num_seqs, generator=gen) < 0.2] = 0
+        lens = lens.cuda()
+        ref = _gfx12_split_rebalance_tiles_torch(lens, num_kv_heads, tile_size)
+        out = ua._gfx12_split_rebalance_tiles(lens, num_kv_heads, tile_size)
+        assert out.dtype == ref.dtype == torch.int32 and out.shape == ref.shape == (1,)
+        assert torch.equal(out, ref), (hi, out.item(), ref.item())
+        # a strided view (every other entry of a wider buffer)
+        wide = torch.repeat_interleave(lens, 2)
+        wide[1::2] = 7_777_777
+        out = ua._gfx12_split_rebalance_tiles(wide[::2], num_kv_heads, tile_size)
+        assert torch.equal(out, ref), (hi, out.item(), ref.item())
+
+    live = torch.zeros(num_seqs, dtype=dtype, device="cuda")
+    ua._gfx12_split_rebalance_tiles(live, num_kv_heads, tile_size)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = ua._gfx12_split_rebalance_tiles(live, num_kv_heads, tile_size)
+    for _ in range(8):
+        lens = torch.randint(0, 262_144, (num_seqs,), generator=gen).to(dtype)
+        live.copy_(lens.cuda())
+        graph.replay()
+        ref = _gfx12_split_rebalance_tiles_torch(live, num_kv_heads, tile_size)
+        assert torch.equal(captured, ref), (captured.item(), ref.item())
+
+
+@pytest.mark.parametrize("gate, select", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # MTP-3 verify rows, the split rebalance's 128-segment grid, 2-40 live a sequence
+        [(4, 41000), (4, 9000), (4, 23456), (4, 130), (4, 65000), (4, 2049)] * 2,
+        # drafter decode, one row a sequence
+        [(1, 41000), (1, 9001), (1, 23456), (1, 3), (1, 65000), (1, 2049)] * 2,
+    ],
+)
+@torch.inference_mode()
+def test_unified_attn_split_rebalance_reduce_k4v8(
+    seq_lens, gate: bool, select: bool, monkeypatch
+):
+    """The split rebalance reduce (reduce_segments_split_rebalance_gluon, always on for
+    the split-rebalanced launch) against the Triton reduce_segments it replaces, on the
+    3D kernel's own partials under the gfx1250 split rebalance (MIN_TILES 16 /
+    MAX_TILES 128 as Qwen3.5 runs it). Another fp32 summation order, so not bitwise:
+    the bf16 outputs match to within 2 ulps of the output (1e-6 of the values that
+    differ), and the gate / row-selection epilogue is bitwise the Triton reduce's
+    epilogue applied to the new reduce."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
+    module = sys.modules[unified_attention.__module__]
+    monkeypatch.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_MIN_TILES", 16)
+    monkeypatch.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_MAX_TILES", 128)
+    monkeypatch.setattr(module, "use_2d_kernel", lambda params, backend="triton": False)
+    torch.manual_seed(0)
+    block_size, head_size, num_heads = 128, 256, (16, 2)
+    # _ua_kv_inputs draws page ids from len(seq_lens) x the longest sequence's pages
+    num_blocks = (
+        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
+        + 16
+    )
+    inp = _ua_kv_inputs(
+        seq_lens, num_heads, head_size, block_size, num_blocks, ref=False
+    )
+    value_cache = inp["value_cache"]
+    tokens = inp["q_fp8"].shape[0]
+    width = num_heads[0] * head_size
+    kw = {}
+    rows_out = tokens
+    if gate:
+        qkvg = 3 * torch.randn(
+            tokens, 2 * width + 512, dtype=torch.bfloat16, device="cuda"
+        )
+        kw["output_gate"] = qkvg[:, :width]
+    if select:
+        kw["output_rows"] = (inp["cu_query_lens"][1:] - 1).to(torch.int64)
+        rows_out = len(seq_lens)
+
+    def run():
+        out = torch.full(
+            (rows_out, num_heads[0], head_size),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        unified_attention(
+            q=inp["q_fp8"],
+            k=inp["k_nvfp4"],
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=inp["cu_query_lens"],
+            seqused_k=inp["kv_lens"],
+            max_seqlen_q=inp["max_query_len"],
+            max_seqlen_k=inp["max_kv_len"],
+            softmax_scale=inp["scale"],
+            causal=True,
+            window_size=(-1, -1),
+            block_table=inp["block_tables"],
+            softcap=0,
+            q_descale=inp["q_descale"],
+            k_descale=inp["k_descale"],
+            v_descale=inp["v_descale"],
+            shuffled_kv_cache=True,
+            equal_seqlen_q=True,
+            backend="gluon",
+            **kw,
+        )
+        return out
+
+    calls = []
+    kernel = module._reduce_segments_split_rebalance_kernel_gfx1250
+
+    class _Spy:
+        def __getitem__(self, grid):
+            calls.append(grid)
+            return kernel[grid]
+
+    monkeypatch.setattr(
+        module, "_reduce_segments_split_rebalance_kernel_gfx1250", _Spy()
+    )
+    with monkeypatch.context() as m:
+        # the reference: the Triton reduce_segments
+        m.setattr(
+            module, "is_reduce_split_rebalance_gluon_available", lambda *a, **k: False
+        )
+        old = run()
+    assert not calls
+    new = run()
+    assert calls, "the split rebalance reduce did not run"
+    assert not new.isnan().any()
+    a, b = old.float(), new.float()
+    differ = a != b
+    # a different fp32 summation order flips the bf16 rounding of a few outputs
+    assert differ.float().mean().item() < 1e-3
+    assert torch.allclose(a, b, rtol=2 * 2**-8, atol=1e-5)
+    print(
+        f"split rebalance reduce vs Triton reduce: {int(differ.sum())}/"
+        f"{differ.numel()} outputs differ, max |diff| {(a - b).abs().max().item():.3g}"
+    )
+
+
+@pytest.mark.parametrize("gate, select", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # MTP-3 verify rows at the agentic contexts: 1-37 live segments of the split
+        # rebalance's 128 (one pass), and 69 / 128 live (two and four passes)
+        [(4, 35000), (4, 9000), (4, 74000), (4, 130), (4, 56000), (4, 2049)],
+        [(4, 140000), (4, 262000), (4, 65536), (4, 65537)],
+        # drafter decode, one row a sequence, and a zero-length pad sequence
+        [(1, 41000), (1, 9001), (1, 23456), (1, 3), (1, 65000), (1, 2048), (1, 0)],
+    ],
+)
+@pytest.mark.parametrize("config", [(64, 0, 2), (64, 64, 1), (32, 16, 4)])
+@torch.inference_mode()
+def test_unified_attn_split_rebalance_reduce_configs_k4v8(
+    seq_lens, config, gate: bool, select: bool, monkeypatch
+):
+    """The split rebalance reduce's (CHUNK, SPEC, NUM_WARPS) does not change its output:
+    bitwise the default config's (the same statistics reduction, the same SB-segment
+    merge steps in the same order), on the 3D kernel's own partials under the gfx1250
+    split rebalance, with and without the gate / row-selection epilogue, speculative or
+    not, over one or several LDS passes."""
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("A8K4V8 runs on the gfx1250 Gluon kernels")
+    module = sys.modules[unified_attention.__module__]
+    monkeypatch.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_MIN_TILES", 16)
+    monkeypatch.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_MAX_TILES", 128)
+    monkeypatch.setattr(module, "use_2d_kernel", lambda params, backend="triton": False)
+    torch.manual_seed(0)
+    block_size, head_size, num_heads = 128, 256, (16, 2)
+    # _ua_kv_inputs draws page ids from len(seq_lens) x the longest sequence's pages
+    num_blocks = (
+        len(seq_lens) * max((k + block_size - 1) // block_size for _, k in seq_lens)
+        + 16
+    )
+    inp = _ua_kv_inputs(
+        seq_lens, num_heads, head_size, block_size, num_blocks, ref=False
+    )
+    value_cache = inp["value_cache"]
+    tokens = inp["q_fp8"].shape[0]
+    width = num_heads[0] * head_size
+    kw = {}
+    rows_out = tokens
+    if gate:
+        qkvg = 3 * torch.randn(
+            tokens, 2 * width + 512, dtype=torch.bfloat16, device="cuda"
+        )
+        kw["output_gate"] = qkvg[:, :width]
+    if select:
+        kw["output_rows"] = (inp["cu_query_lens"][1:] - 1).to(torch.int64)
+        rows_out = len(seq_lens)
+
+    def run():
+        out = torch.full(
+            (rows_out, num_heads[0], head_size),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        unified_attention(
+            q=inp["q_fp8"],
+            k=inp["k_nvfp4"],
+            v=value_cache,
+            out=out,
+            cu_seqlens_q=inp["cu_query_lens"],
+            seqused_k=inp["kv_lens"],
+            max_seqlen_q=inp["max_query_len"],
+            max_seqlen_k=inp["max_kv_len"],
+            softmax_scale=inp["scale"],
+            causal=True,
+            window_size=(-1, -1),
+            block_table=inp["block_tables"],
+            softcap=0,
+            q_descale=inp["q_descale"],
+            k_descale=inp["k_descale"],
+            v_descale=inp["v_descale"],
+            shuffled_kv_cache=True,
+            equal_seqlen_q=True,
+            backend="gluon",
+            **kw,
+        )
+        return out
+
+    def run_config(config):
+        chunk, spec, num_warps = config
+        with monkeypatch.context() as m:
+            m.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_REDUCE_CHUNK", chunk)
+            m.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_REDUCE_SPEC", spec)
+            m.setattr(module, "_GFX12_UA_SPLIT_REBALANCE_REDUCE_NUM_WARPS", num_warps)
+            return run()
+
+    calls = []
+    kernel = module._reduce_segments_split_rebalance_kernel_gfx1250
+
+    class _Spy:
+        def __getitem__(self, grid):
+            calls.append(grid)
+            return kernel[grid]
+
+    monkeypatch.setattr(
+        module, "_reduce_segments_split_rebalance_kernel_gfx1250", _Spy()
+    )
+    old = run()
+    assert len(calls) == 1, "the split rebalance reduce did not run"
+    new = run_config(config)
+    assert len(calls) == 2, "the split rebalance reduce did not run"
+    # a zero-length (pad) sequence's rows are NaN either way
+    live = torch.tensor(
+        [k > 0 for q, k in seq_lens for _ in range(1 if select else q)], device="cuda"
+    )
+    assert not new[live].isnan().any()
+    assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))

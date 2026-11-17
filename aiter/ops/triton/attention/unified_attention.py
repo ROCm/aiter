@@ -103,6 +103,21 @@ _GFX12_TOKEN_SPLIT_MAX_TILES = int(
 _GFX12_TOKEN_SPLIT_MAX_KV = int(
     os.environ.get("AITER_GFX12_TOKEN_SPLIT_MAX_KV", "262144")
 )
+# A8K4V4PT (fp4pt V cache) takes half-size segments by default: its 3D loop issues more per KV tile (the per-token
+# scale TDM load and wait, P * s, the fp4 V LDS loads), so at decode's low occupancy (one single-wave CTA per SIMD,
+# a few hundred working CTAs) shortening each CTA's chain of tiles wins. Qwen3.5 16 / 2 heads, d 256, q 4, 4 x 60k
+# tokens: MIN_TILES 8 vs 16 is 1.22x for fp4pt and 0.82x for A8K4V8 (2026-11-17), so every other format keeps
+# _GFX12_TOKEN_SPLIT_MIN_TILES.
+_GFX12_TOKEN_SPLIT_MIN_TILES_FP4PT = int(
+    os.environ.get("AITER_GFX12_TOKEN_SPLIT_MIN_TILES_FP4PT", "8")
+)
+
+
+def _gfx12_token_split_min_tiles(v_cache_dtype=None) -> int:
+    """The token split's minimum tiles per segment for a V cache dtype (None: the default)."""
+    if v_cache_dtype is not None and _is_fp4pt_v(v_cache_dtype):
+        return _GFX12_TOKEN_SPLIT_MIN_TILES_FP4PT
+    return _GFX12_TOKEN_SPLIT_MIN_TILES
 # Opt-in: compute the token split's tiles per segment in one Triton program instead
 # of the nine torch ops (add, floor-divide, sum, multiply, add, floor-divide, clamp,
 # cast) that run before every 3d launch -- bitwise the same int32, still recomputed
@@ -148,17 +163,18 @@ _GFX12_SPLIT_REDUCE_ONESHOT_CONFIG = tuple(
 )
 
 
-def gfx12_token_split_constants():
+def gfx12_token_split_constants(v_cache_dtype=None):
     """None when the gfx1250 token split is off, else the (PROGRAMS, MIN_TILES,
     MAX_TILES) of its tiles per segment: clamp(cdiv(sum_i cdiv(seqused_k[i],
     tile_size) * num_kv_heads, PROGRAMS), MIN_TILES, MAX_TILES), int32. For a
     caller that computes it itself and passes it as `unified_attention`'s
-    ``gfx12_token_split_tiles``."""
+    ``gfx12_token_split_tiles``: pass the V cache's dtype, since MIN_TILES
+    depends on it (fp4pt V: _GFX12_TOKEN_SPLIT_MIN_TILES_FP4PT)."""
     if not (_GFX12_TOKEN_SPLIT and DEVICE_ARCH == "gfx1250"):
         return None
     return (
         _GFX12_TOKEN_SPLIT_PROGRAMS,
-        _GFX12_TOKEN_SPLIT_MIN_TILES,
+        _gfx12_token_split_min_tiles(v_cache_dtype),
         _GFX12_TOKEN_SPLIT_MAX_TILES,
     )
 
@@ -179,6 +195,50 @@ IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx950")
+
+# A8K4V4PT: fp8 Q, NVFP4 K (as A8K4V8) and an "fp4pt" V, selected by passing the V cache as
+# torch.float4_e2m1fn_x2 (never by a plain uint8 V, which means NVFP4 V). A V page row (one
+# block and KV head) is [block_size * head_size / 2 B e2m1, shuffled exactly as NVFP4 V |
+# block_size fp32 scales, one per token], viewed as [num_blocks, num_kv_heads, block_size,
+# head_size // 2 + 4]: the value of token t, dim d is e2m1[t, d] * scale[t] (* v_descale).
+# gfx1250 Gluon kernels only, 128-token pages: the 3D kernel for decode / spec-decode verify and
+# for prefill over a long cached prefix (the attn_3d PREFILL_MAX_2D_PRGMS route), the 2D kernel
+# for the rest of prefill (loop variants 0 / 1 / 2, tiles of one or two pages, the fused output
+# gate). No sliding window.
+FP4PT_V_DTYPE = torch.float4_e2m1fn_x2
+_FP4PT_BLOCK_SIZE = 128
+# The fp4pt PV variant (V_PT_MODE, the 2D and 3D kernels alike), by AITER_UA_FP4PT_PV_MODE:
+#   "p" / 1: SCALE_ON_P, upcast V to bf16, scale P's columns in fp32, bf16 PV WMMA (the backup)
+#   "fp8" / 2: PV_FP8FP4, P * s in fp8 x the e2m1 V in a scaled WMMA, no V upcast (the default)
+# The default is PV_FP8FP4: the fewest VALU (no V upcast), 1/4 of the bf16 PV WMMAs, ~300 fewer
+# VGPRs than SCALE_ON_P, and 1.11-1.39x A8K4V8's decode speed at the Qwen shapes (SCALE_ON_P:
+# 0.88-1.28x); its P is fp8, as A8K4V8's. (Mode 0, scaling the upcast V rows, was dropped.)
+_FP4PT_PV_MODES = {"p": 1, "fp8": 2, "1": 1, "2": 2}
+_FP4PT_PV_MODE_DEFAULT = "fp8"
+
+
+def _fp4pt_pv_mode() -> int:
+    mode = os.environ.get("AITER_UA_FP4PT_PV_MODE", _FP4PT_PV_MODE_DEFAULT).lower()
+    assert (
+        mode in _FP4PT_PV_MODES
+    ), f"AITER_UA_FP4PT_PV_MODE={mode!r}: one of {sorted(_FP4PT_PV_MODES)}"
+    return _FP4PT_PV_MODES[mode]
+
+
+def _is_fp4pt_v(dtype) -> bool:
+    return dtype == FP4PT_V_DTYPE
+
+
+# AITER_UA_FP4PT_LOG=1: one line per process the first time each fp4pt route (2d / 3d, PV mode) launches
+_FP4PT_LOGGED = set()
+
+
+def _fp4pt_log(route: str, mode: int, **info):
+    if os.environ.get("AITER_UA_FP4PT_LOG", "0") != "1" or (route, mode) in _FP4PT_LOGGED:
+        return
+    _FP4PT_LOGGED.add((route, mode))
+    print(f"[aiter UA fp4pt] pid {os.getpid()} route {route} V_PT_MODE={mode} {info}", flush=True)
+
 
 # LDS the gfx950 KV double buffer may occupy; a wider tile falls back to one buffer.
 _GFX950_LDS_BUDGET = 160 * 1024
@@ -323,29 +383,33 @@ def _gfx12_split_params(params: _UAParams):
 
 
 def _gfx12_token_split_tiles_torch(
-    seqused_k: torch.Tensor, num_kv_heads: int, tile_size: int
+    seqused_k: torch.Tensor, num_kv_heads: int, tile_size: int, min_tiles: int | None = None
 ) -> torch.Tensor:
     """Tiles per segment as plain torch ops (nine kernels): [1] int32."""
+    if min_tiles is None:
+        min_tiles = _GFX12_TOKEN_SPLIT_MIN_TILES
     tiles = (seqused_k + (tile_size - 1)) // tile_size
     want = tiles.sum() * num_kv_heads
     want = (want + (_GFX12_TOKEN_SPLIT_PROGRAMS - 1)) // _GFX12_TOKEN_SPLIT_PROGRAMS
     return (
-        want.clamp(_GFX12_TOKEN_SPLIT_MIN_TILES, _GFX12_TOKEN_SPLIT_MAX_TILES)
+        want.clamp(min_tiles, _GFX12_TOKEN_SPLIT_MAX_TILES)
         .to(torch.int32)
         .reshape(1)
     )
 
 
 def _gfx12_token_split_tiles_fused(
-    seqused_k: torch.Tensor, num_kv_heads: int, tile_size: int
+    seqused_k: torch.Tensor, num_kv_heads: int, tile_size: int, min_tiles: int | None = None
 ) -> torch.Tensor:
     """`_gfx12_token_split_tiles_torch` in one single-program Triton launch.
 
     Bitwise the same [1] int32. No host read of device data and a fixed grid, so
     it captures into a CUDA graph and recomputes from the live seqused_k on replay.
     """
+    if min_tiles is None:
+        min_tiles = _GFX12_TOKEN_SPLIT_MIN_TILES
     if seqused_k.dim() != 1:
-        return _gfx12_token_split_tiles_torch(seqused_k, num_kv_heads, tile_size)
+        return _gfx12_token_split_tiles_torch(seqused_k, num_kv_heads, tile_size, min_tiles)
     segm_tiles = torch.empty(1, dtype=torch.int32, device=seqused_k.device)
     num_seqs = seqused_k.shape[0]
     gfx12_token_split_tiles[(1,)](
@@ -356,7 +420,7 @@ def _gfx12_token_split_tiles_fused(
         num_kv_heads,
         TILE_SIZE=tile_size,
         PROGRAMS=_GFX12_TOKEN_SPLIT_PROGRAMS,
-        MIN_TILES=_GFX12_TOKEN_SPLIT_MIN_TILES,
+        MIN_TILES=min_tiles,
         MAX_TILES=_GFX12_TOKEN_SPLIT_MAX_TILES,
         BLOCK=min(1024, max(64, triton.next_power_of_2(num_seqs))),
         num_warps=4,
@@ -374,27 +438,31 @@ def _gfx12_token_split(params: _UAParams, tile_size: int, precomputed=None):
 
     ``precomputed``: the caller's ``(segm_tiles, tile_size, num_kv_heads)``
     (`unified_attention`'s ``gfx12_token_split_tiles``), used when it was computed
-    for this launch's tile size and KV heads; otherwise it is computed here.
+    for this launch's tile size and KV heads; otherwise it is computed here. The
+    minimum tiles per segment, and so the grid width, depend on the V cache's dtype
+    (_gfx12_token_split_min_tiles); a caller precomputing the tiles has to use
+    gfx12_token_split_constants(<the V dtype>) to match.
     """
+    min_tiles = _gfx12_token_split_min_tiles(params.v_cache_dtype)
     if precomputed is not None:
         tiles, at_tile, at_heads = precomputed
         if at_tile == tile_size and at_heads == params.num_kv_heads:
             kv_cover = max(int(params.max_seqlen_k), _GFX12_TOKEN_SPLIT_MAX_KV)
             num_segments = triton.next_power_of_2(
-                triton.cdiv(kv_cover, _GFX12_TOKEN_SPLIT_MIN_TILES * tile_size)
+                triton.cdiv(kv_cover, min_tiles * tile_size)
             )
             return num_segments, tiles
     if _GFX12_TOKEN_SPLIT_FUSED:
         segm_tiles = _gfx12_token_split_tiles_fused(
-            params.seqused_k, params.num_kv_heads, tile_size
+            params.seqused_k, params.num_kv_heads, tile_size, min_tiles
         )
     else:
         segm_tiles = _gfx12_token_split_tiles_torch(
-            params.seqused_k, params.num_kv_heads, tile_size
+            params.seqused_k, params.num_kv_heads, tile_size, min_tiles
         )
     kv_cover = max(int(params.max_seqlen_k), _GFX12_TOKEN_SPLIT_MAX_KV)
     num_segments = triton.next_power_of_2(
-        triton.cdiv(kv_cover, _GFX12_TOKEN_SPLIT_MIN_TILES * tile_size)
+        triton.cdiv(kv_cover, min_tiles * tile_size)
     )
     return num_segments, segm_tiles
 
@@ -630,7 +698,10 @@ def unified_attention(
         )
         # The shuffled kernels lay V out with HEAD_SIZE, and a shuffled v does not
         # expose its head size as the last dim, so compare per-page element counts.
-        if k.dtype == torch.uint8 and v.dtype != torch.uint8:
+        if k.dtype == torch.uint8 and _is_fp4pt_v(v.dtype):
+            # A8K4V4PT: v is [num_blocks, num_kv_heads, block_size, head_size // 2 + 4] bytes
+            v_page_numel = k.shape[1] * k.shape[2] * (head_size // 2 + 4)
+        elif k.dtype == torch.uint8 and v.dtype != torch.uint8:
             # A8K4V8: k is [num_blocks, num_kv_heads, block_size, head_size // 2 + head_size // 16]
             v_page_numel = k.shape[1] * k.shape[2] * head_size
         else:
@@ -728,6 +799,9 @@ def unified_attention(
         skip_reduce=skip_reduce,
         force_fp8_pv_on_fp4_kv_cache=force_fp8_pv_on_fp4_kv_cache,
     )
+
+    if _is_fp4pt_v(params.v_cache_dtype):
+        _check_fp4pt(params, backend)
 
     # if batch contains a prefill
     if use_2d_kernel(params, backend):
@@ -912,6 +986,40 @@ def unified_attention(
                 output_rows=output_rows,
             )
     return final_out
+
+
+def _check_fp4pt(params: _UAParams, backend: str):
+    """A8K4V4PT (fp4pt V) runs only on the gfx1250 Gluon 2D / 3D kernels: reject what would route elsewhere."""
+    if params.sliding_window > 0:
+        raise NotImplementedError("A8K4V4PT (fp4pt V cache) has no sliding window")
+    if not (
+        IS_DEVICE_ARCH_GFX12
+        and is_3d_gluon_available(params, backend)
+        and is_2d_gluon_available(params, backend)
+    ):
+        raise NotImplementedError(
+            "A8K4V4PT (fp4pt V cache) runs only on the gfx1250 Gluon kernels "
+            "(backend='gluon', shuffled_kv_cache=True, fp8 Q, NVFP4 K)"
+        )
+    assert params.kv_cache_dtype == torch.uint8 and params.q_dtype == e4m3_dtype, (
+        "A8K4V4PT needs an NVFP4 (uint8) K cache and an fp8 Q, got "
+        f"K {params.kv_cache_dtype}, Q {params.q_dtype}"
+    )
+    assert (
+        params.block_size == _FP4PT_BLOCK_SIZE
+    ), f"A8K4V4PT needs {_FP4PT_BLOCK_SIZE}-token pages, got block_size={params.block_size}"
+    assert not (params.softcap or params.use_alibi_slopes or params.use_qq_bias)
+    assert params.head_size_v == params.head_size
+    v = params.v
+    assert v.dim() == 4 and v.shape[2] == params.block_size, (
+        "A8K4V4PT v must be [num_blocks, num_kv_heads, block_size, head_size // 2 + 4], "
+        f"got {tuple(v.shape)}"
+    )
+    # the kernel's TDM descriptors address a (block, kv head) row by stride(1) alone
+    assert v.stride(3) == 1 and v.stride(2) == v.shape[3]
+    assert v.stride(1) == v.shape[2] * v.shape[3] and v.stride(0) == v.shape[
+        1
+    ] * v.stride(1)
 
 
 def _2d_gate_fusable(params: _UAParams, output_rows) -> bool:
@@ -1318,6 +1426,14 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         num_kv_blocks & (num_kv_blocks - 1) == 0
     ), f"TILE_SIZE={TILE_SIZE} must be a power-of-2 multiple of PAGE_SIZE={params.block_size}"
 
+    if _is_fp4pt_v(params.v_cache_dtype) and _fp4pt_pv_mode() == 1:
+        # A8K4V4PT SCALE_ON_P holds V upcast to bf16 (TILE_SIZE x head_size, 512 VGPRs a lane for 128 keys at
+        # d 256) next to P and the accumulator: one-page tiles and at most 16 query rows a warp, 64 a block, keep
+        # it out of scratch (compile-only, Qwen 16 / 2 heads d 256: BLOCK_M 128 or 256-key tiles spill 0.3-2.7 KB)
+        TILE_SIZE = params.block_size
+        if BLOCK_M > 64:
+            BLOCK_M = 64
+        num_warps = max(num_warps, BLOCK_M // 16)
     # the loop variants other than 0 mask at most twice at the end of the loop,
     # and need a tile wider than 32
     query_span = (BLOCK_M - 1) // params.num_queries_per_kv + 1
@@ -1327,6 +1443,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     num_buffers = config["NUM_BUFFERS"]
     waves_per_eu = config["waves_per_eu"]
     kv_nvfp4 = params.kv_cache_dtype == torch.uint8
+    v_fp4pt = _is_fp4pt_v(params.v_cache_dtype)
     if kv_nvfp4:
         num_buffers = 2
         if params.v_cache_dtype == torch.uint8:
@@ -1334,7 +1451,8 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
             TILE_SIZE = params.block_size
             loop_variant = 0
         elif loop_variant not in (0, 1, 2):
-            # NVFP4 K with an fp8 V (A8K4V8): loop variants 0, 1 and 2, tiles of one or more pages
+            # NVFP4 K with an fp8 V (A8K4V8) or an fp4pt V (A8K4V4PT): loop variants 0, 1 and 2, tiles of one
+            # or more pages
             loop_variant = 1
         # the NVFP4 path (packed K, scale layouts; the V upcast for an NVFP4 V) needs the whole VGPR file:
         # one wave per SIMD (2 is 28x slower for A8K4V8 prefill, ~20x for A8W4 decode)
@@ -1358,10 +1476,14 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
     # buffer ops need the tensor to fit a 32-bit offset; gfx1250 loads through TDM
     MAX_INT32 = 2**31 - 1
     USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
+    # A8K4V4PT: the kernel reads the fp4pt V cache as bytes; V_FP4PT says how
+    v_cache = params.v.view(torch.uint8) if v_fp4pt else params.v
+    if v_fp4pt:
+        _fp4pt_log("2d", _fp4pt_pv_mode(), v=tuple(params.v.shape), tile=TILE_SIZE, block_m=BLOCK_M)
     _unified_attention_kernel_2d_gfx1250[(params.num_kv_heads, total_query_blocks)](
         query_ptr=params.q,
         key_cache_ptr=params.k,
-        value_cache_ptr=params.v,
+        value_cache_ptr=v_cache,
         sink_ptr=params.sinks,
         output_ptr=params.out,
         block_tables_ptr=params.block_table,
@@ -1382,10 +1504,10 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         stride_k_cache_1=params.k.stride(1),
         stride_k_cache_2=params.k.stride(2),
         stride_k_cache_3=params.k.stride(3),
-        stride_v_cache_0=params.v.stride(0),
-        stride_v_cache_1=params.v.stride(1),
-        stride_v_cache_2=params.v.stride(2),
-        stride_v_cache_3=params.v.stride(3),
+        stride_v_cache_0=v_cache.stride(0),
+        stride_v_cache_1=v_cache.stride(1),
+        stride_v_cache_2=v_cache.stride(2),
+        stride_v_cache_3=v_cache.stride(3),
         block_table_stride=params.block_table.stride(0),
         num_seqs=NUM_SEQS,
         SCALE=params.softmax_scale,
@@ -1413,6 +1535,8 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         Q_NVFP4=params.q_dtype == torch.uint8,
         KV_NVFP4=kv_nvfp4,
         V_NVFP4=params.v_cache_dtype == torch.uint8,
+        V_FP4PT=v_fp4pt,
+        V_PT_MODE=_fp4pt_pv_mode() if v_fp4pt else 2,
         query_scales_ptr=params.q_scales,
         query_scales_stride_0=params.q_scales.stride(0) if params.q_scales is not None else 0,
         query_scales_stride_1=params.q_scales.stride(1) if params.q_scales is not None else 0,
@@ -1449,6 +1573,13 @@ def _unified_attention_3d_gfx1250(
     )
     config["BLOCK_Q"] = config["BLOCK_M"] // params.num_queries_per_kv
     assert config["BLOCK_Q"] >= 1
+    # A8K4V4PT: the kernel reads the fp4pt V cache as bytes; V_CACHE_DTYPE "fp4pt" says how
+    v_cache = params.v
+    V_PT_MODE = 2  # unused unless V is fp4pt
+    if _is_fp4pt_v(params.v_cache_dtype):
+        v_cache = v_cache.view(torch.uint8)
+        V_PT_MODE = _fp4pt_pv_mode()
+        _fp4pt_log("3d", V_PT_MODE, v=tuple(params.v.shape), block_m=config["BLOCK_M"])
 
     # spec decode launches the exact block count, so the kernel needs no search
     SEQLEN_Q = int(params.max_seqlen_q) if params.spec_decode else 1
@@ -1471,7 +1602,7 @@ def _unified_attention_3d_gfx1250(
         query_ptr=params.q,
         query_scales_ptr=params.q_scales,
         key_cache_ptr=params.k,
-        value_cache_ptr=params.v,
+        value_cache_ptr=v_cache,
         sink_ptr=params.sinks,
         block_tables_ptr=params.block_table,
         seq_lens_ptr=params.seqused_k,
@@ -1511,10 +1642,10 @@ def _unified_attention_3d_gfx1250(
         stride_k_cache_1=params.k.stride(1),
         stride_k_cache_2=params.k.stride(2),
         stride_k_cache_3=params.k.stride(3),
-        stride_v_cache_0=params.v.stride(0),
-        stride_v_cache_1=params.v.stride(1),
-        stride_v_cache_2=params.v.stride(2),
-        stride_v_cache_3=params.v.stride(3),
+        stride_v_cache_0=v_cache.stride(0),
+        stride_v_cache_1=v_cache.stride(1),
+        stride_v_cache_2=v_cache.stride(2),
+        stride_v_cache_3=v_cache.stride(3),
         query_start_len_ptr=params.cu_seqlens_q,
         SCALE=params.softmax_scale,
         NUM_QUERY_HEADS=params.num_query_heads,
@@ -1528,6 +1659,7 @@ def _unified_attention_3d_gfx1250(
         FP8_PV=params.force_fp8_pv_on_fp4_kv_cache
         and params.v_cache_dtype == torch.uint8,
         V_CACHE_DTYPE=V_CACHE_DTYPE,
+        V_PT_MODE=V_PT_MODE,
         USE_STORE_TDM=True,
         # experiment knob: NVFP4 KV + BF16 PV processed in 2 head-dim halves
         HEAD_SIZE_SPLIT=(
