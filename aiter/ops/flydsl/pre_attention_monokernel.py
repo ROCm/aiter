@@ -3,14 +3,15 @@
 
 """The pre-attention monokernel: the self-attention input op under Ulysses parallelism.
 
-One persistent kernel per call computes the fused Q/K/V projection (the INT8 4-wave GEMM),
-applies the model's Q/K prep (``PrepSpec``), quantizes Q, K and V into an Attention A2A
-profile and sends the all-to-all as SDMA copies from inside the kernel. Each rank receives
-the packed MHA-v4 buffers that ``AttentionA2AIntraNodeOp(return_packed=True)`` returns for
-the same profile and inputs, byte for byte, so the MHA path is unchanged.
+One persistent kernel per call computes the fused Q/K/V projection, applies the model's Q/K
+prep (``PrepSpec``), quantizes Q, K and V into an Attention A2A profile and sends the
+all-to-all as SDMA copies from inside the kernel. Each rank receives the packed MHA-v4
+buffers that ``AttentionA2AIntraNodeOp(return_packed=True)`` returns for the same profile
+and inputs, byte for byte, so the MHA path is unchanged.
 
-The GEMM hosts the transport as hooks (``kernels/gemm_hooks.py``,
-``kernels/pre_attention_monokernel_hooks.py``).
+The projection's GEMM hosts the transport as hooks (``kernels/gemm_hooks.py``,
+``kernels/pre_attention_monokernel_hooks.py``). ``gemm`` picks the host: the INT8 4-wave
+GEMM (``"int8"``) or the MXFP6 A6W6 4-wave GEMM (``"a6w6"``).
 """
 
 import hashlib
@@ -38,6 +39,7 @@ from .kernels.tensor_shim import _run_compiled
 from .pre_attention_monokernel_layout import role_layouts
 
 HEAD_DIM = 128
+GEMMS = ("int8", "a6w6")
 
 
 class _DeviceBytes:
@@ -55,13 +57,16 @@ def _resolve_profile(profile):
 
 
 def pre_attention_monokernel_unsupported(
-    *, world_size, rows, K, heads, profile, prep=None, valid_kv_len=None
+    *, world_size, rows, K, heads, profile, prep=None, valid_kv_len=None, gemm="int8"
 ):
     """Why the monokernel cannot run this configuration, or None when it can.
 
     ``rows`` are the tokens per rank, ``heads`` the heads of one role before the exchange,
-    ``K`` the projection's input width. Callers fall back to the unfused path on a reason.
+    ``K`` the projection's input width, ``gemm`` the host GEMM. Callers fall back to the
+    unfused path on a reason.
     """
+    if gemm not in GEMMS:
+        return f"gemm must be one of {GEMMS}, got {gemm!r}"
     if get_gfx_runtime() != "gfx950":
         return f"needs gfx950, got {get_gfx_runtime()}"
     try:
@@ -86,8 +91,10 @@ def pre_attention_monokernel_unsupported(
         return f"heads must be a multiple of 4, got {heads}"
     if heads * HEAD_DIM % BLOCK_N:
         return f"heads * {HEAD_DIM} must be a multiple of {BLOCK_N}"
-    if K % (2 * BLOCK_K):
+    if gemm == "int8" and K % (2 * BLOCK_K):
         return f"K must be a multiple of {2 * BLOCK_K}, got {K}"
+    if K <= 0:
+        return f"K must be positive, got {K}"
     if rows <= 0 or rows % profile.pad_multiple:
         return f"rows per rank must be a positive multiple of {profile.pad_multiple}"
     workgroups, xcds = get_cu_num(), get_cdna4_num_xcds()
@@ -140,7 +147,8 @@ class PreAttentionMonokernel:
     channels each. ``K``: input width of the projection. ``profile``: an Attention A2A
     profile, by name or ``AttentionA2AProfile``. ``prep``: the Q/K prep, by default
     ``PrepSpec(hadamard=profile.hadamard)``. ``valid_kv_len``: global tokens before the
-    sequence padding, trimming K/V for profiles with direct K/V output.
+    sequence padding, trimming K/V for profiles with direct K/V output. ``gemm``: the host
+    GEMM, ``"int8"`` or ``"a6w6"``.
     """
 
     def __init__(
@@ -160,6 +168,7 @@ class PreAttentionMonokernel:
         trace=False,
         defer=True,
         v_tile_amax=True,
+        gemm="int8",
     ):
         from mori.cco import (
             GDA_CONNECTION_NONE,
@@ -179,9 +188,11 @@ class PreAttentionMonokernel:
             profile=self.profile,
             prep=self.prep,
             valid_kv_len=valid_kv_len,
+            gemm=gemm,
         )
         if reason is not None:
             raise ValueError(f"pre-attention monokernel: {reason}")
+        self.gemm = gemm
         if group is None or group.size() != world_size or dist.get_rank(group) != rank:
             raise ValueError(
                 "group must be the Ulysses process group, with size world_size and this "
@@ -211,6 +222,7 @@ class PreAttentionMonokernel:
             trace,
             defer,
             v_tile_amax,
+            gemm,
         )
         configs = [None] * world_size
         dist.all_gather_object(configs, config, group=group)
@@ -319,30 +331,44 @@ class PreAttentionMonokernel:
             + (f"s{softmax_scale:g}" if softmax_scale is not None else "")
             + options
         )
-        self.launch = compile_int8_gemm_4w(
-            K=K,
-            xcd_swizzle=8,
-            num_cu=workgroups,
-            num_xcds=xcds,
-            prep=self.prep,
-            roles=3,
-            role_cols=self.role_cols,
-            consumers=0,
-            eps=eps,
-            hooks=GemmHooks(role_hook, first_block_hook, tile_hook, key),
-            col_amax_offset=plan.vpc if self.layouts[2].scale == "channel" else None,
-        )
+        host = {
+            "xcd_swizzle": 8,
+            "num_cu": workgroups,
+            "num_xcds": xcds,
+            "prep": self.prep,
+            "roles": 3,
+            "role_cols": self.role_cols,
+            "eps": eps,
+            "hooks": GemmHooks(role_hook, first_block_hook, tile_hook, key),
+            "col_amax_offset": (
+                plan.vpc if self.layouts[2].scale == "channel" else None
+            ),
+        }
+        if gemm == "a6w6":
+            from .kernels.gemm_a6w6_4wave_host import compile_a6w6_host_4w
+
+            self.launch = compile_a6w6_host_4w(K=-(-K // BLOCK_K) * BLOCK_K, **host)
+        else:
+            self.launch = compile_int8_gemm_4w(K=K, consumers=0, **host)
         torch.cuda.synchronize()
         self.comm.barrier()
 
-    def __call__(self, x_q, x_scale, weight, columns, cos=None, sin=None):
+    def __call__(
+        self, x_q, x_scale, weight, columns, cos=None, sin=None, weight_scale=None
+    ):
         """One call; returns the packed (payload, scale) of Q, K and V.
 
-        ``x_q``: INT8 ``[rows, K]`` activations, ``x_scale``: their FP32 row scales.
-        ``weight``: the fused Q/K/V INT8 weight ``[3 * heads * 128, K]``, preshuffled with
-        ``shuffle_weight(layout=(16, 16))``. ``columns``: FP32 per column of the fused
-        weight: the scales, then the biases (``prep.bias``), then the norm weights (with a
-        norm; V's are unused), Q's and K's multiplied by 128 ** -0.5 with ``prep.hadamard``.
+        INT8 host: ``x_q``: INT8 ``[rows, K]`` activations, ``x_scale``: their FP32 row
+        scales. ``weight``: the fused Q/K/V INT8 weight ``[3 * heads * 128, K]``,
+        preshuffled with ``shuffle_weight(layout=(16, 16))``.
+
+        A6W6 host: ``x_q`` and ``x_scale``: the activations as ``quant_mxfp6_gemm`` packs
+        them. ``weight`` and ``weight_scale``: the fused Q/K/V weight's rows in the host
+        layout (``w[host_weight_order(3 * heads * 128)]``), packed the same way.
+
+        ``columns``: FP32 per column of the fused weight: the scales (unused by the A6W6
+        host), then the biases (``prep.bias``), then the norm weights (with a norm; V's are
+        unused), Q's and K's multiplied by 128 ** -0.5 with ``prep.hadamard``.
         ``cos``/``sin``: FP32 ``[rows, 64]`` per token and rotation pair (with RoPE).
 
         The results alias this call's half of the receive buffers, which a peer refills two
@@ -352,11 +378,25 @@ class PreAttentionMonokernel:
         prep = self.prep
         column_sets = 1 + prep.bias + (prep.norm != "none")
         rope = prep.rope != "none"
+        if self.gemm == "a6w6":
+            from aiter.ops.gemm_op_a6w6 import mxfp6_gemm_pack_size
+
+            x_sizes = mxfp6_gemm_pack_size(rows, self.K)
+            w_sizes = mxfp6_gemm_pack_size(n, self.K)
+            operands = (
+                ("x_q", x_q, torch.uint8, x_sizes[0]),
+                ("x_scale", x_scale, torch.uint8, x_sizes[1]),
+                ("weight", weight, torch.uint8, w_sizes[0]),
+                ("weight_scale", weight_scale, torch.uint8, w_sizes[1]),
+            )
+        else:
+            operands = (
+                ("x_q", x_q, torch.int8, rows * self.K),
+                ("x_scale", x_scale, torch.float32, rows),
+                ("weight", weight, torch.int8, n * self.K),
+            )
         for name, tensor, dtype, numel in (
-            ("x_q", x_q, torch.int8, rows * self.K),
-            ("x_scale", x_scale, torch.float32, rows),
-            ("weight", weight, torch.int8, n * self.K),
-            ("columns", columns, torch.float32, column_sets * n),
+            operands + (("columns", columns, torch.float32, column_sets * n),)
         ) + (
             (
                 ("cos", cos, torch.float32, rows * 64),
@@ -377,14 +417,17 @@ class PreAttentionMonokernel:
                     f"{self.device}"
                 )
         if not rope:
-            cos = sin = x_scale
+            cos = sin = columns
         self.generation += 1
+        scales = (x_scale.view(-1),) + (
+            (weight_scale.view(-1),) if self.gemm == "a6w6" else ()
+        )
         _run_compiled(
             self.launch,
             x_q.view(-1),
             weight.view(-1),
             self.planar,
-            x_scale.view(-1),
+            *scales,
             columns.view(-1),
             cos.view(-1),
             sin.view(-1),
