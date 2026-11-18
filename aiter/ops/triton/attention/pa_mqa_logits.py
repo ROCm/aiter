@@ -34,6 +34,7 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.plugin import route as _route
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 enable_aot_gluon_pa_mqa_logits = os.environ.get(
@@ -41,7 +42,7 @@ enable_aot_gluon_pa_mqa_logits = os.environ.get(
 )
 enable_aot_gluon_pa_mqa_logits = enable_aot_gluon_pa_mqa_logits == "1"
 triton_version = Version(Version(triton.__version__).base_version)
-_GLUON_PA_MQA_LOGITS_ARCHS = ("gfx942", "gfx950", "gfx1250")
+_GLUON_PA_MQA_LOGITS_ARCHS = ("gfx942", "gfx950", "gfx1250", "gfx1250-strict")
 if triton_version >= Version("3.5.0"):
     from triton.experimental.gluon._runtime import GluonASTSource as ASTSource
 
@@ -332,7 +333,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
 ):
     gfx_version = get_gfx()
     assert gfx_version in _GLUON_PA_MQA_LOGITS_ARCHS
-    is_gfx1250 = gfx_version == "gfx1250"
+    is_gfx1250 = gfx_version in ("gfx1250", "gfx1250-strict")
     if is_gfx1250:
         if Preshuffle:
             assert KVBlockSize > 1 and ChunkK % KVBlockSize == 0, (
@@ -642,6 +643,8 @@ def deepgemm_fp8_paged_mqa_logits_persistent_schedule(
     return out
 
 
+# The public entry is the routed op. It has no backend argument.
+@_route(op="fp8_paged_mqa_logits", version=1)
 def deepgemm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,  # dtype = float8
     kv_cache,
@@ -655,14 +658,20 @@ def deepgemm_fp8_paged_mqa_logits(
     ChunkK: int = 256,
     TotalCuCount: int | None = None,
     WavePerEU: int = 2,
-    VarCtxSchedule: torch.Tensor = None,
+    VarCtxSchedule: torch.Tensor | None = None,
     SplitKV: int | None = None,
-    PersistentSchedule: torch.Tensor = None,
+    PersistentSchedule: torch.Tensor | None = None,
 ):
     """Compute paged FP8 decode logits, optionally using a persistent CTA table.
 
+    Writes the logits into ``out_logits`` in place. Returns the cache key of
+    the compiled Triton kernel, which only AOT tools read. A kernel plugin
+    that serves the call has no such key and returns None.
+
     Build ``PersistentSchedule`` with the same query geometry, context lengths,
     ``max_model_len`` and ``ChunkK`` using the persistent schedule helper above.
+    With ``PersistentSchedule``, the kernels read the row lengths from it and
+    not from ``context_lens``.
     The caller initializes logits outside the context to ``-inf`` as on the
     SplitKV path. Persistent AOT binaries use a separate ``_persistent`` name.
     """
@@ -702,7 +711,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 "PersistentSchedule must be contiguous int32 [NumCTAs, 4] on the query device"
             )
 
-    if get_gfx() == "gfx1250":
+    if get_gfx() in ("gfx1250", "gfx1250-strict"):
         if Preshuffle and hidden_dim <= 128:
             WavePerEU = 4
         else:
@@ -710,7 +719,7 @@ def deepgemm_fp8_paged_mqa_logits(
 
     TileQCount = batch_size * next_n
     if SplitKV is None:
-        if get_gfx() == "gfx1250":
+        if get_gfx() in ("gfx1250", "gfx1250-strict"):
             SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU * 2
         else:
             # One full residency wave, with the context split evenly across it.
@@ -748,7 +757,7 @@ def deepgemm_fp8_paged_mqa_logits(
             f"tile, or to be 8. Got KVBlockSize={KVBlockSize}."
         )
         assert not (
-            KVBlockSize < 16 and get_gfx() == "gfx1250"
+            KVBlockSize < 16 and get_gfx() in ("gfx1250", "gfx1250-strict")
         ), f"gfx1250 preshuffle (TDM block-load) needs KVBlockSize>=16; got {KVBlockSize}."
 
     kv_cache = kv_cache.view(-1, KVBlockSize * index_dim)
@@ -760,7 +769,7 @@ def deepgemm_fp8_paged_mqa_logits(
     kv_cache_fp8 = kv_cache_fp8.view(dtypes.fp8)
     kv_cache_scale = kv_cache_scale.view(torch.float32)
 
-    if VarCtxSchedule is not None and get_gfx() == "gfx1250":
+    if VarCtxSchedule is not None and get_gfx() in ("gfx1250", "gfx1250-strict"):
         import warnings
 
         warnings.warn(

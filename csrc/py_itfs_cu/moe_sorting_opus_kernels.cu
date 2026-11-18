@@ -12,6 +12,7 @@
 #include "aiter_tensor.h"
 #include "mx_quant_utils.h"
 
+#include <hip/hip_bfloat16.h>
 #include <string>
 #include <vector>
 
@@ -120,6 +121,20 @@ __device__ __forceinline__ int round_up_to_block(int value)
     return (value + kBlockM - 1) & ~(kBlockM - 1);
 }
 
+// Hardware wavefront size of the device pass; the host pass only needs a
+// placeholder (same convention as opus::get_warp_size()).
+__host__ __device__ constexpr int sort_wave_size()
+{
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+    return 32;
+#elif defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
+    return 64;
+#else
+    return 32;
+#endif
+}
+
+// Inclusive prefix sum across one hardware wavefront.
 __device__ __forceinline__ int dpp_inclusive_scan_wave(int value)
 {
     int tmp = __builtin_amdgcn_mov_dpp(value, 0x111, 0xF, 0xF, true);
@@ -130,10 +145,23 @@ __device__ __forceinline__ int dpp_inclusive_scan_wave(int value)
     value += tmp;
     tmp = __builtin_amdgcn_mov_dpp(value, 0x118, 0xF, 0xF, true);
     value += tmp;
+#if defined(__GFX9__)
     tmp = __builtin_amdgcn_update_dpp(0, value, 0x142, 0xA, 0xF, true);
     value += tmp;
     tmp = __builtin_amdgcn_update_dpp(0, value, 0x143, 0xC, 0xF, true);
     return value + tmp;
+#else
+    // GFX10+ has no DPP row_bcast: add the totals of the preceding 16-lane
+    // rows, read from the last lane of each row.
+    const int row = static_cast<int>(__lane_id()) >> 4;
+    int carry     = row > 0 ? __builtin_amdgcn_readlane(value, 15) : 0;
+    if(__builtin_amdgcn_wavefrontsize() == 64)
+    {
+        carry += row > 1 ? __builtin_amdgcn_readlane(value, 31) : 0;
+        carry += row > 2 ? __builtin_amdgcn_readlane(value, 47) : 0;
+    }
+    return value + carry;
+#endif
 }
 
 template <int NumCtas>
@@ -164,13 +192,15 @@ __device__ __forceinline__ void build_sorted_metadata(
     int32_t* num_valid_ids,
     int tokens)
 {
-    // Experts are scanned as complete 64-lane waves; a trailing partial wave
+    // Experts are scanned as complete hardware waves; a trailing partial wave
     // (E=385) is covered by the running prefix of the last full wave.
-    constexpr int kFullExpertWaves = NumExperts / 64;
+    constexpr int kWaveSize        = sort_wave_size();
+    constexpr int kFullExpertWaves = NumExperts / kWaveSize;
+    static_assert(kFullExpertWaves <= kWaveSize, "wave totals must fit one wave scan");
     __shared__ int expert_counts[NumExperts];
     __shared__ int expert_offsets[NumExperts + 1];
     __shared__ int expert_cursors[NumExperts];
-    __shared__ int wave_totals[16];
+    __shared__ int wave_totals[kThreads / kWaveSize];
 
     const int tid = threadIdx.x;
     for(int expert = tid; expert < NumExperts; expert += kThreads)
@@ -191,11 +221,11 @@ __device__ __forceinline__ void build_sorted_metadata(
 
     // At decode expert counts a small shared-memory prefix scan is cheaper
     // than the generic Opus one-shot bookkeeping.
-    const int lane = tid & 63;
-    const int wave = tid >> 6;
+    const int lane = tid % kWaveSize;
+    const int wave = tid / kWaveSize;
     int value = tid < NumExperts ? round_up_to_block(expert_counts[tid]) : 0;
     value = dpp_inclusive_scan_wave(value);
-    if(lane == 63 && wave < kFullExpertWaves)
+    if(lane == kWaveSize - 1 && wave < kFullExpertWaves)
         wave_totals[wave] = value;
     __syncthreads();
     if(wave == 0)
@@ -347,9 +377,15 @@ __global__ void __launch_bounds__(kThreads) moe_sort_quant_kernel(
     void* moe_buf,
     uint8_t* activation_quant,
     uint8_t* activation_scale_token,
-    int tokens)
+    int tokens,
+    const int32_t* num_local_tokens)
 {
+    // moe_buf is zeroed whole, so a row past the local-token count reads 0
+    // rather than what the buffer held; only the local rows are sorted and
+    // quantized, as moe_sorting_opus_fwd sorts them.
     zero_moe_output<kSortQuantCtas>(moe_buf, tokens);
+    if(num_local_tokens != nullptr)
+        tokens = min(tokens, *num_local_tokens);
     if(blockIdx.x == 0)
     {
         build_sorted_metadata<NumExperts, TopK>(
@@ -410,7 +446,8 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
                               aiter_tensor_t& moe_buf,
                               aiter_tensor_t& activation_quant,
                               aiter_tensor_t& activation_scale_token,
-                              int num_experts)
+                              int num_experts,
+                              std::optional<aiter_tensor_t> num_local_tokens)
 {
     using namespace aiter::mxfp4_moe;
 
@@ -525,6 +562,10 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
     uint8_t* activation_quant_ptr = static_cast<uint8_t*>(activation_quant.data_ptr());
     uint8_t* activation_scale_token_ptr =
         static_cast<uint8_t*>(activation_scale_token.data_ptr());
+    const int32_t* num_local_tokens_ptr =
+        num_local_tokens.has_value()
+            ? static_cast<const int32_t*>(num_local_tokens.value().data_ptr())
+            : nullptr;
 #define AITER_MXFP4_SORT_QUANT_LAUNCH(NUM_EXPERTS, TOPK)                            \
     if(num_experts == (NUM_EXPERTS) && topk == (TOPK))                              \
     {                                                                               \
@@ -540,7 +581,8 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
                 moe_buf_ptr,                                                        \
                 activation_quant_ptr,                                               \
                 activation_scale_token_ptr,                                         \
-                tokens);                                                            \
+                tokens,                                                             \
+                num_local_tokens_ptr);                                              \
     }
     AITER_MXFP4_SORT_QUANT_ROUTES(AITER_MXFP4_SORT_QUANT_LAUNCH)
 #undef AITER_MXFP4_SORT_QUANT_LAUNCH

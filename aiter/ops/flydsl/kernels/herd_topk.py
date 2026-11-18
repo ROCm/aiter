@@ -15,6 +15,40 @@ from aiter.ops.flydsl.kernels.tensor_shim import ptr_buf_tensor
 _FINALIZE_THREADS = 256
 
 
+def _herd_drop(ids, values, pops, routed_scaling_factor, renormalize=True):
+    """Pick the one candidate of a row that HERD drops: the least popular,
+    then the lowest value, then the lowest expert id.
+
+    Returns the dropped candidate's index and expert id, and the scale of the
+    kept values. Every HERD kernel drops with this, so their routes and
+    weights agree bit for bit.
+    """
+    kp1 = len(ids)
+    drop = Int32(0)
+    drop_id = ids[0]
+    drop_value = values[0]
+    drop_pop = pops[0]
+    for j in range_constexpr(1, kp1):
+        take = (pops[j] < drop_pop) | (
+            (pops[j] == drop_pop)
+            & (
+                (values[j] < drop_value)
+                | ((values[j] == drop_value) & (ids[j] < drop_id))
+            )
+        )
+        drop = take.select(Int32(j), drop)
+        drop_id = take.select(ids[j], drop_id)
+        drop_value = take.select(values[j], drop_value)
+        drop_pop = take.select(pops[j], drop_pop)
+    if not renormalize:
+        return drop, drop_id, routed_scaling_factor
+
+    kept_sum = Float32(0.0)
+    for j in range_constexpr(kp1):
+        kept_sum = kept_sum + (drop != Int32(j)).select(values[j], Float32(0.0))
+    return drop, drop_id, routed_scaling_factor / fx.max(kept_sum, Float32(1e-20))
+
+
 @cache
 def build_herd_finalize_module(
     topk: int,
@@ -22,8 +56,13 @@ def build_herd_finalize_module(
     renormalize: bool,
     round_to_bf16: bool,
     block_threads: int = _FINALIZE_THREADS,
+    has_num_valid_rows: bool = False,
 ):
-    """Build the fused popularity, min-unique, and Top-K output launcher."""
+    """Build the fused popularity, min-unique, and Top-K output launcher.
+
+    `has_num_valid_rows`: rows at or past the device count `num_valid_rows[0]`
+    are padding -- left out of the batch popularity, written as ids -1 and
+    weights 0."""
     if topk < 1 or topk + 1 > num_experts:
         raise ValueError(
             f"invalid HERD geometry: topk={topk}, num_experts={num_experts}"
@@ -44,6 +83,7 @@ def build_herd_finalize_module(
             rn=renormalize,
             rb=round_to_bf16,
             blk=block_threads,
+            nv=has_num_valid_rows,
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -52,6 +92,7 @@ def build_herd_finalize_module(
         candidate_values: fx.Tensor,
         topk_weights: fx.Tensor,
         topk_ids: fx.Tensor,
+        num_valid_rows: fx.Tensor,
         topk_weights_stride: Int32,
         topk_ids_stride: Int32,
         rows: Int32,
@@ -62,12 +103,15 @@ def build_herd_finalize_module(
         popularity = storage.popularity.peek().view(fx.make_layout(num_experts, 1))
         topk_weights_flat = ptr_buf_tensor(topk_weights, elem=Float32)
         topk_ids_flat = ptr_buf_tensor(topk_ids, elem=Int32)
+        valid_rows = rows
+        if const_expr(has_num_valid_rows):
+            valid_rows = fx.min(rows, ptr_buf_tensor(num_valid_rows, elem=Int32)[0])
 
         for expert in range(tid, Int32(num_experts), Int32(block_threads)):
             popularity[expert] = Int32(0)
         gpu.barrier()
 
-        total = rows * Int32(kp1)
+        total = valid_rows * Int32(kp1)
         for idx in range(tid, total, Int32(block_threads)):
             candidate_row = idx // Int32(kp1)
             candidate_col = idx - candidate_row * Int32(kp1)
@@ -76,35 +120,19 @@ def build_herd_finalize_module(
         gpu.barrier()
 
         row = tid
-        if row < rows:
+        if const_expr(has_num_valid_rows):
+            pad_row = (row >= valid_rows) & (row < rows)
+            if pad_row:
+                for j in range_constexpr(topk):
+                    topk_ids_flat[row * topk_ids_stride + j] = Int32(-1)
+                    topk_weights_flat[row * topk_weights_stride + j] = Float32(0.0)
+        if row < valid_rows:
             ids = [candidate_ids[row, j] for j in range_constexpr(kp1)]
             values = [candidate_values[row, j] for j in range_constexpr(kp1)]
             pops = [popularity[ids[j]] for j in range_constexpr(kp1)]
-
-            drop = Int32(0)
-            drop_id = ids[0]
-            drop_value = values[0]
-            drop_pop = pops[0]
-            for j in range_constexpr(1, kp1):
-                take = (pops[j] < drop_pop) | (
-                    (pops[j] == drop_pop)
-                    & (
-                        (values[j] < drop_value)
-                        | ((values[j] == drop_value) & (ids[j] < drop_id))
-                    )
-                )
-                drop = take.select(Int32(j), drop)
-                drop_id = take.select(ids[j], drop_id)
-                drop_value = take.select(values[j], drop_value)
-                drop_pop = take.select(pops[j], drop_pop)
-
-            kept_sum = Float32(0.0)
-            for j in range_constexpr(kp1):
-                kept_sum = kept_sum + (drop != Int32(j)).select(values[j], Float32(0.0))
-            if const_expr(renormalize):
-                scale = routed_scaling_factor / fx.max(kept_sum, Float32(1e-20))
-            else:
-                scale = routed_scaling_factor
+            drop, _, scale = _herd_drop(
+                ids, values, pops, routed_scaling_factor, renormalize
+            )
 
             for j in range_constexpr(kp1):
                 keep = drop != Int32(j)
@@ -125,6 +153,7 @@ def build_herd_finalize_module(
         candidate_values: fx.Tensor,
         topk_weights: fx.Tensor,
         topk_ids: fx.Tensor,
+        num_valid_rows: fx.Tensor,
         topk_weights_stride: fx.Int32,
         topk_ids_stride: fx.Int32,
         rows: Int32,
@@ -136,6 +165,7 @@ def build_herd_finalize_module(
             candidate_values,
             topk_weights,
             topk_ids,
+            num_valid_rows,
             topk_weights_stride,
             topk_ids_stride,
             rows,
@@ -147,3 +177,19 @@ def build_herd_finalize_module(
         )
 
     return launch_finalize
+
+
+def _kept_routes(ids, values, pops, routed_scaling_factor):
+    kp1 = len(ids)
+    drop, _, scale = _herd_drop(ids, values, pops, routed_scaling_factor)
+    keeps = [drop != Int32(j) for j in range_constexpr(kp1)]
+
+    ranks = []
+    for j in range_constexpr(kp1):
+        rank = Int32(0)
+        for other in range_constexpr(kp1):
+            before = keeps[other] & (ids[other] < ids[j])
+            rank = rank + before.select(Int32(1), Int32(0))
+        ranks.append(rank)
+    weights = [values[j] * scale for j in range_constexpr(kp1)]
+    return keeps, ranks, weights
