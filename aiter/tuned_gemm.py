@@ -31,9 +31,10 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
 
 # Same idea as SGLANG_OPT_QUARK_BF16_TGEMM_EXACT_M, for every caller of this lookup.
-# Off: a hipBLASLt row found through get_padded_m is reused at the smaller M.
-# On: that row is kept only when padded_M == M. FlyDSL / triton / torch rows still pad.
-_hipblaslt_exact_m = os.environ.get("AITER_GEMM_A16W16_HIPBLASLT_EXACT_M", "0") == "1"
+# Default on. A hipBLASLt solution is for the M it was tuned at; launching that
+# solidx at a padded M page-faulted on gfx1250. Set the env to 0 to reuse it.
+# FlyDSL / triton / torch rows still pad either way.
+_hipblaslt_exact_m = os.environ.get("AITER_GEMM_A16W16_HIPBLASLT_EXACT_M", "1") == "1"
 
 try:
     from aiter.ops.opus import opus_gemm as _opus_launch
