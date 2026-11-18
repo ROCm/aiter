@@ -969,7 +969,12 @@ def _warn_untuned_int8_fallback(
     )
 
 
+# Routed on the public entry: it takes no backend pin, and the CK, FlyDSL and
+# INT8 choices are made beneath it. The torch_compile_guard sits outside the
+# route, as on fused_moe_ and mhc_pre, so a compiling caller still sees one
+# opaque op and the route runs inside it.
 @torch_compile_guard(gen_fake=gemm_a8w8_bpreshuffle_fake)
+@_route(op="gemm_a8w8_bpreshuffle")
 def gemm_a8w8_bpreshuffle(
     XQ: Tensor,
     WQ: Tensor,
@@ -980,6 +985,23 @@ def gemm_a8w8_bpreshuffle(
     check: bool = False,
 ) -> Tensor:
     """Per-token/per-channel FP8 or signed-INT8 preshuffled GEMM.
+
+    Returns a new ``[M, N]`` tensor of ``dtype``,
+    ``(XQ @ WQ_rowmajor.T) * x_scale * w_scale.T``; nothing is written in place.
+    It is a separate contract from a row-major GEMM for the reason
+    :func:`gemm_a8w8_blockscale_bpreshuffle` gives: the preshuffled weight has
+    the same shape, dtype and strides as the row-major one.
+
+    Args:
+        XQ: ``[M, K]`` fp8 (or int8) activation.
+        WQ: ``[N, K_w]`` weight of XQ's dtype, ``shuffle_weight(w,
+            layout=(16, 16))``-preshuffled. ``K_w >= K``; a wider ``WQ`` is
+            zero-padded K, which a provider reads as ``K_w`` with XQ padded.
+        x_scale: fp32 per-token ``[M, 1]`` scale, or a per-tensor ``[1]``.
+        w_scale: fp32 per-channel ``[N, 1]`` scale, or a per-tensor ``[1]``.
+        bias: must be ``None`` (both paths reject a bias).
+        dtype: output dtype; ``bf16`` or ``fp16``.
+        check: AITER's own debug flag; a provider may ignore it.
 
     The gfx950 INT8 path uses the 4-wave FlyDSL kernel with INT32
     accumulation, FP32 row/column scales, and BF16 output. Untuned supported
@@ -1454,6 +1476,39 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
     # heuristic picks.
     paired = x_block == (_BLOCKSCALE_X_BLOCK if w_scale_block == "128x128" else 32)
     config = get_mxscale_bpreshuffle_config(m, n, k, w_scale_block) if paired else None
+    if config is not None and config["libtype"] == "opus":
+        from csrc.opus_gemm.opus_gemm_common import (
+            a8w8_mxscale_bpreshuffle_supports_shape,
+            get_kernel_instance,
+        )
+
+        kid = int(config["kernelId"])
+        gfx, cu_num = get_gfx(), get_cu_num()
+        instance = get_kernel_instance(
+            gfx, "a8w8_blockscale_bpreshuffle", kid, cu_num=cu_num
+        )
+        if instance is None:
+            raise ValueError(f"Unknown or unavailable OPUS MXFP8 bpreshuffle kid {kid}")
+        if (
+            w_scale_block == "128x128"
+            and x_block == 128
+            and Y.dtype == dtypes.bf16
+            and a8w8_mxscale_bpreshuffle_supports_shape(instance, m, n, k)
+        ):
+            from .opus import opus_gemm
+
+            return opus_gemm(
+                XQ,
+                WQ,
+                Y,
+                kid=kid,
+                family="a8w8_blockscale_bpreshuffle",
+                layout="bpreshuffle",
+                x_scale=x_scale,
+                w_scale=w_scale,
+            )
+        # A padded-M lookup can select a kernel that does not support the original M.
+        config = None
     backend = None if config is None else str(config["kernelId"])
     if config is not None and (
         config["libtype"] != "flydsl" or backend not in _MXSCALE_RAW_KERNEL_IDS
@@ -1461,6 +1516,17 @@ def _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y):
         raise NotImplementedError(
             f"mxscale bpreshuffle row {config['libtype']}/{config['kernelId']} "
             f"has no implementation"
+        )
+    if Y.dtype != dtypes.bf16:
+        # OPUS and the gfx950 BMM write BF16 only. The mxpsh runner supports
+        # FP16 and consumes the same raw E8M0 scales and preshuffled weights.
+        from .flydsl.mxscale_preshuffle_kernels import run_gemm_a8w8_mxfp8_gfx950
+
+        kernel_name = (
+            str(config["kernelName"]) if backend == MXSCALE_MXFP8_KERNEL_ID else None
+        )
+        return run_gemm_a8w8_mxfp8_gfx950(
+            XQ, WQ, x_scale, w_scale, Y, kernel_name, w_scale_block
         )
     if backend == MXSCALE_MXFP8_KERNEL_ID:
         from .flydsl.mxscale_preshuffle_kernels import run_gemm_a8w8_mxfp8_gfx950
