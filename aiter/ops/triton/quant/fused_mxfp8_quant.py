@@ -140,7 +140,7 @@ def fused_dual_rmsnorm_mxfp8_quant(
         persistent: use 256 workers in a one-dimensional grid with four
             wave32 waves per worker on gfx1250.
             The task count selects one, two or four adjacent rows per iteration.
-            A partial batch uses single rows. This is a standalone
+            Each worker owns a balanced interval; tails use two or one rows. This is a standalone
             kernel, not a callable mono device function. This mode requires
             BF16 inputs, contiguous weights, and non-overlapping output rows.
             Outputs must not overlap inputs or each other.

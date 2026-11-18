@@ -22,8 +22,8 @@ def _quantize_fp8_group32_tile(
         + gl.arange(0, 32, layout=gl.SliceLayout(0, layout))[None, :]
     )
     # Buffer offsets are 32-bit; rebase each tile with 64-bit pointer arithmetic.
-    tile_base = tile.to(gl.int64) * (1024 * TILES_PER_ITER)
-    scale_base = tile.to(gl.int64) * (32 * TILES_PER_ITER)
+    tile_base = tile.to(gl.int64) * 1024
+    scale_base = tile.to(gl.int64) * 32
     mask = tile_base + offsets < SIZE
     x = buffer_load(X + tile_base, offsets, mask=mask, other=0).to(gl.float32)
     amax = gl.maximum(gl.max(gl.abs(x), 1), 1e-10)
@@ -70,12 +70,25 @@ def _quantize_fp8_group32_kernel(
             for tile in range(task, gl.cdiv(SIZE, 1024), 256):
                 _quantize_fp8_group32_tile(X, Y, S, SIZE, tile, DEQUANT)
         else:
-            full_batches = SIZE // (1024 * TILES_PER_ITER)
-            for tile in range(task, full_batches, 256):
+            tasks = gl.cdiv(SIZE.to(gl.int64), 1024)
+            base = tasks // 256
+            extra = tasks % 256
+            count = base + (task < extra).to(gl.int32)
+            start = task * base + gl.minimum(task, extra)
+            full_end = start + (count // TILES_PER_ITER) * TILES_PER_ITER
+            # Balance total work before batching each worker's adjacent tasks.
+            for tile in range(start, full_end, TILES_PER_ITER):
                 _quantize_fp8_group32_tile(X, Y, S, SIZE, tile, DEQUANT, TILES_PER_ITER)
-            # Spread the partial batch across workers without padded arithmetic.
-            tail = full_batches * TILES_PER_ITER + task
-            if tail < gl.cdiv(SIZE, 1024):
-                _quantize_fp8_group32_tile(X, Y, S, SIZE, tail, DEQUANT)
+            tail_count = count % TILES_PER_ITER
+            if TILES_PER_ITER == 4:
+                if tail_count >= 2:
+                    _quantize_fp8_group32_tile(X, Y, S, SIZE, full_end, DEQUANT, 2)
+                if tail_count % 2:
+                    _quantize_fp8_group32_tile(
+                        X, Y, S, SIZE, full_end + (tail_count // 2) * 2, DEQUANT
+                    )
+            elif tail_count:
+                _quantize_fp8_group32_tile(X, Y, S, SIZE, full_end, DEQUANT)
+
     else:
         _quantize_fp8_group32_tile(X, Y, S, SIZE, task, DEQUANT)

@@ -147,10 +147,14 @@ def _fused_dual_rmsnorm_mxfp8_quant_ps_kernel(
     k_cols = gl.arange(0, BLOCK_SIZE_KK, layout=gl.SliceLayout(0, k_layout))
     gq = gl.load(gq_ptr + q_cols, q_cols < KQ, other=0).to(gl.float32)
     gk = gl.load(gk_ptr + k_cols, k_cols < KK, other=0).to(gl.float32)
-    full_rows = M - M % ROWS_PER_ITER
-    for first in range(
-        gl.program_id(0) * ROWS_PER_ITER, full_rows, NUM_PRGMS * ROWS_PER_ITER
-    ):
+    pid = gl.program_id(0)
+    base = M // NUM_PRGMS
+    extra = M % NUM_PRGMS
+    count = base + (pid < extra).to(gl.int32)
+    start = pid.to(gl.int64) * base + gl.minimum(pid, extra)
+    full_end = start + (count // ROWS_PER_ITER) * ROWS_PER_ITER
+    # Each worker owns a contiguous interval of floor(M/P) or ceil(M/P) rows.
+    for first in range(start, full_end, ROWS_PER_ITER):
         _fused_dual_rmsnorm_mxfp8_quant_tile(
             q_ptr,
             k_ptr,
@@ -181,9 +185,71 @@ def _fused_dual_rmsnorm_mxfp8_quant_ps_kernel(
             AMAX_FLOOR,
             ROWS_PER_ITER,
         )
-    # Only the remaining rows take the single-row reduction path.
-    if gl.program_id(0) < M % ROWS_PER_ITER:
-        tail = full_rows + gl.program_id(0)
+    tail_count = count % ROWS_PER_ITER
+    if ROWS_PER_ITER == 4:
+        if tail_count >= 2:
+            _fused_dual_rmsnorm_mxfp8_quant_tile(
+                q_ptr,
+                k_ptr,
+                gq,
+                gk,
+                yq_ptr,
+                sq_ptr,
+                yk_ptr,
+                M,
+                KQ,
+                KK,
+                stride_qm,
+                stride_qn,
+                stride_km,
+                stride_kn,
+                stride_yqm,
+                stride_yqn,
+                stride_sqm,
+                stride_sqn,
+                stride_ykm,
+                stride_ykn,
+                eps_q,
+                eps_k,
+                BLOCK_SIZE_KQ,
+                BLOCK_SIZE_KK,
+                QUANT_BLOCK_SIZE,
+                full_end,
+                AMAX_FLOOR,
+                2,
+            )
+        if tail_count % 2:
+            _fused_dual_rmsnorm_mxfp8_quant_tile(
+                q_ptr,
+                k_ptr,
+                gq,
+                gk,
+                yq_ptr,
+                sq_ptr,
+                yk_ptr,
+                M,
+                KQ,
+                KK,
+                stride_qm,
+                stride_qn,
+                stride_km,
+                stride_kn,
+                stride_yqm,
+                stride_yqn,
+                stride_sqm,
+                stride_sqn,
+                stride_ykm,
+                stride_ykn,
+                eps_q,
+                eps_k,
+                BLOCK_SIZE_KQ,
+                BLOCK_SIZE_KK,
+                QUANT_BLOCK_SIZE,
+                full_end + (tail_count // 2) * 2,
+                AMAX_FLOOR,
+                1,
+            )
+    elif tail_count:
         _fused_dual_rmsnorm_mxfp8_quant_tile(
             q_ptr,
             k_ptr,
@@ -210,7 +276,7 @@ def _fused_dual_rmsnorm_mxfp8_quant_ps_kernel(
             BLOCK_SIZE_KQ,
             BLOCK_SIZE_KK,
             QUANT_BLOCK_SIZE,
-            tail,
+            full_end,
             AMAX_FLOOR,
             1,
         )

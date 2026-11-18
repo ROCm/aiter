@@ -79,6 +79,9 @@ def assert_guards(outputs):
         1025,
         1026,
         1027,
+        1536,
+        1537,
+        1793,
         2049,
     ],
 )
@@ -186,6 +189,9 @@ def fp8_oracle(x):
         (1026, 1024),
         (1027, 1024),
         (2049, 1024),
+        (1536, 1024),
+        (1537, 1024),
+        (1793, 1024),
         (513, 1056),
         (1025, 1056),
     ],
@@ -359,9 +365,11 @@ def test_output_contract_rejects_bad_buffers():
     [
         "a03",
         "a03-small",
+        "a03-tail-two",
         "a03-four-row-loop",
         "a09",
         "a09-small",
+        "a09-tail-three",
         "a09-five-iterations",
     ],
 )
@@ -369,7 +377,12 @@ def test_graph_replay_changes_inputs(op):
     torch.manual_seed(453)
     is_a03 = op.startswith("a03")
     if is_a03:
-        rows = 1025 if op == "a03-four-row-loop" else (96 if op == "a03-small" else 513)
+        rows = {
+            "a03": 513,
+            "a03-small": 96,
+            "a03-tail-two": 1537,
+            "a03-four-row-loop": 1025,
+        }[op]
         x = torch.randn((rows, 1792), device="cuda", dtype=torch.bfloat16)
         wq = torch.ones((1280,), device="cuda", dtype=torch.bfloat16)
         wk = torch.ones((512,), device="cuda", dtype=torch.bfloat16)
@@ -390,9 +403,12 @@ def test_graph_replay_changes_inputs(op):
             return native.fused_dual_rmsnorm_mxfp8_quant(*args, amax_floor=1e-10)
 
     else:
-        rows = (
-            513 if op == "a09-five-iterations" else (96 if op == "a09-small" else 257)
-        )
+        rows = {
+            "a09": 257,
+            "a09-small": 96,
+            "a09-tail-three": 897,
+            "a09-five-iterations": 513,
+        }[op]
         x = torch.randn((rows, 2048), device="cuda", dtype=torch.bfloat16)
         outs = (
             *quantize_fp8_group32(x, persistent=True),
