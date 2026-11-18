@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""GPU test suites per MoE migration path (steps doc 0.3).
+"""GPU test suites per MoE migration path.
 
-A path is the unit that moves from the legacy code to aiter.moev2 (design doc §3.10).
+A path is the unit that moves from the legacy code to aiter.moev2.
 Before a path graduates, its suites must pass with `AITER_MOEV2=<path>`; `SHARED`
 suites run for every path.
 
@@ -59,7 +59,10 @@ PATHS = {
         _py("op_tests/test_flydsl_moe_gfx942.py", archs=("gfx942",)),
         _py("op_tests/test_moe.py"),
     ),
-    "a8w8_pt": (_py(_MOE_2STAGE, "-q", "1", *_LEGACY_SWEEP),),
+    "a8w8_pt": (
+        _py(_MOE_2STAGE, "-q", "1", *_LEGACY_SWEEP),
+        _pytest("op_tests/test_moe_per_tensor_a2_init.py"),
+    ),
     "a8w8_ptok": (
         _py(_MOE_2STAGE, "-q", "2", *_LEGACY_SWEEP),
         _py(_MOE_2STAGE, "-q", "3", *_LEGACY_SWEEP),

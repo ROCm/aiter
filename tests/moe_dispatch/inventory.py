@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Inventory of every name used from the legacy MoE modules, and every monkeypatch.
 
-    python tests/moe_dispatch/inventory.py --vllm /path/to/vllm > docs/fused_moe_public_names.txt
+    python tests/moe_dispatch/inventory.py --vllm /path/to/vllm > fused_moe_public_names.txt
 
 Static (AST) scan, so imports inside functions count. For each tracked module it lists
 the names other files use, who uses them (aiter package, aiter tests and tuners, vLLM

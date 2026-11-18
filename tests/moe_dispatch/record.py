@@ -13,7 +13,23 @@ _ADDRESS = re.compile(r" at 0x[0-9a-fA-F]+")
 _PATH = re.compile(r"(?:/[\w.+-]+)+/([\w.+-]+)")
 
 
+@functools.cache
+def _legacy_names():
+    """Functions moved to aiter.moev2 keep the name the legacy module exports them as."""
+    import aiter.fused_moe as fm
+
+    return {
+        id(value): f"fused_moe.{name}"
+        for name, value in vars(fm).items()
+        if callable(value)
+        and (getattr(value, "__module__", None) or "").startswith("aiter.moev2.")
+    }
+
+
 def callable_name(fn):
+    legacy = _legacy_names().get(id(fn))
+    if legacy is not None:
+        return legacy
     module = getattr(fn, "__module__", None) or ""
     name = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", None)
     if name is None:

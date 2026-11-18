@@ -63,11 +63,12 @@ def dispatch_keys(gfx, cu_num):
     from moe_dispatch import keys
 
     table = keys.tuned_table()
-    return (
+    base = (
         keys.tuned_keys(gfx, cu_num, dtypes.fp8, table)
         + keys.fhmoe_keys(gfx, cu_num, dtypes.fp8)
         + keys.grid_keys(dtypes.fp8, table)
     )
+    return base + keys.feature_keys(base, dtypes.fp8)
 
 
 def resolve_same_as_base(records, label):
