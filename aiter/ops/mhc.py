@@ -3,6 +3,7 @@
 
 import functools
 import math
+import os
 from typing import Optional
 
 import torch
@@ -426,6 +427,29 @@ def _mhc_fused_fill_splitk(m, valid_splitk, num_cu):
     """
     ideal = max(1.0, 32.0 * num_cu / m)
     return min(valid_splitk, key=lambda sk: (abs(math.log(sk) - math.log(ideal)), -sk))
+
+
+# gfx950, 256 CUs, FP32 projection weights: up to this row count mhc_fused_post_pre
+# runs post + pre with regular stores in mhc_post. mhc_post on its own switches to
+# non-temporal stores above 8 * cu_num rows; mhc_pre reads that residual back at
+# once, and up to this row count it reads it faster after regular stores (measured
+# on MI350X for hidden sizes 4096, 5120 and 7168). The results are the same bits.
+MHC_POST_PRE_REGULAR_STORE_M_MAX_GFX950 = 16384
+
+
+def _mhc_post_pre_regular_stores_gfx950(m, w_preshuffle_bf16, arch, backend) -> bool:
+    """Whether the unfused post + pre of mhc_fused_post_pre keeps regular stores."""
+    return (
+        not w_preshuffle_bf16
+        and arch == "gfx950"
+        and backend in (None, "hip")
+        and 8 * 256 < m <= MHC_POST_PRE_REGULAR_STORE_M_MAX_GFX950
+        and get_cu_num() == 256
+        and not any(
+            os.environ.get(name) is not None
+            for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+        )
+    )
 
 
 def _mhc_fused_config_gfx950_256(m, hidden_size, num_cu):
@@ -1052,7 +1076,10 @@ def mhc_fused_post_pre(
     ``force_fused``: when True, select the fused HIP path, except for the existing
     gfx950 large-M post+pre specialization with plain residuals. When False
     (default), larger ``m`` with plain residuals falls back to ``mhc_post`` +
-    ``mhc_pre`` (threshold depends on the detected GPU arch).
+    ``mhc_pre`` (threshold depends on the detected GPU arch). On gfx950 with 256
+    CUs and FP32 weights, that ``mhc_post`` + ``mhc_pre`` runs with regular stores
+    in ``mhc_post`` for ``m`` from 8 * 256 + 1 to
+    ``MHC_POST_PRE_REGULAR_STORE_M_MAX_GFX950``; the results are the same bits.
     A ``res_preshuffle`` request uses that same fuse/unfuse boundary.
 
     ``w_preshuffle_bf16=True`` selects BF16 hi/lo compute and requires ``fn`` from
@@ -1251,12 +1278,19 @@ def _mhc_fused_post_pre_native(
     # At the shared bound the input is already in ordinary layout.
     if not force_fused and not res_preshuffle and m >= fused_m_upper_bound:
         next_residual = torch.empty_like(residual_in)
+        # -1 leaves the store policy to mhc_post, 0 keeps regular stores.
+        store_nt = (
+            0
+            if _mhc_post_pre_regular_stores_gfx950(m, w_preshuffle_bf16, arch, backend)
+            else -1
+        )
         mhc_post(
             next_residual,
             layer_input,
             residual_in,
             post_layer_mix,
             comb_res_mix,
+            store_nt,
         )
         post_mix, comb_mix, layer_input_out = mhc_pre(
             next_residual,
