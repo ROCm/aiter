@@ -37,7 +37,9 @@ import torch.distributed as dist
 
 logger = logging.getLogger("aiter")
 
-# flydsl is an optional dependency whose version is checked at import time.
+# flydsl is required on Linux and optional on Windows and Triton-only installs;
+# its version is checked at import time and an older one raises ImportError.
+_flydsl_error: Exception | None = None
 try:
     from aiter.ops.flydsl import allreduce_policy as fly_policy
     from aiter.ops.flydsl.allreduce_policy import (
@@ -45,8 +47,10 @@ try:
         PAYLOAD_ALIGN_BYTES,
     )
     from aiter.ops.flydsl.kernels.comm.allreduce_shared import TILE_BYTES
-except Exception:  # noqa: BLE001 -- flydsl is absent or too old: nothing is served
+except Exception as exc:  # noqa: BLE001
+    # flydsl is absent or too old: nothing is served.
     fly_policy = None
+    _flydsl_error = exc
 
 ELEMENT_BYTES = torch.bfloat16.itemsize
 
@@ -148,7 +152,13 @@ def create_sp_collectives(quick) -> SequenceParallelCollectives | None:
     ``None``.
     """
     window = None
-    if fly_policy is not None:
+    if fly_policy is None:
+        logger.warning(
+            "INT4 sequence-parallel collectives are unavailable: "
+            "FlyDSL cannot be imported: %s",
+            _flydsl_error,
+        )
+    else:
         window = fly_policy.sp_int4_window(
             arch=fly_policy.detect_arch(), link=quick.link, world_size=quick.world_size
         )
