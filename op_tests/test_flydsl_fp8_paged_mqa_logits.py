@@ -773,7 +773,9 @@ def test_fp8_paged_mqa_logits_wide_out(batch, kv_len, kv_block_size=KV_BLOCK_SIZ
 def test_fp8_paged_mqa_logits_scale_stream_contract():
     """Distinct per-token scales remain isolated across caller streams."""
     batch, next_n, kv_len = 2, 4, 128
-    output_width = 64
+    clipped_output = get_gfx_runtime() == "gfx950"
+    output_width = 64 if clipped_output else 2 * kv_len
+    dirty_fill = float("nan") if clipped_output else float("-inf")
     scale_patterns = (
         torch.tensor([0.125, 0.5, 2.0, 4.0], device="cuda"),
         torch.tensor([3.0, 1.0, 0.25, 1.5], device="cuda"),
@@ -793,7 +795,7 @@ def test_fp8_paged_mqa_logits_scale_stream_contract():
         kv_cache_kernel, _ = _kernel_inputs(inp, batch, next_n, HEAD_DIM)
         out = torch.full(
             (batch * next_n, output_width),
-            float("nan"),
+            dirty_fill,
             dtype=torch.float32,
             device="cuda",
         )
@@ -818,7 +820,7 @@ def test_fp8_paged_mqa_logits_scale_stream_contract():
     def candidates():
         for stream, (inp, kv_cache_kernel, out, _) in zip(streams, cases):
             with torch.cuda.stream(stream):
-                out.fill_(float("nan"))
+                out.fill_(dirty_fill)
                 flydsl_fp8_paged_mqa_logits(
                     inp.q_fp8,
                     kv_cache_kernel,
