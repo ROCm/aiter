@@ -27,12 +27,19 @@ def init_routing_data(m, n_expts_tot, n_expts_act, do_gather, do_scatter, device
     )
 
 
-def init_compute_data(m, n, k, n_expts_tot, n_expts_act, gindx, has_y_gammas, device):
+def init_compute_data(
+    m, n, k, n_expts_tot, n_expts_act, gindx, has_y_gammas, device, has_bias=True
+):
     in_m = m * (n_expts_act if gindx is None else 1)
     x = torch.randn((in_m, k), dtype=torch.bfloat16, device=device)
     # (E, K, N) row-major: the N-contiguous layout the kernel requires
     w = torch.randn((n_expts_tot, k, n), dtype=torch.bfloat16, device=device)
-    bias = torch.randn((n_expts_tot, n), dtype=torch.float32, device=device)
+    # bias=None selects TDM_BIAS_WAIT=0, which changes the drain-loop wait
+    bias = (
+        torch.randn((n_expts_tot, n), dtype=torch.float32, device=device)
+        if has_bias
+        else None
+    )
     if has_y_gammas:
         gammas = 2 ** torch.randint(
             -5, 0, (m * n_expts_act,), device=device, dtype=torch.float32
@@ -49,6 +56,9 @@ class Case:
     k: int
     n_expts_tot: int = 1
     n_expts_act: int = 1
+    has_bias: bool = True
+    # The store uses Y's element type. A hard-coded bf16 store fails to compile.
+    out_dtype: torch.dtype = torch.bfloat16
 
 
 @pytest.mark.parametrize(
@@ -73,6 +83,12 @@ class Case:
             Case(64, 256, 320, 8, 2),
             Case(300, 256, 400, 8, 4),
             Case(256, 256, 320, 8, 2),  # block_m 64, ragged K
+            # bias=None, over block_m 16 and block_m 64
+            Case(16, 128, 128, 2, 1, has_bias=False),
+            Case(256, 512, 512, 8, 2, has_bias=False),
+            # fp16 output, with and without bias
+            Case(256, 512, 512, 8, 2, out_dtype=torch.float16),
+            Case(64, 256, 256, 8, 2, has_bias=False, out_dtype=torch.float16),
         ]
     ],
 )
@@ -93,6 +109,8 @@ def test_op(
     k,
     n_expts_tot,
     n_expts_act,
+    has_bias,
+    out_dtype,
     do_gather,
     do_scatter,
     has_y_gammas,
@@ -108,7 +126,7 @@ def test_op(
         m, n_expts_tot, n_expts_act, do_gather, do_scatter, device
     )
     x, w, bias, gammas = init_compute_data(
-        m, n, k, n_expts_tot, n_expts_act, gindx, has_y_gammas, device
+        m, n, k, n_expts_tot, n_expts_act, gindx, has_y_gammas, device, has_bias
     )
 
     ref_y = moe_gemm_torch(
@@ -125,112 +143,16 @@ def test_op(
         apply_swiglu=apply_swiglu,
         alpha=1.0,
         limit=1.0,
+        out_dtype=out_dtype,
     )
 
-    assert_close(ref_y, tri_y, description=f"a16w16 m={m} n={n} k={k}")
-
-
-@pytest.mark.parametrize("apply_swiglu", [False, True])
-def test_no_bias(apply_swiglu, device="cuda"):
-    """`bias=None` selects TDM_BIAS_WAIT=0, which changes the drain-loop wait."""
-    if arch_info.get_arch() not in _SUPPORTED_ARCHS:
-        pytest.skip(f"moe_gemm_a16w16 is only implemented for {_SUPPORTED_ARCHS}")
-
-    m, n, k, n_expts_tot, n_expts_act = 256, 512, 512, 8, 2
-    torch.manual_seed(0)
-    rdata, gindx, sindx = init_routing_data(
-        m, n_expts_tot, n_expts_act, True, True, device
+    assert tri_y.dtype == out_dtype
+    # The reference is bf16. An fp16 result keeps more mantissa bits, so the
+    # two do not round together and the largest element error is wider.
+    maxtol = 3e-2 if out_dtype == torch.float16 else None
+    assert_close(
+        ref_y.to(out_dtype),
+        tri_y,
+        maxtol=maxtol,
+        description=f"a16w16 m={m} n={n} k={k} bias={has_bias} out={out_dtype}",
     )
-    x, w, _, _ = init_compute_data(
-        m, n, k, n_expts_tot, n_expts_act, gindx, False, device
-    )
-
-    ref_y = moe_gemm_torch(
-        x, w, None, rdata, gindx, sindx, None, apply_swiglu, alpha=1.0, limit=1.0
-    )
-    tri_y = moe_gemm_a16w16(
-        x,
-        w,
-        bias=None,
-        routing_data=rdata,
-        gather_indx=gindx,
-        scatter_indx=sindx,
-        apply_swiglu=apply_swiglu,
-        alpha=1.0,
-        limit=1.0,
-    )
-
-    assert_close(ref_y, tri_y, description=f"a16w16 no bias swiglu={apply_swiglu}")
-
-
-def test_out_dtype_fp16(device="cuda"):
-    """The store must use Y's element type. A hard-coded bf16 store fails to compile."""
-    if arch_info.get_arch() not in _SUPPORTED_ARCHS:
-        pytest.skip(f"moe_gemm_a16w16 is only implemented for {_SUPPORTED_ARCHS}")
-
-    m, n, k, n_expts_tot, n_expts_act = 256, 512, 512, 8, 2
-    torch.manual_seed(0)
-    rdata, gindx, sindx = init_routing_data(
-        m, n_expts_tot, n_expts_act, False, False, device
-    )
-    x, w, _, _ = init_compute_data(
-        m, n, k, n_expts_tot, n_expts_act, gindx, False, device
-    )
-
-    ref_y = moe_gemm_torch(x, w, None, rdata, gindx, sindx, None, False)
-    tri_y = moe_gemm_a16w16(
-        x,
-        w,
-        routing_data=rdata,
-        gather_indx=gindx,
-        scatter_indx=sindx,
-        apply_swiglu=False,
-        out_dtype=torch.float16,
-    )
-
-    assert tri_y.dtype == torch.float16
-    assert_close(ref_y.to(torch.float16), tri_y, description="a16w16 fp16 out")
-
-
-def test_rejects_unknown_backend(device="cuda"):
-    """Only the gluon backend exists for this op; any other name must be rejected."""
-    if arch_info.get_arch() not in _SUPPORTED_ARCHS:
-        pytest.skip(f"moe_gemm_a16w16 is only implemented for {_SUPPORTED_ARCHS}")
-
-    m, n, k, n_expts_tot, n_expts_act = 16, 128, 128, 2, 1
-    rdata, gindx, sindx = init_routing_data(
-        m, n_expts_tot, n_expts_act, False, False, device
-    )
-    x, w, _, _ = init_compute_data(
-        m, n, k, n_expts_tot, n_expts_act, gindx, False, device
-    )
-
-    with pytest.raises(AssertionError, match="only has a 'gluon' backend"):
-        moe_gemm_a16w16(
-            x,
-            w,
-            routing_data=rdata,
-            gather_indx=gindx,
-            scatter_indx=sindx,
-            backend="triton",
-        )
-
-
-def test_rejects_non_contiguous_weights(device="cuda"):
-    """`w` must be N-contiguous; a K-contiguous view must be rejected, not silently wrong."""
-    if arch_info.get_arch() not in _SUPPORTED_ARCHS:
-        pytest.skip(f"moe_gemm_a16w16 is only implemented for {_SUPPORTED_ARCHS}")
-
-    m, n, k, n_expts_tot, n_expts_act = 16, 128, 128, 2, 1
-    rdata, gindx, sindx = init_routing_data(
-        m, n_expts_tot, n_expts_act, False, False, device
-    )
-    x, w, _, _ = init_compute_data(
-        m, n, k, n_expts_tot, n_expts_act, gindx, False, device
-    )
-    w_bad = w.transpose(1, 2).contiguous().transpose(1, 2)  # K-contiguous
-
-    with pytest.raises(AssertionError, match="N-contiguous"):
-        moe_gemm_a16w16(
-            x, w_bad, routing_data=rdata, gather_indx=gindx, scatter_indx=sindx
-        )

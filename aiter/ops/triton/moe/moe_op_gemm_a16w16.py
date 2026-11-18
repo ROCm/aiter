@@ -188,6 +188,7 @@ def moe_gemm_a16w16(
     assert quant_static_scale is None, "quant_static_scale must be none"
     assert x.dtype.itemsize == 2, f"x must be 16-bit, got {x.dtype}"
     assert w.dtype.itemsize == 2, f"w must be 16-bit, got {w.dtype}"
+    assert out_dtype.itemsize == 2, f"out_dtype must be 16-bit, got {out_dtype}"
     assert w.stride(-1) == 1, "`w` must be N-contiguous, i.e. (E, K, N) row-major"
 
     _LOGGER.info(
