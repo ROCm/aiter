@@ -165,7 +165,8 @@ def run_torch(
         context_len = int(context_lens[i].item())
         if context_len == 0:
             continue
-        pos = torch.arange(context_len, device=q.device)
+        score_len = min(context_len, max_model_len)
+        pos = torch.arange(score_len, device=q.device)
         blk = block_tables[i, pos // block_size]
         tok = pos % block_size
         kx = kvf[blk, tok]
@@ -177,7 +178,7 @@ def run_torch(
             context_len - next_n + torch.arange(next_n, device=q.device)
         ).unsqueeze(1)
         s = torch.where(pos[None, :] <= q_lim, s, float("-inf"))
-        logits[i * next_n : (i + 1) * next_n, :context_len] = s
+        logits[i * next_n : (i + 1) * next_n, :score_len] = s
     return logits
 
 
@@ -772,6 +773,7 @@ def test_fp8_paged_mqa_logits_wide_out(batch, kv_len, kv_block_size=KV_BLOCK_SIZ
 def test_fp8_paged_mqa_logits_scale_stream_contract():
     """Distinct per-token scales remain isolated across caller streams."""
     batch, next_n, kv_len = 2, 4, 128
+    output_width = 64
     scale_patterns = (
         torch.tensor([0.125, 0.5, 2.0, 4.0], device="cuda"),
         torch.tensor([3.0, 1.0, 0.25, 1.5], device="cuda"),
@@ -788,14 +790,20 @@ def test_fp8_paged_mqa_logits_scale_stream_contract():
             seed=seed,
         )
         _set_packed_kv_scales(inp.kv_cache_fp8, pattern)
-        kv_cache_kernel, out = _kernel_inputs(inp, batch, next_n, HEAD_DIM)
+        kv_cache_kernel, _ = _kernel_inputs(inp, batch, next_n, HEAD_DIM)
+        out = torch.full(
+            (batch * next_n, output_width),
+            float("nan"),
+            dtype=torch.float32,
+            device="cuda",
+        )
         ref = run_torch(
             inp.q,
             inp.kv_cache_fp8,
             inp.weights,
             inp.context_lens,
             inp.block_tables,
-            inp.max_model_len,
+            output_width,
             inp.fp8_dtype,
         )
         cases.append((inp, kv_cache_kernel, out, ref))
@@ -810,7 +818,7 @@ def test_fp8_paged_mqa_logits_scale_stream_contract():
     def candidates():
         for stream, (inp, kv_cache_kernel, out, _) in zip(streams, cases):
             with torch.cuda.stream(stream):
-                out.fill_(float("-inf"))
+                out.fill_(float("nan"))
                 flydsl_fp8_paged_mqa_logits(
                     inp.q_fp8,
                     kv_cache_kernel,
@@ -818,7 +826,7 @@ def test_fp8_paged_mqa_logits_scale_stream_contract():
                     out,
                     inp.context_lens,
                     inp.block_tables,
-                    inp.max_model_len,
+                    output_width,
                     Preshuffle=True,
                     KVBlockSize=KV_BLOCK_SIZE,
                     SplitKV=1,

@@ -404,8 +404,9 @@ def _build_kernel(ctx_stride=1, rebase_kv=False, reserved_rows=MAX_NN, loader_wa
             out = _make_out_row_view(
                 out_logits, stride_out, pid_batch * rows_per_batch + row
             )
-            row_len = effective_len - nn + fx.Int32(row) + 1
+            row_len = context_len - nn + fx.Int32(row) + 1
             row_len = (row_len > 0).select(row_len, fx.Int32(0))
+            row_len = _imin(row_len, effective_len)
 
             def _write(_out=out, _col=col, _value=value):
                 _out[_col] = _value

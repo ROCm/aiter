@@ -371,27 +371,25 @@ def test_indexer_edges(mode):
         case = _make_case(
             3,
             129,
-            16,
+            64,
             seed=11,
             lengths=(0, 127, 129),
         )
-        shuffled = _preshuffle_kv(case.kv)
+        packed = _pack_kv(_preshuffle_kv(case.kv), case.scales)
 
         def candidate():
-            return flydsl_fp8_paged_mqa_local_topk(
-                case.q,
-                shuffled,
-                case.scales,
-                case.weights,
-                case.lengths,
-                case.block_tables,
+            return _compact_case(
+                case,
+                packed,
                 k=128,
-                num_splits=128,
+                splits=128,
             )
 
-        outputs, us = run_perftest(candidate)
-        err = _assert_candidates(case, *outputs, k=128, splits=128)
-        return _edge_result(us, 0, _tensor_bytes(case.q, case.kv, *outputs), err)
+        (scores, positions), us = run_perftest(candidate)
+        err = _assert_compact_topk(case, scores, positions, 128)
+        return _edge_result(
+            us, 0, _tensor_bytes(case.q, case.kv, scores, positions), err
+        )
 
     if mode == "reservoir_compaction":
         case = _make_case(1, 14_000, 64, seed=13)
