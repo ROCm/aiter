@@ -32,6 +32,7 @@ from aiter.ops.flydsl.dcp_mailbox.peer import PeerBuffer
 from aiter.ops.flydsl.kernels.dcp_mailbox.combine import (
     make_kernel as make_combine_kernel,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 MAX_THREADS = 1024
 RANK_MASK = (1 << 31) - 1
@@ -279,7 +280,11 @@ def dcp_lse_combine(
         token_tile=tile,
         row_mask=row_counts is not None,
     )
-    build(key)(
+    # flyc.jit traces the kernel again on every call (tens of ms); the handle
+    # flyc.compile returns does not. Its arguments are all scalars and
+    # addresses, so only the device keys it beyond the build.
+    _run_compiled(
+        build(key),
         out.data_ptr(),
         out.stride(0),
         out.stride(1),
@@ -298,7 +303,8 @@ def dcp_lse_combine(
         ws.state.data_ptr(),
         tokens,
         (tokens + tile - 1) // tile * heads,
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
+        specialization_key=out.device.index,
     )
     _check_debug(ws)
     if return_lse:

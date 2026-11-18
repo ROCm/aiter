@@ -11,6 +11,7 @@ import warnings
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from flydsl.compiler.jit_function import JitFunction
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.dcp_mailbox import (
@@ -321,6 +322,23 @@ def worker(rank, world, tokens):
         for count in counts + counts[::-1]:
             got = dcp_lse_combine(runtime_ws, *inputs[count])
             torch.testing.assert_close(got, expected[count], rtol=1e-2, atol=1e-2)
+        # Once each build has run, an eager call reuses its compiled handle and
+        # does not trace the kernel again (a trace costs tens of ms on the host).
+        traces = []
+        trace = JitFunction._trace
+
+        def counted_trace(*a, **k):
+            traces.append(1)
+            return trace(*a, **k)
+
+        JitFunction._trace = counted_trace
+        try:
+            for count in counts:
+                got = dcp_lse_combine(runtime_ws, *inputs[count])
+                torch.testing.assert_close(got, expected[count], rtol=1e-2, atol=1e-2)
+        finally:
+            JitFunction._trace = trace
+        assert not traces, f"{len(traces)} eager combines traced the kernel again"
         graphs, results = {}, {}
         for count in counts:
             graphs[count] = torch.cuda.CUDAGraph()
