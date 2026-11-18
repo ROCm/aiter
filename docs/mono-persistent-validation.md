@@ -10,16 +10,21 @@ power-of-two reciprocal change, its static cost and the unresolved request cost.
 Selected code commit is `0d54cbf3e7b16ac7563c34df6e5d744945f6a495`.
 This is the exact kernel and test source approved by Claude Opus 5.5 in local
 run `20261118-155450-63f32955`. The fixed outer acceptance passed, exit 0.
-The final delivery adds only guide updates after that code commit. Its supplied
-manifest identifies the delivery commit, patch hash and every changed file.
+The published delivery adds only guide updates after that code commit. Use
+`ROCm/aiter`, branch `asm_mon_dev`, and the exact delivery SHA supplied in the
+handoff. Read this guide from that checkout and keep the delivery checkout for
+all tests; do not reset to an older test commit or apply historical patches.
+Record HEAD, status, dirty diff and source hashes. Check the two selected-source
+hashes below and the frozen native manifest before execution.
 
-Use the single supplied patch on a clean independent checkout at public base
-`a8a913883d7be9837c2f46f2e92de8fc701bac26`. Do not stack historical patches or
-reset to an older test commit. Verify the manifest before execution. Record
-HEAD, dirty diff and source hashes; an applied patch leaves HEAD at the public
-base. Preserve the machine's framework packages and unrelated tasks.
+If using the offline patch bundle instead, apply its single patch to a clean
+independent checkout at public base
+`a8a913883d7be9837c2f46f2e92de8fc701bac26`. Verify that bundle's manifest;
+HEAD remains at the public base after patch application. The offline bundle and
+the published delivery have identical reviewed kernel/test bytes; later guide
+updates can differ. Preserve framework packages and unrelated tasks.
 The isolated review clone omitted one unrelated gitlink for runner support;
-the delivered patch preserves all production submodule entries and declarations.
+both delivery methods preserve production submodule entries and declarations.
 
 | Reference | Fixed source |
 | --- | --- |
@@ -112,7 +117,8 @@ print(torch.cuda.get_device_properties(torch.cuda.current_device()))
 PY
 ```
 
-Compare source hashes with the runner's supplied manifest. Record image digest,
+Check the selected hashes above and the frozen native manifest. For a patch
+bundle, also check its delivery manifest. Record image digest,
 host, selected GPU UUID/ordinal, driver, clock/power settings and other GPU
 workloads. Retain load/clock observations with timestamps and sampling interval.
 Runtime retry state is unknown unless the machine provides evidence for it.
@@ -267,13 +273,13 @@ equal medians or insufficient separation remain inconclusive; they do not
 establish equivalence. No positive slowdown allowance is assumed. A path
 passes only if all six required rows are improvements, and its correctness
 and P256 gates also pass. Report FP8 and QAT status separately. A gain against
-historical PS cannot offset a native regression. Return failed or inconclusive rows with
-the evidence; do not automatically rerun or start another tuning or ablation
+historical PS cannot offset a native regression. Return failed or inconclusive
+rows with the evidence; do not automatically rerun or start another tuning or ablation
 matrix.
 
 ## 4. Return the evidence and exact status
 
-Return the supplied source manifest, dirty diff, environment, correctness
+Return the recorded SHA/source hashes, dirty diff, environment, correctness
 XML/log, dispatch mapping, actual JIT artifacts, offline artifacts and timing
 JSON/log. Full review explanations belong in private runner artifacts. Update
 these two existing guides with verified status; add no tracked result report.
