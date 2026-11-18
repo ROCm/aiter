@@ -687,7 +687,7 @@ def mhc_post_ref(
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
     term2 = torch.bmm(comb_res_mix.mT, residual.float())
-    return (x.float().unsqueeze(-2) * post_layer_mix + term2).bfloat16()
+    return (x.float().unsqueeze(-2) * post_layer_mix + term2).to(x.dtype)
 
 
 @benchmark()
@@ -706,6 +706,12 @@ def test_mhc_post(m, hidden_size, hc_mult, dtype=dtypes.bf16, data_init="norm", 
         comb_res_mix,
     )
     hip_err = checkAllclose(out_ref, out_hip, msg="out")
+    # checkAllclose only reports; a wrong mhc_post (e.g. at a fallback tile:
+    # hidden 512 runs 256-column tiles, 1024 runs 512) must fail the test.
+    assert hip_err <= 0.05, (
+        f"mhc_post m={m} hidden={hidden_size} {dtype}: {hip_err:.2%} of "
+        "elements outside tolerance"
+    )
     ret = {}
     ret["hip_err"] = hip_err
     ret["hip_us"] = hip_us

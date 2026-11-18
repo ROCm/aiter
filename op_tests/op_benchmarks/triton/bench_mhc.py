@@ -141,8 +141,6 @@ def get_benchmark_configs(args):
 
     Ms = [2**i for i in range(10, 15)]
     n = 4
-    # --with-hip: C=512 is excluded because the greedy post dispatcher selects
-    # block=512 and then fails the kernel's hidden_size >= residual_block * 2 check.
     Cs = [1280, 2560, 4096, 7168]
     return sorted(product(Ms, [n], Cs), key=lambda x: (x[2], x[0]))
 
