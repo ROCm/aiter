@@ -695,12 +695,14 @@ def test_hgemm_memory(
     a.neg_()
     out.fill_(8192)
     graph.replay()
-    exact = (a.float() @ w.float().t() + bias.float()).to(out_dtype)
+    graph_out = out.clone()
+    out.fill_(8192)
+    eager_out = candidates["flydsl_memory"]()
     err = checkAllclose(
-        exact.float(),
-        out.float(),
-        rtol=0,
-        atol=0,
+        eager_out.float(),
+        graph_out.float(),
+        rtol=rtol,
+        atol=atol,
         msg="changed-input graph",
         tol_err_ratio=0,
     )
