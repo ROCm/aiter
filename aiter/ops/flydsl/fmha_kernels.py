@@ -259,6 +259,7 @@ def _get_kernel_gfx11(
     kv_tail: bool,
     num_waves: int,
     block_n: int,
+    token_strides: tuple[int, int, int],
 ):
     # device_index intentionally participates in the cache key.
     return build_flash_attn_func_module_gfx11(
@@ -271,6 +272,26 @@ def _get_kernel_gfx11(
         num_waves=num_waves,
         block_n=block_n,
         vt_rows=4 if block_n >= 64 else 2,
+        q_token_stride=token_strides[0],
+        k_token_stride=token_strides[1],
+        v_token_stride=token_strides[2],
+    )
+
+
+def _gfx11_direct(t: torch.Tensor) -> bool:
+    """True if the gfx11 kernel reads ``t`` in place: head_dim and heads packed
+    (strides 1 and head_dim), token / batch strides multiples of 8 elements and a
+    16-byte aligned start. Covers plain BSHD and views of a packed tensor such as
+    ``qkv[:, :, i]`` of ``[B, S, 3, H, D]``."""
+    _, _, num_heads, head_dim = t.shape
+    s_b, s_t, s_h, s_d = t.stride()
+    return (
+        s_d == 1
+        and s_h == head_dim
+        and s_t >= num_heads * head_dim
+        and s_t % 8 == 0
+        and (t.shape[0] == 1 or (s_b % 8 == 0 and 0 <= s_b < 2**31))
+        and t.data_ptr() % 16 == 0
     )
 
 
@@ -283,9 +304,6 @@ def _flydsl_flash_attn_func_gfx11(q, k, v, causal, softmax_scale, stream, out):
     """gfx11 launch; the caller has validated devices, shapes, dtypes and ``out``."""
     batch, seq_q, num_heads, head_dim = q.shape
     seq_kv = k.shape[1]
-    # Per-batch buffer descriptors address with 32-bit byte offsets.
-    if max(seq_q, seq_kv) * num_heads * head_dim * q.element_size() >= 2**31:
-        raise ValueError("one batch slice of q/k/v must be smaller than 2 GiB")
 
     num_waves, block_n = _gfx11_config(seq_q, head_dim)
     with torch.cuda.device(q.device.index):
@@ -297,7 +315,18 @@ def _flydsl_flash_attn_func_gfx11(q, k, v, causal, softmax_scale, stream, out):
                 tensor.record_stream(launch_stream)
             if out is not None:
                 out.record_stream(launch_stream)
-            q_c, k_c, v_c = q.contiguous(), k.contiguous(), v.contiguous()
+            # Plain BSHD and packed views (e.g. qkv[:, :, i] of [B, S, 3, H, D])
+            # are read in place; anything else is copied.
+            q_c, k_c, v_c = (
+                t if _gfx11_direct(t) else t.contiguous() for t in (q, k, v)
+            )
+            for t, seq in ((q_c, seq_q), (k_c, seq_kv), (v_c, seq_kv)):
+                # Per-batch buffer descriptors address with 32-bit byte offsets.
+                rows = (seq - 1) * t.stride(1) + num_heads * head_dim
+                if rows * t.element_size() >= 2**31:
+                    raise ValueError(
+                        "one batch slice of q/k/v must be smaller than 2 GiB"
+                    )
             write_in_place = out is not None and out.is_contiguous()
             o = out if write_in_place else torch.empty_like(q_c)
             exe = _get_kernel_gfx11(
@@ -310,8 +339,21 @@ def _flydsl_flash_attn_func_gfx11(q, k, v, causal, softmax_scale, stream, out):
                 kv_tail=seq_kv % block_n != 0,
                 num_waves=num_waves,
                 block_n=block_n,
+                token_strides=(q_c.stride(1), k_c.stride(1), v_c.stride(1)),
             )
-            exe(q_c, k_c, v_c, o, batch, seq_q, seq_kv, stream=launch_stream)
+            exe(
+                q_c,
+                k_c,
+                v_c,
+                o,
+                batch,
+                seq_q,
+                seq_kv,
+                stream=launch_stream,
+                q_batch_stride=q_c.stride(0) if batch > 1 else 0,
+                k_batch_stride=k_c.stride(0) if batch > 1 else 0,
+                v_batch_stride=v_c.stride(0) if batch > 1 else 0,
+            )
             if out is not None and not write_in_place:
                 out.copy_(o)
                 o = out
@@ -471,9 +513,8 @@ def flydsl_flash_attn_func(
             alias_inputs.extend((q_descale, k_descale, v_descale))
         if any(_storage_overlaps(out, tensor) for tensor in alias_inputs):
             raise ValueError("out must not overlap q, k, v, or FP8 descale storage")
-    materialized_inputs = not (
-        q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
-    )
+    in_place = _gfx11_direct if is_gfx11 else (lambda t: t.is_contiguous())
+    materialized_inputs = not (in_place(q) and in_place(k) and in_place(v))
     temporary_output = out is not None and not out.is_contiguous()
     if materialized_inputs or temporary_output:
         parts = []

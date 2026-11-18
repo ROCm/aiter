@@ -74,6 +74,9 @@ def build_flash_attn_func_module_gfx11(
     waves_per_eu=None,
     unsafe_fp_math=True,
     fast_fp_math=True,
+    q_token_stride=None,
+    k_token_stride=None,
+    v_token_stride=None,
 ):
     """Build the gfx11 Flash Attention forward kernel.
 
@@ -90,9 +93,16 @@ def build_flash_attn_func_module_gfx11(
         head_group: heads walked fastest in the block order (``None`` = all of
             them, 1 = one head at a time). See the block mapping in the kernel.
         waves_per_eu: ``rocdl.waves_per_eu`` occupancy hint.
+        q_token_stride, k_token_stride, v_token_stride: elements between
+            consecutive tokens of Q / K / V (``None`` = ``num_heads * head_dim``,
+            plain BSHD). Larger values read views of a packed tensor such as
+            ``[B, S, 3, H, D]`` in place; heads must stay ``head_dim`` apart.
+            O is always plain BSHD.
 
     Returns:
-        ``launch(Q, K, V, O, batch, seq_q, seq_kv, stream=...)``.
+        ``launch(Q, K, V, O, batch, seq_q, seq_kv, stream=..., q_batch_stride=...,
+        k_batch_stride=..., v_batch_stride=...)``; batch strides are in elements
+        and default to plain BSHD.
     """
     if head_dim % 8 != 0 or head_dim <= 0:
         raise ValueError(f"head_dim must be a positive multiple of 8, got {head_dim}")
@@ -113,6 +123,16 @@ def build_flash_attn_func_module_gfx11(
     NK = BLOCK_N // WMMA_MNK
     THREADS = num_waves * WAVE_SIZE
     TOK = H * D  # elements between consecutive tokens (BSHD)
+    TOK_Q, TOK_K, TOK_V = (
+        TOK if s is None else int(s)
+        for s in (q_token_stride, k_token_stride, v_token_stride)
+    )
+    for name, s in (("q", TOK_Q), ("k", TOK_K), ("v", TOK_V)):
+        # 128-bit loads need every row start 16-byte aligned.
+        if s < TOK or s % 8 != 0:
+            raise ValueError(
+                f"{name}_token_stride must be a multiple of 8 and >= {TOK}, got {s}"
+            )
     is_bf16 = dtype_str == "bf16"
     elem = fx.BFloat16 if is_bf16 else fx.Float16
 
@@ -174,6 +194,9 @@ def build_flash_attn_func_module_gfx11(
         O: fx.Pointer,
         seq_q: fx.Int32,
         seq_kv: fx.Int32,
+        q_bstride: fx.Int32,
+        k_bstride: fx.Int32,
+        v_bstride: fx.Int32,
     ):
         lds_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().kv.ptr
 
@@ -214,11 +237,14 @@ def build_flash_attn_func_module_gfx11(
             # Longest rows first: the diagonal blocks have the most KV tiles.
             qblk = n_qblk - 1 - qblk
 
-        def batch_buf(ptr, seqlen):
-            # Bounded per batch slice: the kernel relies on OOB loads returning 0
-            # (rows past seq_q / seq_kv) and OOB stores being dropped.
-            slice_bytes = fx.Int64(seqlen) * (TOK * 2)
-            base = buf_base_i64(ptr) + fx.Int64(bat) * slice_bytes
+        def batch_buf(ptr, seqlen, tok, bstride):
+            # Bounded per batch slice, up to the end of its last token's row: the
+            # kernel relies on OOB loads returning 0 (rows past seq_q / seq_kv)
+            # and OOB stores being dropped. With a token stride above H*D (packed
+            # views) the bytes between rows belong to other tensors and are never
+            # addressed.
+            slice_bytes = (fx.Int64(seqlen) * tok - (tok - TOK)) * 2
+            base = buf_base_i64(ptr) + fx.Int64(bat) * fx.Int64(bstride) * 2
             return ptr_buf_tensor(
                 base,
                 elem=elem,
@@ -227,21 +253,21 @@ def build_flash_attn_func_module_gfx11(
                 num_records_bytes=slice_bytes,
             )
 
-        q_buf = batch_buf(Q, seq_q)
-        k_buf = batch_buf(K, seq_kv)
-        v_buf = batch_buf(V, seq_kv)
-        o_buf = batch_buf(O, seq_q)
+        q_buf = batch_buf(Q, seq_q, TOK_Q, q_bstride)
+        k_buf = batch_buf(K, seq_kv, TOK_K, k_bstride)
+        v_buf = batch_buf(V, seq_kv, TOK_V, v_bstride)
+        o_buf = batch_buf(O, seq_q, TOK, seq_q * TOK)
 
         def g_load8(buf, off):
             return buf_copy_load(buf, off, elem=elem, unit_elems=8)
 
-        def tok_off(tok):
-            return tok * TOK + head * D
+        def tok_off(tok, stride=TOK):
+            return tok * stride + head * D
 
         # ---- Q -> VGPRs as WMMA B operands (zero past seq_q / past head_dim) ----
         zero_e8 = Vec.filled(8, 0.0, elem)
         q_row = qblk * BLOCK_M + wave * 16 + l16
-        q_base = tok_off(q_row)
+        q_base = tok_off(q_row, TOK_Q)
         q_vecs = []
         for c in range_constexpr(ND):
             lo = zero_e8
@@ -278,7 +304,9 @@ def build_flash_attn_func_module_gfx11(
             for i in range_constexpr(K_PER_THR):
                 chunk = k_chunk(i)
                 row = chunk // DBLKS
-                kregs.append(g_load8(k_buf, tok_off(key0 + row) + (chunk % DBLKS) * 8))
+                kregs.append(
+                    g_load8(k_buf, tok_off(key0 + row, TOK_K) + (chunk % DBLKS) * 8)
+                )
             vregs = []
             for i in range_constexpr(V_PER_THR):
                 blk = v_block(i)
@@ -286,7 +314,7 @@ def build_flash_attn_func_module_gfx11(
                 d0 = (blk % DBLKS) * 8
                 vregs.append(
                     [
-                        g_load8(v_buf, tok_off(kb0 + r) + d0)
+                        g_load8(v_buf, tok_off(kb0 + r, TOK_V) + d0)
                         for r in range_constexpr(vt_rows)
                     ]
                 )
@@ -489,6 +517,9 @@ def build_flash_attn_func_module_gfx11(
         batch_size: fx.Int32,
         seq_q: fx.Int32,
         seq_kv: fx.Int32,
+        q_bstride: fx.Int32,
+        k_bstride: fx.Int32,
+        v_bstride: fx.Int32,
         stream: fx.Stream = fx.Stream(  # noqa: B008  framework idiom: default is evaluated once at import on purpose
             None
         ),
@@ -501,6 +532,9 @@ def build_flash_attn_func_module_gfx11(
             O,
             seq_q,
             seq_kv,
+            q_bstride,
+            k_bstride,
+            v_bstride,
             value_attrs={
                 "rocdl.waves_per_eu": (
                     int(waves_per_eu)
@@ -515,7 +549,19 @@ def build_flash_attn_func_module_gfx11(
         "unsafe_fp_math": unsafe_fp_math,
     }
 
-    def _launch(Q, K, V, O, batch_size, seq_q, seq_kv, stream=None):
+    def _launch(
+        Q,
+        K,
+        V,
+        O,
+        batch_size,
+        seq_q,
+        seq_kv,
+        stream=None,
+        q_batch_stride=None,
+        k_batch_stride=None,
+        v_batch_stride=None,
+    ):
         _run_compiled(
             launch_flash_attn_func,
             ptr_arg(Q),
@@ -525,6 +571,9 @@ def build_flash_attn_func_module_gfx11(
             batch_size,
             seq_q,
             seq_kv,
+            seq_q * TOK_Q if q_batch_stride is None else q_batch_stride,
+            seq_kv * TOK_K if k_batch_stride is None else k_batch_stride,
+            seq_kv * TOK_V if v_batch_stride is None else v_batch_stride,
             fx.Stream(None) if stream is None else stream,
         )
 

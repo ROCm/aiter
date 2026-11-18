@@ -631,6 +631,73 @@ def test_flydsl_fmha_gfx11_out(contiguous):
     _check_gfx11(out, q, k, v, False, 1.0 / 8.0)
 
 
+@_gfx11_only
+@pytest.mark.parametrize(
+    "batch,seq,num_heads,head_dim,causal,dtype",
+    [
+        (2, 1000, 8, 128, False, torch.bfloat16),
+        (3, 777, 4, 72, True, torch.bfloat16),  # head_dim % 16 == 8, q/kv tails
+        (1, 4096, 16, 64, False, torch.float16),
+    ],
+)
+def test_flydsl_fmha_gfx11_packed_qkv(batch, seq, num_heads, head_dim, causal, dtype):
+    """Views of one [B, S, 3, H, D] tensor are read in place (no copy, no warning)."""
+    g = torch.Generator(device="cuda").manual_seed(0)
+    qkv = torch.randn(
+        batch, seq, 3, num_heads, head_dim, generator=g, dtype=dtype, device="cuda"
+    )
+    q, k, v = qkv.unbind(2)
+    assert not q.is_contiguous()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = flydsl_flash_attn_func(q, k, v, causal=causal)
+    _check_gfx11(out, q, k, v, causal, 1.0 / math.sqrt(head_dim))
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_packed_kv_cross():
+    """Plain Q against K/V views of one [B, S_kv, 2, H, D] tensor (cross-attention)."""
+    batch, seq_q, seq_kv, num_heads, head_dim = 2, 1000, 333, 4, 96
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(
+        batch,
+        seq_q,
+        num_heads,
+        head_dim,
+        generator=g,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    kv = torch.randn(
+        batch,
+        seq_kv,
+        2,
+        num_heads,
+        head_dim,
+        generator=g,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k, v = kv.unbind(2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = flydsl_flash_attn_func(q, k, v)
+    _check_gfx11(out, q, k, v, False, 1.0 / math.sqrt(head_dim))
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_head_interleaved_is_copied():
+    """[B, S, H, 3, D] views (heads 3*D apart) are copied first, with a warning."""
+    g = torch.Generator(device="cuda").manual_seed(0)
+    qkv = torch.randn(
+        2, 500, 4, 3, 64, generator=g, dtype=torch.bfloat16, device="cuda"
+    )
+    q, k, v = qkv.unbind(3)
+    with pytest.warns(UserWarning, match="materializes"):
+        out = flydsl_flash_attn_func(q, k, v)
+    _check_gfx11(out, q, k, v, False, 1.0 / 8.0)
+
+
 # gfx950 fp8 (e4m3fn). The reference dequantizes the *same* fp8 tensors, so the
 # error measured is the kernel's, not the quantizer's.
 
