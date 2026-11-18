@@ -368,9 +368,12 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
 
 def limit_cosine_diff_compare(ref, res, msg="", printLog=True):
     # A tiny swiglu_limit makes correct outputs tiny or all zero, which the
-    # 1e-12 floor in cosine_diff_compare rejects, so normalize first.
-    x = _to_f64_flat(ref)
-    y = _to_f64_flat(res)
+    # 1e-12 floor in cosine_diff_compare rejects, so normalize first. Keep the
+    # row axis so row-wise scoring still applies.
+    x = _to_f64_rows(ref)
+    y = _to_f64_rows(res)
+    if x is None or y is None:
+        x, y = _to_f64_flat(ref), _to_f64_flat(res)
     scale = torch.maximum(x.abs().max(), y.abs().max())
     if scale.item() == 0:
         return 0.0

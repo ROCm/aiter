@@ -39,6 +39,8 @@ COS_DIFF_THRESHOLD = 1e-1
 
 _ROWWISE_ENV = "AITER_MOE_COS_DIFF_ROWWISE"
 
+_warned_shapes = set()
+
 
 def rowwise_enabled():
     """Whether to fold the worst-row score into the tuner's verdict.
@@ -98,10 +100,16 @@ def combined_cos_diff(x_rows, y_rows, whole_tensor):
         # Says so rather than quietly degrading to the whole-tensor score: a
         # packed layout compared against an unpacked reference lands here, and
         # silently falling back would look like row-wise scoring was applied.
-        logger.warning(
-            "cos_diff: row-wise scoring requested but skipped, shapes "
-            f"{None if x_rows is None else tuple(x_rows.shape)} vs "
-            f"{None if y_rows is None else tuple(y_rows.shape)}"
+        # Once per shape pair, since the tuner scores many candidates per shape.
+        shapes = (
+            None if x_rows is None else tuple(x_rows.shape),
+            None if y_rows is None else tuple(y_rows.shape),
         )
+        if shapes not in _warned_shapes:
+            _warned_shapes.add(shapes)
+            logger.warning(
+                "cos_diff: row-wise scoring requested but skipped, shapes "
+                f"{shapes[0]} vs {shapes[1]}"
+            )
         return whole_tensor
     return max(whole_tensor, worst_row_cos_diff(x_rows, y_rows))
