@@ -3,18 +3,17 @@
 
 """FlyDSL decode TopK interface."""
 
-import ctypes
 from functools import lru_cache
 
 import torch
 
 from aiter.jit.utils.chip_info import get_cu_num_device, get_gfx_runtime
-from aiter.ops.asm.asm_utils import load_hip
 from aiter.ops.topk_decode_gate import (
     BACKEND_ADAPTIVE,
     decode_adaptive_width,
     decode_backend_for_shape,
 )
+from aiter.utility import graph_alloc
 
 from ..kernels.kernels_common import get_warp_size
 from ..kernels.tensor_shim import _run_compiled
@@ -61,28 +60,6 @@ _captured_adaptive_control: dict[tuple[torch.device, int, int], torch.Tensor] = 
 # call, so a stack that profiles memory and then empties the allocator's cache still
 # counts them. A capture takes its own from the graph's pool, as its control does.
 _adaptive_scratch: dict[tuple[torch.device, int], torch.Tensor] = {}
-_hip_stream_get_capture_info = None
-
-
-def _capture_id(stream_id: int) -> int | None:
-    """Id of the graph capture `stream_id` is recording, or None."""
-    global _hip_stream_get_capture_info
-    if _hip_stream_get_capture_info is None:
-        fn = load_hip().hipStreamGetCaptureInfo
-        fn.restype = ctypes.c_int
-        fn.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_ulonglong),
-        ]
-        _hip_stream_get_capture_info = fn
-    status, capture = ctypes.c_int(), ctypes.c_ulonglong()
-    err = _hip_stream_get_capture_info(
-        ctypes.c_void_p(stream_id), ctypes.byref(status), ctypes.byref(capture)
-    )
-    if err != 0:
-        raise RuntimeError(f"hipStreamGetCaptureInfo failed with error {err}")
-    return capture.value if status.value != 0 else None
 
 
 def _adaptive_capture(device: torch.device, stream_id: int) -> int | None:
@@ -92,7 +69,7 @@ def _adaptive_capture(device: torch.device, stream_id: int) -> int | None:
         and not torch.cuda.is_current_stream_capturing()
     ):
         return None
-    return _capture_id(stream_id)
+    return graph_alloc._capture_id(stream_id)
 
 
 def _get_adaptive_control(
@@ -243,6 +220,24 @@ def _validate_values_signature(
         raise ValueError("values must be contiguous")
     if values_device != logits_device:
         raise ValueError("values must be on the same CUDA device as logits")
+
+
+@lru_cache(maxsize=128)
+def _validate_row_starts_signature(
+    row_starts_shape: torch.Size,
+    row_starts_stride: tuple[int, ...],
+    row_starts_dtype: torch.dtype,
+    row_starts_device: torch.device,
+    rows: int,
+    logits_device: torch.device,
+) -> None:
+    # The kernels read row r's start at element r of the tensor's data.
+    if row_starts_dtype != torch.int32 or row_starts_shape != (rows,):
+        raise ValueError("row_starts must be int32 [num_rows]")
+    if row_starts_stride != (1,):
+        raise ValueError("row_starts must be contiguous")
+    if row_starts_device != logits_device:
+        raise ValueError("row_starts must be on the same CUDA device as logits")
 
 
 def _validate_flydsl_topk_call(
@@ -517,6 +512,24 @@ def _run_adaptive(
     `cfg_width` defaults to `width` for a caller that states no bound.
     `row_starts` makes the rows packed, `width` then being the plane's.
     """
+    if logits.device.index != torch._C._cuda_getDevice():
+        # Planned, built and launched on the input's GPU, as the current one.
+        with torch.cuda.device(logits.device):
+            return _run_adaptive(
+                logits,
+                next_n,
+                seq_lens,
+                indices,
+                rows,
+                width,
+                stride0,
+                stride1,
+                k,
+                stable,
+                stream,
+                cfg_width,
+                row_starts,
+            )
     if cfg_width is None:
         cfg_width = width
     packed = row_starts is not None
@@ -636,6 +649,16 @@ def _decode_with_backend(
     if not validated:
         _validate_flydsl_topk_call(
             logits, next_n, seq_lens, indices, num_rows, stride0, stride1, k, values
+        )
+    # Outside `validated`: the gate's tensor contract does not cover row_starts.
+    if row_starts is not None:
+        _validate_row_starts_signature(
+            row_starts.shape,
+            row_starts.stride(),
+            row_starts.dtype,
+            row_starts.device,
+            num_rows,
+            logits.device,
         )
 
     rows, width = logits.shape
