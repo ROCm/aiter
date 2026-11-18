@@ -3,9 +3,13 @@
 
 import argparse
 import itertools
+import time
+from functools import partial
 
 import pandas as pd
 import torch
+from torch.autograd import DeviceType
+from torch.profiler import ProfilerActivity, profile
 
 import aiter
 from aiter import dtypes
@@ -85,6 +89,117 @@ def test_binary(shape, stride, other_shape, other_stride, op, dtype):
         "gfx": get_gfx_runtime(),
         "aiter us": us,
         "aiter TB/s": nbytes / us / 1e6,
+        "aiter err": err,
+    }
+
+
+INPLACE_OPS = {
+    "add": aiter.add_,
+    "sub": aiter.sub_,
+    "mul": aiter.mul_,
+    "div": aiter.div_,
+}
+
+# gfx archs on which aiter.add / sub / mul run the flat 16-byte-vector kernel
+FLAT_GFX = ["gfx950", "gfx942"]
+
+# output sizes around the flat kernel's limits: whole 16-byte vectors, and the 1 MiB switch to streaming
+SAME_SHAPE_CASES = {
+    "16B": 16,
+    "1MiB-16": (1 << 20) - 16,
+    "1MiB": 1 << 20,
+    "1MiB+16": (1 << 20) + 16,
+    "2MiB": 2 << 20,
+    "1MiB+2": (1 << 20) + 2,
+    "misaligned": 1 << 20,
+    "partial_block": None,
+}
+
+
+def same_shape_operands(case, dtype):
+    esize = torch.finfo(dtype).bits // 8
+    if case == "partial_block":
+        # not a whole number of 256-vector blocks for any of the three dtypes
+        shape = (5, 7176)
+        return make_input(shape, (7176, 1), dtype), make_input(shape, (7176, 1), dtype)
+    n = -(-SAME_SHAPE_CASES[case] // esize)
+    b = make_input((1, n), (n, 1), dtype)
+    if case == "misaligned":
+        a = make_input((1, n + 1), (n + 1, 1), dtype)[:, 1:]
+    else:
+        a = make_input((1, n), (n, 1), dtype)
+    return a, b
+
+
+def flat_kernels_launched(fn, fresh=None, label=""):
+    # fn's result and the flat kernels it launched. The profiler now and then records no device
+    # kernel at all; then the call fresh() returns, the same op on new operands made outside the
+    # profile, is profiled again after a short pause, up to 3 times, with a warning each time. A
+    # profile with device kernels but not the expected one is taken as it is.
+    call = fn
+    for attempt in range(4):
+        if attempt:
+            aiter.logger.warning(
+                "profile recorded no device kernel, re-profiling %s (attempt %d/4)",
+                label,
+                attempt + 1,
+            )
+            call = fresh()
+            time.sleep(0.075)
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            res = call()
+            torch.cuda.synchronize()
+        if attempt == 0:
+            out = res
+        events = prof.key_averages()
+        names = [e.key for e in events if "operator_flat_kernel" in e.key]
+        if fresh is None or any(e.device_type == DeviceType.CUDA for e in events):
+            break
+    return out, names
+
+
+def assert_flat_variant(names, kernel, streaming, msg):
+    # exactly one flat kernel ran, with the expected streaming flag; the profiler may report the
+    # name demangled (", false>") or mangled ("Lb0E")
+    flag = "true" if streaming else "false"
+    bool_arg = (f", {flag}>", "Lb1E" if streaming else "Lb0E")
+    assert len(names) == 1 and any(
+        t in names[0] for t in bool_arg
+    ), f"{msg}expected {kernel}<..., {flag}>, got {names}"
+
+
+@benchmark()
+def test_same_shape(case, op, dtype, inplace):
+    a, b = same_shape_operands(case, dtype)
+    nbytes = a.numel() * a.element_size()
+    gfx = get_gfx_runtime()
+    eligible = (
+        gfx in FLAT_GFX and op != "div" and nbytes % 16 == 0 and a.data_ptr() % 16 == 0
+    )
+    ref = run_torch(op, a.clone(), b)
+    fn = INPLACE_OPS[op] if inplace else OPS[op][0]
+    # every case launches a kernel; new operands of the same case keep its layout and alignment
+    label = f"{op}{'_' if inplace else ''} {dtype} {case}"
+    out, names = flat_kernels_launched(
+        lambda: fn(a, b), lambda: partial(fn, *same_shape_operands(case, dtype)), label
+    )
+    if inplace:
+        assert out is a, f"{op}_ must return its input"
+    msg = f"{label}: "
+    err = compare(out, ref, msg)
+
+    if eligible:
+        assert_flat_variant(names, "operator_flat_kernel", nbytes >= (1 << 20), msg)
+    else:
+        assert not names, f"{msg}unexpected flat kernel {names}"
+
+    _, us = run_perftest(fn, a, b, num_iters=20, num_rotate_args=1)
+    return {
+        "gfx": gfx,
+        "flat": bool(names),
+        "aiter us": us,
+        "aiter TB/s": 3 * nbytes / us / 1e6,
         "aiter err": err,
     }
 
@@ -263,6 +378,14 @@ def main():
         for dtype, op, pair in itertools.product(args.dtype, args.op, pairs)
     ]
     summarize("binary", rows)
+
+    rows = [
+        test_same_shape(case, op, dtype, inplace)
+        for dtype, op, case, inplace in itertools.product(
+            args.dtype, args.op, SAME_SHAPE_CASES, [False, True]
+        )
+    ]
+    summarize("same_shape", rows)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@
 #include "aiter_tensor.h"
 #include "aiter_dispatch.h"
 #include "aiter_stream.h"
+#include "aiter_opus_plus.h"
 
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
@@ -1151,6 +1152,86 @@ __global__ void operator_contiguous_kernel(const void* __restrict a,
     }
 }
 
+// c = a (op) b for a whole number of 16-byte vectors, one per thread; out-of-range vectors of the
+// last block are dropped by the buffer descriptor. fp32 math, one rounding to _T. streaming: nt
+// loads and sc0 nt stores instead of plain loads and sc1 stores.
+template <class _T, typename Operation, bool streaming>
+__global__ __launch_bounds__(256) void operator_flat_kernel(void* __restrict__ c,
+                                                            const void* __restrict__ a,
+                                                            const void* __restrict__ b,
+                                                            uint32_t nbytes)
+{
+    constexpr int VEC = 16 / sizeof(_T);
+    using fvec_t      = opus::vector_t<float, VEC>;
+#if defined(__gfx942__) || defined(__gfx950__)
+    // buffer cache-policy bits here: sc0 = 1, nt = 2, sc1 = 16
+    constexpr int load_aux  = streaming ? 2 : RT;
+    constexpr int store_aux = streaming ? GROUP_NT : 16;
+#else
+    constexpr int load_aux  = RT;
+    constexpr int store_aux = RT;
+#endif
+    auto ga     = opus::make_gmem(static_cast<const _T*>(a), nbytes);
+    auto gb     = opus::make_gmem(static_cast<const _T*>(b), nbytes);
+    auto gc     = opus::make_gmem(static_cast<const _T*>(c), nbytes);
+    const int i = (blockIdx.x * 256 + threadIdx.x) * VEC;
+    const fvec_t x =
+        __builtin_convertvector((load_vector_nbytes<_T, VEC, 16, load_aux>(ga, i)), fvec_t);
+    const fvec_t y =
+        __builtin_convertvector((load_vector_nbytes<_T, VEC, 16, load_aux>(gb, i)), fvec_t);
+    fvec_t r;
+#pragma unroll
+    for(int k = 0; k < VEC; ++k)
+        r[k] = performOperation<float, Operation, true>(x[k], y[k]);
+    store_vector_nbytes<_T, _T, VEC, 16, store_aux>(
+        gc, __builtin_convertvector(r, opus::vector_t<_T, VEC>), i);
+}
+
+template <class T>
+using flat_native_t = std::conditional_t<std::is_same_v<T, hip_bfloat16>, __bf16, T>;
+template <class T>
+inline constexpr bool flat_supported_v =
+    std::is_same_v<T, hip_bfloat16> || std::is_same_v<T, _Float16> || std::is_same_v<T, float>;
+
+// The flat kernels' cache-policy bits are measured on gfx950 and gfx942; other archs keep the
+// general kernels.
+inline bool binary_flat_arch_supported()
+{
+    static SynchronizedCache<int, bool> cache;
+    int device = -1;
+    HIP_CALL(hipGetDevice(&device));
+    return cache.get_or_create(device, []() {
+        const std::string arch = get_gpu_arch();
+        return arch == "gfx950" || arch == "gfx942";
+    });
+}
+
+// Launches operator_flat_kernel when it applies (same dtype everywhere, add / sub / mul, 16-byte
+// aligned, a whole number of 16-byte vectors, < 2 GiB, supported arch); returns false otherwise.
+// Outputs from 1 MiB on stream.
+template <typename Operation, class _T0, class _T1>
+bool binary_flat_launch(const void* a, const void* b, void* c, int64_t n, hipStream_t stream)
+{
+    if constexpr(!std::is_same_v<_T0, _T1> || std::is_same_v<Operation, DivOp> ||
+                 !flat_supported_v<_T0>)
+        return false;
+    else
+    {
+        const int64_t nbytes = n * (int64_t)sizeof(_T0);
+        if(nbytes == 0 || nbytes % 16 != 0 || nbytes >= (int64_t(1) << 31) ||
+           ((uintptr_t)a | (uintptr_t)b | (uintptr_t)c) % 16 != 0 || !binary_flat_arch_supported())
+            return false;
+        const int grid = (int)((nbytes / 16 + 255) / 256);
+        if(nbytes < (int64_t(1) << 20))
+            operator_flat_kernel<flat_native_t<_T0>, Operation, false>
+                <<<grid, 256, 0, stream>>>(c, a, b, (uint32_t)nbytes);
+        else
+            operator_flat_kernel<flat_native_t<_T0>, Operation, true>
+                <<<grid, 256, 0, stream>>>(c, a, b, (uint32_t)nbytes);
+        return true;
+    }
+}
+
 template <class _T, typename Operation, class _T0, class _T1>
 __global__ void operator_element_kernel(const void* __restrict a,
                                         const void* __restrict b,
@@ -2173,6 +2254,10 @@ struct BinaryOperationPattern<4, Operation, _T0, _T1>
         }
 
         const hipStream_t stream = aiter::getCurrentHIPStream();
+        if(output.dtype() == input.dtype() && output.is_contiguous() &&
+           aiter::binary_flat_launch<Operation, _T0, _T1>(
+               buf_a, buf_b, buf_c, (int64_t)output.numel(), stream))
+            return;
         bool types_match         = typeid(_T0) == typeid(_T1);
         int vec                  = 16 / output.element_size();
         hipDevice_t dev;
