@@ -536,6 +536,64 @@ def test_pa_decode_fp16_bf16_case_policy(
             test_pa_decode(case, device, monkeypatch)
 
 
+@pytest.mark.parametrize("query_length", [1, 4])
+def test_pa_decode_mxfp4_gfx1250_strict_refused(device, monkeypatch, query_length):
+    """MI450 A0 (gfx1250-strict) refuses MXFP4 before any kernel compiles.
+
+    chip_info maps strict to gfx1250 only at validated dispatch sites; the MXFP4
+    kernel was not run on A0, nor its scaled WMMAs checked against A0's
+    S_CLAUSE erratum. The tile compiler refuses it too.
+    """
+    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    monkeypatch.setattr(pa, "get_gfx_runtime", lambda: "gfx1250-strict")
+    compile_tile = pa.compile_pa_decode_tile
+
+    def unexpected_compile(**kwargs):
+        raise AssertionError("gfx1250-strict compiled an MXFP4 kernel")
+
+    monkeypatch.setattr(pa, "compile_pa_decode_tile", unexpected_compile)
+    batch, heads = 2, 16
+    pool = torch.zeros((batch, 1, 128 * 68), dtype=torch.uint8, device=device)
+    key_cache, key_scale = _mxfp4_views(pool)
+    value_cache, value_scale = _mxfp4_views(pool.clone())
+    query = torch.zeros(
+        (batch * query_length, heads, 128), dtype=torch.bfloat16, device=device
+    )
+    context = torch.full((batch,), 100, dtype=torch.int32, device=device)
+    table = torch.arange(batch, dtype=torch.int32, device=device).reshape(batch, 1)
+    match = "not validated on gfx1250-strict"
+    with pytest.raises(NotImplementedError, match=match):
+        pa.pa_decode(
+            torch.empty_like(query),
+            query,
+            key_cache,
+            value_cache,
+            context,
+            table,
+            128**-0.5,
+            query_length,
+            compute_type=dtypes.fp4x2,
+            key_scale=key_scale,
+            value_scale=value_scale,
+        )
+    with pytest.raises(NotImplementedError, match=match):
+        compile_tile(
+            architecture="gfx1250-strict",
+            head_dim=128,
+            query_group_size=heads,
+            block_size=128,
+            num_seqs=batch,
+            num_kv_heads=1,
+            num_compute_units=256,
+            work_capacity=batch,
+            query_dtype=torch.bfloat16,
+            kv_dtype=dtypes.fp4x2,
+            per_token_kv=True,
+            query_length=query_length,
+            direct_output=True,
+        )
+
+
 def _reference(
     query, key, value, table, lengths, query_length, window, sinks, dtype=torch.float32
 ):
@@ -1487,6 +1545,20 @@ _MXFP4_CASES = [
         )
         for partitions in (1, 2, 3, 8)
     ],
+    # Default-plan decode merges on chip only with one tile a cluster CTA: 32
+    # one-tile tasks and the reducer beat 16 two-tile cluster CTAs at B1 x 8k.
+    *[
+        (
+            f"mxfp4-decode-{length // 1024}k-{'cluster' if cluster else 'reducer'}",
+            {
+                **_MXFP4_BASE,
+                "query_dtype": torch.bfloat16,
+                "cluster": cluster,
+                "lengths": (length,),
+            },
+        )
+        for length, cluster in ((4096, 16), (8192, 0))
+    ],
     *[
         (
             f"mxfp4-{pattern}-128k{'-plan-free' if free else ''}",
@@ -1657,8 +1729,9 @@ _MXFP4_GFX1250_CASES = [
         )
         for splits in (1, 2, 4)
     ],
-    # Enough tiles that a CTA runs two plan slots (fuse_tasks): adjacent tiles
-    # of a sequence fuse, pairs across sequences (and empty ones) run apart.
+    # Enough tiles that a CTA runs two plan slots (fuse_tasks), and more
+    # sequences than resident clusters: adjacent tiles of a sequence fuse,
+    # pairs across sequences (and empty ones) run apart.
     *[
         (
             f"mxfp4-mtp4-fused{'-window' if window else ''}",
@@ -1668,11 +1741,40 @@ _MXFP4_GFX1250_CASES = [
                 "query_length": 4,
                 "window": window,
                 "fused": True,
-                "lengths": (0, 1, 4, 255, 256, 257, 1027, 513) * 10,
+                "lengths": (0, 1, 4, 255, 256, 257, 1027, 513) * 32,
             },
         )
         for window in (0, 300)
     ],
+    # A table-capacity length bound (as ATOM passes) compiles the fusing
+    # kernel, but the plan's 56 live tasks fit one round, so each CTA runs one
+    # slot.
+    (
+        "mxfp4-mtp4-fused-loose-bound",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "query_length": 4,
+            "fused": True,
+            "lengths": (0, 1, 4, 255, 256, 257, 1027, 513) * 4,
+            "table_width": 1024,
+            "max_context": 1024 * 128,
+        },
+    ),
+    # Long contexts behind a window: the window bounds the tiles, so the call
+    # neither fuses nor launches the reducer.
+    (
+        "mxfp4-mtp4-window4096-long",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "query_length": 4,
+            "window": 4096,
+            "fused": False,
+            "cluster": 16,
+            "lengths": (32768, 30001, 4100),
+        },
+    ),
     (
         "mxfp4-mtp4-graph",
         {
@@ -1784,7 +1886,7 @@ _SELECT_INVALID = {
     "unmapped-kv": ("gfx950", torch.complex64, torch.bfloat16),
 }
 _SELECT_INVALID_CASES = [
-    ("mxfp4-on-gfx942", ValueError, "MXFP4 PA decode requires gfx950"),
+    ("mxfp4-on-gfx942", ValueError, "takes MXFP4 KV only on gfx950"),
     ("fp8-query-fp8-kv", ValueError, "An FP8 query needs MXFP4 KV"),
     ("fp8-query-bf16-kv", ValueError, "BF16 KV requires a BF16 query"),
     (
@@ -2155,7 +2257,7 @@ def _run_pa_decode_case(case, device, monkeypatch):
             "variants": False,
             "cluster": None,
             "query_splits": None,
-            "fused": False,
+            "fused": None,
             "cluster_seqs": None,
             "cluster_steps": None,
             "cluster_runs": None,
@@ -2467,8 +2569,11 @@ def _run_pa_decode_case(case, device, monkeypatch):
     else:
         # MXFP4 KV is per-token KV: its e8m0 bytes are each row's scales.
         assert compile_kwargs and all(k["per_token_kv"] for k in compile_kwargs)
-        if case["fused"]:
-            assert any(k.get("fuse_tasks") == 2 for k in compile_kwargs)
+        if case["fused"] is not None:
+            fused = any(k.get("fuse_tasks") == 2 for k in compile_kwargs)
+            assert fused == case["fused"], compile_kwargs[-1]
+        if case["cluster"] is not None and arch == "gfx1250":
+            assert compile_kwargs[-1]["cluster_merge"] == case["cluster"]
     if case["quant"] and arch == "gfx1250":
         _check_quant_output(launch, query, output, compile_kwargs, case)
     elif case["quant"]:

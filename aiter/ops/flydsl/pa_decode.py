@@ -24,6 +24,7 @@ from .kernels.pa_decode_kernel import (
     KV_COMPUTE_BLOCK,
     MERGE_HEAD_DIM,
     MERGE_PARTITIONS,
+    MXFP4_GFX1250_STRICT_REFUSAL,
     compile_pa_decode_tile,
     gfx1250_tile_traits,
     mxfp4_gfx1250_query_splits,
@@ -266,7 +267,9 @@ def _pa_decode_mxfp4(
     refuse both before this point.
     """
     arch = get_gfx_runtime()
-    gfx1250 = arch in ("gfx1250", "gfx1250-strict")
+    if arch == "gfx1250-strict":
+        raise NotImplementedError(MXFP4_GFX1250_STRICT_REFUSAL)
+    gfx1250 = arch == "gfx1250"
     if arch != "gfx950" and not gfx1250:
         raise NotImplementedError("MXFP4 pa_decode supports gfx950 and gfx1250")
     # fp4x2 data and fp8_e8m0 scale views are the same bytes as uint8 ones.
@@ -386,36 +389,62 @@ def _pa_decode_mxfp4(
     direct = work_plan is None or (work_plan.max_partitions == 1 and same_strides)
     capacity = num_seqs if direct else work_plan.capacity
     num_compute_units = torch.cuda.get_device_properties(dev).multi_processor_count
-    # As for FP8/BF16 on gfx1250: sequences of at most P <= CLUSTER_PARTITIONS
-    # tasks merge within a cluster of P CTAs instead of the reducer, while the
-    # clusters stay resident (15 per 16 CUs).
-    partitions = 1 if direct else min(work_plan.max_partitions, capacity)
+    # Tiles a sequence can own: the length bound's, within the MTP window as on
+    # the FP8/BF16 path.
+    seq_tiles = max(1, -(-schedule_context_length // KV_COMPUTE_BLOCK))
+    if sliding_window > 0:
+        seq_tiles = min(
+            seq_tiles,
+            (sliding_window + query_length - 2 + KV_COMPUTE_BLOCK - 1)
+            // KV_COMPUTE_BLOCK
+            + 1,
+        )
+    # As for FP8/BF16 on gfx1250: a sequence's tasks, at most
+    # CLUSTER_GROUPED_PARTITIONS of them, merge within a cluster of at most
+    # CLUSTER_PARTITIONS CTAs instead of the reducer, while the clusters stay
+    # resident (15 per 16 CUs). Larger bounds split their tiles over the
+    # cluster. Every query split is a cluster of its own, so both bounds count
+    # the splits (G16 x MTP4 at B32 x 8k would launch 1024 cluster CTAs, two
+    # rounds at two a CU: 16.4 us against 14.4 us with the reducer).
+    #
+    # Single-token decode merges on chip only where that costs no
+    # parallelism: one tile a cluster CTA, or clusters that fill the CUs.
+    # Otherwise the plan's one-tile tasks and the reducer win (B1 x 8k:
+    # 5.5 us against 5.9 us for 16 two-tile CTAs; B16 x 8k: 6.9 against
+    # 6.6 us). MTP tasks cost more, so they merge on chip whenever the
+    # clusters fit (G16 x MTP4 at B3 x 8k: 7.4 against 7.1 us).
+    splits = mxfp4_gfx1250_query_splits(query_length, group) if gfx1250 else 1
+    partitions = 1 if direct else min(work_plan.max_partitions, capacity, seq_tiles)
+    cluster_size = min(partitions, CLUSTER_PARTITIONS)
     cluster_merge = (
-        partitions
+        cluster_size
         if gfx1250
         and same_strides
-        and 2 <= partitions <= CLUSTER_PARTITIONS
-        and num_seqs * partitions
+        and 2 <= partitions <= CLUSTER_GROUPED_PARTITIONS
+        and (
+            query_length > 1
+            or partitions <= CLUSTER_PARTITIONS
+            or num_seqs * num_kv_heads * cluster_size >= num_compute_units
+        )
+        and num_seqs * cluster_size * splits
         <= max(capacity, -(-2 * num_compute_units // num_kv_heads))
-        and num_seqs * num_kv_heads <= num_compute_units * 15 // 16
+        and num_seqs * num_kv_heads * splits <= num_compute_units * 15 // 16
         else 0
     )
-    # A gfx1250 MTP CTA keeping several M-tiles fits two to a CU. When its
-    # tasks times the query splits exceed that, a CTA runs two plan slots, so a
-    # sequence's adjacent tiles fuse into one longer task (G16 x MTP4 at the
-    # default budget: B8 x 32k 14.5 -> 13.0 us, B32 x 8k 15.2 -> 13.8 us). The tile
-    # count bounds the tasks of a short batch, which fusing would only serialize.
-    splits = mxfp4_gfx1250_query_splits(query_length, group) if gfx1250 else 1
-    max_tasks = min(
-        capacity, num_seqs * -(-schedule_context_length // KV_COMPUTE_BLOCK)
-    )
+    # A gfx1250 MTP CTA keeping several M-tiles fits two to a CU. When the
+    # plan's tasks times the KV heads and query splits exceed that, a CTA runs
+    # two plan slots, so a sequence's adjacent tiles fuse into one longer task
+    # (G16 x MTP4 at the default budget: B8 x 32k 14.5 -> 13.0 us, B32 x 8k
+    # 15.2 -> 13.8 us). The kernel decides from the plan's live tasks; the
+    # tiles the bound and window allow only decide whether it may.
+    max_tasks = min(capacity, num_seqs * seq_tiles)
     fuse_tasks = (
         2
         if gfx1250
         and not direct
         and not cluster_merge
         and query_length * group // splits > 16
-        and max_tasks * splits > 2 * num_compute_units
+        and max_tasks * num_kv_heads * splits > 2 * num_compute_units
         else 1
     )
     with torch.cuda.device(dev):
@@ -790,7 +819,9 @@ def pa_decode(
             )
 
     if mxfp4:
-        if get_gfx_runtime() not in ("gfx1250", "gfx1250-strict"):
+        if get_gfx_runtime() == "gfx1250-strict":
+            raise NotImplementedError(MXFP4_GFX1250_STRICT_REFUSAL)
+        if get_gfx_runtime() != "gfx1250":
             if query_length != 1:
                 raise NotImplementedError(
                     f"MXFP4 KV supports query_length 1, got {query_length}"

@@ -247,8 +247,10 @@ class PaDecodeSchedule:
             )
         if kv_dtype == MXFP4_KV_DTYPE:
             if arch != "gfx950":
+                # gfx1250 MXFP4 tiles come from gfx1250_tile_traits instead.
                 raise ValueError(
-                    f"MXFP4 PA decode requires gfx950 or gfx1250; got {arch}"
+                    "the gfx942/gfx950 PA decode schedule takes MXFP4 KV only "
+                    f"on gfx950 (gfx1250 selects gfx1250_tile_traits); got {arch}"
                 )
             if query_dtype not in (fx.BFloat16, fx.Float8E4M3FN):
                 raise ValueError("MXFP4 KV requires a BF16 or FP8 query")
@@ -1365,8 +1367,11 @@ class Gfx1250Traits:
     # MXFP4 without a plan: ``work`` holds context lengths, CTA s runs sequence
     # s whole and stores its final rows.
     plan_free: bool = False
-    # MXFP4 partials: plan slots a CTA runs (2: adjacent tiles fuse).
+    # MXFP4 partials: plan slots a CTA may run (2: adjacent tiles fuse).
     fuse_tasks: int = 1
+    # With fuse_tasks 2, CTAs resident at once (two per CU): a CTA runs two
+    # slots only when the plan's live tasks need more CTAs than this.
+    resident_ctas: int = 0
 
     WAVE = 32
     NWARP = 4

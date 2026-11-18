@@ -122,6 +122,12 @@ __all__ = [
 # default, and at most.
 MXFP4_GFX1250_ROWS = 32
 MXFP4_GFX1250_MAX_ROWS = 64
+# chip_info maps gfx1250-strict (MI450 A0) to gfx1250 only at dispatch sites
+# validated on it. The MXFP4 kernel was not run on A0, nor its scaled WMMAs
+# checked against A0's S_CLAUSE erratum.
+MXFP4_GFX1250_STRICT_REFUSAL = (
+    "MXFP4 pa_decode is not validated on gfx1250-strict (MI450 A0)"
+)
 
 
 def mxfp4_gfx1250_query_splits(query_length, query_group_size):
@@ -301,6 +307,8 @@ def compile_pa_decode_tile(
     if architecture in ("gfx1250", "gfx1250-strict"):
         kv_fx, query_fx = pa_fx_dtypes(kv_dtype, query_dtype)
         if kv_fx == MXFP4_KV_DTYPE:
+            if architecture == "gfx1250-strict":
+                raise NotImplementedError(MXFP4_GFX1250_STRICT_REFUSAL)
             if query_fx not in (fx.BFloat16, fx.Float8E4M3FN):
                 raise ValueError("MXFP4 KV requires a BF16 or FP8 query")
         elif query_fx not in (fx.Float16, fx.BFloat16) or kv_fx not in (
@@ -899,6 +907,7 @@ def gfx1250_tile_traits(
         store_output=store_output,
         plan_free=plan_free,
         fuse_tasks=fuse_tasks,
+        resident_ctas=2 * num_compute_units if fuse_tasks > 1 else 0,
     )
 
 
@@ -928,9 +937,11 @@ def compile_gfx1250_pa_decode(t):
     ``plan_free`` instead reads ``work`` as the context lengths, runs sequence
     s whole in CTA s and stores its final rows (an empty sequence's are zeroed).
     ``fuse_tasks=2``
-    (MXFP4 partials) gives CTA b plan slots 2 b and 2 b + 1: adjacent tiles of
-    one sequence run as one task whose partial is slot 2 b's (slot 2 b + 1's
-    holds no mass), others run one after the other.
+    (MXFP4 partials) halves the grid. When the plan's live tasks need more CTAs
+    than ``resident_ctas``, CTA b runs plan slots 2 b and 2 b + 1: adjacent
+    tiles of one sequence run as one task whose partial is slot 2 b's (slot
+    2 b + 1's holds no mass), others run one after the other. Otherwise CTA b
+    runs slot b alone.
     """
     if t.query_splits not in (1, 2, 4) or t.query_length % t.query_splits:
         raise ValueError("query_splits must be 1, 2, or 4 and divide query_length")
@@ -1164,24 +1175,49 @@ def compile_gfx1250_pa_decode(t):
             )
 
         if const_expr(t.fuse_tasks > 1):
-            pair = fx.Int32(gpu.block_id("x")) * 2
+            # The grid holds (capacity + 1) // 2 CTAs. The host's tile bound
+            # cannot see real lengths (a table-capacity bound), so the plan's
+            # live tasks decide: CTA b runs slot b alone when one slot a CTA
+            # fits one round of resident CTAs, else slots 2 b and 2 b + 1.
+            # Scalar loads return out of order, so all of them issue before
+            # any is used.
+            fuse_block = fx.Int32(gpu.block_id("x"))
+            pair = fuse_block * 2
+            last_tasks = fx.ptr_load(
+                fx.add_offset(fx.recast_iter(fx.Int32, reduce_info), sequences * 2 - 2),
+                result_type=fx.Vector.make_type(2, fx.Int32),
+            )
             pair_tasks = [
                 fx.ptr_load(
                     fx.add_offset(
                         fx.recast_iter(fx.Int32, work),
-                        fx.min(pair + i, capacity - 1) * 4,
+                        fx.min(slot, capacity - 1) * 4,
                     ),
                     result_type=fx.Vector.make_type(4, fx.Int32),
                 )
-                for i in range_constexpr(2)
+                for slot in (pair, pair + 1, fuse_block)
             ]
+            fx.rocdl.sched_barrier(0)
+            # Packed tasks: the last sequence's first slot plus its count.
+            fuse_live = fx.Int32(last_tasks[0]) + fx.Int32(last_tasks[1])
+            fuse_pairs = (fuse_live * kv_heads * t.query_splits > t.resident_ctas) | (
+                fuse_live > (capacity + 1) // 2
+            )
+            pair = fuse_pairs.select(pair, fuse_block)
             pair_fields = [
-                [fx.Int32(pair_tasks[i][f]) for f in range_constexpr(4)]
-                for i in range_constexpr(2)
+                [
+                    fuse_pairs.select(
+                        fx.Int32(pair_tasks[0][f]), fx.Int32(pair_tasks[2][f])
+                    )
+                    for f in range_constexpr(4)
+                ],
+                [fx.Int32(pair_tasks[1][f]) for f in range_constexpr(4)],
             ]
             pair_active = [
                 pair_fields[0][1] < pair_fields[0][2],
-                (pair + 1 < capacity) & (pair_fields[1][1] < pair_fields[1][2]),
+                fuse_pairs
+                & (pair + 1 < capacity)
+                & (pair_fields[1][1] < pair_fields[1][2]),
             ]
             # Adjacent tiles of one sequence: one task over both ranges.
             pair_fuse = (
@@ -1190,9 +1226,10 @@ def compile_gfx1250_pa_decode(t):
                 & (pair_fields[0][0] == pair_fields[1][0])
                 & (pair_fields[0][2] == pair_fields[1][1])
             )
-            for pair_sub_i in range(
-                0, 2 - pair_fuse.select(fx.Int32(1), fx.Int32(0)), 1
-            ):
+            fuse_runs = fuse_pairs.select(
+                2 - pair_fuse.select(fx.Int32(1), fx.Int32(0)), fx.Int32(1)
+            )
+            for pair_sub_i in range(0, fuse_runs, 1):
                 pair_sub = fx.Int32(pair_sub_i)
                 pair_first = pair_sub == 0
                 pair_task = [
