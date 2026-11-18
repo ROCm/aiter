@@ -10,6 +10,11 @@ A key is the full argument set of one `get_2stage_cfgs` call, built the way
 - `fhmoe`: one key per row of the dedicated FHMoE table (`config_file=` path);
 - `grid`: the quant combinations found in any tuned table (fp8 mapped to the arch's
   fp8), times `GRID_SHAPES`, times `GRID_M`, in the `base` and `ep` variants.
+
+The `base` tuned and grid keys of the quant types in `FEATURE_QUANT_TYPES` also come in
+feature variants (`feature_keys`): the same call with one more `get_2stage_cfgs` feature
+(`num_local_tokens`, activation scales, bias, padding, ...), so a changed decision for
+it shows up as its own key.
 """
 
 from dataclasses import dataclass, field
@@ -62,6 +67,8 @@ EXTRA_COMBOS = (
 
 TUNED_VARIANTS = ("base", "ep", "unshuffled")
 GRID_VARIANTS = ("base", "ep")
+# Quant types whose keys get the feature variants; a v2 path adds its quant type.
+FEATURE_QUANT_TYPES = ("per_Tensor",)
 
 _FP8_NAMES = ("float8_e4m3fn", "float8_e4m3fnuz")
 
@@ -122,13 +129,22 @@ def _enum(enum_cls, text):
     return getattr(enum_cls, str(text).split(".")[-1])
 
 
-def _variant_kwargs(variant, activation):
+def _activation_kwargs(activation):
     from aiter.fused_moe import _normalize_mxfp4_activation_params
-    from aiter.ops.flydsl.moe_common import GateMode
 
     situ_beta, situ_linear_beta, swiglu_limit = _normalize_mxfp4_activation_params(
         activation, None, None, None
     )
+    return {
+        "situ_beta": situ_beta,
+        "situ_linear_beta": situ_linear_beta,
+        "swiglu_limit": swiglu_limit,
+    }
+
+
+def _variant_kwargs(variant, activation):
+    from aiter.ops.flydsl.moe_common import GateMode
+
     shuffled = variant != "unshuffled"
     return {
         "is_shuffled": shuffled,
@@ -136,9 +152,7 @@ def _variant_kwargs(variant, activation):
         "is_ep": variant == "ep",
         "has_stage1_bias": False,
         "has_stage2_bias": False,
-        "situ_beta": situ_beta,
-        "situ_linear_beta": situ_linear_beta,
-        "swiglu_limit": swiglu_limit,
+        **_activation_kwargs(activation),
         "opus_weights_shuffled": shuffled,
         "gate_up_interleave": None,
     }
@@ -280,6 +294,71 @@ def grid_keys(arch_fp8, table=None):
                 for variant in GRID_VARIANTS:
                     shape = (token, model_dim, inter_dim, expert, topk)
                     keys.append(_make_key("grid", variant, shape, combo))
+    return keys
+
+
+_USE_G1U1, _ACTIVATION, _DOWEIGHT, _HIDDEN_PAD, _INTER_PAD = 9, 10, 11, 12, 13
+
+
+def _feature_variants(arch_fp8):
+    """{variant: (positional argument overrides by index, keyword overrides)}."""
+    from aiter import ActivationType
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    return {
+        "num_local_tokens": ({}, {"has_num_local_tokens": True}),
+        "act_scales": ({}, {"has_activation_scales": True}),
+        "input_act_scales": (
+            {},
+            {"has_activation_scales": True, "_has_input_activation_scales": True},
+        ),
+        "fp8_input": ({}, {"input_dtype": arch_fp8, "has_activation_scales": True}),
+        "fp8_input_no_scales": ({}, {"input_dtype": arch_fp8}),
+        "scatter": ({}, {"has_stage2_scatter": True}),
+        "unshuffled": ({}, {"is_shuffled": False, "opus_weights_shuffled": False}),
+        "half_shuffled": ({}, {"opus_weights_shuffled": False}),
+        "bias1": ({}, {"has_stage1_bias": True}),
+        "bias2": ({}, {"has_stage2_bias": True}),
+        "gate_interleave": ({}, {"gate_mode": GateMode.INTERLEAVE}),
+        "gate_up_interleave": ({}, {"gate_up_interleave": True}),
+        "limit0": ({}, {"swiglu_limit": 0.0}),
+        "limit7": ({}, {"swiglu_limit": 7.0}),
+        "exclude_mxmoe": ({}, {"_exclude_mxmoe": True}),
+        "q_dtype_a2": ({}, {"q_dtype_a2": arch_fp8}),
+        "doweight": ({_DOWEIGHT: True}, {}),
+        "gelu": ({_ACTIVATION: ActivationType.Gelu}, {}),
+        "no_g1u1": ({_USE_G1U1: False}, {}),
+        "pad": ({_HIDDEN_PAD: 128, _INTER_PAD: 128}, {}),
+    }
+
+
+def feature_keys(base_keys, arch_fp8):
+    """The `base` tuned and grid keys of `FEATURE_QUANT_TYPES`, one feature added each."""
+    from aiter import QuantType
+
+    quant_types = {getattr(QuantType, q) for q in FEATURE_QUANT_TYPES}
+    variants = _feature_variants(arch_fp8)
+    keys = []
+    for key in base_keys:
+        if (
+            key.variant != "base"
+            or key.section not in ("tuned", "grid")
+            or key.args[8] not in quant_types
+        ):
+            continue
+        for name, (positional, keyword) in variants.items():
+            if key.section == "tuned" and name in TUNED_VARIANTS:
+                continue
+            args = list(key.args)
+            for index, value in positional.items():
+                args[index] = value
+            kwargs = key.call_kwargs()
+            if _ACTIVATION in positional:
+                kwargs.update(_activation_kwargs(args[_ACTIVATION]))
+            kwargs.update(keyword)
+            keys.append(
+                Key(key.section, name, tuple(args), tuple(sorted(kwargs.items())))
+            )
     return keys
 
 

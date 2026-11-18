@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""End-to-end MoE performance baseline for a fixed shape set (steps doc 0.3).
+"""End-to-end MoE performance baseline for a fixed shape set.
 
     python tests/moe_dispatch/perf_baseline.py --record           # golden/perf_<gfx>.json
     python tests/moe_dispatch/perf_baseline.py --check
+    python tests/moe_dispatch/perf_baseline.py --record --case dsv3_tp8_pt  # add one case
 
 Each case runs `op_tests/test_moe_2stage.py` in a subprocess (one per quant and shape,
 so an OOM or a crash only loses that case) and reads its result table, so inputs, weight
@@ -30,6 +31,7 @@ PREFILL_M = (1024, 4096, 16384)
 # allocates: GPT-OSS 2880 is rounded up to 3072 on ROCm MXFP4. Qwen3-235B FP8 block
 # scale runs at TP4, since its TP8 inter_dim (192) is not a multiple of 128.
 CASES = (
+    ("dsv3_tp8_pt", 1, "silu", (7168, 256), (0, 0), 256, 8, ("gfx942", "gfx950")),
     ("dsv3_tp8_blockscale", 5, "silu", (7168, 256), (0, 0), 256, 8, ("gfx942", "gfx950")),
     ("dsv3_tp8_a4w4", 4, "silu", (7168, 256), (0, 0), 256, 8, ("gfx950",)),
     ("dsv4_a8w4", 7, "silu", (7168, 384), (0, 0), 384, 6, ("gfx950",)),
@@ -95,10 +97,10 @@ def run_case(case, tokens):
     raise RuntimeError(f"case {case[0]} failed:\n{proc.stderr[-3000:]}")
 
 
-def measure(gfx):
+def measure(gfx, names=None):
     results = {}
     for case in CASES:
-        if gfx not in case[-1]:
+        if gfx not in case[-1] or (names and case[0] not in names):
             continue
         try:
             results[case[0]] = run_case(case, DECODE_M + PREFILL_M)
@@ -119,22 +121,32 @@ def main(argv=None):
         default=0.10,
         help="allowed slowdown; unchanged code drifts up to ~8%% at small M on gfx950",
     )
+    parser.add_argument(
+        "--case",
+        action="append",
+        choices=[case[0] for case in CASES],
+        help="only these cases; --record keeps the other recorded cases",
+    )
     args = parser.parse_args(argv)
 
     gfx = _gfx()
     path = GOLDEN_DIR / f"perf_{gfx}.json"
-    results = measure(gfx)
+    results = measure(gfx, args.case)
     errors = [name for name, per_m in results.items() if "error" in per_m]
     if args.record:
         if errors:
             print(f"not writing {path}: cases failed: {errors}")
             return 1
+        if args.case and path.exists():
+            results = {**json.loads(path.read_text())["us"], **results}
         path.write_text(
             json.dumps({"gfx": gfx, "us": results}, indent=1, sort_keys=True) + "\n"
         )
         print(f"wrote {path}")
         return 0
     baseline = json.loads(path.read_text())["us"]
+    if args.case:
+        baseline = {name: baseline[name] for name in args.case if name in baseline}
     problems = []
     for name, per_m in baseline.items():
         for m, us in per_m.items():

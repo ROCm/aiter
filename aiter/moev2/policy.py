@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Activation quantization policy: the activation dtype fused_moe quantizes to.
 
-Fixed before dispatch (design doc §13, D2).
+Fixed before dispatch.
 """
 
 import os
@@ -11,7 +11,11 @@ import torch
 
 from aiter import ActivationType, QuantType
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.flydsl.moe_common import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+    GateMode,
+)
 from aiter.utility import dtypes
 
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
@@ -109,3 +113,24 @@ def resolve_activation_dtype(
             q_dtype_a = dtypes.fp4x2
 
     return q_dtype_a
+
+
+def _normalize_mxfp4_activation_params(
+    activation,
+    beta: float | None,
+    linear_beta: float | None,
+    swiglu_limit: float | None,
+) -> tuple[float, float, float | None]:
+    situ_beta = 1.0
+    situ_linear_beta = 1.0
+    if activation == ActivationType.Situv2:
+        situ_beta = DEFAULT_SITUV2_BETA if beta is None else float(beta)
+        situ_linear_beta = (
+            DEFAULT_SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
+        )
+    normalized_swiglu_limit = (
+        swiglu_limit
+        if activation in (ActivationType.Silu, ActivationType.Swiglu)
+        else None
+    )
+    return situ_beta, situ_linear_beta, normalized_swiglu_limit

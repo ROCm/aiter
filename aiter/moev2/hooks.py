@@ -27,6 +27,17 @@ def set_kernel_bench_callable(calls: list | None = None):
         _kernel_calls = previous
 
 
+def legacy_kernel_bench(calls: list | None):
+    """`set_kernel_bench_callable(calls)`, or nothing when `calls` is None.
+
+    The legacy code wraps v2 runs in this with its `kernel_bench_callable` global, so
+    benchmarks that set that global see the kernels v2 launches too.
+    """
+    if calls is None:
+        return contextlib.nullcontext()
+    return set_kernel_bench_callable(calls)
+
+
 def record_kernel(stage: str, call):
     """Called by the executor after building each kernel launch."""
     if _kernel_calls is not None:

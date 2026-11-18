@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""aiter.moev2 test hooks (steps doc 1.5)."""
+"""aiter.moev2 test hooks."""
 
 import pytest
 

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""aiter.moev2 must not depend on the legacy MoE modules (steps doc 1.1).
+"""aiter.moev2 must not depend on the legacy MoE modules.
 
 The legacy modules may import from moev2, never the reverse, and `import aiter` must not
 load moev2.
