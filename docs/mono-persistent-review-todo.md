@@ -1,4 +1,68 @@
-# A09: final P256 candidate review and acceptance
+# A03/A09 standalone P256 review and acceptance
+
+## Four-task PS experiment: 2026-11-18
+
+This section records the current user-requested four-task experiment. The
+sections below record the earlier one-task implementation and its handoff.
+The older static resource limits describe that earlier selection. The new
+experiment deliberately increases per-wave work and does not meet those old
+VGPR/code-size limits. It is not a successful performance acceptance.
+
+Tested code: `25c1092044557ab3e0c5f90374cb2e4b06cc6142`. Baseline PS1: `6f85fc6d8dbc4c01cf4d40a6e48f1990c7952056`.
+A03 handles four adjacent rows per TG iteration. A09 handles four adjacent
+1024-element tasks (two rows at width 2048). Both keep 256 TGs and 128 threads
+per TG. The actual grid is one-dimensional, with work-item grid `(32768,1,1)`.
+
+All 52 GPU tests passed with zero skips. These retain all original 45 cases
+and add seven A03 cases at the new 1024-row loop boundary. Frozen native hashes
+and all 12 compile variants passed. The first A03 attempt failed six byte
+checks because its automatic reduction layout changed. Explicit Gluon layouts
+fixed these cases; no native source or tolerance changed. Non-PS A03 is unchanged.
+
+Actual Graph tracing recorded 48 dispatches for each of A03 PS, A09 FP8 PS and
+A09 QAT PS. All used 256 TGs x 128 threads. Actual ISA issues four A09 loads
+before the first load-result wait. A03 issues four rows of Q/K loads before
+that wait. PS4 VGPR/shared/scratch are A03 168/64/0, FP8 76/0/0 and QAT 60/0/0.
+These resource fields do not measure residency.
+
+Timing used the shared GPU lock and idle checks, without profiling. Each
+selected case has 15 trials and no foreign GPU PID in its 100 ms process
+samples. Two contaminated paired cases were discarded and repeated in full.
+Native/PS4 use one input pool and alternating order. Values are microseconds.
+
+| Op | Rows | Cache | Native median / P10 / P90 (us) | PS4 median / P10 / P90 (us) | PS4/native | Decision |
+| --- | ---: | --- | ---: | ---: | ---: | --- |
+| a03 | 96 | hot | 1.556748 / 1.553161 / 1.562145 | 2.892640 / 2.878984 / 2.896413 | 1.858130 | regression |
+| a03 | 96 | rotating | 1.918209 / 1.915257 / 1.920165 | 3.276872 / 3.269959 / 3.365023 | 1.708298 | regression |
+| a03 | 257 | hot | 1.685472 / 1.661242 / 1.691207 | 2.963542 / 2.950575 / 2.971481 | 1.758286 | regression |
+| a03 | 257 | rotating | 2.036438 / 2.026278 / 2.053536 | 3.508891 / 3.504066 / 3.515869 | 1.723053 | regression |
+| a03 | 513 | hot | 1.840280 / 1.787212 / 1.846371 | 3.001283 / 2.998181 / 3.013520 | 1.630883 | regression |
+| a03 | 513 | rotating | 2.242006 / 2.234880 / 2.245511 | 3.675697 / 3.672838 / 3.678854 | 1.639468 | regression |
+| a09 | 96 | hot | 1.399276 / 1.392892 / 1.408441 | 1.444631 / 1.323942 / 1.454359 | 1.032414 | inconclusive |
+| a09 | 96 | rotating | 1.732855 / 1.725823 / 1.741467 | 1.719751 / 1.717479 / 1.722751 | 0.992438 | inconclusive |
+| a09 | 257 | hot | 1.538324 / 1.492725 / 1.540745 | 1.507490 / 1.500089 / 1.512898 | 0.979956 | inconclusive |
+| a09 | 257 | rotating | 2.002499 / 1.984849 / 2.009294 | 1.739041 / 1.737788 / 1.740148 | 0.868435 | improvement |
+| a09 | 513 | hot | 1.637156 / 1.631263 / 1.647279 | 1.452247 / 1.431756 / 1.456366 | 0.887055 | improvement |
+| a09 | 513 | rotating | 2.707783 / 2.699110 / 2.715536 | 2.026919 / 2.015178 / 2.044917 | 0.748553 | improvement |
+| a09-qat | 96 | hot | 1.257856 / 1.255068 / 1.258948 | 1.302819 / 1.301787 / 1.307620 | 1.035746 | regression |
+| a09-qat | 96 | rotating | 1.614831 / 1.613323 / 1.616599 | 1.679771 / 1.678194 / 1.681111 | 1.040215 | regression |
+| a09-qat | 257 | hot | 1.314621 / 1.313751 / 1.316103 | 1.341153 / 1.339088 / 1.343135 | 1.020182 | regression |
+| a09-qat | 257 | rotating | 1.692847 / 1.691781 / 1.693656 | 1.754295 / 1.753258 / 1.756638 | 1.036299 | regression |
+| a09-qat | 513 | hot | 1.427337 / 1.425034 / 1.431802 | 1.728108 / 1.712330 / 1.747755 | 1.210722 | regression |
+| a09-qat | 513 | rotating | 1.808997 / 1.805118 / 1.811625 | 2.019332 / 1.999071 / 2.059459 | 1.116272 | regression |
+
+A03 regresses. A09 FP8 improves some cases but does not pass all six cases.
+A09 QAT remains slower than native. The separate three-provider comparison
+shows that four-task PS helps A09 at 257/513 rows relative to old PS. That gain
+does not override a native regression. A03 gains no benefit from this mapping.
+For A03, useful TG counts at 96/257/513 rows fall to 24/65/129; registers and
+per-TG work increase. A09 issues more independent loads and reduces loop trips.
+PS4 ATT, per-WGP residency and exact residual cycle attribution remain untested.
+
+Raw evidence and full before/after statistics: `/home/weizhu15/workspace/mono-ps4-20261118`.
+See `REPORT.zh.md`, `performance-accepted.json`, `performance-selections.json`,
+`performance-load-audit.json`, `trace-jit.jsonl`, `jit-review.json`, and `logs/`.
+No full mono ABI, DEV/HT, reserved-register, join or model integration was added.
 
 Both success conditions remain required: fixed P256 execution and performance
 better than, or non-regressing against, frozen original native. The selected
