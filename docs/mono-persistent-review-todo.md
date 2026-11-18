@@ -21,7 +21,8 @@ has one such synchronization. QAT already has no LDS.
 
 ## 2. Which implementation is selected, and why?
 
-Use the runner's final source based on production `08e20f6`. It retains A09
+Use reviewed code `1777a3f1e67220ff0450f46f1d179b6076358733`, based on
+production `08e20f6`. It retains A09
 `ff4eec11474431671047122be058ad43df5f8be0` and adds buffer access in
 `aiter/ops/triton/_gluon_kernels/gfx1250/quant/fp8_group32.py`.
 The shared math helper, direct non-PS path, grid `(256,)`, four wave32 waves,
@@ -47,6 +48,10 @@ is explicit:
 
 Removing the opcode and EXEC-mask difference is the selection rationale.
 Extra registers, descriptor work and remaining waits can offset that benefit.
+Against frozen native, the selected FP8/QAT PS uses 53/47 versus 49/44 VGPR.
+Compiler VGPRBlocks remain 3/2 for both. This is an allocation comparison,
+not a runtime occupancy result. The selected code is 1436/1420 B versus
+native 1388/1264 B. QAT has no LDS-removal benefit; it must pass separately.
 This is not a performance result. No barrier or wait was manually deleted.
 The local ISA review checks descriptor reuse, store sources, SCC/VCC and loop
 backedges. MI400 branch replay rules protect cross-iteration source reuse;
@@ -66,12 +71,14 @@ MODE.REPLAY_MODE=1 does not establish that retry is enabled.
   checks passed.
 - [x] The two existing A09 Graph nodes now also check QAT over 20 changing
   inputs, with preallocated outputs. FP8 checks and all other nodes remain.
-- [ ] External runner: run its fixed offline acceptance command and retain
-  the complete artifacts. Worker checks do not replace this gate.
-- [ ] Claude: independently review the full existing implementation and this
-  diff. No Claude findings or verdict have been supplied at build-0. Record
-  actual finding IDs, resolutions and verdict in private runner artifacts.
-  Approval means local code/design readiness only.
+- [x] External runner: fixed offline acceptance passed, exit 0. It checked
+  12 builds, frozen hashes, style, 45 collected node IDs and four binder paths.
+- [x] Claude Opus 5.5 independently reviewed the full implementation and diff;
+  verdict `approve`, no blocking findings. This means local readiness only.
+  A09-R1/R3: this guide now runs correctness without profiling and uses an
+  explicit profiler branch for two Graph nodes. A09-R2: the validation guide
+  states that the benchmark default selects A09 FP8/QAT; the handoff uses
+  explicit `--ops`. Private artifacts retain the original findings.
 - [ ] GPU: all 45 tests pass, zero skips, zero byte or guard mismatches.
   `[513,2048]` has 1026 tasks; two workers run five iterations.
   `[513,2080]` has 1043 tasks; the final task has one valid group.
@@ -104,6 +111,10 @@ Keep every round's provider order, latency, absolute difference and timestamps.
 Hot/rotating describes input reuse. Outputs are allocated by the wrappers
 when each graph is captured; there is no shared preallocated output pool.
 Regress if the PS median increase exceeds native P90-P10 and PS P10 exceeds
-native P90. Overlap or insufficient separation is inconclusive, not a pass.
+native P90. Pass a row only if the median decrease exceeds native P90-P10
+and PS P90 is below native P10. All other rows are inconclusive. This strict
+rule does not treat equal medians or overlapping ranges as equivalence.
+Every required row must pass for that path to pass; there is no positive
+slowdown allowance. The validation guide states the complete gates.
 No automatic rerun or tuning sweep follows an inconclusive or failed result.
 Return it with the evidence. Only beating old PS cannot satisfy acceptance.

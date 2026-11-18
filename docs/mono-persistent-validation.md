@@ -7,9 +7,10 @@ candidate, its resource cost and the unresolved 8 B/wave request cost.
 
 ## Source and local status
 
-Use the final source supplied by the runner, based on production `08e20f6`
-with A09 `ff4eec1` and this buffer-access change. Record the supplied source
-manifest, HEAD and dirty diff; HEAD alone does not identify this candidate.
+Use code commit `1777a3f1e67220ff0450f46f1d179b6076358733`, or the supplied
+patch and source manifest for that code. It includes the reviewed buffer
+change on production `08e20f6`. Record the manifest, HEAD and dirty diff;
+HEAD alone does not identify a checkout made by applying the patch.
 Do not replay historical patches or change the working framework packages.
 
 | Reference | Fixed source |
@@ -24,8 +25,10 @@ collected the same 45 tests with a labelled CPU-only import harness. Additional
 offline builds used real binders for FP8/QAT and PS/non-PS, including tails.
 Black checks on individual files, Ruff and diff whitespace checks passed.
 No GPU test, actual GPU JIT, launch trace or timing was executed. The external
-runner must record its own acceptance result and Claude's actual verdict.
-Claude's verdict is pending at build-0, with no findings supplied yet.
+runner passed its fixed command and Claude Opus 5.5 returned `approve` on
+2026-11-18. The reviewed code was applied byte for byte and committed as
+`1777a3f`. Later guide edits record status and separate profiling from numerical
+tests, as Claude advised. Those guide edits were checked by Codex.
 
 The runner's fixed offline command is:
 
@@ -92,8 +95,9 @@ Do not infer it from MODE.REPLAY_MODE in ISA.
 
 The offline compiler checks frozen symbols before compiling. Its metadata and
 ISA do not replace the real GPU wrapper specializations saved by pytest.
-Run all 45 numerical tests once. If rocprofv3 is present, collect the launch
-trace during this correctness run. Profiler durations are not timing results.
+Run all 45 numerical tests once without a profiler. Then trace only the two
+A09 Graph nodes. A profiler failure must not discard the numerical result.
+Profiler durations are not timing results.
 
 ```bash
 python -m op_tests.compile_mono_persistent --output "$MONO_RESULTS/compile" \
@@ -101,12 +105,7 @@ python -m op_tests.compile_mono_persistent --output "$MONO_RESULTS/compile" \
 export TRITON_CACHE_DIR="$MONO_RESULTS/jit-cache"
 export TRITON_DUMP_DIR="$MONO_RESULTS/jit-dump"
 export TRITON_KERNEL_DUMP=1
-mono_trace=()
-if command -v rocprofv3 >/dev/null 2>&1; then
-  mono_trace=(rocprofv3 --kernel-trace --output-format csv \
-    --output-directory "$MONO_RESULTS/launch-trace" --)
-fi
-"${mono_trace[@]}" python -m pytest \
+python -m pytest \
   op_tests/triton_tests/quant/test_mono_persistent.py -ra -v \
   --junitxml="$MONO_RESULTS/correctness.xml" \
   2>&1 | tee "$MONO_RESULTS/correctness.log"
@@ -118,6 +117,29 @@ assert len(cases) == 45, f"Expected 45 tests, found {len(cases)}"
 assert all(c.find("skipped") is None and c.find("failure") is None
            and c.find("error") is None for c in cases), "Correctness gate failed"
 PYXML
+```
+
+After the numerical gate passes, collect launch evidence. The selected nodes
+cover FP8 and QAT at 257 and 513 rows. Reuse the JIT cache from the full run.
+
+```bash
+if command -v rocprofv3 >/dev/null 2>&1; then
+  if rocprofv3 --kernel-trace --output-format csv \
+    --output-directory "$MONO_RESULTS/launch-trace" -- \
+    python -m pytest \
+    'op_tests/triton_tests/quant/test_mono_persistent.py::test_graph_replay_changes_inputs[a09]' \
+    'op_tests/triton_tests/quant/test_mono_persistent.py::test_graph_replay_changes_inputs[a09-five-iterations]' \
+    -ra -v --junitxml="$MONO_RESULTS/launch-correctness.xml" \
+    > "$MONO_RESULTS/launch.log" 2>&1; then
+    printf 'Trace command completed; inspect grid and workgroup before timing.\n'
+  else
+    printf 'Launch gate pending; keep correctness.xml and inspect launch.log.\n'
+    exit 1
+  fi
+else
+  printf 'Launch gate pending: rocprofv3 is unavailable.\n'
+  exit 1
+fi
 ```
 
 Coverage retains all existing nodes and assertions. A09 checks native and
@@ -141,10 +163,20 @@ loop dependencies. A zero fixed LDS field alone is insufficient. Non-PS has
 no task loop. If launch tracing is unavailable, report the P256 runtime gate
 as pending and stop before performance acceptance.
 
+The local real-binder FP8/QAT PS reference is 53/47 VGPR, 68 SGPR, and
+1436/1420 code bytes. Native uses 49/44 VGPR; compiler VGPRBlocks are 3/2 for
+both native and selected PS. These fields do not measure runtime occupancy.
+Expected accesses are buffer_load_b128, FP8 buffer_store_b64 plus a byte scale
+store, and QAT buffer_store_b128. There are no memory-mask EXEC branches.
+Keep the actual compiler version with any differences. A new spill, LDS copy,
+mask branch or lost vector width requires review before spending timing time.
+
 ## 3. Time only frozen native and final PS
 
 After correctness and launch checks pass, run this one matrix without a
 profiler. QAT is included because the shared memory path changed.
+The benchmark now defaults to A09 FP8 and QAT; it does not include A03 unless
+`--ops a03` is supplied. This handoff selects both A09 paths explicitly.
 
 ```bash
 python -m op_tests.op_benchmarks.triton.bench_mono_persistent \
@@ -163,17 +195,21 @@ hits. These are standalone timings, not model TPOT.
 JSON records each round's order, provider times, PS-minus-native microseconds,
 start/end timestamps, all samples, median/P10/P90, pool and graph lengths,
 median difference and PS/native ratio. Report each of the 12 op/rows/cache
-rows separately. Apply the existing regression rule:
+rows separately. Use these conservative decision rules:
 
 ```text
 delta = PS median - native median
 noise = native P90 - native P10
 regression = delta > noise and PS P10 > native P90
+improvement = -delta > noise and PS P90 < native P10
+otherwise = inconclusive
 ```
 
-Overlapping ranges or insufficient evidence are inconclusive, not automatic
-passes. Both P256 and better/non-regressing performance against frozen native
-are required. Report FP8 and QAT status separately. A gain against historical
+An improvement passes that row. A regression fails that row. Overlap,
+equal medians or insufficient separation remain inconclusive; they do not
+establish equivalence. No positive slowdown allowance is assumed. A path
+passes only if every required row passes, and its correctness and P256 gates
+also pass. Report FP8 and QAT status separately. A gain against historical
 PS cannot offset a native regression. Return failed or inconclusive rows with
 the evidence; do not start another tuning or ablation matrix.
 
