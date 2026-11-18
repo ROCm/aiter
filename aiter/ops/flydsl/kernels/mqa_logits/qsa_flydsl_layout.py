@@ -3,7 +3,8 @@
 """FlyDSL MFMA kernel for the QSA indexer scorer (`qsa_paged_mqa_logits`), prefill.
 
 Per index head the score is a GEMM, S_h = q[:, h, :] @ K^T, on bf16 MFMA
-16x16x16; ReLU is applied per head before the heads are summed.
+16x16x16 (gfx942) or 16x16x32 (gfx950); ReLU is applied per head before the
+heads are summed.
 
 One block = 4 waves (256 threads) owns 64 query rows x 64 compressed groups
 (4 pages). Wave 0 derives the block's request range and largest visible count
@@ -13,7 +14,8 @@ logits are never read). Otherwise each wave keeps its 16 rows of Q for all
 heads in VGPRs, and per request present in the block the 4 pages of K are
 staged in LDS (row stride 136 bf16) and consumed page by page with one
 accumulator. Q and K share a head-dim permutation (lane group g, k-step s ->
-dims 32g + 4s + [0..3]) so every lane reads 32 contiguous elements.
+dims 32g + (K/4)s + [0..K/4), K the MFMA depth) so every lane reads 32
+contiguous elements.
 
 Covers index_heads=4, head_dim=128, compressed page size 16, compress_ratio 4,
 bf16 Q/K; other inputs raise. int64 index tensors and a strided page table are
@@ -25,6 +27,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.compiler.protocol import dsl_size_of as sizeof
+
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from ..tensor_shim import _run_compiled
 
@@ -55,6 +59,7 @@ def _qsa_logits_layout_kernel(
     num_requests: fx.Int32,
     width: fx.Int32,
     inv_divisor: fx.Constexpr[float],
+    mfma_k: fx.Constexpr[int],
 ):
     tid = fx.thread_idx.x
     bid = fx.block_idx.x
@@ -214,9 +219,9 @@ def _qsa_logits_layout_kernel(
         fx.make_layout((num_pages, 16, 1, 128), (16 * 128 * 1, 128 * 1, 128, 1)),
     )
 
-    mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
-    MFMA_K_STEP = 16  # head-dim width of one MFMA step
-    MFMA_K_LOOPS = 128 // MFMA_K_STEP
+    mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, mfma_k, fx.BFloat16))
+    MFMA_K_LOOPS = 128 // mfma_k
+    K_PER_LANE = mfma_k // 4  # contiguous head dims one lane feeds per MFMA step
     q_head0123 = [q[None, head, None] for head in fx.range_constexpr(4)]
     # the tiler must cover both modes: (64,128) -> (64,128,ceil(rows/64),1)
     q_head0123_block = [
@@ -225,11 +230,14 @@ def _qsa_logits_layout_kernel(
     q_head0123_wave = [
         fx.flat_divide(qi, (16, 128))[None, None, wave_id, 0] for qi in q_head0123_block
     ]  # 4 x [16,128]
-    # K permutation: at step s lane group g owns dims 32g+4s..32g+4s+3, so over 8 steps each lane reads 32 contiguous elements
-    # (16,(4,4),8):(512,(1,32),4) -- row / (4 elements of a step, lane group g) / step s
+    # K permutation: at step s lane group g owns dims 32g+K_PER_LANE*s..+K_PER_LANE-1, so over all steps each lane reads 32 contiguous elements
+    # (16,(K_PER_LANE,4),steps):(512,(1,32),K_PER_LANE) -- row / (elements of a step, lane group g) / step s
     q_head0123_wave = [
         fx.make_view(
-            fx.get_iter(qi), fx.make_layout((16, (4, 4), 8), (4 * 128, (1, 32), 4))
+            fx.get_iter(qi),
+            fx.make_layout(
+                (16, (K_PER_LANE, 4), MFMA_K_LOOPS), (4 * 128, (1, 32), K_PER_LANE)
+            ),
         )
         for qi in q_head0123_wave
     ]
@@ -243,7 +251,7 @@ def _qsa_logits_layout_kernel(
         ]
         for h in fx.range_constexpr(4)
     ]  # q_frag[head][k step]
-    # global q -> q frag. After the permutation each thread reads 32 contiguous bf16 over 8 steps, merged into 4 buffer_load_dwordx4
+    # global q -> q frag. After the permutation each thread reads 32 contiguous bf16 over all steps, merged into 4 buffer_load_dwordx4
     copy_global_to_frag = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.BFloat16)
     copy_q = fx.make_tiled_copy_A(copy_global_to_frag, tiled_mma).get_slice(lane_id)
     q_global_tile_head0123 = [
@@ -270,11 +278,14 @@ def _qsa_logits_layout_kernel(
     k_tile_pages0123 = [
         fx.make_view(
             fx.get_iter(k_tile[None, None, pageid]),
-            fx.make_layout((16, (4, 4), 8), (HDIMS + 8, (1, 32), 4)),
+            fx.make_layout(
+                (16, (K_PER_LANE, 4), MFMA_K_LOOPS),
+                (HDIMS + 8, (1, 32), K_PER_LANE),
+            ),
         )
         for pageid in fx.range_constexpr(4)
     ]
-    # one page at a time: 8 fragments for that page's 8 k steps
+    # one page at a time: one fragment per k step of that page
     k_frag = [
         thr_mma.make_fragment_B(k_tile_pages0123[0][None, None, 0])
         for kk in fx.range_constexpr(MFMA_K_LOOPS)
@@ -425,6 +436,7 @@ def _qsa_logits_layout_launch(
     width: fx.Int32,
     grid: fx.Int32,
     inv_divisor: fx.Constexpr[float],
+    mfma_k: fx.Constexpr[int],
     stream: fx.Stream,
 ):
     _qsa_logits_layout_kernel(
@@ -443,6 +455,7 @@ def _qsa_logits_layout_launch(
         num_requests,
         width,
         inv_divisor,
+        mfma_k,
     ).launch(grid=(grid, 1, 1), block=(BLOCK_SIZE, 1, 1), stream=stream)
 
 
@@ -513,6 +526,8 @@ def qsa_paged_mqa_logits_flydsl(
     query_positions = query_positions.to(torch.int32).contiguous().view(-1)
     context_lens = context_lens.to(torch.int32).contiguous().view(-1)
     inv_divisor = 1.0 / divisor
+    # gfx942 has only the K=16 bf16 MFMA; gfx950 adds K=32.
+    mfma_k = 16 if get_gfx_runtime() == "gfx942" else 32
     _run_compiled(
         _qsa_logits_layout_launch,
         q,
@@ -531,6 +546,7 @@ def qsa_paged_mqa_logits_flydsl(
         page_table.shape[1],
         _cdiv(rows, BM) * _cdiv(columns, BN),
         inv_divisor,
+        mfma_k,
         torch.cuda.current_stream(),
-        specialization_key=inv_divisor,
+        specialization_key=(inv_divisor, mfma_k),
     )
