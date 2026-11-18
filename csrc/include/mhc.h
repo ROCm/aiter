@@ -58,7 +58,9 @@ void mhc_post(aiter_tensor_t& out,            // (m, hc_mult, hidden_size)
 // (m, hidden_size): each stream exactly as mhc_post writes it, then summed in
 // FP32 with h ascending -- weighted by pre_mix (products and sums rounded
 // apart), or with no pre_mix scaled by 1 / hc_mult (the mean). Bit-identical
-// to mhc_post followed by that reduction. hidden_size must be a multiple of 512.
+// to mhc_post followed by that reduction. residual is the plain layout (no
+// res_preshuffle). Coverage: mhc_post_reduce_supported in aiter/ops/mhc.py (the
+// tiles of mhc_post_tile without the 256-column one).
 void mhc_post_reduce(aiter_tensor_t& out,                   // (m, hidden_size)
                      aiter_tensor_t& x,                     // (m, hidden_size)
                      aiter_tensor_t& residual,              // (m, hc_mult, hidden_size)

@@ -1782,7 +1782,8 @@ namespace aiter {
     //     a coarse lattice (hidden 7168, residual_block 1024 => nblk 7 => k in
     //     {1, 7}, so m = 512 ran 512 work-groups on 256 CUs).
     // Work-groups a CU can hold: thread-limited here, not LDS-limited (20 KB per
-    // work-group at residual_block 1024, against 320 KB per CU on gfx1250).
+    // work-group at residual_block 1024, 28 KB with the reduce epilogue staging the
+    // streams, against 320 KB per CU on gfx1250).
     static inline int mhc_post_wgs_per_cu(int block_size)
     {
         static const int threads_per_cu = []() {
@@ -1821,92 +1822,67 @@ namespace aiter {
         return best;
     }
 
-#define MHC_POST_KERNEL_IMPL_RAW_(kernel_name, hidden_size, residual_block, store_nt) \
-    AITER_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
-    AITER_CHECK(hidden_size >= residual_block * 2, "hidden_size must be >= residual_block * 2 stages prefetch"); \
-    int block_size = 4 * WARP_SIZE; \
-    int k_blocks = mhc_post_pick_kblocks(m, hidden_size, residual_block, cu_num, block_size); \
-    int sub_hidden_size = hidden_size / k_blocks; \
-    dim3 grid(m, k_blocks); \
-    dim3 block(block_size); \
-    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(dtype, "mhc_post_raw", [&] { \
-        using DTYPE_I = typename hip2opus<scalar_t>::type; \
-        kernel_name<DTYPE_I, 4, 4, residual_block, store_nt><<<grid, block, 0, stream>>>( \
-            reinterpret_cast<DTYPE_I*>(out), \
-            reinterpret_cast<DTYPE_I*>(x), \
-            reinterpret_cast<DTYPE_I*>(residual), \
-            reinterpret_cast<float*>(post_layer_mix), \
-            reinterpret_cast<float*>(comb_res_mix), \
-            m, \
-            hidden_size, \
-            x_stride, \
-            residual_stride, \
-            sub_hidden_size \
-        ); \
-    });
-
-#define MHC_POST_KERNEL_IMPL_(kernel_name, hidden_size, residual_block, store_nt) \
-    AITER_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
-    AITER_CHECK(hidden_size >= residual_block * 2, "hidden_size must be >= residual_block * 2 stages prefetch"); \
-    int block_size = 4 * WARP_SIZE; \
-    int k_blocks = mhc_post_pick_kblocks(m, hidden_size, residual_block, cu_num, block_size); \
-    int sub_hidden_size = hidden_size / k_blocks; \
-    dim3 grid(m, k_blocks); \
-    dim3 block(block_size); \
-    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(x.dtype(), "mhc_post", [&] { \
-        using DTYPE_I = typename hip2opus<scalar_t>::type; \
-        kernel_name<DTYPE_I, 4, 4, residual_block, store_nt><<<grid, block, 0, stream>>>( \
-            reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
-            reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
-            reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
-            reinterpret_cast<float*>(post_layer_mix.data_ptr()), \
-            reinterpret_cast<float*>(comb_res_mix.data_ptr()), \
-            m, \
-            hidden_size, \
-            x_stride, \
-            residual_stride, \
-            sub_hidden_size \
-        ); \
-    });
-
-
-#define MHC_POST_KERNEL_IMPL(kernel_name, hidden_size, residual_block) \
-    if (m > 8 * cu_num) { \
-        MHC_POST_KERNEL_IMPL_(kernel_name, hidden_size, residual_block, true); \
-    } else { \
-        MHC_POST_KERNEL_IMPL_(kernel_name, hidden_size, residual_block, false); \
+    // The residual tile (columns per pipeline stage) mhc_post takes for hidden_size,
+    // or 0 where no body serves it: the widest of 1024 / 512 (mhc_post_kernel) and
+    // 256 (mhc_post_kernel_x2vgpr) that divides hidden_size and fits twice, since
+    // the kernel prefetches one tile ahead. gfx942 has no 1024-column tile, and the
+    // reduce epilogue (with_256 = false) only exists in mhc_post_kernel. Every
+    // mhc_post / mhc_post_reduce launch dispatches on this; mhc_post_supported and
+    // mhc_post_reduce_supported in aiter/ops/mhc.py MUST stay in lockstep with it.
+    static inline int mhc_post_tile(int hidden_size, bool gfx942, bool with_256)
+    {
+        for(const int tile : {1024, 512, 256})
+        {
+            if((tile == 1024 && gfx942) || (tile == 256 && !with_256))
+                continue;
+            if(hidden_size % tile == 0 && hidden_size >= 2 * tile)
+                return tile;
+        }
+        return 0;
     }
 
-#define MHC_POST_KERNEL_DISPATCH_NT(hidden_size, store_nt_val) \
-    if (arch_id != "gfx942" && hidden_size % 1024 == 0) { \
-        MHC_POST_KERNEL_IMPL_(mhc_post_kernel, hidden_size, 1024, store_nt_val); \
-    } else if (hidden_size % 512 == 0) { \
-        MHC_POST_KERNEL_IMPL_(mhc_post_kernel, hidden_size, 512, store_nt_val); \
-    } else if (hidden_size % 256 == 0) { \
-        MHC_POST_KERNEL_IMPL_(mhc_post_kernel_x2vgpr, hidden_size, 256, store_nt_val); \
-    } else { \
-        AITER_CHECK(false, "hidden_size must be divisible by 256"); \
-    }
-
-#define MHC_POST_KERNEL_DISPATCH_RAW(hidden_size, store_nt_val) \
+// One launch of kernel_name at residual_block columns. The optional trailing
+// argument is the reduce_mode; it also passes pre_ptr, which only the reduce
+// instantiations of mhc_post_kernel take.
+#define MHC_POST_LAUNCH_(kernel_name, residual_block, store_nt_val, ...) \
     do { \
-        if (arch_id != "gfx942" && hidden_size % 1024 == 0) { \
-            MHC_POST_KERNEL_IMPL_RAW_(mhc_post_kernel, hidden_size, 1024, store_nt_val); \
-        } else if (hidden_size % 512 == 0) { \
-            MHC_POST_KERNEL_IMPL_RAW_(mhc_post_kernel, hidden_size, 512, store_nt_val); \
-        } else if (hidden_size % 256 == 0) { \
-            MHC_POST_KERNEL_IMPL_RAW_(mhc_post_kernel_x2vgpr, hidden_size, 256, store_nt_val); \
-        } else { \
-            AITER_CHECK(false, "hidden_size must be divisible by 256"); \
-        } \
+        int block_size = 4 * WARP_SIZE; \
+        int k_blocks = mhc_post_pick_kblocks(m, hidden_size, residual_block, cu_num, block_size); \
+        int sub_hidden_size = hidden_size / k_blocks; \
+        dim3 grid(m, k_blocks); \
+        dim3 block(block_size); \
+        AITER_DISPATCH_FLOATING16_TYPES_rmTorch(dtype, "mhc_post", [&] { \
+            using DTYPE_I = typename hip2opus<scalar_t>::type; \
+            kernel_name<DTYPE_I, 4, 4, residual_block, store_nt_val __VA_OPT__(, ) __VA_ARGS__> \
+                <<<grid, block, 0, stream>>>( \
+                reinterpret_cast<DTYPE_I*>(out), \
+                reinterpret_cast<DTYPE_I*>(x), \
+                reinterpret_cast<DTYPE_I*>(residual), \
+                reinterpret_cast<float*>(post_layer_mix), \
+                reinterpret_cast<float*>(comb_res_mix), \
+                m, \
+                hidden_size, \
+                x_stride, \
+                residual_stride, \
+                sub_hidden_size __VA_OPT__(, pre_ptr)); \
+        }); \
     } while (0)
 
-#define MHC_POST_KERNEL_DISPATCH(hidden_size) \
+// mhc_post (no trailing argument) or mhc_post_reduce (reduce_mode), at the tile
+// mhc_post_tile picks.
+#define MHC_POST_DISPATCH_(store_nt_val, ...) \
     do { \
-        if (m > 8 * cu_num) { \
-            MHC_POST_KERNEL_DISPATCH_NT(hidden_size, true); \
+        const int tile = mhc_post_tile(hidden_size, arch_id == "gfx942", __VA_OPT__(false &&) true); \
+        if (tile == 1024) { \
+            MHC_POST_LAUNCH_(mhc_post_kernel, 1024, store_nt_val __VA_OPT__(, ) __VA_ARGS__); \
+        } else if (tile == 512) { \
+            MHC_POST_LAUNCH_(mhc_post_kernel, 512, store_nt_val __VA_OPT__(, ) __VA_ARGS__); \
+        } else if (tile == 256) { \
+            __VA_OPT__(AITER_CHECK(false, "mhc_post_reduce has no 256-column body");) \
+            MHC_POST_LAUNCH_(mhc_post_kernel_x2vgpr, 256, store_nt_val); \
         } else { \
-            MHC_POST_KERNEL_DISPATCH_NT(hidden_size, false); \
+            AITER_CHECK(false, "mhc_post: hidden_size ", hidden_size, " has no tile on ", arch_id, \
+                        " (see mhc_post_supported / mhc_post_reduce_supported)"); \
         } \
     } while (0)
 
@@ -1925,24 +1901,14 @@ namespace aiter {
     {
         const int cu_num = get_num_cu_func();
         const std::string arch_id = get_gpu_arch();
-        if(store_nt < 0)
+        const bool use_nt = store_nt < 0 ? m > 8 * cu_num : store_nt != 0;
+        if(use_nt)
         {
-            if(m > 8 * cu_num)
-            {
-                MHC_POST_KERNEL_DISPATCH_RAW(hidden_size, true);
-            }
-            else
-            {
-                MHC_POST_KERNEL_DISPATCH_RAW(hidden_size, false);
-            }
-        }
-        else if(store_nt != 0)
-        {
-            MHC_POST_KERNEL_DISPATCH_RAW(hidden_size, true);
+            MHC_POST_DISPATCH_(true);
         }
         else
         {
-            MHC_POST_KERNEL_DISPATCH_RAW(hidden_size, false);
+            MHC_POST_DISPATCH_(false);
         }
     }
 
@@ -1954,6 +1920,8 @@ namespace aiter {
         aiter_tensor_t& comb_res_mix, // (m, hc_mult, hc_mult)
         int store_nt = -1)
     {
+        // A refused shape surfaces as a Python error rather than an abort.
+        aiter_detail::AiterThrowGuard throw_guard;
         int m = residual.size(0);
         int hc_mult = residual.size(1);
         int hidden_size = residual.size(2);
@@ -1977,62 +1945,23 @@ namespace aiter {
                             store_nt);
     }
 
-#define MHC_POST_REDUCE_KERNEL_IMPL_(residual_block, store_nt_val, reduce_mode) \
-    AITER_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
-    AITER_CHECK(hidden_size >= residual_block * 2, "hidden_size must be >= residual_block * 2 stages prefetch"); \
-    int block_size = 4 * WARP_SIZE; \
-    int k_blocks = mhc_post_pick_kblocks(m, hidden_size, residual_block, cu_num, block_size); \
-    int sub_hidden_size = hidden_size / k_blocks; \
-    dim3 grid(m, k_blocks); \
-    dim3 block(block_size); \
-    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(x.dtype(), "mhc_post_reduce", [&] { \
-        using DTYPE_I = typename hip2opus<scalar_t>::type; \
-        mhc_post_kernel<DTYPE_I, 4, 4, residual_block, store_nt_val, reduce_mode><<<grid, block, 0, stream>>>( \
-            reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
-            reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
-            reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
-            reinterpret_cast<float*>(post_layer_mix.data_ptr()), \
-            reinterpret_cast<float*>(comb_res_mix.data_ptr()), \
-            m, \
-            hidden_size, \
-            x_stride, \
-            residual_stride, \
-            sub_hidden_size, \
-            pre_ptr \
-        ); \
-    });
-
-#define MHC_POST_REDUCE_KERNEL_DISPATCH_MODE(store_nt_val, reduce_mode) \
-    if (arch_id != "gfx942" && hidden_size % 1024 == 0) { \
-        MHC_POST_REDUCE_KERNEL_IMPL_(1024, store_nt_val, reduce_mode); \
-    } else { \
-        MHC_POST_REDUCE_KERNEL_IMPL_(512, store_nt_val, reduce_mode); \
-    }
-
-#define MHC_POST_REDUCE_KERNEL_DISPATCH(store_nt_val) \
-    if (pre_ptr != nullptr) { \
-        MHC_POST_REDUCE_KERNEL_DISPATCH_MODE(store_nt_val, 1); \
-    } else { \
-        MHC_POST_REDUCE_KERNEL_DISPATCH_MODE(store_nt_val, 2); \
-    }
-
     void mhc_post_reduce(
         aiter_tensor_t& out, // (m, hidden_size)
         aiter_tensor_t& x, // (m, hidden_size)
-        aiter_tensor_t& residual, // (m, hc_mult, hidden_size)
+        aiter_tensor_t& residual, // (m, hc_mult, hidden_size), not pre-shuffled
         aiter_tensor_t& post_layer_mix, // (m, hc_mult)
         aiter_tensor_t& comb_res_mix, // (m, hc_mult, hc_mult)
         std::optional<aiter_tensor_t> pre_mix, // (m, hc_mult) fp32, or none for the mean
         int store_nt = -1)
     {
-        int m = residual.size(0);
-        int hc_mult = residual.size(1);
-        int hidden_size = residual.size(2);
-        int x_stride = x.stride(0);
-        int residual_stride = residual.stride(0);
+        // A refused shape surfaces as a Python error rather than an abort.
+        aiter_detail::AiterThrowGuard throw_guard;
+        const int m = residual.size(0);
+        const int hc_mult = residual.size(1);
+        const int hidden_size = residual.size(2);
+        const int x_stride = x.stride(0);
+        const int residual_stride = residual.stride(0);
         AITER_CHECK(hc_mult == 4, "hc_mult only supports 4");
-        // Only the mhc_post body that stages a whole tile in LDS reduces.
-        AITER_CHECK(hidden_size % 512 == 0, "mhc_post_reduce: hidden_size must be divisible by 512");
         AITER_CHECK(out.dtype() == x.dtype() && residual.dtype() == x.dtype(),
                     "mhc_post_reduce: out, x and residual must share one dtype");
         AITER_CHECK(out.dim() == 2 && out.size(0) == m && out.size(1) == hidden_size && out.is_contiguous(),
@@ -2040,28 +1969,54 @@ namespace aiter {
         float* pre_ptr = nullptr;
         if(pre_mix.has_value())
         {
-            AITER_CHECK(pre_mix->dtype() == AITER_DTYPE_fp32 && pre_mix->is_contiguous() &&
-                            pre_mix->numel() == static_cast<size_t>(m) * hc_mult,
-                        "mhc_post_reduce: pre_mix must be a contiguous fp32 (m, hc_mult) tensor");
+            AITER_CHECK(pre_mix->dtype() == AITER_DTYPE_fp32 && pre_mix->dim() == 2 &&
+                            pre_mix->size(0) == m && pre_mix->size(1) == hc_mult &&
+                            pre_mix->is_contiguous() && pre_mix->device_id == residual.device_id,
+                        "mhc_post_reduce: pre_mix must be a contiguous fp32 (m, hc_mult) tensor "
+                        "on residual's device");
             pre_ptr = reinterpret_cast<float*>(pre_mix->data_ptr());
-        }
-        if(m == 0)
-        {
-            return;
         }
 
         const HipDeviceGuard device_guard(residual.device_id);
         const hipStream_t stream = aiter::getCurrentHIPStream();
         const int cu_num = get_num_cu_func();
         const std::string arch_id = get_gpu_arch();
+        AITER_CHECK(mhc_post_tile(hidden_size, arch_id == "gfx942", false) != 0,
+                    "mhc_post_reduce: hidden_size ", hidden_size, " has no tile on ", arch_id,
+                    " (see mhc_post_reduce_supported)");
+        if(m == 0)
+        {
+            return;
+        }
+        const AiterDtype dtype = x.dtype();
+        void* out_ptr = out.data_ptr();
+        void* x_ptr = x.data_ptr();
+        void* residual_ptr = residual.data_ptr();
+        void* post_ptr = post_layer_mix.data_ptr();
+        void* comb_ptr = comb_res_mix.data_ptr();
         const bool use_nt = store_nt < 0 ? m > 8 * cu_num : store_nt != 0;
+        // MHC_POST_LAUNCH_ reads these names.
+        auto launch = [&](auto store_nt_c, auto mode_c) {
+            constexpr bool store_nt_val = decltype(store_nt_c)::value;
+            constexpr int reduce_mode = decltype(mode_c)::value;
+            void* out = out_ptr;
+            void* x = x_ptr;
+            void* residual = residual_ptr;
+            void* post_layer_mix = post_ptr;
+            void* comb_res_mix = comb_ptr;
+            MHC_POST_DISPATCH_(store_nt_val, reduce_mode);
+        };
+        using nt_t = std::true_type;
+        using t_t = std::false_type;
+        using sum_t = std::integral_constant<int, 1>;
+        using mean_t = std::integral_constant<int, 2>;
         if(use_nt)
         {
-            MHC_POST_REDUCE_KERNEL_DISPATCH(true);
+            pre_ptr ? launch(nt_t{}, sum_t{}) : launch(nt_t{}, mean_t{});
         }
         else
         {
-            MHC_POST_REDUCE_KERNEL_DISPATCH(false);
+            pre_ptr ? launch(t_t{}, sum_t{}) : launch(t_t{}, mean_t{});
         }
     }
 

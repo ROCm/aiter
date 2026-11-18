@@ -792,6 +792,58 @@ def test_mhc_post_reduce(
     }
 
 
+def _launch_mhc_post(x, residual, post, comb):
+    aiter.mhc_post(torch.empty_like(residual), x, residual, post, comb)
+
+
+def _launch_mhc_post_reduce(x, residual, post, comb):
+    out = torch.empty(x.shape, dtype=x.dtype)
+    aiter.mhc_post_reduce(out, x, residual, post, comb)
+
+
+def test_mhc_post_support_queries():
+    """`mhc_post_supported` / `mhc_post_reduce_supported` against the launch:
+    over a sweep of hidden sizes and dtypes, a query is False exactly where
+    the op refuses the shape (raises), and True exactly where it runs."""
+    from aiter.ops.mhc import mhc_post_reduce_supported, mhc_post_supported
+
+    arch = get_gfx_runtime()
+    m, hc_mult = 4, 4
+    ops = (
+        ("mhc_post", mhc_post_supported, _launch_mhc_post),
+        ("mhc_post_reduce", mhc_post_reduce_supported, _launch_mhc_post_reduce),
+    )
+    hidden_sizes = sorted(set(range(256, 8193, 256)) | {320, 640, 2560})
+    rows, mismatches = [], []
+    for dtype in (dtypes.bf16, dtypes.fp16, dtypes.fp32):
+        for hidden_size in hidden_sizes:
+            x = torch.randn(m, hidden_size).to(dtype)
+            residual = torch.randn(m, hc_mult, hidden_size).to(dtype)
+            post = torch.rand(m, hc_mult, 1)
+            comb = torch.rand(m, hc_mult, hc_mult)
+            for name, query, launch in ops:
+                supported = query(hidden_size, hc_mult, dtype, arch)
+                try:
+                    launch(x, residual, post, comb)
+                    torch.cuda.synchronize()
+                    ran = True
+                except RuntimeError:
+                    ran = False
+                rows.append(
+                    {
+                        "op": name,
+                        "dtype": str(dtype),
+                        "hidden_size": hidden_size,
+                        "supported": supported,
+                        "ran": ran,
+                    }
+                )
+                if supported != ran:
+                    mismatches.append((name, str(dtype), hidden_size, supported, ran))
+    assert not mismatches, f"query and launch disagree on {arch}: {mismatches}"
+    return rows
+
+
 def mhc_post_pre_ref(
     layer_input: torch.Tensor,
     residual_in: torch.Tensor,
@@ -1328,10 +1380,14 @@ if not args.hc_head:
                         df.append(ret)
     print_json_table("mhc_post summary", df)
 
+    # The query sweep, then the reduce at the 1024- and 512-column tiles (2560
+    # takes the 512 one; gfx942 takes it for every size) in both dtypes.
+    print_json_table("mhc_post support queries", test_mhc_post_support_queries())
+
     df = []
-    for dtype in args.dtype:
+    for dtype in (dtypes.bf16, dtypes.fp16):
         for data_init in args.data_init:
-            for hidden_size in args.hidden_size:
+            for hidden_size in sorted(set(args.hidden_size) | {2560}):
                 for m in args.m:
                     for reduce in ("pre_mix", "mean"):
                         ret = test_mhc_post_reduce(

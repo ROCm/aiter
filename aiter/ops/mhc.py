@@ -858,10 +858,67 @@ def mhc_post_reduce(
     - ``pre_mix=None``: ``(sum_h stream_h) / hc_mult``, the mean.
 
     The result is bit-identical to `mhc_post` followed by that reduction in
-    FP32 and a cast back to the input dtype. Same coverage as `mhc_post` for
-    ``hc_mult == 4``, with ``hidden_size`` a multiple of 512.
+    FP32 and a cast back to the input dtype. ``residual`` is the plain
+    (m, hc_mult, hidden_size) layout: this op has no ``res_preshuffle``.
+    Coverage is `mhc_post_reduce_supported`; anything else raises.
     """
     _mhc_post_reduce(out, x, residual, post_layer_mix, comb_res_mix, pre_mix, store_nt)
+
+
+def _mhc_post_tile(hidden_size: int, arch: str, with_256: bool) -> int:
+    """The residual tile `mhc_post` takes for ``hidden_size``, 0 for none.
+
+    The widest of 1024 / 512 / 256 columns that divides ``hidden_size`` and fits
+    twice (the kernel prefetches one tile ahead); gfx942 has no 1024-column
+    tile, and the reduce epilogue no 256-column body (``with_256=False``).
+
+    MUST stay in lockstep with ``mhc_post_tile`` in csrc/kernels/mhc_kernels.cu,
+    which every `mhc_post` / `mhc_post_reduce` launch dispatches on;
+    ``op_tests/test_mhc.py`` sweeps hidden sizes and checks the two agree.
+    """
+    for tile in (1024, 512, 256):
+        if (tile == 1024 and arch == "gfx942") or (tile == 256 and not with_256):
+            continue
+        if hidden_size % tile == 0 and hidden_size >= 2 * tile:
+            return tile
+    return 0
+
+
+def mhc_post_supported(
+    hidden_size: int,
+    hc_mult: int,
+    dtype: torch.dtype,
+    arch: str | None = None,
+) -> bool:
+    """True where :func:`mhc_post` runs: ``hc_mult`` 4, BF16 or FP16, and a
+    ``hidden_size`` with a residual tile on ``arch`` (default: the live GPU).
+    Elsewhere it raises; callers check this first and keep their own path."""
+    if arch is None:
+        arch = get_gfx_runtime()
+    return (
+        hc_mult == 4
+        and dtype in (dtypes.bf16, dtypes.fp16)
+        and _mhc_post_tile(hidden_size, arch, with_256=True) != 0
+    )
+
+
+def mhc_post_reduce_supported(
+    hidden_size: int,
+    hc_mult: int,
+    dtype: torch.dtype,
+    arch: str | None = None,
+) -> bool:
+    """True where :func:`mhc_post_reduce` runs: as :func:`mhc_post_supported`,
+    without the 256-column tile. So hidden sizes a multiple of 256 but not of
+    512 are refused, and so is 512 itself (its 512-column tile does not fit
+    twice); 1024 runs on 512-column tiles."""
+    if arch is None:
+        arch = get_gfx_runtime()
+    return (
+        hc_mult == 4
+        and dtype in (dtypes.bf16, dtypes.fp16)
+        and _mhc_post_tile(hidden_size, arch, with_256=False) != 0
+    )
 
 
 def get_mhc_pre_splitk_large_m(
