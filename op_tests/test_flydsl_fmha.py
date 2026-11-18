@@ -526,6 +526,16 @@ def _ref_head_fp32(q, k, v, b, h, causal, scale, chunk=4096):
     return out
 
 
+def _check_lse_gfx11(lse, q, k, causal, scale, heads=None):
+    """LSE against an fp32 logsumexp on the same (batch, head) pairs as _check_gfx11."""
+    batch, seq_q, num_heads, _ = q.shape
+    assert lse.shape == (batch, num_heads, seq_q) and lse.dtype == torch.float32
+    pairs = heads or ([(batch - 1, h) for h in range(num_heads)] + [(0, 0)])
+    for b, h in pairs:
+        err = (lse[b, h] - _ref_lse_fp32(q, k, b, h, causal, scale)).abs().max().item()
+        assert err < 1e-3, f"(b={b}, h={h}) max |lse - ref| = {err:.2e}"
+
+
 def _check_gfx11(out, q, k, v, causal, scale, heads=None):
     batch, _, num_heads, _ = q.shape
     assert out.shape == q.shape and out.dtype == q.dtype
@@ -558,8 +568,12 @@ def test_flydsl_fmha_gfx11_correctness(
     v = torch.randn(
         batch, seq_kv, num_heads, head_dim, generator=g, dtype=dtype, device="cuda"
     )
-    out = flydsl_flash_attn_func(q, k, v, causal=causal)
-    _check_gfx11(out, q, k, v, causal, 1.0 / math.sqrt(head_dim))
+    out, lse = flydsl_flash_attn_func(q, k, v, causal=causal, return_lse=True)
+    scale = 1.0 / math.sqrt(head_dim)
+    _check_gfx11(out, q, k, v, causal, scale)
+    _check_lse_gfx11(lse, q, k, causal, scale)
+    # The LSE build writes the same output as the plain one.
+    assert torch.equal(out, flydsl_flash_attn_func(q, k, v, causal=causal))
 
 
 @_gfx11_only
@@ -576,16 +590,10 @@ def test_flydsl_fmha_gfx11_large_batch_offset():
     if torch.cuda.mem_get_info()[0] < 24 * 2**30:
         pytest.skip("needs ~24 GiB of free device memory")
     q, k, v = _make_qkv(batch, seq, heads, dim, torch.bfloat16)
-    out = flydsl_flash_attn_func(q, k, v)
-    _check_gfx11(
-        out,
-        q,
-        k,
-        v,
-        False,
-        1.0 / math.sqrt(dim),
-        heads=[(batch - 1, heads - 1), (batch // 2, 0)],
-    )
+    out, lse = flydsl_flash_attn_func(q, k, v, return_lse=True)
+    pairs = [(batch - 1, heads - 1), (batch // 2, 0)]
+    _check_gfx11(out, q, k, v, False, 1.0 / math.sqrt(dim), heads=pairs)
+    _check_lse_gfx11(lse, q, k, False, 1.0 / math.sqrt(dim), heads=pairs)
 
 
 @_gfx11_only
@@ -877,11 +885,58 @@ def test_flydsl_fmha_gfx11_lse_ring_merge():
 
 
 @_gfx11_only
+def test_flydsl_fmha_gfx11_lse_ring_merge_causal():
+    """Causal ring attention: Q chunk i attends KV chunks j < i without a mask and
+    its own chunk j == i causally; merging those with the LSEs equals causal
+    attention over the whole sequence."""
+    batch, seq, num_heads, head_dim, chunk = 2, 3000, 4, 128, 1000
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q, k, v = (
+        torch.randn(
+            batch,
+            seq,
+            num_heads,
+            head_dim,
+            generator=g,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        for _ in range(3)
+    )
+    full, full_lse = flydsl_flash_attn_func(q, k, v, causal=True, return_lse=True)
+    for i in range(seq // chunk):
+        qi = q[:, i * chunk : (i + 1) * chunk]
+        out, lse = None, None
+        for j in range(i + 1):
+            kj = k[:, j * chunk : (j + 1) * chunk]
+            vj = v[:, j * chunk : (j + 1) * chunk]
+            o_c, l_c = flydsl_flash_attn_func(
+                qi, kj, vj, causal=(j == i), return_lse=True
+            )
+            o_c = o_c.float()
+            if out is None:
+                out, lse = o_c, l_c
+                continue
+            new = torch.logaddexp(lse, l_c)
+            w_old = torch.exp(lse - new).transpose(1, 2).unsqueeze(-1)
+            w_new = torch.exp(l_c - new).transpose(1, 2).unsqueeze(-1)
+            out, lse = out * w_old + o_c * w_new, new
+        ref = full[:, i * chunk : (i + 1) * chunk].float()
+        assert (
+            lse - full_lse[:, :, i * chunk : (i + 1) * chunk]
+        ).abs().max().item() < 5e-4
+        rel = ((out - ref).norm() / ref.norm()).item()
+        assert rel < 1e-2, f"chunk {i}: rel_err={rel:.3e}"
+
+
+@_gfx11_only
 def test_flydsl_fmha_gfx11_lse_with_out():
     q, k, v = _make_qkv(1, 500, 4, 64, torch.bfloat16)
     out = torch.empty_like(q)
     res, lse = flydsl_flash_attn_func(q, k, v, out=out, return_lse=True)
     assert res is out and lse.shape == (1, 4, 500)
+    _check_gfx11(out, q, k, v, False, 1.0 / 8.0)
+    _check_lse_gfx11(lse, q, k, False, 1.0 / 8.0)
 
 
 @_gfx11_only
