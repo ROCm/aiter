@@ -6,8 +6,8 @@
   ``sparse_decode_attn.py``    one CTA per (row, kv head, KV split), reading the
                                selected KV straight from the token pool
   ``sparse_decode_reduce.py``  merges the KV-split partials
-  ``sparse_prefill_*.py``      gfx942 BF16 D256 sparse prefill/extend attention
+  ``sparse_prefill_*.py``      gfx942/gfx950 BF16 D256 sparse prefill/extend attention
 
 The public entry points are ``aiter.ops.flydsl.qsa_sparse_decode`` (gfx950) and
-``aiter.ops.flydsl.qsa_sparse_prefill`` (gfx942).
+``aiter.ops.flydsl.qsa_sparse_prefill`` (gfx942, gfx950).
 """
