@@ -12,6 +12,7 @@ from aiter.ops.triton._triton_kernels.quant.quant_fp8_blockwise import (
     quant_fp8_blockwise_segment_m_kernel,
     requant_fp8_row_to_col_kernel,
 )
+from aiter.ops.triton.utils._triton import arch_info
 
 __all__ = [
     "quant_fp8_blockwise",
@@ -36,7 +37,8 @@ def _no_slp_once_used() -> dict:
     # and 4-9% slower blockwise and weight quant. Turn that seeding off for these two
     # kernels only; the other quant kernels are not affected, and turning it off
     # globally costs other kernels 10-19%. Triton builds without llvm_cl_opts reject
-    # unknown launch options, so probe for it.
+    # unknown launch options, so probe for it. Only measured on gfx950, so the launches
+    # apply it through _no_slp_once_used_on_gfx950().
     try:
         from triton.backends.amd.compiler import HIPOptions
     except ImportError:
@@ -47,6 +49,13 @@ def _no_slp_once_used() -> dict:
 
 
 _NO_SLP_ONCE_USED = _no_slp_once_used()
+
+
+def _no_slp_once_used_on_gfx950() -> dict:
+    # Checked at launch, not import, so importing this module never probes the GPU.
+    if not _NO_SLP_ONCE_USED or arch_info.get_arch() != "gfx950":
+        return {}
+    return _NO_SLP_ONCE_USED
 
 
 def _launch_params(block_size: int) -> dict:
@@ -127,7 +136,7 @@ def quant_fp8_blockwise(
         AXIS=axis,
         DUAL=False,
         **_launch_params(block_size),
-        **_NO_SLP_ONCE_USED,
+        **_no_slp_once_used_on_gfx950(),
     )
     return x_fp8, scales
 
@@ -238,7 +247,7 @@ def quant_fp8_blockwise_for_weight(
         BLOCK_SIZE=block_size,
         FP8_MAX=fp8_max,
         **_launch_params(block_size),
-        **_NO_SLP_ONCE_USED,
+        **_no_slp_once_used_on_gfx950(),
     )
     return w_fp8, scales
 
