@@ -1,0 +1,105 @@
+diff --git a/atom/models/qwen3_next.py b/atom/models/qwen3_next.py
+index 788d27458..3a4afa822 100644
+--- a/atom/models/qwen3_next.py
++++ b/atom/models/qwen3_next.py
+@@ -67,6 +67,7 @@ from atom.model_ops.moe_tail_norm import (
+     silu_gate_up_gemm,
+ )
+ from atom.model_ops.qwen_mono_moe.integration import mono_moe_forward
++from atom.models import qwen3_5_vmoe as _vmoe
+ from atom.model_ops.sigmoid_gate import (
+     can_fuse_output_gate_mx32,
+     output_gate_mul,
+@@ -749,7 +750,16 @@ class Qwen3NextSparseMoeBlock(nn.Module):
+             normed = mono_moe_forward(self, hidden_states, residual)
+             if normed is not None:
+                 return normed
++        if _vmoe.ENABLED:
++            # ATOM_VMOE: the whole block as one dataflow kernel (TP1 decode, <= 16 rows)
++            vout = _vmoe.vmoe_forward(self, hidden_states)
++            if vout is not None:
++                return vout.view(orig_shape)
++        if _vmoe.ENABLED and _vmoe.SHADOW and _vmoe.PRESHADOW and not torch.compiler.is_compiling():
++            _vmoe.pre(self, hidden_states)
+         final_hidden_states = self.native_moe_forward(hidden_states)
++        if _vmoe.ENABLED and _vmoe.SHADOW and not torch.compiler.is_compiling():
++            _vmoe.shadow(self, hidden_states, final_hidden_states)
+         if isinstance(final_hidden_states, MoEGatedSum):
+             # TP1 (see `defer_moe_gated_sums`): nothing to reduce, and the rows
+             # stay 2-D for the norm that sums them.
+@@ -1029,7 +1039,9 @@ class Qwen3NextAttention(nn.Module):
+         """`select_rows` (the MTP drafter, ATOM_MTP_SELECT_ROWS_BEFORE_O_PROJ):
+         every row attends (and writes its KV), and only these rows go on to the
+         output gate and o_proj: the output has `len(select_rows)` rows."""
+-        qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
++        qkv = self.__dict__.pop("_mono_qkv", None)
++        if qkv is None:
++            qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
+         gate = None
+ 
+         if self.attn_output_gate:
+@@ -1544,8 +1556,13 @@ class Qwen3NextDecoderLayer(nn.Module):
+             else None
+         )
+         # Self Attention
+-        mx32_in = self._input_norm_mx32(hidden_states, residual)
+-        if mx32_in is not None:
++        pre_out = self.__dict__.pop("_mono_pre_out", None)
++        mx32_in = None if pre_out is not None else self._input_norm_mx32(hidden_states, residual)
++        if pre_out is not None:
++            # ATOM_MTP_MONO_PRE: the residual and the q/k/v projection come from the drafter's pre-attention kernel
++            residual, self.self_attn._mono_qkv = pre_out
++            x_scale = hidden_bf16 = None
++        elif mx32_in is not None:
+             hidden_states, x_scale, residual = mx32_in
+             hidden_bf16 = None
+         elif self.input_layernorm.use_fused_quant:
+@@ -1575,16 +1592,38 @@ class Qwen3NextDecoderLayer(nn.Module):
+                 x_scale=x_scale,
+             )
+         elif self.layer_type == "full_attention":
+-            hidden_states = self.self_attn(
+-                hidden_states=hidden_states,
+-                positions=positions,
+-                x_scale=x_scale,
+-                **(
+-                    {"select_rows": rows_before_o_proj}
+-                    if rows_before_o_proj is not None
+-                    else {}
+-                ),
+-            )
++            # ATOM_MTP_MONO: the attention keeps its output before o_proj (gated, the selected rows only); one
++            # kernel runs the rest of the drafter pass (qwen3_5_draft_mono).
++            mono = getattr(self, "draft_mono", None)
++            if mono is not None and mono.applies(self.self_attn, hidden_states, select_rows):
++                keep = self.self_attn.skip_out_proj
++                self.self_attn.skip_out_proj = True
++                try:
++                    x0 = self.self_attn(
++                        hidden_states=hidden_states,
++                        positions=positions,
++                        x_scale=x_scale,
++                        **({"select_rows": select_rows} if select_rows is not None else {}),
++                    )
++                finally:
++                    self.self_attn.skip_out_proj = keep
++                out = mono.run(x0, residual, select_rows)
++                if out is not None:
++                    return out, None
++                # check mode: ATOM's own path from here, on the selected rows
++                hidden_states = self.self_attn.o_proj(x0)
++                rows_before_o_proj = select_rows
++            else:
++                hidden_states = self.self_attn(
++                    hidden_states=hidden_states,
++                    positions=positions,
++                    x_scale=x_scale,
++                    **(
++                        {"select_rows": rows_before_o_proj}
++                        if rows_before_o_proj is not None
++                        else {}
++                    ),
++                )
+         else:
+             raise ValueError("Invalid layer_type")
+ 
