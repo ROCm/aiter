@@ -820,19 +820,29 @@ ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
     ),
 }
 
+# The one knob the TP2/TP4 Lamport rungs set: one fanout stripe per rank-tile.
+_STRIPE_FULL = MeshKnobs(stripe="full")
+
 # Mesh, ``TwoShotRung``.
 #
 #   xGMI  gfx942: ST=1 everywhere, except TP4 below 4 MiB and TP8 from 6 MiB (ST=8).
 #           Block 512 from 4 MiB.
 #         gfx950: the Lamport handshake (``HANDSHAKES``), which has no
-#           publish to batch, so a super-tile pays only where it overlaps the
-#           fanout of several tiles (TP8 14-28 MiB).
-#           - TP2 ST=1: b128 cap512, b256 cap256 from 4 MiB
-#           - TP4 ST=1 cap1024: b128, b256 from 32 MiB
-#           - TP8 cap384: b128 ST=1, b256 ST=8 from 2 MiB (ST=1 until the
-#             tiles outnumber the grid, 12 MiB), b256 ST=1 from 48 MiB.
-#             Against the flag rung (ST=8 cap384 b256): 0.81-0.91x the time
-#             from 112 KiB to 224 MiB.
+#           publish to batch. Rungs and ``MeshKnobs`` picked by a knob search
+#           (Step 0, a search over knobs x block x ST x cap per TP and size,
+#           leave-one-out, then a dense size sweep for the switch points). A
+#           rung's super-tile runs ST=1 until the tiles outnumber its grid.
+#           - TP2: b128 ST=8 cap256, b256 ST=8 cap384 from 4 MiB (both
+#             stripe=full), b256 ST=1 cap256 from 12 MiB. Cap 384 takes the
+#             8-12 MiB payloads past cap 256's second pass (1.07-1.09x).
+#           - TP4 stripe=full: b128 ST=1 cap1024, b256 ST=8 cap768 from
+#             4.5 MiB, b128 again from 10 MiB; b256 ST=1 cap1024 (default
+#             knobs) from 32 MiB.
+#           - TP8 cap384: b128 ST=1, then b256 ST=2 fanout=peer prio=1 from
+#             4 MiB. ST=2 beats ST=8 by 2-11 % from 14 MiB and ST=1 by 4-5 %
+#             from 80 MiB, and ties both below.
+#           Against the previous Lamport ladder: 1.02-1.06x at 2-4 MiB,
+#           1.07-1.09x at TP2 8-9 MiB, 1.03-1.11x at TP8 from 28 MiB.
 #   PCIe  TP2 ST=1, then ST=8 from 4 MiB. TP4 ST=1, then ST=8 from 768 KiB.
 #         TP8 ST=8 everywhere.
 MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
@@ -853,10 +863,23 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     # --- gfx950 (MI355X) / xGMI ----------------------------------------------
     ("gfx950", "xgmi", 2): (
         TwoShotRung(
-            min_bytes=0, super_tile=1, grid_cap=512, block=128, handshake="lamport"
+            min_bytes=0,
+            super_tile=8,
+            grid_cap=256,
+            block=128,
+            handshake="lamport",
+            knobs=_STRIPE_FULL,
         ),
         TwoShotRung(
             min_bytes=4 * MiB,
+            super_tile=8,
+            grid_cap=384,
+            block=256,
+            handshake="lamport",
+            knobs=_STRIPE_FULL,
+        ),
+        TwoShotRung(
+            min_bytes=12 * MiB,
             super_tile=1,
             grid_cap=256,
             block=256,
@@ -865,7 +888,28 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     ),
     ("gfx950", "xgmi", 4): (
         TwoShotRung(
-            min_bytes=0, super_tile=1, grid_cap=1024, block=128, handshake="lamport"
+            min_bytes=0,
+            super_tile=1,
+            grid_cap=1024,
+            block=128,
+            handshake="lamport",
+            knobs=_STRIPE_FULL,
+        ),
+        TwoShotRung(
+            min_bytes=4 * MiB + 512 * KiB,
+            super_tile=8,
+            grid_cap=768,
+            block=256,
+            handshake="lamport",
+            knobs=_STRIPE_FULL,
+        ),
+        TwoShotRung(
+            min_bytes=10 * MiB,
+            super_tile=1,
+            grid_cap=1024,
+            block=128,
+            handshake="lamport",
+            knobs=_STRIPE_FULL,
         ),
         TwoShotRung(
             min_bytes=32 * MiB,
@@ -880,18 +924,12 @@ MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
             min_bytes=0, super_tile=1, grid_cap=384, block=128, handshake="lamport"
         ),
         TwoShotRung(
-            min_bytes=2 * MiB,
-            super_tile=8,
+            min_bytes=4 * MiB,
+            super_tile=2,
             grid_cap=384,
             block=256,
             handshake="lamport",
-        ),
-        TwoShotRung(
-            min_bytes=48 * MiB,
-            super_tile=1,
-            grid_cap=384,
-            block=256,
-            handshake="lamport",
+            knobs=MeshKnobs(fanout="peer", prio=1),
         ),
     ),
     # --- gfx950 (MI350P) / PCIe ----------------------------------------------

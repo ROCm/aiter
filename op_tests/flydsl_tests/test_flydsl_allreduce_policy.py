@@ -204,8 +204,11 @@ def test_ladders_are_well_formed(cell):
             assert r.super_tile in legal, (name, r)
             assert r.grid_cap >= 1, (name, r)
             assert r.block in SUPPORTED_BLOCKS, (name, r)
-            # Shipped rungs run the kernel as it was before the knobs.
-            assert r.knobs == P.DEFAULT_MESH_KNOBS, (name, r)
+            # Only a Lamport mesh rung builds with non-default knobs, and
+            # ``prefetch`` only at ST=1.
+            if r.knobs != P.DEFAULT_MESH_KNOBS:
+                assert name == "mesh" and r.handshake == "lamport", (name, r)
+                assert not r.knobs.prefetch or r.super_tile == 1, (name, r)
             assert r.handshake in P.HANDSHAKES, (name, r)
         # One FlyQuickAllReduce runs one handshake.
         assert len({r.handshake for r in rungs}) == 1, name
