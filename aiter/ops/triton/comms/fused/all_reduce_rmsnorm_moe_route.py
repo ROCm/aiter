@@ -72,7 +72,9 @@ class AllReduceRmsnormMoeRoute:
 
     Args:
         group: The CPU (gloo) process group of the ranks.
-        max_tokens (int): The largest number of tokens of a call, at most 512.
+        max_tokens (int): The largest number of tokens of a call, at most 512. Each row
+            of a call's power-of-2 routed bucket takes one CTA, and one CTA must stay
+            free: with 2 ranks and 256 CTAs, max_tokens is at most 256.
         hidden (int): The number of bf16 values in a row.
         num_experts (int): The number of routed experts.
         topk (int): The experts of a token.
@@ -118,6 +120,11 @@ class AllReduceRmsnormMoeRoute:
         self.blocks = min(self.config["BLOCKS"], cus)
         self.num_warps = self.config["num_warps"]
         _plan_layout(self)
+        routed = max(self.routed_rows(t) for t in self.warmup_tokens())
+        assert routed < self.blocks, (
+            f"max_tokens={max_tokens}: a call can need {routed} reduce CTAs, but "
+            f"there are {self.blocks} CTAs and the pushes need one more"
+        )
         self.scratch = torch.zeros(
             self.scratch_words, dtype=torch.int64, device=self.device
         )
@@ -194,6 +201,11 @@ class AllReduceRmsnormMoeRoute:
         sent = (self.world - 1) * tokens * self.hidden * 2
         return tokens <= self.s1max and sent <= self.config["ONESHOT_MAX_BYTES"]
 
+    def routed_rows(self, tokens):
+        """The reduce CTAs of a call: one for each row of its power-of-2 routed bucket."""
+        rows_b = triton.next_power_of_2(tokens)
+        return rows_b if self.one_shot(tokens) else triton.cdiv(rows_b, self.world)
+
     def warmup_tokens(self):
         """One token count for each kernel variant a call can compile (power-of-2 row buckets
         and the protocol): launching each once compiles them all, for example before HIP graph
@@ -230,7 +242,7 @@ def _constexprs(
     """The compile-time arguments of a call. The row count itself is a runtime argument; the
     loops and LDS sizes come from its power-of-2 bucket."""
     rows_b = triton.next_power_of_2(tokens)
-    routed_b = rows_b if one_shot else triton.cdiv(rows_b, comm.world)
+    routed_b = comm.routed_rows(tokens)
     v = triton.cdiv(comm.hidden // 8, 64 * comm.num_warps)
     units = (comm.world - 1) * routed_b * v
     # push units a CTA: the CTAs between the reduce and the router CTAs when they can take

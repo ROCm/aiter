@@ -394,6 +394,52 @@ def _check_timeout(rank, device, tp, failures):
         comm.close()
 
 
+def _check_max_tokens(rank, device, tp, failures):
+    """The constructor rejects a max_tokens that leaves no free CTA for a call. When it
+    accepts a max_tokens, a call with that many tokens is correct. 300 tokens use a
+    512-row bucket: at 2 ranks it needs all 256 CTAs."""
+    shape = SHAPES[0]
+    hidden, e, k, fp32 = shape[:4]
+    gen = torch.Generator(device=device).manual_seed(5)
+    weights = (
+        (
+            0.1
+            * torch.randn((hidden,), generator=gen, dtype=torch.float32, device=device)
+        ).to(torch.bfloat16),
+        0.02
+        * torch.randn((e, hidden), generator=gen, dtype=torch.float32, device=device),
+        0.01 * torch.randn((e,), generator=gen, dtype=torch.float32, device=device),
+    )
+    for max_tokens in (300, 512):
+        try:
+            comm = AllReduceRmsnormMoeRoute(
+                tp.cpu_group, max_tokens, hidden, e, k, router_fp32=fp32
+            )
+        except AssertionError:
+            continue  # rejected: no call can fail later
+        tag = f"world {comm.world} rank {rank} max_tokens {max_tokens}"
+        try:
+            x, r, ref = _inputs(
+                shape,
+                max_tokens,
+                11,
+                rank,
+                device,
+                tp.device_group,
+                weights,
+                comm.num_warps,
+            )
+            try:
+                out = _call(x, r, weights, shape, comm)
+            except Exception as err:  # noqa: BLE001 - every rank raises the same error
+                failures.append(f"{tag}: the call failed: {type(err).__name__}: {err}")
+                continue
+            torch.cuda.synchronize()
+            _check(out, ref, shape, True, failures, tag)
+        finally:
+            comm.close()
+
+
 def _worker(rank, world_size, init_method):
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -404,6 +450,7 @@ def _worker(rank, world_size, init_method):
         for shape in SHAPES:
             _check_shape(rank, device, tp, shape, failures)
         _check_timeout(rank, device, tp, failures)
+        _check_max_tokens(rank, device, tp, failures)
         return failures
     finally:
         aiter.destroy_dist_env()
