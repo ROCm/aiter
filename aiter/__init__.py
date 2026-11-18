@@ -148,6 +148,7 @@ else:
     from .ops.fused_moe_router import *
     from .ops.moe_mxfp4_aux import *
     from .ops.mla_sparse_prefill import *
+    from .ops.mla_nvfp4 import *
     from .ops.pa_sparse_prefill_opus import *
     from .ops.fused_norm_rope_attn_rope_cast import *
     from .ops.msa_attention import *
