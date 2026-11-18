@@ -883,6 +883,68 @@ def _mla_sparse_prefill_v4_fake(
     return torch.empty((t, h, 512), dtype=torch.bfloat16, device=q_nope.device)
 
 
+def _v4_auto_tries_asm(
+    q_nope: torch.Tensor, attn_sink: torch.Tensor | None, num_kv_splits: int | None
+) -> bool:
+    """Whether the default backend choice of v4 tries asm before opus."""
+    return (
+        num_kv_splits in (None, 1)
+        and attn_sink is not None
+        and get_gfx_runtime() == "gfx1250"
+        and q_nope.size(1) == _ASM_HEADS
+    )
+
+
+# Routed below the backend pin, as `mla_sparse_prefill_v41` is. The native body
+# keeps the default choice between asm and opus.
+@_route(op="mla_sparse_prefill_v4", version=1)
+def _mla_sparse_prefill_v4_routed(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    unified_kv_nope: torch.Tensor,
+    unified_kv_rope: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv_nope: torch.Tensor,
+    kv_rope: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
+) -> torch.Tensor:
+    """MLA v4 sparse prefill, below the backend pin.
+
+    Shapes and meanings are those of :func:`mla_sparse_prefill_v4`, minus its
+    ``backend`` argument. The second argument is ``q_rope``, the bf16 RoPE
+    part of the query: ``mla_sparse_prefill_v41`` has the same arity, and its
+    second argument is ``q_scale``. ``out`` is written in place when given and
+    returned either way, so a provider returns what it wrote.
+    """
+    args = (
+        q_nope,
+        q_rope,
+        unified_kv_nope,
+        unified_kv_rope,
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv_nope,
+        kv_rope,
+        kv_indices_extend,
+        kv_indptr_extend,
+        attn_sink,
+        softmax_scale,
+        out,
+    )
+    if _v4_auto_tries_asm(q_nope, attn_sink, num_kv_splits):
+        try:
+            return _asm_sparse_prefill_v4(*args)
+        except RuntimeError as e:  # asm is stricter about dtypes and shapes than opus
+            _warn_asm_fallback(str(e))
+    return _opus_sparse_prefill_v4(*args, num_kv_splits)
+
+
 @torch_compile_guard(mutates_args=["out"], gen_fake=_mla_sparse_prefill_v4_fake)
 def mla_sparse_prefill_v4(
     q_nope: torch.Tensor,
@@ -922,7 +984,8 @@ def mla_sparse_prefill_v4(
       softmax_scale:     float scalar applied to the QK^T scores.
       out:               Optional ``[T, H, 512]`` bf16 output; allocated if ``None``.
       num_kv_splits:     as in :func:`mla_sparse_prefill` (opus only).
-      backend:           ``"asm"``, ``"opus"`` or ``None``.
+      backend:           ``"asm"``, ``"opus"`` or ``None``. Enabled plugins are
+        tried first only with ``None``; they do not receive this native pin.
 
     Returns:
       ``out``.
@@ -943,22 +1006,12 @@ def mla_sparse_prefill_v4(
         softmax_scale,
         out,
     )
-    unsplit = num_kv_splits in (None, 1)
+    if backend is None:
+        return _mla_sparse_prefill_v4_routed(*args, num_kv_splits)
     if backend == "asm":
-        if not unsplit:
+        if num_kv_splits not in (None, 1):
             raise RuntimeError("the asm backend has no split-K")
         return _asm_sparse_prefill_v4(*args)
-    if (
-        backend is None
-        and unsplit
-        and attn_sink is not None
-        and get_gfx_runtime() == "gfx1250"
-        and q_nope.size(1) == _ASM_HEADS
-    ):
-        try:
-            return _asm_sparse_prefill_v4(*args)
-        except RuntimeError as e:  # asm is stricter about dtypes and shapes than opus
-            _warn_asm_fallback(str(e))
     return _opus_sparse_prefill_v4(*args, num_kv_splits)
 
 
