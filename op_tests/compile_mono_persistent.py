@@ -17,6 +17,9 @@ from triton.experimental.gluon._runtime import GluonASTSource
 from aiter.ops.triton._gluon_kernels.gfx1250.quant.fp8_group32 import (
     _quantize_fp8_group32_kernel,
 )
+from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp8_quant import (
+    _fused_dual_rmsnorm_mxfp8_quant_ps_kernel,
+)
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (
     _fused_dual_rmsnorm_mxfp8_quant_kernel,
 )
@@ -76,7 +79,11 @@ def main():
             fn = (
                 native._fused_dual_rmsnorm_mxfp8_quant_kernel
                 if mode == "native"
-                else _fused_dual_rmsnorm_mxfp8_quant_kernel
+                else (
+                    _fused_dual_rmsnorm_mxfp8_quant_ps_kernel
+                    if mode == "persistent"
+                    else _fused_dual_rmsnorm_mxfp8_quant_kernel
+                )
             )
             constants = {
                 "BLOCK_SIZE_KQ": triton.next_power_of_2(nq),
@@ -84,6 +91,9 @@ def main():
                 "QUANT_BLOCK_SIZE": 32,
                 "AMAX_FLOOR": 1e-10,
             }
+            if mode == "persistent":
+                constants["ROWS_PER_ITER"] = 4
+                constants["NUM_PRGMS"] = 256
             signature = {name: "i32" for name in fn.arg_names}
             signature.update(
                 {
@@ -107,6 +117,7 @@ def main():
             constants = {"DEQUANT": dequant}
             if mode != "native":
                 constants["PERSISTENT"] = mode == "persistent"
+                constants["TILES_PER_ITER"] = 4 if mode == "persistent" else 1
             signature = {
                 "X": "*bf16",
                 "Y": "*bf16" if dequant else "*fp8e4nv",

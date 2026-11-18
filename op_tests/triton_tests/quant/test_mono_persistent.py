@@ -60,7 +60,7 @@ def assert_guards(outputs):
         assert torch.all(raw[mask] == 0x5A)
 
 
-@pytest.mark.parametrize("rows", [0, 1, 95, 96, 255, 256, 257, 513])
+@pytest.mark.parametrize("rows", [0, 1, 95, 96, 255, 256, 257, 513, 1023, 1024, 1025])
 @pytest.mark.parametrize("widths", [(1280, 512), (96, 33)])
 def test_dual_norm_native_persistent(rows, widths):
     torch.manual_seed(451)
@@ -322,11 +322,15 @@ def test_output_contract_rejects_bad_buffers():
         fused_dual_rmsnorm_mxfp8_quant(q, k, wq, wk, 1e-20, persistent=True, yk=x)
 
 
-@pytest.mark.parametrize("op", ["a03", "a09", "a09-five-iterations"])
+@pytest.mark.parametrize(
+    "op", ["a03", "a03-four-row-loop", "a09", "a09-five-iterations"]
+)
 def test_graph_replay_changes_inputs(op):
     torch.manual_seed(453)
-    if op == "a03":
-        x = torch.randn((513, 1792), device="cuda", dtype=torch.bfloat16)
+    is_a03 = op.startswith("a03")
+    if is_a03:
+        rows = 1025 if op == "a03-four-row-loop" else 513
+        x = torch.randn((rows, 1792), device="cuda", dtype=torch.bfloat16)
         wq = torch.ones((1280,), device="cuda", dtype=torch.bfloat16)
         wk = torch.ones((512,), device="cuda", dtype=torch.bfloat16)
         args = (x[:, :1280], x[:, 1280:], wq, wk, 1e-20)
@@ -381,8 +385,8 @@ def test_graph_replay_changes_inputs(op):
             not torch.equal(a.view(torch.uint8), b.view(torch.uint8))
             for a, b in zip(expected, previous)
         ]
-        assert any(changed if op == "a03" else changed[:2])
-        if op != "a03":
+        assert any(changed if is_a03 else changed[:2])
+        if not is_a03:
             assert changed[2]
         for a, b in zip(outs, expected):
             assert_bytes(a, b)

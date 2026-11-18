@@ -24,14 +24,15 @@ def quantize_fp8_group32(
 
     Args:
         x: Contiguous BF16 tensor on gfx1250. Its last width is divisible by 32.
-        persistent: Use 256 one-dimensional workers, four waves, and stride 256.
+        persistent: Use 256 one-dimensional workers with four waves each.
+            Each iteration processes four adjacent 1024-element tiles.
         dequantize: Return QAT values in BF16 instead of FP8 and scale tensors.
         out: Optional contiguous output with x.shape and the result dtype.
         scales: Optional contiguous E8M0 tensor, with last width x.shape[-1]/32.
 
     Returns:
         (FP8 values, E8M0 scales), or BF16 values when dequantize is True.
-        One task processes 1024 elements. This is a standalone stage.
+        Non-persistent tasks process 1024 elements. This is a standalone stage.
 
     Outputs must not overlap inputs or each other. Empty inputs do not launch.
     This recipe differs from dynamic_mxfp8_quant. It uses a fixed 1e-10 floor.
@@ -62,6 +63,7 @@ def quantize_fp8_group32(
             x.numel(),
             dequantize,
             persistent,
+            TILES_PER_ITER=4 if persistent else 1,
             num_warps=4,
         )
     return out if dequantize else (out, scales)

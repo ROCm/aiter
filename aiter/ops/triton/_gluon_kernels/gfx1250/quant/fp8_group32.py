@@ -11,17 +11,19 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 @gluon.jit
-def _quantize_fp8_group32_tile(X, Y, S, SIZE, tile, DEQUANT: gl.constexpr):
+def _quantize_fp8_group32_tile(
+    X, Y, S, SIZE, tile, DEQUANT: gl.constexpr, TILES_PER_ITER: gl.constexpr = 1
+):
     # Keep each scale in its reduction layout to avoid an LDS copy across waves.
     layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 4], [4, 1], [1, 0])
-    groups = gl.arange(0, 32, layout=gl.SliceLayout(1, layout))
+    groups = gl.arange(0, 32 * TILES_PER_ITER, layout=gl.SliceLayout(1, layout))
     offsets = (
         groups[:, None] * 32
         + gl.arange(0, 32, layout=gl.SliceLayout(0, layout))[None, :]
     )
     # Buffer offsets are 32-bit; rebase each tile with 64-bit pointer arithmetic.
-    tile_base = tile.to(gl.int64) * 1024
-    scale_base = tile.to(gl.int64) * 32
+    tile_base = tile.to(gl.int64) * (1024 * TILES_PER_ITER)
+    scale_base = tile.to(gl.int64) * (32 * TILES_PER_ITER)
     mask = tile_base + offsets < SIZE
     x = buffer_load(X + tile_base, offsets, mask=mask, other=0).to(gl.float32)
     amax = gl.maximum(gl.max(gl.abs(x), 1), 1e-10)
@@ -49,14 +51,22 @@ def _quantize_fp8_group32_tile(X, Y, S, SIZE, tile, DEQUANT: gl.constexpr):
 
 
 @gluon.jit(
-    repr=make_kernel_repr("_quantize_fp8_group32_kernel", ["PERSISTENT", "DEQUANT"])
+    repr=make_kernel_repr(
+        "_quantize_fp8_group32_kernel", ["PERSISTENT", "DEQUANT", "TILES_PER_ITER"]
+    )
 )
 def _quantize_fp8_group32_kernel(
-    X, Y, S, SIZE, DEQUANT: gl.constexpr, PERSISTENT: gl.constexpr
+    X,
+    Y,
+    S,
+    SIZE,
+    DEQUANT: gl.constexpr,
+    PERSISTENT: gl.constexpr,
+    TILES_PER_ITER: gl.constexpr = 1,
 ):
     task = gl.program_id(0)
     if PERSISTENT:
-        for tile in range(task, gl.cdiv(SIZE, 1024), 256):
-            _quantize_fp8_group32_tile(X, Y, S, SIZE, tile, DEQUANT)
+        for tile in range(task, gl.cdiv(SIZE, 1024 * TILES_PER_ITER), 256):
+            _quantize_fp8_group32_tile(X, Y, S, SIZE, tile, DEQUANT, TILES_PER_ITER)
     else:
         _quantize_fp8_group32_tile(X, Y, S, SIZE, task, DEQUANT)

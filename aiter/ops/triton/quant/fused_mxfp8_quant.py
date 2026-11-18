@@ -139,7 +139,8 @@ def fused_dual_rmsnorm_mxfp8_quant(
         amax_floor: floor of each Q group's amax (0: none).
         persistent: use 256 workers in a one-dimensional grid with four
             wave32 waves per worker on gfx1250.
-            Each worker processes rows at stride 256. This is a standalone
+            Each worker processes four adjacent rows at a time, at stride 1024.
+            This is a standalone
             kernel, not a callable mono device function. This mode requires
             BF16 inputs, contiguous weights, and non-overlapping output rows.
             Outputs must not overlap inputs or each other.
@@ -179,7 +180,16 @@ def fused_dual_rmsnorm_mxfp8_quant(
     NUM_PRGMS = 256 if persistent else M
     grid = (NUM_PRGMS,)
 
-    _fused_dual_rmsnorm_mxfp8_quant_kernel[grid](
+    kernel = _fused_dual_rmsnorm_mxfp8_quant_kernel
+    launch_options = {}
+    if persistent:
+        from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp8_quant import (
+            _fused_dual_rmsnorm_mxfp8_quant_ps_kernel,
+        )
+
+        kernel = _fused_dual_rmsnorm_mxfp8_quant_ps_kernel
+        launch_options["ROWS_PER_ITER"] = 4
+    kernel[grid](
         q,
         k,
         q_weight,
@@ -208,6 +218,7 @@ def fused_dual_rmsnorm_mxfp8_quant(
         NUM_PRGMS=NUM_PRGMS,
         AMAX_FLOOR=amax_floor,
         num_warps=4,
+        **launch_options,
     )
     return yq, sq, yk
 
