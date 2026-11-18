@@ -2,6 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import dataclasses
+import functools
 import gc
 import itertools
 import logging
@@ -19,7 +21,9 @@ from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES
 from aiter.fused_moe import (
     AsmMoeMode,
     _flydsl_route_output_nbytes,
+    _fused_moe_impl,
     _is_flydsl_stage2,
+    _stage2_fp8_kernel_name,
     _stage2_runtime_uses_route_reduce,
     cktile_moe_stage1,
     cktile_moe_stage2,
@@ -150,6 +154,7 @@ def test_fmoe(
     ref_dtype="bf16",
     gate_up_layout: bool | None = None,
     expected_kernel1: str | None = None,
+    stage2_fp8: bool = False,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -579,6 +584,7 @@ def test_fmoe(
         "beta": beta,
         "linear_beta": linear_beta,
         "gate_mode": gateMode,
+        "stage2_fp8": stage2_fp8,
     }
 
     if kernel_bench:
@@ -888,6 +894,11 @@ parser.add_argument(
     "in fp32 so the a2 mxfp4 amax is taken over fp32 (mirrors the fused asm "
     "kernel, which computes amax on the in-register fp32 silu result, instead "
     "of the bf16 round-trip the 2-stage flydsl/torch path does). Default: bf16.",
+)
+parser.add_argument(
+    "--stage2-fp8",
+    action="store_true",
+    help="Call fused_moe with stage2_fp8=True (FP8 route output in stage 2).",
 )
 
 args = parser.parse_args()
@@ -3094,6 +3105,81 @@ def test_swiglu_oai_flat_dispatch():
     aiter.logger.info("moe_2stage: SwiGLU OAI FLAT dispatch regression test passed")
 
 
+def test_stage2_fp8_kernel_name():
+    """stage2_fp8 keeps a reduce stage 2 and maps only an MXFP4 scatter stage 2."""
+    name = "flydsl_moe2_layout_a{}_wfp4_bf16_t128x256x128_{}_sbm128"
+    reduce = name.format("fp4", "reduce")
+    assert _stage2_fp8_kernel_name(name.format("fp4", "scatter")) == reduce
+    ldspa = name.format("fp4", "scatter_nt") + "_ldspa"
+    assert _stage2_fp8_kernel_name(ldspa) == reduce
+    persist = name.format("fp4", "reduce_persist")
+    assert _stage2_fp8_kernel_name(persist) == persist
+    assert _stage2_fp8_kernel_name(name.format("fp8", "scatter")) is None
+    assert _stage2_fp8_kernel_name(name.format("fp4", "atomic")) is None
+
+
+def test_stage2_fp8_per_call():
+    """fused_moe(stage2_fp8=True) gives one call the FP8 route output that
+    AITER_FLYDSL_STAGE2_FP8=1 gives every call, at tuned rows behind both FlyDSL
+    stage-1 families. A call without it keeps the default output."""
+
+    def mxfp4_weight(E, rows, cols):
+        codes = torch.randint(0, 256, (E, rows, cols // 2), device="cuda")
+        weight = shuffle_weight(codes.to(torch.uint8).view(dtypes.fp4x2), (16, 16))
+        weight.is_shuffled = True
+        # e8m0 scales 2^-7 .. 2^-5
+        scale = torch.randint(120, 123, (E * rows, cols // 32), device="cuda")
+        scale = fp4_utils.e8m0_shuffle(scale.to(torch.uint8).view(dtypes.fp8_e8m0))
+        return weight, scale.view(E, rows, -1)
+
+    def run_fp8_kernel(tuned, metadata):
+        kw = metadata.stage2.keywords
+        # MXMOE stage 2s take kernelName2, the others kernelName.
+        name = "kernelName2" if "kernelName2" in kw else "kernelName"
+        assert kw[name] == tuned, metadata.stage2
+        fp8_name = tuned.replace("_scatter_", "_reduce_")
+        stage2 = functools.partial(metadata.stage2, **{name: fp8_name})
+        return dataclasses.replace(metadata, stage2=stage2)
+
+    cases = (
+        # Qwen3.8-Flash, 16,384 tokens: MXMOE stage 1 and a scatter stage 2, which
+        # the flag runs as the reduce stage 2 of the same tile.
+        (16384, 513, 11, 2560, 640, "afp4_wfp4_bf16_t128x256x128_scatter_sbm128"),
+        # DeepSeek-V3 MXFP4, 2 tokens: flydsl_moe1 stage 1 and a reduce stage 2.
+        (2, 256, 8, 7168, 512, "afp4_wfp4_bf16_t32x256x256_reduce_sbm32"),
+    )
+    enums = {
+        "quant_type": aiter.QuantType.per_1x32,
+        "activation": aiter.ActivationType.Silu,
+    }
+    for M, E, topk, model_dim, inter_dim, kn2 in cases:
+        tuned = "flydsl_moe2_layout_" + kn2
+        torch.manual_seed(0)
+        w1, w1_scale = mxfp4_weight(E, 2 * inter_dim, model_dim)
+        w2, w2_scale = mxfp4_weight(E, model_dim, inter_dim)
+        hidden = torch.randn((M, model_dim), dtype=dtypes.bf16, device="cuda")
+        topk_ids = torch.rand((M, E), device="cuda").topk(topk, dim=1).indices
+        topk_weights = torch.softmax(torch.randn((M, topk), device="cuda"), dim=1)
+        args = (hidden, w1, w2, topk_weights, topk_ids.to(torch.int32))
+        kwargs = {"w1_scale": w1_scale, "w2_scale": w2_scale, "gate_mode": "separated"}
+
+        default = fused_moe(*args, **kwargs, **enums)
+        fp8 = fused_moe(*args, **kwargs, **enums, stage2_fp8=True)
+        assert torch.equal(fused_moe(*args, **kwargs, **enums), default), tuned
+        with override_env("AITER_FLYDSL_STAGE2_FP8", "1"):
+            env = _fused_moe_impl(
+                *args,
+                **kwargs,
+                **{k: v.value for k, v in enums.items()},
+                _metadata_transform=functools.partial(run_fp8_kernel, tuned),
+            )
+        assert torch.equal(fp8, env), tuned
+        assert not torch.equal(fp8, default), tuned
+        diff = (fp8.float() - default.float()).norm() / default.float().norm()
+        assert diff < 0.05, (tuned, diff)
+    aiter.logger.info("moe_2stage: stage2_fp8 per-call regression test passed")
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -3118,6 +3204,9 @@ else:
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
     test_swiglu_oai_flat_dispatch()
+    if get_gfx() == "gfx950":
+        test_stage2_fp8_kernel_name()
+        test_stage2_fp8_per_call()
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
     if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(
@@ -3196,7 +3285,10 @@ for kwargs, extras in case_iter:
         )
         with aot_guard:
             ret = test_fmoe(
-                **kwargs, kernel_bench=args.kernel, ref_dtype=args.ref_dtype
+                **kwargs,
+                kernel_bench=args.kernel,
+                ref_dtype=args.ref_dtype,
+                stage2_fp8=args.stage2_fp8,
             )
     except torch.cuda.OutOfMemoryError as exc:
         aiter.logger.warning(
