@@ -1421,8 +1421,9 @@ def test_snapshots_are_the_states_of_their_prefixes(
         assert rel_err(snaps[i], gold[0]) < 2e-2, (n, off)
         if chunks_per_seg == 0:
             # The same Triton K2 walk that ends at `off`, its state cast to
-            # `snap_dtype`. Bit-identical unless the two calls pick different
-            # K2 tiles.
+            # `snap_dtype`. The two calls have separate tuned K2 configs, and
+            # different tiles round differently, so this allows for rounding
+            # instead of asserting bit equality.
             with _route(k2=False):
                 _, ht = run_flash(
                     *head,

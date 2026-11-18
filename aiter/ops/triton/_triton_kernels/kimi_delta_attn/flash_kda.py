@@ -1317,8 +1317,9 @@ def flash_kda_fwd(
                             leave it unwritten; ``()`` leaves it unused.
                             Cast as the final state is, so in ``final_state``'s
                             dtype it holds the bits that a forward ending at
-                            ``off`` returns as its final state, when that
-                            forward also runs unsegmented on the Triton K2.
+                            ``off`` returns as its final state, when both this
+                            call and that forward run unsegmented on the
+                            Triton K2 with the same tuned K2 config.
 
     Returns:
         ``(o, final_state)`` with ``o`` shaped like ``v``. ``final_state`` is

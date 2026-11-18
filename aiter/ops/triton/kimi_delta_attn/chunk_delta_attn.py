@@ -172,9 +172,9 @@ def chunk_kimi_delta_attn(
             `AITER_FDA_ENABLE` and `flash_kda_supported` decide whether a call
             takes that path, and this package exports all three. It is the
             state a forward ending at `off` would return as its final state
-            (bit for bit when that forward also runs unsegmented on the Triton
-            K2), so prefix checkpoints can be taken without ending the forward
-            there.
+            (bit for bit when both this call and that forward run unsegmented
+            on the Triton K2 with the same tuned K2 config), so prefix
+            checkpoints can be taken without ending the forward there.
         snapshot_out (torch.Tensor, optional):
             Destination, `[len(snapshot_targets), HV, V, K]` when
             `state_v_first` else `[.., HV, K, V]`, contiguous; its floating
