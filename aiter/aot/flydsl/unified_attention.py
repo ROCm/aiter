@@ -7,7 +7,7 @@
 
 Unlike the GEMM/MoE families, unified attention has no tuning CSV: the served
 config space is a fixed cross-product of build-time specializations for the
-Qwen3-VL production shape (num_heads=64, num_kv_heads=4 => GQA-16, head_dim=128,
+Qwen3-VL production shape (num_kv_heads=4, GQA-16/8/4, head_dim=128,
 fp8 QKV, paged + varlen). ``default_jobs()`` emits the fixed job list.
 
 One builder backs the family (gfx950-only, forced via FLYDSL_GPU_ARCH):
@@ -43,8 +43,9 @@ UNIFIED_ATTENTION_AOT_ARCH = "gfx950"
 
 # Pinned production geometry (Qwen3-VL fp8 unified attention on gfx950).
 _HEAD_DIM = 128
-_NUM_HEADS = 64
-_NUM_KV_HEADS = 4  # Qwen3-VL production GQA-16
+_NUM_KV_HEADS = 4  # Qwen3-VL production KV heads
+# GQA group sizes the router packs into BN64 (_PACKED_BN64_GROUPS); Q heads = 4 * group.
+_GROUPS = (16, 8, 4)
 
 _OUT_DTYPES = ("bf16", "f16")
 
@@ -62,9 +63,11 @@ def _prefill_jobs() -> list[dict]:
             "rescale_threshold": threshold,
             "block_m": block_m,
             "packed_bn64": packed,
+            "num_heads": _NUM_KV_HEADS * group,
             "batch_chunks": chunks,
             "interleaved": il,
         }
+        for group in _GROUPS
         for causal in (True, False)
         for out_dtype in _OUT_DTYPES
         for shuffled in (False, True)
@@ -72,7 +75,7 @@ def _prefill_jobs() -> list[dict]:
         for chunks in _BATCH_CHUNK_BUCKETS
         # Rank-major order is causal only; the router never sets it otherwise.
         for il in ((False, True) if causal else (False,))
-        # The adapter routes this GQA-16 shape to packed BN64 (fixed block_m=128).
+        # The adapter routes GQA-4/8/16 shapes to packed BN64 (fixed block_m=128).
         for block_m, packed in ((128, True),)
     ]
 
@@ -81,7 +84,6 @@ def default_jobs() -> list[dict]:
     """Return the fixed prefill specialization list."""
     jobs = _prefill_jobs()
     common = {
-        "num_heads": _NUM_HEADS,
         "num_kv_heads": _NUM_KV_HEADS,
         "head_dim": _HEAD_DIM,
         "dtype_str": "fp8",
@@ -103,6 +105,7 @@ def _kernel_name(job: dict) -> str:
     return (
         "flydsl_unified_attn_prefill"
         f"_c{int(job['causal'])}_{job['out_dtype_str']}"
+        f"_g{job['num_heads'] // job['num_kv_heads']}"
         f"_shuf{int(job['shuffled_kv_cache'])}"
         f"_thr{job['rescale_threshold']:g}_bm{job['block_m']}"
         f"{'_bn64pack' if job['packed_bn64'] else ''}"
