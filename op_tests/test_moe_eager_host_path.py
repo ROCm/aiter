@@ -2,8 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """fused_moe's eager host path must not change what runs.
 
-In plain eager mode fused_moe calls the fused_moe_ body without the torch.ops
-dispatch, _fused_moe_impl reuses the plan resolved for an earlier call with the
+In plain eager mode fused_moe calls the fused_moe_ body (its kernel plugin
+route) without the torch.ops dispatch, _fused_moe_impl reuses the plan resolved for an earlier call with the
 same signature, and its own sort writes into reused buffers. The sweep runs
 each case both ways, "eager" and "op" (all three off: _plain_eager false, as
 under a tracer), checks them bit for bit against each other and against the
@@ -313,6 +313,8 @@ def test_plain_eager_only_for_real_eager_tensors():
     x = torch.zeros(2, device=DEV)
     assert fm._plain_eager(x)
     assert fm._op_or_eager_body(fm.fused_moe_, x) is fm.fused_moe_._eager_body
+    # The direct call must still ask the kernel plugin providers first.
+    assert fm.fused_moe_._eager_body.__aiter_plugin_op__.name == "fused_moe"
 
     class Passthrough(TorchDispatchMode):
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):

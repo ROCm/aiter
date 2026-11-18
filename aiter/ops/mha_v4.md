@@ -5,7 +5,8 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 
 ## Scope
 
-- Contiguous BF16 BSHD inputs with head dimension 128, or 256 for dense MXFP4/6/8 on GFX950.
+- Contiguous BF16 BSHD inputs with head dimension 128, or 256 for dense BF16 and MXFP4/6/8 on
+  GFX950.
 - BF16 BSHD output.
 - Dense, sorted block-sparse, and Sol-Attn inference.
 - Each sparse and Sol-Attn row declares the KV tiles per sequence it can traverse (`lut_max`);
@@ -42,8 +43,8 @@ GFX942 ships per-tensor FP8/FP8 and INT8/FP8, dense and sparse. It has no Sol-At
 
 MXFP4 Q/K requires MXFP4 V. The FP8-V variant is retired.
 
-Head dimension 256 exists only for all-MXFP4, all-MXFP6 and MXFP8 (FP8 V) operands, dense, on
-GFX950. Every other recipe, sorted sparse, and GFX942 reject it.
+Head dimension 256 exists only for all-BF16, all-MXFP4, all-MXFP6 and MXFP8 (FP8 V) operands,
+dense, on GFX950. Every other recipe, sorted sparse, and GFX942 reject it.
 
 ## Ownership
 
