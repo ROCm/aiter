@@ -810,14 +810,20 @@ def test_mha_v4_quantized_tolerates_k_common_mode(recipe, head_dim):
     )
 
 
-# gfx942's FP8 dense row stores no LSE and it has no MX rows, so only gfx950 has a row to check.
-@skipif(
-    get_gfx() != "gfx950",
-    reason="gfx950 LSE",
-)
+# gfx942 stores LSE on every dense row it has, but has no MX rows.
+_GFX950_ONLY = get_gfx() != "gfx950"
+
+
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 LSE")
 @parametrize(
     "recipe,head_dim",
-    [("fp8", 128), ("mxfp8", 128), ("mxfp4", 128), ("mxfp4", 256), ("mxfp6", 256)],
+    [
+        ("fp8", 128),
+        param("mxfp8", 128, skip=_GFX950_ONLY),
+        param("mxfp4", 128, skip=_GFX950_ONLY),
+        param("mxfp4", 256, skip=_GFX950_ONLY),
+        param("mxfp6", 256, skip=_GFX950_ONLY),
+    ],
 )
 def test_mha_v4_lse_survives_k_common_mode(recipe, head_dim):
     """K smoothing must not leak into the exported LSE.
@@ -1244,12 +1250,6 @@ def test_mha_v4_mx_v_scale_backing_storage_covers_the_64x64_gather(
 @skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 validation")
 def test_mha_v4_rejects_unsupported_contracts():
     q = torch.empty((1, 128, 2, 128), device="cuda", dtype=torch.bfloat16)
-    if get_gfx() == "gfx942":
-        # Refused by the manifest's lse column: gfx942's FP8 dense object has no LSE store, and a
-        # buffer left as allocated would read as a log-sum-exp rather than as a failure.
-        fp8 = native_fp8_format()
-        with expect_raises(RuntimeError, match="has no LSE store in its code object"):
-            mha_v4(q, q, q, fp8, fp8, fp8, return_lse=True)
     with expect_raises(ValueError, match="matching Q and K formats"):
         mha_v4(
             q,
@@ -1261,27 +1261,34 @@ def test_mha_v4_rejects_unsupported_contracts():
         )
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 LSE")
 @parametrize(
     ("q_format", "v_format", "scale_modes"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16, None),
-        (AttentionFormat.BF16, AttentionFormat.FP8, None),
-        (AttentionFormat.INT8, AttentionFormat.FP8, None),
-        (AttentionFormat.FP8, AttentionFormat.FP8, None),
-        (AttentionFormat.FP8, AttentionFormat.MXFP6, None),
-        (AttentionFormat.MXFP4, AttentionFormat.MXFP4, None),
-        (AttentionFormat.MXFP6_E2M3, AttentionFormat.FP8, None),
-        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6, None),
-        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4, None),
-        (
-            AttentionFormat.FP8,
-            AttentionFormat.FP8,
+        (AttentionFormat.BF16, native_fp8_format(), None),
+        (AttentionFormat.INT8, native_fp8_format(), None),
+        (native_fp8_format(), native_fp8_format(), None),
+        param(native_fp8_format(), AttentionFormat.MXFP6, None, skip=_GFX950_ONLY),
+        param(AttentionFormat.MXFP4, AttentionFormat.MXFP4, None, skip=_GFX950_ONLY),
+        param(
+            AttentionFormat.MXFP6_E2M3, native_fp8_format(), None, skip=_GFX950_ONLY
+        ),
+        param(
+            AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6, None, skip=_GFX950_ONLY
+        ),
+        param(
+            AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP4, None, skip=_GFX950_ONLY
+        ),
+        param(
+            native_fp8_format(),
+            native_fp8_format(),
             (
                 AttentionScaleMode.E8M0_PER_1X32,
                 AttentionScaleMode.E8M0_PER_1X32,
                 AttentionScaleMode.F32_PER_TENSOR,
             ),
+            skip=_GFX950_ONLY,
         ),
     ],
 )
@@ -1325,16 +1332,16 @@ def test_mha_v4_dense_lse_matches_reference(q_format, v_format, scale_modes):
     assert error.mean().item() < 0.05, error.mean().item()
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 LSE")
 @parametrize(
     ("q_format", "v_format"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16),
-        (AttentionFormat.BF16, AttentionFormat.FP8),
-        (AttentionFormat.INT8, AttentionFormat.FP8),
-        (AttentionFormat.FP8, AttentionFormat.FP8),
-        (AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6),
-        (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
+        (AttentionFormat.BF16, native_fp8_format()),
+        (AttentionFormat.INT8, native_fp8_format()),
+        (native_fp8_format(), native_fp8_format()),
+        param(AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6, skip=_GFX950_ONLY),
+        param(AttentionFormat.MXFP4, AttentionFormat.MXFP4, skip=_GFX950_ONLY),
     ],
 )
 @parametrize("gqa_ratio", [2, 4])
@@ -1379,18 +1386,14 @@ def test_mha_v4_dense_lse_under_gqa(q_format, v_format, gqa_ratio):
     assert error < 0.25, error
 
 
-# gfx942 stores LSE on its BF16 Q/K dense rows only, and has no MX rows.
-_GFX950_ONLY = get_gfx() != "gfx950"
-
-
 @skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 LSE")
 @parametrize(
     ("q_format", "v_format", "max_spread"),
     [
         (AttentionFormat.BF16, AttentionFormat.BF16, 0.05),
         (AttentionFormat.BF16, native_fp8_format(), 0.05),
-        param(AttentionFormat.INT8, native_fp8_format(), 0.05, skip=_GFX950_ONLY),
-        param(native_fp8_format(), native_fp8_format(), 0.75, skip=_GFX950_ONLY),
+        (AttentionFormat.INT8, native_fp8_format(), 0.05),
+        (native_fp8_format(), native_fp8_format(), 0.75),
         param(native_fp8_format(), AttentionFormat.MXFP6, 0.75, skip=_GFX950_ONLY),
         param(AttentionFormat.MXFP4, AttentionFormat.MXFP4, 0.35, skip=_GFX950_ONLY),
         param(AttentionFormat.MXFP6_E2M3, native_fp8_format(), 0.35, skip=_GFX950_ONLY),
@@ -3210,8 +3213,8 @@ def check_lse_capable_objects(arch="gfx950"):
     )
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
-@parametrize("arch", ["gfx950"])
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 validation")
+@parametrize("arch", ["gfx942", "gfx950"])
 def test_mha_v4_lse_capable_rows_load_the_lse_kernarg(arch):
     check_lse_capable_objects(arch)
 

@@ -677,7 +677,7 @@ def _sparse_lse_format_params(names, *extra):
     ]
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
 @parametrize(
     ("q_format", "v_format", "tol"),
     [
@@ -742,7 +742,7 @@ def test_mha_v4_sparse_lse_matches_logsumexp_over_selected_blocks(
     assert error < tol, f"sparse LSE off by {error:.4f} nats for tiles {kept}"
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
 @parametrize(
     ("q_format", "v_format"),
     _sparse_lse_format_params(["bf16", "bf16fp8", "fp8", "mxfp6"]),
@@ -788,7 +788,7 @@ def test_mha_v4_sparse_lse_is_neg_inf_where_the_row_selects_nothing(q_format, v_
     assert torch.isfinite(lse[:, 1:].float()).all()
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 LSE")
+@skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
 @parametrize(
     ("q_format", "v_format"), _sparse_lse_format_params(["bf16", "fp8", "mxfp6"])
 )
@@ -3158,9 +3158,8 @@ _LSE_FP6_P_IDS = ("mxfp4_fp6p", "mxfp6_fp6p", "f8f6_fp6p", "f6f4_fp6p")
 _LSE_SPARSE_IDS = ("bf16", "bf16fp8", "fp8", "i8fp8", "mxfp8", "f6f8", *_LSE_FP6_P_IDS)
 
 
-# gfx942's FP8/FP8 and INT8/FP8 dense and 256x64 sparse objects have no LSE store; its BF16 Q/K
-# rows and every 64x64 row do. Every gfx950 row does.
-_LSE_GFX942_IDS = ("bf16", "bf16fp8")
+# gfx942 has no MX rows; every row it does have carries the store, as every gfx950 row does.
+_LSE_GFX942_IDS = ("bf16", "bf16fp8", "fp8", "i8fp8")
 
 
 def _lse_off_arch(row_id, block_tile=None):

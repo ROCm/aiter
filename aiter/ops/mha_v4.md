@@ -14,8 +14,8 @@ dispatch metadata. Unsupported recipes fail instead of falling back to another a
 - Per-batch key lengths via `seqlens_k`, on every dense GFX950 row and the dense `BF16 Q/K` rows
   of GFX942. Entries clamp to the padded key extent, and a null pointer lets one object serve dense
   and varlen. Every other GFX942 recipe and the sorted-sparse path reject it.
-- Log-sum-exp via `return_lse` wherever the selected manifest row declares `lse`. On GFX950 that is
-  every row; on GFX942 every row except the FP8/FP8 and INT8/FP8 dense and 256x64 sparse ones.
+- Log-sum-exp via `return_lse` wherever the selected manifest row declares `lse`. On GFX950 and
+  GFX942 that is every row.
   The value is the log-sum-exp of the *quantized* scores, so its error tracks the row max at each
   format's score precision (~0.001 nats for BF16 Q/K, 36 for MXFP6, 153 for MXFP4, against 1418
   nats of range): safe for merging same-recipe ring chunks, wrong as an absolute quantity or across
