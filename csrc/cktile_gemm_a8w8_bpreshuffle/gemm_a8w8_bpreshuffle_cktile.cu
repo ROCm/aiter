@@ -58,13 +58,15 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K, int lookup_k)
         }
     }();
 
-    const int cu_num           = get_device_cu_num();
+    const TunedCuNums cu_nums  = get_tuned_cu_nums();
     const std::string_view gfx = get_device_gfx();
+    const auto k_fits = [&](const auto& row) { return K == lookup_k || row.supports_k_padding; };
+    const auto m_and_k_fit = [&](const auto& row) { return row.supports_m_padding && k_fits(row); };
 
     // First check if this shape(M,N,K) is available in the direct lookup.
-    auto it = lookup.find({gfx, cu_num, M, N, lookup_k});
+    auto it = find_tuned_row_if(lookup, cu_nums, k_fits, gfx, M, N, lookup_k);
     // If we found an optimal kernel, use it.
-    if(it != lookup.end() && (K == lookup_k || it->second.supports_k_padding))
+    if(it != lookup.end())
     {
         return it->second.kernel;
     }
@@ -74,10 +76,9 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K, int lookup_k)
     // Fine-grained search
     padded_m = getPaddedM(M, N, lookup_k, 0);
     // Second check if this shape(padded_m,N,K) is available in the direct lookup.
-    it = lookup.find({gfx, cu_num, padded_m, N, lookup_k});
+    it = find_tuned_row_if(lookup, cu_nums, m_and_k_fit, gfx, padded_m, N, lookup_k);
     // If we found an optimal kernel, use it.
-    if(it != lookup.end() && it->second.supports_m_padding &&
-       (K == lookup_k || it->second.supports_k_padding))
+    if(it != lookup.end())
     {
         return it->second.kernel;
     }
@@ -85,10 +86,9 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K, int lookup_k)
     // Coarse-grained search
     padded_m = getPaddedM(M, N, lookup_k, 1);
     // Third check if this shape(padded_m,N,K) is available in the direct lookup.
-    it = lookup.find({gfx, cu_num, padded_m, N, lookup_k});
+    it = find_tuned_row_if(lookup, cu_nums, m_and_k_fit, gfx, padded_m, N, lookup_k);
     // If we found an optimal kernel, use it.
-    if(it != lookup.end() && it->second.supports_m_padding &&
-       (K == lookup_k || it->second.supports_k_padding))
+    if(it != lookup.end())
     {
         return it->second.kernel;
     }
