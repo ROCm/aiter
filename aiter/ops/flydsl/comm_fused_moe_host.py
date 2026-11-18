@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import re
 from dataclasses import MISSING, dataclass, fields, replace
 from functools import cache
 from pathlib import Path
@@ -72,6 +73,7 @@ class ShapeKey:
     doweight_stage1: int = 0
     add_shared: bool = True
     comm: str = "ar"
+    gpu_model: str | None = None
 
     def kernel_shape(self) -> Shape:
         return Shape(
@@ -94,6 +96,50 @@ _CONFIG_FAMILIES = {
 }
 _CONFIG_FAMILY_NAMES = {value: key for key, value in _CONFIG_FAMILIES.items()}
 _DERIVED_CONFIG_FIELDS = {"shape", "m", "gather_output"}
+_GPU_MODEL_PATTERN = re.compile(r"\bmi\d+[a-z0-9]*\b", re.IGNORECASE)
+_PCI_DEVICES_ROOT = Path("/sys/bus/pci/devices")
+_GPU_MODELS_BY_PCI_ID = {
+    0x75A0: "mi350x",
+    0x75A3: "mi355x",
+    0x75A8: "mi350p",
+}
+
+
+def _gpu_model_from_pci(properties) -> str | None:
+    try:
+        bdf = (
+            f"{properties.pci_domain_id:04x}:{properties.pci_bus_id:02x}:"
+            f"{properties.pci_device_id:02x}.0"
+        )
+        device_path = _PCI_DEVICES_ROOT / bdf
+        # Prefer the subsystem product ID: virtual functions may expose a VF
+        # device ID while retaining the physical product in subsystem_device.
+        product_ids = (
+            int((device_path / "subsystem_device").read_text(encoding="utf-8"), 0),
+            int((device_path / "device").read_text(encoding="utf-8"), 0),
+        )
+    except (AttributeError, OSError, ValueError):
+        return None
+    return next(
+        (
+            model
+            for product_id in product_ids
+            if (model := _GPU_MODELS_BY_PCI_ID.get(product_id)) is not None
+        ),
+        None,
+    )
+
+
+@cache
+def get_gpu_model() -> str | None:
+    """Return the canonical product name used by comm-fused winner rows."""
+
+    try:
+        properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    except (AssertionError, AttributeError, RuntimeError):
+        return None
+    match = _GPU_MODEL_PATTERN.search(properties.name)
+    return match.group(0).lower() if match else _gpu_model_from_pci(properties)
 
 
 def _window_mxfp8_fallback_enabled() -> bool:
@@ -348,7 +394,7 @@ def _winner_table() -> dict[ShapeKey, dict[int, PipelineConfig]]:
                         f"comm_fused_configs[{mode!r}] must be a JSON object"
                     )
                 unknown = set(entry).difference(
-                    {"family", "params", "tp", "add_shared", "us"}
+                    {"family", "params", "tp", "add_shared", "gpu_model", "us"}
                 )
                 if unknown:
                     raise ValueError(
@@ -360,6 +406,12 @@ def _winner_table() -> dict[ShapeKey, dict[int, PipelineConfig]]:
                 if not isinstance(add_shared, bool):
                     raise TypeError(
                         f"comm_fused_configs[{mode!r}].add_shared must be boolean"
+                    )
+                gpu_model = entry.get("gpu_model")
+                if not isinstance(gpu_model, str) or not gpu_model.strip():
+                    raise TypeError(
+                        f"comm_fused_configs[{mode!r}].gpu_model must be "
+                        "a non-empty string"
                     )
                 shape = ShapeKey(
                     row["gfx"],
@@ -378,6 +430,7 @@ def _winner_table() -> dict[ShapeKey, dict[int, PipelineConfig]]:
                     _int_value(row["doweight_stage1"], "doweight_stage1"),
                     add_shared,
                     mode,
+                    gpu_model.strip().lower(),
                 )
                 key = (shape, _int_value(row["token"], "token"))
                 candidates.setdefault(key, []).append((row, entry))
@@ -393,24 +446,12 @@ def _winner_table() -> dict[ShapeKey, dict[int, PipelineConfig]]:
 def winners_for(shape: ShapeKey) -> dict[int, PipelineConfig]:
     if not is_flydsl_comm_fused_moe_available():
         return {}
-    if shape.cu_num is None:
-        shape = ShapeKey(
-            shape.gfx,
-            shape.model_dim,
-            shape.inter_dim,
-            shape.experts,
-            shape.topk,
-            shape.tp,
-            get_cu_num(),
-            shape.act_type,
-            shape.dtype,
-            shape.q_dtype_a,
-            shape.q_dtype_w,
-            shape.q_type,
-            shape.use_g1u1,
-            shape.doweight_stage1,
-            shape.add_shared,
-            shape.comm,
+    gpu_model = shape.gpu_model.lower() if shape.gpu_model else get_gpu_model()
+    if shape.cu_num is None or shape.gpu_model != gpu_model:
+        shape = replace(
+            shape,
+            cu_num=shape.cu_num if shape.cu_num is not None else get_cu_num(),
+            gpu_model=gpu_model,
         )
     try:
         return _winner_table()[shape]

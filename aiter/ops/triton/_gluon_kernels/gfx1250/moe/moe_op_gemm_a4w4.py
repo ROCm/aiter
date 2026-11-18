@@ -8,9 +8,12 @@ from triton.experimental import gluon
 from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
     _mxfp4_quant_op,
 )
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    pid_grid,
+    remap_xcd,
+)
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 _MOE_GEMM_A4W4_REPR_KEYS = [
     "BLOCK_M",
@@ -46,7 +49,7 @@ def matmul_launch_metadata(grid, kernel, args):
     hist = args["ExptHist"]
     if hist is not None:
         n_rows = int(hist.float().mean())
-        n_tokens = float(hist.sum())
+        n_tokens = int(hist.sum())
         n_w_bytes = (W.numel() * W.element_size() // hist.numel()) * (hist > 0).sum()
     else:
         n_tokens = None

@@ -10,8 +10,18 @@
 #include "aiter_tensor.h"
 
 #include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
 #include <hipblaslt/hipblaslt-ext.hpp>
 #include <hipblaslt/hipblaslt.h>
+
+#if HIPBLASLT_VERSION_MAJOR < 1
+// Compatibility names for internal arguments; older libraries have no scale-mode attributes.
+enum hipblasLtMatmulMatrixScale_t
+{
+    HIPBLASLT_MATMUL_MATRIX_SCALE_SCALAR_32F    = 0,
+    HIPBLASLT_MATMUL_MATRIX_SCALE_OUTER_VEC_32F = 3,
+};
+#endif
 
 #include <algorithm>
 #include <assert.h>
@@ -41,7 +51,9 @@ void hipb_mm(const aiter_tensor_t& mat1,
              std::optional<aiter_tensor_t> scaleB   = std::nullopt,
              std::optional<aiter_tensor_t> scaleOut = std::nullopt,
              std::optional<bool> bpreshuffle        = std::nullopt,
-             std::optional<bool> use_gelu           = std::nullopt);
+             std::optional<bool> use_gelu           = std::nullopt,
+             std::optional<int64_t> scaleA_mode     = std::nullopt,
+             std::optional<int64_t> scaleB_mode     = std::nullopt);
 
 std::vector<int> hipb_findallsols(const aiter_tensor_t& mat1,
                                   const aiter_tensor_t& mat2,
@@ -51,28 +63,32 @@ std::vector<int> hipb_findallsols(const aiter_tensor_t& mat1,
                                   std::optional<aiter_tensor_t> scaleB = std::nullopt,
                                   std::optional<aiter_tensor_t> scaleC = std::nullopt,
                                   bool bpreshuffle                     = false,
-                                  bool use_gelu                        = false);
+                                  bool use_gelu                        = false,
+                                  std::optional<int64_t> scaleA_mode   = std::nullopt,
+                                  std::optional<int64_t> scaleB_mode   = std::nullopt);
 
 std::string getHipblasltKernelName(int solution_index);
 
 int get_algoIdx_hip_tuning_csv(
   const std::string filename, hipblasLtHandle_t handle,
-  const bool bpreshuffle, const bool use_rowwise,
+  const bool bpreshuffle,
   const hipblasOperation_t trans_a, const hipblasOperation_t trans_b,
   const int32_t m, const int32_t n, const int32_t k,
   const hipDataType A_data_type, const int32_t lda, const int64_t stride_a,
   const hipDataType B_data_type, const int32_t ldb, const int64_t stride_b,
   const hipDataType C_data_type, const int32_t ldc, const int64_t stride_c,
-  const hipblasComputeType_t compute_type, const int32_t batch_count);
+  const hipblasComputeType_t compute_type, const int32_t batch_count,
+  hipblasLtMatmulMatrixScale_t scaleA_mode, hipblasLtMatmulMatrixScale_t scaleB_mode);
 
 void append_hip_tuning_csv(
   hipblasLtMatmulAlgo_t& algo, const std::string filename,
-  bool bpreshuffle, bool use_rowwise,
+  bool bpreshuffle,
   hipblasOperation_t trans_a, hipblasOperation_t trans_b,int m, int n, int k,
   hipDataType A_data_type, int32_t lda, int64_t stride_a,
   hipDataType B_data_type, int32_t ldb, int64_t stride_b,
   hipDataType C_data_type, int32_t ldc, int64_t stride_c,
-  hipblasComputeType_t compute_type, int32_t batch_count, bool write_header_if_missing);
+  hipblasComputeType_t compute_type, int32_t batch_count, bool write_header_if_missing,
+  hipblasLtMatmulMatrixScale_t scaleA_mode, hipblasLtMatmulMatrixScale_t scaleB_mode);
 
 hipblasStatus_t hipblasLt_online_tuning(
     hipblasLtHandle_t handle, int m, int n, int k,

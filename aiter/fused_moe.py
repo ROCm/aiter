@@ -2,10 +2,12 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import math
 import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from enum import IntEnum
 
 import torch
 
@@ -22,10 +24,15 @@ from aiter import (
     mxfp4_moe_sort_fwd,
 )
 from aiter import get_hip_quant as get_quant
+from aiter.fhmoe_contract import (
+    FHMOE_BUFFER_MAX_BYTES,
+    fhmoe_reduce_output_nbytes,
+)
 from aiter.fused_moe_registry import (
     BoundFusedMoeImpl,
     FusedMoeImplResolutionError,
     FusedMoeRequest,
+    make_fused_moe_impl_kernel_name,
     resolve_fused_moe_impl,
 )
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
@@ -41,6 +48,8 @@ from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
     GateMode,
+    _flydsl_stage2_fp8_enabled,
+    _mxfp4_intermediate_enabled,
     get_flydsl_activation_name,
 )
 from aiter.ops.flydsl.mxfp4_kname import (
@@ -51,10 +60,26 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
-from aiter.ops.moe_mxfp4_aux import _mxfp4_moe_sort_internal_is_supported
+from aiter.ops.moe_limits import RUNTIME_SILU_LIMIT_QUANT_TYPES, normalize_swiglu_limit
+from aiter.ops.moe_mxfp4_aux import (
+    _MissingMxfp4MoeAuxInstances,
+    _mxfp4_moe_sort_internal_is_supported,
+    is_mxfp4_moe_scatter_supported,
+)
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
+)
+from aiter.plugin import route as _route
+from aiter.presorted_moe import (  # noqa: F401  register_presorted_moe is public
+    aux_sort_capacity,
+    bytes_overlap,
+    drop_presort_after,
+    drop_presort_on_error,
+    match_presorted_moe,
+    pop_presorted_moe,
+    presorted_moe_ignored,
+    register_presorted_moe,
 )
 
 
@@ -66,6 +91,14 @@ def _get_flydsl_moe_kernels():
 
 
 BLOCK_SIZE_M = 32
+_SILU_VALUE = int(ActivationType.Silu)
+
+
+def swiglu_limit_tag(swiglu_limit):
+    """`_tag` value of tuned fmoe rows that were tuned with this swiglu_limit."""
+    swiglu_limit = normalize_swiglu_limit(swiglu_limit)
+    return f"swiglu_limit={float(swiglu_limit):g}" if swiglu_limit else ""
+
 
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") == "1"
@@ -73,6 +106,19 @@ _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") ==
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 
 AUX_SORT_OPUS = "opus"
+
+
+class AsmMoeMode(IntEnum):
+    """ASM manifest modes; integer values are the CSV contract."""
+
+    SORTED = 0
+    NO_SORT = 1
+    EMSORT = 2
+    POST_REDUCE = 3
+
+    @property
+    def requires_host_sort(self) -> bool:
+        return self is AsmMoeMode.SORTED or self is AsmMoeMode.POST_REDUCE
 
 
 def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
@@ -99,23 +145,176 @@ def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
         return True
     if routed_rows is None or num_experts is None:
         return False
-    return routed_rows >= num_experts
+    return 3 * routed_rows >= 4 * num_experts  # crossover ~1.3 rows per expert
 
 
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
+# (num_experts, topk) pairs the HIP kernel is instantiated for; must stay in
+# sync with AITER_MXFP4_SORT_QUANT_ROUTES in moe_sorting_opus_kernels.cu.
+_FUSED_DECODE_SORT_QUANT_ROUTES = {(512, 10), (513, 11)}
+_FUSED_DECODE_SORT_QUANT_MAX_M = 128
+
+# Internal benchmark/test hook (not a public switch): set True to force the
+# generic sort+quant path so base-vs-head latency can be measured from one
+# build. Production leaves this False and selects the fused kernel purely from
+# the hardware/shape/dtype/route gate below.
+_fused_decode_sort_quant_disabled = False
+
+
+def _is_fused_decode_sort_quant_enabled(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    global_experts: int,
+    block_m: int,
+    quant_type: QuantType,
+    q_dtype_a: torch.dtype,
+    q_dtype_w: torch.dtype,
+    activation: ActivationType,
+    is_g1u1: bool,
+    expert_mask: torch.Tensor | None,
+    need_local_topk_ids: bool,
+    run_1stage: bool,
+    stage1_is_flydsl: bool,
+    hidden_pad: int,
+    ksplit: int,
+) -> bool:
+    """Gate the direct-scale HIP route-sort/quant kernel to supported decode.
+
+    The shape bounds mirror the kernel's own contract (``model_dim=4096``,
+    ``block_m=32``, ``M`` in ``[1, 128]``, an instantiated ``(E, topk)``
+    route). The remaining conditions are integration requirements: they
+    describe the stage-1 path whose activation quantization this kernel
+    replaces. The fused path is selected automatically whenever every
+    condition matches; it falls back to the generic sort + quant otherwise.
+    """
+    if _fused_decode_sort_quant_disabled:
+        return False
+    try:
+        runtime_is_gfx950 = get_gfx_runtime() == "gfx950"
+    except (KeyError, OSError, RuntimeError):
+        return False
+    tokens = hidden_states.shape[0] if hidden_states.ndim == 2 else 0
+    topk = topk_ids.shape[1] if topk_ids.ndim == 2 else 0
+    return (
+        runtime_is_gfx950
+        and hidden_states.dtype == dtypes.bf16
+        and 1 <= tokens <= _FUSED_DECODE_SORT_QUANT_MAX_M
+        and hidden_states.shape[1] == 4096
+        and hidden_states.is_contiguous()
+        and topk_ids.dtype == dtypes.i32
+        and (global_experts, topk) in _FUSED_DECODE_SORT_QUANT_ROUTES
+        and topk_ids.shape[0] == tokens
+        and topk_ids.is_contiguous()
+        and topk_weights.dtype == dtypes.fp32
+        and topk_weights.is_contiguous()
+        and block_m == 32
+        and quant_type == QuantType.per_1x32
+        and q_dtype_a == dtypes.fp4x2
+        and q_dtype_w == dtypes.fp4x2
+        and activation == ActivationType.Silu
+        and is_g1u1
+        and expert_mask is None
+        and not need_local_topk_ids
+        and not run_1stage
+        and stage1_is_flydsl
+        and hidden_pad == 0
+        # ksplit > 1 makes fused_moe_2stages hand stage 1 unquantized BF16
+        # activations (the kernel quantizes inline), so prequantizing here
+        # would feed the wrong dtype.
+        and ksplit <= 1
+    )
+
+
+def _fused_decode_sort_quant(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    model_dim: int,
+    global_experts: int,
+    block_m: int,
+    moebuf_dtype: torch.dtype,
+    accumulate: bool,
+    compact_scale: bool = False,
+    num_local_tokens: torch.Tensor | None = None,
+):
+    """Return standard sorted metadata plus the pre-quantized stage-1 input."""
+    device = hidden_states.device
+    tokens = hidden_states.shape[0]
+    route_count = topk_ids.numel()
+    active_experts = min(global_experts, route_count)
+    max_sorted = (
+        (route_count + active_experts * (block_m - 1) + block_m - 1)
+        // block_m
+        * block_m
+    )
+    max_blocks = (max_sorted + block_m - 1) // block_m
+    sorted_ids = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
+    sorted_expert_ids = torch.empty(max_blocks, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    moe_buf = (
+        torch.empty((tokens, model_dim), dtype=moebuf_dtype, device=device)
+        if accumulate
+        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    )
+    activation_quant = torch.empty(
+        (tokens, model_dim // 2), dtype=dtypes.fp4x2, device=device
+    )
+    activation_scale_token = torch.empty(
+        (tokens, model_dim // 32), dtype=dtypes.fp8_e8m0, device=device
+    )
+    aiter.mxfp4_moe_sort_quant_fwd(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        activation_quant,
+        activation_scale_token,
+        global_experts,
+        num_local_tokens,
+    )
+    activation_scale = activation_scale_token
+    if not compact_scale:
+        activation_scale = mxfp4_moe_sort_fwd(
+            activation_scale_token,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=tokens,
+            cols=model_dim,
+        )
+    return (
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        activation_quant,
+        activation_scale,
+    )
+
 
 # Optional hook for collecting per-stage benchmark callables.
 kernel_bench_callable = None
 
 
-# FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
-# topk_weights through the sorted_* kernarg slots and accumulate via
-# global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
+# FLAT 1stage asm kernels ingest raw topk_ids / topk_weights through the
+# sorted_* kernarg slots and accumulate via global_atomic_pk_add_bf16, so
+# moe_sorting is a pass-through for them. The manifest value is flat=1
+# (one token per TG) or flat=2 (EMSORT); either nonzero value takes this path.
 
 
-def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype):
+def _moe_prepare_unsorted_input(
+    topk_ids, topk_weights, model_dim, moebuf_dtype, num_local_tokens=None
+):
     device = topk_ids.device
     M = topk_ids.shape[0]
     # FLAT kernels zero their own output rows on-device and need an
@@ -139,9 +338,31 @@ def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype)
         if topk_weights.dtype == dtypes.fp32 and topk_weights.is_contiguous()
         else topk_weights.to(dtypes.fp32).contiguous()
     )
-    # sorted_expert_ids / num_valid_ids slots are unread by FLAT kernels,
-    # but must be valid device pointers -- alias topk_ids as scratch.
-    return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
+    # sorted_expert_ids is unread; alias topk_ids so the pointer is valid.
+    # XC is one dword. A CUDA num_local_tokens is that storage. Otherwise the
+    # pointer is null (no allocation, no store) and the kernel keeps kernarg
+    # token_cnt, which is M.
+    if isinstance(num_local_tokens, torch.Tensor) and num_local_tokens.is_cuda:
+        num_valid_ids = num_local_tokens
+    else:
+        num_valid_ids = torch.empty(0, dtype=dtypes.i32, device=device)
+    return topk_ids_i32, topk_weights_f32, topk_ids_i32, num_valid_ids, moe_buf
+
+
+def _adaptive_output_usable(output, M, model_dim, dtype, device):
+    """Whether a caller ``output`` can be the adaptive sort's atomic moe_buf.
+
+    The BM16 sort zeroes moe_buf with 4-byte stores, so the buffer has to be
+    4-byte aligned on top of matching what fused_moe would have allocated.
+    """
+    return (
+        output is not None
+        and tuple(output.shape) == (M, model_dim)
+        and output.dtype == dtype
+        and output.device == device
+        and output.is_contiguous()
+        and output.data_ptr() % 4 == 0
+    )
 
 
 def _adaptive_moe_sort(
@@ -156,12 +377,13 @@ def _adaptive_moe_sort(
     emit_aux=False,
     skip_quant=False,
     moebuf_dtype=dtypes.bf16,
+    num_local_tokens=None,
+    output=None,
 ):
     device = topk_ids.device
     M = topk_ids.shape[0]
     BM = block_size
-    active = min(num_experts, M * topk)
-    max_sorted = (((M * topk + active * (BM - 1)) + BM - 1) // BM) * BM
+    max_sorted = aux_sort_capacity(M, topk, num_experts, BM)
 
     sorted_token_ids = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
     sorted_expert_ids = torch.empty(max_sorted // BM, dtype=dtypes.i32, device=device)
@@ -169,11 +391,15 @@ def _adaptive_moe_sort(
     sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
     reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
     m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
-    moe_buf = (
-        torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-        if atomic
-        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
-    )
+    if atomic and _adaptive_output_usable(output, M, model_dim, moebuf_dtype, device):
+        # The sort kernel zeroes (BM16) or we zero below (other BM) whatever buffer
+        # it is handed, so a caller output can stand in for moe_buf: stage2
+        # accumulates straight into it and _return_output skips the copy.
+        moe_buf = output
+    elif atomic:
+        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    else:
+        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
     # BM16 sort fuses output zeroing; three-stage sort only sorts.
     # Atomic GEMM2 needs a zeroed destination on every invocation.
     if atomic and BM != 16:
@@ -210,6 +436,7 @@ def _adaptive_moe_sort(
         D_INTER=1,  # (void)D_INTER in the sort path; unused
         MB=BM,
         prologue=0 if BM == 16 or skip_quant else 1,
+        num_local_tokens=num_local_tokens,
     )
     std = (sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
     if emit_aux:
@@ -223,7 +450,8 @@ def _adaptive_moe_sort(
 #     opus / ck / flydsl sort + accumulate      yes        sort kernel zeroes what it is handed
 #     ... + reduce mode (non-EP)                yes        buffer is born in fused_moe_2stages
 #     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
-#     adaptive-aux sort (a4w4, atomic)          no         parameter not threaded yet
+#     adaptive-aux sort (a4w4, atomic)          yes        if 4-byte aligned (BM16 zeroes in 4B)
+#     caller presort (register_presorted_moe)   yes        zeroed here unless caller did
 #     grouped a4w4/a8w4 (gfx1250)               no         callee has no out param
 #
 # Not in-place => _return_output copies, so the contract holds either way;
@@ -249,10 +477,7 @@ def _validate_output_buffer_no_overlap(output, hidden_states):
     if output is None:
         return
     # Accumulate mode zeroes the output rows before stage1 reads hidden_states.
-    if (
-        output.data_ptr() < hidden_states.data_ptr() + hidden_states.nbytes
-        and hidden_states.data_ptr() < output.data_ptr() + output.nbytes
-    ):
+    if bytes_overlap(output, hidden_states):
         raise RuntimeError(
             "output overlaps hidden_states, which moe_sorting zeroes before stage1 "
             "reads it"
@@ -269,6 +494,20 @@ def _return_output(ret, output):
 def _padded_scale_cols(size, group_size=32):
     """Scale columns per row, padded the way ``e8m0_shuffle`` pads them."""
     return (((size + group_size - 1) // group_size + 7) // 8) * 8
+
+
+def _is_row_major_2d(tensor):
+    return (
+        tensor.ndim == 2
+        and tensor.stride(1) == 1
+        and (
+            tensor.shape[0] == 1
+            or (
+                tensor.stride(0) >= tensor.shape[1]
+                and tensor.stride(0) * tensor.element_size() % 16 == 0
+            )
+        )
+    )
 
 
 def _is_inline_sort_kname(kernel1):
@@ -333,7 +572,6 @@ def _mxfp4_inline_sort_unsupported(
     topk_ids,
     *,
     gate_mode,
-    num_local_tokens,
     expert_mask,
     bias1,
     bias2,
@@ -368,7 +606,6 @@ def _mxfp4_inline_sort_unsupported(
     if bias2 is not None and not metadata.stage2_has_bias:
         return "stage2 kernel does not support bias2"
     for name, value in (
-        ("num_local_tokens", num_local_tokens),
         ("expert_mask", expert_mask),
         ("a1_scale", a1_scale),
         ("a2_scale", a2_scale),
@@ -391,10 +628,12 @@ def _mxfp4_inline_sort_unsupported(
     ):
         return "MXFP4 weight scales are smaller than the padded stride"
 
-    tensors = (hidden_states, w1, w2, topk_ids, w1_scale, w2_scale)
-    if not all(tensor.is_contiguous() for tensor in tensors):
+    tensors = (w1, w2, topk_ids, w1_scale, w2_scale)
+    if not _is_row_major_2d(hidden_states) or not all(
+        tensor.is_contiguous() for tensor in tensors
+    ):
         return "non-contiguous tensors"
-    if len({tensor.device for tensor in tensors}) != 1:
+    if len({tensor.device for tensor in (hidden_states, *tensors)}) != 1:
         return "cross-device tensors"
 
     p2 = parse_flydsl_v2_gemm2_kernel(metadata.stage2.keywords["kernelName2"])
@@ -432,12 +671,18 @@ def _moe_sorting_impl(
         output_aux
         and expert_mask is None
         and not _aux_uses_opus(output_aux, block_size, M * topk, num_experts)
+        and _mxfp4_aux_instance_supported(
+            num_experts, topk, model_dim, block_size, accumulate
+        )
         and _MOE_SORT_BACKEND not in ("opus", "ck")
+        # only the BM16 (prologue 0) sort reads num_local_tokens
+        and (num_local_tokens is None or block_size == 16)
     ):
         # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
         # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
         # It has no expert_mask support, so EP always takes the Opus aux sort.
-        # `output` not threaded here: this buffer also feeds stage1 as moe_buf.
+        # A suitable caller `output` becomes moe_buf (stage2 accumulates in place);
+        # otherwise the sort allocates its own and _return_output copies.
         return _adaptive_moe_sort(
             topk_ids,
             topk_weights,
@@ -448,6 +693,8 @@ def _moe_sorting_impl(
             atomic=accumulate,
             emit_aux=True,
             moebuf_dtype=moebuf_dtype,
+            num_local_tokens=num_local_tokens,
+            output=output,
         )
 
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
@@ -489,14 +736,7 @@ def _moe_sorting_impl(
         aux_m_indices = torch.empty(
             max_num_tokens_padded, dtype=dtypes.i32, device=device
         )
-        # The sort writes local routes only; EP leaves remote routes at -1,
-        # which the scatter reduce skips.
-        if expert_mask is not None:
-            aux_reverse_sorted = torch.full(
-                (M * topk,), -1, dtype=dtypes.i32, device=device
-            )
-        else:
-            aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
+        aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
 
     if use_opus:
         ws_size = aiter.moe_sorting_opus_get_workspace_size(
@@ -559,13 +799,16 @@ def _flydsl_moe_sorting(
     num_local_tokens,
     accumulate=True,
     output=None,
+    herd_topk=0,
+    herd_routed_scaling_factor=1.0,
 ):
     """FlyDSL sorting dispatch -- called outside torch_compile_guard."""
     from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_fwd
 
     device = topk_ids.device
     M, topk = topk_ids.shape
-    max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
+    topk = herd_topk or topk
+    max_num_tokens_padded = int(M * topk + num_experts * block_size - topk)
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
     max_num_tokens_padded = max_num_m_blocks * block_size
     sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
@@ -589,6 +832,23 @@ def _flydsl_moe_sorting(
     else:
         moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
 
+    ret = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
+    if herd_topk:
+        from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_herd
+
+        kept_ids, kept_weights = flydsl_moe_sorting_herd(
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            num_experts,
+            int(block_size),
+            herd_routed_scaling_factor,
+        )
+        return (*ret, kept_ids, kept_weights)
     flydsl_moe_sorting_fwd(
         topk_ids,
         topk_weights,
@@ -602,7 +862,7 @@ def _flydsl_moe_sorting(
         expert_mask,
         num_local_tokens,
     )
-    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+    return ret
 
 
 def moe_sorting(
@@ -617,15 +877,16 @@ def moe_sorting(
     dispatch_policy=0,
     return_local_topk_ids=False,
     accumulate=True,
-    flat=False,
+    flat: AsmMoeMode | int = AsmMoeMode.SORTED,
     output_aux=False,
     output=None,
 ):
+    asm_mode = AsmMoeMode(flat)
     if (
         not _USE_CK_MOE_SORTING
         and _USE_FLYDSL_MOE_SORTING
         and not return_local_topk_ids
-        and not flat
+        and asm_mode.requires_host_sort
         and not output_aux
         and dispatch_policy == 0
     ):
@@ -641,12 +902,16 @@ def moe_sorting(
             accumulate=accumulate,
             output=output,
         )
-    # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
+    # FLAT kernel: in-kernel routing (manifest flat=1 or flat=2); pass through unsorted topk.
     # `output` cannot be written in place: FLAT needs extra bytes appended to moe_buf.
-    if flat:
+    if not asm_mode.requires_host_sort:
         assert output is None, "FLAT over-allocates moe_buf; the caller copies"
         return _moe_prepare_unsorted_input(
-            topk_ids, topk_weights, model_dim, moebuf_dtype
+            topk_ids,
+            topk_weights,
+            model_dim,
+            moebuf_dtype,
+            num_local_tokens,
         )
     try:
         return _moe_sorting_impl(
@@ -691,20 +956,42 @@ def get_topk_valid_mask(
     return expert_mask[topk_ids]
 
 
+def _is_flydsl_stage2(stage2: Callable) -> bool:
+    func = getattr(stage2, "func", stage2)
+    return func is _flydsl_stage2_wrapper or getattr(func, "_is_flydsl_stage2", False)
+
+
+def _stage2_honors_runtime_reduce_override(stage2: Callable) -> bool:
+    """Return whether stage2 reaches common runtime reduce resolution."""
+    if not _is_flydsl_stage2(stage2):
+        return False
+    kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
+    parsed = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernel_name)
+    if parsed is None:
+        raise ValueError(
+            "Runtime reduce overrides require a recognized FlyDSL stage2 "
+            f"kernel, got {kernel_name!r}"
+        )
+    # The a16w-mix launcher returns before the environment override.
+    # MXFP4 and INT4 follow only their configured kernel mode. BF16 has no
+    # reduce epilogue and stays atomic, so AITER_FLYDSL_FORCE_REDUCE must
+    # not skip the output zero-init (the atomic would add into stale memory).
+    return not (
+        parsed.get("a_dtype") == "bf16"
+        and parsed.get("b_dtype") in ("fp4", "int4", "bf16")
+    )
+
+
 def stage2_uses_route_reduce(stage2: Callable) -> bool:
     """Return True when stage2 writes per-slot route output then reduces it."""
     func = getattr(stage2, "func", stage2)
     kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
-    if func is _flydsl_stage2_wrapper or getattr(func, "_is_flydsl_stage2", False):
+    if _is_flydsl_stage2(func):
         parsed = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernel_name)
         if parsed is None:
             return False
-        # a16w4 (bf16 A x mxfp4 W) down-proj only supports atomic scatter into a
-        # pre-zeroed buffer; the ported gemm2 launcher ignores the kernelName's
-        # mode, so a "reduce"-named a16w4 config must still get accumulate=True
-        # sorting (moe_buf zeroed). Treat any a16w4 stage2 as atomic here.
-        if parsed.get("a_dtype") == "bf16" and parsed.get("b_dtype") == "fp4":
-            return False
+        # The a16w-mix launcher honors explicit atomic/reduce table modes for
+        # both MXFP4 and INT4; sorting must allocate the matching output layout.
         return parsed.get("mode", "atomic") == "reduce"
     if func is _opus_a8w4.opus_a8w4_stage2_wrapper:
         return _opus_a8w4.stage2_uses_route_reduce(stage2)
@@ -712,6 +999,95 @@ def stage2_uses_route_reduce(stage2: Callable) -> bool:
         cfg = parse_flydsl_v2_gemm2_kernel(kernel_name)
         return cfg is not None and cfg.get("epilog") == "reduce"
     return False
+
+
+def _stage2_runtime_uses_route_reduce(
+    stage2: Callable,
+    token_num: int,
+    model_dim: int,
+    *,
+    force_reduce: bool | None = None,
+    stage2_fp8: bool | None = None,
+) -> bool:
+    """Return the effective route-output mode used by stage2 at runtime."""
+    if stage2_uses_route_reduce(stage2):
+        return True
+    if not _stage2_honors_runtime_reduce_override(stage2):
+        return False
+    kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
+    parsed = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernel_name)
+    assert parsed is not None
+    mode = _get_flydsl_moe_kernels().resolve_flydsl_stage2_mode(
+        parsed.get("mode", "atomic"),
+        token_num,
+        model_dim,
+        2,
+        parsed.get("b_dtype", ""),
+        False,
+        force_reduce=force_reduce,
+        stage2_fp8=stage2_fp8,
+    )
+    return mode == "reduce"
+
+
+def _stage2_uses_fp8_route_output(
+    stage2: Callable,
+    *,
+    stage2_fp8: bool | None = None,
+    return_per_slot: bool = False,
+) -> bool:
+    """Return whether runtime reduce output uses packed FP8 value/scale rows."""
+    if stage2_fp8 is None:
+        stage2_fp8 = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+    if not stage2_fp8 or return_per_slot:
+        return False
+    if not _stage2_honors_runtime_reduce_override(stage2):
+        return False
+    kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
+    parsed = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernel_name)
+    assert parsed is not None
+    return parsed.get("b_dtype") in ("fp4", "fp8")
+
+
+def _flydsl_route_output_nbytes(
+    stage2: Callable,
+    token_num: int,
+    topk: int,
+    model_dim: int,
+    output_element_size: int,
+    *,
+    stage2_fp8: bool | None = None,
+    return_per_slot: bool = False,
+) -> int:
+    """Return bytes allocated by the effective common stage2 reduce output."""
+    if _stage2_uses_fp8_route_output(
+        stage2,
+        stage2_fp8=stage2_fp8,
+        return_per_slot=return_per_slot,
+    ):
+        from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
+
+        kernels = _get_flydsl_moe_kernels()
+        row_bytes = fp8out_row_bytes(
+            model_dim,
+            scale_blk=kernels._S2_LEGACY_FP8_SCALE_BLK,
+            pitch_align=kernels._S2_LEGACY_FP8_PITCH_ALIGN,
+        )
+        return int(token_num) * int(topk) * int(row_bytes)
+    return fhmoe_reduce_output_nbytes(
+        token_num,
+        topk,
+        model_dim,
+        output_element_size,
+    )
+
+
+def _validate_flydsl_route_output_nbytes(route_output_nbytes: int) -> None:
+    if route_output_nbytes > FHMOE_BUFFER_MAX_BYTES:
+        raise NotImplementedError(
+            "FlyDSL stage2 reduce output exceeds the current 32-bit "
+            f"buffer-addressing limit: {route_output_nbytes} bytes"
+        )
 
 
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
@@ -744,6 +1120,7 @@ def resolve_activation_dtype(
     hidden_dtype: torch.dtype | None = None,
     has_a1_scale: bool = False,
     gfx: str | None = None,
+    gate_up_interleave: bool | None = None,
 ) -> torch.dtype | None:
     """The activation dtype fused_moe() quantizes its input to.
 
@@ -763,7 +1140,7 @@ def resolve_activation_dtype(
     quant_type = quant_remap.get(quant_type, quant_type)
     activation = ActivationType(activation)
     gate_mode = GateMode(gate_mode)
-    gfx = get_gfx() if gfx is None else gfx
+    gfx = get_gfx_runtime() if gfx is None else gfx
 
     q_dtype_a = q_dtype_w if q_dtype_w != torch.uint32 else dtypes.fp8
     # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
@@ -799,15 +1176,17 @@ def resolve_activation_dtype(
             q_dtype_a = _bound_split(
                 M, _SWIGLU_MXFP4_BF16_BOUND, dtypes.bf16, dtypes.fp4x2
             )
+        elif activation == ActivationType.Relu2:
+            q_dtype_a = dtypes.bf16
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
-            if gfx != "gfx950":
+            if gfx != "gfx950" or gate_up_interleave is False:
                 q_dtype_a = dtypes.bf16
             else:
                 q_dtype_a = _bound_split(M, bf16_fp8_bound, dtypes.bf16, dtypes.fp8)
         else:
             q_dtype_a = dtypes.fp4x2
 
-    if gfx == "gfx1250":
+    if gfx in ("gfx1250", "gfx1250-strict"):
         if os.environ.get("AITER_FORCE_A8W4", "0") in ("1"):
             q_dtype_a = dtypes.fp8
         else:
@@ -816,6 +1195,7 @@ def resolve_activation_dtype(
     return q_dtype_a
 
 
+@drop_presort_after
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -859,14 +1239,88 @@ def fused_moe(
     quant_type_a: QuantType | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    # False explicitly selects unclamped shared-expert SiLU semantics.
+    clamp_shared: bool = True,
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
+    deterministic: bool = False,
 ):
-    if (
+    """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
+
+    ``deterministic=True`` gives bitwise the same output for a token whatever the
+    batch, and from run to run: the FlyDSL kernels with one K structure for
+    every token count, no split-K, and the non-atomic reduce epilogue in stage 2
+    (the top-k partials are summed in a fixed order). It changes only the order
+    of the sums. Because the default picks the activation dtype by token count,
+    which would make a token's result depend on its batch, the caller chooses
+    one activation dtype with ``quant_dtype_a``, which is required with
+    ``deterministic=True``: today ``dtypes.fp8`` (MXFP8, the precision the
+    default uses from 256 tokens). It is supported on gfx950 for MXFP4 weights
+    (``QuantType.per_1x32``, preshuffled gate/up-interleaved) with SwiGLU or SiLU, bf16
+    output, without expert parallelism.
+
+    Supplying any shared tensor (or ``shared_expert_id``) requires all four
+    shared weight/scale tensors and dispatches through the gfx950 FHMoE path.
+    Inputs must satisfy the contracts documented in :mod:`aiter.fhmoe`.
+
+    ``clamp_shared`` is an FHMoE model-semantic input. The default ``True``
+    applies the configured SiLU clamp to routed and shared experts. ``False``
+    changes only the shared expert to unclamped SiLU; routed experts still use
+    ``swiglu_limit``. Clamped and unclamped stage-1 kernels have distinct AOT
+    cache identities, so deployments changing this setting must rebuild their
+    FlyDSL AOT cache.
+
+    """
+    has_shared_expert = (
         any(
             tensor is not None
             for tensor in (shared_w1, shared_w2, shared_w1_scale, shared_w2_scale)
         )
         or shared_expert_id != -1
-    ):
+    )
+    if not clamp_shared and not has_shared_expert:
+        raise ValueError("clamp_shared=False requires FHMoE shared-expert dispatch")
+    if has_shared_expert:
+        if herd_topk:
+            raise ValueError("herd_topk does not support fused shared experts")
+        if deterministic:
+            raise NotImplementedError(
+                "fused_moe(deterministic=True) does not support shared experts"
+            )
+        routed_mxfp8 = w1 is not None and w1.dtype == dtypes.fp8
+        unsupported = []
+        if stage2_scatter is not None:
+            unsupported.append("stage2_scatter")
+        if quant_type_a is not None:
+            unsupported.append("quant_type_a")
+        fhmoe_quant_dtype_a = (
+            dtypes.fp8 if GateMode(gate_mode) == GateMode.INTERLEAVE else dtypes.fp4x2
+        )
+        if quant_dtype_a is not None and quant_dtype_a != fhmoe_quant_dtype_a:
+            unsupported.append("quant_dtype_a")
+        if quant_dtype_a2 is not None:
+            unsupported.append("quant_dtype_a2")
+        # The MXFP8 path does not consume caller-prequantized activations and
+        # requires an explicit preshuffle marker. Preserve the existing DSV4
+        # MXFP4 path, which accepts activation scales and trusts its layout.
+        if routed_mxfp8 and a1_scale is not None:
+            unsupported.append("a1_scale")
+        if routed_mxfp8 and a2_scale is not None:
+            unsupported.append("a2_scale")
+        if unsupported:
+            raise NotImplementedError(
+                "FHMoE shared-expert dispatch does not support "
+                + ", ".join(unsupported)
+            )
+        weights = (w1, w2, shared_w1, shared_w2)
+        if routed_mxfp8 and any(
+            weight is not None and not getattr(weight, "is_shuffled", False)
+            for weight in weights
+        ):
+            raise ValueError(
+                "FHMoE weights must be AITER-preshuffled and marked "
+                "is_shuffled=True; re-run the shuffle after tensor copies"
+            )
         from aiter.fhmoe import _fhmoe
 
         return _fhmoe(
@@ -898,6 +1352,7 @@ def fused_moe(
             shared_w1_scale=shared_w1_scale,
             shared_w2_scale=shared_w2_scale,
             shared_expert_id=shared_expert_id,
+            clamp_shared=clamp_shared,
             output=output,
         )
     if not block_size_M:
@@ -926,6 +1381,7 @@ def fused_moe(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
+        splitk=splitk,
         swiglu_limit=swiglu_limit,
         beta=beta,
         linear_beta=linear_beta,
@@ -949,6 +1405,9 @@ def fused_moe(
         quant_type_a=None if quant_type_a is None else quant_type_a.value,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        herd_topk=herd_topk,
+        herd_routed_scaling_factor=herd_routed_scaling_factor,
+        deterministic=deterministic,
     )
 
 
@@ -976,6 +1435,7 @@ def fused_moe_fake(
     intermediate_pad: int = 0,
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
+    splitk: int = 0,
     swiglu_limit: float | None = None,
     beta: float | None = None,
     linear_beta: float | None = None,
@@ -991,6 +1451,9 @@ def fused_moe_fake(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
+    deterministic: bool = False,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1012,7 +1475,152 @@ def fused_moe_fake(
     return torch.empty((M, model_dim), dtype=dtype, device=device)
 
 
+def fused_moe_g1u1_bf16_small_m_direct(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    M = hidden_states.shape[0]
+    topk = topk_ids.shape[1]
+    model_dim = w2.shape[1]
+    inter_dim = w2.shape[2]
+    if output is None:
+        output = torch.empty((M, model_dim), dtype=dtype, device=hidden_states.device)
+    act_workspace = torch.empty(
+        (M * topk, inter_dim), dtype=dtype, device=hidden_states.device
+    )
+    aiter.fmoe_g1u1_bf16_small_m(
+        output,
+        hidden_states.contiguous(),
+        w1.contiguous(),
+        w2.contiguous(),
+        topk_ids.contiguous(),
+        topk_weight.contiguous(),
+        act_workspace,
+        topk,
+        bool(getattr(w1, "is_shuffled", False)),
+        bool(getattr(w2, "is_shuffled", False)),
+    )
+    return output
+
+
+_BF16_G1U1_SMALL_M_DIRECT_SHUFFLE_LAYOUT = (16, 16)
+_BF16_G1U1_SMALL_M_DIRECT_ALLOWED_M = (1, 2, 3, 4, 8, 16)
+_BF16_G1U1_SMALL_M_DIRECT_MODEL_DIM = 2048
+_BF16_G1U1_SMALL_M_DIRECT_INTER_DIMS = (128, 256)
+_BF16_G1U1_SMALL_M_DIRECT_EXPERTS = 256
+_BF16_G1U1_SMALL_M_DIRECT_TOPK = 8
+
+
+def _supports_bf16_g1u1_small_m_direct_shuffle(weight: torch.Tensor) -> bool:
+    if not getattr(weight, "is_shuffled", False):
+        return True
+    return (
+        getattr(weight, "aiter_shuffle_layout", None)
+        == _BF16_G1U1_SMALL_M_DIRECT_SHUFFLE_LAYOUT
+        and not getattr(weight, "gate_up_interleave", False)
+        and not getattr(weight, "aiter_shuffle_is_guinterleave", False)
+    )
+
+
+def _can_use_bf16_g1u1_small_m_direct(
+    *,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: ActivationType,
+    quant_type: QuantType,
+    dtype: torch.dtype,
+    doweight_stage1: bool,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    a1_scale: torch.Tensor | None,
+    a2_scale: torch.Tensor | None,
+    num_local_tokens: torch.Tensor | None,
+    moe_sorting_dispatch_policy: int,
+    expert_mask: torch.Tensor | None,
+    hidden_pad: int,
+    intermediate_pad: int,
+    bias1: torch.Tensor | None,
+    bias2: torch.Tensor | None,
+    splitk: int = 0,
+    swiglu_limit: float | None = None,
+    beta: float | None = None,
+    linear_beta: float | None = None,
+    gate_mode: str | GateMode | None = GateMode.SEPARATED.value,
+    stage2_scatter: Stage2ScatterContext | None = None,
+) -> bool:
+    M = topk_ids.shape[0]
+    topk = topk_ids.shape[1]
+    inter_dim = w2.shape[2]
+    return (
+        get_gfx_runtime() == "gfx1201"
+        and quant_type == QuantType.No
+        and activation == ActivationType.Silu
+        and dtype == dtypes.bf16
+        and M in _BF16_G1U1_SMALL_M_DIRECT_ALLOWED_M
+        and topk == _BF16_G1U1_SMALL_M_DIRECT_TOPK
+        and inter_dim in _BF16_G1U1_SMALL_M_DIRECT_INTER_DIMS
+        and hidden_states.shape == (M, _BF16_G1U1_SMALL_M_DIRECT_MODEL_DIM)
+        and w1.shape
+        == (
+            _BF16_G1U1_SMALL_M_DIRECT_EXPERTS,
+            2 * inter_dim,
+            _BF16_G1U1_SMALL_M_DIRECT_MODEL_DIM,
+        )
+        and w2.shape
+        == (
+            _BF16_G1U1_SMALL_M_DIRECT_EXPERTS,
+            _BF16_G1U1_SMALL_M_DIRECT_MODEL_DIM,
+            inter_dim,
+        )
+        and topk_weight.shape == topk_ids.shape
+        and hidden_states.is_cuda
+        and w1.is_cuda
+        and w2.is_cuda
+        and topk_ids.is_cuda
+        and topk_weight.is_cuda
+        and w1.device == hidden_states.device
+        and w2.device == hidden_states.device
+        and topk_ids.device == hidden_states.device
+        and topk_weight.device == hidden_states.device
+        and hidden_states.dtype == dtypes.bf16
+        and w1.dtype == dtypes.bf16
+        and w2.dtype == dtypes.bf16
+        and topk_ids.dtype == dtypes.i32
+        and topk_weight.dtype == dtypes.fp32
+        and expert_mask is None
+        and stage2_scatter is None
+        and not doweight_stage1
+        and w1_scale is None
+        and w2_scale is None
+        and a1_scale is None
+        and a2_scale is None
+        and num_local_tokens is None
+        and moe_sorting_dispatch_policy == 0
+        and hidden_pad == 0
+        and intermediate_pad == 0
+        and bias1 is None
+        and bias2 is None
+        and splitk in (0, 1)
+        and swiglu_limit is None
+        and beta is None
+        and linear_beta is None
+        and gate_mode in (None, GateMode.SEPARATED, GateMode.SEPARATED.value)
+        and _supports_bf16_g1u1_small_m_direct_shuffle(w1)
+        and _supports_bf16_g1u1_small_m_direct_shuffle(w2)
+    )
+
+
 @torch_compile_guard(gen_fake=fused_moe_fake)
+@_route(op="fused_moe", version=1)
 def fused_moe_(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -1037,6 +1645,7 @@ def fused_moe_(
     intermediate_pad: int = 0,
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
+    splitk: int = 0,
     swiglu_limit: float | None = None,
     beta: float | None = None,
     linear_beta: float | None = None,
@@ -1052,7 +1661,63 @@ def fused_moe_(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
+    deterministic: bool = False,
 ) -> torch.Tensor:
+    """Route each token to its top-k experts, run both expert projections and
+    combine them, weighted by ``topk_weight``.
+
+    Returns a new ``[M, model_dim]`` tensor of ``dtype`` (``hidden_states``'
+    dtype when None), ``M = topk_ids.shape[0]``, ``model_dim = w2.shape[1]``.
+    Given ``output`` -- contiguous, of exactly that shape, dtype and device, not
+    overlapping ``hidden_states`` -- the result is written into it and
+    ``output`` itself is returned. Nothing else is written through the
+    arguments, except under the stage-2 scatter below.
+
+    This is the layer beneath the public ``fused_moe``, whose signature stays
+    as callers know it. That function sends a call with shared experts (any
+    ``shared_*``) to FHMoE without coming here, turns ``block_size_M=None``
+    into -1 and unpacks ``stage2_scatter`` into the ``ep_*`` fields. What
+    arrives here, for a provider:
+
+    * ``activation`` and ``quant_type`` are ints, the ``.value`` of
+      ``ActivationType`` and ``QuantType``; so is ``quant_type_a`` when given.
+    * ``block_size_M=-1`` leaves the tile to AITER; any other value pins it.
+      ``moe_sorting_dispatch_policy`` only schedules AITER's own sort.
+    * ``ep_source_token_map`` set is expert parallelism's stage-2 scatter,
+      described by the other ``ep_*`` fields (all 0 without it): GEMM2
+      P2P-writes the route-weighted rows into the peers' combine buffers, and
+      the returned tensor is an uninitialised placeholder that does not hold
+      the result. ``output`` is refused with it. A provider that does not do
+      that write must decline these calls.
+    * The activation dtype is not in the signature. AITER chooses it from the
+      weights, ``activation``, ``gate_mode`` and the token count M, and the
+      environment moves it: ``AITER_SITUV2_A8W4`` / ``AITER_SITUV2_A4W4``
+      (fp8 / fp4 SiTUv2 activations, bf16 otherwise),
+      ``AITER_BF16_FP8_MOE_BOUND`` (bf16 below that many tokens, fp8 from it)
+      and ``GPTOSS_SWIGLU_MXFP4_BF16_BOUND`` (bf16 below, fp4 from it).
+      ``resolve_activation_dtype`` answers it as this op does, and
+      ``quant_dtype_a`` overrides it.
+    * ``splitk`` is the caller's split-K request; 0 and 1 are no split. AITER
+      reads it here only to keep its gfx1201 small-M kernel off split calls,
+      and it moves no more than the order of the K sums, so a provider may
+      ignore it.
+    * ``swiglu_limit`` of None, 0 (vLLM's spelling) or inf is no clamp for
+      SiLU.
+    * ``deterministic=True`` asks for a result bitwise independent of the
+      batch and of the run (see the public ``fused_moe``). A provider whose
+      reduction order is not fixed must decline it.
+    * ``herd_topk`` (gfx1250) says ``topk_ids`` and ``topk_weight`` hold K+1
+      HERD candidates per token, scaled by ``herd_routed_scaling_factor``;
+      with ``herd_topk=0`` that factor is unused.
+
+    A caller may hand the next call on its thread a precomputed sort with
+    ``register_presorted_moe``. The registration is consumed below this route,
+    on every native call, and the public ``fused_moe`` clears it when the call
+    ends, so a call that a provider serves leaves none behind. A provider may
+    ignore it. A caller of this layer directly gets no such clean-up.
+    """
     stage2_scatter = None
     if ep_source_token_map is not None:
         stage2_scatter = Stage2ScatterContext(
@@ -1086,6 +1751,7 @@ def fused_moe_(
         intermediate_pad=intermediate_pad,
         bias1=bias1,
         bias2=bias2,
+        splitk=splitk,
         swiglu_limit=swiglu_limit,
         beta=beta,
         linear_beta=linear_beta,
@@ -1095,6 +1761,9 @@ def fused_moe_(
         quant_type_a=quant_type_a,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
+        herd_topk=herd_topk,
+        herd_routed_scaling_factor=herd_routed_scaling_factor,
+        deterministic=deterministic,
     )
 
 
@@ -1120,6 +1789,7 @@ def _fused_moe_impl(
     intermediate_pad: int = 0,
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
+    splitk: int = 0,
     swiglu_limit: float | None = None,
     beta: float | None = None,
     linear_beta: float | None = None,
@@ -1129,6 +1799,9 @@ def _fused_moe_impl(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    herd_topk: int = 0,
+    herd_routed_scaling_factor: float = 1.0,
+    deterministic: bool = False,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1136,10 +1809,31 @@ def _fused_moe_impl(
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
     _stage2_override: Callable | None = None,
+    _enforce_metadata_block_size: bool = False,
+    _config_shape: tuple[int, int] | None = None,
 ) -> torch.Tensor:
+    # Consume a caller's presort first, so every path (including early returns
+    # and errors) clears it.
+    presorted_aux = pop_presorted_moe()
+    # vLLM sends 0.0 for "no limit". Check floats and the raw int first:
+    # pybind enum comparisons are much slower than int compares.
+    silu_limit = (
+        swiglu_limit is not None
+        and swiglu_limit != 0
+        and swiglu_limit != math.inf
+        and (
+            activation == _SILU_VALUE
+            if type(activation) is int
+            else ActivationType(activation) == ActivationType.Silu
+        )
+    )
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
+    if silu_limit:
+        quant_type, quant_type_a, swiglu_limit = _normalize_moe_dispatch_contract(
+            quant_type, activation, swiglu_limit, quant_type_a
+        )
     gate_mode = GateMode(gate_mode)
     if quant_type_a is not None and QuantType(quant_type_a) != quant_type:
         raise NotImplementedError(
@@ -1150,7 +1844,32 @@ def _fused_moe_impl(
         block_size_M = None
     """user API"""
     M, topk = topk_ids.shape
+    herd_candidate_ids, herd_candidate_weights = topk_ids, topk_weight
+    if herd_topk:
+        # Only the gfx1250 integration passes K+1 candidates to MoE.
+        # Other architectures finish HERD in the router and pass K routes.
+        if get_gfx() != "gfx1250":
+            raise ValueError("herd_topk is supported only on gfx1250")
+        if topk != herd_topk + 1 or topk_weight.shape != topk_ids.shape:
+            raise ValueError(
+                "herd_topk requires K+1 candidate IDs and weights per token"
+            )
+        if expert_mask is not None or stage2_scatter is not None or doweight_stage1:
+            raise ValueError(
+                "HERD routing requires unmasked routes and doweight_stage1=False"
+            )
+        from aiter.ops.flydsl.kernels.moe_herd_route_psum import HERD_ROUTE_BLOCK
+
+        if M > HERD_ROUTE_BLOCK:
+            raise ValueError(
+                f"herd_topk takes at most {HERD_ROUTE_BLOCK} tokens, got {M}; "
+                "AITER_FLYDSL_HERD_MAX_M must not exceed it"
+            )
+        topk = herd_topk
+    config_M, config_topk = (M, topk) if _config_shape is None else _config_shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    if not hidden_states.is_contiguous() and not _is_row_major_2d(hidden_states):
+        hidden_states = hidden_states.contiguous()
 
     assert w1.shape[1] in [
         inter_dim,
@@ -1159,7 +1878,11 @@ def _fused_moe_impl(
     isG1U1 = inter_dim != w1.shape[1]
     isShuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
     # gfx1250: GUGU row-interleave, not 16-row block shuffle.
-    if get_gfx() == "gfx1250" and isG1U1 and gate_mode != GateMode.INTERLEAVE:
+    if (
+        get_gfx() in ("gfx1250", "gfx1250-strict")
+        and isG1U1
+        and gate_mode != GateMode.INTERLEAVE
+    ):
         raise ValueError(
             "gfx1250 fused_moe requires gu_interleave weight layout "
             f"(gate_mode={GateMode.INTERLEAVE.value!r}), got {gate_mode.value!r}"
@@ -1190,9 +1913,10 @@ def _fused_moe_impl(
         q_dtype_w,
         activation=activation,
         gate_mode=gate_mode,
-        M=M,
+        M=config_M,
         hidden_dtype=hidden_states.dtype,
         has_a1_scale=a1_scale is not None,
+        gate_up_interleave=getattr(w1, "gate_up_interleave", None),
     )
 
     if quant_dtype_a is not None:
@@ -1200,8 +1924,58 @@ def _fused_moe_impl(
     elif _q_dtype_a is not None:
         q_dtype_a = _q_dtype_a
 
+    if deterministic:
+        # The default picks the activation dtype by token count (bf16, then fp4
+        # or fp8 above a bound), which would make results depend on the batch.
+        # The caller fixes one dtype for every token count; it is quantized per
+        # 1x32 block within a token's row, so a row's result does not depend on
+        # the other rows.
+        if quant_dtype_a is None:
+            raise ValueError(
+                "fused_moe(deterministic=True) needs quant_dtype_a: the activation "
+                "dtype for every token count (dtypes.fp8, MXFP8, is supported)"
+            )
+        q_dtype_a = quant_dtype_a
+        _check_deterministic_supported(
+            dtype=dtype,
+            quant_type=quant_type,
+            q_dtype_w=q_dtype_w,
+            q_dtype_a=q_dtype_a,
+            q_dtype_a2=quant_dtype_a2,
+            activation=activation,
+            gate_mode=gate_mode,
+            gate_up_interleave=getattr(w1, "gate_up_interleave", None),
+            # isShuffled is true when either weight is preshuffled; the
+            # deterministic kernels need both.
+            is_shuffled=getattr(w1, "is_shuffled", False)
+            and getattr(w2, "is_shuffled", False),
+            is_g1u1=isG1U1,
+            doweight_stage1=doweight_stage1,
+            expert_mask=expert_mask,
+            stage2_scatter=stage2_scatter,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            block_size_M=block_size_M,
+            tokens=M,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            has_bias1=bias1 is not None,
+            has_bias2=bias2 is not None,
+            weight_bytes=max(
+                w1.numel() * w1.element_size(), w2.numel() * w2.element_size()
+            ),
+        )
+
     grouped_a8w4_out = None
     from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4
+
+    default_situ_beta, default_situ_linear_beta = (
+        (DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA)
+        if activation == ActivationType.Situv2
+        else (1.0, 1.0)
+    )
 
     # grouped_gemm_gfx1250_a8w4 reads GUGU (gate/up row-interleaved) w1 only,
     # so it is reachable exclusively from GateMode.INTERLEAVE. SEPARATED
@@ -1235,13 +2009,61 @@ def _fused_moe_impl(
             bias2=bias2,
             swiglu_limit=swiglu_limit,
             num_local_tokens=num_local_tokens,
-            situ_beta=1.0 if beta is None else float(beta),
-            situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
+            situ_beta=default_situ_beta if beta is None else float(beta),
+            situ_linear_beta=(
+                default_situ_linear_beta if linear_beta is None else float(linear_beta)
+            ),
             stage2_scatter=stage2_scatter,
+            herd_topk=herd_topk,
+            herd_routed_scaling_factor=herd_routed_scaling_factor,
+            output=output,
         )
 
     if grouped_a8w4_out is not None:
         return _return_output(grouped_a8w4_out, output)
+    if herd_topk and get_gfx() == "gfx1250":
+        raise ValueError(
+            "gfx1250 HERD needs the grouped MoE path (per_1x32 MXFP4 weights, "
+            "gate_mode=INTERLEAVE)"
+        )
+
+    if _can_use_bf16_g1u1_small_m_direct(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weight=topk_weight,
+        topk_ids=topk_ids,
+        activation=activation,
+        quant_type=quant_type,
+        dtype=dtype,
+        doweight_stage1=doweight_stage1,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        num_local_tokens=num_local_tokens,
+        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+        expert_mask=expert_mask,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        bias1=bias1,
+        bias2=bias2,
+        swiglu_limit=swiglu_limit,
+        beta=beta,
+        linear_beta=linear_beta,
+        gate_mode=gate_mode,
+        stage2_scatter=stage2_scatter,
+        splitk=splitk,
+    ):
+        return fused_moe_g1u1_bf16_small_m_direct(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            dtype=dtype,
+            output=output,
+        )
 
     # a16w4-SiTUv2 (bf16 A x MXFP4 W); SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
     _is_a16w4_situv2 = (
@@ -1268,6 +2090,7 @@ def _fused_moe_impl(
             use_g1u1=isG1U1,
             doweight_stage1=doweight_stage1,
             gate_mode=gate_mode,
+            gate_up_interleave=getattr(w1, "gate_up_interleave", None),
         )
     )
     if _is_a16w4_situv2 or _is_a16w4_swiglu_rerouted:
@@ -1291,21 +2114,20 @@ def _fused_moe_impl(
         ):
             if _bad:
                 raise NotImplementedError(
-                    f"a16w4 (bf16 A x MXFP4 W) {_a16w4_why} is not supported: "
-                    f"{_why}."
+                    f"a16w4 (bf16 A x MXFP4 W) {_a16w4_why} is not supported: {_why}."
                 )
 
     config_situ_beta, config_situ_linear_beta, _ = _normalize_mxfp4_activation_params(
         activation, beta, linear_beta, swiglu_limit
     )
 
-    def _resolve_metadata(disable_inline_sort=False):
+    def _resolve_metadata(disable_inline_sort=False, exclude_mxmoe=False):
         metadata = get_2stage_cfgs(
-            get_padded_M(M),  # consider token_num > 1024 as prefill
+            get_padded_M(config_M),
             model_dim,
             inter_dim,
             E,
-            topk,
+            config_topk,
             dtype,
             q_dtype_a,
             q_dtype_w,
@@ -1325,19 +2147,66 @@ def _fused_moe_impl(
             swiglu_limit=swiglu_limit,
             opus_weights_shuffled=getattr(w1, "is_shuffled", False)
             and getattr(w2, "is_shuffled", False),
+            gate_up_interleave=getattr(w1, "gate_up_interleave", None),
             config_file=_metadata_config_file,
             _disable_inline_sort=disable_inline_sort,
+            _exclude_mxmoe=exclude_mxmoe,
             q_dtype_a2=quant_dtype_a2,
             input_dtype=hidden_states.dtype,
             has_stage2_scatter=stage2_scatter is not None,
             has_activation_scales=a1_scale is not None or a2_scale is not None,
+            _has_input_activation_scales=a1_scale is not None,
             has_num_local_tokens=num_local_tokens is not None,
         )
         return (
             metadata if _metadata_transform is None else _metadata_transform(metadata)
         )
 
-    metadata = _resolve_metadata()
+    if deterministic:
+        metadata = _deterministic_metadata(
+            M, activation, dtype, quant_type, hidden_pad, intermediate_pad
+        )
+    else:
+        metadata = _resolve_metadata(disable_inline_sort=bool(herd_topk))
+        reason = ""
+        if _is_mxmoe_opus_metadata(metadata):
+            reason = _mxmoe_opus_call_unsupported(
+                metadata,
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                a1_scale,
+                topk_ids,
+                block_size_M=block_size_M,
+            )
+        elif (
+            getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
+            and not _is_mxfp4_inline_sort(metadata)
+            and block_size_M is not None
+            and int(block_size_M) != int(metadata.block_m)
+        ):
+            reason = f"block_size_M={block_size_M} differs from configured BM={metadata.block_m}"
+        if reason:
+            logger.warning(
+                f"[fused_moe] MXMOE pair is unsupported ({reason}); "
+                "using default heuristics"
+            )
+            metadata = _resolve_metadata(
+                disable_inline_sort=bool(herd_topk), exclude_mxmoe=True
+            )
+            if block_size_M is not None and int(block_size_M) != int(metadata.block_m):
+                raise NotImplementedError(
+                    f"No fallback backend supports block_size_M={block_size_M}; "
+                    f"resolved backend requires block_m={metadata.block_m}"
+                )
+        if herd_topk and (
+            metadata.flat or metadata.output_aux or metadata.full_impl is not None
+        ):
+            raise ValueError(
+                "gfx950 HERD needs a MoE backend using the standard sorted-token layout"
+            )
 
     # A tuned fast row that this invocation cannot run is discarded, not raised
     # on: re-resolve with that family disabled and fall back to legacy.
@@ -1352,7 +2221,6 @@ def _fused_moe_impl(
             w2_scale,
             topk_ids,
             gate_mode=gate_mode,
-            num_local_tokens=num_local_tokens,
             expert_mask=expert_mask,
             bias1=bias1,
             bias2=bias2,
@@ -1370,6 +2238,8 @@ def _fused_moe_impl(
             )
             metadata = _resolve_metadata(disable_inline_sort=True)
             use_inline_sort = False
+    if not use_inline_sort and not hidden_states.is_contiguous():
+        hidden_states = hidden_states.contiguous()
 
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
     if (
@@ -1383,7 +2253,40 @@ def _fused_moe_impl(
             "FlyDSL fallback cannot accept this invocation."
         )
 
+    if (
+        _enforce_metadata_block_size
+        and block_size_M is not None
+        and int(block_size_M) != int(metadata.block_m)
+    ):
+        raise ValueError(
+            f"FHMoE block_size_M={block_size_M} does not match the selected "
+            f"kernel block size {metadata.block_m}"
+        )
+    # a16w16 tiles size moe_sorting and both gemms. A caller block_size_M that
+    # disagrees used to let stage1 run on the wrong layout; stage2 then raised
+    # FlyDSL stage2 sorting layout mismatch. Reject here, same as FHMoE.
+    # Not a general FlyDSL rule: some a16w4 names advertise sort_block_m !=
+    # tile_m via _sbm. a16w16 has no such suffix, so tile_m is the sort size.
+    _a16w16_kn1 = str(
+        getattr(metadata.stage1, "keywords", {}).get("kernelName", "") or ""
+    )
+    if (
+        _a16w16_kn1.startswith("flydsl_moe1_abf16_wbf16_")
+        and block_size_M is not None
+        and int(block_size_M) != int(metadata.block_m)
+    ):
+        raise ValueError(
+            f"a16w16 block_size_M={block_size_M} does not match kernel tile "
+            f"{metadata.block_m}; moe_sorting and both gemm tiles share this size"
+        )
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
+    if _stage2_override is not None and (
+        metadata.run_1stage or metadata.full_impl is not None
+    ):
+        raise RuntimeError("_stage2_override requires a two-stage MoE config")
+    if presorted_aux and not metadata.output_aux:
+        presorted_moe_ignored("the selected MoE pipeline takes no BM=16 aux sort")
+    asm_mode = AsmMoeMode(metadata.flat)
     if metadata.full_impl is not None:
         full_output = metadata.full_impl(
             FusedMoeRequest(
@@ -1432,14 +2335,84 @@ def _fused_moe_impl(
         and stage1_func in (_flydsl_stage1_wrapper, cktile_moe_stage1)
         and expert_mask is not None
     )
-    assert not metadata.flat or get_gfx() in (
+    assert asm_mode.requires_host_sort or get_gfx() in (
         "gfx942",
         "gfx950",
     ), f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
 
     sort_m_indices = None
     sort_reverse_sorted = None
-    if metadata.output_aux:
+    runtime_stage2_reduce = _stage2_runtime_uses_route_reduce(
+        metadata.stage2,
+        M,
+        model_dim,
+    )
+    uses_common_route_reduce = (
+        _is_flydsl_stage2(metadata.stage2) and runtime_stage2_reduce
+    )
+    if uses_common_route_reduce:
+        output_element_size = torch.empty((), dtype=dtype).element_size()
+        _validate_flydsl_route_output_nbytes(
+            _flydsl_route_output_nbytes(
+                metadata.stage2,
+                M,
+                topk,
+                model_dim,
+                output_element_size,
+            )
+        )
+    prequantized_a1 = None
+    prequantized_a1_scale = None
+    # The a4w4 aux-sort families already fuse activation quantization into GEMM1,
+    # so the fused sort+quant kernel has nothing left to save there.
+    fused_sort_quant = not metadata.output_aux and _is_fused_decode_sort_quant_enabled(
+        hidden_states,
+        topk_ids,
+        topk_weight,
+        global_experts=global_E,
+        block_m=block_size_M,
+        quant_type=quant_type,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        activation=activation,
+        is_g1u1=isG1U1,
+        expert_mask=expert_mask,
+        need_local_topk_ids=need_local_topk_ids,
+        run_1stage=metadata.run_1stage,
+        stage1_is_flydsl=stage1_func is _flydsl_stage1_wrapper,
+        hidden_pad=hidden_pad,
+        ksplit=metadata.ksplit,
+    )
+    fused_sort_quant = fused_sort_quant and not herd_topk
+    # compact-scale variant not ported (its stage-1 change targets the
+    # refactored mixed_moe_gemm_2stage_common); keep the fused sort+quant on
+    # the expanded-scale path only.
+    fused_compact_scale = False
+    if herd_topk:
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            topk_ids,
+            topk_weight,
+        ) = _flydsl_moe_sorting(
+            herd_candidate_ids,
+            herd_candidate_weights,
+            global_E,
+            model_dim,
+            dtype,
+            block_size_M,
+            None,
+            None,
+            accumulate=not runtime_stage2_reduce,
+            output=output,
+            herd_topk=herd_topk,
+            herd_routed_scaling_factor=herd_routed_scaling_factor,
+        )
+        local_topk_ids = None
+    elif metadata.output_aux:
         # Only the layout-v2 scatter GEMM2 consumes the masked aux sort (remote
         # routes get reverse_sorted = -1). The MXMOE a4w4 port would silently
         # route tokens to the wrong experts, so fail loudly there.
@@ -1453,34 +2426,113 @@ def _fused_moe_impl(
             )
         _stage2_kwargs = metadata.stage2.keywords
         _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get("kernelName", "")
-        _atomic = parse_g2_kname_any(_kn2)["atomic"]
-        # BM16's adaptive sort already emits routes and zeroes the output without
-        # quantizing. Keep the Opus crossover for the configured aux pipeline.
-        sorting_ret = moe_sorting(
+        _atomic = (
+            not stage2_uses_route_reduce(metadata.stage2)
+            if _is_mxmoe_opus_metadata(metadata)
+            else parse_g2_kname_any(_kn2)["atomic"]
+        )
+        # The presort layout has to match both the selected kernels' tile size
+        # and the block size the stages are given, which a caller's
+        # block_size_M can override.
+        presorted = match_presorted_moe(
+            presorted_aux,
             topk_ids,
             topk_weight,
-            global_E,
-            model_dim,
-            dtype,
-            block_size_M,
-            expert_mask,
-            num_local_tokens,
-            return_local_topk_ids=need_local_topk_ids,
-            accumulate=_atomic,
-            output_aux=metadata.output_aux,
+            block_m=metadata.block_m,
+            num_experts=global_E,
+            topk=topk,
+            stage_block_m=block_size_M,
+            expert_mask=expert_mask,
+            num_local_tokens=num_local_tokens,
             output=output,
         )
+        if presorted is not None:
+            sorted_ids = presorted["sorted_token_ids"]
+            sorted_weights = presorted["sorted_weights"]
+            sorted_expert_ids = presorted["sorted_expert_ids"]
+            num_valid_ids = presorted["num_valid_ids"]
+            sort_m_indices = presorted["m_indices"]
+            sort_reverse_sorted = presorted["reverse_sorted"]
+            if _atomic and not runtime_stage2_reduce:
+                # Atomic GEMM2 accumulates with 4-byte atomics and faults on an
+                # output at an odd bf16 element, so such an output gets a fresh
+                # moe_buf and _return_output copies back.
+                in_place = output is not None and output.data_ptr() % 4 == 0
+                moe_buf = (
+                    output
+                    if in_place
+                    else torch.empty(
+                        (M, model_dim), dtype=dtype, device=topk_ids.device
+                    )
+                )
+                # Atomic GEMM2 needs a zeroed destination; skip the zeroing only
+                # if the caller zeroed this exact output. A buffer allocated here
+                # can reuse a freed block at the same address, so always zero it.
+                if not (
+                    in_place
+                    and presorted.get("moe_buf_zeroed")
+                    and int(presorted.get("moe_buf_ptr", 0)) == output.data_ptr()
+                ):
+                    moe_buf.zero_()
+            else:
+                moe_buf = torch.empty((0, 0), dtype=dtype, device=topk_ids.device)
+            local_topk_ids = None
+        else:
+            # BM16's adaptive sort already emits routes and zeroes the output
+            # without quantizing. Keep the Opus crossover for the configured aux
+            # pipeline.
+            sorting_ret = moe_sorting(
+                topk_ids,
+                topk_weight,
+                global_E,
+                model_dim,
+                dtype,
+                block_size_M,
+                expert_mask,
+                num_local_tokens,
+                return_local_topk_ids=need_local_topk_ids,
+                accumulate=_atomic and not runtime_stage2_reduce,
+                output_aux=metadata.output_aux,
+                output=output,
+            )
+            (
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                sort_m_indices,
+                sort_reverse_sorted,
+            ) = sorting_ret[:7]
+            local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
+    elif fused_sort_quant:
         (
             sorted_ids,
             sorted_weights,
             sorted_expert_ids,
             num_valid_ids,
             moe_buf,
-            sort_m_indices,
-            sort_reverse_sorted,
-        ) = sorting_ret[:7]
-        local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
+            prequantized_a1,
+            prequantized_a1_scale,
+        ) = _fused_decode_sort_quant(
+            hidden_states,
+            topk_ids,
+            topk_weight,
+            model_dim=model_dim,
+            global_experts=global_E,
+            block_m=block_size_M,
+            moebuf_dtype=dtype,
+            accumulate=not runtime_stage2_reduce,
+            compact_scale=fused_compact_scale,
+            num_local_tokens=num_local_tokens,
+        )
+        local_topk_ids = None
     else:
+        sort_output = output if asm_mode.requires_host_sort else None
+        if asm_mode is AsmMoeMode.POST_REDUCE:
+            # The reducer overwrites the final output, including masked rows.
+            # An empty buffer also suppresses the sort's EP zero-fill.
+            sort_output = torch.empty((0, 0), dtype=dtype, device=topk_ids.device)
         sorting_ret = moe_sorting(
             topk_ids,
             topk_weight,
@@ -1492,9 +2544,10 @@ def _fused_moe_impl(
             num_local_tokens,
             moe_sorting_dispatch_policy,
             return_local_topk_ids=need_local_topk_ids,
-            accumulate=not stage2_uses_route_reduce(metadata.stage2),
-            flat=metadata.flat,
-            output=None if metadata.flat else output,
+            accumulate=not runtime_stage2_reduce
+            and asm_mode is not AsmMoeMode.POST_REDUCE,
+            flat=asm_mode,
+            output=sort_output,
         )
         if need_local_topk_ids:
             (
@@ -1510,11 +2563,20 @@ def _fused_moe_impl(
                 sorting_ret
             )
             local_topk_ids = None
+        if asm_mode is AsmMoeMode.POST_REDUCE:
+            moe_buf = (
+                output
+                if output is not None
+                else torch.empty((M, model_dim), dtype=dtype, device=topk_ids.device)
+            )
     _opus_a8w4.check_route_bucket_metadata(metadata, sorted_expert_ids, logger)
 
     if metadata.run_1stage:
-        if _stage2_override is not None:
-            raise RuntimeError("_stage2_override requires a two-stage MoE config")
+        if silu_limit and normalize_swiglu_limit(swiglu_limit) is not None:
+            raise NotImplementedError(
+                f"1-stage MoE cannot apply swiglu_limit={swiglu_limit!r}; "
+                "the selected kernel has no clamp."
+            )
         _stage1_call = functools.partial(
             metadata.stage1,
             hidden_states,
@@ -1538,6 +2600,7 @@ def _fused_moe_impl(
             M=M,
             device=topk_ids.device,
             doweight_stage1=doweight_stage1,
+            expert_mask=expert_mask,
         )
         if kernel_bench_callable is not None:
             kernel_bench_callable.append(("stage1", _stage1_call))
@@ -1587,11 +2650,385 @@ def _fused_moe_impl(
             _metadata_config_file=_metadata_config_file,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
+            deterministic=deterministic,
             output=output,
             _stage2_override=_stage2_override,
             routing_num_experts=global_E,
+            prequantized_a1=prequantized_a1,
+            prequantized_a1_scale=prequantized_a1_scale,
         )
         return _return_output(ret, output)
+
+
+@dataclass
+class MoeStage2Inputs:
+    """Returned by ``fused_moe_prepare_stage2`` for ``fused_moe_run_stage2``.
+    Only the stage1 output ``a2`` / ``a2_scale`` is public."""
+
+    # One row per route or per sorted slot; the last dim is the intermediate.
+    a2: torch.Tensor
+    a2_scale: torch.Tensor | None
+    _stage2: Callable
+    # (w1, w2, sorted_ids, sorted_expert_ids, num_valid_ids, moe_out, topk);
+    # moe_out is the [token_num, model_dim] output prepared by the sorting.
+    _args: tuple
+    _kwargs: dict
+    # Set once stage2 has written moe_out.
+    _moe_out_written: bool = False
+
+
+def _stage2_override_kind(stage2: Callable) -> str | None:
+    """Return "v1" or "v2" if ``stage2`` is a FlyDSL MXFP4 kernel that
+    supports per-slot output and replaced operands, else None."""
+    func = getattr(stage2, "func", stage2)
+    kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
+    if func is _flydsl_stage2_wrapper:
+        params = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernel_name)
+        fp4 = params is not None and params["a_dtype"] == params["b_dtype"] == "fp4"
+        return "v1" if fp4 else None
+    if func is _flydsl_v2_stage2_wrapper:
+        cfg = parse_flydsl_v2_gemm2_kernel(kernel_name)
+        fp4 = cfg is not None and cfg["a_dtype"] == cfg["b_dtype"] == "fp4"
+        return "v2" if fp4 and cfg["epilog"] != "scatter" else None
+    return None
+
+
+def supports_stage2_overrides(metadata: "MOEMetadata") -> bool:
+    """Whether ``fused_moe_run_stage2`` supports ``per_slot`` and replaced
+    operands for ``metadata`` (from ``get_2stage_cfgs``). Nothing is run."""
+    if (
+        metadata.run_1stage
+        or metadata.full_impl is not None
+        or metadata.stage2 is None
+        or metadata.output_aux
+        or metadata.stage2_has_bias
+        # Split-K stage1 leaves the intermediate unquantized.
+        or metadata.ksplit > 1
+    ):
+        return False
+    return _stage2_override_kind(metadata.stage2) is not None
+
+
+def _captured_stage2_supports_overrides(inputs: "MoeStage2Inputs") -> bool:
+    """``supports_stage2_overrides`` for a captured stage2: split-K leaves
+    ``a2_scale`` None, and a stage2 bias or the aux sort is in the kwargs."""
+    kwargs = inputs._kwargs
+    return (
+        _stage2_override_kind(inputs._stage2) is not None
+        and inputs.a2_scale is not None
+        and kwargs.get("bias2") is None
+        and kwargs.get("reverse_sorted") is None
+    )
+
+
+def _scaled_dim(dim: int, cols: int, ref_cols: int) -> int:
+    """Logical width of ``cols`` stored columns, if ``ref_cols`` stored
+    columns hold ``dim`` elements."""
+    if (dim * cols) % ref_cols:
+        raise ValueError(
+            f"{cols} stored columns do not hold whole elements "
+            f"({ref_cols} hold {dim})"
+        )
+    return dim * cols // ref_cols
+
+
+def _check_stage2_operands(
+    inputs: "MoeStage2Inputs",
+    w2: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    a2: torch.Tensor | None,
+    a2_scale: torch.Tensor | None,
+) -> None:
+    """Raise ``ValueError`` if a replacing stage2 operand does not fit the
+    one it replaces (see ``fused_moe_run_stage2``). Shuffled E8M0 scales pad
+    rows and groups, so only their minimum size is checked."""
+    old_a2, old_a2_scale = inputs.a2, inputs.a2_scale
+    old_w2 = inputs._args[1]
+    old_w2_scale = inputs._kwargs.get("w2_scale")
+    new_a2 = old_a2 if a2 is None else a2
+    new_w2 = old_w2 if w2 is None else w2
+
+    def fail(msg: str) -> None:
+        raise ValueError(f"fused_moe_run_stage2: {msg}")
+
+    for name, new in (
+        ("w2", w2),
+        ("w2_scale", w2_scale),
+        ("a2", a2),
+        ("a2_scale", a2_scale),
+    ):
+        if new is None:
+            continue
+        if new.device != old_a2.device:
+            fail(f"{name} is on {new.device}, stage1 ran on {old_a2.device}")
+        if not new.is_contiguous():
+            fail(f"{name} is not contiguous")
+    for name, new in (("w2_scale", w2_scale), ("a2_scale", a2_scale)):
+        if new is not None and new.element_size() != 1:
+            fail(f"{name} is a {new.dtype} tensor, not E8M0")
+    for name, new, old in (("a2", a2, old_a2), ("w2", w2, old_w2)):
+        if new is not None and (new.dtype != old.dtype or new.dim() != old.dim()):
+            fail(
+                f"{name} is a {new.dim()}-d {new.dtype} tensor; the one it "
+                f"replaces is a {old.dim()}-d {old.dtype} tensor"
+            )
+    if a2 is not None and a2.shape[:-1] != old_a2.shape[:-1]:
+        fail(
+            f"a2 has rows {tuple(a2.shape[:-1])}, stage1 produced "
+            f"{tuple(old_a2.shape[:-1])}"
+        )
+    if w2 is not None and w2.shape[0] != old_w2.shape[0]:
+        fail(f"w2 has {w2.shape[0]} experts, stage1 ran {old_w2.shape[0]}")
+    # The last dims of w2 and a2 are both the reduction dim (K).
+    if new_w2.shape[-1] * old_a2.shape[-1] != new_a2.shape[-1] * old_w2.shape[-1]:
+        fail(
+            f"w2 last dim {new_w2.shape[-1]} does not match a2 last dim "
+            f"{new_a2.shape[-1]} (stage1: {old_w2.shape[-1]} and "
+            f"{old_a2.shape[-1]})"
+        )
+    if a2 is not None and a2.shape[-1] != old_a2.shape[-1] and a2_scale is None:
+        fail("an a2 of another width needs its a2_scale")
+    if w2 is not None and w2.shape != old_w2.shape and w2_scale is None:
+        fail("a w2 of another shape needs its w2_scale")
+    if w2_scale is not None:
+        if w2 is None and (
+            old_w2_scale is None or w2_scale.shape != old_w2_scale.shape
+        ):
+            fail(
+                f"w2_scale has shape {tuple(w2_scale.shape)}, the one it "
+                f"replaces {None if old_w2_scale is None else tuple(old_w2_scale.shape)}"
+            )
+        # [E * model_dim, groups] or [E, model_dim, groups], rows padded.
+        scale_rows = math.prod(w2_scale.shape[:-1])
+        if scale_rows < new_w2.shape[0] * new_w2.shape[1]:
+            fail(
+                f"w2_scale has {scale_rows} rows, w2 needs at least "
+                f"{new_w2.shape[0] * new_w2.shape[1]}"
+            )
+    if a2_scale is not None and (
+        old_a2_scale is None or a2_scale.shape[0] != old_a2_scale.shape[0]
+    ):
+        fail(
+            f"a2_scale has {a2_scale.shape[0]} rows, stage1 produced "
+            f"{None if old_a2_scale is None else old_a2_scale.shape[0]}"
+        )
+    # One E8M0 scale per 32 FP4 values (2 per byte) of K.
+    groups = -(-new_a2.shape[-1] * 2 // 32)
+    for name, new in (("w2_scale", w2_scale), ("a2_scale", a2_scale)):
+        if new is not None and new.shape[-1] < groups:
+            fail(
+                f"{name} has {new.shape[-1]} groups, the reduction dim needs "
+                f"{groups}"
+            )
+
+
+@drop_presort_on_error
+def fused_moe_prepare_stage2(
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    expert_mask: torch.Tensor | None = None,
+    activation=ActivationType.Silu,
+    quant_type=QuantType.No,
+    doweight_stage1=False,
+    w1_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    block_size_M=None,
+    num_local_tokens: torch.Tensor | None = None,
+    moe_sorting_dispatch_policy=0,
+    dtype=None,
+    hidden_pad=0,
+    intermediate_pad=0,
+    bias1=None,
+    bias2=None,
+    splitk=0,
+    swiglu_limit=None,
+    beta=None,
+    linear_beta=None,
+    gate_mode: str | None = GateMode.SEPARATED.value,
+    *,
+    quant_type_a: QuantType | None = None,
+    quant_dtype_a: torch.dtype | None = None,
+    quant_dtype_a2: torch.dtype | None = None,
+    deterministic: bool = False,
+    config_shape: tuple[int, int] | None = None,
+) -> MoeStage2Inputs:
+    """Run the sorting and stage1 of ``fused_moe`` and return the stage2
+    inputs, so the caller can work on them (e.g. gather ``a2`` across ranks)
+    before ``fused_moe_run_stage2``. Not related to ``fused_moe_1stage``.
+
+    Takes the arguments of ``fused_moe`` up to ``gate_mode`` (same order and
+    defaults), plus keyword-only ``quant_type_a``, ``quant_dtype_a``,
+    ``quant_dtype_a2`` and ``deterministic``. Shared experts (FHMoE),
+    ``stage2_scatter``, ``herd_topk`` and ``output`` are not supported; pass
+    ``out`` to ``fused_moe_run_stage2`` instead of ``output``.
+
+    ``config_shape=(token_num, topk)`` selects kernels and tuned config as if
+    ``topk_ids`` had that shape, e.g. the config of the same routes as a
+    repeated input with top-1.
+
+    Raises ``RuntimeError`` if the selected pipeline has no separate stage2
+    (1-stage, full or direct implementations); for some of them the MoE has
+    already run by then.
+    """
+    captured = []
+
+    def capture_stage2(*, ordinary_stage2, stage2_args, stage2_kwargs):
+        captured.append((ordinary_stage2, stage2_args, stage2_kwargs))
+
+    _fused_moe_impl(
+        hidden_states,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        expert_mask=expert_mask,
+        activation=ActivationType(activation).value,
+        quant_type=QuantType(quant_type).value,
+        doweight_stage1=doweight_stage1,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        block_size_M=block_size_M or -1,
+        num_local_tokens=num_local_tokens,
+        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+        dtype=dtype,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        bias1=bias1,
+        bias2=bias2,
+        splitk=splitk,
+        swiglu_limit=swiglu_limit,
+        beta=beta,
+        linear_beta=linear_beta,
+        gate_mode=gate_mode,
+        quant_type_a=None if quant_type_a is None else QuantType(quant_type_a).value,
+        quant_dtype_a=quant_dtype_a,
+        quant_dtype_a2=quant_dtype_a2,
+        deterministic=deterministic,
+        _stage2_override=capture_stage2,
+        _config_shape=config_shape,
+    )
+    if not captured:
+        raise RuntimeError(
+            "fused_moe_prepare_stage2: the selected MoE pipeline has no "
+            "separate stage2"
+        )
+    ((stage2, args, kwargs),) = captured
+    kwargs = dict(kwargs)
+    return MoeStage2Inputs(
+        a2=args[0],
+        a2_scale=kwargs.pop("a2_scale"),
+        _stage2=stage2,
+        _args=tuple(args[1:]),
+        _kwargs=kwargs,
+    )
+
+
+def fused_moe_run_stage2(
+    inputs: MoeStage2Inputs,
+    *,
+    out: torch.Tensor | None = None,
+    per_slot: bool = False,
+    w2: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    a2: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run the stage2 of ``fused_moe`` on ``inputs`` from
+    ``fused_moe_prepare_stage2``. Returns the ``[token_num, model_dim]``
+    output (``out`` if given).
+
+    Options, if ``supports_stage2_overrides`` is true for the config (else
+    ``NotImplementedError``):
+
+    * ``per_slot``: write each route's weighted output to its own row of
+      ``out[token_num, topk, model_dim]`` instead of summing. Under EP, rows
+      of masked experts are zero if ``out`` is allocated here, and untouched
+      in a caller's ``out``.
+    * ``w2`` / ``w2_scale``: use these down weights (same layout and experts,
+      any ``model_dim``).
+    * ``a2`` / ``a2_scale``: use this intermediate (same layout and rows, any
+      width), e.g. ``inputs.a2`` gathered across ranks.
+
+    Replacing operands must be contiguous, on the same device, of the same
+    dtype, with matching K for ``w2`` and ``a2``, E8M0 scales with enough
+    rows and groups, and a new scale if the shape changes; else
+    ``ValueError``.
+
+    ``inputs`` can be run several times (e.g. with different ``w2`` rows).
+    Without ``out``, the summed output is the sorting's buffer, so it can
+    only be returned once per ``inputs``. ``out`` must be contiguous and must
+    not overlap ``a2``.
+    """
+    stage2 = inputs._stage2
+    w1, w2_, sorted_ids, sorted_expert_ids, num_valid_ids, moe_buf, topk = inputs._args
+    w2_ = w2_ if w2 is None else w2
+    a2_ = inputs.a2 if a2 is None else a2
+    kwargs = dict(inputs._kwargs)
+    kwargs["a2_scale"] = inputs.a2_scale if a2_scale is None else a2_scale
+    if per_slot or any(t is not None for t in (w2, w2_scale, a2, a2_scale)):
+        if not _captured_stage2_supports_overrides(inputs):
+            raise NotImplementedError(
+                f"stage2 {stage2} does not support per_slot or replaced "
+                "operands; see supports_stage2_overrides"
+            )
+        _check_stage2_operands(inputs, w2, w2_scale, a2, a2_scale)
+        if w2_scale is not None:
+            kwargs["w2_scale"] = w2_scale.view(dtypes.fp8_e8m0)
+        # v2 takes the GEMM shape from its config, v1 from the operands.
+        config = getattr(stage2, "keywords", {})
+        if w2 is not None and "model_dim" in config:
+            kwargs["model_dim"] = w2.shape[1]
+        if a2 is not None and "inter_dim" in config:
+            kwargs["inter_dim"] = _scaled_dim(
+                config["inter_dim"], a2.shape[-1], inputs.a2.shape[-1]
+            )
+    token_num, dtype, device = moe_buf.shape[0], moe_buf.dtype, moe_buf.device
+    model_dim = w2_.shape[1]
+    if out is not None and bytes_overlap(out, a2_):
+        raise ValueError("fused_moe_run_stage2: out overlaps a2")
+    if per_slot:
+        shape = (token_num, topk, model_dim)
+        if out is None:
+            out = torch.zeros(shape, dtype=dtype, device=device)
+        _validate_output_buffer_metadata(out, shape, dtype, device)
+        moe_out = moe_buf
+        kwargs["per_slot_out"] = out
+    elif out is None and w2 is None:
+        if inputs._moe_out_written:
+            raise RuntimeError(
+                "fused_moe_run_stage2: the summed output of these inputs was "
+                "already returned; pass out= to run stage2 again"
+            )
+        moe_out = out = moe_buf
+    else:
+        if out is None:
+            out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
+        _validate_output_buffer_metadata(out, (token_num, model_dim), dtype, device)
+        if not _stage2_runtime_uses_route_reduce(stage2, token_num, model_dim):
+            # Accumulating stage2 kernels add into their output.
+            out.zero_()
+        moe_out = out
+    stage2(
+        a2_,
+        w1,
+        w2_,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_out,
+        topk,
+        **kwargs,
+    )
+    if moe_out is moe_buf and not per_slot:
+        inputs._moe_out_written = True
+    return out
 
 
 def fused_moe_1stage(
@@ -1621,8 +3058,10 @@ def fused_moe_1stage(
     M: int | None = None,
     device=None,
     doweight_stage1: bool | None = None,
-    flat: int = 0,
+    flat: AsmMoeMode | int = AsmMoeMode.SORTED,
+    expert_mask: torch.Tensor | None = None,
 ):
+    asm_mode = AsmMoeMode(flat)
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
         aiter.fmoe(
@@ -1714,6 +3153,43 @@ def fused_moe_1stage(
                 fc_scale_blkk=128,
                 block_size_M=block_size_M,
             )
+        elif isG1U1 and asm_mode is AsmMoeMode.POST_REDUCE:
+            # The by-name launcher lookup does not check the sorted tile size.
+            if int(block_size_M) != 256:
+                raise ValueError(
+                    f"{kernelName} needs block_size_M=256, got {block_size_M}"
+                )
+            if a2_scale is not None:
+                raise ValueError("Q256 does not support caller-provided hidden scales")
+            # The ASM stores one weighted BF16 row per token/topk slot.
+            # These partials are consumed once by the FP32 reduction.
+            covers_all_slots = expert_mask is None and num_local_tokens is None
+            partials = (torch.empty if covers_all_slots else torch.zeros)(
+                (token_num, topk, model_dim),
+                dtype=moe_buf.dtype,
+                device=moe_buf.device,
+            )
+            aiter.fmoe_g1u1(
+                partials.view(token_num, -1),
+                a1,
+                w1,
+                w2,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                topk,
+                a1_scale,
+                w1_scale,
+                w2_scale,
+                kernelName,
+                fc2_smooth_scale=None,
+                activation=activation,
+            )
+            _get_flydsl_moe_kernels()._run_moe_reduction(
+                partials, moe_buf, token_num, topk, model_dim, streaming_loads=True
+            )
+            return moe_buf
         elif isG1U1:
             fmoe_func = aiter.fmoe_g1u1
         else:
@@ -1809,6 +3285,40 @@ def get_ksplit(token, topk, expert, inter_dim, model_dim):
 
 cfg_2stages = None
 cfg_2stages_by_file = {}
+cfg_2stages_by_limit_tag = {}
+
+# Itanium symbols encode the activation (`_silu_` / `_gelu_` / `_situv2_`).
+# SiLU and GELU are the same length, so swapping the tag keeps the mangled
+# name valid and names the twin kernel in the other activation's cfg map.
+_ASM_ACT_TAG = {
+    ActivationType.Silu: "_silu_",
+    ActivationType.Gelu: "_gelu_",
+    ActivationType.Situv2: "_situv2_",
+}
+
+
+def _retarget_asm_activation(kernel_name, activation):
+    """Point a 1-stage asm symbol at the kernel for `activation`.
+
+    A tuned row is stored under one activation. The act-type-disabled fallback
+    can hand that symbol to a different activation. SiLU/GELU twins share the
+    mangled length, so the tag is swapped in place. A length-changing tag is
+    dropped and the activation's own cfg map selects a kernel.
+    """
+    if not isinstance(kernel_name, str) or not kernel_name:
+        return kernel_name
+    want = _ASM_ACT_TAG.get(activation)
+    if want is None or want in kernel_name:
+        return kernel_name
+    for other in _ASM_ACT_TAG.values():
+        if other not in kernel_name:
+            continue
+        if len(other) == len(want):
+            return kernel_name.replace(other, want, 1)
+        return ""
+    return kernel_name
+
+
 # fmt: off
 fused_moe_1stage_dict = {
     "gfx942":
@@ -1830,6 +3340,8 @@ fused_moe_1stage_dict = {
     {
         (ActivationType.Silu,    QuantType.per_1x32,   dtypes.bf16,   dtypes.fp4x2,  dtypes.fp4x2,    True,   False) : aiter.fmoe_g1u1,
         (ActivationType.Situv2,  QuantType.per_1x32,   dtypes.bf16,   dtypes.bf16,   dtypes.fp4x2,    True,   False) : aiter.fmoe_g1u1,
+        (ActivationType.Swiglu,  QuantType.per_1x32,   dtypes.bf16,   dtypes.fp4x2,  dtypes.fp4x2,    True,   False) : aiter.fmoe_g1u1,
+        (ActivationType.Swiglu,  QuantType.per_1x32,   dtypes.bf16,    dtypes.bf16,  dtypes.fp4x2,    True,   False) : aiter.fmoe_g1u1,
         (ActivationType.Silu,   QuantType.per_1x128,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_fp8_blockscale_g1u1,
         (ActivationType.Gelu,   QuantType.per_1x128,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True,   False) : aiter.fmoe_fp8_blockscale_g1u1,
         (ActivationType.Silu,   QuantType.per_Token,   dtypes.bf16,    dtypes.bf16,   dtypes.bf16,   False,   False) : aiter.fmoe,
@@ -1841,6 +3353,17 @@ fused_moe_1stage_dict = {
 # fmt: on
 
 quant_remap = {QuantType.per_128x128: QuantType.per_1x128}
+
+
+def _normalize_moe_dispatch_contract(
+    quant_type, activation, swiglu_limit, quant_type_a=None
+):
+    quant_type = quant_remap.get(quant_type, quant_type)
+    if quant_type_a is not None:
+        quant_type_a = quant_remap.get(QuantType(quant_type_a), QuantType(quant_type_a))
+    if activation == ActivationType.Silu:
+        swiglu_limit = normalize_swiglu_limit(swiglu_limit)
+    return quant_type, quant_type_a, swiglu_limit
 
 
 def _mxfp4_per_1x32_weight_expert_to_f32(weight, scale, expert_id, rows, cols):
@@ -1871,6 +3394,12 @@ _PADDED_M_TIERS = [32768, 131072]
 
 
 def get_padded_M(M):
+    """Map runtime M to a tuning bucket.
+
+    Values below 32768 use the next power of two, 32768..131071 use the 32768
+    tier, and values from 131072 upward use the 131072 tier. Individual model
+    contracts may impose a stricter maximum before lookup.
+    """
     if M < _PADDED_M_TIERS[0]:
         return nextPow2(M)
     for tier in reversed(_PADDED_M_TIERS):
@@ -1890,7 +3419,7 @@ class MOEMetadata:
     use_non_temporal_load: bool = True
     fuse_quant: str = ""
     stage2_has_bias: bool = False
-    flat: bool = False
+    flat: AsmMoeMode | int = AsmMoeMode.SORTED
     output_aux: bool | str = False
     prequant: bool = True
     skip_inter_quant: bool = False
@@ -1914,8 +3443,10 @@ def _normalize_mxfp4_activation_params(
     situ_beta = 1.0
     situ_linear_beta = 1.0
     if activation == ActivationType.Situv2:
-        situ_beta = 1.0 if beta is None else float(beta)
-        situ_linear_beta = 1.0 if linear_beta is None else float(linear_beta)
+        situ_beta = DEFAULT_SITUV2_BETA if beta is None else float(beta)
+        situ_linear_beta = (
+            DEFAULT_SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
+        )
     normalized_swiglu_limit = (
         swiglu_limit
         if activation in (ActivationType.Silu, ActivationType.Swiglu)
@@ -1970,6 +3501,9 @@ def _flydsl_stage1_wrapper(
     model_dim_pad: int = 0,
     out_dtype: str | None = None,
     v2_output_layout: bool = False,
+    fused_shared_w1=None,
+    fused_shared_w1_scale=None,
+    shared_inter_bf16=None,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -2025,6 +3559,10 @@ def _flydsl_stage1_wrapper(
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
+        fused_shared_w1=fused_shared_w1,
+        fused_shared_w1_scale=fused_shared_w1_scale,
+        shared_inter_bf16=shared_inter_bf16,
+        shared_tile=moe_kernels.a16w4_shared_tile_from_params(parsed),
     )
 
 
@@ -2047,6 +3585,12 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
+    skip_dropped_routes: bool = False,
+    use_valid_token_count=False,
+    per_slot_out=None,
+    fused_shared_w2=None,
+    fused_shared_w2_scale=None,
+    shared_inter_bf16=None,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -2080,7 +3624,7 @@ def _flydsl_stage2_wrapper(
         sorted_token_ids=sorted_token_ids,
         sorted_expert_ids=sorted_expert_ids,
         num_valid_ids=num_valid_ids,
-        out=out,
+        out=out if per_slot_out is None else per_slot_out,
         topk=topk,
         tile_m=parsed["tile_m"],
         tile_n=parsed["tile_n"],
@@ -2102,8 +3646,15 @@ def _flydsl_stage2_wrapper(
         model_dim_pad=model_dim_pad,
         bias=bias2,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
+        return_per_slot=per_slot_out is not None,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        skip_dropped_routes=skip_dropped_routes,
+        use_valid_token_count=use_valid_token_count,
+        fused_shared_w2=fused_shared_w2,
+        fused_shared_w2_scale=fused_shared_w2_scale,
+        shared_inter_bf16=shared_inter_bf16,
+        shared_tile=moe_kernels.a16w4_shared_tile_from_params(parsed),
     )
 
 
@@ -2204,6 +3755,9 @@ def _mxfp4_a4w4_stage1(
     inter_cols = D_INTER if out_dtype == "fp8" else D_INTER // 2
     inter_scale_cols = D_INTER // 32
     inter_scale_bytes = max_sorted * max((1024 // BM_MIN) * 4, inter_scale_cols * 2)
+    from aiter.ops.flydsl.kernels.mxfp4_gemm_common import kas_per_chunk_dw_for
+
+    chunk_bytes = kas_per_chunk_dw_for(D_INTER) * 4
     if native_scale_layout:
         # The native BM16 layout addresses one *padded* chunk per M block:
         # kas_per_chunk_dw_for pads scale-N up to a multiple of 8 columns, so
@@ -2211,11 +3765,14 @@ def _mxfp4_a4w4_stage1(
         # D_INTER // 32 is not a multiple of 8. Sizing on the unpadded width
         # under-allocates and the last blocks write past the buffer (D_INTER=1408
         # spans 49152 B where the unpadded figure gives 45056 B).
-        from aiter.ops.flydsl.kernels.mxfp4_gemm_common import kas_per_chunk_dw_for
-
         chunks = (max_sorted + BM - 1) // BM
+        inter_scale_bytes = max(inter_scale_bytes, chunks * chunk_bytes)
+    else:
+        # Regular chunks pack 32 rows. Expose their physical column stride so
+        # consumers deriving the chunk stride from tensor metadata read it as-is.
+        inter_scale_cols = _padded_scale_cols(D_INTER)
         inter_scale_bytes = max(
-            inter_scale_bytes, chunks * kas_per_chunk_dw_for(D_INTER) * 4
+            inter_scale_bytes, ((max_sorted + 31) // 32) * chunk_bytes
         )
     inter_dtype = dtypes.fp8 if out_dtype == "fp8" else torch.uint8
     inter_sorted_quant = torch.empty(
@@ -2297,6 +3854,7 @@ def _mxfp4_a4w4_stage2(
     use_nt=False,
     cshuffle=False,
     inter_real=None,  # w2.inter_real (unpadded inter for non-256-aligned shards)
+    use_valid_token_count=False,
 ):
     _xcd2 = _parse_mxfp4_g2_kname(kernelName2).get("xcd_swizzle", 0)
     if atomic:
@@ -2388,6 +3946,7 @@ def _mxfp4_a4w4_stage2(
         D_INTER_REAL=inter_real,
         topk=topk,
         xcd_swizzle=_xcd2,
+        use_valid_token_count=use_valid_token_count,
     )
 
     if atomic:
@@ -2444,10 +4003,6 @@ def _mxfp4_a4w4_stage1_fw(
     runtime_swiglu_limit = _get_flydsl_moe_kernels().runtime_swiglu_limit(
         swiglu_limit, p1["act"]
     )
-    if not p1.get("enable_bias", False) and bias1 is not None:
-        raise ValueError(
-            "MXMOE bias presence does not match the cache-safe kernel name"
-        )
     BM = p1["BM"]
     if native_scale_layout is None:
         native_scale_layout = native_scale_layout_for(BM, p1["out_dtype"])
@@ -2460,8 +4015,6 @@ def _mxfp4_a4w4_stage1_fw(
     # packed and unpacked inputs, so it is the stable source of the GEMM1 K.
     D_HIDDEN = w2.shape[1]
     D_INTER = w1.shape[1] // 2
-    if p1.get("enable_bias", False) and bias1 is None:
-        bias1 = torch.zeros((NE, D_INTER * 2), dtype=dtypes.fp32, device=device)
     Kpad_inter = ((D_INTER + 255) // 256) * 256
     M = hidden_states.shape[0]
     if m_indices is None:
@@ -2624,6 +4177,7 @@ def _mxfp4_a4w4_stage2_fw(
         use_nt=cfg["use_nt"],
         cshuffle=cfg["cshuffle"],
         inter_real=inter_real,
+        use_valid_token_count=use_valid_token_count,
     )
 
     if out is not moe_out:
@@ -2643,17 +4197,28 @@ def _mxfp4_scale_u8(scale):
     return scale
 
 
-def _flydsl_stage2_fp8_enabled():
-    return os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
-
-
-def _mxfp4_intermediate_enabled():
-    # Lossy before-sum 4-bit quant of the scatter intermediate (ok for gsm8k, degrades other evals).
-    return os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1"
-
-
 def _opus_stage2_fp8_enabled():
     return os.environ.get("AITER_OPUS_STAGE2_FP8", "1") == "1"
+
+
+# Grow-only stage2 scratch, keyed by (device, stream, slot).
+_STAGE2_SCRATCH: dict = {}
+
+
+def _stage2_scratch(slot, shape, dtype, device):
+    """Reusable scatter/reduce target: it is consumed before the wrapper returns,
+    and allocating it per call (~2 GiB at 16K tokens for DeepSeek-R1) can OOM a
+    fragmented, capped caching allocator. Graph capture allocates as before."""
+    if torch.cuda.is_current_stream_capturing():
+        return torch.empty(shape, dtype=dtype, device=device)
+    nbytes = math.prod(shape) * dtype.itemsize
+    key = (device, torch.cuda.current_stream(device).cuda_stream, slot)
+    buf = _STAGE2_SCRATCH.get(key)
+    if buf is None or buf.numel() < nbytes:
+        _STAGE2_SCRATCH.pop(key, None)
+        buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        _STAGE2_SCRATCH[key] = buf
+    return buf[:nbytes].view(dtype).view(shape)
 
 
 def _flydsl_v2_stage2_wrapper(
@@ -2679,6 +4244,7 @@ def _flydsl_v2_stage2_wrapper(
     topk_weights=None,
     reverse_sorted=None,
     use_valid_token_count=False,
+    per_slot_out=None,
     **_kwargs,
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
@@ -2690,6 +4256,28 @@ def _flydsl_v2_stage2_wrapper(
     if cfg is None:
         raise ValueError(f"Invalid FlyDSL v2 GEMM2 kernel name: {kernelName}")
     _validate_v2_gemm2_dtypes(cfg["a_dtype"], cfg["b_dtype"])
+    if per_slot_out is not None:
+        # The "reduce" epilog's per-(token, slot) rows, without the reduction.
+        return _flydsl_v2_stage2_per_slot(
+            per_slot_out,
+            cfg,
+            inter_states,
+            w2,
+            sorted_token_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            topk,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            num_experts=num_experts,
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+            sorted_weights=sorted_weights,
+            bias2=bias2,
+            block_m=block_m,
+            is_ep=expert_mask is not None,
+            use_valid_token_count=use_valid_token_count,
+        )
 
     bm = cfg["tile_m"]
     bn = cfg["tile_n"]
@@ -2705,11 +4293,27 @@ def _flydsl_v2_stage2_wrapper(
 
     token_num = out.shape[0]
     model_dim_runtime = out.shape[1]
+    if epilog == "scatter" and not is_mxfp4_moe_scatter_supported(
+        model_dim_runtime, topk
+    ):
+        raise NotImplementedError(
+            "Generated MXMOE scatter auxiliary kernels do not cover "
+            f"(model_dim={model_dim_runtime}, topk={topk})"
+        )
     target = out
     _s2_fp8_inter = epilog == "reduce" and _flydsl_stage2_fp8_enabled()
     if _s2_fp8_inter:
         _s2_fp8_inter = sorted_weights is not None and topk_weights is not None
-    _defer_w = _s2_fp8_inter
+    # AITER_MXFP4_INTERMEDIATE: the same deferred-weight route rows, values in MXFP4.
+    _s2_fp4_inter = (
+        not _s2_fp8_inter
+        and epilog == "reduce"
+        and _mxfp4_intermediate_enabled()
+        and sorted_weights is not None
+        and topk_weights is not None
+        and model_dim_runtime % 32 == 0
+    )
+    _defer_w = _s2_fp8_inter or _s2_fp4_inter
     _fp8_scale_blk = None
     _fp8_pitch_align = None
     _s2_fp4_scatter = (
@@ -2725,19 +4329,15 @@ def _flydsl_v2_stage2_wrapper(
                 "epilog='scatter' FlyDSL GEMM2 requires reverse_sorted and sorted_weights"
             )
         if _s2_fp4_scatter:
-            target = torch.empty(
-                (max_sorted, model_dim_runtime // 2),
-                dtype=torch.uint8,
-                device=out.device,
+            target = _stage2_scratch(
+                "target", (max_sorted, model_dim_runtime // 2), torch.uint8, out.device
             )
-            target_scale = torch.empty(
-                (max_sorted, model_dim_runtime // 32),
-                dtype=torch.uint8,
-                device=out.device,
+            target_scale = _stage2_scratch(
+                "scale", (max_sorted, model_dim_runtime // 32), torch.uint8, out.device
             )
         else:
-            target = torch.empty(
-                (max_sorted, model_dim_runtime), dtype=out.dtype, device=out.device
+            target = _stage2_scratch(
+                "target", (max_sorted, model_dim_runtime), out.dtype, out.device
             )
     elif epilog == "reduce":
         if _s2_fp8_inter:
@@ -2756,7 +4356,8 @@ def _flydsl_v2_stage2_wrapper(
             _fp8_scale_blk = fp8out_scale_blk(model_dim_runtime)
             _fp8_pitch_align = FP8OUT_PITCH_ALIGN
 
-            target = torch.empty(
+            target = _stage2_scratch(
+                "target",
                 (
                     token_num * topk,
                     fp8out_row_bytes(
@@ -2765,14 +4366,21 @@ def _flydsl_v2_stage2_wrapper(
                         pitch_align=_fp8_pitch_align,
                     ),
                 ),
-                dtype=torch.uint8,
-                device=out.device,
+                torch.uint8,
+                out.device,
+            )
+        elif _s2_fp4_inter:
+            from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp4out_row_bytes
+
+            target = _stage2_scratch(
+                "target",
+                (token_num * topk, fp4out_row_bytes(model_dim_runtime)),
+                torch.uint8,
+                out.device,
             )
         else:
-            target = torch.empty(
-                (token_num, topk, model_dim_runtime),
-                dtype=out.dtype,
-                device=out.device,
+            target = _stage2_scratch(
+                "target", (token_num, topk, model_dim_runtime), out.dtype, out.device
             )
         if expert_mask is not None:
             # EP sorting omits remote and fake routes, so GEMM2 intentionally
@@ -2806,11 +4414,18 @@ def _flydsl_v2_stage2_wrapper(
         persist=cfg["persist"],
         g2_bf16_lds=cfg["bf16_lds"],
         g2_spart=cfg["spart"],
-        out_dtype="fp8" if _s2_fp8_inter else ("fp4" if _s2_fp4_scatter else "bf16"),
+        out_dtype=(
+            "fp8"
+            if _s2_fp8_inter
+            else ("fp4" if (_s2_fp4_scatter or _s2_fp4_inter) else "bf16")
+        ),
         bias=bias2,
         is_ep=expert_mask is not None,
         out_scale=target_scale,
         use_valid_token_count=use_valid_token_count,
+        g2_scatter_lds_pairs=cfg["scatter_lds_pairs"]
+        and not _s2_fp4_scatter
+        and bias2 is None,
     )
     if _s2_fp4_scatter:
         aiter.mxfp4_moe_scatter_reduce_q(
@@ -2852,8 +4467,266 @@ def _flydsl_v2_stage2_wrapper(
             topk_weights=topk_weights if _defer_w else None,
             fp8_scale_blk=_fp8_scale_blk,
             fp8_pitch_align=_fp8_pitch_align,
+            is_fp4=_s2_fp4_inter,
         )
     return out
+
+
+def _flydsl_v2_stage2_per_slot(
+    per_slot_out,
+    cfg,
+    inter_states,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    topk,
+    *,
+    model_dim,
+    inter_dim,
+    num_experts,
+    w2_scale,
+    a2_scale,
+    sorted_weights,
+    bias2,
+    block_m,
+    is_ep,
+    use_valid_token_count,
+):
+    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+
+    sbm = cfg["sort_block_m"] or (int(block_m) if block_m else cfg["tile_m"])
+    if cfg["sort_block_m"] and block_m is not None and int(block_m) != sbm:
+        raise ValueError(
+            "FlyDSL v2 stage2 sorting layout mismatch: moe_sorting uses "
+            f"block_m={int(block_m)}, but the kernel expects sort_block_m={sbm}."
+        )
+    mxfp4_moe_gemm2(
+        inter_sorted_quant=_mxfp4_scale_u8(inter_states),
+        inter_sorted_shuffled_scale=_mxfp4_scale_u8(a2_scale),
+        w2_u8=_mxfp4_scale_u8(w2),
+        w2_scale_u8=_mxfp4_scale_u8(w2_scale),
+        sorted_expert_ids=sorted_expert_ids,
+        cumsum_tensor=num_valid_ids,
+        sorted_token_ids=sorted_token_ids,
+        sorted_weights=sorted_weights,
+        out=per_slot_out,
+        M_logical=per_slot_out.shape[0],
+        max_sorted=inter_states.shape[0],
+        NE=num_experts,
+        D_HIDDEN=model_dim,
+        D_INTER=inter_dim,
+        topk=topk,
+        BM=cfg["tile_m"],
+        BN=cfg["tile_n"],
+        BK=cfg["tile_k"],
+        use_nt=cfg["use_nt"],
+        a_dtype=cfg["a_dtype"],
+        b_dtype=cfg["b_dtype"],
+        epilog="reduce",
+        SBM=sbm,
+        persist=cfg["persist"],
+        g2_bf16_lds=cfg["bf16_lds"],
+        g2_spart=cfg["spart"],
+        out_dtype="bf16",
+        bias=bias2,
+        is_ep=is_ep,
+        use_valid_token_count=use_valid_token_count,
+    )
+    return per_slot_out
+
+
+def _mxmoe_opus_cfg_unsupported(
+    p1: dict,
+    kernel_name2: str,
+    cfg: dict,
+    *,
+    gfx: str,
+    model_dim: int,
+    inter_dim: int,
+    expert: int,
+    topk: int,
+    dtype: torch.dtype,
+    q_dtype_a: torch.dtype,
+    q_dtype_w: torch.dtype,
+    q_type: QuantType,
+    use_g1u1: bool,
+    doweight_stage1: bool,
+    gate_mode: GateMode,
+    hidden_pad: int,
+    intermediate_pad: int,
+    is_ep: bool,
+    has_stage2_bias: bool,
+    q_dtype_a2: torch.dtype | None,
+    input_dtype: torch.dtype | None,
+    has_stage2_scatter: bool,
+    has_num_local_tokens: bool,
+) -> str:
+    """Static common contract for the explicit MXMOE -> OPUS selection."""
+    if (p1["a_dtype"], p1["out_dtype"]) != ("fp8", "fp8"):
+        return "GEMM1 requires A8W4 and FP8out"
+    if dtype != dtypes.bf16 or q_dtype_a != dtypes.fp8:
+        return "requires BF16 final output and explicit FP8 activation precision"
+    if q_dtype_w != dtypes.fp4x2 or q_type != QuantType.per_1x32:
+        return "requires per-1x32 MXFP4 weights"
+    if not use_g1u1 or gate_mode != GateMode.INTERLEAVE or doweight_stage1:
+        return "requires G1U1, INTERLEAVE W1 and doweight_stage1=False"
+    if hidden_pad or intermediate_pad:
+        return "hidden/intermediate padding is not supported"
+    if has_stage2_scatter or has_num_local_tokens:
+        return "stage2_scatter/num_local_tokens is not supported"
+    if not aiter.is_mxfp4_moe_shape_supported(expert, model_dim, inter_dim, topk):
+        return "generated MXFP4 auxiliary shape is not registered"
+    if q_dtype_a2 not in (None, dtypes.fp8):
+        return "requires FP8 intermediate precision"
+    if input_dtype not in (None, dtypes.bf16, dtypes.fp8):
+        return "requires raw BF16 or prequantized FP8 input"
+    if p1["inline_quant"] and input_dtype == dtypes.fp8:
+        return "inline GEMM1 reads BF16 and cannot accept FP8 input"
+    supported, reason = _opus_a8w4.cfg_is_supported(
+        kernel_name2,
+        cfg=cfg,
+        gfx=gfx,
+        block_m=cfg.get("block_m", BLOCK_SIZE_M),
+        is_ep=is_ep,
+        has_stage2_bias=has_stage2_bias,
+    )
+    if not supported:
+        return reason
+    launch = _opus_a8w4.parse_stage2_config(cfg, cfg.get("block_m", BLOCK_SIZE_M))
+    if p1["BM"] != launch.sort_block_m:
+        return f"GEMM1 BM={p1['BM']} requires OPUS SBM={p1['BM']}"
+    if inter_dim < 256 or inter_dim % 128:
+        return "OPUS requires inter_dim >= 256 and divisible by 128"
+    if model_dim % launch.instance.block_n:
+        return f"model_dim must be divisible by OPUS block_n={launch.instance.block_n}"
+    from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
+
+    try:
+        _assert_supported(
+            D_HIDDEN=model_dim,
+            D_INTER=inter_dim,
+            BM=p1["BM"],
+            BN=p1["BN"],
+            BK=p1["BK"],
+            use_nt=p1["use_nt"],
+            inline_quant=p1["inline_quant"],
+            prefetch_hidden=p1["prefetch_hidden"],
+            a_dtype=p1["a_dtype"],
+            out_dtype=p1["out_dtype"],
+            act=p1["act"],
+            num_waves=p1["num_waves"],
+            k_wave=p1["k_wave"],
+            native_scale_layout=False,
+        )
+    except NotImplementedError as exc:
+        return str(exc)
+    if p1["splitk"]:
+        return "split-K GEMM1 is not supported"
+    return ""
+
+
+def _is_mxmoe_opus_metadata(metadata: MOEMetadata) -> bool:
+    return (
+        getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
+        and getattr(metadata.stage2, "func", metadata.stage2)
+        is _opus_a8w4.opus_a8w4_stage2_wrapper
+    )
+
+
+def _mxmoe_gemm2_sort_block_m(kernel_name2, sort_block_m):
+    """GEMM2's sort block; a layout-v2 name without _sbm reads the actual one."""
+    v2 = parse_flydsl_v2_gemm2_kernel(kernel_name2)
+    if v2 is not None:
+        return v2["sort_block_m"] or sort_block_m
+    if _is_mxfp4_kname(kernel_name2):
+        return _parse_mxfp4_g2_kname(kernel_name2)["BM"]
+    return sort_block_m
+
+
+def _mxmoe_opus_call_unsupported(
+    metadata: MOEMetadata,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    a1_scale: torch.Tensor | None,
+    topk_ids: torch.Tensor,
+    *,
+    block_size_M: int | None,
+) -> str:
+    """Check tensor preparation and the actual sort before each public call."""
+    if block_size_M is not None and int(block_size_M) != int(metadata.block_m):
+        return f"block_size_M={block_size_M} differs from configured BM/SBM={metadata.block_m}"
+    if not (getattr(w1, "is_shuffled", False) and getattr(w2, "is_shuffled", False)):
+        return "both weights must be marked is_shuffled=True"
+    if w1.dtype != dtypes.fp4x2 or w2.dtype != dtypes.fp4x2:
+        return "both weights must retain packed MXFP4 dtype"
+    tensors = [hidden_states, w1, w2, w1_scale, w2_scale, topk_ids]
+    if w1_scale is None or w2_scale is None:
+        return "both weights require E8M0 scales"
+    if any(
+        scale.dtype not in (torch.uint8, dtypes.fp8_e8m0)
+        for scale in (w1_scale, w2_scale)
+    ):
+        return "weight scales require one-byte E8M0 storage"
+    experts, hidden, inter = w1.shape[0], w2.shape[1], w2.shape[-1] * 2
+    if hidden_states.shape[1] != hidden or w1.shape[-1] * 2 != hidden:
+        return "activation and packed W1 dimensions do not match model_dim"
+    if w1_scale.numel() < experts * 2 * inter * _padded_scale_cols(hidden):
+        return "W1 scales are smaller than the padded preshuffle stride"
+    if (
+        w2_scale.dim() != 2
+        or w2_scale.shape[0] != experts * hidden
+        or w2_scale.shape[1] != _padded_scale_cols(inter)
+    ):
+        return (
+            "W2 scales require contiguous [expert * model_dim, padded group32] storage"
+        )
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        return "weights, scales, activation and routing must be contiguous"
+    if len({tensor.device for tensor in tensors}) != 1:
+        return "cross-device tensors"
+    if hidden_states.dtype == dtypes.fp8:
+        if a1_scale is None:
+            raise ValueError(
+                "MXFP8 input requires original per-token E8M0 activation scales"
+            )
+        expected = (hidden_states.shape[0], hidden_states.shape[1] // 32)
+        if tuple(a1_scale.shape) != expected or a1_scale.dtype not in (
+            torch.uint8,
+            dtypes.fp8_e8m0,
+        ):
+            raise ValueError(
+                f"MXFP8 input requires per-token group32 E8M0 scales of shape {expected}"
+            )
+        if not a1_scale.is_contiguous() or a1_scale.device != hidden_states.device:
+            raise ValueError(
+                "MXFP8 activation scales must be contiguous and on the input device"
+            )
+    M, topk = topk_ids.shape
+    generated_sort = not _aux_uses_opus(
+        metadata.output_aux, metadata.block_m, M * topk, w1.shape[0]
+    ) and _MOE_SORT_BACKEND not in ("opus", "ck")
+    if generated_sort and not _mxfp4_aux_instance_supported(
+        w1.shape[0],
+        topk,
+        w2.shape[1],
+        int(metadata.block_m),
+        not stage2_uses_route_reduce(metadata.stage2),
+    ):
+        raise _MissingMxfp4MoeAuxInstances(
+            [
+                (
+                    w1.shape[0],
+                    topk,
+                    w2.shape[1],
+                    not stage2_uses_route_reduce(metadata.stage2),
+                )
+            ]
+        )
+    return ""
 
 
 def _make_mxfp4_metadata(
@@ -2866,34 +4739,59 @@ def _make_mxfp4_metadata(
     run_1stage=False,
     has_stage1_bias=False,
     has_stage2_bias=False,
+    opus_launch=None,
+    route_bucket_metadata=None,
 ):
     p1 = _parse_mxfp4_g1_kname(kernel_name1)
     # Use the stage2 dispatch parser so metadata only promises supported bias.
     is_layout_gemm2 = parse_flydsl_v2_gemm2_kernel(kernel_name2) is not None
-    if not (_is_mxfp4_kname(kernel_name2) or is_layout_gemm2):
+    is_opus = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernel_name2)
+    if not (_is_mxfp4_kname(kernel_name2) or is_layout_gemm2 or is_opus):
         raise ValueError(
             "MXMOE GEMM1 requires a native or layout GEMM2 backend, "
             f"got {kernel_name2!r}"
         )
+    resolved_block_m = p1["BM"] if block_m is None else int(block_m)
+    if is_opus and opus_launch is None:
+        opus_launch = _opus_a8w4.parse_stage2_config(
+            {"kernelName2": kernel_name2}, resolved_block_m
+        )
+    stage2 = (
+        functools.partial(
+            _opus_a8w4.opus_a8w4_stage2_wrapper,
+            kernelName=kernel_name2,
+            launch=opus_launch,
+        )
+        if is_opus
+        else functools.partial(_mxfp4_a4w4_stage2_fw, kernelName2=kernel_name2)
+    )
     return MOEMetadata(
         stage1=functools.partial(
             _mxfp4_a4w4_stage1_fw,
             kernelName1=kernel_name1,
             interleave=(gate_mode == GateMode.INTERLEAVE),
+            native_scale_layout=native_scale_layout_for(
+                p1["BM"], p1["out_dtype"], kernel_name2
+            ),
         ),
-        stage2=functools.partial(_mxfp4_a4w4_stage2_fw, kernelName2=kernel_name2),
-        block_m=p1["BM"] if block_m is None else int(block_m),
+        stage2=stage2,
+        block_m=resolved_block_m,
         ksplit=int(ksplit),
         run_1stage=bool(run_1stage),
         fuse_quant=p1["out_dtype"],
         output_aux=AUX_SORT_OPUS,
         prequant=p1["a_dtype"] == "fp8" and not p1["inline_quant"],
-        has_bias=has_stage1_bias and p1.get("enable_bias", False),
+        has_bias=has_stage1_bias,
         stage2_has_bias=has_stage2_bias and is_layout_gemm2,
+        **(route_bucket_metadata or {}),
     )
 
 
-def _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode):
+def _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode, gate_up_interleave=None):
+    if gate_up_interleave is not None:
+        return (gate_up_interleave is False and gate_mode == GateMode.SEPARATED) or (
+            gate_up_interleave is True and gate_mode == GateMode.INTERLEAVE
+        )
     return (
         q_dtype_a in (dtypes.bf16, dtypes.fp4x2) and gate_mode == GateMode.SEPARATED
     ) or (q_dtype_a == dtypes.fp8 and gate_mode == GateMode.INTERLEAVE)
@@ -2918,6 +4816,7 @@ def _can_reroute_mxfp4_to_flydsl(
     use_g1u1,
     doweight_stage1,
     gate_mode,
+    gate_up_interleave=None,
 ):
     """Whether the heuristic FlyDSL path accepts this MXFP4 shape and layout."""
     return (
@@ -2928,11 +4827,302 @@ def _can_reroute_mxfp4_to_flydsl(
         and activation == ActivationType.Swiglu
         and inter_dim % 128 == 0
         and model_dim % 256 == 0
-        and _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode)
+        and _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode, gate_up_interleave)
         and is_shuffled
         and use_g1u1
         and not doweight_stage1
     )
+
+
+# Widest row fused_dynamic_mx_quant_moe_sort quantizes (32 elements per thread,
+# 256 threads; csrc/kernels/quant_kernels.cu).
+_MX_QUANT_SORT_MAX_COLS = 8192
+
+
+def _check_deterministic_supported(
+    *,
+    dtype,
+    quant_type,
+    q_dtype_w,
+    q_dtype_a,
+    q_dtype_a2,
+    activation,
+    gate_mode,
+    gate_up_interleave,
+    is_shuffled,
+    is_g1u1,
+    doweight_stage1,
+    expert_mask,
+    stage2_scatter,
+    a1_scale,
+    a2_scale,
+    block_size_M,
+    tokens,
+    model_dim,
+    inter_dim,
+    hidden_pad,
+    intermediate_pad,
+    has_bias1,
+    has_bias2,
+    weight_bytes,
+):
+    """Raise NotImplementedError naming what fused_moe(deterministic=True) cannot run."""
+    layout = {True: "gate/up-interleaved", False: "separated"}.get(
+        gate_up_interleave, "untagged"
+    )
+    unsupported = [
+        why
+        for bad, why in (
+            (
+                not (quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2),
+                f"weights other than MXFP4 ({quant_type!s}, {q_dtype_w})",
+            ),
+            (
+                # MXFP4 activations lose accuracy against the default.
+                q_dtype_a != dtypes.fp8,
+                f"activation dtype {q_dtype_a} (MXFP8 only)",
+            ),
+            (
+                q_dtype_a2 is not None and q_dtype_a2 != q_dtype_a,
+                (
+                    f"stage-2 activation dtype {q_dtype_a2} (must match the stage-1 "
+                    f"activation dtype {q_dtype_a})"
+                ),
+            ),
+            (dtype != dtypes.bf16, f"output dtype {dtype} (bf16 only)"),
+            (
+                # SwiGLU and SiLU are where the default also quantizes the
+                # activations (from 256 tokens); SiTUv2's default keeps bf16.
+                activation not in (ActivationType.Swiglu, ActivationType.Silu),
+                f"activation {activation!s} (SwiGLU or SiLU only)",
+            ),
+            (
+                # The MXFP8-activation (a8w4) kernels take the gate/up-interleaved
+                # preshuffle only.
+                gate_mode != GateMode.INTERLEAVE
+                or not _flydsl_mxfp4_layout_is_compatible(
+                    dtypes.fp8, gate_mode, gate_up_interleave
+                ),
+                (
+                    f"{layout} weights with gate_mode={gate_mode.value!r} "
+                    "(gate/up-interleaved only)"
+                ),
+            ),
+            (not is_shuffled, "w1 and w2 not both preshuffled"),
+            (
+                not (is_g1u1 and not doweight_stage1),
+                "non-g1u1 weights or doweight_stage1=True",
+            ),
+            (expert_mask is not None, "expert-parallel masking"),
+            (stage2_scatter is not None, "stage2_scatter"),
+            (
+                a1_scale is not None or a2_scale is not None,
+                "prequantized activations",
+            ),
+            (
+                block_size_M is not None
+                and int(block_size_M) != _deterministic_block_m(tokens),
+                (
+                    f"block_size_M={block_size_M} "
+                    f"(uses {_deterministic_block_m(tokens)})"
+                ),
+            ),
+            (
+                # Only multiples of 512 have been validated with the deterministic
+                # kernels.
+                model_dim % 512 != 0,
+                f"hidden size {model_dim} (a multiple of 512 only)",
+            ),
+            (
+                # Both stages quantize their activations to MXFP8 at every token
+                # count; at small batches that is the fused quantize-and-sort
+                # kernel, which takes at most 8,192 columns.
+                max(model_dim, inter_dim) > _MX_QUANT_SORT_MAX_COLS,
+                (
+                    f"hidden size {model_dim} / intermediate size {inter_dim} "
+                    f"(at most {_MX_QUANT_SORT_MAX_COLS})"
+                ),
+            ),
+            (
+                # Without a stage-2 bias the padded output columns are not stored
+                # before the top-k reduction reads them.
+                hidden_pad > 0 and not has_bias2,
+                "hidden padding without a stage-2 bias",
+            ),
+            (
+                # Without a stage-1 bias stage 1 skips the padded intermediate
+                # columns, while stage 2 with a bias reads them.
+                intermediate_pad > 0 and has_bias2 and not has_bias1,
+                "intermediate padding with a stage-2 bias but no stage-1 bias",
+            ),
+            (
+                # The kernels address each weight with one 32-bit buffer
+                # descriptor, so experts past 4 GiB would read other experts.
+                weight_bytes > FHMOE_BUFFER_MAX_BYTES,
+                f"weights of {weight_bytes} bytes (at most 4 GiB per projection)",
+            ),
+            (get_gfx_runtime() != "gfx950", f"gfx={get_gfx_runtime()!r}"),
+        )
+        if bad
+    ]
+    if unsupported:
+        raise NotImplementedError(
+            "fused_moe(deterministic=True) does not support: " + "; ".join(unsupported)
+        )
+
+
+def _deterministic_block_m(tokens: int) -> int:
+    # At tile_m 32 the a8w4 (MXFP8-activation) stage 1 with tile_n 128 gives a
+    # different result from run to run on gfx950, so the tile height starts at 64.
+    return 64 if tokens <= 2048 else 128
+
+
+def _deterministic_metadata(
+    tokens, activation, dtype, quant_type, hidden_pad, intermediate_pad
+):
+    """FlyDSL a8w4 (MXFP8 x MXFP4) kernels with one K structure for every token count.
+
+    The tuned MXFP4 configurations change the stage-1 K waves, the fused fp4
+    output and the stage-2 kernel family (v1 / v2 layout, tile_k 128 / 256) with
+    the token count, and each changes how a row's sums are split. Deterministic
+    mode always runs stage 1 with a single K wave (k_wave 1; the _w2 in the
+    kernel name is waves_per_eu 2) and tile_k 256, and stage 2 with the
+    non-atomic reduce epilogue instead of atomic adds of the top-k partials,
+    without split-K, skipping dropped routes in the reduction. Only the tile
+    height grows with the token count, which does not change a row's reduction.
+    """
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    block_m = _deterministic_block_m(tokens)
+    # The a8w4 stage-1 kernels read gate/up-interleaved weights (_gui). The tile
+    # width only splits the output columns, so a row's K reduction is the same at
+    # both widths; the wider tile is faster from tile_m 128.
+    tile_n = 128 if block_m <= 64 else 256
+    kn1 = f"flydsl_moe1_afp8_wfp4_bf16_t{block_m}x{tile_n}x256_w2_gui"
+    kn2 = f"flydsl_moe2_afp8_wfp4_bf16_t{block_m}x128x256_reduce"
+    for kn in (kn1, kn2):
+        params = get_flydsl_kernel_params(kn)
+        if params is None or params.get("k_batch", 1) != 1:
+            raise NotImplementedError(f"{kn} is not registered without split-K")
+    enable_bias = _needs_swiglu_bias_support(dtype, quant_type)
+    return MOEMetadata(
+        functools.partial(
+            _flydsl_stage1_wrapper,
+            kernelName=kn1,
+            activation=activation,
+            inter_dim_pad=intermediate_pad,
+            model_dim_pad=hidden_pad,
+        ),
+        functools.partial(
+            _flydsl_stage2_wrapper,
+            kernelName=kn2,
+            inter_dim_pad=intermediate_pad,
+            model_dim_pad=hidden_pad,
+            # The sort leaves out dropped routes (topk_ids -1), so their rows of
+            # the per-slot output are never written; the reduction skips them.
+            skip_dropped_routes=True,
+        ),
+        block_m,
+        -1,  # no split-K
+        False,
+        has_bias=enable_bias,
+        stage2_has_bias=enable_bias,
+    )
+
+
+def _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled):
+    # is_shuffled is true when either weight is tagged. weights_shuffled is
+    # the both-weights flag when the caller passed opus_weights_shuffled,
+    # which fused_moe and fused_moe_2stages do. gfx is the live device;
+    # get_gfx() follows GPU_ARCHS and can hide an actual gfx950 process.
+    if (
+        gfx == "gfx950"
+        and q_dtype_w == dtypes.fp8
+        and q_type in (QuantType.per_Tensor, QuantType.per_Token)
+        and not weights_shuffled
+    ):
+        raise RuntimeError(
+            "gfx950 fp8 CK MoE reads the shuffle_weight() layout on "
+            "both w1 and w2; unshuffled per_Tensor and per_Token "
+            "weights are unsupported"
+        )
+
+
+def _swiglu_limit_is_active(swiglu_limit) -> bool:
+    """True only when the caller asked for a finite positive clamp bound.
+
+    ``None``, ``0.0``, and ``+inf`` are dispatch sentinels: vLLM's ROCm adapter
+    sends ``0.0`` when the config limit is unset, and those calls must stay on
+    CK. This is not kernel clamp encoding. Once a call is on a16wmix,
+    ``runtime_swiglu_limit`` maps a SwiGLU ``None``/``0.0`` to 7.0 (only ``+inf``
+    turns that clamp off). Rerouting those sentinels would start clamping
+    existing SwiGLU callers at 7, so they must not count as active here.
+    """
+    if swiglu_limit is None:
+        return False
+    try:
+        value = float(swiglu_limit)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(value) and value > 0.0
+
+
+# a16wmix gemm1 clamps SwiGLU natively and SiLU via clamp_gate_up then
+# silu_mul_batch (the shared helper stays unclamped for mixed_moe).
+_A16WMIX_BF16_ACTIVATIONS = (ActivationType.Silu, ActivationType.Swiglu)
+# The port's only arch split is gfx942 vs everything else (gfx950 16x16x32
+# MFMA, buffer_atomic_pk_add_bf16). gfx90a compiles with
+# "s_waitcnt is not supported on target arch 'gfx90a'". Same CDNA pair as the
+# a16w4 FlyDSL guard below.
+_A16WMIX_BF16_ARCHS = ("gfx942", "gfx950")
+
+
+def _can_reroute_bf16_to_a16wmix(
+    *,
+    gfx,
+    model_dim,
+    inter_dim,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    q_type,
+    activation,
+    is_shuffled,
+    use_g1u1,
+    doweight_stage1,
+    swiglu_limit,
+    has_stage1_bias,
+    hidden_pad,
+    intermediate_pad,
+):
+    """Whether untuned/CK BF16 QuantType.No can take the a16wmix a16w16 port.
+
+    Not a default-path swap: ``None`` / ``0.0`` / ``+inf`` stay on CK, so
+    existing callers stay bit-identical. The finite limit is the gate; there is
+    no ``AITER_*`` override. Weights must be preshuffled; a16wmix consumes
+    shuffle_weight (16,16). ``gfx`` is the live device from
+    ``get_gfx_runtime()``.
+    """
+    # gfx90a and RDNA must not fall through to the gfx950 compile path.
+    if gfx not in _A16WMIX_BF16_ARCHS:
+        return False
+    if not (
+        dtype == dtypes.bf16
+        and q_type == QuantType.No
+        and q_dtype_a == dtypes.bf16
+        and q_dtype_w == dtypes.bf16
+        and activation in _A16WMIX_BF16_ACTIVATIONS
+        and use_g1u1
+        and is_shuffled
+        and not doweight_stage1
+        and not has_stage1_bias
+        and not hidden_pad
+        and not intermediate_pad
+        and model_dim % 128 == 0
+        and inter_dim % 128 == 0
+    ):
+        return False
+    return _swiglu_limit_is_active(swiglu_limit)
 
 
 @functools.lru_cache(maxsize=2048)
@@ -2960,6 +5150,7 @@ def get_2stage_cfgs(
     situ_linear_beta=1.0,
     swiglu_limit=None,
     opus_weights_shuffled=None,
+    gate_up_interleave=None,
     config_file=None,
     _disable_inline_sort=False,
     q_dtype_a2=None,
@@ -2967,9 +5158,13 @@ def get_2stage_cfgs(
     has_stage2_scatter=False,
     has_activation_scales=False,
     has_num_local_tokens=False,
+    _exclude_mxmoe=False,
+    _has_input_activation_scales=False,
 ):
     gate_mode = GateMode(gate_mode)
     cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
+    if q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES and activation == ActivationType.Silu:
+        swiglu_limit = normalize_swiglu_limit(swiglu_limit)
     flydsl_can_take_over = _can_reroute_mxfp4_to_flydsl(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -2982,7 +5177,33 @@ def get_2stage_cfgs(
         use_g1u1=use_g1u1,
         doweight_stage1=doweight_stage1,
         gate_mode=gate_mode,
+        gate_up_interleave=gate_up_interleave,
     )
+    if activation == ActivationType.Relu2:
+        if use_g1u1:
+            raise NotImplementedError(
+                "ActivationType.Relu2 is gate-only (non-gated) and does not "
+                "support use_g1u1=True; pass use_g1u1=False."
+            )
+        if doweight_stage1:
+            raise NotImplementedError(
+                "ActivationType.Relu2 CK-Tile stage1 instances are generated "
+                "with MulRoutedWeight=False; doweight_stage1=True is not "
+                "supported and would silently drop routed weights."
+            )
+        if has_stage1_bias or has_stage2_bias:
+            raise NotImplementedError(
+                "ActivationType.Relu2 CK-Tile path does not support "
+                "per-expert bias (has_stage1_bias/has_stage2_bias); the "
+                "returned metadata hardcodes has_bias=False."
+            )
+        if gate_mode != GateMode.SEPARATED:
+            raise NotImplementedError(
+                "ActivationType.Relu2 CK-Tile stage1 instance "
+                "(kFFN_gemm1_gate_only) only supports the gate-only/"
+                f"separated weight layout; gate_mode={gate_mode.value!r} "
+                "is not supported."
+            )
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
     # (e.g. gfx950 vs gfx1250, both report 256 CU) don't collide. Legacy CSVs
     # without a `gfx` column are backfilled from cu_num at load time via
@@ -3022,12 +5243,15 @@ def get_2stage_cfgs(
             df.loc[bad, "gfx"] = df.loc[bad, "cu_num"].map(gfx_from_cu_num)
         return df
 
-    def get_cfg_2stages(tune_file):
+    def get_cfg_2stages(tune_file, tag=None):
         import pandas as pd
 
         df = pd.read_csv(tune_file)
         df = _ensure_gfx_column(df)
-        if "_tag" in df.columns:
+        if tag is not None:
+            tags = df["_tag"] if "_tag" in df.columns else pd.Series("", index=df.index)
+            df = df[tags.fillna("").astype(str) == tag]
+        elif "_tag" in df.columns:
             df = df[df["_tag"].fillna("") != "flydsl_fallback"]
 
         # Primary dict: keep original act_type for exact-match lookup.
@@ -3172,6 +5396,37 @@ def get_2stage_cfgs(
         return result
 
     cfg = _lookup_cfg(active_cfg_2stages)
+    limit_tag = (
+        swiglu_limit_tag(swiglu_limit)
+        if config_file is None
+        and q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
+        and activation == ActivationType.Silu
+        else ""
+    )
+    if limit_tag:
+        limit_tune_file = AITER_CONFIGS.AITER_CONFIG_FMOE_SWIGLU_LIMIT_FILE
+        # Rows tuned by gemm_moe_tune.py --swiglu_limit, tagged with the limit.
+        limit_cfgs = cfg_2stages_by_limit_tag.get((limit_tune_file, limit_tag))
+        if limit_cfgs is None:
+            limit_cfgs = get_cfg_2stages(limit_tune_file, tag=limit_tag)
+            cfg_2stages_by_limit_tag[(limit_tune_file, limit_tag)] = limit_cfgs
+        limit_cfg = _lookup_cfg(limit_cfgs)
+        if limit_cfg is not None:
+            if (
+                limit_cfg.get("run_1stage", False)
+                or int(limit_cfg.get("ksplit", 0) or 0) > 1
+                or "_silu_" not in str(limit_cfg.get("kernelName1", ""))
+                or "Splitk" in str(limit_cfg.get("kernelName1", ""))
+            ):
+                raise ValueError(
+                    "Incompatible runtime SiLU limit tuning row; retune with "
+                    "non-split CK SiLU instances"
+                )
+            cfg = limit_cfg
+        else:
+            logger.info(
+                f"[fused_moe] no row for {keys} with {limit_tag}; using default config"
+            )
     if (
         cfg is None
         and config_file is None
@@ -3188,6 +5443,28 @@ def get_2stage_cfgs(
     if cfg is not None:
         kn1 = str(cfg.get("kernelName1", "") or "").strip()
         kn2 = str(cfg.get("kernelName2", "") or "").strip()
+        # Invalid MXMOE names must fail before a backend/layout check can
+        # silently discard the row and substitute a heuristic kernel.
+        parsed_g1 = _parse_mxfp4_g1_kname(kn1) if _is_mxfp4_kname(kn1) else None
+        if (
+            parsed_g1 is not None
+            and _opus_a8w4.is_opus_a8w4_stage2_kernel(kn2)
+            and q_dtype_a2 not in (None, dtypes.fp8)
+        ):
+            # The existing A8W4 heuristic fallback consumes FP8 intermediate.
+            # Discarding this row cannot satisfy a different explicit request.
+            raise NotImplementedError(
+                f"No fallback backend for MXMOE -> OPUS supports requested intermediate precision {q_dtype_a2}; requires FP8"
+            )
+        if (
+            parsed_g1 is not None
+            and _opus_a8w4.is_opus_a8w4_stage2_kernel(kn2)
+            and input_dtype == dtypes.fp8
+            and not _has_input_activation_scales
+        ):
+            raise ValueError(
+                "MXFP8 input requires original per-token E8M0 activation scales"
+            )
         has_opus = kn1.startswith("opus_") or kn2.startswith("opus_")
         if opus_weights_shuffled is None:
             opus_weights_shuffled = is_shuffled
@@ -3206,6 +5483,18 @@ def get_2stage_cfgs(
             cfg = None
             logger.warning(
                 f"[fused_moe] discarding Opus tuned config for unsupported "
+                f"activation {activation}; using default heuristics"
+            )
+        elif (
+            kn1.startswith("flydsl_") or kn2.startswith("flydsl_")
+        ) and activation not in (
+            ActivationType.Silu,
+            ActivationType.Swiglu,
+            ActivationType.Situv2,
+        ):
+            cfg = None
+            logger.warning(
+                f"[fused_moe] discarding FlyDSL tuned config for unsupported "
                 f"activation {activation}; using default heuristics"
             )
         elif _disable_inline_sort and _is_inline_sort_cfg(kn1, kn2):
@@ -3235,8 +5524,54 @@ def get_2stage_cfgs(
                     "incomplete metadata"
                 )
 
+    if (
+        cfg is not None
+        and cfg.get("run_1stage", False)
+        and kn1.startswith("_ZN5aiter")
+        and activation == ActivationType.Situv2
+        and q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+    ):
+        if is_shuffled:
+            if not opus_weights_shuffled:
+                raise ValueError(
+                    "SiTUv2 MXFP4 requires both w1 and w2 to use the same "
+                    "preshuffled weight layout"
+                )
+            if gate_mode != GateMode.SEPARATED or gate_up_interleave is True:
+                raise ValueError("SiTUv2 A16W4 requires separated preshuffled weights")
+            cfg = None
+            logger.warning(
+                "[fused_moe] discarding 1-stage SiTUv2 ASM config for preshuffled "
+                "MXFP4 weights; using the two-stage layout-compatible path"
+            )
+        elif (
+            situ_beta != DEFAULT_SITUV2_BETA
+            or situ_linear_beta != DEFAULT_SITUV2_LINEAR_BETA
+        ):
+            raise ValueError(
+                "1-stage SiTUv2 ASM has fixed beta=4 and linear_beta=25; "
+                "use separated preshuffled weights for runtime betas"
+            )
+
+    if (
+        cfg is not None
+        and cfg.get("flat", AsmMoeMode.SORTED) == AsmMoeMode.POST_REDUCE
+        and (
+            gate_mode != GateMode.SEPARATED
+            or gate_up_interleave is True
+            or not opus_weights_shuffled
+        )
+    ):
+        if config_file is not None:
+            raise ValueError("Post-reduction requires separated, shuffled weights")
+        cfg = None
+        logger.warning(
+            "[fused_moe] discarding post-reduction config for incompatible weight layout; "
+            "using default heuristics"
+        )
+
     if cfg is not None and _is_mxfp4_kname(kn1):
-        parsed_g1 = _parse_mxfp4_g1_kname(kn1)
         configured_act = parsed_g1["act"]
         # Gelu/GeluTanh are real ActivationType values that MXMOE has no kernel
         # for. Folding them to "silu" would match a SiLU-tuned row and silently
@@ -3250,13 +5585,56 @@ def get_2stage_cfgs(
             reject_reason = f"no MXMOE kernel for activation {activation!r}"
         elif configured_act != expected_act:
             reject_reason = (
-                f"activation {configured_act!r} does not match runtime "
-                f"{expected_act!r}"
+                f"activation {configured_act!r} does not match runtime {expected_act!r}"
             )
         elif swiglu_limit and expected_act not in ("silu", "swiglu"):
             reject_reason = (
                 f"MXMOE cannot apply swiglu_limit={swiglu_limit!r} to "
                 f"activation {expected_act!r}"
+            )
+        elif _exclude_mxmoe:
+            reject_reason = "excluded for this invocation"
+        elif _opus_a8w4.is_opus_a8w4_stage2_kernel(kn2):
+            reject_reason = (
+                _mxmoe_opus_cfg_unsupported(
+                    parsed_g1,
+                    kn2,
+                    cfg,
+                    gfx=gfx,
+                    model_dim=model_dim,
+                    inter_dim=inter_dim,
+                    expert=expert,
+                    topk=topk,
+                    dtype=dtype,
+                    q_dtype_a=q_dtype_a,
+                    q_dtype_w=q_dtype_w,
+                    q_type=q_type,
+                    use_g1u1=use_g1u1,
+                    doweight_stage1=doweight_stage1,
+                    gate_mode=gate_mode,
+                    hidden_pad=hidden_pad,
+                    intermediate_pad=intermediate_pad,
+                    is_ep=is_ep,
+                    has_stage2_bias=has_stage2_bias,
+                    q_dtype_a2=q_dtype_a2,
+                    input_dtype=input_dtype,
+                    has_stage2_scatter=has_stage2_scatter,
+                    has_num_local_tokens=has_num_local_tokens,
+                )
+                or None
+            )
+        elif parsed_g1["inline_quant"] and input_dtype not in (None, dtypes.bf16):
+            reject_reason = (
+                f"inline GEMM1 reads BF16 and cannot accept {input_dtype} input"
+            )
+        elif not (
+            int(cfg.get("block_m", BLOCK_SIZE_M))
+            == parsed_g1["BM"]
+            == _mxmoe_gemm2_sort_block_m(kn2, parsed_g1["BM"])
+        ):
+            reject_reason = (
+                f"sort block_m={cfg.get('block_m', BLOCK_SIZE_M)} and GEMM2 {kn2!r} "
+                f"must both match GEMM1 BM={parsed_g1['BM']}"
             )
         elif not aiter.is_mxfp4_moe_shape_supported(expert, model_dim, inter_dim, topk):
             reject_reason = (
@@ -3264,8 +5642,6 @@ def get_2stage_cfgs(
                 f"(expert={expert}, model_dim={model_dim}, "
                 f"inter_dim={inter_dim}, topk={topk})"
             )
-        elif has_stage1_bias and not parsed_g1.get("enable_bias", False):
-            reject_reason = "stage1 bias is present but kernelName1 lacks '_bias'"
         elif has_stage2_bias and parse_flydsl_v2_gemm2_kernel(kn2) is None:
             reject_reason = (
                 f"stage2 bias requires a flydsl_moe2_layout_ kernel, got {kn2!r}"
@@ -3275,7 +5651,7 @@ def get_2stage_cfgs(
         if reject_reason is not None:
             cfg = None
             logger.warning(
-                f"[fused_moe] discarding MXMOE config: {reject_reason}; "
+                f"[fused_moe] discarding MXMOE config ({kn1!r}, {kn2!r}): {reject_reason}; "
                 f"using default heuristics"
             )
 
@@ -3303,6 +5679,36 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
+    # Runtime SiLU clamping is supported only by the non-split CK stage-1 epilogue
+    # and, for gfx942 per-token FP8, the FlyDSL backend, so it must reject ASM
+    # 1-stage and other FlyDSL whole-graph rows before they resolve.
+    clamp_silu_limit = (
+        bool(swiglu_limit)
+        and q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
+        and activation == ActivationType.Silu
+    )
+    flydsl_gfx942_row = (
+        gfx == "gfx942"
+        and q_type == QuantType.per_Token
+        and q_dtype_w == dtypes.fp8
+        and cfg is not None
+        and str(cfg.get("kernelName1", "")).startswith("impl__flydsl_gfx942__")
+    )
+    if clamp_silu_limit and cfg is not None and not flydsl_gfx942_row:
+        cfg_ksplit = int(cfg.get("ksplit", 0) or 0)
+        if (
+            cfg.get("run_1stage", False)
+            or "ck2stages" not in str(cfg.get("kernelName1", ""))
+            or cfg_ksplit > 1
+            or "_silu_" not in str(cfg.get("kernelName1", ""))
+        ):
+            logger.warning(
+                f"[fused_moe] discarding tuned config {cfg.get('kernelName1')!r} "
+                f"for {keys}: it cannot apply swiglu_limit={swiglu_limit!r}; "
+                "using default heuristics"
+            )
+            cfg = None
+
     bypass_tuned_config = int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0"))
     kernel_name1 = kn1 if cfg is not None else ""
     weights_shuffled = (
@@ -3316,6 +5722,13 @@ def get_2stage_cfgs(
         logger.warning(f"[fused_moe] {error}; using default heuristics.")
         cfg = None
         full_impl = None
+    # Only the clamped SiLU takes num_local_tokens on a FlyDSL row; the other
+    # rows keep the default heuristics for it.
+    clamped_silu = (
+        gfx == "gfx942"
+        and _swiglu_limit_is_active(swiglu_limit)
+        and activation == ActivationType.Silu
+    )
     if full_impl is not None and kernel_name1.startswith("impl__flydsl_"):
         unsupported = None
         if not weights_shuffled:
@@ -3330,7 +5743,7 @@ def get_2stage_cfgs(
             unsupported = "stage2_scatter"
         elif has_activation_scales:
             unsupported = "prequantized activations"
-        elif has_num_local_tokens:
+        elif has_num_local_tokens and not clamped_silu:
             unsupported = "num_local_tokens"
         elif hidden_pad or intermediate_pad:
             unsupported = "hidden/intermediate padding"
@@ -3345,6 +5758,36 @@ def get_2stage_cfgs(
                 f"[fused_moe] discarding FlyDSL whole-graph config for {keys}: "
                 f"unsupported {unsupported}; using default heuristics"
             )
+    # A clamped SiLU on gfx942 per-token FP8 weights with no FlyDSL row in use:
+    # the default heuristics take the 1-stage kernel, which cannot apply
+    # swiglu_limit, so run the gfx942 FlyDSL backend (it applies the clamp) at
+    # its default config for this token count. Tuned FlyDSL rows still win.
+    if (
+        full_impl is None
+        and (cfg is None or bypass_tuned_config or cfg.get("run_1stage", False))
+        and clamped_silu
+        and q_type == QuantType.per_Token
+        and q_dtype_w == dtypes.fp8
+        and use_g1u1
+        and weights_shuffled
+        and gate_mode is GateMode.SEPARATED
+        and input_dtype in (None, dtypes.bf16)
+        and not (
+            doweight_stage1
+            or has_stage1_bias
+            or has_stage2_bias
+            or has_activation_scales
+            or has_stage2_scatter
+            or hidden_pad
+            or intermediate_pad
+        )
+    ):
+        from aiter.ops.flydsl.fused_moe_gfx942 import default_config
+
+        flydsl_config = default_config(token)
+        kernel_name1 = make_fused_moe_impl_kernel_name("flydsl_gfx942", flydsl_config)
+        full_impl = resolve_fused_moe_impl(kernel_name1)
+        cfg = {"block_m": int(flydsl_config.split("_", 1)[0]), "ksplit": 0}
     if is_ep and full_impl is not None:
         cfg = None
         full_impl = None
@@ -3359,24 +5802,83 @@ def get_2stage_cfgs(
             ksplit,
             full_impl=full_impl,
         )
+    # No FlyDSL backend took the clamp, so CK stage 1 must.
+    if clamp_silu_limit and q_type != QuantType.per_1x128:
+        if q_dtype_w != dtypes.fp8 or q_dtype_a != dtypes.fp8:
+            raise NotImplementedError(
+                f"fused_moe cannot apply swiglu_limit={swiglu_limit!r} for {q_type} "
+                f"SiLU with weight dtype {q_dtype_w} / activation dtype {q_dtype_a}; "
+                "the runtime-limit CK instances are FP8 only."
+            )
+        if inter_dim % 128 != 0:
+            raise NotImplementedError(
+                f"fused_moe cannot apply swiglu_limit={swiglu_limit!r} for {q_type} "
+                f"SiLU at inter_dim={inter_dim}; the runtime-limit CK stage1 needs a "
+                "multiple of 128."
+            )
     if config_file is not None and (cfg is None or bypass_tuned_config):
         raise NotImplementedError(
             "The dedicated FHMoE path requires an exact tuned config row for "
             f"{keys} in {tune_file}"
         )
 
-    # Asm 1-stage kernels exist for Silu/Gelu and for gfx950 MXFP4 SiTUv2 FLAT.
+    # Asm 1-stage kernels exist for Silu/Gelu and for gfx950 MXFP4 SiTUv2 and
+    # SwiGLU OAI FLAT.
     if (
         cfg is not None
         and cfg.get("run_1stage", False)
         and activation
-        not in (ActivationType.Silu, ActivationType.Gelu, ActivationType.Situv2)
+        not in (
+            ActivationType.Silu,
+            ActivationType.Gelu,
+            ActivationType.Situv2,
+            ActivationType.Swiglu,
+        )
     ):
         cfg = None
         logger.warning(
             f"[fused_moe] discarding 1-stage tuned config for unsupported "
             f"activation {activation}; using default heuristics"
         )
+
+    # The SwiGLU OAI FLAT asm kernels hard-code alpha=1.702 / limit=7.0, take
+    # GGUU (separated) gate/up weights and have no per-expert bias input. The
+    # 1-stage launch does not forward bias or swiglu_limit, so a row that does
+    # not match the call would silently compute a different function.
+    # They also read raw top-k routing (flat=1). Only a named flat=1 row makes
+    # fused_moe skip the host moe_sorting; an unnamed row would let fmoe_g1u1
+    # pick a FLAT kernel heuristically and hand it host-sorted ids.
+    if (
+        cfg is not None
+        and cfg.get("run_1stage", False)
+        and activation == ActivationType.Swiglu
+    ):
+        swiglu_kernel1 = cfg.get("kernelName1", "")
+        if not isinstance(swiglu_kernel1, str):  # pandas reads a blank cell as NaN
+            swiglu_kernel1 = ""
+        try:
+            swiglu_flat = int(cfg.get("flat", AsmMoeMode.SORTED))
+        except (TypeError, ValueError):  # blank (NaN) flat cell
+            swiglu_flat = AsmMoeMode.SORTED
+        unsupported = None
+        if not swiglu_kernel1.strip():
+            unsupported = "empty kernelName1 (FLAT kernels need an explicit name)"
+        elif swiglu_flat != AsmMoeMode.NO_SORT:
+            unsupported = f"flat={cfg.get('flat')} (FLAT kernels need flat=1)"
+        elif has_stage1_bias or has_stage2_bias:
+            unsupported = "per-expert bias"
+        elif swiglu_limit is not None and float(swiglu_limit) != 7.0:
+            unsupported = f"swiglu_limit={swiglu_limit} (kernel uses 7.0)"
+        elif gate_mode != GateMode.SEPARATED:
+            unsupported = f"gate mode {gate_mode.value!r}"
+        elif gate_up_interleave:
+            unsupported = "gate/up-interleaved (GUGU) weights"
+        if unsupported is not None:
+            cfg = None
+            logger.warning(
+                f"[fused_moe] discarding SwiGLU OAI 1-stage asm config for {keys}: "
+                f"unsupported {unsupported}; using default heuristics"
+            )
 
     use_non_temporal_load = False
     if cfg is None or bypass_tuned_config:
@@ -3385,8 +5887,9 @@ def get_2stage_cfgs(
         kernelName2 = ""
         run_1stage = False
         run_1stage_xbf16 = False
-        # No tuned config => default host moe_sort. For FLAT, run tuner and set flat=1.
-        cfg_flat = 0
+        # No tuned config => default host moe_sort (flat=0). A tuned FLAT row
+        # sets flat=1 (one token per TG) or flat=2 (EMSORT).
+        cfg_flat = AsmMoeMode.SORTED
         if (
             activation,
             q_type,
@@ -3397,8 +5900,21 @@ def get_2stage_cfgs(
             doweight_stage1,
         ) in fused_moe_1stage_dict.get(get_gfx(), {}):
             if q_type == QuantType.per_1x128:
+                xbf16 = (
+                    get_gfx() == "gfx950"
+                    and int(os.environ.get("AITER_XBFLOAT16", "0")) == 1
+                )
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
-                run_1stage = token > 32 and (inter_dim % 128 == 0)
+                run_1stage = (
+                    not clamp_silu_limit
+                    and token > 32
+                    and inter_dim % 128 == 0
+                    and aiter.fmoe_fp8_blockscale_g1u1_has_kernel(
+                        activation.value, xbf16, BLOCK_SIZE_M, inter_dim, model_dim
+                    )
+                    == 1
+                )
+                run_1stage_xbf16 = run_1stage and xbf16
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
@@ -3406,14 +5922,12 @@ def get_2stage_cfgs(
             elif q_type != QuantType.per_1x32:
                 run_1stage = token < 256
 
-            if run_1stage and q_type == QuantType.per_1x128 and get_gfx() == "gfx950":
-                run_1stage_xbf16 = int(os.environ.get("AITER_XBFLOAT16", "0")) == 1
-
         block_m = (
             BLOCK_SIZE_M
             if run_1stage
             else (
-                (64 if token > 32 else 16)
+                # block_m=16 CK stage1 uses KPerBlock=256 (K=model_dim)
+                (64 if token > 32 else 16 if model_dim % 256 == 0 else 32)
                 if q_type == QuantType.per_1x128
                 else get_block_size_M(token, topk, expert, inter_dim)
             )
@@ -3432,6 +5946,16 @@ def get_2stage_cfgs(
             f"run_1stage = {run_1stage}, xbf16 = {run_1stage_xbf16}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
         )
     else:
+        # A tuned CK row does not use the heuristic above. is_shuffled is the
+        # OR, so one tagged weight used to skip the preshuffle warning too.
+        tuned_names = (
+            str(cfg.get("kernelName1", "") or ""),
+            str(cfg.get("kernelName2", "") or ""),
+        )
+        if not cfg.get("run_1stage", False) and any(
+            "moe_ck2stages" in name for name in tuned_names
+        ):
+            _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled)
         block_m = cfg["block_m"]
         nt_override = int(os.environ.get("AITER_USE_NT", "-1"))
         if nt_override != -1:
@@ -3449,6 +5973,14 @@ def get_2stage_cfgs(
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
         run_1stage = cfg.get("run_1stage", False)
+        if run_1stage:
+            retargeted = _retarget_asm_activation(kernelName1, activation)
+            if retargeted != kernelName1:
+                logger.info(
+                    f"[fused_moe] 1-stage kernel {kernelName1!r} is for a "
+                    f"different activation; using {retargeted!r} for {activation}"
+                )
+                kernelName1 = retargeted
         if not is_shuffled and not run_1stage:
             logger.warning(
                 f"[fused_moe] tuned config found for {keys} but is_shuffled=False. "
@@ -3460,9 +5992,9 @@ def get_2stage_cfgs(
         else:
             run_1stage_xbf16 = run_1stage and "blockscaleBf16" in str(kernelName1)
         if "flat" in cfg:
-            cfg_flat = int(cfg["flat"]) if run_1stage else 0
+            cfg_flat = AsmMoeMode(int(cfg["flat"])) if run_1stage else AsmMoeMode.SORTED
         else:
-            cfg_flat = 0
+            cfg_flat = AsmMoeMode.SORTED
 
     is_opus_cfg = cfg is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(
         cfg.get("kernelName2", "")
@@ -3487,10 +6019,36 @@ def get_2stage_cfgs(
     ):
         kernelName2 = kernelName2.replace("_afp4_", "_afp8_", 1)
 
-    tag = f"({kernelName1=}, {kernelName2=})"
-    logger.info(
-        f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys} "
-    )
+    if clamp_silu_limit:
+        # Deliberately override tuned, heuristic and AITER_KSPLIT selections.
+        ksplit = 0
+        run_1stage = False
+
+    reroute_a16wmix_bf16 = _can_reroute_bf16_to_a16wmix(
+        gfx=gfx,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        dtype=dtype,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        q_type=q_type,
+        activation=activation,
+        is_shuffled=bool(weights_shuffled),
+        use_g1u1=use_g1u1,
+        doweight_stage1=doweight_stage1,
+        swiglu_limit=swiglu_limit,
+        has_stage1_bias=has_stage1_bias,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+    ) and not (isinstance(kernelName1, str) and kernelName1.startswith("flydsl_"))
+
+    # The a16wmix reroute below logs its own kernel names; this line would name
+    # the CK/1-stage choice it is about to discard.
+    if not reroute_a16wmix_bf16:
+        tag = f"({kernelName1=}, {kernelName2=})"
+        logger.info(
+            f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys} "
+        )
 
     def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:
@@ -3509,6 +6067,52 @@ def get_2stage_cfgs(
             ksplit,
             has_stage1_bias=has_stage1_bias,
             has_stage2_bias=has_stage2_bias,
+            block_m=block_m,
+            opus_launch=opus_stage2_launch,
+            route_bucket_metadata=route_bucket_metadata,
+        )
+
+    if reroute_a16wmix_bf16:
+        # Untuned a16w16 fallback (and override of a CK/asm tuned row) when a
+        # finite swiglu_limit is configured. Tiles belong in the CSV; this is
+        # the shape-safe default until a tuner row exists. block_m MUST equal
+        # tile_m -- it sizes both moe_sorting and the gemm tile. A caller
+        # block_size_M that disagrees is rejected in _fused_moe_impl, because
+        # the only other check (FHMoE) does not cover this path and stage1
+        # would otherwise run on the mismatched layout.
+        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+
+        _out_str = "bf16"
+        _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
+        _tile_n = _tile_k = 128
+        kn1 = flydsl_kernel_name(1, "bf16", "bf16", _out_str, _tile_m, _tile_n, _tile_k)
+        kn2 = flydsl_kernel_name(
+            2, "bf16", "bf16", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
+        )
+        logger.warning(
+            "[fused_moe] no FlyDSL a16w16 config for %s, "
+            "using untuned fallback (kn1=%s, kn2=%s)",
+            keys,
+            kn1,
+            kn2,
+        )
+        return MOEMetadata(
+            functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kn1,
+                activation=activation,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kn2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            _tile_m,
+            0,
+            False,
         )
 
     if run_1stage:
@@ -3543,7 +6147,9 @@ def get_2stage_cfgs(
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
     if is_opus1 or is_flydsl1 or is_flydsl2:
         enable_bias = (
-            _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
+            activation == ActivationType.Swiglu
+            and _needs_swiglu_bias_support(dtype, q_type)
+            and q_dtype_w == dtypes.fp4x2
         )
         _s1_fp4q = is_flydsl1 and "_fp4" in kernelName1.split("_t")[-1]
         if is_opus1:
@@ -3640,7 +6246,8 @@ def get_2stage_cfgs(
     # (8 * 32 = 256 elements). When inter_dim is not a multiple of 256 the host
     # pads the scale group dimension (shuffle_scale rounds it up to a multiple
     # of 8) and the kernel reads the wrong groups, silently returning a badly
-    # wrong result. Stage-1 is unaffected -- it reduces over model_dim.
+    # wrong result. Stage-1 reduces over model_dim, which must be a multiple
+    # of its 256-wide K tile; cktile_moe_stage1 rejects any other model_dim.
     # Correct shapes keep their existing routing. Unsafe shapes leave CK-Tile
     # only when the target FlyDSL kernel accepts the shape and weight layout.
     # Calls with no safe fallback are rejected before the CK-Tile launch.
@@ -3650,7 +6257,8 @@ def get_2stage_cfgs(
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
-        and q_dtype_w != dtypes.fp8
+        and q_dtype_w == dtypes.fp4x2
+        and (gate_up_interleave is None or gate_up_interleave is True)
         and cktile_mxfp4_ok
     ):
         return MOEMetadata(
@@ -3671,17 +6279,56 @@ def get_2stage_cfgs(
             get_block_m(),
             ksplit,
             run_1stage=False,
-            has_bias=True,
-            stage2_has_bias=True,
+            has_bias=has_stage1_bias,
+            stage2_has_bias=has_stage2_bias,
         )
     swiglu_mxfp4_bf16_cktile = (
         q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
-        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
         and q_dtype_w == dtypes.fp4x2
         and is_shuffled
         and cktile_mxfp4_ok
+        and (
+            gate_up_interleave is False
+            # Callers that never tag w1.gate_up_interleave (None) keep the rule
+            # from before #6478: bf16/fp16 activations on the standard layout.
+            or (gate_up_interleave is None and q_dtype_a in [dtypes.bf16, dtypes.fp16])
+        )
     )
+    if (
+        activation == ActivationType.Relu2
+        and not use_g1u1
+        and q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and q_dtype_a == dtypes.bf16
+        and dtype == dtypes.bf16
+        and not has_stage2_scatter
+        and not has_activation_scales
+        and bool(opus_weights_shuffled)
+        and get_gfx_runtime() == "gfx950"
+    ):
+        _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
+        return MOEMetadata(
+            functools.partial(
+                cktile_moe_stage1,
+                n_pad_zeros=intermediate_pad // 64 * 64,
+                k_pad_zeros=hidden_pad // 128 * 128,
+                activation=activation,
+                split_k=1,
+                dtype=dtype,
+            ),
+            functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
+            ),
+            _cktile_block_m,
+            1,
+            run_1stage,
+            has_bias=False,
+            stage2_has_bias=False,
+        )
     if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
         # Untuned a16wi4 fallback: one shape-safe config on the shared a16w-mix port.
         # Tiles belong in the tuned CSV, not in a heuristic here. ksplit is 0 because
@@ -3760,7 +6407,7 @@ def get_2stage_cfgs(
             q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
             and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
         )
-        and _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode)
+        and _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode, gate_up_interleave)
         and is_shuffled
         and use_g1u1
         and not doweight_stage1
@@ -3853,7 +6500,10 @@ def get_2stage_cfgs(
             f"[fused_moe] no tuned FlyDSL config for {keys}, "
             f"using heuristic FlyDSL fallback ({kn1=}, {kn2=})"
         )
-        enable_bias = _needs_swiglu_bias_support(dtype, q_type)
+        enable_bias = (
+            activation == ActivationType.Swiglu
+            and _needs_swiglu_bias_support(dtype, q_type)
+        )
         return MOEMetadata(
             functools.partial(
                 _flydsl_stage1_wrapper,
@@ -3911,8 +6561,8 @@ def get_2stage_cfgs(
             _cktile_block_m,
             _split_k,
             run_1stage,
-            has_bias=activation == ActivationType.Swiglu,
-            stage2_has_bias=activation == ActivationType.Swiglu,
+            has_bias=has_stage1_bias,
+            stage2_has_bias=has_stage2_bias,
         )
 
     if (
@@ -3946,8 +6596,8 @@ def get_2stage_cfgs(
             _cktile_block_m,
             _split_k,
             run_1stage,
-            has_bias=True,
-            stage2_has_bias=True,
+            has_bias=has_stage1_bias,
+            stage2_has_bias=has_stage2_bias,
         )
 
     if (kernelName1 and "ck2stages" in kernelName1) or (
@@ -3987,6 +6637,8 @@ def get_2stage_cfgs(
                 activation=activation,
             )
         else:
+            # Plain fp8 CK instances read the shuffle_weight() layout.
+            _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled)
             stage2_func = functools.partial(
                 aiter.ck_moe_stage2_fwd,
                 kernelName=kernelName2,
@@ -4099,6 +6751,9 @@ def fused_moe_2stages(
     output=None,
     _stage2_override: Callable | None = None,
     routing_num_experts: int | None = None,
+    prequantized_a1: torch.Tensor | None = None,
+    prequantized_a1_scale: torch.Tensor | None = None,
+    deterministic: bool = False,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -4144,8 +6799,10 @@ def fused_moe_2stages(
         swiglu_limit=swiglu_limit,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
+        gate_up_interleave=getattr(w1, "gate_up_interleave", None),
         config_file=_metadata_config_file,
         input_dtype=hidden_states.dtype,
+        _has_input_activation_scales=a1_scale is not None,
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
@@ -4159,11 +6816,25 @@ def fused_moe_2stages(
         # this keyed on block_m rather than on _aux_uses_opus, which now sends
         # block_m 16 to Opus for the sort alone.
         and int(metadata.block_m) != 16
+        and _parse_mxfp4_g1_kname(metadata.stage1.keywords["kernelName1"])["a_dtype"]
+        == "fp4"
     ):
         # Main's fused prequant already writes the E8M0 scale layout consumed by
         # replacement GEMM1 on the default Opus auxiliary path.
         metadata = replace(metadata, prequant=True)
-    if not metadata.prequant:
+    if prequantized_a1 is not None:
+        if quant_type != QuantType.per_1x32:
+            raise ValueError(
+                "prequantized_a1 is only supported for QuantType.per_1x32, "
+                f"got {quant_type}"
+            )
+        if prequantized_a1_scale is None:
+            raise ValueError(
+                "prequantized_a1_scale must be supplied alongside prequantized_a1"
+            )
+        a1 = prequantized_a1
+        a1_scale = prequantized_a1_scale
+    elif not metadata.prequant:
         a1 = hidden_states
         a1_scale = None
     elif (
@@ -4173,7 +6844,8 @@ def fused_moe_2stages(
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and (
-                activation in (ActivationType.Swiglu, ActivationType.Situv2)
+                activation
+                in (ActivationType.Swiglu, ActivationType.Situv2, ActivationType.Relu2)
                 or gate_mode == GateMode.INTERLEAVE
             )
             or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
@@ -4217,7 +6889,9 @@ def fused_moe_2stages(
                 token_num=token_num,
                 topk=topk,
                 block_size=block_size_M,
-                sorted_weights=sorted_weights,
+                num_rows=num_local_tokens,
+                # As for MXFP4 below: the row is shared by the token's routes.
+                sorted_weights=None if deterministic else sorted_weights,
                 num_experts_upper_bound=routing_num_experts,
             )
 
@@ -4246,7 +6920,10 @@ def fused_moe_2stages(
                 topk=topk,
                 block_size=block_size_M,
                 num_rows=num_local_tokens,
-                sorted_weights=sorted_weights,
+                # A token's activation row is shared by its top-k routes; with
+                # routing weights, zero-weight routes write zeros into that shared
+                # row, so the result would depend on which route writes last.
+                sorted_weights=None if deterministic else sorted_weights,
                 num_experts_upper_bound=routing_num_experts,
             )
     elif hidden_states.dtype != q_dtype_a:
@@ -4285,7 +6962,15 @@ def fused_moe_2stages(
         )
     else:
         _a2_dtype = dtype
-        a2 = torch.empty(
+        # Stage1 does not write slots with topk_ids == -1 or masked out by
+        # expert_mask, but dynamic per-tensor a2 quant reads the whole buffer,
+        # so stale memory in those slots can set the scale.
+        _a2_alloc = (
+            torch.zeros
+            if quant_type == QuantType.per_Tensor and a2_scale is None
+            else torch.empty
+        )
+        a2 = _a2_alloc(
             (token_num, topk, inter_dim),
             dtype=_a2_dtype,
             device=device,
@@ -4302,6 +6987,11 @@ def fused_moe_2stages(
                 extra_stage1_args["topk_ids"] = topk_ids
         if metadata.stage2_has_bias:
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
+    active_silu_limit = (
+        normalize_swiglu_limit(swiglu_limit)
+        if swiglu_limit and activation.value == _SILU_VALUE
+        else None
+    )
     if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
         # Hand these two the caller's limit unchanged. They clamp silu whenever a
         # finite limit is configured (runtime_swiglu_limit in moe_kernels.py), and
@@ -4310,6 +7000,14 @@ def fused_moe_2stages(
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     elif stage1_func is _mxfp4_a4w4_stage1_fw:
         extra_stage1_args["swiglu_limit"] = normalized_swiglu_limit
+    elif active_silu_limit is not None:
+        if stage1_func in (ck_moe_stage1, asm_stage1):
+            extra_stage1_args["swiglu_limit"] = active_silu_limit
+        elif stage1_func is cktile_moe_stage1:
+            raise NotImplementedError(
+                f"CK-Tile MoE stage1 cannot apply swiglu_limit={swiglu_limit!r}; "
+                "the selected kernel has no clamp."
+            )
     if stage1_func is _flydsl_stage1_wrapper and metadata.skip_inter_quant:
         extra_stage1_args["v2_output_layout"] = True
     if stage1_func is _flydsl_stage1_wrapper:
@@ -4317,16 +7015,8 @@ def fused_moe_2stages(
         extra_stage1_args["situ_linear_beta"] = config_situ_linear_beta
     elif stage1_func is _mxfp4_a4w4_stage1_fw:
         # MXMOE's activation comes from its name and betas enter its compile key.
-        extra_stage1_args["situ_beta"] = (
-            DEFAULT_SITUV2_BETA
-            if activation == ActivationType.Situv2 and beta is None
-            else config_situ_beta
-        )
-        extra_stage1_args["situ_linear_beta"] = (
-            DEFAULT_SITUV2_LINEAR_BETA
-            if activation == ActivationType.Situv2 and linear_beta is None
-            else config_situ_linear_beta
-        )
+        extra_stage1_args["situ_beta"] = config_situ_beta
+        extra_stage1_args["situ_linear_beta"] = config_situ_linear_beta
     elif stage1_func is _opus_a8w4_stage1_wrapper:
         if metadata.skip_inter_quant:
             extra_stage1_args["output_sorted"] = True
@@ -4347,17 +7037,28 @@ def fused_moe_2stages(
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
     stage2_keywords = getattr(metadata.stage2, "keywords", None) or {}
+    if stage2_keywords.get("skip_dropped_routes"):
+        # The reduction reads topk_ids to leave out dropped routes.
+        extra_stage2_args["topk_ids"] = topk_ids
     uses_flydsl_v2_stage2 = stage2_func is _flydsl_v2_stage2_wrapper or (
         stage2_func is _mxfp4_a4w4_stage2_fw
         and str(stage2_keywords.get("kernelName2", "")).startswith(
             "flydsl_moe2_layout_"
         )
     )
-    if uses_flydsl_v2_stage2:
+    if stage2_func in (
+        _flydsl_stage2_wrapper,
+        _flydsl_v2_stage2_wrapper,
+        _mxfp4_a4w4_stage2_fw,
+    ):
         extra_stage2_args["use_valid_token_count"] = num_local_tokens is not None
-        if not doweight_stage1 and _flydsl_stage2_fp8_enabled():
-            # FP8 route-output reduction applies the route weights after GEMM2.
-            extra_stage2_args["topk_weights"] = topk_weights
+    if (
+        uses_flydsl_v2_stage2
+        and not doweight_stage1
+        and (_flydsl_stage2_fp8_enabled() or _mxfp4_intermediate_enabled())
+    ):
+        # FP8/FP4 route-output reduction applies the route weights after GEMM2.
+        extra_stage2_args["topk_weights"] = topk_weights
     if stage2_func is _opus_a8w4.opus_a8w4_stage2_wrapper:
         extra_stage2_args["stage2_fp8_enabled"] = _opus_stage2_fp8_enabled()
     if m_indices is not None:
@@ -4414,7 +7115,8 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and activation in (ActivationType.Swiglu, ActivationType.Situv2)
+            and activation
+            in (ActivationType.Swiglu, ActivationType.Situv2, ActivationType.Relu2)
             or (metadata.ksplit > 1 and is_shuffled)
         )
     ):
@@ -4435,6 +7137,7 @@ def fused_moe_2stages(
                 token_num=token_num,
                 topk=topk,
                 block_size=block_size_M,
+                num_rows=num_local_tokens,
                 sorted_weights=sorted_weights,
                 num_experts_upper_bound=routing_num_experts,
             )
@@ -4444,6 +7147,13 @@ def fused_moe_2stages(
             a2_scale = a1_scale
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: stage1 output is bf16, no inter-stage quantization
+        a2_scale = None
+    elif (
+        quant_type == QuantType.No
+        and stage1_func is _flydsl_stage1_wrapper
+        and w1.dtype == dtypes.bf16
+    ):
+        # a16w16: stage1 returns bf16 [sorted_size, inter_dim]; no inter-stage quant
         a2_scale = None
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
@@ -4524,7 +7234,14 @@ def fused_moe_2stages(
     return moe_out if _stage2_override is None else stage2_output
 
 
-def torch_moe_act(act_input, torch_act, inter_dim):
+def torch_moe_act(act_input, torch_act, inter_dim, activation=None):
+    # OAI SwiGLU is a gated (g1u1) activation with its own formula; it has no
+    # single-input torch_act, so it must never reach torch_act below.
+    if activation == ActivationType.Swiglu:
+        if act_input.shape[-1] != 2 * inter_dim:
+            raise NotImplementedError("ActivationType.Swiglu requires g1u1 weights")
+        gate, up = act_input.split([inter_dim, inter_dim], dim=-1)
+        return swiglu(gate, up)
     if act_input.shape[-1] == inter_dim:
         return torch_act(act_input)
     else:
@@ -4549,7 +7266,15 @@ def asm_stage1(
     a1_scale=None,
     w1_scale=None,
     sorted_weights=None,
+    swiglu_limit=None,
 ):
+    if swiglu_limit is not None and activation == ActivationType.Silu:
+        swiglu_limit = normalize_swiglu_limit(swiglu_limit)
+        if swiglu_limit is not None and ksplit <= 0:
+            raise NotImplementedError(
+                f"ASM MoE stage1 cannot apply swiglu_limit={swiglu_limit!r} without "
+                "split-K; the fused SiLU epilogue does not clamp."
+            )
     dtype = dtypes.bf16  # out.dtype, asm only support bf16
     if quant_type != QuantType.per_1x128:
         out = out.view(dtype)
@@ -4590,7 +7315,14 @@ def asm_stage1(
     )
     if ksplit > 0:
         if activation == ActivationType.Silu:
-            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32))
+            # silu_and_mul takes a float32 limit. Keep a positive limit from
+            # narrowing to 0 (no clamp) or inf, like the CK launcher does.
+            limit = (
+                min(max(swiglu_limit, 2.0**-149), torch.finfo(dtypes.fp32).max)
+                if swiglu_limit
+                else 0.0
+            )
+            aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32), limit)
         elif activation == ActivationType.Swiglu:
             aiter.swiglu_and_mul(out, tmp_out.view(dtypes.fp32))
         elif activation == ActivationType.Gelu:
@@ -4658,7 +7390,9 @@ def torch_moe(
                 sub_tokens = sub_tokens * (fc1_smooth_scale[E_id])
 
             act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
-            act_out = torch_moe_act(act_input, torch_act, inter_dim)
+            act_out = torch_moe_act(
+                act_input, torch_act, inter_dim, activation=activation
+            )
             if fc2_smooth_scale is not None:
                 act_out = act_out * (fc2_smooth_scale[E_id])
             out[mask] = act_out @ (w2[E_id].transpose(0, 1))
@@ -4708,6 +7442,11 @@ def torch_moe_stage1(
     situ_linear_beta: float = 25.0,
 ):
     quant_type = quant_remap.get(quant_type, quant_type)
+    if (
+        quant_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
+        and activation == ActivationType.Silu
+    ):
+        swiglu_limit = normalize_swiglu_limit(swiglu_limit)
     ctype = dtypes.fp32  # compute type
     B, _D = hidden_states.shape
     topk = topk_weight.shape[1]
@@ -4833,12 +7572,16 @@ def torch_moe_stage1(
             out = situv2(gate, up, beta=situ_beta, linear_beta=situ_linear_beta)
         else:
             if swiglu_limit:
-                gate = gate.clamp(min=None, max=swiglu_limit)
-                up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+                gate, up = _clamp_swiglu_gate_up(gate, up, swiglu_limit)
             out = torch_act(gate) * up
     else:
         out = torch_act(out)
     return out.to(dtype)
+
+
+def _clamp_swiglu_gate_up(gate: torch.Tensor, up: torch.Tensor, limit: float):
+    limit = min(limit, torch.finfo(gate.dtype).max)
+    return gate.clamp(max=limit), up.clamp(min=-limit, max=limit)
 
 
 def torch_moe_stage2(
@@ -4990,7 +7733,28 @@ def ck_moe_stage1(
     splitk=1,
     use_non_temporal_load=False,
     dtype=None,
+    swiglu_limit=None,
 ):
+    limit = None
+    if swiglu_limit and activation == ActivationType.Silu:
+        limit = normalize_swiglu_limit(swiglu_limit)
+        if limit is not None:
+            quant_type = quant_remap.get(quant_type, quant_type)
+            w1_dtype = getattr(w1, "dtype", None)
+            if quant_type not in RUNTIME_SILU_LIMIT_QUANT_TYPES or (
+                w1_dtype != dtypes.fp8
+            ):
+                raise NotImplementedError(
+                    f"CK MoE stage1 cannot apply swiglu_limit={swiglu_limit!r} for "
+                    f"{quant_type} with weight dtype {w1_dtype}; only FP8 "
+                    "per_1x128 / per_Token / per_Tensor have a clamped CK SiLU "
+                    "epilogue (clamp before SiLU)."
+                )
+            if kernelName and ("Splitk" in kernelName or "_silu_" not in kernelName):
+                raise ValueError(
+                    "Runtime SiLU clamp requires a non-split CK SiLU kernel"
+                )
+            splitk = 0
     token_num = hidden_states.shape[0]
     is_splitk = quant_type == QuantType.per_1x128 and splitk > 1
     if is_splitk:
@@ -5020,6 +7784,7 @@ def ck_moe_stage1(
         splitk if is_splitk else 0,
         use_non_temporal_load,
         out.dtype,
+        limit,
     )
     if is_splitk:
         valid_out = tmp_out[: token_num * topk, :]
@@ -5032,6 +7797,33 @@ def ck_moe_stage1(
                 f"Unsupported activation for split-k post-activation: {activation}"
             )
     return out
+
+
+@functools.lru_cache(maxsize=256)
+def _cktile_gemm1_k_batch(K, split_k, k_pad_zeros=0):
+    """Largest k_batch <= split_k that cuts K into whole K tiles, at least 1."""
+    # KPerBlock of every CK-Tile MXFP4 gemm1 instance (gen_instances.py)
+    k_tile = 256
+    if K % k_tile != 0:
+        # No split fits; cktile_moe_stage1 rejects this K before the launch.
+        return 1
+    if k_pad_zeros > 0:
+        # The kernel skips the k_pad_zeros tail in every split, not only the last.
+        if split_k > 1:
+            logger.info(
+                f"[fused_moe] CK-Tile stage1: k_pad_zeros={k_pad_zeros} would drop "
+                f"K data in every split, using k_batch=1 instead of {split_k}"
+            )
+        return 1
+    k_batch = max(int(split_k), 1)
+    while k_batch > 1 and K % (k_batch * k_tile) != 0:
+        k_batch -= 1
+    if k_batch != split_k:
+        logger.info(
+            f"[fused_moe] CK-Tile stage1: K={K} cannot be split {split_k} ways "
+            f"into whole {k_tile}-wide K tiles, using k_batch={k_batch}"
+        )
+    return k_batch
 
 
 def cktile_moe_stage1(
@@ -5057,6 +7849,13 @@ def cktile_moe_stage1(
     kernel_name="",
     post_activation_layout="auto",
 ):
+    model_dim = hidden_states.shape[-1]
+    # Defense in depth for direct callers and tuned metadata.
+    if w1.dtype == dtypes.fp4x2 and model_dim % 256 != 0:
+        raise NotImplementedError(
+            "CK-Tile MXFP4 stage1 requires model_dim to be a multiple of 256; "
+            f"got {model_dim}"
+        )
     token_num = hidden_states.shape[0]
     _, _n1, k1 = w1.shape
     _, k2, n2 = w2.shape
@@ -5075,10 +7874,14 @@ def cktile_moe_stage1(
     ):
         out = torch.empty(expected_out_shape, dtype=dtype, device=hidden_states.device)
     needs_post_activation = split_k > 1
+    k_batch = split_k
     # Split-k reduces into a token-topk workspace and applies activation after
     # reduction. Non-split legacy A16W4 keeps CK-Tile's fused gate/up epilogue.
     workspace_rows = token_num * topk
     if needs_post_activation:
+        # C++ picks the split-k kernel from this N-wide workspace, also when K
+        # only allows k_batch == 1.
+        k_batch = _cktile_gemm1_k_batch(model_dim, split_k, k_pad_zeros)
         tmp_out = torch.zeros(
             (workspace_rows, w1.shape[1]), dtype=dtype, device=out.device
         )
@@ -5102,7 +7905,7 @@ def cktile_moe_stage1(
         None if needs_post_activation else bias1,
         activation,
         block_m,
-        split_k,
+        k_batch,
         kernel_name,
     )
 
@@ -5247,6 +8050,7 @@ def fused_topk(
     renormalize: bool,
     topk_ids: torch.Tensor | None = None,
     topk_weights: torch.Tensor | None = None,
+    num_valid_rows: torch.Tensor | None = None,  # see aiter.topk_gating
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
@@ -5257,8 +8061,10 @@ def fused_topk(
         M, topk, dtype=dtypes.i32, device=hidden_states.device
     )
 
+    # The asm kernel takes no pad-row count.
     if (
-        get_gfx() in ["gfx942", "gfx950"]
+        num_valid_rows is None
+        and get_gfx() in ["gfx942", "gfx950"]
         and (expert, topk)
         in [
             (128, 4),
@@ -5304,6 +8110,7 @@ def fused_topk(
             token_expert_indicies,
             gating_output,
             renormalize,
+            num_valid_rows=num_valid_rows,
         )
 
     del token_expert_indicies  # Not used. Will be used in the future.

@@ -8,10 +8,8 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm, vector
 from flydsl.expr import range_constexpr, rocdl
-from flydsl.expr.typing import T, as_ir_value
-from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
@@ -47,8 +45,8 @@ def flydsl_absmax():
         div_tensor = fx.logical_divide(A, fx.make_layout(num_values, 1))
         num_atoms = fx.Int32(fxh.div_up(neles, num_values))
         i0 = fx.thread_idx.x
-        for i in range(0, num_atoms, num_threads):
-            src = div_tensor[None, i0 + i]
+        for atom_idx in range(i0, num_atoms, num_threads):
+            src = div_tensor[None, atom_idx]
             frag = fx.make_fragment_like(src)
             fx.copy(copy_atom, src, frag)
             vec = frag.load().to(fx.Float32)
@@ -67,15 +65,7 @@ def flydsl_absmax():
 
         vmax = wave_reduce_max(vmax)
         if tid == 0:
-            llvm_ptr = fx.to_llvm_ptr(Amax)
-            llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.fmax,
-                llvm_ptr,
-                as_ir_value(vmax),
-                llvm.AtomicOrdering.monotonic,
-                syncscope="agent",
-                alignment=4,
-            )
+            fx.atomic_max(Amax, vmax, syncscope="agent")
 
     @flyc.jit
     def launch(
@@ -117,7 +107,7 @@ def flydsl_quant_per_tensor(torch_dtype):
         num_workers = fx.grid_dim.x
 
         amax = fx.Float32(Amax[0])
-        inv_scale = (amax == fx.Float32(0.0)).select(
+        inv_scale = (amax == 0.0).select(
             fx.Float32(0.0),
             fx.Float32(rocdl.rcp(T.f32, amax) * fx.Float32(fmax)),
         )
@@ -141,13 +131,11 @@ def flydsl_quant_per_tensor(torch_dtype):
         num_values = copy_bits // A.dtype.width
         div_tensorA = fx.logical_divide(A, fx.make_layout(num_values, 1))
         div_tensorB = fx.logical_divide(B, fx.make_layout(num_values, 1))
-        fx.Int32(fxh.div_up(neles, num_values))
         num_atoms_full = fx.Int32(neles // num_values)
         i0 = fx.thread_idx.x
         clamp_lo = fx.Float32(-fmax)
         clamp_hi = fx.Float32(fmax)
-        for i in range(0, num_atoms_full, num_threads):
-            atom_idx = i0 + i
+        for atom_idx in range(i0, num_atoms_full, num_threads):
             src = div_tensorA[None, atom_idx]
             dst = div_tensorB[None, atom_idx]
             frag = fx.make_fragment_like(src)
@@ -171,8 +159,7 @@ def flydsl_quant_per_tensor(torch_dtype):
             w0 = rocdl.cvt_pk_fp8_f32(
                 T.i32, _raw(frag_f32[2]), _raw(frag_f32[3]), lo0, True
             )
-            vw0 = vector.broadcast(Vec.make_type((1,), fx.Int32), w0)
-            vi8x4_0 = vector.bitcast(Vec.make_type((4,), fx.Int8), vw0)
+            vi8x4_0 = fx.Vector.from_elements([w0], fx.Int32).bitcast(fx.Int8)
             frag2[0] = vi8x4_0[0]
             frag2[1] = vi8x4_0[1]
             frag2[2] = vi8x4_0[2]
@@ -184,8 +171,7 @@ def flydsl_quant_per_tensor(torch_dtype):
             w1 = rocdl.cvt_pk_fp8_f32(
                 T.i32, _raw(frag_f32[6]), _raw(frag_f32[7]), lo1, True
             )
-            vw1 = vector.broadcast(Vec.make_type((1,), fx.Int32), w1)
-            vi8x4_1 = vector.bitcast(Vec.make_type((4,), fx.Int8), vw1)
+            vi8x4_1 = fx.Vector.from_elements([w1], fx.Int32).bitcast(fx.Int8)
             frag2[4] = vi8x4_1[0]
             frag2[5] = vi8x4_1[1]
             frag2[6] = vi8x4_1[2]

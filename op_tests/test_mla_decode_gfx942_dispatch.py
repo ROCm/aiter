@@ -299,7 +299,7 @@ def test_codegen_produces_expected_entries():
 
         # The ADD_CFG line for gfx942 64mx1 should have qSeqLen=0
         expected_macro_substring_942 = (
-            '"bf16", "bf16",   64,    0,    0,    0,    1,    0,    0, "gfx942", "mla/", '
+            '"bf16", "bf16",   64,    0,    0,    0,    1,    0,    0,    0,    0, "gfx942", "mla/", '
             f'"{EXPECTED_SYMBOL}", "{GFX942_KERNEL_CO.name}"'
         )
         assert (
@@ -308,7 +308,7 @@ def test_codegen_produces_expected_entries():
 
         # The ADD_CFG line for gfx950 v3 should have qSeqLen=1
         expected_macro_substring_950 = (
-            '"bf16", "bf16",   64,    0,    1,    0,    1,    0,    0, "gfx950", "mla/", '
+            '"bf16", "bf16",   64,    0,    1,    0,    1,    0,    0,    0,    0, "gfx950", "mla/", '
             '"_ZN5aiter38mla_a16w16_qh64_qseqlen1_gqaratio64_v3E", "mla_a16w16_qh64_qseqlen1_gqaratio64_v3.co"'
         )
         assert (

@@ -1,5 +1,4 @@
 {
-    "_note": "gfx1250 stopgap: cloned from gfx1250-GEMM-A16WFP4.json (same arch + same A16WFP4 dtype, non-batched). Created to satisfy aiter get_gemm_config() which requires a per-arch default tuning file. NOT tuned for the batched A16WFP4 kernel on gfx1250 -> potential perf and precision-validation risk; revisit if accuracy checks fail. See run_ds-r1.sh notes.",
     "M_LEQ_8": {
         "BLOCK_SIZE_M": 16,
         "BLOCK_SIZE_N": 128,

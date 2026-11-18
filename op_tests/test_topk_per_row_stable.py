@@ -221,6 +221,38 @@ def check_decode_packed(num_rows, width, k, tie_level):
     return ok
 
 
+def check_decode_cross_part_tie():
+    """Stable merge must keep the smallest global indices across equal parts."""
+    rows, width, k = 1, 131072, 512
+    logits = torch.zeros((rows, width), dtype=torch.float32, device="cuda")
+    part_width = width // 2
+    part0_ties = k // 4
+    logits[0, part_width - part0_ties : part_width + k] = 1
+    seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+    indices = torch.empty((rows, k), dtype=torch.int32, device="cuda")
+    top_k_per_row_decode(
+        logits,
+        1,
+        seq_lens,
+        indices,
+        rows,
+        width,
+        1,
+        k=k,
+        stable=True,
+    )
+    torch.cuda.synchronize()
+    expected = torch.arange(
+        part_width - part0_ties,
+        part_width + k - part0_ties,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    ok = torch.equal(indices[0], expected)
+    print(f"[decode cross-part tie] smallest_indices={ok}")
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-k", type=int, default=None, help="top-k (default: sweep)")
@@ -250,6 +282,7 @@ def main():
             all_ok &= check_decode_packed(6, 262144, k, tie)
             all_ok &= check_decode_packed(96, 262144, k, tie)
             all_ok &= check_decode_packed(6, 16384, k, tie)
+    all_ok &= check_decode_cross_part_tie()
     print("\nRESULT:", "ALL PASS" if all_ok else "FAILURES PRESENT")
     assert all_ok, "stable top_k_per_row correctness failed"
 
