@@ -387,6 +387,73 @@ def check_replaced_lookup():
     return rows
 
 
+def check_plugin_route():
+    """While a kernel plugin is enabled, every call goes through the route of
+    `gemm_a16w16`: a provider that serves it runs, one that declines leaves it
+    to the custom op. With none enabled, the fast path takes the call again."""
+    from aiter import plugin
+
+    m, n, k = 1056, 324, 2560
+    x, w = _rand(m, k), _rand(n, k, scale=k**-0.5)
+    buf = torch.empty(m, n, dtype=BF16, device="cuda")
+    ref = _reference(x, w)
+
+    def run(A, B, bias, otype, scale_a, scale_b, scale_c, out):
+        if out is None:
+            return torch.full((A.shape[0], B.shape[0]), 7.0, device=A.device)
+        return out.fill_(7.0)
+
+    class Provider:
+        name = "eager-test"
+        api_versions = (plugin.API_VERSION,)
+        op_versions = ("gemm_a16w16",)
+        serve = True
+
+        def select(self, op, args, kwargs):
+            if not self.serve:
+                return None
+            return plugin.KernelCandidate(
+                provider=self.name,
+                kernel_id="sevens",
+                artifact_digest="sha256:0",
+                run=run,
+            )
+
+    class EntryPoint:
+        name = Provider.name
+
+        def load(self):
+            return provider
+
+    provider = Provider()
+    entry_points = plugin._entry_points
+    plugin._entry_points = lambda: (EntryPoint(),)
+    plugin._reset_for_testing()
+    rows = []
+    try:
+        with _routed({_key(m, n, k, False, BF16, BF16): HIPBLASLT}):
+            plugin.configure(enable=(Provider.name,), source="test_tuned_gemm_eager")
+            for case, call in (
+                ("plugin serves the call", lambda: tgemm.mm(x, w)),
+                ("plugin serves the call, out=", lambda: tgemm.mm(x, w, out=buf)),
+            ):
+                y, calls = _custom_op_calls(call)
+                assert bool((y == 7).all()), f"{case}: the provider did not run"
+                assert plugin.last_decision().route == "provider"
+                rows.append(_row(case, calls, True))
+            provider.serve = False
+            y, calls = _custom_op_calls(lambda: tgemm.mm(x, w))
+            assert plugin.last_decision().route == "native"
+            exact = _check_bits(y, lambda: _op(x, w), ref, "plugin declines")
+            rows.append(_row("plugin enabled, provider declines", calls, True, exact))
+            plugin.configure(enable=(), source="test_tuned_gemm_eager")
+            rows.append(_fast_row("plugin configured with nothing enabled", x, w))
+    finally:
+        plugin._entry_points = entry_points
+        plugin._reset_for_testing()
+    return rows
+
+
 def check_weight_handles():
     """The fast path keeps converted weights per tensor descriptor. A weight in
     a freed one's memory, a view with the same pointer and another shape, and a
@@ -548,6 +615,7 @@ def main():
 
     paths += check_declines()
     paths += check_replaced_lookup()
+    paths += check_plugin_route()
     paths += check_weight_handles()
     paths += check_compile()
     paths += check_cuda_graph()

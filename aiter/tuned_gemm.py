@@ -31,6 +31,8 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
 from aiter.ops.gradlib import _hipb_mm
+from aiter.plugin import _config as _plugin_config
+from aiter.plugin import route as _route
 
 try:
     from aiter.ops.opus import opus_gemm as _opus_launch
@@ -420,7 +422,11 @@ def gemm_a16w16_out(
 ) -> None:
     """`gemm_a16w16` written into ``out`` -- the [M, N] tensor of ``otype`` --
     for a caller whose consumer reads one fixed address."""
-    _gemm_a16w16(A, B, bias, otype, scale_a, scale_b, scale_c, out)
+    result = _gemm_a16w16(A, B, bias, otype, scale_a, scale_b, scale_c, out)
+    # The return value is dropped here, so a provider that answers in a tensor
+    # of its own would leave `out` unwritten; the native path asserts the same.
+    if result.data_ptr() != out.data_ptr():
+        raise RuntimeError("gemm_a16w16_out: the result was not written into out=")
 
 
 # The custom ops: what torch.compile records, and what runs every call the
@@ -527,10 +533,11 @@ def _hipblaslt_eager(
     without the dispatcher when its tuned config is hipBLASLt.
 
     Returns the result -- ``out`` itself when given -- or None to leave the call
-    to the custom op: under torch.compile or jit tracing, inside any dispatch
-    mode, torch-function mode or functorch transform, for tensor subclasses that
-    intercept ops, inputs autograd would record, inputs `_gemm_a16w16` does not
-    simply reshape, and every config that is not hipBLASLt.
+    to the custom op: while a kernel plugin may serve `gemm_a16w16`, under
+    torch.compile or jit tracing, inside any dispatch mode, torch-function mode
+    or functorch transform, for tensor subclasses that intercept ops, inputs
+    autograd would record, inputs `_gemm_a16w16` does not simply reshape, and
+    every config that is not hipBLASLt.
     ``get_GEMM_A16W16_config`` is called through the module attribute on every
     call, exactly as `_gemm_a16w16` calls it, so a replacement installed at any
     time is honoured and its results are never cached here.
@@ -541,6 +548,12 @@ def _hipblaslt_eager(
     if hipb is None:
         hipb = _resolve_eager_hipb()
     if not hipb:
+        return None
+    # `_gemm_a16w16` is routed: unless no provider can serve any call, which is
+    # when its dispatch runs the native body and records nothing, the call must
+    # go through the route.
+    plugin_config = _plugin_config()
+    if plugin_config.enabled and not plugin_config.kill_switch:
         return None
     set_stream, hipb_mm_op, convert, raw_stream, current_device = hipb
     known = _eager_tensor_types.get
@@ -681,6 +694,9 @@ def _gemm_gfx_cu(device: torch.device) -> tuple[str, int]:
     return gfx, cu_num
 
 
+# Routed here, beneath both guarded spellings and `tgemm.mm`, for the reason
+# `rmsnorm` is: every one of them arrives here, so this is where the op begins.
+@_route(op="gemm_a16w16", version=1)
 def _gemm_a16w16(
     A: Tensor,
     B: Tensor,
@@ -691,6 +707,26 @@ def _gemm_a16w16(
     scale_c: Tensor | None = None,
     out: Tensor | None = None,
 ) -> Tensor:
+    """Dense GEMM ``A @ B.T + bias`` in ``otype``, by the tuned backend.
+
+    Returns the ``[*A.shape[:-1], N]`` result. Without ``out`` it is a newly
+    allocated tensor and nothing is written through the arguments. With
+    ``out`` the result is written into ``out`` and ``out`` is returned, viewed
+    to that shape: a provider serving this contract must write it there, since
+    `gemm_a16w16_out` drops the return value and reads only the buffer.
+
+    Args:
+        A: ``[..., K]`` activations, bf16 or fp16 (fp8 with the scales below);
+            the leading dims are the ``M`` rows.
+        B: ``[N, K]`` weights. ``B.is_shuffled`` True says ``B`` holds the
+            preshuffled layout the asm kernels read, not row-major bytes.
+        bias: ``[N]``, added to every row, or None.
+        otype: output dtype; None is ``A``'s dtype.
+        scale_a, scale_b, scale_c: per-tensor scales of a scaled GEMM (``A``
+            and ``B`` dequant, output); all None for a plain 16-bit GEMM.
+        out: ``[M, N]`` buffer of ``otype``, or one shaped like the result;
+            None allocates the result.
+    """
     bpreshuffle = False
     if hasattr(B, "is_shuffled") and B.is_shuffled is True:
         bpreshuffle = True
