@@ -472,7 +472,7 @@ def _make_dualwave_swp_fp8_traits(
     batch_chunks=1,
     interleaved=False,
     o_staged=None,
-    o_store_nt=False,
+    o_store_nt=None,
 ):
     """Build gfx950 DUALWAVE_SWP fp8 compile-time layout traits.
 
@@ -505,6 +505,9 @@ def _make_dualwave_swp_fp8_traits(
         raise RuntimeError(
             "o_staged needs conventional_bn64 with gqa_pack_m and group % 4 == 0"
         )
+    # NT pays only on the staged epilogue's 1 KB stores; on the direct 32-byte-per-row stores it was 7-11% slower.
+    if o_store_nt is None:
+        o_store_nt = o_staged
     if o_store_nt and body_variant != "conventional_bn64":
         raise RuntimeError("o_store_nt applies to conventional_bn64 only")
     if head_dim_v is None:
