@@ -28,6 +28,7 @@ from opus_gemm_common import (
     KERNEL_REGISTRY,
     KernelKey,
     OpusGemmInstance,
+    a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list,
     a8w8_kernels_list,
     a8w8_scale_kernels_list,
     a16w16_flatmm_kernels_list,
@@ -288,12 +289,16 @@ INPUT_DTYPE_MAP = {
     "a8w8_mxscale_bmm_wave4m2_selfload": ("fp8_t", "fp8_t"),
     "a8w8": ("fp8_t", "fp8_t"),
     "a8w8_blockscale_bpreshuffle_singlebuf": ("fp8_t", "fp8_t"),
+    "a8w8_blockscale_mxscale_gemm_bpreshuffle": ("fp8_t", "fp8_t"),
     **{tag: ("bf16_t", "bf16_t") for tag in _A16W16_TAGS},
 }
 
 # A16W16 uses separate direct-output and workspace launcher tables.
 A16W16_KID_DISPATCH_TAGS = set(_A16W16_TAGS)
-A8W8_BPRESHUFFLE_TAGS = {"a8w8_blockscale_bpreshuffle_singlebuf"}
+A8W8_BPRESHUFFLE_TAGS = {
+    "a8w8_blockscale_bpreshuffle_singlebuf",
+    "a8w8_blockscale_mxscale_gemm_bpreshuffle",
+}
 # Three-tensor launchers: A16W16 and A8W8 no-scale.
 NOSCALE_TAGS = A16W16_KID_DISPATCH_TAGS | {"a8w8"}
 
@@ -1309,9 +1314,9 @@ if __name__ == "__main__":
         default=None,
         required=False,
         help=(
-            "Colon-separated list of glob patterns pointing at tuned BF16 "
-            "GEMM CSVs (e.g. aiter/configs/bf16_tuned_gemm.csv and "
-            "aiter/configs/model_configs/*_bf16_tuned_gemm.csv). Each "
+            "Colon-separated paths or glob patterns for tuned GEMM CSVs, "
+            "including BF16 and MXFP8 bpreshuffle tables. Explicit files "
+            "must exist; unmatched model glob patterns are optional. Each "
             "file is filtered by `libtype == 'opus'`; surviving rows "
             "contribute their `solidx`/`kernelId` only to the subset-compile "
             "set S. Runtime callers provide the final kid explicitly. "
@@ -1365,6 +1370,7 @@ if __name__ == "__main__":
         args.tune_files = args.tune_file
 
     TAG_TO_LIST = {
+        "a8w8_blockscale_mxscale_gemm_bpreshuffle": a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list,
         "a8w8_scale": a8w8_scale_kernels_list,
         "a8w8": a8w8_kernels_list,
         "a16w16": a16w16_kernels_list,
@@ -1403,7 +1409,10 @@ if __name__ == "__main__":
             pat = pat.strip()
             if not pat:
                 continue
-            for path in sorted(glob.glob(pat)):
+            matches = sorted(glob.glob(pat))
+            if not matches and not glob.has_magic(pat):
+                parser.error(f"tuned file not found: {pat}")
+            for path in matches:
                 if path in seen:
                     continue
                 seen.add(path)
@@ -1466,7 +1475,14 @@ if __name__ == "__main__":
     defaults = {
         key for gfx, cu in targets for key in default_compiled_keys(gfx, cu)
     } & available.keys()
-    mandatory = {key for key in available if key.family != "a16w16"}
+    # Select the gfx950 MXFP8 sweep from tuned rows, successful sidecars and
+    # explicit requests. Full sweep generation remains available via --tune.
+    mandatory = {
+        key
+        for key in available
+        if key.family != "a16w16"
+        and not (key.gfx == "gfx950" and key.family == "a8w8_blockscale_bpreshuffle")
+    }
     selected = (
         csv_keys | sidecar_keys | requested_keys | defaults | mandatory
     ) & available.keys()
