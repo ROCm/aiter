@@ -230,7 +230,6 @@ class PaDecodeCacheKey(NamedTuple):
     kv_dtype: object
     mask_unowned_kv: bool
     direct_output: bool
-    output_dtype: object
     sparse_grid: bool
     gfx942_busy: bool
     gfx942_two_per_cu: bool
@@ -264,7 +263,6 @@ class PaDecodeSchedule:
         num_partitions: int = 1,
         softmax_scale: float | None = None,
         query_dtype: torch.dtype = torch.float16,
-        output_dtype: torch.dtype | None = None,
         kv_dtype: torch.dtype,
         per_token_kv: bool = False,
         query_length: int = 1,
@@ -330,19 +328,8 @@ class PaDecodeSchedule:
                 raise ValueError("BF16 KV does not use quantization scales")
             if not trans_v:
                 raise ValueError("BF16 KV requires a vectorized-5D value cache")
-        if output_dtype is None:
-            # Only an MXFP4 e4m3 query defaults (to bf16); an FP8-KV e4m3 query needs
-            # an explicit output dtype.
-            if query_dtype == fx.Float8E4M3FN and kv_dtype != MXFP4_KV_DTYPE:
-                raise ValueError("FP8 queries require BF16/FP16 output_dtype")
-            output_dtype = (
-                torch.bfloat16
-                if query_dtype == fx.Float8E4M3FN
-                else fx_to_torch_dtype(query_dtype)
-            )
-        output_dtype = _pa_fx_dtype("output", output_dtype, (fx.Float16, fx.BFloat16))
-        if query_dtype != fx.Float8E4M3FN and output_dtype != query_dtype:
-            raise ValueError("output_dtype must match non-FP8 query dtype")
+        elif query_dtype == fx.Float8E4M3FN:
+            raise ValueError("An FP8 query needs MXFP4 KV")
         TUNED_SHAPE = (
             kv_dtype in FP8_KV_DTYPES
             and is_gfx950
@@ -682,7 +669,6 @@ class PaDecodeSchedule:
             kv_dtype=kv_dtype,
             mask_unowned_kv=bool(mask_unowned_kv),
             direct_output=direct_output,
-            output_dtype=output_dtype,
             # At most one CTA per CU: room for two four-wave groups per CTA.
             sparse_grid=split_workgroups * query_splits <= num_compute_units,
             gfx942_busy=gfx942_busy,
@@ -733,7 +719,6 @@ class PaDecodeTraits:
 
     # Element formats and instruction policy.
     FP8_MAX: float | None
-    FP8_QUERY: bool
     OUT_DTYPE: type
     query_dtype: type
     DIRECT: bool
@@ -864,7 +849,6 @@ class PaDecodeTraits:
         kv_dtype = cache_key.kv_dtype
         mask_unowned_kv = cache_key.mask_unowned_kv
         DIRECT = cache_key.direct_output
-        OUT_DTYPE = cache_key.output_dtype
         SPARSE_GRID = cache_key.sparse_grid
         gfx942_busy = cache_key.gfx942_busy
         gfx942_two_per_cu = cache_key.gfx942_two_per_cu
@@ -877,9 +861,6 @@ class PaDecodeTraits:
         is_gfx942 = schedule.is_gfx942
         # MXFP4 V is widened to bf16 in LDS, so both run the bf16 PV MFMA.
         PV_BF16 = kv_dtype in (fx.BFloat16, MXFP4_KV_DTYPE)
-        # An e4m3 query on an FP8 cache arrives quantized with an external scalar
-        # descale; MXFP4 KV instead quantizes in-kernel to the scaled MFMA's format.
-        FP8_QUERY = query_dtype == fx.Float8E4M3FN and kv_dtype != MXFP4_KV_DTYPE
         TUNED_SHAPE = (
             kv_dtype in FP8_KV_DTYPES
             and is_gfx950
@@ -894,9 +875,7 @@ class PaDecodeTraits:
         buffer_plan_output = (
             is_gfx950
             and head_dim == 128
-            and query_dtype in (fx.BFloat16, fx.Float8E4M3FN)
-            and OUT_DTYPE == fx.BFloat16
-            and not FP8_QUERY
+            and query_dtype in (fx.BFloat16, fx.Float8E4M3FN)  # bf16 output
             and 0 < TOTAL_ROWS * head_dim * 2 <= 0x7FFFFFFF
         )
         # Larger windows have identical visibility for int32 context lengths.
@@ -918,6 +897,8 @@ class PaDecodeTraits:
             64,
             128,
         ), f"pa_decode_tile only supports block_size in (16, 64, 128), got {block_size}"
+        # The output is bf16 for bf16 and e4m3 queries (e4m3 needs MXFP4 KV), else f16.
+        OUT_DTYPE = fx.Float16 if query_dtype == fx.Float16 else fx.BFloat16
         KV_VECTOR_WIDTH = 8 if PV_BF16 else 16
         # Q in LDS: bf16 for BF16 KV, e4m3 bytes otherwise (MXFP4 included).
         QP_ELEM_BYTES = 2 if kv_dtype == fx.BFloat16 else 1
@@ -1233,7 +1214,7 @@ class PaDecodeTraits:
         SP_ROW_BYTES = KV_COMPUTE_BLOCK * QP_ELEM_BYTES + 16
         sP_bytes = P_BUFFERS * MFMA_MNK * SP_ROW_BYTES
         sQscale_off = sP_off + sP_bytes if Q_STAYS else max(sQ_bytes, sP_bytes)
-        sQscale_bytes = 0 if kv_dtype == fx.BFloat16 or FP8_QUERY else ROWS_PADDED * f32
+        sQscale_bytes = 0 if (kv_dtype == fx.BFloat16) else ROWS_PADDED * f32
         # Tuned rows need 16-byte vector alignment; other paths use bank padding.
         NWARP_PAD = (
             NWARP
@@ -1363,7 +1344,6 @@ class PaDecodeTraits:
             nhd_layout=nhd_layout,
             NHD_V_BUFS=NHD_V_BUFS,
             FP8_MAX=FP8_MAX,
-            FP8_QUERY=FP8_QUERY,
             OUT_DTYPE=OUT_DTYPE,
             query_dtype=query_dtype,
             DIRECT=DIRECT,

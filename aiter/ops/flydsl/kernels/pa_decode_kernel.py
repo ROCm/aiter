@@ -8,7 +8,7 @@ are quantized to FP8. Q/key scales fold into QK, value scale and 1/FP8_MAX into
 the epilogue; softmax max/sum stay f32. Tuned gfx950 BF16 per-token MTP3/MTP4
 and the head-256 page-16/64 pipe use K128 MFMA instead of K32, preserving normalized
 Q/P and operand layouts.
-Externally quantized FP8 Q bypasses Q normalization; 16-bit Q uses absmax normalization; per-tensor and per-token K/V scales
+Every FP8-path Q row uses absmax normalization; per-tensor and per-token K/V scales
 retain range normalization for P.
 BF16 K/V use vector-8 caches and native BF16 Q/K/P/V MFMA operands, with
 f32 softmax state and accumulation. BF16 KV does not use quantization scales.
@@ -35,7 +35,7 @@ tile and all dims, so the tile loop has no barrier; the waves merge once after i
 
 Logical layouts (not preshuffled):
 
-* ``query``        [num_seqs * query_length, num_q_heads, head_dim]  f16/bf16/fp8
+* ``query``        [num_seqs * query_length, num_q_heads, head_dim]  f16/bf16
 * ``key_cache``    [num_blocks, num_kv_heads, head_dim//x, block_size, x]
                    or NHD [num_blocks, 64, num_kv_heads, 256] (strided, head contiguous;
                    gfx950 FP8 head 256, page 64, at most two query M-tiles)
@@ -48,7 +48,7 @@ Logical layouts (not preshuffled):
 * ``work_info``    [capacity, 4]  int32 sequence/tile bounds/context length
 * ``pmax``, ``psum`` [num_kv_heads, capacity, query_length * query_group_size] f32
 * ``pout``         [num_kv_heads, capacity, query_length * query_group_size, head_dim]
-                   same dtype as output; normalized partition output
+                   same dtype as query; normalized partition output
 * K/V scales      [1] per-tensor or [num_blocks, num_kv_heads, block_size] per-token
 
 Four-wave CTAs process 256-token blocks: QK splits tokens, PV splits head dim,
@@ -197,7 +197,6 @@ def compile_pa_decode_tile(
     query_splits: int | None = None,
     max_context_length: int | None = None,
     sliding_window: int = 0,
-    output_dtype: torch.dtype | None = None,
     direct_output: bool = False,
     trans_k: bool = True,
     mask_unowned_kv: bool = True,
@@ -214,9 +213,7 @@ def compile_pa_decode_tile(
     flavor: FNUZ on gfx942, OCP elsewhere), ``torch.bfloat16``, or
     ``dtypes.fp4x2`` for MXFP4. ``dtypes.fp4x2`` is ``torch.uint8`` on torch
     builds without ``float4_e2m1fn_x2``, so a uint8 ``kv_dtype`` also selects
-    MXFP4. ``query_dtype`` is the query's: f16, bf16 or e4m3fn (external scalar
-    descale on FP8 KV, in-kernel quantization on MXFP4 KV); ``output_dtype`` is
-    f16 or bf16 and must equal a non-e4m3 query's dtype.
+    MXFP4. ``query_dtype`` is the query's: f16 or bf16, or e4m3fn with MXFP4 KV.
     Non-torch dtypes, such as the former ``"fp8"`` strings, raise TypeError;
     unsupported dtypes and combinations raise ValueError.
 
@@ -332,7 +329,6 @@ def compile_pa_decode_tile(
         num_partitions=num_partitions,
         softmax_scale=softmax_scale,
         query_dtype=query_dtype,
-        output_dtype=output_dtype,
         kv_dtype=kv_dtype,
         per_token_kv=per_token_kv,
         query_length=query_length,
@@ -402,7 +398,6 @@ def compile_pa_decode_tile(
         planned_start: fx.Int32,
         planned_end: fx.Int32,
         planned_context: fx.Int32,
-        query_scale_ptr: fx.Pointer,
     ):
         ctx = PaDecodeContext(
             traits,
@@ -426,7 +421,6 @@ def compile_pa_decode_tile(
             planned_start,
             planned_end,
             planned_context,
-            query_scale_ptr,
             stride_k_block=stride_k_block,
             stride_k_token=stride_k_token,
             stride_k_head=stride_k_head,
@@ -477,7 +471,6 @@ def compile_pa_decode_tile(
         stride_v_head: fx.Int32,
         work_info_ptr: fx.Pointer,
         num_sequences: fx.Int32,
-        query_scale_ptr: fx.Pointer,
     ):
         def _run_task(seq, start, end, context):
             _pa_decode_tile_task(
@@ -506,7 +499,6 @@ def compile_pa_decode_tile(
                 start,
                 end,
                 context,
-                query_scale_ptr,
             )
 
         def _zero_rows(seq):
@@ -616,7 +608,6 @@ def compile_pa_decode_tile(
             stride_ks_head: fx.Int32,
             psum_ptr: fx.Pointer,
             pout_ptr: fx.Pointer,
-            query_scale_ptr: fx.Pointer,
             stride_k_block: fx.Int32,
             stride_k_token: fx.Int32,
             stride_k_head: fx.Int32,
@@ -647,7 +638,6 @@ def compile_pa_decode_tile(
                 stride_v_head,
                 work_info_ptr,
                 num_sequences,
-                query_scale_ptr,
             )
 
         def _tile_args(
@@ -673,7 +663,6 @@ def compile_pa_decode_tile(
             stride_v_head,
             work_info,
             num_seqs,
-            query_scale,
         ):
             return (
                 work_info,
@@ -692,7 +681,6 @@ def compile_pa_decode_tile(
                 stride_ks_head,
                 psum,
                 pout,
-                query_scale,
                 stride_k_block,
                 stride_k_token,
                 stride_k_head,
@@ -727,7 +715,6 @@ def compile_pa_decode_tile(
             stride_v_head: fx.Int32,
             work_info_ptr: fx.Pointer,
             num_sequences: fx.Int32,
-            query_scale_ptr: fx.Pointer,
         ):
             _pa_decode_tile_body(
                 pmax_ptr,
@@ -752,7 +739,6 @@ def compile_pa_decode_tile(
                 stride_v_head,
                 work_info_ptr,
                 num_sequences,
-                query_scale_ptr,
             )
 
         def _tile_args(*args):
@@ -784,7 +770,6 @@ def compile_pa_decode_tile(
         stride_v_head: fx.Int32,
         work_info: fx.Pointer,
         work_capacity: fx.Int32,
-        query_scale: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         # Ambient contract permits FMAs; explicit per-op fastmath still wins.
@@ -813,7 +798,6 @@ def compile_pa_decode_tile(
                     stride_v_head,
                     work_info,
                     num_seqs,
-                    query_scale,
                 )
             ).launch(
                 grid=(

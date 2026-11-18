@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""FP8/BF16 or MXFP4 KV decode with BF16/FP16 or externally quantized FP8 queries.
+"""FP8, BF16 or MXFP4 paged-attention decode on gfx942/gfx950/gfx1250.
 
 Cache layouts are logical, not preshuffled. K/V use E4M3 FNUZ on gfx942 and
 OCP on gfx950/gfx1250. See ``kernels.pa_decode_kernel`` for Q/P quantization and
@@ -539,7 +539,6 @@ def _pa_decode_mxfp4(
             *((0,) * 6),
             ptr_arg(context_lengths if direct else work_plan.work_info, fx.Int32),
             capacity,
-            flyc.from_c_void_p(fx.Float32, 0),
             stream,
         )
         if direct:
@@ -630,10 +629,9 @@ def pa_decode(
     splits BF16 D1024/G16/MTP4 with transposed page128 caches and full attention
     into separate query CTAs. Q/K and V/output
     head dimensions must match.
-    ALiBi is unsupported. FP8 queries require scalar FP32 query_scale and BF16/FP16 output.
-    ``softmax_scale`` must be finite and positive, and so must FP8
-    ``key_scale``/``value_scale`` values: host scalars are checked, device
-    tensors are not read back.
+    ALiBi and externally quantized queries are unsupported. ``softmax_scale``
+    must be finite and positive, and so must FP8 ``key_scale``/``value_scale``
+    values: host scalars are checked, device tensors are not read back.
 
     ``quantized_output`` and ``output_scale`` (gfx1250) add a per-token FP8
     output. They must be supplied together. It is OCP FP8 in the same logical
@@ -764,6 +762,10 @@ def pa_decode(
         raise ValueError("quantized_pad_rows must be a nonnegative int")
     if quantized_pad_rows and not quant_output:
         raise ValueError("quantized_pad_rows requires quantized_output")
+    if query_scale is not None:
+        raise NotImplementedError(
+            "pa_decode does not support externally quantized FP8 queries"
+        )
     if alibi_slopes is not None:
         raise NotImplementedError("pa_decode does not support ALiBi")
     # Masked scores are scaled after masking on some paths, so a negative or
@@ -1037,42 +1039,19 @@ def pa_decode(
         raise TypeError(f"context_lengths must be int32, got {context_lengths.dtype}")
     query_group_size = num_q_heads // num_kv_heads
     max_blocks_per_seq = block_tables.shape[1]
-    fp8_query = query.dtype == dtypes.fp8
-    if arch in ("gfx1250", "gfx1250-strict") and fp8_query:
-        raise ValueError("pa_decode does not support FP8 queries on gfx1250")
-    if fp8_query and nhd_layout:
-        # The NHD pipe's traits only cover a BF16/FP16 query; reject here instead
-        # of failing a traits assertion during compilation.
-        raise NotImplementedError(
-            "NHD (4D) KV caches do not support FP8 queries; use a BF16/FP16 "
-            "query with the NHD page-64 layout, or a packed 5D KV cache for FP8 queries"
-        )
+    if query.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f"pa_decode only supports f16/bf16 query, got {query.dtype}")
     if (
         is_bf16_kv
         and arch not in ("gfx1250", "gfx1250-strict")
         and query.dtype != torch.bfloat16
     ):
         raise NotImplementedError("BF16 KV requires bfloat16 queries")
-    if fp8_query:
-        if not isinstance(query_scale, torch.Tensor):
-            raise TypeError("FP8 query_scale must be a torch.Tensor")
-        if query_scale.dtype != torch.float32:
-            raise TypeError("FP8 query_scale must be float32")
-        if query_scale.shape not in ((), (1,)):
-            raise ValueError("FP8 query_scale must be scalar or shape (1,)")
-        if query_scale.device != query.device:
-            raise ValueError("query_scale must be on the same device as query")
-        if output.dtype not in (torch.bfloat16, torch.float16):
-            raise TypeError("FP8 query requires BF16/FP16 output")
-    else:
-        if query.dtype not in (torch.bfloat16, torch.float16):
-            raise TypeError(
-                f"pa_decode only supports f16/bf16/fp8 query, got {query.dtype}"
-            )
-        if query_scale is not None:
-            raise NotImplementedError("query_scale is only supported for FP8 queries")
-        if output.dtype != query.dtype:
-            raise TypeError("pa_decode requires output.dtype == query.dtype")
+    if output.dtype != query.dtype:
+        raise TypeError(
+            "pa_decode requires output.dtype == query.dtype, "
+            f"got {output.dtype} vs {query.dtype}"
+        )
     if quant_output:
         if arch != "gfx1250":
             raise NotImplementedError("quantized PA output requires gfx1250")
@@ -1464,7 +1443,6 @@ def pa_decode(
         compiled = compile_pa_decode_tile(
             architecture=arch,
             **tile_options,
-            output_dtype=output.dtype,
             wide_kv_addressing=wide_kv_addressing,
             kv_buffer_u32=kv_buffer_u32,
             trans_k=trans_k,
@@ -1600,17 +1578,6 @@ def pa_decode(
                 fx.Int32,
             ),
             work_plan.capacity,
-            *(
-                (
-                    (
-                        ptr_arg(query_scale, fx.Float32)
-                        if fp8_query
-                        else flyc.from_c_void_p(fx.Float32, 0)
-                    ),
-                )
-                if arch in ("gfx942", "gfx950")
-                else ()
-            ),
             *merge_args,
             s,
         )

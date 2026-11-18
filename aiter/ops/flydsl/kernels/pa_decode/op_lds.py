@@ -191,8 +191,7 @@ class PaDecodeLds:
 
 
 class PaDecodeQueryLoader:
-    """Load Q early and stage MFMA operands: native BF16, FP8 quantized in-kernel
-    from f16/bf16, or externally quantized FP8 query that bypasses quantization."""
+    """Load Q early and stage native BF16 or normalized FP8 MFMA operands."""
 
     def __init__(self, ctx, lds, gemm):
         self.ctx = ctx
@@ -207,12 +206,6 @@ class PaDecodeQueryLoader:
             if self.traits.QLOAD_UNIT * dsl_size_of(q_dtype) == 16
             else fx.rocdl.BufferCopy64b()
         )
-        if q_dtype == fx.Float8E4M3FN:
-            _q_copy_op = (
-                fx.rocdl.BufferCopy64b()
-                if self.traits.QLOAD_UNIT == 8
-                else fx.rocdl.BufferCopy32b()
-            )
         self.q_buf = ptr_buf_tensor(self.ctx.query_ptr, q_dtype)
         self.q_tiled = fx.logical_divide(self.q_buf, fx.make_layout(1, 1))
         self.q_copy_atom = fx.make_copy_atom(_q_copy_op, q_dtype)
@@ -383,15 +376,6 @@ class PaDecodeQueryLoader:
                     + u * self.traits.QLOAD_UNIT
                 )
                 self.lds.store(q_row_off + elem_off * 2, fx.BFloat16, q_units[u])
-        elif const_expr(self.traits.FP8_QUERY):
-            for u in range_constexpr(self.traits.N_QLOADS):
-                self.lds.store_words(
-                    q_row_off
-                    + self.ctx.qh_local * self.traits.head_dim
-                    + self.ctx.lane16 * self.traits.QCHUNK
-                    + u * self.traits.QLOAD_UNIT,
-                    q_units[u].bitcast(fx.Int32),
-                )
         elif const_expr(self.traits.query_dtype == fx.Float8E4M3FN):
             self.lds.store_words(
                 q_row_off
@@ -453,14 +437,12 @@ class PaDecodeQueryLoader:
                         + self.ctx.lane16 * self.traits.QCHUNK,
                         fx.full(self.traits.QCHUNK // 4, 0, fx.Int32),
                     )
-                    # const_expr gate must stay separate from the runtime lane test.
-                    if const_expr(not self.traits.FP8_QUERY):  # noqa: SIM102
-                        if self.ctx.lane16 == 0:
-                            self.lds.store_scalar(
-                                self.traits.sQscale_off,
-                                self.ctx.qh_local * self.traits.M_TILES + m,
-                                self.ctx.ZERO_F,
-                            )
+                    if self.ctx.lane16 == 0:
+                        self.lds.store_scalar(
+                            self.traits.sQscale_off,
+                            self.ctx.qh_local * self.traits.M_TILES + m,
+                            self.ctx.ZERO_F,
+                        )
 
     def load_operands(self):
         if const_expr(self.traits.kv_dtype == MXFP4_KV_DTYPE):

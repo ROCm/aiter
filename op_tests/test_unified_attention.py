@@ -360,8 +360,13 @@ def test_decode(dtype, depth, layout):
         # Layer-graph coverage depends on dtype only, so run it once per dtype.
         if dtype not in _LAYER_GRAPH_CHECKED:
             _LAYER_GRAPH_CHECKED.add(dtype)
-            check_decode_layer_graphs(dtype)
-            check_decode_workspace_growth(dtype)
+            check_decode_routing(dtype)
+            # These exercise the pa_decode route, which needs FP8-query pa_decode.
+            from aiter.ops.flydsl import unified_attention_kernels as kernels
+
+            if kernels._PA_DECODE_FP8_QUERY:
+                check_decode_layer_graphs(dtype)
+                check_decode_workspace_growth(dtype)
     if layout == "linear":
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -375,6 +380,27 @@ def test_decode(dtype, depth, layout):
             "decode graph",
         )
     return ret
+
+
+def check_decode_routing(dtype):
+    """Decode routing: pa_decode when it takes FP8 queries, else the fmha kernel
+    (non-causal, forced causal) and Triton (auto causal)."""
+    query_lens, kv_lens = [1] * 4, [64, 777, 1024, 129]
+    for causal in (True, False):
+        for backend in (None, "flydsl"):
+            for layout in ("linear", "vectorized"):
+                case = make_case(query_lens, kv_lens, dtype, causal=causal)
+                want = reference(case, query_lens, kv_lens)
+                if layout == "vectorized":
+                    case["k"], case["v"] = shuffle_kv_cache(case["k"], case["v"])
+                case["shuffled_kv_cache"] = layout == "vectorized"
+                ua.unified_attention(**case, backend=backend)
+                compare(
+                    want,
+                    case["out"],
+                    FP8_REL_ERR[dtype] * want.abs().max().item(),
+                    f"decode routing causal={causal} backend={backend} {layout}",
+                )
 
 
 def check_decode_layer_graphs(dtype):

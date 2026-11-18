@@ -161,6 +161,18 @@ def _env_use_pa_decode(default: bool = True) -> bool:
 _USE_PA_DECODE = _env_use_pa_decode()
 
 
+def _pa_decode_supports_fp8_query() -> bool:
+    # The FP8-query pa_decode PR sets SUPPORTS_FP8_QUERY; this route needs it.
+    try:
+        from . import pa_decode
+    except ModuleNotFoundError:
+        return False
+    return getattr(pa_decode, "SUPPORTS_FP8_QUERY", False)
+
+
+_PA_DECODE_FP8_QUERY = _pa_decode_supports_fp8_query()
+
+
 def _pa_decode_num_partitions(
     num_seqs: int, num_kv_heads: int, max_seqlen_k: int, num_cus: int
 ) -> int:
@@ -177,6 +189,7 @@ def _pa_decode_ok(max_seqlen_q, shuffled_kv_cache, out, num_seqs) -> bool:
     5D shuffled strides, page 64, D128, int32 index tensors, no softcap/alibi)."""
     return (
         _USE_PA_DECODE
+        and _PA_DECODE_FP8_QUERY
         and max_seqlen_q == 1
         and shuffled_kv_cache
         and out.dtype in (torch.bfloat16, torch.float16)
@@ -728,13 +741,20 @@ def flydsl_unified_attention(
                 num_kv_heads=num_kv_heads,
                 num_seqs=num_seqs,
             )
-        # Linear-cache decode has no FlyDSL kernel.
-        return None
+        if _PA_DECODE_FP8_QUERY:
+            # Linear-cache decode has no FlyDSL kernel.
+            return None
+        # Without pa_decode FP8-query support, decode runs on the fmha kernel below
+        # (1-token varlen rows). Auto causal decode reaches here only when forced.
 
     # One query-length-1 row caps M at (B-1)*S+1, so a larger M has no decode rows.
     # Possibly mixed: BN64 pads decode rows to full tiles, slower than the fallback.
     # Non-causal has no fallback, so it stays on FlyDSL.
-    if causal and not (num_seqs == 1 or q.shape[0] > (num_seqs - 1) * max_seqlen_q + 1):
+    if (
+        causal
+        and max_seqlen_q != 1
+        and not (num_seqs == 1 or q.shape[0] > (num_seqs - 1) * max_seqlen_q + 1)
+    ):
         return None
 
     num_query_heads = q.shape[1]

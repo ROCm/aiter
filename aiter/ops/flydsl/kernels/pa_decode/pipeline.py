@@ -689,10 +689,7 @@ class PaDecodePipeline:
                 ]
 
         q_scale_vec = None
-        if const_expr(
-            self.traits.M_TILES > 1
-            and not (self.traits.kv_dtype == fx.BFloat16 or self.traits.FP8_QUERY)
-        ):
+        if const_expr(self.traits.M_TILES > 1 and self.traits.kv_dtype != fx.BFloat16):
             q_scale_vec = self.lds.load(
                 self.traits.sQscale_off
                 + self.ctx.lane16 * (self.traits.M_TILES * self.traits.f32),
@@ -810,9 +807,7 @@ class PaDecodePipeline:
 
             scale = (
                 self.ctx.scale_qk
-                if const_expr(
-                    self.traits.kv_dtype == fx.BFloat16 or self.traits.FP8_QUERY
-                )
+                if const_expr(self.traits.kv_dtype == fx.BFloat16)
                 else self.ctx.scale_qk * fx.Float32(q_scale_vec[m])
             )
             masked_chunks = self.softmax.multi_scores(
@@ -1379,7 +1374,7 @@ class PaDecodePipeline:
             and self.traits.sliding_window == 0
         )
         for m in range_constexpr(self.traits.M_TILES):
-            if const_expr(self.traits.kv_dtype == fx.BFloat16 or self.traits.FP8_QUERY):
+            if const_expr(self.traits.kv_dtype == fx.BFloat16):
                 scale = self.ctx.scale_qk
             elif const_expr(self.traits.M_TILES > 1):
                 scale = self.ctx.scale_qk * fx.Float32(q_scale_vec[m])
