@@ -79,6 +79,17 @@ Python 使用机器上匹配 ROCm 的既有环境；如需隔离，按原指南�
 
 源码确定的分配是 `task = worker + k*256`。A03 每行一个 task；A09 每 1024 元素一个 task，K=2048 时每行两个 task。以 A09 rows=513 为例：1026 task，254 个 worker 各做 4 个，2 个 worker 各做 5 个；native 发出 1026 个独立 TG。PS 将后续 task 放进同一 worker 的循环，改变了独立任务的供给和可重叠程度；具体 load／wait 重叠程度仍需真实 ISA 与测量。
 
+**先验证“同样的 task 切分，为何不能保持性能”，不要将循环轮数直接当作回退原因。** A03 的整个 `tl.range` 循环 AST 与冻结 native 相同，原 wrapper 发 M 个 TG、步长 M，每 TG 实际只做一行；PS 改为 256 TG、步长 256。A09 原来无 task loop，每 TG 做一个 `[32 groups,32 elements]` tile，现在把相同逻辑 tile 放进循环。两者 native／PS 每 TG 均为 128 threads，未增加跨 TG barrier／flag／poll，也未把一个 task 拆小。
+
+| M=513 时的映射 | Native | PS |
+| --- | --- | --- |
+| A03 | TG r 同时负责第 r 行的 Q1280 和 KV512 | worker 0 做 row 0／256／512；worker 1 做 1／257 |
+| A09，K=2048 | TG 2r 做 row r 的前1024元素，TG 2r+1 做后1024元素 | worker 0 做 row 0／128／256／384／512 的前半；worker 1 做相同行的后半 |
+
+96 行时，两者所有有效 worker 都只有一个 task，不能用多轮串行解释该配置。task 内访问地址与逻辑布局不变；A03 worker 下一行相差 896 KiB、A09 下一 task 相差 512 KiB，是跨 task 步长，不能据此称为 task 内访存不合并。A03 原本每 TG 都读权重，PS 每轮读权重不自动构成新增总读取量。
+
+如果 native 也只能以等效 256 个独立 task 同时推进，则1026个task同样需要至少5批；在每 task 指令、等待重叠和调度供给相同的理想条件下，PS 没有必然变慢的理由。需核实实际差异是否为：native 有更多可同时推进的 wave／请求；PS 下一 task load 未重叠；loop／寄存器／grid 形状改变编译或调度。不能仅按 TG 总数推断实际驻留数，也不能把上一 task 发出 store 等同于等待其全局写回后才开始下一 task。
+
 | 条件 | A03 | A09，K=2048 |
 | --- | --- | --- |
 | task 数 N | M | 2M |
@@ -112,6 +123,8 @@ python -m op_tests.op_benchmarks.triton.bench_mono_persistent \
 ```
 
 - [ ] 另加诊断对照 provider：A09 `quantize_fp8_group32(..., persistent=False)`，与冻结 native 及 PS 使用同 pool／seed／Graph。先校验再计时；三 provider 按轮轮换顺序，并保留原两 provider 的正式结果。用于判断迁入 kernel 的通用循环／编译成本与 P256 多轮成本，不能仅凭 native-vs-PS 一组归因。
+- [ ] rows=96 优先比较同一数值 body 的三条路径：native 原 grid、P256 一次执行加有效 task guard、P256 当前循环。一次执行路径只用于 N<=256。这样分别检查空 TG／二维 grid 成本和循环成本；真实 TTGIR 核对 lane layout，不能由源码 tile 相同推断机器布局必然相同。
+- [ ] 在独立诊断分支对 rows=513 比较同一循环 body 的 P=256／512／1024／2048；仍为4 wave32，grid=`(16,P/16)`、worker=`x+16*y`、task stride=P，保持完整工作量。诊断 wrapper 与结果明确标 P，先检查每 task 恰好一次、byte equality／guard，再测量；另以 P256 的 `(256,)` grid 对照 `(16,16)`，前者 worker 直接取 pid0。正式 `persistent=True` 仍固定 P256，其他 P 的时间不能混入正式验收。若增加 P 降低耗时，只能证明 worker 数／迭代链组合影响性能，仍需 ISA／counter 区分供给与循环流水。
 - [ ] 必须保留每轮样本及执行顺序，报告 median、P10、P90、绝对差值和比值；记录 case 起止、GPU 负载及采样间隔、时钟。计时不启 profiler；hot／rotating 只是输入复用方式，不能直接称为已测 cache 命中／未命中。
 - [ ] 比较 A03 256→257、512→513 与 A09 128→129、256→257、512→513 的 native／PS 各自变化。如果整轮配置也回退，则尾轮只能解释部分损失；如果 port 已有相同小幅成本，区分其与多轮 PS 的额外成本。A09 rotating 的回退比例较小也要列绝对 µs，不能据此认定问题消失。
 - [ ] 对决定优化取舍且接近波动的项再做两次完整相关矩阵；不从多次结果拼最好值。未稳定分开的项继续标 inconclusive。
@@ -131,7 +144,7 @@ C2 可以先在 A09 验证，因其每个 group32 独立且现有回退最大；
 
 - **A09 两个 1024 task 合批**：同 TG 同时持有 t 与 t+256 的输入，沿 task 维并行计算，reduce 仅在每个原 group 的 32 元素内进行，两个 task 分别写回原地址。stride 仍服务同一 P256 worker；报告 layout／寄存器变化。它改变计算体布局，须作为后续独立候选，不能只删循环后宣称等价优化。
 - **大 shape standalone native fallback**：可在外层 dispatch 根据已测 shape 选择 native，避免独立服务使用慢路径；它不满足该 case 的 P256 实现目标。不要在 `persistent=True` 下静默改为 native，或将 native 时间记作 PS；本轮给出明确适用 shape 和接口方案即可。
-- 动态 task counter、改变 worker 编号、直接增 P 不能作为本轮正式修复；前两者不能消除不拆 task 时的 `ceil(N/256)` 下界，增 P 则改变验收条件。
+- 动态 task counter、改变 worker 编号、直接增 P 不能作为本轮正式修复；前两者不能消除不拆 task 时的 `ceil(N/256)` 下界，增 P 则改变验收条件。第2节的 P 对照仅用于诊断，不能据其通过而宣称 P256 已修复。
 
 ## 4. 最终验收与回传
 
