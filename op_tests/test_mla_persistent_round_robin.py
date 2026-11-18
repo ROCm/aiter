@@ -91,7 +91,6 @@ def ref_masked_attention(
         attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
         attn_bias.to(query.dtype)
         attn_weights += attn_bias
-        attn_mask = temp_mask
 
     lse = attn_weights.logsumexp(dim=-1)
     m = attn_weights.max(-1).values
@@ -108,8 +107,7 @@ def ref_masked_attention(
 
     if attn_mask is not None:
         # Query rows with no visible key (whole row masked) produce NaN above;
-        # define them as out=0, lse=-inf (an empty CP shard for that token, or a
-        # causal query before the first key when s_k < s_q).
+        # define them as out=0, lse=-inf (an empty CP shard for that token).
         invalid = attn_mask.any(dim=-1).logical_not()  # [s_q]
         if bool(invalid.any()):
             out = out.clone()
@@ -449,9 +447,12 @@ def test_mla_cp(
     kv_block_nums = torch.empty(batch_size, dtype=torch.int)
     seq_lens_kv = torch.empty(batch_size, dtype=torch.int)
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+    # Every rank needs a KV token, and decode never has fewer KV tokens than
+    # query tokens: a causal query row before the first key has no visible key.
+    min_kv = max(W, qlen)
     if varlen:
         for i in range(batch_size):
-            seq_lens_kv[i] = max(int(random.uniform(W, ctx_lens)), W)
+            seq_lens_kv[i] = max(int(random.uniform(min_kv, ctx_lens)), min_kv)
             kv_block_nums[i] = (seq_lens_kv[i] + page_size - 1) // page_size
             kv_last_page_lens[i] = (
                 page_size
@@ -466,8 +467,8 @@ def test_mla_cp(
         )
 
     assert (
-        int(seq_lens_kv.min().item()) >= W
-    ), f"every request kv_len must be >= cp_world_size({W})"
+        int(seq_lens_kv.min().item()) >= min_kv
+    ), f"every request kv_len must be >= max(cp_world_size, qlen) = {min_kv}"
 
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
     kv_indptr[1:] = torch.cumsum(kv_block_nums, dim=0)
@@ -805,7 +806,7 @@ for nhead, decode_qlen in args.nhead:
             continue
         if not check_support(dtype, kvtype, nhead):
             continue
-        if ctx_len < cp_world_size:
+        if ctx_len < max(cp_world_size, decode_qlen):
             continue
         ret = test_mla_cp(
             ctx_len,
