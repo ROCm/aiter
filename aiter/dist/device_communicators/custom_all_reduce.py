@@ -1557,6 +1557,14 @@ class CustomAllreduce:
         self._fly_rms = None
         self._init_fly_rms()
 
+        # Rows a source the gfx1250 DCP merge takes, 0 where it does not run
+        # (see custom_dcp_merge).
+        self._dcp_merge_max_rows = (
+            ops.dcp_merge_max_rows_gfx1250(self._ptr)
+            if self._is_gfx1250 and not self.disabled
+            else 0
+        )
+
     def _init_fly_rms(self):
         """Build the exact FlyDSL fused all-reduce+RMSNorm engine."""
 
@@ -1578,12 +1586,6 @@ class CustomAllreduce:
             rms.close()
             return
         self._fly_rms = rms
-
-        # Rows a source the gfx1250 DCP merge takes, 0 where it does not run
-        # (see custom_dcp_merge).
-        self._dcp_merge_max_rows = (
-            ops.dcp_merge_max_rows_gfx1250(self._ptr) if self._is_gfx1250 else 0
-        )
 
     def _init_fly_oneshot(self):
         """Build the FlyDSL exact one-shot that fronts small plain all-reduces,
