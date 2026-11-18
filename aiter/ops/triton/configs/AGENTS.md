@@ -269,13 +269,16 @@ an arch that runs the GQA decode kernel needs the `v1_w_dot` entry.
 | | `split_short_seq`, `split_short_min_programs` | A sequence shorter than the first value on a grid with at least the second value is not split. |
 | | `tdm_num_warps` | gfx1250 only. A call with unit K/V scales, no ALiBi, page 128, head size 56, 64 or 128 and a group of at most 16 runs the Gluon TDM kernel with this many warps, one of 1, 2, 4 or 8. `null` or no key turns it off. |
 | | `tdm_split_target_programs`, `tdm_split_sizes`, `tdm_split_max_partitions` | The Gluon kernel cuts a sequence into partitions when the grid has fewer programs than the first value. It takes the largest size in the list (tokens, a multiple of 128) that reaches the target within the partition cap, else the smallest size. Partials go through the v2 reduce kernel. `null` or no key keeps sequences whole. |
-| `launch.<v1_w_dot, v2_w_dot, v1_wo_dot or v2_wo_dot>` | `BLK_LEQ_<x>`, `any` | `num_warps`, `num_stages` and `waves_per_eu` for page sizes up to `<x>`, else `any`. `w_dot` kernels run GQA, `wo_dot` kernels run MHA. |
+| `launch.<v1_w_dot, v2_w_dot, v1_wo_dot or v2_wo_dot>` | `BLK_LEQ_<x>`, `any` | `num_warps`, `num_stages` and `waves_per_eu` for page sizes up to `<x>`, else `any`. `w_dot` kernels run GQA, `wo_dot` kernels run MHA. `USE_TENSOR_DESC` (`w_dot` only, default `false`) loads K/V pages through a tensor descriptor. The wrapper ignores it when the cache strides or base pointers are not 16-byte aligned. |
 
 - A `split_*` key is optional. Without `split_target_programs` the kernel does
   not split.
 - A part with another CU count has its own tree, `gfx1250/96cu/` for a 96-CU
   part (see [CU trees](#cu-trees)). The tree is read whole, so it repeats every
   key of the plain `DEFAULT.json` and changes only the ones that differ.
+- `USE_TENSOR_DESC` is on for page sizes above 16 on gfx1250 only. It was 14 to
+  41% faster there and up to 9% slower for page 16. Measure before turning it
+  on for another arch. A CU tree repeats the key to keep it.
 - Do not set `num_stages` to 3 or more on gfx1250. It can hang the GPU.
 - Keep `num_stages` at 1 in the gfx1250 PA decode `launch` table. A value of 2
   gave a GPU memory fault in the page-16 GQA kernels on a 96-CU (DPX) part.
