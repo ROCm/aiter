@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
@@ -17,6 +17,7 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     cluster_m_grid_ok,
     compute_kernel_k_pair,
+    fused_splitk_ok,
 )
 
 WMMA = 16  # WMMA M/N tile granularity
@@ -74,12 +75,14 @@ class WmmaKernelInstance:
     name_prefix: str = NAME_PREFIX
     a_preshuffle: bool = False
     persistent_n_tiles: int = 1
+    fused_splitk: bool = False
 
     def name_for(self, a_preshuffle: bool = False) -> str:
         return (
             f"{self.name_prefix}_t{self.tile_m}x{self.tile_n}x{self.tile_k}_"
             f"mw{self.m_warp}_nw{self.n_warp}_nb{self.num_buffers}_sk{self.split_k}_"
             f"cm{self.cluster_m}_cn{self.cluster_n}"
+            + ("_fsk" if self.fused_splitk else "")
             + ("_apre" if (a_preshuffle or self.a_preshuffle) else "")
             + (f"_ps{self.persistent_n_tiles}" if self.persistent_n_tiles > 1 else "")
         )
@@ -198,6 +201,11 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
                         persistent_n_tiles=ps,
                     )
                     idx += 1
+    # Fused twins go last so every existing kernelId keeps its kernel.
+    for ki in tuple(kl.values()):
+        if ki.split_k > 1:
+            kl[idx] = replace(ki, fused_splitk=True)
+            idx += 1
     return kl
 
 
@@ -209,6 +217,17 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
 
     # Row pairs need both rows, so an odd M has no valid pairing.
     if ki.a_preshuffle and M % 2 != 0:
+        return False
+
+    if ki.fused_splitk and not fused_splitk_ok(
+        ki.tile_m,
+        ki.tile_n,
+        ki.m_warp,
+        ki.n_warp,
+        ki.cluster_m,
+        ki.cluster_n,
+        ki.split_k,
+    ):
         return False
 
     if is_compute_kernel(ki):
