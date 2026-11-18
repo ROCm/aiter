@@ -1,5 +1,69 @@
 # A03/A09 standalone P256 validation
 
+## Adaptive PS result: 2026-11-18
+
+Tested code: `96826c2c50f69d50484d8e64a250d7793268ce9d`. This result supersedes the fixed-four-task
+experiment below. It does not claim a universal performance win.
+
+A03 counts rows. It selects one task through 767 rows and four tasks above
+that bound. The two-row main batch regressed in measured cases and is not
+selected. A09 counts `ceil(numel/1024)`: one task through 256, two tasks
+through 512, and four tasks above 512. Thus A09 width-2048 rows 96/257/513
+select 1/4/4. The two-task path balances one/two-task workers. The four-task
+path keeps the direct cyclic loop; splitting its tail into smaller batches
+did not give a general win. Configs use the existing JSON config loaders.
+
+All 89 GPU tests passed with zero skips. All original 52 tests remain, with
+37 new threshold, tail and Graph cases. All 12 frozen native hashes and
+20 offline compile variants passed. Native source and byte assertions did
+not change. The final Graph trace recorded 336 PS dispatches across eight
+kernel names. All had grid `(32768,1,1)` and workgroup `(128,1,1)`.
+Actual four-task ISA instruction sequences match the prior PS4 kernels.
+All selected PS paths have zero scratch spill.
+
+Against old single-task PS, the 108 four-provider cases have 77 improvements,
+31 inconclusive results and no regressions under the stated rule. Inconclusive
+does not prove equivalence. Four cases still regress against fixed PS4.
+
+The original paired matrix has 18 cases. A separate four-provider matrix has
+108 cases, including threshold boundaries and larger rows. Each selected case
+has 15 trials and no foreign GPU PID observed by 100 ms sampling. Timing uses
+the shared GPU lock, common input pools and graph timing without profiling.
+Values below are median / P10 / P90 in microseconds.
+
+| Op | Rows | Cache | Native median / P10 / P90 (us) | Adaptive median / P10 / P90 (us) | Adaptive/native | Decision |
+| --- | ---: | --- | ---: | ---: | ---: | --- |
+| a03 | 96 | hot | 1.577154 / 1.565078 / 1.594461 | 1.598902 / 1.566974 / 1.611840 | 1.013790 | inconclusive |
+| a03 | 96 | rotating | 1.919952 / 1.915746 / 1.925917 | 1.915368 / 1.913960 / 1.923626 | 0.997613 | inconclusive |
+| a03 | 257 | hot | 1.692482 / 1.673074 / 1.709228 | 2.177104 / 1.895471 / 2.196804 | 1.286338 | regression |
+| a03 | 257 | rotating | 2.034134 / 2.023184 / 2.046160 | 2.299303 / 2.244865 / 2.446154 | 1.130360 | regression |
+| a03 | 513 | hot | 1.817402 / 1.810269 / 1.835534 | 2.592026 / 2.585223 / 2.606715 | 1.426226 | regression |
+| a03 | 513 | rotating | 2.242839 / 2.235572 / 2.246908 | 3.085473 / 3.058017 / 3.127181 | 1.375700 | regression |
+| a09 | 96 | hot | 1.352658 / 1.327280 / 1.358627 | 1.369643 / 1.367575 / 1.371885 | 1.012557 | inconclusive |
+| a09 | 96 | rotating | 1.686201 / 1.675495 / 1.697029 | 1.670057 / 1.655876 / 1.683546 | 0.990426 | inconclusive |
+| a09 | 257 | hot | 1.498188 / 1.490096 / 1.509130 | 1.327011 / 1.323278 / 1.328867 | 0.885744 | improvement |
+| a09 | 257 | rotating | 2.042094 / 2.034590 / 2.092444 | 1.837972 / 1.825438 / 1.844247 | 0.900043 | improvement |
+| a09 | 513 | hot | 1.636515 / 1.630898 / 1.643407 | 1.612555 / 1.604425 / 1.620328 | 0.985359 | improvement |
+| a09 | 513 | rotating | 2.737604 / 2.733202 / 2.743499 | 2.007082 / 1.996708 / 2.020106 | 0.733153 | improvement |
+| a09-qat | 96 | hot | 1.250873 / 1.245912 / 1.252150 | 1.227627 / 1.226595 / 1.228271 | 0.981416 | improvement |
+| a09-qat | 96 | rotating | 1.600152 / 1.598866 / 1.604137 | 1.579173 / 1.577714 / 1.580304 | 0.986889 | improvement |
+| a09-qat | 257 | hot | 1.307610 / 1.305376 / 1.308629 | 1.332011 / 1.329461 / 1.334294 | 1.018660 | regression |
+| a09-qat | 257 | rotating | 1.691141 / 1.689636 / 1.692849 | 1.751627 / 1.750559 / 1.754123 | 1.035767 | regression |
+| a09-qat | 513 | hot | 1.419213 / 1.418548 / 1.424220 | 1.721550 / 1.686713 / 1.747807 | 1.213031 | regression |
+| a09-qat | 513 | rotating | 1.794043 / 1.792317 / 1.795352 | 1.856036 / 1.849132 / 1.859300 | 1.034555 | regression |
+
+Some cases still regress against native, so standalone performance acceptance
+does not pass. Task-count dispatch alone cannot promise zero regression for
+every valid shape. Other widths have correctness coverage, not a broad
+performance guarantee. Full mono ABI, DEV/HT, reserved-register, joins and
+model integration remain outside this change.
+
+Raw evidence: `/home/weizhu15/workspace/mono-adaptive-20261118`. See `REPORT.zh.md`,
+`performance-four-way-table.md`, `performance-accepted.json`,
+`performance-selections.json`, `launch-final-gate.json`, `jit-final-review.json`
+and `logs/`. Earlier strategies and their rejected results remain in that
+directory; they are not mixed into the final timing matrix.
+
 ## Four-task PS experiment: 2026-11-18
 
 This section records the current user-requested four-task experiment. The
