@@ -10,8 +10,8 @@ import torch
 import triton
 
 from aiter.ops.triton.attention.minimax_m3 import (
-    minimax_m3_prefill_score,
     minimax_m3_packed_topk,
+    minimax_m3_prefill_score,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from op_tests.triton_tests.utils import minimax_m3 as m3

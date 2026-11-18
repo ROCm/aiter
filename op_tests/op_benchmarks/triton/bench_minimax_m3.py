@@ -16,8 +16,8 @@ import torch
 import triton
 
 from aiter.ops.triton.attention.minimax_m3 import (
-    minimax_m3_prefill_score,
     minimax_m3_packed_topk,
+    minimax_m3_prefill_score,
 )
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from op_tests.op_benchmarks.triton.utils.argparse import (
