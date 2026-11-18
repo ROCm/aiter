@@ -146,19 +146,13 @@ _captured_uploads: dict[int, torch.Tensor] = {}
 
 
 def wait_for_upload(ticket: UploadTicket, buf: torch.Tensor) -> None:
-    """Make ``buf``, from a cached ``upload_ints`` that returned ``ticket``, safe
-    to use on the current stream.
+    """Make a cached ``upload_ints`` buffer safe to use on the current stream.
 
-    From another stream, the copy may not have run yet and the cache may evict
-    and free ``buf`` while kernels queued here still read it: wait for the
-    ticket's event, which covers the copy and not the work queued on the
-    uploading stream since, and record ``buf`` on the current stream. During
-    graph capture neither can be expressed, so ``buf`` is kept for the life of
-    the process, and the copy must have completed before capture began:
-    ``torch.cuda.graph`` synchronizes the device first; a caller of
-    ``CUDAGraph.capture_begin`` must do so itself.
+    From another stream, wait for the ticket's event and record ``buf`` on the current stream.
     """
     if torch.cuda.is_current_stream_capturing():
+        # Keep ``buf`` for the life of the process. The copy must be done before
+        # capture: ``torch.cuda.graph`` syncs first, but ``capture_begin`` does not.
         _captured_uploads[buf.data_ptr()] = buf
         return
     stream, event = ticket
