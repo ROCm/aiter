@@ -33,35 +33,18 @@ inline __device__ void opus_moe_stage2_a8w4_decode_tile_ids(int wgid,
             const int blocks_per_cycle = nXCD * C;
             const int tiles_per_group = W * num_tiles_n;
             const int limit = (total_wgs / blocks_per_cycle) * blocks_per_cycle;
-            if(wgid >= limit)
+            // The swizzle permutes each full cycle of blocks_per_cycle workgroups;
+            // the tail past limit keeps its index, so the group mapping below
+            // still covers every tile.
+            int swizzled = wgid;
+            if(wgid < limit)
             {
-                const int full_groups = limit / tiles_per_group;
-                const int covered_cols = (limit - full_groups * tiles_per_group) / W;
-                const int partial_first_row = full_groups * W;
-                int partial_row_extent = num_tiles_m - partial_first_row;
-                if(partial_row_extent > W)
-                    partial_row_extent = W;
-                const int tail = wgid - limit;
-                const int partial_tiles =
-                    (partial_row_extent > 0) ? (num_tiles_n - covered_cols) * partial_row_extent
-                                             : 0;
-                if(tail < partial_tiles)
-                {
-                    tile_m_id = partial_first_row + (tail % partial_row_extent);
-                    tile_n_id = covered_cols + (tail / partial_row_extent);
-                    return;
-                }
-                const int rest = tail - partial_tiles;
-                tile_m_id = partial_first_row + partial_row_extent + rest / num_tiles_n;
-                tile_n_id = rest % num_tiles_n;
-                return;
+                const int xcd = wgid % nXCD;
+                const int local = wgid / nXCD;
+                const int chunk_idx = local / C;
+                const int pos = local % C;
+                swizzled = xcd * C + chunk_idx * blocks_per_cycle + pos;
             }
-
-            const int xcd = wgid % nXCD;
-            const int local = wgid / nXCD;
-            const int chunk_idx = local / C;
-            const int pos = local % C;
-            const int swizzled = xcd * C + chunk_idx * blocks_per_cycle + pos;
             const int group_id = swizzled / tiles_per_group;
             const int first_row = group_id * W;
             int win_h = num_tiles_m - first_row;
@@ -154,7 +137,7 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
         int32_t a_base = 0;
         int32_t route_row = -1;
         float weight = 0.0f;
-        if(row < sorted_rows)
+        if(local_m < T::ROUTE_M_STRIDE && row < sorted_rows)
         {
             const int32_t packed = kargs.sorted_token_ids[row];
             const int token = opus_moe_token_id(packed);
@@ -183,7 +166,7 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
     }
     if constexpr(T::DIRECT_ATOMIC_OUT)
     {
-        if(route_base + T::B_M <= sorted_rows)
+        if(route_base + T::ROUTE_M_STRIDE <= sorted_rows)
         {
             __syncthreads();
             return true;
@@ -195,7 +178,7 @@ inline __device__ bool opus_moe_stage2_a8w4_decode_load_route_metadata(
         if constexpr(T::IS_BM32_BN256 || T::IS_BM64_BN256)
         {
             // Full sorted tiles do not need a route-count reduction.
-            if(route_base + T::B_M <= sorted_rows)
+            if(route_base + T::ROUTE_M_STRIDE <= sorted_rows)
             {
                 __syncthreads();
                 return true;

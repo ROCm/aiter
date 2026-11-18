@@ -95,7 +95,94 @@ def get_parser(kernel_name: str) -> argparse.ArgumentParser:
         default="throughput",
         help="metric to plot",
     )
+
+    parser.add_argument(
+        "--graph-warmup-iters",
+        type=positive_int,
+        default=3,
+        help="RotatingBufferBench: untimed iterations before the CUDA graph is captured",
+    )
+    parser.add_argument(
+        "--graph-warmup-replays",
+        type=positive_int,
+        default=3,
+        help="RotatingBufferBench: untimed graph replays before the timed ones",
+    )
+    parser.add_argument(
+        "--graph-kernels-per-graph",
+        type=positive_int,
+        default=1000,
+        help="RotatingBufferBench: kernel calls captured per CUDA graph",
+    )
+    parser.add_argument(
+        "--graph-num-replays",
+        type=positive_int,
+        default=10,
+        help="RotatingBufferBench: timed graph replays",
+    )
+    parser.add_argument(
+        "--rot-bufs-min-pool-len",
+        type=positive_int,
+        default=4,
+        help="rotating buffers minimum pool length",
+    )
+    parser.add_argument(
+        "--rot-bufs-target-mb",
+        type=positive_int,
+        default=None,
+        help="rotating buffers target size in MB (default: a fixed value per "
+        "device arch, see RotatingBufferBench._default_target_rot_pool_sz_mb)",
+    )
+    parser.add_argument(
+        "--rot-bufs-max-gpu-mem-mb",
+        type=positive_int,
+        default=None,
+        help="cap on the rotating pool's total real device-memory footprint, "
+        "in MB (default: 90%% of currently free device memory)",
+    )
+    parser.add_argument(
+        "--rot-bufs-print-info",
+        action="store_true",
+        default=False,
+        help="Print rotating buffers pool info (pool length, per-set and total bytes)",
+    )
+
     return parser
+
+
+def get_do_bench_graph_kwargs(args: argparse.Namespace) -> dict:
+    """RotatingBufferBench.bench/bench_synced kwargs from the --graph-* flags
+    added by get_parser()."""
+    return {
+        "warmup_iters": args.graph_warmup_iters,
+        "warmup_replays": args.graph_warmup_replays,
+        "kernels_per_graph": args.graph_kernels_per_graph,
+        "num_replays": args.graph_num_replays,
+    }
+
+
+def get_rot_bufs_kwargs(args: argparse.Namespace) -> dict:
+    """RotatingBufferBench.from_dict kwargs from the --rot-bufs-* flags added
+    by get_parser().
+    Note: max_pool_len is set to --graph-kernels-per-graph; the MB-valued
+    --rot-bufs-max-gpu-mem-mb flag is converted to GB here for
+    total_pool_sz_gb.
+    """
+    return {
+        "target_rot_pool_sz_mb": args.rot_bufs_target_mb,
+        "total_pool_sz_gb": (
+            args.rot_bufs_max_gpu_mem_mb / 1024
+            if args.rot_bufs_max_gpu_mem_mb is not None
+            else None
+        ),
+        "min_pool_len": args.rot_bufs_min_pool_len,
+        "print_info": args.rot_bufs_print_info,
+        # By default keep the rotating buffer pool length <= graph_kernels_per_graph
+        # Otherwise, in case per-set bytes are too small, then covering
+        # target_rot_pool_sz_mb might blow up the pool_len. This is not ideal
+        # for capturing graph
+        "max_pool_len": args.graph_kernels_per_graph,
+    }
 
 
 def get_ff_args(
