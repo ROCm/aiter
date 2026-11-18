@@ -423,7 +423,7 @@ RMS_EPS = 1e-6
 CANDIDATE_KNOBS = {
     ("oneshot", "ar"): ("atoms", "grid_cap", "fanout", "block"),
     ("oneshot", "ar_rmsnorm"): ("atoms", "grid_cap", "fanout", "block", "split"),
-    ("mesh", "ar"): ("super_tile", "grid_cap", "block", "handshake"),
+    ("mesh", "ar"): ("super_tile", "grid_cap", "block", "handshake", "tuning"),
     ("ring", "ar"): ("super_tile", "grid_cap", "block", "handshake"),
     ("mesh", "ar_rmsnorm"): (
         "super_tile",
@@ -448,10 +448,11 @@ _CANDIDATE_COLUMNS = (
     "atoms_per_row",
     "low_latency",
     "handshake",
+    "tuning",
     "sets",
 )
 # Columns a candidate file may leave out; a missing one is empty on every row.
-_OPTIONAL_CANDIDATE_COLUMNS = ("low_latency", "handshake")
+_OPTIONAL_CANDIDATE_COLUMNS = ("low_latency", "handshake", "tuning")
 
 
 @dataclass(frozen=True)
@@ -477,13 +478,17 @@ def load_candidates(
     A candidate file is a CSV with the columns ``name, operation, algorithm``,
     one column per knob (``atoms, grid_cap, fanout, block, split, super_tile,
     atoms_per_row``, the optional ``low_latency``, 0 or 1, and the optional
-    ``handshake``, ``flag`` or ``lamport``) and ``sets``. ``operation`` is ``ar`` or ``ar_rmsnorm``,
+    ``handshake``, ``flag`` or ``lamport``, and the optional ``tuning``, the
+    Lamport mesh knobs as ``key=value;key=value``, ``MeshKnobs.parse``) and
+    ``sets``. ``operation`` is ``ar`` or ``ar_rmsnorm``,
     ``algorithm`` is ``oneshot``, ``mesh`` or ``ring``. A knob cell is empty
     when the row leaves it to the engine, and a row may only pin the knobs of
     its algorithm and operation (``CANDIDATE_KNOBS``). ``sets`` is a list of
     tags separated by ``;`` that ``--candidate-set`` selects on. Names are
     unique: each is a column prefix in the bench tables.
     """
+    from aiter.ops.flydsl.allreduce_policy import MeshKnobs
+
     df = pd.read_csv(path, dtype=str, keep_default_na=False, comment="#")
     for col in _OPTIONAL_CANDIDATE_COLUMNS:
         if col not in df.columns:
@@ -513,6 +518,13 @@ def load_candidates(
                 )
             if col in ("fanout", "handshake"):
                 knobs[col] = cell
+            elif col == "tuning":
+                try:
+                    knobs[col] = MeshKnobs.parse(cell)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{path} row {i} ({row['name']}): tuning: {exc}"
+                    ) from exc
             elif col == "low_latency":
                 if cell not in ("0", "1"):
                     raise ValueError(
