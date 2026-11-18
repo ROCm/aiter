@@ -31,7 +31,9 @@ MODES = ("post", "no_post", "identity_pre", "no_post_identity")
 BACKENDS = ("hip", "flydsl", "triton")
 OUT_DTYPES = ("bf16", "mxfp8")
 # M covers decode through prefill; use --hidden to test other model widths.
-TOKEN_COUNTS = (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 4160, 8192, 16384)
+# 1152 and 1280 (72 and 80 token tiles) take the gfx1250 three-way split.
+TOKEN_COUNTS = (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1152, 1280, 2048)
+TOKEN_COUNTS += (4096, 4160, 8192, 16384)
 HIDDEN_SIZES = (5120,)
 
 
