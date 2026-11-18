@@ -878,11 +878,8 @@ __global__ void fusedQKNormIdxrQKNormKernel(
 {
     // NVFP4 is K, V and index-K pages together: never a fallback to the MXFP4 stores.
     static_assert(!kNvfp4 || (kKvFp4 && kIndexFp4), "kNvfp4 requires kKvFp4 and kIndexFp4");
-#if !defined(__gfx1250__)
-    if constexpr(kRows > 1)
-    {
-        __builtin_trap(); // the launcher takes several rows per warp on gfx1250 only
-    }
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1250__)
+    static_assert(kRows == 1, "several rows per warp are compiled for gfx1250 only");
 #endif
     constexpr int warps_per_block = kBlockSize / kNumLanes;
     const int lane_id = threadIdx.x % 32;
@@ -1389,8 +1386,14 @@ void launchFusedQKNormIdxrQKNorm(
     const int64_t total_rows = static_cast<int64_t>(num_tokens) * slots_per_token;
     // Several rows per warp on gfx1250 only. The fp4 caches, which run on gfx950 only (the
     // Python op refuses them elsewhere), have no multi-row instantiation, nor does the
-    // split-K partials load.
+    // split-K partials load. Only the host and gfx1250 passes instantiate the multi-row
+    // kernels: the other device passes skip them, so other archs do not build kernels that
+    // never run there (their host-side launch below is not taken off gfx1250).
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1250__)
+    constexpr int kMultiRowsCfg = 1;
+#else
     constexpr int kMultiRowsCfg = kKvFp4 || kIndexFp4 ? 1 : kMultiRows;
+#endif
     static const bool multi_row_arch = get_gpu_arch() == "gfx1250"; // queries the driver
     static const int64_t multi_row_min_rows = kMultiRowMinRowsPerCu * get_num_cu_func();
     const int rows_per_warp = kMultiRowsCfg > 1 && multi_row_arch && partials.num_splits == 0 &&
