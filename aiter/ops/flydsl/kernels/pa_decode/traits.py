@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -1357,6 +1358,10 @@ class Gfx1250Traits:
     # Page128 cluster CTAs take fixed runs of tiles sized by the host, with
     # partials at slot sequence * cluster_merge + part.
     cluster_runs: bool = False
+    # Emit OCP FP8 plus one FP32 descale per logical query token.
+    quant_output: bool = False
+    # With quant_output, False drops the BF16/FP16 store of the final output.
+    store_output: bool = True
     # MXFP4 without a plan: ``work`` holds context lengths, CTA s runs sequence
     # s whole and stores its final rows.
     plan_free: bool = False
@@ -1679,15 +1684,30 @@ class Gfx1250Traits:
         return self.p_offset + self.p_bytes
 
     @property
-    def total_bytes(self):
-        if self.mxfp4:
-            # Only the wave merge after the tile loop uses LDS.
-            return self.mxfp4_stats_offset + 2 * self.NWARP * self.m_tiles * 16 * 4
+    def quant_offset(self):
+        # Per-wave maxima of the FP8 output epilogue's gcd(GQA, 16)-row units.
+        # No loop stage uses them, so a wave can publish its maxima while
+        # others still read P.
         return self.stats_offset + 576
 
     @property
     def mxfp4_stats_offset(self):
         return self.NWARP * self.m_tiles * self.MXFP4_O_BYTES
+
+    @property
+    def quant_unit(self):
+        # Rows behind one per-wave LDS maximum (a token is
+        # query_group_size // quant_unit of them); sizes the maxima region
+        # at quant_offset.
+        return math.gcd(self.query_group_size, 16)
+
+    @property
+    def total_bytes(self):
+        if self.mxfp4:
+            # Only the wave merge after the tile loop uses LDS.
+            return self.mxfp4_stats_offset + 2 * self.NWARP * self.m_tiles * 16 * 4
+        units = self.m_tiles * 16 // self.quant_unit
+        return self.quant_offset + (units * self.NWARP * 4 if self.quant_output else 0)
 
     @property
     def use_tdm(self):
