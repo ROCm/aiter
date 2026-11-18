@@ -591,13 +591,18 @@ class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
             "group_m": 0,
             "use_half_tile_interleaved": False,
         }
+        hti_split_k = {**wide, "split_k": 2, "use_half_tile_interleaved": True}
         with (
             mock.patch.object(policy, "get_gfx_runtime", return_value="gfx950"),
             mock.patch.object(
                 policy.itertools,
                 "product",
                 side_effect=[
-                    [tuple(wide.values()), tuple({**wide, "block_n": 80}.values())],
+                    [
+                        tuple(wide.values()),
+                        tuple({**wide, "block_n": 80}.values()),
+                        tuple(hti_split_k.values()),
+                    ],
                     [(24, 64, 4, 2)],
                 ],
             ),
@@ -625,7 +630,7 @@ class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
             if config.get("policy") == "sk"
             or (config["block_m"], config["block_n"]) == (128, 96)
         ]
-        self.assertEqual(len(derived), 7)
+        self.assertEqual(len(derived), 8)
         copied = {
             (config["block_m"], config["block_n"])
             for config in configs
@@ -633,6 +638,22 @@ class TestGfx950FlydslMemoryCandidates(unittest.TestCase):
         }
         self.assertEqual(copied, {(128, 96)})
         self.assertIn({**wide, "block_n": 80}, configs)
+        self.assertFalse(
+            any(
+                config.get("use_half_tile_interleaved")
+                and config["split_k"] > 1
+                and not config.get("use_split_k_workspace")
+                for config in configs
+            )
+        )
+        self.assertTrue(
+            any(
+                config.get("use_half_tile_interleaved")
+                and config["split_k"] > 1
+                and config.get("use_split_k_workspace")
+                for config in configs
+            )
+        )
         self.assertEqual(configs[-1]["policy"], "sk")
         self.assertNotIn("k_stagger", configs[-1])
         self.assertNotIn("b_non_temporal", configs[-1])
@@ -828,9 +849,26 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             without_workspace(config)
             for config in raw_configs
             if config.get("use_split_k_workspace")
+            and not config["use_half_tile_interleaved"]
         }
         self.assertTrue(atomic)
         self.assertEqual(atomic, workspace)
+        self.assertFalse(
+            any(
+                config["use_half_tile_interleaved"]
+                and config["split_k"] > 1
+                and not config.get("use_split_k_workspace")
+                for config in raw_configs
+            )
+        )
+        self.assertTrue(
+            any(
+                config["use_half_tile_interleaved"]
+                and config["split_k"] > 1
+                and config.get("use_split_k_workspace")
+                for config in raw_configs
+            )
+        )
         self.assertFalse(
             any(
                 config.get("use_split_k_workspace") and config["split_k"] == 1

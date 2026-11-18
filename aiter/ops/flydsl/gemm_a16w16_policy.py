@@ -732,7 +732,12 @@ def get_flydsl_a16w16_configs(
         }
         param = make_gemm_a16w16_param_and_validate(m, n, k, validation_config)
         if param is not None:
-            valid_configs.append(config)
+            hti_atomic_split_k = (
+                config["use_half_tile_interleaved"] and config["split_k"] > 1
+            )
+            # HTI atomic split-K loses partial updates on large-M grids.
+            if not hti_atomic_split_k:
+                valid_configs.append(config)
             # Atomic and workspace reductions trade launch count for traffic;
             # keep both so tuning picks the faster one per shape.
             if split_k_workspace_supported(
@@ -748,7 +753,8 @@ def get_flydsl_a16w16_configs(
             # M, a single row tile streams B; preserve the original catalog
             # and let tuning race stagger and B cache policy against the original.
             if (
-                m <= 128
+                not hti_atomic_split_k
+                and m <= 128
                 and m <= config["block_m"]
                 and _config_key(config) in memory_bases
                 and _uniform_async_loads(param)
