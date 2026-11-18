@@ -281,6 +281,7 @@ def _packed_qk_width(q_format: AttentionFormat, head_dim: int) -> int:
 # under E8M0 block scales (MXFP8): there is no per-tensor FP8 hd256 row.
 _HD256_QV = frozenset(
     {
+        (AttentionFormat.BF16, AttentionFormat.BF16),
         (AttentionFormat.MXFP4, AttentionFormat.MXFP4),
         (AttentionFormat.MXFP6, AttentionFormat.MXFP6),
         (AttentionFormat.FP8_E4M3, AttentionFormat.FP8_E4M3),
@@ -306,7 +307,7 @@ def _check_head_dim(
         _is_fp8_format(q_format) and not mx_qk_scales
     ):
         raise ValueError(
-            f"{operation} head dimension 256 is all-MXFP4, all-MXFP6 or MXFP8 only, got "
+            f"{operation} head dimension 256 is all-BF16, all-MXFP4, all-MXFP6 or MXFP8 only, got "
             f"{q_format.name} Q/K with {v_format.name} V"
             + (" under per-tensor scales" if _is_fp8_format(q_format) else "")
         )
