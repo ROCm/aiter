@@ -620,7 +620,7 @@ def test_global_a16_stale_opus_row_keeps_framework_fallback(monkeypatch):
     )
     row = {"libtype": "opus", "solidx": 999999, "splitK": 2, "kernelName": ""}
     monkeypatch.setattr(tuned, "get_GEMM_A16W16_config_", lambda: {key: row})
-    monkeypatch.setattr(tuned, "get_gfx", lambda: "gfx942")
+    monkeypatch.setattr(tuned, "get_gfx_runtime", lambda: "gfx942")
     monkeypatch.setattr(tuned, "get_cu_num", lambda: 304)
     # Revisit the stale key in both padded lookups without the native helper.
     monkeypatch.setattr(tuned, "get_padded_m", lambda M, _N, _K, _gl: M)
