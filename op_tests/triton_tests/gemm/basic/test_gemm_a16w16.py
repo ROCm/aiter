@@ -7,6 +7,8 @@ import torch.nn.functional as F
 
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available, gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
+from aiter.ops.triton.utils import gemm_config_utils
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 
@@ -97,9 +99,10 @@ def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
 
 
-# A caller-supplied config never went through the config file, so it has no
-# SPLITK_BLOCK_SIZE and no BLOCK_SIZE_K / NUM_KSPLIT clamp. The wrapper derives
-# both, so an explicit config works like the config-file path.
+# A caller's own config has no SPLITK_BLOCK_SIZE and no BLOCK_SIZE_K / NUM_KSPLIT
+# clamp, because the loader adds those on the way out. The wrapper derives them
+# too, so a hand-written config runs like a loaded one -- and it derives on a
+# copy, so the caller's dict still holds a config that never split K.
 @pytest.mark.parametrize("M, N, K", [(1024, 1024, 1024), (2048, 5120, 2880)])
 @pytest.mark.parametrize("num_ksplit", [1, 4])
 def test_gemm_a16_w16_explicit_config(M: int, N: int, K: int, num_ksplit):
@@ -112,23 +115,55 @@ def test_gemm_a16_w16_explicit_config(M: int, N: int, K: int, num_ksplit):
         dtype=torch.bfloat16,
         output=False,
     )
-    config = {
-        "BLOCK_SIZE_M": 32,
-        "BLOCK_SIZE_N": 32,
-        "BLOCK_SIZE_K": 32,
-        "GROUP_SIZE_M": 1,
-        "num_warps": 4,
-        "num_stages": 2,
-        "waves_per_eu": 1,
-        "matrix_instr_nonkdim": 16,
-        "cache_modifier": None,
-        "NUM_KSPLIT": num_ksplit,
-    }
+    config, _ = gemm_config_utils.get_gemm_config(
+        "GEMM-A16W16", M, N, K, backend="triton"
+    )
+    config = dict(config)
+    config.pop("SPLITK_BLOCK_SIZE", None)
+    config["NUM_KSPLIT"] = num_ksplit
 
-    out = gemm_a16w16(x, w, dtype=torch.bfloat16, config=dict(config), backend="triton")
+    out = gemm_a16w16(x, w, dtype=torch.bfloat16, config=config, backend="triton")
 
     torch.testing.assert_close(out, F.linear(x, w), atol=1e-1, rtol=1e-2)
     assert "SPLITK_BLOCK_SIZE" not in config, "the caller's config must not be mutated"
+
+
+# A config that already carries SPLITK_BLOCK_SIZE came from the loader, and the
+# caller who passes it back with skip_reduce asked for the partials that config
+# describes. Re-deriving the split would move NUM_KSPLIT and hand back a single
+# reduced matrix instead.
+@pytest.mark.parametrize("M, N, K", [(2048, 5120, 2880)])
+def test_gemm_a16_w16_loaded_config_keeps_partials(M: int, N: int, K: int):
+    _skip_if_triton_on_gfx1250("triton")
+
+    x, w, _, _out_dtype, _y = generate_gemm_a16w16_inputs(
+        M,
+        N,
+        K,
+        dtype=torch.bfloat16,
+        output=False,
+    )
+    config, _ = gemm_config_utils.get_gemm_config(
+        "GEMM-A16W16", M, N, K, backend="triton"
+    )
+    config = dict(config)
+    if config.get("NUM_KSPLIT", 1) <= 1:
+        pytest.skip(
+            f"the {get_arch()} gemm_a16w16 config for "
+            f"M={M} N={N} K={K} does not split K"
+        )
+
+    out = gemm_a16w16(
+        x,
+        w,
+        dtype=torch.bfloat16,
+        config=config,
+        skip_reduce=True,
+        backend="triton",
+    )
+
+    assert out.shape == (config["NUM_KSPLIT"], M, N)
+    assert out.dtype == torch.float32
 
 
 # Output larger than 2**31 bytes (Wan2.2 FFN up-projection at 720p x 193 frames).
