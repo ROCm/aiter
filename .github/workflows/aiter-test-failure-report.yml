@@ -32,7 +32,7 @@ jobs:
     env:
       AITER_TEST_FAILURE_RUN_ID: ${{ github.event.inputs.run_id || '' }}
       AITER_TEST_FAILURE_LOOKBACK: ${{ github.event.inputs.lookback || '120' }}
-      AITER_TEST_FAILURE_AGENT: ${{ vars.AITER_TEST_FAILURE_AGENT || 'claude-glm' }}
+      AITER_TEST_FAILURE_AGENT: ${{ vars.AITER_TEST_FAILURE_AGENT }}
       AITER_TEST_FAILURE_AGENT_TIMEOUT: ${{ vars.AITER_TEST_FAILURE_AGENT_TIMEOUT || '1800' }}
       GH_TOKEN: ${{ github.token }}
     steps:
