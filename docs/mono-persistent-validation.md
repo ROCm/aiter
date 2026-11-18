@@ -39,6 +39,12 @@ Each TG has four wave32 waves. A09 also has a nonpersistent port for comparison.
 A03 and A09 use different native scale recipes. Do not replace either recipe
 with the other or loosen byte equality to make a mismatch pass.
 
+The grid above describes the pinned implementation. The P256 contract requires
+256 TGs and worker IDs 0 to 255. It does not require a two-dimensional grid.
+For the next A03 run, the follow-up TODO uses the original native kernel with
+grid `(256,)` and `NUM_PRGMS=256` as a control. A one-dimensional grid is valid
+for a P256 fix. Keep 128 threads per TG and record the actual launch shape.
+
 ## Prepare the machine
 
 Use a working gfx1250 ROCm image with its matched PyTorch and Triton versions.
@@ -145,9 +151,11 @@ rocprofv3 --kernel-trace --output-format csv \
   python -m pytest op_tests/triton_tests/quant/test_mono_persistent.py -q
 ```
 
-Check that each nonempty PS launch is 16x16 TGs with 128 threads per TG.
-A work-item grid is `(2048,16,1)` with workgroup `(128,1,1)`; divide grid by
-workgroup to get TG grid `(16,16,1)`. Keep
+Check that each nonempty PS launch has 256 TGs with 128 threads per TG.
+The pinned implementation has work-item grid `(2048,16,1)` and workgroup
+`(128,1,1)`, which gives TG grid `(16,16,1)`. A one-dimensional P256 variant
+has work-item grid `(32768,1,1)` and the same workgroup, which gives TG grid
+`(256,1,1)`. Keep
 the raw CSV and actual JIT metadata. If the profiler is absent, record that the
 runtime launch trace is pending; the wrapper code alone is not a measured trace.
 

@@ -4,6 +4,8 @@
 
 **当前优先只排查 A03 的改造是否引入回退：先执行§2.3.1的原 native 源码 P256 对照。A03 的 C1／C2、跨迭代预取和其他 P 扫描暂不先行实施；取得该对照后再决定。** 原 native 每 TG 只做一行，没有下一迭代需要预取，不能把缺少跨迭代预取直接定为回退原因。A09清单保留，当前先处理A03。
 
+**调度标准只要求256 TG和线性worker ID 0～255，不要求16×16 grid。** 默认采用一维`(256,)`，每TG仍为128 threads。上轮16×16仅是已测实现的配置；它与cluster几何、每TG线程数是不同参数，不再作为正式修复的强制条件。
+
 ## 0. 版本、范围与启动
 
 | 项目 | 固定值 |
@@ -40,7 +42,7 @@ Python 使用机器上匹配 ROCm 的既有环境；如需隔离，按原指南�
 
 若本 TODO 尚未进入上游，先将收到的 MD 保存到 checkout 外，再按正文执行；收到的文档补丁可在发布分支用 `git am <补丁路径>` 应用。基线测试仍固定上述代码，不依赖文档提交是否已合入。
 
-范围固定为 standalone P256，正式 PS 仍为 16×16 TG、每 TG 128 threads。冻结 native、两种 scale 公式、零容差及原测试均保留。完整 mono 的 DEV／HT、s104/s105、跨算子 join、设备函数 ABI 和模型接入不在本轮实施。
+范围固定为 standalone P256，正式 PS 为256 TG、每 TG 128 threads，允许一维`(256,)`。冻结 native、两种 scale 公式、零容差及原测试均保留。完整 mono 的 DEV／HT、s104/s105、跨算子 join、设备函数 ABI 和模型接入不在本轮实施。
 
 ## 1. 正确性／功能是否都 OK：已有结论与补测
 
@@ -111,7 +113,7 @@ Python 使用机器上匹配 ROCm 的既有环境；如需隔离，按原指南�
 - [ ] 输出 native／PS 的带行号 ISA 对照：入口检查、当前／下一 task 的 load、首次依赖 wait、reduce／量化、store、循环回边。说明每次循环实际执行的指令；静态分支条数不等于动态执行次数。
 - [ ] A03：确认已有 `tl.range(..., num_stages=2)` 是否实际形成跨行预取；检查 Q／KV activation 与 weight load 位于循环内外、等待位置和 live range。没有重叠时说明是何种依赖／编译结果，不能只建议再加 `num_stages=2`。
 - [ ] A09：核对 native、`persistent=False` port、PS 的实际 body、指针更新、bounds check 和循环；将数值 body 差异与循环适配差异分开。记录 code-object VGPR／SGPR／scratch／LDS，不直接混用 profiler 的 `VGPR_Count` 数字；如解释差异，给工具字段单位依据。
-- [ ] Profiler 检查正式 PS 实际 16×16 TG、128 threads/TG。grid 正确不能证明全部 256 TG 同时驻留；有可用 occupancy／wave／memory stall counters 时单独采样，写清计数器含义和窗口。不支持则保留未验证状态，不伪造周期归因。
+- [ ] Profiler 检查正式 PS 实际共256 TG、128 threads/TG，记录完整grid形状和线性ID映射。一维TG grid `(256,1,1)`对应work-item grid `(32768,1,1)`；上轮二维TG grid `(16,16,1)`对应`(2048,16,1)`，两者workgroup均为`(128,1,1)`。不能将合法的一维P256判为失败。grid正确不能证明全部256 TG同时驻留；有可用occupancy／wave／memory stall counters时单独采样，写清计数器含义和窗口。不支持则保留未验证状态，不伪造周期归因。
 
 ### 2.3 边界矩阵和单变量对照
 
@@ -155,7 +157,7 @@ python -m op_tests.op_benchmarks.triton.bench_mono_persistent \
 
 | 候选 | 具体修改对象与方法 | 作用与代价 | 验收 |
 | --- | --- | --- | --- |
-| C1：单 task 路径 | A09 `aiter/ops/triton/quant/fp8_group32.py` wrapper 将 `N<=256` 作为 constexpr 传入 `_triton_kernels/quant/fp8_group32.py`；该 specialization 用 uniform `task<N` guard 后执行一次原 body，不进入 task loop。A03 在对应 wrapper／kernel 对 M<=256 做同类 specialization，保留原 Q／KV 数学顺序。仅在 ISA 仍有可去掉的循环成本时保留修改 | 针对 rows=96 的循环状态与回边；仍发 256 TG，无效 worker 不 load/store。不解决 N>256 的多轮链；多一个 JIT specialization | rows=96 与边界测试、零尺寸／尾 task、Graph；核对实际分支与资源是否减少，并以 standalone 时间决定是否保留 |
+| C1：单 task 路径 | A09 `aiter/ops/triton/quant/fp8_group32.py` wrapper 将 `N<=256` 作为 constexpr 传入 `_triton_kernels/quant/fp8_group32.py`；该 specialization 用 uniform `task<N` guard 后执行一次原 body，不进入 task loop。A03 在对应 wrapper／kernel 对 M<=256 做同类 specialization，保留原 Q／KV 数学顺序。仅在原native-P256对照完成且ISA仍有可去掉的循环成本时保留修改 | 针对 rows=96 的循环状态与回边；仍发 256 TG，无效 worker 不 load/store。不解决 N>256 的多轮链；多一个 JIT specialization | rows=96 与边界测试、零尺寸／尾 task、Graph；核对实际分支与资源是否减少，并以 standalone 时间决定是否保留 |
 | C2：重叠相邻迭代的 activation load | 在两个 `_triton_kernels/quant/` 文件中保留每 task 的计算／存储 body：prologue load task t；循环中先对 t+256 发 masked load，再计算／存储 t，然后轮换两个寄存器 buffer；epilogue 消费最后一个有效 task。A03 权重仅在 ISA 证实循环内重复 load 时另作独立 hoist 对照，不与预取混成一个变量 | 增加同 worker 可同时在途的请求，尝试隐藏多轮 load 等待；增加寄存器 live range，可能适得其反。既有 `num_stages=2` 不代表已达到该效果 | 下一 task 越界时不得访问／写出；RMS reduction、scale、舍入顺序不变。真实 ISA 必须看到预期 load 前移；scratch 保持 0，资源增加须报告；全部正确性及大 shape 时间通过 |
 
 C2 可以先在 A09 验证，因其每个 group32 独立且现有回退最大；A03 按实际 ISA 决定是否适用。若无法保持原 task body 的数学与布局，则不将它混入最小修复，写清编译限制和所需 body 变更。
