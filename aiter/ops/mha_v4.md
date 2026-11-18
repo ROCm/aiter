@@ -151,7 +151,9 @@ output, lse = mha_v4(
 
 The manifest's `mode` 3 rows serve it, one per `mask`. `kv_splits` slices each work-group's key
 walk inside the one launch on rows declaring `kv_range`, and the slices are merged by their LSE
-like the dense key ranges; a slice keeps at least 256 keys of the longest document's walk.
+like the dense key ranges; a slice keeps at least 256 keys of the longest document's walk. The
+partials are FP32. On a row declaring `pair_split`, a causal pair's 2-5 slices run on one more
+work-group than slices when that fits the device's CUs, which the launcher passes in.
 
 ## Packed Layouts
 

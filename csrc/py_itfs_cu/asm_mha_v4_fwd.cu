@@ -96,12 +96,14 @@ struct ScalarSlot
 // How a THD row that declares kv_range slices each work-group's key walk: slice i writes its
 // normalized O at ptr_o + i * o_stride and its LSE at ptr_lse + i * lse_stride, both in bytes, for
 // the caller to merge by LSE. Left zero, the row walks its keys once and writes in place.
+// cu_budget is read only by a row that declares pair_split: the CUs a causal pair's kv_splits + 1
+// work-groups must fit; left zero, such a row runs every pair on kv_splits work-groups.
 struct KvSplitSlot
 {
     uint32_t count;
     uint32_t o_stride;
     uint32_t lse_stride;
-    uint32_t padding;
+    uint32_t cu_budget;
 };
 
 // Fixed-width slots reproduce the 656-byte kernarg layout embedded in MHA v4 code objects.
@@ -162,6 +164,7 @@ static_assert(offsetof(FmhaV4Kernarg, ptr_v) == 0x030);
 static_assert(offsetof(FmhaV4Kernarg, scalar) == 0x050);
 static_assert(offsetof(FmhaV4Kernarg, kv_split) == 0x1E0);
 static_assert(offsetof(KvSplitSlot, o_stride) == 0x4 && offsetof(KvSplitSlot, lse_stride) == 0x8);
+static_assert(offsetof(KvSplitSlot, cu_budget) == 0xC);
 static_assert(sizeof(KvSplitSlot) == sizeof(ConstPointerSlot));
 static_assert(offsetof(FmhaV4Kernarg, ptr_q_descale) == 0x200);
 static_assert(offsetof(FmhaV4Kernarg, ptr_k_descale) == 0x210);
@@ -1616,18 +1619,20 @@ void fmha_v4_fwd_thd(const at::Tensor& q,
         args.kv_split.count      = fit_u32(kv_splits, "kv_splits");
         args.kv_split.o_stride   = byte_stride(out, 0, "per-slice output stride");
         args.kv_split.lse_stride = byte_stride(lse.value(), 0, "per-slice LSE stride");
+        if(cfg.pair_split != 0)
+            args.kv_split.cu_budget = get_num_cu_func();
     }
 
     // A causal work-group owns Q tile i and its mirror n - 1 - i, so x covers half the tiles.
-    // With 2-5 slices a causal pair runs on kv_splits + 1 work-groups when its document has 4+
-    // Q tiles and nhead_q * pairs * (kv_splits + 1) <= 256 (the kernel decides this per document
-    // against 256 CUs). Work-groups past a document's need exit at once, so a pack sizes x by its
-    // longest document whenever its smallest such pair count, 2, could qualify.
-    const int64_t q_tiles    = (max_seqlen + cfg.ts_qo - 1) / cfg.ts_qo;
-    const int64_t q_groups   = causal ? (q_tiles + 1) / 2 : q_tiles;
-    const int64_t fit_groups = batch == 1 ? q_groups : 2;
-    const bool pair_extra    = causal && kv_splits >= 2 && kv_splits <= 5 && q_tiles >= 4 &&
-                            nhead_q * fit_groups * (kv_splits + 1) <= 256;
+    // On a pair_split row, 2-5 slices run a pair on kv_splits + 1 work-groups when its document
+    // has 4+ Q tiles and nhead_q * pairs * (kv_splits + 1) <= cu_budget; the kernel decides this
+    // per document. Work-groups past a document's need exit at once, so x is sized by max_seqlen
+    // whenever any document, down to the smallest such pair count, 2, could qualify: max_seqlen
+    // may overstate the longest document.
+    const int64_t q_tiles  = (max_seqlen + cfg.ts_qo - 1) / cfg.ts_qo;
+    const int64_t q_groups = causal ? (q_tiles + 1) / 2 : q_tiles;
+    const bool pair_extra  = causal && args.kv_split.cu_budget != 0 && kv_splits <= 5 &&
+                            q_tiles >= 4 && nhead_q * 2 * (kv_splits + 1) <= args.kv_split.cu_budget;
     launch_row(arch,
                cfg,
                &args,

@@ -2460,9 +2460,12 @@ def _thd_pack(seqlens, heads_q, heads_kv, seed):
     return q, k, torch.randn_like(k)
 
 
-def _bf16_hd256_thd_check(q, k, v, seqlens, causal, documents=None, **kwargs):
+def _bf16_hd256_thd_check(
+    q, k, v, seqlens, causal, documents=None, max_seqlen=None, **kwargs
+):
     """_bf16_hd256_check for THD operands, asserting its tolerance: each of `documents` (default
-    all) against float32 attention over its own keys.
+    all) against float32 attention over its own keys. `max_seqlen` defaults to the longest
+    document.
 
     O is judged on its worst row rather than the pack's norm, which one wrong row of a long
     document would vanish in; a row measures 0.003. The LSE measures 2e-6, so its bound is the
@@ -2477,7 +2480,7 @@ def _bf16_hd256_thd_check(q, k, v, seqlens, causal, documents=None, **kwargs):
         softmax_scale=softmax_scale,
         return_lse=True,
         cu_seqlens=_cu_seqlens(seqlens),
-        max_seqlen=max(seqlens),
+        max_seqlen=max(seqlens) if max_seqlen is None else max_seqlen,
         causal=causal,
         **kwargs,
     )
@@ -2538,6 +2541,42 @@ def test_mha_v4_bf16_hd256_thd_kv_splits_match_attention(causal, splits):
         splits = 2048 // 256 + causal
 
     _bf16_hd256_thd_check(q, k, v, seqlens, causal, kv_splits=splits)
+
+
+# A causal pair runs on kv_splits + 1 work-groups when that fits the CUs, else on kv_splits
+# cutting both tiles along one line (at most 3 slices), else unpaired slices. A grid sized by
+# max_seqlen also reaches work-groups a shorter document does not own, which must exit.
+_THD_CAUSAL_SLICE_LAYOUTS = [
+    param(12, 2, [1536], 5, 0, id="s_plus_1_last_chunk_past_the_line"),
+    param(6, 1, [1536], 5, 0, id="s_plus_1_last_chunk_past_the_line_6_1"),
+    param(6, 1, [1536, 512], 5, 0, id="s_plus_1_last_chunk_in_a_pack"),
+    param(24, 4, [1536], 2, 512, id="s_plus_1_under_overstated_max_seqlen"),
+    param(12, 2, [2304], 3, 512, id="s_plus_1_under_overstated_max_seqlen_s3"),
+    param(24, 4, [3072], 2, 512, id="one_line_under_overstated_max_seqlen"),
+    param(24, 4, [1536], 3, 512, id="one_line_under_overstated_max_seqlen_s3"),
+    param(24, 4, [2560, 2048, 1792], 3, 0, id="one_line_in_a_pack"),
+]
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 BF16 THD key slices")
+@parametrize(
+    ("heads_q", "heads_kv", "seqlens", "splits", "overstated"),
+    _THD_CAUSAL_SLICE_LAYOUTS,
+)
+def test_mha_v4_bf16_hd256_thd_causal_slice_layouts(
+    heads_q, heads_kv, seqlens, splits, overstated
+):
+    q, k, v = _thd_pack(seqlens, heads_q, heads_kv, seed=55)
+
+    _bf16_hd256_thd_check(
+        q,
+        k,
+        v,
+        seqlens,
+        True,
+        max_seqlen=max(seqlens) + overstated,
+        kv_splits=splits,
+    )
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 hd256 BF16 THD key slices")
@@ -2692,7 +2731,8 @@ def test_mha_v4_thd_rejects_what_it_cannot_run(kwargs, error, match):
 @skipif(get_gfx() != "gfx950", reason="gfx950 hd256 BF16 THD validation")
 def test_mha_v4_thd_launcher_refuses_slices_it_cannot_merge():
     """The slice count is the launcher's argument, not read off a tensor rank: it has to match
-    `out`, more than one slice writes FP32 partials, and they need the LSE they are merged by."""
+    `out`, slices write FP32 partials, and more than one needs the LSE they are merged by.
+    """
     q, k, v = _thd_pack([512], 2, 2, seed=54)
     cu_seqlens = _cu_seqlens([512])
     launch = mha_v4_module._fmha_v4_fwd_thd
@@ -3678,6 +3718,45 @@ def check_lse_capable_objects(arch="gfx950"):
 @parametrize("arch", ["gfx950"])
 def test_mha_v4_lse_capable_rows_load_the_lse_kernarg(arch):
     check_lse_capable_objects(arch)
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
+@parametrize("arch", ["gfx950"])
+def test_mha_v4_pair_split_rows_load_the_cu_budget_kernarg(arch):
+    """A row declaring pair_split gets a grid of kv_splits + 1 work-groups per causal pair, and
+    the kernel picks that layout against cu_budget (0x1EC). An object that hard-codes its CU
+    count instead would disagree with the grid on any other count."""
+    asm_dir = os.environ.get(
+        "AITER_ASM_DIR", os.path.join(mha_v4_module.AITER_ROOT_DIR, "hsa")
+    )
+    root = os.path.join(asm_dir, arch, "fmha_v4_fwd")
+    with open(os.path.join(root, "fmha_v4_fwd.csv"), encoding="utf-8") as manifest:
+        rows = [
+            line.strip().split(",")
+            for line in manifest
+            if line.strip() and not line.startswith("#")
+        ]
+    header, rows = rows[0], rows[1:]
+    pair_at, co_at = header.index("pair_split"), header.index("co_name")
+
+    claimed = sorted({row[co_at] for row in rows if row[pair_at] == "1"})
+    assert claimed, f"no {arch} rows declare pair_split"
+
+    silent = []
+    for name in claimed:
+        listing = subprocess.run(
+            [_llvm_objdump(), "-d", f"--mcpu={arch}", os.path.join(root, name)],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        if not re.search(
+            r"s_load_dword\s+s\d+, s\[0:1\], 0x1ec\b", re.sub(r"//.*", "", listing)
+        ):
+            silent.append(name)
+    assert (
+        not silent
+    ), f"{arch} rows declaring pair_split never load cu_budget: {silent}"
 
 
 if __name__ == "__main__":
