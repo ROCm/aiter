@@ -428,7 +428,8 @@ def flydsl_qsa_sparse_prefill(
     ([N,HK], with kv_slots [P,HK]) or both per tensor ([1]); K/V values are K8 * k_scale
     and V8 * v_scale. compute="fp8" (default) runs FP8 MFMA kernels: Q is quantized per
     (query, head) row with scale amax / 240 and the probabilities in FP8 (relative output
-    error of a few percent on random data); as for BF16 K/V, direct rows read the
+    error of a few percent on random data), and per-token V scales are clamped to
+    [2**-60, 2**60] (they join the probabilities); as for BF16 K/V, direct rows read the
     context repacked per call while it fits a budget, else the raw K/V. Its union
     plans may split a short prefill's longest tasks into two key ranges merged at the
     end, and keep only a core of an H12/H6 union tile, the rows' other blocks running

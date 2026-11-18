@@ -884,7 +884,8 @@ FP8_MAX = 240.0  # largest finite E4M3FNUZ
 # a quarter of the output).
 LAZY = 7.5
 P_BIAS = 4.0
-# A V scale enters as log2 and reciprocal; the clamp keeps both finite (NaN maps to the floor).
+# A V scale enters as log2 and reciprocal; the clamp keeps both finite (NaN maps to the floor),
+# and its 2**120 spread keeps a row's P' / v_scale, its row sum terms, within FP32's range.
 SCALE_MIN, SCALE_MAX = 2.0**-60, 2.0**60
 # Q rows of amax below Q_MIN quantize to 0 like zero rows: 240 / amax overflows FP32 below
 # about 2**-120, and their scores are 0 to FP32 precision anyway.

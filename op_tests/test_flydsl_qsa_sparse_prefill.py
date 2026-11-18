@@ -2025,9 +2025,11 @@ def test_qsa_fp8_sink(case, heads):
 def test_qsa_fp8_uniform(case, heads):
     """K = 0 weighs every selected token the same, and power-of-two V scales per token
     keep the scaled probabilities exact: the output is the selected tokens' mean V up to
-    rounding (rtol 0.01 and atol 2e-3, on 96 sample rows). An eighth of
-    the (row, head) Q vectors are zero, whose FP8 scale is 0, and an eighth tiny (amax about
-    2**-121, where 240 / amax overflows FP32), which quantize to 0 too."""
+    rounding (rtol 0.01 and atol 2e-3, on 96 sample rows). The V scales of the first and
+    second requests reach the bounds of compute="fp8"'s per-token V scale clamp (2**56 to
+    2**60, 2**-60 to 2**-56). An eighth of the (row, head) Q vectors are zero, whose FP8
+    scale is 0, and an eighth tiny (amax about 2**-121, where 240 / amax overflows FP32),
+    which quantize to 0 too."""
     layout, _ = FP8_UNIFORM_CASES[case]
     query_lens, prefix_lens, kv_heads, selection, topk = CASES[layout]
     rows, tokens = sum(query_lens), sum(query_lens) + sum(prefix_lens)
@@ -2041,6 +2043,9 @@ def test_qsa_fp8_uniform(case, heads):
     v = torch.randn(tokens, kv_heads, HEAD_DIM, generator=generator) * 60
     v8 = v.clamp(-FP8_MAX, FP8_MAX).to(FP8)
     exponent = torch.randint(-3, 2, (tokens, kv_heads), generator=generator)
+    lengths = [n + p for n, p in zip(query_lens, prefix_lens)]
+    shifts = torch.tensor((59, -57, 0) * len(lengths))[: len(lengths)]
+    exponent += shifts.repeat_interleave(torch.tensor(lengths))[:, None]
     vs = torch.exp2(exponent.float())
     indices = make_indices(query_lens, prefix_lens, selection, generator, topk)
     out = qsa_sparse_prefill(

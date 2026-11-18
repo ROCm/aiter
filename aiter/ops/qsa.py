@@ -254,8 +254,8 @@ def qsa_sparse_prefill(
     kv_slots; FlyDSL on gfx942 only. batch_invariant=True makes each request's result
     independent of the other requests in the call. K/V may be FP8 (dtypes.fp8) with FP32
     k_scale / v_scale per tensor ([1]) or per token and KV head ([N, HK]; [P, HK] with
-    kv_slots), computed with FP8 MFMAs (compute="fp8") or dequantized to BF16
-    (compute="bf16").
+    kv_slots), computed with FP8 MFMAs (compute="fp8"; per-token V scales clamped to
+    [2**-60, 2**60]) or dequantized to BF16 (compute="bf16").
 
     See ``aiter.ops.flydsl.qsa_sparse_prefill.flydsl_qsa_sparse_prefill``.
     """
