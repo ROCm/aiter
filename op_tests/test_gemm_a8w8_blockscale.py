@@ -20,6 +20,7 @@ from aiter import dtypes
 from aiter.benchmark_reporting import print_json_table
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a8w8 import (
+    gemm_a8w8_blockscale_bpreshuffle_prefers_row_major_x_scale,
     gemm_a8w8_blockscale_ck,
     gemm_a8w8_blockscale_cktile,
     gemm_a8w8_blockscale_flydsl,
@@ -67,9 +68,11 @@ def run_gemm(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
-def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
+def run_gemm_bpreshuffle(
+    x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, x_scale_transposed=True
+):
     return aiter.gemm_a8w8_blockscale_bpreshuffle(
-        x, weightshuffle, x_scale, w_scale, dtype
+        x, weightshuffle, x_scale, w_scale, dtype, x_scale_transposed=x_scale_transposed
     )
 
 
@@ -348,6 +351,84 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
     )
 
 
+# Kimi-K3 TP8 projections, which take a fused norm's row-major E8M0 x_scale.
+ROW_MAJOR_X_SCALE_MNK = [
+    (m, n, 7168) for n in (2176, 1536, 6400, 8448) for m in (1, 58, 256, 545, 1024)
+]
+
+
+@benchmark()
+def test_row_major_x_scale(m, n, k, dtype=dtypes.bf16, seed=0):
+    """The same 1x128 E8M0 x_scale passed column-major (the default) and
+    row-major (x_scale_transposed=False): only the byte order differs, so the
+    bpreshuffle outputs must match byte for byte."""
+    generator = bench_init.make_generator(seed)
+    x = bench_init.fill_fp8((m, k), "uniform", generator, dtype=dtypes.fp8)
+    weight = bench_init.fill_fp8((n, k), "uniform", generator, dtype=dtypes.fp8)
+    x_scale_raw = bench_init.fill_scale_e8m0((m, k // 128), "auto", generator)
+    w_scale_raw = bench_init.fill_scale_e8m0((n // 128, k // 128), "auto", generator)
+    x_scale = x_scale_raw.view(dtypes.fp8_e8m0)
+    w_scale = w_scale_raw.view(dtypes.fp8_e8m0)
+    x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+    weightshuffle = shuffle_weight(weight, layout=(16, 16))
+
+    a, _ = run_torch(x, weight, x_scale, w_scale, dtype)
+    out_col, us_col = run_gemm_bpreshuffle(x, weightshuffle, x_scale_t, w_scale, dtype)
+    out_row, us_row = run_gemm_bpreshuffle(
+        x, weightshuffle, x_scale, w_scale, dtype, x_scale_transposed=False
+    )
+    bytes_equal = torch.equal(out_col.view(torch.int16), out_row.view(torch.int16))
+    err = checkAllclose(
+        a,
+        out_row,
+        msg=f"row-major x_scale m={m}, n={n}, k={k}",
+        catastrophic_check=True,
+    )
+    assert bytes_equal, (
+        f"row-major x_scale (m={m}, n={n}, k={k}) differs from the column-major "
+        "result"
+    )
+    return {
+        "prefers_row_major": gemm_a8w8_blockscale_bpreshuffle_prefers_row_major_x_scale(
+            m, n, k
+        ),
+        "us_col": us_col,
+        "us_row": us_row,
+        "bytes_equal": bytes_equal,
+        "err": err,
+    }
+
+
+def test_row_major_x_scale_rejected(m=8, n=256, k=512, dtype=dtypes.bf16):
+    """x_scale_transposed=False takes only a 1x128 E8M0 (M, K // 128) x_scale;
+    any other raises ValueError before a kernel runs."""
+    x = torch.zeros((m, k), dtype=dtypes.fp8, device="cuda")
+    weightshuffle = shuffle_weight(
+        torch.zeros((n, k), dtype=dtypes.fp8, device="cuda"), layout=(16, 16)
+    )
+    w_scale = torch.full(
+        (n // 128, k // 128), 0x7F, dtype=torch.uint8, device="cuda"
+    ).view(dtypes.fp8_e8m0)
+    x_scale_raw = torch.full((m, k // 128), 0x7F, dtype=torch.uint8, device="cuda")
+    bad_x_scales = {
+        "fp32 (M, K // 128)": fp4_utils.e8m0_to_f32(x_scale_raw),
+        "e8m0 (K // 128, M)": x_scale_raw.t().contiguous().view(dtypes.fp8_e8m0),
+        "e8m0 (M, K // 64)": torch.full(
+            (m, k // 64), 0x7F, dtype=torch.uint8, device="cuda"
+        ).view(dtypes.fp8_e8m0),
+    }
+    for name, x_scale in bad_x_scales.items():
+        try:
+            aiter.gemm_a8w8_blockscale_bpreshuffle(
+                x, weightshuffle, x_scale, w_scale, dtype, x_scale_transposed=False
+            )
+        except ValueError as e:
+            assert "x_scale_transposed=False" in str(e), e
+            print(f"test_row_major_x_scale_rejected({name}): {e}")
+        else:
+            raise AssertionError(f"x_scale_transposed=False accepted a {name} x_scale")
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -499,6 +580,16 @@ parser.add_argument(
     help="""Suffix for output CSV filename.
     e.g.: --suffix branch""",
 )
+parser.add_argument(
+    "--row-major-mnk",
+    type=dtypes.str2tuple,
+    nargs="*",
+    default=None,
+    help="""M,N,K shapes for the row-major 1x128 E8M0 x_scale check on gfx1250:
+    x_scale_transposed=False must return the column-major result byte for byte.
+    Default: the Kimi-K3 TP8 projections; no value skips the check.
+    e.g.: --row-major-mnk 545,2176,7168 1024,6400,7168""",
+)
 
 args = parser.parse_args()
 
@@ -588,6 +679,19 @@ if args.table and not df.empty:
     print("=" * 150)
     print(df.to_string(index=False))
     print("=" * 150)
+
+print("\nRunning row-major x_scale checks ...")
+test_row_major_x_scale_rejected()
+row_major_mnk = (
+    ROW_MAJOR_X_SCALE_MNK if args.row_major_mnk is None else args.row_major_mnk
+)
+if get_gfx() in ("gfx1250", "gfx1250-strict"):
+    row_major_df = pd.DataFrame([test_row_major_x_scale(*mnk) for mnk in row_major_mnk])
+    print_json_table("gemm_a8w8_blockscale_bpreshuffle row-major x_scale", row_major_df)
+elif row_major_mnk:
+    print(
+        f"skip: the row-major 1x128 E8M0 x_scale read is gfx1250-only, got {get_gfx()}"
+    )
 
 # Correctness check: verify split-K produces matching results
 print("\nRunning split-K correctness checks ...")

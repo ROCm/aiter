@@ -1828,7 +1828,8 @@ def gemm_a8w8_blockscale_bpreshuffle(
             are column-major ``(K // 128, M)`` (the default, what
             ``per_group_quant_hip(transpose_scale=True)`` emits) or a row-major
             ``(M, K // 128)`` tensor. Backends that only read column-major
-            scales get a transposed copy.
+            scales get a transposed copy. ``False`` with any other
+            ``x_scale`` raises ``ValueError``.
 
     Returns the output tensor -- ``out`` itself when one was passed.
     """
@@ -1866,6 +1867,20 @@ def gemm_a8w8_blockscale_bpreshuffle(
 
         if bmm_a8w8_mxfp8_supported(mxscale_w_scale_block(tuple(w_scale.shape), n, k)):
             return _gemm_mxscale_bpreshuffle(XQ, WQ, x_scale, w_scale, Y)
+
+    # The flag states the byte order, which shape and strides cannot show, so
+    # any other x_scale is rejected rather than read in a guessed order.
+    if not x_scale_transposed and (
+        x_scale.dtype != dtypes.fp8_e8m0
+        or k % 128 != 0
+        or tuple(x_scale.shape) != (m, k // 128)
+    ):
+        raise ValueError(
+            "gemm_a8w8_blockscale_bpreshuffle: x_scale_transposed=False needs a "
+            "row-major 1x128 e8m0 x_scale of shape (M, K // 128) = "
+            f"({m}, {k // 128}) with K % 128 == 0, got K={k}, {x_scale.dtype} "
+            f"{tuple(x_scale.shape)}"
+        )
 
     use_gfx1250_flydsl_or_triton_mxfp8_128 = (
         is_gfx1250_family(get_gfx())
@@ -1931,7 +1946,8 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 x_scale_transposed=x_scale_transposed,
             )
 
-    # Only the gfx1250 mxfp8_128 kernels above read a row-major x_scale.
+    # Only the gfx1250 mxfp8_128 kernels above read a row-major x_scale; it
+    # was checked to be a 1x128 e8m0 (M, K // 128) before them.
     if not x_scale_transposed:
         x_scale = x_scale.t().contiguous().view(x_scale.shape)
 

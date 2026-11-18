@@ -344,9 +344,21 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
         a_scale = _require_e8m0_scale(x_scale, (M, k_blocks), "x_scale")
         b_scale = _require_e8m0_scale(w_scale, (N // _BLOCK_N, k_blocks), "w_scale")
         a_scale_m_major = not x_scale_transposed
-        if a_scale_m_major and compute_bound:
-            a_scale = a_scale.t().contiguous().t()
-            a_scale_m_major = False
+        if a_scale_m_major:
+            preload_fits = _row_major_x_scale_preload(
+                compute_bound,
+                tile_m,
+                tile_n,
+                tile_k,
+                int(num_buffers),
+                split_k,
+                cluster_m,
+                cluster_n,
+                K,
+            )
+            if preload_fits is None:
+                a_scale = a_scale.t().contiguous().t()
+                a_scale_m_major = False
         if a_scale_m_major:
             if a_scale.stride(1) != 1:
                 raise RuntimeError(
@@ -355,16 +367,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
                 )
             stride_ascale_k = a_scale.stride(0)
             if a_scale_preload is None:
-                a_scale_preload = _m_major_a_scale_preload_fits(
-                    tile_m,
-                    tile_n,
-                    tile_k,
-                    int(num_buffers),
-                    split_k,
-                    cluster_m,
-                    cluster_n,
-                    K,
-                )
+                a_scale_preload = preload_fits
             preload_ks = k_blocks if a_scale_preload else 0
         else:
             stride_ascale_k = a_scale.stride(1) if a_scale.stride(0) == 1 else M
@@ -627,27 +630,51 @@ def _m_major_a_scale_preload_fits(
     )
 
 
+def _row_major_x_scale_preload(
+    compute_bound: bool,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    num_buffers: int,
+    split_k: int,
+    cluster_m: int,
+    cluster_n: int,
+    K: int,
+) -> bool | None:
+    """How an mxfp8_128 kernel reads a row-major ``(M, K//128)`` x_scale: None
+    when it takes a column-major copy instead (compute-bound kernels), else
+    whether it reads it natively with the whole-K scale panels preloaded.
+    The A layout does not enter: the A scale is indexed by row whether or not
+    A is preshuffled."""
+    if compute_bound:
+        return None
+    return _m_major_a_scale_preload_fits(
+        tile_m, tile_n, tile_k, num_buffers, split_k, cluster_m, cluster_n, K
+    )
+
+
 @functools.lru_cache(maxsize=4096)
 def mxfp8_128_reads_row_major_x_scale_fast(kernel_name: str, M: int, K: int) -> bool:
     """Whether ``kernel_name`` at (M, K) reads a row-major ``(M, K//128)``
     x_scale natively with the whole-K scale panels preloaded -- the only case
     measured not slower than the column-major default. Compute-bound kernels
     take a transposed copy, and the 2D kernels without the preload re-read the
-    56-byte scale rows per K step, so both prefer column-major."""
-    if is_compute_wmma_kernel_name(kernel_name):
-        return False
+    56-byte scale rows per K step, so both prefer column-major. Shares
+    ``_row_major_x_scale_preload`` with the runner, so the answer is the read
+    the runner does."""
     cfg = dict(_resolved_wmma_config(kernel_name, M, True, False))
-    if cfg["a_preshuffle"]:
-        return False
-    return _m_major_a_scale_preload_fits(
-        cfg["tile_m"],
-        cfg["tile_n"],
-        cfg["tile_k"],
-        int(cfg["num_buffers"]),
-        cfg["split_k"],
-        cfg["cluster_m"],
-        cfg["cluster_n"],
-        K,
+    return bool(
+        _row_major_x_scale_preload(
+            is_compute_wmma_kernel_name(kernel_name),
+            cfg["tile_m"],
+            cfg["tile_n"],
+            cfg["tile_k"],
+            int(cfg["num_buffers"]),
+            cfg["split_k"],
+            cfg["cluster_m"],
+            cfg["cluster_n"],
+            K,
+        )
     )
 
 
