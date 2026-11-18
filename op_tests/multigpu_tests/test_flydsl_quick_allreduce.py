@@ -20,6 +20,12 @@ sweep ends in a markdown table:
   ``AITER_FLY_AR_MESH_MAX_BYTES``.
 * ``test_quick_allreduce_coverage`` -- the kernels those rows ran include
   every kernel the engine's own ``cfgs_for`` says the window selects.
+* ``test_quick_allreduce_knobs`` -- where the mesh ships on the Lamport
+  handshake: every ``MeshKnobs`` value singly (``KNOB_COVERAGE``), and one
+  combination with all of them on, at super-tile 1 and 4 (``prefetch`` at 1
+  only). Each must give the default-knob build's output bit for bit, the same on
+  every rank, over back-to-back calls with fresh inputs. A cold JIT cache takes
+  minutes; raise ``FLYDSL_QR_TIMEOUT`` if a spawn times out compiling.
 * ``test_quick_allreduce_edge_inputs`` -- payloads that land on the group
   scale's edge cases, sums above E4M3's old ceiling of 480 on every rank, and
   degenerate groups that must stay finite.
@@ -175,6 +181,7 @@ from aiter.ops.flydsl.allreduce_policy import (
     SUPPORTED_ARCHS,
     SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
+    MeshKnobs,
     TwoShotRung,
     mesh_st_ladder,
     ring_st_ladder,
@@ -382,6 +389,37 @@ KNOB_CASES = (
     (2, "ring", 9216, 4096, 128),
 )
 
+# Lamport mesh tuning knobs (``MeshKnobs``), each non-default value singly and
+# one combination with everything on. ``test_quick_allreduce_knobs`` holds each
+# to the default-knob build bit for bit.
+KNOB_COVERAGE = (
+    "stripe=full",
+    "fanout=sector",
+    "fanout=peer",
+    "poll_sleep=1",
+    "poll_sleep=2",
+    "recv_order=per_source",
+    "prefetch=1",
+    "lds_bufs=2",
+    "prio=1",
+    "prio=2",
+    (
+        "stripe=full;fanout=peer;poll_sleep=1;recv_order=per_source;prefetch=1;"
+        "lds_bufs=2;prio=1"
+    ),
+)
+# The knob cases' geometry: a block that gives ``stripe=full`` a wider stripe at
+# every world size, and a small grid so one block owns several tiles (the
+# prefetch carry, the super-tile groups). The payloads are in tokens of
+# HIDDEN: 300 is ~75 tiles over 8 blocks, so groups of 4 end on 2 or 1 tiles,
+# odd and even; 77 has a partial last tile; 1 is below the grid, so a
+# super-tile engine falls back to its ST=1 build with the same knobs.
+KNOB_BLOCK = 256
+KNOB_GRID_CAP = 8
+KNOB_SUPER_TILE = 4
+KNOB_SHAPES = ((300, HIDDEN), (77, HIDDEN), (1, HIDDEN))
+KNOB_ITERS = 6
+
 # Seconds to wait for each rank of a spawn. The kernels spin on flags written
 # by peers, so a protocol bug or a dead rank hangs the rest.
 SPAWN_TIMEOUT_S = 600
@@ -554,6 +592,7 @@ def _rung_grids(world_size: int, ladder: tuple) -> dict[tuple, int]:
                 cu_count=cu_count,
                 block=rung.block,
                 handshake=rung.handshake,
+                knobs=rung.knobs,
             ),
         )
     return grids
@@ -780,10 +819,13 @@ def _test_ladder(
     super_tile: int | None = None,
     grid_cap: int | None = None,
     block: int | None = None,
+    handshake: str | None = None,
+    tuning=None,
 ) -> tuple:
     """The ladder of a test engine, from the knobs this test pins: the
     production ladder, with *super_tile* and *block* overriding and *grid_cap*
-    bounding every rung. A schedule with no production ladder on this host
+    bounding every rung. *handshake* and *tuning* (``MeshKnobs``, or its
+    string form) override every rung, as the engine's own ``handshake`` does. A schedule with no production ladder on this host
     (the ring on xGMI) gets one rung, if every knob is pinned.
     """
     link = fly_policy.detect_link()
@@ -805,6 +847,8 @@ def _test_ladder(
             super_tile=r.super_tile if super_tile is None else int(super_tile),
             grid_cap=r.grid_cap if grid_cap is None else min(r.grid_cap, grid_cap),
             block=r.block if block is None else int(block),
+            handshake=r.handshake if handshake is None else handshake,
+            knobs=r.knobs if tuning is None else MeshKnobs.parse(tuning),
         )
         for r in ladder
     )
@@ -821,11 +865,13 @@ def _engine(rank: int, tp: int, gloo, device, engine_kw: dict):
     engine_kw = dict(engine_kw)
     knobs = {
         k: engine_kw.pop(k)
-        for k in ("super_tile", "grid_cap", "block")
+        for k in ("super_tile", "grid_cap", "block", "tuning")
         if k in engine_kw
     }
     if knobs:
-        engine_kw["ladder"] = _test_ladder(engine_kw["algorithm"], tp, **knobs)
+        engine_kw["ladder"] = _test_ladder(
+            engine_kw["algorithm"], tp, handshake=engine_kw.get("handshake"), **knobs
+        )
     fly = FlyQuickAllReduce(
         group=gloo,
         device=device,
@@ -919,7 +965,7 @@ def _run_rank(
     fly = _engine(rank, tp, gloo, device, engine_kw)
     production_cfgs = None
     if window is not None:
-        production_cfgs = [(int(st), int(b)) for st, b in fly.cfgs_for(*window)]
+        production_cfgs = [(int(st), int(b)) for st, b, _kn in fly.cfgs_for(*window)]
     reps, rounds = timing
 
     rows = []
@@ -942,6 +988,7 @@ def _run_rank(
 
             nbytes = int(inp.numel()) * int(inp.element_size())
             cfg_used, _ = fly._pick_cfg(nbytes)
+            cfg_used = cfg_used[:2]
             tile_bytes = _tile_bytes(cfg_used[1])
 
             out = torch.zeros_like(inp)
@@ -983,7 +1030,9 @@ def _run_rank(
                     "ag_codec": fly.ag_codec,
                     "st_used": int(st_used),
                     "block_used": int(block_used),
-                    "grid_by_cfg": {cfg: int(e.grid) for cfg, e in fly._by_cfg.items()},
+                    "grid_by_cfg": {
+                        cfg[:2]: int(e.grid) for cfg, e in fly._by_cfg.items()
+                    },
                     "production_cfgs": production_cfgs,
                     "us": us,
                 }
@@ -992,6 +1041,110 @@ def _run_rank(
             torch.cuda.empty_cache()
     finally:
         _teardown([fly], gloo)
+    return rows
+
+
+def _knob_rank(
+    rank: int,
+    tp: int,
+    init_method: str,
+    super_tile: int,
+    tunings: tuple[str, ...],
+) -> list[dict]:
+    """One rank of a knob spawn: for each of *tunings*, a Lamport mesh engine
+    with those knobs next to the default-knob engine, on the same inputs.
+
+    Per tuning, ``KNOB_ITERS`` back-to-back calls of each engine on every
+    ``KNOB_SHAPES`` shape, a fresh input per call and no barrier between them,
+    with rank 0 dragged now and then so the others run ahead into the next call
+    (a stale or overwritten inbox slot is the wrong answer; a lost wake-up is a
+    hang, which the spawn's timeout reports). Returned per tuning: how many
+    outputs differ from the default build's, bit for bit, how many lanes differ
+    between ranks, and the worst SQNR against an fp32 reference.
+    """
+    import torch.distributed as dist
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    tp_group = _init_dist(rank, tp, init_method, hip=False)
+    gloo = tp_group.cpu_group
+    group = tp_group.device_group
+    drag = torch.randn(2048, 2048, device=device, dtype=torch.float32)
+    rows = []
+    try:
+        for tuning in tunings:
+            knobs = MeshKnobs.parse(tuning)
+            if knobs.prefetch and super_tile != 1:
+                # prefetch is ST=1 only; the combination runs without it.
+                knobs = dataclasses.replace(knobs, prefetch=0)
+                if knobs.is_default():
+                    continue
+            engines = {}
+            for name, kn in (("default", MeshKnobs()), ("knobs", knobs)):
+                engines[name] = _engine(
+                    rank,
+                    tp,
+                    gloo,
+                    device,
+                    {
+                        "algorithm": "mesh",
+                        "handshake": "lamport",
+                        "super_tile": super_tile,
+                        "grid_cap": KNOB_GRID_CAP,
+                        "block": KNOB_BLOCK,
+                        "tuning": kn,
+                    },
+                )
+            outs = {name: [] for name in engines}
+            refs = []
+            for shape_i, (tokens, hidden) in enumerate(KNOB_SHAPES):
+                for it in range(KNOB_ITERS):
+                    seq = shape_i * KNOB_ITERS + it
+                    if rank == 0 and it % 3 == 0:
+                        drag = drag @ drag.T * 1e-6
+                    inp = _run_ahead_part(seq, rank, tokens, hidden, device)
+                    for name, eng in engines.items():
+                        out = torch.empty_like(inp)
+                        eng.allreduce(inp, out)
+                        outs[name].append(out)
+                    refs.append((seq, tokens, hidden))
+            torch.cuda.synchronize()
+            differing = lanes = 0
+            sqnr = float("inf")
+            for i, (seq, tokens, hidden) in enumerate(refs):
+                got, base = outs["knobs"][i], outs["default"][i]
+                differing += int(
+                    (got.view(torch.int16) != base.view(torch.int16)).sum()
+                )
+                lanes = max(lanes, _lanes_differing(got, group))
+                ref = sum(
+                    _run_ahead_part(seq, r, tokens, hidden, device).float()
+                    for r in range(tp)
+                )
+                sqnr = min(sqnr, _sqnr_db(got.float(), ref))
+            rows.append(
+                {
+                    "tuning": str(knobs),
+                    "calls": len(refs),
+                    "differing_from_default": differing,
+                    "lanes_differing": lanes,
+                    "sqnr_db": sqnr,
+                    "symbol": engines["knobs"].variant(
+                        KNOB_SHAPES[0][0] * KNOB_SHAPES[0][1] * 2
+                    ),
+                }
+            )
+            del outs, refs
+            torch.cuda.synchronize()
+            dist.barrier(group=gloo)
+            for eng in engines.values():
+                eng.close()
+            torch.cuda.empty_cache()
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier(group=gloo)
+        destroy_model_parallel()
+        destroy_distributed_environment()
     return rows
 
 
@@ -1815,6 +1968,52 @@ def test_quick_allreduce_coverage(tp, algorithm, window):
         "gfx": ARCH,
         "production_kernels": sorted(production),
         "missing": missing,
+    }
+
+
+@benchmark()
+def test_quick_allreduce_knobs(tp, super_tile):
+    """Every Lamport mesh tuning knob value, singly and all together, gives the
+    default build's output bit for bit, the same on every rank, and survives
+    back-to-back calls on fresh inputs with a rank dragged.
+
+    The knobs reorder and re-time the same arithmetic (see ``MeshKnobs``): the
+    fp16 accumulate order is rank order in every variant, so the result is not
+    merely within a tolerance of the default, it is identical to it.
+    ``prefetch`` runs at ``super_tile`` 1 only; the all-on combination then
+    runs without it.
+    """
+    ranks = _spawn(
+        _knob_rank,
+        tp,
+        super_tile=super_tile,
+        tunings=KNOB_COVERAGE,
+    )
+    fails = []
+    for rank, rank_rows in enumerate(ranks):
+        for row in rank_rows:
+            where = f"rank {rank} [{row['tuning']}]"
+            if row["differing_from_default"]:
+                fails.append(
+                    f"{where}: {row['differing_from_default']} lanes differ from "
+                    "the default-knob build"
+                )
+            if row["lanes_differing"]:
+                fails.append(
+                    f"{where}: {row['lanes_differing']} lanes differ between ranks"
+                )
+            if row["sqnr_db"] < SQNR_MIN_DB:
+                fails.append(f"{where}: SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB}")
+    _check(f"tp={tp} mesh lamport knobs st={super_tile}", fails)
+    return {
+        "gfx": ARCH,
+        "tunings": len(ranks[0]),
+        "calls": ranks[0][0]["calls"],
+        "differing_from_default": max(
+            r["differing_from_default"] for rr in ranks for r in rr
+        ),
+        "lanes_differing": max(r["lanes_differing"] for rr in ranks for r in rr),
+        "sqnr_db": min(r["sqnr_db"] for rr in ranks for r in rr),
     }
 
 
@@ -3917,6 +4116,18 @@ def _verify(args, tps, algos, dts, link) -> None:
             test_quick_allreduce_transport(tokens, hidden, tp, algorithm, st, block)
             for tp, algorithm, tokens, hidden, st, block in transport
         ],
+    )
+    # The Lamport mesh's tuning knobs, where the mesh ships on that handshake.
+    knob_cases = [
+        (tp, st)
+        for tp in tps
+        if (tp, "mesh") in plans
+        and {r.handshake for r in _ladder("mesh", tp, link)} == {"lamport"}
+        for st in (1, KNOB_SUPER_TILE)
+    ]
+    _summarize(
+        "flydsl quick allreduce lamport mesh knobs (bit-identical to default)",
+        [test_quick_allreduce_knobs(tp, st) for tp, st in knob_cases],
     )
     os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = HIP_QR_REGIME
     aiter.qr_max_size()

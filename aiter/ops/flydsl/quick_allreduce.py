@@ -37,6 +37,7 @@ from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
 from .allreduce_policy import (
     AG_CODECS,
+    DEFAULT_MESH_KNOBS,
     HANDSHAKES,
     MESH_CODECS,
     MIN_BATCH_BLOCKS,
@@ -45,6 +46,7 @@ from .allreduce_policy import (
     RS_CODECS,
     SUPER_TILES,
     FusedTwoShotRung,
+    MeshKnobs,
     TwoShotRung,
     default_codecs,
     fused_mesh_st_ladder,
@@ -148,6 +150,9 @@ class _Algorithm:
     # bound the persistent grid by LDS residency as well as by VGPRs; None
     # when the VGPR table is the tighter bound for every codec.
     lds_bytes: Callable[[int, int, str], int] | None = None
+    # Whether ``build`` takes ``knobs`` (``MeshKnobs``) and ``lds_bytes`` the
+    # ``lds_bufs=`` keyword: the mesh does, the ring takes only the defaults.
+    has_knobs: bool = False
 
 
 def _build_mesh(
@@ -166,6 +171,7 @@ def _build_mesh(
     mxfp4=False,
     low_latency=False,
     handshake="flag",
+    knobs=DEFAULT_MESH_KNOBS,
 ):
     if rs_codec != ag_codec:
         raise ValueError(
@@ -186,6 +192,7 @@ def _build_mesh(
         mxfp4=mxfp4,
         low_latency=low_latency,
         handshake=handshake,
+        knobs=knobs,
     )
 
 
@@ -202,6 +209,7 @@ ALGORITHMS = {
         has_divisor=True,
         single_codec=True,
         lds_bytes=mesh_lds_bytes,
+        has_knobs=True,
     ),
     "ring": _Algorithm(
         name="ring",
@@ -356,6 +364,13 @@ class FlyQuickAllReduce:
                 )
             (handshake,) = named
         ladder = tuple(dataclasses.replace(r, handshake=handshake) for r in ladder)
+        if not algo.has_knobs:
+            for r in ladder:
+                if not r.knobs.is_default():
+                    raise ValueError(
+                        f"algorithm={algorithm!r} takes no mesh tuning knobs, "
+                        f"got {str(r.knobs)!r}"
+                    )
         inbox_flags, resolved_inbox = resolve_inbox_flags(
             inbox_memory, world_size, link
         )
@@ -387,11 +402,12 @@ class FlyQuickAllReduce:
         if self.min_bytes < 0:
             raise ValueError(f"min_bytes must be non-negative, got {self.min_bytes}")
 
-        # One engine per distinct ``(super_tile, block)``, keyed that way in
-        # ``_by_cfg``. Each ``block`` also gets an ST=1 engine: _pick_cfg falls
-        # back to it when a payload has fewer tiles than the chosen super-tile,
-        # and the fallback has to share the rung's block -- a different tile
-        # size would change the tile count it was picked for. Engines are built
+        # One engine per distinct ``(super_tile, block, knobs)``, keyed that way
+        # in ``_by_cfg``. Each ``(block, knobs)`` also gets an ST=1 engine:
+        # _pick_cfg falls back to it when a payload has fewer tiles than the
+        # chosen super-tile, and the fallback has to share the rung's block -- a
+        # different tile size would change the tile count it was picked for --
+        # and its knobs, so a tuned rung stays on its tuned kernel. Engines are built
         # in a fixed order because each does its own IPC handle exchange, which
         # is a collective -- ranks disagreeing on the order would deadlock.
         #
@@ -406,15 +422,20 @@ class FlyQuickAllReduce:
         # every object ever constructed.
         caps = {}
         for r in ladder:
-            caps.setdefault((r.super_tile, r.block), r.grid_cap)
-        for b in {b for _st, b in list(caps)}:
-            caps.setdefault((1, b), min(c for (_st, cb), c in caps.items() if cb == b))
+            caps.setdefault((r.super_tile, r.block, r.knobs), r.grid_cap)
+        for b, kn in {(b, kn) for _st, b, kn in list(caps)}:
+            caps.setdefault(
+                (1, b, kn),
+                min(c for (_st, cb, ck), c in caps.items() if (cb, ck) == (b, kn)),
+            )
         self._ladder = ladder
         self._by_cfg = {}
         try:
             with torch.cuda.device(self._device_index):
-                for key in sorted(caps):
-                    st, b = key
+                # Knobs sort by their string form: a total order every rank
+                # shares, which the collective setup below needs.
+                for key in sorted(caps, key=lambda k: (k[0], k[1], str(k[2]))):
+                    st, b, kn = key
                     # A persistent kernel deadlocks if it launches more workgroups
                     # than fit, and the ranks have to agree on the number: take the
                     # minimum across the group so a heterogeneous node converges.
@@ -426,11 +447,14 @@ class FlyQuickAllReduce:
                         cu_count=cu_count,
                         block=b,
                         handshake=handshake,
+                        knobs=kn,
                     )
                     if algo.lds_bytes is not None:
                         # The VGPR table assumes INT4's rank-tile; a wider
                         # codec can run out of LDS first.
-                        wg_lds = algo.lds_bytes(b, self.world_size, rs_codec)
+                        wg_lds = algo.lds_bytes(
+                            b, self.world_size, rs_codec, lds_bufs=kn.lds_bufs
+                        )
                         grid = min(grid, max(1, lds_capacity // wg_lds) * cu_count)
                     shared_grid = torch.tensor(grid, dtype=torch.int64)
                     dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=group)
@@ -444,6 +468,7 @@ class FlyQuickAllReduce:
                         ag_codec=ag_codec,
                         block=b,
                         handshake=handshake,
+                        **({"knobs": kn} if algo.has_knobs else {}),
                     )
                     if spec["lds_bytes"] > lds_capacity:
                         raise ValueError(
@@ -465,7 +490,7 @@ class FlyQuickAllReduce:
 
         # The first rung's shape, reported as this object's own.
         self.super_tile, self.block = ladder[0].super_tile, ladder[0].block
-        primary = self._by_cfg[(self.super_tile, self.block)]
+        primary = self._by_cfg[(self.super_tile, self.block, ladder[0].knobs)]
         self.buf_bytes = primary.buf_bytes
         self.lds_bytes = primary.lds_bytes
         self.tile_bytes = primary.tile_bytes
@@ -486,8 +511,8 @@ class FlyQuickAllReduce:
         """
         return sum(eng.buf_bytes for eng in self._by_cfg.values())
 
-    def _ladder_cfg(self, live_bytes: int) -> tuple[int, int]:
-        """``(super_tile, block)`` the ladder assigns to *live_bytes*.
+    def _ladder_cfg(self, live_bytes: int) -> tuple[int, int, MeshKnobs]:
+        """``(super_tile, block, knobs)`` the ladder assigns to *live_bytes*.
 
         Publishes per rank are ``num_tiles / ST * 2(N-1)`` and cost a full L2
         writeback each, so a bigger payload wants a bigger ST -- but ST also
@@ -496,14 +521,14 @@ class FlyQuickAllReduce:
         ``RING_ST_LADDER``.
         """
         rung = select_rung(self._ladder, live_bytes)
-        return (rung.super_tile, rung.block)
+        return (rung.super_tile, rung.block, rung.knobs)
 
     @staticmethod
     def _num_tiles(live_bytes: int, block: int) -> int:
         tile_bytes = int(block) * ATOMS * 16
         return max(1, (live_bytes + tile_bytes - 1) // tile_bytes)
 
-    def _pick_cfg(self, live_bytes: int) -> tuple[tuple[int, int], int]:
+    def _pick_cfg(self, live_bytes: int) -> tuple[tuple[int, int, MeshKnobs], int]:
         """Engine key for a *live_bytes* payload, and its tile count.
 
         The ladder chooses the rung, which fixes the block and so the tile
@@ -512,15 +537,15 @@ class FlyQuickAllReduce:
         there is not.
         """
 
-        want, b = self._ladder_cfg(live_bytes)
+        want, b, kn = self._ladder_cfg(live_bytes)
         num_tiles = self._num_tiles(live_bytes, b)
         if want == 1:
             st = 1
         elif self._batch_publishes:
             st = want if num_tiles >= want else 1
         else:
-            st = want if num_tiles > self._by_cfg[(want, b)].grid else 1
-        return (st, b), num_tiles
+            st = want if num_tiles > self._by_cfg[(want, b, kn)].grid else 1
+        return (st, b, kn), num_tiles
 
     def _grid_x(self, num_tiles: int, super_tile: int, grid: int) -> int:
         """Blocks to launch for *num_tiles* tiles under *super_tile*.
@@ -593,7 +618,7 @@ class FlyQuickAllReduce:
         with torch.cuda.device(self._device_index):
             _run_compiled(eng.launch, *args)
 
-    def cfgs_for(self, lo: int, hi: int) -> list[tuple[int, int]]:
+    def cfgs_for(self, lo: int, hi: int) -> list[tuple[int, int, MeshKnobs]]:
         """``_by_cfg`` keys a payload of ``lo..hi`` bytes (inclusive) can
         select, in build order."""
         floors = [rung.min_bytes for rung in self._ladder]

@@ -32,7 +32,6 @@ from aiter.ops.flydsl import allreduce_policy as P
 from aiter.ops.flydsl import comm_collectives_host_shared as H
 from aiter.ops.flydsl.allreduce_policy import (
     RING_SUPER_TILES,
-    SUPER_TILES,
     SUPPORTED_ATOMS,
     SUPPORTED_BLOCKS,
     SUPPORTED_SPLITS,
@@ -191,7 +190,8 @@ def test_ladders_are_well_formed(cell):
     """
     link, ws, arch = cell
     kw = {"world_size": ws, "link": link, "arch": arch}
-    two_shot = [("mesh", mesh_st_ladder(**kw), SUPER_TILES)]
+    # The mesh's legal super-tiles depend on the rung's handshake.
+    two_shot = [("mesh", mesh_st_ladder(**kw), None)]
     if _row(*cell).window(RING, quantized=True) is not None:
         two_shot.append(("ring", ring_st_ladder(**kw), RING_SUPER_TILES))
     for name, rungs, valid_st in two_shot:
@@ -200,9 +200,12 @@ def test_ladders_are_well_formed(cell):
         floors = [r.min_bytes for r in rungs]
         assert floors == sorted(floors), name
         for r in rungs:
-            assert r.super_tile in valid_st, (name, r)
+            legal = P.mesh_super_tiles(r.handshake) if valid_st is None else valid_st
+            assert r.super_tile in legal, (name, r)
             assert r.grid_cap >= 1, (name, r)
             assert r.block in SUPPORTED_BLOCKS, (name, r)
+            # Shipped rungs run the kernel as it was before the knobs.
+            assert r.knobs == P.DEFAULT_MESH_KNOBS, (name, r)
             assert r.handshake in P.HANDSHAKES, (name, r)
         # One FlyQuickAllReduce runs one handshake.
         assert len({r.handshake for r in rungs}) == 1, name
@@ -725,14 +728,17 @@ def test_fused_ladders_are_well_formed(cell):
     for hidden in _widths(*cell):
         kw = {"world_size": ws, "link": link, "arch": arch, "hidden": hidden}
         for name, rungs, valid_st in (
-            ("mesh", fused_mesh_st_ladder(**kw), SUPER_TILES),
+            ("mesh", fused_mesh_st_ladder(**kw), None),
             ("ring", fused_ring_st_ladder(**kw), RING_SUPER_TILES),
         ):
             assert rungs and rungs[0].min_bytes == 0, (name, hidden)
             floors = [r.min_bytes for r in rungs]
             assert floors == sorted(floors), (name, hidden)
             for r in rungs:
-                assert r.super_tile in valid_st, (name, hidden, r)
+                legal = (
+                    P.mesh_super_tiles(r.handshake) if valid_st is None else valid_st
+                )
+                assert r.super_tile in legal, (name, hidden, r)
                 assert r.grid_cap >= 1, (name, hidden, r)
                 assert r.handshake in P.HANDSHAKES, (name, hidden, r)
             # One engine set per width runs one handshake.
@@ -1314,3 +1320,151 @@ def test_old_ipc_module_name_still_imports():
     from aiter.ops.flydsl.quick_allreduce_int4_ipc import UncachedIpcHeap as Old
 
     assert Old is UncachedIpcHeap
+
+
+# --- Lamport mesh tuning knobs ------------------------------------------------
+
+
+def test_mesh_knobs_default_tag_and_string_are_empty():
+    k = P.DEFAULT_MESH_KNOBS
+    assert k == P.MeshKnobs() and k.is_default()
+    assert k.tag() == "" and str(k) == ""
+    assert P.MeshKnobs.parse("") == k and P.MeshKnobs.parse(None) == k
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "stripe=full",
+        "fanout=sector",
+        "fanout=peer",
+        "poll_sleep=2",
+        "recv_order=per_source",
+        "prefetch=1",
+        "lds_bufs=2",
+        "prio=1",
+        "stripe=full;prefetch=1",
+        (
+            "stripe=full;fanout=peer;poll_sleep=1;recv_order=per_source;"
+            "prefetch=1;lds_bufs=2;prio=2"
+        ),
+    ],
+)
+def test_mesh_knobs_parse_round_trip(text):
+    k = P.MeshKnobs.parse(text)
+    assert not k.is_default()
+    assert P.MeshKnobs.parse(str(k)) == k
+    # The string form is canonical (field order); the tag is deterministic.
+    assert str(k) == str(P.MeshKnobs.parse(str(k)))
+    assert k.tag() == P.MeshKnobs.parse(str(k)).tag() and k.tag().startswith("_k")
+    assert P.MeshKnobs.parse(k) is k
+
+
+def test_mesh_knobs_tag_example_and_uniqueness():
+    k = P.MeshKnobs.parse("prefetch=1;stripe=full")
+    assert k.tag() == "_kstripefull_kpre1" and str(k) == "stripe=full;prefetch=1"
+    singles = [
+        "stripe=full",
+        "fanout=sector",
+        "fanout=peer",
+        "poll_sleep=1",
+        "poll_sleep=2",
+        "recv_order=per_source",
+        "prefetch=1",
+        "lds_bufs=2",
+        "prio=1",
+        "prio=2",
+    ]
+    tags = [P.MeshKnobs.parse(t).tag() for t in singles]
+    assert len(set(tags)) == len(tags)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "nosuch=1",
+        "stripe=wide",
+        "fanout=atom",
+        "poll_sleep=3",
+        "poll_sleep=x",
+        "recv_order=random",
+        "prefetch=2",
+        "lds_bufs=3",
+        "prio=-1",
+        "stripe",
+        "stripe=full;stripe=cap8",
+    ],
+)
+def test_mesh_knobs_parse_rejects_bad_input(text):
+    with pytest.raises(ValueError):
+        P.MeshKnobs.parse(text)
+
+
+def test_mesh_knobs_constructor_rejects_bad_values():
+    for kw in ({"prefetch": True}, {"prio": 7}, {"stripe": "x"}):
+        with pytest.raises(ValueError):
+            P.MeshKnobs(**kw)
+
+
+def test_two_shot_rung_knob_combinations():
+    base = {"min_bytes": 0, "grid_cap": 64, "block": 256}
+    on = P.MeshKnobs.parse("stripe=full;lds_bufs=2")
+    pre = P.MeshKnobs.parse("prefetch=1")
+    # Defaults are legal on every handshake and super-tile.
+    P.TwoShotRung(**base, super_tile=8, handshake="flag")
+    P.TwoShotRung(**base, super_tile=8, handshake="lamport")
+    # Any non-default knob needs the Lamport handshake.
+    with pytest.raises(ValueError, match="lamport"):
+        P.TwoShotRung(**base, super_tile=1, handshake="flag", knobs=on)
+    P.TwoShotRung(**base, super_tile=1, handshake="lamport", knobs=on)
+    P.TwoShotRung(**base, super_tile=8, handshake="lamport", knobs=on)
+    # prefetch is ST=1 only.
+    P.TwoShotRung(**base, super_tile=1, handshake="lamport", knobs=pre)
+    with pytest.raises(ValueError, match="super_tile=1"):
+        P.TwoShotRung(**base, super_tile=2, handshake="lamport", knobs=pre)
+    # ``dataclasses.replace`` re-validates, as the host does with the handshake.
+    rung = P.TwoShotRung(**base, super_tile=1, handshake="lamport", knobs=on)
+    with pytest.raises(ValueError, match="lamport"):
+        dataclasses.replace(rung, handshake="flag")
+
+
+def test_lamport_super_tiles_2_and_4_flag_does_not():
+    assert P.mesh_super_tiles("lamport") == (1, 2, 4, 8)
+    assert P.mesh_super_tiles("flag") == P.SUPER_TILES == (1, 8)
+    assert set(P.RING_SUPER_TILES) >= {1, 8}
+    kernel = pytest.importorskip("aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh")
+    # The kernel's own build check is handshake-aware too.
+    for st in (2, 4):
+        with pytest.raises(ValueError, match="super_tile"):
+            kernel.make_quick_allreduce_mesh_kernel(
+                world_size=8,
+                super_tile=st,
+                grid=8,
+                inbox_memory="uncached",
+                codec="int4",
+                block=256,
+                rank=0,
+                handshake="flag",
+            )
+
+
+def test_fused_two_shot_check_is_handshake_aware():
+    check = P._two_shot_check(
+        P.SUPER_TILES, low_latency=True, by_handshake=P.mesh_super_tiles
+    )
+
+    def mk(st, hs):
+        return P.FusedTwoShotRung(min_bytes=0, super_tile=st, grid_cap=8, handshake=hs)
+
+    check(mk(2, "lamport"), "r")
+    check(mk(4, "lamport"), "r")
+    with pytest.raises(ValueError, match="super_tile"):
+        check(mk(2, "flag"), "r")
+
+
+def test_mesh_lds_bytes_counts_the_buffers():
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import mesh_lds_bytes
+
+    one = mesh_lds_bytes(256, 8, "int4")
+    assert mesh_lds_bytes(256, 8, "int4", lds_bufs=2) == 2 * one
+    assert mesh_lds_bytes(256, 8, "int4", 16, 2) == 2 * one + 64

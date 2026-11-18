@@ -117,6 +117,16 @@ FANOUT_ORDERS = ("peer", "atom")
 # Super-tile values the mesh accepts.
 SUPER_TILES = (1, 8)
 
+# The Lamport handshake has no publish to batch, so a super-tile there is only
+# an overlap of several tiles' fanouts and polls, and 2 and 4 are worth trying.
+LAMPORT_SUPER_TILES = (1, 2, 4, 8)
+
+
+def mesh_super_tiles(handshake: str) -> tuple[int, ...]:
+    """Super-tile values the mesh accepts on *handshake*."""
+    return LAMPORT_SUPER_TILES if handshake == "lamport" else SUPER_TILES
+
+
 # Wire formats the mesh can build.
 MESH_CODECS = ("int4", "int5", "int6", "fp16")
 
@@ -152,6 +162,150 @@ HANDSHAKES = ("flag", "lamport")
 # How the IPC inbox is allocated. ``"auto"`` resolves to one of the others. The
 # wire protocol is identical in every mode; only the memory type changes.
 INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained")
+
+
+# Mesh tuning knobs
+# =================
+#
+# Default-off levers of the Lamport mesh kernel, which a search tunes per rung.
+# Every default is what the kernel did before the knob existed: a rung with
+# ``DEFAULT_MESH_KNOBS`` builds the same code, under the same symbol name.
+#
+#   stripe       "cap8": a rank-tile's sectors go out in stripes of at most 8
+#                quads per destination. "full": as wide as the block's quads
+#                allow, fewer and wider store instructions.
+#   fanout       "policy": the inbox memory type's own quad order. "sector" /
+#                "peer": force the axis that runs fastest across quads.
+#   poll_sleep   ``s_sleep`` count in the Lamport spin loop (0 = none).
+#   recv_order   "batch": all packets are polled together, then dequantized.
+#                "per_source": poll and dequantize one source at a time, so the
+#                dequant of early sources overlaps the arrival of later ones.
+#   prefetch     1: the next tile's input atoms are loaded before this tile's
+#                reduce-scatter poll (super_tile 1 only).
+#   lds_bufs     2: the reduce-scatter and all-gather packs stage in separate
+#                LDS buffers, which drops one workgroup join per pack.
+#   prio         ``s_setprio`` level raised around the fanout and the poll.
+MESH_KNOB_VALUES = {
+    "stripe": ("cap8", "full"),
+    "fanout": ("policy", "sector", "peer"),
+    "poll_sleep": (0, 1, 2),
+    "recv_order": ("batch", "per_source"),
+    "prefetch": (0, 1),
+    "lds_bufs": (1, 2),
+    "prio": (0, 1, 2),
+}
+# Short key and value spellings of ``MeshKnobs.tag``.
+_KNOB_TAG_KEY = {
+    "stripe": "stripe",
+    "fanout": "fan",
+    "poll_sleep": "slp",
+    "recv_order": "ord",
+    "prefetch": "pre",
+    "lds_bufs": "lds",
+    "prio": "prio",
+}
+_KNOB_TAG_VALUE = {"per_source": "src"}
+
+
+@dataclass(frozen=True)
+class MeshKnobs:
+    """Tuning knobs of the Lamport mesh kernel; see ``MESH_KNOB_VALUES``.
+
+    ``str(knobs)`` is the ``"key=value;key=value"`` form of the non-default
+    fields (``""`` at the defaults), and ``MeshKnobs.parse`` reads it back.
+    ``tag()`` is the symbol-name suffix, ``""`` at the defaults.
+    """
+
+    stripe: str = "cap8"
+    fanout: str = "policy"
+    poll_sleep: int = 0
+    recv_order: str = "batch"
+    prefetch: int = 0
+    lds_bufs: int = 1
+    prio: int = 0
+
+    def __post_init__(self) -> None:
+        for f in dataclasses.fields(self):
+            value = getattr(self, f.name)
+            legal = MESH_KNOB_VALUES[f.name]
+            # bool is an int: ``prefetch=True`` is not a legal spelling.
+            if isinstance(value, bool) or value not in legal:
+                raise ValueError(
+                    f"mesh knob {f.name}: must be one of {legal}, got {value!r}"
+                )
+
+    def is_default(self) -> bool:
+        return self == DEFAULT_MESH_KNOBS
+
+    def _non_default(self) -> list[tuple[str, object]]:
+        return [
+            (f.name, getattr(self, f.name))
+            for f in dataclasses.fields(self)
+            if getattr(self, f.name) != f.default
+        ]
+
+    def tag(self) -> str:
+        """Symbol-name suffix: ``""`` at the defaults, else ``_k<key><value>``
+        per non-default field, in field order (``_kstripefull_kpre1``)."""
+        return "".join(
+            f"_k{_KNOB_TAG_KEY[k]}{_KNOB_TAG_VALUE.get(v, v)}"
+            for k, v in self._non_default()
+        )
+
+    def __str__(self) -> str:
+        return ";".join(f"{k}={v}" for k, v in self._non_default())
+
+    @classmethod
+    def parse(cls, text) -> MeshKnobs:
+        """``"stripe=full;prefetch=1"`` -> ``MeshKnobs``. ``""`` / ``None`` are
+        the defaults; a ``MeshKnobs`` passes through. An unknown key, a value
+        out of range or a repeated key raises."""
+        if isinstance(text, cls):
+            return text
+        if text is None or not str(text).strip():
+            return DEFAULT_MESH_KNOBS
+        values: dict = {}
+        for part in str(text).split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            key, sep, raw = part.partition("=")
+            key, raw = key.strip(), raw.strip()
+            if not sep or key not in MESH_KNOB_VALUES:
+                raise ValueError(
+                    f"mesh knob {part!r}: expected key=value with key in "
+                    f"{tuple(MESH_KNOB_VALUES)}"
+                )
+            if key in values:
+                raise ValueError(f"mesh knob {key} given twice in {text!r}")
+            legal = MESH_KNOB_VALUES[key]
+            if isinstance(legal[0], int):
+                try:
+                    raw = int(raw)
+                except ValueError:
+                    raise ValueError(
+                        f"mesh knob {key}: must be one of {legal}, got {raw!r}"
+                    ) from None
+            values[key] = raw
+        return cls(**values)
+
+    def check(self, *, handshake: str, super_tile: int, where: str = "knobs") -> None:
+        """Reject a combination the kernel cannot build. The defaults pass on
+        every rung."""
+        if self.is_default():
+            return
+        if handshake != "lamport":
+            raise ValueError(
+                f"{where}: mesh knobs ({self}) need handshake='lamport', got "
+                f"{handshake!r}"
+            )
+        if self.prefetch and super_tile != 1:
+            raise ValueError(
+                f"{where}: prefetch=1 needs super_tile=1, got {super_tile}"
+            )
+
+
+DEFAULT_MESH_KNOBS = MeshKnobs()
 
 # Defaults
 # ========
@@ -268,7 +422,9 @@ class TwoShotRung:
     ``block`` sets the tile. ``grid_cap`` bounds the block count, and with
     ``super_tile`` it sets the size of the IPC inbox. ``handshake`` is one of
     ``HANDSHAKES``; every rung of one ladder names the same one, because one
-    ``FlyQuickAllReduce`` runs one handshake.
+    ``FlyQuickAllReduce`` runs one handshake. ``knobs`` are the Lamport mesh
+    tuning knobs (``MeshKnobs``); the defaults leave the kernel as it was, and
+    the ring takes only the defaults.
     """
 
     min_bytes: int
@@ -276,6 +432,14 @@ class TwoShotRung:
     grid_cap: int
     block: int
     handshake: str = "flag"
+    knobs: MeshKnobs = DEFAULT_MESH_KNOBS
+
+    def __post_init__(self) -> None:
+        self.knobs.check(
+            handshake=self.handshake,
+            super_tile=self.super_tile,
+            where="TwoShotRung.knobs",
+        )
 
 
 @dataclass(frozen=True)
@@ -1209,9 +1373,13 @@ def _check_oneshot_rung(rung: FusedOneShotRung, where: str) -> None:
         )
 
 
-def _two_shot_check(super_tiles, *, low_latency: bool):
+def _two_shot_check(super_tiles, *, low_latency: bool, by_handshake=None):
+    """The rung check of a fused family. *by_handshake*, if given, maps a
+    handshake to the super-tiles legal on it, and replaces *super_tiles*."""
+
     def check(rung: FusedTwoShotRung, where: str) -> None:
-        _check_in(rung.super_tile, super_tiles, f"{where}.super_tile")
+        legal = super_tiles if by_handshake is None else by_handshake(rung.handshake)
+        _check_in(rung.super_tile, legal, f"{where}.super_tile")
         _check_grid_cap(rung, where)
         if not isinstance(rung.low_latency, bool):
             msg = f"{where}.low_latency: must be true or false"
@@ -1233,7 +1401,10 @@ def _two_shot_check(super_tiles, *, low_latency: bool):
 # The rung record and the rung check of each family in the file.
 _FUSED_FAMILIES = {
     "oneshot": (FusedOneShotRung, _check_oneshot_rung),
-    "mesh": (FusedTwoShotRung, _two_shot_check(SUPER_TILES, low_latency=True)),
+    "mesh": (
+        FusedTwoShotRung,
+        _two_shot_check(SUPER_TILES, low_latency=True, by_handshake=mesh_super_tiles),
+    ),
     "ring": (FusedTwoShotRung, _two_shot_check(RING_SUPER_TILES, low_latency=False)),
 }
 
