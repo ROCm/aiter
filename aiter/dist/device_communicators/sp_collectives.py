@@ -98,8 +98,9 @@ class SequenceParallelCollectives:
         """The block of the element-wise sum over ranks that this rank owns,
         ``[T / world_size, H]``, from this rank's bf16 ``[T, H]`` partial; the
         rows ``[rank * T/W, (rank + 1) * T/W)`` of the sum. ``None`` when not
-        served: another dtype or rank, ``T`` not divisible by the group size,
-        a payload outside the window, or a padded tensor of 4 GiB or more."""
+        served: another dtype, not a 2-D tensor, ``T`` not divisible by the
+        group size, a payload outside the window, or a padded tensor of 4 GiB
+        or more."""
         w = self.world_size
         if inp.dtype != torch.bfloat16 or inp.dim() != 2 or inp.shape[0] % w:
             return None
@@ -119,8 +120,8 @@ class SequenceParallelCollectives:
     def all_gather(self, inp: torch.Tensor) -> torch.Tensor | None:
         """The ``[world_size * rows, H]`` concatenation, in rank order, of every
         rank's bf16 ``[rows, H]`` block. ``None`` when not served: another
-        dtype or rank, a payload outside the window, or a padded tensor of
-        4 GiB or more."""
+        dtype, not a 2-D tensor, a payload outside the window, or a padded
+        tensor of 4 GiB or more."""
         w = self.world_size
         if inp.dtype != torch.bfloat16 or inp.dim() != 2:
             return None

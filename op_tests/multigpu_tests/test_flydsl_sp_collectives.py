@@ -15,8 +15,9 @@ engine comparison takes its unit from ``block_row_unit``, which
 ``tests/test_sp_collectives.py`` pins to hand-derived values:
 
 * accuracy: NMSE of the router's output against the exact fp32 sum
-  (reduce-scatter) or concatenation (all-gather), below the 7444 test's bound,
-  so a wrong block placement or unpadding, which gives an NMSE near 1, fails;
+  (reduce-scatter) or concatenation (all-gather), below ``NMSE_MAX`` of
+  ``test_flydsl_quick_reduce_scatter_all_gather.py``, so a wrong block placement
+  or unpadding, which gives an NMSE near 1, fails;
 * bit identity with the engine called directly on an input padded in the test
   (zero rows after each block), and the output equal to its unpadded prefix;
 * padding rows must be zero: the router pads into a block the caching allocator
@@ -28,9 +29,10 @@ engine comparison takes its unit from ``block_row_unit``, which
 * a payload below the window is not served (``None``);
 * both modes captured into one CUDA graph after the factory's ``compile_sp``
   replay with new inputs, bit for bit equal to an eager run of the same inputs;
-* ``checkAllclose`` against the same exact fp32 result with the 7444 test's
-  tolerances and mismatch bound. It is supplementary there too: the NMSE bound
-  and the bit identity are the strict checks.
+* ``checkAllclose`` against the same exact fp32 result with the
+  ``checkAllclose`` tolerances and the ``CLOSE_ERR_RATIO`` mismatch bound of
+  ``test_flydsl_quick_reduce_scatter_all_gather.py``. It is supplementary
+  there too: the NMSE bound and the bit identity are the strict checks.
 
 After the checks, a timed sweep of the same shapes (``@benchmark``,
 ``run_perftest`` with CUDA events, a markdown summary): the router, the engine on

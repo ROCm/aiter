@@ -83,11 +83,11 @@ chooses, by payload size:
   which case every rank gets `None`.
 - `reduce_scatter(inp)` and `all_gather(inp)` return a tensor when the bytes of
   the full tensor (the reduce-scatter input, the all-gather output) are inside
-  the window, and `None` otherwise, for another dtype or rank, for a padded
-  tensor of 4 GiB or more, or (reduce-scatter) when `T` does not divide by the
-  group size. `None` means the caller continues with its exact collective. The
-  decision depends on the shape, dtype, window and platform only, so every rank
-  decides alike.
+  the window, and `None` otherwise, for another dtype, for a tensor that is
+  not a 2-D tensor, for a padded tensor of 4 GiB or more, or (reduce-scatter)
+  when `T` does not divide by the group size. `None` means the caller continues
+  with its exact collective. The decision depends on the shape, dtype, window
+  and platform only, so every rank decides alike.
 - The router pads each rank's block with zero rows to a whole number of 32 KiB
   tiles (for hidden 2560: a multiple of 16, 8 or 4 rows at TP 2, 4 or 8),
   copies a misaligned or non-contiguous input, and returns the unpadded
