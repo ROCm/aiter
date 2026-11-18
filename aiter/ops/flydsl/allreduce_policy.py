@@ -416,6 +416,10 @@ _POLICY_BY_KEY = _index(FAMILY_POLICIES)
 #   gfx950 / xGMI / TP2  [8 MiB, inf) -- the lower bound the INT4 path was
 #       checked against end to end (GSM8K) on MI355X TP2. Below it the INT4
 #       crossover has not been swept and the accuracy has not been signed off.
+#       Unlike the mesh all-reduce floor (512 KiB), it is the single-phase
+#       modes' only floor: the engine's ``min_bytes`` does not apply to them.
+#       A gate of about 1 MiB, run with the INT4 all-reduces' gate lowered
+#       too, lost about half a GSM8K point in #7444.
 SP_INT4_WINDOWS: dict[tuple[str, str, int], Window] = {
     ("gfx950", "xgmi", 2): Window(8 * MiB, None),
 }
