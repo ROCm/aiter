@@ -12,6 +12,13 @@ A wait that times out writes an error record into the buffer of each rank."""
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.gfx950.comms.common import (
+    _bf_hi,
+    _bf_lo,
+    _errec_asm,
+    _errec_cons,
+    _pack_bf16,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _SITE_DONE: gl.constexpr = gl.constexpr(1)
@@ -202,28 +209,6 @@ def _store32_cons():
 
 # The error record [1, rank, colour, site] into n buffers, system scope: the high pair
 # first, then the low pair, which holds the word that the waiters read.
-@gluon.constexpr_function
-def _errec_asm(n):
-    return "\n".join(
-        [
-            "v_cmp_ne_u32 vcc, 0, $2",
-            "s_and_saveexec_b64 $1, vcc",
-            "s_cbranch_execz .Ler${:uid}",
-        ]
-        + [
-            f"global_store_dwordx2 ${3 + b}, ${3 + n}, off offset:8 sc0 sc1"
-            for b in range(n)
-        ]
-        + [f"global_store_dwordx2 ${3 + b}, ${4 + n}, off sc0 sc1" for b in range(n)]
-        + [".Ler${:uid}:", "s_mov_b64 exec, $1", "v_mov_b32 $0, 0"]
-    )
-
-
-@gluon.constexpr_function
-def _errec_cons(n):
-    return ",".join(["=v", "=&s"] + ["v"] * (n + 3) + ["~{memory}", "~{vcc}", "~{scc}"])
-
-
 @gluon.jit
 def _thread_ids(W: gl.constexpr):
     L: gl.constexpr = gl.BlockedLayout([1], [64], [W], [0])
@@ -323,24 +308,6 @@ def _fail_record(bufs, rank, colour, site: gl.constexpr, active):
         False,
         1,
     )
-
-
-@gluon.jit
-def _pack_bf16(lo, hi):
-    """Two fp32 values to one dword of 2 bf16 (round to nearest even), lo first."""
-    return gl.inline_asm_elementwise(
-        "v_cvt_pk_bf16_f32 $0, $1, $2", "=v,v,v", [lo, hi], gl.int32, True, 1
-    )
-
-
-@gluon.jit
-def _bf_lo(x):
-    return (x << 16).to(gl.float32, bitcast=True)
-
-
-@gluon.jit
-def _bf_hi(x):
-    return (x & -65536).to(gl.float32, bitcast=True)
 
 
 @gluon.jit
