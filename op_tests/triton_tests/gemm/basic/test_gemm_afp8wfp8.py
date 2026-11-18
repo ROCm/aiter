@@ -1248,12 +1248,23 @@ def preshuffle_reference_fmt(x, w, xs, ws, x_group, w_block):
 
 
 def preshuffle_run_fmt(
-    M, N, K, a_fmt, b_fmt, x_group, w_block, scale_layout="n32k4", x_preshuffled=False
+    M,
+    N,
+    K,
+    a_fmt,
+    b_fmt,
+    x_group,
+    w_block,
+    scale_layout="n32k4",
+    x_preshuffled=False,
+    x_scale_transposed=True,
 ):
     x, w, xs, ws = preshuffle_generate_inputs_fmt(
         M, N, K, a_fmt, b_fmt, x_group, w_block
     )
-    if x_group == 128:
+    if x_group == 128 and not x_scale_transposed:
+        xs_k = xs  # row-major (M, K // 128)
+    elif x_group == 128:
         xs_k = xs.T.contiguous()  # compact column-major (K // 128, M)
     elif M < 32:
         xs_k = xs.contiguous()
@@ -1273,6 +1284,7 @@ def preshuffle_run_fmt(
         scale_layout=scale_layout,
         x_scale_group_size=x_group,
         w_scale_block_size=w_block,
+        is_x_scale_transposed=x_scale_transposed,
     )
     preshuffle_check(y, preshuffle_reference_fmt(x, w, xs, ws, x_group, w_block))
 
@@ -1335,12 +1347,23 @@ def test_gemm_afp8wfp8_preshuffle_formats(M, N, K, a_fmt, b_fmt):
     ],
 )
 @pytest.mark.parametrize("x_preshuffled", [False, True])
-def test_gemm_afp8wfp8_preshuffle_x1x128(M, N, K, w_block, x_preshuffled):
-    """DeepSeek-V3.1-style UE8M0: 1x128 x scales (compact column-major) x coarse w scales."""
+@pytest.mark.parametrize("x_scale_transposed", [True, False])
+def test_gemm_afp8wfp8_preshuffle_x1x128(
+    M, N, K, w_block, x_preshuffled, x_scale_transposed
+):
+    """DeepSeek-V3.1-style UE8M0: 1x128 x scales (column-major or row-major) x coarse w scales."""
     if x_preshuffled and M % 16:
         pytest.skip("x_preshuffled needs M % 16 == 0")
     preshuffle_run_fmt(
-        M, N, K, "e4m3", "e4m3", 128, w_block, x_preshuffled=x_preshuffled
+        M,
+        N,
+        K,
+        "e4m3",
+        "e4m3",
+        128,
+        w_block,
+        x_preshuffled=x_preshuffled,
+        x_scale_transposed=x_scale_transposed,
     )
 
 

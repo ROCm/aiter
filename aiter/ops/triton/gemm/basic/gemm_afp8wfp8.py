@@ -663,6 +663,7 @@ def gemm_afp8wfp8_preshuffle(
     w_scale_block_size: tuple[int, int] = (1, 32),
     x_format: str | None = None,
     w_format: str | None = None,
+    is_x_scale_transposed: bool = True,
 ) -> torch.Tensor:
     """
     gfx1250 (gluon) MXFP8 GEMM: Y = X @ W^T with fp8 e4m3 X and W and standard MX
@@ -697,6 +698,9 @@ def gemm_afp8wfp8_preshuffle(
             compact column-major e8m0 of shape (K // 128, M), contiguous (as produced by
             aiter per_group_quant_hip(..., transpose_scale=True)). 128 runs with
             BLOCK_SIZE_K == 128 and NUM_KSUB == 1.
+        is_x_scale_transposed (bool): x_scale_group_size 128 only. True (default):
+            x_scales is column-major (K // 128, M) as above. False: x_scales is
+            row-major (M, K // 128) with unit K stride.
         w_scale_block_size (tuple[int, int]): (block_n, block_k) of one w scale: (1, 32)
             (MX), (32, 32) or (128, 128). The kernel reads coarse blocks compact and
             repeats them in registers. Coarse blocks run with NUM_KSUB == 1.
@@ -753,7 +757,15 @@ def gemm_afp8wfp8_preshuffle(
             raise ValueError(
                 f"{key} is not a config key; pass scale_layout= / x_preshuffled="
             )
-    if x_scale_group_size == 128:
+    a_scale_rowmajor = x_scale_group_size == 128 and not is_x_scale_transposed
+    if a_scale_rowmajor:
+        assert tuple(x_scales.shape) == (M, K // 128) and x_scales.stride(1) == 1, (
+            f"is_x_scale_transposed=False needs x_scales of shape (M, K // 128) = "
+            f"{(M, K // 128)} with unit K stride, got {tuple(x_scales.shape)} "
+            f"strides {x_scales.stride()}"
+        )
+        config["BLOCK_SIZE_K"], config["NUM_KSUB"] = 128, 1
+    elif x_scale_group_size == 128:
         # compact (K // 128, M) x scales, any M; the kernel's 1x128 path is BK=128 / KSUB1
         assert tuple(x_scales.shape) == (K // 128, M) and x_scales.is_contiguous(), (
             f"x_scale_group_size=128 needs contiguous x_scales of shape (K // 128, M) = "
@@ -851,6 +863,7 @@ def gemm_afp8wfp8_preshuffle(
         config.get("EPI_SPLIT", 1),
         x_scale_group_size,
         w_block,
+        a_scale_rowmajor=a_scale_rowmajor,
     )
     x_k = x.view(torch.uint8)
     if x_preshuffled:
@@ -885,6 +898,11 @@ def gemm_afp8wfp8_preshuffle(
         xs.stride(1),
         ws.stride(0),
         ws.stride(1),
+        0,  # batch strides: unused, BATCHED=0
+        0,
+        0,
+        0,
+        0,
         SCALE_MODE=scale_mode,
         A_DATA_PRESHUFFLE=int(x_preshuffled),
         A_FMT=a_fmt,
@@ -892,6 +910,8 @@ def gemm_afp8wfp8_preshuffle(
         A_SCALE_GROUP=x_scale_group_size,
         W_SCALE_BN=w_block[0],
         W_SCALE_BK=w_block[1],
+        A_SCALE_ROWMAJOR=int(a_scale_rowmajor),
+        A_SCALE_K_COLS=triton.next_power_of_2(K // 128) if a_scale_rowmajor else 1,
         **config,
         **layouts,
     )

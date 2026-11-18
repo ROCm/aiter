@@ -1786,6 +1786,7 @@ def get_gemm_afp8wfp8_preshuffle_layouts(
     epi_split=1,
     a_scale_group=32,
     w_scale_block=(1, 32),
+    a_scale_rowmajor=False,
 ):
     # Building the layouts costs ~1 ms of Python per call and depends only on
     # these ints: build once per config, return a copy (callers may mutate it).
@@ -1802,6 +1803,7 @@ def get_gemm_afp8wfp8_preshuffle_layouts(
             epi_split,
             a_scale_group,
             tuple(w_scale_block),
+            bool(a_scale_rowmajor),
         )
     )
 
@@ -1819,6 +1821,7 @@ def _build_gemm_afp8wfp8_preshuffle_layouts(
     epi_split=1,
     a_scale_group=32,
     w_scale_block=(1, 32),
+    a_scale_rowmajor=False,
 ):
     # each CTA computes BLOCK_M // CTAS_M x BLOCK_N // CTAS_N of it.
     CTAS_M, CTAS_N = cluster_shape(num_ctas, BLOCK_M, BLOCK_N)
@@ -1884,13 +1887,14 @@ def _build_gemm_afp8wfp8_preshuffle_layouts(
         vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=cga_b
     )
     if a_scale_group == 128:
-        # compact column-major (K // 128, M) x scales: one [1, BLOCK_M] row per stage
+        # compact column-major (K // 128, M) x scales: one [1, BLOCK_M] row per stage;
+        # row-major (M, K // 128): one [BLOCK_M, K // 128] strip per tile
         shared_AS = gl.SwizzledSharedLayout(
             vec=1,
             per_phase=1,
             max_phase=1,
             order=[1, 0],
-            cga_layout=[[k, m] for m, k in cga_a],
+            cga_layout=cga_a if a_scale_rowmajor else [[k, m] for m, k in cga_a],
         )
         if scale_mode == 1:
             shared_BS = gl.PaddedSharedLayout.with_identity_for(
@@ -2097,6 +2101,26 @@ def _load_a_scales(
 
 
 @gluon.jit
+def _load_a_scales_k(
+    smem_as,
+    slot,
+    k_idx,
+    BLOCK_M: gl.constexpr,
+    K_GROUPS: gl.constexpr,
+    A_PF: gl.constexpr,
+    SCALE_KWIDTH: gl.constexpr,
+    A_SCALE_GROUP: gl.constexpr,
+    a_scale_layout: gl.constexpr,
+    A_SCALE_ROWMAJOR: gl.constexpr,
+):
+    if A_SCALE_ROWMAJOR:
+        cols = gl.full([BLOCK_M, K_GROUPS], k_idx, gl.int32, layout=a_scale_layout)
+        return smem_as.gather(cols, axis=1)
+    else:
+        return _load_a_scales(smem_as.index(slot), BLOCK_M, K_GROUPS, A_PF, SCALE_KWIDTH, A_SCALE_GROUP, a_scale_layout)  # fmt: skip
+
+
+@gluon.jit
 def _load_b_scales(
     smem_bs,
     BLOCK_N: gl.constexpr,
@@ -2148,6 +2172,7 @@ def _issue_tdm_stage(
     off_bs,
     NUM_WARPS: gl.constexpr,
     AS_K_DIM0: gl.constexpr = False,
+    AS_PRELOADED: gl.constexpr = False,
 ):
     # Movbe all descriptors before the four copies then the compiler fuses all TDM copies
     a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_desc, add_offsets=[0, off_a])
@@ -2171,6 +2196,16 @@ def _issue_tdm_stage(
         )
         gl.amd.gfx1250.tdm.async_load_fused(
             [(as_desc, as_slot, 0b01), (bs_desc, bs_slot, 0b10)]
+        )
+    elif AS_PRELOADED:
+        # warps 0 and 2 split A, so each warp still issues one TDM op per stage
+        W: gl.constexpr = ((1 << NUM_WARPS) - 1) // 0b1111
+        gl.amd.gfx1250.tdm.async_load_fused(
+            [
+                (a_desc, a_slot, W | (W << 2)),
+                (b_desc, b_slot, W << 1),
+                (bs_desc, bs_slot, W << 3),
+            ]
         )
     else:
         W: gl.constexpr = ((1 << NUM_WARPS) - 1) // 0b1111
@@ -2393,6 +2428,12 @@ def _gemm_mxfp8_preshuffle_kernel(
     stride_as_k,
     stride_bs_n,
     stride_bs_k,
+    # per-batch strides of a, b, c, a_scale, b_scale; read only when BATCHED
+    stride_ab,
+    stride_bb,
+    stride_cb,
+    stride_asb,
+    stride_bsb,
     BLOCK_SIZE_M: gl.constexpr,
     BLOCK_SIZE_N: gl.constexpr,
     BLOCK_SIZE_K: gl.constexpr,
@@ -2424,6 +2465,9 @@ def _gemm_mxfp8_preshuffle_kernel(
     b_scale_layout_epi: gl.constexpr = None,
     shared_C_epi: gl.constexpr = None,
     b_scale_layout4: gl.constexpr = None,
+    BATCHED: gl.constexpr = 0,
+    A_SCALE_ROWMAJOR: gl.constexpr = 0,
+    A_SCALE_K_COLS: gl.constexpr = 1,
 ):
     # async_wait counts TDM ops in flight. The compiler fuses each stage's four
     # copies into one op (two with 2 warps, which fuse in pairs).
@@ -2459,7 +2503,7 @@ def _gemm_mxfp8_preshuffle_kernel(
     # A scales are  preshuffled only for M >= 32; for M < 32 (16 rows per CTA) they are
     # un-shuffled (M, K_elems // 32) row-major, i.e. a stripe size of 1.
     if A_SCALE_GROUP == 128:
-        # 1x128 x scales: compact column-major (K // 128, M), never shuffled
+        # 1x128 x scales: compact column-major (K // 128, M) or row-major, never shuffled
         gl.static_assert(BLOCK_SIZE_K == 128)
         gl.static_assert(NUM_KSUB == 1)
         A_PRESHUFFLE_FACTOR: gl.constexpr = 1
@@ -2471,6 +2515,8 @@ def _gemm_mxfp8_preshuffle_kernel(
         A_PRESHUFFLE_FACTOR: gl.constexpr = 1
         AS_STEP: gl.constexpr = K_GROUPS * A_PRESHUFFLE_FACTOR
     gl.static_assert(A_SCALE_GROUP == 32 or A_SCALE_GROUP == 128)
+    gl.static_assert(A_SCALE_ROWMAJOR == 0 or A_SCALE_GROUP == 128)
+    gl.static_assert(A_SCALE_ROWMAJOR == 0 or num_warps == 4 or num_warps == 8)
     W_SCALE_KB: gl.constexpr = W_SCALE_BK // SCALE_GROUP_ELEMS  # K-groups per w scale
     if W_SCALE_BN == 1:
         gl.static_assert(W_SCALE_BK == 32)
@@ -2499,6 +2545,15 @@ def _gemm_mxfp8_preshuffle_kernel(
             is_pure=False,
             pack=1,
         )
+
+    if BATCHED:
+        # batch on grid axis 1; clusters run along axis 0
+        bid = gl.program_id(axis=1).to(gl.int64)
+        a_fp8_ptr = a_fp8_ptr + bid * stride_ab
+        b_preshuf_ptr = b_preshuf_ptr + bid * stride_bb
+        c_ptr = c_ptr + bid * stride_cb
+        a_scale_ptr = a_scale_ptr + bid * stride_asb
+        b_scale_ptr = b_scale_ptr + bid * stride_bsb
 
     pid = gl.program_id(axis=0)
     tiles_n = gl.cdiv(N, BLOCK_SIZE_N)
@@ -2551,7 +2606,16 @@ def _gemm_mxfp8_preshuffle_kernel(
 
     k_scale_cols = K_elems // SCALE_GROUP_ELEMS
 
-    if A_SCALE_GROUP == 128:
+    if A_SCALE_GROUP == 128 and A_SCALE_ROWMAJOR:
+        # x scales (M, K // 128): the tile's whole strip, loaded once
+        as_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=a_scale_ptr + tile_m * BLOCK_SIZE_M * stride_as_m,
+            shape=(M - tile_m * BLOCK_SIZE_M, gl.cdiv(K_elems, 128)),
+            strides=(stride_as_m, stride_as_k),
+            block_shape=(BLOCK_SIZE_M, A_SCALE_K_COLS),
+            layout=shared_AS,
+        )
+    elif A_SCALE_GROUP == 128:
         # x scales (K // 128, M): stride_as_m / stride_as_k are its dim-0 / dim-1 strides
         as_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=a_scale_ptr + tile_m * BLOCK_SIZE_M * stride_as_k,
@@ -2622,7 +2686,13 @@ def _gemm_mxfp8_preshuffle_kernel(
         [NUM_BUFFERS, BLOCK_SIZE_N // 16, BLOCK_K_BYTES * 16],
         layout=shared_B,
     )
-    if A_SCALE_GROUP == 128:
+    if A_SCALE_GROUP == 128 and A_SCALE_ROWMAJOR:
+        smem_AS = gl.allocate_shared_memory(
+            a_scale_ptr.type.element_ty,
+            [BLOCK_SIZE_M, A_SCALE_K_COLS],
+            layout=shared_AS,
+        )
+    elif A_SCALE_GROUP == 128:
         smem_AS = gl.allocate_shared_memory(
             a_scale_ptr.type.element_ty,
             [NUM_BUFFERS, 1, BLOCK_SIZE_M],
@@ -2651,6 +2721,11 @@ def _gemm_mxfp8_preshuffle_kernel(
         (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=wmma_acc_layout
     )
 
+    if A_SCALE_ROWMAJOR:
+        # the stage-0 wait also covers this copy
+        W0: gl.constexpr = ((1 << num_warps) - 1) // 0b1111
+        gl.amd.gfx1250.tdm.async_load(as_desc, dest=smem_AS, warp_used_hint=W0)
+
     # --- 1. Prologue: fill NUM_BUFFERS-1 LDS slots via TDM ---
     # Load-then-advance: each iter consumes the descriptor's current K
     # position, then steps it forward for the next load (prologue or main).
@@ -2659,13 +2734,16 @@ def _gemm_mxfp8_preshuffle_kernel(
         # slot index math (arith.muli) ahead of the copies so the four tdm async_loads emit back-to-back and the compiler can merge them.
         a_slot = smem_A.index(slot)
         b_slot = smem_B.index(slot)
-        as_slot = smem_AS.index(slot)
+        if A_SCALE_ROWMAJOR:
+            as_slot = smem_AS
+        else:
+            as_slot = smem_AS.index(slot)
         bs_slot = smem_BS.index(slot)
         off_a = load_idx * BLOCK_K_BYTES * A_KMUL
         off_b = load_idx * BLOCK_K_BYTES * 16
         off_as = load_idx * AS_STEP
         off_bs = load_idx * BS_STEP
-        _issue_tdm_stage(a_desc, b_desc, as_desc, bs_desc, a_slot, b_slot, as_slot, bs_slot, off_a, off_b, off_as, off_bs, num_warps, A_SCALE_GROUP == 128)  # fmt: skip
+        _issue_tdm_stage(a_desc, b_desc, as_desc, bs_desc, a_slot, b_slot, as_slot, bs_slot, off_a, off_b, off_as, off_bs, num_warps, A_SCALE_GROUP == 128 and not A_SCALE_ROWMAJOR, A_SCALE_ROWMAJOR)  # fmt: skip
         load_idx += 1
 
     if W_SCALE_BN == 128:
@@ -2699,7 +2777,7 @@ def _gemm_mxfp8_preshuffle_kernel(
         cur_B = depreshuffle_b_raw_to_kn(
             smem_B.index(slot_c), BLOCK_N=BLOCK_SIZE_N, BLOCK_K_BYTES=BLOCK_K_BYTES
         ).load(layout=dot_b_layout)
-        cur_AS = _load_a_scales(smem_AS.index(slot_c), BLOCK_SIZE_M, K_GROUPS, A_PRESHUFFLE_FACTOR, SCALE_KWIDTH, A_SCALE_GROUP, a_scale_layout)  # fmt: skip
+        cur_AS = _load_a_scales_k(smem_AS, slot_c, compute_idx, BLOCK_SIZE_M, K_GROUPS, A_PRESHUFFLE_FACTOR, SCALE_KWIDTH, A_SCALE_GROUP, a_scale_layout, A_SCALE_ROWMAJOR)  # fmt: skip
         cur_BS = _load_b_scales(smem_BS.index(slot_c), BLOCK_SIZE_N, K_GROUPS, PRESHUFFLE_FACTOR, SCALE_KWIDTH, W_SCALE_BN, W_SCALE_KB, b_scale_layout, b_scale_layout4, bs_live)  # fmt: skip
 
         if num_ctas > 1:
@@ -2721,13 +2799,16 @@ def _gemm_mxfp8_preshuffle_kernel(
 
             a_slot = smem_A.index(slot)
             b_slot = smem_B.index(slot)
-            as_slot = smem_AS.index(slot)
+            if A_SCALE_ROWMAJOR:
+                as_slot = smem_AS
+            else:
+                as_slot = smem_AS.index(slot)
             bs_slot = smem_BS.index(slot)
             off_a = load_idx * BLOCK_K_BYTES * A_KMUL
             off_b = load_idx * BLOCK_K_BYTES * 16
             off_as = load_idx * AS_STEP
             off_bs = load_idx * BS_STEP
-            _issue_tdm_stage(a_desc, b_desc, as_desc, bs_desc, a_slot, b_slot, as_slot, bs_slot, off_a, off_b, off_as, off_bs, num_warps, A_SCALE_GROUP == 128)  # fmt: skip
+            _issue_tdm_stage(a_desc, b_desc, as_desc, bs_desc, a_slot, b_slot, as_slot, bs_slot, off_a, off_b, off_as, off_bs, num_warps, A_SCALE_GROUP == 128 and not A_SCALE_ROWMAJOR, A_SCALE_ROWMAJOR)  # fmt: skip
 
             gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * TDM_OPS_PER_STAGE)
             load_idx += 1
@@ -2747,7 +2828,7 @@ def _gemm_mxfp8_preshuffle_kernel(
                 BLOCK_N=BLOCK_SIZE_N,
                 BLOCK_K_BYTES=BLOCK_K_BYTES,
             ).load(layout=dot_b_layout)
-            cur_AS = _load_a_scales(smem_AS.index(next_slot), BLOCK_SIZE_M, K_GROUPS, A_PRESHUFFLE_FACTOR, SCALE_KWIDTH, A_SCALE_GROUP, a_scale_layout)  # fmt: skip
+            cur_AS = _load_a_scales_k(smem_AS, next_slot, compute_idx + 1, BLOCK_SIZE_M, K_GROUPS, A_PRESHUFFLE_FACTOR, SCALE_KWIDTH, A_SCALE_GROUP, a_scale_layout, A_SCALE_ROWMAJOR)  # fmt: skip
             cur_BS = _load_b_scales(smem_BS.index(next_slot), BLOCK_SIZE_N, K_GROUPS, PRESHUFFLE_FACTOR, SCALE_KWIDTH, W_SCALE_BN, W_SCALE_KB, b_scale_layout, b_scale_layout4, bs_live)  # fmt: skip
             compute_idx += 1
 
@@ -2779,7 +2860,7 @@ def _gemm_mxfp8_preshuffle_kernel(
                 BLOCK_N=BLOCK_SIZE_N,
                 BLOCK_K_BYTES=BLOCK_K_BYTES,
             ).load(layout=dot_b_layout)
-            cur_AS = _load_a_scales(smem_AS.index(next_slot), BLOCK_SIZE_M, K_GROUPS, A_PRESHUFFLE_FACTOR, SCALE_KWIDTH, A_SCALE_GROUP, a_scale_layout)  # fmt: skip
+            cur_AS = _load_a_scales_k(smem_AS, next_slot, compute_idx + 1, BLOCK_SIZE_M, K_GROUPS, A_PRESHUFFLE_FACTOR, SCALE_KWIDTH, A_SCALE_GROUP, a_scale_layout, A_SCALE_ROWMAJOR)  # fmt: skip
             cur_BS = _load_b_scales(smem_BS.index(next_slot), BLOCK_SIZE_N, K_GROUPS, PRESHUFFLE_FACTOR, SCALE_KWIDTH, W_SCALE_BN, W_SCALE_KB, b_scale_layout, b_scale_layout4, bs_live)  # fmt: skip
             compute_idx += 1
 
@@ -2848,13 +2929,16 @@ def _gemm_mxfp8_preshuffle_kernel(
             slot = load_idx % NUM_BUFFERS
             a_slot = smem_A.index(slot)
             b_slot = smem_B.index(slot)
-            as_slot = smem_AS.index(slot)
+            if A_SCALE_ROWMAJOR:
+                as_slot = smem_AS
+            else:
+                as_slot = smem_AS.index(slot)
             bs_slot = smem_BS.index(slot)
             off_a = load_idx * BLOCK_K_BYTES * A_KMUL
             off_b = load_idx * BLOCK_K_BYTES * 16
             off_as = load_idx * AS_STEP
             off_bs = load_idx * BS_STEP
-            _issue_tdm_stage(a_desc, b_desc, as_desc, bs_desc, a_slot, b_slot, as_slot, bs_slot, off_a, off_b, off_as, off_bs, num_warps, A_SCALE_GROUP == 128)  # fmt: skip
+            _issue_tdm_stage(a_desc, b_desc, as_desc, bs_desc, a_slot, b_slot, as_slot, bs_slot, off_a, off_b, off_as, off_bs, num_warps, A_SCALE_GROUP == 128 and not A_SCALE_ROWMAJOR, A_SCALE_ROWMAJOR)  # fmt: skip
             for j in gl.static_range(1, NUM_KSUB):
                 cur_A, cur_B, cur_AS, cur_BS = _load_ksub(smem_A, smem_B, smem_AS, smem_BS, slot_c, j, BLOCK_SIZE_M, BLOCK_SIZE_N, KSUB_BYTES, KSUB_GROUPS, NUM_KSUB, A_PRESHUFFLE_FACTOR, PRESHUFFLE_FACTOR, SCALE_KWIDTH, dot_a_layout, dot_b_layout, a_scale_layout, b_scale_layout, A_DATA_PRESHUFFLE)  # fmt: skip
                 if j == NUM_KSUB - 1:

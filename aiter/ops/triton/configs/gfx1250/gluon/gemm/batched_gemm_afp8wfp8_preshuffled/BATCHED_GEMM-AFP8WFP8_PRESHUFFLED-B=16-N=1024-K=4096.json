@@ -1,0 +1,79 @@
+{
+  "DEFAULT_FALLBACK": true,
+  "M_BOUNDS": [
+    1,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384
+  ],
+  "M_LEQ_2048": {
+    "BLOCK_SIZE_M": 512,
+    "BLOCK_SIZE_N": 1024,
+    "BLOCK_SIZE_K": 128,
+    "num_warps": 4,
+    "NUM_BUFFERS": 3,
+    "num_ctas": 8,
+    "GROUP_M": 8,
+    "B2B_WMMA": 1,
+    "NUM_KSUB": 1,
+    "EPI_SPLIT": 2
+  },
+  "M_LEQ_4096": {
+    "BLOCK_SIZE_M": 512,
+    "BLOCK_SIZE_N": 1024,
+    "BLOCK_SIZE_K": 128,
+    "num_warps": 4,
+    "NUM_BUFFERS": 3,
+    "num_ctas": 8,
+    "GROUP_M": 8,
+    "B2B_WMMA": 1,
+    "NUM_KSUB": 1,
+    "EPI_SPLIT": 2
+  },
+  "M_LEQ_8192": {
+    "BLOCK_SIZE_M": 512,
+    "BLOCK_SIZE_N": 1024,
+    "BLOCK_SIZE_K": 128,
+    "num_warps": 4,
+    "NUM_BUFFERS": 3,
+    "num_ctas": 8,
+    "GROUP_M": 8,
+    "B2B_WMMA": 1,
+    "NUM_KSUB": 1,
+    "EPI_SPLIT": 2
+  },
+  "M_LEQ_16384": {
+    "BLOCK_SIZE_M": 512,
+    "BLOCK_SIZE_N": 1024,
+    "BLOCK_SIZE_K": 128,
+    "num_warps": 4,
+    "NUM_BUFFERS": 3,
+    "num_ctas": 8,
+    "GROUP_M": 8,
+    "B2B_WMMA": 1,
+    "NUM_KSUB": 1,
+    "EPI_SPLIT": 2
+  },
+  "any": {
+    "BLOCK_SIZE_M": 1024,
+    "BLOCK_SIZE_N": 1024,
+    "BLOCK_SIZE_K": 128,
+    "num_warps": 4,
+    "NUM_BUFFERS": 3,
+    "num_ctas": 16,
+    "GROUP_M": 8,
+    "B2B_WMMA": 1,
+    "NUM_KSUB": 1,
+    "EPI_SPLIT": 1
+  }
+}
