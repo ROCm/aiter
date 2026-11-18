@@ -763,7 +763,8 @@ _MXFP8_SCALE_MODES = {
 def _mx_recipe_args(recipe):
     """(formats, scale-mode keywords) that select an MX recipe through mha_v4."""
     if recipe == "mxfp8":
-        return (native_fp8_format(),) * 3, _MXFP8_SCALE_MODES
+        # MXFP8 rows are OCP E4M3 on every arch, and native_fp8_format() is FNUZ on gfx942.
+        return (AttentionFormat.FP8_E4M3,) * 3, _MXFP8_SCALE_MODES
     return (_MX_RECIPE_FORMATS[recipe],) * 3, {}
 
 
@@ -2314,13 +2315,16 @@ def test_mha_v4_mx_hd256_matches_attention(
 
 
 @skipif(get_gfx() != "gfx950", reason="gfx950 hd256 GQA validation")
-@parametrize("recipe", ["mxfp4", "mxfp6", "mxfp8"])
-def test_mha_v4_mx_hd256_gqa_matches_repeated_kv(recipe):
+@parametrize("recipe", ["bf16", "mxfp4", "mxfp6", "mxfp8"])
+def test_mha_v4_hd256_gqa_matches_repeated_kv(recipe):
     torch.manual_seed(44)
     q = torch.randn((1, 257, 16, 256), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((1, 320, 4, 256), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    formats, scale_modes = _mx_recipe_args(recipe)
+    if recipe == "bf16":
+        formats, scale_modes = (AttentionFormat.BF16,) * 3, {}
+    else:
+        formats, scale_modes = _mx_recipe_args(recipe)
 
     gqa = mha_v4(q, k, v, *formats, **scale_modes)
     mha = mha_v4(
@@ -2335,19 +2339,132 @@ def test_mha_v4_mx_hd256_gqa_matches_repeated_kv(recipe):
     assert torch.equal(gqa, mha)
 
 
+# The hd256 BF16 row's own paths: dense-short (under two KV tiles), a single key, a partial
+# last query tile and a long anti-phase run with a partial KV tail.
+_BF16_HD256_SHAPES = _HD256_SHAPES + [
+    param(1, 300, 100, 2, id="dense_short"),
+    param(1, 64, 1, 1, id="one_key"),
+    param(1, 513, 1088, 3, id="ragged_q"),
+]
+
+
+def _bf16_hd256_check(q, k, v, valid=None, **kwargs):
+    """Relative O error and max LSE error of hd256 BF16 against float32 attention."""
+    softmax_scale = 256**-0.5
+    out, lse = mha_v4(
+        q,
+        k,
+        v,
+        *(AttentionFormat.BF16,) * 3,
+        softmax_scale=softmax_scale,
+        return_lse=True,
+        **kwargs,
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all() and torch.isfinite(lse).all()
+    o_errors, lse_errors = [], []
+    for b in range(q.shape[0]):
+        n = k.shape[1] if valid is None else valid[b]
+        qb, kb, vb = (t[b : b + 1].float() for t in (q, k[:, :n], v[:, :n]))
+        reference = _dense_reference(qb, kb, vb, n)
+        o_errors.append(
+            ((out[b : b + 1].float() - reference).norm() / reference.norm()).item()
+        )
+        scores = qb.permute(0, 2, 1, 3) @ kb.permute(0, 2, 3, 1)
+        lse_ref = torch.logsumexp(scores * softmax_scale, dim=-1)
+        lse_errors.append((lse[b : b + 1] - lse_ref).abs().max().item())
+    return max(o_errors), max(lse_errors)
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 BF16 validation")
+@parametrize(("batch", "sequence_q", "sequence_k", "heads"), _BF16_HD256_SHAPES)
+def test_mha_v4_bf16_hd256_matches_attention(batch, sequence_q, sequence_k, heads):
+    torch.manual_seed(45)
+    q = torch.randn(
+        (batch, sequence_q, heads, 256), device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        (batch, sequence_k, heads, 256), device="cuda", dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+
+    o_error, lse_error = _bf16_hd256_check(q, k, v)
+
+    # Only P and O are rounded to BF16: a wrong tile or row shows up orders of magnitude above.
+    assert o_error < 0.01, o_error
+    assert lse_error < 0.01, lse_error
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 BF16 validation")
+def test_mha_v4_bf16_hd256_rebases_a_rising_max():
+    """Keys that grow along the sequence lift every row's max by far more than the frozen-max
+    threshold, so the out-of-line rebase runs; random keys never reach it."""
+    torch.manual_seed(46)
+    q = torch.randn((1, 512, 2, 256), device="cuda", dtype=torch.bfloat16)
+    ramp = torch.linspace(1.0, 40.0, 2048, device="cuda").view(1, -1, 1, 1)
+    k = (torch.randn((1, 2048, 2, 256), device="cuda") * ramp).to(torch.bfloat16)
+    v = torch.randn_like(k)
+
+    o_error, lse_error = _bf16_hd256_check(q, k, v)
+
+    assert o_error < 0.01, o_error
+    assert lse_error < 0.01, lse_error
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 BF16 per-batch key lengths")
+@parametrize("lengths", [(300, 137), (512, 64), (1, 511), (65, 65)])
+def test_mha_v4_bf16_hd256_seqlens_k(lengths):
+    torch.manual_seed(47)
+    batch = len(lengths)
+    q = torch.randn((batch, 512, 2, 256), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    seqlens_k = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+
+    o_error, lse_error = _bf16_hd256_check(q, k, v, lengths, seqlens_k=seqlens_k)
+
+    assert o_error < 0.01, o_error
+    assert lse_error < 0.01, lse_error
+
+
+@skipif(get_gfx() != "gfx950", reason="gfx950 hd256 BF16 key splits")
+@parametrize("splits", [2, 3])
+def test_mha_v4_bf16_hd256_kv_splits_match_the_unsplit_call(splits):
+    """BF16 is the only hd256 recipe that splits its keys. Three ranges do not divide the keys,
+    so the shorter ones end through seqlens_k."""
+    torch.manual_seed(48)
+    q = torch.randn((1, 300, 3, 256), device="cuda", dtype=torch.bfloat16)
+    ramp = torch.linspace(1.0, 4.0, 1024, device="cuda").view(1, -1, 1, 1)
+    k = (torch.randn((1, 1024, 3, 256), device="cuda") * ramp).to(torch.bfloat16)
+    v = torch.randn_like(k)
+
+    unsplit = _bf16_hd256_check(q, k, v)
+    split = _bf16_hd256_check(q, k, v, kv_splits=splits)
+
+    assert split[0] < unsplit[0] * 1.1 + 1e-3, (split, unsplit)
+    assert split[1] < unsplit[1] * 1.1 + 2e-2, (split, unsplit)
+
+
 @parametrize(
-    "qk_format",
-    [AttentionFormat.BF16, native_fp8_format()],
+    ("qk_format", "v_format"),
+    [
+        (AttentionFormat.BF16, AttentionFormat.FP8),
+        (native_fp8_format(), native_fp8_format()),
+    ],
 )
-def test_mha_v4_rejects_non_mx_head_dim_256(qk_format):
+def test_mha_v4_rejects_other_head_dim_256_recipes(qk_format, v_format):
     q = torch.empty((1, 256, 1, 256), device="meta", dtype=torch.bfloat16)
-    with expect_raises(ValueError, match="all-MXFP4, all-MXFP6 or MXFP8 only"):
-        mha_v4(q, q, q, qk_format, qk_format, qk_format)
+    with expect_raises(
+        ValueError, match="all-BF16, all-MXFP4, all-MXFP6 or MXFP8 only"
+    ):
+        mha_v4(q, q, q, qk_format, qk_format, v_format)
 
 
 def test_mha_v4_rejects_mixed_mxfp6_head_dim_256():
     q = torch.empty((1, 256, 1, 256), device="meta", dtype=torch.bfloat16)
-    with expect_raises(ValueError, match="all-MXFP4, all-MXFP6 or MXFP8 only"):
+    with expect_raises(
+        ValueError, match="all-BF16, all-MXFP4, all-MXFP6 or MXFP8 only"
+    ):
         mha_v4(
             q, q, q, AttentionFormat.MXFP6, AttentionFormat.MXFP6, AttentionFormat.MXFP4
         )
