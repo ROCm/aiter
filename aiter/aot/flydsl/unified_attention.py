@@ -53,7 +53,7 @@ _OUT_DTYPES = ("bf16", "f16")
 def _prefill_jobs() -> list[dict]:
     # The router's own bucket set: every key it can select needs an artifact.
     # Imported here, not at module level, like the other adapter imports.
-    from aiter.ops.flydsl.unified_attention_kernels import _BATCH_CHUNK_BUCKETS
+    from aiter.ops.flydsl.unified_attention_kernels import _buckets_for
 
     return [
         {
@@ -72,7 +72,7 @@ def _prefill_jobs() -> list[dict]:
         for out_dtype in _OUT_DTYPES
         for shuffled in (False, True)
         for threshold in (6.0, 4.0)
-        for chunks in _BATCH_CHUNK_BUCKETS
+        for chunks in _buckets_for(causal)
         # Rank-major order is causal only; the router never sets it otherwise.
         for il in ((False, True) if causal else (False,))
         # The adapter routes GQA-4/8/16 shapes to packed BN64 (fixed block_m=128).

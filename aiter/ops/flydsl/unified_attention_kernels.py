@@ -68,14 +68,25 @@ _SCAN_LANES = 64
 # batch_chunks is a compile-time unroll of the scan, so it is bucketed to keep the
 # key space (and the AOT list) finite. The kernel tolerates an oversized value:
 # lanes past the batch re-read the last entry and are masked out of the vote.
-# Batches needing more chunks decline to the Triton wrapper (no AOT artifact).
-_BATCH_CHUNK_BUCKETS = (1, 2, 4, 8)
+# Above 32 chunks the kernel spills (VGPR/SGPR scratch) and the scan cost grows
+# with the chunk count, so 32 is the ceiling: B <= 2047.
+_BATCH_CHUNK_BUCKETS = (1, 2, 4, 8, 16, 32)
+_MAX_BATCH_NONCAUSAL = _BATCH_CHUNK_BUCKETS[-1] * _SCAN_LANES - 1
+# Causal batches past this chunk count decline to the Triton wrapper (it has a
+# causal path), so only non-causal enrolls the larger buckets.
+_CAUSAL_MAX_BATCH_CHUNKS = 8
 
 
-def _bucket_batch_chunks(num_seqs: int):
+def _buckets_for(causal: bool) -> tuple:
+    if causal:
+        return tuple(b for b in _BATCH_CHUNK_BUCKETS if b <= _CAUSAL_MAX_BATCH_CHUNKS)
+    return _BATCH_CHUNK_BUCKETS
+
+
+def _bucket_batch_chunks(num_seqs: int, causal: bool):
     """Smallest bucket covering ceil((num_seqs + 1) / 64) chunks, or None."""
     need = -(-(num_seqs + 1) // _SCAN_LANES)
-    for bucket in _BATCH_CHUNK_BUCKETS:
+    for bucket in _buckets_for(causal):
         if need <= bucket:
             return bucket
     return None
@@ -747,14 +758,16 @@ def flydsl_unified_attention(
     if packed_bn64:
         block_m = 128  # fixed by the body; keeps the cache key equal to the AOT job
         # cu_seqlens_q has num_seqs + 1 entries, one per scan lane.
-        batch_chunks = _bucket_batch_chunks(num_seqs)
+        batch_chunks = _bucket_batch_chunks(num_seqs, bool(causal))
         if batch_chunks is None:
-            # Non-causal has no Triton fallback (it raises), so it keeps the exact
-            # chunk count and JITs; causal declines.
-            if not causal:
-                batch_chunks = -(-(num_seqs + 1) // _SCAN_LANES)
-            else:
+            if causal:
                 return None
+            raise ValueError(
+                f"FlyDSL unified attention: non-causal batches are limited to "
+                f"num_seqs <= {_MAX_BATCH_NONCAUSAL}, got {num_seqs}. The Triton "
+                "wrapper has no non-causal path to fall back to, and the packed "
+                "kernel's cu_seqlens_q scan (batch_chunks) spills above 32 chunks."
+            )
         bn64_key = {
             "batch_chunks": batch_chunks,
             # A batch filling q at max_seqlen_q per sequence is uniform: rank-major order
