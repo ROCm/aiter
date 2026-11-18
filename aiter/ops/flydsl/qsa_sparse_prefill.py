@@ -554,6 +554,8 @@ def flydsl_qsa_sparse_prefill(
             and source.data_ptr() < end
         ):
             raise ValueError("out must not overlap Q/K/V, indices, kv_slots or scales")
+    if q.shape[0] == 0:
+        return out
     if fp8 is not None and compute == "bf16":
         k, v = _dequantize(k, v, k_scale, v_scale, kv_slots)
         return flydsl_qsa_sparse_prefill(
@@ -567,8 +569,6 @@ def flydsl_qsa_sparse_prefill(
             out=out,
             batch_invariant=batch_invariant,
         )
-    if q.shape[0] == 0:
-        return out
     with _lock, torch.cuda.device(q.device):
         if _device is not None and _device != q.device:
             raise ValueError("QSA sparse attention supports one GPU per process")
