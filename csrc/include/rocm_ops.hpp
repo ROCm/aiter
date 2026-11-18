@@ -182,7 +182,8 @@ namespace py = pybind11;
     m.def("add_", &aiter_add_, "apply for add_ with transpose and broadcast."); \
     m.def("mul_", &aiter_mul_, "apply for mul_ with transpose and broadcast."); \
     m.def("sub_", &aiter_sub_, "apply for sub_ with transpose and broadcast."); \
-    m.def("div_", &aiter_div_, "apply for div_ with transpose and broadcast.");
+    m.def("div_", &aiter_div_, "apply for div_ with transpose and broadcast."); \
+    m.def("binary_scalar", &binary_scalar, "apply add / sub / mul with a host scalar.");
 #define AITER_UNARY_PYBIND                                                        \
     AITER_SET_STREAM_PYBIND;                                                      \
     m.def(                                                                        \
