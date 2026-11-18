@@ -5,6 +5,80 @@ independent local review. Neither certifies GPU correctness or performance.
 The [review TODO](mono-persistent-review-todo.md) records the selected exact
 power-of-two reciprocal change, its static cost and the unresolved request cost.
 
+## MI400 result: 2026-11-18
+
+Delivery `5446016c426910d96e2b13996586dfe875863da0` was tested in a clean,
+independent checkout on `heliosr-1b114-a07-3`. The machine had recovered from
+the earlier driver block. No kernel, wrapper, test, benchmark or frozen native
+source changed. All 12 frozen symbol hashes and 12 offline builds passed.
+
+The numerical suite passed once without profiling: **45 passed, zero skips**.
+This includes 20 A03 cases and 25 A09 cases. Native/PS bytes, input/weight
+preservation, guards, special BF16 fixtures and all Graph checks passed.
+A03 includes shared `[96,1792]` storage with Q1280/KV512 views and row stride
+1792. A09 includes `[96,2048]`, `[513,2048]` and `[513,2080]`.
+
+Both A09 Graph nodes then passed under rocprofv3. All 96 PS dispatches
+(48 FP8, 48 QAT) used grid `(32768,1,1)` and workgroup `(128,1,1)`:
+**256 TGs x 128 threads**. Actual wrapper JIT IR, ISA, code objects and metadata
+were saved. Actual PS FP8 is 808 B / 21 VGPR; QAT is 844 B / 20 VGPR.
+Both use 68 SGPR, shared=0 and scratch=0. These differ from the earlier local
+binder numbers below, but pass the fixed resource gates. Vector widths, masks,
+loop dependencies and FP modes passed review. No general division, LDS,
+scratch or memory-mask EXEC branch was found. Non-PS has no task loop.
+The raw profiler VGPR/SGPR fields are retained separately from compiler counts.
+
+The one required timing matrix ran without a profiler at 12:01:37--12:01:52 UTC.
+Each row has 15 alternating native/PS trials on the same input pool. Each trial
+uses 10 replays of a 1000-kernel Graph. Hot pool length is 1; rotating pool
+lengths are 523, 196 and 98 for 96, 257 and 513 rows. Each sample is mean
+latency per launch. Decisions use the rules in section 3, before rounding.
+
+| Path | Rows | Input reuse | Native median / P10 / P90 (us) | PS median / P10 / P90 (us) | PS/native | Decision |
+| --- | ---: | --- | ---: | ---: | ---: | --- |
+| FP8 | 96 | hot | 1.386007 / 1.374745 / 1.414506 | 1.403738 / 1.387628 / 1.428432 | 1.012792 | inconclusive |
+| FP8 | 96 | rotating | 1.717423 / 1.692109 / 1.730208 | 1.688139 / 1.679708 / 1.709433 | 0.982949 | inconclusive |
+| FP8 | 257 | hot | 1.480265 / 1.474389 / 1.548339 | 2.034931 / 1.946374 / 2.066170 | 1.374707 | regression |
+| FP8 | 257 | rotating | 2.087570 / 2.077553 / 2.207312 | 2.492392 / 2.398856 / 2.518862 | 1.193920 | regression |
+| FP8 | 513 | hot | 1.663527 / 1.658817 / 1.695893 | 3.053400 / 2.986177 / 3.085353 | 1.835498 | regression |
+| FP8 | 513 | rotating | 2.738817 / 2.608372 / 2.744959 | 3.523660 / 3.503407 / 3.546427 | 1.286563 | regression |
+| QAT | 96 | hot | 1.252347 / 1.237009 / 1.256956 | 1.227174 / 1.225645 / 1.228566 | 0.979899 | improvement |
+| QAT | 96 | rotating | 1.603641 / 1.601850 / 1.604787 | 1.581236 / 1.578911 / 1.582523 | 0.986028 | improvement |
+| QAT | 257 | hot | 1.315974 / 1.312891 / 1.571942 | 1.714587 / 1.689177 / 1.753119 | 1.302903 | regression |
+| QAT | 257 | rotating | 1.692194 / 1.689980 / 1.694664 | 2.343633 / 2.328332 / 2.364742 | 1.384967 | regression |
+| QAT | 513 | hot | 1.421809 / 1.418243 / 1.425017 | 2.465512 / 2.430558 / 2.489546 | 1.734067 | regression |
+| QAT | 513 | rotating | 1.793473 / 1.792476 / 1.795698 | 3.187413 / 3.182001 / 3.196832 | 1.777229 | regression |
+
+**FP8 fails:** four regressions and two inconclusive rows.
+**QAT fails:** four regressions and two improvements. Neither path passes all
+six rows. No rerun, tuning or ablation matrix followed. A03 performance was
+not repeated in this A09 FP8/QAT handoff. Historical A03 timings do not certify
+this run. No upstream push was made because the requested success gate failed.
+
+The GPU was ordinal 0, gfx1250/wave32, with 256 CUs. The image digest was
+`sha256:6a40615d965ec6088217e5682a866875e2c218365c7f135ecb83c4907d6bf2dd`.
+It used PyTorch `2.14.0+rocm10.3.0a20261103-bkc.20261105`, HIP `7.18.26435`,
+Triton `3.9.0+gitb7196d97` and amdgpu `7.1.0.31300009`.
+Packages, clocks and power settings were preserved. Performance mode was AUTO.
+The 100 ms process log observed only the benchmark GPU process during timing.
+Seven metric samples at about 2.177 s intervals recorded GFX 2213--2240 MHz,
+HBM 1900 MHz and socket power 1038--1177 W. No sampled thermal or power
+throttle was active. These samples cannot exclude shorter unobserved events.
+
+The measured regression grows when P256 workers must repeat tasks. There are
+192, 514 and 1026 tiles at the tested row counts. PS workers execute up to
+one, three and five serial iterations; native dispatches one TG per tile.
+This is a concrete scheduling and loop-cost difference. The timing pattern is
+consistent with that cost, but does not isolate its cycle contribution.
+Cache traffic, scale-store request combining, residency and runtime retry state
+remain unmeasured. Smaller code and fewer VGPRs do not establish a speedup.
+
+Full logs, JSON/XML, maps, JIT artifacts and private review are on the runner at
+`/home/weizhu15/workspace/mono-acceptance-5446016c-resumed/`.
+Start with `REPORT.zh.md`, `performance.json`, `performance-decisions.json`,
+`jit-launch-gate.json`, `load-audit.json` and `logs/`. Memory-sanitizer coverage
+and full mono ABI/DEV/HT/reserved-register/join/model work remain unverified.
+
 ## Source and local status
 
 Selected code commit is `0d54cbf3e7b16ac7563c34df6e5d744945f6a495`.
@@ -52,9 +126,10 @@ The unchanged external CPU checker was copied into private workspace artifacts
 and run there. It checked 65,536 BF16 bit patterns against 165 scale codes:
 10,813,440 pairs, with zero post-clamp FP8 or QAT byte mismatches. Pre-clamp
 bits match except that NaNs are compared as both NaN. This checks CPU algebra
-and reference semantics; it is not GPU numerical proof. The new GPU fixtures
-are implemented but have not run. Full worker logs, IR/ISA, code objects,
-source manifest, patch and dependency review are in private `build/a09-local/`.
+and reference semantics; it is not GPU numerical proof. At the local handoff,
+the new GPU fixtures had not run. They passed in the hardware result above.
+Full worker logs, IR/ISA, code objects, source manifest, patch and dependency
+review are in private `build/a09-local/`.
 
 The outer runner's fixed command remains:
 
@@ -68,8 +143,9 @@ The outer runner executed this command successfully. Claude independently
 reviewed the recorded result and the exact candidate, and returned `approve`
 with no blockers. Its two advisory items are handled in this guide: special-value
 failure triage below and line wrapping. No reviewed kernel or test bytes changed
-after approval. This approval covers local readiness only; GPU correctness,
-actual JIT, launch and performance remain unverified.
+after approval. This approval covers local readiness only. The separate
+hardware result above records GPU correctness, actual JIT/launch and the
+failed performance gate.
 Never use the CPU collection harness to run numerical tests or bypass the GPU
 gate below.
 

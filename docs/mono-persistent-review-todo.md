@@ -3,8 +3,11 @@
 Both success conditions remain required: fixed P256 execution and performance
 better than, or non-regressing against, frozen original native. The selected
 candidate passes worker checks and the fixed outer acceptance. Claude Opus 5.5
-independent review returned `approve` with no blockers. GPU correctness, actual
-JIT/launch and performance remain UNVERIFIED.
+independent review returned `approve` with no blockers. The recovered MI400 run
+at delivery
+`5446016c426910d96e2b13996586dfe875863da0` passed all 45 GPU tests and actual
+A09 JIT/P256 checks. Both FP8 and QAT failed performance acceptance. See the
+[measured matrix](mono-persistent-validation.md#mi400-result-2026-11-18).
 
 ## 1. Which arithmetic change is selected, and is it exact?
 
@@ -55,8 +58,8 @@ finite-only oracle assertions remain; the new nonfinite data skips that oracle.
 
 ## 2. Does the static reduction justify this candidate?
 
-Yes for local selection; runtime speed is still unknown. The actual selected
-source, hashes, production HEAD and patch baseline are in the
+Yes for local selection. The later hardware run failed the performance gate.
+The actual selected source, hashes, production HEAD and patch baseline are in the
 [validation guide](mono-persistent-validation.md#source-and-local-status).
 Selected code is `0d54cbf3e7b16ac7563c34df6e5d744945f6a495`; its independent
 review is run `20261118-155450-63f32955`. The earlier candidate is historical.
@@ -93,8 +96,9 @@ non-owner offsets. This does not establish a fourfold change in issued stores.
 The explicit layout removed the old PS's 32 B dynamic LDS and two TG syncs;
 frozen FP8 native has one such sync. QAT already has no LDS-removal gain.
 At 96 rows there are only 192 tasks, so no worker amortizes multiple iterations.
-The arithmetic reduction is concrete; request combining, 8 B/wave service
-cost, cache traffic and runtime performance are unmeasured.
+The arithmetic reduction is concrete. Request combining, 8 B/wave service
+cost and cache traffic remain unmeasured. Runtime performance is measured in
+the validation guide; the smaller code did not prevent native regressions.
 
 The new ISA was reviewed for global masks, zero filling, single-writer masks,
 SCC/VCC, descriptor SGPRs and source VGPRs. FP8 PS preserves the owner predicate
@@ -131,11 +135,17 @@ retain the line-by-line review of this build, not the previous line numbers.
 - [x] Claude Opus 5.5 independent arithmetic/code review: approve, no blockers.
   This certifies bounded local readiness only. R1 special-value failure triage
   is in the guide; R2 line wrapping is fixed. Kernel/test bytes remain exact.
-- [ ] GPU: all 45 tests pass, zero skips, byte/guard mismatches or GPU errors.
+- [x] GPU: all 45 tests passed, zero skips, byte/guard mismatches or GPU errors.
   `[513,2048]` has 1026 tasks; two workers run five iterations.
   `[513,2080]` has 1043 tasks; its last task has one valid group.
-- [ ] GPU: save actual wrapper JIT and confirm 256 TGs x 128 threads for PS.
-- [ ] GPU: pass native-versus-PS performance acceptance for both FP8 and QAT.
+- [x] GPU: actual wrapper JIT saved. Both A09 Graph trace nodes passed.
+  All 48 FP8 and 48 QAT PS dispatches used 256 TGs x 128 threads.
+  Actual PS FP8 is 808 B / 21 VGPR; QAT is 844 B / 20 VGPR.
+  Both use 68 SGPR, shared=0 and scratch=0. Actual ISA gates passed.
+- [ ] GPU performance acceptance failed. FP8 has four regressions and two
+  inconclusive rows. QAT has four regressions and two improvements.
+  Each path must pass all six rows. The one 15-trial matrix is complete.
+  No automatic rerun or tuning followed. No upstream push was made.
 
 A03 `7108dbec079595026f76b7b1b8e082fe1669796d`, its wrapper, A09's wrapper,
 benchmark, compiler, frozen native/manifest and submodule declarations remain
@@ -147,9 +157,12 @@ candidate or its QAT changes.
 
 ## 4. What is the one hardware handoff?
 
-Follow [the validation guide](mono-persistent-validation.md). The outer local
-acceptance and Claude review are complete. Use the supplied source and existing
-ROCm environment. Run all 45 numerical tests without profiling. Then trace
+The handoff below was executed once after machine recovery. Its full matrix
+and environment are in [the validation guide](mono-persistent-validation.md).
+The failed performance gate is final for this run. Do not repeat the matrix
+automatically. The outer local acceptance and Claude review are complete.
+Use the supplied source and existing ROCm environment. Run all 45 numerical
+tests without profiling. Then trace
 only `test_graph_replay_changes_inputs[a09]` and `[a09-five-iterations]`.
 A failed or unavailable profiler leaves launch acceptance pending, preserves
 numerical results and stops timing. Save actual JIT and check P256 first.
