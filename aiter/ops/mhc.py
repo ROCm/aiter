@@ -1079,10 +1079,31 @@ def mhc_post_pre_gram_gfx950(
 # fused GEMM and mhc_pre_big_fuse_rmsnorm. Keyed by (hidden_size, w_preshuffle_bf16);
 # a row (first m, last m, split_k, parts) gives the producer's hidden slabs and the
 # finisher's hidden segments per row for those row counts. Every row is a measurement
-# on MI350X against the existing path; row counts in no row keep the existing path.
+# on MI350X against the fastest setting of the existing path, with the inputs in the
+# cache and with rotating inputs; row counts in no row keep the existing path. The
+# launcher has kernels with the sizes of these rows at compile time.
 MHC_GRAM_M_MAX_GFX950 = 1023
 MHC_GRAM_CONFIG_GFX950_256 = {
-    (7168, False): ((64, 64, 56, 4),),
+    (4096, False): (
+        (1, 128, 64, 2),
+        (129, 640, 32, 2),
+        (641, 768, 16, 1),
+        (769, 1008, 32, 1),
+    ),
+    (4096, True): (
+        (65, 400, 32, 2),
+        (401, 512, 16, 2),
+        (513, 624, 32, 2),
+    ),
+    (7168, False): (
+        (1, 32, 112, 4),
+        (33, 704, 56, 2),
+    ),
+    (7168, True): (
+        (33, 208, 56, 4),
+        (257, 352, 56, 2),
+        (577, 640, 56, 2),
+    ),
 }
 
 

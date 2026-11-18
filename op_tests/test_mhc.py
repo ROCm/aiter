@@ -1242,12 +1242,18 @@ def mhc_gram_route_available(m):
 
 
 def mhc_post_pre_gram_route(
-    *inputs, split_k, parts, w_preshuffle_bf16=False, table_m=None, **extra_args
+    *inputs,
+    split_k=None,
+    parts=None,
+    w_preshuffle_bf16=False,
+    table_m=None,
+    **extra_args,
 ):
-    """The default mhc_fused_post_pre call with the table of the Gram route replaced
-    by one row, (split_k, parts) for ``table_m`` rows (default: the rows of this
-    call), so that the call does not depend on the tuned table. Returns the outputs
-    and the (split_k, parts) of every launch of the Gram kernels."""
+    """The default mhc_fused_post_pre call. With ``split_k`` and ``parts`` the table of
+    the Gram route is replaced by one row, (split_k, parts) for ``table_m`` rows
+    (default: the rows of this call), so that the call does not depend on the tuned
+    table; without them the tuned table is used. Returns the outputs and the
+    (split_k, parts) of every launch of the Gram kernels."""
     from aiter.ops import mhc as mhc_ops
 
     m, hidden_size = inputs[0].shape
@@ -1260,12 +1266,11 @@ def mhc_post_pre_gram_route(
         launches.append((args[4].size(0), args[18]))
         return gram_kernels(*args, **kwargs)
 
+    table = mhc_ops.MHC_GRAM_CONFIG_GFX950_256
+    if split_k is not None:
+        table = {key: ((table_m, table_m, split_k, parts),)}
     with (
-        patch.object(
-            mhc_ops,
-            "MHC_GRAM_CONFIG_GFX950_256",
-            {key: ((table_m, table_m, split_k, parts),)},
-        ),
+        patch.object(mhc_ops, "MHC_GRAM_CONFIG_GFX950_256", table),
         patch.object(mhc_ops, "mhc_post_pre_gram_gfx950", record),
     ):
         outs = aiter.mhc_fused_post_pre(
@@ -1274,18 +1279,11 @@ def mhc_post_pre_gram_route(
     return outs, launches
 
 
-@benchmark()
-def test_mhc_post_pre_gram_dispatch(
-    m, hidden_size, hc_mult, slab, parts, w_preshuffle_bf16, dtype=dtypes.bf16, seed=0
-):
-    """gfx950 with 256 CUs: the Gram route of the default call with fused RMSNorm.
-
-    With a table row for m rows (one producer split per ``slab`` hidden elements,
-    ``parts`` finisher segments per row) the call must launch the Gram kernels once
-    with that configuration; with the row moved to m + 1 rows it must not launch
-    them. Weights and mixes are random and differ per row, so a projection or a mix
-    read from the wrong row, slab or segment fails the comparison with the reference.
-    """
+def mhc_gram_case(m, hidden_size, hc_mult, w_preshuffle_bf16, dtype, seed):
+    """Inputs of one Gram route test (the call's tensors, its keyword arguments) and
+    the reference outputs. Weights and mixes are random and differ per row, so a
+    projection or a mix read from the wrong row, slab or segment fails the comparison
+    with the reference."""
     from aiter.ops import mhc as mhc_ops
 
     hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
@@ -1309,28 +1307,82 @@ def test_mhc_post_pre_gram_dispatch(
     }
     inputs = (layer_input, residual_in, post_layer_mix, comb_res_mix)
     refs = mhc_post_pre_ref(*inputs, fn, hc_scale, hc_base, **extra_args)
-    route = {
-        "split_k": hidden_size // slab,
-        "parts": parts,
-        "w_preshuffle_bf16": w_preshuffle_bf16,
-    }
     inputs += (
         mhc_ops.mhc_shuffle_fn(fn) if w_preshuffle_bf16 else fn,
         hc_scale,
         hc_base,
     )
-    outs, launches = mhc_post_pre_gram_route(*inputs, **route, **extra_args)
-    assert launches == [(route["split_k"], parts)], launches
-    _, launches = mhc_post_pre_gram_route(*inputs, **route, table_m=m + 1, **extra_args)
-    assert not launches, launches
+    return inputs, extra_args, refs
+
+
+def mhc_gram_errors(refs, outs, msg, tol_err_ratio=1e-4):
+    """Compare the four outputs with the reference; the layer output's mismatch ratio.
+    The default bound is for the Gram kernels: one wrong row of the largest row count
+    here is 1e-3 of the elements."""
     ret = {}
     for what, ref, out in zip(
         ("post_mix", "comb_mix", "layer_input", "next_residual"), refs, outs
     ):
-        # One wrong row of the largest row count here is 1e-3 of the elements.
-        err = assertAllclose(ref, out, tol_err_ratio=1e-4, msg=f"gram dispatch/{what}")
+        err = assertAllclose(ref, out, tol_err_ratio=tol_err_ratio, msg=f"{msg}/{what}")
         if what == "layer_input":
             ret["err"] = err
+    return ret
+
+
+@benchmark()
+def test_mhc_post_pre_gram_dispatch(
+    m, hidden_size, hc_mult, slab, parts, w_preshuffle_bf16, dtype=dtypes.bf16, seed=0
+):
+    """gfx950 with 256 CUs: the Gram route of the default call with fused RMSNorm.
+
+    With a table row for m rows (one producer split per ``slab`` hidden elements,
+    ``parts`` finisher segments per row) the call must launch the Gram kernels once
+    with that configuration; with the row moved to m + 1 rows it must not launch
+    them.
+    """
+    inputs, extra_args, refs = mhc_gram_case(
+        m, hidden_size, hc_mult, w_preshuffle_bf16, dtype, seed
+    )
+    route = {
+        "split_k": hidden_size // slab,
+        "parts": parts,
+        "w_preshuffle_bf16": w_preshuffle_bf16,
+    }
+    outs, launches = mhc_post_pre_gram_route(*inputs, **route, **extra_args)
+    assert launches == [(route["split_k"], parts)], launches
+    _, launches = mhc_post_pre_gram_route(*inputs, **route, table_m=m + 1, **extra_args)
+    assert not launches, launches
+    return mhc_gram_errors(refs, outs, "gram dispatch")
+
+
+@benchmark()
+def test_mhc_post_pre_gram_table(
+    m, hidden_size, hc_mult, w_preshuffle_bf16, dtype=dtypes.bf16, seed=0
+):
+    """gfx950 with 256 CUs: the tuned table of the Gram route.
+
+    At a row count of MHC_GRAM_CONFIG_GFX950_256 the default call must launch the
+    Gram kernels once with that row's configuration; at any other row count it must
+    not launch them. The outputs are compared with the reference: on the Gram route
+    with the bound of the dispatch test, on the existing path with the bound that the
+    other candidates of this file use.
+    """
+    from aiter.ops import mhc as mhc_ops
+
+    inputs, extra_args, refs = mhc_gram_case(
+        m, hidden_size, hc_mult, w_preshuffle_bf16, dtype, seed
+    )
+    row = mhc_ops._mhc_gram_config_gfx950_256(m, hidden_size, w_preshuffle_bf16)
+    outs, launches = mhc_post_pre_gram_route(
+        *inputs, w_preshuffle_bf16=w_preshuffle_bf16, **extra_args
+    )
+    assert launches == ([tuple(row)] if row else []), (launches, row)
+    ret = {"route": "gram" if row else "existing"}
+    if row:
+        ret["split_k"], ret["parts"] = row
+    ret.update(
+        mhc_gram_errors(refs, outs, "gram table", tol_err_ratio=1e-4 if row else 0.05)
+    )
     return ret
 
 
@@ -1756,6 +1808,28 @@ if not args.hc_head:
             )
         ]
         print_json_table("mhc_post_pre gram dispatch summary", df)
+        # The tuned table: the first and the last row count of every row, and the row
+        # counts just outside it (in the next row, or on the existing path).
+        df = []
+        for (hidden_size, packed), rows in sorted(
+            mhc_ops.MHC_GRAM_CONFIG_GFX950_256.items()
+        ):
+            listed = {m for m_first, m_last, *_ in rows for m in (m_first, m_last)}
+            nearby = {
+                m for m_first, m_last, *_ in rows for m in (m_first - 1, m_last + 1)
+            }
+            limit = mhc_ops.MHC_GRAM_M_MAX_GFX950
+            for m in sorted(listed | {m for m in nearby if 0 < m <= limit}):
+                df.append(
+                    test_mhc_post_pre_gram_table(
+                        m=m,
+                        hidden_size=hidden_size,
+                        hc_mult=4,
+                        w_preshuffle_bf16=packed,
+                        seed=args.seed,
+                    )
+                )
+        print_json_table("mhc_post_pre gram table summary", df)
     else:
         aiter.logger.warning(
             "skip mhc_post_pre gram dispatch cases: unmasked 256-CU gfx950 only"
