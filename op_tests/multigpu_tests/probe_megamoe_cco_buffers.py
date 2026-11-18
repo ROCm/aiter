@@ -94,11 +94,11 @@ def _make_plan(layout, buffers, model, tokens, world, gpus, quant):
             if region.offset < end or region.offset % region.alignment:
                 raise AssertionError(f"overlap or misalignment: {region}")
             end = region.offset + region.nbytes
-        if (
-            end > window.registered_bytes
-            or window.registered_bytes > window.allocation_bytes
-        ):
+        bound = window.registered_bytes if window.cco else window.allocation_bytes
+        if end > bound or window.registered_bytes > window.allocation_bytes:
             raise AssertionError(f"region outside window: {window.name}")
+        if not window.cco and (window.registered_bytes or window.rdma_register):
+            raise AssertionError("private storage must not be registered")
         if (
             window.rdma_register
             and window.registered_bytes > buffers.MAX_CCO_RAIL_MR_BYTES
@@ -119,6 +119,7 @@ def _summary(plan):
                 "allocation_MiB": w.allocation_bytes // 2**20,
                 "registered_MiB": w.registered_bytes // 2**20,
                 "rdma": w.rdma_register,
+                "cco": w.cco,
                 "regions": len(w.regions),
             }
             for w in plan.windows
@@ -204,6 +205,8 @@ def _transfer_launcher(qp, *, rail_team=False, caller_ordered=False):
 def _check_local(storage, rank, lane, generation):
     samples = []
     for window in storage.plan.windows:
+        if not window.cco:
+            continue  # Private GMM1 output has no LSA peer mapping.
         for region in window.regions:
             depth = region.parity_depth if region.shape[0] == region.parity_depth else 1
             plane = region.nbytes // depth
@@ -266,10 +269,10 @@ def _address_launcher(addressing, region_count):
             handle, offset = addressing.region_window_address(table, region, parity)
             dst = output + fx.Int64(entry) * fx.Int64(32)
             store_address(dst, addressing.region_local_address(table, region, parity))
-            store_address(
-                dst + fx.Int64(8),
-                addressing.region_lsa_address(table, region, parity, peer),
-            )
+            lsa = fx.Int64(0)
+            if handle != fx.Int64(0):
+                lsa = addressing.region_lsa_address(table, region, parity, peer)
+            store_address(dst + fx.Int64(8), lsa)
             store_address(dst + fx.Int64(16), handle)
             store_address(dst + fx.Int64(24), offset)
 
@@ -301,9 +304,9 @@ def _check_device_addresses(storage, lane):
                 expected.append(
                     (
                         local,
-                        local + (peer - lane) * dev.per_rank_size,
+                        local + (peer - lane) * dev.per_rank_size if spec.cco else 0,
                         window.handle,
-                        offset,
+                        offset if spec.cco else parity * region.plane_bytes,
                     )
                 )
     observed = result.cpu()

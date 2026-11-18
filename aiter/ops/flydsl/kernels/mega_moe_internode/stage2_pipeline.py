@@ -44,7 +44,7 @@ def compile_stage2_pipeline(k1_kw: dict, k2_kw: dict, k2_ctas: int):
              arg_output_bf16: fx.Int64, arg_scratch: fx.Int64, local_tokens: fx.Int32,
              arg_expert_count: fx.Int64, arg_sd_send: fx.Int64, arg_sd_tb: fx.Int64,
              arg_sd_plan: fx.Int64, arg_sd_cdone: fx.Int64, arg_tr_mcnt: fx.Int64,
-             arg_tr_sdprog: fx.Int64, lds_ptr=None, grp_sync=None, gen_value=None):
+             arg_tr_sdprog: fx.Int64, lds_ptr=None, grp_sync=None, gen_value=None, plan_ctx=None):
     # fmt: on
         bx = fx.Int32(fx.block_idx.x)
         k2_call = functools.partial(k2_body, gen_value=gen_value)
@@ -95,7 +95,7 @@ def compile_stage2_pipeline(k1_kw: dict, k2_kw: dict, k2_ctas: int):
                 dev_comm=dev_comm, arg_sd_send=arg_sd_send, arg_sd_tb=arg_sd_tb,
                 arg_sd_plan=arg_sd_plan, arg_sd_cdone=arg_sd_cdone,
                 arena_win=arena_win, arena_ptr=arena_ptr, lds_ptr=lds_ptr,
-                grp_sync=grp_sync, gen_value=gen_value)
+                grp_sync=grp_sync, gen_value=gen_value, plan_ctx=plan_ctx)
         if bx < fx.Int32(k2_ctas):
             k2_call(dev_comm, arena_win, arena_ptr, arg_output_bf16, arg_scratch,
                     local_tokens, bx, fx.Int32(k2_ctas), part=2 if remote_first else 0)

@@ -26,10 +26,16 @@ from .. import communication_ops_utils as comm
 from . import communication as comm2
 from .buffer_addressing import region_local_address
 from .mega_moe_internode_config import STAGE2_PART1_PROBE
+from .stage2 import gemm2_mode_key
 from .stage2_pipeline import compile_stage2_pipeline
 
 # Ready-word poll back-off (s_sleep units) of the hand-off and GEMM2 group waits.
 SK_POLL = int(__import__("os").environ.get("SK_POLL_SLEEP") or 32)
+# CTAs that skip GMM1 can plan the SDMA layout while the compute CTAs run
+# GMM1. AITER_MEGAMOE_EARLY_SDMA_PLAN=0 restores the previous planning split.
+SK_EARLY_PLAN = (
+    __import__("os").environ.get("AITER_MEGAMOE_EARLY_SDMA_PLAN", "1") == "1"
+)
 
 _CACHE = {}
 
@@ -65,9 +71,10 @@ def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int)
         + k1.kernel_name[len("megamoe_") :]
         + "__"
         + k2.kernel_name[len("megamoe_") :]
-        + f"_k2c{pipeline.k2_ctas}"
+        + (f"_k2c{pipeline.k2_ctas}" if pipeline.k2_ctas != grid else "")
         + ("_p1q" if remote_first and STAGE2_PART1_PROBE else "")
         + f"_ps{SK_POLL}_xi"
+        + ("_epl" if SK_EARLY_PLAN else "")
     )
 
     @fx.struct
@@ -97,6 +104,12 @@ def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int)
         gl = Vec(fx.make_view(fx.recast_iter(fx.Int64, lds), fx.make_layout(2, 1)).load())
         gen = fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(gl[0]).ir_value()))
         eos_seen = fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(gl[1]).ir_value()))
+        plan_ctx = None
+        if const_expr(SK_EARLY_PLAN):
+            pw = Vec(fx.make_view(fx.add_offset(fx.recast_iter(fx.Int32, lds), 4),
+                                  fx.make_layout(2, 1)).load())
+            plan_ctx = (fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(pw[0]).ir_value())),
+                        fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(pw[1]).ir_value())))
         if fx.Int32(gpu.thread_id("x")) == fx.Int32(0):
             # Hand-off (see the module docstring): CTAs that did not pass
             # Stage1's EOS spin wait until its tables are final.
@@ -130,7 +143,8 @@ def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int)
                       arg_scratch, local_tokens, arg_expert_count, arg_sd_send, arg_sd_tb,
                       arg_sd_plan, arg_sd_cdone, arg_tr_mcnt, arg_tr_sdprog,
                       lds_ptr=lds, gen_value=gen,
-                      grp_sync=(gsync["sync_off"], gsync["sync_plane"], gsync["tile_group"]))
+                      grp_sync=(gsync["sync_off"], gsync["sync_plane"], gsync["tile_group"]),
+                      plan_ctx=plan_ctx)
 
     # fmt: off
     @flyc.jit
@@ -186,6 +200,7 @@ def run_single_kernel(
         tuple(sorted(k1_compile.items())),
         tuple(sorted(k2_compile.items())),
         int(k2_ctas),
+        gemm2_mode_key(),
     )
     launch = _CACHE.get(key)
     if launch is None:

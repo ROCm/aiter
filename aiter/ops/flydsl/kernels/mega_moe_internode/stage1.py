@@ -85,11 +85,21 @@ _COMPILED: dict = {}
 
 def compile_stage1(layout: Stage1ArenaLayout, stage2_layout, **kwargs):
     """Compile (or reuse) one EP16 Stage-1 persistent-kernel shape specialization."""
+    env = __import__("os").environ
     key = (
         repr(layout),
         repr(stage2_layout),
         _rail_ccqe(),
         tuple(sorted(kwargs.items())),
+        tuple(
+            env.get(k)
+            for k in (
+                "S1_PACK_RA",
+                "AITER_MEGAMOE_FAN2_ARRIVAL_ORDER",
+                "SK_G2_EARLY",
+                "SK_GR_COARSE",
+            )
+        ),
     )
     launcher = _COMPILED.get(key)
     if launcher is None:
@@ -243,6 +253,17 @@ def _compile_stage1(
         layout.source_capacity * layout.max_routes_per_token_per_rank
     )
     COMPACT_INPUT = layout.input_capacity < layout.source_capacity
+    # Experiment hook: one 64-bit atomic reserves the batch routes (low word) and
+    # its compact input slots (high word) instead of one atomic per token after
+    # the route vote. Every hit token carries >= 1 route and input_capacity ==
+    # route_capacity here, so an accepted batch's slots stay below capacity even
+    # though rejected batches also advance the input word.
+    PACK_RA = (
+        BOUNDED_RECV
+        and COMPACT_INPUT
+        and layout.input_capacity == layout.route_capacity
+        and __import__("os").environ.get("S1_PACK_RA", "0") == "1"
+    )
     COMM_CTAS = GPUS_PER_NODE
     PRODUCER_FIRST = COMM_CTAS
     PRODUCER_CTAS = min(128, MAX_TOKENS)
@@ -339,6 +360,21 @@ def _compile_stage1(
     if data_send_ctas and (WAVES != 8 or SEND_END > worker_blocks):
         raise ValueError("copy roles require eight waves and a resident grid")
     F2S = int(fan2_shards)
+    # With more than one remote node, fan2 takes the nodes in arrival order (see
+    # the fan2 loop): EP32 TPR128 a8w4 -1.5~3.7% min-rank, a4w4 even.
+    # AITER_MEGAMOE_FAN2_ARRIVAL_ORDER=0 restores the fixed RECV_ORDER.
+    F2_DYN = NODES > 2 and (
+        __import__("os").environ.get("AITER_MEGAMOE_FAN2_ARRIVAL_ORDER", "1") == "1"
+    )
+    # Experiment hook (single kernel): tickets that skip GMM1 and start GEMM2 early.
+    G2_EARLY = int(__import__("os").environ.get("SK_G2_EARLY") or 0)
+    if not 0 <= G2_EARLY < worker_blocks - COMPUTE_FIRST:
+        raise ValueError("SK_G2_EARLY must leave at least one original GMM1 consumer")
+    # Experiment hook (single kernel): publish GMM1 completion once per CTA
+    # (store drain + L2 write-back + one count when it leaves GMM1; the last CTA
+    # stamps every group's ready word) instead of write-through h1 and a drain,
+    # barrier and count after every job.
+    GR_COARSE = __import__("os").environ.get("SK_GR_COARSE", "0") == "1"
     if F2S and F2S > fanout_ctas_per_dest - 1:
         raise ValueError("fan2_shards must be <= fanout_ctas_per_dest - 1")
     _FIN_TICKET = local_rank
@@ -368,6 +404,13 @@ def _compile_stage1(
     max_route_tiles = layout.max_route_tiles
     max_tiles_per_expert = layout.max_tiles_per_expert
     GR_N = max_route_tiles // G + 1  # h1_grp_sync words per half (see layout)
+    N_COMPUTE = (
+        (worker_blocks - COMPUTE_FIRST) + len(_XC) - (G2_EARLY if group_ready else 0)
+    )
+    # Tickets that skip GMM1 (single kernel): they reach Stage2 first and can
+    # plan the SDMA layout while the others run GMM1 (see single_kernel.py).
+    _NC_BASE = [t for t in range(COMPUTE_FIRST) if t not in _XC]
+    N_NONCOMPUTE = len(_NC_BASE) + (G2_EARLY if group_ready else 0)
     # GMM1 N width is arena.block_n (256; 128 was slower for every tested shape).
     # Count jobs using GNB.
     GBN = BN
@@ -482,6 +525,10 @@ def _compile_stage1(
         + ("_slg" if split_local else "_nsl")
         + (f"_w{WAVES}" if WAVES != 4 else "")
         + ("_gr_sg" if group_ready else "")
+        + ("_f2d" if F2_DYN else "")
+        + (f"_g2e{G2_EARLY}" if G2_EARLY and group_ready else "")
+        + ("_grc" if GR_COARSE and group_ready else "")
+        + ("_pra" if PACK_RA else "")
         + ("_c1" if buffer_regions else "")
         + (
             f"_vl{gda_peer_stride}l{gda_peer_lane}b{lsa_peer_base}"
@@ -754,6 +801,14 @@ def _compile_stage1(
                         ),
                         fx.Int32(0),
                     )
+                    if const_expr(PACK_RA):
+                        buffer_ops.buffer_store(
+                            fx.Int32(0),
+                            buffer_ops.create_buffer_resource_from_addr(
+                                local_addr("recv_route_count")
+                            ),
+                            fx.Int32(1),
+                        )
                 if const_expr(COMPACT_INPUT):
                     buffer_ops.buffer_store(
                         fx.Int32(0),
@@ -1175,6 +1230,8 @@ def _compile_stage1(
         # Arrival tickets have already been read into registers. Reuse one
         # dword of the reserved 16-dword prefix for the batch acceptance vote.
         _GB_ACCEPT = 4
+        # PACK_RA: the batch's compact input base, also in the reserved prefix.
+        _GB_INBASE = 7
         _GB_CNT = 16
         _GB_BASE = _GB_CNT + LOCAL_EXPERTS
         _GB_HIT = _GB_BASE + LOCAL_EXPERTS
@@ -1289,11 +1346,29 @@ def _compile_stage1(
                     batch_routes = fx.Int32(0)
                     for ex in range_constexpr(LOCAL_EXPERTS):
                         batch_routes += _gb_ld(fx.Int32(_GB_CNT + ex))
-                    prev_routes = fx.Int32(
-                        comm.atomic_add_system(
-                            _peer_addr(dest, "recv_route_count"), batch_routes
+                    if const_expr(PACK_RA):
+                        batch_inputs = fx.Int32(0)
+                        for r2 in range_constexpr(_GB_NB):
+                            batch_inputs += (
+                                _gb_ld(fx.Int32(_GB_HIT + r2)) != fx.Int32(0)
+                            ).select(fx.Int32(1), fx.Int32(0))
+                        prev_pack = fx.Int64(
+                            comm.atomic_add_system(
+                                _peer_addr(dest, "recv_route_count"),
+                                (fx.Int64(batch_inputs) << fx.Int64(32))
+                                | fx.Int64(batch_routes),
+                            )
                         )
-                    )
+                        prev_routes = fx.Int32(prev_pack & fx.Int64(0xFFFFFFFF))
+                        _gb_st(
+                            fx.Int32(_GB_INBASE), fx.Int32(prev_pack >> fx.Int64(32))
+                        )
+                    else:
+                        prev_routes = fx.Int32(
+                            comm.atomic_add_system(
+                                _peer_addr(dest, "recv_route_count"), batch_routes
+                            )
+                        )
                     accepted = prev_routes + batch_routes <= fx.Int32(
                         layout.route_capacity
                     )
@@ -1333,13 +1408,26 @@ def _compile_stage1(
                 # to carry slot+1 into metadata and optional copy CTAs.
                 # Keep the LDS load inside its thread bound; a DSL conjunction
                 # may evaluate both operands before applying the predicate.
+                if const_expr(PACK_RA):
+                    # Slot = batch base + hit tokens before this one. Concurrent
+                    # rewrites of earlier HIT words keep them nonzero (1 -> slot+1).
+                    in_base = _gb_ld(fx.Int32(_GB_INBASE))
+                    in_pre = fx.Int32(0)
+                    for r2 in range_constexpr(_GB_NB):
+                        in_pre += (
+                            (fx.Int32(r2) < tx)
+                            & (_gb_ld(fx.Int32(_GB_HIT + r2)) != fx.Int32(0))
+                        ).select(fx.Int32(1), fx.Int32(0))
                 if tx < fx.Int32(_GB_NB):  # noqa: SIM102
                     if _gb_ld(fx.Int32(_GB_HIT) + tx) != fx.Int32(0):
-                        input_slot = fx.Int32(
-                            comm.atomic_add_system(
-                                _peer_addr(dest, "grouped_input_alloc"), fx.Int32(1)
+                        if const_expr(PACK_RA):
+                            input_slot = in_base + in_pre
+                        else:
+                            input_slot = fx.Int32(
+                                comm.atomic_add_system(
+                                    _peer_addr(dest, "grouped_input_alloc"), fx.Int32(1)
+                                )
                             )
-                        )
                         if input_slot >= fx.Int32(layout.input_capacity):
                             comm.atomic_add_system(error_addr, fx.Int32(1))
                             _llvm_d.intr_trap()
@@ -2285,51 +2373,154 @@ def _compile_stage1(
                 # for remote fanout and stays outside the rail-post pool.
                 if ticket == fx.Int32(GPUS_PER_NODE * _SEG1_SHARD + local_rank):
                     _seal_seg1()
-            for remote_index in range_constexpr(NODES - 1):
-                remote_node = RECV_ORDER[remote_index]
-                # One flush publishes all dispatch chunks together; wait once per CTA.
-                if (tx < fx.Int32(layout.num_qp)) & (
-                    fan_wshard < fx.Int32(F2S if F2S else 1 << 20)
-                ):
-                    _spin(
-                        peer_local_addr("remote_chunk_ready", remote_node)
-                        + fx.Int64(tx) * fx.Int64(8),
-                        generation,
-                    )
-                _cta_acquire()
-                f2_stride = fx.Int32(F2S) if F2S else fan_tstride
-                f2_end = (
-                    (fan_wshard < fx.Int32(F2S)).select(
-                        fx.Int32(MAX_TOKENS), fx.Int32(0)
-                    )
-                    if F2S
-                    else fx.Int32(MAX_TOKENS)
+            if const_expr(F2_DYN):
+                # Take the remote nodes in arrival order rather than RECV_ORDER:
+                # each round picks the first unprocessed node (RECV_ORDER
+                # preference) whose num_qp ready words all carry this generation,
+                # so a late node no longer holds up one that already landed.
+                # CTAs without fan2 work take the next node without waiting.
+                f2_has = fan_wshard < fx.Int32(F2S if F2S else 1 << 20)
+                f2_box = fx.add_offset(
+                    fx.recast_iter(fx.Int32, lds_raw), NC_MBOX_DW + 1
                 )
-                for token in range(fan_wshard, f2_end, f2_stride * fx.Int32(_GB_NB)):
-                    _route_gbatch(
-                        buffer_ops.create_buffer_resource_from_addr(
-                            peer_local_addr("remote_dispatch_rx", remote_node)
-                        ),
-                        token,
-                        f2_stride,
-                        dest,
-                        fx.Int32(
-                            (remote_node * GPUS_PER_NODE + local_rank) * MAX_TOKENS
-                        ),
-                        remote=True,
-                        resv_last=(
-                            token + f2_stride * fx.Int32(_GB_NB) >= f2_end
-                            if tile_ready and remote_node == RECV_ORDER[-1]
-                            else None
-                        ),
-                        resv_n=fan_stride,
+                f2_done = fx.Int32(0)
+                for f2_it in range_constexpr(NODES - 1):
+                    if tx == fx.Int32(0):
+                        f2_first = fx.Int32(-1)
+                        for ri in range_constexpr(NODES - 1):
+                            f2_free = (
+                                (f2_done >> fx.Int32(ri)) & fx.Int32(1)
+                            ) == fx.Int32(0)
+                            f2_first = ((f2_first < fx.Int32(0)) & f2_free).select(
+                                fx.Int32(ri), f2_first
+                            )
+                        f2_pick = f2_has.select(fx.Int32(-1), f2_first)
+                        while f2_pick < fx.Int32(0):
+                            for ri in range_constexpr(NODES - 1):
+                                f2_ok = (
+                                    (f2_done >> fx.Int32(ri)) & fx.Int32(1)
+                                ) == fx.Int32(0)
+                                for w in range_constexpr(layout.num_qp):
+                                    f2_v = fx.Int64(
+                                        comm.load_i64_global_system_relaxed(
+                                            peer_local_addr(
+                                                "remote_chunk_ready", RECV_ORDER[ri]
+                                            )
+                                            + fx.Int64(w * 8)
+                                        )
+                                    )
+                                    f2_ok = f2_ok & (f2_v >= generation)
+                                f2_pick = ((f2_pick < fx.Int32(0)) & f2_ok).select(
+                                    fx.Int32(ri), f2_pick
+                                )
+                            if f2_pick < fx.Int32(0):
+                                _mlir_rocdl.s_sleep(1)
+                        fx.ptr_store(Vec.from_elements([f2_pick], fx.Int32), f2_box)
+                    gpu.barrier()
+                    f2_pick = fx.Int32(
+                        rocdl.readfirstlane(
+                            T.i32,
+                            Vec(fx.make_view(f2_box, fx.make_layout(1, 1)).load())[
+                                0
+                            ].ir_value(),
+                        )
                     )
-                if const_expr(  # noqa: SIM102
-                    tile_ready and remote_node == RECV_ORDER[-1]
-                ):
-                    # Fan CTAs with no batch, including posting CTAs, must still report once to reach fan_stride.
-                    if (fan_wshard >= f2_end) & (tx == fx.Int32(0)):
-                        _tr_resv_signal(dest, fan_stride)
+                    f2_done = f2_done | (fx.Int32(1) << f2_pick)
+                    _cta_acquire()
+                    f2_rx = peer_local_addr("remote_dispatch_rx", RECV_ORDER[0])
+                    f2_src = fx.Int32(
+                        (RECV_ORDER[0] * GPUS_PER_NODE + local_rank) * MAX_TOKENS
+                    )
+                    for ri in range_constexpr(NODES - 1):
+                        if const_expr(ri > 0):
+                            f2_sel = f2_pick == fx.Int32(ri)
+                            f2_rx = f2_sel.select(
+                                peer_local_addr("remote_dispatch_rx", RECV_ORDER[ri]),
+                                f2_rx,
+                            )
+                            f2_src = f2_sel.select(
+                                fx.Int32(
+                                    (RECV_ORDER[ri] * GPUS_PER_NODE + local_rank)
+                                    * MAX_TOKENS
+                                ),
+                                f2_src,
+                            )
+                    f2_stride = fx.Int32(F2S) if F2S else fan_tstride
+                    f2_end = (
+                        (fan_wshard < fx.Int32(F2S)).select(
+                            fx.Int32(MAX_TOKENS), fx.Int32(0)
+                        )
+                        if F2S
+                        else fx.Int32(MAX_TOKENS)
+                    )
+                    for token in range(
+                        fan_wshard, f2_end, f2_stride * fx.Int32(_GB_NB)
+                    ):
+                        _route_gbatch(
+                            buffer_ops.create_buffer_resource_from_addr(f2_rx),
+                            token,
+                            f2_stride,
+                            dest,
+                            f2_src,
+                            remote=True,
+                            resv_last=(
+                                token + f2_stride * fx.Int32(_GB_NB) >= f2_end
+                                if tile_ready and f2_it == NODES - 2
+                                else None
+                            ),
+                            resv_n=fan_stride,
+                        )
+                    if const_expr(tile_ready and f2_it == NODES - 2):  # noqa: SIM102
+                        if (fan_wshard >= f2_end) & (tx == fx.Int32(0)):
+                            _tr_resv_signal(dest, fan_stride)
+            else:
+                for remote_index in range_constexpr(NODES - 1):
+                    remote_node = RECV_ORDER[remote_index]
+                    # One flush publishes all dispatch chunks together; wait once per CTA.
+                    if (tx < fx.Int32(layout.num_qp)) & (
+                        fan_wshard < fx.Int32(F2S if F2S else 1 << 20)
+                    ):
+                        _spin(
+                            peer_local_addr("remote_chunk_ready", remote_node)
+                            + fx.Int64(tx) * fx.Int64(8),
+                            generation,
+                        )
+                    _cta_acquire()
+                    f2_stride = fx.Int32(F2S) if F2S else fan_tstride
+                    f2_end = (
+                        (fan_wshard < fx.Int32(F2S)).select(
+                            fx.Int32(MAX_TOKENS), fx.Int32(0)
+                        )
+                        if F2S
+                        else fx.Int32(MAX_TOKENS)
+                    )
+                    for token in range(
+                        fan_wshard, f2_end, f2_stride * fx.Int32(_GB_NB)
+                    ):
+                        _route_gbatch(
+                            buffer_ops.create_buffer_resource_from_addr(
+                                peer_local_addr("remote_dispatch_rx", remote_node)
+                            ),
+                            token,
+                            f2_stride,
+                            dest,
+                            fx.Int32(
+                                (remote_node * GPUS_PER_NODE + local_rank) * MAX_TOKENS
+                            ),
+                            remote=True,
+                            resv_last=(
+                                token + f2_stride * fx.Int32(_GB_NB) >= f2_end
+                                if tile_ready and remote_node == RECV_ORDER[-1]
+                                else None
+                            ),
+                            resv_n=fan_stride,
+                        )
+                    if const_expr(  # noqa: SIM102
+                        tile_ready and remote_node == RECV_ORDER[-1]
+                    ):
+                        # Fan CTAs with no batch, including posting CTAs, must still report once to reach fan_stride.
+                        if (fan_wshard >= f2_end) & (tx == fx.Int32(0)):
+                            _tr_resv_signal(dest, fan_stride)
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             # Reap this CTA's data request before publishing its shard. It must complete
@@ -2612,10 +2803,10 @@ def _compile_stage1(
                 NW=WAVES,
                 aqin_row_base=INPUT_ROW_BASE,
                 aqout_row_base=H1_ROW_BASE,
-                h1_wt=group_ready,
+                h1_wt=group_ready and not GR_COARSE,
                 a_dtype=A_DTYPE,
             )
-            if const_expr(group_ready):
+            if const_expr(group_ready and not GR_COARSE):
                 # Every wave's write-through h1 stores retired, then one count
                 # per job; the group's last job publishes the generation.
                 fx.rocdl.s_waitcnt(vmcnt=0)
@@ -2648,6 +2839,11 @@ def _compile_stage1(
         is_compute = ticket >= fx.Int32(COMPUTE_FIRST)
         for _xt in _XC:
             is_compute = is_compute | (ticket == fx.Int32(_xt))
+        if const_expr(group_ready and G2_EARLY):
+            # Experiment: the last G2_EARLY tickets skip GMM1 and enter the
+            # fused Stage2 once the tables are final, so GEMM2 runs on groups
+            # as their GMM1 completes while the other CTAs drain GMM1.
+            is_compute = is_compute & (ticket < fx.Int32(worker_blocks - G2_EARLY))
         if is_compute:
             if const_expr(ready_q and not split_local):  # noqa: SIM102
                 # Without split, expert_count is final once all source fan CTAs finish P2.
@@ -2797,6 +2993,56 @@ def _compile_stage1(
                     if rq_has:
                         _run_gemm1_job(rq_job)
                     rq_go = rq_has
+            if const_expr(group_ready and GR_COARSE):
+                # This CTA ran its last GMM1 job: drain its h1 stores, write
+                # back the XCD's L2, count once. The last compute CTA stamps
+                # every group ready (GEMM2's per-group waits are unchanged) and
+                # resets the count by subtraction.
+                fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                gpu.barrier()
+                gc_box = fx.add_offset(
+                    fx.recast_iter(fx.Int32, lds_raw), NC_MBOX_DW + 2
+                )
+                if tx == fx.Int32(0):
+                    comm.fence_system_release()
+                    gc_old = fx.Int32(
+                        comm.atomic_add_system_acq_rel(
+                            local_addr("h1_grp_sync"), fx.Int32(1)
+                        )
+                    )
+                    fx.ptr_store(
+                        Vec.from_elements(
+                            [
+                                (gc_old + fx.Int32(1) == fx.Int32(N_COMPUTE)).select(
+                                    fx.Int32(1), fx.Int32(0)
+                                )
+                            ],
+                            fx.Int32,
+                        ),
+                        gc_box,
+                    )
+                gpu.barrier()
+                gc_last = fx.Int32(
+                    rocdl.readfirstlane(
+                        T.i32,
+                        Vec(fx.make_view(gc_box, fx.make_layout(1, 1)).load())[
+                            0
+                        ].ir_value(),
+                    )
+                ) == fx.Int32(1)
+                if gc_last:
+                    if tx == fx.Int32(0):
+                        comm.atomic_add_agent(
+                            local_addr("h1_grp_sync"), fx.Int32(0 - N_COMPUTE)
+                        )
+                    for gc_i in range(tx, fx.Int32(GR_N), fx.Int32(THREADS)):
+                        comm.store_i32_global_system_relaxed(
+                            local_addr("h1_grp_sync")
+                            + fx.Int64(fx.Int32(GR_N) + gc_i) * fx.Int64(4),
+                            fx.Int32(generation),
+                        )
+                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+                    gpu.barrier()
             if tx == fx.Int32(0):
                 # In the fused path, 248 CTAs wait here after fanout for global sealing.
                 # Back off polling to avoid competing with active fanout and credit CTAs for memory.
@@ -2814,6 +3060,20 @@ def _compile_stage1(
                 fx.ptr_store(
                     Vec.from_elements([generation, eos_seen], fx.Int64),
                     fx.recast_iter(fx.Int64, lds_raw),
+                )
+                nc_e = fx.Int32(-1)
+                for _i, _t in enumerate(_NC_BASE):
+                    nc_e = (ticket == fx.Int32(_t)).select(fx.Int32(_i), nc_e)
+                if const_expr(G2_EARLY):
+                    nc_e = (ticket >= fx.Int32(worker_blocks - G2_EARLY)).select(
+                        ticket - fx.Int32(worker_blocks - G2_EARLY - len(_NC_BASE)),
+                        nc_e,
+                    )
+                # i32 words 4/5: this CTA's index among the GMM1-skipping CTAs
+                # (-1: it ran GMM1) and their count.
+                fx.ptr_store(
+                    Vec.from_elements([nc_e, fx.Int32(N_NONCOMPUTE)], fx.Int32),
+                    fx.add_offset(fx.recast_iter(fx.Int32, lds_raw), 4),
                 )
 
     @flyc.kernel(name=kernel_name, known_block_size=[THREADS, 1, 1])

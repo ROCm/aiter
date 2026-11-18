@@ -1083,7 +1083,7 @@ def _gemm1_body_m16(
             if kk == fx.Int32(0):
                 _store_scale_pair(sub, s_lo, s_hi)
 
-        if const_expr(kSubBlocks % 2):  # noqa: SIM102 (static tail, runtime wave owner)
+        if const_expr(kSubBlocks % 2):  # noqa: SIM102 (trace-time vs runtime guard)
             # An odd final BM32 sub-block belongs to the first four waves.
             # No CTA barrier occurs inside _epi_row or _store_scale_pair.
             if tx_i32 < fx.Int32(256):
@@ -1347,6 +1347,7 @@ def gemm2_compute_v2(
     eids_stride=1,
     NW=4,
     a_dtype="fp4",
+    scoped=False,
 ):
     """GEMM2 of one (m_block, n_block): fp4 A (LDS DMA, kStages+1 slots), fp4 B
     streamed through a 2-stage register pipeline with the A-scale carried alongside.
@@ -1371,6 +1372,13 @@ def gemm2_compute_v2(
     kMChunks = BM // 16  # 16-row MFMA row-groups
     kHalves = BK // 128  # 16x16x128 MFMA K-steps per K-tile
     numAccN = (BN // 4) // 16  # 16-column MFMA subblocks per wave
+    # stream_a: the M row at which the next K tile's B is prefetched. The
+    # original waits for the last row; the next-tile fragments are separate
+    # registers, so an earlier row hides more of the load (experiment hook).
+    PF_ROW = int(__import__("os").environ.get("S2_G2_PF_ROW") or (kMChunks - 1))
+    PF_ROW = min(max(PF_ROW, 0), kMChunks - 1)
+    # stream_a: read row i+1's A from LDS before row i's MFMAs (experiment hook).
+    A_AHEAD = __import__("os").environ.get("S2_G2_A_AHEAD") == "1"
     nPairs = max(1, numAccN // 2)  # one B-scale per two 16-column subblocks
     kScaleSubBlocks = kMChunks // 2
     a_pack = 1 if is_f8_a else 2
@@ -1725,41 +1733,230 @@ def gemm2_compute_v2(
             for sub in range_constexpr(kScaleSubBlocks):
                 nxt_saf[sub].store(cur_saf[sub].load())
 
-    for kt_iv, state in range(
-        fx.Int32(0),
-        K_TILES_RT,
-        fx.Int32(1),
-        init=load_carry(),
-    ):
-        store_carry(state)
-        kt_rt = fx.Int32(kt_iv)
-        if const_expr(not stream_a):
-            prefetch_next_b(kt_rt)
-        gpu.barrier()
-        nxt_a = kt_rt + fx.Int32(kStages)
-        if const_expr(not stream_a):
-            issue_a_ds_read(kt_rt % fx.Int32(aStages))
-        if nxt_a < K_TILES_RT:
-            issue_a_load_lds(nxt_a % fx.Int32(aStages), nxt_a)
-        # A-scale from the prefetch carry (g2_ascale_pf) or loaded synchronously here.
-        sa = [Vec(cur_saf[sub].load())[0] for sub in range_constexpr(kScaleSubBlocks)]
-        # Fence the MFMA chain from the B vmem loads (next-tile loads ride ahead of compute).
-        rocdl.sched_barrier(0)
-        rocdl.s_setprio(1)
-        if const_expr(stream_a):
-            # A row is consumed before reading the next. B is reused over M;
-            # refill its next K tile only when the final M row starts.
-            for i in range_constexpr(kMChunks):
-                issue_a_ds_read(kt_rt % fx.Int32(aStages), i, 1)
-                if const_expr(i == kMChunks - 1):
-                    prefetch_next_b(kt_rt)
-                mfma_row(cur_bqf, cur_bsf, sa, i)
-        else:
-            mfma_cluster(cur_bqf, cur_bsf, sa, kt_rt)
-        rocdl.s_setprio(0)
-        rocdl.sched_barrier(0)
-        results = yield yield_carry()
-    store_carry(results)
+    if const_expr(scoped):
+        # Scoped A ring (as gemm2_pipe): each slot's LDS DMA and ds-reads carry
+        # their own alias scope, a volatile probe of slot u waits for exactly
+        # this wave's DMA into it, then lgkmcnt(0) + a bare s_barrier publish
+        # the slot. gpu.barrier()'s fence drained vmcnt(0) every K step, which
+        # also waited for the next tile's B prefetch (ATT: 34% of the stalls).
+        # The runtime K loop steps by aStages and unrolls one body per slot.
+        from flydsl._mlir import ir as _ir
+
+        assert (
+            INTER_MAX // BK
+        ) % aStages == 0, "scoped A ring needs K tiles % aStages == 0"
+        _dom = '#llvm.alias_scope_domain<id = distinct[0]<>, description = "g2v2_lds">'
+        _scl = _ir.ArrayAttr(
+            _ir.Attribute.parse(
+                "["
+                + ", ".join(
+                    f"#llvm.alias_scope<id = distinct[{i + 1}]<>, domain = {_dom}>"
+                    for i in range(aStages)
+                )
+                + "]"
+            )
+        )
+        _sc_list = [_scl[i] for i in range(aStages)]
+
+        def _sa(idx):
+            return {
+                "alias_scopes": _ir.ArrayAttr.get([_sc_list[idx]]),
+                "noalias_scopes": _ir.ArrayAttr.get(
+                    [_sc_list[j] for j in range(aStages) if j != idx]
+                ),
+            }
+
+        def _swz(row):
+            return (
+                lds_swizzle_mask_f8(row, KH_TILE_A)
+                if is_f8_a
+                else _lds_swizzle_mask(row)
+            )
+
+        s_lpr = KH_TILE_A // 16
+        s_rpc = 64 // s_lpr
+        S_NW = min(NW, BM // s_rpc)
+        s_wave = wave % fx.Int32(S_NW) if S_NW < NW else wave
+        s_rpw = BM // S_NW
+        s_nrg = s_rpw // s_rpc
+        s_rsrc = _buffer_rsrc(
+            fx.Int64(arg_aq) + fx.Int64(a_row) * fx.Int64(K_BYTES),
+            fx.Int64(BM) * fx.Int64(K_BYTES),
+        )
+        s_lane_row = lane // fx.Int32(s_lpr)
+        s_lane_col = (lane % fx.Int32(s_lpr)) * fx.Int32(16)
+        s_voff = []
+        for g in range_constexpr(s_nrg):
+            t_row = s_wave * fx.Int32(s_rpw) + fx.Int32(g * s_rpc) + s_lane_row
+            s_voff.append((s_lane_col ^ _swz(t_row)) + t_row * K_BYTES)
+
+        def issue_a_s(slot, kt):
+            for g in range_constexpr(s_nrg):
+                lds_off = fx.Int32(slot * slot_bytes) + (
+                    s_wave * fx.Int32(s_rpw) + fx.Int32(g * s_rpc)
+                ) * fx.Int32(KH_TILE_A)
+                rocdl.raw_ptr_buffer_load_lds(
+                    s_rsrc,
+                    _lds_ptr3(lds_base_i32, lds_off),
+                    fx.Int32(16),
+                    s_voff[g],
+                    kt * fx.Int32(KH_TILE_A),
+                    fx.Int32(0),
+                    fx.Int32(0),
+                    **_sa(slot),
+                )
+
+        s_mask = _swz(lane_mod_16)
+
+        def read_a_s(slot, i):
+            for k in range_constexpr(kHalves):
+                col0 = lane_div_16 * fx.Int32(16) + fx.Int32(
+                    k * (128 if is_f8_a else 64)
+                )
+                row_off = fx.Int32(slot * slot_bytes) + (
+                    lane_mod_16 + fx.Int32(i * 16)
+                ) * fx.Int32(KH_TILE_A)
+                lo = Vec(
+                    llvm.LoadOp(
+                        Vec.make_type(4, fx.Int32),
+                        _lds_ptr3(lds_base_i32, row_off + (col0 ^ s_mask)),
+                        alignment=16,
+                        **_sa(slot),
+                    ).result
+                )
+                if const_expr(not is_f8_a):
+                    a_frags[i][k].store(lo)
+                else:
+                    hi = Vec(
+                        llvm.LoadOp(
+                            Vec.make_type(4, fx.Int32),
+                            _lds_ptr3(
+                                lds_base_i32, row_off + ((col0 + fx.Int32(64)) ^ s_mask)
+                            ),
+                            alignment=16,
+                            **_sa(slot),
+                        ).result
+                    )
+                    a_frags[i][k].store(
+                        Vec.from_elements(
+                            [lo[j] for j in range_constexpr(4)]
+                            + [hi[j] for j in range_constexpr(4)],
+                            fx.Int32,
+                        )
+                    )
+
+        for t in range_constexpr(kStages):
+            issue_a_s(t, fx.Int32(t))
+        # B ping-pong: step u computes on buffer u % 2 and prefetches the next
+        # K tile into the other buffer, so no step waits for B to be copied
+        # (the cur <- nxt rotation forced vmcnt(0) at every step end). The body
+        # unrolls lcm(aStages, 2) steps so slot and buffer are compile-time.
+        UF = aStages * 2 if aStages % 2 else aStages
+        assert (INTER_MAX // BK) % UF == 0, "B ping-pong needs K tiles % UF == 0"
+        b_q = (cur_bqf, nxt_bqf)
+        b_s = (cur_bsf, nxt_bsf)
+        b_a = (cur_saf, nxt_saf)
+
+        def prefetch_into(buf, kt_rt):
+            nxt_b = kt_rt + fx.Int32(1)
+            if nxt_b < K_TILES_RT:
+                issue_b_load_into(b_q[buf], b_s[buf], nxt_b)
+                issue_a_scale_load_into(b_a[buf], nxt_b)
+
+        for ktu_iv, state in range(
+            fx.Int32(0),
+            K_TILES_RT,
+            fx.Int32(UF),
+            init=load_carry(),
+        ):
+            store_carry(state)
+            for u in range_constexpr(UF):
+                slot = u % aStages
+                cb = u % 2
+                kt_rt = fx.Int32(ktu_iv) + fx.Int32(u)
+                if const_expr(not stream_a):
+                    prefetch_into(1 - cb, kt_rt)
+                llvm.LoadOp(
+                    T.i32,
+                    _lds_ptr3(lds_base_i32, fx.Int32(slot * slot_bytes)),
+                    alignment=4,
+                    volatile_=True,
+                    **_sa(slot),
+                )
+                fx.rocdl.s_waitcnt(lgkmcnt=0)
+                rocdl.s_barrier()
+                rocdl.sched_barrier(0)
+                nxt_a = kt_rt + fx.Int32(kStages)
+                if nxt_a < K_TILES_RT:
+                    issue_a_s((slot + kStages) % aStages, nxt_a)
+                if const_expr(not stream_a):
+                    for i in range_constexpr(kMChunks):
+                        read_a_s(slot, i)
+                sa = [
+                    Vec(b_a[cb][sub].load())[0]
+                    for sub in range_constexpr(kScaleSubBlocks)
+                ]
+                rocdl.sched_barrier(0)
+                rocdl.s_setprio(1)
+                if const_expr(stream_a):
+                    for i in range_constexpr(kMChunks):
+                        read_a_s(slot, i)
+                        if const_expr(i == PF_ROW):
+                            prefetch_into(1 - cb, kt_rt)
+                        mfma_row(b_q[cb], b_s[cb], sa, i)
+                else:
+                    mfma_cluster(b_q[cb], b_s[cb], sa, kt_rt)
+                rocdl.s_setprio(0)
+                rocdl.sched_barrier(0)
+            # UF is even: the last step prefetched into buffer 0 (= cur_*).
+            results = yield load_carry()
+        store_carry(results)
+        # The epilogue reuses the A ring as its accumulator slab.
+        fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+        rocdl.s_barrier()
+    else:
+        for kt_iv, state in range(
+            fx.Int32(0),
+            K_TILES_RT,
+            fx.Int32(1),
+            init=load_carry(),
+        ):
+            store_carry(state)
+            kt_rt = fx.Int32(kt_iv)
+            if const_expr(not stream_a):
+                prefetch_next_b(kt_rt)
+            gpu.barrier()
+            nxt_a = kt_rt + fx.Int32(kStages)
+            if const_expr(not stream_a):
+                issue_a_ds_read(kt_rt % fx.Int32(aStages))
+            if nxt_a < K_TILES_RT:
+                issue_a_load_lds(nxt_a % fx.Int32(aStages), nxt_a)
+            # A-scale from the prefetch carry (g2_ascale_pf) or loaded synchronously here.
+            sa = [
+                Vec(cur_saf[sub].load())[0] for sub in range_constexpr(kScaleSubBlocks)
+            ]
+            # Fence the MFMA chain from the B vmem loads (next-tile loads ride ahead of compute).
+            rocdl.sched_barrier(0)
+            rocdl.s_setprio(1)
+            if const_expr(stream_a):
+                # A row is consumed before reading the next. B is reused over M;
+                # refill its next K tile only when the final M row starts.
+                if const_expr(A_AHEAD):
+                    issue_a_ds_read(kt_rt % fx.Int32(aStages), 0, 1)
+                for i in range_constexpr(kMChunks):
+                    if const_expr(not A_AHEAD):
+                        issue_a_ds_read(kt_rt % fx.Int32(aStages), i, 1)
+                    elif const_expr(i + 1 < kMChunks):
+                        issue_a_ds_read(kt_rt % fx.Int32(aStages), i + 1, 1)
+                    if const_expr(i == PF_ROW):
+                        prefetch_next_b(kt_rt)
+                    mfma_row(cur_bqf, cur_bsf, sa, i)
+            else:
+                mfma_cluster(cur_bqf, cur_bsf, sa, kt_rt)
+            rocdl.s_setprio(0)
+            rocdl.sched_barrier(0)
+            results = yield yield_carry()
+        store_carry(results)
 
     # Load the C fragments (fp8/fp4 unified onto the same fx.gemm path) and hand them to the epilog.
     accm_vecs = [

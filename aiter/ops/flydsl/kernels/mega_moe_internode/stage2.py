@@ -74,7 +74,7 @@ NUM_XCD = 8
 # fmt: off
 def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM, BN, npes, topk,
     log2_max_tok, mask_max_tok, recv_cap, comb_inp_nbytes, lds_packed_off, lds_weight_off,
-    lds_peer_off, scatter_vec, gpus_per_node, lds_rowptr_off=None, NW=4):
+    lds_peer_off, scatter_vec, gpus_per_node, lds_rowptr_off=None, NW=4, ep_rows=None):
 # fmt: on
     """CShuffle one GEMM2 tile into weighted BF16 rows and scatter them to peers.
 
@@ -85,11 +85,15 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
 
     NW=8 (two n_blocks per CTA, see gemm2_compute_v2): each four-wave half
     shuffles through its own BM x BN slab and stores its own n_block.
+
+    ``ep_rows`` < BM shuffles and stores the tile in passes of ep_rows rows
+    through an ep_rows x BN slab (BM96: 192 -> 64 KiB of LDS with NW=8).
     """
+    EP = BM if ep_rows is None else int(ep_rows)
+    assert BM % EP == 0 and EP % 16 == 0
     if NW == 8:
-        lds_acc_base = lds_acc_base + (wave // fx.Int32(4)) * fx.Int32(BM * BN * 4)
+        lds_acc_base = lds_acc_base + (wave // fx.Int32(4)) * fx.Int32(EP * BN * 4)
         wave = wave % fx.Int32(4)
-    kMChunks = BM // 16
     numAccN = (BN // 4) // 16
     wave_n = BN // 4
     lane_div_16 = lane // 16
@@ -103,150 +107,152 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
     out_elem_bytes = 2
     token_nbytes = N_OUT * out_elem_bytes
 
-    fx.barrier()
+    for ep_pass in range_constexpr(BM // EP):
+        fx.barrier()
 
-    for i in range_constexpr(kMChunks):
-        row_base = fx.Int32(i * 16) + lane_div_16 * 4
-        for J in range_constexpr(numAccN):
-            col = wave * fx.Int32(wave_n) + J * 16 + lane_mod_16
-            vec = fx.Vector(accm[i][J])
-            for v in range_constexpr(4):
-                idx = (row_base + v) * BN + col
-                lds_base_fptr[idx] = fx.Float32(vec[v])
+        for i in range_constexpr(EP // 16):
+            row_base = fx.Int32(i * 16) + lane_div_16 * 4
+            for J in range_constexpr(numAccN):
+                col = wave * fx.Int32(wave_n) + J * 16 + lane_mod_16
+                vec = fx.Vector(accm[ep_pass * (EP // 16) + i][J])
+                for v in range_constexpr(4):
+                    idx = (row_base + v) * BN + col
+                    lds_base_fptr[idx] = fx.Float32(vec[v])
 
-    fx.barrier()
+        fx.barrier()
 
-    for row_iter in range_constexpr(BM // 4):
-        row = wave + fx.Int32(row_iter * 4)
-        row_byte_off = row * fx.Int32(4)
-        p = fx.ptr_load(
-            lds_typed_ptr(fx.Int32(lds_packed_off) + row_byte_off, T.i32, align=4)
-        )
-        weight = fx.ptr_load(
-            lds_typed_ptr(fx.Int32(lds_weight_off) + row_byte_off, T.f32, align=4)
-        )
-        p = rocdl.readfirstlane(T.i32, p.ir_value())
-        weight = rocdl.readfirstlane(T.f32, weight.ir_value())
-        if const_expr(lds_rowptr_off is not None):
-            rp = fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(fx.ptr_load(lds_typed_ptr(
-                fx.Int32(lds_rowptr_off) + row * fx.Int32(8), T.i64, align=8))).ir_value()))
-            has_row = rp != fx.Int64(0)
-            active = lane < fx.Int32(BN // scatter_vec)
-            col = active.select(lane * fx.Int32(scatter_vec), fx.Int32(0))
-            idx0 = row * fx.Int32(BN) + col
-            v8 = fx.Vector(lds_vec_load(lds_acc_base, idx0 * fx.Int32(4),
-                fx.Vector.make_type(scatter_vec, fx.Float32), fx.Float32, align=16))
-            # SDMA rows are FP8 (1x32 blocks, E8M0 scales after the H bytes):
-            # half the bytes for the copy engines.  A 32-column block spans
-            # 4 lanes; every lane runs the encode (it shuffles across lanes).
-            vals = [fx.Float32(v8[i] * weight) for i in range_constexpr(scatter_vec)]
-            words, e8m0 = _fp8_encode8_quad(vals)
-            is_ldr = (lane & fx.Int32(3)) == fx.Int32(0)
-            # A row without a destination keeps a mapped base (peer table entry
-            # 0); its stores are masked off.
-            base0 = fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(fx.ptr_load(lds_typed_ptr(
-                fx.Int32(lds_peer_off), T.i64, align=8))).ir_value()))
-            row8 = N_OUT + N_OUT // 32
-            rsrc = buffer_ops.create_buffer_resource_from_addr(
-                has_row.select(rp, base0), num_records_bytes=fx.Int32(row8))
-            colg = n_block_idx * fx.Int32(BN) + col
-            ok = has_row & active
-            buffer_ops.buffer_store(fx.Vector.from_elements(words, fx.Int32), rsrc,
-                colg // fx.Int32(4), mask=ok, cache_modifier=pay_cm)
-            buffer_ops.buffer_store(e8m0.to(fx.Int8), rsrc,
-                fx.Int32(N_OUT) + colg // fx.Int32(32), mask=ok & is_ldr,
-                cache_modifier=pay_cm)
-        else:
-            t = p & fx.Int32(0x00FFFFFF)
-            if const_expr(topk <= 8):
-                # Preserve the established DSV4-Pro instruction sequence.
-                s = p >> fx.Int32(24)
+        for row_iter in range_constexpr(EP // 4):
+            lrow = wave + fx.Int32(row_iter * 4)
+            row = lrow + fx.Int32(ep_pass * EP)
+            row_byte_off = row * fx.Int32(4)
+            p = fx.ptr_load(
+                lds_typed_ptr(fx.Int32(lds_packed_off) + row_byte_off, T.i32, align=4)
+            )
+            weight = fx.ptr_load(
+                lds_typed_ptr(fx.Int32(lds_weight_off) + row_byte_off, T.f32, align=4)
+            )
+            p = rocdl.readfirstlane(T.i32, p.ir_value())
+            weight = rocdl.readfirstlane(T.f32, weight.ir_value())
+            if const_expr(lds_rowptr_off is not None):
+                rp = fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(fx.ptr_load(lds_typed_ptr(
+                    fx.Int32(lds_rowptr_off) + row * fx.Int32(8), T.i64, align=8))).ir_value()))
+                has_row = rp != fx.Int64(0)
+                active = lane < fx.Int32(BN // scatter_vec)
+                col = active.select(lane * fx.Int32(scatter_vec), fx.Int32(0))
+                idx0 = lrow * fx.Int32(BN) + col
+                v8 = fx.Vector(lds_vec_load(lds_acc_base, idx0 * fx.Int32(4),
+                    fx.Vector.make_type(scatter_vec, fx.Float32), fx.Float32, align=16))
+                # SDMA rows are FP8 (1x32 blocks, E8M0 scales after the H bytes):
+                # half the bytes for the copy engines.  A 32-column block spans
+                # 4 lanes; every lane runs the encode (it shuffles across lanes).
+                vals = [fx.Float32(v8[i] * weight) for i in range_constexpr(scatter_vec)]
+                words, e8m0 = _fp8_encode8_quad(vals)
+                is_ldr = (lane & fx.Int32(3)) == fx.Int32(0)
+                # A row without a destination keeps a mapped base (peer table entry
+                # 0); its stores are masked off.
+                base0 = fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(fx.ptr_load(lds_typed_ptr(
+                    fx.Int32(lds_peer_off), T.i64, align=8))).ir_value()))
+                row8 = N_OUT + N_OUT // 32
+                rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    has_row.select(rp, base0), num_records_bytes=fx.Int32(row8))
+                colg = n_block_idx * fx.Int32(BN) + col
+                ok = has_row & active
+                buffer_ops.buffer_store(fx.Vector.from_elements(words, fx.Int32), rsrc,
+                    colg // fx.Int32(4), mask=ok, cache_modifier=pay_cm)
+                buffer_ops.buffer_store(e8m0.to(fx.Int8), rsrc,
+                    fx.Int32(N_OUT) + colg // fx.Int32(32), mask=ok & is_ldr,
+                    cache_modifier=pay_cm)
             else:
-                # Slots 8..15 set bit 31, so decode the high byte as unsigned.
-                s = p.shrui(fx.Int32(24)) & fx.Int32(0xFF)
-            owner_rank = t >> fx.Int32(log2_max_tok)
-            dest_lid = t & fx.Int32(mask_max_tok)
-            valid = (t < fx.Int32(recv_cap)) & (s < fx.Int32(topk)) & (
-                owner_rank < fx.Int32(npes))
-            # Local rank l proxies global ranks l and 8+l: the intra-node hop
-            # always lands on the GPU whose local index matches the owner's, and
-            # the plane says which of that proxy's two identities the token
-            # belongs to. Only the remote plane is later shipped over the rail.
-            dest_pe = owner_rank & fx.Int32(gpus_per_node - 1)
-            dest_lid = (
-                (owner_rank // fx.Int32(gpus_per_node))
-                * fx.Int32(1 << log2_max_tok)
-                + dest_lid
-            )
-            dest_pe_safe = valid.select(dest_pe, fx.Int32(0))
-            peer_base = fx.ptr_load(
-                lds_typed_ptr(
-                    fx.Int32(lds_peer_off) + dest_pe_safe * fx.Int32(8),
-                    T.i64,
-                    align=8,
+                t = p & fx.Int32(0x00FFFFFF)
+                if const_expr(topk <= 8):
+                    # Preserve the established DSV4-Pro instruction sequence.
+                    s = p >> fx.Int32(24)
+                else:
+                    # Slots 8..15 set bit 31, so decode the high byte as unsigned.
+                    s = p.shrui(fx.Int32(24)) & fx.Int32(0xFF)
+                owner_rank = t >> fx.Int32(log2_max_tok)
+                dest_lid = t & fx.Int32(mask_max_tok)
+                valid = (t < fx.Int32(recv_cap)) & (s < fx.Int32(topk)) & (
+                    owner_rank < fx.Int32(npes))
+                # Local rank l proxies global ranks l and 8+l: the intra-node hop
+                # always lands on the GPU whose local index matches the owner's, and
+                # the plane says which of that proxy's two identities the token
+                # belongs to. Only the remote plane is later shipped over the rail.
+                dest_pe = owner_rank & fx.Int32(gpus_per_node - 1)
+                dest_lid = (
+                    (owner_rank // fx.Int32(gpus_per_node))
+                    * fx.Int32(1 << log2_max_tok)
+                    + dest_lid
                 )
-            )
-            peer_base = rocdl.readfirstlane(T.i64, peer_base.ir_value())
-            slot = dest_lid * fx.Int32(topk) + s
+                dest_pe_safe = valid.select(dest_pe, fx.Int32(0))
+                peer_base = fx.ptr_load(
+                    lds_typed_ptr(
+                        fx.Int32(lds_peer_off) + dest_pe_safe * fx.Int32(8),
+                        T.i64,
+                        align=8,
+                    )
+                )
+                peer_base = rocdl.readfirstlane(T.i64, peer_base.ir_value())
+                slot = dest_lid * fx.Int32(topk) + s
 
-            row_base = slot * fx.Int32(token_nbytes)
-            row_off = row_base + n_block_idx * fx.Int32(BN * out_elem_bytes)
+                row_base = slot * fx.Int32(token_nbytes)
+                row_off = row_base + n_block_idx * fx.Int32(BN * out_elem_bytes)
 
-            # Inactive lanes read safe LDS and issue a bounded OOB store.
-            active = lane < fx.Int32(BN // scatter_vec)
-            col = active.select(lane * fx.Int32(scatter_vec), fx.Int32(0))
-            idx0 = row * fx.Int32(BN) + col
-            v8 = fx.Vector(
-                lds_vec_load(
-                    lds_acc_base,
-                    idx0 * fx.Int32(4),
-                    fx.Vector.make_type(scatter_vec, fx.Float32),
+                # Inactive lanes read safe LDS and issue a bounded OOB store.
+                active = lane < fx.Int32(BN // scatter_vec)
+                col = active.select(lane * fx.Int32(scatter_vec), fx.Int32(0))
+                idx0 = lrow * fx.Int32(BN) + col
+                v8 = fx.Vector(
+                    lds_vec_load(
+                        lds_acc_base,
+                        idx0 * fx.Int32(4),
+                        fx.Vector.make_type(scatter_vec, fx.Float32),
+                        fx.Float32,
+                        align=16,
+                    )
+                )
+                weighted_v8 = fx.Vector.from_elements(
+                    [v8[i] * weight for i in range_constexpr(scatter_vec)],
                     fx.Float32,
-                    align=16,
                 )
-            )
-            weighted_v8 = fx.Vector.from_elements(
-                [v8[i] * weight for i in range_constexpr(scatter_vec)],
-                fx.Float32,
-            )
-            pk = weighted_v8.to(fx.BFloat16)
-            if const_expr(comb_inp_nbytes >= 1 << 31):
-                # mtpr > 4096: slot * token_nbytes passes the i32 byte range. The
-                # row goes into the 64-bit descriptor base (slot is wave-uniform,
-                # so no waterfall) and the descriptor covers one token row.
-                row_ptr = fx.Int64(peer_base) + fx.Int64(
-                    valid.select(slot, fx.Int32(0))
-                ) * fx.Int64(token_nbytes)
-                off = (valid & active).select(
-                    n_block_idx * fx.Int32(BN * out_elem_bytes)
-                    + col * fx.Int32(out_elem_bytes),
-                    fx.Int32(token_nbytes),
-                )
-                output_buf = ptr_buf_tensor(
-                    row_ptr,
+                pk = weighted_v8.to(fx.BFloat16)
+                if const_expr(comb_inp_nbytes >= 1 << 31):
+                    # mtpr > 4096: slot * token_nbytes passes the i32 byte range. The
+                    # row goes into the 64-bit descriptor base (slot is wave-uniform,
+                    # so no waterfall) and the descriptor covers one token row.
+                    row_ptr = fx.Int64(peer_base) + fx.Int64(
+                        valid.select(slot, fx.Int32(0))
+                    ) * fx.Int64(token_nbytes)
+                    off = (valid & active).select(
+                        n_block_idx * fx.Int32(BN * out_elem_bytes)
+                        + col * fx.Int32(out_elem_bytes),
+                        fx.Int32(token_nbytes),
+                    )
+                    output_buf = ptr_buf_tensor(
+                        row_ptr,
+                        fx.BFloat16,
+                        unit_elems=scatter_vec,
+                        num_records_bytes=token_nbytes,
+                    )
+                else:
+                    off = (valid & active).select(
+                        row_off + col * fx.Int32(out_elem_bytes),
+                        fx.Int32(comb_inp_nbytes),
+                    )
+                    output_buf = ptr_buf_tensor(
+                        peer_base,
+                        fx.BFloat16,
+                        unit_elems=scatter_vec,
+                        num_records_bytes=comb_inp_nbytes,
+                    )
+                buf_copy_store(
+                    output_buf,
+                    off // fx.Int32(scatter_vec * 2),
+                    pk,
                     fx.BFloat16,
                     unit_elems=scatter_vec,
-                    num_records_bytes=token_nbytes,
+                    cache_modifier=pay_cm,
                 )
-            else:
-                off = (valid & active).select(
-                    row_off + col * fx.Int32(out_elem_bytes),
-                    fx.Int32(comb_inp_nbytes),
-                )
-                output_buf = ptr_buf_tensor(
-                    peer_base,
-                    fx.BFloat16,
-                    unit_elems=scatter_vec,
-                    num_records_bytes=comb_inp_nbytes,
-                )
-            buf_copy_store(
-                output_buf,
-                off // fx.Int32(scatter_vec * 2),
-                pk,
-                fx.BFloat16,
-                unit_elems=scatter_vec,
-                cache_modifier=pay_cm,
-            )
 
 
     # Drain this unit's write-through payload before the CTA moves on; kernel1
@@ -344,13 +350,23 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     parity 0 plus the per-parity step.  ``experts`` is the local expert count:
     Stage1 already stores local expert ids.
     """
-    # Unrolled GEMM2 K pipeline (gemm2_pipe); fp8 A without the BM128 A stream.
+    # Unrolled GEMM2 K pipeline (gemm2_pipe) for fp8 and fp4 A, except BM128.
     # Four B stages and three A stages measured best at BM32 (EP32 TPR128).
-    G2_PIPE = a_dtype == "fp8" and int(gemm2_bm) != 128
-    G2_BSTAGES = 4
+    G2_PIPE = int(gemm2_bm) != 128
+    _env = __import__("os").environ
+    G2_BSTAGES = int(_env.get("S2_G2_BSTAGES") or 4)
+    # Experiment hooks: per-scale-group A reads, epilogue passes of EP_ROWS rows.
+    G2_ASUB = bool(int(_env.get("S2_G2_ASUB") or 0))
+    # Experiment: v2 GEMM2 with a scoped A ring (no per-K-step vmcnt(0) drain).
+    G2_SCOPED = (not G2_PIPE) and _env.get("S2_G2_SCOPED") == "1"
+    EP_ROWS = int(_env.get("S2_EP_ROWS") or 0) or int(gemm2_bm)
+    if EP_ROWS <= 0 or EP_ROWS % 16 or int(gemm2_bm) % EP_ROWS:
+        raise ValueError("S2_EP_ROWS must be a positive multiple of 16 dividing gemm2_bm")
     BK = int(gemm2_bk)
     if BK != 256:
         raise NotImplementedError(f"gemm2_bk {BK}: GEMM2 K tile 256 only (one E8M0 word per K tile)")
+    if G2_PIPE and G2_BSTAGES < 2:
+        raise ValueError("S2_G2_BSTAGES must be at least 2")
     epoch_planes = tuple(int(v) for v in epoch_planes)
     region_indices = {(stage, name): index for stage, name, index in buffer_regions}
     if buffer_regions and token_ready:
@@ -397,7 +413,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         raise ValueError("8-wave kernel1 needs the fused kernel and an even n_block count")
     THREADS_K1 = 64 * WAVES
     NPAIR = 2 if PAIR else 1  # n_blocks per CTA unit
-    compute_lds_bytes = max(NPAIR * GBM * BN * 4, aStages * GBM * KH_TILE_A)
+    compute_lds_bytes = max(NPAIR * EP_ROWS * BN * 4, aStages * GBM * KH_TILE_A)
     lds_packed_off = compute_lds_bytes
     lds_weight_off = lds_packed_off + GBM * 4
     lds_peer_off = lds_weight_off + GBM * 4
@@ -594,6 +610,10 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         + ("ro" if SD_RO else "") + ("_trpub" if TRK else "")
         + (f"s{SD_S}n{SD_NS}" if sdma and SD_NS else "")
         + (f"_g2p{G2_BSTAGES}a{aStages}" if G2_PIPE else "")
+        + ("_as" if G2_ASUB else "") + (f"_ep{EP_ROWS}" if EP_ROWS != GBM else "")
+        + (f"_pf{_env.get('S2_G2_PF_ROW')}" if _env.get("S2_G2_PF_ROW") else "")
+        + ("_aah" if _env.get("S2_G2_A_AHEAD") == "1" else "")
+        + ("_scp" if G2_SCOPED else "")
         + "_de_" + "_".join(str(v) for v in epoch_planes)
         # Symbols cannot contain '-'; encode negative strides with an m prefix.
         + f"_ad{'m' if arrival_delta_step < 0 else ''}{abs(arrival_delta_step)}"
@@ -614,7 +634,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         arg_expert_count=None, boundary_hook=None, dev_comm=None, arg_sd_send=None,
         arg_sd_tb=None, arg_sd_plan=None, arg_sd_cdone=None, arena_win=None, arena_ptr=None,
         lds_ptr=None, grp_sync=None, boundary_probe=None, arg_tr_mcnt=None,
-        unit_hook=None, tail_hook=None, arg_tr_sdprog=None, gen_value=None):
+        unit_hook=None, tail_hook=None, arg_tr_sdprog=None, gen_value=None, plan_ctx=None):
     # fmt: on
         # grp_sync (single fused kernel): (window offset of Stage1's per-group
         # h1 ready words, their parity plane, Stage1 tile group); each unit
@@ -674,12 +694,12 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
 
         def issue_all_a_loads(m_row0):
             # With G2_PIPE, gemm2_compute_pipe issues its own scoped A DMA.
-            if const_expr(A_NW < WAVES and not G2_PIPE):  # noqa: SIM102 (static path, runtime wave owner)
+            if const_expr(A_NW < WAVES and not (G2_PIPE or G2_SCOPED)):  # noqa: SIM102
                 if wave < fx.Int32(A_NW):
                     for slot in range_constexpr(kStages):
                         issue_a_load_lds_dt(arg_aq, lds_base_i32, slot, slot, m_row0, wave, lane,
                             KH_TILE_A, k_bytes, BM=GBM, NW=A_NW, a_dtype=a_dtype)
-            if const_expr(A_NW >= WAVES and not G2_PIPE):
+            if const_expr(A_NW >= WAVES and not (G2_PIPE or G2_SCOPED)):
                 for slot in range_constexpr(kStages):
                     issue_a_load_lds_dt(arg_aq, lds_base_i32, slot, slot, m_row0, wave, lane,
                         KH_TILE_A, k_bytes, BM=GBM, NW=WAVES, a_dtype=a_dtype)
@@ -789,19 +809,21 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 accm_vecs, _m_row, n_block_idx, _n_out_rt = gemm2_compute_pipe(lds_base_i32, arg_ascale,
                     arg_bq, arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter,
                     i32_hidden, BM=GBM, BN=BN, BK=BK, INTER_MAX=inter_dim, aStages=aStages,
-                    explicit_a_row=a_row, eids_stride=GS, NW=WAVES, a_dtype=a_dtype, b_stages=G2_BSTAGES)
+                    explicit_a_row=a_row, eids_stride=GS, NW=WAVES, a_dtype=a_dtype, b_stages=G2_BSTAGES,
+                    a_by_sub=G2_ASUB)
             else:
                 accm_vecs, _m_row, n_block_idx, _n_out_rt = gemm2_compute_v2(lds_base_i32, arg_ascale, arg_bq,
                     arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter, i32_hidden,
                     BM=GBM, BN=BN, BK=BK, INTER_MAX=inter_dim, aStages=aStages, explicit_a_row=a_row,
-                    eids_stride=GS, NW=WAVES, a_dtype=a_dtype)
+                    eids_stride=GS, NW=WAVES, a_dtype=a_dtype, scoped=G2_SCOPED)
             p2p_scatter_epilog(lds_base_i32, accm_vecs,
                 n_block_idx, wave, lane, NW=WAVES, N_OUT=N_OUT,
                 BM=GBM, BN=BN, npes=npes, topk=topk,
                 log2_max_tok=log2_max_tok, mask_max_tok=mask_max_tok, recv_cap=recv_cap,
                 comb_inp_nbytes=comb_inp_nbytes, lds_packed_off=lds_packed_off,
                 lds_weight_off=lds_weight_off, lds_peer_off=lds_peer_off, scatter_vec=scatter_vec,
-                gpus_per_node=gpus_per_node, lds_rowptr_off=lds_rowptr_off if sdma else None)
+                gpus_per_node=gpus_per_node, lds_rowptr_off=lds_rowptr_off if sdma else None,
+                ep_rows=EP_ROWS)
             # fmt: on
 
         if const_expr(grp_sync is not None):
@@ -1022,7 +1044,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                         return fx.Int64(fx.ptr_load(lds_typed_ptr(
                             fx.Int32(lds_peer_off) + p * fx.Int32(8), T.i64, align=8)))
 
-                    def _sdma_plan():
+                    def _sdma_plan(pc_arg=None):
                         """One CTA lays out the send buffer before any GEMM2 row is
                         stored: per (ticket, dest) the exclusive prefix of rows
                         (tile_base, plus the end entry), per dest its run in the
@@ -1031,7 +1053,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                         tickets [tx*k, tx*k+k); counts go to tile_base and a
                         two-level LDS scan turns them into prefixes in place."""
                         n_tk = total_m_blocks
-                        pc = bx_i32 - fx.Int32(SD_PLAN_BX)
+                        pc = bx_i32 - fx.Int32(SD_PLAN_BX) if pc_arg is None else pc_arg
                         c_base = pc * _sd_tpc()
                         n_loc = _min_rt(_max_rt(n_tk - c_base, fx.Int32(0)), _sd_tpc())
                         kper = (n_loc + fx.Int32(THREADS_K1 - 1)) // fx.Int32(THREADS_K1)
@@ -1244,9 +1266,22 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                             _sdma_signal(sd, p)
                             sd.commit(p, fx.Int32(0))
 
-                    is_plan = bx_i32 >= fx.Int32(SD_PLAN_BX)
-                    if is_plan:
-                        _sdma_plan()
+                    if const_expr(plan_ctx is not None):
+                        # Single kernel: the CTAs that skipped GMM1 arrive here
+                        # hundreds of us early and take the plan parts round
+                        # robin; compute CTAs find the plan done.
+                        plan_e, plan_n = plan_ctx
+                        is_plan = plan_e >= fx.Int32(0)
+                        if tx_i32 == fx.Int32(0):
+                            _sd_lds_put(SP_GS, fx.Int32(SP_LAST), fx.Int32(0))
+                        fx.barrier()
+                        if is_plan:
+                            for plan_pc in range(plan_e, fx.Int32(SD_PLAN_CTAS), plan_n):
+                                _sdma_plan(plan_pc)
+                    else:
+                        is_plan = bx_i32 >= fx.Int32(SD_PLAN_BX)
+                        if is_plan:
+                            _sdma_plan()
                     if tx_i32 == fx.Int32(0):
                         pd = fx.Int64(comm.load_i64_global_system_relaxed(
                             fx.Int64(arg_sd_plan) + fx.Int64(128)))
@@ -1615,6 +1650,15 @@ def peer_table_launcher(gpus_per_node: int, npes: int, *, lsa_peer_base: int = 0
 _G2_LAUNCH_CACHE = {}
 
 
+def gemm2_mode_key():
+    """Experiment switches are part of the cached GEMM2 specialization."""
+    env = __import__("os").environ
+    return tuple(env.get(k) for k in (
+        "S2_G2_BSTAGES", "S2_G2_ASUB", "S2_G2_SCOPED", "S2_EP_ROWS",
+        "S2_G2_PF_ROW", "S2_G2_A_AHEAD",
+    ))
+
+
 def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_stids,
                         arg_sweights, arg_trb, arg_p2p, arg_arrival_count, arg_generation,
                         arg_a_tile_map, row_capacity, local_rank, stream, arg_expert_count=0,
@@ -1623,7 +1667,7 @@ def run_mega_moe_stage2(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cu
 
     ``compile_kw`` are the keyword arguments of :func:`compile_mega_moe_stage2`.
     """
-    key = tuple(sorted(compile_kw.items()))
+    key = (tuple(sorted(compile_kw.items())), gemm2_mode_key())
     launch = _G2_LAUNCH_CACHE.get(key)
     if launch is None:
         launch = compile_mega_moe_stage2(**compile_kw)
@@ -2398,7 +2442,7 @@ def compile_stage2_node_combine(
                               + fx.Int64(fx.Int32(plane * MAX_TOKENS) + ck_first)
                               * fx.Int64(8), generation)
                       if const_expr(plane != local_plane):
-                          if const_expr(CREDIT_ASYNC):  # noqa: SIM102 (static protocol, runtime lane owner)
+                          if const_expr(CREDIT_ASYNC):  # noqa: SIM102 (trace-time vs runtime guard)
                               # The peer must have consumed generation g-2 from this
                               # parity slot before this put overwrites it.
                               if lane == fx.Int32(0):
@@ -2684,7 +2728,7 @@ def compile_stage2_node_combine(
                     _consumed_requests.append(_rail.flush_async(
                         dev_comm, fx.Int32(0), fx.Int32(_peer_node)))
                 for _peer_index in range_constexpr(NODES - 1):
-                    if const_expr(not CREDIT_ASYNC):  # noqa: SIM102 (static protocol, runtime lane owner)
+                    if const_expr(not CREDIT_ASYNC):  # noqa: SIM102 (trace-time vs runtime guard)
                         if lane == fx.Int32(0):
                             _credit_ptr = credit_ptr + fx.Int64(_peer_index * 8)
                             _credit = fx.Int64(comm.load_i64_global_system(_credit_ptr))
@@ -3436,7 +3480,8 @@ def run_stage2_fused(*, k1_ptrs: dict, k1_compile: dict, dev_comm, arena_win, ar
                      arg_output_bf16, arg_scratch, local_tokens, k2_ctas, stream,
                      k2_compile: dict):
     """Compile (once per configuration) and launch the fused stage2 kernel."""
-    key = (tuple(sorted(k1_compile.items())), tuple(sorted(k2_compile.items())), int(k2_ctas))
+    key = (tuple(sorted(k1_compile.items())), tuple(sorted(k2_compile.items())), int(k2_ctas),
+           gemm2_mode_key())
     launch = _FUSED_CACHE.get(key)
     if launch is None:
         launch = _FUSED_CACHE[key] = compile_stage2_fused(k1_compile, k2_compile, k2_ctas)

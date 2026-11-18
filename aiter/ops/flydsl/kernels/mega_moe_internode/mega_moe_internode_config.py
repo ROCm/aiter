@@ -3,8 +3,9 @@
 
 Load ``aiter/configs/mega_moe_internode_tuned.csv``, or the file selected by
 ``AITER_CONFIG_MEGAMOE_INTERNODE``. One row configures both stages. Missing
-shapes use built-in rules; both stages reject a row whose split path does
-not match the shape. There are no per-field environment overrides.
+shapes use built-in rules; a row also chooses the split path (``split_local``),
+so Stage1 and Stage2 always follow the same row. There are no per-field
+environment overrides.
 
 The key follows the MegaMoE TP table naming: ``gfx, cu_num, model_dim,
 inter_dim, experts, topk, tokens, quant, world_size, gpus_per_node``. Legacy rows
@@ -18,7 +19,7 @@ Stage1 parameters:
 * ``tile_group``: G adjacent 32-row arena tiles form one GMM1 M tile of 32*G.
   The arena's 32-row granularity stays fixed; G also controls map allocation.
 * ``split_local``: split local/remote-source groups and start local GMM1 early.
-  The current shape rule selects split at tokens>=1024. Each path derives its
+  Without a row the shape rule selects split at tokens>=1024. Each path derives its
   associated scheduling, sealing, and padding switches from this setting.
 * ``fanout_ctas_per_dest``: Stage1 fanout-role CTA slots per destination GPU.
   Eight destinations reserve 8*N slots. T0 occupies destination 0's first slot
@@ -265,9 +266,9 @@ def select_stage1_tile(
     shape; ``source`` is ``table`` or ``default`` (the built-in rule).  The kernel
     name (``_tg{G}``, ``_fos{N}``, ``_slg``) remains the ground truth for what ran.
 
-    ``split_local`` is fixed at compile time by the tokens per rank
-    (``default_split_local``); a table row only supplies G and the fanout shards,
-    and is used only when its ``split_local`` agrees.
+    ``split_local`` comes from the table row when there is one (EP16 K3 a8w4
+    TPR1024 measured 14% faster unsplit); otherwise the tokens-per-rank rule
+    (``default_split_local``) picks it and the built-in G and fanout follow.
 
     The split path needs 16 remote fanout shards plus the CCO ticket,
     so its minimum fanout count is 17; the unsplit minimum is 2.
@@ -300,7 +301,7 @@ def select_stage1_tile(
         # Anything else (no device, no aiter root) falls back to the rule.
         logger.debug("Stage1 tune lookup failed; using built-in rules", exc_info=True)
         tuned = None
-    if tuned is not None and int(tuned["split_local"]) == split:
+    if tuned is not None:
         out = {
             key: tuned[key]
             for key in (
@@ -479,7 +480,7 @@ def lookup_tune(
 
     ``token`` is the GEMM row count (tokens per rank times topk); the CSV uses
     per-rank ``tokens``. ``expert`` maps to the per-rank ``experts`` column.
-    Stage1 and Stage2 share the row and the same split-path compatibility check.
+    Stage1 and Stage2 share the row, including its split path.
     """
     row = TUNE_TABLE.lookup(
         gfx=gfx,
@@ -493,8 +494,6 @@ def lookup_tune(
         world_size=world_size,
         gpus_per_node=gpus_per_node,
     )
-    if row is not None and row["split_local"] != default_split_local(token, topk):
-        return None
     return row
 
 

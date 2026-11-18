@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""GEMM2 core with a compile-time unrolled K loop (fp8 A, fp4 B)."""
+"""GEMM2 core with a compile-time unrolled K loop (fp8 or fp4 A, fp4 B)."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -12,6 +12,7 @@ from flydsl.expr.typing import Vector as Vec
 from ..mxfp4_gemm_common import (
     _buffer_rsrc,
     _lds_ptr3,
+    _lds_swizzle_mask,
     global_typed_ptr,
     kBS_stride_k0_dw,
     lds_swizzle_mask_f8,
@@ -45,6 +46,7 @@ def gemm2_compute_pipe(
     NW=4,
     a_dtype="fp8",
     b_stages=3,
+    a_by_sub=False,
 ):
     """gemm2_compute_v2 with the K loop unrolled at compile time (K = INTER_MAX).
 
@@ -55,26 +57,36 @@ def gemm2_compute_pipe(
     does not wait for every outstanding LDS DMA before reading one slot. The
     caller must not issue A loads itself.
     """
-    assert a_dtype == "fp8" and BK == 256 and BM >= 32 and NW in (4, 8)
+    assert a_dtype in ("fp8", "fp4") and BK == 256 and BM >= 32 and NW in (4, 8)
     assert aStages >= 2 and b_stages >= 2
+    is_f8_a = a_dtype == "fp8"
+    a_pack = 1 if is_f8_a else 2
     A_AHEAD = aStages - 1  # A DMA runs this many K steps ahead
     wave_c = wave % fx.Int32(4) if NW == 8 else wave
-    A_NW = min(NW, BM // 4)
-    if const_expr(A_NW < NW):
-        raise NotImplementedError("gemm2_compute_pipe needs every wave on the A DMA")
+    KH_TILE_A = BK // a_pack  # A bytes per row and K tile: 256 (fp8) / 128 (fp4)
+    lanes_per_row = KH_TILE_A // 16  # one LDS DMA moves 64 lanes x 16 B
+    rows_per_call = 64 // lanes_per_row  # 4 (fp8) / 8 (fp4) rows per DMA
+    # With more waves than row groups (fp4 BM32: 4 groups, 8 waves) wave w and
+    # w + A_NW load the same rows into the same LDS bytes: the duplicate DMA carries
+    # identical data, and every wave waits for its own DMA before the step barrier.
+    # (Guarding the DMA with a runtime "if wave < A_NW" here gave wrong results:
+    # measured relL2 0.48 at a4w4 BM32.)
+    A_NW = min(NW, BM // rows_per_call)
+    wave_a = (
+        wave % fx.Int32(A_NW) if A_NW < NW else wave
+    )  # this wave's A row group owner
     rows_per_wave = BM // A_NW
-    assert rows_per_wave % 4 == 0
-    n_row_groups = rows_per_wave // 4  # fp8: 16 lanes x 16 B per 256-byte row
+    assert rows_per_wave % rows_per_call == 0
+    n_row_groups = rows_per_wave // rows_per_call
     kMChunks = BM // 16
     kHalves = BK // 128
     numAccN = (BN // 4) // 16
     nPairs = max(1, numAccN // 2)
     kScaleSubBlocks = kMChunks // 2
-    KH_TILE_A = BK
     slot_bytes = BM * KH_TILE_A
     K_TILES = INTER_MAX // BK
     K_rt = fx.Int32(i32_inter)
-    K_BYTES = K_rt
+    K_BYTES = K_rt // fx.Int32(a_pack)  # A row stride bytes
     kc_rt = K_rt // 256
     kAS_per_chunk_dw = kc_rt * 64
     kBS_stride_n0_dw = kc_rt * 64
@@ -116,25 +128,30 @@ def gemm2_compute_pipe(
             ),
         }
 
-    # A: one buffer descriptor per unit; one LDS DMA moves 64 lanes x 16 B (4 rows).
+    def _swz(row):
+        return (
+            lds_swizzle_mask_f8(row, KH_TILE_A) if is_f8_a else _lds_swizzle_mask(row)
+        )
+
+    # A: one buffer descriptor per unit; one LDS DMA moves 64 lanes x 16 B.
     a_rsrc = _buffer_rsrc(
         fx.Int64(arg_aq) + fx.Int64(a_row) * fx.Int64(K_BYTES),
         fx.Int64(BM) * fx.Int64(K_BYTES),
     )
-    a_lane_row = lane // fx.Int32(16)
-    a_lane_col = (lane % fx.Int32(16)) * fx.Int32(16)
+    a_lane_row = lane // fx.Int32(lanes_per_row)
+    a_lane_col = (lane % fx.Int32(lanes_per_row)) * fx.Int32(16)
     a_voff = []
     for g in range_constexpr(n_row_groups):
-        tile_row = wave * fx.Int32(rows_per_wave) + fx.Int32(g * 4) + a_lane_row
-        a_voff.append(
-            (a_lane_col ^ lds_swizzle_mask_f8(tile_row, KH_TILE_A)) + tile_row * K_BYTES
+        tile_row = (
+            wave_a * fx.Int32(rows_per_wave) + fx.Int32(g * rows_per_call) + a_lane_row
         )
+        a_voff.append((a_lane_col ^ _swz(tile_row)) + tile_row * K_BYTES)
 
     def issue_a(kt):
         slot = kt % aStages
         for g in range_constexpr(n_row_groups):
             lds_off = fx.Int32(slot * slot_bytes) + (
-                wave * fx.Int32(rows_per_wave) + fx.Int32(g * 4)
+                wave_a * fx.Int32(rows_per_wave) + fx.Int32(g * rows_per_call)
             ) * fx.Int32(KH_TILE_A)
             rocdl.raw_ptr_buffer_load_lds(
                 a_rsrc,
@@ -147,17 +164,21 @@ def gemm2_compute_pipe(
                 **_scope_attrs(slot),
             )
 
-    a_mask = lds_swizzle_mask_f8(lane_mod_16, KH_TILE_A)
+    a_mask = _swz(lane_mod_16)
+    A_NDW = 8 if is_f8_a else 4  # dwords of one 16x128-K A fragment per lane
     a_frags = [
-        [fx.make_rmem_tensor(8, Int32) for _ in range_constexpr(kHalves)]
+        [fx.make_rmem_tensor(A_NDW, Int32) for _ in range_constexpr(kHalves)]
         for _ in range_constexpr(kMChunks)
     ]
 
-    def read_a(kt):
+    all_chunks = tuple(range(kMChunks))
+
+    def read_a(kt, chunks=all_chunks):
         slot = kt % aStages
         for k in range_constexpr(kHalves):
-            col0 = lane_div_16 * fx.Int32(16) + fx.Int32(k * 128)
-            for i in range_constexpr(kMChunks):
+            col0 = lane_div_16 * fx.Int32(16) + fx.Int32(k * (128 if is_f8_a else 64))
+            for ci in range_constexpr(len(chunks)):
+                i = chunks[ci]
                 row_off = fx.Int32(slot * slot_bytes) + (
                     lane_mod_16 + fx.Int32(i * 16)
                 ) * fx.Int32(KH_TILE_A)
@@ -169,23 +190,26 @@ def gemm2_compute_pipe(
                         **_scope_attrs(slot),
                     ).result
                 )
-                hi = Vec(
-                    llvm.LoadOp(
-                        Vec.make_type(4, fx.Int32),
-                        _lds_ptr3(
-                            lds_base_i32, row_off + ((col0 + fx.Int32(64)) ^ a_mask)
-                        ),
-                        alignment=16,
-                        **_scope_attrs(slot),
-                    ).result
-                )
-                a_frags[i][k].store(
-                    Vec.from_elements(
-                        [lo[j] for j in range_constexpr(4)]
-                        + [hi[j] for j in range_constexpr(4)],
-                        fx.Int32,
+                if const_expr(not is_f8_a):
+                    a_frags[i][k].store(lo)
+                else:
+                    hi = Vec(
+                        llvm.LoadOp(
+                            Vec.make_type(4, fx.Int32),
+                            _lds_ptr3(
+                                lds_base_i32, row_off + ((col0 + fx.Int32(64)) ^ a_mask)
+                            ),
+                            alignment=16,
+                            **_scope_attrs(slot),
+                        ).result
                     )
-                )
+                    a_frags[i][k].store(
+                        Vec.from_elements(
+                            [lo[j] for j in range_constexpr(4)]
+                            + [hi[j] for j in range_constexpr(4)],
+                            fx.Int32,
+                        )
+                    )
 
     sc_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), 32)
     asc_per_mb = fx.Int32(kScaleSubBlocks) * kAS_per_chunk_dw * 4
@@ -311,25 +335,41 @@ def gemm2_compute_pipe(
         emit_a(kt + A_AHEAD)
         emit_b(kt + b_stages - 1)
         rocdl.sched_barrier(0)
-        read_a(kt)
+        if const_expr(not a_by_sub):
+            read_a(kt)
         s = kt % b_stages
         sa = [Vec(st_sa[s][sub].load())[0] for sub in range_constexpr(kScaleSubBlocks)]
         sbw = [Vec(st_bs[s][mni].load())[0] for mni in range_constexpr(nPairs)]
         rocdl.s_setprio(1)
-        for J in range_constexpr(numAccN):
-            for sub in range_constexpr(kScaleSubBlocks):
-                mma_one_j(
-                    J,
-                    J % 2,
-                    sa[sub],
-                    sbw[J // 2],
-                    st_bq[s],
-                    a_frags,
-                    c_frags,
-                    mma_atoms,
-                    i0=2 * sub,
-                    k_halves=kHalves,
-                )
+        # a_by_sub: per 32-row scale group, read its two A chunks and run every
+        # J on them, so only one group's A fragments are live (BM96: 96 -> 32
+        # VGPRs). Each accumulator still sees the same K order.
+        order = (
+            [(J, sub) for sub in range(kScaleSubBlocks) for J in range(numAccN)]
+            if a_by_sub
+            else [(J, sub) for J in range(numAccN) for sub in range(kScaleSubBlocks)]
+        )
+        for oi in range_constexpr(len(order)):
+            J, sub = order[oi]
+            if const_expr(a_by_sub and J == 0):
+                read_a(kt, (2 * sub, 2 * sub + 1))
+            mma_one_j(
+                J,
+                J % 2,
+                sa[sub],
+                sbw[J // 2],
+                st_bq[s],
+                a_frags,
+                c_frags,
+                mma_atoms,
+                i0=2 * sub,
+                k_halves=kHalves,
+            )
+            if const_expr(a_by_sub and J == numAccN - 1):
+                # Keep the next group's A reads behind this group's MFMAs; the
+                # unrolled K loop otherwise hoists every group's reads (BM128:
+                # 1126 spilled VGPRs).
+                rocdl.sched_barrier(0)
         rocdl.s_setprio(0)
         rocdl.sched_barrier(0)
     # The epilogue reuses the A ring as its accumulator slab.
