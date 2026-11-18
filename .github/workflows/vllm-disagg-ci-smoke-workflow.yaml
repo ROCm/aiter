@@ -13,7 +13,7 @@ on:
         description: "Shared path visible to Spur login and compute nodes"
         required: false
         type: string
-        default: "/data/xinhuang/vllm-disagg-logs/"
+        default: "/data/aiter-di-ci/vllm-disagg-logs/"
       spur_node_pool:
         description: "Comma-separated Spur node pool used to select idle nodes for each smoke job"
         required: false
@@ -49,11 +49,11 @@ permissions:
 
 env:
   VLLM_REPOSITORY_URL: https://github.com/vllm-project/vllm.git
-  # vLLM main as of 2026-10-27. The harness under .buildkite/amd-disagg and the
+  # vLLM main as of 2026-11-10. The harness under .buildkite/amd-disagg and the
   # case list are taken from this tree and run against the nightly image below,
   # so bump it when the nightly moves past a harness change. A non-empty
   # vllm_ref input overrides it for a single run.
-  VLLM_BASELINE_SHA: 7fe793a5d5b75a30386e0e182708da6fc5487954
+  VLLM_BASELINE_SHA: 4e3463c87493ebd2c5d5fbe4be6469911e23e2bf
   VLLM_REF_INPUT: ${{ inputs.vllm_ref || '' }}
   # :nightly moves daily. build_aiter_wheel pins it to a digest that the wheel
   # build and every case then use, so a nightly published mid-run cannot mix two
@@ -65,7 +65,7 @@ env:
   # sha256:906b6d59b6bbc8adc744012704d3464e58abe47e99d8b1647e1029a4793484e5.
   # Use a dated tag (e.g. nightly-20260916-92d0bb9) to pin a run exactly.
   VLLM_ROUTER_IMAGE: vllm/vllm-router:nightly
-  DISAGG_SCRIPTS_STAGE: ${{ inputs.disagg_scripts_stage || '/data/xinhuang/vllm-disagg-logs/' }}
+  DISAGG_SCRIPTS_STAGE: ${{ inputs.disagg_scripts_stage || '/data/aiter-di-ci/vllm-disagg-logs/' }}
   SPUR_NODE_POOL: ${{ inputs.spur_node_pool || 'ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-5,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-6,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-7,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-8,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16' }}
   # Every case shares SPUR_NODE_POOL, so 3- and 4-node cases queue behind each
   # other in Spur. Allow up to 3 h queued instead of the harness's 30-minute
@@ -80,6 +80,10 @@ env:
   AITER_GPU_ARCHS: gfx950
   AITER_BUILD_MAX_JOBS: "64"
   AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-disagg-wheel-${{ github.run_id }}
+  # Each smoke job downloads the overlay wheels into its own directory here
+  # rather than the runner workspace, which is on the login node's root disk.
+  # The runner user (aiter-di-ci) needs write access to it.
+  AITER_WHEEL_ROOT: /data/aiter-di-ci/vllm-disagg-wheels
 
 jobs:
   ci_config:
@@ -289,6 +293,7 @@ jobs:
           label_re = re.compile(r"-PD-(\d+P\d+D)-([A-Z]+\d+(?:/DP\d+)?)-")
           cases = []
           skipped = []
+          other_connector = []
           pending = None  # vLLM-router label still waiting for its command line
 
           for line in pipeline.read_text(encoding="utf-8").splitlines():
@@ -320,6 +325,11 @@ jobs:
               # IMAGE= would override it.
               command = re.sub(r"^IMAGE=\S+\s+", "", command_match.group(1))
               fields = dict(re.findall(r"(?:^|\s)([A-Za-z_]+)=(\S+)", command))
+              # Only the MoRIIO cases run here. Steps on another KV connector
+              # (the NIXL ones) reuse a MoRIIO case's model and topology.
+              if fields.get("KV_CONNECTOR", "MoRIIOConnector") != "MoRIIOConnector":
+                  other_connector.append(label)
+                  continue
               model = fields.get("MODEL_NAME")
               nodes = fields.get("NODES", "")
               if not model or not nodes.isdigit():
@@ -454,6 +464,12 @@ jobs:
                       f"topology: {', '.join(f'`{label}`' for label in skipped)}\n",
                       file=output,
                   )
+              if other_connector:
+                  print(
+                      "Skipped upstream vLLM-router steps on a KV connector other "
+                      f"than MoRIIO: {', '.join(f'`{label}`' for label in other_connector)}\n",
+                      file=output,
+                  )
               print("| Case | Nodes | Upstream command |", file=output)
               print("|---|---:|---|", file=output)
               for case in cases:
@@ -488,11 +504,16 @@ jobs:
       TOPOLOGY: ${{ matrix.topology }}
       NODES: ${{ matrix.nodes }}
     steps:
+      # The runner service does not read /etc/environment, where the login
+      # node sets the controller address Spur's sinfo and sbatch need.
+      - name: Load the Spur controller address
+        run: grep -E '^SPUR_(CONTROLLER|ACCOUNTING)_ADDR=' /etc/environment >> "${GITHUB_ENV}"
+
       - name: Download AITER overlay wheels
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}
-          path: aiter_wheels/${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.case_slug }}
+          path: ${{ env.AITER_WHEEL_ROOT }}/${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.case_slug }}
 
       - name: Show runner and Slurm state
         run: |
@@ -521,7 +542,7 @@ jobs:
       - name: Add offline AITER wheel overlay to the upstream case
         run: |
           set -euo pipefail
-          artifact_dir="${GITHUB_WORKSPACE}/aiter_wheels/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CASE_SLUG}"
+          artifact_dir="${AITER_WHEEL_ROOT}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${CASE_SLUG}"
           mapfile -d '' aiter_wheels < <(find "${artifact_dir}" -type f -name 'amd_aiter-*.whl' -print0)
           mapfile -d '' flydsl_wheels < <(find "${artifact_dir}" -type f -name 'flydsl-*.whl' -print0)
           if [[ "${#aiter_wheels[@]}" -ne 1 || "${#flydsl_wheels[@]}" -ne 1 ]]; then
