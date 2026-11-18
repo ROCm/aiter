@@ -145,8 +145,8 @@ def blocking_reasons(config) -> list:
     reasons = []
     if config.dispatch_wire != "fp4":
         reasons.append(f"needs the fp4 dispatch wire, got {config.dispatch_wire}")
-    if config.world_size > 8:
-        reasons.append(f"world_size {config.world_size} > 8 (8-bit source mask)")
+    if config.world_size > 16:
+        reasons.append(f"world_size {config.world_size} > 16 (16-bit source mask)")
     if config.experts_per_rank > 255:
         reasons.append(f"{config.experts_per_rank} experts per rank > 255")
     if config.max_tokens_per_rank > 0xFFFF:
