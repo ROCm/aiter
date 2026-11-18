@@ -27,7 +27,10 @@ import aiter
 from aiter import QuantType, dtypes
 from aiter.fused_moe import fused_moe, fused_topk, moe_sorting
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.quant import fused_dynamic_mx_quant_moe_sort
+from aiter.ops.quant import (
+    fused_dynamic_mx_quant_moe_sort,
+    fused_dynamic_mx_quant_moe_sort_hip,
+)
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.fp4_utils import e8m0_shuffle
 
@@ -42,6 +45,16 @@ def _poison(pool_tensors):
     for t in pool_tensors:
         if t.numel():
             t.view(torch.uint8).fill_(0xFF)
+
+
+def _zeros_like(t):
+    """Zero-filled tensor of ``t``'s shape and dtype.
+
+    Packed fp4 / e8m0 have no fill kernel, so zero the raw bytes and view them
+    back. A byte the quant kernel does not write stays 0, which is what a
+    captured replay records with its memset.
+    """
+    return torch.zeros(t.shape, dtype=torch.uint8, device=t.device).view(t.dtype)
 
 
 def _capture(fn):
@@ -70,7 +83,7 @@ def test_quant_sort_replay(token_num, model_dim=1024, num_experts=16, topk=4):
         sorted_ids, sorted_w, _, num_valid, _ = moe_sorting(
             topk_ids, topk_w, num_experts, model_dim, dtypes.bf16, BLOCK_M
         )
-        return fused_dynamic_mx_quant_moe_sort(
+        quant, scale = fused_dynamic_mx_quant_moe_sort(
             x,
             sorted_ids=sorted_ids,
             num_valid_ids=num_valid,
@@ -79,26 +92,42 @@ def test_quant_sort_replay(token_num, model_dim=1024, num_experts=16, topk=4):
             block_size=BLOCK_M,
             sorted_weights=sorted_w,
         )
+        return quant, scale, sorted_ids, sorted_w, num_valid
 
-    eager_q, eager_s = (t.clone() for t in run())
-    graph, (q, s) = _capture(run)
+    graph, (q, s, sorted_ids, sorted_w, num_valid) = _capture(run)
     for i in range(3):
         _poison([q, s])
         graph.replay()
         torch.cuda.synchronize()
-        # Padding rows of the scale are consumed as block-granular tiles, so the
-        # whole tensor (not only the valid rows) must match eager.
-        n_cols = (model_dim // 32 + 7) // 8 * 8
+        # The kernel does not cover every allocated scale byte (swizzle holes
+        # and the tile padding). Eager ``torch.empty`` leaves those as allocator
+        # leftovers, so a whole-buffer compare with eager is not a defined
+        # result. Replay records a memset of the whole buffer and then the
+        # kernel; the reference is that same kernel launched into zeroed
+        # storage, using the routes this replay produced.
+        ref_q, ref_s = _zeros_like(q), _zeros_like(s)
+        fused_dynamic_mx_quant_moe_sort_hip(
+            ref_q,
+            ref_s,
+            x,
+            sorted_ids,
+            num_valid,
+            token_num,
+            BLOCK_M,
+            token_num * topk,
+            32,
+            sorted_w,
+        )
         torch.testing.assert_close(
-            s.view(torch.uint8)[:, :n_cols],
-            eager_s.view(torch.uint8)[:, :n_cols],
+            s.view(torch.uint8),
+            ref_s.view(torch.uint8),
             rtol=0,
             atol=0,
             msg=lambda m, i=i: f"replay {i}: scale diverged\n{m}",
         )
         torch.testing.assert_close(
             q.view(torch.uint8),
-            eager_q.view(torch.uint8),
+            ref_q.view(torch.uint8),
             rtol=0,
             atol=0,
             msg=lambda m, i=i: f"replay {i}: quantized activation diverged\n{m}",
