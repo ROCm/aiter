@@ -237,10 +237,16 @@
         "default": {
           "atoms_per_row": 4,
           "rungs": [
-            {"min_bytes": 0, "super_tile": 8, "grid_cap": 256, "handshake": "lamport"}
+            {"min_bytes": 0, "super_tile": 2, "grid_cap": 256, "handshake": "lamport", "knobs": "stripe=full"}
           ]
         },
         "hidden": {
+          "3584": {
+            "atoms_per_row": 4,
+            "rungs": [
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 256, "handshake": "lamport", "knobs": "stripe=full"}
+            ]
+          },
           "4096": {
             "atoms_per_row": 2,
             "rungs": [
@@ -250,7 +256,7 @@
           "6144": {
             "atoms_per_row": 2,
             "rungs": [
-              {"min_bytes": 0, "super_tile": 1, "grid_cap": 256, "handshake": "lamport"}
+              {"min_bytes": 0, "super_tile": 2, "grid_cap": 256, "handshake": "lamport", "knobs": "stripe=full"}
             ]
           },
           "8192": {
@@ -306,7 +312,7 @@
         "default": {
           "atoms_per_row": 4,
           "rungs": [
-            {"min_bytes": 0, "super_tile": 8, "grid_cap": 256, "handshake": "lamport"}
+            {"min_bytes": 0, "super_tile": 2, "grid_cap": 256, "handshake": "lamport", "knobs": "stripe=full"}
           ]
         },
         "hidden": {
@@ -314,6 +320,12 @@
             "atoms_per_row": 1,
             "rungs": [
               {"min_bytes": 0, "super_tile": 1, "grid_cap": 512, "low_latency": true, "handshake": "lamport"}
+            ]
+          },
+          "3584": {
+            "atoms_per_row": 4,
+            "rungs": [
+              {"min_bytes": 0, "super_tile": 1, "grid_cap": 256, "handshake": "lamport", "knobs": "stripe=full"}
             ]
           },
           "4096": {
