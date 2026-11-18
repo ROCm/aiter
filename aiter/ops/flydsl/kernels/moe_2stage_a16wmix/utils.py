@@ -116,9 +116,7 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, is_gfx942=False, old_pack=Fals
         # gfx942: pack two f32 high-16s into a bf16 pair. Exact for scaled int4.
         # Both eff2 lanes are defined: a splat leaves v_pk_mul_f32's high src0 reg
         # undefined, and the waitcnt pass then waits on the last load into it.
-        eff_hi = llvm.call_intrinsic(
-            T.f32, "llvm.arithmetic.fence", [_raw(eff)], [], []
-        )
+        eff_hi = llvm.intr_arithmetic_fence(_raw(eff))
         eff2 = fx.Vector.from_elements([_raw(eff), eff_hi], fx.Float32)
         los = []
         his = []
@@ -128,14 +126,14 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, is_gfx942=False, old_pack=Fals
             los.append(f_lo)
             his.append(f_hi)
         f32s = (los + his) if old_pack else [x for pair in zip(los, his) for x in pair]
-        hi16 = fx.Int32(0x07060302)  # perm_b32(b1, b0): their high halves
+        pack_sel = fx.Int32(0x07060302)  # perm_b32(b1, b0): their high halves
         i32s = []
         for i in range_constexpr(4):
             pair = [_raw(f32s[2 * i]), _raw(f32s[2 * i + 1])]
             p = fx.Vector.from_elements(pair, fx.Float32) * eff2
             b0 = p[0].bitcast(fx.Int32)
             b1 = p[1].bitcast(fx.Int32)
-            i32s.append(rocdl.perm_b32(_raw(b1), _raw(b0), _raw(hi16)))
+            i32s.append(rocdl.perm_b32(_raw(b1), _raw(b0), _raw(pack_sel)))
         v4i32 = fx.Vector.from_elements(i32s, fx.Int32)
         return v4i32.bitcast(fx.BFloat16)  # v8bf16
     # byte_sel loads (1 shift total); side-effecting pk-convert.
