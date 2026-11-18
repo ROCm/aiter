@@ -20,6 +20,8 @@ Run on gfx950:
     pytest op_tests/test_moe_mxfp4_graph_replay.py -q
 """
 
+import ctypes
+
 import pytest
 import torch
 
@@ -27,6 +29,7 @@ import aiter
 from aiter import QuantType, dtypes
 from aiter.fused_moe import fused_moe, fused_topk, moe_sorting
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.hip_runtime import load_hip_runtime
 from aiter.ops.quant import (
     fused_dynamic_mx_quant_moe_sort,
     fused_dynamic_mx_quant_moe_sort_hip,
@@ -45,6 +48,28 @@ def _poison(pool_tensors):
     for t in pool_tensors:
         if t.numel():
             t.view(torch.uint8).fill_(0xFF)
+
+
+def _poison_graph_pool(graph):
+    """Overwrite every byte of the graph's private pool, including freed blocks.
+
+    Replay does not clear the pool. A scratch buffer that died at the end of
+    capture still has its writes in the graph, and a later capture can place a
+    live tensor at that address. Filling only the output misses that scratch.
+    """
+    hip = load_hip_runtime()
+    pool = graph.pool()
+    for seg in torch.cuda.memory._snapshot()["segments"]:
+        if seg.get("segment_pool_id") != pool:
+            continue
+        err = hip.hipMemset(
+            ctypes.c_void_p(seg["address"]),
+            0xFF,
+            ctypes.c_size_t(seg["total_size"]),
+        )
+        if err != 0:
+            raise RuntimeError(f"hipMemset of graph pool failed with error {err}")
+    torch.cuda.synchronize()
 
 
 def _zeros_like(t):
@@ -210,7 +235,7 @@ def test_fused_moe_a4w4_replay(
     tol = 0.02 * float(eager.abs().max())
     graph, out = _capture(run)
     for i in range(3):
-        _poison([out])
+        _poison_graph_pool(graph)
         graph.replay()
         torch.cuda.synchronize()
         err = float((out.float() - eager).abs().max())
