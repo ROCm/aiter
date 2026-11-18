@@ -75,6 +75,7 @@ from aiter.presorted_moe import (  # noqa: F401  register_presorted_moe is publi
     aux_sort_capacity,
     bytes_overlap,
     drop_presort_after,
+    drop_presort_on_error,
     match_presorted_moe,
     pop_presorted_moe,
     presorted_moe_ignored,
