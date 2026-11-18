@@ -176,7 +176,8 @@ def chunk_delta_attn_fwd(
     if snapshot_targets and not use_flash_kda:
         raise ValueError(
             "state snapshots are only implemented on the FlashKDA path; pass a "
-            "call that flash_kda_supported accepts, with AITER_FDA_ENABLE on"
+            "call that flash_kda_supported accepts, with AITER_FDA_ENABLE on "
+            "(both exported by aiter.ops.triton.kimi_delta_attn)"
         )
 
     if use_flash_kda:

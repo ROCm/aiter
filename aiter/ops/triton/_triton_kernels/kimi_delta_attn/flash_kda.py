@@ -1303,7 +1303,7 @@ def flash_kda_fwd(
         has_initial_state:  Bool ``[N]``; false starts that sequence from zero.
         snapshot_targets:   ``((n, off), ...)``: also write sequence ``n``'s
                             state after its first ``off`` tokens. ``off`` is an
-                            interior multiple of the 32-token chunk. A sequence
+                            interior multiple of ``FLASH_KDA_CHUNK``. A sequence
                             can have any number of targets, in any order, but
                             no position twice. Host ints, so the mapping needs
                             no device read. A call with targets runs K2 on
