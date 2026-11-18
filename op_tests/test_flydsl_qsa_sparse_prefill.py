@@ -1232,17 +1232,36 @@ def main():
         )
         return
 
+    suites = (
+        (
+            "functional",
+            [*FUNCTIONAL_CASES, *CONSTANT_CASES, "mixed_union_raw"],
+            test_qsa_sparse_attention,
+        ),
+        ("graph", list(GRAPH_CASES), test_qsa_graph_replay),
+        ("kv_slots", list(SLOT_CASES), test_qsa_kv_slots),
+        ("span limit", list(SPAN_LIMIT_CASES), test_qsa_span_limit),
+        ("performance", list(PERF_CASES), test_qsa_sparse_attention),
+        ("new-scale graph", list(SCALE_CASES), test_qsa_graph_new_scale),
+        ("batch invariance", list(BATCH_CASES), test_qsa_batch_invariance),
+    )
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="config input of test",
     )
+    # Only names some suite runs: a layout only other rows use would run nothing.
+    runnable = {case for _, cases, _ in suites for case in cases}
     all_cases = [
-        *CASES,
-        *GRAPH_CASES,
-        *SLOT_CASES,
-        *SPAN_LIMIT_CASES,
-        *SCALE_CASES,
-        *BATCH_CASES,
+        case
+        for case in (
+            *CASES,
+            *GRAPH_CASES,
+            *SLOT_CASES,
+            *SPAN_LIMIT_CASES,
+            *SCALE_CASES,
+            *BATCH_CASES,
+        )
+        if case in runnable
     ]
     parser.add_argument(
         "-c",
@@ -1266,19 +1285,7 @@ def main():
     args = parser.parse_args()
 
     layouts = {**GRAPH_CASES, **SLOT_CASES, **SCALE_CASES}
-    for suite, cases, test in (
-        (
-            "functional",
-            [*FUNCTIONAL_CASES, *CONSTANT_CASES, "mixed_union_raw"],
-            test_qsa_sparse_attention,
-        ),
-        ("graph", list(GRAPH_CASES), test_qsa_graph_replay),
-        ("kv_slots", list(SLOT_CASES), test_qsa_kv_slots),
-        ("span limit", list(SPAN_LIMIT_CASES), test_qsa_span_limit),
-        ("performance", list(PERF_CASES), test_qsa_sparse_attention),
-        ("new-scale graph", list(SCALE_CASES), test_qsa_graph_new_scale),
-        ("batch invariance", list(BATCH_CASES), test_qsa_batch_invariance),
-    ):
+    for suite, cases, test in suites:
         df = []
         selected = [case for case in args.case if case in cases]
         for case, group in [
