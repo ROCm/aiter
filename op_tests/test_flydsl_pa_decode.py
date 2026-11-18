@@ -3206,40 +3206,32 @@ def _branch_launch(pa, output, arguments, options, plan, workspace, *, refresh=F
 
 
 def _branch_assert_plan(plan, lengths):
-    """Independent integer oracle for absolute tiles, budgets and packed slots."""
-    first = [
-        (
+    """Split-rule-independent invariants; test_pa_decode_plan owns the exact rule."""
+    info = plan.reduce_info.cpu().tolist()
+    work = plan.work_info.cpu().tolist()
+    cursor = 0
+    for seq, (length, (start, count)) in enumerate(zip(lengths, info)):
+        first = (
             max(0, length - plan.query_length + 1 - plan.sliding_window) // 256
             if plan.sliding_window > 0
             else 0
         )
-        for length in lengths
-    ]
-    last = [(max(0, length) + 255) // 256 for length in lengths]
-    tiles = [end - begin for begin, end in zip(first, last)]
-    remaining = plan.capacity - sum(count > 0 for count in tiles)
-    total = max(sum(tiles), 1)
-    prefix, work, reductions = 0, [], []
-    for seq, (length, begin, count) in enumerate(zip(lengths, first, tiles)):
-        extra = (prefix + count) * remaining // total - prefix * remaining // total
-        parts = min(int(count > 0) + extra, count, plan.max_partitions)
-        prefix += count
-        reductions.append([len(work), parts])
-        for part in range(parts):
-            work.append(
-                [
-                    seq,
-                    begin + part * count // parts,
-                    begin + (part + 1) * count // parts,
-                    length,
-                ]
-            )
-    assert len(work) <= plan.capacity
-    active = len(work)
-    work += [[0, 0, 0, 0]] * (plan.capacity - active)
-    assert plan.reduce_info.cpu().tolist() == reductions
-    assert plan.work_info.cpu().tolist() == work
-    return active
+        last = (max(0, length) + 255) // 256
+        tiles = last - first
+        assert start == cursor
+        assert (count >= 1) == (tiles > 0)
+        assert count <= plan.max_partitions
+        tile = first
+        for record in work[start : start + count]:
+            row, begin, end, original_length = record
+            assert row == seq and original_length == length
+            assert begin == tile and begin < end <= last
+            tile = end
+        assert tile == last
+        cursor += count
+    assert cursor <= plan.capacity
+    assert all(record == [0, 0, 0, 0] for record in work[cursor:])
+    return cursor
 
 
 def _branch_assert_contracts(pa, output, arguments, options, plan):
@@ -3811,6 +3803,15 @@ _branch_CASES = [
         lengths=(511,),
         masked_scale=True,
     ),
+    # FP8 queries with a quantized-query scale, plain decode and MTP with a window.
+    _branch_case("fp8-query-decode", (1, 1, 16, 128), parts=7, fp8_query=True),
+    _branch_case(
+        "fp8-query-mtp-window",
+        (4, 1, 16, 128),
+        parts=7,
+        window=257,
+        fp8_query=True,
+    ),
     *_branch_cases(
         "parts window lengths workgroup_budget",
         [
@@ -3997,11 +3998,17 @@ def test_pa_decode_branch(case, device, monkeypatch):
             units if case["max_partitions"] is None else case["max_partitions"]
         )
         assert plan.max_partitions == expected_parts
+        default_budget = 2 * units
+        if case["query_length"] > 1 and arch == "gfx950":
+            # Multi-query tasks on gfx950 default to fewer, longer tasks.
+            default_budget = min(
+                max(4 * context.numel() * kv_heads, units), default_budget
+            )
         budget = (
             (
                 case["workgroup_budget"]
                 if case["workgroup_budget"] is not None
-                else 2 * units
+                else default_budget
             )
             if planned
             else context.numel() * kv_heads * expected_parts
