@@ -60,7 +60,10 @@ __device__ __forceinline__ float tile_row_sum(float value, int lane)
 // A lane holds VEC hidden elements of its row per step: 8 (16x16x32 MFMA) or 4
 // (16x16x16). PACKED: fn is the BF16 hi/lo layout of mhc_shuffle_fn; otherwise it is
 // FP32 and split into hi and lo here.
-template <int VEC, bool PACKED>
+// HIDDEN and SPLITS are the hidden size and the split count at compile time for the
+// configurations of the table, so that the offsets and the step count fold; 0 takes
+// the kernel argument.
+template <int VEC, bool PACKED, int HIDDEN, int SPLITS>
 __global__ __launch_bounds__(256, 1) void produce(float* __restrict__ partials,
                                                   B* __restrict__ next_residual,
                                                   const B* __restrict__ x,
@@ -69,15 +72,22 @@ __global__ __launch_bounds__(256, 1) void produce(float* __restrict__ partials,
                                                   const float* __restrict__ comb,
                                                   const float* __restrict__ fn,
                                                   int m,
-                                                  int hidden,
-                                                  int splits)
+                                                  int hidden_arg,
+                                                  int splits_arg)
 {
 #if MHC_GRAM_GFX950
     using opus::operator""_I;
     static_assert(VEC == 4 || VEC == 8);
     static_assert(opus::get_warp_size() == 64);
-    using BV = opus::vector_t<B, VEC>;
-    using FV = opus::vector_t<float, VEC>;
+    // Cache policy of the loads of x and the residual streams, which are read once per
+    // call: plain loads measured faster for hidden 7168, non-temporal loads for hidden
+    // 4096 (MI350X, inputs in the cache and rotating inputs). fn is read by every row
+    // tile and keeps plain loads.
+    constexpr auto ACT_AUX = HIDDEN == 7168 ? RT : GROUP_NT;
+    const int hidden       = HIDDEN ? HIDDEN : hidden_arg;
+    const int splits       = SPLITS ? SPLITS : splits_arg;
+    using BV               = opus::vector_t<B, VEC>;
+    using FV               = opus::vector_t<float, VEC>;
     __shared__ float s_projection[3 * 64 * 8];
     __shared__ float s_gram[3 * TM * 10];
 
@@ -118,11 +128,11 @@ __global__ __launch_bounds__(256, 1) void produce(float* __restrict__ partials,
     for(int step = 0; step < steps; ++step)
     {
         const int k = split * (hidden / splits) + (step * 4 + wave) * (4 * VEC) + lane / TM * VEC;
-        const BV xv = load<VEC>(gx, row * hidden + k);
+        const BV xv = load<VEC>(gx, row * hidden + k, 0, opus::number<ACT_AUX>{});
         BV rv[HC];
 #pragma unroll
         for(int h = 0; h < HC; ++h)
-            rv[h] = load<VEC>(gr, row * full + h * hidden + k);
+            rv[h] = load<VEC>(gr, row * full + h * hidden + k, 0, opus::number<ACT_AUX>{});
 
         // The rounded streams stay in registers: each is stored once and then used by the
         // Gram products and the projection. The sum has the operation order of mhc_post as
@@ -149,7 +159,9 @@ __global__ __launch_bounds__(256, 1) void produce(float* __restrict__ partials,
             store<VEC>(gn, stored, row * full + dest * hidden + k);
         }
 
-        // The ten upper-triangle products of the rounded streams.
+        // The ten upper-triangle products of the rounded streams, summed over the four
+        // lanes of a row here: the lane exchanges then overlap the weight loads below.
+        // In front of the barrier they ran one after the other.
 #pragma unroll
         for(int a = 0; a < HC; ++a)
         {
@@ -160,7 +172,7 @@ __global__ __launch_bounds__(256, 1) void produce(float* __restrict__ partials,
 #pragma unroll
                 for(int e = 0; e < VEC; ++e)
                     value += rounded[a][e] * rounded[b][e];
-                gram[a * (9 - a) / 2 + b - a] += value;
+                gram[a * (9 - a) / 2 + b - a] += tile_row_sum(value, lane);
             }
         }
 
@@ -214,9 +226,6 @@ __global__ __launch_bounds__(256, 1) void produce(float* __restrict__ partials,
             }
         }
     }
-#pragma unroll
-    for(int g = 0; g < 10; ++g)
-        gram[g] = tile_row_sum(gram[g], lane);
 
     // The only block barrier: waves 1..3 deposit their projection and Gram sums,
     // wave 0 adds them to its own and stores.
@@ -314,7 +323,9 @@ __device__ __forceinline__ F8 fold_vector(opus::gmem<B>& streams, int hidden, in
 }
 #endif
 
-// One workgroup per row and hidden segment (parts segments per row).
+// One workgroup per row and hidden segment (parts segments per row). HIDDEN, SPLITS and
+// PARTS: as in produce.
+template <int HIDDEN, int SPLITS, int PARTS>
 __global__ __launch_bounds__(THREADS, 1) void finish(float* __restrict__ post,
                                                      float* __restrict__ comb,
                                                      B* __restrict__ output,
@@ -324,9 +335,9 @@ __global__ __launch_bounds__(THREADS, 1) void finish(float* __restrict__ post,
                                                      const float* __restrict__ base,
                                                      const B* __restrict__ norm_weight,
                                                      int m,
-                                                     int hidden,
-                                                     int splits,
-                                                     int parts,
+                                                     int hidden_arg,
+                                                     int splits_arg,
+                                                     int parts_arg,
                                                      float rms_eps,
                                                      float pre_eps,
                                                      float sink_eps,
@@ -336,6 +347,9 @@ __global__ __launch_bounds__(THREADS, 1) void finish(float* __restrict__ post,
 #if MHC_GRAM_GFX950
     using opus::operator""_I;
     static_assert(opus::get_warp_size() == 64);
+    const int hidden = HIDDEN ? HIDDEN : hidden_arg;
+    const int splits = SPLITS ? SPLITS : splits_arg;
+    const int parts  = PARTS ? PARTS : parts_arg;
     __shared__ float s_reduction[GROUPS * FIELDS];
     __shared__ float s_pre[HC];
     __shared__ float s_inverse_norm;
@@ -356,19 +370,44 @@ __global__ __launch_bounds__(THREADS, 1) void finish(float* __restrict__ post,
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     if(field < N + 10)
     {
-        for(int first = group; first < splits; first += GROUPS * 4)
+        if constexpr(SPLITS != 0)
         {
-            float values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            // A fixed trip count, unrolled: every load is issued before the first sum.
+            // A loop over the splits waits for its loads once per round.
+            constexpr int ROUNDS = (SPLITS + GROUPS * 4 - 1) / (GROUPS * 4);
 #pragma unroll
-            for(int u = 0; u < 4; ++u)
+            for(int round = 0; round < ROUNDS; ++round)
             {
-                const int split = first + u * GROUPS;
-                if(split < splits)
-                    values[u] = field_partials[static_cast<int64_t>(split) * m * LD];
-            }
+                const int first = group + round * GROUPS * 4;
+                float values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-            for(int u = 0; u < 4; ++u)
-                acc[u] += values[u];
+                for(int u = 0; u < 4; ++u)
+                {
+                    const int split = first + u * GROUPS;
+                    if(split < splits)
+                        values[u] = field_partials[static_cast<int64_t>(split) * m * LD];
+                }
+#pragma unroll
+                for(int u = 0; u < 4; ++u)
+                    acc[u] += values[u];
+            }
+        }
+        else
+        {
+            for(int first = group; first < splits; first += GROUPS * 4)
+            {
+                float values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+                for(int u = 0; u < 4; ++u)
+                {
+                    const int split = first + u * GROUPS;
+                    if(split < splits)
+                        values[u] = field_partials[static_cast<int64_t>(split) * m * LD];
+                }
+#pragma unroll
+                for(int u = 0; u < 4; ++u)
+                    acc[u] += values[u];
+            }
         }
     }
     s_reduction[tid] = (acc[0] + acc[1]) + (acc[2] + acc[3]);
@@ -470,6 +509,7 @@ __global__ __launch_bounds__(THREADS, 1) void finish(float* __restrict__ post,
         auto gw = opus::make_gmem<B>(const_cast<B*>(norm_weight), hidden * (int)sizeof(B));
         auto go = opus::make_gmem<B>(output + static_cast<int64_t>(row) * hidden,
                                      hidden * (int)sizeof(B));
+#pragma unroll
         for(int v = tid; v < segment; v += FOLD_THREADS)
         {
             const int h     = (part * segment + v) * 8;
@@ -575,8 +615,8 @@ void mhc_post_pre_gram_gfx950(aiter_tensor_t& post,
     using B           = mhc_gram::B;
     const auto stream = getCurrentHIPStream();
     const dim3 grid((m + mhc_gram::TM - 1) / mhc_gram::TM, splits);
-#define MHC_GRAM_PRODUCE(VEC, PACKED)                                       \
-    mhc_gram::produce<VEC, PACKED>                                          \
+#define MHC_GRAM_PRODUCE(VEC, PACKED, HIDDEN, SPLITS)                       \
+    mhc_gram::produce<VEC, PACKED, HIDDEN, SPLITS>                          \
         <<<grid, 256, 0, stream>>>(static_cast<float*>(partials.ptr),       \
                                    static_cast<B*>(next_residual.ptr),      \
                                    static_cast<const B*>(layer_input.ptr),  \
@@ -587,33 +627,67 @@ void mhc_post_pre_gram_gfx950(aiter_tensor_t& post,
                                    m,                                       \
                                    hidden,                                  \
                                    splits)
+    // The configurations of MHC_GRAM_CONFIG_GFX950_256 (aiter/ops/mhc.py) run kernels with
+    // their sizes at compile time; any other configuration runs the kernels that take the
+    // sizes as arguments.
+#define MHC_GRAM_TUNED(H, S)                                      \
+    if(hidden == H && splits == S)                                \
+    {                                                             \
+        if(packed)                                                \
+            MHC_GRAM_PRODUCE((H / S == 64 ? 4 : 8), true, H, S);  \
+        else                                                      \
+            MHC_GRAM_PRODUCE((H / S == 64 ? 4 : 8), false, H, S); \
+    }                                                             \
+    else
+    MHC_GRAM_TUNED(7168, 112)
+    MHC_GRAM_TUNED(7168, 56)
+    MHC_GRAM_TUNED(4096, 64)
+    MHC_GRAM_TUNED(4096, 32)
+    MHC_GRAM_TUNED(4096, 16)
     switch(2 * packed + (slab == 64))
     {
-    case 0: MHC_GRAM_PRODUCE(8, false); break;
-    case 1: MHC_GRAM_PRODUCE(4, false); break;
-    case 2: MHC_GRAM_PRODUCE(8, true); break;
-    default: MHC_GRAM_PRODUCE(4, true);
+    case 0: MHC_GRAM_PRODUCE(8, false, 0, 0); break;
+    case 1: MHC_GRAM_PRODUCE(4, false, 0, 0); break;
+    case 2: MHC_GRAM_PRODUCE(8, true, 0, 0); break;
+    default: MHC_GRAM_PRODUCE(4, true, 0, 0);
     }
+#undef MHC_GRAM_TUNED
 #undef MHC_GRAM_PRODUCE
     HIP_CALL_LAUNCH(hipGetLastError());
-    mhc_gram::finish<<<dim3(m, parts), mhc_gram::THREADS, 0, stream>>>(
-        static_cast<float*>(post.ptr),
-        static_cast<float*>(comb.ptr),
-        static_cast<B*>(out.ptr),
-        static_cast<const float*>(partials.ptr),
-        static_cast<const B*>(next_residual.ptr),
-        static_cast<const float*>(hc_scale.ptr),
-        static_cast<const float*>(hc_base.ptr),
-        static_cast<const B*>(weight.ptr),
-        m,
-        hidden,
-        splits,
-        parts,
-        rms_eps,
-        pre_eps,
-        sink_eps,
-        norm_eps,
-        post_mult);
+#define MHC_GRAM_FINISH(HIDDEN, SPLITS, PARTS)                                                 \
+    mhc_gram::finish<HIDDEN, SPLITS, PARTS><<<dim3(m, parts), mhc_gram::THREADS, 0, stream>>>( \
+        static_cast<float*>(post.ptr),                                                         \
+        static_cast<float*>(comb.ptr),                                                         \
+        static_cast<B*>(out.ptr),                                                              \
+        static_cast<const float*>(partials.ptr),                                               \
+        static_cast<const B*>(next_residual.ptr),                                              \
+        static_cast<const float*>(hc_scale.ptr),                                               \
+        static_cast<const float*>(hc_base.ptr),                                                \
+        static_cast<const B*>(weight.ptr),                                                     \
+        m,                                                                                     \
+        hidden,                                                                                \
+        splits,                                                                                \
+        parts,                                                                                 \
+        rms_eps,                                                                               \
+        pre_eps,                                                                               \
+        sink_eps,                                                                              \
+        norm_eps,                                                                              \
+        post_mult)
+#define MHC_GRAM_TUNED(H, S, P)                  \
+    if(hidden == H && splits == S && parts == P) \
+        MHC_GRAM_FINISH(H, S, P);                \
+    else
+    MHC_GRAM_TUNED(7168, 112, 4)
+    MHC_GRAM_TUNED(7168, 56, 4)
+    MHC_GRAM_TUNED(7168, 56, 2)
+    MHC_GRAM_TUNED(4096, 64, 2)
+    MHC_GRAM_TUNED(4096, 32, 2)
+    MHC_GRAM_TUNED(4096, 32, 1)
+    MHC_GRAM_TUNED(4096, 16, 2)
+    MHC_GRAM_TUNED(4096, 16, 1)
+    MHC_GRAM_FINISH(0, 0, 0);
+#undef MHC_GRAM_TUNED
+#undef MHC_GRAM_FINISH
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 } // namespace aiter
