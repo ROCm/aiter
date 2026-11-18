@@ -4675,11 +4675,16 @@ def _bench_fused_rank(
                 for n in names
             }
             # A --candidates engine whose pinned geometry this width does not
-            # have is left out: n/a.
+            # have is left out: n/a. So is a schedule with no fused build at
+            # this width (the ring at TP8 hidden 12288 needs a 1536-thread row).
             live = {
                 name: eng
                 for name, eng in engines.items()
-                if name in algorithms or _fused_applies(*spec_of[name], tp, hidden)
+                if (name in algorithms and eng.supports_hidden(hidden))
+                or (
+                    name not in algorithms
+                    and _fused_applies(*spec_of[name], tp, hidden)
+                )
             }
             if _fused_route(policy, nbytes) == "oneshot" and oneshot.supports_hidden(
                 hidden
@@ -4900,10 +4905,13 @@ def bench_quick_allreduce_rmsnorm(
         "hip_fused in prod": rows[0]["hip prod"],
     }
     for algorithm in algorithms:
-        ret[f"{algorithm} vs quantized"] = fab.speedup(quant_us, got[algorithm]["us"])
+        # A schedule with no fused build at this width has no time: n/a.
+        mine = got.get(algorithm)
+        mine_us = mine["us"] if mine else None
+        ret[f"{algorithm} vs quantized"] = fab.speedup(quant_us, mine_us)
         unfused = got.get(f"{algorithm}+norm")
         ret[f"{algorithm} vs unfused"] = fab.speedup(
-            unfused["us"] if unfused else None, got[algorithm]["us"]
+            unfused["us"] if unfused else None, mine_us
         )
         if mxfp4:
             fused, unfused = got.get(f"{algorithm}_mxfp4"), got.get(
