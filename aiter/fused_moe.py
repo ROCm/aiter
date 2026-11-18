@@ -1634,8 +1634,12 @@ def _can_use_bf16_g1u1_small_m_direct(
     )
 
 
+# Version 2: v1 ended at `deterministic`; v2 adds `w1_global_scale` and
+# `w2_global_scale`, which turn fp4x2 weights from MXFP4 into NVFP4. A v1
+# provider built for 40 arguments cannot bind 42, and a forwarder that binds
+# them would serve an NVFP4 call as MXFP4, so v1 is not superseded.
 @torch_compile_guard(gen_fake=fused_moe_fake)
-@_route(op="fused_moe", version=1)
+@_route(op="fused_moe", version=2)
 def fused_moe_(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -1728,6 +1732,11 @@ def fused_moe_(
     * ``herd_topk`` (gfx1250) says ``topk_ids`` and ``topk_weight`` hold K+1
       HERD candidates per token, scaled by ``herd_routed_scaling_factor``;
       with ``herd_topk=0`` that factor is unused.
+    * ``w1_global_scale`` / ``w2_global_scale`` set (fp32 ``[E, 2]`` gate/up
+      and ``[E]``, each ``1 / weight_global_scale``) make fp4x2 weights NVFP4:
+      E4M3 per-16 block scales in ``w1_scale`` / ``w2_scale``, multiplied by
+      the per-expert global scale. Both None is MXFP4 as before. A provider
+      without NVFP4 must decline calls that set them.
 
     A caller may hand the next call on its thread a precomputed sort with
     ``register_presorted_moe``. The registration is consumed below this route,
