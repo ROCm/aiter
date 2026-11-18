@@ -441,6 +441,10 @@ class DualwaveSwpFp8Traits:
     # conventional_bn64 compact grid: cu_seqlens_q chunks the sequence scan loads, rank-major slot order.
     BATCH_CHUNKS: int = 1
     INTERLEAVED: bool = False
+    # O stored through an LDS stage as 1 KB contiguous pieces (op_epilog.store_final_o).
+    O_STAGED: bool = False
+    # Non-temporal O stores.
+    O_STORE_NT: bool = False
 
 
 def _make_dualwave_swp_fp8_traits(
@@ -467,6 +471,8 @@ def _make_dualwave_swp_fp8_traits(
     gqa_pack_m=False,
     batch_chunks=1,
     interleaved=False,
+    o_staged=None,
+    o_store_nt=False,
 ):
     """Build gfx950 DUALWAVE_SWP fp8 compile-time layout traits.
 
@@ -486,6 +492,21 @@ def _make_dualwave_swp_fp8_traits(
             raise RuntimeError(f"batch_chunks must be >= 1, got {batch_chunks}")
     elif int(batch_chunks) != 1 or interleaved:
         raise RuntimeError("batch_chunks/interleaved apply to conventional_bn64 only")
+    # The staged O epilogue writes 4 packed rows (1 KB) per store, contiguous in O only when the group is a
+    # multiple of 4, and borrows the kv+vt region (4 waves x 8 KB).
+    o_staged_ok = (
+        body_variant == "conventional_bn64"
+        and gqa_pack_m
+        and (num_heads // num_kv_heads) % 4 == 0
+    )
+    if o_staged is None:
+        o_staged = o_staged_ok
+    elif o_staged and not o_staged_ok:
+        raise RuntimeError(
+            "o_staged needs conventional_bn64 with gqa_pack_m and group % 4 == 0"
+        )
+    if o_store_nt and body_variant != "conventional_bn64":
+        raise RuntimeError("o_store_nt applies to conventional_bn64 only")
     if head_dim_v is None:
         head_dim_v = head_dim
     if gqa_pack_m:
@@ -604,6 +625,10 @@ def _make_dualwave_swp_fp8_traits(
     paged_bt_lds = paged and body_variant != "conventional_bn64"
     if paged_bt_lds:
         lds_bytes += paged_bt_lds_size * 4
+    if o_staged and (lds_kv_total_size * elem_bytes + vt_bf16_total * eb_bf) < (
+        num_waves * rows_per_wave * head_dim_v * 2
+    ):
+        raise RuntimeError("o_staged needs kv+vt LDS to hold the block's O tile")
     if lds_bytes > LDS_BYTES_GFX950:
         raise RuntimeError(
             f"fp8 flash attention head_dim={head_dim}/head_dim_v={head_dim_v} at block_m={block_m} "
@@ -673,6 +698,8 @@ def _make_dualwave_swp_fp8_traits(
         BATCH_CHUNKS=int(batch_chunks),
         # Rank-major order is a causal longest-first heuristic; non-causal blocks cost the same.
         INTERLEAVED=bool(interleaved) and bool(causal),
+        O_STAGED=bool(o_staged),
+        O_STORE_NT=bool(o_store_nt),
     )
 
 
@@ -1247,7 +1274,12 @@ class DualwaveFp8KernelContext:
         self.load_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         self.load_atom_64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
         self.store_atom_64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
-        self.store_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
+        if const_expr(traits.O_STORE_NT):
+            self.store_atom_128 = fx.make_copy_atom(
+                fx.rocdl.BufferCopy128b(2), fx.Int32
+            )
+        else:
+            self.store_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         self.dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         self.o_store_reg = fx.make_rmem_tensor(fx.make_layout(2, 1), fx.Int32)
         self.o_store_reg_128 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
