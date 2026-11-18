@@ -20,12 +20,19 @@ from aiter.utility import dtypes
 
 from .kernels.pa_decode_kernel import (
     CLUSTER_PARTITIONS,
+    CLUSTER_STEP_TOKENS,
     KV_COMPUTE_BLOCK,
     MERGE_HEAD_DIM,
     MERGE_PARTITIONS,
     compile_pa_decode_tile,
+    gfx1250_tile_traits,
 )
 from .kernels.pa_decode_plan import PADecodePlan
+
+# Plans with at most this many partitions per sequence merge within a cluster
+# of at most CLUSTER_PARTITIONS CTAs. Above it, sequences would give each CTA
+# more tiles than the reducer costs.
+CLUSTER_GROUPED_PARTITIONS = 2 * CLUSTER_PARTITIONS
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import (
     DUAL_REGISTER_PARTITIONS,
@@ -40,6 +47,49 @@ from .kernels.tensor_shim import (
     ptr_arg,
     torch_to_fx_dtype,
 )
+
+_CONSTANT_SCALES: dict[tuple[torch.device, float], torch.Tensor] = {}
+
+
+def _constant_scale(device: torch.device, value: float) -> torch.Tensor:
+    """One-element float32 scale, kept per (device, value) once built eagerly.
+
+    Building it per call adds a fill or host copy to every call and to every
+    captured CUDA graph: two extra dispatches per scalar-scale FP8 call. A
+    scale first built during graph capture is not cached: its fill has not run
+    yet, and its memory belongs to that graph's pool.
+    """
+    key = (device, value)
+    scale = _CONSTANT_SCALES.get(key)
+    if scale is None:
+        scale = torch.full((1,), value, dtype=torch.float32, device=device)
+        if not torch.cuda.is_current_stream_capturing() and len(_CONSTANT_SCALES) < 64:
+            torch.cuda.current_stream(device).synchronize()  # readable from any stream
+            _CONSTANT_SCALES[key] = scale
+    return scale
+
+
+def _fuses_quant_output(
+    tile_options: dict, *, cluster_merge: int, cluster_seqs: int
+) -> bool:
+    """Whether the gfx1250 tile quantizes the FP8 output in its epilogue.
+
+    ``tile_options`` are the ``gfx1250_tile_traits`` arguments ``pa_decode``
+    selects. A token's descale needs the max over all of its values. With one
+    KV head a CTA, or the cluster merging its tasks, holds every row of its
+    tokens, so the one-partition direct and the cluster-merge outputs quantize
+    in their epilogue. More KV heads spread a token over separate CTAs (grid
+    y); the last-arriver merge, clusters shared by several sequences
+    (``cluster_seqs > 1``) and query-split tiles are not fused.
+    """
+    return bool(
+        tile_options["num_kv_heads"] == 1
+        and (
+            (tile_options["direct_output"] and tile_options["num_partitions"] == 1)
+            or (cluster_merge and cluster_seqs == 1)
+        )
+        and gfx1250_tile_traits(**tile_options).query_splits == 1
+    )
 
 
 def launch_pa_decode_ps_reduce(
@@ -425,12 +475,16 @@ def pa_decode(
     exp_sums: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size]
     max_logits: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size]
     temporary_output: torch.Tensor = None,  # [num_kv_heads, capacity, query_length * query_group_size, head_size]
+    quantized_output: torch.Tensor = None,  # optional FP8, output's shape + quantized_pad_rows rows
+    output_scale: torch.Tensor = None,  # optional FP32 [num_seqs * query_length + quantized_pad_rows, 1]
     alibi_slopes: torch.Tensor = None,
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
     work_plan: PADecodePlan | None = None,
     max_context_length: int | None = None,
     mask_unowned_kv: bool = True,
+    store_output: bool = True,
+    quantized_pad_rows: int = 0,
 ) -> None:
     """Decode FP8 or BF16 K/V using 256-token compute tiles.
 
@@ -456,6 +510,30 @@ def pa_decode(
     head dimensions must match.
     ALiBi and externally quantized queries are unsupported.
 
+    ``quantized_output`` and ``output_scale`` (gfx1250) add a per-token FP8
+    output. They must be supplied together. It is OCP FP8 in the same logical
+    layout as ``output`` with one contiguous FP32 descale per flattened query
+    token, shape ``[num_seqs * query_length, 1]``, each with
+    ``quantized_pad_rows`` extra rows (default 0); dequantization is
+    ``quantized_output.float() * output_scale``. The tile kernel's epilogue
+    quantizes the output when there is one KV head, the tile does not split
+    its query rows over CTAs, and the plan writes either the one-partition
+    direct output or a cluster merge with one sequence per cluster
+    (``cluster_seqs == 1``). Every other plan writes the BF16/FP16 output and
+    then runs the standalone per-token quant, with identical bytes: several KV
+    heads, the last-arriver direct merge, clusters shared by several sequences
+    (more than 15 sequence-KV-head pairs per 16 CUs), the reducer (sinks included) and the
+    query-split BF16 D1024/G16/MTP4 page128 tile. Calls that omit both tensors
+    retain the existing output and dispatch unchanged.
+    With the quantized output, ``store_output=False`` skips the BF16/FP16
+    store: ``output`` then only fixes the layout and its contents are left
+    unspecified. ``quantized_pad_rows`` extra rows of ``quantized_output`` and
+    ``output_scale`` past the query rows (a token bucket padded past the
+    scheduled tokens) are written as FP8 zeros with a unit descale, so a
+    consumer of the whole bucket reads finite, inert rows. The fused epilogue
+    writes them in the PA launch; the fallback fills them with ``zero_()`` and
+    ``fill_(1.0)`` after the standalone quant.
+
     MTP lengths include the query tokens and use dense causal masking.
     Independently selected sparse queries need separate table rows and
     query_length=1. Positive ``sliding_window`` includes each query's own
@@ -467,17 +545,20 @@ def pa_decode(
     the device CU count for the gfx950 head-256 pipe shapes and twice that
     otherwise; ``tune=True`` forces a search during preparation.
     Decode and graph replay use the explicit plan without accessing autotune. Set its
-    partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250, when
-    sinks are absent and query/output strides match, a cap of one writes output
-    directly. So do plans with one task slot per sequence (capacity equal to
+    partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx950 and
+    gfx1250, when sinks are absent and query/output strides match, a cap of one
+    writes output directly, without the reducer. On gfx1250, so do plans with one task slot per sequence (capacity equal to
     the batch, at most 8 partitions per sequence, head_dim <= 512): sequences
     that still own several tasks merge them in the tile kernel using the plan's
     arrival counters when partial scratch is eight-byte aligned. Otherwise,
     when P = min(partition bound, max_partitions)
-    is in [2, 16], P CTAs per sequence fit the plan capacity or two per CU,
-    and the sequences times KV heads stay within 15 per 16 CUs (head_dim <=
-    512), each sequence's tasks run as one cluster of P workgroups that merges
-    them on chip. Other plans use packed scratch and the separate reducer.
+    is in [2, 32], C = min(P, 16) CTAs per sequence fit the plan capacity or
+    two per CU, and the sequences times KV heads stay within 15 per 16 CUs
+    (head_dim <= 512), each sequence runs as one cluster of C workgroups that
+    split its tiles and merge them on chip. Page16 D128 decode batches within
+    one 16-CTA cluster per CU whose plan holds 16 slots per sequence (see
+    ``plan_pa_decode``) instead split each sequence into 16 step-sized parts.
+    Other plans use packed scratch and the separate reducer.
 
     ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
     query device: unscaled zero-value logits shared across batch/MTP positions.
@@ -539,6 +620,26 @@ def pa_decode(
             "pa_decode only supports context_partition_size=256, "
             f"got {context_partition_size}"
         )
+    quant_output = quantized_output is not None or output_scale is not None
+    if (quantized_output is None) != (output_scale is None):
+        raise ValueError(
+            "quantized_output and output_scale must either both be provided or both "
+            "be None"
+        )
+    if not isinstance(store_output, bool):
+        raise TypeError(
+            f"store_output must be a bool, got {type(store_output).__name__}"
+        )
+    if not (store_output or quant_output):
+        raise ValueError("store_output=False requires quantized_output")
+    if (
+        isinstance(quantized_pad_rows, bool)
+        or not isinstance(quantized_pad_rows, int)
+        or quantized_pad_rows < 0
+    ):
+        raise ValueError("quantized_pad_rows must be a nonnegative int")
+    if quantized_pad_rows and not quant_output:
+        raise ValueError("quantized_pad_rows requires quantized_output")
     if query_scale is not None:
         raise NotImplementedError(
             "pa_decode does not support externally quantized FP8 queries"
@@ -561,7 +662,12 @@ def pa_decode(
         ("context_lengths", context_lengths),
         ("block_tables", block_tables),
     )
-    for name, tensor in required_tensors:
+    quant_tensors = (
+        (("quantized_output", quantized_output), ("output_scale", output_scale))
+        if quant_output
+        else ()
+    )
+    for name, tensor in required_tensors + quant_tensors:
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(
                 f"{name} must be a torch.Tensor, got {type(tensor).__name__}"
@@ -593,6 +699,8 @@ def pa_decode(
             )
         if sinks is not None:
             raise NotImplementedError("MXFP4 KV supports no sinks, got sinks")
+        if quant_output:
+            raise NotImplementedError("MXFP4 KV supports no quantized output")
         if compute_type not in (None, torch.uint8, dtypes.fp4x2):
             raise NotImplementedError(
                 "MXFP4 KV takes compute_type None, uint8 or fp4x2, "
@@ -752,6 +860,43 @@ def pa_decode(
             "pa_decode requires output.dtype == query.dtype, "
             f"got {output.dtype} vs {query.dtype}"
         )
+    if quant_output:
+        if arch != "gfx1250":
+            raise NotImplementedError("quantized PA output requires gfx1250")
+        expected_quant_shape = (
+            output.shape[0] + quantized_pad_rows,
+            *output.shape[1:],
+        )
+        if tuple(quantized_output.shape) != expected_quant_shape:
+            raise ValueError(
+                "quantized_output shape must be output's plus quantized_pad_rows "
+                f"rows, got {tuple(quantized_output.shape)} vs "
+                f"{expected_quant_shape}"
+            )
+        if quantized_output.dtype != dtypes.fp8:
+            raise TypeError(
+                f"quantized_output must use OCP FP8 ({dtypes.fp8}), "
+                f"got {quantized_output.dtype}"
+            )
+        expected_scale_shape = (total_q_rows + quantized_pad_rows, 1)
+        if output_scale.shape != expected_scale_shape:
+            raise ValueError(
+                f"output_scale shape {tuple(output_scale.shape)} must be "
+                f"{expected_scale_shape}"
+            )
+        if output_scale.dtype != torch.float32:
+            raise TypeError(f"output_scale must be float32, got {output_scale.dtype}")
+        if not (
+            query.is_contiguous()
+            and output.is_contiguous()
+            and quantized_output.is_contiguous()
+        ):
+            raise ValueError(
+                "quantized PA output requires contiguous query, output and "
+                "quantized_output tensors"
+            )
+        if not output_scale.is_contiguous():
+            raise ValueError("output_scale must be contiguous")
 
     if key_cache.dtype != expected_kv_dtype:
         raise TypeError(
@@ -793,6 +938,7 @@ def pa_decode(
         ("value_cache", value_cache),
         ("block_tables", block_tables),
         ("context_lengths", context_lengths),
+        *quant_tensors,
     ):
         if tensor.device != dev:
             raise ValueError(
@@ -810,9 +956,9 @@ def pa_decode(
 
     def normalize_scale(scale, name):
         if scale is None:
-            return torch.ones(1, dtype=torch.float32, device=dev)
+            return _constant_scale(dev, 1.0)
         if not isinstance(scale, torch.Tensor):
-            return torch.tensor([float(scale)], dtype=torch.float32, device=dev)
+            return _constant_scale(dev, float(scale))
         if scale.numel() == 1:
             return scale.reshape(1)
         if scale.dim() == 4:
@@ -929,7 +1075,14 @@ def pa_decode(
     # CTA. That merge costs two device-scope round trips (sparse decode 64
     # rows: 17.7 us vs 10.3 us for tile plus reducer), so wider plans merge
     # within workgroup clusters instead.
+    # gfx942/gfx950 one-partition plans (capacity == batch) store final rows
+    # from the tile kernel too, without the reducer launch.
     direct_output = (
+        arch in ("gfx942", "gfx950")
+        and num_partitions == 1
+        and sinks is None
+        and output.stride() == query.stride()
+    ) or (
         arch in ("gfx1250", "gfx1250-strict")
         and sinks is None
         and output.stride() == query.stride()
@@ -957,21 +1110,120 @@ def pa_decode(
     # stays within the plan's or the default two-per-CU budget. gfx1250 keeps
     # 15 clusters resident per 16 CUs (240 on 256 CUs) whatever their size;
     # later clusters run as a second wave, which is slower than the reducer.
+    # A cluster of at most CLUSTER_PARTITIONS CTAs splits each sequence's
+    # tiles among its CTAs, so a 32-partition bound (8K contexts at the
+    # default cap) still merges on chip.
+    cluster_size = min(max_partitions, CLUSTER_PARTITIONS)
+    # gfx1250 keeps 15 clusters resident per 16 CUs; batches with more
+    # sequences share each cluster between several of them.
+    cluster_seqs = 1
+    while (
+        -(-num_seqs // cluster_seqs) * num_kv_heads > num_compute_units * 15 // 16
+        and 2 * cluster_seqs * cluster_size <= CLUSTER_PARTITIONS
+    ):
+        cluster_seqs *= 2
     cluster_merge = (
-        max_partitions
+        cluster_size
         if (
             arch in ("gfx1250", "gfx1250-strict")
             and not direct_output
             and sinks is None
             and output.stride() == query.stride()
-            and 2 <= max_partitions <= CLUSTER_PARTITIONS
-            and num_seqs * max_partitions
+            and 2 <= max_partitions <= CLUSTER_GROUPED_PARTITIONS
+            and num_seqs * cluster_size
             <= max(work_plan.capacity, -(-2 * num_compute_units // num_kv_heads))
-            and num_seqs * num_kv_heads <= num_compute_units * 15 // 16
+            and -(-num_seqs // cluster_seqs) * num_kv_heads
+            <= num_compute_units * 15 // 16
             and head_dim <= MERGE_HEAD_DIM
         )
         else 0
     )
+    # Page16 D128 decode clusters of P CTAs over block tables of at most 16
+    # steps give CTA p steps [p * 16 / P, (p + 1) * 16 / P), so it loads its
+    # first page ids with the context length rather than after it. For rows of
+    # 16 steps the runs are the planner's tiles. Batches within
+    # one cluster per CU split each row into single steps, one per CTA,
+    # whatever the partition bound (sparse decode at 4 rows: 5.3 -> 4.6 us);
+    # their plans reserve the steps' partial slots.
+    step_split = bool(
+        cluster_merge
+        and block_size == 16
+        and head_dim == 128
+        and query_length == 1
+        and sliding_window == 0
+        and max_blocks_per_seq * block_size <= CLUSTER_PARTITIONS * CLUSTER_STEP_TOKENS
+    )
+    step_cluster = (
+        CLUSTER_PARTITIONS
+        if step_split
+        and cluster_seqs == 1
+        and num_seqs * num_kv_heads * CLUSTER_PARTITIONS <= num_compute_units
+        and num_seqs * CLUSTER_PARTITIONS <= work_plan.capacity
+        else cluster_merge
+    )
+    tile_options = {
+        "head_dim": head_dim,
+        "query_group_size": query_group_size,
+        "block_size": int(block_size),
+        "num_seqs": num_seqs,
+        "num_kv_heads": num_kv_heads,
+        "num_compute_units": num_compute_units,
+        "num_partitions": num_partitions,
+        "softmax_scale": softmax_scale,
+        "query_dtype": query.dtype,
+        "kv_dtype": expected_kv_dtype,
+        "per_token_kv": per_token_kv,
+        "query_length": query_length,
+        "trans_v": trans_v,
+        "work_capacity": work_plan.capacity,
+        "max_context_length": schedule_context_length,
+        "sliding_window": sliding_window,
+        "direct_output": direct_output,
+    }
+    # The runs and preloaded page ids assume the tile's 128-token steps. Tiles
+    # that select 64-token steps (two query tiles, plain BF16 V, wider grids)
+    # keep plan-derived clusters.
+    cluster_steps = (
+        step_split
+        and CLUSTER_PARTITIONS % step_cluster == 0
+        and num_seqs * step_cluster <= work_plan.capacity
+        and gfx1250_tile_traits(
+            **tile_options,
+            cluster_merge=step_cluster,
+            cluster_seqs=cluster_seqs,
+            cluster_steps=True,
+        ).TOKENS
+        == CLUSTER_STEP_TOKENS
+    )
+    if cluster_steps:
+        cluster_merge = step_cluster
+    # Page128 clusters given a length bound instead give CTA p tiles
+    # [p * run, (p + 1) * run), runs splitting the bound evenly, so they too
+    # load their first page ids with the context length (decode at 8K, 1-8
+    # rows: 3-5% faster). The bound's longest rows split as the planner
+    # would; shorter rows use fewer CTAs. Runs beyond four tiles gain nothing.
+    bound_tiles = -(-schedule_context_length // KV_COMPUTE_BLOCK)
+    cluster_runs = bool(
+        cluster_merge
+        and not cluster_steps
+        and cluster_seqs == 1
+        and block_size == 128
+        and max_context_length is not None
+        and sliding_window == 0
+        and num_seqs * cluster_merge <= work_plan.capacity
+        and bound_tiles <= 4 * cluster_merge
+    )
+    run_tiles = -(-bound_tiles // cluster_merge) if cluster_runs else 0
+    # Unfused plans write the BF16 output as usual and quantize it after with
+    # the standalone per-token kernel, which is exactly the unfused path.
+    quant_after_output = quant_output and not _fuses_quant_output(
+        tile_options, cluster_merge=cluster_merge, cluster_seqs=cluster_seqs
+    )
+    if quant_after_output:
+        quant_output = False
+        if not store_output:
+            # Keep the caller's BF16 buffer untouched, as the fused path does.
+            output = torch.empty_like(output)
 
     # Bound byte offsets as well as element indices for 16-bit BF16 caches.
     cache_extent = max(
@@ -984,28 +1236,20 @@ def pa_decode(
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
             architecture=arch,
-            head_dim=head_dim,
-            query_group_size=query_group_size,
-            block_size=int(block_size),
-            num_seqs=num_seqs,
-            num_kv_heads=num_kv_heads,
-            num_compute_units=num_compute_units,
-            num_partitions=num_partitions,
-            softmax_scale=softmax_scale,
-            query_dtype=query.dtype,
-            kv_dtype=expected_kv_dtype,
-            per_token_kv=per_token_kv,
-            query_length=query_length,
-            trans_v=trans_v,
+            **tile_options,
             wide_kv_addressing=wide_kv_addressing,
             kv_buffer_u32=kv_buffer_u32,
-            work_capacity=work_plan.capacity,
-            max_context_length=schedule_context_length,
-            sliding_window=sliding_window,
-            direct_output=direct_output,
             trans_k=trans_k,
             mask_unowned_kv=mask_unowned_kv,
             cluster_merge=cluster_merge,
+            cluster_seqs=cluster_seqs,
+            cluster_steps=cluster_steps,
+            cluster_runs=cluster_runs,
+            **(
+                {"quant_output": True, "store_output": store_output}
+                if quant_output
+                else {}
+            ),
         )
 
     total_rows = query_length * query_group_size
@@ -1072,6 +1316,19 @@ def pa_decode(
                 if merged
                 else flyc.from_c_void_p(fx.Int32, 0)
             ),
+            run_tiles,
+            (
+                ptr_arg(quantized_output, torch_to_fx_dtype(quantized_output.dtype))
+                if quant_output
+                else flyc.from_c_void_p(fx.Float8E4M3FN, 0)
+            ),
+            (
+                ptr_arg(output_scale, fx.Float32)
+                if quant_output
+                else flyc.from_c_void_p(fx.Float32, 0)
+            ),
+            # Rows of the FP8 output, padded ones included.
+            int(total_q_rows + quantized_pad_rows) if quant_output else int(num_seqs),
         )
     with torch.cuda.device(dev):
         s = torch.cuda.current_stream(dev)
@@ -1108,35 +1365,50 @@ def pa_decode(
             stride_ks_head,
             int(query.stride(0)),
             int(query.stride(1)),
-            ptr_arg(work_plan.work_info, fx.Int32),
+            # Cluster grids derive their tiles from the context lengths.
+            ptr_arg(
+                (context_lengths if cluster_merge else work_plan.work_info),
+                fx.Int32,
+            ),
             work_plan.capacity,
             *merge_args,
             s,
         )
-        if direct_output or cluster_merge:
-            return
-        output_5d = output.reshape(
-            num_seqs, query_length, num_kv_heads, query_group_size, head_dim
-        )
-        launch_pa_decode_ps_reduce(
-            output_5d,
-            psum,
-            pmax,
-            pout,
-            sinks,
-            output_5d.stride(0),
-            output_5d.stride(1),
-            output_5d.stride(2),
-            output_5d.stride(3),
-            pmax.stride(0),
-            pmax.stride(1),
-            pout.stride(0),
-            pout.stride(1),
-            pout.stride(2),
-            query_seq_len=query_length,
-            query_group_size=query_group_size,
-            head_size=head_dim,
-            max_partitions=max_partitions,
-            stream=s,
-            reduce_info=work_plan.reduce_info,
-        )
+        if not (direct_output or cluster_merge):
+            output_5d = output.reshape(
+                num_seqs, query_length, num_kv_heads, query_group_size, head_dim
+            )
+            launch_pa_decode_ps_reduce(
+                output_5d,
+                psum,
+                pmax,
+                pout,
+                sinks,
+                output_5d.stride(0),
+                output_5d.stride(1),
+                output_5d.stride(2),
+                output_5d.stride(3),
+                pmax.stride(0),
+                pmax.stride(1),
+                pout.stride(0),
+                pout.stride(1),
+                pout.stride(2),
+                query_seq_len=query_length,
+                query_group_size=query_group_size,
+                head_size=head_dim,
+                max_partitions=max_partitions,
+                stream=s,
+                reduce_info=work_plan.reduce_info,
+            )
+        if quant_after_output:
+            from ..quant import dynamic_per_token_scaled_quant
+
+            rows = output.shape[0]
+            dynamic_per_token_scaled_quant(
+                quantized_output[:rows].view(rows, -1),
+                output.view(rows, -1),
+                output_scale[:rows],
+            )
+            if quantized_pad_rows:
+                quantized_output[rows:].zero_()
+                output_scale[rows:].fill_(1.0)
