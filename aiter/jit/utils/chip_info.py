@@ -597,6 +597,14 @@ def get_cu_num() -> int:
     return cu_num
 
 
+def _clear_cu_num_cache() -> None:
+    _shared_cu_num.cache_clear()
+    _cu_num.cache_clear()
+
+
+get_cu_num.cache_clear = _clear_cu_num_cache
+
+
 _CDNA4_CUS_PER_XCD = 32
 _CDNA4_MAX_XCDS = 8
 
