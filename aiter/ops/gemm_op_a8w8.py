@@ -1175,6 +1175,13 @@ def _splitk_views(entry) -> tuple[Tensor, Tensor]:
     )
 
 
+def gemm_a8w8_bpreshuffle_splitk_deferred_supports_arch() -> bool:
+    """Whether gemm_a8w8_bpreshuffle_splitk_deferred can leave a split-K reduction
+    to the consumer on this GPU at all. When False it always returns
+    gemm_a8w8_bpreshuffle's output, so a caller can keep its plain path."""
+    return is_gfx1250_family(get_gfx())
+
+
 def _splitk_deferrable(XQ: Tensor, WQ: Tensor, dtype, max_m: int):
     """(kernelName, split_k) when gemm_a8w8_bpreshuffle would run the gfx1250
     PTPC GEMM with split_k > 1 for this call and M <= max_m, else None. Anything
@@ -1196,7 +1203,7 @@ def _splitk_deferrable(XQ: Tensor, WQ: Tensor, dtype, max_m: int):
     if (
         config is None
         or config["libtype"] != "flydsl"
-        or not is_gfx1250_family(get_gfx())
+        or not gemm_a8w8_bpreshuffle_splitk_deferred_supports_arch()
     ):
         return None
     from .flydsl.bpreshuffle_gemm_gfx1250 import parse_wmma_kernel_name

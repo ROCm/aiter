@@ -14,8 +14,9 @@ an fp32 torch reference:
 * claim: the partials are handed out once; reduce_splitk_partials claims them itself,
   and returns a tensor that holds its values as it is.
 * handoff_table (host only, every arch; both FlyDSL launchers stubbed): claim once,
-  a leading row slice claims, any other view of a deferred output raises, and the
-  oldest unclaimed output is reduced when the table is full.
+  a leading row slice claims, any other view of a deferred output raises, the
+  oldest unclaimed output is reduced when the table is full, and
+  gemm_a8w8_bpreshuffle_splitk_deferred_supports_arch follows the arch.
 
 Runs as `python3 <file>` (summary table) or under pytest (same cases and checks).
 """
@@ -180,6 +181,7 @@ def test_handoff_table():
     with contextlib.ExitStack() as stack:
         for stub in stubs:
             stack.enter_context(stub)
+        assert aiter.gemm_a8w8_bpreshuffle_splitk_deferred_supports_arch()
         y = deferred()
         partials = aiter.splitk_partials(y[: m // 2])  # leading row slice
         assert partials.shape == (split_k, m, n) and partials[-1].eq(split_k).all()
@@ -194,6 +196,8 @@ def test_handoff_table():
         assert ys[0].eq(done).all(), "evicted output left unreduced"
         assert aiter.splitk_partials(ys[0]) is None
         assert all(aiter.splitk_partials(y) is not None for y in ys[1:])
+    with mock.patch.object(gemm_op_a8w8, "get_gfx", return_value="gfx950"):
+        assert not aiter.gemm_a8w8_bpreshuffle_splitk_deferred_supports_arch()
 
 
 def main():
