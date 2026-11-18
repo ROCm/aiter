@@ -19,12 +19,16 @@ A tile's scales are 1024 bytes; lane ``l`` of the wave on row half ``h`` finds
 the scales of its row in the half's eight row blocks in the eight bytes at
 ``512 h + 8 l``.
 
-K loop: three LDS stages, each one K128 tile of A and of B. K tile ``t + 3`` (its
-scales and its LDS-DMA loads) is loaded into tile ``t``'s stage during tile ``t``,
-and tile ``t + 1``'s operands are read into VGPRs, each one after its register's
-last MFMA of tile ``t``. One barrier per tile: before it each wave waits for tile
-``t + 1``'s loads and for its own reads of tile ``t``'s stage. The last three
-tiles load nothing, so the packed layout's guard tiles are never read.
+K loop: three LDS stages, each one K128 tile of A and of B and their scales. K tile
+``t + 3`` is loaded into tile ``t``'s stage during tile ``t`` (``global_load_lds``),
+and tile ``t + 1``'s operands and scales are read into VGPRs, each operand after its
+register's last MFMA of tile ``t``. One barrier per tile: before it each wave waits
+for tile ``t + 1``'s loads and for its own reads of tile ``t``'s stage. The last
+three tiles load nothing, so the packed layout's guard tiles are never read.
+
+The scales go through LDS, as in the ASM ``dmabig`` kernels: a scale load into
+VGPRs would be inline asm, which LLVM takes as complete when issued, and the loop
+carries its result, which LLVM may copy before the load lands.
 
 The weights are the MFMA's first operand, so lane ``l`` of output tile (i, j)
 holds four adjacent columns ``16 j + 4 (l // 16) + r`` of row ``16 i + l % 16``.
@@ -32,12 +36,14 @@ holds four adjacent columns ``16 j + 4 (l // 16) + r`` of row ``16 i + l % 16``.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
 
 # The LLVM dialect is used only for inline assembly at instructions FlyDSL 0.5
 # cannot represent through its stable surface: M0 ownership, signed-offset LDS DMA,
-# the scale loads LLVM must not count, the FP6 scaled MFMA into AGPRs, and the
-# accumulator hazard boundary.
+# the FP6 scaled MFMA into AGPRs, and the accumulator hazard boundary. The raw
+# ROCDL op is the epilogue's v_permlane16_swap, which has no fx wrapper.
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl._mlir.dialects import rocdl as _rocdl
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 
@@ -58,80 +64,116 @@ SCALE_TILE_BYTES = BLOCK_M * BLOCK_K // 32
 PADK = 2  # guard K tiles of the packed layout, past K
 LOADS_PER_REGION = TILE_BYTES // (N_WAVES * 64 * 16)  # 16-byte loads per lane
 WAVE_REGION_BYTES = LOADS_PER_REGION * 1024
-STAGE_BYTES = 2 * TILE_BYTES
-# A tile's VMEM ops: two scale loads, then the A and B LDS-DMA loads.
-TILE_VMEM = 2 + 2 * LOADS_PER_REGION
+# A stage: the A tile, the B tile, the A scales, the B scales.
+B_OFFSET = TILE_BYTES
+SCALES_OFFSET = 2 * TILE_BYTES
+STAGE_BYTES = 2 * TILE_BYTES + 2 * SCALE_TILE_BYTES
+# A tile's VMEM ops: the A and B LDS-DMA loads, then the two scale loads.
+TILE_VMEM = 2 * LOADS_PER_REGION + 2
 CFG_E2M3 = 2  # cbsz / blgp: FP6 E2M3 for both operands
 
 
-class G2SGlobal:
-    """``global_load_lds`` of a wave's share of one operand tile, on one M0 value.
+def _readfirstlane(value):
+    return fx.rocdl.readfirstlane(fx.Int32.ir_type, fx.Int32(value).ir_value())
 
-    The instruction offset applies to the global and the LDS address and is
-    signed 13-bit, so with M0 in the middle of the wave's 6 KB it reaches all six
-    loads. The loads are inline asm because LLVM asserts on the intrinsic's
-    negative LDS offset, so LLVM does not count them in vmcnt and the K loop waits
-    for them explicitly. LLVM does not see M0 in use either, so nothing else in the
-    kernel may use it.
+
+def _set_m0(value):
+    # FlyDSL 0.5 has no stable M0 setter with the write's hazard nop. LLVM does not
+    # see M0 in use, so nothing else in the kernel may use it.
+    _llvm.inline_asm(
+        res=None,
+        operands_=[fx.Int32(value).ir_value()],
+        asm_string="s_mov_b32 m0, $0\ns_nop 0",
+        constraints="s",
+        has_side_effects=True,
+    )
+
+
+def _lds_dma(instruction, voffset, base, imm):
+    # FlyDSL 0.5 cannot encode the signed LDS memory-operand offset; its intrinsic
+    # path reaches an LLVM assertion. LLVM does not count these loads in vmcnt, so
+    # the K loop waits for them explicitly.
+    _llvm.inline_asm(
+        res=None,
+        operands_=[fx.Int32(voffset).ir_value(), fx.Int64(base).ir_value()],
+        asm_string=f"{instruction} $0, $1 offset:{imm}",
+        constraints="v,s",
+        has_side_effects=True,
+    )
+
+
+class G2SOperand:
+    """``global_load_lds_dwordx4`` of a wave's 6 KB share of one operand tile.
+
+    The instruction offset applies to the global and the LDS address and is signed
+    13-bit, so with M0 in the middle of the wave's share it reaches all six loads.
+    The tile is copied as it is, so both addresses share one offset.
     """
 
     CENTER = 3072
 
-    def __init__(self, tensor, wave_id, region_ptrs, tile_row_offset, lane_id):
+    def __init__(self, tensor, wave_id, stage_ptrs, region, tile_row_offset, lane_id):
         self.imm = [q * 1024 - self.CENTER for q in range(LOADS_PER_REGION)]
         assert all(-4096 <= i < 4096 for i in self.imm)
         self.base = fx.Int64(fx.ptrtoint(fx.get_iter(tensor)))
-        # The tile is copied as it is, so the global and the LDS address share one
-        # offset; both carry +CENTER against the signed immediate.
         wave_off = wave_id * WAVE_REGION_BYTES + self.CENTER
-        # M0 is written from an SGPR, so the wave-uniform LDS address is read from
-        # lane 0.
         self.m0 = [
-            fx.rocdl.readfirstlane(
-                fx.Int32.ir_type, (fx.Int32(fx.ptrtoint(ptr)) + wave_off).ir_value()
-            )
-            for ptr in region_ptrs
+            _readfirstlane(fx.Int32(fx.ptrtoint(ptr)) + region + wave_off)
+            for ptr in stage_ptrs
         ]
         self.voffset = tile_row_offset + wave_off + lane_id * 16
 
-    def set_m0(self, stage):
-        # FlyDSL 0.5 has no stable M0 setter with the write's hazard nop.
-        _llvm.inline_asm(
-            res=None,
-            operands_=[fx.Int32(self.m0[stage]).ir_value()],
-            asm_string="s_mov_b32 m0, $0\ns_nop 0",
-            constraints="s",
-            has_side_effects=True,
-        )
+    def ops(self, t, stage):
+        """One op per load; the first also points M0 at ``stage``."""
 
-    def load(self, k_offset, q):
-        # FlyDSL 0.5 cannot encode this signed LDS memory-operand offset; its
-        # intrinsic path reaches an LLVM assertion.
-        _llvm.inline_asm(
-            res=None,
-            operands_=[
-                fx.Int32(self.voffset).ir_value(),
-                (self.base + fx.Int64(k_offset)).ir_value(),
-            ],
-            asm_string=f"global_load_lds_dwordx4 $0, $1 offset:{self.imm[q]}",
-            constraints="v,s",
-            has_side_effects=True,
-        )
+        def op(q):
+            if const_expr(q == 0):
+                _set_m0(self.m0[stage])
+            _lds_dma(
+                "global_load_lds_dwordx4",
+                self.voffset,
+                self.base + fx.Int64(t * TILE_BYTES),
+                self.imm[q],
+            )
+
+        return [lambda q=q: op(q) for q in range(LOADS_PER_REGION)]
 
 
-def _load_scales(base, voffset, k_offset):
-    """The eight scale bytes of the lane's row in its wave's eight row blocks.
+class G2SScales:
+    """``global_load_lds_dword`` of a wave's 256 bytes of the A and the B scales.
 
-    Inline asm so that LLVM's vmcnt waits do not also wait for the LDS-DMA loads
-    issued after it, which it cannot count; the K loop waits for it explicitly.
+    One M0 value covers both: the A scales sit 1024 bytes below the B scales, and
+    the instruction offset (-1024 or 0) applies to both addresses.
     """
-    return _llvm.inline_asm(
-        res=fx.Vector.make_type(2, fx.Int32),
-        operands_=[fx.Int32(voffset).ir_value(), (base + fx.Int64(k_offset)).ir_value()],
-        asm_string="global_load_dwordx2 $0, $1, $2",
-        constraints="=v,v,s",
-        has_side_effects=True,
-    )
+
+    def __init__(self, a_scale, b_scale, wave_id, stage_ptrs, a_row, b_row, lane_id):
+        self.bases = (
+            fx.Int64(fx.ptrtoint(fx.get_iter(a_scale))),
+            fx.Int64(fx.ptrtoint(fx.get_iter(b_scale))),
+        )
+        wave_off = wave_id * 256 + SCALE_TILE_BYTES
+        self.m0 = [
+            _readfirstlane(fx.Int32(fx.ptrtoint(ptr)) + SCALES_OFFSET + wave_off)
+            for ptr in stage_ptrs
+        ]
+        lane_off = wave_id * 256 + lane_id * 4
+        self.voffsets = (
+            a_row * SCALE_TILE_BYTES + lane_off + SCALE_TILE_BYTES,
+            b_row * SCALE_TILE_BYTES + lane_off,
+        )
+
+    def ops(self, t, stage):
+        def op(k):
+            if const_expr(k == 0):
+                _set_m0(self.m0[stage])
+            _lds_dma(
+                "global_load_lds_dword",
+                self.voffsets[k],
+                self.bases[k] + fx.Int64(t * SCALE_TILE_BYTES),
+                -SCALE_TILE_BYTES if k == 0 else 0,
+            )
+
+        return [lambda k=k: op(k) for k in (0, 1)]
 
 
 def _lds_load(ptr, offset, nbytes):
@@ -140,10 +182,10 @@ def _lds_load(ptr, offset, nbytes):
     return Vec(view.load()).bitcast(fx.Int32)
 
 
-def _read_operand(ptr, row_block, lane_id):
+def _read_operand(ptr, region, row_block, lane_id):
     """Lane ``lane_id``'s 32 FP6 values of row block ``row_block``: six dwords."""
-    c0 = _lds_load(ptr, row_block * 1024 + lane_id * 16, 16)
-    c1 = _lds_load(ptr, C1_OFFSET + row_block * 512 + lane_id * 8, 8)
+    c0 = _lds_load(ptr, region + row_block * 1024 + lane_id * 16, 16)
+    c1 = _lds_load(ptr, region + C1_OFFSET + row_block * 512 + lane_id * 8, 8)
     return Vec.from_elements([c0[0], c0[1], c0[2], c0[3], c1[0], c1[1]], fx.Int32)
 
 
@@ -176,6 +218,17 @@ def _mfma(b, a, scale_b, scale_a, j, i, c):
         asm_string=asm,
         constraints=constraints,
         has_side_effects=True,
+    )
+
+
+def _permlane16_swap(x, y):
+    """``v_permlane16_swap_b32``: x's odd 16-lane rows trade places with y's even rows."""
+    pair_t = ir.Type.parse("!llvm.struct<(i32, i32)>")
+    swapped = _rocdl.permlane16_swap(
+        pair_t, fx.Int32(x).ir_value(), fx.Int32(y).ir_value(), False, False
+    )
+    return tuple(
+        fx.Int32(_llvm.extractvalue(fx.Int32.ir_type, swapped, [k])) for k in (0, 1)
     )
 
 
@@ -219,6 +272,10 @@ LAST_USE_B = {j: max(k for k, (jj, _) in enumerate(ORDER) if jj == j) for j in r
 LAST_USE_A = {i: max(k for k, (_, ii) in enumerate(ORDER) if ii == i) for i in range(8)}
 # The barrier precedes B pair 0's last MFMA; the next tile's reads follow it.
 BARRIER_AT = LAST_USE_B[1]
+# Four waves issue together, so a tile's VMEM ops are spread one every
+# VMEM_SPACING MFMAs after the barrier, as the ASM kernels do.
+VMEM_SPACING = 3
+assert BARRIER_AT + 1 + VMEM_SPACING * (TILE_VMEM - 1) < len(ORDER)
 
 
 def compile_a6w6_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_xcds: int = 8):
@@ -256,8 +313,6 @@ def compile_a6w6_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_xcds: int = 8):
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         stage_ptrs = [lds.stage_0.ptr, lds.stage_1.ptr, lds.stage_2.ptr]
-        a_ptrs = stage_ptrs
-        b_ptrs = [fx.add_offset(p, fx.make_int_tuple(TILE_BYTES)) for p in stage_ptrs]
 
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
@@ -271,60 +326,62 @@ def compile_a6w6_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_xcds: int = 8):
             )
         else:
             block_m, block_n = block // n_blocks, block % n_blocks
-        block_m = fx.Int32(block_m)
-        block_n = fx.Int32(block_n)
+        a_row = fx.Int32(block_m) * NK_PAD
+        b_row = fx.Int32(block_n) * NK_PAD
 
-        a_g2s = G2SGlobal(A, wave_id, a_ptrs, block_m * (NK_PAD * TILE_BYTES), lane_id)
-        b_g2s = G2SGlobal(B, wave_id, b_ptrs, block_n * (NK_PAD * TILE_BYTES), lane_id)
-        sa_base = fx.Int64(fx.ptrtoint(fx.get_iter(A_scale)))
-        sb_base = fx.Int64(fx.ptrtoint(fx.get_iter(B_scale)))
-        sa_voff = (
-            block_m * (NK_PAD * SCALE_TILE_BYTES) + wave_m * 512 + lane_id * 8
+        g2s = (
+            G2SOperand(A, wave_id, stage_ptrs, 0, a_row * TILE_BYTES, lane_id),
+            G2SOperand(B, wave_id, stage_ptrs, B_OFFSET, b_row * TILE_BYTES, lane_id),
         )
-        sb_voff = (
-            block_n * (NK_PAD * SCALE_TILE_BYTES) + wave_n * 512 + lane_id * 8
+        g2s_scales = G2SScales(
+            A_scale, B_scale, wave_id, stage_ptrs, a_row, b_row, lane_id
         )
 
         def tile_vmem(t, stage):
-            """Issue tile ``t``'s scale loads; return them and its LDS-DMA ops."""
-            scales = (
-                _load_scales(sa_base, sa_voff, t * SCALE_TILE_BYTES),
-                _load_scales(sb_base, sb_voff, t * SCALE_TILE_BYTES),
-            )
-            ops = []
-            for g2s in (a_g2s, b_g2s):
-                ops.append(lambda g2s=g2s: g2s.set_m0(stage))
-                for q in range_constexpr(LOADS_PER_REGION):
-                    ops.append(lambda g2s=g2s, q=q: g2s.load(t * TILE_BYTES, q))
-            return scales, ops
+            """Tile ``t``'s VMEM ops into ``stage``: A, B, then the scales."""
+            return g2s[0].ops(t, stage) + g2s[1].ops(t, stage) + g2s_scales.ops(t, stage)
 
         def read_a(stage, i):
-            return _read_operand(a_ptrs[stage], wave_m * WAVE_TILES + i, lane_id)
+            return _read_operand(
+                stage_ptrs[stage], 0, wave_m * WAVE_TILES + i, lane_id
+            )
 
         def read_b(stage, j):
-            return _read_operand(b_ptrs[stage], wave_n * WAVE_TILES + j, lane_id)
+            return _read_operand(
+                stage_ptrs[stage], B_OFFSET, wave_n * WAVE_TILES + j, lane_id
+            )
+
+        def read_scales(stage):
+            ptr = stage_ptrs[stage]
+            return (
+                _lds_load(ptr, SCALES_OFFSET + wave_m * 512 + lane_id * 8, 8),
+                _lds_load(
+                    ptr, SCALES_OFFSET + SCALE_TILE_BYTES + wave_n * 512 + lane_id * 8, 8
+                ),
+            )
 
         def k_tile(accs, a_ops, b_ops, scales, stage, has_next, vmem_wait, prefetch):
-            """One K tile in LDS ``stage``, with ``scales`` = (A, B) words.
+            """One K tile in LDS ``stage``; ``scales`` are its (A, B) scale words.
 
-            ``prefetch`` (tile, stage) issues that tile's VMEM ops after the barrier;
+            ``prefetch`` (tile, stage) spreads that tile's VMEM ops after the barrier;
             ``vmem_wait`` is the vmcnt the barrier waits for; ``has_next`` reads the
-            next tile's operands from the next stage.
+            next tile's operands and scales from the next stage.
             """
             next_stage = (stage + 1) % STAGES
             new_a = [None] * WAVE_TILES
             new_b = [None] * WAVE_TILES
+            new_scales = None
             sa = (Vec(scales[0])[0], Vec(scales[0])[1])
             sb = (Vec(scales[1])[0], Vec(scales[1])[1])
-            fetched, vmem = None, []
+            vmem = [] if prefetch is None else tile_vmem(*prefetch)
             for idx, (j, i) in enumerate(ORDER):
                 if const_expr(idx == BARRIER_AT):
                     fx.rocdl.s_waitcnt(vmcnt=vmem_wait, lgkmcnt=0)
                     fx.rocdl.sched_barrier(0)
                     fx.rocdl.s_barrier()
                     fx.rocdl.sched_barrier(0)
-                    if const_expr(prefetch is not None):
-                        fetched, vmem = tile_vmem(*prefetch)
+                    if const_expr(has_next):
+                        new_scales = read_scales(next_stage)
                         fx.rocdl.sched_barrier(0)
                 accs[i][j] = _mfma(
                     b_ops[j], a_ops[i], sb[j // 4], sa[i // 4], j, i, accs[i][j]
@@ -332,8 +389,9 @@ def compile_a6w6_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_xcds: int = 8):
                 fx.rocdl.sched_barrier(0)
                 if const_expr(idx < BARRIER_AT):
                     continue
-                # Spread the LDS-DMA loads over the MFMAs after the barrier.
-                if const_expr(len(vmem) > 0 and idx % 2 == 1):
+                if const_expr(
+                    len(vmem) > 0 and (idx - BARRIER_AT - 1) % VMEM_SPACING == 0
+                ):
                     vmem.pop(0)()
                     fx.rocdl.sched_barrier(0)
                 if const_expr(has_next):
@@ -349,34 +407,31 @@ def compile_a6w6_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_xcds: int = 8):
             while const_expr(len(vmem) > 0):
                 vmem.pop(0)()
                 fx.rocdl.sched_barrier(0)
-            return accs, new_a, new_b, fetched
+            return accs, new_a, new_b, new_scales
 
-        def step(accs, a_ops, b_ops, scale_queue, t, stage, loading, has_next, two_after):
+        def step(accs, a_ops, b_ops, scales, t, stage, loading, has_next, two_after):
             """Tile ``t``; ``loading`` loads tile ``t + 3`` into its stage.
 
             Before the barrier, tile ``t + 1``'s VMEM ops must have landed; tile
             ``t + 2``'s, issued after them, may still run if there is one.
             """
-            prefetch = (t + STAGES, stage) if loading else None
-            accs, a_ops, b_ops, fetched = k_tile(
+            return k_tile(
                 accs,
                 a_ops,
                 b_ops,
-                scale_queue[0],
+                scales,
                 stage,
                 has_next,
                 TILE_VMEM if two_after else 0,
-                prefetch,
+                (t + STAGES, stage) if loading else None,
             )
-            scale_queue = scale_queue[1:] + ([fetched] if loading else [])
-            return accs, a_ops, b_ops, scale_queue
 
-        def flat_state(accs, a_ops, b_ops, scale_queue):
+        def flat_state(accs, a_ops, b_ops, scales):
             return (
                 [accs[i][j] for i in range(WAVE_TILES) for j in range(WAVE_TILES)]
                 + list(a_ops)
                 + list(b_ops)
-                + [s for pair in scale_queue for s in pair]
+                + list(scales)
             )
 
         def unflat_state(values):
@@ -386,28 +441,26 @@ def compile_a6w6_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_xcds: int = 8):
             ]
             a_ops = [values.pop(0) for _ in range(WAVE_TILES)]
             b_ops = [values.pop(0) for _ in range(WAVE_TILES)]
-            scale_queue = [(values.pop(0), values.pop(0)) for _ in range(STAGES)]
-            return accs, a_ops, b_ops, scale_queue
+            scales = (values.pop(0), values.pop(0))
+            return accs, a_ops, b_ops, scales
 
         # Prologue: tiles 0, 1 and 2 in flight; wait for tile 0 and read it.
-        scale_queue = []
         for t in range_constexpr(STAGES):
-            scales, ops = tile_vmem(t, t)
-            scale_queue.append(scales)
-            for op in ops:
+            for op in tile_vmem(t, t):
                 op()
         fx.rocdl.s_waitcnt(vmcnt=(STAGES - 1) * TILE_VMEM)
         fx.rocdl.s_barrier()
+        scales = read_scales(0)
         a_ops = [read_a(0, i) for i in range_constexpr(WAVE_TILES)]
         b_ops = [read_b(0, j) for j in range_constexpr(WAVE_TILES)]
         accs = [[None] * WAVE_TILES for _ in range(WAVE_TILES)]
 
-        def static_step(accs, a_ops, b_ops, scale_queue, t):
+        def static_step(accs, a_ops, b_ops, scales, t):
             return step(
                 accs,
                 a_ops,
                 b_ops,
-                scale_queue,
+                scales,
                 t,
                 t % STAGES,
                 t < LOADING,
@@ -415,49 +468,58 @@ def compile_a6w6_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_xcds: int = 8):
                 t + 2 < K_TILES,
             )
 
-        accs, a_ops, b_ops, scale_queue = static_step(
-            accs, a_ops, b_ops, scale_queue, 0
-        )
+        accs, a_ops, b_ops, scales = static_step(accs, a_ops, b_ops, scales, 0)
         if const_expr(TRIPS > 0):
             for trip, state in range(
-                0, TRIPS, 1, init=flat_state(accs, a_ops, b_ops, scale_queue)
+                0, TRIPS, 1, init=flat_state(accs, a_ops, b_ops, scales)
             ):
-                accs, a_ops, b_ops, scale_queue = unflat_state(state)
+                accs, a_ops, b_ops, scales = unflat_state(state)
                 t0 = fx.Int32(trip) * STAGES + 1
                 for u in range_constexpr(STAGES):
-                    accs, a_ops, b_ops, scale_queue = step(
+                    accs, a_ops, b_ops, scales = step(
                         accs,
                         a_ops,
                         b_ops,
-                        scale_queue,
+                        scales,
                         t0 + u,
                         (1 + u) % STAGES,
                         True,
                         True,
                         True,
                     )
-                results = yield flat_state(accs, a_ops, b_ops, scale_queue)
-            accs, a_ops, b_ops, scale_queue = unflat_state(results)
+                results = yield flat_state(accs, a_ops, b_ops, scales)
+            accs, a_ops, b_ops, scales = unflat_state(results)
         for t in range_constexpr(STATIC_FROM, K_TILES):
-            accs, a_ops, b_ops, scale_queue = static_step(
-                accs, a_ops, b_ops, scale_queue, t
-            )
+            accs, a_ops, b_ops, scales = static_step(accs, a_ops, b_ops, scales, t)
 
         # Epilogue: lane l of tile (i, j) holds row 16 i + l % 16 and the four
-        # columns 16 j + 4 (l // 16) + r of the wave's tile.
+        # columns 16 j + 4 (l // 16) + r of the wave's tile. Swapping the 16-lane
+        # rows of tiles j and j + 1 gives lane group g of the pair the eight columns
+        # 16 (j + g % 2) + 8 (g // 2) of its row: one 16-byte store per lane.
         accs = _mfma_drain(accs)
         c_tensor = fx.rocdl.make_buffer_tensor(
             C, max_size=False, num_records_bytes=fx.Int64(c_m) * fx.Int64(c_n) * 2
         )
         c_div = fx.logical_divide(c_tensor, fx.make_layout(1, 1))
-        out_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
-        reg = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
-        row0 = block_m * BLOCK_M + wave_m * WAVE_ROWS + lane_id % 16
-        col0 = block_n * BLOCK_N + wave_n * WAVE_ROWS + (lane_id // 16) * 4
+        out_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+        reg = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
+        group = lane_id // 16
+        row0 = fx.Int32(block_m) * BLOCK_M + wave_m * WAVE_ROWS + lane_id % 16
+        col0 = (
+            fx.Int32(block_n) * BLOCK_N
+            + wave_n * WAVE_ROWS
+            + (group % 2) * TILE
+            + (group // 2) * 8
+        )
         for i in range_constexpr(WAVE_TILES):
-            for j in range_constexpr(WAVE_TILES):
-                fx.memref_store_vec(Vec(accs[i][j]).to(fx.BFloat16), reg)
-                index = (row0 + i * TILE) * c_n + col0 + j * TILE
+            for jp in range_constexpr(WAVE_TILES // 2):
+                lo = Vec(accs[i][2 * jp]).to(fx.BFloat16).bitcast(fx.Int32)
+                hi = Vec(accs[i][2 * jp + 1]).to(fx.BFloat16).bitcast(fx.Int32)
+                x0, y0 = _permlane16_swap(lo[0], hi[0])
+                x1, y1 = _permlane16_swap(lo[1], hi[1])
+                row = Vec.from_elements([x0, x1, y0, y1], fx.Int32).bitcast(fx.BFloat16)
+                fx.memref_store_vec(row, reg)
+                index = (row0 + i * TILE) * c_n + col0 + jp * 2 * TILE
                 fx.copy(out_atom, reg, fx.slice(c_div, (None, fx.Int32(index))))
 
     @flyc.jit
