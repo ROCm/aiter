@@ -787,7 +787,9 @@ def _sparse_mla_fwd_gfx950_fp8_h64(
         splits = _H64_TOPK // pc["KEY_BLOCK"]
         groups = _H64_HEADS // pc["HEAD_BLOCK"]
         if pc["STATS_IN_PARTIAL"]:
-            partial = torch.empty((C * _H64_HEADS * splits * 514,), dtype=f32, device=dev)
+            partial = torch.empty(
+                (C * _H64_HEADS * splits * 514,), dtype=f32, device=dev
+            )
             stats = None
         else:
             partial = torch.empty((C, _H64_HEADS, splits, 512), dtype=f32, device=dev)
@@ -818,7 +820,7 @@ def _sparse_mla_fwd_gfx950_fp8_h64(
         )
 
         record = pc["RECORD_VALUE"]
-        record_args = dict(RECORD_VALUE=record, PACKED_STATS=pc["PACKED_STATS"])
+        record_args = {"RECORD_VALUE": record, "PACKED_STATS": pc["PACKED_STATS"]}
     else:
         from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla_fp8_h64_panel import (
             _attention_merge,
@@ -826,9 +828,11 @@ def _sparse_mla_fwd_gfx950_fp8_h64(
         )
 
         record = pc["RECORD_WIDTH"]
-        record_args = dict(
-            RECORD_WIDTH=record, COLOR_STEP=pc["COLOR_STEP"], PACK_STATS=pc["PACK_STATS"]
-        )
+        record_args = {
+            "RECORD_WIDTH": record,
+            "COLOR_STEP": pc["COLOR_STEP"],
+            "PACK_STATS": pc["PACK_STATS"],
+        }
     tile, splits = pc["HEAD_TILE"], pc["SPLITS"]
     groups = _H64_HEADS // tile
     partial = torch.empty((C, groups, splits, record * tile), dtype=f32, device=dev)
@@ -836,7 +840,7 @@ def _sparse_mla_fwd_gfx950_fp8_h64(
         stats = partial
     else:
         stats = torch.empty((C, groups, splits, 2, tile), dtype=f32, device=dev)
-    shape = dict(HEADS=_H64_HEADS, VALUE=512)
+    shape = {"HEADS": _H64_HEADS, "VALUE": 512}
     _attention_split[(C, groups, splits)](
         *args, partial, stats, *scales,
         WIDTH=_H64_ROW, TOPK=_H64_TOPK, CACHE_BUFFER=buffer_cache,

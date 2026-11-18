@@ -545,7 +545,9 @@ def _h64_inputs(C, draw, pool=1 << 18, seed=0):
         mult = torch.randint(0, pool // 2, (C, 1), generator=g, device="cuda") * 2 + 1
         ids = (off + mult * j[None, :]) % pool
     short = torch.rand(C, generator=g, device="cuda") < 0.5
-    lens = torch.where(short, torch.randint(1, 2049, (C,), generator=g, device="cuda"), 2048)
+    lens = torch.where(
+        short, torch.randint(1, 2049, (C,), generator=g, device="cuda"), 2048
+    )
     ids = torch.where(pos < lens[:, None], ids, -1).to(torch.int32)
     if draw == "scaled":
         q_scale = (q.abs().amax() / FP8_MAX).reshape(1)
@@ -631,9 +633,9 @@ def test_sparse_mla_fp8_h64_decode_fallback(case):
         big = torch.zeros(rows, D_QK, dtype=torch.uint8, device="cuda")
         big[: cache.shape[0]] = cache
         cache = big
-    q, kw = q8, dict(dot_precision="fp8", q_scale=q_scale)
+    q, kw = q8, {"dot_precision": "fp8", "q_scale": q_scale}
     if case == "bf16_q":
-        q, kw = (q8.float() * q_scale).to(torch.bfloat16), dict(dot_precision="fp8")
+        q, kw = (q8.float() * q_scale).to(torch.bfloat16), {"dot_precision": "fp8"}
     elif case == "bf16_dots":
         kw["dot_precision"] = "bf16"
     routed = (
