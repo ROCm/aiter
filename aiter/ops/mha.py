@@ -3801,7 +3801,6 @@ def _flash_attn_varlen_backward(
         if hdim_q == 256:
             ret &= not causal
             ret &= window_size_left == -1 and window_size_right == -1
-            ret &= nhead_q == nhead_k
             ret &= q.dtype == dtypes.bf16
 
         return ret
