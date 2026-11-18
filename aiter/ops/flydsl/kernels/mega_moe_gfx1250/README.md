@@ -30,7 +30,7 @@ latencies in microseconds (four-rank averages) were:
 | Version | Plan+quant | Ready | GEMM1 incl producer | GEMM2+scatter | E2E/layer |
 |---|---:|---:|---:|---:|---:|
 | Push control in the same merged workspace | 36.10 | — | 625.54 | 597.04 | 1648.78 |
-| **Committed full-row pull, two-run mean** | **39.96** | **12.65** | **570.04** | **595.48** | **1609.77** |
+| **Full-row pull, 64 producers, two-run mean** | **39.96** | **12.65** | **570.04** | **595.48** | **1609.77** |
 | Experimental K1024/M32/2 buffers, one run | 42.02 | 12.74 | 612.45 | 592.61 | 1641.65 |
 | Experimental K1536/M16/3 buffers, one run | 38.27 | 12.65 | 630.76 | 598.67 | 1666.15 |
 
@@ -289,7 +289,7 @@ fused-scatter combine, no bias, and M64/128/256. The producer count defaults
 to64 of256 resident workers. Ordinary push uses the unchanged mailbox
 producer. Pull forwards the resolved CSV tile sizes, wave grid, buffer count,
 next-stage prefetch, TDM wave count/cache hint, LDS interleave, and drain setting
-to the shared GEMM consumer. S1F still requires four waves and cluster1x1;
+to the shared GEMM consumer. S1F still requires four waves. Cluster mode is opt-in; when disabled,
 requested clusters are logged and fall back to1x1. CSV persistent_workers=0
 retains256 resident S1F workers on this256-CU device. Task claims, A-ready
 gates, entry generations and parity-split queue heads remain shared with push.
@@ -522,3 +522,40 @@ Full EP4 correctness passed with 96 producers: changing graph inputs, random/hot
 ```bash
 BENCH_PRODUCERS=96 bash /workspace/gpubench/s1f_pull_ratio_20261118/run.sh current p96_new
 ```
+
+## Optional clusters for initial S1F consumers
+
+Enable with `DS41_CLUSTER=1 bash run_ds41_flash_best.sh`, or set `AITER_MEGA_S1F_PULL_CLUSTER=1` in a direct benchmark invocation. Default is 0. The normal GEMM1 CSV/environment cluster resolver supplies the shape; no CSV rows changed.
+
+## Role and queue contract
+
+- Initial consumers remain consumers and form complete physical clusters. Both the grid and `workers - producers` must be divisible by cluster size; otherwise the request falls back to 1x1.
+- Producer TGs dispatch independently, retire their own stores and publish the existing full-K M64 flags. They retain only the original workgroup transition barriers, with no producer-side cluster barrier.
+- Once finished, a producer TG claims one GEMM tile at a time with A/B multicast disabled. Initial consumer clusters claim cluster_size tiles at a time from the same atomic head. Their static prefix and the shared dynamic range are disjoint.
+- Aligned consumer ranges map physical x/y members to matching N/M tiles. An unaligned range disables multicast for the whole group, because its coordinates cannot satisfy the peer-sharing contract. Physical consumer cluster membership and scheduling barriers remain intact.
+- Producer/GEMM readiness, full payload/scales, and the external source-ready kernel are unchanged. Consumers wait for their tile flags before GEMM. The current cluster path uses blocking group readiness and ticket broadcasts rather than the 1x1 consumer hook pipeline.
+- For 96 producers and 160 initial consumers, 4x2 means 20 initial consumer clusters. Producer TGs stay independent. Actual launch: grid 64x4=256 TGs, 128 threads/TG, 327680B LDS/TG.
+- Incomplete N groups, incompatible M alignment holes or insufficient reserved ticket space fall back to 1x1. Flash has 18 N tiles, so N4 requests fall back; I1024 validates actual 1x4 and 4x4.
+
+## Final validation
+
+- Final queue: all actual 1x2/2x2/4x2/1x4/4x4 small H5120/I1024 checks plus mixed-role fallback passed.
+- Final queue: EP4 H5120/I2304/tpr16384 actual 4x2 passed; H7168/I1024/tpr17 actual 4x2 passed.
+- Checks compare four changing-input graph replays, hot/empty ranks, full output vs push and exact dispatched payload/scales/routing weights.
+- CPU audits cover physical roles, swizzled tile coverage, empty/tail cases, mixed-width atomic ranges and multicast alignment. The CPU recipe suite has 42 passing tests.
+- Three prelaunch reviews are saved per run. Every GPU app checked idle status immediately before launch, polling once per second. All accepted runs exited 0 with unchanged boot IDs; no hang was observed.
+
+## Performance
+
+EP4, tpr16384/global65536, E384, top6, H5120/I2304, balanced, 96 producers, 160 initial consumers, 8 layers, 5 warmups, 32 iterations. Both GEMMs use A preshuffle. Each row is one final-source run, averaged over four ranks. E2E is native median replay time / 8; stage intervals use HIP graph events and include event-boundary overhead. Stage columns do not sum to E2E.
+
+| Initial consumer cluster | Plan+quant us | Ready us | GEMM1+producer us | GEMM2+scatter us | E2E/layer us |
+|---|---:|---:|---:|---:|---:|
+| 1x1 | 38.66 | 12.43 | 561.30 | 594.79 | 1595.63 |
+| 1x2 | 39.15 | 12.62 | 621.44 | 598.13 | 1660.33 |
+| 2x2 | 38.50 | 12.20 | 648.13 | 596.51 | 1688.02 |
+| 4x2 | 38.68 | 12.08 | 682.53 | 595.86 | 1715.05 |
+
+Clustering is correct but regresses this Flash workload. The default remains 96 producers with cluster mode disabled. Extra group synchronization/ticket broadcasts, blocking readiness and unicast fallback for unaligned claims are present in the cluster path; these costs were not separately measured.
+
+Producer ratio tuning is recorded in `/workspace/gpubench/s1f_pull_ratio_20261118/`: three runs each give 1609.81 -> 1601.36 us/layer and GEMM1 570.01 -> 561.39 us for 64 -> 96 producers, with cluster mode off. The later 1595.63 us unclustered run above is a separate measurement, not evidence of another kernel optimization.

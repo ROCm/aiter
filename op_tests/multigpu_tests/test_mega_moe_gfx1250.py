@@ -549,7 +549,7 @@ def _check_vmm_bound(ctx):
 
 
 
-def _check_pull(ctx, *, a_preshuffled=True, fused=False):
+def _check_pull(ctx, *, a_preshuffled=True, fused=False, expected_cluster=None):
     """Validate remote FP4 bytes, inverse maps, and changing graph inputs."""
     from aiter.test_common import checkAllclose
 
@@ -579,6 +579,11 @@ def _check_pull(ctx, *, a_preshuffled=True, fused=False):
         # afterward, exercising generations and stale padding/empty experts.
         ctx.layer(push, "bf16")
         ctx.layer(pull, "bf16")
+        if expected_cluster is not None:
+            selected = pull._ep._dispatch._pull.cluster_selection
+            check(selected[:2] == expected_cluster,
+                  f"cluster {selected} != {expected_cluster}")
+            check.settle()
         torch.cuda.synchronize()
         ctx.comm.barrier()
         graph = torch.cuda.CUDAGraph()
@@ -721,9 +726,49 @@ def _check_pull_s1f(ctx):
     _check_pull(ctx, fused=True)
 
 
+def _check_pull_s1f_clusters(ctx):
+    """Exercise physical cluster roles, multicast, tails and graph generations."""
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.stages.pull import PullDispatch
+
+    original = PullDispatch.gemm1
+    for cm, cn in ((1, 2), (2, 2), (4, 2), (1, 4), (4, 4)):
+        def configured(self, *args, **kwargs):
+            kwargs.update(cluster_m=cm, cluster_n=cn)
+            return original(self, *args, **kwargs)
+
+        expected = (cm, cn) if (2 * INTER // 256) % cn == 0 else (1, 1)
+        with mock.patch.dict(os.environ, {
+            "AITER_MEGA_S1F_PULL_CLUSTER": "1",
+            "AITER_MEGA_S1F_PULL_PRODUCERS": "96",
+        }), mock.patch.object(PullDispatch, "gemm1", configured):
+            _check_pull(ctx, fused=True, expected_cluster=expected)
+        if ctx.rank == 0:
+            print(f"S1F cluster requested={cm}x{cn}, effective={expected}: passed",
+                  flush=True)
+
+
+def _check_pull_s1f_cluster_mixed_roles(ctx):
+    """An incomplete producer cluster must fall back before GPU execution."""
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.stages.pull import PullDispatch
+
+    original = PullDispatch.gemm1
+
+    def configured(self, *args, **kwargs):
+        kwargs.update(cluster_m=4, cluster_n=4)
+        return original(self, *args, **kwargs)
+
+    with mock.patch.dict(os.environ, {
+        "AITER_MEGA_S1F_PULL_CLUSTER": "1",
+        "AITER_MEGA_S1F_PULL_PRODUCERS": "104",
+    }), mock.patch.object(PullDispatch, "gemm1", configured):
+        _check_pull(ctx, fused=True, expected_cluster=(1, 1))
+
+
 CHECKS = (
     _check_pull,
     _check_pull_s1f,
+    _check_pull_s1f_clusters,
+    _check_pull_s1f_cluster_mixed_roles,
     _check_pairings,
     _check_rejected_before_alloc,
     _check_unwind,

@@ -230,7 +230,7 @@ class PullDispatch:
     def gemm1(self, out, a, w, a_scales, w_scales, m_tile_map, **kw):
         """Run readiness followed by fused pull producers and GEMM1 consumers."""
         from aiter.jit.utils.chip_info import get_cu_num
-        from ..s1f_pull import compile_s1f_pull
+        from ..s1f_pull import compile_s1f_pull, resolve_pull_cluster
 
         if kw.get("bias") is not None or not kw.get("stage1_quant_out"):
             raise ValueError("pull S1F requires bias-free fused activation/quant")
@@ -240,6 +240,8 @@ class PullDispatch:
         producers = int(os.environ.get("AITER_MEGA_S1F_PULL_PRODUCERS", "64"))
         from aiter.ops.flydsl.grouped_gemm_mxfp4 import (
             _select_bool_env,
+            _select_cluster_m,
+            _select_cluster_n,
             _select_num_waves_per_tensor_tdm,
             _select_tdm_b_th,
         )
@@ -257,6 +259,20 @@ class PullDispatch:
         # producer/consumer roles, so zero retains its full-CU worker count.
         if workers == 0:
             workers = int(get_cu_num())
+        cluster_m, cluster_n, cluster_reason = 1, 1, "cluster mode disabled"
+        if _select_bool_env("AITER_MEGA_S1F_PULL_CLUSTER", 0):
+            tile_n = int(kw["tile_n"])
+            n_tiles = (2 * config.geometry.inter_dim + tile_n - 1) // tile_n
+            requested_n = max(1, int(os.environ.get(
+                "AITER_FLYDSL_MXFP4_CLUSTER_N", kw.get("cluster_n", 1)
+            )))
+            selected_n = _select_cluster_n(n_tiles, requested_n)
+            selected_m = _select_cluster_m(kw.get("cluster_m", 1), selected_n, 1)
+            cluster_m, cluster_n, cluster_reason = resolve_pull_cluster(
+                selected_m, requested_n, workers, producers, n_tiles,
+                int(kw["tile_m"]), step.align_m,
+            )
+        self.cluster_selection = (cluster_m, cluster_n, cluster_reason)
         gemm = {
             "tile_m": int(kw["tile_m"]),
             "tile_n": int(kw["tile_n"]),
@@ -273,6 +289,8 @@ class PullDispatch:
             "tdm_b_th": _select_tdm_b_th(kw.get("tdm_b_th", 0)),
             "lds_soa_load_interleave": int(kw.get("lds_soa_load_interleave", 0)),
             "rolled_drain": int(kw.get("rolled_drain", 0)),
+            "cluster_m": cluster_m,
+            "cluster_n": cluster_n,
         }
         key = (
             step.align_m,
@@ -284,11 +302,12 @@ class PullDispatch:
         )
         if key not in self._fused_launches:
             logging.getLogger("aiter").info(
-                "pull S1F GEMM1 effective config %s; cluster=1x1 "
-                "(CSV requested %sx%s; explicit-tile S1F requires1x1), "
-                "workers=%s producers=%s",
+                "pull S1F GEMM1 effective config %s; "
+                "CSV requested cluster=%sx%s, "
+                "workers=%s producers=%s; %s",
                 gemm, kw.get("cluster_m", -1), kw.get("cluster_n", -1),
                 workers, producers,
+                cluster_reason or "complete role-homogeneous clusters",
             )
             self._fused_launches[key] = compile_s1f_pull(
                 rank=config.rank,

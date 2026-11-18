@@ -232,6 +232,8 @@ def build_gemm_a8w4_tdm_task(
     defer_c_wait=0,
     tdm_snop=0,
     k_waves=1,
+    explicit_cluster=0,
+    cluster_active=None,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -247,8 +249,14 @@ def build_gemm_a8w4_tdm_task(
     Knobs for that persistent use:
 
     - ``explicit_tile``: ``task_id`` is the m-tile and ``schedule_rows`` the
-      n-tile, replacing the DeepGEMM swizzle of a linear task id (1x1
-      cluster only).
+      n-tile, replacing the DeepGEMM swizzle of a linear task id.
+    - ``explicit_cluster``: the caller schedules complete physical clusters,
+      supplies adjacent M/N tiles matching block y/x, and joins the cluster
+      before claiming another item. Inactive M-tail rows skip the body;
+      incomplete N clusters are rejected by the caller.
+    - ``cluster_active``: optional one-element list containing a TG-uniform
+      predicate. False disables A/B multicast for independently scheduled TGs
+      inside a physical cluster; true requires the full cluster contract.
     - ``lds_base``: a one-element list the enclosing kernel fills with its LDS
       base pointer before calling the body (a kernel may own only one
       SharedAllocator); the body then uses ``arena_bytes`` from it.
@@ -294,10 +302,18 @@ def build_gemm_a8w4_tdm_task(
             "a_ready gates the mainloop's first A issue; an A-scale prologue "
             "load would run ahead of it"
         )
+    if cluster_active is not None:
+        assert explicit_cluster, "runtime multicast gating needs explicit clusters"
+    if explicit_cluster:
+        assert explicit_tile and persistent_workers and tile_meta is not None
+        assert persistent_workers % (cluster_m * cluster_n) == 0
     if explicit_tile:
-        assert persistent_workers and cluster_m == 1 and cluster_n == 1
+        assert persistent_workers
+        assert explicit_cluster or (cluster_m == 1 and cluster_n == 1)
     if persistent_workers:
-        assert cluster_m == 1, "persistent workers require cluster_m=1"
+        assert explicit_cluster or cluster_m == 1, (
+            "persistent workers require cluster_m=1"
+        )
         assert persistent_workers % cluster_n == 0
         assert not (
             enable_ep_scatter and ep_quant_bits
@@ -689,6 +705,9 @@ def build_gemm_a8w4_tdm_task(
         if const_expr(explicit_tile):
             # Persistent work item: the caller names the tile directly.
             m_tile = task_id
+            m_unit = m_tile // cluster_m
+            # Task IDs are M indices; multicast uses the physical N coordinate.
+            local_n = fx.block_idx.x % cluster_n if cluster_n > 1 else 0
             blk_m = m_tile * tile_m
             blk_n = schedule_rows * tile_n
         # A always follows the existing 1x4 direction: one M row broadcasts
@@ -696,6 +715,10 @@ def build_gemm_a8w4_tdm_task(
         a_mcast_mask = (
             ((1 << cluster_n) - 1) << (local_m * cluster_n) if cluster_n > 1 else None
         )
+        if const_expr(cluster_active is not None and cluster_n > 1):
+            # Producer TGs may enter GEMM independently inside a physical
+            # cluster. A zero mask retains ordinary per-workgroup TDM loads.
+            a_mcast_mask = cluster_active[0].select(fx.Int32(a_mcast_mask), 0)
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
         n64 = fx.Int64(i32_n)
@@ -803,6 +826,8 @@ def build_gemm_a8w4_tdm_task(
             # Preserve the existing sync policy while restoring eligible B multicast.
             b_cluster_full = cluster_first_m + cluster_m <= valid_m_tiles
             use_b_mcast = b_cluster_full & (group_size > 1)
+            if const_expr(cluster_active is not None):
+                use_b_mcast = use_b_mcast & cluster_active[0]
             b_mcast_mask = use_b_mcast.select(column_mask << local_n, 0)
 
         if const_expr(lds_base is not None):

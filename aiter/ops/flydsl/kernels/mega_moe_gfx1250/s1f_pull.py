@@ -13,7 +13,28 @@ from flydsl.expr import range_constexpr
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
 
 from .dispatch_pull import make_pull_tile, pull_lds_row_pitch
-from .s1f_stage1 import FLAG_M, FLAG_STRIDE, _trap, make_s1f_stage1
+from .s1f_stage1 import (
+    CTL_CLUSTER_TICKETS, CTL_PHEAD, FLAG_M, FLAG_STRIDE, _trap, make_s1f_stage1,
+)
+
+
+def resolve_pull_cluster(
+    cluster_m, cluster_n, workers, producers, n_tiles, tile_m, align_m,
+):
+    """Keep complete initial-consumer clusters, or return a 1x1 fallback."""
+    size = cluster_m * cluster_n
+    reason = ""
+    if cluster_m not in (1, 2, 4) or cluster_n not in (1, 2, 3, 4) or size > 16:
+        reason = "unsupported physical cluster geometry"
+    elif n_tiles % cluster_n:
+        reason = "N tiles do not form complete clusters"
+    elif workers % size or (workers - producers) % size:
+        reason = "initial consumers would form mixed producer/consumer clusters"
+    elif cluster_m > 1 and align_m != tile_m:
+        reason = "M alignment holes cannot participate in cross-M multicast"
+    elif CTL_CLUSTER_TICKETS + 2 * workers * 4 > CTL_PHEAD:
+        reason = "cluster tickets exceed reserved S1F control storage"
+    return (1, 1, reason) if reason else (cluster_m, cluster_n, "")
 
 
 @functools.cache
@@ -48,13 +69,16 @@ def compile_s1f_pull(
     tdm_b_th,
     lds_soa_load_interleave,
     rolled_drain,
+    cluster_m=1,
+    cluster_n=1,
 ):
     """Build source-ready/metadata setup and S1F with a pull producer.
 
     A flag tile belongs to one producer wave. That wave gathers and shuffles
     four M16 chunks, retires its stores, then publishes the original S1F flag.
-    No cross-wave wait or fence is needed to publish a tile. The consumer,
-    task prefetch, entry tickets, and drain are all in make_s1f_stage1.
+    No cross-wave wait or fence is needed to publish a tile. Consumer scheduling,
+    entry tickets, and drain live in make_s1f_stage1. The 1x1 path retains task
+    prefetch hooks; optional consumer clusters use group readiness and claims.
     """
     if tile_m not in (64, 128, 256):
         raise ValueError("shared-consumer pull S1F requires M64/128/256")
@@ -240,6 +264,8 @@ def compile_s1f_pull(
         tdm_b_th=tdm_b_th,
         lds_soa_load_interleave=lds_soa_load_interleave,
         rolled_drain=rolled_drain,
+        cluster_m=cluster_m,
+        cluster_n=cluster_n,
         ctas_per_cu=1,
         pull_producer=producer,
         pull_lds_bytes=64 * pull_lds_row_pitch(wire_row),

@@ -567,3 +567,24 @@ def test_preshuffled_grouping_reaches_scatter_context():
     assert context.compact_a_preshuffled
     assert context.compact_wire_row_stride == 0
     assert context.compact_psum is counts
+
+
+@pytest.mark.parametrize("cm,cn", [(1, 2), (2, 2), (4, 2), (1, 4), (4, 4)])
+def test_s1f_pull_complete_cluster_roles(cm, cn):
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.s1f_pull import resolve_pull_cluster
+
+    assert resolve_pull_cluster(cm, cn, 256, 96, 16, 256, 256) == (cm, cn, "")
+
+
+@pytest.mark.parametrize("args,reason", [
+    ((4, 4, 256, 104, 16, 256, 256), "mixed producer/consumer"),
+    ((4, 4, 256, 96, 18, 256, 256), "N tiles"),
+    ((4, 2, 256, 96, 18, 128, 256), "M alignment"),
+    ((4, 2, 2048, 96, 18, 256, 256), "control storage"),
+])
+def test_s1f_pull_incomplete_cluster_fallback(args, reason):
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.s1f_pull import resolve_pull_cluster
+
+    cm, cn, message = resolve_pull_cluster(*args)
+    assert (cm, cn) == (1, 1)
+    assert reason in message
