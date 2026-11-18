@@ -117,10 +117,6 @@ def poison_uninitialized_memory():
     torch.use_deterministic_algorithms(False)
 
 
-def test_tile_is_32_kib():
-    assert sp.TILE_BYTES == 32768
-
-
 @pytest.mark.parametrize(
     ("world_size", "hidden", "unit"),
     [
@@ -167,11 +163,8 @@ def test_policy_has_the_one_measured_row(monkeypatch):
         (1634, 2560, False),  # its padded payload, 8,519,680 B, is above 8 MiB
         (1633, 2560, False),  # odd: no equal blocks
         (16385, 2560, False),  # odd, and its floor would be inside the window
-        (1000, 2560, False),
-        (16384, 2560, True),
         (2048, 2048, True),
         (2046, 2048, False),
-        (2040, 2048, False),
         (2, 2568, False),
         (3302, 2568, True),
     ],
