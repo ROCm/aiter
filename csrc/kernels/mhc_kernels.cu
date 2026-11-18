@@ -12,7 +12,9 @@
 #include "aiter_dispatch.h"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
+#include <algorithm>
 #include <optional>
+#include <utility>
 
 
 namespace aiter {
@@ -1560,6 +1562,17 @@ namespace aiter {
 #undef MHC_POST_LOOP_BODY
     }
 
+    // FP32 -> DTYPE_I rounded to nearest even on every arch (opus::cast truncates
+    // BF16 on gfx942 by default).
+    template <typename T>
+    __device__ __forceinline__ T mhc_post_round_rne(float v)
+    {
+        if constexpr(std::is_same_v<T, opus::bf16_t>)
+            return opus::fp32_to_bf16(v, opus::number<0>{});
+        else
+            return opus::cast<T>(v);
+    }
+
     // An optimization barrier: the value of `v`, opaque to the compiler, so a
     // product passed through it is never contracted into the add consuming it.
     __device__ __forceinline__ float mhc_post_reduce_opaque(float v)
@@ -1701,7 +1714,14 @@ namespace aiter {
                     acc[k] = acc[k] * (1.0f / hc_mult);
                 }
             }
-            store_vector<DTYPE_I, float, reduce_vec, store_policy>(g_out, acc, i * residual_block + col);
+            // Round the reduced value to nearest even, as a cast of the FP32
+            // reduction does. (The streams above keep mhc_post's own store
+            // rounding, which truncates BF16 on gfx942.)
+            opus::vector_t<DTYPE_I, reduce_vec> reduced;
+            for(int k = 0; k < reduce_vec; k++) {
+                reduced[k] = mhc_post_round_rne<DTYPE_I>(acc[k]);
+            }
+            store_vector<DTYPE_I, DTYPE_I, reduce_vec, store_policy>(g_out, reduced, i * residual_block + col);
         };
 
         auto compute_store_tile = [&](int i) {
@@ -1781,27 +1801,33 @@ namespace aiter {
     //   - search: it walked DOWN to the first exact divisor, which collapses to 1 on
     //     a coarse lattice (hidden 7168, residual_block 1024 => nblk 7 => k in
     //     {1, 7}, so m = 512 ran 512 work-groups on 256 CUs).
-    // Work-groups a CU can hold: thread-limited here, not LDS-limited (20 KB per
-    // work-group at residual_block 1024, 28 KB with the reduce epilogue staging the
-    // streams, against 320 KB per CU on gfx1250).
-    static inline int mhc_post_wgs_per_cu(int block_size)
+    // Work-groups a CU can hold. mhc_post (lds_bytes 0) aims by threads, as it
+    // always has: 20 KB of LDS per work-group at residual_block 1024 fits that
+    // count on gfx950 and gfx1250. The reduce epilogue stages the streams too
+    // (28 KB at residual_block 1024), which LDS limits below the thread count
+    // (5 work-groups per CU on gfx950's 160 KB), so it passes its LDS size and
+    // the smaller of the two counts is the target.
+    static inline int mhc_post_wgs_per_cu(int block_size, int lds_bytes = 0)
     {
-        static const int threads_per_cu = []() {
+        static const auto per_cu = []() {
             hipDevice_t dev;
             hipDeviceProp_t dev_prop;
             HIP_CALL(hipGetDevice(&dev));
             HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-            return (int)dev_prop.maxThreadsPerMultiProcessor;
+            return std::pair<int, int>((int)dev_prop.maxThreadsPerMultiProcessor,
+                                       (int)dev_prop.maxSharedMemoryPerMultiProcessor);
         }();
-        const int wgs = threads_per_cu / block_size;
+        int wgs = per_cu.first / block_size;
+        if(lds_bytes > 0 && per_cu.second > 0)
+            wgs = std::min(wgs, per_cu.second / lds_bytes);
         return wgs > 0 ? wgs : 1;
     }
 
     static inline int mhc_post_pick_kblocks(
-        int m, int hidden_size, int residual_block, int cu_num, int block_size)
+        int m, int hidden_size, int residual_block, int cu_num, int block_size, int lds_bytes = 0)
     {
         const int nblk        = hidden_size / residual_block;
-        const int grid_target = cu_num * mhc_post_wgs_per_cu(block_size);
+        const int grid_target = cu_num * mhc_post_wgs_per_cu(block_size, lds_bytes);
         const int target      = (m > 0 && grid_target / m > 0) ? grid_target / m : 1;
         int best              = 1;
         int64_t best_score    = -1;
@@ -1847,7 +1873,7 @@ namespace aiter {
 #define MHC_POST_LAUNCH_(kernel_name, residual_block, store_nt_val, ...) \
     do { \
         int block_size = 4 * WARP_SIZE; \
-        int k_blocks = mhc_post_pick_kblocks(m, hidden_size, residual_block, cu_num, block_size); \
+        /* the reduce modes also stage hc_mult streams: 2 + 2 * 4 + 4 tiles */         int lds_bytes = 0 __VA_OPT__(+ 14 * residual_block * 2);         int k_blocks = mhc_post_pick_kblocks(m, hidden_size, residual_block, cu_num, block_size, lds_bytes); \
         int sub_hidden_size = hidden_size / k_blocks; \
         dim3 grid(m, k_blocks); \
         dim3 block(block_size); \
@@ -1966,6 +1992,18 @@ namespace aiter {
                     "mhc_post_reduce: out, x and residual must share one dtype");
         AITER_CHECK(out.dim() == 2 && out.size(0) == m && out.size(1) == hidden_size && out.is_contiguous(),
                     "mhc_post_reduce: out must be a contiguous (m, hidden_size) tensor");
+        AITER_CHECK(x.dim() == 2 && x.size(0) == m && x.size(1) == hidden_size && x.stride(1) == 1,
+                    "mhc_post_reduce: x must be (m, hidden_size) with unit-stride rows");
+        AITER_CHECK(residual.dim() == 3 && residual.stride(2) == 1 && residual.stride(1) == hidden_size,
+                    "mhc_post_reduce: residual must be (m, hc_mult, hidden_size) with contiguous streams");
+        AITER_CHECK(post_layer_mix.dtype() == AITER_DTYPE_fp32 && post_layer_mix.is_contiguous() &&
+                        post_layer_mix.size(0) == m && post_layer_mix.size(1) == hc_mult &&
+                        (post_layer_mix.dim() == 2 || (post_layer_mix.dim() == 3 && post_layer_mix.size(2) == 1)),
+                    "mhc_post_reduce: post_layer_mix must be a contiguous fp32 (m, hc_mult[, 1]) tensor");
+        AITER_CHECK(comb_res_mix.dtype() == AITER_DTYPE_fp32 && comb_res_mix.is_contiguous() &&
+                        comb_res_mix.dim() == 3 && comb_res_mix.size(0) == m &&
+                        comb_res_mix.size(1) == hc_mult && comb_res_mix.size(2) == hc_mult,
+                    "mhc_post_reduce: comb_res_mix must be a contiguous fp32 (m, hc_mult, hc_mult) tensor");
         float* pre_ptr = nullptr;
         if(pre_mix.has_value())
         {
