@@ -1,0 +1,560 @@
+[
+  {
+    "op": "a03",
+    "rows": 96,
+    "provider": "native",
+    "input_shape": [
+      96,
+      1792
+    ],
+    "input_stride": [
+      1792,
+      1
+    ],
+    "q_stride": [
+      1792,
+      1
+    ],
+    "k_stride": [
+      1792,
+      1
+    ],
+    "shared_storage": true,
+    "name": "_fused_dual_rmsnorm_mxfp8_quant_kernel_BLOCK_SIZE_KQ_2048_BLOCK_SIZE_KK_512_QUANT_BLOCK_SIZE_32",
+    "hash": "cc52f67391ddb9f3331d261776783c0798771ee64fc855294602ce855f6670ee",
+    "resources": {
+      "vgpr_count": 83,
+      "sgpr_count": 68,
+      "private_segment_fixed_size": 0,
+      "group_segment_fixed_size": 0,
+      "wavefront_size": 32
+    },
+    "tg_grid": [
+      96,
+      1,
+      1
+    ],
+    "threads_per_tg": [
+      128,
+      1,
+      1
+    ],
+    "conditional_branches": 2,
+    "artifacts_sha256": {
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.source": "284118b06f8ed174730ec5c5ccfa4124b24119f1c2cb7d58ea18c625bbb17f1a",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.ttir": "7d39016e652f1ac1d9ed43a9546f5ca833bd8468dce30db941db2d83d1b0ee80",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.ttgir": "74a91f5e65ee702f00038ab9cd8c22d6f6de9bbe563d3474f0bf884e9788ad20",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.llir": "30d9fc02deebdf8e01463ccc511db5a0ad31783f78e86bd9d0d3526702ddd7fa",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.amdgcn": "f1a7541c3ee2b48dd7ce355555b54826f93dfa715bf89058e266e46aaa989918",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.hsaco": "45eec933f9e0dc126b1290cabb99192e5976b5b005798719a6a620efca9ed712",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.json": "58e1e3311b04b8fefc380214afa13e6fe5e3f4133148c2b19be438f7b9a7dfd6"
+    }
+  },
+  {
+    "op": "a03",
+    "rows": 96,
+    "provider": "persistent",
+    "input_shape": [
+      96,
+      1792
+    ],
+    "input_stride": [
+      1792,
+      1
+    ],
+    "q_stride": [
+      1792,
+      1
+    ],
+    "k_stride": [
+      1792,
+      1
+    ],
+    "shared_storage": true,
+    "name": "_fused_dual_rmsnorm_mxfp8_quant_kernel_BLOCK_SIZE_KQ_2048_BLOCK_SIZE_KK_512_QUANT_BLOCK_SIZE_32_PERSISTENT_1",
+    "hash": "7af1b46f0f17ad1e8334c5834a16bd947d0bca9591dad4756a75ed75888f433b",
+    "resources": {
+      "vgpr_count": 83,
+      "sgpr_count": 68,
+      "private_segment_fixed_size": 0,
+      "group_segment_fixed_size": 0,
+      "wavefront_size": 32
+    },
+    "tg_grid": [
+      16,
+      16,
+      1
+    ],
+    "threads_per_tg": [
+      128,
+      1,
+      1
+    ],
+    "conditional_branches": 2,
+    "artifacts_sha256": {
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.source": "e25969ea6bf75d08fa3a9c476ca32b0810750e096480a68675675129de703d76",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.ttir": "cbb8b126f533e98bf09a586e06bf14d3398619936ce2dec1bb645c9ce9e6be82",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.ttgir": "917bac6cf6499b208f8e78b9032798c0e88265227e72ced2dc8b0824f30377bb",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.llir": "e5f10d1feba2f3168cf3b54788b5ddb61ef2d7eabdfd1c32c34b0bd1d6c7e952",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.amdgcn": "30b17ed6773e90d6ba0c35c21a4a9f8282e695fcd5cb330e2c06bfb169928dad",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.hsaco": "23f2731fde88c29bd57a2a982007e0c9883e33f44a6d4871dcbbe6778bb9ec06",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.json": "aad0c8d985759649d14922129029ee30dde38fe023f6f2856a2e283bb1dc21e7"
+    }
+  },
+  {
+    "op": "a03",
+    "rows": 257,
+    "provider": "native",
+    "input_shape": [
+      257,
+      1792
+    ],
+    "input_stride": [
+      1792,
+      1
+    ],
+    "q_stride": [
+      1792,
+      1
+    ],
+    "k_stride": [
+      1792,
+      1
+    ],
+    "shared_storage": true,
+    "name": "_fused_dual_rmsnorm_mxfp8_quant_kernel_BLOCK_SIZE_KQ_2048_BLOCK_SIZE_KK_512_QUANT_BLOCK_SIZE_32",
+    "hash": "17d9a9d21fd1fa5695771a35d80dce7ea304ddd8ac647f4bf142f4cee9701af7",
+    "resources": {
+      "vgpr_count": 83,
+      "sgpr_count": 68,
+      "private_segment_fixed_size": 0,
+      "group_segment_fixed_size": 0,
+      "wavefront_size": 32
+    },
+    "tg_grid": [
+      257,
+      1,
+      1
+    ],
+    "threads_per_tg": [
+      128,
+      1,
+      1
+    ],
+    "conditional_branches": 2,
+    "artifacts_sha256": {
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.source": "64a6867e5c8cd8966e6d6fa916a4e22edd707d1a721a202fa8cc87d2fe93b345",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.ttir": "b2e88d450dca202ac566fb8127ddbf05dfe79ffb8e8cd8737e09dd334bfdcda7",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.ttgir": "e027ff456681fbb87bdfae7c7b2ad29bdecd3cbcc17f4daf79afd9065ef67bb5",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.llir": "30d9fc02deebdf8e01463ccc511db5a0ad31783f78e86bd9d0d3526702ddd7fa",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.amdgcn": "f1a7541c3ee2b48dd7ce355555b54826f93dfa715bf89058e266e46aaa989918",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.hsaco": "45eec933f9e0dc126b1290cabb99192e5976b5b005798719a6a620efca9ed712",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.json": "0ddcaf48dd09eb8d515a26089b9f0311458ae10d6d091a6cbbfb5395c74bc911"
+    }
+  },
+  {
+    "op": "a03",
+    "rows": 257,
+    "provider": "persistent",
+    "input_shape": [
+      257,
+      1792
+    ],
+    "input_stride": [
+      1792,
+      1
+    ],
+    "q_stride": [
+      1792,
+      1
+    ],
+    "k_stride": [
+      1792,
+      1
+    ],
+    "shared_storage": true,
+    "name": "_fused_dual_rmsnorm_mxfp8_quant_kernel_BLOCK_SIZE_KQ_2048_BLOCK_SIZE_KK_512_QUANT_BLOCK_SIZE_32_PERSISTENT_1",
+    "hash": "eebc518388326491ab173feac4f80cd8470638ebcee4cde651a79dc91f1a5422",
+    "resources": {
+      "vgpr_count": 83,
+      "sgpr_count": 68,
+      "private_segment_fixed_size": 0,
+      "group_segment_fixed_size": 0,
+      "wavefront_size": 32
+    },
+    "tg_grid": [
+      16,
+      16,
+      1
+    ],
+    "threads_per_tg": [
+      128,
+      1,
+      1
+    ],
+    "conditional_branches": 2,
+    "artifacts_sha256": {
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.source": "bc6d02eae5bfa801591d190655b0813f4179eb015fd82fe144fa03b928d23b13",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.ttir": "f7f1f645357422199f46cbc6978a155e6ced26365843ff760b0f912397214ee7",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.ttgir": "e4f4cdd2c27e6b7259e66c17b8722ef872928f56d00359348a0bcfe64caed0af",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.llir": "e5f10d1feba2f3168cf3b54788b5ddb61ef2d7eabdfd1c32c34b0bd1d6c7e952",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.amdgcn": "30b17ed6773e90d6ba0c35c21a4a9f8282e695fcd5cb330e2c06bfb169928dad",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.hsaco": "23f2731fde88c29bd57a2a982007e0c9883e33f44a6d4871dcbbe6778bb9ec06",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.json": "1c8d564f36d58825bb149da5b34b600a4f45b56d9387bdc3a9bba3e0293fe508"
+    }
+  },
+  {
+    "op": "a03",
+    "rows": 513,
+    "provider": "native",
+    "input_shape": [
+      513,
+      1792
+    ],
+    "input_stride": [
+      1792,
+      1
+    ],
+    "q_stride": [
+      1792,
+      1
+    ],
+    "k_stride": [
+      1792,
+      1
+    ],
+    "shared_storage": true,
+    "name": "_fused_dual_rmsnorm_mxfp8_quant_kernel_BLOCK_SIZE_KQ_2048_BLOCK_SIZE_KK_512_QUANT_BLOCK_SIZE_32",
+    "hash": "17d9a9d21fd1fa5695771a35d80dce7ea304ddd8ac647f4bf142f4cee9701af7",
+    "resources": {
+      "vgpr_count": 83,
+      "sgpr_count": 68,
+      "private_segment_fixed_size": 0,
+      "group_segment_fixed_size": 0,
+      "wavefront_size": 32
+    },
+    "tg_grid": [
+      513,
+      1,
+      1
+    ],
+    "threads_per_tg": [
+      128,
+      1,
+      1
+    ],
+    "conditional_branches": 2,
+    "artifacts_sha256": {
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.source": "64a6867e5c8cd8966e6d6fa916a4e22edd707d1a721a202fa8cc87d2fe93b345",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.ttir": "b2e88d450dca202ac566fb8127ddbf05dfe79ffb8e8cd8737e09dd334bfdcda7",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.ttgir": "e027ff456681fbb87bdfae7c7b2ad29bdecd3cbcc17f4daf79afd9065ef67bb5",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.llir": "30d9fc02deebdf8e01463ccc511db5a0ad31783f78e86bd9d0d3526702ddd7fa",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.amdgcn": "f1a7541c3ee2b48dd7ce355555b54826f93dfa715bf89058e266e46aaa989918",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.hsaco": "45eec933f9e0dc126b1290cabb99192e5976b5b005798719a6a620efca9ed712",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.json": "0ddcaf48dd09eb8d515a26089b9f0311458ae10d6d091a6cbbfb5395c74bc911"
+    }
+  },
+  {
+    "op": "a03",
+    "rows": 513,
+    "provider": "persistent",
+    "input_shape": [
+      513,
+      1792
+    ],
+    "input_stride": [
+      1792,
+      1
+    ],
+    "q_stride": [
+      1792,
+      1
+    ],
+    "k_stride": [
+      1792,
+      1
+    ],
+    "shared_storage": true,
+    "name": "_fused_dual_rmsnorm_mxfp8_quant_kernel_BLOCK_SIZE_KQ_2048_BLOCK_SIZE_KK_512_QUANT_BLOCK_SIZE_32_PERSISTENT_1",
+    "hash": "eebc518388326491ab173feac4f80cd8470638ebcee4cde651a79dc91f1a5422",
+    "resources": {
+      "vgpr_count": 83,
+      "sgpr_count": 68,
+      "private_segment_fixed_size": 0,
+      "group_segment_fixed_size": 0,
+      "wavefront_size": 32
+    },
+    "tg_grid": [
+      16,
+      16,
+      1
+    ],
+    "threads_per_tg": [
+      128,
+      1,
+      1
+    ],
+    "conditional_branches": 2,
+    "artifacts_sha256": {
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.source": "bc6d02eae5bfa801591d190655b0813f4179eb015fd82fe144fa03b928d23b13",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.ttir": "f7f1f645357422199f46cbc6978a155e6ced26365843ff760b0f912397214ee7",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.ttgir": "e4f4cdd2c27e6b7259e66c17b8722ef872928f56d00359348a0bcfe64caed0af",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.llir": "e5f10d1feba2f3168cf3b54788b5ddb61ef2d7eabdfd1c32c34b0bd1d6c7e952",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.amdgcn": "30b17ed6773e90d6ba0c35c21a4a9f8282e695fcd5cb330e2c06bfb169928dad",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.hsaco": "23f2731fde88c29bd57a2a982007e0c9883e33f44a6d4871dcbbe6778bb9ec06",
+      "_fused_dual_rmsnorm_mxfp8_quant_kernel.json": "1c8d564f36d58825bb149da5b34b600a4f45b56d9387bdc3a9bba3e0293fe508"
+    }
+  },
+  {
+    "op": "a09",
+    "rows": 96,
+    "provider": "native",
+    "input_shape": [
+      96,
+      2048
+    ],
+    "input_stride": [
+      2048,
+      1
+    ],
+    "name": "quantize_fp8_kernel",
+    "hash": "bd925f2130c56a0841bdf54742e1c36e68ddcdc7d26b4c58ab796bcec24d0011",
+    "resources": {
+      "vgpr_count": 47,
+      "sgpr_count": 68,
+      "private_segment_fixed_size": 0,
+      "group_segment_fixed_size": 0,
+      "wavefront_size": 32
+    },
+    "tg_grid": [
+      192,
+      1,
+      1
+    ],
+    "threads_per_tg": [
+      128,
+      1,
+      1
+    ],
+    "conditional_branches": 0,
+    "artifacts_sha256": {
+      "quantize_fp8_kernel.source": "6c6bf0623488804fb626be6a34748f6b74fd51d7c1f6d982952c44d7c119e6a9",
+      "quantize_fp8_kernel.ttir": "88407eef5816dff0879abc3acb91d52b435653990a201f42faac5a6e73ff7664",
+      "quantize_fp8_kernel.ttgir": "430171f08696ffb73b30a2eeb1b74770920cccf06cdd32b957ca018b06332133",
+      "quantize_fp8_kernel.llir": "87befc1631bc3726126d23ea0635d4fc7b05114c1a36b3c78b1304df38e43b5e",
+      "quantize_fp8_kernel.amdgcn": "f9e949afb5f56ff893661e4f753e5ffb974ca5089f487f9f835b370ee0545068",
+      "quantize_fp8_kernel.hsaco": "8f3981eef78861dd9c479630b3bd8f4e69d328d39532c3799d163dbdad76859e",
+      "quantize_fp8_kernel.json": "275aa94c09c29397719c8e2e47083a624275b435311b1a0b64c7caaddf1d300a"
+    }
+  },
+  {
+    "op": "a09",
+    "rows": 96,
+    "provider": "persistent",
+    "input_shape": [
+      96,
+      2048
+    ],
+    "input_stride": [
+      2048,
+      1
+    ],
+    "name": "_quantize_fp8_group32_kernel_PERSISTENT_1_DEQUANT_0",
+    "hash": "849453e0439d8152e4ab9e3591adc1301998ea7353af8b7323230380fbfa75ff",
+    "resources": {
+      "vgpr_count": 51,
+      "sgpr_count": 68,
+      "private_segment_fixed_size": 0,
+      "group_segment_fixed_size": 0,
+      "wavefront_size": 32
+    },
+    "tg_grid": [
+      16,
+      16,
+      1
+    ],
+    "threads_per_tg": [
+      128,
+      1,
+      1
+    ],
+    "conditional_branches": 2,
+    "artifacts_sha256": {
+      "_quantize_fp8_group32_kernel.source": "8d0b4019aee916754703fc8aff366ce1672bc846c9627ba0ff02a9027f4b1761",
+      "_quantize_fp8_group32_kernel.ttir": "3e36e7e96362a4815e37d12dff5c286c0b3f164ee43d099710faf4b459044502",
+      "_quantize_fp8_group32_kernel.ttgir": "75ff8b47470f54bfe1166467447bfdf6a7f6d0ff9f349107625fd23d0c794cc5",
+      "_quantize_fp8_group32_kernel.llir": "581bf93b676ef5bd6d4b3141d94a11a9dfe789292a575b4ad9d7dfe32952b6b2",
+      "_quantize_fp8_group32_kernel.amdgcn": "8755758b1ceaa28a219e88e34bd95ac1d57c1e38d2a50a3b0b05eeda7fbce77e",
+      "_quantize_fp8_group32_kernel.hsaco": "bc33cefb28a0cdf2921859812e79c009fe03178cdd337929c966ab72af6489de",
+      "_quantize_fp8_group32_kernel.json": "b995b9f19be52c546dbb33d51bca24ac690f49353b2d652c310cbda891bcc3d9"
+    }
+  },
+  {
+    "op": "a09",
+    "rows": 257,
+    "provider": "native",
+    "input_shape": [
+      257,
+      2048
+    ],
+    "input_stride": [
+      2048,
+      1
+    ],
+    "name": "quantize_fp8_kernel",
+    "hash": "bd925f2130c56a0841bdf54742e1c36e68ddcdc7d26b4c58ab796bcec24d0011",
+    "resources": {
+      "vgpr_count": 47,
+      "sgpr_count": 68,
+      "private_segment_fixed_size": 0,
+      "group_segment_fixed_size": 0,
+      "wavefront_size": 32
+    },
+    "tg_grid": [
+      514,
+      1,
+      1
+    ],
+    "threads_per_tg": [
+      128,
+      1,
+      1
+    ],
+    "conditional_branches": 0,
+    "artifacts_sha256": {
+      "quantize_fp8_kernel.source": "6c6bf0623488804fb626be6a34748f6b74fd51d7c1f6d982952c44d7c119e6a9",
+      "quantize_fp8_kernel.ttir": "88407eef5816dff0879abc3acb91d52b435653990a201f42faac5a6e73ff7664",
+      "quantize_fp8_kernel.ttgir": "430171f08696ffb73b30a2eeb1b74770920cccf06cdd32b957ca018b06332133",
+      "quantize_fp8_kernel.llir": "87befc1631bc3726126d23ea0635d4fc7b05114c1a36b3c78b1304df38e43b5e",
+      "quantize_fp8_kernel.amdgcn": "f9e949afb5f56ff893661e4f753e5ffb974ca5089f487f9f835b370ee0545068",
+      "quantize_fp8_kernel.hsaco": "8f3981eef78861dd9c479630b3bd8f4e69d328d39532c3799d163dbdad76859e",
+      "quantize_fp8_kernel.json": "275aa94c09c29397719c8e2e47083a624275b435311b1a0b64c7caaddf1d300a"
+    }
+  },
+  {
+    "op": "a09",
+    "rows": 257,
+    "provider": "persistent",
+    "input_shape": [
+      257,
+      2048
+    ],
+    "input_stride": [
+      2048,
+      1
+    ],
+    "name": "_quantize_fp8_group32_kernel_PERSISTENT_1_DEQUANT_0",
+    "hash": "849453e0439d8152e4ab9e3591adc1301998ea7353af8b7323230380fbfa75ff",
+    "resources": {
+      "vgpr_count": 51,
+      "sgpr_count": 68,
+      "private_segment_fixed_size": 0,
+      "group_segment_fixed_size": 0,
+      "wavefront_size": 32
+    },
+    "tg_grid": [
+      16,
+      16,
+      1
+    ],
+    "threads_per_tg": [
+      128,
+      1,
+      1
+    ],
+    "conditional_branches": 2,
+    "artifacts_sha256": {
+      "_quantize_fp8_group32_kernel.source": "8d0b4019aee916754703fc8aff366ce1672bc846c9627ba0ff02a9027f4b1761",
+      "_quantize_fp8_group32_kernel.ttir": "3e36e7e96362a4815e37d12dff5c286c0b3f164ee43d099710faf4b459044502",
+      "_quantize_fp8_group32_kernel.ttgir": "75ff8b47470f54bfe1166467447bfdf6a7f6d0ff9f349107625fd23d0c794cc5",
+      "_quantize_fp8_group32_kernel.llir": "581bf93b676ef5bd6d4b3141d94a11a9dfe789292a575b4ad9d7dfe32952b6b2",
+      "_quantize_fp8_group32_kernel.amdgcn": "8755758b1ceaa28a219e88e34bd95ac1d57c1e38d2a50a3b0b05eeda7fbce77e",
+      "_quantize_fp8_group32_kernel.hsaco": "bc33cefb28a0cdf2921859812e79c009fe03178cdd337929c966ab72af6489de",
+      "_quantize_fp8_group32_kernel.json": "b995b9f19be52c546dbb33d51bca24ac690f49353b2d652c310cbda891bcc3d9"
+    }
+  },
+  {
+    "op": "a09",
+    "rows": 513,
+    "provider": "native",
+    "input_shape": [
+      513,
+      2048
+    ],
+    "input_stride": [
+      2048,
+      1
+    ],
+    "name": "quantize_fp8_kernel",
+    "hash": "bd925f2130c56a0841bdf54742e1c36e68ddcdc7d26b4c58ab796bcec24d0011",
+    "resources": {
+      "vgpr_count": 47,
+      "sgpr_count": 68,
+      "private_segment_fixed_size": 0,
+      "group_segment_fixed_size": 0,
+      "wavefront_size": 32
+    },
+    "tg_grid": [
+      1026,
+      1,
+      1
+    ],
+    "threads_per_tg": [
+      128,
+      1,
+      1
+    ],
+    "conditional_branches": 0,
+    "artifacts_sha256": {
+      "quantize_fp8_kernel.source": "6c6bf0623488804fb626be6a34748f6b74fd51d7c1f6d982952c44d7c119e6a9",
+      "quantize_fp8_kernel.ttir": "88407eef5816dff0879abc3acb91d52b435653990a201f42faac5a6e73ff7664",
+      "quantize_fp8_kernel.ttgir": "430171f08696ffb73b30a2eeb1b74770920cccf06cdd32b957ca018b06332133",
+      "quantize_fp8_kernel.llir": "87befc1631bc3726126d23ea0635d4fc7b05114c1a36b3c78b1304df38e43b5e",
+      "quantize_fp8_kernel.amdgcn": "f9e949afb5f56ff893661e4f753e5ffb974ca5089f487f9f835b370ee0545068",
+      "quantize_fp8_kernel.hsaco": "8f3981eef78861dd9c479630b3bd8f4e69d328d39532c3799d163dbdad76859e",
+      "quantize_fp8_kernel.json": "275aa94c09c29397719c8e2e47083a624275b435311b1a0b64c7caaddf1d300a"
+    }
+  },
+  {
+    "op": "a09",
+    "rows": 513,
+    "provider": "persistent",
+    "input_shape": [
+      513,
+      2048
+    ],
+    "input_stride": [
+      2048,
+      1
+    ],
+    "name": "_quantize_fp8_group32_kernel_PERSISTENT_1_DEQUANT_0",
+    "hash": "849453e0439d8152e4ab9e3591adc1301998ea7353af8b7323230380fbfa75ff",
+    "resources": {
+      "vgpr_count": 51,
+      "sgpr_count": 68,
+      "private_segment_fixed_size": 0,
+      "group_segment_fixed_size": 0,
+      "wavefront_size": 32
+    },
+    "tg_grid": [
+      16,
+      16,
+      1
+    ],
+    "threads_per_tg": [
+      128,
+      1,
+      1
+    ],
+    "conditional_branches": 2,
+    "artifacts_sha256": {
+      "_quantize_fp8_group32_kernel.source": "8d0b4019aee916754703fc8aff366ce1672bc846c9627ba0ff02a9027f4b1761",
+      "_quantize_fp8_group32_kernel.ttir": "3e36e7e96362a4815e37d12dff5c286c0b3f164ee43d099710faf4b459044502",
+      "_quantize_fp8_group32_kernel.ttgir": "75ff8b47470f54bfe1166467447bfdf6a7f6d0ff9f349107625fd23d0c794cc5",
+      "_quantize_fp8_group32_kernel.llir": "581bf93b676ef5bd6d4b3141d94a11a9dfe789292a575b4ad9d7dfe32952b6b2",
+      "_quantize_fp8_group32_kernel.amdgcn": "8755758b1ceaa28a219e88e34bd95ac1d57c1e38d2a50a3b0b05eeda7fbce77e",
+      "_quantize_fp8_group32_kernel.hsaco": "bc33cefb28a0cdf2921859812e79c009fe03178cdd337929c966ab72af6489de",
+      "_quantize_fp8_group32_kernel.json": "b995b9f19be52c546dbb33d51bca24ac690f49353b2d652c310cbda891bcc3d9"
+    }
+  }
+]

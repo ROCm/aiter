@@ -1,0 +1,13 @@
+[aiter] Triton ops only: CK and HIP ops (and their JIT build) are skipped.
+[aiter] a03 rows=96 cache=hot PS/native=0.9971178138916447
+[aiter] a03 rows=96 cache=rotating PS/native=0.9914510726059064
+[aiter] a03 rows=257 cache=hot PS/native=1.2659213335453434
+[aiter] a03 rows=257 cache=rotating PS/native=1.1617356065459845
+[aiter] a03 rows=513 cache=hot PS/native=1.4985068854868444
+[aiter] a03 rows=513 cache=rotating PS/native=1.3881143314283617
+[aiter] a09 rows=96 cache=hot PS/native=1.040593804311841
+[aiter] a09 rows=96 cache=rotating PS/native=1.0148985435779612
+[aiter] a09 rows=257 cache=hot PS/native=1.324215822419062
+[aiter] a09 rows=257 cache=rotating PS/native=1.1468622705933762
+[aiter] a09 rows=513 cache=hot PS/native=1.931960741565543
+[aiter] a09 rows=513 cache=rotating PS/native=1.3266293501697108

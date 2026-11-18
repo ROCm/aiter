@@ -1,0 +1,47 @@
+============================= test session starts ==============================
+platform linux -- Python 3.14.4, pytest-9.0.3, pluggy-1.7.0 -- /root/venv/rocm-venv/bin/python
+cachedir: .pytest_cache
+rootdir: /validation/checkout
+configfile: pyproject.toml
+plugins: anyio-4.16.0, typeguard-4.4.4
+collecting ... collected 36 items
+
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_native_persistent[widths0-0] PASSED [  2%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_native_persistent[widths0-1] PASSED [  5%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_native_persistent[widths0-95] PASSED [  8%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_native_persistent[widths0-96] PASSED [ 11%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_native_persistent[widths0-255] PASSED [ 13%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_native_persistent[widths0-256] PASSED [ 16%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_native_persistent[widths0-257] PASSED [ 19%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_native_persistent[widths0-513] PASSED [ 22%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_native_persistent[widths1-0] PASSED [ 25%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_native_persistent[widths1-1] PASSED [ 27%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_native_persistent[widths1-95] PASSED [ 30%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_native_persistent[widths1-96] PASSED [ 33%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_native_persistent[widths1-255] PASSED [ 36%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_native_persistent[widths1-256] PASSED [ 38%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_native_persistent[widths1-257] PASSED [ 41%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_native_persistent[widths1-513] PASSED [ 44%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_separate_eps_and_floor[0.0] PASSED [ 47%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_separate_eps_and_floor[1e-10] PASSED [ 50%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_dual_norm_separate_eps_and_floor[0.0001] PASSED [ 52%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_output_quant_native_persistent[shape0] PASSED [ 55%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_output_quant_native_persistent[shape1] PASSED [ 58%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_output_quant_native_persistent[shape2] PASSED [ 61%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_output_quant_native_persistent[shape3] PASSED [ 63%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_output_quant_native_persistent[shape4] PASSED [ 66%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_output_quant_native_persistent[shape5] PASSED [ 69%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_output_quant_native_persistent[shape6] PASSED [ 72%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_output_quant_native_persistent[shape7] PASSED [ 75%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_output_quant_native_persistent[shape8] PASSED [ 77%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_output_quant_native_persistent[shape9] PASSED [ 80%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_output_quant_native_persistent[shape10] PASSED [ 83%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_output_quant_native_persistent[shape11] PASSED [ 86%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_output_quant_native_persistent[shape12] PASSED [ 88%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_output_quant_scale_boundaries PASSED [ 91%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_output_contract_rejects_bad_buffers PASSED [ 94%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_graph_replay_changes_inputs[a03] PASSED [ 97%]
+op_tests/triton_tests/quant/test_mono_persistent.py::test_graph_replay_changes_inputs[a09] PASSED [100%]
+
+------------ generated xml file: /validation/correctness-final.xml -------------
+============================== 36 passed in 5.66s ==============================

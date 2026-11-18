@@ -1,0 +1,74 @@
+[
+  {
+    "symbol": "_mxfp8_quant_op",
+    "expected": "275307480f4d44d5c256c2af33c0ef3e586194eefbcfbaa93f7a08fc69802fdc",
+    "actual": "275307480f4d44d5c256c2af33c0ef3e586194eefbcfbaa93f7a08fc69802fdc",
+    "passed": true
+  },
+  {
+    "symbol": "_fused_dual_rmsnorm_mxfp8_quant_repr",
+    "expected": "f46199c4455e7672dd4f2514d5d99795437c4d55368f21336e9265e2db338d35",
+    "actual": "f46199c4455e7672dd4f2514d5d99795437c4d55368f21336e9265e2db338d35",
+    "passed": true
+  },
+  {
+    "symbol": "_fused_dual_rmsnorm_mxfp8_quant_kernel",
+    "expected": "1cae5095f18dc28e01b627e3f522f208ec116c9145a91a899b766d2a37e1a091",
+    "actual": "1cae5095f18dc28e01b627e3f522f208ec116c9145a91a899b766d2a37e1a091",
+    "passed": true
+  },
+  {
+    "symbol": "fused_dual_rmsnorm_mxfp8_quant",
+    "expected": "b2d80b2bc9710da71a2440df98c0f75da430380817187a027824476409048147",
+    "actual": "b2d80b2bc9710da71a2440df98c0f75da430380817187a027824476409048147",
+    "passed": true
+  },
+  {
+    "symbol": "FP8_DTYPE",
+    "expected": "3ee940afd2343660bcf0a55f98dac44865e82101d74ad174b73496edee3d4bb9",
+    "actual": "3ee940afd2343660bcf0a55f98dac44865e82101d74ad174b73496edee3d4bb9",
+    "passed": true
+  },
+  {
+    "symbol": "FP8_MAX",
+    "expected": "4c5f1272cf5d117edeea4b7058c242155d5728bbcabe60da549fafe5bf8d5d85",
+    "actual": "4c5f1272cf5d117edeea4b7058c242155d5728bbcabe60da549fafe5bf8d5d85",
+    "passed": true
+  },
+  {
+    "symbol": "FP8_TL_DTYPE",
+    "expected": "dd3c090a7bc7b929f28ff58098a0db01db1533f97c8bb0617bbc512f612e6ea0",
+    "actual": "dd3c090a7bc7b929f28ff58098a0db01db1533f97c8bb0617bbc512f612e6ea0",
+    "passed": true
+  },
+  {
+    "symbol": "AMAX_FLOOR",
+    "expected": "96fc94101bc5c66b149b3c1e98f44bf6004e364e4fde9d02be2e83fc0e659251",
+    "actual": "96fc94101bc5c66b149b3c1e98f44bf6004e364e4fde9d02be2e83fc0e659251",
+    "passed": true
+  },
+  {
+    "symbol": "ceil_pow2_code",
+    "expected": "df779fa9d658eab78cc2cf0e99a8464648ff9e47551bc73621b5f97433cfc2d4",
+    "actual": "df779fa9d658eab78cc2cf0e99a8464648ff9e47551bc73621b5f97433cfc2d4",
+    "passed": true
+  },
+  {
+    "symbol": "quantize_fp8_kernel",
+    "expected": "e238753ee52666c337270bb927db954ec317351b4ae0064ddaf24bea1d96ea1d",
+    "actual": "e238753ee52666c337270bb927db954ec317351b4ae0064ddaf24bea1d96ea1d",
+    "passed": true
+  },
+  {
+    "symbol": "_check_quant_input",
+    "expected": "4b5ca1930b882cc61ffece7b72309bd1efb733cc40b6a3f00691c563c5cb4fe6",
+    "actual": "4b5ca1930b882cc61ffece7b72309bd1efb733cc40b6a3f00691c563c5cb4fe6",
+    "passed": true
+  },
+  {
+    "symbol": "quantize_fp8",
+    "expected": "7d868646988836cd58703abcf2302cdcab53a0436e8c9c50c124d6f892503557",
+    "actual": "7d868646988836cd58703abcf2302cdcab53a0436e8c9c50c124d6f892503557",
+    "passed": true
+  }
+]

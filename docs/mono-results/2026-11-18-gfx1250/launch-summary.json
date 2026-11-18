@@ -1,0 +1,25 @@
+{
+  "ps_launches": 92,
+  "workitem_grid": [
+    2048,
+    16,
+    1
+  ],
+  "workgroup": [
+    128,
+    1,
+    1
+  ],
+  "tg_grid": [
+    16,
+    16,
+    1
+  ],
+  "kernels": {
+    "_fused_dual_rmsnorm_mxfp8_quant_kernel_BLOCK_SIZE_KQ_2048_BLOCK_SIZE_KK_512_QUANT_BLOCK_SIZE_32_PERSISTENT_1": 35,
+    "_fused_dual_rmsnorm_mxfp8_quant_kernel_BLOCK_SIZE_KQ_128_BLOCK_SIZE_KK_64_QUANT_BLOCK_SIZE_32_PERSISTENT_1": 8,
+    "_quantize_fp8_group32_kernel_PERSISTENT_1_DEQUANT_0": 37,
+    "_quantize_fp8_group32_kernel_PERSISTENT_1_DEQUANT_1": 12
+  },
+  "all_pass": true
+}

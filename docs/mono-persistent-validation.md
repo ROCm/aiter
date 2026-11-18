@@ -4,6 +4,10 @@ The branch is `Wanzizhu/aiter:mono-dev`. These are standalone persistent stages.
 Run correctness before timing. No GPU result or speedup has been measured on
 the development host. Do not install these stages into a model for this task.
 
+The [2026-11-18 gfx1250 hardware report](mono-results/2026-11-18-gfx1250/README.md)
+records 36 passing GPU tests after an import fix. Eight benchmark configurations
+regress, and four remain inconclusive. Standalone performance acceptance fails.
+
 ## Code and native references
 
 The code commit for this handoff is `efa58c2ccd4525a8287c4f886945fc48ed86a192`.

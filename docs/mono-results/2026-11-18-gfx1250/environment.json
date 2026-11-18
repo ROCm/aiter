@@ -1,0 +1,29 @@
+{
+  "host": "heliosr-1b114-a07-3",
+  "host_kernel": "6.14.0-37-generic",
+  "gpu": "_CudaDeviceProperties(name='AMD Radeon Graphics', major=12, minor=5, gcnArchName='gfx1250', total_memory=442368MB, multi_processor_count=256, uuid=65653536-3737-3631-3666-336265323264, pci_bus_id=1, pci_device_id=0, pci_domain_id=1, L2_cache_size=4MB)",
+  "selected_gpu": 0,
+  "bdf": "0001:01:00.0",
+  "target": {
+    "arch": "gfx1250",
+    "warp_size": 32
+  },
+  "driver": "7.1.0.31300009",
+  "image": "rocm/atom-dev:ub26-dcgpu-rk-10.3.0a20261103.bkc.20261105-pyt2.14.0-tri-main-b7196d97-atomsrc-gfx1250-b1107",
+  "image_digest": "sha256:6a40615d965ec6088217e5682a866875e2c218365c7f135ecb83c4907d6bf2dd",
+  "torch": "2.14.0+rocm10.3.0a20261103-bkc.20261105",
+  "hip": "7.18.26435",
+  "triton": "3.9.0",
+  "python": "3.14.4",
+  "tested_commit": "d5930aff35d67fa0a2e74ba425909747f3ccef9f",
+  "triton_only": true,
+  "TRITON_DEFAULT_FP_FUSION": "1",
+  "performance_level": "auto",
+  "socket_power_cap_w": 2500,
+  "mclk_mhz": 1900,
+  "sclk_sample_min_mhz": 2222,
+  "sclk_sample_max_mhz": 2256,
+  "clock_or_power_settings_changed": false,
+  "framework_packages_changed": false,
+  "profiler_enabled_during_timing": false
+}

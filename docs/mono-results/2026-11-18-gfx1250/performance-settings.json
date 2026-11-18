@@ -1,0 +1,87 @@
+{
+  "sclk_sample_min_mhz": 2222,
+  "sclk_sample_max_mhz": 2256,
+  "sysfs_samples": [
+    {
+      "time": "2026-11-18T02:39:05.976180+00:00",
+      "sysfs": {
+        "gpu_busy_percent": "47\n",
+        "mem_info_vram_used": "1874309120\n",
+        "power_dpm_force_performance_level": "auto\n",
+        "pp_dpm_sclk": "0: 250Mhz \n1: 2237Mhz *\n2: 2400Mhz \n",
+        "pp_dpm_mclk": "0: 1900Mhz *\n"
+      }
+    },
+    {
+      "time": "2026-11-18T02:39:08.342637+00:00",
+      "sysfs": {
+        "gpu_busy_percent": "51\n",
+        "mem_info_vram_used": "3105533952\n",
+        "power_dpm_force_performance_level": "auto\n",
+        "pp_dpm_sclk": "0: 250Mhz \n1: 2237Mhz *\n2: 2400Mhz \n",
+        "pp_dpm_mclk": "0: 1900Mhz *\n"
+      }
+    },
+    {
+      "time": "2026-11-18T02:39:10.683271+00:00",
+      "sysfs": {
+        "gpu_busy_percent": "59\n",
+        "mem_info_vram_used": "3077914624\n",
+        "power_dpm_force_performance_level": "auto\n",
+        "pp_dpm_sclk": "0: 250Mhz \n1: 2228Mhz *\n2: 2400Mhz \n",
+        "pp_dpm_mclk": "0: 1900Mhz *\n"
+      }
+    },
+    {
+      "time": "2026-11-18T02:39:13.051490+00:00",
+      "sysfs": {
+        "gpu_busy_percent": "53\n",
+        "mem_info_vram_used": "2811576320\n",
+        "power_dpm_force_performance_level": "auto\n",
+        "pp_dpm_sclk": "0: 250Mhz \n1: 2222Mhz *\n2: 2400Mhz \n",
+        "pp_dpm_mclk": "0: 1900Mhz *\n"
+      }
+    },
+    {
+      "time": "2026-11-18T02:39:15.393924+00:00",
+      "sysfs": {
+        "gpu_busy_percent": "54\n",
+        "mem_info_vram_used": "2790629376\n",
+        "power_dpm_force_performance_level": "auto\n",
+        "pp_dpm_sclk": "0: 250Mhz \n1: 2232Mhz *\n2: 2400Mhz \n",
+        "pp_dpm_mclk": "0: 1900Mhz *\n"
+      }
+    },
+    {
+      "time": "2026-11-18T02:39:17.741537+00:00",
+      "sysfs": {
+        "gpu_busy_percent": "60\n",
+        "mem_info_vram_used": "2807799808\n",
+        "power_dpm_force_performance_level": "auto\n",
+        "pp_dpm_sclk": "0: 250Mhz \n1: 2226Mhz *\n2: 2400Mhz \n",
+        "pp_dpm_mclk": "0: 1900Mhz *\n"
+      }
+    },
+    {
+      "time": "2026-11-18T02:39:20.087119+00:00",
+      "sysfs": {
+        "gpu_busy_percent": "65\n",
+        "mem_info_vram_used": "2828771328\n",
+        "power_dpm_force_performance_level": "auto\n",
+        "pp_dpm_sclk": "0: 250Mhz \n1: 2234Mhz *\n2: 2400Mhz \n",
+        "pp_dpm_mclk": "0: 1900Mhz *\n"
+      }
+    },
+    {
+      "time": "2026-11-18T02:39:22.433690+00:00",
+      "sysfs": {
+        "gpu_busy_percent": "68\n",
+        "mem_info_vram_used": "3038486528\n",
+        "power_dpm_force_performance_level": "auto\n",
+        "pp_dpm_sclk": "0: 250Mhz \n1: 2256Mhz *\n2: 2400Mhz \n",
+        "pp_dpm_mclk": "0: 1900Mhz *\n"
+      }
+    }
+  ],
+  "note": "No clock/power changes made; performance mode auto; no profiler in any timing process."
+}

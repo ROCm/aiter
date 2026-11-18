@@ -1,0 +1,23 @@
+============================= test session starts ==============================
+platform linux -- Python 3.14.4, pytest-9.0.3, pluggy-1.7.0 -- /root/venv/rocm-venv/bin/python
+cachedir: .pytest_cache
+rootdir: /validation/checkout
+configfile: pyproject.toml
+plugins: anyio-4.16.0, typeguard-4.4.4
+collecting ... collected 0 items / 1 error
+
+==================================== ERRORS ====================================
+_____ ERROR collecting op_tests/triton_tests/quant/test_mono_persistent.py _____
+op_tests/triton_tests/quant/test_mono_persistent.py:7: in <module>
+    from aiter.ops.triton.quant.fp8_group32 import quantize_fp8_group32
+aiter/ops/triton/quant/__init__.py:5: in <module>
+    from aiter.ops.triton.quant.fused_fp8_quant import (
+aiter/ops/triton/quant/fused_fp8_quant.py:24: in <module>
+    fp8_dtype = aiter.dtypes.fp8
+                ^^^^^^^^^^^^
+E   AttributeError: module 'aiter' has no attribute 'dtypes'
+--------------- generated xml file: /validation/correctness.xml ----------------
+=========================== short test summary info ============================
+ERROR op_tests/triton_tests/quant/test_mono_persistent.py - AttributeError: m...
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+=============================== 1 error in 1.27s ===============================
