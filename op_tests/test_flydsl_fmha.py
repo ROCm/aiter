@@ -698,6 +698,73 @@ def test_flydsl_fmha_gfx11_head_interleaved_is_copied():
     _check_gfx11(out, q, k, v, False, 1.0 / 8.0)
 
 
+@_gfx11_only
+@pytest.mark.parametrize(
+    "batch,seq_q,seq_kv,num_heads,num_kv_heads,head_dim,causal,dtype",
+    [
+        (2, 1000, 1000, 32, 8, 128, True, torch.bfloat16),  # Llama-3-8B, tails
+        (1, 777, 333, 28, 4, 128, False, torch.bfloat16),  # Qwen2.5-7B, cross
+        (2, 512, 512, 8, 1, 64, False, torch.float16),  # MQA
+        (1, 300, 300, 16, 2, 72, False, torch.float16),  # head_dim % 16 == 8
+    ],
+)
+def test_flydsl_fmha_gfx11_gqa(
+    batch, seq_q, seq_kv, num_heads, num_kv_heads, head_dim, causal, dtype
+):
+    """Fewer K/V heads than query heads: query head h reads K/V head h // group."""
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(
+        batch, seq_q, num_heads, head_dim, generator=g, dtype=dtype, device="cuda"
+    )
+    k, v = (
+        torch.randn(
+            batch,
+            seq_kv,
+            num_kv_heads,
+            head_dim,
+            generator=g,
+            dtype=dtype,
+            device="cuda",
+        )
+        for _ in range(2)
+    )
+    out = flydsl_flash_attn_func(q, k, v, causal=causal)
+    group = num_heads // num_kv_heads
+    k_full, v_full = (t.repeat_interleave(group, dim=2) for t in (k, v))
+    _check_gfx11(out, q, k_full, v_full, causal, 1.0 / math.sqrt(head_dim))
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_gqa_fused_qkv():
+    """Q / K / V as views of one fused projection [B, S, H + 2 * H_kv, D], in place."""
+    batch, seq, num_heads, num_kv_heads, head_dim = 2, 1000, 32, 8, 128
+    g = torch.Generator(device="cuda").manual_seed(0)
+    qkv = torch.randn(
+        batch,
+        seq,
+        num_heads + 2 * num_kv_heads,
+        head_dim,
+        generator=g,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    q, k, v = qkv.split([num_heads, num_kv_heads, num_kv_heads], dim=2)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = flydsl_flash_attn_func(q, k, v, causal=True)
+    group = num_heads // num_kv_heads
+    k_full, v_full = (t.repeat_interleave(group, dim=2) for t in (k, v))
+    _check_gfx11(out, q, k_full, v_full, True, 1.0 / math.sqrt(head_dim))
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_rejects_gqa_head_ratio():
+    q = torch.randn(1, 256, 6, 64, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(1, 256, 4, 64, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="num_heads"):
+        flydsl_flash_attn_func(q, kv, kv.clone())
+
+
 # gfx950 fp8 (e4m3fn). The reference dequantizes the *same* fp8 tensors, so the
 # error measured is the kernel's, not the quantizer's.
 

@@ -10,8 +10,8 @@ CK/Triton.
 
 ``flydsl_flash_attn_func`` serves gfx11 (RDNA3 / RDNA3.5) with
 ``flash_attn_func_gfx11`` -- any sequence lengths, self- and cross-attention,
-``head_dim % 8 == 0``, bf16/f16, no padding -- and gfx1201 (RDNA4) by wrapping
-the `flash_attn_func_gfx1201` kernel with:
+GQA / MQA, ``head_dim % 8 == 0``, bf16/f16, no padding -- and gfx1201 (RDNA4)
+by wrapping the `flash_attn_func_gfx1201` kernel with:
   - Build cache keyed by shape, dtype, masking, and tuning parameters.
   - Automatic Q and KV sequence padding to their respective tile sizes.
   - BSHD ([B, S, H, D]) input/output convention to match upstream
@@ -252,6 +252,7 @@ def _get_fp8_gfx1201_kernel(
 def _get_kernel_gfx11(
     device_index: int,
     num_heads: int,
+    num_kv_heads: int,
     head_dim: int,
     causal: bool,
     dtype_str: str,
@@ -275,6 +276,7 @@ def _get_kernel_gfx11(
         q_token_stride=token_strides[0],
         k_token_stride=token_strides[1],
         v_token_stride=token_strides[2],
+        num_kv_heads=num_kv_heads,
     )
 
 
@@ -322,7 +324,7 @@ def _flydsl_flash_attn_func_gfx11(q, k, v, causal, softmax_scale, stream, out):
             )
             for t, seq in ((q_c, seq_q), (k_c, seq_kv), (v_c, seq_kv)):
                 # Per-batch buffer descriptors address with 32-bit byte offsets.
-                rows = (seq - 1) * t.stride(1) + num_heads * head_dim
+                rows = (seq - 1) * t.stride(1) + t.shape[2] * head_dim
                 if rows * t.element_size() >= 2**31:
                     raise ValueError(
                         "one batch slice of q/k/v must be smaller than 2 GiB"
@@ -332,6 +334,7 @@ def _flydsl_flash_attn_func_gfx11(q, k, v, causal, softmax_scale, stream, out):
             exe = _get_kernel_gfx11(
                 device_index=q.device.index,
                 num_heads=num_heads,
+                num_kv_heads=k.shape[2],
                 head_dim=head_dim,
                 causal=causal,
                 dtype_str=_torch_dtype_to_str(q.dtype),
@@ -379,7 +382,9 @@ def flydsl_flash_attn_func(
     Args:
         q: tensor with shape ``[batch, seqlen_q, num_heads, head_dim]`` (BSHD).
         k, v: tensors with shape ``[batch, seqlen_kv, num_heads, head_dim]``.
-            All three inputs must share dtype, batch, num_heads, and head_dim.
+            All three inputs must share dtype, batch, num_heads, and head_dim;
+            on gfx11 k/v may have fewer heads than q (GQA / MQA, num_heads a
+            multiple of the K/V heads).
         causal: apply causal masking when ``True``. Causal cross-attention is
             not supported.
         waves_per_eu: kernel occupancy hint passed to the gfx1201 builder.
@@ -429,9 +434,14 @@ def flydsl_flash_attn_func(
         )
     if not (q.dtype == k.dtype == v.dtype):
         raise ValueError(f"q/k/v dtype must match: {q.dtype}/{k.dtype}/{v.dtype}")
-    if q.shape[0] != k.shape[0] or q.shape[2:] != k.shape[2:]:
+    # gfx11 also takes fewer K/V heads than query heads (GQA / MQA).
+    heads_ok = q.shape[2] == k.shape[2] or (
+        is_gfx11 and k.shape[2] > 0 and q.shape[2] % k.shape[2] == 0
+    )
+    if q.shape[0] != k.shape[0] or q.shape[3] != k.shape[3] or not heads_ok:
         raise ValueError(
-            "q/k must share batch, num_heads, and head dimension, got "
+            "q/k must share batch, num_heads (gfx11: num_heads a multiple of "
+            "the K/V heads), and head dimension, got "
             f"{tuple(q.shape)}/{tuple(k.shape)}"
         )
     if stream is not None:

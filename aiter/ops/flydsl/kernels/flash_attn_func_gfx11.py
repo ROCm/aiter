@@ -77,6 +77,7 @@ def build_flash_attn_func_module_gfx11(
     q_token_stride=None,
     k_token_stride=None,
     v_token_stride=None,
+    num_kv_heads=None,
 ):
     """Build the gfx11 Flash Attention forward kernel.
 
@@ -94,10 +95,13 @@ def build_flash_attn_func_module_gfx11(
             them, 1 = one head at a time). See the block mapping in the kernel.
         waves_per_eu: ``rocdl.waves_per_eu`` occupancy hint.
         q_token_stride, k_token_stride, v_token_stride: elements between
-            consecutive tokens of Q / K / V (``None`` = ``num_heads * head_dim``,
-            plain BSHD). Larger values read views of a packed tensor such as
+            consecutive tokens of Q / K / V (``None`` = plain BSHD: ``num_heads *
+            head_dim`` for Q, ``num_kv_heads * head_dim`` for K / V). Larger values read views of a packed tensor such as
             ``[B, S, 3, H, D]`` in place; heads must stay ``head_dim`` apart.
             O is always plain BSHD.
+        num_kv_heads: K / V heads (``None`` = ``num_heads``). Fewer than
+            ``num_heads`` is GQA / MQA: query head ``h`` reads K / V head
+            ``h // (num_heads // num_kv_heads)``; ``num_heads`` must be a multiple.
 
     Returns:
         ``launch(Q, K, V, O, batch, seq_q, seq_kv, stream=..., q_batch_stride=...,
@@ -113,6 +117,10 @@ def build_flash_attn_func_module_gfx11(
 
     H = num_heads
     D = head_dim
+    HKV = num_heads if num_kv_heads is None else int(num_kv_heads)
+    if HKV < 1 or H % HKV != 0:
+        raise ValueError(f"num_heads={H} must be a multiple of num_kv_heads={HKV}")
+    GROUP = H // HKV  # query heads per K/V head
     if head_group is None:
         head_group = num_heads
     HEAD_GROUP = head_group if head_group >= 1 and num_heads % head_group == 0 else 1
@@ -122,16 +130,16 @@ def build_flash_attn_func_module_gfx11(
     BLOCK_N = block_n
     NK = BLOCK_N // WMMA_MNK
     THREADS = num_waves * WAVE_SIZE
-    TOK = H * D  # elements between consecutive tokens (BSHD)
-    TOK_Q, TOK_K, TOK_V = (
-        TOK if s is None else int(s)
-        for s in (q_token_stride, k_token_stride, v_token_stride)
-    )
-    for name, s in (("q", TOK_Q), ("k", TOK_K), ("v", TOK_V)):
+    TOK = H * D  # elements between consecutive Q / O tokens (BSHD)
+    TOK_KV = HKV * D  # elements of one K / V token row
+    TOK_Q = TOK if q_token_stride is None else int(q_token_stride)
+    TOK_K = TOK_KV if k_token_stride is None else int(k_token_stride)
+    TOK_V = TOK_KV if v_token_stride is None else int(v_token_stride)
+    for name, s, row in (("q", TOK_Q, TOK), ("k", TOK_K, TOK_KV), ("v", TOK_V, TOK_KV)):
         # 128-bit loads need every row start 16-byte aligned.
-        if s < TOK or s % 8 != 0:
+        if s < row or s % 8 != 0:
             raise ValueError(
-                f"{name}_token_stride must be a multiple of 8 and >= {TOK}, got {s}"
+                f"{name}_token_stride must be a multiple of 8 and >= {row}, got {s}"
             )
     is_bf16 = dtype_str == "bf16"
     elem = fx.BFloat16 if is_bf16 else fx.Float16
@@ -237,13 +245,13 @@ def build_flash_attn_func_module_gfx11(
             # Longest rows first: the diagonal blocks have the most KV tiles.
             qblk = n_qblk - 1 - qblk
 
-        def batch_buf(ptr, seqlen, tok, bstride):
+        def batch_buf(ptr, seqlen, tok, row, bstride):
             # Bounded per batch slice, up to the end of its last token's row: the
             # kernel relies on OOB loads returning 0 (rows past seq_q / seq_kv)
             # and OOB stores being dropped. With a token stride above H*D (packed
             # views) the bytes between rows belong to other tensors and are never
-            # addressed.
-            slice_bytes = (fx.Int64(seqlen) * tok - (tok - TOK)) * 2
+            # addressed. row: elements of one token row (H*D for Q / O, HKV*D for K / V).
+            slice_bytes = (fx.Int64(seqlen) * tok - (tok - row)) * 2
             base = buf_base_i64(ptr) + fx.Int64(bat) * fx.Int64(bstride) * 2
             return ptr_buf_tensor(
                 base,
@@ -253,16 +261,21 @@ def build_flash_attn_func_module_gfx11(
                 num_records_bytes=slice_bytes,
             )
 
-        q_buf = batch_buf(Q, seq_q, TOK_Q, q_bstride)
-        k_buf = batch_buf(K, seq_kv, TOK_K, k_bstride)
-        v_buf = batch_buf(V, seq_kv, TOK_V, v_bstride)
-        o_buf = batch_buf(O, seq_q, TOK, seq_q * TOK)
+        q_buf = batch_buf(Q, seq_q, TOK_Q, TOK, q_bstride)
+        k_buf = batch_buf(K, seq_kv, TOK_K, TOK_KV, k_bstride)
+        v_buf = batch_buf(V, seq_kv, TOK_V, TOK_KV, v_bstride)
+        o_buf = batch_buf(O, seq_q, TOK, TOK, seq_q * TOK)
 
         def g_load8(buf, off):
             return buf_copy_load(buf, off, elem=elem, unit_elems=8)
 
         def tok_off(tok, stride=TOK):
             return tok * stride + head * D
+
+        kv_head = head // GROUP if GROUP > 1 else head  # GROUP is a Python int
+
+        def kv_off(tok, stride):
+            return tok * stride + kv_head * D
 
         # ---- Q -> VGPRs as WMMA B operands (zero past seq_q / past head_dim) ----
         zero_e8 = Vec.filled(8, 0.0, elem)
@@ -305,7 +318,7 @@ def build_flash_attn_func_module_gfx11(
                 chunk = k_chunk(i)
                 row = chunk // DBLKS
                 kregs.append(
-                    g_load8(k_buf, tok_off(key0 + row, TOK_K) + (chunk % DBLKS) * 8)
+                    g_load8(k_buf, kv_off(key0 + row, TOK_K) + (chunk % DBLKS) * 8)
                 )
             vregs = []
             for i in range_constexpr(V_PER_THR):
@@ -314,7 +327,7 @@ def build_flash_attn_func_module_gfx11(
                 d0 = (blk % DBLKS) * 8
                 vregs.append(
                     [
-                        g_load8(v_buf, tok_off(kb0 + r, TOK_V) + d0)
+                        g_load8(v_buf, kv_off(kb0 + r, TOK_V) + d0)
                         for r in range_constexpr(vt_rows)
                     ]
                 )
