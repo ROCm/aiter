@@ -15,8 +15,9 @@ it before the comparison, so only the location of a function may differ.
 
 The snapshot is not committed: it is more than 1.3 MB per arch and goes stale
 whenever main changes a candidate. AITER_FMOE_CANDIDATE_SNAPSHOT names its
-path, with no default. Take it on the base commit, then run the test on the
-branch, on the same node:
+path, with no default. Take it on the base commit, the commit on the
+refactor branch that adds this test (main plus this safety net), then run
+the test on the branch, on the same node:
     export AITER_FMOE_CANDIDATE_SNAPSHOT=<dir>/fmoe_snapshot_<base>.json
     git checkout <base>
     python3 op_tests/tuning_tests/test_fmoe_candidate_snapshot.py --regenerate
