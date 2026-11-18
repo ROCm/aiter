@@ -97,6 +97,9 @@ if os.path.isdir(_flydsl_cache) and "FLYDSL_RUNTIME_CACHE_DIR" not in os.environ
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = _flydsl_cache
 
 if AITER_TRITON_ONLY:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "jit", "utils"))
+    from .utility import dtypes as dtypes
+
     logger.info("Triton ops only: CK and HIP ops (and their JIT build) are skipped.")
 elif AITER_AOT_IMPORT:
     from .jit import core as core
