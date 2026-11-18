@@ -18,7 +18,7 @@ change.
 A row tuned at M also serves the M between the previous tuned M of its shape
 and M, and the kernels the runtime requests follow the actual M (the row the
 padded-M lookup finds, the untuned-shape heuristics' size classes, and on
-gfx1250 whether a cluster_m divides M's tile count: a compute kernel is one
+gfx1250 whether a cluster_m divides M's tile count: a gfx1250 GEMM kernel is one
 binary for every cluster_m, but a launch that fits to one workgroup runs the
 plain kernel), so every row is replayed at its M and at the smaller M it
 serves. On gfx1250 those M are identified without compiling at the sizes

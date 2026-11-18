@@ -38,13 +38,35 @@ _OUT_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "f16"}
 _MAX_SPLIT_K = 8
 
 
-def _fused_splitk_ok(tile_m, cluster_m, cluster_n, split_k, compute_bound) -> bool:
-    """Whether this launch can run the clustered fused split-K epilogue."""
+def fused_splitk_ok(
+    tile_m, tile_n, m_warp, n_warp, cluster_m, cluster_n, split_k
+) -> bool:
+    """Whether the K splits of a tile can reduce in one cluster (fused split-K)."""
+    waves, lanes_per_row = m_warp * n_warp, tile_n // 4
+    rows_per_iter, reduce_m = waves * 32 // lanes_per_row, tile_m // split_k
+    # The TDM stores of the peer rows (and of the reduced rows past split_k 2)
+    # cut their rows evenly over the waves.
+    tdm_rows = (tile_m - reduce_m, *(() if split_k == 2 else (reduce_m,)))
     return bool(
-        compute_bound
-        and split_k > 1
+        split_k > 1
         and tile_m % split_k == 0
         and cluster_m * cluster_n * split_k <= 16
+        and waves * 32 % lanes_per_row == 0
+        and (reduce_m < rows_per_iter or reduce_m % rows_per_iter == 0)
+        and all(rows % waves == 0 for rows in tdm_rows)
+    )
+
+
+def fused_splitk_partial_shape(M, N, tile_m, tile_n, split_k):
+    """FP32 scratch of the fused epilogue: one plane per split of an output tile.
+
+    A plane holds only the peer rows, so ``split_k == 2`` stores half a tile.
+    """
+    return (
+        ((M + tile_m - 1) // tile_m) * (N // tile_n),
+        split_k,
+        tile_m - tile_m // split_k if split_k == 2 else tile_m,
+        tile_n,
     )
 
 
@@ -356,19 +378,11 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     _lazy_import()
     torch_stream = torch.cuda.current_stream(device=XQ.device)
     stream = _fx.Stream(torch_stream)
-    fused = fused_splitk and _fused_splitk_ok(
-        tile_m, cluster_m, cluster_n, split_k, compute_bound
+    fused = fused_splitk and fused_splitk_ok(
+        tile_m, tile_n, m_warp, n_warp, cluster_m, cluster_n, split_k
     )
     if fused:
-        # One contiguous plane per split of an output tile, holding only the
-        # peer rows -- the local stripe never leaves LDS.  Round M up for the
-        # last tile; the output store's M bound masks its spare rows.
-        partial_shape = (
-            ((M + tile_m - 1) // tile_m) * (N // tile_n),
-            split_k,
-            tile_m - tile_m // split_k if split_k == 2 else tile_m,
-            tile_n,
-        )
+        partial_shape = fused_splitk_partial_shape(M, N, tile_m, tile_n, split_k)
     elif split_k > 1:
         partial_shape = (split_k, M, ldc)
     else:
@@ -408,10 +422,11 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     # Dispatch through the cached CompiledFunction of each constexpr set: calling
     # the JitFunction re-derives its specialization on the host every launch.
     runtime_args, constexpr_args = launch_args[:12], launch_args[12:]
+    # A launch of one workgroup is no cluster: it runs the plain kernel.
+    use_cluster = cluster_m * cluster_n * (split_k if fused else 1) > 1
+    constexpr_args = (*constexpr_args[:7], use_cluster, *constexpr_args[8:])
     if compute_bound:
-        # A launch of one workgroup is no cluster: it runs the plain kernel.
-        use_cluster = cluster_m * cluster_n * (split_k if fused else 1) > 1
-        specialization = (*constexpr_args[:7], use_cluster, *constexpr_args[8:]) + (
+        specialization = constexpr_args + (
             scale_block,
             split_k,
             a_preshuffle,
@@ -435,6 +450,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
         specialization = constexpr_args + (
             scale_block,
             split_k,
+            fused,
             False,  # batched
             0,  # preload_ks
             a_preshuffle,
@@ -443,15 +459,12 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
         )
         _run_compiled(
             _launch_gemm_a8w8,
-            *launch_args,
-            scale_block,
-            split_k,
-            False,  # batched
-            0,  # preload_ks
+            *runtime_args,
+            _ptr_arg(Out),
+            cluster_m,
+            *specialization[:15],
             1,  # batch (runtime)
-            a_preshuffle,
-            a_scale_preshuffled,
-            w_scale_32x32,  # b_scale_32x32
+            *specialization[15:],  # a_preshuffle, a_scale_preshuffled, b_scale_32x32
             False,  # k_tail
             _ptr_arg(Out),  # arg_scale_out
             specialization_key=specialization,
