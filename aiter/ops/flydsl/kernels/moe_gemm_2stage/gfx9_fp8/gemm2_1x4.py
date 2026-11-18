@@ -185,9 +185,30 @@ def _store_cshuffle_row_pair(
 
 
 def _build_moe_gemm2_1x4_n256(
-    *, N, K, weight_quant_type, act_quant_type, TOPK, padding, _task_table=False
+    *,
+    N,
+    K,
+    weight_quant_type,
+    act_quant_type,
+    TOPK,
+    padding,
+    _task_table=False,
+    scale_k=None,
+    scale_block=(128, 128),
 ):
     assert padding in (0, 32, 64, 128)
+    is_block = weight_quant_type == "block"
+    if is_block:
+        # One K core per scale group: a scales [M*TOPK, K/scale_k]; weight scales
+        # [E, ceil(N / block_n), ceil(K / block_k)] as in the checkpoint.
+        assert act_quant_type == "block"
+        assert scale_k == (
+            128 if K % 128 == 0 else 64
+        ), f"block Down needs scale_k equal to the K core ({K=}, {scale_k=})"
+        assert scale_block[0] in (64, 128) and scale_block[1] % scale_k == 0
+        k_groups = K // scale_k
+        n_blocks = fxh.div_up(N, scale_block[0])
+        k_blocks = fxh.div_up(K, scale_block[1])
     _, generic_xcd_count = get_down_device_config()
     block_m_per_4wave_group = 64
     activation_bytes = block_m_per_4wave_group * K
@@ -420,10 +441,59 @@ def _build_moe_gemm2_1x4_n256(
                 mm, sorted_weights, copy_atom_bits=32
             )
 
+            block_token_scales = None
+            if const_expr(is_block):
+                # Per C column n: the (token, slot) row's scale for every K group.
+                coords = down_ops.load_tiled_mma_fragC(
+                    mm,
+                    fx.make_view(
+                        fx.get_iter(arg_p_sorted_ids),
+                        fx.make_layout((BLOCK_N, BLOCK_M), (0, 1)),
+                    ),
+                    copy_atom_bits=32,
+                )
+                a_scale_rows = fx.rocdl.make_buffer_tensor(
+                    fx.make_view(
+                        fx.recast_iter(fx.Float32, fxh._as_ptr(p_a_scale)),
+                        fx.make_layout(M * (TOPK * k_groups), 1),
+                    ),
+                    max_size=False,
+                )
+                block_token_scales = []
+                for n in range_constexpr(BLOCK_M // 16):
+                    sorted_id = coords[0, 0, n].bitcast(fx.Uint32)
+                    row = (
+                        fx.Int32((sorted_id & 0xFFFFFF) * TOPK + (sorted_id >> 24))
+                        * k_groups
+                    )
+                    block_token_scales.append(
+                        [a_scale_rows[row + g] for g in range_constexpr(k_groups)]
+                    )
+                wave_id = fx.Int32(fx.thread_idx.x // 64)
+                # This wave's C rows are channels 64 * wave + [0, 64) of the N
+                # tile, inside one checkpoint scale block.
+                block_w_scale_base = fxh._as_ptr(p_w_scale) + expert_id * (
+                    n_blocks * k_blocks
+                )
+
+            def issue_block_w_scales(block_n):
+                row = (
+                    block_w_scale_base
+                    + (
+                        (fx.Int32(block_n) * BLOCK_N + wave_id * WAVE_N)
+                        // scale_block[0]
+                    )
+                    * k_blocks
+                )
+                return [
+                    fxh.load_f32(row + g * scale_k // scale_block[1])
+                    for g in range_constexpr(k_groups)
+                ]
+
             if const_expr(per_tensor_a_scale is not None):
                 combined_scale = per_tensor_a_scale * per_tensor_w_scale
                 frag_sorted_weight.store(frag_sorted_weight.load() * combined_scale)
-            else:
+            elif const_expr(not is_block):
                 frag_sorted_weight = _apply_token_scales(
                     down_ops,
                     mm,
@@ -548,8 +618,12 @@ def _build_moe_gemm2_1x4_n256(
                             *((0, 3), (3, 5))[k_core],
                         )
 
+            if const_expr(is_block):
+                fragC_part = fx.make_fragment_like(fragC)
+                fragC_part.fill(0)
+
             def run_k_core_pipeline(
-                block_n, k_core, previous_fragC, next_frag_pc_scale
+                block_n, k_core, previous_fragC, next_frag_pc_scale, block_w_scales=None
             ):
                 current_slot = k_core % 2
                 next_slot = (k_core + 1) % 2
@@ -572,8 +646,25 @@ def _build_moe_gemm2_1x4_n256(
                     frag_weight_slots[next_slot],
                 )
                 _set_priority(3)
-                fx.gemm(mm, fragC, frag_weight_slots[current_slot], frag_act, fragC)
+                if const_expr(is_block):
+                    fragC_part.fill(0)
+                    fx.gemm(
+                        mm,
+                        fragC_part,
+                        frag_weight_slots[current_slot],
+                        frag_act,
+                        fragC_part,
+                    )
+                else:
+                    fx.gemm(mm, fragC, frag_weight_slots[current_slot], frag_act, fragC)
                 _set_priority(0)
+                if const_expr(is_block):
+                    w_sc = block_w_scales[k_core]
+                    fxh.scaled_accumulate(
+                        fragC,
+                        fragC_part,
+                        lambda v, m, n: w_sc * block_token_scales[n][k_core],
+                    )
                 if const_expr(k_core + 1 == nBK and weight_quant_type == "ptpc"):
                     commit_scale_block_lds(next_scale_vec, next_frag_pc_scale)
 
@@ -601,10 +692,17 @@ def _build_moe_gemm2_1x4_n256(
                     previous_fragC.store(state[-1])
 
                 # Compute this N tile while retiring the previous tile's stores.
+                block_w_scales = (
+                    issue_block_w_scales(block_n) if const_expr(is_block) else None
+                )
                 fragC.fill(0)
                 for k_core in range_constexpr(nBK):
                     run_k_core_pipeline(
-                        block_n, k_core, previous_fragC, next_frag_pc_scale
+                        block_n,
+                        k_core,
+                        previous_fragC,
+                        next_frag_pc_scale,
+                        block_w_scales,
                     )
 
                 # Apply channel scale, routing weight and BF16 conversion.

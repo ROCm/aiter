@@ -3,16 +3,16 @@
 
 """Regression tests for the gfx942 FlyDSL whole-MoE backend.
 
-Its tuned rows use cu_num=80 (MI308X), so test_moe_2stage.py skips them on
-runners with another CU count. This test runs every shipped config through the
-registered backend on any gfx942 device, checks the compact Down task table
-for both MI308X and MI300X CU counts, and checks the padded sorted reduction.
+This test runs every shipped config through the registered backend on any
+gfx942 device, checks the compact Down task table for both MI308X and MI300X
+CU counts, and checks the padded sorted reduction.
 """
 
 import argparse
 import dataclasses
 import functools
 import itertools
+import math
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -24,6 +24,8 @@ import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import (
     AUX_SORT_OPUS,
+    _dequant_block_128x128,
+    fused_moe,
     fused_topk,
     get_2stage_cfgs,
     moe_sorting,
@@ -39,9 +41,12 @@ from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.fused_moe_gfx942 import (
     Config,
+    _describe,
     _gateup_output,
     _Problem,
+    block_scale_groups,
     get_tune_space,
+    run_flydsl_moe_gfx942,
 )
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
     gemm2_8x1_compact as compact,
@@ -59,8 +64,13 @@ QUANTS = {
     "no": QuantType.No,
     "per_tensor": QuantType.per_Tensor,
     "ptpc": QuantType.per_Token,
+    "block": QuantType.per_128x128,
 }
-ACTIVATIONS = {"silu": ActivationType.Silu, "swiglu": ActivationType.Swiglu}
+ACTIVATIONS = {
+    "silu": ActivationType.Silu,
+    "swiglu": ActivationType.Swiglu,
+    "swiglustep": ActivationType.SwigluStep,
+}
 # MI300X then MI308X, the order in which a cached launcher meets a smaller device.
 CU_COUNTS = (304, 80)
 GUARD, CANARY = 64, -123
@@ -71,6 +81,7 @@ TOKEN_ERR_LIMIT = 0.2
 LOGITS_DIFF_LIMIT = 1e-3
 # Prefill paths of one case share Gate/Up and quantization and agree to BF16 rounding.
 PATH_DIFF_LIMIT = 0.1
+SWIGLU_STEP_LIMIT = 7.0
 
 
 def guarded_task_buffers(sorted_expert_ids, experts, cu_count):
@@ -279,6 +290,131 @@ def test_config_strings():
         assert Config.from_string(tile).unsupported_reason(batch1), tile
 
 
+def test_block_scales():
+    """Checkpoint block scales are validated; gate and up are blocked separately."""
+    experts, model_dim, inter_dim = 2, 512, 192
+    w1 = torch.empty((experts, 2 * inter_dim, model_dim), dtype=dtypes.fp8)
+    w2 = torch.empty((experts, model_dim, inter_dim), dtype=dtypes.fp8)
+    hidden = torch.empty((4, model_dim), dtype=dtypes.bf16)
+    topk_ids = torch.zeros((4, 2), dtype=torch.int32)
+    # 128x128 blocks: gate and up 2 blocks each (vLLM's w13_weight_scale_inv).
+    w1_scale = torch.rand((experts, 4, 4)) + 0.5
+    w2_scale = torch.rand((experts, 4, 2)) + 0.5
+
+    def problem(s1, s2, quant_type=QuantType.per_128x128):
+        return _Problem.from_inputs(hidden, w1, w2, topk_ids, quant_type, s1, s2)
+
+    for quant_type in (QuantType.per_128x128, QuantType.per_1x128):
+        block = problem(w1_scale, w2_scale, quant_type)
+        assert (block.quant_type, block.scale_k1, block.scale_k2) == (
+            "block",
+            128,
+            64,
+        )
+        assert (block.scale_block1, block.scale_block2) == ((128, 128), (128, 128))
+    for s1, s2 in (
+        # w1 blocked as one tensor: its middle block straddles gate and up.
+        (torch.rand((experts, 3, 4)) + 0.5, w2_scale),
+        # The former kernel layout [E, K // 64, N] is rejected, not misread.
+        (torch.rand((experts, 8, 2 * inter_dim)), torch.rand((experts, 3, model_dim))),
+        (w1_scale, w2_scale.transpose(1, 2)),
+        (w1_scale, w2_scale[:, :, :1]),
+        (w1_scale.bfloat16(), w2_scale),
+        (w1_scale, None),
+        # 32x32 blocks: only 128 and 64 are supported.
+        (torch.rand((experts, 12, 16)) + 0.5, torch.rand((experts, 16, 6)) + 0.5),
+    ):
+        try:
+            problem(s1, s2)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted scales {_describe(s1)}, {_describe(s2)}")
+
+    # The torch reference dequantizes gate and up with their own blocks.
+    w1_q, w1_ref, w1_scale = block_quant(
+        torch.randn((experts, 2 * inter_dim, model_dim)), parts=2
+    )
+    assert w1_scale.shape == (experts, 4, 4)
+    assert torch.equal(_dequant_block_128x128(w1_q.float(), w1_scale, 2), w1_ref)
+
+    # 64x64 blocks (vLLM's TP refinement).
+    block = problem(torch.rand((experts, 6, 8)), torch.rand((experts, 8, 3)))
+    assert (block.scale_k1, block.scale_k2) == (64, 64)
+    assert (block.scale_block1, block.scale_block2) == ((64, 64), (64, 64))
+    # With inter_dim % 128 == 0, 64-wide Down blocks leave only decode configs.
+    w1 = torch.empty((experts, 512, model_dim), dtype=dtypes.fp8)
+    w2 = torch.empty((experts, model_dim, 256), dtype=dtypes.fp8)
+    block = problem(torch.rand((experts, 8, 8)), torch.rand((experts, 8, 4)))
+    assert (block.scale_k1, block.scale_k2) == (64, 64)
+    decode = Config.from_string("16_16_16_False:default:0")
+    prefill = Config.from_string("64_128_128_True:1x4_64x256:128")
+    assert decode.unsupported_reason(block) is None
+    assert prefill.unsupported_reason(block)
+
+
+def test_block_scale_updates():
+    """The kernels read the scale tensors on every call, so in-place updates
+    (weight reload, RL weight sync) take effect, on every algorithm."""
+    torch.manual_seed(0)
+    experts, topk, model_dim, inter_dim = 8, 2, 512, 192
+    act = ActivationType.SwigluStep
+    w1_q, _, w1_scale = block_quant(
+        torch.randn((experts, 2 * inter_dim, model_dim), dtype=dtypes.bf16), parts=2
+    )
+    w2_q, _, w2_scale = block_quant(
+        torch.randn((experts, model_dim, inter_dim), dtype=dtypes.bf16)
+    )
+    w1 = shuffle_weight(w1_q, layout=(16, 16))
+    w2 = shuffle_weight(w2_q, layout=(16, 16))
+    for token, config in (
+        (1, "16_16_16_False:default:0"),
+        (4, "16_16_16_False_True:default:0"),
+        (16, "16_128_64_False:default:0"),
+        (256, "64_128_128_True:1x4_64x256:128"),
+    ):
+        hidden = torch.randn((token, model_dim), dtype=dtypes.bf16)
+        weights, ids = fused_topk(
+            hidden, torch.randn((token, experts), dtype=hidden.dtype), topk, True
+        )
+        args = (hidden, w1, w2, weights, ids, act, QuantType.per_128x128)
+        tail = (None, None, 0, config, SWIGLU_STEP_LIMIT)
+
+        def run(s1, s2, args=args, tail=tail):
+            return run_flydsl_moe_gfx942(*args, s1, s2, *tail).float()
+
+        s1, s2 = w1_scale.clone(), w2_scale.clone()
+        base = run(s1, s2)
+        s2.mul_(2)
+        ratio = float(run(s1, s2).norm() / base.norm())
+        assert abs(ratio - 2) < 1e-2, f"{config}: w2_scale.mul_(2) gave {ratio=}"
+        # Writes through .data do not bump the version counter.
+        s2.data.copy_(w2_scale)
+        assert float((run(s1, s2) - base).norm() / base.norm()) < 1e-2, config
+        s1.data.copy_(2 * w1_scale)
+        updated = run(s1, s2)
+        diff = float((updated - run(2 * w1_scale, s2)).norm() / base.norm())
+        moved = float((updated - base).norm() / base.norm())
+        assert diff < 1e-2 and moved > 0.1, f"{config}: {diff=} {moved=}"
+
+
+def test_swiglustep_needs_flydsl_row():
+    """SwigluStep has no CK fallback: without a usable FlyDSL row dispatch says
+    so instead of trying to build a CK module that cannot exist."""
+    get_2stage_cfgs.cache_clear()
+    try:
+        get_2stage_cfgs(
+            32, 1024, 192, 7, 3, dtypes.bf16, dtypes.fp8, dtypes.fp8,
+            QuantType.per_1x128, True, ActivationType.SwigluStep, False, 0, 0,
+            swiglu_limit=SWIGLU_STEP_LIMIT,
+        )  # fmt: skip
+    except NotImplementedError as error:
+        assert "SwigluStep" in str(error), error
+    else:
+        raise AssertionError("an untuned SwigluStep shape did not raise")
+    finally:
+        get_2stage_cfgs.cache_clear()
+
+
 def test_num_local_tokens_dispatch():
     """With num_local_tokens only a clamped SiLU keeps its FlyDSL row. A clamped
     SiLU with per-token FP8 weights and no FlyDSL row in use takes the FlyDSL
@@ -375,6 +511,146 @@ def stale_gateup_output(hidden_states, problem):
     return _gateup_output(hidden_states, problem).fill_(float("inf"))
 
 
+def block_quant(w, block=128, parts=1):
+    """FP8 weights with 128x128 block scales (partial edge blocks allowed).
+
+    Returns the FP8 weights, their exact FP32 dequantization and the checkpoint
+    scales [E, ceil(N / 128), ceil(K / 128)]. With parts=2 (w1) gate and up are
+    blocked separately, as checkpoints store them: [E, 2 * ceil(N / 256), ...].
+    """
+    if parts > 1:
+        quantized = [block_quant(part, block) for part in w.chunk(parts, dim=1)]
+        return tuple(torch.cat(t, dim=1) for t in zip(*quantized))
+    experts, n, k = w.shape
+    n_blocks, k_blocks = -(-n // block), -(-k // block)
+    padded = torch.nn.functional.pad(
+        w.float(), (0, k_blocks * block - k, 0, n_blocks * block - n)
+    )
+    blocks = padded.view(experts, n_blocks, block, k_blocks, block)
+    scale = blocks.abs().amax(dim=(2, 4)) / torch.finfo(dtypes.fp8).max
+    expanded = scale.repeat_interleave(block, 1).repeat_interleave(block, 2)
+    expanded = expanded[:, :n, :k]
+    w_q = (w.float() / expanded).to(dtypes.fp8)
+    return w_q, w_q.float() * expanded, scale
+
+
+def group_quant(x, group):
+    """FP8 round trip with one scale per (row, group of K), as the prefill kernels see x."""
+    groups = x.float().view(*x.shape[:-1], -1, group)
+    scale = groups.abs().amax(dim=-1, keepdim=True) / torch.finfo(dtypes.fp8).max
+    scale = scale.clamp_min(torch.finfo(torch.float32).tiny)
+    return ((groups / scale).to(dtypes.fp8).float() * scale).view(x.shape)
+
+
+def block_reference(hidden, w1, w2, weights, ids, activation, swiglu_limit, groups):
+    """Torch MoE on dequantized weights. With (Gate/Up, Down) K groups the
+    activations take the FP8 round trip of the prefill kernels; decode reads BF16."""
+    token, topk = ids.shape
+    a1 = group_quant(hidden, groups[0]) if groups else hidden
+    stage1 = torch_moe_stage1(
+        a1,
+        w1,
+        w2,
+        weights,
+        ids,
+        dtype=dtypes.bf16,
+        activation=activation,
+        swiglu_limit=swiglu_limit,
+    )
+    a2 = group_quant(stage1, groups[1]) if groups else stage1
+    return torch_moe_stage2(
+        a2.view(token, topk, -1), w1, w2, weights, ids, dtype=dtypes.bf16
+    )
+
+
+def vllm_shard_scale(scale, dim, rank, rows, block=128):
+    """Rank `rank`'s 128x128 checkpoint block scales for `rows` rows sharded along
+    `dim`, loaded as vLLM does: if a shard starts mid-block, the scales are refined
+    to gcd(128, rows) blocks, each taking its checkpoint block's scale, then sliced."""
+    refined = math.gcd(block, rows)
+    factor = block // refined
+    scale = scale.repeat_interleave(factor, 1).repeat_interleave(factor, 2)
+    return scale.narrow(dim, rank * rows // refined, rows // refined).contiguous()
+
+
+def test_tp_block_scales(full_inter, tp=2):
+    """TP shards of a Step-5-shaped 128x128-block FP8 checkpoint with vLLM's scales
+    match the torch reference on the dequantized shard, through the public entry
+    and the tuned aiter.fused_moe dispatch, on an even and an odd rank."""
+    torch.manual_seed(0)
+    experts, topk, model_dim = 352, 8, 4096
+    inter = full_inter // tp
+    block = math.gcd(128, inter)
+    act = ActivationType.SwigluStep
+    gate, up = (
+        block_quant(torch.randn((experts, full_inter, model_dim), dtype=dtypes.bf16))
+        for _ in range(2)
+    )
+    down = block_quant(torch.randn((experts, model_dim, full_inter), dtype=dtypes.bf16))
+    configs = {
+        row[0]: row[-1]
+        for row in shipped_rows()
+        if row[1:6] == (model_dim, inter, experts, topk, "block")
+    }
+    dispatch = get_cu_num() == 304
+    for rank in range(tp):
+        rows = slice(rank * inter, (rank + 1) * inter)
+        w1_q, w1_ref = (
+            torch.cat((gate[i][:, rows], up[i][:, rows]), 1) for i in (0, 1)
+        )
+        w2_q, w2_ref = down[0][:, :, rows].contiguous(), down[1][:, :, rows]
+        w1_scale = torch.cat(
+            [vllm_shard_scale(w[2], 1, rank, inter) for w in (gate, up)], 1
+        )
+        w2_scale = vllm_shard_scale(down[2], 2, rank, inter)
+        assert w1_scale.shape == (experts, 2 * inter // block, model_dim // block)
+        assert w2_scale.shape == (experts, model_dim // block, inter // block)
+        w1 = shuffle_weight(w1_q, layout=(16, 16))
+        w2 = shuffle_weight(w2_q, layout=(16, 16))
+        for token in (1, 4, 64, 512):
+            config = configs[token]
+            hidden = torch.randn((token, model_dim), dtype=dtypes.bf16)
+            weights, ids = fused_topk(
+                hidden, torch.randn((token, experts), dtype=hidden.dtype), topk, True
+            )
+            reference = block_reference(
+                hidden,
+                w1_ref,
+                w2_ref,
+                weights,
+                ids,
+                act,
+                SWIGLU_STEP_LIMIT,
+                (
+                    block_scale_groups(inter, model_dim, block, block)
+                    if Config.from_string(config).use_prefill
+                    else None
+                ),
+            )
+            args = (hidden, w1, w2, weights, ids, act, QuantType.per_128x128)
+            msg = f"TP{tp} rank {rank} {block}x{block} token {token} {config}"
+            output = run_flydsl_moe_gfx942(
+                *args, w1_scale, w2_scale, None, None, 0, config, SWIGLU_STEP_LIMIT
+            )
+            check_output(reference, output, msg)
+            if not dispatch:
+                continue
+            with patch(
+                "aiter.ops.flydsl.fused_moe_gfx942.run_flydsl_moe_gfx942",
+                wraps=run_flydsl_moe_gfx942,
+            ) as spy:
+                output = fused_moe(
+                    *args[:5],
+                    activation=act,
+                    quant_type=QuantType.per_128x128,
+                    w1_scale=w1_scale,
+                    w2_scale=w2_scale,
+                    swiglu_limit=SWIGLU_STEP_LIMIT,
+                )
+            assert spy.call_args.args[12] == config, (msg, spy.call_args)
+            check_output(reference, output, f"fused_moe {msg}")
+
+
 @functools.lru_cache(maxsize=1)
 def make_case(
     token,
@@ -393,6 +669,8 @@ def make_case(
     q_type, act_type = QUANTS[quant], ACTIVATIONS[activation]
     q_dtype = None if q_type == QuantType.No else dtypes.fp8
     torch_quant = aiter.get_torch_quant(q_type)
+    if activation == "swiglustep":
+        swiglu_limit = SWIGLU_STEP_LIMIT
 
     def quantize_activation(x):
         # Decode and batch-1 kernels read BF16 activations even with FP8 weights.
@@ -404,47 +682,73 @@ def make_case(
     w1 = torch.randn((experts, 2 * inter_dim, model_dim), dtype=dtypes.bf16)
     w2 = torch.randn((experts, model_dim, inter_dim), dtype=dtypes.bf16)
     topk_weights, topk_ids = route(hidden, experts, topk, routing)
-    if q_type == QuantType.per_Tensor:
-        w1_q, w1_scale = aiter.pertoken_quant(w1.view(experts, -1), quant_dtype=q_dtype)
-        w2_q, w2_scale = aiter.pertoken_quant(w2.view(experts, -1), quant_dtype=q_dtype)
-        w1_q, w2_q = w1_q.view(w1.shape), w2_q.view(w2.shape)
-    else:
-        w1_q, w1_scale = torch_quant(w1, quant_dtype=q_dtype)
-        w2_q, w2_scale = torch_quant(w2, quant_dtype=q_dtype)
     # Rows at and past num_local_tokens (CUDA-graph padding) run no route: the
     # reference sees zeros there, so its activation scales come from the rest.
     local = token - min(65, (token + 1) // 2) if routing == "local_tokens" else token
-    a1, a1_scale = quantize_activation(torch.cat((hidden[:local], hidden[local:] * 0)))
+    local_hidden = torch.cat((hidden[:local], hidden[local:] * 0))
+    if q_type == QuantType.per_128x128:
+        w1_q, w1_ref, w1_scale = block_quant(w1, parts=2)
+        w2_q, w2_ref, w2_scale = block_quant(w2)
 
-    def torch_reference(limit):
-        stage1 = torch_moe_stage1(
-            a1,
-            w1_q,
-            w2_q,
-            topk_weights,
-            topk_ids,
-            dtype=dtypes.bf16,
-            activation=act_type,
-            quant_type=q_type,
-            a1_scale=a1_scale,
-            w1_scale=w1_scale,
-            swiglu_limit=limit,
-        )
-        a2, a2_scale = quantize_activation(stage1)
-        return torch_moe_stage2(
-            a2.view(token, topk, -1),
-            w1_q,
-            w2_q,
-            topk_weights,
-            topk_ids,
-            dtype=dtypes.bf16,
-            quant_type=q_type,
-            w2_scale=w2_scale,
-            a2_scale=a2_scale,
-        )
+        def torch_reference(limit):
+            return block_reference(
+                local_hidden,
+                w1_ref,
+                w2_ref,
+                topk_weights,
+                topk_ids,
+                act_type,
+                limit,
+                (
+                    block_scale_groups(inter_dim, model_dim)
+                    if quantize_activations
+                    else None
+                ),
+            )
+
+    else:
+        if q_type == QuantType.per_Tensor:
+            w1_q, w1_scale = aiter.pertoken_quant(
+                w1.view(experts, -1), quant_dtype=q_dtype
+            )
+            w2_q, w2_scale = aiter.pertoken_quant(
+                w2.view(experts, -1), quant_dtype=q_dtype
+            )
+            w1_q, w2_q = w1_q.view(w1.shape), w2_q.view(w2.shape)
+        else:
+            w1_q, w1_scale = torch_quant(w1, quant_dtype=q_dtype)
+            w2_q, w2_scale = torch_quant(w2, quant_dtype=q_dtype)
+        a1, a1_scale = quantize_activation(local_hidden)
+
+        def torch_reference(limit):
+            stage1 = torch_moe_stage1(
+                a1,
+                w1_q,
+                w2_q,
+                topk_weights,
+                topk_ids,
+                dtype=dtypes.bf16,
+                activation=act_type,
+                quant_type=q_type,
+                a1_scale=a1_scale,
+                w1_scale=w1_scale,
+                swiglu_limit=limit,
+            )
+            a2, a2_scale = quantize_activation(stage1)
+            return torch_moe_stage2(
+                a2.view(token, topk, -1),
+                w1_q,
+                w2_q,
+                topk_weights,
+                topk_ids,
+                dtype=dtypes.bf16,
+                quant_type=q_type,
+                w2_scale=w2_scale,
+                a2_scale=a2_scale,
+            )
 
     reference = torch_reference(swiglu_limit)
-    if swiglu_limit:
+    if swiglu_limit and activation != "swiglustep":
         # The clamp must move the result, or a kernel that drops it would pass.
         assert token_error(torch_reference(None), reference) > 2 * TOKEN_ERR_LIMIT
     num_local_tokens = None
@@ -636,7 +940,12 @@ def shipped_rows():
     df = df[df["kernelName1"].astype(str).str.startswith(f"impl__{IMPL}__")]
     if "_tag" in df:
         df = df[df["_tag"].fillna("").astype(str).str.strip() == ""]
-    quants = {"No": "no", "per_Tensor": "per_tensor", "per_Token": "ptpc"}
+    quants = {
+        "No": "no",
+        "per_Tensor": "per_tensor",
+        "per_Token": "ptpc",
+        "per_1x128": "block",
+    }
     rows = set()
     for _, row in df.iterrows():
         shape = (
@@ -732,6 +1041,48 @@ EDGE_CASES = [
     ),
     # Direct decoding reads -1 pad rows from topk_ids without sorting.
     (2, 2560, 320, 513, 11, "ptpc", "silu", "pad_rows", "16_16_16_False_True"),
+    # Block-scaled FP8 with SwiGLU-step on every algorithm. inter_dim 192 ends in a
+    # partial 128-wide K block of w2 (64-wide Down groups); 256 uses 128-wide groups.
+    *(
+        (token, 1024, inter_dim, 32, 8, "block", "swiglustep", "random", config)
+        for inter_dim in (192, 256)
+        for token, config in (
+            (1, "16_16_16_False:default:0"),
+            (5, "16_16_16_False_True:default:0"),
+            (64, "16_16_16_False:default:0"),
+            (64, "16_128_64_False:default:0"),
+            (2048, "64_128_128_True:1x4_64x256:128"),
+        )
+    ),
+    # Hot routing (all tokens same expert) on one decode config per inter_dim.
+    *(
+        (
+            64,
+            1024,
+            inter_dim,
+            32,
+            8,
+            "block",
+            "swiglustep",
+            "hot",
+            "16_16_16_False:default:0",
+        )
+        for inter_dim in (192, 256)
+    ),
+    # Step-5 shape (model_dim 4096, inter_dim 192 partial K block) at CI-friendly
+    # sizes; the 2048-token prefill above already covers the full kernel path.
+    (8, 4096, 192, 64, 8, "block", "swiglustep", "random", "16_16_16_False:default:0"),
+    (
+        2048,
+        4096,
+        192,
+        64,
+        8,
+        "block",
+        "swiglustep",
+        "random",
+        "64_128_128_True:1x4_64x256:128",
+    ),
     # num_local_tokens on the batch-1, decode and both prefill Down paths.
     *(
         (token, 2560, 320, 513, 11, "ptpc", "silu", "local_tokens", config)
@@ -806,6 +1157,9 @@ def main():
     args = parser.parse_args()
 
     test_config_strings()
+    test_block_scales()
+    test_block_scale_updates()
+    test_swiglustep_needs_flydsl_row()
     test_num_local_tokens_dispatch()
     summarize(
         "Compact task table",
@@ -831,6 +1185,9 @@ def main():
     rows = shipped_rows()
     for case in cross_config_cases(rows) + EDGE_CASES:
         check_moe(*case)
+    # vLLM TP shards: inter 384 -> 192 refines scales to 64x64; 768 -> 384 keeps 128x128.
+    for full_inter in (384, 768):
+        test_tp_block_scales(full_inter)
     timed = [row for row in rows if not args.batch or row[0] in args.batch]
     summarize("Whole MoE", [test_moe(*row) for row in timed])
 

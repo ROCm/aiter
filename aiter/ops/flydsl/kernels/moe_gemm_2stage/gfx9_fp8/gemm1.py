@@ -11,6 +11,8 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
+from aiter.ops.flydsl.kernels.act import sigmoid_f32
+
 from . import common as fxh
 from .common import (
     _f32_to_bf16,
@@ -35,6 +37,8 @@ def compile_moe_gemm1(
     activation="silu",
     swiglu_limit=None,
     fused_down_clear=False,
+    scale_k=128,
+    scale_block=(128, 128),
     has_num_local_tokens=False,
 ):
     TILE_K = 64
@@ -133,6 +137,20 @@ def compile_moe_gemm1(
             f"dtype={'fp8' if weight_dtype == 'fp8' else 'bf16'})"
         )
 
+    is_block = weight_quant_type == "block"
+    block_n, block_k = scale_block
+    if is_block:
+        # Each split-K wave step and each prefill MFMA pair covers 64 contiguous K.
+        assert scale_k in (64, 128) and K % scale_k == 0, f"scale_k={scale_k}, K={K}"
+        assert block_n in (64, 128) and block_k % scale_k == 0, (scale_block, scale_k)
+        if alg == "prefill_1x4" and TILE_K % scale_k != 0:
+            raise ValueError(f"TILE_K={TILE_K} must be a multiple of scale_k={scale_k}")
+    K_GROUPS = K // scale_k
+    # Checkpoint weight scales [E, 2 * ceil(N / 2 / block_n), ceil(K / block_k)]:
+    # gate blocks, then up blocks.
+    GATE_BLOCKS = fxh.div_up(N // 2, block_n)
+    K_BLOCKS = fxh.div_up(K, block_k)
+
     if weight_dtype == "bf16":
         weight_dtype = fx.BFloat16
     elif weight_dtype == "fp8":
@@ -141,6 +159,31 @@ def compile_moe_gemm1(
     TensorWithIndex, _read_sorted_index, gemm_splitk = make_gemm_helpers(
         K, weight_dtype, BLOCK_TILE_SIZE_M, TOPK
     )
+
+    def _splitk_block_scale(tid, p_w_scale, expert_id, blk_n, contiguous_n, tile_n):
+        """Weight scales of one split-K wave step (64 K per wave), one per M16
+        repeat. A tile's gate rows, and its up rows, lie in one scale block."""
+        if const_expr(not is_block):
+            return None
+        # contiguous_n divides block_n, so the tile's gate rows share one block.
+        gate_ptr = (
+            fxh._as_ptr(p_w_scale)
+            + expert_id * (2 * GATE_BLOCKS * K_BLOCKS)
+            + (blk_n * contiguous_n) // block_n * K_BLOCKS
+        )
+        wave = tid // 64
+
+        def issue(k_idx):
+            k_block = (k_idx * (TILE_K * 4) + wave * TILE_K) // block_k
+            gate = fxh.load_f32(gate_ptr + k_block)
+            up = fxh.load_f32(gate_ptr + GATE_BLOCKS * K_BLOCKS + k_block)
+            # Tile rows [0, contiguous_n) are gate rows, the rest the matching up rows.
+            return [
+                gate if m * 16 < contiguous_n else up
+                for m in range_constexpr(tile_n // 16)
+            ]
+
+        return issue
 
     def _clamp_gateup(gate, up):
         neg_limit = fx.Float32(-swiglu_limit)
@@ -153,6 +196,15 @@ def compile_moe_gemm1(
         neg_alpha_log2e = -1.702 * 1.4426950408889634
         tmp = rocdl.exp2(T.f32, _raw(gate * neg_alpha_log2e))
         return (gate * rocdl.rcp(T.f32, 1.0 + tmp)) * (up + 1.0)
+
+    def _swiglu_step(gate, up):
+        gate, up = _clamp_gateup(gate * sigmoid_f32(gate), up)
+        return gate * up
+
+    def _gated_act(gate, up):
+        if const_expr(activation == "swiglu"):
+            return _swiglu_oai(gate, up)
+        return _swiglu_step(gate, up)
 
     def _apply_scale_gateup_bf16(
         c_frag, tid, expert_id, blk_n, contiguous_n, p_w_scale
@@ -218,9 +270,9 @@ def compile_moe_gemm1(
             gate = c_frag[None, None, 2 * i + 0].load()
             up = c_frag[None, None, 2 * i + 1].load()
             acc = []
-            if const_expr(activation == "swiglu"):
+            if const_expr(activation != "silu"):
                 for j in range_constexpr(gate.numel):
-                    acc.append(_swiglu_oai(gate[j], up[j]))
+                    acc.append(_gated_act(gate[j], up[j]))
             else:
                 log2_exp1 = -1.4426950408889634
                 for j in range_constexpr(gate.numel):
@@ -260,8 +312,8 @@ def compile_moe_gemm1(
                     if const_expr(a_scale is not None):
                         g = g * a_sc
                         u = u * a_sc
-                    if const_expr(activation == "swiglu"):
-                        acc.append(_swiglu_oai(g, u))
+                    if const_expr(activation != "silu"):
+                        acc.append(_gated_act(g, u))
                     else:
                         if const_expr(bool(swiglu_limit)):
                             g, u = _clamp_gateup(g, u)
@@ -311,7 +363,10 @@ def compile_moe_gemm1(
         arg_p_input: fx.Tensor,
         arg_p_weight: fx.Tensor,
         lds,
+        k_scale=None,
     ):
+        """``k_scale(k_tile)`` issues the scale loads of one K tile and returns, per
+        scale group, (gate row-scale frags, up row-scale frags, token scales)."""
         tid = gpu.thread_idx.x
         contiguous_n = TILE_N // 2
 
@@ -447,6 +502,26 @@ def compile_moe_gemm1(
         k_iters = TILE_K // (2 * k_per_mma)
         lds_a_cnt = a_frag.load().numel * weight_dtype.width // 8 // 16
 
+        if const_expr(k_scale is not None):
+            # One FP32 partial per scale group, scaled into c_gate/c_up.
+            p_gate = tiled_mma.make_fragment_C(c_fake)
+            p_up = tiled_mma.make_fragment_C(c_fake)
+            p_gate.fill(0)
+            p_up.fill(0)
+            ki_per_group = scale_k // (2 * k_per_mma)
+            acc_gate, acc_up = p_gate, p_up
+        else:
+            acc_gate, acc_up = c_gate, c_up
+
+        def apply_group_scales(group_scales):
+            gate_scales, up_scales, token_scales = group_scales
+            fxh.scaled_accumulate(
+                c_gate, p_gate, lambda v, m, n: gate_scales[m] * token_scales[n]
+            )
+            fxh.scaled_accumulate(
+                c_up, p_up, lambda v, m, n: up_scales[m] * token_scales[n]
+            )
+
         def hot_loop_scheduler():
             mfma_cnt = 2 * mfma_per_gemm
             n_vmem = mem_a_cnt + 2 * mem_b_cnt
@@ -474,8 +549,10 @@ def compile_moe_gemm1(
             if const_expr(mfma_cnt - used > 0):
                 rocdl.sched_mfma(mfma_cnt - used)
 
-        def pipeline_stage(read_i, k_next, do_prefetch):
+        def pipeline_stage(read_i, k_next, do_prefetch, k_cur):
             write_i = read_i ^ 1
+            # Scale loads go before the prefetch so waiting on them does not drain it.
+            tile_scales = None if const_expr(k_scale is None) else k_scale(k_cur)
             if const_expr(do_prefetch):
                 a_idx.copy(buf_cp_atom_r, k_next, a_cp_frag)
                 fx.copy(
@@ -490,23 +567,30 @@ def compile_moe_gemm1(
                     a_lds_r[read_i][None, None, ki],
                     a_frag_retile[None, None, ki],
                 )
+                if const_expr(k_scale is not None and ki % ki_per_group == 0):
+                    p_gate.fill(0)
+                    p_up.fill(0)
                 for n in range_constexpr(_n_reps):
                     for m in range_constexpr(_m_reps):
                         for k in range_constexpr(2):
                             fx.mma_atom_call(
                                 mma_atom,
-                                c_gate[None, m, n],
+                                acc_gate[None, m, n],
                                 bl_frag_st[read_i][None, m, (k, ki)],
                                 a_frag[None, n, (k, ki)],
-                                c_gate[None, m, n],
+                                acc_gate[None, m, n],
                             )
                             fx.mma_atom_call(
                                 mma_atom,
-                                c_up[None, m, n],
+                                acc_up[None, m, n],
                                 br_frag_st[read_i][None, m, (k, ki)],
                                 a_frag[None, n, (k, ki)],
-                                c_up[None, m, n],
+                                acc_up[None, m, n],
                             )
+                if const_expr(
+                    k_scale is not None and ki % ki_per_group == ki_per_group - 1
+                ):
+                    apply_group_scales(tile_scales[ki // ki_per_group])
             if const_expr(do_prefetch):
                 fx.copy(uni_cp_atom, a_cp_frag_retile, a_lds_w[write_i])
                 hot_loop_scheduler()
@@ -526,14 +610,14 @@ def compile_moe_gemm1(
             c_gate.store(state[0])
             c_up.store(state[1])
             kb = fx.Int32(iv * 2)
-            pipeline_stage(0, kb + 1, True)
-            pipeline_stage(1, kb + 2, True)
+            pipeline_stage(0, kb + 1, True, kb)
+            pipeline_stage(1, kb + 2, True, kb + 1)
             results = yield [c_gate.load(), c_up.load()]
         c_gate.store(results[0])
         c_up.store(results[1])
         kb = fx.Int32(num_tiles - 2)
-        pipeline_stage(0, kb + 1, True)
-        pipeline_stage(1, fx.Int32(0), False)
+        pipeline_stage(0, kb + 1, True, kb)
+        pipeline_stage(1, fx.Int32(0), False, kb + 1)
         return c_gate, c_up
 
     def _apply_1x4_fp8_dequant(
@@ -728,6 +812,9 @@ def compile_moe_gemm1(
                 arg_p_weight,
                 lds,
                 splitk_waves=4,
+                k_scale=_splitk_block_scale(
+                    tid, p_w_scale, expert_id, blk_n, contiguous_n, BLOCK_TILE_SIZE_N
+                ),
             )
 
             c_frag_bf16 = _apply_scale_gateup_bf16(
@@ -783,6 +870,9 @@ def compile_moe_gemm1(
                 lds,
                 splitk_waves=4,
                 a_with_index=False,
+                k_scale=_splitk_block_scale(
+                    tid, p_w_scale, expert_id, blk_n, contiguous_n, BLOCK_TILE_SIZE_N
+                ),
             )
 
             c_frag_bf16 = _apply_scale_gateup_bf16(
@@ -939,7 +1029,9 @@ def compile_moe_gemm1(
             )
 
             asc_idx = None
-            if const_expr(weight_dtype != fx.BFloat16 and act_quant_type == "ptpc"):
+            if const_expr(
+                weight_dtype != fx.BFloat16 and act_quant_type in ("ptpc", "block")
+            ):
                 asc_index_copy = fx.make_tiled_copy(
                     fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32),
                     fx.make_layout(((16, 4, 4), 1), ((1, 0, 0), 0)),
@@ -953,6 +1045,48 @@ def compile_moe_gemm1(
                 asc_idx = fx.make_fragment_like(asc_thr)
                 fx.copy(cp_atom_idx, asc_thr, asc_idx)
 
+            block_k_scale = None
+            if const_expr(is_block):
+                # a scales [M, K/scale_k] fp32; weight scales in checkpoint blocks.
+                a_scale_tensor = fx.rocdl.make_buffer_tensor(
+                    fx.make_view(
+                        fx.recast_iter(fx.Float32, fxh._as_ptr(p_a_scale)),
+                        fx.make_layout(M * K_GROUPS, 1),
+                    ),
+                    max_size=False,
+                )
+                n_tok = BLOCK_TILE_SIZE_M // 16
+                tok_base = [
+                    (asc_idx[0, n] & 0xFFFFFF) * K_GROUPS
+                    for n in range_constexpr(n_tok)
+                ]
+                # M repeat m of every wave covers gate rows
+                # [blk_n * contiguous_n + 64 * m, +64), inside one scale block.
+                gate_rows = [
+                    fxh._as_ptr(p_w_scale)
+                    + expert_id * (2 * GATE_BLOCKS * K_BLOCKS)
+                    + (blk_n * contiguous_n + m * 64) // block_n * K_BLOCKS
+                    for m in range_constexpr(contiguous_n // 64)
+                ]
+                groups_per_tile = TILE_K // scale_k
+
+                def block_k_scale(k_tile):
+                    out = []
+                    for j in range_constexpr(groups_per_tile):
+                        group = k_tile * groups_per_tile + j
+                        k_block = group * scale_k // block_k
+                        gate = [fxh.load_f32(row + k_block) for row in gate_rows]
+                        up = [
+                            fxh.load_f32(row + GATE_BLOCKS * K_BLOCKS + k_block)
+                            for row in gate_rows
+                        ]
+                        tok = [
+                            a_scale_tensor[tok_base[n] + group]
+                            for n in range_constexpr(n_tok)
+                        ]
+                        out.append((gate, up, tok))
+                    return out
+
             c_gate_frag, c_up_frag = gemm_1x4(
                 BLOCK_TILE_SIZE_M,
                 BLOCK_TILE_SIZE_N,
@@ -961,6 +1095,7 @@ def compile_moe_gemm1(
                 arg_p_input,
                 arg_p_weight,
                 lds,
+                k_scale=block_k_scale,
             )
 
             if const_expr(weight_dtype != fx.BFloat16):

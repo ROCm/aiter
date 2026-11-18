@@ -1011,6 +1011,10 @@ def _iter_csv_cases():
                 e,
             )
             continue
+        # SwigluStep rows are covered by test_flydsl_moe_gfx942.py, which runs
+        # them with real block scales and the swiglu limit.
+        if kwargs["actType"] == aiter.ActivationType.SwigluStep:
+            continue
         if kwargs["actType"] == aiter.ActivationType.Situv2:
             kwargs["beta"] = 4.0 if args.beta is None else float(args.beta)
             kwargs["linear_beta"] = (

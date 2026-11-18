@@ -841,15 +841,29 @@ class FmoeTuner(TunerCommon):
         weight,
         qType,
         quant_dtype,
+        parts=1,
     ):
         E, dim1, dim2 = weight.shape
+        if qType == QuantType.per_1x128 and parts > 1:
+            # Block each part (gate, up) of w1 separately, as checkpoints do.
+            quantized = [
+                FmoeTuner.weight_quant(part.contiguous(), qType, quant_dtype)
+                for part in weight.chunk(parts, dim=1)
+            ]
+            return tuple(torch.cat(t, dim=1) for t in zip(*quantized))
         if qType == aiter.QuantType.per_Tensor and quant_dtype != torch.int4:
             weight_qt, weight_scale = aiter.pertoken_quant(
                 weight.view(E, -1), quant_dtype=quant_dtype
             )
         elif qType == QuantType.per_1x128:
+            # 128x128 blocks, scales [E, ceil(dim1 / 128), ceil(dim2 / 128)] as in
+            # checkpoints; zero padding lets partial edge blocks keep their own scale.
+            blocks1, blocks2 = -(-dim1 // 128), -(-dim2 // 128)
             weight_qt = (
-                weight.view(E, dim1 // 128, 128, dim2 // 128, 128)
+                torch.nn.functional.pad(
+                    weight, (0, blocks2 * 128 - dim2, 0, blocks1 * 128 - dim1)
+                )
+                .view(E, blocks1, 128, blocks2, 128)
                 .permute(0, 1, 3, 2, 4)
                 .contiguous()
                 .view(E, -1, 128 * 128)
@@ -857,13 +871,13 @@ class FmoeTuner(TunerCommon):
             weight_qt, weight_scale = aiter.pertoken_quant(
                 weight_qt, quant_dtype=quant_dtype
             )
-            weight_qt = weight_qt.view(E, -1)
             weight_qt = (
-                weight_qt.view(E, dim1 // 128, dim2 // 128, 128, 128)
+                weight_qt.view(E, blocks1, blocks2, 128, 128)
                 .permute(0, 1, 3, 2, 4)
+                .reshape(E, blocks1 * 128, blocks2 * 128)[:, :dim1, :dim2]
                 .contiguous()
-                .view(E, dim1, dim2)
             )
+            weight_scale = weight_scale.view(E, blocks1, blocks2)
         elif (
             qType == aiter.QuantType.per_Tensor and quant_dtype == torch.int4
         ):  # int4 w quant
@@ -1908,7 +1922,9 @@ class FmoeTuner(TunerCommon):
         else:
             w1 = torch.randn((expert, inter_dim, model_dim), dtype=dtype) / 10
         w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtype)
-        w1_qt, w1_scale = FmoeTuner.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
+        w1_qt, w1_scale = FmoeTuner.weight_quant(
+            w1, q_type, quant_dtype=q_dtype_w, parts=2 if use_g1u1 else 1
+        )
         w2_qt, w2_scale = FmoeTuner.weight_quant(w2, q_type, quant_dtype=q_dtype_w)
         if q_dtype_w is not dtypes.fp4x2:
             w1_qt = w1_qt.view(w1.shape)
@@ -2901,8 +2917,10 @@ class FmoeTuner(TunerCommon):
         AQDType = hidden_states.dtype
 
         if quant_type == aiter.QuantType.per_1x128:
+            # Groups of 128 along each route, 64 when inter_dim ends in a half block.
+            group = 128 if ref1.shape[-1] % 128 == 0 else 64
             a2_qt, a2_scale = aiter.pertoken_quant(
-                ref1.view(hidden_states.shape[0], -1, 128), quant_dtype=AQDType
+                ref1.view(ref1.shape[0], ref1.shape[1], -1, group), quant_dtype=AQDType
             )
         elif quant_type == QuantType.per_1x32:
             # per_1x32 stage-2 activation quant depends on the activation scheme,
@@ -5061,6 +5079,12 @@ class FmoeTuner(TunerCommon):
             doweight_stage1 = bool(row["doweight_stage1"])
             limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
             swiglu_limit = None if limit_env in (None, "") else float(limit_env)
+            if act_type == ActivationType.SwigluStep and swiglu_limit is None:
+                # Tuned rows carry no limit. 7.0 is the swiglu_limit of Step-5 and
+                # Step-3.5, the SwigluStep models; the env var overrides it. Only
+                # tuning and --run_config use this default: fused_moe callers
+                # (vLLM) pass the model's swiglu_limit.
+                swiglu_limit = 7.0
             # fused_moe overrides the activation quant dtype at runtime for
             # per_1x32 fp4-weight MoE (gate_mode defaults to SEPARATED, which
             # run_config does not override): Silu -> fp4, Swiglu -> bf16/fp4 by M.
@@ -5113,7 +5137,9 @@ class FmoeTuner(TunerCommon):
                 w2 = torch.randn(
                     (expert, model_dim, inter_dim), dtype=dtype, device="cuda"
                 )
-                w1_qt, w1_scale = self.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
+                w1_qt, w1_scale = self.weight_quant(
+                    w1, q_type, quant_dtype=q_dtype_w, parts=2 if use_g1u1 else 1
+                )
                 w2_qt, w2_scale = self.weight_quant(w2, q_type, quant_dtype=q_dtype_w)
                 if q_dtype_w is not dtypes.fp4x2:
                     w1_qt = w1_qt.view(w1.shape)
@@ -6534,6 +6560,7 @@ class FmoeTuner(TunerCommon):
         from aiter.ops.flydsl.fused_moe_gfx942 import (
             Config,
             _Problem,
+            block_scale_groups,
             get_tune_space,
             run_flydsl_moe_gfx942,
         )
@@ -6611,25 +6638,41 @@ class FmoeTuner(TunerCommon):
         YELLOW = "\033[1;33m"
         RED = "\033[0;31m"
         END = "\033[0m"
+        quant_names = {
+            str(QuantType.No): "no",
+            str(QuantType.per_Token): "ptpc",
+            str(QuantType.per_Tensor): "per_tensor",
+            str(QuantType.per_1x128): "block",
+            str(QuantType.per_128x128): "block",
+        }
+
+        def problem(row):
+            quant_type = quant_names.get(row["q_type"], "")
+            scale_k1, scale_k2 = (
+                block_scale_groups(int(row["inter_dim"]), int(row["model_dim"]))
+                if quant_type == "block"
+                else (0, 0)
+            )
+            return _Problem(
+                batch=int(row["token"]),
+                experts=int(row["expert"]),
+                gateup_dim=int(row["inter_dim"]) * 2,
+                hidden_dim=int(row["model_dim"]),
+                model_dim=int(row["model_dim"]),
+                inter_dim=int(row["inter_dim"]),
+                topk=int(row["topk"]),
+                quant_type=quant_type,
+                scale_k1=scale_k1,
+                scale_k2=scale_k2,
+            )
+
         for config_string in get_tune_space():
             config = Config.from_string(config_string)
             eligible_indices = [
                 position
                 for position, (_, row) in enumerate(self.untunedf.iterrows())
                 if not bool(row["doweight_stage1"])
-                and config.unsupported_reason(
-                    _Problem(
-                        batch=int(row["token"]),
-                        experts=int(row["expert"]),
-                        gateup_dim=int(row["inter_dim"]) * 2,
-                        hidden_dim=int(row["model_dim"]),
-                        model_dim=int(row["model_dim"]),
-                        inter_dim=int(row["inter_dim"]),
-                        topk=int(row["topk"]),
-                        quant_type=("no" if row["q_type"] == str(QuantType.No) else ""),
-                    )
-                )
-                is None
+                and config.unsupported_reason(problem(row)) is None
             ]
             if not eligible_indices:
                 continue

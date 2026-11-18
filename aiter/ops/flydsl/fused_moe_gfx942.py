@@ -18,6 +18,76 @@ from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
 )
 from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import _ptr
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.quant import per_group_quant_hip
+
+_ACTIVATIONS = {
+    ActivationType.Silu: "silu",
+    ActivationType.Swiglu: "swiglu",
+    ActivationType.SwigluStep: "swiglustep",
+}
+
+# Block-scaled FP8 takes the checkpoint's FP32 block scales, b in {128, 64} per
+# dim (64 when vLLM refines 128x128 blocks for a TP shard that starts mid-block):
+# w1 [E, 2 * ceil(inter_dim / b), ceil(model_dim / b)] with gate and up blocked
+# separately, w2 [E, ceil(model_dim / b), ceil(inter_dim / b)]. The kernels read
+# them as they are on every call, and prefill quantizes activations per (token,
+# K group).
+_BLOCK_QUANT_TYPES = (QuantType.per_1x128, QuantType.per_128x128)
+# A dim of at most 64 is one block either way; it reads as 128.
+_BLOCK_SIZES = (128, 64)
+
+
+def _blocks(n, block):
+    return -(-n // block)
+
+
+def _scale_blocks(scale, experts, rows, k, parts=1):
+    """(block_n, block_k) of FP32 scales [experts, parts * ceil(rows / parts /
+    block_n), ceil(k / block_k)] with supported block sizes, else None. With
+    parts=2 the two row halves (gate, up) are blocked separately."""
+    if (
+        scale is None
+        or scale.dtype != torch.float32
+        or scale.dim() != 3
+        or scale.shape[0] != experts
+    ):
+        return None
+    sizes = tuple(
+        next((b for b in _BLOCK_SIZES if n * _blocks(dim, b) == count), None)
+        for count, dim, n in (
+            (scale.shape[1], rows // parts, parts),
+            (scale.shape[2], k, 1),
+        )
+    )
+    return None if None in sizes else sizes
+
+
+def _accepted_shape(experts, rows, k, parts=1):
+    dims = (
+        "|".join(str(n * _blocks(d, b)) for b in _BLOCK_SIZES)
+        for d, n in ((rows // parts, parts), (k, 1))
+    )
+    return f"[{experts}, {', '.join(dims)}]"
+
+
+def _describe(scale):
+    if scale is None:
+        return "None"
+    return f"{scale.dtype} {list(scale.shape)}"
+
+
+def block_scale_groups(inter_dim, hidden_dim, w1_block_k=128, w2_block_k=128):
+    """K groups (Gate/Up, Down) the prefill kernels scale and quantize
+    activations by.
+
+    Gate/Up uses the w1 scale block width when it divides hidden_dim, so each
+    checkpoint block is scaled once, and 64 otherwise. The prefill Down reads one group per K core, 128 wide unless inter_dim
+    ends in a half block. Groups never straddle w2 scale blocks, so 64-wide
+    blocks get 64-wide Down groups; with inter_dim % 128 == 0 that leaves only
+    decode.
+    """
+    gateup = w1_block_k if hidden_dim % w1_block_k == 0 else 64
+    return gateup, min(128 if inter_dim % 128 == 0 else 64, w2_block_k)
 
 
 @dataclass
@@ -96,7 +166,7 @@ class Config:
                 return "specialized Down paths require unchanged M64 Gate/Up metadata"
             # The native tuner's empty quant_type is a shape-only probe. The
             # runtime wrapper checks actual FP8 weight and activation support.
-            if problem.quant_type not in ("", "ptpc", "per_tensor"):
+            if problem.quant_type not in ("", "ptpc", "per_tensor", "block"):
                 return "specialized Down paths require FP8 weights"
             if self.down_path == "8x1_compact":
                 if problem.inter_dim not in (192, 256, 384, 512, 640):
@@ -105,9 +175,20 @@ class Config:
                     return "compact Down requires model_dim >= 512"
                 if not 0 < problem.experts <= 2048:
                     return "compact Down requires 1 to 2048 experts"
-            scale_bytes = 0 if problem.quant_type == "per_tensor" else 256 * 4
+            scale_bytes = 256 * 4 if problem.quant_type == "ptpc" else 0
             if 64 * problem.inter_dim + scale_bytes + 4 * 16 * 64 * 2 > 64 * 1024:
                 return "specialized M64 Down exceeds the 64 KiB LDS capacity"
+        if problem.quant_type == "block" and self.use_prefill:
+            if self.down_path != "1x4_64x256":
+                return "block-scaled prefill requires the 1x4_64x256 Down path"
+            # Each Gate/Up K tile must hold whole scale groups.
+            if self.BLOCK_K % problem.scale_k1 != 0:
+                return "block-scaled Gate/Up scale group must divide BLOCK_K"
+            if problem.scale_k2 != (128 if problem.inter_dim % 128 == 0 else 64):
+                return (
+                    "block-scaled Down needs one scale group per 1x4_64x256 K core; "
+                    "64-wide w2 scale blocks need inter_dim % 128 != 0"
+                )
         if self.use_prefill and problem.quant_type == "no":
             if self.BLOCK_K not in (64, 128):
                 return "BF16 prefill requires Gate/Up BLOCK_K=64 or 128"
@@ -148,6 +229,11 @@ class _Problem:
     inter_dim: int
     topk: int
     quant_type: str
+    scale_k1: int = 0
+    scale_k2: int = 0
+    # Checkpoint (block_n, block_k) of the w1 and w2 block scales.
+    scale_block1: tuple[int, int] | None = None
+    scale_block2: tuple[int, int] | None = None
 
     @classmethod
     def from_inputs(
@@ -157,10 +243,35 @@ class _Problem:
         w2: torch.Tensor,
         topk_ids: torch.Tensor,
         quant_type: QuantType,
+        w1_scale: torch.Tensor | None = None,
+        w2_scale: torch.Tensor | None = None,
     ):
         experts, gateup_dim, hidden_dim = w1.shape
         model_dim, inter_dim = w2.shape[1], w2.shape[2]
         assert gateup_dim == 2 * inter_dim
+        scale_k1 = scale_k2 = 0
+        w1_blocks = w2_blocks = None
+        if quant_type in _BLOCK_QUANT_TYPES:
+            # Gate and up rows are blocked separately, as checkpoints store them.
+            w1_blocks = _scale_blocks(w1_scale, experts, gateup_dim, hidden_dim, 2)
+            w2_blocks = _scale_blocks(w2_scale, experts, model_dim, inter_dim)
+            if w1_blocks is None or w2_blocks is None:
+                raise ValueError(
+                    "block-scaled FP8 needs FP32 checkpoint block scales, b in "
+                    "{128, 64}: w1 [E, 2 * ceil(inter_dim / b), ceil(model_dim / b)] "
+                    f"= {_accepted_shape(experts, gateup_dim, hidden_dim, 2)} and "
+                    "w2 [E, ceil(model_dim / b), ceil(inter_dim / b)] = "
+                    f"{_accepted_shape(experts, model_dim, inter_dim)}, got "
+                    f"{_describe(w1_scale)} and {_describe(w2_scale)}"
+                )
+            if hidden_dim % 64 != 0 or inter_dim % 64 != 0:
+                raise ValueError(
+                    f"block-scaled FP8 needs K dims divisible by 64, got "
+                    f"{hidden_dim=} {inter_dim=}"
+                )
+            scale_k1, scale_k2 = block_scale_groups(
+                inter_dim, hidden_dim, w1_blocks[1], w2_blocks[1]
+            )
         return cls(
             batch=int(hidden_states.shape[0]),
             experts=experts,
@@ -173,7 +284,13 @@ class _Problem:
                 QuantType.No: "no",
                 QuantType.per_Token: "ptpc",
                 QuantType.per_Tensor: "per_tensor",
+                QuantType.per_1x128: "block",
+                QuantType.per_128x128: "block",
             }[quant_type],
+            scale_k1=scale_k1,
+            scale_k2=scale_k2,
+            scale_block1=w1_blocks,
+            scale_block2=w2_blocks,
         )
 
 
@@ -227,6 +344,8 @@ def _get_compiled_kernel(
     down_path="default",
     down_output_padding_bytes=0,
     fused_down_clear=False,
+    scale_k=None,
+    scale_block=None,
     has_num_local_tokens=False,
 ):
     from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import compile_gemm
@@ -250,8 +369,19 @@ def _get_compiled_kernel(
         down_path=down_path,
         down_output_padding_bytes=down_output_padding_bytes,
         fused_down_clear=fused_down_clear,
+        scale_k=scale_k,
+        scale_block=scale_block,
         has_num_local_tokens=has_num_local_tokens,
     )
+
+
+def _scale_kwargs(problem: _Problem, stage: str):
+    """K group and checkpoint (block_n, block_k) of a block-scaled stage."""
+    if problem.quant_type != "block":
+        return {}
+    if stage == "gateup":
+        return {"scale_k": problem.scale_k1, "scale_block": problem.scale_block1}
+    return {"scale_k": problem.scale_k2, "scale_block": problem.scale_block2}
 
 
 def _launch(kernel_fn, *args):
@@ -340,11 +470,17 @@ def _run_prefill(
     )
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
     act_quant_type_str = problem.quant_type
-    quant_func = (
-        aiter.get_hip_quant(aiter.QuantType.per_Token)
-        if quant_type == QuantType.per_Token
-        else _quant_per_tensor
-    )
+    if problem.quant_type == "block":
+        quant_func = per_group_quant_hip
+    elif quant_type == QuantType.per_Token:
+        quant_func = aiter.get_hip_quant(aiter.QuantType.per_Token)
+    else:
+        quant_func = _quant_per_tensor
+
+    def group_kwargs(stage):
+        if problem.quant_type != "block":
+            return {}
+        return {"group_size": _scale_kwargs(problem, stage)["scale_k"]}
 
     if weight_dtype_str == "fp8":
         gateup_in, a_scale = quant_func(
@@ -353,6 +489,7 @@ def _run_prefill(
             quant_dtype=w1.dtype,
             # Per-token scales are row-local; a per-tensor one must skip padding.
             num_rows=num_local_tokens if quant_type == QuantType.per_Tensor else None,
+            **group_kwargs("gateup"),
         )
         a_scale = a_scale.to(torch.float32).contiguous()
     else:
@@ -373,6 +510,7 @@ def _run_prefill(
         BLOCK_TILE_SIZE_N=config.BLOCK_N,
         BLOCK_TILE_SIZE_K=config.BLOCK_K,
         stage="gateup",
+        **_scale_kwargs(problem, "gateup"),
         alg="prefill_1x4",
         E=problem.experts,
         act_quant_type_str=act_quant_type_str,
@@ -406,6 +544,7 @@ def _run_prefill(
                 if quant_type == QuantType.per_Tensor and num_local_tokens is not None
                 else None
             ),
+            **group_kwargs("down"),
         )
     else:
         down_in = gemm1_out
@@ -429,6 +568,7 @@ def _run_prefill(
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
         BLOCK_TILE_SIZE_N=128,
         stage="down",
+        **_scale_kwargs(problem, "down"),
         alg="prefill_1x4",
         E=problem.experts,
         act_quant_type_str=act_quant_type_str,
@@ -520,6 +660,7 @@ def _run_batch1(
         BLOCK_TILE_SIZE_M=16,
         BLOCK_TILE_SIZE_N=32,
         stage="gateup",
+        **_scale_kwargs(problem, "gateup"),
         alg="batch1",
         E=None,
         activation_str=activation_str,
@@ -548,6 +689,7 @@ def _run_batch1(
         BLOCK_TILE_SIZE_M=16,
         BLOCK_TILE_SIZE_N=64,
         stage="down",
+        **_scale_kwargs(problem, "down"),
         alg="batch1",
         E=None,
         has_num_local_tokens=has_num_local_tokens,
@@ -609,6 +751,7 @@ def _run_decode(
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
         BLOCK_TILE_SIZE_N=block_n,
         stage="gateup",
+        **_scale_kwargs(problem, "gateup"),
         alg="splitk",
         E=problem.experts,
         activation_str=activation_str,
@@ -637,6 +780,7 @@ def _run_decode(
         BLOCK_TILE_SIZE_M=config.BLOCK_M,
         BLOCK_TILE_SIZE_N=block_n,
         stage="down",
+        **_scale_kwargs(problem, "down"),
         alg="splitk",
         E=problem.experts,
     )
@@ -672,6 +816,15 @@ def run_flydsl_moe_gfx942(
     config_string: str,
     swiglu_limit: float | None = None,
 ) -> torch.Tensor:
+    """Whole MoE (sort, Gate/Up, activation, Down, reduction) with FlyDSL on gfx942.
+
+    Block-scaled FP8 (per_128x128 or per_1x128) takes the checkpoint's FP32
+    block scales w1_scale [E, 2 * ceil(inter_dim / b), ceil(model_dim / b)]
+    (gate blocks, then up blocks) and w2_scale [E, ceil(model_dim / b),
+    ceil(inter_dim / b)], b in {128, 64} per dim (64 when vLLM refines checkpoint
+    blocks for a TP shard). The kernels read them directly on every call, so
+    in-place updates (weight reload) take effect without any conversion step.
+    """
     # num_local_tokens: rows at and past it (CUDA-graph padding) run no route
     # and their output rows are unspecified, as in fused_moe. The sorted paths
     # hand it to moe_sorting; the batch-1 kernels read it themselves.
@@ -703,12 +856,13 @@ def run_flydsl_moe_gfx942(
     is_fp8 = (
         w1.dtype == torch.float8_e4m3fnuz
         and w2.dtype == torch.float8_e4m3fnuz
-        and quant_type in (QuantType.per_Token, QuantType.per_Tensor)
+        and quant_type
+        in (QuantType.per_Token, QuantType.per_Tensor, *_BLOCK_QUANT_TYPES)
     )
     if (
         hidden_states.dtype != torch.bfloat16
         or expert_mask is not None
-        or activation not in (ActivationType.Silu, ActivationType.Swiglu)
+        or activation not in _ACTIVATIONS
         or not (is_bf16 or is_fp8)
     ):
         raise RuntimeError("Unsupported input for the gfx942 FlyDSL MoE backend")
@@ -717,8 +871,17 @@ def run_flydsl_moe_gfx942(
     if is_bf16 and (w1_scale is not None or w2_scale is not None):
         raise NotImplementedError("BF16 weights do not support weight scales")
 
-    activation_str = "swiglu" if activation == ActivationType.Swiglu else "silu"
-    problem = _Problem.from_inputs(hidden_states, w1, w2, topk_ids, quant_type)
+    if activation == ActivationType.SwigluStep and (
+        not isinstance(swiglu_limit, (int, float)) or swiglu_limit <= 0
+    ):
+        raise ValueError(
+            f"SwigluStep requires a positive swiglu_limit, got {swiglu_limit!r}"
+        )
+
+    activation_str = _ACTIVATIONS[activation]
+    problem = _Problem.from_inputs(
+        hidden_states, w1, w2, topk_ids, quant_type, w1_scale, w2_scale
+    )
     unsupported_reason = config.unsupported_reason(problem)
     if unsupported_reason is not None:
         raise RuntimeError(
