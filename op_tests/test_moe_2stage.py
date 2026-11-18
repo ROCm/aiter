@@ -2435,6 +2435,115 @@ def test_relu2_gate_only_regression():
     aiter.logger.info("moe_2stage: Relu2 gate-only multi-expert regression test passed")
 
 
+def test_relu2_rejects_unsupported_quant_configs():
+    """ReLU2 must reject quant/dtype combinations with no validated kernel
+    instance (e.g. per_1x128 FP8 blockscale) instead of silently dispatching
+    to an untested instance."""
+    if get_gfx() != "gfx950":
+        aiter.logger.info(
+            "skip Relu2 unsupported-quant-config rejection on %s", get_gfx()
+        )
+        return
+    model_dim, inter_dim, E, topk = 7168, 256, 257, 9
+
+    # per_1x128 FP8 blockscale: no ReLU2 kernel instance exists for this
+    # quant/activation combination anywhere in the codegen pipeline.
+    try:
+        get_2stage_cfgs(
+            get_padded_M(128),
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            torch.bfloat16,
+            dtypes.fp8,
+            dtypes.fp8,
+            aiter.QuantType.per_1x128,
+            False,
+            aiter.ActivationType.Relu2,
+            False,
+            0,
+            0,
+            True,
+            GateMode.SEPARATED.value,
+        )
+        raise AssertionError(
+            "expected NotImplementedError for Relu2 + per_1x128, none raised"
+        )
+    except NotImplementedError:
+        pass
+
+    # per_1x32 (CK-Tile route) with a non-fp4x2 weight dtype: the only
+    # validated CK-Tile ReLU2 weight dtype is fp4x2.
+    try:
+        get_2stage_cfgs(
+            get_padded_M(128),
+            6144,
+            512,
+            129,
+            5,
+            torch.bfloat16,
+            dtypes.bf16,
+            dtypes.bf16,
+            aiter.QuantType.per_1x32,
+            False,
+            aiter.ActivationType.Relu2,
+            False,
+            0,
+            0,
+            True,
+            GateMode.SEPARATED.value,
+        )
+        raise AssertionError(
+            "expected NotImplementedError for Relu2 per_1x32 with "
+            "non-fp4x2 weight dtype, none raised"
+        )
+    except NotImplementedError:
+        pass
+
+    # Sanity: both genuinely supported combinations must still be accepted.
+    get_2stage_cfgs(
+        get_padded_M(128),
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        torch.bfloat16,
+        None,
+        None,
+        aiter.QuantType.No,
+        False,
+        aiter.ActivationType.Relu2,
+        False,
+        0,
+        0,
+        True,
+        GateMode.SEPARATED.value,
+    )
+    get_2stage_cfgs(
+        get_padded_M(128),
+        6144,
+        512,
+        129,
+        5,
+        torch.bfloat16,
+        dtypes.bf16,
+        dtypes.fp4x2,
+        aiter.QuantType.per_1x32,
+        False,
+        aiter.ActivationType.Relu2,
+        False,
+        0,
+        0,
+        True,
+        GateMode.SEPARATED.value,
+            opus_weights_shuffled=True,
+    )
+    aiter.logger.info(
+        "moe_2stage: Relu2 unsupported-quant-config rejection test passed"
+    )
+
+
 def test_swiglu_mxfp4_nonsplit_nobias_dispatch():
     if get_gfx() != "gfx950":
         aiter.logger.info(
@@ -3161,6 +3270,7 @@ else:
         run_blockscale_limit_cases()
     run_plain_fp8_limit_cases()
     test_relu2_gate_only_regression()
+    test_relu2_rejects_unsupported_quant_configs()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
     test_swiglu_oai_flat_dispatch()
