@@ -421,8 +421,8 @@ def mha_v4_kv_tile_for_q_tile(q_tile: int, operands=None, mode=None) -> int:
 
     operands is what mha_v4_operands() builds -- the three formats, their three scale modes and V's
     packing, which together are what picks a manifest row. It matters because an arch need not
-    serve every geometry in every precision: gfx942 has 256x64 rows for FP8 and INT8/FP8 only, so
-    asking without operands says 256x64 exists and asking with BF16 ones says it does not. The
+    serve every geometry in every precision: gfx950 has 256x128 rows for FP8 but not for BF16, so
+    asking without operands says 256x128 exists and asking with BF16 ones says it does not. The
     scale modes are part of it and not an over-specification, since the FP8 and MXFP8 rows take
     the same three formats and differ only there.
 
@@ -2499,8 +2499,8 @@ def mha_v4(
     heads. ``"auto"`` picks the count with mha_v4_kv_splits() and falls back to 1 wherever
     splitting is unsupported. Operands are quantized once, before the split, so per-tensor
     scales stay global. For BF16, BF16/FP8, INT8/FP8 and FP8/FP8 operands whose dense row
-    exports the LSE (every gfx950 row; the BF16 Q/K rows of gfx942), without ``block_mask`` or
-    ``seqlens_k``. The ranges are
+    exports the LSE (every row on gfx942 and gfx950), without ``block_mask`` or ``seqlens_k``.
+    The ranges are
     equal when the count divides the key length; otherwise the last one takes the remainder,
     which needs operands that take per-batch key lengths (all four on gfx950), and any others
     need a count that divides it. A count is at most the key length over the KV tile of the
