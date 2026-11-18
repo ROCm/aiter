@@ -228,7 +228,9 @@ def main():
     cases = list(
         itertools.product(DEFAULT_ALIGNMENT_INTER_DIMS, args.block_m or BLOCK_MS)
     ) + list(
-        itertools.product(KPERBLOCK_128_INTER_DIMS, args.block_m or KPERBLOCK_128_BLOCK_MS)
+        itertools.product(
+            KPERBLOCK_128_INTER_DIMS, args.block_m or KPERBLOCK_128_BLOCK_MS
+        )
     )
     rows = [
         bench_case(tokens, 4096, inter_dim, experts, topk, block_m)
