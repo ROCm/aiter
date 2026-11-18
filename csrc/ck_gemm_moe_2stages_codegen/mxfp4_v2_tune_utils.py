@@ -50,9 +50,8 @@ def balanced_score(token, E, topk, dtype):
 def tuning_routing(inp, E, topk):
     """Top-k routing for ``inp``, as the tuner times candidates.
 
-    Random unless TUNE_MOE_EXPERT_BALANCE=true. Balanced routing gives every
-    expert exactly token * topk / E rows, which at a power-of-two token count
-    fills a block_m of that size with no padding tile and so favours it.
+    Random unless TUNE_MOE_EXPERT_BALANCE=true, which gives every expert
+    exactly token * topk / E rows.
     """
     token = inp.shape[0]
     if os.environ.get("TUNE_MOE_EXPERT_BALANCE", "False").lower() == "true":

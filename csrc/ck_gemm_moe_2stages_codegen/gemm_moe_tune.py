@@ -526,10 +526,9 @@ def rank_moe_pairs(profile_df, policy):
 
 
 # The tuner times each stage alone and ranks pairs by the sum, which misses
-# how a kernel runs after its neighbours in fused_moe: a block_m 128 stage 1
-# measured 6-9% slower there than alone, enough to win a near tie it loses in
-# production. FlyDSL v2 pairs this close to the best stage sum are re-timed
-# through fused_moe and only the fastest is kept.
+# how a kernel runs after its neighbours in fused_moe. FlyDSL v2 pairs this
+# close to the best stage sum are re-timed through fused_moe and only the
+# fastest is kept.
 V2_E2E_FINALIST_GATE = 0.05
 V2_E2E_MAX_FINALISTS = 4
 
@@ -548,9 +547,8 @@ def _v2_e2e_scores(kernel_us):
     """fused_moe time of each finalist over the kernels it does not share.
 
     ``kernel_us`` maps finalist -> {kernel name: median us per call}. A kernel
-    every finalist launches under the same name is left out: the reduce's time
-    swings by about 30 us with the output buffer the allocator hands it, which
-    is more than the gap between near-tied pairs.
+    every finalist launches under the same name is left out: it cannot separate
+    the finalists, and its time varies with the buffers it is handed.
     """
     shared = set.intersection(*(set(k) for k in kernel_us.values()))
     return {
