@@ -7,6 +7,8 @@
 
 #include "aiter_hip_common.h"  // AITER_CHECK + hip_runtime (torch-free)
 
+#include <algorithm>
+#include <iterator>
 #include <string>
 #include <utility>
 
@@ -62,4 +64,23 @@ inline const opus_arch_detail::OpusArchInfo &opus_get_arch_info()
 inline OpusGfxArch opus_get_gfx_arch()
 {
     return opus_get_arch_info().arch;
+}
+
+// Return the CU count of the table that serves cu_num in a (cu_num, kid) table.
+// A CU count without a table (a compute partition) uses the largest table.
+template <typename It, typename KeyOf>
+inline int opus_table_cu(It first, It last, int cu_num, KeyOf key_of)
+{
+    if (first == last)
+    {
+        return cu_num;
+    }
+    const auto it = std::lower_bound(first, last, cu_num, [&](const auto& entry, int cu) {
+        return key_of(entry).first < cu;
+    });
+    if (it != last && key_of(*it).first == cu_num)
+    {
+        return cu_num;
+    }
+    return key_of(*std::prev(last)).first;
 }

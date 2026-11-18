@@ -53,7 +53,11 @@ opus_bmm_a8w8_mxscale_exact_dispatch(const std::pair<int, int>& key)
   static const std::map<std::pair<int, int>, OpusBmmMxscaleKernel> kDispatch = {
       GENERATE_BMM_MXSCALE_KID_DISPATCH(fp32_t)
   };
-  const auto it = kDispatch.find(key);
+  // key.first is the CU count of the device, which is fixed for the process.
+  static const int table_cu = opus_table_cu(
+      kDispatch.begin(), kDispatch.end(), key.first,
+      [](const auto& entry) { return entry.first; });
+  const auto it = kDispatch.find({table_cu, key.second});
   AITER_CHECK(it != kDispatch.end(),
               "opus_bmm_a8w8_mxscale: kid ", key.second, " has no emitted instance. It is "
               "either not in the catalog or its kernel_tag is missing from one of "
@@ -69,7 +73,10 @@ static std::pair<int, int> opus_bmm_mxscale_kid_groups(const std::pair<int, int>
   static const std::map<std::pair<int, int>, std::pair<int, int>> kGroups = {
       GENERATE_BMM_MXSCALE_KID_GROUPS
   };
-  const auto it = kGroups.find(key);
+  static const int table_cu = opus_table_cu(
+      kGroups.begin(), kGroups.end(), key.first,
+      [](const auto& entry) { return entry.first; });
+  const auto it = kGroups.find({table_cu, key.second});
   AITER_CHECK(it != kGroups.end(),
               "unknown exact OPUS a8w8_mxscale_bmm kid ", key.second);
   return it->second;
