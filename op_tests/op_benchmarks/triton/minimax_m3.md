@@ -1,7 +1,8 @@
 # MiniMax-M3 Triton/Gluon capture
 
 This is an opt-in, cross-repository regression suite, not a port of ATOM's
-kernels into AITER. Tests call public wrappers and compare against independent
+kernel bodies into AITER. Two public AITER adapters expose the ATOM prefill
+score and selector as separate launches. Tests call public wrappers and compare against independent
 PyTorch oracles. The benchmark shares their input generators and uses AITER's
 `RotatingBufferBench`; it does not run accuracy checks inside timed graphs.
 
@@ -22,6 +23,7 @@ Included implementations:
 
 - ATOM `minimax_m3.index_topk.minimax_m3_index_topk`: Triton block scoring
   (`_index_block_score_kernel`) and packed top-k (`_topk_index_packed_kernel`).
+  The benchmark times these stages as separate rows with preallocated outputs.
   The capture passes no MXFP4 scorer and no AITER selection bounds, keeping
   both operations on the Triton path of the pinned ATOM wrapper.
 - ATOM `minimax_m3.indexer_context_parallel.indexer_context_scores`: Triton
@@ -49,8 +51,20 @@ newer dispatch paths may use different backends.
 ## Reproduce
 
 Use an installed AITER build with its matching dependencies and an ATOM
-checkout at `f6bf6f0aff2fd8267be7bff9deee51ce8863ad7c`. For example, put that
-checkout on `PYTHONPATH` after the current AITER checkout. ATOM is optional for
+checkout at `f6bf6f0aff2fd8267be7bff9deee51ce8863ad7c`. Install the AITER build
+and ATOM dependencies in the same environment. Prepare ATOM outside the timed run:
+
+```bash
+git clone --no-checkout https://github.com/ROCm/ATOM.git ATOM-m3
+git -C ATOM-m3 checkout f6bf6f0aff2fd8267be7bff9deee51ce8863ad7c
+export PYTHONPATH="$PWD:$PWD/ATOM-m3${PYTHONPATH:+:$PYTHONPATH}"
+```
+
+The ATOM kernels stay in that checkout. `minimax_m3_atom.json` pins the six
+measured ATOM source files. The benchmark checks their SHA256 values and Git
+HEAD, when available, before timing. Source archives have no Git identity;
+only the selected file digests can be checked for them. A new ATOM revision
+requires a pin update and a fresh correctness run. ATOM is optional for
 normal AITER CI; its tests skip unless explicitly enabled. An enabled test with
 a missing or incompatible ATOM installation fails rather than silently skips.
 
@@ -62,7 +76,7 @@ python -m pytest -q \
   op_tests/triton_tests/fusions/test_minimax_m3.py \
   op_tests/triton_tests/gemm/basic/test_minimax_m3.py
 python -m op_tests.op_benchmarks.triton.bench_minimax_m3 \
-  --output minimax-m3-baseline.json --profile-dir minimax-m3-profile
+  --metric time -o --output minimax-m3-baseline.json --profile-dir minimax-m3-profile
 ```
 
 On `gfx1250-strict`, the upstream tree currently lacks the separate Gluon GEMM
@@ -74,17 +88,67 @@ work without ATOM: leave the opt-in variable unset and select, for example,
 
 Run on an otherwise idle device, using the machine's cooperative GPU lock.
 JSON records device/software versions, input shapes, dtypes and strides,
-rotating pool sizes, every timing sample, and source-file SHA256 hashes.
+rotating pool sizes, graph/pool settings, one graph mean per row, and source-file
+SHA256 hashes. This includes the two AITER launch adapters and the ATOM wrappers.
 Optional profiler traces record the actual dispatched kernel names in a
-separate untimed invocation. By default each reported median uses three
-independent graph means with the standard rotating-buffer timing settings.
+separate untimed invocation. The profiler counts launches, including repeated
+launches with the same name. With `--profile-dir`, any row that launches other
+than one GPU kernel fails. Correctness checks stay in the UTs.
+
+The benchmark uses `get_parser`, `RotatingBufferBench.from_dict` and
+`triton.testing.perf_report`. It writes the standard `Time_ms` report; `-o` saves
+`bench_minimax_m3.csv`. `--output` is optional metadata, not the daily parser
+interface. The caller owns repeat runs and aggregation. There is no local
+`--repeats` loop or median. Standard `--graph-*` and `--rot-bufs-*` flags apply.
+
+Use the same case IDs, shapes, dtypes and strides across architectures. The
+standard pool policy and native launch policy select their arch defaults. Do
+not copy configs or change arch detection. The pinned AITER router Gluon
+backend supports gfx1250 only; select the ATOM cases on other architectures.
+The existing strict-stack exceptions below still apply. No gfx950 result was
+measured for this capture.
+
+The MI450 workflow at rocAutomation commit
+`2077994eb7eb68264531376bce5c58f00261cd52` has a different driver:
+`perf_daily_mi450/aiter_bench.py` uses `do_bench_cudagraph`, fixed inputs, ten
+samples and 20 ms per sample by default. It does not call this script. Its
+results are not the rotating-buffer baseline. Daily registration, driver
+adaptation and result aggregation are separate integration work.
 
 The historical trace lists ATOM `17a48053c` and AITER `ea8be1a18`. Those are
 different from this suite's measured source versions. Results from the current
 source must not be described as an exact reproduction of that historical
 software baseline, nor as an optimization speedup.
 
-## Recorded baseline
+## Single-stage verification
+
+On gfx1250, all 18 UTs passed, including the two split-stage parity cases.
+Three separate script invocations completed with the standard graph and pool
+settings. Each produced 18 standard `Time_ms` rows. Every untimed profile had
+exactly one GPU kernel launch, including both prefill stages.
+
+`baselines/minimax_m3_gfx1250_single_stage.json` records all 54 graph means,
+input layouts, kernel names, source hashes and the dependency check. The
+runtime used 256 CUs, 432 GiB HBM, PyTorch
+`2.11.0+rocm10.1.0a20260811-bkc.20260820` and Triton `3.9.0`.
+A cooperative GPU lock was held for the UTs and all three runs. Clocks were
+not locked and interference was not continuously audited. These samples
+verify that the benchmark runs. They do not establish an optimization gain.
+Some rows vary across runs, so use a controlled daily campaign for regression
+thresholds.
+
+Run the standard script three times from an outer runner. Save each run's CSV
+and metadata in a separate output directory. Do not compare the historical
+combined indexer row with either single-stage row as a speedup.
+
+## Historical wrapper baseline (before split-stage reporting)
+
+The JSON files below preserve the earlier script and its three-sample median.
+They contain 17 wrapper cases, including the combined `index-prefill` row.
+They are not output from the current 18-row single-stage benchmark. A change
+in timing scope is not a compiler speedup.
+
+## Recorded wrapper baseline
 
 `baselines/minimax_m3_gfx1250.json` is the primary complete baseline: 256 CUs,
 432 GiB HBM, PyTorch `2.11.0+rocm10.1.0a20260811-bkc.20260820`, Triton `3.9.0`

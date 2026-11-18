@@ -9,6 +9,10 @@ import pytest
 import torch
 import triton
 
+from aiter.ops.triton.attention.minimax_m3 import (
+    minimax_m3_prefill_score,
+    minimax_m3_packed_topk,
+)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from op_tests.triton_tests.utils import minimax_m3 as m3
 
@@ -53,6 +57,35 @@ def test_prefill_index_topk():
     torch.testing.assert_close(
         lengths, torch.arange(2018, 2049, dtype=torch.int32, device="cuda")
     )
+
+
+@pytest.mark.parametrize("query", [31, 257])
+def test_prefill_split_stages(query):
+    data = m3.prefill_score_inputs(query, 4096)
+    score = minimax_m3_prefill_score(**data)
+    # Only valid causal blocks are defined by the production scoring kernel.
+    row = torch.arange(query, device="cuda")
+    valid = torch.arange(32, device="cuda")[None, :] * 128 < (
+        4096 - query + row[:, None] + 1
+    )
+    keys = data["index_cache"][data["block_table"][0].long()].float()
+    q = data["idx_q"].to(data["index_cache"].dtype).float()
+    dots = torch.einsum("qhd,btd->hqbt", q, keys)
+    positions = torch.arange(4096, device="cuda").reshape(32, 128)
+    ends = 4096 - query + row + 1
+    dots.masked_fill_(positions[None, None] >= ends[None, :, None, None], -float("inf"))
+    reference = dots.amax(-1) * (128**-0.5) * 1.4426950408889634
+    torch.testing.assert_close(
+        score[0][valid], reference[0][valid], atol=0.003, rtol=0.02
+    )
+
+    selector = m3.packed_topk_inputs(query, 4096)
+    selector["score"] = score
+    actual = minimax_m3_packed_topk(**selector)
+    inputs = {key: value for key, value in data.items() if key != "score"}
+    expected = m3.index_prefill(**inputs)
+    for output, oracle in zip(actual, expected):
+        torch.testing.assert_close(output, oracle, rtol=0, atol=0)
 
 
 def test_decode_candidate_exchange():

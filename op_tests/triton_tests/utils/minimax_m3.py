@@ -8,6 +8,9 @@ import os
 from types import SimpleNamespace
 
 import torch
+import triton
+
+from aiter.ops.triton.attention.minimax_m3 import minimax_m3_prefill_score
 
 
 def router_inputs(tokens):
@@ -17,11 +20,15 @@ def router_inputs(tokens):
     }
 
 
-def atom_op(module, name):
+def atom_module(module):
     """Load a public ATOM wrapper only when the caller opts in."""
     if os.environ.get("AITER_TEST_MINIMAX_M3_ATOM") != "1":
         raise RuntimeError("Set AITER_TEST_MINIMAX_M3_ATOM=1 and install ATOM")
-    return getattr(importlib.import_module("atom.model_ops." + module), name)
+    return importlib.import_module("atom.model_ops." + module)
+
+
+def atom_op(module, name):
+    return getattr(atom_module(module), name)
 
 
 def swiglu_inputs(tokens):
@@ -98,6 +105,40 @@ def index_prefill(
         128**-0.5,
         emit_sparse_block_table=True,
     )
+
+
+def prefill_score_inputs(query=31, context=4096):
+    """Preallocate the output of the pinned ATOM prefill score launch."""
+    data = prefill_inputs(query, context)
+    data["score"] = torch.empty(
+        (1, query, triton.cdiv(context, 128)), dtype=torch.float32, device="cuda"
+    )
+    return data
+
+
+def packed_topk_inputs(query=31, context=4096):
+    """Produce real score values and allocate selector outputs before timing."""
+    data = prefill_score_inputs(query, context)
+    score = minimax_m3_prefill_score(**data)
+    op = atom_module("minimax_m3.index_topk")
+    _, emit_args = op._alloc_emit(
+        query,
+        1,
+        16,
+        data["block_table"],
+        True,
+        score.device,
+        op.PAGES_PER_SPARSE_BLOCK,
+    )
+    return {
+        "score": score,
+        "topk_idx": torch.empty((1, query, 16), dtype=torch.int32, device="cuda"),
+        "cu_seqlens_q": data["cu_seqlens_q"],
+        "prefix_lens": data["prefix_lens"],
+        "block_table": data["block_table"],
+        "emit_args": emit_args,
+        "query": query,
+    }
 
 
 def candidate_inputs(tokens=8, context=4096):
