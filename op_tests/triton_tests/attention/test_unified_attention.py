@@ -2611,3 +2611,140 @@ def test_triton_unified_attn_one_q_block_guard(monkeypatch):
             k_descale=None,
             v_descale=None,
         )
+
+
+class _TritonLaunchSpy:
+    """Forward each launch and record the kernel, grid, and ONE_Q_BLOCK."""
+
+    def __init__(self, kernel, launches, name):
+        self._kernel = kernel
+        self._launches = launches
+        self._name = name
+
+    def __getitem__(self, grid):
+        launch = self._kernel[grid]
+
+        def run(*args, **kwargs):
+            self._launches.append((self._name, tuple(grid), kwargs["ONE_Q_BLOCK"]))
+            return launch(*args, **kwargs)
+
+        return run
+
+
+def _run_gfx942_one_q_block(seq_lens, num_heads, monkeypatch):
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens_list = [kv for _, kv in seq_lens]
+    block_size = 16
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        *_,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * -(-max(kv_lens_list) // block_size),
+        block_size=block_size,
+        head_size=64,
+        num_heads=num_heads,
+    )
+    module = sys.modules[unified_attention.__module__]
+    launches = []
+    monkeypatch.setattr(
+        module,
+        "kernel_unified_attention_2d",
+        _TritonLaunchSpy(module.kernel_unified_attention_2d, launches, "2d"),
+    )
+    monkeypatch.setattr(
+        module,
+        "kernel_unified_attention_3d",
+        _TritonLaunchSpy(module.kernel_unified_attention_3d, launches, "3d"),
+    )
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+    )
+    ref = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+    ).float()
+    torch.testing.assert_close(output.float(), ref, atol=1.5e-2, rtol=1e-2)
+    return launches
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # KV <= 512 stays on the 2d kernel. A zero-length sequence sits in the middle.
+        [(2, 128), (1, 256), (0, 64), (2, 512)],
+        # longer KV takes the 3d kernel on a 304-CU MI300X
+        [(2, 300), (1, 1000), (0, 17), (2, 8192)],
+        [(2, 2048)],
+        [(1, 64), (2, 8192)],
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_gfx942_one_q_block(seq_lens, monkeypatch):
+    """q<=2 with 8 queries per KV head launches one query block per sequence.
+
+    BLOCK_Q is 2 for this head layout, so every sequence fits one block. The
+    2d grid counts sequences on axis 1 and the 3d grid on axis 0.
+    """
+    if DEVICE_ARCH != "gfx942":
+        pytest.skip("gfx942 one-query-block launch")
+    launches = _run_gfx942_one_q_block(seq_lens, (16, 2), monkeypatch)
+    assert launches, "neither Triton kernel launched"
+    for name, grid, one_q_block in launches:
+        assert one_q_block, f"{name} did not take the one-query-block launch"
+        q_blocks = grid[1] if name == "2d" else grid[0]
+        assert q_blocks == len(seq_lens), f"{name} {grid}: one block per sequence"
+
+
+@pytest.mark.parametrize(
+    "seq_lens, num_heads",
+    [
+        # q=8 does not fit BLOCK_Q 2
+        ([(8, 8192)], (16, 2)),
+        # 16 queries per KV head: BLOCK_Q is 1, so q=2 stays on the padded grid
+        ([(2, 2048), (2, 8192)], (16, 1)),
+    ],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_gfx942_one_q_block_off(seq_lens, num_heads, monkeypatch):
+    """The flag stays off when a sequence is longer than one query block."""
+    if DEVICE_ARCH != "gfx942":
+        pytest.skip("gfx942 one-query-block launch")
+    launches = _run_gfx942_one_q_block(seq_lens, num_heads, monkeypatch)
+    assert launches, "neither Triton kernel launched"
+    for name, _grid, one_q_block in launches:
+        assert not one_q_block, f"{name} took the one-query-block launch"
