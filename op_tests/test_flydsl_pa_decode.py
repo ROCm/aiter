@@ -16,7 +16,7 @@ import torch
 
 from aiter import dtypes, per_tensor_quant, pertoken_quant
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.quant import per_1x32_f4_quant
+from aiter.ops.quant import dynamic_per_token_scaled_quant, per_1x32_f4_quant
 from aiter.test_common import checkAllclose
 from aiter.utility import fp4_utils
 
@@ -95,6 +95,24 @@ def test_pa_decode_plan(
         ]
         total_tiles = max(sum(last - first for first, last in ranges), 1)
         remaining = plan.capacity - sum(last > first for first, last in ranges)
+        # gfx942/gfx950 single-block plans bound every task by the smallest
+        # tile count T whose tasks fit the capacity; others split
+        # proportionally.
+        args = calls[-1][0]
+        balanced = len(args) > 3 and args[3] and args[0] <= args[1]
+        if balanced:
+
+            def tasks(tiles, bound):
+                return min(-(-tiles // bound), plan.max_partitions) if tiles else 0
+
+            # The smallest feasible bound from ceil(total / capacity) up;
+            # ceil(total / (capacity - rows)) always fits.
+            low = max(-(-total_tiles // plan.capacity), 1)
+            bound = max(-(-total_tiles // max(remaining, 1)), low)
+            while low < bound:
+                mid = (low + bound) // 2
+                need = sum(tasks(last - first, mid) for first, last in ranges)
+                low, bound = (low, mid) if need <= plan.capacity else (mid + 1, bound)
         cursor = prefix_tiles = 0
         for seq, (ctx, (start, count), (first, last)) in enumerate(
             zip(lengths, info, ranges)
@@ -103,9 +121,12 @@ def test_pa_decode_plan(
             tiles = last - first
             # Verify that the runtime capacity supplies the task budget used
             # to distribute slots by cumulative visible tile count.
-            extra = (prefix_tiles + tiles) * remaining // total_tiles
-            extra -= prefix_tiles * remaining // total_tiles
-            assert count == min(int(tiles > 0) + extra, tiles, plan.max_partitions)
+            if balanced:
+                assert count == tasks(tiles, bound)
+            else:
+                extra = (prefix_tiles + tiles) * remaining // total_tiles
+                extra -= prefix_tiles * remaining // total_tiles
+                assert count == min(int(tiles > 0) + extra, tiles, plan.max_partitions)
             tile = first
             for record in work[start : start + count]:
                 row, begin, end, original_length = record
@@ -214,10 +235,14 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
     Register-only CTAs (24 and 32 partition bounds) and the register branch of
     dual-mode CTAs reduce the same packed partials with one group and with
     split groups; sequences above 32 partitions take the LDS branch and match
-    a float64 reference. Slots past the live tasks hold NaN.
+    a float64 reference. Slots past the live tasks hold NaN. gfx950 splits only
+    dual-mode CTAs (bounds above 64), and its single 32-partition dual rung
+    must match the register-only ladder bit for bit.
     """
-    if get_gfx_runtime() != "gfx1250":
-        pytest.skip("gfx1250 splits register rungs across partition groups")
+    arch = get_gfx_runtime()
+    if arch not in ("gfx950", "gfx1250"):
+        pytest.skip("partition groups split rungs on gfx950 and gfx1250")
+    wave = 32 if arch == "gfx1250" else 64
     import flydsl.compiler as flyc
     import flydsl.expr as fx
 
@@ -258,7 +283,7 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
     def run(partitions, groups):
         pairs = pairs_for(partitions)
         compiled = compile_pa_decode_ps_reduce(
-            architecture="gfx1250",
+            architecture=arch,
             max_context_partition_num=partitions,
             head_size=head_size,
             output_dtype_str=get_dtype_str(dtype),
@@ -316,8 +341,25 @@ def test_pa_decode_reduce_split_groups(device, head_size, dtype, with_sinks):
         reference[seq] = (
             (weights[..., None] * logits[:, f : f + c].double()).sum(1).float()
         )
+
+    def fits(partitions, split):
+        # A CTA holds at most 1024 threads.
+        waves = head_size // (2 if pairs_for(partitions) else 1) // wave
+        return split * waves <= 1024 // wave
+
+    if arch == "gfx950":
+        # Up to 32 live partitions, the dual CTA's single 32-wide rung adds the
+        # same products in the same order as the register-only ladder.
+        ladder = run(32, 1)
+        small = [seq for seq, c in enumerate(counts) if c <= 32]
+        for split in (1, 4):
+            if fits(256, split):
+                rung = run(256, split)
+                assert torch.equal(
+                    ladder[small].view(torch.int16), rung[small].view(torch.int16)
+                ), f"gfx950 dual rung split={split} differs from the ladder"
     for partitions, split in ((32, 4), (24, 4), (32, 2), (64, 16), (256, 4), (256, 16)):
-        if split * head_size // (2 if pairs_for(partitions) else 1) // 32 > 32:
+        if not fits(partitions, split) or (arch == "gfx950" and partitions <= 64):
             continue
         single, grouped = run(partitions, 1), run(partitions, split)
         register = [seq for seq, c in enumerate(counts) if c <= min(partitions, 32)]
@@ -450,9 +492,13 @@ def test_pa_decode_merge_alignment(
         assert torch.count_nonzero(plan.arrival_counters) == 0
     last_arriver = mode == "last" and scratch_offset == 0
     assert compile_kwargs[-1]["direct_output"] == last_arriver
+    # A one-row D128 decode splits its row into 16 step-sized parts; the
+    # one-slot budget of the last-arriver plans leaves no room for them.
+    steps = mode == "cluster" and dim == 128
     assert compile_kwargs[-1]["cluster_merge"] == (
-        0 if last_arriver or mode == "reducer" else 4
+        0 if last_arriver or mode == "reducer" else 16 if steps else 4
     )
+    assert compile_kwargs[-1]["cluster_steps"] == steps
 
 
 @pytest.mark.parametrize("architecture", ["gfx942", "gfx950"])
@@ -764,7 +810,7 @@ def _short_bound_pool(*, device):
 
 
 _COMMON_CASES = [
-    ("decode", {"block_size": 16, "max_partitions": 1}),
+    ("decode", {"block_size": 16, "max_partitions": 1, "quant": "fused"}),
     (
         "window",
         {
@@ -800,10 +846,110 @@ _COMMON_CASES = [
         {
             "group_size": 16,
             "block_size": 16,
-            "lengths": (2048,) * 6 + (0, 1, 257, 2047),
+            "lengths": ((2048,) * 6 + (0, 1, 257, 2047)) * 2,
             "max_partitions": 8,
             "capture": True,
             "cluster": 8,
+            "cluster_steps": True,
+            "quant": "fused",
+        },
+    ),
+    # Batches within one 16-CTA cluster per CU split each row into 16
+    # step-sized parts whatever the cap; short rows leave parts idle.
+    (
+        "cluster16-steps",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (2048,) * 6 + (0, 1, 129, 257, 2047),
+            "max_partitions": 8,
+            "capture": True,
+            "cluster": 16,
+            "cluster_steps": True,
+            "quant": "fused",
+        },
+    ),
+    # Two KV heads split each row's steps per head and keep their partials
+    # apart.
+    (
+        "cluster16-steps-kv2",
+        {
+            "kv_heads": 2,
+            "group_size": 8,
+            "block_size": 16,
+            "lengths": (2048, 0, 129, 1000, 2047),
+            "max_partitions": 8,
+            "capture": True,
+            "cluster": 16,
+            "cluster_steps": True,
+        },
+    ),
+    # Block tables of more than 16 steps keep plan-derived tasks.
+    (
+        "cluster4-wide-table",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (1000, 0, 777, 1),
+            "table_width": 129,
+            "max_partitions": 8,
+            "cluster": 4,
+            "cluster_steps": False,
+        },
+    ),
+    # Two query tiles take 64-token steps, so these clusters keep
+    # plan-derived tasks rather than 16 step-sized parts.
+    (
+        "cluster2-gqa32",
+        {
+            "group_size": 32,
+            "block_size": 16,
+            "lengths": (512, 0, 1, 300),
+            "max_partitions": 2,
+            "cluster": 2,
+            "cluster_steps": False,
+        },
+    ),
+    # A budget beyond two CTAs per CU grows the grid past the 128-token step
+    # bounds (two CTAs per CU for BF16, four for FP8): plan-derived tasks.
+    (
+        "cluster8-wide-grid",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": ((2048,) * 4 + (0, 1, 129, 1000)) * 20,
+            "max_partitions": 8,
+            "budget": 2048,
+            "cluster": 8,
+            "cluster_steps": False,
+        },
+    ),
+    # FP8-output clusters with ragged rows (GQA 6 over 4 CTAs, D64) and with
+    # several rows per wave (GQA 32 over 2); single tasks pad an M-tile or
+    # span two.
+    (
+        "g6-d64-cluster4",
+        {
+            "group_size": 6,
+            "head_dim": 64,
+            "block_size": 16,
+            "lengths": (1024,) * 3 + (0, 1, 300),
+            "window": 600,
+            "max_partitions": 4,
+            "cluster": 4,
+            "quant": "fused",
+        },
+    ),
+    (
+        "g32-d256-page128-cluster2",
+        {
+            "group_size": 32,
+            "head_dim": 256,
+            "block_size": 128,
+            "lengths": (512,) * 3 + (0, 200),
+            "max_partitions": 2,
+            "cluster": 2,
+            "quant": "fused",
         },
     ),
     (
@@ -816,8 +962,51 @@ _COMMON_CASES = [
             "sink_dtype": torch.float32,
         },
     ),
+    # More than 240 split sequences share two-sequence clusters on gfx1250;
+    # an odd batch pads the last cluster, and empty rows still meet the barrier.
+    (
+        "cluster2-shared",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (512, 0, 300) * 81,
+            "max_partitions": 2,
+            "capture": True,
+            "cluster": 2,
+            "cluster_seqs": 2,
+            "cluster_steps": True,
+            "quant": "fallback",
+        },
+    ),
 ]
 _FP8_CASES = _COMMON_CASES + [
+    # Page128 clusters under a length bound give each CTA a fixed run of
+    # tiles: bound rows split evenly, shorter rows leave CTAs idle, and rows
+    # within one tile store directly. A nine-tile bound takes nine CTAs.
+    (
+        "cluster16-runs-page128",
+        {
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (8192, 0, 1, 129, 1000, 4097, 7777, 8191),
+            "max_partitions": 16,
+            "capture": True,
+            "cluster": 16,
+            "cluster_runs": True,
+        },
+    ),
+    (
+        "cluster16-runs-page128-kv2",
+        {
+            "kv_heads": 2,
+            "group_size": 8,
+            "block_size": 128,
+            "lengths": (2048, 300, 0, 2049),
+            "max_partitions": 16,
+            "cluster": 9,
+            "cluster_runs": True,
+        },
+    ),
     (
         "packed-mtp4",
         {
@@ -853,14 +1042,14 @@ _FP8_CASES = _COMMON_CASES + [
     ),
     (
         "default-cap",
-        {"group_size": 16, "block_size": 128, "max_partitions": None},
+        {"group_size": 16, "block_size": 128, "max_partitions": None, "quant": "fused"},
     ),
     # Four 16-row query tiles at D128 give each gfx1250 wave its own tile.
     # Varied token magnitudes make a misplaced per-token scale fail; rows past
     # one page run unmasked interior pages (two-token rows exceed FP8 P error).
     (
         "mtp4-g16-page128-direct",
-        {"query_length": 4, "group_size": 16, "block_size": 128},
+        {"query_length": 4, "group_size": 16, "block_size": 128, "quant": "fused"},
     ),
     (
         "mtp4-g16-page128-varied",
@@ -899,11 +1088,41 @@ _FP8_CASES = _COMMON_CASES + [
     # 60 rows pad the last wave's tile; GQA 8 puts two queries in each tile.
     (
         "mtp5-g12-page128",
-        {"query_length": 5, "group_size": 12, "block_size": 128, "max_partitions": 7},
+        {
+            "query_length": 5,
+            "group_size": 12,
+            "block_size": 128,
+            "max_partitions": 7,
+            "quant": "fused",
+        },
     ),
     ("mtp8-g8-page128", {"query_length": 8, "block_size": 128, "max_partitions": 7}),
 ]
 _BF16_CASES = _COMMON_CASES + [
+    # Fixed runs of tiles, as for FP8; one-CTA grids stage two pages a step.
+    (
+        "cluster16-runs-page128",
+        {
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (8192, 0, 1, 129, 1000, 4097, 7777, 8191),
+            "max_partitions": 16,
+            "capture": True,
+            "cluster": 16,
+            "cluster_runs": True,
+        },
+    ),
+    (
+        "cluster9-runs-page128-bs1",
+        {
+            "group_size": 16,
+            "block_size": 128,
+            "lengths": (2049,),
+            "max_partitions": 16,
+            "cluster": 9,
+            "cluster_runs": True,
+        },
+    ),
     (
         "mtp",
         {
@@ -924,9 +1143,35 @@ _BF16_CASES = _COMMON_CASES + [
         {
             "group_size": 16,
             "block_size": 16,
-            "lengths": (4096,) * 3 + (0, 255),
+            "lengths": ((4096,) * 3 + (0, 255)) * 4,
             "max_partitions": 16,
             "cluster": 16,
+            "cluster_steps": False,
+        },
+    ),
+    # The spilling D1024/G16/MTP4 page128 tile splits its query rows over four
+    # CTAs on gfx1250, so its FP8 output takes the standalone quant.
+    (
+        "head1024-mtp4-g16-page128",
+        {
+            "query_length": 4,
+            "group_size": 16,
+            "head_dim": 1024,
+            "block_size": 128,
+            "quant": "fallback",
+        },
+    ),
+    # Plain BF16 V takes 64-token page16 steps: plan-derived tasks.
+    (
+        "cluster2-plain-v",
+        {
+            "group_size": 16,
+            "block_size": 16,
+            "lengths": (512, 0, 1, 300),
+            "max_partitions": 2,
+            "trans_v": False,
+            "cluster": 2,
+            "cluster_steps": False,
         },
     ),
     ("head192-decode", {"group_size": 16, "head_dim": 192, "max_partitions": 4}),
@@ -953,7 +1198,7 @@ _BF16_CASES = _COMMON_CASES + [
     # one slot per sequence merges the long rows' tasks across replays.
     (
         "mtp4-g16-page128-direct",
-        {"query_length": 4, "group_size": 16, "block_size": 128},
+        {"query_length": 4, "group_size": 16, "block_size": 128, "quant": "fused"},
     ),
     (
         "mtp4-g16-page128-cluster",
@@ -963,6 +1208,7 @@ _BF16_CASES = _COMMON_CASES + [
             "group_size": 16,
             "block_size": 128,
             "max_partitions": 7,
+            "quant": "fallback",
         },
     ),
     (
@@ -975,6 +1221,7 @@ _BF16_CASES = _COMMON_CASES + [
             "max_partitions": 4,
             "budget": 1,
             "capture": True,
+            "quant": "fallback",
         },
     ),
     (
@@ -1354,7 +1601,35 @@ _INVALID_CASES = [
     ),
     ("vector16-k", ValueError, "key_cache shape must be"),
     ("vector16-v", ValueError, "transposed value_cache shape must be"),
+    ("scale-only", ValueError, "must either both be provided or both be None"),
+    ("fp8-only", ValueError, "must either both be provided or both be None"),
+    ("store-without-fp8", ValueError, "store_output=False requires quantized_output"),
+    ("negative-pad-rows", ValueError, "quantized_pad_rows must be a nonnegative int"),
+    ("bool-pad-rows", ValueError, "quantized_pad_rows must be a nonnegative int"),
+    (
+        "pad-rows-without-fp8",
+        ValueError,
+        "quantized_pad_rows requires quantized_output",
+    ),
+    ("fp8-missing-pad-row", ValueError, "quantized_output shape must be"),
+    ("bf16-quantized-output", TypeError, "quantized_output must use OCP FP8"),
+    ("rows-output-scale", ValueError, "output_scale shape"),
+    ("fp16-output-scale", TypeError, "output_scale must be float32"),
 ]
+# FP8-output arguments pa_decode refuses before any kernel compiles.
+_QUANT_ARG_ERRORS = {
+    "store-without-fp8": {"store_output": False},
+    "negative-pad-rows": {"quantized_pad_rows": -1},
+    "bool-pad-rows": {"quantized_pad_rows": True},
+    "pad-rows-without-fp8": {"quantized_pad_rows": 1},
+}
+# gfx1250 FP8-output operands (one pad row) with one wrong shape or dtype.
+_QUANT_OPERAND_ERRORS = {
+    "fp8-missing-pad-row": {"pad": 0},
+    "bf16-quantized-output": {"fp8": torch.bfloat16},
+    "rows-output-scale": {"scale_tail": ()},
+    "fp16-output-scale": {"scale": torch.float16},
+}
 _MXFP4_INVALID_CASES = [
     ("fp16-output", TypeError, "bf16 output"),
     ("fp16-query", TypeError, "e4m3 or bf16 query"),
@@ -1430,6 +1705,27 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
         key = torch.empty((1, 1, 8, 64, 16), dtype=query.dtype, device=query.device)
     elif invalid == "vector16-v":
         value = torch.empty((1, 1, 4, 128, 16), dtype=query.dtype, device=query.device)
+    elif invalid == "scale-only":
+        options["output_scale"] = torch.ones(query.shape[0], 1, device=query.device)
+    elif invalid == "fp8-only":
+        options["quantized_output"] = torch.empty_like(query, dtype=dtypes.fp8)
+    elif invalid in _QUANT_ARG_ERRORS:
+        options.update(_QUANT_ARG_ERRORS[invalid])
+    elif invalid in _QUANT_OPERAND_ERRORS:
+        bad, rows = _QUANT_OPERAND_ERRORS[invalid], query.shape[0]
+        options.update(
+            quantized_pad_rows=1,
+            quantized_output=torch.empty(
+                (rows + bad.get("pad", 1), *query.shape[1:]),
+                dtype=bad.get("fp8", dtypes.fp8),
+                device=query.device,
+            ),
+            output_scale=torch.empty(
+                (rows + 1, *bad.get("scale_tail", (1,))),
+                dtype=bad.get("scale", torch.float32),
+                device=query.device,
+            ),
+        )
 
     def unexpected_compile(**_):
         pytest.fail("invalid BF16 inputs reached kernel compilation")
@@ -1591,82 +1887,114 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
     if case["cluster"] is not None:
         expected = case["cluster"] if arch == "gfx1250" else 0
         assert compile_kwargs[-1]["cluster_merge"] == expected
+    if case["cluster_seqs"] is not None and arch == "gfx1250":
+        assert compile_kwargs[-1]["cluster_seqs"] == case["cluster_seqs"]
+    if case["cluster_steps"] is not None and arch == "gfx1250":
+        assert compile_kwargs[-1]["cluster_steps"] == case["cluster_steps"]
+    if case["cluster_runs"] is not None and arch == "gfx1250":
+        assert compile_kwargs[-1]["cluster_runs"] == case["cluster_runs"]
     if case["pipe"]:
         # The cache key ends with (D256_PIPE, staged page ids).
         schedule_kwargs = dict(compile_kwargs[-1])
         schedule_kwargs.pop("architecture", None)
         schedule_kwargs.pop("direct_output", None)
         schedule_kwargs.pop("cluster_merge", None)
-        pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-3:-1]
+        schedule_kwargs.pop("cluster_seqs", None)
+        schedule_kwargs.pop("cluster_steps", None)
+        schedule_kwargs.pop("cluster_runs", None)
+        pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
             assert (staged > 0) == (case["staged"] is not False)
 
 
-@pytest.mark.parametrize(
-    "case",
-    [
-        *[
-            pytest.param(
-                dict(
-                    geometry,
-                    kv_dtype="fp8",
-                    query_dtype=dtype,
-                    scale_mode=scale_mode,
-                    trans_v=trans_v,
-                ),
-                id=f"fp8-{dtype}-{scale_mode}-{'transposed' if trans_v else 'plain'}-v-{name}",
-            )
-            for name, geometry in _FP8_CASES
-            for dtype, scale_mode, trans_v in product(
-                (torch.bfloat16, torch.float16),
-                ("per-tensor", "per-token"),
-                (False, True),
-            )
-        ],
-        *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
-        *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
-        *[pytest.param(geometry, id=name) for name, geometry in _MXFP4_CASES],
-        *[
-            pytest.param(
-                {
-                    "invalid_input": invalid,
-                    "error": error,
-                    "match": match,
-                    "lengths": (1,),
-                },
-                id=f"invalid-bf16-{invalid}",
-            )
-            for invalid, error, match in _INVALID_CASES
-        ],
-        *[
-            pytest.param(
-                {
-                    "invalid_input": invalid,
-                    "invalid_kind": "mxfp4",
-                    "kv_dtype": "mxfp4",
-                    "error": error,
-                    "match": match,
-                },
-                id=f"invalid-mxfp4-{invalid}",
-            )
-            for invalid, error, match in _MXFP4_INVALID_CASES
-        ],
-        *[
-            pytest.param(
-                {
-                    "invalid_input": invalid,
-                    "invalid_kind": "select",
-                    "error": error,
-                    "match": match,
-                },
-                id=f"invalid-select-{invalid}",
-            )
-            for invalid, error, match in _SELECT_INVALID_CASES
-        ],
+_PA_DECODE_CASES = [
+    *[
+        pytest.param(
+            dict(
+                geometry,
+                kv_dtype="fp8",
+                query_dtype=dtype,
+                scale_mode=scale_mode,
+                trans_v=trans_v,
+            ),
+            id=f"fp8-{dtype}-{scale_mode}-{'transposed' if trans_v else 'plain'}-v-{name}",
+        )
+        for name, geometry in _FP8_CASES
+        for dtype, scale_mode, trans_v in product(
+            (torch.bfloat16, torch.float16),
+            ("per-tensor", "per-token"),
+            (False, True),
+        )
     ],
-)
+    *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
+    *[pytest.param(geometry, id=name) for name, geometry in _PIPE_CASES],
+    *[pytest.param(geometry, id=name) for name, geometry in _MXFP4_CASES],
+    *[
+        pytest.param(
+            {
+                "invalid_input": invalid,
+                "error": error,
+                "match": match,
+                "lengths": (1,),
+            },
+            id=f"invalid-bf16-{invalid}",
+        )
+        for invalid, error, match in _INVALID_CASES
+    ],
+    *[
+        pytest.param(
+            {
+                "invalid_input": invalid,
+                "invalid_kind": "mxfp4",
+                "kv_dtype": "mxfp4",
+                "error": error,
+                "match": match,
+            },
+            id=f"invalid-mxfp4-{invalid}",
+        )
+        for invalid, error, match in _MXFP4_INVALID_CASES
+    ],
+    *[
+        pytest.param(
+            {
+                "invalid_input": invalid,
+                "invalid_kind": "select",
+                "error": error,
+                "match": match,
+            },
+            id=f"invalid-select-{invalid}",
+        )
+        for invalid, error, match in _SELECT_INVALID_CASES
+    ],
+]
+
+
+@pytest.mark.parametrize("case", _PA_DECODE_CASES)
 def test_pa_decode(case, device, monkeypatch):
+    """FP8/BF16/MXFP4 decode shares input, reference, planning and replay checks."""
+    _run_pa_decode_case(case, device, monkeypatch)
+
+
+def test_pa_decode_quant_empty_long_query(device, monkeypatch):
+    """An empty sequence writes every descale of a query longer than a CTA."""
+    if get_gfx_runtime() != "gfx1250":
+        pytest.skip("the fused FP8 output runs on gfx1250")
+    _run_pa_decode_case(
+        {
+            "query_length": 129,
+            "group_size": 1,
+            "head_dim": 256,
+            "block_size": 16,
+            "lengths": (129, 0),
+            "quant": "fused",
+        },
+        device,
+        monkeypatch,
+    )
+
+
+def _run_pa_decode_case(case, device, monkeypatch):
     """FP8/BF16/MXFP4 decode shares input, reference, planning and replay checks.
 
     A case with ``invalid_input`` is an input the wrapper must refuse before any
@@ -1703,6 +2031,10 @@ def test_pa_decode(case, device, monkeypatch):
             "ref_mean_min": None,
             "variants": False,
             "cluster": None,
+            "cluster_seqs": None,
+            "cluster_steps": None,
+            "cluster_runs": None,
+            "quant": None,  # gfx1250 FP8 output path: "fused" or "fallback"
         },
         **case,
     )
@@ -1716,10 +2048,19 @@ def test_pa_decode(case, device, monkeypatch):
         and "invalid_input" not in case
     ):
         pytest.skip("BF16 KV requires bfloat16 queries on gfx942/gfx950")
+    if (
+        arch != "gfx1250"
+        and case["kv_dtype"] == "bf16"
+        and not case["trans_v"]
+        and "invalid_input" not in case
+    ):
+        pytest.skip("BF16 KV requires packed V caches on gfx942/gfx950")
     num_cu = torch.cuda.get_device_properties(device).multi_processor_count
     if case["max_partitions"] is not None and case["max_partitions"] > num_cu:
         pytest.skip(f"plan_pa_decode caps max_partitions at {num_cu} CUs")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    if arch != "gfx1250" and case.get("invalid_input") in _QUANT_OPERAND_ERRORS:
+        pytest.skip("quantized PA output requires gfx1250")
     if get_gfx_runtime() == "gfx1250":
         if case["invalid_kind"] == "bf16" and case.get("invalid_input") in (
             "fp16-query",
@@ -1897,13 +2238,14 @@ def test_pa_decode(case, device, monkeypatch):
             ),
         }
 
-    def launch():
+    def launch(**quant):
         pa.pa_decode(
             output,
             *arguments,
             work_plan=None if case["plan_free"] else plan,
             **options,
             **workspace,
+            **quant,
         )
 
     def check(out=None):
@@ -1984,6 +2326,14 @@ def test_pa_decode(case, device, monkeypatch):
         assert (padded[:, query.shape[1] :] == 7.0).all()
     if case["kv_dtype"] != "mxfp4":
         _check_pipe_policy(pa, case, arch, compile_kwargs)
+    if case["quant"] and arch == "gfx1250":
+        _check_quant_output(launch, query, output, compile_kwargs, case)
+    elif case["quant"]:
+        with pytest.raises(NotImplementedError, match="requires gfx1250"):
+            launch(
+                quantized_output=torch.empty_like(output, dtype=dtypes.fp8),
+                output_scale=torch.empty(output.shape[0], 1, device=device),
+            )
     if case["capture"]:
         # Compile/allocate before capture; replay must observe changed query data.
         capture_stream = torch.cuda.Stream()
@@ -1999,6 +2349,66 @@ def test_pa_decode(case, device, monkeypatch):
             output.fill_(float("nan"))
             graph.replay()
             check()
+
+    # Reuse the validated inputs after restoring the test compilation spy.
+    return case, launch, check, arguments, options, plan
+
+
+def _check_quant_output(launch, query, output, compile_kwargs, case, pad=3):
+    """The FP8 output equals PA's output and the standalone per-token quant bit
+    for bit, eagerly and in graph replays; poisoned outputs show every row is
+    written, padded rows included. ``case["quant"]`` pins the path: "fused"
+    quantizes in the tile epilogue, "fallback" runs the standalone quant after
+    the BF16 output, so a plan that silently stops fusing fails here.
+    """
+    fused = case["quant"] == "fused"
+    rows = output.shape[0]
+    fp8 = torch.empty(
+        (rows + pad, *output.shape[1:]), dtype=dtypes.fp8, device=output.device
+    )
+    scale = torch.empty(rows + pad, 1, device=output.device)
+
+    def run(store_output):
+        output.fill_(float("nan"))
+        fp8.view(torch.uint8).fill_(0x7F)
+        scale.fill_(float("nan"))
+        launch(
+            quantized_output=fp8,
+            output_scale=scale,
+            store_output=store_output,
+            quantized_pad_rows=pad,
+        )
+
+    def check(store_output):
+        stored = output.clone()
+        launch()
+        ref_fp8, ref_scale = torch.empty_like(fp8[:rows]), torch.empty_like(
+            scale[:rows]
+        )
+        dynamic_per_token_scaled_quant(
+            ref_fp8.view(rows, -1), output.view(rows, -1), ref_scale
+        )
+        assert torch.equal(stored, output) if store_output else stored.isnan().all()
+        assert torch.equal(fp8[:rows].view(torch.uint8), ref_fp8.view(torch.uint8))
+        assert torch.equal(scale[:rows], ref_scale)
+        assert (fp8[rows:].view(torch.uint8) == 0).all() and (scale[rows:] == 1).all()
+
+    for store_output in (True, False):
+        run(store_output)
+        assert compile_kwargs[-1].get("quant_output", False) == fused
+        check(store_output)
+    if case["capture"]:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run(False)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            run(False)
+        query.neg_()
+        graph.replay()
+        check(False)
 
 
 def _poison_unowned(cache, scale, owned, fill):
@@ -3457,12 +3867,12 @@ def _branch_check_pipe_policy(pa, case, arch, compile_kwargs):
     if not case["branch_checks"]:
         assert compile_kwargs[-1]["wide_kv_addressing"] == case["wide"]
     if case["pipe"]:
-        # The cache key ends with (D256_PIPE, staged page ids, output dtype).
+        # The cache key ends with (D256_PIPE, staged page ids).
         schedule_kwargs = dict(compile_kwargs[-1])
         schedule_kwargs.pop("architecture", None)
         schedule_kwargs.pop("direct_output", None)
         schedule_kwargs.pop("cluster_merge", None)
-        pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-3:-1]
+        pipe, staged = PaDecodeSchedule.select(**schedule_kwargs).cache_key[-2:]
         assert pipe == (arch == "gfx950")
         if pipe:
             assert (staged > 0) == (case["staged"] is not False)
