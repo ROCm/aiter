@@ -8,6 +8,11 @@ run that cannot start. This workflow is the one watcher outside the runs it watc
 pages by failing its own job: a failed scheduled run notifies the workflow author, with zero
 write permissions and no bot token anywhere in the file.
 
+A `queued` run is not itself the verdict: a request past its gate reads `queued` too while
+it waits for the single box. The gate job's state tells them apart -- past its gate, the
+request is the box's queue and the in-run watchdog's to watch; short of it, nothing in the
+run can ever start, which is the silence this watcher exists to break.
+
 Exactly once per stuck request, with no state to keep: the cron fires every WINDOW_MINUTES
 and a request pages only while its age is inside [STUCK_MINUTES, STUCK_MINUTES +
 WINDOW_MINUTES) -- one poll wide. A late or skipped poll can miss a window entirely; that is
@@ -37,10 +42,11 @@ def _age_minutes(created_at, now):
 
 
 def queued_runs(api, repo):
-    """Every run of the review workflow still sitting at run-level `queued`, not just the
-    first page. A run reads `queued` only until its gate job starts, so this is the set of
-    real review requests no hosted runner has picked up yet -- and the API returns the newest
-    first, so under a burst the run stuck longest is on the last page."""
+    """Every run of the review workflow the API still reports `queued`, not just the first
+    page. `queued` is ambiguous -- a request past its gate reads `queued` too while its
+    review waits for the single box -- so the caller tells the two apart by each run's gate
+    job. The API returns the newest first, so under a burst the run stuck longest is on the
+    last page."""
     out, page = [], 1
     while True:
         batch = api._get("/repos/%s/actions/workflows/%s/runs?status=queued&per_page=%d&page=%d"
@@ -55,14 +61,26 @@ def run(api, env, now):
     repo = env["GITHUB_REPOSITORY"]
     try:
         queued = queued_runs(api, repo)
+        stuck = []
+        for r in queued:
+            age = _age_minutes(r["created_at"], now)
+            if not STUCK_MINUTES <= age < STUCK_MINUTES + WINDOW_MINUTES:
+                continue
+            # `queued` alone cannot tell a starved gate from a request past its gate and
+            # waiting for the single box -- the API reports both as `queued`. The gate
+            # job's state can: past its gate, the request is the box's queue and the
+            # in-run watchdog's to watch; short of it, nothing in the run can ever start.
+            jobs = api.jobs(repo, r["id"])
+            gate = next((j for j in jobs if j["name"] == "gate"), None)
+            if gate is not None and gate["status"] == "completed":
+                continue
+            stuck.append((r, age))
     except Exception as e:                              # noqa: BLE001 - the watcher itself broke
         return failed("cannot read the queued runs: %s: %s" % (type(e).__name__, e))
-    aged = [(r, _age_minutes(r["created_at"], now)) for r in queued]
-    stuck = [(r, a) for r, a in aged if STUCK_MINUTES <= a < STUCK_MINUTES + WINDOW_MINUTES]
     if not stuck:
-        if aged:
+        if queued:
             notice("%d run(s) queued, oldest %.0f min -- nothing newly stuck"
-                   % (len(aged), max(a for _, a in aged)))
+                   % (len(queued), max(_age_minutes(r["created_at"], now) for r in queued)))
         return 0
     owner = (env.get("OWNER_OVERRIDE") or "").strip() or "zufayu"
     msg = ("%d review request(s) have waited up to %.0f min for a hosted runner -- the gate "
