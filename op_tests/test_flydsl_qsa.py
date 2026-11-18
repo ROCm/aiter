@@ -15,12 +15,14 @@ import torch.nn.functional as F
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.flydsl import qsa_paged
 from aiter.ops.flydsl.qsa_paged import (
     flydsl_qsa_paged_gqa,
     flydsl_qsa_paged_gqa_supported,
     qsa_indexer_block_ids,
+    qsa_indexer_select,
+    qsa_indexer_select_supported,
     span_bytes,
 )
 from aiter.ops.qsa import qsa_expand_block_indices
@@ -2329,6 +2331,378 @@ def _raise_if_paged_gqa_above_tolerance(err, m, seq_len):
         )
 
 
+# Max |fp32 - fp64| on the seeded 8K, 32K, and padded-prefix rescores.
+# Twice this is the oracle-vs-fp64 tie window. The kernel-vs-oracle window
+# is this value itself.
+_FP32_TIE_BOUND = 1.7e-6
+_SELECT_PAGE = 392
+_SELECT_PAD_PAGES = 168
+_SELECT_CASES = (
+    "pad",
+    "missing",
+    "wide",
+    "span",
+    "mixed",
+    "mtp",
+    "emit",
+    "workspace",
+)
+
+
+def _fp64_indexer_scores(q, k_bar, qpos, slen, token_to_req, compress, scale):
+    """The oracle's score, accumulated in fp64, with the same visibility mask."""
+    dots = torch.einsum("mhd,nd->mhn", q.double(), k_bar.double())
+    scores = F.relu(dots).sum(dim=1) * float(scale)
+    visible = qsa_visible_blocks(qpos, slen, token_to_req, compress)
+    cols = torch.arange(scores.shape[1], device=scores.device)
+    visible_cols = cols.unsqueeze(0) < visible.unsqueeze(1)
+    return scores.masked_fill(~visible_cols, float("-inf")), visible_cols
+
+
+def _kth_score(scores: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    """Smallest finite selected score per row, the 512th when the row is full."""
+    valid = ids >= 0
+    gathered = scores.gather(1, ids.clamp(min=0).to(torch.int64))
+    gathered = gathered.masked_fill(~valid, float("inf"))
+    return gathered.min(dim=1).values
+
+
+def _tie_mismatch(ref, got, scores, window: float) -> float:
+    """Rows whose block sets differ by more than ``window`` around the 512th score."""
+    if ref.shape[0] == 0:
+        return 0.0
+    kth = _kth_score(scores, ref)
+    rows = ref.shape[0]
+    width = scores.shape[1]
+    ref_mark = torch.zeros(rows, width, dtype=torch.bool, device=scores.device)
+    got_mark = torch.zeros(rows, width, dtype=torch.bool, device=scores.device)
+    row_idx = torch.arange(rows, device=scores.device).unsqueeze(1)
+    ref_ok = (ref >= 0) & (ref < width)
+    got_ok = (got >= 0) & (got < width)
+    ref_mark[row_idx.expand_as(ref)[ref_ok], ref[ref_ok]] = True
+    got_mark[row_idx.expand_as(got)[got_ok], got[got_ok]] = True
+    diff = ref_mark ^ got_mark
+    near = (scores - kth.unsqueeze(1)).abs() <= window
+    far = diff & ~near
+    count_bad = ref_ok.sum(dim=1) != got_ok.sum(dim=1)
+    bad = far.any(dim=1) | count_bad | ~torch.isfinite(kth)
+    return float(bad.sum().item()) / rows
+
+
+def _block_agreement(ref: torch.Tensor, got: torch.Tensor) -> float:
+    """Fraction of the reference's selected blocks that ``got`` also selected."""
+    rows, width = ref.shape[0], int(ref.max().item()) + 1 if ref.numel() else 0
+    if rows == 0:
+        return 1.0
+    width = max(width, int(got.max().item()) + 1 if got.numel() else 0, 1)
+    ref_ok = ref >= 0
+    total = int(ref_ok.sum().item())
+    if total == 0:
+        return 1.0
+    ref_mark = torch.zeros(rows, width, dtype=torch.bool, device=ref.device)
+    got_mark = torch.zeros(rows, width, dtype=torch.bool, device=got.device)
+    row_idx = torch.arange(rows, device=ref.device).unsqueeze(1)
+    ref_mark[row_idx.expand_as(ref)[ref_ok], ref[ref_ok]] = True
+    got_ok = (got >= 0) & (got < width)
+    got_mark[row_idx.expand_as(got)[got_ok], got[got_ok]] = True
+    return float((ref_mark & got_mark).sum().item()) / total
+
+
+def _select_request(rows, context, seed, device):
+    """One request's tail rows, compressed K, and its page-392 cache."""
+    idx = FLASH_NEXT_INDEXER
+    torch.manual_seed(seed)
+    q = torch.randn(rows, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+    n_blocks = context // idx.compress_ratio
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed + 1000)
+    cache, table = pack_paged_cache(k_bar.unsqueeze(1), _SELECT_PAGE, generator=gen)
+    qpos = _query_positions(rows, context, device)
+    return q, k_bar, cache, table[0], qpos
+
+
+def _select_case(case: str):
+    """Acceptance-geometry tensors for one set-gate case.
+
+    Page size is 392. ``pad`` and ``workspace`` widen the table to 168 pages.
+    ``wide`` is a strided view past 4 GiB. ``emit`` is one page, so the
+    column count stays under 512 and the emit path runs.
+    """
+    device = torch.device("cuda")
+    idx = FLASH_NEXT_INDEXER
+    context = 1568 if case == "emit" else 8192
+    if case == "span":
+        parts = [_select_request(8, context, seed, device) for seed in (1, 2)]
+        decode_rows = 0
+    elif case == "mtp":
+        parts = [_select_request(4, context, seed, device) for seed in (3, 4)]
+        decode_rows = 0
+    elif case == "mixed":
+        parts = [_select_request(1, context, seed, device) for seed in range(4)]
+        parts.append(_select_request(12, context, 8, device))
+        decode_rows = 4
+    else:
+        rows = 32 if case in ("pad", "workspace") else 16
+        parts = [_select_request(rows, context, 5, device)]
+        decode_rows = 0
+    q = torch.cat([part[0] for part in parts]).contiguous()
+    caches = [part[2] for part in parts]
+    base = 0
+    tables = []
+    for cache, part in zip(caches, parts):
+        tables.append(part[3] + base)
+        base += int(cache.shape[0])
+    cache = torch.cat(caches)
+    width = (
+        _SELECT_PAD_PAGES
+        if case in ("pad", "workspace")
+        else max(int(table.numel()) for table in tables)
+    )
+    page_table = torch.zeros(len(parts), width, dtype=dtypes.i32, device=device)
+    for req, physical in enumerate(tables):
+        page_table[req, : physical.numel()] = physical
+    if case == "missing":
+        page_table = page_table.clone()
+        page_table[0, 1] = -1
+    if case == "wide":
+        cache = _widen_cache(cache)
+    qpos = torch.cat([part[4] for part in parts])
+    token_to_req = torch.cat(
+        [
+            torch.full((part[0].shape[0],), req, dtype=dtypes.i32, device=device)
+            for req, part in enumerate(parts)
+        ]
+    )
+    slen = torch.full((len(parts),), context, dtype=dtypes.i32, device=device)
+    score_rows = []
+    for req, part in enumerate(parts):
+        rows = part[0].shape[0]
+        one = torch.zeros(rows, dtype=dtypes.i32, device=device)
+        one_len = torch.tensor([context], dtype=dtypes.i32, device=device)
+        scores = _indexer_scores(idx, part[0], part[1], part[4], one_len, one)
+        if case == "missing" and req == 0:
+            block0 = _SELECT_PAGE
+            scores[:, block0 : block0 + _SELECT_PAGE] = float("-inf")
+        score_rows.append(scores)
+    ref_scores = torch.cat(score_rows, dim=0)
+    if case in ("pad", "workspace"):
+        pad_cols = width * _SELECT_PAGE - ref_scores.shape[1]
+        if pad_cols < 0:
+            raise RuntimeError("padded table is narrower than the live blocks")
+        ref_scores = F.pad(ref_scores, (0, pad_cols), value=float("-inf"))
+    ref_blocks = qsa_topk_blocks(ref_scores, idx.block_budget)
+    return {
+        "q": q,
+        "cache": cache,
+        "page_table": page_table,
+        "token_to_req": token_to_req,
+        "qpos": qpos,
+        "slen": slen,
+        "scores": ref_scores,
+        "blocks": ref_blocks,
+        "decode_rows": decode_rows,
+        "context": context,
+        "live_blocks": context // idx.compress_ratio,
+    }
+
+
+def _oracle_rescore(case: str, rows: int, context: int) -> dict:
+    """fp32 oracle against an fp64 rescore. Returns the tie-gate numbers."""
+    idx = FLASH_NEXT_INDEXER
+    device = torch.device("cuda")
+    q, k_bar, qpos, slen, token_to_req = _indexer_inputs(
+        idx, rows, context, dtypes.bf16, device
+    )
+    fp32 = qsa_indexer_scores(
+        q,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
+    )
+    fp64, visible = _fp64_indexer_scores(
+        q,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        FLASH_NEXT_SCORE_SCALE,
+    )
+    err = (fp32.double() - fp64).abs()
+    err = err.masked_fill(~visible, 0)
+    bound = float(err.max())
+    top32 = qsa_topk_blocks(fp32, idx.block_budget)
+    top64 = qsa_topk_blocks(fp64, idx.block_budget)
+    if case == "pad":
+        pad_cols = _SELECT_PAD_PAGES * _SELECT_PAGE - fp64.shape[1]
+        padded = F.pad(fp64, (0, pad_cols), value=float("-inf"))
+        top_pad = qsa_topk_blocks(padded, idx.block_budget)
+        if not torch.equal(top_pad, top64):
+            raise AssertionError("padding the score row changed the fp64 top-512")
+    agreement = _block_agreement(top64, top32)
+    mismatch = _tie_mismatch(top64, top32, fp64, 2 * _FP32_TIE_BOUND)
+    return {
+        "bound": bound,
+        "agreement": agreement,
+        "mismatch": mismatch,
+        "rows": rows,
+        "cols": int(fp32.shape[1]),
+    }
+
+
+@benchmark()
+def test_qsa_oracle_fp64(case, rows, context):
+    """fp32 oracle scores against the fp64 rescore of the same bf16 inputs."""
+    got = _oracle_rescore(case, rows, context)
+    if got["bound"] > _FP32_TIE_BOUND:
+        raise AssertionError(
+            f"{case}: fp32/fp64 score gap {got['bound']:.3e} "
+            f"exceeds {_FP32_TIE_BOUND:.3e}"
+        )
+    if got["agreement"] < 0.999:
+        raise AssertionError(f"{case}: fp64 block agreement {got['agreement']:.6f}")
+    err = checkAllclose(
+        torch.zeros(1),
+        torch.tensor([got["mismatch"]]),
+        rtol=0,
+        atol=0,
+        msg=f"oracle fp64 {case}",
+    )
+    assert err == 0, f"{case}: tie mismatch {got['mismatch']:.2%}"
+    return {
+        "gfx": get_gfx_runtime(),
+        "fp64 bound": got["bound"],
+        "agreement": got["agreement"],
+        "oracle err": err,
+    }
+
+
+def _launch_select(built, block_ids, token_ids, workspace):
+    return qsa_indexer_select(
+        built["q"],
+        built["cache"],
+        built["page_table"],
+        built["token_to_req"],
+        built["qpos"],
+        built["slen"],
+        num_decode_rows=built["decode_rows"],
+        max_seq_len=built["context"],
+        block_ids=block_ids,
+        token_ids=token_ids,
+        workspace=workspace,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
+    )
+
+
+@benchmark()
+def test_qsa_indexer_select(case):
+    """Set-gate ``qsa_indexer_select`` against the fp32 oracle on one geometry."""
+    built = _select_case(case)
+    rows = built["q"].shape[0]
+    n_columns = int(built["page_table"].shape[1]) * _SELECT_PAGE
+    block_ids = torch.full((rows, 512), 2**31 - 1, dtype=dtypes.i32, device="cuda")
+    token_ids = torch.full(
+        (rows, FLASH_NEXT_INDEXER.index_width),
+        2**31 - 1,
+        dtype=dtypes.i32,
+        device="cuda",
+    )
+    workspace = torch.empty(rows, n_columns, dtype=torch.float32, device="cuda")
+    if case == "workspace":
+        workspace.fill_(float("nan"))
+        _launch_select(built, block_ids, token_ids, workspace)
+        first = token_ids.clone()
+        workspace.fill_(12345.0)
+        block_ids.fill_(2**31 - 1)
+        token_ids.fill_(2**31 - 1)
+        _launch_select(built, block_ids, token_ids, workspace)
+        if not torch.equal(first, token_ids):
+            raise AssertionError("workspace contents changed the token ids")
+    else:
+        workspace.fill_(float("nan"))
+    token_ids, us = run_perftest(
+        _launch_select,
+        built,
+        block_ids,
+        token_ids,
+        workspace,
+        num_iters=10,
+        num_warmup=2,
+    )
+    for i in range(rows):
+        reason = _indexer_row_is_packed(block_ids[i])
+        if reason is not None:
+            raise AssertionError(f"{case}: row {i} {reason}")
+    mismatch = _tie_mismatch(
+        built["blocks"], block_ids, built["scores"], _FP32_TIE_BOUND
+    )
+    err = checkAllclose(
+        torch.zeros(1),
+        torch.tensor([mismatch]),
+        rtol=0,
+        atol=0,
+        msg=f"qsa_indexer_select {case}",
+    )
+    assert err == 0, f"{case}: set mismatch {mismatch:.2%}"
+    expanded = qsa_expand_tail(
+        block_ids,
+        built["qpos"],
+        built["slen"],
+        built["token_to_req"],
+        FLASH_NEXT_INDEXER.compress_ratio,
+        FLASH_NEXT_INDEXER.token_budget,
+    )
+    if not torch.equal(token_ids, expanded):
+        raise AssertionError(f"{case}: token ids are not the expanded blocks")
+    visible = built["live_blocks"]
+    flops = 2 * rows * 4 * 128 * visible
+    if case == "emit":
+        flops = 0
+    live_pages = (visible + _SELECT_PAGE - 1) // _SELECT_PAGE
+    nbytes = (
+        built["q"].numel() * built["q"].element_size()
+        + live_pages * _SELECT_PAGE * 128 * 2
+        + token_ids.numel() * token_ids.element_size()
+    )
+    return {
+        "gfx": get_gfx_runtime(),
+        "rows": rows,
+        "columns": n_columns,
+        "select us": us,
+        "select TFLOPS": flops / us / 1e6 if us else 0.0,
+        "select TB/s": nbytes / us / 1e6 if us else 0.0,
+        "select err": err,
+    }
+
+
+def run_qsa_indexer_select_oracle():
+    """fp64 rescore of the oracle on the 8K, 32K, and padded-prefix cases."""
+    rows = []
+    for case, n_rows, context in (
+        ("8k", 256, 8192),
+        ("32k", 128, 32768),
+        ("pad", 128, 8192),
+    ):
+        rows.append(test_qsa_oracle_fp64(case, n_rows, context))
+    _summarize("QSA indexer oracle fp64 rescore", rows)
+
+
+def run_qsa_indexer_select_gate():
+    """Set-gate the fused entry. Skip on an arch where that entry is off."""
+    reason = qsa_indexer_select_supported()
+    if reason is not None:
+        aiter.logger.warning("qsa_indexer_select skipped: %s", reason)
+        return
+    if not _enough_memory(5 << 30, "indexer select wide cache"):
+        raise RuntimeError("wide indexer cache does not fit")
+    rows = [test_qsa_indexer_select(case) for case in _SELECT_CASES]
+    _summarize("QSA indexer select set gate", rows)
+
+
 def _summarize(name, rows):
     """Log one sweep table."""
     if not rows:
@@ -2463,6 +2837,8 @@ def main():
 
     check_qsa_rejections()
     check_qsa_edges()
+    run_qsa_indexer_select_oracle()
+    run_qsa_indexer_select_gate()
 
     for dtype in args.dtype:
         decode_m, prefill_m = _indexer_paged_gqa_sweep_batches(args.batch)

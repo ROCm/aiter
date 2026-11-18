@@ -144,6 +144,8 @@ _MEASURED_GQA_QUERIES = frozenset(
 __all__ = [
     "flydsl_qsa_paged_gqa",
     "qsa_indexer_block_ids",
+    "qsa_indexer_select",
+    "qsa_indexer_select_supported",
     "span_bytes",
 ]
 
@@ -912,6 +914,102 @@ def qsa_indexer_block_ids(
         scores,
         m,
         arch,
+    )
+
+
+def qsa_indexer_select_supported() -> str | None:
+    """Why ``qsa_indexer_select`` does not run on this GPU, or None.
+
+    gfx950 is the acceptance device. gfx942 keeps today's indexer until a
+    fused shape wins there, so this entry stays gated off on gfx942.
+    """
+    arch, reason = _qsa_support_arch()
+    if reason is not None:
+        return reason
+    if arch is None:
+        return "fused indexer select needs a GPU"
+    if arch != "gfx950":
+        return f"fused indexer select is gated off on {arch}"
+    return None
+
+
+def qsa_indexer_select(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    *,
+    num_decode_rows: int,
+    max_seq_len: int,
+    block_ids: torch.Tensor | None = None,
+    token_ids: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
+    score_scale: float = _SCORE_SCALE,
+) -> torch.Tensor:
+    """Select compressed blocks and expand them to token ids.
+
+    ``q`` is bf16 ``[M, 4, 128]``. ``workspace``, when passed, is the fp32
+    score buffer ``[M, page_table_width * page_size]`` and is not cleared.
+    The call overwrites the columns it scores. ``block_ids`` and
+    ``token_ids`` are the optional caller-owned outputs. ``num_decode_rows``
+    counts the decode rows at the front of ``q``. ``max_seq_len`` is the
+    step's longest context.
+    """
+    # Local import: aiter.ops.qsa imports this module.
+    from aiter.ops.qsa import qsa_expand_block_indices
+
+    reason = qsa_indexer_select_supported()
+    if reason is not None:
+        raise ValueError(f"[FlyDSL qsa_indexer_select] {reason}")
+    if q.dim() != 3 or int(q.shape[1]) != _H:
+        raise ValueError(f"q must be [M, {_H}, {_D}], got {tuple(q.shape)}")
+    rows = int(q.shape[0])
+    if type(num_decode_rows) is not int:
+        raise TypeError(f"num_decode_rows must be an int, got {num_decode_rows!r}")
+    if num_decode_rows < 0 or num_decode_rows > rows:
+        raise ValueError(f"num_decode_rows must be in 0..{rows}, got {num_decode_rows}")
+    if type(max_seq_len) is not int:
+        raise TypeError(f"max_seq_len must be an int, got {max_seq_len!r}")
+    if max_seq_len < 1:
+        raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
+    n_columns = int(page_table.shape[1]) * int(k_cache.shape[1])
+    scores = None
+    if workspace is not None:
+        if (
+            workspace.dtype != torch.float32
+            or workspace.dim() != 2
+            or int(workspace.shape[0]) < rows
+            or int(workspace.shape[1]) != n_columns
+            or workspace.stride(-1) != 1
+        ):
+            raise ValueError(
+                f"workspace must be float32 [>= {rows}, {n_columns}] "
+                f"with a unit column stride, got {workspace.dtype} "
+                f"{tuple(workspace.shape)} stride {tuple(workspace.stride())}"
+            )
+        scores = workspace[:rows]
+    block_ids = qsa_indexer_block_ids(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        context_lens,
+        out=block_ids,
+        score_scale=score_scale,
+        heads=(_H,),
+        scores=scores,
+    )
+    return qsa_expand_block_indices(
+        block_ids,
+        query_positions,
+        context_lens,
+        token_to_req,
+        _R,
+        _K * _R,
+        token_ids,
     )
 
 
