@@ -6,6 +6,7 @@ from .fmoe_tp_sdma import (
     TpAsmContext,
     TpMoeCall,
     TpMoeOut,
+    prepare_downstream_mx_inputs,
     quantize_moe_input,
     tp_moe_layer_asm,
 )
@@ -15,6 +16,7 @@ __all__ = [
     "TpAsmContext",
     "TpMoeCall",
     "TpMoeOut",
+    "prepare_downstream_mx_inputs",
     "quantize_moe_input",
     "tp_moe_layer_asm",
 ]

@@ -40,9 +40,7 @@ _LAZY_IMPORTS = {
         "KERNEL_VARIANTS",
     ),
     "FlyQuickAllReduce": (".quick_allreduce", "FlyQuickAllReduce"),
-    # Old name of FlyQuickAllReduce, kept for vLLM's _aiter_ops.py. Remove it
-    # once vLLM imports FlyQuickAllReduce.
-    "QuickAllReduceInt4": (".quick_allreduce", "FlyQuickAllReduce"),
+    "QuickAllReduceInt4": (".quick_allreduce", "QuickAllReduceInt4"),
     "OneShotAllReduce": (".one_shot_allreduce", "OneShotAllReduce"),
     "DenseGemmConfig": (".gemm_a16wfp4", "DenseGemmConfig"),
     "PreshuffledA16WFP4Weight": (

@@ -505,11 +505,32 @@ def tp_moe_layer_asm(
     return TpMoeOut(out, res_u if is_add else res_o, out_scale)
 
 
+def prepare_downstream_mx_inputs(
+    out_q: Tensor, out_scale: Tensor, a_dtype: str = "fp4"
+) -> tuple[Tensor, Tensor]:
+    """Prepare ``tp_moe_layer_asm`` quantized epilogue outputs for AITER dense MX GEMMs.
+
+    - ``a_dtype == "fp4"``: ``gemm_a4w4`` on gfx950 consumes ``mfma_tile`` (32x8)
+      preshuffled ``e8m0`` scales, so ``out_scale`` is shuffled via
+      ``fp4_utils.e8m0_shuffle``.
+    - ``a_dtype == "fp8"``: ``gemm_a8w8_mxfp8_bpreshuffle`` on gfx950 consumes
+      plain row-major ``[T, D // 32]`` ``e8m0`` scales directly with zero copy.
+    """
+    if a_dtype == "fp4":
+        from aiter.utility import fp4_utils
+
+        return out_q, fp4_utils.e8m0_shuffle(out_scale)
+    if a_dtype == "fp8":
+        return out_q, out_scale
+    raise ValueError(f"unsupported a_dtype={a_dtype!r}, expected 'fp4' or 'fp8'")
+
+
 __all__ = [
     "EPI_MODES",
     "TpAsmContext",
     "TpMoeCall",
     "TpMoeOut",
+    "prepare_downstream_mx_inputs",
     "quantize_moe_input",
     "tp_moe_layer_asm",
 ]
