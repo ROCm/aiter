@@ -98,6 +98,10 @@ _TP2_BELOW_WINDOW = ((256, 2560), (2, 2568))
 _TP4_CASES = ((40, 2560), (2044, 2568), (4096, 2560))
 _GRAPH_CASE = (1640, 2560)
 _GRAPH_REPLAYS = 3
+# A pool ends after this many seconds, a hang included (ranks that disagree on
+# a call leave their peers polling); FLYDSL_QR_TIMEOUT can lower it further.
+# It covers the first JIT build, so it is not tight.
+_POOL_TIMEOUT_S = 600.0
 
 
 def _poison(elements: int, device) -> None:
@@ -470,7 +474,14 @@ def _bench_rank(
 
 @benchmark()
 def test_sp_router(tokens, hidden, tp):
-    ranks = _run_pool(tp, _bench_rank, tokens=tokens, hidden=hidden, factory=tp == 2)
+    ranks = _run_pool(
+        tp,
+        _bench_rank,
+        timeout=_POOL_TIMEOUT_S,
+        tokens=tokens,
+        hidden=hidden,
+        factory=tp == 2,
+    )
     # the slowest rank's time, the worst rank's mismatch fraction
     ret = {"gfx": get_gfx_runtime()}
     for column in ranks[0]:
@@ -510,7 +521,7 @@ def main():
     served = []  # the world sizes with a router here, which the sweep times
     for tp in tps:
         factory = tp == 2
-        ranks = _run_pool(tp, _run_rank, factory=factory)
+        ranks = _run_pool(tp, _run_rank, timeout=_POOL_TIMEOUT_S, factory=factory)
         fails += _failures(ranks, tp=tp, factory=factory)
         if not ranks[0]["factory_none"]:
             served.append(tp)
