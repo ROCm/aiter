@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 """MegaMoE v2 fused dispatch, GEMM1, GEMM2, and combine implementation."""
 
 import os
@@ -1125,6 +1125,7 @@ class MegaMoEV2:
 
     def _build_fused_stage2(self):
         from .mega_moe_stage2 import (
+            p2p_row_nbytes,
             preload_mega_moe_stage2,
             run_mega_moe_stage2,
         )
@@ -1150,18 +1151,14 @@ class MegaMoEV2:
         self._g2_residual_start = torch.cuda.Event()
         self._g2_residual_done = torch.cuda.Event()
         self._g2_invariants_by_quant = {}
-        for p2p_quant in ("none", "fp8_blockwise_1x32"):
-            p2p_row_nbytes = (
-                int(comb_cfg.hidden_dim) + int(comb_cfg.hidden_dim) // 32
-                if p2p_quant == "fp8_blockwise_1x32"
-                else int(comb_cfg.hidden_dim) * 2
-            )
+        for p2p_quant in ("none", "fp8_blockwise_1x32", "fp4_blockwise_1x32"):
+            row_nbytes = p2p_row_nbytes(int(comb_cfg.hidden_dim), p2p_quant)
             self._g2_invariants_by_quant[p2p_quant] = {
                 "model_dim": int(comb_cfg.hidden_dim), "inter_dim": int(self.inter_dim),
                 "experts": int(comb_cfg.num_experts_per_rank), "topk": int(k), "rank": int(comb_cfg.rank),
                 "npes": int(comb_cfg.world_size), "max_tok": int(comb_cfg.max_num_inp_token_per_rank),
                 "recv_cap": int(self.max_recv),
-                "comb_inp_nbytes": int(comb_cfg.max_num_inp_token_per_rank) * int(k) * p2p_row_nbytes,
+                "comb_inp_nbytes": int(comb_cfg.max_num_inp_token_per_rank) * int(k) * row_nbytes,
                 "HIDDEN_MAX": int(comb_cfg.hidden_dim), "INTER_MAX": int(self.inter_dim), "cu_num": int(cu_num),
                 "p2p_quant_type": p2p_quant, "fixed_slot_dispatch": bool(self._s1_fixed_slot),
                 "a_dtype": self._a_dtype,

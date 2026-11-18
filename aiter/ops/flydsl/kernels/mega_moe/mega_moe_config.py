@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 """Static MegaMoEV2 configuration rules for MI355X."""
 
 from bisect import bisect_left
@@ -60,7 +60,14 @@ MAX_FANOUT_EXPERTS_PER_RANK = 256
 P2P_QUANT_AUTO = "auto"
 P2P_QUANT_NONE = "none"
 P2P_QUANT_FP8_BLOCKWISE = "fp8_blockwise_1x32"
-SUPPORTED_P2P_QUANT_MODES = (P2P_QUANT_NONE, P2P_QUANT_FP8_BLOCKWISE)
+# MXFP4 combine rows: E2M1 pairs with one E8M0 scale per 32 values, a quarter of
+# the BF16 row bytes. Selected explicitly; "auto" never picks it.
+P2P_QUANT_FP4_BLOCKWISE = "fp4_blockwise_1x32"
+SUPPORTED_P2P_QUANT_MODES = (
+    P2P_QUANT_NONE,
+    P2P_QUANT_FP8_BLOCKWISE,
+    P2P_QUANT_FP4_BLOCKWISE,
+)
 
 ACTIVATION_FP4 = "fp4"
 ACTIVATION_FP8 = "fp8"
@@ -142,10 +149,10 @@ class MegaMoEConfig:
             raise ValueError(
                 f"Stage2 block_m={bm} must divide Stage1 sort_block_m={sbm}"
             )
-        if self.p2p_quant not in ("none", "fp8_blockwise_1x32"):
+        if self.p2p_quant not in SUPPORTED_P2P_QUANT_MODES:
             raise ValueError(f"unsupported p2p_quant={self.p2p_quant!r}")
         if self.p2p_quant != "none" and self.stage2.bf16_lds:
-            raise ValueError("FP8 P2P requires Stage2 bf16_lds=False")
+            raise ValueError("FP8/FP4 P2P requires Stage2 bf16_lds=False")
         if self.stage2.deep_a_pipeline and not self.stage2.b2stage:
             raise ValueError("Stage2 deep_a_pipeline requires b2stage=True")
 
@@ -163,7 +170,7 @@ class Stage2BundleKey:
             raise ValueError(
                 f"Stage2 block_m={self.config.block_m} must divide bundle SBM={self.sbm}"
             )
-        if self.p2p_quant not in ("none", "fp8_blockwise_1x32"):
+        if self.p2p_quant not in SUPPORTED_P2P_QUANT_MODES:
             raise ValueError(f"unsupported p2p_quant={self.p2p_quant!r}")
 
 
@@ -1026,6 +1033,10 @@ def select_mega_moe_config(
         # is the race-safe path (only the SYNC reg->LDS copy races at SBM32+nw8)
         # and it reclaims the small-bucket cost that forcing sync would add.
         config = _replace_config(config, stage1={"async_a_copy": True})
+    if config.stage2.aligned_pair and config.p2p_quant == P2P_QUANT_FP4_BLOCKWISE:
+        # The aligned-pair kernel writes FP8 rows only; an explicitly requested
+        # FP4 combine keeps the plain Stage2.
+        config = _replace_config(config, stage2={"aligned_pair": False, "pair_cu": 0})
     if config.stage2.aligned_pair and config.p2p_quant != P2P_QUANT_FP8_BLOCKWISE:
         # The aligned-pair Stage2 kernel only emits the FP8 P2P row layout, so
         # reject the combination here instead of at launch.
