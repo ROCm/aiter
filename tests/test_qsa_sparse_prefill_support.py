@@ -8,9 +8,15 @@ These run on CPU tensors: the architecture and the ROCm device rule are injected
 rejected call raises before any kernel or GPU API is reached. Each tensor names its
 device, since a module imported in the same session may set a default device. Message
 texts are written out here, not taken from the code under test.
+
+The support query (``qsa_sparse_prefill_widths``, ``qsa_sparse_prefill_supports_selection``)
+has to answer exactly what the entry accepts: gfx942 or gfx950, the widths 4T + 3,
+T = 256/512/768/1024, and an int32 selection under 2**31 bytes.
+op_tests/test_flydsl_qsa_sparse_prefill.py exercises the kernels themselves.
 """
 
 import contextlib
+import itertools
 from collections.abc import Callable
 from typing import NamedTuple
 
@@ -516,3 +522,66 @@ def test_without_flydsl_the_op_is_unavailable_and_every_call_has_a_problem(monke
     assert not qsa.can_use_flydsl_qsa_sparse_prefill(**args)
     with pytest.raises(RuntimeError, match="requires FlyDSL"):
         qsa.qsa_sparse_prefill(**args)
+
+
+# The support query of qsa_sparse_prefill.
+
+WIDTHS = (1027, 2051, 3075, 4099)
+
+
+def _set_gfx(monkeypatch, gfx):
+    monkeypatch.setattr(op, "get_gfx_runtime", lambda: gfx)
+
+
+@pytest.fixture(params=["gfx942", "gfx950"])
+def supported_gfx(monkeypatch, request):
+    _set_gfx(monkeypatch, request.param)
+
+
+def _entry_rule(rows, width):
+    """What the entry accepted inline before the query existed."""
+    topk = (width - 3) // 4
+    return (
+        width == 4 * topk + 3
+        and topk % 256 == 0
+        and 256 <= topk <= 1024
+        and rows * width * 4 < 2**31
+    )
+
+
+def test_widths_are_the_kernel_budgets_in_increasing_order(supported_gfx):
+    assert op.SELECTION_WIDTHS == WIDTHS
+    assert qsa.qsa_sparse_prefill_widths() == WIDTHS
+
+
+@pytest.mark.parametrize("width", WIDTHS)
+def test_byte_limit_is_the_last_row_under_2_31_bytes(supported_gfx, width):
+    rows = (2**31 - 1) // (4 * width)
+    assert qsa.qsa_sparse_prefill_supports_selection(rows, width)
+    assert not qsa.qsa_sparse_prefill_supports_selection(rows + 1, width)
+
+
+def test_query_matches_the_entry_rule(supported_gfx):
+    widths = sorted(
+        {w + d for w in WIDTHS for d in (-4, -1, 0, 1, 4)} | {0, 3, 7, 4103, 5123}
+    )
+    rows = [0, 1, 8192, 131072, 131073, 2**20]
+    for r, w in itertools.product(rows, widths):
+        assert qsa.qsa_sparse_prefill_supports_selection(r, w) == _entry_rule(r, w), (
+            r,
+            w,
+        )
+
+
+@pytest.mark.parametrize("gfx", ["gfx90a", "gfx1250"])
+def test_other_gpus_support_nothing(monkeypatch, gfx):
+    _set_gfx(monkeypatch, gfx)
+    assert not op.flydsl_qsa_sparse_prefill_available()
+    assert qsa.qsa_sparse_prefill_widths() == ()
+    assert not qsa.qsa_sparse_prefill_supports_selection(8, 2051)
+
+
+def test_without_flydsl_nothing_is_supported(supported_gfx, monkeypatch):
+    monkeypatch.setattr(qsa, "_HAS_FLYDSL_PREFILL", False)
+    assert qsa.qsa_sparse_prefill_widths() == ()
+    assert not qsa.qsa_sparse_prefill_supports_selection(8, 2051)
