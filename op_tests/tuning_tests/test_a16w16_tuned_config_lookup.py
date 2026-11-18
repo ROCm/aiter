@@ -29,7 +29,7 @@ class TestA16W16TunedConfigLookup(unittest.TestCase):
     def _lookup(self, table):
         patches = [
             mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: table),
-            mock.patch.object(tuned, "get_gfx", lambda: GFX),
+            mock.patch.object(tuned, "get_gfx_runtime", lambda: GFX),
             mock.patch.object(tuned, "get_cu_num", lambda: CU_NUM),
             mock.patch.object(tuned, "get_padded_m", lambda m, _n, _k, _gl: m),
         ]
