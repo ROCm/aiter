@@ -156,10 +156,11 @@ def wait_for_upload(ticket: UploadTicket, buf: torch.Tensor) -> None:
         _captured_uploads[buf.data_ptr()] = buf
         return
     stream, event = ticket
+    if torch._C._cuda_getCurrentRawStream(stream.device.index) == stream.cuda_stream:
+        return
     current = torch.cuda.current_stream(stream.device)
-    if current != stream:
-        current.wait_event(event)
-        buf.record_stream(current)
+    current.wait_event(event)
+    buf.record_stream(current)
 
 
 def _get_available_device() -> str:
