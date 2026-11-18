@@ -270,6 +270,7 @@ for file in "${sharded_files[@]}"; do
     esac
     tee_targets=("latest_test.log")
     if [[ "$file" == "op_tests/test_moe_2stage.py" && "${AITER_MOE_2STAGE_FULL_MATRIX:-false}" == "true" ]]; then
+        : > full_matrix.log
         tee_targets+=("full_matrix.log")
     fi
     # Capture start time (nanoseconds since epoch)
