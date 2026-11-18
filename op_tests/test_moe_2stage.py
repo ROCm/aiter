@@ -2537,7 +2537,7 @@ def test_relu2_rejects_unsupported_quant_configs():
         0,
         True,
         GateMode.SEPARATED.value,
-            opus_weights_shuffled=True,
+        opus_weights_shuffled=True,
     )
     aiter.logger.info(
         "moe_2stage: Relu2 unsupported-quant-config rejection test passed"
