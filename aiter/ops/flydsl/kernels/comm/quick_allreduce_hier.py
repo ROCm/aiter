@@ -238,7 +238,6 @@ def make_quick_allreduce_hier_kernel(
     local_rs: str = "mesh",
     local_ag: str = "mesh",
     x_mover: bool = False,
-    x_mover_wt: bool = True,
 ):
     """Build the hierarchical kernel for one *rank*.
 
@@ -258,8 +257,12 @@ def make_quick_allreduce_hier_kernel(
     * The mover wave waits for that flag and copies the slot, verbatim, into
       the partner's inbox. Its stores are outside the compute waves'
       ``vmcnt`` and fences, so the exchange stays in flight under the next
-      group's laps. *x_mover_wt* stores them write-through (``sc0 sc1``);
-      otherwise ``nt`` and a release fence per slot.
+      group's laps. They are written through (``sc0 sc1``). ``nt`` stores and
+      a release per slot are not safe here: a line can reach the partner by
+      eviction before the release, the partner reads and re-arms it, and the
+      release's writeback of the same line puts the old bytes back over the
+      sentinel, read as landed four groups later (measured: rare cross-rank
+      differences under run-ahead; write-through passes).
     * No flag goes with the data (a Lamport exchange): an unwritten slot holds
       the sentinel in every dword (``_lamport_fix`` keeps the producer off
       it), lap 3 polls the partner's packet until no dword is the sentinel,
@@ -354,10 +357,20 @@ def make_quick_allreduce_hier_kernel(
     # ``color % x_buffers`` rotating through 0xFFFFFFFF.
     color_wrap = x_buffers
     waves = block // WAVE
+    # The flag schedule's single-colour argument for the local slots needs an
+    # all-gather between two reduce-scatters and a reduce-scatter between two
+    # all-gathers. The mover's pipelined order breaks both: a block's first
+    # iteration runs RS(g + 1) right after RS(g), and its last runs AG(L)
+    # right after AG(L - 1). So both local laps are double-buffered by colour
+    # parity there: a peer's lap ``j + 2`` needs its lap ``j + 1``, which needs
+    # our send of lap ``j + 1``, which comes after our reads of lap ``j``.
+    rs_bufs = ag_bufs = 2 if x_mover else 1
+    rs_region = grid * rs_n * rs_slot
+    ag_region = grid * ag_n * ag_slot
     rs_base = 0
-    x_base = rs_base + grid * rs_n * rs_slot
+    x_base = rs_base + rs_bufs * rs_region
     ag_base = x_base + x_buffers * grid * 2 * x_slot
-    inbox_i32 = ag_base + grid * ag_n * ag_slot
+    inbox_i32 = ag_base + ag_bufs * ag_region
 
     lds_bytes = hier_lds_bytes(
         block, G, rs_codec, x_codec, ag_codec, local_rs, local_ag
@@ -436,12 +449,32 @@ def make_quick_allreduce_hier_kernel(
                 + sub * fx.Int32(payload)
             )
 
+        # The reduce-scatter buffer of the group being reduced (mover only):
+        # set from its colour before each lap 1 and lap 2.
+        rs_cur = [None]
+
+        def _use_rs_buffer(color):
+            # A setter, not an assignment in the loop body: FlyDSL's loop
+            # rewriter would try to carry ``rs_cur`` through the scf.for.
+            rs_cur[0] = color & fx.Int32(1)
+
         def _rs_slot(idx, sub):
             """Mesh: *idx* is the source local index. Ring: the hop."""
-            return _local_slot(rs_base, rs_slot, rs_payload, rs_n, idx, sub)
+            off = _local_slot(rs_base, rs_slot, rs_payload, rs_n, idx, sub)
+            if const_expr(rs_bufs > 1):
+                off = off + rs_cur[0] * fx.Int32(rs_region)
+            return off
+
+        ag_cur = [None]
+
+        def _use_ag_buffer(color):
+            ag_cur[0] = color & fx.Int32(1)
 
         def _ag_slot(idx, sub):
-            return _local_slot(ag_base, ag_slot, ag_payload, ag_n, idx, sub)
+            off = _local_slot(ag_base, ag_slot, ag_payload, ag_n, idx, sub)
+            if const_expr(ag_bufs > 1):
+                off = off + ag_cur[0] * fx.Int32(ag_region)
+            return off
 
         def _x_slot(parity, grp, sub, blk=None):
             """*parity* is the buffer: ``color % x_buffers``. *blk* is the
@@ -865,6 +898,7 @@ def make_quick_allreduce_hier_kernel(
             """Lap 3 and the all-gather on the mover schedule: as the flag
             schedule's, with the partner's packet polled (``_x_poll``)."""
             buf = _x_buf(color)
+            _use_ag_buffer(color)
             for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                 tile = bid + (i + s) * n_blocks
                 theirs = _x_poll(buf, s)
@@ -918,6 +952,7 @@ def make_quick_allreduce_hier_kernel(
             for i in range(fx.Int32(0), n_block_tiles, st_i):
                 remain = n_block_tiles - i
                 n_this = (remain < st_i).select(remain, st_i)
+                _use_rs_buffer(color)
                 if const_expr(rs_ring):
                     _rs_ring(i, n_this, color)
                 else:
@@ -953,39 +988,37 @@ def make_quick_allreduce_hier_kernel(
                     src = _x_slot(_x_buf(mcolor), my_group, fx.Int32(0), served)
                     if lane == fx.Int32(0):
                         _spin(src + fx.Int32(x_release), mcolor)
-                    # The copy's loads go past L1/L2 (sc0 sc1) and issue after
-                    # the spin returns, so this is only a compiler barrier: a
-                    # system-scope acquire would invalidate the XCD's L2 under
-                    # the compute blocks.
-                    _acquire_inbox(rocdl.SyncScope.WorkgroupOneAs)
+                    # System scope (buffer_inv sc0 sc1): the mover usually runs
+                    # on another XCD than the block it serves, and a workgroup-
+                    # scope acquire here gave stale cross packets (2026-11-17).
+                    _acquire_inbox(acquire_scope)
                     n_vec = n_this * fx.Int32(x_payload // 4)
                     last = n_vec - fx.Int32(1)
+                    # Where a lane past the end stores: this slot's tail sector
+                    # in the partner's inbox, which nobody reads on the mover
+                    # schedule (ready flags live in each rank's own half). It
+                    # must not store a payload vector twice: the receiver
+                    # re-arms what it read, and a late duplicate would then put
+                    # stale bytes back, to be read as landed a lap later.
+                    spare = src + fx.Int32(x_release)
                     for v0 in range(fx.Int32(0), n_vec, fx.Int32(step)):
-                        # A lane past the end copies the last vector again:
-                        # the same bytes to the same place, and no branch for
-                        # the compiler to sink a load into. Never past the end:
-                        # stale bytes there would read as landed later.
-                        offs = []
+                        # No branch, so the compiler cannot sink a load into
+                        # one: an idle lane loads the last vector and stores it
+                        # to the spare sector.
+                        lds_off, st_off = [], []
                         for u in range_constexpr(_MOVER_UNROLL):
                             x = v0 + lane + fx.Int32(u * WAVE)
-                            offs.append(src + (x < n_vec).select(x, last) * fx.Int32(4))
+                            live = x < n_vec
+                            lds_off.append(src + live.select(x, last) * fx.Int32(4))
+                            st_off.append(live.select(src + x * fx.Int32(4), spare))
                         data = [
                             _buffer_load(inbox, o, 4, fx.Int32, _CM_SC0 | _CM_SC1)
-                            for o in offs
+                            for o in lds_off
                         ]
                         for u in range_constexpr(_MOVER_UNROLL):
-                            if const_expr(x_mover_wt):
-                                _buffer_store(
-                                    partner_buf, offs[u], data[u], _CM_SC0 | _CM_SC1
-                                )
-                            else:
-                                _store_v4i32_peer(
-                                    partner_base + _i32_to_bytes(offs[u]),
-                                    data[u],
-                                    payload_policy,
-                                )
-                    if const_expr(not x_mover_wt and release_scope is not None):
-                        _release_inbox(release_scope)
+                            _buffer_store(
+                                partner_buf, st_off[u], data[u], _CM_SC0 | _CM_SC1
+                            )
                     mcolor = _next_color(mcolor)
                 if lane == fx.Int32(0):
                     store_mc(mcolor)
@@ -1120,7 +1153,7 @@ def make_quick_allreduce_hier_kernel(
         f"{SCALE_CODEC_TAG}_ws{world_size}_g{gtag}_r{self_rank}_st{super_tile}"
         f"_g{grid}_{inbox_memory}_{rs_codec}_{x_codec}_{ag_codec}_b{block}"
         f"_{local_rs}_{local_ag}"
-        + (f"_xm{'wt' if x_mover_wt else 'nt'}" if x_mover else "")
+        + ("_xm" if x_mover else "")
     )
     launch_quick_allreduce_hier.func.__name__ = f"launch_quick_allreduce_hier_{tag}"
     try:

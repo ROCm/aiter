@@ -397,21 +397,15 @@ class FlyQuickAllReduce:
         local_rs: str | None = None,
         local_ag: str | None = None,
         x_mover: bool | None = None,
-        x_mover_wt: bool | None = None,
     ):
         check_world_size(world_size)
         if x_mover is None:
-            # PROTOTYPE switch for the test suites: "wt" or "nt" (the mover's
-            # store policy) turns the mover on for every hierarchical engine.
-            env = os.environ.get("AITER_FLY_AR_HIER_MOVER", "").strip().lower()
-            if env not in ("", "0", "wt", "nt"):
-                raise ValueError(
-                    f"AITER_FLY_AR_HIER_MOVER must be wt or nt, got {env!r}"
-                )
-            x_mover = env in ("wt", "nt") and algorithm == "hier"
-            if x_mover_wt is None:
-                x_mover_wt = env != "nt"
-        x_mover_wt = True if x_mover_wt is None else bool(x_mover_wt)
+            # PROTOTYPE switch for the test suites: 1 turns the mover on for
+            # every hierarchical engine.
+            env = os.environ.get("AITER_FLY_AR_HIER_MOVER", "").strip()
+            if env not in ("", "0", "1"):
+                raise ValueError(f"AITER_FLY_AR_HIER_MOVER must be 0 or 1, got {env!r}")
+            x_mover = env == "1" and algorithm == "hier"
         if algorithm not in ALGORITHMS:
             raise ValueError(
                 f"algorithm must be one of {tuple(ALGORITHMS)}, got {algorithm!r}"
@@ -469,7 +463,7 @@ class FlyQuickAllReduce:
             build_kw = {"groups": groups}
             if x_mover:
                 # PROTOTYPE: the cross exchange on mover waves, Lamport slots.
-                build_kw.update(x_mover=True, x_mover_wt=bool(x_mover_wt))
+                build_kw.update(x_mover=True)
         self.x_mover = bool(x_mover)
         if ladder is None:
             ladder = algo.st_ladder(world_size=world_size, link=link, arch=arch)
