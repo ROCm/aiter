@@ -44,10 +44,12 @@ from .core import (
     TIMEOUT_S,
     TR_N,
     KCtx,
+    compact_flag_bytes,
     compact_scratch_bytes,
     ctl_arena_bytes,
     ctl_layout,
     epr_pad,
+    read_mtready,
     segs_pad,
     src_off,
 )
@@ -169,6 +171,11 @@ def make_megakernel(
     TR_BASE = CTL_WORDS  # i64 stamps [G][TR_N] after the control words
     RT_BASE = TR_BASE + 2 * G * TR_N  # i64 [RT_N][4] per-route stamps
     CTL_ARENA_B = ctl_arena_bytes(npes=npes, experts_per_rank=EPR)
+    # Compact: the (expert, source) landed flags past the arena control words.
+    MTREADY = int(COMPACT and read_mtready())
+    FLG_OFF = CTL_ARENA_B
+    if MTREADY:
+        CTL_ARENA_B += compact_flag_bytes(EPR)
 
     from aiter.ops.flydsl.grouped_moe_gfx1250 import get_wmma_m_rep
 
@@ -260,6 +267,7 @@ def make_megakernel(
             ("tc", T_CHUNK if COMPACT else TALLY_CHUNK, TALLY_CHUNK),
             ("ru", RED_UN, RED_UN_DEF),
             ("rb", RED_B64, RED_B64_DEF),
+            ("mr", MTREADY, int(COMPACT)),
             ("ps", POLL_SL, POLL_SLEEP),
             ("hs", int(HS and not COMPACT), 0),
             ("pt", PLAN_TAG, 1 if TM <= 16 else 0),
@@ -309,6 +317,9 @@ def make_megakernel(
         RED_CH=RED_CH,
         RED_UN=RED_UN,
         RED_B64=RED_B64,
+        MTREADY=MTREADY,
+        FLG_OFF=FLG_OFF,
+        MT_CAP=MT_CAP,
         REP_W=REP_W,
         ROW=ROW,
         RS_OFF=RS_OFF,

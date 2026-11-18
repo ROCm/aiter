@@ -7,6 +7,8 @@ the reduce (phases 2. to 5. of the package docstring)."""
 
 from __future__ import annotations
 
+import os
+
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
@@ -138,6 +140,20 @@ PREF_DEPTH = 8
 RED_ELEMS = WAVE * 16
 
 
+#: Compact layout, AITER_DMK_MTREADY (default on): a GEMM item waits for its
+#: expert's rows from every source, not for every row of every rank. Past
+#: the arena control words, flags[EPR_PAD][WAVE] (local expert, source) hold
+#: the launch's generation once that source's rows of the expert landed. A
+#: source counts its sent rows per segment in its (cleared) tally counters;
+#: the wave completing a segment's tally stores the flag, the last tally CTA
+#: stores those of empty segments. One remote store per segment: an atomic
+#: per row on a destination counter queued ~80 deep per m-tile (DSR1 1536).
+
+
+def read_mtready() -> bool:
+    return os.environ.get("AITER_DMK_MTREADY", "1") != "0"
+
+
 def vdst_fence(v):
     """``v`` once every VALU write has landed. The fp4 converts are inline
     asm, so no VALU -> VMEM wait guards a store that reads their results;
@@ -151,6 +167,11 @@ def vdst_fence(v):
             has_side_effects=True,
         )
     )
+
+
+def compact_flag_bytes(experts_per_rank: int) -> int:
+    """Bytes of a compact kernel's (expert, source) landed flags."""
+    return epr_pad(experts_per_rank) * WAVE * 4 if read_mtready() else 0
 
 
 def ctl_arena_bytes(*, npes: int, experts_per_rank: int) -> int:
@@ -733,6 +754,32 @@ def gemm_queue(kc, n_mt):
     meta2_holder, par, ready1_holder = kc.meta2_holder, kc.par, kc.ready1_holder
     ready2_holder, rsrc_ctl, spin_end = kc.ready2_holder, kc.rsrc_ctl, kc.spin_end
     spin_fail, stamp, wait_gate = kc.spin_fail, kc.stamp, kc.wait_gate
+    MTREADY, FLG_OFF, npes = kc.MTREADY, kc.FLG_OFF, kc.npes
+    rsrc_actl = kc.rsrc_actl
+
+    def wait_expert(e_):
+        """MTREADY: until every source's rows (and rowmap pairs) of local
+        expert e_ landed: lane s polls flag (e_, s). Once CTA 0 opened this
+        CTA's GATE_P (every row landed) one cached load decides: the flags'
+        uncached polls cost ~2 us an item."""
+        landed = _uniform(
+            _load_i32_dev(rsrc_ctl, fx.Int32(GATE_P) + bid * fx.Int32(GATE_STRIDE))
+        )
+        src = fx.Int32((lane < fx.Int32(npes)).select(lane, fx.Int32(0)))
+        flag_w = fx.Int32(FLG_OFF // 4) + e_ * fx.Int32(WAVE) + src
+        bad = fx.Int32(0)
+        if landed != gen:
+            cur = _load_i32_sys(rsrc_actl, flag_w)
+            bad = fx.Int32(ballot(T.i32, (lane < fx.Int32(npes)) & (cur != gen)))
+        t_end = spin_end()
+        live = fx.Int32(1)
+        while (bad != fx.Int32(0)) & (live != fx.Int32(0)):
+            fx.rocdl.s_sleep(GATE_SLEEP)
+            cur = _load_i32_sys(rsrc_actl, flag_w)
+            bad = fx.Int32(ballot(T.i32, (lane < fx.Int32(npes)) & (cur != gen)))
+            live = alive(t_end)
+        if bad != fx.Int32(0):
+            spin_fail(7)
 
     def decode_mtile(i):
         """(expert, GEMM m-tile index, valid rows) of plan m-tile i: the
@@ -805,7 +852,15 @@ def gemm_queue(kc, n_mt):
             i = u // fx.Int32(NT1)
             n = u - i * fx.Int32(NT1)
             e_, mt_idx, rows = decode_mtile(i)
-            if const_expr(COMPACT or EARLY):
+            if const_expr(MTREADY):
+
+                def a_ready1(e_=e_):
+                    # This expert's rows have landed: only A owners
+                    # wait, the W1 prologue streams meanwhile.
+                    wait_expert(e_)
+
+                set_meta1((e_, rows), a_ready1)
+            elif const_expr(COMPACT or EARLY):
 
                 def a_ready1():
                     # The rows of every rank have landed (CTA 0 saw
@@ -860,7 +915,11 @@ def gemm_queue(kc, n_mt):
             i = v // fx.Int32(NT2)
             n = v - i * fx.Int32(NT2)
             e_, mt_idx, rows = decode_mtile(i)
-            if const_expr(COMPACT or EARLY):
+            if const_expr(MTREADY):
+                # GEMM2's epilogue loads its rows' rowmap pairs before
+                # a_ready: every wave waits for its expert's rows first.
+                wait_expert(e_)
+            elif const_expr(COMPACT or EARLY):
                 # GEMM2's epilogue loads its rows' rowmap pairs before
                 # a_ready, and compact / EARLY start the queue before
                 # the peers' rows land: every wave waits for them

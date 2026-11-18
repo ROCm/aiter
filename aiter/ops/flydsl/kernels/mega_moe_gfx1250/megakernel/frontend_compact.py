@@ -43,6 +43,7 @@ from .core import (
     SEG_BITS,
     SEG_STRIDE,
     _load_i32_dev,
+    _load_i32_sys,
     device_fn,
     vdst_fence,
 )
@@ -64,6 +65,7 @@ def produce(kc, n_mine, n_routes):
     rsrc_ctl, rsrc_ids, rsrc_wts = kc.rsrc_ctl, kc.rsrc_ids, kc.rsrc_wts
     rsrc_x, spin_end, spin_fail, stamp = kc.rsrc_x, kc.spin_end, kc.spin_fail, kc.stamp
     tag16, tid, tok, wait_gate, wave = kc.tag16, kc.tid, kc.tok, kc.wait_gate, kc.wave
+    MTREADY, FLG_OFF, gen = kc.MTREADY, kc.FLG_OFF, kc.gen
     # ======== 1. FRONT-END (compact layout) ========
     # LDS scratch in the GEMM arena (no GEMM item runs before the
     # plan gate): a tally CTA's histogram, bases and route table;
@@ -179,6 +181,13 @@ def produce(kc, n_mine, n_routes):
                             )
                         )
                     )
+            if const_expr(MTREADY):
+                # The counters count this launch's sent rows next: clear
+                # them before X1 lets any send gate open.
+                rocdl.s_wait_loadcnt(0)
+                for w_ in cws:
+                    buffer_store(fx.Int32(0), rsrc_ctl, w_, cache_modifier=SCOPE_DEV)
+                rocdl.s_wait_storecnt(0)
             for j in range_constexpr(SEGS_PAD // 128):
                 cs = []
                 cw = cws[4 * j : 4 * j + 4]
@@ -198,13 +207,29 @@ def produce(kc, n_mine, n_routes):
                         fx.Int32(rank * SEGS_PAD + 128 * j) + lane * fx.Int32(4),
                         cache_modifier=SCOPE_SYS,
                     )
-                for q in range_constexpr(4):
-                    buffer_store(
-                        fx.Int32(0),
-                        rsrc_ctl,
-                        cw[q],
-                        cache_modifier=SCOPE_DEV,
-                    )
+                if const_expr(not MTREADY):
+                    for q in range_constexpr(4):
+                        buffer_store(
+                            fx.Int32(0),
+                            rsrc_ctl,
+                            cw[q],
+                            cache_modifier=SCOPE_DEV,
+                        )
+                else:
+                    # No row completes an empty segment: its flag goes now.
+                    for q in range_constexpr(4):
+                        sg_q = fx.Int32(128 * j + q) + lane * fx.Int32(4)
+                        if (cvs[4 * j + q] == fx.Int32(0)) & (
+                            sg_q < fx.Int32(npes * EPR)
+                        ):
+                            d_q = sg_q // fx.Int32(EPR)
+                            le_q = sg_q - d_q * fx.Int32(EPR)
+                            comm_ops.store_i32_global_system_monotonic(
+                                peer_va(d_q, off_ctl)
+                                + fx.Int64(FLG_OFF)
+                                + fx.Int64((le_q * fx.Int32(WAVE) + rank) * 4),
+                                gen,
+                            )
             stamp(23)
     # ---- CTA 0: X1 from every source -> every destination's
     # layout (the staged compact one: expert-major, each expert
@@ -460,5 +485,47 @@ def produce(kc, n_mine, n_routes):
                         fx.Int32(0),
                         mask=lane == fx.Int32(0),
                         cache_modifier=SCOPE_SYS,
+                    )
+            if const_expr(MTREADY):
+                # Once this token's rows and rowmap pairs retired (SCOPE_SYS),
+                # count each route sent (or dropped) in its segment's counter;
+                # the route completing a segment's tally clears the counter
+                # and tells the destination: flag (expert, this rank) = gen.
+                rocdl.s_wait_storecnt(0)
+                okc = (lane < fx.Int32(K)) & (rs >= fx.Int32(0))
+                sgc = fx.Int32(
+                    okc.select(rs & fx.Int32((1 << SEG_BITS) - 1), fx.Int32(0))
+                )
+                old = fx.Int32(
+                    _buffer_atomic_add_ret(
+                        rsrc_ctl,
+                        fx.Int32(
+                            okc.select(
+                                (fx.Int32(SEG_CNT_W) + sgc * fx.Int32(SEG_STRIDE))
+                                * fx.Int32(4),
+                                fx.Int32(_OOB),
+                            )
+                        ),
+                        1,
+                        SCOPE_DEV,
+                    )
+                )
+                tot = _load_i32_sys(
+                    rsrc_actl, fx.Int32(rank * SEGS_PAD) + sgc
+                ) & fx.Int32(0xFFFF)
+                if okc & (old + fx.Int32(1) == tot):
+                    buffer_store(
+                        fx.Int32(0),
+                        rsrc_ctl,
+                        fx.Int32(SEG_CNT_W) + sgc * fx.Int32(SEG_STRIDE),
+                        cache_modifier=SCOPE_DEV,
+                    )
+                    d_c = sgc // fx.Int32(EPR)
+                    le_c = sgc - d_c * fx.Int32(EPR)
+                    comm_ops.store_i32_global_system_monotonic(
+                        peer_va(d_c, off_ctl)
+                        + fx.Int64(FLG_OFF)
+                        + fx.Int64((le_c * fx.Int32(WAVE) + rank) * 4),
+                        gen,
                     )
     return n_mine

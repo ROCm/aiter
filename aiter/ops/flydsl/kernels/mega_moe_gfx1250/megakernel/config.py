@@ -15,6 +15,7 @@ from .core import (
     SEG_BITS,
     TALLY_MAX,
     TALLY_MAXR,
+    compact_flag_bytes,
     compact_scratch_bytes,
     ctl_arena_bytes,
     segs_pad,
@@ -341,7 +342,7 @@ def compact_regions(config) -> dict:
     for i in range(len(variants)):
         regions[compact_ctl_region(i)] = ctl_arena_bytes(
             npes=config.world_size, experts_per_rank=config.experts_per_rank
-        )
+        ) + compact_flag_bytes(config.experts_per_rank)
     return regions
 
 
