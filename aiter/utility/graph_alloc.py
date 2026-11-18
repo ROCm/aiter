@@ -49,6 +49,22 @@ def persistent_alloc(device: torch.device):
         yield
 
 
+def capture_defined(*size, dtype, device):
+    """``torch.empty``, zeroed when the current stream is capturing a graph.
+
+    Replay reuses the capture's private pool and does not clear it, so a byte no
+    kernel writes keeps the previous replay's value. While a stream is capturing,
+    zero the buffer (packed fp4 / e8m0 have no fill kernel, so zero the raw
+    bytes). The memset is recorded and runs on every replay. Eager calls stay
+    ``torch.empty``.
+    """
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        if torch.empty((), dtype=dtype).element_size() == 1:
+            return torch.zeros(*size, dtype=torch.uint8, device=device).view(dtype)
+        return torch.zeros(*size, dtype=dtype, device=device)
+    return torch.empty(*size, dtype=dtype, device=device)
+
+
 def _target_stream(args) -> int:
     """Handle of the stream a cached builder's fill runs on: an explicit stream
     argument, else the current stream of its device argument (a torch.device, or
