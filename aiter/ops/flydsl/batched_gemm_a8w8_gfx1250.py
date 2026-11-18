@@ -725,21 +725,19 @@ def run_bmm_a8w8_mxfp8_128_gfx1250(
     return Out
 
 
-# Default kernel of ``run_gate_up_silu_mxfp8_32_gfx1250`` when the caller names
-# none (the tile gate_up_silu_kernel_for picks for mid-size decode batches).
-GATE_UP_SILU_DEFAULT_KERNEL = (
-    "flydsl_bmm_mxfp8_32_wmma_t192x128x256_mw2_nw2_nb3_sk1_cm1_cn1_pl"
-)
 # The fused gate_up tiles were measured against GEMM + silu_and_mul +
 # quantize_fp8 only on a gfx1250 part with this many CUs and at these
-# (2*I, K) gate_up shapes (the DSV4.1 shared expert). gate_up_silu_kernel_for
-# returns None anywhere else, so an unmeasured shape keeps the unfused path.
+# (2*I, K) gate_up shapes (the DSV4.1 shared expert). gate_up_silu_supported
+# is False anywhere else, so an unmeasured shape keeps the caller's unfused
+# path.
 _GATE_UP_SILU_CU_NUM = 256
 _GATE_UP_SILU_SHAPES = ((4608, 5120),)
 # (largest M, kernelName) at those shapes. Each name pins its K loop with
 # ``_pl``, the loop the tile was timed with, instead of inheriting the default
-# pick. Above the last bound the 2-D compute GEMM wins and the caller keeps the
-# unfused path.
+# pick. Above the last bound the 2-D compute GEMM followed by silu_and_mul and
+# quantize_fp8 was faster, so gate_up_silu_kernel_for leaves those rows to the
+# caller's unfused path; the launch itself runs any M (see
+# run_gate_up_silu_mxfp8_32_gfx1250).
 _GATE_UP_SILU_TILES = (
     (384, "flydsl_bmm_mxfp8_32_wmma_t64x128x256_mw2_nw2_nb4_sk1_cm1_cn1_pl"),
     (512, "flydsl_bmm_mxfp8_32_wmma_t64x256x256_mw1_nw4_nb3_sk1_cm1_cn1_pl"),
@@ -750,7 +748,13 @@ _GATE_UP_SILU_TILES = (
     (2048, "flydsl_bmm_mxfp8_32_wmma_t192x128x256_mw2_nw2_nb3_sk1_cm1_cn1_pl"),
     (4096, "flydsl_bmm_mxfp8_32_wmma_t128x256x256_mw2_nw4_nb3_sk1_cm1_cn1_pl"),
 )
+# Largest row count the fused path was measured to win at.
+GATE_UP_SILU_MAX_ROWS = _GATE_UP_SILU_TILES[-1][0]
 _GFX1250_ARCHS = ("gfx1250", "gfx1250-strict")
+# 1-byte storage the launch reads / writes: e4m3 codes and e8m0 scales, or
+# their raw bytes.
+_FP8_STORAGE = (torch.float8_e4m3fn, torch.uint8)
+_E8M0_STORAGE = (torch.float8_e8m0fnu, torch.uint8)
 
 
 def gate_up_silu_kernel_ok(name: str | None) -> bool:
@@ -779,8 +783,8 @@ def _gate_up_silu_tiles_shape(cfg: dict[str, int], n2: int, k: int) -> bool:
 
 
 def _check_gate_up_silu_tiles() -> None:
-    # The picker returns these names without parsing them (it runs inside
-    # traced forwards), so every name is checked once here, at import.
+    # Every table name is checked once here, at import, so the per-call pick
+    # is a plain table walk.
     for _, name in _GATE_UP_SILU_TILES:
         cfg = parse_bmm_mx32_kernel_name(name)
         if not gate_up_silu_kernel_ok(name) or cfg["pipelined"] != 1:
@@ -796,35 +800,49 @@ _check_gate_up_silu_tiles()
 @torch.compiler.assume_constant_result
 def _gate_up_silu_device_measured() -> bool:
     """Whether the running GPU is the gfx1250 part the fused tiles were
-    measured on. torch.compile takes the answer as a constant, so the picker
-    traces to plain integer compares."""
+    measured on; False when that cannot be determined (no GPU, an unknown arch,
+    mixed or unreadable CU counts)."""
     try:
         return (
             get_gfx_runtime() in _GFX1250_ARCHS and get_cu_num() == _GATE_UP_SILU_CU_NUM
         )
-    except RuntimeError:  # no GPU visible
+    except (RuntimeError, KeyError, AssertionError, ValueError):
         return False
+
+
+def gate_up_silu_supported(n2: int, k: int) -> bool:
+    """Whether the fused gate_up path applies to a [n2, k] gate_up weight on
+    this device: gfx1250 with the CU count and at a (n2, k) the tiles were
+    measured on. Independent of the row count, so a model can decide once,
+    when it is built, whether to route its gate_up through the fused op."""
+    if not _gate_up_silu_device_measured():
+        return False
+    return any(n2 == s_n2 and k == s_k for s_n2, s_k in _GATE_UP_SILU_SHAPES)
+
+
+def _gate_up_silu_tile(m: int) -> str:
+    """The table's tile for ``m`` rows; past the table, its largest bucket's."""
+    for bound, name in _GATE_UP_SILU_TILES:
+        if m <= bound:
+            return name
+    return _GATE_UP_SILU_TILES[-1][1]
 
 
 def gate_up_silu_kernel_for(m: int, n2: int, k: int) -> str | None:
     """kernelName for ``run_gate_up_silu_mxfp8_32_gfx1250`` at ``[m, k] x
-    [n2, k]``, or None when the fused path does not apply: another arch or CU
-    count, a (n2, k) the tiles were not measured at, or an M the unfused path
-    serves better.
+    [n2, k]``, or None where the fused path does not apply: not
+    ``gate_up_silu_supported(n2, k)``, or an M outside 1..GATE_UP_SILU_MAX_ROWS,
+    which the unfused path serves better.
 
-    Safe to call from a forward that torch.compile traces (symbolic ``m``
-    included): it compares ``m`` against a table resolved at import and reads
-    the device check as a compile-time constant."""
-    # Plain == compares, which also trace when n2 / k are symbolic.
-    measured = False
-    for shape_n2, shape_k in _GATE_UP_SILU_SHAPES:
-        measured = measured or (n2 == shape_n2 and k == shape_k)
-    if not measured or not _gate_up_silu_device_measured() or m < 1:
+    A host-side helper for code that sees the real row count (eager code, or
+    the body of a custom op). Do not branch on it in a forward that
+    torch.compile traces: a compiled graph can be replayed for other row
+    counts without re-checking guards, which freezes the choice made for the
+    first one. The registered op ``gate_up_silu_mxfp8_32`` picks the tile from
+    the runtime row count itself."""
+    if not 1 <= m <= GATE_UP_SILU_MAX_ROWS or not gate_up_silu_supported(n2, k):
         return None
-    for bound, name in _GATE_UP_SILU_TILES:
-        if m <= bound:
-            return name
-    return None
+    return _gate_up_silu_tile(m)
 
 
 def gate_up_silu_limit(swiglu_limit: float) -> float:
@@ -853,52 +871,73 @@ def run_gate_up_silu_mxfp8_32_gfx1250(
 ) -> Tensor:
     """gate_up GEMM with the SwiGLU activation and its MXFP8 quant fused.
 
-    ``XQ`` [M, K] e4m3 with row-major ``x_scale`` [M, K//32] e8m0; ``WQ`` the
-    [2*I, K] gate_up weight ([gate; up] rows) 16x16-preshuffled, ``w_scale``
-    its raw [2*I//32, K//32] 32x32 e8m0 block scale. Writes ``Out`` [M, I] e4m3
-    and ``y_scale_out`` [M, I//32] e8m0: ``quantize_fp8`` of aiter
+    ``XQ`` [M, K] e4m3 (row-contiguous) with row-major ``x_scale`` [M, K//32]
+    e8m0; ``WQ`` the contiguous [2*I, K] gate_up weight ([gate; up] rows)
+    16x16-preshuffled, ``w_scale`` its raw [2*I//32, K//32] 32x32 e8m0 block
+    scale. Writes ``Out`` [M, I] e4m3 and ``y_scale_out`` [M, I//32] e8m0
+    (either may also be uint8 storage): ``quantize_fp8`` of aiter
     ``silu_and_mul(gemm_out, swiglu_limit)`` on the bf16 GEMM output, with the
-    same scales and the same e4m3 codes up to one step (the epilogue's exp/rcp
+    same scales and the same e4m3 codes up to one step. The epilogue's exp/rcp
     can round a bf16 activation to the neighbour of silu_and_mul's, which can
-    move an e4m3 rounding midpoint). ``swiglu_limit`` follows silu_and_mul (see
-    ``gate_up_silu_limit``).
+    move an e4m3 rounding midpoint; with a limit bf16 cannot represent, the
+    gate is also clamped in f32 where silu_and_mul rounds the clamped gate to
+    bf16. ``swiglu_limit`` follows silu_and_mul (see ``gate_up_silu_limit``).
 
-    This is the raw FlyDSL launch. A caller inside a torch.compile region uses
-    the registered op ``aiter.ops.batched_gemm_op_a8w8.gate_up_silu_mxfp8_32``.
+    ``kernel_name`` None picks the tile from ``XQ``'s row count; past
+    GATE_UP_SILU_MAX_ROWS that is the largest bucket's tile, which computes the
+    same values but was not measured to beat the unfused chain there.
+
+    This is the raw FlyDSL launch; a torch.compile region calls the registered
+    op ``aiter.ops.batched_gemm_op_a8w8.gate_up_silu_mxfp8_32`` instead.
     """
+    tag = "[FlyDSL gfx1250 gate_up silu]"
     limit = gate_up_silu_limit(swiglu_limit)
+    if XQ.dim() != 2 or WQ.dim() != 2:
+        raise RuntimeError(
+            f"{tag} XQ/WQ must be 2-D, got {tuple(XQ.shape)}, {tuple(WQ.shape)}"
+        )
     m, k = XQ.shape
     n2, wk = WQ.shape
     inter = n2 // 2
     if wk != k or n2 % 128 or k % BLOCK_K:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 gate_up silu] bad shapes XQ {tuple(XQ.shape)} "
-            f"WQ {tuple(WQ.shape)}"
+            f"{tag} bad shapes XQ {tuple(XQ.shape)} WQ {tuple(WQ.shape)}"
         )
+    if XQ.dtype not in _FP8_STORAGE or WQ.dtype not in _FP8_STORAGE:
+        raise RuntimeError(
+            f"{tag} XQ/WQ must be e4m3 (or uint8 storage), got {XQ.dtype}, "
+            f"{WQ.dtype}"
+        )
+    # The launch passes raw pointers with lda = K.
+    if XQ.stride() != (k, 1):
+        raise RuntimeError(
+            f"{tag} XQ must be row-contiguous [M, K], got strides {tuple(XQ.stride())}"
+        )
+    if not WQ.is_contiguous():
+        raise RuntimeError(f"{tag} WQ must be contiguous")
     if (
         tuple(Out.shape) != (m, inter)
-        or Out.element_size() != 1
+        or Out.dtype not in _FP8_STORAGE
         or not Out.is_contiguous()
         or tuple(y_scale_out.shape) != (m, inter // 32)
-        or y_scale_out.element_size() != 1
+        or y_scale_out.dtype not in _E8M0_STORAGE
         or not y_scale_out.is_contiguous()
     ):
         raise RuntimeError(
-            "[FlyDSL gfx1250 gate_up silu] Out must be contiguous e4m3 "
-            f"[{m}, {inter}] and y_scale_out e8m0 [{m}, {inter // 32}]"
+            f"{tag} Out must be contiguous e4m3 [{m}, {inter}] and y_scale_out "
+            f"e8m0 [{m}, {inter // 32}], got {Out.dtype} {tuple(Out.shape)}, "
+            f"{y_scale_out.dtype} {tuple(y_scale_out.shape)}"
         )
-    name = kernel_name or GATE_UP_SILU_DEFAULT_KERNEL
+    name = _gate_up_silu_tile(m) if kernel_name is None else kernel_name
     if not gate_up_silu_kernel_ok(name):
-        raise ValueError(f"[FlyDSL gfx1250 gate_up silu] unsupported kernel {name!r}")
+        raise ValueError(f"{tag} unsupported kernel {name!r}")
     cfg = parse_bmm_mx32_kernel_name(name)
     tile_n, tile_k = cfg["tile_n"], cfg["tile_k"]
     if not _gate_up_silu_tiles_shape(cfg, n2, k):
-        raise RuntimeError(
-            f"[FlyDSL gfx1250 gate_up silu] {name!r} does not tile I={inter}, K={k}"
-        )
+        raise RuntimeError(f"{tag} {name!r} does not tile I={inter}, K={k}")
     gfx = get_gfx_runtime()
     if gfx not in _GFX1250_ARCHS:
-        raise RuntimeError(f"[FlyDSL gfx1250 gate_up silu] requires gfx1250, got {gfx}")
+        raise RuntimeError(f"{tag} requires gfx1250, got {gfx}")
     _lazy_import()
     k_blocks = k // MX32_BLOCK_K
     _check_e8m0(x_scale, "x_scale", "FlyDSL gfx1250 gate_up silu", (m, k_blocks))
@@ -961,9 +1000,11 @@ def run_gate_up_silu_mxfp8_32_gfx1250(
 
 
 __all__ = [
+    "GATE_UP_SILU_MAX_ROWS",
     "gate_up_silu_kernel_for",
     "gate_up_silu_kernel_ok",
     "gate_up_silu_limit",
+    "gate_up_silu_supported",
     "run_bmm_a8w8_mxfp8_32_gfx1250",
     "run_bmm_a8w8_mxfp8_128_gfx1250",
     "run_gate_up_silu_mxfp8_32_gfx1250",

@@ -529,42 +529,52 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
     return bmm_a8w8_mxfp8_fused_quant_supported(_w_scale_block_of(w_scale, n, k))
 
 
-# Only Out and y_scale_out are written, so only they are declared mutable, and
-# the op returns nothing (no output aliases an input); the fake is a no-op.
-@torch_compile_guard(
-    mutates_args=["Out", "y_scale_out"], gen_fake=lambda *args, **kwargs: None
-)
+def _gate_up_silu_mxfp8_32_fake(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    swiglu_limit: float,
+) -> tuple[Tensor, Tensor]:
+    m, inter = XQ.shape[0], WQ.shape[0] // 2
+    return (
+        torch.empty((m, inter), dtype=torch.float8_e4m3fn, device=XQ.device),
+        torch.empty((m, inter // 32), dtype=dtypes.fp8_e8m0, device=XQ.device),
+    )
+
+
+# Functional: allocates and returns its outputs and writes no argument
+# (mutates_args=[]). An E8M0 tensor in mutates_args leaves an
+# auto_functionalized_v2 that Inductor does not remove.
+@torch_compile_guard(mutates_args=[], gen_fake=_gate_up_silu_mxfp8_32_fake)
 def gate_up_silu_mxfp8_32(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    Out: Tensor,
-    y_scale_out: Tensor,
     swiglu_limit: float,
-    kernel_name: str | None = None,
-) -> None:
+) -> tuple[Tensor, Tensor]:
     """gfx1250 gate_up GEMM with the SwiGLU activation and its MXFP8 quant
     fused, as a registered op that torch.compile can trace.
 
-    Same arguments and contract as
-    ``aiter.ops.flydsl.batched_gemm_a8w8_gfx1250.run_gate_up_silu_mxfp8_32_gfx1250``
-    (writes ``Out`` [M, I] e4m3 and ``y_scale_out`` [M, I//32] e8m0); pick
-    ``kernel_name`` with ``gate_up_silu_kernel_for`` there, which returns None
-    where the fused path does not apply.
+    Inputs as ``aiter.ops.flydsl.batched_gemm_a8w8_gfx1250.run_gate_up_silu_mxfp8_32_gfx1250``;
+    returns ``(act [M, I] e4m3, act_scale [M, I//32] e8m0)``. The tile is
+    picked inside the op from the runtime row count, so a compiled graph
+    replayed for another M still runs that M's tile. Check
+    ``gate_up_silu_supported(2*I, K)`` once (e.g. when the model is built)
+    before routing through it. The op runs every M; past
+    ``GATE_UP_SILU_MAX_ROWS`` the fused kernel computes the same values but
+    was not measured to beat the unfused chain, so a caller that keeps an
+    unfused path for those rows makes that split inside its own op, where the
+    row count is real.
     """
     from .flydsl.batched_gemm_a8w8_gfx1250 import run_gate_up_silu_mxfp8_32_gfx1250
 
+    act, act_scale = _gate_up_silu_mxfp8_32_fake(XQ, WQ, x_scale, w_scale, 0.0)
     run_gate_up_silu_mxfp8_32_gfx1250(
-        XQ,
-        WQ,
-        x_scale,
-        w_scale,
-        Out,
-        y_scale_out,
-        swiglu_limit,
-        kernel_name=kernel_name,
+        XQ, WQ, x_scale, w_scale, act, act_scale, swiglu_limit
     )
+    return act, act_scale
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=_batched_gemm_a8w8_mxscale_fake)

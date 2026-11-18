@@ -637,6 +637,7 @@ def test_gate_up_silu_fused(m, n2, k, limit, kernel_name=None):
     differ by one step where the epilogue's exp/rcp and silu_and_mul's
     round to bf16 values on either side of an e4m3 rounding midpoint.
     Returns (scale mismatches, e4m3 mismatches, e4m3 codes off by > 1)."""
+    from aiter.ops.batched_gemm_op_a8w8 import gate_up_silu_mxfp8_32
     from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
         run_bmm_a8w8_mxfp8_32_gfx1250,
         run_gate_up_silu_mxfp8_32_gfx1250,
@@ -675,6 +676,21 @@ def test_gate_up_silu_fused(m, n2, k, limit, kernel_name=None):
         limit,
         kernel_name=name,
     )
+    if kernel_name is None:
+        # The registered op picks the same table tile from the runtime rows.
+        q_op, sc_op = gate_up_silu_mxfp8_32(
+            x8.view(m, k),
+            w_shuf.view(n2, k),
+            xs8.view(m, k // 32),
+            ws8.view(n2 // 32, k // 32),
+            limit,
+        )
+        if not (
+            torch.equal(q_op.view(torch.uint8), q.view(torch.uint8))
+            and torch.equal(sc_op.view(torch.uint8), sc)
+        ):
+            print(f"gate_up silu M={m}: registered op differs from the launch")
+            return 1, 1, 1
     scale_bad = int((sc != s_ref.view(m, inter // 32)).sum())
     a = q.view(torch.uint8).to(torch.int32)
     r = q_ref.view(torch.uint8).to(torch.int32)

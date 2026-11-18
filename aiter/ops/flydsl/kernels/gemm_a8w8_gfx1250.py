@@ -319,8 +319,13 @@ def launch_gemm_a8w8(
         + ("_bs32x32" if b_scale_32x32 else "")
         + ("_ktail" if k_tail else "")
         + ("_pl" if pipelined else "")
-        # the exact limit (repr round-trips), "." spelled "p" for the symbol
-        + (f"_silu{float(act_limit)!r}q".replace(".", "p") if fuse_act_mul else "")
+        # the exact limit (repr round-trips); "." -> "p" and "+" (1e+16) dropped,
+        # since neither is a legal symbol character ("-" is mapped below)
+        + (
+            f"_silu{float(act_limit)!r}q".replace(".", "p").replace("+", "")
+            if fuse_act_mul
+            else ""
+        )
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -1428,7 +1433,9 @@ def launch_gemm_a8w8(
 
             def _act(g, u):
                 # aiter act_and_mul_kernel<silu>: with a limit, the fminf /
-                # fmed3 clamp (none at act_limit 0, as silu_and_mul with 0);
+                # fmed3 clamp (none at act_limit 0, as silu_and_mul with 0),
+                # here in f32 (silu_and_mul rounds the clamped gate to bf16,
+                # the same value whenever bf16 holds the limit exactly);
                 # x * rcp(1 + exp(-x)), times up, rounded to bf16.
                 if const_expr(act_limit > 0):
                     g = fx.Float32(fx.minnumf(g, lim))
