@@ -200,7 +200,6 @@ M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle
 1,6144,9216,False,torch.bfloat16,torch.bfloat16,False,False
 1,18432,6144,False,torch.bfloat16,torch.bfloat16,False,False
 2,6144,9216,False,torch.bfloat16,torch.bfloat16,False,False
-2,18432,6144,False,torch.bfloat16,torch.bfloat16,False,False
 4,6144,9216,False,torch.bfloat16,torch.bfloat16,False,False
 4,18432,6144,False,torch.bfloat16,torch.bfloat16,False,False
 8,6144,9216,False,torch.bfloat16,torch.bfloat16,False,False
