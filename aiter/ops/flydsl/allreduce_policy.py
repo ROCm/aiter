@@ -144,7 +144,7 @@ AG_CODECS = ("int4", "int6", "fp16")
 
 # Hierarchical algorithm.
 HIER_CODECS = ("int4", "int5", "int6", "fp16")
-HIER_SUPER_TILES = (1, 2, 4, 8, 16, 32)
+HIER_SUPER_TILES = (1, 8, 16, 32)
 HIER_LOCAL_SCHEDULES = ("mesh", "ring")
 # The default wire format of the hierarchical algorithm's exchange between the two
 # groups.

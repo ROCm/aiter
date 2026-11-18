@@ -25,7 +25,6 @@ import dataclasses
 import functools
 import logging
 import math
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -396,22 +395,8 @@ class FlyQuickAllReduce:
         groups=None,
         local_rs: str | None = None,
         local_ag: str | None = None,
-        x_mover: bool | None = None,
-        x_mover_wt: bool | None = None,
     ):
         check_world_size(world_size)
-        if x_mover is None:
-            # PROTOTYPE switch for the test suites: "wt" or "nt" (the mover's
-            # store policy) turns the mover on for every hierarchical engine.
-            env = os.environ.get("AITER_FLY_AR_HIER_MOVER", "").strip().lower()
-            if env not in ("", "0", "wt", "nt"):
-                raise ValueError(
-                    f"AITER_FLY_AR_HIER_MOVER must be wt or nt, got {env!r}"
-                )
-            x_mover = env in ("wt", "nt") and algorithm == "hier"
-            if x_mover_wt is None:
-                x_mover_wt = env != "nt"
-        x_mover_wt = True if x_mover_wt is None else bool(x_mover_wt)
         if algorithm not in ALGORITHMS:
             raise ValueError(
                 f"algorithm must be one of {tuple(ALGORITHMS)}, got {algorithm!r}"
@@ -422,13 +407,11 @@ class FlyQuickAllReduce:
         # kept for that.
         requested_codecs = (rs_codec, x_codec, ag_codec)
         rs_codec, ag_codec = _resolve_codecs(algo, int(world_size), rs_codec, ag_codec)
-        if not algo.hierarchical and (
-            any(v is not None for v in (x_codec, groups, local_rs, local_ag))
-            or x_mover
+        if not algo.hierarchical and any(
+            v is not None for v in (x_codec, groups, local_rs, local_ag)
         ):
             raise ValueError(
-                "x_codec, groups, local_rs, local_ag and x_mover are for "
-                "algorithm='hier' only"
+                "x_codec, groups, local_rs and local_ag are for algorithm='hier' only"
             )
         for label, sched in (("local_rs", local_rs), ("local_ag", local_ag)):
             if sched is not None and sched not in HIER_LOCAL_SCHEDULES:
@@ -467,10 +450,6 @@ class FlyQuickAllReduce:
             groups = check_groups(groups, int(world_size))
             self.groups = groups
             build_kw = {"groups": groups}
-            if x_mover:
-                # PROTOTYPE: the cross exchange on mover waves, Lamport slots.
-                build_kw.update(x_mover=True, x_mover_wt=bool(x_mover_wt))
-        self.x_mover = bool(x_mover)
         if ladder is None:
             ladder = algo.st_ladder(world_size=world_size, link=link, arch=arch)
         if not ladder:
@@ -584,24 +563,6 @@ class FlyQuickAllReduce:
                             rung.local_ag,
                         )
                         grid = min(grid, max(1, lds_capacity // wg_lds) * cu_count)
-                        if self.x_mover:
-                            # The movers, one wave per compute block, must be
-                            # resident too: compute + movers within what
-                            # clamp_grid_cap allows at an unbounded cap.
-                            resident = clamp_grid_cap(
-                                1 << 20,
-                                arch=arch,
-                                world_size=len(self.groups[0]),
-                                super_tile=st,
-                                cu_count=cu_count,
-                                block=b,
-                            )
-                            resident = min(
-                                resident, max(1, lds_capacity // wg_lds) * cu_count
-                            )
-                            waves = b // 64
-                            while grid > 1 and grid + -(-grid // waves) > resident:
-                                grid -= 1
                     if algo.lds_bytes is not None:
                         # The VGPR table assumes INT4's rank-tile; a wider
                         # codec can run out of LDS first.

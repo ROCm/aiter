@@ -153,10 +153,7 @@ class _StEngine:
                 peer_ptrs[r] = base + off
 
         peer_bytes = world_size * 8
-        # One colour per block; a hierarchical mover build keeps a second
-        # copy per block for its mover wave (``color_slots``).
-        n_colors = self.grid * int(self.spec.get("color_slots", 1))
-        color_bytes = n_colors * 4
+        color_bytes = self.grid * 4
         # Peer-pointer table and per-block colours: written by the host once
         # and by this rank's own kernel, never by a peer. Stays uncached in
         # every mode -- no cross-GPU visibility question, and it is a few
@@ -179,7 +176,7 @@ class _StEngine:
         )
         IpcHeap.copy_host_to_device(
             self._colors,
-            (ctypes.c_int32 * n_colors)(*([1] * n_colors)),
+            (ctypes.c_int32 * self.grid)(*([1] * self.grid)),
             color_bytes,
         )
         if xchg_bytes:
