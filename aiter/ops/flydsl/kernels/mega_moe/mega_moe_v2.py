@@ -17,7 +17,8 @@ from ..flydsl_dispatch_combine_intranode_op import (
     FlyDSLDispatchCombineIntraNodeOp,
 )
 from . import envs
-from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
+from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot, fused_stage2_state_ints
+from .gemm2 import _resolve_g2_knobs
 from .mega_moe_config import (
     INDEXED_PAYLOAD_MIN_MTPR,
     MegaMoEConfig,
@@ -400,6 +401,12 @@ class MegaMoEV2:
         self._s1_bounds_check = (
             os.environ.get("AITER_MEGA_MOE_BOUNDS_CHECK", "0") == "1"
         )
+        # Fixed-slot Stage1 runs GEMM2 itself (mega_moe_stage1 FUSE_G2).
+        # Fused GEMM2 is validated for the 48-expert target layout only; the draft MoE keeps its Stage2 launch.
+        self._s1_fused_g2 = (
+            self._s1_fixed_slot and envs.AITER_MEGA_S1_FIXED_FUSED_STAGE2 and self.epr == 48
+        )
+        self._fused_stage2_settings_cache = {}
         self._s1_w1 = w1.contiguous().view(torch.uint8)
         self._s1_w1_scale = w1_scale.contiguous().view(torch.uint8)
         op = self.comb_op._gm
@@ -459,19 +466,28 @@ class MegaMoEV2:
 
         inter_dim = self.inter_dim
         a2rows = self._s1_nvm
-        if self._a_dtype == "fp4":
-            self._s1_out = torch.zeros(
-                (a2rows, inter_dim // 2), dtype=torch.uint8, device=self.dev
-            ).view(torch.float4_e2m1fn_x2)
-            self._s1_out_kernel = self._s1_out.view(torch.uint8)
+        out_row_bytes = inter_dim // 2 if self._a_dtype == "fp4" else inter_dim
+        if self._s1_fused_g2:
+            # Fused GEMM2 reads GEMM1's output in the same launch from CUs on
+            # other XCDs, so it lives on the uncached symmetric heap.  It only
+            # needs a row per route plus each expert's last-tile padding.
+            a2rows = min(a2rows, self.world_size * self.mtpr * self.topk + self.epr * 128)
+            prows = ((a2rows + 255) // 256) * 256
+            pcols = (((inter_dim // 32) + 7) // 8) * 8
+            out_bytes = op._sym((a2rows * out_row_bytes,), torch.uint8).view(a2rows, out_row_bytes)
+            self._s1_osd = op._sym((prows * pcols + inter_dim,), torch.uint8)
         else:
-            self._s1_out = torch.zeros(
-                (a2rows, inter_dim), dtype=torch.float8_e4m3fn, device=self.dev
-            )
+            out_bytes = torch.zeros((a2rows, out_row_bytes), dtype=torch.uint8, device=self.dev)
+            prows = ((a2rows + 255) // 256) * 256
+            pcols = (((inter_dim // 32) + 7) // 8) * 8
+            self._s1_osd = torch.zeros(prows * pcols + inter_dim, dtype=torch.uint8, device=self.dev)
+        self._s1_out_rows = a2rows
+        if self._a_dtype == "fp4":
+            self._s1_out = out_bytes.view(torch.float4_e2m1fn_x2)
+            self._s1_out_kernel = out_bytes
+        else:
+            self._s1_out = out_bytes.view(torch.float8_e4m3fn)
             self._s1_out_kernel = self._s1_out
-        prows = ((a2rows + 255) // 256) * 256
-        pcols = (((inter_dim // 32) + 7) // 8) * 8
-        self._s1_osd = torch.zeros(prows * pcols + inter_dim, dtype=torch.uint8, device=self.dev)
         if self._a_dtype == "fp4":
             self._s1_quant_x = torch.empty(
                 self.mtpr,
@@ -592,6 +608,11 @@ class MegaMoEV2:
         workspace["ready_tile_epoch"] = op._sym((tile_state_blocks,), torch.int32)
         workspace["ready_tile_tail"] = op._sym((2,), torch.int32)
         workspace["payload_ready_rows"] = op._sym((1,), torch.int32)
+        workspace["g2_state"] = (
+            op._sym((fused_stage2_state_ints(metadata_blocks),), torch.int32)
+            if self._s1_fused_g2
+            else torch.zeros(1, dtype=torch.int32, device=self.dev)
+        )
         ms.shmem_barrier_all()
         for name in (
             "bigcnt",
@@ -667,12 +688,17 @@ class MegaMoEV2:
             DispatchSlot.P2P_PAYLOAD_READY_ROWS: "p2p_payload_ready_rows",
             DispatchSlot.PAYLOAD_BLOCKS_PER_DESTINATION: "payload_blocks_per_destination",
             DispatchSlot.PAYLOAD_CHUNKS_PER_DESTINATION: "payload_chunks_per_destination",
+            DispatchSlot.G2_STATE: "g2_state",
         }
         for slot, name in op_slots.items():
             table[slot] = getattr(op, name).data_ptr()
         for slot, name in workspace_slots.items():
             table[slot] = workspace[name].data_ptr()
         table[DispatchSlot.TILE_INPUT_BASE] = self._s1_tile_input_base.data_ptr()
+        table[DispatchSlot.S1_OUT] = self._s1_out_kernel.data_ptr()
+        table[DispatchSlot.S1_OUT_SCALE] = self._s1_osd.data_ptr()
+        table[DispatchSlot.WEIGHT] = op.wts_em.data_ptr()
+        table[DispatchSlot.P2P_COMB_INP] = self.comb_op._p2p_comb_inp.data_ptr()
         if any(pointer == 0 for pointer in table):
             raise RuntimeError("incomplete MegaMoE dispatch table")
         self._s1_disp = torch.tensor(table, dtype=torch.int64, device=self.dev)
@@ -732,7 +758,7 @@ class MegaMoEV2:
             op.sorted_expert_ids,
             op.num_valid,
             self._s1_osd,
-            fx.Int32(self._s1_nvm),
+            fx.Int32(self._s1_out_rows),
             fx.Int64(self._s1_disp.data_ptr()),
             fx.Int32(1),
             fx.Int64(0),
@@ -841,6 +867,7 @@ class MegaMoEV2:
         config: Stage1Config | None = None,
         *,
         prepared: bool = False,
+        fused_stage2: tuple | None = None,
     ):
         if stream is None:
             stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
@@ -895,7 +922,7 @@ class MegaMoEV2:
         op = self._s1_op
         common_args = (
             self._s1_out_kernel, self._s1_rx_kernel, self._s1_w1, self._s1_scale_kernel, self._s1_w1_scale,
-            op.tile_row_base, op.sorted_expert_ids, op.num_valid, self._s1_osd, fx.Int32(self._s1_nvm),
+            op.tile_row_base, op.sorted_expert_ids, op.num_valid, self._s1_osd, fx.Int32(self._s1_out_rows),
             fx.Int64(self._s1_disp.data_ptr()), fx.Int32(cur_tok), fx.Int64(x.data_ptr()),
             fx.Int64(topk_ids.data_ptr()), fx.Int64(wts.data_ptr()), fx.Int64(scales.data_ptr()),
             fx.Int64(self._s1_epoch_parity.data_ptr()), fx.Int64(self._s1_epoch_expected.data_ptr()),
@@ -920,10 +947,13 @@ class MegaMoEV2:
             "out_dtype": self._a_dtype,
             "bounds_check": self._s1_bounds_check,
         }
+        if fused_stage2 is not None:
+            common_compile["fused_stage2"] = fused_stage2
         entry = self._active_bundle_entry
         use_bundle = (
             entry is not None
             and entry.config.stage1 == config
+            and fused_stage2 is None
         )
         if use_bundle:
             self._s1_mega_bundle(
@@ -935,8 +965,11 @@ class MegaMoEV2:
                 variants=self._bundle_plan.stage1_variants,
             )
         else:
+            # vLLM rebinds w2 per layer on the one shared instance.
             self._s1_mega(
                 *common_args,
+                fx.Int64(self.w2.data_ptr() if fused_stage2 is not None else 0),
+                fx.Int64(self.w2_scale.data_ptr() if fused_stage2 is not None else 0),
                 stream,
                 **common_compile,
                 sort_block_m=config.sort_block_m,
@@ -1000,6 +1033,7 @@ class MegaMoEV2:
         # caller says ids may be -1.
         if mask_invalid_slots is None:
             mask_invalid_slots = self._combine_mask
+        fused_stage2 = self._fused_stage2_settings(config)
         self._run_fused_stage1(
             x,
             wts,
@@ -1008,9 +1042,55 @@ class MegaMoEV2:
             stream=stream,
             config=config.stage1,
             prepared=prepared,
+            fused_stage2=fused_stage2,
         )
         combine_ids = topk_ids if mask_invalid_slots else None
+        if fused_stage2 is not None:
+            result = self.comb_op.combine_no_stage1(
+                self._g2_combine_placeholder, None, combine_ids, cur_tok=run_tokens,
+                enable_weights=False, stage2_p2p_quant=config.p2p_quant,
+            )
+            return self._stage2_output(result, run_tokens, slice_output)
         return self._run_stage2(run_tokens, stream, slice_output, config, combine_ids)
+
+    def _fused_stage2_settings(self, config: MegaMoEConfig):
+        """Stage2Unit settings for a Stage1 launch that also runs GEMM2, or None."""
+        stage2 = config.stage2
+        if (
+            not self._s1_fused_g2
+            or stage2.aligned_pair
+            or config.stage1.num_waves != 4
+            or self._a_dtype != "fp4"
+            or config.p2p_quant != "fp4_blockwise_1x32"
+        ):
+            return None
+        cache = self._fused_stage2_settings_cache
+        if config not in cache:
+            cache[config] = self._build_fused_stage2_settings(config)
+        return cache[config]
+
+    def _build_fused_stage2_settings(self, config: MegaMoEConfig):
+        stage2 = config.stage2
+        invariants = self._g2_invariants_by_quant[config.p2p_quant]
+        g2_bhoist, g2_ascale_pf, _, _, _, _ = _resolve_g2_knobs(
+            stage2.b_hoist, stage2.ascale_prefetch, stage2.spatial_partition, False, False
+        )
+        return tuple(sorted({
+            "recv_cap": int(invariants["recv_cap"]),
+            "comb_inp_nbytes": int(invariants["comb_inp_nbytes"]),
+            "BM": stage2.block_m,
+            "BN": stage2.block_n,
+            "BK": stage2.block_k,
+            "use_nt": stage2.use_nt,
+            "INTER_MAX": int(invariants["INTER_MAX"]),
+            "g2_bhoist": bool(g2_bhoist),
+            "g2_ascale_pf": bool(g2_ascale_pf),
+            "g2_b2stage": stage2.b2stage,
+            "g2_deep_a_pipeline": stage2.deep_a_pipeline,
+            "g2_bf16_lds": stage2.bf16_lds,
+            "p2p_quant_type": config.p2p_quant,
+            "scatter_vec": 8,
+        }.items()))
 
     def _run_stage2(
         self, run_tokens, stream, slice_output, config: MegaMoEConfig, combine_ids=None
@@ -1188,7 +1268,7 @@ class MegaMoEV2:
             fx.Int64(workspace["fanout_pair_config"].data_ptr()),
             fx.Int64(self._s1_epoch_parity.data_ptr()),
             self.comb_op._fx_p2p_comb_inp,
-            self._s1_nvm,
+            self._s1_out_rows,
             self._g2v2_inter,
             self._g2v2_hidden,
             stream,
@@ -1246,7 +1326,7 @@ class MegaMoEV2:
             fx.Int64(workspace["fanout_pair_config"].data_ptr()),
             fx.Int64(self._s1_epoch_parity.data_ptr()),
             self.comb_op._fx_p2p_comb_inp,
-            self._s1_nvm,
+            self._s1_out_rows,
             self._g2v2_inter,
             self._g2v2_hidden,
             stream,

@@ -809,6 +809,66 @@ def _tune_v41_flash_ep8(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoECo
         # A4W4 fixed-slot decode at MTPR 512 (AITER_MEGA_FIXED_SLOT_MAX_MTPR=1023), MXFP4 combine. Searched
         # on 8x MI355X over the DP-padded decode graph sizes 128/160 (bucket 128) and 192/224 (bucket 256);
         # outputs match the base config bitwise.
+        if (
+            ctx.fixed_slot
+            and ctx.mtpr == 512
+            and ctx.bucket in (128, 256)
+            and (
+                envs.AITER_MEGA_S1_FIXED_FUSED_STAGE2
+                or envs.AITER_MEGA_S1_FIXED_TUNED_GEMM1
+            )
+        ):
+            # The fused-GEMM2 Stage1 (256-thread CTAs) on the MoRI + fused-MoE tiles: GEMM1 t32x128x256 with
+            # 4 waves and async A copies, GEMM2 bm32 bn128 bk256 nt with bhoist, apf and spart 4x2; the FP4
+            # combine needs Stage2's f32 CShuffle, so bf16_lds stays off. The tuned flags move both to the
+            # fused-MoE recipe's 64-row tiles.
+            # A separate Stage2 runs on a persistent grid of 240 CUs: the one-shot
+            # grid takes ~117 us at 160-224 tokens a rank, a persistent one ~75 us.
+            persist_cu = 240
+            stage1 = {
+                "sort_block_m": 32,
+                "tile_n": 128,
+                "tile_k": 256,
+                "num_waves": 4,
+                "async_a_copy": True,
+            }
+            if envs.AITER_MEGA_S1_FIXED_TUNED_GEMM1:
+                # At 160-224 tokens a rank most experts get under 64 rows, so one
+                # 64-row tile streams each expert's W1 once where 32-row tiles
+                # stream it twice: ~106 us standalone against 116-125 us at 224.
+                stage1.update(sort_block_m=64, waves_per_eu_hint=3, b_nt=2)
+                if envs.AITER_MEGA_S1_FIXED_TUNED_GEMM1_WIDE:
+                    # 864 items of 64 x 256 on 512 CTAs, as the fused-MoE kernel's
+                    # workgroups: ~62 us a round at full load against ~45 us per
+                    # 64 x 128 item on 768 CTAs, which leaves a 25%-full third round.
+                    stage1.update(tile_n=256, grid_mult=2, waves_per_eu_hint=2)
+            stage2_block_m = 32
+            if (
+                envs.AITER_MEGA_S1_FIXED_TUNED_GEMM1
+                and envs.AITER_MEGA_S2_FIXED_TUNED_GEMM2
+            ):
+                # At 160-224 tokens a rank an expert's rows fit one 64-row tile, so
+                # 32-row GEMM2 blocks run about half padding and read W2 twice.
+                stage2_block_m = stage1["sort_block_m"]
+            return _replace_config(
+                config,
+                stage1=stage1,
+                stage2={
+                    "block_m": stage2_block_m,
+                    "block_n": 128,
+                    "block_k": 256,
+                    "use_nt": True,
+                    "persist": persist_cu > 0,
+                    "persist_cu": persist_cu,
+                    "persist_strided": False,
+                    "b_hoist": True,
+                    "ascale_prefetch": True,
+                    "spatial_partition": 402,
+                    "b2stage": False,
+                    "deep_a_pipeline": False,
+                    "bf16_lds": False,
+                },
+            )
         if ctx.fixed_slot and ctx.mtpr == 512:
             if ctx.bucket == 128:
                 return _replace_config(
