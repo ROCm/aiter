@@ -300,7 +300,12 @@ def _check_call(
         return _Rejected(ValueError, "Q/K/V must be BF16 [tokens, heads, 256]")
     if isinstance(softmax_scale, (torch.Tensor, bool)):
         return _Rejected(TypeError, "softmax_scale must be a host scalar or None")
-    scale = 0.0625 if softmax_scale is None else float(softmax_scale)
+    try:
+        scale = 0.0625 if softmax_scale is None else float(softmax_scale)
+    except OverflowError:
+        scale = math.inf  # too large for a float: the range rule below rejects it
+    except (TypeError, ValueError):
+        return _Rejected(TypeError, "softmax_scale must be a host scalar or None")
     # The kernels multiply masked -inf scores by it: an FP32 zero would give NaN.
     scaled = scale * math.log2(math.e)
     if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:

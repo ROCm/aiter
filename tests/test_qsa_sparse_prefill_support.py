@@ -173,6 +173,7 @@ REJECTED = [
     # 1e-50 x log2(e) < 2**-149, 1e40 x log2(e) > the largest FP32.
     case("scale_underflow", lambda: {"softmax_scale": 1e-50}, SCALE_RANGE),
     case("scale_overflow", lambda: {"softmax_scale": 1e40}, SCALE_RANGE),
+    case("scale_int_overflow", lambda: {"softmax_scale": 10**400}, SCALE_RANGE),
     case("slots_list", lambda: {"kv_slots": list(range(ROWS))}, SLOTS),
     case("slots_int64", lambda: {"kv_slots": zeros(ROWS, dtype=torch.int64)}, SLOTS),
     case("slots_2d", lambda: {"kv_slots": zeros(ROWS, 1, dtype=torch.int32)}, SLOTS),
