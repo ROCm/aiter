@@ -489,9 +489,10 @@ def flydsl_qsa_sparse_prefill(
         raise ValueError("Host query/prefix lengths must describe the packed Q/K/V")
     if q.device.type != "cuda" or torch.version.hip is None:
         raise ValueError("QSA sparse attention requires ROCm gfx942")
-    for tensor in (q, k, v):
+    kv_dtype = torch.bfloat16 if fp8 is None else FP8
+    for tensor, dtype in ((q, torch.bfloat16), (k, kv_dtype), (v, kv_dtype)):
         if (
-            tensor.dtype != (torch.bfloat16 if tensor is q or fp8 is None else FP8)
+            tensor.dtype != dtype
             or tensor.device != q.device
             or tensor.layout != torch.strided
             or not tensor.is_contiguous()

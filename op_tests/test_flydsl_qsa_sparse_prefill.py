@@ -2356,8 +2356,9 @@ ENTRY_PARAMETERS = (
 @benchmark()
 def test_qsa_fp8_input_errors(case, heads):
     """Malformed FP8 calls raise ValueError before any launch (no FlyDSL specialization
-    is added), each differing from a valid call in one input; the entry's parameters are
-    API.md's: names, order, keyword-only and defaults."""
+    is added), each differing from a valid call in one input, and Q passed again as K
+    with FP8 V; the entry's parameters are API.md's: names, order, keyword-only and
+    defaults."""
     layout, _ = FP8_ERROR_CASES[case]
     query_lens, prefix_lens = CASES[layout][:2]
     generator = torch.Generator(device="cuda").manual_seed(fp8_seed(case, heads))
@@ -2408,6 +2409,22 @@ def test_qsa_fp8_input_errors(case, heads):
             accepted.append(label)
         except ValueError:
             pass
+    # Q passed again as K (one BF16 tensor) with FP8 V: K must be FP8 as well.
+    alias = q[:4].clone()
+    try:
+        qsa_sparse_prefill(
+            alias,
+            alias,
+            torch.zeros_like(alias).to(FP8),
+            make_indices((4,), (0,), "random", generator, (indices.shape[1] - 3) // 4),
+            query_lens=(4,),
+            prefix_lens=(0,),
+            k_scale=one,
+            v_scale=one,
+        )
+        accepted.append("Q as BF16 K with FP8 V")
+    except ValueError:
+        pass
     after = flydsl_variants()
     parameters = tuple(
         (
