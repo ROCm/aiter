@@ -65,6 +65,21 @@ _PACKED_BN64_GROUPS = (4, 8, 16)
 # Lanes per wave in packed BN64's cu_seqlens_q scan.
 _SCAN_LANES = 64
 
+# batch_chunks is a compile-time unroll of the scan, so it is bucketed to keep the
+# key space (and the AOT list) finite. The kernel tolerates an oversized value:
+# lanes past the batch re-read the last entry and are masked out of the vote.
+# Batches needing more chunks decline to the Triton wrapper (no AOT artifact).
+_BATCH_CHUNK_BUCKETS = (1, 2, 4, 8)
+
+
+def _bucket_batch_chunks(num_seqs: int):
+    """Smallest bucket covering ceil((num_seqs + 1) / 64) chunks, or None."""
+    need = -(-(num_seqs + 1) // _SCAN_LANES)
+    for bucket in _BATCH_CHUNK_BUCKETS:
+        if need <= bucket:
+            return bucket
+    return None
+
 
 # Packed BN64 adds batch_chunks and interleaved to the key, so it is several times
 # the base config space; a thrash would retrace (~75 ms per flyc.compile).
@@ -731,9 +746,17 @@ def flydsl_unified_attention(
     bn64_args = {}
     if packed_bn64:
         block_m = 128  # fixed by the body; keeps the cache key equal to the AOT job
+        # cu_seqlens_q has num_seqs + 1 entries, one per scan lane.
+        batch_chunks = _bucket_batch_chunks(num_seqs)
+        if batch_chunks is None:
+            # Non-causal has no Triton fallback (it raises), so it keeps the exact
+            # chunk count and JITs; causal declines.
+            if not causal:
+                batch_chunks = -(-(num_seqs + 1) // _SCAN_LANES)
+            else:
+                return None
         bn64_key = {
-            # cu_seqlens_q has num_seqs + 1 entries, one per scan lane.
-            "batch_chunks": -(-(num_seqs + 1) // _SCAN_LANES),
+            "batch_chunks": batch_chunks,
             # A batch filling q at max_seqlen_q per sequence is uniform: rank-major order
             # is longest-first across it. Host ints only; the kernel re-checks, so a
             # ragged replay of a captured graph stays correct.

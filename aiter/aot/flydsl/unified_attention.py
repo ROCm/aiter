@@ -50,6 +50,10 @@ _OUT_DTYPES = ("bf16", "f16")
 
 
 def _prefill_jobs() -> list[dict]:
+    # The router's own bucket set: every key it can select needs an artifact.
+    # Imported here, not at module level, like the other adapter imports.
+    from aiter.ops.flydsl.unified_attention_kernels import _BATCH_CHUNK_BUCKETS
+
     return [
         {
             "causal": causal,
@@ -58,11 +62,16 @@ def _prefill_jobs() -> list[dict]:
             "rescale_threshold": threshold,
             "block_m": block_m,
             "packed_bn64": packed,
+            "batch_chunks": chunks,
+            "interleaved": il,
         }
         for causal in (True, False)
         for out_dtype in _OUT_DTYPES
         for shuffled in (False, True)
         for threshold in (6.0, 4.0)
+        for chunks in _BATCH_CHUNK_BUCKETS
+        # Rank-major order is causal only; the router never sets it otherwise.
+        for il in ((False, True) if causal else (False,))
         # The adapter routes this GQA-16 shape to packed BN64 (fixed block_m=128).
         for block_m, packed in ((128, True),)
     ]
@@ -97,6 +106,7 @@ def _kernel_name(job: dict) -> str:
         f"_shuf{int(job['shuffled_kv_cache'])}"
         f"_thr{job['rescale_threshold']:g}_bm{job['block_m']}"
         f"{'_bn64pack' if job['packed_bn64'] else ''}"
+        f"_bc{job['batch_chunks']}_il{int(job['interleaved'])}"
     )
 
 
@@ -155,6 +165,8 @@ def _compile_prefill(job: dict) -> None:
         job["rescale_threshold"],
         job["block_m"],
         packed_bn64=job["packed_bn64"],
+        batch_chunks=job["batch_chunks"],
+        interleaved=job["interleaved"],
     )
 
     fp8 = torch.float8_e4m3fn
@@ -208,7 +220,8 @@ def compile_one_config(**job) -> dict:
     shape_str = (
         f"{kernel_name}  causal={job.get('causal')} "
         f"out={job.get('out_dtype_str')} shuffled={job.get('shuffled_kv_cache')} "
-        f"threshold={job.get('rescale_threshold')} block_m={job.get('block_m')}"
+        f"threshold={job.get('rescale_threshold')} bc={job.get('batch_chunks')} "
+        f"il={job.get('interleaved')} block_m={job.get('block_m')}"
     )
 
     t0 = time.time()
