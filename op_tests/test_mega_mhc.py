@@ -116,10 +116,10 @@ def reference_for(args, kw):
     return ref_mhc_fused_post_pre_delayed_rmsnorm(*args, **reference_kw)
 
 
-def case(t, h, mode, seed=0):
+def case(t, h, mode, seed=0, rms_eps=ARGS[0], norm_eps=1e-6):
     r, y, fn, scale, base, post, comb, pre, w = make_inputs(t, h, seed=seed)
-    args = (r, fn, scale, base, *ARGS)
-    kw = {"pre_mix": pre, "norm_weight": w}
+    args = (r, fn, scale, base, rms_eps, *ARGS[1:])
+    kw = {"pre_mix": pre, "norm_weight": w, "norm_eps": norm_eps}
     if "no_post" not in mode:
         kw.update(sublayer_out=y, post_layer_mix=post, comb_res_mix=comb)
     if "identity" in mode:
@@ -222,12 +222,16 @@ class _BenchmarkBackend:
         workspace=None,
         res_preshuffle=False,
         scale_row_major=False,
+        norm_eps=1e-6,
+        persistent_workers=0,
     ):
         self.name = name
         self.res_preshuffle = res_preshuffle
         self.scale_row_major = scale_row_major
         self.backend = backend_function(name)
         self.scalar_args = scalar_args
+        self.norm_eps = norm_eps
+        self.persistent_workers = persistent_workers
         self.out_dtype = out_dtype
         if name == "triton" and out_dtype != "bf16":
             raise ValueError("Triton Mega-MHC has no fused mxfp8 output")
@@ -242,9 +246,12 @@ class _BenchmarkBackend:
             "post_layer_mix": post,
             "comb_res_mix": comb,
             "norm_weight": weight,
+            "norm_eps": self.norm_eps,
             "residual_out": residual_out,
         }
         if self.name == "hip":
+            if self.persistent_workers:
+                kw["persistent_workers"] = self.persistent_workers
             kw["workspace"] = self.workspace
             kw["w_preshuffle_bf16"] = True
             if self.res_preshuffle:
@@ -297,6 +304,9 @@ def benchmark_mega_mhc(
     check_only=False,
     res_preshuffle=False,
     scale_row_major=False,
+    rms_eps=ARGS[0],
+    norm_eps=1e-6,
+    persistent_workers=0,
 ):
     """Check one M/H/mode/dtype combination and return its backend results.
 
@@ -304,7 +314,7 @@ def benchmark_mega_mhc(
     returns is unshuffled outside the timed calls before the checks.
     scale_row_major asks HIP for row-major MXFP8 scales (affects gfx1250).
     """
-    args, kw, reference = case(m, hidden_size, mode, seed)
+    args, kw, reference = case(m, hidden_size, mode, seed, rms_eps, norm_eps)
     result = {"status": "PASS"}
     num_bytes = benchmark_bytes(m, hidden_size, mode, out_dtype)
     # Include all inputs and the residual output buffer in rotation sizing.
@@ -341,7 +351,7 @@ def benchmark_mega_mhc(
             workspace = prepare_mega_mhc(args[0].device, m, hidden_size)
         row_major = name == "hip" and scale_row_major
         caller = _BenchmarkBackend(
-            name, args[4:], out_dtype, workspace, shuffled, row_major
+            name, args[4:], out_dtype, workspace, shuffled, row_major, norm_eps
         )
 
         def check_backend(out, shuffled=shuffled, row_major=row_major):
@@ -349,8 +359,19 @@ def benchmark_mega_mhc(
                 out = (unshuffle_residual(out[0]), *out[1:])
             check(out, reference, row_major)
 
+        if persistent_workers:
+            from torch.utils._pytree import tree_flatten, tree_map
+            assert name == "hip"
+            frozen = tree_map(torch.clone, caller(*backend_tensors))
+            caller.persistent_workers = persistent_workers
         out = caller(*backend_tensors)
         check_backend(out)
+        if persistent_workers:
+            got, spec = tree_flatten(out)
+            ref, ref_spec = tree_flatten(frozen)
+            assert spec == ref_spec
+            for actual, expected in zip(got, ref):
+                assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
         result[name] = "PASS"
         if not check_only:
             us = float("nan")  # Empty tensors have no kernel to time.
@@ -367,6 +388,54 @@ def benchmark_mega_mhc(
         "PASS" if any(result[name] == "PASS" for name in backends) else "SKIP"
     )
     return result
+
+
+def test_p256_a01_bf16_midpoints():
+    """Check both BF16 rounding sites and the partials consumed by other splits."""
+    import pytest
+    from torch.utils._pytree import tree_flatten
+
+    if not torch.cuda.is_available() or get_gfx_runtime() != "gfx1250":
+        pytest.skip("requires the gfx1250 MONO split32 kernel")
+    m, h = 96, 5120
+    residual, sublayer, fn, scale, base, post, comb, pre, weight = make_inputs(m, h)
+    packed = mega_mhc_shuffle_fn(fn)
+    workspace = prepare_mega_mhc(residual.device, m, h)
+    residual.fill_(1)
+    sublayer.fill_(1)
+    # sqrt(2^32 + mean(x^2)) rounds to 2^16 on these inputs: the norm also
+    # exposes the stored collapse, independently of the square partial.
+    weight.fill_(2**16)
+    for post_midpoint in (True, False):
+        post.zero_()
+        pre.zero_()
+        comb.zero_()
+        if post_midpoint:
+            post.fill_(1 + 2**-8)
+            comb[:, 3, :].fill_(2**-27)
+            rows = torch.arange(m, device=residual.device)
+            pre[rows, rows % 4] = 1
+        else:
+            comb.copy_(torch.eye(4, device=residual.device).expand(m, 4, 4))
+            pre[:, 0].fill_(1 + 2**-8)
+            pre[:, 3].fill_(2**-27)
+        frozen = None
+        for workers in (0, 256):
+            result = mega_mhc(
+                residual, packed, scale, base, 1e-20, 1e-6, 1e-6, 2.0, 20, pre,
+                sublayer_out=sublayer, post_layer_mix=post, comb_res_mix=comb,
+                norm_weight=weight, norm_eps=2**32, workspace=workspace,
+                w_preshuffle_bf16=True, out_dtype="mxfp8", scale_row_major=True,
+                persistent_workers=workers,
+            )
+            tensors, _ = tree_flatten(result)
+            tensors.append(workspace.partials.view(32, m, 32)[:, :, :26].contiguous())
+            if frozen is None:
+                frozen = [t.clone() for t in tensors]
+            else:
+                for actual, expected in zip(tensors, frozen):
+                    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+            assert _counter_state_ok(workspace)
 
 
 def main():
@@ -438,7 +507,12 @@ def main():
         action="store_true",
         help="check the selected shapes and backends, without timing",
     )
+    parser.add_argument("--rms-eps", type=float, default=ARGS[0])
+    parser.add_argument("--norm-eps", type=float, default=1e-6)
+    parser.add_argument("--persistent-workers", type=int, default=0)
     args = parser.parse_args()
+    if args.persistent_workers and any(dtype != "mxfp8" for dtype in args.out_dtype):
+        parser.error("--persistent-workers requires --out-dtype mxfp8 (A01)")
     if any(m < 0 for m in args.tokens):
         parser.error("tokens must be nonnegative")
     if any(not 0 < h <= 65536 or h % 32 for h in args.hidden):
@@ -507,6 +581,9 @@ def main():
                 args.check_only,
                 args.res_preshuffle,
                 args.scale_row_major,
+                args.rms_eps,
+                args.norm_eps,
+                args.persistent_workers,
             )
         )
     columns = ["m", "hidden_size", "mode", "out_dtype"]

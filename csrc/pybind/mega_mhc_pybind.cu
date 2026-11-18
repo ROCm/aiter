@@ -39,5 +39,6 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("variant"),
           py::arg("mxfp8"),
           py::arg("res_preshuffle"),
-          py::arg("scale_row_major"));
+          py::arg("scale_row_major"),
+          py::arg("persistent_workers") = 0);
 }

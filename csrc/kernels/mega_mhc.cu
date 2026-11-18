@@ -12,6 +12,7 @@
 #include "opus/opus.hpp"
 #include <cstdlib>
 #include <limits>
+#include <stdexcept>
 
 #ifndef MHC_HIDDEN
 #error "MHC_HIDDEN must be set by the Mega-MHC module build recipe"
@@ -2625,7 +2626,8 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                    int variant,
                    bool mxfp8,
                    bool res_preshuffle,
-                   bool scale_row_major)
+                   bool scale_row_major,
+                   int persistent_workers)
 {
     {
         const HipDeviceGuard guard(residual.device_id);
@@ -2661,10 +2663,13 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                              quant_out,
                              quant_scale,
                              mxfp8,
-                             scale_row_major);
+                             scale_row_major,
+                             persistent_workers);
             return;
         }
     }
+    if(persistent_workers)
+        throw std::invalid_argument("P256 mHC requires gfx1250");
     AITER_CHECK(!res_preshuffle, "Mega-MHC res_preshuffle requires gfx1250");
     auto launch = [&]<int H, int VARIANT, bool MXFP8>() {
         launch_mega_mhc<H, VARIANT, MXFP8>(residual_out,

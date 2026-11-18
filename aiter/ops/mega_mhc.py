@@ -168,6 +168,7 @@ def _native_launcher(hidden):
         mxfp8: bool,
         res_preshuffle: bool,
         scale_row_major: bool,
+        persistent_workers: int = 0,
     ) -> None: ...
 
     launch.__name__ = f"_mega_mhc_stream_{suffix}"
@@ -404,6 +405,7 @@ def mega_mhc(
     out_dtype: str = "bf16",
     res_preshuffle: bool = False,
     scale_row_major: bool = False,
+    persistent_workers: int = 0,
 ):
     """Delayed post/pre/RMSNorm seam, returning (R, post, comb, norm, next_pre).
 
@@ -422,6 +424,10 @@ def mega_mhc(
     H=5120/7168 on gfx950 and gfx1250 uses stream dispatch for Sinkhorn=20;
     other positive repeat counts use the generic stream kernel with the same
     pack.
+
+    For the gfx1250 H5120 MXFP8 attention input (A01), persistent_workers=256
+    selects the standalone MONO grid (16, 16) with four wave32s. The split32
+    variant uses one resident cohort per row tile and the native workspace.
 
     out_dtype="mxfp8" (gfx950 and gfx1250) returns (norm, q, e8m0) in place of
     norm: the BF16 norm (T, H), float8_e4m3fn q (T, H) and uint8 E8M0 exponent
@@ -453,6 +459,14 @@ def mega_mhc(
         raise ValueError("residual must be a GPU (T, 4, H) tensor")
     t, _, h = residual.shape
     device = residual.device
+    if not isinstance(persistent_workers, int) or persistent_workers not in (0, 256):
+        raise ValueError("gfx1250 MONO requires persistent_workers=256")
+    if persistent_workers and out_dtype != "mxfp8":
+        raise ValueError("P256 mHC is available only for the MXFP8 attention input (A01)")
+    if persistent_workers and (
+        h != 5120 or res_preshuffle or pre_mix is None or sublayer_out is None or sinkhorn_repeat != 20
+    ):
+        raise ValueError("P256 mHC requires the H5120 learned-pre/post REUSE specialization")
     if out_dtype not in ("bf16", "mxfp8"):
         raise ValueError("out_dtype must be 'bf16' or 'mxfp8'")
     _require_tensor(residual, "residual", (t, 4, h), torch.bfloat16, device)
@@ -541,6 +555,8 @@ def mega_mhc(
                 scratch.generic_partials,
                 scratch.generic_counters,
             )
+        if persistent_workers and (arch != "gfx1250" or variant != "gfx1250_split32"):
+            raise ValueError("P256 mHC requires gfx1250_split32 and one resident cohort per tile")
         launch = _native_launcher(h if h in _STREAM_HIDDEN_SIZES else 0)
         launch(
             residual_out,
@@ -574,5 +590,6 @@ def mega_mhc(
             out_dtype == "mxfp8",
             res_preshuffle,
             scale_row_major,
+            *((persistent_workers,) if persistent_workers else ()),
         )
     return residual_out, post_out, comb_out, layer_input, next_pre
