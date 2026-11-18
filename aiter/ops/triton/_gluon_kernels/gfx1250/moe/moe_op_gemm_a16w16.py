@@ -56,6 +56,9 @@ def _build_moe_a16w16_layouts(
 ):
     assert BLOCK_K <= 512, "BLOCK_K exceeds the TDM pad interval"
     assert BLOCK_N <= 512, "BLOCK_N exceeds the TDM pad interval"
+    # The warp bases below give 4 warps or 8 warps. Another count would build a
+    # layout for 8 warps and not match the launch.
+    assert num_warps in (4, 8), f"num_warps must be 4 or 8, got {num_warps}"
     if num_warps == 4:
         warp_bases = [[0, 1], [0, 2]]
     elif BLOCK_M == 16:
