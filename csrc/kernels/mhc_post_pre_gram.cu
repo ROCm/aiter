@@ -124,8 +124,10 @@ __global__ __launch_bounds__(256, 1) void produce(float* __restrict__ partials,
         for(int h = 0; h < HC; ++h)
             rv[h] = load<VEC>(gr, row * full + h * hidden + k);
 
-        // The rounded streams stay in registers: each is stored once and then used
-        // by the Gram products and the projection.
+        // The rounded streams stay in registers: each is stored once and then used by the
+        // Gram products and the projection. The sum has the operation order of mhc_post as
+        // compiled for gfx950 (the product of stream 0 rounded, then x * post and streams
+        // 1..3 fused), spelled out so that next_residual has the bits mhc_post stores.
         FV rounded[HC];
         BV rounded_bf16[HC];
 #pragma unroll
@@ -135,10 +137,11 @@ __global__ __launch_bounds__(256, 1) void produce(float* __restrict__ partials,
 #pragma unroll
             for(int e = 0; e < VEC; ++e)
             {
-                float value = static_cast<float>(xv[e]) * post_v[dest];
+                float value = static_cast<float>(rv[0][e]) * comb_v[dest][0];
+                value       = __builtin_fmaf(static_cast<float>(xv[e]), post_v[dest], value);
 #pragma unroll
-                for(int source = 0; source < HC; ++source)
-                    value += static_cast<float>(rv[source][e]) * comb_v[dest][source];
+                for(int h = 1; h < HC; ++h)
+                    value = __builtin_fmaf(static_cast<float>(rv[h][e]), comb_v[dest][h], value);
                 stored[e]        = opus::fp32_to_bf16(value);
                 rounded[dest][e] = static_cast<float>(stored[e]);
             }
@@ -288,13 +291,11 @@ __device__ __forceinline__ float max_row(float value)
 
 __device__ __forceinline__ float sigmoid(float value) { return 1.0f / (1.0f + __expf(-value)); }
 
-// Elements h .. h + 7 of the fold of one row's four streams (streams starts at its
-// first stream) with the pre mix p. The form mirrors the fold of
-// mhc_pre_big_fuse_rmsnorm_kernel: one product per stream lane, then a pairwise reduce
-// over the four lanes, where each lane fuses its own product into its first add. The
-// FMAs are spelled out so that the result does not depend on implicit contraction;
-// when the streams cancel, that choice changes the folded value. The stream-cancellation
-// cases of op_tests/test_mhc.py hold this fold and the existing one to the same reference.
+// Elements h .. h + 7 of the fold of one row's four streams (streams starts at its first
+// stream) with the pre mix p, in the form of the fold of mhc_pre_big_fuse_rmsnorm_kernel:
+// one product per stream lane, then a pairwise reduce in which each lane fuses its own
+// product into its first add. The FMAs are spelled out: when the streams cancel, implicit
+// contraction changes the folded value (see the cancellation cases of op_tests/test_mhc.py).
 __device__ __forceinline__ F8 fold_vector(opus::gmem<B>& streams, int hidden, int h, const float* p)
 {
     const B8 r0 = load<8>(streams, h);
