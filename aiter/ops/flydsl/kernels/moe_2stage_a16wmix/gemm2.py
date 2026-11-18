@@ -580,13 +580,10 @@ def compile_gemm2_a16w4_port(
         "fp8",
     ), f"a_dtype must be 'bf16' or 'fp8', got {a_dtype!r}"
     assert a_dtype == "bf16" or (
-        w_dtype == "fp4"
-        and not persist
-        and not reuse_lds
-        and str(rocm_arch).startswith("gfx942")
+        w_dtype == "fp4" and not persist and str(rocm_arch).startswith("gfx942")
     ), (
-        f"a_dtype='fp8' needs mxfp4 W, non-persist, no LDS reuse, gfx942: "
-        f"{w_dtype=} {persist=} {reuse_lds=}"
+        f"a_dtype='fp8' needs mxfp4 W, non-persist, gfx942: "
+        f"{w_dtype=} {persist=} {rocm_arch=}"
     )
     if epilog not in ("atomic", "reduce"):
         raise ValueError(f"epilog must be 'atomic' or 'reduce', got {epilog!r}")

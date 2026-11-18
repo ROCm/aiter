@@ -1038,6 +1038,21 @@ _A16W4_FP8_SREF: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDi
 _A16W4_FP8_SREF_MAX = 512
 
 
+def _a16w4_fp8_q2_rows(
+    routed: int, experts: int, sort_block: int, max_sorted: int
+) -> int:
+    """Host-side upper bound on the sorted rows ``moe_sorting`` fills (``num_valid_ids``).
+
+    Each expert's rows are padded to the sort block (the kernel's ``tile_m``, or its
+    ``_sbm`` size when the name has one): ``routed`` (tokens x topk) rows plus at most
+    ``sort_block - 1`` padding rows for each expert that received one. Lets the stage-2
+    fp8 quant skip the unused tail of the ``max_sorted`` buffer without a sync.
+    """
+    routed = int(routed)
+    pad = min(int(experts), routed) * (int(sort_block) - 1)
+    return min(int(max_sorted), routed + pad)
+
+
 def _a16w4_fp8_sref(w_scale: torch.Tensor, experts: int, n_out: int, k_groups: int):
     """Cached ``[E, n_out]`` u8 reference exponents of an MXFP4 scale for the fp8 mode.
 
@@ -2401,15 +2416,24 @@ def _flydsl_moe_stage2_impl(
                 from aiter.utility import dtypes
 
                 # A sorted row is one route and stage 2 contracts over inter_dim, so a
-                # per-row scale is constant over K. gemm2 reads no row past num_valid.
+                # per-row scale is constant over K. gemm2 reads no row past num_valid,
+                # so the quant is launched over the host bound on it: at small token
+                # counts most of max_sorted is padding the grid would still cover.
                 _i_q = torch.empty(
                     inter_states.shape, dtype=dtypes.fp8, device=inter_states.device
                 )
                 _i_s = torch.empty(
                     (max_sorted, 1), dtype=torch.float32, device=inter_states.device
                 )
+                _routed = topk_ids.numel() if topk_ids is not None else M_logical * topk
+                _rows = _a16w4_fp8_q2_rows(
+                    _routed, E, sort_block_m or tile_m, max_sorted
+                )
                 dynamic_per_token_scaled_quant(
-                    _i_q, inter_states, _i_s, num_rows=num_valid_ids
+                    _i_q[:_rows],
+                    inter_states[:_rows],
+                    _i_s[:_rows],
+                    num_rows=num_valid_ids,
                 )
                 inter_states = _i_q
                 _fp8 = {"a_dtype": "fp8", "a_scale": _i_s, "w2_sref": _sref}
