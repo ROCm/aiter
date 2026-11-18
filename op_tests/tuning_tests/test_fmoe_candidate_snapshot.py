@@ -65,9 +65,91 @@ _BASE_TUNER_BLOB = "dd51167d8e6811b9eaceee9267a6ae1912c07b27"
 # Version 1 kept only the tags; a snapshot in it has to be taken again.
 _FORMAT = 2
 
+
+def _moved(old_module, new_module, *names):
+    """{old_module.name: new_module.<name without its class>} for each name."""
+    return {f"{old_module}.{n}": f"{new_module}.{n.rsplit('.', 1)[-1]}" for n in names}
+
+
+_TUNER = "csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune"
+_MOE = "aiter.tuning.moe"
+
 # Task functions that moved since the snapshot was taken: old qualified name
 # -> new one.
-MOVED = {}
+MOVED = {
+    **_moved(
+        _TUNER,
+        f"{_MOE}.backends.asm_1stage",
+        "FmoeTuner.run_1stage_fmoe_fp8_blockscale_g1u1",
+        "FmoeTuner.run_1stage_fmoe_g1u1",
+        "FmoeTuner.run_1stage_fmoe_g1u1_tkw1",
+    ),
+    **_moved(_TUNER, f"{_MOE}.backends.asm_stage1", "FmoeTuner.run_asm_stage1"),
+    **_moved(
+        _TUNER,
+        f"{_MOE}.backends.ck",
+        "FmoeTuner.ck_moe_stage1_fwd_out",
+        "FmoeTuner.ck_moe_stage2_fwd_out",
+    ),
+    **_moved(
+        _TUNER,
+        f"{_MOE}.backends.cktile",
+        "FmoeTuner.cktile_moe_stage1_out",
+        "FmoeTuner.cktile_moe_stage2_out",
+    ),
+    **_moved(
+        _TUNER,
+        f"{_MOE}.backends.flydsl",
+        "FmoeTuner.run_a16w_stage1_sorted_ref",
+        "FmoeTuner.run_flydsl_stage1_out",
+        "FmoeTuner.run_flydsl_stage2_out",
+    ),
+    **_moved(
+        _TUNER,
+        f"{_MOE}.backends.flydsl_v2",
+        "FmoeTuner.generate_v2_stage1_data",
+        "FmoeTuner.generate_v2_stage2_data",
+        "FmoeTuner.run_flydsl_v2_stage1_out",
+        "FmoeTuner.run_flydsl_v2_stage2_out",
+        "FmoeTuner.run_v2_stage1_sorted_ref",
+        "FmoeTuner.run_v2_stage2_ref",
+    ),
+    **_moved(
+        _TUNER,
+        f"{_MOE}.backends.opus",
+        "FmoeTuner.run_opus_stage1_out",
+        "FmoeTuner.run_opus_stage2_out",
+    ),
+    **_moved(
+        _TUNER,
+        f"{_MOE}.compare",
+        "FmoeTuner.run_torch_moe_stage1",
+        "FmoeTuner.run_torch_moe_stage1_ref",
+        "FmoeTuner.run_torch_moe_stage2",
+        "_a16w_sorted_cos",
+        "sorted_stage1_cosine_diff_compare",
+    ),
+    **_moved(
+        _TUNER,
+        f"{_MOE}.inputs",
+        "FmoeTuner.generate_asm_stage1",
+        "FmoeTuner.generate_data_1stage",
+        "FmoeTuner.generate_data_2stages",
+        "FmoeTuner.generate_opus_sorted_stage2_data",
+    ),
+    **_moved(
+        "csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils",
+        f"{_MOE}.mxfp4_v2_tune_utils",
+        "v2_stage1_dequant_cosine_err",
+    ),
+    **_moved(
+        _TUNER,
+        "aiter.fused_moe",
+        "FmoeTuner.torch_moe_2stages",
+        "FmoeTuner.torch_moe_blockscale",
+    ),
+    **_moved(_TUNER, "aiter.test_common", "cosine_diff_compare"),
+}
 
 
 def snapshot_path():
