@@ -127,7 +127,7 @@ def run_torch(x, w, w_scales, dtype):
 
 @pytest.mark.parametrize(
     "B, M, N, K",
-    get_shapes(k_mult=32, max_size=256 * 256 * 256, batch=[1, 2, 4, 8, 16]),
+    get_shapes(k_mult=32, max_size=256 * 512 * 128, batch=[1, 2, 4, 8, 16]),
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])

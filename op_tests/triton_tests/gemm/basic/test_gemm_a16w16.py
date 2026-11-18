@@ -110,7 +110,7 @@ def test_gemm_a16_w16_large_output(M: int, N: int, K: int):
 # and output tensor arg. We don't want the larger set above to test
 # all these combinations.
 @pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu"])
-@pytest.mark.parametrize("M, N, K", get_shapes(max_size=512 * 1024 * 1024))
+@pytest.mark.parametrize("M, N, K", get_shapes(max_size=8192 * 8192 * 8192))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
@@ -201,7 +201,7 @@ def test_gemm_a16_w16_atomic(M: int, N: int, K: int, output):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("M, N, K", get_shapes(max_size=512 * 1024 * 1024))
+@pytest.mark.parametrize("M, N, K", get_shapes(max_size=8192 * 8192 * 8192))
 @pytest.mark.parametrize("layout", ["TT", "NN", "NT"])
 def test_gemm_a16_w16_atomic_layout(M: int, N: int, K: int, layout):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
@@ -218,7 +218,7 @@ def test_gemm_a16_w16_atomic_layout(M: int, N: int, K: int, layout):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("M, N, K", get_shapes(max_size=512 * 1024 * 1024))
+@pytest.mark.parametrize("M, N, K", get_shapes(max_size=8192 * 8192 * 8192))
 @pytest.mark.parametrize("strided", [False, True])
 def test_gemm_a16_w16_atomic_accumulate(M: int, N: int, K: int, strided):
     """accumulate=True adds X @ W^T into y in place, like torch.addmm_."""

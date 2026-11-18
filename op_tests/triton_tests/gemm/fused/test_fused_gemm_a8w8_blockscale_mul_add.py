@@ -24,7 +24,7 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
 from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 
-@pytest.mark.parametrize("M, N, K", get_shapes(min_k=128, max_size=512 * 1024 * 1024))
+@pytest.mark.parametrize("M, N, K", get_shapes(min_k=128, max_size=1024 * 7168 * 256))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN"])
 @pytest.mark.parametrize("output", [True, False])

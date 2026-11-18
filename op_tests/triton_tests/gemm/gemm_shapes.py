@@ -9,22 +9,55 @@ stay in that kernel's test file.
 """
 
 # (M, N, K)
-SHAPES = (
-    # Tails in every dimension.
-    [(1, 1, 1), (3, 5, 2), (17, 200, 384), (31, 7168, 4608), (159, 17389, 597)]
-    + [(1024, 1024, 1024), (4096, 4096, 4096)]
-    # Decode to small prefill over model (N, K): DSR1 router, low N / high K
-    # (split-K), high N / low K, GPT-OSS QKV.
-    + [
-        (m, n, k)
-        for n, k in [(256, 7168), (1280, 8192), (8192, 1024), (5120, 2880)]
-        for m in (1, 32, 128, 1024)
-    ]
-    # DSR1 MLA absorbed BMMs: W_UK (N=512, K=128) and W_UV (N=128, K=512).
-    + [(m, n, k) for n, k in [(512, 128), (128, 512)] for m in (1, 32, 128)]
-    # Prefill and a very large N (LL3 405B FC1).
-    + [(8192, 5120, 2880), (256, 106496, 16384)]
-)
+EDGE_CASES = [
+    (1, 1, 1),
+    (3, 5, 2),
+    (17, 200, 384),
+    (31, 7168, 4608),
+    (159, 17389, 597),
+]
+
+# (M, N, K), M <= 256
+DECODE = [
+    # DSR1 router
+    (1, 256, 7168),
+    (32, 256, 7168),
+    (128, 256, 7168),
+    # Low N, high K (split-K)
+    (1, 1280, 8192),
+    (32, 1280, 8192),
+    (128, 1280, 8192),
+    # High N, low K
+    (1, 8192, 1024),
+    (32, 8192, 1024),
+    (128, 8192, 1024),
+    # GPT-OSS QKV
+    (1, 5120, 2880),
+    (32, 5120, 2880),
+    (128, 5120, 2880),
+    # DSR1 MLA absorbed BMMs: W_UK (N=512, K=128) and W_UV (N=128, K=512)
+    (1, 512, 128),
+    (32, 512, 128),
+    (128, 512, 128),
+    (1, 128, 512),
+    (32, 128, 512),
+    (128, 128, 512),
+    # LL3 405B FC1 (very large N)
+    (256, 106496, 16384),
+]
+
+# (M, N, K), M >= 1024
+PREFILL = [
+    (1024, 256, 7168),
+    (1024, 1280, 8192),
+    (1024, 8192, 1024),
+    (1024, 5120, 2880),
+    (1024, 1024, 1024),
+    (4096, 4096, 4096),
+    (8192, 5120, 2880),
+]
+
+SHAPES = EDGE_CASES + DECODE + PREFILL
 
 
 def get_shapes(n_mult=1, k_mult=1, min_k=1, max_size=None, batch=None, n2=None):

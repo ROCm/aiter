@@ -106,7 +106,7 @@ def test_batched_gemm_a8w8(dtype, b, m, n, k, output):
         (dtype, b, *shape, layout, output)
         for dtype in ["bf16"]
         for b in [16]
-        for shape in get_shapes(max_size=512 * 1024 * 1024)
+        for shape in get_shapes(max_size=2048 * 2048 * 2048)
         for output in [True, False]
         for layout in ["TT", "NN", "NT"]
     ],

@@ -74,7 +74,7 @@ def test_gemm(M, N1, N2, K, dtype, output):
 
 @pytest.mark.parametrize(
     "M, N1, N2, K",
-    get_shapes(k_mult=128, max_size=512 * 1024 * 1024, n2=[32, 96]) + _ODD_SHAPES,
+    get_shapes(k_mult=128, max_size=128 * 16384 * 5120, n2=[32, 96]) + _ODD_SHAPES,
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])

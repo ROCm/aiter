@@ -143,7 +143,7 @@ def skip_if_gluon_unsupported(backend, x, weight, bias):
         for output in [True, False]
         for dtype in ["bf16"]
         for b in [16]
-        for shape in get_shapes(max_size=512 * 1024 * 1024)
+        for shape in get_shapes(max_size=8192 * 8192 * 8192)
         for group_size in [128]
         for has_bias in [True, False]
         for transpose_bm in [True, False]

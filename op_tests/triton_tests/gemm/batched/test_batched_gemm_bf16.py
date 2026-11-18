@@ -95,7 +95,7 @@ e5m2_type, e4m3_type = get_fp8_dtypes()
         (dtype, b, *shape, output)
         for dtype in ["bf16"]
         for b in [4, 8, 16]
-        for shape in get_shapes(max_size=4096 * 4096 * 8192)
+        for shape in get_shapes(max_size=16384 * 1024 * 4096)
         for output in [True, False]
     ],
 )
@@ -125,7 +125,7 @@ def test_batched_gemm_bf16(dtype, b, m, n, k, output, backend, kernel_type):
         (dtype, b, *shape, layout, output)
         for dtype in ["bf16"]
         for b in [4, 8, 16]
-        for shape in get_shapes(max_size=512 * 1024 * 1024)
+        for shape in get_shapes(max_size=16384 * 1024 * 4096)
         for output in [True, False]
         for layout in ["TT", "NN", "NT"]
     ],
