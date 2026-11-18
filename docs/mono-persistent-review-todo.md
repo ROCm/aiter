@@ -1,20 +1,21 @@
 # A03／A09：MI400 复核补测与性能修复 TODO
 
-给 MI400 机器上的 agent：请执行本清单，补齐正确性与真实 JIT 证据，定位 standalone P256 回退，再验证最小修改。不要只返回计划。当前任务状态为**待执行**；下列候选优化均未实施、未测收益。
+给 MI400 机器上的 agent：请执行本清单，补齐正确性与真实 JIT 证据，定位 standalone P256 回退，再验证最小修改。不要只返回计划。A03一维P256最小改动已在本地实现，待用户review及MI400复测；远端清单状态为**待执行**，C1／C2等后续优化未实施、未测收益。
 
 **当前优先只排查 A03 的改造是否引入回退：先执行§2.3.1的原 native 源码 P256 对照。A03 的 C1／C2、跨迭代预取和其他 P 扫描暂不先行实施；取得该对照后再决定。** 原 native 每 TG 只做一行，没有下一迭代需要预取，不能把缺少跨迭代预取直接定为回退原因。A09清单保留，当前先处理A03。
 
-**调度标准只要求256 TG和线性worker ID 0～255，不要求16×16 grid。** 默认采用一维`(256,)`，每TG仍为128 threads。上轮16×16仅是已测实现的配置；它与cluster几何、每TG线程数是不同参数，不再作为正式修复的强制条件。
+**调度标准只要求256 TG和线性worker ID 0～255。** A03采用一维`(256,)`，每TG仍为128 threads；设备端直接复用原native kernel，只在host wrapper设置grid与NUM_PRGMS。后文保留上轮二维版本作为性能排查对照，不将其grid形状作为标准。
 
 ## 0. 版本、范围与启动
 
 | 项目 | 固定值 |
 | --- | --- |
 | 仓库／分支 | `https://github.com/ROCm/aiter`，`asm_mon_dev`；以公开上游为唯一执行与回传入口 |
+| A03一维P256代码 | `7108dbec079595026f76b7b1b8e082fe1669796d`；本地待review，未推送。A09不变；不沿用旧GPU结论 |
 | 本次 review 的结果版本 | `a8a913883d7be9837c2f46f2e92de8fc701bac26` |
 | 上轮实际 GPU 测试代码 | `d5930aff35d67fa0a2e74ba425909747f3ccef9f`；相对 `efa58c2` 只修复 Triton-only import |
-| 原验收指南 | [mono-persistent-validation.md](mono-persistent-validation.md) |
-| 上轮报告／原始数据 | [2026-11-18-gfx1250](mono-results/2026-11-18-gfx1250/README.md) |
+| 原验收指南 | [mono-persistent-validation.md](https://github.com/ROCm/aiter/blob/asm_mon_dev/docs/mono-persistent-validation.md) |
+| 上轮报告／原始数据 | [2026-11-18-gfx1250](https://github.com/ROCm/aiter/tree/a8a913883d7be9837c2f46f2e92de8fc701bac26/docs/mono-results/2026-11-18-gfx1250) |
 | 上轮完整产物 | `/home/weizhu15/workspace/mono-acceptance-20261118`，同级 `mono-acceptance-20261118-results.tar.gz` |
 | 上轮归档 SHA256 | `ec38c863944cc59bef4980f5409b3ba05aac8c33defde8bc89b0e9b9dd40808a` |
 
@@ -40,7 +41,7 @@ git rev-parse HEAD > "$MONO_RESULTS/base-commit.txt"
 
 Python 使用机器上匹配 ROCm 的既有环境；如需隔离，按原指南创建继承 system packages 的 venv。以上命令不安装或升级框架。
 
-若本 TODO 尚未进入上游，先将收到的 MD 保存到 checkout 外，再按正文执行；收到的文档补丁可在发布分支用 `git am <补丁路径>` 应用。基线测试仍固定上述代码，不依赖文档提交是否已合入。
+若本 TODO 尚未进入上游，先将收到的 MD 保存到 checkout 外，再按正文执行；收到的文档补丁可在发布分支用 `git am <补丁路径>` 应用。基线测试仍固定上述代码，不依赖文档提交是否已合入。A03新候选使用`7108dbe`：收到`a03-native-p256.patch`后，在基线的独立候选checkout执行`git am /绝对路径/a03-native-p256.patch`；补丁只包含3个代码文件，可独立于文档提交应用。记录应用后的实际SHA与tree diff，不假定cherry-pick／git am保留原SHA。
 
 范围固定为 standalone P256，正式 PS 为256 TG、每 TG 128 threads，允许一维`(256,)`。冻结 native、两种 scale 公式、零容差及原测试均保留。完整 mono 的 DEV／HT、s104/s105、跨算子 join、设备函数 ABI 和模型接入不在本轮实施。
 
@@ -115,21 +116,23 @@ Python 使用机器上匹配 ROCm 的既有环境；如需隔离，按原指南�
 - [ ] A09：核对 native、`persistent=False` port、PS 的实际 body、指针更新、bounds check 和循环；将数值 body 差异与循环适配差异分开。记录 code-object VGPR／SGPR／scratch／LDS，不直接混用 profiler 的 `VGPR_Count` 数字；如解释差异，给工具字段单位依据。
 - [ ] Profiler 检查正式 PS 实际共256 TG、128 threads/TG，记录完整grid形状和线性ID映射。一维TG grid `(256,1,1)`对应work-item grid `(32768,1,1)`；上轮二维TG grid `(16,16,1)`对应`(2048,16,1)`，两者workgroup均为`(128,1,1)`。不能将合法的一维P256判为失败。grid正确不能证明全部256 TG同时驻留；有可用occupancy／wave／memory stall counters时单独采样，写清计数器含义和窗口。不支持则保留未验证状态，不伪造周期归因。
 
+- [ ] A03新候选已删除设备端`PERSISTENT`参数及repr字段，native／PS不能再靠`PERSISTENT_1`后缀区分。分别运行带provider标记的trace，或按dispatch correlation ID与host launch记录关联；必须记录M、NUM_PRGMS、grid和provider。M=256时两provider的grid及步长相同，不能仅靠grid识别。A09原有后缀不变。
+
 ### 2.3 边界矩阵和单变量对照
 
 #### 2.3.1 A03：先用未修改的 native kernel 直接做 P256
 
-A03 冻结 kernel 已有 `tl.range(row_start, M, NUM_PRGMS, num_stages=2)`，无需添加新循环就能执行 P256。先只增加独立的验收 wrapper，调用冻结的 `_fused_dual_rmsnorm_mxfp8_quant_kernel`；测试／benchmark经该wrapper调用。**不修改 `mono_native.py`，不复制或改写计算体。** 下表中的 M 始终是实际行数，不能为凑 grid 改成256。
+A03 原kernel已有`tl.range(row_start, M, NUM_PRGMS, num_stages=2)`。`7108dbe`将整个设备端文件恢复到`df6a53e`的原字节，wrapper仅以`NUM_PRGMS = 256 if persistent else M`及`grid=(NUM_PRGMS,)`选择调度；保留host接口校验和4 waves。**不修改`mono_native.py`，不复制计算体。** 本地12项离线编译及冻结hash、18组host传参检查通过；尚无新候选GPU结果。M始终是实际行数。
 
 | 对照 | 使用的kernel源码 | grid | NUM_PRGMS／row_start |
 | --- | --- | --- | --- |
 | A：原native | 冻结native | `(M,)` | M／pid0 |
-| B：原native直接P256 | 与A相同的冻结native | `(256,)` | 256／pid0 |
-| C：当前PS | 当前候选，`persistent=True` | `(16,16)` | 256／pid0+16*pid1 |
+| B：新一维PS | `7108dbe`公开wrapper，`persistent=True`；设备端文件与native baseline逐字节相同 | `(256,)` | 256／pid0 |
+| C：上轮二维PS | `a8a913883`历史wrapper，`persistent=True`；通过独立模块与checkout保留 | `(16,16)` | 256／pid0+16*pid1 |
 
 - [ ] 三者固定相同 Q／KV view、权重、eps、floor、dtype、stride、4 wave32、输入pool，以及在capture前分配并保留的同一套输出pool。逐项记录实际kernel参数及JIT specialization；`NUM_PRGMS`数值／整除属性可能改变生成代码，不能仅因源码相同就宣称binary相同。
 - [ ] 先校验 rows=96／256／257／512／513，native逐字节比较、guard／输入未写均通过；再用同一Graph方法，hot／rotating各15轮，按轮轮换A／B／C顺序。保留原正式benchmark结果，三者的诊断时间单列，不混用不同输出pool口径。
-- [ ] 若B与A相当、C较慢，回退位于当前适配路径；对照B／C真实ISA、JIT参数及1D／2D grid。进一步用当前候选的 `PERSISTENT=False`、1D grid=256／步长256作为D，区分源码迁入／编译与二维ID适配。先修该差异，不用预取掩盖。
+- [ ] 若B与A相当、C较慢，回退与上轮适配路径相关；对照B／C真实ISA、JIT参数及1D／2D grid，不能仅凭新候选较快就单独归因于二维grid。新候选没有设备端`PERSISTENT`参数，不再传`PERSISTENT=False`；公共wrapper的`persistent=False`仍表示native grid／步长M。
 - [ ] 若B和C都比A慢，说明保留原源码、只限为P256也可复现；先比较A／B真实代码及运行时参数，再区分TG调度供给和loop执行成本，不能直接写“原native也一样，所以无问题”或“PS必然更慢”。
 - [ ] 若三者在统一buffer的诊断中相当，检查原benchmark的输出分配／地址／Graph节点和JIT差异，复现原回退后再归因。当前Python接口检查发生在capture阶段，不能把它直接加到Graph replay耗时。
 

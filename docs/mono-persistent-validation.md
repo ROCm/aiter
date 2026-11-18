@@ -13,6 +13,13 @@ It keeps the import fix and adds correctness cases, runtime JIT evidence,
 boundary measurements and separate optimization candidates. Its checkout
 instructions replace the original pinned checkout command below.
 
+The local A03 candidate is `7108dbec079595026f76b7b1b8e082fe1669796d`.
+Its device source file is byte-identical to the A03 native base. The wrapper
+uses grid `(256,)` and row-loop step `NUM_PRGMS=256` in persistent mode.
+A09 is unchanged. The candidate has passed local checks and offline builds;
+GPU correctness and performance are pending. The report above covers the old
+two-dimensional implementation only.
+
 ## Code and native references
 
 The code commit for this handoff is `efa58c2ccd4525a8287c4f886945fc48ed86a192`.
@@ -41,9 +48,10 @@ with the other or loosen byte equality to make a mismatch pass.
 
 The grid above describes the pinned implementation. The P256 contract requires
 256 TGs and worker IDs 0 to 255. It does not require a two-dimensional grid.
-For the next A03 run, the follow-up TODO uses the original native kernel with
-grid `(256,)` and `NUM_PRGMS=256` as a control. A one-dimensional grid is valid
-for a P256 fix. Keep 128 threads per TG and record the actual launch shape.
+The new A03 candidate uses the original native kernel with grid `(256,)` and
+`NUM_PRGMS=256`. The actual row count M is unchanged. Keep 128 threads per TG
+and record the actual launch shape. A09 still uses the pinned two-dimensional
+mapping; both implementations have 256 TGs.
 
 ## Prepare the machine
 
@@ -156,7 +164,10 @@ The pinned implementation has work-item grid `(2048,16,1)` and workgroup
 `(128,1,1)`, which gives TG grid `(16,16,1)`. A one-dimensional P256 variant
 has work-item grid `(32768,1,1)` and the same workgroup, which gives TG grid
 `(256,1,1)`. Keep
-the raw CSV and actual JIT metadata. If the profiler is absent, record that the
+the raw CSV and actual JIT metadata. New A03 kernel names no longer contain
+a `PERSISTENT` field. Trace each provider separately or map dispatch correlation
+IDs to host calls, including M, NUM_PRGMS and grid. Grid alone cannot identify
+the provider at M=256. If the profiler is absent, record that the
 runtime launch trace is pending; the wrapper code alone is not a measured trace.
 
 ## Compare performance after correctness passes
