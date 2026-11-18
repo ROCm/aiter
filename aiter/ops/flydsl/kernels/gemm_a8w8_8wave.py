@@ -78,7 +78,10 @@ def wait_barrier(count):
 
 
 class G2SLoader:
-    def __init__(self, gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id):
+    def __init__(
+        self, gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id, non_temporal=False
+    ):
+        self.non_temporal = non_temporal
         self.g2lds_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         self.LdsPtr_t = fx.PointerType.get(lds_dtype, 2, 512)
         self.gl_src = gl_src
@@ -96,14 +99,25 @@ class G2SLoader:
 
     def load(self, lds_dst, k_offset):
         for step in range_constexpr(self.n_load_steps):
-            src = fx.slice(self.gl_src, (None, fx.Int32(self.gl_offsets[step])))
-            dst = self._lds_dst_at(lds_dst, step)
-            fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(k_offset))
+            self.load_one(lds_dst, k_offset, step)
 
     def load_one(self, lds_dst, k_offset, step):
         src = fx.slice(self.gl_src, (None, fx.Int32(self.gl_offsets[step])))
         dst = self._lds_dst_at(lds_dst, step)
-        fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(k_offset))
+        if const_expr(self.non_temporal):
+            # BufferCopyLDS has no cache-policy state. Use its synchronous
+            # intrinsic form so LLVM retains the same LDS dependency tracking.
+            rocdl.raw_ptr_buffer_load_lds(
+                rocdl.get_buffer_rsrc(fx.get_iter(self.gl_src)),
+                fx.to_llvm_ptr(fx.get_iter(dst)),
+                fx.Int32(16),
+                fx.Int32(self.gl_offsets[step]),
+                fx.Int32(k_offset),
+                fx.Int32(0),
+                aux=2,
+            )
+        else:
+            fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(k_offset))
 
 
 class S2RLoader:
