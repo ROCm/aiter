@@ -2413,3 +2413,201 @@ def test_unified_attn_split_rebalance_reduce_configs_k4v8(
     )
     assert not new[live].isnan().any()
     assert torch.equal(old[live].view(torch.int16), new[live].view(torch.int16))
+
+
+class _LaunchSpy:
+    """Forward each launch to the real kernel and record its grid and ONE_Q_BLOCK."""
+
+    def __init__(self, kernel, launches):
+        self._kernel = kernel
+        self._launches = launches
+
+    def __getitem__(self, grid):
+        launch = self._kernel[grid]
+
+        def run(*args, **kwargs):
+            self._launches.append((tuple(grid), kwargs["ONE_Q_BLOCK"]))
+            return launch(*args, **kwargs)
+
+        return run
+
+
+@pytest.mark.parametrize(
+    "seq_lens, num_heads, head_size, block_size",
+    [
+        # max query length 2: one query block per sequence, 3d path for 5000 keys
+        ([(2, 300), (1, 1000), (2, 40), (1, 17), (2, 5000)], (16, 2), 128, 16),
+        ([(2, 96)], (16, 2), 128, 16),
+        # a zero-length sequence sits between the others in the search
+        ([(1, 64), (8, 512), (0, 33), (3, 7)], (8, 8), 64, 64),
+        ([(8, 5000), (1, 9)], (8, 8), 128, 16),
+    ],
+)
+@pytest.mark.parametrize(
+    "q_dtype, use_descale",
+    [(torch.bfloat16, False), (e4m3_dtype, True)],
+)
+@torch.inference_mode()
+def test_triton_unified_attn_one_q_block(
+    seq_lens, num_heads, head_size, block_size, q_dtype, use_descale, monkeypatch
+):
+    """Short batches launch one query block per sequence, and the output is correct.
+
+    The launch is checked directly: every launch must set ONE_Q_BLOCK and use
+    grid[1] == num_seqs. The opt-in length guard is on, so every sequence is
+    also checked to fit the query block.
+    """
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon one-query-block launch")
+    monkeypatch.setenv("AITER_UNIFIED_ATTN_CHECK_SEQLENS", "1")
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens_list = [kv for _, kv in seq_lens]
+    (
+        query,
+        key_cache_orig,
+        value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        _output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * -(-max(kv_lens_list) // block_size),
+        block_size=block_size,
+        head_size=head_size,
+        num_heads=num_heads,
+        q_dtype=q_dtype,
+        kv_dtype=q_dtype,
+        use_q_descale=use_descale,
+        use_kv_descale=use_descale,
+        device="cuda",
+    )
+    module = sys.modules[unified_attention.__module__]
+    launches = []
+    monkeypatch.setattr(
+        module,
+        "_unified_attention_kernel_gfx950",
+        _LaunchSpy(module._unified_attention_kernel_gfx950, launches),
+    )
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    assert launches, "the gfx950 gluon kernel did not launch"
+    for grid, one_q_block in launches:
+        assert one_q_block, "short batch did not take the one-query-block launch"
+        assert grid[1] == len(seq_lens), f"grid {grid}: want one program per sequence"
+
+    ref = ref_paged_attn(
+        query=query,
+        key_cache=key_cache_orig,
+        value_cache=value_cache_orig,
+        query_lens=query_lens,
+        kv_lens=kv_lens_list,
+        block_tables=block_tables,
+        scale=scale,
+        out_dtype=torch.bfloat16,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    ).float()
+    out = output.float()
+    if use_descale:
+        # fp8 gets the same 0.5% mismatch budget as the fp8 gluon tests
+        mismatch = (out - ref).abs() > 1.5e-1 + 1.5e-1 * ref.abs()
+        mismatch_fraction = mismatch.float().mean().item()
+        assert mismatch_fraction < 0.005, (
+            f"fp8 mismatch fraction {mismatch_fraction:.4%} exceeds 0.5% "
+            f"(max abs diff {torch.max(torch.abs(out - ref))})"
+        )
+    else:
+        torch.testing.assert_close(out, ref, atol=1.5e-2, rtol=1e-2)
+
+
+@torch.inference_mode()
+def test_triton_unified_attn_one_q_block_guard(monkeypatch):
+    """With the length guard on, a max_seqlen_q that is too small fails before launch.
+
+    Reporting max_seqlen_q=2 for a 512-token sequence would drop rows on the
+    one-query-block launch, so the guard must raise.
+    """
+    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
+        pytest.skip("gfx950 gluon one-query-block launch")
+    monkeypatch.setenv("AITER_UNIFIED_ATTN_CHECK_SEQLENS", "1")
+    seq_lens = [(2, 300), (512, 512)]
+    block_size = 16
+    (
+        query,
+        _key_cache_orig,
+        _value_cache_orig,
+        key_cache,
+        value_cache,
+        _sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        _max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        _q_descale,
+        _k_descale,
+        _v_descale,
+        _output_scale,
+    ) = generate_data(
+        seq_lens=seq_lens,
+        num_blocks=len(seq_lens) * -(-512 // block_size),
+        block_size=block_size,
+        head_size=128,
+        num_heads=(16, 2),
+    )
+    with pytest.raises(AssertionError, match="rows would be dropped"):
+        unified_attention(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=output,
+            cu_seqlens_q=cu_query_lens,
+            seqused_k=kv_lens,
+            max_seqlen_q=2,
+            max_seqlen_k=max_kv_len,
+            softmax_scale=scale,
+            causal=True,
+            window_size=window_size,
+            block_table=block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+        )
