@@ -350,11 +350,12 @@ def get_flydsl_a16w16_configs(
     if get_gfx_runtime() != "gfx950":
         return []
 
-    split_k_candidates = [1]
-    split_k_candidates.extend(split_k for split_k in range(2, 10) if k % split_k == 0)
+    # FT may distribute whole K tiles unevenly. The kernel validator retains
+    # the stricter HTI/alignment requirements for each candidate.
+    split_k_candidates = list(range(1, min(k, 9) + 1))
     selections = {
         "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
-        "block_n": [16, 32, 64, 80, 96, 128, 256],
+        "block_n": [16, 32, 64, 80, 96, 128, 160, 256],
         "block_k": [64, 128, 256],
         "stages": list(range(2, 10)),
         "split_k": split_k_candidates,

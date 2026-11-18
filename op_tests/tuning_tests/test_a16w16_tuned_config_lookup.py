@@ -29,7 +29,7 @@ class TestA16W16TunedConfigLookup(unittest.TestCase):
     def _lookup(self, table):
         patches = [
             mock.patch.object(tuned, "get_GEMM_A16W16_config_", lambda: table),
-            mock.patch.object(tuned, "get_gfx", lambda: GFX),
+            mock.patch.object(tuned, "get_gfx_runtime", lambda: GFX),
             mock.patch.object(tuned, "get_cu_num", lambda: CU_NUM),
             mock.patch.object(tuned, "get_padded_m", lambda m, _n, _k, _gl: m),
         ]
@@ -721,6 +721,124 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
                 self.assertIs(kw["stream"], stream)
                 self.assertEqual(launch.call_args.args[1].shape, b.t().shape)
         self.assertGreater(len(seen), 0)
+
+
+class TestHgemmInterleavePreshuffleRouting(unittest.TestCase):
+    """Keep the TDM schedule and gfx950 packed-weight APIs independent."""
+
+    def setUp(self):
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+
+        import aiter.ops.flydsl.gemm_kernels as kernels
+
+        self.kernels = kernels
+        self.a = torch.empty((32, 128), dtype=torch.bfloat16)
+        self.b = torch.empty((128, 128), dtype=self.a.dtype)
+        self.out = torch.empty((32, 128), dtype=self.a.dtype)
+        self.stream = SimpleNamespace(device=self.a.device)
+        patcher = mock.patch.object(
+            torch.cuda, "stream", side_effect=lambda _: nullcontext()
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_tdm_interleave_forwards_with_unshuffled_weights(self):
+        import importlib
+
+        tdm = importlib.import_module("aiter.ops.flydsl.gemm_a16w16_tdm")
+        with (
+            mock.patch.object(self.kernels, "get_gfx_runtime", return_value="gfx1250"),
+            mock.patch.object(tdm, "gemm_a16w16_tdm", return_value=self.out) as launch,
+        ):
+            for interleave in (False, True):
+                with self.subTest(interleave=interleave):
+                    result = self.kernels.flydsl_hgemm(
+                        self.a,
+                        self.b,
+                        out=self.out,
+                        stream=self.stream,
+                        policy="tdm",
+                        interleave=interleave,
+                        bpreshuffle=False,
+                    )
+                    self.assertIs(result, self.out)
+                    self.assertEqual(launch.call_args.kwargs["interleave"], interleave)
+                    self.assertIs(launch.call_args.kwargs["stream"], self.stream)
+                    self.assertEqual(
+                        launch.call_args.args[1].stride(), self.b.t().stride()
+                    )
+
+    def test_gfx950_preshuffle_forwards_to_ft_and_skinny(self):
+        with mock.patch.object(self.kernels, "get_gfx_runtime", return_value="gfx950"):
+            for policy, target in (("ft", "gemm_a16w16"), ("sk", "gemm_a16w16_skinny")):
+                with (
+                    self.subTest(policy=policy),
+                    mock.patch.object(
+                        self.kernels, target, return_value=self.out
+                    ) as launch,
+                ):
+                    result = self.kernels.flydsl_hgemm(
+                        self.a,
+                        self.b,
+                        out=self.out,
+                        stream=self.stream,
+                        policy=policy,
+                        split_k=1,
+                        m_waves=1,
+                        n_waves=1,
+                        k_waves=1,
+                        interleave=False,
+                        bpreshuffle=True,
+                    )
+                    self.assertIs(result, self.out)
+                    kwargs = launch.call_args.kwargs
+                    self.assertTrue(
+                        kwargs["user_kwargs"]["bpreshuffle"]
+                        if policy == "ft"
+                        else kwargs["bpreshuffle"]
+                    )
+
+    def test_preshuffle_cannot_enter_tdm_path(self):
+        import importlib
+
+        tdm = importlib.import_module("aiter.ops.flydsl.gemm_a16w16_tdm")
+        with (
+            mock.patch.object(self.kernels, "get_gfx_runtime", return_value="gfx1250"),
+            mock.patch.object(tdm, "gemm_a16w16_tdm") as launch,
+        ):
+            for interleave in (False, True):
+                with self.subTest(interleave=interleave):
+                    with self.assertRaisesRegex(ValueError, "BF16 preshuffle requires"):
+                        self.kernels.flydsl_hgemm(
+                            self.a,
+                            self.b,
+                            out=self.out,
+                            stream=self.stream,
+                            policy="tdm",
+                            interleave=interleave,
+                            bpreshuffle=True,
+                        )
+            launch.assert_not_called()
+
+    def test_interleave_cannot_enter_gfx950_preshuffle_path(self):
+        with (
+            mock.patch.object(self.kernels, "get_gfx_runtime", return_value="gfx950"),
+            mock.patch.object(self.kernels, "gemm_a16w16") as launch,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "interleave is a TDM schedule option"
+            ):
+                self.kernels.flydsl_hgemm(
+                    self.a,
+                    self.b,
+                    out=self.out,
+                    stream=self.stream,
+                    policy="ft",
+                    interleave=True,
+                    bpreshuffle=True,
+                )
+            launch.assert_not_called()
 
 
 if __name__ == "__main__":
