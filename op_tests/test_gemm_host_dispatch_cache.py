@@ -15,8 +15,10 @@ The first two and the routing contract run on CPU; the numerical checks run
 on any GPU whose arch has the kernel and skip elsewhere.
 """
 
+import csv
 import itertools
 import logging
+import os
 
 import pytest
 import torch
@@ -24,7 +26,7 @@ import torch
 from aiter import dtypes
 from aiter.ops import gemm_op_a8w8
 from aiter.ops.flydsl import batched_gemm_a8w8_gfx1250 as bmm
-from aiter.ops.gemm_op_common import find_padded_m_row
+from aiter.ops.gemm_op_common import find_padded_m_row, get_padded_m, padded_m_py
 
 # DeepSeek-V4.1 projection shapes at TP4/TP8 plus generic ones; K = 576 is the
 # ragged shared-expert down projection.
@@ -209,6 +211,32 @@ def test_blockscale_bpreshuffle_nested_matches_op(m, n, k, w_rows):
         x, w_shuf, xs, ws, dtypes.bf16
     )
     assert torch.equal(nested, via_op)
+
+
+_QWEN38_CSV = os.path.join(
+    os.path.dirname(__file__),
+    "../aiter/configs/model_configs/qwen38_27b_a4w4_blockscale_tuned_gemm.csv",
+)
+# Covers every decode M and the padded-M walk boundaries.
+_PARITY_MAX_M = 512
+_PARITY_GENERIC_NK = [(4096, 4096), (8192, 1024)]
+
+
+def _parity_nk_shapes():
+    with open(_QWEN38_CSV, newline="") as f:
+        shapes = {(int(r["N"]), int(r["K"])) for r in csv.DictReader(f)}
+    return sorted(shapes | set(_PARITY_GENERIC_NK))
+
+
+@pytest.mark.skipif(not _gpu(), reason="needs a GPU")
+@pytest.mark.parametrize("gl", [0, 1])
+def test_padded_m_parity(gl):
+    """padded_m_py (pure Python, used by the GPU-free AOT wheel build) matches
+    the compiled getPaddedM it mirrors; get_padded_m dispatches through
+    torch_compile_guard, hence the GPU."""
+    for n, k in _parity_nk_shapes():
+        for m in range(1, _PARITY_MAX_M + 1):
+            assert padded_m_py(m, n, k, gl) == get_padded_m(m, n, k, gl), (m, n, k, gl)
 
 
 if __name__ == "__main__":

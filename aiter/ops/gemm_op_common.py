@@ -13,7 +13,7 @@ def get_padded_m(M: int, N: int, K: int, gl: int) -> int: ...
 def padded_m_py(M: int, N: int, K: int, gl: int) -> int:
     """Mirrors getPaddedM in csrc/py_itfs_cu/gemm_common.cu for GPU-free callers
     (AOT wheel build); keep in sync, parity is checked by
-    op_tests/tuning_tests/test_padded_m_parity.py. Valid for M >= 0."""
+    op_tests/test_gemm_host_dispatch_cache.py. Valid for M >= 0."""
 
     def next_pow2(num: int) -> int:
         return 1 if num <= 1 else 1 << (num - 1).bit_length()
