@@ -75,12 +75,12 @@ _GFX12_3D_MAX_QUERY_ROWS_PER_CU = 8
 # long after the rest are done: Qwen3.5 (16 q / 2 kv heads, d 256, fp8, 4-token verify),
 # 64 sequences of 4k-191k tokens: 5.5 TB/s, against 16.7 for 64 x 64k.
 # The segment size is computed on the device each launch from the batch's total KV,
-# for about _GFX12_UA_SPLIT_REBALANCE programs, clamped to
+# for about one full wave of programs (CU count x attn_3d occupancy, see
+# _gfx12_split_rebalance_programs), clamped to
 # [_GFX12_UA_SPLIT_REBALANCE_MIN_TILES, _GFX12_UA_SPLIT_REBALANCE_MAX_TILES] tiles, so
 # it follows the live batch under a CUDA graph too. The grid covers
 # _GFX12_UA_SPLIT_REBALANCE_MAX_KV_LEN tokens at the minimum segment size, since a graph
 # keeps its capture's grid; spare segments exit at once.
-_GFX12_UA_SPLIT_REBALANCE = 2048
 _GFX12_UA_SPLIT_REBALANCE_MIN_TILES = 16
 _GFX12_UA_SPLIT_REBALANCE_MAX_TILES = 256
 _GFX12_UA_SPLIT_REBALANCE_MAX_KV_LEN = 262144
@@ -262,13 +262,24 @@ def _gfx950_split_params(params: _UAParams):
 _SW_SPLIT_MAX_Q = 16
 
 
+def _gfx12_split_rebalance_programs(num_sms: int, attn_3d_config: dict) -> int:
+    """Programs that fill the GPU once: CU count x attn_3d CTAs per CU.
+
+    A CU has 4 SIMDs and waves_per_eu waves on each, and a CTA keeps all its
+    num_warps waves on one CU, so a CU holds cdiv(4 * waves_per_eu, num_warps)
+    CTAs (at least 1).
+    """
+    waves_per_eu = max(int(attn_3d_config["waves_per_eu"]), 1)
+    occupancy = triton.cdiv(4 * waves_per_eu, int(attn_3d_config["num_warps"]))
+    return num_sms * occupancy
+
+
 def _gfx12_split_rebalance_tiles(
-    seqused_k: torch.Tensor, num_kv_heads: int, tile_size: int
+    seqused_k: torch.Tensor, num_kv_heads: int, tile_size: int, programs: int
 ) -> torch.Tensor:
     """The split rebalance's tiles per segment, [1] int32, in one single-program
     Triton launch (unified_attention_3d_split_rebalance_kernel):
-      clamp(ceil(sum_i ceil(seqused_k[i] / tile_size) * num_kv_heads
-                 / _GFX12_UA_SPLIT_REBALANCE),
+      clamp(ceil(sum_i ceil(seqused_k[i] / tile_size) * num_kv_heads / programs),
             _GFX12_UA_SPLIT_REBALANCE_MIN_TILES, _GFX12_UA_SPLIT_REBALANCE_MAX_TILES).
 
     No host read of device data and a fixed grid, so it captures into a CUDA graph
@@ -284,7 +295,7 @@ def _gfx12_split_rebalance_tiles(
         seqused_k.stride(0),
         num_kv_heads,
         TILE_SIZE=tile_size,
-        PROGRAMS=_GFX12_UA_SPLIT_REBALANCE,
+        PROGRAMS=programs,
         MIN_TILES=_GFX12_UA_SPLIT_REBALANCE_MIN_TILES,
         MAX_TILES=_GFX12_UA_SPLIT_REBALANCE_MAX_TILES,
         BLOCK=min(1024, max(64, triton.next_power_of_2(num_seqs))),
@@ -293,16 +304,19 @@ def _gfx12_split_rebalance_tiles(
     return segm_tiles
 
 
-def _gfx12_split_rebalance(params: _UAParams, tile_size: int):
+def _gfx12_split_rebalance(params: _UAParams, tile_size: int, attn_3d_config: dict):
     """The split rebalance's grid width (NUM_SEGMENTS) and its tiles per segment.
 
     Tiles per segment is a device tensor: the batch's KV tiles over every KV head,
-    over _GFX12_UA_SPLIT_REBALANCE, clamped to [MIN_TILES, MAX_TILES], from one
-    Triton program, so a CUDA graph recomputes it from the live context lengths on
-    replay.
+    over _gfx12_split_rebalance_programs, clamped to [MIN_TILES, MAX_TILES], from
+    one Triton program, so a CUDA graph recomputes it from the live context lengths
+    on replay.
     """
     segm_tiles = _gfx12_split_rebalance_tiles(
-        params.seqused_k, params.num_kv_heads, tile_size
+        params.seqused_k,
+        params.num_kv_heads,
+        tile_size,
+        _gfx12_split_rebalance_programs(params.num_sms, attn_3d_config),
     )
     kv_cover = max(int(params.max_seqlen_k), _GFX12_UA_SPLIT_REBALANCE_MAX_KV_LEN)
     num_segments = triton.next_power_of_2(
@@ -678,29 +692,39 @@ def unified_attention(
         split_params = params
         if use_gluon_3d and DEVICE_ARCH == "gfx950":
             split_params = _gfx950_split_params(params)
-        config = get_unified_attention_config(
+        kv_split_config = get_unified_attention_config(
             "kv_split", split_params, backend="gluon" if use_gluon_3d else "triton"
         )
-        NUM_SEGMENTS, CONFIG_TILE_SIZE = _split_launch_config(config)
+        NUM_SEGMENTS, CONFIG_TILE_SIZE = _split_launch_config(kv_split_config)
+        # the gfx1250 attn_3d config, read once for the split and the launch
+        attn_3d_config = None
+        if use_gluon_3d and IS_DEVICE_ARCH_GFX12:
+            attn_3d_config = get_unified_attention_config(
+                "attn_3d", params, backend="gluon"
+            )
         if (
             use_gluon_3d
             and IS_DEVICE_ARCH_GFX12
             and not (params.all_decode or params.spec_decode)
-            and config.get("FILL_MIN_SEGMENTS")
+            and kv_split_config.get("FILL_MIN_SEGMENTS")
         ):
             # the derived split bounds the grid at BLOCK_M 16, which on an uneven
             # batch leaves it a few segments; the work hint says when to widen it
-            ref = get_unified_attention_config("attn_3d", params, backend="gluon")
-            prgms_bq = _gfx12_2d_prgms(params, ref.get("PREFILL_REF_BLOCK_M"))
+            prgms_bq = _gfx12_2d_prgms(
+                params, attn_3d_config.get("PREFILL_REF_BLOCK_M")
+            )
             fill = _gfx12_prefill_fill(params, *prgms_bq)
             if fill is not None:
                 limit = triton.cdiv(params.max_seqlen_k, CONFIG_TILE_SIZE)
-                for max_fill, min_segments in config["FILL_MIN_SEGMENTS"]:
+                for max_fill, min_segments in kv_split_config["FILL_MIN_SEGMENTS"]:
                     if fill < max_fill:
                         NUM_SEGMENTS = max(NUM_SEGMENTS, min(min_segments, limit))
         segm_tiles = None
         if use_gluon_3d and DEVICE_ARCH == "gfx1250":
-            NUM_SEGMENTS, segm_tiles = _gfx12_split_rebalance(params, CONFIG_TILE_SIZE)
+            NUM_SEGMENTS, segm_tiles = _gfx12_split_rebalance(
+                params, CONFIG_TILE_SIZE, attn_3d_config
+            )
+            # print(NUM_SEGMENTS, segm_tiles)
         # The triton kernels read a shuffled tile as one contiguous page, so
         # there the tile is the page. The gfx950 gluon loader gathers per token
         # and keeps its tuned tile.
@@ -746,6 +770,7 @@ def unified_attention(
                     segm_expsum,
                     NUM_SEGMENTS,
                     TILE_SIZE,
+                    attn_3d_config,
                     segm_tiles=segm_tiles,
                 )
             elif DEVICE_ARCH == "gfx950":
@@ -1386,8 +1411,10 @@ def _unified_attention_3d_gfx1250(
     segm_expsum,
     NUM_SEGMENTS,
     TILE_SIZE,
+    config,
     segm_tiles=None,
 ):
+    # config: the caller's attn_3d config; changed here for the launch.
     # its split carves [0, seq_len), unlike reduce_segments for a sliding window;
     # use_2d_kernel keeps every sliding-window call on the 2d grid here
     assert params.sliding_window <= 0, "gfx1250 split-KV has no sliding-window carve"
@@ -1400,7 +1427,6 @@ def _unified_attention_3d_gfx1250(
         if params.v_cache_dtype != params.kv_cache_dtype
         else ""
     )
-    config = get_unified_attention_config("attn_3d", params, backend="gluon")
     for key in _GFX12_ROUTING_KEYS:
         config.pop(key, None)
     config["BLOCK_M"] = max(

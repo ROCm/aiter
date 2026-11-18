@@ -2103,7 +2103,7 @@ def test_unified_attn_output_gate_k4v8(
 
 
 def _gfx12_split_rebalance_tiles_torch(
-    seqused_k: torch.Tensor, num_kv_heads: int, tile_size: int
+    seqused_k: torch.Tensor, num_kv_heads: int, tile_size: int, programs: int
 ) -> torch.Tensor:
     """Reference for _gfx12_split_rebalance_tiles: the same integer arithmetic as plain
     torch ops (nine kernels), [1] int32."""
@@ -2111,7 +2111,7 @@ def _gfx12_split_rebalance_tiles_torch(
 
     tiles = (seqused_k + (tile_size - 1)) // tile_size
     want = tiles.sum() * num_kv_heads
-    want = (want + (ua._GFX12_UA_SPLIT_REBALANCE - 1)) // ua._GFX12_UA_SPLIT_REBALANCE
+    want = (want + (programs - 1)) // programs
     return (
         want.clamp(
             ua._GFX12_UA_SPLIT_REBALANCE_MIN_TILES,
@@ -2126,7 +2126,10 @@ def _gfx12_split_rebalance_tiles_torch(
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("num_kv_heads", [1, 2, 8])
 @pytest.mark.parametrize("tile_size", [16, 64, 128])
-def test_gfx12_split_rebalance_tiles(num_seqs, dtype, num_kv_heads, tile_size):
+@pytest.mark.parametrize("programs", [768, 2048])
+def test_gfx12_split_rebalance_tiles(
+    num_seqs, dtype, num_kv_heads, tile_size, programs
+):
     """_gfx12_split_rebalance_tiles (one Triton program) gives bitwise the nine
     torch ops' segm_tiles, eagerly and on CUDA-graph replay with live lengths."""
     from aiter.ops.triton.attention import unified_attention as ua
@@ -2136,27 +2139,35 @@ def test_gfx12_split_rebalance_tiles(num_seqs, dtype, num_kv_heads, tile_size):
         lens = torch.randint(0, hi + 1, (num_seqs,), generator=gen).to(dtype)
         lens[torch.rand(num_seqs, generator=gen) < 0.2] = 0
         lens = lens.cuda()
-        ref = _gfx12_split_rebalance_tiles_torch(lens, num_kv_heads, tile_size)
-        out = ua._gfx12_split_rebalance_tiles(lens, num_kv_heads, tile_size)
+        ref = _gfx12_split_rebalance_tiles_torch(
+            lens, num_kv_heads, tile_size, programs
+        )
+        out = ua._gfx12_split_rebalance_tiles(lens, num_kv_heads, tile_size, programs)
         assert out.dtype == ref.dtype == torch.int32 and out.shape == ref.shape == (1,)
         assert torch.equal(out, ref), (hi, out.item(), ref.item())
         # a strided view (every other entry of a wider buffer)
         wide = torch.repeat_interleave(lens, 2)
         wide[1::2] = 7_777_777
-        out = ua._gfx12_split_rebalance_tiles(wide[::2], num_kv_heads, tile_size)
+        out = ua._gfx12_split_rebalance_tiles(
+            wide[::2], num_kv_heads, tile_size, programs
+        )
         assert torch.equal(out, ref), (hi, out.item(), ref.item())
 
     live = torch.zeros(num_seqs, dtype=dtype, device="cuda")
-    ua._gfx12_split_rebalance_tiles(live, num_kv_heads, tile_size)
+    ua._gfx12_split_rebalance_tiles(live, num_kv_heads, tile_size, programs)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = ua._gfx12_split_rebalance_tiles(live, num_kv_heads, tile_size)
+        captured = ua._gfx12_split_rebalance_tiles(
+            live, num_kv_heads, tile_size, programs
+        )
     for _ in range(8):
         lens = torch.randint(0, 262_144, (num_seqs,), generator=gen).to(dtype)
         live.copy_(lens.cuda())
         graph.replay()
-        ref = _gfx12_split_rebalance_tiles_torch(live, num_kv_heads, tile_size)
+        ref = _gfx12_split_rebalance_tiles_torch(
+            live, num_kv_heads, tile_size, programs
+        )
         assert torch.equal(captured, ref), (captured.item(), ref.item())
 
 

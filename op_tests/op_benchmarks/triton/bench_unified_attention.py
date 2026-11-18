@@ -425,6 +425,7 @@ def _make_unified_attention_fn(
             shuffled_kv_cache=shuffled_kv_cache,
             equal_seqlen_q=equal_seqlen_q,
             backend=backend,
+            skip_reduce=True,
         )
 
     return kernel_fn
