@@ -64,12 +64,18 @@ def _gemm1_body_a16w4(
     activation_bf16=False,
     rocm_arch="",
     prefetch=1,
+    dense=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W) fused stage1 gemm1 body.
 
     A is native bf16 (no A-scale). W is mxfp4/int4 (packed, per-group scale, upconverted
-    in-kernel) or raw bf16. Non-scaled MFMA(16,16,32,bf16) K=32; epilogue SiLU(gate)*up
+    in-kernel), raw bf16 or (the shared expert) MXFP8 e4m3 codes upconverted in-kernel. Non-scaled MFMA(16,16,32,bf16) K=32; epilogue SiLU(gate)*up
     -> bf16 intermediate ``[sorted_size, inter_dim]`` stored by SORTED POSITION.
+
+    ``dense=True`` is the shared-expert prologue: one expert and no routing. The A row
+    and the output row are the token (rows 0 .. i32_ntok - 1). ``arg_bq`` is the W1 of
+    that expert and ``arg_out`` is its bf16 ``[i32_ntok, inter_dim]`` intermediate. The
+    body does not read ``arg_eids``, ``arg_mind`` or ``arg_cumsum``.
     """
     _is_gfx942 = str(rocm_arch).startswith("gfx942")
     N_OUT = 2 * INTER
@@ -113,7 +119,10 @@ def _gemm1_body_a16w4(
     # ---- grid decode: m-block (expert block) x n-block (inter tile) -----------
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
-    e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
+    if const_expr(dense):
+        e = fx.Int32(0)
+    else:
+        e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
     bx_m = m_block_idx * fx.Int32(BM)  # first sorted row of this m-block
     by_n = n_block_idx * fx.Int32(TILE_N)
     inter_i32 = fx.Int32(INTER)
@@ -139,10 +148,13 @@ def _gemm1_body_a16w4(
     # (clamped) stores land OOB. KEPT RAW: the output resource + masked buffer_store need a
     # dynamic (runtime cumsum0) num_records and per-store predication; the fx.copy layout
     # API does not express the masked scalar scatter this epilogue relies on.
-    _cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
+    if const_expr(dense):
+        _out_rows = i32_ntok
+    else:
+        _out_rows = _global_i32_at(arg_cumsum, fx.Int32(0))
     out_rsrc = buffer_ops.create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_out)),
-        num_records_bytes=_raw(fx.Int64(_cumsum0) * fx.Int64(INTER * 2)),
+        num_records_bytes=_raw(fx.Int64(_out_rows) * fx.Int64(INTER * 2)),
     )
 
     # ---- A path (shared with gemm2, see utils.make_a_loader) -------------------
@@ -152,6 +164,9 @@ def _gemm1_body_a16w4(
     c_k_div4 = (K * elem_bytes) // 4
 
     def _a_row_base_dwords(row_local):
+        if const_expr(dense):
+            # A row past i32_ntok is outside a_num_bytes, so its buffer load gives 0.
+            return (bx_m + row_local) * fx.Int32(c_k_div4)
         # arg_mind holds the raw sorted_token_ids (token in low 24 bits, slot in high 8).
         # token_id is multiplied in fx.Int32; tokens*K*2 bytes >= 2^31 overflows silently
         # (~116k tokens at K=9216). Pre-existing on gfx950; newly reachable on gfx942
@@ -411,8 +426,11 @@ def _gemm1_body_a16w4(
         for ii in range_constexpr(4):
             row_in_tile = fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4) + fx.Int32(ii)
             sorted_row = bx_m + row_in_tile
-            fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
-            token = fused & 0x00FFFFFF
+            if const_expr(dense):
+                token = sorted_row
+            else:
+                fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
+                token = fused & 0x00FFFFFF
             valid = token < i32_ntok
             if const_expr(k_wave > 1):
                 valid = valid & _is_primary
@@ -434,10 +452,37 @@ def _gemm1_body_a16w4(
                 buffer_ops.buffer_store(yb, _raw(out_rsrc), _raw(out_idx), mask=valid)
 
 
-def gemm1_a16w4_grid(BM, *, INTER, TILE_N, max_m_blocks):
-    """Flattened grid for a16w4 gemm1: (m-blocks) x (inter/tile_n) n-blocks."""
+def gemm1_a16w4_grid(BM, *, INTER, TILE_N, max_m_blocks, shared_tiles=0):
+    """Flattened grid for a16w4 gemm1: (m-blocks) x (inter/tile_n) n-blocks.
+
+    ``shared_tiles`` adds the shared-expert tiles (see ``a16w4_shared_tiles``).
+    """
     num_n_blocks = INTER // TILE_N
-    return int(max_m_blocks) * num_n_blocks
+    return int(max_m_blocks) * num_n_blocks + int(shared_tiles)
+
+
+def a16w4_shared_tiles(BM, *, n_tokens, N, shared_tile_n):
+    """Return the shared-expert tile count: ceil(n_tokens / BM) x (N / shared_tile_n)."""
+    return -(-int(n_tokens) // BM) * (N // shared_tile_n)
+
+
+def a16w4_default_shared_tile_n(tile_n, N, *, step):
+    """Return the default shared-expert tile N.
+
+    A bf16 W tile has 4x the bytes of an MXFP4 tile at the same N. The default is
+    tile_n / 4, rounded down to a multiple of ``step`` (the smallest N that the body
+    supports), at most N, and then up to a divisor of N. N must be a positive
+    multiple of ``step``.
+    """
+    if N <= 0 or N % step:
+        raise ValueError(
+            f"the shared-expert N must be a positive multiple of {step}, got {N}"
+        )
+    # Start at most at N, so that the search ends at N in the worst case.
+    tn = min(N, max(step, (tile_n // 4) // step * step))
+    while N % tn:
+        tn += step
+    return tn
 
 
 @functools.cache
@@ -460,6 +505,11 @@ def compile_gemm1_a16w4_port(
     activation_bf16=False,
     rocm_arch,
     prefetch=1,
+    shared_tile_n=None,
+    shared_tile_m=None,
+    shared_tile_k=None,
+    shared_k_wave=None,
+    shared_w_dtype="bf16",
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
 
@@ -483,6 +533,21 @@ def compile_gemm1_a16w4_port(
     or up offset. ``activation_bf16=True`` rounds GEMM accumulators to bf16
     before that activation, matching a separate bf16 gate/up GEMM. Defaults
     preserve the existing fused f32 activation path.
+
+    ``shared_tile_n`` adds the optional shared-expert prologue. ``None`` (the default)
+    keeps the kernel, its name and its launch signature. With a value, the launch takes
+    three more pointers: ``arg_sh_w`` is the shared W1 ``[2*D_INTER, D_HIDDEN]`` in the
+    ``shuffle_weight`` (16, 16) layout, ``arg_sh_ws`` its scales and ``arg_sh_out`` its
+    bf16 ``[n_tokens, D_INTER]`` intermediate. ``shared_w_dtype="bf16"``: W1 is raw bf16
+    and ``arg_sh_ws`` is not read. ``"fp8"`` (MXFP8, gfx950): W1 is fp8 e4m3 codes and
+    ``arg_sh_ws`` their e8m0 per-1x32 scales in the ``shuffle_scale`` layout; the tiles
+    scale the codes to bf16 in registers (exact) and run the same bf16 MFMAs, so the
+    output is bitwise that of the bf16 W1 upcast. The first ``a16w4_shared_tiles`` program ids
+    compute the shared expert for every token with the same activation. The shared tile
+    is ``shared_tile_m x shared_tile_n x shared_tile_k`` with ``shared_k_wave``; an
+    unset value uses the routed BM, TILE_K or k_wave. The routed tiles follow in their
+    usual order. The LDS size is the larger of the two bodies. The grid is
+    ``gemm1_a16w4_grid(..., shared_tiles=...)``.
     """
     assert w_dtype in (
         "fp4",
@@ -567,6 +632,41 @@ def compile_gemm1_a16w4_port(
     _kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
     _kw_tag += f"_pf{prefetch}" if prefetch > 1 else ""
     name_suffix = f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}"
+    if shared_tile_n is not None:
+        SH_BM = shared_tile_m or BM
+        SH_TK = shared_tile_k or TILE_K
+        SH_KW = shared_k_wave or k_wave
+        _sh_step = 16 * (4 // SH_KW)
+        assert shared_w_dtype in (
+            "bf16",
+            "fp8",
+        ), f"shared_w_dtype must be 'bf16' or 'fp8', got {shared_w_dtype!r}"
+        assert (
+            shared_w_dtype == "bf16" or SH_TK % 128 == 0
+        ), f"an fp8 shared_tile_k must be a multiple of 128, got {SH_TK}"
+        assert SH_KW in (1, 2, 4), f"shared_k_wave must be 1, 2 or 4, got {SH_KW}"
+        assert (
+            shared_tile_n % _sh_step == 0 and _INTER % shared_tile_n == 0
+        ), f"shared_tile_n must divide D_INTER and be a multiple of {_sh_step}, got {shared_tile_n}"
+        assert SH_BM % 16 == 0, f"shared_tile_m must be a multiple of 16, got {SH_BM}"
+        assert (
+            _K % (SH_KW * SH_TK) == 0
+        ), f"D_HIDDEN must be a multiple of shared_k_wave*shared_tile_k, got {_K}"
+        _sh_klen = _K // SH_KW
+        _sh_stages = 2 if (_sh_klen // SH_TK) > 1 else 1
+        _sh_lds = SH_KW * _sh_stages * SH_BM * SH_TK * 2
+        if SH_KW > 1:
+            _sh_acc = (shared_tile_n // (4 // SH_KW)) // 16 * (SH_BM // 16)
+            _sh_lds = max(_sh_lds, 4 * _sh_acc * 64 * 4 * 4)
+        lds_bytes_shared = max(lds_bytes, _sh_lds)
+        from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+
+        lds_capacity = get_lds_capacity_bytes(str(rocm_arch))
+        if lds_bytes_shared > lds_capacity:
+            raise NotImplementedError(
+                f"a16w4 gemm1 with the shared expert requires {lds_bytes_shared} LDS "
+                f"bytes, exceeding {rocm_arch} capacity {lds_capacity}"
+            )
 
     @fx.struct
     class SharedStorage:
@@ -699,4 +799,187 @@ def compile_gemm1_a16w4_port(
             value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
-    return launch_gemm1
+    if shared_tile_n is None:
+        return launch_gemm1
+
+    SH_TN = shared_tile_n
+    SH_NB = _INTER // SH_TN
+    _sh_fp8 = shared_w_dtype == "fp8"
+    _sh_tag = "_mxfp8" if _sh_fp8 else ""
+
+    @fx.struct
+    class SharedStorageSh:
+        raw: fx.Array[fx.Uint8, lds_bytes_shared, 16]
+
+    @flyc.kernel(
+        name=f"gemm1_a16w4_port_{name_suffix}_sh{SH_BM}x{SH_TN}x{SH_TK}kw{SH_KW}{_sh_tag}",
+        known_block_size=[256, 1, 1],
+    )
+    def gemm1_kernel_shared(
+        arg_x: fx.Int64,
+        arg_bq: fx.Int64,
+        arg_bscale: fx.Int64,
+        arg_eids: fx.Int64,
+        arg_cumsum: fx.Int64,
+        arg_mind: fx.Int64,
+        i32_ntok: fx.Int32,
+        f32_situ_beta: fx.Float32,
+        f32_situ_beta_rcp: fx.Float32,
+        f32_situ_linbeta: fx.Float32,
+        f32_situ_linbeta_rcp: fx.Float32,
+        f32_swiglu_limit: fx.Float32,
+        arg_out: fx.Int64,
+        arg_sh_w: fx.Int64,
+        arg_sh_ws: fx.Int64,
+        arg_sh_out: fx.Int64,
+    ):
+        lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorageSh).peek().raw.ptr
+        tx_i32 = fx.Int32(gpu.thread_id("x"))
+        bx_i32 = fx.Int32(gpu.block_id("x"))
+        lane = tx_i32 % 64
+        wave = rocdl.readfirstlane(T.i32, tx_i32 // 64)
+        _situ = situ_params(
+            f32_situ_beta,
+            f32_situ_beta_rcp,
+            f32_situ_linbeta,
+            f32_situ_linbeta_rcp,
+            f32_swiglu_limit,
+        )
+        # Program ids [0, sh_tiles) run the shared tiles, so they dispatch first. The
+        # routed tiles follow in their usual (swizzled) order.
+        sh_tiles = ((i32_ntok + fx.Int32(SH_BM - 1)) // fx.Int32(SH_BM)) * fx.Int32(
+            SH_NB
+        )
+        cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
+        total_m_blocks = cumsum0 // fx.Int32(BM)
+        bound = total_m_blocks * fx.Int32(NUM_N_BLOCKS)
+        _NXCD = 8
+        _xq = _udiv(bound, _NXCD)
+        _xr = _umod(bound, _NXCD)
+        _SW = xcd_swizzle
+
+        def _xcd(pid):
+            xc = _umod(pid, _NXCD)
+            wgid = xc * _xq + fx.min(xc, _xr) + _udiv(pid, _NXCD)
+            _ng = fx.Int32(_SW * NUM_N_BLOCKS)
+            group_id = wgid // _ng
+            first_pid_m = group_id * fx.Int32(_SW)
+            remaining_m = total_m_blocks - first_pid_m
+            group_size_m = fx.min(remaining_m, fx.Int32(_SW))
+            wig = wgid % _ng
+            m_block = first_pid_m + (wig % group_size_m)
+            n_block = wig // group_size_m
+            return m_block * fx.Int32(NUM_N_BLOCKS) + n_block
+
+        rpid = bx_i32 - sh_tiles
+        if bx_i32 < sh_tiles:
+            _gemm1_body_a16w4(
+                lds_raw_ptr,
+                arg_x,
+                arg_sh_w,
+                arg_sh_ws,
+                arg_eids,
+                arg_mind,
+                arg_cumsum,
+                arg_sh_out,
+                bx_i32,
+                lane,
+                wave,
+                i32_ntok,
+                _situ,
+                BM=SH_BM,
+                TILE_N=SH_TN,
+                TILE_K=SH_TK,
+                K=_K,
+                INTER=_INTER,
+                NE=1,
+                TOPK=TOPK,
+                act=act,
+                b_cache_mod=b_cache_mod,
+                w_dtype=shared_w_dtype,
+                w_layout="standard",
+                k_wave=SH_KW,
+                activation_bf16=activation_bf16,
+                rocm_arch=rocm_arch,
+                dense=True,
+            )
+        else:
+            if rpid < bound:
+                if const_expr(_SW > 0):
+                    _tile = _xcd(rpid)
+                else:
+                    _tile = rpid
+                _gemm1_body_a16w4(
+                    lds_raw_ptr,
+                    arg_x,
+                    arg_bq,
+                    arg_bscale,
+                    arg_eids,
+                    arg_mind,
+                    arg_cumsum,
+                    arg_out,
+                    _tile,
+                    lane,
+                    wave,
+                    i32_ntok,
+                    _situ,
+                    BM=BM,
+                    TILE_N=TILE_N,
+                    TILE_K=TILE_K,
+                    K=_K,
+                    INTER=_INTER,
+                    NE=NE,
+                    TOPK=TOPK,
+                    act=act,
+                    b_cache_mod=b_cache_mod,
+                    w_dtype=w_dtype,
+                    w_layout=w_layout,
+                    k_wave=k_wave,
+                    activation_bf16=activation_bf16,
+                    rocm_arch=rocm_arch,
+                    prefetch=prefetch,
+                )
+
+    @flyc.jit
+    def launch_gemm1_shared(
+        arg_x: fx.Int64,
+        arg_bq: fx.Int64,
+        arg_bscale: fx.Int64,
+        arg_eids: fx.Int64,
+        arg_cumsum: fx.Int64,
+        arg_mind: fx.Int64,
+        i32_ntok: fx.Int32,
+        i32_grid: fx.Int32,
+        f32_situ_beta: fx.Float32,
+        f32_situ_beta_rcp: fx.Float32,
+        f32_situ_linbeta: fx.Float32,
+        f32_situ_linbeta_rcp: fx.Float32,
+        f32_swiglu_limit: fx.Float32,
+        arg_out: fx.Int64,
+        arg_sh_w: fx.Int64,
+        arg_sh_ws: fx.Int64,
+        arg_sh_out: fx.Int64,
+        stream: fx.Stream,
+    ):
+        grid_x = fx.Int64(i32_grid)
+        gemm1_kernel_shared(
+            arg_x,
+            arg_bq,
+            arg_bscale,
+            arg_eids,
+            arg_cumsum,
+            arg_mind,
+            i32_ntok,
+            f32_situ_beta,
+            f32_situ_beta_rcp,
+            f32_situ_linbeta,
+            f32_situ_linbeta_rcp,
+            f32_swiglu_limit,
+            arg_out,
+            arg_sh_w,
+            arg_sh_ws,
+            arg_sh_out,
+            value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
+        ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+
+    return launch_gemm1_shared

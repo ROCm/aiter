@@ -1437,6 +1437,89 @@ class TestPowerTableSeparation(unittest.TestCase):
         self.assertGreater(corrected, 430.0)
         self.assertLess(corrected, 620.0)
 
+    def test_gpu_fault_in_power_pass_is_raised(self):
+        from aiter.utility import package_power
+
+        class AcceleratorError(RuntimeError):
+            pass
+
+        def faulting_launch():
+            raise AcceleratorError("illegal memory access")
+
+        with (
+            mock.patch.object(package_power, "power_input_path", return_value="x"),
+            self.assertRaises(AcceleratorError),
+        ):
+            package_power.measure_kernel(faulting_launch, device_index=0)
+
+    def test_error_that_breaks_synchronize_is_raised_as_the_fault(self):
+        from aiter.utility import package_power
+
+        lost = RuntimeError("HIP error: unspecified launch failure")
+
+        def launch():
+            raise ValueError("kernel rejected its arguments")
+
+        with (
+            mock.patch.object(package_power, "power_input_path", return_value="x"),
+            mock.patch.object(package_power, "_gpu_fault", return_value=lost),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            package_power.measure_kernel(launch, device_index=0)
+        self.assertIs(raised.exception, lost)
+        self.assertIsInstance(raised.exception.__cause__, ValueError)
+
+    def test_non_fault_error_in_power_pass_reads_as_nan(self):
+        import math
+
+        from aiter.utility import package_power
+
+        def launch():
+            raise ValueError("kernel rejected its arguments")
+
+        with (
+            mock.patch.object(package_power, "power_input_path", return_value="x"),
+            mock.patch.object(package_power, "_gpu_fault", return_value=None),
+        ):
+            watts = package_power.measure_kernel(launch, device_index=0)
+        self.assertTrue(math.isnan(watts))
+
+    def test_gpu_fault_check_uses_synchronize(self):
+        from aiter.utility import package_power
+
+        lost = RuntimeError("HIP error: unspecified launch failure")
+        with (
+            mock.patch("torch.cuda.is_available", return_value=True),
+            mock.patch("torch.cuda.is_initialized", return_value=True),
+            mock.patch("torch.cuda.synchronize", side_effect=lost),
+        ):
+            self.assertIs(package_power._gpu_fault(ValueError("x")), lost)
+        with (
+            mock.patch("torch.cuda.is_available", return_value=True),
+            mock.patch("torch.cuda.is_initialized", return_value=True),
+            mock.patch("torch.cuda.synchronize"),
+        ):
+            self.assertIsNone(package_power._gpu_fault(ValueError("x")))
+
+    def test_failed_synchronize_stops_the_sampling_thread(self):
+        import threading
+
+        from aiter.utility import package_power
+
+        lost = RuntimeError("HIP error: unspecified launch failure")
+        before = threading.active_count()
+        with (
+            mock.patch.object(package_power, "power_input_path", return_value="x"),
+            mock.patch.object(package_power, "_read_watts", return_value=400.0),
+            mock.patch.object(
+                package_power, "_sync_cuda", side_effect=[None, None, lost]
+            ),
+            mock.patch.object(package_power._InFlight, "mark"),
+            self.assertRaises(RuntimeError),
+        ):
+            package_power.measure_package_watts(lambda: None, seconds=0.05)
+        self.assertEqual(threading.active_count(), before)
+
     def test_a16w16_hands_its_policy_to_hipblaslt(self):
         from csrc.gemm_a16w16 import gemm_a16w16_tune
 
