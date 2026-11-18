@@ -23,10 +23,17 @@ from aiter.ops.asm import asm_utils as _au
 
 _CSV_STR = frozenset({"a_dtype", "act", "epi_mode", "knl_name", "co_name"})
 _KFD = "/sys/class/kfd/kfd/topology/nodes"
-_RING_B, _FLAG_B, _INT4_B, _CTRL_ERR = 256 * 1024, 4096, 1168, 63
-_WINS = {8192: (4096, 3072, 1024), 4096: (2048, 1024, 1024)}
-_WINS.update({3584: (2048, 1024, 512), 2560: (1280, 768, 512)})
-EPI_MODES = ("add_rmsnorm", "rmsnorm_only", "raw_bf16")
+_RING_B, _FLAG_B, _INT4_B = 256 * 1024, 4096, 1168
+_CTRL_WORDS, _CTRL_TOTAL_WORDS = 40960, 81920
+_CTRL_HRDY_BASE, _CTRL_MAX_HRDY_TILES, _CTRL_ERR = 5120, 35840, 63
+_CTRL_LAYOUT_VERSION = 2
+_EVEN_SDMA_ENG_MASK = 0x55555555
+_MAX_MUBUF_P8_BYTES, _MAX_IPC_INBOX_BYTES = 0xFFFFF000, 0x7FFFF000
+_WIN_CFGS = {8192: ((4096, 3072, 1024), (4096, 2048, 1536, 512))}
+_WIN_CFGS |= {4096: ((2048, 1024, 1024),), 3584: ((2048, 1024, 512),)}
+_WIN_CFGS[2560] = ((1280, 768, 512),)
+_EPI_Q = ("add_rmsnorm_fp4", "add_rmsnorm_fp8", "rmsnorm_only_fp4", "rmsnorm_only_fp8")
+EPI_MODES = ("add_rmsnorm", "rmsnorm_only", "raw_bf16", *_EPI_Q)
 _ERR_NAMES = {1: "RS flag timeout", 2: "AG flag timeout", 4: "local counter timeout"}
 _LOCK, _LOADED, _POOL = threading.RLock(), set(), {}
 _U64_29, _U32_3 = ctypes.c_uint64 * 29, ctypes.c_uint32 * 3
@@ -54,12 +61,31 @@ class TpMoeCall:
     norm_weight: Tensor | None = None
     eps: float = 1e-6
     gemma: bool = False
+    x_scale: Tensor | None = None
 
 
 @dataclass
 class TpMoeOut:
     out: Tensor
     residual_out: Tensor | None = None
+    out_scale: Tensor | None = None
+
+
+def quantize_moe_input(x: Tensor, a_dtype: str = "fp4") -> tuple[Tensor, Tensor]:
+    """Quantize ``[T, D]`` bf16/fp16 activations into row-major ``1x32`` MX format."""
+    if a_dtype not in ("fp4", "fp8") or x.dim() != 2 or x.shape[1] % 32 != 0:
+        raise ValueError(f"bad a_dtype={a_dtype!r} or shape={tuple(x.shape)}")
+    t, d = int(x.shape[0]), int(x.shape[1])
+    xc = x if x.is_contiguous() else x.contiguous()
+    qdt, sdt = (dtypes.fp8 if a_dtype == "fp8" else dtypes.fp4x2), dtypes.fp8_e8m0
+    xq, xs = aiter.per_1x32_mx_quant_hip(xc, quant_dtype=qdt, scale_type=sdt)
+    return xq, xs.view(t, d // 32)
+
+
+@functools.lru_cache(maxsize=64)
+def _sort_ws_size(tokens: int, num_experts: int, topk: int, dev_idx: int) -> int:
+    fn = aiter.moe_sorting_opus_get_workspace_size
+    return int(fn(tokens, num_experts, topk, 0, dev_idx))
 
 
 @functools.lru_cache(maxsize=1)
@@ -116,6 +142,46 @@ def _kfd_node(device: int) -> tuple[int, int]:
     raise RuntimeError(f"no KFD node found for HIP device {device}")
 
 
+def _max_sorted_tiles(tokens: int, num_experts: int, topk: int, tile_m: int) -> int:
+    return int(num_experts) + (
+        (max(int(tokens), 1) - 1) * int(topk) + int(tile_m) - 1
+    ) // int(tile_m)
+
+
+def _select_even_sdma_engines(mask: int) -> list[int]:
+    even_mask = int(mask) & _EVEN_SDMA_ENG_MASK
+    return [b for b in range(32) if (even_mask >> b) & 1]
+
+
+def _select_tile_m(
+    tokens: int,
+    num_experts: int,
+    model_dim: int,
+    inter_dim: int,
+    topk: int,
+    reg: dict,
+    mk,
+    tm_req,
+) -> int:
+    nb32 = _max_sorted_tiles(tokens, num_experts, topk, 32)
+    nb64 = _max_sorted_tiles(tokens, num_experts, topk, 64)
+    if tm_req is None or tm_req == "auto":
+        flash_next_sig = model_dim == 2560 and inter_dim == 256 and topk == 10
+        bm32_pref = (
+            tokens <= 4096 if flash_next_sig else tokens * topk <= 28 * num_experts
+        )
+        use32 = bm32_pref and nb32 <= _CTRL_MAX_HRDY_TILES and mk(32) in reg
+        tm = 32 if use32 else (64 if mk(64) in reg or mk(32) not in reg else 32)
+    elif (tm := int(tm_req)) not in (32, 64):
+        raise ValueError(f"unsupported tile_m={tm_req!r}, expected 32 or 64")
+    n_tiles_max = nb32 if tm == 32 else nb64
+    if n_tiles_max > _CTRL_MAX_HRDY_TILES:
+        raise ValueError(
+            f"tile_m={tm} tiles ({n_tiles_max}) exceed {_CTRL_MAX_HRDY_TILES} HRDY limit"
+        )
+    return tm
+
+
 def _open_sdma(st: SimpleNamespace, rank: int, src: int, gid: int, nodes: list[int]):
     lib = _hsakmt_lib()
     if rc := lib.xs_open():
@@ -141,8 +207,10 @@ def _open_sdma(st: SimpleNamespace, rank: int, src: int, gid: int, nodes: list[i
                     ):
                         mask = m
                         break
-        if not (engs := [b for b in range(32) if (mask >> b) & 1]):
-            raise RuntimeError(f"no SDMA engine for KFD {src} -> {dst}")
+        if not (engs := _select_even_sdma_engines(mask)):
+            raise RuntimeError(
+                f"no even gfx950 SDMA engine for KFD {src} -> {dst} (mask={mask:#x})"
+            )
         for q in range(2):
             eng, out = engs[q % len(engs)], (ctypes.c_uint64 * 7)()
             if rc := lib.xs_create(hk.value, eng, _RING_B, 3, out):
@@ -169,12 +237,10 @@ def _free_state(st: SimpleNamespace, dev: torch.device) -> None:
         st.queues.clear()
         lib.xs_close()
         st.sdma_open = False
-    for b in st.opened:
-        if b:
-            hip.hipIpcCloseMemHandle(ctypes.c_void_p(b))
-    for p in (st.quiet, st.send_ptr, st.ipc_ptr):
-        if p:
-            hip.hipFree(ctypes.c_void_p(p))
+    for b in filter(None, st.opened):
+        hip.hipIpcCloseMemHandle(ctypes.c_void_p(b))
+    for p in filter(None, (st.quiet, st.send_ptr, st.ipc_ptr)):
+        hip.hipFree(ctypes.c_void_p(p))
 
 
 @functools.lru_cache(maxsize=8)
@@ -183,12 +249,11 @@ def load_fmoe_tp_sdma_registry(co_dir=None):
     raw = os.fspath(co_dir) if co_dir else os.getenv("AITER_ASM_TP_CO_DIR")
     rdir = os.path.abspath(raw or f"{base}/gfx950/fmoe_tp_sdma")
     rows = _au.load_asm_cfg_csv(f"{rdir}/fmoe_tp_sdma.csv", _CSV_STR)
-    ks = ("world", "model_dim", "inter_dim", "topk", "a_dtype", "act", "epi_mode")
-    out = {}
-    for r in rows:
-        k = (*(r[c] for c in ks), r["gemma"])
-        out[k] = (f"{rdir}/{r['co_name']}", r["knl_name"])
-    return out
+    ks, ts = ("world", "model_dim", "inter_dim", "topk"), ("a_dtype", "act", "epi_mode")
+    rk = lambda r: (*(r[c] for c in ks), r.get("tile_m", 64), *(r[c] for c in ts))
+    return {
+        (*rk(r), r["gemma"]): (f"{rdir}/{r['co_name']}", r["knl_name"]) for r in rows
+    }
 
 
 class TpAsmContext:
@@ -208,11 +273,11 @@ class TpAsmContext:
         self.co_dir = kw.get("co_dir")
         self.rank = int(dist.get_rank(group=group))
         self.world = int(dist.get_world_size(group=group))
-        if self.world not in (2, 4, 8) or int(model_dim) not in _WINS:
+        if self.world not in (2, 4, 8) or int(model_dim) not in _WIN_CFGS:
             raise ValueError(f"unsupported world={self.world} or model_dim={model_dim}")
         self.max_tokens, self.model_dim = int(max_tokens), int(model_dim)
         self.topk, self.num_experts = int(topk), int(num_experts)
-        self.inter_dim, wins = int(inter_dim), _WINS[self.model_dim]
+        self.inter_dim, win_cfgs = int(inter_dim), _WIN_CFGS[self.model_dim]
         sk = (self.max_tokens, self.model_dim, self.topk, self.num_experts)
         pkey = (id(group), self.device_idx, *sk, self.inter_dim)
         self._closed, self._pkey = False, pkey
@@ -223,13 +288,26 @@ class TpAsmContext:
 
         bw = 2048 * self.world
         ru = bw // math.gcd(self.model_dim, bw)
-        w_rus = [bw // math.gcd(w, bw) for w in wins]
+        w_rus = [bw // math.gcd(w, bw) for w in {w for ws in win_cfgs for w in ws}]
         rus = (math.lcm(ru, *w_rus), *w_rus)
+        pr = -(-self.max_tokens // 64) * 64 * self.topk
+        p8_max_win = max(max(w[0], w[1], sum(w[2:])) for w in win_cfgs)
+        if pr * p8_max_win > _MAX_MUBUF_P8_BYTES:
+            raise ValueError(
+                f"P8 buffer {pr * p8_max_win} B exceeds 32-bit MUBUF limit "
+                f"{_MAX_MUBUF_P8_BYTES:#x}"
+            )
         cmb_rows = max(-(-self.max_tokens // u) * u for u in rus)
         inbox_bytes = ((-(-cmb_rows // ru) * ru) * self.model_dim // 2048) * _INT4_B
         ipc_bytes = _FLAG_B + 4 * inbox_bytes
-        if ipc_bytes >= 2**31:
+        if ipc_bytes >= 2**31 or inbox_bytes > _MAX_IPC_INBOX_BYTES:
             raise ValueError(f"IPC buffer {ipc_bytes} B exceeds 2 GiB int32 range")
+        nb64_max = _max_sorted_tiles(self.max_tokens, self.num_experts, self.topk, 64)
+        if nb64_max > _CTRL_MAX_HRDY_TILES:
+            raise ValueError(
+                f"max_tokens={self.max_tokens} requires {nb64_max} BM64 tiles "
+                f"> {_CTRL_MAX_HRDY_TILES} HRDY limit"
+            )
 
         st = SimpleNamespace(dev=dev, inbox_bytes=inbox_bytes, ipc_ptr=0, send_ptr=0)
         st.quiet, st.sdma_err, st.sdma_open, st.refcount = 0, 0, False, 1
@@ -257,15 +335,27 @@ class TpAsmContext:
                 st.peer_tab = torch.tensor(bases, dtype=torch.int64, device=dev)
                 z32 = lambda n: torch.zeros(n, dtype=dtypes.i32, device=dev)
                 eu8 = lambda *s: torch.empty(s, dtype=torch.uint8, device=dev)
+                s8r = lambda w: -(-(w // 32) // 16) * 16
                 pr = -(-self.max_tokens // 64) * 64 * self.topk
-                st.p8_wins = [eu8(pr, w) for w in wins]
-                st.s8_wins = [eu8(pr, -(-(w // 32) // 16) * 16) for w in wins]
-                raw_s = self.max_tokens * self.topk + self.num_experts * 64 - self.topk
-                mt = max(pr, -(-raw_s // 64) * 64) // 64
-                st.hq = eu8(mt * 64, self.inter_dim // 2)
-                st.hss = eu8(mt, 2 * (((self.inter_dim // 32) + 7) // 8) * 256)
+                p8_t = ((w[0], w[1], sum(w[2:])) for w in win_cfgs)
+                s8_t = ((s8r(w[0]), s8r(w[1]), sum(map(s8r, w[2:]))) for w in win_cfgs)
+                st.p8_wins = [eu8(pr, max(v)) for v in zip(*p8_t)]
+                st.s8_wins = [eu8(pr, max(v)) for v in zip(*s8_t)]
+                rt, ne = self.max_tokens * self.topk - self.topk, self.num_experts
+                nb64, nb32 = -(-(rt + ne * 64) // 64), -(-(rt + ne * 32) // 32)
+                max_nb, max_r = max(nb64, nb32, pr // 64), max(nb64 * 64, nb32 * 32)
+                st.hq = eu8(max_nb * 64, self.inter_dim // 2)
+                st.hss = eu8(max_nb, 2 * (((self.inter_dim // 32) + 7) // 8) * 256)
                 st.ss_part = torch.empty(self.max_tokens, dtype=dtypes.fp32, device=dev)
-                st.err, st.epoch, st.ctrl = z32(4), z32(1), z32(max(10240, 2048 + mt))
+                ei32 = lambda n: torch.empty(n, dtype=dtypes.i32, device=dev)
+                st.s_ids, st.s_exp, st.n_val = ei32(max_r), ei32(max_nb), ei32(2)
+                st.s_w = torch.empty(max_r, dtype=dtypes.fp32, device=dev)
+                st.mbuf = torch.empty((0, 0), dtype=dtypes.bf16, device=dev)
+                ps = {1, min(128, self.max_tokens), self.max_tokens}
+                ws_m = max(_sort_ws_size(t, ne, self.topk, self.device_idx) for t in ps)
+                st.sort_ws = eu8(ws_m)
+                st.err, st.epoch = z32(4), z32(1)
+                st.ctrl = z32(_CTRL_TOTAL_WORDS)
                 torch.cuda.synchronize(dev)
                 _open_sdma(st, self.rank, src, gid, [o[0][1] for o in objs])
         except Exception:
@@ -290,63 +380,96 @@ class TpAsmContext:
         rc = _hip_ext().hipMemset(vp, 0xFF, 4 * self._st.inbox_bytes)
         _au.hip_check(rc, "memset")
 
+    def reset_epoch(self, val: int = 0) -> None:
+        self._st.epoch.fill_(int(val))
+        self._st.ctrl.zero_()
+
     def check_error(self) -> None:
         torch.cuda.synchronize(self.device)
         st, v = self._st, ctypes.c_int32(0)
         rc = _hip_ext().hipMemcpy(ctypes.byref(v), ctypes.c_void_p(st.sdma_err), 4, 2)
         _au.hip_check(rc, "hipMemcpy(D2H)")
-        code = int(st.err[0].item()) | int(st.ctrl[_CTRL_ERR].item()) | int(v.value)
+        c_err = int(st.ctrl[_CTRL_ERR].item()) | int(
+            st.ctrl[_CTRL_WORDS + _CTRL_ERR].item()
+        )
+        code = int(st.err[0].item()) | c_err | int(v.value)
         if code:
             ns = ", ".join(nm for k, nm in _ERR_NAMES.items() if code & k) or "sdma"
             raise RuntimeError(f"rank {self.rank}: TP MoE error {code:#x} ({ns})")
 
     def close(self) -> None:
-        if not getattr(self, "_closed", True):
-            self._closed = True
-            self._st.refcount -= 1
-            if self._st.refcount <= 0:
-                _POOL.pop(self._pkey, None)
-                _free_state(self._st, self.device)
+        if getattr(self, "_closed", True):
+            return
+        self._closed, self._st.refcount = True, self._st.refcount - 1
+        if self._st.refcount <= 0:
+            _POOL.pop(self._pkey, None)
+            _free_state(self._st, self.device)
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
             self.close()
 
 
-def tp_moe_layer_asm(call, ctx, epi_mode="add_rmsnorm", out=None, **kw) -> TpMoeOut:
+def tp_moe_layer_asm(
+    call, ctx, epi_mode="add_rmsnorm", out=None, out_scale=None, **kw
+) -> TpMoeOut:
     """Execute one TP rank's single-launch MoE + device-SDMA combine + epilogue."""
-    from aiter.ops.quant import fused_dynamic_mx_quant_moe_sort
-
     res_o, co_dir = kw.get("residual_out"), kw.get("co_dir")
     a_dt, act_n = kw.get("a_dtype", "fp4"), kw.get("act", "silu")
     act_n = "situ" if act_n == "situv2" else act_n
     bad_m = epi_mode not in EPI_MODES or a_dt not in ("fp4", "fp8")
     if bad_m or act_n not in ("silu", "situ"):
         raise ValueError(f"unsupported epi={epi_mode!r}, a_dtype={a_dt!r}")
-    tokens, d = int(call.x.shape[0]), int(call.x.shape[1])
+    ok_1b = lambda t, s: t.shape == s and t.is_contiguous() and t.element_size() == 1
+    if call.x_scale is not None:
+        if call.x.dim() != 2 or call.x_scale.dim() != 2:
+            raise ValueError("pre-quantized x and x_scale must be 2D")
+        tokens, d = int(call.x.shape[0]), int(call.x_scale.shape[1]) * 32
+        xc = d // 2 if a_dt == "fp4" else d
+        if not (ok_1b(call.x, (tokens, xc)) and ok_1b(call.x_scale, (tokens, d // 32))):
+            raise ValueError(f"invalid pre-quantized x/x_scale for a_dtype={a_dt!r}")
+        xq, xs = call.x, call.x_scale
+    else:
+        if call.x.dim() != 2:
+            raise ValueError(f"expected 2D x, got {tuple(call.x.shape)}")
+        tokens, d, xq, xs = int(call.x.shape[0]), int(call.x.shape[1]), None, None
     topk, num_experts = int(call.topk_ids.shape[1]), int(call.w2.shape[0])
-    inter, ctx_s = int(call.w2.shape[2]) * 2, (ctx.model_dim, ctx.topk, ctx.inter_dim)
-    if not (0 < tokens <= ctx.max_tokens) or (d, topk, inter) != ctx_s:
-        raise ValueError(f"call (T={tokens}, D={d}, k={topk}, I={inter}) != ctx")
+    inter = int(call.w2.shape[2]) * 2
+    ctx_s = (ctx.model_dim, ctx.topk, ctx.inter_dim, ctx.num_experts)
+    if not (0 < tokens <= ctx.max_tokens) or (d, topk, inter, num_experts) != ctx_s:
+        raise ValueError(
+            f"call (T={tokens}, D={d}, k={topk}, I={inter}, E={num_experts}) != ctx"
+        )
+    is_add, is_norm = epi_mode.startswith("add_rmsnorm"), epi_mode != "raw_bf16"
+    is_fp4_o, is_fp8_o = epi_mode.endswith("_fp4"), epi_mode.endswith("_fp8")
     bp = (float(kw.get("beta1", 4.0)), float(kw.get("beta2", 25.0)))
-    bad_eps = epi_mode != "raw_bf16" and abs(float(call.eps) - 1e-6) > 1e-12
+    bad_eps = is_norm and abs(float(call.eps) - 1e-6) > 1e-12
     if bad_eps or (act_n == "situ" and bp != (4.0, 25.0)):
         raise NotImplementedError("unsupported eps or situ beta for precompiled .co")
-    need_r = epi_mode == "add_rmsnorm" and call.residual is None
-    if need_r or (epi_mode != "raw_bf16" and call.norm_weight is None):
+    if (is_add and call.residual is None) or (is_norm and call.norm_weight is None):
         raise ValueError(f"missing residual or norm_weight for {epi_mode!r}")
 
-    if out is None:
-        out = torch.empty((tokens, d), dtype=dtypes.bf16, device=ctx.device)
-    is_add = epi_mode == "add_rmsnorm"
-    res_u = res_o if epi_mode in ("rmsnorm_only", "add_rmsnorm") else None
-    if is_add and res_u is None:
-        res_u = torch.empty_like(call.residual)
+    emp = lambda s, dt: torch.empty(s, dtype=dt, device=ctx.device)
+    if is_fp4_o or is_fp8_o:
+        oc, odt = (d // 2, dtypes.fp4x2) if is_fp4_o else (d, dtypes.fp8)
+        out = emp((tokens, oc), odt) if out is None else out
+        sc_shape = (tokens, d // 32)
+        out_scale = emp(sc_shape, dtypes.fp8_e8m0) if out_scale is None else out_scale
+        if not (ok_1b(out, (tokens, oc)) and ok_1b(out_scale, sc_shape)):
+            raise ValueError(f"invalid out or out_scale for {epi_mode!r}")
+    else:
+        out = emp((tokens, d), dtypes.bf16) if out is None else out
+        if out.shape != (tokens, d) or not out.is_contiguous():
+            raise ValueError(f"invalid bf16 out {tuple(out.shape)} for {epi_mode!r}")
+        out_scale = None
+    res_u = res_o if is_norm else None
+    res_u = emp((tokens, d), dtypes.bf16) if (is_add and res_u is None) else res_u
 
-    gm = 0 if epi_mode == "raw_bf16" else int(bool(call.gemma))
+    gm = 0 if not is_norm else int(bool(call.gemma))
     reg = load_fmoe_tp_sdma_registry(ctx.co_dir if co_dir is None else co_dir)
-    key = (ctx.world, d, inter, topk, a_dt, act_n, epi_mode, gm)
-    if (entry := reg.get(key)) is None:
+    mk = lambda tm: (ctx.world, d, inter, topk, tm, a_dt, act_n, epi_mode, gm)
+    tm = _select_tile_m(tokens, num_experts, d, inter, topk, reg, mk, kw.get("tile_m"))
+    if (entry := reg.get(key := mk(tm))) is None:
         raise NotImplementedError(f"no precompiled .co for {key}")
     co_path, symbol = entry
     if (ck := (ctx.device_idx, co_path, symbol)) not in _LOADED:
@@ -358,35 +481,35 @@ def tp_moe_layer_asm(call, ctx, epi_mode="add_rmsnorm", out=None, **kw) -> TpMoe
             _LOADED.add(ck)
     fn = _au.get_function(co_path, symbol, device=ctx.device_idx)
 
-    st, dev = ctx._st, ctx.device
+    st = ctx._st
     with _au.device_guard(ctx.device_idx):
-        nb = -(-(tokens * topk + num_experts * 64 - topk) // 64)
-        ei32 = lambda n: torch.empty(n, dtype=dtypes.i32, device=dev)
-        s_ids, s_exp, n_val = ei32(nb * 64), ei32(nb), ei32(2)
-        s_w = torch.empty(nb * 64, dtype=dtypes.fp32, device=dev)
-        mbuf = torch.empty((0, 0), dtype=dtypes.bf16, device=dev)
-        ids, wts = call.topk_ids, call.topk_weights
-        sa = (ids, wts, s_ids, s_w, s_exp, n_val, mbuf, num_experts, 64)
+        xq, xs = quantize_moe_input(call.x, a_dt) if xq is None else (xq, xs)
+        nb = -(-(tokens * topk + num_experts * tm - topk) // tm)
+        s_ids, s_exp, s_w = st.s_ids[: nb * tm], st.s_exp[:nb], st.s_w[: nb * tm]
+        sa = (call.topk_ids, call.topk_weights, s_ids, s_w, s_exp, st.n_val, st.mbuf)
         if os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1":
-            aiter.moe_sorting_fwd(*sa)
+            aiter.moe_sorting_fwd(*sa, num_experts, tm)
         else:
-            ws_fn = aiter.moe_sorting_opus_get_workspace_size
-            ws_sz = ws_fn(tokens, num_experts, topk, 0, ctx.device_idx)
-            ws = torch.empty(ws_sz, dtype=torch.uint8, device=dev) if ws_sz else None
-            aiter.moe_sorting_opus_fwd(*sa, workspace=ws)
-        qdt = dtypes.fp8 if a_dt == "fp8" else dtypes.fp4x2
-        qa = (call.x, s_ids, n_val, tokens, topk, 64, qdt, None, 32, s_w, num_experts)
-        xq, xs = fused_dynamic_mx_quant_moe_sort(*qa)
-        st.ctrl.zero_()
+            ws_sz = _sort_ws_size(tokens, num_experts, topk, ctx.device_idx)
+            ws = st.sort_ws[:ws_sz] if ws_sz else None
+            aiter.moe_sorting_opus_fwd(*sa, num_experts, tm, workspace=ws)
         mt = (xq, xs, call.w1, call.w1_scale, call.w2, call.w2_scale)
-        st_t = (*mt, s_ids, s_w, s_exp, n_val)
-        et = (call.residual, res_u, st.ss_part, call.norm_weight, out)
+        st_t = (*mt, s_ids, s_w, s_exp, st.n_val)
+        sc_buf = out_scale if out_scale is not None else st.ss_part
+        et = (call.residual if is_add else None, res_u, sc_buf, call.norm_weight, out)
         ep = (0 if t is None else t.data_ptr() for t in et)
         u64s = (*(t.data_ptr() for t in st_t), *st.mid_p, *ep)
         karg = _FmoeTpKernarg(_U64_29(*u64s), _U32_3(ctx.rank, tokens, st.inbox_bytes))
         stream = _au.current_raw_stream(ctx.device_idx)
         _au.launch_co(fn, (512, 1, 1), (256, 1, 1), karg, stream)
-    return TpMoeOut(out, res_u if is_add else res_o)
+    return TpMoeOut(out, res_u if is_add else res_o, out_scale)
 
 
-__all__ = ["EPI_MODES", "TpAsmContext", "TpMoeCall", "TpMoeOut", "tp_moe_layer_asm"]
+__all__ = [
+    "EPI_MODES",
+    "TpAsmContext",
+    "TpMoeCall",
+    "TpMoeOut",
+    "quantize_moe_input",
+    "tp_moe_layer_asm",
+]
