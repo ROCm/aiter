@@ -30,7 +30,7 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
         conversion differs; the lane-swap and store code downstream is shared.
         """
         if const_expr(self.traits.OUT_F16):
-            # FlyDSL 0.4.0's toward_zero cast emits scalar v_cvt_f16_f32 (not RTZ), changing f16 outputs by 1 ulp.
+            # FlyDSL 0.5.0 toward_zero cast (unchanged from 0.4.0) emits scalar v_cvt_f16_f32 (not RTZ), changing f16 outputs by 1 ulp.
             v2 = rocdl.cvt_pkrtz(
                 Vec.make_type(2, fx.Float16), fx.as_ir_value(a), fx.as_ir_value(b)
             )
@@ -49,7 +49,7 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
         pair_i32_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
         # Raw rocdl op: stable fx.gpu.shuffle_xor returns one value per call, so replacing
         # the dual-output swap needs extra selects/moves (+~10% main-loop VALU on shuffled
-        # BN64/paged, 5-6% slower prefill on gfx950). No stable dual-output swap at v0.4.0.
+        # BN64/paged, 5-6% slower prefill on gfx950). No stable dual-output swap at FlyDSL 0.5.0.
         swapped = rocdl.permlane32_swap(
             pair_i32_ty, as_mlir_value(dw), as_mlir_value(dw), False, False
         )
@@ -113,6 +113,7 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
         ]
         # The stage overlaps the K/V ring, which other waves may still be reading for the last tile.
         rocdl.s_waitcnt(lgkmcnt=0)
+        # Raw rocdl op: keeps the scheduler from moving LDS accesses across the barrier; FlyDSL 0.5.0 exports no sched_barrier wrapper.
         rocdl.sched_barrier(0)
         fx.gpu.barrier()
         rocdl.sched_barrier(0)
@@ -134,6 +135,7 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
                 fx.ptr_store(o_pack, fx.add_offset(lds_i8, off))
         # Each wave reads back only its own rows.
         rocdl.s_waitcnt(lgkmcnt=0)
+        # Raw rocdl op (see above): no sched_barrier wrapper in FlyDSL 0.5.0.
         rocdl.sched_barrier(0)
         lane = fx.Int32(self.lane)
         c = lane % fx.Int32(16)

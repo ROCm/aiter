@@ -373,7 +373,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         l_row = loop_results[1]
         v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
 
-        # No stable approximate-reciprocal API at v0.4.0: 1.0 / x lowers to arith.divf (IEEE).
+        # No stable approximate-reciprocal API at FlyDSL 0.5.0: 1.0 / x lowers to arith.divf (IEEE).
         inv_l_rcp = rocdl.rcp(T.f32, fx.as_ir_value(l_row))
         inv_l = fx.Float32(
             (fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
@@ -437,10 +437,10 @@ def build_flash_attn_dualwave_swp_fp8_module(
         def _tile_top():
             # Publish the prefetched tile and release the slot all waves last read.
             rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-            # Keep the scheduler from moving LDS accesses across the barrier; the pinned FlyDSL exports no stable equivalent.
+            # Keep the scheduler from moving LDS accesses across the barrier; FlyDSL 0.5.0 exports no stable equivalent.
             rocdl.sched_barrier(0)
             fx.gpu.barrier()
-            # Same fence after the barrier; no stable sched_barrier equivalent in the pinned FlyDSL.
+            # Same fence after the barrier; no stable sched_barrier equivalent in FlyDSL 0.5.0.
             rocdl.sched_barrier(0)
             # The just-synchronised WG gets the SIMDs for its K reads and QK so its waves reach the next barrier together.
             _bn64_prio(BN64_QK_PRIO)
@@ -526,6 +526,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 # Non-causal measured no gain (0.997).
                 rocdl.s_waitcnt(lgkmcnt=0)
                 p_lo8 = gemm_helper.cast_p_fp8_half(p_lists, 0)
+                # Raw rocdl op: no sched_barrier wrapper in FlyDSL 0.5.0 (only sched_mfma/vmem/dsrd/dswr).
                 rocdl.sched_barrier(0)
                 v_v = kv_lds_to_regs.load_v(buf, j * BN, full=True)
                 v_p = gemm_helper.join_p_fp8_halves(
@@ -533,6 +534,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 )
             else:
                 v_p = gemm_helper.cast_p_fp8_direct(p_lists)
+                # Raw rocdl op: no sched_barrier wrapper in FlyDSL 0.5.0.
                 rocdl.sched_barrier(0)
                 v_v = kv_lds_to_regs.load_v(
                     buf, j * BN if traits.V_SHUFFLED else None, full=True
@@ -628,7 +630,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         l_row = softmax_helper.finish_half_row_sum(loop_results[1])
         v_o = [loop_results[2 + i] for i in range_constexpr(D_CHUNKS)]
         _bn64_prio(0)
-        # No stable approximate-reciprocal API at v0.4.0: 1.0 / x lowers to arith.divf (IEEE).
+        # No stable approximate-reciprocal API at FlyDSL 0.5.0: 1.0 / x lowers to arith.divf (IEEE).
         inv_l_rcp = rocdl.rcp(T.f32, fx.as_ir_value(l_row))
         inv_l = fx.Float32(
             (fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)

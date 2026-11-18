@@ -87,7 +87,7 @@ def _attn_mask_vec2_imm(rel_i32, neg_inf_i32, thr_x, thr_y, x_ref_i32, y_ref_i32
 def _reduction_pair(v_f32):
     v_i32 = _bitcast_i32(v_f32)
     pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
-    # No stable dual-output lane-swap API at v0.4.0; fx.gpu.shuffle_xor is not
+    # No stable dual-output lane-swap API at FlyDSL 0.5.0; fx.gpu.shuffle_xor is not
     # one-for-one (single result, different lowering).
     swapped = rocdl.permlane32_swap(pair_ty, v_i32, v_i32, False, True)
     lhs_i32 = llvm.extractvalue(T.i32, swapped, [0])
@@ -1336,7 +1336,7 @@ class DualwaveFp8KernelContext:
         self.c_logit_scale = c_sm_scale_log2e * (_qd * _kd)
         if const_expr(self.traits.BODY_VARIANT == "conventional_bn64"):
             # Wave-uniform: in an SGPR the per-score FMAs read it as a scalar operand, not a VGPR splat.
-            # Raw rocdl op: no stable uniform-broadcast API in the pinned FlyDSL.
+            # Raw rocdl op: no stable uniform-broadcast API in FlyDSL 0.5.0.
             self.c_logit_scale = fx.Float32(
                 _bitcast_f32(
                     rocdl.readfirstlane(T.i32, _bitcast_i32(self.c_logit_scale))

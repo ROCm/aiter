@@ -210,7 +210,7 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         return acc, den
 
     def pack_output(self, acc, den):
-        # No stable approximate-reciprocal API at v0.4.0: 1.0 / x lowers to arith.divf (IEEE).
+        # No stable approximate-reciprocal API at FlyDSL 0.5.0: 1.0 / x lowers to arith.divf (IEEE).
         inv_rcp = rocdl.rcp(T.f32, den)
         inv = (fx.Float32(den) > self.c_zero_f).select(inv_rcp, self.c_zero_f)
         inv4 = fx.full(4, fx.Float32(inv), fx.Float32)

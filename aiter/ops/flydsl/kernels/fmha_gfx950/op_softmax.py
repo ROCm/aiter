@@ -315,6 +315,7 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
             t = fx.Float32(m_half) * self.c_logit_scale + nsm
             # Finite clamped max and finite offset: t is never NaN, so "no lane above" reads straight off VCC.
             above = t > limit
+            # Raw rocdl op: no stable wave-vote API in FlyDSL 0.5.0 (gpu.__all__ has no ballot); the result feeds a scalar branch on VCC; llvm.intr_expect is a branch-weight hint with no stable wrapper.
             ballot = rocdl.ballot(T.i64, as_mlir_value(above))
             all_below = (fx.Int64(ballot) == fx.Int64(0)).ir_value()
             all_below = llvm.intr_expect(all_below, fx.Boolean(True).ir_value())
@@ -449,6 +450,7 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
                 _score_pair_to_lists((p_lo, p_hi)), self.c_zero_f, reducer, None
             )
             over = fx.Float32(maxp) > fx.Float32(2.0**limit)
+            # Raw rocdl op: no stable wave-vote API in FlyDSL 0.5.0 (gpu.__all__ has no ballot); the result feeds a scalar branch on VCC.
             ballot = rocdl.ballot(T.i64, as_mlir_value(over))
             all_ok = (fx.Int64(ballot) == fx.Int64(0)).ir_value()
             o_out = [
@@ -493,6 +495,7 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
         @flyc.jit
         def _run(v_o, nsm, l_row, p_lo, p_hi, l_tile, mb):
             bad = fx.Float32(mb) > fx.Float32(3.0e38)
+            # Raw rocdl op: no stable wave-vote API in FlyDSL 0.5.0 (gpu.__all__ has no ballot); the result feeds a scalar branch on VCC; llvm.intr_expect is a branch-weight hint with no stable wrapper.
             ballot = rocdl.ballot(T.i64, as_mlir_value(bad))
             any_bad = (fx.Int64(ballot) != fx.Int64(0)).ir_value()
             any_bad = llvm.intr_expect(any_bad, fx.Boolean(False).ir_value())
@@ -533,6 +536,7 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
         def _run(v_o, nsm, l_row, p_lo, p_hi, l_tile, mb):
             # "Some lane over" straight off VCC; mb is never NaN (sums of P in [0, inf]).
             over = fx.Float32(mb) > fx.Float32(2.0**limit)
+            # Raw rocdl op: no stable wave-vote API in FlyDSL 0.5.0 (gpu.__all__ has no ballot); the result feeds a scalar branch on VCC; llvm.intr_expect is a branch-weight hint with no stable wrapper.
             ballot = rocdl.ballot(T.i64, as_mlir_value(over))
             any_over = (fx.Int64(ballot) != fx.Int64(0)).ir_value()
             any_over = llvm.intr_expect(any_over, fx.Boolean(False).ir_value())
