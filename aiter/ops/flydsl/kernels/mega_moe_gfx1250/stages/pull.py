@@ -230,7 +230,9 @@ class PullDispatch:
     def gemm1(self, out, a, w, a_scales, w_scales, m_tile_map, **kw):
         """Run readiness followed by fused pull producers and GEMM1 consumers."""
         from aiter.jit.utils.chip_info import get_cu_num
-        from ..s1f_pull import compile_s1f_pull, resolve_pull_cluster
+        from ..s1f_pull import (
+            compile_s1f_pull, pull_affinity_geometry, resolve_pull_cluster,
+        )
 
         if kw.get("bias") is not None or not kw.get("stage1_quant_out"):
             raise ValueError("pull S1F requires bias-free fused activation/quant")
@@ -260,7 +262,17 @@ class PullDispatch:
         if workers == 0:
             workers = int(get_cu_num())
         cluster_m, cluster_n, cluster_reason = 1, 1, "cluster mode disabled"
-        if _select_bool_env("AITER_MEGA_S1F_PULL_CLUSTER", 0):
+        affinity_size, affinity_producers = 1, 0
+        if _select_bool_env("AITER_MEGA_S1F_PULL_AFFINITY", 0):
+            affinity_size, affinity_producers = pull_affinity_geometry(
+                workers, producers
+            )
+            cluster_reason = (
+                f"mixed-role affinity: {affinity_producers} producers / "
+                f"{affinity_size - affinity_producers} consumers per cluster; "
+                "local queue first, cross-cluster stealing enabled"
+            )
+        elif _select_bool_env("AITER_MEGA_S1F_PULL_CLUSTER", 0):
             tile_n = int(kw["tile_n"])
             n_tiles = (2 * config.geometry.inter_dim + tile_n - 1) // tile_n
             requested_n = max(1, int(os.environ.get(
@@ -273,6 +285,7 @@ class PullDispatch:
                 int(kw["tile_m"]), step.align_m,
             )
         self.cluster_selection = (cluster_m, cluster_n, cluster_reason)
+        self.affinity_selection = (affinity_size, affinity_producers)
         gemm = {
             "tile_m": int(kw["tile_m"]),
             "tile_n": int(kw["tile_n"]),
@@ -291,6 +304,8 @@ class PullDispatch:
             "rolled_drain": int(kw.get("rolled_drain", 0)),
             "cluster_m": cluster_m,
             "cluster_n": cluster_n,
+            "affinity_size": affinity_size,
+            "affinity_producers": affinity_producers,
         }
         key = (
             step.align_m,
@@ -331,7 +346,14 @@ class PullDispatch:
                 **gemm,
             )
             mailbox = None
-            if cluster_n > 1:
+            if affinity_size > 1:
+                # One 128-byte-separated head per cluster. The existing ready
+                # kernel resets these before every fused launch/graph replay.
+                mailbox = torch.empty(
+                    workers // affinity_size * 32,
+                    dtype=torch.int32, device=self.ctl.device,
+                )
+            elif cluster_n > 1:
                 from ..s1f_stage1 import s1f_cluster_mailbox_words
 
                 mailbox = torch.zeros(
@@ -353,6 +375,7 @@ class PullDispatch:
             m_tile_map,
             self.tile_info,
             rows,
+            mailbox.data_ptr() if mailbox is not None else 0,
             stream,
         )
         _run_compiled(

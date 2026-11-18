@@ -553,6 +553,8 @@ def make_s1f_stage1(
     rolled_drain=0,
     cluster_m=1,
     cluster_n=1,
+    affinity_size=1,
+    affinity_producers=0,
 ):
     """Build the S1F stage-1 kernel; returns a ``@flyc.jit`` launcher.
 
@@ -655,6 +657,20 @@ def make_s1f_stage1(
         raise ValueError("S1F requires a four-wave GEMM layout")
     cluster_m, cluster_n = int(cluster_m), int(cluster_n)
     cluster_size = cluster_m * cluster_n
+    affinity_size, affinity_producers = int(affinity_size), int(affinity_producers)
+    if affinity_size > 1:
+        if (
+            pull_producer is None or cluster_size != 1
+            or affinity_size not in (2, 4, 8, 16)
+            or workers % affinity_size
+            or not 0 < affinity_producers < affinity_size
+            or producers != workers // affinity_size * affinity_producers
+        ):
+            raise ValueError("invalid mixed-role affinity cluster geometry")
+    affinity_clusters = int(workers) // affinity_size
+    affinity_consumers = affinity_size - affinity_producers
+    launch_n = min(4, affinity_size) if affinity_size > 1 else cluster_n
+    launch_m = affinity_size // launch_n if affinity_size > 1 else cluster_m
     if cluster_m != 1 or cluster_n not in (1, 2, 3, 4):
         raise ValueError("S1F leader scheduling supports only 1xN clusters")
     if cluster_size > 16 or workers % cluster_size or (workers - producers) % cluster_size:
@@ -685,6 +701,9 @@ def make_s1f_stage1(
     P = int(producers)
     GM = int(group_m)
     SHARED_FIRST = S1F_SHARED_FIRST if S1F_SHARED_FIRST < epr else 0
+    if affinity_size > 1:
+        # Physical producer ownership is m % affinity_clusters, without rotation.
+        SHARED_FIRST = 0
     N1 = 2 * int(inter_dim)
     assert N1 % tile_n == 0
     NT = N1 // tile_n
@@ -882,6 +901,7 @@ def make_s1f_stage1(
             + (f"_sf{SHARED_FIRST}" if SHARED_FIRST else "")
             + (f"_ts{SPAN}" if SPAN != G else "")
             + ("_leadercluster" if cluster_size > 1 else "")
+            + (f"_affinity{affinity_size}p{affinity_producers}" if affinity_size > 1 else "")
             + f"_{g1_name}"
         )
 
@@ -962,7 +982,14 @@ def make_s1f_stage1(
             workgroup_barrier()
             gen = _uniform(comm_ops.load_i32_lds(fx.Int64(bc)))
             tword = _uniform(comm_ops.load_i32_lds(fx.Int64(bc + fx.Int32(4))))
-            if const_expr(cluster_size > 1):
+            if const_expr(affinity_size > 1):
+                affinity_id = fx.Int32(fx.block_idx.x) // launch_n
+                affinity_member = (
+                    fx.Int32(fx.block_idx.y) * launch_n
+                    + fx.Int32(fx.block_idx.x) % launch_n
+                )
+                bid = affinity_id * affinity_size + affinity_member
+            elif const_expr(cluster_size > 1):
                 cluster_id = fx.Int32(fx.block_idx.x) // cluster_n
                 local_n = fx.Int32(fx.block_idx.x) % cluster_n
                 local_m = fx.Int32(fx.block_idx.y)
@@ -988,6 +1015,12 @@ def make_s1f_stage1(
                     fx.Int32(P) + xcc * fx.Int32(CB) + kq - fx.Int32(PB),
                 )
             )
+            if const_expr(affinity_size > 1):
+                slot_id = fx.Int32((affinity_member < affinity_producers).select(
+                    affinity_id * affinity_producers + affinity_member,
+                    P + affinity_id * affinity_consumers
+                    + affinity_member - affinity_producers,
+                ))
             par = tword & fx.Int32(1)
             other = fx.Int32(1) - par
             # ---- zero the other parity's counters for the next launch ----
@@ -1746,8 +1779,12 @@ def make_s1f_stage1(
             # ---- the GEMM1 work queue ----
             # Clustered consumers and former producers share a queue of N-tile
             # groups. The 1x1 path keeps its original static consumer prefix.
-            SQ = 0 if cluster_size > 1 else G - P
+            SQ = 0 if cluster_size > 1 or affinity_size > 1 else G - P
             claim_state = [fx.Int32(0), fx.Int32(-1)]
+            if const_expr(affinity_size > 1):
+                rsrc_affinity = create_buffer_resource_from_addr(
+                    addr_runs, num_records_bytes=affinity_clusters * 128
+                )
             if const_expr(cluster_size > 1):
                 clustered = slot_id >= P
                 leader = local_n == 0
@@ -1790,12 +1827,19 @@ def make_s1f_stage1(
             gs_last = m_tiles - (groups - fx.Int32(1)) * fx.Int32(GM)
 
             def q_items(xq):
+                if const_expr(affinity_size > 1):
+                    return fx.max(
+                        0, (m_tiles - xq + affinity_clusters - 1) // affinity_clusters
+                    ) * NT
                 if const_expr(cluster_size > 1):
                     return m_tiles * fx.Int32(NT // cluster_n)
                 return m_tiles * fx.Int32(NT)
 
             def q_code(xq, w):
-                if const_expr(cluster_size > 1):
+                if const_expr(affinity_size > 1):
+                    m_q = xq + (w // NT) * affinity_clusters
+                    return (m_q << _ITEM_N_BITS) | (w % NT)
+                elif const_expr(cluster_size > 1):
                     n_groups = NT // cluster_n
                     group = w // (GM * n_groups)
                     first = group * GM
@@ -1828,6 +1872,12 @@ def make_s1f_stage1(
                 """Branch-free claim on queue xq's head: only tid 0 touches
                 memory; the old value stays in flight until read."""
                 claim_on = is_t0
+                if const_expr(affinity_size > 1):
+                    return _buffer_atomic_add_ret(
+                        rsrc_affinity,
+                        fx.Int32(claim_on.select(xq * 128, fx.Int32(_OOB))),
+                        1, SCOPE_DEV,
+                    )
                 if const_expr(cluster_size > 1):
                     # Solo former producers finish their current N-tile group
                     # before claiming another; only TG0 claims for a cluster.
@@ -1893,6 +1943,14 @@ def make_s1f_stage1(
                 code_s = fx.Int32(-2)
                 xq_s = xq0
                 it = fx.Int32(0)
+                if const_expr(affinity_size > 1):
+                    # Every tile belongs to one atomic queue; any TG may steal.
+                    # An exhausted queue never refills within this launch.
+                    while (code_s == fx.Int32(-2)) & (it < affinity_clusters):
+                        xq_s = (xq_s + 1) % affinity_clusters
+                        code_s = claim_resolve(xq_s, claim_issue(xq_s))
+                        it += 1
+                    return (code_s == fx.Int32(-2)).select(-1, code_s), xq_s
                 while (code_s == fx.Int32(-2)) & (it < fx.Int32(SPIN_LIMIT)):
                     bal = fx.Int32(1)
                     xq_c = xq0
@@ -2036,6 +2094,8 @@ def make_s1f_stage1(
             tinfo = fx.Int32(0)
             ready = fx.Int32(0)
             queue = fx.Int32(0)
+            if const_expr(affinity_size > 1):
+                queue = affinity_id
             static_ok = fx.Int32(0)
             # Consumers only: a producer's first item would wait for its own
             # runs, and those cover the earliest tiles.
@@ -2045,7 +2105,7 @@ def make_s1f_stage1(
                     fx.Int32(1), fx.Int32(0)
                 )
             )
-            if const_expr(cluster_size > 1):
+            if const_expr(cluster_size > 1 or affinity_size > 1):
                 static_ok = fx.Int32(0)
             code = fx.Int32(
                 (static_ok != fx.Int32(0)).select(q_code(queue, q0), fx.Int32(-1))
@@ -2186,7 +2246,7 @@ def make_s1f_stage1(
                     nxt["tinfo"] = ti_n
                     nxt["flags"] = fl_n
 
-                def epi_end(queue=queue, nxt=nxt):
+                def epi_end(queue=queue, nxt=nxt, m=m):
                     if is_w0:
                         c = nxt["code"]
                         ti = nxt["tinfo"]
@@ -2196,6 +2256,11 @@ def make_s1f_stage1(
                             c, xq_n = steal(queue)
                             ti = tinfo_m(c >> fx.Int32(_ITEM_N_BITS))
                             rdy = fx.Int32(0)
+                        if const_expr(affinity_size > 1):
+                            # This TG has already consumed the current A tile.
+                            # Changing only N needs no second producer wait.
+                            same_a = (c >= 0) & ((c >> _ITEM_N_BITS) == m)
+                            rdy = same_a.select(fx.Int32(1), rdy)
                         publish_slot(c, ti, rdy, xq_n)
 
                 set_holders(
@@ -2256,17 +2321,17 @@ def make_s1f_stage1(
             inp_cur_tok,
             f32_swiglu_limit,
         )
-        if const_expr(cluster_size > 1):
+        if const_expr(cluster_size > 1 or affinity_size > 1):
             kernel(
                 *launch_args,
                 value_attrs={
                     **lay["kernel_attrs"],
-                    "rocdl.cluster_dims": f"{cluster_n},{cluster_m},1",
+                    "rocdl.cluster_dims": f"{launch_n},{launch_m},1",
                 },
             ).launch(
-                grid=(G // cluster_m, cluster_m, 1),
+                grid=(G // launch_m, launch_m, 1),
                 block=(block, 1, 1), stream=stream,
-                cluster=(cluster_n, cluster_m, 1),
+                cluster=(launch_n, launch_m, 1),
             )
         else:
             kernel(*launch_args).launch(

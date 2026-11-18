@@ -549,7 +549,10 @@ def _check_vmm_bound(ctx):
 
 
 
-def _check_pull(ctx, *, a_preshuffled=True, fused=False, expected_cluster=None):
+def _check_pull(
+    ctx, *, a_preshuffled=True, fused=False, expected_cluster=None,
+    expected_affinity=None,
+):
     """Validate remote FP4 bytes, inverse maps, and changing graph inputs."""
     from aiter.test_common import checkAllclose
 
@@ -579,6 +582,11 @@ def _check_pull(ctx, *, a_preshuffled=True, fused=False, expected_cluster=None):
         # afterward, exercising generations and stale padding/empty experts.
         ctx.layer(push, "bf16")
         ctx.layer(pull, "bf16")
+        if expected_affinity is not None:
+            selected = pull._ep._dispatch._pull.affinity_selection
+            check(selected == expected_affinity,
+                  f"affinity {selected} != {expected_affinity}")
+            check.settle()
         if expected_cluster is not None:
             selected = pull._ep._dispatch._pull.cluster_selection
             check(selected[:2] == expected_cluster,
@@ -726,6 +734,16 @@ def _check_pull_s1f(ctx):
     _check_pull(ctx, fused=True)
 
 
+def _check_pull_s1f_affinity(ctx):
+    """Check mixed 3P/5C clusters, stealing, tails and changing graph inputs."""
+    with mock.patch.dict(os.environ, {
+        "AITER_MEGA_S1F_PULL_AFFINITY": "1",
+        "AITER_MEGA_S1F_PULL_PRODUCERS": "96",
+        "AITER_MEGA_S1F_PULL_CLUSTER": "0",
+    }):
+        _check_pull(ctx, fused=True, expected_affinity=(8, 3))
+
+
 def _check_pull_s1f_clusters(ctx):
     """Exercise physical cluster roles, multicast, tails and graph generations."""
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250.stages.pull import PullDispatch
@@ -768,6 +786,7 @@ def _check_pull_s1f_cluster_m_projection(ctx):
 CHECKS = (
     _check_pull,
     _check_pull_s1f,
+    _check_pull_s1f_affinity,
     _check_pull_s1f_clusters,
     _check_pull_s1f_cluster_m_projection,
     _check_pairings,

@@ -4,11 +4,12 @@
 """Pull/shuffle producer adapter for the original S1F consumer."""
 
 import functools
+import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
-from flydsl.expr import range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
 
@@ -16,6 +17,17 @@ from .dispatch_pull import make_pull_tile, pull_lds_row_pitch
 from .s1f_stage1 import (
     FLAG_M, FLAG_STRIDE, _trap, make_s1f_stage1,
 )
+
+
+def pull_affinity_geometry(workers, producers):
+    """Reduce the global role ratio into complete physical clusters."""
+    if not 0 < producers < workers:
+        raise ValueError("affinity requires 0 < producers < workers")
+    clusters = math.gcd(workers, producers)
+    size = workers // clusters
+    if size not in (2, 4, 8, 16):
+        raise ValueError("affinity role ratio needs a 2/4/8/16-TG cluster")
+    return size, producers // clusters
 
 
 def resolve_pull_cluster(
@@ -69,6 +81,8 @@ def compile_s1f_pull(
     rolled_drain,
     cluster_m=1,
     cluster_n=1,
+    affinity_size=1,
+    affinity_producers=0,
 ):
     """Build source-ready/metadata setup and S1F with a pull producer.
 
@@ -85,16 +99,26 @@ def compile_s1f_pull(
     if align_m % tile_m:
         raise ValueError("plan alignment must be a multiple of GEMM1 tile_m")
     tile_cap = (compact_cap + FLAG_M - 1) // FLAG_M
+    affinity_clusters = workers // affinity_size
+    ready_extent = max(tile_cap, affinity_clusters if affinity_size > 1 else 0)
+    ready_name = f"s1f_pull_ready_ep{world}"
+    if affinity_size > 1:
+        ready_name += f"_affinity{affinity_size}"
 
-    @flyc.kernel(name=f"s1f_pull_ready_ep{world}", known_block_size=(128, 1, 1))
+    @flyc.kernel(name=ready_name, known_block_size=(128, 1, 1))
     def ready_kernel(
         arena: fx.Int64,
         generation: fx.Tensor,
         psum: fx.Tensor,
         tile_info: fx.Tensor,
         rows: fx.Int32,
+        queue_heads: fx.Pointer,
     ):
         tid = fx.thread_idx.x
+        if const_expr(affinity_size > 1):
+            index = fx.block_idx.x * 128 + tid
+            if index < affinity_clusters:
+                fx.recast_iter(fx.Int32, queue_heads)[index * 32] = 0
         win = cco.CachedWindow(arena)
         ptr = fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4)
         epoch = generation[2]
@@ -157,10 +181,17 @@ def compile_s1f_pull(
         psum: fx.Tensor,
         tile_info: fx.Tensor,
         rows: fx.Int32,
+        queue_heads: fx.Int64,
         stream: fx.Stream,
     ):
-        ready_kernel(arena, generation, psum, tile_info, rows).launch(
-            grid=((tile_cap + 127) // 128, 1, 1),
+        ready_kernel(
+            arena, generation, psum, tile_info, rows,
+            fx.inttoptr(
+                fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4),
+                queue_heads,
+            ),
+        ).launch(
+            grid=((ready_extent + 127) // 128, 1, 1),
             block=(128, 1, 1),
             stream=stream,
         )
@@ -199,10 +230,21 @@ def compile_s1f_pull(
         output = fx.Int64(fx.ptrtoint(payload))
         ends = fx.recast_iter(global_i32, psum)
         active_rows = fx.min(rows, ends[experts - 1])
+        first = slot * 4 + wave
+        stride = producers * 4
+        live_wave = fx.Int32(1)
+        if const_expr(affinity_size > 1):
+            # Each producer owns complete M tiles from its physical cluster.
+            # Different producers may prepare subsequent M tiles concurrently.
+            cluster_id = slot // affinity_producers
+            member = slot % affinity_producers
+            first = (cluster_id + member * affinity_clusters) * (tile_m // FLAG_M) + wave
+            stride = affinity_clusters * affinity_producers * (tile_m // FLAG_M)
+            live_wave = fx.Int32(wave < tile_m // FLAG_M)
         for tile in range(
-            slot * 4 + wave,
+            live_wave.select(first, (active_rows + FLAG_M - 1) // FLAG_M),
             (active_rows + FLAG_M - 1) // FLAG_M,
-            producers * 4,
+            stride,
         ):
             # Each wave owns the entire flag tile. Its four M16 copies use
             # its private LDS slice; other waves can publish independently.
@@ -264,6 +306,8 @@ def compile_s1f_pull(
         rolled_drain=rolled_drain,
         cluster_m=cluster_m,
         cluster_n=cluster_n,
+        affinity_size=affinity_size,
+        affinity_producers=affinity_producers,
         ctas_per_cu=1,
         pull_producer=producer,
         pull_lds_bytes=64 * pull_lds_row_pitch(wire_row),

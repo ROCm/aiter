@@ -590,6 +590,26 @@ def test_s1f_pull_incomplete_cluster_fallback(args, reason):
     assert reason in message
 
 
+@pytest.mark.parametrize("producers,expected", [
+    (32, (8, 1)), (64, (4, 1)), (96, (8, 3)),
+    (112, (16, 7)), (128, (2, 1)), (192, (4, 3)),
+])
+def test_s1f_affinity_ratio(producers, expected):
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.s1f_pull import pull_affinity_geometry
+
+    size, per_cluster = pull_affinity_geometry(256, producers)
+    assert (size, per_cluster) == expected
+    assert 256 // size * per_cluster == producers
+
+
+@pytest.mark.parametrize("producers", [0, 1, 256, 257])
+def test_s1f_affinity_invalid_ratio(producers):
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.s1f_pull import pull_affinity_geometry
+
+    with pytest.raises(ValueError):
+        pull_affinity_geometry(256, producers)
+
+
 def test_s1f_cluster_mailbox_capacity():
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250.s1f_stage1 import s1f_cluster_mailbox_words
 

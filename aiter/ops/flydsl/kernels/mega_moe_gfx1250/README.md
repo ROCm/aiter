@@ -618,3 +618,112 @@ still differ from unclustered S1F; their individual timing costs are not isolate
 
 Logs, source snapshots, commands and event samples:
 `/workspace/gpubench/s1f_cluster_leader_20261118/`.
+
+## Optional mixed-role S1F affinity, 2026-11-18
+
+Enable with `DS41_AFFINITY=1 bash run_ds41_flash_best.sh`, or set
+`AITER_MEGA_S1F_PULL_AFFINITY=1` alongside the normal S1F pull options.
+The default remains off. This option takes precedence over the earlier
+consumer-only `AITER_MEGA_S1F_PULL_CLUSTER` experiment.
+
+The total producer/worker ratio is preserved. With 96 producers and 256
+workers, its reduced ratio is 3 producers + 5 initial consumers per physical
+8-TG cluster: 32 clusters, hardware dimensions `(4, 2, 1)`. Ratios reducible
+to 2/4/8/16-TG clusters are supported; unsupported ratios raise before launch.
+GEMM tiling and its four waves are unchanged. This variant uses physical
+clustering for locality, without GEMM multicast or added cluster barriers.
+
+M tile `m` belongs initially to queue `m % cluster_count`. Producers in that
+cluster gather/shuffle its A and scales, and publish the existing M64 flags.
+Its consumers claim N tiles from that queue first. After exhaustion, any TG
+may steal from other queues. Producers join GEMM after finishing dispatch.
+A task is claimed once through its owner's atomic queue even when stolen;
+no duplicate task bitmap or leader/follower task mailbox is needed. A TG
+that has consumed A may reuse its ready state while advancing N for the same
+M tile. Each launch's existing source-ready kernel resets the queue heads;
+32 heads separated by 128 B add 4096 B of global scratch, no additional LDS.
+
+At Flash EP4, tpr16384/global65536, balanced routing, each GPU has 384 valid
+M256 tiles and 6912 GEMM1 (M,N) tasks. The 32 queues initially own 12 M tiles
+each. This ownership is a preference; cross-cluster stealing remains enabled.
+Sharing a cluster/L2 does not guarantee cache residency or a 100% hit rate.
+The change also changes task order and ready reuse, so these results do not
+isolate cache locality as the sole cause.
+
+Fresh interleaved runs, 8 layers, warmup5/iters32, means across 4 GPUs and
+3 runs. Native E2E is measured before HIP event insertion. GEMM1 includes
+its producer; GEMM2 includes scatter. Event intervals include boundary
+overhead and must not be summed into native E2E. Actual runtime CSV lookup
+is token65536, topk=-1; token32768 also appears during precompile setup.
+
+| Mode | GEMM1+producer us | GEMM2+scatter us | E2E/layer us |
+|---|---:|---:|---:|
+| Affinity off | 555.74 | 582.78 | 1583.32 |
+| Affinity on, 3P+5C | 534.26 | 582.38 | 1567.34 |
+| Latency reduction | 3.86% | 0.07% | 1.01% |
+
+GEMM1 improves in all three runs. E2E ranges overlap: off1576.47–1588.34 us,
+on1556.35–1584.15 us, so the smaller E2E improvement needs a variability
+qualification; default selection has not changed.
+
+Validation: 53 CPU recipe tests; EP4 changing-input output checks plus exact
+payload/scales/routing-weight comparison against push, at H5120/I1024/tpr17
+and full Flash H5120/I2304/tpr16384. Four random/hot routing graph replays
+include empty ranks/experts. Both checks and six performance runs exited0,
+with unchanged boot ID. Two earlier host configuration failures are retained:
+the small Flash CSV selected unsupported prologue A-scale loads; a test-only
+persistent-worker override conflicted with the ordinary push reference's
+cluster_m=2 row and was removed. Neither is counted as a passing test.
+
+Commands, source snapshots, all samples, symbols and reviews:
+`/workspace/gpubench/s1f_mixed_affinity_20261118/`.
+
+## Completed BTH tuning with affinity, 2026-11-18
+
+Keep BTH=0. No repeatable E2E benefit from another hint was established.
+All rows below are fresh measurements with affinity enabled, P96/G256,
+tpr16384/global65536, balanced EP4, both GEMMs using preshuffled A.
+The override affects only B TDM loads, in both GEMM1 and GEMM2.
+
+| BTH | Hint | Runs | GEMM1 + producer (us) | GEMM2 + scatter (us) | E2E/layer (us) | E2E reduction vs 0 |
+|---:|---|---:|---:|---:|---:|---:|
+| 0 | regular | 4 | 536.86 | 590.54 | 1592.91 | +0.00% |
+| 1 | non_temporal | 1 | 552.47 | 612.42 | 1624.28 | -1.97% |
+| 2 | high_temporal | 3 | 537.55 | 590.17 | 1594.89 | -0.12% |
+| 3 | last_use | 1 | 550.20 | 609.37 | 1618.16 | -1.59% |
+| 4 | non_temporal_regular | 1 | 549.64 | 608.72 | 1605.96 | -0.82% |
+| 5 | regular_non_temporal | 3 | 539.55 | 591.45 | 1590.52 | +0.15% |
+| 6 | non_temporal_high_temporal | 1 | 552.16 | 613.14 | 1611.54 | -1.17% |
+
+The comparison uses four fresh BTH=0 repeats. Its first run was unusually
+slow (GEMM1 546.82, GEMM2 758.16, E2E 1789.61 us) with large rank differences.
+That run remains in raw results and the all-run summary, but is excluded
+from this comparison; the cause is not established. No gain is claimed
+against that anomalous baseline. Values 1/3/4/6 had one screening run each;
+0/2/5 were repeated and interleaved because their differences were small.
+
+BTH=5's mean E2E reduction is only about 0.15%, with slower mean GEMM1 and
+GEMM2. The last adjacent 0/5 pair reversed it: 1588.12 vs 1596.22 us.
+BTH=2 also failed to sustain its initial advantage. This does not justify
+changing the default B-load policy. Hints affect B-weight cache treatment;
+they do not change producer/A-data affinity, dispatch overlap, or readiness.
+There are no cache-counter measurements attributing the differences.
+
+All 15 performance runs exited successfully and retained the same boot ID.
+Both actual GEMM symbols reflect every nonzero BTH override, and launch
+geometry/LDS match across the sweep. These runs used acc_verify=0; no new
+numerical validation was performed in this hint-only sweep. The unchanged
+BTH=0 affinity kernel retains the prior passed full Flash reference checks.
+No GPU kernel source or CSV was changed during this tuning.
+
+Reproduce native E2E with the retained setting:
+
+```sh
+DS41_AFFINITY=1 DS41_BTH=0 bash /app/aiter/run_ds41_flash_best.sh
+```
+
+Set DS41_BTH=2 or 5 to reproduce the alternatives. The script clears raw
+AITER overrides, so use DS41_BTH with this script. Raw benchmark launches
+can instead use AITER_TDM_B_TH directly. Logs, run-level/rank-level values,
+exact symbols, commands and diffs are under
+/workspace/gpubench/s1f_affinity_bth_20261118/.
