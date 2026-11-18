@@ -1040,6 +1040,13 @@ def pa_decode(
     fp8_query = query.dtype == dtypes.fp8
     if arch in ("gfx1250", "gfx1250-strict") and fp8_query:
         raise ValueError("pa_decode does not support FP8 queries on gfx1250")
+    if fp8_query and nhd_layout:
+        # The NHD pipe's traits only cover a BF16/FP16 query; reject here instead
+        # of failing a traits assertion during compilation.
+        raise NotImplementedError(
+            "NHD (4D) KV caches do not support FP8 queries; use a BF16/FP16 "
+            "query with the NHD page-64 layout, or a packed 5D KV cache for FP8 queries"
+        )
     if (
         is_bf16_kv
         and arch not in ("gfx1250", "gfx1250-strict")
