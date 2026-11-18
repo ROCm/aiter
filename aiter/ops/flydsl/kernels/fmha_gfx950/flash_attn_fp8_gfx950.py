@@ -61,15 +61,11 @@ def build_flash_attn_dualwave_swp_fp8_module(
     gqa_pack_m=False,
     batch_chunks=1,
     interleaved=False,
-    o_staged=None,
-    o_store_nt=False,
 ):
     """Build the gfx950 dual-wave fp8 launcher (dense, packed varlen, or split-K).
 
     conventional_bn64 only: ``batch_chunks`` (>= ceil((batch + 1) / 64)) sizes the on-device cu_seqlens_q scan, and
-    ``interleaved`` orders a uniform causal batch's q-blocks rank-major; both are compile-time. ``o_staged`` (None:
-    on wherever it applies) stages O through LDS for 1 KB contiguous stores; ``o_store_nt`` makes O stores
-    non-temporal.
+    ``interleaved`` orders a uniform causal batch's q-blocks rank-major; both are compile-time.
     """
     gpu_arch = get_hip_arch()
 
@@ -116,8 +112,6 @@ def build_flash_attn_dualwave_swp_fp8_module(
         gqa_pack_m=gqa_pack_m,
         batch_chunks=batch_chunks,
         interleaved=interleaved,
-        o_staged=o_staged,
-        o_store_nt=o_store_nt,
     )
     # Builder-level aliases used by SharedStorage and the launch/compile wrappers.
     SPLITK = traits.SPLITK
