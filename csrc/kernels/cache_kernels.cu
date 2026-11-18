@@ -5514,23 +5514,8 @@ static size_t mla_rope_tdm_lds_bytes(int hpt, size_t elem_size)
 // HPT is then repeatedly halved until it divides num_heads. LAT is selected
 // for final HPT == 1 or rows/CU <= 128. NOPE_EARLY is selected on LAT when
 // final HPT <= 2 or rows/CU <= 48; every LAT form also has K_EARLY.
-//
-// These ranges were fit on gfx1250 (H=16/24/32/48/96/128, T=1..4096) and
-// checked on gfx950 at H=96 T=48/64. Other architectures retain the previous
-// selection ([0,32] -> 1, (32,80] -> 2, (80,160] -> 4, then 8), K_EARLY
-// through 48 rows/CU, and do not select the new LAT/NOPE_EARLY forms.
-// Between 12 and 18 the latency path's second head per block beats one head
-// (CUDA graph, H=24 T=128 2.03 -> 1.88 us, T=160 2.22 -> 1.99 us); below 12
-// it is 1-4% slower. From 18 to 128 four heads on the latency path beat both
-// two heads and the TDM path, which stages Q through LDS with fewer loads in
-// flight (H=24 T=512 3.66 -> 3.16 us, T=768 4.82 -> 4.36 us, H=96 T=128
-// 3.53 -> 3.19 us, H=16 T=768 3.70 -> 3.24 us); past 128 eight heads on the
-// TDM path win by 4-9% (H=24 T=1664 7.82 -> 7.61 us, H=96 T=416 7.64 -> 7.43
-// us). Four heads on the latency path issue the Q nope loads before the slot
-// and position round trip up to 48 rows per CU (cold L2, H=96 T=64 2.99 ->
-// 2.82 us, T=48 2.85 -> 2.75 us) and behind it beyond, where issuing them
-// first measured 3% slower (H=96 T=192 4.21 -> 4.32 us); one or two heads
-// always issue them first.
+// Other architectures keep the previous bands and do not select LAT or
+// NOPE_EARLY.
 static int mla_rope_entry_heads_per_block(int64_t num_tokens,
                                           int num_heads,
                                           bool& k_early,
