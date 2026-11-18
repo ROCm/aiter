@@ -765,6 +765,125 @@ def test_flydsl_fmha_gfx11_rejects_gqa_head_ratio():
         flydsl_flash_attn_func(q, kv, kv.clone())
 
 
+def _ref_lse_fp32(q, k, b, h, causal, scale, chunk=4096):
+    """fp32 natural-log logsumexp of the scaled scores of one (batch, head)."""
+    group = q.shape[2] // k.shape[2]
+    qh, kh = q[b, :, h].float(), k[b, :, h // group].float()
+    out = torch.empty(qh.shape[0], device=q.device)
+    for r0 in range(0, qh.shape[0], chunk):
+        s = (qh[r0 : r0 + chunk] @ kh.t()) * scale
+        if causal:
+            rows = torch.arange(r0, r0 + s.shape[0], device=s.device)[:, None]
+            cols = torch.arange(kh.shape[0], device=s.device)[None, :]
+            s = s.masked_fill(cols > rows, float("-inf"))
+        out[r0 : r0 + chunk] = torch.logsumexp(s, dim=-1)
+    return out
+
+
+@_gfx11_only
+@pytest.mark.parametrize(
+    "batch,seq_q,seq_kv,num_heads,num_kv_heads,head_dim,causal,scale",
+    [
+        (2, 1000, 1000, 8, 8, 128, True, None),  # tails, causal
+        (1, 777, 333, 4, 4, 64, False, None),  # cross, odd lengths
+        (2, 300, 300, 32, 8, 128, False, 0.05),  # GQA, custom scale
+        (1, 129, 129, 2, 2, 72, False, None),  # head_dim % 16 == 8
+    ],
+)
+def test_flydsl_fmha_gfx11_lse(
+    batch, seq_q, seq_kv, num_heads, num_kv_heads, head_dim, causal, scale
+):
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(
+        batch,
+        seq_q,
+        num_heads,
+        head_dim,
+        generator=g,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k, v = (
+        torch.randn(
+            batch,
+            seq_kv,
+            num_kv_heads,
+            head_dim,
+            generator=g,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        for _ in range(2)
+    )
+    out, lse = flydsl_flash_attn_func(
+        q, k, v, causal=causal, softmax_scale=scale, return_lse=True
+    )
+    assert lse.shape == (batch, num_heads, seq_q) and lse.dtype == torch.float32
+    # out is the same as without return_lse
+    assert torch.equal(
+        out, flydsl_flash_attn_func(q, k, v, causal=causal, softmax_scale=scale)
+    )
+    sc = 1.0 / math.sqrt(head_dim) if scale is None else scale
+    for b, h in [(batch - 1, hh) for hh in range(num_heads)] + [(0, 0)]:
+        ref = _ref_lse_fp32(q, k, b, h, causal, sc)
+        err = (lse[b, h] - ref).abs().max().item()
+        assert err < 1e-3, f"(b={b}, h={h}) max |lse - ref| = {err:.2e}"
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_lse_ring_merge():
+    """Ring-attention merge: attention over KV chunks combined with their LSEs
+    equals attention over the whole KV (as xDiT / ring flash-attn do)."""
+    batch, seq_q, seq_kv, num_heads, head_dim = 1, 1024, 3000, 8, 128
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(
+        batch,
+        seq_q,
+        num_heads,
+        head_dim,
+        generator=g,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k, v = (
+        torch.randn(
+            batch,
+            seq_kv,
+            num_heads,
+            head_dim,
+            generator=g,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        for _ in range(2)
+    )
+    full, full_lse = flydsl_flash_attn_func(q, k, v, return_lse=True)
+    out, lse = None, None
+    for c in torch.arange(seq_kv).split(1000):
+        o_c, l_c = flydsl_flash_attn_func(
+            q, k[:, c[0] : c[-1] + 1], v[:, c[0] : c[-1] + 1], return_lse=True
+        )
+        o_c = o_c.float()
+        if out is None:
+            out, lse = o_c, l_c
+            continue
+        new = torch.logaddexp(lse, l_c)
+        w_old = torch.exp(lse - new).transpose(1, 2).unsqueeze(-1)
+        w_new = torch.exp(l_c - new).transpose(1, 2).unsqueeze(-1)
+        out, lse = out * w_old + o_c * w_new, new
+    assert (lse - full_lse).abs().max().item() < 5e-4
+    rel = ((out - full.float()).norm() / full.float().norm()).item()
+    assert rel < 1e-2, f"rel_err={rel:.3e}"
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_lse_with_out():
+    q, k, v = _make_qkv(1, 500, 4, 64, torch.bfloat16)
+    out = torch.empty_like(q)
+    res, lse = flydsl_flash_attn_func(q, k, v, out=out, return_lse=True)
+    assert res is out and lse.shape == (1, 4, 500)
+
+
 # gfx950 fp8 (e4m3fn). The reference dequantizes the *same* fp8 tensors, so the
 # error measured is the kernel's, not the quantizer's.
 

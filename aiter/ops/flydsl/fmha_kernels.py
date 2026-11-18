@@ -261,6 +261,7 @@ def _get_kernel_gfx11(
     num_waves: int,
     block_n: int,
     token_strides: tuple[int, int, int],
+    return_lse: bool,
 ):
     # device_index intentionally participates in the cache key.
     return build_flash_attn_func_module_gfx11(
@@ -277,6 +278,7 @@ def _get_kernel_gfx11(
         k_token_stride=token_strides[1],
         v_token_stride=token_strides[2],
         num_kv_heads=num_kv_heads,
+        return_lse=return_lse,
     )
 
 
@@ -302,8 +304,11 @@ def _gfx11_config(seq_q: int, head_dim: int) -> tuple[int, int]:
     return 16, 32
 
 
-def _flydsl_flash_attn_func_gfx11(q, k, v, causal, softmax_scale, stream, out):
-    """gfx11 launch; the caller has validated devices, shapes, dtypes and ``out``."""
+def _flydsl_flash_attn_func_gfx11(
+    q, k, v, causal, softmax_scale, stream, out, return_lse=False
+):
+    """gfx11 launch; the caller has validated devices, shapes, dtypes and ``out``.
+    Returns ``out``, or ``(out, lse)`` with ``return_lse`` (fp32 ``[B, H, Sq]``)."""
     batch, seq_q, num_heads, head_dim = q.shape
     seq_kv = k.shape[1]
 
@@ -331,6 +336,13 @@ def _flydsl_flash_attn_func_gfx11(q, k, v, causal, softmax_scale, stream, out):
                     )
             write_in_place = out is not None and out.is_contiguous()
             o = out if write_in_place else torch.empty_like(q_c)
+            lse = (
+                torch.empty(
+                    batch, num_heads, seq_q, dtype=torch.float32, device=q.device
+                )
+                if return_lse
+                else None
+            )
             exe = _get_kernel_gfx11(
                 device_index=q.device.index,
                 num_heads=num_heads,
@@ -343,6 +355,7 @@ def _flydsl_flash_attn_func_gfx11(q, k, v, causal, softmax_scale, stream, out):
                 num_waves=num_waves,
                 block_n=block_n,
                 token_strides=(q_c.stride(1), k_c.stride(1), v_c.stride(1)),
+                return_lse=return_lse,
             )
             exe(
                 q_c,
@@ -356,11 +369,12 @@ def _flydsl_flash_attn_func_gfx11(q, k, v, causal, softmax_scale, stream, out):
                 q_batch_stride=q_c.stride(0) if batch > 1 else 0,
                 k_batch_stride=k_c.stride(0) if batch > 1 else 0,
                 v_batch_stride=v_c.stride(0) if batch > 1 else 0,
+                lse=lse,
             )
             if out is not None and not write_in_place:
                 out.copy_(o)
                 o = out
-    return o
+    return (o, lse) if return_lse else o
 
 
 def flydsl_flash_attn_func(
@@ -376,7 +390,8 @@ def flydsl_flash_attn_func(
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run FlyDSL Flash Attention on gfx11 (RDNA3 / RDNA3.5) or gfx1201 (RDNA4).
 
     Args:
@@ -397,10 +412,13 @@ def flydsl_flash_attn_func(
             required for FP8 input (gfx1201 only; gfx11 takes BF16/F16).
         out: optional output tensor. It must not alias an input. FP8 input
             requires BF16 output.
+        return_lse: also return the fp32 softmax log-sum-exp (natural log),
+            ``[batch, num_heads, seqlen_q]``, as in flash-attn. gfx11 only.
 
     Returns:
         Output with Q's shape. Its dtype matches Q for BF16/F16 input and is
         BF16 for FP8 input.
+        With ``return_lse``, a tuple ``(out, lse)``.
 
     Raises:
         ValueError: if shapes/dtypes/devices are incompatible, dimensions are
@@ -541,8 +559,10 @@ def flydsl_flash_attn_func(
 
     if is_gfx11:
         return _flydsl_flash_attn_func_gfx11(
-            q, k, v, causal, softmax_scale, stream, out
+            q, k, v, causal, softmax_scale, stream, out, return_lse
         )
+    if return_lse:
+        raise ValueError("return_lse is only supported on gfx11")
 
     block_m, block_n = _pick_gfx1201_tiles(seq_len_real, head_dim, causal)
     lds_bytes = _gfx1201_fmha_lds_bytes(head_dim, block_n, fp8=is_fp8)

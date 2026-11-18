@@ -46,6 +46,7 @@ WAVE_SIZE = 32
 WMMA_MNK = 16
 LDS_LIMIT_BYTES = 65536
 NEG_BIG = -1.0e30  # finite: NEG_BIG - m stays finite, exp2 of it is exactly 0
+_LN2 = host_math.log(2.0)
 
 # K rows and V^T rows are padded by 8 elements: keeps every v8 LDS access
 # 16-byte aligned and makes the 16 row reads of one WMMA operand bank-conflict free.
@@ -78,6 +79,7 @@ def build_flash_attn_func_module_gfx11(
     k_token_stride=None,
     v_token_stride=None,
     num_kv_heads=None,
+    return_lse=False,
 ):
     """Build the gfx11 Flash Attention forward kernel.
 
@@ -102,11 +104,13 @@ def build_flash_attn_func_module_gfx11(
         num_kv_heads: K / V heads (``None`` = ``num_heads``). Fewer than
             ``num_heads`` is GQA / MQA: query head ``h`` reads K / V head
             ``h // (num_heads // num_kv_heads)``; ``num_heads`` must be a multiple.
+        return_lse: also write the natural-log softmax log-sum-exp of every query
+            row, fp32 ``[batch, num_heads, seq_q]``, to the ``LSE`` launch argument.
 
     Returns:
         ``launch(Q, K, V, O, batch, seq_q, seq_kv, stream=..., q_batch_stride=...,
-        k_batch_stride=..., v_batch_stride=...)``; batch strides are in elements
-        and default to plain BSHD.
+        k_batch_stride=..., v_batch_stride=..., lse=...)``; batch strides are in
+        elements and default to plain BSHD; ``lse`` is required with ``return_lse``.
     """
     if head_dim % 8 != 0 or head_dim <= 0:
         raise ValueError(f"head_dim must be a positive multiple of 8, got {head_dim}")
@@ -194,12 +198,17 @@ def build_flash_attn_func_module_gfx11(
         # Arguments are <= 0 (<= -huge for masked keys); a flushed denormal is fine.
         return fx.Float32(fx.rocdl.exp2(T.f32, fx.Float32(x).ir_value()))
 
+    def _log2(x):
+        # Only applied to the row sum, which is >= 1.
+        return fx.Float32(fx.rocdl.log(T.f32, fx.Float32(x).ir_value()))
+
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def flash_attn_func_kernel(
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
         O: fx.Pointer,
+        LSE: fx.Pointer,
         seq_q: fx.Int32,
         seq_kv: fx.Int32,
         q_bstride: fx.Int32,
@@ -521,12 +530,39 @@ def build_flash_attn_func_module_gfx11(
                     o_buf, off, Vec.from_elements(out, elem), elem=elem, unit_elems=8
                 )
 
+        if const_expr(return_lse):
+            # lse = scale * m + ln(l), m in raw S units: in log2 units first, then
+            # times ln 2. Both lane halves hold the row's m and l; lanes 0-15
+            # store. One [seq_q] fp32 row per (batch, head); rows past seq_q and
+            # the upper lane half are pointed past the bound and dropped.
+            lse = (
+                fx.Float32(results[0]) * fx.Float32(SCALE_LOG2) + _log2(l_fin)
+            ) * fx.Float32(_LN2)
+            q_row_fin = qblk * BLOCK_M + (tid // WAVE_SIZE) * 16 + (tid % 16)
+            lse_base = buf_base_i64(LSE) + (
+                (fx.Int64(bat) * H + fx.Int64(head)) * fx.Int64(seq_q) * 4
+            )
+            lse_buf = ptr_buf_tensor(
+                lse_base,
+                elem=fx.Float32,
+                unit_elems=1,
+                num_records_bytes=fx.Int64(seq_q) * 4,
+            )
+            buf_copy_store(
+                lse_buf,
+                is_h0.select(q_row_fin, seq_q),
+                lse,
+                elem=fx.Float32,
+                unit_elems=1,
+            )
+
     @flyc.jit
     def launch_flash_attn_func(
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
         O: fx.Pointer,
+        LSE: fx.Pointer,
         batch_size: fx.Int32,
         seq_q: fx.Int32,
         seq_kv: fx.Int32,
@@ -543,6 +579,7 @@ def build_flash_attn_func_module_gfx11(
             K,
             V,
             O,
+            LSE,
             seq_q,
             seq_kv,
             q_bstride,
@@ -574,13 +611,19 @@ def build_flash_attn_func_module_gfx11(
         q_batch_stride=None,
         k_batch_stride=None,
         v_batch_stride=None,
+        lse=None,
     ):
+        if return_lse and lse is None:
+            raise ValueError(
+                "built with return_lse=True: pass lse=, fp32 [batch, num_heads, seq_q]"
+            )
         _run_compiled(
             launch_flash_attn_func,
             ptr_arg(Q),
             ptr_arg(K),
             ptr_arg(V),
             ptr_arg(O),
+            ptr_arg(O if lse is None else lse),  # not read unless return_lse
             batch_size,
             seq_q,
             seq_kv,
