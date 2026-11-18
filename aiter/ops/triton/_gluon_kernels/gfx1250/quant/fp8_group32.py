@@ -66,7 +66,16 @@ def _quantize_fp8_group32_kernel(
 ):
     task = gl.program_id(0)
     if PERSISTENT:
-        for tile in range(task, gl.cdiv(SIZE, 1024 * TILES_PER_ITER), 256):
-            _quantize_fp8_group32_tile(X, Y, S, SIZE, tile, DEQUANT, TILES_PER_ITER)
+        if TILES_PER_ITER == 1:
+            for tile in range(task, gl.cdiv(SIZE, 1024), 256):
+                _quantize_fp8_group32_tile(X, Y, S, SIZE, tile, DEQUANT)
+        else:
+            full_batches = SIZE // (1024 * TILES_PER_ITER)
+            for tile in range(task, full_batches, 256):
+                _quantize_fp8_group32_tile(X, Y, S, SIZE, tile, DEQUANT, TILES_PER_ITER)
+            # Spread the partial batch across workers without padded arithmetic.
+            tail = full_batches * TILES_PER_ITER + task
+            if tail < gl.cdiv(SIZE, 1024):
+                _quantize_fp8_group32_tile(X, Y, S, SIZE, tail, DEQUANT)
     else:
         _quantize_fp8_group32_tile(X, Y, S, SIZE, task, DEQUANT)

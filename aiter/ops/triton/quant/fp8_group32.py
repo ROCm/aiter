@@ -8,6 +8,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.quant.fp8_group32 import (
     _quantize_fp8_group32_kernel,
 )
 from aiter.ops.triton.quant.mono_utils import check_output, require_wave32
+from aiter.ops.triton.utils.quant_config_utils import get_mono_persistent_config
 
 __all__ = ["quantize_fp8_group32"]
 
@@ -25,7 +26,8 @@ def quantize_fp8_group32(
     Args:
         x: Contiguous BF16 tensor on gfx1250. Its last width is divisible by 32.
         persistent: Use 256 one-dimensional workers with four waves each.
-            Each iteration processes four adjacent 1024-element tiles.
+            Each iteration processes one, two or four adjacent 1024-element tiles.
+            The task count selects the batch. A partial batch uses single tiles.
         dequantize: Return QAT values in BF16 instead of FP8 and scale tensors.
         out: Optional contiguous output with x.shape and the result dtype.
         scales: Optional contiguous E8M0 tensor, with last width x.shape[-1]/32.
@@ -55,7 +57,15 @@ def quantize_fp8_group32(
     if not dequantize and scales is None:
         scales = torch.empty(shape_s, device=x.device, dtype=torch.float8_e8m0fnu)
     if x.numel():
-        grid = (256,) if persistent else (triton.cdiv(x.numel(), 1024),)
+        tasks = triton.cdiv(x.numel(), 1024)
+        batch = (
+            get_mono_persistent_config("a09_qat" if dequantize else "a09_fp8", tasks)[
+                "tasks_per_iter"
+            ]
+            if persistent
+            else 1
+        )
+        grid = (256,) if persistent else (tasks,)
         _quantize_fp8_group32_kernel[grid](
             x,
             out,
@@ -63,7 +73,7 @@ def quantize_fp8_group32(
             x.numel(),
             dequantize,
             persistent,
-            TILES_PER_ITER=4 if persistent else 1,
+            TILES_PER_ITER=batch,
             num_warps=4,
         )
     return out if dequantize else (out, scales)

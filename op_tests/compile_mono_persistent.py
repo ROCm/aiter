@@ -75,13 +75,19 @@ def main():
     native = native_reference(Path(__file__).resolve().parents[1])
     results = []
     for nq, nk in ((1280, 512), (96, 33)):
-        for mode in ("native", "nonpersistent", "persistent"):
+        for mode in (
+            "native",
+            "nonpersistent",
+            "persistent1",
+            "persistent2",
+            "persistent4",
+        ):
             fn = (
                 native._fused_dual_rmsnorm_mxfp8_quant_kernel
                 if mode == "native"
                 else (
                     _fused_dual_rmsnorm_mxfp8_quant_ps_kernel
-                    if mode == "persistent"
+                    if mode in ("persistent2", "persistent4")
                     else _fused_dual_rmsnorm_mxfp8_quant_kernel
                 )
             )
@@ -91,9 +97,10 @@ def main():
                 "QUANT_BLOCK_SIZE": 32,
                 "AMAX_FLOOR": 1e-10,
             }
-            if mode == "persistent":
-                constants["ROWS_PER_ITER"] = 4
+            if mode.startswith("persistent"):
                 constants["NUM_PRGMS"] = 256
+                if mode != "persistent1":
+                    constants["ROWS_PER_ITER"] = int(mode[-1])
             signature = {name: "i32" for name in fn.arg_names}
             signature.update(
                 {
@@ -108,7 +115,13 @@ def main():
             name = f"a03-{nq}-{nk}-{mode}"
             results.append(compile_one(fn, name, constants, signature, args.output))
     for dequant in (False, True):
-        for mode in ("native", "nonpersistent", "persistent"):
+        for mode in (
+            "native",
+            "nonpersistent",
+            "persistent1",
+            "persistent2",
+            "persistent4",
+        ):
             fn = (
                 native.quantize_fp8_kernel
                 if mode == "native"
@@ -116,8 +129,10 @@ def main():
             )
             constants = {"DEQUANT": dequant}
             if mode != "native":
-                constants["PERSISTENT"] = mode == "persistent"
-                constants["TILES_PER_ITER"] = 4 if mode == "persistent" else 1
+                constants["PERSISTENT"] = mode.startswith("persistent")
+                constants["TILES_PER_ITER"] = (
+                    int(mode[-1]) if mode.startswith("persistent") else 1
+                )
             signature = {
                 "X": "*bf16",
                 "Y": "*bf16" if dequant else "*fp8e4nv",

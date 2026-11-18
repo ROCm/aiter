@@ -60,7 +60,28 @@ def assert_guards(outputs):
         assert torch.all(raw[mask] == 0x5A)
 
 
-@pytest.mark.parametrize("rows", [0, 1, 95, 96, 255, 256, 257, 513, 1023, 1024, 1025])
+@pytest.mark.parametrize(
+    "rows",
+    [
+        0,
+        1,
+        95,
+        96,
+        255,
+        256,
+        257,
+        511,
+        512,
+        513,
+        514,
+        1023,
+        1024,
+        1025,
+        1026,
+        1027,
+        2049,
+    ],
+)
 @pytest.mark.parametrize("widths", [(1280, 512), (96, 33)])
 def test_dual_norm_native_persistent(rows, widths):
     torch.manual_seed(451)
@@ -156,6 +177,17 @@ def fp8_oracle(x):
         (257, 1024),
         (513, 1024),
         (8193, 32),
+        (511, 1024),
+        (512, 1024),
+        (514, 1024),
+        (1023, 1024),
+        (1024, 1024),
+        (1025, 1024),
+        (1026, 1024),
+        (1027, 1024),
+        (2049, 1024),
+        (513, 1056),
+        (1025, 1056),
     ],
 )
 def test_output_quant_native_persistent(shape):
@@ -323,13 +355,21 @@ def test_output_contract_rejects_bad_buffers():
 
 
 @pytest.mark.parametrize(
-    "op", ["a03", "a03-four-row-loop", "a09", "a09-five-iterations"]
+    "op",
+    [
+        "a03",
+        "a03-small",
+        "a03-four-row-loop",
+        "a09",
+        "a09-small",
+        "a09-five-iterations",
+    ],
 )
 def test_graph_replay_changes_inputs(op):
     torch.manual_seed(453)
     is_a03 = op.startswith("a03")
     if is_a03:
-        rows = 1025 if op == "a03-four-row-loop" else 513
+        rows = 1025 if op == "a03-four-row-loop" else (96 if op == "a03-small" else 513)
         x = torch.randn((rows, 1792), device="cuda", dtype=torch.bfloat16)
         wq = torch.ones((1280,), device="cuda", dtype=torch.bfloat16)
         wk = torch.ones((512,), device="cuda", dtype=torch.bfloat16)
@@ -350,7 +390,9 @@ def test_graph_replay_changes_inputs(op):
             return native.fused_dual_rmsnorm_mxfp8_quant(*args, amax_floor=1e-10)
 
     else:
-        rows = 513 if op == "a09-five-iterations" else 257
+        rows = (
+            513 if op == "a09-five-iterations" else (96 if op == "a09-small" else 257)
+        )
         x = torch.randn((rows, 2048), device="cuda", dtype=torch.bfloat16)
         outs = (
             *quantize_fp8_group32(x, persistent=True),

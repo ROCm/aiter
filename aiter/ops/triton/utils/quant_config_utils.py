@@ -44,3 +44,10 @@ def get_quant_config(config_name: str, **values) -> dict:
     cfg_dir = resolve_config_dir("quant", config_name, backend="gluon")
     tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
     return select_leq_config(tuned, axes=table_axes(tuned), **values)
+
+
+def get_mono_persistent_config(op: str, tasks: int) -> dict:
+    """Select the per-worker batch for a standalone P256 quant stage."""
+    cfg_dir = resolve_config_dir("quant", "MONO-PERSISTENT", backend="gluon")
+    configs = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    return select_leq_config(configs[op], tasks, prefix="T_LEQ_")

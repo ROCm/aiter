@@ -1,0 +1,35 @@
+{
+  "a03": {
+    "T_LEQ_511": {
+      "tasks_per_iter": 1
+    },
+    "T_LEQ_1023": {
+      "tasks_per_iter": 2
+    },
+    "any": {
+      "tasks_per_iter": 4
+    }
+  },
+  "a09_fp8": {
+    "T_LEQ_511": {
+      "tasks_per_iter": 1
+    },
+    "T_LEQ_1023": {
+      "tasks_per_iter": 2
+    },
+    "any": {
+      "tasks_per_iter": 4
+    }
+  },
+  "a09_qat": {
+    "T_LEQ_511": {
+      "tasks_per_iter": 1
+    },
+    "T_LEQ_1023": {
+      "tasks_per_iter": 2
+    },
+    "any": {
+      "tasks_per_iter": 4
+    }
+  }
+}
