@@ -309,7 +309,7 @@ class PullDispatch:
                 workers, producers,
                 cluster_reason or "complete role-homogeneous clusters",
             )
-            self._fused_launches[key] = compile_s1f_pull(
+            compiled = compile_s1f_pull(
                 rank=config.rank,
                 world=config.world_size,
                 experts=config.experts_per_rank,
@@ -330,7 +330,20 @@ class PullDispatch:
                 quant_wmma_rep=key[2],
                 **gemm,
             )
-        ready, fused = self._fused_launches[key]
+            mailbox = None
+            if cluster_n > 1:
+                from ..s1f_stage1 import s1f_cluster_mailbox_words
+
+                mailbox = torch.zeros(
+                    s1f_cluster_mailbox_words(
+                        compact_cap=self.dispatch.compact.cap,
+                        tile_m=gemm["tile_m"],
+                        n_tiles=2 * config.geometry.inter_dim // gemm["tile_n"],
+                        cluster_n=cluster_n, workers=workers, producers=producers,
+                    ), dtype=torch.int32, device=self.ctl.device,
+                )
+            self._fused_launches[key] = (*compiled, mailbox)
+        ready, fused, mailbox = self._fused_launches[key]
         stream = fx.Stream(kw.get("stream") or torch.cuda.current_stream())
         rows = int(kw["contiguous_m"])
         _run_compiled(
@@ -356,7 +369,7 @@ class PullDispatch:
             0,
             0,
             0,
-            0,
+            mailbox.data_ptr() if mailbox is not None else 0,
             self.tile_info.data_ptr(),
             self.ctl.data_ptr(),
             rows,

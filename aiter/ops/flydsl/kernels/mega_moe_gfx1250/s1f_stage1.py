@@ -233,6 +233,16 @@ def s1f_block_runs(tokens_per_rank: int) -> int:
     return S1F_BLOCK_RUNS[_tpr_bucket(tokens_per_rank)]
 
 
+def s1f_cluster_mailbox_words(
+    *, compact_cap, tile_m, n_tiles, cluster_n, workers, producers,
+):
+    """Write-once task/ready records for each initial consumer cluster."""
+    if cluster_n == 1:
+        return 0
+    tasks = ((compact_cap + tile_m - 1) // tile_m) * (n_tiles // cluster_n)
+    return ((workers - producers) // cluster_n) * (tasks + 1) * 4
+
+
 def _now():
     """Constant-rate device clock (``s_sendmsg_rtn_b64 REALTIME``), i64 ticks."""
     return fx.Int64(_llvm.call_intrinsic(T.i64, "llvm.readsteadycounter", [], [], []))
@@ -553,6 +563,9 @@ def make_s1f_stage1(
     inp_wts, send_list, runs, tile_src, ctl``, then ``i32_m`` (GEMM1 rows
     capacity), ``inp_cur_tok``, ``f32_swiglu_limit``, ``stream``.
 
+    For clustered pull, ``addr_runs`` carries the private cluster mailbox;
+    push retains its compact-run pointer there.
+
     ``pull_producer`` optionally replaces only the dispatch producer. It writes
     preshuffled A and row-major scales, publishing the same generation flags
     after its stores retire. Tile metadata and source readiness must be ready
@@ -642,11 +655,13 @@ def make_s1f_stage1(
         raise ValueError("S1F requires a four-wave GEMM layout")
     cluster_m, cluster_n = int(cluster_m), int(cluster_n)
     cluster_size = cluster_m * cluster_n
-    if cluster_m not in (1, 2, 4) or cluster_n not in (1, 2, 3, 4):
-        raise ValueError("unsupported S1F cluster geometry")
+    if cluster_m != 1 or cluster_n not in (1, 2, 3, 4):
+        raise ValueError("S1F leader scheduling supports only 1xN clusters")
     if cluster_size > 16 or workers % cluster_size or (workers - producers) % cluster_size:
         raise ValueError("S1F initial consumer count must form complete physical clusters")
     if cluster_size > 1:
+        if pull_producer is None:
+            raise ValueError("leader clusters require the pull producer adapter")
         if (2 * inter_dim // tile_n) % cluster_n or group_m % cluster_m:
             raise ValueError("S1F cluster must divide N tiles and the M task group")
     epr = int(experts_per_rank)
@@ -866,7 +881,7 @@ def make_s1f_stage1(
             + f"_poll{POLL}"
             + (f"_sf{SHARED_FIRST}" if SHARED_FIRST else "")
             + (f"_ts{SPAN}" if SPAN != G else "")
-            + ("_consumercluster" if cluster_size > 1 else "")
+            + ("_leadercluster" if cluster_size > 1 else "")
             + f"_{g1_name}"
         )
 
@@ -938,6 +953,10 @@ def make_s1f_stage1(
                     (_i32_lo(t64 - l64 * fx.Int64(SPAN)) << fx.Int32(1))
                     | (_i32_lo(l64) & fx.Int32(1)),
                 )
+                if const_expr(cluster_size > 1):
+                    comm_ops.store_i32_lds(
+                        fx.Int64(bc + fx.Int32(144)), _i32_lo(l64) + 1
+                    )
                 # GEMM1 flag-wait token (bc[4]): no item has passed yet.
                 comm_ops.store_i32_lds(fx.Int64(bc + fx.Int32(16)), fx.Int32(-1))
             workgroup_barrier()
@@ -1725,52 +1744,67 @@ def make_s1f_stage1(
                 return tinfo_join(tinfo_words(m))
 
             # ---- the GEMM1 work queue ----
-            # One global queue; consumer c = slot_id - P starts on item c
-            # without a claim.
+            # Clustered consumers and former producers share a queue of N-tile
+            # groups. The 1x1 path keeps its original static consumer prefix.
             SQ = 0 if cluster_size > 1 else G - P
-            next_cluster_item = [fx.Int32(0)]
+            claim_state = [fx.Int32(0), fx.Int32(-1)]
             if const_expr(cluster_size > 1):
                 clustered = slot_id >= P
-                # Reserve complete cluster units for initial consumers. Within
-                # each G-tile stripe, consumers own [0, G-P), former producers
-                # own [G-P, G). Only the latter range uses the atomic queue.
-                m_units = (m_tiles + cluster_m - 1) // cluster_m
-                n_groups = NT // cluster_n
-                cluster_items = m_units * n_groups * cluster_size
-                producer_items = (cluster_items // G) * P + fx.max(
-                    0, cluster_items % G - (G - P)
-                )
-                q0_cluster = bid - P
-                next_cluster_item[0] = q0_cluster
+                leader = local_n == 0
                 cluster_holder[0] = clustered
+                epoch = _uniform(comm_ops.load_i32_lds(fx.Int64(bc + 144)))
+                # Keep every task record until kernel completion. Even a TG0
+                # that runs ahead cannot overwrite a slow peer's task/ready.
+                record_cap = m_cap * (NT // cluster_n) + 1
+                record_base = addr_runs + fx.Int64(
+                    cluster_id - P // cluster_n
+                ) * fx.Int64(record_cap * 16)
+
+                def record_ptr(sequence, field):
+                    address = record_base + fx.Int64(sequence) * 16 + field * 4
+                    return fx.inttoptr(i32_gptr, address)
+
+                def wait_record(sequence, field):
+                    value = fx.generic_load(
+                        record_ptr(sequence, field),
+                        memory_order=fx.AtomicOrdering.Acquire, syncscope="agent",
+                    )
+                    spins = fx.Int32(0)
+                    while (value != epoch) & (spins < SPIN_LIMIT):
+                        fx.rocdl.s_sleep(POLL_SLEEP)
+                        value = fx.generic_load(
+                            record_ptr(sequence, field),
+                            memory_order=fx.AtomicOrdering.Acquire, syncscope="agent",
+                        )
+                        spins += 1
+                    if spins >= SPIN_LIMIT:
+                        _trap()
+
+                def publish_record(sequence, field):
+                    if lane == 0:
+                        fx.generic_store(
+                            record_ptr(sequence, field), epoch,
+                            memory_order=fx.AtomicOrdering.Release, syncscope="agent",
+                        )
             groups = (m_tiles + fx.Int32(GM - 1)) // fx.Int32(GM)
             gs_last = m_tiles - (groups - fx.Int32(1)) * fx.Int32(GM)
 
             def q_items(xq):
                 if const_expr(cluster_size > 1):
-                    return clustered.select(cluster_items, producer_items)
+                    return m_tiles * fx.Int32(NT // cluster_n)
                 return m_tiles * fx.Int32(NT)
 
             def q_code(xq, w):
                 if const_expr(cluster_size > 1):
-                    # Every consumer cluster keeps the same aligned M/N unit
-                    # across iterations, as in the non-S1F strided scheduler.
-                    logical = clustered.select(w, (w // P) * G + G - P + w % P)
-                    unit = logical // cluster_size
-                    member_id = logical % cluster_size
-                    group_units = GM // cluster_m
-                    group = unit // (group_units * n_groups)
-                    first_unit = group * group_units
-                    units = fx.max(1, fx.min(group_units, m_units - first_unit))
-                    offset = unit - group * (group_units * n_groups)
-                    mu = first_unit + offset % units
+                    n_groups = NT // cluster_n
+                    group = w // (GM * n_groups)
+                    first = group * GM
+                    height = fx.max(1, fx.min(GM, m_tiles - first))
+                    offset = w - group * GM * n_groups
+                    m_q = first + offset % height
                     if const_expr(SHARED_FIRST):
-                        # Rotate whole M-clusters; a per-tile rotation would
-                        # change the physical M member used by B multicast.
-                        mu = (mu + m_sh // cluster_m) % fx.max(1, m_units)
-                    m_q = mu * cluster_m + member_id // cluster_n
-                    n_q = (offset // units) * cluster_n + member_id % cluster_n
-                    # All N peers of an inactive M row skip the same task.
+                        m_q = (m_q + m_sh) % fx.max(1, m_tiles)
+                    n_q = (offset // height) * cluster_n
                     return (m_q << _ITEM_N_BITS) | n_q
                 else:
                     # m-major in groups of GM m-tiles, m fastest.
@@ -1795,7 +1829,14 @@ def make_s1f_stage1(
                 memory; the old value stays in flight until read."""
                 claim_on = is_t0
                 if const_expr(cluster_size > 1):
-                    claim_on = claim_on & ~clustered
+                    # Solo former producers finish their current N-tile group
+                    # before claiming another; only TG0 claims for a cluster.
+                    current = claim_state[1]
+                    last_column = (current & _ITEM_N_MASK) % cluster_n
+                    need_group = (current < 0) | (last_column == cluster_n - 1)
+                    claim_on = claim_on & (
+                        (clustered & leader) | (~clustered & need_group)
+                    )
                 return _buffer_atomic_add_ret(
                     rsrc_ctl_b,
                     fx.Int32(claim_on.select(q_head_bytes(xq), fx.Int32(_OOB))),
@@ -1807,7 +1848,32 @@ def make_s1f_stage1(
                 """Item code of a returned claim on queue xq; -2: exhausted."""
                 q = fx.Int32(SQ) + _uniform(got_v)
                 if const_expr(cluster_size > 1):
-                    q = clustered.select(next_cluster_item[0], q)
+                    current = claim_state[1]
+                    code_next = (q < q_items(xq)).select(
+                        q_code(xq, q), fx.Int32(-1)
+                    )
+                    if clustered:
+                        if is_w0:
+                            sequence = claim_state[0]
+                            if sequence >= record_cap:
+                                _trap()
+                            if leader:
+                                if is_t0:
+                                    fx.generic_store(
+                                        record_ptr(sequence, 0), code_next
+                                    )
+                                    publish_record(sequence, 1)
+                            else:
+                                wait_record(sequence, 1)
+                                code_next = fx.generic_load(record_ptr(sequence, 0))
+                                code_next = (code_next >= 0).select(
+                                    code_next + local_n, code_next
+                                )
+                    else:
+                        column = (current & _ITEM_N_MASK) % cluster_n
+                        advance = (current >= 0) & (column != cluster_n - 1)
+                        code_next = advance.select(current + 1, code_next)
+                    return code_next
                 return fx.Int32((q < q_items(xq)).select(q_code(xq, q), fx.Int32(-2)))
 
             def claim_now(xq0):
@@ -1953,9 +2019,12 @@ def make_s1f_stage1(
                 """The next item's tile_info words, joined tile_info and
                 flags, left in flight for its pre-check in epi_end."""
                 ts = tinfo_words(m_n)
+                flag_on = is_w0 & live
+                if const_expr(cluster_size > 1):
+                    flag_on = flag_on & (~clustered | leader)
                 if const_expr(SUB == 1):
-                    return ts, ts[0], flag_load(m_n, is_w0 & live, spin=False)
-                return ts, tinfo_join(ts), flag_load_sub(m_n, is_w0 & live, spin=False)
+                    return ts, ts[0], flag_load(m_n, flag_on, spin=False)
+                return ts, tinfo_join(ts), flag_load_sub(m_n, flag_on, spin=False)
 
             def pre_ready(fv, ts):
                 if const_expr(SUB == 1):
@@ -1971,13 +2040,13 @@ def make_s1f_stage1(
             # Consumers only: a producer's first item would wait for its own
             # runs, and those cover the earliest tiles.
             q0 = slot_id - fx.Int32(P)
-            if const_expr(cluster_size > 1):
-                q0 = q0_cluster
             static_ok = fx.Int32(
                 ((slot_id >= fx.Int32(P)) & (q0 < q_items(queue))).select(
                     fx.Int32(1), fx.Int32(0)
                 )
             )
+            if const_expr(cluster_size > 1):
+                static_ok = fx.Int32(0)
             code = fx.Int32(
                 (static_ok != fx.Int32(0)).select(q_code(queue, q0), fx.Int32(-1))
             )
@@ -1997,14 +2066,15 @@ def make_s1f_stage1(
             if code >= fx.Int32(0):
                 tinfo = tinfo_m(code >> fx.Int32(_ITEM_N_BITS))
 
-            def set_holders(meta, ready_fn, hooks, next_item):
+            def set_holders(meta, ready_fn, hooks, sequence, current):
                 # The GEMM body reads these when it is inlined below; a
                 # subscript store directly in a loop body would make the AST
                 # rewriter treat the holder as loop state.
                 meta_holder[0] = meta
                 ready_holder[0] = ready_fn
                 hooks_holder[0] = hooks
-                next_cluster_item[0] = next_item
+                claim_state[0] = sequence
+                claim_state[1] = current
 
             seq = fx.Int32(0)
             while code >= fx.Int32(0):
@@ -2012,7 +2082,7 @@ def make_s1f_stage1(
                 n = code & fx.Int32(_ITEM_N_MASK)
                 mask = tinfo & fx.Int32(0xFF)
 
-                def a_ready(m=m, mask=mask, ready=ready, seq=seq):
+                def local_a_ready(m=m, mask=mask, ready=ready, seq=seq):
                     # A / A-scale owner waves only (0 and 1): wave 0 polls the
                     # tile's flags unless the previous item pre-checked them;
                     # wave 1 waits for wave 0's LDS token.
@@ -2069,6 +2139,34 @@ def make_s1f_stage1(
                             if it1 >= fx.Int32(SPIN_LIMIT * 64):
                                 _trap()
 
+                def a_ready(seq=seq):
+                    # Multicast early-timeout can serve peers independently.
+                    # Gate every peer's A issue on TG0's one source-ready check.
+                    if const_expr(cluster_size > 1):
+                        if clustered:
+                            if leader:
+                                local_a_ready()
+                                if is_w0:
+                                    publish_record(seq, 2)
+                            else:
+                                if is_w0:
+                                    wait_record(seq, 2)
+                                    if lane == 0:
+                                        comm_ops.store_i32_lds(fx.Int64(bc_tok), seq)
+                                else:
+                                    spins = fx.Int32(0)
+                                    seen = _load_i32_lds_volatile(bc_tok)
+                                    while (seen != seq) & (spins < SPIN_LIMIT * 64):
+                                        fx.rocdl.s_sleep(4)
+                                        seen = _load_i32_lds_volatile(bc_tok)
+                                        spins += 1
+                                    if spins >= SPIN_LIMIT * 64:
+                                        _trap()
+                        else:
+                            local_a_ready()
+                    else:
+                        local_a_ready()
+
                 # Per-item holder, bound explicitly (not closed over) so each
                 # item's hooks see their own iteration's values.
                 nxt = {}
@@ -2111,54 +2209,27 @@ def make_s1f_stage1(
                         "epi_start": epi_start,
                         "epi_end": epi_end,
                     },
-                    q0 + (seq + 1) * G,
+                    seq + 1,
+                    code,
                 )
-                if const_expr(cluster_size > 1):
-                    if m >= m_tiles:
-                        # No A/B multicast includes this sentinel M row.
-                        # Still advance the deterministic task stream.
-                        drain_start()
-                        epi_start()
-                        epi_end()
-                        _rawbar()
-                    else:
-                        g1_task(
-                            arg_a2,
-                            arg_a1,
-                            arg_w1,
-                            arg_a1_scale,
-                            arg_w1_scale,
-                            arg_psum,
-                            arg_a1,
-                            arg_a2_scale,
-                            arg_a1,
-                            i32_m,
-                            n1,
-                            f32_swiglu_limit,
-                            fx.Float32(1.0),
-                            fx.Float32(1.0),
-                            m,
-                            n,
-                        )
-                else:
-                    g1_task(
-                        arg_a2,
-                        arg_a1,
-                        arg_w1,
-                        arg_a1_scale,
-                        arg_w1_scale,
-                        arg_psum,
-                        arg_a1,
-                        arg_a2_scale,
-                        arg_a1,
-                        i32_m,
-                        n1,
-                        f32_swiglu_limit,
-                        fx.Float32(1.0),
-                        fx.Float32(1.0),
-                        m,
-                        n,
-                    )
+                g1_task(
+                    arg_a2,
+                    arg_a1,
+                    arg_w1,
+                    arg_a1_scale,
+                    arg_w1_scale,
+                    arg_psum,
+                    arg_a1,
+                    arg_a2_scale,
+                    arg_a1,
+                    i32_m,
+                    n1,
+                    f32_swiglu_limit,
+                    fx.Float32(1.0),
+                    fx.Float32(1.0),
+                    m,
+                    n,
+                )
                 code, tinfo, ready, queue = read_slot()
                 seq = seq + fx.Int32(1)
             # Retire the last item's deferred C / e8m0 stores before exit.

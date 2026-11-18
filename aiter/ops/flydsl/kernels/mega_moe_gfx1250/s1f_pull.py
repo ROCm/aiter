@@ -22,17 +22,17 @@ def resolve_pull_cluster(
     cluster_m, cluster_n, workers, producers, n_tiles, tile_m, align_m,
 ):
     """Keep complete initial-consumer clusters, or return a 1x1 fallback."""
-    size = cluster_m * cluster_n
+    size = cluster_n
     reason = ""
-    if cluster_m not in (1, 2, 4) or cluster_n not in (1, 2, 3, 4) or size > 16:
-        reason = "unsupported physical cluster geometry"
+    if cluster_m not in (1, 2, 4) or cluster_n not in (1, 2, 3, 4):
+        reason = "only 1xN leader clusters are supported"
     elif n_tiles % cluster_n:
         reason = "N tiles do not form complete clusters"
     elif workers % size or (workers - producers) % size:
         reason = "initial consumers would form mixed producer/consumer clusters"
-    elif cluster_m > 1 and align_m != tile_m:
-        reason = "M alignment holes cannot participate in cross-M multicast"
-    return (1, 1, reason) if reason else (cluster_m, cluster_n, "")
+    if reason:
+        return 1, 1, reason
+    return 1, cluster_n, ("M clustering disabled; using 1xN" if cluster_m != 1 else "")
 
 
 @functools.cache

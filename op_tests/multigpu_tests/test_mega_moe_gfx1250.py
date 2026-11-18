@@ -736,7 +736,7 @@ def _check_pull_s1f_clusters(ctx):
             kwargs.update(cluster_m=cm, cluster_n=cn)
             return original(self, *args, **kwargs)
 
-        expected = (cm, cn) if (2 * INTER // 256) % cn == 0 else (1, 1)
+        expected = (1, cn) if (2 * INTER // 256) % cn == 0 else (1, 1)
         with mock.patch.dict(os.environ, {
             "AITER_MEGA_S1F_PULL_CLUSTER": "1",
             "AITER_MEGA_S1F_PULL_PRODUCERS": "96",
@@ -747,8 +747,8 @@ def _check_pull_s1f_clusters(ctx):
                   flush=True)
 
 
-def _check_pull_s1f_cluster_mixed_roles(ctx):
-    """An incomplete producer cluster must fall back before GPU execution."""
+def _check_pull_s1f_cluster_m_projection(ctx):
+    """An MxN request projects onto the supported 1xN consumer layout."""
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250.stages.pull import PullDispatch
 
     original = PullDispatch.gemm1
@@ -761,14 +761,15 @@ def _check_pull_s1f_cluster_mixed_roles(ctx):
         "AITER_MEGA_S1F_PULL_CLUSTER": "1",
         "AITER_MEGA_S1F_PULL_PRODUCERS": "104",
     }), mock.patch.object(PullDispatch, "gemm1", configured):
-        _check_pull(ctx, fused=True, expected_cluster=(1, 1))
+        expected = (1, 4) if (2 * INTER // 256) % 4 == 0 else (1, 1)
+        _check_pull(ctx, fused=True, expected_cluster=expected)
 
 
 CHECKS = (
     _check_pull,
     _check_pull_s1f,
     _check_pull_s1f_clusters,
-    _check_pull_s1f_cluster_mixed_roles,
+    _check_pull_s1f_cluster_m_projection,
     _check_pairings,
     _check_rejected_before_alloc,
     _check_unwind,

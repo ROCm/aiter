@@ -573,14 +573,14 @@ def test_preshuffled_grouping_reaches_scatter_context():
 def test_s1f_pull_complete_cluster_roles(cm, cn):
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250.s1f_pull import resolve_pull_cluster
 
-    assert resolve_pull_cluster(cm, cn, 256, 96, 16, 256, 256) == (cm, cn, "")
+    assert resolve_pull_cluster(cm, cn, 256, 96, 16, 256, 256)[:2] == (1, cn)
 
 
 @pytest.mark.parametrize("args,reason", [
-    ((4, 4, 256, 104, 16, 256, 256), "mixed producer/consumer"),
+    ((1, 3, 256, 96, 18, 256, 256), "mixed producer/consumer"),
     ((4, 4, 256, 96, 18, 256, 256), "N tiles"),
-    ((4, 2, 256, 96, 18, 128, 256), "M alignment"),
-    ((4, 8, 256, 96, 16, 256, 256), "unsupported physical"),
+    ((1, 2, 256, 96, 17, 128, 256), "N tiles"),
+    ((4, 8, 256, 96, 16, 256, 256), "only 1xN"),
 ])
 def test_s1f_pull_incomplete_cluster_fallback(args, reason):
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250.s1f_pull import resolve_pull_cluster
@@ -588,3 +588,13 @@ def test_s1f_pull_incomplete_cluster_fallback(args, reason):
     cm, cn, message = resolve_pull_cluster(*args)
     assert (cm, cn) == (1, 1)
     assert reason in message
+
+
+def test_s1f_cluster_mailbox_capacity():
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.s1f_stage1 import s1f_cluster_mailbox_words
+
+    # Every leader may claim all groups plus one exhaustion sentinel; records
+    # remain distinct even if a peer is delayed for the whole invocation.
+    words = s1f_cluster_mailbox_words(compact_cap=1025, tile_m=256,
+        n_tiles=8, cluster_n=4, workers=256, producers=96)
+    assert words == 40 * (5 * 2 + 1) * 4
