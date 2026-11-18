@@ -3,21 +3,22 @@
 
 """Non-S1F plan/quant and pull dispatch resources for the compact stage."""
 
+import logging
 import os
 
 import flydsl.expr as fx
 import torch
 
 from ...moe_apreshuffled_quant_scatter import validate_apre_k
-from ...tensor_shim import _preload_compiled, _run_compiled
+from ...tensor_shim import _preload_compiled, _run_compiled, ptr_arg
 from ..compact_plan import compact_plan_blocks, compile_tdm_compact_plan
 from ..dispatch_pull import compile_pull_dispatch
-from ..s1f_ctl import _QUANT_FUSE_BLOCKS
+from ..s1f_ctl import _QUANT_FUSE_BLOCKS, read_s1f_mode
 from .base import BatchLayout, ExpertGrouping, _DispatchBatch
 
 
 def enabled(config):
-    """An explicit opt-in; S1F's actual per-step verdict takes precedence."""
+    """Opt into pull; S1F_PULL selects the fused producer/consumer path."""
     return os.environ.get("AITER_MEGA_DISPATCH_PULL", "0") == "1"
 
 
@@ -27,6 +28,13 @@ def check(config):
         return
     if config.dispatch_wire != "fp4":
         raise ValueError("AITER_MEGA_DISPATCH_PULL requires FP4 dispatch")
+    if os.environ.get("AITER_MEGA_S1F_PULL", "0") == "1":
+        if not config.stage2_fused:
+            raise ValueError("pull S1F requires fused-scatter combine")
+        if not read_s1f_mode():
+            raise ValueError("AITER_MEGA_S1F_PULL requires AITER_MEGA_S1F=1")
+        if os.environ.get("AITER_MEGA_PULL_TDM_GATHER", "0") != "1":
+            raise ValueError("pull S1F requires AITER_MEGA_PULL_TDM_GATHER=1")
     validate_apre_k(config.hidden_dim)
     if config.geometry.inter_dim % 128:
         raise ValueError("pull preshuffle requires intermediate % 128 == 0")
@@ -38,12 +46,17 @@ def regions(config, geometry):
     """Extra symmetric source storage; destination rowmap is shared with push."""
     if not enabled(config):
         return {}
-    return {
+    from ..s1f_stage1 import FLAG_M, FLAG_STRIDE
+
+    extra = {
         "pull_wire": config.max_tokens_per_rank * geometry.wire_row,
         "pull_hist": geometry.hist_stride * 4,
         "pull_done": 4,
         "pull_ready": 4,
     }
+    if os.environ.get("AITER_MEGA_S1F_PULL", "0") == "1":
+        extra["pull_tile_flag"] = (geometry.cap + FLAG_M - 1) // FLAG_M * FLAG_STRIDE
+    return extra
 
 
 class PullDispatch:
@@ -54,14 +67,13 @@ class PullDispatch:
         config, geo = dispatch.config, dispatch.compact
         self.config = config
         self.tdm_gather = os.environ.get("AITER_MEGA_PULL_TDM_GATHER", "0") == "1"
+        self.fused = os.environ.get("AITER_MEGA_S1F_PULL", "0") == "1"
         self.arena = dispatch.res.arena
         device = dispatch.res.total_recv.device
         routes = geo.max_routes
         segments = config.world_size * config.experts_per_rank
         self.tok_map = torch.empty(routes, dtype=torch.int32, device=device)
-        self.block_hist = torch.empty(
-            16 * segments, dtype=torch.int32, device=device
-        )
+        self.block_hist = torch.empty(16 * segments, dtype=torch.int32, device=device)
         self.send_base = torch.empty(segments, dtype=torch.int32, device=device)
         self.masked_m = torch.empty(
             config.experts_per_rank, dtype=torch.int32, device=device
@@ -76,6 +88,19 @@ class PullDispatch:
         )
         self.wire_ptr = self.arena.local_ptr("pull_wire")
         self._launches = {}
+        self._fused_launches = {}
+        self.tile_info = None
+        self.ctl = None
+        if self.fused:
+            from ..s1f_stage1 import FLAG_M, s1f_ctl_words
+
+            tile_cap = (geo.cap + FLAG_M - 1) // FLAG_M
+            self.tile_info = torch.empty(tile_cap, dtype=torch.int32, device=device)
+            self.ctl = torch.zeros(
+                s1f_ctl_words(npes=config.world_size, tile_cap=tile_cap),
+                dtype=torch.int32,
+                device=device,
+            )
 
     def _plan_args(self, ids, hidden, weights, tokens, stream):
         return (
@@ -115,9 +140,7 @@ class PullDispatch:
         if key in self._launches:
             return self._launches[key]
         if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "warm the pull dispatch token bucket before capture"
-            )
+            raise RuntimeError("warm the pull dispatch token bucket before capture")
         config, geo, arena = self.config, self.dispatch.compact, self.arena
         plan = compile_tdm_compact_plan(
             rank=config.rank,
@@ -137,6 +160,7 @@ class PullDispatch:
             quant_row_stride=geo.wire_row,
             quant_payload_bytes=config.dispatch_token_nbytes,
             pull=True,
+            write_tok_map=False,
             off_pull_map=arena.offset("ep_rowmap"),
         )
         pull = compile_pull_dispatch(
@@ -160,32 +184,29 @@ class PullDispatch:
         return plan, pull
 
     def run(self, hidden, weights, ids):
-        """Plan/quant on the plan stream, then pull on the caller's stream."""
+        """Run plan/quant and pull in caller stream order, matching push S1F."""
         dispatch, step = self.dispatch, self.dispatch._step
         tokens = int(hidden.shape[0])
         plan, pull = self.warmup(step, tokens)
-        # A previously prefetched ordinary plan cannot supply quantized inputs.
-        # Join it before reusing ep_rowmap; future non-S1F prefetch is suppressed.
-        dispatch._wait_plan()
-        plan_stream = dispatch._plan_stream
-        plan_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(plan_stream):
-            _run_compiled(
-                plan,
-                *self._plan_args(
-                    ids.data_ptr(),
-                    hidden.data_ptr(),
-                    weights.data_ptr(),
-                    tokens,
-                    fx.Stream(plan_stream),
-                ),
-            )
-        dispatch._plan_event.record(plan_stream)
-        torch.cuda.current_stream().wait_event(dispatch._plan_event)
+        # Main runs plans in stream order. Any prefetched ordinary plan has
+        # completed before this plan reuses ep_rowmap; it cannot supply the
+        # quantized source wire needed by pull.
+        dispatch._plan_pending = False
         _run_compiled(
-            pull,
-            *self._pull_args(step.rows, fx.Stream(torch.cuda.current_stream())),
+            plan,
+            *self._plan_args(
+                ids.data_ptr(),
+                hidden.data_ptr(),
+                weights.data_ptr(),
+                tokens,
+                fx.Stream(torch.cuda.current_stream()),
+            ),
         )
+        if not self.fused:
+            _run_compiled(
+                pull,
+                *self._pull_args(step.rows, fx.Stream(torch.cuda.current_stream())),
+            )
         return _DispatchBatch(
             x=self.payload[: step.rows],
             topk_weights=dispatch._dummy_wts,
@@ -204,4 +225,123 @@ class PullDispatch:
                 rows=step.rows,
                 a_preshuffled=True,
             ),
+        )
+
+    def gemm1(self, out, a, w, a_scales, w_scales, m_tile_map, **kw):
+        """Run readiness followed by fused pull producers and GEMM1 consumers."""
+        from aiter.jit.utils.chip_info import get_cu_num
+        from ..s1f_pull import compile_s1f_pull
+
+        if kw.get("bias") is not None or not kw.get("stage1_quant_out"):
+            raise ValueError("pull S1F requires bias-free fused activation/quant")
+        if not kw.get("a_preshuffled") or not kw.get("row_major_ascale"):
+            raise ValueError("pull S1F requires preshuffled A and row-major scales")
+        config, step = self.config, self.dispatch._step
+        producers = int(os.environ.get("AITER_MEGA_S1F_PULL_PRODUCERS", "64"))
+        from aiter.ops.flydsl.grouped_gemm_mxfp4 import (
+            _select_bool_env,
+            _select_num_waves_per_tensor_tdm,
+            _select_tdm_b_th,
+        )
+
+        if int(kw.get("k_waves", 1)) != 1:
+            raise ValueError("pull S1F does not support split-K wave groups")
+        if int(kw.get("tdm_as_in_prologue", 0)):
+            raise ValueError("pull S1F must gate A-scale loads on tile readiness")
+        workers = int(os.environ.get(
+            "AITER_FLYDSL_PERSISTENT_WORKERS1",
+            os.environ.get("AITER_FLYDSL_PERSISTENT_WORKERS",
+                           kw.get("persistent_workers", 0)),
+        ))
+        # CSV zero requests a non-persistent ordinary GEMM. S1F needs resident
+        # producer/consumer roles, so zero retains its full-CU worker count.
+        if workers == 0:
+            workers = int(get_cu_num())
+        gemm = {
+            "tile_m": int(kw["tile_m"]),
+            "tile_n": int(kw["tile_n"]),
+            "tile_k": int(kw["tile_k"]),
+            "m_warp": int(kw["m_warp"]),
+            "n_warp": int(kw["n_warp"]),
+            "num_buffers": int(kw["num_buffers"]),
+            "next_stage_prefetch": _select_bool_env(
+                "AITER_TDM_NEXT_STAGE_PREFETCH", kw.get("next_stage_prefetch", 0)
+            ),
+            "waves_per_tensor_tdm": _select_num_waves_per_tensor_tdm(
+                int(kw.get("waves_per_tensor_tdm", -1))
+            ),
+            "tdm_b_th": _select_tdm_b_th(kw.get("tdm_b_th", 0)),
+            "lds_soa_load_interleave": int(kw.get("lds_soa_load_interleave", 0)),
+            "rolled_drain": int(kw.get("rolled_drain", 0)),
+        }
+        key = (
+            step.align_m,
+            int(kw["stage1_act"]),
+            int(kw["quant_wmma_rep"]),
+            producers,
+            workers,
+            tuple(sorted(gemm.items())),
+        )
+        if key not in self._fused_launches:
+            logging.getLogger("aiter").info(
+                "pull S1F GEMM1 effective config %s; cluster=1x1 "
+                "(CSV requested %sx%s; explicit-tile S1F requires1x1), "
+                "workers=%s producers=%s",
+                gemm, kw.get("cluster_m", -1), kw.get("cluster_n", -1),
+                workers, producers,
+            )
+            self._fused_launches[key] = compile_s1f_pull(
+                rank=config.rank,
+                world=config.world_size,
+                experts=config.experts_per_rank,
+                max_routes=self.dispatch.compact.max_routes,
+                compact_cap=self.dispatch.compact.cap,
+                model_dim=config.hidden_dim,
+                inter_dim=config.geometry.inter_dim,
+                wire_row=self.dispatch.compact.wire_row,
+                off_wire=self.arena.offset("pull_wire"),
+                off_ready=self.arena.offset("pull_ready"),
+                off_rowmap=self.arena.offset("ep_rowmap"),
+                off_tile_flag=self.arena.offset("pull_tile_flag"),
+                align_m=step.align_m,
+                topk=config.topk,
+                workers=workers,
+                producers=producers,
+                stage1_act=key[1],
+                quant_wmma_rep=key[2],
+                **gemm,
+            )
+        ready, fused = self._fused_launches[key]
+        stream = fx.Stream(kw.get("stream") or torch.cuda.current_stream())
+        rows = int(kw["contiguous_m"])
+        _run_compiled(
+            ready,
+            self.arena.handle,
+            self.barrier,
+            m_tile_map,
+            self.tile_info,
+            rows,
+            stream,
+        )
+        _run_compiled(
+            fused,
+            out,
+            ptr_arg(a),
+            ptr_arg(w),
+            a_scales.view(torch.int32),
+            w_scales.view(torch.int32),
+            kw["quant_scale"].view(torch.uint8),
+            ptr_arg(m_tile_map),
+            self.arena.handle,
+            self.wire_ptr,
+            0,
+            0,
+            0,
+            0,
+            self.tile_info.data_ptr(),
+            self.ctl.data_ptr(),
+            rows,
+            0,
+            float(kw.get("swiglu_limit", 7.0)),
+            stream,
         )

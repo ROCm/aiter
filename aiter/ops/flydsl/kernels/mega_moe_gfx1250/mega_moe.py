@@ -372,7 +372,13 @@ class MegaMoEGfx1250:
         if isinstance(disp, _CompactDispatch):
             # The tile is fixed before the stage-1 verdict, which is per tile.
             disp.prepare_step(recv_token_bound)
-            s1f = disp.fusion.eligible(bias1, bias2)
+            pull_s1f = disp._pull is not None and disp._pull.fused
+            s1f = not pull_s1f and disp.fusion.eligible(bias1, bias2)
+            if pull_s1f:
+                if bias1 is not None or bias2 is not None:
+                    raise ValueError("pull S1F does not support bias")
+                next_topk_ids = None
+                hook = disp._pull.gemm1
             if s1f:
                 # No in-forward plan prefetch under S1F: without the dispatch
                 # tail, the next layer's plan must come after this rank's

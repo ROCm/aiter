@@ -350,9 +350,10 @@ def compile_tdm_compact_plan(
     tile start)``, clipped to ``compact_cap``), which the GEMM1 item uses
     instead of bisecting psum.
 
-    ``write_tok_map=False`` (S1F only) skips the tok_map rewrite: the stage-1
-    kernel reads the send list and the run table, tok_map only feeds the
-    default dispatch (and the S1F check mode, which keeps it).
+    ``write_tok_map=False`` (S1F or pull) skips the final tok_map rewrite:
+    push S1F reads the send list and run table; pull reads the inverse rowmap.
+    Default dispatch and S1F check mode keep the tok_map output. The non-LDS
+    route fallback still uses tok_map as scratch before producing either output.
 
     ``align_m`` (a multiple of ``tile_m``; default ``tile_m``) pads every
     expert to that many rows instead of ``tile_m``. ``tile_m`` then only cuts
@@ -438,8 +439,7 @@ def compile_tdm_compact_plan(
     peer_mask = (1 << peer_bits) - 1
     if compact_cap >= (1 << (31 - peer_bits)):
         raise ValueError(
-            "compact row encoding exceeds positive i32: "
-            f"cap={compact_cap} peers={npes}"
+            f"compact row encoding exceeds positive i32: cap={compact_cap} peers={npes}"
         )
     hist_stride = int(hist_stride)
     row_dwords, _sparse_cap, use_sparse = compact_hist_layout(
@@ -477,9 +477,9 @@ def compile_tdm_compact_plan(
     merge_routes = chunk_cap <= _LDS_ROUTE_CAP
     dropped = -1
     write_tok_map = bool(write_tok_map)
-    if not write_tok_map and not emit_runs:
+    if not write_tok_map and not (emit_runs or pull):
         raise ValueError(
-            "write_tok_map=False needs emit_runs (S1F): tok_map is the default "
+            "write_tok_map=False needs emit_runs (S1F) or pull: tok_map is the default "
             "dispatch's only input"
         )
     if not write_tok_map:
@@ -490,6 +490,8 @@ def compile_tdm_compact_plan(
     # counts, so it is built while the X1 rows are in flight. Without the
     # LDS route table (chunk_cap > _LDS_ROUTE_CAP) it is scattered as before.
     stage_send = emit_runs and merge_routes
+    stage_pull = pull and merge_routes
+    stage_rows = stage_send or stage_pull
     # S1F without tok_map: the other blocks need only the send offsets, which
     # block 0 has before X1, so they are released then (barrier[3]).
     early_release = emit_runs and stage_send and not write_tok_map and plan_blocks > 1
@@ -636,7 +638,7 @@ def compile_tdm_compact_plan(
             inc = _wave32_inclusive_scan_i32(fx.Int32(v), lane_i)
             return fx.Int32(readlane(T.i32, arith.unwrap(inc), WAVE - 1))
 
-        if const_expr(emit_runs):
+        if const_expr(emit_runs or stage_pull):
             # Sized: a stray index is dropped by the hardware, not written.
             rsrc_send = create_buffer_resource_from_addr(
                 addr_send_list, num_records_bytes=4 * max_routes
@@ -673,12 +675,12 @@ def compile_tdm_compact_plan(
                 bnd_ptr = smem.allocate(epr * bnd_n * 4, 16)._ptr
                 lds_t2e = fx.Int64(fx.ptrtoint(t2e_ptr))
                 lds_bnd = fx.Int64(fx.ptrtoint(bnd_ptr))
-            if const_expr(stage_send):
+            if const_expr(stage_rows):
                 # This block's send-list entries: one block -> at their final
                 # slot; several -> segment-major at lpos[seg] + intra.
-                send_ptr = smem.allocate(chunk_cap * 4, 16)._ptr
+                send_ptr = smem.allocate(chunk_cap * (8 if pull else 4), 16)._ptr
                 lds_send = fx.Int64(fx.ptrtoint(send_ptr))
-                if const_expr(plan_blocks > 1):
+                if const_expr(plan_blocks > 1 or stage_pull):
                     lpos_ptr = smem.allocate(segs * 4, 16)._ptr
                     bcnt_ptr = smem.allocate(segs * 4, 16)._ptr
                     lds_lpos = fx.Int64(fx.ptrtoint(lpos_ptr))
@@ -870,38 +872,74 @@ def compile_tdm_compact_plan(
             fx.barrier()
 
         def _stage_routes(slot_base):
-            """This block's valid routes into lds_send[slot_base[seg] + intra]."""
+            """Stage source-ordered routes into segment-major LDS storage."""
             for local in range(tid, r_n, plan_threads):
                 packed = _ld(lds_routes, local)
                 if packed >= fx.Int32(0):
                     seg_r = packed & fx.Int32(0xFFFF)
-                    _st(
-                        lds_send,
-                        _ld(slot_base, seg_r) + (packed >> fx.Int32(16)),
-                        r0 + local,
-                    )
+                    slot = _ld(slot_base, seg_r) + (packed >> fx.Int32(16))
+                    route = r0 + local
+                    if const_expr(stage_pull):
+                        # Load weights in source order before rearranging in
+                        # LDS, so both the input reads and peer writes coalesce.
+                        weights = create_buffer_resource_from_addr(addr_route_weights)
+                        weight = buffer_load(weights, route, vec_width=1, dtype=T.i32)
+                        _st(
+                            lds_send,
+                            slot * fx.Int32(2),
+                            fx.Int32(rank * max_routes) + route,
+                        )
+                        _st(lds_send, slot * fx.Int32(2) + fx.Int32(1), weight)
+                    else:
+                        _st(lds_send, slot, route)
 
         def _copy_segments():
-            """Several blocks: this block's entries of each segment are
-            consecutive at lpos[seg] here and at sendpos[seg] in the send
-            list; waves over segments, lanes over a segment's entries."""
+            """Copy each block's segment with consecutive lanes at both ends."""
             s_lo = warp_u * fx.Int32(pos_per_wave)
             s_hi = _imin(s_lo + fx.Int32(pos_per_wave), fx.Int32(segs))
             for sb in range(s_lo, s_hi, fx.Int32(WAVE)):
                 sl = sb + lane_i
                 sl_s = fx.Int32((sl < s_hi).select(sl, fx.Int32(0)))
                 n_l = _ld(lds_bcnt, sl_s)
-                g_l = _ld(lds_sendpos, sl_s)
+                if const_expr(stage_pull):
+                    g_l = _ld(lds_hist, sl_s)
+                else:
+                    g_l = _ld(lds_sendpos, sl_s)
                 l_l = _ld(lds_lpos, sl_s)
                 nb = _imin(s_hi - sb, fx.Int32(WAVE))
                 for i in range(fx.Int32(0), nb, fx.Int32(1)):
                     n_s = _bcast(n_l, i)
                     g_s = _bcast(g_l, i)
                     l_s = _bcast(l_l, i)
+                    if const_expr(stage_pull):
+                        peer = (sb + i) // fx.Int32(epr)
+                        destination = lsa(peer, off_pull_map)
                     for j0 in range(fx.Int32(0), n_s, fx.Int32(WAVE)):
                         j = j0 + lane_i
-                        if j < n_s:
-                            buffer_store(_ld(lds_send, l_s + j), rsrc_send, g_s + j)
+                        if const_expr(stage_pull):
+                            row = g_s + j
+                            if (j < n_s) & (row < fx.Int32(compact_cap)):
+                                slot = (l_s + j) * fx.Int32(2)
+                                route = fx.Uint64(_ld(lds_send, slot))
+                                weight = fx.Uint64(_ld(lds_send, slot + fx.Int32(1)))
+                                metadata = route | (weight << 32)
+                                pointer_type = fx.PointerType.get(
+                                    fx.Uint64.ir_type, fx.AddressSpace.Global, 8
+                                )
+                                fx.generic_store(
+                                    fx.inttoptr(
+                                        pointer_type, destination + fx.Int64(row) * 8
+                                    ),
+                                    metadata,
+                                )
+                        else:
+                            if j < n_s:
+                                buffer_store(_ld(lds_send, l_s + j), rsrc_send, g_s + j)
+
+        if const_expr(stage_pull and plan_blocks == 1):
+            for s in range(tid, segs, plan_threads):
+                _st(lds_bcnt, s, _ld(lds_hist, s))
+            _lds_barrier()
 
         if const_expr(plan_blocks > 1):
             # barrier[0] counts arrivals and is reset by block 0 once all are in:
@@ -909,7 +947,7 @@ def compile_tdm_compact_plan(
             for s in range(tid, segs, plan_threads):
                 cnt = comm_ops.load_i32_lds(lds_hist + fx.Int64(s) * 4)
                 buffer_store(cnt, rsrc_bhist, fx.Int32(bid) * segs + s)
-                if const_expr(stage_send):
+                if const_expr(stage_rows):
                     # This block's own counts, for its send-list staging
                     # (lds_hist is overwritten by the merge / the bases).
                     _st(lds_bcnt, s, cnt)
@@ -925,7 +963,7 @@ def compile_tdm_compact_plan(
                     comm_ops.fence_agent_acquire()
                     buffer_store(arith.constant(0), rsrc_bar, 0)
             fx.barrier()
-            if const_expr(stage_send):  # noqa: SIM102
+            if const_expr(stage_rows):  # noqa: SIM102
                 # Not on block 0's path to X1: the other blocks stage their
                 # send-list entries while block 0 merges and exchanges.
                 if bid != 0:
@@ -1067,6 +1105,10 @@ def compile_tdm_compact_plan(
                         _stage_segments()
                         _lds_barrier()
                         _copy_segments()
+
+            if const_expr(stage_pull):
+                _stage_segments()
+                _lds_barrier()
 
             if const_expr(not use_tag):
                 fx.barrier()
@@ -1321,7 +1363,7 @@ def compile_tdm_compact_plan(
                         vec_width=1,
                         dtype=T.i32,
                     )
-                    if const_expr(write_tok_map):
+                    if const_expr(write_tok_map or pull):
                         base = buffer_load(rsrc_base, s, vec_width=1, dtype=T.i32)
                         comm_ops.store_i32_lds(
                             lds_hist + fx.Int64(s) * fx.Int64(4), base + off
@@ -1338,8 +1380,12 @@ def compile_tdm_compact_plan(
                             + off,
                         )
                 _lds_barrier()
-                if const_expr(stage_send):
+                if const_expr(stage_rows):
                     _copy_segments()
+
+        if const_expr(stage_pull):
+            if bid == 0:
+                _copy_segments()
 
         if const_expr(emit_runs):  # noqa: SIM102
             if bid == 0:
@@ -1485,7 +1531,9 @@ def compile_tdm_compact_plan(
                             fx.Int32(run_hdr + 2 * run_cap) + r,
                         )
 
-        if const_expr(write_tok_map or not stage_send):
+        if const_expr(
+            write_tok_map or (pull and not stage_pull) or (emit_runs and not stage_send)
+        ):
             for local in range(tid, r_n, plan_threads):
                 route = r0 + local
                 if const_expr(merge_routes):
@@ -1503,29 +1551,19 @@ def compile_tdm_compact_plan(
                 )
                 dest_row = send_base + intra
                 in_cap = dest_row < compact_cap
-                if const_expr(pull):  # noqa: SIM102
+                if const_expr(pull and not stage_pull):  # noqa: SIM102
                     if valid & in_cap:
-                        weights = create_buffer_resource_from_addr(
-                            addr_route_weights
-                        )
-                        weight = buffer_load(
-                            weights, route, vec_width=1, dtype=T.i32
-                        )
+                        weights = create_buffer_resource_from_addr(addr_route_weights)
+                        weight = buffer_load(weights, route, vec_width=1, dtype=T.i32)
                         # Peers differ across lanes. A global pointer avoids
                         # serializing divergent buffer-resource descriptors.
-                        reverse = (
-                            lsa(dest_pe, off_pull_map) + fx.Int64(dest_row) * 8
-                        )
-                        source_route = fx.Uint64(
-                            fx.Int32(rank * max_routes) + route
-                        )
+                        reverse = lsa(dest_pe, off_pull_map) + fx.Int64(dest_row) * 8
+                        source_route = fx.Uint64(fx.Int32(rank * max_routes) + route)
                         metadata = source_route | (fx.Uint64(weight) << 32)
                         pointer_type = fx.PointerType.get(
                             fx.Uint64.ir_type, fx.AddressSpace.Global, 8
                         )
-                        fx.generic_store(
-                            fx.inttoptr(pointer_type, reverse), metadata
-                        )
+                        fx.generic_store(fx.inttoptr(pointer_type, reverse), metadata)
                 if const_expr(write_tok_map):
                     flat = (dest_row << fx.Int32(peer_bits)) | (
                         dest_pe & fx.Int32(peer_mask)

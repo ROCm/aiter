@@ -549,7 +549,7 @@ def _check_vmm_bound(ctx):
 
 
 
-def _check_pull(ctx, *, a_preshuffled=True):
+def _check_pull(ctx, *, a_preshuffled=True, fused=False):
     """Validate remote FP4 bytes, inverse maps, and changing graph inputs."""
     from aiter.test_common import checkAllclose
 
@@ -561,13 +561,19 @@ def _check_pull(ctx, *, a_preshuffled=True):
     try:
         with mock.patch.dict(os.environ, {
             "AITER_MEGA_S1F": "0", "AITER_MEGA_DISPATCH_PULL": "0",
+            "AITER_MEGA_S1F_PULL": "0",
         }):
             push = ctx.build(**fields)
         with mock.patch.dict(os.environ, {
-            "AITER_MEGA_S1F": "0", "AITER_MEGA_DISPATCH_PULL": "1",
+            "AITER_MEGA_S1F": "1" if fused else "0",
+            "AITER_MEGA_DISPATCH_PULL": "1",
+            "AITER_MEGA_S1F_PULL": "1" if fused else "0",
+            "AITER_MEGA_PULL_TDM_GATHER": "1" if fused else os.environ.get(
+                "AITER_MEGA_PULL_TDM_GATHER", "0"),
         }):
             pull = ctx.build(**fields)
         check(pull._ep._dispatch._pull is not None, "pull was not selected")
+        check(pull._ep._dispatch._pull.fused == fused, "wrong fusion mode")
         check.settle()
         # Warm the same addresses used in capture. The input contents change
         # afterward, exercising generations and stale padding/empty experts.
@@ -611,6 +617,22 @@ def _check_pull(ctx, *, a_preshuffled=True):
             valid = torch.cat([
                 torch.arange(end - count, end) for count, end in zip(counts, ends)
             ]).long()
+            if fused:
+                # GEMM1 can use a smaller tile than the plan/GEMM2 alignment.
+                # Metadata must count actual rows, excluding alignment holes.
+                metadata = helper.tile_info.cpu().to(torch.int64)
+                expected_counts = torch.zeros_like(metadata)
+                for count, end in zip(counts, ends):
+                    start = end - count
+                    for tile in range(start // 64, (end + 63) // 64):
+                        if tile < metadata.numel():
+                            expected_counts[tile] += max(
+                                0, min(end, (tile + 1) * 64) - max(start, tile * 64)
+                            )
+                check(torch.equal((metadata >> 16) & 0xFFFF, expected_counts),
+                      "pull tile metadata includes padding or misses live rows")
+                check(torch.equal((metadata & 0xFF) != 0, expected_counts > 0),
+                      "empty pull tiles must not wait for producer flags")
             rowmap = stage._ep_rowmap.cpu()[valid]
             if a_preshuffled:
                 packed = helper.payload.cpu().reshape(-1, HIDDEN // 32, 16, 16)
@@ -694,8 +716,14 @@ def _check_pull(ctx, *, a_preshuffled=True):
                 mega.close()
         ctx.comm.barrier()
 
+def _check_pull_s1f(ctx):
+    """Exercise fused pull/GEMM1 with changing inputs and empty ranks."""
+    _check_pull(ctx, fused=True)
+
+
 CHECKS = (
     _check_pull,
+    _check_pull_s1f,
     _check_pairings,
     _check_rejected_before_alloc,
     _check_unwind,

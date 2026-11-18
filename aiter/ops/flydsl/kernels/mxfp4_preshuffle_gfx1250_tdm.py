@@ -2857,6 +2857,13 @@ def build_gemm_a8w4_tdm_task(
         "prologue_stages": _pro_stages,
         "c_ep_off": C_EP_OFF,
         "c_q_off": C_Q_OFF,
+        # Planar B starts on64KiB. The padding after all SB stages can hold
+        # caller control data if it also lies past every epilogue's C staging.
+        # Exclude the A-scale prologue, whose storage has a separate lifetime.
+        "control_gap": (
+            (max(PLANAR_SB_OFF + num_buffers * STAGE_SB, C_STORE_B), PLANAR_B_OFF)
+            if planar_lds_on and not tdm_as_in_prologue else (0, 0)
+        ),
     }
     return gemm_task, block, _kname, cluster_m, layout
 

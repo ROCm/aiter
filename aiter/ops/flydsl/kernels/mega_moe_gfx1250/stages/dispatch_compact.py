@@ -545,7 +545,7 @@ class _CompactDispatch(_Dispatch):
                 f"recv_token_bound={recv_token_bound} needs {self._step.align_m}; "
                 "pass the bound the plan was started with"
             )
-        if self._pull is not None and not s1f and not self.fusion.should_probe():
+        if self._pull is not None and not s1f:
             return self._pull.run(hidden_states, topk_weights, topk_ids)
         kernel = self._kernels[_pick(self.schedule, token_count)]
         # The plan quantizes the payload itself when the fused quant is on;
@@ -647,7 +647,9 @@ class _CompactDispatch(_Dispatch):
         _check_recv_token_bound(self.config, "recv_token_bound", recv_token_bound)
         token_count = int(topk_ids.shape[0])
         self._step = self._step_for(self._recv_bound(recv_token_bound))
-        if self._pull is not None and not self.fusion.step_will_run():
+        if self._pull is not None and (
+            self._pull.fused or not self.fusion.step_will_run()
+        ):
             return
         self._launch_plan(
             topk_ids,
