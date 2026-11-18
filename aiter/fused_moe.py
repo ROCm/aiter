@@ -2711,6 +2711,55 @@ def _cfg_topk(topk: int, n_shared: int, expert_mask: torch.Tensor | None) -> int
     return topk + n_shared + int(expert_mask is not None and n_shared > 0)
 
 
+def _fused_moe_router_buffers(
+    M: int,
+    topk_total: int,
+    E_tot: int,
+    block_size_M: int,
+    model_dim: int,
+    group_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, ...]:
+    """Output buffers of ``fused_moe_router_impl``, in its argument order.
+
+    The sorted map is sized as _moe_sorting_impl does, but over the full slot
+    count: every emitted id (shared and sentinel included) gets its own padded
+    block. The row count is whole blocks because stage1 walks block_size_M rows
+    per sorted_expert_ids entry, while the kernel's tail fill stops at
+    sorted_ids.numel().
+    """
+    max_num_tokens_padded = M * topk_total + E_tot * block_size_M - topk_total
+    max_num_m_blocks = (max_num_tokens_padded + block_size_M - 1) // block_size_M
+    max_num_tokens_padded = max_num_m_blocks * block_size_M
+    topk_ids = torch.empty((M, topk_total), dtype=dtypes.i32, device=device)
+    topk_weights = torch.empty((M, topk_total), dtype=dtypes.fp32, device=device)
+    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(
+        max_num_tokens_padded, dtype=dtypes.fp32, device=device
+    )
+    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    # Quantized stage1 input, sized as fused_dynamic_mx_quant_moe_sort does.
+    scaleN_pad = ((model_dim // group_size) + 7) // 8 * 8
+    a1 = torch.empty(M, model_dim // 2, dtype=dtypes.fp4x2, device=device)
+    a1_scale_sorted = torch.empty(
+        (max_num_tokens_padded + 31) // 32 * 32,
+        scaleN_pad,
+        dtype=dtypes.fp8_e8m0,
+        device=device,
+    )
+    return (
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        a1,
+        a1_scale_sorted,
+    )
+
+
 def fused_moe_router_arch_supported() -> bool:
     """Whether this GPU can run :func:`fused_moe_router` at all.
 
@@ -3075,20 +3124,19 @@ def fused_moe_router(
         f"entries, need at least {global_E}"
     )
 
-    # Sorted-map buffers, sized exactly as _moe_sorting_impl does, but over the
-    # full slot count: every emitted id (shared and sentinel included) gets its
-    # own padded block in the sort.
     group_size = 32
-    max_num_tokens_padded = M * topk_total + E_tot * block_size_M - topk_total
-    max_num_m_blocks = (max_num_tokens_padded + block_size_M - 1) // block_size_M
-    topk_ids = torch.empty((M, topk_total), dtype=dtypes.i32, device=device)
-    topk_weights = torch.empty((M, topk_total), dtype=dtypes.fp32, device=device)
-    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(
-        max_num_tokens_padded, dtype=dtypes.fp32, device=device
+    (
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        a1,
+        a1_scale_sorted,
+    ) = _fused_moe_router_buffers(
+        M, topk_total, E_tot, block_size_M, model_dim, group_size, device
     )
-    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
     # stage2 atomically accumulates into moe_buf, so it must start zeroed.
     # The fused routing kernel now does that clear itself (passed as moe_buf
     # below), which removes a separate ~4.6us torch FillFunctor launch per MoE
@@ -3096,16 +3144,6 @@ def fused_moe_router(
     # correct here: the kernel writes every element before stage2 runs, which
     # test_moe_buf_zero_fill pins with a poisoned buffer.
     moe_buf = torch.empty((M, model_dim), dtype=dtype, device=device)
-
-    # Quantized stage1 input, sized as fused_dynamic_mx_quant_moe_sort does.
-    scaleN_pad = ((model_dim // group_size) + 7) // 8 * 8
-    a1 = torch.empty(M, model_dim // 2, dtype=dtypes.fp4x2, device=device)
-    a1_scale_sorted = torch.empty(
-        (max_num_tokens_padded + 31) // 32 * 32,
-        scaleN_pad,
-        dtype=dtypes.fp8_e8m0,
-        device=device,
-    )
 
     fused_moe_router_impl(
         gating_output,

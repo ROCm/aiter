@@ -1076,10 +1076,14 @@ void fused_moe_router_impl(aiter_tensor_t& gating,
                     " elements, need M * (topk + fused shared) = ",
                     (int64_t)M * topk_total);
     // Phase 3 writes through num_valid, not through these lengths, so an
-    // undersized output is an out-of-bounds device write.
-    const int64_t need_rows =
+    // undersized output is an out-of-bounds device write. Stage1 then walks
+    // unit_size rows per sorted_expert_ids entry, but the tail fill stops at
+    // sorted_ids.numel(), so the row buffers must cover every block.
+    const int64_t worst_rows =
         (int64_t)M * topk_total + (int64_t)E_tot * unit_size - topk_total;
-    const int64_t need_blocks = (need_rows + unit_size - 1) / unit_size;
+    const int64_t need_blocks = (worst_rows + unit_size - 1) / unit_size;
+    const int64_t need_rows =
+        std::max(need_blocks, (int64_t)sorted_expert_ids.numel()) * unit_size;
     const int64_t scaleN_pad  = ((cols + group_size - 1) / group_size + kScalesPerThread - 1) /
                                kScalesPerThread * kScalesPerThread;
     const int64_t out_rows    = ((int64_t)sorted_ids.numel() + 31) / 32 * 32;

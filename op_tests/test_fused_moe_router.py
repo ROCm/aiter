@@ -663,11 +663,12 @@ def check_rejects_bad_shapes(E=320, topk=8, unit_size=16):
         "group_size=0",
     )
 
-    # Phase 3 writes through num_valid, so outputs must hold the worst case;
-    # one element short of it must be refused.
-    rows = M * topk + E * unit_size - topk
+    # Phase 3 writes through num_valid, so outputs must hold the worst case,
+    # rounded up to whole blocks for stage1; one element short must be refused.
+    rows = -(-(M * topk + E * unit_size - topk) // unit_size) * unit_size
     scale_n_pad = (COLS // GROUP_SIZE + 7) // 8 * 8
     need = {
+        "sids": rows,
         "sw": rows,
         "osc": (got["sids"].numel() + 31) // 32 * 32 * scale_n_pad,
     }
@@ -895,6 +896,51 @@ def test_tail_fill_exact(path, M, unit_size):
     )
     fails = _tail_errs(got, M, 8, unit_size, f"{path} M={M} u={unit_size}")
     assert not fails, fails
+
+
+# fused_moe_router allocates its own sorted buffers rather than taking
+# moe_sorting's, and every other test reuses stock-sized ones, so only this one
+# sees its sizing. topk=8 with M=2/7/33 puts M*topk + E*unit - topk off a block
+# boundary, where an unrounded sorted_ids ends inside the last block stage1 reads.
+@pytest.mark.parametrize("unit_size", [16, 32, 128])
+@pytest.mark.parametrize("M", [2, 7, 33])
+@pytest.mark.parametrize("ep,n_shared", [(None, 0), ((2, 4, True), 1)])
+def test_router_buffers_match_stock(path, M, unit_size, ep, n_shared):
+    from aiter.fused_moe import _fused_moe_router_buffers
+
+    E, topk = 320, 8
+    topk_total = topk + n_shared
+    mask, shared = None, {"n_shared": n_shared}
+    if ep is not None:
+        mask = _make_mask(E, ep[0], ep[1], vllm_shape=ep[2], n_shared=n_shared)
+        shared.update(ep_rank=ep[0], ep_size=ep[1])
+    g, b, h = _inputs(M, E, dtypes.bf16, M)
+    ref = _run_stock(g, b, h, M, E, topk, unit_size, True, 1.0, mask, **shared)
+
+    keys = ("ti", "tw", "sids", "sw", "seids", "nv", "o4", "osc")
+    bufs = _fused_moe_router_buffers(
+        M,
+        topk_total,
+        _expert_slots(E, n_shared, mask is not None),
+        unit_size,
+        COLS,
+        GROUP_SIZE,
+        g.device,
+    )
+    got = {k: _fill_pat(t, 0) for k, t in zip(keys, bufs)}
+    got["nv"].zero_()
+    ctx = f"{path} M={M} u={unit_size} ep={ep} n_shared={n_shared}"
+    assert got["sids"].numel() == got["seids"].numel() * unit_size, ctx
+    for k in ("sids", "sw", "seids"):
+        assert got[k].shape == ref[k].shape, (
+            f"{ctx}: {k} is {tuple(got[k].shape)}, "
+            f"stock moe_sorting gives {tuple(ref[k].shape)}"
+        )
+
+    _call_fused(g, b, h, got, E, topk, unit_size, True, 1.0, mask, None, **shared)
+    torch.cuda.synchronize()
+    _assert_ok(_compare(ref, got, M, topk_total, unit_size), ctx)
+    assert not _tail_errs(got, M, topk_total, unit_size, ctx)
 
 
 # An all-zero mask makes num_valid 0 and every phase-3 slice empty; an all-ones
