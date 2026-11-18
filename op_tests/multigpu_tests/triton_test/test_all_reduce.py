@@ -14,7 +14,7 @@ from aiter.dist.cuda_wrapper import find_loaded_library
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.ops.triton.comms.all_reduce import (
-    _LINES,
+    _get_config,
     all_reduce,
     all_reduce_free,
     all_reduce_init,
@@ -30,6 +30,8 @@ NUMELS += [3 * HIDDEN + 8, 600 * HIDDEN + 8]
 MIXED = [8, 1, 2048, 2, 64, 4, 512, 8, 16, 1024, 32, 128, 256, 1, 8]
 
 SKIP = torch.cuda.device_count() < WORLD_SIZE or arch_info.get_arch() != "gfx1250"
+if not SKIP:
+    _LINES = _get_config()["LINES"]
 pytestmark = pytest.mark.skipif(SKIP, reason="needs 4 gfx1250 GPUs")
 
 
