@@ -106,6 +106,7 @@ def peers(monkeypatch):
         out[:] = [obj] + [other] * (len(out) - 1)
 
     monkeypatch.setattr(sp.dist, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(sp.dist, "get_world_size", lambda group=None: 2)
     return state
 
 
@@ -295,7 +296,9 @@ def test_factory_without_a_window_returns_none_after_the_vote_without_compiling(
     assert peers.calls == [quick.group]
 
 
-@pytest.mark.parametrize("others", [None, (1 << 30, None)])
+@pytest.mark.parametrize(
+    "others", ["no INT4 window for this platform", {"min": 1 << 30, "max": None}]
+)
 def test_factory_returns_none_when_a_peer_has_another_window(gfx950, peers, others):
     peers.others = others
     quick = FakeQuick()
@@ -311,7 +314,10 @@ def test_the_vote_is_plain_data(monkeypatch, peers, arch):
     monkeypatch.setattr(policy, "detect_arch", lambda: arch)
     sp.create_sp_collectives(FakeQuick())
     (vote,) = peers.votes
-    assert vote == ((8 << 20, None) if arch == "gfx950" else None)
+    if arch == "gfx950":
+        assert vote == {"min": 8 << 20, "max": None}
+    else:
+        assert isinstance(vote, str)
     assert b"aiter" not in pickle.dumps(vote)
 
 

@@ -35,6 +35,8 @@ import math
 import torch
 import torch.distributed as dist
 
+from aiter.dist.device_communicators.flydsl_utils import all_ranks_agree_on_plan
+
 logger = logging.getLogger("aiter")
 
 # flydsl is required on Linux and optional on Windows and Triton-only installs;
@@ -152,31 +154,43 @@ def create_sp_collectives(quick) -> SequenceParallelCollectives | None:
     served call launches at once, and a failure on any rank gives every rank
     ``None``.
     """
-    window = None
-    if fly_policy is None:
-        logger.warning(
-            "INT4 sequence-parallel collectives are unavailable: "
-            "FlyDSL cannot be imported: %s",
-            _flydsl_error,
-        )
-    else:
-        window = fly_policy.sp_int4_window(
-            arch=fly_policy.detect_arch(), link=quick.link, world_size=quick.world_size
-        )
+    window = full = shard = None
     # Every rank votes before any rank returns: one that returned alone would
-    # leave its peers waiting in compile_sp's own vote. The vote is plain data: a
-    # peer's Window would be unpickled here, which imports FlyDSL again on a rank
-    # that has none and raises instead of returning None.
-    vote = None if window is None else (window.min, window.max)
-    votes = [None] * quick.world_size
-    dist.all_gather_object(votes, vote, group=quick.group)
-    if votes[0] is None or any(v != votes[0] for v in votes):
+    # leave its peers waiting in compile_sp's own vote, so nothing before the
+    # vote may raise. The vote is plain data: a peer's Window would be unpickled
+    # here, which imports FlyDSL again on a rank that has none and raises
+    # instead of returning None. It is the window's bounds, or a string naming
+    # why this rank declines, which this rank logs.
+    vote = None
+    try:
+        if fly_policy is None:
+            vote = f"FlyDSL cannot be imported: {_flydsl_error}"
+            logger.warning("INT4 sequence-parallel collectives declined: %s", vote)
+        else:
+            window = fly_policy.sp_int4_window(
+                arch=fly_policy.detect_arch(),
+                link=quick.link,
+                world_size=quick.world_size,
+            )
+            if window is None:
+                vote = "no INT4 window for this platform"
+                logger.info("INT4 sequence-parallel collectives declined: %s", vote)
+            else:
+                elements = TILE_BYTES // ELEMENT_BYTES
+                full = torch.empty(elements, dtype=torch.bfloat16, device=quick.device)
+                shard = torch.empty(
+                    elements // quick.world_size,
+                    dtype=torch.bfloat16,
+                    device=quick.device,
+                )
+                vote = {"min": window.min, "max": window.max}
+    except Exception as exc:  # noqa: BLE001
+        vote = f"setup failed: {exc!r}"
+        logger.warning("INT4 sequence-parallel collectives declined: %s", vote)
+    if not all_ranks_agree_on_plan(
+        vote, quick.group, owner="INT4 sequence-parallel collectives"
+    ):
         return None
-    elements = TILE_BYTES // ELEMENT_BYTES
-    full = torch.empty(elements, dtype=torch.bfloat16, device=quick.device)
-    shard = torch.empty(
-        elements // quick.world_size, dtype=torch.bfloat16, device=quick.device
-    )
     # compile_sp raises on every rank when any rank cannot run the kernels.
     try:
         quick.compile_sp(full, shard)
