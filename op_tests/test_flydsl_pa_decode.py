@@ -1324,6 +1324,24 @@ _BF16_CASES = _COMMON_CASES + [
         )
         for length, dim, splits in ((4, 512, 2), (4, 1024, 4), (3, 1024, 3))
     ],
+    # The same tiles on a grid filling more than half of gfx950's CUs fit its
+    # 160 KiB of LDS unsplit.
+    *[
+        (
+            f"head{dim}-mtp4-wide-grid",
+            {
+                "query_length": 4,
+                "group_size": 16,
+                "head_dim": dim,
+                "block_size": 128,
+                "lengths": (4096,) * 16,
+                "max_partitions": 16,
+                "budget": 512,
+                "query_splits": {"gfx950": 1, "gfx942": gfx942_splits},
+            },
+        )
+        for dim, gfx942_splits in ((512, 2), (1024, 4))
+    ],
     # Four 16-row query tiles at D64/D128 over page128 caches: on gfx1250, wave
     # pairs share two tiles and split every page, in each output mode. One
     # task per sequence runs window-masked, unmasked and causal pages in turn;
@@ -2115,6 +2133,47 @@ def _check_select_rejected(monkeypatch, invalid, error, match):
         )
 
 
+@pytest.mark.parametrize(
+    "arch,head_dim,query_length,query_group_size,work_capacity,expected",
+    [
+        ("gfx950", 512, 4, 16, 256, 1),
+        ("gfx950", 1024, 3, 16, 192, 1),
+        ("gfx950", 1024, 4, 16, 129, 1),
+        ("gfx950", 1024, 2, 16, 512, 1),
+        ("gfx950", 1024, 9, 4, 512, 1),
+        # At most half of the CUs busy: the 64 KiB split.
+        ("gfx950", 512, 4, 16, 128, 2),
+        ("gfx950", 1024, 4, 16, 128, 4),
+        # Three M-tiles per split ran slower unsplit; D768 MTP4 and D1024 CTAs
+        # with a partial second M-tile fail to compile.
+        ("gfx950", 512, 6, 16, 512, 2),
+        ("gfx950", 768, 4, 16, 512, 2),
+        ("gfx950", 1024, 3, 8, 512, 3),
+        ("gfx950", 1024, 12, 2, 512, 2),
+        ("gfx942", 512, 4, 16, 512, 2),
+    ],
+)
+def test_pa_decode_bf16_lds_splits(
+    monkeypatch, arch, head_dim, query_length, query_group_size, work_capacity, expected
+):
+    """gfx950 BF16 heads 512/1024 use its 160 KiB of LDS only on busy grids."""
+    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
+    monkeypatch.setattr(traits, "get_rocm_arch", lambda: arch)
+    schedule = traits.PaDecodeSchedule.select(
+        head_dim=head_dim,
+        query_group_size=query_group_size,
+        block_size=128,
+        num_seqs=work_capacity,
+        num_kv_heads=1,
+        num_compute_units=256,
+        work_capacity=work_capacity,
+        query_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        query_length=query_length,
+    )
+    assert schedule.cache_key.query_splits == expected
+
+
 def _one_hot_kv(key, value, table, context, compute_type, tokens_per_channel=256):
     """Zero K and one-hot V in channel (token // tokens_per_channel) % dim.
 
@@ -2183,7 +2242,8 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         assert compile_kwargs[-1]["cluster_steps"] == case["cluster_steps"]
     if case["cluster_runs"] is not None and arch == "gfx1250":
         assert compile_kwargs[-1]["cluster_runs"] == case["cluster_runs"]
-    if case["pipe"]:
+    expected_splits = (case["query_splits"] or {}).get(arch)
+    if case["pipe"] or expected_splits is not None:
         schedule_kwargs = dict(compile_kwargs[-1])
         schedule_kwargs.pop("architecture", None)
         schedule_kwargs.pop("direct_output", None)
@@ -2191,7 +2251,11 @@ def _check_pipe_policy(pa, case, arch, compile_kwargs):
         schedule_kwargs.pop("cluster_seqs", None)
         schedule_kwargs.pop("cluster_steps", None)
         schedule_kwargs.pop("cluster_runs", None)
-        traits = PaDecodeTraits.create(PaDecodeSchedule.select(**schedule_kwargs))
+        schedule = PaDecodeSchedule.select(**schedule_kwargs)
+        if expected_splits is not None:
+            assert schedule.cache_key.query_splits == expected_splits
+    if case["pipe"]:
+        traits = PaDecodeTraits.create(schedule)
         assert traits.D256_PIPE == (arch == "gfx950")
         if traits.D256_PIPE:
             assert (traits.stage_page_capacity > 0) == (case["staged"] is not False)
@@ -2357,6 +2421,7 @@ def _run_pa_decode_case(case, device, monkeypatch):
             "cluster_steps": None,
             "cluster_runs": None,
             "quant": None,  # gfx1250 FP8 output path: "fused" or "fallback"
+            "query_splits": None,  # {arch: expected split count}
         },
         **case,
     )

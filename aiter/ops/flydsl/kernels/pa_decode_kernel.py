@@ -221,7 +221,10 @@ def compile_pa_decode_tile(
     count overrides splitting and selects the matching prefetch policy.
     BF16 also selects the smallest query-length divisor that fits 64 KiB LDS;
     for example D512/MTP4/GQA16 splits twice and D1024/MTP3/GQA16 splits three
-    ways. Explicit BF16 splits must fit that limit as well.
+    ways. Explicit BF16 splits must fit that limit as well. On gfx950, heads
+    512 and 1024 whose split leaves at most two M-tiles instead fit 160 KiB
+    once more than half the CUs hold a task, so those examples run unsplit;
+    D1024 CTAs of 17-31 rows keep the 64 KiB split.
     ``max_context_length`` bounds dense planned work for scheduling only; it does not
     change the launch capacity, scratch layout, or single-tile guarantee. Every
     context length, including later graph replays, must be at most this value:

@@ -29,6 +29,7 @@ MXFP4_V_BF16_CHUNK_BYTES = 16 * 16 * 16
 # Keeps the f32 O accumulator from overflowing; the epilogue undoes it.
 MXFP4_P_EXP_SHIFT = 20
 BF16_LDS_LIMIT_BYTES = 64 * 1024
+GFX950_BF16_LDS_LIMIT_BYTES = 160 * 1024
 MXFP4_LDS_LIMIT_BYTES = 160 * 1024
 PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
 LDS_BYTES_PER_CU = 160 * 1024  # gfx950; NHD runs only there.
@@ -206,6 +207,23 @@ def _bf16_lds_bytes(head_dim, query_rows, block_size):
     return qp_bytes + max_sum_bytes + 4 * pages_per_chunk * 4
 
 
+def _bf16_query_splits(
+    head_dim, query_length, query_group_size, block_size, first, limit
+):
+    """Smallest split from ``first`` whose CTA fits ``limit``; past the
+    query length when none does."""
+    query_splits = first
+    while query_splits <= query_length and (
+        query_length % query_splits
+        or _bf16_lds_bytes(
+            head_dim, (query_length // query_splits) * query_group_size, block_size
+        )
+        > limit
+    ):
+        query_splits += 1
+    return query_splits
+
+
 class PaDecodeCacheKey(NamedTuple):
     """Tile specialization key. ``select`` builds it by keyword and ``create``
     reads it by name, so a field one change adds and another misses fails
@@ -366,6 +384,7 @@ class PaDecodeSchedule:
                 num_partitions >= window_tiles
                 and work_capacity >= num_seqs * window_tiles
             )
+        bf16_lds_limit = BF16_LDS_LIMIT_BYTES
         if query_splits is None:
             # Single-tile page128 MTP4 tolerates more split-query CTAs per CU.
             split_weight = (
@@ -440,22 +459,46 @@ class PaDecodeSchedule:
             if kv_dtype == fx.BFloat16:
                 # Native BF16 doubles Q's LDS footprint. Select the smallest
                 # split that fits, keeping the packed reducer rows unchanged.
-                while query_splits <= query_length and (
-                    query_length % query_splits
-                    or _bf16_lds_bytes(
-                        head_dim,
-                        (query_length // query_splits) * query_group_size,
-                        block_size,
-                    )
-                    > BF16_LDS_LIMIT_BYTES
-                ):
-                    query_splits += 1
+                query_splits = _bf16_query_splits(
+                    head_dim,
+                    query_length,
+                    query_group_size,
+                    block_size,
+                    query_splits,
+                    BF16_LDS_LIMIT_BYTES,
+                )
                 if query_splits > query_length:
                     raise ValueError(
                         "BF16 PA query group exceeds the 64 KiB LDS limit, "
                         f"even with one query position per CTA: head_dim={head_dim}, "
                         f"query_group_size={query_group_size}"
                     )
+                # gfx950 CTAs may use all 160 KiB, so fewer splits re-read K/V,
+                # once more than half the CUs hold a task (MI355X). Splits that
+                # already leave three or more M-tiles ran slower unsplit (D512
+                # MTP6, D384/D256 MTP8), and unsplit D768 MTP4 and D896 MTP3
+                # fail LLVM's machine verifier, hence heads 512 and 1024 only.
+                # D1024 CTAs with a partial second M-tile fail it too (19 and
+                # 22-30 rows; 17-20 pass but are excluded alongside).
+                split_rows = (query_length // query_splits) * query_group_size
+                if (
+                    is_gfx950
+                    and head_dim in (512, 1024)
+                    and 2 * split_workgroups > num_compute_units
+                    and split_rows <= 2 * MFMA_MNK
+                ):
+                    wide_splits = _bf16_query_splits(
+                        head_dim,
+                        query_length,
+                        query_group_size,
+                        block_size,
+                        1,
+                        GFX950_BF16_LDS_LIMIT_BYTES,
+                    )
+                    wide_rows = (query_length // wide_splits) * query_group_size
+                    if not (head_dim == 1024 and MFMA_MNK < wide_rows < 2 * MFMA_MNK):
+                        bf16_lds_limit = GFX950_BF16_LDS_LIMIT_BYTES
+                        query_splits = wide_splits
         if kv_dtype == fx.BFloat16:
             assert query_splits >= 1, "query_splits must be positive"
         else:
@@ -465,10 +508,11 @@ class PaDecodeSchedule:
             lds_bytes = _bf16_lds_bytes(
                 head_dim, (query_length // query_splits) * query_group_size, block_size
             )
-            if lds_bytes > BF16_LDS_LIMIT_BYTES:
+            if lds_bytes > bf16_lds_limit:
                 raise ValueError(
                     f"BF16 PA query_splits={query_splits} requires {lds_bytes} LDS "
-                    "bytes, exceeding the 64 KiB limit; increase query_splits"
+                    f"bytes, exceeding the {bf16_lds_limit // 1024} KiB limit; "
+                    "increase query_splits"
                 )
         QUERIES_PER_CTA = query_length // query_splits
         TOTAL_ROWS = query_length * query_group_size
