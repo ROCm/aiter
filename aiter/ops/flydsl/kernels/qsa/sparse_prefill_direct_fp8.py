@@ -1327,6 +1327,22 @@ def launchers(*, inputs, prepared, out):
     stream = torch.cuda.current_stream(inputs.q.device)
     pack, direct, pack_fn, direct_fn = _compiled(inputs, prepared, out, stream)
     slotted, raw = prepared.slotted, prepared.raw
+    # Bind only fixed arguments: the cached workspace must not keep this call's Q, K/V,
+    # scales, slot table or out alive.
+    pack_mid, pack_table, flag, pack_tail = pack[4:9], pack[9], pack[10], pack[12:]
+    packed_kv, records, table_fixed, direct_tail = (
+        direct[2:4],
+        direct[4],
+        direct[8],
+        direct[10:],
+    )
+    if slotted:
+        pack_table = None
+    if raw:
+        packed_kv = None
+        if slotted:
+            table_fixed = None
+    del pack, direct
 
     def pack_launch(q, k, v, ks, vs, slots):
         pack_fn(
@@ -1334,16 +1350,16 @@ def launchers(*, inputs, prepared, out):
             v,
             ks,
             vs,
-            *pack[4:9],
-            slots if slotted else pack[9],
-            pack[10],
+            *pack_mid,
+            slots if slotted else pack_table,
+            flag,
             q,
-            *pack[12:],
+            *pack_tail,
         )
 
     def direct_launch(q8, qs, k, v, o, ks, vs, slots, scale_log2):
-        kv = (k, v) if raw else direct[2:4]
-        table = slots if raw and slotted else direct[8]
-        direct_fn(q8, qs, *kv, direct[4], ks, vs, o, table, scale_log2, *direct[10:])
+        kv = (k, v) if raw else packed_kv
+        table = slots if raw and slotted else table_fixed
+        direct_fn(q8, qs, *kv, records, ks, vs, o, table, scale_log2, *direct_tail)
 
     return pack_launch, direct_launch

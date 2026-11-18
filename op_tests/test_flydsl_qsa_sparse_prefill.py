@@ -96,11 +96,13 @@ Usage:
 
 import argparse
 import contextlib
+import gc
 import importlib
 import inspect
 import math
 import os
 import pkgutil
+import weakref
 import zlib
 
 import numpy as np
@@ -2255,7 +2257,8 @@ def test_qsa_fp8_workspace(case, heads):
     tensors anew. One stream runs the layout with BF16 K/V, then FP8 K/V per tensor, per
     token, per tensor with new scale tensors, per tensor through a pool, per token with
     compute="bf16", per token with batch_invariant=True and per token again; each call
-    gives the bits of the same call on a new stream."""
+    gives the bits of the same call on a new stream. A workspace keeps none of the tensors
+    of the call that built it alive (per token, and per tensor through a pool)."""
     layout, _ = FP8_WORKSPACE_CASES[case]
     query_lens, prefix_lens = CASES[layout][:2]
     generator = torch.Generator(device="cuda").manual_seed(fp8_seed(case, heads))
@@ -2307,6 +2310,30 @@ def test_qsa_fp8_workspace(case, heads):
     assert not any(
         differing.values()
     ), f"{case} H{heads}: calls differ from new streams {differing}"
+    alive = {}
+    for label, kv, extra in (calls[2], calls[4]):
+        built = {"q": q, "k": kv[0], "v": kv[1], **extra}
+        built = {name: x.clone() for name, x in built.items()}
+        built["out"] = torch.empty_like(q)
+        refs = {name: weakref.ref(x) for name, x in built.items()}
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            qsa_sparse_prefill(
+                built.pop("q"),
+                built.pop("k"),
+                built.pop("v"),
+                indices,
+                **kwargs,
+                **built,
+            )
+        torch.cuda.synchronize()
+        del built
+        gc.collect()
+        alive[label] = [name for name, ref in refs.items() if ref() is not None]
+    assert not any(
+        alive.values()
+    ), f"{case} H{heads}: workspaces keep caller tensors alive {alive}"
     return {"gfx": get_gfx(), "rows": q.shape[0], "calls": len(calls)}
 
 
