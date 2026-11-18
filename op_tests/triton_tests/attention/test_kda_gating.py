@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""ATOM's fused gating entry: same slots, a state fork, and speculative verify."""
+"""KDA gating decode: same slots, a state fork, and speculative verify."""
+
+import logging
 
 import pytest
 import torch
 
 from aiter.ops.triton.attention.kda import fused_recurrent_kda
-from aiter.ops.triton.attention.kda_atom import fused_sigmoid_gating_delta_rule_update
+from aiter.ops.triton.attention.kda_gating import kda_gating_decode, supports
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 pytestmark = pytest.mark.skipif(
@@ -47,7 +49,7 @@ def _gating_case(mode, lens, seed, heads=H, value_heads=None, dtype=torch.bfloat
 
     ``mode`` is ``decode`` (a separate read table with the write slots),
     ``fork`` (all reads from slots that no sequence writes), ``spec`` (2D
-    tables, every second row forks) or ``multi`` (the 2D tables of ``spec``
+    tables, the odd rows fork) or ``multi`` (the 2D tables of ``spec``
     without accepted counts, so each sequence reads column 0). With five or
     more sequences, one sequence has a negative read slot and one has negative
     write slots.
@@ -99,7 +101,7 @@ def _gating_lens(mode, sequences):
 def _call(inputs, indices, indices_in, cu, accepted=None, **kwargs):
     args = dict(inputs)
     out = args.pop("o")
-    return fused_sigmoid_gating_delta_rule_update(
+    return kda_gating_decode(
         q=args.pop("q"),
         k=args.pop("k"),
         v=args.pop("v"),
@@ -112,7 +114,6 @@ def _call(inputs, indices, indices_in, cu, accepted=None, **kwargs):
         ssm_state_indices_in=indices_in,
         num_accepted_tokens=accepted,
         use_qk_l2norm_in_kernel=True,
-        is_kda=True,
         lower_bound=-5.0,
         **args,
         **kwargs,
@@ -133,7 +134,7 @@ def _recurrence(state, token, A_log, dt_bias):
 
 
 def _reference(inputs, indices, indices_in, cu, accepted, state, out):
-    """ATOM's read-slot / write-slot recurrence, including a negative write.
+    """The read-slot / write-slot recurrence, including a negative write.
 
     Value head ``i`` uses q/k head ``i // (HV // H)``.
     """
@@ -150,10 +151,10 @@ def _reference(inputs, indices, indices_in, cu, accepted, state, out):
         length = int(cu[seq + 1]) - bos
         if length <= 0:
             continue
-        if read.ndim == 1:
-            origin = int(read[seq])
-        else:
-            origin = int(read[seq, int(accepted[seq]) - 1])
+        column = int(accepted[seq]) - 1
+        if column < 0:
+            continue
+        origin = int(read[seq] if read.ndim == 1 else read[seq, column])
         if origin < 0:
             continue
         current = state[origin].clone()
@@ -299,9 +300,63 @@ def test_speculative_verify_without_fork_matches_single_index():
         lower_bound=-5.0,
         out=out,
     )
-    atom_out, atom_state = _call(inputs, indices, None, cu, accepted)
-    torch.testing.assert_close(atom_out, fused_out.squeeze(0), atol=2e-3, rtol=2e-2)
-    torch.testing.assert_close(atom_state, fused_state, atol=1e-4, rtol=1e-4)
+    out, state = _call(inputs, indices, None, cu, accepted)
+    torch.testing.assert_close(out, fused_out.squeeze(0), atol=2e-3, rtol=2e-2)
+    torch.testing.assert_close(state, fused_state, atol=1e-4, rtol=1e-4)
+
+
+def test_speculative_verify_skips_a_sequence_with_a_count_below_one():
+    torch.manual_seed(6)
+    sequences, width = 2, 2
+    inputs = _inputs(sequences * width, 8)
+    cu = torch.arange(0, sequences * width + 1, width, dtype=torch.int32, device="cuda")
+    accepted = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+    indices = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32, device="cuda")
+    expected_state = inputs["initial_state"].clone()
+    expected_out = inputs["o"].clone()
+    _reference(inputs, indices, None, cu, accepted, expected_state, expected_out)
+    out, state = _call(inputs, indices, None, cu, accepted)
+    _assert_close(out, state, expected_out, expected_state)
+    assert torch.equal(out[:width], inputs["o"].new_full((width, H, K), 7))
+
+
+@pytest.mark.parametrize("given", ["none", "4d"])
+def test_output_may_be_none_or_have_the_shape_of_v(given):
+    torch.manual_seed(9)
+    inputs = _inputs(4, 6)
+    cu = torch.arange(5, dtype=torch.int32, device="cuda")
+    indices = torch.tensor([1, 0, 4, 2], dtype=torch.int32, device="cuda")
+    expected_state = inputs["initial_state"].clone()
+    expected_out = inputs["o"].clone()
+    _reference(inputs, indices, None, cu, None, expected_state, expected_out)
+    o = None if given == "none" else inputs["o"].unsqueeze(0)
+    out, state = _call(inputs | {"o": o}, indices, None, cu)
+    assert out.shape == inputs["v"].shape
+    assert o is None or out is o
+    _assert_close(out[0], state, expected_out, expected_state)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {},
+        {"lower_bound": None},
+        {"state_dtype": torch.bfloat16},
+        {"head_k_dim": 64},
+        {"head_v_dim": 64},
+        {"act_dtype": torch.float32},
+    ],
+    ids=["kimi-k3", "no-lower-bound", "bf16-state", "k64", "v64", "fp32-activations"],
+)
+def test_supports_checks_the_model_setup(change):
+    setup = {
+        "lower_bound": -5.0,
+        "state_dtype": torch.float32,
+        "head_k_dim": K,
+        "head_v_dim": K,
+        "act_dtype": torch.bfloat16,
+    }
+    assert supports(**(setup | change)) is (change == {})
 
 
 def test_cuda_graph_replay_uses_updated_slots():
@@ -416,12 +471,27 @@ def test_strided_beta_is_read_with_its_token_stride():
 
 def _unsupported(case, inputs, indices):
     """Arguments that ``kda_gating_kernel`` does not cover."""
+    act = {"dtype": torch.bfloat16, "device": "cuda"}
     return {
         "not_in_place": {"inplace_final_state": False},
         "no_l2norm": {"use_qk_l2norm_in_kernel": False},
-        "softplus_gate": {"is_kda": False},
         "no_lower_bound": {"lower_bound": None},
         "bf16_state": {"initial_state": inputs["initial_state"].bfloat16()},
+        "k_dim_64": {"q": inputs["q"][..., :64]},
+        "v_dim_64": {"v": inputs["v"][..., :64]},
+        "fp32_activations": {n: inputs[n].float() for n in ("q", "k", "v", "a", "b")},
+        "value_heads_not_a_multiple": {"v": torch.randn((1, 4, H + 1, K), **act)},
+        "short_A_log": {"A_log": inputs["A_log"][:-1]},
+        "strided_dt_bias": {"dt_bias": inputs["dt_bias"].t()},
+        "int64_cu_seqlens": {"cu_seqlens": torch.arange(5, device="cuda")},
+        "tokens_past_1d_table": {
+            "cu_seqlens": torch.tensor([0, 2, 4], dtype=torch.int32, device="cuda"),
+            "ssm_state_indices": indices[:2],
+            "ssm_state_indices_in": None,
+        },
+        "fp32_output": {"o": inputs["o"].float()},
+        "strided_output": {"o": torch.full((4, H, 2 * K), 7, **act)[..., ::2]},
+        "short_output": {"o": inputs["o"][:3]},
         "int64_slots": {
             "ssm_state_indices": indices.long(),
             "ssm_state_indices_in": None,
@@ -455,9 +525,19 @@ def _unsupported(case, inputs, indices):
     [
         "not_in_place",
         "no_l2norm",
-        "softplus_gate",
         "no_lower_bound",
         "bf16_state",
+        "k_dim_64",
+        "v_dim_64",
+        "fp32_activations",
+        "value_heads_not_a_multiple",
+        "short_A_log",
+        "strided_dt_bias",
+        "int64_cu_seqlens",
+        "tokens_past_1d_table",
+        "fp32_output",
+        "strided_output",
+        "short_output",
         "int64_slots",
         "read_table_shape",
         "accepted_with_1d_slots",
@@ -467,7 +547,7 @@ def _unsupported(case, inputs, indices):
         "cpu_slot_table",
     ],
 )
-def test_unsupported_inputs_return_none_without_writes(case):
+def test_unsupported_inputs_return_none_without_writes(case, caplog):
     torch.manual_seed(8)
     inputs = _inputs(4, 6)
     indices = torch.tensor([1, 0, 4, 2], dtype=torch.int32, device="cuda")
@@ -476,13 +556,14 @@ def test_unsupported_inputs_return_none_without_writes(case):
         "ssm_state_indices": indices,
         "ssm_state_indices_in": indices.clone(),
         "use_qk_l2norm_in_kernel": True,
-        "is_kda": True,
         "lower_bound": -5.0,
     }
     args |= _unsupported(case, inputs, indices)
     state = args["initial_state"].clone()
     out = args["o"].clone()
-    assert fused_sigmoid_gating_delta_rule_update(**args) is None
+    with caplog.at_level(logging.DEBUG, logger="AITER_TRITON"):
+        assert kda_gating_decode(**args) is None
+    assert "kda_gating_decode declines the call" in caplog.text
     torch.cuda.synchronize()
     assert torch.equal(args["initial_state"], state)
     assert torch.equal(args["o"], out)

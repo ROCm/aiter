@@ -1,22 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx1250 Gluon kernel for ATOM's KDA gating entry: decode, fork and spec verify.
+"""gfx1250 Gluon kernel of ``kda_gating_decode``: decode, fork and spec verify.
 
 One program keeps ``BV`` V-rows of one (sequence, value head) state tile in
 registers for all tokens of the sequence. Each lane holds runs of ``VEC``
 consecutive K columns, so the state loads and stores are wide. The program
 requests the whole tile before the math, so it waits for memory one time.
 
-The slots follow ATOM. The read slot is ``read[seq, accepted - 1]`` in spec
-verify, else ``read[seq]``. A negative read slot or an empty sequence leaves
-the output and all slots unchanged. A negative write slot still writes the
-output.
+The read slot is ``read[seq, accepted - 1]`` in spec verify, else
+``read[seq]``. A negative read slot, an empty sequence or an accepted count
+below 1 leaves the output and all slots unchanged. A negative write slot still
+writes the output.
 """
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.common.utils import fast_sigmoid
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.config_utils import (
     load_config_json,
@@ -65,15 +66,14 @@ def _step(S, q, k, a, v, b, exp_alog, bias, lower_bound, scale, FAST_DIV: gl.con
     q = q * (gl.rsqrt(gl.sum(q * q, axis=0) + 1e-6) * scale)
     k = k * gl.rsqrt(gl.sum(k * k, axis=0) + 1e-6)
     z = exp_alog * (a.to(gl.float32) + bias)
-    # decay = exp(lower_bound * sigmoid(z)) and beta = sigmoid(b).
-    ez = 1.0 + gl.exp2(-z * _LOG2E)
-    eb = 1.0 + gl.exp2(-b.to(gl.float32) * _LOG2E)
     if FAST_DIV:
-        decay = gl.exp2(gl.extra.libdevice.fast_dividef(lower_bound * _LOG2E, ez))
-        beta = gl.extra.libdevice.fast_dividef(1.0, eb)
+        decay = gl.exp2((lower_bound * _LOG2E) * fast_sigmoid(z))
+        beta = fast_sigmoid(b)
     else:
-        decay = gl.exp2((lower_bound * _LOG2E) / ez)
-        beta = 1.0 / eb
+        # The tuned in-place configs at up to 4596 sequence-heads are faster
+        # with the IEEE divide than with fast_sigmoid.
+        decay = gl.exp2((lower_bound * _LOG2E) / (1.0 + gl.exp2(-z * _LOG2E)))
+        beta = 1.0 / (1.0 + gl.exp2(-b.to(gl.float32) * _LOG2E))
     decay = gl.convert_layout(decay, k.type.layout)
     S = S * decay[None, :]
     err = (v.to(gl.float32) - gl.sum(S * k[None, :], axis=1)) * beta
@@ -118,7 +118,7 @@ def _one_token(
     STORE_CACHE: gl.constexpr,
     GATE_DIST: gl.constexpr,
     STORE_BURST: gl.constexpr = False,
-    FAST_DIV: gl.constexpr = False,
+    FAST_DIV: gl.constexpr = True,
 ):
     L: gl.constexpr = _tile_layout(BV, K, TK, VEC, NUM_WARPS)
     rows = gl.arange(0, BV, layout=gl.SliceLayout(1, L))
@@ -353,8 +353,8 @@ def _multi_token_pre(
         qc = qc * (gl.rsqrt(gl.sum(qc * qc, axis=1) + 1e-6) * scale)[:, None]
         kc = kc * gl.rsqrt(gl.sum(kc * kc, axis=1) + 1e-6)[:, None]
         z = exp_alog * (ac + bias[None, :])
-        dc = gl.exp2((lower_bound * _LOG2E) / (1.0 + gl.exp2(-z * _LOG2E)))
-        beta = 1.0 / (1.0 + gl.exp2(-bc * _LOG2E))
+        dc = gl.exp2((lower_bound * _LOG2E) * fast_sigmoid(z))
+        beta = fast_sigmoid(bc)
         s_d.store(dc)
         s_q.store(qc)
         s_dk.store(dc * kc)
@@ -478,8 +478,10 @@ def kda_gating_kernel(
     idx_row = seq.to(gl.int64) * stride_idx_seq
     if IS_SPEC:
         col = gl.load(accepted_ptr + seq) - 1
-        # An empty sequence may have no accepted token, which is column -1.
-        slot_in = gl.load(read_ptr + idx_row + col, mask=eos > bos, other=-1)
+        # A count below 1, which an empty sequence can have, names no read slot.
+        slot_in = gl.load(
+            read_ptr + idx_row + col, mask=(eos > bos) & (col >= 0), other=-1
+        )
     else:
         slot_in = gl.load(read_ptr + idx_row)
         # Load the write slot with the read slot: the in-place test needs both.
