@@ -150,6 +150,8 @@ def test_gemm_a16wfp4(
 ):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
+    if shuffle and (N % 16 != 0 or K % 256 != 0):
+        pytest.skip("Shuffled weight and scales need N % 16 == 0 and K % 256 == 0")
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 

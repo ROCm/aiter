@@ -81,6 +81,8 @@ def test_gemm(dtype, M, N1, N2, K, output, skip_reduce, fp4_shuffle):
 
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
+    if fp4_shuffle and N1 % 16 != 0:
+        pytest.skip("Shuffled weight needs N1 % 16 == 0")
     torch.manual_seed(0)
 
     (

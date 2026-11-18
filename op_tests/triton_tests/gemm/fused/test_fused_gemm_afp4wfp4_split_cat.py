@@ -144,7 +144,7 @@ def generate_fused_gemm_afp4wfp4_split_cat_inputs(
     [
         (dtype, *shape, d, s3, layout, shuffle)
         for dtype in ["bf16"]
-        for shape in get_shapes()
+        for shape in get_shapes(k_mult=256)
         for d in [16]
         for s3 in [64]
         for layout in ["TN", "TT", "NN", "NT"]

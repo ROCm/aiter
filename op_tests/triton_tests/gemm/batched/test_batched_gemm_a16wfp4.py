@@ -7,6 +7,15 @@ from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
+# (B, M, N, K). K=192 mirrors GLM MLA's qk_nope_head_dim. K = 35 * 32 leaves a
+# ragged tail under any BLOCK_SIZE_K >= 64, after several full K iterations
+# rather than within the first one.
+_KERNEL_SHAPES = [
+    (16, 32, 512, 192),
+    (2, 7, 512, 1120),
+    (3, 16, 128, 1120),
+]
+
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
 
@@ -127,7 +136,8 @@ def run_torch(x, w, w_scales, dtype):
 
 @pytest.mark.parametrize(
     "B, M, N, K",
-    get_shapes(k_mult=32, max_size=256 * 512 * 128, batch=[1, 2, 4, 8, 16]),
+    get_shapes(k_mult=32, max_size=256 * 512 * 128, batch=[1, 2, 4, 8, 16])
+    + _KERNEL_SHAPES,
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
