@@ -3621,12 +3621,13 @@ else:
     # them for an explicit CLI quant sweep, like the tuned-CSV validation above.
     if args.quant is not None:
         aiter.logger.info("skipping presorted MoE hook tests for a --quant sweep")
-    elif get_gfx() == "gfx950":
+    elif get_gfx_runtime() == "gfx950":
         test_presorted_moe_hook()
         test_plain_presorted_moe_hook()
     else:
         aiter.logger.warning(
-            "%s: skipping presorted MoE hook tests (a4w4 is gfx950-only)", get_gfx()
+            "%s: skipping presorted MoE hook tests (a4w4 is gfx950-only)",
+            get_gfx_runtime(),
         )
 case_iter = itertools.chain(*_case_iters)
 
