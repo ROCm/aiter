@@ -1050,6 +1050,98 @@ def _mhc_fused_post_pre_gluon(
     )
 
 
+@compile_ops("module_mhc", develop=True)
+def mhc_post_pre_gram_gfx950(
+    post: Tensor,
+    comb: Tensor,
+    out: Tensor,
+    next_residual: Tensor,
+    partials: Tensor,  # (split_k, m, 48) scratch
+    layer_input: Tensor,
+    residual_in: Tensor,
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    fn: Tensor,  # fp32, or pre-packed BF16 hi/lo (int32) from mhc_shuffle_fn
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    weight: Tensor,
+    rms_eps: float,
+    pre_eps: float,
+    sink_eps: float,
+    norm_eps: float,
+    post_mult: float,
+    parts: int = 4,  # hidden segments of a row in the finisher
+) -> None: ...
+
+
+# gfx950, 256 CUs: decode row counts at which mhc_fused_post_pre with fused RMSNorm
+# takes the Gram-statistics route (csrc/kernels/mhc_post_pre_gram.cu) instead of the
+# fused GEMM and mhc_pre_big_fuse_rmsnorm. Keyed by (hidden_size, w_preshuffle_bf16);
+# a row (first m, last m, split_k, parts) gives the producer's hidden slabs and the
+# finisher's hidden segments per row for those row counts. Every row is a measurement
+# on MI350X against the existing path; row counts in no row keep the existing path.
+MHC_GRAM_M_MAX_GFX950 = 1023
+MHC_GRAM_CONFIG_GFX950_256 = {
+    (7168, False): ((64, 64, 56, 4),),
+}
+
+
+def _mhc_gram_config_gfx950_256(m, hidden_size, w_preshuffle_bf16):
+    """(split_k, parts) of the Gram route for m rows, or None where the existing
+    path is kept."""
+    rows = MHC_GRAM_CONFIG_GFX950_256.get((hidden_size, bool(w_preshuffle_bf16)), ())
+    for m_first, m_last, split_k, parts in rows:
+        if m_first <= m <= m_last:
+            return split_k, parts
+    return None
+
+
+def _mhc_gram_gfx950(
+    layer_input, residual_in, post_mix, comb_mix, fn, hc_scale, hc_base, weight, packed
+):
+    """(split_k, parts) when these tensors take the Gram route on gfx950 (256 CUs
+    without a CU mask, a row count of ``MHC_GRAM_CONFIG_GFX950_256``), else None."""
+    if weight is None or residual_in.dim() != 3:
+        return None
+    m, hc_mult, hidden_size = residual_in.shape
+    config = _mhc_gram_config_gfx950_256(m, hidden_size, packed)
+    if (
+        config is None
+        or hc_mult != 4
+        # The configurations are tuned for the whole device.
+        or get_cu_num() != 256
+        or any(
+            os.environ.get(name) is not None
+            for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+        )
+    ):
+        return None
+    # The kernels take contiguous, 16-byte aligned tensors of these shapes and
+    # types; every other input keeps the existing path.
+    bf16, fp32 = torch.bfloat16, torch.float32
+    expected = (
+        (layer_input, (m, hidden_size), bf16),
+        (residual_in, (m, 4, hidden_size), bf16),
+        (post_mix, (m, 4, 1) if post_mix.dim() == 3 else (m, 4), fp32),
+        (comb_mix, (m, 4, 4), fp32),
+        (fn, (24, 4 * hidden_size), torch.int32 if packed else fp32),
+        (hc_scale, (3,), fp32),
+        (hc_base, (24,), fp32),
+        (weight, (hidden_size,), bf16),
+    )
+    device = layer_input.device
+    if device.type == "cuda" and all(
+        tensor.device == device
+        and tensor.shape == shape
+        and tensor.dtype == dtype
+        and tensor.is_contiguous()
+        and tensor.data_ptr() % 16 == 0
+        for tensor, shape, dtype in expected
+    ):
+        return config
+    return None
+
+
 def _mhc_fused_prefill_gfx950(
     layer_input: torch.Tensor,
     residual_in: torch.Tensor,
@@ -1150,6 +1242,20 @@ def mhc_fused_post_pre(
     ``mhc_res_unshuffle``, ``mhc_pre`` and ``mhc_post`` follow by default. Plain
     residuals and other hidden sizes keep the HIP kernels. The fuse/unfuse
     boundary is unchanged.
+
+    On gfx950 with 256 CUs, a call with fused RMSNorm (``norm_weight``), four BF16
+    residual streams and 20 Sinkhorn iterations takes the Gram-statistics route at
+    the decode row counts of ``MHC_GRAM_CONFIG_GFX950_256`` (at most
+    ``MHC_GRAM_M_MAX_GFX950`` rows), with FP32 ``fn`` and with packed weights. Its
+    producer computes the new residual, the projection of the rounded residual
+    with BF16 hi/lo weights (FP32 ``fn`` is split in the kernel) and the Gram
+    matrix ``G`` of the four streams. Its finisher folds the streams as
+    ``mhc_pre_big_fuse_rmsnorm`` does, normalises the fold by ``p.T @ G @ p`` of
+    the pre mix ``p`` and rounds to BF16 once. Where that quadratic is at most
+    1e-3 of its diagonal part (cancelling streams) or not finite, the norm is
+    summed from the fold itself. ``force_fused``, inputs that are not contiguous,
+    16-byte aligned tensors of the documented shapes and types, and devices with
+    another CU count or a CU mask keep the existing path.
 
     ``backend``: None (default) picks as above; ``"hip"`` / ``"gluon"`` force the
     implementation of the fused path (tests, benchmarks). A shuffled residual must
@@ -1327,6 +1433,57 @@ def _mhc_fused_post_pre_native(
     _check_mhc_res_preshuffle_arch(res_preshuffle, arch)
     res_preshuffle = res_preshuffle and mhc_res_shuffle_enabled(m, arch)
     fused_m_upper_bound = MHC_FUSED_POST_PRE_M_UPPER_BOUND.get(arch, 1024)
+
+    gram = None
+    if (
+        arch == "gfx950"
+        and backend in (None, "hip")
+        and not force_fused
+        and sinkhorn_repeat == 20
+    ):
+        gram = _mhc_gram_gfx950(
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            w_preshuffle_bf16,
+        )
+    if gram is not None:
+        split_k, parts = gram
+        device = layer_input.device
+        # Per split and row: the projection (24 sums in 32 floats) and the ten
+        # Gram entries of the streams (in 16 floats).
+        partials = torch.empty((split_k, m, 48), dtype=dtypes.fp32, device=device)
+        next_residual = torch.empty_like(residual_in)
+        post_mix = torch.empty((m, 4, 1), dtype=dtypes.fp32, device=device)
+        comb_mix = torch.empty((m, 4, 4), dtype=dtypes.fp32, device=device)
+        layer_input_out = torch.empty_like(layer_input)
+        mhc_post_pre_gram_gfx950(
+            post_mix,
+            comb_mix,
+            layer_input_out,
+            next_residual,
+            partials,
+            layer_input,
+            residual_in,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            norm_eps,
+            hc_post_mult_value,
+            parts,
+        )
+        return post_mix, comb_mix, layer_input_out, next_residual
 
     # At the shared bound the input is already in ordinary layout.
     if (
