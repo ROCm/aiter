@@ -516,3 +516,136 @@ def test_sparse_mla_fp8_two_caches(one_alloc, mxfp8, splits):
         out = (data.float().view(C, -1, 32) * step).view(C, H, KV_LORA)
     e = rel_err(out, ref)
     assert e < 0.1, f"{one_alloc=} {mxfp8=} {splits=}: rel-err {e:.3e}"
+
+
+H64_ROWS = (1, 2, 4, 8, 12, 16, 24, 32)
+
+
+def _h64_inputs(C, draw, pool=1 << 18, seed=0):
+    """GLM-5.2 EP8 decode inputs: fp8 q [C, 64, 576], an fp8_scalar cache and a
+    [C, 2048] top-k table padded with -1, flattened with a uniform kv_indptr.
+
+    draw "benign": unit-scale q and keys, half of the rows short.
+    draw "wide": q 8x wider, every row's keys a clustered window with 5% holes.
+    draw "scaled": per-tensor q and cache scales that are not 1.
+    """
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    q = torch.randn(C, 64, D_QK, generator=g, device="cuda")
+    kv = torch.randn(pool, D_QK, generator=g, device="cuda")
+    j = torch.randperm(2048, generator=g, device="cuda")
+    pos = torch.arange(2048, device="cuda")[None, :]
+    if draw == "wide":
+        q *= 8.0
+        base = int(torch.randint(0, pool, (1,), generator=g, device="cuda"))
+        ids = (base + torch.arange(C, device="cuda")[:, None] - j[None, :]) % pool
+        holes = (torch.rand(C, 2048, generator=g, device="cuda") < 0.05) & (pos > 0)
+        ids = torch.where(holes, -1, ids)
+    else:
+        off = torch.randint(0, pool, (C, 1), generator=g, device="cuda")
+        mult = torch.randint(0, pool // 2, (C, 1), generator=g, device="cuda") * 2 + 1
+        ids = (off + mult * j[None, :]) % pool
+    short = torch.rand(C, generator=g, device="cuda") < 0.5
+    lens = torch.where(short, torch.randint(1, 2049, (C,), generator=g, device="cuda"), 2048)
+    ids = torch.where(pos < lens[:, None], ids, -1).to(torch.int32)
+    if draw == "scaled":
+        q_scale = (q.abs().amax() / FP8_MAX).reshape(1)
+        cache, ks = quantize_flat_fp8(kv * 3.0)
+    else:
+        q_scale = torch.ones(1, device="cuda")
+        cache, ks = kv.to(torch.float8_e4m3fn).view(torch.uint8), q_scale.clone()
+    q8 = (q / q_scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    ptr = torch.arange(0, (C + 1) * 2048, 2048, dtype=torch.int32, device="cuda")
+    return q8, q_scale, cache, ks, ptr, ids
+
+
+def _h64_reference(q8, q_scale, cache, ks, ids, sm):
+    """f32 attention over the dequantized q and cache; -1 entries are masked."""
+    truth = dequant_flat_fp8(cache, ks)
+    qf = q8.float() * q_scale
+    out = torch.zeros(q8.shape[0], 64, KV_LORA, device="cuda")
+    for c in range(q8.shape[0]):
+        k = truth[ids[c][ids[c] >= 0].long()]
+        if k.shape[0]:
+            p = torch.softmax(qf[c] @ k.t() * sm, dim=-1)
+            out[c] = p @ k[:, :KV_LORA]
+    return out
+
+
+@pytest.mark.parametrize("C", H64_ROWS)
+@pytest.mark.parametrize("draw", ["benign", "wide", "scaled"])
+def test_sparse_mla_fp8_h64_decode(C, draw):
+    """GLM-5.2 EP8 decode: 64 heads, fp8 q, a -1-padded [C, 2048] table and fp8
+    dots run gfx950's 64-head decode kernels (sparse_mla_fp8_h64_*.py)."""
+    _skip_unless_supported("fp8", "tensor")
+    if not smd._gluon_supported()[0]:
+        pytest.skip(smd._gluon_supported()[1])
+    sm = 0.0625
+    q8, q_scale, cache, ks, ptr, ids = _h64_inputs(C, draw, seed=C)
+    if C > 1:
+        ids[1] = -1  # a row with no key comes out 0
+    idx = ids.flatten()
+    assert smd._h64_decode_config(q8, cache, 1, idx) is not None
+    out, lse = sparse_mla_fwd(
+        q8, cache, ptr, idx, sm, kv_scale=ks, has_invalid=True,
+        dot_precision="fp8", q_scale=q_scale,
+    )  # fmt: skip
+    assert lse is None and out.shape == (C, 64, KV_LORA)
+    assert not out.isnan().any()
+    if C > 1:
+        assert (out[1] == 0).all(), "a query with no key must come out 0"
+    e = rel_err(out, _h64_reference(q8, q_scale, cache, ks, ids, sm))
+    assert e < 2e-2, f"C={C} {draw}: rel-err {e:.3e}"
+
+
+def test_sparse_mla_fp8_h64_decode_out_buffer():
+    """A caller's output wider than kv_lora_rank is written in its leading columns."""
+    _skip_unless_supported("fp8", "tensor")
+    if not smd._gluon_supported()[0]:
+        pytest.skip(smd._gluon_supported()[1])
+    C, sm = 16, 0.0625
+    q8, q_scale, cache, ks, ptr, ids = _h64_inputs(C, "benign")
+    buf = torch.full((C, 64, KV_LORA + 64), 7.0, dtype=torch.bfloat16, device="cuda")
+    out, _ = sparse_mla_fwd(
+        q8, cache, ptr, ids.flatten(), sm, kv_scale=ks, has_invalid=True,
+        dot_precision="fp8", q_scale=q_scale, out=buf,
+    )  # fmt: skip
+    assert out.data_ptr() == buf.data_ptr() and (buf[..., KV_LORA:] == 7.0).all()
+    e = rel_err(out[..., :KV_LORA], _h64_reference(q8, q_scale, cache, ks, ids, sm))
+    assert e < 2e-2, f"out buffer: rel-err {e:.3e}"
+
+
+@pytest.mark.parametrize(
+    "case", ["rows3", "bf16_q", "bf16_dots", "no_invalid", "big_pool"]
+)
+def test_sparse_mla_fp8_h64_decode_fallback(case):
+    """Calls the 64-head decode kernels do not take keep the previous path."""
+    _skip_unless_supported("fp8", "tensor")
+    C = 3 if case == "rows3" else 8
+    sm = 0.0625
+    q8, q_scale, cache, ks, ptr, ids = _h64_inputs(C, "benign", pool=1 << 16)
+    if case == "no_invalid":
+        ids = torch.where(ids < 0, ids[:, :1], ids)
+    idx = ids.flatten()
+    if case == "big_pool":
+        rows = (1 << 31) // D_QK + 1
+        big = torch.zeros(rows, D_QK, dtype=torch.uint8, device="cuda")
+        big[: cache.shape[0]] = cache
+        cache = big
+    q, kw = q8, dict(dot_precision="fp8", q_scale=q_scale)
+    if case == "bf16_q":
+        q, kw = (q8.float() * q_scale).to(torch.bfloat16), dict(dot_precision="fp8")
+    elif case == "bf16_dots":
+        kw["dot_precision"] = "bf16"
+    routed = (
+        q.dtype == torch.float8_e4m3fn
+        and kw["dot_precision"] == "fp8"
+        and case != "no_invalid"
+        and smd._h64_decode_config(q, cache, 1, idx) is not None
+    )
+    assert not routed
+    out, _ = sparse_mla_fwd(
+        q, cache, ptr, idx, sm, kv_scale=ks, has_invalid=case != "no_invalid", **kw
+    )  # fmt: skip
+    ref = _h64_reference(q8, q_scale, cache[: 1 << 16], ks, ids, sm)
+    e = rel_err(out, ref)
+    assert e < 7e-2, f"{case}: rel-err {e:.3e}"
