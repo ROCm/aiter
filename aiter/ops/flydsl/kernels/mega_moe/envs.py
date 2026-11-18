@@ -35,6 +35,11 @@ environment_variables: dict[str, tuple[Callable[[str], Any], str]] = {
     "AITER_MEGA_S1_FIXED_KPAIR": (_flag, "1"),
     # Compact dispatch producers keep two rows in flight.
     "AITER_MEGA_DISPATCH_FAST_COPY": (_flag, "1"),
+    # Small- and large-input paths for the EP8 DeepSeek-V4 a8w4 layout (gfx950), read when an
+    # instance is built. Small: single-kernel runtimes next to the main path (forward_small_m).
+    "AITER_MEGA_SMALL_M": (_flag, "0"),
+    # Large: quantization plus one persistent kernel for large per-rank inputs.
+    "AITER_MEGA_LARGE_M": (_flag, "0"),
 }
 
 

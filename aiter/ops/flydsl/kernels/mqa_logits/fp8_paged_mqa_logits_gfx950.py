@@ -16,7 +16,7 @@ import torch
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 from .. import buffer_ops
@@ -522,8 +522,8 @@ def flydsl_fp8_paged_mqa_logits(
     ``(B, 1)`` is the same as ``[B]``. Anything else raises ``ValueError``; a
     strided tensor is rejected rather than copied.
     """
-    if get_gfx() != _GFX950:
-        raise RuntimeError(f"gfx950 kernel requested on {get_gfx()}")
+    if get_gfx_runtime() != _GFX950:
+        raise RuntimeError(f"gfx950 kernel requested on {get_gfx_runtime()}")
     if not Preshuffle:
         raise ValueError("requires Preshuffle=True")
     if q_fp8.ndim != 4:

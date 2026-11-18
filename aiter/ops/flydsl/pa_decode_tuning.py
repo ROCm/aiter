@@ -555,12 +555,12 @@ def main(argv=None):
     device = torch.device("cuda", args.device)
     properties = torch.cuda.get_device_properties(device)
     arch = get_gfx_runtime()
-    if arch not in ("gfx942", "gfx950", "gfx1250"):
+    if arch not in ("gfx942", "gfx950", "gfx1250", "gfx1250-strict"):
         raise RuntimeError(
             f"PA decode tuning only supports gfx942/gfx950/gfx1250, got {arch}"
         )
     if args.kv_dtype == "bf16":
-        if arch == "gfx1250":
+        if arch in ("gfx1250", "gfx1250-strict"):
             if args.head_dim != 64 and args.head_dim % 128:
                 raise ValueError(
                     "gfx1250 BF16 head-dim must be 64 or a multiple of 128"
