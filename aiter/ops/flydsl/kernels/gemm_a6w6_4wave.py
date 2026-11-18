@@ -236,51 +236,91 @@ def _mfma_drain(accs):
     """Return ``accs`` readable after the XDL-write -> v_accvgpr_read wait states.
 
     LLVM does not see the asm MFMA as one, so it would read an accumulator right
-    after its last MFMA; each passes through an empty asm placed after the nops.
+    after its last MFMA; each passes through an empty asm placed after the nop.
+    The callers leave EPI_LAG MFMAs between an accumulator's last MFMA and this.
     """
     _llvm.inline_asm(
         res=None,
         operands_=[],
-        asm_string="s_nop 7\ns_nop 7\ns_nop 7",
+        asm_string="s_nop 7",
         constraints="",
         has_side_effects=True,
     )
     return [
-        [
-            _llvm.inline_asm(
-                res=Vec(acc).ir_value().type,
-                operands_=[Vec(acc).ir_value()],
-                asm_string="",
-                constraints="=a,0",
-                has_side_effects=True,
-            )
-            for acc in row
-        ]
-        for row in accs
+        _llvm.inline_asm(
+            res=Vec(acc).ir_value().type,
+            operands_=[Vec(acc).ir_value()],
+            asm_string="",
+            constraints="=a,0",
+            has_side_effects=True,
+        )
+        for acc in accs
     ]
 
 
-# MFMA order of a K tile: B row blocks in pairs, each pair over the eight A blocks.
-# B pair g is dead after its 16 MFMAs, A block i after the last pair's MFMA on it.
-ORDER = [
-    (j, i)
-    for g in range(WAVE_TILES // 2)
-    for i in range(WAVE_TILES)
-    for j in (2 * g, 2 * g + 1)
-]
-LAST_USE_B = {j: max(k for k, (jj, _) in enumerate(ORDER) if jj == j) for j in range(8)}
-LAST_USE_A = {i: max(k for k, (_, ii) in enumerate(ORDER) if ii == i) for i in range(8)}
-# The barrier precedes B pair 0's last MFMA; the next tile's reads follow it.
-BARRIER_AT = LAST_USE_B[1]
-# Four waves issue together, so a tile's VMEM ops are spread one every
-# VMEM_SPACING MFMAs after the barrier, as the ASM kernels do.
-VMEM_SPACING = 3
-assert BARRIER_AT + 1 + VMEM_SPACING * (TILE_VMEM - 1) < len(ORDER)
+# The last tile stores output tile pair (i, g) EPI_LAG MFMAs after the pair's last
+# MFMA, so the epilogue overlaps the remaining MFMAs, as in the ASM kernels.
+EPI_LAG = 2
 
 
-def compile_a6w6_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_xcds: int = 8):
-    """``K`` is the padded contraction dimension, a multiple of 128 of at least 384."""
+class Schedule:
+    """A K tile's MFMA order and the slots of its barrier, reads and VMEM ops.
+
+    ``mblk_n`` B row blocks at a time are swept over the eight A blocks, the order
+    the ASM generators call FlyDSL ``mblk=(8, mblk_n)``: B blocks are dead after
+    their sweep, A blocks after the last sweep. The barrier follows MFMA ``bar``;
+    each operand is re-read after its last MFMA and the barrier. Four waves issue
+    together, so the tile's VMEM ops are spread evenly over the slots after the
+    barrier that hold no read, as in the ASM generators.
+    """
+
+    def __init__(self, mblk_n=2, bar=None):
+        assert mblk_n in (2, 4)
+        self.mblk_n = mblk_n
+        self.order = [
+            (j, i)
+            for g in range(WAVE_TILES // mblk_n)
+            for i in range(WAVE_TILES)
+            for j in range(g * mblk_n, (g + 1) * mblk_n)
+        ]
+        last = lambda key: max(k for k, cell in enumerate(self.order) if key(cell))
+        self.last_b = {j: last(lambda c, j=j: c[0] == j) for j in range(WAVE_TILES)}
+        self.last_a = {i: last(lambda c, i=i: c[1] == i) for i in range(WAVE_TILES)}
+        first_last = min(min(self.last_b.values()), min(self.last_a.values()))
+        self.bar = first_last if bar is None else bar
+        assert 0 <= self.bar < len(self.order)
+        read_slots = {
+            max(s, self.bar) for s in list(self.last_b.values()) + list(self.last_a.values())
+        }
+        free = [k for k in range(self.bar + 1, len(self.order)) if k not in read_slots]
+        assert len(free) >= TILE_VMEM
+        self.vmem_slots = [free[k * len(free) // TILE_VMEM] for k in range(TILE_VMEM)]
+        self.pair_done = {
+            (i, g): last(lambda c, i=i, g=g: c[1] == i and c[0] // 2 == g)
+            for i in range(WAVE_TILES)
+            for g in range(WAVE_TILES // 2)
+        }
+
+    @property
+    def tag(self):
+        return f"m8{self.mblk_n}b{self.bar}"
+
+
+def compile_a6w6_gemm_4w(
+    *,
+    K: int,
+    xcd_swizzle: int = 4,
+    num_xcds: int = 8,
+    mblk_n: int = 2,
+    bar: int | None = 8,
+):
+    """``K`` is the padded contraction dimension, a multiple of 128 of at least 384.
+
+    ``xcd_swizzle`` is the M-tile group of the tile order; ``mblk_n`` and ``bar``
+    select the K tile's schedule (``Schedule``).
+    """
     assert K % BLOCK_K == 0 and K >= STAGES * BLOCK_K
+    sched = Schedule(mblk_n, bar)
     K_TILES = K // BLOCK_K
     NK_PAD = K_TILES + PADK
     # Tiles 0 .. LOADING - 1 load the tile three ahead.
@@ -290,7 +330,9 @@ def compile_a6w6_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_xcds: int = 8):
     TRIPS = max(0, (LOADING - 1) // STAGES)
     STATIC_FROM = 1 + TRIPS * STAGES
 
-    _kname = f"flydsl_a6w6_4w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_1x{xcd_swizzle}_k{K}"
+    _kname = (
+        f"flydsl_a6w6_4w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_{sched.tag}_1x{xcd_swizzle}_k{K}"
+    )
 
     @fx.struct
     class SharedStorage:
@@ -360,12 +402,48 @@ def compile_a6w6_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_xcds: int = 8):
                 ),
             )
 
-        def k_tile(accs, a_ops, b_ops, scales, stage, has_next, vmem_wait, prefetch):
+        # The epilogue's store context. Lane l of output tile (i, j) holds row
+        # 16 i + l % 16 and the four columns 16 j + 4 (l // 16) + r of the wave's
+        # tile. Swapping the 16-lane rows of tiles j and j + 1 gives lane group g of
+        # the pair the eight columns 16 (j + g % 2) + 8 (g // 2) of its row: one
+        # 16-byte store per lane. The output is written once, so the stores are
+        # non-temporal, as the ASM kernels' are.
+        c_tensor = fx.rocdl.make_buffer_tensor(
+            C, max_size=False, num_records_bytes=fx.Int64(c_m) * fx.Int64(c_n) * 2
+        )
+        c_div = fx.logical_divide(c_tensor, fx.make_layout(1, 1))
+        out_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(2), fx.BFloat16)
+        out_reg = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
+        group = lane_id // 16
+        row0 = fx.Int32(block_m) * BLOCK_M + wave_m * WAVE_ROWS + lane_id % 16
+        col0 = (
+            fx.Int32(block_n) * BLOCK_N
+            + wave_n * WAVE_ROWS
+            + (group % 2) * TILE
+            + (group // 2) * 8
+        )
+
+        def store_pair(accs, i, g):
+            """Output tiles (i, 2 g) and (i, 2 g + 1), EPI_LAG MFMAs after their last."""
+            lo, hi = _mfma_drain([accs[i][2 * g], accs[i][2 * g + 1]])
+            lo = Vec(lo).to(fx.BFloat16).bitcast(fx.Int32)
+            hi = Vec(hi).to(fx.BFloat16).bitcast(fx.Int32)
+            x0, y0 = _permlane16_swap(lo[0], hi[0])
+            x1, y1 = _permlane16_swap(lo[1], hi[1])
+            row = Vec.from_elements([x0, x1, y0, y1], fx.Int32).bitcast(fx.BFloat16)
+            fx.memref_store_vec(row, out_reg)
+            index = (row0 + i * TILE) * c_n + col0 + g * 2 * TILE
+            fx.copy(out_atom, out_reg, fx.slice(c_div, (None, fx.Int32(index))))
+
+        def k_tile(
+            accs, a_ops, b_ops, scales, stage, has_next, vmem_wait, prefetch, epilogue
+        ):
             """One K tile in LDS ``stage``; ``scales`` are its (A, B) scale words.
 
             ``prefetch`` (tile, stage) spreads that tile's VMEM ops after the barrier;
             ``vmem_wait`` is the vmcnt the barrier waits for; ``has_next`` reads the
-            next tile's operands and scales from the next stage.
+            next tile's operands and scales from the next stage. The last tile
+            (``epilogue``) has no barrier and stores the output as it completes.
             """
             next_stage = (stage + 1) % STAGES
             new_a = [None] * WAVE_TILES
@@ -374,8 +452,18 @@ def compile_a6w6_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_xcds: int = 8):
             sa = (Vec(scales[0])[0], Vec(scales[0])[1])
             sb = (Vec(scales[1])[0], Vec(scales[1])[1])
             vmem = [] if prefetch is None else tile_vmem(*prefetch)
-            for idx, (j, i) in enumerate(ORDER):
-                if const_expr(idx == BARRIER_AT):
+            for idx, (j, i) in enumerate(sched.order):
+                accs[i][j] = _mfma(
+                    b_ops[j], a_ops[i], sb[j // 4], sa[i // 4], j, i, accs[i][j]
+                )
+                fx.rocdl.sched_barrier(0)
+                if const_expr(epilogue):
+                    for (pi, pg), done in sched.pair_done.items():
+                        if const_expr(done + EPI_LAG == idx):
+                            store_pair(accs, pi, pg)
+                            fx.rocdl.sched_barrier(0)
+                    continue
+                if const_expr(idx == sched.bar):
                     fx.rocdl.s_waitcnt(vmcnt=vmem_wait, lgkmcnt=0)
                     fx.rocdl.sched_barrier(0)
                     fx.rocdl.s_barrier()
@@ -383,30 +471,29 @@ def compile_a6w6_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_xcds: int = 8):
                     if const_expr(has_next):
                         new_scales = read_scales(next_stage)
                         fx.rocdl.sched_barrier(0)
-                accs[i][j] = _mfma(
-                    b_ops[j], a_ops[i], sb[j // 4], sa[i // 4], j, i, accs[i][j]
-                )
-                fx.rocdl.sched_barrier(0)
-                if const_expr(idx < BARRIER_AT):
+                if const_expr(idx < sched.bar):
                     continue
-                if const_expr(
-                    len(vmem) > 0 and (idx - BARRIER_AT - 1) % VMEM_SPACING == 0
-                ):
+                if const_expr(len(vmem) > 0 and idx in sched.vmem_slots):
                     vmem.pop(0)()
                     fx.rocdl.sched_barrier(0)
                 if const_expr(has_next):
                     # Each read follows its register's last MFMA, and the barrier.
                     for jj in range_constexpr(WAVE_TILES):
-                        if const_expr(new_b[jj] is None and LAST_USE_B[jj] <= idx):
+                        if const_expr(new_b[jj] is None and sched.last_b[jj] <= idx):
                             new_b[jj] = read_b(next_stage, jj)
                             fx.rocdl.sched_barrier(0)
                     for ii in range_constexpr(WAVE_TILES):
-                        if const_expr(new_a[ii] is None and LAST_USE_A[ii] <= idx):
+                        if const_expr(new_a[ii] is None and sched.last_a[ii] <= idx):
                             new_a[ii] = read_a(next_stage, ii)
                             fx.rocdl.sched_barrier(0)
             while const_expr(len(vmem) > 0):
                 vmem.pop(0)()
                 fx.rocdl.sched_barrier(0)
+            if const_expr(epilogue):
+                for (pi, pg), done in sched.pair_done.items():
+                    if const_expr(done + EPI_LAG >= len(sched.order)):
+                        store_pair(accs, pi, pg)
+                        fx.rocdl.sched_barrier(0)
             return accs, new_a, new_b, new_scales
 
         def step(accs, a_ops, b_ops, scales, t, stage, loading, has_next, two_after):
@@ -424,6 +511,7 @@ def compile_a6w6_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_xcds: int = 8):
                 has_next,
                 TILE_VMEM if two_after else 0,
                 (t + STAGES, stage) if loading else None,
+                not has_next,
             )
 
         def flat_state(accs, a_ops, b_ops, scales):
@@ -489,38 +577,9 @@ def compile_a6w6_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_xcds: int = 8):
                     )
                 results = yield flat_state(accs, a_ops, b_ops, scales)
             accs, a_ops, b_ops, scales = unflat_state(results)
+        # The last tile stores the output as its accumulators complete.
         for t in range_constexpr(STATIC_FROM, K_TILES):
             accs, a_ops, b_ops, scales = static_step(accs, a_ops, b_ops, scales, t)
-
-        # Epilogue: lane l of tile (i, j) holds row 16 i + l % 16 and the four
-        # columns 16 j + 4 (l // 16) + r of the wave's tile. Swapping the 16-lane
-        # rows of tiles j and j + 1 gives lane group g of the pair the eight columns
-        # 16 (j + g % 2) + 8 (g // 2) of its row: one 16-byte store per lane.
-        accs = _mfma_drain(accs)
-        c_tensor = fx.rocdl.make_buffer_tensor(
-            C, max_size=False, num_records_bytes=fx.Int64(c_m) * fx.Int64(c_n) * 2
-        )
-        c_div = fx.logical_divide(c_tensor, fx.make_layout(1, 1))
-        out_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-        reg = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
-        group = lane_id // 16
-        row0 = fx.Int32(block_m) * BLOCK_M + wave_m * WAVE_ROWS + lane_id % 16
-        col0 = (
-            fx.Int32(block_n) * BLOCK_N
-            + wave_n * WAVE_ROWS
-            + (group % 2) * TILE
-            + (group // 2) * 8
-        )
-        for i in range_constexpr(WAVE_TILES):
-            for jp in range_constexpr(WAVE_TILES // 2):
-                lo = Vec(accs[i][2 * jp]).to(fx.BFloat16).bitcast(fx.Int32)
-                hi = Vec(accs[i][2 * jp + 1]).to(fx.BFloat16).bitcast(fx.Int32)
-                x0, y0 = _permlane16_swap(lo[0], hi[0])
-                x1, y1 = _permlane16_swap(lo[1], hi[1])
-                row = Vec.from_elements([x0, x1, y0, y1], fx.Int32).bitcast(fx.BFloat16)
-                fx.memref_store_vec(row, reg)
-                index = (row0 + i * TILE) * c_n + col0 + jp * 2 * TILE
-                fx.copy(out_atom, reg, fx.slice(c_div, (None, fx.Int32(index))))
 
     @flyc.jit
     def launch_gemm(

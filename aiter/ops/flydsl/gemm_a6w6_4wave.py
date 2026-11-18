@@ -24,7 +24,7 @@ MIN_K = 3 * BLOCK_K
 PADK = 2
 TILE_BYTES = BLOCK_M * BLOCK_K * 6 // 8
 SCALE_TILE_BYTES = BLOCK_M * BLOCK_K // 32
-DEFAULT_XCD_SWIZZLE = 8
+DEFAULT_XCD_SWIZZLE = 4
 
 _compile = None
 _run_compiled = None
@@ -45,12 +45,30 @@ def _lazy_import() -> None:
     _fx = fx_mod
 
 
-def make_kernel_name(*, K: int, xcd_swizzle: int = DEFAULT_XCD_SWIZZLE) -> str:
-    return f"flydsl_a6w6_4w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_1x{int(xcd_swizzle)}_k{int(K)}"
+def make_kernel_name(
+    *,
+    K: int,
+    xcd_swizzle: int = DEFAULT_XCD_SWIZZLE,
+    mblk_n: int = 2,
+    bar: int | None = 8,
+) -> str:
+    from .kernels.gemm_a6w6_4wave import Schedule
+
+    tag = Schedule(int(mblk_n), bar).tag
+    return (
+        f"flydsl_a6w6_4w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_{tag}_1x{int(xcd_swizzle)}"
+        f"_k{int(K)}"
+    )
 
 
 @functools.lru_cache(maxsize=256)
-def compile_a6w6_gemm(*, K: int, xcd_swizzle: int = DEFAULT_XCD_SWIZZLE):
+def compile_a6w6_gemm(
+    *,
+    K: int,
+    xcd_swizzle: int = DEFAULT_XCD_SWIZZLE,
+    mblk_n: int = 2,
+    bar: int | None = 8,
+):
     """Compile and memoize one launcher for the padded contraction dimension ``K``."""
     _lazy_import()
     if K < MIN_K or K % BLOCK_K:
@@ -59,7 +77,13 @@ def compile_a6w6_gemm(*, K: int, xcd_swizzle: int = DEFAULT_XCD_SWIZZLE):
             f"least {MIN_K}, got {K}"
         )
     num_xcds = get_cdna4_num_xcds() if xcd_swizzle > 0 else 8
-    return _compile(K=int(K), xcd_swizzle=int(xcd_swizzle), num_xcds=int(num_xcds))
+    return _compile(
+        K=int(K),
+        xcd_swizzle=int(xcd_swizzle),
+        num_xcds=int(num_xcds),
+        mblk_n=int(mblk_n),
+        bar=bar,
+    )
 
 
 def run_gemm_a6w6_4wave(
@@ -70,6 +94,8 @@ def run_gemm_a6w6_4wave(
     out: Tensor,
     K: int,
     xcd_swizzle: int = DEFAULT_XCD_SWIZZLE,
+    mblk_n: int = 2,
+    bar: int | None = 8,
 ) -> Tensor:
     """``out = A * B^T`` for packed operands; ``K`` is the padded K."""
     if get_gfx_runtime() != "gfx950":
@@ -97,7 +123,9 @@ def run_gemm_a6w6_4wave(
             )
     if max(A.numel(), B.numel(), out.numel() * 2) >= 2**31:
         raise ValueError("[FlyDSL A6W6 4wave] operands exceed 32-bit byte offsets")
-    executable = compile_a6w6_gemm(K=int(K), xcd_swizzle=int(xcd_swizzle))
+    executable = compile_a6w6_gemm(
+        K=int(K), xcd_swizzle=int(xcd_swizzle), mblk_n=int(mblk_n), bar=bar
+    )
     _run_compiled(
         executable,
         A.view(-1),
