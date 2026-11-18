@@ -1044,8 +1044,11 @@ def test_mla_gluon_decode_over_2gb(batch, ctx, nhead, kv_lora_rank, qk_rope_head
     torch.testing.assert_close(o_big, o_ref, atol=0, rtol=0)
 
 
-def _mla_gluon_ref(q_nope, q_pe, kv_c, seq_lens, token_idx, sm_scale, kv_scale):
-    """fp32 MLA decode; query position i of qlen attends KV [0, len - qlen + i]."""
+def _mla_gluon_ref(
+    q_nope, q_pe, kv_c, seq_lens, token_idx, sm_scale, kv_scale, attn_sink=None
+):
+    """fp32 MLA decode; query position i of qlen attends KV [0, len - qlen + i].
+    attn_sink [nhead] adds one logit with no value to each softmax."""
     batch, qlen, nhead, kv_lora_rank = q_nope.shape
     out = torch.zeros(
         (batch, qlen, nhead, kv_lora_rank), dtype=torch.float32, device=q_nope.device
@@ -1057,13 +1060,19 @@ def _mla_gluon_ref(q_nope, q_pe, kv_c, seq_lens, token_idx, sm_scale, kv_scale):
     q_off = torch.arange(qlen, device=q_nope.device)[:, None]
     for b, seq_len in enumerate(seq_lens):
         if seq_len == 0:
+            if attn_sink is not None:
+                lse[b] = attn_sink.float()
             continue
         kv = kv_c[token_idx[b][:seq_len].long()].float() * kv_scale
         s = torch.einsum("qhd,ld->qhl", q[b], kv) * sm_scale
         pos = torch.arange(seq_len, device=q_nope.device)[None, :]
         s = s.masked_fill(~(pos <= seq_len - qlen + q_off)[:, None, :], float("-inf"))
-        lse[b] = torch.logsumexp(s, dim=-1)
-        out[b] = torch.softmax(s, dim=-1) @ kv[:, :kv_lora_rank]
+        if attn_sink is None:
+            lse[b] = torch.logsumexp(s, dim=-1)
+        else:
+            sink = attn_sink.float()[None, :, None].expand(qlen, nhead, 1)
+            lse[b] = torch.logsumexp(torch.cat([s, sink], dim=-1), dim=-1)
+        out[b] = torch.exp(s - lse[b][..., None]) @ kv[:, :kv_lora_rank]
     return out, lse
 
 
@@ -1219,6 +1228,57 @@ def test_mla_gluon_decode_split_rebalance(batch, qlen, nhead, kv_dtype, use_2d_v
     )
     _assert_mla_close(o, o_ref, o_base)
     torch.testing.assert_close(lse, lse_ref, atol=1e-3, rtol=0)
+
+
+@pytest.mark.parametrize("qlen", [1, 2])
+@pytest.mark.parametrize(
+    "nhead, kv_dtype", [(8, torch.float8_e4m3fn), (16, torch.bfloat16)]
+)
+def test_mla_gluon_decode_split_rebalance_attn_sink(qlen, nhead, kv_dtype):
+    """With kv_split_info, a sequence has several segments; the sink is in the
+    softmax once for each sequence, not once for each segment."""
+    if DEVICE_ARCH != "gfx950":
+        pytest.skip("Gluon MLA decode is gfx950-only")
+    from aiter.ops.triton.gluon.mla_gluon import mla_gluon, mla_gluon_split_metadata
+
+    random.seed(0)
+    torch.manual_seed(0)
+    lens = [random.randint(qlen, 3000) for _ in range(60)]
+    lens[1] = 12000
+    if qlen == 1:
+        lens[2] = 0
+    kv_c, block_table, q_nope, q_pe = _split_rebalance_inputs(
+        len(lens), qlen, nhead, kv_dtype, max(lens)
+    )
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
+    kv_scale = 0.5 if kv_dtype == torch.float8_e4m3fn else 1.0
+    sm_scale = 1.0 / (kv_c.shape[-1] ** 0.5)
+    # sinks near the logits, so that they change the softmax
+    attn_sink = torch.randn(nhead, dtype=torch.float32, device="cuda") + 4.0
+    info = mla_gluon_split_metadata(seq_lens, nhead, kv_dtype, qlen=qlen)
+    q_n, q_p = (q_nope[:, 0], q_pe[:, 0]) if qlen == 1 else (q_nope, q_pe)
+    o, lse = mla_gluon(
+        q_nope=q_n,
+        q_pe=q_p,
+        kv_c=kv_c,
+        o=torch.empty(q_n.shape, dtype=torch.bfloat16, device="cuda"),
+        page_table=block_table,
+        seq_info=seq_lens,
+        sm_scale=sm_scale,
+        kv_pe_offset=512,
+        kv_scale=kv_scale,
+        return_lse=True,
+        attn_sink=attn_sink,
+        kv_split_info=info,
+    )
+    o_ref, lse_ref = _mla_gluon_ref(
+        q_nope, q_pe, kv_c, lens, block_table, sm_scale, kv_scale, attn_sink
+    )
+    scale = o_ref.abs().max().item()
+    torch.testing.assert_close(
+        o.view(o_ref.shape).float(), o_ref, atol=2**-6 * scale, rtol=2**-6
+    )
+    torch.testing.assert_close(lse.view(lse_ref.shape), lse_ref, atol=1e-3, rtol=0)
 
 
 def test_mla_gluon_split_metadata_not_applicable():

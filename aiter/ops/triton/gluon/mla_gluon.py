@@ -751,6 +751,7 @@ def _mla_softmax_reducev_kernel(
     Final_lse,
     B_seq_len,  # same seq_info as the decode kernel to derive empty kv splits
     Split_meta,  # SPLIT_REBALANCE only: batch b owns slots [Split_meta[b], Split_meta[b + 1])
+    Attn_sink,  # HAS_ATTN_SINK only: [nhead] fp32
     stride_l_b,
     stride_l_qs,  # MTP: q_pos (qlen) stride; 0 when QLEN==1
     stride_l_h,
@@ -772,6 +773,7 @@ def _mla_softmax_reducev_kernel(
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     SPLIT_REBALANCE: tl.constexpr,
+    HAS_ATTN_SINK: tl.constexpr,  # add the sink once for each sequence (stage-1 did not)
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -837,6 +839,15 @@ def _mla_softmax_reducev_kernel(
         logits = tl.where(lse[:, None] == -float("inf"), 0.0, logits)
         acc = acc * old_scale + tl.sum(w[:, None] * logits, axis=0)
         e_sum = e_sum * old_scale + tl.sum(w, axis=0)
+        e_max = n_e_max
+
+    if HAS_ATTN_SINK:
+        # natural-log units, as stage-1 lse; no V contribution
+        sink = tl.load(Attn_sink + cur_head).to(tl.float32)
+        n_e_max = tl.maximum(e_max, sink)
+        old_scale = tl.where(e_max == -float("inf"), 0.0, tl.exp(e_max - n_e_max))
+        acc = acc * old_scale
+        e_sum = e_sum * old_scale + tl.exp(sink - n_e_max)
         e_max = n_e_max
 
     out = acc / e_sum if e_sum > 0.0 else tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
@@ -925,7 +936,8 @@ def mla_gluon(
         gets more KV splits than a short one, so a batch with mixed KV lengths
         does not wait on its longest sequence. Build it once for each decode step
         and pass it to the call of each layer. None (default) gives each sequence
-        the same number of splits.
+        the same number of splits. With attn_sink, the reduce adds the sink once
+        for each sequence.
 
     The decode mode (has_pe=True, no attn_sink and no kv_split_info) is the
     routed op `mla_paged_decode`. An enabled kernel plugin can serve it. The
@@ -1341,7 +1353,9 @@ def _mla_gluon_launch(
         RETURN_LSE=return_lse,
         QLEN=qlen,
         HAS_PE=has_pe,
-        HAS_ATTN_SINK=has_attn_sink,
+        # split rebalance: a sequence has several segments, so the reduce adds
+        # the sink once instead
+        HAS_ATTN_SINK=has_attn_sink and not split_rebalance,
         SPLIT_REBALANCE=split_rebalance,
     )
 
@@ -1369,6 +1383,7 @@ def _mla_gluon_launch(
         final_lse,
         seq_info,
         split_meta,
+        attn_sink,
         sl_b,
         sl_qs,
         sl_h,
@@ -1390,6 +1405,7 @@ def _mla_gluon_launch(
         BLOCK_S=reduce_block_s,
         BLOCK_N=BLOCK_N,
         SPLIT_REBALANCE=split_rebalance,
+        HAS_ATTN_SINK=has_attn_sink and split_rebalance,
         num_warps=reduce_num_warps,
     )
 
