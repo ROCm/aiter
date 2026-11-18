@@ -37,6 +37,7 @@ from aiter.ops.flydsl.dcp_mailbox.peer import PeerBuffer
 from aiter.ops.flydsl.kernels.dcp_mailbox.gather import (
     make_kernel as make_gather_kernel,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 THREADS = 128
 
@@ -218,13 +219,16 @@ def _launch(ws, key, args):
         raise ValueError("folded gather requires qlen > 0 and tokens divisible by qlen")
     _prepare_debug(ws)
     out = ws.folded_buffer(key.fold) if key.fold else ws.gathered
-    build(key)(
+    # A compiled handle, not the flyc.jit launcher: see dcp_lse_combine.
+    _run_compiled(
+        build(key),
         *args,
         out.data_ptr(),
         ws.peers.addresses.data_ptr(),
         ws.rank,
         ws.state.data_ptr(),
-        stream=torch.cuda.current_stream(),
+        torch.cuda.current_stream(),
+        specialization_key=out.device.index,
     )
     if key.phase == 1:
         return None
