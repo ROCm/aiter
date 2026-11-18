@@ -11,10 +11,7 @@ from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_quant_x import (
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
 )
-from op_tests.triton_tests.gemm.gemm_shapes import (
-    FUSED_GEMM_A16W16_QUANT_X,
-    FUSED_GEMM_A16W16_QUANT_X_FEWER,
-)
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 _QUANT_BLOCK_SIZE = 32
 # 0xFF800000 in two's complement int32. Mask keeps sign + 8-bit exponent + top mantissa bit.
@@ -65,7 +62,7 @@ def _assert_quant_close(triton_x_quant, triton_x_scales, x):
 
 @pytest.mark.parametrize(
     "M, N, K, dtype, layout",
-    [(M, N, K, torch.bfloat16, "TN") for M, N, K in FUSED_GEMM_A16W16_QUANT_X]
+    [(M, N, K, torch.bfloat16, "TN") for M, N, K in get_shapes()]
     + [
         (M, 2048, 2048, dtype, layout)
         for M, layout in (
@@ -101,7 +98,7 @@ def test_fused_gemm_a16w16_quant_x(
 
 
 @pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu"])
-@pytest.mark.parametrize("M, N, K", FUSED_GEMM_A16W16_QUANT_X_FEWER)
+@pytest.mark.parametrize("M, N, K", get_shapes(max_size=512 * 1024 * 1024))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_fused_gemm_a16w16_quant_x_activation(
@@ -130,7 +127,7 @@ def test_fused_gemm_a16w16_quant_x_activation(
     _assert_quant_close(triton_x_quant, triton_x_scales, x)
 
 
-@pytest.mark.parametrize("M, N, K", FUSED_GEMM_A16W16_QUANT_X_FEWER)
+@pytest.mark.parametrize("M, N, K", get_shapes(max_size=512 * 1024 * 1024))
 @pytest.mark.parametrize("skip_reduce", [True, False])
 def test_fused_gemm_a16w16_quant_x_skip_reduce(M: int, N: int, K: int, skip_reduce):
     torch.cuda.empty_cache()

@@ -20,10 +20,10 @@ from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
 from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
     run_torch as run_torch_gemm_afp4wfp4,
 )
-from op_tests.triton_tests.gemm.gemm_shapes import FUSED_GEMM_AFP4WFP4_MUL_ADD
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 
-@pytest.mark.parametrize("M, N, K", FUSED_GEMM_AFP4WFP4_MUL_ADD)
+@pytest.mark.parametrize("M, N, K", get_shapes(k_mult=32, max_size=512 * 1024 * 1024))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN"])
 @pytest.mark.parametrize("output", [True, False])

@@ -3,7 +3,7 @@ import torch
 
 from aiter.ops.triton.gemm.batched.batched_gemm_afp4wfp4 import batched_gemm_afp4wfp4
 from aiter.ops.triton.utils._triton import arch_info
-from op_tests.triton_tests.gemm.gemm_shapes import BATCHED_GEMM_AFP4WFP4
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -125,7 +125,7 @@ def run_torch(x, w, x_scales, w_scales, dtype):
     return torch.bmm(x_f32, w_f32.transpose(1, 2)).to(dtype)
 
 
-@pytest.mark.parametrize("B, M, N, K", BATCHED_GEMM_AFP4WFP4)
+@pytest.mark.parametrize("B, M, N, K", get_shapes(k_mult=32, batch=[1, 2, 3, 5, 7, 8]))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 def test_batched_gemm_afp4_wfp4(B: int, M: int, N: int, K: int, dtype, layout):

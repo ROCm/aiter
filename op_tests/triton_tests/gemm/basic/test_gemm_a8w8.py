@@ -18,7 +18,7 @@ from aiter.ops.triton.utils.gemm_config_utils import (
     get_gemm_config,
 )
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
-from op_tests.triton_tests.gemm.gemm_shapes import FEWER, GEMM_A8W8, GEMM_A8W8_SPLITK
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -108,7 +108,11 @@ def generate_gemm_a8w8_inputs(
 
 @pytest.mark.parametrize(
     "in_dtype, m, n, k",
-    [(in_dtype, *shape) for in_dtype in ["fp8e4m3", "fp8e5m2"] for shape in GEMM_A8W8],
+    [
+        (in_dtype, *shape)
+        for in_dtype in ["fp8e4m3", "fp8e5m2"]
+        for shape in get_shapes()
+    ],
 )
 @pytest.mark.parametrize(
     "impl",
@@ -167,7 +171,7 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
     [
         (out_dtype, *shape, layout, output)
         for out_dtype in ["fp16", "fp32", "int32"]
-        for shape in FEWER
+        for shape in get_shapes(max_size=512 * 1024 * 1024)
         for layout in ["TN", "TT", "NN", "NT"]
         for output in [True, False]
     ],
@@ -235,7 +239,7 @@ def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
         (in_dtype, out_dtype, *shape)
         for in_dtype in ["fp8e4m3", "fp8e5m2", "int8"]
         for out_dtype in ["bf16", "fp32"]
-        for shape in GEMM_A8W8_SPLITK
+        for shape in get_shapes(max_size=512 * 1024 * 1024)
     ],
 )
 @pytest.mark.parametrize("num_ksplit", [2, 4, 8])

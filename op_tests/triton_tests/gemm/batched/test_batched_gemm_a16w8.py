@@ -7,10 +7,7 @@ import triton
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_dtypes
-from op_tests.triton_tests.gemm.gemm_shapes import (
-    BATCHED_GEMM_A16W8_GENERIC,
-    BATCHED_GEMM_A16W8_MLA,
-)
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or arch_info.get_arch() != "gfx1250",
@@ -81,7 +78,7 @@ def run_gluon(x, weight, w_scale, y, transpose_bm, config=None):
 @pytest.mark.parametrize("transpose_bm", [True, False])
 @pytest.mark.parametrize("strided_x", [True, False])
 @pytest.mark.parametrize(
-    "b, m, n, k", BATCHED_GEMM_A16W8_MLA + BATCHED_GEMM_A16W8_GENERIC
+    "b, m, n, k", get_shapes(max_size=1024 * 1024 * 1024, batch=[1, 2, 4, 8, 16])
 )
 def test_batched_gemm_a16w8(b, m, n, k, strided_x, transpose_bm, output):
     torch.cuda.empty_cache()

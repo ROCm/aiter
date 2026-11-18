@@ -6,10 +6,7 @@ import torch
 from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_mul_add import (
     fused_gemm_a16w16_mul_add,
 )
-from op_tests.triton_tests.gemm.gemm_shapes import (
-    FUSED_GEMM_A16W16_MUL_ADD_2D,
-    FUSED_GEMM_A16W16_MUL_ADD_3D,
-)
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 
 def generate_fused_gemm_a16w16_mul_add_inputs(
@@ -50,7 +47,7 @@ def run_torch(x, w, a, b, bias, dtype):
     return (a * y + b).to(dtype)
 
 
-@pytest.mark.parametrize("M, N, K", FUSED_GEMM_A16W16_MUL_ADD_2D)
+@pytest.mark.parametrize("M, N, K", get_shapes())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("a_kind", ["scalar", "channel", "full"])
 @pytest.mark.parametrize("b_kind", ["scalar", "full"])
@@ -80,7 +77,7 @@ def test_fused_gemm_a16w16_mul_add_strided_bias(M, N, K, dtype, step):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
 
 
-@pytest.mark.parametrize("B, S, N, K", FUSED_GEMM_A16W16_MUL_ADD_3D)
+@pytest.mark.parametrize("B, S, N, K", get_shapes(batch=[1, 2]))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("a_kind", ["gate", "full"])
 @pytest.mark.parametrize("x_strided", [False, True])

@@ -11,11 +11,11 @@ from op_tests.triton_tests.gemm.feed_forward.ff_test_utils import (
     ff_gated_test,
     ff_ungated_test,
 )
-from op_tests.triton_tests.gemm.gemm_shapes import GEMM_A16W16
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 
 @pytest.mark.parametrize("activation", ["silu_exp2", "gelu_tanh", "relu", None])
-@pytest.mark.parametrize("batch, hidden_dim, intermediate_dim", GEMM_A16W16)
+@pytest.mark.parametrize("batch, hidden_dim, intermediate_dim", get_shapes())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_ff_a16w16_fused_ungated(
@@ -39,7 +39,7 @@ def test_ff_a16w16_fused_ungated(
 
 
 @pytest.mark.parametrize("activation", ["silu_exp2", "gelu_tanh", "relu", None])
-@pytest.mark.parametrize("batch, hidden_dim, intermediate_dim", GEMM_A16W16)
+@pytest.mark.parametrize("batch, hidden_dim, intermediate_dim", get_shapes())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_ff_a16w16_fused_gated(
@@ -63,7 +63,7 @@ def test_ff_a16w16_fused_gated(
     )
 
 
-# gfx950 M<=8 launch regression (PR #5399). GEMM_A16W16 jumps from M=3 to M>=32,
+# gfx950 M<=8 launch regression (PR #5399). get_shapes() jumps from M=3 to M>=32,
 # so M=5-8 -- the only range that selects the DEFAULT M_LEQ_8 tile -- is otherwise
 # uncompiled by CI. A DEFAULT M_LEQ_8 that exceeds LDS (the bug this PR fixes)
 # raises OutOfResources at launch; these cases take the config=None default path

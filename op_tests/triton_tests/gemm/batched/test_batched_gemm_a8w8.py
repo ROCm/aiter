@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from aiter.ops.triton.gemm.batched.batched_gemm_a8w8 import batched_gemm_a8w8
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
-from op_tests.triton_tests.gemm.gemm_shapes import BATCHED_GEMM_A8W8, smallest
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 
 def generate_batched_gemm_a8w8_inputs(
@@ -84,7 +84,7 @@ e5m2_type, e4m3_type = get_fp8_dtypes()
         for output in [True, False]
         for dtype in ["bf16"]
         for b in [16]
-        for shape in BATCHED_GEMM_A8W8
+        for shape in get_shapes()
     ],
 )
 def test_batched_gemm_a8w8(dtype, b, m, n, k, output):
@@ -106,7 +106,7 @@ def test_batched_gemm_a8w8(dtype, b, m, n, k, output):
         (dtype, b, *shape, layout, output)
         for dtype in ["bf16"]
         for b in [16]
-        for shape in smallest(BATCHED_GEMM_A8W8)
+        for shape in get_shapes(max_size=512 * 1024 * 1024)
         for output in [True, False]
         for layout in ["TT", "NN", "NT"]
     ],

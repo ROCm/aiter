@@ -10,7 +10,7 @@ from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
-from op_tests.triton_tests.gemm.gemm_shapes import BATCHED_GEMM_A8W8_PREQUANT
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
 
@@ -143,7 +143,7 @@ def skip_if_gluon_unsupported(backend, x, weight, bias):
         for output in [True, False]
         for dtype in ["bf16"]
         for b in [16]
-        for shape in BATCHED_GEMM_A8W8_PREQUANT
+        for shape in get_shapes(max_size=512 * 1024 * 1024)
         for group_size in [128]
         for has_bias in [True, False]
         for transpose_bm in [True, False]

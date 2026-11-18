@@ -14,7 +14,7 @@ from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
     gemm_a16w8_blockscale_preshuffle,
 )
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
-from op_tests.triton_tests.gemm.gemm_shapes import GEMM_A16W8_BLOCKSCALE
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 block_shape = (128, 128)
 
@@ -106,7 +106,7 @@ def generate_gemm_a16w8_blockscale_inputs(
         (dtype, *shape, output)
         for output in [False]
         for dtype in ["bf16"]
-        for shape in GEMM_A16W8_BLOCKSCALE
+        for shape in get_shapes()
     ],
 )
 @pytest.mark.parametrize("shuffle", [True, False])

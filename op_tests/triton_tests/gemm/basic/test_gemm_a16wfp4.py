@@ -8,7 +8,7 @@ from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
-from op_tests.triton_tests.gemm.gemm_shapes import GEMM_A16WFP4
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -128,7 +128,7 @@ def run_torch(x, w, w_scales, dtype):
     return torch.mm(x_f32, w_f32.T).to(dtype)
 
 
-@pytest.mark.parametrize("M, N, K", GEMM_A16WFP4)
+@pytest.mark.parametrize("M, N, K", get_shapes(k_mult=32))
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize(
     "atomic_add, shuffle, skip_reduce",

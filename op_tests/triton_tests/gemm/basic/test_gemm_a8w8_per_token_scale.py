@@ -9,7 +9,7 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8_per_token_scale import (
     gemm_a8w8_per_token_scale,
 )
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
-from op_tests.triton_tests.gemm.gemm_shapes import GEMM_A8W8_PER_TOKEN_SCALE
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 
 def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
@@ -73,7 +73,7 @@ def generate_gemm_a8w8_per_token_scale_inputs(
         for output in [True, False]
         for dtype in ["bf16"]
         for layout in ["TN", "TT", "NN", "NT"]
-        for shape in GEMM_A8W8_PER_TOKEN_SCALE
+        for shape in get_shapes()
     ],
 )
 def test_gemm(dtype, M, N, K, layout, output):

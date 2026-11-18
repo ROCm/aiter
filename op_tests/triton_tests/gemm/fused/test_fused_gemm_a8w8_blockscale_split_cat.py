@@ -15,7 +15,7 @@ from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_split_cat import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
-from op_tests.triton_tests.gemm.gemm_shapes import FUSED_GEMM_A8W8_BLOCKSCALE_SPLIT_CAT
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 block_shape = (128, 128)
 DEVICE_ARCH = arch_info.get_arch()
@@ -116,7 +116,7 @@ def generate_fused_gemm_a8w8_blockscale_split_cat_inputs(
     [
         (dtype, *shape, d, s3, layout, impl)
         for dtype in ["bf16"]
-        for shape in FUSED_GEMM_A8W8_BLOCKSCALE_SPLIT_CAT
+        for shape in get_shapes(min_k=128)
         for d in [16]
         for s3 in [64]
         for layout in ["TN", "TT", "NN", "NT"]

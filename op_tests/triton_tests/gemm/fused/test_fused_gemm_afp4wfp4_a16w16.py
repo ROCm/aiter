@@ -19,7 +19,7 @@ from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
 from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
     run_torch as run_torch_fp4,
 )
-from op_tests.triton_tests.gemm.gemm_shapes import FUSED_GEMM_AFP4WFP4_A16W16
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 
 def run_torch(
@@ -72,7 +72,7 @@ def run_triton(
     )
 
 
-@pytest.mark.parametrize("M, N1, N2, K", FUSED_GEMM_AFP4WFP4_A16W16)
+@pytest.mark.parametrize("M, N1, N2, K", get_shapes(k_mult=32, n2=[256, 512]))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("skip_reduce", [True, False])

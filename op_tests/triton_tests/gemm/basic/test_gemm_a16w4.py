@@ -14,7 +14,7 @@ from aiter.ops.triton.utils.shuffle import (
     gptq_to_gemm_a16w4,
     pack_gemm_a16w4_weight,
 )
-from op_tests.triton_tests.gemm.gemm_shapes import GEMM_A16W4
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 # Archs with gemm_a16w4 configs.
 SUPPORTED_ARCHS = ("gfx942", "gfx1100")
@@ -100,7 +100,7 @@ def _check(out, ref, dtype):
     torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize("M, N, K", GEMM_A16W4)
+@pytest.mark.parametrize("M, N, K", get_shapes(n_mult=8, k_mult=128))
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_gemm_a16w4(M: int, N: int, K: int, dtype):
     _skip_if_unsupported_arch()

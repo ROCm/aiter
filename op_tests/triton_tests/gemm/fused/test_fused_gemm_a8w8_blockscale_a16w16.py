@@ -18,7 +18,7 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
 )
-from op_tests.triton_tests.gemm.gemm_shapes import FUSED_GEMM_A8W8_BLOCKSCALE_A16W16
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 block_shape = (128, 128)
 
@@ -71,7 +71,7 @@ def run_triton(
     )
 
 
-@pytest.mark.parametrize("M, N1, N2, K", FUSED_GEMM_A8W8_BLOCKSCALE_A16W16)
+@pytest.mark.parametrize("M, N1, N2, K", get_shapes(k_mult=128, n2=[256, 512]))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("skip_reduce", [True, False])

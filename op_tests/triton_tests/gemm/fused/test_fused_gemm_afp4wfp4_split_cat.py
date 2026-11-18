@@ -16,7 +16,7 @@ from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (
     e8m0_to_f32,
     mxfp4_to_f32,
 )
-from op_tests.triton_tests.gemm.gemm_shapes import FUSED_GEMM_AFP4WFP4_SPLIT_CAT
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 SCALE_GROUP_SIZE = 32
 
@@ -144,7 +144,7 @@ def generate_fused_gemm_afp4wfp4_split_cat_inputs(
     [
         (dtype, *shape, d, s3, layout, shuffle)
         for dtype in ["bf16"]
-        for shape in FUSED_GEMM_AFP4WFP4_SPLIT_CAT
+        for shape in get_shapes()
         for d in [16]
         for s3 in [64]
         for layout in ["TN", "TT", "NN", "NT"]

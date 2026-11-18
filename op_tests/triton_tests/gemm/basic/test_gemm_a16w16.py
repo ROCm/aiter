@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available, gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
-from op_tests.triton_tests.gemm.gemm_shapes import FEWER, GEMM_A16W16, GPTOSS_NK
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 
@@ -58,7 +58,7 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
 
 
 # Test plain BF16 GEMMs - the most common types.
-@pytest.mark.parametrize("M, N, K", GEMM_A16W16)
+@pytest.mark.parametrize("M, N, K", get_shapes())
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 @pytest.mark.parametrize("kernel_type", ["bandwidth_bound", "compute_bound"])
 def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
@@ -110,7 +110,7 @@ def test_gemm_a16_w16_large_output(M: int, N: int, K: int):
 # and output tensor arg. We don't want the larger set above to test
 # all these combinations.
 @pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu"])
-@pytest.mark.parametrize("M, N, K", FEWER)
+@pytest.mark.parametrize("M, N, K", get_shapes(max_size=512 * 1024 * 1024))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
@@ -154,7 +154,7 @@ def test_gemm_a16_w16_activation(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
 
 
-@pytest.mark.parametrize("M, N, K", GEMM_A16W16)
+@pytest.mark.parametrize("M, N, K", get_shapes())
 @pytest.mark.parametrize("layout", ["TT", "NN", "NT"])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 @pytest.mark.parametrize("kernel_type", ["bandwidth_bound", "compute_bound"])
@@ -180,7 +180,7 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout, backend, kernel_typ
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("M, N, K", GEMM_A16W16)
+@pytest.mark.parametrize("M, N, K", get_shapes())
 @pytest.mark.parametrize("output", [True, False])
 def test_gemm_a16_w16_atomic(M: int, N: int, K: int, output):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
@@ -201,7 +201,7 @@ def test_gemm_a16_w16_atomic(M: int, N: int, K: int, output):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("M, N, K", FEWER)
+@pytest.mark.parametrize("M, N, K", get_shapes(max_size=512 * 1024 * 1024))
 @pytest.mark.parametrize("layout", ["TT", "NN", "NT"])
 def test_gemm_a16_w16_atomic_layout(M: int, N: int, K: int, layout):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
@@ -218,7 +218,7 @@ def test_gemm_a16_w16_atomic_layout(M: int, N: int, K: int, layout):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("M, N, K", FEWER)
+@pytest.mark.parametrize("M, N, K", get_shapes(max_size=512 * 1024 * 1024))
 @pytest.mark.parametrize("strided", [False, True])
 def test_gemm_a16_w16_atomic_accumulate(M: int, N: int, K: int, strided):
     """accumulate=True adds X @ W^T into y in place, like torch.addmm_."""
@@ -237,7 +237,7 @@ def test_gemm_a16_w16_atomic_accumulate(M: int, N: int, K: int, strided):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("M, N, K", GEMM_A16W16)
+@pytest.mark.parametrize("M, N, K", get_shapes())
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("layout", ["TN", "TT"])
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
@@ -328,8 +328,19 @@ def test_gemm_a16w16_gfx1250_store_env_override(monkeypatch):
 
 # The gpt-oss entries are tuned on a 96-CU DPX partition and live in configs/gfx1250/96cu/: a 96-CU device must pick
 # them (not the 96cu DEFAULT's bandwidth_bound rows), and every bucket they select must compute the right result.
+_GPTOSS_SHAPES = [
+    (5120, 2880),  # TP1 QKV
+    (2880, 4096),  # TP1 O
+    (128, 2880),  # router
+    (2560, 2880),  # TP2 QKV
+    (2880, 2048),  # TP2 O
+    (201088, 2880),  # LM head, TP1
+    (100544, 2880),  # LM head, TP2 (partial last N tile)
+]
+
+
 @pytest.mark.parametrize(
-    "N, K", GPTOSS_NK[:5]
+    "N, K", _GPTOSS_SHAPES[:5]
 )  # the LM heads are tuned for decode M only
 def test_gemm_a16w16_gfx1250_gptoss_96cu_lookup(N, K, monkeypatch):
     """Read configs/gfx1250/96cu. The arch is pinned because this only reads
@@ -356,7 +367,7 @@ def test_gemm_a16w16_gfx1250_gptoss_96cu_lookup(N, K, monkeypatch):
         gemm_config_utils._get_gemm_config_cached.cache_clear()
 
 
-@pytest.mark.parametrize("N, K", GPTOSS_NK)
+@pytest.mark.parametrize("N, K", _GPTOSS_SHAPES)
 @pytest.mark.parametrize("M", [1, 64, 1000, 2049, 3073, 8192])
 def test_gemm_a16w16_gfx1250_gptoss_tuned(M, N, K):
     if not is_gluon_supported():

@@ -15,7 +15,7 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
-from op_tests.triton_tests.gemm.gemm_shapes import GEMM_A8W8_BLOCKSCALE
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 block_shape = (128, 128)
 DEVICE_ARCH = arch_info.get_arch()
@@ -113,7 +113,7 @@ def generate_gemm_a8w8_blockscale_inputs(
         for output in [True]
         for dtype in ["bf16"]
         for layout in ["TN"]
-        for shape in GEMM_A8W8_BLOCKSCALE
+        for shape in get_shapes(min_k=128)
     ],
 )
 @pytest.mark.parametrize("backend", ["gluon", "triton"])

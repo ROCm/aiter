@@ -9,7 +9,7 @@ import torch
 from aiter.ops.triton.gemm.basic.gemm_a8wfp4 import gemm_a8wfp4
 from aiter.ops.triton.utils import types
 from aiter.ops.triton.utils._triton import arch_info
-from op_tests.triton_tests.gemm.gemm_shapes import GEMM_A8WFP4
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 # Debug
 DEBUG = False
@@ -316,7 +316,7 @@ def run_torch_emulation(x, w, x_scales, w_scales, dtype):
 e5m2_type, e4m3_type = types.get_fp8_dtypes()
 
 
-@pytest.mark.parametrize("M, N, K", GEMM_A8WFP4)
+@pytest.mark.parametrize("M, N, K", get_shapes(k_mult=32))
 # @pytest.mark.parametrize("M, N, K", [
 #     (2, 2, 32),
 #     (4, 4, 32),

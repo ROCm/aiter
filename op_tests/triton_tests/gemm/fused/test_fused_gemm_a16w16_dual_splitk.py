@@ -14,7 +14,7 @@ from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,
 )
-from op_tests.triton_tests.gemm.gemm_shapes import FUSED_GEMM_A16W16_DUAL_SPLITK
+from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 # Configs exist for gfx950 only; the config loader needs an arch-local DEFAULT.json.
 pytestmark = pytest.mark.skipif(
@@ -61,7 +61,7 @@ def _assert_close(y, ref, n1):
     triton.testing.assert_close(y[:, n1:], ref[:, n1:], atol=0.1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("M, N1, N2, K", FUSED_GEMM_A16W16_DUAL_SPLITK)
+@pytest.mark.parametrize("M, N1, N2, K", get_shapes(k_mult=128, n2=[32, 96]))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_gemm(M, N1, N2, K, dtype, output):
@@ -72,7 +72,10 @@ def test_gemm(M, N1, N2, K, dtype, output):
     _assert_close(y_triton, run_torch(x, w, dtype), N1)
 
 
-@pytest.mark.parametrize("M, N1, N2, K", FUSED_GEMM_A16W16_DUAL_SPLITK + _ODD_SHAPES)
+@pytest.mark.parametrize(
+    "M, N1, N2, K",
+    get_shapes(k_mult=128, max_size=512 * 1024 * 1024, n2=[32, 96]) + _ODD_SHAPES,
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("ks1, ks2", [(1, 1), (1, 4), (2, 1), (2, 4)])

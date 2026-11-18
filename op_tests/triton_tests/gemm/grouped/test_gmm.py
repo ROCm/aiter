@@ -41,11 +41,35 @@ from aiter.ops.triton.utils.gmm_common import (
     get_tgmm_output,
     get_tgmm_shape,
 )
-from op_tests.triton_tests.gemm.gemm_shapes import GMM_SHAPES, GMM_TEST_ONLY_SHAPES
 
 # Common code shared by GMM and TGMM unit tests.
 # ------------------------------------------------------------------------------
 
+
+# Shapes.
+
+# Shapes used only for test purposes.
+# fmt: off
+TEST_ONLY_SHAPES: list[tuple[int, int, int, int]] = [
+    #  M,    K,    N,   G
+    ( 10,    2,    3,   4),
+    ( 32,   16,    8,   4),
+]
+# fmt: on
+
+# Real shapes, used by real models.
+# fmt: off
+REAL_SHAPES: list[tuple[int, int, int, int]] = [
+    #      M,     K,     N,   G
+    (  49152,  1408,  2048,  64),  # deepseekv2-16B
+    (3145728,  2048,  1408,   8),  # deepseekv2-16B
+    (  32768,  6144, 16384,   8),  # Mixtral 8x22B
+    (  32768, 16384,  6144,   8),  # Mixtral 8x22B
+]
+# fmt: on
+
+# Test shapes are test only + real ones.
+TEST_SHAPES: list[tuple[int, int, int, int]] = TEST_ONLY_SHAPES + REAL_SHAPES
 
 # Other production workload: unknown model
 #                                                   M,    K,    N,  G
@@ -157,7 +181,7 @@ def torch_gmm(
     return out
 
 
-@pytest.mark.parametrize("M, K, N, G", GMM_SHAPES)
+@pytest.mark.parametrize("M, K, N, G", TEST_SHAPES)
 @pytest.mark.parametrize("trans_rhs_str", TRANS_RHS_STR)
 @pytest.mark.parametrize("use_bias", [False, True])
 def test_gmm(
@@ -493,7 +517,7 @@ def torch_tgmm(
 
 @pytest.mark.parametrize("persistent_str", {"p", "np"})
 @pytest.mark.parametrize("with_bias_grad", [False, True])
-@pytest.mark.parametrize("M, K, N, G", GMM_SHAPES)
+@pytest.mark.parametrize("M, K, N, G", TEST_SHAPES)
 @pytest.mark.parametrize("trans_lhs_str", TRANS_LSH_STR)
 def test_tgmm(
     persistent_str: str,
@@ -594,8 +618,8 @@ def test_tgmm_accumulate(persistent_str: str, with_bias_grad: bool):
     persistent: bool = persistent_str == "p"
 
     """Test ACCUMULATE semantics for persistent TGMM on a small, focused case."""
-    # Use the smallest GMM_TEST_ONLY_SHAPES entry to keep runtime low.
-    M, K, N, G = GMM_TEST_ONLY_SHAPES[0]
+    # Use the smallest TEST_ONLY_SHAPES entry to keep runtime low.
+    M, K, N, G = TEST_ONLY_SHAPES[0]
 
     in_dtype = out_dtype = DTYPE
 
