@@ -66,9 +66,17 @@ def _quantize_fp8_group32_kernel(
 ):
     task = gl.program_id(0)
     if PERSISTENT:
-        if TILES_PER_ITER == 1:
-            for tile in range(task, gl.cdiv(SIZE, 1024), 256):
-                _quantize_fp8_group32_tile(X, Y, S, SIZE, tile, DEQUANT)
+        if TILES_PER_ITER != 2:
+            for tile in range(task, gl.cdiv(SIZE, 1024 * TILES_PER_ITER), 256):
+                _quantize_fp8_group32_tile(
+                    X,
+                    Y,
+                    S,
+                    SIZE,
+                    tile.to(gl.int64) * TILES_PER_ITER,
+                    DEQUANT,
+                    TILES_PER_ITER,
+                )
         else:
             tasks = gl.cdiv(SIZE.to(gl.int64), 1024)
             base = tasks // 256
@@ -80,14 +88,7 @@ def _quantize_fp8_group32_kernel(
             for tile in range(start, full_end, TILES_PER_ITER):
                 _quantize_fp8_group32_tile(X, Y, S, SIZE, tile, DEQUANT, TILES_PER_ITER)
             tail_count = count % TILES_PER_ITER
-            if TILES_PER_ITER == 4:
-                if tail_count >= 2:
-                    _quantize_fp8_group32_tile(X, Y, S, SIZE, full_end, DEQUANT, 2)
-                if tail_count % 2:
-                    _quantize_fp8_group32_tile(
-                        X, Y, S, SIZE, full_end + (tail_count // 2) * 2, DEQUANT
-                    )
-            elif tail_count:
+            if tail_count:
                 _quantize_fp8_group32_tile(X, Y, S, SIZE, full_end, DEQUANT)
 
     else:

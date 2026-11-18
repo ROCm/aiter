@@ -365,11 +365,12 @@ def test_output_contract_rejects_bad_buffers():
     [
         "a03",
         "a03-small",
-        "a03-tail-two",
+        "a03-1537-rows",
         "a03-four-row-loop",
         "a09",
         "a09-small",
-        "a09-tail-three",
+        "a09-two-tasks",
+        "a09-897-rows",
         "a09-five-iterations",
     ],
 )
@@ -380,7 +381,7 @@ def test_graph_replay_changes_inputs(op):
         rows = {
             "a03": 513,
             "a03-small": 96,
-            "a03-tail-two": 1537,
+            "a03-1537-rows": 1537,
             "a03-four-row-loop": 1025,
         }[op]
         x = torch.randn((rows, 1792), device="cuda", dtype=torch.bfloat16)
@@ -406,7 +407,8 @@ def test_graph_replay_changes_inputs(op):
         rows = {
             "a09": 257,
             "a09-small": 96,
-            "a09-tail-three": 897,
+            "a09-two-tasks": 256,
+            "a09-897-rows": 897,
             "a09-five-iterations": 513,
         }[op]
         x = torch.randn((rows, 2048), device="cuda", dtype=torch.bfloat16)

@@ -27,7 +27,8 @@ def quantize_fp8_group32(
         x: Contiguous BF16 tensor on gfx1250. Its last width is divisible by 32.
         persistent: Use 256 one-dimensional workers with four waves each.
             Each iteration processes one, two or four adjacent 1024-element tiles.
-            The task count selects the batch. Each worker owns a balanced interval; tails use two or one tiles.
+            The task count selects the batch. Two-tile batches balance one/two-task workers. Four-tile batches
+            use the cyclic P256 loop.
         dequantize: Return QAT values in BF16 instead of FP8 and scale tensors.
         out: Optional contiguous output with x.shape and the result dtype.
         scales: Optional contiguous E8M0 tensor, with last width x.shape[-1]/32.

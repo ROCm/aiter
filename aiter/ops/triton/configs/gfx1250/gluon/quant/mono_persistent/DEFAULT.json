@@ -1,6 +1,6 @@
 {
   "a03": {
-    "T_LEQ_1023": {
+    "T_LEQ_767": {
       "tasks_per_iter": 1
     },
     "any": {
@@ -11,7 +11,7 @@
     "T_LEQ_256": {
       "tasks_per_iter": 1
     },
-    "T_LEQ_768": {
+    "T_LEQ_512": {
       "tasks_per_iter": 2
     },
     "any": {
@@ -22,7 +22,7 @@
     "T_LEQ_256": {
       "tasks_per_iter": 1
     },
-    "T_LEQ_768": {
+    "T_LEQ_512": {
       "tasks_per_iter": 2
     },
     "any": {
