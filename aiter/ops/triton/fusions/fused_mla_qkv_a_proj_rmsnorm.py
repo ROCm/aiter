@@ -9,7 +9,7 @@ weight (GLM-5.x, DeepSeek-V3 style). The output is the BF16 ``q_lora`` after ``q
 the BF16 ``kv_lora`` after ``kv_a_layernorm`` and the BF16 ``k_pe`` (rope) slice.
 
 The kernels are Gluon split-K schedules for small decode batches (M = 1, 2, 4, 8, 16, 32)
-on gfx950, ported from the Artemis GLM-5.2 FP8 kernel pack. Each M has one schedule in
+on gfx950, tuned for the GLM-5.2 FP8 shape. Each M has one schedule in
 ``configs/gfx950/gluon/fusions/fused_mla_qkv_a_proj_rmsnorm/DEFAULT.json``. The split-K
 partials are FP32.
 

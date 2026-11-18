@@ -9,10 +9,8 @@ Each call is two launches. A producer launch quantizes the BF16 activation per
 adds the partials, rounds the projection to BF16, applies RMSNorm to the q and
 kv slices and copies the rope slice.
 
-The schedules are ported from the Artemis GLM-5.2 FP8 kernel pack
-(``glm52_fp8/qkv_a_norm_r3``). The split-K partials and the intra-CTA wave
-exchange are FP32 here. The pack stores them in BF16/FP16, which loses accuracy
-when the partial sums cancel.
+The split-K partials and the intra-CTA wave exchange are kept in FP32: storing
+them in BF16/FP16 loses accuracy when the partial sums cancel.
 
 The host code is in ``aiter/ops/triton/fusions/fused_mla_qkv_a_proj_rmsnorm.py``.
 """
