@@ -352,6 +352,11 @@ class StoreCInt8Rows(StoreC):
     register ``r`` and column ``8 (l % 16) + j``, so register ``r`` of the
     eight j tiles is one 16-byte store and 16 lanes cover a 256-byte row.
     Preshuffled B has N % 16 == 0: a store is fully inside C or past column N.
+
+    ``fp32_acc`` takes FP32 accumulators that are already scaled, as a block-scaled
+    MFMA leaves them, in the same layout: no row or column scales are loaded or applied.
+    B_scale keeps its column scales' place, so the biases and norm weights stay at the
+    same offsets.
     """
 
     SCALE_LOADS = WAVE_TILES + 2
@@ -374,15 +379,18 @@ class StoreCInt8Rows(StoreC):
         eps=1e-6,
         amax_partials=None,
         planar_cols=0,
+        fp32_acc=False,
     ):
         super().__init__(A_scale, B_scale, C, c_rows, c_cols, *args)
         self.has_bias = has_bias
         self.planar_cols = planar_cols
+        self.fp32_acc = fp32_acc
         self.prep = prep is not None
         self.spec = prep_spec
         self.has_gamma = self.prep and prep_spec.gammas
-        # Index of the first norm-weight load in scale_load_ops' result.
-        self.gamma_index = WAVE_TILES + 2 + (self.BIAS_LOADS if has_bias else 0)
+        # Indices of the first bias and norm-weight loads in scale_load_ops' result.
+        self.bias_index = 0 if fp32_acc else WAVE_TILES + 2
+        self.gamma_index = self.bias_index + (self.BIAS_LOADS if has_bias else 0)
         self.eps = eps
         self.amax = self.prep or amax_partials is not None
         if self.amax and not self.prep:
@@ -411,6 +419,8 @@ class StoreCInt8Rows(StoreC):
         )
         self.sa_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(sa_tensor))
         self.sb_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(sb_tensor))
+        if fp32_acc:
+            self.columns_div = fx.logical_divide(sb_tensor, fx.make_layout(1, 1))
 
     @staticmethod
     def _load_f32x4(rsrc, byte_offset):
@@ -435,10 +445,16 @@ class StoreCInt8Rows(StoreC):
 
         The loads are asm, so LLVM leaves them out of its vmcnt waits: an LLVM
         wait for them would also wait for the LDS-DMA loads that follow them,
-        which it cannot count. The caller waits before the stores.
+        which it cannot count. The caller waits before the stores. With
+        ``fp32_acc`` they are stable loads, issued after the host's last LDS-DMA
+        load has landed.
         """
 
         def op(rsrc, element):
+            if self.fp32_acc:
+                # No LDS-DMA loads are in flight where an fp32_acc host issues these,
+                # so they are stable loads: LLVM waits for them before any use or copy.
+                return lambda: self._load_freq4(self.columns_div, element())
             return lambda: self._load_f32x4(rsrc, element() * 4)
 
         def row(i):
@@ -447,9 +463,10 @@ class StoreCInt8Rows(StoreC):
         def col(half):
             return col_base + (self.lane_id % 16) * 8 + half * 4
 
-        ops = [op(self.sa_rsrc, lambda i=i: row(i)) for i in range(WAVE_TILES)] + [
-            op(self.sb_rsrc, lambda h=h: col(h)) for h in (0, 1)
-        ]
+        ops = []
+        if not self.fp32_acc:
+            ops += [op(self.sa_rsrc, lambda i=i: row(i)) for i in range(WAVE_TILES)]
+            ops += [op(self.sb_rsrc, lambda h=h: col(h)) for h in (0, 1)]
         if self.has_bias:
             ops += [op(self.sb_rsrc, lambda h=h: self.c_cols + col(h)) for h in (0, 1)]
         if self.has_gamma:
@@ -585,13 +602,16 @@ class StoreCInt8Rows(StoreC):
             )
         row0 = row_base + (self.lane_id // 16) * 4
         col = col_base + (self.lane_id % 16) * 8
-        a_scales = [Vec(s) for s in scales[:WAVE_TILES]]
-        b_lo, b_hi = (Vec(s) for s in scales[WAVE_TILES : WAVE_TILES + 2])
-        b_scales = Vec.from_elements(
-            [b_lo[j] for j in range(4)] + [b_hi[j] for j in range(4)], fx.Float32
-        )
+        if const_expr(not self.fp32_acc):
+            a_scales = [Vec(s) for s in scales[:WAVE_TILES]]
+            b_lo, b_hi = (Vec(s) for s in scales[WAVE_TILES : WAVE_TILES + 2])
+            b_scales = Vec.from_elements(
+                [b_lo[j] for j in range(4)] + [b_hi[j] for j in range(4)], fx.Float32
+            )
         if const_expr(self.has_bias):
-            bias_lo, bias_hi = (Vec(s) for s in scales[WAVE_TILES + 2 : WAVE_TILES + 4])
+            bias_lo, bias_hi = (
+                Vec(s) for s in scales[self.bias_index : self.bias_index + 2]
+            )
             biases = Vec.from_elements(
                 [bias_lo[j] for j in range(4)] + [bias_hi[j] for j in range(4)],
                 fx.Float32,
@@ -616,11 +636,16 @@ class StoreCInt8Rows(StoreC):
                 # One wait for the tile's four rows rather than one per row.
                 tile_freqs = [self._load_freqs(row0 + i * TILE + r) for r in range(4)]
             for r in range_constexpr(4):
-                acc = Vec.from_elements(
-                    [Vec(accs[i][j])[r] for j in range(WAVE_TILES)], fx.Int32
-                )
-                a_scale = Vec.filled(WAVE_TILES, a_scales[i][r], fx.Float32)
-                scaled = acc.to(fx.Float32) * (a_scale * b_scales)
+                if const_expr(self.fp32_acc):
+                    scaled = Vec.from_elements(
+                        [Vec(accs[i][j])[r] for j in range(WAVE_TILES)], fx.Float32
+                    )
+                else:
+                    acc = Vec.from_elements(
+                        [Vec(accs[i][j])[r] for j in range(WAVE_TILES)], fx.Int32
+                    )
+                    a_scale = Vec.filled(WAVE_TILES, a_scales[i][r], fx.Float32)
+                    scaled = acc.to(fx.Float32) * (a_scale * b_scales)
                 if const_expr(self.has_bias):
                     scaled = scaled + biases
                 row = row0 + i * TILE + r
