@@ -1631,8 +1631,9 @@ def mla_decode_fwd(
                 cp_world_size,
                 cp_rank,
             )
-        elif use_flydsl_ps1 and q.dtype == dtypes.bf16:
-            if kv_buffer.dtype == dtypes.fp8:
+        elif use_flydsl_ps1:
+            qkv_types = (q.dtype, kv_buffer.dtype)
+            if qkv_types == (dtypes.bf16, dtypes.fp8):
                 from aiter.ops.flydsl.mla_kernels import (
                     flydsl_mla_pagesize1_bf16_fp8,
                 )
@@ -1658,7 +1659,7 @@ def mla_decode_fwd(
                     cp_world_size=cp_world_size,
                     cp_rank=cp_rank,
                 )
-            else:
+            elif qkv_types == (dtypes.bf16, dtypes.bf16):
                 from aiter.ops.flydsl.mla_kernels import (
                     flydsl_mla_pagesize1_bf16_bf16,
                 )
@@ -1682,30 +1683,30 @@ def mla_decode_fwd(
                     cp_world_size=cp_world_size,
                     cp_rank=cp_rank,
                 )
-        elif use_flydsl_ps1:
-            from aiter.ops.flydsl.mla_kernels import flydsl_mla_pagesize1_fp8_fp8
+            elif qkv_types == (dtypes.fp8, dtypes.fp8):
+                from aiter.ops.flydsl.mla_kernels import flydsl_mla_pagesize1_fp8_fp8
 
-            flydsl_mla_pagesize1_fp8_fp8(
-                logits.view(-1, nhead, v_head_dim),
-                attn_lse.view(-1, nhead),
-                o,
-                q,
-                kv_buffer,
-                kv_indices,
-                work_indptr,
-                work_info_set,
-                sm_scale,
-                q_scale=q_scale,
-                kv_scale=kv_scale,
-                final_lse=final_lse,
-                max_seqlen_q=max_seqlen_q,
-                causal=causal,
-                qo_indptr=qo_indptr,
-                kv_indptr=kv_indptr,
-                g_kv_indptr=g_kv_indptr,
-                cp_world_size=cp_world_size,
-                cp_rank=cp_rank,
-            )
+                flydsl_mla_pagesize1_fp8_fp8(
+                    logits.view(-1, nhead, v_head_dim),
+                    attn_lse.view(-1, nhead),
+                    o,
+                    q,
+                    kv_buffer,
+                    kv_indices,
+                    work_indptr,
+                    work_info_set,
+                    sm_scale,
+                    q_scale=q_scale,
+                    kv_scale=kv_scale,
+                    final_lse=final_lse,
+                    max_seqlen_q=max_seqlen_q,
+                    causal=causal,
+                    qo_indptr=qo_indptr,
+                    kv_indptr=kv_indptr,
+                    g_kv_indptr=g_kv_indptr,
+                    cp_world_size=cp_world_size,
+                    cp_rank=cp_rank,
+                )
         elif use_opus:
             aiter.opus_mla_decode_fwd(
                 q,
