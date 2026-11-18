@@ -1,0 +1,35 @@
+{
+    "LINES": 64,
+    "NUM_PROGRAMS": 2048,
+    "num_warps": 1,
+    "RSAG": false,
+    "VARIANTS": [
+        {
+            "MIN_NUMEL": 262144,
+            "config": {
+                "LINES": 128,
+                "NUM_PROGRAMS": 512,
+                "num_warps": 2,
+                "RSAG": false
+            }
+        },
+        {
+            "MIN_NUMEL": 409600,
+            "config": {
+                "LINES": 512,
+                "NUM_PROGRAMS": 2048,
+                "num_warps": 2,
+                "RSAG": false
+            }
+        },
+        {
+            "MIN_NUMEL": 1048576,
+            "config": {
+                "LINES": 512,
+                "NUM_PROGRAMS": 2048,
+                "num_warps": 2,
+                "RSAG": true
+            }
+        }
+    ]
+}

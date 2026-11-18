@@ -165,7 +165,7 @@ configs/<arch>/<backend>/<op>/<d_type>/DEFAULT.json
 configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 ```
 
-`<op>` is `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`, `quant`
+`<op>` is `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `comms`, `fusions`, `quant`
 or `normalization`.
 
 The plain `<arch>/` folder holds the configs of the CU count the arch was
@@ -225,4 +225,29 @@ you cannot launch alone does not need a `repr`.
 pytest op_tests/triton_tests/              # all tests
 pytest op_tests/triton_tests/gemm/basic/   # one folder
 python op_tests/op_benchmarks/triton/bench_gemm_a16w16.py
+```
+
+
+### TP4 bf16 all-reduce on gfx1250
+
+`comms/all_reduce.py` selects a single-launch kernel by message size. Small
+messages use the direct peer-broadcast path. Larger messages use larger chunks.
+At 1,048,576 values and above, each chunk is sent to one owner, which sums it
+in rank order and broadcasts the bf16 result. This halves the peer payload
+traffic from three to one-and-a-half input tensors per rank.
+
+`configs/gfx1250/gluon/comms/all_reduce/DEFAULT.json` holds the chunk size,
+receiver count, warp count and `RSAG` switch. Its `VARIANTS` list is ordered by
+`MIN_NUMEL`. `all_reduce_init` allocates separate IPC buffers and counters for
+each reachable variant. This uses more scratch memory but permits mixed sizes
+in one HIP graph without reusing another variant's tags. `calls[-1]` reports
+poll timeouts from all variants. `all_reduce_free` releases every variant.
+
+The default API is unchanged. An optional `config` argument to `all_reduce_init`
+selects one fixed configuration; every rank must use the same configuration.
+Use one stream and the same call order and tensor sizes on all four ranks.
+
+```bash
+torchrun --standalone --nproc-per-node=4 -m pytest -q op_tests/triton_tests/comms/test_all_reduce.py
+python -m op_tests.op_benchmarks.triton.bench_all_reduce --hidden 7168 --tokens 1 2 4 8 16 32 64 128 256 --metric time
 ```

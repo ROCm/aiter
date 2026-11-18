@@ -187,3 +187,172 @@ def _all_reduce_kernel(
             gl.amd.cdna5.buffer_store(s0, y, value, mask=first < n)
             gl.amd.cdna5.buffer_store(s1, y, value + 2 * LINES, mask=ok1)
             gl.amd.cdna5.buffer_store(s2, y, value + 4 * LINES, mask=ok2)
+
+
+@gluon.jit
+def _pack_values(v0, v1, v2, call):
+    LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
+    b0 = v0.to(gl.int16, bitcast=True).to(gl.int32) & 65535
+    b1 = v1.to(gl.int16, bitcast=True).to(gl.int32) << 16
+    b2 = v2.to(gl.int16, bitcast=True).to(gl.int32) & 65535
+    # Never 0 (an empty inbox). Before the data comes, a unit holds the call of 2 uses
+    # of the chunk ago: 15 bits tell the 2 calls apart.
+    tag = call % 32768 + 1
+    N: gl.constexpr = v0.shape[0]
+    H: gl.constexpr = v0.shape[1] // 2  # lines of a row
+    # Line h * N + i has the units of columns 2h and 2h + 1 of row i.
+    lines = gl.reshape(gl.join(b1 | b0, tag << 16 | b2), [N, H, 4])
+    lines = gl.reshape(gl.permute(lines, (1, 0, 2)), [H * N, 4])
+    return gl.convert_layout(lines, LINE, assert_trivial=True)
+
+
+@gluon.jit
+def _post_result(
+    lines,
+    inboxes,
+    pos,
+    mask,
+    call,
+    RANK: gl.constexpr,
+    SLOT: gl.constexpr,
+):
+    """Writes the lines in the mask to pos in the slot of this rank in each peer."""
+    slot = 8 * SLOT + (call % 2 * 4 + RANK) * SLOT
+    for peer in gl.static_range(4):
+        if peer != RANK:
+            # 16-byte aligned, so that a line moves in one store.
+            inbox = gl.multiple_of(inboxes[peer].to(gl.pointer_type(gl.int32)), 16)
+            gl.amd.cdna5.buffer_store(lines, inbox, slot + pos, mask=mask, cache=".wt")
+
+
+@gluon.jit
+def _receive_result(
+    inboxes,
+    pos,
+    mask,
+    call,
+    err,
+    owner,
+    RANK: gl.constexpr,
+    SLOT: gl.constexpr,
+    MAXIT: gl.constexpr,
+):
+    LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
+    col = gl.arange(0, 4, layout=gl.SliceLayout(0, LINE))[None, :]
+    tag = call % 32768 + 1
+    empty = col % 2 * (tag << 16)
+    inbox = gl.multiple_of(inboxes[RANK].to(gl.pointer_type(gl.int32)), 16)
+    slot = 8 * SLOT + (call % 2 * 4 + owner) * SLOT
+    lines = gl.zeros(pos.shape, gl.int32, LINE)
+    late = 1
+    it = 0
+    while (late > 0) & (it < MAXIT):
+        lines = gl.amd.cdna5.buffer_load(
+            inbox, slot + pos, mask=mask, other=empty, cache=".cv"
+        )
+        _, hi = _unit_words(lines)
+        late = gl.sum(gl.sum(((hi & -65536) != tag << 16).to(gl.int32), 1), 0)
+        gl.inline_asm("", "~{memory}", [], [], is_pure=False)
+        it += 1
+    if late > 0:
+        gl.atomic_add(err, 1)
+    return _values(lines)
+
+
+@gluon.jit(
+    repr=make_kernel_repr("_all_reduce_rsag", ["RANK", "LINES"]),
+    do_not_specialize=["n", "programs"],
+)
+def _all_reduce_rsag_kernel(
+    x,
+    y,
+    inboxes,
+    calls,
+    err,
+    n,
+    programs,
+    RANK: gl.constexpr,
+    LINES: gl.constexpr,
+    SLOT: gl.constexpr,
+    MAXIT: gl.constexpr,
+):
+    """Send each chunk to one owner, then broadcast that owner's reduced chunk.
+
+    Input senders precede owner reducers, which precede result receivers. Polling
+    receivers therefore cannot fill the GPU before the producers have run.
+    """
+    WORDS: gl.constexpr = gl.BlockedLayout([1, 2], [32, 1], [gl.num_warps(), 1], [1, 0])
+    LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
+    line = gl.arange(0, LINES, layout=gl.SliceLayout(1, WORDS))[:, None]
+    pair = gl.arange(0, 2, layout=gl.SliceLayout(0, WORDS))[None, :]
+    line4 = gl.arange(0, LINES, layout=gl.SliceLayout(1, LINE))[:, None]
+    col4 = gl.arange(0, 4, layout=gl.SliceLayout(0, LINE))[None, :]
+    chunks = gl.cdiv(n, 6 * LINES)
+    owned = gl.cdiv(chunks - RANK, 4)
+    pid = gl.program_id(0)
+    if pid < chunks:
+        c = pid
+        first = 6 * c * LINES + 2 * line
+        call, lines = _lines(
+            x,
+            first + pair,
+            first < n,
+            first + 2 * LINES < n,
+            first + 4 * LINES < n,
+            2 * LINES,
+            calls + 2 * c,
+        )
+        owner = c % 4
+        pos = 4 * (c * LINES + line4) + col4
+        for peer in gl.static_range(4):
+            if (owner == peer) & (peer != RANK):
+                inbox = gl.multiple_of(inboxes[peer].to(gl.pointer_type(gl.int32)), 16)
+                slot = (call % 2 * 4 + RANK) * SLOT
+                gl.amd.cdna5.buffer_store(lines, inbox, slot + pos, cache=".wt")
+    elif pid < chunks + owned:
+        c = 4 * (pid - chunks) + RANK
+        first = 6 * c * LINES + 2 * line
+        value = first + pair
+        ok1 = first + 2 * LINES < n
+        ok2 = first + 4 * LINES < n
+        call, lines = _lines(
+            x, value, first < n, ok1, ok2, 2 * LINES, calls + 2 * c + 1
+        )
+        pos = 4 * (c * LINES + line4) + col4
+        needed = 6 * c * LINES + 2 * line4 < n
+        s0, s1, s2 = _receive(inboxes, pos, needed, call, lines, err, RANK, SLOT, MAXIT)
+        v0, v1, v2 = s0.to(gl.bfloat16), s1.to(gl.bfloat16), s2.to(gl.bfloat16)
+        reduced = _pack_values(v0, v1, v2, call)
+        _post_result(reduced, inboxes, pos, line4 < LINES, call, RANK, SLOT)
+        gl.amd.cdna5.buffer_store(v0, y, value, mask=first < n)
+        gl.amd.cdna5.buffer_store(v1, y, value + 2 * LINES, mask=ok1)
+        gl.amd.cdna5.buffer_store(v2, y, value + 4 * LINES, mask=ok2)
+    else:
+        for c in range(pid - chunks - owned, chunks, programs):
+            owner = c % 4
+            if owner != RANK:
+                counter = calls + 2 * c + 1
+                call = gl.load(counter) % (1 << 30) + 1
+                gl.barrier()
+                gl.store(counter, call)
+                first = 6 * c * LINES + 2 * line
+                pos = 4 * (c * LINES + line4) + col4
+                needed = 6 * c * LINES + 2 * line4 < n
+                s0, s1, s2 = _receive_result(
+                    inboxes, pos, needed, call, err, owner, RANK, SLOT, MAXIT
+                )
+                gl.amd.cdna5.buffer_store(
+                    s0.to(gl.bfloat16), y, first + pair, mask=first < n
+                )
+                gl.amd.cdna5.buffer_store(
+                    s1.to(gl.bfloat16),
+                    y,
+                    first + pair + 2 * LINES,
+                    mask=first + 2 * LINES < n,
+                )
+                gl.amd.cdna5.buffer_store(
+                    s2.to(gl.bfloat16),
+                    y,
+                    first + pair + 4 * LINES,
+                    mask=first + 4 * LINES < n,
+                )
