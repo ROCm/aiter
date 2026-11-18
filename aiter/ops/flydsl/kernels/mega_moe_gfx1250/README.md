@@ -12,7 +12,7 @@ The script runs the existing native MegaMoE benchmark on four gfx1250 GPUs:
 16384 tokens per rank (65536 global), 384 experts, top-k 6, H5120/I2304,
 balanced routing, eight layers, five warmups and 32 iterations. It explicitly
 loads `aiter/configs/model_configs/dsv41_flash_tuned_grouped_fmoe.csv`, enables
-S1F pull with A preshuffle, uses 64 producers, and enables fused GEMM2. The
+S1F pull with A preshuffle, uses 96 producers after the ratio tuning below, and enables fused GEMM2. The
 selected GEMM1 cluster falls back to 1x1; GEMM2 retains its CSV cluster 1x4.
 It clears old tuning overrides and checks GPU idleness every second before
 launching. FlyDSL must match `requirements.txt` (0.5.0 at this revision).
@@ -496,3 +496,29 @@ passed both fused/unfused H7168/I1024/tpr17 and fused H5120/I2304/tpr16384,
 including changed graph inputs and hot/empty ranks. No hang/reboot observed.
 The implementation was reverted to the best measured CSV-fed baseline before
 commit; baseline snapshots, patch, review log and all timings are in `/workspace/gpubench/s1f_pull_split_barrier_20261118/`.
+
+## Producer-count tuning, 2026-11-18
+
+Commit 13b230a52, full-row gather, EP4, tpr16384/global65536, E384, top6, H5120/I2304, balanced, 8 layers, 5 warmups, 32 iterations. Both GEMMs use A preshuffle. Only producer count changes; GEMM1 cluster remains 1x1.
+
+Native E2E median per rank divided by 8, then averaged over ranks. Stage values are mean HIP-event intervals including boundary overhead; stages do not sum to native E2E.
+
+| Producers | Initial consumers | Runs | Plan+quant us | Ready us | GEMM1 incl producer us | GEMM2+scatter us | E2E/layer us |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 224 | 1 | 39.48 | 12.46 | 610.94 | 594.75 | 1650.94 |
+| 64 | 192 | 3 | 40.16 | 12.52 | 570.01 | 595.52 | 1609.81 |
+| 80 | 176 | 1 | 39.82 | 12.49 | 564.18 | 594.80 | 1604.87 |
+| 96 | 160 | 3 | 39.72 | 12.51 | 561.38 | 595.95 | 1601.36 |
+| 112 | 144 | 1 | 40.09 | 12.60 | 563.73 | 595.63 | 1604.35 |
+| 128 | 128 | 1 | 39.67 | 12.60 | 567.24 | 595.18 | 1604.58 |
+| 192 | 64 | 1 | 39.42 | 12.53 | 605.32 | 595.80 | 1645.44 |
+
+96 producers reduce GEMM1 latency by 1.51% and E2E by 0.52% versus 64, based on three runs each. Other candidates have one screening run. This does not establish a global optimum over all counts/shapes.
+
+Baseline E2E range: 1608.55–1612.07 us; 96-producer range: 1599.57–1603.07 us. Producers join the consumer queue after their own work; these ratios describe initial roles.
+
+Full EP4 correctness passed with 96 producers: changing graph inputs, random/hot/empty ranks, full output vs push and exact dispatched payload/scales/weights. All runs exited 0 with unchanged boot ID. Every run directory contains three prelaunch review passes, source snapshots, command, environment and idle checks.
+
+```bash
+BENCH_PRODUCERS=96 bash /workspace/gpubench/s1f_pull_ratio_20261118/run.sh current p96_new
+```
