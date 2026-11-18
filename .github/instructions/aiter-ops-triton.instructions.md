@@ -86,7 +86,7 @@ These parts must work without PyTorch, for example with JAX-Triton. Flag:
 ## Configs: files and names
 
 All tuned configs are in `configs/<arch>/<backend>/<op>/<d_type>/`. `<op>` is
-`gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions` or `quant`.
+`gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `comms`, `fusions` or `quant`.
 `<d_type>` is `config_name.lower().replace("-", "_")`. A family tuned on a
 CU count other than the arch's default can have its own tree,
 `configs/<arch>/<cu_num>cu/<backend>/<op>/<d_type>/`, with its own
