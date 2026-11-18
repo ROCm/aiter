@@ -167,6 +167,29 @@ def conv2d_padding_reference(
     return F.conv2d(source, weight, bias, stride, padding, dilation)
 
 
+def conv3d_padding_reference(
+    source,
+    weight,
+    bias=None,
+    stride=(1, 1, 1),
+    padding=(0, 0, 0),
+    dilation=(1, 1, 1),
+    padding_mode="zeros",
+):
+    """Reference convolution without using production padding preparation."""
+    if padding_mode != "zeros":
+        pad_depth, pad_height, pad_width = (
+            (padding, padding, padding) if isinstance(padding, int) else padding
+        )
+        source = F.pad(
+            source,
+            (pad_width, pad_width, pad_height, pad_height, pad_depth, pad_depth),
+            mode=padding_mode,
+        )
+        padding = (0, 0, 0)
+    return F.conv3d(source, weight, bias, stride, padding, dilation)
+
+
 # -- Architecture gating ------------------------------------------------------
 # NOTE: CDNA configs are not tuned at all - these are included only so
 # correctness tests can run on CDNA hardware without being skipped.

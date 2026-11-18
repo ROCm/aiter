@@ -87,9 +87,11 @@ from aiter.ops.triton._triton_kernels.conv.ncx_to_cblocked import (
 )
 from aiter.ops.triton.conv._utils import (
     _conv2d_padding_geometry,
+    _conv3d_padding_geometry,
     _ensure_layout,
     _normalize_tuple,
     _validate_conv2d_padding_mode,
+    _validate_conv3d_padding_mode,
     _winograd_transform_storage_dtype,
 )
 from aiter.ops.triton.utils.conv_config_utils import (
@@ -190,6 +192,44 @@ def _prepare_conv2d_padding(
     output = F.pad(
         source,
         (pad_width, pad_width, pad_height, pad_height),
+        mode=padding_mode,
+    )
+    return _ensure_layout(output, layout), conv_padding
+
+
+def _prepare_conv3d_padding(
+    source: torch.Tensor,
+    padding,
+    padding_mode: str = "zeros",
+    *,
+    layout: str = "ncdhw",
+    x_blocked: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, tuple[int, int, int]]:
+    """Prepare Conv3D padding and layout; leave implicit and zero-amount paths unchanged."""
+    if source.ndim != 5:
+        raise ValueError(f"conv3d padding input must be 5-D NCDHW, got {source.ndim}-D")
+    if layout not in ("ncdhw", "ndhwc"):
+        raise ValueError(f"layout must be 'ncdhw' or 'ndhwc', got {layout!r}")
+    padding = _normalize_tuple(padding, 3, "padding", allow_zero=True)
+    depth, height, width = source.shape[2:]
+    _validate_conv3d_padding_mode(padding_mode, depth, height, width, padding)
+    padded_depth, padded_height, padded_width, conv_padding = _conv3d_padding_geometry(
+        depth, height, width, padding, padding_mode
+    )
+    if (padded_depth, padded_height, padded_width) == (depth, height, width):
+        return source, conv_padding
+    if x_blocked is not None:
+        raise ValueError(
+            "x_blocked cannot be used with materialized padding; "
+            "omit it to pack the padded input"
+        )
+    if not source.is_cuda:
+        raise ValueError("materialized conv3d padding requires a CUDA/ROCm tensor")
+
+    pad_depth, pad_height, pad_width = padding
+    output = F.pad(
+        source,
+        (pad_width, pad_width, pad_height, pad_height, pad_depth, pad_depth),
         mode=padding_mode,
     )
     return _ensure_layout(output, layout), conv_padding

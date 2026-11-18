@@ -184,6 +184,63 @@ def _normalize_conv3d_params(stride, padding, dilation):
     )
 
 
+def _validate_conv3d_devices(x, w_oidhw, bias=None):
+    """Require input, weight, and optional bias on one CUDA/ROCm device."""
+    if not x.is_cuda:
+        raise ValueError("conv3d input must be a CUDA/ROCm tensor")
+    if w_oidhw.device != x.device or (bias is not None and bias.device != x.device):
+        raise ValueError("conv3d input, weight, and bias must be on the same device")
+
+
+def _validate_conv3d_padding_mode(
+    padding_mode: str,
+    depth: int,
+    height: int,
+    width: int,
+    padding: tuple[int, int, int],
+) -> None:
+    """Validate the mode and spatial limits after non-negative normalization."""
+    modes = ("zeros", "reflect", "replicate", "circular")
+    if padding_mode not in modes:
+        raise ValueError(f"padding_mode must be one of {modes}, got {padding_mode!r}")
+    spatial = (depth, height, width)
+    if any(size <= 0 for size in spatial):
+        raise ValueError(f"input spatial dimensions must be positive, got {spatial}")
+    if padding_mode == "reflect" and any(
+        amount >= size for amount, size in zip(padding, spatial)
+    ):
+        raise ValueError(
+            "reflect padding must be less than each input spatial dimension, "
+            f"got padding={padding} for input {spatial}"
+        )
+    if padding_mode == "circular" and any(
+        amount > size for amount, size in zip(padding, spatial)
+    ):
+        raise ValueError(
+            "circular padding must not exceed each input spatial dimension, "
+            f"got padding={padding} for input {spatial}"
+        )
+
+
+def _conv3d_padding_geometry(
+    depth: int,
+    height: int,
+    width: int,
+    padding: tuple[int, int, int],
+    padding_mode: str,
+) -> tuple[int, int, int, tuple[int, int, int]]:
+    """Return effective dimensions and kernel padding for normalized, valid inputs."""
+    if padding_mode == "zeros" or padding == (0, 0, 0):
+        return depth, height, width, padding
+    pad_depth, pad_height, pad_width = padding
+    return (
+        depth + 2 * pad_depth,
+        height + 2 * pad_height,
+        width + 2 * pad_width,
+        (0, 0, 0),
+    )
+
+
 def _out_dhw(D, H, W, T, R, S, stride, padding, dilation):
     """Return the standard Conv3D output depth, height, and width."""
     sd, sh, sw = stride
