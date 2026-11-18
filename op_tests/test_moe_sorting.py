@@ -23,17 +23,22 @@ SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 def test_moe_sorting_opus_host_dispatch_boundaries():
     if get_gfx() != "gfx950":
         device_id = torch.cuda.current_device()
+        assert aiter.moe_sorting_opus_get_workspace_size(1, 384, 8, 0, device_id) == 0
         assert aiter.moe_sorting_opus_get_workspace_size(1, 385, 8, 0, device_id) == 0
         assert aiter.moe_sorting_opus_get_workspace_size(1, 512, 8, 0, device_id) > 0
         return
 
     device_id = torch.cuda.current_device()
-    tokens = (1, 7, 8, 12, 16, 24, 25, 31)
+    tokens = (1, 7, 8, 12, 16, 17, 24, 25, 31)
     multi_tokens = {
-        255: (25, 31),
-        256: (8, 12, 16, 24, 25, 31),
-        257: (8, 12, 16, 24, 25, 31),
-        384: (8, 12, 16, 24, 25, 31),
+        127: (),
+        128: (17, 24, 25, 31),
+        192: (17, 24, 25, 31),
+        255: (17, 24, 25, 31),
+        256: (8, 12, 16, 17, 24, 25, 31),
+        257: (8, 12, 16, 17, 24, 25, 31),
+        383: (8, 12, 16, 17, 24, 25, 31),
+        384: tokens,
         385: tokens,
     }
     for E, token in itertools.product(multi_tokens, tokens):
@@ -247,7 +252,7 @@ def _compare_moe_sorting_outputs(ref, out, topk, num_rows):
 
 def test_moe_sorting_opus_aux_outputs(dtype, model_dim):
     """Cover auxiliary outputs on one-shot and newly multi-phase auto routes."""
-    for token, E, topk in ((7, 32, 5), (8, 256, 8), (1, 385, 7)):
+    for token, E, topk in ((7, 32, 5), (8, 256, 8), (1, 384, 6), (1, 385, 7)):
         topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
             token,
             model_dim,
@@ -313,7 +318,7 @@ def test_moe_sorting_opus_aux_outputs(dtype, model_dim):
 
 
 def test_moe_sorting_opus_local_ids_large_expert_auto(dtype, model_dim):
-    for token, E, topk in ((8, 256, 8), (1, 385, 7)):
+    for token, E, topk in ((8, 256, 8), (1, 384, 6), (1, 385, 7)):
         topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
             token,
             model_dim,

@@ -22,6 +22,20 @@ def run_host_scalar_ops_for_real(enabled: bool) -> bool:
     return previous
 
 
+_python_ops_real = False
+
+
+def run_python_ops_for_real(enabled: bool) -> bool:
+    """Make ops with a Python body (not bound C++ functions) run that body
+    instead of dispatching, so under FakeTensorMode the host code picking and
+    launching kernels runs while the C++ ops it calls still dispatch to their
+    fakes. Returns the previous setting."""
+    global _python_ops_real
+    previous = _python_ops_real
+    _python_ops_real = enabled
+    return previous
+
+
 def is_torch_equal_or_newer(target: str) -> bool:
     """Check if the installed torch version is >= the target version.
 
@@ -224,6 +238,18 @@ def torch_compile_guard(
         # In core.py, we calling wrapper, but actually we need use aiter.op func
         calling_func = calling_func_ if calling_func_ is not None else func
 
+        def _as_public(wrapped):
+            """Report the op's own signature rather than the wrapper's.
+
+            Every wrapper here takes (*args, **kwargs), so without this
+            inspect.signature() of a guarded op shows no parameter names and no
+            defaults. Anything reading the public surface needs them -- the
+            kernel provider interface captures the signature as the op contract.
+            """
+
+            wrapped.__wrapped__ = calling_func
+            return wrapped
+
         def wrapper(*args, **kwargs):
             return func(*args, **kwargs)
 
@@ -233,10 +259,10 @@ def torch_compile_guard(
             import torch
             from torch.library import Library  # noqa: F401  availability probe
         except ImportError:
-            return wrapper
+            return _as_public(wrapper)
 
         if calling_func.__name__ in NONE_WRAPPED_OP:
-            return wrapper
+            return _as_public(wrapper)
 
         def wrapper_register(calling_func):
             import inspect
@@ -305,8 +331,12 @@ def torch_compile_guard(
         schema = f"{new_input} -> {output_part}".strip()
 
         loadName = calling_func.__name__
+        # A bound C++ function arrives through calling_func_; its func is a stub.
+        python_body = calling_func_ is None
 
         def wrapper_custom(*args, **kwargs):
+            if python_body and _python_ops_real:
+                return func(*args, **kwargs)
             result = (
                 getattr(torch.ops.aiter, f"{loadName}")(*args, **kwargs)
                 if input_is_tensor
@@ -325,7 +355,7 @@ def torch_compile_guard(
                 return dispatch_custom(*args, **kwargs)
 
         if hasattr(torch.ops.aiter, loadName):
-            return wrapper_custom
+            return _as_public(wrapper_custom)
 
         def abstract_impl(*args, **kwargs):
             if gen_fake is not None:
@@ -384,6 +414,6 @@ def torch_compile_guard(
             # the op: a pre-existing registration may run a different body.
             wrapper_custom._eager_body = func
 
-        return wrapper_custom
+        return _as_public(wrapper_custom)
 
     return decorator

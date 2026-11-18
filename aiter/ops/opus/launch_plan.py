@@ -302,6 +302,16 @@ def _build_a16w16_launch_plan(
     instance = get_kernel_instance(
         registry_arch, "a16w16", resolved_kid, output_dtype, cu_num=cu_num
     )
+    if instance is None and registry_arch == "gfx1250-strict":
+        # The OPUS CO kernels are pre-compiled gfx1250 images, and the CO
+        # loader does not distinguish the strict runtime id. Resolve only CO
+        # kids through the base family; every other kernel keeps the real id.
+        candidate = get_kernel_instance(
+            GFX1250, "a16w16", resolved_kid, output_dtype, cu_num=cu_num
+        )
+        if candidate is not None and candidate.kernel_tag in _GFX1250_CO_TAGS:
+            instance = candidate
+            registry_arch = GFX1250
     if instance is None:
         if (
             get_kernel_instance(registry_arch, "a16w16", resolved_kid, cu_num=cu_num)
@@ -492,6 +502,7 @@ _A8W8_FAMILY_BY_TAG = {
     "a8w8": _A8W8_FAMILY,
     "a8w8_scale": _A8W8_BLOCKSCALE_FAMILY,
     "a8w8_blockscale_bpreshuffle_singlebuf": _A8W8_BPRESHUFFLE_FAMILY,
+    "a8w8_blockscale_mxscale_gemm_bpreshuffle": _A8W8_BPRESHUFFLE_FAMILY,
     **{tag: _A8W8_MXSCALE_BMM_FAMILY for tag in _A8W8_MXSCALE_BMM_TAGS},
 }
 _A8W8_FAMILY_LAYOUT = {
@@ -548,6 +559,14 @@ def _validate_a8w8_public_contract(
         )
     if input_dtype not in _FP8_DTYPES:
         raise ValueError(f"OPUS kid {kid} requires FP8 XQ/WQ; got {input_dtype}")
+    if (
+        kernel_tag == "a8w8_blockscale_mxscale_gemm_bpreshuffle"
+        and input_dtype != torch.float8_e4m3fn
+    ):
+        raise ValueError(
+            f"OPUS gfx950 MXFP8 bpreshuffle requires float8_e4m3fn XQ/WQ; "
+            f"got {input_dtype}"
+        )
 
     if family == _A8W8_MXSCALE_BMM_FAMILY:
         if output_dtype not in (torch.bfloat16, torch.float32):
