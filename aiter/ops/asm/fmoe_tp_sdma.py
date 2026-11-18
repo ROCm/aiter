@@ -6,6 +6,7 @@
 import contextlib
 import ctypes
 import functools
+import hashlib
 import math
 import os
 import threading
@@ -21,7 +22,7 @@ from aiter import dtypes
 from aiter.jit.core import AITER_ASM_DIR, build_ctypes_module
 from aiter.ops.asm import asm_utils as _au
 
-_CSV_STR = frozenset({"a_dtype", "act", "epi_mode", "knl_name", "co_name"})
+_CSV_STR = frozenset({"a_dtype", "act", "epi_mode", "knl_name", "co_name", "sha256"})
 _KFD = "/sys/class/kfd/kfd/topology/nodes"
 _RING_B, _FLAG_B, _INT4_B = 256 * 1024, 4096, 1168
 _CTRL_WORDS, _CTRL_TOTAL_WORDS = 40960, 81920
@@ -29,9 +30,12 @@ _CTRL_HRDY_BASE, _CTRL_MAX_HRDY_TILES, _CTRL_ERR = 5120, 35840, 63
 _CTRL_LAYOUT_VERSION = 2
 _EVEN_SDMA_ENG_MASK = 0x55555555
 _MAX_MUBUF_P8_BYTES, _MAX_IPC_INBOX_BYTES = 0xFFFFF000, 0x7FFFF000
-_WIN_CFGS = {8192: ((4096, 3072, 1024), (4096, 2048, 1536, 512))}
-_WIN_CFGS |= {4096: ((2048, 1024, 1024),), 3584: ((2048, 1024, 512),)}
-_WIN_CFGS[2560] = ((1280, 768, 512),)
+_WIN_CFGS = {
+    8192: ((4096, 3072, 1024),),
+    4096: ((2048, 1024, 1024),),
+    3584: ((2048, 1024, 512),),
+    2560: ((1280, 768, 512),),
+}
 _EPI_Q = ("add_rmsnorm_fp4", "add_rmsnorm_fp8", "rmsnorm_only_fp4", "rmsnorm_only_fp8")
 EPI_MODES = ("add_rmsnorm", "rmsnorm_only", "raw_bf16", *_EPI_Q)
 _ERR_NAMES = {1: "RS flag timeout", 2: "AG flag timeout", 4: "local counter timeout"}
@@ -116,9 +120,16 @@ def _hsakmt_lib():
 def _alloc_uncached(nbytes: int) -> int:
     sz, hip, buf = -(-int(nbytes) // 4096) * 4096, _hip_ext(), ctypes.c_void_p()
     _au.hip_check(hip.hipExtMallocWithFlags(ctypes.byref(buf), sz, 3), "ExtMalloc")
-    _au.hip_check(hip.hipMemset(buf, 0, sz), "hipMemset")
-    _au.hip_check(hip.hipDeviceSynchronize(), "hipDeviceSynchronize")
-    return int(buf.value or 0)
+    ptr = int(buf.value or 0)
+    try:
+        _au.hip_check(hip.hipMemset(buf, 0, sz), "hipMemset")
+        _au.hip_check(hip.hipDeviceSynchronize(), "hipDeviceSynchronize")
+    except Exception:
+        if ptr:
+            with contextlib.suppress(Exception):
+                hip.hipFree(ctypes.c_void_p(ptr))
+        raise
+    return ptr
 
 
 def _kfd_props(path: str) -> dict[str, int]:
@@ -215,9 +226,10 @@ def _open_sdma(st: SimpleNamespace, rank: int, src: int, gid: int, nodes: list[i
             eng, out = engs[q % len(engs)], (ctypes.c_uint64 * 7)()
             if rc := lib.xs_create(hk.value, eng, _RING_B, 3, out):
                 raise RuntimeError(f"SDMA create failed (peer={peer}): {rc}")
-            sh = _alloc_uncached(_RING_B)
             r_va, qid, rp_va, wp_va, db_va, rp, wp = map(int, out)
-            st.queues.append((qid, r_va, sh))
+            st.queues.append((qid, r_va, 0))
+            sh = _alloc_uncached(_RING_B)
+            st.queues[-1] = (qid, r_va, sh)
             i = peer * 2 + q
             hd = [r_va, _RING_B, rp_va, wp_va, db_va, wp, wp, rp, st.quiet + 8 * i]
             rows[i, :9] = torch.tensor(hd)
@@ -226,21 +238,27 @@ def _open_sdma(st: SimpleNamespace, rank: int, src: int, gid: int, nodes: list[i
 
 
 def _free_state(st: SimpleNamespace, dev: torch.device) -> None:
-    torch.cuda.synchronize(dev)
+    with contextlib.suppress(Exception):
+        torch.cuda.synchronize(dev)
     hip = _hip_ext()
     if st.sdma_open:
         lib = _hsakmt_lib()
         for qid, ring, sh in st.queues:
-            lib.xs_destroy(qid, ring, _RING_B)
+            with contextlib.suppress(Exception):
+                lib.xs_destroy(qid, ring, _RING_B)
             if sh:
-                hip.hipFree(ctypes.c_void_p(sh))
+                with contextlib.suppress(Exception):
+                    hip.hipFree(ctypes.c_void_p(sh))
         st.queues.clear()
-        lib.xs_close()
+        with contextlib.suppress(Exception):
+            lib.xs_close()
         st.sdma_open = False
     for b in filter(None, st.opened):
-        hip.hipIpcCloseMemHandle(ctypes.c_void_p(b))
+        with contextlib.suppress(Exception):
+            hip.hipIpcCloseMemHandle(ctypes.c_void_p(b))
     for p in filter(None, (st.quiet, st.send_ptr, st.ipc_ptr)):
-        hip.hipFree(ctypes.c_void_p(p))
+        with contextlib.suppress(Exception):
+            hip.hipFree(ctypes.c_void_p(p))
 
 
 @functools.lru_cache(maxsize=8)
@@ -251,9 +269,26 @@ def load_fmoe_tp_sdma_registry(co_dir=None):
     rows = _au.load_asm_cfg_csv(f"{rdir}/fmoe_tp_sdma.csv", _CSV_STR)
     ks, ts = ("world", "model_dim", "inter_dim", "topk"), ("a_dtype", "act", "epi_mode")
     rk = lambda r: (*(r[c] for c in ks), r.get("tile_m", 64), *(r[c] for c in ts))
-    return {
-        (*rk(r), r["gemma"]): (f"{rdir}/{r['co_name']}", r["knl_name"]) for r in rows
-    }
+    reg = {}
+    for r in rows:
+        ver = r.get("layout_version")
+        if ver != _CTRL_LAYOUT_VERSION:
+            raise RuntimeError(
+                f"fmoe_tp_sdma.csv row {r.get('co_name')!r} has layout_version={ver!r}, "
+                f"expected {_CTRL_LAYOUT_VERSION}"
+            )
+        co_path = f"{rdir}/{r['co_name']}"
+        if not os.path.isfile(co_path):
+            raise FileNotFoundError(f"missing precompiled .co binary: {co_path}")
+        if digest := r.get("sha256", ""):
+            with open(co_path, "rb") as f:
+                actual = hashlib.sha256(f.read()).hexdigest()
+            if actual != digest:
+                raise RuntimeError(
+                    f"sha256 mismatch for {co_path}: expected {digest}, got {actual}"
+                )
+        reg[(*rk(r), r["gemma"])] = (co_path, r["knl_name"])
+    return reg
 
 
 class TpAsmContext:
@@ -270,7 +305,11 @@ class TpAsmContext:
         if (arch := _au.get_gfx_from_device(dev)) != "gfx950":
             raise NotImplementedError(f"fmoe_tp_sdma requires gfx950, got {arch!r}")
         self.device, self.device_idx = dev, int(dev.index)
+        self.group = group
         self.co_dir = kw.get("co_dir")
+        self.slot_id = int(kw.get("slot_id", 0))
+        if self.slot_id < 0:
+            raise ValueError(f"slot_id must be >= 0, got {self.slot_id}")
         self.rank = int(dist.get_rank(group=group))
         self.world = int(dist.get_world_size(group=group))
         if self.world not in (2, 4, 8) or int(model_dim) not in _WIN_CFGS:
@@ -279,7 +318,7 @@ class TpAsmContext:
         self.topk, self.num_experts = int(topk), int(num_experts)
         self.inter_dim, win_cfgs = int(inter_dim), _WIN_CFGS[self.model_dim]
         sk = (self.max_tokens, self.model_dim, self.topk, self.num_experts)
-        pkey = (id(group), self.device_idx, *sk, self.inter_dim)
+        pkey = (id(group), self.device_idx, *sk, self.inter_dim, self.slot_id)
         self._closed, self._pkey = False, pkey
         if (st := _POOL.get(pkey)) is not None:
             st.refcount += 1
@@ -375,16 +414,47 @@ class TpAsmContext:
             return getattr(st, name)
         raise AttributeError(name)
 
+    def _ensure_open(self) -> None:
+        if getattr(self, "_closed", True):
+            raise RuntimeError("TpAsmContext is closed")
+
+    def acquire_arena(self, slot_id: int = 0) -> "TpAsmArenaLease":
+        self._ensure_open()
+        return TpAsmArenaLease(self, int(slot_id))
+
     def poison_ipc(self) -> None:
+        self._ensure_open()
         vp = ctypes.c_void_p(self._st.ipc_ptr + _FLAG_B)
         rc = _hip_ext().hipMemset(vp, 0xFF, 4 * self._st.inbox_bytes)
         _au.hip_check(rc, "memset")
 
-    def reset_epoch(self, val: int = 0) -> None:
-        self._st.epoch.fill_(int(val))
+    def reset_epoch(
+        self, val: int = 0, *, reset_ipc_flags: bool = True, group=None
+    ) -> None:
+        self._ensure_open()
+        if not reset_ipc_flags:
+            raise ValueError(
+                "reset_epoch on live shared IPC state requires reset_ipc_flags=True"
+            )
+        grp = self.group if group is None else group
+        has_dist = grp is not None and dist.is_initialized()
+        torch.cuda.synchronize(self.device)
+        if has_dist:
+            dist.barrier(group=grp)
+        rc = _hip_ext().hipMemset(ctypes.c_void_p(self._st.ipc_ptr), 0, _FLAG_B)
+        _au.hip_check(rc, "hipMemset(ipc_flags)")
         self._st.ctrl.zero_()
+        self._st.err.zero_()
+        self._st.epoch.fill_(int(val))
+        torch.cuda.synchronize(self.device)
+        if has_dist:
+            dist.barrier(group=grp)
+
+    def reset(self, val: int = 0, *, group=None) -> None:
+        self.reset_epoch(val=val, reset_ipc_flags=True, group=group)
 
     def check_error(self) -> None:
+        self._ensure_open()
         torch.cuda.synchronize(self.device)
         st, v = self._st, ctypes.c_int32(0)
         rc = _hip_ext().hipMemcpy(ctypes.byref(v), ctypes.c_void_p(st.sdma_err), 4, 2)
@@ -410,10 +480,55 @@ class TpAsmContext:
             self.close()
 
 
+class TpAsmArenaLease:
+    """Explicit multi-slot arena lease for disjoint DBO microbatch execution."""
+
+    def __init__(self, base_ctx: TpAsmContext, slot_id: int) -> None:
+        base_ctx._ensure_open()
+        self.slot_id = int(slot_id)
+        if self.slot_id < 0:
+            raise ValueError(f"slot_id must be >= 0, got {self.slot_id}")
+        self._owns_ctx = self.slot_id != base_ctx.slot_id
+        self.context = (
+            TpAsmContext(
+                base_ctx.group,
+                base_ctx.device,
+                base_ctx.max_tokens,
+                base_ctx.model_dim,
+                base_ctx.topk,
+                base_ctx.num_experts,
+                base_ctx.inter_dim,
+                co_dir=base_ctx.co_dir,
+                slot_id=self.slot_id,
+            )
+            if self._owns_ctx
+            else base_ctx
+        )
+
+    def release(self) -> None:
+        if self._owns_ctx:
+            self.context.close()
+
+    def __enter__(self) -> TpAsmContext:
+        self.context._ensure_open()
+        return self.context
+
+    def __exit__(self, *_exc) -> None:
+        self.release()
+
+
+def _ranges_overlap(a: Tensor, b: Tensor) -> bool:
+    a0, b0 = int(a.data_ptr()), int(b.data_ptr())
+    return a0 < b0 + int(b.nbytes) and b0 < a0 + int(a.nbytes)
+
+
 def tp_moe_layer_asm(
     call, ctx, epi_mode="add_rmsnorm", out=None, out_scale=None, **kw
 ) -> TpMoeOut:
     """Execute one TP rank's single-launch MoE + device-SDMA combine + epilogue."""
+    if isinstance(ctx, TpAsmArenaLease):
+        ctx = ctx.context
+    ctx._ensure_open()
     res_o, co_dir = kw.get("residual_out"), kw.get("co_dir")
     a_dt, act_n = kw.get("a_dtype", "fp4"), kw.get("act", "silu")
     act_n = "situ" if act_n == "situv2" else act_n
@@ -421,18 +536,26 @@ def tp_moe_layer_asm(
     if bad_m or act_n not in ("silu", "situ"):
         raise ValueError(f"unsupported epi={epi_mode!r}, a_dtype={a_dt!r}")
     ok_1b = lambda t, s: t.shape == s and t.is_contiguous() and t.element_size() == 1
+    if call.x.device != ctx.device or not call.x.is_contiguous():
+        raise ValueError(f"x must be contiguous on {ctx.device}")
     if call.x_scale is not None:
         if call.x.dim() != 2 or call.x_scale.dim() != 2:
             raise ValueError("pre-quantized x and x_scale must be 2D")
+        if call.x_scale.device != ctx.device:
+            raise ValueError(f"x_scale must be on {ctx.device}")
         tokens, d = int(call.x.shape[0]), int(call.x_scale.shape[1]) * 32
         xc = d // 2 if a_dt == "fp4" else d
         if not (ok_1b(call.x, (tokens, xc)) and ok_1b(call.x_scale, (tokens, d // 32))):
             raise ValueError(f"invalid pre-quantized x/x_scale for a_dtype={a_dt!r}")
         xq, xs = call.x, call.x_scale
     else:
-        if call.x.dim() != 2:
-            raise ValueError(f"expected 2D x, got {tuple(call.x.shape)}")
+        if call.x.dim() != 2 or call.x.dtype != dtypes.bf16:
+            raise ValueError(
+                f"expected 2D bf16 x, got {tuple(call.x.shape)} {call.x.dtype}"
+            )
         tokens, d, xq, xs = int(call.x.shape[0]), int(call.x.shape[1]), None, None
+    if call.topk_ids.dim() != 2 or call.topk_weights.dim() != 2:
+        raise ValueError("topk_ids and topk_weights must be 2D")
     topk, num_experts = int(call.topk_ids.shape[1]), int(call.w2.shape[0])
     inter = int(call.w2.shape[2]) * 2
     ctx_s = (ctx.model_dim, ctx.topk, ctx.inter_dim, ctx.num_experts)
@@ -440,14 +563,57 @@ def tp_moe_layer_asm(
         raise ValueError(
             f"call (T={tokens}, D={d}, k={topk}, I={inter}, E={num_experts}) != ctx"
         )
+    if call.topk_ids.shape != (tokens, topk) or not call.topk_ids.is_contiguous():
+        raise ValueError(f"topk_ids must be contiguous {(tokens, topk)}")
+    if call.topk_ids.device != ctx.device or call.topk_ids.dtype != torch.int32:
+        raise ValueError(f"topk_ids must be int32 on {ctx.device}")
+    if (
+        call.topk_weights.shape != (tokens, topk)
+        or not call.topk_weights.is_contiguous()
+        or call.topk_weights.device != ctx.device
+        or call.topk_weights.dtype != torch.float32
+    ):
+        raise ValueError(
+            f"topk_weights must be contiguous fp32 {(tokens, topk)} on {ctx.device}"
+        )
+    for nm, t in (
+        ("w1", call.w1),
+        ("w2", call.w2),
+        ("w1_scale", call.w1_scale),
+        ("w2_scale", call.w2_scale),
+    ):
+        if t.device != ctx.device or not t.is_contiguous():
+            raise ValueError(f"{nm} must be contiguous on {ctx.device}")
     is_add, is_norm = epi_mode.startswith("add_rmsnorm"), epi_mode != "raw_bf16"
     is_fp4_o, is_fp8_o = epi_mode.endswith("_fp4"), epi_mode.endswith("_fp8")
     bp = (float(kw.get("beta1", 4.0)), float(kw.get("beta2", 25.0)))
     bad_eps = is_norm and abs(float(call.eps) - 1e-6) > 1e-12
     if bad_eps or (act_n == "situ" and bp != (4.0, 25.0)):
         raise NotImplementedError("unsupported eps or situ beta for precompiled .co")
-    if (is_add and call.residual is None) or (is_norm and call.norm_weight is None):
-        raise ValueError(f"missing residual or norm_weight for {epi_mode!r}")
+    if is_add:
+        if call.residual is None:
+            raise ValueError(f"missing residual for {epi_mode!r}")
+        if (
+            call.residual.shape != (tokens, d)
+            or call.residual.dtype != dtypes.bf16
+            or not call.residual.is_contiguous()
+            or call.residual.device != ctx.device
+        ):
+            raise ValueError(
+                f"residual must be contiguous bf16 {(tokens, d)} on {ctx.device}"
+            )
+    if is_norm:
+        if call.norm_weight is None:
+            raise ValueError(f"missing norm_weight for {epi_mode!r}")
+        if (
+            call.norm_weight.shape != (d,)
+            or call.norm_weight.dtype != dtypes.bf16
+            or not call.norm_weight.is_contiguous()
+            or call.norm_weight.device != ctx.device
+        ):
+            raise ValueError(
+                f"norm_weight must be contiguous bf16 {(d,)} on {ctx.device}"
+            )
 
     emp = lambda s, dt: torch.empty(s, dtype=dt, device=ctx.device)
     if is_fp4_o or is_fp8_o:
@@ -455,15 +621,46 @@ def tp_moe_layer_asm(
         out = emp((tokens, oc), odt) if out is None else out
         sc_shape = (tokens, d // 32)
         out_scale = emp(sc_shape, dtypes.fp8_e8m0) if out_scale is None else out_scale
-        if not (ok_1b(out, (tokens, oc)) and ok_1b(out_scale, sc_shape)):
+        if (
+            out.device != ctx.device
+            or out_scale.device != ctx.device
+            or not (ok_1b(out, (tokens, oc)) and ok_1b(out_scale, sc_shape))
+            or out.nbytes < tokens * oc
+            or out_scale.nbytes < tokens * (d // 32)
+            or out.dtype not in (odt, torch.uint8)
+            or out_scale.dtype not in (dtypes.fp8_e8m0, torch.uint8)
+        ):
             raise ValueError(f"invalid out or out_scale for {epi_mode!r}")
+        if _ranges_overlap(out, out_scale):
+            raise ValueError("out and out_scale must not overlap")
     else:
         out = emp((tokens, d), dtypes.bf16) if out is None else out
-        if out.shape != (tokens, d) or not out.is_contiguous():
-            raise ValueError(f"invalid bf16 out {tuple(out.shape)} for {epi_mode!r}")
+        if (
+            out.shape != (tokens, d)
+            or out.dtype != dtypes.bf16
+            or out.nbytes < tokens * d * 2
+            or not out.is_contiguous()
+            or out.device != ctx.device
+        ):
+            raise ValueError(
+                f"invalid bf16 out {tuple(out.shape)} {out.dtype} for {epi_mode!r}"
+            )
         out_scale = None
     res_u = res_o if is_norm else None
     res_u = emp((tokens, d), dtypes.bf16) if (is_add and res_u is None) else res_u
+    if is_add:
+        if (
+            res_u.shape != (tokens, d)
+            or res_u.dtype != dtypes.bf16
+            or res_u.nbytes < tokens * d * 2
+            or not res_u.is_contiguous()
+            or res_u.device != ctx.device
+        ):
+            raise ValueError(f"invalid residual_out {tuple(res_u.shape)} {res_u.dtype}")
+        if _ranges_overlap(out, res_u) or (
+            out_scale is not None and _ranges_overlap(out_scale, res_u)
+        ):
+            raise ValueError("residual_out must not overlap out or out_scale")
 
     gm = 0 if not is_norm else int(bool(call.gemma))
     reg = load_fmoe_tp_sdma_registry(ctx.co_dir if co_dir is None else co_dir)
@@ -527,6 +724,7 @@ def prepare_downstream_mx_inputs(
 
 __all__ = [
     "EPI_MODES",
+    "TpAsmArenaLease",
     "TpAsmContext",
     "TpMoeCall",
     "TpMoeOut",

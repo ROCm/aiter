@@ -69,20 +69,25 @@ PAIR = 2
 # block 128 up; at 64 it is padded, see :func:`codecs_for_block`.
 # i32 per 64 B fabric sector.
 SECTOR_I32 = 16
+# Native short-row mesh widths: 320 threads (5 waves, D=2560) and 448 threads
+# (7 waves, D=3584). Both keep every rank-tile region on the 64 B sector grid.
+NATIVE_SHORT_BLOCKS = (320, 448)
 
 
 def validate_block(block: int) -> int:
     block = int(block)
     # Besides ``SUPPORTED_BLOCKS``, the fused schedules size a workgroup to one
     # token row (block = hidden / 8), on any BLOCK_ALIGN multiple up to
-    # MAX_BLOCK. Both keep every rank-tile region on the 64 B sector grid.
-    if block in SUPPORTED_BLOCKS or (
-        BLOCK_ALIGN <= block <= MAX_BLOCK and block % BLOCK_ALIGN == 0
+    # MAX_BLOCK, plus NATIVE_SHORT_BLOCKS for unpadded short-row mesh widths.
+    if (
+        block in SUPPORTED_BLOCKS
+        or block in NATIVE_SHORT_BLOCKS
+        or (BLOCK_ALIGN <= block <= MAX_BLOCK and block % BLOCK_ALIGN == 0)
     ):
         return block
     raise ValueError(
-        f"codec block must be one of {SUPPORTED_BLOCKS} or a multiple of "
-        f"{BLOCK_ALIGN} in [{BLOCK_ALIGN}, {MAX_BLOCK}], got {block!r}"
+        f"codec block must be one of {SUPPORTED_BLOCKS}, {NATIVE_SHORT_BLOCKS}, "
+        f"or a multiple of {BLOCK_ALIGN} in [{BLOCK_ALIGN}, {MAX_BLOCK}], got {block!r}"
     )
 
 

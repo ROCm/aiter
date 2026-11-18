@@ -67,6 +67,9 @@ FUSIONS = ("none", "rmsnorm")
 #: bf16 values in one 16 B atom, per thread.
 ATOM_ELEMS = 8
 
+#: Native short-row mesh workgroup widths (D=2560 -> 320, D=3584 -> 448).
+NATIVE_SHORT_BLOCKS = (320, 448)
+
 
 # -- fusion-agnostic: geometry ------------------------------------------------
 
@@ -471,15 +474,29 @@ def quick_reduce_atoms_choices(
 
 
 def quick_reduce_row_block_options(
-    hidden: int, world_size: int, *, wide_rows: bool = False
+    hidden: int,
+    world_size: int,
+    *,
+    wide_rows: bool = False,
+    native_short_row: bool = False,
 ) -> tuple[tuple[int, int], ...]:
     """Every ``(block, atoms_per_row)`` a fused mesh or ring build can use;
     ``wide_rows`` as in :func:`quick_reduce_atoms_choices`."""
-    return row_block_options(
-        hidden,
-        atoms_choices=quick_reduce_atoms_choices(world_size, wide_rows=wide_rows),
-        align=BLOCK_ALIGN,
+    atoms_choices = quick_reduce_atoms_choices(world_size, wide_rows=wide_rows)
+    opts = list(
+        row_block_options(
+            hidden,
+            atoms_choices=atoms_choices,
+            align=BLOCK_ALIGN,
+        )
     )
+    if native_short_row and 1 in atoms_choices:
+        hidden_i = int(hidden)
+        if hidden_i > 0 and hidden_i % ATOM_ELEMS == 0:
+            block = hidden_i // ATOM_ELEMS
+            if block in NATIVE_SHORT_BLOCKS and (block, 1) not in opts:
+                opts.insert(0, (block, 1))
+    return tuple(opts)
 
 
 def quick_reduce_padded_row_block_options(
@@ -494,7 +511,11 @@ def quick_reduce_padded_row_block_options(
 
 
 def quick_reduce_row_block(
-    hidden: int, world_size: int, *, wide_rows: bool = False
+    hidden: int,
+    world_size: int,
+    *,
+    wide_rows: bool = False,
+    native_short_row: bool = False,
 ) -> tuple[int, int]:
     """``(block, atoms_per_row)`` for a fused mesh or ring build.
 
@@ -506,7 +527,9 @@ def quick_reduce_row_block(
     a reduce-scatter chunk cannot carry at TP8, so hidden=16384 is TP2/TP4 only
     -- unless ``wide_rows`` (mesh only) lifts the chunk bound.
     """
-    opts = quick_reduce_row_block_options(hidden, world_size, wide_rows=wide_rows)
+    opts = quick_reduce_row_block_options(
+        hidden, world_size, wide_rows=wide_rows, native_short_row=native_short_row
+    )
     if opts:
         return opts[0]
     span = max(quick_reduce_atoms_choices(world_size, wide_rows=wide_rows))
@@ -533,6 +556,7 @@ def quick_reduce_row_block_at(
     block: int | None = None,
     *,
     wide_rows: bool = False,
+    native_short_row: bool = False,
 ) -> tuple[int, int]:
     """``(block, atoms_per_row)`` for a fused mesh or ring build, block optional.
 
@@ -540,9 +564,13 @@ def quick_reduce_row_block_at(
     every caller got before the block was tunable.
     """
     if block is None:
-        return quick_reduce_row_block(hidden, world_size, wide_rows=wide_rows)
+        return quick_reduce_row_block(
+            hidden, world_size, wide_rows=wide_rows, native_short_row=native_short_row
+        )
     block = int(block)
-    opts = quick_reduce_row_block_options(hidden, world_size, wide_rows=wide_rows)
+    opts = quick_reduce_row_block_options(
+        hidden, world_size, wide_rows=wide_rows, native_short_row=native_short_row
+    )
     for b, a in opts:
         if b == block:
             return b, a
@@ -561,27 +589,44 @@ def quick_reduce_row_block_for(
     block: int | None = None,
     atoms_per_row: int | None = None,
     wide_rows: bool = False,
+    native_short_row: bool = False,
 ) -> tuple[int, int]:
     """``(block, atoms_per_row)``, pinned by either knob or the widest default."""
     if block is not None and atoms_per_row is not None:
         raise ValueError("pin block or atoms_per_row, not both")
     if atoms_per_row is None:
-        return quick_reduce_row_block_at(hidden, world_size, block, wide_rows=wide_rows)
-    opts = quick_reduce_row_block_options(hidden, world_size, wide_rows=wide_rows)
+        return quick_reduce_row_block_at(
+            hidden,
+            world_size,
+            block,
+            wide_rows=wide_rows,
+            native_short_row=native_short_row,
+        )
+    opts = quick_reduce_row_block_options(
+        hidden, world_size, wide_rows=wide_rows, native_short_row=native_short_row
+    )
     if not opts:
         # Raises, naming why.
-        return quick_reduce_row_block(hidden, world_size, wide_rows=wide_rows)
+        return quick_reduce_row_block(
+            hidden, world_size, wide_rows=wide_rows, native_short_row=native_short_row
+        )
     want = int(atoms_per_row)
     pick = min(opts, key=lambda ba: (abs(ba[1] - want), ba[1]))
     return pick
 
 
 def quick_reduce_hidden_supported(
-    hidden: int, world_size: int, *, wide_rows: bool = False
+    hidden: int,
+    world_size: int,
+    *,
+    wide_rows: bool = False,
+    native_short_row: bool = False,
 ) -> bool:
     """Whether a fused mesh/ring build exists for this width. For host gates."""
     try:
-        quick_reduce_row_block(hidden, world_size, wide_rows=wide_rows)
+        quick_reduce_row_block(
+            hidden, world_size, wide_rows=wide_rows, native_short_row=native_short_row
+        )
     except ValueError:
         return False
     return True

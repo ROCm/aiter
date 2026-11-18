@@ -783,6 +783,7 @@ class FlyQuickAllReduceRMSNorm:
         hiddens: tuple[int, ...] = (),
         link: str | None = None,
         low_latency: bool | None = None,
+        native_row_block: bool = True,
     ):
         check_world_size(world_size)
         link = resolve_link(link)
@@ -829,6 +830,7 @@ class FlyQuickAllReduceRMSNorm:
             raise ValueError("pin block or atoms_per_row, not both")
         self.block = None if block is None else int(block)
         self.atoms_per_row = None if atoms_per_row is None else int(atoms_per_row)
+        self.native_row_block = bool(native_row_block)
         # Widths whose requested ``atoms_per_row`` was substituted, logged once.
         self._apr_substituted: set[int] = set()
         self._algo = algo
@@ -922,7 +924,12 @@ class FlyQuickAllReduceRMSNorm:
     def _native_opts(self, hidden: int) -> tuple[tuple[int, int], ...]:
         """``(block, atoms_per_row)`` this width admits with no padding."""
         opts = quick_reduce_row_block_options(
-            int(hidden), self.world_size, wide_rows=self._wide_rows(hidden)
+            int(hidden),
+            self.world_size,
+            wide_rows=self._wide_rows(hidden),
+            native_short_row=(
+                getattr(self, "native_row_block", True) and self._algo.name == "mesh"
+            ),
         )
         opts = tuple(o for o in opts if self._block_ok(o[0]))
         if self.block is not None:
@@ -980,6 +987,10 @@ class FlyQuickAllReduceRMSNorm:
                     block=self.block,
                     atoms_per_row=want,
                     wide_rows=self._wide_rows(hidden),
+                    native_short_row=(
+                        getattr(self, "native_row_block", True)
+                        and self._algo.name == "mesh"
+                    ),
                 )
             if want is not None and apr != want and hidden not in self._apr_substituted:
                 # The width has no block for the requested atoms_per_row,
@@ -1170,26 +1181,22 @@ class FlyQuickAllReduceRMSNorm:
     # -- selection -----------------------------------------------------------
 
     def _tile_bytes(self, hidden: int) -> int:
-        """HBM bytes one tile spans at hidden dim, building its engines if needed.
+        """HBM bytes one tile spans at hidden dim.
 
         A fused tile is ``rows_per_tile`` token rows of this width.
 
         ``hbm_tile_bytes``, not ``tile_bytes``: on a padded build the wire tile
         is rows of ``h_pad`` while the footprint is rows of ``hidden``, and it
-        is the footprint a tile *count* has to divide. They are equal whenever
-        the build is not padded.
+        is the footprint a tile *count* has to divide. Derived from any already-
+        built entry for *hidden* or pure geometry math so MX-only preload +
+        CUDA-Graph capture never triggers a lazy non-MX build.
         """
-        key = (
-            int(hidden),
-            1,
-            None,
-            True,
-            True,
-            False,
-        )  # ST=1 is always built; see the constructor
-        if key not in self._by_cfg:
-            self._build_hidden(int(hidden))
-        return self._by_cfg[key][1]["hbm_tile_bytes"]
+        hidden = int(hidden)
+        for key, (_, spec) in self._by_cfg.items():
+            if key[0] == hidden:
+                return spec["hbm_tile_bytes"]
+        _block, atoms_per_row, _h_pad = self._geom_for(hidden)
+        return (ATOMS // atoms_per_row) * hidden * 2
 
     def _pick_cfg(
         self,
@@ -1239,9 +1246,10 @@ class FlyQuickAllReduceRMSNorm:
             "inp": inp,
             "residual_in": residual_in,
             "weight": weight,
-            "out": out,
             "residual_out": residual_out,
         }
+        if out is not None:
+            tensors["out"] = out
         for name, t in tensors.items():
             if not isinstance(t, torch.Tensor):
                 raise TypeError(
@@ -1269,13 +1277,20 @@ class FlyQuickAllReduceRMSNorm:
             raise ValueError(
                 f"residual_in shape {tuple(residual_in.shape)} != inp {tuple(inp.shape)}"
             )
-        if tuple(out.shape) != tuple(inp.shape) or tuple(residual_out.shape) != tuple(
-            inp.shape
+        if tuple(residual_out.shape) != tuple(inp.shape) or (
+            out is not None and tuple(out.shape) != tuple(inp.shape)
         ):
             raise ValueError("out/residual_out must have the input's shape")
         if not self.supports_hidden(hidden):
             quick_reduce_row_block_at(
-                hidden, self.world_size, self.block, wide_rows=self._wide_rows(hidden)
+                hidden,
+                self.world_size,
+                self.block,
+                wide_rows=self._wide_rows(hidden),
+                native_short_row=(
+                    getattr(self, "native_row_block", True)
+                    and self._algo.name == "mesh"
+                ),
             )
         live_bytes = int(inp.numel()) * 2
         if live_bytes > 0xFFFFFFFF:
@@ -1291,7 +1306,28 @@ class FlyQuickAllReduceRMSNorm:
             residual_out.shape
         ) != tuple(residual_in.shape):
             raise ValueError("an in-place residual must have residual_in's shape")
-        check_fused_aliasing(inp, residual_in, out, residual_out, live_bytes)
+        if out is not None:
+            check_fused_aliasing(inp, residual_in, out, residual_out, live_bytes)
+        else:
+            r0 = int(residual_out.data_ptr())
+            r1 = r0 + live_bytes
+            i0 = int(inp.data_ptr())
+            if max(r0, i0) < min(r1, i0 + live_bytes):
+                raise ValueError("residual_out overlaps inp")
+            ri0 = int(residual_in.data_ptr())
+            if r0 != ri0 and max(r0, ri0) < min(r1, ri0 + live_bytes):
+                raise ValueError(
+                    "residual_out overlaps residual_in; only residual_out aliasing "
+                    "residual_in exactly is allowed"
+                )
+        w0 = int(weight.data_ptr())
+        w1 = w0 + hidden * 2
+        for wname, wt in (("out", out), ("residual_out", residual_out)):
+            if wt is None:
+                continue
+            p0 = int(wt.data_ptr())
+            if max(p0, w0) < min(p0 + live_bytes, w1):
+                raise ValueError(f"{wname} overlaps weight")
         return hidden, live_bytes
 
     @staticmethod
@@ -1386,12 +1422,13 @@ class FlyQuickAllReduceRMSNorm:
         quant_dtype: str | None = None,
         scale_shuffle: bool = True,
         return_norm_bf16: bool = True,
+        cfg_key=None,
     ):
         live_bytes = int(inp.numel()) * 2
         num_tiles = max(1, -(-live_bytes // self._tile_bytes(hidden)))
         qdt = quant_dtype if mxfp4 is not None else None
-        eng, spec = self._by_cfg[
-            self._pick_cfg(
+        if cfg_key is None:
+            cfg_key = self._pick_cfg(
                 hidden,
                 live_bytes,
                 num_tiles,
@@ -1399,9 +1436,13 @@ class FlyQuickAllReduceRMSNorm:
                 scale_shuffle=scale_shuffle,
                 return_norm_bf16=return_norm_bf16,
             )
-        ]
-        ptrs = tuple(
-            int(t.data_ptr()) for t in (inp, out, residual_in, residual_out, weight)
+        eng, spec = self._by_cfg[cfg_key]
+        ptrs = (
+            int(inp.data_ptr()),
+            0 if out is None else int(out.data_ptr()),
+            int(residual_in.data_ptr()),
+            int(residual_out.data_ptr()),
+            int(weight.data_ptr()),
         )
         args = self._launch_args(
             eng,
@@ -1427,20 +1468,27 @@ class FlyQuickAllReduceRMSNorm:
         *,
         quant_dtype: str = "fp4",
         scale_shuffle: bool = True,
+        inp=None,
+        residual_in=None,
+        weight=None,
+        out=None,
+        residual_out=None,
     ):
         """Validate MX output buffers (packed fp4x2/fp8 + shuffled or plain e8m0)."""
         if not self.supports_mxfp4:
             raise RuntimeError(f"fused MX quantization needs gfx950, not {self.arch}")
         rows = live_bytes // (hidden * 2)
-        q_bytes = live_bytes // 4 if quant_dtype == "fp4" else live_bytes // 2
+        q_shape = (rows, hidden // 2) if quant_dtype == "fp4" else (rows, hidden)
+        q_bytes = math.prod(q_shape)
         sc_shape = (
             mxfp4_scale_shape(rows, hidden)
             if scale_shuffle
             else mx_plain_scale_shape(rows, hidden)
         )
-        for name, t, nbytes in (
-            ("out_q", out_q, q_bytes),
-            ("out_scale", out_scale, math.prod(sc_shape)),
+        sc_bytes = math.prod(sc_shape)
+        for name, t, shape_2d, nbytes in (
+            ("out_q", out_q, q_shape, q_bytes),
+            ("out_scale", out_scale, sc_shape, sc_bytes),
         ):
             if not isinstance(t, torch.Tensor):
                 raise TypeError(
@@ -1450,8 +1498,45 @@ class FlyQuickAllReduceRMSNorm:
                 raise ValueError(f"{name} must be a 1-byte tensor")
             if not t.is_cuda or t.device.index != self._device_index:
                 raise ValueError(f"{name} must be on cuda:{self._device_index}")
-            if not t.is_contiguous() or t.numel() != nbytes:
-                raise ValueError(f"{name} must be contiguous with {nbytes} bytes")
+            if not t.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+            if int(t.data_ptr()) % 16 != 0:
+                raise ValueError(f"{name} must be 16-byte aligned")
+            if t.ndim == 2:
+                if tuple(t.shape) != shape_2d:
+                    raise ValueError(
+                        f"{name} shape {tuple(t.shape)} != expected {shape_2d}"
+                    )
+            elif t.ndim == 1:
+                if t.numel() != nbytes:
+                    raise ValueError(
+                        f"{name} must have {nbytes} bytes, got {t.numel()}"
+                    )
+            else:
+                raise ValueError(
+                    f"{name} must be 1D ({nbytes} B) or 2D {shape_2d}, got ndim={t.ndim}"
+                )
+
+        q0, q1 = int(out_q.data_ptr()), int(out_q.data_ptr()) + q_bytes
+        s0, s1 = int(out_scale.data_ptr()), int(out_scale.data_ptr()) + sc_bytes
+        if max(q0, s0) < min(q1, s1):
+            raise ValueError("out_q and out_scale overlap")
+        peers = [
+            ("inp", inp, live_bytes),
+            ("residual_in", residual_in, live_bytes),
+            ("residual_out", residual_out, live_bytes),
+            ("weight", weight, hidden * 2),
+        ]
+        if out is not None:
+            peers.append(("out", out, live_bytes))
+        for pname, pt, pbytes in peers:
+            if pt is None:
+                continue
+            p0, p1 = int(pt.data_ptr()), int(pt.data_ptr()) + pbytes
+            if max(q0, p0) < min(q1, p1):
+                raise ValueError(f"out_q overlaps {pname}")
+            if max(s0, p0) < min(s1, p1):
+                raise ValueError(f"out_scale overlaps {pname}")
 
     def allreduce_rmsnorm(
         self,
@@ -1575,20 +1660,25 @@ class FlyQuickAllReduceRMSNorm:
         scale_shuffle: bool = True,
         return_norm_bf16: bool = True,
     ):
-        if out is None:
-            out = torch.empty_like(inp)
         if residual_out is None:
             residual_out = torch.empty_like(residual_in)
         hidden, live_bytes = self._check(inp, residual_in, weight, out, residual_out)
-        if mxfp4 is not None:
-            self._check_mxfp4(
-                *mxfp4,
-                hidden,
-                live_bytes,
-                quant_dtype=quant_dtype,
-                scale_shuffle=scale_shuffle,
-            )
         if live_bytes == 0:
+            if out is None and return_norm_bf16:
+                out = torch.empty_like(inp)
+            if mxfp4 is not None:
+                self._check_mxfp4(
+                    *mxfp4,
+                    hidden,
+                    live_bytes,
+                    quant_dtype=quant_dtype,
+                    scale_shuffle=scale_shuffle,
+                    inp=inp,
+                    residual_in=residual_in,
+                    weight=weight,
+                    out=out,
+                    residual_out=residual_out,
+                )
             return out, residual_out
         if not self.is_beneficial(live_bytes):
             raise ValueError(
@@ -1596,6 +1686,33 @@ class FlyQuickAllReduceRMSNorm:
                 f"the {self.min_bytes} B floor: at decode sizes this kernel "
                 "charges real SQNR for microseconds that are not the "
                 "bottleneck. Route small messages to OneShotAllReduceRMSNorm."
+            )
+        num_tiles = max(1, -(-live_bytes // self._tile_bytes(hidden)))
+        qdt = quant_dtype if mxfp4 is not None else None
+        cfg_key = self._pick_cfg(
+            hidden,
+            live_bytes,
+            num_tiles,
+            quant_dtype=qdt,
+            scale_shuffle=scale_shuffle,
+            return_norm_bf16=return_norm_bf16,
+        )
+        if out is None and (
+            return_norm_bf16 or (self._algo.name == "mesh" and cfg_key[1] > 1)
+        ):
+            out = torch.empty_like(inp)
+        if mxfp4 is not None:
+            self._check_mxfp4(
+                *mxfp4,
+                hidden,
+                live_bytes,
+                quant_dtype=quant_dtype,
+                scale_shuffle=scale_shuffle,
+                inp=inp,
+                residual_in=residual_in,
+                weight=weight,
+                out=out,
+                residual_out=residual_out,
             )
         self._launch(
             inp,
@@ -1611,6 +1728,7 @@ class FlyQuickAllReduceRMSNorm:
             quant_dtype=quant_dtype,
             scale_shuffle=scale_shuffle,
             return_norm_bf16=return_norm_bf16,
+            cfg_key=cfg_key,
         )
         return out, residual_out
 

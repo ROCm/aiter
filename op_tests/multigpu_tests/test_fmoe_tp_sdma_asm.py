@@ -23,7 +23,9 @@ EPI_K3 = (
     ("rmsnorm_only", True),
     *EPI_ADD,
     ("rmsnorm_only_fp8", False),
+    ("rmsnorm_only_fp8", True),
     ("add_rmsnorm_fp8", False),
+    ("add_rmsnorm_fp8", True),
 )
 EPI_RAW = (("raw_bf16", False), *EPI_ADD, ("add_rmsnorm_fp4", False))
 SHAPES = (
@@ -303,6 +305,9 @@ def _worker(rank: int, tp: int, init_m: str, full: bool) -> None:
             finally:
                 ctx.close()
                 sync()
+            if sname == "q38":
+                _check_s4_disjoint_slots(gloo, dev, 64, D, k, E, I)
+                sync()
     finally:
         dist.destroy_process_group()
     assert sys.modules["flydsl"] is None
@@ -311,11 +316,11 @@ def _worker(rank: int, tp: int, init_m: str, full: bool) -> None:
 def test_zero_flydsl_import() -> None:
     c1 = (
         "import sys; sys.modules['flydsl']=None; "
-        "from aiter.ops.asm import EPI_MODES, TpMoeCall, TpMoeOut, quantize_moe_input, tp_moe_layer_asm; "
+        "from aiter.ops.asm import EPI_MODES, TpAsmArenaLease, TpMoeCall, TpMoeOut, quantize_moe_input, tp_moe_layer_asm; "
     )
     c2 = (
         "from aiter.ops.asm.fmoe_tp_sdma import load_fmoe_tp_sdma_registry as r; "
-        "assert len(EPI_MODES)==7 and len(r())==96"
+        "assert len(EPI_MODES)==7 and len(r())==108"
     )
     env = {**os.environ, "PYTHONPATH": f"{_REPO_ROOT}:{os.getenv('PYTHONPATH', '')}"}
     subprocess.run([sys.executable, "-c", f"{c1}{c2}"], check=True, env=env)
@@ -382,6 +387,189 @@ def test_gate0_host_bounds_and_policies() -> None:
         pytest.raises(ValueError, match="32-bit MUBUF limit"),
     ):
         mod.TpAsmContext(None, 0, 131072, 8192, 10, 64, 256)
+
+    # P8 window trim: q38 uses 3 windows summing to 8192 (not 9216)
+    assert (
+        sum(
+            max(w)
+            for w in zip(*((w[0], w[1], sum(w[2:])) for w in mod._WIN_CFGS[8192]))
+        )
+        == 8192
+    )
+
+
+def test_hardened_v2_validation_and_manifest(tmp_path) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import aiter.ops.asm.fmoe_tp_sdma as mod
+    from aiter import dtypes
+    from aiter.ops.asm import TpMoeCall, tp_moe_layer_asm
+
+    # 1. Manifest layout_version mismatch & missing .co refusal
+    mod.load_fmoe_tp_sdma_registry.cache_clear()
+    d_v1 = tmp_path / "v1"
+    d_v1.mkdir()
+    (d_v1 / "fmoe_tp_sdma.csv").write_text(
+        "world,model_dim,inter_dim,topk,tile_m,a_dtype,act,epi_mode,gemma,layout_version,sha256,knl_name,co_name\n"
+        "2,8192,256,10,64,fp4,silu,add_rmsnorm,0,1,deadbeef,k,missing.co\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="layout_version=1"):
+        mod.load_fmoe_tp_sdma_registry(str(d_v1))
+
+    mod.load_fmoe_tp_sdma_registry.cache_clear()
+    d_miss = tmp_path / "missing"
+    d_miss.mkdir()
+    (d_miss / "fmoe_tp_sdma.csv").write_text(
+        "world,model_dim,inter_dim,topk,tile_m,a_dtype,act,epi_mode,gemma,layout_version,sha256,knl_name,co_name\n"
+        "2,8192,256,10,64,fp4,silu,add_rmsnorm,0,2,deadbeef,k,missing.co\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(FileNotFoundError, match="missing.co"):
+        mod.load_fmoe_tp_sdma_registry(str(d_miss))
+    mod.load_fmoe_tp_sdma_registry.cache_clear()
+
+    # 2. Safe reset_epoch: refuses reset_ipc_flags=False; zeroes ipc_ptr[:_FLAG_B] when True
+    memsets = []
+    fake_hip = SimpleNamespace(
+        hipMemset=lambda vp, val, sz: (memsets.append((vp.value, val, sz)), 0)[1]
+    )
+    ctx_fake = mod.TpAsmContext.__new__(mod.TpAsmContext)
+    ctx_fake._closed = False
+    ctx_fake._pkey = ("fake",)
+    ctx_fake.device = torch.device("cpu")
+    ctx_fake.device_idx = 0
+    ctx_fake.group = None
+    ctx_fake.slot_id = 0
+    ctx_fake.model_dim, ctx_fake.topk, ctx_fake.inter_dim, ctx_fake.num_experts = (
+        8192,
+        10,
+        256,
+        64,
+    )
+    ctx_fake.max_tokens = 16
+    ctx_fake._st = SimpleNamespace(
+        ipc_ptr=0x10000,
+        ctrl=torch.ones(16, dtype=torch.int32),
+        err=torch.ones(4, dtype=torch.int32),
+        epoch=torch.tensor([9], dtype=torch.int32),
+        refcount=1,
+        sdma_open=False,
+        queues=[],
+        opened=[],
+        quiet=0,
+        send_ptr=0,
+    )
+    with pytest.raises(ValueError, match="reset_ipc_flags=True"):
+        ctx_fake.reset_epoch(0, reset_ipc_flags=False)
+    with (
+        patch.object(mod, "_hip_ext", return_value=fake_hip),
+        patch.object(mod.torch.cuda, "synchronize", return_value=None),
+    ):
+        ctx_fake.reset_epoch(0)
+    assert memsets == [(0x10000, 0, mod._FLAG_B)]
+    assert int(ctx_fake._st.ctrl.sum().item()) == 0
+    assert int(ctx_fake._st.err.sum().item()) == 0
+    assert int(ctx_fake._st.epoch.item()) == 0
+
+    # 3. Caller validation: bad topk_ids shape, bad out dtype, overlapping out/out_scale
+    t, d, k, e, i = 4, 8192, 10, 64, 256
+    x = torch.empty((t, d), dtype=dtypes.bf16)
+    ids_ok = torch.zeros((t, k), dtype=torch.int32)
+    ids_bad = torch.zeros((t - 1, k), dtype=torch.int32)
+    wts = torch.ones((t, k), dtype=torch.float32)
+    w1 = torch.empty((e, 2 * i, d // 2), dtype=torch.uint8)
+    w2 = torch.empty((e, d, i // 2), dtype=torch.uint8)
+    w1s = torch.empty((e, 2 * i, d // 32), dtype=torch.uint8)
+    w2s = torch.empty((e, d, i // 32), dtype=torch.uint8)
+    nw = torch.ones((d,), dtype=dtypes.bf16)
+
+    with pytest.raises(ValueError, match="topk_ids must be contiguous"):
+        tp_moe_layer_asm(
+            TpMoeCall(x, ids_bad, wts, w1, w2, w1s, w2s, norm_weight=nw),
+            ctx_fake,
+            "raw_bf16",
+        )
+    out_u8 = torch.empty((t, d), dtype=torch.uint8)
+    with pytest.raises(ValueError, match="invalid bf16 out"):
+        tp_moe_layer_asm(
+            TpMoeCall(x, ids_ok, wts, w1, w2, w1s, w2s, norm_weight=nw),
+            ctx_fake,
+            "raw_bf16",
+            out=out_u8,
+        )
+    backing = torch.empty((t, d // 2), dtype=torch.uint8)
+    out_fp4 = backing.view(dtypes.fp4x2)
+    sc_overlap = (
+        backing.view(-1)[: t * (d // 32)].view(t, d // 32).view(dtypes.fp8_e8m0)
+    )
+    with pytest.raises(ValueError, match="must not overlap"):
+        tp_moe_layer_asm(
+            TpMoeCall(x, ids_ok, wts, w1, w2, w1s, w2s, residual=x, norm_weight=nw),
+            ctx_fake,
+            "add_rmsnorm_fp4",
+            out=out_fp4,
+            out_scale=sc_overlap,
+        )
+
+    # 4. Use-after-close refusal
+    ctx_fake._closed = True
+    with pytest.raises(RuntimeError, match="closed"):
+        tp_moe_layer_asm(
+            TpMoeCall(x, ids_ok, wts, w1, w2, w1s, w2s), ctx_fake, "raw_bf16"
+        )
+    with pytest.raises(RuntimeError, match="closed"):
+        ctx_fake.check_error()
+    with pytest.raises(RuntimeError, match="closed"):
+        ctx_fake.acquire_arena(1)
+
+
+def _check_s4_disjoint_slots(gloo, dev, T, D, k, E, I) -> None:
+    from aiter.ops.asm import TpAsmContext
+
+    ctx0 = TpAsmContext(gloo, dev, T, D, k, E, I, slot_id=0)
+    try:
+        with ctx0.acquire_arena(1) as ctx1:
+            assert ctx0.slot_id == 0 and ctx1.slot_id == 1
+            ptrs0 = [
+                ctx0.ipc_ptr,
+                ctx0.send_ptr,
+                ctx0.ctrl.data_ptr(),
+                ctx0.epoch.data_ptr(),
+                ctx0.err.data_ptr(),
+                ctx0.hq.data_ptr(),
+                ctx0.hss.data_ptr(),
+                ctx0.s_ids.data_ptr(),
+                ctx0.s_exp.data_ptr(),
+                ctx0.s_w.data_ptr(),
+                ctx0.n_val.data_ptr(),
+                ctx0.handles.data_ptr(),
+                *(t.data_ptr() for t in ctx0.p8_wins),
+                *(t.data_ptr() for t in ctx0.s8_wins),
+                *((ctx0.sort_ws.data_ptr(),) if ctx0.sort_ws.numel() else ()),
+            ]
+            ptrs1 = [
+                ctx1.ipc_ptr,
+                ctx1.send_ptr,
+                ctx1.ctrl.data_ptr(),
+                ctx1.epoch.data_ptr(),
+                ctx1.err.data_ptr(),
+                ctx1.hq.data_ptr(),
+                ctx1.hss.data_ptr(),
+                ctx1.s_ids.data_ptr(),
+                ctx1.s_exp.data_ptr(),
+                ctx1.s_w.data_ptr(),
+                ctx1.n_val.data_ptr(),
+                ctx1.handles.data_ptr(),
+                *(t.data_ptr() for t in ctx1.p8_wins),
+                *(t.data_ptr() for t in ctx1.s8_wins),
+                *((ctx1.sort_ws.data_ptr(),) if ctx1.sort_ws.numel() else ()),
+            ]
+            assert all(ptrs0) and all(ptrs1)
+            assert set(ptrs0).isdisjoint(set(ptrs1))
+    finally:
+        ctx0.close()
 
 
 @pytest.mark.parametrize(("tp", "full"), [(2, True), (4, False)])

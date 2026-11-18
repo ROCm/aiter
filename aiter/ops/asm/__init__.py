@@ -3,6 +3,7 @@
 
 from .fmoe_tp_sdma import (
     EPI_MODES,
+    TpAsmArenaLease,
     TpAsmContext,
     TpMoeCall,
     TpMoeOut,
@@ -13,6 +14,7 @@ from .fmoe_tp_sdma import (
 
 __all__ = [
     "EPI_MODES",
+    "TpAsmArenaLease",
     "TpAsmContext",
     "TpMoeCall",
     "TpMoeOut",

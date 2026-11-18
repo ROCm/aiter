@@ -573,7 +573,9 @@ def test_accuracy_is_block_invariant(codec_name):
 # above is derived from.
 
 
-@pytest.mark.parametrize("block", (64, 128, 256, 384, 512, 640, 896, MAX_BLOCK))
+@pytest.mark.parametrize(
+    "block", (64, 128, 256, 320, 384, 448, 512, 640, 896, MAX_BLOCK)
+)
 def test_codec_regions_stay_on_the_sector_grid(block):
     """Every rank-tile is a whole number of 64 B fabric sectors at every legal
     width. A fractional one would have the fanout address past its end."""
@@ -607,7 +609,7 @@ def test_default_block_reproduces_the_shipped_geometry():
     assert t is CODECS, "the module table must be the cached default-width one"
 
 
-@pytest.mark.parametrize("block", (0, 96, 192, 320, MAX_BLOCK + 128))
+@pytest.mark.parametrize("block", (0, 96, 192, 576, MAX_BLOCK + 128))
 def test_illegal_block_widths_raise(block):
     """Off-grid or out-of-range widths are rejected at build time rather than
     producing a kernel that addresses past a rank-tile."""

@@ -3167,6 +3167,376 @@ def test_quick_allreduce_rmsnorm_first_call_in_capture(tp):
     }
 
 
+def _mx_preload_capture_rank(rank: int, tp: int, init_method: str) -> dict:
+    """Fresh FlyQuickAllReduceRMSNorm: preload ONLY FP8 MX, then capture + replay."""
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl.quick_allreduce import FlyQuickAllReduceRMSNorm
+
+    dev = torch.device("cuda", rank)
+    torch.cuda.set_device(dev)
+    dist.init_process_group(
+        backend="gloo", init_method=init_method, world_size=tp, rank=rank
+    )
+    group = dist.group.WORLD
+    d, t_cnt = 3584, 512
+    eps = 1e-6
+    qr = FlyQuickAllReduceRMSNorm(
+        group=group,
+        device=dev,
+        rank=rank,
+        world_size=tp,
+        algorithm="mesh",
+        hiddens=(),
+        native_row_block=True,
+    )
+    try:
+        qr.preload(
+            d,
+            quant_dtype="fp8",
+            scale_shuffle=False,
+            return_norm_bf16=False,
+        )
+        non_mx_present = (d, 1, None, True, True, False) in qr._by_cfg
+        gen = torch.Generator(device=dev).manual_seed(700 + 17 * rank)
+        inp = torch.randn(t_cnt, d, generator=gen, device=dev, dtype=dtypes.bf16) * 0.5
+        gen_s = torch.Generator(device=dev).manual_seed(777)
+        res = (
+            torch.randn(t_cnt, d, generator=gen_s, device=dev, dtype=dtypes.bf16) * 0.5
+        )
+        nw = 0.2 * torch.randn(d, generator=gen_s, device=dev, dtype=dtypes.bf16) + 1.0
+        out_q = torch.empty((t_cnt, d), dtype=dtypes.fp8, device=dev)
+        out_s = torch.empty((t_cnt, d // 32), dtype=dtypes.fp8_e8m0, device=dev)
+        res_out = torch.empty((t_cnt, d), dtype=dtypes.bf16, device=dev)
+
+        # Validation checks (bad 2D shape, unaligned, overlapping).
+        val_errs = []
+        for what, fn in (
+            (
+                "bad_q_shape",
+                lambda: qr.allreduce_rmsnorm_mx(
+                    inp,
+                    res,
+                    nw,
+                    eps,
+                    torch.empty((t_cnt // 2, d * 2), dtype=dtypes.fp8, device=dev),
+                    out_s,
+                    quant_dtype="fp8",
+                    scale_shuffle=False,
+                    return_norm_bf16=False,
+                ),
+            ),
+            (
+                "unaligned_scale",
+                lambda: qr.allreduce_rmsnorm_mx(
+                    inp,
+                    res,
+                    nw,
+                    eps,
+                    out_q,
+                    torch.empty(t_cnt * (d // 32) + 16, dtype=torch.uint8, device=dev)[
+                        1 : 1 + t_cnt * (d // 32)
+                    ],
+                    quant_dtype="fp8",
+                    scale_shuffle=False,
+                    return_norm_bf16=False,
+                ),
+            ),
+            (
+                "overlap_q_inp",
+                lambda: qr.allreduce_rmsnorm_mx(
+                    inp,
+                    res,
+                    nw,
+                    eps,
+                    inp.view(torch.uint8).reshape(-1)[: t_cnt * d].view(t_cnt, d),
+                    out_s,
+                    quant_dtype="fp8",
+                    scale_shuffle=False,
+                    return_norm_bf16=False,
+                ),
+            ),
+            (
+                "overlap_q_scale",
+                lambda: qr.allreduce_rmsnorm_mx(
+                    inp,
+                    res,
+                    nw,
+                    eps,
+                    out_q,
+                    out_q.view(torch.uint8)
+                    .reshape(-1)[: t_cnt * (d // 32)]
+                    .view(t_cnt, d // 32),
+                    quant_dtype="fp8",
+                    scale_shuffle=False,
+                    return_norm_bf16=False,
+                ),
+            ),
+        ):
+            try:
+                fn()
+                val_errs.append(f"{what}: did not raise ValueError")
+            except ValueError:
+                pass
+
+        # Capture + replay immediately with zero eager warmup.
+        torch.cuda.synchronize(dev)
+        graph = torch.cuda.CUDAGraph()
+        ret_holder = []
+        with torch.cuda.graph(graph):
+            ret_bf16, ret_res = qr.allreduce_rmsnorm_mx(
+                inp,
+                res,
+                nw,
+                eps,
+                out_q,
+                out_s,
+                quant_dtype="fp8",
+                scale_shuffle=False,
+                return_norm_bf16=False,
+                out=None,
+                residual_out=res_out,
+            )
+            ret_holder.append((ret_bf16, ret_res))
+        graph.replay()
+        torch.cuda.synchronize(dev)
+
+        ref_ar = inp.float()
+        dist.all_reduce(ref_ar, op=dist.ReduceOp.SUM, group=group)
+        ref_res = ref_ar.bfloat16().float() + res.float()
+        res_sqnr = _sqnr_db(res_out, ref_res)
+        still_no_non_mx = (d, 1, None, True, True, False) not in qr._by_cfg
+        return {
+            "non_mx_present": non_mx_present,
+            "still_no_non_mx": still_no_non_mx,
+            "ret_bf16_is_none": ret_holder[0][0] is None,
+            "res_sqnr": res_sqnr,
+            "q_finite": bool(torch.isfinite(out_q.float()).all()),
+            "val_errs": val_errs,
+        }
+    finally:
+        qr.close()
+        dist.destroy_process_group()
+
+
+@benchmark()
+def test_quick_allreduce_rmsnorm_mx_preload_capture(tp):
+    """Fresh object with MX-only preload captures and replays without lazy BF16 build."""
+    if ARCH != "gfx950":
+        return {"gfx": ARCH, "skipped": True}
+    ranks = _spawn(_mx_preload_capture_rank, tp)
+    fails = []
+    for rank, r in enumerate(ranks):
+        if r["non_mx_present"] or not r["still_no_non_mx"]:
+            fails.append(f"rank {rank}: lazy non-MX entry was built")
+        if not r["ret_bf16_is_none"]:
+            fails.append(f"rank {rank}: return_norm_bf16=False did not return None")
+        if not r["q_finite"]:
+            fails.append(f"rank {rank}: non-finite out_q")
+        if r["res_sqnr"] < FUSED_SQNR_MIN_DB:
+            fails.append(f"rank {rank}: res_sqnr={r['res_sqnr']:.2f} dB")
+        fails.extend(f"rank {rank}: {e}" for e in r["val_errs"])
+    _check(f"tp={tp} mx preload capture", fails)
+    return {
+        "gfx": ARCH,
+        "min_res_sqnr_db": min(r["res_sqnr"] for r in ranks),
+    }
+
+
+def _native_short_d_rank(rank: int, tp: int, init_method: str) -> dict:
+    """Correctness & cross-rank bitwise equality for native 320/448-thread mesh."""
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl.kernels.comm.quick_allreduce_fusions import (
+        mx_plain_scale_shape,
+        mxfp4_scale_shape,
+    )
+    from aiter.ops.flydsl.quick_allreduce import FlyQuickAllReduceRMSNorm
+
+    dev = torch.device("cuda", rank)
+    torch.cuda.set_device(dev)
+    dist.init_process_group(
+        backend="gloo", init_method=init_method, world_size=tp, rank=rank
+    )
+    group = dist.group.WORLD
+    eps = 1e-6
+    qr = FlyQuickAllReduceRMSNorm(
+        group=group,
+        device=dev,
+        rank=rank,
+        world_size=tp,
+        algorithm="mesh",
+        native_row_block=True,
+    )
+    fails = []
+    tested = 0
+    try:
+        for d, exp_block in ((2560, 320), (3584, 448)):
+            if qr.pads_hidden(d) != d or qr._geom_for(d)[0] != exp_block:
+                fails.append(f"D={d}: geom={qr._geom_for(d)}, want block={exp_block}")
+                continue
+            for t_cnt in (512, 1021, 4096):
+                for gemma in (False, True):
+                    gen = torch.Generator(device=dev).manual_seed(
+                        1000 + 31 * rank + d + t_cnt
+                    )
+                    inp = (
+                        torch.randn(
+                            t_cnt, d, generator=gen, device=dev, dtype=dtypes.bf16
+                        )
+                        * 0.5
+                    )
+                    gen_s = torch.Generator(device=dev).manual_seed(555 + d + t_cnt)
+                    res = (
+                        torch.randn(
+                            t_cnt, d, generator=gen_s, device=dev, dtype=dtypes.bf16
+                        )
+                        * 0.5
+                    )
+                    nw = (
+                        0.2
+                        * torch.randn(d, generator=gen_s, device=dev, dtype=dtypes.bf16)
+                    ) + (0.0 if gemma else 1.0)
+                    ref_ar = inp.float()
+                    dist.all_reduce(ref_ar, op=dist.ReduceOp.SUM, group=group)
+                    ref_res = ref_ar.bfloat16().float() + res.float()
+                    sc_w = nw.float() + (1.0 if gemma else 0.0)
+                    ref_norm = (
+                        ref_res
+                        * torch.rsqrt(ref_res.pow(2).mean(-1, keepdim=True) + eps)
+                        * sc_w
+                    )
+
+                    # BF16 mode
+                    out_bf16 = torch.empty((t_cnt, d), dtype=dtypes.bf16, device=dev)
+                    res_out = torch.empty((t_cnt, d), dtype=dtypes.bf16, device=dev)
+                    qr.allreduce_rmsnorm(
+                        inp,
+                        res,
+                        nw,
+                        eps,
+                        out=out_bf16,
+                        residual_out=res_out,
+                        gemma_norm=gemma,
+                    )
+                    torch.cuda.synchronize(dev)
+                    tested += 1
+                    if _sqnr_db(out_bf16, ref_norm) < FUSED_SQNR_MIN_DB:
+                        fails.append(f"D={d} T={t_cnt} gemma={gemma} bf16 sqnr low")
+                    for bname, buf in (("out", out_bf16), ("res", res_out)):
+                        peers = [torch.empty_like(buf) for _ in range(tp)]
+                        dist.all_gather(peers, buf, group=group)
+                        if not all(torch.equal(buf, p) for p in peers):
+                            fails.append(
+                                f"D={d} T={t_cnt} gemma={gemma} bf16 {bname} rank mismatch"
+                            )
+
+                    # MX modes (fp4/fp8 x plain/shuffled x return_bf16 True/False)
+                    if ARCH == "gfx950":
+                        for qdt in ("fp4", "fp8"):
+                            for shuf in (False, True):
+                                for ret_bf16 in (True, False):
+                                    q_cols = d // 2 if qdt == "fp4" else d
+                                    q_dt = dtypes.fp4x2 if qdt == "fp4" else dtypes.fp8
+                                    sc_shape = (
+                                        mxfp4_scale_shape(t_cnt, d)
+                                        if shuf
+                                        else mx_plain_scale_shape(t_cnt, d)
+                                    )
+                                    out_q = torch.empty(
+                                        (t_cnt, q_cols), dtype=q_dt, device=dev
+                                    )
+                                    out_s = torch.empty(
+                                        sc_shape, dtype=dtypes.fp8_e8m0, device=dev
+                                    )
+                                    out_b = (
+                                        torch.empty(
+                                            (t_cnt, d), dtype=dtypes.bf16, device=dev
+                                        )
+                                        if ret_bf16
+                                        else None
+                                    )
+                                    res_o = torch.empty(
+                                        (t_cnt, d), dtype=dtypes.bf16, device=dev
+                                    )
+                                    rb, rr = qr.allreduce_rmsnorm_mx(
+                                        inp,
+                                        res,
+                                        nw,
+                                        eps,
+                                        out_q,
+                                        out_s,
+                                        quant_dtype=qdt,
+                                        scale_shuffle=shuf,
+                                        return_norm_bf16=ret_bf16,
+                                        out=out_b,
+                                        residual_out=res_o,
+                                        gemma_norm=gemma,
+                                    )
+                                    torch.cuda.synchronize(dev)
+                                    tested += 1
+                                    if ret_bf16 and rb is not out_b:
+                                        fails.append(
+                                            f"D={d} T={t_cnt} {qdt} rb mismatch"
+                                        )
+                                    if not ret_bf16 and rb is not None:
+                                        fails.append(
+                                            f"D={d} T={t_cnt} {qdt} rb not None"
+                                        )
+                                    if qdt == "fp8" and not bool(
+                                        torch.isfinite(out_q.float()).all()
+                                    ):
+                                        fails.append(
+                                            f"D={d} T={t_cnt} {qdt} non-finite q"
+                                        )
+                                    if _sqnr_db(rr, ref_res) < FUSED_SQNR_MIN_DB:
+                                        fails.append(
+                                            f"D={d} T={t_cnt} {qdt} res sqnr low"
+                                        )
+                                    if (
+                                        ret_bf16
+                                        and _sqnr_db(out_b, ref_norm)
+                                        < FUSED_SQNR_MIN_DB
+                                    ):
+                                        fails.append(
+                                            f"D={d} T={t_cnt} {qdt} bf16 sqnr low"
+                                        )
+                                    for bname, buf in (("q", out_q), ("res", res_o)):
+                                        bi = buf.contiguous().view(torch.uint8)
+                                        peers = [
+                                            torch.empty_like(bi) for _ in range(tp)
+                                        ]
+                                        dist.all_gather(peers, bi, group=group)
+                                        if not all(torch.equal(bi, p) for p in peers):
+                                            fails.append(
+                                                f"D={d} T={t_cnt} {qdt} shuf={shuf} {bname} rank mismatch"
+                                            )
+                                    # For plain scales (no uninitialized padding rows), check bitwise equality too.
+                                    if not shuf:
+                                        bi = out_s.contiguous().view(torch.uint8)
+                                        peers = [
+                                            torch.empty_like(bi) for _ in range(tp)
+                                        ]
+                                        dist.all_gather(peers, bi, group=group)
+                                        if not all(torch.equal(bi, p) for p in peers):
+                                            fails.append(
+                                                f"D={d} T={t_cnt} {qdt} plain scale rank mismatch"
+                                            )
+        return {"tested": tested, "fails": fails}
+    finally:
+        qr.close()
+        dist.destroy_process_group()
+
+
+@benchmark()
+def test_quick_allreduce_rmsnorm_native_short_d(tp):
+    """Native 320/448-thread unpadded mesh for D=2560 and D=3584."""
+    ranks = _spawn(_native_short_d_rank, tp)
+    fails = [f"rank {rank}: {e}" for rank, r in enumerate(ranks) for e in r["fails"]]
+    _check(f"tp={tp} native short D", fails)
+    return {"gfx": ARCH, "cases_per_rank": ranks[0]["tested"]}
+
+
 def _expect_raises(what: str, pattern: str, fn) -> list[str]:
     try:
         fn()
@@ -3221,6 +3591,7 @@ def _bare_fused_engine(algorithm: str, tp: int, **knobs):
     eng.rs_codec, _ag = _resolve_codecs(algo, tp, None, None)
     eng.block = knobs.get("block")
     eng.atoms_per_row = knobs.get("atoms_per_row")
+    eng.native_row_block = knobs.get("native_row_block", True)
     eng._apr_substituted = set()
     eng._pins = {"low_latency": True} if knobs.get("low_latency") else {}
     return eng
@@ -3516,6 +3887,36 @@ def _host_fused_one_shot_block_options() -> list[str]:
     return fails
 
 
+def _host_native_short_row_blocks() -> list[str]:
+    """Native 320/448-thread mesh geometry for D=2560/3584, plus MX validation."""
+    fails = []
+    for world_size in SUPPORTED_WORLDS:
+        for hidden, exp_block in ((2560, 320), (3584, 448)):
+            eng_nat = _bare_fused_engine("mesh", world_size, native_row_block=True)
+            got_nat = eng_nat._geom_for(hidden)
+            if got_nat != (exp_block, 1, hidden):
+                fails.append(
+                    f"mesh native tp={world_size} D={hidden}: {got_nat}, "
+                    f"want ({exp_block}, 1, {hidden})"
+                )
+            eng_pad = _bare_fused_engine("mesh", world_size, native_row_block=False)
+            got_pad = eng_pad._geom_for(hidden)
+            exp_h_pad = 3072 if hidden == 2560 else 4096
+            if got_pad[2] != exp_h_pad:
+                fails.append(
+                    f"mesh padded tp={world_size} D={hidden}: {got_pad}, "
+                    f"want h_pad={exp_h_pad}"
+                )
+            eng_ring = _bare_fused_engine("ring", world_size, native_row_block=True)
+            got_ring = eng_ring._geom_for(hidden)
+            if got_ring[2] != exp_h_pad:
+                fails.append(
+                    f"ring tp={world_size} D={hidden}: {got_ring}, "
+                    f"want h_pad={exp_h_pad}"
+                )
+    return fails
+
+
 _HOST_CHECKS = {
     "rejects_unsupported_hidden": _host_rejects_unsupported_hidden,
     "supported_hiddens": _host_supported_hiddens,
@@ -3525,6 +3926,7 @@ _HOST_CHECKS = {
     "mesh_fanout_quad_budget": _host_mesh_fanout_quad_budget_gates_narrow_blocks,
     "row_block_is_first_option": _host_row_block_is_first_option,
     "fused_one_shot_block_options": _host_fused_one_shot_block_options,
+    "native_short_row_blocks": _host_native_short_row_blocks,
 }
 
 
@@ -4014,6 +4416,15 @@ def _verify_fused(tps, algos, extended: bool) -> None:
         "flydsl quick allreduce rmsnorm first call in capture",
         [test_quick_allreduce_rmsnorm_first_call_in_capture(tp) for tp in tps],
     )
+    if mesh:
+        _summarize(
+            "flydsl quick allreduce rmsnorm mx preload capture",
+            [test_quick_allreduce_rmsnorm_mx_preload_capture(tp) for tp in tps],
+        )
+        _summarize(
+            "flydsl quick allreduce rmsnorm native short D (320/448)",
+            [test_quick_allreduce_rmsnorm_native_short_d(tp) for tp in tps],
+        )
     _summarize(
         "flydsl quick allreduce rmsnorm host-side geometry checks",
         [test_quick_allreduce_host_checks(check) for check in _HOST_CHECKS],

@@ -96,7 +96,11 @@ class _QuickReduceRMSNorm:
         # An explicit block picks among the widths this hidden dim admits; None
         # keeps the widest.
         self.block, self.atoms_per_row = quick_reduce_row_block_at(
-            self.h_pad, world_size, block, wide_rows=self.wide_rows
+            self.h_pad,
+            world_size,
+            block,
+            wide_rows=self.wide_rows,
+            native_short_row=self.wide_rows,
         )
         self.padded = self.h_pad != hidden
         self.rank_atoms = ATOMS // world_size
