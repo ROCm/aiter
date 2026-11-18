@@ -1369,8 +1369,9 @@ class Gfx1250Traits:
     plan_free: bool = False
     # MXFP4 partials: plan slots a CTA may run (2: adjacent tiles fuse).
     fuse_tasks: int = 1
-    # With fuse_tasks 2, CTAs resident at once (two per CU): a CTA runs two
-    # slots only when the plan's live tasks need more CTAs than this.
+    # With fuse_tasks 2, CTAs of this size resident at once
+    # (mxfp4_gfx1250_resident_ctas): a CTA runs two slots only when the
+    # plan's live tasks need more CTAs than this.
     resident_ctas: int = 0
 
     WAVE = 32

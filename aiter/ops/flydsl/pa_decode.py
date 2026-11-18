@@ -28,6 +28,7 @@ from .kernels.pa_decode_kernel import (
     compile_pa_decode_tile,
     gfx1250_tile_traits,
     mxfp4_gfx1250_query_splits,
+    mxfp4_gfx1250_resident_ctas,
 )
 from .kernels.pa_decode_plan import PADecodePlan
 
@@ -405,7 +406,8 @@ def _pa_decode_mxfp4(
     # resident (15 per 16 CUs). Larger bounds split their tiles over the
     # cluster. Every query split is a cluster of its own, so both bounds count
     # the splits (G16 x MTP4 at B32 x 8k would launch 1024 cluster CTAs, two
-    # rounds at two a CU: 16.4 us against 14.4 us with the reducer).
+    # rounds at two a CU: 16.4 us against 14.4 us with the reducer), and MTP
+    # clusters of 3 and 4 M-tile CTAs, one a CU, stay within the CUs.
     #
     # Single-token decode merges on chip only where that costs no
     # parallelism: one tile a cluster CTA, or clusters that fill the CUs.
@@ -414,8 +416,13 @@ def _pa_decode_mxfp4(
     # 6.6 us). MTP tasks cost more, so they merge on chip whenever the
     # clusters fit (G16 x MTP4 at B3 x 8k: 7.4 against 7.1 us).
     splits = mxfp4_gfx1250_query_splits(query_length, group) if gfx1250 else 1
+    rows = query_length * group // splits
+    resident_ctas = mxfp4_gfx1250_resident_ctas(rows, num_compute_units)
     partitions = 1 if direct else min(work_plan.max_partitions, capacity, seq_tiles)
     cluster_size = min(partitions, CLUSTER_PARTITIONS)
+    cluster_ctas = max(capacity, -(-2 * num_compute_units // num_kv_heads))
+    if rows > 32:
+        cluster_ctas = -(-resident_ctas // num_kv_heads)
     cluster_merge = (
         cluster_size
         if gfx1250
@@ -426,25 +433,24 @@ def _pa_decode_mxfp4(
             or partitions <= CLUSTER_PARTITIONS
             or num_seqs * num_kv_heads * cluster_size >= num_compute_units
         )
-        and num_seqs * cluster_size * splits
-        <= max(capacity, -(-2 * num_compute_units // num_kv_heads))
+        and num_seqs * cluster_size * splits <= cluster_ctas
         and num_seqs * num_kv_heads * splits <= num_compute_units * 15 // 16
         else 0
     )
-    # A gfx1250 MTP CTA keeping several M-tiles fits two to a CU. When the
-    # plan's tasks times the KV heads and query splits exceed that, a CTA runs
-    # two plan slots, so a sequence's adjacent tiles fuse into one longer task
-    # (G16 x MTP4 at the default budget: B8 x 32k 14.5 -> 13.0 us, B32 x 8k
-    # 15.2 -> 13.8 us). The kernel decides from the plan's live tasks; the
-    # tiles the bound and window allow only decide whether it may.
+    # A gfx1250 MTP CTA keeping several M-tiles fits two to a CU, or one with
+    # 3 or 4 M-tiles. When the plan's tasks times the KV heads and query
+    # splits exceed the resident CTAs, a CTA runs two plan slots, so a
+    # sequence's adjacent tiles fuse into one longer task. The kernel decides
+    # from the plan's live tasks; the tiles the bound and window allow only
+    # decide whether it may.
     max_tasks = min(capacity, num_seqs * seq_tiles)
     fuse_tasks = (
         2
         if gfx1250
         and not direct
         and not cluster_merge
-        and query_length * group // splits > 16
-        and max_tasks * num_kv_heads * splits > 2 * num_compute_units
+        and rows > 16
+        and max_tasks * num_kv_heads * splits > resident_ctas
         else 1
     )
     with torch.cuda.device(dev):
@@ -698,7 +704,9 @@ def pa_decode(
     128, at most 16 query heads per KV head. gfx950 takes ``query_length`` 1 and no
     sliding window; gfx1250 also takes MTP query lengths and sliding windows, with
     at most 64 query rows (query positions / query splits times GQA heads) a CTA:
-    it splits the positions so that a CTA keeps at most 32 rows by default.
+    by default the positions split by 1, 2 or 4 so that a CTA keeps at most 32
+    rows, or else by the largest of those dividing ``query_length`` (MTP3 x G16
+    keeps 48 rows, MTP5 x G12 60; MTP5 x G16 is refused).
     Refused: other block sizes, head dims and output dtypes, and sinks
     (``mask_unowned_kv`` has no effect: tokens past the context are always masked).
     Scale bytes 0 and 255 are not supported in valid rows. V is widened to bf16,

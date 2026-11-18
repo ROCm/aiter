@@ -146,6 +146,13 @@ def mxfp4_gfx1250_query_splits(query_length, query_group_size):
     )
 
 
+def mxfp4_gfx1250_resident_ctas(rows, num_compute_units):
+    """gfx1250 MXFP4 CTAs of ``rows`` query rows resident at once: two a CU up to
+    MXFP4_GFX1250_ROWS rows (2 M-tiles, at most 441 VGPRs), one above (3 and 4
+    M-tiles take 579 and 710 VGPRs)."""
+    return num_compute_units * (2 if rows <= MXFP4_GFX1250_ROWS else 1)
+
+
 # Key by selected specialization, not batch/head/CU scheduling inputs.
 _PA_DECODE_TILE_CACHE = {}
 _GFX1250_PA_DECODE_CACHE = {}
@@ -907,7 +914,13 @@ def gfx1250_tile_traits(
         store_output=store_output,
         plan_free=plan_free,
         fuse_tasks=fuse_tasks,
-        resident_ctas=2 * num_compute_units if fuse_tasks > 1 else 0,
+        resident_ctas=(
+            mxfp4_gfx1250_resident_ctas(
+                query_length * query_group_size // query_splits, num_compute_units
+            )
+            if fuse_tasks > 1
+            else 0
+        ),
     )
 
 
@@ -1245,292 +1258,281 @@ def compile_gfx1250_pa_decode(t):
                 gpu.barrier()
             if pair_fuse:
                 empty_partial(pair + 1)
-        else:
-            task_slot = fx.Int32(gpu.block_id("x"))
-            if const_expr(t.cluster_merge):
-                # Cluster s runs sequence s's tasks on its leading CTAs. Their
-                # tiles follow from the context length and task count exactly as
-                # plan_pa_decode splits them: ``work`` holds the context lengths,
-                # read alongside reduce_info instead of after it.
-                seq, part = task_slot // t.cluster_merge, task_slot % t.cluster_merge
-                # The last cluster pads the grid past the batch; with quant_output,
-                # whole clusters past it write padded FP8 rows (below).
-                pad_grid = t.cluster_seqs > 1 or t.quant_output
+            # The fused grid runs only plan slots, never the paths below.
+            return
+
+        task_slot = fx.Int32(gpu.block_id("x"))
+        if const_expr(t.cluster_merge):
+            # Cluster s runs sequence s's tasks on its leading CTAs. Their
+            # tiles follow from the context length and task count exactly as
+            # plan_pa_decode splits them: ``work`` holds the context lengths,
+            # read alongside reduce_info instead of after it.
+            seq, part = task_slot // t.cluster_merge, task_slot % t.cluster_merge
+            # The last cluster pads the grid past the batch; with quant_output,
+            # whole clusters past it write padded FP8 rows (below).
+            pad_grid = t.cluster_seqs > 1 or t.quant_output
+            if const_expr(pad_grid):
+                present = seq < sequences
+                seq = present.select(seq, fx.Int32(0))
+            task_context = fx.Int32(fx.recast_iter(fx.Int32, work)[seq])
+            step_bounds = None
+            if const_expr(t.cluster_steps):
+                # Block tables hold at most CLUSTER_PARTITIONS steps, so CTA p
+                # takes steps [p chunk, (p + 1) chunk). Its first page ids
+                # depend on no load, so they load with the context length
+                # rather than after it: the wave's pages, then token 0's for
+                # masked tail slices. The plan's tasks are not read.
+                chunk = CLUSTER_PARTITIONS // t.cluster_merge
+                first_step = part * chunk
+                wave_pages = t.TOKENS // t.block_size // t.NWARP
+                tbl = fx.recast_iter(fx.Int32, table)
+                row = seq * max_blocks
+                page = (
+                    first_step * (t.TOKENS // t.block_size)
+                    + fx.Int32(fx.rocdl.wave_id()) * wave_pages
+                )
+                # Only the active branch reads the ids, and the compiler would
+                # sink their loads into it, after the length's wait; the
+                # readfirstlanes are convergent, so they keep the loads here.
+                stage_pages = [
+                    fx.Int32(
+                        fx.rocdl.readfirstlane(
+                            T.i32, tbl[row + fx.min(page + j, max_blocks - 1)]
+                        )
+                    )
+                    for j in range_constexpr(wave_pages)
+                ] + [fx.Int32(fx.rocdl.readfirstlane(T.i32, tbl[row]))]
+                # The scheduler would still place the loads after the wait.
+                fx.rocdl.sched_barrier(0)
+                length = fx.max(task_context, fx.Int32(0))
+                steps = (length + t.TOKENS - 1) // t.TOKENS
+                count = fx.min((steps + chunk - 1) // chunk, fx.Int32(t.cluster_merge))
                 if const_expr(pad_grid):
-                    present = seq < sequences
-                    seq = present.select(seq, fx.Int32(0))
-                task_context = fx.Int32(fx.recast_iter(fx.Int32, work)[seq])
-                step_bounds = None
-                if const_expr(t.cluster_steps):
-                    # Block tables hold at most CLUSTER_PARTITIONS steps, so CTA p
-                    # takes steps [p chunk, (p + 1) chunk). Its first page ids
-                    # depend on no load, so they load with the context length
-                    # rather than after it: the wave's pages, then token 0's for
-                    # masked tail slices. The plan's tasks are not read.
-                    chunk = CLUSTER_PARTITIONS // t.cluster_merge
-                    first_step = part * chunk
-                    wave_pages = t.TOKENS // t.block_size // t.NWARP
-                    tbl = fx.recast_iter(fx.Int32, table)
-                    row = seq * max_blocks
-                    page = (
-                        first_step * (t.TOKENS // t.block_size)
-                        + fx.Int32(fx.rocdl.wave_id()) * wave_pages
-                    )
-                    # Only the active branch reads the ids, and the compiler would
-                    # sink their loads into it, after the length's wait; the
-                    # readfirstlanes are convergent, so they keep the loads here.
-                    stage_pages = [
-                        fx.Int32(
-                            fx.rocdl.readfirstlane(
-                                T.i32, tbl[row + fx.min(page + j, max_blocks - 1)]
-                            )
+                    count = present.select(count, fx.Int32(0))
+                first = seq * t.cluster_merge
+                task_slot = first + part
+                step_bounds = (first_step * t.TOKENS, (first_step + chunk) * t.TOKENS)
+                task_seq = seq
+                task_begin = step_bounds[0] // KV_COMPUTE_BLOCK
+                task_end = (step_bounds[1] + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
+                active = part < count
+            elif const_expr(t.cluster_runs):
+                # CTA p takes tiles [p run_tiles, (p + 1) run_tiles), a run the
+                # host sizes from the length bound, so its first stage's page
+                # ids load with the context length rather than after it. Only
+                # the active branch reads them, and the compiler would sink
+                # their loads into it; readfirstlane keeps them here.
+                first_tile = part * run_tiles
+                tbl = fx.recast_iter(fx.Int32, table)
+                row = seq * max_blocks
+                page = first_tile * (KV_COMPUTE_BLOCK // t.block_size)
+                stage_pages = [
+                    fx.Int32(
+                        fx.rocdl.readfirstlane(
+                            T.i32, tbl[row + fx.min(page + j, max_blocks - 1)]
                         )
-                        for j in range_constexpr(wave_pages)
-                    ] + [fx.Int32(fx.rocdl.readfirstlane(T.i32, tbl[row]))]
-                    # The scheduler would still place the loads after the wait.
-                    fx.rocdl.sched_barrier(0)
-                    length = fx.max(task_context, fx.Int32(0))
-                    steps = (length + t.TOKENS - 1) // t.TOKENS
-                    count = fx.min(
-                        (steps + chunk - 1) // chunk, fx.Int32(t.cluster_merge)
                     )
-                    if const_expr(pad_grid):
-                        count = present.select(count, fx.Int32(0))
-                    first = seq * t.cluster_merge
-                    task_slot = first + part
-                    step_bounds = (
-                        first_step * t.TOKENS,
-                        (first_step + chunk) * t.TOKENS,
-                    )
-                    task_seq = seq
-                    task_begin = step_bounds[0] // KV_COMPUTE_BLOCK
-                    task_end = (
-                        step_bounds[1] + KV_COMPUTE_BLOCK - 1
-                    ) // KV_COMPUTE_BLOCK
-                    active = part < count
-                elif const_expr(t.cluster_runs):
-                    # CTA p takes tiles [p run_tiles, (p + 1) run_tiles), a run the
-                    # host sizes from the length bound, so its first stage's page
-                    # ids load with the context length rather than after it. Only
-                    # the active branch reads them, and the compiler would sink
-                    # their loads into it; readfirstlane keeps them here.
-                    first_tile = part * run_tiles
-                    tbl = fx.recast_iter(fx.Int32, table)
-                    row = seq * max_blocks
-                    page = first_tile * (KV_COMPUTE_BLOCK // t.block_size)
-                    stage_pages = [
-                        fx.Int32(
-                            fx.rocdl.readfirstlane(
-                                T.i32, tbl[row + fx.min(page + j, max_blocks - 1)]
-                            )
-                        )
-                        # BF16 wave pipelines stage two pages up front.
-                        for j in range_constexpr(max(t.TOKENS // t.block_size, 2))
-                    ] + [fx.Int32(fx.rocdl.readfirstlane(T.i32, tbl[row]))]
-                    # Keep the loads ahead of the length's wait.
-                    fx.rocdl.sched_barrier(0)
-                    length = fx.max(task_context, fx.Int32(0))
-                    tiles = (length + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
-                    count = fx.min(
-                        (tiles + run_tiles - 1) // run_tiles, fx.Int32(t.cluster_merge)
-                    )
-                    first = seq * t.cluster_merge
-                    task_slot = first + part
-                    task_seq = seq
-                    task_begin = first_tile
-                    task_end = fx.min(first_tile + run_tiles, tiles)
-                    active = first_tile < tiles
-                    if const_expr(pad_grid):
-                        count = present.select(count, fx.Int32(0))
-                        active = active & present
-                else:
-                    # Scalar loads return out of order, so a use waits for every
-                    # load issued before it: issue both before either is used.
-                    seq_tasks = fx.ptr_load(
-                        fx.add_offset(fx.recast_iter(fx.Int32, reduce_info), seq * 2),
-                        result_type=fx.Vector.make_type(2, fx.Int32),
-                    )
-                    fx.rocdl.sched_barrier(0)
-                    # A sequence with more tasks than the cluster has CTAs splits its
-                    # tiles over the cluster, in its first task slots.
-                    first = fx.Int32(seq_tasks[0])
-                    count = fx.min(fx.Int32(seq_tasks[1]), fx.Int32(t.cluster_merge))
-                    if const_expr(pad_grid):
-                        count = present.select(count, fx.Int32(0))
-                    task_slot = (part < count).select(first + part, fx.Int32(0))
-                    # Tiles of an int32 length, times at most 16 parts, fit Int32.
-                    length = fx.max(task_context, fx.Int32(0))
-                    first_tile = fx.Int32(0)
-                    if const_expr(t.sliding_window > 0):
-                        window = min(t.query_length - 1 + t.sliding_window, 2**31 - 1)
-                        first_tile = (
-                            fx.max(length - window, fx.Int32(0)) // KV_COMPUTE_BLOCK
-                        )
-                    tiles = (
-                        length // KV_COMPUTE_BLOCK
-                        + fx.Int32(length % KV_COMPUTE_BLOCK != 0)
-                        - first_tile
-                    )
-                    parts = fx.max(count, fx.Int32(1))
-                    task_seq = seq
-                    task_begin = first_tile + part * tiles // parts
-                    task_end = first_tile + (part + 1) * tiles // parts
-                    active = part < count
+                    # BF16 wave pipelines stage two pages up front.
+                    for j in range_constexpr(max(t.TOKENS // t.block_size, 2))
+                ] + [fx.Int32(fx.rocdl.readfirstlane(T.i32, tbl[row]))]
+                # Keep the loads ahead of the length's wait.
+                fx.rocdl.sched_barrier(0)
+                length = fx.max(task_context, fx.Int32(0))
+                tiles = (length + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
+                count = fx.min(
+                    (tiles + run_tiles - 1) // run_tiles, fx.Int32(t.cluster_merge)
+                )
+                first = seq * t.cluster_merge
+                task_slot = first + part
+                task_seq = seq
+                task_begin = first_tile
+                task_end = fx.min(first_tile + run_tiles, tiles)
+                active = first_tile < tiles
+                if const_expr(pad_grid):
+                    count = present.select(count, fx.Int32(0))
+                    active = active & present
             else:
-                if const_expr(t.direct_output):
-                    # One task per nonempty sequence; reduce_info supplies its slot.
-                    # Later sequences start first: sparse prefill rows grow with
-                    # their position, so the longest tasks no longer form a tail.
-                    task_slot = sequences - 1 - task_slot
-                    if const_expr(t.quant_output):
-                        # CTAs past the sequences write padded FP8 rows (below);
-                        # they read sequence 0's entry and run no task.
-                        task_slot = fx.max(task_slot, fx.Int32(0))
-                    direct_seq = task_slot
-                    info = fx.recast_iter(fx.Int32, pmax)
-                    count = fx.Int32(info[task_slot * 2 + 1])
-                    if const_expr(t.quant_output):
-                        count = (fx.Int32(gpu.block_id("x")) < sequences).select(
-                            count, fx.Int32(0)
-                        )
-                    # A trailing empty sequence's start can equal capacity. Its dummy
-                    # task read must stay in bounds even though no compute consumes it.
-                    task_slot = (count > 0).select(
-                        fx.Int32(info[task_slot * 2]), fx.Int32(0)
+                # Scalar loads return out of order, so a use waits for every
+                # load issued before it: issue both before either is used.
+                seq_tasks = fx.ptr_load(
+                    fx.add_offset(fx.recast_iter(fx.Int32, reduce_info), seq * 2),
+                    result_type=fx.Vector.make_type(2, fx.Int32),
+                )
+                fx.rocdl.sched_barrier(0)
+                # A sequence with more tasks than the cluster has CTAs splits its
+                # tiles over the cluster, in its first task slots.
+                first = fx.Int32(seq_tasks[0])
+                count = fx.min(fx.Int32(seq_tasks[1]), fx.Int32(t.cluster_merge))
+                if const_expr(pad_grid):
+                    count = present.select(count, fx.Int32(0))
+                task_slot = (part < count).select(first + part, fx.Int32(0))
+                # Tiles of an int32 length, times at most 16 parts, fit Int32.
+                length = fx.max(task_context, fx.Int32(0))
+                first_tile = fx.Int32(0)
+                if const_expr(t.sliding_window > 0):
+                    window = min(t.query_length - 1 + t.sliding_window, 2**31 - 1)
+                    first_tile = (
+                        fx.max(length - window, fx.Int32(0)) // KV_COMPUTE_BLOCK
                     )
-                if const_expr(t.plan_free):
-                    # CTA s runs sequence s: the tiles its query positions can see.
-                    task_context = fx.Int32(fx.recast_iter(fx.Int32, work)[task_slot])
-                    task_seq, task_begin = task_slot, fx.Int32(0)
-                    if const_expr(t.sliding_window > 0):
-                        first_visible = (
-                            task_context - t.query_length + 1 - t.sliding_window
-                        )
-                        task_begin = (first_visible > 0).select(
-                            first_visible // KV_COMPUTE_BLOCK, fx.Int32(0)
-                        )
-                    task_end = (
-                        task_context + (KV_COMPUTE_BLOCK - 1)
-                    ) // KV_COMPUTE_BLOCK
+                tiles = (
+                    length // KV_COMPUTE_BLOCK
+                    + fx.Int32(length % KV_COMPUTE_BLOCK != 0)
+                    - first_tile
+                )
+                parts = fx.max(count, fx.Int32(1))
+                task_seq = seq
+                task_begin = first_tile + part * tiles // parts
+                task_end = first_tile + (part + 1) * tiles // parts
+                active = part < count
+        else:
+            if const_expr(t.direct_output):
+                # One task per nonempty sequence; reduce_info supplies its slot.
+                # Later sequences start first: sparse prefill rows grow with
+                # their position, so the longest tasks no longer form a tail.
+                task_slot = sequences - 1 - task_slot
+                if const_expr(t.quant_output):
+                    # CTAs past the sequences write padded FP8 rows (below);
+                    # they read sequence 0's entry and run no task.
+                    task_slot = fx.max(task_slot, fx.Int32(0))
+                direct_seq = task_slot
+                info = fx.recast_iter(fx.Int32, pmax)
+                count = fx.Int32(info[task_slot * 2 + 1])
+                if const_expr(t.quant_output):
+                    count = (fx.Int32(gpu.block_id("x")) < sequences).select(
+                        count, fx.Int32(0)
+                    )
+                # A trailing empty sequence's start can equal capacity. Its dummy
+                # task read must stay in bounds even though no compute consumes it.
+                task_slot = (count > 0).select(
+                    fx.Int32(info[task_slot * 2]), fx.Int32(0)
+                )
+            if const_expr(t.plan_free):
+                # CTA s runs sequence s: the tiles its query positions can see.
+                task_context = fx.Int32(fx.recast_iter(fx.Int32, work)[task_slot])
+                task_seq, task_begin = task_slot, fx.Int32(0)
+                if const_expr(t.sliding_window > 0):
+                    first_visible = task_context - t.query_length + 1 - t.sliding_window
+                    task_begin = (first_visible > 0).select(
+                        first_visible // KV_COMPUTE_BLOCK, fx.Int32(0)
+                    )
+                task_end = (task_context + (KV_COMPUTE_BLOCK - 1)) // KV_COMPUTE_BLOCK
+            else:
+                task = fx.ptr_load(
+                    fx.add_offset(fx.recast_iter(fx.Int32, work), task_slot * 4),
+                    result_type=fx.Vector.make_type(4, fx.Int32),
+                )
+                task_seq, task_begin = fx.Int32(task[0]), fx.Int32(task[1])
+                task_end, task_context = fx.Int32(task[2]), fx.Int32(task[3])
+            active = task_begin < task_end
+            if const_expr(t.direct_output):
+                active = count > 0
+        if active:
+            ctx = PaDecodeContext(
+                t,
+                SharedStorage,
+                pmax,
+                psum,
+                pout,
+                query,
+                key,
+                value,
+                table,
+                ks,
+                vs,
+                max_blocks,
+                sk_block,
+                sk_head,
+                sq_row,
+                sq_head,
+                sequences,
+                task_seq,
+                task_begin,
+                task_end,
+                task_context,
+            )
+            # Packed partials are [KV heads, capacity, rows] by task slot.
+            ctx.task_slot, ctx.capacity = task_slot, capacity
+            ctx.n_kv = kv_heads
+            ctx.quant = quant
+            if const_expr(t.merge_partitions):
+                # Issued early: only the epilogue reads the sequence's tasks.
+                tasks = fx.ptr_load(
+                    fx.add_offset(fx.recast_iter(fx.Int32, reduce_info), task_seq * 2),
+                    result_type=fx.Vector.make_type(2, fx.Int32),
+                )
+                ctx.first_task = fx.Int32(tasks[0])
+                ctx.task_count = fx.Int32(tasks[1])
+                ctx.output_ptr = output
+                ctx.counters_ptr = counters
+            if const_expr(t.cluster_merge):
+                ctx.task_count = count
+                ctx.output_ptr = output
+                ctx.step_bounds = step_bounds
+                if const_expr(t.cluster_steps or t.cluster_runs):
+                    ctx.stage_pages = stage_pages
+            if const_expr(t.plan_free):
+                ctx.output_ptr = output
+            if const_expr(t.mxfp4):
+                Gfx1250Mxfp4Pipeline(ctx).run()
+            elif const_expr(t.bf16_wave_query_tiles):
+                Gfx1250Bf16WavePipeline(ctx).run()
+            elif const_expr(t.bf16_page128_packed):
+                Gfx1250Bf16Pipeline(ctx).run()
+            elif const_expr(t.wave_query_tiles):
+                Gfx1250WavePipeline(ctx).run()
+            else:
+                Gfx1250Pipeline(ctx).run()
+        elif const_expr(t.direct_output):
+            if const_expr(t.quant_output):
+                block = fx.Int32(gpu.block_id("x"))
+                if block < sequences:
+                    zero_output(direct_seq, pout)
                 else:
-                    task = fx.ptr_load(
-                        fx.add_offset(fx.recast_iter(fx.Int32, work), task_slot * 4),
-                        result_type=fx.Vector.make_type(4, fx.Int32),
-                    )
-                    task_seq, task_begin = fx.Int32(task[0]), fx.Int32(task[1])
-                    task_end, task_context = fx.Int32(task[2]), fx.Int32(task[3])
-                active = task_begin < task_end
-                if const_expr(t.direct_output):
-                    active = count > 0
-            if active:
-                ctx = PaDecodeContext(
+                    pad_output(block - sequences)
+            else:
+                zero_output(direct_seq, pout)
+        elif const_expr(t.plan_free):
+            zero_output(task_slot, output)
+        if const_expr(t.merge_partitions):
+            # Empty sequences own no task. Capacity >= batch gives each one the
+            # CTA at its index, which clears its rows.
+            info = fx.recast_iter(fx.Int32, reduce_info)
+            if task_slot < sequences:  # noqa: SIM102
+                if fx.Int32(info[task_slot * 2 + 1]) == 0:
+                    zero_output(task_slot, output)
+        if const_expr(t.cluster_merge and t.cluster_seqs > 1):
+            # Sequences sharing a cluster need not agree on their task counts:
+            # every CTA reaches the barrier, and only split sequences merge.
+            Gfx1250ClusterMerge(t, pmax, psum, pout, output, sq_row, sq_head).sync()
+            if count > 1:
+                Gfx1250ClusterMerge(t, pmax, psum, pout, output, sq_row, sq_head).merge(
+                    seq, part, first, count, capacity
+                )
+            elif (count == 0) & (part == 0) & present:
+                zero_output(seq, output)
+        elif const_expr(t.cluster_merge):
+            # Every CTA of a cluster reaches its barrier exactly once.
+            if count > 1:
+                merge = Gfx1250ClusterMerge(
                     t,
-                    SharedStorage,
                     pmax,
                     psum,
                     pout,
-                    query,
-                    key,
-                    value,
-                    table,
-                    ks,
-                    vs,
-                    max_blocks,
-                    sk_block,
-                    sk_head,
+                    output,
                     sq_row,
                     sq_head,
-                    sequences,
-                    task_seq,
-                    task_begin,
-                    task_end,
-                    task_context,
+                    quant if t.quant_output else None,
                 )
-                # Packed partials are [KV heads, capacity, rows] by task slot.
-                ctx.task_slot, ctx.capacity = task_slot, capacity
-                ctx.n_kv = kv_heads
-                ctx.quant = quant
-                if const_expr(t.merge_partitions):
-                    # Issued early: only the epilogue reads the sequence's tasks.
-                    tasks = fx.ptr_load(
-                        fx.add_offset(
-                            fx.recast_iter(fx.Int32, reduce_info), task_seq * 2
-                        ),
-                        result_type=fx.Vector.make_type(2, fx.Int32),
-                    )
-                    ctx.first_task = fx.Int32(tasks[0])
-                    ctx.task_count = fx.Int32(tasks[1])
-                    ctx.output_ptr = output
-                    ctx.counters_ptr = counters
-                if const_expr(t.cluster_merge):
-                    ctx.task_count = count
-                    ctx.output_ptr = output
-                    ctx.step_bounds = step_bounds
-                    if const_expr(t.cluster_steps or t.cluster_runs):
-                        ctx.stage_pages = stage_pages
-                if const_expr(t.plan_free):
-                    ctx.output_ptr = output
-                if const_expr(t.mxfp4):
-                    Gfx1250Mxfp4Pipeline(ctx).run()
-                elif const_expr(t.bf16_wave_query_tiles):
-                    Gfx1250Bf16WavePipeline(ctx).run()
-                elif const_expr(t.bf16_page128_packed):
-                    Gfx1250Bf16Pipeline(ctx).run()
-                elif const_expr(t.wave_query_tiles):
-                    Gfx1250WavePipeline(ctx).run()
-                else:
-                    Gfx1250Pipeline(ctx).run()
-            elif const_expr(t.direct_output):
-                if const_expr(t.quant_output):
-                    block = fx.Int32(gpu.block_id("x"))
-                    if block < sequences:
-                        zero_output(direct_seq, pout)
-                    else:
-                        pad_output(block - sequences)
-                else:
-                    zero_output(direct_seq, pout)
-            elif const_expr(t.plan_free):
-                zero_output(task_slot, output)
-            if const_expr(t.merge_partitions):
-                # Empty sequences own no task. Capacity >= batch gives each one the
-                # CTA at its index, which clears its rows.
-                info = fx.recast_iter(fx.Int32, reduce_info)
-                if task_slot < sequences:  # noqa: SIM102
-                    if fx.Int32(info[task_slot * 2 + 1]) == 0:
-                        zero_output(task_slot, output)
-            if const_expr(t.cluster_merge and t.cluster_seqs > 1):
-                # Sequences sharing a cluster need not agree on their task counts:
-                # every CTA reaches the barrier, and only split sequences merge.
-                Gfx1250ClusterMerge(t, pmax, psum, pout, output, sq_row, sq_head).sync()
-                if count > 1:
-                    Gfx1250ClusterMerge(
-                        t, pmax, psum, pout, output, sq_row, sq_head
-                    ).merge(seq, part, first, count, capacity)
-                elif (count == 0) & (part == 0) & present:
-                    zero_output(seq, output)
-            elif const_expr(t.cluster_merge):
-                # Every CTA of a cluster reaches its barrier exactly once.
-                if count > 1:
-                    merge = Gfx1250ClusterMerge(
-                        t,
-                        pmax,
-                        psum,
-                        pout,
-                        output,
-                        sq_row,
-                        sq_head,
-                        quant if t.quant_output else None,
-                    )
-                    merge.run(seq, part, first, count, capacity)
-                elif const_expr(t.quant_output):
-                    pad_row = fx.Int32(gpu.block_id("x")) - sequences * t.cluster_merge
-                    if pad_row >= 0:
-                        if pad_row < quant_rows - sequences * t.query_length:
-                            pad_output(pad_row)
-                    elif (count == 0) & (part == 0):
-                        zero_output(seq, output)
+                merge.run(seq, part, first, count, capacity)
+            elif const_expr(t.quant_output):
+                pad_row = fx.Int32(gpu.block_id("x")) - sequences * t.cluster_merge
+                if pad_row >= 0:
+                    if pad_row < quant_rows - sequences * t.query_length:
+                        pad_output(pad_row)
                 elif (count == 0) & (part == 0):
                     zero_output(seq, output)
+            elif (count == 0) & (part == 0):
+                zero_output(seq, output)
 
     @flyc.jit
     def launch(

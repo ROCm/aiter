@@ -1677,7 +1677,17 @@ _MXFP4_GFX1250_CASES = [
                 "lengths": (0, 1, query_length, 255, 256, 257, 1027),
             },
         )
-        for query_length, group in ((2, 16), (3, 16), (4, 16), (4, 8), (3, 4), (4, 1))
+        # MTP5 x G8 / G12: one split of 40 / 60 rows, the last M-tile part-filled.
+        for query_length, group in (
+            (2, 16),
+            (3, 16),
+            (4, 16),
+            (4, 8),
+            (3, 4),
+            (4, 1),
+            (5, 8),
+            (5, 12),
+        )
     ],
     *[
         (
@@ -2677,6 +2687,41 @@ def _poison_unowned(cache, scale, owned, fill):
         scale.view(scale.shape[:3])[rows] = {"zero": 0.0, "nan": float("nan")}.get(
             fill, float("inf")
         )
+
+
+def test_pa_decode_mxfp4_is_per_token_kv(monkeypatch):
+    """MXFP4 KV is per-token KV: each cache row carries its own e8m0 scales.
+
+    Selection only, so no kernel compiles and any GPU will do. The gfx950
+    schedule keys MXFP4 as per-token, while its kernel traits keep the f32
+    per-token scale tensors and LDS buffers off (the scales come with the
+    rows); that keeps the gfx950 MXFP4 kernels unchanged. The gfx1250 tile
+    selection drops the flag alike, so either value selects one kernel.
+    """
+    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
+    kernel = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode_kernel")
+    shape = {
+        "head_dim": 128,
+        "query_group_size": 16,
+        "block_size": 128,
+        "num_seqs": 1,
+        "num_kv_heads": 1,
+        "num_compute_units": 256,
+        "work_capacity": 1,
+        "query_dtype": torch.bfloat16,
+        "kv_dtype": dtypes.fp4x2,
+        "max_context_length": 2048,
+    }
+    monkeypatch.setattr(traits, "get_rocm_arch", lambda: "gfx950")
+    for per_token_kv in (False, True):
+        schedule = traits.PaDecodeSchedule.select(**shape, per_token_kv=per_token_kv)
+        assert schedule.cache_key.per_token_kv
+        assert not traits.PaDecodeTraits.create(schedule).per_token_kv
+    selected = [
+        kernel.gfx1250_tile_traits(**shape, per_token_kv=per_token_kv)
+        for per_token_kv in (False, True)
+    ]
+    assert selected[0] == selected[1] and not selected[0].per_token_kv
 
 
 @pytest.mark.parametrize("fill", ["nan", "inf"])
