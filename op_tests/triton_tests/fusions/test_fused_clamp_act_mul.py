@@ -723,3 +723,26 @@ def test_fused_clamp_act_mul_row_counts_share_one_compile(backend):
     )
     assert run.returncode == 0, run.stderr[-2000:]
     assert run.stdout.split()[-1] == "1", run.stdout
+
+
+@pytest.mark.parametrize("M", [8])
+@pytest.mark.parametrize("n_half", [32, 64])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_fused_clamp_act_mul_quant_group_wider_than_tile_raises(M, n_half, backend):
+    """A quant group wider than the compute tile (n_half <= quant_block_size / 2)
+    must raise a clean AssertionError on both backends rather than reach the
+    kernel with NUM_QUANT_BLOCKS = BLOCK_SIZE_N // QUANT_BLOCK_SIZE == 0. The
+    Triton path, whose tile is exactly next_power_of_2(n_half), lost this guard
+    when the whole-group requirement was relaxed; the Gluon path always had it."""
+    _check_backend(backend)
+    torch.manual_seed(n_half + M)
+    inp = torch.randn(M, 2 * n_half, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="must be a multiple of"):
+        fused_clamp_act_mul(
+            inp,
+            swiglu_limit=0.0,
+            activation="silu",
+            dtype_quant=aiter.dtypes.fp8,
+            quant_block_size=128,
+            backend=backend,
+        )
