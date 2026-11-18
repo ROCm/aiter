@@ -605,20 +605,22 @@ def _attn_fwd(
     GRP_SZ: gl.constexpr = NUM_Q_HEADS // NUM_K_HEADS
     off_k_head = off_q_head // GRP_SZ
 
+    NUM_WARPS: gl.constexpr = gl.num_warps()
     HAS_PE: gl.constexpr = BLOCK_DMODEL_PE > 0
+    # The subtiled loop races with 8 warps, so 8 warps use the plain loop.
     SUBTILED: gl.constexpr = (
         not (IS_FP8 or ENABLE_DROPOUT or RETURN_SCORES or HAS_PE)
         and SLIDING_WINDOW == 0
         and alibi_slopes_ptr is None
         and BLOCK_N >= 32
         and BLOCK_DMODEL_POW2 >= 32
+        and NUM_WARPS <= 4
     )
 
     # Non-pow2 head dim: Q is zero-masked at the load, K/V are zero-filled by
     # the TDM descriptor bound, and the O store drops the trailing columns.
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
 
-    NUM_WARPS: gl.constexpr = gl.num_warps()
     WARP_SIZE: gl.constexpr = 32  # gfx1250 is wave32
     gl.static_assert(
         BLOCK_M // 16 >= NUM_WARPS, "BLOCK_M must give each warp >=1 WMMA M-tile"
@@ -828,7 +830,7 @@ def _attn_fwd(
                     + cu_seqlens_q_start * stride_lse_m
                     + offs_m * stride_lse_m
                 )
-                lse_mask = offs_m < SEQLEN_Q
+                lse_mask = offs_m < seqlen_q
                 lse = gl.full([BLOCK_M], 0.0, gl.float32, gl.SliceLayout(1, PV_LAYOUT))
                 gl.store(softmax_lse_ptr + offs_lse, lse, mask=lse_mask)
 
