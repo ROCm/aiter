@@ -465,8 +465,10 @@ def _strict_allclose_default():
     turned 13 of 17 shards red, and 79% of what it raised was in files whose own
     accuracy criterion had already passed.
 
-    The runner invokes each test as ``python3 op_tests/test_x.py``, so argv[0]
-    names the file under test without having to inspect the stack.
+    The file under test comes from ``AITER_TEST_FILE``, which the CI runner
+    exports for each file, because under ``python3 -m pytest`` or torchrun
+    argv[0] is not the test file. Without it (a test run by hand as
+    ``python3 op_tests/test_x.py``), argv[0] is used.
 
     Read at call time rather than import time so a single test can set it.
     """
@@ -475,7 +477,7 @@ def _strict_allclose_default():
         return False
     if value == "1":
         return True
-    current = os.path.basename(sys.argv[0])
+    current = os.path.basename(os.environ.get("AITER_TEST_FILE") or sys.argv[0])
     return any(
         current == os.path.basename(name.strip())
         for name in value.split(",")
