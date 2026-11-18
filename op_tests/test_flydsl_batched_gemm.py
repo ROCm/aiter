@@ -20,6 +20,10 @@ plus gfx1250's 1x32 (n32k4-shuffled) weight scale. gfx950 also runs 1x32 /
 opus untuned. A K that 128 does not divide runs only on 1x32 / 32x32 (a ragged
 last k-tile); DeepSeek-V4.1's shared-expert down projection has K = 576 at TP4.
 
+On gfx1250 this file also checks the mxfp8_32 GEMM's fused quant epilogue:
+``y_scale_out`` must be byte-identical to quantize_fp8 of the unfused bf16
+output. gfx1250-strict runs that check and the compute kernelName cases alone.
+
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
 in the cosine gate. 1x32 gets its own weight and reference, whose magnitudes
@@ -39,13 +43,16 @@ Run:
 import argparse
 import functools
 import itertools
+import sys
 
 import pandas as pd
+import pytest
 import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.build_targets import base_gfx_arch
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale_bpreshuffle
 from aiter.ops.flydsl.batched_gemm_a8w8 import run_bmm_a8w8_mxfp8
 from aiter.ops.flydsl.batched_gemm_mxfp4 import (
@@ -71,6 +78,51 @@ A8W8_BLOCKS = {
 A8W8_1X32_GFX = ["gfx1250"]
 # Archs whose a8w8 32x32 GEMM runs a ragged last k-tile (K not a multiple of 128).
 RAGGED_K_GFX = ["gfx1250"]
+# Archs whose a8w8 mxfp8_32 batched GEMM also runs the compute kernel.
+COMPUTE_GFX = ["gfx1250", "gfx1250-strict"]
+# (b, m, n, k, kernelName): ragged M, persistent N tiles with and without the
+# four-buffer C relocation, a three-wide cluster, and a cluster_n = 1 config that
+# falls back to a one-workgroup cluster at a prime M-tile count.
+COMPUTE_CASES = (
+    (
+        8,
+        333,
+        1024,
+        4096,
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn2_ps2",
+    ),
+    (
+        3,
+        777,
+        2048,
+        2048,
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t128x256x128_mw2_nw2_nb3_sk1_cm2_cn2",
+    ),
+    (
+        2,
+        333,
+        2048,
+        2048,
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm2_cn2_ps2",
+    ),
+    (
+        1,
+        768,
+        32768,
+        1280,
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb4_sk1_cm3_cn4",
+    ),
+    (
+        2,
+        1787,
+        1792,
+        5120,
+        "flydsl_mxfp8_32_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk1_cm4_cn1",
+    ),
+)
+
+# ATOM quantize_fp8's fp8 finite bound. The fused epilogue must match it.
+_FP8_MAX = 448.0
 
 
 def _to_e8m0_scale(scale):
@@ -184,7 +236,7 @@ def test_fused_quant_n32k4_mbn(b, m, k, dtype):
         + ((m + 31) // 32) * b * (k // 32) * 32  # n32k4 scale
     )
 
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     for name, fn in candidates.items():
         (got_fp8, got_scale), us = run_perftest(fn)
         err_fp8 = checkAllclose(
@@ -240,7 +292,7 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
     # a8w4, a8w8_128 and the n32k4 1x32 scale do not run it; 32x32 does, on the
     # archs in RAGGED_K_GFX.
     ragged_k = k % 128 != 0
-    if get_gfx() in A8W4_GFX and not ragged_k:
+    if get_gfx_runtime() in A8W4_GFX and not ragged_k:
         w_bnk, refs["a8w4"] = weight(32)
         # Offline weight prep (not in the hot path); act quant mirrors every forward.
         w_codes, w_scales = preshuffle_a8w4_weight_mbn(w_bnk)
@@ -269,9 +321,11 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
             + b * m * n * y_phys.element_size()  # bf16 out
         )
 
-    a8w8_blocks = A8W8_BLOCKS[get_gfx()] if layout == "mbn" else ()
+    a8w8_blocks = A8W8_BLOCKS[get_gfx_runtime()] if layout == "mbn" else ()
     for rows, block in a8w8_blocks:
-        if ragged_k and (rows != 32 or block != 32 or get_gfx() not in RAGGED_K_GFX):
+        if ragged_k and (
+            rows != 32 or block != 32 or get_gfx_runtime() not in RAGGED_K_GFX
+        ):
             continue
         name = f"a8w8_{rows}x{block}"
         w_blk, refs[name] = weight(min(rows, 32))
@@ -288,7 +342,7 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
             + b * (n // rows) * (k // block)  # B scale (rows x block)
             + b * m * n * y_phys.element_size()
         )
-        if rows == block == 32 and get_gfx() in A8W8_1X32_GFX and not ragged_k:
+        if rows == block == 32 and get_gfx_runtime() in A8W8_1X32_GFX and not ragged_k:
             candidates["a8w8_1x32"] = functools.partial(
                 _a8w8, x8, shuffle_weight(w8), xs8, expand_32x32_to_n32k4(ws8), dtype
             )
@@ -299,7 +353,7 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
 
     flops = 2 * b * m * n * k
 
-    ret = {"gfx": get_gfx()}
+    ret = {"gfx": get_gfx_runtime()}
     for name, fn in candidates.items():
         out, us = run_perftest(fn)
         if layout == "mbn":
@@ -322,16 +376,203 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
     return ret
 
 
+@benchmark()
+def test_batched_gemm_a8w8_compute(b, m, n, k, kernel_name, dtype=dtypes.bf16):
+    """The 32x32 batched GEMM on an explicit compute kernelName; the output starts
+    as NaN and every batch is checked against its own dequantized reference."""
+    torch.manual_seed(SEED)
+    x8, xs8 = quant_act_e8m0(blockwise_randn(m, b, k, dtype=dtype), 32)
+    w = blockwise_randn(b, n, k, dtype=dtype)
+    w = w * torch.exp2(torch.arange(b) % 4 - 1.0).to(dtype)[:, None, None]
+    w8, ws8 = quant_weight_e8m0(w, 32, 32)
+    out = torch.full((m, b, n), float("nan"), dtype=dtype)
+    fn = functools.partial(
+        run_bmm_a8w8_mxfp8,
+        x8,
+        shuffle_weight(w8),
+        xs8,
+        ws8,
+        out,
+        kernel_name=kernel_name,
+    )
+    _, us = run_perftest(fn)
+    x_scale = torch.exp2(xs8.to(dtypes.fp32) - 127).repeat_interleave(32, -1)
+    w_scale = torch.exp2(ws8.to(dtypes.fp32) - 127).repeat_interleave(32, -2)
+    w_scale = w_scale.repeat_interleave(32, -1)
+    ref = torch.einsum(
+        "mbk,bnk->mbn", x8.to(dtypes.fp32) * x_scale, w8.to(dtypes.fp32) * w_scale
+    )
+    assert torch.isfinite(out).all(), f"{kernel_name}: unwritten or non-finite output"
+    errs = []
+    for i in range(b):
+        err = checkAllclose(
+            ref[:, i],
+            out[:, i].to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            tol_err_ratio=0.01,
+            msg=f"{kernel_name} B={b} M={m} N={n} K={k} batch {i}",
+        )
+        assert err <= 0.01, f"{kernel_name}: batch {i} mismatch ratio {err}"
+        errs.append(err)
+    nbytes = (
+        m * b * k
+        + b * n * k
+        + m * b * (k // 32)
+        + b * (n // 32) * (k // 32)
+        + b * m * n * out.element_size()
+    )
+    return {
+        "gfx": get_gfx_runtime(),
+        "compute us": us,
+        "compute TFLOPS": 2 * b * m * n * k / us / 1e6,
+        "compute TB/s": nbytes / us / 1e6,
+        "compute err": max(errs),
+    }
+
+
+def test_compute_operand_guards():
+    """The compute route refuses dense A / C at batch > 1, which its per-batch
+    offsets would read and write out of bounds, and a fused quant it has no
+    epilogue for, before anything launches."""
+    from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
+        run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
+    )
+
+    b, m, n, k, kernel_name = COMPUTE_CASES[0]
+    x8 = torch.empty((m, b, k), dtype=dtypes.fp8)
+    w8 = torch.empty((b, n, k), dtype=dtypes.fp8)
+    xs8 = torch.empty((m, b, k // 32), dtype=torch.uint8)
+    ws8 = torch.empty((b, n // 32, k // 32), dtype=torch.uint8)
+    out = torch.empty((m, b, n), dtype=dtypes.bf16)
+
+    def run_dense(xq, o):
+        return run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
+            xq,
+            w8[0],
+            xs8[:, 0].view(dtypes.fp8_e8m0),
+            ws8[0].view(dtypes.fp8_e8m0),
+            o,
+            kernel_name,
+            w_scale_32x32=True,
+            batch=b,
+        )
+
+    with pytest.raises(RuntimeError, match="batch > 1 needs XQ strides"):
+        run_dense(x8[:, 0].contiguous(), out[:, 0])
+    with pytest.raises(RuntimeError, match="batch > 1 needs XQ strides"):
+        run_dense(x8[:, 0], out[:, 0].contiguous())
+
+    y8 = torch.empty((m, b, n), dtype=dtypes.fp8)
+    y_scale = torch.empty(m * (b * n // 32), dtype=torch.uint8)
+    with pytest.raises(ValueError, match="no fused quant epilogue"):
+        run_bmm_a8w8_mxfp8(
+            x8, w8, xs8, ws8, y8, kernel_name=kernel_name, y_scale_out=y_scale
+        )
+
+
+def atom_quantize_fp8(y_bf16: torch.Tensor):
+    """Torch mirror of ATOM ``quantize_fp8``: group-32 over the flattened row,
+    amax floored at 1e-10, code = ceil_pow2(amax/448). ``y_bf16`` is [rows, C]."""
+    rows, c = y_bf16.shape
+    yv = y_bf16.to(dtypes.fp32).view(rows, c // 32, 32)
+    amax = yv.abs().amax(dim=-1).clamp(min=1e-10)
+    raw = (amax * (1.0 / _FP8_MAX)).view(torch.int32)
+    code = (raw >> 23) + ((raw & 0x7FFFFF) != 0).to(torch.int32)
+    code = code.clamp(0, 255).to(torch.int32)
+    scale = (code << 23).view(torch.float32)
+    q = (yv / scale[..., None]).clamp(-_FP8_MAX, _FP8_MAX).to(dtypes.fp8)
+    return q.view(rows, c).contiguous(), code.to(torch.uint8).contiguous()
+
+
+def test_woa_fused_quant_epilogue(b, m, n, k):
+    """``y_scale_out`` must match quantize_fp8 of the unfused bf16 GEMM.
+
+    Returns (scale mismatches, fp8 mismatches). The n32k4 weight scale needs
+    a whole 128-K tile, and the quant needs N and B*N to be whole groups of 32.
+    Other shapes contribute nothing.
+    """
+    if n % 32 or k % 128 or (b * n) % 32:
+        return 0, 0
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
+        run_bmm_a8w8_mxfp8_32_gfx1250,
+    )
+
+    torch.manual_seed(SEED)
+    o_mbn = blockwise_randn(m, b, k, dtype=dtypes.bf16)
+    w_bnk = blockwise_randn(b, n, k, dtype=dtypes.bf16, rows=32)
+    x8, xs8 = quant_act_e8m0(o_mbn, 32)
+    w8, ws8 = quant_weight_e8m0(w_bnk, 32, 32)
+    w_scale = expand_32x32_to_n32k4(ws8)
+    w_shuf = shuffle_weight(w8)
+
+    y_bf16 = torch.empty(m, b, n, dtype=dtypes.bf16)
+    run_bmm_a8w8_mxfp8_32_gfx1250(x8, w_shuf, xs8, w_scale, y_bf16)
+    y8_ref, yscale_ref = atom_quantize_fp8(y_bf16.view(m, b * n))
+
+    y8 = torch.empty(m, b, n, dtype=dtypes.fp8)
+    yscale = torch.empty(m * (b * n // 32), dtype=torch.uint8)
+    run_bmm_a8w8_mxfp8_32_gfx1250(x8, w_shuf, xs8, w_scale, y8, y_scale_out=yscale)
+    scale_mismatch = int((yscale.view(m, b * n // 32) != yscale_ref).sum())
+    fp8_mismatch = int(
+        (
+            y8.view(m, b * n).view(torch.uint8).to(torch.int32)
+            != y8_ref.view(torch.uint8).to(torch.int32)
+        ).sum()
+    )
+    print(
+        f"fused quant B={b} M={m} N={n} K={k}: "
+        f"scale mismatch {scale_mismatch}/{m * b * n // 32}, "
+        f"fp8 mismatch {fp8_mismatch}/{m * b * n}"
+    )
+    return scale_mismatch, fp8_mismatch
+
+
+def _fused_quant_shapes(args, include_ragged_m):
+    shapes = [(b, m, n, k) for b in args.batch for (m, n, k) in args.mnk]
+    if include_ragged_m:
+        shapes.extend((b, 48, 1024, 4096) for b in args.batch)
+    # One launch per shape. The ragged-M row is only on the default sweep.
+    seen = set()
+    unique = []
+    for shape in shapes:
+        if shape not in seen:
+            seen.add(shape)
+            unique.append(shape)
+    return unique
+
+
+def _run_fused_quant(shapes):
+    bad = 0
+    ran = 0
+    for b, m, n, k in shapes:
+        if n % 32 or k % 128 or (b * n) % 32:
+            continue
+        scale_mismatch, fp8_mismatch = test_woa_fused_quant_epilogue(b, m, n, k)
+        ran += 1
+        if scale_mismatch or fp8_mismatch:
+            bad += 1
+    if ran == 0:
+        print("fused quant epilogue: no whole group-32 shape to check")
+        raise SystemExit(1)
+    if bad:
+        print(f"{bad} fused-quant shape(s) mismatched")
+        raise SystemExit(1)
+    print("fused quant epilogue ALL BIT-EXACT")
+
+
 def summarize(title: str, rows: list) -> None:
     df = pd.DataFrame(rows)
     aiter.logger.info("%s (markdown):\n%s", title, df.to_markdown(index=False))
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning(
-            "flydsl batched GEMMs unsupported on %s; skipping", get_gfx()
-        )
+    gfx = get_gfx_runtime()
+    arch = base_gfx_arch(gfx)
+    # gfx1250-strict shares the gfx1250 kernel but is not a full-suite arch.
+    epilogue_only = arch == "gfx1250" and gfx not in SUPPORTED_GFX
+    if gfx not in SUPPORTED_GFX and not epilogue_only:
+        aiter.logger.warning("flydsl batched GEMMs unsupported on %s; skipping", gfx)
         return
 
     parser = argparse.ArgumentParser(
@@ -386,6 +627,22 @@ def main():
         help="Output layout (wo_a uses mbn only).\n        e.g.: -l mbn",
     )
     args = parser.parse_args()
+    custom_shape = any(flag in sys.argv for flag in ("-s", "--mnk", "-b", "--batch"))
+    if gfx in COMPUTE_GFX:
+        test_compute_operand_guards()
+        summarize(
+            "batched_gemm a8w8 on explicit compute kernelNames",
+            [test_batched_gemm_a8w8_compute(*case) for case in COMPUTE_CASES],
+        )
+
+    if epilogue_only:
+        shapes = (
+            _fused_quant_shapes(args, include_ragged_m=False)
+            if custom_shape
+            else [(2, m, 1024, 4096) for m in (16, 48, 128, 256)]
+        )
+        _run_fused_quant(shapes)
+        return
 
     for dtype in args.dtype:
         quant_rows = []
@@ -401,6 +658,9 @@ def main():
         ):
             gemm_rows.append(test_batched_gemm(b, m, n, k, dtype, layout))
         summarize("batched_gemm (a8w4 and a8w8, each vs its BF16 reference)", gemm_rows)
+
+    if arch == "gfx1250":
+        _run_fused_quant(_fused_quant_shapes(args, include_ragged_m=not custom_shape))
 
 
 if __name__ == "__main__":
