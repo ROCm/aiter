@@ -1450,9 +1450,9 @@ def test_mha_v4_lse_bias_is_constant_across_key_chunks(q_format, v_format, max_s
 
 _KV_SPLIT_FORMATS = [
     (AttentionFormat.BF16,) * 3,
-    (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.FP8),
-    (AttentionFormat.INT8, AttentionFormat.INT8, AttentionFormat.FP8),
-    (AttentionFormat.FP8,) * 3,
+    (AttentionFormat.BF16, AttentionFormat.BF16, native_fp8_format()),
+    (AttentionFormat.INT8, AttentionFormat.INT8, native_fp8_format()),
+    (native_fp8_format(),) * 3,
 ]
 
 
@@ -1464,7 +1464,7 @@ def _patched_cu_count(cus):
     )
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 LSE")
 @parametrize("formats", _KV_SPLIT_FORMATS)
 @parametrize("splits", [2, 3, 4])
 @parametrize(
@@ -1704,7 +1704,7 @@ def test_mha_v4_kv_splits_rejects_what_it_cannot_split(kwargs, error, match):
         mha_v4(q, q, q, *formats, **kwargs)
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 LSE")
 def test_mha_v4_kv_splits_allow_one_kv_tile_per_range():
     """The bound is inclusive: a count leaving exactly one KV tile per range still splits."""
     torch.manual_seed(67)
@@ -1718,25 +1718,26 @@ def test_mha_v4_kv_splits_allow_one_kv_tile_per_range():
     torch.testing.assert_close(out, mha_v4(q, q, q, *bf16), atol=2e-2, rtol=2e-2)
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 LSE")
 def test_mha_v4_kv_splits_need_a_divisor_without_per_batch_key_lengths():
     """Every recipe kv_splits takes has per-batch key lengths on gfx950, so a row without them is
-    simulated: its last range has no way to end short, and a count must divide the keys.
+    simulated there: its last range has no way to end short, and a count must divide the keys.
+    gfx942's FP8 dense row really has none, so there the patch changes nothing.
     """
     q = torch.randn((1, 1024, 1, 128), device="cuda", dtype=torch.bfloat16)
-    formats = (AttentionFormat.FP8,) * 3
+    formats = (native_fp8_format(),) * 3
     with patched_attr(mha_v4_module, "_varlen_capable", lambda *formats: False):
         with expect_raises(ValueError, match="divide the key length"):
             mha_v4(q, q, q, *formats, kv_splits=3)
         assert mha_v4(q, q, q, *formats, kv_splits=4).shape == q.shape
 
 
-@skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 LSE")
+@skipif(get_gfx() not in ("gfx942", "gfx950"), reason="gfx942/gfx950 MHA v4 LSE")
 @parametrize(
     "formats",
     [
         param((AttentionFormat.BF16,) * 3, id="BF16"),
-        param((AttentionFormat.FP8,) * 3, id="FP8"),
+        param((native_fp8_format(),) * 3, id="FP8"),
     ],
 )
 def test_mha_v4_kv_splits_compile_parity(formats):
