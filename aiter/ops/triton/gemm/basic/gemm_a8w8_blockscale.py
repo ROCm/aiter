@@ -26,6 +26,7 @@ from aiter.ops.triton.utils.gemm_config_utils import (
     compute_splitk_params,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.plugin import route as _route
 
 _LOGGER = AiterTritonLogger()
 _FORCE_GFX1250_EX = os.environ.get("AITER_FORCE_GFX1250_EX", "0") == "1"
@@ -48,7 +49,7 @@ def gemm_a8w8_blockscale(
     w: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    dtype: float | None = torch.bfloat16,
+    dtype: torch.dtype | None = torch.bfloat16,
     y: torch.Tensor | None = None,
     config: dict | None = None,
     skip_reduce: bool | None = False,
@@ -70,10 +71,82 @@ def gemm_a8w8_blockscale(
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).
         config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
             BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT).
+        backend (Optional[str]): "triton", "gluon", or None (auto-detect).
+            Only None lets a kernel plugin run the call.
 
     Returns:
         torch.Tensor: Output with shape (M, N).
     """
+    # A call that sets backend gets that backend. Other calls go to the routed op.
+    if backend is None:
+        result = _gemm_a8w8_blockscale_routed(
+            x, w, x_scale, w_scale, dtype, y, config, skip_reduce, kernel_type
+        )
+        # A kernel plugin must return y itself when y is given, as the native
+        # path does. Identity, not data_ptr: this runs under torch.compile too.
+        if y is not None and result.dim() == y.dim() and result is not y:
+            raise RuntimeError(
+                "gemm_a8w8_blockscale: the result was not written into y="
+            )
+        return result
+    return _gemm_a8w8_blockscale_native(
+        x, w, x_scale, w_scale, dtype, y, config, skip_reduce, kernel_type, backend
+    )
+
+
+# The op name is not "gemm_a8w8_blockscale": that is the contract of
+# aiter.ops.gemm_op_a8w8. This contract also writes into y if y is given.
+@_route(op="gemm_a8w8_blockscale_out", version=1)
+def _gemm_a8w8_blockscale_routed(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    skip_reduce: bool | None = False,
+    kernel_type: str = "bandwidth_bound",
+) -> torch.Tensor:
+    """
+    Computes Y = X @ W^T in 8 bits, with a scale for each block of X and W.
+
+    Returns the (M, N) result. If y is not None, the result is written into y
+    and y is returned. If skip_reduce is True and the config splits K, the
+    (NUM_KSPLIT, M, N) fp32 partials are returned and y is not written.
+    Nothing else is written through the arguments.
+
+    Args:
+        x (torch.Tensor): FP8 or INT8 input with shape (M, K).
+        w (torch.Tensor): Weight with shape (N, K), the dtype of x.
+        x_scale (torch.Tensor): Scale for each block of x, shape (M, scale_k).
+            The kernel reads it through its strides, so a transposed view is valid.
+        w_scale (torch.Tensor): Scale for each block of w, shape (scale_n, scale_k).
+        dtype (Optional[torch.dtype]): Output datatype when y is None.
+        y (Optional[torch.Tensor]): Output buffer with shape (M, N).
+        config (Optional[dict]): Kernel tuning parameters.
+            It sets the schedule, not the result.
+        skip_reduce (Optional[bool]): Return the split-K partials.
+        kernel_type (str): Gluon kernel variant. It sets the schedule, not the result.
+    """
+    return _gemm_a8w8_blockscale_native(
+        x, w, x_scale, w_scale, dtype, y, config, skip_reduce, kernel_type, None
+    )
+
+
+def _gemm_a8w8_blockscale_native(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    dtype: torch.dtype | None,
+    y: torch.Tensor | None,
+    config: dict | None,
+    skip_reduce: bool | None,
+    kernel_type: str,
+    backend: str | None,
+) -> torch.Tensor:
+    """Runs the kernels of gemm_a8w8_blockscale."""
     _LOGGER.info(
         "GEMM_A8W8_BLOCKSCALE: x=%s w=%s x_scale=%s w_scale=%s",
         tuple(x.shape),

@@ -43,11 +43,11 @@ from .kernels.conv.conv3d_transpose import (
 
 # TILE_K=32 is mfma_f32_16x16x32_bf16 (CDNA4). Allow-list so an unsupported
 # card fails at the entry, including the 1x1 matmul path.
-SUPPORTED_GFX = ("gfx950",)
+SUPPORTED_GFX = ("gfx950", "gfx1250")
 
 
 def _check_supported_arch():
-    """Refuse an arch whose MFMA this kernel is written against, before compiling."""
+    """Refuse an arch this op has no backend for, before compiling."""
     from aiter.jit.utils.chip_info import get_gfx
 
     # get_gfx matches the tuned table / tuner stamp; strip feature suffixes.
@@ -55,9 +55,16 @@ def _check_supported_arch():
     if gfx not in SUPPORTED_GFX:
         raise RuntimeError(
             f"flydsl_conv_implicit requires one of {list(SUPPORTED_GFX)}, got {gfx}. "
-            f"Its MMA is mfma_f32_16x16x32_bf16 (TILE_K={TILE_K}), which is CDNA4 "
-            f"only; use torch.nn.functional.conv{{1,2,3}}d on this device."
+            f"gfx950 uses mfma_f32_16x16x32_bf16 (TILE_K={TILE_K}); "
+            f"gfx1250 uses wmma_f32_16x16x32_bf16. "
+            f"Use torch.nn.functional.conv{{1,2,3}}d on this device."
         )
+
+
+def _current_gfx():
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return get_gfx().split(":", 1)[0]
 
 
 # Tuned launch configs from csrc/flydsl_conv3d/conv3d_tune.py, which times
@@ -91,6 +98,11 @@ TUNED_DEVICE_COLUMNS = ("gfx", "cu_num")
 # Optional result column: output rows of a block's 2D patch (kH x kW reuse).
 # A table without it, or an empty cell, means 1 (consecutive rows).
 TUNED_BLOCK_ROWS_COLUMN = "block_r"
+# Optional gfx1250 result columns: the K loop's software pipeline, K tile
+# width and kH x kW patch reuse. A table without them, or an empty cell, leaves
+# the runtime default.
+TUNED_PIPELINE_COLUMNS = ("num_buffers", "main_loop_unroll", "tile_k", "patch")
+_TUNED_INT_PIPELINE_COLUMNS = ("num_buffers", "tile_k")
 
 # Result column, not part of the key. Empty cell means FlyDSL; other backends skipped.
 TUNED_LIBTYPE_COLUMN = "libtype"
@@ -108,6 +120,21 @@ _MATMUL_FAST_PATH_INT_COLS = (
     "pad_h",
     "pad_w",
 )
+
+
+def _parse_pipeline_columns(row) -> dict:
+    """The ``TUNED_PIPELINE_COLUMNS`` a tuned row sets, parsed; empty cells skipped."""
+    out = {}
+    for col in TUNED_PIPELINE_COLUMNS:
+        raw = getattr(row, col, None)
+        if raw is None or (isinstance(raw, float) and math.isnan(raw)):
+            continue
+        if isinstance(raw, str) and raw.strip().lower() in ("", "null", "nan"):
+            continue
+        out[col] = (
+            int(raw) if col in _TUNED_INT_PIPELINE_COLUMNS else _parse_tuned_bool(raw)
+        )
+    return out
 
 
 def _parse_tuned_bool(value) -> bool:
@@ -271,7 +298,11 @@ _TUNED_LOOKUP_LOGGED = set()
 
 @functools.lru_cache(maxsize=1)
 def _load_tuned_table():
-    """``{(gfx, cu_num, *shape): (tile, wgm, splitk, block_rows)}``. Empty dict on any failure."""
+    """``{(gfx, cu_num, *shape): (tile, wgm, splitk, block_rows, pipeline)}``.
+
+    ``pipeline`` holds the ``TUNED_PIPELINE_COLUMNS`` the row sets. Empty dict
+    on any failure.
+    """
     try:
         import pandas as pd
 
@@ -344,6 +375,7 @@ def _load_tuned_table():
                 int(row.wgm),
                 splitk,
                 block_rows,
+                _parse_pipeline_columns(row),
             )
         if skipped_libtypes:
             from aiter import logger
@@ -385,15 +417,15 @@ def _log_tuned_lookup(table, dev, key, hit, borrowed=False):
     if hit is not None:
         splitk = hit[2]
         sk_s = f", splitK={splitk}" if splitk is not None else ""
+        br_s = f", block_rows={hit[3]}" if hit[3] > 1 else ""
         if borrowed:
             logger.info(
                 f"conv3d_implicit: {shape} has no tuned row of its own on "
                 f"gfx={dev[0]}, cu_num={dev[1]}; borrowing this layer's nearest "
-                f"tuned resolution, tile={hit[0]}, wgm={hit[1]}. Tune this shape "
-                f"for the exact config."
+                f"tuned resolution, tile={hit[0]}, wgm={hit[1]}{br_s}. Tune this "
+                f"shape for the exact config."
             )
             return
-        br_s = f", block_rows={hit[3]}" if hit[3] > 1 else ""
         logger.info(
             f"conv3d_implicit: {shape} is tuned on gfx={dev[0]}, "
             f"cu_num={dev[1]}; running tile={hit[0]}, wgm={hit[1]}{sk_s}{br_s}."
@@ -468,11 +500,11 @@ def _borrow_tuned_tile(dev, key):
     f = dict(zip(TUNED_KEY_COLUMNS, key))
     if not _tile_fills_device(want, f["K"], f["groups"], hit[0], dev[1]):
         return None
-    return (hit[0], hit[1], None, hit[3])
+    return (hit[0], hit[1], None, *hit[3:])
 
 
 def _lookup_tuned_tile(key, device):
-    """Tuned (tile, wgm, splitk, block_rows) for this device, or a borrowed same-layer row."""
+    """Tuned (tile, wgm, splitk, block_rows, pipeline) for this device, or a borrowed same-layer row."""
     del device
     if key is None:
         return None
@@ -759,6 +791,7 @@ def _conv3d_impl(
     input_layout="NCDHW",
     output_layout="NCDHW",
     block_rows=None,
+    patch_reuse=True,
 ):
     _check_layouts(3, input_layout, output_layout)
 
@@ -878,6 +911,32 @@ def _conv3d_impl(
             y = y + bias.to(y.dtype).view(1, k, 1, 1, 1)
         return y.permute(0, 2, 3, 4, 1).contiguous() if out_ndhwc else y
 
+    # gfx1250: separate TDM+WMMA backend (host pre-pad, NDHWC, C aligned to 32).
+    # Use the already-normalized x / pad_mode / (pt,ph,pw) so asymmetric and
+    # non-zero modes that were materialized above are not padded twice.
+    if _current_gfx() == "gfx1250":
+        from .conv3d_gfx1250 import run_conv3d_gfx1250
+
+        return run_conv3d_gfx1250(
+            x,
+            weight,
+            bias=bias,
+            stride=(st, sh, sw),
+            padding=(pt, ph, pw),
+            dilation=(dt, dh, dw),
+            groups=groups,
+            padding_mode=pad_mode,
+            splitk=splitk,
+            stream=stream,
+            tile=tile,
+            input_layout="NDHWC" if in_ndhwc else "NCDHW",
+            output_layout=output_layout,
+            block_rows=block_rows,
+            # gfx950's patch_reuse=True only allows the reuse paths; on gfx1250
+            # the tuned row then decides, and False still forces the tap path.
+            patch_reuse=None if patch_reuse else False,
+        )
+
     do = out_extent(d, pt, dt, kt, st)
     ho = out_extent(h, ph, dh, kh, sh)
     wo = out_extent(w, pw, dw, kw, sw)
@@ -973,7 +1032,7 @@ def _conv3d_impl(
     else:
         hit = _lookup_tuned_tile(tuned_key, x.device)
         if hit is not None:
-            chosen_tile, chosen_wgm, tuned_splitk, chosen_block_rows = hit
+            chosen_tile, chosen_wgm, tuned_splitk, chosen_block_rows = hit[:4]
             if forced_wgm is not None:
                 chosen_wgm = forced_wgm
         else:
