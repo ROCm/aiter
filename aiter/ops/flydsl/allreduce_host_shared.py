@@ -5,6 +5,8 @@
 
 import ctypes
 import logging
+import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -365,17 +367,230 @@ def probe_xgmi_peer_links() -> bool | None:
     """
     try:
         found = False
-        for subdir in ("io_links", "p2p_links"):
-            for props in _KFD_NODES.glob(f"*/{subdir}/*/properties"):
-                found = True
-                for line in props.read_text().splitlines():
-                    field, _, value = line.partition(" ")
-                    if field == "type" and int(value) == _HSA_IOLINK_TYPE_XGMI:
-                        return True
+        for _src, _dst, props in kfd_links():
+            found = True
+            if props.get("type") == _HSA_IOLINK_TYPE_XGMI:
+                return True
         return False if found else None
-    except (OSError, ValueError):
+    except (OSError, ValueError, KeyError):
         logger.debug("FlyDSL all-reduce: cannot read KFD topology", exc_info=True)
         return None
+
+
+def kfd_props(path: Path) -> dict[str, int]:
+    """The integer fields of one KFD ``properties`` file."""
+    out = {}
+    for line in path.read_text().splitlines():
+        key, _, value = line.partition(" ")
+        try:
+            out[key] = int(value)
+        except ValueError:
+            continue
+    return out
+
+
+def kfd_links(root: Path = _KFD_NODES):
+    """Every KFD link as ``(node_from, node_to, props)``, from both
+    ``io_links`` and ``p2p_links``. Raises OSError or ValueError if 
+    the topology cannot be read."""
+    for subdir in ("io_links", "p2p_links"):
+        for props_file in sorted(Path(root).glob(f"*/{subdir}/*/properties")):
+            props = kfd_props(props_file)
+            yield props["node_from"], props["node_to"], props
+
+
+def kfd_node_of_device(device_index: int, root: Path = _KFD_NODES) -> int | None:
+    """The KFD topology node of HIP device *device_index*, matched on its PCI
+    domain and location (``bus << 8 | device << 3``, function 0). None if no
+    node matches or the topology cannot be read.
+
+    torch reports the physical PCI address, so this holds whatever
+    ``HIP_VISIBLE_DEVICES`` selects.
+    """
+    try:
+        prop = torch.cuda.get_device_properties(int(device_index))
+        location = (int(prop.pci_bus_id) << 8) | (int(prop.pci_device_id) << 3)
+        domain = int(prop.pci_domain_id)
+    except (RuntimeError, AttributeError, AssertionError):
+        logger.debug("FlyDSL topology: no PCI address for the device", exc_info=True)
+        return None
+    try:
+        for node in Path(root).iterdir():
+            if not node.name.isdigit():
+                continue
+            props = kfd_props(node / "properties")
+            if props.get("location_id") == location and props.get("domain") == domain:
+                return int(node.name)
+    except (OSError, ValueError):
+        logger.debug("FlyDSL topology: cannot read KFD nodes", exc_info=True)
+    return None
+
+
+def kfd_link_weights(
+    nodes: list[int], root: Path = _KFD_NODES
+) -> list[list[int]] | None:
+    """KFD link weights between *nodes*: ``[i][j]`` is the weight of the link
+    from ``nodes[i]`` to ``nodes[j]``, 0 on the diagonal. A lower weight is a 
+    closer peer. None if a pair has no link or the topology cannot be read."""
+    index = {int(n): i for i, n in enumerate(nodes)}
+    n = len(nodes)
+    weights = [[0 if i == j else None for j in range(n)] for i in range(n)]
+    try:
+        for src, dst, props in kfd_links(root):
+            if src in index and dst in index and src != dst:
+                weights[index[src]][index[dst]] = int(props.get("weight", 0))
+    except (OSError, ValueError, KeyError):
+        logger.debug("FlyDSL topology: cannot read KFD links", exc_info=True)
+        return None
+    if any(w is None for row in weights for w in row):
+        return None
+    return weights
+
+
+def socket_groups(weights) -> tuple[tuple[int, ...], ...]:
+    """The groups of ranks that *weights* splits into, or one group if it does
+    not split uniformly.
+
+    Ranks joined by the lowest off-diagonal weight form a group. The split is
+    accepted only if there are at least two groups, all of the same size of at
+    least two, every pair inside a group has that lowest weight, and every pair
+    across groups has one same, higher weight. Anything else -- a flat mesh, or
+    a host that is not symmetric -- is one group.
+    """
+    n = len(weights)
+    flat = (tuple(range(n)),)
+    if n < 4:
+        return flat
+    off = [weights[i][j] for i in range(n) for j in range(n) if i != j]
+    near = min(off)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        for j in range(n):
+            if i != j and weights[i][j] == near:
+                parent[find(i)] = find(j)
+    by_root: dict[int, list[int]] = {}
+    for i in range(n):
+        by_root.setdefault(find(i), []).append(i)
+    groups = tuple(sorted(tuple(sorted(g)) for g in by_root.values()))
+    if len(groups) < 2 or len({len(g) for g in groups}) != 1 or len(groups[0]) < 2:
+        return flat
+    group_of = {r: gi for gi, g in enumerate(groups) for r in g}
+    far = set()
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            if group_of[i] == group_of[j]:
+                if weights[i][j] != near:
+                    return flat
+            else:
+                far.add(weights[i][j])
+    if len(far) != 1:
+        return flat
+    return groups
+
+
+GROUPS_ENV = "AITER_FLY_AR_GROUPS"
+
+
+def parse_groups_env(text: str, world_size: int) -> tuple[tuple[int, ...], ...]:
+    """Groups from ``AITER_FLY_AR_GROUPS``, e.g. ``"0,1,2,3;4,5,6,7"``."""
+    try:
+        groups = tuple(
+            tuple(sorted(int(r) for r in part.split(",") if r.strip()))
+            for part in text.split(";")
+            if part.strip()
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"{GROUPS_ENV}={text!r} is not a ';'-list of ','-lists"
+        ) from exc
+    if sorted(r for g in groups for r in g) != list(range(int(world_size))):
+        raise ValueError(
+            f"{GROUPS_ENV}={text!r} must hold every rank of world_size={world_size} once"
+        )
+    return tuple(sorted(groups))
+
+
+@dataclass(frozen=True)
+class PeerTopology:
+    """How the ranks of one process group sit on the host's fabric.
+
+    ``weights[i][j]`` is the KFD link weight from rank ``i``'s GPU to rank
+    ``j``'s (None when it was not read, e.g. under an override). ``groups`` are
+    the ranks of each socket group (sorted). A single group means the host is
+    flat for this process group.
+    """
+
+    groups: tuple[tuple[int, ...], ...]
+    weights: tuple[tuple[int, ...], ...] | None = None
+    kfd_nodes: tuple[int, ...] | None = None
+    source: str = "kfd"
+
+    @property
+    def is_hierarchical(self) -> bool:
+        return len(self.groups) >= 2
+
+    def group_of(self, rank: int) -> int:
+        return next(gi for gi, g in enumerate(self.groups) if int(rank) in g)
+
+    def local_index(self, rank: int) -> int:
+        return self.groups[self.group_of(rank)].index(int(rank))
+
+    def partner(self, rank: int) -> int:
+        """The rank at the same local index in the other group (two groups)."""
+        if len(self.groups) != 2:
+            raise ValueError(f"partner needs exactly two groups, got {self.groups}")
+        return self.groups[1 - self.group_of(rank)][self.local_index(rank)]
+
+
+def probe_peer_topology(
+    group, *, rank: int, world_size: int, device_index: int
+) -> PeerTopology:
+    """The ``PeerTopology`` of *group*, identical on every rank.
+
+    A collective over *group* (which must carry CPU objects, i.e. gloo): each
+    rank finds its own GPU's KFD node, the nodes are gathered, and rank 0 reads
+    the link weights and broadcasts the result. ``AITER_FLY_AR_GROUPS``
+    overrides the detected groups (read on rank 0). An unreadable topology is
+    one flat group.
+    """
+    # Never raises: every rank has to reach the collectives below.
+    node = kfd_node_of_device(device_index)
+    nodes = IpcHeap.gather_object_list_via_broadcast(group, node)
+    topo = None
+    if int(rank) == 0:
+        override = os.environ.get(GROUPS_ENV, "").strip()
+        weights = None
+        if all(n is not None for n in nodes):
+            weights = kfd_link_weights([int(n) for n in nodes])
+        groups, source = (tuple(range(int(world_size))),), "unknown"
+        if weights is not None:
+            groups, source = socket_groups(weights), "kfd"
+        if override:
+            try:
+                groups, source = parse_groups_env(override, world_size), "env"
+            except ValueError:
+                # Rank 0 alone reads it; a bad value must still reach the
+                # broadcast below, or the other ranks would wait in it.
+                logger.warning("ignoring %s", GROUPS_ENV, exc_info=True)
+        topo = PeerTopology(
+            groups=groups,
+            weights=None if weights is None else tuple(tuple(r) for r in weights),
+            kfd_nodes=None if None in nodes else tuple(int(n) for n in nodes),
+            source=source,
+        )
+    holder = [topo]
+    src = dist.get_process_group_ranks(group=group)[0]
+    dist.broadcast_object_list(holder, src=src, group=group, device="cpu")
+    return holder[0]
 
 
 def kernel_symbol(launch) -> str:

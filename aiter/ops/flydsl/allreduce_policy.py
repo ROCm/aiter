@@ -35,6 +35,9 @@ The one-shot window may overlap the mesh and the ring windows:
 ``QuickAllReduce`` runs before ``CustomAllreduce``, and with quantization on,
 the mesh and the ring take their payloads first.
 
+A row may also give the hierarchical schedule a window (``hier``). It applies
+only on a host whose ranks split into two uniform groups.
+
 ``resolve_family_policy`` gives the policy for a given rank: the table row for the
 host's arch and link, with the ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES``
 overrides applied.
@@ -42,10 +45,12 @@ overrides applied.
 **Level 2: which configuration**
 
 Each algorithm has a tuning ladder per ``(arch, link, world_size)``:
-``ONESHOT_LADDER``, ``MESH_ST_LADDER`` and ``RING_ST_LADDER``. A ladder is a
+``ONESHOT_LADDER``, ``MESH_ST_LADDER``, ``RING_ST_LADDER`` and
+``HIER_ST_LADDER``. A ladder is a
 tuple of rungs in ascending ``min_bytes`` order, and a payload runs on the last
 rung whose ``min_bytes`` is at most its size (``select_rung``). The host builds
-one engine per rung.
+one engine per rung. A hierarchical rung (``HierRung``) also picks the schedule
+of its two local laps, the mesh or the ring.
 
 **Fused all-reduce + RMSNorm**
 """
@@ -137,6 +142,14 @@ RING_SUPER_TILES = (1, 8, 16, 32)
 RS_CODECS = ("int4", "int6", "fp16")
 AG_CODECS = ("int4", "int6", "fp16")
 
+# Hierarchical algorithm.
+HIER_CODECS = ("int4", "int5", "int6", "fp16")
+HIER_SUPER_TILES = (1, 8, 16, 32)
+HIER_LOCAL_SCHEDULES = ("mesh", "ring")
+# The default wire format of the hierarchical algorithm's exchange between the two
+# groups.
+HIER_X_CODEC = "int6"
+
 # How the IPC inbox is allocated. ``"auto"`` resolves to one of the others. The
 # wire protocol is identical in every mode; only the memory type changes.
 INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained")
@@ -165,6 +178,7 @@ RS_INT6_MIN_WORLD = 4
 _TWO_SHOT_CODECS = {
     "mesh": (MESH_CODECS, MESH_CODECS),
     "ring": (RS_CODECS, AG_CODECS),
+    "hier": (HIER_CODECS, HIER_CODECS),
 }
 
 
@@ -262,6 +276,65 @@ class TwoShotRung:
     grid_cap: int
     block: int
 
+    @property
+    def engine_key(self) -> tuple:
+        """The host's engine key, ``(super_tile, block)``: rungs that share it
+        share one engine, at the first such rung's ``grid_cap``."""
+        return (self.super_tile, self.block)
+
+
+@dataclass(frozen=True)
+class HierRung(TwoShotRung):
+    """A hierarchical rung: a ``TwoShotRung`` plus the schedule of each local
+    lap, ``local_rs`` for the reduce-scatter and ``local_ag`` for the
+    all-gather inside a group, ``"mesh"`` or ``"ring"``.
+
+    The choice follows the TP``G`` policy of the same platform: the mesh's one
+    hop wins on small payloads, the ring's ``G - 1`` single-destination hops
+    on large ones.
+
+    ``rs_codec``, ``x_codec`` and ``ag_codec`` are the rung's wire formats,
+    ``None`` for the default: ``HIER_X_CODEC`` on the exchange and, on a local
+    lap, that of a TP``G`` schedule like its own (``default_codecs``; a ring
+    reduce-scatter requantizes its partial at every hop, so it is INT6 from
+    ``RS_INT6_MIN_WORLD``). Codecs a caller passes to the engine override
+    them.
+    """
+
+    local_rs: str = "mesh"
+    local_ag: str = "mesh"
+    rs_codec: str | None = None
+    x_codec: str | None = None
+    ag_codec: str | None = None
+
+    def __post_init__(self):
+        for name in ("local_rs", "local_ag"):
+            if getattr(self, name) not in HIER_LOCAL_SCHEDULES:
+                raise ValueError(
+                    f"{name} must be one of {HIER_LOCAL_SCHEDULES}, "
+                    f"got {getattr(self, name)!r}"
+                )
+        for name in ("rs_codec", "x_codec", "ag_codec"):
+            value = getattr(self, name)
+            if value is not None and value not in HIER_CODECS:
+                raise ValueError(
+                    f"{name} must be one of {HIER_CODECS} or None, got {value!r}"
+                )
+
+    @property
+    def engine_key(self) -> tuple:
+        """``(super_tile, block, local_rs, local_ag, rs_codec, x_codec,
+        ag_codec)``."""
+        return (
+            self.super_tile,
+            self.block,
+            self.local_rs,
+            self.local_ag,
+            self.rs_codec,
+            self.x_codec,
+            self.ag_codec,
+        )
+
 
 @dataclass(frozen=True)
 class FusedOneShotRung:
@@ -320,6 +393,7 @@ class AllReduceAlgorithm(enum.Enum):
     OneShot = "oneshot"
     TwoShotMesh = "mesh"
     TwoShotRing = "ring"
+    TwoShotHierarchical = "hier"
 
 
 @dataclass(frozen=True)
@@ -382,6 +456,12 @@ class FamilyPolicy:
     The mesh and the ring are quantized, so they run only with quantization on
     (``AITER_QUICK_REDUCE_QUANTIZATION=INT4``), and their windows do not
     overlap. The one-shot is exact and runs in both modes.
+
+    ``hier`` is the window of the hierarchical schedule, which needs the ranks
+    to split into two uniform groups (``PeerTopology.is_hierarchical``). It
+    applies only once ``with_topology(hierarchical=True)`` has set
+    ``hierarchical``, and then it replaces the mesh and takes the start of the
+    ring's window.
     """
 
     arch: str
@@ -390,6 +470,8 @@ class FamilyPolicy:
     oneshot: Window | None
     mesh: Window | None
     ring: Window | None
+    hier: Window | None = None
+    hierarchical: bool = False
 
     def __post_init__(self):
         if self.arch not in SUPPORTED_ARCHS:
@@ -425,6 +507,8 @@ class FamilyPolicy:
             w = None
         elif algorithm == AllReduceAlgorithm.TwoShotMesh:
             w = self.mesh
+        elif algorithm == AllReduceAlgorithm.TwoShotHierarchical:
+            w = self.hier if self.hierarchical else None
         else:
             w = self.ring
         return None if w is None or w.is_empty else w
@@ -440,9 +524,10 @@ class FamilyPolicy:
 
     def select(self, nbytes: int, *, quantized: bool) -> AllReduceAlgorithm | None:
         """The algorithm that runs *nbytes*, or None for
-        ``cross_device_reduce`` or RCCL. The mesh and the ring come first, as
-        in dispatch."""
+        ``cross_device_reduce`` or RCCL. The quantized schedules come first,
+        as in dispatch, and the hierarchical one first of them."""
         for alg in (
+            AllReduceAlgorithm.TwoShotHierarchical,
             AllReduceAlgorithm.TwoShotMesh,
             AllReduceAlgorithm.TwoShotRing,
             AllReduceAlgorithm.OneShot,
@@ -451,6 +536,35 @@ class FamilyPolicy:
             if w is not None and w.contains(nbytes):
                 return alg
         return None
+
+    def with_topology(self, *, hierarchical: bool) -> FamilyPolicy:
+        """This policy on a host whose ranks do (or do not) split into two
+        uniform groups. Splitting enables ``hier``, drops the mesh, and starts
+        the ring where ``hier`` ends, so that no ring engine is built for
+        payloads it would never run."""
+        if not hierarchical or self.hier is None or self.hier.is_empty:
+            return dataclasses.replace(self, hierarchical=False)
+        if self.mesh is not None and not self.mesh.is_empty:
+            ignored = [
+                v
+                for v in ("AITER_FLY_AR_MESH_MIN_BYTES", "AITER_FLY_AR_MESH_MAX_BYTES")
+                if os.environ.get(v, "").strip()
+            ]
+            if ignored:
+                logger.warning(
+                    "%s ignored: this host splits into two groups and runs the "
+                    "hierarchical schedule, not the mesh, on %s.",
+                    ", ".join(ignored),
+                    self._cell(),
+                )
+        ring = self.ring
+        if ring is not None and not ring.is_empty:
+            if self.hier.max is None:
+                ring = None
+            else:
+                lo = max(ring.min, self.hier.max)
+                ring = Window(lo, None if ring.max is None else max(ring.max, lo))
+        return dataclasses.replace(self, hierarchical=True, mesh=None, ring=ring)
 
     def describe(self, *, quantized: bool) -> str:
         """The enabled windows, for logs."""
@@ -540,8 +654,12 @@ FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         link="pcie",
         world_size=8,
         oneshot=Window(0, 1216 * KiB),
+        # The mesh/ring is the fallback of a host that does not split into two
+        # groups, or whose topology cannot be read.
         mesh=Window(96 * KiB, 24 * MiB),
         ring=Window(24 * MiB, None),
+        # The hierarchical algorithm is the default for TP=8,
+        hier=Window(96 * KiB, None),
     ),
 )
 
@@ -647,7 +765,7 @@ ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
 #           - TP4 ST=1 cap1024
 #           - TP8 ST=8 cap384:
 #   PCIe  TP2 ST=1, then ST=8 from 4 MiB. TP4 ST=1, then ST=8 from 768 KiB.
-#         TP8 ST=8 everywhere.
+#         TP8 ST=8 everywhere, for a host that does not split into groups.
 MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     # --- gfx942 (MI300X) / xGMI ----------------------------------------------
     ("gfx942", "xgmi", 2): (
@@ -714,12 +832,33 @@ RING_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
     ),
 }
 
+# Hierarchical, ``HierRung``. Only for hosts whose ranks split into two
+# uniform groups. Its local laps carry the bytes of a TP``G`` mesh or ring, so
+# it starts from the PCIe TP4 mesh's ladder.
+HIER_ST_LADDER: dict[tuple[str, str, int], tuple[HierRung, ...]] = {
+    ("gfx950", "pcie", 8): (
+        HierRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
+        HierRung(min_bytes=768 * KiB, super_tile=8, grid_cap=128, block=512),
+        HierRung(
+            min_bytes=24 * MiB,
+            super_tile=32,
+            grid_cap=128,
+            block=512,
+            local_rs="ring",
+            local_ag="ring",
+            rs_codec="int5",
+            x_codec="int5",
+        ),
+    ),
+}
+
 # The ladder table of each algorithm. A table has a row exactly where the
 # policy table gives its algorithm a window.
 LADDERS: dict[AllReduceAlgorithm, dict] = {
     AllReduceAlgorithm.OneShot: ONESHOT_LADDER,
     AllReduceAlgorithm.TwoShotMesh: MESH_ST_LADDER,
     AllReduceAlgorithm.TwoShotRing: RING_ST_LADDER,
+    AllReduceAlgorithm.TwoShotHierarchical: HIER_ST_LADDER,
 }
 
 
@@ -754,6 +893,14 @@ def ring_st_ladder(
     """The ring rungs for *(arch, link, world_size)*. *arch* defaults to this
     host's."""
     return _ladder(RING_ST_LADDER, "ring", arch, link, world_size)
+
+
+def hier_st_ladder(
+    *, world_size: int, link: str, arch: str | None = None
+) -> tuple[HierRung, ...]:
+    """The hierarchical rungs for *(arch, link, world_size)*. *arch* defaults
+    to this host's."""
+    return _ladder(HIER_ST_LADDER, "hier", arch, link, world_size)
 
 
 # Host and environment
@@ -802,6 +949,7 @@ _WINDOW_ENV = {
     AllReduceAlgorithm.OneShot: "ONESHOT",
     AllReduceAlgorithm.TwoShotMesh: "MESH",
     AllReduceAlgorithm.TwoShotRing: "RING",
+    AllReduceAlgorithm.TwoShotHierarchical: "HIER",
 }
 
 
@@ -826,7 +974,7 @@ def _has_ladder(alg: AllReduceAlgorithm, key: tuple, *, fused: bool) -> bool:
         AllReduceAlgorithm.OneShot: FUSED_ONESHOT_LADDER,
         AllReduceAlgorithm.TwoShotMesh: FUSED_MESH_ST_LADDER,
         AllReduceAlgorithm.TwoShotRing: FUSED_RING_ST_LADDER,
-    }[alg]
+    }.get(alg, {})
     return any(k[:3] == key for k in table)
 
 
@@ -853,6 +1001,7 @@ def apply_env_overrides(
         (AllReduceAlgorithm.OneShot, "oneshot"),
         (AllReduceAlgorithm.TwoShotMesh, "mesh"),
         (AllReduceAlgorithm.TwoShotRing, "ring"),
+        (AllReduceAlgorithm.TwoShotHierarchical, "hier"),
     ):
         window = _override(getattr(policy, field), *bounds[alg])
         if (
