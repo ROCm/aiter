@@ -434,22 +434,17 @@ def _moe_gemm_a16w16(
 
     out = out.to(Y.type.element_ty)
 
-    # TDM Store: accumulator -> shared memory -> global memory
-    Y += start_m * stride_y_m
-    y_buffer = gl.allocate_shared_memory(
-        Y.type.element_ty,
-        shape=[BLOCK_M, OUT_BLOCK_N],
-        layout=SHARED_LAYOUT_Y,
+    # Store from registers. A TDM store reads an LDS tile, and the allocator
+    # puts that tile on the loop buffers, so the store can read stale weights
+    # (PR 7202). Switch back to the TDM store when that is fixed.
+    # The row base goes into the pointer in index_type. The buffer offset is
+    # then one tile wide and stays in 32 bits.
+    Y += (start_m + BLOCK_M * block_id).to(index_type) * stride_y_m
+    offs_y_m = gl.arange(0, BLOCK_M)
+    offs_y_n = pid_n * OUT_BLOCK_N + gl.arange(0, OUT_BLOCK_N)
+    gl.amd.gfx1250.buffer_store(
+        out,
+        Y,
+        offs_y_m[:, None] * stride_y_m + offs_y_n[None, :] * stride_y_n,
+        mask=((BLOCK_M * block_id + offs_y_m)[:, None] < M) & (offs_y_n[None, :] < yN),
     )
-    y_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=Y,
-        shape=(M, yN),
-        strides=(stride_y_m, stride_y_n),
-        block_shape=(BLOCK_M, OUT_BLOCK_N),
-        layout=SHARED_LAYOUT_Y,
-    )
-    y_buffer.store(out)
-    gl.amd.gfx1250.tdm.async_store(
-        y_desc, [block_id * BLOCK_M, pid_n * OUT_BLOCK_N], y_buffer
-    )
-    gl.amd.gfx1250.tdm.async_wait(0)
