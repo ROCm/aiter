@@ -38,6 +38,14 @@ MAX_MTPR_CLASS = 32768
 # regardless of sort_block_m; smaller MTPR classes keep the route-major layout.
 INDEXED_PAYLOAD_MIN_MTPR = MAX_MTPR_CLASS
 REFERENCE_EXPERTS_PER_RANK = 48
+# Direct fixed-slot layouts validated at EP8: V4 (48 experts per rank) and the
+# V4.1-Flash DSpark draft MoE (128 experts, 16 per rank). Fixed-slot reserves
+# world_size * MTPR rows per local expert, so other widths stay compact.
+V41_FLASH_DRAFT_EXPERTS_PER_RANK = 16
+FIXED_SLOT_EXPERTS_PER_RANK = (
+    REFERENCE_EXPERTS_PER_RANK,
+    V41_FLASH_DRAFT_EXPERTS_PER_RANK,
+)
 R1_EXPERTS_PER_RANK = 32
 KIMI_K3_EXPERTS_PER_RANK = 112
 # Per-network tuning is keyed by the full (experts_per_rank, model_dim,
@@ -795,7 +803,87 @@ def _tune_v41_flash_ep2(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoECo
 
 
 def _tune_v41_flash_ep8(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
-    if ctx.apply_fp4 or ctx.world_size != 8:
+    if ctx.world_size != 8:
+        return config
+    if ctx.apply_fp4:
+        # A4W4 fixed-slot decode at MTPR 512 (AITER_MEGA_FIXED_SLOT_MAX_MTPR=1023), MXFP4 combine. Searched
+        # on 8x MI355X over the DP-padded decode graph sizes 128/160 (bucket 128) and 192/224 (bucket 256);
+        # outputs match the base config bitwise.
+        if ctx.fixed_slot and ctx.mtpr == 512:
+            if ctx.bucket == 128:
+                return _replace_config(
+                    config,
+                    stage1={
+                        "tile_n": 512,
+                        "num_waves": 8,
+                        "async_a_copy": True,
+                        "grid_mult": 1,
+                        "num_dispatch_cu": 240,
+                        "waves_per_eu_hint": 1,
+                        "work_shards": 1,
+                    },
+                    stage2={"block_n": 256, "persist_cu": 128, "spatial_partition": 0},
+                )
+            if ctx.bucket == 256:
+                return _replace_config(
+                    config,
+                    stage1={
+                        "sort_block_m": 64,
+                        "tile_n": 512,
+                        "num_waves": 8,
+                        "async_a_copy": True,
+                        "grid_mult": 1,
+                        "num_dispatch_cu": 168,
+                        "work_shards": 1,
+                    },
+                    stage2={
+                        "block_m": 64,
+                        "block_n": 256,
+                        "persist_cu": 256,
+                        "b2stage": True,
+                        "deep_a_pipeline": True,
+                        "spatial_partition": 201,
+                    },
+                )
+        # A4W4 compact runtime at MTPR 4096 (max_num_batched_tokens) on steps that carry a prefill chunk.
+        # Searched like the decode rules at 768/1024, 1536/2048 and 3072/4096 tokens per rank; outputs match
+        # the base config bitwise. Bucket 4096 keeps 32 dispatch CUs: 40 and up deadlocked at 3072 and 4096
+        # tokens in the search.
+        if not ctx.fixed_slot and ctx.mtpr == 4096:
+            if ctx.bucket == 1024:
+                return _replace_config(
+                    config,
+                    stage1={
+                        "grid_mult": 2,
+                        "num_dispatch_cu": 144,
+                        "prepare_quant_cu": 32,
+                        "work_shards": 2,
+                    },
+                    stage2={"b2stage": True, "deep_a_pipeline": True, "skew_cu": 128},
+                )
+            if ctx.bucket == 2048:
+                return _replace_config(
+                    config,
+                    stage1={
+                        "sort_block_m": 128,
+                        "grid_mult": 2,
+                        "num_dispatch_cu": 40,
+                        "prepare_quant_cu": 32,
+                        "work_shards": 2,
+                    },
+                    stage2={"block_m": 64, "b2stage": True, "deep_a_pipeline": True},
+                )
+            if ctx.bucket == 4096:
+                return _replace_config(
+                    config,
+                    stage1={"prepare_quant_cu": 32, "work_shards": 2},
+                    stage2={
+                        "block_m": 128,
+                        "persist_cu": 256,
+                        "skew_cu": 32,
+                        "spatial_partition": 201,
+                    },
+                )
         return config
     if ctx.fixed_slot:
         if ctx.bucket in (16, 32):
@@ -825,6 +913,54 @@ def _tune_v41_flash_ep8(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoECo
             "skew_cu": 240 if ctx.bucket == 32768 else config.stage2.skew_cu,
         },
     )
+
+
+def _tune_v41_flash_draft_ep8(
+    config: MegaMoEConfig, ctx: _TuningContext
+) -> MegaMoEConfig:
+    # DSpark draft MoE (16 experts per rank), A4W4 fixed-slot decode at MTPR 512 with the MXFP4 combine.
+    # Searched like v41_flash_ep8; outputs match the base config bitwise.
+    if (
+        ctx.world_size != 8
+        or not ctx.apply_fp4
+        or not ctx.fixed_slot
+        or ctx.mtpr != 512
+    ):
+        return config
+    if ctx.bucket == 128:
+        return _replace_config(
+            config,
+            stage1={
+                "sort_block_m": 64,
+                "tile_n": 512,
+                "num_waves": 8,
+                "async_a_copy": True,
+                "grid_mult": 2,
+                "num_dispatch_cu": 240,
+                "mfma_amajor": True,
+                "b_nt": 0,
+            },
+            stage2={"persist_cu": 160, "use_nt": False, "spatial_partition": 804},
+        )
+    if ctx.bucket == 256:
+        return _replace_config(
+            config,
+            stage1={
+                "tile_n": 512,
+                "num_waves": 8,
+                "async_a_copy": True,
+                "grid_mult": 2,
+                "num_dispatch_cu": 208,
+                "b_nt": 0,
+            },
+            stage2={
+                "persist_cu": 192,
+                "persist_strided": True,
+                "skew_cu": 64,
+                "use_nt": False,
+            },
+        )
+    return config
 
 
 @dataclass(frozen=True, slots=True)
@@ -880,6 +1016,13 @@ _NETWORKS = (
         fp4_prelude=True,
     ),
     NetworkProfile("v41_flash_ep8", 48, 5120, 2304, _tune_v41_flash_ep8),
+    NetworkProfile(
+        "v41_flash_draft_ep8",
+        V41_FLASH_DRAFT_EXPERTS_PER_RANK,
+        5120,
+        2304,
+        _tune_v41_flash_draft_ep8,
+    ),
 )
 
 
@@ -939,7 +1082,7 @@ def select_mega_moe_config(
     fixed_slot_dispatch = (
         mtpr_class <= FIXED_SLOT_MAX_MTPR
         and world_size == 8
-        and experts_per_rank == REFERENCE_EXPERTS_PER_RANK
+        and experts_per_rank in FIXED_SLOT_EXPERTS_PER_RANK
     )
     if fixed_slot_dispatch and bucket > FIXED_SLOT_MAX_MTPR:
         raise ValueError(f"fixed-slot does not support token bucket {bucket}")
@@ -1067,7 +1210,7 @@ def build_mega_moe_bundle_plan(
     fixed_slot_dispatch = (
         mtpr <= FIXED_SLOT_MAX_MTPR
         and world_size == 8
-        and experts_per_rank == REFERENCE_EXPERTS_PER_RANK
+        and experts_per_rank in FIXED_SLOT_EXPERTS_PER_RANK
     )
     stage1_variants: list[Stage1Config] = []
     stage2_variants: list[Stage2BundleKey] = []

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 """Fused Stage1 dispatch with FP8/FP4 activation and FP4-weight GEMM1."""
 
 import functools
@@ -29,6 +29,7 @@ from .dispatch import (
 from .gemm1 import _LdsF32View, build_fused_gemm1
 from .mega_moe_config import (
     FIXED_GRID_MULT_VALUES,
+    FIXED_SLOT_EXPERTS_PER_RANK,
     INDEXED_PAYLOAD_MIN_MTPR,
     Stage1Config,
     fixed_stage1_epoch_slot,
@@ -54,8 +55,15 @@ def _validate_fixed_slot_geometry(
     if tile_m <= 0 or max_tokens_per_rank <= 0:
         raise ValueError("fixed-slot requires positive tile and token capacities")
     required_cap = ((npes * max_tokens_per_rank + tile_m - 1) // tile_m) * tile_m
-    if npes != 8 or experts_per_rank != 48 or cap != required_cap:
-        raise ValueError("fixed-slot dispatch requires the direct EP8/EPR48 layout")
+    if (
+        npes != 8
+        or experts_per_rank not in FIXED_SLOT_EXPERTS_PER_RANK
+        or cap != required_cap
+    ):
+        raise ValueError(
+            "fixed-slot dispatch requires the direct EP8 layout with "
+            f"{FIXED_SLOT_EXPERTS_PER_RANK} experts per rank"
+        )
 
 
 def _validate_dispatch_capacity(
