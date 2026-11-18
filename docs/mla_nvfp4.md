@@ -12,7 +12,7 @@ support split-K, MTP, context parallelism, logit capping or other head counts.
 | `q_nope` | uint8 `[B,128,256]` | 512 NoPE E2M1 values, low nibble first |
 | `q_aux` | uint8 `[B,128,128]` | RoPE base/residual, E4M3 scales, padding |
 | `kv_nope` | uint8 `[P,16384]` | Page64 NoPE in 16-token x 32-channel bricks |
-| `kv_aux` | uint8 `[P,8192]` | Page64 RoPE, residual and scales, field-shuffled |
+| `kv_aux` | uint8 `[P,8192]` | Page64 RoPE, residual and scales, N16 bricks |
 | `kv_indptr` | int32 `[B+1]` | Page-count prefix sum |
 | `kv_indices` | int32 `[capacity]` | Physical page IDs, valid up to `kv_indptr[-1]` |
 | `kv_last_page_lens` | int32 `[B]` | 1..64 for nonempty rows, 0 for empty rows |
@@ -25,6 +25,10 @@ Q/output require 16-byte alignment. Normal PyTorch allocations satisfy these
 requirements, while arbitrary offset views may not. Q's two planes have fixed
 row strides of 256 and 128 bytes: slices of an interleaved row are unsupported.
 The byte layout is distinct from FP8 MLA, MXFP4 and other NVFP4 operators.
+Each token16 AUX tile occupies 2048 bytes: two 256-byte RoPE bricks, two
+residual bricks, two NoPE-scale bricks, one RoPE/residual-scale brick and one
+padding brick. Each brick has 16 rows of 16 bytes. The scale brick stores
+four RoPE and four residual scales in each row; its remaining bytes are padding.
 
 Gains are fixed: `G_Q=6.72`, `G_KV=89.6`, `G_P=2688`. Each reconstructed value
 is `E2M1(code) * E4M3(scale) / gain`. The query producer takes absorbed,
@@ -41,7 +45,10 @@ Valid input values must be finite. This is a quantized attention operator:
 agreement with its quantized oracle does not establish full-model accuracy.
 
 The shader uses N128 tiles, FP4 probabilities and delayed threshold rescaling.
-The default log2 rescale threshold is 1; 0 and 6 are explicit alternatives.
+Probabilities use a common N128 anchor and one scale per 32 tokens. The
+pipeline overlaps KV prefetch with QK/PV and uses separate startup and drain
+paths. Output uses LDS staging and tensor stores.
+The default log2 rescale threshold is 6; 0 and 1 are explicit alternatives.
 Its fixed PSF multiplier 5 folds in the KV gain. Arbitrary global gains or
 unquantized probabilities are not supported by this code object.
 
@@ -96,18 +103,17 @@ group from their original values. Do not rebuild the tail by dequantizing old
 FP4. Completed groups need no repeated work. The writer directly updates the
 native bricks and needs no global V copy or full-history shuffle.
 
-The cache writer also accepts `aux_layout="n16"` to write four contiguous
-2048-byte token16 AUX tiles per page. The default `aux_layout="n32"` retains
-the existing decoder format. N16 contains RoPE, residual and scale bricks
-with 16 bytes per token row. It is for a compatible N16 decoder; do not pass
-an N16 AUX cache to the currently shipped N32 decoder. Q/NoPE packing and
-quantization are unchanged. Both layouts support active-tail updates and graphs.
-
 The caller owns page allocation, tail retention, shared-prefix copy-on-write
 and metadata publication. Publish lengths/CSR after the tile write on the same
 stream, or establish an event dependency across streams. Shape checks do not
 read GPU metadata back: valid CSR, page IDs, params capacity and live finite
 scales remain caller contracts. Per-request KV length must fit signed int32.
+
+The current decoder requires `aux_layout="n16"`, the cache writer's default.
+The writer also accepts `aux_layout="n32"` for the previous decoder's format.
+These AUX byte layouts are incompatible despite having the same tensor shape.
+Rebuild old AUX caches with the current producer before using this CO; do not
+reuse an N32 cache with the new decoder. Q and NoPE layouts are unchanged.
 
 Prepare immutable params and warm up all selected operators before graph
 capture. The current stream is selected from the input tensor's device.
@@ -155,7 +161,22 @@ separately and are not distributed with AITER.
 ```bash
 python3 -m pytest op_tests/test_mla_nvfp4.py -q
 AITER_NVFP4_TEST_LARGE=1 python3 -m pytest op_tests/test_mla_nvfp4.py -q
+python3 -m pytest op_tests/test_mla_decode_pagesize64.py -k Nvfp4 -q
+python3 op_tests/test_mla_decode_pagesize64.py --kv-layout nvfp4_n128 -b 1536 -c 1024 2048 3072 4096 5120
 ```
+
+The page64 tests start from BF16 Q/KV, call both GPU producers, and check the
+unified decode entry against full FP32 attention on those BF16 inputs. Output
+and finite LSE use `atol=rtol=0.3` with the page64 benchmark's existing 5%
+element-mismatch budget. A per-request normalized RMS output error limit of
+0.3 also rejects zero outputs for long histories. These are
+end-to-end quantization tolerances, separate from the stricter quantized
+oracle checks in `test_mla_nvfp4.py`. Invalid tail tokens are NaN; empty requests
+must return exact zero output and negative-infinity LSE.
+
+The CLI reports mean decode time from 30 HIP-event samples of a 32-dispatch
+graph. It excludes quantization, cache writes, reference checks and transfers.
+The default FP8 page64 test behavior is unchanged.
 
 Tests cover an independent NumPy N128 oracle, all four score contributions,
 per-token RoPE scales, cold rescaling, empty/tail/ring boundaries, native/public
@@ -165,7 +186,26 @@ The optional test allocates approximately 12GiB to put both KV streams above
 4GiB offsets. Full-model accuracy and shape-specific performance tuning remain
 separate from this first integration.
 
-### Validation record (2026-11-15)
+### Current decode benchmark (2026-11-18)
+
+On gfx1250 B0, the page64 command above checked every output for batch 1536
+with independent random BF16 KV histories, QH128, one query, no split and B6.
+Output and LSE element-mismatch ratios were zero at the stated tolerances.
+Mean decode time uses 30 HIP-event samples, each a 32-dispatch graph; producers
+and reference evaluation run outside the timed graph.
+
+| KV tokens | Mean decode (us) | Maximum per-request output NRMS |
+|---:|---:|---:|
+| 1024 | 86.478 | 0.183017 |
+| 2048 | 160.188 | 0.165114 |
+| 3072 | 238.664 | 0.156243 |
+| 4096 | 319.234 | 0.141637 |
+| 5120 | 396.416 | 0.135378 |
+
+### Previous implementation validation (2026-11-15)
+
+This record applies to the earlier N16 probability implementation. The current
+N32 CO has the same public symbol and ABI but a different numerical contract.
 
 On gfx1250 B0, the 17 NVFP4 tests passed both from the checkout and from a
 clean wheel installed outside the checkout with a fresh JIT directory. This

@@ -2,8 +2,8 @@
   "symbol": "mla_nvfp4_n128",
   "padding": 8,
   "raw_src2_bit58": true,
-  "native32_count": 272,
-  "code_bytes": 63040,
+  "native32_count": 720,
+  "code_bytes": 90256,
   "vgpr": 1024,
   "sgpr": 106,
   "lds": 262144,
@@ -12,7 +12,8 @@
     16384,
     16384
   ],
+  "probability_quantization": "common_n128_anchor_n32",
   "sha256": {
-    "mla_nvfp4_n128.co": "6b856a0577ed30b3e24eaf1ad7d48ad59fe2ceca6f4b7304cb469747ff7044f1"
+    "mla_nvfp4_n128.co": "1570b4fd58887a540dba40b42f798042d0ae8456558d3175927c3fe6666dcab9"
   }
 }

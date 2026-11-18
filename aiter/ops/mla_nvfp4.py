@@ -54,7 +54,7 @@ def _mla_nvfp4_update_cache(
 
 
 def prepare_mla_nvfp4_params(
-    *, device, physical_pages: int, sm_scale: float, rebase_threshold: float = 1.0
+    *, device, physical_pages: int, sm_scale: float, rebase_threshold: float = 6.0
 ) -> torch.Tensor:
     """Create the immutable int32[4] ABI bit buffer before graph capture.
 
@@ -71,7 +71,7 @@ def prepare_mla_nvfp4_params(
     if not math.isfinite(sm_scale):
         raise ValueError("sm_scale must be finite")
     if rebase_threshold not in (0.0, 1.0, 6.0):
-        raise ValueError("rebase_threshold must be 0, 1 or 6; use 1 by default")
+        raise ValueError("rebase_threshold must be 0, 1 or 6; use 6 by default")
     device = torch.device(device)
     if device.type != "cuda":
         raise ValueError("params must be prepared on a GPU device")
@@ -164,7 +164,7 @@ def mla_nvfp4_update_cache(
     kv_nope: torch.Tensor,
     kv_aux: torch.Tensor,
     *,
-    aux_layout: str = "n32",
+    aux_layout: str = "n16",
 ) -> None:
     """Requantize BF16 tiles[T,16,576] directly into the page64 cache.
 
@@ -176,8 +176,8 @@ def mla_nvfp4_update_cache(
     old FP4. No other stream/request may concurrently write the same tile.
     Publish page lengths/CSR after this operation on the same stream or event.
     This function does not own a tail ring, page allocator or prefix copy-on-write.
-    aux_layout="n32" preserves the current decoder format. "n16" writes
-    token16 bricks for a compatible decoder; these layouts cannot be mixed.
+    aux_layout="n16" writes token16 bricks for the current decoder. "n32"
+    writes the legacy N32 field layout; caches in these layouts cannot be mixed.
     """
     if aux_layout not in ("n16", "n32"):
         raise ValueError("aux_layout must be 'n16' or 'n32'")

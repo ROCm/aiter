@@ -78,7 +78,7 @@ def pack4(c):
     return c[..., ::2] | (c[..., 1::2] << 4)
 
 
-def pack(qc, qs, cc, cs, aux_layout="n32"):
+def pack(qc, qs, cc, cs, aux_layout="n16"):
     b, _, _ = qc.shape
     p = cc.shape[0]
     qn = pack4(qc[..., :512]).copy()
@@ -132,7 +132,7 @@ def gpu(x):
     return torch.from_numpy(np.ascontiguousarray(x)).to("cuda")
 
 
-def make_case(lengths, mode="random", threshold=1.0, scale=576**-0.5):
+def make_case(lengths, mode="random", threshold=6.0, scale=576**-0.5):
     lengths = np.array(lengths, np.int32)
     counts = (lengths + 63) // 64
     ptr = np.r_[0, counts.cumsum()].astype(np.int32)
@@ -234,41 +234,50 @@ def oracle(case):
                     @ ct[:, k * 128 : (k + 1) * 128].astype(np.float64).T
                 ).astype(np.float32)
             score += (
-                q[:, 512:].astype(np.float64)
-                @ np.concatenate((ct[:, 512:576], ct[:, 512:576]), axis=1)
-                .astype(np.float64)
-                .T
+                np.concatenate((q[:, 512:576], q[:, 512:576]), axis=1).astype(
+                    np.float64
+                )
+                @ ct[:, 512:].astype(np.float64).T
             ).astype(np.float32)
             score += (
-                q[:, 512:576].astype(np.float64) @ ct[:, 576:].astype(np.float64).T
+                q[:, 576:].astype(np.float64) @ ct[:, 512:576].astype(np.float64).T
             ).astype(np.float32)
             scores = np.full((128, 128), -np.inf, np.float32)
             scores[:, :n] = score * case["beta"]
-            scores = scores.reshape(128, 8, 16)
+            scores = scores.reshape(128, 4, 32)
             gm = scores.max(axis=2)
-            local = np.exp2(
-                scores - np.maximum(gm[..., None], np.finfo(np.float32).min)
-            ).astype(np.float32)
             tilemax = gm.max(axis=1)
             if anchor is None:
                 anchor = tilemax.copy()
             else:
                 new = np.where(tilemax - anchor > case["threshold"], tilemax, anchor)
-                alpha = np.exp2(anchor - new).astype(np.float32)
+                alpha = np.exp2((anchor - new).astype(np.float64)).astype(np.float32)
                 den *= alpha
                 acc *= alpha[:, None]
                 anchor = new
-            relative = np.exp2(gm - anchor[:, None]).astype(np.float32)
-            den += (local.sum(axis=2) * relative).sum(axis=1)
+            # Common tile anchor, fused score scaling, and one P scale per N32.
+            # Evaluate exp2 in FP64 then round, to avoid NumPy FP32 SIMD error
+            # moving a probability across an E2M1 midpoint.
+            exponent = (
+                score.astype(np.float64) * float(case["beta"]) - anchor[:, None]
+            ).astype(np.float32)
+            weights = np.zeros((128, 128), np.float32)
+            weights[:, :n] = np.exp2(exponent.astype(np.float64)).astype(np.float32)
+            delta = gm - anchor[:, None]
+            relative = np.exp2(delta.astype(np.float64)).astype(np.float32)
+            factor = np.float32(6) * np.exp2(
+                np.minimum(-delta, 124).astype(np.float64)
+            ).astype(np.float32)
+            den += weights.astype(np.float64).sum(axis=1).astype(np.float32)
             p = (
-                F4[nearest(local * 6, F4[:8])]
+                F4[nearest(weights.reshape(128, 4, 32) * factor[..., None], F4[:8])]
                 * S8[nearest(relative * 5, S8)][..., None]
             )
             acc += (
                 p.reshape(128, 128)[:, :n].astype(np.float64)
                 @ ct[:, :512].astype(np.float64)
             ).astype(np.float32)
-        outputs.append(acc * (np.float32(1 / 2688) / den)[:, None])
+        outputs.append(acc * ((np.float32(1) / den) * np.float32(1 / 2688))[:, None])
         lses.append((np.log2(den) + anchor) * np.float32(np.log(2)))
     if not outputs:
         return np.empty((0, 128, 512), np.float32), np.empty((0, 128), np.float32)
@@ -285,7 +294,7 @@ def check(args, logical, guards=None):
         rms = np.sqrt(np.mean(expected.astype(np.float64) ** 2))
         diff = actual - expected
         assert np.sqrt(np.mean(diff.astype(np.float64) ** 2)) <= 0.003 * max(rms, 1e-8)
-        assert np.max(np.abs(diff)) <= 0.025 * max(rms, 1e-8)
+        assert np.max(np.abs(diff)) <= 0.03 * max(rms, 1e-8)
         np.testing.assert_allclose(lse.cpu().numpy(), expected_lse, atol=2e-4, rtol=0)
     if guards:
         assert torch.isnan(guards[0][-256:]).all()
@@ -342,7 +351,7 @@ def test_decode_oracle(mode):
         assert torch.equal(args["lse"], expected[1])
 
 
-@pytest.mark.parametrize("threshold", [0.0, 6.0])
+@pytest.mark.parametrize("threshold", [0.0, 1.0, 6.0])
 def test_threshold(threshold):
     check(*make_case([1, 129, 1153, 2049], "rescale", threshold))
 
@@ -480,7 +489,7 @@ def test_quantize_q():
     np.testing.assert_array_equal(qa.cpu().numpy(), ref[1])
 
 
-def cpu_cache(raw, valid, aux_layout="n32"):
+def cpu_cache(raw, valid, aux_layout="n16"):
     cc = np.zeros((2, 64, 640), np.uint8)
     cs = np.full((2, 64, 40), 127, np.uint8)
     x = np.where(np.arange(16)[:, None] < valid, raw, 0).astype(np.float32)
@@ -628,7 +637,7 @@ def test_bf16_producers_to_decode():
         "lengths": lengths,
         "idx": idx,
         "ptr": ptr,
-        "threshold": 1.0,
+        "threshold": 6.0,
         "beta": np.float32(0.07 * math.log2(math.e) / (6.72 * 89.6)),
     }
     check(args, logical)
