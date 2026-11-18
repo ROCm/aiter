@@ -68,20 +68,22 @@ inline bool mla_reduce_v1_supports(const int32_t num_heads, const int32_t head_d
 }
 #undef AITER_MLA_REDUCE_SUPPORTS_X
 
-// gfx942 FlyDSL low-head MLA decode (aiter/ops/flydsl/kernels/mla_gfx942/
-// mla_pagesize1_bf16_fp8.py): BF16 Q, FP8 KV, page size 1, one work item holds every
-// (query, head) row of its Q tile (num_heads * max_seqlen_qo <= 128). It is the only gfx942
-// kernel for these shapes (the BF16/FP8 asm kernel is QH16 and qlen <= 4), so it needs no
-// AITER_MLA_DECODE_PS1_FLYDSL. Below 16 heads the reduce must have a (num_heads, 512) case.
-inline bool mla_gfx942_flydsl_low_head(const std::string_view arch_id,
-                                       const int32_t num_heads,
-                                       const int32_t max_seqlen_qo,
-                                       const AiterDtype q_dtype,
-                                       const AiterDtype kv_dtype,
-                                       const int32_t page_size)
+// gfx942/gfx950 FlyDSL low-head MLA decode (aiter/ops/flydsl/kernels/mla_gfx942/
+// mla_pagesize1_bf16_fp8.py): BF16 Q, the arch's native FP8 KV (FNUZ on gfx942, OCP on
+// gfx950), page size 1, one work item holds every (query, head) row of its Q tile
+// (num_heads * max_seqlen_qo <= 128). It is the only kernel for these shapes on either arch
+// (the BF16/FP8 asm kernel is QH16 and qlen <= 4), so it needs no AITER_MLA_DECODE_PS1_FLYDSL.
+// Below 16 heads the reduce must have a (num_heads, 512) case.
+inline bool mla_flydsl_low_head(const std::string_view arch_id,
+                                const int32_t num_heads,
+                                const int32_t max_seqlen_qo,
+                                const AiterDtype q_dtype,
+                                const AiterDtype kv_dtype,
+                                const int32_t page_size)
 {
-    return (arch_id == "gfx942") && (page_size == 1) && (q_dtype == AITER_DTYPE_bf16) &&
-           (kv_dtype == AITER_DTYPE_fp8) && (max_seqlen_qo >= 1) && (max_seqlen_qo <= 8) &&
+    return (arch_id == "gfx942" || arch_id == "gfx950") && (page_size == 1) &&
+           (q_dtype == AITER_DTYPE_bf16) && (kv_dtype == AITER_DTYPE_fp8) &&
+           (max_seqlen_qo >= 1) && (max_seqlen_qo <= 8) &&
            (((num_heads >= 1) && (num_heads < 16) && mla_reduce_v1_supports(num_heads, 512)) ||
             ((num_heads == 16) && (max_seqlen_qo > 4)));
 }
@@ -180,8 +182,8 @@ inline MlaDecodeHeadPlan mla_decode_head_plan_v1_2(const std::string_view arch_i
     // FP8 or BF16 Q/KV, the dtypes the FlyDSL PS1 kernels take.
     const bool flydsl_ps1_dtypes =
         (q_dtype == kv_dtype) && (q_is_fp8 || (q_dtype == AITER_DTYPE_bf16));
-    const bool gfx942_flydsl_low_head =
-        mla_gfx942_flydsl_low_head(arch_id, num_heads, max_seqlen_qo, q_dtype, kv_dtype, page_size);
+    const bool flydsl_low_head =
+        mla_flydsl_low_head(arch_id, num_heads, max_seqlen_qo, q_dtype, kv_dtype, page_size);
     const bool gfx1250_flydsl_ps1_heads =
         flydsl_ps1 && ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) && flydsl_ps1_dtypes &&
         ((num_heads == 96) ||
@@ -192,7 +194,7 @@ inline MlaDecodeHeadPlan mla_decode_head_plan_v1_2(const std::string_view arch_i
 
     // gfx942 native QH64 FP8 only supports page_size=64; otherwise fold to QH16.
     const bool natively_supported =
-        (num_heads == 16) || gfx1250_flydsl_ps1_heads || gfx942_flydsl_low_head ||
+        (num_heads == 16) || gfx1250_flydsl_ps1_heads || flydsl_low_head ||
         ((arch_id == "gfx950" || (arch_id == "gfx942" && page_size == 64)) &&
          (num_heads == 64) && q_is_fp8 && kv_is_fp8 && (max_seqlen_qo == 1)) ||
         ((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8) ||
@@ -302,11 +304,11 @@ inline MlaBackendId mla_decode_backend(const std::string_view arch_id,
     // FP8 Q/KV with per-tensor scales, or BF16 Q/KV (no scales read).
     const bool ps1_is_fp8     = q_is_fp8 && kv_is_fp8 && has_scales;
     const bool ps1_is_bf16    = q_is_bf16 && kv_is_bf16;
-    const bool gfx942_flydsl_low_head =
-        mla_gfx942_flydsl_low_head(arch_id, num_heads, max_seqlen_qo, q_dtype, kv_dtype, page_size) &&
+    const bool flydsl_low_head =
+        mla_flydsl_low_head(arch_id, num_heads, max_seqlen_qo, q_dtype, kv_dtype, page_size) &&
         (kernel_num_heads == num_heads) && (cp_world_size == 1) && !intra_batch_mode;
     const bool use_flydsl_ps1 =
-        (gfx942_flydsl_low_head ||
+        (flydsl_low_head ||
          (flags.flydsl_ps1 && ((arch_id == "gfx1250" || arch_id == "gfx1250-strict")) &&
           (page_size == 1) && (ps1_is_fp8 || ps1_is_bf16) &&
           ((num_heads == 16) || (num_heads == 32) || (num_heads == 64) ||

@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""gfx942 persistent page-size-one MLA: BF16 Q, E4M3FNUZ KV.
+"""gfx942/gfx950 persistent page-size-one MLA: BF16 Q, native E4M3 KV.
+
+KV is E4M3FNUZ on gfx942 and OCP E4M3FN on gfx950, the formats each arch's
+cvt_pk_f32_fp8 decodes.
 
 Rows are packed as qpos * H + head. Four/eight waves share one gathered KV
 slab; QK row tiles are wave-owned, PV output columns are wave-owned.
@@ -53,7 +56,8 @@ def _mfma(a, b, acc):
 
 
 def _pack_exact(v):
-    # gfx942 native unpack is FNUZ. Every finite FP8 value is exactly BF16.
+    # Native unpack is FNUZ on gfx942 and OCP on gfx950; every finite value of
+    # either E4M3 format is exactly BF16.
     packed = fx.rocdl.perm_b32(
         v[1].bitcast(fx.Int32), v[0].bitcast(fx.Int32), fx.Int32(0x07060302)
     )

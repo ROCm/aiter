@@ -2270,12 +2270,12 @@ def _get_mla_decode_shape_support_cached(
         supported = True
     elif (
         backend is MlaBackend.FLYDSL_PS1
-        and arch == "gfx942"
+        and arch in ("gfx942", "gfx950")
         and v_head_dim == 512
         and cp_world_size == 1
     ):
-        # The planner selects this route only for shapes the gfx942 low-head
-        # FlyDSL kernel covers (mla_gfx942_flydsl_low_head).
+        # The planner selects this route only for shapes the gfx942/gfx950
+        # low-head FlyDSL kernel covers (mla_flydsl_low_head).
         supported = True
     else:
         supported = None

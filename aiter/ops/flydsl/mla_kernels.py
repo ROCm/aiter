@@ -5,6 +5,7 @@ import flydsl.expr as fx
 import torch
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter import dtypes
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
 from .kernels.tensor_shim import _run_compiled, ptr_arg
@@ -44,9 +45,10 @@ def flydsl_mla_pagesize1_bf16_fp8(
     cp_rank=0,
     stream=None,
 ):
-    """gfx942 BF16-Q / FNUZ-FP8-KV page-size-1 MLA decode stage 1 for low head counts.
+    """gfx942/gfx950 BF16-Q / FP8-KV page-size-1 MLA decode stage 1 for low head counts.
 
-    Covers the shapes the planner routes here (``mla_gfx942_flydsl_low_head`` in
+    KV is the arch's native E4M3: FNUZ on gfx942, OCP on gfx950.
+    Covers the shapes the planner routes here (``mla_flydsl_low_head`` in
     csrc/include/mla_decode_shape.h): ``q.size(1)`` in 1..16 query heads (one KV
     head), ``max_seqlen_q`` in 1..8, 576-wide Q/KV rows and 512-wide outputs.
     Every (query, head) row of a work item is packed into 16-row MFMA tiles, so
@@ -65,8 +67,8 @@ def flydsl_mla_pagesize1_bf16_fp8(
     from .kernels.mla_gfx942.mla_pagesize1_bf16_fp8 import (
         launch_mla_pagesize1_bf16_fp8,
     )
-
-    _require_runtime(get_gfx_runtime() == "gfx942", "expected gfx942")
+    arch = get_gfx_runtime()
+    _require_runtime((arch == "gfx942") or (arch == "gfx950") , "expected gfx942 or gfx950")
     _require(q.dim() == 3, "q: expected [total_q, num_heads, 576]")
     num_heads = q.size(1)
     _require(1 <= num_heads <= 16, "q: expected 1--16 query heads")
@@ -78,7 +80,7 @@ def flydsl_mla_pagesize1_bf16_fp8(
     _require(g_kv_indptr is None, "round-robin context parallelism is unsupported")
     _require(q_scale is None, "BF16 Q does not accept q_scale")
     _require_layout("q", q, torch.bfloat16, (None, num_heads, 576))
-    _require_layout("kv_buffer", kv_buffer, torch.float8_e4m3fnuz, (None, 1, 1, 576))
+    _require_layout("kv_buffer", kv_buffer, dtypes.fp8, (None, 1, 1, 576))
     _require_layout("split_data", split_data, torch.float32, (None, num_heads, 512))
     _require_layout(
         "split_lse", split_lse, torch.float32, (split_data.size(0), num_heads)
