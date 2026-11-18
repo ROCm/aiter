@@ -505,13 +505,16 @@ def _ladder(algorithm: str, world_size: int, link: str) -> tuple:
     return ring_st_ladder(world_size=world_size, link=link)
 
 
-def _ships(world_size: int, algorithm: str, link: str) -> bool:
+def _ships(world_size: int, algorithm: str, link: str, fused: bool = False) -> bool:
     """Whether production has a ladder for algorithm at world_size on this
-    host. A schedule without one is never built, so nothing that runs the
-    shipped ladder sweeps it. The pinned-ladder transport cases still run its
-    kernel."""
-    table = fly_policy.LADDERS[fly_policy.AllReduceAlgorithm(algorithm)]
-    return (ARCH, link, int(world_size)) in table
+    host, a fused one (any width) when *fused*. A schedule without one is never
+    built, so nothing that runs the shipped ladder sweeps it. The pinned-ladder
+    transport cases still run its kernel."""
+    return fly_policy._has_ladder(
+        fly_policy.AllReduceAlgorithm(algorithm),
+        (ARCH, link, int(world_size)),
+        fused=fused,
+    )
 
 
 def _expected_cfg(
@@ -4349,9 +4352,10 @@ def _bench_fused_rank(
     as production builds it, the *extra* engines from ``--candidates``,
     ``FUSED_STOCK`` and ``EXACT_STOCK``. Where the fused policy routes a case
     to the one-shot, ``OneShotAllReduceRMSNorm`` as ``oneshot`` too, so every
-    row has the FlyDSL kernel production would run. Each schedule also runs
-    unfused, as ``<schedule>+norm`` (see ``_unfused_bench_thunks``), and with
-    *mxfp4* (gfx950) quantizing, as ``<schedule>_mxfp4`` and
+    row has the FlyDSL kernel production would run. Each schedule with a plain
+    ladder also runs unfused, as ``<schedule>+norm`` (see
+    ``_unfused_bench_thunks``), and with *mxfp4* (gfx950) each schedule
+    quantizes, as ``<schedule>_mxfp4``, and its unfused path too, as
     ``<schedule>+norm+mxfp4``. A case is ``(tokens, hidden)``. Returns, per
     case, whether production would run the HIP fused kernel on it and each
     candidate's per-rank result.
@@ -4410,9 +4414,12 @@ def _bench_fused_rank(
             **knobs,
         )
     # The all-reduce each schedule's fused kernel replaces, as production
-    # builds it, for the unfused columns.
+    # builds it, for the unfused columns. A schedule can ship fused only
+    # (the ring on gfx950/xGMI); it has no unfused columns.
     plains = {}
     for algorithm in algorithms if every else ():
+        if not _ships(tp, algorithm, link):
+            continue
         plains[algorithm] = FlyQuickAllReduce(
             group=gloo,
             device=device,
@@ -4573,7 +4580,8 @@ def _bench_fused_rank(
                 res[f"{a}_mxfp4"]["variant"] = engines[a].variant(
                     hidden, nbytes, mxfp4=True
                 )
-                res[f"{a}+norm+mxfp4"]["variant"] = plains[a].variant(nbytes)
+                if a in plains:
+                    res[f"{a}+norm+mxfp4"]["variant"] = plains[a].variant(nbytes)
             wire = "fp16" if qr is not None and qr.use_fp16_kernels else "bf16"
             for name in FUSED_STOCK:
                 if name in res:
@@ -4619,12 +4627,15 @@ def _unfused_bench_thunks(
                 x, residual, weight, eps, q, q_s, out=o[0], residual_out=o[1]
             )
 
+        thunks[f"{a}_mxfp4"] = _fused_mxfp4
+        if a not in plains:
+            continue
+
         def _unfused_mxfp4(p=plains[a], o=outs[f"{a}+norm+mxfp4"]):
             p.allreduce(x, ar_buf)
             rmsnorm2d_fwd_with_add(o[0], ar_buf, residual, o[1], weight, eps)
             per_1x32_f4_quant_hip(o[0], shuffle=True)
 
-        thunks[f"{a}_mxfp4"] = _fused_mxfp4
         thunks[f"{a}+norm+mxfp4"] = _unfused_mxfp4
     return thunks
 
@@ -4732,8 +4743,9 @@ def _bench_fused(args, tps, algos, link) -> None:
     )
     rows = []
     for tp in tps:
-        # A schedule with no ladder at this (arch, link, tp) is never built.
-        shipped = tuple(a for a in algos if _ships(tp, a, link))
+        # A schedule with no fused ladder at this (arch, link, tp) is never
+        # built.
+        shipped = tuple(a for a in algos if _ships(tp, a, link, fused=True))
         if not shipped:
             continue
         policy = fly_policy.resolve_fused_policy(world_size=tp, link=link)
