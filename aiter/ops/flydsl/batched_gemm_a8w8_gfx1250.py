@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import functools
 import re
+import threading
 
 import torch
 from torch import Tensor
@@ -63,6 +64,8 @@ _run_compiled = None
 _ptr_arg = None
 _check_e8m0 = None
 _fx = None
+_ps_compiled = {}
+_ps_compile_lock = threading.Lock()
 
 
 def _lazy_import():
@@ -80,6 +83,41 @@ def _lazy_import():
     _ptr_arg = ptr_arg
     _check_e8m0 = check_e8m0
     _fx = fx_mod
+
+
+def _run_ps_compiled(exe, *args, specialization_key):
+    """Qualify the code object before any workgroup can touch the mono SGPRs."""
+    import flydsl.compiler as flyc
+    from flydsl.compiler.jit_argument import PointerJitArg
+    from flydsl.utils import env
+
+    if env.compile.compile_only:
+        return _run_compiled(exe, *args, specialization_key=specialization_key)
+    cf = _ps_compiled.get(specialization_key)
+    if cf is None:
+        with _ps_compile_lock:
+            cf = _ps_compiled.get(specialization_key)
+            if cf is None:
+                # Live pointers make flyc.compile dispatch immediately. These
+                # uint8 placeholders preserve the signature without a dispatch.
+                null = flyc.from_c_void_p(_fx.Uint8, 0)
+                placeholders = tuple(null if isinstance(a, PointerJitArg) else a for a in args)
+                cf = flyc.compile(exe, *placeholders)
+                # FlyDSL 0.4.1 retains the lowered gpu.binary on the compiled
+                # artifact. Its metadata comes from the actual AMDGPU object.
+                ir_text = getattr(getattr(cf, "_keepalive", None), "_ir_text", "")
+                header = ir_text.partition('bin = "')[0]
+                counts = re.findall(r"\bsgpr_count = (\d+) : i64", header)
+                spills = re.findall(r"\bsgpr_spill_count = (\d+) : i64", header)
+                if len(counts) != 1 or len(spills) != 1:
+                    raise RuntimeError("Cannot verify gfx1250 PS SGPR metadata before dispatch")
+                if int(counts[0]) > 104 or int(spills[0]):
+                    raise RuntimeError(
+                        f"PS skipped before dispatch to reserve s104/s105: "
+                        f"sgpr_count={counts[0]}, sgpr_spill_count={spills[0]}"
+                    )
+                _ps_compiled[specialization_key] = cf
+    cf(*args)
 
 
 def parse_bmm_kernel_name(name: str) -> dict[str, int] | None:
@@ -420,12 +458,17 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
     Out: Tensor,
     kernel_name: str | None = None,
     w_scale_32x32: bool = False,
+    persistent_workers: int = 0,
 ) -> Tensor:
     """Run the batched mxfp8_32 GEMM; writes into ``Out`` and returns it.
 
     ``w_scale_32x32`` selects the raw ``[B, N//32, K//32]`` block scale; else
     w_scale is the n32k4-shuffled 1x32 ``[B, N, K//32]`` (see module doc).
+    A positive worker count selects the MONO 16x16 grid and four wave32s.
+    Activation/scale reads are DEV and the next stage consumes DEV+HT output.
     """
+    if not isinstance(persistent_workers, int) or persistent_workers not in (0, 256):
+        raise ValueError("gfx1250 MONO requires persistent_workers=256")
     m, b, n, k, out_dtype = _check_bmm_operands("mxfp8_32", XQ, WQ, Out)
     _lazy_import()
     if n % 32 or k % MX32_BLOCK_K:
@@ -453,6 +496,8 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
             f"[FlyDSL gfx1250 bmm] split-K / clusters are not supported on the "
             f"batched path, got {name!r}"
         )
+    if persistent_workers and cfg["m_warp"] * cfg["n_warp"] != 4:
+        raise ValueError("gfx1250 MONO requires four wave32s per workgroup")
     tile_n, tile_k = cfg["tile_n"], cfg["tile_k"]
     k_tail = k % tile_k != 0
     if n % tile_n or tile_n % 32 or (k_tail and not w_scale_32x32):
@@ -470,6 +515,9 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         return Out
 
     out_is_f16 = 1 if out_dtype == "f16" else 0
+    mt = -(-m // cfg["tile_m"]) if persistent_workers else 0
+    nt = n // tile_n if persistent_workers else 0
+    schedule = (persistent_workers, mt, nt, mt * nt * b)
     bmm_spec = (
         cfg["tile_m"],
         tile_n,
@@ -489,9 +537,11 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         False,  # a_scale_preshuffled
         bool(w_scale_32x32),
         k_tail,
+        *schedule,
     )
     # Cached CompiledFunction per constexpr set; see _run_compiled.
-    _run_compiled(
+    runner = _run_ps_compiled if persistent_workers else _run_compiled
+    runner(
         _launch_gemm_a8w8,
         _ptr_arg(Out),
         _ptr_arg(XQ),
@@ -524,7 +574,8 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         False,  # a_scale_preshuffled
         bool(w_scale_32x32),
         k_tail,
-        specialization_key=bmm_spec,
+        *schedule,
+        specialization_key=(XQ.device.index, *bmm_spec) if persistent_workers else bmm_spec,
     )
     return Out
 

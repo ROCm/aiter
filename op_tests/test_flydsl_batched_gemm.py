@@ -211,7 +211,7 @@ def test_fused_quant_n32k4_mbn(b, m, k, dtype):
 
 
 @benchmark()
-def test_batched_gemm(b, m, n, k, dtype, layout):
+def test_batched_gemm(b, m, n, k, dtype, layout, mx32_kernel=None, persistent_workers=0):
     """a8w4 and a8w8 strided-batched GEMM, each vs the BF16 einsum of its
     weight."""
     torch.manual_seed(SEED)
@@ -240,7 +240,7 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
     # a8w4, a8w8_128 and the n32k4 1x32 scale do not run it; 32x32 does, on the
     # archs in RAGGED_K_GFX.
     ragged_k = k % 128 != 0
-    if get_gfx() in A8W4_GFX and not ragged_k:
+    if mx32_kernel is None and get_gfx() in A8W4_GFX and not ragged_k:
         w_bnk, refs["a8w4"] = weight(32)
         # Offline weight prep (not in the hot path); act quant mirrors every forward.
         w_codes, w_scales = preshuffle_a8w4_weight_mbn(w_bnk)
@@ -270,6 +270,8 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
         )
 
     a8w8_blocks = A8W8_BLOCKS[get_gfx()] if layout == "mbn" else ()
+    if mx32_kernel:
+        a8w8_blocks = ((32, 32),)
     for rows, block in a8w8_blocks:
         if ragged_k and (rows != 32 or block != 32 or get_gfx() not in RAGGED_K_GFX):
             continue
@@ -281,6 +283,23 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
         candidates[name] = functools.partial(
             run, x8, shuffle_weight(w8), xs8, ws8, dtype
         )
+        if mx32_kernel:
+            from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import run_bmm_a8w8_mxfp8_32_gfx1250
+
+            w_shuf = shuffle_weight(w8)
+            options = dict(kernel_name=mx32_kernel, w_scale_32x32=True)
+            native = run_bmm_a8w8_mxfp8_32_gfx1250(
+                x8, w_shuf, xs8, ws8, torch.empty_like(y_phys), **options
+            )
+            if persistent_workers:
+                options["persistent_workers"] = persistent_workers
+
+            def launch_mx32():
+                return run_bmm_a8w8_mxfp8_32_gfx1250(
+                    x8, w_shuf, xs8, ws8, y_phys, **options
+                ).transpose(0, 1)
+
+            candidates[name] = launch_mx32
         nbytes[name] = (
             m * b * k  # fp8 A
             + b * n * k  # fp8 B (twice the fp4 codes)
@@ -288,7 +307,7 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
             + b * (n // rows) * (k // block)  # B scale (rows x block)
             + b * m * n * y_phys.element_size()
         )
-        if rows == block == 32 and get_gfx() in A8W8_1X32_GFX and not ragged_k:
+        if mx32_kernel is None and rows == block == 32 and get_gfx() in A8W8_1X32_GFX and not ragged_k:
             candidates["a8w8_1x32"] = functools.partial(
                 _a8w8, x8, shuffle_weight(w8), xs8, expand_32x32_to_n32k4(ws8), dtype
             )
@@ -313,6 +332,9 @@ def test_batched_gemm(b, m, n, k, dtype, layout):
         mre = (ref_f - out_f).abs().mean().item() / denom.item()
         # MXFP8 x MXFP4 vs BF16: cosine is the primary gate (see original wo_a test).
         err = 0.0 if cos >= 0.99 else (1.0 - cos)
+        if mx32_kernel:
+            assert cos >= 0.99, (name, cos, mre)
+            assert torch.equal(out_mbn.view(torch.uint8), native.view(torch.uint8)), name
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes[name] / us / 1e6
@@ -385,21 +407,31 @@ def main():
         default=["mbn"],
         help="Output layout (wo_a uses mbn only).\n        e.g.: -l mbn",
     )
+    parser.add_argument("--mx32-kernel", help="Run only this gfx1250 32x32-scale specialization")
+    parser.add_argument("--persistent-workers", type=int, default=0)
     args = parser.parse_args()
+    if args.persistent_workers and not args.mx32_kernel:
+        parser.error("--persistent-workers requires --mx32-kernel")
+    if args.mx32_kernel and get_gfx() != "gfx1250":
+        parser.error("--mx32-kernel requires gfx1250")
 
     for dtype in args.dtype:
-        quant_rows = []
-        for b, (m, n, k) in itertools.product(args.batch, args.mnk):
-            if k % 128:  # n32k4 groups four 32-wide scales: whole 128-K groups only
-                continue
-            quant_rows.append(test_fused_quant_n32k4_mbn(b, m, k, dtype))
-        summarize("fused_quant_n32k4_mbn", quant_rows)
+        if not args.mx32_kernel:
+            quant_rows = []
+            for b, (m, n, k) in itertools.product(args.batch, args.mnk):
+                if k % 128:  # n32k4 groups four 32-wide scales: whole 128-K groups only
+                    continue
+                quant_rows.append(test_fused_quant_n32k4_mbn(b, m, k, dtype))
+            if quant_rows:
+                summarize("fused_quant_n32k4_mbn", quant_rows)
 
         gemm_rows = []
         for layout, b, (m, n, k) in itertools.product(
             args.layout, args.batch, args.mnk
         ):
-            gemm_rows.append(test_batched_gemm(b, m, n, k, dtype, layout))
+            gemm_rows.append(test_batched_gemm(
+                b, m, n, k, dtype, layout, args.mx32_kernel, args.persistent_workers
+            ))
         summarize("batched_gemm (a8w4 and a8w8, each vs its BF16 reference)", gemm_rows)
 
 

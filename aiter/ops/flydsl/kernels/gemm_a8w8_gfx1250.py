@@ -64,6 +64,10 @@ def launch_gemm_a8w8(
     a_scale_preshuffled: Constexpr[bool] = False,
     b_scale_32x32: Constexpr[bool] = False,
     k_tail: Constexpr[bool] = False,
+    persistent_workers: Constexpr[int] = 0,
+    ps_m_tiles: Constexpr[int] = 0,
+    ps_n_tiles: Constexpr[int] = 0,
+    ps_tasks: Constexpr[int] = 0,
 ):
     mx32 = is_mxscale and block_size == 32
     mx128 = is_mxscale and block_size == 128
@@ -207,6 +211,17 @@ def launch_gemm_a8w8(
             f"limit is {lds_cap} bytes"
         )
     use_quadrant = (wmma_m_rep % 2 == 0) and (wmma_n_rep % 2 == 0) and (n_acc >= 8)
+    # gfx1250 CPOL: DEV=2 in bits 4:3, TH_STORE_HT=2 in bits 2:0.
+    activation_policy = (2 << 3) if persistent_workers else 0
+    output_policy = ((2 << 3) | 2) if persistent_workers else 0
+    # On the 16x16 physical grid, distribute the M tiles in strips of N.
+    # Grouped WOa retains its native M-fastest order across the two batches.
+    n_strip = 0
+    if persistent_workers and ps_tasks == ps_m_tiles * ps_n_tiles:
+        if ps_m_tiles == 2 and ps_n_tiles % 16 == 0:
+            n_strip = 16
+        elif ps_m_tiles == 3 and ps_n_tiles % 4 == 0:
+            n_strip = 4
     scale_tag = "mx32" if mx32 else ("mx128" if mx128 else "ptpc")
     kernel_name = format_kernel_name(
         f"{'batched_' if batched else ''}gemm_a8w8_{scale_tag}"
@@ -219,10 +234,11 @@ def launch_gemm_a8w8(
         + ("_aspre" if a_scale_preshuffled else "")
         + ("_bs32x32" if b_scale_32x32 else "")
         + ("_ktail" if k_tail else "")
+        + (f"_ps256_{ps_m_tiles}x{ps_n_tiles}x{ps_tasks}" if persistent_workers else "")
+        + (f"_ns{n_strip}" if n_strip else "")
     )
 
-    @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
-    def kernel_gemm_a8w8(
+    def gemm_tile(
         arg_c: fx.Pointer,
         arg_a: fx.Pointer,
         arg_b: fx.Pointer,
@@ -234,6 +250,7 @@ def launch_gemm_a8w8(
         i32_stride_ascale_k: fx.Int32,
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
+        bid_x, bid_y, bid_z,
     ):
         if const_expr(k_tail):
             K_TILES = (i32_k + tile_k - 1) // tile_k
@@ -245,7 +262,6 @@ def launch_gemm_a8w8(
         ldc64 = fx.Int64(i32_ldc)
 
         tid = fx.Int32(fx.thread_idx.x)
-        bid_x, bid_y, bid_z = fx.block_idx
         kt_base = fx.Int64(bid_z) * fx.Int64(K_TILES) if split_k > 1 else None
         kt_base_i32 = fx.Int32(bid_z) * fx.Int32(K_TILES) if split_k > 1 else None
         bz64 = fx.Int64(bid_z) if const_expr(batched) else None
@@ -323,6 +339,7 @@ def launch_gemm_a8w8(
                 num_warps=1,
                 pad_interval=A_PAD_INTERVAL,
                 pad_amount=LDS_PAD_A,
+                cache_modifier=activation_policy,
                 early_timeout=True,
             ),
             "workgroup_mask",
@@ -343,12 +360,13 @@ def launch_gemm_a8w8(
         if const_expr(is_mxscale):
 
             def _tdm1(
-                gt, outer, inner, o_stride, mask=0
+                gt, outer, inner, o_stride, mask=0, cache_policy=0
             ):  # single-warp 2-D atom, both dims clamped
                 atom = fx.rocdl.make_tdm_atom(
                     gt,
                     [outer, inner],
                     strides=[o_stride, None],
+                    cache_modifier=cache_policy,
                     num_warps=1,
                     early_timeout=True,
                 )
@@ -359,7 +377,7 @@ def launch_gemm_a8w8(
                 if const_expr(a_scale_preshuffled):
                     sa_off0 = blk_m64 // 32 * k64
                     gSA = _gv(arg_scale_a, sa_off0, SA_SHAPE, (tile_k, 1))
-                    atomSA = _tdm1(gSA, sa_oob, None, k64, a_mask)
+                    atomSA = _tdm1(gSA, sa_oob, None, k64, a_mask, activation_policy)
 
                     def sa_imm(kt):
                         return fx.Int64(kt) * tile_k
@@ -369,7 +387,7 @@ def launch_gemm_a8w8(
                     if const_expr(batched):
                         sa_off0 = sa_off0 + bz64 * (k64 // 32)
                     gSA = _gv(arg_scale_a, sa_off0, SA_SHAPE, (tile_k // 32, 1))
-                    atomSA = _tdm1(gSA, sa_oob, None, stride_ask64, a_mask)
+                    atomSA = _tdm1(gSA, sa_oob, None, stride_ask64, a_mask, activation_policy)
 
                     def sa_imm(kt):
                         return fx.Int64(kt) * (tile_k // 32)
@@ -393,7 +411,7 @@ def launch_gemm_a8w8(
                 if const_expr(sa_m_major):
                     sa_off0 = blk_m64 * stride_ask64 + bz64 * (k64 // 128)
                     gSA = _gv(arg_scale_a, sa_off0, SA_TDM_SHAPE, (SA_LDS_ROW, 1))
-                    atomSA = _tdm1(gSA, mn_oob, None, stride_ask64, a_mask)
+                    atomSA = _tdm1(gSA, mn_oob, None, stride_ask64, a_mask, activation_policy)
 
                     def sa_imm(kt):
                         return fx.Int64(kt * K_WS)
@@ -401,7 +419,7 @@ def launch_gemm_a8w8(
                 else:
                     sa_off0 = blk_m64
                     gSA = _gv(arg_scale_a, sa_off0, SA_SHAPE, (tile_m, 1))
-                    atomSA = _tdm1(gSA, None, mn_oob, stride_ask64, a_mask)
+                    atomSA = _tdm1(gSA, None, mn_oob, stride_ask64, a_mask, activation_policy)
 
                     def sa_imm(kt):
                         return fx.Int64(kt * K_WS) * stride_ask64
@@ -924,7 +942,7 @@ def launch_gemm_a8w8(
         C_TILE = (tile_m, C_LDS_ROW)
         gtC = _gv(gC_base, c_off_rt, (mn_oob, tile_n), (ldc64, 1))
         atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
-            fx.rocdl.TensorStore(),
+            fx.rocdl.TensorStore(cache_modifier=output_policy),
             gtC,
             fx.make_layout(C_TILE, (C_LDS_ROW, 1)),
             C_TILE,
@@ -941,6 +959,49 @@ def launch_gemm_a8w8(
         )
         fx.copy(atomC, tCs[None, 0], tCg[None, 0])
         rocdl.s_wait_tensorcnt(0)
+
+    @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
+    def kernel_gemm_a8w8(
+        arg_c: fx.Pointer, arg_a: fx.Pointer, arg_b: fx.Pointer,
+        arg_scale_a: fx.Pointer, arg_scale_b: fx.Pointer,
+        i32_m: fx.Int32, i32_n: fx.Int32, i32_k: fx.Int32,
+        i32_stride_ascale_k: fx.Int32, i32_lda: fx.Int32, i32_ldc: fx.Int32,
+    ):
+        def tile_at(x, y, z):
+            gemm_tile(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, i32_m, i32_n,
+                      i32_k, i32_stride_ascale_k, i32_lda, i32_ldc, x, y, z)
+
+        def persistent_tile(task):
+            index = fx.Uint32(task)
+            mt = fx.Uint32(ps_m_tiles)
+            mn = index // mt
+            if const_expr(n_strip):
+                width = fx.Uint32(n_strip)
+                stripe = index // width
+                n = (stripe // mt) * width + index % width
+                tile_at(fx.Int32(stripe % mt), fx.Int32(n), fx.Int32(0))
+            elif const_expr(ps_tasks == ps_m_tiles * ps_n_tiles):
+                tile_at(fx.Int32(index % mt), fx.Int32(mn), fx.Int32(0))
+            else:
+                nt = fx.Uint32(ps_n_tiles)
+                tile_at(fx.Int32(index % mt), fx.Int32(mn % nt), fx.Int32(mn // nt))
+
+        if const_expr(persistent_workers):
+            worker = fx.Int32(fx.block_idx.x) + 16 * fx.Int32(fx.block_idx.y)
+            if const_expr(ps_tasks == 256):
+                persistent_tile(worker)
+            elif const_expr(ps_tasks < 256):
+                if worker < ps_tasks:
+                    persistent_tile(worker)
+            else:
+                for task in range(worker, ps_tasks, 256):
+                    persistent_tile(task)
+                    if task + 256 < ps_tasks:
+                        rocdl.s_wait_tensorcnt(0)
+                        workgroup_barrier(use_cluster=False)
+        else:
+            bx, by, bz = fx.block_idx
+            tile_at(bx, by, bz)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
@@ -963,7 +1024,7 @@ def launch_gemm_a8w8(
             "rocdl.cluster_dims": f"{cluster_m},{cluster_n},1" if use_cluster else None
         },
     ).launch(
-        grid=(gx, gy, batch if batched else split_k),  # batched pins split_k==1
+        grid=(16, 16, 1) if persistent_workers else (gx, gy, batch if batched else split_k),
         block=(block, 1, 1),
         stream=stream,
         cluster=cluster_arg,
