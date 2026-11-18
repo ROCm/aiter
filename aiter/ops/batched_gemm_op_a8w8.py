@@ -376,6 +376,23 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
             kernel_name=str(cfg["kernelName"]) if cfg is not None else None,
         )
 
+    if libtype == "triton" and str(cfg["kernelName"]) == "gluon":
+        from .triton.gemm.batched.batched_gemm_afp8wfp8 import (
+            batched_gemm_afp8wfp8_preshuffle,
+        )
+
+        y = torch.empty((m, g, n), dtype=dtype, device=x.device)
+        batched_gemm_afp8wfp8_preshuffle(
+            x.transpose(0, 1),
+            wo_a.view(g, n // 16, k * 16),
+            x_scale.transpose(0, 1),
+            w_scale,
+            dtype=dtype,
+            y=y.transpose(0, 1),
+            is_x_scale_transposed=False,
+        )
+        return y
+
     raise NotImplementedError(
         f"tuned row for B:{g}, M:{m}, N:{n}, K:{k} wants libtype {libtype!r}, "
         "which has no preshuffled-B batched GEMM; row-major rows are served by "
@@ -416,7 +433,8 @@ def batched_gemm_a8w8_mxscale_bpreshuffle(
       whichever was faster at that shape; flydsl's heuristic off the table.
       DeepSeek-V4.1's original wo_a weight (32x32) and V4's (128x128) both run
       as is.
-    * gfx1250, 128x128: flydsl.
+    * gfx1250, 128x128: the tuned row's libtype, flydsl or triton (kernelName
+      "gluon"); flydsl's heuristic off the table.
 
     Returns a fresh token-major [M, G, N]. A caller that must write into its own
     buffer calls a backend directly (both keep ``out=``): the arch's
