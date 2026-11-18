@@ -4508,8 +4508,12 @@ def _bench_fused(args, tps, algos, link) -> None:
     )
     rows = []
     for tp in tps:
+        # A schedule with no ladder at this (arch, link, tp) is never built.
+        shipped = tuple(a for a in algos if _ships(tp, a, link))
+        if not shipped:
+            continue
         policy = fly_policy.resolve_fused_policy(world_size=tp, link=link)
-        key = _bench_key(tp, algos, None, None, extra, "ar_rmsnorm", mxfp4)
+        key = _bench_key(tp, shipped, None, None, extra, "ar_rmsnorm", mxfp4)
         for shape in shapes:
             _register(key, shape)
         rows += [
@@ -4517,7 +4521,7 @@ def _bench_fused(args, tps, algos, link) -> None:
                 tokens,
                 hidden,
                 tp,
-                algos,
+                shipped,
                 route=_fused_route(policy, tokens * hidden * 2),
                 extra=extra,
                 mxfp4=mxfp4,
