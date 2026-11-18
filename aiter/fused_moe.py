@@ -5962,6 +5962,11 @@ def get_2stage_cfgs(
                 _tile_m, _s1_tn, _s2_tk = 32, _tn, 128
                 _s1_tk = 256 if _rows < 96 else 128
                 _s1_sfx, _s2_sfx = ("_bnt0", "") if _rows >= 24 else ("", "_bnt2")
+                if _s1_tk == 256 and _tn == 128:
+                    # Uncapped, LLVM gives this fp8 gemm1 206 VGPRs (2 waves/SIMD);
+                    # waves_per_eu=3 fits it in 162 with no spill, and its bf16
+                    # fallback stays at 168.
+                    _s1_sfx = "_w3" + _s1_sfx
         elif _is_a16w4 and gfx == "gfx942":
             # gfx942 has 64 KiB of LDS, and the a16w-mix port needs 128 KiB at
             # BM=128 x TILE_K=256. Use the a16wi4 fallback's shape-safe tiles
