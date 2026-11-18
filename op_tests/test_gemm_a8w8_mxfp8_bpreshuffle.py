@@ -36,12 +36,12 @@ DEFAULT_MNK_GFX950 = [
 ]
 
 
-def run_torch(x, x_scale, weight, w_scale, w_block=(128, 128)):
-    """fp32 reference from row-major 1x32 A-scales and w_block B-scales."""
+def run_torch(x, x_scale, weight, w_scale, w_block=(128, 128), x_block=32):
+    """fp32 reference from row-major 1 x x_block A-scales and w_block B-scales."""
     m, k = x.shape
     n = weight.shape[0]
     x_scale = torch.exp2(x_scale.view(torch.uint8).float() - 127)
-    x = (x.float().view(m, k // 32, 32) * x_scale[..., None]).view(m, k)
+    x = (x.float().view(m, k // x_block, x_block) * x_scale[..., None]).view(m, k)
     w_scale = torch.exp2(w_scale.view(torch.uint8).float() - 127)
     w_scale = w_scale.repeat_interleave(w_block[0], 0)[:n]
     w_scale = w_scale.repeat_interleave(w_block[1], 1)
@@ -109,6 +109,129 @@ def test_w_scale_layout(n=64, kb=16):
     aiter.logger.info("shuffle_mxfp8_bpreshuffle_scale layout: OK")
 
 
+# (scale block, kernelName without _fsk, N, K): the generic kernel at split_k 2/4/8,
+# a one-row tile, and clusters along M and N next to the K-split cluster.
+FUSED_SPLITK_CASES = (
+    (
+        128,
+        "flydsl_mxfp8_128_bpreshuffle_wmma_t32x64x256_mw1_nw4_nb3_sk2_cm1_cn1",
+        1536,
+        7168,
+    ),
+    (
+        128,
+        "flydsl_mxfp8_128_bpreshuffle_wmma_t16x128x256_mw1_nw4_nb3_sk4_cm1_cn1",
+        2176,
+        7168,
+    ),
+    (
+        128,
+        "flydsl_mxfp8_128_bpreshuffle_wmma_t64x128x128_mw2_nw2_nb4_sk8_cm1_cn1",
+        6400,
+        7168,
+    ),
+    (
+        128,
+        "flydsl_mxfp8_128_bpreshuffle_wmma_t64x128x256_mw2_nw2_nb3_sk2_cm2_cn1",
+        1536,
+        4096,
+    ),
+    (
+        128,
+        "flydsl_mxfp8_128_bpreshuffle_wmma_t32x64x256_mw1_nw4_nb3_sk4_cm1_cn2",
+        1536,
+        4096,
+    ),
+    (
+        32,
+        "flydsl_mxfp8_32_bpreshuffle_wmma_t32x64x256_mw1_nw4_nb3_sk4_cm1_cn1",
+        1536,
+        7168,
+    ),
+    (
+        32,
+        "flydsl_mxfp8_32_bpreshuffle_wmma_t64x128x128_mw2_nw2_nb4_sk2_cm2_cn1",
+        1536,
+        4096,
+    ),
+)
+# M of each case: a single row, ragged tiles, and a tile count cluster_m divides or not.
+FUSED_SPLITK_M = (1, 7, 33, 300, 640)
+
+
+def _fused_splitk_operands(block, m, n, k):
+    """(xq, x_scale, weight, w_scale) with a 1 x block A scale, and a 128 x 128
+    (block 128) or 32 x 32 (block 32) weight scale."""
+    x = torch.randn(m, k, dtype=dtypes.bf16)
+    xq, x_scale = per_group_quant_hip(
+        x, quant_dtype=dtypes.fp8, group_size=block, scale_type=dtypes.fp8_e8m0
+    )
+    weight = (torch.randn(n, k) * 0.02).to(dtypes.fp8)
+    w_scale = torch.randint(122, 127, (n // block, k // block), dtype=torch.uint8)
+    return xq, x_scale, weight, w_scale.view(dtypes.fp8_e8m0)
+
+
+@perftest()
+def run_flydsl(entry, xq, x_scale, weight_shuffle, w_scale, out, kernel_name, **kw):
+    return entry(xq, weight_shuffle, x_scale, w_scale, out, kernel_name, **kw)
+
+
+@benchmark()
+def test_fused_splitk(block, kernel_name, m, n, k):
+    """The generic kernel's fused split-K gives the bytes of its unfused twin, and
+    really skips the reduce kernel, eagerly and under CUDA graph replay."""
+    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as flydsl_gemm
+
+    flydsl_gemm._lazy_import()
+    mx128 = block == 128
+    entry = (
+        flydsl_gemm.run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250
+        if mx128
+        else flydsl_gemm.run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250
+    )
+    kw = {} if mx128 else {"w_scale_32x32": True}
+    xq, x_scale, weight, w_scale = _fused_splitk_operands(block, m, n, k)
+    ref = run_torch(xq, x_scale, weight, w_scale, (block, block), x_block=block)
+    if mx128:  # the kernel reads the A scale as K-major storage of an (M, K/128) view
+        x_scale = x_scale.t().contiguous().view(*x_scale.shape)
+    w_shuf = shuffle_weight(weight, layout=(16, 16))
+    reduces = {}
+
+    def launch(name):
+        out = torch.full((m, n), float("nan"), dtype=dtypes.bf16)
+        with mock.patch.object(
+            flydsl_gemm,
+            "_compile_splitk_reduce",
+            wraps=flydsl_gemm._compile_splitk_reduce,
+        ) as reduce:
+            res, us = run_flydsl(entry, xq, x_scale, w_shuf, w_scale, out, name, **kw)
+        reduces[name] = reduce.call_count
+        return res, us
+
+    unfused, us_unfused = launch(kernel_name)
+    fused, us_fused = launch(kernel_name + "_fsk")
+    assert reduces[kernel_name] > 0 and reduces[kernel_name + "_fsk"] == 0, reduces
+    assert torch.equal(fused, unfused), f"{kernel_name}: fused != unfused at M={m}"
+    err = checkAllclose(ref, fused.float(), msg=f"M={m} N={n} K={k} fused: ")
+
+    out = torch.full((m, n), float("nan"), dtype=dtypes.bf16)
+    entry(xq, w_shuf, x_scale, w_scale, out, kernel_name + "_fsk", **kw)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        entry(xq, w_shuf, x_scale, w_scale, out, kernel_name + "_fsk", **kw)
+    out.fill_(float("nan"))
+    graph.replay()
+    assert torch.equal(out, unfused), f"{kernel_name}: graph replay differs at M={m}"
+    flops, nbytes = 2 * m * n * k, m * k + n * k + m * n * 2
+    return {
+        "unfused us": round(us_unfused, 2),
+        "fused us": round(us_fused, 2),
+        "fused TFLOPS": round(flops / us_fused / 1e6, 1),
+        "fused TB/s": round(nbytes / us_fused / 1e6, 2),
+        "fused err": err,
+    }
+
+
 def tuned_shapes():
     table = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE)
     table = table[(table["gfx"] == get_gfx()) & (table["cu_num"] == get_cu_num())]
@@ -139,3 +262,12 @@ if __name__ == "__main__":
     else:
         df = pd.DataFrame([test_gemm(*mnk) for mnk in args.mnk or tuned_shapes()])
         aiter.logger.info(f"gemm_a8w8_mxfp8_bpreshuffle summary:\n{df.to_markdown()}")
+    if get_gfx() == "gfx1250":
+        df = pd.DataFrame(
+            [
+                test_fused_splitk(block, name, m, n, k)
+                for block, name, n, k in FUSED_SPLITK_CASES
+                for m in FUSED_SPLITK_M
+            ]
+        )
+        aiter.logger.info(f"fused split-K summary:\n{df.to_markdown(index=False)}")
