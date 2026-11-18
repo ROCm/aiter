@@ -1,0 +1,86 @@
+[
+  {
+    "repo": "ROCm/aiter",
+    "commit": "df6a53e19a6d4bbd434c1700b83a862d79215e9e",
+    "path": "aiter/ops/triton/_triton_kernels/quant/quant.py",
+    "symbol": "_mxfp8_quant_op",
+    "sha256": "275307480f4d44d5c256c2af33c0ef3e586194eefbcfbaa93f7a08fc69802fdc"
+  },
+  {
+    "repo": "ROCm/aiter",
+    "commit": "df6a53e19a6d4bbd434c1700b83a862d79215e9e",
+    "path": "aiter/ops/triton/_triton_kernels/quant/fused_mxfp8_quant.py",
+    "symbol": "_fused_dual_rmsnorm_mxfp8_quant_repr",
+    "sha256": "f46199c4455e7672dd4f2514d5d99795437c4d55368f21336e9265e2db338d35"
+  },
+  {
+    "repo": "ROCm/aiter",
+    "commit": "df6a53e19a6d4bbd434c1700b83a862d79215e9e",
+    "path": "aiter/ops/triton/_triton_kernels/quant/fused_mxfp8_quant.py",
+    "symbol": "_fused_dual_rmsnorm_mxfp8_quant_kernel",
+    "sha256": "1cae5095f18dc28e01b627e3f522f208ec116c9145a91a899b766d2a37e1a091"
+  },
+  {
+    "repo": "ROCm/aiter",
+    "commit": "df6a53e19a6d4bbd434c1700b83a862d79215e9e",
+    "path": "aiter/ops/triton/quant/fused_mxfp8_quant.py",
+    "symbol": "fused_dual_rmsnorm_mxfp8_quant",
+    "sha256": "b2d80b2bc9710da71a2440df98c0f75da430380817187a027824476409048147"
+  },
+  {
+    "repo": "ROCm/ATOM",
+    "commit": "10b99a085ba46e5b3a125f0114cec7c71e401552",
+    "path": "atom/model_ops/blockscale_kernels/quantization.py",
+    "symbol": "FP8_DTYPE",
+    "sha256": "3ee940afd2343660bcf0a55f98dac44865e82101d74ad174b73496edee3d4bb9"
+  },
+  {
+    "repo": "ROCm/ATOM",
+    "commit": "10b99a085ba46e5b3a125f0114cec7c71e401552",
+    "path": "atom/model_ops/blockscale_kernels/quantization.py",
+    "symbol": "FP8_MAX",
+    "sha256": "4c5f1272cf5d117edeea4b7058c242155d5728bbcabe60da549fafe5bf8d5d85"
+  },
+  {
+    "repo": "ROCm/ATOM",
+    "commit": "10b99a085ba46e5b3a125f0114cec7c71e401552",
+    "path": "atom/model_ops/blockscale_kernels/quantization.py",
+    "symbol": "FP8_TL_DTYPE",
+    "sha256": "dd3c090a7bc7b929f28ff58098a0db01db1533f97c8bb0617bbc512f612e6ea0"
+  },
+  {
+    "repo": "ROCm/ATOM",
+    "commit": "10b99a085ba46e5b3a125f0114cec7c71e401552",
+    "path": "atom/model_ops/blockscale_kernels/quantization.py",
+    "symbol": "AMAX_FLOOR",
+    "sha256": "96fc94101bc5c66b149b3c1e98f44bf6004e364e4fde9d02be2e83fc0e659251"
+  },
+  {
+    "repo": "ROCm/ATOM",
+    "commit": "10b99a085ba46e5b3a125f0114cec7c71e401552",
+    "path": "atom/model_ops/blockscale_kernels/quantization.py",
+    "symbol": "ceil_pow2_code",
+    "sha256": "df779fa9d658eab78cc2cf0e99a8464648ff9e47551bc73621b5f97433cfc2d4"
+  },
+  {
+    "repo": "ROCm/ATOM",
+    "commit": "10b99a085ba46e5b3a125f0114cec7c71e401552",
+    "path": "atom/model_ops/blockscale_kernels/quantization.py",
+    "symbol": "quantize_fp8_kernel",
+    "sha256": "e238753ee52666c337270bb927db954ec317351b4ae0064ddaf24bea1d96ea1d"
+  },
+  {
+    "repo": "ROCm/ATOM",
+    "commit": "10b99a085ba46e5b3a125f0114cec7c71e401552",
+    "path": "atom/model_ops/blockscale.py",
+    "symbol": "_check_quant_input",
+    "sha256": "4b5ca1930b882cc61ffece7b72309bd1efb733cc40b6a3f00691c563c5cb4fe6"
+  },
+  {
+    "repo": "ROCm/ATOM",
+    "commit": "10b99a085ba46e5b3a125f0114cec7c71e401552",
+    "path": "atom/model_ops/blockscale.py",
+    "symbol": "quantize_fp8",
+    "sha256": "7d868646988836cd58703abcf2302cdcab53a0436e8c9c50c124d6f892503557"
+  }
+]
