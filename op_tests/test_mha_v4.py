@@ -763,7 +763,8 @@ _MXFP8_SCALE_MODES = {
 def _mx_recipe_args(recipe):
     """(formats, scale-mode keywords) that select an MX recipe through mha_v4."""
     if recipe == "mxfp8":
-        return (native_fp8_format(),) * 3, _MXFP8_SCALE_MODES
+        # MXFP8 rows are OCP E4M3 on every arch, and native_fp8_format() is FNUZ on gfx942.
+        return (AttentionFormat.FP8_E4M3,) * 3, _MXFP8_SCALE_MODES
     return (_MX_RECIPE_FORMATS[recipe],) * 3, {}
 
 
