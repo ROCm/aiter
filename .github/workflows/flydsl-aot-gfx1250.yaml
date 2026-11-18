@@ -1,0 +1,286 @@
+name: FlyDSL AOT gfx1250
+
+# Compiles every FlyDSL kernel aiter's AOT modules reach on gfx1250 (the
+# replays of aiter/aot/flydsl/*.py with GPU_ARCHS=gfx1250), on a CPU runner,
+# then checks that the runtime's cache keys hit what was built. The wheel
+# builds of the other workflows target gfx942/gfx950 only, so this is the one
+# place gfx1250 FlyDSL kernels and their tuned tables are compiled in CI.
+# See .github/scripts/flydsl_aot_ci.py for the pass/fail contract and
+# .github/flydsl-aot/ for the known failures.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths:
+      - 'aiter/**'
+      - 'aiter_worker_limits.py'
+      - 'requirements.txt'
+      - 'setup.py'
+      - '.github/flydsl-aot/**'
+      - '.github/scripts/flydsl_aot_ci.py'
+      - '.github/scripts/flydsl_aot_ci_selftest.py'
+      - '.github/workflows/flydsl-aot-gfx1250.yaml'
+      - '.github/workflows/ci-config.yaml'
+      - '!**/*.md'
+  push:
+    branches: [main]
+    paths:
+      - 'aiter/**'
+      - 'aiter_worker_limits.py'
+      - 'requirements.txt'
+      - 'setup.py'
+      - '.github/flydsl-aot/**'
+      - '.github/scripts/flydsl_aot_ci.py'
+      - '.github/scripts/flydsl_aot_ci_selftest.py'
+      - '.github/workflows/flydsl-aot-gfx1250.yaml'
+      - '.github/workflows/ci-config.yaml'
+      - '!**/*.md'
+  schedule:
+    - cron: '30 19 * * *'
+  workflow_dispatch:
+    inputs:
+      docker_image:
+        description: >-
+          Build image; empty uses the CI config's Python 3.12 image. FlyDSL keys
+          its cache on the image's ROCm device bitcode, so artifacts hit at
+          runtime only in an image with the same ROCm.
+        required: false
+        default: ''
+        type: string
+      gfx1250_runner:
+        description: >-
+          Self-hosted gfx1250 runner label. When set, a second job loads every
+          built code object on that runner's GPU, in the same image.
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  AOT_ARCH: gfx1250
+  AOT_DIR: flydsl-aot
+
+jobs:
+  ci_config:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    uses: ./.github/workflows/ci-config.yaml
+
+  build:
+    name: FlyDSL AOT gfx1250 compile and cache check
+    needs: ci_config
+    runs-on: build-only-aiter
+    timeout-minutes: 120
+    env:
+      DOCKER_IMAGE: ${{ inputs.docker_image || needs.ci_config.outputs.pytorch_py312_image }}
+      AITER_MAX_JOBS: "64"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Self-test the CI driver
+        run: python3 .github/scripts/flydsl_aot_ci_selftest.py
+
+      - name: Docker login
+        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+        env:
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
+
+      - name: Pull build image
+        run: |
+          set -euo pipefail
+          if docker image inspect "${DOCKER_IMAGE}" >/dev/null 2>&1; then
+            echo "Using locally cached build image: ${DOCKER_IMAGE}"
+          else
+            bash .github/scripts/docker_pull_with_retry.sh "${DOCKER_IMAGE}"
+          fi
+
+      - name: Compile and check the FlyDSL AOT cache
+        run: |
+          set -euo pipefail
+          rm -rf "${AOT_DIR}"
+          mkdir -p "${AOT_DIR}"
+          docker run --rm --pull=never --network=host \
+            -e AOT_ARCH -e AOT_DIR -e AITER_MAX_JOBS \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            "${DOCKER_IMAGE}" \
+            bash -lc '
+              set -euo pipefail
+              # Hand everything the build wrote back to the runner user.
+              trap "chown -R ${HOST_UID}:${HOST_GID} /workspace" EXIT
+              pip install -r requirements.txt
+              python -c "import flydsl, torch; print(\"flydsl\", flydsl.__version__, \"torch\", torch.__version__)"
+              # aiter merges its tuned tables under the temp dir.
+              export TMPDIR="/workspace/${AOT_DIR}/tmp"
+              mkdir -p "${TMPDIR}"
+              args=(build --arch "${AOT_ARCH}"
+                    --cache-dir "/workspace/${AOT_DIR}/cache"
+                    --out-dir "/workspace/${AOT_DIR}/report")
+              known=".github/flydsl-aot/${AOT_ARCH}-known-failures.txt"
+              if [ -f "${known}" ]; then
+                args+=(--known-failures "${known}")
+              fi
+              python .github/scripts/flydsl_aot_ci.py "${args[@]}"
+            '
+
+      - name: Summarize
+        if: ${{ always() }}
+        run: |
+          if [ -f "${AOT_DIR}/report/summary.md" ]; then
+            cat "${AOT_DIR}/report/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "::warning::The FlyDSL AOT build wrote no summary"
+          fi
+
+      - name: Upload logs and summary
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flydsl-aot-${{ env.AOT_ARCH }}-report
+          path: ${{ env.AOT_DIR }}/report
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Package the FlyDSL cache
+        run: |
+          set -euo pipefail
+          tar -C "${AOT_DIR}" --exclude='*.lock' -czf "${AOT_DIR}/flydsl-aot-cache-${AOT_ARCH}.tar.gz" cache
+          ls -lh "${AOT_DIR}/flydsl-aot-cache-${AOT_ARCH}.tar.gz"
+
+      - name: Upload the FlyDSL cache
+        uses: actions/upload-artifact@v4
+        with:
+          name: flydsl-aot-${{ env.AOT_ARCH }}-cache
+          path: ${{ env.AOT_DIR }}/flydsl-aot-cache-${{ env.AOT_ARCH }}.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Drop registry credentials
+        if: ${{ always() }}
+        run: |
+          # Self-hosted runners are persistent: drop the registry credentials
+          # written by the "Docker login" step so they do not outlive this job
+          # (SEC-00837 / ROCM-26712).
+          docker logout || true
+
+  load:
+    name: FlyDSL AOT gfx1250 load on GPU
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.gfx1250_runner != '' }}
+    needs: [ci_config, build]
+    runs-on: ${{ inputs.gfx1250_runner }}
+    timeout-minutes: 60
+    env:
+      DOCKER_IMAGE: ${{ inputs.docker_image || needs.ci_config.outputs.pytorch_py312_image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Docker login
+        env:
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
+
+      - name: Pull image
+        run: |
+          set -euo pipefail
+          if docker image inspect "${DOCKER_IMAGE}" >/dev/null 2>&1; then
+            echo "Using locally cached image: ${DOCKER_IMAGE}"
+          else
+            bash .github/scripts/docker_pull_with_retry.sh "${DOCKER_IMAGE}"
+          fi
+
+      - name: Download the FlyDSL cache
+        uses: actions/download-artifact@v4
+        with:
+          name: flydsl-aot-${{ env.AOT_ARCH }}-cache
+          path: ${{ env.AOT_DIR }}
+
+      - name: Load every code object on the GPU
+        run: |
+          set -euo pipefail
+          tar -C "${AOT_DIR}" -xzf "${AOT_DIR}/flydsl-aot-cache-${AOT_ARCH}.tar.gz"
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          # shellcheck disable=SC2086
+          docker run --rm --pull=never --network=host \
+            --device=/dev/kfd ${DEVICE_FLAG} \
+            --group-add "$(getent group render | cut -d: -f3)" \
+            --group-add "$(getent group video | cut -d: -f3)" \
+            -e AOT_ARCH -e AOT_DIR \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            "${DOCKER_IMAGE}" \
+            bash -lc '
+              set -euo pipefail
+              trap "chown -R ${HOST_UID}:${HOST_GID} /workspace" EXIT
+              pip install -r requirements.txt
+              python .github/scripts/flydsl_aot_ci.py load --arch "${AOT_ARCH}" \
+                --cache-dir "/workspace/${AOT_DIR}/cache" \
+                --out-dir "/workspace/${AOT_DIR}/load-report"
+            '
+
+      - name: Summarize
+        if: ${{ always() }}
+        run: |
+          if [ -f "${AOT_DIR}/load-report/summary.md" ]; then
+            cat "${AOT_DIR}/load-report/summary.md" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload the load report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flydsl-aot-${{ env.AOT_ARCH }}-load-report
+          path: ${{ env.AOT_DIR }}/load-report
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Drop registry credentials
+        if: ${{ always() }}
+        run: docker logout || true

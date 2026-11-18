@@ -1,0 +1,17 @@
+# FlyDSL AOT known failures on gfx1250, for .github/scripts/flydsl_aot_ci.py.
+#
+# Each line is "<module> <count> <regex>": the regex is searched in the text
+# of the module's "[FAIL]" lines, and must match exactly <count> of them in
+# both the compile and the --check pass. A fixed failure therefore changes a
+# count and turns the run red, as a new failure does: remove the entry with
+# the fix. Never raise a count, or widen a regex, to turn a run green.
+
+# #8162: since #7726, 256x256x256 grouped tiles use the explicit VGPR
+# partition, whose 128-VGPR register slot five tuned rows overflow (A8W4 with
+# 2x2 or 1x4 warps, A4W4 with 1x4): tracing fails at `assert slot_width <= 128`
+# in aiter/ops/flydsl/kernels/mxfp4_preshuffle_gfx1250_tdm.py, at both ends of
+# each row's token bucket. The runtime fails the same way there.
+moe 12 ^grouped_gemm1_fp4_gugu \| grouped_gemm2_fp4 .* dims=\(3072,3072\) E=128 topk=4 .*arch=gfx1250: AssertionError:$
+moe 4 ^grouped_gemm1_fp4_gugu \| grouped_gemm2_fp4 .* dims=\(4096,2048\) E=256 topk=6 .*arch=gfx1250: AssertionError:$
+moe 12 ^grouped_gemm1_fp4_gugu \| grouped_gemm2_fp4 .* dims=\(6144,3072\) E=129 topk=5 .*arch=gfx1250: AssertionError:$
+moe 8 ^grouped_gemm1_fp4_gugu \| grouped_gemm2_fp4 .* dims=\(7168,3072\) E=96 topk=6 .*arch=gfx1250: AssertionError:$

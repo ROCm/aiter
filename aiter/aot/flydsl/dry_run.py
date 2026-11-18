@@ -51,6 +51,12 @@ class _Device:
         return False
 
 
+# Fake device addresses of FakeTensor storages: page-aligned, a guard page
+# apart, from a base inside the 47-bit user address space.
+_FAKE_ADDRESS_BASE = 1 << 44
+_FAKE_PAGE = 1 << 12
+
+
 class GpuRuntimeReached(RuntimeError):
     """Host code under :func:`dry_run` reached the GPU runtime."""
 
@@ -211,6 +217,24 @@ def dry_run(
         name=name or arch, gcnArchName=arch, multi_processor_count=cu_num
     )
     real_data_ptr = torch.Tensor.data_ptr
+    # Fake address range of each storage alive in this dry run, by storage
+    # identity: (base, bytes). Host code compares pointers and the ranges they
+    # span (a GEMM refuses an output that overlaps its inputs), so storages
+    # get disjoint, page-aligned ranges; the address of the storage object
+    # itself would put two storages a few hundred bytes apart.
+    storage_ranges: dict[int, tuple[int, int]] = {}
+    next_base = [_FAKE_ADDRESS_BASE]
+
+    def storage_base(storage) -> int:
+        nbytes = storage.nbytes()
+        base, size = storage_ranges.get(storage._cdata, (0, -1))
+        if size < nbytes:
+            # New, or its identity was reused by a larger storage after the
+            # last one died.
+            base = next_base[0]
+            next_base[0] += -(-max(nbytes, 1) // _FAKE_PAGE) * _FAKE_PAGE + _FAKE_PAGE
+            storage_ranges[storage._cdata] = (base, nbytes)
+        return base
 
     def data_ptr(tensor):
         if not isinstance(tensor, FakeTensor):
@@ -220,7 +244,7 @@ def dry_run(
         # Storage identity keeps aliasing visible to host code comparing
         # pointers; the address is never dereferenced.
         return (
-            tensor.untyped_storage()._cdata
+            storage_base(tensor.untyped_storage())
             + tensor.storage_offset() * tensor.element_size()
         )
 

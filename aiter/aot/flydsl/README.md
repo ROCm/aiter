@@ -439,3 +439,45 @@ python op_tests/test_moe_2stage.py
   does not need. It is noise, not a failure.
 - **Step 2 reports a cache miss**: confirm step 1 actually ran, the cache dir and
   arch match, and the CSV config hasn't changed.
+
+---
+
+## 4. gfx1250 CI
+
+The wheel builds of aiter's CI target gfx942 and gfx950, so they never compile
+a gfx1250 FlyDSL kernel. `.github/workflows/flydsl-aot-gfx1250.yaml` does, on a
+CPU build runner, for every pull request that touches `aiter/`, on `main` and
+nightly. It runs `.github/scripts/flydsl_aot_ci.py build`, which:
+
+- builds aiter's C++ host modules for gfx950 first (`--host-arch`): the
+  replays call only their host code, and ROCm 7.2's HIP cannot build them for
+  gfx1250 (see above);
+- runs every module `run_aot` runs, with `GPU_ARCHS=gfx1250`, into an empty
+  cache, then runs each again with `--check`;
+- fails on any failed replay that `.github/flydsl-aot/gfx1250-known-failures.txt`
+  does not list, on a listed failure whose count changed (so a fix shows up and
+  its entry gets removed), on a worker that died, and on a cache without
+  artifacts or with an artifact compiled for another target.
+
+Its logs and `summary.md` are uploaded as `flydsl-aot-gfx1250-report`, and
+the cache as `flydsl-aot-gfx1250-cache`. Run it locally the same way:
+
+```bash
+python .github/scripts/flydsl_aot_ci.py build --arch gfx1250 \
+  --cache-dir /tmp/flydsl-aot/cache --out-dir /tmp/flydsl-aot/report \
+  --known-failures .github/flydsl-aot/gfx1250-known-failures.txt
+# One module, compile pass only:
+python .github/scripts/flydsl_aot_ci.py build --arch gfx1250 --modules gemm \
+  --no-check --cache-dir /tmp/flydsl-aot/gemm --out-dir /tmp/flydsl-aot/gemm-report
+```
+
+A failure's traceback is in its module's log (the build sets
+`AITER_FLYDSL_AOT_TRACEBACK=1`).
+
+FlyDSL keys each artifact on the ROCm device bitcode of the image that built
+it, so the cache of the default CI image (ROCm 7.2) is a compile check: a
+gfx1250 runtime image with another ROCm misses it. To build a cache for a
+gfx1250 image, dispatch the workflow with `docker_image` naming that image;
+`gfx1250_runner` then names a gfx1250 runner on which a second job loads every
+code object of the cache (`flydsl_aot_ci.py load`: `hipModuleLoadData` and a
+lookup of each kernel), in the same image.

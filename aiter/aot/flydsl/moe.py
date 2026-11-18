@@ -60,6 +60,7 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 import zlib
 from collections import Counter
 from contextlib import contextmanager
@@ -545,6 +546,8 @@ def compile_one_config(**job) -> dict:
             f"  [FAIL] {description}  arch={arch}: {type(error).__name__}: {error}",
             flush=True,
         )
+        if os.environ.get("AITER_FLYDSL_AOT_TRACEBACK") == "1":
+            traceback.print_exc()
     return result
 
 
