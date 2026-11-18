@@ -2,6 +2,8 @@
 
 给 MI400 机器上的 agent：请执行本清单，补齐正确性与真实 JIT 证据，定位 standalone P256 回退，再验证最小修改。不要只返回计划。当前任务状态为**待执行**；下列候选优化均未实施、未测收益。
 
+**当前优先只排查 A03 的改造是否引入回退：先执行§2.3.1的原 native 源码 P256 对照。A03 的 C1／C2、跨迭代预取和其他 P 扫描暂不先行实施；取得该对照后再决定。** 原 native 每 TG 只做一行，没有下一迭代需要预取，不能把缺少跨迭代预取直接定为回退原因。A09清单保留，当前先处理A03。
+
 ## 0. 版本、范围与启动
 
 | 项目 | 固定值 |
@@ -113,6 +115,24 @@ Python 使用机器上匹配 ROCm 的既有环境；如需隔离，按原指南�
 
 ### 2.3 边界矩阵和单变量对照
 
+#### 2.3.1 A03：先用未修改的 native kernel 直接做 P256
+
+A03 冻结 kernel 已有 `tl.range(row_start, M, NUM_PRGMS, num_stages=2)`，无需添加新循环就能执行 P256。先只增加独立的验收 wrapper，调用冻结的 `_fused_dual_rmsnorm_mxfp8_quant_kernel`；测试／benchmark经该wrapper调用。**不修改 `mono_native.py`，不复制或改写计算体。** 下表中的 M 始终是实际行数，不能为凑 grid 改成256。
+
+| 对照 | 使用的kernel源码 | grid | NUM_PRGMS／row_start |
+| --- | --- | --- | --- |
+| A：原native | 冻结native | `(M,)` | M／pid0 |
+| B：原native直接P256 | 与A相同的冻结native | `(256,)` | 256／pid0 |
+| C：当前PS | 当前候选，`persistent=True` | `(16,16)` | 256／pid0+16*pid1 |
+
+- [ ] 三者固定相同 Q／KV view、权重、eps、floor、dtype、stride、4 wave32、输入pool，以及在capture前分配并保留的同一套输出pool。逐项记录实际kernel参数及JIT specialization；`NUM_PRGMS`数值／整除属性可能改变生成代码，不能仅因源码相同就宣称binary相同。
+- [ ] 先校验 rows=96／256／257／512／513，native逐字节比较、guard／输入未写均通过；再用同一Graph方法，hot／rotating各15轮，按轮轮换A／B／C顺序。保留原正式benchmark结果，三者的诊断时间单列，不混用不同输出pool口径。
+- [ ] 若B与A相当、C较慢，回退位于当前适配路径；对照B／C真实ISA、JIT参数及1D／2D grid。进一步用当前候选的 `PERSISTENT=False`、1D grid=256／步长256作为D，区分源码迁入／编译与二维ID适配。先修该差异，不用预取掩盖。
+- [ ] 若B和C都比A慢，说明保留原源码、只限为P256也可复现；先比较A／B真实代码及运行时参数，再区分TG调度供给和loop执行成本，不能直接写“原native也一样，所以无问题”或“PS必然更慢”。
+- [ ] 若三者在统一buffer的诊断中相当，检查原benchmark的输出分配／地址／Graph节点和JIT差异，复现原回退后再归因。当前Python接口检查发生在capture阶段，不能把它直接加到Graph replay耗时。
+
+完成上述对照后，按结果选择以下边界与优化任务；A03尚未完成本对照时，不以新增跨迭代预取替代排查。
+
 - [ ] 正确性先通过，再用原 benchmark 测以下共同 rows，hot／rotating 各 15 轮：`96 127 128 129 255 256 257 511 512 513`。它们覆盖 A09 第一轮边界、两算子的整轮／少量尾 task；A03 在 127～129 作为未跨轮对照。
 
 ```bash
@@ -131,7 +151,7 @@ python -m op_tests.op_benchmarks.triton.bench_mono_persistent \
 
 ## 3. 有什么方案解决：按证据实施有限候选
 
-优先级：补正确性缺口 → 真实 ISA／边界对照 → C1 → 有明确串行等待证据时 C2。每个候选独立 commit／diff，只改候选代码，保留基线可重跑；目标是解决 standalone 成本，不进入融合。收益全部以实测为准。
+当前优先级：A03原native源码P256对照（§2.3.1）→定位改造／编译／计时差异并修复→必要时再选C1或C2。其余正确性缺口保留；不得把预取作为恢复原性能的先决条件。每个候选独立 commit／diff，只改候选代码，保留基线可重跑；目标是解决 standalone 成本，不进入融合。收益全部以实测为准。
 
 | 候选 | 具体修改对象与方法 | 作用与代价 | 验收 |
 | --- | --- | --- | --- |
