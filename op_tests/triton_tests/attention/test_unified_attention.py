@@ -24,12 +24,12 @@ from aiter.ops.triton.utils.unified_attention_utils import (
     get_unified_attention_config,
 )
 from aiter.test_common import checkAllclose
-from op_tests.gpu_fault_subprocess import (
-    assert_no_gpu_memory_fault,
-    run_in_subprocess,
-)
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
+)
+from op_tests.triton_tests.utils.test_common_utils import (
+    assert_no_gpu_memory_fault,
+    run_in_subprocess,
 )
 
 DEVICE_ARCH = arch_info.get_arch()

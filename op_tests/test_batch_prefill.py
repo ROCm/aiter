@@ -6,6 +6,7 @@ import ctypes
 import itertools
 import math
 import os
+import sys
 import weakref
 
 import pandas as pd
@@ -18,7 +19,13 @@ from aiter import dtypes, per_tensor_quant
 from aiter.test_common import (
     perftest,
 )
-from op_tests.gpu_fault_subprocess import is_gpu_memory_fault, run_in_subprocess
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from op_tests.triton_tests.utils.test_common_utils import (
+    is_gpu_memory_fault,
+    run_in_subprocess,
+)
 
 
 def skip_test_if(condition: bool, reason: str) -> bool:
