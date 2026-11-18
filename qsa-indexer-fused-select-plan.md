@@ -183,10 +183,10 @@ Both competitor arms are open pull requests on `vllm-project/vllm`. The local ch
 
 ### 4. Split-aware merge with folded expand
 
-- [ ] Write a merge kernel that reads each row's split candidates and the first-level histogram, starts at the second radix pass, and selects the final 512. Exact ties at the 512th score may resolve to either block.
-- [ ] Fold expand into the merge: write `token_ids [M, 2051]` directly, with each block's 4 tokens and the incomplete tail, `-1` padded. Optionally also write `block_ids [M, 512]`.
-- [ ] Make the workspace self-zeroing, so the merge clears the histogram it consumed for the next call.
-- [ ] Phase 2 set-gate tests pass end to end.
+- [x] Write a merge kernel that reads each row's split candidates and the first-level histogram, starts at the second radix pass, and selects the final 512. Exact ties at the 512th score may resolve to either block.
+- [x] Fold expand into the merge: write `token_ids [M, 2051]` directly, with each block's 4 tokens and the incomplete tail, `-1` padded. Optionally also write `block_ids [M, 512]`.
+- [x] Make the workspace self-zeroing, so the merge clears the histogram it consumed for the next call.
+- [x] Phase 2 set-gate tests pass end to end.
 
 ### 5. Host entry point and dispatch
 
@@ -306,6 +306,21 @@ Set-gate on gfx950, 2026-11-18. `select err` is the fraction of rows outside the
 | emit | 16 | 392 | 6.75 | 0 |
 | workspace | 32 | 65856 | 29009 | 0 |
 
+### Fused select, Phase 4
+
+Set-gate on gfx950, 2026-11-18, after the merge replaced the torch reduction and the Triton expand on the long-row path. `select err` is the fraction of rows outside the 1.7e-6 window. Every case is one span, so the merge keeps the scorer's top-512. The `select us` column is still the serial 512-slot scan on these small batches, not a serving measurement. Emit stays on the one-page path.
+
+| case | rows | columns | select us | select err |
+| --- | ---: | ---: | ---: | ---: |
+| pad | 32 | 65856 | 29372 | 0 |
+| missing | 16 | 2352 | 21125 | 0 |
+| wide | 16 | 2352 | 28080 | 0 |
+| span | 16 | 2352 | 54261 | 0 |
+| mixed | 16 | 2352 | 134729 | 0 |
+| mtp | 8 | 2352 | 53216 | 0 |
+| emit | 16 | 392 | 5.52 | 0 |
+| workspace | 32 | 65856 | 29004 | 0 |
+
 ### Candidate-state probe, gfx942
 
 Median `T_score` in microseconds, two repeats (`r1 / r2`), each the median of 10 after 5 warmups. "fail" means the launch raised `hipErrorIllegalState`, checked in a fresh process. The gfx942 scorer uses the same probe copy as gfx950. The trimmed-prefix budget is Arm A's top-k plus expand, timed in the same session. The probe does not time Arm A on the pad table, so the pad rows have no budget verdict.
@@ -386,3 +401,4 @@ Fallback used (yes or no, and why):
 - 2026-11-18: Candidate layout chosen from the strided-cache probe. 4-byte candidates (16-bit order-preserving key and 16-bit column offset) for all 16 rows, 32 KiB of LDS. The tile itself is 34400 bytes, so the workgroup total is 67168 bytes. 64 KiB of candidates is over every gfx950 budget, and the 32 KiB dead-array slowdown stays under, with 317.8 µs to spare at `p256k`. One split at 8K, 32K and 128K (2352, 8232 and 32928 columns). Two splits of 32928 at 256K, because 65856 columns exceeds the 16-bit offset. gfx942 has 31136 bytes free beside the tile, so this state does not launch there and the fused path stays on the current indexer until Phase 6.
 - 2026-11-18: Phase 2 oracle check and set-gate, gfx950, gpuq device 0, rocm-smi 2, bus 0000:65:00.0, MI355X, idle at grant. The fp32 oracle matches the fp64 top-512 on the seeded 8K (256 rows), 32K (128 rows), and padded-prefix cases. The largest score gap is 1.62e-6, and the tie bound is 1.7e-6. `qsa_indexer_select` is the entry the set-gate calls. Until the fused kernel replaces its body, that entry runs today's indexer and expand, and it does not clear the caller's score workspace. The set-gate covered a 168-page table, a missing page, a strided cache past 4 GiB, a 16-row tile across two requests, decode rows ahead of prefill rows, MTP rows, and a one-page emit (`n_columns` 392). All eight cases matched the oracle. gfx942 stays gated off.
 - 2026-11-18: Phase 3 fused score and split-local top-512. The kernel is `aiter/ops/flydsl/kernels/qsa/indexer_fused_select.py`. A workgroup owns one 16-row tile and one column span from `fused_split_spans` (one span through 128K, two of 32928 at 256K). It keeps the bf16 MFMA and the 4-head ReLU sum, compares candidates with the fp32 score in the 32 KiB LDS array, and writes a packed 16-bit key plus 16-bit span offset. The first-level histogram is 256 bins of that key, updated on insert and eviction. Invisible, incomplete, and missing-page columns are not inserted. `qsa_indexer_select` uses this path when `n_columns > 512`; the one-page emit path is unchanged. The torch merge returns the kernel's columns for one span and re-ranks two spans in fp32. The Phase 2 set-gate passed on gfx950, gpuq device 0, rocm-smi 4, bus 0000:85:00.0, idle at grant (use 0%, no other pids). A grant on bus 0000:15:00.0 had use 2% and exited 86. All eight cases have `select err` 0. The gate's `select us` is the serial 512-slot scan on these small batches, recorded under [Fused select, Phase 3](#fused-select-phase-3), and is not a serving measurement. gfx942 stays gated off. The real merge is Phase 4.
+- 2026-11-18: Phase 4 split-aware merge. The kernel is `aiter/ops/flydsl/kernels/qsa/indexer_fused_merge.py`. One workgroup per row sums the per-span 256-bin histograms, walks them from the high bin, and runs the second radix pass on the low byte of the one bin that straddles 512. Exact ties on that final key may resolve to either block. It writes `block_ids [M, 512]` and `token_ids [M, 2051]` (four tokens per block, the incomplete tail, `-1` padded) and zeros the histogram bins it read. The scorer still zeros the histogram before it fills it. `qsa_indexer_select` returns those token ids when `n_columns > 512` and no longer calls the Triton expand on that path. The one-page emit path is unchanged. Host compile covered the narrow and wide scorers and the merge (`dry_run("gfx950", 256)`, GPUs hidden). The Phase 2 set-gate passed on gfx950, gpuq device 0, rocm-smi 6, bus 0000:e5:00.0, idle at grant (use 0%, no other pids). All eight cases have `select err` 0, recorded under [Fused select, Phase 4](#fused-select-phase-4). The gate's contexts are one span, so this run does not exercise the second pass. gfx942 stays gated off.

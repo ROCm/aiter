@@ -30,13 +30,13 @@ reports it.
 """
 
 import functools
-import os
 
 import torch
 
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
 from .kernels.kernels_common import LOG2E, ceildiv, get_warp_size
+from .kernels.qsa.indexer_fused_merge import build_qsa_indexer_fused_merge_module
 from .kernels.qsa.indexer_fused_select import (
     HIST_BINS,
     build_qsa_indexer_fused_select_module,
@@ -956,118 +956,12 @@ def _fused_workspace_storage(
     return torch.empty(needed, dtype=torch.int32, device=device)
 
 
-def _check_first_level_histogram(packed: torch.Tensor, histogram: torch.Tensor) -> None:
-    """The 256 bins are the top 8 bits of each surviving candidate's key."""
-    # A compile-only replay has no candidate values to count.
-    if os.environ.get("COMPILE_ONLY") == "1":
-        return
-    valid = packed >= 0
-    keys = (packed >> 16) & 0xFFFF
-    bins = (keys >> 8).clamp(0, HIST_BINS - 1).to(torch.int64)
-    weight = valid.to(torch.int32)
-    expected = torch.zeros(
-        packed.reshape(-1, _K).shape[0],
-        HIST_BINS,
-        dtype=torch.int32,
-        device=packed.device,
-    )
-    expected.scatter_add_(1, bins.reshape(-1, _K), weight.reshape(-1, _K))
-    if not torch.equal(expected, histogram.reshape(-1, HIST_BINS)):
-        raise RuntimeError(
-            "fused indexer histogram does not match the stored candidate keys"
-        )
+_FUSED_TOKEN_WIDTH = _K * _R + _R - 1
 
 
-def _columns_from_packed(packed: torch.Tensor, split_begin: int) -> torch.Tensor:
-    """Global column ids. An empty slot stays ``-1``."""
-    valid = packed >= 0
-    offset = packed & 0xFFFF
-    return torch.where(valid, offset + int(split_begin), torch.full_like(packed, -1))
-
-
-def _rescore_candidate_columns(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    token_to_req: torch.Tensor,
-    query_positions: torch.Tensor,
-    context_lens: torch.Tensor,
-    columns: torch.Tensor,
-    score_scale: float,
-) -> torch.Tensor:
-    """Oracle ReLU-sum on candidate columns. Invisible columns are ``-inf``.
-
-    This is the Phase 3 merge stand-in. It ranks the split candidates by the
-    same fp32 score the set gate uses, and it drops a missing page.
-    """
-    rows, width = columns.shape
-    valid = columns >= 0
-    safe = columns.clamp(min=0)
-    page_size = int(k_cache.shape[1])
-    n_pages = int(page_table.shape[1])
-    page = torch.div(safe, page_size, rounding_mode="floor")
-    off = safe - page * page_size
-    page = page.clamp(max=max(n_pages - 1, 0))
-    n_req = int(context_lens.shape[0])
-    valid_req = (token_to_req >= 0) & (token_to_req < n_req)
-    req = token_to_req.clamp(0, max(n_req - 1, 0)).view(rows, 1).expand(rows, width)
-    phys = page_table[req, page]
-    n_cache = int(k_cache.shape[0])
-    phys_ok = (phys >= 0) & (phys < n_cache) & valid
-    k = k_cache[phys.clamp(min=0), off, 0, :].to(torch.float32)
-    dots = torch.einsum("mhd,mcd->mhc", q.to(torch.float32), k)
-    scores = torch.nn.functional.relu(dots).sum(dim=1) * float(score_scale)
-    slen = context_lens[req[:, 0]]
-    visible = torch.minimum(
-        torch.div(query_positions + 1, _R, rounding_mode="floor"),
-        torch.div(slen, _R, rounding_mode="floor"),
-    )
-    visible = torch.where(valid_req, visible, torch.zeros_like(visible))
-    n_columns = n_pages * page_size
-    visible = torch.minimum(visible, torch.full_like(visible, n_columns))
-    keep = phys_ok & (columns < visible.view(rows, 1))
-    return torch.where(keep, scores, torch.full_like(scores, float("-inf")))
-
-
-def _reference_merge_candidates(
-    packed: torch.Tensor,
-    spans: list[tuple[int, int]],
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    token_to_req: torch.Tensor,
-    query_positions: torch.Tensor,
-    context_lens: torch.Tensor,
-    score_scale: float,
-) -> torch.Tensor:
-    """Reduce per-span top-512 lists to one ``[M, 512]`` block-id tensor.
-
-    One span is already the selection. Two spans are re-ranked in fp32.
-    """
-    columns = torch.cat(
-        [
-            _columns_from_packed(packed[index], begin)
-            for index, (begin, _end) in enumerate(spans)
-        ],
-        dim=1,
-    )
-    if len(spans) == 1:
-        return columns.to(torch.int32)
-    scores = _rescore_candidate_columns(
-        q,
-        k_cache,
-        page_table,
-        token_to_req,
-        query_positions,
-        context_lens,
-        columns,
-        score_scale,
-    )
-    order = torch.argsort(scores, dim=-1, descending=True, stable=True)[:, :_K]
-    picked = torch.gather(scores, 1, order)
-    chosen = torch.gather(columns, 1, order)
-    chosen = torch.where(torch.isfinite(picked), chosen, torch.full_like(chosen, -1))
-    return chosen.to(torch.int32)
+@functools.lru_cache(maxsize=1)
+def _fused_merge_plan():
+    return build_qsa_indexer_fused_merge_module()
 
 
 def _write_fused_indexer_block_ids(
@@ -1078,11 +972,15 @@ def _write_fused_indexer_block_ids(
     query_positions: torch.Tensor,
     context_lens: torch.Tensor,
     out: torch.Tensor | None,
+    token_ids: torch.Tensor | None,
     score_scale: float,
     workspace: torch.Tensor | None,
     max_seq_len: int,
 ) -> torch.Tensor:
-    """Score each span and merge its candidates. No fp32 score matrix is written."""
+    """Score each span, merge on the GPU, and return token ids.
+
+    The merge writes ``block_ids`` and ``token_ids`` and clears the histogram.
+    """
     m, _arch = _prepare_indexer_launch(
         q,
         k_cache,
@@ -1096,8 +994,24 @@ def _write_fused_indexer_block_ids(
     )
     if out is None:
         out = torch.empty(m, _K, dtype=torch.int32, device=q.device)
+    if token_ids is None:
+        token_ids = torch.empty(
+            m, _FUSED_TOKEN_WIDTH, dtype=torch.int32, device=q.device
+        )
+    elif (
+        token_ids.dtype != torch.int32
+        or token_ids.shape != (m, _FUSED_TOKEN_WIDTH)
+        or not token_ids.is_contiguous()
+        or token_ids.device != q.device
+    ):
+        raise ValueError(
+            f"token_ids must be contiguous int32 [{m}, {_FUSED_TOKEN_WIDTH}] "
+            f"on {q.device}, got {token_ids.dtype} {tuple(token_ids.shape)} "
+            f"on {token_ids.device}"
+        )
     if _indexer_empty_geometry(m, k_cache, page_table, context_lens):
-        return out.fill_(-1)
+        out.fill_(-1)
+        return token_ids.fill_(-1)
     q = q.contiguous()
     page_table = page_table.contiguous()
     token_to_req = token_to_req.contiguous()
@@ -1135,20 +1049,25 @@ def _write_fused_indexer_block_ids(
             row_tiles,
             stream,
         )
-    _check_first_level_histogram(packed, histogram)
-    chosen = _reference_merge_candidates(
+    split_begins = torch.tensor(
+        [begin for begin, _end in spans], dtype=torch.int32, device=q.device
+    )
+    _run_compiled(
+        _fused_merge_plan(),
         packed,
-        spans,
-        q,
-        k_cache,
-        page_table,
+        histogram,
+        split_begins,
+        out,
+        token_ids,
         token_to_req,
         query_positions,
         context_lens,
-        score_scale,
+        len(spans),
+        m,
+        int(context_lens.shape[0]),
+        stream,
     )
-    out.copy_(chosen)
-    return out
+    return token_ids
 
 
 def qsa_indexer_select_supported() -> str | None:
@@ -1186,14 +1105,14 @@ def qsa_indexer_select(
 
     ``q`` is bf16 ``[M, 4, 128]``. Rows no wider than 512 use the emit path.
     Longer rows score on the GPU into per-span top-512 candidates and a
-    first-level radix histogram, then a torch merge reduces the spans.
-    ``workspace``, when passed, is still the fp32 buffer
-    ``[M, page_table_width * page_size]`` and is not cleared. The fused path
-    reuses a long enough contiguous buffer as candidate scratch and
-    overwrites every slot it reads. ``block_ids`` and ``token_ids`` are the
-    optional caller-owned outputs. ``num_decode_rows`` counts the decode
-    rows at the front of ``q``. ``max_seq_len`` is the step's longest context
-    and selects the span width.
+    first-level radix histogram. The merge reads that histogram, starts at
+    the second radix pass, writes ``block_ids`` and the expanded
+    ``token_ids``, and clears the histogram. ``workspace``, when passed, is
+    still the fp32 buffer ``[M, page_table_width * page_size]`` and is not
+    cleared. The fused path reuses a long enough contiguous buffer as
+    candidate scratch and overwrites every slot it reads. ``num_decode_rows``
+    counts the decode rows at the front of ``q``. ``max_seq_len`` is the
+    step's longest context and selects the span width.
     """
     # Local import: aiter.ops.qsa imports this module.
     from aiter.ops.qsa import qsa_expand_block_indices
@@ -1244,7 +1163,7 @@ def qsa_indexer_select(
             scores=scores,
         )
     else:
-        block_ids = _write_fused_indexer_block_ids(
+        return _write_fused_indexer_block_ids(
             q,
             k_cache,
             page_table,
@@ -1252,6 +1171,7 @@ def qsa_indexer_select(
             query_positions,
             context_lens,
             block_ids,
+            token_ids,
             score_scale,
             scores,
             max_seq_len,
