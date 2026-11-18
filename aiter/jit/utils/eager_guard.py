@@ -8,10 +8,13 @@ would make, without the torch.ops dispatch in between. `plain_eager` says
 when that is the same thing: no dispatch mode, torch-function mode, functorch
 transform or jit trace is active, no input intercepts ops, and autograd would
 record nothing. Callers check ``torch.compiler.is_compiling()`` first, so
-dynamo folds the fast path away before reaching here.
+dynamo folds the fast path away before reaching here. An entry point that
+stands in for a routed op also checks `unrouted`.
 """
 
 import torch
+
+from aiter.plugin import _config as _plugin_config
 
 _tensor_types: dict[type, bool] = {torch.Tensor: True, torch.nn.Parameter: True}
 
@@ -30,6 +33,14 @@ def _plain_tensor_type(cls: type) -> bool:
         )
         _tensor_types[cls] = ok
     return ok
+
+
+def unrouted() -> bool:
+    """Whether no kernel plugin can serve any routed op: ``AITER_PLUGINS=0``,
+    or nothing enabled by `aiter.plugin.configure`. That is when a routed op's
+    dispatch runs its native body and records nothing, so a call may skip it."""
+    config = _plugin_config()
+    return config.kill_switch or not config.enabled
 
 
 def plain_eager(tensors: tuple) -> bool:

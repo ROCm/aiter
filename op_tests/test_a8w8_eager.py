@@ -452,6 +452,76 @@ def check_rebound_ops():
     ]
 
 
+def check_plugin_route():
+    """While a kernel plugin is enabled, every GEMM goes through the route of
+    `gemm_a8w8_bpreshuffle`: a provider that serves it runs, one that declines
+    leaves it to the custom op. The quant is not routed and keeps its fast
+    path. With none enabled, the GEMM fast path takes the call again."""
+    from aiter import plugin
+
+    m, n, k = 128, 256, 1024
+    xq, wq, x_scale, w_scale, _ = _inputs(m, n, k)
+    x = _rand(m, k)
+
+    def run(XQ, WQ, x_scale, w_scale, bias, dtype, check):
+        return torch.full((XQ.shape[0], WQ.shape[0]), 7.0, dtype=dtype, device="cuda")
+
+    class Provider:
+        name = "eager-test"
+        api_versions = (plugin.API_VERSION,)
+        op_versions = ("gemm_a8w8_bpreshuffle",)
+        serve = True
+
+        def select(self, op, args, kwargs):
+            if not self.serve:
+                return None
+            return plugin.KernelCandidate(
+                provider=self.name,
+                kernel_id="sevens",
+                artifact_digest="sha256:0",
+                run=run,
+            )
+
+    class EntryPoint:
+        name = Provider.name
+
+        def load(self):
+            return provider
+
+    provider = Provider()
+    entry_points = plugin._entry_points
+    plugin._entry_points = lambda: (EntryPoint(),)
+    plugin._reset_for_testing()
+    rows = []
+    try:
+        with _routed({(m, n, k): CK}):
+            plugin.configure(enable=(Provider.name,), source="test_a8w8_eager")
+            y, calls = _custom_op_calls(lambda: _gemm(xq, wq, x_scale, w_scale))
+            assert bool((y == 7).all()), "the provider did not run"
+            assert plugin.last_decision().route == "provider"
+            rows.append(_row("GEMM, plugin serves the call", calls, True))
+            provider.serve = False
+            y, calls = _custom_op_calls(lambda: _gemm(xq, wq, x_scale, w_scale))
+            assert plugin.last_decision().route == "native"
+            exact = _check_bits(
+                y, lambda: _gemm_op(xq, wq, x_scale, w_scale), "plugin declines"
+            )
+            rows.append(_row("GEMM, plugin enabled, declines", calls, True, exact))
+            q, calls = _custom_op_calls(lambda: _quant(x))
+            assert _same_quant(q, _quant_op(x)), "quant, plugin enabled"
+            rows.append(_row("quant, plugin enabled", calls, False, True))
+            plugin.configure(enable=(), source="test_a8w8_eager")
+            y, calls = _custom_op_calls(lambda: _gemm(xq, wq, x_scale, w_scale))
+            exact = _check_bits(
+                y, lambda: _gemm_op(xq, wq, x_scale, w_scale), "nothing enabled"
+            )
+            rows.append(_row("GEMM, plugin with nothing enabled", calls, False, exact))
+    finally:
+        plugin._entry_points = entry_points
+        plugin._reset_for_testing()
+    return rows
+
+
 def check_compile():
     """torch.compile records both custom ops and gives the eager bits."""
     m, n, k = 256, 512, 1024
@@ -578,6 +648,7 @@ def main():
     paths += check_modes()
     paths += check_replaced_lookup()
     paths += check_rebound_ops()
+    paths += check_plugin_route()
     paths += check_compile()
     paths += check_cuda_graph()
     paths += check_argument_logging()

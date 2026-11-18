@@ -23,7 +23,7 @@ from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..jit.utils.build_targets import base_gfx_arch, is_gfx1250_family
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
-from ..jit.utils.eager_guard import plain_eager
+from ..jit.utils.eager_guard import plain_eager, unrouted
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import (
     find_padded_m_row,
@@ -970,7 +970,12 @@ def _warn_untuned_int8_fallback(
     )
 
 
+# Routed on the public entry: it takes no backend pin, and the CK, FlyDSL and
+# INT8 choices are made beneath it. The torch_compile_guard sits outside the
+# route, as on fused_moe_ and mhc_pre, so a compiling caller still sees one
+# opaque op and the route runs inside it.
 @torch_compile_guard(gen_fake=gemm_a8w8_bpreshuffle_fake)
+@_route(op="gemm_a8w8_bpreshuffle")
 def gemm_a8w8_bpreshuffle(
     XQ: Tensor,
     WQ: Tensor,
@@ -980,6 +985,46 @@ def gemm_a8w8_bpreshuffle(
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
 ) -> Tensor:
+    """Per-token/per-channel FP8 or signed-INT8 preshuffled GEMM.
+
+    Returns a new ``[M, N]`` tensor of ``dtype``,
+    ``(XQ @ WQ_rowmajor.T) * x_scale * w_scale.T``; nothing is written in place.
+    It is a separate contract from a row-major GEMM for the reason
+    :func:`gemm_a8w8_blockscale_bpreshuffle` gives: the preshuffled weight has
+    the same shape, dtype and strides as the row-major one.
+
+    Args:
+        XQ: ``[M, K]`` fp8 (or int8) activation.
+        WQ: ``[N, K_w]`` weight of XQ's dtype, ``shuffle_weight(w,
+            layout=(16, 16))``-preshuffled. ``K_w >= K``; a wider ``WQ`` is
+            zero-padded K, which a provider reads as ``K_w`` with XQ padded.
+        x_scale: fp32 per-token ``[M, 1]`` scale, or a per-tensor ``[1]``.
+        w_scale: fp32 per-channel ``[N, 1]`` scale, or a per-tensor ``[1]``.
+        bias: must be ``None`` (both paths reject a bias).
+        dtype: output dtype; ``bf16`` or ``fp16``.
+        check: AITER's own debug flag; a provider may ignore it.
+
+    The gfx950 INT8 path uses the 4-wave FlyDSL kernel with INT32
+    accumulation, FP32 row/column scales, and BF16 output. Untuned supported
+    shapes use the same kernel through a conservative persistent/non-persistent
+    fallback policy.
+
+    INT8 requires ``bias=None``. A bias tensor is rejected before dispatch;
+    callers add bias to the BF16 output after the GEMM.
+
+    INT8 requires contiguous ``XQ[M,K]`` and ``WQ[N,K_w]`` tensors, with WQ
+    produced by ``shuffle_weight(..., layout=(16, 16))``. K and K_w are
+    multiples of 128, K >= 256, N is a multiple of 16, and K_w may be greater
+    than K. In that padded-weight case XQ is zero-padded and dispatch resolves
+    against the effective launch K_w. The kernel uses 32-bit offsets, so
+    ``M * N * 2``, ``M * K_w`` and ``N * K_w`` must each be below ``2**31``.
+    It accumulates in INT32, so K_w is at most 130944: K_w full-range products
+    of 128 * 128 must stay below ``2**31``.
+
+    AOT packaging covers only specializations reachable from tuned CSV rows.
+    An untuned fallback whose K, CU/XCD topology, or persistence variant is not
+    packaged requires JIT compilation and therefore fails in run-only mode.
+    """
     is_int8 = XQ.dtype == dtypes.i8 or WQ.dtype == dtypes.i8
     if is_int8:
         _check_int8_bpreshuffle_contract(XQ, WQ, x_scale, w_scale, bias, dtype)
@@ -1177,12 +1222,13 @@ def _a8w8_bpreshuffle_eager(
 ) -> Tensor | None:
     """`gemm_a8w8_bpreshuffle` run without the dispatcher when it runs a CK
     kernel (a CK row of the tuned table, or no row at all), or None to leave
-    the call to the custom op: under torch.compile or jit tracing, inside any
-    dispatch mode, torch-function mode or functorch transform, for tensor
-    subclasses that intercept ops, inputs autograd would record, operands
-    other than FP8 (INT8 runs FlyDSL kernels), arguments the op rejects or
-    pads (bias, an unsupported output dtype, a K-padded WQ, other ranks),
-    shapes whose kernel is not CK, and a rebound ``gemm_a8w8_bpreshuffle_ck``.
+    the call to the custom op: while a kernel plugin is enabled (the op is
+    routed), under torch.compile or jit tracing, inside any dispatch mode,
+    torch-function mode or functorch transform, for tensor subclasses that
+    intercept ops, inputs autograd would record, operands other than FP8
+    (INT8 runs FlyDSL kernels), arguments the op rejects or pads (bias, an
+    unsupported output dtype, a K-padded WQ, other ranks), shapes whose kernel
+    is not CK, and a rebound ``gemm_a8w8_bpreshuffle_ck``.
     The kernel comes from `_bpreshuffle_kernel`, as on the op path, so
     ``get_GEMM_config_with_quant_type`` is called through the module attribute
     on every call.
@@ -1195,6 +1241,7 @@ def _a8w8_bpreshuffle_eager(
         or bias is not None
         or (dtype is not torch.bfloat16 and dtype is not torch.float16)
         or gemm_a8w8_bpreshuffle_ck is not _gemm_a8w8_bpreshuffle_ck_op
+        or not unrouted()
         or not plain_eager((XQ, WQ, x_scale, w_scale))
         or XQ.dim() != 2
         or WQ.dim() != 2
@@ -1233,29 +1280,9 @@ def gemm_a8w8_bpreshuffle(
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
 ) -> Tensor:
-    """Per-token/per-channel FP8 or signed-INT8 preshuffled GEMM.
-
-    The gfx950 INT8 path uses the 4-wave FlyDSL kernel with INT32
-    accumulation, FP32 row/column scales, and BF16 output. Untuned supported
-    shapes use the same kernel through a conservative persistent/non-persistent
-    fallback policy.
-
-    INT8 requires ``bias=None``. A bias tensor is rejected before dispatch;
-    callers add bias to the BF16 output after the GEMM.
-
-    INT8 requires contiguous ``XQ[M,K]`` and ``WQ[N,K_w]`` tensors, with WQ
-    produced by ``shuffle_weight(..., layout=(16, 16))``. K and K_w are
-    multiples of 128, K >= 256, N is a multiple of 16, and K_w may be greater
-    than K. In that padded-weight case XQ is zero-padded and dispatch resolves
-    against the effective launch K_w. The kernel uses 32-bit offsets, so
-    ``M * N * 2``, ``M * K_w`` and ``N * K_w`` must each be below ``2**31``.
-    It accumulates in INT32, so K_w is at most 130944: K_w full-range products
-    of 128 * 128 must stay below ``2**31``.
-
-    AOT packaging covers only specializations reachable from tuned CSV rows.
-    An untuned fallback whose K, CU/XCD topology, or persistence variant is not
-    packaged requires JIT compilation and therefore fails in run-only mode.
-    """
+    """Per-token/per-channel FP8 or signed-INT8 preshuffled GEMM: the routed
+    op `_gemm_a8w8_bpreshuffle_op`, whose docstring is its contract, behind
+    the eager fast path."""
     result = _a8w8_bpreshuffle_eager(XQ, WQ, x_scale, w_scale, bias, dtype)
     if result is not None:
         return result
