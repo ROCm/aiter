@@ -17,6 +17,7 @@ from aiter.utility.fp4_utils import (
     dynamic_mxfp4_quant,
     f32_to_mx_e8m0_scale,
     f32_to_mxfp4,
+    fp4_f32_to_e8m0_scale,
     moe_mxfp4_sort,
 )
 from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
@@ -261,13 +262,31 @@ def torch_rms_gated(x, weight, z, eps, group_size, norm_before_gate, activation)
     return y
 
 
+def torch_hadamard32_mxfp4_quant(y):
+    """MXFP4 of y rotated per 32-element block: the fp32 butterfly, rounded
+    to y.dtype, then the ceil_pow2(amax / 6) scale with a 1e-10 amax floor and
+    round-to-nearest-even E2M1."""
+    M, N = y.shape
+    v = y.float()
+    for h in (1, 2, 4, 8, 16):
+        v = v.view(M, N // (2 * h), 2, h)
+        v = torch.stack((v[:, :, 0] + v[:, :, 1], v[:, :, 0] - v[:, :, 1]), dim=2)
+    v = (v.view(M, N) * 0.17677669529663687).to(y.dtype).float()
+    v = v.view(M, N // 32, 32)
+    amax = v.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
+    scale = fp4_f32_to_e8m0_scale(amax).view(torch.uint8)
+    y_fp4 = f32_to_mxfp4(v / e8m0_to_f32(scale.float())).view(torch.uint8)
+    return y_fp4.view(M, N // 2), scale.view(M, N // 32)
+
+
 @pytest.mark.parametrize("M", [1, 1000])
 @pytest.mark.parametrize("N, group_size", [(3072, 128), (256, None), (4096, None)])
 @pytest.mark.parametrize(
-    "norm_before_gate, activation, dtype, transpose_scale",
+    "norm_before_gate, activation, dtype, transpose_scale, hadamard_rotate",
     [
-        (True, "sigmoid", torch.bfloat16, True),
-        (False, "silu", torch.float16, False),
+        (True, "sigmoid", torch.bfloat16, True, False),
+        (False, "silu", torch.float16, False, False),
+        (True, "sigmoid", torch.bfloat16, False, True),
     ],
 )
 def test_fused_rms_gated_mxfp4_quant(
@@ -278,9 +297,12 @@ def test_fused_rms_gated_mxfp4_quant(
     activation: str,
     dtype,
     transpose_scale: bool,
+    hadamard_rotate: bool,
 ):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
+    if hadamard_rotate and arch_info.get_arch() != "gfx950":
+        pytest.skip("hadamard_rotate requires gfx950")
 
     torch.manual_seed(0)
     G = N if group_size is None else group_size
@@ -289,9 +311,12 @@ def test_fused_rms_gated_mxfp4_quant(
     w = torch.randn(G, dtype=dtype, device="cuda")
 
     y_torch = torch_rms_gated(x, w, z, 1e-6, G, norm_before_gate, activation)
-    y_fp4_torch, y_scales_torch = torch_dynamic_mxfp4_quant(
-        y_torch.to(dtype).to(torch.float32)
-    )
+    if hadamard_rotate:
+        y_fp4_torch, y_scales_torch = torch_hadamard32_mxfp4_quant(y_torch.to(dtype))
+    else:
+        y_fp4_torch, y_scales_torch = torch_dynamic_mxfp4_quant(
+            y_torch.to(dtype).to(torch.float32)
+        )
     y_fp4, y_scales = fused_rms_gated_mxfp4_quant(
         x,
         w,
@@ -301,6 +326,7 @@ def test_fused_rms_gated_mxfp4_quant(
         activation=activation,
         group_size=group_size,
         transpose_scale=transpose_scale,
+        hadamard_rotate=hadamard_rotate,
     )
 
     assert y_fp4.shape == (M, N // 2) and y_scales.shape == (M, N // 32)
