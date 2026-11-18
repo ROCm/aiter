@@ -14,7 +14,7 @@ MHA_PATH = Path(__file__).resolve().parents[1] / "aiter" / "ops" / "mha.py"
 
 def _top_level_node(name, node_type):
     tree = ast.parse(MHA_PATH.read_text(encoding="utf-8"), filename=str(MHA_PATH))
-    return next(
+    node = next(
         node
         for node in tree.body
         if isinstance(node, node_type)
@@ -27,6 +27,12 @@ def _top_level_node(name, node_type):
             )
         )
     )
+    # The tests compile the bare function into their own namespace; its
+    # decorators (a plugin route, say) would be evaluated there and need names
+    # that namespace does not have, and they are not what these tests check.
+    if isinstance(node, ast.FunctionDef):
+        node.decorator_list = []
+    return node
 
 
 def _flydsl_available(find_spec):
