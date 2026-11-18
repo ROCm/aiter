@@ -943,6 +943,7 @@ def reduce(kc):
     """5. REDUCE: once every peer closed, sum each token's top-k slots."""
     CF_OFF, E, G, GATE_C, H, K, PH = kc.CF_OFF, kc.E, kc.G, kc.GATE_C, kc.H, kc.K, kc.PH
     RED_CH, RED_UN, addr_out, bid = kc.RED_CH, kc.RED_UN, kc.addr_out, kc.bid
+    RED_B64 = kc.RED_B64
     comb_slot_stride, lane, off_comb_inp = kc.comb_slot_stride, kc.lane, kc.off_comb_inp
     open_gates, peer_va, poll_peer_flags = kc.open_gates, kc.peer_va, kc.poll_peer_flags
     rank, rsrc_ids, stamp, tok = kc.rank, kc.rsrc_ids, kc.stamp, kc.tok
@@ -960,9 +961,12 @@ def reduce(kc):
     rocdl.s_barrier_signal(-1)
     rocdl.s_barrier_wait(-1)
     stamp(6)
-    # Each token's top-k slots get their own resource from its 64-bit
-    # base: past ~14.6 k tokens x top-9 the region outgrows i32 offsets.
+    # RED_B64: each token's top-k slots get their own resource from its 64-bit
+    # base (past ~14.6 k tokens x top-9 the region outgrows i32 offsets);
+    # otherwise one resource and i32 offsets.
     comb_base = peer_va(rank, off_comb_inp)
+    if const_expr(not RED_B64):
+        rsrc_comb_all = create_buffer_resource_from_addr(comb_base)
     rsrc_out = create_buffer_resource_from_addr(addr_out)
     n_red = tok * fx.Int32(RED_CH if PH & 8 else 0)
     for w in range(wave_gid, n_red, G * 4 * RED_UN):
@@ -976,9 +980,14 @@ def reduce(kc):
             w_u = fx.Int32(in_u.select(w_u, w))
             t = w_u // fx.Int32(RED_CH)
             ch = w_u - t * fx.Int32(RED_CH)
-            rsrc_comb = create_buffer_resource_from_addr(
-                comb_base + fx.Int64(t * fx.Int32(K)) * fx.Int64(comb_slot_stride)
-            )
+            if const_expr(RED_B64):
+                rsrc_comb = create_buffer_resource_from_addr(
+                    comb_base + fx.Int64(t * fx.Int32(K)) * fx.Int64(comb_slot_stride)
+                )
+                tok_b = fx.Int32(0)
+            else:
+                rsrc_comb = rsrc_comb_all
+                tok_b = t * fx.Int32(K * int(comb_slot_stride))
             vals = []
             for k in range_constexpr(K):
                 gid = fx.Int32(
@@ -991,7 +1000,7 @@ def reduce(kc):
                     )
                 )
                 valid = (gid >= fx.Int32(0)) & (gid < fx.Int32(E))
-                slot_b = fx.Int32(k * int(comb_slot_stride))
+                slot_b = tok_b + fx.Int32(k * int(comb_slot_stride))
                 for j in range_constexpr(2):
                     raw = buffer_load(
                         rsrc_comb,

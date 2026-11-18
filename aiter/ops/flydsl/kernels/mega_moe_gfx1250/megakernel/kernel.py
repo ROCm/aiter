@@ -246,12 +246,20 @@ def make_megakernel(
     # (V4.1-Flash DEP4, 2048 tokens/rank: the reduce 19 -> 14 us at 2).
     RED_UN_DEF = 2 if COMPACT else 1
     RED_UN = int(os.environ.get("AITER_DMK_RED_UNROLL", str(RED_UN_DEF)))
+    # The reduce reads each token's top-k slots through one comb_inp resource
+    # and i32 offsets while the region fits them; past that (~14.6k tokens x
+    # top-9) each token gets its own resource from a 64-bit base, which costs
+    # 1.3-2.7 us/layer at 256-512 tokens/rank (DSR1, DSV4-Pro DEP4).
+    # AITER_DMK_RED_BASE64=0/1 forces either (debug).
+    RED_B64_DEF = int(int(max_tok_per_rank) * K * int(comb_slot_stride) >= 1 << 31)
+    RED_B64 = int(os.environ.get("AITER_DMK_RED_BASE64", str(RED_B64_DEF)))
     knob_sfx = f"_wpe{WPE}" if WPE else ""
     knob_sfx += "".join(
         f"_{name}{val}"
         for name, val, default in (
             ("tc", T_CHUNK if COMPACT else TALLY_CHUNK, TALLY_CHUNK),
             ("ru", RED_UN, RED_UN_DEF),
+            ("rb", RED_B64, RED_B64_DEF),
             ("ps", POLL_SL, POLL_SLEEP),
             ("hs", int(HS and not COMPACT), 0),
             ("pt", PLAN_TAG, 1 if TM <= 16 else 0),
@@ -300,6 +308,7 @@ def make_megakernel(
         PREF_B=PREF_B,
         RED_CH=RED_CH,
         RED_UN=RED_UN,
+        RED_B64=RED_B64,
         REP_W=REP_W,
         ROW=ROW,
         RS_OFF=RS_OFF,
