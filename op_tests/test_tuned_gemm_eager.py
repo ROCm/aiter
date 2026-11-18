@@ -47,6 +47,12 @@ SUPPORTED_GFX = ["gfx942", "gfx950"]
 CUSTOM_OPS = ("aiter::gemm_a16w16", "aiter::gemm_a16w16_out")
 HIPBLASLT = {"libtype": "hipblaslt", "solidx": -1}
 OUT_KINDS = [None, "mm", "out_op"]
+# The other backends a BF16 GEMM may be tuned to, and the archs they run on.
+FALLBACKS = {
+    "torch": ({"libtype": "torch", "solidx": 0}, SUPPORTED_GFX),
+    "skinny": ({"libtype": "skinny", "solidx": 2}, ["gfx942", "gfx950"]),
+    "triton": ({"libtype": "triton", "solidx": 0}, SUPPORTED_GFX),
+}
 
 
 def _rand(*shape, dtype=BF16, scale=1.0):
@@ -133,15 +139,18 @@ def _check_bits(y, op_call, ref, what):
 
 
 def _host_us(fn, iters=50):
-    """Host time of one call in us, over ``iters`` calls queued back to back."""
+    """Host time of one call in us: the median, over 5 rounds, of ``iters``
+    calls queued back to back."""
     fn()
+    times = []
+    for _ in range(5):
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        for _ in range(iters):
+            fn()
+        times.append((time.perf_counter() - start) / iters * 1e6)
     torch.cuda.synchronize()
-    start = time.perf_counter()
-    for _ in range(iters):
-        fn()
-    elapsed = time.perf_counter() - start
-    torch.cuda.synchronize()
-    return elapsed / iters * 1e6
+    return sorted(times)[2]
 
 
 @benchmark()
@@ -186,6 +195,28 @@ def test_eager(m, n, k, dtype, otype, bias, rank, out):
             ret[f"{name} TFLOPS"] = flops / us / 1e6
             ret[f"{name} TB/s"] = nbytes / us / 1e6
             ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_fallback(m, n, k, libtype):
+    """The public `gemm_a16w16` against the custom op wrapper it was before the
+    fast path, for a shape routed to another backend: the fast path declines,
+    after a config lookup of its own, and the custom op runs."""
+    x, w = _rand(m, k), _rand(n, k, scale=k**-0.5)
+    ref = _reference(x, w)
+    candidates = {
+        "custom op": lambda: tuned._gemm_a16w16_op(x, w, None, None, None, None, None),
+        "gemm_a16w16": lambda: tuned.gemm_a16w16(x, w),
+    }
+    ret = {"gfx": get_gfx_runtime()}
+    with _routed({_key(m, n, k, False, BF16, BF16): FALLBACKS[libtype][0]}):
+        y, calls = _custom_op_calls(candidates["gemm_a16w16"])
+        assert calls == 1, f"{libtype}: {calls} custom-op calls"
+        ret["bitwise"] = _check_bits(y.clone(), lambda: _op(x, w), ref, libtype)
+        for name, fn in candidates.items():
+            ret[f"{name} host us"] = _host_us(fn)
+    ret["extra host us"] = ret["gemm_a16w16 host us"] - ret["custom op host us"]
     return ret
 
 
@@ -507,6 +538,13 @@ def main():
     for otype, rank, out in itertools.product([None, FP32], [2, 3], OUT_KINDS):
         df.append(test_eager(m - m % 2, n, k, BF16, otype, False, rank, out))
     summarize("tuned_gemm eager fast path vs custom op", df)
+    # A decode-sized GEMM, in the skinny kernels' default range on every arch.
+    df = [
+        test_fallback(4, 64, 1024, libtype)
+        for libtype, (_, archs) in FALLBACKS.items()
+        if gfx in archs
+    ]
+    summarize("tuned_gemm fallback to other backends vs custom op", df)
 
     paths += check_declines()
     paths += check_replaced_lookup()
