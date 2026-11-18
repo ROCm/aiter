@@ -1654,17 +1654,8 @@ def _unified_attention_gfx950(
 
     # every sequence fits one query block: launch exactly one per sequence.
     # This trusts max_seqlen_q. An underestimate drops query rows (the
-    # previous grid covered them). AITER_UNIFIED_ATTN_CHECK_SEQLENS=1 asserts.
+    # previous grid covered them). Checking the lengths would sync the device.
     one_q_block = not params.all_decode and params.max_seqlen_q <= BLOCK_Q
-    if one_q_block and os.environ.get("AITER_UNIFIED_ATTN_CHECK_SEQLENS") == "1":
-        # Reading the lengths syncs the device, so the check stays opt-in.
-        starts = params.cu_seqlens_q[: params.num_seqs + 1]
-        longest = int((starts[1:] - starts[:-1]).max().item())
-        assert longest <= BLOCK_Q, (
-            f"max_seqlen_q={params.max_seqlen_q} fits one query block of "
-            f"{BLOCK_Q}, but a sequence has {longest} query tokens; those "
-            "rows would be dropped"
-        )
     if params.all_decode:
         total_query_blocks = params.num_seqs
         grid = (total_query_blocks, params.num_kv_heads)

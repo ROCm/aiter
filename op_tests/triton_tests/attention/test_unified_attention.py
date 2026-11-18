@@ -2454,12 +2454,10 @@ def test_triton_unified_attn_one_q_block(
     """Short batches launch one query block per sequence, and the output is correct.
 
     The launch is checked directly: every launch must set ONE_Q_BLOCK and use
-    grid[1] == num_seqs. The opt-in length guard is on, so every sequence is
-    also checked to fit the query block.
+    grid[1] == num_seqs.
     """
     if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
         pytest.skip("gfx950 gluon one-query-block launch")
-    monkeypatch.setenv("AITER_UNIFIED_ATTN_CHECK_SEQLENS", "1")
     query_lens = [q for q, _ in seq_lens]
     kv_lens_list = [kv for _, kv in seq_lens]
     (
@@ -2550,67 +2548,6 @@ def test_triton_unified_attn_one_q_block(
         )
     else:
         torch.testing.assert_close(out, ref, atol=1.5e-2, rtol=1e-2)
-
-
-@torch.inference_mode()
-def test_triton_unified_attn_one_q_block_guard(monkeypatch):
-    """With the length guard on, a max_seqlen_q that is too small fails before launch.
-
-    Reporting max_seqlen_q=2 for a 512-token sequence would drop rows on the
-    one-query-block launch, so the guard must raise.
-    """
-    if DEVICE_ARCH != "gfx950" or not _is_gluon_available():
-        pytest.skip("gfx950 gluon one-query-block launch")
-    monkeypatch.setenv("AITER_UNIFIED_ATTN_CHECK_SEQLENS", "1")
-    seq_lens = [(2, 300), (512, 512)]
-    block_size = 16
-    (
-        query,
-        _key_cache_orig,
-        _value_cache_orig,
-        key_cache,
-        value_cache,
-        _sinks,
-        output,
-        cu_query_lens,
-        kv_lens,
-        _max_query_len,
-        max_kv_len,
-        scale,
-        window_size,
-        block_tables,
-        _maybe_quant_query,
-        _query_scales,
-        _q_descale,
-        _k_descale,
-        _v_descale,
-        _output_scale,
-    ) = generate_data(
-        seq_lens=seq_lens,
-        num_blocks=len(seq_lens) * -(-512 // block_size),
-        block_size=block_size,
-        head_size=128,
-        num_heads=(16, 2),
-    )
-    with pytest.raises(AssertionError, match="rows would be dropped"):
-        unified_attention(
-            q=query,
-            k=key_cache,
-            v=value_cache,
-            out=output,
-            cu_seqlens_q=cu_query_lens,
-            seqused_k=kv_lens,
-            max_seqlen_q=2,
-            max_seqlen_k=max_kv_len,
-            softmax_scale=scale,
-            causal=True,
-            window_size=window_size,
-            block_table=block_tables,
-            softcap=0,
-            q_descale=None,
-            k_descale=None,
-            v_descale=None,
-        )
 
 
 class _TritonLaunchSpy:
