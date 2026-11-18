@@ -448,7 +448,8 @@ def gemm_a16w32(shape, backend):
 
     def should_skip(config):
         if config.get("kernel_type") != "bandwidth_bound":
-            return False
+            # tl.dot in the bf16x3 kernel needs blocks of 16 or more in each dimension.
+            return min(config[f"BLOCK_SIZE_{d}"] for d in "MNK") < 16
         # The fp32 FMA kernel computes one row of W in each program (BLOCK_SIZE_N 1,
         # below SEARCH_SPACE), with no split-K and no tile swizzle. The sweep times
         # the bf16x3 tiles against the installed FMA config.
