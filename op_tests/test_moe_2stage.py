@@ -3160,6 +3160,7 @@ else:
     if get_gfx() in ("gfx942", "gfx950"):
         run_blockscale_limit_cases()
     run_plain_fp8_limit_cases()
+    test_relu2_gate_only_regression()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
     test_swiglu_oai_flat_dispatch()
