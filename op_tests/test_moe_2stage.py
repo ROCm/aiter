@@ -7,7 +7,7 @@ import itertools
 import logging
 import os
 import sys
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 
 import pandas as pd
 import torch
@@ -119,6 +119,26 @@ def parse_num_expert_activated():
 
 
 AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
+
+
+@contextmanager
+def _record_fmoe_g1u1_launches(launches):
+    """Append the kernel name of every aiter.fmoe_g1u1 launch inside the block.
+
+    fused_moe_1stage looks fmoe_g1u1 up on the aiter module at call time, so this
+    sees the 1-stage kernel that actually ran, whichever activation selected it.
+    """
+    real = aiter.fmoe_g1u1
+
+    def recording(*args, **kwargs):
+        launches.append(kwargs.get("kernelName", args[12] if len(args) > 12 else ""))
+        return real(*args, **kwargs)
+
+    aiter.fmoe_g1u1 = recording
+    try:
+        yield
+    finally:
+        aiter.fmoe_g1u1 = real
 
 
 @benchmark()
@@ -623,17 +643,28 @@ def test_fmoe(
             "us_stage2": us2_stage,
         }
 
-    out2_ck, us2 = run_perftest(
-        fused_moe,
-        input,
-        w1_qt_aiter,
-        w2_qt_aiter,
-        topk_weights,
-        topk_ids,
-        num_iters=5,
-        num_warmup=2,
-        **_fused_moe_kwargs,
-    )
+    fmoe_launches = []
+    with (
+        _record_fmoe_g1u1_launches(fmoe_launches)
+        if expected_kernel1 is not None
+        else nullcontext()
+    ):
+        out2_ck, us2 = run_perftest(
+            fused_moe,
+            input,
+            w1_qt_aiter,
+            w2_qt_aiter,
+            topk_weights,
+            topk_ids,
+            num_iters=5,
+            num_warmup=2,
+            **_fused_moe_kwargs,
+        )
+    if expected_kernel1 is not None:
+        launched = sorted(set(fmoe_launches))
+        assert launched == [
+            expected_kernel1
+        ], f"{token=}: expected 1-stage {expected_kernel1}, launched {launched or 'no fmoe_g1u1'}"
     # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
     # the unfixed K-padding tail-tile path leaves the padded lanes uninitialized,
     # producing NaN in the fused_moe output. checkAllclose's err/logits_diff can be
