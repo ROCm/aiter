@@ -2345,6 +2345,8 @@ _BF16_HD256_SHAPES = _HD256_SHAPES + [
     param(1, 300, 100, 2, id="dense_short"),
     param(1, 64, 1, 1, id="one_key"),
     param(1, 513, 1088, 3, id="ragged_q"),
+    # 8 heads x 2 Q tiles: the kernel relabels its work-groups per XCD.
+    param(1, 300, 384, 8, id="xcd_relabel"),
 ]
 
 
