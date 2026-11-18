@@ -81,8 +81,6 @@ def main():
                 "QUANT_BLOCK_SIZE": 32,
                 "AMAX_FLOOR": 1e-10,
             }
-            if mode != "native":
-                constants["PERSISTENT"] = mode == "persistent"
             signature = {name: "i32" for name in fn.arg_names}
             signature.update(
                 {

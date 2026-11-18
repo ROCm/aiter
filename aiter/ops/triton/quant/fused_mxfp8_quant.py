@@ -137,7 +137,8 @@ def fused_dual_rmsnorm_mxfp8_quant(
         eps_k: K RMSNorm epsilon; defaults to eps_q.
         yq, sq, yk: optional pre-allocated outputs.
         amax_floor: floor of each Q group's amax (0: none).
-        persistent: use 16x16 workers with four wave32 waves on gfx1250.
+        persistent: use 256 workers in a one-dimensional grid with four
+            wave32 waves per worker on gfx1250.
             Each worker processes rows at stride 256. This is a standalone
             kernel, not a callable mono device function. This mode requires
             BF16 inputs, contiguous weights, and non-overlapping output rows.
@@ -176,7 +177,7 @@ def fused_dual_rmsnorm_mxfp8_quant(
         yk = torch.empty((M, KK), dtype=k.dtype, device=k.device)
 
     NUM_PRGMS = 256 if persistent else M
-    grid = (16, 16) if persistent else (NUM_PRGMS,)
+    grid = (NUM_PRGMS,)
 
     _fused_dual_rmsnorm_mxfp8_quant_kernel[grid](
         q,
@@ -206,7 +207,6 @@ def fused_dual_rmsnorm_mxfp8_quant(
         QUANT_BLOCK_SIZE=_QUANT_BLOCK_SIZE,
         NUM_PRGMS=NUM_PRGMS,
         AMAX_FLOOR=amax_floor,
-        PERSISTENT=persistent,
         num_warps=4,
     )
     return yq, sq, yk
