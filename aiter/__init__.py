@@ -135,6 +135,10 @@ else:
     from .ops.aiter_operator import *
     from .ops.activation import *
     from .ops.attention import *
+    from .ops.sparse_mla import (  # noqa: F401
+        sparse_mla_fp8_fwd,
+        allocate_sparse_mla_fp8_workspace,
+    )
     from .ops.custom import *
     from .ops.custom_all_reduce import *
     from .ops.quick_all_reduce import *
@@ -144,6 +148,7 @@ else:
     from .ops.moe_mxfp4_aux import *
     from .ops.moe_nvfp4 import NvFp4MoeWeights, moe_nvfp4, uses_fallback  # noqa: F401
     from .ops.mla_sparse_prefill import *
+    from .ops.mla_nvfp4 import *
     from .ops.pa_sparse_prefill_opus import *
     from .ops.fused_norm_rope_attn_rope_cast import *
     from .ops.msa_attention import *

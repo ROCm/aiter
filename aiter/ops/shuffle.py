@@ -4,7 +4,8 @@
 import torch
 import torch.nn.functional as F
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.build_targets import is_gfx1250_family
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.moe_nvfp4_common import scale_gs
 
 
@@ -64,6 +65,25 @@ def shuffle_mxfp8fp4_scale(src: torch.Tensor) -> torch.Tensor:
         s = F.pad(s, (0, 0, 0, pad), value=0x7F)
     out = _moe_tile_shuffle(s, tile_minor=32, tile_major=4)
     return out.view(x_type)
+
+
+def shuffle_mxfp8_bpreshuffle_scale(w_scale: torch.Tensor) -> torch.Tensor:
+    """1x32 e8m0 weight scale ``[N, K/32]`` as this arch's mxfp8 bpreshuffle GEMM reads it.
+
+    The w_scale of ``gemm_a8w8_mxfp8_bpreshuffle`` (and of group32
+    ``gemm_a8w8_blockscale(isBpreshuffled=True)``): 32x4 shuffled on the gfx1250
+    family (``shuffle_mxfp8fp4_scale`` bytes, same shape and dtype). On every
+    other arch (e.g. gfx950) it is row-major and the input is returned unchanged.
+    The arch is the running GPU's (``get_gfx_runtime()``), as in the GEMM dispatch.
+    """
+    if not is_gfx1250_family(get_gfx_runtime()):
+        return w_scale
+    if w_scale.dim() != 2 or w_scale.shape[0] % 32 or w_scale.shape[1] % 4:
+        raise ValueError(
+            "gfx1250 1x32 w_scale must be [N, K/32] with N % 32 == 0 and "
+            f"K % 128 == 0, got {tuple(w_scale.shape)}"
+        )
+    return shuffle_mxfp8fp4_scale(w_scale.contiguous())
 
 
 def shuffle_blockscale_to_mxfp8_scale(scale: torch.Tensor, n: int) -> torch.Tensor:
@@ -192,6 +212,8 @@ def shuffle_weight(
             x_ = x_.permute(0, 1, 3, 4, 2, 5).contiguous()
         x_ = x_.view(*x.shape).contiguous().view(x_type)
         x_.is_shuffled = True
+        x_.aiter_shuffle_layout = tuple(layout)
+        x_.aiter_shuffle_is_guinterleave = True
         x_.gate_up_interleave = gate_up
         return x_
 
@@ -214,6 +236,8 @@ def shuffle_weight(
     x_ = x_.view(*x.shape)
     x_ = x_.view(x_type)
     x_.is_shuffled = True
+    x_.aiter_shuffle_layout = tuple(layout)
+    x_.aiter_shuffle_is_guinterleave = False
     if pad_k_to:
         x_.aiter_original_k = original_k
         x_.aiter_padded_k = x.shape[-1]
