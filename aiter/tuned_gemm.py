@@ -30,6 +30,11 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
 
+# Same idea as SGLANG_OPT_QUARK_BF16_TGEMM_EXACT_M, for every caller of this lookup.
+# Off: a hipBLASLt row found through get_padded_m is reused at the smaller M.
+# On: that row is kept only when padded_M == M. FlyDSL / triton / torch rows still pad.
+_hipblaslt_exact_m = os.environ.get("AITER_GEMM_A16W16_HIPBLASLT_EXACT_M", "0") == "1"
+
 try:
     from aiter.ops.opus import opus_gemm as _opus_launch
 except Exception:  # noqa: BLE001  blanket catch is intentional here
@@ -173,6 +178,13 @@ def get_GEMM_A16W16_tuned_config(
                     )
                     config = None
             if config is None:
+                continue
+            if (
+                _hipblaslt_exact_m
+                and config["libtype"] == "hipblaslt"
+                and padded_M != M
+            ):
+                config = None
                 continue
             if config["libtype"] == "opus":
                 resolved = None
