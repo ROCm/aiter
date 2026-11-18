@@ -181,7 +181,6 @@ M,N,K,q_dtype_w
 8192,9856,6144,torch.float8_e4m3fn
 16384,9856,6144,torch.float8_e4m3fn
 32768,9856,6144,torch.float8_e4m3fn
-56,6144,4096,torch.float8_e4m3fn
 72,6144,4096,torch.float8_e4m3fn
 80,6144,4096,torch.float8_e4m3fn
 88,6144,4096,torch.float8_e4m3fn
@@ -204,14 +203,10 @@ M,N,K,q_dtype_w
 368,6144,4096,torch.float8_e4m3fn
 376,6144,4096,torch.float8_e4m3fn
 384,6144,4096,torch.float8_e4m3fn
-424,6144,4096,torch.float8_e4m3fn
-448,6144,4096,torch.float8_e4m3fn
 456,6144,4096,torch.float8_e4m3fn
 464,6144,4096,torch.float8_e4m3fn
-472,6144,4096,torch.float8_e4m3fn
 480,6144,4096,torch.float8_e4m3fn
 1536,6144,4096,torch.float8_e4m3fn
-65536,6144,4096,torch.float8_e4m3fn
 1,1280,6144,torch.float8_e4m3fn
 2,1280,6144,torch.float8_e4m3fn
 4,1280,6144,torch.float8_e4m3fn
@@ -226,7 +221,6 @@ M,N,K,q_dtype_w
 128,1280,6144,torch.float8_e4m3fn
 136,1280,6144,torch.float8_e4m3fn
 152,1280,6144,torch.float8_e4m3fn
-160,1280,6144,torch.float8_e4m3fn
 168,1280,6144,torch.float8_e4m3fn
 184,1280,6144,torch.float8_e4m3fn
 192,1280,6144,torch.float8_e4m3fn
@@ -376,7 +370,6 @@ M,N,K,q_dtype_w
 5703,1536,6144,torch.float8_e4m3fn
 5738,1536,6144,torch.float8_e4m3fn
 5799,1536,6144,torch.float8_e4m3fn
-7081,1536,6144,torch.float8_e4m3fn
 7176,1536,6144,torch.float8_e4m3fn
 7280,1536,6144,torch.float8_e4m3fn
 7341,1536,6144,torch.float8_e4m3fn
@@ -392,7 +385,6 @@ M,N,K,q_dtype_w
 11631,1536,6144,torch.float8_e4m3fn
 13828,1536,6144,torch.float8_e4m3fn
 18541,1536,6144,torch.float8_e4m3fn
-21633,1536,6144,torch.float8_e4m3fn
 21706,1536,6144,torch.float8_e4m3fn
 21778,1536,6144,torch.float8_e4m3fn
 22120,1536,6144,torch.float8_e4m3fn
