@@ -160,8 +160,8 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
                 ownership,
             )
             coord = fx.idx2crd(element, logical)
-            n_in_tile = fx.Index(fx.get(coord, 0))
-            global_d = fx.Index(fx.get(coord, 1))
+            n_in_tile = fx.Index(coord[0].unpack())
+            global_d = fx.Index(coord[1].unpack())
             src_elem = (
                 self.kv_gmem_elem_offset + n_in_tile * self.stride_kv_n_v + global_d
             )
