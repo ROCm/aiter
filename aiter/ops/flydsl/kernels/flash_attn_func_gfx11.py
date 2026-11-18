@@ -111,6 +111,12 @@ def build_flash_attn_func_module_gfx11(
         ``launch(Q, K, V, O, batch, seq_q, seq_kv, stream=..., q_batch_stride=...,
         k_batch_stride=..., v_batch_stride=..., lse=...)``; batch strides are in
         elements and default to plain BSHD; ``lse`` is required with ``return_lse``.
+
+    The builder does not check launch arguments. ``flydsl_flash_attn_func`` does;
+    a direct caller must guarantee ``seq_q, seq_kv >= 1``, ``sm_scale > 0``, every
+    batch slice of Q / K / V / O below 2 GiB (32-bit buffer offsets; the dropped
+    stores past ``head_dim`` rely on it), 16-byte aligned tensors, and O as plain
+    BSHD.
     """
     if head_dim % 8 != 0 or head_dim <= 0:
         raise ValueError(f"head_dim must be a positive multiple of 8, got {head_dim}")

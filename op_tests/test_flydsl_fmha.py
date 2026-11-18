@@ -474,7 +474,7 @@ def test_flydsl_fmha_rejects_device_mismatch():
 # head_dim % 8 == 0, with no host padding, so the grid leans on the tails.
 
 _gfx11_only = pytest.mark.skipif(
-    not _arch().startswith("gfx11"),
+    not _arch().startswith(("gfx110", "gfx115")),
     reason="flydsl_flash_attn_func gfx11 path needs an RDNA3 / RDNA3.5 GPU",
 )
 
@@ -882,6 +882,111 @@ def test_flydsl_fmha_gfx11_lse_with_out():
     out = torch.empty_like(q)
     res, lse = flydsl_flash_attn_func(q, k, v, out=out, return_lse=True)
     assert res is out and lse.shape == (1, 4, 500)
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_seq_first_transpose():
+    """Dense but permuted inputs ([S, B, H, D].transpose(0, 1)) are read in place
+    and the output is still plain BSHD with the right values."""
+    seq, batch, num_heads, head_dim = 300, 3, 4, 64
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q, k, v = (
+        torch.randn(
+            seq,
+            batch,
+            num_heads,
+            head_dim,
+            generator=g,
+            dtype=torch.bfloat16,
+            device="cuda",
+        ).transpose(0, 1)
+        for _ in range(3)
+    )
+    out = flydsl_flash_attn_func(q, k, v)
+    assert out.is_contiguous()
+    _check_gfx11(
+        out,
+        q,
+        k,
+        v,
+        False,
+        1.0 / 8.0,
+        heads=[(b, h) for b in range(batch) for h in range(num_heads)],
+    )
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_decode_query_view():
+    """seq_q == 1 from a [B, H, 1, D] transpose: the size-1 dim's stride is ignored."""
+    batch, num_heads, seq_kv, head_dim = 2, 8, 700, 128
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(
+        batch, num_heads, 1, head_dim, generator=g, dtype=torch.bfloat16, device="cuda"
+    ).transpose(1, 2)
+    k, v = (
+        torch.randn(
+            batch,
+            seq_kv,
+            num_heads,
+            head_dim,
+            generator=g,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        for _ in range(2)
+    )
+    out, lse = flydsl_flash_attn_func(q, k, v, return_lse=True)
+    _check_gfx11(out, q, k, v, False, 1.0 / math.sqrt(head_dim))
+    ref = _ref_lse_fp32(
+        q, k, batch - 1, num_heads - 1, False, 1.0 / math.sqrt(head_dim)
+    )
+    assert (lse[batch - 1, num_heads - 1] - ref).abs().max().item() < 1e-3
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_misaligned_input_is_copied():
+    """A contiguous view that does not start 16-byte aligned is copied first."""
+    batch, seq, num_heads, head_dim = 2, 256, 4, 64
+    n = batch * seq * num_heads * head_dim
+    g = torch.Generator(device="cuda").manual_seed(0)
+    buf = torch.randn(n + 1, generator=g, dtype=torch.bfloat16, device="cuda")
+    q = buf[1:].view(batch, seq, num_heads, head_dim)
+    assert q.is_contiguous() and q.data_ptr() % 16 != 0
+    k, v = _make_qkv(batch, seq, num_heads, head_dim, torch.bfloat16)[1:]
+    with pytest.warns(UserWarning, match="materializes"):
+        out = flydsl_flash_attn_func(q, k, v)
+    _check_gfx11(out, q, k, v, False, 1.0 / 8.0)
+
+
+@_gfx11_only
+def test_flydsl_fmha_gfx11_lse_fused_gqa_causal_f16():
+    """LSE with f16, causal GQA and Q / K / V views of one fused projection."""
+    batch, seq, num_heads, num_kv_heads, head_dim = 2, 777, 16, 4, 64
+    g = torch.Generator(device="cuda").manual_seed(0)
+    qkv = torch.randn(
+        batch,
+        seq,
+        num_heads + 2 * num_kv_heads,
+        head_dim,
+        generator=g,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    q, k, v = qkv.split([num_heads, num_kv_heads, num_kv_heads], dim=2)
+    out, lse = flydsl_flash_attn_func(q, k, v, causal=True, return_lse=True)
+    group = num_heads // num_kv_heads
+    k_full, v_full = (t.repeat_interleave(group, dim=2) for t in (k, v))
+    _check_gfx11(out, q, k_full, v_full, True, 1.0 / math.sqrt(head_dim))
+    for b, h in ((0, 0), (batch - 1, num_heads - 1)):
+        ref = _ref_lse_fp32(q, k, b, h, True, 1.0 / math.sqrt(head_dim))
+        assert (lse[b, h] - ref).abs().max().item() < 1e-3
+
+
+@_gfx1201_only
+def test_flydsl_fmha_gfx1201_rejects_return_lse():
+    q, k, v = _make_qkv(1, 256, 4, 64, torch.bfloat16)
+    with pytest.raises(ValueError, match="return_lse"):
+        flydsl_flash_attn_func(q, k, v, return_lse=True)
 
 
 # gfx950 fp8 (e4m3fn). The reference dequantizes the *same* fp8 tensors, so the
