@@ -9,6 +9,29 @@ at delivery
 A09 JIT/P256 checks. Both FP8 and QAT failed performance acceptance. See the
 [measured matrix](mono-persistent-validation.md#mi400-result-2026-11-18).
 
+## User-requested follow-up result
+
+A03 was retested at delivery `5446016c`: 20 tests and P256 Graph tracing passed.
+Its six performance rows have four regressions and two inconclusive results.
+The [follow-up evidence](mono-persistent-validation.md#follow-up-a03-timing-and-a09-diagnosis)
+contains the measured table and A09 controlled comparisons.
+
+A09's main issue is now supported by actual ATT data: fewer independent wave
+contexts and serial load-result waits in the current loop. At the sampled
+SIMD, native and the same loop body with one TG per task have four overlapping
+waves; P256 has one wave processing four tasks. P256 QAT load-result stalls
+are 1682 GFX cycles, versus 233 XACK-wait cycles in that sampled wave.
+Removing descriptor reuse waits alone does not recover QAT performance.
+P512/P1024/P1026 comparisons keep the same instruction sequence except four
+stride immediates and reduce the slowdown. A clean 512-row QAT case still
+regresses with exactly four tasks per worker, so the extra tail is not required.
+These facts revise the earlier unmeasured scheduling hypothesis. Exact cache
+traffic and whole-GPU cycle attribution remain open.
+
+The diagnostic wrappers passed 64 strict cases plus four boundary cases.
+Contaminated timing cases and zero-valued SQ wait/cycle counters are marked
+unusable. No production kernel changed; standalone acceptance still fails.
+
 ## 1. Which arithmetic change is selected, and is it exact?
 
 Select the exponent-code reciprocal in the shared Gluon tile helper. For

@@ -5,6 +5,83 @@ independent local review. Neither certifies GPU correctness or performance.
 The [review TODO](mono-persistent-review-todo.md) records the selected exact
 power-of-two reciprocal change, its static cost and the unresolved request cost.
 
+## Follow-up: A03 timing and A09 diagnosis
+
+The user requested A03 retesting and further A09 analysis after the first
+acceptance. All GPU work used the same fixed delivery `5446016c` and image.
+Production kernel, wrapper, benchmark, tests and native source did not change.
+The diagnostic wrappers and raw evidence stay outside the checkout.
+
+A03 passed all 20 selected tests again, with zero skips. Its Graph trace passed;
+all 24 PS dispatches used grid `(32768,1,1)` and workgroup `(128,1,1)`.
+The original benchmark then ran all six A03 cases with 15 alternating trials.
+The 101 process samples during the case windows saw only this benchmark.
+
+| Rows | Cache | Native median / P10 / P90 (us) | PS median / P10 / P90 (us) | PS/native | Decision |
+| ---: | --- | ---: | ---: | ---: | --- |
+| 96 | hot | 1.564855 / 1.554226 / 1.589715 | 1.585209 / 1.567499 / 1.604769 | 1.013007 | inconclusive |
+| 96 | rotating | 1.919946 / 1.917698 / 1.925404 | 1.916001 / 1.912472 / 1.919784 | 0.997945 | inconclusive |
+| 257 | hot | 1.667741 / 1.656719 / 1.701918 | 1.920399 / 1.917161 / 1.967340 | 1.151497 | regression |
+| 257 | rotating | 2.043015 / 2.025434 / 2.046702 | 2.349874 / 2.278817 / 2.467875 | 1.150199 | regression |
+| 513 | hot | 1.821483 / 1.816528 / 1.851258 | 2.701228 / 2.663911 / 2.783161 | 1.482983 | regression |
+| 513 | rotating | 2.252620 / 2.244447 / 2.263607 | 3.190436 / 3.169208 / 3.216171 | 1.416322 | regression |
+
+A03 performance fails: four regressions and two inconclusive rows. These are
+current-delivery measurements, not the historical two-dimensional-grid data.
+
+A09 diagnostics kept the task math fixed. The external P256 replica has
+instruction-identical ISA to selected P256. P512, P1024 and P1026 retain the
+same instruction sequence and resources; only four stride immediates change.
+At `[513,2048]`, all cases below had no observed concurrent GPU process.
+These values are median microseconds from 15 trials without profiling.
+
+| Diagnostic | FP8 hot | QAT hot | FP8 rotating | QAT rotating |
+| --- | ---: | ---: | ---: | ---: |
+| Frozen native | 1.666988 | 1.420895 | 2.766726 | 1.778635 |
+| Selected non-PS | 1.628382 | 1.351147 | 2.778071 | 1.765415 |
+| P256 replica | 3.046068 | 2.559087 | 3.503421 | 3.186402 |
+| Fixed descriptor, P256 | 2.918942 | 2.560750 | 3.363139 | 3.181355 |
+| Same loop body, P512 | 2.028084 | 1.828533 | 3.052226 | 2.261622 |
+| Same loop body, P1024 | 1.674411 | 1.528544 | 2.588580 | 1.791406 |
+| Same loop body, P1026 | 1.649970 | 1.359507 | 2.799002 | 1.777249 |
+
+Raw JSON has full precision and P10/P90. Removing descriptor reuse/XACK waits
+at fixed P256 barely changes QAT and only partly helps FP8. Thus those waits
+are not the main cause. The fixed-descriptor diagnostic also changes address
+arithmetic and is limited to inputs below 2 GiB; it is not a production fix.
+
+An actual QAT ATT trace at SE0, target CU/WGP 1, SIMD0 shows four overlapping
+waves for native, one wave for P256, and four for P1026. In this sample, native
+and P1026 issue four loads across four wave contexts. P256 issues four loads
+serially in one context. Its wave lasts 3655 GFX cycles, with 1682 cycles at
+load-result waits and 233 at XACK waits. This is local trace evidence, not a
+whole-GPU occupancy percentage or a substitute for benchmark timing.
+Both the timed controls and trace identify the main mechanism: the current
+P256 loop exposes fewer independent waves and does not pipeline the next tile's
+load ahead of the current tile's work. Hardware workgroup scheduling can overlap
+independent wave contexts; this software loop cannot provide the same overlap.
+Equal task counts do not imply equal latency hiding. Exact cache-level and
+whole-kernel cycle attribution remain open.
+
+Tail work cannot explain the clean boundary regression. At exactly 512 rows, every
+P256 worker has four tasks, yet QAT hot is 2.392025 us versus native 1.419148 us.
+There is already a large regression without a fifth-iteration tail.
+
+The external diagnostic wrappers passed 64 strict inherited assertion cases,
+plus four exact-boundary cases, including special BF16 values and Graph replay.
+One of 12 main diagnostic cases and four of eight boundary cases overlapped
+other GPU jobs. They are marked unusable; no favorable samples were selected
+from them. SQ_WAVES matched 1024/4104 for P256/native at 513 rows. Four other
+SQ instruction/wait/cycle counters returned zero on all variants and are unusable.
+The final ATT sample had no other GPU process in adjacent 100 ms observations.
+
+Evidence root: `/home/weizhu15/workspace/mono-followup-5446016c-20261118/`.
+See `REPORT.zh.md`, `a03-performance.json`, `diagnostic-performance.json`,
+`per-case-load-audit.json`, `review/worker-count-isa.diff`, and
+`diagnostic-att-clean-summary.json`. `att-wave-timeline.svg` plots the actual
+wave trace. No production fix or upstream push was made. The original A09
+acceptance result remains failed.
+
 ## MI400 result: 2026-11-18
 
 Delivery `5446016c426910d96e2b13996586dfe875863da0` was tested in a clean,
@@ -51,9 +128,10 @@ latency per launch. Decisions use the rules in section 3, before rounding.
 
 **FP8 fails:** four regressions and two inconclusive rows.
 **QAT fails:** four regressions and two improvements. Neither path passes all
-six rows. No rerun, tuning or ablation matrix followed. A03 performance was
-not repeated in this A09 FP8/QAT handoff. Historical A03 timings do not certify
-this run. No upstream push was made because the requested success gate failed.
+six rows. No automatic rerun, tuning or ablation matrix followed that run.
+The later user-requested follow-up above adds current A03 timing and A09
+diagnostics. Historical A03 timings do not certify either run. No upstream push
+was made because the requested success gate failed.
 
 The GPU was ordinal 0, gfx1250/wave32, with 256 CUs. The image digest was
 `sha256:6a40615d965ec6088217e5682a866875e2c218365c7f135ecb83c4907d6bf2dd`.
