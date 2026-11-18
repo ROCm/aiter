@@ -1683,6 +1683,11 @@ def _unified_attention_gfx950(
         stride_v_cache_2=params.v.stride(2),
         stride_v_cache_3=params.v.stride(3),
         block_table_stride=params.block_table.stride(0),
+        PRELOAD_PAGES=config.get("PRELOAD_PAGES", 0),
+        PRELOAD_TABLE_STRIDE=(
+            int(params.block_table.stride(0)) if config.get("PRELOAD_PAGES", 0) else 0
+        ),
+        USE_EXPLICIT_FMA=config.get("USE_EXPLICIT_FMA", False),
         num_seqs=params.num_seqs,
         SCALE=params.softmax_scale,
         SOFTCAP=params.softcap,
