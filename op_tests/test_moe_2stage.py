@@ -2216,15 +2216,32 @@ def test_plain_presorted_moe_ep_mask():
     assert check(mask, E, layout) is True
 
     # Allocator reuse: a new tensor at the freed mask's address is checked anew.
+    # Handing the freed address straight back is not an allocator contract, so
+    # take the first of a few allocations that lands on it and skip only the
+    # reused-address case when none does. Dropping the entry with the mask is
+    # checked either way.
     ptr = mask.data_ptr()
     del mask
     assert not cache, "a freed mask's entry was kept"
-    reused = torch.empty(E, dtype=torch.int32)
-    assert reused.data_ptr() == ptr, "the allocator did not reuse the address"
-    reused.copy_(torch.tensor([0, 0, 1, 1], dtype=torch.int32))
-    assert (
-        check(reused, E, layout) is False
-    ), "a new tensor at a reused address was trusted"
+    spares = []
+    reused = None
+    for _ in range(16):
+        candidate = torch.empty(E, dtype=torch.int32)
+        if candidate.data_ptr() == ptr:
+            reused = candidate
+            break
+        spares.append(candidate)
+    del spares
+    if reused is None:
+        aiter.logger.info(
+            "skipping the reused-address case: no allocation returned %#x", ptr
+        )
+        reused = torch.empty(E, dtype=torch.int32)
+    else:
+        reused.copy_(torch.tensor([0, 0, 1, 1], dtype=torch.int32))
+        assert (
+            check(reused, E, layout) is False
+        ), "a new tensor at a reused address was trusted"
     another = reused.view(E)
     reused.copy_(torch.tensor([1, 1, 0, 0], dtype=torch.int32))
     assert check(another, E, layout) is True
