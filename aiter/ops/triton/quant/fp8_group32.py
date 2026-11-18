@@ -4,7 +4,7 @@
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.quant.fp8_group32 import (
+from aiter.ops.triton._gluon_kernels.gfx1250.quant.fp8_group32 import (
     _quantize_fp8_group32_kernel,
 )
 from aiter.ops.triton.quant.mono_utils import check_output, require_wave32
@@ -24,7 +24,7 @@ def quantize_fp8_group32(
 
     Args:
         x: Contiguous BF16 tensor on gfx1250. Its last width is divisible by 32.
-        persistent: Use 16x16 workers, four waves, and task stride 256.
+        persistent: Use 256 one-dimensional workers, four waves, and stride 256.
         dequantize: Return QAT values in BF16 instead of FP8 and scale tensors.
         out: Optional contiguous output with x.shape and the result dtype.
         scales: Optional contiguous E8M0 tensor, with last width x.shape[-1]/32.
@@ -54,7 +54,7 @@ def quantize_fp8_group32(
     if not dequantize and scales is None:
         scales = torch.empty(shape_s, device=x.device, dtype=torch.float8_e8m0fnu)
     if x.numel():
-        grid = (16, 16) if persistent else (triton.cdiv(x.numel(), 1024),)
+        grid = (256,) if persistent else (triton.cdiv(x.numel(), 1024),)
         _quantize_fp8_group32_kernel[grid](
             x,
             out,

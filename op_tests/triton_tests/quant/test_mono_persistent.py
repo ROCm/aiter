@@ -144,6 +144,13 @@ def fp8_oracle(x):
         (96, 2048),
         (96, 5120),
         (96, 576),
+        (128, 2048),
+        (129, 2048),
+        (256, 2048),
+        (257, 2048),
+        (512, 2048),
+        (513, 2048),
+        (513, 2080),
         (255, 1024),
         (256, 1024),
         (257, 1024),
@@ -168,6 +175,7 @@ def test_output_quant_native_persistent(shape):
         guarded(shape, torch.float8_e4m3fn),
         guarded((*shape[:-1], shape[-1] // 32), torch.float8_e8m0fnu),
     ]
+    qat_output = guarded(shape, torch.bfloat16)
     for persistent in (False, True):
         for (out, _, _), ref in zip(outputs, expected):
             out.view(torch.uint8).copy_(ref.view(torch.uint8) ^ 0xFF)
@@ -178,10 +186,15 @@ def test_output_quant_native_persistent(shape):
             assert_bytes(a, b)
         assert_bytes(actual[0], oracle_q)
         assert_bytes(actual[1].view(torch.uint8), oracle_s)
-        qat = quantize_fp8_group32(x, persistent=persistent, dequantize=True)
-        assert_bytes(qat, native.quantize_fp8(x, dequantize=True))
+        expected_qat = native.quantize_fp8(x, dequantize=True)
+        qat_output[0].view(torch.uint8).copy_(expected_qat.view(torch.uint8) ^ 0xFF)
+        qat = quantize_fp8_group32(
+            x, persistent=persistent, dequantize=True, out=qat_output[0]
+        )
+        assert_bytes(qat, expected_qat)
         assert_bytes(qat, oracle_qat)
         assert_guards(outputs)
+        assert_guards([qat_output])
     assert_bytes(x, before)
 
 
@@ -201,6 +214,35 @@ def test_output_quant_scale_boundaries():
     assert_bytes(actual[1].view(torch.uint8), oracle_s)
 
 
+def test_output_quant_scale_ownership():
+    values = torch.tensor(
+        [0.0, -0.0, 1e-12, 224, 448, 450, 896, -448, -450],
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    groups = torch.arange(513 * 64, device="cuda") % values.numel()
+    x = values[groups, None].expand(-1, 32).contiguous().view(513, 2048)
+    before = x.clone()
+    expected = native.quantize_fp8(x)
+    oracle_q, oracle_s, _ = fp8_oracle(x)
+    outputs = [
+        guarded(x.shape, torch.float8_e4m3fn),
+        guarded((513, 64), torch.float8_e8m0fnu),
+    ]
+    for persistent in (False, True):
+        for (out, _, _), ref in zip(outputs, expected):
+            out.view(torch.uint8).copy_(ref.view(torch.uint8) ^ 0xFF)
+        actual = quantize_fp8_group32(
+            x, persistent=persistent, out=outputs[0][0], scales=outputs[1][0]
+        )
+        for a, b in zip(actual, expected):
+            assert_bytes(a, b)
+        assert_bytes(actual[0], oracle_q)
+        assert_bytes(actual[1].view(torch.uint8), oracle_s)
+        assert_guards(outputs)
+    assert_bytes(x, before)
+
+
 def test_output_contract_rejects_bad_buffers():
     x = torch.zeros((96, 2048), device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="contiguous BF16"):
@@ -215,7 +257,7 @@ def test_output_contract_rejects_bad_buffers():
         fused_dual_rmsnorm_mxfp8_quant(q, k, wq, wk, 1e-20, persistent=True, yk=x)
 
 
-@pytest.mark.parametrize("op", ["a03", "a09"])
+@pytest.mark.parametrize("op", ["a03", "a09", "a09-five-iterations"])
 def test_graph_replay_changes_inputs(op):
     torch.manual_seed(453)
     if op == "a03":
@@ -239,7 +281,8 @@ def test_graph_replay_changes_inputs(op):
             return native.fused_dual_rmsnorm_mxfp8_quant(*args, amax_floor=1e-10)
 
     else:
-        x = torch.randn((257, 2048), device="cuda", dtype=torch.bfloat16)
+        rows = 513 if op == "a09-five-iterations" else 257
+        x = torch.randn((rows, 2048), device="cuda", dtype=torch.bfloat16)
         outs = quantize_fp8_group32(x, persistent=True)
 
         def run():
@@ -257,8 +300,15 @@ def test_graph_replay_changes_inputs(op):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         run()
+    previous = reference()
     for _ in range(20):
         x.normal_()
         graph.replay()
-        for a, b in zip(outs, reference()):
+        expected = reference()
+        assert any(
+            not torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+            for a, b in zip(expected, previous)
+        )
+        for a, b in zip(outs, expected):
             assert_bytes(a, b)
+        previous = expected

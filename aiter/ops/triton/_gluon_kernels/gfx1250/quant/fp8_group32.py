@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# Based on ROCm/ATOM 10b99a085ba46e5b3a125f0114cec7c71e401552,
+# atom/model_ops/blockscale_kernels/quantization.py (MIT).
+
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
+
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+
+@gluon.jit
+def _quantize_fp8_group32_tile(X, Y, S, SIZE, tile, DEQUANT: gl.constexpr):
+    # Keep each scale in its reduction layout to avoid an LDS copy across waves.
+    layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 4], [4, 1], [1, 0])
+    groups = tile * 32 + gl.arange(0, 32, layout=gl.SliceLayout(1, layout))
+    offsets = (
+        groups[:, None] * 32
+        + gl.arange(0, 32, layout=gl.SliceLayout(0, layout))[None, :]
+    )
+    x = gl.load(X + offsets, offsets < SIZE, other=0).to(gl.float32)
+    amax = gl.maximum(gl.max(gl.abs(x), 1), 1e-10)
+    bits = (amax * (1.0 / 448.0)).to(gl.uint32, bitcast=True)
+    code = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(gl.uint32)
+    scale = (code << 23).to(gl.float32, bitcast=True)
+    q = gl.minimum(gl.maximum(x / scale[:, None], -448.0), 448.0).to(gl.float8e4nv)
+    if DEQUANT:
+        gl.store(Y + offsets, q.to(gl.float32) * scale[:, None], offsets < SIZE)
+    else:
+        gl.store(Y + offsets, q, offsets < SIZE)
+        gl.store(S + groups, code.to(gl.uint8), groups < SIZE // 32)
+
+
+@gluon.jit(
+    repr=make_kernel_repr("_quantize_fp8_group32_kernel", ["PERSISTENT", "DEQUANT"])
+)
+def _quantize_fp8_group32_kernel(
+    X, Y, S, SIZE, DEQUANT: gl.constexpr, PERSISTENT: gl.constexpr
+):
+    task = gl.program_id(0)
+    if PERSISTENT:
+        for tile in range(task, gl.cdiv(SIZE, 1024), 256):
+            _quantize_fp8_group32_tile(X, Y, S, SIZE, tile, DEQUANT)
+    else:
+        _quantize_fp8_group32_tile(X, Y, S, SIZE, task, DEQUANT)

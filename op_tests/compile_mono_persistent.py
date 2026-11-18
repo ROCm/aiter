@@ -12,8 +12,9 @@ from pathlib import Path
 import triton
 from triton.backends.compiler import GPUTarget
 from triton.compiler import ASTSource
+from triton.experimental.gluon._runtime import GluonASTSource
 
-from aiter.ops.triton._triton_kernels.quant.fp8_group32 import (
+from aiter.ops.triton._gluon_kernels.gfx1250.quant.fp8_group32 import (
     _quantize_fp8_group32_kernel,
 )
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (
@@ -47,12 +48,14 @@ def native_reference(root):
 
 
 def compile_one(fn, name, constants, signatures, output):
-    source = ASTSource(fn, signature=signatures, constexprs=constants)
+    source_type = GluonASTSource if fn.is_gluon() else ASTSource
+    source = source_type(fn, signature=signatures, constexprs=constants)
     kernel = triton.compile(
         source, target=GPUTarget("hip", "gfx1250", 32), options={"num_warps": 4}
     )
-    for suffix in ("amdgcn", "llir", "ttgir"):
-        (output / f"{name}.{suffix}").write_text(kernel.asm[suffix])
+    for suffix in ("glir", "ttir", "ttgir", "llir", "amdgcn"):
+        if suffix in kernel.asm:
+            (output / f"{name}.{suffix}").write_text(kernel.asm[suffix])
     (output / f"{name}.hsaco").write_bytes(kernel.asm["hsaco"])
     return {
         "name": name,
