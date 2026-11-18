@@ -266,6 +266,13 @@ def test_pci_chip_id_attribute_follows_runtime_version(hip, version, attribute):
     assert hip.hipDeviceGetAttribute.call_args.args[1:] == (attribute, 0)
 
 
+def test_mi300a_chip_id_is_named_separately_from_mi300(hip):
+    hip.archs[0] = "gfx942:sramecc+:xnack-"
+    hip.hipDeviceGetAttribute.side_effect = _hip_result(0x74A0)
+    assert chip_info.get_device_name() == "MI300A"
+    assert hip.hipDeviceGetAttribute.call_args.args[1:] == (10020, 0)
+
+
 def test_pci_chip_id_raises_on_unknown_version(hip):
     hip.archs[0] = "gfx942:sramecc+:xnack-"
     hip.hipRuntimeGetVersion.side_effect = _hip_result(0, 999)
@@ -287,3 +294,12 @@ def test_windows_library_names_search_the_rocm_home(monkeypatch, tmp_path):
 
     rocm_home._find_rocm_home = lambda: None
     assert hip_runtime._library_names() == ("amdhip64.dll",)
+
+
+def test_cdna4_xcd_count_accepts_whole_xcd_topologies():
+    assert [chip_info.get_cdna4_num_xcds(cu) for cu in (96, 128, 160, 256)] == [
+        3,
+        4,
+        5,
+        8,
+    ]
