@@ -99,7 +99,6 @@ def build_flash_attn_dualwave_swp_fp8_module(
     DEFAULT_STRIDE_Q_N = traits.DEFAULT_STRIDE_Q_N
     DEFAULT_STRIDE_O_N = traits.DEFAULT_STRIDE_O_N
     DEFAULT_STRIDE_KV_N = traits.DEFAULT_STRIDE_KV_N
-    _dualwave_swp_fp8_cache_tag = traits.cache_tag
     _lds_elem_dtype = fx.Float8E4M3FN
 
     # fx.Array rejects a length of 0.
@@ -408,8 +407,6 @@ def build_flash_attn_dualwave_swp_fp8_module(
         lse_stride_h: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008  framework idiom
     ):
-        # Make shape/mode traits visible to the JIT cache key.
-        _ = _dualwave_swp_fp8_cache_tag
         bs_idx = fx.Index(batch_size)
         sl_idx = fx.Index(seq_len)
         num_q_blocks = (sl_idx + BLOCK_M - 1) // BLOCK_M
