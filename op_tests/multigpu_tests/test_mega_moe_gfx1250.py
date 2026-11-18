@@ -737,7 +737,7 @@ def _check_pull_s1f(ctx):
 def _check_pull_s1f_affinity(ctx):
     """Check mixed 3P/5C clusters, stealing, tails and changing graph inputs."""
     with mock.patch.dict(os.environ, {
-        "AITER_MEGA_S1F_PULL_AFFINITY": "1",
+        "AITER_MOE_S1F_AFFINITY": "1",
         "AITER_MEGA_S1F_PULL_PRODUCERS": "96",
         "AITER_MEGA_S1F_PULL_CLUSTER": "0",
     }):

@@ -4,9 +4,10 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
-# Ignore stale tuning overrides from earlier experiments.
+# Preserve the public affinity switch; clear stale tuning overrides.
 for name in $(compgen -e); do
   case "$name" in
+    AITER_MOE_S1F_AFFINITY) ;;
     AITER_*|FLYDSL_*|MORI_*|MEGA_*|COMBINE_QUANT|DEBUG_HIP_GRAPH_CLASSIC_PATH)
       unset "$name" ;;
   esac
@@ -19,7 +20,7 @@ export AITER_MEGA_S1F=1 AITER_MEGA_QUANT_FUSE=128 AITER_MEGA_PLAN_PREFETCH=0
 export AITER_MEGA_DISPATCH_PULL=1 AITER_MEGA_PULL_TDM_GATHER=1
 export AITER_MEGA_S1F_PULL=1 AITER_MEGA_S1F_PULL_PRODUCERS=${DS41_PRODUCERS:-96}
 export AITER_MEGA_S1F_PULL_CLUSTER=${DS41_CLUSTER:-0}
-export AITER_MEGA_S1F_PULL_AFFINITY=${DS41_AFFINITY:-0}
+export AITER_MOE_S1F_AFFINITY=${AITER_MOE_S1F_AFFINITY:-0}
 export AITER_TDM_B_TH=${DS41_BTH:-0}
 export AITER_MOE_EXPERT_BALANCE=true
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"

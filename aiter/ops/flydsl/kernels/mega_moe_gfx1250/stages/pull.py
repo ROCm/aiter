@@ -263,7 +263,7 @@ class PullDispatch:
             workers = int(get_cu_num())
         cluster_m, cluster_n, cluster_reason = 1, 1, "cluster mode disabled"
         affinity_size, affinity_producers = 1, 0
-        if _select_bool_env("AITER_MEGA_S1F_PULL_AFFINITY", 0):
+        if _select_bool_env("AITER_MOE_S1F_AFFINITY", 0):
             affinity_size, affinity_producers = pull_affinity_geometry(
                 workers, producers
             )

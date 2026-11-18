@@ -621,8 +621,9 @@ Logs, source snapshots, commands and event samples:
 
 ## Optional mixed-role S1F affinity, 2026-11-18
 
-Enable with `DS41_AFFINITY=1 bash run_ds41_flash_best.sh`, or set
-`AITER_MEGA_S1F_PULL_AFFINITY=1` alongside the normal S1F pull options.
+Set `AITER_MOE_S1F_AFFINITY=1` alongside the normal S1F pull options.
+The reproducer preserves this switch:
+`AITER_MOE_S1F_AFFINITY=1 bash run_ds41_flash_best.sh`.
 The default remains off. This option takes precedence over the earlier
 consumer-only `AITER_MEGA_S1F_PULL_CLUSTER` experiment.
 
@@ -719,7 +720,7 @@ No GPU kernel source or CSV was changed during this tuning.
 Reproduce native E2E with the retained setting:
 
 ```sh
-DS41_AFFINITY=1 DS41_BTH=0 bash /app/aiter/run_ds41_flash_best.sh
+AITER_MOE_S1F_AFFINITY=1 DS41_BTH=0 bash /app/aiter/run_ds41_flash_best.sh
 ```
 
 Set DS41_BTH=2 or 5 to reproduce the alternatives. The script clears raw
