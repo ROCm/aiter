@@ -4,12 +4,16 @@
 
 Each selected shape runs reference checks before timing.
 Use --check-only to check those shapes and backends without benchmarking.
+--backends asm runs the gfx1250 asm kernels (AITER_MEGA_MHC_ASM=1) and skips
+shapes without one; hip then always runs the HIP kernels.
 """
 
 import argparse
+import contextlib
 import copy
 import itertools
 import math
+import os
 from functools import cache
 
 import pandas as pd
@@ -17,6 +21,7 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.mega_mhc import (
+    _asm_tile,
     _counter_state_ok,
     mega_mhc,
     mega_mhc_shuffle_fn,
@@ -29,6 +34,8 @@ from aiter.test_common import benchmark, device_memory_profiling, run_perftest
 ARGS = (1e-6, 1e-6, 1e-6, 2.0, 20)
 MODES = ("post", "no_post", "identity_pre", "no_post_identity")
 BACKENDS = ("hip", "flydsl", "triton")
+# asm shares mega_mhc and its arguments with hip.
+NATIVE_BACKENDS = ("hip", "asm")
 OUT_DTYPES = ("bf16", "mxfp8")
 # M covers decode through prefill; use --hidden to test other model widths.
 # 1152 and 1280 (72 and 80 token tiles) take the gfx1250 three-way split.
@@ -178,9 +185,38 @@ def check(out, reference, scale_row_major=False):
         torch.testing.assert_close(out[i], reference[i], rtol=1e-3, atol=5e-4)
 
 
+@contextlib.contextmanager
+def asm_env(enabled):
+    """Set AITER_MEGA_MHC_ASM for one call, then restore it."""
+    previous = os.environ.get("AITER_MEGA_MHC_ASM")
+    os.environ["AITER_MEGA_MHC_ASM"] = "1" if enabled else "0"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("AITER_MEGA_MHC_ASM")
+        else:
+            os.environ["AITER_MEGA_MHC_ASM"] = previous
+
+
+def _asm_tile_for(m, hidden_size, mode, out_dtype, scalar_args, scale_row_major):
+    """Token tile of the asm kernel the asm backend runs, None if it has none."""
+    with asm_env(True):
+        return _asm_tile(
+            get_gfx_runtime(),
+            m,
+            hidden_size,
+            out_dtype,
+            "no_post" not in mode,
+            "identity" in mode,
+            scale_row_major=scale_row_major,
+            sinkhorn_repeat=scalar_args[4],
+        )
+
+
 @cache
 def backend_function(name):
-    if name == "hip":
+    if name in NATIVE_BACKENDS:
         return mega_mhc
     if name == "flydsl":
         from aiter.ops.flydsl.mega_mhc_kernels import flydsl_mega_mhc
@@ -246,7 +282,7 @@ class _BenchmarkBackend:
             "norm_weight": weight,
             "residual_out": residual_out,
         }
-        if self.name == "hip":
+        if self.name in NATIVE_BACKENDS:
             kw["workspace"] = self.workspace
             kw["w_preshuffle_bf16"] = True
             if self.res_preshuffle:
@@ -255,7 +291,10 @@ class _BenchmarkBackend:
                 kw["scale_row_major"] = True
         if self.name != "triton":
             kw["out_dtype"] = self.out_dtype
-        return self.backend(r, fn, scale, base, *self.scalar_args, **kw)
+        if self.name not in NATIVE_BACKENDS:
+            return self.backend(r, fn, scale, base, *self.scalar_args, **kw)
+        with asm_env(self.name == "asm"):
+            return self.backend(r, fn, scale, base, *self.scalar_args, **kw)
 
 
 def _run_rotating_perftest(caller, tensors, num_iters):
@@ -332,16 +371,26 @@ def benchmark_mega_mhc(
                 result[name] = "SKIP"
                 result[f"{name}_us"] = result[f"{name}_TB/s"] = float("nan")
                 continue
+        if name == "asm" and (
+            res_preshuffle
+            or _asm_tile_for(m, hidden_size, mode, out_dtype, args[4:], scale_row_major)
+            is None
+        ):
+            result[name] = "SKIP"
+            result[f"{name}_us"] = result[f"{name}_TB/s"] = float("nan")
+            continue
         backend_tensors = tensors
         workspace = None
         shuffled = name == "hip" and res_preshuffle
-        if name == "hip":
+        if name in NATIVE_BACKENDS:
             # Rotate already-packed weights; deepcopy preserves their layout.
             fn_packed = mega_mhc_shuffle_fn(args[1])
             residual = shuffle_residual(tensors[0]) if shuffled else tensors[0]
             backend_tensors = (residual, fn_packed, *tensors[2:])
-            workspace = prepare_mega_mhc(args[0].device, m, hidden_size)
-        row_major = name == "hip" and scale_row_major
+            with asm_env(name == "asm"):
+                workspace = prepare_mega_mhc(args[0].device, m, hidden_size)
+            assert (workspace.asm_partials is not None) == (name == "asm")
+        row_major = name in NATIVE_BACKENDS and scale_row_major
         caller = _BenchmarkBackend(
             name, args[4:], out_dtype, workspace, shuffled, row_major
         )
@@ -413,10 +462,10 @@ def main():
     )
     parser.add_argument(
         "--backends",
-        choices=BACKENDS,
+        choices=BACKENDS + ("asm",),
         nargs="+",
         help="default: HIP/FlyDSL/Triton on gfx950; HIP/Triton on gfx942/gfx1250; "
-        "Triton is omitted for MXFP8",
+        "Triton is omitted for MXFP8; asm: gfx1250 asm kernels",
     )
     parser.add_argument(
         "--res-preshuffle",
@@ -426,7 +475,7 @@ def main():
     parser.add_argument(
         "--scale-row-major",
         action="store_true",
-        help="HIP writes row-major [T, H/32] MXFP8 scales (gfx1250; gfx950 always)",
+        help="HIP/asm write row-major [T, H/32] MXFP8 scales (gfx1250; gfx950 always)",
     )
     parser.add_argument("--seed", type=int, default=0, help="shared input seed")
     parser.add_argument(
@@ -472,6 +521,8 @@ def main():
     )
     if "flydsl" in backends and arch != "gfx950":
         parser.error("FlyDSL Mega-MHC requires gfx950")
+    if "asm" in backends and arch != "gfx1250":
+        parser.error("Mega-MHC asm kernels require gfx1250")
     for name in backends:
         try:
             backend_function(name)
