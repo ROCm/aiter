@@ -991,9 +991,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if hadamard_rotate:
                 from aiter.ops.quant import per_1x32_f4_quant_hip
 
-                out_fp4, scale_out = per_1x32_f4_quant_hip(
-                    normed, hadamard_rotate=True
-                )
+                out_fp4, scale_out = per_1x32_f4_quant_hip(normed, hadamard_rotate=True)
             else:
                 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 

@@ -645,7 +645,17 @@ class Stage1ArenaLayout:
         if max_recv_routes_per_rank < theoretical_routes:
             # Only a tighter receive contract needs a hot-path reservation.
             # Append it so the default EP16 window offsets stay unchanged.
-            specs.append(("recv_route_count", (parity_depth,), torch.int32, 64))
+            # S1_PACK_RA (experiment): routes and compact input slots share one
+            # 8-byte word pair per parity for a single 64-bit reservation atomic.
+            _pack = __import__("os").environ.get("S1_PACK_RA", "0") == "1"
+            specs.append(
+                (
+                    "recv_route_count",
+                    (parity_depth, 2) if _pack else (parity_depth,),
+                    torch.int32,
+                    64,
+                )
+            )
             specs.append(("recv_overflow", (parity_depth,), torch.int32, 64))
             specs.append(("forward_status", (1,), torch.int32, 64))
         if input_capacity < source_capacity:
