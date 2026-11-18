@@ -865,6 +865,45 @@ def _flydsl_moe_sorting(
     return ret
 
 
+# Above this many routed rows the single-CTA BM16 sort loses to the multi-CTA one.
+_FUSED_BM16_SORT_MAX_ROUTED_ROWS = 1024
+
+
+def _use_fused_bm16_sort(
+    stage1_func,
+    block_size,
+    routed_rows,
+    num_experts,
+    topk,
+    model_dim,
+    expert_mask,
+    need_local_topk_ids,
+    asm_mode,
+    accumulate,
+) -> bool:
+    """Whether a FlyDSL stage1 reads its routes from the fused BM16 sort.
+
+    The fused sort also zeroes the atomic stage2 output, so it replaces the generic
+    sort for the decode-sized BM16 FlyDSL pipelines on the shapes it is generated for.
+    """
+    return (
+        stage1_func is _flydsl_stage1_wrapper
+        and block_size == 16
+        and routed_rows <= _FUSED_BM16_SORT_MAX_ROUTED_ROWS
+        and accumulate
+        and asm_mode is AsmMoeMode.SORTED
+        and expert_mask is None
+        and not need_local_topk_ids
+        and not _USE_CK_MOE_SORTING
+        and not _USE_FLYDSL_MOE_SORTING
+        and _MOE_SORT_BACKEND not in ("opus", "ck")
+        and get_gfx() == "gfx950"
+        and _mxfp4_aux_instance_supported(
+            num_experts, topk, model_dim, block_size, True
+        )
+    )
+
+
 def moe_sorting(
     topk_ids,
     topk_weights,
@@ -2533,22 +2572,49 @@ def _fused_moe_impl(
             # The reducer overwrites the final output, including masked rows.
             # An empty buffer also suppresses the sort's EP zero-fill.
             sort_output = torch.empty((0, 0), dtype=dtype, device=topk_ids.device)
-        sorting_ret = moe_sorting(
-            topk_ids,
-            topk_weight,
-            global_E,
-            model_dim,
-            dtype,
-            block_size_M,
-            expert_mask,
-            num_local_tokens,
-            moe_sorting_dispatch_policy,
-            return_local_topk_ids=need_local_topk_ids,
-            accumulate=not runtime_stage2_reduce
-            and asm_mode is not AsmMoeMode.POST_REDUCE,
-            flat=asm_mode,
-            output=sort_output,
+        accumulate = (
+            not runtime_stage2_reduce and asm_mode is not AsmMoeMode.POST_REDUCE
         )
+        if _use_fused_bm16_sort(
+            stage1_func,
+            block_size_M,
+            M * topk,
+            global_E,
+            topk,
+            model_dim,
+            expert_mask,
+            need_local_topk_ids,
+            asm_mode,
+            accumulate,
+        ):
+            sorting_ret = _adaptive_moe_sort(
+                topk_ids,
+                topk_weight,
+                global_E,
+                topk,
+                block_size_M,
+                model_dim,
+                atomic=True,
+                moebuf_dtype=dtype,
+                num_local_tokens=num_local_tokens,
+                output=sort_output,
+            )
+        else:
+            sorting_ret = moe_sorting(
+                topk_ids,
+                topk_weight,
+                global_E,
+                model_dim,
+                dtype,
+                block_size_M,
+                expert_mask,
+                num_local_tokens,
+                moe_sorting_dispatch_policy,
+                return_local_topk_ids=need_local_topk_ids,
+                accumulate=accumulate,
+                flat=asm_mode,
+                output=sort_output,
+            )
         if need_local_topk_ids:
             (
                 sorted_ids,

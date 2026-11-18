@@ -271,6 +271,24 @@ def _gemm1_body_a16w4(
         u_raw = [b_loader.load_raw(base_k, c) for c in cols_up]
         return g_raw, u_raw, g_sc, u_sc
 
+    # Deferred e8m0 scales (mxfp4): issue only the scale dword loads with the tile and
+    # decode them when the tile is consumed, so the decode (which waits on its load)
+    # does not hold back the next tile's weight loads.
+    def issue_b_tile(base_k):
+        g_sc = [b_loader.load_scale_raw(base_k, c) for c in cols_gate]
+        u_sc = [b_loader.load_scale_raw(base_k, c) for c in cols_up]
+        g_raw = [b_loader.load_raw(base_k, c) for c in cols_gate]
+        u_raw = [b_loader.load_raw(base_k, c) for c in cols_up]
+        return base_k, g_raw, u_raw, g_sc, u_sc
+
+    def finish_b_tile(tile):
+        base_k, g_raw, u_raw, g_sc, u_sc = tile
+        g_scale = [
+            b_loader.convert_scale(base_k, c, s) for c, s in zip(cols_gate, g_sc)
+        ]
+        u_scale = [b_loader.convert_scale(base_k, c, s) for c, s in zip(cols_up, u_sc)]
+        return g_raw, u_raw, g_scale, u_scale
+
     def preload_a(read_slot):
         # Read ALL current-tile A-LDS fragments up front, before the next tile's A-DMA
         # (aiter phase-separated iteration): drops the per-read vmcnt(0) drains that
@@ -306,6 +324,22 @@ def _gemm1_body_a16w4(
         gpu.barrier()
         compute_tile(b0, preload_a(0))
         gpu.barrier()
+    elif const_expr(prefetch == 1 and w_dtype == "fp4" and not _is_gfx942):
+        a_loader.store_tile(k_base, slot=0)
+        b_cur = issue_b_tile(k_base)
+        for kt in range_constexpr(K_TILES_TOTAL):
+            cur_slot = kt % A_LDS_STAGES
+            rocdl.s_waitcnt(lgkmcnt=0)
+            gpu.barrier()
+            a_frags = preload_a(cur_slot)
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                a_loader.store_tile(
+                    k_base + fx.Int32((kt + 1) * TILE_K), slot=(kt + 1) % A_LDS_STAGES
+                )
+                b_nxt = issue_b_tile(k_base + fx.Int32((kt + 1) * TILE_K))
+            compute_tile(finish_b_tile(b_cur), a_frags)
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                b_cur = b_nxt
     elif const_expr(prefetch == 1):
         a_loader.store_tile(k_base, slot=0)
         b_cur = load_b_tile(k_base)
@@ -334,23 +368,6 @@ def _gemm1_body_a16w4(
         # tile's MFMAs and scales are decoded when consumed. Loads, MFMA order and
         # values are those of prefetch=1, so the output is bitwise identical.
         _depth = min(prefetch, K_TILES_TOTAL)
-
-        def issue_b_tile(base_k):
-            g_sc = [b_loader.load_scale_raw(base_k, c) for c in cols_gate]
-            u_sc = [b_loader.load_scale_raw(base_k, c) for c in cols_up]
-            g_raw = [b_loader.load_raw(base_k, c) for c in cols_gate]
-            u_raw = [b_loader.load_raw(base_k, c) for c in cols_up]
-            return base_k, g_raw, u_raw, g_sc, u_sc
-
-        def finish_b_tile(tile):
-            base_k, g_raw, u_raw, g_sc, u_sc = tile
-            g_scale = [
-                b_loader.convert_scale(base_k, c, s) for c, s in zip(cols_gate, g_sc)
-            ]
-            u_scale = [
-                b_loader.convert_scale(base_k, c, s) for c, s in zip(cols_up, u_sc)
-            ]
-            return g_raw, u_raw, g_scale, u_scale
 
         a_loader.store_tile(k_base, slot=0)
         a_inflight = {}
