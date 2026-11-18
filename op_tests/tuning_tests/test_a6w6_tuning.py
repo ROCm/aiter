@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import pandas as pd
@@ -15,6 +16,7 @@ from aiter.ops import gemm_op_a6w6
 from csrc.gemm_a6w6.gemm_a6w6_tune import (
     FLYDSL_KERNEL_ID_BASE,
     FLYDSL_VARIANTS,
+    GemmA6W6Tuner,
     candidate_supports_shape,
     choose_guarded_kernel,
     flydsl_candidates,
@@ -377,6 +379,82 @@ class TestA6W6MinimumGainGuard(unittest.TestCase):
         selected, gain_pct = choose_guarded_kernel("default", "default", [], 2.0, True)
         self.assertEqual(selected, "default")
         self.assertEqual(gain_pct, 0.0)
+
+    def _guard(self, speedups):
+        """The row the guard keeps for one shape whose profiled candidates are
+        ``speedups``' keys in order, each re-timed at those paired speedups."""
+        tuner = object.__new__(GemmA6W6Tuner)
+        tuner.candidates = [{"kernel_id": 34, "kernel_name": "asm_kernel"}]
+        rows = [
+            {
+                "gfx": "gfx950",
+                "cu_num": 256,
+                "M": 4096,
+                "N": 4096,
+                "K": 4096,
+                "kernelId": 0,
+                "splitK": 0,
+                "us": 100.0 + index,
+                "kernelName": name,
+                "tflops": 0.0,
+                "bw": 0.0,
+                "errRatio": 0.0,
+            }
+            for index, name in enumerate(speedups)
+        ]
+        args = SimpleNamespace(
+            min_gain_pct=0.5,
+            gain_guard_warmup=0,
+            gain_guard_iters=1,
+            gain_guard_reps=3,
+            disable_gain_guard=False,
+        )
+
+        def validate(M, N, K, default_kernel, candidate_kernel, *_):
+            paired = speedups[candidate_kernel]
+            return {
+                "default_us": 100.0,
+                "candidate_us": 100.0 / paired[0],
+                "paired_speedups": paired,
+                "exact_match": True,
+            }
+
+        with mock.patch(
+            "csrc.gemm_a6w6.gemm_a6w6_tune.benchmark_candidate_gain",
+            side_effect=validate,
+        ):
+            result = tuner._apply_min_gain_guard(pd.DataFrame(rows), args)
+        self.assertEqual(len(result), 1)
+        return result.iloc[0]
+
+    def test_keeps_the_fastest_validated_candidate_of_either_backend(self):
+        flydsl = [name for _, name in flydsl_candidates()]
+        row = self._guard(
+            {
+                flydsl[2]: [1.003] * 3,  # below the threshold
+                "asm_kernel": [1.012] * 3,
+                flydsl[9]: [1.02, 0.99, 1.03],  # one repeat loses
+            }
+        )
+        self.assertEqual(row["kernelName"], "asm_kernel")
+        self.assertEqual(row["kernelId"], 34)
+        self.assertAlmostEqual(row["us"], round(100.0 / 1.012, 4))
+
+    def test_retimes_the_fastest_asm_kernel_outside_the_fastest_four(self):
+        default = gemm_op_a6w6._default_gemm_a6w6_kernel(4096, 4096, 4096)
+        flydsl = [name for _, name in flydsl_candidates() if name != default]
+        speedups = {name: [1.001] * 3 for name in flydsl[:5]}
+        speedups["asm_kernel"] = [1.02] * 3
+        self.assertEqual(self._guard(speedups)["kernelName"], "asm_kernel")
+
+    def test_keeps_the_default_when_no_candidate_clears_the_threshold(self):
+        flydsl = [name for _, name in flydsl_candidates()]
+        row = self._guard({flydsl[2]: [1.003] * 3, "asm_kernel": [0.99] * 3})
+        self.assertEqual(
+            row["kernelName"], gemm_op_a6w6._default_gemm_a6w6_kernel(4096, 4096, 4096)
+        )
+        self.assertEqual(row["us"], 100.0)
+        self.assertEqual(row["errRatio"], 0.0)
 
 
 if __name__ == "__main__":

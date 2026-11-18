@@ -470,10 +470,10 @@ def test_a6w6_csv_rows_reach_the_4wave_kernel_through_public_replay(
     source = _REPO_ROOT / "aiter/configs/a6w6_blockscale_tuned_gemm.csv"
     with source.open(newline="") as stream:
         reader = csv.DictReader(stream)
-        rows = list(reader)
+        rows = [row for row in reader if row["kernelName"].startswith("flydsl_a6w6_")]
         fieldnames = reader.fieldnames
-    assert all(row["kernelName"].startswith("flydsl_a6w6_") for row in rows)
     rows = rows[:3]
+    assert len(rows) == 3
     path = tmp_path / "a6w6_blockscale_tuned_gemm.csv"
     with path.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
