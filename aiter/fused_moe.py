@@ -5229,9 +5229,13 @@ def get_2stage_cfgs(
             if has_stage2_scatter:
                 _unsupported_reasons.append("has_stage2_scatter=True (expected False)")
             if has_activation_scales:
-                _unsupported_reasons.append("has_activation_scales=True (expected False)")
+                _unsupported_reasons.append(
+                    "has_activation_scales=True (expected False)"
+                )
             if not bool(opus_weights_shuffled):
-                _unsupported_reasons.append("opus_weights_shuffled=False (expected True)")
+                _unsupported_reasons.append(
+                    "opus_weights_shuffled=False (expected True)"
+                )
             if get_gfx_runtime() != "gfx950":
                 _unsupported_reasons.append(
                     f"gfx runtime={get_gfx_runtime()!r} (expected gfx950)"
