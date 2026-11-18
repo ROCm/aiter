@@ -5623,27 +5623,22 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
-    # Runtime SiLU clamping is supported only by the non-split CK stage-1 epilogue,
-    # so it must reject ASM 1-stage and FlyDSL whole-graph rows before they resolve.
+    # Runtime SiLU clamping is supported only by the non-split CK stage-1 epilogue
+    # and, for gfx942 per-token FP8, the FlyDSL backend, so it must reject ASM
+    # 1-stage and other FlyDSL whole-graph rows before they resolve.
     clamp_silu_limit = (
         bool(swiglu_limit)
         and q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
         and activation == ActivationType.Silu
     )
-    if clamp_silu_limit and q_type != QuantType.per_1x128:
-        if q_dtype_w != dtypes.fp8 or q_dtype_a != dtypes.fp8:
-            raise NotImplementedError(
-                f"fused_moe cannot apply swiglu_limit={swiglu_limit!r} for {q_type} "
-                f"SiLU with weight dtype {q_dtype_w} / activation dtype {q_dtype_a}; "
-                "the runtime-limit CK instances are FP8 only."
-            )
-        if inter_dim % 128 != 0:
-            raise NotImplementedError(
-                f"fused_moe cannot apply swiglu_limit={swiglu_limit!r} for {q_type} "
-                f"SiLU at inter_dim={inter_dim}; the runtime-limit CK stage1 needs a "
-                "multiple of 128."
-            )
-    if clamp_silu_limit and cfg is not None:
+    flydsl_gfx942_row = (
+        gfx == "gfx942"
+        and q_type == QuantType.per_Token
+        and q_dtype_w == dtypes.fp8
+        and cfg is not None
+        and str(cfg.get("kernelName1", "")).startswith("impl__flydsl_gfx942__")
+    )
+    if clamp_silu_limit and cfg is not None and not flydsl_gfx942_row:
         cfg_ksplit = int(cfg.get("ksplit", 0) or 0)
         if (
             cfg.get("run_1stage", False)
@@ -5751,6 +5746,20 @@ def get_2stage_cfgs(
             ksplit,
             full_impl=full_impl,
         )
+    # No FlyDSL backend took the clamp, so CK stage 1 must.
+    if clamp_silu_limit and q_type != QuantType.per_1x128:
+        if q_dtype_w != dtypes.fp8 or q_dtype_a != dtypes.fp8:
+            raise NotImplementedError(
+                f"fused_moe cannot apply swiglu_limit={swiglu_limit!r} for {q_type} "
+                f"SiLU with weight dtype {q_dtype_w} / activation dtype {q_dtype_a}; "
+                "the runtime-limit CK instances are FP8 only."
+            )
+        if inter_dim % 128 != 0:
+            raise NotImplementedError(
+                f"fused_moe cannot apply swiglu_limit={swiglu_limit!r} for {q_type} "
+                f"SiLU at inter_dim={inter_dim}; the runtime-limit CK stage1 needs a "
+                "multiple of 128."
+            )
     if config_file is not None and (cfg is None or bypass_tuned_config):
         raise NotImplementedError(
             "The dedicated FHMoE path requires an exact tuned config row for "
