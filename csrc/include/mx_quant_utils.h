@@ -108,6 +108,18 @@ template <> struct MxDtypeConfig<MxDtype::FP8_E4M3_FNUZ> {
     static constexpr uint32_t even_val_to_add = 0x00080000u;    // 1 << (23 - 3 - 1) = 1 << 19
 };
 
+// The compile target's hardware fp8 e4m3: gfx942 ships e4m3fnuz (max_pos=240), gfx950 and later
+// OCP e4m3fn (max_pos=448).
+constexpr MxDtype kHwFp8MxDtype =
+#if defined(__gfx942__)
+    MxDtype::FP8_E4M3_FNUZ;
+#else
+    MxDtype::FP8_E4M3;
+#endif
+
+// An MXFP8 group holding an Inf (the amax skips NaN) gets the largest finite scale, 2^127 (0xFE).
+__device__ __forceinline__ float mxfp8_cap_scale(float scale) { return fminf(scale, 0x1.0p127f); }
+
 // Biased exponent of ceil_pow2(|x|), with 0xFF (Inf/NaN) kept: adding the mantissa mask
 // carries into the exponent exactly when the mantissa is nonzero. Same result as
 // `e + (e < 0xFF && mantissa != 0)` for every input, without the compare pair.

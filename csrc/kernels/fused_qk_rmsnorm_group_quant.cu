@@ -302,15 +302,9 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
                 if constexpr(E8M0_SCALE)
                 {
                     // per_group_quant_hip's rule: RoundUp E8M0, capped at 2^127 (an Inf group).
-                    constexpr aiter::MxDtype kMxDtype =
-#if defined(__gfx942__)
-                        aiter::MxDtype::FP8_E4M3_FNUZ;
-#else
-                        aiter::MxDtype::FP8_E4M3;
-#endif
-                    quant_scale = fminf(
-                        aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(max),
-                        0x1.0p127f);
+                    quant_scale = aiter::mxfp8_cap_scale(
+                        aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode,
+                                                    aiter::kHwFp8MxDtype>(max));
                 }
                 else
                 {

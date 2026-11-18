@@ -10,10 +10,6 @@ from ..jit.core import compile_ops
 from ..utility import dtypes
 from .fused_qk_norm_rope_cache_quant import _fused_qk_rmsnorm
 
-# fused_qk_rmsnorm_group_quant accepts an fp8_e8m0 q_out_scale (fp8 output);
-# older builds abort on it, so callers check this first.
-FUSED_QK_RMSNORM_SUPPORTS_E8M0_GROUP_SCALE = True
-
 
 @compile_ops(
     "module_fused_qk_rmsnorm_group_quant",
