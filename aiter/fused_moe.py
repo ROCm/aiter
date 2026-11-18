@@ -1646,7 +1646,7 @@ def _can_use_bf16_g1u1_small_m_direct(
 
 
 @torch_compile_guard(gen_fake=fused_moe_fake)
-@_route(op="fused_moe", version=1)
+@_route(op="fused_moe", version=2)
 def fused_moe_(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
