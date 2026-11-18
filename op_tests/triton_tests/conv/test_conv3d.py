@@ -51,13 +51,13 @@ from aiter.ops.triton.utils.conv_config_utils import (
     format_prepack_shape_key_3d,
     format_shape_key_3d,
 )
-
-from ._helpers import (
+from op_tests.triton_tests.conv._helpers import (
     ALL_SUPPORTED_ARCHS,
     CONV3D_WEIGHT_PACK_CACHE_NAMES,
     _winograd_tolerances,
     apply_activation,
     assert_weight_pack_cache_clear_is_scoped,
+    conv3d_padding_reference,
     dynamic_conv_tolerances,
 )
 
@@ -593,8 +593,272 @@ def test_conv3d_execution_rejects_cpu_tensors():
     x = torch.empty((1, 4, 3, 4, 4), dtype=torch.float16, device="cpu")
     w = torch.empty((4, 4, 1, 1, 1), dtype=torch.float16, device="cpu")
 
-    with pytest.raises(ValueError, match="requires CUDA input and weight tensors"):
+    with pytest.raises(ValueError, match="conv3d input must be a CUDA/ROCm tensor"):
         conv3d_general(x, w)
+
+
+@pytest.mark.parametrize(
+    "api,layout,padding_mode,dtype,filter_shape,stride,dilation,padding",
+    [
+        (
+            "conv3d",
+            "ndhwc",
+            "reflect",
+            torch.float16,
+            (3, 3, 3),
+            (1, 1, 1),
+            (1, 1, 1),
+            (1, 2, 1),
+        ),
+        (
+            "conv3d_ncdhw",
+            "ncdhw",
+            "replicate",
+            torch.bfloat16,
+            (3, 5, 3),
+            (1, 2, 1),
+            (1, 1, 2),
+            (1, 2, 2),
+        ),
+        (
+            "conv3d_ndhwc",
+            "ndhwc",
+            "circular",
+            torch.float16,
+            (3, 3, 3),
+            (1, 1, 1),
+            (1, 1, 1),
+            (1, 2, 1),
+        ),
+        (
+            "conv3d_1x1x1",
+            "ndhwc",
+            "circular",
+            torch.bfloat16,
+            (1, 1, 1),
+            (2, 1, 1),
+            (1, 1, 1),
+            (4, 0, 2),
+        ),
+        (
+            "conv3d_general",
+            "ncdhw",
+            "reflect",
+            torch.bfloat16,
+            (3, 5, 3),
+            (1, 2, 1),
+            (1, 1, 1),
+            (1, 2, 1),
+        ),
+        (
+            "conv3d_ndhwc_3x3x3",
+            "ndhwc",
+            "replicate",
+            torch.bfloat16,
+            (3, 3, 3),
+            (1, 1, 1),
+            (1, 1, 1),
+            (5, 1, 2),
+        ),
+        (
+            "conv3d_ncdhw_cblocked",
+            "ncdhw",
+            "circular",
+            torch.float16,
+            (3, 3, 3),
+            (1, 1, 1),
+            (1, 1, 1),
+            (1, 2, 1),
+        ),
+        (
+            "conv3d_winograd_hw_f4x3",
+            "ncdhw",
+            "reflect",
+            torch.bfloat16,
+            (3, 3, 3),
+            (1, 1, 1),
+            (1, 1, 1),
+            (1, 2, 1),
+        ),
+        (
+            "conv3d_winograd_hw_f4x3_cblocked",
+            "ncdhw",
+            "replicate",
+            torch.float16,
+            (3, 3, 3),
+            (1, 1, 1),
+            (1, 1, 1),
+            (1, 2, 1),
+        ),
+    ],
+)
+def test_padding_matches_reference(
+    api, layout, padding_mode, dtype, filter_shape, stride, dilation, padding
+):
+    torch.manual_seed(0)
+    source = torch.randn((1, 64, 4, 7, 9), device="cuda", dtype=dtype)
+    memory_format = (
+        torch.channels_last_3d if layout == "ndhwc" else torch.contiguous_format
+    )
+    source = source.contiguous(memory_format=memory_format)
+    weight = torch.randn((64, 64, *filter_shape), device="cuda", dtype=dtype)
+    bias = torch.randn((64,), device="cuda", dtype=dtype)
+    kwargs = (
+        {"layout": layout}
+        if api in ("conv3d", "conv3d_general", "conv3d_1x1x1")
+        else {}
+    )
+    expected = conv3d_padding_reference(
+        source.float(),
+        weight.float(),
+        bias.float(),
+        stride,
+        padding,
+        dilation,
+        padding_mode=padding_mode,
+    )
+    actual = getattr(conv3d_module, api)(
+        source,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        padding_mode=padding_mode,
+        **kwargs,
+    )
+    tolerances = _winograd_tolerances if "winograd" in api else dynamic_conv_tolerances
+    rtol, atol = tolerances(dtype, weight[0].numel())
+    context = f"{api}, mode={padding_mode}, layout={layout}, dtype={dtype}"
+    torch.testing.assert_close(
+        actual.float(),
+        expected,
+        rtol=rtol,
+        atol=atol,
+        msg=lambda details: f"{context}:\n{details}",
+    )
+    assert actual.dtype == dtype, f"{context}: output dtype must match the input"
+    assert (
+        actual.device == source.device
+    ), f"{context}: output must stay on the input device"
+    assert actual.is_contiguous(
+        memory_format=memory_format
+    ), f"{context}: wrong output layout"
+
+
+@pytest.mark.parametrize("layout", ["ncdhw", "ndhwc"])
+def test_padding_noop_preserves_zero_path(monkeypatch, layout):
+    source = torch.randn((1, 4, 3, 5, 7), device="cuda", dtype=torch.float16)
+    weight = torch.randn((4, 4, 1, 1, 1), device="cuda", dtype=torch.float16)
+
+    def unexpected_pad(*args, **kwargs):
+        pytest.fail("implicit padding and zero padding amounts must not call F.pad")
+
+    monkeypatch.setattr(F, "pad", unexpected_pad)
+    baseline = conv3d(source, weight, layout=layout)
+    for mode in ("reflect", "replicate", "circular"):
+        actual = conv3d(source, weight, padding=0, padding_mode=mode, layout=layout)
+        torch.testing.assert_close(
+            actual,
+            baseline,
+            rtol=0,
+            atol=0,
+            msg=lambda details, mode=mode: f"zero-amount {mode}, layout={layout}:\n{details}",
+        )
+    actual = conv3d(source, weight, padding=(1, 0, 2), layout=layout)
+    expected = F.conv3d(source.float(), weight.float(), padding=(1, 0, 2))
+    rtol, atol = dynamic_conv_tolerances(source.dtype, 4)
+    torch.testing.assert_close(
+        actual.float(),
+        expected,
+        rtol=rtol,
+        atol=atol,
+        msg=lambda details: f"implicit padding, layout={layout}:\n{details}",
+    )
+
+
+@pytest.mark.parametrize(
+    "api", ["conv3d_ncdhw_cblocked", "conv3d_winograd_hw_f4x3_cblocked"]
+)
+def test_padding_prepacked_input(api):
+    source = torch.randn((1, 64, 4, 7, 9), device="cuda", dtype=torch.float16)
+    weight = torch.randn((64, 64, 3, 3, 3), device="cuda", dtype=torch.float16)
+    packed, _ = prepack_ncdhw_to_cblocked(source)
+    function = getattr(conv3d_module, api)
+    with pytest.raises(ValueError, match="x_blocked.*materialized padding"):
+        function(
+            source, weight, padding=(1, 0, 0), padding_mode="reflect", x_blocked=packed
+        )
+    for padding, mode in [((1, 0, 1), "zeros"), (0, "reflect")]:
+        actual = function(
+            source, weight, padding=padding, padding_mode=mode, x_blocked=packed
+        )
+        expected = conv3d_padding_reference(
+            source.float(), weight.float(), padding=padding, padding_mode=mode
+        )
+        tolerances = (
+            _winograd_tolerances if "winograd" in api else dynamic_conv_tolerances
+        )
+        rtol, atol = tolerances(source.dtype, weight[0].numel())
+        torch.testing.assert_close(
+            actual.float(),
+            expected,
+            rtol=rtol,
+            atol=atol,
+            msg=lambda details, mode=mode: f"{api}, prepacked {mode}:\n{details}",
+        )
+
+
+@pytest.mark.parametrize(
+    "shape,padding,mode,message",
+    [
+        ((1, 4, 4, 7, 9), 0, "invalid", "padding_mode must be one of"),
+        ((1, 4, 4, 7, 9), (4, 0, 0), "reflect", "reflect padding must be less"),
+        ((1, 4, 4, 7, 9), (0, 7, 0), "reflect", "reflect padding must be less"),
+        ((1, 4, 4, 7, 9), (0, 0, 10), "circular", "circular padding must not exceed"),
+        ((1, 4, 0, 7, 9), 0, "replicate", "spatial dimensions must be positive"),
+        ((1, 4, 7, 9), 0, "reflect", "must be 5-D NCDHW"),
+    ],
+)
+def test_padding_validates_before_materialization(
+    monkeypatch, shape, padding, mode, message
+):
+    source = torch.empty(shape, device="cuda", dtype=torch.float16)
+    weight = torch.empty((4, 4, 1, 1, 1), device="cuda", dtype=torch.float16)
+
+    def unexpected_pad(*args, **kwargs):
+        pytest.fail("invalid padding must be rejected before calling F.pad")
+
+    monkeypatch.setattr(F, "pad", unexpected_pad)
+    with pytest.raises(ValueError, match=message):
+        conv3d(source, weight, padding=padding, padding_mode=mode)
+
+
+@pytest.mark.parametrize(
+    "api,cpu_argument",
+    [("conv3d_ncdhw", "weight"), ("conv3d_ndhwc", "bias"), ("conv3d_general", "bias")],
+)
+def test_padding_rejects_device_mismatch(monkeypatch, api, cpu_argument):
+    source = torch.empty((1, 4, 3, 5, 7), device="cuda", dtype=torch.float16)
+    weight = torch.empty(
+        (4, 4, 1, 1, 1),
+        device="cpu" if cpu_argument == "weight" else "cuda",
+        dtype=torch.float16,
+    )
+    bias = torch.empty(
+        (4,), device="cpu" if cpu_argument == "bias" else "cuda", dtype=torch.float16
+    )
+
+    def unexpected_pad(*args, **kwargs):
+        pytest.fail("device mismatches must be rejected before calling F.pad")
+
+    monkeypatch.setattr(F, "pad", unexpected_pad)
+    with pytest.raises(
+        ValueError, match="input, weight, and bias must be on the same device"
+    ):
+        getattr(conv3d_module, api)(
+            source, weight, bias, padding=1, padding_mode="reflect"
+        )
 
 
 def test_input_weight_channel_mismatch():
