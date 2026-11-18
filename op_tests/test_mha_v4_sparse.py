@@ -11,6 +11,7 @@ one contiguous block of it. Absorbs the former test_mha_v4_sparse_tile_scaling.p
 import argparse
 import csv
 import functools
+import inspect
 import itertools
 import math
 import os
@@ -49,6 +50,7 @@ from aiter.ops.mha_v4 import (
     scale_modes_for_formats,
 )
 from aiter.ops.mha_v4_quant import (
+    MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
     MHA_V4_LOG2E,
     mha_v4_q_multiplier,
     mxfp4_k_view,
@@ -2980,6 +2982,58 @@ def test_mha_v4_mx_scales_must_be_producer_contiguous(recipe, block_tile, mode):
             RuntimeError, match=f"MX {slot.upper()} descale must be contiguous"
         ):
             _mx_k_scale_launch(recipe, *launched.values(), plan, block_tile, mode)
+
+
+_SOL_ATTN_MXFP8 = next(r for r in _SOL_ATTN_RECIPES if r.id == "mxfp8")
+
+
+@_requires_sol_row(_SOL_ATTN_MXFP8, _MHA_V4_FINE_TILE)
+@parametrize("jensen", [False, True])
+@parametrize(
+    "kv_blocks",
+    # 8 pooled rows leave most of the 128-row scale tile as padding; 128 fill it.
+    [param(8, id="padded-tile"), param(SOL_ATTN_TS_KV, id="full-tile")],
+)
+def test_mha_v4_mxfp8_sol_64x64_reads_backed_pooled_k_scales(kv_blocks, jensen):
+    """The 64x64 MXFP8 row reads its pooled K scales past their last 128-row tile.
+
+    So the scales it gets must have mapped, zeroed bytes behind that tile for the producer's
+    lookahead, as AITER's own K scales do. sol_prepare pads them to the tile only, which faulted
+    whenever the allocation ended at an unmapped page.
+    """
+    recipe, heads = _SOL_ATTN_MXFP8, 2
+    q, k, v = recipe.operands(sequence_k=kv_blocks * _MHA_V4_FINE_TILE[1], heads=heads)
+    plan = recipe.prepare(
+        q, k, v, beta=0.4, heads=heads, block_tile=_MHA_V4_FINE_TILE, k_variance=jensen
+    )
+    native = aiter.ops.mha_v4._fmha_v4_fwd_sol
+    signature = inspect.signature(native)
+    seen = {}
+
+    def capture(*args, **kwargs):
+        seen.update(signature.bind(*args, **kwargs).arguments)
+        return native(*args, **kwargs)
+
+    with mock.patch.object(aiter.ops.mha_v4, "_fmha_v4_fwd_sol", capture):
+        out = _sol_attn_launch(
+            q, k, v, plan, recipe=recipe, block_tile=_MHA_V4_FINE_TILE, jensen=jensen
+        )
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all()
+
+    for name in ("mean_k_scale", "mean_k_var_scale") if jensen else ("mean_k_scale",):
+        scale = seen[name]
+        assert torch.equal(scale, plan[name]), name
+        row_bytes = scale[0, 0].numel()
+        tile_rows = -(-scale.shape[1] // SOL_ATTN_TS_KV) * SOL_ATTN_TS_KV
+        padding = tile_rows - scale.shape[1] + MHA_V4_KV_SCALE_LOOKAHEAD_ROWS
+        backed = padding * row_bytes
+        end = (scale.storage_offset() + scale.numel()) * scale.element_size()
+        tail = _uint8_storage(scale)[end:]
+        assert (
+            tail.numel() >= backed
+        ), f"{name}: {tail.numel()} of {backed} bytes backed"
+        assert not tail[:backed].any(), f"{name}: backing past its tile is not zeroed"
 
 
 def test_mha_v4_sol_rejects_recipes_without_a_manifest_row():
