@@ -1,8 +1,8 @@
-# gfx1250-strict (MI450 A0) configs: NOT TUNED
+# gfx1250-strict configs: NOT TUNED
 
-gfx1250-strict reads only this tree. Nothing here is tuned for A0. The tables
-let the kernels run on A0; they say nothing about A0 performance. Replace a
-family's tables with measured A0 values when it is tuned.
+gfx1250-strict reads only this tree. Nothing here is tuned. The tables let the
+kernels run; they say nothing about performance. Replace a family's tables with
+measured values when it is tuned.
 
 Every family that gfx1250 has, has a table here, made from the gfx1250 table:
 

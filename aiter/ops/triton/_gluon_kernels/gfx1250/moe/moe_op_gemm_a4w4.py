@@ -101,8 +101,7 @@ def matmul_launch_metadata(grid, kernel, args):
 
 @functools.lru_cache(maxsize=None)  # noqa: UP033
 def _fp4_wmma_m():
-    # gfx1250-strict (MI450 A0) has no v_wmma_scale{,16}_f32_32x16x128_f4, so use the 16x16x128 scaled WMMA
-    # there (v_wmma_scale_f32_16x16x128_f8f6f4 with e2m1 operands). gfx1250 keeps the 32x16x128 instruction.
+    # gfx1250-strict has no v_wmma_scale_f32_32x16x128_f4, so use v_wmma_scale_f32_16x16x128_f8f6f4.
     return 16 if get_arch() == "gfx1250-strict" else 32
 
 

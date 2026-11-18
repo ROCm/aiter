@@ -350,10 +350,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             )
     cdna_version = get_cdna_version()
     warp_size = 32 if is_gfx1250 else 64
-    # get_gfx() follows GPU_ARCHS, so it names gfx1250 on a gfx1250-strict (MI450
-    # A0) device when GPU_ARCHS=gfx1250. Compile for the device that runs the
-    # kernel: gfx1250 code can use instructions gfx1250-strict lacks (e.g.
-    # v_wmma_f32_16x16x128_fp8_fp8), which then run on A0 and give wrong results.
+    # Compile for get_gfx_runtime() so gfx1250-strict never gets gfx1250-only instructions.
     target_arch = gfx_version
     try:
         runtime_arch = get_gfx_runtime()

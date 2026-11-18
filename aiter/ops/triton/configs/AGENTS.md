@@ -341,11 +341,11 @@ only.
 Never seed a Gluon folder. Never seed into gfx950. Replace seeds with
 measured values.
 
-gfx1250-strict (MI450 A0) is the one exception. It has its own tree and reads
+gfx1250-strict is the one exception. It has its own tree and reads
 no other arch's tables. Its tables come from gfx1250, Triton and Gluon, and
 keep only the generic entries that the loaders need; tables keyed by kernel
 variant are byte-identical copies. `configs/gfx1250-strict/README.md` lists
-the rules for each family. Replace these tables with measured A0 values.
+the rules for each family. Replace these tables with measured values.
 
 ## Not configs
 

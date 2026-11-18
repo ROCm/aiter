@@ -357,9 +357,7 @@ def _mxfp8_quant_tile(
 
 @gluon.constexpr_function
 def _mxfp8_scale_smem_layout(BLOCK_SIZE_M, NUM_QUANT_BLOCKS):
-    # The scales are 1 byte each and are loaded with TDM. TDM padding needs a dword-aligned interval of 2 to
-    # 256 dwords (enforced since triton-lang/triton#12534), so a row of fewer than 8 scales (BLOCK_SIZE_N < 256)
-    # can't be padded. Use plain row-major LDS there; the padding only avoided bank conflicts.
+    # Pad only when NUM_QUANT_BLOCKS is 8 to 1024 and a multiple of 4; otherwise use a plain layout.
     if NUM_QUANT_BLOCKS % 4 == 0 and 8 <= NUM_QUANT_BLOCKS <= 1024:
         return gl.PaddedSharedLayout.with_identity_for(
             [[NUM_QUANT_BLOCKS, 8]], [BLOCK_SIZE_M, NUM_QUANT_BLOCKS], [1, 0]

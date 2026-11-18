@@ -226,16 +226,7 @@ def mha_set_swizzle(value: Literal["default", "spatial"]):
 def _effective_swizzle(
     num_q_heads: int, num_k_heads: int, num_xcds: int, num_blocks: int, batch: int
 ) -> str:
-    """The swizzle to launch with: "spatial" only where remap_workgroup_spatial
-    maps every (head, block) exactly once.
-
-    The spatial remap assumes the work splits evenly across XCDs: MHA needs
-    num_q_heads % num_xcds == 0; GQA needs num_k_heads % num_xcds == 0, or
-    num_xcds % num_k_heads == 0 with the per-KV-head work (queries per KV head
-    x blocks x batch) divisible by the XCDs sharing that head. Other shapes
-    (e.g. 8 KV heads on a 6-XCD part) would compute some tiles twice and skip
-    others, so they use the default mapping.
-    """
+    """Use "spatial" only if the work splits evenly across XCDs, else "default"."""
     if _MHA_SWIZZLE != "spatial":
         return _MHA_SWIZZLE
     if num_q_heads == num_k_heads:

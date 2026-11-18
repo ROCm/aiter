@@ -1562,12 +1562,7 @@ def build_module(
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
-        # GPU_ARCHS may name only the base family of the running GPU (gfx1250
-        # on an MI450 A0, which reports gfx1250-strict). _needs_arch_rebuild()
-        # rebuilds for the running arch, so the build must target it too, or the
-        # rebuilt .so still lacks its code and fails to load. Only that variant
-        # case is touched: any other GPU_ARCHS (including deliberate cross-builds
-        # for a different arch) is used exactly as given.
+        # If GPU_ARCHS has gfx1250 but the GPU is gfx1250-strict, also build for gfx1250-strict.
         if "native" not in archs:
             try:
                 runtime_arch = get_gfx_runtime()
