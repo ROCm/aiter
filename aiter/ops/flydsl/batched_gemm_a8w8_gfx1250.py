@@ -38,6 +38,9 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_lds_capacity_byte
 
 from .mxfp8_bpreshuffle_gemm_gfx1250 import (
     BASE_NAME_SUFFIX_RE,
+    PIPELINED_BY_SUFFIX,
+    PIPELINED_DEFAULT,
+    default_pipelined_k_loop,
     is_compute_wmma_kernel_name,
     run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
 )
@@ -57,9 +60,11 @@ _BMM_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(BMM_WMMA_NAME_PREFIX)}_{_SUFFIX_RE}(?P<preload>_pre)?$"
 )
 # mxfp8_32 has no whole-K scale preload: its scale panels are 4x (A) and 32x
-# (n32k4 B) the mxfp8_128 ones.
+# (n32k4 B) the mxfp8_128 ones. A trailing ``_pl`` / ``_nopl`` selects the
+# software-pipelined / single-fence K loop (see check_pipelined_k_loop);
+# without either, default_pipelined_k_loop picks it.
 _BMM_MX32_KERNEL_NAME_RE = re.compile(
-    rf"^{re.escape(BMM_MX32_WMMA_NAME_PREFIX)}_{_SUFFIX_RE}$"
+    rf"^{re.escape(BMM_MX32_WMMA_NAME_PREFIX)}_{_SUFFIX_RE}(?P<pipelined>_pl|_nopl)?$"
 )
 
 _launch_gemm_a8w8 = None
@@ -103,8 +108,25 @@ def _parse_bmm_mx32_kernel_name_cached(name: str) -> dict[str, int] | None:
     match = _BMM_MX32_KERNEL_NAME_RE.fullmatch(name)
     if match is None:
         return None
-    cfg = {key: int(value) for key, value in match.groupdict().items()}
+    groups = match.groupdict()
+    pipelined = PIPELINED_BY_SUFFIX[groups.pop("pipelined")]
+    cfg = {key: int(value) for key, value in groups.items()}
     cfg["preload"] = 0
+    if pipelined == PIPELINED_DEFAULT:
+        # The batched path has no M-dependent config fix-up, so the K loop is
+        # final here.
+        pipelined = default_pipelined_k_loop(
+            mx32=True,
+            preload=False,
+            use_cluster=cfg["cluster_m"] > 1 or cfg["cluster_n"] > 1,
+            split_k=cfg["split_k"],
+            tile_m=cfg["tile_m"],
+            tile_n=cfg["tile_n"],
+            tile_k=cfg["tile_k"],
+            m_warp=cfg["m_warp"],
+            n_warp=cfg["n_warp"],
+        )
+    cfg["pipelined"] = pipelined
     return cfg
 
 
@@ -374,8 +396,10 @@ def _check_bmm_operands(
     """Shared operand checks of the batched runners; returns (m, b, n, k, out).
 
     ``fused_fp8_out``: the GEMM quantizes its C tile to e4m3 in the epilogue, so
-    ``Out`` is a 1-byte fp8 buffer. The C staging is still bf16 (what the quant
-    reads), so the returned out name stays ``bf16``.
+    ``Out`` is a 1-byte fp8 buffer. The returned out name stays ``bf16``: the
+    quant reads values rounded to bf16, either from a bf16 C tile staged in LDS
+    or, on the accumulator branch, from the accumulators rounded to bf16 in
+    registers (no bf16 staging there).
     """
     if get_gfx() not in ("gfx1250", "gfx1250-strict"):
         raise RuntimeError(
@@ -406,7 +430,7 @@ def _check_bmm_operands(
                 "[FlyDSL gfx1250 bmm] fused fp8 Out must be 1-byte e4m3 storage, "
                 f"got {Out.dtype}"
             )
-        out_dtype = "bf16"  # C staging dtype; the epilogue quantizes it to e4m3
+        out_dtype = "bf16"  # dtype the epilogue rounds C to before the e4m3 quant
     else:
         out_dtype = _OUT_DTYPE_NAME.get(Out.dtype)
         if out_dtype is None:
@@ -544,6 +568,7 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         bool(w_scale_32x32),
         k_tail,
         fused,  # fuse_quant_out
+        cfg["pipelined"],
     )
     # Cached CompiledFunction per constexpr set; see _run_compiled.
     _run_compiled(
@@ -581,6 +606,7 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         k_tail,
         _ptr_arg(y_scale_out) if fused else _ptr_arg(Out),  # arg_scale_out
         fused,  # fuse_quant_out
+        cfg["pipelined"],
         specialization_key=bmm_spec,
     )
     return Out

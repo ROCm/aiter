@@ -147,6 +147,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     scale_block: int = BLOCK_K,
     w_scale_32x32: bool = False,
     batch: int = 1,
+    pipelined: int = 0,
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 / mxfp8_32 bpreshuffle GEMM.
 
@@ -439,6 +440,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             a_preshuffle,
             a_scale_preshuffled,
             w_scale_32x32,
+            pipelined,
         )
         _run_compiled(
             _launch_gemm_a8w8,
@@ -453,6 +455,8 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             w_scale_32x32,  # b_scale_32x32
             False,  # k_tail
             _ptr_arg(Out),  # arg_scale_out
+            False,  # fuse_quant_out
+            pipelined,
             specialization_key=specialization,
         )
     if partials is not None and not fused:
@@ -488,12 +492,53 @@ _KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}"
 _COMPUTE_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(COMPUTE_WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}"
 )
+# K loop of the generic mxfp8_32 kernel (see check_pipelined_k_loop): a
+# trailing ``_pl`` selects the software-pipelined loop, ``_nopl`` the
+# single-fence loop, and no suffix leaves the choice to
+# default_pipelined_k_loop. Compute-bound names take neither suffix.
 _MX32_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(MX32_WMMA_NAME_PREFIX)}_{MX32_NAME_SUFFIX_RE}"
+    r"(?P<pipelined>_pl|_nopl)?"
 )
 _MX32_COMPUTE_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(MX32_COMPUTE_WMMA_NAME_PREFIX)}_{MX32_NAME_SUFFIX_RE}"
 )
+# ``pipelined`` of a parsed name: 1 / 0 as the suffix asks, PIPELINED_DEFAULT
+# when an mxfp8_32 generic name has no suffix (resolved by
+# default_pipelined_k_loop once the launch config is final), 0 for names that
+# have no such choice (mxfp8_128, compute-bound).
+PIPELINED_DEFAULT = -1
+PIPELINED_BY_SUFFIX = {"_pl": 1, "_nopl": 0, None: PIPELINED_DEFAULT}
+
+
+def default_pipelined_k_loop(
+    *,
+    mx32: bool,
+    preload: bool,
+    use_cluster: bool,
+    split_k: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    m_warp: int,
+    n_warp: int,
+) -> int:
+    """K loop of an mxfp8_32 config whose kernelName does not choose one.
+
+    1 (software-pipelined) when the loop applies (mxfp8_32, no scale preload,
+    no cluster, split_k 1) with at least two 128-deep k-steps per K-tile
+    (tile_k >= 256), and the accumulators plus the two fragment sets it keeps
+    in flight fit 512 VGPRs per lane; else 0 (single-fence loop). A tuned row
+    overrides this with ``_pl`` / ``_nopl``.
+    """
+    if not (mx32 and not preload and not use_cluster and split_k == 1):
+        return 0
+    if tile_k < 256:
+        return 0
+    wmma_m_rep = tile_m // m_warp // 16
+    wmma_n_rep = tile_n // n_warp // 16
+    n_acc = wmma_m_rep * wmma_n_rep
+    return int(n_acc * 8 + 2 * (wmma_m_rep + wmma_n_rep) * 16 <= 512)
 
 
 def _parse_name(match):
@@ -504,11 +549,14 @@ def _parse_name(match):
     a_scale_preshuffled = groups.pop("a_scale_preshuffled", None) is not None
     fused_splitk = groups.pop("fused_splitk", None) is not None
     persistent_n_tiles = groups.pop("persistent_n_tiles", None)
+    # Names whose regex has no ``pipelined`` group have no K-loop choice.
+    pipelined = PIPELINED_BY_SUFFIX[groups.pop("pipelined", "_nopl")]
     cfg = {key: int(value) for key, value in groups.items()}
     cfg["a_preshuffle"] = a_preshuffle
     cfg["a_scale_preshuffled"] = a_scale_preshuffled
     cfg["fused_splitk"] = fused_splitk
     cfg["persistent_n_tiles"] = int(persistent_n_tiles) if persistent_n_tiles else 1
+    cfg["pipelined"] = pipelined
     return cfg
 
 
@@ -565,7 +613,8 @@ def is_compute_wmma_kernel_name(name: str) -> bool:
 def _resolved_wmma_config(
     kernel_name: str, true_m: int, allow_cluster_m_fallback: bool, mx32: bool
 ) -> tuple[tuple[str, int | bool], ...]:
-    """Parsed kernelName with its cluster_m fitted to M, cached off the hot path."""
+    """Parsed kernelName with its cluster_m fitted to M and its K loop picked,
+    cached off the hot path."""
     parse = parse_mxfp8_32_wmma_kernel_name if mx32 else parse_wmma_kernel_name
     cfg = parse(kernel_name)
     tag = "mxfp8_32" if mx32 else "mxfp8_128"
@@ -577,6 +626,18 @@ def _resolved_wmma_config(
         cfg["cluster_m"] = (
             resolve_cluster_m(true_m, cfg["tile_m"], cfg["cluster_m"])
             or cfg["cluster_m"]
+        )
+    if cfg["pipelined"] == PIPELINED_DEFAULT:
+        cfg["pipelined"] = default_pipelined_k_loop(
+            mx32=mx32,
+            preload=False,
+            use_cluster=cfg["cluster_m"] > 1 or cfg["cluster_n"] > 1,
+            split_k=cfg["split_k"],
+            tile_m=cfg["tile_m"],
+            tile_n=cfg["tile_n"],
+            tile_k=cfg["tile_k"],
+            m_warp=cfg["m_warp"],
+            n_warp=cfg["n_warp"],
         )
     return tuple(cfg.items())
 
@@ -678,4 +739,5 @@ def run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
         a_scale_preshuffled=a_scale_preshuffled,
         w_scale_32x32=w_scale_32x32,
         batch=batch,
+        pipelined=cfg["pipelined"],
     )
