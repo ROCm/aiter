@@ -28,10 +28,6 @@ def _get_config() -> dict:
     return dict(load_config_json(f"{config_dir}/DEFAULT.json")["any"])
 
 
-def _pow2(n):
-    return 1 << max(0, int(n) - 1).bit_length()
-
-
 def _plan_layout(c):
     """Buffer layout and router plan of a comm-like object c (world, blocks, num_warps, config,
     max_tokens, hidden, num_experts, topk, router_fp32). Router tasks are 16 experts x K part:
@@ -204,7 +200,7 @@ class AllReduceRmsnormMoeRoute:
         capture. Launches are collective, so all ranks must use the same list."""
         seen, out = set(), []
         for t in range(1, self.max_tokens + 1):
-            key = (_pow2(t), self.one_shot(t))
+            key = (triton.next_power_of_2(t), self.one_shot(t))
             if key not in seen:
                 seen.add(key)
                 out.append(t)
@@ -233,7 +229,7 @@ def _constexprs(
 ):
     """The compile-time arguments of a call. The row count itself is a runtime argument; the
     loops and LDS sizes come from its power-of-2 bucket."""
-    rows_b = _pow2(tokens)
+    rows_b = triton.next_power_of_2(tokens)
     routed_b = rows_b if one_shot else triton.cdiv(rows_b, comm.world)
     v = triton.cdiv(comm.hidden // 8, 64 * comm.num_warps)
     units = (comm.world - 1) * routed_b * v
@@ -241,9 +237,9 @@ def _constexprs(
     # them all at up to 8 each, else every CTA after the reduce CTAs
     free = comm.blocks - comm.nrc - routed_b
     if free > 0 and triton.cdiv(units, free) <= 8:
-        pmax = _pow2(triton.cdiv(units, free))
+        pmax = triton.next_power_of_2(triton.cdiv(units, free))
     else:
-        pmax = _pow2(triton.cdiv(units, comm.blocks - routed_b))
+        pmax = triton.next_power_of_2(triton.cdiv(units, comm.blocks - routed_b))
     return {
         "HIDDEN": comm.hidden,
         "WORLD": comm.world,
@@ -262,7 +258,7 @@ def _constexprs(
         "ZERO": zero_moe_buf,
         "BLOCKS": comm.blocks,
         "PROTO": 0 if one_shot else 1,
-        "RTMAX": _pow2(triton.cdiv(routed_b, 16)),
+        "RTMAX": triton.next_power_of_2(triton.cdiv(routed_b, 16)),
         "SORT_ROWS": max(32, rows_b),
         "PMAX": pmax,
         "KP": comm.kp,
