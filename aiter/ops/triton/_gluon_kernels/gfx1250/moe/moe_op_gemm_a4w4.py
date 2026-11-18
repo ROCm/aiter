@@ -99,12 +99,12 @@ def matmul_launch_metadata(grid, kernel, args):
     return ret
 
 
-@functools.lru_cache(maxsize=None)  # noqa: UP033
 def _fp4_wmma_m():
     # gfx1250-strict has no v_wmma_scale_f32_32x16x128_f4, so use v_wmma_scale_f32_16x16x128_f8f6f4.
     return 16 if get_arch() == "gfx1250-strict" else 32
 
 
+@functools.lru_cache(maxsize=None)  # noqa: UP033
 def get_moe_a4w4_layouts_prefill(
     BLOCK_M,
     BLOCK_N,
