@@ -3,6 +3,8 @@
 
 """Route unified attention between FlyDSL and Triton/Gluon backends."""
 
+import os
+
 
 def unified_attention(
     q,
@@ -46,7 +48,8 @@ def unified_attention(
     ``skip_reduce`` are backend-dependent. ``shuffled_kv_cache=None`` infers
     the layout; False with rank-5 K raises ValueError.
 
-    ``backend=None`` tries FlyDSL then Triton/Gluon; explicit ``"flydsl"``
+    ``backend=None`` tries FlyDSL then Triton/Gluon (causal decode, max_seqlen_q == 1,
+    goes straight to Triton/Gluon unless AITER_UNIFIED_ATTN_PA_DECODE=1); explicit ``"flydsl"``
     raises RuntimeError when declined. ``"triton"``/``"gluon"`` bypass FlyDSL.
     The Triton/Gluon fallback supports causal attention only. Returns ``out``
     written in place; with ``skip_reduce`` the fallback may instead return
@@ -79,8 +82,21 @@ def unified_attention(
     else:
         shuffled_kv_cache = bool(shuffled_kv_cache)
 
+    # Auto decode goes to the Triton/Gluon kernel: paired A/B showed FlyDSL pa_decode
+    # slower on 33/35 uniform cells (up to 1.98x), and no sync-free host quantity
+    # separates the skew batches where it wins (max_seqlen_k, num_seqs and table
+    # width are identical to the uniform cells). Non-causal decode has no fallback,
+    # so it stays on FlyDSL. backend="flydsl" or AITER_UNIFIED_ATTN_PA_DECODE=1
+    # keeps FlyDSL pa_decode reachable.
+    auto_decode_to_triton = (
+        backend is None
+        and max_seqlen_q == 1
+        and causal
+        and os.environ.get("AITER_UNIFIED_ATTN_PA_DECODE") != "1"
+    )
+
     unified_attention_flydsl = None
-    if backend in (None, "flydsl"):
+    if backend == "flydsl" or (backend is None and not auto_decode_to_triton):
         # FlyDSL is absent in AITER_TRITON_ONLY and Windows installs, where this
         # op ran Triton; only an explicit backend="flydsl" may fail on it.
         try:
