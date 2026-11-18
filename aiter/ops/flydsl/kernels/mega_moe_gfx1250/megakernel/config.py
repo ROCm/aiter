@@ -36,6 +36,16 @@ SLOTS_TILE = dict(  # noqa: C408 - the builder's keyword names
     tile_k2=128,
     num_buffers2=3,
 )
+#: The 16-row tile's pipelines: GEMM1 with 4 stages, GEMM2 with 2 stages of
+#: K 256. With few rows an item is bound by the bytes a CTA keeps in flight,
+#: not by HBM; tpr 1-64 DEP4 us/layer: DSR1 -1.3 to -2.7, DSV4-Pro -0.2 to
+#: -2.2, DSV4.1-Flash -0.2 to -1.6. The 64-row tile's 4 stages do not fit 2
+#: CTAs per CU, and the 32-row tile was not measured, so both keep the above.
+SLOTS_TILE_M16 = dict(  # noqa: C408 - the builder's keyword names
+    num_buffers=4,
+    tile_k2=256,
+    num_buffers2=2,
+)
 #: Past this many tokens per rank the 32-row tile wins (tpr 128: 303 vs
 #: 312 us/layer; tpr 64: 306 vs 301).
 SLOTS_TILE_M32_TOKENS = 64
@@ -71,6 +81,8 @@ def slots_tile(max_tokens_per_rank: int) -> dict:
         tile["tile_m"] = 64
     elif int(max_tokens_per_rank) > SLOTS_TILE_M32_TOKENS:
         tile["tile_m"] = 32
+    else:
+        tile.update(SLOTS_TILE_M16)
     return tile
 
 
