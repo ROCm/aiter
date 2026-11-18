@@ -182,8 +182,8 @@ def _fused_dual_rmsnorm_mxfp8_quant_ps_kernel(
             ROWS_PER_ITER,
         )
     # Only the remaining rows take the single-row reduction path.
-    tail = full_rows + gl.program_id(0)
-    if tail < M:
+    if gl.program_id(0) < M % ROWS_PER_ITER:
+        tail = full_rows + gl.program_id(0)
         _fused_dual_rmsnorm_mxfp8_quant_tile(
             q_ptr,
             k_ptr,
