@@ -2109,6 +2109,276 @@ def test_fmha_fwd_bf16_opus_d128_paged_needs_group_mode():
         )
 
 
+# Paged sliding window and attention sink (D=128). A window narrower than the longest
+# group runs the SWA kernel; a wider one folds to the causal kernel.
+#   (q seqlens, kv seqlens, nheads, nheads_k, window_size_left)
+_OPUS_D128_PAGED_SWA_CASES = [
+    ([300, 77], [900, 200], 8, 2, 128),  # cross-attention, GQA, partial last pages
+    ([256, 256], [0, 256], 8, 2, 64),  # no keys in the first group
+    ([1024, 8], [1, 8], 2, 1, 16),  # rows that see no keys (more queries than keys)
+    ([513, 1025], [513, 1025], 4, 4, 257),  # odd window, bounds inside a page
+    ([1] * 64, [4096] * 64, 16, 4, 1000),  # decode rows
+    ([824], [66999], 32, 8, 32767),  # long cached prefix, few Q blocks: the split case
+    ([824, 37, 300], [66999, 5000, 300], 32, 8, 4095),  # long, short, self-attention
+    ([8192], [24576], 8, 2, 16383),  # an 8192-row chunk over a long prefix
+    ([2048] * 4, [2048] * 4, 8, 2, 4096),  # window >= max_seqlen_k: folds to causal
+]
+_OPUS_PAGED_SPLITS = (1, 0, 3, 16)
+
+
+def _run_opus_paged_swa_case(
+    seqlens_q, seqlens_kv, nheads, nheads_k, window_size_left, sink
+):
+    """OPUS D=128 paged causal forward with a window and/or sink, at each split count.
+
+    num_splits == 1 must match the contiguous kernel exactly. Every split count is
+    checked against attention_ref and an fp32 LSE: logaddexp(window LSE, sink) with a
+    sink, so rows with no keys get lse = sink and O = 0.
+    """
+    torch.manual_seed(0)
+    d = 128
+    cu_q, cu_k = _opus_cumsum(seqlens_q), _opus_cumsum(seqlens_kv)
+    total_q = sum(seqlens_q)
+    q = torch.randn(total_q, nheads, d, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(sum(seqlens_kv), nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(sum(seqlens_kv), nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    k_cache, v_cache, block_table = _opus_paged_pool(k, v, seqlens_kv)
+    max_q, max_k = max(seqlens_q), max(max(seqlens_kv), 1)
+
+    with torch.no_grad():
+        out_c = torch.empty_like(q)
+        lse_c = torch.empty(nheads, total_q, device="cuda", dtype=torch.float32)
+        mha_ops._fmha_fwd_bf16_opus_fwd(
+            q,
+            k,
+            v,
+            out_c,
+            True,
+            d**-0.5,
+            lse_c,
+            cu_q,
+            cu_k,
+            cu_q,
+            cu_k,
+            max_q,
+            max_k,
+            window_size_left,
+            None,
+            1,
+            sink,
+        )
+        runs = {
+            s: fmha_fwd_bf16_opus_paged_fwd(
+                q,
+                k_cache,
+                v_cache,
+                d**-0.5,
+                True,
+                cu_q,
+                cu_k,
+                block_table,
+                max_q,
+                max_k,
+                return_lse=True,
+                num_splits=s,
+                window_size_left=window_size_left,
+                sink=sink,
+            )
+            for s in _OPUS_PAGED_SPLITS
+        }
+
+    assert torch.equal(runs[1][0], out_c), "paged differs from contiguous"
+    assert torch.equal(runs[1][1], lse_c), "paged lse differs from contiguous"
+    for s, (out, lse) in runs.items():
+        assert not torch.isnan(out).any(), f"S={s}: NaN in out"
+        assert not torch.isnan(lse).any(), f"S={s}: NaN in lse"
+
+    window_size = (window_size_left, 0)
+    for g in range(len(seqlens_q)):
+        ql, qh = int(cu_q[g]), int(cu_q[g + 1])
+        kl, kh = int(cu_k[g]), int(cu_k[g + 1])
+        if ql == qh:
+            continue
+        tag = f"opus-paged-win{window_size_left} g{g}"
+        if kl == kh:
+            lse_ref = torch.full((nheads, qh - ql), float("-inf"), device="cuda")
+            if sink is not None:
+                lse_ref = torch.logaddexp(lse_ref, sink[:, None])
+            for s, (out, lse) in runs.items():
+                assert torch.equal(
+                    out[ql:qh], torch.zeros_like(out[ql:qh])
+                ), f"S={s} group {g}: no keys, out must be 0"
+                opus_check_lse(f"{tag} S={s}", lse[:, ql:qh], lse_ref)
+            continue
+        qg, kg, vg = q[ql:qh].unsqueeze(0), k[kl:kh].unsqueeze(0), v[kl:kh].unsqueeze(0)
+        out_ref, _, _ = attention_ref(
+            qg, kg, vg, causal=True, window_size=window_size, sink=sink
+        )
+        out_pt, _, _ = attention_ref(
+            qg,
+            kg,
+            vg,
+            causal=True,
+            window_size=window_size,
+            upcast=False,
+            reorder_ops=True,
+            sink=sink,
+        )
+        tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
+        lse_ref = opus_ref_lse(qg, kg, True, window_size_left=window_size_left)[0]
+        if sink is not None:
+            lse_ref = torch.logaddexp(lse_ref, sink[:, None])
+        for s, (out, lse) in runs.items():
+            diff = (out[ql:qh].unsqueeze(0) - out_ref).abs().max().item()
+            assert diff <= tol, f"S={s} group {g}: diff {diff} > tol {tol}"
+            opus_check_lse(f"{tag} S={s}", lse[:, ql:qh], lse_ref)
+
+
+@pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize(
+    "seqlens_q,seqlens_kv,nheads,nheads_k,window_size_left",
+    _OPUS_D128_PAGED_SWA_CASES,
+    ids=[
+        f"g{len(a)}_maxk{max(b)}_h{h}_hkv{hk}_win{w}"
+        for (a, b, h, hk, w) in _OPUS_D128_PAGED_SWA_CASES
+    ],
+)
+def test_fmha_fwd_bf16_opus_d128_paged_swa(
+    seqlens_q, seqlens_kv, nheads, nheads_k, window_size_left, with_sink, monkeypatch
+):
+    """OPUS D=128 over a paged KV pool with a sliding window, with and without a sink,
+    unsplit and split. The contiguous window tests never select PAGED or SPLIT."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    sink = torch.randn(nheads, generator=gen, device="cuda") * 2 if with_sink else None
+    _run_opus_paged_swa_case(
+        seqlens_q, seqlens_kv, nheads, nheads_k, window_size_left, sink
+    )
+
+
+@pytest.mark.parametrize("sink_kind", ["large", "dominant", "negligible", "minus_inf"])
+@pytest.mark.parametrize("window_size_left", [-1, 300])
+def test_fmha_fwd_bf16_opus_d128_paged_sink_range(
+    window_size_left, sink_kind, monkeypatch
+):
+    """Sinks far from the scores, on both D=128 kernels, unsplit and split.
+
+    8 to 12 nats compete with a whole row's mass. +200 nats dominate it, so the kernel
+    must rebase onto the sink instead of overflowing exp2. -200 nats change nothing, and
+    -inf is no sink at all, also for rows and groups with no keys (lse = -inf, O = 0).
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    nheads = 8
+    gen = torch.Generator(device="cuda").manual_seed(2)
+    sink = {
+        "large": lambda: torch.rand(nheads, generator=gen, device="cuda") * 4 + 8,
+        "dominant": lambda: torch.full((nheads,), 200.0, device="cuda"),
+        "negligible": lambda: torch.full((nheads,), -200.0, device="cuda"),
+        "minus_inf": lambda: torch.full((nheads,), float("-inf"), device="cuda"),
+    }[sink_kind]()
+    # The last two groups have rows with no keys and no keys at all.
+    _run_opus_paged_swa_case(
+        [300, 77, 1024, 300, 64],
+        [900, 200, 5000, 128, 0],
+        nheads,
+        2,
+        window_size_left,
+        sink,
+    )
+
+
+@pytest.mark.parametrize(
+    "causal,window_size_left", [(False, -1), (True, -1), (True, 100)]
+)
+def test_fmha_fwd_bf16_opus_d128_batch_sink(causal, window_size_left, monkeypatch):
+    """A sink on the dense batch layout, which uses batch strides in the same store."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    torch.manual_seed(0)
+    b, sq, sk, h, hk, d = 2, 300, 500, 8, 2, 128
+    q = torch.randn(b, sq, h, d, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(b, sk, hk, d, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(b, sk, hk, d, device="cuda", dtype=dtypes.bf16)
+    sink = torch.randn(h, device="cuda") * 2
+    out = torch.empty_like(q)
+    lse = torch.empty(b, h, sq, device="cuda", dtype=torch.float32)
+    with torch.no_grad():
+        mha_ops._fmha_fwd_bf16_opus_fwd(
+            q,
+            k,
+            v,
+            out,
+            causal,
+            d**-0.5,
+            lse=lse,
+            window_size_left=window_size_left,
+            sink=sink,
+        )
+    window_size = (window_size_left, 0) if window_size_left >= 0 else (-1, -1)
+    out_ref, _, _ = attention_ref(
+        q, k, v, causal=causal, window_size=window_size, sink=sink
+    )
+    out_pt, _, _ = attention_ref(
+        q,
+        k,
+        v,
+        causal=causal,
+        window_size=window_size,
+        upcast=False,
+        reorder_ops=True,
+        sink=sink,
+    )
+    tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
+    diff = (out - out_ref).abs().max().item()
+    assert diff <= tol, f"diff {diff} > tol {tol}"
+    lse_ref = opus_ref_lse(q, k, causal, window_size_left=window_size_left)
+    opus_check_lse(
+        "opus-batch-sink", lse, torch.logaddexp(lse_ref, sink[None, :, None])
+    )
+
+
+def test_fmha_fwd_bf16_opus_sink_rejects_bad_input():
+    """sink must be contiguous fp32 [H]; the D_QK=192 kernel takes none."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus kernels require gfx950")
+    cu = torch.tensor([0, 64], device="cuda", dtype=torch.int32)
+
+    def call(q, k, v, sink):
+        mha_ops._fmha_fwd_bf16_opus_fwd(
+            q,
+            k,
+            v,
+            torch.empty(64, 4, 128, device="cuda", dtype=dtypes.bf16),
+            True,
+            q.size(-1) ** -0.5,
+            None,
+            cu,
+            cu,
+            cu,
+            cu,
+            64,
+            64,
+            sink=sink,
+        )
+
+    q = torch.randn(64, 4, 128, device="cuda", dtype=dtypes.bf16)
+    for bad in (
+        torch.zeros(4, device="cuda", dtype=dtypes.bf16),  # dtype
+        torch.zeros(5, device="cuda"),  # one per query head
+        torch.zeros(8, device="cuda")[::2],  # not contiguous
+    ):
+        with pytest.raises(RuntimeError, match="sink must be"):
+            call(q, q, q, bad)
+    q192 = torch.randn(64, 4, 192, device="cuda", dtype=dtypes.bf16)
+    with pytest.raises(RuntimeError, match="does not support attention sinks"):
+        call(q192, q192, q, torch.zeros(4, device="cuda"))
+
+
 # ---------------------------------------------------------------------------
 # OPUS varlen dispatch. Everything above calls fmha_fwd_bf16_opus_varlen_fwd
 # directly, which proves the kernel computes the right thing but never executes

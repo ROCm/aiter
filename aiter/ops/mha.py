@@ -431,8 +431,8 @@ def gen_fmha_fwd_bf16_opus_fwd_fake(
 # OPUS gfx950 bf16 forward (shared entry point): low-level @compile_ops stub bound to
 # the pybind symbol via fc_name. Dispatches by head dim in C++ to the symmetric
 # D_QK = D_V in {64, 128} kernel or the asymmetric D_QK=192/D_V=128 kernel; all take
-# batch and group/varlen inputs, and only D=128 implements `window_size_left`. `sink`
-# is symmetric-only and excludes a window.
+# batch and group/varlen inputs, and only D=128 implements `window_size_left` and paged /
+# split KV. `sink` is symmetric-only.
 # Writes `out` (and `lse`, when given) in place, returns None.
 @compile_ops(
     "module_fmha_fwd_bf16_opus",
@@ -489,7 +489,7 @@ def fmha_fwd_bf16_opus_fwd(
 
     `sink` is an optional attention sink: one fp32 logit per query head ([H_q]),
     acting as a valueless extra key in the softmax denominator. It attenuates O
-    and raises lse; symmetric kernels only, and not together with a window.
+    and raises lse; symmetric kernels only.
 
     Varlen / packed inputs go through `fmha_fwd_bf16_opus_varlen_fwd` instead.
     """
@@ -537,16 +537,25 @@ def fmha_fwd_bf16_opus_paged_fwd(
     return_lse: bool = False,
     lse: Tensor | None = None,
     num_splits: int = 0,
+    window_size_left: int = -1,
+    sink: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """OPUS gfx950 bf16 D=128 group/varlen forward over a paged KV cache. q is packed
     [total_q, H, 128]; k_cache / v_cache are [num_blocks, 128, H_KV, 128] views of a page
     pool (any strides with a contiguous head dim, e.g. vLLM's K and V halves of one
     cache); block_table [num_groups, max_pages] int32 maps each group's pages, and
     seqstart_k gives the per-group KV lengths as cumulative sums (pool offsets are not
-    used). No sliding window.
+    used).
 
-    `num_splits` cuts each Q block's KV range into page-aligned shares that run as
-    separate workgroups, with fp32 partials merged by a combine kernel: 1 is off, 0 picks
+    `window_size_left` >= 0 adds a left bound to the causal mask: the query at KV
+    position j keeps keys [j - window_size_left, j].
+
+    `sink` is an optional attention sink, one fp32 logit per query head ([H], natural
+    log). It joins the softmax denominator as a key with no value, so rows with no keys
+    get lse = sink and O = 0. A -inf logit means no sink for that head.
+
+    `num_splits` cuts each Q block's KV range into shares that run as separate
+    workgroups, with fp32 partials merged by a combine kernel: 1 is off, 0 picks
     a count that fills idle CUs (long context, few Q blocks), up to 16.
 
     `lse` / `return_lse` behave as in `fmha_fwd_bf16_opus_varlen_fwd`.
@@ -572,7 +581,8 @@ def fmha_fwd_bf16_opus_paged_fwd(
         seqstart_k,
         int(max_seqlen_q),
         int(max_seqlen_k),
-        -1,
+        int(window_size_left),
+        sink=None if sink is None else sink.float().contiguous(),
         block_table=block_table,
         num_splits=int(num_splits),
     )
@@ -618,7 +628,7 @@ def fmha_fwd_bf16_opus_varlen_fwd(
                                        sequence; -1 is plain causal. Needs `causal`
                                        and is implemented by the D=128 kernel only.
     sink                             : optional fp32 [H_q] attention-sink logits, as
-                                       for the dense wrapper (symmetric, no window).
+                                       for the dense wrapper (symmetric only).
     """
     v_head_dim = v.size(-1)
     total_q, q_head_num = q.size(0), q.size(1)
@@ -2498,7 +2508,8 @@ def _flash_attn_forward(
 
     def _can_impl_fmha_fwd_hd128_bf16_opus():
         # Symmetric D_QK == D_V in {64, 128}: one kernel template, only the head dim
-        # differs. The sliding window exists at D=128 only, and not with a sink.
+        # differs. The sliding window exists at D=128 only; a window with a sink stays
+        # on CK here.
         if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
             return False
         if hdim_q != hdim_v or hdim_q not in (64, 128):
@@ -3581,7 +3592,7 @@ def _flash_attn_varlen_forward(
         # OPUS gfx950 group/varlen symmetric D=64/128 bf16 forward. Env-gated OFF by
         # default, the same opt-in as the dense path, so enabling varlen does not
         # silently change which backend an existing workload lands on. The sliding
-        # window exists at D=128 only, and not with a sink.
+        # window exists at D=128 only; a window with a sink stays on CK here.
         if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
             return False
         if hdim_q != hdim_v or hdim_q not in (64, 128):

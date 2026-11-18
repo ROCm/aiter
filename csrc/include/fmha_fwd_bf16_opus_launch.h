@@ -35,7 +35,7 @@ struct fmha_fwd_bf16_opus_args
     // nullptr => the kernel skips the log-sum-exp store entirely.
     void* lse_ptr = nullptr;
     // Optional attention sink: one fp32 logit per query head, [nhead]. nullptr => no sink.
-    // Symmetric D=64/128 kernels only, and not with a sliding window.
+    // Symmetric D=64/128 kernels only.
     const void* sink_ptr = nullptr;
 
     // Group / varlen, int32, length batch+1. A null seqstart_q_ptr selects batch mode.
@@ -97,9 +97,9 @@ struct fmha_fwd_bf16_opus_args
     long long stride_v_page    = 0;
 
     // Paged only. Split-KV: num_splits > 1 cuts each Q block's KV range into that many
-    // page-aligned shares (grid z). Their fp32 partials go to o_acc [num_splits, total_q, H,
-    // 128] and lse_acc [num_splits, H, total_q], contiguous and caller-allocated, and a
-    // combine kernel then writes o / lse. Needs total_q.
+    // shares (grid z; page-aligned without a window). Their fp32 partials go to o_acc
+    // [num_splits, total_q, H, 128] and lse_acc [num_splits, H, total_q], contiguous and
+    // caller-allocated, and a combine kernel then writes o / lse. Needs total_q.
     int num_splits    = 1;
     void* o_acc_ptr   = nullptr;
     void* lse_acc_ptr = nullptr;
@@ -126,14 +126,15 @@ constexpr int kMaxSplits = 16;
 
 // Split-KV merge: o[q, h] = sum_s exp(lse_s - lse) * o_acc[s, q, h], lse = log sum_s exp(lse_s).
 // One 32-lane group per (q, h), four head-dim elements per lane. The module builds with
-// -ffast-math, so a share with no keys (lse = -inf) is recognized by its bit pattern, never
-// by comparing against infinity, and is skipped. Rows outside
+// -ffast-math, so a share with no keys (lse = -inf) or a -inf sink is recognized by its bit
+// pattern, never by comparing against infinity, and is skipped. Rows outside
 // [seqstart_q[0], seqstart_q[batch]) belong to no group; their partials were never written.
 __global__ void __launch_bounds__(256)
     opus_splitkv_combine_kernel(const float* __restrict__ o_acc,
                                 const float* __restrict__ lse_acc,
                                 unsigned short* __restrict__ o,
                                 float* __restrict__ lse,
+                                const float* __restrict__ sink,
                                 const int* __restrict__ seqstart_q,
                                 int batch,
                                 int num_splits,
@@ -168,6 +169,17 @@ __global__ void __launch_bounds__(256)
             any = true;
         }
     }
+    // A sink is one more term with no value, added once per row; none or -inf adds nothing.
+    // The empty asm keeps -ffast-math from folding the -inf test into the fmaxf below.
+    unsigned sink_bits = sink != nullptr ? __float_as_uint(sink[h]) : NEG_INF;
+    asm volatile("" : "+v"(sink_bits));
+    const bool has_sink = sink_bits != NEG_INF;
+    const float sink_h  = __uint_as_float(sink_bits);
+    if(has_sink)
+    {
+        m   = any ? fmaxf(m, sink_h) : sink_h;
+        any = true;
+    }
     float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
     float sum  = 0.f;
 #pragma unroll
@@ -186,6 +198,8 @@ __global__ void __launch_bounds__(256)
         acc.w += w * x.w;
         sum += w;
     }
+    if(has_sink)
+        sum += __expf(sink_h - m);
     if(any)
     {
         const float inv = 1.f / sum;
@@ -209,13 +223,20 @@ __global__ void __launch_bounds__(256)
 // the grid runs in ceil(workgroups / CUs) waves and a ragged last wave costs a full one.
 // Pick the count with the shortest critical path, waves(S) / S, taking more splits only for
 // a 3% gain (each adds combine traffic), with shares of at least 4096 keys.
-inline int
-d128_auto_splits(int nhead, int total_q, int batch, int max_seqlen_q, int max_seqlen_k, int num_cus)
+inline int d128_auto_splits(int nhead,
+                            int total_q,
+                            int batch,
+                            int max_seqlen_q,
+                            int max_seqlen_k,
+                            int window_size_left,
+                            int num_cus)
 {
     // Workgroups that hold rows: at most the flat grid's extent, at most batch full-length
-    // groups; exact for one group or equal lengths.
+    // groups; exact for one group or equal lengths. A window bounds each one's keys.
     const int wgs   = nhead * std::min(total_q / 256 + batch, batch * ceil_div(max_seqlen_q, 256));
-    const int max_s = std::min(kMaxSplits, std::max(1, max_seqlen_k / 4096));
+    const int keys =
+        window_size_left >= 0 ? std::min(max_seqlen_k, window_size_left + 1) : max_seqlen_k;
+    const int max_s = std::min(kMaxSplits, std::max(1, keys / 4096));
     if(wgs <= 0 || num_cus <= 0)
         return 1;
     int best      = 1;
@@ -294,8 +315,8 @@ inline bool fill_d128_kargs(opus_gqa_kargs& kargs, const fmha_fwd_bf16_opus_args
     kargs.stride_bt_b     = a.stride_bt_b;
     kargs.stride_k_page   = a.stride_k_page;
     kargs.stride_v_page   = a.stride_v_page;
-    // Paged KV is group mode without a window.
-    if(a.block_table_ptr != nullptr && (!is_group || is_local))
+    // Paged KV is group mode.
+    if(a.block_table_ptr != nullptr && !is_group)
         return false;
 
     kargs.num_splits          = a.num_splits > 1 ? a.num_splits : 1;
@@ -381,6 +402,7 @@ inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
                 static_cast<const float*>(a.lse_acc_ptr),
                 static_cast<unsigned short*>(a.o_ptr),
                 static_cast<float*>(a.lse_ptr),
+                static_cast<const float*>(a.sink_ptr),
                 a.seqstart_q_ptr,
                 a.batch,
                 kargs.num_splits,
@@ -415,14 +437,18 @@ inline bool launch_d128(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
     // causal x group x local (x paged). LOCAL implies CAUSAL, so there is no non-causal window.
     if(a.block_table_ptr != nullptr && kargs.num_splits > 1)
     {
-        if(a.causal)
+        if(is_local)
+            launch(opus_gqa_traits<32, 64, 128, 8, true, true, true, true, true>{});
+        else if(a.causal)
             launch(opus_gqa_traits<32, 64, 128, 8, true, true, false, true, true>{});
         else
             launch(opus_gqa_traits<32, 64, 128, 8, false, true, false, true, true>{});
     }
     else if(a.block_table_ptr != nullptr)
     {
-        if(a.causal)
+        if(is_local)
+            launch(opus_gqa_traits<32, 64, 128, 8, true, true, true, true>{});
+        else if(a.causal)
             launch(opus_gqa_traits<32, 64, 128, 8, true, true, false, true>{});
         else
             launch(opus_gqa_traits<32, 64, 128, 8, false, true, false, true>{});
@@ -610,9 +636,9 @@ inline bool fmha_fwd_bf16_opus_launch(const fmha_fwd_bf16_opus_args& a, hipStrea
         return false;
     }
     // Only gqa_d128_kernel reads the sink; refuse it where it would be ignored.
-    if(a.sink_ptr != nullptr && (a.window_size_left >= 0 || a.hdim_q != a.hdim_v))
+    if(a.sink_ptr != nullptr && a.hdim_q != a.hdim_v)
     {
-        AITER_LOG_WARNING("opus fwd: attention sink needs a symmetric head dim and no window");
+        AITER_LOG_WARNING("opus fwd: attention sink needs a symmetric head dim");
         return false;
     }
 

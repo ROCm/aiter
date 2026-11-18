@@ -66,8 +66,6 @@ void launch_d128(at::Tensor& q,
                 "OPUS D=", D, ": window_size_left >= 0 requires causal");
     TORCH_CHECK(window_size_left < 0 || D == 128,
                 "OPUS D=64 kernel has no sliding window");
-    TORCH_CHECK(window_size_left < 0 || !sink.has_value(),
-                "OPUS: attention sink is not supported with a sliding window");
     args.window_size_left = window_size_left;
 
     HipDeviceGuard guard(q.device().index());
@@ -206,7 +204,8 @@ void launch_d128(at::Tensor& q,
                 cu_count[dev].store(num_cus, std::memory_order_relaxed);
             }
             num_splits = paged ? fmha_fwd_bf16_opus_detail::d128_auto_splits(
-                                     H, static_cast<int>(total_q), B, max_seqlen_q, max_seqlen_k, num_cus)
+                                     H, static_cast<int>(total_q), B, max_seqlen_q, max_seqlen_k,
+                                     window_size_left, num_cus)
                                : 1;
         }
         if (num_splits > 1) {

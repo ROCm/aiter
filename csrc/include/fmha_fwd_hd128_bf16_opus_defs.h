@@ -35,7 +35,7 @@ struct opus_gqa_kargs {
     int stride_lse_h;
     // Optional attention sink: one fp32 logit per QUERY head, [H], unit stride -- a
     // valueless extra key in the softmax denominator (see store_result). nullptr => none.
-    // Read by gqa_d128_kernel only; the sliding-window kernel is never given one.
+    // Read by both the causal and the sliding-window kernel.
     const void* __restrict__ ptr_sink;
 
     // ── group mode (varlen / packed sequences) ──
@@ -119,8 +119,8 @@ struct opus_gqa_traits {
     static constexpr int PAGE_SIZE = 128;
     static constexpr int KV_TILES_PER_PAGE = PAGE_SIZE / KV_TILE_SIZE_;
     static_assert(PAGE_SIZE % KV_TILE_SIZE_ == 0, "a KV tile must not straddle a page");
-    static_assert(!PAGED_ || (GROUP_MODE_ && !LOCAL_), "PAGED is group mode, no window");
-    // Split-KV: grid z splits each Q-block's KV range into page-aligned shares.
+    static_assert(!PAGED_ || GROUP_MODE_, "PAGED is group mode");
+    // Split-KV: grid z splits each Q-block's KV range into shares (page-aligned unless LOCAL).
     static constexpr bool SPLIT = SPLIT_;
     static_assert(!SPLIT_ || PAGED_, "SPLIT runs on the paged path");
 
