@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-
 """The shapes every Triton GEMM test runs.
 
 All GEMM tests call get_shapes(). Kernel limits come in as arguments, so each
@@ -31,18 +28,18 @@ DECODE = [
     (1, 8192, 1024),
     (32, 8192, 1024),
     (128, 8192, 1024),
-    # GPT-OSS QKV
+    
     (1, 5120, 2880),
     (32, 5120, 2880),
     (128, 5120, 2880),
-    # DSR1 MLA absorbed BMMs: W_UK (N=512, K=128) and W_UV (N=128, K=512)
+    
     (1, 512, 128),
     (32, 512, 128),
     (128, 512, 128),
     (1, 128, 512),
     (32, 128, 512),
     (128, 128, 512),
-    # LL3 405B FC1 (very large N)
+    #very large N
     (256, 106496, 16384),
 ]
 
