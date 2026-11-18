@@ -1510,10 +1510,7 @@ class AttentionProgram:
     def softmax_part1(self, p, L, acc, alpha, target_dtype=gl.bfloat16):
         acc = acc * alpha[:, None]
         l_ij = gl.sum(p, 1)
-        if target_dtype != gl.bfloat16:
-            p = p.to(target_dtype)
-        else:
-            p = p.to(target_dtype, fp_downcast_rounding="rtz")
+        p = p.to(target_dtype)
         if self.cfg.USE_EXPLICIT_FMA:
             L = gl.fma(L, alpha, l_ij)
         else:
