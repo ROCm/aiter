@@ -13,6 +13,7 @@ from __future__ import annotations
 import gc
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from inspect import signature
 from typing import Any, ClassVar
@@ -677,3 +678,341 @@ def test_turning_a_provider_off_does_not_reach_an_already_captured_graph(
     expect = (value.float() * scale * weight.float()).to(out.dtype)
     torch.testing.assert_close(out, expect)
     assert plugin.last_decision() is None, "the switch is off for anything new"
+
+
+# ---------------------------------------------------------------------------
+# fused_dual_rmsnorm_mxfp8_quant: the out-buffer bypass
+#
+# This op's public name has two paths -- naming any of `yq`, `sq`, `yk`
+# bypasses routing, because the buffered form RETURNS the buffers it was
+# given while a custom op's schema declares its results do not alias its
+# inputs. The split is deliberate and documented; what it needs is proof
+# that each side is the side it claims to be.
+#
+# The risk is one-directional. Landing on the buffered path by naming a
+# buffer gets AITER's own kernel, which is what naming it asked for. The
+# failure that matters is the reverse: a call that looks routed quietly
+# not being routed. So every test below pins WHICH path ran, not just that
+# the call returned something.
+# ---------------------------------------------------------------------------
+
+
+def _dual_rmsnorm_args(device="cpu", dtype=torch.bfloat16):
+    """The seven parameters of the routed contract -- no output buffers."""
+
+    m, kq, kk = 4, 64, 32
+    return {
+        "q": torch.randn(m, kq, device=device, dtype=dtype),
+        "k": torch.randn(m, kk, device=device, dtype=dtype),
+        "q_weight": torch.randn(kq, device=device, dtype=dtype),
+        "k_weight": torch.randn(kk, device=device, dtype=dtype),
+        "eps_q": 1e-6,
+    }
+
+
+def _serve_dual_rmsnorm(monkeypatch, served):
+    """Enable a provider for this contract and hand back its spy object."""
+
+    provider = _Provider("aklr", _candidate("aklr", served))
+    provider.op_versions = {"fused_dual_rmsnorm_mxfp8_quant": {1}}
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    return provider
+
+
+def test_the_allocating_form_is_what_a_provider_serves(monkeypatch):
+    """No buffers named, so the call is routed and a provider can take it."""
+
+    from aiter.ops.triton.quant.fused_mxfp8_quant import (
+        fused_dual_rmsnorm_mxfp8_quant,
+    )
+
+    served = (torch.zeros(4, 64), torch.zeros(4, 2), torch.zeros(4, 32))
+    provider = _serve_dual_rmsnorm(monkeypatch, served)
+
+    result = fused_dual_rmsnorm_mxfp8_quant(**_dual_rmsnorm_args())
+
+    decision = plugin.last_decision()
+    assert (decision.route, decision.provider) == ("provider", "aklr")
+    assert provider.select_calls == 1
+    assert all(torch.equal(a, b) for a, b in zip(result, served))
+
+
+@pytest.mark.parametrize("buffer_name", ["yq", "sq", "yk"])
+def test_naming_any_one_output_buffer_bypasses_routing(monkeypatch, buffer_name):
+    """Each buffer on its own is enough to leave the routed path.
+
+    Parametrised per buffer rather than testing them together: the branch
+    reads all three, so a test that passes them at once would still pass if
+    two of the three conditions were dropped.
+
+    The native body is replaced here so this runs without a device -- what is
+    under test is which branch the public name picks, not what the kernel
+    computes. The provider is enabled and must come out untouched.
+    """
+
+    from aiter.ops.triton.quant import fused_mxfp8_quant as module
+
+    provider = _serve_dual_rmsnorm(monkeypatch, (None, None, None))
+    sentinel = ("native-ran", None, None)
+    monkeypatch.setattr(
+        module,
+        "_fused_dual_rmsnorm_mxfp8_quant_native",
+        lambda *args, **kwargs: sentinel,
+    )
+
+    args = _dual_rmsnorm_args()
+    args[buffer_name] = torch.zeros(4, 64)
+    result = module.fused_dual_rmsnorm_mxfp8_quant(**args)
+
+    assert result is sentinel, f"naming {buffer_name} did not reach the native body"
+    assert provider.select_calls == 0, (
+        f"naming {buffer_name} still asked a provider to select; the buffered "
+        f"form must not reach routing at all"
+    )
+
+
+@requires_cuda
+def test_the_buffered_form_writes_and_returns_the_caller_s_buffers():
+    """Buffer identity, not just equal values.
+
+    A fake that allocates compiles fine and returns the right value while
+    leaving the caller's buffer unwritten -- correct return, stale buffer,
+    no error. Comparing values alone cannot see that. These assertions are
+    on `data_ptr`, so they fail if the returned tensor is a different
+    allocation that merely holds the right numbers.
+    """
+
+    from aiter.ops.triton.quant.fused_mxfp8_quant import (
+        fused_dual_rmsnorm_mxfp8_quant,
+    )
+
+    args = _dual_rmsnorm_args(device="cuda")
+    expected = fused_dual_rmsnorm_mxfp8_quant(**args)
+
+    buffers = {
+        "yq": torch.empty_like(expected[0]),
+        "sq": torch.empty_like(expected[1]),
+        "yk": torch.empty_like(expected[2]),
+    }
+    got = fused_dual_rmsnorm_mxfp8_quant(**args, **buffers)
+
+    for name, returned, want in zip(buffers, got, expected):
+        assert returned.data_ptr() == buffers[name].data_ptr(), (
+            f"{name}: the buffered form returned a different allocation, so a "
+            f"caller reading its own buffer afterwards would read stale data"
+        )
+        assert torch.equal(
+            returned, want
+        ), f"{name}: buffered value differs from routed"
+
+
+@requires_cuda
+def test_the_routed_form_runs_inside_a_compiled_region():
+    """The allocating form is the one a compiled caller reaches.
+
+    Registration exists so the dispatch stays out of the caller's graph; a
+    compiled call that returns something other than the eager one would mean
+    the fake's metadata disagrees with the kernel.
+    """
+
+    from aiter.ops.triton.quant.fused_mxfp8_quant import (
+        fused_dual_rmsnorm_mxfp8_quant,
+    )
+
+    args = _dual_rmsnorm_args(device="cuda")
+    eager = fused_dual_rmsnorm_mxfp8_quant(**args)
+
+    compiled = torch.compile(fused_dual_rmsnorm_mxfp8_quant, dynamic=False)
+    got = compiled(**args)
+
+    for i, (a, b) in enumerate(zip(got, eager)):
+        assert a.shape == b.shape and a.dtype == b.dtype, (
+            f"output {i}: compiled metadata {tuple(a.shape)}/{a.dtype} differs "
+            f"from eager {tuple(b.shape)}/{b.dtype} -- the fake is wrong"
+        )
+        assert torch.equal(a, b), f"output {i}: compiled value differs from eager"
+
+
+# ---------------------------------------------------------------------------
+# Measured selection, end to end: real kernels, measured here, no fixed numbers
+#
+# The unit tests for selection build candidates by hand. This one runs two real
+# implementations of one contract, times them on the machine the test is on,
+# reports those times, and checks that routing followed them. What it asserts
+# is the relationship -- the faster one serves, the one that reported losing
+# does not -- never a duration, because a duration is a property of the runner.
+# ---------------------------------------------------------------------------
+
+
+def _torch_rmsnorm(input, weight, epsilon, use_model_sensitive_rmsnorm=0):
+    scale = torch.rsqrt(input.float().pow(2).mean(-1, keepdim=True) + epsilon)
+    return (input.float() * scale * weight.float()).to(input.dtype)
+
+
+def _native_rmsnorm(input, weight, epsilon, use_model_sensitive_rmsnorm=0):
+    """AITER's kernel through the binding, NOT through the routed public name.
+
+    A provider's ``run`` must not call the spelling that routes to it: dispatch
+    would reach the provider again and recurse until the stack ends. Reaching
+    past the routed layer is what a real provider does anyway -- it has its own
+    kernel -- but a provider built by wrapping AITER, which is what a port
+    starts as, lands on this immediately.
+    """
+
+    from aiter.ops.rmsnorm import rms_norm_cu
+
+    out = torch.empty_like(input)
+    rms_norm_cu(out, input, weight, epsilon)
+    return out
+
+
+def _time_us(fn, rounds: int = 20) -> float:
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(rounds):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - start) / rounds * 1e6
+
+
+def _reporting(name, run, latency_us, baseline_us, baseline_path):
+    return plugin.KernelCandidate(
+        provider=name,
+        kernel_id=f"{name}-kernel",
+        artifact_digest="sha256:measured-in-test",
+        run=run,
+        latency_us=latency_us,
+        baseline_us=baseline_us,
+        baseline_path=baseline_path,
+        measured_under={"mode": "eager", "rounds": 20},
+        measurement_ref="tests/test_plugin_routed_ops.py",
+    )
+
+
+@requires_cuda
+def test_measured_selection_follows_real_timings(monkeypatch):
+    """Two real kernels, timed here, and the reports decide which one runs."""
+
+    big = torch.randn(2048, 4096, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(4096, device="cuda", dtype=torch.bfloat16)
+    native_us = _time_us(lambda: _native_rmsnorm(big, weight, 1e-6))
+    torch_us = _time_us(lambda: _torch_rmsnorm(big, weight, 1e-6))
+    assert native_us < torch_us, (
+        f"this test needs AITER's kernel to be the faster of the two on this "
+        f"machine; measured {native_us:.1f}us against {torch_us:.1f}us"
+    )
+
+    # "loser" reports the slow implementation against AITER's own: it measured
+    # itself and lost. "winner" reports AITER's kernel against the slow one.
+    loser = _Provider(
+        "loser",
+        _reporting("loser", _torch_rmsnorm, torch_us, native_us, "aiter native"),
+    )
+    loser.op_versions = {"rmsnorm": {2}}
+    winner = _Provider(
+        "winner",
+        _reporting("winner", _native_rmsnorm, native_us, torch_us, "torch rmsnorm"),
+    )
+    winner.op_versions = {"rmsnorm": {2}}
+
+    plugin.configure(enable=("loser", "winner"), source="test")
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("l", loser), _EntryPoint("w", winner)),
+    )
+
+    small = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    small_w = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+    explained = plugin.explain("rmsnorm", small, small_w, 1e-6, 0)
+    # Both were asked by the dry run; the real call asks them again, because
+    # explain() must not leave state behind that dispatch then relies on.
+    assert loser.select_calls == 1 and winner.select_calls == 1
+    result = aiter.rms_norm(small, small_w, 1e-6)
+    decision = plugin.last_decision()
+
+    # Second in the enable list, and selected anyway: the report outranked the
+    # order, which is the whole change.
+    assert decision.provider == "winner"
+    assert decision.reason == plugin.PROVIDER_FASTER
+    # Both were asked again for the real call: comparing needs every offer, so
+    # there is no asking the first and stopping.
+    assert loser.select_calls == 2 and winner.select_calls == 2
+    assert explained.decision.provider == decision.provider
+    assert explained.decision.reason == decision.reason
+    assert torch.allclose(result, _torch_rmsnorm(small, small_w, 1e-6), atol=2e-2)
+
+
+@requires_cuda
+def test_a_reporting_provider_that_lost_leaves_the_call_native(monkeypatch):
+    """Alone and reporting a loss: AITER serves, rather than the slower kernel."""
+
+    big = torch.randn(2048, 4096, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(4096, device="cuda", dtype=torch.bfloat16)
+    native_us = _time_us(lambda: _native_rmsnorm(big, weight, 1e-6))
+    torch_us = _time_us(lambda: _torch_rmsnorm(big, weight, 1e-6))
+
+    loser = _Provider(
+        "loser",
+        _reporting("loser", _torch_rmsnorm, torch_us, native_us, "aiter native"),
+    )
+    loser.op_versions = {"rmsnorm": {2}}
+    plugin.configure(enable=("loser",), source="test")
+    monkeypatch.setattr(plugin, "_entry_points", lambda: (_EntryPoint("l", loser),))
+
+    small = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    small_w = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+    aiter.rms_norm(small, small_w, 1e-6)
+
+    assert plugin.last_decision().route == "native"
+
+
+@requires_cuda
+def test_a_comparison_made_at_capture_is_the_one_every_replay_runs(monkeypatch):
+    """Replay executes no Python, so the comparison is made once, at capture.
+
+    `_choose` documents this; without a test it is a belief. The failure it
+    guards against is quiet by construction: a provider that retunes, or that
+    would report differently on later calls, cannot change a captured route,
+    and nothing in the replay says which call decided it.
+    """
+
+    slower = _Provider(
+        "slower", _reporting("slower", _torch_rmsnorm, 9.0, 10.0, "aiter native")
+    )
+    slower.op_versions = {"rmsnorm": {2}}
+    faster = _Provider(
+        "faster", _reporting("faster", _native_rmsnorm, 4.0, 10.0, "aiter native")
+    )
+    faster.op_versions = {"rmsnorm": {2}}
+
+    plugin.configure(enable=("slower", "faster"), source="test")
+    monkeypatch.setattr(
+        plugin,
+        "_entry_points",
+        lambda: (_EntryPoint("s", slower), _EntryPoint("f", faster)),
+    )
+
+    x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(256, device="cuda", dtype=torch.bfloat16)
+    graph, captured = _capture(lambda: aiter.rms_norm(x, weight, 1e-6))
+
+    decision = plugin.last_decision()
+    assert decision.provider == "faster"
+    assert decision.reason == plugin.PROVIDER_FASTER
+    asked_at_capture = (slower.select_calls, faster.select_calls)
+
+    # The reports reverse: were the comparison live, "slower" would now win.
+    slower.selected = _reporting("slower", _torch_rmsnorm, 1.0, 10.0, "aiter native")
+    graph.replay()
+    torch.cuda.synchronize()
+
+    # Nobody was asked again, and the route did not move.
+    assert (slower.select_calls, faster.select_calls) == asked_at_capture
+    assert plugin.last_decision().provider == "faster"
+    assert torch.allclose(captured, _native_rmsnorm(x, weight, 1e-6), atol=2e-2)

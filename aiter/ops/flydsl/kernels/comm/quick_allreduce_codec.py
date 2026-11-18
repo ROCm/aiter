@@ -32,7 +32,7 @@ every codec, and all in-kernel arithmetic is packed fp16. Two limits follow.
 many blocks a payload gets.
 
 Imported by the mesh and ring kernels, which must agree on it byte for byte.
-Depends on ``allreduce_shared`` for ``BLOCK``, ``WAVE`` and ``I32_BYTES``.
+Depends on ``transport`` for ``BLOCK``, ``WAVE`` and ``I32_BYTES``.
 """
 
 import functools
@@ -43,11 +43,18 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr
 
-from ...allreduce_policy import SUPPORTED_BLOCKS
+from ...allreduce_policy import (
+    BLOCK_ALIGN,
+    MAX_BLOCK,
+    SUPPORTED_BLOCKS,
+)
 from ..kernels_common import ceildiv
-from .allreduce_shared import BLOCK, I32_BYTES, WAVE
+from .transport import (
+    BLOCK,
+    I32_BYTES,
+    WAVE,
+)
 
-SUPER_TILES = (1, 8)
 # Two threads (PAIR) share one scale byte; GROUP threads share the i32 slot.
 GROUP = 8
 PAIR = 2
@@ -57,8 +64,8 @@ PAIR = 2
 # Every region of a rank-tile has to be a whole number of 64 B fabric sectors:
 # the fanout moves one sector per quad, so a region ending mid-sector would
 # ship the next region's bytes with it and overwrite them in the peer's inbox.
-# The nibble and 2-bit planes are 4*block and 2*block bytes, whole sectors at
-# every width here. The scale region is block/2 bytes, a whole sector only from
+# The nibble, 1-bit and 2-bit planes are 4*block, block and 2*block bytes,
+# whole sectors at every width here. The scale region is block/2 bytes, a whole sector only from
 # block 128 up; at 64 it is padded, see :func:`codecs_for_block`.
 # i32 per 64 B fabric sector.
 SECTOR_I32 = 16
@@ -66,11 +73,17 @@ SECTOR_I32 = 16
 
 def validate_block(block: int) -> int:
     block = int(block)
-    if block not in SUPPORTED_BLOCKS:
-        raise ValueError(
-            f"codec block must be one of {SUPPORTED_BLOCKS}, got {block!r}"
-        )
-    return block
+    # Besides ``SUPPORTED_BLOCKS``, the fused schedules size a workgroup to one
+    # token row (block = hidden / 8), on any BLOCK_ALIGN multiple up to
+    # MAX_BLOCK. Both keep every rank-tile region on the 64 B sector grid.
+    if block in SUPPORTED_BLOCKS or (
+        BLOCK_ALIGN <= block <= MAX_BLOCK and block % BLOCK_ALIGN == 0
+    ):
+        return block
+    raise ValueError(
+        f"codec block must be one of {SUPPORTED_BLOCKS} or a multiple of "
+        f"{BLOCK_ALIGN} in [{BLOCK_ALIGN}, {MAX_BLOCK}], got {block!r}"
+    )
 
 
 def _round_up_to_sector(n_i32: int) -> int:
@@ -92,10 +105,9 @@ _K_HALF2_1056 = 0xE420E420  # -1056.0 fp16x2 = -(1024 + 32)
 _FP16_MAX = 65504.0
 # Exponent bias of the E5M2 group scale.
 _SCALE_BIAS = 12
-# Bump whenever the group-scale codec changes. The codec helpers are only
-# called from nested functions, so FlyDSL does not hash them into the disk
-# cache key; the kernels put this tag in their launch names, which is what
-# keeps a warm cache from loading binaries built with an older codec.
+# Names the group-scale codec in every mesh and ring launch name. FlyDSL 0.5.0
+# keys its cache on the traced IR, so a codec change rebuilds the kernels
+# without a new tag; the tag only labels the binaries.
 SCALE_CODEC_TAG = "s5m2b12"
 
 
@@ -516,19 +528,7 @@ def _quant_atom_fp16(codec, atom, enc_pk):
     m_hi = fx.Int32(hi_mask | (hi_mask << 16))
     lo4 = [qi & m4 for qi in q]
     hi = [qi.shrui(fx.Int32(4)) & m_hi for qi in q]
-    packed_lo = (
-        lo4[0]
-        | (lo4[1] << fx.Int32(4))
-        | (lo4[2] << fx.Int32(8))
-        | (lo4[3] << fx.Int32(12))
-    )
-    packed_hi = (
-        hi[0]
-        | (hi[1] << fx.Int32(hi_bits))
-        | (hi[2] << fx.Int32(2 * hi_bits))
-        | (hi[3] << fx.Int32(3 * hi_bits))
-    )
-    return (packed_lo, packed_hi)
+    return (_pack_fields(lo4, 4), _pack_fields(hi, hi_bits))
 
 
 def _compact_hi(packed_hi, lane, hi_bits):
@@ -555,7 +555,7 @@ def _compact_hi(packed_hi, lane, hi_bits):
     shift = thread_bits
     xor_off = 1
     while xor_off < share:
-        other = fx.Int32(gpu.shuffle_xor(word, xor_off, WAVE))
+        other = word.shuffle_xor(xor_off, WAVE)
         is_lo = (lane & fx.Int32(xor_off)) == fx.Int32(0)
         word = is_lo.select(
             word | (other << fx.Int32(shift)),
