@@ -65,6 +65,18 @@ def bmm_a8w8_mxfp8_supported(
     return _runner(get_gfx(), w_scale_block, x_scale_transposed) is not None
 
 
+def bmm_a8w8_mxfp8_fused_quant_supported(
+    w_scale_block: str, x_scale_transposed: bool = False
+) -> bool:
+    """Whether this arch's kernel for a w_scale block can fuse the output
+    group-32 MXFP8 quant into its epilogue (``y_scale_out=``). Only the gfx1250
+    batched mxfp8_32 runner does. The lookup goes through ``base_gfx_arch``,
+    the same mapping ``_runner`` uses, so gfx1250-strict selects that runner
+    instead of missing the table and looking like an unsupported shape."""
+    entry = _RUNNERS.get((base_gfx_arch(get_gfx()), w_scale_block, x_scale_transposed))
+    return entry is not None and entry[:2] == _GFX1250_MX32
+
+
 def run_bmm_a8w8_mxfp8(
     XQ: Tensor,
     WQ: Tensor,
@@ -73,11 +85,17 @@ def run_bmm_a8w8_mxfp8(
     Out: Tensor,
     kernel_name: str | None = None,
     x_scale_transposed: bool = False,
+    y_scale_out: Tensor | None = None,
 ) -> Tensor:
     """``Out[m, b] = dequant(XQ[m, b]) @ dequant(WQ[b]).T`` on this arch's
     kernel for the w_scale block and x_scale layout; writes into ``Out`` and
     returns it. ``kernel_name`` is a tuned row's kernelName, else the arch's
-    heuristic picks one."""
+    heuristic picks one.
+
+    ``y_scale_out``: when given, the GEMM fuses the output group-32 MXFP8 quant
+    into its epilogue -- ``Out`` is the e4m3 output and ``y_scale_out`` the
+    row-major e8m0 scale. Only the gfx1250 batched mxfp8_32 runner supports it
+    (see :func:`bmm_a8w8_mxfp8_fused_quant_supported`)."""
     n, k = WQ.shape[-2], WQ.shape[-1]
     w_scale_block = mxscale_w_scale_block(tuple(w_scale.shape), n, k)
     run = _runner(get_gfx(), w_scale_block, x_scale_transposed)
@@ -87,7 +105,26 @@ def run_bmm_a8w8_mxfp8(
             f"no preshuffled mxfp8 BMM kernel reads a {w_scale_block} w_scale "
             f"with a {layout} x_scale on {get_gfx()}"
         )
+    if y_scale_out is not None:
+        if not bmm_a8w8_mxfp8_fused_quant_supported(w_scale_block, x_scale_transposed):
+            raise NotImplementedError(
+                f"fused output quant (y_scale_out) is unsupported for a "
+                f"{w_scale_block} w_scale on {get_gfx()}"
+            )
+        return run(
+            XQ,
+            WQ,
+            x_scale,
+            w_scale,
+            Out,
+            kernel_name=kernel_name,
+            y_scale_out=y_scale_out,
+        )
     return run(XQ, WQ, x_scale, w_scale, Out, kernel_name=kernel_name)
 
 
-__all__ = ["bmm_a8w8_mxfp8_supported", "run_bmm_a8w8_mxfp8"]
+__all__ = [
+    "bmm_a8w8_mxfp8_fused_quant_supported",
+    "bmm_a8w8_mxfp8_supported",
+    "run_bmm_a8w8_mxfp8",
+]
