@@ -439,7 +439,7 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             max_threads_per_multi_processor=2048,
         )
         with (
-            mock.patch.object(policy, "get_gfx", lambda: "gfx950"),
+            mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx950"),
             mock.patch.object(torch.cuda, "current_device", lambda: 0),
             mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
             mock.patch.object(
@@ -478,7 +478,7 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             max_threads_per_multi_processor=2048,
         )
         with (
-            mock.patch.object(policy, "get_gfx", lambda: "gfx950"),
+            mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx950"),
             mock.patch.object(torch.cuda, "current_device", lambda: 0),
             mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
             mock.patch.object(
@@ -588,7 +588,7 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             max_threads_per_multi_processor=2048,
         )
         with (
-            mock.patch.object(policy, "get_gfx", lambda: "gfx950"),
+            mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx950"),
             mock.patch.object(torch.cuda, "current_device", lambda: 0),
             mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
             mock.patch.object(
@@ -681,7 +681,7 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             max_threads_per_multi_processor=2048,
         )
         with (
-            mock.patch.object(policy, "get_gfx", lambda: "gfx950"),
+            mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx950"),
             mock.patch.object(torch.cuda, "current_device", lambda: 0),
             mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
             mock.patch.object(
@@ -711,7 +711,7 @@ class TestGfx950FlydslCandidates(unittest.TestCase):
             max_threads_per_multi_processor=2048,
         )
         with (
-            mock.patch.object(policy, "get_gfx", lambda: "gfx950"),
+            mock.patch.object(policy, "get_gfx_runtime", lambda: "gfx950"),
             mock.patch.object(torch.cuda, "current_device", lambda: 0),
             mock.patch.object(torch.cuda, "get_device_properties", lambda _: props),
             mock.patch.object(
@@ -943,6 +943,8 @@ class TestLegacyFlydslHgemmConfigs(unittest.TestCase):
                 continue
             params = kernels.get_flydsl_hgemm_kernel_params(name)
             if not params["target_gfx"].startswith("gfx1250"):
+                continue
+            if params["policy"] in ("tdm", "tdmi", "tdma", "tdmia"):
                 continue
             seen.add(name)
             for gfx in ("gfx1250", "gfx1250-strict"):

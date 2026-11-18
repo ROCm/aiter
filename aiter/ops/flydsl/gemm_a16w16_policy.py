@@ -145,7 +145,7 @@ class GemmConfigPruner:
         for config, iou in zip(configs, ious):
             tiles = self._tiles(config)
             validated_half_tile = (
-                config["use_half_tile_interleaved"]
+                config.get("use_half_tile_interleaved", False)
                 and config["block_m"] == 256
                 and config["block_n"] == 256
                 and config["block_k"] == 64
@@ -157,7 +157,7 @@ class GemmConfigPruner:
                 and config["group_m"] in (0, 1, 2, 4, 8, 16)
             )
             validated_grouped_half_tile = (
-                config["use_half_tile_interleaved"]
+                config.get("use_half_tile_interleaved", False)
                 and config["group_m"] == 4
                 and (
                     config["block_m"],
@@ -169,7 +169,7 @@ class GemmConfigPruner:
                 == (192, 128, 128, 2, 4)
             )
             validated_half_tile_workspace = (
-                config["use_half_tile_interleaved"]
+                config.get("use_half_tile_interleaved", False)
                 and config["block_m"] == 256
                 and config["block_n"] == 256
                 and config["block_k"] == 64
