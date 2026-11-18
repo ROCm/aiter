@@ -5538,9 +5538,11 @@ static int mla_rope_entry_heads_per_block(int64_t num_tokens,
                                           bool& nope_early)
 {
     const int64_t per_cu = num_tokens * num_heads / get_num_cu_func();
-    const std::string arch = get_gpu_arch();
-    const bool tuned_arch =
-        arch == "gfx1250" || arch == "gfx1250-strict" || arch == "gfx950";
+    // The arch is fixed for the process: query it once, as mla_rope_tdm_lds_bytes does.
+    static const bool tuned_arch = [] {
+        const std::string arch = get_gpu_arch();
+        return arch == "gfx1250" || arch == "gfx1250-strict" || arch == "gfx950";
+    }();
     int hpt = tuned_arch
                   ? (per_cu < 12 ? 1 : per_cu < 18 ? 2 : per_cu <= 128 ? 4 : 8)
                   : (per_cu <= 32 ? 1 : per_cu <= 80 ? 2 : per_cu <= 160 ? 4 : 8);
@@ -5713,6 +5715,12 @@ void fused_qk_concat_and_cache_mla(
               "Q/K inputs and q_out must have at least slot_mapping.size(0) rows");
   AITER_CHECK(q_out.size(1) >= num_heads,
               "q_out must have at least q_nope.size(1) heads");
+  // The kernel reads slot_mapping as contiguous int64 and writes kv_lora_rank +
+  // pe_dim elements per cache entry; check both here rather than trust the caller.
+  AITER_CHECK(slot_mapping.dtype() == AITER_DTYPE_i64 && slot_mapping.stride(0) == 1,
+              "slot_mapping must be a contiguous int64 tensor");
+  AITER_CHECK(kv_cache.size(-1) >= kv_lora_rank + pe_dim,
+              "kv_cache entries must hold kv_lora_rank + pe_dim elements");
   AITER_CHECK(kv_lora_rank == qk_lora_rank,
               "kv_lora_rank and qk_lora_rank must be the same");
   AITER_CHECK(kv_c.stride(-1) == 1, "kv_c stride(-1) must be equal to 1");
