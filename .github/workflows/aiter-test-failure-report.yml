@@ -1,0 +1,46 @@
+name: aiter-test-failure-report
+
+on:
+  schedule:
+    # The main Aiter Test run starts at 22:00 UTC. Run later so the scheduled
+    # suite usually has time to finish before this report scans for failures.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Optional Aiter Test workflow run id to analyze"
+        required: false
+        type: string
+      lookback:
+        description: "Number of recent Aiter Test runs to scan when run_id is empty"
+        required: false
+        default: "120"
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: aiter-test-failure-report
+  cancel-in-progress: true
+
+jobs:
+  report:
+    runs-on: [self-hosted, box308]
+    timeout-minutes: 60
+    env:
+      AITER_TEST_FAILURE_RUN_ID: ${{ github.event.inputs.run_id || '' }}
+      AITER_TEST_FAILURE_LOOKBACK: ${{ github.event.inputs.lookback || '120' }}
+      AITER_TEST_FAILURE_AGENT: ${{ vars.AITER_TEST_FAILURE_AGENT || 'claude-glm' }}
+      AITER_TEST_FAILURE_AGENT_TIMEOUT: ${{ vars.AITER_TEST_FAILURE_AGENT_TIMEOUT || '1800' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Analyze latest Aiter Test failure
+        run: .claude/skills/aiter-test-failure-analysis/scripts/run_report.sh "${GITHUB_REPOSITORY}"
