@@ -213,6 +213,71 @@ def test_output_quant_scale_boundaries():
     assert_bytes(actual[0], oracle_q)
     assert_bytes(actual[1].view(torch.uint8), oracle_s)
 
+    # Copy integer bits so fixture construction does not quiet signalling NaNs.
+    all_bits = torch.arange(65536, device="cuda", dtype=torch.int32).to(torch.int16)
+    all_bits = all_bits[:, None].expand(-1, 32).contiguous()
+    finite_bits = torch.tensor(
+        [
+            0x0000,
+            0x0001,
+            0x0002,
+            0x007F,
+            0x0080,
+            0x0081,
+            0x1E3C,
+            0x2F80,
+            0x3F80,
+            0x435F,
+            0x4360,
+            0x43DF,
+            0x43E0,
+            0x43E1,
+            0x7F00,
+            0x7F7F,
+        ],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    templates = torch.cat((finite_bits, finite_bits ^ 0x8000)).repeat(4, 1)
+    templates[1, 0] = 0x7F80
+    templates[1, 17] = 0xFF80
+    nan_bits = torch.tensor(
+        [0x7FC1, 0xFFC1, 0x7F81, 0xFF81], device="cuda", dtype=torch.int32
+    )
+    templates[2, :4] = nan_bits
+    templates[3] = nan_bits.repeat(8)
+    groups = torch.arange(8193, device="cuda")
+    positions = (torch.arange(32, device="cuda")[None, :] + groups[:, None] // 4) % 32
+    mixed_bits = templates[(groups % 4)[:, None], positions].to(torch.int16)
+
+    # The mixed fixture has 257 tasks and one valid group in its last task.
+    for fixture in (all_bits, mixed_bits):
+        input_buffer = guarded(fixture.shape, torch.bfloat16)
+        x = input_buffer[0]
+        x.view(torch.int16).copy_(fixture)
+        before = x.clone()
+        expected = (*native.quantize_fp8(x), native.quantize_fp8(x, dequantize=True))
+        outputs = [
+            guarded(x.shape, torch.float8_e4m3fn),
+            guarded((x.shape[0], 1), torch.float8_e8m0fnu),
+            guarded(x.shape, torch.bfloat16),
+        ]
+        for persistent in (False, True):
+            for (out, _, _), ref in zip(outputs, expected):
+                out.view(torch.uint8).copy_(ref.view(torch.uint8) ^ 0xFF)
+            actual = (
+                *quantize_fp8_group32(
+                    x, persistent=persistent, out=outputs[0][0], scales=outputs[1][0]
+                ),
+                quantize_fp8_group32(
+                    x, persistent=persistent, dequantize=True, out=outputs[2][0]
+                ),
+            )
+            for a, b in zip(actual, expected):
+                assert_bytes(a, b)
+            assert_bytes(x, before)
+            assert_guards([input_buffer, *outputs])
+
 
 def test_output_quant_scale_ownership():
     values = torch.tensor(

@@ -28,7 +28,13 @@ def _quantize_fp8_group32_tile(X, Y, S, SIZE, tile, DEQUANT: gl.constexpr):
     bits = (amax * (1.0 / 448.0)).to(gl.uint32, bitcast=True)
     code = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(gl.uint32)
     scale = (code << 23).to(gl.float32, bitcast=True)
-    q = gl.minimum(gl.maximum(x / scale[:, None], -448.0), 448.0).to(gl.float8e4nv)
+    # These power-of-two reciprocals are exact; keep the Inf and -0 scale cases.
+    reciprocal_code = gl.maximum(254 - code.to(gl.int32), 0)
+    reciprocal_bits = gl.where(code == 256, -8388608, reciprocal_code << 23)
+    reciprocal_scale = reciprocal_bits.to(gl.float32, bitcast=True)
+    q = gl.minimum(gl.maximum(x * reciprocal_scale[:, None], -448.0), 448.0).to(
+        gl.float8e4nv
+    )
     if DEQUANT:
         y = (q.to(gl.float32) * scale[:, None]).to(Y.dtype.element_ty)
         buffer_store(y, Y + tile_base, offsets, mask=mask)

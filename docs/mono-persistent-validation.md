@@ -2,15 +2,21 @@
 
 Use this guide only after the external runner's offline gate and Claude's
 independent local review. Neither certifies GPU correctness or performance.
-The [review TODO](mono-persistent-review-todo.md) records the selected buffer
-candidate, its resource cost and the unresolved 8 B/wave request cost.
+The [review TODO](mono-persistent-review-todo.md) records the selected exact
+power-of-two reciprocal change, its static cost and the unresolved request cost.
 
 ## Source and local status
 
-Use code commit `1777a3f1e67220ff0450f46f1d179b6076358733`, or the supplied
-patch and source manifest for that code. It includes the reviewed buffer
-change on production `08e20f6`. Record the manifest, HEAD and dirty diff;
-HEAD alone does not identify a checkout made by applying the patch.
+Production HEAD is `f4317a49eb72ef43525e2331c73db515a8edd5cd`.
+The code baseline is `1777a3f1e67220ff0450f46f1d179b6076358733`.
+The selected source is that baseline plus this arithmetic and test patch; it
+is not code commit `1777a3f`. Use the supplied patch and final source manifest.
+The runner checkout starts at `7bdd28762c6248f67e0babce8bc25e08ff82a61d`.
+The read-only proof at
+`/home/weizhu15/workspace/mono-a09-finalize-20261118/standalone-source.json`
+confirms that only an unrelated gitlink was removed from the source clone.
+All other index modes and blobs match production. Submodule declarations stay
+unchanged. Record the manifest, HEAD and dirty diff; HEAD alone is insufficient.
 Do not replay historical patches or change the working framework packages.
 
 | Reference | Fixed source |
@@ -20,26 +26,44 @@ Do not replay historical patches or change the working framework packages.
 | A03, unchanged | `7108dbec079595026f76b7b1b8e082fe1669796d` |
 | Frozen excerpts / hashes | `op_tests/triton_tests/utils/mono_native.py` and `mono_native_manifest.json` |
 
-The worker compiled 12 offline variants, checked the 12 frozen hashes and
-collected the same 45 tests with a labelled CPU-only import harness. Additional
-offline builds used real binders for FP8/QAT and PS/non-PS, including tails.
-Black checks on individual files, Ruff and diff whitespace checks passed.
-No GPU test, actual GPU JIT, launch trace or timing was executed. The external
-runner passed its fixed command and Claude Opus 5.5 returned `approve` on
-2026-11-18. The reviewed code was applied byte for byte and committed as
-`1777a3f`. Later guide edits record status and separate profiling from numerical
-tests, as Claude advised. Those guide edits were checked by Codex.
-
-The runner's fixed offline command is:
+Selected code SHA256:
 
 ```text
-/home/weizhu15/workspace/aiter-mono-tools/bin/python /home/weizhu15/workspace/mono-a09-claude-review-20261118/offline_acceptance.py
+0393295fc04b699224174e77ed5ede74f28d46ea588afed986f48cd87c2a2849  aiter/ops/triton/_gluon_kernels/gfx1250/quant/fp8_group32.py
+6e64b2b37adc63e55a9d5306ae5c5d9a6ca9d5b18efa436374490a5908c71e60  op_tests/triton_tests/quant/test_mono_persistent.py
 ```
 
-It checks 12 builds, frozen hashes, Black/Ruff, exactly 45 unchanged node IDs
-and four binder specializations. The CPU import harness is for collection
-only. Never use it to run numerical tests or bypass the GPU gate below.
-Private runner artifacts hold full review notes, offline IR/ISA and logs.
+The worker completed 12 offline native/candidate builds and checked all 12
+frozen symbol hashes. The collection-only CPU import harness found the same
+45 node IDs. All original assertions remain. Black checks on individual files,
+Ruff and diff whitespace checks passed. The worker also built 22 real-binder
+variants: 12 selected, six native and four previous-code comparisons. These
+cover FP8/QAT, PS/non-PS and `[1,32]`, `[513,2048]`, `[513,2080]` tails. QAT
+uses the wrapper's actual `S=None` specialization.
+
+The unchanged external CPU checker was copied into private workspace artifacts
+and run there. It checked 65,536 BF16 bit patterns against 165 scale codes:
+10,813,440 pairs, with zero post-clamp FP8 or QAT byte mismatches. Pre-clamp
+bits match except that NaNs are compared as both NaN. This checks CPU algebra
+and reference semantics; it is not GPU numerical proof. The new GPU fixtures
+are implemented but have not run. Full worker logs, IR/ISA, code objects,
+source manifest, patch and dependency review are in private `build/a09-local/`.
+
+The outer runner's fixed command remains:
+
+```text
+/home/weizhu15/workspace/aiter-mono-tools/bin/python /home/weizhu15/workspace/mono-a09-finalize-20261118/acceptance.py
+```
+
+It checks 12 builds, frozen hashes, Black/Ruff, the exact 45 node IDs, four real
+binder variants, exhaustive CPU arithmetic and ISA/resource selection gates.
+The worker did not run this command because it writes outside its allowed
+workspace. The outer runner owns its execution and result. Independent Claude
+review of this new arithmetic is pending until the outer workflow records it.
+The previous approval does not cover this patch. Neither local checks nor a
+local approval certify GPU correctness, actual JIT, launch or performance.
+Never use the CPU collection harness to run numerical tests or bypass the GPU
+gate below.
 
 The [historical report](mono-results/2026-11-18-gfx1250/README.md) covers
 `d5930aff35d67fa0a2e74ba425909747f3ccef9f`, before this implementation. Its
@@ -142,10 +166,18 @@ else
 fi
 ```
 
-Coverage retains all existing nodes and assertions. A09 checks native and
-independent FP8/E8M0/QAT oracles, XOR-prefilled outputs, guards and unchanged
-inputs. Shapes include `[513,2048]` with five iterations and `[513,2080]` with
-one valid group in the last task. Scale ownership spans all four waves.
+Coverage retains all existing nodes and assertions. A09 retains native and
+independent finite-value FP8/E8M0/QAT oracles, XOR-prefilled outputs, guards and
+unchanged inputs. The existing scale-boundary node also builds integer bits
+on GPU for `[65536,32]` (all BF16 patterns, 4 MiB) and `[8193,32]` (mixed groups,
+512 KiB plus 64 B). The fixtures cover normal/subnormal values, signed zeros,
+finite extremes, Inf and signed quiet/signalling NaNs. Mixed groups rotate
+values through all lane slices and waves; finite groups force underflow with
+large maxima. Both fixtures compare PS and non-PS FP8/E8M0/QAT bytes against
+frozen native and check input/output guards. Nonfinite data never enters the
+finite-only oracle. There is no relaxed NaN or byte tolerance. Shapes also
+include `[513,2048]` with five iterations and `[513,2080]` with one valid group
+in the last task. Scale ownership spans all four waves.
 The two A09 Graph nodes check both FP8 and QAT after each of 20 input changes.
 A03 tests and its existing FP64 K tolerance remain unchanged.
 
@@ -163,18 +195,31 @@ loop dependencies. A zero fixed LDS field alone is insufficient. Non-PS has
 no task loop. If launch tracing is unavailable, report the P256 runtime gate
 as pending and stop before performance acceptance.
 
-The local real-binder FP8/QAT PS reference is 53/47 VGPR, 68 SGPR, and
-1436/1420 code bytes. Native uses 49/44 VGPR; compiler VGPRBlocks are 3/2 for
-both native and selected PS. These fields do not measure runtime occupancy.
-Expected accesses are buffer_load_b128, FP8 buffer_store_b64 plus a byte scale
-store, and QAT buffer_store_b128. There are no memory-mask EXEC branches.
-Keep the actual compiler version with any differences. A new spill, LDS copy,
-mask branch or lost vector width requires review before spending timing time.
+The selected real-binder FP8/QAT PS uses 21/18 VGPR and 892/876 code bytes.
+Frozen native uses 49/44 VGPR and 1388/1264 bytes. The previous PS used 53/47
+VGPR and 1436/1420 bytes. All use 68 SGPR. Selected PS compiler VGPRBlocks
+are 1/1, versus native 3/2; these are allocation fields, not measured occupancy.
+The reduction removes eight general division sequences per lane in both paths.
+Scale derivation, clamp/conversion order and stored E8M0 bytes remain fixed.
+The [review TODO](mono-persistent-review-todo.md) gives the arithmetic proof
+and the non-PS comparison.
+
+Expected accesses remain buffer_load_b128, FP8 buffer_store_b64 plus
+buffer_store_b8, and QAT buffer_store_b128. Local IR/ISA has no general divide,
+LDS, scratch or memory-mask EXEC branch. It retains a single scale writer,
+global tail masks, zero-filled masked loads and safe descriptor/source reuse.
+FP32 denorm mode remains 3, round mode 0, with `allow_flush_denorm=false`.
+Review actual JIT for these properties before timing. A new spill, LDS copy,
+mask branch, lost vector width, changed FP mode or unsafe dependency requires
+review. Static selection requires FP8 code < 1388 B and VGPR <= 49, QAT code
+< 1264 B and VGPR <= 44, with shared=0 and scratch=0 on both paths. These are
+local readiness gates, not a runtime speed guarantee.
 
 ## 3. Time only frozen native and final PS
 
 After correctness and launch checks pass, run this one matrix without a
-profiler. QAT is included because the shared memory path changed.
+profiler. QAT is required because the shared arithmetic change affects both
+paths.
 The benchmark now defaults to A09 FP8 and QAT; it does not include A03 unless
 `--ops a03` is supplied. This handoff selects both A09 paths explicitly.
 
@@ -208,10 +253,11 @@ otherwise = inconclusive
 An improvement passes that row. A regression fails that row. Overlap,
 equal medians or insufficient separation remain inconclusive; they do not
 establish equivalence. No positive slowdown allowance is assumed. A path
-passes only if every required row passes, and its correctness and P256 gates
-also pass. Report FP8 and QAT status separately. A gain against historical
+passes only if all six required rows are improvements, and its correctness
+and P256 gates also pass. Report FP8 and QAT status separately. A gain against historical
 PS cannot offset a native regression. Return failed or inconclusive rows with
-the evidence; do not start another tuning or ablation matrix.
+the evidence; do not automatically rerun or start another tuning or ablation
+matrix.
 
 ## 4. Return the evidence and exact status
 
@@ -219,8 +265,8 @@ Return the supplied source manifest, dirty diff, environment, correctness
 XML/log, dispatch mapping, actual JIT artifacts, offline artifacts and timing
 JSON/log. Full review explanations belong in private runner artifacts. Update
 these two existing guides with verified status; add no tracked result report.
-Separate implementation, local compiler/collection, Claude local review,
-GPU numerical/Graph/launch and performance status. Lower-level scale request
-combining, cache traffic, retry state and cycle attribution remain unknown
-without evidence. Full mono ABI, DEV/HT, reserved registers, joins and model
+Separate implementation, code/algebra review, CPU exhaustive checks, offline
+ISA/resource/collection, Claude local review, GPU numerical/Graph/JIT/launch
+and performance status. Lower-level scale request combining, cache traffic,
+retry state and cycle attribution remain unknown without evidence. Full mono ABI, DEV/HT, reserved registers, joins and model
 integration are outside this standalone acceptance.
