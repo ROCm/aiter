@@ -354,6 +354,29 @@ def _failures(ranks, *, tp: int, factory: bool) -> list[str]:
     return fails
 
 
+def _case_lines(ranks, tp: int) -> list[str]:
+    """One line per checked shape and mode: the worst NMSE and mismatch fraction
+    over the ranks, and whether every rank was served and equal to the engine."""
+    lines = []
+    for i, row in enumerate(ranks[0]["rows"]):
+        each = [r["rows"][i] for r in ranks]
+        for mode in ("rs", "ag"):
+            served = all(r[f"{mode}_served"] for r in each)
+            line = f"tp={tp} {row['tokens']}x{row['hidden']} {mode}: served={served}"
+            if served:
+                equal = all(r[f"{mode}_engine_equal"] for r in each)
+                unchanged = all(r[f"{mode}_input_unchanged"] for r in each)
+                line += (
+                    f" nmse={max(r[f'{mode}_nmse'] for r in each):.3e}"
+                    f" err={max(r[f'{mode}_err'] for r in each):.4f}"
+                    f" engine_equal={equal} input_unchanged={unchanged}"
+                )
+                if mode == "ag":
+                    line += f" ranks_equal={all(r['ag_ranks_equal'] for r in each)}"
+            lines.append(line)
+    return lines
+
+
 def _bench(router, fly, rank: int, tokens: int, hidden: int, device) -> dict:
     """The router, the engine on an input padded here and the exact collective
     (RCCL) on one shape: per candidate the time, the bytes of the full tensor
@@ -489,6 +512,8 @@ def main():
         fails += _failures(ranks, tp=tp, factory=factory)
         if not ranks[0]["factory_none"]:
             served.append(tp)
+        for line in _case_lines(ranks, tp):
+            print(line)
         print(
             f"tp={tp}: {len(ranks[0]['rows'])} shapes checked on {tp} ranks"
             f"{', the factory returned None, as expected here' if ranks[0]['factory_none'] and not ranks[0]['router_expected'] else ''}"
