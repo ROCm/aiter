@@ -25,12 +25,14 @@ capture-time allocation, stable pointers) is a correctness property.
 
 import argparse
 import itertools
+from unittest.mock import patch
 
 import pandas as pd
 import torch
 
 import aiter
-from aiter.jit.utils.chip_info import get_gfx
+import aiter.ops.flydsl.mxmoe_native_reduce as native_reduce_api
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.ops.flydsl.grouped_moe_gfx1250 import (
     _build_g2l_lut,
     _grouped_a8w4_preshuffle_e8m0_scale,
@@ -60,6 +62,11 @@ from aiter.ops.flydsl.kernels.moe_scatter_copy_token import (
     build_moe_scatter_copy_token_module,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.mxmoe_native_reduce import (
+    _NATIVE_BF16_SOURCE,
+    _OPUS_REVERSE_SOURCE,
+    ep32_native_reduce,
+)
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -1133,10 +1140,284 @@ def summarize(name, rows):
     )
 
 
+@benchmark()
+def test_ep32_native_reduce(tokens, reverse_masked, output_zeroed, scenario):
+    """Kimi-K3 EP32: weighted BF16 staging, H3584, TOPK16, arbitrary EP mask."""
+    h, topk, rows, experts = 3584, 16, 64, 896
+    torch.manual_seed(41)
+    linear = (torch.randn(rows, h) + torch.arange(rows)[:, None] / 16).bfloat16()
+    linear[0], linear[1], linear[2] = 2**20, -(2**20), 2**-8
+    staging = (
+        linear.reshape(rows // 16, 4, 4, h // 16, 16)
+        .permute(0, 3, 1, 4, 2)
+        .contiguous()
+        .reshape(rows // 16, h // 16, 64, 4)
+    )
+    # The producer already applied the weights; a second multiplication is wrong.
+    weights = torch.rand(rows, dtype=torch.float32)
+    ids = torch.full((tokens, topk), experts - 1, dtype=I32)
+    ids[:, :3] = 128 + torch.arange(tokens)[:, None] % 28
+    ids[::7] = 128 + torch.arange(topk) % 28
+    ids[::5] = experts - 1
+    reverse = torch.randint(0, rows, ids.shape, dtype=I32)
+    reverse[1, :3] = torch.tensor([0, 2, 1], dtype=I32)
+    mask = torch.zeros(experts, dtype=I32)
+    mask[128:156] = 1  # exercise a shard that is not the global expert prefix
+    valid_tokens = tokens - 13 if scenario == "tail" else tokens
+    valid = torch.tensor([rows, valid_tokens], dtype=I32)
+    if scenario == "empty":
+        mask.zero_()
+        reverse.fill_(2**30)
+        valid[0] = 0
+    elif scenario == "invalid":
+        ids[0, 0], ids[1, 0], ids[2, 0] = -1, experts, experts + 7
+        reverse[3, 0], reverse[4, 0], reverse[5, 0] = -1, rows, 2**30
+        mask[132] = 0
+        valid[0] = rows - 7
+    local = (
+        (ids >= 0)
+        & (ids < experts)
+        & (mask[ids.clamp(0, experts - 1).long()] != 0)
+        & (torch.arange(tokens)[:, None] < valid_tokens)
+    )
+    verified_reverse = reverse_masked and scenario != "untrusted"
+    if verified_reverse:
+        reverse = torch.where(local, reverse, torch.full_like(reverse, -1))
+    keep = local & (reverse >= 0) & (reverse < valid[0])
+    ref = torch.zeros((tokens, h), dtype=torch.float32)
+    for k in range(topk):
+        active = keep[:, k].nonzero().flatten()
+        ref[active] = ref[active] + linear[reverse[active, k].long()].float()
+    ref = ref.bfloat16()
+    out = torch.empty_like(ref)
+
+    def fn():
+        ep32_native_reduce(
+            staging,
+            reverse,
+            weights,
+            mask,
+            ids,
+            valid,
+            out,
+            preweighted_bf16=True,
+            reverse_masked=reverse_masked,
+            output_zeroed=output_zeroed,
+            _native_source=_NATIVE_BF16_SOURCE,
+            _reverse_source=_OPUS_REVERSE_SOURCE if verified_reverse else None,
+        )
+
+    routes = int(keep.sum())
+    written_rows = (
+        int(keep.any(dim=1).sum())
+        if tokens == 4096 and verified_reverse and output_zeroed
+        else tokens
+    )
+    # Useful input/output payload; native packet and cache-line amplification vary.
+    nbytes = (routes + written_rows) * h * 2 + ids.numel() * 4 + routes * 4
+    ret = {"gfx": get_gfx_runtime()}
+    candidates = {"eager": fn, "cudagraph": _graph_runner(fn)}
+    for name, run in candidates.items():
+        # Prezeroing is an explicit caller contract, also tested with dirty output.
+        (
+            out.zero_()
+            if output_zeroed and scenario != "untrusted"
+            else out.fill_(float("nan"))
+        )
+        _, us = run_perftest(run)
+        err = checkAllclose(
+            ref.float(), out.float(), rtol=0, atol=0, msg=f"{name}: ep32_native_reduce"
+        )
+        assert err == 0
+        assert torch.equal(ref.view(torch.int16), out.view(torch.int16))
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = routes * h / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    # Reuse the compiled handle with new device contents and no local routes.
+    ids.fill_(experts - 1)
+    if verified_reverse:
+        reverse.fill_(-1)
+    if output_zeroed and scenario != "untrusted":
+        out.zero_()
+    else:
+        out.fill_(float("nan"))
+    candidates["cudagraph"]()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(out) == 0
+    return ret
+
+
+def check_ep32_native_reduce_guards():
+    """Invalid metadata must fail before compilation, including on cached dispatch."""
+    m, h, rows, topk = 8192, 3584, 64, 16
+    base = {
+        "x": torch.empty((rows // 16, 224, 64, 4), dtype=torch.bfloat16),
+        "reverse": torch.empty((m, topk), dtype=I32),
+        "weights": torch.empty(rows, dtype=torch.float32),
+        "mask": torch.empty(896, dtype=I32),
+        "ids": torch.empty((m, topk), dtype=I32),
+        "valid": torch.tensor([rows, m], dtype=I32),
+        "out": torch.empty((m, h), dtype=torch.bfloat16),
+        "preweighted_bf16": True,
+        "reverse_masked": True,
+        "output_zeroed": True,
+        "_native_source": _NATIVE_BF16_SOURCE,
+        "_reverse_source": _OPUS_REVERSE_SOURCE,
+    }
+
+    class OversizedTensor(torch.Tensor):
+        def numel(self):
+            return 0x80000000
+
+    class OtherDeviceTensor(torch.Tensor):
+        @property
+        def device(self):
+            return torch.device("cuda", base["out"].device.index + 1)
+
+    x_unaligned = torch.empty(base["x"].numel() + 1, dtype=torch.bfloat16)[1:].view(
+        base["x"].shape
+    )
+    out_unaligned = torch.empty(m * h + 1, dtype=torch.bfloat16)[1:].view(m, h)
+    cases = {
+        "missing_native_source": {"_native_source": None},
+        "unknown_native_source": {"_native_source": object()},
+        "wrong_weighting_source": {
+            "_native_source": native_reduce_api._NATIVE_FP32_SOURCE
+        },
+        "unknown_reverse_source": {"_reverse_source": object()},
+        "nonboolean_mode": {"reverse_masked": 1},
+        "not_a_tensor": {"weights": None},
+        "row_major_staging": {"x": base["x"].view(rows, h)},
+        "wrong_fragment_shape": {"x": base["x"].view(rows // 16, 224, 32, 8)},
+        "noncontiguous_staging": {
+            "x": torch.empty((rows // 16, 224, 64, 8), dtype=torch.bfloat16)[..., ::2]
+        },
+        "wrong_staging_dtype": {"x": base["x"].float()},
+        "unaligned_staging": {"x": x_unaligned},
+        "unsupported_hidden": {"out": base["out"][:, :3583]},
+        "wrong_output_rank": {"out": base["out"].view(m, 224, 16)},
+        "wrong_output_dtype": {"out": torch.empty((m, h), dtype=torch.float32)},
+        "noncontiguous_output": {
+            "out": torch.empty((m, h * 2), dtype=torch.bfloat16)[:, ::2]
+        },
+        "unaligned_output": {"out": out_unaligned},
+        "wrong_ids_rank": {"ids": base["ids"].reshape(-1)},
+        "ids_token_mismatch": {"ids": base["ids"][:-1]},
+        "unsupported_topk": {"ids": torch.empty((m, 8), dtype=I32)},
+        "wrong_ids_dtype": {"ids": torch.empty((m, topk), dtype=torch.int64)},
+        "short_reverse": {"reverse": base["reverse"].reshape(-1)[:-1]},
+        "wrong_reverse_dtype": {"reverse": torch.empty((m, topk), dtype=torch.int64)},
+        "cpu_reverse": {"reverse": torch.empty((m, topk), device="cpu", dtype=I32)},
+        "other_gpu": {"x": base["x"].as_subclass(OtherDeviceTensor)},
+        "short_valid": {"valid": base["valid"][:1]},
+        "wrong_valid_dtype": {"valid": base["valid"].long()},
+        "wrong_mask_dtype": {"mask": torch.empty(896, dtype=torch.bool)},
+        "empty_mask": {"mask": base["mask"][:0]},
+        "wrong_weights_dtype": {"weights": base["weights"].bfloat16()},
+        "buffer_over_4gib": {"x": base["x"].as_subclass(OversizedTensor)},
+        "output_staging_alias": {"x": base["out"].view(m // 16, 224, 64, 4)},
+        "output_reverse_alias": {
+            "reverse": base["out"].view(I32).reshape(-1)[: m * topk]
+        },
+    }
+    for name, changes in cases.items():
+        with patch.object(
+            native_reduce_api, "compile_native_reduce"
+        ) as compile_spy, patch.object(
+            native_reduce_api, "_run_compiled"
+        ) as launch_spy:
+            try:
+                ep32_native_reduce(**(base | changes))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"{name}: unsupported input was accepted")
+            compile_spy.assert_not_called()
+            launch_spy.assert_not_called()
+
+    def selected(changes, gfx="gfx950"):
+        with patch.object(
+            native_reduce_api, "get_gfx_runtime", return_value=gfx
+        ), patch.object(
+            native_reduce_api, "compile_native_reduce", return_value=object()
+        ) as compile_spy, patch.object(
+            native_reduce_api, "_run_compiled"
+        ):
+            ep32_native_reduce(**(base | changes))
+            return compile_spy.call_args.args[2:]
+
+    assert selected({}) == (False, True)
+    assert selected({}, gfx="gfx942") == (False, False)
+    assert selected({"_reverse_source": None}) == (False, False)
+    assert selected({"reverse_masked": False}) == (False, False)
+    assert selected(
+        {
+            "x": base["x"].float(),
+            "preweighted_bf16": False,
+            "_native_source": native_reduce_api._NATIVE_FP32_SOURCE,
+        }
+    ) == (False, False)
+    m4096 = {
+        "out": base["out"][:4096],
+        "ids": base["ids"][:4096],
+        "reverse": base["reverse"][:4096],
+        "valid": torch.tensor([rows, 4096], dtype=I32),
+    }
+    assert selected(m4096) == (True, False)
+    assert selected(m4096 | {"output_zeroed": False}) == (False, False)
+    torch.cuda.synchronize()
+    return list(cases)
+
+
+def check_ep32_native_reduce_bad_counts(mode, which):
+    """Run in an isolated process: a GPU assertion intentionally poisons its context."""
+    m, rows = 32, 64
+    counts = {
+        "rows": [rows + 1, m],
+        "tokens": [rows, m + 1],
+        "negative_rows": [-1, m],
+        "negative_tokens": [rows, -1],
+        "valid": [rows, m],
+    }
+    valid = torch.tensor(counts[which], dtype=I32)
+
+    def invoke():
+        ep32_native_reduce(
+            x,
+            reverse,
+            weights,
+            mask,
+            ids,
+            valid,
+            out,
+            preweighted_bf16=True,
+            reverse_masked=True,
+            _native_source=_NATIVE_BF16_SOURCE,
+        )
+
+    x = torch.zeros((rows // 16, 224, 64, 4), dtype=torch.bfloat16)
+    reverse = torch.full((m, 16), -1, dtype=I32)
+    weights = torch.ones(rows, dtype=torch.float32)
+    mask = torch.ones(28, dtype=I32)
+    ids = torch.zeros((m, 16), dtype=I32)
+    out = torch.empty((m, 3584), dtype=torch.bfloat16)
+    # Isolate the count assertion from the downstream reducer and its compilation.
+    with patch.object(native_reduce_api, "_run_compiled"):
+        if mode == "graph":
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                invoke()
+            graph.replay()
+        else:
+            invoke()
+        torch.cuda.synchronize()
+
+
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
+    if get_gfx_runtime() not in SUPPORTED_GFX:
         aiter.logger.warning(
-            "flydsl MoE aux kernels unsupported on %s; skipping", get_gfx()
+            "flydsl MoE aux kernels unsupported on %s; skipping", get_gfx_runtime()
         )
         return
 
@@ -1157,6 +1438,24 @@ def main():
     parser.add_argument("--numel", type=int, nargs="*", default=[256, 4096, 65536])
     args = parser.parse_args()
     dmap = {"bf16": torch.bfloat16, "f16": torch.float16}
+
+    if get_gfx_runtime() == "gfx950":
+        checked = check_ep32_native_reduce_guards()
+        aiter.logger.info(
+            "EP32 native reduce rejected %d invalid call cases", len(checked)
+        )
+        summarize(
+            "ep32_native_reduce",
+            [
+                test_ep32_native_reduce(t, masked, zeroed, scenario)
+                for t, masked, zeroed, scenario in itertools.product(
+                    [4096, 8192],
+                    (False, True),
+                    (False, True),
+                    ("mixed", "empty", "invalid", "tail", "untrusted"),
+                )
+            ],
+        )
 
     # Keep one direct-kernel case for each meaningful extension point: the first
     # 1024-thread variant, K3's sparse production shape, and full capacity.
