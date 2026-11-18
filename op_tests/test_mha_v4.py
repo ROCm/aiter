@@ -1273,9 +1273,7 @@ def test_mha_v4_rejects_unsupported_contracts():
         (native_fp8_format(), native_fp8_format(), None),
         param(native_fp8_format(), AttentionFormat.MXFP6, None, skip=_GFX950_ONLY),
         param(AttentionFormat.MXFP4, AttentionFormat.MXFP4, None, skip=_GFX950_ONLY),
-        param(
-            AttentionFormat.MXFP6_E2M3, native_fp8_format(), None, skip=_GFX950_ONLY
-        ),
+        param(AttentionFormat.MXFP6_E2M3, native_fp8_format(), None, skip=_GFX950_ONLY),
         param(
             AttentionFormat.MXFP6_E2M3, AttentionFormat.MXFP6, None, skip=_GFX950_ONLY
         ),
