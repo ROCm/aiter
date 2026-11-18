@@ -155,6 +155,16 @@ __device__ inline void async_load_range(Mem& g, void* smem_base, const LayoutG& 
     }
 }
 
+// Issue one d-chunk whose global layout is a single-chunk layout of another buffer into
+// d-chunk SMEM_CHUNK of the shared tile (K_ROT: the rope chunk of a K tile).
+template<opus::index_t vec, int SMEM_CHUNK, typename Mem, typename LayoutG, typename LayoutS>
+__device__ inline void async_load_chunk(Mem& g, void* smem_base, const LayoutG& u_gmem, const LayoutS& u_smem, int s_os = 0) {
+    auto gmem_offsets = opus::layout_to_offsets<vec>(u_gmem);
+    auto smem_offsets = opus::layout_to_offsets<vec>(u_smem);
+    auto smem_ptr = reinterpret_cast<typename Mem::scalar_type*>(smem_base);
+    g.template async_load<vec>(reinterpret_cast<void*>(smem_ptr + smem_offsets[SMEM_CHUNK]), gmem_offsets[0], s_os);
+}
+
 
 // ─── O store layout for a WIDENED (dwordx4 / VEC_O_X4) store ───
 // The GEMM1 (swap_ab) output has head_dim along registers, but a lane holds only VEC_O
@@ -480,6 +490,8 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     int64_t q_batch_base, o_batch_base;      // Q/O base offset (excludes q_block_start & head)
     int64_t k_batch_base, v_batch_base;      // K/V base offset (excludes head)
     int64_t lse_batch_base;                  // LSE base offset (excludes q_block_start & head)
+    [[maybe_unused]] int64_t gate_batch_base;   // GATE: like O
+    [[maybe_unused]] int64_t k_rot_batch_base;  // K_ROT: like K
     int q_block_idx, h;
     if constexpr (T::GROUP_MODE) {
         // Rotated axis order (matches production asm GROUP_MODE): head=x, group=y,
@@ -500,6 +512,8 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
         k_batch_base = kpad * kargs.stride_k_n;
         v_batch_base = kpad * kargs.stride_v_n;
         lse_batch_base = qpad;                    // [H, total_q]: unit stride along the packed row
+        gate_batch_base  = qpad * kargs.stride_gate_n;
+        k_rot_batch_base = kpad * kargs.stride_k_rot_n;
         h           = block_id_x();          // head    ← hw x
         q_block_idx = block_id_z();          // Q-block ← hw z (empty tail blocks on slowest axis)
         // short-circuit: drop workgroups past this group's real Q-block count (the
@@ -516,6 +530,8 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
         k_batch_base = (int64_t)b * kargs.stride_k_b;
         v_batch_base = (int64_t)b * kargs.stride_v_b;
         lse_batch_base = (int64_t)b * kargs.stride_lse_b;
+        gate_batch_base  = (int64_t)b * kargs.stride_gate_b;
+        k_rot_batch_base = (int64_t)b * kargs.stride_k_rot_b;
         q_block_idx = block_id_x();          // config A: q-block=x, head=y, batch=z
         h = block_id_y();
     }
@@ -600,9 +616,28 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     auto k_tile_soffset = [&](int ti) { return T::LARGE_K ? 0 : ti * k_tile_stride; };
     auto v_tile_soffset = [&](int ti) { return T::LARGE_V ? 0 : ti * v_tile_stride; };
 
-    auto load_k_async = [&](void* smem, const auto& u_gk, const auto& u_sk, int ti) {
+    // K_ROT: one descriptor for this (b, h_kv)'s rope rows, tile offset in soffset. The rope
+    // rows are only 64 wide, and the host refuses extents past the 32-bit num_records.
+    [[maybe_unused]] auto g_k_rot = make_gmem(
+        reinterpret_cast<const D_ATTN*>(kargs.ptr_k_rot) + k_rot_batch_base +
+            (int64_t)h_kv * kargs.stride_k_rot_h,
+        rec_bytes(static_cast<int64_t>(seqlen_kv) * kargs.stride_k_rot_n));
+    [[maybe_unused]] const int k_rot_tile_stride = T::KV_TILE_SIZE * kargs.stride_k_rot_n;
+    constexpr int K_ROT_CHUNK = T::smem_d_rpt_qk - 1;   // d-chunk 2: dims 128..191
+    auto load_k_rot_chunk = [&](void* smem, const auto& u_gkr, const auto& u_sk, int ti) {
+        async_load_chunk<T::VEC_KV, K_ROT_CHUNK>(g_k_rot, smem, u_gkr, u_sk, ti * k_rot_tile_stride);
+    };
+
+    // Whole K tile. Under K_ROT the rope chunk comes from ptr_k_rot, still one load
+    // instruction per d-chunk, so the vmcnt bookkeeping is the same either way.
+    auto load_k_async = [&](void* smem, const auto& u_gk, const auto& u_gkr, const auto& u_sk, int ti) {
         auto&& g = k_gmem_at(ti);
-        async_load<T::VEC_KV>(g, smem, u_gk, u_sk, k_tile_soffset(ti));
+        if constexpr (T::K_ROT) {
+            async_load_range<T::VEC_KV, 0, K_ROT_CHUNK>(g, smem, u_gk, u_sk, k_tile_soffset(ti));
+            load_k_rot_chunk(smem, u_gkr, u_sk, ti);
+        } else {
+            async_load<T::VEC_KV>(g, smem, u_gk, u_sk, k_tile_soffset(ti));
+        }
     };
     auto load_v_async = [&](void* smem, const auto& u_gv, const auto& u_sv, int ti) {
         auto&& g = v_gmem_at(ti);
@@ -762,6 +797,7 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
         auto u_gq = make_layout_g<T, T::smem_d_rpt_qk, T::Q_TOTAL_TILE_SIZE>(warp_id, lane_id, kargs.stride_q_n);
         auto u_sq = make_layout_sq<T, T::smem_d_rpt_qk, T::smem_padding_16B>(warp_id);
         auto u_gk = make_layout_g<T, T::smem_d_rpt_qk, T::KV_TILE_SIZE>(warp_id, lane_id, kargs.stride_k_n);
+        [[maybe_unused]] auto u_gkr = make_layout_g<T, 1, T::KV_TILE_SIZE>(warp_id, lane_id, kargs.stride_k_rot_n);
         auto u_sk = make_layout_s<T, T::smem_d_rpt_qk, T::smem_padding_16B>(warp_id);
         auto u_gv = make_layout_g<T, T::smem_d_rpt_v, T::KV_TILE_SIZE>(warp_id, lane_id, kargs.stride_v_n);
         auto u_sv = make_layout_s<T, T::smem_d_rpt_v, T::smem_padding_64B>(warp_id);
@@ -773,6 +809,30 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
         // here, mirroring the production asm's `s_cmp_le_u32 s_KV_seq_len, 0 /
         // s_cbranch_scc1 label_write_out`.
         auto store_result = [&]() {
+            constexpr index_t VEC_X4    = T::VEC_O_X4;                                  // bf16 / dwordx4
+            constexpr index_t NUM_GROUP = o_len / VEC_X4;                               // store groups / lane
+            constexpr index_t GRP_U32   = VEC_X4 * sizeof(D_ATTN) / sizeof(opus::u32_t); // u32 regs / group
+            constexpr index_t GRP_HALF  = GRP_U32 / 2;                                  // permlane swap pairs
+            using grp_u32_t = opus::vector_t<opus::u32_t, GRP_U32>;
+
+            // GATE: the gate tile is read in the O store layout (VEC_O_X4 contiguous head
+            // dims per lane), issued first so its latency hides behind the LSE store and
+            // the 1/l scale.
+            [[maybe_unused]] grp_u32_t v_gate[NUM_GROUP];
+            if constexpr (T::GATE) {
+                const int64_t gate_gmem_offset = gate_batch_base +
+                                                 (int64_t)q_block_start * kargs.stride_gate_n +
+                                                 (int64_t)h * kargs.stride_gate_h;
+                auto g_gate = make_gmem(reinterpret_cast<const D_ATTN*>(kargs.ptr_gate) + gate_gmem_offset,
+                                        rec_bytes((int64_t)(seqlen_q - q_block_start) * kargs.stride_gate_n));
+                auto gate_offs = opus::layout_to_offsets<VEC_X4>(
+                    make_layout_o_x4<T>(warp_id, lane_id, kargs.stride_gate_n));
+                opus::static_for<NUM_GROUP>([&](auto g) {
+                    v_gate[g.value] = __builtin_bit_cast(
+                        grp_u32_t, g_gate.template load<VEC_X4>(gate_offs[g.value]));
+                });
+            }
+
             if (kargs.ptr_lse != nullptr && lane_id < T::W_M) {
                 constexpr D_ACC LN2 = D_ACC(0.69314718055994531f);   // 1 / log2(e)
                 const D_ACC lse = (l_row > D_ACC(0.0f))
@@ -790,17 +850,29 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
             // Widened store: each dwordx4 (VEC_O_X4) group is packed and stored one group
             // at a time so store(g) overlaps the cvt/permlane of group g+1 (a monolithic
             // pack would serialize that). group g owns v_o [g*VEC_O_X4, (g+1)*VEC_O_X4).
-            constexpr index_t VEC_X4    = T::VEC_O_X4;                                  // bf16 / dwordx4
-            constexpr index_t NUM_GROUP = o_len / VEC_X4;                               // store groups / lane
-            constexpr index_t GRP_U32   = VEC_X4 * sizeof(D_ATTN) / sizeof(opus::u32_t); // u32 regs / group
-            constexpr index_t GRP_HALF  = GRP_U32 / 2;                                  // permlane swap pairs
             auto u_o  = make_layout_o_x4<T>(warp_id, lane_id, kargs.stride_o_n);
             auto offs = opus::layout_to_offsets<VEC_X4>(u_o);
             auto g_o  = make_gmem(reinterpret_cast<D_ATTN*>(kargs.ptr_o) + o_gmem_offset, o_num_records);
             opus::static_for<NUM_GROUP>([&](auto g) {
                 auto grp_f  = slice(v_o, number<g.value * VEC_X4>{}, number<g.value * VEC_X4 + VEC_X4>{});
+                if constexpr (T::GATE) {
+                    // The swap below is its own inverse, so applying it to the gate tile
+                    // brings it from the store layout back to the accumulator layout;
+                    // the gate is then applied in fp32 and O is rounded to bf16 once.
+                    grp_u32_t gg = v_gate[g.value];
+                    opus::static_for<GRP_HALF>([&](auto i) {
+                        opus::vector_t<opus::u32_t, 2> s =
+                            __builtin_amdgcn_permlane32_swap(gg[i.value], gg[i.value + GRP_HALF], false, true);
+                        gg[i.value] = s.x; gg[i.value + GRP_HALF] = s.y;
+                    });
+                    auto gf = opus::cast<D_ACC>(__builtin_bit_cast(opus::vector_t<D_ATTN, VEC_X4>, gg));
+                    opus::static_for<VEC_X4>([&](auto j) {
+                        grp_f[j.value] *= __builtin_amdgcn_rcpf(
+                            D_ACC(1.0f) + __builtin_amdgcn_exp2f(-LOG2_E * gf[j.value]));
+                    });
+                }
                 auto grp_bf = opus::cast<D_ATTN>(grp_f);
-                auto gu = __builtin_bit_cast(opus::vector_t<opus::u32_t, GRP_U32>, grp_bf);
+                auto gu = __builtin_bit_cast(grp_u32_t, grp_bf);
                 // Swap this lane's high head_dim half [GRP_HALF, GRP_U32) with the lane±32
                 // partner's low half so each half ends up holding VEC_O contiguous head_dim
                 // → together VEC_O_X4 contiguous per lane.
@@ -895,6 +967,9 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
             const int k_pf_os = k_tile_soffset(k_pf_ti);
             if constexpr(STAGGER) {
                 async_load_range<T::VEC_KV, 0, 1>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, k_pf_os);
+            } else if constexpr (T::K_ROT) {
+                async_load_range<T::VEC_KV, 0, K_ROT_CHUNK>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, k_pf_os);
+                load_k_rot_chunk(s_k[cur].ptr, u_gkr, u_sk, k_pf_ti);
             } else {
                 async_load<T::VEC_KV>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, k_pf_os);
             }
@@ -938,7 +1013,12 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
             // stage6 [mem]: read V(t-1) su1; (stagger only) issue the remaining 2 K(t+2) d-chunks.
             v_v = tr_load<T::VEC_TR_V>(s_v[prev], u_rv + V_SU1_OFF);
             if constexpr(STAGGER) {
-                async_load_range<T::VEC_KV, 1, 3>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, k_pf_os);
+                if constexpr (T::K_ROT) {
+                    async_load_range<T::VEC_KV, 1, K_ROT_CHUNK>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, k_pf_os);
+                    load_k_rot_chunk(s_k[cur].ptr, u_gkr, u_sk, k_pf_ti);
+                } else {
+                    async_load_range<T::VEC_KV, 1, 3>(g_k_pf, s_k[cur].ptr, u_gk, u_sk, k_pf_os);
+                }
             }
             s_waitcnt_lgkmcnt(0_I);
             s_waitcnt_vmcnt(number<T::KEEP_VMCNT>{});
@@ -976,13 +1056,13 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     // free, so K2 is prefetched into K0's buffer (2-tile-ahead, still 2 K buffers).
 
     async_load<T::VEC_Q>(g_q, s_q.ptr, u_gq, u_sq, 0);
-    load_k_async(s_k[0].ptr, u_gk, u_sk, tile_idx(0));
+    load_k_async(s_k[0].ptr, u_gk, u_gkr, u_sk, tile_idx(0));
     // clear(v_o);
     s_waitcnt_vmcnt(number<T::k_buffer_load_insts>{}); // wait vmem-Q
     stage_end();
     
     v_q = load<T::VEC_Q>(s_q, u_rq);
-    load_k_async(s_k[1].ptr, u_gk, u_sk, tile_idx(min(1, max_num_tiles - 1)));
+    load_k_async(s_k[1].ptr, u_gk, u_gkr, u_sk, tile_idx(min(1, max_num_tiles - 1)));
     s_waitcnt_lgkmcnt(0_I); // wait LDS-Q, mem-Q release
     s_waitcnt_vmcnt(number<T::k_buffer_load_insts>{}); // wait vmem-K.blk[0]
     stage_end();
@@ -1029,7 +1109,7 @@ __device__ __attribute__((always_inline)) void gqa_d192_v128_impl(opus_gqa_d192_
     stage_end();
     // Safe to reuse K0's buffer for K2 now: the barrier above synced all waves after the
     // last K0 read (see RACE NOTE at top).
-    load_k_async(s_k[0].ptr, u_gk, u_sk, tile_idx(min(2, max_num_tiles - 1)));
+    load_k_async(s_k[0].ptr, u_gk, u_gkr, u_sk, tile_idx(min(2, max_num_tiles - 1)));
 
     stage_end(); //wait mem-K.blk[1]
 

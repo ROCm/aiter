@@ -23,7 +23,8 @@ import torch
 import torch.nn.functional as F
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.gated_mla_train import gated_mla_train
+from aiter.ops.gated_mla_train import _gated_mla_fwd, gated_mla_train
+from aiter.ops.mha import fmha_fwd_bf16_opus_varlen_fwd
 
 HIDDEN = 7168
 HEADS = 96
@@ -174,6 +175,80 @@ def test_gated_mla_train_random_weights(seqlens):
 @pytest.mark.parametrize("layer", [3, 7, 11])
 def test_gated_mla_train_tiny_l13(layer):
     _run_parity(_tiny_l13_weights(layer), [1000, 3000, 513])
+
+
+# Kernel-level forward: lengths around the 64-row KV tile and the 256-row Q block.
+_FWD_SEQLENS = [[2048], [1000, 3000, 513], [1, 63, 64, 65, 255, 257, 700]]
+_FWD_IDS = [f"b{len(s)}_max{max(s)}" for s in _FWD_SEQLENS]
+SCALE = (D_NOPE + D_ROT) ** -0.5
+# Measured on MI350X: out passes at atol 5e-3 with rtol <= 2.3e-3; LSE is off by <= 2e-6.
+FWD_ATOL, FWD_RTOL, LSE_ATOL = 5e-3, 1e-2, 1e-4
+
+
+def _fwd_inputs(seqlens, seed=0):
+    torch.manual_seed(seed)
+    cu = torch.tensor(
+        [0, *itertools.accumulate(seqlens)], dtype=torch.int32, device="cuda"
+    )
+    t = int(cu[-1])
+    bf = torch.bfloat16
+    q = torch.randn(t, HEADS, D_NOPE + D_ROT, device="cuda", dtype=bf)
+    kv = torch.randn(t, HEADS, D_NOPE + D_V, device="cuda", dtype=bf)
+    # k_rot as the module produces it: a strided view of the kv_a_proj_with_mqa output.
+    k_rot = torch.randn(t, KV_LORA + D_ROT, device="cuda", dtype=bf)[:, KV_LORA:]
+    gate = 2 * torch.randn(t, HEADS * D_V, device="cuda", dtype=bf)
+    return cu, max(seqlens), q, kv, k_rot, gate
+
+
+def _expanded_kv(kv, k_rot):
+    t = kv.shape[0]
+    k_nope, v = kv.split([D_NOPE, D_V], dim=-1)
+    k = torch.cat([k_nope, k_rot.unsqueeze(1).expand(t, HEADS, D_ROT)], dim=-1)
+    return k, v.contiguous()
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("seqlens", _FWD_SEQLENS, ids=_FWD_IDS)
+def test_gated_mla_fwd_matches_opus_mha(seqlens, causal):
+    """With sigmoid(gate) == 1 the gated kernel must reproduce the OPUS MHA kernel on a
+    materialized K bit for bit: only where K's two parts are read from differs."""
+    cu, smax, q, kv, k_rot, _ = _fwd_inputs(seqlens)
+    gate = torch.full((q.shape[0], HEADS * D_V), 100.0, device="cuda", dtype=q.dtype)
+    out, lse = _gated_mla_fwd(q, kv, k_rot, gate, cu, smax, SCALE, causal, True)
+    k, v = _expanded_kv(kv, k_rot)
+    ref_out, ref_lse = fmha_fwd_bf16_opus_varlen_fwd(
+        q, k, v, SCALE, causal, cu, cu, smax, smax, return_lse=True
+    )
+    assert torch.equal(out, ref_out)
+    assert torch.equal(lse, ref_lse)
+
+
+def _ref_attention(q, k, v, gate, cu, causal):
+    """fp32 per-sequence attention: gated output [T, H, D_V] and LSE [H, T]."""
+    q, k, v, gate = (x.float() for x in (q, k, v, gate))
+    out = torch.empty(q.shape[0], HEADS, D_V, device=q.device)
+    lse = torch.empty(HEADS, q.shape[0], device=q.device)
+    for b in range(cu.numel() - 1):
+        rows = slice(int(cu[b]), int(cu[b + 1]))
+        s = rows.stop - rows.start
+        scores = torch.einsum("qhd,khd->hqk", q[rows], k[rows]) * SCALE
+        if causal:
+            mask = torch.ones(s, s, dtype=torch.bool, device=q.device).triu(1)
+            scores = scores.masked_fill(mask, float("-inf"))
+        lse[:, rows] = torch.logsumexp(scores, dim=-1)
+        out[rows] = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v[rows])
+    return out * gate.view(out.shape).sigmoid(), lse
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("seqlens", _FWD_SEQLENS, ids=_FWD_IDS)
+def test_gated_mla_fwd_reference(seqlens, causal):
+    """Gated output and LSE against fp32, within a bf16 output's rounding."""
+    cu, smax, q, kv, k_rot, gate = _fwd_inputs(seqlens)
+    out, lse = _gated_mla_fwd(q, kv, k_rot, gate, cu, smax, SCALE, causal, True)
+    ref_out, ref_lse = _ref_attention(q, *_expanded_kv(kv, k_rot), gate, cu, causal)
+    torch.testing.assert_close(out.float(), ref_out, atol=FWD_ATOL, rtol=FWD_RTOL)
+    torch.testing.assert_close(lse, ref_lse, atol=LSE_ATOL, rtol=0)
 
 
 if __name__ == "__main__":

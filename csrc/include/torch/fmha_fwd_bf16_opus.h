@@ -58,3 +58,26 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             int max_seqlen_q                         = 0,
                             int max_seqlen_k                         = 0,
                             int window_size_left                     = -1);
+
+// Gated MLA forward (Kimi-K3 full-attention layers) on the D_QK=192 / D_V=128 kernel,
+// group / varlen only. K is not materialized: its dims 0..127 come from `k_nope` and its
+// dims 128..191 from `k_rot`, which every head shares. `k_nope` and `v` may be strided
+// views of one kv_b_proj output. The epilogue writes out = O * sigmoid(gate).
+//   q      [total_q, H, 192]        k_nope [total_k, H_KV, 128]   v [total_k, H_KV, 128]
+//   k_rot  [total_k, 64]            gate / out [total_q, H, 128]
+//   lse    [H, total_q] fp32, of the ungated attention; std::nullopt skips it
+// All bf16, contiguous along the head dim, 16-byte aligned rows. seqstart_q / seqstart_k
+// are int32 cumulative lengths [num_seqs + 1].
+void gated_mla_fwd_bf16_opus(at::Tensor& q,
+                             at::Tensor& k_nope,
+                             at::Tensor& v,
+                             at::Tensor& k_rot,
+                             at::Tensor& gate,
+                             at::Tensor& out,
+                             std::optional<at::Tensor> lse,
+                             at::Tensor& seqstart_q,
+                             at::Tensor& seqstart_k,
+                             int max_seqlen_q,
+                             int max_seqlen_k,
+                             bool causal,
+                             float softmax_scale);

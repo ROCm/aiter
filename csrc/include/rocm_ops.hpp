@@ -1623,7 +1623,22 @@ namespace py = pybind11;
           py::arg("seqstart_k_pad")   = std::nullopt, \
           py::arg("max_seqlen_q")     = 0,            \
           py::arg("max_seqlen_k")     = 0,            \
-          py::arg("window_size_left") = -1);
+          py::arg("window_size_left") = -1);          \
+    m.def("gated_mla_fwd_bf16_opus",                  \
+          &gated_mla_fwd_bf16_opus,                   \
+          py::arg("q"),                               \
+          py::arg("k_nope"),                          \
+          py::arg("v"),                               \
+          py::arg("k_rot"),                           \
+          py::arg("gate"),                            \
+          py::arg("out"),                             \
+          py::arg("lse"),                             \
+          py::arg("seqstart_q"),                      \
+          py::arg("seqstart_k"),                      \
+          py::arg("max_seqlen_q"),                    \
+          py::arg("max_seqlen_k"),                    \
+          py::arg("causal"),                          \
+          py::arg("softmax_scale"));
 
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \

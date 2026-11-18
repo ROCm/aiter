@@ -14,30 +14,203 @@ rotary on the attention path (NoPE) and an elementwise sigmoid output gate. Per 
 
 ``out`` is the ``o_proj`` input. The q / kv down-projections, their RMSNorms,
 ``q_b_proj``, ``g_proj`` and ``o_proj`` stay with the caller.
+
+The forward runs on the gfx950 OPUS D_QK=192 / D_V=128 kernel: it reads ``k_nope`` and
+``v`` straight out of the ``kv_b_proj`` output and ``k_rot`` from its own buffer, so K is
+never concatenated, and it applies the gate before the O store. Only ``kv_latent`` is kept
+for the backward, which recomputes the expansion.
 """
 
 import torch
-import torch.nn.functional as F
+from torch import Tensor
 
-from .mha import flash_attn_varlen_func
+from ..jit.core import compile_ops
+from ..jit.utils.chip_info import get_gfx
+from .mha import _flash_attn_varlen_backward
 
 
-class _SigmoidGate(torch.autograd.Function):
-    """``o * sigmoid(gate)``; backward keeps only the two inputs."""
+def _gated_mla_fwd_bf16_opus_fake(
+    q: Tensor,
+    k_nope: Tensor,
+    v: Tensor,
+    k_rot: Tensor,
+    gate: Tensor,
+    out: Tensor,
+    lse: Tensor | None,
+    seqstart_q: Tensor,
+    seqstart_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    causal: bool,
+    softmax_scale: float,
+) -> None:
+    return None
 
+
+# Writes `out` (and `lse`, when given) in place.
+@compile_ops(
+    "module_fmha_fwd_bf16_opus",
+    fc_name="gated_mla_fwd_bf16_opus",
+    gen_fake=_gated_mla_fwd_bf16_opus_fake,
+)
+def _gated_mla_fwd_bf16_opus(
+    q: Tensor,
+    k_nope: Tensor,
+    v: Tensor,
+    k_rot: Tensor,
+    gate: Tensor,
+    out: Tensor,
+    lse: Tensor | None,
+    seqstart_q: Tensor,
+    seqstart_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    causal: bool,
+    softmax_scale: float,
+) -> None: ...
+
+
+def _kernel_ready(x: Tensor) -> Tensor:
+    """`x` if the kernel's 16-byte row loads can read it as is, else a contiguous copy."""
+    aligned = x.stride(-1) == 1 and x.data_ptr() % 16 == 0
+    aligned = aligned and all(s % 8 == 0 for s in x.stride()[:-1])
+    return x if aligned else x.contiguous()
+
+
+def _gated_mla_fwd(
+    q: Tensor,
+    kv: Tensor,
+    k_rot: Tensor,
+    gate: Tensor,
+    cu_seqlens: Tensor,
+    max_seqlen: int,
+    softmax_scale: float,
+    causal: bool,
+    return_lse: bool,
+) -> tuple[Tensor, Tensor | None]:
+    """Fused attention + gate on the expanded ``kv`` ``[T, H, d_nope + d_v]``.
+
+    Returns ``out [T, H, d_v]`` and, when ``return_lse``, the ungated attention's
+    log-sum-exp ``[H, T]`` (fp32, natural log).
+    """
+    t, h, d_qk = q.shape
+    d_nope = d_qk - k_rot.shape[-1]
+    d_v = kv.shape[-1] - d_nope
+    out = torch.empty(t, h, d_v, dtype=q.dtype, device=q.device)
+    lse = (
+        torch.empty(h, t, dtype=torch.float32, device=q.device) if return_lse else None
+    )
+    _gated_mla_fwd_bf16_opus(
+        _kernel_ready(q),
+        kv[..., :d_nope],
+        kv[..., d_nope:],
+        _kernel_ready(k_rot),
+        _kernel_ready(gate.reshape(t, h, d_v)),
+        out,
+        lse,
+        cu_seqlens,
+        cu_seqlens,
+        int(max_seqlen),
+        int(max_seqlen),
+        bool(causal),
+        float(softmax_scale),
+    )
+    return out, lse
+
+
+class _GatedMLA(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, o, gate):
-        ctx.save_for_backward(o, gate)
-        return (o.float() * torch.sigmoid(gate.float())).to(o.dtype)
+    def forward(
+        ctx,
+        q,
+        kv_latent,
+        k_rot,
+        kv_b_weight,
+        gate,
+        cu_seqlens,
+        max_seqlen,
+        scale,
+        causal,
+    ):
+        t, h, _ = q.shape
+        cu_seqlens = cu_seqlens.to(torch.int32).contiguous()
+        kv = torch.mm(kv_latent, kv_b_weight.t()).view(t, h, -1)
+        out, lse = _gated_mla_fwd(
+            q,
+            kv,
+            k_rot,
+            gate,
+            cu_seqlens,
+            max_seqlen,
+            scale,
+            causal,
+            return_lse=any(ctx.needs_input_grad),
+        )
+        ctx.save_for_backward(
+            q, kv_latent, k_rot, kv_b_weight, gate, out, lse, cu_seqlens
+        )
+        ctx.max_seqlen, ctx.scale, ctx.causal = max_seqlen, scale, causal
+        return out.view(t, -1)
 
     @staticmethod
     def backward(ctx, dout):
-        o, gate = ctx.saved_tensors
-        s = torch.sigmoid(gate.float())
-        dout = dout.float()
-        do = dout * s
-        dgate = dout * o.float() * s * (1.0 - s)
-        return do.to(o.dtype), dgate.to(gate.dtype)
+        q, kv_latent, k_rot, kv_b_weight, gate, out, lse, cu_seqlens = ctx.saved_tensors
+        t, h, d_qk = q.shape
+        d_rot = k_rot.shape[-1]
+        d_nope = d_qk - d_rot
+        kv = torch.mm(kv_latent, kv_b_weight.t()).view(t, h, -1)
+        k_nope, v = kv.split([d_nope, kv.shape[-1] - d_nope], dim=-1)
+        k = torch.cat([k_nope, k_rot.unsqueeze(1).expand(t, h, d_rot)], dim=-1)
+        v = v.contiguous()
+
+        dout = dout.view(out.shape).float()
+        out_f = out.float()
+        s = torch.sigmoid(gate.reshape(out.shape).float())
+        dgate = (dout * out_f * (1.0 - s)).to(gate.dtype)
+        do = (dout * s).to(q.dtype)
+        # The CK backward forms D = rowsum(dO * O) from the (dO, O) it is given, so it gets
+        # O = out / sigmoid(gate): that keeps D = rowsum(dout * out) without saving the
+        # ungated O. Where the sigmoid underflows to 0, dO is 0 and O does not matter.
+        o = torch.where(s > 0, out_f / s, 0.0).to(q.dtype)
+
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        _flash_attn_varlen_backward(
+            do,
+            q,
+            k,
+            v,
+            o,
+            lse,
+            dq,
+            dk,
+            dv,
+            cu_seqlens,
+            cu_seqlens,
+            ctx.max_seqlen,
+            ctx.max_seqlen,
+            0.0,
+            ctx.scale,
+            ctx.causal,
+            -1,
+            -1,
+            None,
+            False,
+        )
+        dkv = torch.cat([dk[..., :d_nope], dv], dim=-1).view(t, -1)
+        d_latent = torch.mm(dkv, kv_b_weight)
+        d_weight = torch.mm(dkv.t(), kv_latent)
+        dk_rot = dk[..., d_nope:].float().sum(1).to(k_rot.dtype)
+        return (
+            dq,
+            d_latent,
+            dk_rot,
+            d_weight,
+            dgate.view_as(gate),
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def gated_mla_train(
@@ -64,7 +237,8 @@ def gated_mla_train(
     max_seqlen  : longest sequence in the batch.
     softmax_scale : defaults to ``(d_nope + d_rot) ** -0.5``.
 
-    Returns ``[T, H * d_v]`` in ``q.dtype``.
+    BF16 on gfx950, with (d_nope, d_rot, d_v) = (128, 64, 128). Returns
+    ``[T, H * d_v]`` in ``q.dtype``.
     """
     t, h, d_qk = q.shape
     d_rot = k_rot.shape[-1]
@@ -82,22 +256,22 @@ def gated_mla_train(
         raise ValueError(f"k_rot shape {tuple(k_rot.shape)} != {(t, d_rot)}")
     if gate.shape != (t, h * d_v):
         raise ValueError(f"gate shape {tuple(gate.shape)} != {(t, h * d_v)}")
+    if (d_nope, d_rot, d_v) != (128, 64, 128):
+        raise ValueError(
+            f"(d_nope, d_rot, d_v) = {(d_nope, d_rot, d_v)}, only (128, 64, 128) is supported"
+        )
+    if get_gfx() != "gfx950":
+        raise NotImplementedError(f"gated_mla_train needs gfx950, got {get_gfx()}")
     if softmax_scale is None:
         softmax_scale = d_qk**-0.5
-
-    kv = F.linear(kv_latent, kv_b_weight).view(t, h, d_nope + d_v)
-    k_nope, v = kv.split([d_nope, d_v], dim=-1)
-    k = torch.cat([k_nope, k_rot.unsqueeze(1).expand(t, h, d_rot)], dim=-1)
-    o, _ = flash_attn_varlen_func(
+    return _GatedMLA.apply(
         q,
-        k,
-        v.contiguous(),
-        cu_seqlens,
+        kv_latent,
+        k_rot,
+        kv_b_weight,
+        gate,
         cu_seqlens,
         max_seqlen,
-        max_seqlen,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        return_lse=True,
+        softmax_scale,
+        causal,
     )
-    return _SigmoidGate.apply(o.reshape(t, h * d_v), gate)

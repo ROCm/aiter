@@ -84,6 +84,15 @@ struct fmha_fwd_bf16_opus_args
     // keep the rectangular grid.
     int total_q = 0;
 
+    // Gated MLA, (hdim_q, hdim_v) = (192, 128) only, set together or not at all.
+    // gate_ptr: sigmoid output gate with O's [.., H, D_V] layout, applied before the store.
+    // k_rot_ptr: K dims 128..191 ([.., H_KV, 64], stride_k_rot_h may be 0 to share one rope
+    // key across heads); k_ptr then supplies dims 0..127 only.
+    const void* gate_ptr  = nullptr;
+    const void* k_rot_ptr = nullptr;
+    int stride_gate_b = 0, stride_gate_n = 0, stride_gate_h = 0;
+    int stride_k_rot_b = 0, stride_k_rot_n = 0, stride_k_rot_h = 0;
+
     std::string data_type = "bf16";
 };
 
@@ -302,6 +311,28 @@ inline bool launch_d192_v128(const fmha_fwd_bf16_opus_args& a, hipStream_t strea
     kargs.ptr_seqstart_q_pad = a.seqstart_q_pad_ptr;
     kargs.ptr_seqstart_k_pad = a.seqstart_k_pad_ptr;
 
+    const bool gated = (a.gate_ptr != nullptr);
+    if(gated != (a.k_rot_ptr != nullptr))
+    {
+        return false;
+    }
+    if(gated)
+    {
+        // The rope buffer keeps one descriptor per (b, h_kv); see the kernel's g_k_rot.
+        if(static_cast<long long>(a.seqlen_k) * a.stride_k_rot_n * 2LL >= (1LL << 32))
+        {
+            return false;
+        }
+        kargs.ptr_gate       = a.gate_ptr;
+        kargs.stride_gate_b  = a.stride_gate_b;
+        kargs.stride_gate_n  = a.stride_gate_n;
+        kargs.stride_gate_h  = a.stride_gate_h;
+        kargs.ptr_k_rot      = a.k_rot_ptr;
+        kargs.stride_k_rot_b = a.stride_k_rot_b;
+        kargs.stride_k_rot_n = a.stride_k_rot_n;
+        kargs.stride_k_rot_h = a.stride_k_rot_h;
+    }
+
     // Head/tail merge (causal load balance): the host is the single source of truth; the
     // kernel reads the OPT_MERGE_HEADTAIL bit and never recomputes it.
     const long long full_wgs = static_cast<long long>(num_q_blocks) * a.nhead * a.batch;
@@ -347,6 +378,28 @@ inline bool launch_d192_v128(const fmha_fwd_bf16_opus_args& a, hipStream_t strea
                 launch(opus_gqa_d192_traits<32, 64, 8, false, false, LK, LV>{});
         }
     };
+
+    if(gated)
+    {
+        // Gated MLA is group mode only. Its nope K and V are views of one kv_b_proj output,
+        // so they cross the 32-bit extent together and need no mixed (LK, LV) form.
+        if(!is_group || large_k != large_v)
+        {
+            return false;
+        }
+        auto launch_gated = [&](auto large_tag) {
+            constexpr bool L = decltype(large_tag)::value;
+            if(a.causal)
+                launch(opus_gqa_d192_traits<32, 64, 8, true, true, L, L, true, true>{});
+            else
+                launch(opus_gqa_d192_traits<32, 64, 8, false, true, L, L, true, true>{});
+        };
+        if(large_k)
+            launch_gated(std::true_type{});
+        else
+            launch_gated(std::false_type{});
+        return true;
+    }
 
     // (small K, large V) needs strides that invert the usual 192/128 row widths; rebasing K
     // too is still correct there, so it folds into the all-large form rather than costing a

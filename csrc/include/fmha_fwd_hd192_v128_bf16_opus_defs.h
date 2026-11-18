@@ -63,6 +63,20 @@ struct opus_gqa_d192_kargs {
     void* __restrict__ ptr_lse;
     int stride_lse_b;
     int stride_lse_h;
+    // ── gated MLA (read only by the GATE / K_ROT instantiations) ──
+    // gate: sigmoid output gate, multiplied into O before the store. Same row / head
+    // addressing as O, [B, N, H, D_V] or packed [total_q, H, D_V].
+    const void* __restrict__ ptr_gate;
+    int stride_gate_b;
+    int stride_gate_n;
+    int stride_gate_h;
+    // k_rot: K's last 64 dims, read from their own buffer instead of from ptr_k, so the
+    // 128-wide nope part can be a strided view of the kv_b_proj output and the rope part
+    // can be shared by every head (stride_k_rot_h == 0). K rows follow ptr_k's row index.
+    const void* __restrict__ ptr_k_rot;
+    int stride_k_rot_b;
+    int stride_k_rot_n;
+    int stride_k_rot_h;
 };
 
 // opus_gqa_d192_kargs::opt bit flags.
@@ -86,13 +100,17 @@ static constexpr int HEADTAIL_MIN_WG = 512;
 // span is 1.5x V's at (D_QK, D_V) = (192, 128), so K crosses 4GiB at two thirds the seqlen
 // V does and there is a band where only K needs rebasing. The host picks both from the
 // actual extents, so shapes under 4GiB do not pay for the large-KV support.
+// GATE_ multiplies O by sigmoid(gate) in the epilogue. K_ROT_ reads K's last d-chunk
+// (dims 128..191) from ptr_k_rot; ptr_k then only supplies dims 0..127.
 template<int Q_TILE_SIZE_ = 32,
          int KV_TILE_SIZE_ = 64,
          int NUM_WARPS_ = 8,
          bool CAUSAL_ = false,
          bool GROUP_MODE_ = false,
          bool LARGE_K_ = true,
-         bool LARGE_V_ = true>
+         bool LARGE_V_ = true,
+         bool GATE_ = false,
+         bool K_ROT_ = false>
 struct opus_gqa_d192_traits {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
@@ -103,6 +121,8 @@ struct opus_gqa_d192_traits {
     static constexpr bool GROUP_MODE  = GROUP_MODE_;
     static constexpr bool LARGE_K     = LARGE_K_;
     static constexpr bool LARGE_V     = LARGE_V_;
+    static constexpr bool GATE        = GATE_;
+    static constexpr bool K_ROT       = K_ROT_;
     static constexpr int Q_TOTAL_TILE_SIZE  = Q_TILE_SIZE * NUM_WARPS; // 256
 
     static constexpr int WARP_SIZE  = 64; // AMD wavefront size
