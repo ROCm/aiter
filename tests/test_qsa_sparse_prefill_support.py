@@ -436,6 +436,19 @@ def test_the_first_broken_rule_is_reported_and_raised(monkeypatch, rejected):
     assert str(raised.value) == rejected.message
 
 
+def out_in_kv_gap():
+    """K/V rows 32768 elements apart (HK 1) and an out in the padding after row 0:
+    byte offset 2048, 16-byte aligned, inside K's bounding span but off every row."""
+    stride = 32768
+    k = zeros(ROWS * stride)
+    out = k[1024 : 1024 + ROWS * GROUP * DIM].view(ROWS, GROUP, DIM)
+    return {
+        "k": k.as_strided((ROWS, 1, DIM), (stride, DIM, 1)),
+        "v": rows_of(stride),
+        "out": out,
+    }
+
+
 def accepted(name, changes, **kwargs):
     return pytest.param(Case(changes, "", **kwargs), id=name)
 
@@ -468,6 +481,7 @@ ACCEPTED = [
     ),
     accepted("out_apart", lambda: {"out": zeros(ROWS, GROUP, DIM)}),
     accepted("interleaved_on_gfx950", dict, base=interleaved),
+    accepted("out_in_the_gap_between_kv_rows", out_in_kv_gap),
     accepted("group_16", lambda: {"q": zeros(ROWS, 16, DIM)}),
     accepted(
         "topk_1024", lambda: {"indices": zeros(ROWS, 4 * 1024 + 3, dtype=torch.int32)}

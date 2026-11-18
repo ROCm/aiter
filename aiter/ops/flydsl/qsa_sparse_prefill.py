@@ -424,17 +424,26 @@ def _check_call(
         ):
             return _Rejected(ValueError, "out must be aligned, contiguous and match Q")
         begin, end = out.data_ptr(), out.data_ptr() + out.numel() * out.element_size()
-        # Strided K/V rows span more bytes than they hold.
-        kv_bytes = _span_bytes(k.shape[0], stride, k.shape[1])
-        sources = [(k.data_ptr(), kv_bytes), (v.data_ptr(), kv_bytes)] + [
-            (source.data_ptr(), source.numel() * source.element_size())
-            for source in (q, indices) + (() if kv_slots is None else (kv_slots,))
-        ]
-        for pointer, size in sources:
-            if begin < pointer + size and pointer < end:
-                return _Rejected(
-                    ValueError, "out must not overlap Q/K/V, indices or kv_slots"
-                )
+        # Strided K/V rows hold hk * 512 bytes every stride * 2 bytes; the padding
+        # between rows is not read, so only the rows themselves are checked.
+        row_bytes, row_step = k.shape[1] * 512, stride * 2
+        overlaps = False
+        for tensor in (k, v):
+            # Rows r with begin < start + r * step + row_bytes, start + r * step < end.
+            first = max(0, (begin - tensor.data_ptr() - row_bytes) // row_step + 1)
+            last = min(k.shape[0] - 1, (end - tensor.data_ptr() - 1) // row_step)
+            overlaps = overlaps or first <= last
+        for source in (q, indices) + (() if kv_slots is None else (kv_slots,)):
+            pointer = source.data_ptr()
+            if (
+                begin < pointer + source.numel() * source.element_size()
+                and pointer < end
+            ):
+                overlaps = True
+        if overlaps:
+            return _Rejected(
+                ValueError, "out must not overlap Q/K/V, indices or kv_slots"
+            )
     return _Checked(scale, query_lens, prefix_lens, stride, topk)
 
 
