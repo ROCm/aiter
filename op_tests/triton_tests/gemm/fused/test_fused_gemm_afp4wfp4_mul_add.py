@@ -20,16 +20,10 @@ from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
 from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
     run_torch as run_torch_gemm_afp4wfp4,
 )
+from op_tests.triton_tests.gemm.gemm_shapes import FUSED_GEMM_AFP4WFP4_MUL_ADD
 
 
-def get_x_vals():
-
-    x_vals = [(v, 7168, 256) for v in [1, 2, 4, 8, 16, 31, 32, 1024]]
-    # x_vals += [(1, 1, 32)]  # minimal case
-    return x_vals
-
-
-@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("M, N, K", FUSED_GEMM_AFP4WFP4_MUL_ADD)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN"])
 @pytest.mark.parametrize("output", [True, False])
