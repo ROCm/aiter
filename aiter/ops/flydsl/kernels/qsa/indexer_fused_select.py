@@ -142,9 +142,15 @@ def build_qsa_indexer_fused_select_module(
         visible: fx.Array[Int32, block_m, 16]
         req: fx.Array[Int32, block_m, 16]
         live: fx.Array[Int32, block_n, 16]
-        # fp32 comparison state for the 16-row top-512. 32 KiB.
+        # fp32 scores and 16-bit-fit offsets for the 16-row top-512.
+        # Scores are 32 KiB. Offsets stay in LDS so an eviction does not
+        # reload them from the global candidate buffer.
         cand: fx.Array[Float32, block_m * _K, 16]
+        off: fx.Array[Int32, block_m * _K, 16]
         count: fx.Array[Int32, block_m, 16]
+        worst_score: fx.Array[Float32, block_m, 16]
+        worst_off: fx.Array[Int32, block_m, 16]
+        worst_slot: fx.Array[Int32, block_m, 16]
         tile_scores: fx.Array[Float32, tile_score_elems, 16]
 
     @flyc.kernel(
@@ -218,7 +224,11 @@ def build_qsa_indexer_fused_select_module(
         req_lds = storage.req.view(fx.make_layout(block_m, 1))
         live_lds = storage.live.view(fx.make_layout(block_n, 1))
         cand_lds = storage.cand.view(fx.make_layout((block_m, _K), (_K, 1)))
+        off_lds = storage.off.view(fx.make_layout((block_m, _K), (_K, 1)))
         count_lds = storage.count.view(fx.make_layout(block_m, 1))
+        worst_score_lds = storage.worst_score.view(fx.make_layout(block_m, 1))
+        worst_off_lds = storage.worst_off.view(fx.make_layout(block_m, 1))
+        worst_slot_lds = storage.worst_slot.view(fx.make_layout(block_m, 1))
         tile_scores = storage.tile_scores.view(
             fx.make_layout((block_m, block_n), (block_n, 1))
         )
@@ -255,6 +265,12 @@ def build_qsa_indexer_fused_select_module(
             for slot in range(Int32(_K)):
                 cand_lds[tid, Int32(slot)] = neg
             count_lds[tid] = zero
+            # Larger than any ReLU score, so the first finite score becomes
+            # the worst entry. A later score replaces it only when it is
+            # strictly better, or equal with a smaller offset.
+            worst_score_lds[tid] = Float32(1.0e30)
+            worst_off_lds[tid] = zero
+            worst_slot_lds[tid] = zero
         # Every live row starts empty. The histogram bins are exactly the
         # workgroup, so each thread clears one bin of every row in the tile.
         for r in range_constexpr(block_m):
@@ -431,7 +447,9 @@ def build_qsa_indexer_fused_select_module(
 
                         # One thread per row inserts this tile. A smaller
                         # offset wins an exact fp32 tie, matching the oracle's
-                        # stable argsort.
+                        # stable argsort. Once 512 slots are full, a score that
+                        # does not beat the current worst is rejected without
+                        # walking the list.
                         if tid < Int32(block_m):
                             row_i = row_tile * Int32(block_m) + tid
                             if row_i < rows:
@@ -444,37 +462,31 @@ def build_qsa_indexer_fused_select_module(
                                             tile_t * Int32(block_n) + c_i - split_begin
                                         )
                                         cnt = count_lds[tid]
+                                        worst_score = worst_score_lds[tid]
+                                        worst_off = worst_off_lds[tid]
                                         if cnt < Int32(_K):
                                             cand_lds[tid, cnt] = sc
-                                            candidates[row_i, cnt] = offset
+                                            off_lds[tid, cnt] = offset
+                                            entered = (cnt == zero) | (
+                                                (sc < worst_score)
+                                                | (
+                                                    (sc == worst_score)
+                                                    & (offset > worst_off)
+                                                )
+                                            )
+                                            if entered:
+                                                worst_score_lds[tid] = sc
+                                                worst_off_lds[tid] = offset
+                                                worst_slot_lds[tid] = cnt
                                             count_lds[tid] = cnt + one
                                             _hist_add(histogram, row_i, sc, one)
                                         else:
-                                            worst_score = cand_lds[tid, zero]
-                                            worst_off = candidates[row_i, zero]
-                                            worst_slot = zero
-                                            for slot in range(one, Int32(_K)):
-                                                slot_i = Int32(slot)
-                                                slot_score = cand_lds[tid, slot_i]
-                                                slot_off = candidates[row_i, slot_i]
-                                                worse = (slot_score < worst_score) | (
-                                                    (slot_score == worst_score)
-                                                    & (slot_off > worst_off)
-                                                )
-                                                worst_score = worse.select(
-                                                    slot_score, worst_score
-                                                )
-                                                worst_off = worse.select(
-                                                    slot_off, worst_off
-                                                )
-                                                worst_slot = worse.select(
-                                                    slot_i, worst_slot
-                                                )
                                             better = (sc > worst_score) | (
                                                 (sc == worst_score)
                                                 & (offset < worst_off)
                                             )
                                             if better:
+                                                worst_slot = worst_slot_lds[tid]
                                                 _hist_add(
                                                     histogram,
                                                     row_i,
@@ -482,8 +494,31 @@ def build_qsa_indexer_fused_select_module(
                                                     Int32(-1),
                                                 )
                                                 cand_lds[tid, worst_slot] = sc
-                                                candidates[row_i, worst_slot] = offset
+                                                off_lds[tid, worst_slot] = offset
                                                 _hist_add(histogram, row_i, sc, one)
+                                                new_score = cand_lds[tid, zero]
+                                                new_off = off_lds[tid, zero]
+                                                new_slot = zero
+                                                for slot in range(one, Int32(_K)):
+                                                    slot_i = Int32(slot)
+                                                    slot_score = cand_lds[tid, slot_i]
+                                                    slot_off = off_lds[tid, slot_i]
+                                                    worse = (slot_score < new_score) | (
+                                                        (slot_score == new_score)
+                                                        & (slot_off > new_off)
+                                                    )
+                                                    new_score = worse.select(
+                                                        slot_score, new_score
+                                                    )
+                                                    new_off = worse.select(
+                                                        slot_off, new_off
+                                                    )
+                                                    new_slot = worse.select(
+                                                        slot_i, new_slot
+                                                    )
+                                                worst_score_lds[tid] = new_score
+                                                worst_off_lds[tid] = new_off
+                                                worst_slot_lds[tid] = new_slot
                         gpu.barrier()
 
         if tid < Int32(block_m):
@@ -494,7 +529,7 @@ def build_qsa_indexer_fused_select_module(
                     slot_i = Int32(slot_p)
                     filled = slot_i < cnt_p
                     key = _score_key16(cand_lds[tid, slot_i])
-                    offset_p = candidates[row_p, slot_i]
+                    offset_p = off_lds[tid, slot_i]
                     packed = (key << Int32(16)) | (offset_p & Int32(0xFFFF))
                     candidates[row_p, slot_i] = filled.select(
                         packed, Int32(_INVALID_PACKED)

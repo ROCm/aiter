@@ -201,9 +201,9 @@ Both competitor arms are open pull requests on `vllm-project/vllm`. The local ch
 
 ### 6. Performance gate against the arms
 
-- [ ] Rerun the Phase 0 bench with the fused arm added, on an idle gfx950, in one session with interleaved repeats, warm and cold.
-- [ ] Apply gate 1 per case and fill the [Kernel gate](#kernel-gate) table.
-- [ ] Tune the split count, tile count and candidate layout on the losing cases. Record each tuning change and its effect in [Log](#log).
+- [x] Rerun the Phase 0 bench with the fused arm added, on an idle gfx950, in one session with interleaved repeats, warm and cold.
+- [x] Apply gate 1 per case and fill the [Kernel gate](#kernel-gate) table.
+- [x] Tune the split count, tile count and candidate layout on the losing cases. Record each tuning change and its effect in [Log](#log).
 - [ ] Measure gfx942. Enable the fused path there only for the cases where it wins, and record that set.
 - [ ] If option 1 still misses gate 1 on 128K or 256K after tuning, record that in [Decision record](#decision-record) and plan the 16-bit fallback as a follow-up subtask list here.
 
@@ -360,7 +360,33 @@ Median microseconds per QSA layer per step, gfx950.
 
 | Case | Fused | aiter#5996 | vllm#65188 | Faster arm | Margin | Pass |
 | --- | ---: | ---: | ---: | --- | ---: | --- |
-| | | | | | | |
+| p8k | 41987.8 | 915.3 | 217.2 | vllm#65188 | 193.3× | no |
+| p32k | 436213.9 | 2194.2 | 1042.7 | vllm#65188 | 418.4× | no |
+| p128k | 1188684.5 | 4185.9 | 4441.1 | aiter#5996 | 284.0× | no |
+| p256k | 2403158.7 | 6457.3 | 67348.9 | aiter#5996 | 372.2× | no |
+| two128k | 1219889.7 | 4245.0 | 4529.0 | aiter#5996 | 287.4× | no |
+| four128k | 1225201.7 | 4354.4 | 4569.5 | aiter#5996 | 281.4× | no |
+| mix3 | 1198644.7 | 4264.9 | 4630.6 | aiter#5996 | 281.0× | no |
+| mix16 | 1262303.3 | 4785.2 | 4585.2 | vllm#65188 | 275.3× | no |
+| mix64 | 1283286.5 | 5335.9 | 4598.6 | vllm#65188 | 279.1× | no |
+| mtp | 1225800.1 | 4193.6 | 4679.7 | aiter#5996 | 292.3× | no |
+
+Warm-2 medians, microseconds, from one interleaved session of aiter#5996, vllm#65188, vllm#62589, and fused (`op_tests/bench_qsa_indexer_select_abc.py`). Five warmup steps and ten timed steps. Fused `T_step` is the whole `_write_fused_indexer_block_ids` call, so merge and expand sit inside that number. Margin is fused divided by the faster of aiter#5996 and vllm#65188. At 8K a pass is fused at or under 1.05× that arm. At 32K and above a pass is fused strictly faster. Cold repeats of fused stay within about 2% of these warm-2 medians. gpuq GPU 5, rocm-smi 4, bus 0000:85:00.0, MI355X, gfx950, idle at grant (use 0%, no other pids). A first grant on that bus had use 3% and was discarded.
+
+### Span and tile tune, Phase 6
+
+Median fused microseconds, five timed steps after two warmup steps, fused only. A width is `FUSED_SPLIT_COLUMNS`. Tiles are that width divided into blocks of 64, which is the column work one workgroup walks. The sweep is `op_tests/bench_qsa_phase6_tune.py`, gpuq GPU 5, rocm-smi 4, bus 0000:85:00.0, idle at grant. Grants with use above 0 or other pids were discarded.
+
+| Width | Tiles | p8k | p128k | p256k |
+| ---: | ---: | ---: | ---: | ---: |
+| 32928 | 515 | 42891.4 | 1204075.6 | 2434540.0 |
+| 8192 | 128 | 43001.2 | 2022635.0 | 4117271.0 |
+| 2048 | 32 | 43156.2 | 1952640.5 | 4025907.5 |
+| 1024 | 16 | 31897.0 | 1374162.7 | 2826779.3 |
+| 512 | 8 | 3205.9 | 110029.6 | 223478.9 |
+| 256 | 4 | 4732.0 | 155108.9 | 314414.4 |
+
+Eight tiles (512 columns) is the fastest width in the sweep: `p128k` 110029.6 µs against the gate's faster arm of 4185.9 µs (26.3×), `p256k` 223478.9 µs against 6457.3 µs (34.6×), `p8k` 3205.9 µs against 217.2 µs (14.8×). Four tiles is slower because the extra launches cost more than the shorter walk saves. Widths that still fill a 512-slot list and then walk it are slower than one span. The 512-column width is not the default: with the fused predicate forced, the Phase 2 set gate fails on `pad` at a 75% set mismatch. `FUSED_SPLIT_COLUMNS` stays 32928.
 
 ### Serving gate
 
@@ -423,3 +449,7 @@ Fallback used (yes or no, and why):
 - 2026-11-18: Phase 3 fused score and split-local top-512. The kernel is `aiter/ops/flydsl/kernels/qsa/indexer_fused_select.py`. A workgroup owns one 16-row tile and one column span from `fused_split_spans` (one span through 128K, two of 32928 at 256K). It keeps the bf16 MFMA and the 4-head ReLU sum, compares candidates with the fp32 score in the 32 KiB LDS array, and writes a packed 16-bit key plus 16-bit span offset. The first-level histogram is 256 bins of that key, updated on insert and eviction. Invisible, incomplete, and missing-page columns are not inserted. `qsa_indexer_select` uses this path when `n_columns > 512`; the one-page emit path is unchanged. The torch merge returns the kernel's columns for one span and re-ranks two spans in fp32. The Phase 2 set-gate passed on gfx950, gpuq device 0, rocm-smi 4, bus 0000:85:00.0, idle at grant (use 0%, no other pids). A grant on bus 0000:15:00.0 had use 2% and exited 86. All eight cases have `select err` 0. The gate's `select us` is the serial 512-slot scan on these small batches, recorded under [Fused select, Phase 3](#fused-select-phase-3), and is not a serving measurement. gfx942 stays gated off. The real merge is Phase 4.
 - 2026-11-18: Phase 4 split-aware merge. The kernel is `aiter/ops/flydsl/kernels/qsa/indexer_fused_merge.py`. One workgroup per row sums the per-span 256-bin histograms, walks them from the high bin, and runs the second radix pass on the low byte of the one bin that straddles 512. Exact ties on that final key may resolve to either block. It writes `block_ids [M, 512]` and `token_ids [M, 2051]` (four tokens per block, the incomplete tail, `-1` padded) and zeros the histogram bins it read. The scorer still zeros the histogram before it fills it. `qsa_indexer_select` returns those token ids when `n_columns > 512` and no longer calls the Triton expand on that path. The one-page emit path is unchanged. Host compile covered the narrow and wide scorers and the merge (`dry_run("gfx950", 256)`, GPUs hidden). The Phase 2 set-gate passed on gfx950, gpuq device 0, rocm-smi 6, bus 0000:e5:00.0, idle at grant (use 0%, no other pids). All eight cases have `select err` 0, recorded under [Fused select, Phase 4](#fused-select-phase-4). The gate's contexts are one span, so this run does not exercise the second pass. gfx942 stays gated off.
 - 2026-11-18: Phase 5 dispatch. `qsa_indexer_select` checks the contract (bf16 `[M, 4, 128]`, k strides, int32 page table, gfx950, and either the score buffer or the scratch from `qsa_indexer_select_workspace_elems`) and rejects anything else with a reason. The helper sizes one buffer for `max_num_batched_tokens` at `max_model_len`: one span through 128K, two at 256K, 768 int32 slots per row per span. The dispatch run is [Dispatch, Phase 5](#dispatch-phase-5), gpuq device 0, rocm-smi 7, bus 0000:f5:00.0, idle at grant. A grant on that bus with use 1% exited 86. Fused is slower than today's indexer on every step, from 57.9 µs against 28053 µs at 16 rows of 8K up to 4454 µs against 2.96 s at `p256k`. No measured shape selects it. A mixed tile that holds several decode requests walks each request id and repeats the scan, so a fused step keeps those rows on today's indexer; split beat the shared launch on all four mixed cases and still lost to today's full step. The set gate passed on this dispatch, gfx950, rocm-smi 3, bus 0000:75:00.0, idle at grant, `select err` 0. Forcing the fused predicate on the gate's mixed case also matched the oracle. gfx942 stays gated off.
+- 2026-11-18: Phase 6 kernel gate. Interleaved aiter#5996, vllm#65188, vllm#62589, and fused, `op_tests/bench_qsa_indexer_select_abc.py`. gpuq GPU 5, rocm-smi 4, bus 0000:85:00.0, MI355X, gfx950. Idle at grant (use 0%, no other pids). A first grant on that bus had use 3% and was discarded. Warm-2 medians are the [Kernel gate](#kernel-gate) table. Fused loses every case. The closest long case is `mix16` at 275.3× the faster arm, and `p8k` is 193.3×, outside the 1.05× noise bar. Cold fused stays within about 2% of warm-2. The fused call includes merge and expand.
+- 2026-11-18: Phase 6 tune. Candidate layout: the local top-512 keeps column offsets in LDS and skips the 512-walk when the new score loses to the tracked worst. The Phase 5 `p128k` fused median was 1422285.2 µs. After this layout, a scout on rocm-smi 3, bus 0000:75:00.0, idle, with the fused predicate forced, passed the set gate at `select err` 0 and timed `p128k` fused at 1144902.1 µs. The interleaved gate then measured 1188684.5 µs. A follow-up that gave the walk a runtime trip count of 0 on a loss timed `p128k` at 2193743.4 µs on the same bus and was reverted. Span width and tile count, same day, rocm-smi 4, bus 0000:85:00.0, idle: the table under [Span and tile tune, Phase 6](#span-and-tile-tune-phase-6). Eight tiles (512 columns) is fastest and still 14.8× to 34.6× behind the faster arm. The set gate at that width, rocm-smi 7, bus 0000:f5:00.0, idle, fails `pad` at a 75% set mismatch, so `FUSED_SPLIT_COLUMNS` stays 32928. Widths of 8192 and 2048, which still walk a full 512 after the list fills, are slower than one span. Four tiles is slower than eight because the extra launches dominate. The public entry stays on today's indexer.
+- 2026-11-18: Phase 6 set gate at the production width. The staged kernel with `FUSED_SPLIT_COLUMNS` 32928 passes the Phase 2 oracle and set gate on gfx950, gpuq device 0, rocm-smi 5, bus 0000:95:00.0, idle at grant (use 0%, no other pids). The fp64 rescores match, and all eight cases have `select err` 0 (`op_tests/bench_qsa_phase6_tune.py --set-gate --width 32928`). The 512-column failure above is the same code at another width, so it does not change this result.
+- 2026-11-18: Phase 6 score floor at `p128k`. The fused kernel was rebuilt with the serial insert stripped, candidates left empty, and the merge still launched. gpuq device 0, rocm-smi 6, bus 0000:e5:00.0, MI355X, gfx950, idle at grant (use 0%, no other pids). A grant on bus 0000:15:00.0 had other pids and exited 86. Medians of 5 after 2 warmup steps: today's indexer 2979.2 µs, fused with the insert 1187314.5 µs, fused without the insert 3630.2 µs. The Kernel gate's faster arm at `p128k` is 4185.9 µs, so the score-and-merge floor leaves 556 µs for selection. That is too small for a parallel top-512 over 32928 columns, and the floor is already slower than today's indexer in this session. The parallel selection kernel was not written. The `select=False` build was removed, and the production kernel is the one that passed the 32928 set gate.

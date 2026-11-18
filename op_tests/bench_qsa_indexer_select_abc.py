@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Interleaved phase-0 session for arms A, B and C.
+"""Interleaved session for arms A, B, C, and the fused indexer.
 
 One gpuq job. Live indexer pages are filled with random bf16 before any
 arm runs, because an uninitialized pool makes top-k time depend on garbage.
@@ -35,6 +35,7 @@ from aiter.ops.flydsl import qsa_paged as paged
 from aiter.ops.qsa import qsa_expand_block_indices
 
 ARM_A_LABEL = "aiter#5996"
+ARM_F_LABEL = "fused"
 
 
 def _live_pages(cases) -> int:
@@ -87,6 +88,40 @@ def _arm_a(
     )
 
 
+def _arm_fused(
+    q,
+    index_k,
+    table,
+    token_to_req,
+    positions,
+    context,
+    block_ids,
+    token_ids,
+    scratch,
+    max_seq_len,
+):
+    """Fused score, merge, and expand. The whole call is ``T_step``."""
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    paged._write_fused_indexer_block_ids(
+        q,
+        index_k,
+        table,
+        token_to_req,
+        positions,
+        context,
+        block_ids,
+        token_ids,
+        paged._SCORE_SCALE,
+        scratch,
+        max_seq_len,
+    )
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) * 1000.0, 0.0, 0.0
+
+
 def _arm_vllm(arm, q, table, token_to_req, positions, context, token_ids, decode_rows):
     probe = {"score": [], "topk": [], "expand": []}
     arm.step(q, table, token_to_req, positions, context, token_ids, decode_rows, probe)
@@ -111,7 +146,7 @@ def main() -> None:
     arm_b = ArmB(index_k, bench.MAX_MODEL_LEN)
     arm_c = ArmC(index_k, bench.MAX_MODEL_LEN)
     flush = torch.empty(bench.FLUSH_BYTES, dtype=torch.uint8, device="cuda")
-    order = (ARM_A_LABEL, ARM_B_LABEL, ARM_C_LABEL)
+    order = (ARM_A_LABEL, ARM_B_LABEL, ARM_C_LABEL, ARM_F_LABEL)
     rows = []
     with bench._StageProbe() as stage:
         for case in cases:
@@ -129,7 +164,15 @@ def main() -> None:
                 token_ids,
             ) = built
             decode_rows = num_decode_rows(case)
-            arm_b.set_max_seq_len(context, max(req.context for req in case.requests))
+            max_seq_len = max(req.context for req in case.requests)
+            arm_b.set_max_seq_len(context, max_seq_len)
+            scratch = torch.empty(
+                paged.qsa_indexer_select_workspace_elems(
+                    q.shape[0], max_seq_len, bench.PAGE
+                ),
+                dtype=torch.float32,
+                device=q.device,
+            )
             ids = {
                 ARM_A_LABEL: (
                     block_ids,
@@ -137,6 +180,7 @@ def main() -> None:
                 ),
                 ARM_B_LABEL: (None, token_ids.clone()),
                 ARM_C_LABEL: (None, token_ids.clone()),
+                ARM_F_LABEL: (block_ids.clone(), token_ids.clone()),
             }
 
             def once(
@@ -149,6 +193,8 @@ def main() -> None:
                 positions=positions,
                 context=context,
                 decode_rows=decode_rows,
+                scratch=scratch,
+                max_seq_len=max_seq_len,
             ):
                 if cold:
                     bench._flush(flush)
@@ -164,6 +210,19 @@ def main() -> None:
                         block,
                         tokens,
                         stage,
+                    )
+                if label == ARM_F_LABEL:
+                    return _arm_fused(
+                        q,
+                        index_k,
+                        table,
+                        token_to_req,
+                        positions,
+                        context,
+                        block,
+                        tokens,
+                        scratch,
+                        max_seq_len,
                     )
                 arm = arm_b if label == ARM_B_LABEL else arm_c
                 return _arm_vllm(
