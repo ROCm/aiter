@@ -212,8 +212,8 @@ def measure_package_watts(
             fn()
             calls += 1
             in_flight.mark()
-    finally:
         _sync_cuda()
+    finally:
         window_s = time.perf_counter() - window_start
         stop.set()
         thread.join()
@@ -351,12 +351,34 @@ def _positive(value) -> float | None:
 
 
 def _sync_cuda() -> None:
+    """Wait for the GPU. A failed synchronize is a GPU fault and is raised."""
     try:
         import torch
-
+    except ImportError:
+        return
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
         torch.cuda.synchronize()
-    except Exception:
-        logger.debug("CUDA synchronize skipped", exc_info=True)
+
+
+def _gpu_fault(exc: BaseException) -> BaseException | None:
+    """The error to raise when ``exc`` left the GPU context unusable, else None.
+
+    An ``AcceleratorError`` is a fault. So is any error after which a
+    synchronize fails. A sensor that cannot be read is neither.
+    """
+    if type(exc).__name__ == "AcceleratorError":
+        return exc
+    try:
+        import torch
+    except ImportError:
+        return None
+    if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
+        return None
+    try:
+        torch.cuda.synchronize()
+    except Exception as error:  # noqa: BLE001 - any failure here is the fault
+        return error
+    return None
 
 
 def shared_power_override_rejected() -> str | None:
@@ -418,8 +440,11 @@ def measure_kernel(
     readings behind graph readings.
     ``AITER_POWER_GRAPH=0`` is a temporary rollback switch to the eager path
     while graph sampling is new; it is not a tuning knob. NaN (with an empty
-    ``sample``) means the sensor could not be read, the call raised, or the
-    window was too idle to tell.
+    ``sample``) means the sensor could not be read, the call raised without
+    breaking the GPU, or the window was too idle to tell.
+
+    A GPU fault during the sampling pass is raised, so the tuner charges it
+    to this candidate instead of the next one in the same worker.
     """
     if device_index is None:
         try:
@@ -451,7 +476,12 @@ def measure_kernel(
             measure_package_watts(call, device_index=device_index, kernel_us=kernel_us),
             EAGER_SAMPLE,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
+        fault = _gpu_fault(exc)
+        if fault is exc:
+            raise
+        if fault is not None:
+            raise fault from exc
         logger.warning("package power measurement failed: %s", exc)
         return PowerReading(float("nan"))
 

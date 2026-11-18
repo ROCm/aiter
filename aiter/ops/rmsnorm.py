@@ -417,6 +417,22 @@ def _use_hip_common(input: Tensor, use_model_sensitive_rmsnorm: int) -> bool:
 def _rms_norm_fwd_dispatch(
     input, weight, epsilon, use_model_sensitive_rmsnorm
 ) -> Tensor:
+    """RMSNorm over the last axis, returning a new tensor.
+
+    Args:
+        input: ``[M, N]`` activation. Read only -- v1 of this op name wrote
+            into the caller's input, which is why a v1 kernel is not offered
+            a v2 call.
+        weight: ``[N]`` scale applied after normalising.
+        epsilon: added inside the rsqrt.
+        use_model_sensitive_rmsnorm: non-zero selects the model-sensitive
+            variant, which also takes the op off the fast HIP path.
+
+    Returns a newly allocated tensor shaped and typed like ``input``. A
+    provider serving this contract allocates its own output; nothing here is
+    written in place. ``rmsnorm_with_add`` is the separate contract for the
+    fused residual form.
+    """
     # Flat one-guard dispatch: common (bf16/fp16, hidden<=8192, non-T5, 2-D) -> fast HIP
     # module_rmsnorm_quant; opus generic otherwise. rms_norm and rmsnorm2d_fwd both call this
     # directly (not each other) so the vLLM no-add path pays a single torch_compile_guard.
@@ -449,7 +465,20 @@ def rmsnorm2d_fwd(
     return _rms_norm_fwd_dispatch(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
-@_route(op="rmsnorm_with_add", version=1)
+def _rmsnorm_with_add_fake(*args, **kwargs) -> None:
+    """Every result of this op is one of its in-place writes -- ``out`` and
+    ``residual_out`` -- so a trace of it produces nothing. The fake is what
+    lets `route` register the op, which keeps the plugin's dispatch out of a
+    caller's compiled graph."""
+    return
+
+
+@_route(
+    op="rmsnorm_with_add",
+    version=1,
+    fake=_rmsnorm_with_add_fake,
+    mutates_args=["out", "residual_out"],
+)
 @torch_compile_guard(
     mutates_args=["out", "residual_out"], gen_fake=lambda *a, **k: None
 )
@@ -463,6 +492,30 @@ def rmsnorm2d_fwd_with_add(
     gemma_norm: bool = False,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None:
+    """Fused residual add + RMSNorm. Writes ``out`` and ``residual_out``.
+
+    Computes ``residual_out = input + residual_in`` and then normalises THAT
+    sum into ``out``. Both are outputs, and the un-normalised sum is one of
+    them: the next block needs the running residual, so it has to leave here
+    as well as the normalised activation.
+
+    Args:
+        out: ``[M, N]`` normalised result. Written, not accumulated.
+        input: ``[M, N]`` this block's activation.
+        residual_in: ``[M, N]`` incoming residual.
+        residual_out: ``[M, N]`` receives ``input + residual_in``. May alias
+            ``residual_in``; it may NOT alias ``out``.
+        weight: ``[N]`` RMSNorm weight.
+        epsilon: added inside the rsqrt.
+        gemma_norm: scale by ``1 + weight`` instead of ``weight``.
+        use_model_sensitive_rmsnorm: selects the model-sensitive variant;
+            with the default 0 the fast HIP path is eligible.
+
+    Returns nothing. A provider serving this contract owns both writes and
+    must leave ``out`` and ``residual_out`` fully written for every row; a
+    caller cannot tell a skipped row from a correct one by inspecting the
+    return value, because there is none.
+    """
     if _use_hip_common(input, use_model_sensitive_rmsnorm):
         add_rmsnorm(  # fast HIP module_rmsnorm_quant
             out, input, residual_in, residual_out, weight, epsilon, gemma_norm
