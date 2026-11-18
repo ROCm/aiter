@@ -346,14 +346,28 @@ def _amdsmi_partition(amdsmi, handle) -> tuple:
     return _amdsmi_value(mode) or None, _amdsmi_value(nps) or None, num_partitions
 
 
+_SYSFS_DRM = "/sys/class/drm"
+
+
+def _render_device(render_minor) -> str | None:
+    """Name of the device that owns a render node: a PCI address or amdgpu_xcp_<n>."""
+    if render_minor is None:
+        return None
+    path = os.path.join(_SYSFS_DRM, f"renderD{render_minor}", "device")
+    return os.path.basename(os.path.realpath(path)) if os.path.exists(path) else None
+
+
 def _amdsmi_gpus() -> list[tuple[str, PartitionInfo]]:
     """(UUID, PartitionInfo) of every GPU amdsmi reports, in HIP order.
 
     One amdsmi handle is one KFD node, that is one compute partition. Its CU
     count is the CU count of the partition, the value HIP reports. KFD gives
-    each partition an equal share of the CUs of the chip. A partition that
-    does not report a partition field takes it from another partition of the
-    same PCIe device, if amdsmi can see one that reports it.
+    each partition an equal share of the CUs of the chip. Partition 0 owns the
+    render node of the PCI device. A secondary partition owns the render node
+    of an amdgpu_xcp platform device, and KFD gives it the address of its GPU
+    with the partition index as the PCI function. Only such a partition takes
+    a field that it does not report from partition 0 of its GPU. Separate PCI
+    functions, for example SR-IOV VFs, never share fields.
     """
     import amdsmi
 
@@ -366,7 +380,8 @@ def _amdsmi_gpus() -> list[tuple[str, PartitionInfo]]:
                 (
                     enum.get("hip_id", index),
                     enum.get("hip_uuid", ""),
-                    amdsmi.amdsmi_get_gpu_device_bdf(handle).rsplit(".", 1)[0],
+                    amdsmi.amdsmi_get_gpu_device_bdf(handle).lower(),
+                    _render_device(enum.get("drm_render")),
                     amdsmi.amdsmi_get_gpu_asic_info(handle),
                     _amdsmi_partition(amdsmi, handle),
                 )
@@ -375,16 +390,13 @@ def _amdsmi_gpus() -> list[tuple[str, PartitionInfo]]:
         amdsmi.amdsmi_shut_down()
     if not gpus:
         raise RuntimeError("amdsmi reports no GPU")
-    shared: dict[str, list] = {}
-    for _, _, pci_device, _, fields in gpus:
-        known = shared.setdefault(pci_device, [None, None, None])
-        for i, value in enumerate(fields):
-            known[i] = known[i] or value
+    partition0 = {bdf: fields for _, _, bdf, dev, _, fields in gpus if dev == bdf}
     result = []
-    for _, uuid, pci_device, asic, fields in sorted(gpus, key=lambda gpu: gpu[0]):
-        mode, nps, num_partitions = (
-            own or other for own, other in zip(fields, shared[pci_device])
-        )
+    for _, uuid, bdf, dev, asic, fields in sorted(gpus, key=lambda gpu: gpu[0]):
+        if dev is not None and dev.startswith("amdgpu_xcp"):
+            gpu_fields = partition0.get(bdf[:-1] + "0", (None, None, None))
+            fields = tuple(own or gpu for own, gpu in zip(fields, gpu_fields))
+        mode, nps, num_partitions = fields
         cu_num = int(asic["num_compute_units"])
         info = PartitionInfo(
             gfx=str(asic["target_graphics_version"]).lower(),
@@ -426,17 +438,27 @@ def _rocminfo_gpus() -> list[tuple[str, PartitionInfo]]:
 
 
 @functools.lru_cache(maxsize=1)
+def _query_node_gpus() -> tuple[list[tuple[str, PartitionInfo]], bool, str | None]:
+    try:
+        return _amdsmi_gpus(), True, None
+    except Exception as e:  # noqa: BLE001  amdsmi can be missing or unsupported
+        logger.debug("amdsmi partition query failed (%s), using %s", e, _GPU_INFO_TOOL)
+    try:
+        return _rocminfo_gpus(), False, None
+    except Exception as e:  # noqa: BLE001  blanket catch is intentional here
+        return [], False, f"Get GPU Compute Unit from {_GPU_INFO_TOOL} failed {e!s}"
+
+
 def _node_gpus() -> tuple[list[tuple[str, PartitionInfo]], bool]:
     """The GPUs of the node and whether amdsmi reported them.
 
-    The amdsmi session is the expensive part, so it runs once per process,
-    also when it fails. Without amdsmi, rocminfo gives the GPUs.
+    The amdsmi session is the expensive part, so the query runs once per
+    process, also when it fails. Without amdsmi, rocminfo gives the GPUs.
     """
-    try:
-        return _amdsmi_gpus(), True
-    except Exception as e:  # noqa: BLE001  amdsmi can be missing or unsupported
-        logger.debug("amdsmi partition query failed (%s), using %s", e, _GPU_INFO_TOOL)
-        return _rocminfo_gpus(), False
+    gpus, from_amdsmi, error = _query_node_gpus()
+    if error:
+        raise RuntimeError(error)
+    return gpus, from_amdsmi
 
 
 def _rocr_visible(uuids: list[str]) -> list[int]:

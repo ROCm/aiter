@@ -19,14 +19,16 @@ class FakeAmdSmiException(Exception):
 def _gpu(gfx, cu, mode, num_partitions, nps="NPS1", bus=0, secondary_reports=False):
     """The partitions of one GPU.
 
-    Without the amdsmi fix for secondary partitions, only partition 0 reports
-    the partition fields.
+    Partition 0 owns the render node of the PCI device, the other partitions
+    own the render node of an amdgpu_xcp platform device. Without the amdsmi
+    fix for secondary partitions, only partition 0 reports the partition fields.
     """
     return [
         {
             "gfx": gfx,
             "cu": cu,
             "bdf": f"0000:{bus:02x}:00.{i}",
+            "dev": f"amdgpu_xcp_{bus * 8 + i}" if i else f"0000:{bus:02x}:00.0",
             "mode": mode if i == 0 or secondary_reports else None,
             "n": num_partitions if i == 0 or secondary_reports else None,
             "nps": nps if i == 0 or secondary_reports else None,
@@ -46,6 +48,28 @@ MIXED = _gpu("gfx942", 304, "SPX", 1, bus=0x0C) + MI300X_DPX
 SECONDARY_ONLY = MI300X_DPX[1:]
 SECONDARY_ONLY_FIXED = _gpu("gfx942", 152, "DPX", 2, "NPS2", secondary_reports=True)[1:]
 SECONDARY_ONLY_COUNT = [dict(SECONDARY_ONLY[0], n=2)]
+# SR-IOV VFs that are functions 0 and 1 of one PCI bus:device. Each VF owns the
+# render node of its own PCI function. VF 1 does not report a mode.
+TWO_VFS = [
+    {
+        "gfx": "gfx942",
+        "cu": 304,
+        "bdf": "0000:85:00.0",
+        "dev": "0000:85:00.0",
+        "mode": "SPX",
+        "n": 1,
+        "nps": "NPS1",
+    },
+    {
+        "gfx": "gfx942",
+        "cu": 304,
+        "bdf": "0000:85:00.1",
+        "dev": "0000:85:00.1",
+        "mode": None,
+        "n": None,
+        "nps": None,
+    },
+]
 
 
 def fake_amdsmi(gpus, missing=()):
@@ -66,6 +90,7 @@ def fake_amdsmi(gpus, missing=()):
     mod.amdsmi_get_gpu_enumeration_info = lambda h: {
         "hip_id": h,
         "hip_uuid": f"GPU-{h:016x}",
+        "drm_render": 128 + h,
     }
     mod.amdsmi_get_gpu_device_bdf = lambda h: gpus[h]["bdf"]
     mod.amdsmi_get_gpu_asic_info = lambda h: {
@@ -100,13 +125,13 @@ def fake_amdsmi(gpus, missing=()):
 
 
 def _clear_caches():
-    chip_info._node_gpus.cache_clear()
+    chip_info._query_node_gpus.cache_clear()
     chip_info._cu_num.cache_clear()
     chip_info._shared_cu_num.cache_clear()
 
 
 @pytest.fixture
-def node(monkeypatch):
+def node(monkeypatch, tmp_path):
     for var in (
         "CU_NUM",
         "ROCR_VISIBLE_DEVICES",
@@ -116,7 +141,16 @@ def node(monkeypatch):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(chip_info, "_current_device", lambda: 0)
 
+    drm = tmp_path / "drm"
+    monkeypatch.setattr(chip_info, "_SYSFS_DRM", str(drm))
+
     def install(gpus, missing=()):
+        for h, gpu in enumerate(gpus):
+            (tmp_path / "devices" / gpu["dev"]).mkdir(parents=True, exist_ok=True)
+            (drm / f"renderD{128 + h}").mkdir(parents=True)
+            (drm / f"renderD{128 + h}" / "device").symlink_to(
+                tmp_path / "devices" / gpu["dev"]
+            )
         mod = fake_amdsmi(gpus, missing)
         monkeypatch.setitem(sys.modules, "amdsmi", mod)
         _clear_caches()
@@ -170,6 +204,20 @@ def test_old_amdsmi_keeps_the_fields_it_has(node, missing, expected):
     assert tuple(chip_info.get_partition_info(1)) == expected
 
 
+def test_vf_does_not_take_the_mode_of_another_function(node):
+    """Only a secondary partition takes fields from partition 0 of its GPU."""
+    node(TWO_VFS)
+    assert chip_info.get_partition_info(0) == ("gfx942", 304, 304, "SPX", "NPS1", 1)
+    assert chip_info.get_partition_info(1) == ("gfx942", 304, None, None, None, None)
+
+
+def test_partition_without_render_device_takes_no_fields(node, monkeypatch, tmp_path):
+    """A partition that sysfs does not show as an amdgpu_xcp device keeps its fields."""
+    node(MI300X_DPX)
+    monkeypatch.setattr(chip_info, "_SYSFS_DRM", str(tmp_path / "missing"))
+    assert chip_info.get_partition_info(1) == ("gfx942", 152, None, None, None, None)
+
+
 def test_one_amdsmi_session_per_process(node, monkeypatch):
     """The amdsmi session runs once, and get_cu_num is cached per device."""
     amdsmi = node(MIXED)
@@ -205,6 +253,27 @@ def test_failed_amdsmi_session_is_not_retried(node, monkeypatch):
     for device in (0, 0, 0):
         assert chip_info.get_partition_info(device).cu_num == 128
     assert amdsmi.init_calls == 1
+
+
+def test_failed_rocminfo_fallback_is_not_retried(node, monkeypatch):
+    """When amdsmi and rocminfo both fail, each later call raises without a new query."""
+    amdsmi = node(MI300X_SPX)
+    calls = {"amdsmi": 0, "rocminfo": 0}
+
+    def fail_amdsmi():
+        calls["amdsmi"] += 1
+        raise FakeAmdSmiException("init failed")
+
+    def fail_rocminfo():
+        calls["rocminfo"] += 1
+        raise FileNotFoundError("rocminfo")
+
+    amdsmi.amdsmi_init = fail_amdsmi
+    monkeypatch.setattr(chip_info, "_gpu_info_output", fail_rocminfo)
+    for _ in range(3):
+        with pytest.raises(RuntimeError, match="rocminfo failed"):
+            chip_info.get_partition_info()
+    assert calls == {"amdsmi": 1, "rocminfo": 1}
 
 
 def test_mixed_modes_use_the_current_device(node, monkeypatch):
