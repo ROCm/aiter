@@ -96,6 +96,13 @@ group from their original values. Do not rebuild the tail by dequantizing old
 FP4. Completed groups need no repeated work. The writer directly updates the
 native bricks and needs no global V copy or full-history shuffle.
 
+The cache writer also accepts `aux_layout="n16"` to write four contiguous
+2048-byte token16 AUX tiles per page. The default `aux_layout="n32"` retains
+the existing decoder format. N16 contains RoPE, residual and scale bricks
+with 16 bytes per token row. It is for a compatible N16 decoder; do not pass
+an N16 AUX cache to the currently shipped N32 decoder. Q/NoPE packing and
+quantization are unchanged. Both layouts support active-tail updates and graphs.
+
 The caller owns page allocation, tail retention, shared-prefix copy-on-write
 and metadata publication. Publish lengths/CSR after the tile write on the same
 stream, or establish an event dependency across streams. Shape checks do not

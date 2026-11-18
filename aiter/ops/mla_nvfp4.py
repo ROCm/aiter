@@ -19,7 +19,8 @@ G_KV = 89.6
 G_P = 2688.0
 
 
-@compile_ops("module_mla_nvfp4", ffi_type="ctypes")
+# ABI v2 adds the cache layout flag; do not load an existing v1 JIT binary.
+@compile_ops("module_mla_nvfp4_v2", ffi_type="ctypes")
 def mla_nvfp4_asm_fwd(
     q_nope: torch.Tensor,
     q_aux: torch.Tensor,
@@ -34,13 +35,13 @@ def mla_nvfp4_asm_fwd(
 ) -> None: ...
 
 
-@compile_ops("module_mla_nvfp4", ffi_type="ctypes")
+@compile_ops("module_mla_nvfp4_v2", ffi_type="ctypes")
 def _mla_nvfp4_quantize_q(
     q: torch.Tensor, q_nope: torch.Tensor, q_aux: torch.Tensor
 ) -> None: ...
 
 
-@compile_ops("module_mla_nvfp4", ffi_type="ctypes")
+@compile_ops("module_mla_nvfp4_v2", ffi_type="ctypes")
 def _mla_nvfp4_update_cache(
     tiles: torch.Tensor,
     page_ids: torch.Tensor,
@@ -48,6 +49,7 @@ def _mla_nvfp4_update_cache(
     valid_tokens: torch.Tensor,
     kv_nope: torch.Tensor,
     kv_aux: torch.Tensor,
+    n16_aux: bool,
 ) -> None: ...
 
 
@@ -161,6 +163,8 @@ def mla_nvfp4_update_cache(
     valid_tokens: torch.Tensor,
     kv_nope: torch.Tensor,
     kv_aux: torch.Tensor,
+    *,
+    aux_layout: str = "n32",
 ) -> None:
     """Requantize BF16 tiles[T,16,576] directly into the page64 cache.
 
@@ -172,8 +176,14 @@ def mla_nvfp4_update_cache(
     old FP4. No other stream/request may concurrently write the same tile.
     Publish page lengths/CSR after this operation on the same stream or event.
     This function does not own a tail ring, page allocator or prefix copy-on-write.
+    aux_layout="n32" preserves the current decoder format. "n16" writes
+    token16 bricks for a compatible decoder; these layouts cannot be mixed.
     """
-    _mla_nvfp4_update_cache(tiles, page_ids, tile_ids, valid_tokens, kv_nope, kv_aux)
+    if aux_layout not in ("n16", "n32"):
+        raise ValueError("aux_layout must be 'n16' or 'n32'")
+    _mla_nvfp4_update_cache(
+        tiles, page_ids, tile_ids, valid_tokens, kv_nope, kv_aux, aux_layout == "n16"
+    )
 
 
 __all__ = [

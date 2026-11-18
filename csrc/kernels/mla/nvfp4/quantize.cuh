@@ -6,7 +6,9 @@
 
 namespace mla_nvfp4 {
 __device__ __forceinline__ float bf16(const uint16_t* p)
-{ return __uint_as_float(uint32_t(*p) << 16); }
+{
+    return __uint_as_float(uint32_t(*p) << 16);
+}
 __device__ __forceinline__ float sf_value(uint8_t c)
 {
     return c < 8 ? c * 0x1p-9f
@@ -66,9 +68,14 @@ residual16(float (&v)[16], float gain, uint8_t sf, const uint8_t (&codes)[16])
         v[i] -= f4_value(codes[i]) * sf_value(sf) / gain;
 }
 __device__ __forceinline__ int c_offset(int t, int d)
-{ return (t / 16) * 4096 + (d / 32) * 256 + (t % 16) * 16 + (d % 32) / 2; }
-__device__ __forceinline__ int r_offset(int t, int byte)
-{ return (t / 32) * 4096 + ((t % 32) / 16) * 512 + (byte / 16) * 256 + (t % 16) * 16 + byte % 16; }
+{
+    return (t / 16) * 4096 + (d / 32) * 256 + (t % 16) * 16 + (d % 32) / 2;
+}
+__device__ __forceinline__ int r_offset(int t, int byte, bool n16_aux)
+{
+    int base = n16_aux ? (t / 16) * 2048 : (t / 32) * 4096 + ((t % 32) / 16) * 512;
+    return base + (byte / 16) * 256 + (t % 16) * 16 + byte % 16;
+}
 } // namespace mla_nvfp4
 
 // Alignment applies to the instruction entry, not just its descriptor.
@@ -111,7 +118,8 @@ __launch_bounds__(64) void mla_nvfp4_update_cache_kernel(const uint16_t* tiles,
                                                          const int32_t* lengths,
                                                          uint8_t* cn,
                                                          uint8_t* ca,
-                                                         int64_t npages)
+                                                         int64_t npages,
+                                                         bool n16_aux)
 {
     using namespace mla_nvfp4;
     const int64_t update = blockIdx.x;
@@ -141,8 +149,10 @@ __launch_bounds__(64) void mla_nvfp4_update_cache_kernel(const uint16_t* tiles,
                     t < valid ? f4_code(bf16(tiles + t * 576 + lane * 16 + d + 1) / ideal) : 0;
                 cn[c_offset(pt, lane * 16 + d)] = a | (b << 4);
             }
-            ca[(pt / 32) * 4096 + 2048 + (lane / 8) * 256 + (pt % 32) * 8 + lane % 8] =
-                t < valid ? sf : 0x7f;
+            int offset =
+                n16_aux ? tile * 2048 + 1024 + (lane / 16) * 256 + t * 16 + lane % 16
+                        : (pt / 32) * 4096 + 2048 + (lane / 8) * 256 + (pt % 32) * 8 + lane % 8;
+            ca[offset] = t < valid ? sf : 0x7f;
         }
     }
     else
@@ -153,16 +163,24 @@ __launch_bounds__(64) void mla_nvfp4_update_cache_kernel(const uint16_t* tiles,
             uint8_t code[16];
             for(int i = 0; i < 16; ++i)
                 v[i] = t < valid ? bf16(tiles + t * 576 + 512 + rb * 16 + i) : 0;
-            uint8_t sf                                       = quantize16(v, 89.6f, code);
-            ca[(pt / 32) * 4096 + 3072 + (pt % 32) * 4 + rb] = t < valid ? sf : 0x7f;
+            uint8_t sf       = quantize16(v, 89.6f, code);
+            int scale_offset = n16_aux ? tile * 2048 + 1536 + t * 16 + rb
+                                       : (pt / 32) * 4096 + 3072 + (pt % 32) * 4 + rb;
+            ca[scale_offset] = t < valid ? sf : 0x7f;
             for(int i = 0; i < 8; ++i)
-                ca[r_offset(pt, rb * 8 + i)] = code[2 * i] | (code[2 * i + 1] << 4);
+                ca[r_offset(pt, rb * 8 + i, n16_aux)] = code[2 * i] | (code[2 * i + 1] << 4);
             residual16(v, 89.6f, sf, code);
-            sf                                               = quantize16(v, 89.6f, code);
-            ca[(pt / 32) * 4096 + 3200 + (pt % 32) * 4 + rb] = t < valid ? sf : 0x7f;
+            sf                                     = quantize16(v, 89.6f, code);
+            ca[scale_offset + (n16_aux ? 4 : 128)] = t < valid ? sf : 0x7f;
             for(int i = 0; i < 8; ++i)
-                ca[1024 + r_offset(pt, rb * 8 + i)] = code[2 * i] | (code[2 * i + 1] << 4);
+                ca[(n16_aux ? 512 : 1024) + r_offset(pt, rb * 8 + i, n16_aux)] =
+                    code[2 * i] | (code[2 * i + 1] << 4);
         }
     for(int i = lane; i < 16 * 24; i += 64)
-        ca[(tile / 2) * 4096 + 3328 + (tile % 2) * 16 * 24 + i] = 0x7f;
+    {
+        int offset =
+            n16_aux ? tile * 2048 + (i < 128 ? 1536 + (i / 8) * 16 + 8 + i % 8 : 1792 + i - 128)
+                    : (tile / 2) * 4096 + 3328 + (tile % 2) * 16 * 24 + i;
+        ca[offset] = 0x7f;
+    }
 }

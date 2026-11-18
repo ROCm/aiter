@@ -165,8 +165,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_mla_nvfp4_update_cache,
                                      aiter_tensor_t* lengths,
                                      aiter_tensor_t* cn,
                                      aiter_tensor_t* ca,
+                                     bool n16_aux,
                                      hipStream_t stream),
-                                    (tiles, pages, groups, lengths, cn, ca, stream))
+                                    (tiles, pages, groups, lengths, cn, ca, n16_aux, stream))
 {
     const int dev = device(tiles);
     const HipDeviceGuard guard(dev);
@@ -190,6 +191,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(_mla_nvfp4_update_cache,
         static_cast<const int32_t*>(lengths->data_ptr()),
         static_cast<uint8_t*>(cn->data_ptr()),
         static_cast<uint8_t*>(ca->data_ptr()),
-        npages);
+        npages,
+        n16_aux);
     HIP_CALL_LAUNCH(hipGetLastError());
 }
