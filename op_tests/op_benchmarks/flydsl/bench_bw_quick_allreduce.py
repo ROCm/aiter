@@ -43,7 +43,7 @@ for _path in (
 
 import report
 
-DEFAULT_TOKENS = (64, 256, 1024, 4096, 8192)
+DEFAULT_TOKENS = (1024, 2048, 4096, 8192, 16384)
 HIDDEN = 7168
 # The hierarchical schedule with both local laps pinned, as
 # ``(local_rs, local_ag)``.

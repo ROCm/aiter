@@ -42,6 +42,21 @@ import bench_attention_a2a as a2a
 import report
 
 
+# Sequence-length multipliers: the message grows linearly with S.
+DEFAULT_SCALES = (0.5, 1.0, 2.0, 3.0, 4.0)
+
+
+def _scaled_shapes(names, scales):
+    """Case name -> global (B, S, H, D), S scaled; the name keeps a scale of 1 bare."""
+    shapes = {}
+    for name in names:
+        batch, seq, heads, dim = a2a._SHAPES[name]
+        for scale in scales:
+            label = name if scale == 1 else f"{name}x{scale:g}"
+            shapes[label] = (batch, max(1, round(seq * scale)), heads, dim)
+    return shapes
+
+
 def _no_role(role, index, start, end):
     """``_time_roles`` also times single roles; only the trio is graded."""
     start.record()
@@ -163,6 +178,14 @@ def main(argv=None) -> int:
     p.add_argument(
         "--shapes", choices=tuple(a2a._SHAPES), nargs="+", default=list(a2a._SHAPES)
     )
+    p.add_argument(
+        "--scales",
+        type=float,
+        nargs="+",
+        default=list(DEFAULT_SCALES),
+        help="sequence-length multipliers applied to every shape, one case each "
+        "(message size scales linearly); 1 alone gives the shapes as is",
+    )
     p.add_argument("--recipes", choices=["all", *names], nargs="+", default=["all"])
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iterations", type=int, default=15)
@@ -194,7 +217,7 @@ def main(argv=None) -> int:
         _worker,
         args.world_size,
         init_method=get_distributed_init_method(get_ip(), get_open_port()),
-        shapes={name: a2a._SHAPES[name] for name in args.shapes},
+        shapes=_scaled_shapes(args.shapes, args.scales),
         recipes=recipes,
         warmup=args.warmup,
         iterations=args.iterations,
