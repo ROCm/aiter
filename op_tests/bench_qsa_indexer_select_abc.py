@@ -1,0 +1,221 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Interleaved phase-0 session for arms A, B and C.
+
+One gpuq job. Live indexer pages are filled with random bf16 before any
+arm runs, because an uninitialized pool makes top-k time depend on garbage.
+Arms alternate inside each repeat. Sparse GQA is not launched.
+
+Launch from the repo root, in flydsl_venv, through gpuq, after the three
+arms' kernels are already compiled::
+
+    gpuq --num-gpus=1 /workspaces/aiter/flydsl_venv/bin/python -u \\
+        op_tests/bench_qsa_indexer_select_abc.py
+"""
+
+from __future__ import annotations
+
+import statistics
+import sys
+from pathlib import Path
+
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import bench_qsa_indexer_select as bench
+from qsa_phase0_arm_vllm62589 import ARM_LABEL as ARM_C_LABEL
+from qsa_phase0_arm_vllm62589 import Arm as ArmC
+from qsa_phase0_arm_vllm65188 import ARM_LABEL as ARM_B_LABEL
+from qsa_phase0_arm_vllm65188 import Arm as ArmB
+from qsa_phase0_arm_vllm65188 import num_decode_rows
+
+from aiter.ops.flydsl import qsa_paged as paged
+from aiter.ops.qsa import qsa_expand_block_indices
+
+ARM_A_LABEL = "aiter#5996"
+
+
+def _live_pages(cases) -> int:
+    pages = 0
+    for case in cases:
+        n = 0
+        for req in case.requests:
+            cols = req.context // bench.COMPRESS
+            n += (cols + bench.PAGE - 1) // bench.PAGE
+        pages = max(pages, n)
+    return pages
+
+
+def _us(pairs) -> float:
+    return sum(start.elapsed_time(end) for start, end in pairs) * 1000.0
+
+
+def _arm_a(
+    q, index_k, table, token_to_req, positions, context, block_ids, token_ids, stage
+):
+    stage.reset()
+    paged.qsa_indexer_block_ids(
+        q,
+        index_k,
+        table,
+        token_to_req,
+        positions,
+        context,
+        out=block_ids,
+        heads=(bench.HEADS,),
+    )
+    expand_start = torch.cuda.Event(enable_timing=True)
+    expand_end = torch.cuda.Event(enable_timing=True)
+    expand_start.record()
+    qsa_expand_block_indices(
+        block_ids,
+        positions,
+        context,
+        token_to_req,
+        bench.COMPRESS,
+        bench.TOKEN_TOPK,
+        token_ids,
+    )
+    expand_end.record()
+    torch.cuda.synchronize()
+    return (
+        _us(stage.score),
+        _us(stage.topk),
+        expand_start.elapsed_time(expand_end) * 1000.0,
+    )
+
+
+def _arm_vllm(arm, q, table, token_to_req, positions, context, token_ids, decode_rows):
+    probe = {"score": [], "topk": [], "expand": []}
+    arm.step(q, table, token_to_req, positions, context, token_ids, decode_rows, probe)
+    torch.cuda.synchronize()
+    return _us(probe["score"]), _us(probe["topk"]), _us(probe["expand"])
+
+
+def main() -> None:
+    bench._print_device()
+    bench._assert_idle()
+    cases = bench._cases()
+    index_k = bench._wide_indexer_cache()
+    live = _live_pages(cases)
+    torch.manual_seed(0)
+    index_k[:live].normal_()
+    torch.cuda.synchronize()
+    print(
+        f"indexer pool pages={index_k.shape[0]} span_bytes={paged.span_bytes(index_k)} "
+        f"filled_pages={live}",
+        flush=True,
+    )
+    arm_b = ArmB(index_k, bench.MAX_MODEL_LEN)
+    arm_c = ArmC(index_k, bench.MAX_MODEL_LEN)
+    flush = torch.empty(bench.FLUSH_BYTES, dtype=torch.uint8, device="cuda")
+    order = (ARM_A_LABEL, ARM_B_LABEL, ARM_C_LABEL)
+    rows = []
+    with bench._StageProbe() as stage:
+        for case in cases:
+            built = bench._build(case, index_k)
+            (
+                q,
+                _,
+                table,
+                token_to_req,
+                positions,
+                context,
+                _,
+                _,
+                block_ids,
+                token_ids,
+            ) = built
+            decode_rows = num_decode_rows(case)
+            arm_b.set_max_seq_len(context, max(req.context for req in case.requests))
+            ids = {
+                ARM_A_LABEL: (
+                    block_ids,
+                    token_ids.clone(),
+                ),
+                ARM_B_LABEL: (None, token_ids.clone()),
+                ARM_C_LABEL: (None, token_ids.clone()),
+            }
+
+            def once(
+                label,
+                cold,
+                ids=ids,
+                q=q,
+                table=table,
+                token_to_req=token_to_req,
+                positions=positions,
+                context=context,
+                decode_rows=decode_rows,
+            ):
+                if cold:
+                    bench._flush(flush)
+                block, tokens = ids[label]
+                if label == ARM_A_LABEL:
+                    return _arm_a(
+                        q,
+                        index_k,
+                        table,
+                        token_to_req,
+                        positions,
+                        context,
+                        block,
+                        tokens,
+                        stage,
+                    )
+                arm = arm_b if label == ARM_B_LABEL else arm_c
+                return _arm_vllm(
+                    arm, q, table, token_to_req, positions, context, tokens, decode_rows
+                )
+
+            for repeat, cold in (("warm-1", False), ("warm-2", False), ("cold", True)):
+                print(f"{case.name}: {repeat}", flush=True)
+                for _ in range(bench.WARMUP):
+                    for label in order:
+                        once(label, cold)
+                samples = {label: [] for label in order}
+                for _ in range(bench.ITERS):
+                    for label in order:
+                        samples[label].append(once(label, cold))
+                for label in order:
+                    med = [
+                        statistics.median(sample[i] for sample in samples[label])
+                        for i in range(3)
+                    ]
+                    step = sum(med)
+                    got = {
+                        "case": case.name,
+                        "arm": label,
+                        "repeat": repeat,
+                        "score": med[0],
+                        "topk": med[1],
+                        "expand": med[2],
+                        "step": step,
+                        "share": (med[1] + med[2]) / step if step else float("nan"),
+                    }
+                    print(
+                        f"{case.name} {label} {repeat}: T_score {got['score']:.1f} "
+                        f"T_topk {got['topk']:.1f} T_expand {got['expand']:.1f} "
+                        f"T_step {got['step']:.1f} share {got['share']:.3f}",
+                        flush=True,
+                    )
+                    rows.append(got)
+            del built
+            torch.cuda.empty_cache()
+    print(
+        "case | arm | repeat | T_score | T_topk | T_expand | T_step | top-k+expand share",
+        flush=True,
+    )
+    for got in rows:
+        print(
+            f"{got['case']} | {got['arm']} | {got['repeat']} | {got['score']:.1f} | "
+            f"{got['topk']:.1f} | {got['expand']:.1f} | {got['step']:.1f} | "
+            f"{got['share']:.3f}",
+            flush=True,
+        )
+
+
+if __name__ == "__main__":
+    main()
