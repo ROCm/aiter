@@ -11,7 +11,7 @@ Selected code commit is `0d54cbf3e7b16ac7563c34df6e5d744945f6a495`.
 This is the exact kernel and test source approved by Claude Opus 5.5 in local
 run `20261118-155450-63f32955`. The fixed outer acceptance passed, exit 0.
 The published delivery adds only guide updates after that code commit. Use
-`ROCm/aiter`, branch `asm_mon_dev`, and the exact delivery SHA supplied in the
+`Wanzizhu/aiter`, branch `mono-dev`, and the exact delivery SHA supplied in the
 handoff. Read this guide from that checkout and keep the delivery checkout for
 all tests; do not reset to an older test commit or apply historical patches.
 Record HEAD, status, dirty diff and source hashes. Check the two selected-source
