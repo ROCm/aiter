@@ -7,17 +7,19 @@ power-of-two reciprocal change, its static cost and the unresolved request cost.
 
 ## Source and local status
 
-Production HEAD is `f4317a49eb72ef43525e2331c73db515a8edd5cd`.
-The code baseline is `1777a3f1e67220ff0450f46f1d179b6076358733`.
-The selected source is that baseline plus this arithmetic and test patch; it
-is not code commit `1777a3f`. Use the supplied patch and final source manifest.
-The runner checkout starts at `7bdd28762c6248f67e0babce8bc25e08ff82a61d`.
-The read-only proof at
-`/home/weizhu15/workspace/mono-a09-finalize-20261118/standalone-source.json`
-confirms that only an unrelated gitlink was removed from the source clone.
-All other index modes and blobs match production. Submodule declarations stay
-unchanged. Record the manifest, HEAD and dirty diff; HEAD alone is insufficient.
-Do not replay historical patches or change the working framework packages.
+Selected code commit is `0d54cbf3e7b16ac7563c34df6e5d744945f6a495`.
+This is the exact kernel and test source approved by Claude Opus 5.5 in local
+run `20261118-155450-63f32955`. The fixed outer acceptance passed, exit 0.
+The final delivery adds only guide updates after that code commit. Its supplied
+manifest identifies the delivery commit, patch hash and every changed file.
+
+Use the single supplied patch on a clean independent checkout at public base
+`a8a913883d7be9837c2f46f2e92de8fc701bac26`. Do not stack historical patches or
+reset to an older test commit. Verify the manifest before execution. Record
+HEAD, dirty diff and source hashes; an applied patch leaves HEAD at the public
+base. Preserve the machine's framework packages and unrelated tasks.
+The isolated review clone omitted one unrelated gitlink for runner support;
+the delivered patch preserves all production submodule entries and declarations.
 
 | Reference | Fixed source |
 | --- | --- |
@@ -57,11 +59,12 @@ The outer runner's fixed command remains:
 
 It checks 12 builds, frozen hashes, Black/Ruff, the exact 45 node IDs, four real
 binder variants, exhaustive CPU arithmetic and ISA/resource selection gates.
-The worker did not run this command because it writes outside its allowed
-workspace. The outer runner owns its execution and result. Independent Claude
-review of this new arithmetic is pending until the outer workflow records it.
-The previous approval does not cover this patch. Neither local checks nor a
-local approval certify GPU correctness, actual JIT, launch or performance.
+The outer runner executed this command successfully. Claude independently
+reviewed the recorded result and the exact candidate, and returned `approve`
+with no blockers. Its two advisory items are handled in this guide: special-value
+failure triage below and line wrapping. No reviewed kernel or test bytes changed
+after approval. This approval covers local readiness only; GPU correctness,
+actual JIT, launch and performance remain unverified.
 Never use the CPU collection harness to run numerical tests or bypass the GPU
 gate below.
 
@@ -186,6 +189,15 @@ For a failure, retain node ID, seed, input, outputs, source manifest and complet
 log. Stop before timing. Do not loosen numerical checks or change frozen native.
 GPU memory-sanitizer coverage remains unverified unless separately evidenced.
 
+For the new special-value fixtures, record fixture name, row/group, raw BF16
+bits, native/candidate E8M0 codes and FP8/QAT output bytes. If scales differ,
+inspect the existing amax reduction, input masks and scale ownership/storage
+before attributing the mismatch to the new multiply. If scales match, inspect
+the arithmetic, clamp/conversion and payload storage paths. An sNaN-only failure
+would motivate a reduction-order check; it is not proof of that cause. No such
+GPU failure has been observed locally. Retain strict assertions and do not run
+an automatic variant sweep.
+
 Map A09 `PERSISTENT_1` dispatches to actual JIT artifacts and host calls.
 Every nonempty PS launch must have 256 TGs x 128 threads, or work-item grid
 `(32768,1,1)` and workgroup `(128,1,1)`. This does not prove concurrent residency.
@@ -254,8 +266,8 @@ An improvement passes that row. A regression fails that row. Overlap,
 equal medians or insufficient separation remain inconclusive; they do not
 establish equivalence. No positive slowdown allowance is assumed. A path
 passes only if all six required rows are improvements, and its correctness
-and P256 gates also pass. Report FP8 and QAT status separately. A gain against historical
-PS cannot offset a native regression. Return failed or inconclusive rows with
+and P256 gates also pass. Report FP8 and QAT status separately. A gain against
+historical PS cannot offset a native regression. Return failed or inconclusive rows with
 the evidence; do not automatically rerun or start another tuning or ablation
 matrix.
 
@@ -268,5 +280,6 @@ these two existing guides with verified status; add no tracked result report.
 Separate implementation, code/algebra review, CPU exhaustive checks, offline
 ISA/resource/collection, Claude local review, GPU numerical/Graph/JIT/launch
 and performance status. Lower-level scale request combining, cache traffic,
-retry state and cycle attribution remain unknown without evidence. Full mono ABI, DEV/HT, reserved registers, joins and model
-integration are outside this standalone acceptance.
+retry state and cycle attribution remain unknown without evidence. Full mono
+ABI, DEV/HT, reserved registers, joins and model integration are outside this
+standalone acceptance.

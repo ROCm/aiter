@@ -2,8 +2,9 @@
 
 Both success conditions remain required: fixed P256 execution and performance
 better than, or non-regressing against, frozen original native. The selected
-candidate passes worker local checks. GPU correctness, actual JIT/launch and
-performance remain UNVERIFIED. Independent Claude review is pending.
+candidate passes worker checks and the fixed outer acceptance. Claude Opus 5.5
+independent review returned `approve` with no blockers. GPU correctness, actual
+JIT/launch and performance remain UNVERIFIED.
 
 ## 1. Which arithmetic change is selected, and is it exact?
 
@@ -57,7 +58,8 @@ finite-only oracle assertions remain; the new nonfinite data skips that oracle.
 Yes for local selection; runtime speed is still unknown. The actual selected
 source, hashes, production HEAD and patch baseline are in the
 [validation guide](mono-persistent-validation.md#source-and-local-status).
-Do not identify the new arithmetic as commit `1777a3f` or reuse its approval.
+Selected code is `0d54cbf3e7b16ac7563c34df6e5d744945f6a495`; its independent
+review is run `20261118-155450-63f32955`. The earlier candidate is historical.
 
 Real-binder builds with Triton 3.9.0, gfx1250/wave32, four waves and
 `[513,2048]` give these results. Instruction counts are static ISA instructions,
@@ -125,10 +127,10 @@ retain the line-by-line review of this build, not the previous line numbers.
 - [x] A4/A5 and A09-R1/R2/R3: mandatory FP8/QAT timing, explicit row decisions,
   numerical tests without profiling, then two Graph traces with explicit
   profiler branches. The guide states that benchmark defaults exclude A03.
-- [ ] Outer runner: execute its unchanged fixed acceptance command and record
-  the result. Worker checks do not claim that runner result.
-- [ ] Claude independent review of this arithmetic patch. Previous approval
-  is historical; any new approval certifies only bounded local readiness.
+- [x] Outer runner: unchanged fixed acceptance passed, exit 0.
+- [x] Claude Opus 5.5 independent arithmetic/code review: approve, no blockers.
+  This certifies bounded local readiness only. R1 special-value failure triage
+  is in the guide; R2 line wrapping is fixed. Kernel/test bytes remain exact.
 - [ ] GPU: all 45 tests pass, zero skips, byte/guard mismatches or GPU errors.
   `[513,2048]` has 1026 tasks; two workers run five iterations.
   `[513,2080]` has 1043 tasks; its last task has one valid group.
@@ -145,8 +147,8 @@ candidate or its QAT changes.
 
 ## 4. What is the one hardware handoff?
 
-Follow [the validation guide](mono-persistent-validation.md) after the outer
-local acceptance and Claude review. Use the supplied final source and existing
+Follow [the validation guide](mono-persistent-validation.md). The outer local
+acceptance and Claude review are complete. Use the supplied source and existing
 ROCm environment. Run all 45 numerical tests without profiling. Then trace
 only `test_graph_replay_changes_inputs[a09]` and `[a09-five-iterations]`.
 A failed or unavailable profiler leaves launch acceptance pending, preserves
