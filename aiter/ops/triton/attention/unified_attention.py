@@ -248,8 +248,15 @@ def _gfx950_gluon_supported(params: _UAParams):
 def _gfx950_split_params(params: _UAParams):
     """Size the split by the gluon grid when a sequence spans several query blocks."""
     q_rows = params.max_seqlen_q * params.num_queries_per_kv
-    if params.all_decode or (q_rows <= 128 and params.sliding_window <= 0):
+    if params.all_decode:
         return params
+    if q_rows <= 128 and params.sliding_window <= 0:
+        # one query block per sequence; count that grid only while the
+        # padded count leaves the launch unsplit
+        config = get_unified_attention_config("kv_split", params, backend="gluon")
+        if _split_launch_config(config)[0] > 1:
+            return params
+        return params._replace(num_2d_prgms=params.num_seqs * params.num_kv_heads)
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
     block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
     if q_rows <= 128:

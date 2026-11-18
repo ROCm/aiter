@@ -2438,6 +2438,8 @@ class _LaunchSpy:
         # max query length 2: one query block per sequence, 3d path for 5000 keys
         ([(2, 300), (1, 1000), (2, 40), (1, 17), (2, 5000)], (16, 2), 128, 16),
         ([(2, 96)], (16, 2), 128, 16),
+        # max_seqlen_q == BLOCK_Q: q * qpkv = 32 is a power of two and the launch splits
+        ([(4, 4096)] * 4, (16, 2), 128, 16),
         # a zero-length sequence sits between the others in the search
         ([(1, 64), (8, 512), (0, 33), (3, 7)], (8, 8), 64, 64),
         ([(8, 5000), (1, 9)], (8, 8), 128, 16),
