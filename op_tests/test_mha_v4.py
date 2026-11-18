@@ -52,6 +52,7 @@ from aiter.ops.mha_v4_quant import (
     MHA_V4_MXFP8_HD256_K_DATA_BYTES,
     MHA_V4_MXFP8_HD256_K_TILE_BYTES,
     MHA_V4_QUERY_TILE_ROWS,
+    k_smooth_mean,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
@@ -835,6 +836,26 @@ def test_mha_v4_k_smooth_mean_runs_on_k_device():
     torch.cuda.synchronize(1)
     assert actual.device == k.device
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+@skipif(
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gfx942/gfx950 MHA v4 K smoothing",
+)
+def test_mha_v4_k_smooth_mean_rejects_unsupported_inputs():
+    """Arguments the HIP op would abort the process on raise instead."""
+    k = torch.zeros((1, 64, 2, 128), device="cuda", dtype=torch.bfloat16)
+    cases = [
+        (k.cpu(), _K_SMOOTH_SAMPLE_ROWS, "BSHD input on a GPU"),
+        (k[0], _K_SMOOTH_SAMPLE_ROWS, "BSHD input on a GPU"),
+        (k.float(), _K_SMOOTH_SAMPLE_ROWS, "BF16 or FP16 input"),
+        (k[..., :96], _K_SMOOTH_SAMPLE_ROWS, "head dimension 64, 128 or 256"),
+        (k[..., ::2], _K_SMOOTH_SAMPLE_ROWS, "contiguous last dimension"),
+        (k, 0, "positive sample_rows"),
+    ]
+    for bad, sample_rows, match in cases:
+        with expect_raises(ValueError, match=match):
+            k_smooth_mean(bad, sample_rows, _K_SMOOTH_MIN_COMMON)
 
 
 @skipif(

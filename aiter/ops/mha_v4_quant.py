@@ -322,6 +322,21 @@ def k_smooth_mean(k: Tensor, sample_rows: int, min_common: float) -> Tensor:
     Returns fp32 [B, H, D]: the sample mean where its squared norm exceeds min_common**2 times
     the mean squared row norm, zeros elsewhere.
     """
+    # The HIP op's own checks abort the process, so bad arguments are refused here.
+    if k.dim() != 4 or not k.is_cuda:
+        raise ValueError("K smoothing requires a BSHD input on a GPU")
+    if k.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"K smoothing requires a BF16 or FP16 input, got {k.dtype}")
+    if k.shape[-1] not in (64, 128, 256):
+        raise ValueError(
+            f"K smoothing supports head dimension 64, 128 or 256, got {k.shape[-1]}"
+        )
+    if k.stride(-1) != 1:
+        raise ValueError("K smoothing requires a contiguous last dimension")
+    if sample_rows <= 0:
+        raise ValueError(
+            f"K smoothing requires positive sample_rows, got {sample_rows}"
+        )
     batch, sequence, heads, head_dim = k.shape
     mean = k.new_empty((batch, heads, head_dim), dtype=torch.float32)
     if sequence == 0 or batch * heads == 0:
