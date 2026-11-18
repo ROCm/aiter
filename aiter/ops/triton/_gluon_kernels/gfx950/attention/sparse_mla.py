@@ -47,7 +47,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import PropagateNan
 from triton.language.core import _aggregate as aggregate
-from triton.language.target_info import is_hip_cdna4
+from triton.language.target_info import is_hip_cdna3, is_hip_cdna4
 
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
@@ -2431,6 +2431,10 @@ def _sparse_mla(
         STAGED_K32,
         BF16_GATHER,
         FP8_FNUZ,
+    )
+    gl.static_assert(
+        not is_hip_cdna3() or cfg.FP8_TY == gl.float8e4b8,
+        "CDNA3 reads fp8 as e4m3fnuz; FP8_FNUZ must be set",
     )
     main_fmt = Fmt(
         cfg,
