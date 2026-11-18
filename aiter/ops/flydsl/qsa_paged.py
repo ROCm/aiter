@@ -152,6 +152,7 @@ __all__ = [
     "qsa_indexer_block_ids",
     "qsa_indexer_select",
     "qsa_indexer_select_supported",
+    "qsa_indexer_select_workspace_elems",
     "span_bytes",
 ]
 
@@ -989,7 +990,7 @@ def _write_fused_indexer_block_ids(
         query_positions,
         context_lens,
         out,
-        workspace,
+        None,
         (_H,),
     )
     if out is None:
@@ -1070,6 +1071,44 @@ def _write_fused_indexer_block_ids(
     return token_ids
 
 
+def qsa_indexer_select_workspace_elems(
+    max_num_batched_tokens: int,
+    max_model_len: int,
+    page_size: int = 392,
+) -> int:
+    """fp32 elements to allocate once for ``qsa_indexer_select``.
+
+    The buffer holds every row's split candidates and first-level histograms
+    at ``max_model_len``. A shorter step reuses a prefix. The caller does
+    not memset it. ``page_size`` is the compressed indexer page (392).
+    """
+    if (
+        type(max_num_batched_tokens) is not int
+        or type(max_model_len) is not int
+        or type(page_size) is not int
+    ):
+        raise TypeError(
+            "max_num_batched_tokens, max_model_len and page_size must be ints, "
+            f"got {max_num_batched_tokens!r}, {max_model_len!r}, {page_size!r}"
+        )
+    if max_num_batched_tokens < 1 or max_model_len < 1 or page_size < 1:
+        raise ValueError(
+            "workspace size needs positive max_num_batched_tokens, "
+            f"max_model_len and page_size, got {max_num_batched_tokens}, "
+            f"{max_model_len}, {page_size}"
+        )
+    page_tokens = page_size * _R
+    pages = (max_model_len + page_tokens - 1) // page_tokens
+    n_columns = pages * page_size
+    spans = fused_split_spans(max_model_len, n_columns, page_size, _R)
+    return len(spans) * max_num_batched_tokens * (_K + HIST_BINS)
+
+
+def _fused_scratch_elems(rows: int, n_splits: int) -> int:
+    """Int32 slots the fused path reads for this step."""
+    return n_splits * rows * (_K + HIST_BINS)
+
+
 def qsa_indexer_select_supported() -> str | None:
     """Why ``qsa_indexer_select`` does not run on this GPU, or None.
 
@@ -1084,6 +1123,18 @@ def qsa_indexer_select_supported() -> str | None:
     if arch != "gfx950":
         return f"fused indexer select is gated off on {arch}"
     return None
+
+
+def _fused_select_wins(rows: int, n_columns: int, max_seq_len: int) -> bool:
+    """Whether fused score-and-merge beats today's indexer on this step.
+
+    Measured on gfx950, 2026-11-18, on the Phase 0 geometry. Fused was
+    slower at every step from 16 to 16384 rows and from 8K to 256K, by
+    about 125x at 8K and about 500x at 128K. The serial 512-slot scan is
+    the cost. No shape selects fused until a later measurement says so.
+    """
+    del rows, n_columns, max_seq_len
+    return False
 
 
 def qsa_indexer_select(
@@ -1104,15 +1155,15 @@ def qsa_indexer_select(
     """Select compressed blocks and expand them to token ids.
 
     ``q`` is bf16 ``[M, 4, 128]``. Rows no wider than 512 use the emit path.
-    Longer rows score on the GPU into per-span top-512 candidates and a
-    first-level radix histogram. The merge reads that histogram, starts at
-    the second radix pass, writes ``block_ids`` and the expanded
-    ``token_ids``, and clears the histogram. ``workspace``, when passed, is
-    still the fp32 buffer ``[M, page_table_width * page_size]`` and is not
-    cleared. The fused path reuses a long enough contiguous buffer as
-    candidate scratch and overwrites every slot it reads. ``num_decode_rows``
-    counts the decode rows at the front of ``q``. ``max_seq_len`` is the
-    step's longest context and selects the span width.
+    Longer rows use today's indexer. The fused scorer and merge stay
+    available, and a measured step that beats today's indexer takes them.
+    On that step, decode rows keep today's indexer and the prefill rows
+    take the fused launch. The merge writes ``block_ids`` and ``token_ids``
+    and clears the histogram it read. ``workspace`` is either the fp32
+    score buffer ``[>= M, page_table_width * page_size]`` or the contiguous
+    scratch from ``qsa_indexer_select_workspace_elems``. It is not cleared.
+    ``num_decode_rows`` counts the decode rows at the front of ``q``.
+    ``max_seq_len`` is the step's longest context and selects the span width.
     """
     # Local import: aiter.ops.qsa imports this module.
     from aiter.ops.qsa import qsa_expand_block_indices
@@ -1120,8 +1171,9 @@ def qsa_indexer_select(
     reason = qsa_indexer_select_supported()
     if reason is not None:
         raise ValueError(f"[FlyDSL qsa_indexer_select] {reason}")
-    if q.dim() != 3 or int(q.shape[1]) != _H:
-        raise ValueError(f"q must be [M, {_H}, {_D}], got {tuple(q.shape)}")
+    reason = qsa_indexer_supported(q, k_cache, page_table, (_H,))
+    if reason is not None:
+        raise ValueError(f"[FlyDSL qsa_indexer_select] {reason}")
     rows = int(q.shape[0])
     if type(num_decode_rows) is not int:
         raise TypeError(f"num_decode_rows must be an int, got {num_decode_rows!r}")
@@ -1132,37 +1184,89 @@ def qsa_indexer_select(
     if max_seq_len < 1:
         raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
     n_columns = int(page_table.shape[1]) * int(k_cache.shape[1])
+    page_size = int(k_cache.shape[1])
+    spans = fused_split_spans(max_seq_len, max(n_columns, 1), page_size, _R)
+    needed = _fused_scratch_elems(rows, len(spans)) if rows else 0
     scores = None
+    fused_workspace = None
     if workspace is not None:
-        if (
-            workspace.dtype != torch.float32
-            or workspace.dim() != 2
-            or int(workspace.shape[0]) < rows
-            or int(workspace.shape[1]) != n_columns
-            or workspace.stride(-1) != 1
-        ):
+        if workspace.dtype != torch.float32 or not workspace.is_cuda:
             raise ValueError(
-                f"workspace must be float32 [>= {rows}, {n_columns}] "
-                f"with a unit column stride, got {workspace.dtype} "
+                "workspace must be a float32 GPU tensor, "
+                f"got {workspace.dtype} on {workspace.device}"
+            )
+        if workspace.device != q.device:
+            raise ValueError(f"workspace must be on {q.device}, got {workspace.device}")
+        score_buffer = (
+            workspace.dim() == 2
+            and int(workspace.shape[0]) >= rows
+            and int(workspace.shape[1]) == n_columns
+            and workspace.stride(-1) == 1
+        )
+        scratch = workspace.is_contiguous() and workspace.numel() >= needed
+        if score_buffer:
+            scores = workspace[:rows]
+            if scratch:
+                fused_workspace = workspace
+        elif scratch:
+            fused_workspace = workspace
+        else:
+            raise ValueError(
+                f"workspace must be float32 [>= {rows}, {n_columns}] with a "
+                f"unit column stride, or a contiguous float32 buffer of at "
+                f"least {needed} elements, got {workspace.dtype} "
                 f"{tuple(workspace.shape)} stride {tuple(workspace.stride())}"
             )
-        scores = workspace[:rows]
-    if n_columns <= _K or _indexer_empty_geometry(
+    use_fused = n_columns > _K and not _indexer_empty_geometry(
         rows, k_cache, page_table, context_lens
-    ):
-        block_ids = qsa_indexer_block_ids(
-            q,
+    )
+    use_fused = use_fused and _fused_select_wins(rows, n_columns, max_seq_len)
+    # A shared tile walks every request id between its first and last row
+    # and repeats the column scan. Decode rows stay on today's indexer.
+    if use_fused and 0 < num_decode_rows < rows:
+        if block_ids is None:
+            block_ids = torch.empty(rows, _K, dtype=torch.int32, device=q.device)
+        if token_ids is None:
+            token_ids = torch.empty(
+                rows, _FUSED_TOKEN_WIDTH, dtype=torch.int32, device=q.device
+            )
+        decode = num_decode_rows
+        qsa_indexer_block_ids(
+            q[:decode],
             k_cache,
             page_table,
-            token_to_req,
-            query_positions,
+            token_to_req[:decode],
+            query_positions[:decode],
             context_lens,
-            out=block_ids,
+            out=block_ids[:decode],
             score_scale=score_scale,
             heads=(_H,),
-            scores=scores,
+            scores=None if scores is None else scores[:decode],
         )
-    else:
+        qsa_expand_block_indices(
+            block_ids[:decode],
+            query_positions[:decode],
+            context_lens,
+            token_to_req[:decode],
+            _R,
+            _K * _R,
+            token_ids[:decode],
+        )
+        _write_fused_indexer_block_ids(
+            q[decode:],
+            k_cache,
+            page_table,
+            token_to_req[decode:],
+            query_positions[decode:],
+            context_lens,
+            block_ids[decode:],
+            token_ids[decode:],
+            score_scale,
+            fused_workspace,
+            max_seq_len,
+        )
+        return token_ids
+    if use_fused:
         return _write_fused_indexer_block_ids(
             q,
             k_cache,
@@ -1173,9 +1277,21 @@ def qsa_indexer_select(
             block_ids,
             token_ids,
             score_scale,
-            scores,
+            fused_workspace,
             max_seq_len,
         )
+    block_ids = qsa_indexer_block_ids(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        context_lens,
+        out=block_ids,
+        score_scale=score_scale,
+        heads=(_H,),
+        scores=scores,
+    )
     return qsa_expand_block_indices(
         block_ids,
         query_positions,

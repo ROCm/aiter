@@ -190,14 +190,14 @@ Both competitor arms are open pull requests on `vllm-project/vllm`. The local ch
 
 ### 5. Host entry point and dispatch
 
-- [ ] Add `qsa_indexer_select` in `aiter/ops/flydsl/qsa_paged.py`, following the [contract](#base-code-and-contract). Validate shapes, strides, dtypes, the `heads == 4` contract, arch, and workspace size, and reject anything unsupported with a clear reason.
-- [ ] Per-step variant choice on the host:
+- [x] Add `qsa_indexer_select` in `aiter/ops/flydsl/qsa_paged.py`, following the [contract](#base-code-and-contract). Validate shapes, strides, dtypes, the `heads == 4` contract, arch, and workspace size, and reject anything unsupported with a clear reason.
+- [x] Per-step variant choice on the host:
   - Rows no wider than 512 take the emit path.
   - Long rows take fused plus merge.
   - Shapes the fused path does not win take the existing path.
   - Write the thresholds down as measured, not guessed.
-- [ ] Mixed steps: measure decode rows in the prefill launch against a separate small launch. Answer the ticket's open question in [Log](#log) and pick the faster option.
-- [ ] Add a helper that sizes the workspace once from `max_num_batched_tokens` and `max_model_len`.
+- [x] Mixed steps: measure decode rows in the prefill launch against a separate small launch. Answer the ticket's open question in [Log](#log) and pick the faster option.
+- [x] Add a helper that sizes the workspace once from `max_num_batched_tokens` and `max_model_len`.
 
 ### 6. Performance gate against the arms
 
@@ -239,6 +239,7 @@ Both competitor arms are open pull requests on `vllm-project/vllm`. The local ch
 | A/B/C | 2026-11-12 | gfx950 / gfx950 | 4 / 7 / 0000:f5:00.0 | MI355X `0x75a3` | use 0%, no other pids. The first grant, bus 0000:15:00.0, had other pids and was discarded (exit 86). Live pages filled. |
 | Candidate probe, gfx942 | 2026-11-18 | gfx942 / gfx942 | no gpuq (not available on this node) / 7 / 0000:cf:00.0 | MI300X `0x74a1`, 304 CUs | use 0%, no other pids. `HIP_VISIBLE_DEVICES=7`. The probe's own idle check passed. |
 | Candidate probe, strided cache | 2026-11-18 | gfx950 / gfx950 | 0 / 1 / 0000:15:00.0 | MI355X `0x75a3` | use 0%, no other pids. Grants on 0000:95:00.0 (use 2%) and 0000:05:00.0 (other pids) exited 86 and were discarded. |
+| Dispatch, Phase 5 | 2026-11-18 | gfx950 / gfx950 | 0 / 7 / 0000:f5:00.0 | MI355X `0x75a3` | use 0%, no other pids. A grant on the same bus with use 1% exited 86 and was discarded. |
 
 ### Baseline
 
@@ -321,6 +322,25 @@ Set-gate on gfx950, 2026-11-18, after the merge replaced the torch reduction and
 | emit | 16 | 392 | 5.52 | 0 |
 | workspace | 32 | 65856 | 29004 | 0 |
 
+### Dispatch, Phase 5
+
+Pass 2 of one gfx950 session, 2026-11-18. Medians of 10 calls after 5 warmups, microseconds. Both arms see the padded 168-page table and the wide cache. Fused trims to `max_seq_len`. `split` runs the decode prefix on today's indexer and the prefill rows on fused. Empty cells are steps with no decode prefix.
+
+| case | rows | existing | fused | split |
+| --- | ---: | ---: | ---: | ---: |
+| m16_8k | 16 | 57.9 | 28053.1 | |
+| p8k | 8192 | 261.6 | 32870.8 | |
+| p32k | 16384 | 965.6 | 300889.6 | |
+| m16_128k | 16 | 57.9 | 563827.7 | |
+| p128k | 16384 | 2849.6 | 1422285.2 | |
+| p256k | 16384 | 4453.7 | 2955287.1 | |
+| mix3 | 16384 | 2897.9 | 2281008.3 | 1415733.8 |
+| mix16 | 16384 | 3571.2 | 8976522.5 | 1423855.8 |
+| mix64 | 16384 | 3515.9 | 9037425.8 | 1416253.2 |
+| mtp | 16384 | 2875.2 | 1663306.4 | 1428432.8 |
+
+Fused loses every row. The host keeps today's indexer for every measured step. Pass 1 is the same decision. `qsa_indexer_select_workspace_elems(16384, max_model_len)` is 12,582,912 elements through 128K and 25,165,824 at 256K.
+
 ### Candidate-state probe, gfx942
 
 Median `T_score` in microseconds, two repeats (`r1 / r2`), each the median of 10 after 5 warmups. "fail" means the launch raised `hipErrorIllegalState`, checked in a fresh process. The gfx942 scorer uses the same probe copy as gfx950. The trimmed-prefix budget is Arm A's top-k plus expand, timed in the same session. The probe does not time Arm A on the pad table, so the pad rows have no budget verdict.
@@ -372,7 +392,7 @@ Fallback used (yes or no, and why):
 
 ## Open questions
 
-- Should decode rows of a mixed step share the prefill launch or keep a separate small launch? Phase 5 answers this by measurement.
+- Should decode rows of a mixed step share the prefill launch or keep a separate small launch? Phase 5 answers this by measurement. Answered 2026-11-18: keep the separate launch. Sharing the prefill tile repeats the column scan once per request id in the tile, and split was faster on mix3, mix16, mix64, and mtp. Both still lose to today's indexer, so the public entry does not take either fused launch until a measured step wins.
 - Which split count and candidate layout per context bucket? Phase 1 chose 4-byte candidates for 16 rows and the split counts in [Candidate state](#candidate-state). Phase 6 retunes a case that loses.
 - On gfx942, 16 KiB of candidates fits beside the key tile and 32 KiB does not. Whether a 16 KiB state wins there is a Phase 6 measurement.
 
@@ -402,3 +422,4 @@ Fallback used (yes or no, and why):
 - 2026-11-18: Phase 2 oracle check and set-gate, gfx950, gpuq device 0, rocm-smi 2, bus 0000:65:00.0, MI355X, idle at grant. The fp32 oracle matches the fp64 top-512 on the seeded 8K (256 rows), 32K (128 rows), and padded-prefix cases. The largest score gap is 1.62e-6, and the tie bound is 1.7e-6. `qsa_indexer_select` is the entry the set-gate calls. Until the fused kernel replaces its body, that entry runs today's indexer and expand, and it does not clear the caller's score workspace. The set-gate covered a 168-page table, a missing page, a strided cache past 4 GiB, a 16-row tile across two requests, decode rows ahead of prefill rows, MTP rows, and a one-page emit (`n_columns` 392). All eight cases matched the oracle. gfx942 stays gated off.
 - 2026-11-18: Phase 3 fused score and split-local top-512. The kernel is `aiter/ops/flydsl/kernels/qsa/indexer_fused_select.py`. A workgroup owns one 16-row tile and one column span from `fused_split_spans` (one span through 128K, two of 32928 at 256K). It keeps the bf16 MFMA and the 4-head ReLU sum, compares candidates with the fp32 score in the 32 KiB LDS array, and writes a packed 16-bit key plus 16-bit span offset. The first-level histogram is 256 bins of that key, updated on insert and eviction. Invisible, incomplete, and missing-page columns are not inserted. `qsa_indexer_select` uses this path when `n_columns > 512`; the one-page emit path is unchanged. The torch merge returns the kernel's columns for one span and re-ranks two spans in fp32. The Phase 2 set-gate passed on gfx950, gpuq device 0, rocm-smi 4, bus 0000:85:00.0, idle at grant (use 0%, no other pids). A grant on bus 0000:15:00.0 had use 2% and exited 86. All eight cases have `select err` 0. The gate's `select us` is the serial 512-slot scan on these small batches, recorded under [Fused select, Phase 3](#fused-select-phase-3), and is not a serving measurement. gfx942 stays gated off. The real merge is Phase 4.
 - 2026-11-18: Phase 4 split-aware merge. The kernel is `aiter/ops/flydsl/kernels/qsa/indexer_fused_merge.py`. One workgroup per row sums the per-span 256-bin histograms, walks them from the high bin, and runs the second radix pass on the low byte of the one bin that straddles 512. Exact ties on that final key may resolve to either block. It writes `block_ids [M, 512]` and `token_ids [M, 2051]` (four tokens per block, the incomplete tail, `-1` padded) and zeros the histogram bins it read. The scorer still zeros the histogram before it fills it. `qsa_indexer_select` returns those token ids when `n_columns > 512` and no longer calls the Triton expand on that path. The one-page emit path is unchanged. Host compile covered the narrow and wide scorers and the merge (`dry_run("gfx950", 256)`, GPUs hidden). The Phase 2 set-gate passed on gfx950, gpuq device 0, rocm-smi 6, bus 0000:e5:00.0, idle at grant (use 0%, no other pids). All eight cases have `select err` 0, recorded under [Fused select, Phase 4](#fused-select-phase-4). The gate's contexts are one span, so this run does not exercise the second pass. gfx942 stays gated off.
+- 2026-11-18: Phase 5 dispatch. `qsa_indexer_select` checks the contract (bf16 `[M, 4, 128]`, k strides, int32 page table, gfx950, and either the score buffer or the scratch from `qsa_indexer_select_workspace_elems`) and rejects anything else with a reason. The helper sizes one buffer for `max_num_batched_tokens` at `max_model_len`: one span through 128K, two at 256K, 768 int32 slots per row per span. The dispatch run is [Dispatch, Phase 5](#dispatch-phase-5), gpuq device 0, rocm-smi 7, bus 0000:f5:00.0, idle at grant. A grant on that bus with use 1% exited 86. Fused is slower than today's indexer on every step, from 57.9 µs against 28053 µs at 16 rows of 8K up to 4454 µs against 2.96 s at `p256k`. No measured shape selects it. A mixed tile that holds several decode requests walks each request id and repeats the scan, so a fused step keeps those rows on today's indexer; split beat the shared launch on all four mixed cases and still lost to today's full step. The set gate passed on this dispatch, gfx950, rocm-smi 3, bus 0000:75:00.0, idle at grant, `select err` 0. Forcing the fused predicate on the gate's mixed case also matched the oracle. gfx942 stays gated off.
