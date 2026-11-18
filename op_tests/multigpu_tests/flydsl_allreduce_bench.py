@@ -432,6 +432,7 @@ CANDIDATE_KNOBS = {
         "atoms_per_row",
         "low_latency",
         "handshake",
+        "tuning",
     ),
     ("ring", "ar_rmsnorm"): ("super_tile", "grid_cap", "atoms_per_row", "handshake"),
 }

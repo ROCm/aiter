@@ -53,6 +53,7 @@ from .allreduce_policy import (
     fused_qr_row_atoms,
     fused_ring_st_ladder,
     mesh_st_ladder,
+    mesh_super_tiles,
     quantized_floor,
     resolve_link,
     ring_st_ladder,
@@ -827,6 +828,7 @@ class FlyQuickAllReduceRMSNorm:
         link: str | None = None,
         low_latency: bool | None = None,
         handshake: str | None = None,
+        tuning: MeshKnobs | str | None = None,
     ):
         check_world_size(world_size)
         if handshake is not None and handshake not in HANDSHAKES:
@@ -839,9 +841,14 @@ class FlyQuickAllReduceRMSNorm:
                 f"algorithm must be one of {tuple(ALGORITHMS)}, got {algorithm!r}"
             )
         algo = ALGORITHMS[algorithm]
-        if super_tile is not None and super_tile not in algo.super_tiles:
+        # The mesh also takes 2 and 4 on the Lamport handshake, which a rung may
+        # name without the pin; the kernel build rejects them on a flag one.
+        legal_st = (
+            mesh_super_tiles("lamport") if algorithm == "mesh" else algo.super_tiles
+        )
+        if super_tile is not None and super_tile not in legal_st:
             raise ValueError(
-                f"super_tile must be one of {algo.super_tiles} for "
+                f"super_tile must be one of {legal_st} for "
                 f"algorithm={algorithm!r}, got {super_tile!r}"
             )
         rs_codec, ag_codec = _resolve_codecs(algo, int(world_size), rs_codec, ag_codec)
@@ -922,11 +929,25 @@ class FlyQuickAllReduceRMSNorm:
         # ``handshake`` replaces the ladder's on every rung; None keeps it.
         if handshake is not None:
             self._pins["handshake"] = handshake
-        # hidden -> (that width's ladder, its grid cap per (super-tile, low_latency)).
-        self._ladders: dict[int, tuple[tuple, dict[tuple[int, bool], int]]] = {}
+        # ``tuning`` (``MeshKnobs`` or its string form) replaces the knobs of
+        # every rung; None keeps the ladder's own. Mesh only, Lamport only
+        # (``FusedTwoShotRung`` checks the latter when the pin is applied).
+        if tuning is not None:
+            tuning = MeshKnobs.parse(tuning)
+            if algorithm != "mesh" and not tuning.is_default():
+                raise ValueError(
+                    f"algorithm={algorithm!r} takes no mesh tuning knobs, got "
+                    f"{str(tuning)!r}"
+                )
+            self._pins["knobs"] = tuning
+        # hidden -> (that width's ladder, its grid cap per
+        # (super-tile, low_latency, knobs)).
+        self._ladders: dict[
+            int, tuple[tuple, dict[tuple[int, bool, MeshKnobs], int]]
+        ] = {}
 
-        # (hidden, super_tile, mxfp4, low_latency) -> (engine, spec). The MXFP4 and
-        # low-latency builds are separate engines, made on first use.
+        # (hidden, super_tile, mxfp4, low_latency, knobs) -> (engine, spec). The
+        # MXFP4 and low-latency builds are separate engines, made on first use.
         self._by_cfg: dict[tuple, tuple] = {}
         try:
             for h in sorted({int(x) for x in hiddens}):
@@ -1123,9 +1144,20 @@ class FlyQuickAllReduceRMSNorm:
                 )
             by_cap = {}
             for r in rungs:
-                by_cap.setdefault((r.super_tile, r.low_latency), r.grid_cap)
-            by_cap.setdefault((1, False), min(by_cap.values()))
-            got = self._ladders[hidden] = (rungs, dict(sorted(by_cap.items())))
+                by_cap.setdefault((r.super_tile, r.low_latency, r.knobs), r.grid_cap)
+            # The ST=1 fallback of each knob set: a tuned rung falls back to its
+            # own tuned kernel.
+            for kn in {k for _st, _ll, k in list(by_cap)}:
+                by_cap.setdefault(
+                    (1, False, kn),
+                    min(c for (_st, _ll, k), c in by_cap.items() if k == kn),
+                )
+            got = self._ladders[hidden] = (
+                rungs,
+                dict(
+                    sorted(by_cap.items(), key=lambda kv: (*kv[0][:2], str(kv[0][2])))
+                ),
+            )
         return got
 
     def _build_hidden(self, hidden: int, mxfp4: bool = False) -> None:
@@ -1144,8 +1176,8 @@ class FlyQuickAllReduceRMSNorm:
             )
         block, _atoms_per_row, h_pad = self._geom_for(hidden)
         rungs, by_cap = self._ladder(hidden)
-        for (st, low_latency), rung_cap in by_cap.items():
-            key = (hidden, st, bool(mxfp4), low_latency)
+        for (st, low_latency, kn), rung_cap in by_cap.items():
+            key = (hidden, st, bool(mxfp4), low_latency, kn)
             if key in self._by_cfg:
                 continue
             check_build_outside_capture(owner="FlyQuickAllReduceRMSNorm", hidden=hidden)
@@ -1164,6 +1196,7 @@ class FlyQuickAllReduceRMSNorm:
                 mxfp4=bool(mxfp4),
                 handshake=rungs[0].handshake,
                 **({"low_latency": True} if low_latency else {}),
+                **({"knobs": kn} if self._algo.has_knobs else {}),
             )
             if spec["lds_bytes"] * (2 if low_latency else 1) > self._lds_capacity:
                 raise ValueError(
@@ -1206,31 +1239,40 @@ class FlyQuickAllReduceRMSNorm:
         is the footprint a tile *count* has to divide. They are equal whenever
         the build is not padded.
         """
-        key = (
-            int(hidden),
-            1,
-            False,
-            False,
-        )  # ST=1 is always built; see the constructor
-        if key not in self._by_cfg:
+
+        # An ST=1 engine without low latency is always built (see the
+        # constructor); the tile does not depend on the knobs.
+        def _find():
+            return next(
+                (
+                    v[1]["hbm_tile_bytes"]
+                    for k, v in self._by_cfg.items()
+                    if k[:4] == (int(hidden), 1, False, False)
+                ),
+                None,
+            )
+
+        got = _find()
+        if got is None:
             self._build_hidden(int(hidden))
-        return self._by_cfg[key][1]["hbm_tile_bytes"]
+            got = _find()
+        return got
 
     def _pick_cfg(
         self, hidden: int, live_bytes: int, num_tiles: int, mxfp4: bool = False
     ) -> tuple:
         rungs, by_cap = self._ladder(hidden)
         rung = select_rung(rungs, live_bytes)
-        want, low_latency = rung.super_tile, rung.low_latency
+        want, low_latency, kn = rung.super_tile, rung.low_latency, rung.knobs
         if want != 1:
             if self._batch_publishes:
                 want = want if num_tiles >= want else 1
             else:
-                key = (int(hidden), want, bool(mxfp4), False)
+                key = (int(hidden), want, bool(mxfp4), False, kn)
                 built = self._by_cfg.get(key)
-                grid = built[0].grid if built else by_cap[(want, False)]
+                grid = built[0].grid if built else by_cap[(want, False, kn)]
                 want = want if num_tiles > grid else 1
-        key = (int(hidden), want, bool(mxfp4), bool(low_latency))
+        key = (int(hidden), want, bool(mxfp4), bool(low_latency), kn)
         if key not in self._by_cfg:
             self._build_hidden(int(hidden), mxfp4)
         return key

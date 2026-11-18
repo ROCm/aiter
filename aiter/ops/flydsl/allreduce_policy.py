@@ -471,7 +471,10 @@ class FusedTwoShotRung:
     one, so ``grid_cap`` may go up to twice the CU count. It needs
     ``super_tile=1`` and a width whose block is ``BLOCK``. ``handshake`` is as
     on ``TwoShotRung``: one of ``HANDSHAKES``, the same on every rung of a
-    width's ladder.
+    width's ladder. ``knobs`` are the Lamport mesh tuning knobs (``MeshKnobs``;
+    in the JSON file a ``"knobs": "stripe=full;fanout=peer"`` string): every
+    knob but ``prefetch`` works with a fused build, low-latency included. The
+    ring takes only the defaults.
     """
 
     min_bytes: int
@@ -479,6 +482,18 @@ class FusedTwoShotRung:
     grid_cap: int
     low_latency: bool = False
     handshake: str = "flag"
+    knobs: MeshKnobs = DEFAULT_MESH_KNOBS
+
+    def __post_init__(self) -> None:
+        self.knobs.check(
+            handshake=self.handshake,
+            super_tile=self.super_tile,
+            where="FusedTwoShotRung.knobs",
+        )
+        if self.knobs.prefetch:
+            # The fused epilogue's prefetch result is not carried across the
+            # loop the knob builds; see ``make_quick_allreduce_mesh_kernel``.
+            raise ValueError("FusedTwoShotRung.knobs: prefetch=1 is a plain-path knob")
 
 
 def select_rung(ladder, nbytes: int):
@@ -1411,7 +1426,9 @@ def _check_oneshot_rung(rung: FusedOneShotRung, where: str) -> None:
         )
 
 
-def _two_shot_check(super_tiles, *, low_latency: bool, by_handshake=None):
+def _two_shot_check(
+    super_tiles, *, low_latency: bool, by_handshake=None, knobs: bool = False
+):
     """The rung check of a fused family. *by_handshake*, if given, maps a
     handshake to the super-tiles legal on it, and replaces *super_tiles*."""
 
@@ -1419,6 +1436,11 @@ def _two_shot_check(super_tiles, *, low_latency: bool, by_handshake=None):
         legal = super_tiles if by_handshake is None else by_handshake(rung.handshake)
         _check_in(rung.super_tile, legal, f"{where}.super_tile")
         _check_grid_cap(rung, where)
+        if rung.knobs != DEFAULT_MESH_KNOBS and not knobs:
+            raise ValueError(
+                f"{where}.knobs: only a mesh rung takes tuning knobs, got "
+                f"{str(rung.knobs)!r}"
+            )
         if not isinstance(rung.low_latency, bool):
             msg = f"{where}.low_latency: must be true or false"
             raise ValueError(msg)  # noqa: TRY004
@@ -1441,7 +1463,12 @@ _FUSED_FAMILIES = {
     "oneshot": (FusedOneShotRung, _check_oneshot_rung),
     "mesh": (
         FusedTwoShotRung,
-        _two_shot_check(SUPER_TILES, low_latency=True, by_handshake=mesh_super_tiles),
+        _two_shot_check(
+            SUPER_TILES,
+            low_latency=True,
+            by_handshake=mesh_super_tiles,
+            knobs=True,
+        ),
     ),
     "ring": (FusedTwoShotRung, _two_shot_check(RING_SUPER_TILES, low_latency=False)),
 }
@@ -1460,7 +1487,21 @@ def _parse_rungs(raw, cls, check, where: str) -> tuple:
         values = {name: fields[name] for name in names}
         values.update({k: fields.get(k, v) for k, v in optional.items()})
         values["min_bytes"] = _parse_bytes(values["min_bytes"], f"{rw}.min_bytes")
-        rung = cls(**values)
+        if "knobs" in fields:
+            raw_knobs = fields["knobs"]
+            if not isinstance(raw_knobs, str):
+                raise ValueError(
+                    f"{rw}.knobs: expected a string like 'stripe=full;fanout=peer', "
+                    f"got {raw_knobs!r}"
+                )
+            try:
+                values["knobs"] = MeshKnobs.parse(raw_knobs)
+            except ValueError as exc:
+                raise ValueError(f"{rw}.knobs: {exc}") from None
+        try:
+            rung = cls(**values)
+        except ValueError as exc:
+            raise ValueError(f"{rw}: {exc}") from None
         check(rung, rw)
         rungs.append(rung)
     floors = [r.min_bytes for r in rungs]

@@ -1471,3 +1471,103 @@ def test_mesh_lds_bytes_counts_the_buffers():
     one = mesh_lds_bytes(256, 8, "int4")
     assert mesh_lds_bytes(256, 8, "int4", lds_bufs=2) == 2 * one
     assert mesh_lds_bytes(256, 8, "int4", 16, 2) == 2 * one + 64
+
+
+# --- Fused Lamport mesh tuning knobs ---------------------------------------------
+
+
+def _shipped_fused_doc():
+    with open(P.fused_ladders_path()) as f:
+        return json.load(f)
+
+
+def _first_lamport_mesh_rung(doc):
+    for plat in doc["platforms"]:
+        spec = plat["mesh"]["default"]
+        rung = spec["rungs"][0]
+        if rung.get("handshake") == "lamport":
+            return plat, rung
+    raise AssertionError("no Lamport mesh rung in the shipped file")
+
+
+def test_fused_json_knobs_parse(tmp_path):
+    doc = _shipped_fused_doc()
+    plat, rung = _first_lamport_mesh_rung(doc)
+    rung["knobs"] = "stripe=full;fanout=peer"
+    got = P.load_fused_ladders(_write_ladders(tmp_path, doc))
+    cell = (plat["arch"], plat["link"], plat["world_size"], None)
+    assert got.mesh[cell][0].knobs == P.MeshKnobs(stripe="full", fanout="peer")
+    # Lamport accepts super-tiles 2 and 4 on a fused mesh rung too.
+    rung["super_tile"] = 2
+    got = P.load_fused_ladders(_write_ladders(tmp_path, doc))
+    assert got.mesh[cell][0].super_tile == 2
+
+
+@pytest.mark.parametrize(
+    "knobs, match",
+    [
+        ("nosuch=1", "knobs"),
+        ("stripe=wide", "knobs"),
+        ("prefetch=1", "prefetch"),
+        (7, "string"),
+    ],
+)
+def test_fused_json_rejects_bad_knobs(tmp_path, knobs, match):
+    doc = _shipped_fused_doc()
+    _plat, rung = _first_lamport_mesh_rung(doc)
+    rung["knobs"] = knobs
+    with pytest.raises(ValueError, match=match):
+        P.load_fused_ladders(_write_ladders(tmp_path, doc))
+
+
+def test_fused_json_rejects_knobs_on_flag_and_ring_rungs(tmp_path):
+    doc = _shipped_fused_doc()
+    plat, rung = _first_lamport_mesh_rung(doc)
+    rung["knobs"] = "stripe=full"
+    rung["handshake"] = "flag"
+    with pytest.raises(ValueError, match="lamport"):
+        P.load_fused_ladders(_write_ladders(tmp_path, doc))
+    # A flag rung may not take super_tile 2 either.
+    doc = _shipped_fused_doc()
+    _plat, rung = _first_lamport_mesh_rung(doc)
+    rung["handshake"] = "flag"
+    rung["super_tile"] = 2
+    with pytest.raises(ValueError, match="super_tile"):
+        P.load_fused_ladders(_write_ladders(tmp_path, doc))
+    # The ring takes no knobs, Lamport or not.
+    doc = _shipped_fused_doc()
+    plat = doc["platforms"][0]
+    ring_rung = plat["ring"]["default"]["rungs"][0]
+    ring_rung["handshake"] = "lamport"
+    ring_rung["knobs"] = "stripe=full"
+    with pytest.raises(ValueError, match="mesh rung"):
+        P.load_fused_ladders(_write_ladders(tmp_path, doc))
+
+
+def test_fused_rung_knob_rules():
+    base = {"min_bytes": 0, "grid_cap": 8}
+    on = P.MeshKnobs.parse("stripe=full;fanout=peer")
+    P.FusedTwoShotRung(**base, super_tile=1, handshake="lamport", knobs=on)
+    # Low latency composes with the knobs (checked on the GPU).
+    P.FusedTwoShotRung(
+        **base, super_tile=1, low_latency=True, handshake="lamport", knobs=on
+    )
+    with pytest.raises(ValueError, match="lamport"):
+        P.FusedTwoShotRung(**base, super_tile=1, handshake="flag", knobs=on)
+    with pytest.raises(ValueError, match="prefetch"):
+        P.FusedTwoShotRung(
+            **base,
+            super_tile=1,
+            handshake="lamport",
+            knobs=P.MeshKnobs.parse("prefetch=1"),
+        )
+
+
+def test_shipped_fused_ladders_knobs_are_legal():
+    ladders = P.load_fused_ladders(P.fused_ladders_path())
+    for rungs in ladders.ring.values():
+        assert all(r.knobs == P.DEFAULT_MESH_KNOBS for r in rungs)
+    for rungs in ladders.mesh.values():
+        assert all(
+            r.knobs == P.DEFAULT_MESH_KNOBS or r.handshake == "lamport" for r in rungs
+        )

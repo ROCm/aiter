@@ -3419,6 +3419,37 @@ def _host_rejects_unsupported_hidden() -> list[str]:
     return fails
 
 
+# The fused mesh's Lamport knobs (``prefetch`` is plain-path only): each
+# non-default value singly, then two combinations.
+FUSED_KNOB_COVERAGE = (
+    "stripe=full",
+    "fanout=sector",
+    "fanout=peer",
+    "poll_sleep=1",
+    "poll_sleep=2",
+    "recv_order=per_source",
+    "lds_bufs=2",
+    "prio=1",
+    "prio=2",
+    "stripe=full;fanout=peer",
+    "stripe=full;fanout=peer;poll_sleep=1;recv_order=per_source;lds_bufs=2;prio=1",
+)
+# ``(mode, engine pins)``. ``prod``: the ladder as production has it, low-latency
+# rungs included. The pinned ones turn the low-latency build off or on (``ll``,
+# where the width's block is BLOCK) and force the super-tile; ``st4`` with a
+# small grid so a block owns several super-tiles.
+FUSED_KNOB_MODES = (
+    ("prod", {}),
+    ("st1", {"super_tile": 1, "low_latency": False}),
+    ("st4", {"super_tile": 4, "low_latency": False, "grid_cap": 8}),
+    ("ll", {"low_latency": True, "grid_cap": 8}),
+)
+FUSED_KNOB_HIDDENS = (4096, 7168)
+# Tokens per call: ~75 tiles at the narrowest tile, a partial last tile, one row.
+FUSED_KNOB_TOKENS = (600, 77, 1)
+FUSED_KNOB_ITERS = 4
+
+
 def _bare_fused_engine(algorithm: str, tp: int, **knobs):
     """A ``FlyQuickAllReduceRMSNorm`` with just enough state to resolve row
     geometry (``supports_hidden``, ``_geom_for``) without a process group."""
@@ -4234,6 +4265,19 @@ def _verify_fused(tps, algos, extended: bool) -> None:
         ],
     )
     _summarize(
+        "flydsl quick allreduce rmsnorm lamport mesh knobs (bit-identical to default)",
+        [
+            test_quick_allreduce_rmsnorm_knobs(tp)
+            for tp in tps
+            if mesh
+            and tp in (4, 8)
+            and fly_policy.fused_mesh_st_ladder(
+                world_size=tp, link=fly_policy.detect_link(), arch=ARCH, hidden=4096
+            )[0].handshake
+            == "lamport"
+        ],
+    )
+    _summarize(
         "flydsl quick allreduce rmsnorm zero bytes",
         [
             test_quick_allreduce_zero_bytes(tp, algorithm, "ar_rmsnorm")
@@ -4248,6 +4292,149 @@ def _verify_fused(tps, algos, extended: bool) -> None:
         "flydsl quick allreduce rmsnorm host-side geometry checks",
         [test_quick_allreduce_host_checks(check) for check in _HOST_CHECKS],
     )
+
+
+def _knob_rank_fused(
+    rank: int, tp: int, init_method: str, hiddens: tuple[int, ...], tunings: tuple
+) -> list[dict]:
+    """One rank of a fused knob spawn. For every width, mode (``FUSED_KNOB_MODES``)
+    and tuning, a Lamport fused mesh engine with those knobs runs next to the
+    default-knob one on the same inputs, ``FUSED_KNOB_ITERS`` back-to-back
+    calls per payload size with fresh inputs and rank 0 dragged. Returns, per
+    case, how many output and ``residual_out`` lanes differ from the default
+    build, and how many differ between ranks."""
+    import torch.distributed as dist
+
+    from aiter.ops.flydsl.kernels.comm.transport import BLOCK
+    from aiter.ops.flydsl.quick_allreduce import FlyQuickAllReduceRMSNorm
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=init_method,
+        world_size=tp,
+        rank=rank,
+        device_id=device,
+    )
+    gloo = dist.new_group(backend="gloo")
+    drag = torch.randn(2048, 2048, device=device, dtype=torch.float32)
+    rows = []
+    try:
+        for hidden in hiddens:
+            for mode, pins in FUSED_KNOB_MODES:
+                if pins.get("low_latency"):
+                    bare = _bare_fused_engine("mesh", tp, low_latency=True)
+                    if not bare.supports_hidden(hidden) or (
+                        bare._geom_for(hidden)[0] != BLOCK
+                    ):
+                        continue
+                for tuning in tunings:
+                    engines = {}
+                    for name, kn in (("default", MeshKnobs()), ("knobs", tuning)):
+                        engines[name] = FlyQuickAllReduceRMSNorm(
+                            group=gloo,
+                            device=device,
+                            rank=rank,
+                            world_size=tp,
+                            algorithm="mesh",
+                            min_bytes=0,
+                            handshake="lamport",
+                            tuning=kn,
+                            **pins,
+                        )
+                        engines[name].preload(hidden)
+                    outs = {name: [] for name in engines}
+                    seq = 0
+                    for tokens in FUSED_KNOB_TOKENS:
+                        for _ in range(FUSED_KNOB_ITERS):
+                            seq += 1
+                            if rank == 0 and seq % 3 == 0:
+                                drag = drag @ drag.T * 1e-6
+                            inp, residual, weight = _fused_inputs(
+                                tokens, hidden, rank, device
+                            )
+                            g = torch.Generator().manual_seed(5000 + seq * 16 + rank)
+                            inp.copy_(torch.randn(tokens, hidden, generator=g) * 0.25)
+                            for name, eng in engines.items():
+                                out = torch.empty_like(inp)
+                                res_out = torch.empty_like(inp)
+                                eng.allreduce_rmsnorm(
+                                    inp,
+                                    residual,
+                                    weight,
+                                    RMS_EPS,
+                                    out=out,
+                                    residual_out=res_out,
+                                )
+                                outs[name].append((out, res_out))
+                    torch.cuda.synchronize()
+                    differing = lanes = 0
+                    for (o, r), (o0, r0) in zip(outs["knobs"], outs["default"]):
+                        for a, b in ((o, o0), (r, r0)):
+                            differing += int(
+                                (a.view(torch.int16) != b.view(torch.int16)).sum()
+                            )
+                            lanes = max(lanes, _lanes_differing(a, dist.group.WORLD))
+                    rows.append(
+                        {
+                            "hidden": hidden,
+                            "mode": mode,
+                            "tuning": str(tuning),
+                            "calls": seq,
+                            "differing_from_default": differing,
+                            "lanes_differing": lanes,
+                        }
+                    )
+                    del outs
+                    torch.cuda.synchronize()
+                    dist.barrier(group=gloo)
+                    for eng in engines.values():
+                        eng.close()
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier(group=gloo)
+        dist.destroy_process_group()
+    return rows
+
+
+@benchmark()
+def test_quick_allreduce_rmsnorm_knobs(tp):
+    """The Lamport mesh tuning knobs on the fused all-reduce + RMSNorm: every
+    value but ``prefetch`` singly, and two combinations, at hidden 4096 and 7168,
+    on the production ladder and with ST=1, ST=4 and the low-latency build
+    pinned (where the width's block allows it). Each must give the default-knob
+    build's ``out`` and ``residual_out`` bit for bit, the same on every rank,
+    over back-to-back calls with fresh inputs and rank 0 dragged."""
+    ranks = _spawn(
+        _knob_rank_fused,
+        tp,
+        hiddens=FUSED_KNOB_HIDDENS,
+        tunings=tuple(MeshKnobs.parse(t) for t in FUSED_KNOB_COVERAGE),
+    )
+    fails = []
+    for rank, rank_rows in enumerate(ranks):
+        for row in rank_rows:
+            where = f"rank {rank} h={row['hidden']} {row['mode']} [{row['tuning']}]"
+            if row["differing_from_default"]:
+                fails.append(
+                    f"{where}: {row['differing_from_default']} lanes differ from "
+                    "the default-knob build"
+                )
+            if row["lanes_differing"]:
+                fails.append(
+                    f"{where}: {row['lanes_differing']} lanes differ between ranks"
+                )
+    _check(f"tp={tp} fused mesh lamport knobs", fails)
+    return {
+        "gfx": ARCH,
+        "cases": len(ranks[0]),
+        "modes": sorted({r["mode"] for r in ranks[0]}),
+        "differing_from_default": max(
+            r["differing_from_default"] for rr in ranks for r in rr
+        ),
+        "lanes_differing": max(r["lanes_differing"] for rr in ranks for r in rr),
+    }
 
 
 def _fused_applies(algorithm: str, knobs: dict, tp: int, hidden: int) -> bool:
