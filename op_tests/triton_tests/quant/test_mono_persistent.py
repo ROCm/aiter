@@ -283,13 +283,20 @@ def test_graph_replay_changes_inputs(op):
     else:
         rows = 513 if op == "a09-five-iterations" else 257
         x = torch.randn((rows, 2048), device="cuda", dtype=torch.bfloat16)
-        outs = quantize_fp8_group32(x, persistent=True)
+        outs = (
+            *quantize_fp8_group32(x, persistent=True),
+            quantize_fp8_group32(x, persistent=True, dequantize=True),
+        )
 
         def run():
-            return quantize_fp8_group32(x, persistent=True, out=outs[0], scales=outs[1])
+            quantized = quantize_fp8_group32(
+                x, persistent=True, out=outs[0], scales=outs[1]
+            )
+            qat = quantize_fp8_group32(x, persistent=True, dequantize=True, out=outs[2])
+            return (*quantized, qat)
 
         def reference():
-            return native.quantize_fp8(x)
+            return (*native.quantize_fp8(x), native.quantize_fp8(x, dequantize=True))
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -305,10 +312,13 @@ def test_graph_replay_changes_inputs(op):
         x.normal_()
         graph.replay()
         expected = reference()
-        assert any(
+        changed = [
             not torch.equal(a.view(torch.uint8), b.view(torch.uint8))
             for a, b in zip(expected, previous)
-        )
+        ]
+        assert any(changed if op == "a03" else changed[:2])
+        if op != "a03":
+            assert changed[2]
         for a, b in zip(outs, expected):
             assert_bytes(a, b)
         previous = expected
