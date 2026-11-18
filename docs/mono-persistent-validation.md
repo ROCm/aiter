@@ -1,12 +1,17 @@
 # A03 and A09: gfx1250 native / persistent validation
 
-The branch is `Wanzizhu/aiter:mono-dev`. These are standalone persistent stages.
+The branch is `ROCm/aiter:asm_mon_dev`. These are standalone persistent stages.
 Run correctness before timing. No GPU result or speedup has been measured on
 the development host. Do not install these stages into a model for this task.
 
 The [2026-11-18 gfx1250 hardware report](mono-results/2026-11-18-gfx1250/README.md)
 records 36 passing GPU tests after an import fix. Eight benchmark configurations
 regress, and four remain inconclusive. Standalone performance acceptance fails.
+
+For the next run, use the [review follow-up TODO](mono-persistent-review-todo.md).
+It keeps the import fix and adds correctness cases, runtime JIT evidence,
+boundary measurements and separate optimization candidates. Its checkout
+instructions replace the original pinned checkout command below.
 
 ## Code and native references
 
@@ -44,7 +49,7 @@ framework packages and model checkout.
 
 ```bash
 set -euo pipefail
-git clone --branch mono-dev git@github.com:Wanzizhu/aiter.git aiter-mono-validation
+git clone --branch asm_mon_dev git@github.com:ROCm/aiter.git aiter-mono-validation
 cd aiter-mono-validation
 git checkout efa58c2ccd4525a8287c4f886945fc48ed86a192
 python3 -m venv --system-site-packages .venv-mono-test
