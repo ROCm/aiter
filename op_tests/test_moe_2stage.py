@@ -1858,6 +1858,277 @@ def test_presorted_moe_hook():
     aiter.logger.info("moe_2stage: presorted MoE hook contract passed")
 
 
+def _reference_presort(topk_ids, topk_weights, E, block_m, moe_buf=None):
+    """A presort in moe_sorting's standard layout, built in torch.
+
+    Each expert's routes in token order as (slot << 24) | token, padded to a
+    multiple of block_m with (topk << 24) | M and weight 0, one expert id per
+    block_m rows; num_valid_ids is [padded rows, M]. Sized for the worst case
+    (aux_sort_capacity), without m_indices and reverse_sorted.
+    """
+    M, topk = topk_ids.shape
+    device = topk_ids.device
+    capacity = presorted_moe.aux_sort_capacity(M, topk, E, block_m)
+    flat = topk_ids.flatten().long()
+    route = torch.sort(flat, stable=True).indices
+    counts = torch.bincount(flat, minlength=E)
+    padded = (counts + block_m - 1) // block_m * block_m
+    starts = torch.cumsum(padded, 0) - padded
+    expert = flat[route]
+    rank = (
+        torch.arange(route.numel(), device=device)
+        - (torch.cumsum(counts, 0) - counts)[expert]
+    )
+    pos = starts[expert] + rank
+    ids = torch.full((capacity,), (topk << 24) | M, dtype=dtypes.i32, device=device)
+    ids[pos] = ((route % topk) << 24 | route // topk).to(dtypes.i32)
+    weights = torch.zeros(capacity, dtype=dtypes.fp32, device=device)
+    weights[pos] = topk_weights.flatten()[route].float()
+    experts = torch.zeros(capacity // block_m, dtype=dtypes.i32, device=device)
+    blocks = torch.repeat_interleave(torch.arange(E, device=device), padded // block_m)
+    experts[: blocks.numel()] = blocks.to(dtypes.i32)
+    num_valid = torch.tensor([int(padded.sum()), M], dtype=dtypes.i32, device=device)
+    return {
+        "sorted_token_ids": ids,
+        "sorted_weights": weights,
+        "sorted_expert_ids": experts,
+        "num_valid_ids": num_valid,
+        "topk_ids_ptr": topk_ids.data_ptr(),
+        "topk_weights_ptr": topk_weights.data_ptr(),
+        "M": M,
+        "block_m": block_m,
+        "num_experts": E,
+        "topk": topk,
+        "moe_buf_zeroed": moe_buf is not None,
+        "moe_buf_ptr": 0 if moe_buf is None else moe_buf.data_ptr(),
+    }
+
+
+def test_presorted_moe_std_sort_layout():
+    """The documented presort layout is moe_sorting's, bit for bit, at each BM.
+
+    For every block size in PRESORTED_MOE_BLOCK_MS and Kimi-K3 routing (E=896,
+    top-16) from 1 to 512 tokens, _reference_presort must equal
+    moe_sorting(block_size=block_m) in sorted_token_ids and sorted_weights up to
+    num_valid_ids[0], sorted_expert_ids for those blocks and num_valid_ids, fit
+    the capacity the matcher requires, and moe_sorting must zero the output it
+    is handed (the zeroing a presort leaves to the caller or fused_moe).
+    """
+    E, topk, model_dim = 896, 16, 3584
+    torch.manual_seed(0)
+    for block_m in presorted_moe.PRESORTED_MOE_BLOCK_MS:
+        for token in (1, 3, 64, 65, 128, 256, 512):
+            hidden = torch.randn((token, model_dim), dtype=dtypes.bf16)
+            gating = torch.randn((token, E), dtype=dtypes.bf16)
+            topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
+            buf = torch.full((token, model_dim), 1e3, dtype=dtypes.bf16)
+            ids, weights, experts, num_valid, moe_buf = aiter.fused_moe.moe_sorting(
+                topk_ids, topk_weights, E, model_dim, dtypes.bf16, block_m, output=buf
+            )
+            ref = _reference_presort(topk_ids, topk_weights, E, block_m)
+            what = f"BM={block_m} token={token}"
+            assert torch.equal(num_valid[:2], ref["num_valid_ids"]), what
+            n = int(num_valid[0])
+            assert n <= ref["sorted_token_ids"].numel(), f"{what}: capacity"
+            assert torch.equal(ids[:n], ref["sorted_token_ids"][:n]), what
+            assert torch.equal(weights[:n], ref["sorted_weights"][:n]), what
+            assert torch.equal(
+                experts[: n // block_m], ref["sorted_expert_ids"][: n // block_m]
+            ), what
+            assert moe_buf is buf and not buf.any(), f"{what}: output not zeroed"
+    aiter.logger.info("moe_2stage: presorted MoE standard sort layout passed")
+
+
+def test_presorted_moe_std_pipelines():
+    """FlyDSL pipelines without the aux sort run on a registered presort.
+
+    Kimi-K3 TP=8 (E=896, top-16, model_dim 3584, inter_dim 384): the shipped
+    A4W4 table runs BM=32 FlyDSL kernels at 65-256 tokens (BM=16 aux-sort ones
+    at 64), and A16W4 runs BM=32 (heuristic) to 32 tokens and BM=16 FlyDSL
+    kernels from 33, none with the aux sort. presorted_moe_block_m must report
+    each pipeline's block_m. For each, a presort in moe_sorting's layout must replace the sort
+    (no moe_sorting call) and give fused_moe's own result: bit-identical where
+    two own-sort runs are (the reduce GEMM2), within atomic-accumulation noise
+    otherwise. Pad rows of plain M are taken too. A stale output is zeroed
+    unless the presort says the caller zeroed it, and a presort for another
+    block_m is ignored, so fused_moe sorts again.
+    """
+    fm = aiter.fused_moe
+    E, topk, model_dim, inter_dim = 896, 16, 3584, 384
+    dtype = dtypes.bf16
+    torch_quant = aiter.get_torch_quant(aiter.QuantType.per_1x32)
+
+    def prep(w):
+        q, scale = torch_quant(w, quant_dtype=dtypes.fp4x2)
+        q = q.view(*w.shape[:-1], w.shape[-1] // 2)
+        scale = scale.view(*w.shape[:-1], w.shape[-1] // 32)
+        n_rows = scale.shape[0] * scale.shape[1]
+        return (
+            shuffle_weight(q.view(dtypes.fp4x2), (16, 16)),
+            fp4_utils.e8m0_shuffle(scale.view(n_rows, -1)).view(*scale.shape[:2], -1),
+        )
+
+    torch.manual_seed(0)
+    w1, w1_scale = prep(torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10)
+    w2, w2_scale = prep(torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10)
+    base = {
+        "w1_scale": w1_scale,
+        "w2_scale": w2_scale,
+        "quant_type": aiter.QuantType.per_1x32,
+        "activation": aiter.ActivationType.Situv2,
+    }
+    # (name, A4W4 env, extra kwargs, {token: block_m fused_moe must select})
+    cases = (
+        ("a4w4", "1", {"quant_dtype_a": dtypes.fp4x2}, {64: 16, 65: 32, 256: 32}),
+        ("a16w4", None, {}, {1: 32, 32: 32, 64: 16, 256: 16}),
+    )
+    real_sorting = fm.moe_sorting
+    real_cfgs = fm.get_2stage_cfgs
+    sort_calls, selected = [], []
+
+    def counting_sorting(*a, **kw):
+        sort_calls.append(1)
+        return real_sorting(*a, **kw)
+
+    def recording_cfgs(*a, **kw):
+        metadata = real_cfgs(*a, **kw)
+        selected.append(metadata)
+        return metadata
+
+    def check_close(ref, out, what):
+        mismatch = checkAllclose(
+            ref.float(), out.float(), rtol=1e-2, atol=1e-2, msg=what, printLog=False
+        )
+        assert mismatch == 0, f"{what}: {mismatch:.2%} of elements out of tolerance"
+
+    def timed_call(aux, hidden, topk_weights, topk_ids, kwargs):
+        fm.register_presorted_moe(aux)
+        return fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
+
+    def run(call, aux=None, output=None):
+        hidden, topk_weights, topk_ids, kwargs = call
+        sort_calls.clear()
+        selected.clear()
+        fm.register_presorted_moe(aux)
+        out = fused_moe(hidden, w1, w2, topk_weights, topk_ids, output=output, **kwargs)
+        return out.clone(), bool(sort_calls)
+
+    rows = []
+    try:
+        fm.moe_sorting = counting_sorting
+        fm.get_2stage_cfgs = recording_cfgs
+        for name, a4w4, extra, tokens in cases:
+            kwargs = {**base, **extra}
+            with override_env("AITER_SITUV2_A8W4", None), override_env(
+                "AITER_SITUV2_A4W4", a4w4
+            ):
+                for token, block_m in tokens.items():
+                    what = f"{name} token={token}"
+                    hidden = torch.randn((token, model_dim), dtype=dtype) / 10
+                    gating = torch.randn((token, E), dtype=dtype)
+                    topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
+                    call = (hidden, topk_weights, topk_ids, kwargs)
+
+                    own, sorted_ = run(call)
+                    metadata = selected[-1]
+                    assert sorted_, f"{what}: fused_moe did not sort"
+                    assert int(metadata.block_m) == block_m, f"{what}: {metadata}"
+                    # What a caller's router asks before building the sort.
+                    got = fm.presorted_moe_block_m(metadata)
+                    assert got == block_m, f"{what}: presorted_moe_block_m={got}"
+                    if metadata.output_aux:
+                        # The BM=16 aux-sort pipeline (test_presorted_moe_hook
+                        # runs it on a presort).
+                        continue
+                    own2, _ = run(call)
+                    deterministic = torch.equal(own, own2)
+                    aux = _reference_presort(topk_ids, topk_weights, E, block_m)
+                    pre, sorted_ = run(call, aux)
+                    assert not sorted_, f"{what}: presort unused"
+                    if deterministic:
+                        assert torch.equal(
+                            own, pre
+                        ), f"{what}: presort changed the result"
+                    else:
+                        check_close(own, pre, f"{what} presorted")
+                    pad = aux["sorted_token_ids"] == (topk << 24) | token
+                    plain = {
+                        **aux,
+                        "sorted_token_ids": torch.where(
+                            pad, token, aux["sorted_token_ids"]
+                        ),
+                    }
+                    out, sorted_ = run(call, plain)
+                    assert not sorted_, f"{what}: plain-M pads unused"
+                    check_close(own, out, f"{what} plain-M pads")
+                    # A stale output is zeroed; a caller-zeroed one is used as is.
+                    stale = torch.full((token, model_dim), 1e3, dtype=dtype)
+                    out, sorted_ = run(call, aux, output=stale)
+                    assert not sorted_, f"{what}: presort unused with output="
+                    check_close(own, out, f"{what} stale output")
+                    buf = torch.zeros((token, model_dim), dtype=dtype)
+                    zeroed = _reference_presort(
+                        topk_ids, topk_weights, E, block_m, moe_buf=buf
+                    )
+                    out, sorted_ = run(call, zeroed, output=buf)
+                    assert not sorted_, f"{what}: caller-zeroed presort unused"
+                    check_close(own, out, f"{what} caller-zeroed output")
+                    other = 48 - block_m  # 16 <-> 32
+                    _, sorted_ = run(
+                        call, _reference_presort(topk_ids, topk_weights, E, other)
+                    )
+                    assert sorted_, f"{what}: a BM={other} presort was used"
+                    assert (
+                        getattr(presorted_moe._PRESORTED_MOE, "aux", None) is None
+                    ), f"{what}: not consumed"
+                    row = {
+                        "pipeline": name,
+                        "token": token,
+                        "block_m": block_m,
+                        "bit-identical": deterministic,
+                        "presorted max abs diff": float(
+                            (own.float() - pre.float()).abs().max()
+                        ),
+                    }
+                    # The presort is built beforehand, as a caller's router
+                    # writes it before fused_moe, so only fused_moe is timed.
+                    # num_rotate_args=1: a rotated copy of topk_ids would no
+                    # longer match the registration.
+                    flops = 2 * 3 * token * topk * model_dim * inter_dim
+                    w_vals = 3 * model_dim * inter_dim
+                    nbytes = 2 * token * model_dim * dtype.itemsize + min(
+                        E, token * topk
+                    ) * (w_vals // 2 + w_vals // 32)
+                    for cand, reg in (("moe_sorting", None), ("presorted", aux)):
+                        sort_calls.clear()
+                        _, us = run_perftest(
+                            timed_call,
+                            reg,
+                            hidden,
+                            topk_weights,
+                            topk_ids,
+                            kwargs,
+                            num_rotate_args=1,
+                        )
+                        assert bool(sort_calls) == (
+                            reg is None
+                        ), f"{what}: {cand} timed with moe_sorting={bool(sort_calls)}"
+                        row[f"{cand} us"] = us
+                        row[f"{cand} TFLOPS"] = flops / us / 1e6
+                        row[f"{cand} TB/s"] = nbytes / us / 1e6
+                    rows.append(row)
+                    gc.collect()
+                    torch.cuda.empty_cache()
+    finally:
+        fm.moe_sorting = real_sorting
+        fm.get_2stage_cfgs = real_cfgs
+        fm.register_presorted_moe(None)
+    aiter.logger.info(
+        "moe_2stage presorted standard-sort pipelines (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+
 def test_presorted_moe_wrapper_error():
     """A fused_moe call rejected in the public wrapper still drops a registration.
 
@@ -1910,13 +2181,13 @@ def test_presorted_moe_wrapper_error():
 
 
 def _presorted_aux_stub(ids, weights, E, block_m=16):
-    """A registration whose sort tensors have the BM=16 aux-sort layout.
+    """A registration whose sort tensors have the BM=block_m aux-sort layout.
 
     Sized like fused_moe._adaptive_moe_sort; contents are left unset, since the
     matcher only checks the layout and no kernel reads them.
     """
     M, topk = ids.shape
-    BM = presorted_moe.PRESORTED_MOE_BLOCK_M
+    BM = block_m
     max_sorted = presorted_moe.aux_sort_capacity(M, topk, E, BM)
     i32 = dtypes.i32
     return {
@@ -2027,6 +2298,46 @@ def test_presorted_moe_layout_mismatch():
             if value is None:
                 del aux[key]
         assert match(aux) is None, f"presort with {name} was accepted"
+
+    # A pipeline without the aux sort reads only the four standard tensors: it
+    # takes a presort without m_indices and reverse_sorted, at BM=16 and BM=32,
+    # and still rejects one whose standard tensors break the BM layout.
+    def match_std(aux):
+        return presorted_moe.match_presorted_moe(
+            aux,
+            ids,
+            weights,
+            block_m=aux["block_m"],
+            num_experts=E,
+            topk=topk,
+            aux_sort=False,
+        )
+
+    for block_m in presorted_moe.PRESORTED_MOE_BLOCK_MS:
+        std = _presorted_aux_stub(ids, weights, E, block_m=block_m)
+        del std["m_indices"], std["reverse_sorted"]
+        n = std["sorted_token_ids"].numel()
+        assert match_std(std) is not None, f"BM={block_m} standard presort rejected"
+        assert match(std) is None, "an aux-sort pipeline took a presort without aux"
+        for name, change in {
+            "missing sorted_weights": {"sorted_weights": None},
+            "int64 sorted_expert_ids": {
+                "sorted_expert_ids": std["sorted_expert_ids"].to(torch.int64)
+            },
+            f"sorted_expert_ids not one per {block_m} rows": {
+                "sorted_expert_ids": torch.empty(n // block_m + 1, dtype=dtypes.i32)
+            },
+            "undersized sort": {
+                "sorted_token_ids": torch.empty(block_m, dtype=dtypes.i32),
+                "sorted_weights": torch.empty(block_m, dtype=dtypes.fp32),
+                "sorted_expert_ids": torch.empty(1, dtype=dtypes.i32),
+            },
+        }.items():
+            aux = {**std, **change}
+            for key, value in change.items():
+                if value is None:
+                    del aux[key]
+            assert match_std(aux) is None, f"BM={block_m}: {name} was accepted"
     aiter.logger.info(
         "moe_2stage: presorted MoE layout contract passed (%d mismatches)",
         len(bad_cases),
@@ -2063,37 +2374,47 @@ def test_presorted_moe_output_overlap():
 
 
 def test_presorted_moe_block_m():
-    """Only a BM=16 presort is accepted; another block_m falls back to fused_moe's sort.
+    """A presort is accepted only at a block_m its pipeline supports.
 
-    kimik3_a4w4_tuned_fmoe.csv also routes BM=32 tiles through the aux-sort path,
-    so a registration labelled block_m=32 that matches the call must still be
-    ignored. Checks the matcher fused_moe uses; no MoE kernel launches.
+    The aux-sort pipelines take PRESORTED_MOE_BLOCK_M (16); the FlyDSL pipelines
+    that read the standard sort take every size in PRESORTED_MOE_BLOCK_MS (16
+    and 32). Any other block_m, a presort labelled with another block_m than
+    the kernels', or a caller's block_size_M that hands the stages another size
+    falls back to fused_moe's sort. Checks the matcher fused_moe uses; no MoE
+    kernel launches.
     """
     M, E, topk = 4, 8, 2
     ids = torch.zeros((M, topk), dtype=torch.int32)
     weights = torch.zeros((M, topk))
+    std_ms = presorted_moe.PRESORTED_MOE_BLOCK_MS
 
-    def match(block_m):
+    def match(block_m, aux_sort, kernel_block_m=None, stage_block_m=None):
         aux = _presorted_aux_stub(ids, weights, E, block_m=block_m)
         return presorted_moe.match_presorted_moe(
-            aux, ids, weights, block_m=block_m, num_experts=E, topk=topk
-        )
-
-    assert match(16) is not None, "a matching BM=16 presort was rejected"
-    assert match(32) is None, "a BM=32 presort was accepted"
-    # BM=16 kernels, but a caller's block_size_M hands the stages another size.
-    aux = _presorted_aux_stub(ids, weights, E)
-    for stage_block_m, ok in ((16, True), (32, False)):
-        got = presorted_moe.match_presorted_moe(
             aux,
             ids,
             weights,
-            block_m=16,
+            block_m=block_m if kernel_block_m is None else kernel_block_m,
             num_experts=E,
             topk=topk,
+            aux_sort=aux_sort,
             stage_block_m=stage_block_m,
         )
-        assert (got is not None) == ok, f"block_size_M={stage_block_m}: {ok=}"
+
+    assert std_ms == (16, 32), std_ms
+    for block_m in (16, 32, 64):
+        for aux_sort, supported in ((True, (16,)), (False, std_ms)):
+            ok = block_m in supported
+            got = match(block_m, aux_sort) is not None
+            assert got == ok, f"BM={block_m} {aux_sort=}: accepted={got}"
+    for aux_sort in (True, False):
+        # A BM=16 presort for BM=32 kernels, and a matching presort whose
+        # stages a caller's block_size_M sets to another size.
+        assert match(16, aux_sort, kernel_block_m=32) is None, f"{aux_sort=}"
+        for stage_block_m, ok in ((16, True), (32, False)):
+            got = match(16, aux_sort, stage_block_m=stage_block_m) is not None
+            assert got == ok, f"{aux_sort=} block_size_M={stage_block_m}: {ok=}"
+    assert match(32, False, stage_block_m=16) is None, "BM=32 sort, BM=16 stages"
     aiter.logger.info("moe_2stage: presorted MoE block_m contract passed")
 
 
@@ -3136,12 +3457,14 @@ else:
     test_presorted_moe_layout_mismatch()
     test_presorted_moe_ignored_is_logged()
     test_presorted_moe_compile_order()
+    test_presorted_moe_std_sort_layout()
     # The hook test quantizes E=896 weights and times three candidates; skip it
     # for an explicit CLI quant sweep, like the tuned-CSV validation above.
     if args.quant is not None:
         aiter.logger.info("skipping presorted MoE hook test for a --quant sweep")
     elif get_gfx() == "gfx950":
         test_presorted_moe_hook()
+        test_presorted_moe_std_pipelines()
     else:
         aiter.logger.warning(
             "%s: skipping presorted MoE hook test (a4w4 is gfx950-only)", get_gfx()
