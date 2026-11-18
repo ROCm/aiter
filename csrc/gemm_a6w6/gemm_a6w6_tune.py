@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Tune registered gfx950 MXFP6 A6W6 assembly kernels by GEMM shape."""
+"""Tune gfx950 MXFP6 A6W6 kernels by GEMM shape.
+
+The candidates are the FlyDSL 4-wave kernel's variants (tile order and K-tile
+schedule) and, with ``--include-asm``, the registered assembly kernels. A row keeps a
+candidate only if it beats the untuned default (the FlyDSL kernel's default variant)
+by the minimum gain.
+"""
 
 import gc
 import math
@@ -21,6 +27,15 @@ from aiter.utility.mp_tuner import mp_tuner
 
 PACK_LAYOUT = "mxfp6_c0c1_256_padk2"
 _MANIFEST_NAME = "f6gemm_bf16_per1x32Fp6.csv"
+_FLYDSL_PREFIX = "flydsl_a6w6_"
+# FlyDSL candidates: M-tile swizzle group by MFMA block, barrier after MFMA 8. Their
+# kernelIds start above the assembly manifest's row indices.
+FLYDSL_KERNEL_ID_BASE = 1000
+FLYDSL_VARIANTS = tuple(
+    {"xcd_swizzle": group, "mblk_n": mblk_n, "bar": 8}
+    for mblk_n in (2, 4)
+    for group in (1, 2, 3, 4, 8)
+)
 _MANIFEST_COLUMNS = frozenset(
     {
         "tile_M",
@@ -132,6 +147,29 @@ def load_f6gemm_candidates() -> list[F6GemmCandidate]:
     return candidates
 
 
+def flydsl_candidates() -> list[tuple[int, str]]:
+    """(kernelId, kernelName) of each FlyDSL variant; every one runs any K."""
+    from aiter.ops.flydsl.gemm_a6w6_4wave import make_kernel_name
+
+    return [
+        (FLYDSL_KERNEL_ID_BASE + index, make_kernel_name(**variant))
+        for index, variant in enumerate(FLYDSL_VARIANTS)
+    ]
+
+
+def flydsl_kernel_id(kernel_name: str) -> int | None:
+    """The kernelId of a FlyDSL variant's name, or None for any other name."""
+    from aiter.ops.flydsl.gemm_a6w6_4wave import parse_kernel_name
+
+    config = parse_kernel_name(kernel_name)
+    if config is None:
+        return None
+    for index, variant in enumerate(FLYDSL_VARIANTS):
+        if variant == config:
+            return FLYDSL_KERNEL_ID_BASE + index
+    return None
+
+
 def candidate_supports_shape(
     candidate: F6GemmCandidate, M: int, N: int, K: int
 ) -> bool:
@@ -164,11 +202,12 @@ def generate_data(
     x_packed, x_scales = aiter.quant_mxfp6_gemm(x)
     w_packed, w_scales = aiter.quant_mxfp6_gemm(w)
     out = torch.empty((_ceil(M, 256), _ceil(N, 256)), dtype=dtype, device=device)
-    # Candidate kernels share the same quantized math. Use the safe production
-    # fallback as the tuning reference so large diffusion sweeps do not allocate
-    # multi-gigabyte fp32 dequantized operands/results. Independent numerical
-    # validation remains in op_tests/test_gemm_a6w6.py.
-    from aiter.ops.gemm_op_a6w6 import _default_gemm_a6w6_kernel
+    # Candidate kernels share the same quantized math. Use the safe assembly
+    # fallback, an independent implementation, as the tuning reference so large
+    # diffusion sweeps do not allocate multi-gigabyte fp32 dequantized
+    # operands/results. Independent numerical validation remains in
+    # op_tests/test_gemm_a6w6.py.
+    from aiter.ops.gemm_op_a6w6 import _default_gemm_a6w6_asm_kernel
 
     reference_out = torch.empty_like(out)
     aiter.gemm_a6w6_asm(
@@ -178,7 +217,7 @@ def generate_data(
         w_scales,
         reference_out,
         _ceil(K, 128),
-        _default_gemm_a6w6_kernel(M, N, K),
+        _default_gemm_a6w6_asm_kernel(M, N, K),
     )
     ref = reference_out[:M, :N].clone()
     return {
@@ -195,7 +234,20 @@ def return_reference(ref: torch.Tensor) -> torch.Tensor:
     return ref
 
 
-def run_gemm_a6w6_asm(
+def _launch(x_packed, w_packed, x_scales, w_scales, out, K, kernel_name):
+    """Run one candidate by name: a FlyDSL variant or an assembly kernel."""
+    if kernel_name.startswith(_FLYDSL_PREFIX):
+        aiter.gemm_a6w6_flydsl_out(
+            x_packed, w_packed, x_scales, w_scales, out, _ceil(K, 128), kernel_name
+        )
+    else:
+        aiter.gemm_a6w6_asm(
+            x_packed, w_packed, x_scales, w_scales, out, _ceil(K, 128), kernel_name
+        )
+    return out
+
+
+def run_gemm_a6w6(
     x_packed: torch.Tensor,
     w_packed: torch.Tensor,
     x_scales: torch.Tensor,
@@ -206,15 +258,7 @@ def run_gemm_a6w6_asm(
     K: int,
     kernel_name: str,
 ) -> torch.Tensor:
-    aiter.gemm_a6w6_asm(
-        x_packed,
-        w_packed,
-        x_scales,
-        w_scales,
-        out,
-        _ceil(K, 128),
-        kernel_name,
-    )
+    _launch(x_packed, w_packed, x_scales, w_scales, out, K, kernel_name)
     return out[:M, :N]
 
 
@@ -290,18 +334,12 @@ def benchmark_candidate_gain(
     candidate_out = torch.empty_like(default_out)
 
     def launch_default():
-        return aiter.gemm_a6w6_asm(
-            x_packed,
-            w_packed,
-            x_scales,
-            w_scales,
-            default_out,
-            padK,
-            default_kernel,
+        return _launch(
+            x_packed, w_packed, x_scales, w_scales, default_out, padK, default_kernel
         )
 
     def launch_candidate():
-        return aiter.gemm_a6w6_asm(
+        return _launch(
             x_packed,
             w_packed,
             x_scales,
@@ -399,6 +437,12 @@ class GemmA6W6Tuner(GemmCommonTuner):
             action="store_true",
             help="Disable paired validation against the safe default.",
         )
+        self.parser.add_argument(
+            "--include-asm",
+            action="store_true",
+            help="Also tune the registered assembly kernels, besides the FlyDSL "
+            "kernel's variants.",
+        )
 
     def _clear_op_caches(self):
         from aiter.ops.gemm_op_a6w6 import clear_gemm_a6w6_config_cache
@@ -406,8 +450,18 @@ class GemmA6W6Tuner(GemmCommonTuner):
         clear_gemm_a6w6_config_cache()
 
     def getKernelName(self, kernel_id):
+        # A FlyDSL variant's name carries K, so its tasks carry their names instead.
         candidate = self.candidates_by_id.get(kernel_id)
         return None if candidate is None else candidate["kernel_name"]
+
+    def _kernel_id(self, kernel_name):
+        flydsl_id = flydsl_kernel_id(kernel_name)
+        if flydsl_id is not None:
+            return flydsl_id
+        for candidate in self.candidates:
+            if candidate["kernel_name"] == kernel_name:
+                return candidate["kernel_id"]
+        raise KeyError(f"unknown A6W6 kernel {kernel_name!r}")
 
     def calculate(self, results, bpes=(0.75, 0.75, 2)):
         return super().calculate(results, bpes=bpes)
@@ -429,9 +483,6 @@ class GemmA6W6Tuner(GemmCommonTuner):
 
         from aiter.ops.gemm_op_a6w6 import _default_gemm_a6w6_kernel
 
-        candidates_by_name = {
-            candidate["kernel_name"]: candidate for candidate in self.candidates
-        }
         guarded = resultdf.copy()
         for index, row in guarded.iterrows():
             M, N, K = int(row["M"]), int(row["N"]), int(row["K"])
@@ -472,8 +523,8 @@ class GemmA6W6Tuner(GemmCommonTuner):
                     default_kernel,
                 )
 
-            selected = candidates_by_name[selected_kernel]
-            guarded.at[index, "kernelId"] = selected["kernel_id"]
+            selected_id = self._kernel_id(selected_kernel)
+            guarded.at[index, "kernelId"] = selected_id
             guarded.at[index, "kernelName"] = selected_kernel
             guarded.at[index, "splitK"] = 0
             if validation is not None:
@@ -497,7 +548,7 @@ class GemmA6W6Tuner(GemmCommonTuner):
                             N,
                             K,
                         ),
-                        selected["kernel_id"],
+                        selected_id,
                         0,
                         selected_kernel,
                     ),
@@ -600,23 +651,21 @@ class GemmA6W6Tuner(GemmCommonTuner):
         seed = 0
         for _, row in untunedf.iterrows():
             M, N, K = int(row["M"]), int(row["N"]), int(row["K"])
-            compatible_candidates = [
-                candidate
-                for candidate in self.candidates
-                if candidate_supports_shape(candidate, M, N, K)
-            ]
-            if not compatible_candidates:
-                raise RuntimeError(f"no safe A6W6 candidate for {(M, N, K)}")
-            for candidate in compatible_candidates:
-                kernel_id = candidate["kernel_id"]
-                kernel_name = candidate["kernel_name"]
+            compatible_candidates = flydsl_candidates()
+            if args.include_asm:
+                compatible_candidates += [
+                    (candidate["kernel_id"], candidate["kernel_name"])
+                    for candidate in self.candidates
+                    if candidate_supports_shape(candidate, M, N, K)
+                ]
+            for kernel_id, kernel_name in compatible_candidates:
                 info = ((gfx, cu_num, M, N, K), kernel_id, 0, kernel_name)
                 tasks.append(
                     (
                         info,
                         generate_data,
                         (M, N, K, seed),
-                        run_gemm_a6w6_asm,
+                        run_gemm_a6w6,
                         (gemm_keys, M, N, K, kernel_name),
                         {
                             "num_warmup": args.warmup,
@@ -652,6 +701,7 @@ class GemmA6W6Tuner(GemmCommonTuner):
 if __name__ == "__main__":
     tuner = GemmA6W6Tuner(
         "GemmA6W6Tuner",
-        description="Tune gfx950 MXFP6 A6W6 assembly kernels",
+        description="Tune gfx950 MXFP6 A6W6 kernels (FlyDSL variants; assembly "
+        "kernels with --include-asm)",
     )
     tuner.run(tuner.parse_args(), False)

@@ -13,8 +13,12 @@ import torch
 
 from aiter.ops import gemm_op_a6w6
 from csrc.gemm_a6w6.gemm_a6w6_tune import (
+    FLYDSL_KERNEL_ID_BASE,
+    FLYDSL_VARIANTS,
     candidate_supports_shape,
     choose_guarded_kernel,
+    flydsl_candidates,
+    flydsl_kernel_id,
 )
 
 AITER_ROOT = os.path.dirname(
@@ -165,9 +169,29 @@ class TestA6W6TuningLookup(unittest.TestCase):
             "explicit_kernel",
         )
         self.assertEqual(
-            gemm_op_a6w6._default_gemm_a6w6_kernel(512, 55296, 6144),
+            gemm_op_a6w6._default_gemm_a6w6_asm_kernel(512, 55296, 6144),
             gemm_op_a6w6._SAFE_FALLBACK_KERNEL_NAME,
         )
+
+    def test_default_is_the_flydsl_kernel(self):
+        self.assertEqual(
+            gemm_op_a6w6._default_gemm_a6w6_kernel(512, 55296, 6143),
+            "flydsl_a6w6_4w_256x256x128_m82b8_1x4",
+        )
+        with mock.patch.object(gemm_op_a6w6, "_DEFAULT_BACKEND", "asm"):
+            self.assertEqual(
+                gemm_op_a6w6._default_gemm_a6w6_kernel(512, 55296, 6144),
+                gemm_op_a6w6._SAFE_FALLBACK_KERNEL_NAME,
+            )
+
+    def test_flydsl_candidates_name_their_variant(self):
+        candidates = flydsl_candidates()
+        self.assertEqual(len(candidates), len(FLYDSL_VARIANTS))
+        self.assertEqual(len({name for _, name in candidates}), len(candidates))
+        for index, (kernel_id, kernel_name) in enumerate(candidates):
+            self.assertEqual(kernel_id, FLYDSL_KERNEL_ID_BASE + index)
+            self.assertEqual(flydsl_kernel_id(kernel_name), kernel_id)
+        self.assertIsNone(flydsl_kernel_id(gemm_op_a6w6._KERNEL_NAME))
 
     def test_compiled_selector_matches_exact_then_padded_shape(self):
         configs = (

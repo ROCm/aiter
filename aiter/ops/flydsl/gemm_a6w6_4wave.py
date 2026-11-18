@@ -11,6 +11,7 @@ The operands are the ASM A6W6 kernels' packed blobs from
 from __future__ import annotations
 
 import functools
+import re
 
 import torch
 from torch import Tensor
@@ -20,7 +21,7 @@ from aiter.jit.utils.chip_info import get_cdna4_num_xcds, get_gfx_runtime
 BLOCK_M = 256
 BLOCK_N = 256
 BLOCK_K = 128
-MIN_K = 3 * BLOCK_K
+MIN_K = BLOCK_K
 PADK = 2
 TILE_BYTES = BLOCK_M * BLOCK_K * 6 // 8
 SCALE_TILE_BYTES = BLOCK_M * BLOCK_K // 32
@@ -45,20 +46,34 @@ def _lazy_import() -> None:
     _fx = fx_mod
 
 
+KERNEL_PREFIX = "flydsl_a6w6_4w_"
+_KERNEL_NAME_RE = re.compile(
+    rf"^{KERNEL_PREFIX}{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_m8(?P<mblk_n>[24])b(?P<bar>\d+)"
+    r"_1x(?P<xcd_swizzle>\d+)$"
+)
+
+
 def make_kernel_name(
     *,
-    K: int,
     xcd_swizzle: int = DEFAULT_XCD_SWIZZLE,
     mblk_n: int = 2,
     bar: int | None = 8,
 ) -> str:
+    """The tuned-table name of one variant. A name leaves K open, as tuned rows key
+    on it and the launch passes it, so the untuned default name is a constant
+    under torch.compile with dynamic shapes."""
     from .kernels.gemm_a6w6_4wave import Schedule
 
     tag = Schedule(int(mblk_n), bar).tag
-    return (
-        f"flydsl_a6w6_4w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_{tag}_1x{int(xcd_swizzle)}"
-        f"_k{int(K)}"
-    )
+    return f"{KERNEL_PREFIX}{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_{tag}_1x{int(xcd_swizzle)}"
+
+
+def parse_kernel_name(name: str) -> dict[str, int] | None:
+    """The variant a canonical kernel name selects, or ``None``."""
+    match = _KERNEL_NAME_RE.fullmatch(name)
+    if match is None:
+        return None
+    return {key: int(value) for key, value in match.groupdict().items()}
 
 
 @functools.lru_cache(maxsize=256)
@@ -99,7 +114,9 @@ def run_gemm_a6w6_4wave(
 ) -> Tensor:
     """``out = A * B^T`` for packed operands; ``K`` is the padded K."""
     if get_gfx_runtime() != "gfx950":
-        raise NotImplementedError("[FlyDSL A6W6 4wave] kernel is supported only on gfx950")
+        raise NotImplementedError(
+            "[FlyDSL A6W6 4wave] kernel is supported only on gfx950"
+        )
     if out.dtype != torch.bfloat16 or out.ndim != 2 or not out.is_contiguous():
         raise ValueError("[FlyDSL A6W6 4wave] out must be a contiguous 2-D BF16 tensor")
     pad_m, pad_n = out.shape
@@ -140,4 +157,29 @@ def run_gemm_a6w6_4wave(
     return out
 
 
-__all__ = ["compile_a6w6_gemm", "make_kernel_name", "run_gemm_a6w6_4wave"]
+def run_named_gemm_a6w6_4wave(
+    A: Tensor,
+    B: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    out: Tensor,
+    K: int,
+    kernel_name: str,
+) -> Tensor:
+    """Run the variant ``kernel_name`` names; ``K`` is the padded K."""
+    config = parse_kernel_name(kernel_name)
+    if config is None:
+        raise ValueError(
+            f"[FlyDSL A6W6 4wave] unrecognized kernelName: {kernel_name!r}"
+        )
+    return run_gemm_a6w6_4wave(A, B, A_scale, B_scale, out, K, **config)
+
+
+__all__ = [
+    "KERNEL_PREFIX",
+    "compile_a6w6_gemm",
+    "make_kernel_name",
+    "parse_kernel_name",
+    "run_gemm_a6w6_4wave",
+    "run_named_gemm_a6w6_4wave",
+]

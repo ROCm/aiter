@@ -11,11 +11,14 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.core import get_asm_dir
+from aiter.ops import gemm_op_a6w6
 from aiter.ops.gemm_op_a6w6 import (
     _ceil,
+    _default_gemm_a6w6_asm_kernel,
     _select_gemm_a6w6_kernel,
     dequant_mxfp6_torch,
     gemm_a6w6_asm,
+    gemm_a6w6_flydsl_out,
     quant_mxfp6_gemm,
     quant_mxfp6_torch,
 )
@@ -132,9 +135,7 @@ def _manifest_kernel_names(M, N, K):
     ids=("square", "ffn_up", "ffn_down"),
 )
 @torch.no_grad()
-def test_specialized_dispatch_matches_safe_kernel(
-    shape, specialized_kernel, safe_kernel
-):
+def test_specialized_kernel_matches_safe_kernel(shape, specialized_kernel, safe_kernel):
     from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
     if get_gfx() != "gfx950":
@@ -149,11 +150,111 @@ def test_specialized_dispatch_matches_safe_kernel(
     B, B_scale = quant_mxfp6_gemm(w)
     baseline = torch.empty((padM, padN), dtype=torch.bfloat16)
     actual = torch.empty_like(baseline)
-    selected = _select_gemm_a6w6_kernel(M, N, K, None)
-    assert selected == specialized_kernel
     gemm_a6w6_asm(A, B, A_scale, B_scale, baseline, K, safe_kernel)
-    gemm_a6w6_asm(A, B, A_scale, B_scale, actual, K, selected)
+    gemm_a6w6_asm(A, B, A_scale, B_scale, actual, K, specialized_kernel)
     assert torch.equal(actual[:M, :N], baseline[:M, :N])
+
+
+# FlyDSL variants: the default, both MFMA blocks, and other tile orders.
+FLYDSL_VARIANTS = (
+    {},
+    {"mblk_n": 4},
+    {"xcd_swizzle": 1},
+    {"xcd_swizzle": 8, "mblk_n": 4, "bar": 12},
+)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    (
+        (256, 256, 128),  # one K tile
+        (257, 513, 129),  # row, column and K padding; two K tiles
+        (513, 784, 1152),  # nine K tiles, through the runtime K loop
+        (1024, 768, 1280),
+        (9450, 5120, 5120),
+        (9450, 13824, 5120),
+        (9450, 5120, 13824),
+    ),
+)
+@pytest.mark.parametrize("variant", FLYDSL_VARIANTS, ids=lambda v: str(v) or "default")
+@torch.no_grad()
+def test_flydsl_matches_asm_bitwise(shape, variant):
+    from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+    from aiter.ops.flydsl.gemm_a6w6_4wave import make_kernel_name
+
+    if get_gfx() != "gfx950":
+        pytest.skip("A6W6 requires gfx950")
+    M, N, K = shape
+    padM, padN, padK = _ceil(M, 256), _ceil(N, 256), _ceil(K, 128)
+    torch.manual_seed(M + N + K)
+    x = torch.randn((M, K), dtype=torch.bfloat16)
+    w = torch.randn((N, K), dtype=torch.bfloat16)
+    A, A_scale = quant_mxfp6_gemm(x)
+    B, B_scale = quant_mxfp6_gemm(w)
+    baseline = torch.empty((padM, padN), dtype=torch.bfloat16)
+    actual = torch.empty_like(baseline)
+    gemm_a6w6_asm(
+        A, B, A_scale, B_scale, baseline, padK, _default_gemm_a6w6_asm_kernel(M, N, K)
+    )
+    kernel = make_kernel_name(**variant)
+    gemm_a6w6_flydsl_out(A, B, A_scale, B_scale, actual, padK, kernel)
+    torch.cuda.synchronize()
+    assert torch.equal(
+        actual[:M, :N].view(torch.int16), baseline[:M, :N].view(torch.int16)
+    )
+
+
+def test_untuned_shapes_default_to_flydsl():
+    pytest.importorskip("flydsl")
+    # 257x513x129 has no tuned row.
+    assert _select_gemm_a6w6_kernel(257, 513, 129, None) == (
+        "flydsl_a6w6_4w_256x256x128_m82b8_1x4"
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(gemm_op_a6w6, "_DEFAULT_BACKEND", "asm")
+        assert _select_gemm_a6w6_kernel(257, 513, 129, None) == (
+            _default_gemm_a6w6_asm_kernel(257, 513, 129)
+        )
+
+
+@torch.no_grad()
+def test_gemm_a6w6_runs_the_named_backend():
+    from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+
+    if get_gfx() != "gfx950":
+        pytest.skip("A6W6 requires gfx950")
+    M, N, K = 300, 600, 1000
+    torch.manual_seed(7)
+    A, A_scale = quant_mxfp6_gemm(torch.randn((M, K), dtype=torch.bfloat16))
+    B, B_scale = quant_mxfp6_gemm(torch.randn((N, K), dtype=torch.bfloat16))
+    asm = aiter.gemm_a6w6(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        M,
+        N,
+        K,
+        kernelName=_default_gemm_a6w6_asm_kernel(M, N, K),
+    )
+    default = aiter.gemm_a6w6(A, B, A_scale, B_scale, M, N, K)
+    torch.cuda.synchronize()
+    assert torch.equal(default.view(torch.int16), asm.view(torch.int16))
+
+
+def test_asm_wrapper_rejects_flydsl_kernel_names():
+    out = torch.empty((256, 256), dtype=torch.bfloat16, device="meta")
+    packed = torch.empty(0, dtype=torch.uint8, device="meta")
+    with pytest.raises(ValueError, match="FlyDSL kernel"):
+        gemm_a6w6_asm(
+            packed,
+            packed,
+            packed,
+            packed,
+            out,
+            128,
+            "flydsl_a6w6_4w_256x256x128_m82b8_1x4",
+        )
 
 
 @pytest.mark.parametrize(
