@@ -10,8 +10,6 @@ gathered during the first tile's PV (32 rows). Per-row knobs come from the
 "_sparse_mla_fp8_h64" config.
 
 Index, scale and output contracts are those of sparse_mla_fp8_h64_small.
-
-Ported from the Artemis glm52_fp8_ep8 kernel pack (GLM-5.2 FP8 EP8 decode).
 """
 
 from triton.experimental import gluon

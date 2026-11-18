@@ -14,8 +14,6 @@ Each row reads at most 2048 indices from kv_indices[kv_indptr[row]:], and a
 -1 index or an index past the row's count is masked out. The cache rows are
 576 B ([P, 576] fp8). The scales fold in as sm_scale * q_scale * kv_scale on
 the scores and kv_scale on the output.
-
-Ported from the Artemis glm52_fp8_ep8 kernel pack (GLM-5.2 FP8 EP8 decode).
 """
 
 from triton.experimental import gluon
