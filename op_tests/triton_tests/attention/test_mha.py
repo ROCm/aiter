@@ -969,6 +969,15 @@ def test_mha_varlen(
     )
 
 
+# The cases above stay at seqlen <= 2048. Longer sequences route head dims in
+# (64, 128] to the register-heavy forward configs on gfx1250.
+@pytest.mark.parametrize("CAUSAL, SEQLEN", [(True, 4608), (False, 3072)])
+@pytest.mark.parametrize("VARLEN", [False, True])
+def test_mha_long_seqlen(CAUSAL: bool, SEQLEN: int, VARLEN: bool):
+    impl = _test_mha_varlen_impl if VARLEN else _test_mha_impl
+    impl(2, SEQLEN, SEQLEN, 16, 4, 128, 0.0, False, False, CAUSAL)
+
+
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 1)])
 @pytest.mark.parametrize("DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.2, True, True)])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
@@ -1537,47 +1546,6 @@ def test_mha_fwd_mid_head_selection(
         # Arches without mid_head keep the pre-existing selection.
         assert "mid_head_skip" not in fwd_cfg or "mid_head" in fwd_cfg
         pytest.skip("mid_head_skip rules are only defined for gfx950")
-    cfg = _get_config(
-        False,
-        torch.bfloat16,
-        head_dim_v=head_dim_v,
-        causal=causal,
-        max_seqlen_q=seqlen_q,
-        max_seqlen_k=seqlen_k,
-        batch_heads=batch_heads,
-    )
-    assert cfg == fwd_cfg[expected]
-
-
-@pytest.mark.parametrize(
-    "causal, head_dim_v, seqlen_q, seqlen_k, batch_heads, expected",
-    [
-        (True, 128, None, None, None, "mid_head"),  # no shape info
-        (True, 128, 4096, 4096, 32, "mid_head_short"),  # causal, at boundary
-        (True, 128, 4097, 4097, 32, "mid_head"),  # causal, one token over
-        (True, 96, 16384, 16384, 32, "mid_head"),
-        (False, 128, 2048, 2048, 32, "mid_head_short"),  # non-causal, at boundary
-        (False, 128, 2049, 2049, 32, "mid_head_noncausal"),
-        (False, 96, 16384, 16384, 32, "mid_head_noncausal"),
-        (True, 64, 16384, 16384, 32, "small_head"),  # outside mid_head range
-        (True, 160, 16384, 16384, 32, "default"),
-    ],
-)
-def test_mha_fwd_mid_head_selection_gfx1250(
-    causal, head_dim_v, seqlen_q, seqlen_k, batch_heads, expected
-):
-    from aiter.ops.triton._triton_kernels.attention.mha import _get_config
-    from aiter.ops.triton.utils._triton.arch_info import get_arch
-    from aiter.ops.triton.utils.config_utils import (
-        load_config_json,
-        resolve_config_dir,
-    )
-
-    if get_arch() != "gfx1250":
-        pytest.skip("gfx1250 mid_head routing")
-    fwd_cfg = load_config_json(
-        f"{resolve_config_dir('attention', 'MHA', backend='triton')}/DEFAULT.json"
-    )["fwd"]
     cfg = _get_config(
         False,
         torch.bfloat16,
