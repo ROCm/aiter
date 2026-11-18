@@ -79,6 +79,10 @@ struct opus_gqa_kargs {
     long long stride_oacc_split;
     int stride_lseacc_h;
     long long stride_lseacc_split;
+
+    // Optional per-head attention sink, fp32 [H], natural-log logits: one more softmax term per
+    // row that carries no value. nullptr = none.
+    const void* ptr_sink;
 };
 
 // Configuration traits for the GQA kernel (tile sizes, data types, vector lengths,
@@ -112,8 +116,8 @@ struct opus_gqa_traits {
     static constexpr int PAGE_SIZE = 128;
     static constexpr int KV_TILES_PER_PAGE = PAGE_SIZE / KV_TILE_SIZE_;
     static_assert(PAGE_SIZE % KV_TILE_SIZE_ == 0, "a KV tile must not straddle a page");
-    static_assert(!PAGED_ || (GROUP_MODE_ && !LOCAL_), "PAGED is group mode, no window");
-    // Split-KV: grid z splits each Q-block's KV range into page-aligned shares.
+    static_assert(!PAGED_ || GROUP_MODE_, "PAGED is group mode");
+    // Split-KV: grid z splits each Q-block's KV range into shares (page-aligned unless LOCAL).
     static constexpr bool SPLIT = SPLIT_;
     static_assert(!SPLIT_ || PAGED_, "SPLIT runs on the paged path");
 

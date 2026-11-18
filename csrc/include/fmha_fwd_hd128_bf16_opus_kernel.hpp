@@ -846,10 +846,28 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
             store<T::VEC_O>(g_oacc, v_o, make_layout_o<T>(warp_id, lane_id, kargs.stride_oacc_n));
             return;
         }
+        // Sink: a key with no value, sink * log2e in this base-2 domain. Rebase onto
+        // max(m_row, sink) so a large sink cannot overflow; with no keys, lse = sink, O = 0.
+        D_ACC m_fin = m_row, l_fin = l_row;
+        D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
+        if (kargs.ptr_sink != nullptr) {
+            // Address space 4 makes it an s_load; a global load would add a vmcnt(0) wait.
+            using sink_elem_t = const __attribute__((address_space(4))) float;
+            const D_ACC s2 = ((sink_elem_t*)kargs.ptr_sink)[h] * LOG2_E;
+            if (l_row > D_ACC(0.0f)) {
+                m_fin = m_row > s2 ? m_row : s2;
+                const D_ACC alpha = __builtin_amdgcn_exp2f(m_row - m_fin);
+                l_fin = l_row * alpha + __builtin_amdgcn_exp2f(s2 - m_fin);
+                l_inv = alpha / l_fin;
+            } else {
+                m_fin = s2;
+                l_fin = D_ACC(1.0f);
+            }
+        }
         if (kargs.ptr_lse != nullptr && lane_id < T::W_M) {
             constexpr D_ACC LN2 = D_ACC(0.69314718055994531f);   // 1 / log2(e)
-            const D_ACC lse = (l_row > D_ACC(0.0f))
-                                  ? ((m_row + __builtin_amdgcn_logf(l_row)) * LN2)
+            const D_ACC lse = (l_fin > D_ACC(0.0f))
+                                  ? ((m_fin + __builtin_amdgcn_logf(l_fin)) * LN2)
                                   : -opus::numeric_limits<D_ACC>::infinity();
             auto g_lse = make_gmem(reinterpret_cast<D_ACC*>(kargs.ptr_lse) +
                                        lse_batch_base +
@@ -858,7 +876,6 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
             g_lse.store(lse, warp_id * T::Q_TILE_SIZE + lane_id);
         }
 
-        D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
         static_for<o_len>([&](auto i) { v_o[i.value] *= l_inv; });
 
         // Widened store: each dwordx4 (VEC_O_X4) group is packed and stored one group at a

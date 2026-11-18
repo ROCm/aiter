@@ -40,7 +40,8 @@ void launch_d128(at::Tensor& q,
                  int max_seqlen_k,
                  int window_size_left,
                  std::optional<at::Tensor>& block_table,
-                 int num_splits)
+                 int num_splits,
+                 std::optional<at::Tensor>& sink)
 {
     constexpr int D = 128;
     constexpr int Q_TILE_SIZE = 32, NUM_WARPS = 8;
@@ -198,7 +199,8 @@ void launch_d128(at::Tensor& q,
                 cu_count[dev].store(num_cus, std::memory_order_relaxed);
             }
             num_splits = paged ? fmha_fwd_bf16_opus_detail::d128_auto_splits(
-                                     H, static_cast<int>(total_q), B, max_seqlen_q, max_seqlen_k, num_cus)
+                                     H, static_cast<int>(total_q), B, max_seqlen_q, max_seqlen_k,
+                                     window_size_left, num_cus)
                                : 1;
         }
         if (num_splits > 1) {
@@ -243,6 +245,13 @@ void launch_d128(at::Tensor& q,
     }
 
     TORCH_CHECK(H_KV > 0 && (H % H_KV) == 0, "H must be divisible by H_KV (GQA group)");
+    if (sink.has_value()) {
+        const at::Tensor& sk = *sink;
+        TORCH_CHECK(sk.device() == q.device(), "sink must be on the same device as q");
+        TORCH_CHECK(sk.scalar_type() == at::kFloat && sk.dim() == 1 && sk.numel() == H && sk.is_contiguous(),
+                    "sink must be contiguous fp32 [H]");
+        args.sink_ptr = sk.data_ptr();
+    }
     TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1 && out.stride(-1) == 1,
                 "q/k/v/out must be contiguous along the head dim D");
 
@@ -456,7 +465,8 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             int max_seqlen_k,
                             int window_size_left,
                             std::optional<at::Tensor> block_table,
-                            int num_splits)
+                            int num_splits,
+                            std::optional<at::Tensor> sink)
 {
     TORCH_CHECK(q.is_cuda(), "q must be a GPU tensor");
     TORCH_CHECK(k.device() == q.device() && v.device() == q.device() &&
@@ -473,12 +483,12 @@ void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
     if (D_QK == 128 && D_V == 128) {
         launch_d128(q, k, v, out, causal, softmax_scale, lse,
                     seqstart_q, seqstart_k, seqstart_q_pad, seqstart_k_pad,
-                    max_seqlen_q, max_seqlen_k, window_size_left, block_table, num_splits);
+                    max_seqlen_q, max_seqlen_k, window_size_left, block_table, num_splits, sink);
     } else if (D_QK == 192 && D_V == 128) {
         TORCH_CHECK(window_size_left < 0,
                     "OPUS D_QK=192/D_V=128 kernel has no sliding window");
-        TORCH_CHECK(!block_table.has_value() && num_splits == 1,
-                    "OPUS D_QK=192/D_V=128 kernel has no paged or split KV");
+        TORCH_CHECK(!block_table.has_value() && num_splits == 1 && !sink.has_value(),
+                    "OPUS D_QK=192/D_V=128 kernel has no paged or split KV and no sink");
         launch_d192_v128(q, k, v, out, causal, softmax_scale, lse,
                          seqstart_q, seqstart_k, seqstart_q_pad, seqstart_k_pad,
                          max_seqlen_q, max_seqlen_k);
