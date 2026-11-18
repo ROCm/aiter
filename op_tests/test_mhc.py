@@ -801,6 +801,59 @@ def _launch_mhc_post_reduce(x, residual, post, comb):
     aiter.mhc_post_reduce(out, x, residual, post, comb)
 
 
+def test_mhc_post_reduce_operand_guards():
+    """`mhc_post_reduce` refuses an ``out`` that overlaps an input and operands
+    off ``residual``'s GPU, and on a second GPU launches on that GPU's stream
+    even while another device is current."""
+    m, hidden_size, hc_mult = 2, 1024, 4
+    x = torch.randn(m, hidden_size).bfloat16()
+    residual = torch.randn(m, hc_mult, hidden_size).bfloat16()
+    post = torch.rand(m, hc_mult, 1)
+    comb = torch.rand(m, hc_mult, hc_mult)
+    refusals = {
+        "out overlaps residual": lambda: aiter.mhc_post_reduce(
+            residual.view(-1)[: m * hidden_size].view(m, hidden_size),
+            x,
+            residual,
+            post,
+            comb,
+        ),
+        "out is x": lambda: aiter.mhc_post_reduce(x, x, residual, post, comb),
+        "post_layer_mix on the CPU": lambda: aiter.mhc_post_reduce(
+            torch.empty(m, hidden_size, dtype=x.dtype), x, residual, post.cpu(), comb
+        ),
+        "comb_res_mix on the CPU": lambda: aiter.mhc_post_reduce(
+            torch.empty(m, hidden_size, dtype=x.dtype), x, residual, post, comb.cpu()
+        ),
+    }
+    rows = []
+    for name, launch in refusals.items():
+        try:
+            launch()
+            torch.cuda.synchronize()
+            raised = False
+        except RuntimeError:
+            raised = True
+        assert raised, f"mhc_post_reduce accepted: {name}"
+        rows.append({"case": f"{name} raises", "ok": raised})
+    if torch.cuda.device_count() > 1:
+        expected = torch.empty(m, hidden_size, dtype=x.dtype)
+        aiter.mhc_post_reduce(expected, x, residual, post, comb)
+        dev = torch.device("cuda", 1)
+        args = [t.to(dev) for t in (x, residual, post, comb)]
+        out = torch.empty(m, hidden_size, dtype=x.dtype, device=dev)
+        side = torch.cuda.Stream(device=0)
+        with torch.cuda.device(0), torch.cuda.stream(side):
+            aiter.mhc_post_reduce(out, *args)
+        torch.cuda.synchronize(dev)
+        same = torch.equal(out.cpu(), expected.cpu())
+        assert same, "mhc_post_reduce on cuda:1 with cuda:0 current differs"
+        rows.append(
+            {"case": "cuda:1 inputs, cuda:0 current on a side stream", "ok": same}
+        )
+    return rows
+
+
 def test_mhc_post_support_queries():
     """`mhc_post_supported` / `mhc_post_reduce_supported` against the launch:
     over a sweep of hidden sizes and dtypes, a query is False exactly where
@@ -1383,6 +1436,7 @@ if not args.hc_head:
     # The query sweep, then the reduce at the 1024- and 512-column tiles (1024 and
     # 2560 take the 512 one; gfx942 takes it for every size) in both dtypes.
     print_json_table("mhc_post support queries", test_mhc_post_support_queries())
+    print_json_table("mhc_post_reduce guards", test_mhc_post_reduce_operand_guards())
 
     df = []
     for dtype in (dtypes.bf16, dtypes.fp16):

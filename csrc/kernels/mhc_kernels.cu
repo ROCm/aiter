@@ -13,6 +13,7 @@
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
 #include <algorithm>
+#include <cstdint>
 #include <optional>
 #include <utility>
 
@@ -1562,6 +1563,25 @@ namespace aiter {
 #undef MHC_POST_LOOP_BODY
     }
 
+    // The bytes a tensor's elements can reach, [first, last) from data_ptr.
+    static inline std::pair<uintptr_t, uintptr_t> mhc_byte_span(const aiter_tensor_t& t)
+    {
+        const uintptr_t first = reinterpret_cast<uintptr_t>(t.data_ptr());
+        if(t.numel() == 0)
+            return {first, first};
+        int64_t last = 0;
+        for(int d = 0; d < t.dim(); d++)
+            last += (t.size(d) - 1) * t.stride(d);
+        return {first, first + static_cast<uintptr_t>(last + 1) * t.element_size()};
+    }
+
+    static inline bool mhc_bytes_overlap(const aiter_tensor_t& a, const aiter_tensor_t& b)
+    {
+        const auto sa = mhc_byte_span(a);
+        const auto sb = mhc_byte_span(b);
+        return sa.first < sb.second && sb.first < sa.second;
+    }
+
     // FP32 -> DTYPE_I rounded to nearest even on every arch (opus::cast truncates
     // BF16 on gfx942 by default).
     template <typename T>
@@ -2004,6 +2024,12 @@ namespace aiter {
                         comb_res_mix.dim() == 3 && comb_res_mix.size(0) == m &&
                         comb_res_mix.size(1) == hc_mult && comb_res_mix.size(2) == hc_mult,
                     "mhc_post_reduce: comb_res_mix must be a contiguous fp32 (m, hc_mult, hc_mult) tensor");
+        AITER_CHECK(residual.is_gpu() && out.device_id == residual.device_id &&
+                        x.device_id == residual.device_id &&
+                        post_layer_mix.device_id == residual.device_id &&
+                        comb_res_mix.device_id == residual.device_id,
+                    "mhc_post_reduce: out, x, residual, post_layer_mix and comb_res_mix must be "
+                    "on one GPU");
         float* pre_ptr = nullptr;
         if(pre_mix.has_value())
         {
@@ -2014,6 +2040,13 @@ namespace aiter {
                         "on residual's device");
             pre_ptr = reinterpret_cast<float*>(pre_mix->data_ptr());
         }
+        // Work-groups read their rows' inputs while others write out, so out must
+        // not share storage with any input.
+        AITER_CHECK(!mhc_bytes_overlap(out, x) && !mhc_bytes_overlap(out, residual) &&
+                        !mhc_bytes_overlap(out, post_layer_mix) &&
+                        !mhc_bytes_overlap(out, comb_res_mix) &&
+                        !(pre_mix.has_value() && mhc_bytes_overlap(out, *pre_mix)),
+                    "mhc_post_reduce: out overlaps an input");
 
         const HipDeviceGuard device_guard(residual.device_id);
         const hipStream_t stream = aiter::getCurrentHIPStream();

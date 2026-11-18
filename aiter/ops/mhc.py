@@ -860,9 +860,14 @@ def mhc_post_reduce(
     The result is bit-identical to `mhc_post` followed by that reduction in
     FP32 and a cast back to the input dtype. ``residual`` is the plain
     (m, hc_mult, hidden_size) layout: this op has no ``res_preshuffle``.
-    Coverage is `mhc_post_reduce_supported`; anything else raises.
+    Coverage is `mhc_post_reduce_supported`; anything else raises, as do
+    operands on different devices and an ``out`` that overlaps an input.
     """
-    _mhc_post_reduce(out, x, residual, post_layer_mix, comb_res_mix, pre_mix, store_nt)
+    # The launch takes the current stream: make it residual's device's.
+    with torch.cuda.device(residual.device):
+        _mhc_post_reduce(
+            out, x, residual, post_layer_mix, comb_res_mix, pre_mix, store_nt
+        )
 
 
 def _mhc_post_tile(hidden_size: int, arch: str, with_256: bool) -> int:
