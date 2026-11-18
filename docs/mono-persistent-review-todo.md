@@ -1,17 +1,18 @@
 # A03／A09：MI400 复核补测与性能修复 TODO
 
-给 MI400 机器上的 agent：请执行本清单，补齐正确性与真实 JIT 证据，定位 standalone P256 回退，再验证最小修改。不要只返回计划。A03一维P256最小改动已在本地实现，待用户review及MI400复测；远端清单状态为**待执行**，C1／C2等后续优化未实施、未测收益。
+给 MI400 机器上的 agent：请执行本清单，补齐正确性与真实 JIT 证据，验证 standalone P256 候选。A03一维P256已获用户确认；A09显式layout候选已实现，本地验证通过，45项GPU UT及性能均待执行。
 
-**当前优先只排查 A03 的改造是否引入回退：先执行§2.3.1的原 native 源码 P256 对照。A03 的 C1／C2、跨迭代预取和其他 P 扫描暂不先行实施；取得该对照后再决定。** 原 native 每 TG 只做一行，没有下一迭代需要预取，不能把缺少跨迭代预取直接定为回退原因。A09清单保留，当前先处理A03。
+**当前先验收已实现候选：A03 `7108dbe`；A09 `ff4eec1`。** 不先实施C1／C2或跨迭代预取。A09用Gluon固定原计算layout、各wave直接写scale，离线确认消除LDS／barrier；非PS直接执行一次共享body。数学、1024元素task、FP8／E8M0／QAT和mask不变。新路径有global访存及EXEC mask，不能把收益归因写成仅删除barrier；性能尚未测量。
 
-**调度标准只要求256 TG和线性worker ID 0～255。** A03采用一维`(256,)`，每TG仍为128 threads；设备端直接复用原native kernel，只在host wrapper设置grid与NUM_PRGMS。后文保留上轮二维版本作为性能排查对照，不将其grid形状作为标准。
+**调度标准只要求256 TG和线性worker ID 0～255。** 两者当前均为一维`(256,)`，每TG128 threads。A03设备端仍是原native。后文上轮二维版本仅作对照，不作为标准。
 
 ## 0. 版本、范围与启动
 
 | 项目 | 固定值 |
 | --- | --- |
 | 仓库／分支 | `https://github.com/ROCm/aiter`，`asm_mon_dev`；以公开上游为唯一执行与回传入口 |
-| A03一维P256代码 | `7108dbec079595026f76b7b1b8e082fe1669796d`；本地待review，未推送。A09不变；不沿用旧GPU结论 |
+| A03一维P256代码 | `7108dbec079595026f76b7b1b8e082fe1669796d`；用户已确认diff，未推送，新GPU验收待执行 |
+| A09显式layout代码 | `ff4eec11474431671047122be058ad43df5f8be0`；本地实现／离线验证完成，未推送；45项GPU UT及性能待测 |
 | 本次 review 的结果版本 | `a8a913883d7be9837c2f46f2e92de8fc701bac26` |
 | 上轮实际 GPU 测试代码 | `d5930aff35d67fa0a2e74ba425909747f3ccef9f`；相对 `efa58c2` 只修复 Triton-only import |
 | 原验收指南 | [mono-persistent-validation.md](https://github.com/ROCm/aiter/blob/asm_mon_dev/docs/mono-persistent-validation.md) |
@@ -41,7 +42,7 @@ git rev-parse HEAD > "$MONO_RESULTS/base-commit.txt"
 
 Python 使用机器上匹配 ROCm 的既有环境；如需隔离，按原指南创建继承 system packages 的 venv。以上命令不安装或升级框架。
 
-若本 TODO 尚未进入上游，先将收到的 MD 保存到 checkout 外，再按正文执行；收到的文档补丁可在发布分支用 `git am <补丁路径>` 应用。基线测试仍固定上述代码，不依赖文档提交是否已合入。A03新候选使用`7108dbe`：收到`a03-native-p256.patch`后，在基线的独立候选checkout执行`git am /绝对路径/a03-native-p256.patch`；补丁只包含3个代码文件，可独立于文档提交应用。记录应用后的实际SHA与tree diff，不假定cherry-pick／git am保留原SHA。
+若本 TODO 尚未进入上游，先将收到的 MD 保存到 checkout 外，再按正文执行；收到的文档补丁可在发布分支用 `git am <补丁路径>` 应用。基线测试仍固定上述代码，不依赖文档提交是否已合入。A03新候选使用`7108dbe`：收到`a03-native-p256.patch`后，在基线的独立候选checkout执行`git am /绝对路径/a03-native-p256.patch`；补丁只包含3个代码文件，可独立于文档提交应用。记录应用后的实际SHA与tree diff，不假定cherry-pick／git am保留原SHA。 A09随后执行`git am /绝对路径/a09-explicit-layout.patch`；此补丁也已验证可单独应用到`a8a913883`。当前完整候选需两份代码补丁；记录实际应用SHA。
 
 范围固定为 standalone P256，正式 PS 为256 TG、每 TG 128 threads，允许一维`(256,)`。冻结 native、两种 scale 公式、零容差及原测试均保留。完整 mono 的 DEV／HT、s104/s105、跨算子 join、设备函数 ABI 和模型接入不在本轮实施。
 
@@ -52,13 +53,14 @@ Python 使用机器上匹配 ROCm 的既有环境；如需隔离，按原指南�
 ### 1.1 保留原门槛，补齐精确 shape
 
 - [ ] 在基线先运行原 36 项 UT 和冻结 native hash／12 项 compile 检查，保存 XML、日志及真实 JIT。原 36 项必须全通过且无 skip；不能只重新收集测试。
-- [ ] 修改 `op_tests/triton_tests/quant/test_mono_persistent.py::test_output_quant_native_persistent` 的 shape 参数，增加 `(257,2048)`、`(513,2048)`。保留原 case；每个新增 case 同时检查 frozen native、非 PS port、PS、独立 PyTorch FP8／E8M0／QAT oracle、输入未写、输出 guard 和 XOR `0xFF` 预填充。
-- [ ] 给 `test_graph_replay_changes_inputs` 增加 A09 `[513,2048]`，保留现有 A03 和 A09 case；至少 20 次改变输入再 replay，逐次比较全部输出。验证新值确实改变参考输出，避免只重复同一输入。
+- [x] 候选已保留原36项并扩到45项：A09新增`(128,2048)`、`(129,2048)`、`(256,2048)`、`(257,2048)`、`(512,2048)`、`(513,2048)`、`(513,2080)`；FP8／E8M0／QAT与native及oracle逐字节比较，输入、guard、XOR预填充均保留。此勾选只表示测试代码已实现。
+- [x] 新增`[513,2048]` scale ownership case及五轮Graph case；20次换输入replay，断言参考结果改变。原Graph case保留。
+- [ ] 在MI400运行候选全部45项，无skip；本地仅做45项收集、原36项保留核对及28组host传参检查，没有GPU执行。
 - [ ] 第 2 节边界性能测试之前，对所有新增 shape 先做同样的 native／PS／oracle／guard 数值检查。可参数化上述测试；不要把只跑过的 shape 写成校验过。
-- [ ] 保存 `baseline-36.xml` 和 `expanded.xml` 两份结果。扩展后的总数可大于 36；报告原 36 项均保留，以及新增 node ID、数量和结果，不再用 `len(cases)==36` 拒绝合法扩展。
+- [ ] 保存 `baseline-36.xml` 和 `expanded.xml` 两份结果。当前候选预期45项；报告原36项保留及9个新增node ID。后续再扩展时同步更新数量门槛。
 - [ ] 任一失败先保存 node ID、seed、shape／stride、输入／权重、native／PS 输出、代码 SHA／diff 和完整日志，再修复候选；修复后重跑失败 case、原 36 项及全部新增项。禁止改冻结 native、降低数值标准或删除失败 case。
 
-原指南的 compile／pytest 命令可直接沿用；基线、每个候选分别使用独立 `TRITON_CACHE_DIR`／`TRITON_DUMP_DIR`，防止混淆产物。
+沿用指南的compile／pytest命令；XML数量门槛在基线为36、当前候选为45。基线、每个候选分别使用独立 `TRITON_CACHE_DIR`／`TRITON_DUMP_DIR`，防止混淆产物。
 
 ### 1.2 功能结论的边界
 
@@ -68,6 +70,12 @@ Python 使用机器上匹配 ROCm 的既有环境；如需隔离，按原指南�
 - [ ] 若当前环境有兼容 GPU memory checker，运行目标／尾 task／5 轮 case 并保存日志；没有则写明 sanitizer 未验证，不能以 guard 通过替代。不要为此更换机器的工作运行时。
 
 ## 2. 为什么下降、什么条件下降：取证与区分实验
+
+### 2.0 A09当前候选的验收重点
+
+- [ ] 源码入口为`aiter/ops/triton/_gluon_kernels/gfx1250/quant/fp8_group32.py`。抓真实wrapper JIT的FP8／QAT、非PS／PS四种产物；检查LDS=0、无`ds_*`和TG barrier、scratch=0、非PS无task loop。离线FP8 native／旧PS／新非PS／新PS机器码为1388／1516／1264／1388 B，VGPR为49／52／47／46；这些不是机器实际launch结果。
+- [ ] 比较冻结native、上轮PS、新非PS、新PS；同输入／预分配输出pool、同Graph，保留15轮和原正式矩阵。确认新增EXEC保存／恢复、XACK与VM_VSRC等待；记录可获得的RETRY_DISABLE设置，无法获取时保留未知。
+- [ ] scale store由一wave32 B重排改为四wave各8 B；global指令、mask分支和store请求成本均需纳入解释。不能仅以无LDS或代码缩小认定性能恢复。
 
 ### 2.1 当前已确认到哪一步
 
@@ -109,7 +117,7 @@ Python 使用机器上匹配 ROCm 的既有环境；如需隔离，按原指南�
 
 ### 2.2 先把真实产物带回可 review 的位置
 
-- [ ] 校验上轮归档 SHA256，依据 `target-resources.json` 的 JIT hash 提取两算子、rows=96／257／513、native／PS 的 `.source/.ttir/.ttgir/.llir/.amdgcn/.hsaco/.json`。相同产物可去重，但保留 12 个 launch 到产物的映射、shape／stride／编译参数和 SHA256。
+- [ ] 校验上轮归档 SHA256，依据 `target-resources.json` 的 JIT hash 提取两算子、rows=96／257／513、native／PS 的 `.source/.ttir`或`.glir`、`.ttgir/.llir/.amdgcn/.hsaco/.json`。相同产物可去重，但保留 12 个 launch 到产物的映射、shape／stride／编译参数和 SHA256。
 - [ ] 将原始 `target-launches.csv`、提取脚本、精简产物包和 manifest 提交到本轮结果目录。必须让无 SSH 的 reviewer 能通过分支获得真实 ISA、IR 和 metadata；code object 也保留。若文件超出仓库限制，压缩去重后提供同账号可读取的下载地址及 hash，不能只给主机绝对路径。排除凭据和无关机器数据。
 - [ ] 输出 native／PS 的带行号 ISA 对照：入口检查、当前／下一 task 的 load、首次依赖 wait、reduce／量化、store、循环回边。说明每次循环实际执行的指令；静态分支条数不等于动态执行次数。
 - [ ] A03：确认已有 `tl.range(..., num_stages=2)` 是否实际形成跨行预取；检查 Q／KV activation 与 weight load 位于循环内外、等待位置和 live range。没有重叠时说明是何种依赖／编译结果，不能只建议再加 `num_stages=2`。
@@ -156,12 +164,12 @@ python -m op_tests.op_benchmarks.triton.bench_mono_persistent \
 
 ## 3. 有什么方案解决：按证据实施有限候选
 
-当前优先级：A03原native源码P256对照（§2.3.1）→定位改造／编译／计时差异并修复→必要时再选C1或C2。其余正确性缺口保留；不得把预取作为恢复原性能的先决条件。每个候选独立 commit／diff，只改候选代码，保留基线可重跑；目标是解决 standalone 成本，不进入融合。收益全部以实测为准。
+当前优先级：验收A03原native源码P256及A09显式layout候选→核对真实JIT与性能→必要时再选C1或C2。其余正确性缺口保留；不得把预取作为恢复原性能的先决条件。每个候选独立 commit／diff，只改候选代码，保留基线可重跑；目标是解决 standalone 成本，不进入融合。收益全部以实测为准。
 
 | 候选 | 具体修改对象与方法 | 作用与代价 | 验收 |
 | --- | --- | --- | --- |
-| C1：单 task 路径 | A09 `aiter/ops/triton/quant/fp8_group32.py` wrapper 将 `N<=256` 作为 constexpr 传入 `_triton_kernels/quant/fp8_group32.py`；该 specialization 用 uniform `task<N` guard 后执行一次原 body，不进入 task loop。A03 在对应 wrapper／kernel 对 M<=256 做同类 specialization，保留原 Q／KV 数学顺序。仅在原native-P256对照完成且ISA仍有可去掉的循环成本时保留修改 | 针对 rows=96 的循环状态与回边；仍发 256 TG，无效 worker 不 load/store。不解决 N>256 的多轮链；多一个 JIT specialization | rows=96 与边界测试、零尺寸／尾 task、Graph；核对实际分支与资源是否减少，并以 standalone 时间决定是否保留 |
-| C2：重叠相邻迭代的 activation load | 在两个 `_triton_kernels/quant/` 文件中保留每 task 的计算／存储 body：prologue load task t；循环中先对 t+256 发 masked load，再计算／存储 t，然后轮换两个寄存器 buffer；epilogue 消费最后一个有效 task。A03 权重仅在 ISA 证实循环内重复 load 时另作独立 hoist 对照，不与预取混成一个变量 | 增加同 worker 可同时在途的请求，尝试隐藏多轮 load 等待；增加寄存器 live range，可能适得其反。既有 `num_stages=2` 不代表已达到该效果 | 下一 task 越界时不得访问／写出；RMS reduction、scale、舍入顺序不变。真实 ISA 必须看到预期 load 前移；scratch 保持 0，资源增加须报告；全部正确性及大 shape 时间通过 |
+| C1：单 task 路径 | A09 `aiter/ops/triton/quant/fp8_group32.py` wrapper 将 `N<=256` 作为 constexpr 传入 `_gluon_kernels/gfx1250/quant/fp8_group32.py`；该 specialization 用 uniform `task<N` guard 后执行一次原 body，不进入 task loop。A03 在对应 wrapper／kernel 对 M<=256 做同类 specialization，保留原 Q／KV 数学顺序。仅在原native-P256对照完成且ISA仍有可去掉的循环成本时保留修改 | 针对 rows=96 的循环状态与回边；仍发 256 TG，无效 worker 不 load/store。不解决 N>256 的多轮链；多一个 JIT specialization | rows=96 与边界测试、零尺寸／尾 task、Graph；核对实际分支与资源是否减少，并以 standalone 时间决定是否保留 |
+| C2：重叠相邻迭代的 activation load | 在A03 `_triton_kernels/quant/fused_mxfp8_quant.py`与A09上述Gluon文件中保留每 task 的计算／存储 body：prologue load task t；循环中先对 t+256 发 masked load，再计算／存储 t，然后轮换两个寄存器 buffer；epilogue 消费最后一个有效 task。A03 权重仅在 ISA 证实循环内重复 load 时另作独立 hoist 对照，不与预取混成一个变量 | 增加同 worker 可同时在途的请求，尝试隐藏多轮 load 等待；增加寄存器 live range，可能适得其反。既有 `num_stages=2` 不代表已达到该效果 | 下一 task 越界时不得访问／写出；RMS reduction、scale、舍入顺序不变。真实 ISA 必须看到预期 load 前移；scratch 保持 0，资源增加须报告；全部正确性及大 shape 时间通过 |
 
 C2 可以先在 A09 验证，因其每个 group32 独立且现有回退最大；A03 按实际 ISA 决定是否适用。若无法保持原 task body 的数学与布局，则不将它混入最小修复，写清编译限制和所需 body 变更。
 

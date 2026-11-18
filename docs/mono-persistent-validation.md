@@ -11,18 +11,20 @@ regress, and four remain inconclusive. Standalone performance acceptance fails.
 For the next run, use the [review follow-up TODO](mono-persistent-review-todo.md).
 It keeps the import fix and adds correctness cases, runtime JIT evidence,
 boundary measurements and separate optimization candidates. Its checkout
-instructions replace the original pinned checkout command below.
+instructions describe the separate baseline and candidate runs.
 
-The local A03 candidate is `7108dbec079595026f76b7b1b8e082fe1669796d`.
-Its device source file is byte-identical to the A03 native base. The wrapper
-uses grid `(256,)` and row-loop step `NUM_PRGMS=256` in persistent mode.
-A09 is unchanged. The candidate has passed local checks and offline builds;
-GPU correctness and performance are pending. The report above covers the old
-two-dimensional implementation only.
+The local code candidate is `ff4eec11474431671047122be058ad43df5f8be0`. It includes A03
+`7108dbec079595026f76b7b1b8e082fe1669796d` and the A09 explicit-layout change.
+Both PS wrappers use grid `(256,)`. A03 keeps the native device source; A09
+uses a shared Gluon tile helper and runs a task loop only for PS. Each wave
+stores its own scales without LDS rearrangement. Quantization math is unchanged.
+Local compilation and host checks pass; the expanded 45 GPU tests and timing
+are pending. The report above covers the previous implementation only.
 
 ## Code and native references
 
-The code commit for this handoff is `efa58c2ccd4525a8287c4f886945fc48ed86a192`.
+The original handoff was `efa58c2ccd4525a8287c4f886945fc48ed86a192`.
+For the current candidate, apply the code patches below and record the resulting SHA.
 
 | Item | Fixed source |
 | --- | --- |
@@ -41,17 +43,11 @@ gfx1250. No ATOM installation or model checkpoint is required.
 | A03 | Shared BF16 `[96,1792]`; Q width 1280 and K width 512, both row stride 1792 elements. Q output E4M3FN `[96,1280]`, uint8 E8M0 `[96,40]`; K output BF16 `[96,512]`. Separate weights, eps `1e-20`, amax floor `1e-10`. | Add `persistent=True` to `fused_dual_rmsnorm_mxfp8_quant`. One row per task; original math and row loop remain. |
 | A09 | BF16 `[96,2048]` to E4M3FN `[96,2048]` and E8M0 `[96,64]`. Group32, amax floor `1e-10`. | `quantize_fp8_group32(..., persistent=True)`. ATOM's 1024-element task, 192 tasks for this shape. |
 
-Both PS grids are `(16,16)`. Worker `x + 16*y` processes tasks at stride 256.
-Each TG has four wave32 waves. A09 also has a nonpersistent port for comparison.
-A03 and A09 use different native scale recipes. Do not replace either recipe
-with the other or loosen byte equality to make a mismatch pass.
-
-The grid above describes the pinned implementation. The P256 contract requires
-256 TGs and worker IDs 0 to 255. It does not require a two-dimensional grid.
-The new A03 candidate uses the original native kernel with grid `(256,)` and
-`NUM_PRGMS=256`. The actual row count M is unchanged. Keep 128 threads per TG
-and record the actual launch shape. A09 still uses the pinned two-dimensional
-mapping; both implementations have 256 TGs.
+Both PS grids are `(256,)`. Worker `pid0` processes tasks at stride 256.
+Each TG has four wave32 waves. A09 nonpersistent mode calls the same tile
+helper once. A03 and A09 use different native scale recipes. Do not replace
+either recipe with the other or loosen byte equality to make a mismatch pass.
+A03 keeps the actual row count M and uses `NUM_PRGMS=256` only for PS.
 
 ## Prepare the machine
 
@@ -65,7 +61,12 @@ framework packages and model checkout.
 set -euo pipefail
 git clone --branch asm_mon_dev git@github.com:ROCm/aiter.git aiter-mono-validation
 cd aiter-mono-validation
-git checkout efa58c2ccd4525a8287c4f886945fc48ed86a192
+git switch -c mono-p256-candidate a8a913883d7be9837c2f46f2e92de8fc701bac26
+# Save this updated guide outside the checkout first. Receive both code patches.
+# Set MONO_PATCH_DIR to their absolute directory before running these commands.
+: "${MONO_PATCH_DIR:?Set the directory containing the received code patches}"
+git am "$MONO_PATCH_DIR/a03-native-p256.patch"
+git am "$MONO_PATCH_DIR/a09-explicit-layout.patch"
 python3 -m venv --system-site-packages .venv-mono-test
 source .venv-mono-test/bin/activate
 python -m pip install pytest
@@ -104,7 +105,7 @@ traceback before changing dependencies.
 
 The compile command also rejects changes to the frozen native excerpts. It
 builds 12 variants with an explicit gfx1250 / wave32 target and saves LLVM IR,
-Triton IR, assembly, code objects and metadata. It does not run a kernel.
+Triton/Gluon IR, assembly, code objects and metadata. It does not run a kernel.
 These offline signatures do not include the real wrapper's pointer alignment
 and integer/stride specialization. Their ISA and resource counts are examples,
 not a substitute for the actual JIT artifacts saved during pytest below.
@@ -122,7 +123,7 @@ python - "$MONO_RESULTS/correctness.xml" <<'PYXML'
 import sys
 import xml.etree.ElementTree as ET
 cases = list(ET.parse(sys.argv[1]).iter("testcase"))
-assert len(cases) == 36, f"Expected 36 tests, found {len(cases)}"
+assert len(cases) == 45, f"Expected 45 tests, found {len(cases)}"
 assert all(c.find("skipped") is None and c.find("failure") is None
            and c.find("error") is None for c in cases), "Correctness gate failed"
 PYXML
@@ -132,13 +133,14 @@ PYXML
 | --- | --- |
 | A03 task count | 0, 1, 95, 96, 255, 256, 257, 513 rows; both 1280/512 and 96/33 widths |
 | A03 layout and math | Shared storage, actual strides, padded outputs, independent Q/K eps, floors 0 / `1e-10` / `1e-4`; K also checked against FP64 RMSNorm |
-| A09 shape | `(0,32)`, `(1,32)`, `(3,288)`, `(17,5120)`, `(2,3,128)`, `(96,2048)`, `(96,5120)`, `(96,576)`, `(255,1024)`, `(256,1024)`, `(257,1024)`, `(513,1024)`, `(8193,32)` |
-| A09 values | Zero and negative zero, small and large finite BF16 values, E8M0 scale boundaries; separate PyTorch quant and QAT oracle |
+| A09 shape | `(0,32)`, `(1,32)`, `(3,288)`, `(17,5120)`, `(2,3,128)`, `(96,2048)`, `(96,5120)`, `(96,576)`, `(128,2048)`, `(129,2048)`, `(256,2048)`, `(257,2048)`, `(512,2048)`, `(513,2048)`, `(513,2080)`, `(255,1024)`, `(256,1024)`, `(257,1024)`, `(513,1024)`, `(8193,32)` |
+| A09 values | Zero and negative zero, small and large finite BF16 values, E8M0 scale boundaries; separate PyTorch quant and QAT oracle; `[513,2048]` scale ownership patterns across waves and five iterations |
 | Output writes | Before each provider, fill output bytes with the native result XOR `0xFF`; compare all result bytes and guards |
-| Replay | 20 Graph replays for each op; change input before each replay, then compare to frozen native |
+| Replay | 20 Graph replays for A03 and A09 `[257,2048]` / `[513,2048]`; change input, assert reference output changes, then compare all bytes to frozen native |
 | API limits | Reject invalid output shape and noncontiguous A09 input |
 
-Pass requires all 36 tests to pass, with no skips, byte mismatch, guard change,
+Pass requires all 45 candidate tests (including the original 36) to pass,
+with no skips, byte mismatch, guard change,
 input/weight mutation or GPU error. FP64 K comparison has its stated BF16
 tolerance; native/PS output comparison has zero tolerance. Zero-size tensors
 have no payload; A09 skips their launch. Do not treat skipped tests as success.
@@ -160,10 +162,8 @@ rocprofv3 --kernel-trace --output-format csv \
 ```
 
 Check that each nonempty PS launch has 256 TGs with 128 threads per TG.
-The pinned implementation has work-item grid `(2048,16,1)` and workgroup
-`(128,1,1)`, which gives TG grid `(16,16,1)`. A one-dimensional P256 variant
-has work-item grid `(32768,1,1)` and the same workgroup, which gives TG grid
-`(256,1,1)`. Keep
+The current candidate has work-item grid `(32768,1,1)` and workgroup
+`(128,1,1)`, which gives TG grid `(256,1,1)`. Keep
 the raw CSV and actual JIT metadata. New A03 kernel names no longer contain
 a `PERSISTENT` field. Trace each provider separately or map dispatch correlation
 IDs to host calls, including M, NUM_PRGMS and grid. Grid alone cannot identify
