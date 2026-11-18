@@ -824,6 +824,46 @@ def mhc_post(
     _mhc_post(out, x, residual, post_layer_mix, comb_res_mix, store_nt)
 
 
+@compile_ops("module_mhc", fc_name="mhc_post_reduce", develop=True)
+def _mhc_post_reduce(
+    out: Tensor,
+    x: Tensor,
+    residual: Tensor,
+    post_layer_mix: Tensor,
+    comb_res_mix: Tensor,
+    pre_mix: Tensor | None = None,
+    store_nt: int = -1,
+) -> None: ...
+
+
+@torch_compile_guard(mutates_args=["out"], gen_fake=lambda *args, **kwargs: None)
+def mhc_post_reduce(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    pre_mix: torch.Tensor | None = None,
+    store_nt: int = -1,
+) -> None:
+    """`mhc_post` with its ``hc_mult`` output streams reduced in the epilogue.
+
+    Writes ``out`` (m, hidden_size), contiguous, in place; the
+    (m, hc_mult, hidden_size) result of `mhc_post` is never stored. Each stream
+    is computed and rounded to the input dtype exactly as `mhc_post` writes it,
+    then the streams are summed in FP32 with ``h`` ascending:
+
+    - ``pre_mix`` (m, hc_mult) FP32: ``sum_h pre_mix[:, h] * stream_h``, each
+      product and each sum rounded on its own (no FMA);
+    - ``pre_mix=None``: ``(sum_h stream_h) / hc_mult``, the mean.
+
+    The result is bit-identical to `mhc_post` followed by that reduction in
+    FP32 and a cast back to the input dtype. Same coverage as `mhc_post` for
+    ``hc_mult == 4``, with ``hidden_size`` a multiple of 512.
+    """
+    _mhc_post_reduce(out, x, residual, post_layer_mix, comb_res_mix, pre_mix, store_nt)
+
+
 def get_mhc_pre_splitk_large_m(
     m: int, hc_hidden_size: int, w_preshuffle_bf16: bool = False
 ) -> tuple[int, int]:

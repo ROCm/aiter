@@ -12,6 +12,7 @@
 #include "aiter_dispatch.h"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
+#include <optional>
 
 
 namespace aiter {
@@ -1559,8 +1560,22 @@ namespace aiter {
 #undef MHC_POST_LOOP_BODY
     }
 
-    template <typename DTYPE_I, int num_warps, int hc_mult, int residual_block, bool store_nt>
-    __global__ 
+    // An optimization barrier: the value of `v`, opaque to the compiler, so a
+    // product passed through it is never contracted into the add consuming it.
+    __device__ __forceinline__ float mhc_post_reduce_opaque(float v)
+    {
+        asm volatile("" : "+v"(v));
+        return v;
+    }
+
+    // reduce_mode 0 is mhc_post: out (m, hc_mult, hidden_size). Otherwise the
+    // hc_mult streams each work-group computes are rounded to DTYPE_I exactly
+    // as mode 0 stores them, staged in LDS and reduced to out (m, hidden_size)
+    // in FP32 with h ascending from 0: mode 1 sums pre_mix[h] * stream[h]
+    // (products and sums rounded apart), mode 2 sums the streams and scales by
+    // 1 / hc_mult. That is mhc_post followed by either reduction, to the bit.
+    template <typename DTYPE_I, int num_warps, int hc_mult, int residual_block, bool store_nt, int reduce_mode = 0>
+    __global__
     void mhc_post_kernel(
         DTYPE_I* out,
         DTYPE_I* x,
@@ -1571,7 +1586,8 @@ namespace aiter {
         int hidden_size,
         int x_stride,
         int residual_stride,
-        int sub_hidden_size
+        int sub_hidden_size,
+        float* pre_mix = nullptr // (m, hc_mult), reduce_mode 1 only
     )
     {
         static constexpr int store_policy = store_nt ? GROUP_NT : RT;
@@ -1580,9 +1596,12 @@ namespace aiter {
         static constexpr int block_size = num_warps * warp_size;
         static constexpr int hc_mult2 = hc_mult * hc_mult;
         static_assert(block_size == hc_mult * warp_size, "block_size must be equal to hc_mult * warp_size");
+        static_assert(reduce_mode >= 0 && reduce_mode <= 2, "reduce_mode is 0 (none), 1 (pre_mix) or 2 (mean)");
+        static constexpr int out_streams = reduce_mode ? 1 : hc_mult;
 
         __shared__ DTYPE_I s_x[2 * residual_block];
         __shared__ DTYPE_I s_residual[2 * hc_mult * residual_block];
+        __shared__ DTYPE_I s_streams[reduce_mode ? hc_mult * residual_block : 1];
 
         int64_t idx = blockIdx.x;
         int k_offset = blockIdx.y * sub_hidden_size;
@@ -1592,8 +1611,8 @@ namespace aiter {
         auto g_x = opus::make_gmem<DTYPE_I>(x_ptr, (hidden_size - k_offset) * sizeof(DTYPE_I));
         DTYPE_I* residual_ptr = residual + idx * residual_stride + k_offset;
         auto g_residual = opus::make_gmem<DTYPE_I>(residual_ptr, (hc_mult * hidden_size - k_offset) * sizeof(DTYPE_I));
-        DTYPE_I* out_ptr = out + idx * hc_mult * hidden_size + k_offset;
-        auto g_out = opus::make_gmem<DTYPE_I>(out_ptr, (hc_mult * hidden_size - k_offset) * sizeof(DTYPE_I));
+        DTYPE_I* out_ptr = out + idx * out_streams * hidden_size + k_offset;
+        auto g_out = opus::make_gmem<DTYPE_I>(out_ptr, (out_streams * hidden_size - k_offset) * sizeof(DTYPE_I));
 
         const int residual_hc_stride = residual_stride / hc_mult;
 
@@ -1645,6 +1664,46 @@ namespace aiter {
         static_assert(residual_block % (warp_size * ds_read_vec) == 0, "residual_block must be divisible by warp_size * ds_read_vec");
         const int loop = sub_hidden_size / residual_block;
 
+        // reduce_mode != 0: every thread reduces reduce_vec columns of the
+        // tile's staged streams and stores them to the one output row.
+        static constexpr int reduce_vec = residual_block / block_size;
+        static_assert(reduce_mode == 0 || residual_block % block_size == 0,
+                      "residual_block must be divisible by block_size");
+        float_hc_mult pre_v;
+        if constexpr(reduce_mode == 1) {
+            for(int h = 0; h < hc_mult; h++) {
+                pre_v[h] = pre_mix[idx * hc_mult + h];
+            }
+        }
+        auto reduce_store_tile = [&](int i) {
+            using DTYPE_I_rvec = opus::vector_t<DTYPE_I, reduce_vec>;
+            s_wait_all_dscnt(0_I);
+            __builtin_amdgcn_s_barrier();
+            const int col = threadIdx.x * reduce_vec;
+            opus::vector_t<float, reduce_vec> acc;
+            for(int k = 0; k < reduce_vec; k++) {
+                acc[k] = 0.0f;
+            }
+            opus::static_for<hc_mult>([&](auto h) {
+                DTYPE_I_rvec stream = *(reinterpret_cast<DTYPE_I_rvec*>(s_streams + h.value * residual_block + col));
+                for(int k = 0; k < reduce_vec; k++) {
+                    const float v = static_cast<float>(stream[k]);
+                    if constexpr(reduce_mode == 1) {
+                        acc[k] = acc[k] + mhc_post_reduce_opaque(pre_v[h.value] * v);
+                    }
+                    else {
+                        acc[k] = acc[k] + v;
+                    }
+                }
+            });
+            if constexpr(reduce_mode == 2) {
+                for(int k = 0; k < reduce_vec; k++) {
+                    acc[k] = acc[k] * (1.0f / hc_mult);
+                }
+            }
+            store_vector<DTYPE_I, float, reduce_vec, store_policy>(g_out, acc, i * residual_block + col);
+        };
+
         auto compute_store_tile = [&](int i) {
             DTYPE_I* s_x_rd_ptr = s_x + (i & 1) * residual_block;
             DTYPE_I* s_residual_rd_ptr = s_residual + (i & 1) * (hc_mult * residual_block);
@@ -1666,7 +1725,20 @@ namespace aiter {
                         res[k] += static_cast<float>(residual_vec[h.value][k]) * comb_mix[h.value];
                     }
                 });
-                store_vector<DTYPE_I, float, ds_read_vec, store_policy>(g_out, res, warp_id * hidden_size + i * residual_block + s_offset);
+                if constexpr(reduce_mode == 0) {
+                    store_vector<DTYPE_I, float, ds_read_vec, store_policy>(g_out, res, warp_id * hidden_size + i * residual_block + s_offset);
+                }
+                else {
+                    // The stream as mode 0 would store it.
+                    DTYPE_I_vec stream;
+                    for(int k = 0; k < ds_read_vec; k++) {
+                        stream[k] = opus::cast<DTYPE_I>(res[k]);
+                    }
+                    *(reinterpret_cast<DTYPE_I_vec*>(s_streams + warp_id * residual_block + s_offset)) = stream;
+                }
+            }
+            if constexpr(reduce_mode != 0) {
+                reduce_store_tile(i);
             }
         };
 
@@ -1903,6 +1975,94 @@ namespace aiter {
                             x_stride,
                             residual_stride,
                             store_nt);
+    }
+
+#define MHC_POST_REDUCE_KERNEL_IMPL_(residual_block, store_nt_val, reduce_mode) \
+    AITER_CHECK(hidden_size % residual_block == 0, "hidden_size must be divisible by residual_block"); \
+    AITER_CHECK(hidden_size >= residual_block * 2, "hidden_size must be >= residual_block * 2 stages prefetch"); \
+    int block_size = 4 * WARP_SIZE; \
+    int k_blocks = mhc_post_pick_kblocks(m, hidden_size, residual_block, cu_num, block_size); \
+    int sub_hidden_size = hidden_size / k_blocks; \
+    dim3 grid(m, k_blocks); \
+    dim3 block(block_size); \
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(x.dtype(), "mhc_post_reduce", [&] { \
+        using DTYPE_I = typename hip2opus<scalar_t>::type; \
+        mhc_post_kernel<DTYPE_I, 4, 4, residual_block, store_nt_val, reduce_mode><<<grid, block, 0, stream>>>( \
+            reinterpret_cast<DTYPE_I*>(out.data_ptr()), \
+            reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
+            reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
+            reinterpret_cast<float*>(post_layer_mix.data_ptr()), \
+            reinterpret_cast<float*>(comb_res_mix.data_ptr()), \
+            m, \
+            hidden_size, \
+            x_stride, \
+            residual_stride, \
+            sub_hidden_size, \
+            pre_ptr \
+        ); \
+    });
+
+#define MHC_POST_REDUCE_KERNEL_DISPATCH_MODE(store_nt_val, reduce_mode) \
+    if (arch_id != "gfx942" && hidden_size % 1024 == 0) { \
+        MHC_POST_REDUCE_KERNEL_IMPL_(1024, store_nt_val, reduce_mode); \
+    } else { \
+        MHC_POST_REDUCE_KERNEL_IMPL_(512, store_nt_val, reduce_mode); \
+    }
+
+#define MHC_POST_REDUCE_KERNEL_DISPATCH(store_nt_val) \
+    if (pre_ptr != nullptr) { \
+        MHC_POST_REDUCE_KERNEL_DISPATCH_MODE(store_nt_val, 1); \
+    } else { \
+        MHC_POST_REDUCE_KERNEL_DISPATCH_MODE(store_nt_val, 2); \
+    }
+
+    void mhc_post_reduce(
+        aiter_tensor_t& out, // (m, hidden_size)
+        aiter_tensor_t& x, // (m, hidden_size)
+        aiter_tensor_t& residual, // (m, hc_mult, hidden_size)
+        aiter_tensor_t& post_layer_mix, // (m, hc_mult)
+        aiter_tensor_t& comb_res_mix, // (m, hc_mult, hc_mult)
+        std::optional<aiter_tensor_t> pre_mix, // (m, hc_mult) fp32, or none for the mean
+        int store_nt = -1)
+    {
+        int m = residual.size(0);
+        int hc_mult = residual.size(1);
+        int hidden_size = residual.size(2);
+        int x_stride = x.stride(0);
+        int residual_stride = residual.stride(0);
+        AITER_CHECK(hc_mult == 4, "hc_mult only supports 4");
+        // Only the mhc_post body that stages a whole tile in LDS reduces.
+        AITER_CHECK(hidden_size % 512 == 0, "mhc_post_reduce: hidden_size must be divisible by 512");
+        AITER_CHECK(out.dtype() == x.dtype() && residual.dtype() == x.dtype(),
+                    "mhc_post_reduce: out, x and residual must share one dtype");
+        AITER_CHECK(out.dim() == 2 && out.size(0) == m && out.size(1) == hidden_size && out.is_contiguous(),
+                    "mhc_post_reduce: out must be a contiguous (m, hidden_size) tensor");
+        float* pre_ptr = nullptr;
+        if(pre_mix.has_value())
+        {
+            AITER_CHECK(pre_mix->dtype() == AITER_DTYPE_fp32 && pre_mix->is_contiguous() &&
+                            pre_mix->numel() == static_cast<size_t>(m) * hc_mult,
+                        "mhc_post_reduce: pre_mix must be a contiguous fp32 (m, hc_mult) tensor");
+            pre_ptr = reinterpret_cast<float*>(pre_mix->data_ptr());
+        }
+        if(m == 0)
+        {
+            return;
+        }
+
+        const HipDeviceGuard device_guard(residual.device_id);
+        const hipStream_t stream = aiter::getCurrentHIPStream();
+        const int cu_num = get_num_cu_func();
+        const std::string arch_id = get_gpu_arch();
+        const bool use_nt = store_nt < 0 ? m > 8 * cu_num : store_nt != 0;
+        if(use_nt)
+        {
+            MHC_POST_REDUCE_KERNEL_DISPATCH(true);
+        }
+        else
+        {
+            MHC_POST_REDUCE_KERNEL_DISPATCH(false);
+        }
     }
 
 

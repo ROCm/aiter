@@ -732,6 +732,66 @@ def test_mhc_post(m, hidden_size, hc_mult, dtype=dtypes.bf16, data_init="norm", 
     return ret
 
 
+def mhc_post_reduce_ref(
+    streams: torch.Tensor, pre_mix: torch.Tensor | None
+) -> torch.Tensor:
+    """The streams `mhc_post` wrote, reduced in FP32 with h ascending from 0.
+
+    Eager torch runs every product and every sum as its own kernel, so none of
+    them is contracted into an FMA -- the rounding `mhc_post_reduce` promises.
+    """
+    y = streams.float()
+    acc = torch.zeros_like(y[:, 0])
+    for h in range(y.shape[1]):
+        acc = acc + (y[:, h] if pre_mix is None else pre_mix[:, h : h + 1] * y[:, h])
+    if pre_mix is None:
+        acc = acc * (1.0 / y.shape[1])
+    return acc.to(streams.dtype)
+
+
+@benchmark()
+def test_mhc_post_reduce(
+    m, hidden_size, hc_mult, reduce, dtype=dtypes.bf16, data_init="norm", seed=0
+):
+    """`mhc_post_reduce` against `mhc_post` + the FP32 reduction, to the bit.
+
+    ``reduce`` is "pre_mix" (the pre-mix weighted sum) or "mean".
+    """
+    gen = make_generator(seed)
+    x = fill((m, hidden_size), data_init, gen, dtype=dtype)
+    residual = fill((m, hc_mult, hidden_size), data_init, gen, dtype=dtype)
+    post_layer_mix = fill((m, hc_mult, 1), data_init, gen, dtype=dtypes.fp32)
+    comb_res_mix = fill((m, hc_mult, hc_mult), data_init, gen, dtype=dtypes.fp32)
+    pre_mix = (
+        fill((m, hc_mult), data_init, gen, dtype=dtypes.fp32)
+        if reduce == "pre_mix"
+        else None
+    )
+    streams, post_us = run_perftest(
+        mhc_post_hip, x, residual, post_layer_mix, comb_res_mix
+    )
+    out_ref = mhc_post_reduce_ref(streams, pre_mix)
+
+    def run_reduce():
+        out = torch.empty(m, hidden_size, dtype=dtype)
+        aiter.mhc_post_reduce(out, x, residual, post_layer_mix, comb_res_mix, pre_mix)
+        return out
+
+    out, reduce_us = run_perftest(run_reduce)
+    bit_exact = torch.equal(out.view(torch.int16), out_ref.view(torch.int16))
+    mismatches = int((out.view(torch.int16) != out_ref.view(torch.int16)).sum())
+    assert bit_exact, (
+        f"mhc_post_reduce({reduce}) m={m} hidden={hidden_size}: "
+        f"{mismatches} elements differ from mhc_post + the FP32 reduction"
+    )
+    return {
+        "reduce": reduce,
+        "bit_exact": bit_exact,
+        "mhc_post_us": post_us,
+        "reduce_us": reduce_us,
+    }
+
+
 def mhc_post_pre_ref(
     layer_input: torch.Tensor,
     residual_in: torch.Tensor,
@@ -1267,6 +1327,24 @@ if not args.hc_head:
                         )
                         df.append(ret)
     print_json_table("mhc_post summary", df)
+
+    df = []
+    for dtype in args.dtype:
+        for data_init in args.data_init:
+            for hidden_size in args.hidden_size:
+                for m in args.m:
+                    for reduce in ("pre_mix", "mean"):
+                        ret = test_mhc_post_reduce(
+                            m=m,
+                            hidden_size=hidden_size,
+                            hc_mult=4,
+                            reduce=reduce,
+                            dtype=dtype,
+                            data_init=data_init,
+                            seed=args.seed,
+                        )
+                        df.append(ret)
+    print_json_table("mhc_post_reduce summary", df)
 
     df = []
     for dtype in args.dtype:

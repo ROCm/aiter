@@ -5,6 +5,7 @@
 
 #include "aiter_tensor.h"
 #include <hip/hip_runtime.h>
+#include <optional>
 
 namespace aiter {
 void mhc_pre_gemm_sqrsum(aiter_tensor_t& out,    // (split_k, m, hc_mult3) / (m, hc_mult3)
@@ -53,6 +54,18 @@ void mhc_post(aiter_tensor_t& out,            // (m, hc_mult, hidden_size)
               aiter_tensor_t& post_layer_mix, // (m, hc_mult)
               aiter_tensor_t& comb_res_mix,   // (m, hc_mult, hc_mult)
               int store_nt                    = -1);
+// mhc_post with its hc_mult output streams reduced in the epilogue, into out
+// (m, hidden_size): each stream exactly as mhc_post writes it, then summed in
+// FP32 with h ascending -- weighted by pre_mix (products and sums rounded
+// apart), or with no pre_mix scaled by 1 / hc_mult (the mean). Bit-identical
+// to mhc_post followed by that reduction. hidden_size must be a multiple of 512.
+void mhc_post_reduce(aiter_tensor_t& out,                   // (m, hidden_size)
+                     aiter_tensor_t& x,                     // (m, hidden_size)
+                     aiter_tensor_t& residual,              // (m, hc_mult, hidden_size)
+                     aiter_tensor_t& post_layer_mix,        // (m, hc_mult)
+                     aiter_tensor_t& comb_res_mix,          // (m, hc_mult, hc_mult)
+                     std::optional<aiter_tensor_t> pre_mix, // (m, hc_mult) fp32, or none
+                     int store_nt = -1);
 // Optimized mhc_post launch on raw device pointers (used by fused AR+MHC split epilogue).
 void launch_mhc_post_raw(hipStream_t stream,
                          AiterDtype dtype,
