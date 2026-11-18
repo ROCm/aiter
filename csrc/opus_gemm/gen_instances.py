@@ -4,7 +4,6 @@ import argparse
 import glob
 import json
 import os
-import sys
 from pathlib import Path
 
 import pandas as pd
@@ -18,6 +17,7 @@ from codegen.common import (
     _GFX942_A16W16_TAGS,
     _NOSPLIT,
     _SPLITK,
+    add_aiter_utils_to_sys_path,
     get_arch_map,
     open_if_changed,
     prune_unwritten,
@@ -28,6 +28,7 @@ from opus_gemm_common import (
     KERNEL_REGISTRY,
     KernelKey,
     OpusGemmInstance,
+    a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list,
     a8w8_kernels_list,
     a8w8_scale_kernels_list,
     a16w16_flatmm_kernels_list,
@@ -59,6 +60,29 @@ def _registry_arch(gfx: str) -> str:
     return base_gfx_arch(gfx)
 
 
+def _gfx950_num_xcd(targets: list[tuple[str, int]], targets_from_cli: bool) -> int:
+    """Choose one gfx950 XCD count for all kernels emitted by this generator."""
+    if add_aiter_utils_to_sys_path() is None:
+        return 8  # Standalone codegen without aiter.
+    import build_targets
+
+    if not targets_from_cli:
+        # Automatic targets include extra registry CU counts. Resolve the build
+        # target again to preserve CU_NUM overrides and native GPU detection.
+        return build_targets.build_num_xcds("gfx950")
+
+    target_cus = {cu for gfx, cu in targets if gfx == "gfx950"}
+
+    # Prefer supported targets in table order, with the full GPU first.
+    for cu in build_targets.GFX_CU_NUMS_MAP["gfx950"]:
+        if cu in target_cus:
+            return build_targets.target_num_xcds("gfx950", cu)
+
+    # For unlisted targets use the largest CU count; without gfx950 use 256 CUs.
+    cu = max(target_cus, default=256)
+    return build_targets.target_num_xcds("gfx950", cu)
+
+
 def _build_targets_standalone(explicit_targets=()):
     if explicit_targets:
         targets = []
@@ -84,14 +108,9 @@ def _build_targets_standalone(explicit_targets=()):
         )
     import importlib.util
 
-    spec = importlib.util.find_spec("aiter")  # locates, does not execute
-    if spec is None or not spec.submodule_search_locations:
+    utils_dir = add_aiter_utils_to_sys_path()
+    if utils_dir is None:
         raise ImportError("aiter package not found")
-    utils_dir = os.path.join(
-        next(iter(spec.submodule_search_locations)), "jit", "utils"
-    )
-    if utils_dir not in sys.path:
-        sys.path.insert(0, utils_dir)
     mod_spec = importlib.util.spec_from_file_location(
         "_opus_chip_info", os.path.join(utils_dir, "chip_info.py")
     )
@@ -270,12 +289,16 @@ INPUT_DTYPE_MAP = {
     "a8w8_mxscale_bmm_wave4m2_selfload": ("fp8_t", "fp8_t"),
     "a8w8": ("fp8_t", "fp8_t"),
     "a8w8_blockscale_bpreshuffle_singlebuf": ("fp8_t", "fp8_t"),
+    "a8w8_blockscale_mxscale_gemm_bpreshuffle": ("fp8_t", "fp8_t"),
     **{tag: ("bf16_t", "bf16_t") for tag in _A16W16_TAGS},
 }
 
 # A16W16 uses separate direct-output and workspace launcher tables.
 A16W16_KID_DISPATCH_TAGS = set(_A16W16_TAGS)
-A8W8_BPRESHUFFLE_TAGS = {"a8w8_blockscale_bpreshuffle_singlebuf"}
+A8W8_BPRESHUFFLE_TAGS = {
+    "a8w8_blockscale_bpreshuffle_singlebuf",
+    "a8w8_blockscale_mxscale_gemm_bpreshuffle",
+}
 # Three-tensor launchers: A16W16 and A8W8 no-scale.
 NOSCALE_TAGS = A16W16_KID_DISPATCH_TAGS | {"a8w8"}
 
@@ -513,8 +536,9 @@ def _record_one_instantiation(
 
 
 class opus_gemm_codegen:
-    def __init__(self, working_path, istune=False):
+    def __init__(self, working_path, istune=False, *, num_xcd):
         self.working_path = working_path
+        self.num_xcd = num_xcd
         self.impl_path = os.path.join(working_path, "impl")
         self.instances_path = os.path.join(working_path, "instances")
         self.istune = istune
@@ -1290,9 +1314,9 @@ if __name__ == "__main__":
         default=None,
         required=False,
         help=(
-            "Colon-separated list of glob patterns pointing at tuned BF16 "
-            "GEMM CSVs (e.g. aiter/configs/bf16_tuned_gemm.csv and "
-            "aiter/configs/model_configs/*_bf16_tuned_gemm.csv). Each "
+            "Colon-separated paths or glob patterns for tuned GEMM CSVs, "
+            "including BF16 and MXFP8 bpreshuffle tables. Explicit files "
+            "must exist; unmatched model glob patterns are optional. Each "
             "file is filtered by `libtype == 'opus'`; surviving rows "
             "contribute their `solidx`/`kernelId` only to the subset-compile "
             "set S. Runtime callers provide the final kid explicitly. "
@@ -1346,6 +1370,7 @@ if __name__ == "__main__":
         args.tune_files = args.tune_file
 
     TAG_TO_LIST = {
+        "a8w8_blockscale_mxscale_gemm_bpreshuffle": a8w8_blockscale_mxscale_gemm_bpreshuffle_kernels_list,
         "a8w8_scale": a8w8_scale_kernels_list,
         "a8w8": a8w8_kernels_list,
         "a16w16": a16w16_kernels_list,
@@ -1384,7 +1409,10 @@ if __name__ == "__main__":
             pat = pat.strip()
             if not pat:
                 continue
-            for path in sorted(glob.glob(pat)):
+            matches = sorted(glob.glob(pat))
+            if not matches and not glob.has_magic(pat):
+                parser.error(f"tuned file not found: {pat}")
+            for path in matches:
                 if path in seen:
                     continue
                 seen.add(path)
@@ -1447,7 +1475,14 @@ if __name__ == "__main__":
     defaults = {
         key for gfx, cu in targets for key in default_compiled_keys(gfx, cu)
     } & available.keys()
-    mandatory = {key for key in available if key.family != "a16w16"}
+    # Select the gfx950 MXFP8 sweep from tuned rows, successful sidecars and
+    # explicit requests. Full sweep generation remains available via --tune.
+    mandatory = {
+        key
+        for key in available
+        if key.family != "a16w16"
+        and not (key.gfx == "gfx950" and key.family == "a8w8_blockscale_bpreshuffle")
+    }
     selected = (
         csv_keys | sidecar_keys | requested_keys | defaults | mandatory
     ) & available.keys()
@@ -1484,7 +1519,11 @@ if __name__ == "__main__":
         f"[opus gen_instances] targets={targets}, routes={len(selected)}, "
         f"symbols={len({available[key].name for key in selected})}"
     )
-    codegen = opus_gemm_codegen(args.working_path, args.tune)
+    codegen = opus_gemm_codegen(
+        args.working_path,
+        args.tune,
+        num_xcd=_gfx950_num_xcd(targets, targets_from_cli=bool(args.targets)),
+    )
     codegen.gen_instances({key: available[key] for key in sorted(selected)})
     Path(sidecar_path).parent.mkdir(parents=True, exist_ok=True)
     Path(sidecar_path).write_text(
