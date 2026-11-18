@@ -242,6 +242,9 @@ def _build_kernel(ctx_stride=1, rebase_kv=False, reserved_rows=MAX_NN, loader_wa
         has_next_n_lens: fx.Int32,
         stride_q_batch: fx.Int32,
         max_block_len: fx.Int32,
+        table_span: fx.Int32,
+        physical_pages: fx.Int32,
+        output_width: fx.Int32,
         stride_out: fx.Int32,
     ):
         tid = fx.Int32(fx.thread_idx.x)
@@ -263,10 +266,15 @@ def _build_kernel(ctx_stride=1, rebase_kv=False, reserved_rows=MAX_NN, loader_wa
         def _imin(a, b):
             return (a <= b).select(a, b)
 
-        ragged_nn = _imin(fx.Int32(nn_t[pid_batch]), rows_per_batch)
+        ragged_nn = fx.Int32(nn_t[pid_batch])
+        ragged_nn = (ragged_nn > 0).select(ragged_nn, fx.Int32(0))
+        ragged_nn = _imin(ragged_nn, rows_per_batch)
         nn = (has_next_n_lens != 0).select(ragged_nn, rows_per_batch)
         context_len = fx.Int32(context_t[_context_len_index(pid_batch)])
-        page_count = uceildiv(context_len, fx.Int32(KV_BLOCK_SIZE))
+        context_len = (context_len > 0).select(context_len, fx.Int32(0))
+        effective_len = _imin(context_len, table_span)
+        effective_len = _imin(effective_len, output_width)
+        page_count = uceildiv(effective_len, fx.Int32(KV_BLOCK_SIZE))
         pages_per_split = uceildiv(page_count, split_kv)
         page_lo = pid_split * pages_per_split
         page_hi = _imin(page_lo + pages_per_split, page_count)
@@ -347,16 +355,20 @@ def _build_kernel(ctx_stride=1, rebase_kv=False, reserved_rows=MAX_NN, loader_wa
         gpu.barrier()
 
         def _load_physical(page):
-            safe_page = _imin(page, page_hi - fx.Int32(1))
-            return fx.Int32(
+            logical_ok = (page >= 0) & (page < max_block_len)
+            safe_logical = logical_ok.select(page, fx.Int32(0))
+            physical = fx.Int32(
                 buffer_ops.buffer_load(
                     table_t.rsrc,
-                    pid_batch * max_block_len + safe_page,
+                    pid_batch * max_block_len + safe_logical,
                     vec_width=1,
                     dtype=T.i32,
                     is_scalar=True,
                 )
             )
+            physical_ok = (physical >= 0) & (physical < physical_pages)
+            safe_physical = physical_ok.select(physical, fx.Int32(0))
+            return safe_physical, logical_ok & physical_ok
 
         def _page_buffer(physical):
             # Buffer offsets are 32-bit even when the allocation is larger.
@@ -367,7 +379,7 @@ def _build_kernel(ctx_stride=1, rebase_kv=False, reserved_rows=MAX_NN, loader_wa
             )
 
         def _copy_page(bank_base, page, copy_tid, copy_threads, reps):
-            physical = _load_physical(page)
+            physical, _ = _load_physical(page)
             if const_expr(rebase_kv):
                 rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(_page_buffer(physical)))
                 page_base = fx.Int32(0)
@@ -392,16 +404,13 @@ def _build_kernel(ctx_stride=1, rebase_kv=False, reserved_rows=MAX_NN, loader_wa
             out = _make_out_row_view(
                 out_logits, stride_out, pid_batch * rows_per_batch + row
             )
+            row_len = effective_len - nn + fx.Int32(row) + 1
+            row_len = (row_len > 0).select(row_len, fx.Int32(0))
 
             def _write(_out=out, _col=col, _value=value):
                 _out[_col] = _value
 
-            _guarded(
-                (lane_div_16 == 0)
-                & (col < context_len)
-                & (col <= context_len - nn + row),
-                _write,
-            )
+            _guarded((lane_div_16 == 0) & (col < row_len), _write)
 
         def _compute_tile(bank_base, page, tile):
             k_base = lds_base + bank_base
@@ -411,10 +420,11 @@ def _build_kernel(ctx_stride=1, rebase_kv=False, reserved_rows=MAX_NN, loader_wa
                 k_base,
                 KV_BLOCK_SIZE * HEAD_DIM + (token_base + lane_mod_16) * 4,
             )
+            _, physical_ok = _load_physical(page)
 
-            _compute_pack(page, tile, b_pack, scale)
+            _compute_pack(page, tile, b_pack, scale, physical_ok)
 
-        def _compute_pack(page, tile, b_pack, scale):
+        def _compute_pack(page, tile, b_pack, scale, physical_ok):
             token_base = tile * MFMA_N
 
             def _score_row(r):
@@ -439,6 +449,7 @@ def _build_kernel(ctx_stride=1, rebase_kv=False, reserved_rows=MAX_NN, loader_wa
                 ]
                 rocdl.s_setprio(0)
                 value = _reduce_scores(scores, weights_frag, scale)
+                value = physical_ok.select(value, fx.Float32(float("-inf")))
                 _store_logit(
                     r,
                     page * KV_BLOCK_SIZE + token_base + lane_mod_16,
@@ -522,6 +533,9 @@ def _build_kernel(ctx_stride=1, rebase_kv=False, reserved_rows=MAX_NN, loader_wa
         has_next_n_lens,
         stride_q_batch,
         max_block_len,
+        table_span,
+        physical_pages,
+        output_width,
         stride_out,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
@@ -540,6 +554,9 @@ def _build_kernel(ctx_stride=1, rebase_kv=False, reserved_rows=MAX_NN, loader_wa
             has_next_n_lens,
             stride_q_batch,
             max_block_len,
+            table_span,
+            physical_pages,
+            output_width,
             stride_out,
         ).launch(
             grid=(fx.Int64(grid_blocks), 1, 1),
@@ -577,7 +594,8 @@ def flydsl_fp8_paged_mqa_logits(
 
     ``next_n`` may be 1..8. The default path reserves one LDS row for
     width 1, four for widths 2..4, otherwise eight. ``next_n_lens`` optionally
-    selects fewer live rows per sequence.
+    selects fewer live rows per sequence; device values are clamped to
+    ``[0, next_n]``.
 
     ``context_lens``: int32, contiguous, on ``q_fp8``'s device. Either
 
@@ -590,15 +608,27 @@ def flydsl_fp8_paged_mqa_logits(
       ``next_n``), so other row values are not supported.
 
     ``(B, 1)`` is the same as ``[B]``. Anything else raises ``ValueError``; a
-    strided tensor is rejected rather than copied.
+    strided tensor is rejected rather than copied. The output is a rank-2
+    row-major fp32 ``[B * next_n, N]`` with unit inner stride. Both the context
+    and the page table are bounded by ``N`` in the kernel; invalid physical page
+    IDs store ``-inf`` instead of reading another page.
+
+    A positive ``SplitKV`` is capture-safe because it fixes the grid without
+    reading device lengths. ``SplitKV`` values ``None`` or ``<= 0`` use the
+    automatic plan, which synchronizes through ``context_lens.max().item()``
+    and therefore must run outside CUDA graph capture.
     """
     if get_gfx_runtime() != _GFX950:
         raise RuntimeError(f"gfx950 kernel requested on {get_gfx_runtime()}")
     if not Preshuffle:
         raise ValueError("requires Preshuffle=True")
+    if not q_fp8.is_cuda:
+        raise ValueError("q_fp8 must be on a GPU device")
     if q_fp8.ndim != 4:
         raise ValueError(f"q_fp8 must be rank 4, got shape {tuple(q_fp8.shape)}")
     batch_size, next_n, heads, head_dim = q_fp8.shape
+    if batch_size <= 0:
+        raise ValueError(f"q_fp8 batch must be positive, got {batch_size}")
     if not 1 <= next_n <= MAX_NN:
         raise ValueError(f"q_fp8 next_n must be in 1..{MAX_NN}, got {next_n}")
     if (heads, head_dim, int(KVBlockSize)) != (
@@ -611,17 +641,39 @@ def flydsl_fp8_paged_mqa_logits(
         raise ValueError("q_fp8 must be contiguous")
     if q_fp8.dtype != get_fp8_e4m3_dtype():
         raise ValueError(f"q_fp8 must be native FP8 E4M3, got {q_fp8.dtype}")
-    if kv_cache.dtype != torch.uint8 or not kv_cache.is_contiguous():
-        raise ValueError("kv_cache must be contiguous preshuffled uint8 FP8 data")
+    if (
+        kv_cache.ndim != 4
+        or kv_cache.dtype != torch.uint8
+        or kv_cache.device != q_fp8.device
+        or not kv_cache.is_contiguous()
+    ):
+        raise ValueError(
+            "kv_cache must be contiguous preshuffled uint8 FP8 data on q_fp8's device"
+        )
     _, block_size, one, index_dim = kv_cache.shape
     if (block_size, one, index_dim) != (KV_BLOCK_SIZE, 1, INDEX_DIM):
         raise ValueError(f"unexpected KV cache shape {tuple(kv_cache.shape)}")
     if weights.shape != (batch_size * next_n, NUM_HEADS):
         raise ValueError(f"weights must have shape {(batch_size * next_n, NUM_HEADS)}")
-    if not weights.is_contiguous() or weights.dtype != torch.float32:
-        raise ValueError("weights must be contiguous float32")
-    if out_logits.shape[0] != batch_size * next_n:
-        raise ValueError(f"out_logits first dimension must be {batch_size * next_n}")
+    if (
+        not weights.is_contiguous()
+        or weights.dtype != torch.float32
+        or weights.device != q_fp8.device
+    ):
+        raise ValueError("weights must be contiguous float32 on q_fp8's device")
+    if (
+        out_logits.ndim != 2
+        or out_logits.shape[0] != batch_size * next_n
+        or out_logits.shape[1] <= 0
+        or out_logits.stride(1) != 1
+        or out_logits.stride(0) < out_logits.shape[1]
+        or out_logits.dtype != torch.float32
+        or out_logits.device != q_fp8.device
+    ):
+        raise ValueError(
+            f"out_logits must be float32 [{batch_size * next_n}, N>0] "
+            "row-major on q_fp8's device"
+        )
 
     # The kernel reads request b's length at b * ctx_stride + ctx_stride - 1.
     # A strided input is rejected rather than copied: a hidden copy allocates on
@@ -644,14 +696,45 @@ def flydsl_fp8_paged_mqa_logits(
         )
     ctx_stride = context_lens.shape[1] if context_lens.dim() == 2 else 1
     context_lens = context_lens.reshape(-1)
+    if (
+        kv_indices.ndim != 2
+        or kv_indices.shape[0] != batch_size
+        or kv_indices.dtype != torch.int32
+        or kv_indices.device != q_fp8.device
+        or not kv_indices.is_contiguous()
+    ):
+        raise ValueError(
+            f"kv_indices must be contiguous int32 [{batch_size}, max_blocks] "
+            "on q_fp8's device"
+        )
     max_block_len = kv_indices.shape[-1]
-    kv_indices = kv_indices.reshape(batch_size, max_block_len)
     has_next_n_lens = next_n_lens is not None
     if next_n_lens is None:
         next_n_lens = context_lens[:batch_size]
-    next_n_lens = next_n_lens.reshape(batch_size)
-    if next_n_lens.dtype != torch.int32 or next_n_lens.device != q_fp8.device:
-        raise ValueError("next_n_lens must be int32 on the same device as q_fp8")
+    elif (
+        next_n_lens.ndim != 1
+        or next_n_lens.shape != (batch_size,)
+        or next_n_lens.dtype != torch.int32
+        or next_n_lens.device != q_fp8.device
+        or not next_n_lens.is_contiguous()
+    ):
+        raise ValueError(
+            f"next_n_lens must be contiguous int32 [{batch_size}] on q_fp8's device"
+        )
+
+    max_i32 = 0x7FFFFFFF
+    if (
+        max_block_len > max_i32
+        or kv_indices.numel() > max_i32
+        or kv_cache.shape[0] > max_i32
+        or out_logits.shape[1] > max_i32
+        or q_fp8.stride(0) > max_i32
+        or out_logits.stride(0) > max_i32
+    ):
+        raise ValueError("tensor extents and element strides must fit signed int32")
+    if kv_cache.shape[0] == 0:
+        raise ValueError("kv_cache must contain at least one physical page")
+    table_span = min(max_block_len * KV_BLOCK_SIZE, max_i32)
 
     reserved_rows = 1 if next_n == 1 else 4 if next_n <= 4 else MAX_NN
     loader_waves = 2 if next_n == 1 else 4
@@ -659,21 +742,39 @@ def flydsl_fp8_paged_mqa_logits(
         NN1_CTA_CAP if next_n == 1 else NN4_CTA_CAP if next_n <= 4 else NN8_CTA_CAP
     )
 
-    # Auto mode retains its runtime-context sync; explicit SplitKV is capture-safe.
+    # Auto mode retains its runtime-context sync; positive explicit SplitKV is
+    # capture-safe. CUDA graph capture must not use None/zero auto mode.
     if SplitKV is None or int(SplitKV) <= 0:
+        context_pages = max(
+            1,
+            (
+                int(context_lens[ctx_stride - 1 :: ctx_stride].max().item())
+                + KV_BLOCK_SIZE
+                - 1
+            )
+            // KV_BLOCK_SIZE,
+        )
         real_pages = max(
             1,
-            (int(context_lens.max().item()) + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE,
+            min(
+                context_pages,
+                (table_span + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE,
+                (out_logits.shape[1] + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE,
+            ),
         )
         total_cu = (
             device_cu_count(q_fp8.device.index)
             if TotalCuCount is None
             else int(TotalCuCount)
         )
+        if total_cu <= 0:
+            raise ValueError("TotalCuCount must be positive")
         # Rows replay inside each CTA: only B * SplitKV contributes to the grid.
         split_kv = max(1, min(real_pages, total_cu * cta_cap // batch_size))
     else:
         split_kv = max(1, int(SplitKV))
+    if batch_size * split_kv > max_i32:
+        raise ValueError("batch_size * SplitKV exceeds the grid index range")
 
     grid_blocks = batch_size * split_kv
     launcher = _compile(
@@ -698,6 +799,9 @@ def flydsl_fp8_paged_mqa_logits(
             int(has_next_n_lens),
             int(q_fp8.stride(0)),
             int(max_block_len),
+            int(table_span),
+            int(kv_cache.shape[0]),
+            int(out_logits.shape[1]),
             int(out_logits.stride(0)),
             stream,
         )

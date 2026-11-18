@@ -146,7 +146,12 @@ def build_sampled_topk_module(k=2048, report_counts=False):
             sample_count = (chunks - 1) * 32 + fx.min(tail, fx.Int32(32))
             # Eight lanes share a 128-byte chunk, so sparse sampling fetches
             # sparse cache lines rather than a separate line for every value.
-            chunk = tid // 8
+            sample_owner = fx.make_layout((_THREADS // 8, 8), (8, 1))
+            sample_layout = fx.make_layout(
+                (_THREADS // 8, 8, 4),
+                (32, 4, 1),
+            )
+            chunk, lane_in_chunk = fx.idx2crd(tid, sample_owner).unpack()
             begin = chunk * stratum
             extent = fx.min(stratum, length - begin)
             hashed = fx.Uint32(chunk + row * 4099 + 17)
@@ -154,10 +159,12 @@ def build_sampled_topk_module(k=2048, report_counts=False):
             hashed = (hashed ^ (hashed >> fx.Uint32(15))) * fx.Uint32(0x846CA68B)
             hashed = hashed ^ (hashed >> fx.Uint32(16))
             slots = fx.max(extent // 32, fx.Int32(1))
-            col = begin + fx.Int32(hashed % fx.Uint32(slots)) * 32 + (tid % 8) * 4
+            col = begin + fx.Int32(hashed % fx.Uint32(slots)) * 32 + lane_in_chunk * 4
             values = _load_f32x4(tiles, (chunk < chunks).select(col // 4, length))
             for j in range_constexpr(4):
-                sample_index = tid * 4 + j
+                sample_index = fx.Int32(
+                    fx.get_scalar(fx.crd2idx((chunk, lane_in_chunk, j), sample_layout))
+                )
                 if sample_index < sample_count:
                     keys[sample_index] = _f32_to_ord(values[j]) ^ sign
             gpu.barrier()

@@ -1337,11 +1337,14 @@ def _flydsl_topk_decode_shape_supported(
     if k not in _FLYDSL_TOPK_DECODE_KS:
         return False
     gates = _FLYDSL_TOPK_PACKED_DECODE_GATES if packed else _FLYDSL_TOPK_DECODE_GATES
+    arch_gates = gates.get(arch)
+    if arch_gates is None:
+        return False
     return any(
         min_width <= width
         and (max_width is None or width <= max_width)
         and 0 < num_rows <= max_rows
-        for min_width, max_width, max_rows in gates[arch][stable]
+        for min_width, max_width, max_rows in arch_gates[stable]
     )
 
 
@@ -1468,7 +1471,12 @@ def top_k_per_row_decode(
     ``row_starts[r]`` [numRows] i32 (``stride0`` / ``stride1`` unused), the
     indices relative to that start. ``plane_width`` is the width of the plane
     the rows stand for: it bounds every row and uses the packed multi-CTA
-    gates. Packed calls never use sampled selection."""
+    gates. Packed calls never use sampled selection.
+
+    This logits API intentionally does not dispatch producer-side fused
+    index-score/TopK kernels: those consume queries, paged keys and head weights,
+    so routing them here would require already-materialized logits to be ignored
+    or materialized again. Integrate that path at the score-producing caller."""
     if row_starts is not None:
         return _top_k_per_row_decode_packed(
             logits, next_n, seqLens, indices, numRows, k, stable, values,

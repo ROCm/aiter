@@ -23,7 +23,8 @@ from ..candidate_topk_common import (
     radix_pass_bits,
 )
 from ..kernels_common import atomic_add_i32
-from ..tensor_shim import GTensor, _run_compiled, _to_raw
+from ..tensor_shim import GTensor, _to_raw
+from ..topk.topk_launch import run_topk_launcher
 
 HEADS = 32
 HEAD_DIM = 128
@@ -519,7 +520,9 @@ def compile_fp8_paged_mqa_local_topk(
                         total = total + activated * weight
                 total = total + total.shuffle_xor(16, WAVE_SIZE)
                 total = total + total.shuffle_xor(32, WAVE_SIZE)
-                # The per-position scale is shared by every contributing head.
+                # Scales are a finite, nonnegative MQA cache contract. Apply
+                # each head's ReLU before scaling, and do not reinterpret an
+                # invalid value with abs or a clamp in the hot path.
                 total = total * scale
                 total = page_oks[ni].select(total, fx.Float32(float("-inf")))
 
@@ -807,7 +810,7 @@ def launch_fp8_paged_mqa_local_topk(
         merge_histogram = candidate_scores
     if merge_state is None:
         merge_state = candidate_counts
-    _run_compiled(
+    run_topk_launcher(
         launcher,
         q_fp8,
         kv_cache,

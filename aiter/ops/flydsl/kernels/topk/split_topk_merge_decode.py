@@ -12,7 +12,6 @@ from flydsl.expr import (
     Array,
     Float32,
     Int32,
-    arith,
     as_ir_value,
     const_expr,
     gpu,
@@ -27,6 +26,7 @@ from aiter.ops.flydsl.kernels.dpp_utils import update_dpp_i32
 from aiter.ops.flydsl.kernels.kernels_common import (
     atomic_add_i32,
     kernel_signature,
+    ord_signed_f32,
     uint32_to_int32,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_atom
@@ -51,9 +51,9 @@ _CHUNKS_PER_ROW = 16
 # 128 -> 138. At M=64 the balance inverts and 8 wins, so the host picks a value
 # per shape; see `topk_per_row_decode_chunks`.
 _MAX_BLOCK_THREADS = 1024
-# The cross-chunk prefix at the end of `stable_count_prefix_kernel` is a single
-# wave, so it cannot carry more chunks than a wave has lanes.
-_MAX_CHUNKS_PER_ROW = 64
+# Unstable split merges have no cross-chunk prefix and cover the 128-way Stage-A
+# plan. Stable selection is checked separately against one wave's 64 lanes.
+_MAX_CHUNKS_PER_ROW = 128
 _STATE_PREFIX = 0
 _STATE_MASK = 1
 _STATE_REMAINING_K = 2
@@ -151,11 +151,7 @@ def _radix_pass(pass_idx: int) -> _RadixPass:
 
 
 def _f32_to_ord(val):
-    bits = val.bitcast(Int32)
-    ords = bits ^ ((bits >> fx.Int32(31)) & fx.Int32(0x7FFFFFFF))
-    abs_bits = bits & fx.Int32(0x7FFFFFFF)
-    is_nan = arith.cmpi(arith.CmpIPredicate.ugt, abs_bits, fx.Int32(0x7F800000))
-    return is_nan.select(fx.Int32(0x7FFFFFFF), ords)
+    return ord_signed_f32(val)
 
 
 def _row_length(row, row_ends, width, next_n):
@@ -370,9 +366,21 @@ def build_topk_per_row_decode_module(
         hist_chunk = fx.Int32(0) if combine_histograms else chunk
         chunk_hist = fx.slice(partial_hist, (row, hist_chunk, None))
         if first_pass != 0 and chunk == 0 and tid == 0:
+            live_row_len = row_len
+            if use_split_counts:
+                live_row_len = fx.Int32(0)
+                for split in range_constexpr(chunks_per_row):
+                    split_count = split_counts[row, fx.Int32(split)]
+                    split_count = (split_count < 0).select(fx.Int32(0), split_count)
+                    split_count = (split_count > fx.Int32(split_width)).select(
+                        fx.Int32(split_width), split_count
+                    )
+                    live_row_len = live_row_len + split_count
             row_state[_STATE_PREFIX] = 0
             row_state[_STATE_MASK] = 0
-            row_state[_STATE_REMAINING_K] = (row_len < k).select(row_len, fx.Int32(k))
+            row_state[_STATE_REMAINING_K] = (live_row_len < k).select(
+                live_row_len, fx.Int32(k)
+            )
             row_state[_STATE_DIRECT] = direct.select(fx.Int32(1), fx.Int32(0))
         if first_pass != 0 and chunk == 0 and direct:
             for output_step in range_constexpr(output_steps):
@@ -456,7 +464,12 @@ def build_topk_per_row_decode_module(
                 vector_end = vector_start + fx.Int32(split_vectors)
                 valid_end = vector_end * fx.Int32(_VEC)
                 if use_split_counts:
-                    valid_end = chunk * fx.Int32(split_width) + split_counts[row, chunk]
+                    split_count = split_counts[row, chunk]
+                    split_count = (split_count < 0).select(fx.Int32(0), split_count)
+                    split_count = (split_count > fx.Int32(split_width)).select(
+                        fx.Int32(split_width), split_count
+                    )
+                    valid_end = chunk * fx.Int32(split_width) + split_count
                 vector_end = (vector_end < row_vectors).select(vector_end, row_vectors)
                 for vec_idx in range(
                     vector_start + tid,
@@ -730,7 +743,12 @@ def build_topk_per_row_decode_module(
                 vector_end = (chunk + fx.Int32(1)) * fx.Int32(split_vectors)
                 valid_end = vector_end * fx.Int32(_VEC)
                 if use_split_counts:
-                    valid_end = chunk * fx.Int32(split_width) + split_counts[row, chunk]
+                    split_count = split_counts[row, chunk]
+                    split_count = (split_count < 0).select(fx.Int32(0), split_count)
+                    split_count = (split_count > fx.Int32(split_width)).select(
+                        fx.Int32(split_width), split_count
+                    )
+                    valid_end = chunk * fx.Int32(split_width) + split_count
                 vector_end = (vector_end < row_vectors).select(vector_end, row_vectors)
                 vector_step = fx.Int32(block_threads)
             for vec_idx in range(vector_start, vector_end, vector_step):

@@ -7,15 +7,18 @@ from functools import cache
 
 import torch
 
-from .kernels.tensor_shim import _run_compiled
+from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
+
 from .kernels.topk.split_topk_merge_decode import (
     _STATE_SIZE,
     build_topk_per_row_decode_module,
 )
+from .kernels.topk.topk_launch import run_topk_launcher
 
 _RADIX_BINS = 1 << 11
 _BLOCK_THREADS = 256
 _WAVE_SIZE = 64
+_MAX_SPLITS = 128
 
 
 def split_topk_merge_workspace_shapes(rows: int):
@@ -28,31 +31,42 @@ def split_topk_merge_workspace_shapes(rows: int):
     return (rows, 1, _RADIX_BINS), (rows, _STATE_SIZE)
 
 
-@cache
-def _full_widths(device_index: int, rows: int, width: int) -> torch.Tensor:
-    return torch.full(
-        (rows,),
-        width,
-        dtype=torch.int32,
-        device=torch.device("cuda", device_index),
-    )
+@capture_scoped_cache
+def _full_widths(
+    device: torch.device, stream_id: int, rows: int, width: int
+) -> torch.Tensor:
+    del stream_id
+    with persistent_alloc(device):
+        return torch.full(
+            (rows,),
+            width,
+            dtype=torch.int32,
+            device=device,
+        )
 
 
-@cache
+@capture_scoped_cache
 def _split_workspace(
-    device_index: int,
+    device: torch.device,
     stream_id: int,
     rows: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del stream_id
-    device = torch.device("cuda", device_index)
-    return (
-        torch.zeros((rows, 1, _RADIX_BINS), dtype=torch.int32, device=device),
-        torch.empty((rows, _STATE_SIZE), dtype=torch.int32, device=device),
-    )
+    with persistent_alloc(device):
+        return (
+            torch.zeros((rows, 1, _RADIX_BINS), dtype=torch.int32, device=device),
+            torch.empty((rows, _STATE_SIZE), dtype=torch.int32, device=device),
+        )
 
 
 def clear_split_topk_merge_workspace_cache() -> None:
+    """Drop cached workspace references after all users of them have drained.
+
+    Do this only when no graph can replay a captured address. Clearing this
+    cache does not synchronize or revoke a pair already captured by a graph.
+    Cached workspaces that remain in use must not be returned to a different
+    sequence.
+    """
     _full_widths.cache_clear()
     _split_workspace.cache_clear()
 
@@ -80,7 +94,13 @@ def _build_split_topk_merge(k: int, splits: int, precomputed_first_pass: bool):
 def alloc_split_topk_merge_workspace(
     device: torch.device, rows: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Allocate a clean workspace once. Do not call this inside a CUDA graph."""
+    """Allocate clean, caller-owned scratch once outside graph capture.
+
+    The pair is exclusive to one in-flight Stage-A/merge sequence. Its
+    initialization runs on the current stream, so a caller that first uses it
+    on another stream must provide an explicit dependency. Keep the pair alive
+    for every graph that captured its address.
+    """
     hist_shape, state_shape = split_topk_merge_workspace_shapes(rows)
     return (
         torch.zeros(hist_shape, dtype=torch.int32, device=device),
@@ -95,10 +115,13 @@ def split_topk_merge_workspace(
     """Return the cached histogram and state used when the caller passes none.
 
     First miss allocates zeros. Capture reuses that tensor; it does not
-    ``zeros()`` again. Serving should pass its own pair instead of this cache.
+    ``zeros()`` again. A cold capture gets capture-scoped scratch and records
+    initialization into that graph. A warm capture can reuse the eager pair, so
+    cached scratch is for serialized use only. Pass a separate caller-owned
+    pair for overlapping graphs, streams, or eager sequences.
     """
     stream = torch.cuda.current_stream(device)
-    return _split_workspace(device.index, stream.cuda_stream, rows)
+    return _split_workspace(device, stream.cuda_stream, rows)
 
 
 def _require_merge_workspace(
@@ -121,6 +144,8 @@ def _require_merge_workspace(
             raise ValueError(f"{name} must be on {device}, got {tensor.device}")
         if tensor.dtype != torch.int32 or not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous int32")
+        if int(tensor.data_ptr()) % 4:
+            raise ValueError(f"{name} must be 4-byte aligned")
         if tuple(tensor.shape) != expected:
             raise ValueError(
                 f"{name} must have shape {expected}, got {tuple(tensor.shape)}"
@@ -148,6 +173,8 @@ def _require_merge_outputs(
             raise ValueError(f"{name} must be on {device}, got {tensor.device}")
         if tensor.dtype != dtype or not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous {dtype}")
+        if int(tensor.data_ptr()) % 4:
+            raise ValueError(f"{name} must be 4-byte aligned")
         if tensor.shape != (rows, k):
             raise ValueError(
                 f"{name} must have shape {(rows, k)}, got {tuple(tensor.shape)}"
@@ -156,14 +183,8 @@ def _require_merge_outputs(
 
 
 def _row_ends(device: torch.device, rows: int, width: int) -> torch.Tensor:
-    if torch.cuda.is_current_stream_capturing():
-        return torch.full(
-            (rows,),
-            width,
-            dtype=torch.int32,
-            device=device,
-        )
-    return _full_widths(device.index, rows, width)
+    stream = torch.cuda.current_stream(device)
+    return _full_widths(device, stream.cuda_stream, rows, width)
 
 
 def split_topk_merge(
@@ -182,10 +203,35 @@ def split_topk_merge(
     ``candidate_counts`` bounds the live prefix of each split's bag, so the
     slots Stage A left as ``(-inf, -1)`` are never read. Pass
     ``precomputed_first_pass`` when Stage A already filled the pass-0
-    histogram in ``workspace``; the merge then skips that data pass.
+    histogram in an explicitly supplied ``workspace``; the merge then skips
+    that data pass.
 
-    A caller-owned ``workspace`` is not zeroed here. It must be zeros before
-    Stage A; after this merge it is zeros again.
+    Device counts outside ``[0, k]`` are clamped by the kernel, without a
+    synchronization, so malformed counts cannot make a split read another bag.
+    Scores use torch TopK ordering: NaNs sort above finite values and ``+inf``.
+
+    Ownership and lifetime
+    ----------------------
+    A merge workspace is exclusive mutable scratch for one in-flight
+    Stage-A/merge sequence. It must not overlap another sequence. Reuse is safe
+    only after the preceding merge completes on the same stream or after an
+    explicit caller-provided cross-stream dependency. Use distinct,
+    non-aliasing pairs for graphs or eager work that can overlap, and keep each
+    pair alive for every graph that captured its address. No synchronization
+    or event is inserted by this helper.
+
+    A fresh caller-owned histogram must be zeros; Stage A requires that clean
+    histogram when ``precomputed_first_pass`` is true, and a completed merge
+    restores it to zero. The state tensor is overwritten by the kernels and
+    need not be zero-filled. Cold captured cached scratch records
+    initialization in the graph. Warm cached scratch is reused and therefore
+    must remain serialized.
+
+    If Stage A or a merge is interrupted before the histogram is restored,
+    drain all outstanding work on the pair, then explicitly zero the histogram
+    before reuse or replace the pair. Clearing the cache is not a
+    synchronization operation and does not make captured addresses safe to
+    reuse.
     """
     if candidate_scores.ndim != 3:
         raise ValueError("candidate_scores must have shape [rows,splits,local_k]")
@@ -194,10 +240,20 @@ def split_topk_merge(
     rows, splits, local_k = candidate_scores.shape
     if candidate_counts.shape != (rows, splits):
         raise ValueError("candidate_counts must have shape [rows,splits]")
+    if rows <= 0:
+        raise ValueError("candidate tensors must contain at least one row")
+    if not isinstance(k, int) or isinstance(k, bool) or k <= 0:
+        raise ValueError(f"k must be a positive integer, got {k}")
+    if k % 4:
+        raise ValueError(f"k must be divisible by 4, got {k}")
     if local_k != k:
         raise ValueError(f"local_k must equal k, got {local_k} and {k}")
     if splits <= 1:
         raise ValueError("split-aware merge requires at least two splits")
+    if splits > _MAX_SPLITS:
+        raise ValueError(f"splits must be at most {_MAX_SPLITS}, got {splits}")
+    if precomputed_first_pass and workspace is None:
+        raise ValueError("workspace is required with precomputed_first_pass=True")
     if candidate_scores.dtype != torch.float32:
         raise TypeError("candidate_scores must be float32")
     if candidate_positions.dtype != torch.int32:
@@ -215,6 +271,11 @@ def split_topk_merge(
         raise ValueError("candidate scores and positions must be contiguous")
     if not candidate_counts.is_contiguous():
         raise ValueError("candidate_counts must be contiguous")
+    if any(
+        int(tensor.data_ptr()) % 4
+        for tensor in (candidate_scores, candidate_positions, candidate_counts)
+    ):
+        raise ValueError("candidate tensors must be 4-byte aligned")
 
     device = candidate_scores.device
     out_scores, out_positions = _require_merge_outputs(
@@ -244,7 +305,7 @@ def split_topk_merge(
             workspace, rows=rows, device=device
         )
     launcher = _build_split_topk_merge(k, splits, precomputed_first_pass)
-    _run_compiled(
+    run_topk_launcher(
         launcher,
         scores,
         positions,

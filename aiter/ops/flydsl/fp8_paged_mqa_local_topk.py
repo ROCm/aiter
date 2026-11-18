@@ -23,6 +23,8 @@ from .split_topk_merge import (
 )
 
 SUPPORTED_ARCHES = ("gfx950",)
+_FLYDSL_I32_EXTENT_MAX = (1 << 31) - 1
+_RAW_I32_ALIGNMENT = 4
 
 
 def _arch_name(device: torch.device) -> str:
@@ -30,13 +32,24 @@ def _arch_name(device: torch.device) -> str:
     return props.gcnArchName.split(":", 1)[0]
 
 
-def _require_cuda_contiguous(name: str, tensor: torch.Tensor) -> None:
+def _require_cuda_contiguous(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    alignment: int | None = None,
+) -> None:
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
     if tensor.device.type != "cuda":
         raise ValueError(f"{name} must be on a CUDA/HIP device")
     if not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
+    if any(int(extent) > _FLYDSL_I32_EXTENT_MAX for extent in tensor.shape):
+        raise ValueError(
+            f"{name} has a dimension exceeding FlyDSL's signed-int32 extent limit"
+        )
+    if alignment is not None and int(tensor.data_ptr()) % alignment:
+        raise ValueError(f"{name} must be {alignment}-byte aligned")
 
 
 def _packed_page_shape(kv_cache: torch.Tensor) -> tuple[int, int] | None:
@@ -48,7 +61,13 @@ def _packed_page_shape(kv_cache: torch.Tensor) -> tuple[int, int] | None:
 
 
 def _packed_scale_view(kv_cache: torch.Tensor) -> torch.Tensor:
-    return kv_cache.view(torch.float32).reshape(-1)
+    """Interpret canonical packed K as ``[pages,page_size,33]`` FP32 words.
+
+    Keeping the page and token axes avoids putting ``pages*page_size*33`` in
+    one signed-int32 dynamic shape extent. The returned view aliases the
+    allocation and adds no copy.
+    """
+    return kv_cache.view(torch.float32)
 
 
 def _normalize_kv_inputs(kv_cache, k_scales, q_dtype):
@@ -60,7 +79,16 @@ def _normalize_kv_inputs(kv_cache, k_scales, q_dtype):
                 "packed kv_cache must be uint8 or the query fp8 dtype, "
                 f"got {kv_cache.dtype}"
             )
-        return kv_cache, _packed_scale_view(kv_cache), True, num_pages, page_size
+        kv_bytes = kv_cache.view(torch.uint8)
+        if kv_bytes.ndim == 4:
+            kv_bytes = kv_bytes.squeeze(2)
+        return (
+            kv_bytes,
+            _packed_scale_view(kv_bytes),
+            True,
+            num_pages,
+            page_size,
+        )
     if kv_cache.ndim != 3 or kv_cache.shape[2] != HEAD_DIM:
         raise ValueError(
             "kv_cache must have shape [num_pages,page_size,128] or packed "
@@ -143,17 +171,17 @@ def _prepare_stage_a(
     preshuffled=True,
     require_page64=False,
 ):
-    for name, tensor in (
-        ("q_fp8", q_fp8),
-        ("kv_cache", kv_cache),
-        ("weights", weights),
-        ("context_lens", context_lens),
-        ("block_tables", block_tables),
+    for name, tensor, alignment in (
+        ("q_fp8", q_fp8, _RAW_I32_ALIGNMENT),
+        ("kv_cache", kv_cache, _RAW_I32_ALIGNMENT),
+        ("weights", weights, None),
+        ("context_lens", context_lens, None),
+        ("block_tables", block_tables, None),
     ):
-        _require_cuda_contiguous(name, tensor)
+        _require_cuda_contiguous(name, tensor, alignment=alignment)
     packed_shape = _packed_page_shape(kv_cache)
     if packed_shape is None:
-        _require_cuda_contiguous("k_scales", k_scales)
+        _require_cuda_contiguous("k_scales", k_scales, alignment=_RAW_I32_ALIGNMENT)
     elif k_scales is not None:
         raise ValueError("k_scales must be None when kv_cache contains packed scales")
 
@@ -163,6 +191,8 @@ def _prepare_stage_a(
     )
     if num_pages < 1:
         raise ValueError("kv_cache must contain at least one page")
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
     if any(
         tensor.device != device
         for tensor in (kv_cache, k_scales, weights, context_lens, block_tables)
@@ -187,6 +217,8 @@ def _prepare_stage_a(
         raise ValueError("kv_cache must use shuffle_weight(..., layout=(16, 16))")
 
     rows = q_fp8.shape[0]
+    if rows <= 0:
+        raise ValueError("q_fp8 batch dimension must be positive")
     if weights.shape != (rows, 32) or weights.dtype != torch.float32:
         raise ValueError(
             f"weights must be contiguous float32 with shape {(rows, 32)}, "
@@ -220,6 +252,8 @@ def _prepare_stage_a(
         num_splits = _auto_num_splits(rows, device, max_history, k)
     if not isinstance(num_splits, int) or num_splits <= 0:
         raise ValueError(f"num_splits must be a positive integer, got {num_splits}")
+    if num_splits > 128:
+        raise ValueError(f"num_splits must be at most 128, got {num_splits}")
     max_split_span = (max_history + num_splits - 1) // num_splits
     if max_split_span > 65535:
         raise ValueError(
@@ -290,9 +324,16 @@ def flydsl_fp8_paged_mqa_local_topk(
     span. Block-table entries outside ``[0, num_pages)`` are not scored (they
     contribute ``-inf``); the kernel will not index the KV cache with those ids.
 
+    Scale entries must be finite and nonnegative. Device values are not
+    synchronized here: invalid values are not abs'd or clamped; a negative
+    scale changes the score's sign and a NaN scale produces a NaN score.
+
     If ``workspace`` is set and ``num_splits > 1``, Stage A fills that pair's
     pass-0 histogram for ``split_topk_merge(..., precomputed_first_pass=True)``.
-    The pair is not zeroed here; it must already be zeros.
+    The pair is not zeroed here; it must already be zeros. The pair is exclusive
+    mutable scratch for one in-flight Stage-A/merge sequence, not a set of
+    reentrant buffers. Reuse it only after that sequence completes; callers
+    crossing streams must order use explicitly.
     """
     launch = _prepare_stage_a(
         q_fp8,
@@ -360,6 +401,11 @@ def flydsl_fp8_paged_mqa_topk(
     ``shuffle_weight(..., layout=(16,16))``. Lengths and block-table ids follow
     the same safety contract as ``flydsl_fp8_paged_mqa_local_topk``.
 
+    Every scale entry must be finite and nonnegative. These device tensors are
+    not reduced or synchronized to validate values. The ReLU is applied before
+    scaling, exactly as in the MQA oracle; invalid scales are neither abs'd nor
+    clamped and therefore remain observable as invalid/negative arithmetic.
+
     Serving / CUDA-graph caller
     ---------------------------
     Allocate the merge workspace **once**, outside capture, then pass the same
@@ -379,9 +425,31 @@ def flydsl_fp8_paged_mqa_topk(
     ``rows`` is ``q.shape[0]``. Shapes: histogram ``[rows, 1, 2048]`` int32,
     state ``[rows, 6]`` int32 (see ``split_topk_merge_workspace_shapes``).
 
-    Stage A atomics the retained bag's 11-bit pass-0 histogram into
-    ``workspace[0]``. The merge skips that data pass, then writes every bin
-    back to 0. If Stage A runs and merge does not, the histogram is dirty.
+    Workspace ownership
+    ------------------
+    ``workspace`` is exclusive mutable scratch for one in-flight Stage-A/merge
+    sequence. This includes graph replay. Allocate caller-owned scratch once
+    outside capture and keep it alive for every graph that can replay with its
+    captured address. One pair may be replayed sequentially on the same stream,
+    or on another stream after an explicit caller-provided dependency, but work
+    on that pair must never overlap.
+
+    Use a separate, non-aliasing pair for each graph, stream, or eager sequence
+    that can overlap. The default cached pair is intended for serialized use;
+    warming it before capture does not make one pair safe for overlapping
+    replays. This helper adds no events, waits, or implicit synchronization.
+
+    A fresh caller-owned histogram is initialized to zero by
+    ``alloc_split_topk_merge_workspace``. Cold captured allocations record that
+    initialization in the graph; warmed allocations must already be initialized
+    and ordered on the launch stream by the caller. Stage A atomics the retained
+    bag's 11-bit pass-0 histogram into ``workspace[0]``. The merge skips that
+    data pass, then writes every bin back to 0.
+
+    If Stage A is interrupted before its merge completes, the histogram is
+    dirty. After all outstanding work on the old sequence has ended, zero only
+    the histogram before reuse, or discard the old pair and allocate a fresh
+    initialized pair. Do not reset scratch concurrently with either stage.
 
     Two-kernel form (caller owns the ``[rows, S, k]`` bags too)::
 
@@ -471,11 +539,20 @@ def merge_local_topk_candidates(
     *,
     k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select directly from the fixed-width Stage-A candidate buffer.
+    """Merge the private fixed-width candidate bags produced by Stage A.
 
-    Invalid local slots are already ``(-inf, -1)``. Stage A always emits
-    ``local_k == k``, so multi-split rows go through ``split_topk_merge``.
+    This is not a general-purpose local-TopK merge. Stage A always emits
+    ``local_k == k`` and pads every slot beyond a bag's retained count with
+    ``(-inf, -1)``. The single-split branch is valid only under that contract:
+    the sole padded bag is already the complete result, including its cleared
+    tail.
     """
+    if not isinstance(candidate_scores, torch.Tensor):
+        raise TypeError("candidate_scores must be a torch.Tensor")
+    if not isinstance(candidate_positions, torch.Tensor):
+        raise TypeError("candidate_positions must be a torch.Tensor")
+    if not isinstance(candidate_counts, torch.Tensor):
+        raise TypeError("candidate_counts must be a torch.Tensor")
     if candidate_scores.ndim != 3:
         raise ValueError("candidate_scores must have shape [rows,splits,local_k]")
     if candidate_positions.shape != candidate_scores.shape:
@@ -483,10 +560,40 @@ def merge_local_topk_candidates(
     rows, splits, local_k = candidate_scores.shape
     if candidate_counts.shape != (rows, splits):
         raise ValueError("candidate_counts must have shape [rows,splits]")
+    if rows <= 0 or splits <= 0:
+        raise ValueError("candidate tensors must contain positive rows and splits")
+    if k not in SUPPORTED_K or local_k != k:
+        raise ValueError(
+            f"Stage A requires k in {SUPPORTED_K} and local_k == k, "
+            f"got k={k} and local_k={local_k}"
+        )
+    if candidate_scores.dtype != torch.float32:
+        raise TypeError("candidate_scores must be float32")
+    if (
+        candidate_positions.dtype != torch.int32
+        or candidate_counts.dtype != torch.int32
+    ):
+        raise TypeError("candidate_positions and candidate_counts must be int32")
+    if (
+        not candidate_scores.is_contiguous()
+        or not candidate_positions.is_contiguous()
+        or not candidate_counts.is_contiguous()
+    ):
+        raise ValueError("candidate tensors must be contiguous")
+    if (
+        candidate_positions.device != candidate_scores.device
+        or candidate_counts.device != candidate_scores.device
+    ):
+        raise ValueError("candidate tensors must share one device")
+    if any(
+        int(tensor.data_ptr()) % 4
+        for tensor in (candidate_scores, candidate_positions, candidate_counts)
+    ):
+        raise ValueError("candidate tensors must be 4-byte aligned")
+    if not candidate_scores.is_cuda:
+        raise ValueError("candidate tensors must be on a CUDA/HIP device")
     if splits == 1:
-        return candidate_scores[:, 0, :k], candidate_positions[:, 0, :k]
-    if local_k != k:
-        raise ValueError(f"local_k must equal k, got {local_k} and {k}")
+        return candidate_scores[:, 0, :], candidate_positions[:, 0, :]
     return split_topk_merge(
         candidate_scores,
         candidate_positions,

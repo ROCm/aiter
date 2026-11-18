@@ -12,7 +12,7 @@ from flydsl.expr import arith, gpu
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.typing import T
 
-from .kernels_common import uint32_to_int32
+from .kernels_common import ord_signed_f32, uint32_to_int32
 
 BLOCK_THREADS = 256
 WAVE_SIZE = 64
@@ -55,8 +55,7 @@ def make_streaming_topk_storage(
 
 def f32_to_ordered_i32(value):
     """Map float32 bits to signed-order int32."""
-    bits = value.bitcast(fx.Int32)
-    return bits ^ ((bits >> fx.Int32(31)) & fx.Int32(0x7FFFFFFF))
+    return ord_signed_f32(value)
 
 
 def radix_pass_bits(pass_index):
