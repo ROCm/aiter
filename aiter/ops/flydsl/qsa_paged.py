@@ -30,12 +30,18 @@ reports it.
 """
 
 import functools
+import os
 
 import torch
 
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
 from .kernels.kernels_common import LOG2E, ceildiv, get_warp_size
+from .kernels.qsa.indexer_fused_select import (
+    HIST_BINS,
+    build_qsa_indexer_fused_select_module,
+    fused_split_spans,
+)
 from .kernels.qsa.indexer_select import (
     _D,
     _DECODE_MAX_ROWS,
@@ -917,6 +923,234 @@ def qsa_indexer_block_ids(
     )
 
 
+@functools.lru_cache(maxsize=16)
+def _fused_select_plan(
+    page_size: int,
+    use_k32: bool,
+    wide_cache: bool,
+    k_strides: tuple[int, int, int] | None,
+):
+    return build_qsa_indexer_fused_select_module(
+        page_size, use_k32, wide_cache, k_strides
+    )
+
+
+def _fused_workspace_storage(
+    workspace: torch.Tensor | None, rows: int, n_splits: int, device: torch.device
+) -> torch.Tensor:
+    """Int32 scratch for ``n_splits`` candidate lists and their histograms.
+
+    A caller-owned score buffer is large enough for the trimmed shapes this
+    path scores, and the kernel overwrites every slot it reads. A short
+    buffer is left untouched and a private scratch is used instead.
+    """
+    needed = n_splits * rows * (_K + HIST_BINS)
+    if (
+        workspace is not None
+        and workspace.is_cuda
+        and workspace.is_contiguous()
+        and workspace.dtype == torch.float32
+        and workspace.numel() >= needed
+    ):
+        return workspace.view(torch.int32).reshape(-1)[:needed]
+    return torch.empty(needed, dtype=torch.int32, device=device)
+
+
+def _check_first_level_histogram(packed: torch.Tensor, histogram: torch.Tensor) -> None:
+    """The 256 bins are the top 8 bits of each surviving candidate's key."""
+    # A compile-only replay has no candidate values to count.
+    if os.environ.get("COMPILE_ONLY") == "1":
+        return
+    valid = packed >= 0
+    keys = (packed >> 16) & 0xFFFF
+    bins = (keys >> 8).clamp(0, HIST_BINS - 1).to(torch.int64)
+    weight = valid.to(torch.int32)
+    expected = torch.zeros(
+        packed.reshape(-1, _K).shape[0],
+        HIST_BINS,
+        dtype=torch.int32,
+        device=packed.device,
+    )
+    expected.scatter_add_(1, bins.reshape(-1, _K), weight.reshape(-1, _K))
+    if not torch.equal(expected, histogram.reshape(-1, HIST_BINS)):
+        raise RuntimeError(
+            "fused indexer histogram does not match the stored candidate keys"
+        )
+
+
+def _columns_from_packed(packed: torch.Tensor, split_begin: int) -> torch.Tensor:
+    """Global column ids. An empty slot stays ``-1``."""
+    valid = packed >= 0
+    offset = packed & 0xFFFF
+    return torch.where(valid, offset + int(split_begin), torch.full_like(packed, -1))
+
+
+def _rescore_candidate_columns(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    columns: torch.Tensor,
+    score_scale: float,
+) -> torch.Tensor:
+    """Oracle ReLU-sum on candidate columns. Invisible columns are ``-inf``.
+
+    This is the Phase 3 merge stand-in. It ranks the split candidates by the
+    same fp32 score the set gate uses, and it drops a missing page.
+    """
+    rows, width = columns.shape
+    valid = columns >= 0
+    safe = columns.clamp(min=0)
+    page_size = int(k_cache.shape[1])
+    n_pages = int(page_table.shape[1])
+    page = torch.div(safe, page_size, rounding_mode="floor")
+    off = safe - page * page_size
+    page = page.clamp(max=max(n_pages - 1, 0))
+    n_req = int(context_lens.shape[0])
+    valid_req = (token_to_req >= 0) & (token_to_req < n_req)
+    req = token_to_req.clamp(0, max(n_req - 1, 0)).view(rows, 1).expand(rows, width)
+    phys = page_table[req, page]
+    n_cache = int(k_cache.shape[0])
+    phys_ok = (phys >= 0) & (phys < n_cache) & valid
+    k = k_cache[phys.clamp(min=0), off, 0, :].to(torch.float32)
+    dots = torch.einsum("mhd,mcd->mhc", q.to(torch.float32), k)
+    scores = torch.nn.functional.relu(dots).sum(dim=1) * float(score_scale)
+    slen = context_lens[req[:, 0]]
+    visible = torch.minimum(
+        torch.div(query_positions + 1, _R, rounding_mode="floor"),
+        torch.div(slen, _R, rounding_mode="floor"),
+    )
+    visible = torch.where(valid_req, visible, torch.zeros_like(visible))
+    n_columns = n_pages * page_size
+    visible = torch.minimum(visible, torch.full_like(visible, n_columns))
+    keep = phys_ok & (columns < visible.view(rows, 1))
+    return torch.where(keep, scores, torch.full_like(scores, float("-inf")))
+
+
+def _reference_merge_candidates(
+    packed: torch.Tensor,
+    spans: list[tuple[int, int]],
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    score_scale: float,
+) -> torch.Tensor:
+    """Reduce per-span top-512 lists to one ``[M, 512]`` block-id tensor.
+
+    One span is already the selection. Two spans are re-ranked in fp32.
+    """
+    columns = torch.cat(
+        [
+            _columns_from_packed(packed[index], begin)
+            for index, (begin, _end) in enumerate(spans)
+        ],
+        dim=1,
+    )
+    if len(spans) == 1:
+        return columns.to(torch.int32)
+    scores = _rescore_candidate_columns(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        context_lens,
+        columns,
+        score_scale,
+    )
+    order = torch.argsort(scores, dim=-1, descending=True, stable=True)[:, :_K]
+    picked = torch.gather(scores, 1, order)
+    chosen = torch.gather(columns, 1, order)
+    chosen = torch.where(torch.isfinite(picked), chosen, torch.full_like(chosen, -1))
+    return chosen.to(torch.int32)
+
+
+def _write_fused_indexer_block_ids(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    query_positions: torch.Tensor,
+    context_lens: torch.Tensor,
+    out: torch.Tensor | None,
+    score_scale: float,
+    workspace: torch.Tensor | None,
+    max_seq_len: int,
+) -> torch.Tensor:
+    """Score each span and merge its candidates. No fp32 score matrix is written."""
+    m, _arch = _prepare_indexer_launch(
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        context_lens,
+        out,
+        workspace,
+        (_H,),
+    )
+    if out is None:
+        out = torch.empty(m, _K, dtype=torch.int32, device=q.device)
+    if _indexer_empty_geometry(m, k_cache, page_table, context_lens):
+        return out.fill_(-1)
+    q = q.contiguous()
+    page_table = page_table.contiguous()
+    token_to_req = token_to_req.contiguous()
+    query_positions = query_positions.contiguous()
+    context_lens = context_lens.contiguous()
+    page_size = int(k_cache.shape[1])
+    n_columns = int(page_table.shape[1]) * page_size
+    spans = fused_split_spans(max_seq_len, n_columns, page_size, _R)
+    storage = _fused_workspace_storage(workspace, m, len(spans), q.device)
+    packed = storage[: len(spans) * m * _K].view(len(spans), m, _K)
+    histogram = storage[len(spans) * m * _K :].view(len(spans), m, HIST_BINS)
+    wide_cache = span_bytes(k_cache) > (1 << 32)
+    k_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
+    launch = _fused_select_plan(page_size, True, wide_cache, k_strides)
+    row_tiles = ceildiv(m, 16)
+    stream = torch.cuda.current_stream(q.device)
+    for index, (begin, end) in enumerate(spans):
+        _run_compiled(
+            launch,
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            packed[index],
+            histogram[index],
+            int(n_columns),
+            m,
+            int(context_lens.shape[0]),
+            float(score_scale),
+            int(k_cache.shape[0]),
+            int(begin),
+            int(end),
+            row_tiles,
+            stream,
+        )
+    _check_first_level_histogram(packed, histogram)
+    chosen = _reference_merge_candidates(
+        packed,
+        spans,
+        q,
+        k_cache,
+        page_table,
+        token_to_req,
+        query_positions,
+        context_lens,
+        score_scale,
+    )
+    out.copy_(chosen)
+    return out
+
+
 def qsa_indexer_select_supported() -> str | None:
     """Why ``qsa_indexer_select`` does not run on this GPU, or None.
 
@@ -950,12 +1184,16 @@ def qsa_indexer_select(
 ) -> torch.Tensor:
     """Select compressed blocks and expand them to token ids.
 
-    ``q`` is bf16 ``[M, 4, 128]``. ``workspace``, when passed, is the fp32
-    score buffer ``[M, page_table_width * page_size]`` and is not cleared.
-    The call overwrites the columns it scores. ``block_ids`` and
-    ``token_ids`` are the optional caller-owned outputs. ``num_decode_rows``
-    counts the decode rows at the front of ``q``. ``max_seq_len`` is the
-    step's longest context.
+    ``q`` is bf16 ``[M, 4, 128]``. Rows no wider than 512 use the emit path.
+    Longer rows score on the GPU into per-span top-512 candidates and a
+    first-level radix histogram, then a torch merge reduces the spans.
+    ``workspace``, when passed, is still the fp32 buffer
+    ``[M, page_table_width * page_size]`` and is not cleared. The fused path
+    reuses a long enough contiguous buffer as candidate scratch and
+    overwrites every slot it reads. ``block_ids`` and ``token_ids`` are the
+    optional caller-owned outputs. ``num_decode_rows`` counts the decode
+    rows at the front of ``q``. ``max_seq_len`` is the step's longest context
+    and selects the span width.
     """
     # Local import: aiter.ops.qsa imports this module.
     from aiter.ops.qsa import qsa_expand_block_indices
@@ -990,18 +1228,34 @@ def qsa_indexer_select(
                 f"{tuple(workspace.shape)} stride {tuple(workspace.stride())}"
             )
         scores = workspace[:rows]
-    block_ids = qsa_indexer_block_ids(
-        q,
-        k_cache,
-        page_table,
-        token_to_req,
-        query_positions,
-        context_lens,
-        out=block_ids,
-        score_scale=score_scale,
-        heads=(_H,),
-        scores=scores,
-    )
+    if n_columns <= _K or _indexer_empty_geometry(
+        rows, k_cache, page_table, context_lens
+    ):
+        block_ids = qsa_indexer_block_ids(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            out=block_ids,
+            score_scale=score_scale,
+            heads=(_H,),
+            scores=scores,
+        )
+    else:
+        block_ids = _write_fused_indexer_block_ids(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            block_ids,
+            score_scale,
+            scores,
+            max_seq_len,
+        )
     return qsa_expand_block_indices(
         block_ids,
         query_positions,

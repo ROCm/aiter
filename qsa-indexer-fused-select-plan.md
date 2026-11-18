@@ -174,12 +174,12 @@ Both competitor arms are open pull requests on `vllm-project/vllm`. The local ch
 
 ### 3. Fused score and split-local top-512 kernel
 
-- [ ] Add a new module in `aiter/ops/flydsl/kernels/qsa/` for fused score and local top-512. It keeps the 16-row multi-row tile, the bf16 MFMA scoring, and the 4-head ReLU sum.
-- [ ] Assign each workgroup one row tile and one column span. Pick the split count per `max_seq_len` bucket so the GPU fills with row tiles, using few splits that are each much wider than 512.
-- [ ] Maintain each row's local top-512 over the span in the Phase 1 layout. Write candidates (key and column) to the global workspace. Do not write fp32 scores.
-- [ ] Fill the merge's first-level radix histogram while scoring.
-- [ ] Mask invisible and incomplete blocks, and drop blocks on missing pages, matching current semantics.
-- [ ] Correctness: the Phase 2 tests pass with a reference merge in torch, before the real merge exists.
+- [x] Add a new module in `aiter/ops/flydsl/kernels/qsa/` for fused score and local top-512. It keeps the 16-row multi-row tile, the bf16 MFMA scoring, and the 4-head ReLU sum.
+- [x] Assign each workgroup one row tile and one column span. Pick the split count per `max_seq_len` bucket so the GPU fills with row tiles, using few splits that are each much wider than 512.
+- [x] Maintain each row's local top-512 over the span in the Phase 1 layout. Write candidates (key and column) to the global workspace. Do not write fp32 scores.
+- [x] Fill the merge's first-level radix histogram while scoring.
+- [x] Mask invisible and incomplete blocks, and drop blocks on missing pages, matching current semantics.
+- [x] Correctness: the Phase 2 tests pass with a reference merge in torch, before the real merge exists.
 
 ### 4. Split-aware merge with folded expand
 
@@ -291,6 +291,21 @@ Median `T_score` in microseconds, warm-2, on a strided per-layer cache (page str
 
 Layout chosen from this table: 4-byte candidates for all 16 rows, 32 KiB per workgroup. See [Candidate state](#candidate-state).
 
+### Fused select, Phase 3
+
+Set-gate on gfx950, 2026-11-18. `select err` is the fraction of rows outside the 1.7e-6 window. The `select us` column is this run's `run_perftest` median on the gate's small batches. The top-512 update is a serial scan of the 512-slot list, so these times are not a serving measurement.
+
+| case | rows | columns | select us | select err |
+| --- | ---: | ---: | ---: | ---: |
+| pad | 32 | 65856 | 29593 | 0 |
+| missing | 16 | 2352 | 21163 | 0 |
+| wide | 16 | 2352 | 27944 | 0 |
+| span | 16 | 2352 | 54653 | 0 |
+| mixed | 16 | 2352 | 128912 | 0 |
+| mtp | 8 | 2352 | 58133 | 0 |
+| emit | 16 | 392 | 6.75 | 0 |
+| workspace | 32 | 65856 | 29009 | 0 |
+
 ### Candidate-state probe, gfx942
 
 Median `T_score` in microseconds, two repeats (`r1 / r2`), each the median of 10 after 5 warmups. "fail" means the launch raised `hipErrorIllegalState`, checked in a fresh process. The gfx942 scorer uses the same probe copy as gfx950. The trimmed-prefix budget is Arm A's top-k plus expand, timed in the same session. The probe does not time Arm A on the pad table, so the pad rows have no budget verdict.
@@ -370,3 +385,4 @@ Fallback used (yes or no, and why):
 - 2026-11-18: gfx950 remeasure on the acceptance cache. `_wide_indexer_cache` is now a per-layer view, page stride 262176, span 4295067584 bytes, and the live pages hold random bf16. `op_tests/spike_silotiger_1481_indexer_lds_probe.py`. gpuq device 0, rocm-smi 1, bus 0000:15:00.0, MI355X, gfx950. Idle at grant (use 0%, no other pids). Grants on 0000:95:00.0 (use 2%) and 0000:05:00.0 (other pids) exited 86 and were discarded. Kernels were host-compiled with the GPUs hidden before the timed job. The 0-byte copy matches the unmodified visible prefix on all 33 `p32k` chunks. Warm-2 `T_score` is 711.4 µs against 704.8 µs unmodified (ratio 1.009); warm-1 is 0.978. Both are inside 5%. `LAUNCH_OK` is true for 16, 32 and 64 KiB, all in this process. Warm-2 slowdowns: `p128k` pad 311.1 / 952.9 / 3214.6 µs, `p256k` 429.7 / 1590.8 / 5839.5 µs, `p128k` trim 242.2 / 714.8 / 2351.1 µs, for 16 / 32 / 64 KiB. In-session Arm A budgets: `p128k` pad 1721.2 µs (share 0.455), `p128k` trim 1499.5 µs (share 0.494), `p256k` 1908.6 µs (share 0.329). 16 KiB and 32 KiB stay under every budget. 64 KiB stays over, so the gfx950 32 KiB cap stays. The strided shares stay above 0.15, so gate 5 still does not fire and the baseline table was not re-run. The candidate layout choice is still open.
 - 2026-11-18: Candidate layout chosen from the strided-cache probe. 4-byte candidates (16-bit order-preserving key and 16-bit column offset) for all 16 rows, 32 KiB of LDS. The tile itself is 34400 bytes, so the workgroup total is 67168 bytes. 64 KiB of candidates is over every gfx950 budget, and the 32 KiB dead-array slowdown stays under, with 317.8 µs to spare at `p256k`. One split at 8K, 32K and 128K (2352, 8232 and 32928 columns). Two splits of 32928 at 256K, because 65856 columns exceeds the 16-bit offset. gfx942 has 31136 bytes free beside the tile, so this state does not launch there and the fused path stays on the current indexer until Phase 6.
 - 2026-11-18: Phase 2 oracle check and set-gate, gfx950, gpuq device 0, rocm-smi 2, bus 0000:65:00.0, MI355X, idle at grant. The fp32 oracle matches the fp64 top-512 on the seeded 8K (256 rows), 32K (128 rows), and padded-prefix cases. The largest score gap is 1.62e-6, and the tie bound is 1.7e-6. `qsa_indexer_select` is the entry the set-gate calls. Until the fused kernel replaces its body, that entry runs today's indexer and expand, and it does not clear the caller's score workspace. The set-gate covered a 168-page table, a missing page, a strided cache past 4 GiB, a 16-row tile across two requests, decode rows ahead of prefill rows, MTP rows, and a one-page emit (`n_columns` 392). All eight cases matched the oracle. gfx942 stays gated off.
+- 2026-11-18: Phase 3 fused score and split-local top-512. The kernel is `aiter/ops/flydsl/kernels/qsa/indexer_fused_select.py`. A workgroup owns one 16-row tile and one column span from `fused_split_spans` (one span through 128K, two of 32928 at 256K). It keeps the bf16 MFMA and the 4-head ReLU sum, compares candidates with the fp32 score in the 32 KiB LDS array, and writes a packed 16-bit key plus 16-bit span offset. The first-level histogram is 256 bins of that key, updated on insert and eviction. Invisible, incomplete, and missing-page columns are not inserted. `qsa_indexer_select` uses this path when `n_columns > 512`; the one-page emit path is unchanged. The torch merge returns the kernel's columns for one span and re-ranks two spans in fp32. The Phase 2 set-gate passed on gfx950, gpuq device 0, rocm-smi 4, bus 0000:85:00.0, idle at grant (use 0%, no other pids). A grant on bus 0000:15:00.0 had use 2% and exited 86. All eight cases have `select err` 0. The gate's `select us` is the serial 512-slot scan on these small batches, recorded under [Fused select, Phase 3](#fused-select-phase-3), and is not a serving measurement. gfx942 stays gated off. The real merge is Phase 4.
