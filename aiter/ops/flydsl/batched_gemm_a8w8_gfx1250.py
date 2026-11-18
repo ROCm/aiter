@@ -29,12 +29,18 @@ mxfp8_32 (``run_bmm_a8w8_mxfp8_32_gfx1250``): same XQ / WQ / Out, a row-major
 from __future__ import annotations
 
 import functools
+import math
 import re
 
 import torch
 from torch import Tensor
 
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import (
+    get_cu_num,
+    get_gfx,
+    get_gfx_runtime,
+    get_lds_capacity_bytes,
+)
 
 from .mxfp8_bpreshuffle_gemm_gfx1250 import (
     BASE_NAME_SUFFIX_RE,
@@ -719,48 +725,32 @@ def run_bmm_a8w8_mxfp8_128_gfx1250(
     return Out
 
 
-# Decode-width default for the fused gate_up + SiLU*up + MXFP8 quant GEMM
-# (``run_gate_up_silu_mxfp8_32_gfx1250``) when the caller names no kernel.
+# Default kernel of ``run_gate_up_silu_mxfp8_32_gfx1250`` when the caller names
+# none (the tile gate_up_silu_kernel_for picks for mid-size decode batches).
 GATE_UP_SILU_DEFAULT_KERNEL = (
-    "flydsl_bmm_mxfp8_32_wmma_t192x128x256_mw2_nw2_nb3_sk1_cm1_cn1"
+    "flydsl_bmm_mxfp8_32_wmma_t192x128x256_mw2_nw2_nb3_sk1_cm1_cn1_pl"
 )
-# (largest M, tile) for the fused gate_up GEMM, measured on gfx1250 at the
-# DSV4.1 shared-expert shape (2*I=4608, K=5120) against GEMM + silu_and_mul +
-# quantize_fp8. Above the last bound the 2-D compute GEMM wins and the caller
-# keeps the unfused path.
+# The fused gate_up tiles were measured against GEMM + silu_and_mul +
+# quantize_fp8 only on a gfx1250 part with this many CUs and at these
+# (2*I, K) gate_up shapes (the DSV4.1 shared expert). gate_up_silu_kernel_for
+# returns None anywhere else, so an unmeasured shape keeps the unfused path.
+_GATE_UP_SILU_CU_NUM = 256
+_GATE_UP_SILU_SHAPES = ((4608, 5120),)
+# (largest M, kernelName) at those shapes. Each name pins its K loop with
+# ``_pl``, the loop the tile was timed with, instead of inheriting the default
+# pick. Above the last bound the 2-D compute GEMM wins and the caller keeps the
+# unfused path.
 _GATE_UP_SILU_TILES = (
-    (384, "t64x128x256_mw2_nw2_nb4"),
-    (512, "t64x256x256_mw1_nw4_nb3"),
-    (640, "t192x128x256_mw2_nw2_nb3"),
-    (768, "t96x256x256_mw2_nw4_nb3"),
-    (960, "t192x128x256_mw2_nw2_nb3"),
-    (1792, "t128x256x256_mw2_nw4_nb3"),
-    (2048, "t192x128x256_mw2_nw2_nb3"),
-    (4096, "t128x256x256_mw2_nw4_nb3"),
+    (384, "flydsl_bmm_mxfp8_32_wmma_t64x128x256_mw2_nw2_nb4_sk1_cm1_cn1_pl"),
+    (512, "flydsl_bmm_mxfp8_32_wmma_t64x256x256_mw1_nw4_nb3_sk1_cm1_cn1_pl"),
+    (640, "flydsl_bmm_mxfp8_32_wmma_t192x128x256_mw2_nw2_nb3_sk1_cm1_cn1_pl"),
+    (768, "flydsl_bmm_mxfp8_32_wmma_t96x256x256_mw2_nw4_nb3_sk1_cm1_cn1_pl"),
+    (960, "flydsl_bmm_mxfp8_32_wmma_t192x128x256_mw2_nw2_nb3_sk1_cm1_cn1_pl"),
+    (1792, "flydsl_bmm_mxfp8_32_wmma_t128x256x256_mw2_nw4_nb3_sk1_cm1_cn1_pl"),
+    (2048, "flydsl_bmm_mxfp8_32_wmma_t192x128x256_mw2_nw2_nb3_sk1_cm1_cn1_pl"),
+    (4096, "flydsl_bmm_mxfp8_32_wmma_t128x256x256_mw2_nw4_nb3_sk1_cm1_cn1_pl"),
 )
-
-
-@functools.lru_cache(maxsize=4096)
-def gate_up_silu_kernel_for(m: int, n2: int, k: int) -> str | None:
-    """kernelName for ``run_gate_up_silu_mxfp8_32_gfx1250`` at ``[m, k] x
-    [n2, k]``, or None when the fused path does not apply (wrong arch, shape the
-    tiles do not divide, or an M the unfused path serves better)."""
-    if m < 1 or get_gfx() not in ("gfx1250", "gfx1250-strict"):
-        return None
-    for bound, tile in _GATE_UP_SILU_TILES:
-        if m <= bound:
-            name = f"{BMM_MX32_WMMA_NAME_PREFIX}_{tile}_sk1_cm1_cn1"
-            cfg = parse_bmm_mx32_kernel_name(name)
-            if (
-                n2 % 128 == 0
-                and (n2 // 2) % (cfg["tile_n"] // 2) == 0
-                and k % cfg["tile_k"] == 0
-                and k // cfg["tile_k"] >= cfg["num_buffers"]
-                and gate_up_silu_kernel_ok(name)
-            ):
-                return name
-            return None
-    return None
+_GFX1250_ARCHS = ("gfx1250", "gfx1250-strict")
 
 
 def gate_up_silu_kernel_ok(name: str | None) -> bool:
@@ -778,6 +768,79 @@ def gate_up_silu_kernel_ok(name: str | None) -> bool:
     )
 
 
+def _gate_up_silu_tiles_shape(cfg: dict[str, int], n2: int, k: int) -> bool:
+    """Whether a fused-epilogue config tiles a [n2, k] gate_up weight."""
+    return (
+        n2 % 128 == 0
+        and (n2 // 2) % (cfg["tile_n"] // 2) == 0
+        and k % cfg["tile_k"] == 0
+        and k // cfg["tile_k"] >= cfg["num_buffers"]
+    )
+
+
+def _check_gate_up_silu_tiles() -> None:
+    # The picker returns these names without parsing them (it runs inside
+    # traced forwards), so every name is checked once here, at import.
+    for _, name in _GATE_UP_SILU_TILES:
+        cfg = parse_bmm_mx32_kernel_name(name)
+        if not gate_up_silu_kernel_ok(name) or cfg["pipelined"] != 1:
+            raise AssertionError(f"bad fused gate_up tile {name!r}")
+        for n2, k in _GATE_UP_SILU_SHAPES:
+            if not _gate_up_silu_tiles_shape(cfg, n2, k):
+                raise AssertionError(f"{name!r} does not tile [{n2}, {k}]")
+
+
+_check_gate_up_silu_tiles()
+
+
+@torch.compiler.assume_constant_result
+def _gate_up_silu_device_measured() -> bool:
+    """Whether the running GPU is the gfx1250 part the fused tiles were
+    measured on. torch.compile takes the answer as a constant, so the picker
+    traces to plain integer compares."""
+    try:
+        return (
+            get_gfx_runtime() in _GFX1250_ARCHS and get_cu_num() == _GATE_UP_SILU_CU_NUM
+        )
+    except RuntimeError:  # no GPU visible
+        return False
+
+
+def gate_up_silu_kernel_for(m: int, n2: int, k: int) -> str | None:
+    """kernelName for ``run_gate_up_silu_mxfp8_32_gfx1250`` at ``[m, k] x
+    [n2, k]``, or None when the fused path does not apply: another arch or CU
+    count, a (n2, k) the tiles were not measured at, or an M the unfused path
+    serves better.
+
+    Safe to call from a forward that torch.compile traces (symbolic ``m``
+    included): it compares ``m`` against a table resolved at import and reads
+    the device check as a compile-time constant."""
+    # Plain == compares, which also trace when n2 / k are symbolic.
+    measured = False
+    for shape_n2, shape_k in _GATE_UP_SILU_SHAPES:
+        measured = measured or (n2 == shape_n2 and k == shape_k)
+    if not measured or not _gate_up_silu_device_measured() or m < 1:
+        return None
+    for bound, name in _GATE_UP_SILU_TILES:
+        if m <= bound:
+            return name
+    return None
+
+
+def gate_up_silu_limit(swiglu_limit: float) -> float:
+    """``swiglu_limit`` as the fused kernel takes it, with the meaning aiter
+    ``silu_and_mul`` gives it: a positive limit clamps (gate from above at L, up
+    to [-L, L]), 0 clamps nothing, and a negative or NaN limit is an error.
+    +inf also clamps nothing, so it runs the same kernel as 0."""
+    limit = float(swiglu_limit)
+    if not limit >= 0.0:
+        raise ValueError(
+            "[FlyDSL gfx1250 gate_up silu] swiglu_limit must be >= 0 "
+            f"(0 = no clamp), got {swiglu_limit!r}"
+        )
+    return 0.0 if math.isinf(limit) else limit
+
+
 def run_gate_up_silu_mxfp8_32_gfx1250(
     XQ: Tensor,
     WQ: Tensor,
@@ -793,12 +856,17 @@ def run_gate_up_silu_mxfp8_32_gfx1250(
     ``XQ`` [M, K] e4m3 with row-major ``x_scale`` [M, K//32] e8m0; ``WQ`` the
     [2*I, K] gate_up weight ([gate; up] rows) 16x16-preshuffled, ``w_scale``
     its raw [2*I//32, K//32] 32x32 e8m0 block scale. Writes ``Out`` [M, I] e4m3
-    and ``y_scale_out`` [M, I//32] e8m0 -- bit-matching ``quantize_fp8`` of
-    aiter ``silu_and_mul(gemm_out, swiglu_limit)`` on the bf16 GEMM output.
+    and ``y_scale_out`` [M, I//32] e8m0: ``quantize_fp8`` of aiter
+    ``silu_and_mul(gemm_out, swiglu_limit)`` on the bf16 GEMM output, with the
+    same scales and the same e4m3 codes up to one step (the epilogue's exp/rcp
+    can round a bf16 activation to the neighbour of silu_and_mul's, which can
+    move an e4m3 rounding midpoint). ``swiglu_limit`` follows silu_and_mul (see
+    ``gate_up_silu_limit``).
+
+    This is the raw FlyDSL launch. A caller inside a torch.compile region uses
+    the registered op ``aiter.ops.batched_gemm_op_a8w8.gate_up_silu_mxfp8_32``.
     """
-    if get_gfx() not in ("gfx1250", "gfx1250-strict"):
-        raise RuntimeError("[FlyDSL gfx1250 gate_up silu] requires gfx1250")
-    _lazy_import()
+    limit = gate_up_silu_limit(swiglu_limit)
     m, k = XQ.shape
     n2, wk = WQ.shape
     inter = n2 // 2
@@ -819,23 +887,27 @@ def run_gate_up_silu_mxfp8_32_gfx1250(
             "[FlyDSL gfx1250 gate_up silu] Out must be contiguous e4m3 "
             f"[{m}, {inter}] and y_scale_out e8m0 [{m}, {inter // 32}]"
         )
-    k_blocks = k // MX32_BLOCK_K
-    _check_e8m0(x_scale, "x_scale", "FlyDSL gfx1250 gate_up silu", (m, k_blocks))
-    _check_e8m0(w_scale, "w_scale", "FlyDSL gfx1250 gate_up silu", (n2 // 32, k_blocks))
     name = kernel_name or GATE_UP_SILU_DEFAULT_KERNEL
     if not gate_up_silu_kernel_ok(name):
         raise ValueError(f"[FlyDSL gfx1250 gate_up silu] unsupported kernel {name!r}")
     cfg = parse_bmm_mx32_kernel_name(name)
     tile_n, tile_k = cfg["tile_n"], cfg["tile_k"]
-    if inter % (tile_n // 2) or k % tile_k or k // tile_k < cfg["num_buffers"]:
+    if not _gate_up_silu_tiles_shape(cfg, n2, k):
         raise RuntimeError(
             f"[FlyDSL gfx1250 gate_up silu] {name!r} does not tile I={inter}, K={k}"
         )
+    gfx = get_gfx_runtime()
+    if gfx not in _GFX1250_ARCHS:
+        raise RuntimeError(f"[FlyDSL gfx1250 gate_up silu] requires gfx1250, got {gfx}")
+    _lazy_import()
+    k_blocks = k // MX32_BLOCK_K
+    _check_e8m0(x_scale, "x_scale", "FlyDSL gfx1250 gate_up silu", (m, k_blocks))
+    _check_e8m0(w_scale, "w_scale", "FlyDSL gfx1250 gate_up silu", (n2 // 32, k_blocks))
     if m == 0:
         return Out
-    limit = float(swiglu_limit)
     spec = (
         "gate_up_silu",
+        XQ.device.index,
         cfg["tile_m"],
         tile_n,
         tile_k,
@@ -882,7 +954,7 @@ def run_gate_up_silu_mxfp8_32_gfx1250(
         True,  # fuse_quant_out
         cfg["pipelined"],
         True,  # fuse_act_mul
-        limit,
+        limit,  # act_limit: 0 = no clamp
         specialization_key=spec,
     )
     return Out
@@ -891,6 +963,7 @@ def run_gate_up_silu_mxfp8_32_gfx1250(
 __all__ = [
     "gate_up_silu_kernel_for",
     "gate_up_silu_kernel_ok",
+    "gate_up_silu_limit",
     "run_bmm_a8w8_mxfp8_32_gfx1250",
     "run_bmm_a8w8_mxfp8_128_gfx1250",
     "run_gate_up_silu_mxfp8_32_gfx1250",

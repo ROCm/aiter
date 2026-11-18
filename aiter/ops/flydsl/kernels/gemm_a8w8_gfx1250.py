@@ -127,9 +127,15 @@ def launch_gemm_a8w8(
     # the 32 matching up rows] (one nested TDM view, no weight reorder), so a
     # wave's 64 columns hold 32 gate and their 32 up columns in the same
     # lanes. The epilogue then forms bf16(silu(min(g, L)) * clamp(u, -L, L))
-    # from the bf16-rounded accumulators -- the math of aiter silu_and_mul --
-    # and quantizes it to group-32 MXFP8 like fuse_quant_out. arg_c is the
-    # e4m3 [M, I] activation, ldc its row stride, arg_scale_out [M, I/32].
+    # from the bf16-rounded accumulators -- the math of aiter silu_and_mul,
+    # where act_limit L = 0 means no clamp -- and quantizes it to group-32
+    # MXFP8 like fuse_quant_out. arg_c is the e4m3 [M, I] activation, ldc its
+    # row stride, arg_scale_out [M, I/32].
+    if fuse_act_mul and not (math.isfinite(act_limit) and act_limit >= 0):
+        raise ValueError(
+            "[FlyDSL gfx1250] act_limit must be finite and >= 0 (0 = no clamp), "
+            f"got {act_limit!r}"
+        )
     if fuse_act_mul and not (
         fuse_quant_out
         and b_scale_32x32
@@ -313,7 +319,8 @@ def launch_gemm_a8w8(
         + ("_bs32x32" if b_scale_32x32 else "")
         + ("_ktail" if k_tail else "")
         + ("_pl" if pipelined else "")
-        + (f"_silu{int(act_limit * 1000)}q" if fuse_act_mul else "")
+        # the exact limit (repr round-trips), "." spelled "p" for the symbol
+        + (f"_silu{float(act_limit)!r}q".replace(".", "p") if fuse_act_mul else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -1295,14 +1302,22 @@ def launch_gemm_a8w8(
             workgroup_barrier(use_cluster=False)
 
         if const_expr(fuse_quant_out):
-            # Shared by the group-32 MXFP8 quant epilogues below; all emit
-            # e4m3 + the e8m0 ceil scale, bit-matching ATOM `quantize_fp8`
-            # (amax floored at 1e-10, ceil_pow2(amax/448)).
+            # Shared by the group-32 MXFP8 quant epilogues below. Each emits
+            # e4m3 + the e8m0 ceil scale of its input exactly as ATOM
+            # `quantize_fp8` does (amax floored at 1e-10, ceil_pow2(amax/448)).
+            # The plain-GEMM epilogues therefore bit-match quantize_fp8 of the
+            # bf16 output. The fuse_act_mul one quantizes its own SwiGLU
+            # values, which can sit one bf16 step from silu_and_mul's (exp/rcp
+            # rounding), so an e4m3 code can differ by one step there.
             from aiter.ops.flydsl.kernels.quant_utils import (
                 emit_cvt_scalef32_pk8_fp8_f32,
                 emit_mx_e8m0_scale,
             )
             from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
+
+            s8 = fx.recast_iter(fx.Int8, arg_scale_out_k)
+            v2i32_ty = T.vec(2, T.i32)
+            srow = ldc64 // 32  # scale row stride: output row width / 32
 
             def _group_scale(amax):
                 # A 32-column group's amax -> (e8m0 ceil scale byte, its f32).
@@ -1314,13 +1329,80 @@ def launch_gemm_a8w8(
                 )
                 return e8, (fx.Int32(e8) << 23).bitcast(fx.Float32)
 
+            def _quant_group_to_lds(lds8, c8_row, s8_off, gn, row_rel, gcol, v0, v1):
+                # One lane's two 8-column pieces (v0 at column gcol + kgrp*8,
+                # v1 16 columns on) of a 32-column group; lane l^16 holds the
+                # other two, so the group amax is one shuffle_xor(16). Stages
+                # the e4m3 codes and (from kgrp 0) the e8m0 scale byte in LDS
+                # for _store_quant_tile.
+                amax = abs(v0[0])
+                for t in range_constexpr(1, 8):
+                    amax = fx.maxnumf(amax, abs(v0[t]))
+                for t in range_constexpr(8):
+                    amax = fx.maxnumf(amax, abs(v1[t]))
+                amax = fx.maxnumf(amax, fx.Float32(amax).shuffle_xor(16, WAVE))
+                e8, scale_f32 = _group_scale(amax)
+                p0 = emit_cvt_scalef32_pk8_fp8_f32(
+                    v0.ir_value(), scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
+                )
+                p1 = emit_cvt_scalef32_pk8_fp8_f32(
+                    v1.ir_value(), scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
+                )
+                l_off = fx.Int64(row_rel) * c8_row + gcol + fx.Int64(kgrp * 8)
+                fx.ptr_store(fx.Vector(p0).bitcast(fx.Int8), fx.add_offset(lds8, l_off))
+                fx.ptr_store(
+                    fx.Vector(p1).bitcast(fx.Int8), fx.add_offset(lds8, l_off + 16)
+                )
+                if kgrp == 0:
+                    fx.ptr_store(
+                        Vec.from_elements([fx.Uint8(e8)], fx.Int8),
+                        fx.add_offset(
+                            lds8, fx.Int64(s8_off + row_rel * gn) + gcol // 32
+                        ),
+                    )
+
+            def _store_quant_tile(
+                lds8, gc8_base, c8_off, out_cols, c8_row, s8_off, gn, sbase_blk
+            ):
+                # After one barrier, write the staged tile: one row's gn scale
+                # bytes per thread (contiguous in the row-major scale, so one
+                # small store per row) and the [tile_m, out_cols] e4m3 codes
+                # with one TDM store.
+                workgroup_barrier(use_cluster=False)
+                for rr in range_constexpr((tile_m + block - 1) // block):
+                    srow_rel = fx.Int32(tid) + rr * block
+                    if (srow_rel < tile_m) and (srow_rel < mn_oob):
+                        sv = fx.ptr_load(
+                            fx.add_offset(lds8, fx.Int64(s8_off + srow_rel * gn)),
+                            result_type=T.vec(gn, T.i8),
+                        )
+                        fx.ptr_store(
+                            fx.Vector(sv),
+                            fx.add_offset(
+                                s8, (blk_m64 + fx.Int64(srow_rel)) * srow + sbase_blk
+                            ),
+                        )
+                c8_tile = (tile_m, c8_row)
+                gtC8 = _gv(gc8_base, c8_off, (mn_oob, out_cols), (ldc64, 1))
+                atomC8, coordC8 = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                    fx.rocdl.TensorStore(),
+                    gtC8,
+                    fx.make_layout(c8_tile, (c8_row, 1)),
+                    c8_tile,
+                    num_warps=num_waves,
+                )
+                blkC8 = fx.zipped_divide(coordC8, c8_tile)[None, (0, None)]
+                sC8 = _lv(lds8, (c8_tile, 1), ((c8_row, 1), tile_m * c8_row))
+                tC8s, tC8g = fx.rocdl.cdna5.tdm_partition(
+                    atomC8, wave, fx.make_layout(num_waves, 1), sC8, blkC8
+                )
+                fx.copy(atomC8, tC8s[None, 0], tC8g[None, 0])
+                rocdl.s_wait_tensorcnt(0)
+
         if const_expr(fuse_quant_out and not fuse_act_mul):
             # The accumulator and LDS-staged quant epilogues of the plain GEMM.
-            s8 = fx.recast_iter(fx.Int8, arg_scale_out_k)
-            v2i32_ty = T.vec(2, T.i32)
             GN = tile_n // 32  # quant groups per row (constexpr)
             n32_64 = fx.Int64(i32_n) // 32
-            srow = ldc64 // 32  # scale row stride = (B*N)//32
             sbase_blk = (
                 bz64 * n32_64 if const_expr(batched) else fx.Int64(0)
             ) + blk_n64 // 32
@@ -1332,7 +1414,6 @@ def launch_gemm_a8w8(
             # one row per lane, so a 32-column output group is tiles j=0,1 of
             # lanes l and l^16 -- the same cross-lane max as fuse_quant_out.
             OUT_TN = tile_n // 2
-            s8 = fx.recast_iter(fx.Int8, arg_scale_out_k)
             lds8 = fx.recast_iter(fx.Int8, base_ptr)
             gC8_base = fx.recast_iter(
                 fx.PointerType.get(fx.Int8.ir_type, arg_c.address_space), arg_c
@@ -1340,18 +1421,18 @@ def launch_gemm_a8w8(
             C8_ROW = OUT_TN + 16
             GN = OUT_TN // 32
             S8_OFF = tile_m * C8_ROW
-            v2i32_ty = T.vec(2, T.i32)
-            srow = ldc64 // 32  # scale row stride = I // 32
-            sbase_blk = blk_n64 // 64
-            lim = fx.Float32(act_limit)
-            nlim = fx.Float32(-act_limit)
             one = fx.Float32(1.0)
+            if const_expr(act_limit > 0):
+                lim = fx.Float32(act_limit)
+                nlim = fx.Float32(-act_limit)
 
             def _act(g, u):
-                # aiter act_and_mul_kernel<silu, limit>: fminf / fmed3 clamp,
+                # aiter act_and_mul_kernel<silu>: with a limit, the fminf /
+                # fmed3 clamp (none at act_limit 0, as silu_and_mul with 0);
                 # x * rcp(1 + exp(-x)), times up, rounded to bf16.
-                g = fx.Float32(fx.minnumf(g, lim))
-                u = fx.Float32(fx.maxnumf(fx.minnumf(u, lim), nlim))
+                if const_expr(act_limit > 0):
+                    g = fx.Float32(fx.minnumf(g, lim))
+                    u = fx.Float32(fx.maxnumf(fx.minnumf(u, lim), nlim))
                 e = fx.Float32(fx.exp(-g))
                 sig = fx.Float32(rocdl.rcp(T.f32, _raw_f32(one + e)))
                 return fx.Float32(g * sig * u).to(out_cls).to(fx.Float32)
@@ -1364,71 +1445,32 @@ def launch_gemm_a8w8(
                     for j in range_constexpr(2):
                         g8 = accs[base_i + j].to(out_cls).to(fx.Float32)
                         u8 = accs[base_i + 2 + j].to(out_cls).to(fx.Float32)
-                        hs.append([_act(g8[t], u8[t]) for t in range_constexpr(8)])
-                    amax = abs(hs[0][0])
-                    for t in range_constexpr(1, 8):
-                        amax = fx.maxnumf(amax, abs(hs[0][t]))
-                    for t in range_constexpr(8):
-                        amax = fx.maxnumf(amax, abs(hs[1][t]))
-                    amax = fx.maxnumf(amax, fx.Float32(amax).shuffle_xor(16, WAVE))
-                    e8, scale_f32 = _group_scale(amax)
-                    ps = [
-                        emit_cvt_scalef32_pk8_fp8_f32(
-                            Vec.from_elements(hs[j], fx.Float32).ir_value(),
-                            scale_f32,
-                            v2i32_ty=v2i32_ty,
-                            rocdl=rocdl,
+                        hs.append(
+                            Vec.from_elements(
+                                [_act(g8[t], u8[t]) for t in range_constexpr(8)],
+                                fx.Float32,
+                            )
                         )
-                        for j in range_constexpr(2)
-                    ]
-                    gcol = fx.Int64(wnb // 2 + blk * 32)
-                    l_off = fx.Int64(row_rel) * C8_ROW + gcol + fx.Int64(kgrp * 8)
-                    fx.ptr_store(
-                        fx.Vector(ps[0]).bitcast(fx.Int8), fx.add_offset(lds8, l_off)
+                    _quant_group_to_lds(
+                        lds8,
+                        C8_ROW,
+                        S8_OFF,
+                        GN,
+                        row_rel,
+                        fx.Int64(wnb // 2 + blk * 32),
+                        hs[0],
+                        hs[1],
                     )
-                    fx.ptr_store(
-                        fx.Vector(ps[1]).bitcast(fx.Int8),
-                        fx.add_offset(lds8, l_off + 16),
-                    )
-                    if kgrp == 0:
-                        fx.ptr_store(
-                            Vec.from_elements([fx.Uint8(e8)], fx.Int8),
-                            fx.add_offset(
-                                lds8,
-                                fx.Int64(S8_OFF + row_rel * GN) + gcol // 32,
-                            ),
-                        )
-            workgroup_barrier(use_cluster=False)
-            for rr in range_constexpr((tile_m + block - 1) // block):
-                srow_rel = fx.Int32(tid) + rr * block
-                if (srow_rel < tile_m) and (srow_rel < mn_oob):
-                    sv = fx.ptr_load(
-                        fx.add_offset(lds8, fx.Int64(S8_OFF + srow_rel * GN)),
-                        result_type=T.vec(GN, T.i8),
-                    )
-                    fx.ptr_store(
-                        fx.Vector(sv),
-                        fx.add_offset(
-                            s8, (blk_m64 + fx.Int64(srow_rel)) * srow + sbase_blk
-                        ),
-                    )
-            c8_off = blk_m64 * ldc64 + blk_n64 // 2
-            C8_TILE = (tile_m, C8_ROW)
-            gtC8 = _gv(gC8_base, c8_off, (mn_oob, OUT_TN), (ldc64, 1))
-            atomC8, coordC8 = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorStore(),
-                gtC8,
-                fx.make_layout(C8_TILE, (C8_ROW, 1)),
-                C8_TILE,
-                num_warps=num_waves,
+            _store_quant_tile(
+                lds8,
+                gC8_base,
+                blk_m64 * ldc64 + blk_n64 // 2,
+                OUT_TN,
+                C8_ROW,
+                S8_OFF,
+                GN,
+                blk_n64 // 64,
             )
-            blkC8 = fx.zipped_divide(coordC8, C8_TILE)[None, (0, None)]
-            sC8 = _lv(lds8, (C8_TILE, 1), ((C8_ROW, 1), tile_m * C8_ROW))
-            tC8s, tC8g = fx.rocdl.cdna5.tdm_partition(
-                atomC8, wave, fx.make_layout(num_waves, 1), sC8, blkC8
-            )
-            fx.copy(atomC8, tC8s[None, 0], tC8g[None, 0])
-            rocdl.s_wait_tensorcnt(0)
         elif const_expr(not fuse_quant_out):
             _stage_c_tile()
             c_off_rt = blk_m64 * ldc64 + blk_n64
@@ -1475,73 +1517,22 @@ def launch_gemm_a8w8(
             for wm in range_constexpr(wmma_m_rep):
                 row_rel = wmb + wm * 16 + lane16
                 for wp in range_constexpr(wmma_n_rep // 2):
-                    h0 = accs[wm * wmma_n_rep + 2 * wp].to(out_cls).to(fx.Float32)
-                    h1 = accs[wm * wmma_n_rep + 2 * wp + 1].to(out_cls).to(fx.Float32)
-                    amax = abs(h0[0])
-                    for t in range_constexpr(1, 8):
-                        amax = fx.maxnumf(amax, abs(h0[t]))
-                    for t in range_constexpr(8):
-                        amax = fx.maxnumf(amax, abs(h1[t]))
-                    amax = fx.maxnumf(amax, fx.Float32(amax).shuffle_xor(16, WAVE))
-                    e8, scale_f32 = _group_scale(amax)
-                    p0 = emit_cvt_scalef32_pk8_fp8_f32(
-                        h0.ir_value(), scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
-                    )
-                    p1 = emit_cvt_scalef32_pk8_fp8_f32(
-                        h1.ir_value(), scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
-                    )
-                    gcol = fx.Int64(wnb + wp * 32)
-                    l_off = fx.Int64(row_rel) * C8_ROW + gcol + fx.Int64(kgrp * 8)
-                    fx.ptr_store(
-                        fx.Vector(p0).bitcast(fx.Int8), fx.add_offset(lds8, l_off)
-                    )
-                    fx.ptr_store(
-                        fx.Vector(p1).bitcast(fx.Int8),
-                        fx.add_offset(lds8, l_off + 16),
-                    )
-                    if kgrp == 0:
-                        fx.ptr_store(
-                            Vec.from_elements([fx.Uint8(e8)], fx.Int8),
-                            fx.add_offset(
-                                lds8,
-                                fx.Int64(S8_OFF + row_rel * GN) + gcol // 32,
-                            ),
-                        )
-            workgroup_barrier(use_cluster=False)
-            # One row's GN scale bytes per thread: contiguous in the row-major
-            # [M, (B*N)//32] scale, so each row is a single small store.
-            for rr in range_constexpr((tile_m + block - 1) // block):
-                srow_rel = fx.Int32(tid) + rr * block
-                if (srow_rel < tile_m) and (srow_rel < mn_oob):
-                    sv = fx.ptr_load(
-                        fx.add_offset(lds8, fx.Int64(S8_OFF + srow_rel * GN)),
-                        result_type=T.vec(GN, T.i8),
-                    )
-                    fx.ptr_store(
-                        fx.Vector(sv),
-                        fx.add_offset(
-                            s8, (blk_m64 + fx.Int64(srow_rel)) * srow + sbase_blk
-                        ),
+                    _quant_group_to_lds(
+                        lds8,
+                        C8_ROW,
+                        S8_OFF,
+                        GN,
+                        row_rel,
+                        fx.Int64(wnb + wp * 32),
+                        accs[wm * wmma_n_rep + 2 * wp].to(out_cls).to(fx.Float32),
+                        accs[wm * wmma_n_rep + 2 * wp + 1].to(out_cls).to(fx.Float32),
                     )
             c8_off = blk_m64 * ldc64 + blk_n64
             if const_expr(batched):
                 c8_off = c8_off + bz64 * fx.Int64(i32_n)
-            C8_TILE = (tile_m, C8_ROW)
-            gtC8 = _gv(gC8_base, c8_off, (mn_oob, tile_n), (ldc64, 1))
-            atomC8, coordC8 = fx.rocdl.cdna5.make_tiled_tdm_atom(
-                fx.rocdl.TensorStore(),
-                gtC8,
-                fx.make_layout(C8_TILE, (C8_ROW, 1)),
-                C8_TILE,
-                num_warps=num_waves,
+            _store_quant_tile(
+                lds8, gC8_base, c8_off, tile_n, C8_ROW, S8_OFF, GN, sbase_blk
             )
-            blkC8 = fx.zipped_divide(coordC8, C8_TILE)[None, (0, None)]
-            sC8 = _lv(lds8, (C8_TILE, 1), ((C8_ROW, 1), tile_m * C8_ROW))
-            tC8s, tC8g = fx.rocdl.cdna5.tdm_partition(
-                atomC8, wave, fx.make_layout(num_waves, 1), sC8, blkC8
-            )
-            fx.copy(atomC8, tC8s[None, 0], tC8g[None, 0])
-            rocdl.s_wait_tensorcnt(0)
         else:
             _stage_c_tile()
             # Group-32 MXFP8 quant epilogue. The whole [tile_m, tile_n] C tile

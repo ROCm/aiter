@@ -529,6 +529,44 @@ def batched_gemm_a8w8_mxscale_bpreshuffle_fused_quant_supported(
     return bmm_a8w8_mxfp8_fused_quant_supported(_w_scale_block_of(w_scale, n, k))
 
 
+# Only Out and y_scale_out are written, so only they are declared mutable, and
+# the op returns nothing (no output aliases an input); the fake is a no-op.
+@torch_compile_guard(
+    mutates_args=["Out", "y_scale_out"], gen_fake=lambda *args, **kwargs: None
+)
+def gate_up_silu_mxfp8_32(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    y_scale_out: Tensor,
+    swiglu_limit: float,
+    kernel_name: str | None = None,
+) -> None:
+    """gfx1250 gate_up GEMM with the SwiGLU activation and its MXFP8 quant
+    fused, as a registered op that torch.compile can trace.
+
+    Same arguments and contract as
+    ``aiter.ops.flydsl.batched_gemm_a8w8_gfx1250.run_gate_up_silu_mxfp8_32_gfx1250``
+    (writes ``Out`` [M, I] e4m3 and ``y_scale_out`` [M, I//32] e8m0); pick
+    ``kernel_name`` with ``gate_up_silu_kernel_for`` there, which returns None
+    where the fused path does not apply.
+    """
+    from .flydsl.batched_gemm_a8w8_gfx1250 import run_gate_up_silu_mxfp8_32_gfx1250
+
+    run_gate_up_silu_mxfp8_32_gfx1250(
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        Out,
+        y_scale_out,
+        swiglu_limit,
+        kernel_name=kernel_name,
+    )
+
+
 @torch_compile_guard(mutates_args=[], gen_fake=_batched_gemm_a8w8_mxscale_fake)
 @_route(op="batched_gemm_a8w8_mxscale_bpreshuffle", version=1)
 def batched_gemm_a8w8_mxscale_bpreshuffle(
