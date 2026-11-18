@@ -1190,7 +1190,7 @@ def _attn_fwd(
     start_m_idx = start_m * BLOCK_M
     end_m_idx = (start_m + 1) * BLOCK_M
     causal_start_idx = seqlen_q - seqlen_k
-    if IS_CAUSAL:
+    if IS_CAUSAL:  # noqa: SIM102
         # Rows fully above the diagonal softmax'd a row of all -infs (NaN);
         # they should be zero.
         if causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
