@@ -53,6 +53,14 @@ on:
         description: 'Use pytorch/manylinux2_28-builder ROCm image (AlmaLinux 8 + devtoolset, glibc 2.28). Produces wheels ABI-compatible with vLLM/Ubuntu 22 containers.'
         type: boolean
         default: false
+      torch_pin:
+        description: 'Optional torch version pin for the manylinux build (e.g. 2.13.0+rocm10.0.0). Empty = latest.'
+        required: false
+        default: ''
+      torch_index_url:
+        description: 'Optional torch index URL override. Empty = auto-derive from builder image tag.'
+        required: false
+        default: ''
   workflow_call:
     inputs:
       release_type:
@@ -344,10 +352,10 @@ jobs:
         run: |
           set -e
           # Detect ROCm flavor of the builder image to pick a torch index
-          # Image tag looks like pytorch/manylinux2_28-builder:rocm7.2
+          # Image tag looks like pytorch/manylinux2_28-builder:rocm10.0
           IMG="${BUILD_DOCKER_IMAGE}"
-          ROCM_TAG="${IMG##*:}"           # rocm7.2 / rocm7.1 / rocm7.0
-          ROCM_NUM="${ROCM_TAG#rocm}"      # 7.2
+          ROCM_TAG="${IMG##*:}"           # rocm7.2 / rocm7.14 / rocm10.0 / rocm10.1
+          ROCM_NUM="${ROCM_TAG#rocm}"      # 10.0
           # Allow caller to override the torch wheel index (e.g. pin a release
           # to a specific ROCm flavor's PyTorch ABI). Defaults preserve the
           # legacy auto-derived behavior.
@@ -379,6 +387,15 @@ jobs:
               set -e
               ${PYBIN}/pip install --upgrade --timeout=60 --retries=10 pip
               ${PYBIN}/pip install --timeout=60 --retries=10 --index-url "${TORCH_INDEX}" "${TORCH_SPEC}"
+              # ROCm >= 7.14 builder images pip-install ROCm into the image python3,
+              # not ${PYBIN}, and torch only pulls rocm[libraries] into ${PYBIN}.
+              # Add the devel SDK (headers, hipcc) at the exact same version.
+              if ${PYBIN}/python -c "import rocm_sdk" 2>/dev/null; then
+                ROCM_SDK_VERSION="$(${PYBIN}/pip show rocm | sed -n "s/^Version: //p")"
+                echo "pip ROCm SDK ${ROCM_SDK_VERSION}: installing rocm[devel]"
+                ${PYBIN}/pip install --timeout=60 --retries=10 --index-url "${TORCH_INDEX}" "rocm[devel]==${ROCM_SDK_VERSION}"
+                ${PYBIN}/python -m rocm_sdk init
+              fi
               # flydsl 0.1.9.dev599+ ships manylinux_2_28 wheels via AMD mirror
               # (see ROCm/FlyDSL#527 backport). Required at build time since
               # v0.1.15 setup.py imports aiter.aot.flydsl.gemm during start_aot().
@@ -413,6 +430,8 @@ jobs:
             -e PREBUILD_KERNELS=1 \
             -e GPU_ARCHS="${GPU_ARCHS}" \
             -e PYBIN="${PYBIN}" \
+            -e PYTHONUNBUFFERED=1 \
+            -e PYTHONFAULTHANDLER=1 \
             -w /workspace \
             aiter_build_${{ matrix.python_version }} \
             bash -c '
@@ -420,6 +439,15 @@ jobs:
               # gcc-toolset-13 is the default manylinux_2_28 toolchain
               source /opt/rh/gcc-toolset-13/enable 2>/dev/null || true
               export PATH="${PYBIN}:${PATH}"
+              if python -c "import rocm_sdk" 2>/dev/null; then
+                export ROCM_HOME="$(python -m rocm_sdk path --root)"
+                export ROCM_PATH="${ROCM_HOME}"
+                export PATH="$(python -m rocm_sdk path --bin):${PATH}"
+                echo "Using pip ROCm SDK: ROCM_HOME=${ROCM_HOME}"
+                # install_triton.sh has no triton builds for pip ROCm SDKs; keep
+                # the triton that torch pins (e.g. 3.8.0+git...rocm10.0.0).
+                export AITER_USE_SYSTEM_TRITON=1
+              fi
               python --version
               which python gcc
               gcc --version | head -1
