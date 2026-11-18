@@ -1032,12 +1032,17 @@ def test_a_comparison_made_at_capture_is_the_one_every_replay_runs(monkeypatch):
 # imported later inside a test would leave its op out of plugin._routed_ops.
 import aiter.fused_moe
 import aiter.mla
+import aiter.ops.attention
+import aiter.ops.gemm_op_a8w8
+import aiter.ops.mha
 import aiter.ops.mhc
 import aiter.ops.mla_sparse_prefill
 import aiter.ops.pa_sparse_prefill_opus
 import aiter.ops.quant
 import aiter.ops.topk
+import aiter.ops.triton.attention.kda
 import aiter.ops.triton.attention.pa_mqa_logits
+import aiter.ops.triton.gated_delta_net.causal_conv1d_prefill
 import aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale
 import aiter.ops.triton.gemm.basic.gemm_a16w16
 import aiter.ops.triton.gluon.mla_gluon
@@ -1130,12 +1135,33 @@ def _route_cases():
     from aiter.ops import mhc, mla_sparse_prefill, pa_sparse_prefill_opus, quant
     from aiter.ops.topk import biased_grouped_topk
     from aiter.ops.triton.attention import pa_mqa_logits
+    from aiter.ops.triton.attention.kda import (
+        fused_recurrent_kda,
+        fused_recurrent_kda_packed_decode,
+    )
+    from aiter.ops.triton.gated_delta_net.causal_conv1d_prefill import (
+        causal_conv1d_split_qkv_triton_tile_fn,
+    )
     from aiter.ops.triton.gemm.basic import gemm_a8w8_blockscale as triton_blockscale
     from aiter.ops.triton.gemm.basic import gemm_a16w16 as triton_a16w16
     from aiter.ops.triton.gluon import mla_gluon
     from aiter.tuned_gemm import gemm_a16w16
 
     out = _z(2, 3, dtype=torch.bfloat16)
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+    ps_args = (
+        _z(4, 2, 192, dtype=torch.bfloat16),
+        _z(4, 2, 192, dtype=torch.bfloat16),
+        _z(4, 2, 128, dtype=torch.bfloat16),
+        cu_seqlens,
+        cu_seqlens,
+        _z(4, dtype=torch.int32),
+        None,
+        None,
+        4,
+        0.25,
+    )
+    kda_state = _z(2, 2, 8, 8)
     logits_args = (_z(2, 1, 4, 128), _z(8, 1, 1, 132), _z(2, 4), _z(2, 64))
     logits_args += (
         torch.tensor([4, 4], dtype=torch.int32),
@@ -1259,6 +1285,97 @@ def _route_cases():
             0.25,
             _z(2, 4, 512, dtype=torch.bfloat16),
         ),
+        "flash_attn_varlen": (
+            lambda: aiter.flash_attn_varlen_func(
+                *ps_args[:3], cu_seqlens, cu_seqlens, 4, 4, causal=True
+            ),
+            "causal",
+            True,
+            _z(4, 2, 128, dtype=torch.bfloat16),
+        ),
+        "mla_prefill_ps": (
+            lambda: aiter.mla_prefill_ps_asm_fwd(
+                *ps_args,
+                True,
+                _z(2, 2, 128),
+                _z(2, 2),
+                _z(4, 2, 128, dtype=torch.bfloat16),
+            ),
+            "is_causal",
+            True,
+            None,
+        ),
+        "mla_reduce": (
+            lambda: aiter.mla_reduce_v1(
+                _z(2, 2, 128),
+                _z(2, 2),
+                torch.tensor([0, 2], dtype=torch.int32),
+                None,
+                torch.tensor([0, 1], dtype=torch.int32),
+                4,
+                0,
+                _z(1, 2, 128, dtype=torch.bfloat16),
+            ),
+            "max_seqlen_q",
+            4,
+            None,
+        ),
+        "gemm_a8w8_bpreshuffle": (
+            lambda: aiter.gemm_a8w8_bpreshuffle(
+                _z(2, 256, dtype=dtypes.fp8),
+                _z(16, 256, dtype=dtypes.fp8),
+                _z(2, 1),
+                _z(16, 1),
+                None,
+                torch.float16,
+            ),
+            "dtype",
+            torch.float16,
+            _z(2, 16, dtype=torch.float16),
+        ),
+        "causal_conv1d_split_qkv": (
+            lambda: causal_conv1d_split_qkv_triton_tile_fn(
+                _z(24, 4, dtype=torch.bfloat16),
+                _z(24, 4, dtype=torch.bfloat16),
+                None,
+                _z(1, 24, 3, dtype=torch.bfloat16),
+                cu_seqlens,
+                8,
+                8,
+            ),
+            "k_dim",
+            8,
+            tuple(_z(4, 8, dtype=torch.bfloat16) for _ in range(3)),
+        ),
+        "fused_recurrent_kda": (
+            lambda: fused_recurrent_kda(
+                *(_z(1, 1, 2, 8) for _ in range(4)), _z(1, 1, 2), scale=0.5
+            ),
+            "scale",
+            0.5,
+            (_z(1, 1, 2, 8), None),
+        ),
+        "fused_recurrent_kda_packed_decode": (
+            lambda: fused_recurrent_kda_packed_decode(
+                _z(1, 48),
+                _z(1, 2, 8),
+                _z(1, 2),
+                _z(2),
+                _z(2, 8),
+                None,
+                kda_state,
+                torch.tensor([1], dtype=torch.int32),
+                _z(2, 48, 3),
+                _z(3, 4, 16),
+                _z(1, 2, 8),
+                _z(8),
+                1e-6,
+                _z(1, 2, 8),
+            ),
+            "norm_eps",
+            1e-6,
+            _z(1, 2, 8),
+        ),
     }
 
 
@@ -1276,6 +1393,13 @@ _ROUTE_CASES = [
     "mla_sparse_prefill_v4 (opus name)",
     "mhc_fused_post_pre",
     "per_group_quant",
+    "flash_attn_varlen",
+    "mla_prefill_ps",
+    "mla_reduce",
+    "gemm_a8w8_bpreshuffle",
+    "causal_conv1d_split_qkv",
+    "fused_recurrent_kda",
+    "fused_recurrent_kda_packed_decode",
 ]
 
 

@@ -659,6 +659,32 @@ _NOT_REGISTERED = {
         "it returns the Triton cache key, a str, which a custom op cannot "
         "return (bench_deepgemm_attention.py reads it)"
     ),
+    "flash_attn_varlen": (
+        "unannotated contract, an out-buffer in it (`out`), and a result whose "
+        "arity follows `return_lse` and `return_attn_probs`; its native path "
+        "is an autograd.Function that a registered op would cut off"
+    ),
+    "mla_prefill_ps": (
+        "out-buffers in the contract (`splitData`, `splitLse`, `output`); the "
+        "ctypes binding beneath it is already registered under its own name"
+    ),
+    "mla_reduce": (
+        "out-buffers in the contract (`final_output`, `final_lse`); the HIP "
+        "binding beneath it is already registered under its own name"
+    ),
+    "causal_conv1d_split_qkv": (
+        "unannotated contract (`metadata`), and it writes `conv_states` in place"
+    ),
+    "fused_recurrent_kda": (
+        "an out-buffer in the contract (`out`), state written in place "
+        "(`initial_state`, `conv_state`), and `config` is a dict no schema can "
+        "express"
+    ),
+    "fused_recurrent_kda_packed_decode": (
+        "an out-buffer in the contract (`out`), state written in place "
+        "(`initial_state`, `conv_state`), and `config` is a dict no schema can "
+        "express"
+    ),
     "sp_qkv_fused": "unannotated contract",
     "pertoken_quant": (
         "unannotated contract; and its body is pure torch, which inductor "
