@@ -1191,6 +1191,21 @@ def test_mhc_post_pre_cancellation(
             *inputs, w_preshuffle_bf16=w_preshuffle_bf16, backend="hip", **extra_args
         ),
     }
+    if dtype == dtypes.bf16 and mhc_gram_route_available(m):
+        # The default call on the Gram route, whatever its tuned table lists: one
+        # producer split per 128 hidden elements, four finisher segments per row.
+        def gram():
+            outs, launches = mhc_post_pre_gram_route(
+                *inputs,
+                split_k=hidden_size // 128,
+                parts=4,
+                w_preshuffle_bf16=w_preshuffle_bf16,
+                **extra_args,
+            )
+            assert launches == [(hidden_size // 128, 4)], launches
+            return outs
+
+        candidates["gram"] = gram
     ret = {}
     for name, candidate in candidates.items():
         # A numerical case: a short timing run is enough for the table.
@@ -1202,11 +1217,120 @@ def test_mhc_post_pre_cancellation(
             if what == "layer_input":
                 ret[f"{name}_err"] = err
         ret[f"{name}_us"] = us
-    # The default call may not leave the reference further than post + pre does.
-    assert ret["default_err"] <= ret["unfused_err"] + 5e-3, (
-        f"cancellation: default {ret['default_err']:.3%} of elements outside "
-        f"tolerance against {ret['unfused_err']:.3%} for post + pre"
+    # No other candidate may leave the reference further than post + pre does.
+    for name in candidates:
+        assert ret[f"{name}_err"] <= ret["unfused_err"] + 5e-3, (
+            f"cancellation: {name} {ret[f'{name}_err']:.3%} of elements outside "
+            f"tolerance against {ret['unfused_err']:.3%} for post + pre"
+        )
+    return ret
+
+
+def mhc_gram_route_available(m):
+    """Whether the Gram route of mhc_fused_post_pre can serve m rows on this device:
+    gfx950 with 256 CUs and no CU mask, a decode row count."""
+    from aiter.ops.mhc import MHC_GRAM_M_MAX_GFX950
+
+    return (
+        get_gfx_runtime() == "gfx950"
+        and get_cu_num() == 256
+        and not any(
+            name in os.environ for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+        )
+        and 0 < m <= MHC_GRAM_M_MAX_GFX950
     )
+
+
+def mhc_post_pre_gram_route(
+    *inputs, split_k, parts, w_preshuffle_bf16=False, table_m=None, **extra_args
+):
+    """The default mhc_fused_post_pre call with the table of the Gram route replaced
+    by one row, (split_k, parts) for ``table_m`` rows (default: the rows of this
+    call), so that the call does not depend on the tuned table. Returns the outputs
+    and the (split_k, parts) of every launch of the Gram kernels."""
+    from aiter.ops import mhc as mhc_ops
+
+    m, hidden_size = inputs[0].shape
+    table_m = m if table_m is None else table_m
+    key = (hidden_size, bool(w_preshuffle_bf16))
+    launches = []
+    gram_kernels = mhc_ops.mhc_post_pre_gram_gfx950
+
+    def record(*args, **kwargs):
+        launches.append((args[4].size(0), args[18]))
+        return gram_kernels(*args, **kwargs)
+
+    with (
+        patch.object(
+            mhc_ops,
+            "MHC_GRAM_CONFIG_GFX950_256",
+            {key: ((table_m, table_m, split_k, parts),)},
+        ),
+        patch.object(mhc_ops, "mhc_post_pre_gram_gfx950", record),
+    ):
+        outs = aiter.mhc_fused_post_pre(
+            *inputs, w_preshuffle_bf16=w_preshuffle_bf16, **extra_args
+        )
+    return outs, launches
+
+
+@benchmark()
+def test_mhc_post_pre_gram_dispatch(
+    m, hidden_size, hc_mult, slab, parts, w_preshuffle_bf16, dtype=dtypes.bf16, seed=0
+):
+    """gfx950 with 256 CUs: the Gram route of the default call with fused RMSNorm.
+
+    With a table row for m rows (one producer split per ``slab`` hidden elements,
+    ``parts`` finisher segments per row) the call must launch the Gram kernels once
+    with that configuration; with the row moved to m + 1 rows it must not launch
+    them. Weights and mixes are random and differ per row, so a projection or a mix
+    read from the wrong row, slab or segment fails the comparison with the reference.
+    """
+    from aiter.ops import mhc as mhc_ops
+
+    hc_mult3 = hc_mult * 2 + hc_mult * hc_mult
+    gen = make_generator(seed)
+    layer_input = fill((m, hidden_size), "norm", gen, dtype=dtype)
+    residual_in = fill((m, hc_mult, hidden_size), "norm", gen, dtype=dtype)
+    post_layer_mix = fill((m, hc_mult, 1), "norm", gen, dtype=dtypes.fp32)
+    comb_res_mix = fill((m, hc_mult, hc_mult), "norm", gen, dtype=dtypes.fp32)
+    fn = fill((hc_mult3, hc_mult * hidden_size), "norm", gen, dtype=dtypes.fp32)
+    hc_scale = fill((3,), "norm", gen, dtype=dtypes.fp32) * 0.1
+    hc_base = fill((hc_mult3,), "norm", gen, dtype=dtypes.fp32) * 0.1
+    # Four different epsilons, large enough that a swapped one fails the comparison.
+    extra_args = {
+        "rms_eps": 0.3,
+        "hc_pre_eps": 0.2,
+        "hc_sinkhorn_eps": 0.1,
+        "hc_post_mult_value": 2.0,
+        "sinkhorn_repeat": 20,
+        "norm_weight": fill((hidden_size,), "norm", gen, dtype=dtype),
+        "norm_eps": 0.5,
+    }
+    inputs = (layer_input, residual_in, post_layer_mix, comb_res_mix)
+    refs = mhc_post_pre_ref(*inputs, fn, hc_scale, hc_base, **extra_args)
+    route = {
+        "split_k": hidden_size // slab,
+        "parts": parts,
+        "w_preshuffle_bf16": w_preshuffle_bf16,
+    }
+    inputs += (
+        mhc_ops.mhc_shuffle_fn(fn) if w_preshuffle_bf16 else fn,
+        hc_scale,
+        hc_base,
+    )
+    outs, launches = mhc_post_pre_gram_route(*inputs, **route, **extra_args)
+    assert launches == [(route["split_k"], parts)], launches
+    _, launches = mhc_post_pre_gram_route(*inputs, **route, table_m=m + 1, **extra_args)
+    assert not launches, launches
+    ret = {}
+    for what, ref, out in zip(
+        ("post_mix", "comb_mix", "layer_input", "next_residual"), refs, outs
+    ):
+        # One wrong row of the largest row count here is 1e-3 of the elements.
+        err = assertAllclose(ref, out, tol_err_ratio=1e-4, msg=f"gram dispatch/{what}")
+        if what == "layer_input":
+            ret["err"] = err
     return ret
 
 
@@ -1590,4 +1714,49 @@ if not args.hc_head:
     else:
         aiter.logger.warning(
             "skip mhc_post_pre prefill dispatch cases: unmasked 256-CU gfx950 only"
+        )
+
+    from aiter.ops import mhc as mhc_ops
+
+    # The tuned table of the Gram route: ascending row ranges, legal configurations.
+    for (hidden_size, _), rows in mhc_ops.MHC_GRAM_CONFIG_GFX950_256.items():
+        last = 0
+        for m_first, m_last, split_k, parts in rows:
+            slab = hidden_size // split_k
+            assert last < m_first <= m_last <= mhc_ops.MHC_GRAM_M_MAX_GFX950, rows
+            assert slab * split_k == hidden_size, rows
+            assert slab == 64 or slab % 128 == 0, rows
+            assert hidden_size % (8 * parts) == 0, rows
+            last = m_last
+
+    if mhc_gram_route_available(1):
+        # (m, slab, parts): one row, partial producer tiles, both MFMA widths, up to
+        # four producer steps per split, 1 to 8 segments, the largest row count.
+        df = [
+            test_mhc_post_pre_gram_dispatch(
+                m=m,
+                hidden_size=hidden_size,
+                hc_mult=4,
+                slab=slab,
+                parts=parts,
+                w_preshuffle_bf16=packed,
+                seed=args.seed,
+            )
+            for hidden_size, packed, (m, slab, parts) in itertools.product(
+                args.hidden_size,
+                (False, True),
+                (
+                    (1, 64, 8),
+                    (5, 128, 4),
+                    (33, 256, 2),
+                    (64, 128, 4),
+                    (129, 512, 1),
+                    (mhc_ops.MHC_GRAM_M_MAX_GFX950, 128, 1),
+                ),
+            )
+        ]
+        print_json_table("mhc_post_pre gram dispatch summary", df)
+    else:
+        aiter.logger.warning(
+            "skip mhc_post_pre gram dispatch cases: unmasked 256-CU gfx950 only"
         )
