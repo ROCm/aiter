@@ -1,8 +1,14 @@
 {
   "schema": {
     "attn_2d": [
+      "SIMPLE",
+      "C",
+      "H",
       "D",
       "Q",
+      "K",
+      "BS",
+      "EQ",
       "P",
       "SW",
       "SKLT",
@@ -29,7 +35,9 @@
       "NUM_BUFFERS": 2,
       "waves_per_eu": 1,
       "TILE_SIZE_MIN": 64,
-      "TILE_SIZE_MAX": 64
+      "TILE_SIZE_MAX": 64,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "D_LEQ_64.Q_LEQ_4.P_LEQ_8.SW.DT_bf16_bf16": {
       "BLOCK_M": 32,
@@ -38,7 +46,9 @@
       "NUM_BUFFERS": 2,
       "waves_per_eu": 1,
       "TILE_SIZE_MIN": 64,
-      "TILE_SIZE_MAX": 64
+      "TILE_SIZE_MAX": 64,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "D_LEQ_64.Q_LEQ_8.P_LEQ_8.SW.DT_bf16_bf16": {
       "BLOCK_M": 64,
@@ -47,7 +57,9 @@
       "NUM_BUFFERS": 2,
       "waves_per_eu": 1,
       "TILE_SIZE_MIN": 64,
-      "TILE_SIZE_MAX": 64
+      "TILE_SIZE_MAX": 64,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "D_LEQ_64.Q_LEQ_16.P_LEQ_8.SW.DT_bf16_bf16": {
       "BLOCK_M": 128,
@@ -56,7 +68,9 @@
       "NUM_BUFFERS": 2,
       "waves_per_eu": 1,
       "TILE_SIZE_MIN": 64,
-      "TILE_SIZE_MAX": 64
+      "TILE_SIZE_MAX": 64,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "D_LEQ_64.SW": {
       "BLOCK_M": 128,
@@ -65,7 +79,9 @@
       "NUM_BUFFERS": 2,
       "waves_per_eu": 0,
       "TILE_SIZE_MIN": 64,
-      "TILE_SIZE_MAX": 64
+      "TILE_SIZE_MAX": 64,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "D_LEQ_128.SW": {
       "BLOCK_M": 128,
@@ -74,7 +90,9 @@
       "NUM_BUFFERS": 2,
       "waves_per_eu": 0,
       "TILE_SIZE_MIN": 64,
-      "TILE_SIZE_MAX": 64
+      "TILE_SIZE_MAX": 64,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "D_LEQ_64": {
       "BLOCK_M": 128,
@@ -83,7 +101,9 @@
       "NUM_BUFFERS": 2,
       "waves_per_eu": 0,
       "TILE_SIZE_MIN": 64,
-      "TILE_SIZE_MAX": 64
+      "TILE_SIZE_MAX": 64,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "D_GEQ_256.DT_fp8_fp8": {
       "BLOCK_M": 128,
@@ -92,7 +112,9 @@
       "NUM_BUFFERS": 2,
       "waves_per_eu": 0,
       "TILE_SIZE_MIN": 64,
-      "TILE_SIZE_MAX": 64
+      "TILE_SIZE_MAX": 64,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "D_GEQ_256": {
       "BLOCK_M": 128,
@@ -101,7 +123,9 @@
       "NUM_BUFFERS": 2,
       "waves_per_eu": 1,
       "TILE_SIZE_MIN": 64,
-      "TILE_SIZE_MAX": 64
+      "TILE_SIZE_MAX": 64,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "any": {
       "BLOCK_M": 128,
@@ -110,7 +134,31 @@
       "NUM_BUFFERS": 2,
       "waves_per_eu": 0,
       "TILE_SIZE_MIN": 64,
-      "TILE_SIZE_MAX": 64
+      "TILE_SIZE_MAX": 64,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
+    },
+    "SIMPLE.C_EQ_256.H_EQ_16.D_EQ_128.BS_EQ_512.Q_RANGE_2049_4095.EQ.DT_bf16_bf16": {
+      "BLOCK_M": 128,
+      "num_warps": 4,
+      "MFMA_DIM": 32,
+      "NUM_BUFFERS": 2,
+      "waves_per_eu": 1,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64,
+      "PRELOAD_PAGES": 8,
+      "USE_EXPLICIT_FMA": true
+    },
+    "SIMPLE.C_EQ_256.H_EQ_16.D_EQ_128.BS_EQ_512.Q_RANGE_257_512.K_RANGE_769_1024.DT_bf16_bf16": {
+      "BLOCK_M": 64,
+      "num_warps": 4,
+      "MFMA_DIM": 32,
+      "NUM_BUFFERS": 2,
+      "waves_per_eu": 0,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64,
+      "PRELOAD_PAGES": 2,
+      "USE_EXPLICIT_FMA": true
     }
   },
   "attn_3d": {
@@ -118,101 +166,133 @@
       "BLOCK_M": 128,
       "MFMA_DIM": 32,
       "NUM_BUFFERS": 2,
-      "waves_per_eu": 0
+      "waves_per_eu": 0,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "D_LEQ_64.Q_GEQ_64": {
       "BLOCK_M": 128,
       "MFMA_DIM": 32,
       "NUM_BUFFERS": 2,
-      "waves_per_eu": 0
+      "waves_per_eu": 0,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "D_LEQ_64.DT_fp8_fp8": {
       "BLOCK_M": 32,
       "MFMA_DIM": 32,
       "NUM_BUFFERS": 2,
-      "waves_per_eu": 1
+      "waves_per_eu": 1,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "D_LEQ_64": {
       "BLOCK_M": 16,
       "MFMA_DIM": 16,
       "NUM_BUFFERS": 2,
-      "waves_per_eu": 1
+      "waves_per_eu": 1,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "D_GEQ_256.SW.DT_fp8_fp8": {
       "BLOCK_M": 32,
       "MFMA_DIM": 32,
       "NUM_BUFFERS": 2,
       "waves_per_eu": 1,
-      "WIDE_BLOCK_M_MULT": 2
+      "WIDE_BLOCK_M_MULT": 2,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "D_GEQ_256.SW": {
       "BLOCK_M": 16,
       "MFMA_DIM": 16,
       "NUM_BUFFERS": 2,
       "waves_per_eu": 1,
-      "WIDE_BLOCK_M_MULT": 2
+      "WIDE_BLOCK_M_MULT": 2,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "D_GEQ_256.Q_GEQ_64.DT_fp8_fp8": {
       "BLOCK_M": 64,
       "MFMA_DIM": 32,
       "NUM_BUFFERS": 2,
-      "waves_per_eu": 0
+      "waves_per_eu": 0,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "D_GEQ_256.Q_GEQ_64": {
       "BLOCK_M": 128,
       "MFMA_DIM": 32,
       "NUM_BUFFERS": 2,
-      "waves_per_eu": 0
+      "waves_per_eu": 0,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "D_GEQ_256.DT_fp8_fp8": {
       "BLOCK_M": 32,
       "MFMA_DIM": 32,
       "NUM_BUFFERS": 2,
       "waves_per_eu": 1,
-      "WIDE_BLOCK_M_MULT": 2
+      "WIDE_BLOCK_M_MULT": 2,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "D_GEQ_256": {
       "BLOCK_M": 16,
       "MFMA_DIM": 16,
       "NUM_BUFFERS": 2,
       "waves_per_eu": 1,
-      "WIDE_BLOCK_M_MULT": 2
+      "WIDE_BLOCK_M_MULT": 2,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "Q_GEQ_64.DT_fp8_fp8": {
       "BLOCK_M": 64,
       "MFMA_DIM": 32,
       "NUM_BUFFERS": 2,
-      "waves_per_eu": 0
+      "waves_per_eu": 0,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "Q_GEQ_64": {
       "BLOCK_M": 128,
       "MFMA_DIM": 32,
       "NUM_BUFFERS": 2,
-      "waves_per_eu": 0
+      "waves_per_eu": 0,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "Q_GEQ_2.DT_fp8_fp8": {
       "BLOCK_M": 32,
       "MFMA_DIM": 32,
       "NUM_BUFFERS": 2,
-      "waves_per_eu": 1
+      "waves_per_eu": 1,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "DT_fp8_fp8": {
       "BLOCK_M": 32,
       "MFMA_DIM": 32,
       "NUM_BUFFERS": 2,
-      "waves_per_eu": 2
+      "waves_per_eu": 2,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "Q_GEQ_2": {
       "BLOCK_M": 32,
       "MFMA_DIM": 32,
       "NUM_BUFFERS": 2,
-      "waves_per_eu": 1
+      "waves_per_eu": 1,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     },
     "any": {
       "BLOCK_M": 16,
       "MFMA_DIM": 16,
       "NUM_BUFFERS": 2,
-      "waves_per_eu": 2
+      "waves_per_eu": 2,
+      "PRELOAD_PAGES": 0,
+      "USE_EXPLICIT_FMA": false
     }
   },
   "kv_split": {
