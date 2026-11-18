@@ -22,6 +22,7 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_fmoe_ck_swiglu_limit.py` | 1 | No | `--swiglu_limit` in the CK two-stage candidates: stage-1 kwargs, torch reference and compare of both stages, only for FP8 `per_1x128` |
 | `test_fmoe_aiter_import.py` | 1 | No | fmoe tuner modules that read `aiter.<name>` have a module-level `import aiter`; `aiter` is also a Python builtin, so ruff and the import do not catch a missing one |
 | `test_fmoe_candidate_snapshot.py` | 1 | Yes (no kernel timing) | Reads the real GPU architecture and compares candidates against the matching architecture entry in a base-commit snapshot (`AITER_FMOE_CANDIDATE_SNAPSHOT`). Record each entry on a node of that architecture; skipped without the snapshot. |
+| `test_fmoe_task_record.py` | 1 | No | The snapshot's task record on hand-made tasks: a different tolerance, compare function, kernel function or kwargs gives a different record; guarded ops by the op they wrap; `MOVED` renames only a function's location |
 | `test_tune_pipeline.py` | 2 | Yes | End-to-end: run each tuner on small shapes (mp=1 + mp=default), verify output CSV; `--compare --update_improved`; `AITER_ONLINE_TUNE` e2e |
 | `test_asm_splitk_guard.py` | 1 | No | `GemmTuner.asm_gemm_all_solutions` SplitK semaphore grid guard |
 | `test_run_config.py` | 2 | Yes | Run --run_config on ALL existing tuned CSVs (configs + model_configs) |
@@ -34,8 +35,9 @@ validation, shape-collision checks, the mixed-MXFP tuner unit tests, the
 compare logic, the dispatch verification, the one-GPU `mp_tuner` fault and
 worker-death tests, the fused-MoE winner replay, the fused-MoE tune-dispatch
 locks, the FlyDSL gfx942 e2e tune selection, the fused-MoE TFLOPS and
-bandwidth estimate, the fused-MoE `--swiglu_limit` rows and CK candidates, and
-the `aiter` import check of the fused-MoE tuner modules.
+bandwidth estimate, the fused-MoE `--swiglu_limit` rows and CK candidates, the
+`aiter` import check of the fused-MoE tuner modules, and the fused-MoE snapshot
+task record.
 
 The full Level 0+1 workflow repeats the broader CPU suite on its daily/manual
 schedule. GPU tuner-pipeline and all-shape `--run_config` validation remain
@@ -87,6 +89,7 @@ python3 -m unittest op_tests.tuning_tests.test_csv_validation \
   op_tests.tuning_tests.test_fmoe_e2e_tune \
   op_tests.tuning_tests.test_fmoe_calculate \
   op_tests.tuning_tests.test_fmoe_tag_rows \
+  op_tests.tuning_tests.test_fmoe_task_record \
   op_tests.tuning_tests.test_fmoe_ck_swiglu_limit \
   op_tests.tuning_tests.test_fmoe_aiter_import \
   op_tests.tuning_tests.test_online_tune -v
