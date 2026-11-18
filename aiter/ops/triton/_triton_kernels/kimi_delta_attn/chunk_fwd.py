@@ -114,7 +114,8 @@ def chunk_delta_attn_fwd(
         state_cache:        Optional paged fp32 V-first cache. FlashKDA-only.
         snapshot_targets:   Optional interior states to write out, see
                             ``flash_kda_fwd``. FlashKDA-only.
-        snapshot_out:       Their destination. FlashKDA-only.
+        snapshot_out:       Their destination, rejected without them.
+                            FlashKDA-only.
 
     Returns:
         (o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg)
@@ -172,6 +173,10 @@ def chunk_delta_attn_fwd(
         raise ValueError(
             "out is only implemented on the FlashKDA path; use the returned "
             "tensor, or pass a call that flash_kda_supported accepts"
+        )
+    if snapshot_targets is None and snapshot_out is not None:
+        raise ValueError(
+            "snapshot_out is given without snapshot_targets, so nothing would write it"
         )
     if snapshot_targets and not use_flash_kda:
         raise ValueError(

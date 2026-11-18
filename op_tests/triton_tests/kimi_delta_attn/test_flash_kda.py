@@ -1384,13 +1384,13 @@ def _interior_targets(lens, every=1):
     )
 
 
-def _snapshot_run(args, targets, **kw):
+def _snapshot_run(args, targets, snap_dtype=torch.float32, **kw):
     """``flash_kda_fwd`` with ``targets``: ``(o, final_state, snapshots)``."""
     snaps = torch.full(
         (len(targets), args[0].shape[2], K_DIM, K_DIM),
         float("nan"),
         device=device,
-        dtype=torch.float32,
+        dtype=snap_dtype,
     )
     o, ht = flash_kda_fwd(
         *args,
@@ -1409,22 +1409,28 @@ def _prefix(args, lens, n, off):
     return (*head, *args[5:])
 
 
+@pytest.mark.parametrize("snap_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("chunks_per_seg", [0, 2])
 @pytest.mark.parametrize("state_v_first", [False, True])
-def test_snapshots_are_the_states_of_their_prefixes(state_v_first, chunks_per_seg):
+def test_snapshots_are_the_states_of_their_prefixes(
+    state_v_first, chunks_per_seg, snap_dtype
+):
     """Several targets per sequence, in reverse order, on several sequences."""
     lens = [256, 100, 160]
     args = make_inputs(1, sum(lens), 4)
     targets = _interior_targets(lens)[::-1]
     kw = {"state_v_first": state_v_first, "chunks_per_seg": chunks_per_seg}
-    _o, _ht, snaps = _snapshot_run(args, targets, cu_seqlens=_cu_seqlens(lens), **kw)
+    _o, _ht, snaps = _snapshot_run(
+        args, targets, snap_dtype, cu_seqlens=_cu_seqlens(lens), **kw
+    )
     for i, (n, off) in enumerate(targets):
         head = _prefix(args, lens, n, off)
         _, gold = fp32_gold(*head, output_final_state=True, state_v_first=state_v_first)
         assert rel_err(snaps[i], gold[0]) < 2e-2, (n, off)
         if chunks_per_seg == 0:
-            # The same Triton K2 walk that ends at `off`. Bit-identical unless
-            # the two calls pick different K2 tiles.
+            # The same Triton K2 walk that ends at `off`, its state cast to
+            # `snap_dtype`. Bit-identical unless the two calls pick different
+            # K2 tiles.
             with _route(k2=False):
                 _, ht = run_flash(
                     *head,
@@ -1432,7 +1438,7 @@ def test_snapshots_are_the_states_of_their_prefixes(state_v_first, chunks_per_se
                     state_v_first=state_v_first,
                     chunks_per_seg=0,
                 )
-            assert rel_err(snaps[i], ht[0]) < 1e-4, (n, off)
+            assert rel_err(snaps[i], ht[0].to(snap_dtype)) < 1e-4, (n, off)
 
 
 @pytest.mark.parametrize("state_v_first", [False, True])
@@ -1590,10 +1596,13 @@ def test_snapshot_out_must_be_contiguous():
 def test_snapshot_arguments_are_checked():
     args = make_inputs(1, 256, 4)
     good = torch.empty(1, 4, K_DIM, K_DIM, device=device)
+    as_int = torch.empty(1, 4, K_DIM, K_DIM, device=device, dtype=torch.int32)
     for targets, out in (
         (((0, 128),), None),  # no destination
+        (None, good),  # a destination nothing would write
         (((0, 128),), torch.empty(2, 4, K_DIM, K_DIM, device=device)),
         (((0, 128),), torch.empty(1, 4, K_DIM, K_DIM)),  # on the CPU
+        (((0, 128),), as_int),  # not floating point
         (((0, 100),), good),  # off the chunk grid
         (((0, 256),), good),  # the final state
     ):
@@ -1605,27 +1614,29 @@ def test_snapshot_arguments_are_checked():
                 snapshot_out=out,
             )
     q, k, v, g, beta, A_log, dt_bias, scale = args
-    with _force_default_pipeline(), pytest.raises(ValueError):
-        chunk_delta_attn_fwd(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            initial_state=None,
-            output_final_state=False,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            chunk_size=FLASH_KDA_CHUNK,
-            safe_gate=True,
-            lower_bound=LOWER_BOUND,
-            use_gate_in_kernel=True,
-            use_qk_l2norm_in_kernel=True,
-            use_beta_sigmoid_in_kernel=True,
-            snapshot_targets=((0, 128),),
-            snapshot_out=good,
-        )
+    # Off the FlashKDA path: targets it cannot store, and a destination alone.
+    for targets in (((0, 128),), None):
+        with _force_default_pipeline(), pytest.raises(ValueError):
+            chunk_delta_attn_fwd(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=None,
+                output_final_state=False,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                chunk_size=FLASH_KDA_CHUNK,
+                safe_gate=True,
+                lower_bound=LOWER_BOUND,
+                use_gate_in_kernel=True,
+                use_qk_l2norm_in_kernel=True,
+                use_beta_sigmoid_in_kernel=True,
+                snapshot_targets=targets,
+                snapshot_out=good,
+            )
 
 
 # ── Where pass C puts the snapshots: CPU only, no kernel launch ──────────────

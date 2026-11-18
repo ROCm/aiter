@@ -177,8 +177,9 @@ def chunk_kimi_delta_attn(
             there.
         snapshot_out (torch.Tensor, optional):
             Destination, `[len(snapshot_targets), HV, V, K]` when
-            `state_v_first` else `[.., HV, K, V]`, contiguous; its dtype is
-            the cast applied. Required with `snapshot_targets`.
+            `state_v_first` else `[.., HV, K, V]`, contiguous; its floating
+            point dtype is the cast applied. Required with `snapshot_targets`,
+            and rejected without it.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:

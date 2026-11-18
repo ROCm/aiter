@@ -1309,10 +1309,12 @@ def flash_kda_fwd(
                             no device read. A call with targets runs K2 on
                             Triton, which is the only K2 that stores them.
         snapshot_out:       ``[len(snapshot_targets), H, V, K]`` when
-                            ``state_v_first`` else ``[.., H, K, V]``, on the
-                            device of ``q``, and contiguous: it is written in
-                            place rather than packed by ``input_guard``. Row
-                            ``i`` receives target ``i``.
+                            ``state_v_first`` else ``[.., H, K, V]``, floating
+                            point, on the device of ``q``, and contiguous: it
+                            is written in place rather than packed by
+                            ``input_guard``. Row ``i`` receives target ``i``.
+                            Rejected without ``snapshot_targets``, which would
+                            leave it unwritten; ``()`` leaves it unused.
                             Cast as the final state is, so in ``final_state``'s
                             dtype it holds the bits that a forward ending at
                             ``off`` returns as its final state, when that
@@ -1539,6 +1541,10 @@ def flash_kda_fwd(
     seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, seg_seq, seg_is_last = desc
 
     snap_args = {}
+    if snapshot_targets is None and snapshot_out is not None:
+        raise ValueError(
+            "snapshot_out is given without snapshot_targets, so nothing would write it"
+        )
     if snapshot_targets:
         if snapshot_out is None:
             raise ValueError("snapshot_targets needs snapshot_out")
@@ -1547,11 +1553,13 @@ def flash_kda_fwd(
         if (
             tuple(snapshot_out.shape) != want
             or not snapshot_out.is_contiguous()
+            or not snapshot_out.dtype.is_floating_point
             or snapshot_out.device != dev
         ):
             raise ValueError(
-                f"snapshot_out must be a contiguous {want} tensor on {dev}, got "
-                f"{tuple(snapshot_out.shape)} on {snapshot_out.device}"
+                f"snapshot_out must be a contiguous floating-point {want} tensor "
+                f"on {dev}, got {snapshot_out.dtype} {tuple(snapshot_out.shape)} "
+                f"on {snapshot_out.device}"
             )
         snap_args = {
             "snap_out": snapshot_out,
