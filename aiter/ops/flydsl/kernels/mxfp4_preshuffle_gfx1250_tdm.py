@@ -251,8 +251,8 @@ def build_gemm_a8w4_tdm_task(
     - ``explicit_tile``: ``task_id`` is the m-tile and ``schedule_rows`` the
       n-tile, replacing the DeepGEMM swizzle of a linear task id.
     - ``explicit_cluster``: the caller schedules complete physical clusters,
-      supplies adjacent M/N tiles matching block y/x, and joins the cluster
-      before claiming another item. Inactive M-tail rows skip the body;
+      supplies adjacent M/N tiles matching block y/x in the same task order.
+      Multicast uses the ordinary TDM protocol. Inactive M-tail rows skip the body;
       incomplete N clusters are rejected by the caller.
     - ``cluster_active``: optional one-element list containing a TG-uniform
       predicate. False disables A/B multicast for independently scheduled TGs
@@ -373,8 +373,8 @@ def build_gemm_a8w4_tdm_task(
     next_stage_on = 1 if (next_stage_prefetch and num_buffers >= 2) else 0
     assert rolled_drain in (0, 1), "rolled_drain must be 0 or 1"
     rolled_drain = bool(rolled_drain)
-    # full_cluster is derived from the unpadded tile map, so a tile m_align
-    # skips would leave its M peers waiting in cluster_sync().
+    # B multicast groups use the unpadded tile map. Skipping an aligned hole
+    # would make peer workgroups issue different multicast task sequences.
     assert not (m_align and cluster_m > 1), "m_align requires cluster_m=1"
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
@@ -820,7 +820,7 @@ def build_gemm_a8w4_tdm_task(
                 group_size = group_size + same_expert.select(fx.Int32(1), fx.Int32(0))
             # A partial M-tail retains four independent copies of the current
             # 1x4 A protocol.  Disable B multicast there so sentinel rows can
-            # take the existing early exit without entering a cluster barrier.
+            # take the existing early exit without unmatched B multicast loads.
             # A one-row expert subgroup is also the current 1x4 fallback: A
             # broadcasts across N and B remains an ordinary per-WG load.
             # Preserve the existing sync policy while restoring eligible B multicast.
@@ -2951,27 +2951,18 @@ def launch_gemm_a8w4_tdm(
 
     ``cluster_m`` and ``cluster_n`` explicitly select the physical workgroup
     cluster. Peers along N share A, while expert-compatible peers along M can
-    share B. A 1xN cluster needs no software cluster barrier; an MxN cluster
-    uses ``cluster_sync`` to protect its cross-M multicast and LDS reuse.
+    share B. Both use the same TDM pipeline without software cluster barriers.
 
-    For a 1xN cluster, a non-zero workgroup mask turns the load into
-    CLUSTER_LOAD_ASYNC, which rendezvouses with the named peers, and each
-    workgroup's own s_wait_tensorcnt covers its LDS. For an MxN cluster, the
-    strided cross-M multicast additionally needs cluster_sync to keep producer
-    and consumer workgroups from reusing an LDS stage at different times.
+    A non-zero workgroup mask selects CLUSTER_LOAD_ASYNC. Compatible peer
+    requests can share the global fetch; each workgroup's tensor wait covers
+    its own LDS. With early_timeout, present requesters can complete while
+    latecomers rebroadcast, so this is not an input-ready barrier. Fused callers
+    must gate each A issuer until its source data is ready.
 
-    The rendezvous replaces drift bounding with two hard preconditions, and
-    breaking either hangs rather than corrupts:
-
-    1. Every peer issues the same number of pairwise-matching multicast loads.
-       This holds because K_TILES is a compile-time constant and the
-       ``expert < n_experts`` skip is cluster-uniform: peers share m_tile, hence
-       expert, so they all skip or none do.
-    2. The grid fills every cluster exactly, i.e. ceil(N/tile_n) % cluster_n == 0.
-       That cannot be checked here -- inside @flyc.jit ``N`` is a traced value, so
-       a Python ``if`` on it becomes a traced branch rather than a host-side
-       check -- so the callers that choose cluster_n enforce it
-       (batched_gemm_mxfp4._pick_cluster_n and its assert).
+    Peers must traverse matching tiles in the same order. N peers share an M
+    tile and skip it together. B masks include only expert-compatible M peers
+    and exclude partial M tails. The grid must fill every physical cluster:
+    ceil(N/tile_n) must be divisible by cluster_n, enforced by the host callers.
     """
     gemm_task, block, _kname, cluster_m, layout = build_gemm_a8w4_tdm_task(
         K=K,

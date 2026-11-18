@@ -14,7 +14,7 @@ from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
 
 from .dispatch_pull import make_pull_tile, pull_lds_row_pitch
 from .s1f_stage1 import (
-    CTL_CLUSTER_TICKETS, CTL_PHEAD, FLAG_M, FLAG_STRIDE, _trap, make_s1f_stage1,
+    FLAG_M, FLAG_STRIDE, _trap, make_s1f_stage1,
 )
 
 
@@ -32,8 +32,6 @@ def resolve_pull_cluster(
         reason = "initial consumers would form mixed producer/consumer clusters"
     elif cluster_m > 1 and align_m != tile_m:
         reason = "M alignment holes cannot participate in cross-M multicast"
-    elif CTL_CLUSTER_TICKETS + 2 * workers * 4 > CTL_PHEAD:
-        reason = "cluster tickets exceed reserved S1F control storage"
     return (1, 1, reason) if reason else (cluster_m, cluster_n, "")
 
 
@@ -77,8 +75,8 @@ def compile_s1f_pull(
     A flag tile belongs to one producer wave. That wave gathers and shuffles
     four M16 chunks, retires its stores, then publishes the original S1F flag.
     No cross-wave wait or fence is needed to publish a tile. Consumer scheduling,
-    entry tickets, and drain live in make_s1f_stage1. The 1x1 path retains task
-    prefetch hooks; optional consumer clusters use group readiness and claims.
+    entry tickets, and drain live in make_s1f_stage1. Both clustered and solo
+    consumers retain the same readiness and task-prefetch hooks.
     """
     if tile_m not in (64, 128, 256):
         raise ValueError("shared-consumer pull S1F requires M64/128/256")

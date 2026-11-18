@@ -435,7 +435,7 @@ expert96, topk=-1, merged into `/tmp/aiter_configs/tuned_grouped_fmoe.csv`.
 The32768 warmup lookup is not this step's selected row. GEMM2's wpt1 is correct.
 
 GEMM1 now uses256x256x256,2x2 waves,nb4,prefetch1,interleave1,wpt2;
-cluster4x2 falls back to1x1 as required by the explicit-tile S1F scheduler.
+cluster4x2 falls back to1x1 in these measurements, with consumer clustering disabled.
 GEMM2 remains256x256x256,2x2 waves,nb4,prefetch1,interleave1,wpt1,cluster1x4.
 Both kernels reserve327680B LDS. The S1F control block occupies unused planar
 B-alignment padding [181248,181504), beyond producer storage and GEMM C stores.
@@ -527,35 +527,71 @@ BENCH_PRODUCERS=96 bash /workspace/gpubench/s1f_pull_ratio_20261118/run.sh curre
 
 Enable with `DS41_CLUSTER=1 bash run_ds41_flash_best.sh`, or set `AITER_MEGA_S1F_PULL_CLUSTER=1` in a direct benchmark invocation. Default is 0. The normal GEMM1 CSV/environment cluster resolver supplies the shape; no CSV rows changed.
 
-## Role and queue contract
+## Implementation
 
-- Initial consumers remain consumers and form complete physical clusters. Both the grid and `workers - producers` must be divisible by cluster size; otherwise the request falls back to 1x1.
-- Producer TGs dispatch independently, retire their own stores and publish the existing full-K M64 flags. They retain only the original workgroup transition barriers, with no producer-side cluster barrier.
-- Once finished, a producer TG claims one GEMM tile at a time with A/B multicast disabled. Initial consumer clusters claim cluster_size tiles at a time from the same atomic head. Their static prefix and the shared dynamic range are disjoint.
-- Aligned consumer ranges map physical x/y members to matching N/M tiles. An unaligned range disables multicast for the whole group, because its coordinates cannot satisfy the peer-sharing contract. Physical consumer cluster membership and scheduling barriers remain intact.
-- Producer/GEMM readiness, full payload/scales, and the external source-ready kernel are unchanged. Consumers wait for their tile flags before GEMM. The current cluster path uses blocking group readiness and ticket broadcasts rather than the 1x1 consumer hook pipeline.
-- For 96 producers and 160 initial consumers, 4x2 means 20 initial consumer clusters. Producer TGs stay independent. Actual launch: grid 64x4=256 TGs, 128 threads/TG, 327680B LDS/TG.
-- Incomplete N groups, incompatible M alignment holes or insufficient reserved ticket space fall back to 1x1. Flash has 18 N tiles, so N4 requests fall back; I1024 validates actual 1x4 and 4x4.
+Initial consumers remain in complete physical clusters. The guard requires both
+workers and workers minus producers to be multiples of cluster size. No extra
+cluster barrier or cluster ticket broadcast surrounds GEMM. Both initial
+consumers and former producers retain the original a_ready/item_hooks pipeline.
+Producer dispatch, full-K M64 store/flag retirement, compact plan and source-ready
+kernels are unchanged. GEMM1 and GEMM2 both retain A preshuffle.
 
-## Final validation
+Tasks are assigned in whole aligned cluster units. With G=256, P=96 and
+cluster4x2, 20 consumer clusters own units c + 32*k (c=0..19). Independent former
+producers atomically claim individual tiles only from units 20..31 of each
+32-unit stripe, with multicast disabled. This partition covers every task once
+and prevents producer claims from breaking consumer cluster alignment. It does
+not support work stealing between the two roles; this is a scheduling difference
+from the unclustered dynamic queue, not an inherent cluster restriction.
 
-- Final queue: all actual 1x2/2x2/4x2/1x4/4x4 small H5120/I1024 checks plus mixed-role fallback passed.
-- Final queue: EP4 H5120/I2304/tpr16384 actual 4x2 passed; H7168/I1024/tpr17 actual 4x2 passed.
-- Checks compare four changing-input graph replays, hot/empty ranks, full output vs push and exact dispatched payload/scales/routing weights.
-- CPU audits cover physical roles, swizzled tile coverage, empty/tail cases, mixed-width atomic ranges and multicast alignment. The CPU recipe suite has 42 passing tests.
-- Three prelaunch reviews are saved per run. Every GPU app checked idle status immediately before launch, polling once per second. All accepted runs exited 0 with unchanged boot IDs; no hang was observed.
+The GEMM body uses the ordinary A/B workgroup masks, TDM waits and LDS pipeline.
+A shares across N peers, B across compatible M peers. Input readiness stays at
+the existing pre-A issue hook and next-task metadata/flag prefetch stays in the
+epilogue hooks. Each A issuer still checks readiness: the selected descriptor's
+early_timeout allows present requesters to proceed and latecomers to rebroadcast,
+so one TG's readiness check cannot safely gate every other requester's read.
+No new inter-TG readiness barrier is inserted. Inactive M-tail rows skip GEMM and
+advance their task stream; the ordinary GEMM masks exclude them from B multicast.
 
-## Performance
+## Validation
 
-EP4, tpr16384/global65536, E384, top6, H5120/I2304, balanced, 96 producers, 160 initial consumers, 8 layers, 5 warmups, 32 iterations. Both GEMMs use A preshuffle. Each row is one final-source run, averaged over four ranks. E2E is native median replay time / 8; stage intervals use HIP graph events and include event-boundary overhead. Stage columns do not sum to E2E.
+- 42 CPU recipe tests pass, including complete-role guards and fallback.
+- Independent CPU audit checks exhaustive disjoint role coverage, complete
+  cluster task units, physical M/N coordinates, shared-first rotation and tails.
+- EP4 small H5120/I1024 checks pass for actual 1x2, 2x2, 4x2, 1x4 and 4x4,
+  including incomplete-role fallback.
+- EP4 H5120/I2304/tpr16384 and H7168/I1024/tpr17 actual 4x2 pass.
+- Four changing-input graph replays compare output against push and check exact
+  dispatched payload, scales and routing weights, including hot/empty ranks.
+- Three prelaunch reviews and successful idle checks were recorded per run.
+  All runs exit 0 with unchanged boot IDs. No hang observed.
 
-| Initial consumer cluster | Plan+quant us | Ready us | GEMM1+producer us | GEMM2+scatter us | E2E/layer us |
+## Timing
+
+DSV4.1 Flash, EP4, tpr16384/global65536, E384, top6, H5120/I2304, balanced,
+96 producers/160 initial consumers, S1F pull, fused GEMM2, A preshuffle in both
+GEMMs, 8 layers, 5 warmups, 32 iterations. One run per configuration, averaged
+across four ranks. Native E2E is median replay / 8. Stage intervals are explicit
+HIP graph-event nodes and include boundary overhead; they do not sum to E2E.
+
+| Consumer cluster | Plan+quant us | Ready us | GEMM1+producer us | GEMM2+scatter us | E2E/layer us |
 |---|---:|---:|---:|---:|---:|
-| 1x1 | 38.66 | 12.43 | 561.30 | 594.79 | 1595.63 |
-| 1x2 | 39.15 | 12.62 | 621.44 | 598.13 | 1660.33 |
-| 2x2 | 38.50 | 12.20 | 648.13 | 596.51 | 1688.02 |
-| 4x2 | 38.68 | 12.08 | 682.53 | 595.86 | 1715.05 |
+| 1x1 | 40.26 | 12.87 | 560.19 | 597.30 | 1602.47 |
+| 1x2 | 38.67 | 12.31 | 697.28 | 597.08 | 1738.47 |
+| 4x2 | 39.81 | 12.34 | 787.18 | 595.50 | 1835.61 |
 
-Clustering is correct but regresses this Flash workload. The default remains 96 producers with cluster mode disabled. Extra group synchronization/ticket broadcasts, blocking readiness and unicast fallback for unaligned claims are present in the cluster path; these costs were not separately measured.
+Clustering remains opt-in/default off. Removing the old barriers does not recover
+performance with this fixed partition. The regression is in GEMM1; compact plan
+and GEMM2 remain close. Fixed role ownership and changed tile order may affect
+load balance and locality; their separate contributions have not been measured.
+Do not attribute this run to the deleted cluster barriers or disabled hooks.
 
-Producer ratio tuning is recorded in `/workspace/gpubench/s1f_pull_ratio_20261118/`: three runs each give 1609.81 -> 1601.36 us/layer and GEMM1 570.01 -> 561.39 us for 64 -> 96 producers, with cluster mode off. The later 1595.63 us unclustered run above is a separate measurement, not evidence of another kernel optimization.
+For historical comparison, commit 12b63e32e used mixed-width claims, four outer
+cluster barriers per continuing iteration and disabled GEMM hooks. It measured
+4x2 GEMM1=682.53 us, E2E=1715.05 us; that is a different scheduling implementation,
+not an isolated barrier toggle. Its logs remain in
+/workspace/gpubench/s1f_consumer_cluster_20261118/.
+
+
+Raw logs, source snapshots, commands, three prelaunch reviews and HIP-event data:
+`/workspace/gpubench/s1f_cluster_native_sync_20261118/`.

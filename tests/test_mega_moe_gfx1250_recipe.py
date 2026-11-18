@@ -580,7 +580,7 @@ def test_s1f_pull_complete_cluster_roles(cm, cn):
     ((4, 4, 256, 104, 16, 256, 256), "mixed producer/consumer"),
     ((4, 4, 256, 96, 18, 256, 256), "N tiles"),
     ((4, 2, 256, 96, 18, 128, 256), "M alignment"),
-    ((4, 2, 2048, 96, 18, 256, 256), "control storage"),
+    ((4, 8, 256, 96, 16, 256, 256), "unsupported physical"),
 ])
 def test_s1f_pull_incomplete_cluster_fallback(args, reason):
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250.s1f_pull import resolve_pull_cluster
