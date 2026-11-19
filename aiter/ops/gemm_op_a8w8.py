@@ -1242,6 +1242,28 @@ def gemm_a8w8_blockscale_bpreshuffle(
         # shuffled weight + column-major x_scale layout is a direct fit.
         # Deliberately checked BEFORE the FlyDSL availability gate so a
         # triton-tuned shape does not require FlyDSL to be installed.
+        if (
+            config is not None
+            and config["libtype"] == "triton"
+            and config.get("kernelName") == "gemm_afp8wfp8_preshuffle"
+        ):
+            from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
+                gemm_afp8wfp8_preshuffle as _gemm_afp8wfp8_preshuffle_gluon,
+            )
+
+            # Gluon MXFP8 kernel in 1x128 scale mode. The x_scale and WQ views give
+            # the layouts that it reads.
+            return _gemm_afp8wfp8_preshuffle_gluon(
+                XQ,
+                WQ.view(n // 16, k * 16),
+                x_scale.view(k // 128, m),
+                w_scale,
+                dtype=dtype,
+                y=Y,  # honor caller out= (zero-copy); Y = out or fresh empty
+                x_scale_group_size=128,
+                # DeepSeek-V4 uses 128x128. The wrapper rejects unsupported blocks.
+                w_scale_block_size=(n // w_scale.shape[-2], k // w_scale.shape[-1]),
+            )
         if config is not None and config["libtype"] == "triton":
             from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import (
                 gemm_afp8wfp8_block128_preshuffle as _gemm_afp8wfp8_block128_preshuffle_triton,
