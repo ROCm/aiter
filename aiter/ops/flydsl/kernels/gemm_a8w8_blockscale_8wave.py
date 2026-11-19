@@ -48,8 +48,6 @@ def compile_gemm_fp8_8wave(
     pid_swizzle=True,
     permlane_epilogue=True,
     preshuffle_b=False,
-    C_LDS_STAGE=True,
-    C_AUX=0,
 ):
     """Compile the half-M single-FIFO blockscale kernel with raw A/B DMA.
 
@@ -580,9 +578,19 @@ def compile_gemm_fp8_8wave(
             for half in range_constexpr(2)
         ]
 
-        def raw_g2s(src_iter, num_bytes, dst_base, half, ki):
+        def a_dma_rsrc(ki):
+            return dma_resource(
+                a_iter, a_num_bytes, fx.Int32(ki) * BLOCK_K * _elem_bytes
+            )
+
+        def b_dma_rsrc(ki):
             byte_offset = fx.Int32(ki) * BLOCK_K * _elem_bytes
-            rsrc = dma_resource(src_iter, num_bytes, byte_offset)
+            if const_expr(preshuffle_b):
+                # Each 16-row group stores its K tile as one 16x128-byte block.
+                byte_offset = byte_offset * 16
+            return dma_resource(b_iter, b_num_bytes, byte_offset)
+
+        def raw_g2s(rsrc, dst_base, half):
             for chunk in range_constexpr(BLOCK_M // 64):
                 dest_lds_m0 = _lds_byte_ptr(
                     dst_base,
@@ -617,16 +625,13 @@ def compile_gemm_fp8_8wave(
             ]
             lds_wave_offset = rocdl.readfirstlane(T.i32, (wave_id * 1024).ir_value())
 
-            def preshuffle_g2s(root_view, quadrant, ki, rsrc=None):
-                if const_expr(rsrc is None):
-                    byte_offset = fx.Int32(ki) * BLOCK_K * 16
-                    rsrc = dma_resource(b_iter, b_num_bytes, byte_offset)
+            def preshuffle_g2s(b_rsrc, root_view, quadrant):
                 for chunk in range_constexpr(2):
                     dest_lds_m0 = _lds_byte_ptr(
                         fx.get_iter(root_view), lds_wave_offset + chunk * 8192
                     )
                     rocdl.raw_ptr_buffer_load_lds(
-                        rsrc,
+                        b_rsrc,
                         dest_lds_m0,
                         fx.Int32(16),
                         preshuffle_slice_chunk_src_offsets[quadrant][chunk],
@@ -636,34 +641,27 @@ def compile_gemm_fp8_8wave(
                     )
 
         def async_copy_At(lds_idx, ki):
-            raw_g2s(a_iter, a_num_bytes, dma_aT_dst[lds_idx], 0, ki)
+            raw_g2s(a_dma_rsrc(ki), dma_aT_dst[lds_idx], 0)
 
         def async_copy_Ab(lds_idx, ki):
-            raw_g2s(
-                a_iter,
-                a_num_bytes,
-                dma_aB_dst[lds_idx],
-                1,
-                ki,
-            )
+            raw_g2s(a_dma_rsrc(ki), dma_aB_dst[lds_idx], 1)
 
-        def async_copy_Bl(lds_idx, ki, rsrc=None):
+        # b_rsrc: a descriptor prebuilt by b_dma_rsrc(ki), built here if None.
+        def async_copy_Bl(lds_idx, ki, b_rsrc=None):
+            if const_expr(b_rsrc is None):
+                b_rsrc = b_dma_rsrc(ki)
             if const_expr(preshuffle_b):
-                preshuffle_g2s(ldsB_l_rd[lds_idx], 0, ki, rsrc)
+                preshuffle_g2s(b_rsrc, ldsB_l_rd[lds_idx], 0)
             else:
-                raw_g2s(b_iter, b_num_bytes, dma_bL_dst[lds_idx], 0, ki)
+                raw_g2s(b_rsrc, dma_bL_dst[lds_idx], 0)
 
-        def async_copy_Br(lds_idx, ki, rsrc=None):
+        def async_copy_Br(lds_idx, ki, b_rsrc=None):
+            if const_expr(b_rsrc is None):
+                b_rsrc = b_dma_rsrc(ki)
             if const_expr(preshuffle_b):
-                preshuffle_g2s(ldsB_r_rd[lds_idx], 1, ki, rsrc)
+                preshuffle_g2s(b_rsrc, ldsB_r_rd[lds_idx], 1)
             else:
-                raw_g2s(
-                    b_iter,
-                    b_num_bytes,
-                    dma_bR_dst[lds_idx],
-                    1,
-                    ki,
-                )
+                raw_g2s(b_rsrc, dma_bR_dst[lds_idx], 1)
 
         rocdl.sched_barrier(0)
         async_copy_scale_a(lds_idx=0, ki=fx.Int32(0))
@@ -779,12 +777,12 @@ def compile_gemm_fp8_8wave(
 
                     if const_expr(m_slice == 0):
                         lds_rd_Br(tick)
-                        # Build k+2's B descriptor here, under this
-                        # reads-only half's LDS latency, not in the next
-                        # (critical) half that issues the B DMA.
-                        b_rsrc_k2 = dma_resource(
-                            b_iter, b_num_bytes, (ki + 2) * BLOCK_K * 16
-                        )
+                        # Preshuffled B builds k+2's descriptor under this
+                        # phase's LDS reads instead of in the next phase,
+                        # which issues the B DMA. Plain B is no faster with it.
+                        b_rsrc_k2 = None
+                        if const_expr(preshuffle_b):
+                            b_rsrc_k2 = b_dma_rsrc(ki + 2)
                     else:
                         async_copy_At(lds_idx=tick, ki=ki + 2)
 
@@ -806,7 +804,7 @@ def compile_gemm_fp8_8wave(
                     if const_expr(m_slice == 0):
                         # B survives in registers through slice1; its LDS
                         # slot is already free after slice0's reads.
-                        async_copy_Bl(lds_idx=tick, ki=ki + 2, rsrc=b_rsrc_k2)
+                        async_copy_Bl(lds_idx=tick, ki=ki + 2, b_rsrc=b_rsrc_k2)
                     else:
                         # Six k+2 A/B loads follow all k+1 loads; ScaleA(k+2)
                         # has not issued yet. W6 before BL[s1].begin lets
@@ -826,7 +824,7 @@ def compile_gemm_fp8_8wave(
                     end_compute_phase()
 
                     if const_expr(m_slice == 0):
-                        async_copy_Br(lds_idx=tick, ki=ki + 2, rsrc=b_rsrc_k2)
+                        async_copy_Br(lds_idx=tick, ki=ki + 2, b_rsrc=b_rsrc_k2)
                     else:
                         lds_rd_Bl(lds_idx=tock)
                         rocdl.sched_barrier(0)
@@ -966,67 +964,50 @@ def compile_gemm_fp8_8wave(
                             + wave_n * 16
                             + lane_group // 2 * 8
                         )
-                        byte_offset = (row * N + col) * 2
-                        if const_expr(N_tail):
-                            # N % 8 == 0: each eight-element store is fully in or out.
-                            byte_offset = (col < b_rows_left).select(
-                                byte_offset, fx.Int32(0x7FFFFFFF)
-                            )
                         # vector<4xi32> -> buffer_store_dwordx4:
                         # one 16-byte store per lane to C[row, col:col+8].
-                        if const_expr(C_LDS_STAGE):
-                            # Stage into the dead A/B ring (padded row pitch).
-                            _llvm.store(
-                                packed.ir_value(),
-                                _lds_byte_ptr(c_stage_base, row * C_PITCH + col * 2),
-                                alignment=16,
-                            )
-                        else:
-                            rocdl.raw_ptr_buffer_store(
-                                packed.ir_value(),
-                                c_store_rsrc,
-                                byte_offset.ir_value(),
-                                fx.Int32(0).ir_value(),
-                                aux=ir.IntegerAttr.get(T.i32, C_AUX),
-                            )
+                        # Stage into the dead A/B ring (padded row pitch).
+                        _llvm.store(
+                            packed.ir_value(),
+                            _lds_byte_ptr(c_stage_base, row * C_PITCH + col * 2),
+                            alignment=16,
+                        )
 
-            if const_expr(C_LDS_STAGE):
-                # All waves finished their final LDS reads and every
-                # speculative DMA into the A/B ring has landed.
-                rocdl.sched_barrier(0)
-                rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
-                rocdl.s_barrier()
-                rocdl.sched_barrier(0)
+            # All waves finished their final LDS reads and every
+            # speculative DMA into the A/B ring has landed.
+            rocdl.sched_barrier(0)
+            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+            rocdl.s_barrier()
+            rocdl.sched_barrier(0)
             store_c_quadrant(frag_C_tl, 0, 0)
             store_c_quadrant(frag_C_tr, 0, 1)
             store_c_quadrant(frag_C_bl, 1, 0)
             store_c_quadrant(frag_C_br, 1, 1)
-            if const_expr(C_LDS_STAGE):
-                rocdl.sched_barrier(0)
-                rocdl.s_waitcnt(lgkmcnt=0)
-                rocdl.s_barrier()
-                rocdl.sched_barrier(0)
-                # Each wave stores 32 whole rows: lanes 0-31 row r, 32-63 row
-                # r+1; each lane 8 contiguous bf16 -> 512 B per row run.
-                half = lane_id // 32
-                lcol = lane_id % 32 * 8
-                for it in range_constexpr(TILE_M // 8 // 2):
-                    srow = wave_id * (TILE_M // 8) + it * 2 + half
-                    v = _llvm.load(
-                        T.vec(4, T.i32),
-                        _lds_byte_ptr(c_stage_base, srow * C_PITCH + lcol * 2),
-                        alignment=16,
-                    )
-                    g_off = (srow * N + lcol) * 2
-                    if const_expr(N_tail):
-                        g_off = (lcol < b_rows_left).select(g_off, fx.Int32(0x7FFFFFFF))
-                    rocdl.raw_ptr_buffer_store(
-                        v,
-                        c_store_rsrc,
-                        g_off.ir_value(),
-                        fx.Int32(0).ir_value(),
-                        aux=ir.IntegerAttr.get(T.i32, C_AUX),
-                    )
+            rocdl.sched_barrier(0)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            rocdl.s_barrier()
+            rocdl.sched_barrier(0)
+            # Each wave stores 32 whole rows: lanes 0-31 row r, 32-63 row
+            # r+1; each lane 8 contiguous bf16 -> 512 B per row run.
+            half = lane_id // 32
+            lcol = lane_id % 32 * 8
+            for it in range_constexpr(TILE_M // 8 // 2):
+                srow = wave_id * (TILE_M // 8) + it * 2 + half
+                v = _llvm.load(
+                    T.vec(4, T.i32),
+                    _lds_byte_ptr(c_stage_base, srow * C_PITCH + lcol * 2),
+                    alignment=16,
+                )
+                g_off = (srow * N + lcol) * 2
+                if const_expr(N_tail):
+                    g_off = (lcol < b_rows_left).select(g_off, fx.Int32(0x7FFFFFFF))
+                rocdl.raw_ptr_buffer_store(
+                    v,
+                    c_store_rsrc,
+                    g_off.ir_value(),
+                    fx.Int32(0).ir_value(),
+                    aux=ir.IntegerAttr.get(T.i32, 0),
+                )
         else:
             assert (
                 N % TILE_N == 0
