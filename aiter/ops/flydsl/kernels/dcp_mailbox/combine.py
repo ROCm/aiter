@@ -5,13 +5,11 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64
 
 from aiter.ops.flydsl.kernels.communication_ops_utils import (
     CACHE_DEVICE,
-    EPOCH_MASK,
-    TaggedMailbox,
     buffer_load_i32,
     load_i64_from_buffer,
     tagged_peer_address,
@@ -19,6 +17,9 @@ from aiter.ops.flydsl.kernels.communication_ops_utils import (
     wave_uniform_i32,
 )
 from aiter.ops.flydsl.kernels.dcp_mailbox.common import (
+    BF16,
+    F32,
+    SentinelMailbox,
     bf2_f32,
     bf16_pair,
     finish,
@@ -50,6 +51,7 @@ def _row_empty(row, seqs, seq_lens, query_start_loc):
 @flyc.jit
 def _poll_combine(
     poll,
+    rearm,
     own_lse,
     own_data,
     ranks,
@@ -66,16 +68,26 @@ def _poll_combine(
     result_stride_head,
     result_lse,
 ):
-    """Poll one head from all ranks and store its LSE combine."""
+    """Poll one head from all ranks, store its LSE combine, and rearm the slots."""
     word = tid * 2
     own_slot = [
         (source * max_tokens + row) * heads + local_head for source in range(ranks)
     ]
     got = poll(
-        [(own_lse, own_slot[source], 1) for source in range(ranks)]
-        + [(own_data, own_slot[source] * words + word, 2) for source in range(ranks)],
+        [(own_lse, own_slot[source], 1, F32) for source in range(ranks)]
+        + [
+            (own_data, own_slot[source] * words + word, 2, BF16)
+            for source in range(ranks)
+        ],
         batch=2 * ranks,
     )
+    # Every thread polled every source's LSE: rearm them only once all have.
+    for source in range_constexpr(ranks):
+        rearm(own_data, own_slot[source] * words + word, 2)
+    gpu.barrier()
+    for source in range_constexpr(ranks):
+        if tid == source:
+            rearm(own_lse, own_slot[source], 1)
     lse_values = []
     for source in range_constexpr(ranks):
         value = got[source][0].bitcast(fx.Float32)
@@ -139,7 +151,7 @@ def _poll_combine(
             )
 
 
-def make_kernel(key, name, block_count, threads, layout, half_span, epoch_base):
+def make_kernel(key, name, threads, layout, half_span, epoch_base):
     """Create the specialized DCP combine kernel."""
     ranks = key.ranks
     heads = key.heads
@@ -165,6 +177,8 @@ def make_kernel(key, name, block_count, threads, layout, half_span, epoch_base):
         peers: Int64,
         rank: Int32,
         state: Int64,
+        tokens: Int32,
+        nblk: Int32,
     ):
         tid = fx.thread_idx.x
         block = fx.block_idx.x
@@ -183,14 +197,15 @@ def make_kernel(key, name, block_count, threads, layout, half_span, epoch_base):
         ]
         if const_expr(key.debug):
             push_epoch(block, tid, epoch, epoch_targets)
-        mailbox = TaggedMailbox(
-            epoch & fx.Int32(EPOCH_MASK),
+        mailbox = SentinelMailbox(
             debug=key.debug,
             epoch_addresses=epoch_sources,
             expected_epoch=epoch + 1,
             diagnostic=state,
         )
-        put, put_words, poll = mailbox.put, mailbox.put_words, mailbox.poll
+        # Bound methods, not the object: the runtime row check below becomes an
+        # scf.if, which can carry callables but not an arbitrary Python object.
+        put, poll, rearm = mailbox.put, mailbox.poll, mailbox.rearm
         data_targets = [
             tagged_shift(tagged_peer_address(peer, layout["data"][0]), parity_offset)
             for peer in peer_bases
@@ -208,7 +223,7 @@ def make_kernel(key, name, block_count, threads, layout, half_span, epoch_base):
         word = tid * 2
         for token_offset in range_constexpr(tile):
             row = first_row + token_offset
-            if row < key.tokens:
+            if row < tokens:
                 slot = (rank * max_tokens + row) * heads + local_head
                 out_buffer = ptr_buf_tensor(out, fx.Int32, unit_elems=2, unit_stride=1)
                 out_words = [
@@ -234,10 +249,11 @@ def make_kernel(key, name, block_count, threads, layout, half_span, epoch_base):
                     for destination in range(ranks)
                 ]
                 for destination in range_constexpr(ranks):
-                    put_words(
+                    put(
                         data_targets[destination],
                         slot * words + word,
                         [out_words[destination][0], out_words[destination][1]],
+                        BF16,
                     )
                 if const_expr(key.seqs > 0):
                     empty = _row_empty(row, key.seqs, seq_lens, qsl)
@@ -256,10 +272,12 @@ def make_kernel(key, name, block_count, threads, layout, half_span, epoch_base):
                         put(
                             lse_targets[destination],
                             slot,
-                            lse_values[destination],
+                            [lse_values[destination].bitcast(fx.Int32)],
+                            F32,
                         )
                 _poll_combine(
                     poll,
+                    rearm,
                     own_lse,
                     own_data,
                     ranks,
@@ -276,6 +294,6 @@ def make_kernel(key, name, block_count, threads, layout, half_span, epoch_base):
                     res_sh,
                     res_lse,
                 )
-        finish(tid, state, epoch, block_count)
+        finish(tid, state, epoch, nblk)
 
     return combine
