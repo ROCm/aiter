@@ -2,51 +2,53 @@
 
 ## Current acceptance checklist: 2026-11-19
 
+Tested code: `9a294c8c1661c5c69e8b75ea8c8ce7fdb7d977c8`.
 The [current contract](mono-persistent-validation.md#current-acceptance-contract-2026-11-19)
-supersedes the historical standalone-only scope and synthetic performance gate.
-The prior results below remain historical evidence, not a full mono pass.
+supersedes the historical scope. The full acceptance item does not pass.
 
 - [ ] Complete A03/A09 mono acceptance.
-- [ ] Real physical grid 16 x 16, fixed 256 TGs, 128 threads/TG and wave32.
-- [ ] Original task ownership `task = tg + j*256`, including batched paths.
+- [x] Both ops keep one original task per iteration at task count <= 256.
+- [x] Real standalone physical 16 x 16 grid, 256 TGs, 128 threads/TG, wave32.
+- [x] Original task ownership `task = tg + j*256`, including batched paths.
+- [x] All 108 UTs pass with no skips; prior tests remain. Native bytes,
+  input/weight integrity, guards and Graph replay pass in the covered cases.
+- [x] All 22 recorded real PS JIT variants avoid s104/s105 operands.
+- [x] Actual op activation loads use DEV and output payload/scale stores
+  use DEV + HT. Frozen native sources are unchanged.
+- [x] Final 22 unique target-shape timing cases, 15 trials each, hot/rotating,
+  common native/PS input pools and Graph method, no profiling during timing.
+- [ ] c16 no-regression: A03 fails (+7.18% hot, +2.83% rotating). A09 FP8
+  is inconclusive; QAT improves. Inconclusive does not establish equivalence.
+- [ ] c64/c128/c256 secondary acceptance: multiple regressions remain.
+- [ ] Every possible source-supported shape. The finite suite is coverage,
+  not a proof; wide-stride fallback builds have no GPU coverage yet.
 - [ ] All 256 TGs can reside together; idle TGs return to the caller's join.
-- [ ] All ops use the same 1 x 1 cluster geometry.
-- [ ] No op instruction reads or writes `s104/s105`; the actual call path
-  preserves the main kernel's values.
-- [ ] All handoff payload, scale and metadata stores use DEV + HT.
-- [ ] Activation loads/prefetches use DEV and follow the required join.
-- [ ] Main-kernel flags use DEV + HT stores and DEV + default RT loads.
-  Only wave0 lane0 publishes after all writers finish. All reader waves
-  converge. The all-DEV path adds no WB/INV.
-- [ ] Every source-supported shape keeps native output bytes, input/weight
-  integrity, guards and Graph behavior. Retain the existing 89 tests and add
-  new scheduling, model-shape and join coverage. No tolerance relaxation.
-- [ ] Primary performance gate: DSV4.1 c16 has no native regression under
-  the pinned model configuration, with actual shape/Graph provenance.
-- [ ] Secondary performance review: DSV4.1 c64, c128 and c256.
+- [ ] All ops use the same physical 1 x 1 cluster in the final fused launch.
+- [ ] Actual call/return preserves the main kernel's s104/s105 values.
+- [ ] Consumer loads follow the required join. Flag store/load scope and
+  writer completion, single-lane publication and reader convergence pass.
+- [ ] Actual TP4/EP4 model shape/Graph trace and model-path performance.
 
-Other shapes need correctness coverage only. Do not tune for their latency or
-use their regressions as an acceptance failure. Do not confuse concurrency
-with tensor rows or improvements over PS1 with native non-regression.
+Keep the measured candidate. A03 counts rows; A09 counts ceil(numel/1024).
+Do not force every task count into a four-task batch. Only target-model shapes
+are performance priorities; other shapes retain correctness coverage.
 
-The prior tested code is standalone. Its physical grid was `(256,1,1)`;
-four-task paths group adjacent original tasks and the A09 two-task path balances
-contiguous ranges. These mappings need alignment with the stated task rule.
-Actual JIT memory instructions omit explicit DEV/HT. The inspected instructions
-do not reference `s104/s105`, but a full call/return preservation check is absent.
-The new candidate corrects the grid and original task ownership, adds DEV/HT
-memory operations and limits SGPR allocation. Its 20 main and three wide-stride
-offline builds pass. Static PS operand checks pass. It has 108 collected tests,
-with GPU validation pending. See the candidate section in the validation guide.
-No new runtime pass or completed mono integration is claimed by this checklist.
+The ordinary-weight-load trial `e055dedfb` passed correctness but slowed A03.
+It is rejected by `9a294c8c1`, which restores the earlier measured source tree.
+The restored tree was tested again in full. No untested rollback is accepted.
+The final timing matrix is from one complete run, not best samples from
+multiple runs. All 22 cases have no foreign GPU PID in the 100 ms samples.
 
-Use the user's table as the mono contract. Connect and test the actual
-main-kernel return/join path. The model recipe and native baseline are confirmed:
-c16/c64 use TP4 + DSpark5; c128/c256 use EP4 + DP attention. Capture actual
-per-rank shapes before certifying c16/c64/c128/c256 performance. The old
-18-case and 108-case tables do not by themselves close either requirement.
-The current machine has only one visible GPU and cannot certify TP4/EP4 model
-performance. The shared GPU lock is held by another A/B task; preserve that job.
+The recipe/native baseline is confirmed: c16/c64 TP4 + DSpark5,
+c128/c256 EP4 + DP attention. Current measurements use source-derived full,
+balanced verify shapes. A03 c256 shares the measured c64 shape. One visible
+GPU cannot certify four-GPU model execution; the op data remain valid as
+isolated measurements. The main-kernel integration is still absent.
+
+Full report and evidence: `/home/weizhu15/workspace/mono-criteria-20261119`.
+See `REPORT.zh.md`, `final/performance-table.md`, `final/all-real-jit-audit.json`,
+`final/launch-current-gate.json`, `final/logs/`, and `round2/` for the rejected
+trial. The validation guide contains the full final performance table.
 
 ## Adaptive PS result: 2026-11-18
 

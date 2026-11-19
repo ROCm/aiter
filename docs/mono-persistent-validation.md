@@ -73,76 +73,116 @@ non-regression or invent an allowed slowdown. Repeat unresolved c16 evidence
 as needed. Model-level non-regression requires the model path to be exercised;
 an isolated op benchmark must be labeled as such.
 
-### Current evidence and open gates
+### Current measured result: 2026-11-19
 
-The prior tested code is `96826c2c50f69d50484d8e64a250d7793268ce9d`.
-Its 89 UT passes and previous timings apply only to that standalone code.
+Tested code: `9a294c8c1661c5c69e8b75ea8c8ce7fdb7d977c8`.
+The full acceptance item remains open. Correctness and standalone launch
+checks pass. The c16 A03 performance gate fails.
 
-- Verified in the prior run: 256 TGs, 128 threads/TG, strict UT coverage and
-  saved real JIT artifacts.
-- Prior code does not meet the new contract: its physical grid is one-dimensional;
-  batched task ownership differs from the original task sequence; the kernels
-  do not explicitly request DEV/HT for the handoff memory operations.
-- Still unverified: the full call ABI, reserved-register preservation across
-  calls, common cluster geometry, simultaneous residency, idle-TG joins and
-  model-level c16 non-regression. The inspected JIT operands do not use
-  `s104/s105`, but this alone is not a general ABI guarantee.
-- Needed to close the integration gates: the target main kernel and exact
-  mono specification/ABI revision, plus the target model configuration and
-  its actual shape/Graph trace.
+Keep the best measured candidate under the current contract. Both ops use
+one task per TG iteration when the task count is at most 256. A03 retains
+one task through 767 rows and four above that bound. A09 retains one/two/four
+tasks at the 256/512 bounds. These choices do not guarantee no regression.
+Do not replace a measured path with an untested fixed batch size.
 
-The overall A03/A09 mono acceptance item stays unchecked.
+The wrappers use physical `(16,16)` TG grids. Each batched task retains the
+original `tg + j*256` owner. Activation loads use DEV; all output payload and
+scale stores use DEV + HT. PS wrappers limit SGPR allocation with
+`amdgpu-num-sgpr=104`. Actual instruction operands are checked as well.
+Native and non-PS A03 sources are unchanged.
 
-### Candidate implementation: 2026-11-19
+All 108 GPU tests passed with zero skips. This retains the prior 89 tests
+and adds target rows and the DP-attention width. Byte comparisons, input and
+weight integrity, guards, scale cases and Graph replay pass. All 12 frozen
+native symbol hashes and 20 main offline builds pass. Three wide-stride
+fallback variants also compile; those fallback paths do not yet have GPU
+coverage. The earlier unsupported `gl.broadcast_to` failure and the SGPR
+violations before the allocation limit remain in the evidence directory.
 
-Scheduling commit: `367e16a74`. Memory and register commit: `aa2870cbb`.
-These commits are a candidate, not an accepted replacement.
+Real Graph profiling records 336 PS dispatches across eight kernel names.
+Every work-item grid is `(2048,16,1)` and every workgroup is `(128,1,1)`:
+16 x 16 TGs, 128 threads per TG, wave32. The full UT and Graph run saves
+22 actual PS JIT variants. None references s104/s105. All inspected activation
+loads use DEV, and all output stores use DEV + HT. Actual metadata has
+`num_ctas=1`. This does not verify the common cluster of a future fused launch.
+All selected PS paths have zero scratch spill. Resource counts do not prove
+simultaneous residency.
 
-The wrappers select `(16,16)` TG grids. Both ops flatten the TG id as `x+16*y`.
-One-, two- and four-task iterations use the original task sequence at stride
-256, including tails. A03 now uses its explicit-layout Gluon implementation
-for every PS batch size. Each row has a 64-bit base address. A wide column
-stride uses a 64-bit global-address path instead of truncating a buffer offset.
+A two-line weight-load trial (`e055dedfb`) changed A03 weights to ordinary
+loads. It passed 108 UTs but was slower. At c16 its hot median changed from
+1.569852 us native to 1.939973 us PS; rotating changed from 1.913189 to
+2.327549 us. Actual A03 B1 VGPR count rose from 61 to 74, and static
+instruction count rose from 342 to 361. Commit `9a294c8c1` reverts that trial.
+Its tree is identical to the earlier measured `892f22b4b`. The final tree was
+then tested again in full. No data from the slower trial is hidden.
 
-PS loads use the installed Triton descriptor API with `scope="gpu"`. PS output
-stores also use `CachePolicy(temporal="high")`. Legacy `.cg`, `.wb` and
-`evict_last` probes did not generate this combination. An aligned descriptor
-probe emitted 128-bit DEV loads and DEV + HT stores. These are offline probes,
-not a substitute for wrapper launch evidence. Native and non-PS math are
-unchanged; no framework package was changed.
+The user confirmed c16/c64 TP4 + DSpark5 and c128/c256 EP4 + DP attention,
+with native as the baseline. Source-derived full verify rows are 96/384/192/384;
+A09 widths are 2048/2048/8192/8192. DP rows assume a balanced batch. A03 uses
+shared storage with Q1280/KV512 views and row stride 1792. The c256 A03 case
+reuses the c64 measurement. These are isolated op measurements, not actual
+four-GPU model traces. See `model-shape-provenance.json` for source locations.
 
-The PS wrappers set `llvm_fn_attrs="amdgpu-num-sgpr=104"`. Before this limit,
-offline multirow A03 used the reserved SGPRs. With it, operand checks of the
-12 main PS builds and three wide-stride builds found no `s104/s105` access.
-Every global/buffer load in these builds has DEV scope; every output store
-has DEV + HT. Inspect actual JIT variants again before acceptance. Resource
-counts from unspecialized offline builds are not residency measurements.
+The final exclusive window was 2026-11-19 03:05:22 through 03:06:09 UTC.
+All 22 unique cases have 15 alternating native/PS trials, one shared input
+pool per case and the same Graph method. Profiling was off during timing.
+The shared GPU lock and a five-second idle gate were used. No foreign GPU
+PID was seen in the 100 ms samples for any final timing case. Sampling cannot
+exclude a shorter task between samples.
 
-The frozen hash check and all 20 main offline builds passed. Three wide-stride
-variants also compiled. Black and Ruff passed. Collection found 108 UT cases:
-the prior 89 plus 19 cases for the selected row counts and DP-attention width. New GPU correctness, real
-JIT/launch and performance results are pending. The failure log from the
-initial unsupported `gl.broadcast_to` call was saved before its local fix.
+Final measurements are below. Values are median / P10 / P90 in us.
+PS/native greater than one means slower. Use the stated noise rule; an
+inconclusive row is not proof of equivalence.
 
-The runner exposes one GPU. TP4/EP4 model runs require a suitable four-GPU
-environment. Its shared GPU lock is also held by another A/B task. The prepared
-validation chain waits for the lock and a five-second exclusive idle window.
-It first runs all UTs, then traces the Graph cases and checks the real op ISA.
-Only after those checks does it time the source-derived TP4 verify shapes
-for c16/c64/c128/c256, with 15 alternating trials and no profiler.
-The source-derived verify rows are 96/384/192/384; A09 widths are
-2048/2048/8192/8192. DP rows assume a balanced full batch. The c256 A03
-case reuses the c64 shape. `model-shape-provenance.json` records the sources
-and assumptions; an actual model trace is still needed to confirm coverage. Such isolated
-op results must not be reported as full-model non-regression.
+| Profile | Op | Input storage | Cache | Native median / P10 / P90 (us) | PS median / P10 / P90 (us) | PS/native | Decision |
+| --- | --- | --- | --- | ---: | ---: | ---: | --- |
+| c128-verify-proxy | a03 | [192, 1792] | hot | 1.630421 / 1.609686 / 1.672318 | 1.813660 / 1.804882 / 1.832563 | 1.112387 | regression |
+| c128-verify-proxy | a03 | [192, 1792] | rotating | 2.000277 / 1.992518 / 2.010591 | 2.108283 / 2.090597 / 2.122904 | 1.053996 | regression |
+| c128-verify-proxy | a09 | [192, 8192] | hot | 1.771914 / 1.765367 / 1.806087 | 2.450433 / 2.435325 / 2.469004 | 1.382930 | regression |
+| c128-verify-proxy | a09 | [192, 8192] | rotating | 2.543625 / 2.539411 / 2.553766 | 3.653580 / 3.650046 / 3.657656 | 1.436367 | regression |
+| c128-verify-proxy | a09-qat | [192, 8192] | hot | 1.525492 / 1.524571 / 1.536172 | 1.877733 / 1.868006 / 1.883597 | 1.230903 | regression |
+| c128-verify-proxy | a09-qat | [192, 8192] | rotating | 1.960629 / 1.959303 / 1.962539 | 2.558295 / 2.557087 / 2.560527 | 1.304834 | regression |
+| c16-verify-proxy | a03 | [96, 1792] | hot | 1.566726 / 1.557397 / 1.579537 | 1.679187 / 1.668888 / 1.693446 | 1.071781 | regression |
+| c16-verify-proxy | a03 | [96, 1792] | rotating | 1.913230 / 1.909461 / 1.918965 | 1.967319 / 1.957823 / 1.980313 | 1.028271 | regression |
+| c16-verify-proxy | a09 | [96, 2048] | hot | 1.398305 / 1.373869 / 1.444611 | 1.422293 / 1.406815 / 1.479777 | 1.017155 | inconclusive |
+| c16-verify-proxy | a09 | [96, 2048] | rotating | 1.701877 / 1.694562 / 1.724261 | 1.694866 / 1.672302 / 1.723398 | 0.995881 | inconclusive |
+| c16-verify-proxy | a09-qat | [96, 2048] | hot | 1.247919 / 1.243472 / 1.255294 | 1.226547 / 1.221013 / 1.241018 | 0.982874 | improvement |
+| c16-verify-proxy | a09-qat | [96, 2048] | rotating | 1.606013 / 1.605191 / 1.607560 | 1.596490 / 1.590440 / 1.598033 | 0.994071 | improvement |
+| c256-verify-proxy | a09 | [384, 8192] | hot | 2.778085 / 2.697536 / 2.894113 | 3.291468 / 3.237629 / 3.356923 | 1.184797 | regression |
+| c256-verify-proxy | a09 | [384, 8192] | rotating | 3.645972 / 3.632150 / 3.697716 | 5.542000 / 5.355763 / 5.572408 | 1.520033 | regression |
+| c256-verify-proxy | a09-qat | [384, 8192] | hot | 2.083562 / 2.063756 / 2.084862 | 2.630134 / 2.614614 / 2.637116 | 1.262326 | regression |
+| c256-verify-proxy | a09-qat | [384, 8192] | rotating | 2.708276 / 2.705739 / 2.709637 | 3.516237 / 3.514233 / 3.517834 | 1.298331 | regression |
+| c64-verify-proxy | a03 | [384, 1792] | hot | 1.784493 / 1.777990 / 1.819571 | 2.605750 / 2.589721 / 2.634008 | 1.460219 | regression |
+| c64-verify-proxy | a03 | [384, 1792] | rotating | 2.138024 / 2.120752 / 2.146905 | 3.030929 / 3.027107 / 3.033556 | 1.417631 | regression |
+| c64-verify-proxy | a09 | [384, 2048] | hot | 1.594527 / 1.590420 / 1.600424 | 1.657133 / 1.651747 / 1.672075 | 1.039263 | regression |
+| c64-verify-proxy | a09 | [384, 2048] | rotating | 2.400931 / 2.040275 / 2.448104 | 2.682670 / 2.242688 / 2.733188 | 1.117346 | inconclusive |
+| c64-verify-proxy | a09-qat | [384, 2048] | hot | 1.374938 / 1.373812 / 1.377627 | 1.362607 / 1.360615 / 1.366206 | 0.991032 | improvement |
+| c64-verify-proxy | a09-qat | [384, 2048] | rotating | 1.735767 / 1.733683 / 1.736753 | 1.774638 / 1.773583 / 1.775772 | 1.022394 | regression |
 
-Evidence and the resumable runner are in
-`/home/weizhu15/workspace/mono-criteria-20261119`. See `abi-static-final.json`,
-`compile-scoped-capped/`, `compile-wide-stride/`, `logs/`, `gpu-stage-events.jsonl`
-and `validate_current.py`. The main-kernel return/join path, flag protocol,
-common cluster geometry and simultaneous residency still need integration
-and runtime evidence. c128/c256 also need actual per-rank shape provenance;
-DP attention can change widths as well as row counts.
+There are 16 regressions, three inconclusive results and three improvements.
+c16 A03 regresses by 7.18% hot and 2.83% rotating. c16 A09 FP8 is inconclusive;
+c16 QAT improves. Secondary gains do not offset the primary A03 failure.
+
+At c16, A03 has 96 original tasks and A09 has 192. These are B1 paths; the
+slowdown cannot be explained as reducing thousands of active TGs to 256.
+Larger shapes add serial task batches and masked tail work. Cyclic A09 batches
+also place consecutive per-TG slots 512 KiB apart in BF16 input memory.
+DEV/HT, address work, batch size and register liveness can all affect latency.
+No cache or wave-residency counter measurement assigns a precise contribution
+to each factor. Do not state a measured TG-per-WGP occupancy from launch count.
+
+Evidence: `/home/weizhu15/workspace/mono-criteria-20261119`.
+See `REPORT.zh.md`, `final/performance-table.md`,
+`final/timing-process-audit.json`, `final/all-real-jit-audit.json`,
+`final/launch-current-trace/`, `final/logs/` and `jit-cache/`.
+The first run is at the directory root. The rejected weight trial is in
+`round2/`. All raw trials, JIT artifacts, failure logs and diffs are retained.
+
+Still unverified: the actual main-kernel call/return and register preservation,
+idle-TG joins, flag ordering, cross-TG producer/consumer visibility, common
+fused-launch cluster, simultaneous residency, and the TP4/EP4 model path.
+Standalone Graph replay is not join validation. The machine has one visible
+GPU. The op timing is valid evidence, but it does not certify the model path.
 
 ## Adaptive PS result: 2026-11-18
 
