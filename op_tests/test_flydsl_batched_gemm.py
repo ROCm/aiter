@@ -22,8 +22,9 @@ last k-tile); DeepSeek-V4.1's shared-expert down projection has K = 576 at TP4.
 
 On gfx1250 (the mxfp8_32 GEMM) and gfx950 (the bmm) this file also checks
 the fused quant epilogue: ``y_scale_out`` must be byte-identical to
-quantize_fp8 of the unfused bf16 output. gfx1250-strict runs that check and
-the compute kernelName cases alone.
+quantize_fp8 of the unfused bf16 output. On gfx1250, M above 1024 runs it on
+the compute-bound kernel. gfx1250-strict runs that check and the compute
+kernelName cases alone.
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
@@ -434,8 +435,8 @@ def test_batched_gemm_a8w8_compute(b, m, n, k, kernel_name, dtype=dtypes.bf16):
 
 def test_compute_operand_guards():
     """The compute route refuses dense A / C at batch > 1, which its per-batch
-    offsets would read and write out of bounds, and a fused quant it has no
-    epilogue for, before anything launches."""
+    offsets would read and write out of bounds, and a fused quant on a kernel
+    with no epilogue for it (persistent tiles here), before anything launches."""
     from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
         run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
     )
@@ -657,7 +658,7 @@ def main():
         shapes = (
             _fused_quant_shapes(args, include_ragged_m=False)
             if custom_shape
-            else [(2, m, 1024, 4096) for m in (16, 48, 128, 256)]
+            else [(2, m, 1024, 4096) for m in (16, 48, 128, 256, 1025, 2048)]
         )
         _run_fused_quant(shapes)
         return
