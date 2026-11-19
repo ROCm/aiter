@@ -148,8 +148,13 @@ def fused_gemm_a16w16_router_shared_expert_topk_v2(
     num_valid_rows: torch.Tensor | None = None,
     logits: torch.Tensor | None = None,
     shared: torch.Tensor | None = None,
+    prenorm: tuple | None = None,
 ):
-    """As ``fused_gemm_a16w16_router_shared_expert_topk``: ``(logits, shared, routed)``, bitwise the same."""
+    """As ``fused_gemm_a16w16_router_shared_expert_topk``: ``(logits, shared, routed)``, bitwise the same.
+
+    prenorm = (ssq, norm_weight, eps) (ATOM_FOLD_POSTNORM, <= 16 rows): x is the residual sum before the
+    post-attention RMSNorm, ssq (M, NSSQ power of two) fp32 its per-tile sums of squares, and w_router / w_gate_up
+    are pre-scaled by (1 + norm_weight) along K. Not bitwise the unfolded path (the norm moves past the GEMMs)."""
     from aiter.ops.triton._gluon_kernels.gfx1250.gemm.fused.fused_gemm_a16w16_router_shared_expert_topk_v2 import (
         _gemm_a16w16_router_shared_expert_topk_v2_kernel,
         _gemm_a16w16_router_shared_expert_topk_v2w_kernel,
@@ -179,10 +184,19 @@ def fused_gemm_a16w16_router_shared_expert_topk_v2(
         _gemm_a16w16_router_shared_expert_topk_v2_kernel if M <= MAX_ROWS
         else _gemm_a16w16_router_shared_expert_topk_v2w_kernel
     )
+    extra = {}
+    if prenorm is not None:
+        ssq, nw, eps = prenorm
+        nssq = ssq.shape[1]
+        assert M <= MAX_ROWS and nssq & (nssq - 1) == 0 and ssq.dtype == torch.float32 and nw.shape == (K,)
+        extra = {
+            "ssq_ptr": ssq, "nw_ptr": nw, "stride_sm": ssq.stride(0), "eps": float(eps), "NSSQ": nssq,
+            "PRENORM": 1,
+        }
     kernel[(P, 1, 1)](
         x, w_router, w_gate_up, w_down, logits, h, shared, ws, fws, lsc, nvr, tw, tid, rows, mm, ps,
         payload.view(torch.int32), scale.view(torch.int32), M, x.stride(0), logits.stride(0), h.stride(0),
         shared.stride(0), K=K, NR=n_router, NR_ROWS=nr_rows, NGU=ngu, ND=nd, ALIGN_M=align_m,
-        WMMA_REP=wmma_rep, HAS_NVR=has_nvr, **meta,
+        WMMA_REP=wmma_rep, HAS_NVR=has_nvr, **meta, **extra,
     )
     return logits, shared, (tw, tid, mm, rows, ps, payload, scale)

@@ -127,10 +127,24 @@ def _unit_acc(x_ptr, w_ptr, M, N, K: gl.constexpr, stride_xm, nb,
 
 
 @gluon.jit
+def _rstd_rows(ssq_ptr, stride_sm, M, eps, K: gl.constexpr, BLOCK_M: gl.constexpr, NSSQ: gl.constexpr,
+               NUM_WARPS: gl.constexpr, OUT: gl.constexpr):
+    """ATOM_FOLD_POSTNORM: the post-attention RMSNorm's 1 / rms of rows [0, BLOCK_M) from the producer GEMM's
+    per-tile sums of squares ssq[row, 0:NSSQ], in SliceLayout(1, OUT)."""
+    L: gl.constexpr = gl.BlockedLayout([1, 1], [1, 32], [NUM_WARPS, 1], [1, 0])
+    r = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, L))
+    c = gl.arange(0, NSSQ, layout=gl.SliceLayout(0, L))
+    v = gl.load(ssq_ptr + r[:, None] * stride_sm + c[None, :], mask=(r < M)[:, None], other=0.0)
+    rs = gl.rsqrt(gl.sum(v, axis=1) / K + eps)
+    return gl.convert_layout(rs, gl.SliceLayout(1, OUT))
+
+
+@gluon.jit
 def _route_tile_v2(
     u, x_ptr, logits_ptr, nvr_ptr, tw_ptr, tid_ptr, rows_ptr, mm_ptr, psum_ptr, pay_ptr, scale_ptr, fws_ptr,
     ws_ptr, lsc_ptr, M: gl.constexpr, stride_xm, LSC_STRIDE: gl.constexpr, ALIGN_M: gl.constexpr,
     WMMA_REP: gl.constexpr, HAS_NVR: gl.constexpr, NUM_WARPS: gl.constexpr, RPT: gl.constexpr,
+    ssq_ptr=None, nw_ptr=None, stride_sm=0, eps=0.0, NSSQ: gl.constexpr = 1, PRENORM: gl.constexpr = 0,
 ):
     """fold 1's route tile (topkGatingSoftmax<renorm> top-8, routing tables, MXFP4 activation quant to the
     grouped rows), bit for bit, with the handoffs above."""
@@ -148,6 +162,13 @@ def _route_tile_v2(
     qr = gl.arange(0, FEAT // 32, layout=gl.SliceLayout(1, QL))
     qc = gl.arange(0, 32, layout=gl.SliceLayout(0, QL))
     xv = gl.amd.gfx1250.buffer_load(x_ptr + t.to(gl.int64) * stride_xm, qr[:, None] * 32 + qc[None, :])
+    if PRENORM:
+        # x is the un-normalized residual sum: apply the post-attention RMSNorm (as _gluon_fused_rms_kernel)
+        PNL: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
+        sci = gl.arange(0, NSSQ, layout=PNL)
+        rs = gl.rsqrt(gl.sum(gl.load(ssq_ptr + t.to(gl.int64) * stride_sm + sci), axis=0) / FEAT + eps)
+        wv = gl.amd.gfx1250.buffer_load(nw_ptr, qr[:, None] * 32 + qc[None, :]).to(gl.float32) + 1.0
+        xv = (xv.to(gl.float32) * rs * wv).to(xv.dtype)
     amax = gl.max(gl.abs(xv.to(gl.float32)), axis=1)
     work = (amax * 0.16666667163372040).to(gl.int32, bitcast=True)  # * 1/6 (0x3E2AAAAB)
     bexp = (work >> 23) & 0xFF
@@ -294,7 +315,12 @@ def _gemm_a16w16_router_shared_expert_topk_v2_kernel(
     OP_B2: gl.constexpr, STORE1: gl.constexpr, TIMEOUT_NS: gl.constexpr, H_CACHE: gl.constexpr,
     LSC_STRIDE: gl.constexpr, ALIGN_M: gl.constexpr, WMMA_REP: gl.constexpr, HAS_NVR: gl.constexpr,
     RPT: gl.constexpr,
+    ssq_ptr=None, nw_ptr=None, stride_sm=0, eps=0.0, NSSQ: gl.constexpr = 1, PRENORM: gl.constexpr = 0,
 ):
+    # PRENORM (ATOM_FOLD_POSTNORM): x is the residual sum h + r, not its post-attention RMSNorm; ssq holds its
+    # rows' per-tile sums of squares (the producer GEMM's epilogue) and nw the norm weight. The router and gate/up
+    # weights come pre-scaled by (1 + nw) (the caller's), so x_norm @ W^T = rstd * (x @ W'^T): the units scale
+    # their accumulators by rstd; the route tiles normalize their row before the MXFP4 quant.
     KD: gl.constexpr = NGU // 2
     N_GU: gl.constexpr = NGU // ROWS_G
     N_R: gl.constexpr = (NR + ROWS_R - 1) // ROWS_R
@@ -325,19 +351,23 @@ def _gemm_a16w16_router_shared_expert_topk_v2_kernel(
     if pid < N_R:
         acc = _unit_acc(x_ptr, wr_ptr, M, NR_ROWS, K, stride_xm, pid, BLOCK_M, BLOCK_N1, BKT1, BLOCK_K1,
                         SHARED_A1, SHARED_B1, WMMA1, OP_A1, OP_B1, ROWS_R)
+        if PRENORM:
+            acc = acc * _rstd_rows(ssq_ptr, stride_sm, M, eps, K, BLOCK_M, NSSQ, NUM_WARPS, WMMA1)[:, None]
         _store_tile(acc, lsc_ptr, M, pid * ROWS_R + ROWS_R, LSC_STRIDE, zi, pid * ROWS_R, WMMA1, ".cg")
         _store_tile(acc, logits_ptr, M, gl.minimum(pid * ROWS_R + ROWS_R, NR), stride_lm, zi, pid * ROWS_R,
                     WMMA1, "")
     if pid < NQ:
         _route_tile_v2(pid, x_ptr, logits_ptr, nvr_ptr, tw_ptr, tid_ptr, rows_ptr, mm_ptr, psum_ptr, pay_ptr,
                        scale_ptr, fws_ptr, ws_ptr, lsc_ptr, M, stride_xm, LSC_STRIDE, ALIGN_M, WMMA_REP, HAS_NVR,
-                       NUM_WARPS, RPT)
+                       NUM_WARPS, RPT, ssq_ptr, nw_ptr, stride_sm, eps, NSSQ, PRENORM)
     # gate/up unit: h[:, g*HG : g*HG+HG] = silu(gate) * up (gate, up rounded to bf16 first, as
     # gemm_a16w16_gated), device-scope stores, then one arrival a wave
     g = pid - PQ0
     if (g >= 0) & (g < N_GU):
         acc = _unit_acc(x_ptr, wgu_ptr, M, NGU, K, stride_xm, g, BLOCK_M, BLOCK_N1, BKT1, BLOCK_K1,
                         SHARED_A1, SHARED_B1, WMMA1, OP_A1, OP_B1, ROWS_G)
+        if PRENORM:
+            acc = acc * _rstd_rows(ssq_ptr, stride_sm, M, eps, K, BLOCK_M, NSSQ, NUM_WARPS, WMMA1)[:, None]
         gate, up = gl.split(gl.reshape(acc, [BLOCK_M, HALF, 2]))
         gate = gate.to(h_ptr.type.element_ty).to(gl.float32)
         up = up.to(h_ptr.type.element_ty).to(gl.float32)
