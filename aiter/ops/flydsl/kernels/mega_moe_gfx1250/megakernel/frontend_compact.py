@@ -44,6 +44,7 @@ from .core import (
     SEG_STRIDE,
     _load_i32_dev,
     device_fn,
+    vdst_fence,
 )
 
 
@@ -390,6 +391,15 @@ def produce(kc, n_mine, n_routes):
                         )
                     )
                 scales.append(fx.Int32(e8m0) & fx.Int32(0xFF))
+            packed_v = []
+            for jj in range_constexpr(NG):
+                packed_v.append(
+                    vdst_fence(
+                        fx.Vector.from_elements(
+                            packed[4 * jj : 4 * jj + 4], dtype=fx.Int32
+                        )
+                    )
+                )
             sc_dw = []
             for jj in range_constexpr(NG):
                 w_ = fx.Int32(0)
@@ -426,9 +436,7 @@ def produce(kc, n_mine, n_routes):
                     )
                     for jj in range_constexpr(NG):
                         buffer_store(
-                            fx.Vector.from_elements(
-                                packed[4 * jj : 4 * jj + 4], dtype=fx.Int32
-                            ),
+                            packed_v[jj],
                             rsrc_row,
                             (lane + fx.Int32(jj * WAVE)) * fx.Int32(4),
                             cache_modifier=SCOPE_SYS,

@@ -138,6 +138,21 @@ PREF_DEPTH = 8
 RED_ELEMS = WAVE * 16
 
 
+def vdst_fence(v):
+    """``v`` once every VALU write has landed. The fp4 converts are inline
+    asm, so no VALU -> VMEM wait guards a store that reads their results;
+    without one the store can send a stale dword."""
+    return fx.Vector(
+        _llvm.inline_asm(
+            v.type,
+            [v.ir_value()],
+            "s_wait_alu depctr_va_vdst(0)",
+            "=v,0",
+            has_side_effects=True,
+        )
+    )
+
+
 def ctl_arena_bytes(*, npes: int, experts_per_rank: int) -> int:
     """Bytes of the arena's ``slots_ctl`` region: slot counters, then src_done,
     comb_flag (``FLAG_SPAN`` apart), started and reserved (one line per

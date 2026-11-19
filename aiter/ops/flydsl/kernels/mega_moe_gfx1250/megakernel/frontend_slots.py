@@ -45,6 +45,7 @@ from .core import (
     RT_N,
     RUN_STRIDE,
     device_fn,
+    vdst_fence,
 )
 
 
@@ -168,6 +169,13 @@ def produce(kc, n_mine):
                     )
                 )
             scales.append(fx.Int32(e8m0) & fx.Int32(0xFF))
+        packed_v = []
+        for jj in range_constexpr(NG):
+            packed_v.append(
+                vdst_fence(
+                    fx.Vector.from_elements(packed[4 * jj : 4 * jj + 4], dtype=fx.Int32)
+                )
+            )
         # Lane q < 8 packs the e8m0 bytes of groups 4q .. 4q+3 of each
         # 32-group slab into one dword.
         sc_dw = []
@@ -192,9 +200,7 @@ def produce(kc, n_mine):
             )
             for jj in range_constexpr(NG):
                 buffer_store(
-                    fx.Vector.from_elements(
-                        packed[4 * jj : 4 * jj + 4], dtype=fx.Int32
-                    ),
+                    packed_v[jj],
                     rsrc_row,
                     (lane + fx.Int32(jj * WAVE)) * fx.Int32(4),
                     cache_modifier=SCOPE_SYS,
