@@ -35,6 +35,10 @@ LDS_BYTES_GFX950 = 160 * 1024
 DUALWAVE_SWP_BLOCK_M = 256
 
 
+def _round_up_16(n):
+    return -(-n // 16) * 16
+
+
 def _waitcnt_vm_n(n):
     """Emit s_waitcnt vmcnt(n) only."""
     rocdl.s_waitcnt(vmcnt=n)
@@ -391,13 +395,15 @@ def _stagger_extra_barrier_if_one(stagger_i32):
 
 @dataclass(frozen=True)
 class _LdsViews:
-    """Peeked LDS arrays; ``o`` (bn64's O stage, overlaying kv/vt) and ``bt`` (paged default body) may be absent."""
+    """Peeked LDS arrays; ``o_lo``/``o_hi`` (bn64's O stage halves, overlaying kv/vt) and ``bt`` (paged default
+    body) may be absent."""
 
     kv: object
     vt: object
     q: object
     bt: object = None
-    o: object = None
+    o_lo: object = None
+    o_hi: object = None
 
 
 @dataclass(frozen=True)
@@ -646,12 +652,13 @@ def _make_dualwave_swp_fp8_traits(
     # BN64 loads Q straight into VGPRs: dropping the Q stage lets 3 WGs share a CU.
     qlds = head_dim <= 128 and body_variant != "conventional_bn64"
 
-    # bn64's SharedStorage overlays the staged O tile on kv+vt in a union, so the larger of the two counts.
+    # bn64's SharedStorage overlays one half of the staged O tile on kv and the other on vt, each in its own union.
     bn64 = body_variant == "conventional_bn64"
     o_stage_bytes = num_waves * rows_per_wave * head_dim_v * 2 if bn64 else 0
-    lds_bytes = max(
-        lds_kv_total_size * elem_bytes + vt_bf16_total * eb_bf, o_stage_bytes
-    )
+    # Every member is 16-byte aligned, so each struct field starts on a 16-byte boundary.
+    lds_bytes = _round_up_16(
+        max(lds_kv_total_size * elem_bytes, o_stage_bytes // 2)
+    ) + _round_up_16(max(vt_bf16_total * eb_bf, o_stage_bytes // 2))
     if qlds:
         lds_bytes += block_m * head_dim * elem_bytes
     # bn64 reads page ids with scalar loads; only the default body stages the table in LDS.
@@ -956,12 +963,13 @@ class DualwaveFp8KernelContext:
     def init_lds(self, shared_storage):
         st = fx.SharedAllocator().allocate(shared_storage)
         # A struct holding a union cannot be peeked whole (FlyDSL 0.5.0), so resolve each leaf.
-        if const_expr(hasattr(st, "u")):
+        if const_expr(hasattr(st, "ko")):
             lds = _LdsViews(
-                kv=st.u.kvvt.kv.peek(),
-                vt=st.u.kvvt.vt.peek(),
+                kv=st.ko.kv.peek(),
+                vt=st.vo.vt.peek(),
                 q=st.q.peek(),
-                o=st.u.o.peek(),
+                o_lo=st.ko.o.peek(),
+                o_hi=st.vo.o.peek(),
             )
         else:
             whole = st.peek()

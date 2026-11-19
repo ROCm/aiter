@@ -150,20 +150,23 @@ def build_flash_attn_dualwave_swp_fp8_module(
 
     elif traits.BODY_VARIANT == "conventional_bn64":
 
-        @fx.struct
-        class KvVtRing:
-            kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
-            vt: fx.Array[fx.BFloat16, traits.VT_BF16_TOTAL, 16]
-
-        # The staged O epilogue reuses the K/V ring once the last tile is consumed.
+        # The staged O epilogue overlays each half of its tile on one ring buffer once the last tile is consumed.
+        # Two unions keep kv and vt distinct LDS objects, so the backend keeps their alias scopes: a K/V DMA into
+        # one ring buffer does not serialise ds_reads of the other. Each O half stays in bounds of its own object.
         @fx.union
-        class RingOrOStage:
-            kvvt: KvVtRing
-            o: fx.Array[fx.Int8, traits.O_STAGE_BYTES, 16]
+        class KvOrOLo:
+            kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
+            o: fx.Array[fx.Int8, traits.O_STAGE_BYTES // 2, 16]
+
+        @fx.union
+        class VtOrOHi:
+            vt: fx.Array[fx.BFloat16, traits.VT_BF16_TOTAL, 16]
+            o: fx.Array[fx.Int8, traits.O_STAGE_BYTES // 2, 16]
 
         @fx.struct
         class SharedStorage:
-            u: RingOrOStage
+            ko: KvOrOLo
+            vo: VtOrOHi
             q: fx.Array[_lds_elem_dtype, _q_lds_elems, 16]
 
     else:

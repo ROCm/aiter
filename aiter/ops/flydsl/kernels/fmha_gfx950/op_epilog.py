@@ -79,16 +79,18 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
         return has_keys
 
     def _o_stage_layout(self):
-        """Byte offset of (packed row, 16-byte chunk) in the O stage: 256-byte rows, chunk XOR (row % 16).
+        """Byte offset of (packed row, 16-byte chunk) in one O stage half: 256-byte rows, chunk XOR (row % 16).
 
         A ds_write_b128 phase (16 rows, one chunk) and a ds_read_b128 phase (one row, 16 chunks) both hit all 64
         banks. The swizzle keys on the packed row, so it is the same for every group.
         """
         traits = self.traits
+        half_rows = traits.NUM_WAVES // 2 * traits.ROWS_PER_WAVE
+        assert half_rows % 16 == 0, half_rows
         return fx.make_composed_layout(
             fx.static(fx.SwizzleType.get(4, 4, 4)),
             fx.make_layout(
-                (traits.BLOCK_M, traits.HEAD_DIM_V * 2 // 16),
+                (half_rows, traits.HEAD_DIM_V * 2 // 16),
                 (traits.HEAD_DIM_V * 2, 16),
             ),
         )
@@ -101,18 +103,25 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
         """
         traits = self.traits
         o_stage = self._o_stage_layout()
-        lds_i8 = fx.recast_iter(
-            fx.PointerType.get(fx.Int8.ir_type, fx.AddressSpace.Shared, alignment=16),
-            self.lds.o.ptr,
-        )
-        wave_row0 = fx.Int32(self.wave_id_uni) * fx.Int32(traits.ROWS_PER_WAVE)
+        # Waves [0, NUM_WAVES/2) stage their rows in the half overlaying kv, the rest in the half overlaying vt.
+        # Rows are relative to the half; BLOCK_M/2 is a multiple of 16, so the row % 16 swizzle is unchanged.
+        is_hi = self.wave_id_uni >= traits.NUM_WAVES // 2
+        # ptrtoint/select/inttoptr: FlyDSL 0.5.0 has no pointer select. Epilogue only; the hot loop keeps its scopes.
+        p_i8 = fx.PointerType.get(fx.Int8.ir_type, fx.AddressSpace.Shared, alignment=16)
+        lo_addr = fx.Int32(fx.ptrtoint(self.lds.o_lo.ptr))
+        hi_addr = fx.Int32(fx.ptrtoint(self.lds.o_hi.ptr))
+        lds_i8 = fx.inttoptr(p_i8, is_hi.select(hi_addr, lo_addr))
+        wave_row0 = (
+            fx.Int32(self.wave_id_uni)
+            - is_hi.select(fx.Int32(traits.NUM_WAVES // 2), fx.Int32(0))
+        ) * fx.Int32(traits.ROWS_PER_WAVE)
         has_keys = self._row_has_keys(q_row)
         packs = [
             [self._packed_o_128_vec(v_o, dc, g) for g in range_constexpr(2)]
             for dc in range_constexpr(traits.D_CHUNKS)
         ]
-        # The stage is the `o` arm of the union overlaying the K/V ring (kv/vt), which other waves may still be
-        # reading for the last tile; the ring is dead only after this waitcnt + barrier. vmcnt(0) drains
+        # Each stage half is the `o` arm of a union overlaying one ring buffer (kv or vt), which other waves may
+        # still be reading for the last tile; the ring is dead only after this waitcnt + barrier. vmcnt(0) drains
         # this wave's LDS DMAs (tracked by vmcnt, not lgkmcnt): an empty segment issues tile 0's K/V DMA and runs
         # no loop, so nothing else guarantees it landed before the stage overwrites it. The loop path issues no
         # prefetch on its last tile, so the wait is already satisfied there.
