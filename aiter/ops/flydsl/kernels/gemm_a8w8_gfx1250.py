@@ -16,6 +16,8 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.utils.lds_capacity import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
+    fclamp_f32,
+    fmin_f32,
     make_lds_copy_ops,
     pipeline_fence,
     pipeline_fence_signal,
@@ -1444,8 +1446,8 @@ def launch_gemm_a8w8(
                 # (the up clamp stays f32 there too);
                 # x * rcp(1 + exp(-x)), times up, rounded to bf16.
                 if const_expr(act_clamp):
-                    g = fx.Float32(fx.minnumf(g, lim)).to(out_cls).to(fx.Float32)
-                    u = fx.Float32(fx.maxnumf(fx.minnumf(u, lim), nlim))
+                    g = fx.Float32(fmin_f32(g, lim)).to(out_cls).to(fx.Float32)
+                    u = fclamp_f32(u, nlim, lim)
                 e = fx.Float32(fx.exp(-g))
                 sig = fx.Float32(rocdl.rcp(T.f32, _raw_f32(one + e)))
                 return fx.Float32(g * sig * u).to(out_cls).to(fx.Float32)

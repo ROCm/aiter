@@ -30,8 +30,9 @@ pipelined K loop (kernelName suffix ``_pl``) writes the single-fence loop's
 (``_nopl``) output bit for bit (PIPELINED_CASES), and that the gate_up GEMM
 with the fused SwiGLU + MXFP8 epilogue (run_gate_up_silu_mxfp8_32_gfx1250 and
 the registered op gate_up_silu_mxfp8_32) matches the bf16 GEMM + silu_and_mul
-+ quantize_fp8 chain: scales exact, e4m3 codes at most one step apart in a
-negligible fraction, for every tile bucket and swiglu_limit 10, 0 and 5.02.
++ quantize_fp8 chain: scales exact, e4m3 codes at most one step apart and in
+each case at most max(2, 1/10000 of its codes), for every tile bucket and
+swiglu_limit 10, 0 and 5.02.
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
@@ -734,12 +735,18 @@ def _run_gate_up_silu():
         bad_pick = any(p is not None for p in picks)
     cases = list(itertools.product(GATE_UP_SILU_MS, GATE_UP_SILU_LIMITS))
     res = [test_gate_up_silu_fused(m, n2, k, limit) for m, limit in cases]
-    total = n2 // 2 * sum(m for m, _ in cases)
     scale_bad = sum(r[0] for r in res)
-    code_bad = sum(r[1] for r in res)
     far = sum(r[2] for r in res)
-    # Isolated one-step e4m3 differences only (far below the MXFP8 noise).
-    if bad_pick or not res or scale_bad or far or code_bad * 10000 > total:
+    # Isolated one-step e4m3 differences only (far below the MXFP8 noise),
+    # allowed per case: at most max(2, 1/10000 of the case's codes).
+    one_step_bad = [
+        (m, limit, r[1])
+        for (m, limit), r in zip(cases, res)
+        if r[1] > max(2, m * (n2 // 2) // 10000)
+    ]
+    for m, limit, n in one_step_bad:
+        print(f"gate_up silu M={m} limit={limit}: {n} one-step e4m3 codes, over budget")
+    if bad_pick or not res or scale_bad or far or one_step_bad:
         print(f"gate_up silu fused epilogue mismatched (picker wrong: {bad_pick})")
         raise SystemExit(1)
     print(f"gate_up silu fused epilogue OK ({len(res)} cases)")
