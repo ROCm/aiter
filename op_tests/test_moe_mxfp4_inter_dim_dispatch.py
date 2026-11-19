@@ -39,16 +39,22 @@ def _stage_backend(fn):
 
 
 def _tuned_key(
-    inter_dim=INTER_DIM, activation=ActivationType.Swiglu, q_dtype_a=dtypes.bf16
+    inter_dim=INTER_DIM,
+    activation=ActivationType.Swiglu,
+    q_dtype_a=dtypes.bf16,
+    *,
+    model_dim=MODEL_DIM,
+    experts=E,
+    topk=TOPK,
 ):
     return (
         fused_moe_module.get_gfx_runtime(),
         fused_moe_module.get_cu_num(),
         TOKEN,
-        MODEL_DIM,
+        model_dim,
         inter_dim,
-        E,
-        TOPK,
+        experts,
+        topk,
         str(activation),
         str(dtypes.bf16),
         str(q_dtype_a),
@@ -224,6 +230,35 @@ A4W4_ROW = {
 }
 
 
+def _collect_warnings(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(
+        fused_moe_module.logger,
+        "warning",
+        lambda message: warnings.append(str(message)),
+    )
+    return warnings
+
+
+def _a16w4_discards(warnings):
+    return [w for w in warnings if "discarding a16w4 FlyDSL tuned config" in w]
+
+
+def _a16w4_call_tensors(tokens=TOKEN, experts=4, topk=2, model_dim=256, inter_dim=256):
+    """Uninitialized CPU inputs of a small a16w4 MoE call: bf16 activations and
+    preshuffled fp4x2 weights, enough to reach the tuned-row lookup."""
+    w1 = torch.empty((experts, 2 * inter_dim, model_dim // 2), dtype=dtypes.fp4x2)
+    w2 = torch.empty((experts, model_dim, inter_dim // 2), dtype=dtypes.fp4x2)
+    w1.is_shuffled = w2.is_shuffled = True
+    return (
+        torch.empty((tokens, model_dim), dtype=dtypes.bf16),
+        w1,
+        w2,
+        torch.ones((tokens, topk), dtype=torch.float32),
+        torch.zeros((tokens, topk), dtype=torch.int32),
+    )
+
+
 def _dispatch_tuned(
     monkeypatch,
     row,
@@ -234,19 +269,14 @@ def _dispatch_tuned(
 ):
     key = _tuned_key(A16W4_INTER, activation, q_dtype_a)
     monkeypatch.setattr(fused_moe_module, "cfg_2stages", ({key: row}, {}))
-    warnings = []
-    monkeypatch.setattr(
-        fused_moe_module.logger,
-        "warning",
-        lambda message: warnings.append(str(message)),
-    )
+    warnings = _collect_warnings(monkeypatch)
     try:
         meta = _dispatch(
             inter_dim=A16W4_INTER, activation=activation, q_dtype_a=q_dtype_a, **call
         )
     finally:
         get_2stage_cfgs.cache_clear()
-    return meta, [w for w in warnings if "discarding a16w4 FlyDSL tuned config" in w]
+    return meta, _a16w4_discards(warnings)
 
 
 @_SKIP
@@ -355,23 +385,78 @@ def test_fused_moe_impl_passes_block_size_to_the_row_lookup(
         raise _Lookup
 
     monkeypatch.setattr(fused_moe_module, "get_2stage_cfgs", spy)
-    experts, topk, tokens, model_dim, inter_dim = 4, 2, 4, 256, 256
-    w1 = torch.empty((experts, 2 * inter_dim, model_dim // 2), dtype=dtypes.fp4x2)
-    w2 = torch.empty((experts, model_dim, inter_dim // 2), dtype=dtypes.fp4x2)
-    w1.is_shuffled = w2.is_shuffled = True
+    hidden, w1, w2, weights, ids = _a16w4_call_tensors(tokens=4)
     with pytest.raises(_Lookup):
         fused_moe_module._fused_moe_impl(
-            torch.empty((tokens, model_dim), dtype=dtypes.bf16),
+            hidden,
             w1,
             w2,
-            torch.ones((tokens, topk), dtype=torch.float32),
-            torch.zeros((tokens, topk), dtype=torch.int32),
+            weights,
+            ids,
             activation=ActivationType.Swiglu.value,
             quant_type=QuantType.per_1x32.value,
             block_size_M=block_size_M,
             dtype=dtypes.bf16,
         )
     assert seen == [want]
+
+
+# fused_moe_2stages takes the sorted inputs and their block size from the caller, so
+# its own lookup must see that size, with no fused_moe and no metadata transform.
+@_SKIP
+@pytest.mark.parametrize(
+    ("block_size_M", "want", "n_discards"),
+    [(32, "cktile", 1), (16, "flydsl", 0)],
+    ids=["32", "16"],
+)
+def test_fused_moe_2stages_selects_by_block_size(
+    monkeypatch, block_size_M, want, n_discards
+):
+    experts, topk, model_dim, inter_dim = 4, 2, 256, 256
+    key = _tuned_key(
+        inter_dim,
+        model_dim=model_dim,
+        experts=experts,
+        topk=topk,
+    )
+    monkeypatch.setattr(fused_moe_module, "cfg_2stages", ({key: A16W4_ROW}, {}))
+    warnings = _collect_warnings(monkeypatch)
+    seen = []
+
+    def lookup(*args, **kwargs):
+        meta = get_2stage_cfgs(*args, **kwargs)
+        seen.append((_stage_backend(meta.stage1), _stage_backend(meta.stage2)))
+        raise _Lookup
+
+    monkeypatch.setattr(fused_moe_module, "get_2stage_cfgs", lookup)
+    get_2stage_cfgs.cache_clear()
+    hidden, w1, w2, weights, ids = _a16w4_call_tensors(
+        experts=experts, topk=topk, model_dim=model_dim, inter_dim=inter_dim
+    )
+    try:
+        # `ids` stands in for the sorted inputs: the lookup raises before they are read.
+        with pytest.raises(_Lookup):
+            fused_moe_module.fused_moe_2stages(
+                hidden,
+                w1,
+                w2,
+                topk,
+                ids,
+                weights,
+                ids,
+                ids,
+                torch.empty_like(hidden),
+                True,
+                block_size_M,
+                activation=ActivationType.Swiglu,
+                quant_type=QuantType.per_1x32,
+                q_dtype_a=dtypes.bf16,
+                q_dtype_w=dtypes.fp4x2,
+            )
+    finally:
+        get_2stage_cfgs.cache_clear()
+    assert seen == [(want, want)]
+    assert len(_a16w4_discards(warnings)) == n_discards
 
 
 @_SKIP

@@ -6889,6 +6889,7 @@ def fused_moe_2stages(
         config_file=_metadata_config_file,
         input_dtype=hidden_states.dtype,
         _has_input_activation_scales=a1_scale is not None,
+        block_size_M=block_size_M,
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
