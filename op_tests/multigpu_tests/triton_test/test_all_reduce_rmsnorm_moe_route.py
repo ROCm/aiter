@@ -397,7 +397,13 @@ def _check_timeout(rank, device, tp, failures):
 def _check_max_tokens(rank, device, tp, failures):
     """The constructor rejects a max_tokens that leaves no free CTA for a call. When it
     accepts a max_tokens, a call with that many tokens is correct. 300 tokens use a
-    512-row bucket: at 2 ranks it needs all 256 CTAs."""
+    512-row bucket: at 2 ranks it needs all 256 CTAs. The constructor also rejects a shape
+    that needs more LDS than a CU has: 2048 experts at hidden 8192 need 304 KiB."""
+    try:
+        AllReduceRmsnormMoeRoute(tp.cpu_group, 64, 8192, 2048, 8).close()
+        failures.append(f"rank {rank}: a shape that needs 304 KiB of LDS was accepted")
+    except AssertionError:
+        pass
     shape = SHAPES[0]
     hidden, e, k, fp32 = shape[:4]
     gen = torch.Generator(device=device).manual_seed(5)

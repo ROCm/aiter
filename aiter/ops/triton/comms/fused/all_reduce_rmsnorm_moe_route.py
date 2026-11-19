@@ -10,6 +10,7 @@ import triton
 from aiter.ops.triton._gluon_kernels.gfx950.comms.fused.all_reduce_rmsnorm_moe_route import (
     _all_reduce_rmsnorm_moe_route_kernel,
 )
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -60,6 +61,27 @@ def _plan_layout(c):
     c.scratch_words = c.scp + c.s1max * 2 * c.topk
 
 
+def _lds_bytes(c, tokens):
+    """The LDS bytes of the kernel variant of a call with this many tokens, with a correction
+    bias. The compiler reuses LDS between the router, route and sort stages, so the largest
+    stage sets the size. Keep it in step with the kernel's allocations."""
+    t = 64 * c.num_warps
+    e = c.num_experts
+    ep = triton.next_power_of_2(e + 1)
+    rtmax = triton.next_power_of_2(triton.cdiv(c.routed_rows(tokens), 16))
+    router = rtmax * c.num_warps * 16 * 16 * 4
+    # partial logits, then logits; selection values and bias only above 256 experts
+    kep = triton.next_power_of_2(triton.cdiv(c.kp * e, t) * t)
+    route = 4 * (kep + (3 if e > 256 else 1) * ep)
+    rows = max(32, triton.next_power_of_2(tokens))
+    bmn = triton.next_power_of_2(e * triton.cdiv(rows, 32))
+    pkn = triton.next_power_of_2(max(rows * c.topk, t))
+    pre = bmn * 8 + pkn * 8 <= 98304  # the kernel's PRE
+    # bitmaps, word prefix counts, counts, offsets, picks; scan scratch a warp
+    sort = 4 * (bmn * (2 if pre else 1) + 2 * ep + 2 * pkn + min(c.num_warps, ep // 64))
+    return max(router, route, sort)
+
+
 class AllReduceRmsnormMoeRoute:
     """
     The IPC buffers, scratch and launch colours of ``fused_all_reduce_rmsnorm_moe_route``
@@ -69,6 +91,10 @@ class AllReduceRmsnormMoeRoute:
     reduce-scatter and all-gather inboxes (2 halves each, for odd and even launches) and the
     exchange of the top-k picks. The constructor, ``reset`` and ``close`` are collective: all
     ranks of the group must call them.
+
+    The kernel must fit in the 160 KiB of LDS of a CU for each token count up to max_tokens.
+    The constructor rejects the other shapes. Many experts, a large topk and a large max_tokens
+    increase the LDS.
 
     Args:
         group: The CPU (gloo) process group of the ranks.
@@ -124,6 +150,12 @@ class AllReduceRmsnormMoeRoute:
         assert routed < self.blocks, (
             f"max_tokens={max_tokens}: a call can need {routed} reduce CTAs, but "
             f"there are {self.blocks} CTAs and the pushes need one more"
+        )
+        lds = max(_lds_bytes(self, t) for t in self.warmup_tokens())
+        lds_cap = arch_info._LDS_CAP_BYTES["gfx950"]
+        assert lds <= lds_cap, (
+            f"a call can need {lds} bytes of LDS, but a gfx950 CU has {lds_cap}: "
+            "use fewer experts, a smaller topk or a smaller max_tokens"
         )
         self.scratch = torch.zeros(
             self.scratch_words, dtype=torch.int64, device=self.device
@@ -358,9 +390,10 @@ def fused_all_reduce_rmsnorm_moe_route(
         moe_buf, as aiter.moe_sorting returns them. Every rank gets all rows.
 
     Limits: gfx950, 2, 4 or 8 ranks, hidden a multiple of 64 up to 8192, experts a multiple of
-    16 up to 2048, topk up to 64, tokens 1 to comm.max_tokens (at most 512). All CTAs of the
-    launch must run at the same time. If a wait times out, the outputs are wrong and
-    ``comm.error()`` is not 0. Then call ``comm.reset()`` on all ranks.
+    16 up to 2048, topk up to 64, tokens 1 to comm.max_tokens (at most 512). The kernel must
+    fit in the LDS of a CU: ``AllReduceRmsnormMoeRoute`` rejects the shapes that do not fit.
+    All CTAs of the launch must run at the same time. If a wait times out, the outputs are
+    wrong and ``comm.error()`` is not 0. Then call ``comm.reset()`` on all ranks.
     """
     tokens, hidden = x.shape
     e, k = comm.num_experts, comm.topk
