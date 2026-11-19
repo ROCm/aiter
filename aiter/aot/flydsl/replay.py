@@ -444,16 +444,13 @@ def _replay_batch(module_name: str, jobs: list[dict], kernel_name: str) -> dict:
 
 
 def _batches(jobs: list[dict]) -> list[list[dict]]:
-    """Jobs in runs of at most ``_JOBS_PER_WORKER``, short enough to occupy
-    every worker, neighbours (which share kernels and tuned-table lookups)
-    together, runs in a stable shuffle so that no two workers start on the
-    same kernels."""
+    """Jobs in runs of at most ``_JOBS_PER_WORKER``, neighbours (which share
+    kernels and tuned-table lookups) together, runs in a stable shuffle so
+    that no two workers start on the same kernels."""
     ordered = sorted(jobs, key=lambda job: repr(sorted(job.items())))
-    workers = get_max_workers(len(jobs))
-    per_worker = max(1, min(_JOBS_PER_WORKER, -(-len(jobs) // workers)))
     batches = [
-        ordered[start : start + per_worker]
-        for start in range(0, len(ordered), per_worker)
+        ordered[start : start + _JOBS_PER_WORKER]
+        for start in range(0, len(ordered), _JOBS_PER_WORKER)
     ]
     batches.sort(key=lambda batch: zlib.crc32(repr(batch[0]).encode()))
     return batches

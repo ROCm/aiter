@@ -36,11 +36,6 @@ def run_python_ops_for_real(enabled: bool) -> bool:
     return previous
 
 
-def python_ops_run_for_real() -> bool:
-    """Whether run_python_ops_for_real is on."""
-    return _python_ops_real
-
-
 def is_torch_equal_or_newer(target: str) -> bool:
     """Check if the installed torch version is >= the target version.
 

@@ -296,12 +296,10 @@ Running the AOT dry run with `AITER_FLYDSL_AOT_CACHE=1` and a fixed
 `AITER_FLYDSL_AOT_CACHE_DIR` therefore prebuilds `.o` files for a target arch
 on any machine. The dry run's fingerprint equals the one a process on that
 arch computes, so the runtime hits them without tracing.
-
-Ops routed through `torch.ops.aiter_routed` (`aiter/plugin`) register a fake
-that the dry run would execute instead of the op. Their fake now runs the
-Python body while `run_python_ops_for_real` is on
-(`torch_guard.python_ops_run_for_real()`), as `torch_compile_guard` ops do,
-so the replay reaches FlyDSL for them too.
+Ops routed through `torch.ops.aiter_routed` (`aiter/plugin`) are the
+exception: under the dry run's `FakeTensorMode` their registered fake runs
+instead of the op, so the replay never reaches FlyDSL for them and they are
+not prebuilt. This predates the cache and is left to a separate change.
 
 ## 5. Validated cases
 
