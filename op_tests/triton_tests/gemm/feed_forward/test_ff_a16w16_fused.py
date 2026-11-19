@@ -48,7 +48,7 @@ def _gated_config_exceeds_lds(batch, hidden_dim, intermediate_dim):
     from aiter.ops.triton.utils._triton.arch_info import get_arch
 
     return (
-        "gfx950" in (get_arch() or "")
+        get_arch() == "gfx950"
         and batch <= 64
         and intermediate_dim == 8192
         and hidden_dim in (1280, 8192)

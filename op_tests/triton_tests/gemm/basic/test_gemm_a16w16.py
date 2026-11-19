@@ -224,7 +224,7 @@ def test_gemm_a16_w16_atomic_accumulate(M: int, N: int, K: int, strided):
     """accumulate=True adds X @ W^T into y in place, like torch.addmm_."""
     from aiter.ops.triton.utils._triton.arch_info import get_arch
 
-    if N % 16 != 0 and "gfx942" in (get_arch() or ""):
+    if N % 16 != 0 and get_arch() == "gfx942":
         pytest.skip(
             "On gfx942 the accumulate config for N % 16 != 0 needs more than 64 KB of LDS"
         )
