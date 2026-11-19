@@ -60,10 +60,6 @@ def _lds_byte_ptr(ptr, byte_offset):
     )
 
 
-def _lds_ptr(dtype, ptr, offset):
-    return fx.add_offset(fx.recast_iter(dtype, ptr), fx.make_int_tuple(offset))
-
-
 def compile_gemm_fp8_8wave(N, K, preshuffle_b=False):
     """Compile the half-M single-FIFO blockscale kernel with raw A/B DMA.
 
@@ -924,13 +920,26 @@ def compile_gemm_fp8_8wave(N, K, preshuffle_b=False):
         c_stage_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), out_dtype)
         c_store_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_dtype)
 
+        # Each staged block: 32 C rows with a padded row pitch, split into
+        # 8-column pieces indexed [row, col // 8].
+        c_stage_pieces = [
+            fx.flat_divide(
+                fx.make_view(
+                    fx.recast_iter(out_dtype, ptr),
+                    fx.make_layout(
+                        (C_ROWS_PER_TILE, TILE_N), (c_stage_pitch_bytes // 2, 1)
+                    ),
+                ),
+                (1, 8),
+            )
+            for ptr in c_rows_ptrs
+        ]
+        # This WG's C tile in 8-column pieces, also indexed [row, col // 8].
+        c_pieces = fx.flat_divide(C, (1, 8))
+
         def c_stage_view(c_tile, row_in_tile, col):
             # C[row, col:col+8] staged in LDS; col is a multiple of 8.
-            offset = row_in_tile * (c_stage_pitch_bytes // 2) + col
-            return fx.make_view(
-                _lds_ptr(out_dtype, c_rows_ptrs[c_tile], offset),
-                fx.make_layout(8, 1),
-            )
+            return c_stage_pieces[c_tile][0, None, row_in_tile, col // 8]
 
         def store_c_quadrant(c_frag, quadrant_m, quadrant_n):
             for row_repeat in range_constexpr(fragment_mode_1_repeat):
@@ -1030,17 +1039,13 @@ def compile_gemm_fp8_8wave(N, K, preshuffle_b=False):
                 c_src = c_stage_view(c_tile, row_in_tile, lane_col)
                 staged = fx.make_fragment_like(c_src)
                 fx.copy(c_stage_copy_atom, c_src, staged)
-                c_off = c_row * N + lane_col
+                c_dst = c_pieces[0, None, c_row, lane_col // 8]
+                pred = None
                 if const_expr(N_tail):
-                    # N % 8 == 0, so each 8-column store is wholly in or
-                    # out. 2**30 elements is 2**31 bytes, past this WG's
-                    # C bound (asserted < 2**31), so the buffer drops it.
-                    c_off = (lane_col < b_rows_left).select(c_off, fx.Int32(2**30))
-                c_dst = fx.make_view(
-                    fx.add_offset(fx.get_iter(C), fx.make_int_tuple(c_off)),
-                    fx.make_layout(8, 1),
-                )
-                fx.copy(c_store_copy_atom, staged, c_dst)
+                    # N % 8 == 0, so each 8-column piece is wholly in or out.
+                    pred = fx.make_rmem_tensor(1, fx.Boolean)
+                    pred[0] = lane_col < b_rows_left
+                fx.copy(c_store_copy_atom, staged, c_dst, pred=pred)
 
     @flyc.jit
     def launch_gemm(
