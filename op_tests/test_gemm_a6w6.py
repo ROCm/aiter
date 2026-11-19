@@ -32,17 +32,17 @@ SPECIALIZED_CASES = (
     (
         (9450, 5120, 5120),
         "_ZN5aiter44f6gemm_bf16_per1x32Fp6_m9472_n5120_k5120_m82E",
-        "f6gemm_dmabig_kernel_func",
+        "_ZN5aiter29f6gemm_bf16_per1x32Fp6_dmabigE",
     ),
     (
         (9450, 13824, 5120),
         "_ZN5aiter45f6gemm_bf16_per1x32Fp6_m9472_n13824_k5120_m82E",
-        "f6gemm_dmabig_kernel_func",
+        "_ZN5aiter29f6gemm_bf16_per1x32Fp6_dmabigE",
     ),
     (
         (9450, 5120, 13824),
         "_ZN5aiter45f6gemm_bf16_per1x32Fp6_m9472_n5120_k13824_m82E",
-        "f6gemm_dmabig_allk_kernel_func",
+        "_ZN5aiter34f6gemm_bf16_per1x32Fp6_dmabig_allkE",
     ),
 )
 SPECIALIZED_SQUARE_KERNEL = SPECIALIZED_CASES[0][1]
@@ -161,13 +161,17 @@ def test_specialized_dispatch_matches_safe_kernel(
     (
         (
             (257, 513, 129),
-            "f6gemm_dmabig_swz0_kernel_func",
+            "_ZN5aiter34f6gemm_bf16_per1x32Fp6_dmabig_swz0E",
             DMABIG_DS_SWZ0_KERNEL,
         ),
-        ((513, 784, 1152), "f6gemm_dmabig_kernel_func", DMABIG_DS_KERNEL),
+        (
+            (513, 784, 1152),
+            "_ZN5aiter29f6gemm_bf16_per1x32Fp6_dmabigE",
+            DMABIG_DS_KERNEL,
+        ),
         (
             (256, 256, 6273),
-            "f6gemm_dmabig_swz0_kernel_func",
+            "_ZN5aiter34f6gemm_bf16_per1x32Fp6_dmabig_swz0E",
             DMABIG_DS_SWZ0_KERNEL,
         ),
     ),
