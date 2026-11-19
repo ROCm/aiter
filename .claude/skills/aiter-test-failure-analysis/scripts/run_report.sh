@@ -5,7 +5,7 @@ REPO="${1:-${GITHUB_REPOSITORY:-ROCm/aiter}}"
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK_DIR="${AITER_TEST_FAILURE_WORKDIR:-$(mktemp -d "${RUNNER_TEMP:-/tmp}/aiter-test-failure.XXXXXX")}"
 SUMMARY_FILE="${GITHUB_STEP_SUMMARY:-${WORK_DIR}/summary.md}"
-AGENT="${AITER_TEST_FAILURE_AGENT:-claude-glm}"
+AGENT="${AITER_TEST_FAILURE_AGENT:-${AITER_REVIEW_AGENT:-claude-glm}}"
 AGENT_TIMEOUT="${AITER_TEST_FAILURE_AGENT_TIMEOUT:-1800}"
 LOOKBACK="${AITER_TEST_FAILURE_LOOKBACK:-120}"
 RUN_ID="${AITER_TEST_FAILURE_RUN_ID:-}"
@@ -23,8 +23,20 @@ fi
 
 python3 "$SKILL_DIR/scripts/collect_aiter_test_failure.py" "${args[@]}"
 
+echo "Selected analysis agent: ${AGENT}"
+if [ -n "${AITER_TEST_FAILURE_AGENT:-}" ]; then
+  echo "Agent source: AITER_TEST_FAILURE_AGENT"
+elif [ -n "${AITER_REVIEW_AGENT:-}" ]; then
+  echo "Agent source: AITER_REVIEW_AGENT"
+else
+  echo "Agent source: default claude-glm"
+fi
+if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
+  echo "ANTHROPIC_BASE_URL is set"
+fi
+
 REPORT="$WORK_DIR/fallback_report.md"
-if [ -s "$WORK_DIR/prompt.md" ] && command -v "$AGENT" >/dev/null 2>&1; then
+if [ -s "$WORK_DIR/prompt.md" ] && { [ -x "$AGENT" ] || command -v "$AGENT" >/dev/null 2>&1; }; then
   set +e
   env -u GH_TOKEN -u GITHUB_TOKEN timeout "$AGENT_TIMEOUT" \
     "$AGENT" -p --dangerously-skip-permissions "$(cat "$WORK_DIR/prompt.md")" \

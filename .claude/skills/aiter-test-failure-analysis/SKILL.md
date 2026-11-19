@@ -21,7 +21,8 @@ Environment knobs:
 
 - `AITER_TEST_FAILURE_RUN_ID`: analyze a specific workflow run id instead of scanning.
 - `AITER_TEST_FAILURE_LOOKBACK`: recent Aiter Test runs to scan; default `120`.
-- `AITER_TEST_FAILURE_AGENT`: headless analysis agent; default `claude-glm`.
+- `AITER_TEST_FAILURE_AGENT`: headless analysis agent; default is `AITER_REVIEW_AGENT`
+  from the runner environment, then `claude-glm`.
 - `AITER_TEST_FAILURE_AGENT_TIMEOUT`: agent timeout in seconds; default `1800`.
 - `AITER_TEST_FAILURE_SKIP_DOWNLOADS=1`: skip log/artifact downloads for dry runs.
 - `GITHUB_STEP_SUMMARY`: summary output file; GitHub Actions provides this.

@@ -10,7 +10,12 @@ New code should use :mod:`aiter.ops.mla_sparse_prefill`: ``mla_sparse_prefill`` 
 import torch
 
 from ..jit.utils.torch_guard import torch_compile_guard
-from .mla_sparse_prefill import _mla_sparse_prefill_routed, _opus_sparse_prefill_v4
+from .mla_sparse_prefill import (
+    _mla_sparse_prefill_routed,
+    _mla_sparse_prefill_v4_routed,
+    _opus_sparse_prefill_v4,
+    _v4_auto_tries_asm,
+)
 from .opus.mla import (
     opus_mla_v4_prefill_a8w8_gfx950_fwd as pa_sparse_prefill_fp8_gfx950_opus_fwd,
 )
@@ -150,8 +155,17 @@ def pa_sparse_prefill_fp8_opus(
     softmax_scale: float,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """:func:`aiter.ops.mla_sparse_prefill.mla_sparse_prefill_v4` on the opus backend."""
-    return _opus_sparse_prefill_v4(
+    """:func:`aiter.ops.mla_sparse_prefill.mla_sparse_prefill_v4` on the opus backend.
+
+    Writes ``out`` when given and returns it either way. Where the default
+    backend choice is opus anyway -- off gfx1250, without a sink, or with a head
+    count the asm kernel does not take -- this enters the routed
+    ``mla_sparse_prefill_v4`` layer, so a provider serving that contract serves
+    callers of this name. Where the default would try asm first, it runs opus
+    directly, as it always did: the pin then names a different kernel than the
+    routed layer would run.
+    """
+    args = (
         q_nope,
         q_rope,
         unified_kv_nope,
@@ -166,6 +180,9 @@ def pa_sparse_prefill_fp8_opus(
         softmax_scale,
         out,
     )
+    if not _v4_auto_tries_asm(q_nope, attn_sink, None):
+        return _mla_sparse_prefill_v4_routed(*args)
+    return _opus_sparse_prefill_v4(*args)
 
 
 __all__ = [
