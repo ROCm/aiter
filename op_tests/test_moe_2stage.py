@@ -2875,10 +2875,15 @@ def test_plain_fp8_swiglu_limit_dispatch():
         # Without a limit, 64+ per_Token tokens take ASM 1-stage.
         for limit in (7.0, 5.0):
             md = dispatch(token, q, limit)
-            name = md.stage1.keywords.get("kernelName", "")
-            assert md.stage1.func is fused_moe_mod.ck_moe_stage1, (q, token, limit)
             assert not md.run_1stage and int(md.ksplit or 0) == 0, (q, token, limit)
-            assert not name or ("_silu_" in name and "Splitk" not in name), name
+            if md.stage1 is None:
+                # #8178: on gfx942 per-token FP8 + clamped SiLU the FlyDSL
+                # backend takes over (full_impl), so stage1 is None.
+                assert md.full_impl is not None, (q, token, limit)
+            else:
+                name = md.stage1.keywords.get("kernelName", "")
+                assert md.stage1.func is fused_moe_mod.ck_moe_stage1, (q, token, limit)
+                assert not name or ("_silu_" in name and "Splitk" not in name), name
         absent = dispatch(token, q, None)
         for limit in (0.0, float("inf")):
             md = dispatch(token, q, limit)
