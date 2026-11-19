@@ -691,6 +691,27 @@ def per_1x32_mx_quant_hip(
         )
         return y, scale
 
+    # MXFP8 with row-major e8m0 scales is `per_group_quant` at group 32: the same
+    # buffers and the same kernel call, so the routed op runs it.
+    if (
+        quant_dtype == dtypes.fp8
+        and scale_type == dtypes.fp8_e8m0
+        and not shuffle
+        and scale is None
+        and not hadamard_rotate
+    ):
+        return _per_group_quant_routed(
+            x,
+            None,
+            dtypes.fp8,
+            32,
+            False,
+            num_rows,
+            num_rows_factor,
+            dtypes.fp8_e8m0,
+            False,
+        )
+
     # Per-dtype defaults / validation.
     if quant_dtype == dtypes.fp4x2:
         assert n % 2 == 0
