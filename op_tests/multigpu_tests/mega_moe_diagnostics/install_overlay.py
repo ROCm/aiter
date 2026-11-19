@@ -34,7 +34,7 @@ def install():
         original_init(self, dispatch)
         if not self.fused:
             return
-        assert not self.ready_first and not self.packed and self.producer_group == 1
+        assert not self.ready_first and not self.packed and not self.unique and self.producer_group == 1
         cap = dispatch.compact.cap
         flags, m_tiles = (cap + 63) // 64, (cap + 255) // 256
         words = flags * 16 + m_tiles * 18 * 4 * 20

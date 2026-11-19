@@ -27,8 +27,18 @@ def check(config):
     """Reject unsupported pull wire/layout combinations before allocation."""
     if not enabled(config):
         return
+    unique = os.environ.get("AITER_MEGA_PULL_UNIQUE", "0") == "1"
     packed = os.environ.get("AITER_MEGA_PULL_PLAN_PACK", "0") == "1"
     source_shuffle = os.environ.get("AITER_MEGA_PULL_SRC_SHUFFLE", "0") == "1"
+    if unique and (
+        packed
+        or source_shuffle
+        or os.environ.get("AITER_MEGA_S1F_PULL", "0") != "1"
+        or os.environ.get("AITER_MOE_S1F_READY_FIRST", "0") == "1"
+        or os.environ.get("AITER_MOE_S1F_TILE_READY", "1") != "0"
+        or os.environ.get("AITER_MOE_S1F_PRODUCER_GROUP", "1") != "1"
+    ):
+        raise ValueError("unique pull requires unpacked external-ready S1F and M64 flags")
     if source_shuffle and not packed:
         raise ValueError("source-rank shuffle requires packed pull")
     if packed and (
@@ -90,6 +100,9 @@ def regions(config, geometry):
         extra["ep_linear_base"] = config.world_size * config.experts_per_rank * 4
         extra["ep_linear_tiles"] = ((geometry.cap + 255) // 256) * 4
         extra["ep_linear_slots"] = geometry.max_routes * 4
+    if os.environ.get("AITER_MEGA_PULL_UNIQUE", "0") == "1":
+        extra["pull_unique_routes"] = (geometry.max_routes + 1) * 4
+        extra["pull_unique_counts"] = ((geometry.cap + 63) // 64) * 4
     return extra
 
 
@@ -122,6 +135,7 @@ class PullDispatch:
         if self.ready_queue and not self.ready_first:
             raise ValueError("ready queue requires pull S1F with READY_FIRST=1")
         self.src_rank_shuffle = os.environ.get("AITER_MEGA_PULL_SRC_SHUFFLE", "0") == "1"
+        self.unique = os.environ.get("AITER_MEGA_PULL_UNIQUE", "0") == "1"
         self.linear_store = linear_combine.enabled(config)
         self.packed = os.environ.get("AITER_MEGA_PULL_PLAN_PACK", "0") == "1"
         if self.packed and (not self.fused or self.ready_first or self.producer_group != 1):
@@ -134,7 +148,14 @@ class PullDispatch:
         device = dispatch.res.total_recv.device
         routes = geo.max_routes
         segments = config.world_size * config.experts_per_rank
-        self.tok_map = torch.empty(routes, dtype=torch.int32, device=device)
+        if self.unique:
+            from ..arena import _from_gpu_ptr
+            self.tok_map = _from_gpu_ptr(
+                self.arena.local_ptr("pull_unique_routes"), (routes + 1,), torch.int32
+            )
+            self.tok_map.fill_(-1)
+        else:
+            self.tok_map = torch.empty(routes, dtype=torch.int32, device=device)
         self.block_hist = torch.empty(16 * segments, dtype=torch.int32, device=device)
         self.send_base = torch.empty(
             segments, dtype=torch.int32, device=device,
@@ -243,7 +264,8 @@ class PullDispatch:
             quant_row_stride=geo.wire_row,
             quant_payload_bytes=config.dispatch_token_nbytes,
             pull=True,
-            write_tok_map=self.packed,
+            write_tok_map=self.packed or self.unique,
+            unique_routes=self.unique,
             pull_pack=self.packed,
             pull_src_shuffle=self.src_rank_shuffle,
             linear_capacity=linear_combine.capacity(config) if self.linear_store else 0,
@@ -321,7 +343,7 @@ class PullDispatch:
                 recv_bound=step.recv_bound,
                 align_m=step.align_m,
                 rows=step.rows,
-                a_preshuffled=True,
+                a_preshuffled=not self.unique,
             ),
         )
 
@@ -335,8 +357,11 @@ class PullDispatch:
 
         if kw.get("bias") is not None or not kw.get("stage1_quant_out"):
             raise ValueError("pull S1F requires bias-free fused activation/quant")
-        if not kw.get("a_preshuffled") or not kw.get("row_major_ascale"):
-            raise ValueError("pull S1F requires preshuffled A and row-major scales")
+        if (
+            bool(kw.get("a_preshuffled")) != (not self.unique)
+            or not kw.get("row_major_ascale")
+        ):
+            raise ValueError("pull S1F input layout disagrees with its producer")
         config, step = self.config, self.dispatch._step
         producers = int(os.environ.get("AITER_MEGA_S1F_PULL_PRODUCERS", "64"))
         from aiter.ops.flydsl.grouped_gemm_mxfp4 import (
@@ -434,6 +459,13 @@ class PullDispatch:
             "ready_queue": self.ready_queue,
             "cluster_local": self.cluster_local,
             "producer_group": self.producer_group,
+            "unique_pull": self.unique,
+            "off_unique_routes": (
+                self.arena.offset("pull_unique_routes") if self.unique else 0
+            ),
+            "off_unique_counts": (
+                self.arena.offset("pull_unique_counts") if self.unique else 0
+            ),
             "packed_input": self.packed,
             "src_rank_shuffle": self.src_rank_shuffle,
             "packed_wave_load": self.src_rank_shuffle

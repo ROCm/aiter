@@ -308,6 +308,7 @@ def compile_tdm_compact_plan(
     off_packed: int = 0,
     off_pack_done: int = 0,
     pull_src_shuffle: bool = False,
+    unique_routes: bool = False,
     linear_capacity: int = 0,
     off_linear_base: int = 0,
     off_linear_tiles: int = 0,
@@ -630,6 +631,13 @@ def compile_tdm_compact_plan(
         def lsa(peer, off):
             return win_base + fx.Int64(peer) * win_stride + fx.Int64(off)
 
+        if const_expr(unique_routes):
+            if (bid == 0) & (tid == 0):
+                header = fx.inttoptr(
+                    fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
+                    addr_tok_map + fx.Int64(max_routes) * 4,
+                )
+                fx.generic_store(header, inp_cur_tok)
         rsrc_idx = create_buffer_resource_from_addr(addr_inp_idx)
         rsrc_map = create_buffer_resource_from_addr(addr_tok_map)
         rsrc_bhist = create_buffer_resource_from_addr(addr_block_hist)

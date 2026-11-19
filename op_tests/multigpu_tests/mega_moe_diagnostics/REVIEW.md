@@ -49,3 +49,47 @@ Linear GEMM2 three-pass prelaunch review:
 3. Feature defaults off, requires source shuffle and bf16 fused combine.
    Run small then full changing-input correctness before timings. Push reference
    explicitly disables linear store. Idle gate and boot-ID timeout remain.
+
+Unique pull three-pass review (2026-11-19):
+1. One wave owns one (source rank, M16 source-token interval); ownership is
+   disjoint across producer slots. The symmetric route map has max_routes+1
+   words, with a current-token-count header. Invalid tail lanes never issue a
+   payload read; all route destinations come from the existing bounded plan.
+   LDS has four M16 slices at the existing 64*n+4 DWORD row pitch. One loaded
+   payload/scale is reused for every matching local expert, with 64-bit offsets.
+2. Existing external-ready waits for the complete source plan/quant, including
+   the route-map writes. The ready kernel resets local per-M64 row counters.
+   Each wave retires all fan-out stores before AcqRel agent RMWs. The last row
+   acquires all prior writer releases and publishes the existing SYS A flag.
+   Consumers, combine barrier and producer-to-consumer transition are retained.
+3. Default off; restrict to external-ready, unpacked S1F, M64 flags and group1.
+   First small changing-input test, then full EP4. Compare outputs, exact bytes,
+   maps and completion counts. Native/HIP event timing only after correctness.
+   Idle gate, one-second polling and boot/timeout guards remain unchanged.
+
+Unique row-major follow-up, three prelaunch review passes:
+1. Address/layout: one wave owns M16 unique source tokens; for each token,
+   adjacent lanes load/store adjacent 16B K vectors. Global payload offset is
+   destination_row * payload_bytes + vector * 16. Scale rows remain contiguous.
+   Destination IDs are broadcast from that token's lane before fan-out. Tail
+   tokens and dropped routes remain masked; no new source-token permutation.
+2. Synchronization: both gathers complete before LDS reads. All M16 fan-out
+   stores retire before the original per-route completion RMW/release chain.
+   Counters still count rows, not vectors; the last writer publishes M64 ready.
+3. Consumers: ExpertGrouping and fused GEMM1 both select a_preshuffled=0.
+   The existing grouped wrapper propagates that layout to the quantized GEMM1
+   output and GEMM2 input. Tests decode dispatched bytes as row-major. Run small
+   and full changing-input checks, then matching baseline/hybrid HIP timings.
+
+Row-major payload TDM scatter follow-up, three review passes:
+1. The existing indexed-store API writes two groups of8 LDS rows per top-k
+   route. Global row stride/payload width are2560B; LDS row width remains2832B
+   for Flash. Columns beyond2560B are OOB stores, so scales/padding cannot reach
+   payload output. Dropped/nonlocal routes use index=rows, the descriptor bound.
+2. TDM gather finishes before scatter reads LDS. Payload TDM stores overlap
+   generic scale stores, both only read the wave-owned LDS slice. tensor_wait(0)
+   retires all payload stores before counter publication or LDS reuse; ordinary
+   scale stores retain store wait and the existing AcqRel completion chain.
+3. Producer storage, counter ownership, consumer layout and scheduler unchanged.
+   Repeat small/full correctness before timings. No GPU jobs active at edit time;
+   runner retains immediate idle check, three-review snapshot and timeout guard.

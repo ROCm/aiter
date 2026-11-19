@@ -90,6 +90,9 @@ def compile_s1f_pull(
     cluster_local=False,
     producer_group=1,
     tile_ready=False,
+    unique_pull=False,
+    off_unique_routes=0,
+    off_unique_counts=0,
     packed_input=False,
     off_packed=0,
     src_rank_shuffle=False,
@@ -127,6 +130,8 @@ def compile_s1f_pull(
         raise ValueError("cluster-local S1F requires aligned local-ready affinity")
     if ready_queue and (not ready_first or align_m != tile_m):
         raise ValueError("ready queue requires local-ready and aligned GEMM tiles")
+    if unique_pull and (packed_input or ready_first or tile_ready or producer_group != 1):
+        raise ValueError("unique pull requires ordinary external-ready M64 flags")
     tile_cap = (compact_cap + FLAG_M - 1) // FLAG_M
     affinity_clusters = producers // 4 if producer_group == 4 else workers // affinity_size
     queue_affinity = affinity_size > 1 or producer_group == 4
@@ -184,6 +189,13 @@ def compile_s1f_pull(
                     spins += 1
                 if value != epoch:
                     _trap()
+        if const_expr(unique_pull):
+            tile = fx.block_idx.x * 128 + tid
+            if tile < tile_cap:
+                pointer = fx.inttoptr(
+                    ptr, win.base + rank * win.stride + off_unique_counts
+                )
+                fx.generic_store(fx.add_offset(pointer, tile), fx.Int32(0))
         if const_expr(not src_rank_shuffle):
             tile = fx.block_idx.x * 128 + tid
             if tile < tile_cap:
@@ -586,6 +598,15 @@ def compile_s1f_pull(
                                 )
 
     selected_producer = producer_ready_first if ready_first else producer
+    if unique_pull:
+        from .unique_pull import make_unique_producer
+        selected_producer = make_unique_producer(
+            rank=rank, world=world, model_dim=model_dim, wire_row=wire_row,
+            max_routes=max_routes, topk=topk, producers=producers,
+            off_wire=off_wire, off_routes=off_unique_routes,
+            off_counts=off_unique_counts, off_tile_flag=off_tile_flag,
+            flag_stride=FLAG_STRIDE,
+        )
     if producer_group == 4:
         selected_producer = make_group_producer(
             copy_tile=copy_tile, rank=rank, world=world, experts=experts,
@@ -630,6 +651,7 @@ def compile_s1f_pull(
         affinity_producers=affinity_producers,
         ctas_per_cu=1,
         pull_producer=selected_producer,
+        pull_unique=unique_pull,
         pull_producer_group=producer_group,
         pull_tile_ready=tile_ready,
         pull_ready_queue=ready_queue,

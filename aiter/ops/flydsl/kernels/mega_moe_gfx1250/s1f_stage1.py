@@ -555,6 +555,7 @@ def make_s1f_stage1(
     pull_tile_ready=False,
     pull_lds_bytes=0,
     pull_lds_control_gap=None,
+    pull_unique=False,
     pull_ready_queue=False,
     pull_cluster_local=False,
     pull_cluster_config=None,
@@ -586,7 +587,8 @@ def make_s1f_stage1(
     statically assigned first task in that mode.
 
     ``pull_producer`` optionally replaces only the dispatch producer. It writes
-    preshuffled A and row-major scales, publishing the same generation flags
+    preshuffled A (row-major for unique pull) and row-major scales, publishing
+    the same generation flags
     after its stores retire. Tile metadata and source readiness must be ready
     before launch. The consumer, its hooks, and entry/exit protocol are shared.
 
@@ -886,7 +888,7 @@ def make_s1f_stage1(
             lds_soa_load_interleave=lds_soa_load_interleave,
             persistent_workers=G,
             rolled_drain=rolled_drain,
-            a_preshuffled=int(pull_producer is not None),
+            a_preshuffled=int(pull_producer is not None and not pull_unique),
             m_align=0,
             explicit_tile=1,
             explicit_cluster=int(cluster_size > 1),
@@ -936,7 +938,10 @@ def make_s1f_stage1(
             raise ValueError(
                 f"{ctas_per_cu} CTAs of {total_lds} B LDS do not fit one CU"
             )
-        producer_name = "pull" if pull_producer is not None else "stage1"
+        producer_name = (
+            "pull_unique" if pull_unique
+            else "pull" if pull_producer is not None else "stage1"
+        )
         kname = (
             f"s1f_{producer_name}_p{P}_w{G}_gm{GM}_r{R}d{D}s{S}_ps{POLL_SLEEP}"
             + f"_mb{RBK}i{MB_ST_INFL}l{MB_LD_INFL}"

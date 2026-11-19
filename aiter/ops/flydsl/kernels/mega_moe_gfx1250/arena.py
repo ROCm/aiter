@@ -96,6 +96,8 @@ _ARENA_REGION_ORDER = (
     "ep_linear_base",
     "ep_linear_tiles",
     "ep_linear_slots",
+    "pull_unique_routes",
+    "pull_unique_counts",
 )
 # cco rounds each allocation up to its VMM granularity -- 2 MiB on the parts
 # MegaMoE runs on -- and, past 2 GiB, to 2 MiB again for the MR registration.

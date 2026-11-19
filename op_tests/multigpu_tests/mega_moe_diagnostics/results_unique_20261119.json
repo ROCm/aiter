@@ -1,0 +1,494 @@
+[
+  {
+    "routing": "Balanced",
+    "configuration": "Original pull, preshuffled",
+    "run": "op_tests/multigpu_tests/mega_moe_diagnostics/ipflegacy_p96_events_unique_baseline_01",
+    "aggregate": {
+      "gemm1_median_us": 538.5598689317703,
+      "gemm2_median_us": 579.7667428851128,
+      "plan_median_us": 37.48587518930435,
+      "ready_median_us": 12.533749919384718,
+      "native_e2e_median_us_per_layer": 1554.7812187435284
+    },
+    "gpus": [
+      {
+        "run": "ipflegacy_p96_events_unique_baseline_01",
+        "rank": 0,
+        "gemm1_median_us": 542.5499975681305,
+        "gemm2_median_us": 582.1294784545898,
+        "plan_median_us": 36.253999918699265,
+        "ready_median_us": 11.897999793291092,
+        "native_e2e_median_us_per_layer": 1555.1190000451243,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_baseline_01",
+        "rank": 1,
+        "gemm1_median_us": 545.4759895801544,
+        "gemm2_median_us": 579.706996679306,
+        "plan_median_us": 35.73350049555302,
+        "ready_median_us": 11.617499869316816,
+        "native_e2e_median_us_per_layer": 1554.5916249948277,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_baseline_01",
+        "rank": 2,
+        "gemm1_median_us": 521.5980112552643,
+        "gemm2_median_us": 576.6409933567047,
+        "plan_median_us": 41.642000898718834,
+        "ready_median_us": 14.74200002849102,
+        "native_e2e_median_us_per_layer": 1554.2239999604135,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_baseline_01",
+        "rank": 3,
+        "gemm1_median_us": 544.6154773235321,
+        "gemm2_median_us": 580.5895030498505,
+        "plan_median_us": 36.31399944424629,
+        "ready_median_us": 11.877499986439943,
+        "native_e2e_median_us_per_layer": 1555.190249973748,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "routing": "Balanced",
+    "configuration": "Unique pull, preshuffled generic scatter (superseded)",
+    "run": "op_tests/multigpu_tests/mega_moe_diagnostics/ipflegacy_p96_events_unique_flash_01",
+    "aggregate": {
+      "gemm1_median_us": 1025.9484946727753,
+      "gemm2_median_us": 580.2325010299683,
+      "plan_median_us": 38.02174981683493,
+      "ready_median_us": 11.817749822512269,
+      "native_e2e_median_us_per_layer": 2055.341250027709
+    },
+    "gpus": [
+      {
+        "run": "ipflegacy_p96_events_unique_flash_01",
+        "rank": 0,
+        "gemm1_median_us": 1005.4609775543213,
+        "gemm2_median_us": 575.2789974212646,
+        "plan_median_us": 37.215499207377434,
+        "ready_median_us": 14.86200001090765,
+        "native_e2e_median_us_per_layer": 2055.736250042628,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_unique_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_flash_01",
+        "rank": 1,
+        "gemm1_median_us": 1043.12002658844,
+        "gemm2_median_us": 577.0434737205505,
+        "plan_median_us": 35.0125003606081,
+        "ready_median_us": 8.51299986243248,
+        "native_e2e_median_us_per_layer": 2055.5412500016246,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_unique_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_flash_01",
+        "rank": 2,
+        "gemm1_median_us": 1015.2754783630371,
+        "gemm2_median_us": 573.1755197048187,
+        "plan_median_us": 43.52499917149544,
+        "ready_median_us": 14.821999706327915,
+        "native_e2e_median_us_per_layer": 2054.9800000253526,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_unique_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_flash_01",
+        "rank": 3,
+        "gemm1_median_us": 1039.9374961853027,
+        "gemm2_median_us": 595.4320132732391,
+        "plan_median_us": 36.334000527858734,
+        "ready_median_us": 9.073999710381031,
+        "native_e2e_median_us_per_layer": 2055.107500041231,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_unique_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "routing": "Balanced",
+    "configuration": "Unique pull, row-major generic scatter (superseded)",
+    "run": "op_tests/multigpu_tests/mega_moe_diagnostics/ipflegacy_p96_events_unique_rowmajor_flash_01",
+    "aggregate": {
+      "gemm1_median_us": 1038.2015854120255,
+      "gemm2_median_us": 586.7216289043427,
+      "plan_median_us": 36.74500063061714,
+      "ready_median_us": 11.552499956451356,
+      "native_e2e_median_us_per_layer": 2071.8027812307582
+    },
+    "gpus": [
+      {
+        "run": "ipflegacy_p96_events_unique_rowmajor_flash_01",
+        "rank": 0,
+        "gemm1_median_us": 1028.935968875885,
+        "gemm2_median_us": 584.3320190906525,
+        "plan_median_us": 35.31250171363354,
+        "ready_median_us": 8.593000005930662,
+        "native_e2e_median_us_per_layer": 2071.9102499811015,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_unique_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_rowmajor_flash_01",
+        "rank": 1,
+        "gemm1_median_us": 1056.3799738883972,
+        "gemm2_median_us": 580.9684991836548,
+        "plan_median_us": 34.69200059771538,
+        "ready_median_us": 11.458000168204308,
+        "native_e2e_median_us_per_layer": 2071.937874973173,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_unique_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_rowmajor_flash_01",
+        "rank": 2,
+        "gemm1_median_us": 1009.6469521522522,
+        "gemm2_median_us": 586.8759751319885,
+        "plan_median_us": 41.52250103652477,
+        "ready_median_us": 14.421000145375729,
+        "native_e2e_median_us_per_layer": 2071.827874999599,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_unique_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_rowmajor_flash_01",
+        "rank": 3,
+        "gemm1_median_us": 1057.8434467315674,
+        "gemm2_median_us": 594.7100222110748,
+        "plan_median_us": 35.45299917459488,
+        "ready_median_us": 11.737999506294727,
+        "native_e2e_median_us_per_layer": 2071.5351249691594,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_unique_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "routing": "Balanced",
+    "configuration": "Unique pull, row-major TDM scatter",
+    "run": "op_tests/multigpu_tests/mega_moe_diagnostics/ipflegacy_p96_events_unique_tdm_flash_01",
+    "aggregate": {
+      "gemm1_median_us": 894.3762555718422,
+      "gemm2_median_us": 580.5723816156387,
+      "plan_median_us": 36.47474944591522,
+      "ready_median_us": 11.937750270590186,
+      "native_e2e_median_us_per_layer": 1914.9233124835519
+    },
+    "gpus": [
+      {
+        "run": "ipflegacy_p96_events_unique_tdm_flash_01",
+        "rank": 0,
+        "gemm1_median_us": 876.1274814605713,
+        "gemm2_median_us": 584.1119885444641,
+        "plan_median_us": 35.37299856543541,
+        "ready_median_us": 12.218000367283821,
+        "native_e2e_median_us_per_layer": 1915.0729999637406,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_unique_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_tdm_flash_01",
+        "rank": 1,
+        "gemm1_median_us": 913.8465225696564,
+        "gemm2_median_us": 580.3675055503845,
+        "plan_median_us": 34.53199937939644,
+        "ready_median_us": 8.573000319302082,
+        "native_e2e_median_us_per_layer": 1914.9942500007455,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_unique_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_tdm_flash_01",
+        "rank": 2,
+        "gemm1_median_us": 877.3090243339539,
+        "gemm2_median_us": 573.7560093402863,
+        "plan_median_us": 41.00150056183338,
+        "ready_median_us": 14.882000163197517,
+        "native_e2e_median_us_per_layer": 1914.500499992755,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_unique_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_tdm_flash_01",
+        "rank": 3,
+        "gemm1_median_us": 910.2219939231873,
+        "gemm2_median_us": 584.05402302742,
+        "plan_median_us": 34.99249927699566,
+        "ready_median_us": 12.078000232577324,
+        "native_e2e_median_us_per_layer": 1915.1254999769662,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_unique_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "routing": "Random",
+    "configuration": "Original pull, preshuffled",
+    "run": "op_tests/multigpu_tests/mega_moe_diagnostics/ipflegacy_p96_events_unique_baseline_random_01",
+    "aggregate": {
+      "gemm1_median_us": 595.0290039181709,
+      "gemm2_median_us": 585.2293819189072,
+      "plan_median_us": 37.696000188589096,
+      "ready_median_us": 12.103249900974333,
+      "native_e2e_median_us_per_layer": 1625.6486874794973
+    },
+    "gpus": [
+      {
+        "run": "ipflegacy_p96_events_unique_baseline_random_01",
+        "rank": 0,
+        "gemm1_median_us": 594.2670106887817,
+        "gemm2_median_us": 584.3520164489746,
+        "plan_median_us": 36.45400144159794,
+        "ready_median_us": 11.998000089079142,
+        "native_e2e_median_us_per_layer": 1625.5683749477612,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_baseline_random_01",
+        "rank": 1,
+        "gemm1_median_us": 604.0429770946503,
+        "gemm2_median_us": 595.3699946403503,
+        "plan_median_us": 36.474501714110374,
+        "ready_median_us": 9.213999845087528,
+        "native_e2e_median_us_per_layer": 1625.8296249134219,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_baseline_random_01",
+        "rank": 2,
+        "gemm1_median_us": 580.1860094070435,
+        "gemm2_median_us": 581.2875032424927,
+        "plan_median_us": 41.1204993724823,
+        "ready_median_us": 15.182999894022942,
+        "native_e2e_median_us_per_layer": 1625.499624992699,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_baseline_random_01",
+        "rank": 3,
+        "gemm1_median_us": 601.6200184822083,
+        "gemm2_median_us": 579.908013343811,
+        "plan_median_us": 36.73499822616577,
+        "ready_median_us": 12.017999775707722,
+        "native_e2e_median_us_per_layer": 1625.6971250641072,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "routing": "Random",
+    "configuration": "Unique pull, row-major TDM scatter",
+    "run": "op_tests/multigpu_tests/mega_moe_diagnostics/ipflegacy_p96_events_unique_tdm_random_01",
+    "aggregate": {
+      "gemm1_median_us": 1503.270983695984,
+      "gemm2_median_us": 578.2034993171692,
+      "plan_median_us": 36.50424908846617,
+      "ready_median_us": 11.316625052131712,
+      "native_e2e_median_us_per_layer": 2541.1734687850185
+    },
+    "gpus": [
+      {
+        "run": "ipflegacy_p96_events_unique_tdm_random_01",
+        "rank": 0,
+        "gemm1_median_us": 1477.2844910621643,
+        "gemm2_median_us": 578.9240002632141,
+        "plan_median_us": 35.85299849510193,
+        "ready_median_us": 11.176500003784895,
+        "native_e2e_median_us_per_layer": 2541.1331250779767,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_unique_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_tdm_random_01",
+        "rank": 1,
+        "gemm1_median_us": 1547.854483127594,
+        "gemm2_median_us": 586.2955152988434,
+        "plan_median_us": 35.37299856543541,
+        "ready_median_us": 11.256000027060509,
+        "native_e2e_median_us_per_layer": 2541.5656250515894,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_unique_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_tdm_random_01",
+        "rank": 2,
+        "gemm1_median_us": 1442.6524639129639,
+        "gemm2_median_us": 576.2199759483337,
+        "plan_median_us": 37.79600001871586,
+        "ready_median_us": 11.256000027060509,
+        "native_e2e_median_us_per_layer": 2541.1768749563635,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_unique_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      },
+      {
+        "run": "ipflegacy_p96_events_unique_tdm_random_01",
+        "rank": 3,
+        "gemm1_median_us": 1545.2924966812134,
+        "gemm2_median_us": 571.3745057582855,
+        "plan_median_us": 36.99499927461147,
+        "ready_median_us": 11.578000150620937,
+        "native_e2e_median_us_per_layer": 2540.8182500541443,
+        "symbols": {
+          "gemm1": [
+            "s1f_pull_unique_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ],
+          "gemm2": [
+            "mxfp4_tdm_fp4_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+          ]
+        }
+      }
+    ]
+  }
+]

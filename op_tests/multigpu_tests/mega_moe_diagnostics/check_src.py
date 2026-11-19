@@ -1,4 +1,4 @@
-"""Run the existing source-rank shuffle checks at a full Flash shape."""
+"""Run the existing source-shuffle or unique-pull checks at a Flash shape."""
 
 import os
 from pathlib import Path
@@ -21,7 +21,10 @@ Communicator.init = classmethod(init_test_comm)
 suite.HIDDEN, suite.INTER, suite.TOPK = 5120, 2304, 6
 suite.TOKENS = int(os.environ.get("CHECK_TPR", "257"))
 suite.EXPERTS_PER_RANK = 96
-suite.CHECKS = (suite._check_pull_s1f_src_rank_shuffle,)
+suite.CHECKS = (
+    suite._check_pull_s1f_unique if os.environ.get("CHECK_UNIQUE") == "1"
+    else suite._check_pull_s1f_src_rank_shuffle,
+)
 
 if __name__ == "__main__":
     raise SystemExit(suite.main())

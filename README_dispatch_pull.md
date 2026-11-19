@@ -269,3 +269,65 @@ python op_tests/multigpu_tests/mega_moe_diagnostics/analyze.py op_tests/multigpu
 - Next-machine commands need the installed AITER/MORI and pinned FlyDSL0.5.0.
   No temporary overlay under `/workspace/gpubench` is needed for the TDM paths.
   Keep source readiness, A readiness, and combine completion distinct.
+
+## Unique pull with local row-major scatter (experimental)
+
+`AITER_MEGA_PULL_UNIQUE=1` replaces the S1F pull producer. Each wave owns
+16 source tokens, fetches each needed payload/scale once for this destination
+rank, and fans out from LDS to all matching local expert rows. This is a
+hybrid: remote pull is deduplicated, local writes still occur once per route.
+The source wire stays in its original per-token layout; compact-plan writes
+its final route map into peer-visible storage. There is no separate unique
+cache or extra local gather kernel.
+
+The local expert payload is **row-major**. Each wave issues two indexed TDM
+stores per top-k slot for its16 loaded rows, reusing LDS directly. The output
+row width is the payload width; TDM drops scale/padding columns and masked
+nonlocal destinations. Small scale rows use contiguous lane stores while the
+payload stores are in flight. GEMM1 explicitly
+uses `a_preshuffled=0`; the existing GEMM1 quant epilogue and GEMM2 entry point
+also use matching row-major payloads. This differs from the source-shuffle
+experiment above: destination M256 tiles are not guaranteed source-homogeneous,
+and `PLAN_PACK`, `SRC_SHUFFLE` and `EP_LINEAR_STORE` must remain off.
+
+The original external-ready kernel waits for source quantization and final
+route-map visibility. It also resets local M64 completion counters. After
+fan-out stores retire, each source row contributes one AcqRel agent atomic per
+local route; the last writer publishes the original M64 A-ready generation.
+Consumers and producer-to-consumer transition retain their original scheduler.
+No new cross-device completion atomic is required.
+
+```bash
+# Six changing-input correctness replays, including hot/empty experts and tails.
+CHECK_TPR=257 CHECK_UNIQUE=1 BENCH_UNIQUE_PULL=1 BENCH_IPF=legacy bash op_tests/multigpu_tests/mega_moe_diagnostics/run.sh affinity check_src_unique_small_NEW
+CHECK_TPR=16384 CHECK_UNIQUE=1 BENCH_UNIQUE_PULL=1 BENCH_IPF=legacy bash op_tests/multigpu_tests/mega_moe_diagnostics/run.sh affinity check_src_unique_flash_NEW
+# Explicit HIP event stage timing and a separate native E2E pass.
+BENCH_UNIQUE_PULL=1 BENCH_IPF=legacy bash op_tests/multigpu_tests/mega_moe_diagnostics/run.sh affinity events_unique_NEW
+BENCH_UNIQUE_PULL=0 BENCH_IPF=legacy bash op_tests/multigpu_tests/mega_moe_diagnostics/run.sh affinity events_unique_baseline_NEW
+```
+
+Use unique labels for every run. Add `BENCH_BALANCED=false` to both timing
+commands for random top-k routing. The balanced pattern has six routes to one
+destination per token (4.5 remote routes but0.75 remote destinations/token).
+That sixfold reduction in requested peer payload bytes does not apply to
+random routing. Local output byte volume is unchanged; latency must be measured.
+
+Final row-major/TDM correctness passed at257 and16384 tokens/rank. This version
+is slower than the original pull, so `AITER_MEGA_PULL_UNIQUE` defaults to0.
+Balanced GEMM1/GEMM2 are894.38/580.57us versus538.56/579.77us for the baseline;
+random routing is1503.27/578.20us versus595.03/585.23us. One successful run per
+configuration, averaging the four GPU HIP-event medians. GEMM1 includes dispatch.
+Full results, limitations and the intermediate layout experiments are in
+[RESULTS_UNIQUE_20261119.md](op_tests/multigpu_tests/mega_moe_diagnostics/RESULTS_UNIQUE_20261119.md)
+and [results_unique_20261119.json](op_tests/multigpu_tests/mega_moe_diagnostics/results_unique_20261119.json).
+
+Native timing only, with the same hybrid P96/C160 and affinity:
+
+```bash
+AITER_MEGA_PULL_UNIQUE=1 AITER_MOE_S1F_AFFINITY=1 bash run_ds41_flash_best.sh
+```
+
+The script name reflects the original default, not a claim that the optional
+hybrid is faster. Source-map scans, per-route completion RMWs and changed
+consumer startup remain candidates for further cycle-level analysis. The next
+optimization must address destination-tile completion as well as copy layout.

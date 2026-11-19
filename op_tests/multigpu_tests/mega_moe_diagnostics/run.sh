@@ -41,6 +41,7 @@ export AITER_MOE_S1F_PRODUCER_GROUP=${BENCH_PRODUCER_GROUP:-1}
 export CYCLE_TRACE=${CYCLE_TRACE:-1}
 export AITER_MEGA_PULL_PLAN_PACK=${BENCH_PLAN_PACK:-0}
 export AITER_MEGA_PULL_SRC_SHUFFLE=${BENCH_SRC_SHUFFLE:-0}
+export AITER_MEGA_PULL_UNIQUE=${BENCH_UNIQUE_PULL:-0}
 export AITER_MEGA_EP_LINEAR_STORE=${BENCH_EP_LINEAR_STORE:-0}
 export AITER_MEGA_PULL_WAVE_LOAD=${BENCH_WAVE_LOAD:-1}
 export AITER_MEGA_PULL_LOAD_K_BYTES=${BENCH_LOAD_K_BYTES:-1024}
@@ -83,6 +84,7 @@ printf '\n' >> "$out/command.sh"
 git rev-parse HEAD > "$out/head.txt"
 git diff HEAD > "$out/source.diff"
 cp aiter/ops/flydsl/kernels/mega_moe_gfx1250/packed_wave_copy.py "$out/"
+cp aiter/ops/flydsl/kernels/mega_moe_gfx1250/unique_pull.py "$out/"
 cp aiter/ops/flydsl/kernels/mega_moe_gfx1250/linear_combine.py "$out/"
 cp aiter/ops/flydsl/kernels/mega_moe_gfx1250/s1f_producer_group.py "$out/s1f_producer_group.py"
 cp aiter/ops/flydsl/kernels/mega_moe_gfx1250/ready_queue.py "$out/ready_queue.py"
