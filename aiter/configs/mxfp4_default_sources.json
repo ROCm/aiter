@@ -1,0 +1,10 @@
+[
+  "a4w4_blockscale_tuned_gemm.csv",
+  "model_configs/dsv3_a4w4_blockscale_tuned_gemm.csv",
+  "model_configs/gemma4_31b_a4w4_blockscale_tuned_gemm.csv",
+  "model_configs/kimik3_a4w4_blockscale_tuned_gemm.csv",
+  "model_configs/narrow_n_a4w4_blockscale_tuned_gemm.csv",
+  "model_configs/q3vl_a4w4_blockscale_tuned_gemm.csv",
+  "model_configs/qwen38_27b_a4w4_blockscale_tuned_gemm.csv",
+  "model_configs/qwen38_2p4t_a4w4_blockscale_tuned_gemm.csv"
+]
