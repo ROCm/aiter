@@ -32,11 +32,36 @@ from .kernels.qsa.sparse_prefill_common import (
     platform,
 )
 
-__all__ = ["flydsl_qsa_sparse_prefill"]
+__all__ = [
+    "SELECTION_WIDTHS",
+    "flydsl_qsa_sparse_prefill",
+    "flydsl_qsa_sparse_prefill_available",
+    "flydsl_qsa_sparse_prefill_supports_selection",
+]
 
 # Kernels use unsigned 32-bit buffer byte offsets; the 1 MiB margin keeps out-of-range
 # sentinels plus their lane offsets from wrapping.
 _MAX_SPAN = 2**32 - 2**20
+
+# Selection widths 4T + 3 for the per-row block budgets T the kernels take.
+SELECTION_WIDTHS = tuple(4 * topk + 3 for topk in (256, 512, 768, 1024))
+# The selection is addressed at signed 32-bit byte offsets.
+_MAX_SELECTION_BYTES = 2**31 - 1
+
+
+def flydsl_qsa_sparse_prefill_available() -> bool:
+    """Whether ``flydsl_qsa_sparse_prefill`` runs on the live GPU (gfx942 only)."""
+    return get_gfx_runtime() == "gfx942"
+
+
+def flydsl_qsa_sparse_prefill_supports_selection(rows: int, width: int) -> bool:
+    """Whether ``flydsl_qsa_sparse_prefill`` takes an int32 [rows, width] selection:
+    width is one of ``SELECTION_WIDTHS`` and the selection spans fewer than 2**31
+    bytes. Only the selection's shape is answered; the GPU is answered by
+    ``flydsl_qsa_sparse_prefill_available`` and Q/K/V, kv_slots and the lengths
+    are checked by the call itself.
+    """
+    return width in SELECTION_WIDTHS and 0 <= rows * width * 4 <= _MAX_SELECTION_BYTES
 
 
 def _union_min_rows(group):
@@ -327,22 +352,21 @@ def flydsl_qsa_sparse_prefill(
     span = q.numel() if kv_slots is not None else max(q.numel(), tokens * k.stride(0))
     if span * q.element_size() > _MAX_SPAN:
         raise ValueError("Q and each request's K/V require byte spans <= 2**32 - 2**20")
-    if get_gfx_runtime() != "gfx942":
+    if not flydsl_qsa_sparse_prefill_available():
         raise ValueError("QSA sparse attention requires gfx942")
-    topk = (indices.shape[-1] - 3) // 4 if indices.ndim else 0
     if (
-        indices.shape != (q.shape[0], 4 * topk + 3)
-        or topk % 256
-        or not 256 <= topk <= 1024
+        indices.ndim != 2
+        or indices.shape[0] != q.shape[0]
+        or not flydsl_qsa_sparse_prefill_supports_selection(*indices.shape)
         or indices.dtype != torch.int32
         or indices.device != q.device
         or not indices.is_contiguous()
-        or indices.numel() * indices.element_size() >= 2**31
     ):
         raise ValueError(
             "indices must be contiguous device int32 [M,4T+3], T = 256/512/768/1024, "
             "with byte span < 2**31"
         )
+    topk = (indices.shape[1] - 3) // 4
     if out is None:
         out = torch.empty_like(q)
     if (
