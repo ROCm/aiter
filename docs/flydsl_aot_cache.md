@@ -73,7 +73,7 @@ an entry and how to invalidate it when a kernel source changes:
 | this design | **yes** | no | toolchain/env dir + **per-entry recorded sources** + key |
 | a cache of FlyDSL handles keyed by private state | yes | **yes** (rejected) | fragile |
 
-## 3. FlyDSL building blocks (public API only)
+## 3. FlyDSL building blocks
 
 | API | use |
 |---|---|
@@ -89,9 +89,21 @@ tensor contributes two slots, a data pointer and a packed layout struct with
 its dynamic shape and stride values; a scalar slot holds its value; the stream
 slot holds a `hipStream_t`.
 
+The APIs above are stable under FlyDSL's `docs/api_stability.md`
+(`flyc.load_module` once it is released). The cache also uses three FlyDSL
+internals, which a FlyDSL release may move or rename without notice:
+
+| internal | use |
+|---|---|
+| `flydsl.compiler.jit_argument.PointerJitArg` | Constructed with a null pointer as the placeholder of a pointer argument, so the compile-only export does not launch. |
+| `flydsl.utils.env` (`env.compile.compile_only`) | Detects `COMPILE_ONLY`. |
+| `fx.Stream._is_stream_param` | Recognizes a stream argument, whose placeholder is a null stream. |
+
+Re-run `op_tests/test_flydsl_aot_cache.py` on every FlyDSL pin bump.
+
 ## 4. aiter design: `aiter/ops/flydsl/aot_cache.py`
 
-The design is the exported-object cache of §2.3, using only the public API
+The design is the exported-object cache of §2.3, built on the FlyDSL APIs
 in §3.
 
 ```
