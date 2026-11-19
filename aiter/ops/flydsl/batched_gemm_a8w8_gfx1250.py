@@ -29,7 +29,6 @@ mxfp8_32 (``run_bmm_a8w8_mxfp8_32_gfx1250``): same XQ / WQ / Out, a row-major
 from __future__ import annotations
 
 import functools
-import math
 import re
 
 import numpy as np
@@ -848,20 +847,20 @@ def gate_up_silu_kernel_for(m: int, n2: int, k: int) -> str | None:
 
 def gate_up_silu_limit(swiglu_limit: float) -> float:
     """``swiglu_limit`` as the fused kernel takes it, with the meaning aiter
-    ``silu_and_mul`` gives it: a limit whose f32 value is positive clamps (gate
-    from above at L, up to [-L, L]), 0 clamps nothing, and a negative or NaN
-    limit is an error. silu_and_mul takes the limit as f32, so +inf and a
-    positive value that rounds to f32 0 also clamp nothing and run the same
-    kernel as 0."""
-    limit = float(swiglu_limit)
-    if not limit >= 0.0:
+    ``silu_and_mul`` gives the f32 it receives: a finite positive f32 limit
+    clamps (gate from above at L, up to [-L, L]); 0, -0.0 (a tiny negative
+    double), +inf and a double that overflows f32 clamp nothing and run the
+    same kernel as 0; a negative or NaN limit is an error."""
+    with np.errstate(over="ignore"):
+        f = np.float32(swiglu_limit)
+    if not f >= 0:
         raise ValueError(
             "[FlyDSL gfx1250 gate_up silu] swiglu_limit must be >= 0 "
             f"(0 = no clamp), got {swiglu_limit!r}"
         )
-    if math.isinf(limit) or not np.float32(limit) > 0:
+    if not (np.isfinite(f) and f > 0):
         return 0.0
-    return limit
+    return float(swiglu_limit)
 
 
 def run_gate_up_silu_mxfp8_32_gfx1250(

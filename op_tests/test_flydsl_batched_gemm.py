@@ -24,10 +24,14 @@ On gfx1250 this file also checks the mxfp8_32 GEMM's fused quant epilogue:
 ``y_scale_out`` must be byte-identical to quantize_fp8 of the unfused bf16
 output, on the heuristic tile and on tuned tiles that pin each epilogue
 branch (FUSED_QUANT_TILES: one LDS-staged tile and two accumulator tiles, one
-of them with each K loop). gfx1250-strict runs that check and the compute
-kernelName cases alone. gfx1250 also checks that the pipelined K loop
-(kernelName suffix ``_pl``) writes the single-fence loop's (``_nopl``) output
-bit for bit (PIPELINED_CASES).
+of them with each K loop). gfx1250-strict runs that check, the gate_up check
+below and the compute kernelName cases alone. gfx1250 also checks that the
+pipelined K loop (kernelName suffix ``_pl``) writes the single-fence loop's
+(``_nopl``) output bit for bit (PIPELINED_CASES), and that the gate_up GEMM
+with the fused SwiGLU + MXFP8 epilogue (run_gate_up_silu_mxfp8_32_gfx1250 and
+the registered op gate_up_silu_mxfp8_32) matches the bf16 GEMM + silu_and_mul
++ quantize_fp8 chain: scales exact, e4m3 codes at most one step apart in a
+negligible fraction, for every tile bucket and swiglu_limit 10, 0 and 5.02.
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up

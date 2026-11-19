@@ -7,12 +7,17 @@
   each M bucket of its table there and returns None elsewhere;
 * every table tile pins its K loop with ``_pl`` and passes
   ``gate_up_silu_kernel_ok``;
-* ``swiglu_limit`` follows aiter ``silu_and_mul`` (0 = no clamp, negative or
-  NaN rejected), and the launch rejects bad limits, operand dtypes, strides,
-  shapes, buffers and kernel names before it touches a GPU;
+* ``swiglu_limit`` follows aiter ``silu_and_mul`` on the f32 it receives
+  (0, -0.0, f32 inf = no clamp; negative or NaN rejected), and the launch
+  rejects bad limits, operand dtypes, strides, shapes, buffers, devices,
+  misaligned bases and kernel names before it touches a GPU;
 * with no kernel name the launch picks the tile from the runtime row count,
   and the functional registered op does that inside a graph compiled once
-  for every row count.
+  for every row count;
+* a CPU model of the clamp step documents the bf16-rounded gate clamp. Its
+  epilogue model performs the same operations as its silu_and_mul model, so
+  their agreement holds by construction: it shows what the f32 clamp got
+  wrong, it does not test the kernel.
 
 Runs on CPU; no case needs a GPU. The numerical check against GEMM +
 silu_and_mul + quantize_fp8 is in op_tests/test_flydsl_batched_gemm.py
@@ -20,6 +25,7 @@ silu_and_mul + quantize_fp8 is in op_tests/test_flydsl_batched_gemm.py
 """
 
 import math
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -153,10 +159,16 @@ def test_kernel_ok_rejects(name):
         # positive doubles whose f32 value is 0: silu_and_mul gets 0.0f
         (1e-46, 0.0),
         (5e-324, 0.0),
+        # -0.0f: silu_and_mul runs it as no clamp
+        (-1e-46, 0.0),
+        # inf as f32 (no overflow warning)
+        (1e39, 0.0),
     ],
 )
 def test_limit_accepts(limit, want):
-    assert bmm.gate_up_silu_limit(limit) == want
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert bmm.gate_up_silu_limit(limit) == want
 
 
 @pytest.mark.parametrize("limit", [-1.0, -1e-6, -math.inf, math.nan])
@@ -214,8 +226,10 @@ def _saturated_rows(limit):
 @pytest.mark.parametrize("limit", [7.49, 5.02, 5.14])
 def test_clamped_gate_rounding_matches_silu_and_mul(limit):
     """At limits bf16 cannot hold, an f32-clamped gate moves some groups' e8m0
-    scale against silu_and_mul (the old epilogue); rounding the clamped gate to
-    bf16, as the epilogue now does, gives silu_and_mul's values and scales."""
+    scale against silu_and_mul (the old epilogue). The bf16-rounded model
+    performs the same operations as the silu_and_mul model, so the equality
+    below holds by construction and documents the semantics; the kernel itself
+    is checked by the gfx1250 op test."""
     assert float(torch.tensor(limit).to(torch.bfloat16)) != limit
     g, u = _saturated_rows(limit)
     ref = _silu_and_mul_ref(g, u, limit)

@@ -132,15 +132,16 @@ def launch_gemm_a8w8(
     # where act_limit L = 0 means no clamp -- and quantizes it to group-32
     # MXFP8 like fuse_quant_out. arg_c is the e4m3 [M, I] activation, ldc its
     # row stride, arg_scale_out [M, I/32].
-    if fuse_act_mul and not (math.isfinite(act_limit) and act_limit >= 0):
+    # The limit as the f32 the kernel (and silu_and_mul) uses; it must be
+    # finite and >= 0, and only a positive one clamps.
+    with np.errstate(over="ignore"):
+        act_limit_f32 = np.float32(act_limit)
+    if fuse_act_mul and not (np.isfinite(act_limit_f32) and act_limit_f32 >= 0):
         raise ValueError(
-            "[FlyDSL gfx1250] act_limit must be finite and >= 0 (0 = no clamp), "
-            f"got {act_limit!r}"
+            "[FlyDSL gfx1250] act_limit must be finite and >= 0 as f32 "
+            f"(0 = no clamp), got {act_limit!r}"
         )
-    # Clamp only where the f32 limit the kernel sees is positive: silu_and_mul
-    # takes the limit as f32, so a positive double that rounds to 0 clamps
-    # nothing there either.
-    act_clamp = bool(fuse_act_mul and np.float32(act_limit) > 0)
+    act_clamp = bool(fuse_act_mul and act_limit_f32 > 0)
     if fuse_act_mul and not (
         fuse_quant_out
         and b_scale_32x32
