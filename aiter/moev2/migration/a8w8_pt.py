@@ -15,7 +15,7 @@ import functools
 from dataclasses import replace
 
 from aiter import ActivationType, QuantType, dtypes, presorted_moe
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .. import api, paths
@@ -86,7 +86,7 @@ def claims(call) -> bool:
         ActivationType.Gelu,
     ):
         return False
-    if get_gfx() not in ARCHS or get_gfx_runtime() not in ARCHS:
+    if get_gfx_runtime() not in ARCHS:
         return False
     w1, w2 = call["w1"], call["w2"]
     if (
