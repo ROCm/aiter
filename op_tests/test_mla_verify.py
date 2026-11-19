@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MLA target verify (QLEN 8, 12 heads, FP8 KV): HK vs Gluon vs torch, host
-kernel selection, and CUDA-graph replay of HK with changing lengths."""
+"""MLA target verify (QLEN 8, 12 heads, FP8 KV): HK (direct and through
+mla_decode_fwd) vs Gluon vs torch, and CUDA-graph replay of HK with changing
+lengths."""
 
 import argparse
 import itertools
@@ -12,13 +13,8 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.mla_verify import (
-    MLA_VERIFY_GLUON,
-    MLA_VERIFY_HK,
-    mla_verify_hk,
-    mla_verify_hk_threshold,
-    select_mla_verify_kernel,
-)
+from aiter.mla import mla_decode_fwd
+from aiter.mla_verify import mla_verify_hk
 from aiter.ops.triton.gluon.mla_gluon import mla_gluon
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -90,6 +86,22 @@ def run_gluon(q, kv, slots, indptr, out, kv_scale):
     return out
 
 
+def run_decode_fwd(q, kv, out, qo_indptr, indptr, slots, last_page_lens, kv_scale):
+    mla_decode_fwd(
+        q,
+        kv,
+        out,
+        qo_indptr,
+        indptr,
+        slots,
+        last_page_lens,
+        QLEN,
+        sm_scale=SCALE,
+        kv_scale=kv_scale,
+    )
+    return out
+
+
 @benchmark()
 def test_mla_verify(bs, ctx, kv_scale_val):
     # Uneven lengths: request b has ctx * (b + 1) / bs tokens incl. the 8 drafts.
@@ -97,22 +109,22 @@ def test_mla_verify(bs, ctx, kv_scale_val):
     q, kv, slots, indptr = make_inputs(lens, seed=bs * ctx)
     kv_scale = torch.tensor([kv_scale_val], dtype=torch.float32)
     ref = run_torch(q, kv, lens, slots.long(), kv_scale_val)
+    qo_indptr = torch.arange(bs + 1, dtype=torch.int32) * QLEN
+    last_page_lens = torch.ones(bs, dtype=torch.int32)
     candidates = {
-        MLA_VERIFY_HK: lambda out: mla_verify_hk(
-            q, kv, indptr, slots, SCALE, kv_scale, out=out
+        "hk": lambda out: mla_verify_hk(q, kv, indptr, slots, SCALE, kv_scale, out=out),
+        "mla_decode_fwd": lambda out: run_decode_fwd(
+            q, kv, out, qo_indptr, indptr, slots, last_page_lens, kv_scale
         ),
-        MLA_VERIFY_GLUON: lambda out: run_gluon(
-            q, kv, slots, indptr, out, kv_scale_val
-        ),
+        "gluon": lambda out: run_gluon(q, kv, slots, indptr, out, kv_scale_val),
     }
     flops = 2 * QLEN * H * (D + DV) * sum(lens)
     nbytes = sum(lens) * D + q.numel() * 2 * (1 + DV / D)
     ret = {
         "gfx": get_gfx(),
         "max_kv_len": max(lens),
-        "selected": select_mla_verify_kernel(bs, max(lens)),
-        "threshold": mla_verify_hk_threshold(bs),
     }
+    outs = {}
     for name, fn in candidates.items():
         out_buf = torch.empty(q.shape[0], H, DV, dtype=torch.bfloat16)
         out, us = run_perftest(fn, out_buf)
@@ -126,10 +138,13 @@ def test_mla_verify(bs, ctx, kv_scale_val):
         assert_close_to_ref(
             ref, out, f"{name} bs={bs} ctx={ctx} kv_scale={kv_scale_val}"
         )
+        outs[name] = out
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
+    # mla_decode_fwd routes this shape to the HK kernel
+    assert torch.equal(outs["mla_decode_fwd"], outs["hk"]), f"bs={bs} ctx={ctx}"
     return ret
 
 
@@ -171,21 +186,6 @@ def test_mla_verify_hk_graph(bs, ctx, kv_scale_val):
     return ret
 
 
-def check_selection():
-    for bs in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 24, 32, 48, 64, 96):
-        thresh = mla_verify_hk_threshold(bs)
-        assert thresh is not None and thresh > 0
-        below = -(-thresh // bs) - 1
-        assert select_mla_verify_kernel(bs, below) == MLA_VERIFY_GLUON, bs
-        assert select_mla_verify_kernel(bs, -(-thresh // bs)) == MLA_VERIFY_HK, bs
-    big = 1 << 20
-    assert select_mla_verify_kernel(1, big, num_heads=16) == MLA_VERIFY_GLUON
-    assert select_mla_verify_kernel(1, big, qlen=4) == MLA_VERIFY_GLUON
-    assert select_mla_verify_kernel(1, big, kv_dtype=torch.bfloat16) == MLA_VERIFY_GLUON
-    assert select_mla_verify_kernel(1, big, page_size=64) == MLA_VERIFY_GLUON
-    assert select_mla_verify_kernel(0, big) == MLA_VERIFY_GLUON
-
-
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("mla_verify_hk unsupported on %s; skipping", get_gfx())
@@ -206,9 +206,6 @@ def main():
         help="longest request KV length incl. the 8 draft tokens",
     )
     args = parser.parse_args()
-
-    check_selection()
-    aiter.logger.info("select_mla_verify_kernel: ok")
 
     df = pd.DataFrame(
         [

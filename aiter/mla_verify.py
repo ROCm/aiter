@@ -1,15 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MLA target verify (speculative decoding) kernel selection and the gfx950
-HipKittens-style verify kernel.
+"""gfx950 HipKittens kernel for MLA target verify (speculative decoding) at
+QLEN 8, 12 heads, latent 576 / value 512, FP8 e4m3 KV with page size 1.
 
-Callers pick a kernel on the host with ``select_mla_verify_kernel`` and, under
-CUDA graphs, capture one graph per returned kernel:
-
-- ``"gluon"``: ``aiter.ops.triton.gluon.mla_gluon.mla_gluon`` (short contexts).
-- ``"hk"``: ``mla_verify_hk`` below (long contexts; QLEN 8, 12 heads,
-  latent 576 / value 512, FP8 e4m3 KV with page size 1, gfx950 only).
+``mla_decode_fwd`` dispatches this shape here (see ``mla.py``), so callers of the
+existing decode entry point get it without picking a kernel. ``mla_verify_hk``
+is the direct entry point for callers that already know the shape.
 """
 
 import torch
@@ -20,10 +17,6 @@ from aiter.ops.attention import hk_mla_verify_fwd, hk_mla_verify_reduce
 from aiter.ops.triton._triton_kernels.attention.mla_verify_reduce import (
     _mla_verify_reduce_kernel,
 )
-
-MLA_VERIFY_GLUON = "gluon"
-MLA_VERIFY_HK = "hk"
-MLA_VERIFY_KERNELS = (MLA_VERIFY_GLUON, MLA_VERIFY_HK)
 
 _HK_HEADS = 12
 _HK_QLEN = 8
@@ -37,80 +30,18 @@ _HK_MAX_SPLITS = 256
 _HK_PART8_MIN_SPLITS = 96
 _LOG2E = 1.4426950408889634
 
-# Gluon -> HK crossover per GPU: HK when batch * max_kv_len >= threshold, keyed
-# by the largest batch size each threshold covers (the default covers larger
-# batches). Measured with CUDA graphs on MI355X at QLEN 8, 12 heads, FP8 KV.
-_HK_THRESHOLDS = {
-    "gfx950": (
-        {
-            1: 17000,
-            2: 22000,
-            3: 16000,
-            4: 25000,
-            5: 20000,
-            6: 19500,
-            7: 23000,
-            8: 26000,
-            10: 24000,
-            12: 21500,
-            16: 30000,
-            24: 30000,
-            32: 45000,
-            48: 36000,
-            64: 49000,
-        },
-        49000,
-    ),
-}
-
 
 def mla_verify_hk_supported(
     num_heads: int, qlen: int, kv_dtype: torch.dtype, page_size: int = 1
 ) -> bool:
     """Whether mla_verify_hk can run this verify configuration on this GPU."""
     return (
-        get_gfx() in _HK_THRESHOLDS
+        get_gfx() == "gfx950"
         and num_heads == _HK_HEADS
         and qlen == _HK_QLEN
         and kv_dtype == torch.float8_e4m3fn
         and page_size == 1
     )
-
-
-def mla_verify_hk_threshold(batch_size: int) -> int | None:
-    """batch * max_kv_len from which HK beats Gluon, or None without HK."""
-    entry = _HK_THRESHOLDS.get(get_gfx())
-    if entry is None:
-        return None
-    table, default = entry
-    for bs in sorted(table):
-        if batch_size <= bs:
-            return table[bs]
-    return default
-
-
-def select_mla_verify_kernel(
-    batch_size: int,
-    max_kv_len: int,
-    num_heads: int = _HK_HEADS,
-    qlen: int = _HK_QLEN,
-    kv_dtype: torch.dtype = torch.float8_e4m3fn,
-    page_size: int = 1,
-) -> str:
-    """Pick the verify kernel for a batch on the host.
-
-    max_kv_len is the longest request's KV length including the draft tokens,
-    e.g. ``max(seq_lens_cpu) + num_draft_tokens``. Returns one of
-    MLA_VERIFY_KERNELS.
-    """
-    if batch_size <= 0 or not mla_verify_hk_supported(
-        num_heads, qlen, kv_dtype, page_size
-    ):
-        return MLA_VERIFY_GLUON
-    threshold = mla_verify_hk_threshold(batch_size)
-    if threshold is not None and batch_size * max_kv_len >= threshold:
-        return MLA_VERIFY_HK
-    return MLA_VERIFY_GLUON
 
 
 def mla_verify_hk_num_splits(batch_size: int) -> int:
