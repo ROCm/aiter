@@ -371,6 +371,7 @@ def fused_all_reduce_rmsnorm_moe_route(
         router_weight (torch.Tensor): Contiguous [experts, hidden], fp32 or bf16 (as comm).
         comm (AllReduceRmsnormMoeRoute): The buffers of the group.
         correction_bias (torch.Tensor, optional): [experts] fp32, added for the selection only.
+            Only with sigmoid scoring.
         scoring (str): "sigmoid" or "softmax".
         renormalize (bool): Divide the weights by their sum.
         routed_scaling_factor (float): Factor of the weights.
@@ -413,6 +414,10 @@ def fused_all_reduce_rmsnorm_moe_route(
     if correction_bias is not None:
         assert correction_bias.dtype == torch.float32 and correction_bias.shape == (e,)
     assert scoring in _SCORING, f"scoring must be one of {tuple(_SCORING)}"
+    assert correction_bias is None or scoring == "sigmoid", (
+        "correction_bias needs sigmoid scoring: with softmax, vLLM ranks the experts "
+        "by softmax(logit) + bias, and the kernel does not"
+    )
     assert num_expert_group >= 1 and e % num_expert_group == 0
     assert 1 <= topk_group <= num_expert_group <= 32
     assert block_size in (16, 32, 64, 128)

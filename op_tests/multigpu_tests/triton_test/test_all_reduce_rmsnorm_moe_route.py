@@ -394,6 +394,75 @@ def _check_timeout(rank, device, tp, failures):
         comm.close()
 
 
+def _check_routing_edges(rank, device, tp, failures):
+    """Softmax routing with logits far apart, and the inputs that the wrapper rejects. Rank 0
+    sends 2.0 in the columns 128 r .. 128 r + 127 of row r and the other ranks send zeros, so
+    the normed row r is 2.0 in these columns and the logits of row r are exactly
+    2 router_weight[:, 128 r]."""
+    hidden, e, k = 512, 16, 4
+    logits = torch.tensor(
+        [
+            [300, 200, 100, 0] + [-1000] * 12,
+            [0, -88, -89, -150, 7] + [-1000] * 11,
+            [10, 9, 5, 0, 4.5] + [-30] * 11,
+            [-500, -400, -450, -300] + [-1000] * 12,
+        ],
+        dtype=torch.float32,
+        device=device,
+    )
+    x = torch.zeros((4, hidden), dtype=torch.bfloat16, device=device)
+    router_w = torch.zeros((e, hidden), dtype=torch.float32, device=device)
+    for r in range(4):
+        if rank == 0:
+            x[r, 128 * r : 128 * (r + 1)] = 2.0
+        router_w[:, 128 * r] = logits[r] / 2
+    norm_w = torch.ones((hidden,), dtype=torch.bfloat16, device=device)
+    comm = AllReduceRmsnormMoeRoute(tp.cpu_group, 4, hidden, e, k)
+    tag = f"world {comm.world} rank {rank} routing edges"
+    try:
+        for renorm in (True, False):
+            out = fused_all_reduce_rmsnorm_moe_route(
+                x,
+                None,
+                norm_w,
+                EPS,
+                router_w,
+                comm,
+                scoring="softmax",
+                renormalize=renorm,
+            )
+            torch.cuda.synchronize()
+            ids_r, w_r, _ = _reference_route(
+                logits.cpu(), None, k, "softmax", 1, 1, renorm, 1.0
+            )
+            w = out["topk_weights"].cpu().double()
+            if not torch.equal(out["topk_ids"].cpu().long(), ids_r):
+                failures.append(f"{tag}: softmax top-k ids differ (renorm {renorm})")
+            if not (torch.isfinite(w).all() and torch.allclose(w, w_r, 1e-5, 1e-7)):
+                failures.append(
+                    f"{tag}: softmax weights {w.tolist()} (renorm {renorm})"
+                )
+        bias = torch.zeros((e,), dtype=torch.float32, device=device)
+        try:
+            fused_all_reduce_rmsnorm_moe_route(
+                x,
+                None,
+                norm_w,
+                EPS,
+                router_w,
+                comm,
+                correction_bias=bias,
+                scoring="softmax",
+            )
+            failures.append(f"{tag}: softmax with a correction bias was accepted")
+        except AssertionError:
+            pass
+        if comm.error() != [0, 0, 0, 0]:
+            failures.append(f"{tag}: error {comm.error()}")
+    finally:
+        comm.close()
+
+
 def _check_max_tokens(rank, device, tp, failures):
     """The constructor rejects a max_tokens that leaves no free CTA for a call. When it
     accepts a max_tokens, a call with that many tokens is correct. 300 tokens use a
@@ -456,6 +525,7 @@ def _worker(rank, world_size, init_method):
         for shape in SHAPES:
             _check_shape(rank, device, tp, shape, failures)
         _check_timeout(rank, device, tp, failures)
+        _check_routing_edges(rank, device, tp, failures)
         _check_max_tokens(rank, device, tp, failures)
         return failures
     finally:

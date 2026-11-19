@@ -536,7 +536,8 @@ def _select(
             w = my_w * routed_scale
     else:
         if RENORM:
-            top = gl.max(gl.where(lane == 0, lgk, neg), axis=0)
+            # the largest picked logit: no exp overflow
+            top = gl.max(gl.where(slot, lgk, neg), axis=0)
             ex = gl.where(slot, _exp2((lgk - top) * _LOG2E), 0.0)
             z = _bfly_op(ex, _BFLY_ADD)
         else:
