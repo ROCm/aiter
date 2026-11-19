@@ -72,6 +72,8 @@ class Path:
     the key (not claimed, or declined). Used by the CPU differential test; the GPU cases
     of each path are in tests/moe_dispatch/gpu_differential.py.
     `segments`: the segments the path resolves plans from; the ranking checks use them.
+    `supported_archs`: GPU architectures on which the path can claim calls. An empty set
+    means the path does not declare an architecture restriction.
     """
 
     name: str
@@ -81,6 +83,7 @@ class Path:
     dispatch_record: Callable[[tuple, dict], object] | None = None
     entry: str = "api"
     segments: tuple = ()
+    supported_archs: frozenset[str] = frozenset()
 
     def __post_init__(self):
         if self.entry not in ENTRIES:
