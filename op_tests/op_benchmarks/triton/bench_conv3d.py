@@ -20,9 +20,9 @@ from aiter.ops.triton.conv._prepack import (
 )
 from aiter.ops.triton.conv._utils import (
     BLOCK_K,
-    _conv3d_padding_geometry,
     _out_dhw,
-    _validate_conv3d_padding_mode,
+    _padding_geometry,
+    _validate_padding_mode,
 )
 from aiter.ops.triton.conv.conv3d import (
     _resolve_route,
@@ -173,10 +173,10 @@ def _selected_kernel(
     case: Conv3DCase, method: str, layout: str, padding_mode: str = "zeros"
 ) -> str:
     N, C, D, H, W, K, T, R, S = case.dims
-    _validate_conv3d_padding_mode(padding_mode, D, H, W, case.padding)
+    _validate_padding_mode(padding_mode, (D, H, W), case.padding)
     if method != "auto":
         return method
-    D, H, W, padding = _conv3d_padding_geometry(D, H, W, case.padding, padding_mode)
+    (D, H, W), padding = _padding_geometry((D, H, W), case.padding, padding_mode)
     return _resolve_route(
         T,
         R,
