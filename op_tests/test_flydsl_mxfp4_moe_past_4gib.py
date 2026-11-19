@@ -10,7 +10,7 @@ import torch
 
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe, moe_sorting, torch_moe_stage1, torch_moe_stage2
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 from aiter.ops.quant import (
     mxfp4_moe_sort_fwd,
@@ -30,7 +30,9 @@ from aiter.utility.fp4_utils import e8m0_shuffle
 Q_TYPE = QuantType.per_1x32
 BETA, LINEAR_BETA = 2.0, 1.5
 
-_SKIP = pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 FlyDSL required")
+_SKIP = pytest.mark.skipif(
+    get_gfx_runtime() != "gfx950", reason="gfx950 FlyDSL required"
+)
 
 
 def _check_close(ref, out, label, atol=1.0, rtol=0.05, max_err_ratio=0.05):
@@ -253,5 +255,13 @@ def test_a4w4_mxmoe_experts_past_4gib(monkeypatch):
     )
     torch.cuda.synchronize()
     assert stage1_calls, "fused_moe did not run the MXMOE stage 1"
-    rel = (out.float() - ref.float()).norm(dim=-1) / ref.float().norm(dim=-1)
+    ref, out = ref.float(), out.float()
+    rel = (out - ref).norm(dim=-1) / ref.norm(dim=-1)
     assert rel.max() < 0.1, f"a4w4 past 4 GiB: max row relative error {rel.max():.3f}"
+    # Per element, in row-RMS units: MXFP4 rounding flips of the intermediate
+    # reach 0.18 with this PR; experts read at the wrong offset put 82% past 0.2.
+    rms = ref.square().mean(dim=-1, keepdim=True).sqrt()
+    err = checkAllclose(
+        ref / rms, out / rms, rtol=0.1, atol=0.25, msg="a4w4 past 4 GiB"
+    )
+    assert err == 0, f"a4w4 past 4 GiB: {err:.2%} of elements outside rtol/atol"
