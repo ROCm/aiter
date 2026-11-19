@@ -19,6 +19,8 @@ import re
 import torch
 from torch import Tensor
 
+from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
+
 _launch_gemm_a8w8 = None
 _launch_gemm_a8w8_compute_bound = None
 _compile_splitk_reduce = None
@@ -36,6 +38,18 @@ MX32_COMPUTE_WMMA_NAME_PREFIX = "flydsl_mxfp8_32_bpreshuffle_compute_wmma"
 _SUPPORTED_NUM_BUFFERS = (2, 3, 4)
 _OUT_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "f16"}
 _MAX_SPLIT_K = 8
+
+
+@capture_scoped_cache
+def _fused_splitk_workspace(
+    device: torch.device,
+    stream_id: int,
+    shape: tuple[int, ...],
+) -> Tensor:
+    """Reuse stream-private fused split-K scratch in eager and graph modes."""
+    del stream_id
+    with persistent_alloc(device):
+        return torch.empty(shape, dtype=torch.float32, device=device)
 
 
 def _fused_splitk_ok(tile_m, cluster_m, cluster_n, split_k, compute_bound) -> bool:
@@ -423,9 +437,15 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     else:
         partial_shape = None
     partials = (
-        None
-        if partial_shape is None
-        else torch.empty(partial_shape, dtype=torch.float32, device=Out.device)
+        _fused_splitk_workspace(
+            Out.device, int(torch_stream.cuda_stream), tuple(partial_shape)
+        )
+        if fused
+        else (
+            None
+            if partial_shape is None
+            else torch.empty(partial_shape, dtype=torch.float32, device=Out.device)
+        )
     )
     gemm_out = Out if partials is None else partials
     out_is_f16 = 1 if out_dtype == "f16" else 0
