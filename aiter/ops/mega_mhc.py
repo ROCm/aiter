@@ -169,6 +169,7 @@ def _native_launcher(hidden):
         res_preshuffle: bool,
         scale_row_major: bool,
         persistent_workers: int = 0,
+        cluster_y: int = 1,
     ) -> None: ...
 
     launch.__name__ = f"_mega_mhc_stream_{suffix}"
@@ -406,6 +407,7 @@ def mega_mhc(
     res_preshuffle: bool = False,
     scale_row_major: bool = False,
     persistent_workers: int = 0,
+    cluster_y: int = 1,
 ):
     """Delayed post/pre/RMSNorm seam, returning (R, post, comb, norm, next_pre).
 
@@ -428,6 +430,8 @@ def mega_mhc(
     For the gfx1250 H5120 MXFP8 attention input (A01), persistent_workers=256
     selects the standalone MONO grid (16, 16) with four wave32s. The split32
     variant uses one resident cohort per row tile and the native workspace.
+    cluster_y=4 groups four workgroups along Y on this grid. The mHC device
+    function is identical for 1x1 and 1x4.
 
     out_dtype="mxfp8" (gfx950 and gfx1250) returns (norm, q, e8m0) in place of
     norm: the BF16 norm (T, H), float8_e4m3fn q (T, H) and uint8 E8M0 exponent
@@ -461,6 +465,8 @@ def mega_mhc(
     device = residual.device
     if not isinstance(persistent_workers, int) or persistent_workers not in (0, 256):
         raise ValueError("gfx1250 MONO requires persistent_workers=256")
+    if not isinstance(cluster_y, int) or cluster_y not in (1, 4) or (cluster_y != 1 and persistent_workers != 256):
+        raise ValueError("mHC cluster_y=4 requires P256; the default is 1")
     if persistent_workers and out_dtype != "mxfp8":
         raise ValueError("P256 mHC is available only for the MXFP8 attention input (A01)")
     if persistent_workers and (
@@ -591,5 +597,6 @@ def mega_mhc(
             res_preshuffle,
             scale_row_major,
             *((persistent_workers,) if persistent_workers else ()),
+            *((cluster_y,) if cluster_y != 1 else ()),
         )
     return residual_out, post_out, comb_out, layer_input, next_pre

@@ -50,7 +50,8 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                    bool mxfp8,
                    bool res_preshuffle,
                    bool scale_row_major,
-                   int persistent_workers = 0);
+                   int persistent_workers = 0,
+                   int cluster_y = 1);
 
 // gfx1250 kernels (mega_mhc_gfx1250.cu), reached through mega_mhc_bf16. With mxfp8,
 // quant_out is [T, H] E4M3 and quant_scale holds E8M0 bytes in the gfx1250 MXFP8
@@ -87,5 +88,6 @@ void mega_mhc_gfx1250(aiter_tensor_t& residual_out,
                       aiter_tensor_t& quant_scale,
                       bool mxfp8,
                       bool scale_row_major,
-                      int persistent_workers = 0);
+                      int persistent_workers = 0,
+                      int cluster_y = 1);
 } // namespace aiter

@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 
 #ifndef MHC_HIDDEN
 #error "MHC_HIDDEN must be set by the Mega-MHC module build recipe"
@@ -1553,6 +1554,35 @@ void check_tensor(const aiter_tensor_t& t,
                 " must be 16-byte aligned");
 }
 
+// The driver launch preserves physical cluster geometry during HIP Graph capture.
+template <typename... Args>
+void launch_ps_cluster(void (*kernel)(Args...), dim3 grid, int threads, int cluster_y,
+                       hipStream_t stream, std::type_identity_t<Args>... args)
+{
+#ifdef AITER_ENABLE_CLUSTER_LAUNCH
+    hipFunction_t function{};
+    HIP_CALL(hipGetFuncBySymbol(&function, reinterpret_cast<const void*>(kernel)));
+    hipLaunchAttribute cluster{};
+    cluster.id               = hipLaunchAttributeClusterDimension;
+    cluster.val.clusterDim.x = 1;
+    cluster.val.clusterDim.y = cluster_y;
+    cluster.val.clusterDim.z = 1;
+    HIP_LAUNCH_CONFIG config{};
+    config.gridDimX  = grid.x;
+    config.gridDimY  = grid.y;
+    config.gridDimZ  = grid.z;
+    config.blockDimX = threads;
+    config.blockDimY = config.blockDimZ = 1;
+    config.hStream   = stream;
+    config.attrs     = &cluster;
+    config.numAttrs  = 1;
+    void* params[]   = {&args...};
+    HIP_CALL(hipDrvLaunchKernelEx(&config, function, params, nullptr));
+#else
+    throw std::invalid_argument("clustered mHC requires gfx1250 cluster launch support");
+#endif
+}
+
 // COMPACT partials are [split][T][32]; otherwise [split][T/16][16][32]. With
 // a TAIL config, tokens from body_blocks * 16 on use TAIL split tiles.
 template <class C, class TAIL = void, bool COMPACT = C::PROTO == DISTRIBUTED>
@@ -1585,7 +1615,8 @@ void launch(int body_blocks,
             aiter_tensor_t& quant_out,
             aiter_tensor_t& quant_scale,
             bool mxfp8,
-            bool scale_row_major)
+            bool scale_row_major,
+            int cluster_y)
 {
     constexpr int H = C::H;
     AITER_CHECK(residual.is_gpu() && residual.dim() == 3 && residual.size(1) == 4,
@@ -1665,37 +1696,38 @@ void launch(int body_blocks,
         tail_token0 = body_blocks * BM;
         grid.x      = body_blocks + (blocks - body_blocks) * TAIL::SPLIT;
     }
-#define LAUNCH(POST, IDENTITY, MX)                                                           \
-    mega_mhc_kernel<C, TAIL, POST, IDENTITY, MX>                                             \
-        <<<grid, C::THREADS, 0, stream>>>(static_cast<const bf16*>(residual.data_ptr()),     \
-                                          static_cast<const bf16*>(sublayer_out.data_ptr()), \
-                                          static_cast<const float*>(post_mix.data_ptr()),    \
-                                          static_cast<const float*>(comb_mix.data_ptr()),    \
-                                          static_cast<const float*>(pre_mix.data_ptr()),     \
-                                          static_cast<const bf16*>(fn_packed.data_ptr()),    \
-                                          t,                                                 \
-                                          split_k,                                           \
-                                          static_cast<bf16*>(residual_out.data_ptr()),       \
-                                          static_cast<float*>(post_out.data_ptr()),          \
-                                          static_cast<float*>(comb_out.data_ptr()),          \
-                                          static_cast<bf16*>(layer_input.data_ptr()),        \
-                                          static_cast<float*>(next_pre.data_ptr()),          \
-                                          static_cast<const float*>(hc_scale.data_ptr()),    \
-                                          static_cast<const float*>(hc_base.data_ptr()),     \
-                                          static_cast<const bf16*>(norm_weight.data_ptr()),  \
-                                          static_cast<float*>(partials.data_ptr()),          \
-                                          static_cast<unsigned int*>(counters.data_ptr()),   \
-                                          h,                                                 \
-                                          rms_eps,                                           \
-                                          hc_pre_eps,                                        \
-                                          hc_sinkhorn_eps,                                   \
-                                          hc_post_mult,                                      \
-                                          norm_eps,                                          \
-                                          sinkhorn_repeat,                                   \
-                                          tail_token0,                                       \
-                                          static_cast<uint8_t*>(quant_out.data_ptr()),       \
-                                          static_cast<uint8_t*>(quant_scale.data_ptr()),     \
-                                          scale_row_major)
+#define MHC_ARGS \
+    static_cast<const bf16*>(residual.data_ptr()), \
+    static_cast<const bf16*>(sublayer_out.data_ptr()), \
+    static_cast<const float*>(post_mix.data_ptr()), \
+    static_cast<const float*>(comb_mix.data_ptr()), \
+    static_cast<const float*>(pre_mix.data_ptr()), \
+    static_cast<const bf16*>(fn_packed.data_ptr()), \
+    t, \
+    split_k, \
+    static_cast<bf16*>(residual_out.data_ptr()), \
+    static_cast<float*>(post_out.data_ptr()), \
+    static_cast<float*>(comb_out.data_ptr()), \
+    static_cast<bf16*>(layer_input.data_ptr()), \
+    static_cast<float*>(next_pre.data_ptr()), \
+    static_cast<const float*>(hc_scale.data_ptr()), \
+    static_cast<const float*>(hc_base.data_ptr()), \
+    static_cast<const bf16*>(norm_weight.data_ptr()), \
+    static_cast<float*>(partials.data_ptr()), \
+    static_cast<unsigned int*>(counters.data_ptr()), \
+    h, \
+    rms_eps, \
+    hc_pre_eps, \
+    hc_sinkhorn_eps, \
+    hc_post_mult, \
+    norm_eps, \
+    sinkhorn_repeat, \
+    tail_token0, \
+    static_cast<uint8_t*>(quant_out.data_ptr()), \
+    static_cast<uint8_t*>(quant_scale.data_ptr()), \
+    scale_row_major
+#define LAUNCH(POST, IDENTITY, MX) \
+    mega_mhc_kernel<C, TAIL, POST, IDENTITY, MX><<<grid, C::THREADS, 0, stream>>>(MHC_ARGS)
 #define DISPATCH(MX)                  \
     if(has_post)                      \
     {                                 \
@@ -1713,7 +1745,11 @@ void launch(int body_blocks,
     }
     if constexpr(C::MONO)
     {
-        LAUNCH(true, false, true);
+        if(cluster_y == 1)
+            LAUNCH(true, false, true);
+        else
+            launch_ps_cluster(mega_mhc_kernel<C, TAIL, true, false, true>,
+                              grid, C::THREADS, cluster_y, stream, MHC_ARGS);
     }
     else if(mxfp8)
     {
@@ -1725,6 +1761,7 @@ void launch(int body_blocks,
     }
 #undef DISPATCH
 #undef LAUNCH
+#undef MHC_ARGS
     HIP_CALL(hipGetLastError());
 }
 
@@ -1762,7 +1799,8 @@ void mega_mhc_gfx1250(aiter_tensor_t& residual_out,
                       aiter_tensor_t& quant_scale,
                       bool mxfp8,
                       bool scale_row_major,
-                      int persistent_workers)
+                      int persistent_workers,
+                      int cluster_y)
 {
     using namespace gfx1250_mhc;
     auto run = [&]<class C, class TAIL = void, bool COMPACT = C::PROTO == DISTRIBUTED>(
@@ -1796,7 +1834,8 @@ void mega_mhc_gfx1250(aiter_tensor_t& residual_out,
                                  quant_out,
                                  quant_scale,
                                  mxfp8,
-                                 scale_row_major);
+                                 scale_row_major,
+                                 cluster_y);
     };
     if(persistent_workers)
     {

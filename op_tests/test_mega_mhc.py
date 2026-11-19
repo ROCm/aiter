@@ -224,6 +224,7 @@ class _BenchmarkBackend:
         scale_row_major=False,
         norm_eps=1e-6,
         persistent_workers=0,
+        cluster_y=1,
     ):
         self.name = name
         self.res_preshuffle = res_preshuffle
@@ -232,6 +233,7 @@ class _BenchmarkBackend:
         self.scalar_args = scalar_args
         self.norm_eps = norm_eps
         self.persistent_workers = persistent_workers
+        self.cluster_y = cluster_y
         self.out_dtype = out_dtype
         if name == "triton" and out_dtype != "bf16":
             raise ValueError("Triton Mega-MHC has no fused mxfp8 output")
@@ -252,6 +254,7 @@ class _BenchmarkBackend:
         if self.name == "hip":
             if self.persistent_workers:
                 kw["persistent_workers"] = self.persistent_workers
+                kw["cluster_y"] = self.cluster_y
             kw["workspace"] = self.workspace
             kw["w_preshuffle_bf16"] = True
             if self.res_preshuffle:
@@ -307,6 +310,7 @@ def benchmark_mega_mhc(
     rms_eps=ARGS[0],
     norm_eps=1e-6,
     persistent_workers=0,
+    cluster_y=1,
 ):
     """Check one M/H/mode/dtype combination and return its backend results.
 
@@ -351,7 +355,7 @@ def benchmark_mega_mhc(
             workspace = prepare_mega_mhc(args[0].device, m, hidden_size)
         row_major = name == "hip" and scale_row_major
         caller = _BenchmarkBackend(
-            name, args[4:], out_dtype, workspace, shuffled, row_major, norm_eps
+            name, args[4:], out_dtype, workspace, shuffled, row_major, norm_eps, cluster_y=cluster_y
         )
 
         def check_backend(out, shuffled=shuffled, row_major=row_major):
@@ -420,13 +424,14 @@ def test_p256_a01_bf16_midpoints():
             pre[:, 0].fill_(1 + 2**-8)
             pre[:, 3].fill_(2**-27)
         frozen = None
-        for workers in (0, 256):
+        for workers, cluster_y in ((0, 1), (256, 1), (256, 4)):
             result = mega_mhc(
                 residual, packed, scale, base, 1e-20, 1e-6, 1e-6, 2.0, 20, pre,
                 sublayer_out=sublayer, post_layer_mix=post, comb_res_mix=comb,
                 norm_weight=weight, norm_eps=2**32, workspace=workspace,
                 w_preshuffle_bf16=True, out_dtype="mxfp8", scale_row_major=True,
                 persistent_workers=workers,
+                cluster_y=cluster_y,
             )
             tensors, _ = tree_flatten(result)
             tensors.append(workspace.partials.view(32, m, 32)[:, :, :26].contiguous())
@@ -510,7 +515,11 @@ def main():
     parser.add_argument("--rms-eps", type=float, default=ARGS[0])
     parser.add_argument("--norm-eps", type=float, default=1e-6)
     parser.add_argument("--persistent-workers", type=int, default=0)
+    parser.add_argument("--cluster-y", type=int, choices=(1, 4), default=1,
+                        help="physical cluster Y for the P256 HIP kernel (X=1)")
     args = parser.parse_args()
+    if args.cluster_y != 1 and args.persistent_workers != 256:
+        parser.error("--cluster-y 4 requires --persistent-workers 256")
     if args.persistent_workers and any(dtype != "mxfp8" for dtype in args.out_dtype):
         parser.error("--persistent-workers requires --out-dtype mxfp8 (A01)")
     if any(m < 0 for m in args.tokens):
@@ -584,6 +593,7 @@ def main():
                 args.rms_eps,
                 args.norm_eps,
                 args.persistent_workers,
+                args.cluster_y,
             )
         )
     columns = ["m", "hidden_size", "mode", "out_dtype"]

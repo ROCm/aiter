@@ -2627,8 +2627,11 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                    bool mxfp8,
                    bool res_preshuffle,
                    bool scale_row_major,
-                   int persistent_workers)
+                   int persistent_workers,
+                   int cluster_y)
 {
+    if(cluster_y != 1 && (cluster_y != 4 || persistent_workers != 256))
+        throw std::invalid_argument("mHC cluster 1x4 requires P256");
     {
         const HipDeviceGuard guard(residual.device_id);
         if(get_gpu_arch() == "gfx1250")
@@ -2664,7 +2667,8 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
                              quant_scale,
                              mxfp8,
                              scale_row_major,
-                             persistent_workers);
+                             persistent_workers,
+                             cluster_y);
             return;
         }
     }

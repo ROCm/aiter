@@ -40,5 +40,6 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("mxfp8"),
           py::arg("res_preshuffle"),
           py::arg("scale_row_major"),
-          py::arg("persistent_workers") = 0);
+          py::arg("persistent_workers") = 0,
+          py::arg("cluster_y") = 1);
 }
