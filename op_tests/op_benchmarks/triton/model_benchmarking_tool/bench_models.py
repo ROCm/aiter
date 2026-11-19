@@ -241,6 +241,18 @@ class GemmKernelHandler(KernelHandler):
         }
 
 
+# MoE benchmarks print one line per batch. Each layer group is
+# "<name> <us>us <TF/s> TF/s <TB/s> TB/s", optionally followed by " [kernel]".
+# a4w4 omits that bracket and prints the kernel name once after the groups.
+# `total` is both GEMMs back to back, the whole MLP.
+_MOE_TOTAL_RE = re.compile(
+    r"total\s+"
+    r"(?P<us>\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)us\s+"
+    r"(?P<tflops>\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s+TF/s\s+"
+    r"(?P<tbps>\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s+TB/s"
+)
+
+
 class MoeKernelHandler(KernelHandler):
     """Handler for MoE benchmarks."""
 
@@ -257,22 +269,21 @@ class MoeKernelHandler(KernelHandler):
         return f"--M {M} --shape {dim1} {dim2} --experts {E} {topk}"
 
     def parse_stdout(self, stdout: str) -> float:
-        lines = [line for line in stdout.splitlines() if line.strip()]
-        data_line = lines[-1]
-        data: dict[str, float] = {}
-        for result in data_line.split("|"):
-            key, value = result.split(":")
-            data[key.strip()] = float(value.strip())
+        matches = list(_MOE_TOTAL_RE.finditer(stdout))
+        if not matches:
+            raise ValueError(f"Unexpected MoE bench output format: {stdout!r}")
+        measurement = matches[-1]
+        us = float(measurement.group("us"))
+        tflops = float(measurement.group("tflops"))
+        tbps = float(measurement.group("tbps"))
         metric = self._metric
         if metric == "time":
-            bench_result = data["Kernel latency (us)"] * 1e-3  # Convert from us to ms
-        elif metric == "throughput":
-            bench_result = data["TFLOPS"]
-        elif metric == "bandwidth":
-            bench_result = data["TBPS"] * 1e3  # Convert from TBps to GBps
-        else:
-            raise ValueError(f"Unknown metric: {metric}")
-        return bench_result
+            return us * 1e-3  # us -> ms
+        if metric == "throughput":
+            return tflops
+        if metric == "bandwidth":
+            return tbps * 1e3  # TB/s -> GB/s
+        raise ValueError(f"Unknown metric: {metric}")
 
     def build_result_row(self, bench_result: float | str) -> ResultRow:
         shape = self._shape
