@@ -185,7 +185,11 @@ def run_case(path_name, case):
 
 
 def _child(args):
-    sys.path.insert(0, str(_HERE.parent))
+    # `tests` so `moe_dispatch` imports, and the repository root so `aiter` is
+    # this checkout rather than an installed copy.
+    sys.path[:0] = [
+        p for p in (str(_HERE.parent), str(_HERE.parents[1])) if p not in sys.path
+    ]
     import torch
 
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime

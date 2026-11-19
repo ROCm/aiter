@@ -58,9 +58,12 @@ print("@@RESULT@@" + json.dumps(rows))
 
 
 def _gfx():
-    from aiter.jit.utils.chip_info import get_gfx
+    # The baseline names the hardware the numbers were measured on, so this is
+    # get_gfx_runtime(): get_gfx() follows GPU_ARCHS and returns its last entry on a
+    # multi-target build, which would read or write another GPU's baseline.
+    from aiter.jit.utils.chip_info import get_gfx_runtime
 
-    return get_gfx()
+    return get_gfx_runtime()
 
 
 def run_case(case, tokens):

@@ -36,7 +36,11 @@ SAME_AS_BASE = "=base"
 
 
 def _setup(frozen=True):
-    sys.path.insert(0, str(_HERE.parent))
+    # `tests` so `moe_dispatch` imports, and the repository root so `aiter` is
+    # this checkout rather than an installed copy.
+    sys.path[:0] = [
+        p for p in (str(_HERE.parent), str(_HERE.parents[1])) if p not in sys.path
+    ]
     from moe_dispatch import arch_sim
 
     tables = None
