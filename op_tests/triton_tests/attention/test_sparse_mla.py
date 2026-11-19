@@ -599,6 +599,37 @@ def test_sparse_mla_fp8_h64_decode(C, draw):
     assert e < 2e-2, f"C={C} {draw}: rel-err {e:.3e}"
 
 
+@pytest.mark.parametrize("C", H64_ROWS)
+@pytest.mark.parametrize("span", ["2g", "4g"])
+def test_sparse_mla_fp8_h64_decode_big_pool(C, span):
+    """Caches past buffer_load's signed 32-bit offset range route too and gather
+    with 64-bit global offsets; past 2**32 B the rows that form offsets in
+    uint32 (NARROW_FORM 1 and 2) switch to the int64 form. The live rows sit at
+    the end of the pool so every gathered offset is past the limit under test."""
+    _skip_unless_supported("fp8", "tensor")
+    if not smd._gluon_supported()[0]:
+        pytest.skip(smd._gluon_supported()[1])
+    sm = 0.0625
+    q8, q_scale, cache, ks, ptr, ids = _h64_inputs(C, "wide", seed=C)
+    live = cache.shape[0]
+    rows = ((1 << 31) if span == "2g" else (1 << 32)) // D_QK + live
+    big = torch.zeros(rows, D_QK, dtype=torch.uint8, device="cuda")
+    big[rows - live :] = cache
+    buffer_cache, narrow_ok = smd._h64_cache_forms(big)
+    assert not buffer_cache and narrow_ok == (span == "2g")
+    shifted = torch.where(ids >= 0, ids + (rows - live), ids)
+    idx = shifted.flatten()
+    assert smd._h64_decode_config(q8, big, 1, idx) is not None
+    out, lse = sparse_mla_fwd(
+        q8, big, ptr, idx, sm, kv_scale=ks, has_invalid=True,
+        dot_precision="fp8", q_scale=q_scale,
+    )  # fmt: skip
+    del big
+    assert lse is None and not out.isnan().any()
+    e = rel_err(out, _h64_reference(q8, q_scale, cache, ks, ids, sm))
+    assert e < 2e-2, f"C={C} {span}: rel-err {e:.3e}"
+
+
 def test_sparse_mla_fp8_h64_decode_out_buffer():
     """A caller's output wider than kv_lora_rank is written in its leading columns."""
     _skip_unless_supported("fp8", "tensor")
@@ -616,9 +647,7 @@ def test_sparse_mla_fp8_h64_decode_out_buffer():
     assert e < 2e-2, f"out buffer: rel-err {e:.3e}"
 
 
-@pytest.mark.parametrize(
-    "case", ["rows3", "bf16_q", "bf16_dots", "no_invalid", "big_pool"]
-)
+@pytest.mark.parametrize("case", ["rows3", "bf16_q", "bf16_dots", "no_invalid"])
 def test_sparse_mla_fp8_h64_decode_fallback(case):
     """Calls the 64-head decode kernels do not take keep the previous path."""
     _skip_unless_supported("fp8", "tensor")
@@ -628,11 +657,6 @@ def test_sparse_mla_fp8_h64_decode_fallback(case):
     if case == "no_invalid":
         ids = torch.where(ids < 0, ids[:, :1], ids)
     idx = ids.flatten()
-    if case == "big_pool":
-        rows = (1 << 31) // D_QK + 1
-        big = torch.zeros(rows, D_QK, dtype=torch.uint8, device="cuda")
-        big[: cache.shape[0]] = cache
-        cache = big
     q, kw = q8, {"dot_precision": "fp8", "q_scale": q_scale}
     if case == "bf16_q":
         q, kw = (q8.float() * q_scale).to(torch.bfloat16), {"dot_precision": "fp8"}
@@ -648,6 +672,6 @@ def test_sparse_mla_fp8_h64_decode_fallback(case):
     out, _ = sparse_mla_fwd(
         q, cache, ptr, idx, sm, kv_scale=ks, has_invalid=case != "no_invalid", **kw
     )  # fmt: skip
-    ref = _h64_reference(q8, q_scale, cache[: 1 << 16], ks, ids, sm)
+    ref = _h64_reference(q8, q_scale, cache, ks, ids, sm)
     e = rel_err(out, ref)
     assert e < 7e-2, f"{case}: rel-err {e:.3e}"

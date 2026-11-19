@@ -737,8 +737,8 @@ def _h64_decode_config(q, cache, block_size, kv_indices) -> dict | None:
 
     The kernels read q as a contiguous [C, 64, 576] tensor, the cache as flat
     576 B rows, and C * 2048 indices as one 2048-wide window per row from
-    kv_indptr[row]. Only the row counts in the config run, and only on caches
-    under 2**31 B, where they were measured.
+    kv_indptr[row]. Only the row counts in the config run. Any cache size is
+    taken: see _h64_cache_forms for how the kernels address it.
     """
     C, H, row = q.shape
     if H != _H64_HEADS or row != _H64_ROW or not q.is_contiguous():
@@ -747,12 +747,27 @@ def _h64_decode_config(q, cache, block_size, kv_indices) -> dict | None:
         return None
     if block_size != 1 or cache.ndim != 2 or cache.stride() != (row, 1):
         return None
-    if cache.numel() == 0 or max_addressable_bytes(cache) >= 2**31 - 1:
+    if cache.numel() == 0:
         return None
     cfg = _h64_rows().get(f"M_{C}")
     if cfg is None or not _gluon_supported()[0]:
         return None
     return cfg
+
+
+def _h64_cache_forms(kv) -> tuple[bool, bool]:
+    """(buffer_cache, narrow_ok) for the cache the 64-head kernels address.
+
+    buffer_cache: the whole cache lies within buffer_load's signed 32-bit
+    offset range, so the kernels gather with buffer loads. Otherwise they
+    gather with 64-bit global offsets.
+    narrow_ok: in the global arm, the "small" kernel's NARROW_FORM 1 and 2
+    (rows 2 and 8) form slot * 576 in uint32, which needs the cache to span
+    under 2**32 B. Past that the host selects the clamped int64 form
+    (NARROW_FORM 0), as the pack these kernels come from does.
+    """
+    span = max_addressable_bytes(kv)
+    return span < 2**31 - 1, span < 2**32
 
 
 @functools.lru_cache(maxsize=1)
@@ -772,8 +787,10 @@ def _sparse_mla_fwd_gfx950_fp8_h64(
     kv = cache.view(torch.float8_e4m3fn)
     kv_scale = kv_scale.reshape(1).to(torch.float32).contiguous()
     out = _check_out(out, q, 512)
-    buffer_cache = max_addressable_bytes(kv) < 2**31 - 1
+    buffer_cache, narrow_ok = _h64_cache_forms(kv)
     pc, mc = cfg["partials"], cfg["merge"]
+    if not buffer_cache and not narrow_ok and pc.get("NARROW_FORM"):
+        pc = {**pc, "NARROW_FORM": 0}
     args = (q, kv, kv_indices, kv_indptr)
     scales = (float(softmax_scale), q_scale, kv_scale)
     out_args = (out, kv_scale, out.stride(0), out.stride(1))
