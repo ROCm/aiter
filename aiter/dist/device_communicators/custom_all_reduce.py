@@ -287,10 +287,6 @@ _LAMPORT_AR_RMS_MAX_SIZE_ENV = "AITER_CUSTOM_AR_LAMPORT_RMS_MAX_SIZE"
 # gfx1250, CUDA graphs, bf16 and fp16 alike). Unmeasured world sizes take the
 # one-shot up to the cap, as the other Lamport ops do.
 _LAMPORT_AR_1SHOT_MAX_BYTES = {2: 9 * 1024 * 1024, 4: 1280 * 1024}
-# Plain all-reduce on the Lamport inbox up to this many bytes (0 = off).
-_LAMPORT_AR_MAX_SIZE = int(
-    os.environ.get("AITER_CUSTOM_AR_LAMPORT_AR_MAX_SIZE", "0") or 0
-)
 # INT4-coded Lamport two-shot (lossy, bf16) window (bytes): (MIN, MAX], MAX also sizes its inbox (0 = off).
 _Q4_2S_MAX_SIZE = int(os.environ.get("AITER_CUSTOM_AR_Q4_2S_MAX_SIZE", "0") or 0)
 _Q4_2S_MIN_SIZE = int(os.environ.get("AITER_CUSTOM_AR_Q4_2S_MIN_SIZE", "0") or 0)
@@ -2589,30 +2585,6 @@ class CustomAllreduce:
             and 0 < nbytes <= self._lamport_max_bytes
         )
 
-    def should_lamport_ar(self, inp: torch.Tensor) -> bool:
-        """Opt-in plain all-reduce on the Lamport inbox (one-shot): inputs of at
-        most AITER_CUSTOM_AR_LAMPORT_AR_MAX_SIZE bytes. Shape-only, so every
-        rank decides the same."""
-        cap = _LAMPORT_AR_MAX_SIZE
-        return (
-            cap > 0
-            and inp.numel() * inp.element_size() <= cap
-            and self.should_lamport_ar_add(inp, inp)
-        )
-
-    def lamport_all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
-        """all_reduce(inp) on the Lamport inbox: lamport_ar_add with a zero
-        addend (inp + 0 rounds to inp, so the result has the plain sum's bits)."""
-        zeros = getattr(self, "_lamport_zeros", None)
-        n = inp.numel()
-        if zeros is None or zeros.dtype != inp.dtype or zeros.numel() < n:
-            zeros = torch.zeros(
-                max(n, self._lamport_max_bytes // inp.element_size()),
-                dtype=inp.dtype,
-                device=inp.device,
-            )
-            self._lamport_zeros = zeros
-        return self.lamport_ar_add(inp, zeros[:n].view(inp.shape))
     def should_lamport_q4_2s(self, inp: torch.Tensor) -> bool:
         """Opt-in INT4 Lamport two-shot (lossy) for bf16 inputs of
         AITER_CUSTOM_AR_Q4_2S_MIN_SIZE < bytes <= the inbox cap."""
