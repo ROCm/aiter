@@ -311,6 +311,10 @@ def build_gemm_a8w4_tdm_task(
             raise ValueError("one peer's buffer-store extent must be below 4GiB")
         raw_drain = 1
 
+    ep_preissue_barrier = bool(
+        persistent_workers and enable_ep_scatter and not ep_buffer_store
+    )
+
     def task_barrier():
         # gpu.barrier() can insert store waits; ISA requires LDS-only
         # ownership transfer here so prior peer stores remain in flight.
@@ -660,6 +664,7 @@ def build_gemm_a8w4_tdm_task(
         if ep_buffer_store
         else ""
     ) + f"_prebarrier{ksl1_prefence_mma}_barrier{wmma_in_barrier}"
+    _prefence += "_preissuerawbarrier" if ep_preissue_barrier else ""
     _prefence += f"_ksl0tail_{ksl0_fence_mma}"
     if a_is_fp4 and KWS > 1 and ksl0_prefix_mma:
         _prefence += f"_ksl0prefix{ksl0_prefix_mma}"
@@ -2081,6 +2086,16 @@ def build_gemm_a8w4_tdm_task(
                     _rm_weight_rows.append(
                         _weight_valid.select(_weight, fx.Float32(0.0))
                     )
+            if const_expr(ep_preissue_barrier):
+                # Prior-task tensor stores retire per wave in the epilogue.
+                # Rendezvous only before the first LDS writer, allowing the
+                # next task's register-only metadata setup to run ahead.
+                # gpu.barrier lowers to loadcnt0 here (preissue ISA line2530),
+                # unnecessarily draining metadata loads. Raw rendezvous keeps
+                # them in flight; prior-task tensor_wait already retired C.
+                rocdl.s_wait_dscnt(0)
+                rocdl.s_barrier_signal(-1)
+                rocdl.s_barrier_wait(-1)
             if const_expr(tdm_as_in_prologue):
                 issue_as_prologue()
                 # The first normal pipeline fence covers this oldest TDM load.
@@ -3146,7 +3161,7 @@ def build_gemm_a8w4_tdm_task(
                 # Same region as drain_start / epi_start (inside has_work).
                 item_hooks[0]["epi_end"]()
 
-        if const_expr(persistent_workers > 0):
+        if const_expr(persistent_workers > 0 and not ep_preissue_barrier):
             if const_expr(raw_drain or defer_c_wait):
                 # LDS hand-off only (S1F: the next item's slot). The output
                 # store no longer reads what the next prologue writes: either

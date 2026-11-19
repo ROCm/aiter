@@ -1,5 +1,14 @@
 # S1F pull dispatch: current code and experiment handoff
 
+**Latest refinement: persistent GEMM2 now rendezvous immediately before the next
+task's first TDM issue, using raw signal/wait. Per-wave output tensor_wait(0)
+remains at the previous task's end.** Two fresh interleaved runs per mode give
+GEMM2 **561.66 -> 545.44us (-2.89%)** and native E2E **1577.90 -> 1526.04us/layer
+(-3.29%)**, versus the same persistent256 configuration with the old task-end
+barrier. Full-size correctness and emitted ISA checked; no new flag needed.
+See [barrier relocation results](op_tests/multigpu_tests/mega_moe_diagnostics/RESULTS_EP_PREISSUE_BARRIER_20261119.md).
+The earlier comparisons below remain historical and use different controls.
+
 **Latest measured selection (2026-11-19): original gather/preshuffled S1F,
 P96/C160 with affinity3:5, and GEMM2 TDM gather scatter with persistent256.**
 At16384 tokens/rank (65536 global), two interleaved runs per mode give

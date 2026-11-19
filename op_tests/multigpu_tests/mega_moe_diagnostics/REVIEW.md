@@ -226,3 +226,35 @@ Final selected-mode outcome (2026-11-19):
   stores, one storecnt in exit block .LBB0_51, outside all CFG cycles.
 - AST parse, shell syntax and git diff whitespace checks pass. Post-test edits
   only add reports/results; no kernel change follows final validation.
+
+Persistent TDM pre-issue barrier experiment, three prelaunch review passes:
+1. Restrict relocation to persistent EP scatter with TDM output, not buffer
+   stores or S1F/GEMM1. Retain each wave's epilogue tensor_wait(0). No LDS layout,
+   task assignment, output addresses or allocation changes.
+2. Metadata before the new barrier uses registers/global loads only. Place it
+   before optional issue_as_prologue as well as A/B issue_prologue, so the
+   earliest possible TDM LDS writer is covered. All waves take has_work together;
+   skipped tasks do not touch LDS. Final task drains its own TDM on every wave.
+3. First task also rendezvous (one extra startup barrier, replacing the final
+   closing barrier). Cluster multicast policy unchanged. Run six full-size
+   changing-route replays and inspect emitted loop ordering before timing.
+
+Pre-issue raw rendezvous, three prelaunch review passes:
+1. Regular moved-barrier version passed six full-size routing replays. Its
+   actual ISA contains loadcnt_dscnt0 before signal/wait, draining next-task
+   metadata loads. Change only that barrier to dscnt0 + raw signal/wait.
+2. Previous-task tensor_wait0 stays on every wave. No global-memory handoff
+   occurs between waves here; metadata lives in the issuing wave's registers,
+   and compiler use-site waits remain. LDS output reads have already retired.
+3. Keep first-task rendezvous and uniform has_work guard. Verify raw preissue
+   ISA, rerun full changing-route correctness, then time with identical inputs.
+
+Pre-issue barrier final outcome:
+- Regular/raw candidates each passed full-size six-replay correctness.
+- Raw ISA retains previous-task tensor_wait0, then next-task metadata, then
+  dscnt0 + signal/wait before the first tensor load. Metadata loadcnt0 moves
+  later into the GEMM pipeline. Original regular barrier drains it pre-issue.
+- Two interleaved controls/candidates: GEMM2 561.66 -> 545.44us (-2.89%),
+  E2E/layer1577.90 -> 1526.04us (-3.29%). Retain tested raw source unchanged.
+- Test purpose is synchronization across task LDS reuse with changing routes;
+  numerical reference is existing push/persistent TDM, not a new fp32 oracle.
