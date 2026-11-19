@@ -386,14 +386,17 @@ def test_a_declined_call_runs_on_legacy(monkeypatch):
     from aiter.moev2 import paths
     from aiter.moev2.migration import a8w8_pt
 
-    monkeypatch.setattr(a8w8_pt, "_dispatch", lambda *a: None)
-    monkeypatch.setattr(
-        a8w8_pt.executor,
-        "prologue",
-        lambda call, remap: {"hidden_states": torch.empty(2, 64)},
-    )
+    prepares = []
+
+    def prologue(call, remap, *, prepare=True):
+        prepares.append(prepare)
+        return {"hidden_states": torch.empty(2, 64)}
+
+    monkeypatch.setattr(a8w8_pt, "_dispatch", lambda *a, **k: None)
+    monkeypatch.setattr(a8w8_pt.executor, "prologue", prologue)
     monkeypatch.setattr(api, "dispatch_key", lambda c: ((), {}, None))
     assert a8w8_pt.run({}) is paths.DECLINED
+    assert prepares == [False]
 
 
 def test_explain_lists_problem_structures_and_choice(monkeypatch, caplog):

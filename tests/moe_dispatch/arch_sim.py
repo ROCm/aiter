@@ -108,8 +108,12 @@ def simulated_arch(name):
     import aiter.fhmoe as _fhmoe  # noqa: F401 - preload before scanning bindings
     import aiter.fused_moe as fm
     from aiter.jit.utils import chip_info
+    from aiter.moev2 import paths
     from aiter.utility import dtypes
 
+    # Built-in paths bind chip-info helpers at import time. Load them before the module
+    # scan so every alias is patched for this context and restored when it exits.
+    paths.registered()
     gfx, cu_num = ARCHS[name]
     fakes = {
         "get_gfx": lambda: gfx,

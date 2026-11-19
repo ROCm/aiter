@@ -44,6 +44,7 @@ SEGMENTS = (
 # hidden_states rows. _fused_moe_impl's _metadata_transform then replaces the result
 # with the first lookup's, so the second lookup only logs, or raises.
 _RELOOKUP_DROPS = frozenset({"act_scales", "num_local_tokens", "scatter"})
+_UNRESOLVED = object()
 
 
 def claims(call) -> bool:
@@ -151,7 +152,7 @@ def _relookup_decline(problem, token):
 
 
 @tuned.cached(maxsize=2048)
-def _dispatch(args, kwargs_items, arch, cu_num, token):
+def _dispatch(args, kwargs_items, arch, cu_num, token, emit=True):
     """`(resolution, problem)` for a key, or None when declined.
 
     `token` is the bucketed `hidden_states` row count. `problem` is None when no second
@@ -160,11 +161,13 @@ def _dispatch(args, kwargs_items, arch, cu_num, token):
     problem = api.problem_from_key(args, dict(kwargs_items), arch, cu_num)
     reason = _relookup_decline(problem, token)
     if reason is not None:
-        if overrides.explain():
+        if emit and overrides.explain():
             line = f"declined: {reason}; the legacy code runs this call"
             resolver.Resolution(None, declined=reason, explain=(line,)).emit()
         return None
-    primary = _resolve(problem, False)
+    primary = _resolve(problem, False) if emit else _peek(problem)
+    if primary is None:
+        return _UNRESOLVED
     if primary.plan is None:
         return None
     if primary.metadata.full_impl is not None:
@@ -173,11 +176,24 @@ def _dispatch(args, kwargs_items, arch, cu_num, token):
 
 
 def run(call):
+    preview = executor.prologue(call, quant_remap, prepare=False)
+    args, kwargs, _ = api.dispatch_key(preview)
+    token = get_padded_M(preview["hidden_states"].shape[0])
+    where = (args, tuple(kwargs.items()), get_gfx_runtime(), get_cu_num(), token)
+    previewed = _dispatch(*where, emit=False)
+    if previewed is None:
+        _dispatch(*where, emit=True)
+        return paths.DECLINED
+
     c = executor.prologue(call, quant_remap)
     args, kwargs, q_dtype_a = api.dispatch_key(c)
-    token = get_padded_M(c["hidden_states"].shape[0])
     dispatched = _dispatch(
-        args, tuple(kwargs.items()), get_gfx_runtime(), get_cu_num(), token
+        args,
+        tuple(kwargs.items()),
+        get_gfx_runtime(),
+        get_cu_num(),
+        token,
+        emit=True,
     )
     if dispatched is None:
         return paths.DECLINED
@@ -215,5 +231,6 @@ PATH = paths.Path(
     dispatch_record=dispatch_record,
     entry="op",
     segments=SEGMENTS,
+    supported_archs=frozenset(ARCHS),
 )
 paths.register(PATH)

@@ -101,12 +101,28 @@ def _registered():
     return sorted(paths.registered())
 
 
+def _path_supports_device(path_name, gfx=None):
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+    from aiter.moev2 import paths
+
+    path = paths.registered()[path_name]
+    gfx = get_gfx_runtime() if gfx is None else gfx
+    return not path.supported_archs or gfx in path.supported_archs
+
+
+def test_gpu_differential_architecture_filter():
+    assert _path_supports_device("a8w8_pt", "gfx950")
+    assert not _path_supports_device("a8w8_pt", "gfx1250")
+
+
 @pytest.mark.parametrize("path_name", _registered())
 def test_outputs_match_legacy(path_name):
     import torch
 
     if not torch.cuda.is_available():
         pytest.skip("needs a GPU")
+    if not _path_supports_device(path_name):
+        pytest.skip(f"{path_name} does not support this GPU architecture")
     proc = subprocess.run(
         [
             sys.executable,

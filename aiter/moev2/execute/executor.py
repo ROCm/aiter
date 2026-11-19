@@ -47,8 +47,13 @@ class Call:
         return self.args[name]
 
 
-def prologue(call, quant_remap) -> Call:
-    """The validation and derived values of `_fused_moe_impl`, up to the dispatch key."""
+def prologue(call, quant_remap, *, prepare=True) -> Call:
+    """The validation and derived values of `_fused_moe_impl`, up to dispatch.
+
+    ``prepare=False`` builds a side-effect-free dispatch preview. A path that accepts the
+    preview calls the full prologue before execution; a declined call reaches legacy
+    without materializing a strided activation or validating its output buffer twice.
+    """
     activation = ActivationType(call["activation"])
     quant_type = QuantType(call["quant_type"])
     gate_mode = GateMode(call["gate_mode"])
@@ -58,7 +63,11 @@ def prologue(call, quant_remap) -> Call:
     hidden_states, w1, w2 = call["hidden_states"], call["w1"], call["w2"]
     M, topk = call["topk_ids"].shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    if not hidden_states.is_contiguous() and not _is_row_major_2d(hidden_states):
+    if (
+        prepare
+        and not hidden_states.is_contiguous()
+        and not _is_row_major_2d(hidden_states)
+    ):
         hidden_states = hidden_states.contiguous()
         call = {**call, "hidden_states": hidden_states}
 
@@ -75,11 +84,12 @@ def prologue(call, quant_remap) -> Call:
         dtypes.fp16,
         dtypes.bf16,
     ], f"Fused_moe unsupported out dtype: {dtype}"
-    output = call["output"]
-    _validate_output_buffer_metadata(
-        output, (M, model_dim), dtype, hidden_states.device
-    )
-    _validate_output_buffer_no_overlap(output, hidden_states)
+    if prepare:
+        output = call["output"]
+        _validate_output_buffer_metadata(
+            output, (M, model_dim), dtype, hidden_states.device
+        )
+        _validate_output_buffer_no_overlap(output, hidden_states)
     quant_type = quant_remap.get(quant_type, quant_type)
     return Call(
         call,
