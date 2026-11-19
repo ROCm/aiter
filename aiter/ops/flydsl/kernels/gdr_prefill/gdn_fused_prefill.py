@@ -108,6 +108,34 @@ def _mfma16(a4, b4, c4):
     )
 
 
+def _cat8(x4, y4):
+    return fx.Vector(x4).shuffle(fx.Vector(y4), [0, 1, 2, 3, 4, 5, 6, 7])
+
+
+def _mfma16_pair(a0, b0, a1, b1, c4):
+    """``a0 @ b0 + a1 @ b1`` as one 16x16x32 MFMA.
+
+    Lane (c, gq) of 16x16x32 supplies K indices 8gq..8gq+7. Concatenating the
+    two 16x16x16 operands maps those to (pair, 4gq + e) on both A and B.
+    """
+    return _mfma32(_cat8(a0, a1), _cat8(b0, b1), c4)
+
+
+def _acc_switch(acc):
+    """Stall ``acc`` before a different MFMA opcode reads it as source C.
+
+    gfx950 forwards a full-register accumulator only within one opcode. Both
+    of these 16x16 bf16 instructions are 4-pass, so a cross-opcode read needs
+    6 wait states, which is ``s_nop 5``. ``sched_barrier(0)`` keeps that nop
+    between the two MFMAs; a bare ``s_nop`` is not ordered against them.
+    FlyDSL 0.5.0 on ROCm 7.2.1 does not insert it (llvm-project #218363).
+    """
+    rocdl.sched_barrier(0)
+    rocdl.s_nop(5)
+    rocdl.sched_barrier(0)
+    return acc
+
+
 def _split_bf16(v4):
     v = fx.Vector(v4)
     hi = v.to(fx.BFloat16)
@@ -115,12 +143,17 @@ def _split_bf16(v4):
     return hi, lo
 
 
-def _mm16_x3(a, b, c4):
-    """16x16 product to ~2^-16 relative error from three bf16 MFMAs; ``a`` and
-    ``b`` are (hi, lo) splits."""
-    acc = _mfma16(a[1], b[0], c4)
-    acc = _mfma16(a[0], b[1], acc)
-    return _mfma16(a[0], b[0], acc)
+def _mm16_x3(a, b, c4, *, switch_in=False):
+    """16x16 product to ~2^-16 relative error; ``a`` and ``b`` are (hi, lo) splits.
+
+    ``switch_in`` when ``c4`` was written by a 16x16x16 MFMA. The cross terms
+    are one 16x16x32, and the hi*hi term stays 16x16x16, so each opcode change
+    takes ``_acc_switch``.
+    """
+    if const_expr(switch_in):
+        c4 = _acc_switch(c4)
+    acc = _mfma16_pair(a[1], b[0], a[0], b[1], c4)
+    return _mfma16(a[0], b[0], _acc_switch(acc))
 
 
 def _dpp_i32(src, ctrl, row_mask, bank_mask, bound_ctrl=False, old=0):
@@ -162,9 +195,9 @@ def _diag_inverse(aa, ab, ident):
     b4 = _split_bf16(_mm16_x3(b2t, b2, z))
     b4t = _split_bf16(_mm16_x3(b2, b2t, z))
     acc = _mm16_x3(b4t, b4, ident)
-    acc = _mm16_x3(b4t, _split_bf16(acc), acc)
-    acc = _mm16_x3(b2t, _split_bf16(acc), acc)
-    return _mm16_x3(naa, _split_bf16(acc), acc)
+    acc = _mm16_x3(b4t, _split_bf16(acc), acc, switch_in=True)
+    acc = _mm16_x3(b2t, _split_bf16(acc), acc, switch_in=True)
+    return _mm16_x3(naa, _split_bf16(acc), acc, switch_in=True)
 
 
 def _exp2(x):
@@ -390,6 +423,12 @@ def compile_gdn_fused_prefill(
 
         def _fac1(row, tok):
             return _lds_ld(p_f, row * BT + tok, 1, fx.Float32)[0]
+
+        def _a_frag(kb, j):
+            """Strictly-lower A block (kb, j), fragment-native."""
+            return _lds_ld(
+                p_ap, (kb * (kb - 1) // 2 + j) * FRAG + lane * 4, 4, fx.BFloat16
+            )
 
         # q/k staging: thread owns token row r and K columns 8*sub + 64*m.
         r_row = tid // 8
@@ -675,14 +714,24 @@ def compile_gdn_fused_prefill(
                 )
                 for j in range_constexpr(2, -1, -1):
                     y = _zeros4()
-                    for kb in range_constexpr(j + 1, 4):
-                        a_frag = _lds_ld(
-                            p_ap,
-                            (kb * (kb - 1) // 2 + j) * FRAG + lane * 4,
-                            4,
-                            fx.BFloat16,
-                        )
-                        y = _mfma16(a_frag, _bf16(z[kb]), y)
+                    odd = (3 - j) % 2
+                    # j=2 is one K=16 term. j=1 is one K=32 pair from zeros.
+                    # j=0 is a K=16 term then a K=32 pair, so the pair reads a
+                    # different opcode and the following K=16 reads the pair.
+                    if const_expr(odd):
+                        y = _mfma16(_a_frag(j + 1, j), _bf16(z[j + 1]), y)
+                    if const_expr(j < 2):
+                        if const_expr(odd):
+                            y = _acc_switch(y)
+                        for kb in range_constexpr(j + 1 + odd, 4, 2):
+                            y = _mfma16_pair(
+                                _a_frag(kb, j),
+                                _bf16(z[kb]),
+                                _a_frag(kb + 1, j),
+                                _bf16(z[kb + 1]),
+                                y,
+                            )
+                        y = _acc_switch(y)
                     td_frag = _lds_ld(p_td, j * FRAG + lane * 4, 4, fx.BFloat16)
                     zc = _mfma16(td_frag, _bf16(y), _zeros4())
                     z[j] = _vec(
@@ -696,15 +745,13 @@ def compile_gdn_fused_prefill(
                 zb = [_bf16(z[j]) for j in range(4)]
                 edrk4w = _fac4(F_EDRK, tw4)
                 for vb in range_constexpr(NVB):
+                    rhs_f = [
+                        _lds_ld(p_rhs, (j * NVB + vb) * FRAG + lane * 4, 4, fx.BFloat16)
+                        for j in range(4)
+                    ]
                     vn = _zeros4()
-                    for j in range_constexpr(4):
-                        vn = _mfma16(
-                            zb[j],
-                            _lds_ld(
-                                p_rhs, (j * NVB + vb) * FRAG + lane * 4, 4, fx.BFloat16
-                            ),
-                            vn,
-                        )
+                    for j in range_constexpr(0, 4, 2):
+                        vn = _mfma16_pair(zb[j], rhs_f[j], zb[j + 1], rhs_f[j + 1], vn)
                     _lds_st(
                         p_vn,
                         (wl * NVB + vb) * FRAG + lane * 4,
@@ -784,16 +831,23 @@ def compile_gdn_fused_prefill(
             else:
                 for vb in range_constexpr(NVB):
                     acc = o_acc[vb]
+                    vn_f = []
+                    pt_f = []
                     for b in range_constexpr(4):
                         p_idx = (b > wl).select(
                             fx.Int32(ZERO_TILE), N_A_TILES + wl * (wl + 1) // 2 + b
                         )
-                        acc = _mfma16(
+                        vn_f.append(
                             _lds_ld(
                                 p_vn, (b * NVB + vb) * FRAG + lane * 4, 4, fx.BFloat16
-                            ),
-                            _lds_ld(p_ap, p_idx * FRAG + lane * 4, 4, fx.BFloat16),
-                            acc,
+                            )
+                        )
+                        pt_f.append(
+                            _lds_ld(p_ap, p_idx * FRAG + lane * 4, 4, fx.BFloat16)
+                        )
+                    for b in range_constexpr(0, 4, 2):
+                        acc = _mfma16_pair(
+                            vn_f[b], pt_f[b], vn_f[b + 1], pt_f[b + 1], acc
                         )
                     _g_st(
                         o_it,
