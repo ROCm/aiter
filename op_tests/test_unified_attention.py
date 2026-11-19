@@ -518,6 +518,61 @@ def check_decode_routing(dtype):
                 assert not called(spies)
 
 
+def check_triton_only_arg_routing(dtype):
+    """Host-side routing of the Triton-only arguments; no kernel launches. The
+    FlyDSL entry and Triton are mocked at their source modules because the wrapper
+    imports both inside the function."""
+    from aiter.ops.flydsl import unified_attention as fly_ua
+    from aiter.ops.triton.attention import unified_attention as triton_ua
+
+    sentinel = object()
+    case, _ = decode_case([5, 9], [64, 80], dtype, True, "linear", with_reference=False)
+    gate = torch.empty(14, H * D, device=case["q"].device, dtype=dtype)
+    rows = torch.arange(14, device=case["q"].device, dtype=torch.int32)
+    unsupported = {
+        "output_gate": gate,
+        "output_rows": rows,
+        "force_fp8_pv_on_fp4_kv_cache": True,
+    }
+
+    def run(backend, **extra):
+        with (
+            mock.patch.object(fly_ua, "unified_attention_flydsl") as fly,
+            mock.patch.object(
+                triton_ua, "unified_attention", return_value=sentinel
+            ) as triton,
+        ):
+            try:
+                result = ua.unified_attention(**case, backend=backend, **extra)
+            except RuntimeError as error:
+                result = error
+        return fly, triton, result
+
+    for name, value in unsupported.items():
+        fly, triton, result = run(None, **{name: value})
+        assert not fly.called, f"{name}: auto routing called FlyDSL"
+        assert result is sentinel and triton.call_count == 1, f"{name}: no Triton call"
+        assert triton.call_args.kwargs[name] is value, f"{name}: not forwarded"
+
+        fly, triton, result = run("flydsl", **{name: value})
+        assert isinstance(result, RuntimeError) and name in str(result), (name, result)
+        assert not fly.called and not triton.called, f"{name}: flydsl did not raise"
+
+    # equal_seqlen_q / attn_work reach Triton and do not change the FlyDSL decision.
+    fly, triton, result = run(
+        "triton", equal_seqlen_q=True, attn_work=123, output_rows=rows
+    )
+    assert result is sentinel and not fly.called
+    assert triton.call_args.kwargs["equal_seqlen_q"] is True
+    assert triton.call_args.kwargs["attn_work"] == 123
+    fly, triton, result = run("triton", equal_seqlen_q=True, attn_work=123)
+    assert triton.call_args.kwargs["equal_seqlen_q"] is True
+    assert triton.call_args.kwargs["attn_work"] == 123
+    fly, triton, result = run("triton")
+    assert triton.call_args.kwargs["equal_seqlen_q"] is False
+    assert triton.call_args.kwargs["attn_work"] is None
+
+
 def check_batch_limits(dtype):
     """Batch-chunk bucket edges and the causal / non-causal batch limits."""
     kernels = _kernels()
@@ -986,6 +1041,7 @@ def main():
             "%s summary (markdown):\n%s", name, df.to_markdown(index=False)
         )
     for dtype in args.dtype:
+        check_triton_only_arg_routing(dtype)
         check_batch_limits(dtype)
         check_bucket_crossings(dtype)
         check_uniform_capture_ragged_replay(dtype)

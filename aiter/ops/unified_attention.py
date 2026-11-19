@@ -5,6 +5,8 @@
 
 import os
 
+import torch
+
 
 def _pa_decode_env() -> bool | None:
     """Parse AITER_UNIFIED_ATTN_PA_DECODE once for every consumer.
@@ -44,6 +46,12 @@ def unified_attention(
     skip_reduce: bool = False,
     # backend
     backend: str | None = None,  # "triton" | "gluon" | "flydsl"
+    # Triton/Gluon-only arguments, appended so existing positional calls keep working.
+    equal_seqlen_q: bool = False,
+    attn_work: int | None = None,
+    force_fp8_pv_on_fp4_kv_cache: bool = False,
+    output_gate: torch.Tensor | None = None,
+    output_rows: torch.Tensor | None = None,
 ):
     """Compute paged variable-length scaled dot-product attention into ``out``.
 
@@ -73,6 +81,16 @@ def unified_attention(
     f16 outputs for Hkv=4 with GQA group 4, 8 and 16 (both cache layouts, causal
     and non-causal; decode calls share the prefill keys). Other shapes JIT-compile
     on first call, and under FLYDSL_RUNTIME_RUN_ONLY=1 raise on a cache miss.
+
+    Triton/Gluon-only arguments: ``equal_seqlen_q`` (every sequence has query
+    length ``max_seqlen_q``), ``attn_work`` (host-computed causal query-key pair
+    count, used only by the gfx1250 router), ``force_fp8_pv_on_fp4_kv_cache``
+    (NVFP4 KV cache: run PV as an FP8 WMMA), ``output_gate`` (multiply ``out`` by
+    ``sigmoid(output_gate)``, [tokens, query_heads * head_dim_v]) and
+    ``output_rows`` ([R] int32/int64 token indices; ``out`` has R rows). All five
+    are forwarded to Triton/Gluon. FlyDSL implements none of the last three, so
+    when any is set auto routing uses Triton/Gluon and ``backend="flydsl"``
+    raises RuntimeError. ``equal_seqlen_q`` and ``attn_work`` do not affect routing.
 
     Decode (max_seqlen_q == 1) runs on the fmha kernel as 1-token rows, or on
     FlyDSL pa_decode once ``pa_decode`` sets ``SUPPORTS_FP8_QUERY``. In that
@@ -111,8 +129,26 @@ def unified_attention(
         and _pa_decode_env() is not True
     )
 
+    # FlyDSL has no gate/row-select epilogue and no FP8-PV-on-FP4 path.
+    flydsl_unsupported = [
+        name
+        for name, used in (
+            ("output_gate", output_gate is not None),
+            ("output_rows", output_rows is not None),
+            ("force_fp8_pv_on_fp4_kv_cache", force_fp8_pv_on_fp4_kv_cache),
+        )
+        if used
+    ]
+    if backend == "flydsl" and flydsl_unsupported:
+        raise RuntimeError(
+            "FlyDSL unified_attention backend does not support "
+            + ", ".join(flydsl_unsupported)
+        )
+
     unified_attention_flydsl = None
-    if backend == "flydsl" or (backend is None and not auto_decode_to_triton):
+    if (backend == "flydsl" or (backend is None and not auto_decode_to_triton)) and (
+        not flydsl_unsupported
+    ):
         # FlyDSL is absent in AITER_TRITON_ONLY and Windows installs, where this
         # op ran Triton; only an explicit backend="flydsl" may fail on it.
         try:
@@ -182,5 +218,10 @@ def unified_attention(
         shuffled_kv_cache=shuffled_kv_cache,
         skip_reduce=skip_reduce,
         backend=backend,
+        equal_seqlen_q=equal_seqlen_q,
+        attn_work=attn_work,
+        force_fp8_pv_on_fp4_kv_cache=force_fp8_pv_on_fp4_kv_cache,
+        output_gate=output_gate,
+        output_rows=output_rows,
     )
     return result
