@@ -29,6 +29,7 @@ from aiter.ops.triton.utils.gemm_config_utils import (
     get_gemm_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.plugin import route as _route
 
 _LOGGER = AiterTritonLogger()
 
@@ -106,11 +107,113 @@ def gemm_a16w16_(
             results. Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
         kernel_type (str): [gluon only] Kernel variant ("bandwidth_bound", "compute_bound").
         backend (Optional[str]): "triton", "gluon", or None (auto-detect).
+            Only None lets a kernel plugin run the call.
         persistent (bool): Use the persistent kernel, NUM_SMS workgroups
 
     Returns:
         torch.Tensor: Output with shape (M, N) or (NUM_KSPLIT, M, N) if skip_reduce=True.
     """
+    # A call that sets backend gets that backend. Other calls go to the routed op.
+    if backend is None:
+        result = _gemm_a16w16_routed(
+            x,
+            w,
+            bias,
+            dtype,
+            y,
+            config,
+            activation,
+            skip_reduce,
+            kernel_type,
+            persistent,
+        )
+        # A kernel plugin must return y itself when y is given, as the native
+        # path does. Identity, not data_ptr: this runs under torch.compile too.
+        if y is not None and result.dim() == y.dim() and result is not y:
+            raise RuntimeError("gemm_a16w16: the result was not written into y=")
+        return result
+    return _gemm_a16w16_native(
+        x,
+        w,
+        bias,
+        dtype,
+        y,
+        config,
+        activation,
+        skip_reduce,
+        kernel_type,
+        backend,
+        persistent,
+    )
+
+
+# The op name is not "gemm_a16w16": that is the contract of aiter.tuned_gemm.
+# This contract also applies an activation and can return split-K partials.
+@_route(op="gemm_a16w16_activation", version=1)
+def _gemm_a16w16_routed(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
+    activation: str | None = None,
+    skip_reduce: bool | None = False,
+    kernel_type: str = "bandwidth_bound",
+    persistent: bool = False,
+) -> torch.Tensor:
+    """
+    Computes Y = activation(X @ W^T + bias) in 16 bits.
+
+    Returns the (M, N) result. If y is not None, the result is written into y
+    and y is returned. If skip_reduce is True and the config splits K, the
+    (NUM_KSPLIT, M, N) fp32 partials are returned and y is not written.
+    Nothing else is written through the arguments.
+
+    Args:
+        x (torch.Tensor): Input with shape (M, K), fp16 or bf16.
+        w (torch.Tensor): Weight with shape (N, K), fp16 or bf16.
+        bias (Optional[torch.Tensor]): Bias with shape (N,).
+        dtype (Optional[torch.dtype]): Output datatype when y is None.
+        y (Optional[torch.Tensor]): Output buffer with shape (M, N).
+        config (Optional[str]): Serialized kernel tuning parameters.
+            It sets the schedule, not the result.
+        activation (Optional[str]): "gelu", "gelu_tanh", "silu", "silu_exp2"
+            or "relu", applied after the bias.
+        skip_reduce (Optional[bool]): Return the split-K partials.
+        kernel_type (str): Gluon kernel variant. It sets the schedule, not the result.
+        persistent (bool): Use the persistent kernel. It sets the schedule,
+            not the result. It does not support skip_reduce.
+    """
+    return _gemm_a16w16_native(
+        x,
+        w,
+        bias,
+        dtype,
+        y,
+        config,
+        activation,
+        skip_reduce,
+        kernel_type,
+        None,
+        persistent,
+    )
+
+
+def _gemm_a16w16_native(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    bias: torch.Tensor | None,
+    dtype: torch.dtype | None,
+    y: torch.Tensor | None,
+    config: str | None,
+    activation: str | None,
+    skip_reduce: bool | None,
+    kernel_type: str,
+    backend: str | None,
+    persistent: bool,
+) -> torch.Tensor:
+    """Runs the kernels of gemm_a16w16_. config is the serialized string."""
     config = deserialize_str(config) if config is not None else None
 
     if backend is None:

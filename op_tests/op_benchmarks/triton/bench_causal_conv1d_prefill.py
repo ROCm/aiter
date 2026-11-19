@@ -112,7 +112,12 @@ def run(args):
         old_us = _time_us(inputs, window=False)
         os.environ["AITER_CONV1D_SPLIT_QKV_WINDOW"] = "1"
         window_config = conv_prefill._window_config(
-            inputs["x"], inputs["weight"], inputs["conv_states"], args.k_dim, args.v_dim
+            inputs["x"],
+            inputs["weight"],
+            inputs["conv_states"],
+            args.k_dim,
+            args.v_dim,
+            conv_prefill.PAD_SLOT_ID,
         )
         if window_config is None:
             logger.info("%-40s %12.2f %12s", name, old_us, "n/a (2D)")

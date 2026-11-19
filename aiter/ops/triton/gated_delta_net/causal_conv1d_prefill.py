@@ -24,7 +24,6 @@ The ``@triton.jit`` kernels themselves live in
 concatenation ``[Q | K | V]`` (``dim == 2*k_dim + v_dim``).
 """
 
-import functools
 import os
 
 import torch
@@ -39,6 +38,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.causal_conv1d_fwd_
 )
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config, has_conv_config
 from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.plugin import route as _route
 
 __all__ = [
     "PAD_SLOT_ID",
@@ -169,6 +169,10 @@ def _build_chunk_schedule(
     return tot, batch_ptr, tco
 
 
+# Routed on this public entry, the one KDA's vLLM prefill imports. The op name
+# drops the backend: a provider serves the split conv, not this Triton tiling,
+# so block_m, block_n and num_warps are hints it may ignore.
+@_route(op="causal_conv1d_split_qkv")
 def causal_conv1d_split_qkv_triton_tile_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -182,7 +186,7 @@ def causal_conv1d_split_qkv_triton_tile_fn(
     activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     block_m: int = 64,
-    block_n: int | None = None,
+    block_n: int = 32,
     num_warps: int = 4,
     metadata=None,
     preserve_input_dtype: bool = False,
@@ -196,10 +200,18 @@ def causal_conv1d_split_qkv_triton_tile_fn(
     Returns contiguous (q, k, v) of shapes [cu_seqlen, k_dim] / [cu_seqlen, v_dim].
 
     preserve_input_dtype: return q/k/v in x's dtype to match vLLM
-    block_n: None picks 16 B per lane for channel-contiguous x, else 32.
 
     Channel-contiguous x with conv width 4 runs the sliding-window kernel (tuned config; block_m, block_n,
     num_warps and metadata unused). AITER_CONV1D_SPLIT_QKV_WINDOW=0 turns it off.
+
+    Contract for a provider: returns three new tensors (q, k, v) in x's dtype
+    when ``preserve_input_dtype`` else in ``conv_states``' dtype, and writes
+    ``conv_states`` in place -- each sequence's line ``cache_indices[i]`` ends
+    holding its last ``width - 1`` inputs, read first when
+    ``has_initial_state[i]``. A ``cache_indices`` entry equal to
+    ``pad_slot_id`` marks a padded sequence: its state line is neither read
+    nor written and its q/k/v rows are left unwritten. ``metadata`` only memoizes AITER's own chunk schedule; a provider
+    reads ``query_start_loc`` instead.
     """
     window_config = _window_config(x, weight, conv_states, k_dim, v_dim, pad_slot_id)
     if window_config is not None:
@@ -229,13 +241,6 @@ def causal_conv1d_split_qkv_triton_tile_fn(
     np2_statelen = triton.next_power_of_2(state_len)
 
     BLOCK_M = int(block_m)
-    if block_n is None:
-        # 16 B per lane for channel-contiguous x
-        block_n = (
-            min(512, max(32, 8 * num_warps * _warp_size() // BLOCK_M))
-            if x.stride(0) == 1
-            else 32
-        )
     BLOCK_N = int(block_n)
     n_seqs = int(query_start_loc.numel() - 1)
 
@@ -360,11 +365,6 @@ def causal_conv1d_split_qkv_triton_tile_fn(
 
 
 _WINDOW_CONFIG_NAME = "CAUSAL_CONV1D_SPLIT_QKV"
-
-
-@functools.cache
-def _warp_size() -> int:
-    return triton.runtime.driver.active.get_current_target().warp_size
 
 
 def _window_config(x, weight, conv_states, k_dim, v_dim, pad_slot_id) -> dict | None:

@@ -165,9 +165,14 @@ void h32_kernel(mqa_logits_mxfp4_kargs k) {
                 opus::static_for<NT / 2>([&](auto uc) {
                     constexpr int u = uc.value;
                     const int key = u * 2 * T::MMA_N + lane;
+                    // Each id pinned before the select: picked straight from ids[], clang 24's
+                    // promote-alloca-to-vector makes this lambda's captures a vector of pointers
+                    // to pid and ids, which then stay on the stack (scratch, flat loads).
                     int pid = ids[0];
                     opus::static_for<T::TILE_PAGES>([&](auto i) {
-                        pid = (key >> 3) == i.value ? ids[i.value] : pid;
+                        int id = ids[i.value];
+                        pin_sgpr(id);
+                        pid = (key >> 3) == i.value ? id : pid;
                     });
                     kvs_ring[slot][u] = *reinterpret_cast<const int*>(
                         reinterpret_cast<const D_BYTE*>(k.ptr_kv_scale) +
@@ -270,13 +275,21 @@ void h32_kernel(mqa_logits_mxfp4_kargs k) {
     float* out_ptr[R];          // each row's window: base and byte count, uniform (SGPR)
     unsigned out_bytes[R];
     unsigned q_nan_rows = 0;    // bit r = row r's q scales hold a NaN (uniform)
+    // A row's window and out offset through the constant address space, as the table: s_load.
+    // Plain loads here come after a TDM issue, which clang 24 counts as a store to any memory, so
+    // they would be global_loads, and the out V# built from them a waterfall loop around each store.
+    using row_scalar_ptr = const int __attribute__((address_space(4)))*;
+    const auto row_ends =
+        reinterpret_cast<row_scalar_ptr>(reinterpret_cast<__UINTPTR_TYPE__>(k.ptr_row_ends));
+    const auto out_offsets =
+        reinterpret_cast<row_scalar_ptr>(reinterpret_cast<__UINTPTR_TYPE__>(k.ptr_out_offsets));
     opus::static_for<R>([&](auto rc) {
         constexpr int r = rc.value;
         const int  slot = wave * R + r;
         const bool ok   = slot < wk.group_rows && wk.row_id + slot < num_rows;
         int row = wk.row_id + (ok ? slot : 0);
         pin_sgpr(row);
-        int end = ok ? k.ptr_row_ends[row] : 0;
+        int end = ok ? row_ends[row] : 0;
         end = __builtin_amdgcn_readfirstlane(end);
 
         auto g_q = opus::make_gmem(reinterpret_cast<const D_SCALE*>(
@@ -302,7 +315,7 @@ void h32_kernel(mqa_logits_mxfp4_kargs k) {
             });
         });
         // An offset is >= 0: zero-extended, it needs no wait for its load here, as a sign would.
-        const long long base = k.ptr_out_offsets ? (long long)(unsigned)k.ptr_out_offsets[row]
+        const long long base = k.ptr_out_offsets ? (long long)(unsigned)out_offsets[row]
                                                  : (long long)row * k.out_stride;
         out_ptr[r]   = k.ptr_out + base;
         out_bytes[r] = (unsigned)(end > 0 ? end : 0) * (unsigned)sizeof(float);
