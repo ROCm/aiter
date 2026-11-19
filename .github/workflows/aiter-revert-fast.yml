@@ -1,0 +1,95 @@
+name: aiter-revert-fast
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or SHA to validate"
+        required: true
+        type: string
+      failed_run_id:
+        description: "Original failed Aiter Test workflow run id"
+        required: false
+        type: string
+      runner:
+        description: "Runner to use for focused validation"
+        required: true
+        type: choice
+        options:
+          - linux-aiter-mi35x-1
+          - linux-aiter-oci-mi300x-1
+          - linux-aiter-do-mi350x-8
+          - linux-aiter-do-mi350x-dpx-8
+      test_files:
+        description: "Focused test files, separated by spaces, commas, or newlines"
+        required: false
+        type: string
+      mori_smoke:
+        description: "Run only the Mori smoke test"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aiter-revert-fast-${{ inputs.ref }}-${{ inputs.runner }}
+  cancel-in-progress: false
+
+jobs:
+  ci_config:
+    uses: ./.github/workflows/ci-config.yaml
+
+  focused:
+    name: Focused validation (${{ inputs.runner }})
+    needs: ci_config
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    env:
+      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
+      TEST_FILES: ${{ inputs.test_files }}
+      MORI_SMOKE: ${{ inputs.mori_smoke && 'true' || 'false' }}
+      FAILED_RUN_ID: ${{ inputs.failed_run_id }}
+    steps:
+      - name: Checkout target ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Docker login
+        env:
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
+
+      - name: Run focused validation
+        run: python3 .github/scripts/aiter_revert_fast.py
+
+      - name: Upload focused validation log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter-revert-fast-${{ github.run_id }}
+          path: latest_test.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f aiter_revert_fast_${GITHUB_RUN_ID} || true
+          docker logout || true

@@ -1063,7 +1063,8 @@ class _Recorder(_Provider):
 
 def _serve(monkeypatch, op, candidate):
     provider = _Recorder("aklr", candidate)
-    provider.op_versions = {op: {1}}
+    routed = plugin._routed_ops.get(op)
+    provider.op_versions = {op: {routed.op.version if routed else 1}}
     plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
