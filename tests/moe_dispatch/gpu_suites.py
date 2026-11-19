@@ -14,6 +14,7 @@ Commands match how .github/scripts/aiter_test.sh runs each file.
 """
 
 import argparse
+import os
 import shlex
 import subprocess
 import sys
@@ -149,8 +150,11 @@ def main(argv=None):
                 f"; {suite.note}" if suite.note else ""
             )
             print(f"  {line}{extra}")
-            if args.run and subprocess.run(suite.cmd, check=False).returncode != 0:
-                failed.append(line)
+            if args.run:
+                env = os.environ.copy()
+                env["AITER_MOEV2"] = path
+                if subprocess.run(suite.cmd, check=False, env=env).returncode != 0:
+                    failed.append(line)
     if not args.path:
         print("[shared, every path]")
         for suite in SHARED:

@@ -7,6 +7,7 @@ CPU only. Regenerate after an intentional change, and list the changed keys in t
     python tests/moe_dispatch/snapshot.py --update
 """
 
+import dataclasses
 import os
 import pathlib
 import subprocess
@@ -14,6 +15,32 @@ import sys
 
 _REPO = pathlib.Path(__file__).resolve().parents[1]
 _SNAPSHOT = _REPO / "tests" / "moe_dispatch" / "snapshot.py"
+
+
+def test_moe_metadata_defaults_are_frozen_snapshot_inputs():
+    from aiter.moev2.execute.metadata import AsmMoeMode, MOEMetadata
+
+    defaults = {
+        field.name: field.default
+        for field in dataclasses.fields(MOEMetadata)
+        if field.default is not dataclasses.MISSING
+    }
+    assert defaults == {
+        "run_1stage": False,
+        "has_bias": False,
+        "use_non_temporal_load": True,
+        "fuse_quant": "",
+        "stage2_has_bias": False,
+        "flat": AsmMoeMode.SORTED,
+        "output_aux": False,
+        "prequant": True,
+        "skip_inter_quant": False,
+        "route_bucket": "",
+        "expected_sorted_blocks": None,
+        "min_sorted_blocks": None,
+        "max_sorted_blocks": None,
+        "full_impl": None,
+    }
 
 
 def test_legacy_dispatch_matches_golden_snapshot():

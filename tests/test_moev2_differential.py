@@ -10,11 +10,42 @@ path: same kernels on the same inputs, same outputs and log lines as legacy.
 import pathlib
 import subprocess
 import sys
+from functools import partial
 
 import pytest
 
 _HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
+
+
+def test_whole_graph_launches_are_compared_without_a_stage1_record():
+    import torch
+    from moe_dispatch.differential import compare_launches
+
+    from aiter.fused_moe_registry import FusedMoeRequest
+
+    def whole_graph(request):
+        return request.hidden_states
+
+    def request():
+        return FusedMoeRequest(
+            hidden_states=torch.ones(1, 2),
+            w1=torch.ones(1, 2, 2),
+            w2=torch.ones(1, 2, 2),
+            topk_weight=torch.ones(1, 1),
+            topk_ids=torch.zeros(1, 1, dtype=torch.int32),
+        )
+
+    legacy_request, v2_request = request(), request()
+    call = {"topk_ids": legacy_request.topk_ids, "expert_mask": None}
+    problems = compare_launches(
+        [("whole_graph", partial(whole_graph, legacy_request))],
+        [("whole_graph", partial(whole_graph, v2_request))],
+        call,
+        torch.empty(1, 2),
+        torch.empty(1, 2),
+    )
+    assert not problems
 
 
 def test_dispatch_plans_match_legacy():

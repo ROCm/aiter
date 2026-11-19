@@ -200,6 +200,7 @@ FEATURES = frozenset(
         "scatter",  # stage2 writes into peers' combine buffers (stage2_scatter)
         "act_scales",  # caller passes a1_scale / a2_scale
         "a1_scale",  # caller passes a1_scale
+        "global_scale",  # NVFP4 per-expert global weight scales
     }
 )
 
@@ -345,6 +346,7 @@ class MoeProblem:
         has_num_local_tokens=False,
         _exclude_mxmoe=False,
         _has_input_activation_scales=False,
+        has_global_scale=False,
         *,
         arch: str,
         cu_num: int,
@@ -363,6 +365,7 @@ class MoeProblem:
             "act_scales": has_activation_scales,
             "num_local_tokens": has_num_local_tokens,
             "a1_scale": _has_input_activation_scales,
+            "global_scale": has_global_scale,
         }
         extras = {}
         if config_file is not None:
@@ -439,6 +442,7 @@ class MoeProblem:
             "has_num_local_tokens": "num_local_tokens" in self.features,
             "_exclude_mxmoe": bool(self.extras.get("exclude_mxmoe")),
             "_has_input_activation_scales": "a1_scale" in self.features,
+            "has_global_scale": "global_scale" in self.features,
         }
         return args, kwargs
 

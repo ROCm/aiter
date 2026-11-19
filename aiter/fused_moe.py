@@ -2204,40 +2204,42 @@ def _fused_moe_impl(
         presorted_moe_ignored("the selected MoE pipeline takes no BM=16 aux sort")
     asm_mode = AsmMoeMode(metadata.flat)
     if metadata.full_impl is not None:
-        full_output = metadata.full_impl(
-            FusedMoeRequest(
-                hidden_states=hidden_states,
-                w1=w1,
-                w2=w2,
-                topk_weight=topk_weight,
-                topk_ids=topk_ids,
-                expert_mask=expert_mask,
-                activation=activation,
-                quant_type=quant_type,
-                doweight_stage1=doweight_stage1,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                a1_scale=a1_scale,
-                a2_scale=a2_scale,
-                block_size_m=(int(block_size_M) if block_size_M is not None else None),
-                ksplit=metadata.ksplit,
-                num_local_tokens=num_local_tokens,
-                moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
-                dtype=dtype,
-                hidden_pad=hidden_pad,
-                intermediate_pad=intermediate_pad,
-                bias1=bias1,
-                bias2=bias2,
-                swiglu_limit=swiglu_limit,
-                beta=beta,
-                linear_beta=linear_beta,
-                gate_mode=gate_mode,
-                q_dtype_a=q_dtype_a,
-                q_dtype_w=q_dtype_w,
-                w1_global_scale=w1_global_scale,
-                w2_global_scale=w2_global_scale,
-            )
+        request = FusedMoeRequest(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weight=topk_weight,
+            topk_ids=topk_ids,
+            expert_mask=expert_mask,
+            activation=activation,
+            quant_type=quant_type,
+            doweight_stage1=doweight_stage1,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            block_size_m=(int(block_size_M) if block_size_M is not None else None),
+            ksplit=metadata.ksplit,
+            num_local_tokens=num_local_tokens,
+            moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+            dtype=dtype,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            bias1=bias1,
+            bias2=bias2,
+            swiglu_limit=swiglu_limit,
+            beta=beta,
+            linear_beta=linear_beta,
+            gate_mode=gate_mode,
+            q_dtype_a=q_dtype_a,
+            q_dtype_w=q_dtype_w,
+            w1_global_scale=w1_global_scale,
+            w2_global_scale=w2_global_scale,
         )
+        full_call = functools.partial(metadata.full_impl, request)
+        if kernel_bench_callable is not None:
+            kernel_bench_callable.append(("whole_graph", full_call))
+        full_output = full_call()
         return _return_output(full_output, output)
 
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)

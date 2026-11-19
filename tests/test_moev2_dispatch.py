@@ -110,6 +110,7 @@ def test_problem_round_trips_through_the_legacy_key():
         {"is_shuffled": True, "opus_weights_shuffled": False},
         {"config_file": "/tmp/t.csv", "_disable_inline_sort": True},
         {"q_dtype_a2": dtypes.fp8, "input_dtype": dtypes.bf16, "swiglu_limit": 7.0},
+        {"has_global_scale": True},
     ):
         p = _problem(**kwargs)
         args, kw = p.legacy_key()
@@ -507,6 +508,8 @@ def test_claims_only_per_tensor_fp8(monkeypatch):
         {"dtype": torch.float32},
         {"herd_topk": 1},
         {"deterministic": True},
+        {"w1_global_scale": torch.empty(4, 2)},
+        {"w2_global_scale": torch.empty(4)},
     ):
         assert not a8w8_pt.claims({**call, **change}), change
     register_presorted_moe({"M": 2})
