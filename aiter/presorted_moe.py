@@ -233,3 +233,22 @@ def drop_presort_on_error(fn):
             raise
 
     return wrapper
+
+
+def drop_presort_after(fn):
+    """Clear the registration when ``fn`` returns or raises.
+
+    The registration is for the next fused_moe call, and this call is that
+    call. A kernel plugin that serves it returns before _fused_moe_impl
+    consumes the registration, which would otherwise apply to the next native
+    call on reused routing buffers.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            pop_presorted_moe()
+
+    return wrapper

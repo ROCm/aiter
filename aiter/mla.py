@@ -988,6 +988,11 @@ def mla_decode_prepare_page_csr(
     return kv_indptr, kv_indices, kv_last_page_lens
 
 
+# Routed on the public entry point: it is the op's one spelling, it takes no
+# backend pin, and `@compile_ops` sits on the asm bindings beneath it. The
+# contract is the whole signature, schedule metadata included: a provider with
+# its own schedule reads what it needs from it and ignores the rest.
+@_route(op="mla_decode_fwd", version=1)
 def mla_decode_fwd(
     q,
     kv_buffer,
@@ -1072,6 +1077,16 @@ def mla_decode_fwd(
     prepare_mla_nvfp4_params; it owns the softmax scale and fixed NVFP4 gains,
     so leave sm_scale/q_scale/kv_scale unset. nvfp4_lse is reusable scratch
     even when return_lse=False. No planner, split-K, CP or implicit conversion.
+
+    Output: the attention is written in place into ``o``, and ``o`` is the
+    result. The call returns ``(logits, lse)``. With ``return_logits=False``,
+    ``logits`` is the implementation's scratch -- the per-split partial
+    results, or a view of ``o`` when nothing was split -- so callers read
+    ``o``, never it, and a provider may return ``o`` there. With
+    ``return_logits=True`` the caller reads the per-split partial results: a
+    provider must return them or decline. ``lse`` is the natural-log FP32 final LSE
+    ``[total_q, nhead]`` when ``return_lse`` is set; without it the second
+    element is unspecified (None or scratch).
     """
     if kv_layout == "nvfp4_n128":
         from aiter.ops.mla_nvfp4 import mla_decode_nvfp4_fwd
