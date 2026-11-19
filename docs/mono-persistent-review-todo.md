@@ -1,4 +1,52 @@
-# A03/A09 standalone P256 review and acceptance
+# A03/A09 mono review and acceptance
+
+## Current acceptance checklist: 2026-11-19
+
+The [current contract](mono-persistent-validation.md#current-acceptance-contract-2026-11-19)
+supersedes the historical standalone-only scope and synthetic performance gate.
+The prior results below remain historical evidence, not a full mono pass.
+
+- [ ] Complete A03/A09 mono acceptance.
+- [ ] Real physical grid 16 x 16, fixed 256 TGs, 128 threads/TG and wave32.
+- [ ] Original task ownership `task = tg + j*256`, including batched paths.
+- [ ] All 256 TGs can reside together; idle TGs return to the caller's join.
+- [ ] All ops use the same 1 x 1 cluster geometry.
+- [ ] No op instruction reads or writes `s104/s105`; the actual call path
+  preserves the main kernel's values.
+- [ ] All handoff payload, scale and metadata stores use DEV + HT.
+- [ ] Activation loads/prefetches use DEV and follow the required join.
+- [ ] Main-kernel flags use DEV + HT stores and DEV + default RT loads.
+  Only wave0 lane0 publishes after all writers finish. All reader waves
+  converge. The all-DEV path adds no WB/INV.
+- [ ] Every source-supported shape keeps native output bytes, input/weight
+  integrity, guards and Graph behavior. Retain the existing 89 tests and add
+  new scheduling, model-shape and join coverage. No tolerance relaxation.
+- [ ] Primary performance gate: DSV4.1 c16 has no native regression under
+  the pinned model configuration, with actual shape/Graph provenance.
+- [ ] Secondary performance review: DSV4.1 c64, c128 and c256.
+
+Other shapes need correctness coverage only. Do not tune for their latency or
+use their regressions as an acceptance failure. Do not confuse concurrency
+with tensor rows or improvements over PS1 with native non-regression.
+
+The prior tested code is standalone. Its physical grid was `(256,1,1)`;
+four-task paths group adjacent original tasks and the A09 two-task path balances
+contiguous ranges. These mappings need alignment with the stated task rule.
+Actual JIT memory instructions omit explicit DEV/HT. The inspected instructions
+do not reference `s104/s105`, but a full call/return preservation check is absent.
+The new candidate corrects the grid and original task ownership, adds DEV/HT
+memory operations and limits SGPR allocation. Its 20 main and three wide-stride
+offline builds pass. Static PS operand checks pass. It has 108 collected tests,
+with GPU validation pending. See the candidate section in the validation guide.
+No new runtime pass or completed mono integration is claimed by this checklist.
+
+Use the user's table as the mono contract. Connect and test the actual
+main-kernel return/join path. The model recipe and native baseline are confirmed:
+c16/c64 use TP4 + DSpark5; c128/c256 use EP4 + DP attention. Capture actual
+per-rank shapes before certifying c16/c64/c128/c256 performance. The old
+18-case and 108-case tables do not by themselves close either requirement.
+The current machine has only one visible GPU and cannot certify TP4/EP4 model
+performance. The shared GPU lock is held by another A/B task; preserve that job.
 
 ## Adaptive PS result: 2026-11-18
 

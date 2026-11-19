@@ -1,4 +1,148 @@
-# A03/A09 standalone P256 validation
+# A03/A09 mono validation
+
+## Current acceptance contract: 2026-11-19
+
+This section replaces the earlier standalone-only scope and performance gate.
+The sections below retain historical results. They do not certify this contract.
+The user's table is the authority for the mono rules below. SH and section
+references are retained as supplied. A target main-kernel call interface has
+not been connected to these standalone wrappers.
+
+### Mono requirements
+
+| Item | Required behavior | Required evidence |
+| --- | --- | --- |
+| Scheduling | Exactly 256 TGs in a physical 16 x 16 grid. Linear TG id is `tg = x + 16*y`. Each op processes `task = tg + j*256`. A TG without work returns from the op and still reaches the next join. | Actual main-kernel launch, task coverage, and a join test with idle TGs. A standalone `(256,1,1)` grid does not pass the geometry check. |
+| Residency | All 256 TGs must be able to reside together for the join. The flag array has 256 four-byte entries, or 1 KB. | Resource and residency checks for the final fused launch, plus a join progress test. TG count alone is not residency evidence. |
+| TG shape | Four wave32 waves, or 128 threads, for every op in the launch. | Real dispatch metadata. The join assigns 64 flags to each wave. |
+| SGPRs | The op must neither read nor write `s104` or `s105`. These are ordinary hardware SGPRs reserved by the mono ABI for the main kernel. | Check all actual op instruction operands, including register ranges and helper code. Verify preservation through the main-kernel call path. SH L2148 and L2419 are the supplied references. |
+| Cluster | Every op uses the same physical cluster geometry, currently 1 x 1. | The final launch descriptor and code-object metadata; mono section 4.6.4. |
+| Output stores | DEV scope and HT for every payload, scale and metadata store handed to the next op. This includes ordinary and TDM stores. | Actual loaded ISA and producer/consumer tests; SH section 4.2.1 and Table 78. HT is a retention hint, not a cache-hit or speed guarantee. |
+| Activation loads | DEV scope. TH may be omitted, with default RT. Loads and prefetches start only after the required join. | Actual loaded ISA and ordering in the main-kernel path. Load TH need not match store TH. |
+| Flags and join | The main kernel stores flags with DEV + HT and loads them with DEV + default RT. Only wave0 lane0 publishes per TG, after all writers complete. The TG converges after successful reads. The all-DEV path adds no WB/INV. | The pinned join implementation, writer-completion ordering and replay tests, including idle TGs; mono section 0.4. |
+
+Keep the original task unit explicit: one row for A03 and one 1024-element
+tile for A09. A09 task count is `ceil(numel/1024)`, not the row count.
+Unrolling or issuing several loads may group tasks from the required sequence
+`tg + (j+k)*256`. A contiguous batch mapping must not silently redefine that
+sequence. The previous adaptive two-task and four-task mappings need review
+against this rule.
+
+An op return is not a kernel exit. Idle TGs must retain a path to the main
+kernel's join. Standalone Graph replay does not test this condition.
+
+### Correctness requirements
+
+For every shape in the source operator's supported input domain, preserve its
+outputs byte for byte. Do not restrict correctness to model performance shapes.
+Keep A03 rounded-amax and A09 ceil-scale algorithms separate. Do not change the
+frozen native, relax comparisons or remove supported shapes to pass a test.
+Inputs, weights and guards must remain unchanged. Check partial tasks, unusual
+legal widths and strides, empty inputs, scale boundaries and Graph replay.
+
+Keep all existing 89 UT cases. Add coverage for changed scheduling, all selected
+model shapes and the actual mono call/join path. A finite passing suite records
+tested coverage; it does not prove all possible shapes.
+
+### Performance priorities
+
+1. DSV4.1 c16 is the primary gate: no performance regression against the
+   original/native implementation under the same model configuration.
+2. DSV4.1 c64, c128 and c256 are the secondary performance targets. Report
+   each target separately. Gains there do not compensate for c16 regression.
+3. Other shapes remain correctness cases. Their performance is not an
+   acceptance gate or an optimization target. In particular, rows 257/513
+   are no longer mandatory performance points unless a target model trace
+   contains them.
+
+Pin model revision, TP/DP/EP mode, DSpark settings, phase, rank, Graph bucket,
+shape, stride and dtype before assigning a concurrency label to a benchmark.
+Concurrency is a request count, not a tensor row count. The local historical
+recipe uses TP4 for c16/c64 and DP attention with EP4 for c128/c256. The user
+confirmed this recipe, DSpark5 and the original/native baseline. With
+DSpark5, a full c16 verify batch can have 96 rows. This is a source-derived
+candidate, not a recorded current model trace. Draft, verify, partial batches,
+rank imbalance and Graph padding can select other shapes.
+
+Use the same GPU, input pool and Graph method for native and PS. Alternate
+providers, keep hot/rotating cases and 15 trials, wait for the authorized
+exclusive window, and disable profiling during timing. Report median, P10,
+P90, PS/native and the noise assessment. Do not require an improvement on
+every old synthetic case. Do not turn an inconclusive result into proof of
+non-regression or invent an allowed slowdown. Repeat unresolved c16 evidence
+as needed. Model-level non-regression requires the model path to be exercised;
+an isolated op benchmark must be labeled as such.
+
+### Current evidence and open gates
+
+The prior tested code is `96826c2c50f69d50484d8e64a250d7793268ce9d`.
+Its 89 UT passes and previous timings apply only to that standalone code.
+
+- Verified in the prior run: 256 TGs, 128 threads/TG, strict UT coverage and
+  saved real JIT artifacts.
+- Prior code does not meet the new contract: its physical grid is one-dimensional;
+  batched task ownership differs from the original task sequence; the kernels
+  do not explicitly request DEV/HT for the handoff memory operations.
+- Still unverified: the full call ABI, reserved-register preservation across
+  calls, common cluster geometry, simultaneous residency, idle-TG joins and
+  model-level c16 non-regression. The inspected JIT operands do not use
+  `s104/s105`, but this alone is not a general ABI guarantee.
+- Needed to close the integration gates: the target main kernel and exact
+  mono specification/ABI revision, plus the target model configuration and
+  its actual shape/Graph trace.
+
+The overall A03/A09 mono acceptance item stays unchecked.
+
+### Candidate implementation: 2026-11-19
+
+Scheduling commit: `367e16a74`. Memory and register commit: `aa2870cbb`.
+These commits are a candidate, not an accepted replacement.
+
+The wrappers select `(16,16)` TG grids. Both ops flatten the TG id as `x+16*y`.
+One-, two- and four-task iterations use the original task sequence at stride
+256, including tails. A03 now uses its explicit-layout Gluon implementation
+for every PS batch size. Each row has a 64-bit base address. A wide column
+stride uses a 64-bit global-address path instead of truncating a buffer offset.
+
+PS loads use the installed Triton descriptor API with `scope="gpu"`. PS output
+stores also use `CachePolicy(temporal="high")`. Legacy `.cg`, `.wb` and
+`evict_last` probes did not generate this combination. An aligned descriptor
+probe emitted 128-bit DEV loads and DEV + HT stores. These are offline probes,
+not a substitute for wrapper launch evidence. Native and non-PS math are
+unchanged; no framework package was changed.
+
+The PS wrappers set `llvm_fn_attrs="amdgpu-num-sgpr=104"`. Before this limit,
+offline multirow A03 used the reserved SGPRs. With it, operand checks of the
+12 main PS builds and three wide-stride builds found no `s104/s105` access.
+Every global/buffer load in these builds has DEV scope; every output store
+has DEV + HT. Inspect actual JIT variants again before acceptance. Resource
+counts from unspecialized offline builds are not residency measurements.
+
+The frozen hash check and all 20 main offline builds passed. Three wide-stride
+variants also compiled. Black and Ruff passed. Collection found 108 UT cases:
+the prior 89 plus 19 cases for the selected row counts and DP-attention width. New GPU correctness, real
+JIT/launch and performance results are pending. The failure log from the
+initial unsupported `gl.broadcast_to` call was saved before its local fix.
+
+The runner exposes one GPU. TP4/EP4 model runs require a suitable four-GPU
+environment. Its shared GPU lock is also held by another A/B task. The prepared
+validation chain waits for the lock and a five-second exclusive idle window.
+It first runs all UTs, then traces the Graph cases and checks the real op ISA.
+Only after those checks does it time the source-derived TP4 verify shapes
+for c16/c64/c128/c256, with 15 alternating trials and no profiler.
+The source-derived verify rows are 96/384/192/384; A09 widths are
+2048/2048/8192/8192. DP rows assume a balanced full batch. The c256 A03
+case reuses the c64 shape. `model-shape-provenance.json` records the sources
+and assumptions; an actual model trace is still needed to confirm coverage. Such isolated
+op results must not be reported as full-model non-regression.
+
+Evidence and the resumable runner are in
+`/home/weizhu15/workspace/mono-criteria-20261119`. See `abi-static-final.json`,
+`compile-scoped-capped/`, `compile-wide-stride/`, `logs/`, `gpu-stage-events.jsonl`
+and `validate_current.py`. The main-kernel return/join path, flag protocol,
+common cluster geometry and simultaneous residency still need integration
+and runtime evidence. c128/c256 also need actual per-rank shape provenance;
+DP attention can change widths as well as row counts.
 
 ## Adaptive PS result: 2026-11-18
 
