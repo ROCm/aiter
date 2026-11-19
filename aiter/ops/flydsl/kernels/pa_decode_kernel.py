@@ -190,6 +190,7 @@ def _pa_decode_tile_kernel_name(
     fuse_tasks=1,
     wave_partials=False,
     wave_pairs=False,
+    wave_dims=False,
 ):
     """Trace-visible symbol carrying the main compile-time constants."""
     name = (
@@ -220,6 +221,8 @@ def _pa_decode_tile_kernel_name(
         name += "_wp"
     if wave_pairs:
         name += "_pairs"
+    if wave_dims:
+        name += "_dims"
     return name
 
 
@@ -257,6 +260,7 @@ def compile_pa_decode_tile(
     fuse_tasks: int = 1,
     wave_partials: bool = False,
     wave_pairs: bool = False,
+    wave_dims: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -370,6 +374,7 @@ def compile_pa_decode_tile(
                 fuse_tasks=fuse_tasks,
                 wave_partials=wave_partials,
                 wave_pairs=wave_pairs,
+                wave_dims=wave_dims,
             )
         )
     if architecture not in ("gfx942", "gfx950"):
@@ -378,9 +383,9 @@ def compile_pa_decode_tile(
         raise NotImplementedError(
             "cluster_merge, quant_output and a skipped store require gfx1250"
         )
-    if fuse_tasks != 1 or wave_partials or wave_pairs:
+    if fuse_tasks != 1 or wave_partials or wave_pairs or wave_dims:
         raise NotImplementedError(
-            "fuse_tasks, wave_partials and wave_pairs require gfx1250 MXFP4"
+            "fuse_tasks, wave_partials, wave_pairs and wave_dims require gfx1250 MXFP4"
         )
     schedule = PaDecodeSchedule.select(
         head_dim=head_dim,
@@ -918,6 +923,7 @@ def gfx1250_tile_traits(
     fuse_tasks: int = 1,
     wave_partials: bool = False,
     wave_pairs: bool = False,
+    wave_dims: bool = False,
 ) -> Gfx1250Traits:
     """Select the gfx1250 tile ``compile_pa_decode_tile`` compiles.
 
@@ -1012,6 +1018,7 @@ def gfx1250_tile_traits(
         fuse_tasks=fuse_tasks,
         wave_partials=wave_partials,
         wave_pairs=wave_pairs,
+        wave_dims=wave_dims,
         resident_ctas=(
             mxfp4_gfx1250_resident_ctas(
                 query_length * query_group_size // query_splits, num_compute_units
@@ -1077,6 +1084,17 @@ def compile_gfx1250_pa_decode(t):
         raise ValueError(
             "wave_pairs requires one split of 33-64 MXFP4 rows, without fused "
             "tasks or wave partials"
+        )
+    if t.wave_dims and not (
+        t.mxfp4
+        and t.rows <= 16
+        and t.fuse_tasks == 1
+        and not t.wave_partials
+        and not t.wave_pairs
+    ):
+        raise ValueError(
+            "wave_dims requires one M-tile of MXFP4 rows, without fused tasks, "
+            "wave partials or wave pairs"
         )
     if t.fuse_tasks not in (1, 2) or (
         t.fuse_tasks > 1 and (not t.mxfp4 or t.plan_free or t.cluster_merge)
@@ -1178,6 +1196,7 @@ def compile_gfx1250_pa_decode(t):
         fuse_tasks=t.fuse_tasks,
         wave_partials=t.wave_partials,
         wave_pairs=t.wave_pairs,
+        wave_dims=t.wave_dims,
     )
 
     # Every argument that reducer-fed and direct-output kernels read fits in
@@ -1593,6 +1612,8 @@ def compile_gfx1250_pa_decode(t):
             if const_expr(t.mxfp4):
                 if const_expr(t.wave_pairs):
                     Gfx1250Mxfp4Pipeline(ctx).run_pairs()
+                elif const_expr(t.wave_dims):
+                    Gfx1250Mxfp4Pipeline(ctx).run_dims()
                 else:
                     Gfx1250Mxfp4Pipeline(ctx).run()
             elif const_expr(t.bf16_wave_query_tiles):

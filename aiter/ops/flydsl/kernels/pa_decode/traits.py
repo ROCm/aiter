@@ -1520,6 +1520,10 @@ class Gfx1250Traits:
     # tokens [64 p, +64) of each page; partners (0, p) and (1, p) dequantize
     # half the dims each and swap them through LDS.
     wave_pairs: bool = False
+    # MXFP4 decode CTAs of one M-tile: wave w scores its own 64 tokens but
+    # dequantizes dim block w of all 256 and runs its PV against every wave's
+    # P, exchanged through LDS each tile; no merge of the waves' outputs.
+    wave_dims: bool = False
     # With fuse_tasks 2, CTAs of this size resident at once
     # (mxfp4_gfx1250_resident_ctas): a CTA runs two slots only when the
     # plan's live tasks need more CTAs than this.
@@ -1848,6 +1852,21 @@ class Gfx1250Traits:
         # others still read P.
         return self.stats_offset + 576
 
+    # Wave dims LDS: 2 buffers x waves x M-tiles of the P operand (32 lanes x 32
+    # B), then of the rows' alpha (16 x 4 B), then the rows' final (max, sum).
+    def dims_p_offset(self, buf, wave, m):
+        return ((buf * self.NWARP + wave) * self.m_tiles + m) * 1024
+
+    def dims_alpha_offset(self, buf, wave, m):
+        return (
+            2 * self.NWARP * self.m_tiles * 1024
+            + ((buf * self.NWARP + wave) * self.m_tiles + m) * 64
+        )
+
+    @property
+    def dims_stats_offset(self):
+        return 2 * self.NWARP * self.m_tiles * (1024 + 64)
+
     @property
     def mxfp4_stats_offset(self):
         return self.NWARP * self.m_tiles * self.MXFP4_O_BYTES
@@ -1873,6 +1892,8 @@ class Gfx1250Traits:
             if self.wave_pairs:
                 # Swap area: 2 buffers x 2 halves x 8 dim tiles x 32 lanes x 32 B.
                 return max(merge, 2 * 2 * 8 * 32 * 32)
+            if self.wave_dims:
+                return self.dims_stats_offset + self.NWARP * self.m_tiles * 16 * 8
             return merge
         units = self.m_tiles * 16 // self.quant_unit
         return self.quant_offset + (units * self.NWARP * 4 if self.quant_output else 0)

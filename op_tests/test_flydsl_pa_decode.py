@@ -1805,19 +1805,30 @@ _MXFP4_CASES = [
         )
         for partitions in (1, 2, 3, 8)
     ],
-    # Default-plan decode merges on chip only with one tile a cluster CTA: 32
-    # one-tile tasks and the reducer beat 16 two-tile cluster CTAs at B1 x 8k.
+    # Default-plan decode of one M-tile: clusters that run in one round split
+    # their waves by dims (one and two tiles a CTA at 4k and 8k, a part-filled
+    # M-tile at G8); 64 tiles take one-tile tasks and the reducer.
     *[
         (
-            f"mxfp4-decode-{length // 1024}k-{'cluster' if cluster else 'reducer'}",
+            (
+                f"mxfp4-decode-g{group}-{length // 1024}k-"
+                f"{'dims' if cluster else 'reducer'}"
+            ),
             {
                 **_MXFP4_BASE,
+                "group_size": group,
                 "query_dtype": torch.bfloat16,
                 "cluster": cluster,
+                "dims": bool(cluster),
                 "lengths": (length,),
             },
         )
-        for length, cluster in ((4096, 16), (8192, 0))
+        for group, length, cluster in (
+            (16, 4096, 16),
+            (16, 8192, 16),
+            (8, 4096, 16),
+            (16, 16384, 0),
+        )
     ],
     *[
         (
@@ -2613,6 +2624,7 @@ def _run_pa_decode_case(case, device, monkeypatch):
             "query_splits": None,
             "fused": None,
             "pairs": None,
+            "dims": None,
             "cluster_seqs": None,
             "cluster_steps": None,
             "cluster_runs": None,
@@ -2957,6 +2969,9 @@ def _run_pa_decode_case(case, device, monkeypatch):
         if case["pairs"] is not None and arch == "gfx1250":
             pairs = any(k.get("wave_pairs") for k in compile_kwargs)
             assert pairs == case["pairs"], compile_kwargs[-1]
+        if case["dims"] is not None and arch == "gfx1250":
+            dims = any(k.get("wave_dims") for k in compile_kwargs)
+            assert dims == case["dims"], compile_kwargs[-1]
         if case["cluster"] is not None and arch == "gfx1250":
             assert compile_kwargs[-1]["cluster_merge"] == case["cluster"]
     if case["nhd_contracts"]:

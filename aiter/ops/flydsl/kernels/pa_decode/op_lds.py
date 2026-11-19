@@ -2538,6 +2538,79 @@ class Gfx1250Mxfp4Loader:
             self.table[self.ctx.planned_seq * self.ctx.max_blocks_per_seq + page]
         )
 
+    def tile_pages(self, tt):
+        """Both page ids of tile ``tt`` (wave dims), past the context the
+        sequence's first page as in ``page_id``."""
+        row = self.ctx.planned_seq * self.ctx.max_blocks_per_seq
+        pages = []
+        for slot in range_constexpr(2):
+            page = tt * 2 + slot
+            page = (page < self.num_pages).select(page, fx.Int32(0))
+            pages.append(fx.Int32(self.table[row + page]))
+        return pages
+
+    def first_tile_pages(self, tt):
+        """``tile_pages(tt)`` of a CTA's first tile, from the pages a cluster
+        run preloads with the context length when it has them."""
+        stage_pages = getattr(self.ctx, "stage_pages", None)
+        if const_expr(stage_pages is None or not self.ctx.traits.cluster_runs):
+            return self.tile_pages(tt)
+        return [
+            (tt * 2 + slot < self.num_pages).select(stage_pages[slot], stage_pages[-1])
+            for slot in range_constexpr(2)
+        ]
+
+    def load_dims(self, bases, block):
+        """V of dim block ``block`` for the tile's four 64-token packs (pack p on
+        page p // 2, rows 64 (p % 2) + [0, 64)), as the E2M1 A operand of one
+        scaled WMMA a pack: lane (r, h) holds the block's 16 bytes of pack rows
+        16 h + r and 32 + 16 h + r (K blocks h and 2 + h), so K block q of row r
+        is pack row 16 q + r. Per pack: the two rows' scale dwords, then the 8
+        data dwords. Scales issue first."""
+        rows = [16 * self.half + self.lane16, 32 + 16 * self.half + self.lane16]
+        scales, words = [], []
+        for p in range_constexpr(4):
+            base = bases[p // 2]
+            scale = fx.add_offset(self.ptr["vs"], base // 4)
+            for row in rows:
+                scales.append(
+                    fx.ptr_load(fx.add_offset(scale, fx.Uint32(64 * (p % 2) + row)))
+                )
+        for p in range_constexpr(4):
+            data = fx.add_offset(self.ptr["vd"], bases[p // 2] // 4)
+            for row in rows:
+                words.append(
+                    fx.ptr_load(
+                        fx.add_offset(
+                            data,
+                            fx.Uint32(((64 * (p % 2) + row) * 64 + 16 * block) // 4),
+                        ),
+                        result_type=fx.Vector.make_type(4, fx.Int32),
+                    )
+                )
+        raw = []
+        for p in range_constexpr(4):
+            raw.extend([scales[2 * p], scales[2 * p + 1]])
+            for part in range_constexpr(2):
+                raw.extend([words[2 * p + part][i] for i in range_constexpr(4)])
+        return fx.Vector.from_elements(raw, dtype=fx.Int32)
+
+    DIMS_WORDS = 10  # per pack: two scale dwords, then 8 data dwords
+
+    @staticmethod
+    def dims_pack(raw, p):
+        """(scale dword of pack row 16 h + r, of row 32 + 16 h + r, A operand) of
+        pack ``p`` of a ``load_dims`` result."""
+        base = p * Gfx1250Mxfp4Loader.DIMS_WORDS
+        return (
+            fx.Int32(raw[base]),
+            fx.Int32(raw[base + 1]),
+            fx.Vector.from_elements(
+                [fx.Int32(raw[base + 2 + i]) for i in range_constexpr(8)],
+                dtype=fx.Int32,
+            ),
+        )
+
     def page_id(self, tt):
         """This wave's page of tile ``tt``. Pages past the context (the second
         page of a short last tile) read the sequence's first page instead: the

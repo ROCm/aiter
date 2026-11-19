@@ -537,6 +537,12 @@ def _pa_decode_mxfp4(
         # MTP4 at B32 x 8k: 14.2 -> 11.7 us with 8-CTA clusters).
         while cluster_size > 2 and num_seqs * cluster_size * splits > cluster_ctas:
             cluster_size //= 2
+    # One-M-tile CTAs whose clusters run in one round split their waves by
+    # dims (``run_dims``) and merge on chip faster than the reducer (G16 B2 x
+    # 8k: 5.3 -> 5.1 us), so single-token decode then takes the cluster too.
+    dims_cluster = rows <= 16 and (
+        num_seqs * num_kv_heads * splits * cluster_size <= num_compute_units
+    )
     cluster_merge = (
         cluster_size
         if gfx1250
@@ -546,6 +552,7 @@ def _pa_decode_mxfp4(
             query_length > 1
             or partitions <= CLUSTER_PARTITIONS
             or 4 * num_seqs * num_kv_heads * cluster_size >= num_compute_units
+            or dims_cluster
         )
         and num_seqs * cluster_size * splits <= cluster_ctas
         and num_seqs * num_kv_heads * splits <= num_compute_units * 15 // 16
@@ -577,30 +584,39 @@ def _pa_decode_mxfp4(
     wave_pairs = fuse_tasks == 2 and query_length * group > 40
     if wave_pairs:
         fuse_tasks = 1
+    # Clusters of at most 8 CTAs whose scratch holds a slot per wave merge
+    # each wave's partial directly, skipping the CTA's LDS merge of its four
+    # waves and its barrier (G16 B1 x 1k decode: 4.6 -> 3.8 us). From 8 CTAs,
+    # wave dims are faster where they apply (B4 x 2k: 4.28 -> 4.17 us).
+    wave_partials = bool(
+        gfx1250
+        and cluster_merge
+        and cluster_merge * 4 <= 32
+        and 4 * num_seqs * cluster_merge <= capacity
+        and not (dims_cluster and cluster_merge >= 8)
+    )
+    # Wave dims: wave w dequantizes dim block w of the whole tile and runs
+    # its PV against every wave's P, so no wave merges another's outputs
+    # (G16 decode B1 x 4k: 4.8 -> 4.1 us, B8 x 8k: 5.8 -> 5.3 us). Their
+    # 520-odd VGPRs fit one CTA a CU, so only calls that fit one round use
+    # them (B32 x 8k: 7.7 against 10.5 us).
+    wave_dims = bool(gfx1250 and dims_cluster and cluster_merge and not wave_partials)
     # As on the FP8/BF16 path: clusters given a length bound give CTA p tiles
     # [p * run, (p + 1) * run), runs splitting the bound evenly, so each CTA
     # loads its first page ids with the context length rather than after it.
-    # MTP only: single-token decode measured no faster with runs (G16 B16 x
-    # 8k 6.2 -> 6.3 us), MTP4 faster (B3 x 8k 7.4 -> 6.9 us).
+    # Single-token decode takes runs with wave dims only (G16 B16 x 8k 6.2 ->
+    # 6.3 us without them; B1 x 4k 4.12 -> 4.01 us with them); MTP4 is faster
+    # with runs (B3 x 8k 7.4 -> 6.9 us).
     bound_tiles = -(-schedule_context_length // KV_COMPUTE_BLOCK)
     cluster_runs = bool(
         cluster_merge
-        and query_length > 1
+        and (query_length > 1 or wave_dims)
         and max_context_length is not None
         and sliding_window == 0
         and num_seqs * cluster_merge <= capacity
         and bound_tiles <= 4 * cluster_merge
     )
     run_tiles = -(-bound_tiles // cluster_merge) if cluster_runs else 0
-    # Clusters of at most 8 CTAs whose scratch holds a slot per wave merge
-    # each wave's partial directly, skipping the CTA's LDS merge of its four
-    # waves and its barrier (G16 B1 x 1k decode: 4.6 -> 3.8 us).
-    wave_partials = bool(
-        gfx1250
-        and cluster_merge
-        and cluster_merge * 4 <= 32
-        and 4 * num_seqs * cluster_merge <= capacity
-    )
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
             head_dim=head_dim,
@@ -625,6 +641,7 @@ def _pa_decode_mxfp4(
             fuse_tasks=fuse_tasks,
             wave_partials=wave_partials,
             wave_pairs=wave_pairs,
+            wave_dims=wave_dims,
         )
     pmax = psum = pout = output
     if not direct:
