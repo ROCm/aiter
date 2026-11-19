@@ -1925,27 +1925,24 @@ def _ua_kv_inputs(
     kv_format="k4v8",
     ref=True,
 ):
-    """fp8 Q and an NVFP4 K cache with an fp8 V (kv_format "k4v8", A8K4V8) or an fp4pt V ("k4v4pt",
-    A8K4V4PT), built by the benchmark's _make_ua_cache / _make_ua_rotating_inputs (they replaced the
-    old bench.make_inputs in #6839). Keys as make_inputs gave them; value_cache is the V the kernels read
+    """fp8 Q and an NVFP4 K cache with an fp8 V (kv_format "k4v8", the bench's a8k4v8) or an fp4pt V
+    ("k4v4pt", a8k4v4pt), built by the benchmark's _make_ua_cache / _make_ua_rotating_inputs (they replaced
+    the old bench.make_inputs in #6839). Keys as make_inputs gave them; value_cache is the V the kernels read
     (shuffled fp8, or fp4pt). ref: fp32 dequantized K (and fp4pt V) for the reference; the fp8 V reference
     is the fp8 cache with v_descale."""
     from op_tests.op_benchmarks.triton import bench_unified_attention as bench
 
     assert kv_format in ("k4v8", "k4v4pt")
-    k4v4pt = kv_format == "k4v4pt"
+    fmt = bench.KV_FORMATS["a8" + kv_format]
     k, v, k_ref, v_ref, k_descale, v_descale, scale = bench._make_ua_cache(
+        fmt,
         num_heads[1],
         head_size,
         head_size,
         block_size,
         num_blocks,
-        fp8_kv=not k4v4pt,
         shuffled_kv_cache=True,
-        nvfp4_kv=True,
-        nvfp4_ref=ref,
-        nvfp4_v=False,
-        v_fp4pt=k4v4pt,
+        ref=ref,
     )
     (
         q,
@@ -1966,7 +1963,7 @@ def _ua_kv_inputs(
         head_size_v=head_size,
         block_size=block_size,
         num_blocks=num_blocks,
-        fp8_q=True,
+        prep_q=fmt.prep_q,
         fp8_output=False,
         out_scale_value=1.0,
     )
