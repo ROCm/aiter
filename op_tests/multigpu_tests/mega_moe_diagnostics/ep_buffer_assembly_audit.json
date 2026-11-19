@@ -1,0 +1,29 @@
+{
+  "exit_blocks": [
+    ".LBB0_310"
+  ],
+  "assembly": "op_tests/multigpu_tests/mega_moe_diagnostics/ipflegacy_p96_check_src_ep_buffer_rows_flash_01/asm/mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_epbuffer_rows_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc/22_final_isa.s",
+  "buffer_stores": 128,
+  "tensor_stores": 0,
+  "store_waits": [
+    {
+      "line": 10100,
+      "block": ".LBB0_310",
+      "in_cycle": false
+    }
+  ],
+  "xcnt_waits": 35,
+  "xcnt_scope": "XNACK address-translation operand protection, not store completion",
+  "cyclic_blocks": 154,
+  "wait_instructions": {
+    "s_wait_kmcnt": 1,
+    "s_wait_dscnt": 203,
+    "s_wait_alu": 678,
+    "s_wait_loadcnt": 9,
+    "s_wait_xcnt": 35,
+    "s_wait_loadcnt_dscnt": 1,
+    "s_wait_tensorcnt": 24,
+    "s_wait_storecnt": 1
+  },
+  "sha256": "4f595292977afd6076cc2537e5d137b13228bcc788368b4adc1eb50704e888ac"
+}

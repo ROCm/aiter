@@ -1,0 +1,244 @@
+{
+  "workload": {
+    "tokens_per_rank": 16384,
+    "global_tokens": 65536,
+    "world_size": 4,
+    "experts": 384,
+    "topk": 6,
+    "hidden": 5120,
+    "intermediate": 2304,
+    "balanced": true,
+    "layers": 8,
+    "warmup": 5,
+    "iters": 32
+  },
+  "means": {
+    "original": {
+      "gemm1_median_us": 537.9398688673973,
+      "gemm2_median_us": 578.3452391624451,
+      "plan_median_us": 37.235625088214874,
+      "ready_median_us": 12.158249970525503,
+      "native_e2e_median_us_per_layer": 1553.6714062420742
+    },
+    "persistent_tdm": {
+      "gemm1_median_us": 541.8763682246208,
+      "gemm2_median_us": 553.1731247901917,
+      "plan_median_us": 40.861000306904316,
+      "ready_median_us": 13.740499969571829,
+      "native_e2e_median_us_per_layer": 1574.990437489987
+    },
+    "persistent_buffer_rows": {
+      "gemm1_median_us": 525.0757411122322,
+      "gemm2_median_us": 729.7669947147369,
+      "plan_median_us": 36.6451246663928,
+      "ready_median_us": 11.912749847397208,
+      "native_e2e_median_us_per_layer": 1685.2132499707295
+    }
+  },
+  "per_gpu": [
+    {
+      "run": "ipflegacy_p96_events_ep_original_flash_01",
+      "rank": 0,
+      "gemm1_median_us": 544.2734956741333,
+      "gemm2_median_us": 581.5289914608002,
+      "plan_median_us": 36.05400025844574,
+      "ready_median_us": 8.972999639809132,
+      "native_e2e_median_us_per_layer": 1553.6813750713918,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    },
+    {
+      "run": "ipflegacy_p96_events_ep_original_flash_01",
+      "rank": 1,
+      "gemm1_median_us": 544.6355044841766,
+      "gemm2_median_us": 577.084481716156,
+      "plan_median_us": 35.53299978375435,
+      "ready_median_us": 11.978000402450562,
+      "native_e2e_median_us_per_layer": 1553.5088749629722,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    },
+    {
+      "run": "ipflegacy_p96_events_ep_original_flash_01",
+      "rank": 2,
+      "gemm1_median_us": 520.858496427536,
+      "gemm2_median_us": 574.9385058879852,
+      "plan_median_us": 41.481999680399895,
+      "ready_median_us": 15.422999858856201,
+      "native_e2e_median_us_per_layer": 1553.7563749603578,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    },
+    {
+      "run": "ipflegacy_p96_events_ep_original_flash_01",
+      "rank": 3,
+      "gemm1_median_us": 541.9919788837433,
+      "gemm2_median_us": 579.8289775848389,
+      "plan_median_us": 35.873500630259514,
+      "ready_median_us": 12.258999980986118,
+      "native_e2e_median_us_per_layer": 1553.7389999735751,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    },
+    {
+      "run": "ipflegacy_p96_events_ep_tdm_persist_flash_01",
+      "rank": 0,
+      "gemm1_median_us": 541.9109761714935,
+      "gemm2_median_us": 547.698974609375,
+      "plan_median_us": 40.78100062906742,
+      "ready_median_us": 15.542999841272831,
+      "native_e2e_median_us_per_layer": 1575.1357500448648,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    },
+    {
+      "run": "ipflegacy_p96_events_ep_tdm_persist_flash_01",
+      "rank": 1,
+      "gemm1_median_us": 542.4124896526337,
+      "gemm2_median_us": 542.8130030632019,
+      "plan_median_us": 38.69800083339214,
+      "ready_median_us": 15.422999858856201,
+      "native_e2e_median_us_per_layer": 1575.130749984055,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    },
+    {
+      "run": "ipflegacy_p96_events_ep_tdm_persist_flash_01",
+      "rank": 2,
+      "gemm1_median_us": 519.5769965648651,
+      "gemm2_median_us": 542.1105027198792,
+      "plan_median_us": 47.3099984228611,
+      "ready_median_us": 15.302999876439571,
+      "native_e2e_median_us_per_layer": 1574.8570000369,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    },
+    {
+      "run": "ipflegacy_p96_events_ep_tdm_persist_flash_01",
+      "rank": 3,
+      "gemm1_median_us": 563.605010509491,
+      "gemm2_median_us": 580.0700187683105,
+      "plan_median_us": 36.6550013422966,
+      "ready_median_us": 8.693000301718712,
+      "native_e2e_median_us_per_layer": 1574.8382498941282,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    },
+    {
+      "run": "ipflegacy_p96_events_ep_buffer_rows_flash_01",
+      "rank": 0,
+      "gemm1_median_us": 527.488499879837,
+      "gemm2_median_us": 730.0709784030914,
+      "plan_median_us": 35.49300134181976,
+      "ready_median_us": 12.47899979352951,
+      "native_e2e_median_us_per_layer": 1685.0232499336926,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_epbuffer_rows_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    },
+    {
+      "run": "ipflegacy_p96_events_ep_buffer_rows_flash_01",
+      "rank": 1,
+      "gemm1_median_us": 532.2369933128357,
+      "gemm2_median_us": 728.9114892482758,
+      "plan_median_us": 35.092998296022415,
+      "ready_median_us": 11.69699989259243,
+      "native_e2e_median_us_per_layer": 1684.9845000024288,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_epbuffer_rows_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    },
+    {
+      "run": "ipflegacy_p96_events_ep_buffer_rows_flash_01",
+      "rank": 2,
+      "gemm1_median_us": 509.88197326660156,
+      "gemm2_median_us": 727.1470129489899,
+      "plan_median_us": 40.941499173641205,
+      "ready_median_us": 15.022999607026577,
+      "native_e2e_median_us_per_layer": 1685.5882499839936,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_epbuffer_rows_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    },
+    {
+      "run": "ipflegacy_p96_events_ep_buffer_rows_flash_01",
+      "rank": 3,
+      "gemm1_median_us": 530.6954979896545,
+      "gemm2_median_us": 732.9384982585907,
+      "plan_median_us": 35.05299985408783,
+      "ready_median_us": 8.452000096440315,
+      "native_e2e_median_us_per_layer": 1685.256999962803,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_epbuffer_rows_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    }
+  ]
+}

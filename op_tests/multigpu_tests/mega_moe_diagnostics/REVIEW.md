@@ -93,3 +93,71 @@ Row-major payload TDM scatter follow-up, three review passes:
 3. Producer storage, counter ownership, consumer layout and scheduler unchanged.
    Repeat small/full correctness before timings. No GPU jobs active at edit time;
    runner retains immediate idle check, three-review snapshot and timeout guard.
+
+Persistent GEMM2 buffer scatter, three prelaunch review passes:
+1. Direct compute-wave output: multiply routing weight in fp32 before bf16
+   conversion, exactly as TDM scatter. Each WMMA lane owns its existing disjoint
+   (M row, eight N values); one typed BufferCopy128b emits their four dwords.
+   Per-peer SGPR descriptors use64-bit bases; per-peer offsets are bounded below
+   4GiB and row/column tails are masked. No new LDS output staging is needed.
+2. All task barriers and pipeline fences select dscnt plus TG signal/wait for
+   this mode. Output uses VMEM buffer stores, not tensor stores, and the task
+   emits no storecnt wait. A single final storecnt wait occurs after the outer
+   persistent loop, before the stream-ordered combine kernel. Existing combine
+   inter-rank barrier remains. ASM must verify no compiler-inserted store waits
+   appear on the next-task backedge; source review alone is insufficient.
+3. Opt-in AITER_MOE_EP_BUFFER_STORE, persistent256, bf16 combine only. Baseline
+   keeps original gather S1F (unique/pack/source-shuffle off). Small and full
+   checks compare with a push/TDM reference forced off at invocation, including
+   six graph replays with changing routes/weights/input and empty experts. Keep
+   all existing idle/timeout/boot checks; dump ASM separately from timing.
+
+ASM review follow-up: small and full direct-buffer paths passed correctness.
+The first ASM had exactly one storecnt wait at exit, but opaque CCO window
+loads left resource descriptors in VGPRs: LLVM inserted descriptor waterfall
+loops with wait_xcnt. Window base/stride are wave-uniform by the CCO contract;
+readfirstlane of both32-bit address halves now establishes SGPR descriptors.
+This only changes representation, not addresses or ownership. Re-review all
+bounds and exit ordering unchanged; repeat small/full checks and inspect both
+storecnt and xcnt on the actual loop backedge before timing.
+
+SGPR-base ASM removed descriptor waterfalls, but every divergent peer branch
+still emitted wait_xcnt before restoring EXEC. Replace the branch with buffer
+OOB predication: non-target/invalid lanes use the descriptor's exact byte bound
+as their offset. The16-byte access is dropped completely. Valid offsets, fp32
+weighting, final store retirement and LDS barriers are unchanged. Three-pass
+recheck: (1) bounds include all legal slots, (2) no mask restoration between
+stores and next task, (3) re-run both correctness sizes and CFG/ISA audit.
+
+Counter semantics correction: LLVM SIInsertWaitcnts.cpp associates X_CNT with
+SMEM_GROUP/VMEM_GROUP and protects instruction source operands until address
+translations finish under XNACK. STORE_CNT separately tracks VMEM_WRITE_ACCESS.
+OOB predication reduces xcnts but remaining translation/source-register hazards
+must be retained. The audit reports xcnt counts, and rejects storecnt in any CFG
+cycle; it no longer incorrectly requires zero xcnt instructions.
+Reference: https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/AMDGPU/SIInsertWaitcnts.cpp
+
+Coalesced compute-wave row writeback, three review passes:
+1. Restore original weighted-bf16 LDS staging. Each wave reads only its own
+   (wave_m M rows, wave_n N span);32 lanes each transfer four adjacent bf16
+   values, giving256B contiguous writes for the Flash128-column wave tile.
+   Row routes are broadcast from the preloaded compute-wave metadata. Scalar
+   row descriptors name one peer/slot; masks cover M/N tails and invalid routes.
+2. Each wave waits dscnt before reading its own C values. No TG rendezvous is
+   required for wave-private C ownership. The final raw TG barrier retires all
+   LDS reads before next-task TDM reuse. Buffer stores remain in flight; only
+   the final loop-exit storecnt waits for remote completion.
+3. This replaces the validated but slow fragmented register-store experiment.
+   Retain P256, original S1F/preshuffle/CSV, and all idle/timeout guards. Re-run
+   small/full correctness, inspect the _epbuffer_rows_ symbol and CFG, then time.
+
+Final review after row-writeback validation:
+1. Small257 and full16384 correctness passed six changing-input graph replays
+   against push/TDM. M tails, hot/empty experts and disjoint ownership passed.
+2. Full b4/cluster1x4/pw256 ISA has128 buffer stores, zero tensor stores and
+   one storecnt in the noncyclic exit block. Raw barrier on the task backedge
+   waits only LDS. Existing combine synchronization remains unchanged.
+3. Coalesced-buffer GEMM2/E2E729.77/1685.21us loses to default578.35/1553.67us;
+   keep opt-in disabled. Formatting/comments and unused-import cleanup leave
+   the tested kernel AST identical. Commit lightweight metrics and ISA audit,
+   not compilation caches. All successful runs retained their boot ID.

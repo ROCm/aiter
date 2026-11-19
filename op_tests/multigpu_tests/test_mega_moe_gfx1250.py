@@ -555,6 +555,7 @@ def _check_pull(
     expected_tile_ready=None,
     src_rank_shuffle=False,
     unique_pull=False,
+    ep_buffer_store=False,
 ):
     """Validate remote FP4 bytes, inverse maps, and changing graph inputs."""
     from aiter.test_common import checkAllclose
@@ -612,7 +613,8 @@ def _check_pull(
                 % EXPERTS_PER_RANK + ctx.rank * EXPERTS_PER_RANK
             ).reshape_as(ctx.ids)
             ctx.ids.copy_(own)
-        ctx.layer(push, "bf16")
+        with mock.patch.dict(os.environ, {"AITER_MOE_EP_BUFFER_STORE": "0"}):
+            ctx.layer(push, "bf16")
         ctx.layer(pull, "bf16")
         if ready_first:
             if ready_probe is not None:
@@ -649,15 +651,15 @@ def _check_pull(
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = ctx.layer(pull, "bf16")
-        for iteration in range(6 if ready_first or src_rank_shuffle or unique_pull else 4):
-            if (ready_first and iteration == 2) or ((src_rank_shuffle or unique_pull) and iteration == 4):
+        for iteration in range(6 if ready_first or src_rank_shuffle or unique_pull or ep_buffer_store else 4):
+            if (ready_first and iteration == 2) or ((src_rank_shuffle or unique_pull or ep_buffer_store) and iteration == 4):
                 # Disjoint source/destination ownership and empty segments.
                 hot = (
                     torch.arange(TOPK, device=ctx.device, dtype=torch.int32)
                     + ctx.rank * EXPERTS_PER_RANK
                 )
                 ctx.ids.copy_(hot.expand_as(ctx.ids))
-            elif (ready_first and iteration == 3) or ((src_rank_shuffle or unique_pull) and iteration == 5):
+            elif (ready_first and iteration == 3) or ((src_rank_shuffle or unique_pull or ep_buffer_store) and iteration == 5):
                 # Unequal, non-M16 source boundaries within otherwise hot
                 # experts. Each rank contributes a different random tail.
                 hot = torch.arange(TOPK, device=ctx.device, dtype=torch.int32)
@@ -671,7 +673,8 @@ def _check_pull(
                 ctx.ids.copy_(saved_ids)
             ctx.x.copy_(torch.roll(saved_x, iteration * 17, dims=1))
             ctx.wts.copy_(torch.roll(saved_weights, iteration, dims=1))
-            expected = ctx.layer(push, "bf16").clone()
+            with mock.patch.dict(os.environ, {"AITER_MOE_EP_BUFFER_STORE": "0"}):
+                expected = ctx.layer(push, "bf16").clone()
             if tile_flags is not None:
                 # A new generation must be published; unused M64/source slots
                 # must stay untouched, so the legacy protocol cannot pass.
@@ -1157,6 +1160,39 @@ def _check_pull_s1f_unique(ctx):
         _check_pull(ctx, fused=True, unique_pull=True, a_preshuffled=False)
 
 
+def _check_pull_s1f_ep_buffer(ctx):
+    """Check persistent GEMM2 buffer stores across changing graph replays."""
+    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
+
+    original_find = grouped._find_grouped_config
+
+    def configured(**kwargs):
+        row = dict(original_find(**kwargs) or {})
+        row["tdm_as_in_prologue"] = "0"
+        return row
+
+    with mock.patch.dict(os.environ, {
+        "AITER_MEGA_PULL_UNIQUE": "0",
+        "AITER_MOE_EP_BUFFER_STORE": "1",
+        "AITER_FLYDSL_PERSISTENT_WORKERS2": "256",
+        "AITER_MEGA_PULL_PLAN_PACK": "0",
+        "AITER_MEGA_PULL_SRC_SHUFFLE": "0",
+        "AITER_MEGA_EP_LINEAR_STORE": "0",
+        "AITER_MOE_S1F_TILE_READY": "0",
+        "AITER_MOE_S1F_READY_FIRST": "0",
+        "AITER_MOE_S1F_PRODUCER_GROUP": "1",
+        "AITER_MOE_S1F_CLUSTER_LOCAL": "0",
+        "AITER_MOE_S1F_READY_QUEUE": "0",
+        "AITER_MOE_S1F_AFFINITY": "1",
+        "AITER_MEGA_S1F_PULL_PRODUCERS": "96",
+        "AITER_TDM_TILE_M": "256", "AITER_TDM_TILE_N": "256",
+        "AITER_TDM_TILE_K": "256",
+        "AITER_TDM_NUM_BUFFERS": "4" if TOKENS >= 4096 else "2",
+        "AITER_TDM_M_WARP": "2", "AITER_TDM_N_WARP": "2",
+    }), mock.patch.object(grouped, "_find_grouped_config", configured):
+        _check_pull(ctx, fused=True, ep_buffer_store=True)
+
+
 def _check_pull_s1f_src_rank_shuffle(ctx):
     """Check source-homogeneous M256 tiles with arbitrary routing and padding."""
     from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
@@ -1243,6 +1279,7 @@ CHECKS = (
     _check_pull_s1f_tile_ready_leader,
     _check_pull_s1f_src_rank_shuffle,
     _check_pull_s1f_unique,
+    _check_pull_s1f_ep_buffer,
     _check_pull_s1f_clusters,
     _check_pull_s1f_cluster_m_projection,
     _check_pairings,

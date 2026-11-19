@@ -331,3 +331,50 @@ The script name reflects the original default, not a claim that the optional
 hybrid is faster. Source-map scans, per-route completion RMWs and changed
 consumer startup remain candidates for further cycle-level analysis. The next
 optimization must address destination-tile completion as well as copy layout.
+
+## Persistent GEMM2 remote buffer scatter (experimental)
+
+`AITER_MOE_EP_BUFFER_STORE=1 AITER_FLYDSL_PERSISTENT_WORKERS2=256` changes only
+GEMM2's unquantized EP scatter. Start from the original gather/preshuffled S1F
+baseline, with unique pull, source packing and linear GEMM2 stores disabled.
+
+Each compute wave weights its accumulator in fp32, converts to bf16, and
+stages its output in the existing LDS layout. It reads only its own M/N region
+and issues `buffer_store_b64` along contiguous columns:32 lanes write four
+bf16 values each (256 contiguous bytes per wave). Wave-uniform row descriptors
+select the source rank's combine landing slot; invalid rows/columns are masked.
+Output uses no TDM stores, so the next task's tensor counter covers input only.
+
+All workgroup barriers inside this mode use `s_wait_dscnt 0` followed by
+`rocdl.s_barrier_signal/wait`. A single `s_wait_storecnt 0` follows the outer
+persistent loop, immediately before kernel exit. The original stream ordering
+and combine cross-rank barrier retain remote completion guarantees.
+`xcnt` waits remain where LLVM needs XNACK address-translation operand
+protection; they do not represent remote-store completion. They must not be
+removed solely to reduce the instruction count.
+
+```bash
+# Native timing; preserve original gather GEMM1 and affinity3:5.
+AITER_MOE_EP_BUFFER_STORE=1 AITER_MOE_S1F_AFFINITY=1 bash run_ds41_flash_best.sh
+# HIP-event breakdown; use fresh labels, flags default to the original path.
+BENCH_EP_BUFFER_STORE=1 BENCH_GEMM2_WORKERS=256 BENCH_IPF=legacy bash op_tests/multigpu_tests/mega_moe_diagnostics/run.sh affinity events_ep_buffer_NEW
+BENCH_EP_BUFFER_STORE=0 BENCH_GEMM2_WORKERS=256 BENCH_IPF=legacy bash op_tests/multigpu_tests/mega_moe_diagnostics/run.sh affinity events_ep_tdm_persist_NEW
+BENCH_IPF=legacy bash op_tests/multigpu_tests/mega_moe_diagnostics/run.sh affinity events_ep_original_NEW
+# Changing-routing correctness and actual ISA (repeat with CHECK_TPR=16384).
+CHECK_TPR=257 CHECK_EP_BUFFER=1 BENCH_EP_BUFFER_STORE=1 BENCH_GEMM2_WORKERS=256 BENCH_DUMP_ASM=1 BENCH_IPF=legacy bash op_tests/multigpu_tests/mega_moe_diagnostics/run.sh affinity check_src_ep_buffer_NEW
+```
+
+`audit_ep_buffer_asm.py PATH_TO_22_final_isa.s` checks the emitted CFG: no
+storecnt wait can belong to a control-flow cycle, the sole store wait must be
+in the exit block, and output must contain buffer stores without tensor stores.
+The runtime symbol contains `_pw256_` and `_epbuffer_`; A remains preshuffled.
+The mode rejects quantized combine, linear landing maps, split-K, nonpersistent
+launches, and per-peer landing extents reaching4GiB.
+
+**This option is slower and remains disabled by default.** At16384 tokens/rank,
+GEMM2/E2E are729.77/1685.21us versus578.35/1553.67us for the original default.
+Persistent256 with TDM scatter measures553.17/1574.99us. All values average the
+four GPU medians; E2E is per layer. Small and full changing-routing checks passed.
+The emitted full-size kernel has128 static buffer stores, no tensor stores and
+one exit-only storecnt wait. See [results and analysis](op_tests/multigpu_tests/mega_moe_diagnostics/RESULTS_EP_BUFFER_20261119.md)
+and [actual ISA excerpt](op_tests/multigpu_tests/mega_moe_diagnostics/ep_buffer_assembly_excerpt.s).

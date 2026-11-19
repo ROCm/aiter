@@ -24,7 +24,6 @@ from .gemm_common_gfx1250 import (
     fused_silu_swiglu_elem,
     fused_situv2_elem,
     make_lds_copy_ops,
-    pipeline_fence,
     prefetch_kernel_code,
     situv2_consts,
     workgroup_barrier,
@@ -240,6 +239,7 @@ def build_gemm_a8w4_tdm_task(
     prologue_barrier=None,
     ep_linear_map_offset=0,
     ep_linear_capacity=0,
+    ep_buffer_store=0,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -301,6 +301,30 @@ def build_gemm_a8w4_tdm_task(
     - ``tdm_snop``: ``s_nop 0`` after every TDM issue, so no branch or label
       directly follows one (a gfx1250 TDM hazard).
     """
+
+    if ep_buffer_store:
+        if not enable_ep_scatter or not persistent_workers or ep_quant_bits:
+            raise ValueError("buffer EP stores require persistent unquantized GEMM2")
+        if ep_linear_capacity or k_waves != 1:
+            raise ValueError("buffer EP stores require the ordinary scatter map")
+        if ep_destination_stride * ep_slot_stride_bytes >= 2**32:
+            raise ValueError("one peer's buffer-store extent must be below 4GiB")
+        raw_drain = 1
+
+    def task_barrier():
+        # gpu.barrier() can insert store waits; ISA requires LDS-only
+        # ownership transfer here so prior peer stores remain in flight.
+        if ep_buffer_store:
+            rocdl.s_wait_dscnt(0)
+            rocdl.s_barrier_signal(-1)
+            rocdl.s_barrier_wait(-1)
+        else:
+            workgroup_barrier()
+
+    def task_fence(outstanding=0):
+        tdm_ops.tensor_wait(outstanding)
+        task_barrier()
+
     if tile_meta is not None or item_hooks is not None:
         assert explicit_tile and persistent_workers, "S1F hooks need explicit tiles"
     if defer_c_wait:
@@ -626,7 +650,9 @@ def build_gemm_a8w4_tdm_task(
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
     _wmma_2x4 = "_wmma2x4_order" if wmma_2x4 else ""
-    _prefence = f"_prebarrier{ksl1_prefence_mma}_barrier{wmma_in_barrier}"
+    _prefence = (
+        "_epbuffer_rows" if ep_buffer_store else ""
+    ) + f"_prebarrier{ksl1_prefence_mma}_barrier{wmma_in_barrier}"
     _prefence += f"_ksl0tail_{ksl0_fence_mma}"
     if a_is_fp4 and KWS > 1 and ksl0_prefix_mma:
         _prefence += f"_ksl0prefix{ksl0_prefix_mma}"
@@ -962,6 +988,26 @@ def build_gemm_a8w4_tdm_task(
             )
             _ep_lsa0 = fx.Int64(ep_win.lsa_ptr(fx.Int32(0), 0))
             _ep_lsa1 = fx.Int64(ep_win.lsa_ptr(fx.Int32(1), 0))
+            if const_expr(ep_buffer_store):
+
+                def scalar_address(address):
+                    # CCO window fields are identical across this wave. No typed
+                    # uniform cast exists; without readfirstlane, BufferCopy
+                    # generates descriptor waterfalls and per-store wait_xcnt.
+                    low = fx.Int32(
+                        rocdl.readfirstlane(T.i32, fx.Int32(address).ir_value())
+                    )
+                    high = fx.Int32(
+                        rocdl.readfirstlane(T.i32, fx.Int32(address >> 32).ir_value())
+                    )
+                    return fx.Int64(fx.Uint32(low)) | (fx.Int64(high) << 32)
+
+                _ep_lsa0 = scalar_address(_ep_lsa0)
+                _ep_lsa1 = scalar_address(_ep_lsa1)
+                _ep_store_atom = fx.make_copy_atom(
+                    fx.rocdl.BufferCopy64b(3 << 3), fx.Int32
+                )
+                _ep_store_value = fx.make_rmem_tensor(fx.make_layout(2, 1), fx.Int32)
         b_outer_row = eb64 * B_BATCH_ROWS + blk_n64 // 16
         a_off0 = blk_m64 * A_GROW
         b_off0 = b_outer_row * Kp16
@@ -1941,44 +1987,56 @@ def build_gemm_a8w4_tdm_task(
                 # multiple vectors. Issue all loads before the GEMM pipeline so
                 # their latency overlaps the mainloop. Invalid lanes safely read
                 # row zero and are replaced with the TDM OOB index below.
-                _rm_dst_lanes = []
-                _scatter_lane_valids = []
-                for scatter_vector in range_constexpr(scatter_dst_vectors):
-                    _scatter_pass_lane = lane // fx.Int32(
-                        SCATTER_GROUP_ROWS
-                    ) + fx.Int32(scatter_vector * SCATTER_PASSES_PER_VECTOR)
-                    _scatter_group_lane = wave + _scatter_pass_lane * fx.Int32(
-                        num_waves
-                    )
-                    _scatter_row_lane = _scatter_group_lane * fx.Int32(
-                        SCATTER_GROUP_ROWS
-                    ) + lane % fx.Int32(SCATTER_GROUP_ROWS)
-                    _scatter_lane_valid = (
-                        _scatter_pass_lane < fx.Int32(scatter_passes)
-                    ) & (_scatter_group_lane < fx.Int32(scatter_groups))
-                    _scatter_lane_valid = _scatter_lane_valid & (
-                        _scatter_row_lane < mn_oob
-                    )
-                    _scatter_safe_row = _scatter_lane_valid.select(
-                        _scatter_row_lane, fx.Int32(0)
-                    )
-                    _rm_dst_lanes.append(
-                        fx.Int32(
-                            fx.ptr_load(
-                                _rm_i32 + blk_m64 * 2 + fx.Int64(_scatter_safe_row) * 2
+                if const_expr(not ep_buffer_store):
+                    _rm_dst_lanes = []
+                    _scatter_lane_valids = []
+                    for scatter_vector in range_constexpr(scatter_dst_vectors):
+                        _scatter_pass_lane = lane // fx.Int32(
+                            SCATTER_GROUP_ROWS
+                        ) + fx.Int32(scatter_vector * SCATTER_PASSES_PER_VECTOR)
+                        _scatter_group_lane = wave + _scatter_pass_lane * fx.Int32(
+                            num_waves
+                        )
+                        _scatter_row_lane = _scatter_group_lane * fx.Int32(
+                            SCATTER_GROUP_ROWS
+                        ) + lane % fx.Int32(SCATTER_GROUP_ROWS)
+                        _scatter_lane_valid = (
+                            _scatter_pass_lane < fx.Int32(scatter_passes)
+                        ) & (_scatter_group_lane < fx.Int32(scatter_groups))
+                        _scatter_lane_valid = _scatter_lane_valid & (
+                            _scatter_row_lane < mn_oob
+                        )
+                        _scatter_safe_row = _scatter_lane_valid.select(
+                            _scatter_row_lane, fx.Int32(0)
+                        )
+                        _rm_dst_lanes.append(
+                            fx.Int32(
+                                fx.ptr_load(
+                                    _rm_i32 + blk_m64 * 2 + fx.Int64(_scatter_safe_row) * 2
+                                )
                             )
                         )
-                    )
-                    _scatter_lane_valids.append(_scatter_lane_valid)
+                        _scatter_lane_valids.append(_scatter_lane_valid)
                 # Every GEMM wave needs the route weight for all of its M rows.
                 # Coalesced global loads replace the shared row-map TDM,
                 # LDS allocation, barrier, and four epilogue LDS reads. Their
                 # latency is likewise covered by the mainloop.
                 _rm_weight_rows = []
+                _rm_buffer_rows = []
                 for wm in range_constexpr(wmma_m_rep):
                     _weight_row = wmb + wm * 16 + lane16
                     _weight_valid = _weight_row < mn_oob
                     _weight_safe_row = _weight_valid.select(_weight_row, fx.Int32(0))
+                    if const_expr(ep_buffer_store):
+                        _rm_buffer_rows.append(
+                            fx.Int32(
+                                fx.ptr_load(
+                                    _rm_i32
+                                    + blk_m64 * 2
+                                    + fx.Int64(_weight_safe_row) * 2
+                                )
+                            )
+                        )
                     _weight_bits = fx.Int32(
                         fx.ptr_load(
                             _rm_i32
@@ -2005,7 +2063,7 @@ def build_gemm_a8w4_tdm_task(
                     rocdl.s_barrier_signal(-1)
                     rocdl.s_barrier_wait(-1)
                 else:
-                    pipeline_fence(outstanding=outstanding)
+                    task_fence(outstanding=outstanding)
 
             def a_ready_gate():
                 # S1F: only the A / A-scale owners wait for the tile's rows.
@@ -2041,7 +2099,7 @@ def build_gemm_a8w4_tdm_task(
                         # Every rolled iteration reads the carry, so prime it here --
                         # outside ``dispatch_wave_job``, since every wave runs this once.
                         tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
-                        workgroup_barrier()
+                        task_barrier()
                         first_lds_addr = calc_lds_addr(0)
                         rocdl.sched_barrier(0)
                         load_lds_data(
@@ -2053,7 +2111,7 @@ def build_gemm_a8w4_tdm_task(
                             s = kt % num_buffers
                             buf = s
                             if const_expr(not next_stage_on):
-                                pipeline_fence(outstanding=TDM_PER * (num_buffers - 1))
+                                task_fence(outstanding=TDM_PER * (num_buffers - 1))
                             next_stage_buf = (
                                 (kt + 1) % num_buffers
                                 if const_expr(next_stage_on)
@@ -2072,7 +2130,7 @@ def build_gemm_a8w4_tdm_task(
                                 ),
                                 interleaved_lds_load=interleaved_lds_load,
                             )
-                            workgroup_barrier()
+                            task_barrier()
                             issue(s, kt + num_buffers, my_jobs)
 
                     dispatch_wave_job(steady_post)
@@ -2106,7 +2164,7 @@ def build_gemm_a8w4_tdm_task(
                     init_accumulators()
                     n_steady = K_TILES - PRE
                     if const_expr(next_stage_on):
-                        pipeline_fence(outstanding=TDM_PER * (PRE - 1))
+                        task_fence(outstanding=TDM_PER * (PRE - 1))
                         first_lds_addr = calc_lds_addr(0)
                         rocdl.sched_barrier(0)
                         load_lds_data(
@@ -2118,7 +2176,7 @@ def build_gemm_a8w4_tdm_task(
                     def steady_mid_iteration(my_jobs, kt, s):
                         buf = s
                         if const_expr(not next_stage_on):
-                            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
+                            task_fence(outstanding=TDM_PER * (num_buffers - 2))
                             rocdl.sched_barrier(0)
                             issue(
                                 (kt + PRE) % num_buffers,
@@ -2189,7 +2247,7 @@ def build_gemm_a8w4_tdm_task(
                                 rocdl.s_barrier_signal(-1)
                                 rocdl.s_barrier_wait(-1)
                             else:
-                                workgroup_barrier()
+                                task_barrier()
                         next_stage_buf = (
                             (kt + 1) % num_buffers if const_expr(has_next) else None
                         )
@@ -2234,7 +2292,7 @@ def build_gemm_a8w4_tdm_task(
                 # retires, so each parks its partials in its own arena. Group 0
                 # adds them in group order (deterministic) and alone keeps the
                 # tile; the other groups blank their epilogue via mn_oob.
-                pipeline_fence(outstanding=0)
+                task_fence(outstanding=0)
                 KW_CHUNKS = WMMA_VECTOR_DWORDS // 4
                 KW_LANES = num_waves * WAVE
                 kw_tid = tid % KW_LANES
@@ -2257,7 +2315,7 @@ def build_gemm_a8w4_tdm_task(
                                 .bitcast(fx.Int32)
                                 .ir_value(),
                             )
-                workgroup_barrier()
+                task_barrier()
                 if k_group == 0:
                     for idx in range_constexpr(n_acc):
                         own = Vec(c_frags[idx].load())
@@ -2719,6 +2777,64 @@ def build_gemm_a8w4_tdm_task(
                                     hv_i32,
                                 )
 
+            if const_expr(ep_buffer_store):
+                # Each wave reads only the M/N region it staged itself. Adjacent
+                # lanes now write adjacent K bytes, rather than short fragments
+                # scattered across 16 output rows. Closing task_barrier protects
+                # all LDS reads before any wave starts the next task's TDM loads.
+                rocdl.s_wait_dscnt(0)
+                ep_lds_ptr = fx.recast_iter(fx.Int32, c_ep_base_ptr)
+                for wm in range_constexpr(wmma_m_rep):
+                    for row in range(16):
+                        destination = fx.Int32(
+                            fx.gpu.shuffle_idx(_rm_buffer_rows[wm], row, 32)
+                        )
+                        destination = fx.Int32(
+                            rocdl.readfirstlane(T.i32, destination.ir_value())
+                        )
+                        row_rel = wmb + wm * 16 + row
+                        valid = fx.Int32(
+                            ((row_rel < mn_oob) & (destination >= 0)).select(
+                                fx.Int32(1), fx.Int32(0)
+                            )
+                        )
+                        valid = fx.Int32(rocdl.readfirstlane(T.i32, valid.ir_value()))
+                        if valid != 0:
+                            peer = destination // ep_destination_stride
+                            slot = destination % ep_destination_stride
+                            address = (
+                                _ep_lsa0
+                                + fx.Int64(peer) * (_ep_lsa1 - _ep_lsa0)
+                                + ep_combine_input_offset
+                                + fx.Int64(slot) * ep_slot_stride_bytes
+                                + fx.Int64(blk_n + wnb) * 2
+                            )
+                            pointer = fx.inttoptr(
+                                fx.PointerType.get(T.i32, fx.AddressSpace.Global, 8),
+                                scalar_address(address),
+                            )
+                            view = fx.make_view(
+                                pointer, fx.make_layout(warp_tile_n // 2, 1)
+                            )
+                            buffer = fx.rocdl.make_buffer_tensor(
+                                fx.Tensor(view),
+                                max_size=False,
+                                num_records_bytes=warp_tile_n * 2,
+                            )
+                            pieces = fx.logical_divide(buffer, fx.make_layout(2, 1))
+                            for vector in range(lane, warp_tile_n // 4, 32):
+                                offset = (row_rel * STORE_PITCH + wnb + vector * 4) // 2
+                                data = fx.generic_load(ep_lds_ptr + offset, count=2)
+                                fx.memref_store_vec(data, _ep_store_value)
+                                index = (blk_n + wnb + vector * 4 < i32_n).select(
+                                    vector, fx.Int32(warp_tile_n // 4)
+                                )
+                                fx.copy(
+                                    _ep_store_atom,
+                                    _ep_store_value,
+                                    fx.slice(pieces, (None, index)),
+                                )
+
             # -- Shared LDS -> global --
             # dscnt-only barrier: the store reads LDS, not the e8m0 scales still
             # in flight, so their storecnt wait moves past the store below.
@@ -2726,9 +2842,9 @@ def build_gemm_a8w4_tdm_task(
                 rocdl.s_wait_dscnt(0)
                 rocdl.s_barrier_signal(-1)
                 rocdl.s_barrier_wait(-1)
-            else:
-                workgroup_barrier()
-            if const_expr(enable_ep_scatter):
+            elif const_expr(not ep_buffer_store):
+                task_barrier()
+            if const_expr(enable_ep_scatter and not ep_buffer_store):
                 if const_expr(ep_linear_capacity):
                     # Each M256 has one source rank and a contiguous home
                     # landing range. One 2D TDM stores this wave's whole M slice.
@@ -2888,7 +3004,7 @@ def build_gemm_a8w4_tdm_task(
                         else:
                             issue_scatter_group(group, scatter_vector, vector_pass)
                 tdm_ops.tensor_wait(0)
-            else:
+            elif const_expr(not ep_buffer_store):
 
                 def store_tile(gt, tile, lds_ptr, lds_row):
                     # A k_waves workgroup's tile belongs to group 0 alone.
@@ -2956,7 +3072,8 @@ def build_gemm_a8w4_tdm_task(
             if const_expr(raw_drain or defer_c_wait):
                 # LDS hand-off only (S1F: the next item's slot). The output
                 # store no longer reads what the next prologue writes: either
-                # every wave waited for it above, or (defer_c_wait) it reads
+                # it is a register-fed buffer store, every wave waited for it
+                # above, or (defer_c_wait) it reads
                 # the last stage, which the prologue does not touch.
                 rocdl.s_wait_dscnt(0)
                 rocdl.s_barrier_signal(-1)
@@ -2965,7 +3082,7 @@ def build_gemm_a8w4_tdm_task(
                 # Every wave must retire the output store before another wave
                 # reuses the same LDS arena for the next task's input. This
                 # also covers the fused scatter's tensor_wait above.
-                workgroup_barrier()
+                task_barrier()
 
     layout = {
         "kernel_attrs": kernel_attrs,
@@ -3040,6 +3157,7 @@ def launch_gemm_a8w4_tdm(
     k_waves: Constexpr[int] = 1,
     ep_linear_map_offset: Constexpr[int] = 0,
     ep_linear_capacity: Constexpr[int] = 0,
+    ep_buffer_store: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -3088,6 +3206,7 @@ def launch_gemm_a8w4_tdm(
         ep_quant_bits=ep_quant_bits,
         ep_linear_map_offset=ep_linear_map_offset,
         ep_linear_capacity=ep_linear_capacity,
+        ep_buffer_store=ep_buffer_store,
         row_major_ascale=row_major_ascale,
         a_row_stride_bytes=a_row_stride_bytes,
         a_scale_row_stride_bytes=a_scale_row_stride_bytes,
@@ -3155,6 +3274,10 @@ def launch_gemm_a8w4_tdm(
             tasks = ceildiv(rows, tile_m) * ceildiv(i32_n, tile_n)
             for task_id in range(fx.block_idx.x, tasks, persistent_workers):
                 run_task(task_id, rows)
+            if const_expr(ep_buffer_store):
+                # Combine follows on the same stream. Retire this wave's peer
+                # stores once, outside the persistent task loop.
+                rocdl.s_wait_storecnt(0)
         else:
             run_task(fx.block_idx.x, i32_m)
 

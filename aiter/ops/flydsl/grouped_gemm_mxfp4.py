@@ -316,6 +316,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         k_waves,
         int(stage2_scatter.linear_tile_map_offset) if enable_ep_scatter else 0,
         int(stage2_scatter.linear_slot_capacity) if enable_ep_scatter else 0,
+        int(enable_ep_scatter and _select_bool_env("AITER_MOE_EP_BUFFER_STORE", 0)),
     )
     _run_compiled(
         launch_gemm_a8w4_tdm,
