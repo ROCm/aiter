@@ -1686,6 +1686,7 @@ def test_a_triton_gemm_refuses_a_result_that_is_not_y(monkeypatch, op):
         "mla_sparse_prefill_v41",
         "inverse_rope_group_quant",
         "pa_decode_bf16",
+        "pa_fwd",
     ],
 )
 def test_the_buffer_free_contracts_resolve_under_torch_ops(op_name):
@@ -1746,3 +1747,129 @@ def test_the_buffer_free_contracts_resolve_under_torch_ops(op_name):
         superseded[0]["version"]
         == plugin.status()["routed_ops"][op_name]["version"] - 1
     )
+
+
+# ---------------------------------------------------------------------------
+# pa_fwd: the out-buffer bypass, and which spellings route
+#
+# `pa_fwd` has two public spellings and one of them is named `_asm`, which
+# looks like a backend pin and is not: `pa_fwd_asm` predates the neutral name,
+# so an ordinary call through it routes. Only `kernelName` pins a kernel no
+# provider has, and only that bypasses on its own.
+#
+# The other bypass is `out_`. The buffered form RETURNS the buffer it was
+# given, while a custom op's schema declares its results do not alias its
+# inputs; v2 leaves the buffer out of the contract rather than picking a side
+# of that contradiction.
+#
+# Five call sites in op_tests pass `out_`, so after this change they exercise
+# the bypass and nothing exercises the routed path. These tests are that
+# coverage: each pins WHICH path ran, not merely that the call returned.
+# ---------------------------------------------------------------------------
+
+
+def _pa_fwd_args(device="cpu"):
+    """The eleven parameters of the v2 contract -- no output buffer."""
+    heads, head_dim, batch, pages = 2, 16, 1, 1
+    return (
+        torch.randn(batch, heads, head_dim, device=device),
+        torch.randn(pages, heads, head_dim, device=device),
+        torch.randn(pages, heads, head_dim, device=device),
+        torch.zeros(batch, 1, dtype=torch.int32, device=device),
+        torch.ones(batch, dtype=torch.int32, device=device),
+        1,
+    )
+
+
+def _serve_pa_fwd(monkeypatch, served):
+    """Enable a provider for the pa_fwd contract and hand back its spy."""
+    provider = _Provider("aklr", _candidate("aklr", served))
+    provider.op_versions = {"pa_fwd": {2}}
+    plugin.configure(enable=("aklr",), source="test")
+    monkeypatch.setattr(
+        plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
+    )
+    return provider
+
+
+@pytest.mark.parametrize("spelling", ["pa_fwd", "pa_fwd_asm"])
+def test_pa_fwd_both_spellings_route_when_no_buffer_is_named(monkeypatch, spelling):
+    """`pa_fwd_asm` is a historical name, not a backend pin, so it routes too.
+
+    Parametrised over both names rather than testing the neutral one alone:
+    the `_asm` suffix reads like a pin, and a reader who assumes it bypasses
+    would leave half this op's callers unrouted without noticing.
+    """
+    module = sys.modules["aiter.ops.attention"]
+    served = torch.zeros(1, 2, 16)
+    provider = _serve_pa_fwd(monkeypatch, served)
+
+    result = getattr(module, spelling)(*_pa_fwd_args())
+
+    decision = plugin.last_decision()
+    assert (decision.route, decision.provider) == ("provider", "aklr")
+    assert provider.select_calls == 1
+    assert torch.equal(result, served)
+
+
+@pytest.mark.parametrize("spelling", ["pa_fwd", "pa_fwd_asm"])
+def test_pa_fwd_naming_the_output_buffer_bypasses_routing(monkeypatch, spelling):
+    """A named `out_` must not reach a provider, from either spelling.
+
+    The native body is replaced so this runs without a device: what is under
+    test is which branch the public name picks, not what the kernel computes.
+    """
+    module = sys.modules["aiter.ops.attention"]
+    sentinel = object()
+    monkeypatch.setattr(module, "_pa_fwd_native", lambda *a, **k: sentinel)
+    provider = _serve_pa_fwd(monkeypatch, served=None)
+
+    args = _pa_fwd_args()
+    result = getattr(module, spelling)(*args, out_=torch.zeros(1, 2, 16))
+
+    assert result is sentinel, "naming out_ did not reach the native body"
+    assert provider.select_calls == 0, (
+        "a named buffer must not reach a provider: the buffered form returns "
+        "the tensor it was given, which the registered schema forbids"
+    )
+
+
+def test_pa_fwd_kernel_name_bypasses_routing(monkeypatch):
+    """`kernelName` pins one asm kernel, which no provider has.
+
+    This is the only argument that bypasses on its own; keeping it pinned
+    separately from `out_` stops the two reasons being merged into one.
+    """
+    module = sys.modules["aiter.ops.attention"]
+    sentinel = object()
+    monkeypatch.setattr(module, "_pa_fwd_native", lambda *a, **k: sentinel)
+    provider = _serve_pa_fwd(monkeypatch, served=None)
+
+    result = module.pa_fwd_asm(*_pa_fwd_args(), kernelName="pa_fwd_some_kernel")
+
+    assert result is sentinel
+    assert provider.select_calls == 0
+
+
+def test_pa_fwd_buffered_form_returns_the_caller_s_buffer(monkeypatch):
+    """Buffer identity through the dispatcher, not just a correct value.
+
+    A fake that allocates returns the right value while leaving the caller's
+    buffer unwritten -- correct return, stale buffer, no error. The assertion
+    is on `data_ptr`, so it fails if the dispatcher hands back a different
+    allocation that merely holds the right numbers.
+    """
+    module = sys.modules["aiter.ops.attention"]
+    buffer = torch.zeros(1, 2, 16)
+
+    def native(*args, **kwargs):
+        # `out_` sits after V_QScale in the native signature.
+        assert args[9] is buffer
+        args[9].fill_(1.0)
+        return args[9]
+
+    monkeypatch.setattr(module, "_pa_fwd_native", native)
+    result = module.pa_fwd(*_pa_fwd_args(), out_=buffer)
+
+    assert result.data_ptr() == buffer.data_ptr()
+    assert torch.equal(result, torch.ones(1, 2, 16))

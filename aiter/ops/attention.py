@@ -198,7 +198,83 @@ def _pa_fwd_native(
 # decline every call that passes one. They stay above this layer, where a
 # caller passing one bypasses routing entirely and gets exactly the kernel it
 # asked for. Nothing a provider cannot honour reaches the contract.
-@_route(op="pa_fwd", version=1)
+def _pa_fwd_contract_fake(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables_stride0: int,
+    max_qlen: int = 1,
+    K_QScale: torch.Tensor | None = None,
+    V_QScale: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    high_precision: int | None = 1,
+) -> torch.Tensor:
+    """The tensor the v2 contract returns, shaped but not filled.
+
+    Allocating rather than handing back an argument is the whole reason v2
+    carries no output buffer: see :func:`_pa_fwd_routed`.
+    """
+    return torch.empty_like(Q)
+
+
+# v2 drops the ``out_=`` buffer v1 carried. The older version stays acceptable:
+# the only change is removing an OPTIONAL output buffer, so a v1 provider handed
+# a v2 call sees ``out_=None`` and allocates -- which is v2's semantics exactly.
+# (`rmsnorm` v1 was left out of its own supersedes for the opposite reason: a v1
+# kernel handed a v2 call writes the caller's INPUT.)
+# `mutates_args=[]` here, unlike `pa_decode_bf16` above: dropping `out_` leaves
+# this contract with no scratch at all -- every remaining argument is read, and
+# the result is freshly allocated -- so the conservative default would buy an
+# `auto_functionalized_v2` wrap for nothing.
+@_route(
+    op="pa_fwd",
+    version=2,
+    supersedes={1: "a later aiter release"},
+    fake=_pa_fwd_contract_fake,
+    mutates_args=[],
+)
+def _pa_fwd_contract(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables_stride0: int,
+    max_qlen: int = 1,
+    K_QScale: torch.Tensor | None = None,
+    V_QScale: torch.Tensor | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    high_precision: int | None = 1,
+) -> torch.Tensor:
+    """Paged attention forward over a block table -- the routed contract.
+
+    Arguments and meanings are those of :func:`_pa_fwd_routed`, minus its
+    output buffer.
+
+    Returns a newly allocated tensor shaped like ``Q``. It writes through none
+    of its arguments: a provider serving this contract must allocate its result
+    too, and a caller that wants the result in a buffer it owns passes ``out_``,
+    which does not route.
+    """
+    return _pa_fwd_native(
+        Q,
+        K,
+        V,
+        block_tables,
+        context_lens,
+        block_tables_stride0,
+        max_qlen,
+        K_QScale,
+        V_QScale,
+        None,
+        qo_indptr,
+        high_precision,
+        None,
+    )
+
+
 def _pa_fwd_routed(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -229,7 +305,34 @@ def _pa_fwd_routed(
         high_precision: 0, 1 or 2 for fp8 KV, 2 being the most precise.
 
     Returns the output tensor -- ``out_`` itself when one was passed.
+
+    Passing ``out_`` bypasses routing. The reason is a schema one rather than
+    a policy one: with a buffer this op RETURNS the tensor it was given, while
+    the schema a custom op is registered under declares that its results do
+    not alias its inputs. `opcheck` reports the contradiction, and under
+    compile both ways of resolving it are wrong -- a fake that allocates
+    leaves the caller's buffer UNWRITTEN while still returning the right
+    value, with nothing to say so.
+
+    The v2 contract (:func:`_pa_fwd_contract`) leaves the buffer out instead
+    of picking a side. A provider serves the allocating form only; the
+    buffered form runs AITER's own kernel, which is what naming the buffer
+    asked for -- and what pins the result to a fixed address.
     """
+    if out_ is None:
+        return _pa_fwd_contract(
+            Q,
+            K,
+            V,
+            block_tables,
+            context_lens,
+            block_tables_stride0,
+            max_qlen,
+            K_QScale,
+            V_QScale,
+            qo_indptr,
+            high_precision,
+        )
     return _pa_fwd_native(
         Q,
         K,

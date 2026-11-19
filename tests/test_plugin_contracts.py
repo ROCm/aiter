@@ -642,7 +642,6 @@ _NOT_REGISTERED = {
         "out-buffer in the contract (`y`), and no schema can express it "
         "(`config` is a dict)"
     ),
-    "pa_fwd": "out-buffer in the contract (`out_`)",
     "mla_decode_fwd_v4_nm": "unannotated contract, and an out-buffer in it",
     "mla_decode_fwd_v4_nm_ps": "unannotated contract, and an out-buffer in it",
     "mla_decode_fwd": (

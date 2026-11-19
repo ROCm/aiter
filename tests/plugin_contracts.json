@@ -227,11 +227,13 @@
   "version": 2
  },
  "pa_fwd": {
-  "fingerprint": "6afde3d0a53acf6a",
-  "signature": "Q:positional:torch.Tensor, K:positional:torch.Tensor, V:positional:torch.Tensor, block_tables:positional:torch.Tensor, context_lens:positional:torch.Tensor, block_tables_stride0:positional:int, max_qlen:positional:int=1, K_QScale:positional:torch.Tensor | None=None, V_QScale:positional:torch.Tensor | None=None, out_:positional:torch.Tensor | None=None, qo_indptr:positional:torch.Tensor | None=None, high_precision:positional:int | None=1, -> torch.Tensor",
+  "fingerprint": "e7c2f5e4fbec1641",
+  "signature": "Q:positional:torch.Tensor, K:positional:torch.Tensor, V:positional:torch.Tensor, block_tables:positional:torch.Tensor, context_lens:positional:torch.Tensor, block_tables_stride0:positional:int, max_qlen:positional:int=1, K_QScale:positional:torch.Tensor | None=None, V_QScale:positional:torch.Tensor | None=None, qo_indptr:positional:torch.Tensor | None=None, high_precision:positional:int | None=1, -> torch.Tensor",
   "source": "aiter/ops/attention.py",
-  "supersedes": [],
-  "version": 1
+  "supersedes": [
+   1
+  ],
+  "version": 2
  },
  "pa_persistent_fwd": {
   "fingerprint": "5256b167078255dd",
