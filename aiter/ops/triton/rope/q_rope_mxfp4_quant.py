@@ -114,6 +114,12 @@ def q_rope_mxfp4_quant(
                 f"weights_proj {tuple(weights_proj.shape)} must be [H={num_heads}, "
                 f"K={proj_in}] head-major with unit last stride"
             )
+        if proj_block_k <= 0 or proj_block_k & (proj_block_k - 1):
+            # The kernel tiles K with tl.arange(0, BLOCK_K); Triton needs a
+            # positive power of two, and <= 0 would also divide by zero below.
+            raise ValueError(
+                f"proj_block_k must be a positive power of two, got {proj_block_k}"
+            )
         if proj_in % proj_block_k:
             raise ValueError(
                 f"hidden width K={proj_in} must be a multiple of "
