@@ -327,6 +327,21 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
                 disable_arb=True,
             )
             idx += 1
+    # Retained by the M3.1 graph-replay screen.  The generic four-owner TDM
+    # pipeline needs at least two waves; do not add one-wave variants.
+    kl[idx] = WmmaKernelInstance(
+        tile_m=16,
+        tile_n=32,
+        tile_k=512,
+        num_buffers=2,
+        split_k=4,
+        cluster_m=1,
+        cluster_n=1,
+        m_warp=1,
+        n_warp=2,
+        name_prefix=NAME_PREFIX,
+        fused_splitk=True,
+    )
     return kl
 
 
@@ -411,6 +426,15 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         )
 
     if ki.persistent_n_tiles > 1:
+        return False
+    if ki.fused_splitk and (
+        ki.split_k <= 1
+        or ki.tile_m % ki.split_k
+        or ki.tile_m & (ki.tile_m - 1)
+        or ki.cluster_m != 1
+        or ki.cluster_n != 1
+        or ki.m_warp * ki.n_warp < 2
+    ):
         return False
     if N % _BLOCK_N != 0 or K % _BLOCK_K != 0:
         return False

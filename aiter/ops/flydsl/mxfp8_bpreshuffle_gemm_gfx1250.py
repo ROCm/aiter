@@ -54,14 +54,27 @@ def _fused_splitk_workspace(
 
 
 def _fused_splitk_ok(
-    tile_m, cluster_m, cluster_n, split_k, native_fused_splitk
+    tile_m,
+    cluster_m,
+    cluster_n,
+    split_k,
+    native_fused_splitk,
+    m_warp,
+    n_warp,
 ) -> bool:
     """Whether this launch can run the clustered fused split-K epilogue."""
     return bool(
-        native_fused_splitk
-        and split_k > 1
+        split_k > 1
         and tile_m % split_k == 0
         and cluster_m * cluster_n * split_k <= 16
+        and (
+            native_fused_splitk
+            or (
+                tile_m & (tile_m - 1) == 0
+                and cluster_m == cluster_n == 1
+                and m_warp * n_warp >= 2
+            )
+        )
     )
 
 
@@ -423,7 +436,13 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     torch_stream = torch.cuda.current_stream(device=XQ.device)
     stream = _fx.Stream(torch_stream)
     fused = fused_splitk and _fused_splitk_ok(
-        tile_m, cluster_m, cluster_n, split_k, compute_bound or small_native
+        tile_m,
+        cluster_m,
+        cluster_n,
+        split_k,
+        compute_bound or small_native,
+        m_warp,
+        n_warp,
     )
     bounded_m = bool(M % tile_m)
     if fused:
@@ -431,10 +450,19 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
         # peer rows -- the local stripe never leaves LDS.  Round M up for the
         # last tile; the output store's M bound masks its spare rows.
         partial_shape = (
-            ((M + tile_m - 1) // tile_m) * (N // tile_n),
-            split_k,
-            tile_m - tile_m // split_k if split_k == 2 else tile_m,
-            tile_n,
+            (
+                ((M + tile_m - 1) // tile_m) * (N // tile_n),
+                split_k,
+                tile_m - tile_m // split_k if split_k == 2 else tile_m,
+                tile_n,
+            )
+            if compute_bound
+            else (
+                ((M + tile_m - 1) // tile_m) * (N // tile_n),
+                split_k,
+                tile_m,
+                tile_n,
+            )
         )
     elif split_k > 1:
         partial_shape = (split_k, M, ldc)

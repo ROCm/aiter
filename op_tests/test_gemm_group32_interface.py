@@ -494,16 +494,31 @@ def test_gfx1250_compute_catalog_exposes_cluster_local_splitk():
         instance for instance in catalog.kernels_list.values() if instance.fused_splitk
     ]
     assert fused
+    compute_fused = [
+        instance for instance in fused if catalog.is_compute_kernel(instance)
+    ]
     assert all(
         (catalog.is_compute_kernel(instance) or catalog.is_small_kernel(instance))
         and instance.split_k > 1
         and instance.tile_m % instance.split_k == 0
         and instance.cluster_m * instance.cluster_n * instance.split_k <= 16
         and "_fsk" in instance.name
-        for instance in fused
+        for instance in compute_fused
     )
     parsed = direct.parse_mxfp8_32_wmma_kernel_name(
-        fused[0].name.replace("mxfp8_128", "mxfp8_32")
+        compute_fused[0].name.replace("mxfp8_128", "mxfp8_32")
+    )
+    assert parsed is not None and parsed["fused_splitk"] is True
+    generic_fused = [
+        instance for instance in fused if not catalog.is_compute_kernel(instance)
+    ]
+    assert [instance.name for instance in generic_fused] == [
+        "flydsl_mxfp8_128_bpreshuffle_wmma_"
+        "t16x32x512_mw1_nw2_nb2_sk4_cm1_cn1_fsk"
+    ]
+    assert all(instance.m_warp * instance.n_warp >= 2 for instance in generic_fused)
+    parsed = direct.parse_mxfp8_32_wmma_kernel_name(
+        generic_fused[0].name.replace("mxfp8_128", "mxfp8_32")
     )
     assert parsed is not None and parsed["fused_splitk"] is True
 
