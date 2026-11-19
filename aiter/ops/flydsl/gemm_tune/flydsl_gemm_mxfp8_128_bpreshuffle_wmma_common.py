@@ -178,6 +178,21 @@ def kernel_instance_estimated_lds_bytes(ki: WmmaKernelInstance) -> int:
     return max(arena_bytes, total_d_bytes)
 
 
+def mxfp8_32_kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
+    """Whether a shared WMMA instance fits the shape and mx32 LDS footprint."""
+    if not kernel_fits_shape(ki, M, N, K):
+        return False
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import mx32_lds_bytes
+
+    config = {
+        "tile_m": ki.tile_m,
+        "tile_n": ki.tile_n,
+        "tile_k": ki.tile_k,
+        "num_buffers": ki.num_buffers,
+    }
+    return mx32_lds_bytes(config) <= LDS_BYTES
+
+
 def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
     kl = {}
     idx = 0

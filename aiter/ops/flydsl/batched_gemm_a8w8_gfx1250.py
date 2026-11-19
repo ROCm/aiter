@@ -187,8 +187,8 @@ def bmm_candidates(b: int, m: int, n: int, k: int) -> list[dict[str, int]]:
     """Every batched config that can legally run this shape, tuner-ordered."""
     from .gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
         is_compute_kernel,
-        kernel_fits_shape,
         kernels_list,
+        mxfp8_32_kernel_fits_shape,
     )
 
     out = []
@@ -197,7 +197,7 @@ def bmm_candidates(b: int, m: int, n: int, k: int) -> list[dict[str, int]]:
             continue
         if ki.cluster_m != 1 or ki.cluster_n != 1:
             continue
-        if not kernel_fits_shape(ki, m, n, k):
+        if not mxfp8_32_kernel_fits_shape(ki, m, n, k):
             continue
         out.append(
             {
@@ -210,6 +210,24 @@ def bmm_candidates(b: int, m: int, n: int, k: int) -> list[dict[str, int]]:
             }
         )
     return out
+
+
+@functools.lru_cache(maxsize=4096)
+def bmm_mx32_kernel_launchable(kernel_name: str, m: int, n: int, k: int) -> bool:
+    """Whether a tuned batched mx32 name can launch at B=1 for this shape."""
+    cfg = parse_bmm_mx32_kernel_name(kernel_name)
+    return bool(
+        cfg is not None
+        and m > 0
+        and cfg["split_k"] == cfg["cluster_m"] == cfg["cluster_n"] == 1
+        and cfg["tile_m"] % (cfg["m_warp"] * 16) == 0
+        and cfg["tile_n"] % (cfg["n_warp"] * 16) == 0
+        and cfg["tile_n"] % 32 == 0
+        and n % cfg["tile_n"] == 0
+        and k % cfg["tile_k"] == 0
+        and k // cfg["tile_k"] >= cfg["num_buffers"]
+        and mx32_lds_bytes(cfg) <= get_lds_capacity_bytes(get_gfx())
+    )
 
 
 @functools.lru_cache(maxsize=1024)

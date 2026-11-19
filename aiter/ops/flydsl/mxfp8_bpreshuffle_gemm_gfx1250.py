@@ -704,6 +704,37 @@ def parse_mxfp8_32_wmma_kernel_name(name: str):
     )
 
 
+@functools.lru_cache(maxsize=4096)
+def mxfp8_32_kernel_launchable(kernel_name: str, M: int, N: int, K: int) -> bool:
+    """Whether a tuned mx32 kernelName can launch for the real, unpadded shape."""
+    cfg = parse_mxfp8_32_wmma_kernel_name(kernel_name)
+    if cfg is None:
+        return False
+    if cfg.get("smallm_1x32", False):
+        tile_n = cfg["tile_n"]
+        split_k = cfg["split_k"]
+        return bool(
+            M % 16 == 0
+            and N % tile_n == 0
+            and K % (128 * split_k) == 0
+            and (K // split_k) // 128 >= 2
+            and (tile_n, cfg["num_waves"]) in MX32_SMALLM_1X32_TILE_WAVES
+        )
+
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
+        kernels_list,
+        mxfp8_32_kernel_fits_shape,
+    )
+
+    base_name = kernel_name.removesuffix("_aspre")
+    for instance in kernels_list.values():
+        if instance.name.replace("mxfp8_128", "mxfp8_32") == base_name:
+            return not instance.a_preshuffle and mxfp8_32_kernel_fits_shape(
+                instance, M, N, K
+            )
+    return False
+
+
 def compute_kernel_k_pair(num_buffers: int, tile_n: int) -> int:
     """K-tiles the compute-bound kernel stages per TDM super."""
     return 1 if num_buffers == 4 and tile_n == 256 else 2

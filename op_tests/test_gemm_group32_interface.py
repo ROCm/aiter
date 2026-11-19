@@ -1163,10 +1163,7 @@ def test_bmm_candidates_split_swizzled_seeds():
         assert cfg["splits"] == 1 or not (cfg["xcd_order"] or cfg["xcd_swizzle"])
 
 
-@pytest.mark.parametrize("block", ["1x32", "32x32", "128x128"])
-def test_mxscale_table_tuner_times_bmm(block):
-    """--mxscale_table times bmm on every w_scale block, 1x32's included; a
-    128x128 candidate also runs the row-major x_scale M = 1 reads."""
+def _load_mxfp8_tuner_module(name):
     import importlib.util
     import os
 
@@ -1177,9 +1174,24 @@ def test_mxscale_table_tuner_times_bmm(block):
         "gemm_a8w8_mxfp8_bpreshuffle",
         "gemm_a8w8_mxfp8_bpreshuffle_tune.py",
     )
-    spec = importlib.util.spec_from_file_location("mxfp8_tune", path)
-    tune = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(tune)
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _new_mxfp8_tuner(module):
+    return module.GemmA8W8MXFP8BpreshuffleTuner(
+        "test",
+        key=["gfx", "cu_num", "M", "N", "K", "w_scale_block"],
+    )
+
+
+@pytest.mark.parametrize("block", ["1x32", "32x32", "128x128"])
+def test_mxscale_table_tuner_times_bmm(block):
+    """--mxscale_table times bmm on every w_scale block, 1x32's included; a
+    128x128 candidate also runs the row-major x_scale M = 1 reads."""
+    tune = _load_mxfp8_tuner_module("mxfp8_tune")
     from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import parse_bmm_kernel_name
     from aiter.ops.flydsl.kernels.bmm_a8w8_mxscale_gfx950 import check_bmm_config
 
@@ -1190,6 +1202,301 @@ def test_mxscale_table_tuner_times_bmm(block):
         check_bmm_config(
             4608, 6144, 1, **cfg, x_scale_k=cols, w_scale_n=rows, w_scale_k=cols
         )
+
+
+def test_gfx1250_1x32_tuner_builds_graph_tasks(monkeypatch):
+    from types import SimpleNamespace
+
+    import pandas as pd
+
+    tune = _load_mxfp8_tuner_module("mxfp8_tune_gfx1250")
+    tuner = _new_mxfp8_tuner(tune)
+    name = "flydsl_mxfp8_32_bpreshuffle_wmma_t16x32x128_mw1_nw2_nb2_sk1_cm1_cn1"
+    monkeypatch.setattr(tuner, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setattr(tuner, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(
+        tune,
+        "gfx1250_1x32_runs",
+        lambda *_args: [(134, 1, name, tune.run_gemm_flydsl_gfx1250_1x32)],
+    )
+    captured = []
+    monkeypatch.setattr(
+        tuner, "_run_tasks", lambda tasks, _args: captured.extend(tasks) or []
+    )
+    monkeypatch.setattr(
+        tuner,
+        "_confirm_gfx1250_1x32",
+        lambda results, _tasks, _tunedf, _args: results,
+    )
+    args = SimpleNamespace(
+        libtype="flydsl",
+        mxscale_table=False,
+        warmup=2,
+        iters=11,
+        shape_grouped=False,
+    )
+    shapes = pd.DataFrame(
+        [
+            {
+                "gfx": "gfx1250",
+                "cu_num": 256,
+                "M": 16,
+                "N": 32,
+                "K": 128,
+                "w_scale_block": "1x32",
+            }
+        ]
+    )
+    assert tuner.tune(shapes, pd.DataFrame(), args) == []
+    assert tuner._gfx1250_1x32
+    assert len(captured) == 1
+    task = captured[0]
+    assert task[1] is tune.generate_data_gfx1250_1x32
+    assert task[2] == (16, 32, 128, 0)
+    assert task[3] is tune.run_gemm_flydsl_gfx1250_1x32
+    assert task[5]["testGraph"] is True
+    assert task[5]["use_cuda_event"] is True
+    assert task[5]["num_rotate_args"] == 1
+
+
+def test_gfx1250_1x32_tuner_serializes_backend_ids():
+    tune = _load_mxfp8_tuner_module("mxfp8_tune_ids")
+    tuner = _new_mxfp8_tuner(tune)
+    keys = ("gfx1250", 256, 16, 32, 128, "1x32")
+    bmm_name = "flydsl_bmm_mxfp8_32_wmma_t16x32x128_mw1_nw2_nb2_sk1_cm1_cn1"
+    direct_name = (
+        "flydsl_mxfp8_32_bpreshuffle_wmma_" "t32x32x512_mw2_nw2_nb3_sk1_cm1_cn1"
+    )
+    rows = tuner.result_to_df(
+        [
+            (
+                (keys, tune.KERNEL_ID_BASE_BMM, 1, bmm_name, "flydsl"),
+                1.0,
+                0.0,
+            ),
+            ((keys, 134, 1, direct_name, "flydsl"), 2.0, 0.0),
+        ]
+    )
+    assert list(rows["kernelId"]) == ["bmm", 134]
+
+
+@pytest.mark.parametrize(
+    "candidate_times, expected_name",
+    [
+        ([8.0, 8.1, 7.9], "candidate"),
+        ([9.9, 10.1, 9.9], "baseline"),
+    ],
+)
+def test_gfx1250_1x32_tuner_paired_confirmation(
+    monkeypatch, candidate_times, expected_name
+):
+    from types import SimpleNamespace
+
+    import pandas as pd
+
+    tune = _load_mxfp8_tuner_module("mxfp8_tune_confirm")
+    tuner = _new_mxfp8_tuner(tune)
+    keys = ("gfx1250", 256, 16, 32, 128, "1x32")
+    baseline_info = (keys, 1, 1, "baseline", "flydsl")
+    candidate_info = (keys, 2, 1, "candidate", "flydsl")
+    tasks = [(baseline_info,), (candidate_info,)]
+    coarse = [(baseline_info, 10.0, 0.0), (candidate_info, 8.0, 0.0)]
+    baseline_times = iter([10.0, 10.1, 9.9])
+    candidate_values = iter(candidate_times)
+
+    def confirm(confirm_tasks, _args):
+        values = {"baseline": baseline_times, "candidate": candidate_values}
+        return [(task[0], next(values[task[0][3]]), 0.0) for task in confirm_tasks]
+
+    monkeypatch.setattr(tuner, "_run_tasks", confirm)
+    tuned = pd.DataFrame(
+        [
+            {
+                "gfx": "gfx1250",
+                "cu_num": 256,
+                "M": 16,
+                "N": 32,
+                "K": 128,
+                "w_scale_block": "1x32",
+                "kernelName": "baseline",
+                "us": 10.2,
+            }
+        ]
+    )
+    args = SimpleNamespace(confirm_rounds=3, min_gain_pct=2.0, errRatio=0.05)
+    selected = tuner._confirm_gfx1250_1x32(coarse, tasks, tuned, args)
+    assert len(selected) == 1
+    assert selected[0][0][3] == expected_name
+
+
+def test_gfx1250_mxfp8_tuned_bmm_routes_to_batched_backend(monkeypatch):
+    """A tuned B=1 backend name must not be handed to the direct-name parser."""
+    from aiter.ops import gemm_op_a8w8 as op
+    from aiter.ops.flydsl import (
+        batched_gemm_a8w8 as bmm,
+    )
+    from aiter.ops.flydsl import (
+        mxfp8_bpreshuffle_gemm_gfx1250 as direct,
+    )
+
+    m, n, k = 2, 32, 128
+    name = "flydsl_bmm_mxfp8_32_wmma_t16x32x128_mw1_nw2_nb2_sk1_cm1_cn1"
+    x = torch.empty((m, k), dtype=torch.uint8)
+    w = torch.empty((n, k), dtype=torch.uint8)
+    xs = torch.empty((m, k // 32), dtype=torch.uint8)
+    ws = torch.empty((n, k // 32), dtype=torch.uint8)
+    calls = []
+
+    monkeypatch.setattr(op, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setattr(
+        op,
+        "_get_mxfp8_bpreshuffle_config",
+        lambda *_args: ("flydsl", name, 1),
+    )
+
+    def run_bmm(xq, wq, x_scale, w_scale, out, kernel_name=None, **_kwargs):
+        calls.append((xq.shape, wq.shape, x_scale.shape, w_scale.shape, kernel_name))
+        return out
+
+    monkeypatch.setattr(bmm, "run_bmm_a8w8_mxfp8", run_bmm)
+    monkeypatch.setattr(
+        direct,
+        "run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250",
+        lambda *_args, **_kwargs: pytest.fail("BMM name reached direct runner"),
+    )
+
+    out = op.gemm_a8w8_mxfp8_bpreshuffle.__wrapped__(x, w, xs, ws, dtype=torch.bfloat16)
+    assert out.shape == (m, n)
+    assert calls == [((m, 1, k), (1, n, k), (m, 1, k // 32), (1, n, k // 32), name)]
+
+
+def test_gfx1250_mxfp8_bmm_row_uses_direct_fallback_for_preshuffled_a(monkeypatch):
+    from aiter.ops import gemm_op_a8w8 as op
+    from aiter.ops.flydsl import (
+        batched_gemm_a8w8 as bmm,
+    )
+    from aiter.ops.flydsl import (
+        mxfp8_bpreshuffle_gemm_gfx1250 as direct,
+    )
+
+    m, n, k = 16, 32, 128
+    bmm_name = "flydsl_bmm_mxfp8_32_wmma_t16x32x128_mw1_nw2_nb2_sk1_cm1_cn1"
+    x = torch.empty((m, k), dtype=torch.uint8)
+    w = torch.empty((n, k), dtype=torch.uint8)
+    xs = torch.empty((m, k // 32), dtype=torch.uint8)
+    ws = torch.empty((n, k // 32), dtype=torch.uint8)
+    calls = []
+
+    monkeypatch.setattr(op, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setattr(
+        op,
+        "_get_mxfp8_bpreshuffle_config",
+        lambda *_args: ("flydsl", bmm_name, 1),
+    )
+    monkeypatch.setattr(
+        op, "_mxfp8_32_fallback_kernel_name", lambda *_args: "direct_fallback"
+    )
+    monkeypatch.setattr(
+        bmm,
+        "run_bmm_a8w8_mxfp8",
+        lambda *_args, **_kwargs: pytest.fail("preshuffled A reached BMM runner"),
+    )
+
+    def run_direct(*args, **kwargs):
+        calls.append((kwargs["a_scale_preshuffled"], args[5]))
+        return args[4]
+
+    monkeypatch.setattr(
+        direct, "run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250", run_direct
+    )
+    out = op.gemm_a8w8_mxfp8_bpreshuffle.__wrapped__(
+        x,
+        w,
+        xs,
+        ws,
+        dtype=torch.bfloat16,
+        a_scale_preshuffled=True,
+    )
+    assert out.shape == (m, n)
+    assert calls == [(True, "direct_fallback_aspre")]
+
+
+def test_gfx1250_mxfp8_padded_row_must_launch_at_real_m(monkeypatch):
+    from aiter.ops import gemm_op_a8w8 as op
+
+    name = "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_w1_sk1"
+    tuned = {
+        ("gfx1250", 256, 16, 32, 256, "1x32"): {
+            "libtype": "flydsl",
+            "kernelName": name,
+            "splitK": 1,
+        }
+    }
+    monkeypatch.setattr(op, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setattr(op, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(op, "_load_mxfp8_bpreshuffle_tuned", lambda _path: tuned)
+    monkeypatch.setattr(op, "get_padded_m", lambda *_args: 16)
+    monkeypatch.setattr(op, "_mxfp8_32_fallback_kernel_name", lambda *_args: "fallback")
+    op._get_mxfp8_bpreshuffle_config.cache_clear()
+    try:
+        assert op._get_mxfp8_bpreshuffle_config(15, 32, 256) == (
+            "flydsl",
+            "fallback",
+            1,
+        )
+    finally:
+        op._get_mxfp8_bpreshuffle_config.cache_clear()
+
+
+def test_gfx1250_mxfp8_aot_replays_direct_and_bmm_rows(tmp_path):
+    from aiter.aot.flydsl import gemm as aot
+    from aiter.aot.flydsl.common import override_env
+    from aiter.aot.flydsl.dry_run import dry_run
+    from aiter.aot.flydsl.replay import identified_kernels
+    from aiter.ops import gemm_op_a8w8 as op
+    from aiter.utility import dtypes
+
+    bmm_name = "flydsl_bmm_mxfp8_32_wmma_t16x32x128_mw1_nw2_nb2_sk1_cm1_cn1"
+    direct_name = (
+        "flydsl_mxfp8_32_bpreshuffle_wmma_" "t32x32x512_mw2_nw2_nb3_sk1_cm1_cn1"
+    )
+    csv_path = tmp_path / "a8w8_mxfp8_bpreshuffle_tuned_gemm.csv"
+    csv_path.write_text(
+        "gfx,cu_num,M,N,K,w_scale_block,libtype,kernelId,splitK,us,kernelName\n"
+        f"gfx1250,256,2,128,1536,1x32,flydsl,bmm,1,1.0,{bmm_name}\n"
+        f"gfx1250,256,16,128,1536,1x32,flydsl,40,1,1.0,{direct_name}\n"
+    )
+    caches = (
+        AITER_CONFIGS.get_config_file,
+        op._load_mxfp8_bpreshuffle_tuned,
+        op._mxfp8_bpreshuffle_tuned_nk,
+        op._get_mxfp8_bpreshuffle_config,
+    )
+    for cache in caches:
+        cache.cache_clear()
+    try:
+        with (
+            override_env("AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE", str(csv_path)),
+            dry_run("gfx1250", 256, python_ops=True),
+        ):
+            jobs = aot.parse_csv(str(csv_path))
+            assert {job["kernel_name"] for job in jobs} == {bmm_name, direct_name}
+            for job in jobs:
+                with identified_kernels() as replayed:
+                    aot.replay(job)
+                with identified_kernels() as launched:
+                    op.gemm_a8w8_mxfp8_bpreshuffle(
+                        torch.empty((job["m"], 1536), dtype=dtypes.fp8, device="cuda"),
+                        torch.empty((128, 1536), dtype=dtypes.fp8, device="cuda"),
+                        torch.empty(
+                            (job["m"], 48), dtype=dtypes.fp8_e8m0, device="cuda"
+                        ),
+                        torch.empty((128, 48), dtype=dtypes.fp8_e8m0, device="cuda"),
+                    )
+                assert replayed and replayed == launched
+    finally:
+        for cache in caches:
+            cache.cache_clear()
 
 
 @pytest.mark.parametrize("w_scale_n", [1, 32, 128])
