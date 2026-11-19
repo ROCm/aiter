@@ -37,13 +37,13 @@ from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
 TOKENS = [24, 48, 64, 96, 128, 160, 192, 256]
 
 
-def benchmark(args, device, tp, comm):
+def benchmark(args, device, tp, comms):
     config = triton.testing.Benchmark(
         x_names=["tokens"],
         x_vals=args.tokens,
         line_arg="provider",
-        line_vals=["gluon"],
-        line_names=["gluon"],
+        line_vals=list(comms),
+        line_names=list(comms),
         ylabel="us",
         plot_name=get_caller_name_no_ext(),
         args={},
@@ -85,7 +85,7 @@ def benchmark(args, device, tp, comm):
                 residual,
                 weight,
                 1e-6,
-                comm,
+                comms[provider],
                 gemma=args.gemma,
                 out=(x_q, x_s, res_out),
             )
@@ -104,13 +104,31 @@ def _worker(rank, init_method, args):
     torch.cuda.set_device(device)
     aiter.init_dist_env(args.world_size, rank, distributed_init_method=init_method)
     tp = get_tp_group()
-    comm = AllReduceRmsnormMxfp8(tp.cpu_group, max(args.tokens), args.hidden)
+    comms = {}
     try:
-        benchmark(args, device, tp, comm)
-        assert comm.error() == [0, 0, 0, 0], "a wait timed out"
+        comms = _comms(args, tp)
+        benchmark(args, device, tp, comms)
+        for comm in comms.values():
+            assert comm.error() == [0, 0, 0, 0], "a wait timed out"
     finally:
-        comm.close()
+        for comm in comms.values():
+            comm.close()
         aiter.destroy_dist_env()
+
+
+def _comms(args, tp):
+    """A comm for each config to time: the tuned config, then each BLOCKS and
+    num_warps pair of --blocks and --num-warps. The constructors are collective."""
+    tuned = AllReduceRmsnormMxfp8(tp.cpu_group, max(args.tokens), args.hidden)
+    comms = {"tuned": tuned}
+    for blocks in args.blocks or [tuned.config["BLOCKS"]]:
+        for warps in args.num_warps or [tuned.config["num_warps"]]:
+            config = {"BLOCKS": blocks, "num_warps": warps}
+            if config != tuned.config:
+                comms[f"BLOCKS={blocks} num_warps={warps}"] = AllReduceRmsnormMxfp8(
+                    tp.cpu_group, max(args.tokens), args.hidden, config=config
+                )
+    return comms
 
 
 def parse_args():
@@ -125,6 +143,10 @@ def parse_args():
     parser.add_argument(
         "--gemma", action="store_true", default=False, help="Gemma norm (1 + weight)"
     )
+    parser.add_argument(
+        "--blocks", type=int, nargs="+", help="BLOCKS values to sweep (CTAs a launch)"
+    )
+    parser.add_argument("--num-warps", type=int, nargs="+", help="num_warps to sweep")
     parser.add_argument(
         "-o", action="store_true", default=False, help="Write results to CSV"
     )
