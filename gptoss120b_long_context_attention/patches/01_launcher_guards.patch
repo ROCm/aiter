@@ -1,0 +1,26 @@
+--- a/aiter/ops/triton/attention/unified_attention.py
++++ b/aiter/ops/triton/attention/unified_attention.py
+@@ -854,6 +854,14 @@
+ 
+     BLOCK_Q = BLOCK_M // params.num_queries_per_kv
+     assert BLOCK_Q >= 1
++    # Each warp owns 16-row WMMA tiles of the BLOCK_M rows (warp_bases split the rows), so a
++    # BLOCK_M below 16 * num_warps would leave a warp without rows.
++    assert BLOCK_M >= 16 * num_warps, (
++        f"BLOCK_M={BLOCK_M} needs at least 16 rows per warp (num_warps={num_warps})"
++    )
++    # Loop variant 0 is double-buffered only (static_assert in the kernel); a config that asks
++    # for 3 buffers and is demoted to variant 0 above falls back to 2.
++    num_buffers = config["NUM_BUFFERS"] if loop_variant != 0 else 2
+     if params.all_decode:
+         total_query_blocks = NUM_SEQS
+     else:
+@@ -926,7 +934,7 @@
+         CAUSAL=params.causal,
+         # useful for debugging when needed
+         REMOVE_INDIRECT_ACCESS=False,
+-        NUM_BUFFERS=config["NUM_BUFFERS"],
++        NUM_BUFFERS=num_buffers,
+         LOOP_VARIANT=loop_variant,
+         USE_TDM_STORE=not REGISTER_STORE,
+         enable_fp_fusion=True,
