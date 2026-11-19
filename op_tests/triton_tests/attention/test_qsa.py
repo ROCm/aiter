@@ -199,6 +199,58 @@ def test_qsa_row_sharded_groups_match_whole_batch(shards):
     assert torch.equal(sharded, whole)
 
 
+@pytest.mark.parametrize("rows", [1100, 1500])
+def test_qsa_multi_chunk_selection_matches_unchunked(rows):
+    """Chunked scoring must write each chunk at its own row offset.
+
+    The workspace default puts all 1500 rows of the shard test in one chunk, so
+    nonzero row offsets and a partial final chunk are only reachable with a
+    small `logits_workspace_bytes`. Groups and expanded tokens must then match
+    an unchunked call exactly.
+    """
+    from aiter.ops.qsa import qsa_select_paged_groups, qsa_select_paged_tokens
+
+    torch.manual_seed(11)
+    block, ratio, budget, start, columns = 16, 4, 2048, 2000, 256
+    s = _make_paged_scenario(
+        rows,
+        columns,
+        block,
+        ratio,
+        index_heads=4,
+        index_dim=128,
+        query_heads=8,
+        query_dim=128,
+        kv_heads=1,
+        start=start,
+    )
+    args = (s["index_q"], s["compressed"], s["tables"])
+    tail = (s["requests"], s["positions"], s["lengths"], budget, ratio)
+
+    # 400 rows per chunk: 1100 -> 400 + 400 + 300, 1500 -> 400 + 400 + 400 + 300.
+    chunked_groups, chunked_width = qsa_select_paged_groups(
+        *args,
+        *tail,
+        max_seq_len=start + rows,
+        logits_workspace_bytes=400 * columns * 4,
+    )
+    whole_groups, whole_width = qsa_select_paged_groups(
+        *args, *tail, max_seq_len=start + rows
+    )
+
+    assert chunked_width == whole_width
+    assert torch.equal(chunked_groups, whole_groups)
+    assert torch.equal(
+        qsa_select_paged_tokens(
+            *args,
+            *tail,
+            max_seq_len=start + rows,
+            logits_workspace_bytes=400 * columns * 4,
+        ),
+        qsa_select_paged_tokens(*args, *tail, max_seq_len=start + rows),
+    )
+
+
 @pytest.mark.parametrize("rows", [512, 1024])
 def test_qsa_mfma_scorer_matches_vector_path(rows):
     """The MFMA scorer (rows > 256) must match the vector-path scorer row for row."""
