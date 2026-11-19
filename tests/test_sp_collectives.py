@@ -17,6 +17,7 @@ from conftest import requires_built_aiter
 requires_built_aiter()
 pytest.importorskip("flydsl")
 
+from aiter.dist.device_communicators import flydsl_utils
 from aiter.dist.device_communicators import sp_collectives as sp
 from aiter.ops.flydsl import allreduce_policy as policy
 
@@ -105,8 +106,8 @@ def peers(monkeypatch):
         other = obj if state.others == "same" else state.others
         out[:] = [obj] + [other] * (len(out) - 1)
 
-    monkeypatch.setattr(sp.dist, "all_gather_object", all_gather_object)
-    monkeypatch.setattr(sp.dist, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(flydsl_utils.dist, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(flydsl_utils.dist, "get_world_size", lambda group=None: 2)
     return state
 
 

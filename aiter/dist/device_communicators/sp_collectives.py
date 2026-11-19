@@ -33,7 +33,6 @@ import logging
 import math
 
 import torch
-import torch.distributed as dist
 
 from aiter.dist.device_communicators.flydsl_utils import all_ranks_agree_on_plan
 
