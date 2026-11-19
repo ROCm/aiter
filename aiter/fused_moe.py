@@ -4358,6 +4358,29 @@ def _flydsl_v2_stage2_wrapper(
             f"block_m={int(block_m)}, but the kernel expects sort_block_m={sbm}."
         )
     epilog = cfg["epilog"]
+    # T1_PATHB_HOOK: offer this call to the retargeted gfx950 ASM stage-2 kernels.
+    if _MXFP4_MOE_STAGE2_T1:
+        from aiter.ops.asm.moe_stage2_mxfp4_t1 import moe_stage2_mxfp4_t1 as _t1_fw
+
+        if _t1_fw(
+            inter_states,
+            w2,
+            sorted_token_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            out,
+            topk,
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+            block_m=sbm,
+            sorted_weights=sorted_weights,
+            topk_weights=topk_weights,
+            bias2=bias2,
+            reverse_sorted=reverse_sorted,
+            use_valid_token_count=use_valid_token_count,
+            atomic=(epilog == "atomic"),
+        ):
+            return out
     max_sorted = inter_states.shape[0]
 
     token_num = out.shape[0]

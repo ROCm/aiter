@@ -5,8 +5,10 @@
 ``hsa/gfx950/moe_stage2_mxfp4_t1`` (made by ``gen_t1g2.py`` in that directory).
 
 The kernels do the stage 2 (down projection) of AITER's MXFP4 a4w4 MoE for one
-shape: 128 experts, top-4, model_dim 6144, inter_dim 1536 (MiniMax-M3.1-Flash at
-TP2), for a large prefill. They replace the FlyDSL scatter gemm2
+shape, recorded in the generated registry CSV and read from it at import: by default
+128 experts, top-4, model_dim 6144, inter_dim 1536 (MiniMax-M3.1-Flash at TP2), for a
+large prefill. ``gen_t1g2.py`` can emit code objects for another shape (see its
+``--model-dim`` / ``--topk``); this launcher follows the registry rather than a literal. They replace the FlyDSL scatter gemm2
 (``..._scatter_sbm128``): unweighted bf16 rows into a flat buffer, then
 ``aiter.mxfp4_moe_scatter_reduce``, as AITER's own non-atomic path, with the same
 output bits. They read stage 1's output and AITER's sort as they are, with no
@@ -38,7 +40,35 @@ from aiter.ops.asm.asm_utils import (
 
 _SUBDIR = "moe_stage2_mxfp4_t1"
 _CSV = "moe_stage2_mxfp4_t1.csv"
-_NE, _TOPK, _D_HIDDEN, _D_INTER = 128, 4, 6144, 1536
+_SHAPE_FALLBACK = (128, 4, 6144, 1536)
+
+
+def _registry_shape():
+    """(NE, TOPK, D_HIDDEN, D_INTER) the installed code objects actually serve.
+
+    Read from the generated registry instead of hardcoded here: gen_t1g2.py writes these
+    columns from its own H/I/E/TOPK, so regenerating for another shape needs no edit in
+    this file and the guard cannot silently disagree with the .co it dispatches to -- a
+    disagreement would admit a call the kernel cannot serve, which is wrong output rather
+    than a clean fallback to AITER.
+
+    Falls back to the shipped shape when the registry is absent (a Triton-only wheel has
+    an empty hsa/); check_installed() reports that case properly.
+    """
+    try:
+        d = os.path.join(AITER_ASM_DIR, "gfx950", _SUBDIR)
+        rows = list(load_asm_cfg_csv(os.path.join(d, _CSV)))
+    except Exception:
+        return _SHAPE_FALLBACK
+    shapes = {(r["NE"], r["TOPK"], r["D_HIDDEN"], r["D_INTER"]) for r in rows}
+    if len(shapes) != 1:
+        raise RuntimeError(
+            f"moe_stage2_mxfp4_t1: registry rows disagree on shape: {sorted(shapes)}"
+        )
+    return shapes.pop()
+
+
+_NE, _TOPK, _D_HIDDEN, _D_INTER = _registry_shape()
 _BM = 128  # the block_m of AITER's FlyDSL scatter epilogue
 # Token counts (M = moe_out.shape[0]) from which the kernels were measured faster than
 # AITER's scatter stage 2 on gfx950, under uniform and under skewed routing (1.07x-1.37x

@@ -153,12 +153,36 @@ def _tool(name):
     return shutil.which(name)
 
 
-H, I, E, TOPK = 6144, 1536, 128, 4
+def _shape_from_argv():
+    """Shape to generate for, overridable from the command line.
+
+    Parsed before the module-level derivations below because W2_E/S2_E/OROW and NSL are
+    computed from H at import. Defaults reproduce the MiniMax-M3.1-Flash TP2 kernels
+    byte-for-byte, so the checked-in code objects are unchanged.
+
+    A CTA owns 256 features x I regardless of H, so another model_dim is a reshape of the
+    grid (NSL = H // 256), not of the inner loop. TOPK never reaches the generated ASM --
+    it is registry metadata only -- but it is recorded so the launcher can match on it.
+    """
+    import argparse as _ap
+
+    p = _ap.ArgumentParser(add_help=False)
+    p.add_argument("--model-dim", type=int, default=6144)
+    p.add_argument("--inter-dim", type=int, default=1536)
+    p.add_argument("--experts", type=int, default=128)
+    p.add_argument("--topk", type=int, default=4)
+    known, _ = p.parse_known_args()
+    if known.model_dim % 256:
+        raise SystemExit(f"--model-dim must be a multiple of 256, got {known.model_dim}")
+    return known.model_dim, known.inter_dim, known.experts, known.topk
+
+
+H, I, E, TOPK = _shape_from_argv()
 KT = I // 128  # 12 K-steps of 128
 W2_E = H * I // 2  # fp4 bytes per expert
 S2_E = H * I // 32  # e8m0 bytes per expert
 XROW = I // 2  # 768 B per activation row
-OROW = 2 * H  # 12288 B per bf16 output row
+OROW = 2 * H  # 8192 B per bf16 output row
 CHUNK = 1536  # e8m0_shuffle bytes per 32 rows (I/32 = 48 columns)
 
 
@@ -251,7 +275,10 @@ TPITCH = 144
 
 def v2_source(
     BM=128,
-    NSL=24,
+    # Derived from H rather than hardcoded so the two cannot drift; L312 asserts
+    # H == NSL * 256. H=4096 gives NSL=16, a power of two, so magic_div below
+    # degenerates to a shift -- cheaper than the NSL=24 case upstream generates.
+    NSL=H // 256,  # 256-feature slices; H=6144 -> 24, H=4096 -> 16
     store_nt=False,
     w2_nt=False,
     tag="v2",
@@ -1330,6 +1357,10 @@ def main():
     )
     ap.add_argument("--out", default=HERE, help="output directory (default: here)")
     ap.add_argument("--llvm-bin", help="directory that holds clang and ld.lld")
+    ap.add_argument("--model-dim", type=int, default=6144, help="D_HIDDEN to generate for")
+    ap.add_argument("--inter-dim", type=int, default=1536, help="D_INTER to generate for")
+    ap.add_argument("--experts", type=int, default=128, help="expert count recorded in the registry")
+    ap.add_argument("--topk", type=int, default=4, help="top-k recorded in the registry")
     ap.add_argument("--asm-dir", help="also write the generated assembly here")
     ap.add_argument(
         "--check",
