@@ -2679,6 +2679,166 @@ def test_qsa_indexer_select(case):
     }
 
 
+def _score_key16(scores: torch.Tensor) -> torch.Tensor:
+    """High 16 bits of the order-preserving fp32 key.
+
+    Same map as ``_score_key16`` in ``indexer_fused_select.py``. Positive
+    scores, which are the only finite indexer scores, keep fp32 order.
+    """
+    bits = scores.view(torch.int32)
+    ordered = torch.bitwise_xor(bits, torch.bitwise_and(bits >> 31, 0x7FFFFFFF))
+    return ordered >> 16
+
+
+def _colliding_pairs(scores: torch.Tensor, keys: torch.Tensor, bound: float) -> dict:
+    """Visible scores that share a key and differ by more than ``bound``."""
+    pairs = 0
+    colliding_keys = 0
+    max_span = 0.0
+    finite = torch.isfinite(scores)
+    for row in range(scores.shape[0]):
+        live = finite[row]
+        group_scores = scores[row][live]
+        group_keys = keys[row][live]
+        if group_scores.numel() < 2:
+            continue
+        order = torch.argsort(group_keys, stable=True)
+        group_scores = group_scores[order]
+        group_keys = group_keys[order]
+        change = torch.empty(
+            group_keys.shape[0], dtype=torch.bool, device=scores.device
+        )
+        change[0] = True
+        change[1:] = group_keys[1:] != group_keys[:-1]
+        starts = torch.nonzero(change, as_tuple=False).flatten()
+        ends = torch.cat([starts[1:], group_keys.new_tensor([group_keys.shape[0]])])
+        for start, end in zip(starts.tolist(), ends.tolist()):
+            if end - start < 2:
+                continue
+            bucket = torch.sort(group_scores[start:end]).values
+            span = float((bucket[-1] - bucket[0]).item())
+            if span <= bound:
+                continue
+            colliding_keys += 1
+            max_span = max(max_span, span)
+            nxt = torch.searchsorted(bucket, bucket + bound, right=True)
+            pairs += int((bucket.shape[0] - nxt).sum().item())
+    return {
+        "pairs": pairs,
+        "colliding keys": colliding_keys,
+        "max span": max_span,
+    }
+
+
+def _boundary_select(scores: torch.Tensor, keys: torch.Tensor, k: int) -> tuple:
+    """Keep keys above the 512th, and rescore that key's bucket in fp32.
+
+    The rescore is the oracle score of those blocks. The smaller index wins
+    an exact tie, matching ``qsa_topk_blocks``.
+    """
+    rows, _ = scores.shape
+    chosen = torch.full((rows, k), -1, dtype=torch.int32, device=scores.device)
+    widths = torch.zeros(rows, dtype=torch.int32, device=scores.device)
+    finite = torch.isfinite(scores)
+    order = torch.argsort(scores, dim=-1, descending=True, stable=True)
+    for row in range(rows):
+        live = int(finite[row].sum().item())
+        if live <= k:
+            picked = order[row, :live]
+            chosen[row, :live] = picked.to(torch.int32)
+            continue
+        boundary = int(keys[row, order[row, k - 1]].item())
+        row_keys = keys[row]
+        above = finite[row] & (row_keys > boundary)
+        bucket = finite[row] & (row_keys == boundary)
+        widths[row] = int(bucket.sum().item())
+        n_above = int(above.sum().item())
+        if n_above > k:
+            raise AssertionError(f"row {row}: {n_above} keys sit above the 512th key")
+        need = k - n_above
+        bucket_scores = scores[row].masked_fill(~bucket, float("-inf"))
+        take = torch.argsort(bucket_scores, descending=True, stable=True)[:need]
+        picked = torch.cat([torch.nonzero(above, as_tuple=False).flatten(), take])
+        chosen[row] = picked.to(torch.int32)
+    return chosen, widths
+
+
+def _exact_set_mismatch(ref: torch.Tensor, got: torch.Tensor) -> float:
+    """Rows whose selected block sets differ. -1 padding is ignored."""
+    if ref.shape[0] == 0:
+        return 0.0
+    rows = ref.shape[0]
+    width = int(max(ref.max().item(), got.max().item())) + 1
+    ref_mark = torch.zeros(rows, width, dtype=torch.bool, device=ref.device)
+    got_mark = torch.zeros(rows, width, dtype=torch.bool, device=got.device)
+    row_idx = torch.arange(rows, device=ref.device).unsqueeze(1)
+    ref_ok = ref >= 0
+    got_ok = got >= 0
+    ref_mark[row_idx.expand_as(ref)[ref_ok], ref[ref_ok]] = True
+    got_mark[row_idx.expand_as(got)[got_ok], got[got_ok]] = True
+    bad = (ref_mark != got_mark).any(dim=1) | (ref_ok.sum(1) != got_ok.sum(1))
+    return float(bad.sum().item()) / rows
+
+
+@benchmark()
+def test_qsa_score_key16(case, rows, context):
+    """Boundary rescore of ``_score_key16`` against the fp32 oracle set."""
+    idx = FLASH_NEXT_INDEXER
+    device = torch.device("cuda")
+    q, k_bar, qpos, slen, token_to_req = _indexer_inputs(
+        idx, rows, context, dtypes.bf16, device
+    )
+    scores = qsa_indexer_scores(
+        q,
+        k_bar,
+        qpos,
+        slen,
+        token_to_req,
+        idx.compress_ratio,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
+    )
+    if case == "pad":
+        pad_cols = _SELECT_PAD_PAGES * _SELECT_PAGE - scores.shape[1]
+        scores = F.pad(scores, (0, pad_cols), value=float("-inf"))
+    keys = _score_key16(scores)
+    collisions = _colliding_pairs(scores, keys, _FP32_TIE_BOUND)
+    picked, widths = _boundary_select(scores, keys, idx.block_budget)
+    oracle = qsa_topk_blocks(scores, idx.block_budget)
+    mismatch = _exact_set_mismatch(oracle, picked)
+    err = checkAllclose(
+        torch.zeros(1),
+        torch.tensor([mismatch]),
+        rtol=0,
+        atol=0,
+        msg=f"score key16 {case}",
+    )
+    assert err == 0, f"{case}: boundary rescore set mismatch {mismatch:.2%}"
+    live = widths[widths > 0]
+    return {
+        "gfx": get_gfx_runtime(),
+        "cols": int(scores.shape[1]),
+        "colliding keys": collisions["colliding keys"],
+        "colliding pairs": collisions["pairs"],
+        "max span": collisions["max span"],
+        "boundary min": int(widths.min().item()),
+        "boundary median": float(live.median().item()) if live.numel() else 0.0,
+        "boundary max": int(widths.max().item()),
+        "key16 err": err,
+    }
+
+
+def run_qsa_score_key16():
+    """Key collisions and boundary width on the oracle's three seeded cases."""
+    rows = []
+    for case, n_rows, context in (
+        ("8k", 256, 8192),
+        ("32k", 128, 32768),
+        ("pad", 128, 8192),
+    ):
+        rows.append(test_qsa_score_key16(case, n_rows, context))
+    _summarize("QSA indexer 16-bit key boundary", rows)
+
+
 def run_qsa_indexer_select_oracle():
     """fp64 rescore of the oracle on the 8K, 32K, and padded-prefix cases."""
     rows = []
@@ -2838,6 +2998,7 @@ def main():
     check_qsa_rejections()
     check_qsa_edges()
     run_qsa_indexer_select_oracle()
+    run_qsa_score_key16()
     run_qsa_indexer_select_gate()
 
     for dtype in args.dtype:

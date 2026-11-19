@@ -60,9 +60,9 @@ Change these only by editing this section and adding a log line. Code, tests, an
 
 ### 1. Key and boundary check
 
-- [ ] On the seeded 8K, 32K, and padded-prefix cases from the master's oracle check, count how often two scores that differ by more than 1.7e-6 share a `_score_key16` value, and how wide the boundary bucket is at the 512th key.
-- [ ] Keep `_score_key16` if a torch rescore of that boundary bucket reproduces the oracle set on those three cases. Otherwise pick another order-preserving 16-bit map, log it, and rerun the same check.
-- [ ] Record the key, the boundary rule, and the collision counts in [Key check](#key-check).
+- [x] On the seeded 8K, 32K, and padded-prefix cases from the master's oracle check, count how often two scores that differ by more than 1.7e-6 share a `_score_key16` value, and how wide the boundary bucket is at the 512th key.
+- [x] Keep `_score_key16` if a torch rescore of that boundary bucket reproduces the oracle set on those three cases. Otherwise pick another order-preserving 16-bit map, log it, and rerun the same check. Kept. The rescore matched the oracle set on all three cases.
+- [x] Record the key, the boundary rule, and the collision counts in [Key check](#key-check).
 
 ### 2. Store 16-bit keys from the existing scorer
 
@@ -134,11 +134,15 @@ The faster arm at `p128k` and `p256k` is aiter#5996, both in this baseline (`T_s
 
 ### Key check
 
-| Case | Rows | Keys that collide across a 1.7e-6 gap | Boundary bucket width | Oracle set matches |
-| --- | ---: | ---: | ---: | --- |
-| 8K | | | | |
-| 32K | | | | |
-| padded prefix | | | | |
+`_score_key16` stays the key. gfx950, gpuq GPU 0, the seeded inputs from `run_qsa_indexer_select_oracle`: 256 rows at context 8192, 128 rows at context 32768, and 128 rows at context 8192 padded to 65856 columns. A colliding key holds two or more visible scores whose span exceeds 1.7e-6. A colliding pair is two such scores inside one key. The boundary width is the number of visible blocks whose key equals the key of the 512th score. The rescore keeps every strictly higher key and fills the rest from that bucket by the fp32 score, smaller index on an exact tie.
+
+| Case | Rows | Columns | Colliding keys | Colliding pairs | Max span | Boundary min / median / max | Oracle set matches |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| 8K | 256 | 2048 | 101944 | 975004 | 0.0308 | 2 / 8 / 18 | yes |
+| 32K | 128 | 8192 | 85240 | 8062017 | 0.0311 | 3 / 11 / 19 | yes |
+| padded prefix | 128 | 65856 | 51048 | 497783 | 0.0307 | 2 / 8 / 17 | yes |
+
+The key is coarser than 1.7e-6: one key spans up to about 0.031 in score. The boundary bucket stays under 20 blocks, so the fp32 rescore reads that many blocks per row on these cases, not the whole row. The check is `test_qsa_score_key16` in `op_tests/test_flydsl_qsa.py`.
 
 ### Kernel gate
 
@@ -185,11 +189,13 @@ Margins: not measured. The budget is the table under [Budget](#budget).
 
 gfx942 enablement: not measured.
 
-Fallback key (the `_score_key16` map, or the replacement Phase 1 logged): not chosen. Phase 1 checks `_score_key16`.
+Phase 1, 2026-11-19: keep `_score_key16`. On the three seeded cases the boundary rescore matches the oracle set, and the boundary bucket is at most 19 blocks.
+
+Fallback key: `_score_key16`, the high 16 bits of the order-preserving fp32 key.
 
 ## Open questions
 
-- Is the high-16-bit key fine enough that the boundary bucket stays small on 128K and 256K rows, or does the rescore read a large fraction of the blocks?
+- On the seeded 8K, 32K, and padded-prefix cases the boundary bucket is at most 19 blocks. Whether it stays that small at 128K and 256K, where a row has many more visible blocks, is still open.
 - Does the existing radix consume uint16 keys, or does the boundary path need its own select?
 - The master's aiter arm chunks the padded 65,856-column table, and vllm#65188 trims to `max_seq_len`. This plan keeps the aiter width. A later trim is out of scope here.
 
@@ -197,3 +203,4 @@ Fallback key (the `_score_key16` map, or the replacement Phase 1 logged): not ch
 
 - 2026-11-19: Plan opened. The master is [qsa-indexer-fused-select-plan.md](qsa-indexer-fused-select-plan.md), and its fixed decisions carry over. Option 1 misses gate 1 on the probe-free interleaved run: `p128k` fused 3814.2 µs against aiter#5996 at 3623.9 µs, `p256k` 7934.8 µs against 5845.4 µs, and every other case misses, including `p8k` at 1.13× vllm#65188. Option 2 stays out, per the master. This document is the ticket's 16-bit score-buffer fallback. No kernel work has started. `_fused_select_wins` stays false.
 - 2026-11-19: Phase 0 budget, from the master's baseline. No GPU run. aiter#5996 scores 65856 columns, 509 fp32 rows per 128 MiB chunk: 17 chunks at `p8k` (8192 rows) and 33 at `p32k`, `p128k`, and `p256k` (16384 rows). Score bytes are 2058.0 MiB and 4116.0 MiB. The 2-byte formula gives 1019 rows per chunk, 9 chunks at `p8k` and 17 on the 16384-row cases, and half the bytes. Stage times are in [Budget](#budget). The faster arm at `p128k` and `p256k` is aiter#5996, and its score stage is 0.546 and 0.666 of `T_step`, larger than the strict improvement this path has to find. The stop does not fire. Phase 1 is next. At `p8k` the faster arm is vllm#65188 at 207.3 µs and the whole aiter score stage is 328.0 µs, so that miss is not a score-buffer miss. `_fused_select_wins` stays false.
+- 2026-11-19: Phase 1 key check, gfx950, gpuq GPU 0. `test_qsa_score_key16` uses the oracle's seeded 8K, 32K, and padded-prefix inputs. `_score_key16` stays. Colliding pairs, scores that share a key and differ by more than 1.7e-6, are 975004, 8062017, and 497783. The widest key span is 0.0311. Boundary width is 2/8/18, 3/11/19, and 2/8/17 (min/median/max). The fp32 rescore of that bucket matches the oracle top-512 on every row. Phase 2 is next. `_fused_select_wins` stays false.
