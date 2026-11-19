@@ -24,6 +24,7 @@ self-hosted-runner:
     - radeon-r9700
     - xsj-dispatch
     - box308
+    - box308-pr-revert
 
 config-variables: null
 
