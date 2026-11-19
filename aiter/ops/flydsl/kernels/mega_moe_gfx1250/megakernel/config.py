@@ -17,6 +17,7 @@ from .core import (
     TALLY_MAXR,
     compact_flag_bytes,
     compact_scratch_bytes,
+    compact_tail_bytes,
     ctl_arena_bytes,
     segs_pad,
     src_off,
@@ -340,9 +341,15 @@ def compact_regions(config) -> dict:
     rows, rowmap = compact_row_regions()
     regions = {rows: caps * wire_row(config), rowmap: (caps + 1) * 8}
     for i in range(len(variants)):
-        regions[compact_ctl_region(i)] = ctl_arena_bytes(
-            npes=config.world_size, experts_per_rank=config.experts_per_rank
-        ) + compact_flag_bytes(config.experts_per_rank)
+        regions[compact_ctl_region(i)] = (
+            ctl_arena_bytes(
+                npes=config.world_size, experts_per_rank=config.experts_per_rank
+            )
+            + compact_flag_bytes(config.experts_per_rank)
+            + compact_tail_bytes(
+                npes=config.world_size, experts_per_rank=config.experts_per_rank
+            )
+        )
     return regions
 
 

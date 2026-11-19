@@ -46,10 +46,12 @@ from .core import (
     KCtx,
     compact_flag_bytes,
     compact_scratch_bytes,
+    compact_tail_bytes,
     ctl_arena_bytes,
     ctl_layout,
     epr_pad,
     read_mtready,
+    read_tailrdy,
     segs_pad,
     src_off,
 )
@@ -176,6 +178,13 @@ def make_megakernel(
     FLG_OFF = CTL_ARENA_B
     if MTREADY:
         CTL_ARENA_B += compact_flag_bytes(EPR)
+    # AITER_DMK_TAILRDY: per-segment GEMM2-done flags after the landed flags.
+    TAIL = int(MTREADY and read_tailrdy())
+    if TAIL and EPR > MT_CAP:
+        TAIL = 0
+    FL2_OFF = CTL_ARENA_B
+    if TAIL:
+        CTL_ARENA_B += compact_tail_bytes(npes=npes, experts_per_rank=EPR)
 
     from aiter.ops.flydsl.grouped_moe_gfx1250 import get_wmma_m_rep
 
@@ -268,6 +277,7 @@ def make_megakernel(
             ("ru", RED_UN, RED_UN_DEF),
             ("rb", RED_B64, RED_B64_DEF),
             ("mr", MTREADY, int(COMPACT)),
+            ("tl", TAIL, 0),
             ("ps", POLL_SL, POLL_SLEEP),
             ("hs", int(HS and not COMPACT), 0),
             ("pt", PLAN_TAG, 1 if TM <= 16 else 0),
@@ -319,6 +329,8 @@ def make_megakernel(
         RED_B64=RED_B64,
         MTREADY=MTREADY,
         FLG_OFF=FLG_OFF,
+        TAIL=TAIL,
+        FL2_OFF=FL2_OFF,
         MT_CAP=MT_CAP,
         REP_W=REP_W,
         ROW=ROW,

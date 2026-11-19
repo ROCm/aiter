@@ -59,6 +59,8 @@ CTL_TALLY = 5248  # + 32 * parity: compact layout, tally CTAs done
 CTL_G1 = 6144
 G1_STRIDE = 64
 G1_READY = 32
+#: TAILRDY: local expert e's GEMM2 item count, in m-tile e's line.
+G2_CNT = 16
 #: Words between two CTAs' gate words (one 128 B line each), and where the
 #: packed plan starts inside a plan replica.
 GATE_STRIDE = 32
@@ -167,6 +169,20 @@ def vdst_fence(v):
             has_side_effects=True,
         )
     )
+
+
+def read_tailrdy() -> bool:
+    """AITER_DMK_TAILRDY=1 (compact, needs MTREADY): a token is reduced once
+    GEMM2 finished every (destination, expert) segment of its routes, instead
+    of once every peer closed: the reduce overlaps the GEMM2 queue's tail."""
+    return read_mtready() and os.environ.get("AITER_DMK_TAILRDY", "0") != "0"
+
+
+def compact_tail_bytes(*, npes: int, experts_per_rank: int) -> int:
+    """Bytes of a compact kernel's per-segment GEMM2-done flags."""
+    if not read_tailrdy():
+        return 0
+    return segs_pad(npes=npes, experts_per_rank=experts_per_rank) * 4
 
 
 def compact_flag_bytes(experts_per_rank: int) -> int:
@@ -756,6 +772,8 @@ def gemm_queue(kc, n_mt):
     spin_fail, stamp, wait_gate = kc.spin_fail, kc.stamp, kc.wait_gate
     MTREADY, FLG_OFF, npes = kc.MTREADY, kc.FLG_OFF, kc.npes
     rsrc_actl = kc.rsrc_actl
+    TAIL, FL2_OFF, off_ctl, peer_va = kc.TAIL, kc.FL2_OFF, kc.off_ctl, kc.peer_va
+    rank, wave = kc.rank, kc.wave
 
     def wait_expert(e_):
         """MTREADY: until every source's rows (and rowmap pairs) of local
@@ -961,6 +979,39 @@ def gemm_queue(kc, n_mt):
                 mt_idx,
                 n,
             )
+            if const_expr(TAIL):
+                # Every wave's EP scatter retired (SCOPE_SYS) before this
+                # barrier: count the item in its expert. The item completing
+                # the expert clears the count and tells every source.
+                rocdl.s_barrier_signal(-1)
+                rocdl.s_barrier_wait(-1)
+                if wave == fx.Int32(0):
+                    end_e = fx.Int32(
+                        comm_ops.load_i32_lds(fx.Int64(lds_end + e_ * fx.Int32(4)))
+                    )
+                    e_p = fx.Int32((e_ > fx.Int32(0)).select(e_ - fx.Int32(1), e_))
+                    beg_e = fx.Int32(
+                        comm_ops.load_i32_lds(fx.Int64(lds_end + e_p * fx.Int32(4)))
+                    )
+                    beg_e = fx.Int32((e_ > fx.Int32(0)).select(beg_e, fx.Int32(0)))
+                    tot_e = _uniform((end_e - beg_e) * fx.Int32(NT2))
+                    cnt2_va = addr_ctl + fx.Int64(
+                        (fx.Int32(CTL_G1 + G2_CNT) + e_ * fx.Int32(G1_STRIDE)) * 4
+                    )
+                    old2 = fx.Int32(0)
+                    if lane == fx.Int32(0):
+                        old2 = fx.Int32(comm_ops.atomic_add_agent(cnt2_va, fx.Int32(1)))
+                    old2 = _uniform(readlane(T.i32, arith.unwrap(old2), 0))
+                    if old2 + fx.Int32(1) == tot_e:
+                        if lane == fx.Int32(0):
+                            comm_ops.atomic_add_agent(cnt2_va, fx.Int32(0) - tot_e)
+                        if lane < fx.Int32(npes):
+                            comm_ops.store_i32_global_system_monotonic(
+                                peer_va(lane, off_ctl)
+                                + fx.Int64(FL2_OFF)
+                                + fx.Int64((rank * fx.Int32(EPR) + e_) * 4),
+                                gen,
+                            )
         if is_t0:
             comm_ops.store_i32_lds(bc_next, fx.Int32(G) + claim)
         rocdl.s_wait_dscnt(0)
@@ -1014,7 +1065,8 @@ def close(kc, n2_done, total_units):
 
 @device_fn
 def reduce(kc):
-    """5. REDUCE: once every peer closed, sum each token's top-k slots."""
+    """5. REDUCE: once every peer closed (TAILRDY: once GEMM2 finished each of
+    its routes' segments), sum each token's top-k slots."""
     CF_OFF, E, G, GATE_C, H, K, PH = kc.CF_OFF, kc.E, kc.G, kc.GATE_C, kc.H, kc.K, kc.PH
     RED_CH, RED_UN, addr_out, bid = kc.RED_CH, kc.RED_UN, kc.addr_out, kc.bid
     RED_B64 = kc.RED_B64
@@ -1022,15 +1074,19 @@ def reduce(kc):
     open_gates, peer_va, poll_peer_flags = kc.open_gates, kc.peer_va, kc.poll_peer_flags
     rank, rsrc_ids, stamp, tok = kc.rank, kc.rsrc_ids, kc.stamp, kc.tok
     wait_gate, wave, wave_gid = kc.wait_gate, kc.wave, kc.wave_gid
+    TAIL, FL2_OFF, MAXR, addr_route = kc.TAIL, kc.FL2_OFF, kc.MAXR, kc.addr_route
+    alive, gen, rsrc_actl = kc.alive, kc.gen, kc.rsrc_actl
+    spin_end, spin_fail = kc.spin_end, kc.spin_fail
     # ======================== 5. REDUCE ========================
     # CTA 0 alone polls the peers' comb_flag, then opens the gates.
-    if (bid == fx.Int32(0)) & (wave == fx.Int32(0)):
-        poll_peer_flags(CF_OFF, 5)
-        stamp(18)
-        open_gates(GATE_C, GATE_STRIDE)
-        stamp(19)
-    if wave == fx.Int32(0):
-        wait_gate(GATE_C, GATE_STRIDE, 6)
+    if const_expr(not TAIL):
+        if (bid == fx.Int32(0)) & (wave == fx.Int32(0)):
+            poll_peer_flags(CF_OFF, 5)
+            stamp(18)
+            open_gates(GATE_C, GATE_STRIDE)
+            stamp(19)
+        if wave == fx.Int32(0):
+            wait_gate(GATE_C, GATE_STRIDE, 6)
     rocdl.s_wait_dscnt(0)
     rocdl.s_barrier_signal(-1)
     rocdl.s_barrier_wait(-1)
@@ -1042,68 +1098,122 @@ def reduce(kc):
     if const_expr(not RED_B64):
         rsrc_comb_all = create_buffer_resource_from_addr(comb_base)
     rsrc_out = create_buffer_resource_from_addr(addr_out)
-    n_red = tok * fx.Int32(RED_CH if PH & 8 else 0)
-    for w in range(wave_gid, n_red, G * 4 * RED_UN):
-        # Every item's loads first, then each item's sum in k order (the
-        # staged reduce's arithmetic). An item past the end reloads the
-        # first one and skips its store.
-        items = []
-        for u in range_constexpr(RED_UN):
-            w_u = w + fx.Int32(u * G * 4)
-            in_u = w_u < n_red
-            w_u = fx.Int32(in_u.select(w_u, w))
-            t = w_u // fx.Int32(RED_CH)
-            ch = w_u - t * fx.Int32(RED_CH)
-            if const_expr(RED_B64):
-                rsrc_comb = create_buffer_resource_from_addr(
-                    comb_base + fx.Int64(t * fx.Int32(K)) * fx.Int64(comb_slot_stride)
+
+    def item_loads(t, ch):
+        """Chunk ch of token t: its top-k slots' loads (valid, raw)."""
+        if const_expr(RED_B64):
+            rsrc_comb = create_buffer_resource_from_addr(
+                comb_base + fx.Int64(t * fx.Int32(K)) * fx.Int64(comb_slot_stride)
+            )
+            tok_b = fx.Int32(0)
+        else:
+            rsrc_comb = rsrc_comb_all
+            tok_b = t * fx.Int32(K * int(comb_slot_stride))
+        vals = []
+        for k in range_constexpr(K):
+            gid = fx.Int32(
+                buffer_load(
+                    rsrc_ids,
+                    t * fx.Int32(K) + fx.Int32(k),
+                    vec_width=1,
+                    dtype=T.i32,
+                    is_scalar=True,
                 )
-                tok_b = fx.Int32(0)
-            else:
-                rsrc_comb = rsrc_comb_all
-                tok_b = t * fx.Int32(K * int(comb_slot_stride))
-            vals = []
-            for k in range_constexpr(K):
-                gid = fx.Int32(
-                    buffer_load(
-                        rsrc_ids,
-                        t * fx.Int32(K) + fx.Int32(k),
-                        vec_width=1,
-                        dtype=T.i32,
-                        is_scalar=True,
-                    )
+            )
+            valid = (gid >= fx.Int32(0)) & (gid < fx.Int32(E))
+            slot_b = tok_b + fx.Int32(k * int(comb_slot_stride))
+            for j in range_constexpr(2):
+                raw = buffer_load(
+                    rsrc_comb,
+                    (slot_b + ch * fx.Int32(RED_ELEMS * 2) + lane * fx.Int32(32))
+                    // fx.Int32(4)
+                    + fx.Int32(4 * j),
+                    vec_width=4,
+                    dtype=T.i32,
+                    cache_modifier=SCOPE_SYS,
                 )
-                valid = (gid >= fx.Int32(0)) & (gid < fx.Int32(E))
-                slot_b = tok_b + fx.Int32(k * int(comb_slot_stride))
-                for j in range_constexpr(2):
-                    raw = buffer_load(
-                        rsrc_comb,
-                        (slot_b + ch * fx.Int32(RED_ELEMS * 2) + lane * fx.Int32(32))
-                        // fx.Int32(4)
-                        + fx.Int32(4 * j),
-                        vec_width=4,
-                        dtype=T.i32,
-                        cache_modifier=SCOPE_SYS,
-                    )
-                    vals.append((valid, raw))
-            items.append((t, ch, in_u, vals))
-        for u in range_constexpr(RED_UN):
-            t, ch, in_u, vals = items[u]
-            accs = [fx.full(8, 0.0, fx.Float32) for _ in range_constexpr(2)]
-            for k in range_constexpr(K):
-                for j in range_constexpr(2):
-                    valid, raw = vals[2 * k + j]
-                    v = fx.Vector(raw).bitcast(fx.BFloat16).to(fx.Float32)
-                    v = valid.select(v, fx.full(8, 0.0, fx.Float32))
-                    accs[j] = accs[j] + v
-            o_dw = (
-                t * fx.Int32(H) + ch * fx.Int32(RED_ELEMS) + lane * fx.Int32(16)
-            ) // fx.Int32(2)
-            if in_u:
-                for j in range_constexpr(2):
-                    buffer_store(
-                        accs[j].to(fx.BFloat16).bitcast(fx.Int32),
-                        rsrc_out,
-                        o_dw + fx.Int32(4 * j),
-                    )
+                vals.append((valid, raw))
+        return vals
+
+    def item_sum(t, ch, vals):
+        """The chunk's sum in k order (the staged reduce's arithmetic) and
+        its output dword."""
+        accs = [fx.full(8, 0.0, fx.Float32) for _ in range_constexpr(2)]
+        for k in range_constexpr(K):
+            for j in range_constexpr(2):
+                valid, raw = vals[2 * k + j]
+                v = fx.Vector(raw).bitcast(fx.BFloat16).to(fx.Float32)
+                v = valid.select(v, fx.full(8, 0.0, fx.Float32))
+                accs[j] = accs[j] + v
+        o_dw = (
+            t * fx.Int32(H) + ch * fx.Int32(RED_ELEMS) + lane * fx.Int32(16)
+        ) // fx.Int32(2)
+        return accs, o_dw
+
+    def item_store(accs, o_dw):
+        for j in range_constexpr(2):
+            buffer_store(
+                accs[j].to(fx.BFloat16).bitcast(fx.Int32),
+                rsrc_out,
+                o_dw + fx.Int32(4 * j),
+            )
+
+    if const_expr(TAIL):
+        rsrc_rt = create_buffer_resource_from_addr(
+            addr_route, num_records_bytes=4 * MAXR
+        )
+
+        def wait_tok(t):
+            """Until GEMM2 finished the segment of each of token t's routes:
+            lane k polls the (destination, expert) flag of route k."""
+            kk = lane < fx.Int32(K)
+            rs = _load_i32_dev(
+                rsrc_rt, t * fx.Int32(K) + fx.Int32(kk.select(lane, fx.Int32(0)))
+            )
+            ok = kk & (rs >= fx.Int32(0))
+            fw = fx.Int32(FL2_OFF // 4) + fx.Int32(
+                ok.select(rs & fx.Int32((1 << SEG_BITS) - 1), fx.Int32(0))
+            )
+            cur = _load_i32_sys(rsrc_actl, fw)
+            bad = fx.Int32(ballot(T.i32, ok & (cur != gen)))
+            t_end = spin_end()
+            live = fx.Int32(1)
+            while (bad != fx.Int32(0)) & (live != fx.Int32(0)):
+                fx.rocdl.s_sleep(GATE_SLEEP)
+                cur = _load_i32_sys(rsrc_actl, fw)
+                bad = fx.Int32(ballot(T.i32, ok & (cur != gen)))
+                live = alive(t_end)
+            if bad != fx.Int32(0):
+                spin_fail(6)
+
+        # One token a wave: its readiness is checked once for all its chunks.
+        n_tok = tok if PH & 8 else fx.Int32(0)
+        for t in range(wave_gid, n_tok, G * 4):
+            wait_tok(t)
+            for c0 in range_constexpr(0, RED_CH, RED_UN):
+                items = []
+                for u in range_constexpr(RED_UN):
+                    if const_expr(c0 + u < RED_CH):
+                        items.append((c0 + u, item_loads(t, fx.Int32(c0 + u))))
+                for ch_, vals in items:
+                    accs, o_dw = item_sum(t, fx.Int32(ch_), vals)
+                    item_store(accs, o_dw)
+    else:
+        n_red = tok * fx.Int32(RED_CH if PH & 8 else 0)
+        for w in range(wave_gid, n_red, G * 4 * RED_UN):
+            # Every item's loads first, then each item's sum in k order. An
+            # item past the end reloads the first one and skips its store.
+            items = []
+            for u in range_constexpr(RED_UN):
+                w_u = w + fx.Int32(u * G * 4)
+                in_u = w_u < n_red
+                w_u = fx.Int32(in_u.select(w_u, w))
+                t = w_u // fx.Int32(RED_CH)
+                ch = w_u - t * fx.Int32(RED_CH)
+                items.append((t, ch, in_u, item_loads(t, ch)))
+            for u in range_constexpr(RED_UN):
+                t, ch, in_u, vals = items[u]
+                accs, o_dw = item_sum(t, ch, vals)
+                if in_u:
+                    item_store(accs, o_dw)
     stamp(7)
