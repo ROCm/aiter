@@ -421,7 +421,7 @@ def test_a16w4_policy_matches_full_shape_and_semantics(monkeypatch):
     monkeypatch.setattr(
         policy,
         "_TUNED_TILES",
-        {("gfx942", 304, 8, 5120, 384, 288, 384, 6, 10.0): tiles},
+        {("gfx942", 304, 8, 5120, 384, 288, 384, 6, True, 10.0): tiles},
     )
     arguments = {
         "token_num": 8,
@@ -455,6 +455,103 @@ def test_a16w4_policy_matches_full_shape_and_semantics(monkeypatch):
     monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx942")
     monkeypatch.setattr(chip_info, "get_cu_num", lambda: 80)
     assert policy.get_a16w4_tuned_tiles(**arguments) is None
+
+
+def test_a16w4_policy_80cu_default_false(monkeypatch):
+    from aiter.jit.utils import chip_info
+    from aiter.ops.flydsl import moe_a16w4_policy as policy
+
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx942")
+    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 80)
+
+    expected = {
+        1: policy.A16W4Tiles(16, 32, 128, 128, 128, True, 4, 1),
+        2: policy.A16W4Tiles(16, 32, 128, 256, 128, False, 4, 1),
+        4: policy.A16W4Tiles(16, 64, 256, 128, 128, True, 1, 4),
+        8: policy.A16W4Tiles(16, 64, 128, 128, 128, True, 1, 3),
+    }
+
+    for token_num, tiles in expected.items():
+        selected = policy.get_a16w4_tuned_tiles(
+            token_num,
+            5120,
+            640,
+            576,
+            384,
+            6,
+            act="silu_clamped",
+            activation_bf16=False,
+            swiglu_limit=10.0,
+        )
+        assert selected == tiles, f"token={token_num}"
+
+    # True must not borrow False rows
+    for token_num in expected:
+        assert (
+            policy.get_a16w4_tuned_tiles(
+                token_num,
+                5120,
+                640,
+                576,
+                384,
+                6,
+                act="silu_clamped",
+                activation_bf16=True,
+                swiglu_limit=10.0,
+            )
+            is None
+        )
+
+    # Wrong geometry for 80CU false falls back
+    assert (
+        policy.get_a16w4_tuned_tiles(
+            1,
+            5120,
+            384,
+            288,
+            384,
+            6,
+            act="silu_clamped",
+            activation_bf16=False,
+            swiglu_limit=10.0,
+        )
+        is None
+    )
+
+    # Wrong CU count for false geometry falls back
+    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 304)
+    assert (
+        policy.get_a16w4_tuned_tiles(
+            1,
+            5120,
+            640,
+            576,
+            384,
+            6,
+            act="silu_clamped",
+            activation_bf16=False,
+            swiglu_limit=10.0,
+        )
+        is None
+    )
+
+    # Wrong arch falls back
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 80)
+    assert (
+        policy.get_a16w4_tuned_tiles(
+            1,
+            5120,
+            640,
+            576,
+            384,
+            6,
+            act="silu_clamped",
+            activation_bf16=False,
+            swiglu_limit=10.0,
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -1673,6 +1770,390 @@ def test_stage2_weight_formats(token, tile_m, weight_dtype):
     )
 
 
+def _single_token_routing_reference(route_ids, route_weights, experts, block_m):
+    routes = len(route_ids)
+    ids = torch.full((routes * block_m,), 1, dtype=torch.int32, device="cpu")
+    weights = torch.zeros(routes * block_m, dtype=torch.float32, device="cpu")
+    groups = torch.full((routes,), -1, dtype=torch.int32, device="cpu")
+    valid = sorted(
+        (expert, slot) for slot, expert in enumerate(route_ids) if 0 <= expert < experts
+    )
+    group, offset, previous = -1, 0, None
+    for expert, slot in valid:
+        if expert != previous:
+            group += 1
+            offset = 0
+            previous = expert
+            groups[group] = expert
+        ids[group * block_m + offset] = slot << 24
+        weights[group * block_m + offset] = route_weights[slot]
+        offset += 1
+    counts = torch.tensor(
+        [(group + 1) * block_m, len(valid)], dtype=torch.int32, device="cpu"
+    )
+    return ids, weights, groups, counts
+
+
+@benchmark()
+def benchmark_single_token_routing(experts, topk, block_m):
+    from aiter.ops.flydsl.moe_routing_single import prepare_single_token_routing
+
+    route_ids = [slot % max(1, experts // 2) for slot in range(topk)]
+    if topk > 2:
+        route_ids[0], route_ids[-1] = -1, experts
+    route_weights = [(slot - 2) * 0.125 for slot in range(topk)]
+    route_weights[min(1, topk - 1)] = -0.0
+    ids = torch.tensor([route_ids], dtype=torch.int32, device="cuda")
+    weights = torch.tensor([route_weights], dtype=torch.float32, device=ids.device)
+    reference = _single_token_routing_reference(
+        route_ids, route_weights, experts, block_m
+    )
+    candidates = {
+        "FlyDSL single-token": lambda: prepare_single_token_routing(
+            ids, weights, experts, block_m
+        )
+    }
+    # Logical integer-indexing/copy I/O, not measured HBM traffic or GEMM FLOPs.
+    nbytes = 4 * (2 * topk + 2 * topk * block_m + topk + 2)
+    ret = {"gfx": get_gfx_runtime()}
+    for name, fn in candidates.items():
+        actual, us = run_perftest(fn)
+        for value, expected in zip(actual, reference):
+            assert value.device == ids.device and value.dtype == expected.dtype
+            assert torch.equal(
+                value.cpu().view(torch.int32), expected.view(torch.int32)
+            )
+        err = checkAllclose(
+            reference[1].to(ids.device), actual[1], rtol=0, atol=0, msg=name
+        )
+        assert err == 0
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = 0.0
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@pytest.mark.skipif(
+    get_gfx_runtime() != "gfx942",
+    reason="gfx942 single-token routing specialization",
+)
+@pytest.mark.parametrize("block_m", [16, 32])
+@pytest.mark.parametrize(
+    "route_ids",
+    [[5], [5, 1, 5, -1, 3, 384], [-1] * 6, [383, 0, 382, 1, 383, 0], [2] * 16],
+)
+def test_single_token_routing_exact_metadata(route_ids, block_m):
+    """Stable-sort metadata matches the CPU prefix proof on the host module."""
+    from aiter.ops.flydsl.moe_routing_single import prepare_single_token_routing
+
+    r = len(route_ids)
+    for repeat in range(2):
+        values = [(slot - 2) * 0.125 + repeat * 0.25 for slot in range(r)]
+        values[0] = -0.0
+        ids = torch.tensor([route_ids], device="cuda", dtype=torch.int32)
+        weights = torch.tensor([values], device=ids.device, dtype=torch.float32)
+        expected_ids = torch.full((r * block_m,), 1, dtype=torch.int32)
+        expected_weights = torch.zeros(r * block_m, dtype=torch.float32)
+        expected_experts = torch.full((r,), -1, dtype=torch.int32)
+        group, offset, previous = -1, 0, None
+        valid = sorted(
+            (expert, slot) for slot, expert in enumerate(route_ids) if 0 <= expert < 384
+        )
+        for expert, slot in valid:
+            if expert != previous:
+                group += 1
+                offset = 0
+                previous = expert
+                expected_experts[group] = expert
+            expected_ids[group * block_m + offset] = slot << 24
+            expected_weights[group * block_m + offset] = values[slot]
+            offset += 1
+        expected_counts = torch.tensor(
+            [(group + 1) * block_m, len(valid)], dtype=torch.int32
+        )
+        actual = prepare_single_token_routing(ids, weights, 384, block_m)
+        torch.cuda.synchronize()
+        expected = (expected_ids, expected_weights, expected_experts, expected_counts)
+        for tensor, ref in zip(actual, expected):
+            assert tensor.dtype == ref.dtype and tensor.shape == ref.shape
+            assert tensor.device == ids.device
+            assert torch.equal(tensor.cpu().view(torch.int32), ref.view(torch.int32))
+        err = checkAllclose(
+            expected_weights.to(ids.device),
+            actual[1],
+            rtol=0,
+            atol=0,
+            msg="single-token routing weight copy",
+        )
+        assert err == 0
+
+
+@pytest.mark.skipif(
+    get_gfx_runtime() != "gfx942", reason="gfx942 single-token routing specialization"
+)
+@pytest.mark.parametrize("block_m", [16, 32])
+def test_single_token_routing_graph_replay(block_m):
+    from aiter.ops.flydsl.moe_routing_single import prepare_single_token_routing
+
+    ids = torch.tensor([[5, 1, 5, -1, 3, 384]], dtype=torch.int32, device="cuda")
+    weights = torch.tensor(
+        [[0.25, -0.0, 0.5, 1.0, -0.125, 0.75]], dtype=torch.float32, device=ids.device
+    )
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream(device=ids.device)
+    with torch.cuda.graph(graph, stream=stream):
+        actual = prepare_single_token_routing(ids, weights, 384, block_m)
+    for route_ids, route_weights in (
+        ([5, 1, 5, -1, 3, 384], [0.25, -0.0, 0.5, 1.0, -0.125, 0.75]),
+        ([383, 0, 383, 2, -1, 384], [0.5, 0.25, -0.0, 0.75, 1.0, -0.5]),
+        ([-1] * 6, [1.0] * 6),
+    ):
+        ids.copy_(torch.tensor([route_ids], dtype=ids.dtype, device=ids.device))
+        weights.copy_(
+            torch.tensor([route_weights], dtype=weights.dtype, device=weights.device)
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        reference = _single_token_routing_reference(
+            route_ids, route_weights, 384, block_m
+        )
+        for value, expected in zip(actual, reference):
+            assert torch.equal(
+                value.cpu().view(torch.int32), expected.view(torch.int32)
+            )
+
+
+_DIRECT_A_SKIP = pytest.mark.skipif(
+    get_gfx_runtime() != "gfx942", reason="gfx942 direct-A specialization"
+)
+
+
+@_DIRECT_A_SKIP
+@pytest.mark.parametrize(
+    "token,activation_bf16", [(2, False), (2, True), (4, False), (4, True)]
+)
+def test_direct_a_small_m_clamped_silu(token, activation_bf16):
+    """gfx942 fp4 small-M direct-A is numerically identical to the stock path."""
+    result = benchmark_stage1_clamped_silu(
+        token, 256, 256, 8, 6, "fp4", activation_bf16, logical_inter=192
+    )
+    aiter.logger.info(
+        "Direct-A small-M stage1 summary (markdown):\n%s",
+        pd.DataFrame([result]).to_markdown(index=False),
+    )
+
+
+@_DIRECT_A_SKIP
+@pytest.mark.parametrize("token", [1, 2, 4, 8])
+def test_direct_a_small_m_full_moe(token):
+    """gfx942 fp4 small-M full MoE through the stock path (direct_a set by host)."""
+    result = benchmark_moe_clamped_silu(
+        token, 256, 384, 8, 6, False, logical_inter=288, tile_m=32, tile_k=128
+    )
+    aiter.logger.info(
+        "Direct-A small-M full MoE summary (markdown):\n%s",
+        pd.DataFrame([result]).to_markdown(index=False),
+    )
+
+
+@_DIRECT_A_SKIP
+@pytest.mark.parametrize("token", [1, 2, 4, 8])
+def test_direct_a_small_m_non_constant_scales(token):
+    """Small-M direct-A with per-expert varying scales and clamp edges."""
+    assert get_gfx_runtime() == "gfx942"
+    torch.manual_seed(41)
+    model_dim, inter_dim, experts, topk = 256, 256, 8, 6
+    hidden = torch.randn((token, model_dim), dtype=dtypes.bf16, device="cuda")
+    weight = torch.randn(
+        (experts, 2 * inter_dim, model_dim), dtype=dtypes.bf16, device=hidden.device
+    )
+    # Vary per-expert scales to ensure direct-A does not assume constant scale
+    weight *= torch.arange(1, experts + 1, device=weight.device).view(-1, 1, 1) * 0.3
+    packed, scales = aiter.get_torch_quant(QuantType.per_1x32)(
+        weight, quant_dtype=dtypes.fp4x2
+    )
+    packed = packed.view(experts, 2 * inter_dim, model_dim // 2)
+    scales = scales.view(experts, 2 * inter_dim, model_dim // 32)
+    reference_weight = (
+        (
+            mxfp4_to_f32(packed).view(experts, 2 * inter_dim, -1, 32)
+            * e8m0_to_f32(scales).unsqueeze(-1)
+        )
+        .reshape_as(weight)
+        .to(torch.bfloat16)
+    )
+    shuffled_weight = shuffle_weight_a16w4(packed, 16, False)
+    shuffled_scale = shuffle_scale_a16w4(
+        scales.reshape(-1, scales.shape[-1]), experts, False
+    )
+    scores = torch.randn((token, experts), device=hidden.device)
+    routing_ids = scores.topk(topk, dim=-1).indices.to(torch.int32)
+    routing_weights = torch.rand((token, topk), device=hidden.device)
+    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    block_m = 16 if token <= 4 else 32
+    sorted_ids, _, sorted_experts, cumsum, _ = moe_sorting(
+        routing_ids,
+        routing_weights,
+        experts,
+        model_dim,
+        dtypes.bf16,
+        block_m,
+    )
+    sorted_size = sorted_experts.numel() * block_m
+    guard = 64
+    canary = -123.0
+    storage = torch.full(
+        (sorted_size * inter_dim + 2 * guard,),
+        canary,
+        dtype=torch.bfloat16,
+        device=hidden.device,
+    )
+    output = storage[guard:-guard].view(sorted_size, inter_dim)
+    valid_size = int(cumsum[0])
+    packed_ids = sorted_ids[:valid_size].long()
+    token_ids = packed_ids & 0x00FFFFFF
+    slots = packed_ids >> 24
+    valid = token_ids < token
+    valid_positions = torch.arange(valid_size, device=hidden.device)[valid]
+    padded = torch.ones(sorted_size, device=hidden.device, dtype=torch.bool)
+    padded[valid_positions] = False
+    # Force a clamp that triggers on some values
+    limit = 2.0
+    reference = _stage1_reference(
+        hidden, reference_weight, routing_ids, limit, activation_bf16=False
+    )
+    flydsl_a16w4_gemm1(
+        a_bf16=hidden,
+        w1_u8=shuffled_weight.view(torch.uint8),
+        w1_scale_u8=shuffled_scale.view(torch.uint8),
+        sorted_expert_ids=sorted_experts,
+        cumsum_tensor=cumsum,
+        m_indices=sorted_ids,
+        inter_sorted_bf16=output,
+        n_tokens=token,
+        NE=experts,
+        D_HIDDEN=model_dim,
+        D_INTER=inter_dim,
+        topk=topk,
+        tile_m=block_m,
+        tile_n=128,
+        tile_k=256,
+        act="silu_clamped",
+        swiglu_limit=limit,
+    )
+    torch.cuda.synchronize()
+    actual = output[valid_positions]
+    expected = reference[token_ids[valid], slots[valid]]
+    rms = expected.float().square().mean(dim=-1, keepdim=True).sqrt().clamp_min(1e-6)
+    err = checkAllclose(
+        expected.float() / rms,
+        actual.float() / rms,
+        rtol=2 * torch.finfo(dtypes.bf16).eps,
+        atol=0.002,
+        msg=f"direct-A varying-scales clamp={limit} M={token}",
+    )
+    assert err == 0, err
+    assert (storage[:guard] == canary).all().item()
+    assert (storage[-guard:] == canary).all().item()
+    assert (output[padded] == canary).all().item()
+
+
+@_DIRECT_A_SKIP
+@pytest.mark.parametrize("token", [1, 2, 4, 8])
+def test_direct_a_small_m_packed_id_canary(token):
+    """Invalid packed tokens (24-bit large value) must not OOB read the A buffer."""
+    assert get_gfx_runtime() == "gfx942"
+    torch.manual_seed(43)
+    model_dim, inter_dim, experts, topk = 256, 256, 8, 6
+    hidden = torch.randn((token, model_dim), dtype=dtypes.bf16, device="cuda")
+    weight = torch.randn(
+        (experts, 2 * inter_dim, model_dim), dtype=dtypes.bf16, device=hidden.device
+    )
+    quantize = aiter.get_torch_quant(QuantType.per_1x32)
+    packed, scales = quantize(weight, quant_dtype=dtypes.fp4x2)
+    packed = packed.view(experts, 2 * inter_dim, model_dim // 2)
+    scales = scales.view(experts, 2 * inter_dim, model_dim // 32)
+    shuffled_weight = shuffle_weight_a16w4(packed, 16, False)
+    shuffled_scale = shuffle_scale_a16w4(
+        scales.reshape(-1, scales.shape[-1]), experts, False
+    )
+    scores = torch.randn((token, experts), device=hidden.device)
+    routing_ids = scores.topk(topk, dim=-1).indices.to(torch.int32)
+    routing_weights = torch.rand((token, topk), device=hidden.device)
+    routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+    block_m = 16 if token <= 4 else 32
+    sorted_ids, _, sorted_experts, cumsum, _ = moe_sorting(
+        routing_ids,
+        routing_weights,
+        experts,
+        model_dim,
+        dtypes.bf16,
+        block_m,
+    )
+    valid_size = int(cumsum[0])
+    packed_ids = sorted_ids[:valid_size].long()
+    valid = (packed_ids & 0x00FFFFFF) < token
+    valid_positions = torch.arange(valid_size, device=hidden.device)[valid]
+    valid_tokens = packed_ids[valid] & 0x00FFFFFF
+    valid_slots = packed_ids[valid] >> 24
+    reference_weight = (
+        mxfp4_to_f32(packed).view(experts, 2 * inter_dim, -1, 32)
+        * e8m0_to_f32(scales).unsqueeze(-1)
+    ).reshape_as(weight)
+    reference = _stage1_reference(hidden, reference_weight, routing_ids, 10.0, False)
+    # Poison only padding, leaving every live sorted route intact.
+    padding_ids = torch.ones_like(sorted_ids, dtype=torch.bool)
+    padding_ids[valid_positions] = False
+    sorted_ids[padding_ids] = 0x00FFFFFF
+    sorted_size = sorted_experts.numel() * block_m
+    guard = 64
+    canary = -123.0
+    storage = torch.full(
+        (sorted_size * inter_dim + 2 * guard,),
+        canary,
+        dtype=torch.bfloat16,
+        device=hidden.device,
+    )
+    output = storage[guard:-guard].view(sorted_size, inter_dim)
+    flydsl_a16w4_gemm1(
+        a_bf16=hidden,
+        w1_u8=shuffled_weight.view(torch.uint8),
+        w1_scale_u8=shuffled_scale.view(torch.uint8),
+        sorted_expert_ids=sorted_experts,
+        cumsum_tensor=cumsum,
+        m_indices=sorted_ids,
+        inter_sorted_bf16=output,
+        n_tokens=token,
+        NE=experts,
+        D_HIDDEN=model_dim,
+        D_INTER=inter_dim,
+        topk=topk,
+        tile_m=block_m,
+        tile_n=128,
+        tile_k=256,
+        act="silu_clamped",
+        swiglu_limit=10.0,
+    )
+    torch.cuda.synchronize()
+    assert (storage[:guard] == canary).all().item()
+    assert (storage[-guard:] == canary).all().item()
+    padding_output = torch.ones(sorted_size, dtype=torch.bool, device=hidden.device)
+    padding_output[valid_positions] = False
+    assert (output[padding_output] == canary).all()
+    expected = reference[valid_tokens, valid_slots].float()
+    actual = output[valid_positions].float()
+    rms = expected.square().mean(dim=-1, keepdim=True).sqrt().clamp_min(1e-6)
+    err = checkAllclose(
+        expected / rms,
+        actual / rms,
+        rtol=2 * torch.finfo(dtypes.bf16).eps,
+        atol=0.002,
+        msg="direct-A invalid-row canary",
+    )
+    assert err == 0
+
+
 # ---- Optional shared expert (bf16 or MXFP8) in the a16w4 gemm1/gemm2 launches ----
 
 _SHARED_SKIP = pytest.mark.skipif(
@@ -2457,8 +2938,10 @@ def test_moe_shared_expert_mxfp8_bitwise_m3(m3_moe_weights, token):
 
 
 def main():
-    if get_gfx() not in ("gfx942", "gfx950"):
-        aiter.logger.warning("FlyDSL a16w-mix unsupported on %s; skipping", get_gfx())
+    if get_gfx_runtime() not in ("gfx942", "gfx950"):
+        aiter.logger.warning(
+            "FlyDSL a16w-mix unsupported on %s; skipping", get_gfx_runtime()
+        )
         return
     parser = argparse.ArgumentParser(description="Clamped SiLU a16w-mix stage1")
     parser.add_argument(
@@ -2487,6 +2970,18 @@ def main():
     parser.add_argument("--tile-n", type=int, nargs="+", default=[128])
     parser.add_argument("--tile-k", type=int, nargs="+", default=[256])
     args = parser.parse_args()
+    if get_gfx_runtime() == "gfx942":
+        routing_rows = [
+            benchmark_single_token_routing(experts, topk, block_m)
+            for experts, topk, block_m in itertools.product(
+                args.experts, args.topk, args.tile_m
+            )
+            if 1 <= topk <= min(experts, 16) and block_m in (16, 32, 64, 128)
+        ]
+        aiter.logger.info(
+            "Single-token routing summary (logical I/O, markdown):\n%s",
+            pd.DataFrame(routing_rows).to_markdown(index=False),
+        )
     if 2 in args.stages:
         assert args.weight_dtype == ["fp4"], "full MoE sweep requires fp4 weights"
         rows = [

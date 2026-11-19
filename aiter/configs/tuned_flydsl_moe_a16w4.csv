@@ -2,3 +2,7 @@ gfx,cu_num,token,hidden_dim,inter_dim,logical_inter,experts,topk,swiglu_limit,ac
 gfx942,304,1,5120,384,288,384,6,10.0,silu_clamped,1,fp4,standard,16,32,128,256,128,0,4,1
 gfx942,304,8,5120,384,288,384,6,10.0,silu_clamped,1,fp4,standard,16,64,256,128,128,1,1,4
 gfx942,304,32,5120,384,288,384,6,10.0,silu_clamped,1,fp4,standard,16,32,128,128,128,1,2,3
+gfx942,80,1,5120,640,576,384,6,10.0,silu_clamped,0,fp4,standard,16,32,128,128,128,1,4,1
+gfx942,80,2,5120,640,576,384,6,10.0,silu_clamped,0,fp4,standard,16,32,128,256,128,0,4,1
+gfx942,80,4,5120,640,576,384,6,10.0,silu_clamped,0,fp4,standard,16,64,256,128,128,1,1,4
+gfx942,80,8,5120,640,576,384,6,10.0,silu_clamped,0,fp4,standard,16,64,128,128,128,1,1,3

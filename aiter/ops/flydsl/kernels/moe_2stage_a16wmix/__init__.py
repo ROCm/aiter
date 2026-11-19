@@ -40,6 +40,7 @@ epilog). Only gfx950 is validated.
 import torch
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.jit.utils import chip_info
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from .gemm1 import (
@@ -283,6 +284,18 @@ def flydsl_a16w4_gemm1(
         activation_bf16=activation_bf16,
         rocm_arch=str(get_rocm_arch()),
         prefetch=prefetch,
+        **(
+            {"direct_a": True}
+            if (
+                0 < int(n_tokens) <= 8
+                and w_dtype == "fp4"
+                and act == "silu_clamped"
+                and chip_info.get_gfx_runtime() == "gfx942"
+                and chip_info.get_cu_num() == 80
+                and fused_shared_w1 is None
+            )
+            else {}
+        ),
         **_shared_kw(
             sh_tn,
             shared_tile_m=shared_tile_m,
@@ -536,13 +549,12 @@ def flydsl_a16w4_moe(
     is cleared before every atomic reduction, including graph replay.
     """
     from aiter.fused_moe import moe_sorting
-    from aiter.jit.utils.chip_info import get_gfx_runtime
     from aiter.ops.flydsl.moe_a16w4_policy import (
         A16W4Tiles,
         get_a16w4_tuned_tiles,
     )
 
-    if get_gfx_runtime() not in ("gfx942", "gfx950"):
+    if chip_info.get_gfx_runtime() not in ("gfx942", "gfx950"):
         raise NotImplementedError("clamped A16W4 MoE requires gfx942 or gfx950")
     if not float(swiglu_limit) > 0.0:
         raise ValueError("silu_clamped requires swiglu_limit > 0")
@@ -623,9 +635,29 @@ def flydsl_a16w4_moe(
         or tiles.stage1_prefetch not in (1, 2, 3, 4)
     ):
         raise ValueError("tile pair does not divide the physical MoE dimensions")
-    sorted_ids, sorted_weights, sorted_experts, cumsum, _ = moe_sorting(
-        topk_ids, topk_weights, experts, model_dim, hidden_states.dtype, tiles.block_m
+    is_gfx942_80cu = (
+        chip_info.get_gfx_runtime() == "gfx942" and chip_info.get_cu_num() == 80
     )
+    use_single_routing = (
+        is_gfx942_80cu and token_num == 1 and topk <= 16 and intermediate is None
+    )
+    if use_single_routing:
+        from aiter.ops.flydsl.moe_routing_single import prepare_single_token_routing
+
+        sorted_ids, sorted_weights, sorted_experts, cumsum = (
+            prepare_single_token_routing(topk_ids, topk_weights, experts, tiles.block_m)
+        )
+        sort_out = None
+    else:
+        sorted_ids, sorted_weights, sorted_experts, cumsum, sort_out = moe_sorting(
+            topk_ids,
+            topk_weights,
+            experts,
+            model_dim,
+            hidden_states.dtype,
+            tiles.block_m,
+        )
+    reuse_sort_output = out is None and is_gfx942_80cu and not use_single_routing
     sorted_size = sorted_experts.numel() * tiles.block_m
     if intermediate is None:
         intermediate = torch.empty(
@@ -634,7 +666,7 @@ def flydsl_a16w4_moe(
             device=hidden_states.device,
         )
     if out is None:
-        out = torch.empty_like(hidden_states)
+        out = sort_out if reuse_sort_output else torch.empty_like(hidden_states)
     for buffer, shape in (
         (out, (token_num, model_dim)),
         (intermediate, (sorted_size, inter_dim)),
@@ -655,7 +687,12 @@ def flydsl_a16w4_moe(
             raise ValueError("MoE output buffers must not alias inputs")
     if out.untyped_storage().data_ptr() == intermediate.untyped_storage().data_ptr():
         raise ValueError("MoE output buffers must not alias each other")
-    out.zero_()
+    if not reuse_sort_output:
+        out.zero_()
+    if is_gfx942_80cu and token_num <= 2:
+        # Every nonempty expert block consumes at least one of M*topk routes.
+        # Keep the owned buffers/capacity, but exclude unused expert-block CTAs.
+        sorted_experts = sorted_experts[: min(sorted_experts.numel(), token_num * topk)]
     flydsl_a16w4_gemm1(
         a_bf16=hidden_states,
         w1_u8=w1,
