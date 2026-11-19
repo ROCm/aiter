@@ -101,6 +101,8 @@ def main():
                 constants["NUM_PRGMS"] = 256
                 if mode != "persistent1":
                     constants["ROWS_PER_ITER"] = int(mode[-1])
+                else:
+                    constants["PERSISTENT"] = True
             signature = {name: "i32" for name in fn.arg_names}
             signature.update(
                 {

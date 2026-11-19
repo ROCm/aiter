@@ -155,11 +155,14 @@ def _fused_dual_rmsnorm_mxfp8_quant_kernel(
     QUANT_BLOCK_SIZE: tl.constexpr,  # =32 (MXFP8 group size)
     NUM_PRGMS,  # row-loop stride; runtime, see `_fused_rms_mxfp8_kernel`
     AMAX_FLOOR: tl.constexpr = 0.0,  # Q groups' amax floor (none by default)
+    PERSISTENT: tl.constexpr = False,
 ):
     """One program per row: do Q-side RMSNorm+MXFP8 quant AND K-side RMSNorm
     (bf16 out) in one launch. Mirrors the CK `fused_qk_rmsnorm_group_quant`
     fusion topology but emits MXFP8 1x32 (e8m0) scales for Q directly."""
     row_start = tl.program_id(0)
+    if PERSISTENT:
+        row_start += 16 * tl.program_id(1)
 
     q_col_offsets = tl.arange(0, BLOCK_SIZE_KQ)
     q_mask = q_col_offsets < KQ

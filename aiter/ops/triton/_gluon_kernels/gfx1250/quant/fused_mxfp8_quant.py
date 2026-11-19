@@ -54,11 +54,12 @@ def _fused_dual_rmsnorm_mxfp8_quant_ps_kernel(
     k_cols = gl.arange(0, BLOCK_SIZE_KK, layout=gl.SliceLayout(0, k_layout))
     q_rows = gl.arange(0, ROWS_PER_ITER, layout=gl.SliceLayout(1, q_layout))
     k_rows = gl.arange(0, ROWS_PER_ITER, layout=gl.SliceLayout(1, k_layout))
-    gq = gl.load(gq_ptr + q_cols, q_cols < KQ, other=0).to(gl.float32)
-    gk = gl.load(gk_ptr + k_cols, k_cols < KK, other=0).to(gl.float32)
-    for first in range(gl.program_id(0) * ROWS_PER_ITER, M, NUM_PRGMS * ROWS_PER_ITER):
-        qr = first.to(gl.int64) + q_rows
-        kr = first.to(gl.int64) + k_rows
+    tg = gl.program_id(0) + 16 * gl.program_id(1)
+    for first in range(tg, M, NUM_PRGMS * ROWS_PER_ITER):
+        gq = gl.load(gq_ptr + q_cols, q_cols < KQ, other=0).to(gl.float32)
+        gk = gl.load(gk_ptr + k_cols, k_cols < KK, other=0).to(gl.float32)
+        qr = first.to(gl.int64) + q_rows * NUM_PRGMS
+        kr = first.to(gl.int64) + k_rows * NUM_PRGMS
         qm = (qr[:, None] < M) & (q_cols[None, :] < KQ)
         km = (kr[:, None] < M) & (k_cols[None, :] < KK)
         xq = gl.load(
@@ -92,8 +93,10 @@ def _fused_dual_rmsnorm_mxfp8_quant_ps_kernel(
         )
         scales = gl.reshape(scales, (ROWS_PER_ITER, groups))
         scale_layout: gl.constexpr = scales.type.layout
-        sr = first.to(gl.int64) + gl.arange(
-            0, ROWS_PER_ITER, layout=gl.SliceLayout(1, scale_layout)
+        sr = (
+            first.to(gl.int64)
+            + gl.arange(0, ROWS_PER_ITER, layout=gl.SliceLayout(1, scale_layout))
+            * NUM_PRGMS
         )
         sg = gl.arange(0, groups, layout=gl.SliceLayout(0, scale_layout))
         gl.store(

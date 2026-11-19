@@ -12,11 +12,19 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 @gluon.jit
 def _quantize_fp8_group32_tile(
-    X, Y, S, SIZE, tile, DEQUANT: gl.constexpr, TILES_PER_ITER: gl.constexpr = 1
+    X,
+    Y,
+    S,
+    SIZE,
+    tile,
+    DEQUANT: gl.constexpr,
+    TILES_PER_ITER: gl.constexpr = 1,
+    TILE_STRIDE: gl.constexpr = 1,
 ):
     # Keep each scale in its reduction layout to avoid an LDS copy across waves.
     layout: gl.constexpr = gl.BlockedLayout([1, 8], [8, 4], [4, 1], [1, 0])
     groups = gl.arange(0, 32 * TILES_PER_ITER, layout=gl.SliceLayout(1, layout))
+    groups = (groups // 32) * (32 * TILE_STRIDE) + groups % 32
     offsets = (
         groups[:, None] * 32
         + gl.arange(0, 32, layout=gl.SliceLayout(0, layout))[None, :]
@@ -66,30 +74,10 @@ def _quantize_fp8_group32_kernel(
 ):
     task = gl.program_id(0)
     if PERSISTENT:
-        if TILES_PER_ITER != 2:
-            for tile in range(task, gl.cdiv(SIZE, 1024 * TILES_PER_ITER), 256):
-                _quantize_fp8_group32_tile(
-                    X,
-                    Y,
-                    S,
-                    SIZE,
-                    tile.to(gl.int64) * TILES_PER_ITER,
-                    DEQUANT,
-                    TILES_PER_ITER,
-                )
-        else:
-            tasks = gl.cdiv(SIZE.to(gl.int64), 1024)
-            base = tasks // 256
-            extra = tasks % 256
-            count = base + (task < extra).to(gl.int32)
-            start = task * base + gl.minimum(task, extra)
-            full_end = start + (count // TILES_PER_ITER) * TILES_PER_ITER
-            # Balance total work before batching each worker's adjacent tasks.
-            for tile in range(start, full_end, TILES_PER_ITER):
-                _quantize_fp8_group32_tile(X, Y, S, SIZE, tile, DEQUANT, TILES_PER_ITER)
-            tail_count = count % TILES_PER_ITER
-            if tail_count:
-                _quantize_fp8_group32_tile(X, Y, S, SIZE, full_end, DEQUANT)
-
+        task += 16 * gl.program_id(1)
+        for tile in range(task, gl.cdiv(SIZE, 1024), 256 * TILES_PER_ITER):
+            _quantize_fp8_group32_tile(
+                X, Y, S, SIZE, tile, DEQUANT, TILES_PER_ITER, TILE_STRIDE=256
+            )
     else:
         _quantize_fp8_group32_tile(X, Y, S, SIZE, task, DEQUANT)
