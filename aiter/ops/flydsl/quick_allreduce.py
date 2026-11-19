@@ -48,12 +48,17 @@ from .allreduce_host_shared import (
     kernel_symbol,
     payload_probes,
     preload_launcher,
+    probe_peer_topology,
     require_arch,
 )
 from .allreduce_policy import (
     AG_CODECS,
     DEFAULT_MESH_KNOBS,
     HANDSHAKES,
+    HIER_CODECS,
+    HIER_LOCAL_SCHEDULES,
+    HIER_SUPER_TILES,
+    HIER_X_CODEC,
     MESH_CODECS,
     MIN_BATCH_BLOCKS,
     PAD_MASK_MAX_BYTES,
@@ -61,12 +66,15 @@ from .allreduce_policy import (
     RS_CODECS,
     SUPER_TILES,
     FusedTwoShotRung,
+    HierRung,
     MeshKnobs,
+    NoPolicyError,
     TwoShotRung,
     default_codecs,
     fused_mesh_st_ladder,
     fused_qr_row_atoms,
     fused_ring_st_ladder,
+    hier_st_ladder,
     mesh_st_ladder,
     mesh_super_tiles,
     quantized_floor,
@@ -80,6 +88,11 @@ from .kernels.comm.quick_allreduce_fusions import (
     quick_reduce_row_block_at,
     quick_reduce_row_block_for,
     quick_reduce_row_block_options,
+)
+from .kernels.comm.quick_allreduce_hier import (
+    check_groups,
+    hier_lds_bytes,
+    make_quick_allreduce_hier_kernel,
 )
 from .kernels.comm.quick_allreduce_mesh import (
     DEFAULT_DIVISOR,
@@ -154,6 +167,10 @@ class _Algorithm:
     # Whether ``build`` takes ``knobs`` (``MeshKnobs``) and ``lds_bytes`` the
     # ``lds_bufs=`` keyword: the mesh does, the ring takes only the defaults.
     has_knobs: bool = False
+    # Whether the schedule needs the host split into socket groups (the
+    # hierarchical one): its build then takes ``groups``, ``x_codec``,
+    # ``local_rs`` and ``local_ag``, and its ladder holds ``HierRung``s.
+    hierarchical: bool = False
 
 
 def _build_mesh(
@@ -197,6 +214,10 @@ def _build_mesh(
     )
 
 
+def _no_fused_ladder(*, world_size, link, arch=None, hidden=None):
+    raise NoPolicyError("the hierarchical all-reduce has no fused build")
+
+
 ALGORITHMS = {
     "mesh": _Algorithm(
         name="mesh",
@@ -220,6 +241,16 @@ ALGORITHMS = {
         ag_codecs=AG_CODECS,
         st_ladder=ring_st_ladder,
         fused_st_ladder=fused_ring_st_ladder,
+    ),
+    "hier": _Algorithm(
+        name="hier",
+        build=make_quick_allreduce_hier_kernel,
+        super_tiles=HIER_SUPER_TILES,
+        rs_codecs=HIER_CODECS,
+        ag_codecs=HIER_CODECS,
+        st_ladder=hier_st_ladder,
+        fused_st_ladder=_no_fused_ladder,
+        hierarchical=True,
     ),
 }
 
@@ -265,6 +296,46 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
     return resolved_rs, resolved_ag
 
 
+def _as_hier_rung(rung: TwoShotRung, local_rs, local_ag) -> HierRung:
+    """*rung* as a ``HierRung``. A plain ``TwoShotRung`` runs the mesh on both
+    local laps at the default codecs, on its own handshake; *local_rs* and
+    *local_ag*, when not None, replace the rung's schedules."""
+    if not isinstance(rung, HierRung):
+        rung = HierRung(
+            min_bytes=rung.min_bytes,
+            super_tile=rung.super_tile,
+            grid_cap=rung.grid_cap,
+            block=rung.block,
+            handshake=rung.handshake,
+            knobs=rung.knobs,
+        )
+    return dataclasses.replace(
+        rung,
+        local_rs=local_rs or rung.local_rs,
+        local_ag=local_ag or rung.local_ag,
+    )
+
+
+def _engine_sort_key(key: tuple) -> tuple:
+    """A total order on engine keys that every rank computes alike: ``None``
+    sorts as ``""`` and ``MeshKnobs`` by its string form."""
+    return tuple(
+        "" if v is None else str(v) if isinstance(v, MeshKnobs) else v for v in key
+    )
+
+
+def _hier_codecs(requested, rung: HierRung, group_size: int):
+    """``(rs, x, ag)`` codecs of the engine for *rung*: the caller's
+    *requested* ``(rs, x, ag)``, else the rung's, else the defaults
+    (``HierRung``)."""
+    rs, x, ag = requested
+    return (
+        rs or rung.rs_codec or default_codecs(rung.local_rs, group_size)[0],
+        x or rung.x_codec or HIER_X_CODEC,
+        ag or rung.ag_codec or default_codecs(rung.local_ag, group_size)[1],
+    )
+
+
 def batches_publishes(inbox_memory: str, algorithm: str, link: str) -> bool:
     """Whether ``FlyQuickAllReduce`` batches publishes into super-tiles.
 
@@ -288,6 +359,17 @@ class FlyQuickAllReduce:
     * ``"ring"``: ``2(N-1)`` hops, each a single contiguous run into exactly
       one peer's inbox. Same wire volume (``2(N-1)/N`` of the payload), traded
       for per-destination locality. Optimal for large messages on PCIe.
+    * ``"hier"``: for hosts whose ranks split into two uniform groups (the
+      CPU sockets of a two-socket PCIe host). A reduce-scatter inside each
+      group, an exchange between partner ranks of the two groups, and an
+      all-gather inside each group; only the exchange crosses groups.
+      ``groups`` gives the split; by default it is detected from the KFD
+      topology (``probe_peer_topology``), and a host that does not split
+      raises. ``x_codec`` is the wire format of the exchange. Each rung of
+      the ladder (``HierRung``) picks the mesh or the ring for each local
+      lap, and its codecs; ``local_rs`` and ``local_ag`` pin one schedule,
+      and ``rs_codec``, ``x_codec`` and ``ag_codec`` one codec, on every
+      rung. The rungs' ``handshake`` runs all three laps.
 
     ``rs_codec`` and ``ag_codec`` are the wire formats of the ring's two laps.
     The reduce-scatter lap requantizes ``N-1`` times and it defaults to ``"int6"``
@@ -336,6 +418,10 @@ class FlyQuickAllReduce:
         link: str | None = None,
         ladder: tuple[TwoShotRung, ...] | None = None,
         handshake: str | None = None,
+        x_codec: str | None = None,
+        groups=None,
+        local_rs: str | None = None,
+        local_ag: str | None = None,
     ):
         check_world_size(world_size)
         if handshake is not None and handshake not in HANDSHAKES:
@@ -348,11 +434,53 @@ class FlyQuickAllReduce:
             )
         algo = ALGORITHMS[algorithm]
         link = resolve_link(link)
+        # A hierarchical engine resolves its codecs per rung; the request is
+        # kept for that.
+        requested_codecs = (rs_codec, x_codec, ag_codec)
         rs_codec, ag_codec = _resolve_codecs(algo, int(world_size), rs_codec, ag_codec)
+        if not algo.hierarchical and any(
+            v is not None for v in (x_codec, groups, local_rs, local_ag)
+        ):
+            raise ValueError(
+                "x_codec, groups, local_rs and local_ag are for algorithm='hier' only"
+            )
+        for label, sched in (("local_rs", local_rs), ("local_ag", local_ag)):
+            if sched is not None and sched not in HIER_LOCAL_SCHEDULES:
+                raise ValueError(
+                    f"{label} must be one of {HIER_LOCAL_SCHEDULES}, got {sched!r}"
+                )
         _validate_ipc_process_group(
             group, rank=int(rank), world_size=world_size, owner="FlyQuickAllReduce"
         )
         arch = require_arch(owner="FlyQuickAllReduce")
+        self._device_index = _cuda_index(device, owner="FlyQuickAllReduce")
+        # The hierarchical schedule's extra build arguments.
+        build_kw = {}
+        self.x_codec = None
+        self.groups = None
+        self.local_rs = self.local_ag = None
+        if algo.hierarchical:
+            if x_codec is not None and x_codec not in HIER_CODECS:
+                raise ValueError(
+                    f"x_codec must be one of {HIER_CODECS}, got {x_codec!r}"
+                )
+            if groups is None:
+                topo = probe_peer_topology(
+                    group,
+                    rank=int(rank),
+                    world_size=int(world_size),
+                    device_index=self._device_index,
+                )
+                if len(topo.groups) != 2:
+                    raise ValueError(
+                        f"algorithm='hier' needs the ranks to split into two "
+                        f"uniform groups; the topology ({topo.source}) gives "
+                        f"{topo.groups}"
+                    )
+                groups = topo.groups
+            groups = check_groups(groups, int(world_size))
+            self.groups = groups
+            build_kw = {"groups": groups}
         if ladder is None:
             ladder = algo.st_ladder(world_size=world_size, link=link, arch=arch)
         if not ladder:
@@ -372,10 +500,11 @@ class FlyQuickAllReduce:
                         f"algorithm={algorithm!r} takes no mesh tuning knobs, "
                         f"got {str(r.knobs)!r}"
                     )
+        if algo.hierarchical:
+            ladder = tuple(_as_hier_rung(r, local_rs, local_ag) for r in ladder)
         inbox_flags, resolved_inbox = _resolve_inbox_flags(
             inbox_memory, world_size, link
         )
-        self._device_index = _cuda_index(device, owner="FlyQuickAllReduce")
         self.group = group
         self.device = torch.device("cuda", self._device_index)
         self.rank = int(rank)
@@ -403,12 +532,15 @@ class FlyQuickAllReduce:
         if self.min_bytes < 0:
             raise ValueError(f"min_bytes must be non-negative, got {self.min_bytes}")
 
-        # One engine per distinct ``(super_tile, block, knobs)``, keyed that way
-        # in ``_by_cfg``. Each ``(block, knobs)`` also gets an ST=1 engine:
-        # _pick_cfg falls back to it when a payload has fewer tiles than the
-        # chosen super-tile, and the fallback has to share the rung's block -- a
+        # One engine per distinct ``engine_key`` -- ``(super_tile, block,
+        # knobs)``, and on a hierarchical rung ``(super_tile, block)`` plus its
+        # local schedules and codecs (``HierRung.engine_key``) -- keyed that way
+        # in ``_by_cfg``. Each key tail also gets an ST=1 engine: _pick_cfg
+        # falls back to it when a payload has fewer tiles than the chosen
+        # super-tile, and the fallback has to share the rung's block -- a
         # different tile size would change the tile count it was picked for --
-        # and its knobs, so a tuned rung stays on its tuned kernel. Engines are built
+        # and the rest of its key, so a tuned rung stays on its tuned kernel
+        # and a hierarchical one on its local schedules. Engines are built
         # in a fixed order because each does its own IPC handle exchange, which
         # is a collective -- ranks disagreeing on the order would deadlock.
         #
@@ -422,34 +554,66 @@ class FlyQuickAllReduce:
         # built a 194 MiB inbox to launch at most 32 blocks into, and did it on
         # every object ever constructed.
         caps = {}
+        rungs = {}
         for r in ladder:
-            caps.setdefault((r.super_tile, r.block, r.knobs), r.grid_cap)
-        for b, kn in {(b, kn) for _st, b, kn in list(caps)}:
+            caps.setdefault(r.engine_key, r.grid_cap)
+            rungs.setdefault(r.engine_key[1:], r)
+        for tail in {key[1:] for key in list(caps)}:
             caps.setdefault(
-                (1, b, kn),
-                min(c for (_st, cb, ck), c in caps.items() if (cb, ck) == (b, kn)),
+                (1, *tail), min(c for key, c in caps.items() if key[1:] == tail)
             )
         self._ladder = ladder
         self._by_cfg = {}
         try:
             with torch.cuda.device(self._device_index):
-                # Knobs sort by their string form: a total order every rank
-                # shares, which the collective setup below needs.
-                for key in sorted(caps, key=lambda k: (k[0], k[1], str(k[2]))):
-                    st, b, kn = key
+                # Knobs sort by their string form, and a hierarchical key may
+                # hold None (a default codec) where another holds a name: the
+                # order only has to be a total one that every rank shares, which
+                # the collective setup below needs.
+                for key in sorted(caps, key=_engine_sort_key):
+                    st, b = key[0], key[1]
+                    rung = rungs[key[1:]]
+                    kn = rung.knobs
+                    eng_rs, eng_ag = rs_codec, ag_codec
+                    if algo.hierarchical:
+                        eng_rs, eng_x, eng_ag = _hier_codecs(
+                            requested_codecs, rung, len(self.groups[0])
+                        )
+                        build_kw.update(
+                            local_rs=rung.local_rs,
+                            local_ag=rung.local_ag,
+                            x_codec=eng_x,
+                        )
                     # A persistent kernel deadlocks if it launches more workgroups
                     # than fit, and the ranks have to agree on the number: take the
                     # minimum across the group so a heterogeneous node converges.
                     grid = clamp_grid_cap(
                         caps[key],
                         arch=arch,
-                        world_size=self.world_size,
+                        # The hierarchical kernel's registers are those of a
+                        # mesh over one group.
+                        world_size=(
+                            len(self.groups[0])
+                            if algo.hierarchical
+                            else self.world_size
+                        ),
                         super_tile=st,
                         cu_count=cu_count,
                         block=b,
                         handshake=handshake,
                         knobs=kn,
                     )
+                    if algo.hierarchical:
+                        wg_lds = hier_lds_bytes(
+                            b,
+                            len(self.groups[0]),
+                            eng_rs,
+                            eng_x,
+                            eng_ag,
+                            rung.local_rs,
+                            rung.local_ag,
+                        )
+                        grid = min(grid, max(1, lds_capacity // wg_lds) * cu_count)
                     if algo.lds_bytes is not None:
                         # The VGPR table assumes INT4's rank-tile; a wider
                         # codec can run out of LDS first.
@@ -465,15 +629,16 @@ class FlyQuickAllReduce:
                         super_tile=st,
                         grid=int(shared_grid.item()),
                         inbox_memory=resolved_inbox,
-                        rs_codec=rs_codec,
-                        ag_codec=ag_codec,
+                        rs_codec=eng_rs,
+                        ag_codec=eng_ag,
                         block=b,
                         handshake=handshake,
                         **({"knobs": kn} if algo.has_knobs else {}),
+                        **build_kw,
                     )
                     if spec["lds_bytes"] > lds_capacity:
                         raise ValueError(
-                            f"{algorithm} (rs_codec={rs_codec}, ag_codec={ag_codec}) "
+                            f"{algorithm} (rs_codec={eng_rs}, ag_codec={eng_ag}) "
                             f"at block={b} needs "
                             f"{spec['lds_bytes']} B of LDS, over the "
                             f"{lds_capacity} B {arch} has"
@@ -489,9 +654,15 @@ class FlyQuickAllReduce:
             self.close()
             raise
 
-        # The first rung's shape, reported as this object's own.
+        # The first rung's shape, reported as this object's own; on a
+        # hierarchical engine its codecs and local schedules too.
         self.super_tile, self.block = ladder[0].super_tile, ladder[0].block
-        primary = self._by_cfg[(self.super_tile, self.block, ladder[0].knobs)]
+        primary = self._by_cfg[ladder[0].engine_key]
+        if algo.hierarchical:
+            self.rs_codec = primary.spec["rs_codec"]
+            self.x_codec = primary.spec["x_codec"]
+            self.ag_codec = primary.spec["ag_codec"]
+            self.local_rs, self.local_ag = ladder[0].local_rs, ladder[0].local_ag
         self.buf_bytes = primary.buf_bytes
         self.lds_bytes = primary.lds_bytes
         self.tile_bytes = primary.tile_bytes
@@ -512,8 +683,9 @@ class FlyQuickAllReduce:
         """
         return sum(eng.buf_bytes for eng in self._by_cfg.values())
 
-    def _ladder_cfg(self, live_bytes: int) -> tuple[int, int, MeshKnobs]:
-        """``(super_tile, block, knobs)`` the ladder assigns to *live_bytes*.
+    def _ladder_cfg(self, live_bytes: int) -> tuple:
+        """The engine key the ladder assigns to *live_bytes*
+        (``TwoShotRung.engine_key``, ``HierRung.engine_key``).
 
         Publishes per rank are ``num_tiles / ST * 2(N-1)`` and cost a full L2
         writeback each, so a bigger payload wants a bigger ST -- but ST also
@@ -521,15 +693,14 @@ class FlyQuickAllReduce:
         and the measurements behind them are in ``MESH_ST_LADDER`` and
         ``RING_ST_LADDER``.
         """
-        rung = select_rung(self._ladder, live_bytes)
-        return (rung.super_tile, rung.block, rung.knobs)
+        return select_rung(self._ladder, live_bytes).engine_key
 
     @staticmethod
     def _num_tiles(live_bytes: int, block: int) -> int:
         tile_bytes = int(block) * ATOMS * 16
         return max(1, (live_bytes + tile_bytes - 1) // tile_bytes)
 
-    def _pick_cfg(self, live_bytes: int) -> tuple[tuple[int, int, MeshKnobs], int]:
+    def _pick_cfg(self, live_bytes: int) -> tuple[tuple, int]:
         """Engine key for a *live_bytes* payload, and its tile count.
 
         The ladder chooses the rung, which fixes the block and so the tile
@@ -538,15 +709,16 @@ class FlyQuickAllReduce:
         there is not.
         """
 
-        want, b, kn = self._ladder_cfg(live_bytes)
+        key = self._ladder_cfg(live_bytes)
+        want, b = key[0], key[1]
         num_tiles = self._num_tiles(live_bytes, b)
         if want == 1:
             st = 1
         elif self._batch_publishes:
             st = want if num_tiles >= want else 1
         else:
-            st = want if num_tiles > self._by_cfg[(want, b, kn)].grid else 1
-        return (st, b, kn), num_tiles
+            st = want if num_tiles > self._by_cfg[key].grid else 1
+        return (st, *key[1:]), num_tiles
 
     def _grid_x(self, num_tiles: int, super_tile: int, grid: int) -> int:
         """Blocks to launch for *num_tiles* tiles under *super_tile*.
@@ -619,7 +791,7 @@ class FlyQuickAllReduce:
         with torch.cuda.device(self._device_index):
             _run_compiled(eng.launch, *args)
 
-    def cfgs_for(self, lo: int, hi: int) -> list[tuple[int, int, MeshKnobs]]:
+    def cfgs_for(self, lo: int, hi: int) -> list[tuple]:
         """``_by_cfg`` keys a payload of ``lo..hi`` bytes (inclusive) can
         select, in build order."""
         floors = [rung.min_bytes for rung in self._ladder]
@@ -841,6 +1013,11 @@ class FlyQuickAllReduceRMSNorm:
                 f"algorithm must be one of {tuple(ALGORITHMS)}, got {algorithm!r}"
             )
         algo = ALGORITHMS[algorithm]
+        if algo.hierarchical:
+            raise ValueError(
+                f"FlyQuickAllReduceRMSNorm has no {algorithm!r} build; use "
+                "'mesh' or 'ring'"
+            )
         # The mesh also takes 2 and 4 on the Lamport handshake, which a rung may
         # name without the pin; the kernel build rejects them on a flag one.
         legal_st = (
