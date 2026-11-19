@@ -11,7 +11,7 @@ from aiter import get_hip_quant, logger
 from aiter.dist.parallel_state import is_global_first_rank
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.enum import QuantType
-from aiter.utility.dtypes import fp8
+from aiter.utility.dtypes import fp8, fp8_e8m0
 
 from ._all_reduce_config import get_ar_1stage_max_bytes
 from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
@@ -587,9 +587,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
         hadamard_rotate: bool = False,
     ):
         # quant_type arrives already canonicalized to a string ("per_token"/
-        # "per_group"/"mxfp4") from the public API.
+        # "mxfp8"/"per_group"/"mxfp4") from the public API.
         if hadamard_rotate and quant_type != "mxfp4":
             raise ValueError("hadamard_rotate is MXFP4-only")
+        if quant_type == "mxfp8":
+            if group_size != 32:
+                raise ValueError("mxfp8 requires group_size=32")
+            if emit_bf16 or transpose_scale or hadamard_rotate:
+                raise ValueError(
+                    "mxfp8 does not support emit_bf16, transpose_scale, "
+                    "or hadamard_rotate"
+                )
+            return self.fused_allreduce_rmsnorm_mxfp8_quant(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                prefill_support=prefill_support,
+                gemma_norm=gemma_norm,
+            )
         if quant_type == "per_group":
             return self.fused_allreduce_rmsnorm_quant_per_group(
                 input_,
@@ -794,6 +810,70 @@ class CudaCommunicator(DeviceCommunicatorBase):
             assert bf16_out is not None
             return out, res_out, scale_out, bf16_out
         return out, res_out, scale_out
+
+    def fused_allreduce_rmsnorm_mxfp8_quant(
+        self,
+        input_: torch.Tensor,
+        res_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        prefill_support: bool = False,
+        gemma_norm: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return E4M3 values with row-major group-32 E8M0 scales."""
+        if input_.dim() != 2 or input_.shape[-1] % 32:
+            raise ValueError(
+                "mxfp8 requires a 2-D input with hidden size divisible by 32"
+            )
+
+        tokens, hidden = input_.shape
+        if tokens == 0:
+            return (
+                torch.empty_like(input_, dtype=fp8),
+                torch.empty_like(res_inp_),
+                torch.empty(
+                    (0, hidden // 32),
+                    dtype=fp8_e8m0,
+                    device=input_.device,
+                ),
+            )
+
+        # This one-shot has its own measured crossover, so it uses the plain
+        # Gluon all-reduce's 4 MiB eligibility bound rather than the Lamport
+        # per-token cutoff.
+        if _use_gluon_ar_norm(self, input_, res_inp_, weight_, lamport=False):
+            from aiter.ops.triton.comms.all_reduce import (
+                all_reduce_rmsnorm_mxfp8_quant,
+            )
+
+            inboxes, calls = self.gluon_ar_plain
+            return all_reduce_rmsnorm_mxfp8_quant(
+                input_,
+                res_inp_,
+                weight_,
+                eps,
+                gemma_norm,
+                group=self.cpu_group,
+                inboxes=inboxes,
+                calls=calls,
+            )
+
+        normed, res_out = self.fused_allreduce_rmsnorm(
+            input_,
+            res_inp_,
+            weight_,
+            eps,
+            prefill_support,
+            gemma_norm=gemma_norm,
+        )
+        from aiter.ops.quant import per_1x32_mx_quant_hip
+
+        out, scale = per_1x32_mx_quant_hip(
+            normed,
+            quant_dtype=fp8,
+            scale_type=fp8_e8m0,
+        )
+        return out, res_out, scale
 
     def fused_allreduce_rmsnorm_quant_per_group(
         self,
@@ -1032,9 +1112,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if hadamard_rotate:
                 from aiter.ops.quant import per_1x32_f4_quant_hip
 
-                out_fp4, scale_out = per_1x32_f4_quant_hip(
-                    normed, hadamard_rotate=True
-                )
+                out_fp4, scale_out = per_1x32_f4_quant_hip(normed, hadamard_rotate=True)
             else:
                 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 

@@ -4,7 +4,7 @@ receiver waits until its lines carry the tag of the call, then adds the 4 chunks
 and odd calls use 2 banks of the inbox: a GPU can be one call ahead of a peer.
 
 With NORM, the kernel also adds the residual and applies RMSNorm (and per-token FP8
-quant) to its rows. A row is then cdiv(HIDDEN, 384) chunks; the last one is partial and
+or native group-32 MXFP8 quant) to its rows. A row is then cdiv(HIDDEN, 384) chunks; the last one is partial and
 its lines past the row carry 0. A program runs W waves (a power of 2, at least
 HIDDEN / 768): a sender sends one chunk a wave, and a receiver takes one row, 2 chunks
 a wave. For HIDDEN 6144 (W 8), these 768 values are those of one wave of the HIP
@@ -247,6 +247,50 @@ def _asm(op: gl.constexpr, v):
 
 
 @gluon.jit
+def _mxfp8_quant_store(
+    y,
+    out,
+    scale,
+    at,
+    local,
+    mask,
+    row,
+    HIDDEN: gl.constexpr,
+):
+    """Store one contiguous 128-value plane as native group-32 MXFP8."""
+    y = _wave_units(y.to(gl.bfloat16).to(gl.float32))
+    at = _wave_units(at)
+    mask = gl.broadcast(mask, local)[0]
+    local = _wave_units(local)
+    mask = _wave_units(mask)
+
+    W: gl.constexpr = gl.num_warps()
+    groups = gl.reshape(y, [4 * W, 32])
+    amax = gl.maximum(gl.max(gl.abs(groups), axis=1), 1e-10)
+    scaled = amax * (1.0 / 448.0)
+    bits = scaled.to(gl.uint32, bitcast=True)
+    code = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(gl.uint32)
+    reciprocal = (gl.maximum(254 - code.to(gl.int32), 0) << 23).to(
+        gl.float32, bitcast=True
+    )
+    reciprocal = gl.reshape(
+        gl.broadcast(reciprocal[:, None], groups)[0],
+        [W, 128],
+    )
+    q = gl.clamp(y * reciprocal, -448.0, 448.0).to(gl.float8e4nv)
+    gl.amd.cdna5.buffer_store(q, out, at, mask=mask)
+
+    code = gl.reshape(gl.broadcast(code[:, None], groups)[0], [W, 128]).to(gl.uint8)
+    group_at = row * (HIDDEN // 32) + local // 32
+    gl.amd.cdna5.buffer_store(
+        code,
+        scale,
+        group_at,
+        mask=mask & (local % 32 == 0),
+    )
+
+
+@gluon.jit
 def _wave_units(p):
     """Plane p [rows, 2] of the waves as [wave, unit] (see _wave_lines)."""
     W: gl.constexpr = gl.num_warps()
@@ -372,9 +416,10 @@ def _receive_norm(
 ):
     """Receives one row: wave w takes slab w (chunks 2w and 2w + 1 of the row; the
     values past the row are masked). Then stores residual_out = the sum + residual and
-    out = RMSNorm(residual_out) as bf16 (NORM 1) or as per-token FP8 with its fp32
-    scale (NORM 2). The arithmetic is that of add_rmsnorm_quant_kernel<256, 24>,
-    and for FP8 then that of the per-token quant of its bf16 out."""
+    out = RMSNorm(residual_out) as bf16 (NORM 1), per-token FP8 with its fp32
+    scale (NORM 2), or E4M3 with row-major group-32 E8M0 scales (NORM 3).
+    The arithmetic is that of add_rmsnorm_quant_kernel<256, 24>; quantization
+    reads the BF16 norm result, matching the corresponding standalone quantizer."""
     WORDS: gl.constexpr = gl.BlockedLayout([1, 2], [32, 1], [gl.num_warps(), 1], [1, 0])
     LINE: gl.constexpr = gl.BlockedLayout([1, 4], [32, 1], [gl.num_warps(), 1], [1, 0])
     ROW: gl.constexpr = _row_chunks(HIDDEN, LINES)
@@ -455,8 +500,7 @@ def _receive_norm(
         gl.amd.cdna5.buffer_store(y3.to(gl.bfloat16), out, vb, mask=m3)
         gl.amd.cdna5.buffer_store(y4.to(gl.bfloat16), out, vb + 2 * LINES, mask=m4)
         gl.amd.cdna5.buffer_store(y5.to(gl.bfloat16), out, vb + 4 * LINES, mask=m5)
-    else:
-        gl.static_assert(NORM == 2)
+    elif NORM == 2:
         # Quantize the bf16 norm output, as the split norm -> per-token quant path.
         y0 = y0.to(gl.bfloat16).to(gl.float32)
         y1 = y1.to(gl.bfloat16).to(gl.float32)
@@ -483,6 +527,22 @@ def _receive_norm(
         gl.amd.cdna5.buffer_store(q, out, vb + 2 * LINES, mask=m4)
         q = gl.clamp(y5 * inv, -448.0, 448.0).to(gl.float8e4nv)
         gl.amd.cdna5.buffer_store(q, out, vb + 4 * LINES, mask=m5)
+    else:
+        gl.static_assert(NORM == 3)
+        _mxfp8_quant_store(y0, out, scale, va, wa, m0, row, HIDDEN)
+        _mxfp8_quant_store(
+            y1, out, scale, va + 2 * LINES, wa + 2 * LINES, m1, row, HIDDEN
+        )
+        _mxfp8_quant_store(
+            y2, out, scale, va + 4 * LINES, wa + 4 * LINES, m2, row, HIDDEN
+        )
+        _mxfp8_quant_store(y3, out, scale, vb, wb, m3, row, HIDDEN)
+        _mxfp8_quant_store(
+            y4, out, scale, vb + 2 * LINES, wb + 2 * LINES, m4, row, HIDDEN
+        )
+        _mxfp8_quant_store(
+            y5, out, scale, vb + 4 * LINES, wb + 4 * LINES, m5, row, HIDDEN
+        )
 
 
 _plain_repr = make_kernel_repr("_all_reduce_kernel", ["RANK", "LINES"])
@@ -525,7 +585,7 @@ def _all_reduce_kernel(
     C+P-1 receive chunks p, p + P, ... (P = programs). The GPU starts programs in
     order, so a waiting receiver cannot block a sender.
 
-    NORM 0 ignores residual, weight, out and scale. With NORM 1 or 2, y is
+    NORM 0 ignores residual, weight, out and scale. With NORM 1, 2 or 3, y is
     residual_out, there are P rows of HIDDEN values, and the W-wave programs 0 to
     S - 1 send W chunks each (S = cdiv(P cdiv(HIDDEN, 6 LINES), W)); the next programs
     receive one row each."""

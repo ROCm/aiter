@@ -39,6 +39,9 @@ _FUSED_AR_RMS_QUANT_ALIASES = {
     "per-token": "per_token",
     "per_token": "per_token",
     "per_token_fp8": "per_token",
+    "mxfp8": "mxfp8",
+    "mxfp8_per_1x32": "mxfp8",
+    "per_1x32_mxfp8": "mxfp8",
     "fp8_per_group": "per_group",
     "per-group": "per_group",
     "per_group": "per_group",
@@ -52,7 +55,7 @@ _FUSED_AR_RMS_QUANT_ALIASES = {
 }
 
 
-def _normalize_fused_ar_rms_quant_type(quant_type):
+def _normalize_fused_ar_rms_quant_type(quant_type: Any) -> str:
     if isinstance(quant_type, str):
         normalized = _FUSED_AR_RMS_QUANT_ALIASES.get(quant_type.lower())
         if normalized is not None:
@@ -70,7 +73,8 @@ def _normalize_fused_ar_rms_quant_type(quant_type):
             pass
     raise ValueError(
         "unsupported fused AR+RMSNorm quant_type="
-        f"{quant_type!r}; expected per_token, per_group/per_1x128, or mxfp4/per_1x32"
+        f"{quant_type!r}; expected per_token, mxfp8, per_group/per_1x128, "
+        "or mxfp4/per_1x32"
     )
 
 
@@ -95,17 +99,19 @@ _MXFP4_QUANT_VALUES = frozenset(
 )
 
 
-def _is_per_group_quant(quant_type):
+def _is_per_group_quant(quant_type: Any) -> bool:
     if isinstance(quant_type, str):
         return quant_type.lower() in _PER_GROUP_QUANT_ALIASES
     return getattr(quant_type, "value", quant_type) in _PER_GROUP_QUANT_VALUES
 
 
-def _canonical_fused_ar_rms_quant_type(quant_type):
-    """Trace-safe canonical string ("per_token"/"per_group"/"mxfp4").
+def _canonical_fused_ar_rms_quant_type(quant_type: Any) -> str:
+    """Return a trace-safe canonical quantization family.
 
     Reduces the pybind enum via int ``.value`` (never ``enum == enum``, which
-    graph-breaks Dynamo) so downstream string guards match under torch.compile.
+    graph-breaks Dynamo) so downstream string guards match under
+    ``torch.compile``. ``QuantType.per_1x32`` remains MXFP4 because the enum
+    does not carry the value dtype; native MXFP8 uses an explicit string alias.
     """
     if isinstance(quant_type, str):
         return _normalize_fused_ar_rms_quant_type(quant_type)
@@ -118,7 +124,8 @@ def _canonical_fused_ar_rms_quant_type(quant_type):
         return "mxfp4"
     raise ValueError(
         "unsupported fused AR+RMSNorm quant_type="
-        f"{quant_type!r}; expected per_token, per_group/per_1x128, or mxfp4/per_1x32"
+        f"{quant_type!r}; expected per_token, mxfp8, per_group/per_1x128, "
+        "or mxfp4/per_1x32"
     )
 
 
@@ -201,15 +208,17 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     transpose_scale: bool = False,
     gemma_norm: bool = False,
     hadamard_rotate: bool = False,
-):
+) -> tuple[torch.Tensor, ...]:
     """Fused tensor-parallel all-reduce + RMSNorm + quantization.
 
     ``quant_type`` selects the quantization epilogue:
     ``"per_token"`` for existing FP8 per-token quantization,
+    ``"mxfp8"`` for E4M3 values with row-major group-32 E8M0 scales,
     ``"per_group"`` / ``"per_1x128"`` for FP8 per-group quantization, and
     ``"mxfp4"`` / ``"per_1x32"`` for MXFP4 quantization.
 
-    ``group_size`` is the per-group quantization block size (per-group only).
+    ``group_size`` is the quantization block size for per-group FP8 and must be
+    32 for MXFP8.
 
     ``transpose_scale`` (per-group only) writes the per-group scale in
     column-major layout ``(num_groups, M)`` viewed as ``(M, num_groups)``,
@@ -228,6 +237,14 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_quant(
     quant_type = _canonical_fused_ar_rms_quant_type(quant_type)
     if hadamard_rotate and quant_type != "mxfp4":
         raise ValueError("hadamard_rotate is MXFP4-only")
+    if quant_type == "mxfp8":
+        if group_size != 32:
+            raise ValueError("mxfp8 requires group_size=32")
+        if emit_bf16 or transpose_scale or hadamard_rotate:
+            raise ValueError(
+                "mxfp8 does not support emit_bf16, transpose_scale, "
+                "or hadamard_rotate"
+            )
 
     # Per-group has its own traceable torch.library method; the generic path would
     # hit raw pybind and graph-break.
@@ -268,7 +285,7 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant(
     emit_bf16: bool = False,
     gemma_norm: bool = False,
     hadamard_rotate: bool = False,
-):
+) -> tuple[torch.Tensor, ...]:
     return tensor_model_parallel_fused_allreduce_rmsnorm_quant(
         input_,
         residual_inp_,
@@ -279,6 +296,27 @@ def tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant(
         emit_bf16=emit_bf16,
         gemma_norm=gemma_norm,
         hadamard_rotate=hadamard_rotate,
+    )
+
+
+def tensor_model_parallel_fused_allreduce_rmsnorm_mxfp8_quant(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    prefill_support: bool = False,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run fused AR + RMSNorm + native group-32 MXFP8 quantization."""
+    return tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+        input_,
+        residual_inp_,
+        weight_,
+        eps,
+        prefill_support,
+        quant_type="mxfp8",
+        group_size=32,
+        gemma_norm=gemma_norm,
     )
 
 
