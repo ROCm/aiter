@@ -1038,11 +1038,17 @@ jobs:
           bash -c "python3 -m pytest -q tests"
 
       - name: Tests
-        timeout-minutes: 90
+        timeout-minutes: 120
+        env:
+          AITER_MOE_2STAGE_FULL_MATRIX: >-
+            ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+              && matrix.label == 'MI35X'
+              && 'true' || 'false' }}
         run: |
           set -ex
           docker exec \
           -w /workspace \
+          -e AITER_MOE_2STAGE_FULL_MATRIX \
           aiter_test \
           bash -c "SHARD_TOTAL=${{ matrix.shard_total }} SHARD_IDX=${{ matrix.shard_idx }} ./.github/scripts/aiter_test.sh"
 
@@ -1063,6 +1069,18 @@ jobs:
             tuned_op_bench.csv
           if-no-files-found: warn
           retention-days: 7
+
+      - name: Upload MoE 2-stage full matrix log
+        if: >-
+          always() &&
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
+          matrix.label == 'MI35X'
+        uses: actions/upload-artifact@v4
+        with:
+          name: moe-2stage-full-matrix-log-${{ github.run_id }}
+          path: full_matrix.log
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Cleanup container
         if: always()
