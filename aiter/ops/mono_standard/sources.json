@@ -1,0 +1,16 @@
+{
+  "atom_helpers.py": {
+    "sha256": "78f02467def3bef464e69c82e3cebde61b708ad262cf8ae2f3310d8628becff2",
+    "origin": "ATOM frozen handoff ceil_pow2_code and window_row function excerpts; FP8 constants bound explicitly to the gfx1250 E4M3FN operator contract"
+  },
+  "sources/rope_window_mono.py": {
+    "sha256": "8f5f75c621cdcfb190435546cc2bc230aeab1d6237f0b9d632ac03316b33b333",
+    "handoff_sha256": "07d8a8910cb53650b760631e13a13077cc0e3cdbc1ba750a2fe085d9c75c6c72",
+    "migration": "package imports only"
+  },
+  "sources/inverse_rope_group_quant_mono.cu": {
+    "sha256": "8d6e3f86ebcfec041522ccd4dfd60f7695345c5fdfa495cbcfecb614f12f4a95",
+    "handoff_sha256": "8d6e3f86ebcfec041522ccd4dfd60f7695345c5fdfa495cbcfecb614f12f4a95",
+    "migration": "byte-identical"
+  }
+}
