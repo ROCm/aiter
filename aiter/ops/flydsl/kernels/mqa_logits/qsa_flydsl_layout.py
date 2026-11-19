@@ -6,12 +6,13 @@ Per index head the score is a GEMM, S_h = q[:, h, :] @ K^T, on bf16 MFMA
 16x16x16 (gfx942) or 16x16x32 (gfx950); ReLU is applied per head before the
 heads are summed.
 
-One block = 4 waves (256 threads) owns 64 query rows x 64 compressed groups
-(4 pages). Wave 0 derives the block's request range and largest visible count
-with a shuffle reduction; a block none of whose rows sees its first column
-exits before reading Q (top-k reads each row only over [0, visible), so those
-logits are never read). Otherwise each wave keeps its 16 rows of Q for all
-heads in VGPRs, and per request present in the block the 4 pages of K are
+One block = 4 waves (256 threads) owns 64 query rows and `n_col_tiles`
+consecutive groups of 64 compressed columns. Wave 0 derives the block's
+request range and largest visible count with a shuffle reduction; a block
+none of whose rows sees its first column exits before reading Q (top-k reads
+each row only over [0, visible), so those logits are never read). Otherwise
+each wave keeps its 16 rows of Q for all heads in VGPRs across those column
+tiles, and per request present in the block the 4 pages of K are
 staged in LDS (row stride 136 bf16) and consumed page by page with one
 accumulator. Q and K share a head-dim permutation (lane group g, k-step s ->
 dims 32g + (K/4)s + [0..K/4), K the MFMA depth) so every lane reads 32
@@ -28,7 +29,7 @@ import flydsl.expr as fx
 import torch
 from flydsl.compiler.protocol import dsl_size_of as sizeof
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
 from ..tensor_shim import _run_compiled
 
@@ -60,16 +61,20 @@ def _qsa_logits_layout_kernel(
     width: fx.Int32,
     inv_divisor: fx.Constexpr[float],
     mfma_k: fx.Constexpr[int],
+    n_col_tiles: fx.Constexpr[int],
 ):
     tid = fx.thread_idx.x
     bid = fx.block_idx.x
     wave_id = tid // 64
     lane_id = tid % 64
+    # One block keeps Q and walks n_col_tiles consecutive 64-column tiles.
+    col_tiles = (num_columns + BN - 1) // BN
+    col_groups = (col_tiles + n_col_tiles - 1) // n_col_tiles
     block_layout = fx.make_layout(
-        ((rows + BM - 1) // BM, (num_columns + BN - 1) // BN),
-        ((num_columns + BN - 1) // BN, 1),
+        ((rows + BM - 1) // BM, col_groups),
+        (col_groups, 1),
     )
-    bidm, bidn = fx.idx2crd(bid, block_layout).unpack()
+    bidm, bidg = fx.idx2crd(bid, block_layout).unpack()
 
     def get_buffer_ptr(tensor, num_elem):
         return fx.rocdl.make_buffer_ptr(
@@ -147,7 +152,7 @@ def _qsa_logits_layout_kernel(
         block_info[2] = red_vis
         gstore(
             visible_out_ptr,
-            byte_offset=(row_valid & (bidn == 0)).select(
+            byte_offset=(row_valid & (bidg == 0)).select(
                 row_thread * sizeof(fx.Int32), 0x7FFFFFFF
             ),
             vec=fx.Vector.from_elements([vis_out], dtype=fx.Int32),
@@ -156,7 +161,7 @@ def _qsa_logits_layout_kernel(
         )
         gstore(
             row_starts_ptr,
-            byte_offset=(row_valid & (bidn == 0)).select(
+            byte_offset=(row_valid & (bidg == 0)).select(
                 row_thread * sizeof(fx.Int32), 0x7FFFFFFF
             ),
             vec=fx.Vector.from_elements([0], dtype=fx.Int32),
@@ -174,9 +179,9 @@ def _qsa_logits_layout_kernel(
     req_low = no_valid.select(0, req_low)
     req_high = no_valid.select(0, req_high)
 
-    # first column of this block
-    col0 = bidn * 64
-    page0 = col0 // PAGE_SIZE
+    # first column of this block's first tile. Later tiles add 64 columns each.
+    tile_base = bidg * fx.Int32(n_col_tiles)
+    col0_first = tile_base * fx.Int32(BN)
     # a block owns 64 rows, a wave 16 rows, each row has 4 heads
     q = fx.make_view(
         fx.get_iter(
@@ -258,7 +263,8 @@ def _qsa_logits_layout_kernel(
         copy_q.partition_S(q_head0123_wave[i]) for i in fx.range_constexpr(4)
     ]
 
-    logits = fx.flat_divide(logits, (64, 64))[None, None, bidm, bidn]
+    # The C fragment only needs the tile shape; stores address logits directly.
+    logits = fx.flat_divide(logits, (64, 64))[None, None, bidm, 0]
     logits = fx.flat_divide(logits, (16, 64))[
         None, None, wave_id, 0
     ]  # [64,64]->[16,64,4,1], the slice of logits this wave owns
@@ -327,11 +333,11 @@ def _qsa_logits_layout_kernel(
         copy_k.retile(k_frag[kk]) for kk in fx.range_constexpr(MFMA_K_LOOPS)
     ]
 
-    # Early exit: no row of the block sees col0 or beyond, and top-k reads each row only over [0, visible), so the block computes and writes nothing.
+    # Early exit: no row of the block sees its first tile, and top-k reads each row only over [0, visible), so the block computes and writes nothing.
     # Q is loaded inside the if too, so skipped blocks never read it. Inside the if, methods on outside objects are equally off limits,
     # and loop variables need names not used outside it (qh / qs)
-    if col0 < vis_max:
-        # Q depends only on the rows: load it into registers once, outside the request loop
+    if col0_first < vis_max:
+        # Q depends only on the rows: load it once and reuse it across the column tiles.
         for qh in fx.range_constexpr(4):
             for qs in fx.range_constexpr(MFMA_K_LOOPS):
                 fx.copy(
@@ -340,82 +346,100 @@ def _qsa_logits_layout_kernel(
                     dst=q_frag_retiled[qh][qs],
                 )
 
-        # collective load k to lds
-        for reqid in range(req_low, req_high + 1):
-            reqid = fx.Int32(reqid)
-            page_ok = []
-            for page_offset in fx.range_constexpr(4):
-                logical_page = page0 + page_offset
-                logical_page_valid = logical_page < width
-                logical_page = logical_page_valid.select(logical_page, 0)
-                physical_page = page_table[reqid, logical_page]
-                physical_page_valid = (physical_page >= 0) & (physical_page < num_pages)
-                physical_page = physical_page_valid.select(physical_page, 0)
-                page_ok.append(physical_page_valid & logical_page_valid)
-                fx.copy(
-                    g2r_atom,
-                    src=kc_thr[None, None, None, physical_page],
-                    dst=k_reg[page_offset],
-                )
-            for page_offset in fx.range_constexpr(4):
-                fx.copy(
-                    r2s_atom,
-                    src=k_reg[page_offset],
-                    dst=k_lds_thr[None, None, None, page_offset],
-                )
-            # all 4 pages of K are in LDS
-            # MFMA: each wave's Q fragments against all 4 K pages
-            fx.gpu.barrier()
-            NEG_INF = fx.Float32(float("-inf"))
-            DROP = fx.Int32(0x7FFFFFFF)
-            r_grp = lane_id // 16  # C fragment: row = 4*r_grp + jr
-            c_in = lane_id % 16  #             column = c_in
-            # the 4 rows this lane writes: row, visible count, valid, and whether this pass writes it
-            own = []
-            for jr in fx.range_constexpr(4):
-                row_local = (
-                    wave_id * 16 + r_grp * 4 + jr
-                )  # row within the block (0..63)
-                tag = row_valid_tag[row_local]
-                valid = (tag >= 0) & (tag < num_requests)
-                invalid = (tag != -999) & ((tag < 0) | (tag >= num_requests))
-                owned = (valid & (tag == reqid)) | (invalid & (reqid == req_low))
-                own.append((row0 + row_local, row_vis[row_local], valid, owned))
+        # A one-iteration runtime loop still costs time on the short launches,
+        # so that specialization calls the body directly. Larger counts stay a
+        # runtime loop: unrolling them duplicates the MFMA body.
+        def score_tile(tile):
+            bidn = tile_base + tile
+            col0 = bidn * fx.Int32(BN)
+            # A partial last group, or a tile past every row's visible count, stores nothing.
+            if (bidn < col_tiles) & (col0 < vis_max):
+                page0 = col0 // PAGE_SIZE
+                for reqid in range(req_low, req_high + 1):
+                    reqid = fx.Int32(reqid)
+                    page_ok = []
+                    for page_offset in fx.range_constexpr(4):
+                        logical_page = page0 + page_offset
+                        logical_page_valid = logical_page < width
+                        logical_page = logical_page_valid.select(logical_page, 0)
+                        physical_page = page_table[reqid, logical_page]
+                        physical_page_valid = (physical_page >= 0) & (
+                            physical_page < num_pages
+                        )
+                        physical_page = physical_page_valid.select(physical_page, 0)
+                        page_ok.append(physical_page_valid & logical_page_valid)
+                        fx.copy(
+                            g2r_atom,
+                            src=kc_thr[None, None, None, physical_page],
+                            dst=k_reg[page_offset],
+                        )
+                    for page_offset in fx.range_constexpr(4):
+                        fx.copy(
+                            r2s_atom,
+                            src=k_reg[page_offset],
+                            dst=k_lds_thr[None, None, None, page_offset],
+                        )
+                    # all 4 pages of K are in LDS
+                    # MFMA: each wave's Q fragments against all 4 K pages
+                    fx.gpu.barrier()
+                    NEG_INF = fx.Float32(float("-inf"))
+                    DROP = fx.Int32(0x7FFFFFFF)
+                    r_grp = lane_id // 16  # C fragment: row = 4*r_grp + jr
+                    c_in = lane_id % 16  #             column = c_in
+                    # the 4 rows this lane writes
+                    own = []
+                    for jr in fx.range_constexpr(4):
+                        row_local = wave_id * 16 + r_grp * 4 + jr
+                        tag = row_valid_tag[row_local]
+                        valid = (tag >= 0) & (tag < num_requests)
+                        invalid = (tag != -999) & ((tag < 0) | (tag >= num_requests))
+                        owned = (valid & (tag == reqid)) | (invalid & (reqid == req_low))
+                        own.append(
+                            (row0 + row_local, row_vis[row_local], valid, owned)
+                        )
 
-            # page outer, head middle, k step inner: one accumulator at a time, each page written back when done
-            for pg in fx.range_constexpr(4):
-                for kk in fx.range_constexpr(MFMA_K_LOOPS):
-                    fx.copy(
-                        copy_k_lds_frag,
-                        src=k_lds_tile0123[pg][None, None, None, kk],
-                        dst=k_frag_retiled[kk],
-                    )
-                score = None
-                for hd in fx.range_constexpr(4):
-                    acc[0].fill(0.0)
-                    for kk in fx.range_constexpr(MFMA_K_LOOPS):
-                        fx.gemm(thr_mma, acc[0], q_frag[hd][kk], k_frag[kk], acc[0])
-                    v = acc[0].load()
-                    v = v.maximumf(fx.Vector.zeros_like(v))  # ReLU per head
-                    score = v if score is None else score + v  # then sum over heads
-                score = score * inv_divisor
+                    # page outer, head middle, k step inner
+                    for pg in fx.range_constexpr(4):
+                        for kk in fx.range_constexpr(MFMA_K_LOOPS):
+                            fx.copy(
+                                copy_k_lds_frag,
+                                src=k_lds_tile0123[pg][None, None, None, kk],
+                                dst=k_frag_retiled[kk],
+                            )
+                        score = None
+                        for hd in fx.range_constexpr(4):
+                            acc[0].fill(0.0)
+                            for kk in fx.range_constexpr(MFMA_K_LOOPS):
+                                fx.gemm(
+                                    thr_mma, acc[0], q_frag[hd][kk], k_frag[kk], acc[0]
+                                )
+                            v = acc[0].load()
+                            v = v.maximumf(fx.Vector.zeros_like(v))  # ReLU per head
+                            score = v if score is None else score + v
+                        score = score * inv_divisor
 
-                col = col0 + pg * 16 + c_in
-                for jr in fx.range_constexpr(4):
-                    row, vis, valid, owned = own[jr]
-                    keep = valid & (col < vis) & page_ok[pg]
-                    val = keep.select(fx.Float32(score[jr]), NEG_INF)
-                    off = (owned & (col < num_columns)).select(
-                        (row * num_columns + col) * 4, DROP
-                    )
-                    gstore(
-                        logits_ptr,
-                        off,
-                        fx.Vector.from_elements([val], dtype=fx.Float32),
-                        1,
-                        fx.Float32,
-                    )
-            fx.gpu.barrier()  # every wave is done with this pass's K before the next pass overwrites LDS
+                        col = col0 + pg * 16 + c_in
+                        for jr in fx.range_constexpr(4):
+                            row, vis, valid, owned = own[jr]
+                            keep = valid & (col < vis) & page_ok[pg]
+                            val = keep.select(fx.Float32(score[jr]), NEG_INF)
+                            off = (owned & (col < num_columns)).select(
+                                (row * num_columns + col) * 4, DROP
+                            )
+                            gstore(
+                                logits_ptr,
+                                off,
+                                fx.Vector.from_elements([val], dtype=fx.Float32),
+                                1,
+                                fx.Float32,
+                            )
+                    fx.gpu.barrier()  # done with this pass's K before the next overwrites LDS
+
+        if fx.const_expr(n_col_tiles == 1):
+            score_tile(fx.Int32(0))
+        else:
+            for tile in range(fx.Int32(n_col_tiles)):
+                score_tile(tile)
 
 
 @flyc.jit
@@ -437,6 +461,7 @@ def _qsa_logits_layout_launch(
     grid: fx.Int32,
     inv_divisor: fx.Constexpr[float],
     mfma_k: fx.Constexpr[int],
+    n_col_tiles: fx.Constexpr[int],
     stream: fx.Stream,
 ):
     _qsa_logits_layout_kernel(
@@ -456,6 +481,7 @@ def _qsa_logits_layout_launch(
         width,
         inv_divisor,
         mfma_k,
+        n_col_tiles,
     ).launch(grid=(grid, 1, 1), block=(BLOCK_SIZE, 1, 1), stream=stream)
 
 
@@ -465,6 +491,23 @@ _MAX_BYTES = 2**31 - 1
 
 def _cdiv(a: int, b: int) -> int:
     return -(-a // b)
+
+
+# Measured on gfx950: grouping column tiles pays off while the launch still has
+# about two blocks per CU, and costs time once it drops below that.
+_MIN_BLOCKS_PER_CU = 2
+_COL_TILE_CHOICES = (8, 4, 2, 1)
+
+
+def _n_col_tiles_for(rows: int, columns: int) -> int:
+    """Largest of 1, 2, 4, 8 that still leaves two blocks per CU."""
+    row_blocks = _cdiv(rows, BM)
+    col_tiles = _cdiv(columns, BN)
+    min_blocks = get_cu_num() * _MIN_BLOCKS_PER_CU
+    for n in _COL_TILE_CHOICES:
+        if row_blocks * _cdiv(col_tiles, n) >= min_blocks:
+            return n
+    return 1
 
 
 def _check_supported(
@@ -513,11 +556,20 @@ def qsa_paged_mqa_logits_flydsl(
     logits: torch.Tensor,
     visible_groups: torch.Tensor,
     row_starts: torch.Tensor | None,
+    n_col_tiles: int | None = None,
 ) -> None:
     """Fill `logits` [rows, columns] fp32 over each row's [0, visible) and
-    `visible_groups` [rows] int32 in place."""
+    `visible_groups` [rows] int32 in place.
+
+    ``n_col_tiles`` is how many 64-column tiles a block walks while holding Q.
+    ``None`` picks the largest of 1, 2, 4, 8 that still launches two blocks per CU.
+    """
     rows, columns = logits.shape
     _check_supported(q, compressed_k_cache, page_table, compress_ratio, columns)
+    if n_col_tiles is None:
+        n_col_tiles = _n_col_tiles_for(rows, columns)
+    elif n_col_tiles < 1:
+        raise ValueError(f"n_col_tiles must be >= 1, got {n_col_tiles}")
     if row_starts is None:
         row_starts = torch.empty(rows, dtype=torch.int32, device=q.device)
     # The kernel reads int32 indices and uses `width` as the page-table row stride.
@@ -544,9 +596,10 @@ def qsa_paged_mqa_logits_flydsl(
         compressed_k_cache.shape[0],
         page_table.shape[0],
         page_table.shape[1],
-        _cdiv(rows, BM) * _cdiv(columns, BN),
+        _cdiv(rows, BM) * _cdiv(_cdiv(columns, BN), n_col_tiles),
         inv_divisor,
         mfma_k,
+        n_col_tiles,
         torch.cuda.current_stream(),
-        specialization_key=(inv_divisor, mfma_k),
+        specialization_key=(inv_divisor, mfma_k, n_col_tiles),
     )
