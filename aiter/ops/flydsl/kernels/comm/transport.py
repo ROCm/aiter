@@ -5,7 +5,7 @@
 
 This module contains the tile geometry, the inbox cache-policy table, the peer
 store and load primitives, and the LDS staging factory. The limits and the
-policy records are in ``allreduce_policy``.
+policy records are in ``aiter.ops.flydsl.allreduce_policy``.
 """
 
 import logging
@@ -16,13 +16,13 @@ from flydsl.expr.typing import T, as_ir_value
 
 logger = logging.getLogger("aiter")
 
+# Tile geometry
+# =============
+
 WORLD = 8  # Default value for world size
 BLOCK = 256
 ATOMS = 8
 TILE_BYTES = BLOCK * ATOMS * 16
-TILE_I32 = TILE_BYTES // 4
-TILE_FP16 = TILE_BYTES // 2
-DEFAULT_GRID_CAP = 304 * 4
 WAVE = 64
 WAVES = BLOCK // WAVE
 # 4 lanes × 16 B = one 64 B NT sector. Not world_size.
@@ -36,7 +36,6 @@ I32_BYTES = 4
 FLAG_LANES = 8
 FLAG_I32_PER_LANE = 2
 
-
 # Buffer aux bits on gfx942/gfx950. This is LLVM's CPol encoding, which the
 # backend renames for CDNA: bit 0 (GLC) prints as `sc0`, bit 1 (SLC) as `nt`,
 # bit 4 (SCC) as `sc1`. Bit 2 exists in the encoding but CDNA has no use for
@@ -45,10 +44,10 @@ _CM_SC0 = 1
 _CM_NT = 2
 _CM_SC1 = 16
 
-# Cache policy for the ring and one-shot loads from our own inbox, on every
-# inbox memory type. A peer wrote these lines microseconds ago, so a cache hit
-# is a stale hit. ``nt`` (the fine-grained ``recv`` entry below) is only a
-# reuse hint; ``sc0 sc1`` sends the load to memory.
+# Cache policy for the loads of a rank-tile from our own inbox, in the one-shot
+# and the ring, on every inbox type. These loads need a cache bypass: with
+# ``sc0 sc1`` it goes to memory. The ``recv`` entry of ``_INBOX_POLICY`` is
+# ``nt`` on a fine-grained inbox, which is only a reuse hint.
 _RECV_POLICY = _CM_SC0 | _CM_SC1
 
 # Cache policy for each inbox memory type
@@ -72,7 +71,7 @@ _RECV_POLICY = _CM_SC0 | _CM_SC1
 # The table is the policy of the flag-based mesh. The ring uses
 # ``_RECV_POLICY`` instead of ``recv``. The one-shot has no flag and no
 # acquire: it polls the payload itself for a sentinel, and so it loads every
-# payload with ``_RECV_POLICY`` on both memory types, and it does not use
+# payload with ``_CM_SC0 | _CM_SC1`` on both memory types, and it does not use
 # the ``acquire`` or ``recv`` entries.
 #
 # On gfx942/gfx950, the stores lower as follows:
@@ -334,6 +333,25 @@ def _acquire_inbox(scope):
     fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope=scope)
 
 
+def atom_bf16_to_f32(atom_i32):
+    """16 B of bf16 (8 values) -> 8 f32.
+
+    bf16 is the high half of f32, so this is a widening move, not a conversion
+    -- exact, no rounding.
+    """
+    return fx.Vector(atom_i32).bitcast(fx.BFloat16).to(fx.Float32)
+
+
+def atom_f32_to_bf16(acc_f32):
+    """8 f32 -> 16 B of bf16.
+
+    One rounding, at the end of whatever computed *acc_f32*, which is what makes
+    the exact schedules bit-comparable with ``cross_device_reduce``'s fp32
+    accumulate + single downcast.
+    """
+    return acc_f32.to(fx.BFloat16).bitcast(fx.Int32)
+
+
 def make_pack_storage(n_i32: int):
     """LDS staging for *n_i32* packed words, 16 B aligned."""
 
@@ -342,6 +360,32 @@ def make_pack_storage(n_i32: int):
         pack: fx.Array[fx.Int32, n_i32, 16]
 
     return PackStorage
+
+
+def make_hbm_operand(*, padded, nbytes, hbm_i32_ptr, hbm_layout):
+    """``operand(ptr, records=None)``: the handle the atom load/store helpers
+    address an HBM operand through, given its raw ``Int64`` base pointer.
+
+    A padded build hands the pointer back untouched: its pad lanes need a
+    *per-lane* bound, which a whole-tensor descriptor cannot express, so
+    ``make_rowbuf_atom_row`` builds a bounded descriptor per row from it. An
+    unpadded build hands back a tiled-copy tensor (layout + descriptor) whose
+    ``num_records_bytes`` is *records*, the live payload by default, so a
+    partial last tile reads 0 and its stores are dropped rather than faulting.
+
+    ``hbm_i32_ptr``/``hbm_layout`` are only read on the unpadded branch, so a
+    padded build may pass ``None`` for ``hbm_layout`` (it is never built there).
+    The one-shot, mesh and ring kernels all share this verbatim.
+    """
+
+    def _operand(ptr, records=None):
+        if padded:
+            return ptr
+        n = nbytes if records is None else records
+        view = fx.make_view(fx.inttoptr(hbm_i32_ptr, ptr), hbm_layout)
+        return rocdl.make_buffer_tensor(view, max_size=False, num_records_bytes=n)
+
+    return _operand
 
 
 def make_pack_norm_storage(n_i32: int, n_red_f32: int):
