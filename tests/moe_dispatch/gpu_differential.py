@@ -34,6 +34,9 @@ _A8W8_PT_DEFAULT = (
     *((m, 4096, 512, 64, 4, "Silu", True, "bf16", False) for m in (8, 300)),
     *((m, 2048, 256, 64, 6, "Silu", False, "fp16", False) for m in (5, 200)),
     *((m, 7168, 256, 64, 8, "Silu", False, "bf16", True) for m in (16, 512)),
+)  # fmt: skip
+
+_A8W8_PT_GFX942_CU80 = (
     # A shipped gfx942-cu80 row selects the FlyDSL whole-graph implementation.
     (1, 4096, 192, 192, 8, "Silu", False, "bf16", False),
 )  # fmt: skip
@@ -124,10 +127,13 @@ def _synth_rows(table_file, gfx, cu_num, limit):
     return src, cases
 
 
-def cases(path_name, synth_cases=()):
+def cases(path_name, synth_cases=(), gfx=None, cu_num=None):
     if path_name != "a8w8_pt":
         raise SystemExit(f"no GPU cases for path {path_name}")
-    return list(_A8W8_PT_DEFAULT) + list(synth_cases)
+    selected = list(_A8W8_PT_DEFAULT)
+    if (gfx, cu_num) == ("gfx942", 80):
+        selected.extend(_A8W8_PT_GFX942_CU80)
+    return selected + list(synth_cases)
 
 
 def _clear_dispatch_caches():
@@ -185,10 +191,9 @@ def _child(args):
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
     synth_cases = json.loads(os.environ.get("_MOEV2_SYNTH_CASES", "[]"))
-    todo = cases(args.path, [tuple(c) for c in synth_cases])
-    print(
-        f"{get_gfx_runtime()} cu{get_cu_num()} torch {torch.__version__}: {len(todo)} cases"
-    )
+    gfx, cu_num = get_gfx_runtime(), get_cu_num()
+    todo = cases(args.path, [tuple(c) for c in synth_cases], gfx=gfx, cu_num=cu_num)
+    print(f"{gfx} cu{cu_num} torch {torch.__version__}: {len(todo)} cases")
     problems = []
     for case in todo:
         problem = run_case(args.path, case)

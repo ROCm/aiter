@@ -202,7 +202,7 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
     skip = {out_legacy.data_ptr(), out_v2.data_ptr()}
     problems = {}
     for (name, a), (_, b) in zip(legacy, v2):
-        if a.func is not b.func:
+        if a.func != b.func:
             problems[name, ""] = f"{name}: {a.func} vs {b.func}"
             continue
         if len(a.args) != len(b.args) or set(a.keywords) != set(b.keywords):
