@@ -60,10 +60,17 @@ def test_split_bf16x3_limits():
 @pytest.mark.parametrize("M", [1, 3, 16, 32, 33, 64, 127, 256, 1000, 2048, 4096])
 @pytest.mark.parametrize("N, K", SHAPES_NK)
 def test_gemm_a16w32(M, N, K):
-    x, w, w_bf16x3, y = generate_gemm_a16w32_inputs(M, N, K)
-    out = gemm_a16w32(x, w, w_bf16x3, y=y)
+    x, w, _, y = generate_gemm_a16w32_inputs(M, N, K)
+    out = gemm_a16w32(x, w, y=y)
     assert out is y
     _check(out, x, w)
+
+
+@pytest.mark.parametrize("M", [1, 33, 256, 2048, 4096])
+def test_gemm_a16w32_takes_w_bf16x3(M):
+    # vLLM gives the terms as the third argument. The result has the same bits.
+    x, w, w_bf16x3, _ = generate_gemm_a16w32_inputs(M, 128, 6144, output=False)
+    assert torch.equal(gemm_a16w32(x, w, w_bf16x3), gemm_a16w32(x, w))
 
 
 @pytest.mark.parametrize("M", range(1, 34))

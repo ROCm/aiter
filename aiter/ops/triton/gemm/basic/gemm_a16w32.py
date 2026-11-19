@@ -58,7 +58,7 @@ def split_bf16x3(weight: torch.Tensor) -> torch.Tensor:
 def gemm_a16w32_fake_tensor(
     x: torch.Tensor,
     w: torch.Tensor,
-    w_bf16x3: torch.Tensor,
+    w_bf16x3: torch.Tensor | None = None,
     y: torch.Tensor | None = None,
     config: str | None = None,
 ) -> torch.Tensor:
@@ -95,9 +95,10 @@ def _gemm_fma(x, w, y, config):
     )
 
 
-def _gemm_bf16x3(x, w_bf16x3, y, config):
+def _gemm_bf16x3(x, b, y, config):
+    # b is the fp32 weight (N, K), which the kernel splits, or its terms (3, N, K).
     M, K = x.shape
-    N = w_bf16x3.shape[1]
+    N = b.shape[-2]
     compute_splitk_params(config, K)
     block_m, block_n = config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"]
     splits = config["NUM_KSPLIT"]
@@ -116,7 +117,7 @@ def _gemm_bf16x3(x, w_bf16x3, y, config):
         out, fused_splits = y, splits
     _gemm_a16w32_bf16x3_kernel[grid](
         x,
-        w_bf16x3,
+        b,
         out,
         partials,
         counters,
@@ -125,9 +126,9 @@ def _gemm_bf16x3(x, w_bf16x3, y, config):
         K,
         x.stride(0),
         x.stride(1),
-        w_bf16x3.stride(0),
-        w_bf16x3.stride(1),
-        w_bf16x3.stride(2),
+        b.stride(0) if b.dim() == 3 else 0,
+        b.stride(-2),
+        b.stride(-1),
         out.stride(0) if out.dim() == 3 else 0,
         out.stride(-2),
         out.stride(-1),
@@ -162,7 +163,7 @@ def _gemm_bf16x3(x, w_bf16x3, y, config):
 def gemm_a16w32_(
     x: torch.Tensor,
     w: torch.Tensor,
-    w_bf16x3: torch.Tensor,
+    w_bf16x3: torch.Tensor | None = None,
     y: torch.Tensor | None = None,
     config: str | None = None,
 ) -> torch.Tensor:
@@ -173,19 +174,25 @@ def gemm_a16w32_(
 
     - ``"bandwidth_bound"`` (small M): fp32 FMA on W, one row of W in each
       program (``BLOCK_SIZE_N`` is 1). It reads 4 bytes for each weight value.
-    - ``"compute_bound"``: bf16 MFMA on the three bf16 terms of W. Each K step
-      loads the X tile one time and adds the three dots into one fp32
-      accumulator. On gfx950 split-K is in the kernel: the last split of a
-      tile adds the partials in split order. Else a reduce kernel adds them.
+    - ``"compute_bound"``: bf16 MFMA on the three bf16 terms of W. With
+      ``w_bf16x3``, the kernel reads the terms (6 bytes for each weight
+      value). Without it, the kernel splits each W tile into the same terms
+      (4 bytes for each value, but more ALU work). Each K step loads the X tile
+      one time and adds the three dots into one fp32 accumulator. On gfx950
+      split-K is in the kernel: the last split of a tile adds the partials in
+      split order. Else a reduce kernel adds them.
 
     Both kernels match an fp32 GEMM of X and W up to fp32 rounding. The result
-    does not depend on the order in which workgroups finish.
+    does not depend on the order in which workgroups finish, and it is the
+    same with and without ``w_bf16x3``.
 
     Args:
         x (torch.Tensor): BF16 input with shape (M, K).
         w (torch.Tensor): FP32 weight with shape (N, K).
-        w_bf16x3 (torch.Tensor): BF16 terms of w with shape (3, N, K), from
-            split_bf16x3(w).
+        w_bf16x3 (Optional[torch.Tensor]): BF16 terms of w with shape (3, N, K),
+            from split_bf16x3(w). Optional. It uses 1.5 times the memory of w.
+            The bf16x3 kernel reads it when you give it. Without it, the
+            kernel is 3 to 33% slower at N=128, K=6144 on gfx950.
         y (Optional[torch.Tensor]): Pre-allocated FP32 output with shape (M, N).
         config (Optional[str]): Kernel tuning parameters (kernel_type, BLOCK_SIZE_M,
             BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, cache_modifier,
@@ -199,12 +206,15 @@ def gemm_a16w32_(
     do not run one graph on two streams at the same time, or two graphs captured
     on one stream at the same time on different streams. With torch < 2.10, a
     first split-K call on a stream inside a graph capture uses the reduce kernel.
+    Without w_bf16x3, the limits of split_bf16x3 apply to w in the bf16x3 kernel:
+    |w| >= 2**128 - 2**119 gives inf or NaN, and bits under 2**-133 are lost.
     """
     _LOGGER.info("GEMM_A16W32: x.shape=%s, w.shape=%s", tuple(x.shape), tuple(w.shape))
     assert x.dtype == torch.bfloat16 and x.dim() == 2, "bf16 (M, K) x"
     assert w.dtype == torch.float32 and w.dim() == 2, "fp32 (N, K) w"
-    assert w_bf16x3.dtype == torch.bfloat16, "bf16 w_bf16x3"
-    assert w_bf16x3.shape == (3, *w.shape), "w_bf16x3 must be (3, N, K)"
+    if w_bf16x3 is not None:
+        assert w_bf16x3.dtype == torch.bfloat16, "bf16 w_bf16x3"
+        assert w_bf16x3.shape == (3, *w.shape), "w_bf16x3 must be (3, N, K)"
     assert x.shape[1] == w.shape[1], "x and w must have the same K"
 
     M, K = x.shape
@@ -224,14 +234,15 @@ def gemm_a16w32_(
     if kernel_type == "bandwidth_bound":
         _gemm_fma(x, w, y, config)
     else:
-        _gemm_bf16x3(x, w_bf16x3, y, config)
+        # The given terms are faster to read than w is to split.
+        _gemm_bf16x3(x, w if w_bf16x3 is None else w_bf16x3, y, config)
     return y
 
 
 def gemm_a16w32(
     x: torch.Tensor,
     w: torch.Tensor,
-    w_bf16x3: torch.Tensor,
+    w_bf16x3: torch.Tensor | None = None,
     y: torch.Tensor | None = None,
     config: dict | None = None,
 ) -> torch.Tensor:

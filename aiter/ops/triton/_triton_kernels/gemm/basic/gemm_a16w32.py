@@ -15,6 +15,17 @@ from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
+
+@triton.jit
+def _split_bf16x3(w):
+    """The three bf16 terms of fp32 w, largest first, rounded as split_bf16x3 does."""
+    hi = w.to(tl.bfloat16)
+    rest = w - hi.to(tl.float32)
+    mid = rest.to(tl.bfloat16)
+    lo = (rest - mid.to(tl.float32)).to(tl.bfloat16)
+    return hi, mid, lo
+
+
 _gemm_a16w32_bf16x3_repr = make_kernel_repr(
     "_gemm_a16w32_bf16x3_kernel",
     [
@@ -68,21 +79,25 @@ def _gemm_a16w32_bf16x3_kernel(
     EVEN_K: tl.constexpr,
     NUM_XCDS: tl.constexpr,
 ):
-    """C (fp32) = A @ (B[0] + B[1] + B[2])^T, with A (M, K) bf16 and B (3, N, K) bf16.
+    """C (fp32) = A @ (B[0] + B[1] + B[2])^T, with A (M, K) bf16 and the three bf16
+    terms B of W (N, K).
 
-    Each K step loads A once and adds three MFMA dots into one fp32 accumulator.
-    With FUSED_SPLITS > 1, the last split of a tile adds the partials in split
-    order. Else split pid_k writes its partial to c_ptr + pid_k * stride_ck.
+    b_ptr is W in fp32, which the kernel splits after each load as split_bf16x3
+    does, or the terms (3, N, K) in bf16. Each K step loads A once and adds three
+    MFMA dots into one fp32 accumulator. With FUSED_SPLITS > 1, the last split of
+    a tile adds the partials in split order. Else split pid_k writes its partial
+    to c_ptr + pid_k * stride_ck.
     """
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
-    tl.assume(stride_bt > 0)
+    tl.assume(stride_bt >= 0)
     tl.assume(stride_bn > 0)
     tl.assume(stride_bk > 0)
     tl.assume(stride_ck >= 0)
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
 
+    SPLIT_W: tl.constexpr = b_ptr.dtype.element_ty == tl.float32
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     if FUSED_SPLITS > 1:
@@ -129,8 +144,11 @@ def _gemm_a16w32_bf16x3_kernel(
             if EVEN_K:
                 a = tl.load(a_ptrs)
                 b0 = tl.load(b_ptrs, cache_modifier=cache_modifier)
-                b1 = tl.load(b_ptrs + term_stride, cache_modifier=cache_modifier)
-                b2 = tl.load(b_ptrs + 2 * term_stride, cache_modifier=cache_modifier)
+                if not SPLIT_W:
+                    b1 = tl.load(b_ptrs + term_stride, cache_modifier=cache_modifier)
+                    b2 = tl.load(
+                        b_ptrs + 2 * term_stride, cache_modifier=cache_modifier
+                    )
             else:
                 k_left = k_end - (k_start + k * BLOCK_SIZE_K)
                 a = tl.load(a_ptrs, mask=offs_k[None, :] < k_left, other=0.0)
@@ -138,18 +156,21 @@ def _gemm_a16w32_bf16x3_kernel(
                 b0 = tl.load(
                     b_ptrs, mask=b_mask, other=0.0, cache_modifier=cache_modifier
                 )
-                b1 = tl.load(
-                    b_ptrs + term_stride,
-                    mask=b_mask,
-                    other=0.0,
-                    cache_modifier=cache_modifier,
-                )
-                b2 = tl.load(
-                    b_ptrs + 2 * term_stride,
-                    mask=b_mask,
-                    other=0.0,
-                    cache_modifier=cache_modifier,
-                )
+                if not SPLIT_W:
+                    b1 = tl.load(
+                        b_ptrs + term_stride,
+                        mask=b_mask,
+                        other=0.0,
+                        cache_modifier=cache_modifier,
+                    )
+                    b2 = tl.load(
+                        b_ptrs + 2 * term_stride,
+                        mask=b_mask,
+                        other=0.0,
+                        cache_modifier=cache_modifier,
+                    )
+            if SPLIT_W:
+                b0, b1, b2 = _split_bf16x3(b0)
 
             accumulator = tl.dot(a, b0, acc=accumulator)
             accumulator = tl.dot(a, b1, acc=accumulator)
