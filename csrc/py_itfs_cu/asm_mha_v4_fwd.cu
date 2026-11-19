@@ -93,6 +93,19 @@ struct ScalarSlot
     uint32_t padding[3];
 };
 
+// How a THD row that declares kv_range slices each work-group's key walk: slice i writes its
+// normalized O at ptr_o + i * o_stride and its LSE at ptr_lse + i * lse_stride, both in bytes, for
+// the caller to merge by LSE. Left zero, the row walks its keys once and writes in place.
+// cu_budget is read only by a row that declares pair_split: the CUs a causal pair's kv_splits + 1
+// work-groups must fit; left zero, such a row runs every pair on kv_splits work-groups.
+struct KvSplitSlot
+{
+    uint32_t count;
+    uint32_t o_stride;
+    uint32_t lse_stride;
+    uint32_t cu_budget;
+};
+
 // Fixed-width slots reproduce the 656-byte kernarg layout embedded in MHA v4 code objects.
 struct __attribute__((packed)) FmhaV4Kernarg
 {
@@ -128,7 +141,9 @@ struct __attribute__((packed)) FmhaV4Kernarg
     ConstPointerSlot ptr_qseq;
     ConstPointerSlot ptr_kseq;
     ScalarSlot s_lse_Hs;
-    ConstPointerSlot ptr_qseq_padding;
+    // ptr_qseq_padding in the v1 layout. THD rows, whose documents carry no padding, read their
+    // KV split from it.
+    KvSplitSlot kv_split;
     ConstPointerSlot ptr_kseq_padding;
     ConstPointerSlot ptr_q_descale;
     ConstPointerSlot ptr_k_descale;
@@ -147,6 +162,10 @@ static_assert(offsetof(FmhaV4Kernarg, ptr_q) == 0x010);
 static_assert(offsetof(FmhaV4Kernarg, ptr_k) == 0x020);
 static_assert(offsetof(FmhaV4Kernarg, ptr_v) == 0x030);
 static_assert(offsetof(FmhaV4Kernarg, scalar) == 0x050);
+static_assert(offsetof(FmhaV4Kernarg, kv_split) == 0x1E0);
+static_assert(offsetof(KvSplitSlot, o_stride) == 0x4 && offsetof(KvSplitSlot, lse_stride) == 0x8);
+static_assert(offsetof(KvSplitSlot, cu_budget) == 0xC);
+static_assert(sizeof(KvSplitSlot) == sizeof(ConstPointerSlot));
 static_assert(offsetof(FmhaV4Kernarg, ptr_q_descale) == 0x200);
 static_assert(offsetof(FmhaV4Kernarg, ptr_k_descale) == 0x210);
 static_assert(offsetof(FmhaV4Kernarg, ptr_v_descale) == 0x220);
@@ -343,20 +362,21 @@ void check_lut_capacity(const fmha_v4_fwdConfig& cfg, int64_t kv_tiles, const ch
 // A block-sparse caller therefore names the geometry it prepared its operands for, so a missing row
 // is an error rather than silently whichever row the manifest listed first.
 //
-// 0 means "any", which is what the dense path passes. Dense builds no mask, so its geometry is an
-// implementation detail of the row -- and it genuinely varies (bf16 tiles 256x64 where the
-// quantized rows tile 256x128), so there is nothing for a dense caller to name.
+// 0 means "any", which is what the dense and THD paths pass. Neither builds a block mask, so the
+// geometry is an implementation detail of the row -- and it genuinely varies (bf16 tiles 256x64
+// where the quantized rows tile 256x128), so there is nothing for such a caller to name.
 const fmha_v4_fwdConfig& find_config(const std::string& arch,
                                      const MhaV4Recipe& recipe,
                                      int64_t mode,
                                      int64_t head_dim,
                                      int64_t ts_qo,
-                                     int64_t ts_kv)
+                                     int64_t ts_kv,
+                                     int64_t mask = 0)
 {
     // cfg_fmha_v4_fwd is an unordered_map, so "first row that matches" is only well defined when at
     // most one row can match. That holds for dense, but gfx950 now has two block-sparse FP8 rows
     // per mode, so leaving the geometry unnamed there would pick a tile by hash order.
-    TORCH_CHECK(mode == 0 || (ts_qo != 0 && ts_kv != 0),
+    TORCH_CHECK(mode == 0 || mode == 3 || (ts_qo != 0 && ts_kv != 0),
                 "block-sparse MHA v4 (mode=",
                 mode,
                 ") requires an explicit q_tile/kv_tile: several tile geometries can serve one "
@@ -370,7 +390,7 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
            cfg.k_scale_mode == recipe.k_scale_mode && cfg.v_scale_mode == recipe.v_scale_mode &&
            cfg.o_format == format_id(AttentionFormat::Bf16) &&
            cfg.o_scale_mode == scale_mode_id(AttentionScaleMode::None) && cfg.hdim_q == head_dim &&
-           cfg.hdim_v == head_dim && cfg.mask == 0 && cfg.mode == mode &&
+           cfg.hdim_v == head_dim && cfg.mask == mask && cfg.mode == mode &&
            (ts_qo == 0 || cfg.ts_qo == ts_qo) && (ts_kv == 0 || cfg.ts_kv == ts_kv))
             return cfg;
     }
@@ -395,7 +415,9 @@ const fmha_v4_fwdConfig& find_config(const std::string& arch,
                 head_dim,
                 ", mode=",
                 mode,
-                " (0=dense, 1=sorted-sparse, 2=sol-attn), tile=",
+                " (0=dense, 1=sorted-sparse, 2=sol-attn, 3=thd), mask=",
+                mask,
+                " (0=none, 1=causal), tile=",
                 ts_qo,
                 "x",
                 ts_kv);
@@ -605,6 +627,47 @@ uint32_t fit_u32(int64_t value, const char* name)
 uint32_t byte_stride(const at::Tensor& tensor, int64_t dim, const char* name)
 {
     return fit_u32(tensor.stride(dim) * tensor.element_size(), name);
+}
+
+// Load the row's code object once per process and launch it on the current stream. One cache
+// serves every mode: a row is one (arch, symbol, object) whichever launcher dispatches it.
+void launch_row(const std::string& arch,
+                const fmha_v4_fwdConfig& cfg,
+                void* args,
+                size_t arg_size,
+                int64_t gdx,
+                int64_t gdy,
+                int64_t gdz)
+{
+    // The launch ABI takes each grid dimension as an int; a larger one would wrap, not fault.
+    for(const int64_t dim : {gdx, gdy, gdz})
+    {
+        TORCH_CHECK(dim >= 0 && dim <= std::numeric_limits<int>::max(),
+                    "MHA v4 row ",
+                    cfg.knl_name,
+                    " would launch a ",
+                    gdx,
+                    "x",
+                    gdy,
+                    "x",
+                    gdz,
+                    " grid, which does not fit the launch ABI; this shape is too large");
+    }
+    static SynchronizedCache<std::string, AiterAsmKernel> kernels;
+    const std::string cache_key = arch + "|" + cfg.knl_name + "|" + cfg.co_name;
+    auto& kernel                = kernels.get_or_create(
+        cache_key, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
+
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+    kernel.launch_kernel({args,
+                          &arg_size,
+                          static_cast<int>(gdx),
+                          static_cast<int>(gdy),
+                          static_cast<int>(gdz),
+                          workgroup_size_for(cfg),
+                          1,
+                          1,
+                          stream});
 }
 
 void set_descale_strides(const at::Tensor& tensor,
@@ -1078,6 +1141,9 @@ struct PackedMhaV4Shapes
 // s_lse_Hs, and writes nothing past seqlen_q. The batch stride is therefore not independently
 // settable, and a head stride below seqlen_q -- an expanded view's 0, say -- writes the rows over
 // each other. Only a contiguous [batch, nhead_q, seqlen_q] tensor is safe on every count.
+//
+// A THD row has no batch axis: it writes head h's total_tokens floats at ptr_lse + h * s_lse_Hs,
+// once per KV slice, so its caller passes the slice count as `batch` and names the `layout`.
 void set_lse_kernarg(FmhaV4Kernarg& args,
                      const std::optional<at::Tensor>& lse,
                      const fmha_v4_fwdConfig& cfg,
@@ -1085,7 +1151,8 @@ void set_lse_kernarg(FmhaV4Kernarg& args,
                      int64_t batch,
                      int64_t nhead_q,
                      int64_t seqlen_q,
-                     const char* mode_name)
+                     const char* mode_name,
+                     const char* layout = "[batch, nhead_q, seqlen_q]")
 {
     if(!lse.has_value())
     {
@@ -1106,7 +1173,9 @@ void set_lse_kernarg(FmhaV4Kernarg& args,
     TORCH_CHECK(t.dim() == 3 && t.size(0) == batch && t.size(1) == nhead_q &&
                     t.size(2) == seqlen_q,
                 mode_name,
-                " MHA v4 LSE must be [batch, nhead_q, seqlen_q] = [",
+                " MHA v4 LSE must be ",
+                layout,
+                " = [",
                 batch,
                 ", ",
                 nhead_q,
@@ -1437,17 +1506,140 @@ void fmha_v4_fwd(const at::Tensor& q,
         args.ptr_kseq.value = seqlens_k->data_ptr();
     }
 
-    static SynchronizedCache<std::string, AiterAsmKernel> kernels;
-    const std::string cache_key = arch + "|" + cfg.knl_name + "|" + cfg.co_name;
-    auto& kernel                = kernels.get_or_create(
-        cache_key, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
+    launch_row(arch,
+               cfg,
+               &args,
+               sizeof(args),
+               (shapes.seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo,
+               shapes.nhead_q,
+               shapes.batch);
+}
 
-    size_t arg_size          = sizeof(args);
-    const int gdx            = (shapes.seqlen_q + cfg.ts_qo - 1) / cfg.ts_qo;
-    const int gdy            = shapes.nhead_q;
-    const int gdz            = shapes.batch;
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    kernel.launch_kernel({&args, &arg_size, gdx, gdy, gdz, workgroup_size_for(cfg), 1, 1, stream});
+void fmha_v4_fwd_thd(const at::Tensor& q,
+                     const at::Tensor& k,
+                     const at::Tensor& v,
+                     at::Tensor out,
+                     const at::Tensor& cu_seqlens,
+                     int64_t max_seqlen,
+                     double softmax_scale,
+                     bool causal,
+                     int64_t kv_splits,
+                     std::optional<at::Tensor> lse)
+{
+    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3,
+                "THD MHA v4 takes [total_tokens, heads, head_dim] Q, K and V");
+    TORCH_CHECK(kv_splits >= 1, "THD MHA v4 needs kv_splits >= 1, got ", kv_splits);
+    TORCH_CHECK(out.dim() == 4 && out.size(0) == kv_splits && out[0].sizes() == q.sizes(),
+                "THD MHA v4 out must be [kv_splits, total_tokens, nhead_q, head_dim] = [",
+                kv_splits,
+                ", ",
+                q.sizes(),
+                "], got ",
+                out.sizes());
+    // The only THD rows are BF16. A quantized one brings descale operands, and with them a
+    // different signature, so the recipe is this launcher's rather than an argument.
+    const MhaV4Recipe recipe{format_id(AttentionFormat::Bf16),
+                             format_id(AttentionFormat::Bf16),
+                             format_id(AttentionFormat::Bf16),
+                             pack_id(AttentionPack::Default),
+                             scale_mode_id(AttentionScaleMode::None),
+                             scale_mode_id(AttentionScaleMode::None),
+                             scale_mode_id(AttentionScaleMode::None)};
+    check_format_tensor(q, recipe.q_format, "Q");
+    check_format_tensor(k, recipe.k_format, "K");
+    check_format_tensor(v, recipe.v_format, "V");
+    // Slices write FP32 partials: BF16 ones cost ~7% rel L2 against CK once merged.
+    TORCH_CHECK(out.scalar_type() == (kv_splits == 1 ? at::ScalarType::BFloat16 : at::kFloat),
+                "THD MHA v4 out must be BF16, or FP32 partials when kv_splits > 1");
+    for(const at::Tensor* t : std::initializer_list<const at::Tensor*>{&q, &k, &v, &out})
+    {
+        TORCH_CHECK(t->is_cuda() && t->get_device() == q.get_device(),
+                    "THD MHA v4 operands must be GPU tensors on one device");
+        TORCH_CHECK(t->stride(-1) == 1, "THD MHA v4 needs unit-stride head_dim");
+    }
+    const int64_t total    = q.size(0);
+    const int64_t nhead_q  = q.size(1);
+    const int64_t nhead_k  = k.size(1);
+    const int64_t head_dim = q.size(2);
+    TORCH_CHECK(k.size(0) == total && v.size(0) == total,
+                "THD MHA v4 needs whole documents: Q, K and V share total_tokens");
+    TORCH_CHECK(v.size(1) == nhead_k && k.size(2) == head_dim && v.size(2) == head_dim,
+                "THD MHA v4 K and V must share heads, and head_dim with Q");
+    TORCH_CHECK(nhead_k > 0 && nhead_q % nhead_k == 0,
+                "THD MHA v4 query heads must be a multiple of KV heads");
+    TORCH_CHECK(cu_seqlens.is_cuda() && cu_seqlens.get_device() == q.get_device() &&
+                    cu_seqlens.scalar_type() == at::kInt && cu_seqlens.dim() == 1 &&
+                    cu_seqlens.is_contiguous() && cu_seqlens.numel() >= 2,
+                "THD MHA v4 cu_seqlens must be a contiguous int32 GPU tensor [batch + 1]");
+    // Contents stay the caller's contract: bounding them on the host would synchronize the launch.
+    TORCH_CHECK(max_seqlen > 0, "THD MHA v4 needs max_seqlen > 0");
+    const int64_t batch = cu_seqlens.numel() - 1;
+
+    const HipDeviceGuard device_guard{q.get_device()};
+    const auto arch = get_gpu_arch();
+    const auto& cfg =
+        find_config(arch, recipe, /*mode=*/3, head_dim, /*ts_qo=*/0, /*ts_kv=*/0, causal ? 1 : 0);
+    TORCH_CHECK(kv_splits == 1 || cfg.kv_range != 0,
+                "THD MHA v4 row ",
+                cfg.knl_name,
+                " has no in-kernel KV split; pass kv_splits=1");
+    TORCH_CHECK(kv_splits == 1 || lse.has_value(),
+                "THD MHA v4 KV slices are merged by their LSE; pass one");
+
+    // Not populate_dense_kernarg: that fills the BSHD slots, and its batch stride, the whole pack
+    // here, has to fit 32 bits. A THD row addresses a token through a 64-bit product, so only the
+    // per-token strides must fit.
+    FmhaV4Kernarg args{};
+    args.ptr_o.value = out.data_ptr();
+    args.ptr_q.value = q.data_ptr();
+    args.ptr_k.value = k.data_ptr();
+    args.ptr_v.value = v.data_ptr();
+    const float scale = static_cast<float>(softmax_scale);
+    std::memcpy(&args.scalar.value, &scale, sizeof(scale));
+    args.s_seq_len.value     = fit_u32(max_seqlen, "max_seqlen");
+    args.s_kv_seq_len.value  = args.s_seq_len.value;
+    args.s_Seqs.value        = byte_stride(q, 0, "Q token stride");
+    args.s_Hs.value          = byte_stride(q, 1, "Q head stride");
+    args.s_gqa.value         = fit_u32(nhead_q / nhead_k, "GQA ratio");
+    args.s_k_Seqs.value      = byte_stride(k, 0, "K token stride");
+    args.s_k_Hs.value        = byte_stride(k, 1, "K head stride");
+    args.s_qk_head_dim.value = head_dim;
+    args.s_v_head_dim.value  = head_dim;
+    args.s_q_head_num.value  = nhead_q;
+    args.s_v_Seqs.value      = byte_stride(v, 0, "V token stride");
+    args.s_v_Hs.value        = byte_stride(v, 1, "V head stride");
+    args.s_o_Seqs.value      = byte_stride(out, 1, "output token stride");
+    args.s_o_Hs.value        = byte_stride(out, 2, "output head stride");
+    args.ptr_qseq.value      = cu_seqlens.data_ptr();
+    args.ptr_kseq.value      = cu_seqlens.data_ptr();
+    set_lse_kernarg(
+        args, lse, cfg, q, kv_splits, nhead_q, total, "THD", "[kv_splits, nhead_q, total_tokens]");
+    if(kv_splits > 1)
+    {
+        args.kv_split.count      = fit_u32(kv_splits, "kv_splits");
+        args.kv_split.o_stride   = byte_stride(out, 0, "per-slice output stride");
+        args.kv_split.lse_stride = byte_stride(lse.value(), 0, "per-slice LSE stride");
+        if(cfg.pair_split != 0)
+            args.kv_split.cu_budget = get_num_cu_func();
+    }
+
+    // A causal work-group owns Q tile i and its mirror n - 1 - i, so x covers half the tiles.
+    // On a pair_split row, 2-5 slices run a pair on kv_splits + 1 work-groups when its document
+    // has 4+ Q tiles and nhead_q * pairs * (kv_splits + 1) <= cu_budget; the kernel decides this
+    // per document. Work-groups past a document's need exit at once, so x is sized by max_seqlen
+    // whenever any document, down to the smallest such pair count, 2, could qualify: max_seqlen
+    // may overstate the longest document.
+    const int64_t q_tiles  = (max_seqlen + cfg.ts_qo - 1) / cfg.ts_qo;
+    const int64_t q_groups = causal ? (q_tiles + 1) / 2 : q_tiles;
+    const bool pair_extra  = causal && args.kv_split.cu_budget != 0 && kv_splits <= 5 &&
+                            q_tiles >= 4 && nhead_q * 2 * (kv_splits + 1) <= args.kv_split.cu_budget;
+    launch_row(arch,
+               cfg,
+               &args,
+               sizeof(args),
+               q_groups * (pair_extra ? kv_splits + 1 : kv_splits),
+               nhead_q,
+               batch);
 }
 
 void fmha_v4_fwd_sparse(const at::Tensor& q,
@@ -1576,14 +1768,7 @@ void fmha_v4_fwd_sparse(const at::Tensor& q,
     args.s_num_wgs                  = static_cast<uint32_t>(lut_rows);
     args.s_total_tiles              = static_cast<uint32_t>(lut_rows);
 
-    static SynchronizedCache<std::string, AiterAsmKernel> kernels;
-    const std::string cache_key = arch + "|" + cfg.knl_name + "|" + cfg.co_name;
-    auto& kernel                = kernels.get_or_create(
-        cache_key, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
-
-    size_t arg_size          = sizeof(args);
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    kernel.launch_kernel({&args, &arg_size, static_cast<int>(lut_rows), 1, 1, workgroup_size_for(cfg), 1, 1, stream});
+    launch_row(arch, cfg, &args, sizeof(args), lut_rows, 1, 1);
 }
 
 void fmha_v4_fwd_sol(const at::Tensor& q,
@@ -2008,17 +2193,13 @@ void fmha_v4_fwd_sol(const at::Tensor& q,
         std::memcpy(&args.s_mean_v_scale_Bs, &shift_ptr, sizeof(shift_ptr));
     }
 
-    static SynchronizedCache<std::string, AiterAsmKernel> kernels;
-    const std::string cache_key = arch + "|" + cfg.knl_name + "|" + cfg.co_name;
-    auto& kernel                = kernels.get_or_create(
-        cache_key, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
-
-    size_t arg_size          = sizeof(args);
-    const int gdx            = static_cast<int>(use_sorted ? lut_rows : q_tiles);
-    const int gdy            = use_sorted ? 1 : static_cast<int>(shapes.nhead_q);
-    const int gdz            = use_sorted ? 1 : static_cast<int>(shapes.batch);
-    const hipStream_t stream = at::hip::getCurrentHIPStream();
-    kernel.launch_kernel({&args, &arg_size, gdx, gdy, gdz, workgroup_size_for(cfg), 1, 1, stream});
+    launch_row(arch,
+               cfg,
+               &args,
+               sizeof(args),
+               use_sorted ? lut_rows : q_tiles,
+               use_sorted ? 1 : shapes.nhead_q,
+               use_sorted ? 1 : shapes.batch);
 }
 
 } // namespace torch_itfs
