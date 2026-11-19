@@ -73,15 +73,72 @@ non-regression or invent an allowed slowdown. Repeat unresolved c16 evidence
 as needed. Model-level non-regression requires the model path to be exercised;
 an isolated op benchmark must be labeled as such.
 
-### SGPR rule correction: 2026-11-19
+### Current measured result: 2026-11-19 (1 x 256)
 
-The user limited the s104/s105 rule to ASM kernels. A03/A09 are compiled
-Triton/Gluon kernels, so their wrappers and offline compiler no longer set
-`amdgpu-num-sgpr=104`. Their ISA may use these registers. Such use is not
-an acceptance failure. DEV activation loads and DEV + HT output stores
-remain required. The `(1,256)` grid and task batching are unchanged.
-The earlier cap and operand checks below describe historical candidates.
-The current candidate still needs GPU correctness and performance validation.
+The user limits the s104/s105 rule to ASM kernels. A03/A09 use Triton/Gluon,
+so the wrappers and offline compiler no longer set `amdgpu-num-sgpr=104`.
+Their ISA may use these registers; this is not an acceptance failure.
+DEV activation loads and DEV + HT output stores remain required.
+Both PS wrappers use `(1,256)` and `tg = program_id(1)`, with 128 threads/TG.
+Task ownership remains `tg + j*256`; task batching and native math are unchanged.
+
+Tested commit: `ce7b69057f6da66c3291ec89361cdc202253034d`. All 108 UTs pass with zero skips, including
+byte output checks, input/weight integrity, guards and Graph replay. Frozen
+native hashes and 20 offline variants pass. Real Graph profiling records
+336 PS dispatches with work-item grid `(128,256,1)` and workgroup `(128,1,1)`.
+That is exactly `(1,256,1)` TGs. All 22 recorded real PS JIT variants pass
+DEV activation load and DEV + HT output store checks. Actual JIT metadata
+has no explicit SGPR allocation cap. Register references are recorded only;
+they do not gate Triton/Gluon acceptance.
+
+The four target profiles have 22 unique timing cases, 15 alternating trials
+each, with shared native/PS input pools and the same Graph method. Timing
+runs without profiling, under the shared GPU lock after the idle gate.
+No foreign GPU PID was seen in any case's 100 ms samples. c256 A03 reuses
+c64's identical shape. These are source-derived full/balanced verify shapes,
+not four-GPU model results.
+
+[Raw performance and launch evidence](mono-persistent-results/2026-11-19-grid1x256-unrestricted-sgpr) includes all samples, JUnit,
+actual profiler records, and JIT IR/ISA/code objects/metadata in the archive.
+Its manifest records file hashes and the tested revision. The previous
+1 x 256 capped candidate had no GPU results; the older 16 x 16 results below
+apply only to that revision. Separate windows do not isolate a geometry-only
+or SGPR-cap-only speed change.
+
+Values below are median / P10 / P90 in us. PS/native greater than one means
+slower. The existing noise rule distinguishes regressions, improvements and
+inconclusive cases. Inconclusive does not prove equivalence.
+
+| Profile | Op | Input storage | Cache | Native median / P10 / P90 (us) | PS median / P10 / P90 (us) | PS/native | Decision |
+| --- | --- | --- | --- | ---: | ---: | ---: | --- |
+| c128-verify-proxy | a03 | [192, 1792] | hot | 1.642247 / 1.628110 / 1.651762 | 1.820719 / 1.807771 / 1.834877 | 1.108675 | regression |
+| c128-verify-proxy | a03 | [192, 1792] | rotating | 1.992524 / 1.983766 / 2.005778 | 2.116570 / 2.094131 / 2.128387 | 1.062256 | regression |
+| c128-verify-proxy | a09 | [192, 8192] | hot | 1.795180 / 1.791494 / 1.835548 | 2.379880 / 2.351662 / 2.406297 | 1.325705 | regression |
+| c128-verify-proxy | a09 | [192, 8192] | rotating | 2.787266 / 2.523658 / 2.798663 | 3.651453 / 3.619377 / 3.898790 | 1.310048 | regression |
+| c128-verify-proxy | a09-qat | [192, 8192] | hot | 1.522592 / 1.518187 / 1.523627 | 1.866671 / 1.857305 / 1.873475 | 1.225982 | regression |
+| c128-verify-proxy | a09-qat | [192, 8192] | rotating | 1.936981 / 1.935680 / 1.938701 | 2.561208 / 2.559520 / 2.563050 | 1.322268 | regression |
+| c16-verify-proxy | a03 | [96, 1792] | hot | 1.591535 / 1.578307 / 1.601127 | 1.698395 / 1.678168 / 1.703538 | 1.067143 | regression |
+| c16-verify-proxy | a03 | [96, 1792] | rotating | 1.915124 / 1.911720 / 1.925315 | 1.977866 / 1.968349 / 1.998499 | 1.032761 | regression |
+| c16-verify-proxy | a09 | [96, 2048] | hot | 1.425262 / 1.398810 / 1.435245 | 1.434224 / 1.428618 / 1.450415 | 1.006288 | inconclusive |
+| c16-verify-proxy | a09 | [96, 2048] | rotating | 1.673170 / 1.667351 / 1.687780 | 1.688970 / 1.674123 / 1.693980 | 1.009443 | inconclusive |
+| c16-verify-proxy | a09-qat | [96, 2048] | hot | 1.248566 / 1.246202 / 1.254113 | 1.251943 / 1.250060 / 1.256892 | 1.002704 | inconclusive |
+| c16-verify-proxy | a09-qat | [96, 2048] | rotating | 1.612727 / 1.611016 / 1.614337 | 1.622654 / 1.620817 / 1.624282 | 1.006155 | regression |
+| c256-verify-proxy | a09 | [384, 8192] | hot | 2.767693 / 2.689468 / 2.925294 | 3.283733 / 3.232896 / 3.430986 | 1.186452 | regression |
+| c256-verify-proxy | a09 | [384, 8192] | rotating | 3.643368 / 3.302288 / 3.995756 | 5.523183 / 5.348033 / 5.537386 | 1.515955 | regression |
+| c256-verify-proxy | a09-qat | [384, 8192] | hot | 2.042780 / 2.040198 / 2.043853 | 2.621875 / 2.620315 / 2.624765 | 1.283484 | regression |
+| c256-verify-proxy | a09-qat | [384, 8192] | rotating | 2.683343 / 2.681049 / 2.685822 | 3.519535 / 3.517631 / 3.523570 | 1.311623 | regression |
+| c64-verify-proxy | a03 | [384, 1792] | hot | 1.764094 / 1.749916 / 1.786133 | 2.593680 / 2.588503 / 2.603332 | 1.470262 | regression |
+| c64-verify-proxy | a03 | [384, 1792] | rotating | 2.128011 / 2.122766 / 2.129647 | 3.026929 / 3.023472 / 3.277277 | 1.422422 | regression |
+| c64-verify-proxy | a09 | [384, 2048] | hot | 1.603946 / 1.597546 / 1.607983 | 1.695803 / 1.692431 / 1.698723 | 1.057270 | regression |
+| c64-verify-proxy | a09 | [384, 2048] | rotating | 2.424262 / 2.396061 / 2.430109 | 2.709286 / 2.699976 / 2.721768 | 1.117571 | regression |
+| c64-verify-proxy | a09-qat | [384, 2048] | hot | 1.376505 / 1.373316 / 1.378113 | 1.404523 / 1.401549 / 1.406672 | 1.020355 | regression |
+| c64-verify-proxy | a09-qat | [384, 2048] | rotating | 1.726001 / 1.725239 / 1.727264 | 1.795072 / 1.792825 / 1.796607 | 1.040018 | regression |
+
+
+Decisions: {'regression': 19, 'inconclusive': 3}. Primary c16: a03 hot regression (+6.71%); a03 rotating regression (+3.28%); a09 hot inconclusive (+0.63%); a09 rotating inconclusive (+0.94%); a09-qat hot inconclusive (+0.27%); a09-qat rotating regression (+0.62%).
+The full mono call/join path, simultaneous residency, common fused cluster
+and model path still require runtime evidence. The s104/s105 preservation
+gate applies only to ASM kernels.
 
 ### Previous grid-only candidate: 2026-11-19
 

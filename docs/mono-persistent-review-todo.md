@@ -1,12 +1,26 @@
 # A03/A09 mono review and acceptance
 
-## Current SGPR rule: 2026-11-19
+## Current 1 x 256 result: 2026-11-19
 
-Only ASM kernels must avoid s104/s105. HIP, FlyDSL and Triton kernels have
-no such requirement. A03/A09 use Triton/Gluon; remove the 104-register cap
-from their wrappers and offline compiler. Record register resources without
-failing these kernels for an s104/s105 operand. Keep DEV/HT, `(1,256)`,
-128 threads/TG and the existing task batches. GPU validation is pending.
+Tested commit: `ce7b69057f6da66c3291ec89361cdc202253034d`. Only ASM kernels must avoid s104/s105.
+HIP/FlyDSL/Triton have no such requirement. A03/A09 use Triton/Gluon and
+no longer impose the 104-SGPR allocation limit. Grid and task batches remain
+`(1,256)`, 128 threads/TG, and `task = tg + j*256`.
+
+- [x] All 108 UTs pass with zero skips; frozen native hashes pass.
+- [x] Actual 336 PS dispatches use 1 x 256 TGs, 128 threads/TG and wave32.
+- [x] Recorded actual PS JIT variants keep DEV activation loads and DEV + HT
+  output stores. Metadata confirms no explicit SGPR cap.
+- [x] Four-profile timing: 22 unique cases, 15 trials each, hot/rotating,
+  paired native/PS pools and Graph method, no profiling during timing.
+- [ ] Full performance acceptance. Decisions: {'regression': 19, 'inconclusive': 3}.
+- [ ] Main-kernel call/join, simultaneous residency, common fused cluster and
+  model path. Standalone results do not prove these.
+
+Primary c16: a03 hot regression (+6.71%); a03 rotating regression (+3.28%); a09 hot inconclusive (+0.63%); a09 rotating inconclusive (+0.94%); a09-qat hot inconclusive (+0.27%); a09-qat rotating regression (+0.62%).
+
+[Raw results and JIT evidence](mono-persistent-results/2026-11-19-grid1x256-unrestricted-sgpr) record this revision.
+Earlier capped candidates and 16 x 16 results below are historical.
 
 ## Previous grid-only candidate: 2026-11-19
 

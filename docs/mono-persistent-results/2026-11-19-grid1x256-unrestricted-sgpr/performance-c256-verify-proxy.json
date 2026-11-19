@@ -1,0 +1,1102 @@
+{
+  "timestamp_utc": "2026-11-19T07:02:34.387662+00:00",
+  "torch": "2.14.0+rocm10.3.0a20261103-bkc.20261105",
+  "hip": "7.18.26435",
+  "triton": "3.9.0",
+  "python": "3.14.4",
+  "gpu": "_CudaDeviceProperties(name='AMD Radeon Graphics', major=12, minor=5, gcnArchName='gfx1250', total_memory=442368MB, multi_processor_count=256, uuid=65653536-3737-3631-3666-336265323264, pci_bus_id=1, pci_device_id=0, pci_domain_id=1, L2_cache_size=4MB)",
+  "aiter_commit": "ce7b69057f6da66c3291ec89361cdc202253034d",
+  "git_status": "",
+  "timing": "RotatingBufferBench graph replay; each sample is mean per launch in one trial",
+  "buffers": "Shared input pool; wrappers allocate outputs during graph capture",
+  "results": [
+    {
+      "native": {
+        "median_us": 2.767692613601685,
+        "p10_us": 2.689467554092407,
+        "p90_us": 2.9252944612503056,
+        "samples_us": [
+          2.7021507024765015,
+          2.815424084663391,
+          2.7637869358062743,
+          2.9236381292343143,
+          2.685918188095093,
+          2.723009967803955,
+          2.683738970756531,
+          2.6947916030883787,
+          2.930464482307434,
+          2.9263986825942996,
+          2.767692613601685,
+          2.7767303466796873,
+          2.793078804016113,
+          2.813861966133118,
+          2.7565361976623532
+        ]
+      },
+      "persistent": {
+        "median_us": 3.283733487129211,
+        "p10_us": 3.232895746231079,
+        "p90_us": 3.4309861803054806,
+        "samples_us": [
+          3.2340830564498897,
+          3.260546708106995,
+          3.240324687957764,
+          3.1974802970886227,
+          3.483993697166443,
+          3.250083303451538,
+          3.357099604606628,
+          3.3096765756607054,
+          3.343807768821716,
+          3.4802438974380494,
+          3.241370058059692,
+          3.3311727046966553,
+          3.2321042060852054,
+          3.283733487129211,
+          3.289778923988342
+        ]
+      },
+      "op": "a09",
+      "rows": 384,
+      "input_storage_shape": [
+        384,
+        8192
+      ],
+      "cache": "hot",
+      "started_utc": "2026-11-19T07:02:34.400018+00:00",
+      "finished_utc": "2026-11-19T07:02:36.560518+00:00",
+      "rounds": [
+        {
+          "trial": 0,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:34.440788+00:00",
+          "latency_us": {
+            "native": 2.7021507024765015,
+            "persistent": 3.2340830564498897
+          },
+          "delta_ps_native_us": 0.5319323539733882,
+          "finished_utc": "2026-11-19T07:02:34.850422+00:00"
+        },
+        {
+          "trial": 1,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:34.850436+00:00",
+          "latency_us": {
+            "persistent": 3.260546708106995,
+            "native": 2.815424084663391
+          },
+          "delta_ps_native_us": 0.44512262344360387,
+          "finished_utc": "2026-11-19T07:02:34.974314+00:00"
+        },
+        {
+          "trial": 2,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:34.974324+00:00",
+          "latency_us": {
+            "native": 2.7637869358062743,
+            "persistent": 3.240324687957764
+          },
+          "delta_ps_native_us": 0.4765377521514895,
+          "finished_utc": "2026-11-19T07:02:35.094364+00:00"
+        },
+        {
+          "trial": 3,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:35.094381+00:00",
+          "latency_us": {
+            "persistent": 3.1974802970886227,
+            "native": 2.9236381292343143
+          },
+          "delta_ps_native_us": 0.27384216785430837,
+          "finished_utc": "2026-11-19T07:02:35.212021+00:00"
+        },
+        {
+          "trial": 4,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:35.212031+00:00",
+          "latency_us": {
+            "native": 2.685918188095093,
+            "persistent": 3.483993697166443
+          },
+          "delta_ps_native_us": 0.7980755090713503,
+          "finished_utc": "2026-11-19T07:02:35.389488+00:00"
+        },
+        {
+          "trial": 5,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:35.389505+00:00",
+          "latency_us": {
+            "persistent": 3.250083303451538,
+            "native": 2.723009967803955
+          },
+          "delta_ps_native_us": 0.5270733356475832,
+          "finished_utc": "2026-11-19T07:02:35.504172+00:00"
+        },
+        {
+          "trial": 6,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:35.504181+00:00",
+          "latency_us": {
+            "native": 2.683738970756531,
+            "persistent": 3.357099604606628
+          },
+          "delta_ps_native_us": 0.673360633850097,
+          "finished_utc": "2026-11-19T07:02:35.619511+00:00"
+        },
+        {
+          "trial": 7,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:35.619519+00:00",
+          "latency_us": {
+            "persistent": 3.3096765756607054,
+            "native": 2.6947916030883787
+          },
+          "delta_ps_native_us": 0.6148849725723267,
+          "finished_utc": "2026-11-19T07:02:35.734384+00:00"
+        },
+        {
+          "trial": 8,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:35.734393+00:00",
+          "latency_us": {
+            "native": 2.930464482307434,
+            "persistent": 3.343807768821716
+          },
+          "delta_ps_native_us": 0.41334328651428187,
+          "finished_utc": "2026-11-19T07:02:35.853067+00:00"
+        },
+        {
+          "trial": 9,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:35.853076+00:00",
+          "latency_us": {
+            "persistent": 3.4802438974380494,
+            "native": 2.9263986825942996
+          },
+          "delta_ps_native_us": 0.5538452148437498,
+          "finished_utc": "2026-11-19T07:02:35.973493+00:00"
+        },
+        {
+          "trial": 10,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:35.973501+00:00",
+          "latency_us": {
+            "native": 2.767692613601685,
+            "persistent": 3.241370058059692
+          },
+          "delta_ps_native_us": 0.4736774444580072,
+          "finished_utc": "2026-11-19T07:02:36.088844+00:00"
+        },
+        {
+          "trial": 11,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:36.088856+00:00",
+          "latency_us": {
+            "persistent": 3.3311727046966553,
+            "native": 2.7767303466796873
+          },
+          "delta_ps_native_us": 0.554442358016968,
+          "finished_utc": "2026-11-19T07:02:36.212281+00:00"
+        },
+        {
+          "trial": 12,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:36.212297+00:00",
+          "latency_us": {
+            "native": 2.793078804016113,
+            "persistent": 3.2321042060852054
+          },
+          "delta_ps_native_us": 0.43902540206909224,
+          "finished_utc": "2026-11-19T07:02:36.327882+00:00"
+        },
+        {
+          "trial": 13,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:36.327891+00:00",
+          "latency_us": {
+            "persistent": 3.283733487129211,
+            "native": 2.813861966133118
+          },
+          "delta_ps_native_us": 0.46987152099609286,
+          "finished_utc": "2026-11-19T07:02:36.444556+00:00"
+        },
+        {
+          "trial": 14,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:36.444565+00:00",
+          "latency_us": {
+            "native": 2.7565361976623532,
+            "persistent": 3.289778923988342
+          },
+          "delta_ps_native_us": 0.5332427263259887,
+          "finished_utc": "2026-11-19T07:02:36.560484+00:00"
+        }
+      ],
+      "pool_len": 1,
+      "kernels_per_graph": 1000,
+      "replays_per_trial": 10,
+      "ratio_ps_native": 1.1864516568752865,
+      "delta_ps_native_us": 0.5160408735275261
+    },
+    {
+      "native": {
+        "median_us": 3.6433683156967165,
+        "p10_us": 3.3022879362106323,
+        "p90_us": 3.995755910873413,
+        "samples_us": [
+          3.6461323976516726,
+          3.64259889125824,
+          3.645555591583252,
+          3.6229417800903323,
+          4.0857706546783445,
+          4.1399119853973385,
+          3.2977666854858403,
+          3.3064839363098146,
+          3.3009114503860473,
+          3.3043526649475092,
+          3.860733795166016,
+          3.319315028190613,
+          3.6433683156967165,
+          3.649713897705078,
+          3.6495578527450565
+        ]
+      },
+      "persistent": {
+        "median_us": 5.523183488845825,
+        "p10_us": 5.348033113479614,
+        "p90_us": 5.537385587692261,
+        "samples_us": [
+          5.538229990005493,
+          5.523496055603027,
+          5.534857082366944,
+          5.517378902435302,
+          5.531427955627442,
+          5.345605421066284,
+          5.523143577575683,
+          5.2784212112426765,
+          5.369188976287842,
+          5.351674652099609,
+          5.533234691619873,
+          5.515908765792847,
+          5.538762950897216,
+          5.523183488845825,
+          5.536118984222412
+        ]
+      },
+      "op": "a09",
+      "rows": 384,
+      "input_storage_shape": [
+        384,
+        8192
+      ],
+      "cache": "rotating",
+      "started_utc": "2026-11-19T07:02:36.560857+00:00",
+      "finished_utc": "2026-11-19T07:02:38.854399+00:00",
+      "rounds": [
+        {
+          "trial": 0,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:36.561326+00:00",
+          "latency_us": {
+            "native": 3.6461323976516726,
+            "persistent": 5.538229990005493
+          },
+          "delta_ps_native_us": 1.8920975923538204,
+          "finished_utc": "2026-11-19T07:02:36.718707+00:00"
+        },
+        {
+          "trial": 1,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:36.718715+00:00",
+          "latency_us": {
+            "persistent": 5.523496055603027,
+            "native": 3.64259889125824
+          },
+          "delta_ps_native_us": 1.8808971643447867,
+          "finished_utc": "2026-11-19T07:02:36.871423+00:00"
+        },
+        {
+          "trial": 2,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:36.871432+00:00",
+          "latency_us": {
+            "native": 3.645555591583252,
+            "persistent": 5.534857082366944
+          },
+          "delta_ps_native_us": 1.889301490783692,
+          "finished_utc": "2026-11-19T07:02:37.024127+00:00"
+        },
+        {
+          "trial": 3,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:37.024135+00:00",
+          "latency_us": {
+            "persistent": 5.517378902435302,
+            "native": 3.6229417800903323
+          },
+          "delta_ps_native_us": 1.89443712234497,
+          "finished_utc": "2026-11-19T07:02:37.179717+00:00"
+        },
+        {
+          "trial": 4,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:37.179725+00:00",
+          "latency_us": {
+            "native": 4.0857706546783445,
+            "persistent": 5.531427955627442
+          },
+          "delta_ps_native_us": 1.4456573009490974,
+          "finished_utc": "2026-11-19T07:02:37.337057+00:00"
+        },
+        {
+          "trial": 5,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:37.337066+00:00",
+          "latency_us": {
+            "persistent": 5.345605421066284,
+            "native": 4.1399119853973385
+          },
+          "delta_ps_native_us": 1.2056934356689455,
+          "finished_utc": "2026-11-19T07:02:37.495066+00:00"
+        },
+        {
+          "trial": 6,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:37.495078+00:00",
+          "latency_us": {
+            "native": 3.2977666854858403,
+            "persistent": 5.523143577575683
+          },
+          "delta_ps_native_us": 2.225376892089843,
+          "finished_utc": "2026-11-19T07:02:37.643696+00:00"
+        },
+        {
+          "trial": 7,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:37.643704+00:00",
+          "latency_us": {
+            "persistent": 5.2784212112426765,
+            "native": 3.3064839363098146
+          },
+          "delta_ps_native_us": 1.9719372749328619,
+          "finished_utc": "2026-11-19T07:02:37.789110+00:00"
+        },
+        {
+          "trial": 8,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:37.789118+00:00",
+          "latency_us": {
+            "native": 3.3009114503860473,
+            "persistent": 5.369188976287842
+          },
+          "delta_ps_native_us": 2.0682775259017947,
+          "finished_utc": "2026-11-19T07:02:37.936580+00:00"
+        },
+        {
+          "trial": 9,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:37.936590+00:00",
+          "latency_us": {
+            "persistent": 5.351674652099609,
+            "native": 3.3043526649475092
+          },
+          "delta_ps_native_us": 2.0473219871521,
+          "finished_utc": "2026-11-19T07:02:38.082664+00:00"
+        },
+        {
+          "trial": 10,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:38.082673+00:00",
+          "latency_us": {
+            "native": 3.860733795166016,
+            "persistent": 5.533234691619873
+          },
+          "delta_ps_native_us": 1.6725008964538568,
+          "finished_utc": "2026-11-19T07:02:38.238443+00:00"
+        },
+        {
+          "trial": 11,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:38.238459+00:00",
+          "latency_us": {
+            "persistent": 5.515908765792847,
+            "native": 3.319315028190613
+          },
+          "delta_ps_native_us": 2.1965937376022344,
+          "finished_utc": "2026-11-19T07:02:38.389647+00:00"
+        },
+        {
+          "trial": 12,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:38.389676+00:00",
+          "latency_us": {
+            "native": 3.6433683156967165,
+            "persistent": 5.538762950897216
+          },
+          "delta_ps_native_us": 1.8953946352004998,
+          "finished_utc": "2026-11-19T07:02:38.544283+00:00"
+        },
+        {
+          "trial": 13,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:38.544306+00:00",
+          "latency_us": {
+            "persistent": 5.523183488845825,
+            "native": 3.649713897705078
+          },
+          "delta_ps_native_us": 1.8734695911407466,
+          "finished_utc": "2026-11-19T07:02:38.700974+00:00"
+        },
+        {
+          "trial": 14,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:38.700999+00:00",
+          "latency_us": {
+            "native": 3.6495578527450565,
+            "persistent": 5.536118984222412
+          },
+          "delta_ps_native_us": 1.8865611314773556,
+          "finished_utc": "2026-11-19T07:02:38.854342+00:00"
+        }
+      ],
+      "pool_len": 33,
+      "kernels_per_graph": 1000,
+      "replays_per_trial": 10,
+      "ratio_ps_native": 1.5159552947338055,
+      "delta_ps_native_us": 1.8798151731491082
+    },
+    {
+      "native": {
+        "median_us": 2.0427795171737673,
+        "p10_us": 2.040198016166687,
+        "p90_us": 2.043852944374085,
+        "samples_us": [
+          2.039955234527588,
+          2.0430155992507935,
+          2.0404597759246825,
+          2.044225311279297,
+          2.040127491950989,
+          2.0439810991287235,
+          2.0430597066879272,
+          2.042795372009277,
+          2.0420182228088377,
+          2.042198395729065,
+          2.0418059110641478,
+          2.0435121774673464,
+          2.0427795171737673,
+          2.0436607122421266,
+          2.040303802490234
+        ]
+      },
+      "persistent": {
+        "median_us": 2.6218745708465576,
+        "p10_us": 2.620315408706665,
+        "p90_us": 2.6247646713256834,
+        "samples_us": [
+          2.6169470071792604,
+          2.6215461969375613,
+          2.6218745708465576,
+          2.6236931562423704,
+          2.620560383796692,
+          2.6250915050506594,
+          2.621305823326111,
+          2.623577094078064,
+          2.6210689783096313,
+          2.6253437757492066,
+          2.6221710681915282,
+          2.6223071813583374,
+          2.6218666315078734,
+          2.62427442073822,
+          2.6201520919799806
+        ]
+      },
+      "op": "a09-qat",
+      "rows": 384,
+      "input_storage_shape": [
+        384,
+        8192
+      ],
+      "cache": "hot",
+      "started_utc": "2026-11-19T07:02:38.855213+00:00",
+      "finished_utc": "2026-11-19T07:02:40.172166+00:00",
+      "rounds": [
+        {
+          "trial": 0,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:38.855469+00:00",
+          "latency_us": {
+            "native": 2.039955234527588,
+            "persistent": 2.6169470071792604
+          },
+          "delta_ps_native_us": 0.5769917726516725,
+          "finished_utc": "2026-11-19T07:02:38.947430+00:00"
+        },
+        {
+          "trial": 1,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:38.947438+00:00",
+          "latency_us": {
+            "persistent": 2.6215461969375613,
+            "native": 2.0430155992507935
+          },
+          "delta_ps_native_us": 0.5785305976867678,
+          "finished_utc": "2026-11-19T07:02:39.034943+00:00"
+        },
+        {
+          "trial": 2,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:39.034952+00:00",
+          "latency_us": {
+            "native": 2.0404597759246825,
+            "persistent": 2.6218745708465576
+          },
+          "delta_ps_native_us": 0.5814147949218751,
+          "finished_utc": "2026-11-19T07:02:39.122939+00:00"
+        },
+        {
+          "trial": 3,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:39.122953+00:00",
+          "latency_us": {
+            "persistent": 2.6236931562423704,
+            "native": 2.044225311279297
+          },
+          "delta_ps_native_us": 0.5794678449630735,
+          "finished_utc": "2026-11-19T07:02:39.210578+00:00"
+        },
+        {
+          "trial": 4,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:39.210586+00:00",
+          "latency_us": {
+            "native": 2.040127491950989,
+            "persistent": 2.620560383796692
+          },
+          "delta_ps_native_us": 0.5804328918457031,
+          "finished_utc": "2026-11-19T07:02:39.298018+00:00"
+        },
+        {
+          "trial": 5,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:39.298027+00:00",
+          "latency_us": {
+            "persistent": 2.6250915050506594,
+            "native": 2.0439810991287235
+          },
+          "delta_ps_native_us": 0.5811104059219359,
+          "finished_utc": "2026-11-19T07:02:39.385417+00:00"
+        },
+        {
+          "trial": 6,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:39.385425+00:00",
+          "latency_us": {
+            "native": 2.0430597066879272,
+            "persistent": 2.621305823326111
+          },
+          "delta_ps_native_us": 0.5782461166381836,
+          "finished_utc": "2026-11-19T07:02:39.472668+00:00"
+        },
+        {
+          "trial": 7,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:39.472676+00:00",
+          "latency_us": {
+            "persistent": 2.623577094078064,
+            "native": 2.042795372009277
+          },
+          "delta_ps_native_us": 0.580781722068787,
+          "finished_utc": "2026-11-19T07:02:39.560026+00:00"
+        },
+        {
+          "trial": 8,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:39.560037+00:00",
+          "latency_us": {
+            "native": 2.0420182228088377,
+            "persistent": 2.6210689783096313
+          },
+          "delta_ps_native_us": 0.5790507555007935,
+          "finished_utc": "2026-11-19T07:02:39.647408+00:00"
+        },
+        {
+          "trial": 9,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:39.647415+00:00",
+          "latency_us": {
+            "persistent": 2.6253437757492066,
+            "native": 2.042198395729065
+          },
+          "delta_ps_native_us": 0.5831453800201416,
+          "finished_utc": "2026-11-19T07:02:39.734908+00:00"
+        },
+        {
+          "trial": 10,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:39.734918+00:00",
+          "latency_us": {
+            "native": 2.0418059110641478,
+            "persistent": 2.6221710681915282
+          },
+          "delta_ps_native_us": 0.5803651571273805,
+          "finished_utc": "2026-11-19T07:02:39.822150+00:00"
+        },
+        {
+          "trial": 11,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:39.822164+00:00",
+          "latency_us": {
+            "persistent": 2.6223071813583374,
+            "native": 2.0435121774673464
+          },
+          "delta_ps_native_us": 0.578795003890991,
+          "finished_utc": "2026-11-19T07:02:39.909675+00:00"
+        },
+        {
+          "trial": 12,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:39.909683+00:00",
+          "latency_us": {
+            "native": 2.0427795171737673,
+            "persistent": 2.6218666315078734
+          },
+          "delta_ps_native_us": 0.5790871143341061,
+          "finished_utc": "2026-11-19T07:02:39.997126+00:00"
+        },
+        {
+          "trial": 13,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:39.997133+00:00",
+          "latency_us": {
+            "persistent": 2.62427442073822,
+            "native": 2.0436607122421266
+          },
+          "delta_ps_native_us": 0.5806137084960934,
+          "finished_utc": "2026-11-19T07:02:40.084659+00:00"
+        },
+        {
+          "trial": 14,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:40.084666+00:00",
+          "latency_us": {
+            "native": 2.040303802490234,
+            "persistent": 2.6201520919799806
+          },
+          "delta_ps_native_us": 0.5798482894897465,
+          "finished_utc": "2026-11-19T07:02:40.172144+00:00"
+        }
+      ],
+      "pool_len": 1,
+      "kernels_per_graph": 1000,
+      "replays_per_trial": 10,
+      "ratio_ps_native": 1.2834838751829574,
+      "delta_ps_native_us": 0.5790950536727903
+    },
+    {
+      "native": {
+        "median_us": 2.6833425998687743,
+        "p10_us": 2.6810494852066045,
+        "p90_us": 2.6858223724365233,
+        "samples_us": [
+          2.6812753915786742,
+          2.685774064064026,
+          2.6832505941390994,
+          2.6833425998687743,
+          2.6829380989074707,
+          2.6845845222473144,
+          2.684327983856201,
+          2.680898880958557,
+          2.6807228088378903,
+          2.6835506916046143,
+          2.6858545780181884,
+          2.6844401121139523,
+          2.682893919944763,
+          2.6860143899917603,
+          2.6826575994491577
+        ]
+      },
+      "persistent": {
+        "median_us": 3.51953489780426,
+        "p10_us": 3.517630510330201,
+        "p90_us": 3.523569808006287,
+        "samples_us": [
+          3.5224391698837283,
+          3.52136549949646,
+          3.519106221199036,
+          3.5238534688949588,
+          3.5209451913833614,
+          3.519366693496704,
+          3.5149478912353516,
+          3.5185335874557495,
+          3.518505382537842,
+          3.523144316673279,
+          3.5188017606735227,
+          3.5248827695846554,
+          3.51953489780426,
+          3.520752692222595,
+          3.517047262191773
+        ]
+      },
+      "op": "a09-qat",
+      "rows": 384,
+      "input_storage_shape": [
+        384,
+        8192
+      ],
+      "cache": "rotating",
+      "started_utc": "2026-11-19T07:02:40.172538+00:00",
+      "finished_utc": "2026-11-19T07:02:41.797338+00:00",
+      "rounds": [
+        {
+          "trial": 0,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:40.173008+00:00",
+          "latency_us": {
+            "native": 2.6812753915786742,
+            "persistent": 3.5224391698837283
+          },
+          "delta_ps_native_us": 0.8411637783050541,
+          "finished_utc": "2026-11-19T07:02:40.281244+00:00"
+        },
+        {
+          "trial": 1,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:40.281252+00:00",
+          "latency_us": {
+            "persistent": 3.52136549949646,
+            "native": 2.685774064064026
+          },
+          "delta_ps_native_us": 0.8355914354324341,
+          "finished_utc": "2026-11-19T07:02:40.389376+00:00"
+        },
+        {
+          "trial": 2,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:40.389384+00:00",
+          "latency_us": {
+            "native": 2.6832505941390994,
+            "persistent": 3.519106221199036
+          },
+          "delta_ps_native_us": 0.8358556270599364,
+          "finished_utc": "2026-11-19T07:02:40.497320+00:00"
+        },
+        {
+          "trial": 3,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:40.497327+00:00",
+          "latency_us": {
+            "persistent": 3.5238534688949588,
+            "native": 2.6833425998687743
+          },
+          "delta_ps_native_us": 0.8405108690261844,
+          "finished_utc": "2026-11-19T07:02:40.605847+00:00"
+        },
+        {
+          "trial": 4,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:40.605855+00:00",
+          "latency_us": {
+            "native": 2.6829380989074707,
+            "persistent": 3.5209451913833614
+          },
+          "delta_ps_native_us": 0.8380070924758907,
+          "finished_utc": "2026-11-19T07:02:40.713955+00:00"
+        },
+        {
+          "trial": 5,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:40.713967+00:00",
+          "latency_us": {
+            "persistent": 3.519366693496704,
+            "native": 2.6845845222473144
+          },
+          "delta_ps_native_us": 0.8347821712493895,
+          "finished_utc": "2026-11-19T07:02:40.822154+00:00"
+        },
+        {
+          "trial": 6,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:40.822166+00:00",
+          "latency_us": {
+            "native": 2.684327983856201,
+            "persistent": 3.5149478912353516
+          },
+          "delta_ps_native_us": 0.8306199073791505,
+          "finished_utc": "2026-11-19T07:02:40.930479+00:00"
+        },
+        {
+          "trial": 7,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:40.930508+00:00",
+          "latency_us": {
+            "persistent": 3.5185335874557495,
+            "native": 2.680898880958557
+          },
+          "delta_ps_native_us": 0.8376347064971923,
+          "finished_utc": "2026-11-19T07:02:41.039232+00:00"
+        },
+        {
+          "trial": 8,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:41.039250+00:00",
+          "latency_us": {
+            "native": 2.6807228088378903,
+            "persistent": 3.518505382537842
+          },
+          "delta_ps_native_us": 0.8377825736999518,
+          "finished_utc": "2026-11-19T07:02:41.148539+00:00"
+        },
+        {
+          "trial": 9,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:41.148557+00:00",
+          "latency_us": {
+            "persistent": 3.523144316673279,
+            "native": 2.6835506916046143
+          },
+          "delta_ps_native_us": 0.8395936250686646,
+          "finished_utc": "2026-11-19T07:02:41.256688+00:00"
+        },
+        {
+          "trial": 10,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:41.256698+00:00",
+          "latency_us": {
+            "native": 2.6858545780181884,
+            "persistent": 3.5188017606735227
+          },
+          "delta_ps_native_us": 0.8329471826553343,
+          "finished_utc": "2026-11-19T07:02:41.365669+00:00"
+        },
+        {
+          "trial": 11,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:41.365688+00:00",
+          "latency_us": {
+            "persistent": 3.5248827695846554,
+            "native": 2.6844401121139523
+          },
+          "delta_ps_native_us": 0.8404426574707031,
+          "finished_utc": "2026-11-19T07:02:41.473887+00:00"
+        },
+        {
+          "trial": 12,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:41.473897+00:00",
+          "latency_us": {
+            "native": 2.682893919944763,
+            "persistent": 3.51953489780426
+          },
+          "delta_ps_native_us": 0.836640977859497,
+          "finished_utc": "2026-11-19T07:02:41.581698+00:00"
+        },
+        {
+          "trial": 13,
+          "provider_order": [
+            "persistent",
+            "native"
+          ],
+          "started_utc": "2026-11-19T07:02:41.581706+00:00",
+          "latency_us": {
+            "persistent": 3.520752692222595,
+            "native": 2.6860143899917603
+          },
+          "delta_ps_native_us": 0.8347383022308348,
+          "finished_utc": "2026-11-19T07:02:41.689530+00:00"
+        },
+        {
+          "trial": 14,
+          "provider_order": [
+            "native",
+            "persistent"
+          ],
+          "started_utc": "2026-11-19T07:02:41.689538+00:00",
+          "latency_us": {
+            "native": 2.6826575994491577,
+            "persistent": 3.517047262191773
+          },
+          "delta_ps_native_us": 0.8343896627426153,
+          "finished_utc": "2026-11-19T07:02:41.797309+00:00"
+        }
+      ],
+      "pool_len": 33,
+      "kernels_per_graph": 1000,
+      "replays_per_trial": 10,
+      "ratio_ps_native": 1.3116233827079624,
+      "delta_ps_native_us": 0.8361922979354857
+    }
+  ]
+}

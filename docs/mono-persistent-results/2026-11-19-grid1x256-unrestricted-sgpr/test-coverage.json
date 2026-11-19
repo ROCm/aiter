@@ -1,0 +1,9 @@
+{
+  "test_dual_norm_native_persistent": 50,
+  "test_dual_norm_separate_eps_and_floor": 3,
+  "test_output_quant_native_persistent": 43,
+  "test_output_quant_scale_boundaries": 1,
+  "test_output_quant_scale_ownership": 1,
+  "test_output_contract_rejects_bad_buffers": 1,
+  "test_graph_replay_changes_inputs": 9
+}
