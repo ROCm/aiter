@@ -75,6 +75,17 @@ an isolated op benchmark must be labeled as such.
 
 ### Current measured result: 2026-11-19
 
+Published evidence is in [mono-persistent-results/2026-11-19](mono-persistent-results/2026-11-19).
+The [manifest](mono-persistent-results/2026-11-19/manifest.json) records the tested
+commit, result counts and file hashes. The four performance JSON files contain
+all 15 trial samples. JUnit, the real launch gate and the process audit are
+included. `validation-evidence.tar.gz` contains actual wrapper JIT IR, ISA,
+code objects and metadata, full profiler traces, final test logs, and the two
+earlier performance rounds. `jit-evidence.json` maps each JIT hash to archive
+paths. The archive preserves original runtime paths in the raw launch maps;
+use the manifest and JIT evidence map to locate the portable copies.
+
+
 Tested code: `9a294c8c1661c5c69e8b75ea8c8ce7fdb7d977c8`.
 The full acceptance item remains open. Correctness and standalone launch
 checks pass. The c16 A03 performance gate fails.

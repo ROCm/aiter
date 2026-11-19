@@ -2,6 +2,9 @@
 
 ## Current acceptance checklist: 2026-11-19
 
+[Published raw results and JIT evidence](mono-persistent-results/2026-11-19)
+include all four target profiles and the rejected weight-load trial.
+
 Tested code: `9a294c8c1661c5c69e8b75ea8c8ce7fdb7d977c8`.
 The [current contract](mono-persistent-validation.md#current-acceptance-contract-2026-11-19)
 supersedes the historical scope. The full acceptance item does not pass.
