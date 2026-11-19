@@ -263,6 +263,15 @@ jobs:
           ${{ env.BUILD_DOCKER_IMAGE }} \
           sleep infinity
 
+      - name: Configure Git workspace trust
+        if: ${{ matrix.build_enabled }}
+        run: |
+          set -e
+          docker exec \
+          -w /workspace \
+          aiter_build_${{ matrix.python_version }} \
+          git config --global --add safe.directory /workspace
+
       - name: Install Dependencies (legacy rocm/pytorch image)
         if: ${{ matrix.build_enabled && env.USE_MANYLINUX != 'true' }}
         run: |
