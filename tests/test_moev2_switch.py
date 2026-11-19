@@ -226,6 +226,23 @@ def test_gpu_suites_cover_exactly_the_planned_paths():
     assert set(gpu_suites.PATHS) == set(paths.PLANNED)
 
 
+def test_gpu_suite_runner_enables_the_selected_path(monkeypatch):
+    from moe_dispatch import gpu_suites
+
+    seen = []
+
+    def run(cmd, *, check, env):
+        seen.append((cmd, check, env[envs.AITER_MOEV2]))
+        return type("Result", (), {"returncode": 0})()
+
+    suite = gpu_suites.Suite(("python3", "selected_path_test.py"))
+    monkeypatch.setattr(gpu_suites, "PATHS", {"a8w8_pt": (suite,)})
+    monkeypatch.setattr(gpu_suites, "SHARED", ())
+    monkeypatch.setattr(gpu_suites.subprocess, "run", run)
+    assert gpu_suites.main(["--path", "a8w8_pt", "--run"]) == 0
+    assert seen == [(suite.cmd, False, "a8w8_pt")]
+
+
 def test_legacy_fused_moe_is_a_plain_function():
     assert inspect.isfunction(legacy.fused_moe)
     assert not hasattr(legacy.fused_moe, "cache_info")

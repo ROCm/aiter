@@ -99,38 +99,41 @@ def prologue(call, quant_remap) -> Call:
 
 
 def run_whole_graph(c: Call, metadata, block_size_M, q_dtype_a):
-    full_output = metadata.full_impl(
-        FusedMoeRequest(
-            hidden_states=c["hidden_states"],
-            w1=c["w1"],
-            w2=c["w2"],
-            topk_weight=c["topk_weight"],
-            topk_ids=c["topk_ids"],
-            expert_mask=c["expert_mask"],
-            activation=c.activation,
-            quant_type=c.quant_type,
-            doweight_stage1=c["doweight_stage1"],
-            w1_scale=c["w1_scale"],
-            w2_scale=c["w2_scale"],
-            a1_scale=c["a1_scale"],
-            a2_scale=c["a2_scale"],
-            block_size_m=(int(block_size_M) if block_size_M is not None else None),
-            ksplit=metadata.ksplit,
-            num_local_tokens=c["num_local_tokens"],
-            moe_sorting_dispatch_policy=c["moe_sorting_dispatch_policy"],
-            dtype=c.dtype,
-            hidden_pad=c["hidden_pad"],
-            intermediate_pad=c["intermediate_pad"],
-            bias1=c["bias1"],
-            bias2=c["bias2"],
-            swiglu_limit=c["swiglu_limit"],
-            beta=c["beta"],
-            linear_beta=c["linear_beta"],
-            gate_mode=c.gate_mode,
-            q_dtype_a=q_dtype_a,
-            q_dtype_w=c["w1"].dtype,
-        )
+    request = FusedMoeRequest(
+        hidden_states=c["hidden_states"],
+        w1=c["w1"],
+        w2=c["w2"],
+        topk_weight=c["topk_weight"],
+        topk_ids=c["topk_ids"],
+        expert_mask=c["expert_mask"],
+        activation=c.activation,
+        quant_type=c.quant_type,
+        doweight_stage1=c["doweight_stage1"],
+        w1_scale=c["w1_scale"],
+        w2_scale=c["w2_scale"],
+        a1_scale=c["a1_scale"],
+        a2_scale=c["a2_scale"],
+        block_size_m=(int(block_size_M) if block_size_M is not None else None),
+        ksplit=metadata.ksplit,
+        num_local_tokens=c["num_local_tokens"],
+        moe_sorting_dispatch_policy=c["moe_sorting_dispatch_policy"],
+        dtype=c.dtype,
+        hidden_pad=c["hidden_pad"],
+        intermediate_pad=c["intermediate_pad"],
+        bias1=c["bias1"],
+        bias2=c["bias2"],
+        swiglu_limit=c["swiglu_limit"],
+        beta=c["beta"],
+        linear_beta=c["linear_beta"],
+        gate_mode=c.gate_mode,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=c["w1"].dtype,
+        w1_global_scale=c["w1_global_scale"],
+        w2_global_scale=c["w2_global_scale"],
     )
+    full_call = functools.partial(metadata.full_impl, request)
+    hooks.record_kernel("whole_graph", full_call)
+    full_output = full_call()
     return _return_output(full_output, c["output"])
 
 

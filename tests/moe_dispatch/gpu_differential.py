@@ -34,6 +34,8 @@ _A8W8_PT_DEFAULT = (
     *((m, 4096, 512, 64, 4, "Silu", True, "bf16", False) for m in (8, 300)),
     *((m, 2048, 256, 64, 6, "Silu", False, "fp16", False) for m in (5, 200)),
     *((m, 7168, 256, 64, 8, "Silu", False, "bf16", True) for m in (16, 512)),
+    # A shipped gfx942-cu80 row selects the FlyDSL whole-graph implementation.
+    (1, 4096, 192, 192, 8, "Silu", False, "bf16", False),
 )  # fmt: skip
 
 
@@ -158,16 +160,17 @@ def run_case(path_name, case):
     torch.cuda.synchronize()
     _clear_dispatch_caches()
     with moev2_mode("off"), captured_logs() as legacy_logs:
-        _raised(lambda: fm.fused_moe(**call))
+        legacy_error = _raised(lambda: fm.fused_moe(**call))
     _clear_dispatch_caches()
     with moev2_mode(path_name), captured_logs() as v2_logs:
         v2_error = _raised(lambda: fm.fused_moe(**call))
     if legacy_logs != v2_logs:
         return f"{case}: log lines differ\n    legacy: {legacy_logs}\n    v2:     {v2_logs}"
     if legacy_error or v2_error:
-        if legacy_error != v2_error:
-            return f"{case}: legacy raises {legacy_error}; v2 raises {v2_error}"
-        return None
+        return (
+            f"{case}: expected successful execution; "
+            f"legacy raises {legacy_error}; v2 raises {v2_error}"
+        )
     try:
         run_differential(path_name, call)
     except AssertionError as exc:

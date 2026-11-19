@@ -90,6 +90,9 @@ def dispatch_key(c: Call):
         "has_num_local_tokens": c["num_local_tokens"] is not None,
         "_exclude_mxmoe": False,
         "_has_input_activation_scales": c["a1_scale"] is not None,
+        "has_global_scale": (
+            c["w1_global_scale"] is not None or c["w2_global_scale"] is not None
+        ),
     }
     return args, kwargs, q_dtype_a
 
@@ -180,6 +183,8 @@ def op_call(call) -> dict | None:
         "herd_topk": call["herd_topk"],
         "herd_routed_scaling_factor": call["herd_routed_scaling_factor"],
         "deterministic": call["deterministic"],
+        "w1_global_scale": call["w1_global_scale"],
+        "w2_global_scale": call["w2_global_scale"],
     }
 
 
@@ -225,6 +230,8 @@ def fused_moe(
     herd_topk: int = 0,
     herd_routed_scaling_factor: float = 1.0,
     deterministic: bool = False,
+    w1_global_scale: torch.Tensor | None = None,
+    w2_global_scale: torch.Tensor | None = None,
 ):
     """Same contract as `aiter.fused_moe.fused_moe`, served by aiter.moev2."""
     call = dict(locals())

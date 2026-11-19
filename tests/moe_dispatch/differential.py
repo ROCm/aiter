@@ -17,6 +17,7 @@ tests/moe_dispatch/gpu_differential.py).
 
 import argparse
 import contextlib
+import dataclasses
 import json
 import os
 import pathlib
@@ -182,18 +183,20 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
         return {
             ("", ""): f"stages differ: {[n for n, _ in legacy]} vs {[n for n, _ in v2]}"
         }
-    stage1 = dict(legacy)["stage1"]
-    v2_stage1 = dict(v2)["stage1"]
-    # Executor and legacy both call stage 1 as (a1, w1, w2, sorted_ids,
-    # sorted_expert_ids, num_valid_ids, out, topk, block_m=..., ...).
-    block_m = int(stage1.keywords["block_m"])
-    num_valid = int(stage1.args[5][0])
     roles = {}
-    for a, b, role in zip(stage1.args[3:5], v2_stage1.args[3:5], ("ids", "blocks")):
-        roles[a.data_ptr()], roles[b.data_ptr()] = role, role
-    for _, launch in legacy + v2:
-        if launch.keywords.get("sorted_weights") is not None:
-            roles[launch.keywords["sorted_weights"].data_ptr()] = "ids"
+    block_m = num_valid = None
+    if "stage1" in dict(legacy):
+        stage1 = dict(legacy)["stage1"]
+        v2_stage1 = dict(v2)["stage1"]
+        # Executor and legacy both call stage 1 as (a1, w1, w2, sorted_ids,
+        # sorted_expert_ids, num_valid_ids, out, topk, block_m=..., ...).
+        block_m = int(stage1.keywords["block_m"])
+        num_valid = int(stage1.args[5][0])
+        for a, b, role in zip(stage1.args[3:5], v2_stage1.args[3:5], ("ids", "blocks")):
+            roles[a.data_ptr()], roles[b.data_ptr()] = role, role
+        for _, launch in legacy + v2:
+            if launch.keywords.get("sorted_weights") is not None:
+                roles[launch.keywords["sorted_weights"].data_ptr()] = "ids"
     topk_ids, expert_mask = call["topk_ids"], call.get("expert_mask")
     slots = None if expert_mask is None else expert_mask[topk_ids.long()].bool()
     skip = {out_legacy.data_ptr(), out_v2.data_ptr()}
@@ -207,6 +210,25 @@ def compare_launches(legacy, v2, call, out_legacy, out_v2):
             continue
         pairs = [(i, x, y) for i, (x, y) in enumerate(zip(a.args, b.args))]
         pairs += [(k, a.keywords[k], b.keywords[k]) for k in a.keywords]
+        expanded = []
+        for where, x, y in pairs:
+            if dataclasses.is_dataclass(x) and dataclasses.is_dataclass(y):
+                if type(x) is not type(y):
+                    problems[name, where] = (
+                        f"{name}[{where}]: {type(x).__name__} vs {type(y).__name__}"
+                    )
+                    continue
+                expanded.extend(
+                    (
+                        f"{where}.{field.name}",
+                        getattr(x, field.name),
+                        getattr(y, field.name),
+                    )
+                    for field in dataclasses.fields(x)
+                )
+            else:
+                expanded.append((where, x, y))
+        pairs = expanded
         for where, x, y in pairs:
             if not isinstance(x, torch.Tensor) or not isinstance(y, torch.Tensor):
                 if x != y:
@@ -280,8 +302,10 @@ def run_differential(path_name, call, *, bitwise=False):
         torch.cuda.synchronize()
         return out, bench
 
-    ref, legacy_launches = launch("off")
-    ref2, _ = launch("off")
+    ref_raw, legacy_launches = launch("off")
+    ref = ref_raw.clone()
+    ref2_raw, _ = launch("off")
+    ref2 = ref2_raw.clone()
     results = []
 
     def run(c):
@@ -295,14 +319,15 @@ def run_differential(path_name, call, *, bitwise=False):
             routed = paths.route_to_v2(entry_call, path.entry)
             if routed is None or routed.name != path_name:
                 raise AssertionError(f"path {path_name} does not claim this call")
-        out, v2_launches = launch(path_name)
+        out_raw, v2_launches = launch(path_name)
+        out = out_raw.clone()
     finally:
         paths._REGISTRY[path_name] = path
         paths.reload()
     if len(results) != 1 or results[0] is paths.DECLINED:
         raise AssertionError(f"path {path_name} did not run this call: {results}")
     problems = list(
-        compare_launches(legacy_launches, v2_launches, call, ref, out).values()
+        compare_launches(legacy_launches, v2_launches, call, ref_raw, out_raw).values()
     )
     if problems:
         raise AssertionError(
