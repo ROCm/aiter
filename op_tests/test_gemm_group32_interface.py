@@ -557,6 +557,21 @@ def test_gfx1250_small_splitk_uses_low_resource_profiles():
         and direct.parse_mxfp8_32_wmma_kernel_name(instance.name)["fused_splitk"]
         for instance in small
     )
+    short_pipeline = [
+        instance
+        for instance in fused
+        if (
+            instance.tile_m,
+            instance.tile_n,
+            instance.num_buffers,
+            instance.split_k,
+            instance.cluster_m,
+            instance.cluster_n,
+        )
+        == (128, 128, 2, 4, 1, 1)
+    ]
+    assert len(short_pipeline) == 1
+    assert catalog.kernel_fits_shape(short_pipeline[0], 256, 2304, 6144)
 
 
 def test_gfx1250_compute_catalog_exposes_arbitration_strategy():
