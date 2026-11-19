@@ -7,12 +7,12 @@ name: Triton Test
 #     selection existed. DRY_RUN: 'false' applies the selection; setting it
 #     back to 'true' is the revert for every PR.
 #   - PR label ci:triton-355: that PR runs the full suite.
-# Main runs the full suite once a night, on MI35X and MI300X. A manual run does
-# the same, on any branch. A push to main (a merge) runs the tests that the
-# selection picks for that commit, as a PR does, in a run of its own. The nightly
-# result goes on the open "Triton nightly status" issue, with a mention of each
-# user in .github/triton-nightly-watchers.txt. GitHub emails the users that it
-# mentions.
+# Main runs the full suite once a night, on MI350X DPX and MI300X. A manual run
+# does the same, on any branch. A push to main (a merge) runs the tests that the
+# selection picks for that commit, as a PR does, in a run of its own. The
+# nightly result goes on the open "Triton nightly status" issue, with a mention
+# of each user in .github/triton-nightly-watchers.txt. GitHub emails the users
+# that it mentions.
 
 on:
   push:
@@ -122,12 +122,12 @@ jobs:
       artifact-name: ${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
       retention-days: 3
 
-  # Step 2: MI35X matrix jobs
+  # Step 2: MI350X DPX matrix jobs
   triton:
     if: ${{ needs.split_triton_tests.outputs.selected_count != '0' }}
-    name: Triton Tests (MI35X) / Shard ${{ matrix.shard }}
-    runs-on: linux-aiter-mi35x-1
-    timeout-minutes: 120
+    name: Triton Tests (MI350X DPX) / Shard ${{ matrix.shard }}
+    runs-on: linux-aiter-do-mi350x-dpx-1
+    timeout-minutes: 180
     needs: [split_triton_tests, prepare_triton_wheel, check-signal, ci_config]
     strategy:
       fail-fast: false
@@ -146,7 +146,6 @@ jobs:
           submodules: 'recursive'
 
       - name: Network preflight before Triton artifact downloads
-        if: ${{ startsWith(runner.name, 'linux-aiter-mi35x-1-') }}
         continue-on-error: true
         timeout-minutes: 5
         run: |
@@ -210,7 +209,7 @@ jobs:
           path: triton_wheels
 
       - name: Speedtest after Triton cache or artifact download failure
-        if: ${{ always() && startsWith(runner.name, 'linux-aiter-mi35x-1-') && (steps.download_triton_shards.outcome == 'failure' || steps.restore_triton_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
+        if: ${{ always() && (steps.download_triton_shards.outcome == 'failure' || steps.restore_triton_wheel.outcome == 'failure' || steps.download_triton_wheel.outcome == 'failure') }}
         continue-on-error: true
         timeout-minutes: 5
         run: |
@@ -279,6 +278,29 @@ jobs:
           --name triton_test \
           ${{ env.DOCKER_IMAGE }}
 
+      - name: Verify DPX 1-GPU visibility
+        run: |
+          set -euo pipefail
+          docker exec \
+          -w /workspace \
+          triton_test \
+          bash -lc '
+            set -euo pipefail
+            echo "=== /dev/dri render devices ==="
+            ls -l /dev/dri/renderD* || true
+            python3 - <<'"'"'PY'"'"'
+          import torch
+
+          count = torch.cuda.device_count()
+          print(f"torch.cuda.is_available={torch.cuda.is_available()}")
+          print(f"torch.cuda.device_count={count}")
+          for idx in range(count):
+              print(f"torch.cuda.device[{idx}]={torch.cuda.get_device_name(idx)}")
+          if count != 1:
+              raise SystemExit(f"Expected exactly 1 visible GPU on DPX 1-GPU runner, got {count}")
+          PY
+          '
+
       - name: Setup Aiter and Triton
         timeout-minutes: 20
         run: |
@@ -287,7 +309,7 @@ jobs:
           docker exec -w /workspace triton_test ./.github/scripts/build_aiter_triton.sh
 
       - name: Triton Tests
-        timeout-minutes: 60
+        timeout-minutes: 120
         run: |
           set -exo pipefail
           echo "Running Triton Tests..."
@@ -500,7 +522,7 @@ jobs:
           SELECTION_RESULT: ${{ needs.split_triton_tests.result }}
           SELECTED_COUNT: ${{ needs.split_triton_tests.outputs.selected_count }}
           NEEDS_MI300X: ${{ needs.split_triton_tests.outputs.needs_mi300x }}
-          MI35X_RESULT: ${{ needs.triton.result }}
+          TRITON_RESULT: ${{ needs.triton.result }}
           MI300X_RESULT: ${{ needs.triton-mi300x.result }}
         run: |
           set -euo pipefail
@@ -513,7 +535,7 @@ jobs:
             echo "No Triton/Gluon tests required for this change."
             exit 0
           fi
-          test "$MI35X_RESULT" = success
+          test "$TRITON_RESULT" = success
           if [ "$NEEDS_MI300X" = true ]; then
             test "$MI300X_RESULT" = success
           fi
