@@ -27,6 +27,8 @@ def gemm_a16w16_tdm(
     interleave: bool = False,
     split_k_atomic: bool = False,
     split_k_policy: str | None = None,
+    swiglu_col: int | None = None,
+    out2: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """C = A[M,K] @ B[K,N]; FP16/BF16 output, optional bias.
 
@@ -49,6 +51,12 @@ def gemm_a16w16_tdm(
     input/output dtype (BF16 or FP16, two bytes), not FP32. Bias is added once
     after the completed sum. ``split_k_policy`` is a compatibility alias;
     ``"workspace"`` selects the default, ``"atomic"`` selects BF16 atomics.
+
+    ``swiglu_col`` fuses a SwiGLU epilogue: B's columns from ``swiglu_col`` on are
+    interleaved (gate, up) pairs, and ``silu(gate) * up`` of the rounded products
+    goes to ``out2`` [M, (N - swiglu_col) / 2]. ``out`` is then [M, swiglu_col],
+    or None at ``swiglu_col == 0``, where every column is activated.
+    It requires interleave, split_k == 1, no bias and whole N tiles.
     """
     import flydsl.expr as fx
 
@@ -114,11 +122,40 @@ def gemm_a16w16_tdm(
         b_leading_stride = _leading_stride(
             b, 1, 0, n, "B does not satisfy the NN layout"
         )
-    if out is None:
+    swiglu = swiglu_col is not None
+    all_activated = swiglu and swiglu_col == 0
+    out_n = swiglu_col if swiglu else n
+    if swiglu:
+        if (
+            not interleave
+            or split_k != 1
+            or bias is not None
+            or swiglu_col % block_n
+            or n % block_n
+            or not 0 <= swiglu_col < n
+            or (out is None) != all_activated
+            or out2 is None
+            or out2.shape != (m, (n - swiglu_col) // 2)
+            or out2.dtype != a.dtype
+            or out2.device != a.device
+        ):
+            raise ValueError("unsupported swiglu epilogue configuration")
+    elif out2 is not None:
+        raise ValueError("out2 requires swiglu_col")
+    if all_activated:
+        # No tile takes the plain path, so the kernel never writes through out.
+        out = out2
+        out_n = out2.shape[1]
+    elif out is None:
         out = torch.empty((m, (n + 7) // 8 * 8), device=a.device, dtype=a.dtype)[:, :n]
-    if out.shape != (m, n) or out.dtype != a.dtype or out.device != a.device:
+    if out.shape != (m, out_n) or out.dtype != a.dtype or out.device != a.device:
         raise ValueError("out must be [M,N] with the input dtype and device")
-    c_leading_stride = _leading_stride(out, 1, 0, n, "out must be row-major [M,N]")
+    c_leading_stride = _leading_stride(out, 1, 0, out_n, "out must be row-major [M,N]")
+    c2_leading_stride = (
+        _leading_stride(out2, 1, 0, out2.shape[1], "out2 must be row-major")
+        if swiglu
+        else c_leading_stride
+    )
     if split_k_atomic and c_leading_stride % 2:
         raise ValueError("split_k_atomic requires an even output leading stride")
     if bias is not None and (
@@ -129,6 +166,13 @@ def gemm_a16w16_tdm(
     ):
         raise ValueError("bias must be contiguous [N] with the input dtype and device")
     tensors = [a, b, out] + ([] if bias is None else [bias])
+    if swiglu and not all_activated:
+        tensors.append(out2)
+        if m * c2_leading_stride > (2**32 - 1) // 2:
+            raise ValueError("tensor offsets exceed the supported 32-bit byte range")
+        out2_lo, out2_hi = _storage_span(out2)
+        if any(_overlaps(out2_lo, out2_hi, t) for t in (a, b, out)):
+            raise ValueError("out2 must not overlap the inputs or out")
     if any(t.data_ptr() % 16 for t in tensors):
         raise ValueError("all pointers must be 16-byte aligned")
     b_rows = n if layout == "nt" else k
@@ -183,6 +227,7 @@ def gemm_a16w16_tdm(
             interleave,
             split_k_atomic,
             device_id=torch.cuda.current_device(),
+            swiglu=swiglu,
         )
         _run_compiled(
             launch,
@@ -197,6 +242,9 @@ def gemm_a16w16_tdm(
             a_leading_stride,
             b_leading_stride,
             c_leading_stride,
+            ptr_arg(out2 if swiglu else out, dtype),
+            c2_leading_stride,
+            swiglu_col if swiglu else 0,
             fx.Stream(stream.cuda_stream),
         )
         for tensor in tensors + [workspace]:
