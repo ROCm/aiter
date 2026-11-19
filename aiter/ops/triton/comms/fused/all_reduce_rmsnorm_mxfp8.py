@@ -48,9 +48,10 @@ class AllReduceRmsnormMxfp8(IpcCommBuffers):
         max_tokens (int): The largest number of tokens of a call.
         hidden (int): The number of bf16 values in a row.
         timeout_s (float): The time limit of each wait in the kernel.
-        config (dict, optional): BLOCKS and num_warps in place of the tuned config,
-            for example for a benchmark sweep. The config is fixed for the comm,
-            because all its launches must use the same CTAs.
+        config (dict, optional): Values that replace the values of the tuned config
+            (BLOCKS, num_warps), for example in a benchmark sweep. An unknown key is
+            an error. The config is fixed for the comm: all its launches must use
+            the same CTAs.
     """
 
     def __init__(self, group, max_tokens, hidden, timeout_s=60.0, config=None):
@@ -59,7 +60,11 @@ class AllReduceRmsnormMxfp8(IpcCommBuffers):
             hidden % 64 == 0 and hidden <= _MAX_HIDDEN
         ), f"hidden must be a multiple of 64, up to {_MAX_HIDDEN}"
         self.hidden, self.max_tokens = hidden, max_tokens
-        self.config = _get_config(hidden) if config is None else dict(config)
+        self.config = _get_config(hidden)
+        if config is not None:
+            unknown = sorted(set(config) - set(self.config))
+            assert not unknown, f"unknown config keys: {unknown}"
+            self.config.update(config)
         assert hidden // 16 <= 64 * self.config["num_warps"], "too few warps for hidden"
         # All CTAs must run at the same time: one CTA a CU.
         self.blocks = min(self.config["BLOCKS"], self.num_cus)

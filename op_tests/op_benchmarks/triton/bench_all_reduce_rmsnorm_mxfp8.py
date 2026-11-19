@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Gluon all-reduce + residual add + RMSNorm + MXFP8 quant on 2, 4 or 8 gfx950 GPUs.
-The time is the slowest rank, in a HIP graph."""
+The time is the slowest rank, in a HIP graph. ``--sweep KEY=V1,V2`` times each
+combination of config values: the tuning scripts cannot time a kernel that all ranks
+must launch together."""
 
 import itertools
 import multiprocessing as mp
@@ -24,9 +26,11 @@ from op_tests.multigpu_tests.triton_test.test_all_reduce_rmsnorm_mxfp8 import (
     generate_all_reduce_rmsnorm_mxfp8_inputs,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    add_sweep_argument,
     get_do_bench_graph_kwargs,
     get_parser,
     get_rot_bufs_kwargs,
+    get_sweep_configs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
@@ -117,17 +121,17 @@ def _worker(rank, init_method, args):
 
 
 def _comms(args, tp):
-    """A comm for each config to time: the tuned config, then each BLOCKS and
-    num_warps pair of --blocks and --num-warps. The constructors are collective."""
-    tuned = AllReduceRmsnormMxfp8(tp.cpu_group, max(args.tokens), args.hidden)
-    comms = {"tuned": tuned}
-    for blocks in args.blocks or [tuned.config["BLOCKS"]]:
-        for warps in args.num_warps or [tuned.config["num_warps"]]:
-            config = {"BLOCKS": blocks, "num_warps": warps}
-            if config != tuned.config:
-                comms[f"BLOCKS={blocks} num_warps={warps}"] = AllReduceRmsnormMxfp8(
-                    tp.cpu_group, max(args.tokens), args.hidden, config=config
-                )
+    """A comm for each config of --sweep, or for the tuned config. The constructors are
+    collective. A config that the constructor rejects is skipped on all ranks."""
+    comms = {}
+    for name, config in get_sweep_configs(args).items():
+        try:
+            comms[name] = AllReduceRmsnormMxfp8(
+                tp.cpu_group, max(args.tokens), args.hidden, config=config
+            )
+        except AssertionError as err:
+            if dist.get_rank(tp.cpu_group) == 0:
+                logger.warning("config %s skipped: %s", name, err)
     return comms
 
 
@@ -143,10 +147,7 @@ def parse_args():
     parser.add_argument(
         "--gemma", action="store_true", default=False, help="Gemma norm (1 + weight)"
     )
-    parser.add_argument(
-        "--blocks", type=int, nargs="+", help="BLOCKS values to sweep (CTAs a launch)"
-    )
-    parser.add_argument("--num-warps", type=int, nargs="+", help="num_warps to sweep")
+    add_sweep_argument(parser)
     parser.add_argument(
         "-o", action="store_true", default=False, help="Write results to CSV"
     )
