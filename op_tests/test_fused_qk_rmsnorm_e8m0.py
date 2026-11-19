@@ -161,26 +161,27 @@ def test_fused_qk_rmsnorm_e8m0(n1, n2, m, transpose_scale, scale_dtype, gs):
     _check_quant(q8, s, q_norm, transpose_scale, gs)
 
 
+@pytest.mark.parametrize("gs", GROUP_SIZES)
 @pytest.mark.parametrize("gemma", [False, True])
 @pytest.mark.parametrize("residual", [False, True])
 @pytest.mark.parametrize("transpose_scale", [True, False])
 @pytest.mark.parametrize("m", [1, 135, 4096])
 @pytest.mark.parametrize(("n1", "n2"), [(1536, 512), (4096, 512)])
 def test_fused_qk_rmsnorm_e8m0_residual_gemma(
-    n1, n2, m, transpose_scale, residual, gemma
+    n1, n2, m, transpose_scale, residual, gemma, gs
 ):
     q, qw, k, kw, res = _inputs(m, n1, n2, m + n1 + 1)
     res = res if residual else None
     q_norm = torch.empty_like(q)
     q8, s, k_out, res_out = _fused_e8m0(
-        q, qw, k, kw, transpose_scale, dtypes.fp8_e8m0, q_norm, res, gemma
+        q, qw, k, kw, transpose_scale, dtypes.fp8_e8m0, q_norm, res, gemma, gs
     )
     x = q.float() + res.float() if residual else q
     if residual:
         assert torch.equal(res_out, x.bfloat16())
     assert _ulps(q_norm, _ref_norm(x, qw, gemma)) <= 1
     assert _ulps(k_out, _ref_norm(k, kw, gemma)) <= 1
-    _check_quant(q8, s, q_norm, transpose_scale)
+    _check_quant(q8, s, q_norm, transpose_scale, gs)
 
 
 if __name__ == "__main__":
