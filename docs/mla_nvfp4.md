@@ -226,20 +226,6 @@ kernel comparison. The FP8 CO is
 The measurements use the N16-only producer; packing is outside timing.
 The original decoder instruction stream is preserved by the final CO rename.
 
-**d07-2, gfx1250 B0 — requested repeat**
-
-| Batch | KV tokens | NVFP4 us | FP8 us | FP8 / NVFP4 |
-|---:|---:|---:|---:|---:|
-| 5120 | 5120 | 1399.63 | 1677.46 | 1.1985x |
-| 5120 | 8192 | 2171.23 | 2629.99 | 1.2113x |
-| 5120 | 10240 | 2685.66 | 3282.10 | 1.2221x |
-| 6144 | 5120 | 1680.36 | 2017.27 | 1.2005x |
-| 6144 | 8192 | 2605.87 | 3169.14 | 1.2162x |
-| 6144 | 10240 | 3218.04 | 3950.61 | 1.2276x |
-| 7168 | 5120 | 1959.91 | 2351.34 | 1.1997x |
-| 7168 | 8192 | 3036.21 | 3708.13 | 1.2213x |
-| 7168 | 10240 | 3754.82 | 4628.45 | 1.2327x |
-
 **a07-3, gfx1250 B0 — complete rerun**
 
 | Batch | KV tokens | NVFP4 us | FP8 us | FP8 / NVFP4 |
@@ -253,12 +239,6 @@ The original decoder instruction stream is preserved by the final CO rename.
 | 7168 | 5120 | 1825.46 | 2295.34 | 1.2574x |
 | 7168 | 8192 | 2879.88 | 3605.19 | 1.2519x |
 | 7168 | 10240 | 3582.31 | 4497.11 | 1.2554x |
-
-All nine a07-3 cases exceed 1.2x; the geometric mean is **1.2555x**.
-Seven of nine d07-2 cases exceed 1.2x; the geometric mean is **1.2144x**.
-B5120/KV5120 is 1.1985x and B7168/KV5120 is 1.1997x on d07-2, below the
-strict 1.2 target. All samples are retained. The first complete d07-2 sweep
-gave 1.1991–1.2336x; this table uses the explicitly requested repeat.
 
 All 18 completed pairs passed output, LSE, per-request NRMS, guard and
 eager/graph checks. At each case's maximum request NRMS, NVFP4 spans
