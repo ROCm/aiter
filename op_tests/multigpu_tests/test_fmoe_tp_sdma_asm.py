@@ -320,7 +320,7 @@ def test_zero_flydsl_import() -> None:
     )
     c2 = (
         "from aiter.ops.asm.fmoe_tp_sdma import load_fmoe_tp_sdma_registry as r; "
-        "assert len(EPI_MODES)==10 and len(r())==144"
+        "assert len(EPI_MODES)==10 and len(r())==180"
     )
     env = {**os.environ, "PYTHONPATH": f"{_REPO_ROOT}:{os.getenv('PYTHONPATH', '')}"}
     subprocess.run([sys.executable, "-c", f"{c1}{c2}"], check=True, env=env)
