@@ -811,6 +811,62 @@ def test_fp8_paged_mqa_logits_mixed_context_lens(batch=5, next_n=3, kv_len=3000)
     )
 
 
+def test_fp8_paged_mqa_logits_dcp_context_lens(batch=5, next_n=3, kv_len=3000):
+    """The (B, next_n) table vLLM builds with DCP 2 on rank 0: each row is the
+    rank's share of that row's global length, so rows repeat (e.g. [50, 51, 51])
+    and top-k reads row j up to its own length. Every column below the last
+    one must be written: a logit, or -inf past the row's bound."""
+    inp = _build_inputs(
+        batch,
+        next_n,
+        HEADS,
+        HEAD_DIM,
+        kv_len,
+        _E4M3_NATIVE,
+        block_size=KV_BLOCK_SIZE,
+        var_ratio=0.9,
+    )
+    kv_cache_kernel, out = _kernel_inputs(inp, batch, next_n, HEAD_DIM)
+    local_lens = inp.context_lens
+    offsets = torch.arange(next_n, dtype=torch.int32, device=local_lens.device)
+    global_lens = 2 * local_lens[:, None] - next_n + 1 + offsets
+    row_lens = ((global_lens + 1) // 2).to(torch.int32).contiguous()
+    assert torch.equal(row_lens[:, -1], local_lens)
+    assert bool((row_lens[:, 1:] == row_lens[:, :-1]).any()), row_lens.tolist()
+    ref = run_torch(
+        inp.q,
+        inp.kv_cache_fp8,
+        inp.weights,
+        local_lens,
+        inp.block_tables,
+        inp.max_model_len,
+        inp.fp8_dtype,
+        block_size=KV_BLOCK_SIZE,
+    )
+    for split_kv in (0, 3):
+        # NaN marks a column the kernel did not write.
+        out.fill_(float("nan"))
+        flydsl_fp8_paged_mqa_logits(
+            inp.q_fp8,
+            kv_cache_kernel,
+            inp.weights,
+            out,
+            row_lens,
+            inp.block_tables,
+            inp.max_model_len,
+            Preshuffle=True,
+            KVBlockSize=KV_BLOCK_SIZE,
+            SplitKV=_split_arg(split_kv),
+        )
+        msg = f"dcp context_lens split_kv={split_kv} rows={row_lens.tolist()}"
+        for b, length in enumerate(local_lens.tolist()):
+            rows = slice(b * next_n, (b + 1) * next_n)
+            assert not out[rows, :length].isnan().any(), f"{msg}: unwritten column"
+            out[rows, length:] = float("-inf")
+        _grade(ref, out, msg)
+    aiter.logger.info("fp8_paged_mqa_logits dcp context_lens ok")
+
+
 def test_fp8_paged_mqa_logits_bad_context_lens(next_n=3, kv_len=3000):
     """Layouts the kernel would read wrongly raise ``ValueError``."""
     batch = 4
@@ -1066,6 +1122,7 @@ def main():
         )
     ]
     test_fp8_paged_mqa_logits_mixed_context_lens()
+    test_fp8_paged_mqa_logits_dcp_context_lens()
     test_fp8_paged_mqa_logits_bad_context_lens()
     if get_gfx() == "gfx1250":
         test_fp8_paged_mqa_logits_padded_rows()
