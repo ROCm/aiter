@@ -47,6 +47,7 @@ The Step 8 output rules are reproduced verbatim below, because the most-violated
     - In this tier the line is advisory in both directions: a slower hand-measured number is not a gate, and `MEASURED` is not clearance — one run on a shared box is weak evidence, so report the sample count with it.
   - Never label a hand-run number `(deterministic)`, and never soften a `stages.perf` `fail`
     into `(advisory)`. The label is the reader's only signal for whether a reproducer exists.
+- **The Size, Design and Human lines are status lines, not findings.** They ride the header block with Review/Validation/Perf, never as findings — the 5-finding cap must not be able to evict them, and the refutation steps do not put them on trial. `Design (advisory)` tells the reader the design judgment was routed to the `Human:` line, not made here.
 - The review line is always advisory. `🔴 HIGH RISK` requests human attention; it is not a merge gate. A deterministic `Validation: BLOCK` may gate because its reproducer is in the report.
 
 ```
@@ -59,6 +60,9 @@ Validation (deterministic): [PASS/NEEDS_WORK/BLOCK/INCONCLUSIVE — target, exac
 Perf (deterministic): [REGRESSION | NO REGRESSION — median_ratio N on <worst_column> over N rows, threshold T]
   ...or, when the report carries no usable stages.perf, this line instead:
 Perf (advisory): [MEASURED — shapes, base vs head with units, delta, sample count | N/A — no runtime surface changed | NOT RUN — reason]
+Size: [N lines / M files | N lines / M files — over the review bar]
+Design (advisory): [the decision | NONE — reason | SPLIT — the natural seams]
+Human: [recommend <person> review <question> | N/A — reason]
 
 🔴 [specific finding — what, where, why it matters]
 ⚠️ [specific finding]
@@ -97,6 +101,47 @@ each is **one sentence** stating the problem, a short clause stating the impact,
 hold more than one piece of evidence, **put the strongest one in the body**; fold the rest into
 the same finding's sentence or drop them — `at most 5 findings` already forces the trade-off.
 
+Step 7.8 is quoted verbatim below for the same reason — it is the step a detail-focused
+reviewer skips, because it is the one step that is not about a detail:
+
+```
+## Step 7.8 — Design Assessment
+
+**The one judgment this skill does not make: whether the design is right.** Every step
+above checks the diff against a rule, and rules are local — they catch a wrong line, not a
+wrong plan. Route that judgment to a person instead of making it: the routing is
+mechanically checkable, the judgment is not.
+
+Write two lines into `$WORK/design.txt`, then mirror them on the card's header block:
+
+```
+DESIGN: <the decision that, once made, explains the rest of the diff> | NONE -- <the existing pattern this change sits inside> | SPLIT -- <the natural seams>
+HUMAN: recommend <person> review <the question only they can answer> | N/A -- <reason>
+```
+
+- `DESIGN:` names the choice — a cache layout, a dispatch order, a data format. `NONE --
+  <reason>` is for a diff that sits inside an existing pattern and decides nothing; the
+  reason names that pattern, and a bare `NONE` is a skipped step.
+- `HUMAN:` routes the decision to a person from `$WORK/reviewers.txt` — this PR's reviewers
+  plus the authors who last touched the changed paths, never the PR's own author. The
+  question names the decision and this PR. `N/A -- <reason>` only when the design is `NONE`
+  or the roster is empty.
+- **Size bar:** the header carries `Size: N lines / M files` (from `$WORK/size.txt`; the
+  gate recomputes it from the PR metadata). Past **1000 lines or 15 files** a review
+  degrades from reading to sampling — the Size line says `over the review bar` and
+  `DESIGN:` becomes `SPLIT -- <the natural seams>`: over the bar the split is not a
+  judgment to weigh, it is the recommendation — the worker's only judgment is where the
+  seams fall, and the `HUMAN:` line routes the design question as in any other review.
+  ghstack makes a stacked split cheap; recommend it rather than complain about the size.
+- A lean concern with a concrete case is an ordinary finding; a taste is not. "This
+  abstraction has one implementation" with file:line is a Step 5/7 finding — "over-engineered"
+  with no case goes nowhere: not into a finding, not into the design lines.
+
+Step 8's `design` gate checks the routing, not the judgment: the lines exist in both
+places, the size is the PR's real size, the person is on the roster and not the author, the
+question names this PR, and an over-bar PR carries a split.
+```
+
 ---
 
 # 2. Materials
@@ -104,8 +149,9 @@ the same finding's sentence or drop them — `at most 5 findings` already forces
 `{{WORK}}` holds all of Step 1's output: `pr.diff`, `pr_meta.json`, `rules.txt`, `rules_expanded.txt`,
 `applies.txt`, `merge_target.txt`, `guards.txt`, `siblings.txt`, `symbols.txt`, `twins.txt`,
 `test_quality.txt`, `kernel_tests.txt`, `ci_coverage.txt`, `perf_claims.txt`, `struct_abi.txt`,
-`comment_only.txt`, `evidence.txt`, `validation_requirement.json`,
+`comment_only.txt`, `evidence.txt`, `size.txt`, `reviewers.txt`, `validation_requirement.json`,
 plus `merge-target/` (the base-side worktree) and `head/` (the PR head file tree).
+You write `design.txt` yourself (Step 7.8) — it is not in this list because Step 1 does not produce it.
 
 **Both worktrees are read-only**: do not write into them or create symlinks pointing at them. To build an experiment sandbox, make a new directory under `/tmp`.
 
