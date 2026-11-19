@@ -177,8 +177,17 @@ def test_public_default_reaches_native_entry(monkeypatch, splits):
         assert args[14].dtype == args[15].dtype == torch.float32
 
 
-@pytest.mark.parametrize("n,csa_rows", [(8, 4096), (16, 1024), (32, 1024), (96, 1024)])
-def test_auto_split_matches_forced(monkeypatch, n, csa_rows):
+@pytest.mark.parametrize(
+    "n,csa_rows,window",
+    [
+        (8, 4096, None),
+        (16, 1024, None),
+        (32, 1024, None),
+        (96, 1024, None),
+        (32, 1024, 16),
+    ],
+)
+def test_auto_split_matches_forced(monkeypatch, n, csa_rows, window):
     native_module = importlib.import_module("aiter.ops.mla_sparse_prefill_v41_asm")
     native_entry = native_module.asm_mla_sparse_prefill_v41_fwd
     selected = []
@@ -190,11 +199,22 @@ def test_auto_split_matches_forced(monkeypatch, n, csa_rows):
     monkeypatch.setattr(
         native_module, "asm_mla_sparse_prefill_v41_fwd", record_and_launch
     )
-    inputs, expected = _case(n=n, csa_rows=csa_rows)
+    inputs, expected = _case(
+        n=n, csa_rows=csa_rows, swa_rows=128 if window is None else n, window=window
+    )
     nnz = inputs["kv_indices_prefix"].numel() + inputs["kv_indices_extend"].numel()
     split = native_module._auto_v41_asm_splits(
         n, nnz, prefix_nnz=inputs["kv_indices_prefix"].numel()
     )
+    if window is not None:
+        # Cover sliding-window correctness with the host-selected S4 launch.
+        assert split == 4
+        indptr = inputs["kv_indptr_extend"].tolist()
+        indices = inputs["kv_indices_extend"].tolist()
+        for token in (window - 1, window, n - 1):
+            assert indices[indptr[token] : indptr[token + 1]] == list(
+                range(max(0, token + 1 - window), token + 1)
+            )
     actual = _invoke(inputs, None)
     _check(actual, expected)
     forced = _invoke(inputs, split)
