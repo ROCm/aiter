@@ -715,6 +715,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             args.tune_file = MXSCALE_TUNED_FILE
         if args.libtype == "opus" and not self._mxscale_table:
             self.parser.error("OPUS tuning requires --mxscale_table")
+        self._baseline_tunedf = self.get_tuned_gemm_list(args.tune_file)
         super().pre_process(args)
 
     def _clear_op_caches(self):
@@ -1134,7 +1135,9 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             return []
         results = self._run_tasks(task, args)
         if self._gfx1250_1x32:
-            return self._confirm_gfx1250_1x32(results, task, tunedf, args)
+            return self._confirm_gfx1250_1x32(
+                results, task, getattr(self, "_baseline_tunedf", tunedf), args
+            )
         return results
 
     def _run_tasks(self, tasks, args):
