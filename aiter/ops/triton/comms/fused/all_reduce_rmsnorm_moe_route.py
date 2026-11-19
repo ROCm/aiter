@@ -370,13 +370,14 @@ def fused_all_reduce_rmsnorm_moe_route(
         eps (float): The epsilon of the norm.
         router_weight (torch.Tensor): Contiguous [experts, hidden], fp32 or bf16 (as comm).
         comm (AllReduceRmsnormMoeRoute): The buffers of the group.
-        correction_bias (torch.Tensor, optional): [experts] fp32, added for the selection only.
-            Only with sigmoid scoring.
+        correction_bias (torch.Tensor, optional): Contiguous [experts] fp32, added for the
+            selection only. Only with sigmoid scoring.
         scoring (str): "sigmoid" or "softmax".
         renormalize (bool): Divide the weights by their sum.
         routed_scaling_factor (float): Factor of the weights.
-        num_expert_group (int): Expert groups (1: no group limit).
-        topk_group (int): Groups a token can use.
+        num_expert_group (int): Expert groups (1: no group limit). With a correction bias,
+            each group needs 2 experts or more.
+        topk_group (int): Groups a token can use. They must have topk experts or more.
         gemma (bool): Use 1 + weight (Gemma norm) in place of weight.
         quant (bool): Also write the MXFP8 copy of the normed rows.
         block_size (int): The moe_sorting block.
@@ -413,6 +414,7 @@ def fused_all_reduce_rmsnorm_moe_route(
     assert router_weight.is_contiguous()
     if correction_bias is not None:
         assert correction_bias.dtype == torch.float32 and correction_bias.shape == (e,)
+        assert correction_bias.is_contiguous(), "correction_bias must be contiguous"
     assert scoring in _SCORING, f"scoring must be one of {tuple(_SCORING)}"
     assert correction_bias is None or scoring == "sigmoid", (
         "correction_bias needs sigmoid scoring: with softmax, vLLM ranks the experts "
@@ -420,6 +422,15 @@ def fused_all_reduce_rmsnorm_moe_route(
     )
     assert num_expert_group >= 1 and e % num_expert_group == 0
     assert 1 <= topk_group <= num_expert_group <= 32
+    group_size = e // num_expert_group
+    assert topk_group * group_size >= k, (
+        f"the {topk_group} kept groups have {topk_group * group_size} experts, "
+        f"fewer than topk={k}"
+    )
+    assert num_expert_group == 1 or correction_bias is None or group_size >= 2, (
+        "with a correction bias, the score of a group is the sum of its 2 best "
+        "experts: each group needs 2 experts or more"
+    )
     assert block_size in (16, 32, 64, 128)
     dev = x.device
     o = dict(out or {})

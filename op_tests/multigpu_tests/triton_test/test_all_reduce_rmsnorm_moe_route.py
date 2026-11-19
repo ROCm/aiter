@@ -443,20 +443,31 @@ def _check_routing_edges(rank, device, tp, failures):
                     f"{tag}: softmax weights {w.tolist()} (renorm {renorm})"
                 )
         bias = torch.zeros((e,), dtype=torch.float32, device=device)
-        try:
-            fused_all_reduce_rmsnorm_moe_route(
-                x,
-                None,
-                norm_w,
-                EPS,
-                router_w,
-                comm,
-                correction_bias=bias,
-                scoring="softmax",
-            )
-            failures.append(f"{tag}: softmax with a correction bias was accepted")
-        except AssertionError:
-            pass
+        strided = torch.zeros((2 * e,), dtype=torch.float32, device=device)[::2]
+        rejected = {
+            "softmax with a correction bias": {
+                "correction_bias": bias,
+                "scoring": "softmax",
+            },
+            "a strided correction bias": {"correction_bias": strided},
+            "kept groups with fewer experts than topk": {
+                "num_expert_group": 8,
+                "topk_group": 1,
+            },
+            "groups of one expert with a correction bias": {
+                "correction_bias": bias,
+                "num_expert_group": 16,
+                "topk_group": 4,
+            },
+        }
+        for name, kwargs in rejected.items():
+            try:
+                fused_all_reduce_rmsnorm_moe_route(
+                    x, None, norm_w, EPS, router_w, comm, **kwargs
+                )
+                failures.append(f"{tag}: {name} was accepted")
+            except AssertionError:
+                pass
         if comm.error() != [0, 0, 0, 0]:
             failures.append(f"{tag}: error {comm.error()}")
     finally:
