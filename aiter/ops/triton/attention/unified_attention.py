@@ -97,6 +97,12 @@ _GFX12_3D_PREFILL_SPLIT = os.environ.get("AITER_UA3D_PREFILL_SPLIT", "1") == "1"
 # gfx1250 2D kernel, a prefill whose grid leaves CUs idle: split the KV range when the
 # attn_2d entry has SPLIT_* keys (_gfx12_2d_split). Off: AITER_UA2D_PREFILL_SPLIT=0.
 _GFX12_2D_PREFILL_SPLIT = os.environ.get("AITER_UA2D_PREFILL_SPLIT", "1") == "1"
+# AITER_UA_FP4PT_NO_SPECIALIZE=1: the gfx1250 2D kernel takes the KV pool's page count (num_blocks) as a runtime,
+# never-specialized i32 instead of a constexpr. num_blocks only bounds the TDM descriptors' rows (the loaders clamp
+# the page ids to the sequence's own pages), but a constexpr keys the compile, and a served pool's count comes from
+# the memory profile: it differs per DP rank and per restart, so every prefill shape a fresh server meets (BLOCK_M,
+# NUM_SPLITS, GATE) recompiles for seconds and the on-disk cache never covers it. Any KV format (A8K4V4PT, A8K4V8).
+_GFX12_UA_RUNTIME_NUM_BLOCKS = os.environ.get("AITER_UA_FP4PT_NO_SPECIALIZE", "0") == "1"
 # Opt-in floor on the gfx1250 gluon 3d KV split (decode and spec-decode verify).
 # The split is sized from the launch's program count, so a CUDA graph captured
 # at a batch wider than the live sequences (DP padding) splits too few ways.
@@ -1653,7 +1659,10 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         out_scale_ptr=params.output_scale if num_splits == 1 else None,
         USE_SINKS=(params.sinks is not None),
         SLIDING_WINDOW=params.sliding_window,
-        num_blocks=params.num_blocks,
+        # AITER_UA_FP4PT_NO_SPECIALIZE: a constant 0 keys the compile, num_blocks_rt carries the count
+        num_blocks=0 if _GFX12_UA_RUNTIME_NUM_BLOCKS else params.num_blocks,
+        NUM_BLOCKS_RUNTIME=_GFX12_UA_RUNTIME_NUM_BLOCKS,
+        num_blocks_rt=int(params.num_blocks) if _GFX12_UA_RUNTIME_NUM_BLOCKS else None,
         stride_k_cache_0=params.k.stride(0),
         stride_k_cache_1=params.k.stride(1),
         stride_k_cache_2=params.k.stride(2),

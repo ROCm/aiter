@@ -604,7 +604,10 @@ class TDMKVLoader:
         kv_head_idx,
         block_table_stride,
         REMOVE_INDIRECT_ACCESS,
+        num_blocks,
     ):
+        # num_blocks: the KV pool's page count, only the TDM descriptors' row bound: cfg.num_blocks (a
+        # constexpr), or the runtime i32 of NUM_BLOCKS_RUNTIME (AITER_UA_FP4PT_NO_SPECIALIZE)
         kv_cfg = TDMKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
         if cfg.KV_NVFP4:
             return TDMKVLoader.initialize_nvfp4(
@@ -615,14 +618,15 @@ class TDMKVLoader:
                 block_tables_ptr_shifted,
                 kv_head_idx,
                 block_table_stride,
+                num_blocks,
             )
         else:
             k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=key_cache_ptr,
                 shape=(
-                    (cfg.num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE)
+                    (num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE)
                     if cfg.SHUFFLED_KV_CACHE
-                    else (cfg.num_blocks * cfg.BLOCK_SIZE, cfg.NUM_KV_HEADS * cfg.HEAD_SIZE)
+                    else (num_blocks * cfg.BLOCK_SIZE, cfg.NUM_KV_HEADS * cfg.HEAD_SIZE)
                 ),
                 strides=(cfg.stride_k_cache_1, 1),
                 block_shape=(
@@ -635,9 +639,9 @@ class TDMKVLoader:
             v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=value_cache_ptr,
                 shape=(
-                    (cfg.num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE)
+                    (num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE)
                     if cfg.SHUFFLED_KV_CACHE
-                    else (cfg.num_blocks * cfg.BLOCK_SIZE, cfg.NUM_KV_HEADS * cfg.HEAD_SIZE)
+                    else (num_blocks * cfg.BLOCK_SIZE, cfg.NUM_KV_HEADS * cfg.HEAD_SIZE)
                 ),
                 strides=(cfg.stride_v_cache_1, 1),
                 block_shape=(
@@ -692,12 +696,13 @@ class TDMKVLoader:
         block_tables_ptr_shifted,
         kv_head_idx,
         block_table_stride,
+        num_blocks,
     ):
         # A shuffled NVFP4 page row (one block, one KV head) is BLOCK_SIZE * HEAD_SIZE / 2 bytes of packed e2m1
         # followed by BLOCK_SIZE * HEAD_SIZE / 16 e4m3 scales; each part gets its own descriptor and LDS buffer.
         DATA: gl.constexpr = cfg.BLOCK_SIZE * cfg.HEAD_SIZE // 2
         SCALES: gl.constexpr = cfg.BLOCK_SIZE * cfg.HEAD_SIZE // 16
-        ROWS = cfg.num_blocks * cfg.NUM_KV_HEADS
+        ROWS = num_blocks * cfg.NUM_KV_HEADS
         k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=key_cache_ptr,
             shape=(ROWS, DATA),
@@ -1070,14 +1075,17 @@ class TDMGatherKVLoader:
         kv_head_idx,
         block_table_stride,
         REMOVE_INDIRECT_ACCESS,
+        num_blocks,
     ):
+        # num_blocks: the KV pool's page count, only the TDM descriptors' row bound: cfg.num_blocks (a
+        # constexpr), or the runtime i32 of NUM_BLOCKS_RUNTIME (AITER_UA_FP4PT_NO_SPECIALIZE)
         kv_cfg = TDMKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
         if cfg.KV_NVFP4:
             # NVFP4 K pages (data and scales, two gathers) with fp8 V pages; an NVFP4 V runs one page per tile
             gl.static_assert(not cfg.V_NVFP4, "an NVFP4 V runs one page per tile")
             DATA: gl.constexpr = cfg.BLOCK_SIZE * cfg.HEAD_SIZE // 2
             SCALES: gl.constexpr = cfg.BLOCK_SIZE * cfg.HEAD_SIZE // 16
-            ROWS = cfg.num_blocks * cfg.NUM_KV_HEADS
+            ROWS = num_blocks * cfg.NUM_KV_HEADS
             k_shared = gl.allocate_shared_memory(
                 key_cache_ptr.type.element_ty,
                 [cfg.NUM_BUFFERS, cfg.NUM_KV_BLOCKS, DATA],
@@ -1191,7 +1199,7 @@ class TDMGatherKVLoader:
 
             k_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=key_cache_ptr,
-                shape=(cfg.num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE),
+                shape=(num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE),
                 strides=(
                     (cfg.stride_k_cache_1, 1)
                     if cfg.SHUFFLED_KV_CACHE
@@ -1202,7 +1210,7 @@ class TDMGatherKVLoader:
             )
             v_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=value_cache_ptr,
-                shape=(cfg.num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE),
+                shape=(num_blocks * cfg.NUM_KV_HEADS, cfg.BLOCK_SIZE * cfg.HEAD_SIZE),
                 strides=(
                     (cfg.stride_v_cache_1, 1)
                     if cfg.SHUFFLED_KV_CACHE
@@ -2918,7 +2926,7 @@ def unified_attention_gluon_kernel_2d_repr(specialization):
 
 @gluon.jit(
     repr=unified_attention_gluon_kernel_2d_repr,
-    do_not_specialize=["block_table_stride", "num_seqs"],
+    do_not_specialize=["block_table_stride", "num_seqs", "num_blocks_rt"],
 )
 def _unified_attention_gluon_kernel_2d(
     query_ptr,  # [num_tokens, num_query_heads, head_size]
@@ -2995,6 +3003,11 @@ def _unified_attention_gluon_kernel_2d(
     gate_ptr=None,
     gate_stride_0=0,
     GATE: gl.constexpr = False,
+    # AITER_UA_FP4PT_NO_SPECIALIZE: the KV pool's page count as a runtime i32 (num_blocks_rt, never specialized)
+    # instead of the num_blocks constexpr. The count only bounds the TDM descriptors' rows, but as a constexpr it
+    # keys the compile, and a served pool's count is the memory profile's: per DP rank and per restart.
+    NUM_BLOCKS_RUNTIME: gl.constexpr = False,
+    num_blocks_rt=None,
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     kv_head_idx = gl.program_id(0)
@@ -3236,6 +3249,10 @@ def _unified_attention_gluon_kernel_2d(
     # sequence's own pages; the overhang then re-reads its last page, which
     # the mask drops like any key past seq_len.
     seq_pages = gl.minimum((seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE, block_table_stride)
+    if NUM_BLOCKS_RUNTIME:
+        kv_num_blocks = num_blocks_rt
+    else:
+        kv_num_blocks: gl.constexpr = cfg.num_blocks
     kv_loader = KVLoader.initialize(
         cfg,
         key_cache_ptr,
@@ -3244,6 +3261,7 @@ def _unified_attention_gluon_kernel_2d(
         kv_head_idx,
         gl.maximum(seq_pages, 1),
         REMOVE_INDIRECT_ACCESS,
+        kv_num_blocks,
     )
 
     if not USE_SINKS:
