@@ -181,6 +181,10 @@ def launch_gemm_a8w8(
     block = num_waves * WAVE
     if fused_splitk:
         # Geometry of splitk_fused_epilogue_gfx1250 (see fused_splitk_ok).
+        if block < 128:
+            raise ValueError(
+                f"[FlyDSL gfx1250] fused_splitk needs at least 4 waves, got {num_waves}"
+            )
         lanes_per_row = tile_n // 4
         rows_per_iter, reduce_m = block // lanes_per_row, tile_m // split_k
         tdm_rows = (tile_m - reduce_m, *(() if split_k == 2 else (reduce_m,)))
@@ -188,7 +192,7 @@ def launch_gemm_a8w8(
             1,
             min(
                 UNROLL,
-                MAX_PARTIAL_VECTORS // max(1, block // 128) // split_k,
+                MAX_PARTIAL_VECTORS // (block // 128) // split_k,
                 reduce_m // max(1, rows_per_iter),
             ),
         )

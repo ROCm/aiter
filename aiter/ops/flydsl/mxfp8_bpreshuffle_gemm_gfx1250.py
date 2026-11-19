@@ -49,11 +49,14 @@ def fused_splitk_ok(
 
     The epilogue wraps peer stripes with ``& (split_k - 1)``, so only 2/4/8 splits qualify,
     and it stores whole passes of ``rows_per_iter * unroll`` rows, so a stripe taller than
-    one row pass must be a whole number of passes.
+    one row pass must be a whole number of passes. Its load batch is sized per 128
+    threads, so at least four waves are needed.
     """
     waves, lanes_per_row = m_warp * n_warp, tile_n // 4
+    if waves < 4:
+        return False
     rows_per_iter, reduce_m = waves * 32 // lanes_per_row, tile_m // split_k
-    partial_vectors = _FUSED_MAX_PARTIAL_VECTORS // max(1, waves * 32 // 128)
+    partial_vectors = _FUSED_MAX_PARTIAL_VECTORS // (waves * 32 // 128)
     unroll = max(
         1,
         min(

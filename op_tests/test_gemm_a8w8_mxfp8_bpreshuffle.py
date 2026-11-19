@@ -246,6 +246,8 @@ def test_fused_splitk_whole_row_passes():
         epilogue.MAX_PARTIAL_VECTORS,
     )
     assert not flydsl_gemm.fused_splitk_ok(192, 256, 2, 2, 1, 1, 2)
+    # The epilogue sizes its load batch per 128 threads: two waves must not fuse.
+    assert not flydsl_gemm.fused_splitk_ok(32, 64, 1, 2, 1, 1, 2)
     m, n, k = 192, 256, 1024
     name = "flydsl_mxfp8_128_bpreshuffle_wmma_t192x256x128_mw2_nw2_nb2_sk2_cm1_cn1_fsk"
     xq, x_scale, weight, w_scale = _fused_splitk_operands(128, m, n, k)

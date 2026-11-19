@@ -117,6 +117,11 @@ def run_preshuffle_gemm_a8_gfx1250(
     split_k = max(1, int(split_k))
     cluster_m = max(1, int(cluster_m))
     cluster_n = max(1, int(cluster_n))
+    if N % (tile_n * cluster_n) != 0:
+        raise RuntimeError(
+            f"[FlyDSL gfx1250] N={N} must be a multiple of "
+            f"tile_n*cluster_n={tile_n}*{cluster_n}={tile_n * cluster_n}"
+        )
 
     if split_k > _MAX_SPLIT_K:
         raise RuntimeError(
