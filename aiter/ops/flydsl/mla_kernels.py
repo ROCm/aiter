@@ -17,7 +17,6 @@ __all__ = [
 ]
 
 _PAGESIZE1_NUM_Q_HEADS = (16, 32, 64, 96, 128)
-_PAGESIZE1_PACKED_Q_HEADS = 64
 
 
 def _require(condition, message):
@@ -76,16 +75,13 @@ def _validate_pagesize1_inputs(
         f"q: expected one of {list(_PAGESIZE1_NUM_Q_HEADS)} heads, "
         f"got {num_q_heads}",
     )
-    _require(
-        max_seqlen_q in (1, 2, 3, 4) or num_q_heads > _PAGESIZE1_PACKED_Q_HEADS,
-        f"max_seqlen_q: expected one of [1, 2, 3, 4], got {max_seqlen_q}",
-    )
-    _require(
-        num_q_heads > _PAGESIZE1_PACKED_Q_HEADS
-        or num_q_heads * max_seqlen_q <= 2 * _PAGESIZE1_PACKED_Q_HEADS,
-        f"q: {num_q_heads} heads support max_seqlen_q up to "
-        f"{min(4, 2 * _PAGESIZE1_PACKED_Q_HEADS // num_q_heads)}, got {max_seqlen_q}",
-    )
+    _require(max_seqlen_q >= 1, f"max_seqlen_q: expected >= 1, got {max_seqlen_q}")
+    # The kernel's own layout rule: a work item holds one planner tile of the
+    # query (see mla_common.planner_q_tile_rows), so 32 and 64 heads take
+    # queries longer than 128 / num_q_heads rows as several tiles.
+    from .kernels.mla_gfx1250.mla_common import wave_layout
+
+    wave_layout(num_q_heads, max_seqlen_q)
     _require_layout("q", q, qkv_dtype, (total_q, num_q_heads, 576))
     _require_layout("kv_buffer", kv_buffer, qkv_dtype, (None, 1, 1, 576))
     _require_layout("split_data", split_data, torch.float32, (None, num_q_heads, 512))
@@ -186,6 +182,22 @@ def _run_pagesize1(
         _require_layout("qo_indptr", qo_indptr, torch.int32, (None,))
         _require_layout("kv_indptr", kv_indptr, torch.int32, (qo_indptr.numel(),))
         _require_layout("g_kv_indptr", g_kv_indptr, torch.int32, (qo_indptr.numel(),))
+    # A causal query cut into several qo tiles masks each row from the request's
+    # last row, which the kernel reads from qo_indptr.
+    from .kernels.mla_gfx1250.mla_common import planner_q_tile_rows
+
+    tiled_causal = bool(causal) and planner_q_tile_rows(
+        num_q_heads, max_seqlen_q
+    ) not in (
+        1,
+        max_seqlen_q,
+    )
+    if tiled_causal and not cp_round_robin:
+        _require(
+            qo_indptr is not None,
+            f"causal {num_q_heads}-head decode at max_seqlen_q={max_seqlen_q} needs qo_indptr",
+        )
+        _require_layout("qo_indptr", qo_indptr, torch.int32, (None,))
     if stream is None:
         stream = torch.cuda.current_stream(q.device)
     buffers = (
@@ -215,7 +227,7 @@ def _run_pagesize1(
         kv_page_indices.numel(),
         (
             ptr_arg(qo_indptr, fx.Int32)
-            if cp_round_robin
+            if cp_round_robin or tiled_causal
             else flyc.from_c_void_p(fx.Int32, 0)
         ),
         (
