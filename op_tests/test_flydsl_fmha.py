@@ -3100,4 +3100,12 @@ def main_gfx1201():
 
 
 if __name__ == "__main__":
+    # CI runs op_tests as scripts, so run the pytest suite here; the sweep only
+    # follows a clean pass.
+    status = pytest.main([__file__, "-q", "-p", "no:cacheprovider"])
+    if status != pytest.ExitCode.OK:
+        aiter.logger.error(
+            "flydsl_fmha: checks failed (pytest exit %s); skipping sweep", int(status)
+        )
+        sys.exit(int(status))
     main()
