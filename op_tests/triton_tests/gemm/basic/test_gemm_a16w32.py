@@ -4,8 +4,8 @@
 import pytest
 import torch
 
-import aiter.ops.triton.gemm.basic.gemm_a16w32 as a16w32_op
 from aiter.ops.triton.gemm.basic.gemm_a16w32 import gemm_a16w32, split_bf16x3
+from aiter.ops.triton.utils import fused_splitk
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.utility.graph_alloc import ROUTES_INSIDE_CAPTURE, capture_scoped_cache
 
@@ -113,8 +113,8 @@ def test_gemm_a16w32_repeats_bitwise(M):
 def test_gemm_a16w32_in_graph_capture(M, monkeypatch):
     # A fresh counter cache makes the first split-K call happen inside the capture.
     torch.cuda.synchronize()
-    fresh = capture_scoped_cache(a16w32_op._split_counters.__wrapped__)
-    monkeypatch.setattr(a16w32_op, "_split_counters", fresh)
+    fresh = capture_scoped_cache(fused_splitk._split_counters_keyed.__wrapped__)
+    monkeypatch.setattr(fused_splitk, "_split_counters_keyed", fresh)
     N, K = 128, 6144
     x, w, w_bf16x3, y = generate_gemm_a16w32_inputs(M, N, K)
     graph = torch.cuda.CUDAGraph()

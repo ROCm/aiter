@@ -5,6 +5,9 @@ import torch
 import triton
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
+    _gemm_splitk_reduce_kernel,
+)
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w32 import (
     _gemm_a16w32_bf16x3_kernel,
     _gemm_a16w32_fma_kernel,
@@ -12,14 +15,11 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w32 import (
 )
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
 from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.fused_splitk import fused_splitk_workspace
 from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
 _LOGGER = AiterTritonLogger()
-
-# One split-K arrival counter for each output tile.
-_SPLIT_COUNTERS = 1 << 16
 
 
 def split_bf16x3(weight: torch.Tensor) -> torch.Tensor:
@@ -53,13 +53,6 @@ def split_bf16x3(weight: torch.Tensor) -> torch.Tensor:
     if not torch.isfinite(terms[0]).all():
         raise ValueError("the weight has values that round to inf in bf16")
     return torch.stack(terms).contiguous()
-
-
-@capture_scoped_cache
-def _split_counters(device: torch.device, stream_id: int) -> torch.Tensor:
-    # Zeroed counters for each (device, stream). The kernel resets the ones it uses.
-    with persistent_alloc(device):
-        return torch.zeros(_SPLIT_COUNTERS, dtype=torch.int32, device=device)
 
 
 def gemm_a16w32_fake_tensor(
@@ -106,24 +99,26 @@ def _gemm_bf16x3(x, w_bf16x3, y, config):
     M, K = x.shape
     N = w_bf16x3.shape[1]
     compute_splitk_params(config, K)
-    num_tiles = triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(
-        N, config["BLOCK_SIZE_N"]
-    )
-    workspace, counters = None, None
-    if config["NUM_KSPLIT"] > 1:
-        assert num_tiles <= _SPLIT_COUNTERS, "too many output tiles for split-K"
-        workspace = torch.empty(
-            (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=x.device
-        )
-        stream_id = torch.cuda.current_stream(x.device).cuda_stream
-        counters = _split_counters(x.device, stream_id)
-
-    grid = (num_tiles * config["NUM_KSPLIT"],)
+    block_m, block_n = config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"]
+    splits = config["NUM_KSPLIT"]
+    tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    workspace = None
+    if splits > 1:
+        workspace = fused_splitk_workspace(y, tiles, splits, block_m, block_n)
+    if workspace is None:
+        # Unfused: each split writes its partial, then the reduce kernel adds them.
+        out = y
+        if splits > 1:
+            out = torch.empty((splits, M, N), dtype=torch.float32, device=x.device)
+        grid, partials, counters, fused_splits = (tiles * splits,), None, None, 1
+    else:
+        grid, partials, counters = workspace
+        out, fused_splits = y, splits
     _gemm_a16w32_bf16x3_kernel[grid](
         x,
         w_bf16x3,
-        y,
-        workspace,
+        out,
+        partials,
         counters,
         M,
         N,
@@ -133,11 +128,34 @@ def _gemm_bf16x3(x, w_bf16x3, y, config):
         w_bf16x3.stride(0),
         w_bf16x3.stride(1),
         w_bf16x3.stride(2),
-        y.stride(0),
-        y.stride(1),
+        out.stride(0) if out.dim() == 3 else 0,
+        out.stride(-2),
+        out.stride(-1),
         **config,
+        FUSED_SPLITS=fused_splits,
         NUM_XCDS=get_num_xcds(),
     )
+    if out is not y:
+        _gemm_splitk_reduce_kernel[(triton.cdiv(M, block_m), triton.cdiv(N, block_n))](
+            out,
+            y,
+            None,
+            M,
+            N,
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            y.stride(0),
+            y.stride(1),
+            BLOCK_SIZE_M=block_m,
+            BLOCK_SIZE_N=block_n,
+            ACTUAL_KSPLIT=splits,
+            MAX_KSPLIT=triton.next_power_of_2(splits),
+            ADD_BIAS=False,
+            activation=None,
+            use_activation=False,
+            KERNEL_NAME="_gemm_a16w32_reduce_kernel",
+        )
 
 
 @torch_compile_guard(gen_fake=gemm_a16w32_fake_tensor)
@@ -157,8 +175,8 @@ def gemm_a16w32_(
       program (``BLOCK_SIZE_N`` is 1). It reads 4 bytes for each weight value.
     - ``"compute_bound"``: bf16 MFMA on the three bf16 terms of W. Each K step
       loads the X tile one time and adds the three dots into one fp32
-      accumulator. Split-K is in the kernel. The last split of a tile adds the
-      partials in split order.
+      accumulator. On gfx950 split-K is in the kernel: the last split of a
+      tile adds the partials in split order. Else a reduce kernel adds them.
 
     Both kernels match an fp32 GEMM of X and W up to fp32 rounding. The result
     does not depend on the order in which workgroups finish.
@@ -179,8 +197,8 @@ def gemm_a16w32_(
     Limits: configs exist for gfx950 only. Split-K launches use counters of the
     current stream, and graphs captured on a stream can share its counters. So
     do not run one graph on two streams at the same time, or two graphs captured
-    on one stream at the same time on different streams. With torch < 2.10, run
-    one eager split-K call on a stream before a graph capture on that stream.
+    on one stream at the same time on different streams. With torch < 2.10, a
+    first split-K call on a stream inside a graph capture uses the reduce kernel.
     """
     _LOGGER.info("GEMM_A16W32: x.shape=%s, w.shape=%s", tuple(x.shape), tuple(w.shape))
     assert x.dtype == torch.bfloat16 and x.dim() == 2, "bf16 (M, K) x"

@@ -8,6 +8,10 @@ from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
     pid_grid,
     remap_xcd,
 )
+from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
+    _sum_splits_on_xcd,
+    _tile_on_xcd,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
@@ -20,9 +24,9 @@ _gemm_a16w32_bf16x3_repr = make_kernel_repr(
         "GROUP_SIZE_M",
         "NUM_KSPLIT",
         "SPLITK_BLOCK_SIZE",
+        "FUSED_SPLITS",
         "cache_modifier",
         "EVEN_K",
-        "GRID_MN",
     ],
 )
 
@@ -32,8 +36,6 @@ _gemm_a16w32_bf16x3_repr = make_kernel_repr(
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"]) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"]) == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_gemm_a16w32_bf16x3_repr)
@@ -44,13 +46,14 @@ def _gemm_a16w32_bf16x3_kernel(
     ws_ptr,
     cnt_ptr,
     M,
-    N,
+    N: tl.constexpr,
     K,
     stride_am,
     stride_ak,
     stride_bt,
     stride_bn,
     stride_bk,
+    stride_ck,
     stride_cm,
     stride_cn,
     # Meta-parameters
@@ -60,36 +63,44 @@ def _gemm_a16w32_bf16x3_kernel(
     GROUP_SIZE_M: tl.constexpr,
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
+    FUSED_SPLITS: tl.constexpr,
     cache_modifier: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     NUM_XCDS: tl.constexpr,
 ):
     """C (fp32) = A @ (B[0] + B[1] + B[2])^T, with A (M, K) bf16 and B (3, N, K) bf16.
 
-    Each K step loads A once and adds three MFMA dots into one fp32 accumulator. With
-    NUM_KSPLIT > 1, the last split of a tile adds all partials in split order.
+    Each K step loads A once and adds three MFMA dots into one fp32 accumulator.
+    With FUSED_SPLITS > 1, the last split of a tile adds the partials in split
+    order. Else split pid_k writes its partial to c_ptr + pid_k * stride_ck.
     """
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
     tl.assume(stride_bt > 0)
     tl.assume(stride_bn > 0)
     tl.assume(stride_bk > 0)
+    tl.assume(stride_ck >= 0)
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
 
-    pid_unified = tl.program_id(axis=0)
-    pid_k = pid_unified % NUM_KSPLIT
-    pid = pid_unified // NUM_KSPLIT
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-
-    if NUM_KSPLIT == 1:
-        pid = remap_xcd(pid, GRID_MN, NUM_XCDS=NUM_XCDS)
-        pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+    if FUSED_SPLITS > 1:
+        pid_m, pid_n, tile, pid_k = _tile_on_xcd(N, BLOCK_SIZE_N, FUSED_SPLITS)
+        if pid_m * BLOCK_SIZE_M >= M:
+            return
     else:
-        pid_m = pid // num_pid_n
-        pid_n = pid % num_pid_n
+        pid_unified = tl.program_id(axis=0)
+        pid_k = pid_unified % NUM_KSPLIT
+        pid = pid_unified // NUM_KSPLIT
+        if NUM_KSPLIT == 1:
+            pid = remap_xcd(pid, num_pid_m * num_pid_n, NUM_XCDS=NUM_XCDS)
+            pid_m, pid_n = pid_grid(
+                pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M
+            )
+        else:
+            pid_m = pid // num_pid_n
+            pid_n = pid % num_pid_n
 
     tl.assume(pid_m >= 0)
     tl.assume(pid_n >= 0)
@@ -111,20 +122,34 @@ def _gemm_a16w32_bf16x3_kernel(
         b_ptrs = b_ptr + (
             offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
         )
+        # 2 * stride_bt overflows int32 when N * K >= 2**30.
+        term_stride = stride_bt.to(tl.int64)
 
         for k in range(num_k_iter):
             if EVEN_K:
                 a = tl.load(a_ptrs)
                 b0 = tl.load(b_ptrs, cache_modifier=cache_modifier)
-                b1 = tl.load(b_ptrs + stride_bt, cache_modifier=cache_modifier)
-                b2 = tl.load(b_ptrs + 2 * stride_bt, cache_modifier=cache_modifier)
+                b1 = tl.load(b_ptrs + term_stride, cache_modifier=cache_modifier)
+                b2 = tl.load(b_ptrs + 2 * term_stride, cache_modifier=cache_modifier)
             else:
                 k_left = k_end - (k_start + k * BLOCK_SIZE_K)
                 a = tl.load(a_ptrs, mask=offs_k[None, :] < k_left, other=0.0)
                 b_mask = offs_k[:, None] < k_left
-                b0 = tl.load(b_ptrs, mask=b_mask, other=0.0)
-                b1 = tl.load(b_ptrs + stride_bt, mask=b_mask, other=0.0)
-                b2 = tl.load(b_ptrs + 2 * stride_bt, mask=b_mask, other=0.0)
+                b0 = tl.load(
+                    b_ptrs, mask=b_mask, other=0.0, cache_modifier=cache_modifier
+                )
+                b1 = tl.load(
+                    b_ptrs + term_stride,
+                    mask=b_mask,
+                    other=0.0,
+                    cache_modifier=cache_modifier,
+                )
+                b2 = tl.load(
+                    b_ptrs + 2 * term_stride,
+                    mask=b_mask,
+                    other=0.0,
+                    cache_modifier=cache_modifier,
+                )
 
             accumulator = tl.dot(a, b0, acc=accumulator)
             accumulator = tl.dot(a, b1, acc=accumulator)
@@ -135,44 +160,25 @@ def _gemm_a16w32_bf16x3_kernel(
 
     offs_cm = pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_ptrs = (
+        c_ptr
+        + stride_cm * offs_cm[:, None]
+        + stride_cn * offs_cn[None, :]
+        + pid_k.to(tl.int64) * stride_ck
+    )
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    if NUM_KSPLIT == 1:
-        tl.store(c_ptrs, accumulator, mask=c_mask)
-    else:
-        # Partials go write-through and are read volatile: the last split can run
-        # on another XCD. The split order of the sum makes the result deterministic.
-        ws_tile = offs_cm[:, None] * N + offs_cn[None, :]
-        tl.store(
-            ws_ptr + pid_k * M * N + ws_tile,
+    if FUSED_SPLITS > 1:
+        _sum_splits_on_xcd(
             accumulator,
-            mask=c_mask,
-            cache_modifier=".wt",
+            c_ptrs,
+            c_mask,
+            ws_ptr + tile.to(tl.int64) * (FUSED_SPLITS * BLOCK_SIZE_M * BLOCK_SIZE_N),
+            cnt_ptr + tile,
+            pid_k,
+            FUSED_SPLITS,
         )
-        tile_id = pid_m * num_pid_n + pid_n
-        # The release of the arrival covers only the wave that adds it. So each wave
-        # drains its partial stores before the barrier (a bare s_barrier).
-        tl.inline_asm_elementwise(
-            "s_waitcnt vmcnt(0)",
-            "=v,v",
-            [tile_id],
-            dtype=tl.int32,
-            is_pure=False,
-            pack=1,
-        )
-        tl.debug_barrier()
-        arrived = tl.atomic_add(cnt_ptr + tile_id, 1, sem="acq_rel", scope="gpu")
-        if arrived == NUM_KSPLIT - 1:
-            total = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-            for s in range(NUM_KSPLIT):
-                total += tl.load(
-                    ws_ptr + s * M * N + ws_tile,
-                    mask=c_mask,
-                    other=0.0,
-                    cache_modifier=".cv",
-                )
-            tl.store(c_ptrs, total, mask=c_mask)
-            tl.atomic_xchg(cnt_ptr + tile_id, 0, sem="relaxed", scope="gpu")
+    else:
+        tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 _gemm_a16w32_fma_repr = make_kernel_repr(
@@ -233,7 +239,7 @@ def _gemm_a16w32_fma_kernel(
         else:
             k_mask = offs_k < K - k
             a = tl.load(a_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
-            w = tl.load(w_ptrs, mask=k_mask, other=0.0)
+            w = tl.load(w_ptrs, mask=k_mask, other=0.0, cache_modifier=cache_modifier)
         partial += a.to(tl.float32) * w[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         w_ptrs += BLOCK_SIZE_K * stride_wk
