@@ -96,8 +96,7 @@ def _split_state(state, vec_width):
 @lru_cache(maxsize=1)
 def group_fp8_mx_dtype():
     """e4m3fnuz on gfx942 (MI300), OCP e4m3fn on gfx950+/gfx1250. Matches the C++
-    aiter::kHwFp8MxDtype selection so the e8m0 scale + fp8 bytes align across
-    kernels."""
+    kHwFp8E4m3Dtype selection so the e8m0 scale + fp8 bytes align across kernels."""
     return _MxD.FP8_E4M3_FNUZ if get_rocm_arch() == "gfx942" else _MxD.FP8_E4M3
 
 
