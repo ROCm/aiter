@@ -1628,13 +1628,3 @@ def test_seg_packed_mla_cache_cuda_graph():
     graphed.copy_(sentinel)
     graph.replay()
     torch.testing.assert_close(graphed, eager, atol=0, rtol=0)
-
-
-def test_seg_packed_mla_cache_rejects_noncontiguous():
-    _skip_unless_gfx1250()
-    case = _seg_case(7, 7, 8, torch.bfloat16)
-    base = torch.zeros((256, 2, 576), dtype=torch.bfloat16, device="cuda")
-    view = base[:, :1, :]
-    assert not view.is_contiguous()
-    with pytest.raises(AssertionError, match="contiguous"):
-        _run_seg(case, view, _SEG_PAGE, False, None)

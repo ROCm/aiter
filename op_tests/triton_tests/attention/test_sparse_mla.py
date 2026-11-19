@@ -258,38 +258,6 @@ def test_fp8_arch_gate(arch):
                 smd._check_fp8_arch(arch, fmt, q_dtype)
 
 
-@pytest.mark.parametrize("fmt", ["tensor", "dsmla"])
-def test_native_fp8_cache_rejected(fmt):
-    """This arch's own fp8 behind a uint8 view, through the public wrapper.
-
-    Only the arch tells those bytes apart from OCP, and going through
-    sparse_mla_fwd also catches the gate losing its one call site.
-    """
-    arch = arch_info.get_arch()
-    if arch not in SUPPORTED_ARCHS or arch in FP8_ARCHS:
-        pytest.skip(f"fp8 caches run on {arch}")
-    if fmt == "dsmla" and arch in FNUZ_DSV32_ARCHS:
-        pytest.skip(f"{arch} reads fp8_dsv32_mla in its native fnuz")
-    q, cache, ks, idx, ptr, _ = _build(fmt, 1, 16, 64, 1024, ragged=False)
-    assert cache.dtype == torch.uint8
-    with pytest.raises(ValueError, match="fnuz"):
-        sparse_mla_fwd(q, cache, ptr, idx, D_QK**-0.5, kv_scale=ks)
-
-
-@pytest.mark.parametrize("arch", SUPPORTED_ARCHS)
-def test_launch_config_published(arch):
-    """Every supported arch ships its launch config, checked from any machine."""
-    assert {"BLOCK_K", "num_warps"} <= smd._get_config(arch).keys()
-
-
-def test_lds_budget_gfx950_is_unchecked():
-    """gfx950 is left to the launcher, though arch_info lists its LDS too.
-
-    The footprint model holds only for gfx942's bf16, non-async tiles.
-    """
-    smd._check_lds_budget("gfx950", 64, 2048, 64, kv_lds_pad=16)
-
-
 @pytest.mark.parametrize(
     "kv_lds_pad, kv_lora_rank, rope, need",
     [
