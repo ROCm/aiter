@@ -78,7 +78,7 @@ def pack4(c):
     return c[..., ::2] | (c[..., 1::2] << 4)
 
 
-def pack(qc, qs, cc, cs, aux_layout="n16"):
+def pack(qc, qs, cc, cs):
     b, _, _ = qc.shape
     p = cc.shape[0]
     qn = pack4(qc[..., :512]).copy()
@@ -91,40 +91,20 @@ def pack(qc, qs, cc, cs, aux_layout="n16"):
         .copy()
         .reshape(p, 16384)
     )
-    if aux_layout == "n16":
-        ca = np.full((p, 4, 8, 16, 16), 127, np.uint8)
-        for g in range(4):
-            for f in range(2):
-                ca[:, g, 2 * f : 2 * f + 2] = (
-                    pack4(cc[:, g * 16 : (g + 1) * 16, 512 + f * 64 : 576 + f * 64])
-                    .reshape(p, 16, 2, 16)
-                    .transpose(0, 2, 1, 3)
-                )
-            ca[:, g, 4:6] = (
-                cs[:, g * 16 : (g + 1) * 16, :32]
+    ca = np.full((p, 4, 8, 16, 16), 127, np.uint8)
+    for g in range(4):
+        for f in range(2):
+            ca[:, g, 2 * f : 2 * f + 2] = (
+                pack4(cc[:, g * 16 : (g + 1) * 16, 512 + f * 64 : 576 + f * 64])
                 .reshape(p, 16, 2, 16)
                 .transpose(0, 2, 1, 3)
             )
-            ca[:, g, 6, :, :8] = cs[:, g * 16 : (g + 1) * 16, 32:]
-        return qn, qa, cn, ca.reshape(p, 8192)
-    assert aux_layout == "n32"
-    ca = np.full((p, 2, 4096), 127, np.uint8)
-    for g in range(2):
-        for f in range(2):
-            ca[:, g, f * 1024 : (f + 1) * 1024] = (
-                pack4(cc[:, g * 32 : (g + 1) * 32, 512 + f * 64 : 576 + f * 64])
-                .reshape(p, 2, 16, 2, 16)
-                .transpose(0, 1, 3, 2, 4)
-                .reshape(p, 1024)
-            )
-        ca[:, g, 2048:3072] = (
-            cs[:, g * 32 : (g + 1) * 32, :32]
-            .reshape(p, 32, 4, 8)
+        ca[:, g, 4:6] = (
+            cs[:, g * 16 : (g + 1) * 16, :32]
+            .reshape(p, 16, 2, 16)
             .transpose(0, 2, 1, 3)
-            .reshape(p, 1024)
         )
-        ca[:, g, 3072:3200] = cs[:, g * 32 : (g + 1) * 32, 32:36].reshape(p, 128)
-        ca[:, g, 3200:3328] = cs[:, g * 32 : (g + 1) * 32, 36:].reshape(p, 128)
+        ca[:, g, 6, :, :8] = cs[:, g * 16 : (g + 1) * 16, 32:]
     return qn, qa, cn, ca.reshape(p, 8192)
 
 
@@ -433,14 +413,16 @@ def test_contracts():
     for kw in (
         {"physical_pages": 0},
         {"sm_scale": float("nan")},
+        {"rebase_threshold": 0},
+        {"rebase_threshold": 1},
         {"rebase_threshold": 8},
     ):
         with pytest.raises(ValueError):
             prepare_mla_nvfp4_params(
                 **({"device": "cuda", "physical_pages": 1, "sm_scale": 0.1} | kw)
             )
-    with pytest.raises(ValueError, match="aux_layout"):
-        mla_nvfp4_update_cache(None, None, None, None, None, None, aux_layout="unknown")
+    with pytest.raises(TypeError, match="aux_layout"):
+        mla_nvfp4_update_cache(None, None, None, None, None, None, aux_layout="n32")
 
 
 def test_stream_graph_compile():
@@ -488,7 +470,7 @@ def test_quantize_q():
     np.testing.assert_array_equal(qa.cpu().numpy(), ref[1])
 
 
-def cpu_cache(raw, valid, aux_layout="n16"):
+def cpu_cache(raw, valid):
     cc = np.zeros((2, 64, 640), np.uint8)
     cs = np.full((2, 64, 40), 127, np.uint8)
     x = np.where(np.arange(16)[:, None] < valid, raw, 0).astype(np.float32)
@@ -504,12 +486,10 @@ def cpu_cache(raw, valid, aux_layout="n16"):
         np.zeros((1, 128, 40), np.uint8),
         cc,
         cs,
-        aux_layout,
     )[2:]
 
 
-@pytest.mark.parametrize("aux_layout", ["n16", "n32"])
-def test_cache_tail_requantization_and_graph(aux_layout):
+def test_cache_tail_requantization_and_graph():
     rng = np.random.default_rng(31)
     raw = torch.from_numpy(rng.normal(0, 0.15, (1, 16, 576)).astype(np.float32)).to(
         torch.bfloat16
@@ -523,38 +503,19 @@ def test_cache_tail_requantization_and_graph(aux_layout):
     valid = gpu(np.array([5], np.int32))
     cn = torch.zeros((2, 16384), device="cuda", dtype=torch.uint8)
     ca = torch.full((2, 8192), 127, device="cuda", dtype=torch.uint8)
-    mla_nvfp4_update_cache(tiles, pages, groups, valid, cn, ca, aux_layout=aux_layout)
+    mla_nvfp4_update_cache(tiles, pages, groups, valid, cn, ca)
     previous = cn.clone()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        mla_nvfp4_update_cache(
-            tiles, pages, groups, valid, cn, ca, aux_layout=aux_layout
-        )
+        mla_nvfp4_update_cache(tiles, pages, groups, valid, cn, ca)
     valid.fill_(6)
     graph.replay()
-    ref_cn, ref_ca = cpu_cache(raw[0].float().numpy(), 6, aux_layout)
+    ref_cn, ref_ca = cpu_cache(raw[0].float().numpy(), 6)
     np.testing.assert_array_equal(cn[1, 12288:].cpu().numpy(), ref_cn[1, 12288:])
     assert not torch.equal(cn[1, 12288:12544], previous[1, 12288:12544])
     assert (cn[0] == 0).all() and (ca[0] == 127).all()
-    if aux_layout == "n16":
-        np.testing.assert_array_equal(ca[1, 6144:].cpu().numpy(), ref_ca[1, 6144:])
-        assert (ca[1, :6144] == 127).all()
-        return
-    # The legacy token16 owns scattered fields in N32's AUX arena.
-    ref_ca = ref_ca[1].reshape(2, 4096)[1]
-    got = ca[1].cpu().numpy().reshape(2, 4096)[1]
-    for start, end in (
-        (512, 1024),
-        (1536, 2048),
-        (2176, 2304),
-        (2432, 2560),
-        (2688, 2816),
-        (2944, 3072),
-        (3136, 3200),
-        (3264, 3328),
-        (3712, 4096),
-    ):
-        np.testing.assert_array_equal(got[start:end], ref_ca[start:end])
+    np.testing.assert_array_equal(ca[1, 6144:].cpu().numpy(), ref_ca[1, 6144:])
+    assert (ca[1, :6144] == 127).all()
 
 
 def test_bf16_producers_to_decode():

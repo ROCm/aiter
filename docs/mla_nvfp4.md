@@ -53,7 +53,8 @@ The pipeline overlaps KV prefetch with QK/PV and uses separate startup and drain
 paths. Output uses LDS staging and tensor stores. O24a retains the public ABI
 and N16 AUX cache layout; its probability quantization differs from O21y's N32
 groups, so output bits can change for the same packed inputs.
-The default log2 rescale threshold is 6; 0 and 1 are explicit alternatives.
+The only supported log2 rescale threshold is 6; the parameter helper rejects
+other values.
 Its fixed PSF multiplier 5 folds in the KV gain. Arbitrary global gains or
 unquantized probabilities are not supported by this code object.
 
@@ -114,11 +115,12 @@ stream, or establish an event dependency across streams. Shape checks do not
 read GPU metadata back: valid CSR, page IDs, params capacity and live finite
 scales remain caller contracts. Per-request KV length must fit signed int32.
 
-The current decoder requires `aux_layout="n16"`, the cache writer's default.
-The writer also accepts `aux_layout="n32"` for the previous decoder's format.
-These AUX byte layouts are incompatible despite having the same tensor shape.
-Rebuild old AUX caches with the current producer before using this CO; do not
-reuse an N32 cache with the new decoder. Q and NoPE layouts are unchanged.
+The cache writer only emits N16 AUX. Its `aux_layout` keyword and native layout
+flag have been removed. Existing calls should omit the keyword, and old N32 AUX
+caches must be rebuilt from original BF16 data. The layouts are incompatible
+despite having the same tensor shape. Q and NoPE layouts are unchanged.
+The ctypes module is `module_mla_nvfp4_v3`, so existing v1/v2 JIT binaries cannot
+be reused with the smaller argument list; no manual cache deletion is needed.
 
 Prepare immutable params and warm up all selected operators before graph
 capture. The current stream is selected from the input tensor's device.
@@ -260,75 +262,22 @@ fresh complete grid is queued under the shared GPU lock. Complete a07-3
 performance results are pending; the incomplete sweep is excluded from this
 table.
 
-### O24a validation and decode benchmark (2026-11-19)
+### N16-only validation (2026-11-19)
 
-On gfx1250 B0 (d07-2), the NVFP4 and existing FP8 QH128 regression selection
-passed **43 tests**, with no skips. The run used a fresh JIT cache and covered
-the quantized oracle, BF16 producers, B6 rescaling, every tail after the
-four-slot wrap, empty rows, guards, graph replay, fullgraph compile and KV
-addresses above 4GiB. Runtime inspection matched all 94568 decode instruction
-bytes to the manifest and verified 16KiB entries for decode and both producers.
+The final N16-only revision passed **44 selected regression tests on each of
+d07-2 and a07-3**, with no skips. Both used the same pinned ROCm/PyTorch image.
+The a07-3 run built a fresh JIT module. The d07-2 run retained the old v2 module
+and built/selected v3, checking the existing-cache migration path.
 
-The command above checks all outputs and LSEs for nine shapes, using independent
-random BF16 histories and **threshold 6 only**. All nine passed: output and LSE
-element-mismatch ratios were zero at `atol=rtol=0.3`; the largest per-request
-output NRMS was **0.133525** (limit 0.3).
+The selection covers the independent quantized oracle, all score contributions,
+per-token RoPE scales, threshold 6 and rejection of other values, all tails after
+the four-slot wrap, empty rows, output guards, byte-exact BF16 producer layouts,
+active-tail requantization, graph replay, fullgraph compile and KV addresses above
+4GiB, plus the existing FP8 QH128 route. The obsolete N32 writer branch and its
+layout-specific test were removed; the removed keyword is explicitly rejected.
 
-Mean decode time in microseconds, using 30 HIP-event samples of a 32-dispatch
-graph divided by 32; producers, transfers and reference checks are excluded:
-
-| Batch | KV 5120 | KV 8192 | KV 10240 |
-|---:|---:|---:|---:|
-| 5120 | 1360.15 | 2116.49 | 2635.67 |
-| 6144 | 1635.87 | 2552.81 | 3175.12 |
-| 7168 | 1913.14 | 2987.13 | 3715.40 |
-
-These are O24a measurements; no paired baseline was measured in this sweep.
-
-### Previous O21y decode benchmark (2026-11-18)
-
-These measurements describe the previous O21y CO, not the current O24a CO.
-On gfx1250 B0, the page64 benchmark checked every output for batch 1536
-with independent random BF16 KV histories, QH128, one query, no split and B6.
-Output and LSE element-mismatch ratios were zero at the stated tolerances.
-Mean decode time uses 30 HIP-event samples, each a 32-dispatch graph; producers
-and reference evaluation run outside the timed graph.
-
-| KV tokens | Mean decode (us) | Maximum per-request output NRMS |
-|---:|---:|---:|
-| 1024 | 86.478 | 0.183017 |
-| 2048 | 160.188 | 0.165114 |
-| 3072 | 238.664 | 0.156243 |
-| 4096 | 319.234 | 0.141637 |
-| 5120 | 396.416 | 0.135378 |
-
-### Previous implementation validation (2026-11-15)
-
-This record applies to the earlier N16 probability implementation. O21y and
-O24a retain its public symbol and ABI; validation below belongs to that earlier CO.
-
-On gfx1250 B0, the 17 NVFP4 tests passed both from the checkout and from a
-clean wheel installed outside the checkout with a fresh JIT directory. This
-includes the opt-in allocation above 4GiB. Existing QH128/page64 and MLA gate
-regression selection: 61 passed, 5 skipped by platform conditions.
-Profiler kernel metadata verified 16KiB instruction entry alignment for decode
-and both GPU producers, using
-`kernel_object + kernel_code_entry_byte_offset`.
-
-Both paths below execute the same hand-written ASM kernel,
-`mla_nvfp4_n128`, from the same shipped `mla_nvfp4_n128.co`. One runner loads
-and launches it directly with `hipModuleLoad/hipModuleLaunchKernel`; the other
-calls it through AITER's `mla_decode_nvfp4_fwd` wrapper. Their O/LSE outputs
-were bit-identical for all shapes below and were also checked against the
-independent quantized oracle. Alternating 30 rounds of 32-dispatch HIP graphs
-gave these arithmetic means per decode dispatch:
-
-| Batch / KV length | ASM via direct HIP launch (us) | Same ASM via AITER (us) |
-|---|---:|---:|
-| 1 / 128 | 9.828 | 9.774 |
-| 64 / 512 | 20.186 | 20.100 |
-| 128 / 1024 | 35.899 | 35.807 |
-
-These measure the same decode CO inside a graph; the small differences are not
-a kernel speedup claim. They exclude Python enqueue, quantization, cache writes
-and metadata preparation, and are not comparisons with an FP8 MLA backend.
+Runtime inspection on both machines matched all 94568 decode instruction bytes
+to the manifest and verified 16KiB instruction entries for decode and both
+producers. The N16 producer address formulas and quantization arithmetic are
+unchanged by the cleanup. The paired measurements above time decode only and
+do not measure a producer speedup.

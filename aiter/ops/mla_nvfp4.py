@@ -19,8 +19,8 @@ G_KV = 89.6
 G_P = 2688.0
 
 
-# ABI v2 adds the cache layout flag; do not load an existing v1 JIT binary.
-@compile_ops("module_mla_nvfp4_v2", ffi_type="ctypes")
+# ABI v3 removes the legacy AUX layout flag; never reuse a v1/v2 JIT binary.
+@compile_ops("module_mla_nvfp4_v3", ffi_type="ctypes")
 def mla_nvfp4_asm_fwd(
     q_nope: torch.Tensor,
     q_aux: torch.Tensor,
@@ -35,13 +35,13 @@ def mla_nvfp4_asm_fwd(
 ) -> None: ...
 
 
-@compile_ops("module_mla_nvfp4_v2", ffi_type="ctypes")
+@compile_ops("module_mla_nvfp4_v3", ffi_type="ctypes")
 def _mla_nvfp4_quantize_q(
     q: torch.Tensor, q_nope: torch.Tensor, q_aux: torch.Tensor
 ) -> None: ...
 
 
-@compile_ops("module_mla_nvfp4_v2", ffi_type="ctypes")
+@compile_ops("module_mla_nvfp4_v3", ffi_type="ctypes")
 def _mla_nvfp4_update_cache(
     tiles: torch.Tensor,
     page_ids: torch.Tensor,
@@ -49,7 +49,6 @@ def _mla_nvfp4_update_cache(
     valid_tokens: torch.Tensor,
     kv_nope: torch.Tensor,
     kv_aux: torch.Tensor,
-    n16_aux: bool,
 ) -> None: ...
 
 
@@ -70,8 +69,8 @@ def prepare_mla_nvfp4_params(
         raise ValueError("physical_pages must be an integer in [1, INT32_MAX]")
     if not math.isfinite(sm_scale):
         raise ValueError("sm_scale must be finite")
-    if rebase_threshold not in (0.0, 1.0, 6.0):
-        raise ValueError("rebase_threshold must be 0, 1 or 6; use 6 by default")
+    if rebase_threshold != 6.0:
+        raise ValueError("rebase_threshold must be 6 for the N128 decoder")
     device = torch.device(device)
     if device.type != "cuda":
         raise ValueError("params must be prepared on a GPU device")
@@ -163,8 +162,6 @@ def mla_nvfp4_update_cache(
     valid_tokens: torch.Tensor,
     kv_nope: torch.Tensor,
     kv_aux: torch.Tensor,
-    *,
-    aux_layout: str = "n16",
 ) -> None:
     """Requantize BF16 tiles[T,16,576] directly into the page64 cache.
 
@@ -176,14 +173,9 @@ def mla_nvfp4_update_cache(
     old FP4. No other stream/request may concurrently write the same tile.
     Publish page lengths/CSR after this operation on the same stream or event.
     This function does not own a tail ring, page allocator or prefix copy-on-write.
-    aux_layout="n16" writes token16 bricks for the current decoder. "n32"
-    writes the legacy N32 field layout; caches in these layouts cannot be mixed.
+    AUX always uses the N16 token-brick layout consumed by the N128 decoder.
     """
-    if aux_layout not in ("n16", "n32"):
-        raise ValueError("aux_layout must be 'n16' or 'n32'")
-    _mla_nvfp4_update_cache(
-        tiles, page_ids, tile_ids, valid_tokens, kv_nope, kv_aux, aux_layout == "n16"
-    )
+    _mla_nvfp4_update_cache(tiles, page_ids, tile_ids, valid_tokens, kv_nope, kv_aux)
 
 
 __all__ = [
