@@ -4,8 +4,10 @@
 """BF16/F16 Flash Attention kernel for gfx1201 (RDNA4).
 
 Inputs and output are flattened BSHD tensors. The kernel uses wave32 16x16x16
-WMMA, online softmax, and pipelined V loads. It requires ``head_dim >= 64`` and
-``head_dim % 32 == 0``.
+WMMA, online softmax, and pipelined V loads. It requires ``head_dim % 8 == 0``.
+A head_dim that is not a multiple of 16 is padded to the next multiple of 16
+inside the kernel: the padded Q/K/V columns are zero and the padded output
+columns are not stored.
 """
 
 import math as host_math
@@ -28,9 +30,14 @@ NUM_PREFETCH_K = 1
 NUM_PREFETCH_V = 1
 
 
+def _pad_head_dim(head_dim: int) -> int:
+    """head_dim rounded up to the 16-column WMMA step."""
+    return (head_dim + 15) // 16 * 16
+
+
 def get_flash_attn_lds_bytes(head_dim: int, block_n: int) -> int:
     """Return the BF16/F16 kernel's exact static LDS allocation."""
-    stride = head_dim + 4
+    stride = _pad_head_dim(head_dim) + 4
     elements = NUM_PREFETCH_K * block_n * stride
     elements += NUM_PREFETCH_V * block_n * stride
     return elements * 2
@@ -83,19 +90,23 @@ def build_flash_attn_func_module(
 
     BLOCK_N_OUT = BLOCK_N
 
+    assert head_dim % 8 == 0 and head_dim >= 8
+    # The WMMA steps, output chunks and LDS rows use the padded width; global
+    # indexing uses the real head_dim. D_TAIL marks a half-filled last step.
+    HEAD_DIM_PAD = _pad_head_dim(head_dim)
+    D_TAIL = HEAD_DIM_PAD != head_dim
+
     K_STEP_QK = WMMA_K
-    K_STEPS_QK = head_dim // K_STEP_QK
+    K_STEPS_QK = HEAD_DIM_PAD // K_STEP_QK
     WMMA_LANE_K = 8
 
     D_CHUNK = WMMA_N
-    D_CHUNKS = head_dim // D_CHUNK
+    D_CHUNKS = HEAD_DIM_PAD // D_CHUNK
 
     PV_K_STEP = WMMA_K
     PV_K_STEPS = K_SUB_N // PV_K_STEP
 
     assert BLOCK_M % NUM_WAVES == 0
-    assert head_dim % 32 == 0
-    assert head_dim >= 64
     assert dtype_str in ("f16", "bf16")
 
     if sm_scale is None:
@@ -109,8 +120,8 @@ def build_flash_attn_func_module(
     STRIDE_TOKEN = NUM_HEADS * HEAD_DIM
 
     # K/V are row-major in LDS; padding reduces bank conflicts.
-    K_STRIDE = HEAD_DIM + 4
-    V_STRIDE = HEAD_DIM + 4
+    K_STRIDE = HEAD_DIM_PAD + 4
+    V_STRIDE = HEAD_DIM_PAD + 4
 
     if lds_vec_width is None:
         lds_vec_width = (
@@ -120,12 +131,14 @@ def build_flash_attn_func_module(
         )
     if lds_vec_width not in (8, 16):
         raise ValueError(f"lds_vec_width must be 8 or 16, got {lds_vec_width}")
-    VEC_WIDTH = lds_vec_width
+    # With a padded head_dim, 8-wide K/V pieces are either all real columns or
+    # all padding, so the padding is a whole-piece select.
+    VEC_WIDTH = 8 if D_TAIL else lds_vec_width
     (
         THREADS_PER_ROW_LOAD,
         NUM_BATCHES_KV,
         KV_NEEDS_GUARD,
-    ) = kv_load_schedule(BLOCK_SIZE, HEAD_DIM, BLOCK_N, VEC_WIDTH)
+    ) = kv_load_schedule(BLOCK_SIZE, HEAD_DIM_PAD, BLOCK_N, VEC_WIDTH)
     NUM_KV_CHUNKS = BLOCK_N * THREADS_PER_ROW_LOAD
 
     # Buffer loads cap at dwordx4, so V rows are fetched in 8-element pieces.
@@ -318,6 +331,16 @@ def build_flash_attn_func_module(
         def v_buf_base(buf_id):
             return fx.Int64(LDS_V_BASE + buf_id * LDS_V_TILE_SIZE)
 
+        def _load_kv_piece(elem_ptr, idx_fn, row_idx, col, width):
+            """Global K/V piece at (row, col). Pieces past the real head_dim
+            read a valid column of the row and are replaced by zeros."""
+            if const_expr(D_TAIL):
+                col_valid = col < fx.Uint64(HEAD_DIM)
+                safe_col = col_valid.select(col, fx.Uint64(0))
+                vec = _load_global_half_vec(elem_ptr, idx_fn(row_idx, safe_col), width)
+                return col_valid.select(vec, Vec.filled(width, 0.0, elem_dtype))
+            return _load_global_half_vec(elem_ptr, idx_fn(row_idx, col), width)
+
         def coop_load_k(tile_start, buf_id=0):
             tile_start = fx.Int64(tile_start)
             k_base = k_buf_base(buf_id)
@@ -330,14 +353,30 @@ def build_flash_attn_func_module(
                 if const_expr(KV_NEEDS_GUARD):
                     chunk_valid = linear_chunk < fx.Uint64(NUM_KV_CHUNKS)
                     if chunk_valid:
+                        if const_expr(D_TAIL):
+                            vec = _load_kv_piece(
+                                k_elem_ptr,
+                                kv_global_idx,
+                                row_idx,
+                                load_col_base,
+                                VEC_WIDTH,
+                            )
+                            lds_idx = k_base + lds_row * K_STRIDE + load_col_base
+                        else:
+                            g_idx = kv_global_idx(row_idx, load_col_base)
+                            lds_idx = k_base + lds_row * K_STRIDE + load_col_base
+                            vec = _load_global_half_vec(k_elem_ptr, g_idx, VEC_WIDTH)
+                        lds_store(lds_idx, vec)
+                else:
+                    if const_expr(D_TAIL):
+                        vec = _load_kv_piece(
+                            k_elem_ptr, kv_global_idx, row_idx, load_col_base, VEC_WIDTH
+                        )
+                        lds_idx = k_base + lds_row * K_STRIDE + load_col_base
+                    else:
                         g_idx = kv_global_idx(row_idx, load_col_base)
                         lds_idx = k_base + lds_row * K_STRIDE + load_col_base
                         vec = _load_global_half_vec(k_elem_ptr, g_idx, VEC_WIDTH)
-                        lds_store(lds_idx, vec)
-                else:
-                    g_idx = kv_global_idx(row_idx, load_col_base)
-                    lds_idx = k_base + lds_row * K_STRIDE + load_col_base
-                    vec = _load_global_half_vec(k_elem_ptr, g_idx, VEC_WIDTH)
                     lds_store(lds_idx, vec)
 
         def _v_store_row_major(v_base, lds_row, load_col_base, col_extra, vec):
@@ -361,8 +400,8 @@ def build_flash_attn_func_module(
                 else:
                     row_idx = tile_start + lds_row
                 for sv in range_constexpr(V_SUBVECS):
-                    g_idx = v_idx(row_idx, load_col_base + fx.Int64(sv * 8))
-                    vecs.append(_load_global_half_vec(v_buf_ptr, g_idx, 8))
+                    col = load_col_base + fx.Uint64(sv * 8)
+                    vecs.append(_load_kv_piece(v_buf_ptr, v_idx, row_idx, col, 8))
             return vecs
 
         def coop_store_v_lds(vecs, buf_id=0):
@@ -405,8 +444,14 @@ def build_flash_attn_func_module(
         q_b_packs = []
         for ks in range_constexpr(K_STEPS_QK):
             q_col = fx.Int64(ks * K_STEP_QK) + klane * WMMA_LANE_K
+            if const_expr(D_TAIL and ks == K_STEPS_QK - 1):
+                # The upper 8 columns of the last step are padding.
+                q_col_valid = q_col < fx.Int64(HEAD_DIM)
+                q_col = q_col_valid.select(q_col, fx.Int64(0))
             g_idx = global_idx(q_row_safe, q_col)
             raw = _load_global_half_vec(q_elem_ptr, g_idx, 8)
+            if const_expr(D_TAIL and ks == K_STEPS_QK - 1):
+                raw = q_col_valid.select(raw, c_zero_v8f16)
             q_b_packs.append(q_in_bounds.select(raw, c_zero_v8f16))
 
         c_neg_inf = fx.Float32(float("-inf"))
@@ -654,7 +699,12 @@ def build_flash_attn_func_module(
                 o_trunc = Vec(o_norm_vec).to(elem_dtype)
                 d_col = fx.Int64(dc * D_CHUNK) + klane * 8
                 o_global = global_idx(q_row, d_col)
-                _store_global_half(o_elem_ptr, o_global, o_trunc)
+                if const_expr(D_TAIL and dc == D_CHUNKS - 1):
+                    # The upper 8 columns of the last chunk are padding.
+                    if d_col < fx.Int64(HEAD_DIM):
+                        _store_global_half(o_elem_ptr, o_global, o_trunc)
+                else:
+                    _store_global_half(o_elem_ptr, o_global, o_trunc)
 
     @flyc.jit
     def launch_flash_attn_func(
