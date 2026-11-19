@@ -22,7 +22,12 @@ last k-tile); DeepSeek-V4.1's shared-expert down projection has K = 576 at TP4.
 
 On gfx1250 this file also checks the mxfp8_32 GEMM's fused quant epilogue:
 ``y_scale_out`` must be byte-identical to quantize_fp8 of the unfused bf16
-output. gfx1250-strict runs that check and the compute kernelName cases alone.
+output, on the heuristic tile and on tuned tiles that pin each epilogue
+branch (FUSED_QUANT_TILES: one LDS-staged tile and two accumulator tiles, one
+of them with each K loop). gfx1250-strict runs that check and the compute
+kernelName cases alone. gfx1250 also checks that the pipelined K loop
+(kernelName suffix ``_pl``) writes the single-fence loop's (``_nopl``) output
+bit for bit (PIPELINED_CASES).
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
@@ -123,6 +128,53 @@ COMPUTE_CASES = (
 
 # ATOM quantize_fp8's fp8 finite bound. The fused epilogue must match it.
 _FP8_MAX = 448.0
+# Tuned DSv4.1 tiles that pin both fused-quant epilogue branches: one
+# LDS-staged tile and two accumulator tiles. One 16-column WMMA tile per warp
+# (t16x64 nw4) keeps the LDS-staged quant; an even count (t32x64 nw2, t128x128
+# nw2) quantizes from the accumulators. t128x128 runs once with the
+# single-fence K loop (_nopl) and once with the pipelined one (_pl); the other
+# tiles take the default K loop of their name.
+FUSED_QUANT_TILES = (
+    "flydsl_bmm_mxfp8_32_wmma_t16x64x512_mw1_nw4_nb4_sk1_cm1_cn1",
+    "flydsl_bmm_mxfp8_32_wmma_t32x64x512_mw2_nw2_nb4_sk1_cm1_cn1",
+    "flydsl_bmm_mxfp8_32_wmma_t128x128x256_mw2_nw2_nb4_sk1_cm1_cn1_nopl",
+    "flydsl_bmm_mxfp8_32_wmma_t128x128x256_mw2_nw2_nb4_sk1_cm1_cn1_pl",
+)
+# M = 200 is ragged for every tile above; M = 48 is ragged for all but the
+# t16x64 tile, which it fills a whole number of times. Both use the DSv4.1
+# wo_a N, K.
+FUSED_QUANT_TILE_SHAPES = ((8, 48, 1024, 4096), (8, 200, 1024, 4096))
+# The pipelined K loop (kernelName suffix _pl) must give the single-fence
+# loop's (_nopl) output bit for bit: (b, m, n, k, kernelName without a K-loop
+# suffix) for a ragged K (k_tail), for a shipped DSv4.1 _pl row (b=1, as the
+# 2-D table runs it), and
+# for three- and four-buffer tiles on the DSv4.1 N=5120, K=8192 GEMM, where the
+# tail fences wait on fewer outstanding tiles than the steady loop (with two
+# buffers the tail fence count is always 0).
+PIPELINED_CASES = (
+    (2, 200, 512, 576, "flydsl_bmm_mxfp8_32_wmma_t64x128x256_mw2_nw2_nb2_sk1_cm1_cn1"),
+    (
+        1,
+        576,
+        32768,
+        1280,
+        "flydsl_bmm_mxfp8_32_wmma_t192x256x256_mw2_nw2_nb2_sk1_cm1_cn1",
+    ),
+    (
+        1,
+        672,
+        5120,
+        8192,
+        "flydsl_bmm_mxfp8_32_wmma_t192x128x256_mw2_nw2_nb3_sk1_cm1_cn1",
+    ),
+    (
+        1,
+        576,
+        5120,
+        8192,
+        "flydsl_bmm_mxfp8_32_wmma_t128x128x256_mw2_nw2_nb4_sk1_cm1_cn1",
+    ),
+)
 
 
 def _to_e8m0_scale(scale):
@@ -485,8 +537,9 @@ def atom_quantize_fp8(y_bf16: torch.Tensor):
     return q.view(rows, c).contiguous(), code.to(torch.uint8).contiguous()
 
 
-def test_woa_fused_quant_epilogue(b, m, n, k):
-    """``y_scale_out`` must match quantize_fp8 of the unfused bf16 GEMM.
+def test_woa_fused_quant_epilogue(b, m, n, k, kernel_name=None):
+    """``y_scale_out`` must match quantize_fp8 of the unfused bf16 GEMM, both
+    run with ``kernel_name`` (the heuristic tile when None).
 
     Returns (scale mismatches, fp8 mismatches). The n32k4 weight scale needs
     a whole 128-K tile, and the quant needs N and B*N to be whole groups of 32.
@@ -507,12 +560,16 @@ def test_woa_fused_quant_epilogue(b, m, n, k):
     w_shuf = shuffle_weight(w8)
 
     y_bf16 = torch.empty(m, b, n, dtype=dtypes.bf16)
-    run_bmm_a8w8_mxfp8_32_gfx1250(x8, w_shuf, xs8, w_scale, y_bf16)
+    run_bmm_a8w8_mxfp8_32_gfx1250(
+        x8, w_shuf, xs8, w_scale, y_bf16, kernel_name=kernel_name
+    )
     y8_ref, yscale_ref = atom_quantize_fp8(y_bf16.view(m, b * n))
 
     y8 = torch.empty(m, b, n, dtype=dtypes.fp8)
     yscale = torch.empty(m * (b * n // 32), dtype=torch.uint8)
-    run_bmm_a8w8_mxfp8_32_gfx1250(x8, w_shuf, xs8, w_scale, y8, y_scale_out=yscale)
+    run_bmm_a8w8_mxfp8_32_gfx1250(
+        x8, w_shuf, xs8, w_scale, y8, kernel_name=kernel_name, y_scale_out=yscale
+    )
     scale_mismatch = int((yscale.view(m, b * n // 32) != yscale_ref).sum())
     fp8_mismatch = int(
         (
@@ -521,11 +578,175 @@ def test_woa_fused_quant_epilogue(b, m, n, k):
         ).sum()
     )
     print(
-        f"fused quant B={b} M={m} N={n} K={k}: "
+        f"fused quant B={b} M={m} N={n} K={k} tile {kernel_name or 'heuristic'}: "
         f"scale mismatch {scale_mismatch}/{m * b * n // 32}, "
         f"fp8 mismatch {fp8_mismatch}/{m * b * n}"
     )
     return scale_mismatch, fp8_mismatch
+
+
+def test_pipelined_k_loop(b, m, n, k, kernel_name):
+    """``kernel_name + "_nopl"`` and ``kernel_name + "_pl"`` must write the
+    same bf16 output bit for bit (32x32 weight scale, which a ragged K needs).
+    Returns the number of mismatched elements."""
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
+        run_bmm_a8w8_mxfp8_32_gfx1250,
+    )
+
+    torch.manual_seed(SEED)
+    o_mbn = blockwise_randn(m, b, k, dtype=dtypes.bf16)
+    w_bnk = blockwise_randn(b, n, k, dtype=dtypes.bf16, rows=32)
+    x8, xs8 = quant_act_e8m0(o_mbn, 32)
+    w8, ws8 = quant_weight_e8m0(w_bnk, 32, 32)
+    w_shuf = shuffle_weight(w8)
+    outs = []
+    for name in (kernel_name + "_nopl", kernel_name + "_pl"):
+        y = torch.empty(m, b, n, dtype=dtypes.bf16)
+        run_bmm_a8w8_mxfp8_32_gfx1250(
+            x8, w_shuf, xs8, ws8, y, kernel_name=name, w_scale_32x32=True
+        )
+        outs.append(y.view(torch.int16))
+    mismatch = int((outs[0] != outs[1]).sum())
+    print(
+        f"pipelined K loop B={b} M={m} N={n} K={k} {kernel_name}: "
+        f"mismatch {mismatch}/{m * b * n}"
+    )
+    return mismatch
+
+
+# Fused gate_up + SwiGLU + MXFP8 quant at the DSv4.1 shared-expert shape
+# (2*I = 4608, K = 5120): M covers every tile bucket of the picker's table,
+# ragged M included, with swiglu_limit 10, 0 (no clamp, as silu_and_mul) and
+# 5.02, which bf16 cannot hold (the clamped gate is rounded to bf16).
+GATE_UP_SILU_MS = (1, 7, 384, 500, 640, 768, 960, 1152, 1345, 2048, 4096)
+GATE_UP_SILU_SHAPE = (4608, 5120)
+GATE_UP_SILU_LIMITS = (10.0, 0.0, 5.02)
+
+
+def _gate_up_silu_table_tile(m):
+    """The picker table's tile for ``m``, whatever the device: every bucket
+    runs on any gfx1250, also one the picker declines for its CU count."""
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import _GATE_UP_SILU_TILES
+
+    return next(name for bound, name in _GATE_UP_SILU_TILES if m <= bound)
+
+
+def test_gate_up_silu_fused(m, n2, k, limit, kernel_name=None):
+    """``run_gate_up_silu_mxfp8_32_gfx1250`` against the unfused chain: the
+    bf16 gate_up GEMM (same tile), aiter ``silu_and_mul`` and ATOM
+    ``quantize_fp8``. The e8m0 scales must match exactly; an e4m3 code may
+    differ by one step where the epilogue's exp/rcp and silu_and_mul's
+    round to bf16 values on either side of an e4m3 rounding midpoint.
+    Returns (scale mismatches, e4m3 mismatches, e4m3 codes off by > 1)."""
+    from aiter.ops.batched_gemm_op_a8w8 import gate_up_silu_mxfp8_32
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
+        run_bmm_a8w8_mxfp8_32_gfx1250,
+        run_gate_up_silu_mxfp8_32_gfx1250,
+    )
+
+    name = kernel_name or _gate_up_silu_table_tile(m)
+    inter = n2 // 2
+    torch.manual_seed(SEED)
+    x = blockwise_randn(m, 1, k, dtype=dtypes.bf16) * 20
+    # Rows past the clamp, tiny rows and a zero row, each only where it does
+    # not land on another one (at M = 1 the one row carries the clamp).
+    x[: max(m // 8, 1)] *= 8
+    if m >= 4:  # below that m // 4 is row 0, the clamped row
+        x[m // 4 : m // 4 + max(m // 8, 1)] *= 1e-3
+    if m > 1:  # at M = 1 row 0 is already the clamped row
+        x[m - 1] = 0
+    w = blockwise_randn(1, n2, k, dtype=dtypes.bf16, rows=32)
+    x8, xs8 = quant_act_e8m0(x.to(dtypes.bf16), 32)
+    w8, ws8 = quant_weight_e8m0(w, 32, 32)
+    w_shuf = shuffle_weight(w8)
+
+    gu = torch.empty(m, 1, n2, dtype=dtypes.bf16)
+    run_bmm_a8w8_mxfp8_32_gfx1250(
+        x8, w_shuf, xs8, ws8, gu, kernel_name=name, w_scale_32x32=True
+    )
+    act = torch.empty(m, inter, dtype=dtypes.bf16)
+    aiter.silu_and_mul(act, gu.view(m, n2), limit)
+    q_ref, s_ref = atom_quantize_fp8(act)
+
+    q = torch.empty(m, inter, dtype=dtypes.fp8)
+    sc = torch.empty(m, inter // 32, dtype=torch.uint8)
+    run_gate_up_silu_mxfp8_32_gfx1250(
+        x8.view(m, k),
+        w_shuf.view(n2, k),
+        xs8.view(m, k // 32),
+        ws8.view(n2 // 32, k // 32),
+        q,
+        sc,
+        limit,
+        kernel_name=name,
+    )
+    if kernel_name is None:
+        # The registered op picks the same table tile from the runtime rows.
+        q_op, sc_op = gate_up_silu_mxfp8_32(
+            x8.view(m, k),
+            w_shuf.view(n2, k),
+            xs8.view(m, k // 32),
+            ws8.view(n2 // 32, k // 32),
+            limit,
+        )
+        if not (
+            torch.equal(q_op.view(torch.uint8), q.view(torch.uint8))
+            and torch.equal(sc_op.view(torch.uint8), sc)
+        ):
+            print(f"gate_up silu M={m}: registered op differs from the launch")
+            return 1, 1, 1
+    scale_bad = int((sc != s_ref.view(m, inter // 32)).sum())
+    a = q.view(torch.uint8).to(torch.int32)
+    r = q_ref.view(torch.uint8).to(torch.int32)
+    code_bad = int((a != r).sum())
+    # Same sign and adjacent magnitude codes (e4m3 bytes are sign-magnitude).
+    sign_differs = ((a ^ r) & 0x80) != 0
+    magnitude_far = ((a & 0x7F) - (r & 0x7F)).abs() > 1
+    far = int(((a != r) & (sign_differs | magnitude_far)).sum())
+    print(
+        f"gate_up silu M={m} N2={n2} K={k} limit={limit} {name}: scale mismatch "
+        f"{scale_bad}/{m * inter // 32}, e4m3 mismatch {code_bad}/{m * inter} "
+        f"(off by more than one code: {far})"
+    )
+    return scale_bad, code_bad, far
+
+
+def _run_gate_up_silu():
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
+        _gate_up_silu_device_measured,
+        gate_up_silu_kernel_for,
+    )
+
+    n2, k = GATE_UP_SILU_SHAPE
+    # On the part the tiles were measured on, the picker must serve every
+    # bucket with the table's tile; elsewhere it declines (None) and the test
+    # still runs the table's tiles.
+    picks = [gate_up_silu_kernel_for(m, n2, k) for m in GATE_UP_SILU_MS]
+    want = [_gate_up_silu_table_tile(m) for m in GATE_UP_SILU_MS]
+    if _gate_up_silu_device_measured():
+        bad_pick = picks != want
+    else:
+        print("gate_up silu: picker declines on this CU count; table tiles only")
+        bad_pick = any(p is not None for p in picks)
+    cases = list(itertools.product(GATE_UP_SILU_MS, GATE_UP_SILU_LIMITS))
+    res = [test_gate_up_silu_fused(m, n2, k, limit) for m, limit in cases]
+    total = n2 // 2 * sum(m for m, _ in cases)
+    scale_bad = sum(r[0] for r in res)
+    code_bad = sum(r[1] for r in res)
+    far = sum(r[2] for r in res)
+    # Isolated one-step e4m3 differences only (far below the MXFP8 noise).
+    if bad_pick or not res or scale_bad or far or code_bad * 10000 > total:
+        print(f"gate_up silu fused epilogue mismatched (picker wrong: {bad_pick})")
+        raise SystemExit(1)
+    print(f"gate_up silu fused epilogue OK ({len(res)} cases)")
+
+
+def _run_pipelined():
+    bad = sum(bool(test_pipelined_k_loop(*case)) for case in PIPELINED_CASES)
+    if bad:
+        print(f"{bad} pipelined K-loop case(s) mismatched")
+        raise SystemExit(1)
+    print("pipelined K loop ALL BIT-EXACT")
 
 
 def _fused_quant_shapes(args, include_ragged_m):
@@ -542,13 +763,24 @@ def _fused_quant_shapes(args, include_ragged_m):
     return unique
 
 
-def _run_fused_quant(shapes):
+def _run_fused_quant(shapes, pin_tiles=False):
+    """Each shape on the heuristic tile; with ``pin_tiles`` also every
+    FUSED_QUANT_TILES entry on FUSED_QUANT_TILE_SHAPES."""
+    runs = [(shape, None) for shape in shapes]
+    if pin_tiles:
+        runs += [
+            (shape, name)
+            for name in FUSED_QUANT_TILES
+            for shape in FUSED_QUANT_TILE_SHAPES
+        ]
     bad = 0
     ran = 0
-    for b, m, n, k in shapes:
+    for (b, m, n, k), kernel_name in runs:
         if n % 32 or k % 128 or (b * n) % 32:
             continue
-        scale_mismatch, fp8_mismatch = test_woa_fused_quant_epilogue(b, m, n, k)
+        scale_mismatch, fp8_mismatch = test_woa_fused_quant_epilogue(
+            b, m, n, k, kernel_name
+        )
         ran += 1
         if scale_mismatch or fp8_mismatch:
             bad += 1
@@ -641,7 +873,9 @@ def main():
             if custom_shape
             else [(2, m, 1024, 4096) for m in (16, 48, 128, 256)]
         )
-        _run_fused_quant(shapes)
+        _run_fused_quant(shapes, pin_tiles=not custom_shape)
+        if not custom_shape:
+            _run_gate_up_silu()
         return
 
     for dtype in args.dtype:
@@ -660,7 +894,13 @@ def main():
         summarize("batched_gemm (a8w4 and a8w8, each vs its BF16 reference)", gemm_rows)
 
     if arch == "gfx1250":
-        _run_fused_quant(_fused_quant_shapes(args, include_ragged_m=not custom_shape))
+        _run_fused_quant(
+            _fused_quant_shapes(args, include_ragged_m=not custom_shape),
+            pin_tiles=not custom_shape,
+        )
+        if not custom_shape:
+            _run_pipelined()
+            _run_gate_up_silu()
 
 
 if __name__ == "__main__":
