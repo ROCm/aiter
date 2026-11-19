@@ -11,11 +11,13 @@ they can gate every PR without a GPU runner (see tests/conftest.py).
 from __future__ import annotations
 
 import gc
+import json
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from inspect import signature
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
@@ -1657,3 +1659,76 @@ def test_a_triton_gemm_refuses_a_result_that_is_not_y(monkeypatch, op):
     y = _z(2, 3, dtype=torch.bfloat16)
     assert call(*args, y=y) is y
     assert torch.equal(y, torch.ones(2, 3, dtype=torch.bfloat16))
+
+
+# ---------------------------------------------------------------------------
+# Registration actually reaching torch, not just `fake=` being present
+#
+# `tests/test_plugin_contracts.py` reads the source and checks that a route
+# passes `fake=`; the registry check above reads the plugin's own dict. Neither
+# calls into torch. `_as_custom_op` returns None on any failure and logs at
+# debug level, so a torch change that broke `infer_schema` would un-register
+# every contract silently: the gate would stay green, the registry would still
+# list them, and the ops would be back to splitting a caller's graph with
+# nothing to say so.
+#
+# These names are the ones whose contract was changed to make registration
+# possible at all. If registration stops reaching torch, the change has no
+# remaining effect and this is where that shows up.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "op_name",
+    [
+        "gemm_a8w8_blockscale_bpreshuffle",
+        "mla_sparse_prefill",
+        "mla_sparse_prefill_v41",
+        "inverse_rope_group_quant",
+        "pa_decode_bf16",
+    ],
+)
+def test_the_buffer_free_contracts_resolve_under_torch_ops(op_name):
+    """Each contract is reachable as a real custom op after import."""
+    import aiter.ops.attention
+    import aiter.ops.gemm_op_a8w8
+    import aiter.ops.inverse_rope_group_quant
+    import aiter.ops.mla_sparse_prefill  # noqa: F401
+
+    namespace = getattr(torch.ops, "aiter_routed", None)
+    assert namespace is not None, "no routed op registered at all"
+    assert hasattr(namespace, op_name), (
+        f"{op_name} passes fake= but did not reach torch.ops.aiter_routed; "
+        "_as_custom_op swallows the reason, so check its debug log"
+    )
+
+    # The registered schema must carry exactly the contract's parameters.
+    # Comparing against the recorded baseline rather than a list of likely
+    # buffer names: `x_scale` is an output buffer for one of these ops and an
+    # input for another, so a name-based check reads the wrong way round
+    # depending on which op it is applied to.
+    # Split on the arrow first: a tuple return is parenthesised too, so the
+    # last ")" in the string belongs to the result for some of these ops.
+    schema = str(getattr(namespace, op_name).default._schema)
+    head = schema.split("->")[0]
+    parameters = head[head.index("(") + 1 : head.rindex(")")]
+    registered = [
+        part.strip().split()[-1].split("=")[0]
+        for part in parameters.split(",")
+        if part.strip() and part.strip() != "*"
+    ]
+
+    baseline = json.loads(
+        (Path(__file__).with_name("plugin_contracts.json")).read_text()
+    )[op_name]["signature"]
+    expected = [
+        piece.split(":")[0].strip()
+        for piece in baseline.split(", ->")[0].split(",")
+        if piece.strip()
+    ]
+
+    assert registered == expected, (
+        f"{op_name}'s registered schema does not match the recorded contract.\n"
+        f"  registered: {registered}\n"
+        f"  contract:   {expected}"
+    )

@@ -255,6 +255,7 @@ def _inverse_rope_group_quant_contract_fake(
     version=2,
     supersedes={1: "a later aiter release"},
     fake=_inverse_rope_group_quant_contract_fake,
+    mutates_args=[],
 )
 def _inverse_rope_group_quant_routed(
     o: Tensor,

@@ -828,6 +828,7 @@ def _mla_sparse_prefill_contract_fake(
     version=2,
     supersedes={1: "a later aiter release"},
     fake=_mla_sparse_prefill_contract_fake,
+    mutates_args=[],
 )
 def _mla_sparse_prefill_contract(
     q: torch.Tensor,
@@ -1200,6 +1201,7 @@ def _mla_sparse_prefill_v41_contract_fake(
     version=3,
     supersedes={2: "a later aiter release"},
     fake=_mla_sparse_prefill_v41_contract_fake,
+    mutates_args=[],
 )
 def _mla_sparse_prefill_v41_routed(
     q: torch.Tensor,

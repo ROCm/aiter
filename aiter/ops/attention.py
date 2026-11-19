@@ -717,6 +717,13 @@ def _pa_decode_bf16_contract_fake(
 # a v2 call sees ``out=None`` and allocates -- which is v2's semantics exactly.
 # (`rmsnorm` v1 was left out of its own supersedes for the opposite reason: a v1
 # kernel handed a v2 call writes the caller's INPUT.)
+# No `mutates_args=[]` here, unlike the other contracts this change touches.
+# Dropping `out` removes the buffer this op RETURNED, but `split_o`, `split_lse`
+# and `work_info` are still handed to the asm binding as split-KV scratch, and
+# nothing in the tree establishes that the kernel leaves them alone. `route()`
+# says the conservative default costs an `auto_functionalized_v2` wrap while a
+# declared list that lies is undefined behaviour, so the wrap is the cheaper of
+# the two until someone can state per buffer that it is read-only.
 @_route(
     op="pa_decode_bf16",
     version=2,

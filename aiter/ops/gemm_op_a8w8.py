@@ -1602,9 +1602,14 @@ def gemm_a8w8_blockscale(
             # tensors: tracing uses gemm_a8w8_blockscale_fake), so the nested
             # op's body is called directly instead of dispatching
             # torch.ops.aiter.gemm_a8w8_blockscale_bpreshuffle a second time.
-            # A rebound module attribute (e.g. monkeypatched) is still called.
-            bpreshuffle = gemm_a8w8_blockscale_bpreshuffle
-            bpreshuffle = getattr(bpreshuffle, "_eager_body", bpreshuffle)
+            #
+            # The target is the native body rather than the public spelling:
+            # with no output buffer named, the public one now routes, and a
+            # provider serving this nested call would be both the second
+            # dispatch this avoids and a different kernel inside what the
+            # caller asked AITER to compute. A rebound module attribute (e.g.
+            # monkeypatched) is still called.
+            bpreshuffle = _gemm_a8w8_blockscale_bpreshuffle_native
             return bpreshuffle(XQ, WQ, x_scale.view(e8m0), w_scale.view(e8m0), dtype)
         if get_gfx() in ["gfx950"] and m >= 16 and k >= 512 and dtype == dtypes.bf16:
             Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
@@ -1764,7 +1769,6 @@ def _warn_blockscale_asm_row_not_bf16(n: int, k: int, dtype: torch.dtype):
 # independent: gemm_a8w8_blockscale with isBpreshuffled delegates to this one's
 # E8M0 route. Whether they should converge is #7150's question, not this one's;
 # routing them as they are keeps this pilot out of a public API change.
-@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
 def _gemm_a8w8_blockscale_bpreshuffle_native(
     XQ: Tensor,
     WQ: Tensor,
@@ -2063,6 +2067,7 @@ def _gemm_a8w8_blockscale_bpreshuffle_fake(
     version=2,
     supersedes={1: "a later aiter release"},
     fake=_gemm_a8w8_blockscale_bpreshuffle_fake,
+    mutates_args=[],
 )
 def _gemm_a8w8_blockscale_bpreshuffle_routed(
     XQ: Tensor,
@@ -2088,6 +2093,7 @@ def _gemm_a8w8_blockscale_bpreshuffle_routed(
     )
 
 
+@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
 def gemm_a8w8_blockscale_bpreshuffle(
     XQ: Tensor,
     WQ: Tensor,
