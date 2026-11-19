@@ -83,6 +83,19 @@ math, DEV activation loads and DEV + HT output stores are unchanged.
 The prior 16 x 16 measurements below remain historical. GPU validation of
 the new geometry is pending; do not relabel the old trace as a 1 x 256 run.
 
+Candidate commit: `2dc6f7c3516d3a99c04a4be2cd33870775d0e3b4`.
+Black and Ruff pass. All 12 frozen native symbol hashes and 20 offline builds
+pass. Static checks of 12 PS variants pass for DEV loads, DEV + HT stores and
+no s104/s105 operands. These are offline checks, not GPU correctness or launch
+evidence. See the [candidate manifest](mono-persistent-results/2026-11-19-grid1x256/manifest.json).
+
+The GPU attempt waited for the shared lock. Another job held it and four
+waiters preceded this candidate. The attempt was stopped before lock acquisition;
+no UT, real-launch trace or performance run started. The resumable runner is
+in `/home/weizhu15/workspace/mono-grid1x256-20261119`. Resume when the shared
+lock and five-second exclusive idle gate are available. Keep the earlier
+16 x 16 evidence attached to its original revision.
+
 ### Previous 16 x 16 result: 2026-11-19
 
 Published evidence is in [mono-persistent-results/2026-11-19](mono-persistent-results/2026-11-19).

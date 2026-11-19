@@ -1,0 +1,29 @@
+{
+  "candidate_commit": "2dc6f7c3516d3a99c04a4be2cd33870775d0e3b4",
+  "base_commit": "ac58088350b6bf385a41a770ee8b0bea11c1f10a",
+  "requested_tg_grid": [
+    1,
+    256,
+    1
+  ],
+  "requested_threads_per_tg": 128,
+  "tg_id": "program_id(1)",
+  "task_rule": "tg + j * 256",
+  "native_hash_check": "passed",
+  "offline_variants_compiled": 20,
+  "offline_ps_operand_scope_audits_passed": 12,
+  "black": "passed",
+  "ruff": "passed",
+  "gpu_executed": false,
+  "correctness": "pending",
+  "real_launch": "pending",
+  "performance": "pending",
+  "blocking_condition": "Shared GPU lock held by another job; four earlier waiters. The queued attempt was stopped before lock acquisition.",
+  "resume_condition": "Acquire the shared GPU lock and pass the five-second exclusive idle gate.",
+  "previous_16x16_results_apply_to_new_grid": false,
+  "local_results_directory": "/home/weizhu15/workspace/mono-grid1x256-20261119",
+  "files": {
+    "compile-offline.json": "6b5c23176ddc26278cfe6f58a3f160dace9591b7448ee90fc2de47375bee83fa",
+    "offline-audit.json": "7557794d300934e067a496cc10e71ac3de1a4a47f7ed914ebc043e4c62bf50f9"
+  }
+}

@@ -7,6 +7,13 @@ The requirement is fixed 256 TGs. The selected A03/A09 PS grid is now
 Batch selection and memory scope are unchanged. The earlier 16 x 16 checklist
 below records that tested revision only. New GPU validation is pending.
 
+Candidate `2dc6f7c35` passes Black, Ruff, frozen native hashes and 20 offline
+builds. Static checks of 12 PS variants pass. The GPU attempt could not acquire
+the shared lock, with four earlier waiters, and stopped before any GPU launch.
+The [manifest](mono-persistent-results/2026-11-19-grid1x256/manifest.json)
+marks UT, actual dispatch and timing as pending. Resume the saved runner in
+`/home/weizhu15/workspace/mono-grid1x256-20261119` in the next exclusive window.
+
 ## Previous 16 x 16 acceptance checklist: 2026-11-19
 
 [Published raw results and JIT evidence](mono-persistent-results/2026-11-19)
