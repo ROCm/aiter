@@ -4037,91 +4037,19 @@ class Gfx1250Mxfp4Pipeline:
         else:
             direct = fx.Int32(int(t.plan_free)) == 1
         local, dim = tid // 8, (tid % 8) * 16
+        merged = []
         for m in range_constexpr(tiles):
             waves = [2 * (m // 2), 2 * (m // 2) + 1]
             s_waves = [
                 fx.Int32(self.mem.load(s_slot + w * 16 + (dim // 32) * 4, fx.Int32)[0])
                 for w in waves
             ]
-            s_all = fx.max(s_waves[0], s_waves[1])
-            maxima = [
-                fx.Float32(
-                    self.mem.load(
-                        stats + ((m * t.NWARP + w) * 16 + local) * 4, fx.Float32
-                    )[0]
-                )
-                for w in waves
-            ]
-            sums = [
-                fx.Float32(
-                    self.mem.load(
-                        stats + (((tiles + m) * t.NWARP + w) * 16 + local) * 4,
-                        fx.Float32,
-                    )[0]
-                )
-                for w in waves
-            ]
-            row_max = fx.maxnumf(maxima[0], maxima[1])
-            safe = fx.Float32(
-                (row_max > fx.Float32(float("-inf"))).select(row_max, fx.Float32(0.0))
-            )
-            denom = fx.Float32(0.0)
-            acc = fx.Vector.filled(16, 0.0, fx.Float32)
-            for idx in range_constexpr(2):
-                w = waves[idx]
-                weight = fx.Float32(fx.exp2(maxima[idx] - safe, fastmath="afn"))
-                denom = denom + sums[idx] * weight
-                weight = weight * self.pow2(s_waves[idx] - s_all)
-                acc = acc + self.mem.load(
-                    (w * 2 + m % 2) * t.MXFP4_O_BYTES
-                    + (local * t.MXFP4_O_STRIDE + dim) * 4,
-                    fx.Float32,
-                    16,
-                ) * fx.full(16, weight, fx.Float32)
-            inv = fx.Float32(
-                (denom > fx.Float32(0.0)).select(
-                    fx.Float32(rcp_f32(denom)), fx.Float32(0.0)
+            merged.append(
+                self.merge_rows(
+                    m, [(w, w * 2 + m % 2) for w in waves], s_waves, local, dim
                 )
             )
-            restore = s_all - fx.Int32(self.OUT_EXP)
-            high = fx.max(restore, fx.Int32(-126))
-            values = (
-                (acc * fx.full(16, inv, fx.Float32))
-                * fx.full(16, self.pow2(restore - high), fx.Float32)
-                * fx.full(16, self.pow2(high), fx.Float32)
-            ).to(t.q_dtype)
-            row = m * 16 + local
-            if row < t.rows:
-                position = row // t.query_group_size
-                head = ctx.kv_h * t.query_group_size + row % t.query_group_size
-                if direct:
-                    fx.ptr_store(
-                        values,
-                        fx.add_offset(
-                            fx.recast_iter(t.q_dtype, ctx.output_ptr),
-                            (fx.Int64(ctx.planned_seq) * t.query_length + position)
-                            * ctx.stride_q_row
-                            + head * ctx.stride_q_head
-                            + dim,
-                        ),
-                    )
-                else:
-                    partial = (
-                        fx.Int64(ctx.kv_h) * fx.Int64(ctx.capacity)
-                        + fx.Int64(ctx.task_slot)
-                    ) * t.rows + row
-                    fx.ptr_store(
-                        values,
-                        fx.add_offset(
-                            fx.recast_iter(t.q_dtype, ctx.pout_ptr),
-                            partial * t.head_dim + dim,
-                        ),
-                    )
-                    if tid % 8 == 0:
-                        pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
-                        psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
-                        pmax[partial] = row_max * fx.Float32(1.0 / LOG2E)
-                        psum[partial] = denom
+        self.store_rows(merged, local, dim, direct)
 
     @flyc.jit
     def store_wave(self, final, warp, lane16, half, score_scales):
@@ -4171,15 +4099,24 @@ class Gfx1250Mxfp4Pipeline:
                 * score_scales[m]
                 * fx.Float32(1.0 / LOG2E)
             )
-            if row < t.rows:
-                for j in range_constexpr(self.DIM_TILES):
-                    fx.ptr_store(
-                        values[j],
-                        fx.add_offset(pout, partial * t.head_dim + 16 * j + 8 * half),
-                    )
-                if half == 0:
-                    pmax[partial] = row_max
-                    psum[partial] = row_sum
+            stored = (values, row_max, row_sum, partial)
+            if const_expr((m + 1) * 16 <= t.rows):
+                self.store_wave_row(stored, half, pout, pmax, psum)
+            else:
+                if row < t.rows:
+                    self.store_wave_row(stored, half, pout, pmax, psum)
+
+    def store_wave_row(self, stored, half, pout, pmax, psum):
+        # Both half-waves hold the row's maximum and sum, so both store them:
+        # no exec-mask branch between the rows' stores.
+        values, row_max, row_sum, partial = stored
+        for j in range_constexpr(self.DIM_TILES):
+            fx.ptr_store(
+                values[j],
+                fx.add_offset(pout, partial * self.t.head_dim + 16 * j + 8 * half),
+            )
+        pmax[partial] = row_max
+        psum[partial] = row_sum
 
     @flyc.jit
     def store(self, final, warp, lane16, half, tid, score_scales):
@@ -4242,93 +4179,143 @@ class Gfx1250Mxfp4Pipeline:
             fx.Int32(self.mem.load(s_slot + w * 16 + (dim // 32) * 4, fx.Int32)[0])
             for w in range_constexpr(t.NWARP)
         ]
-        s_all = fx.max(fx.max(s_waves[0], s_waves[1]), fx.max(s_waves[2], s_waves[3]))
-        for m in range_constexpr(tiles):
-            maxima = [
-                fx.Float32(
-                    self.mem.load(
-                        stats + ((m * t.NWARP + w) * 16 + local) * 4, fx.Float32
-                    )[0]
-                )
-                for w in range_constexpr(t.NWARP)
-            ]
-            sums = [
-                fx.Float32(
-                    self.mem.load(
-                        stats + (((tiles + m) * t.NWARP + w) * 16 + local) * 4,
-                        fx.Float32,
-                    )[0]
-                )
-                for w in range_constexpr(t.NWARP)
-            ]
-            row_max = maxima[0]
-            for w in range_constexpr(1, t.NWARP):
-                row_max = fx.maxnumf(row_max, maxima[w])
-            safe = fx.Float32(
-                (row_max > fx.Float32(float("-inf"))).select(row_max, fx.Float32(0.0))
+        # Every M-tile merges before any stores: the stores' branches would
+        # otherwise hold each tile's LDS loads behind the previous tile's
+        # stores (G16 x MTP4 wave pairs: four serial ~500-cycle merges).
+        merged = [
+            self.merge_rows(
+                m,
+                [(w, w * tiles + m) for w in range_constexpr(t.NWARP)],
+                s_waves,
+                local,
+                dim,
             )
-            denom = fx.Float32(0.0)
-            acc = fx.Vector.filled(16, 0.0, fx.Float32)
-            for w in range_constexpr(t.NWARP):
-                weight = fx.Float32(fx.exp2(maxima[w] - safe, fastmath="afn"))
-                denom = denom + sums[w] * weight
-                # Each wave's outputs carry its own S: align them to the largest.
-                weight = weight * self.pow2(s_waves[w] - s_all)
-                acc = acc + self.mem.load(
-                    (w * tiles + m) * t.MXFP4_O_BYTES
-                    + (local * t.MXFP4_O_STRIDE + dim) * 4,
-                    fx.Float32,
-                    16,
-                ) * fx.full(16, weight, fx.Float32)
-            # A row's max token has p = 1, so the denominator is a normal f32
-            # when nonzero. A row that sees no token (an MTP position before the
-            # context) stores zeros. The 2**(S - OUT_EXP) restore is exact, down
-            # to subnormal outputs.
-            inv = fx.Float32(
-                (denom > fx.Float32(0.0)).select(
-                    fx.Float32(rcp_f32(denom)), fx.Float32(0.0)
-                )
+            for m in range_constexpr(tiles)
+        ]
+        self.store_rows(merged, local, dim, direct)
+
+    def merge_rows(self, m, sources, s_waves, local, dim):
+        """Row ``m * 16 + local``, dims [dim, +16), of the (wave, O slot)
+        ``sources`` through LDS, whose outputs carry 2**(OUT_EXP - s_waves[i]):
+        the q-dtype values, the row's log2 maximum and its denominator."""
+        t = self.t
+        tiles = t.m_tiles
+        stats = t.mxfp4_stats_offset
+        s_all = s_waves[0]
+        for s_wave in s_waves[1:]:
+            s_all = fx.max(s_all, s_wave)
+        maxima = [
+            fx.Float32(
+                self.mem.load(stats + ((m * t.NWARP + w) * 16 + local) * 4, fx.Float32)[
+                    0
+                ]
             )
-            restore = s_all - fx.Int32(self.OUT_EXP)
-            high = fx.max(restore, fx.Int32(-126))
-            values = (
-                (acc * fx.full(16, inv, fx.Float32))
-                * fx.full(16, self.pow2(restore - high), fx.Float32)
-                * fx.full(16, self.pow2(high), fx.Float32)
-            ).to(t.q_dtype)
-            row = m * 16 + local
-            if row < t.rows:
-                position = ctx.query_begin + row // t.query_group_size
-                head = ctx.kv_h * t.query_group_size + row % t.query_group_size
-                if direct:
-                    fx.ptr_store(
-                        values,
-                        fx.add_offset(
-                            fx.recast_iter(t.q_dtype, ctx.output_ptr),
-                            (fx.Int64(ctx.planned_seq) * t.query_length + position)
-                            * ctx.stride_q_row
-                            + head * ctx.stride_q_head
-                            + dim,
-                        ),
-                    )
+            for w, _ in sources
+        ]
+        sums = [
+            fx.Float32(
+                self.mem.load(
+                    stats + (((tiles + m) * t.NWARP + w) * 16 + local) * 4, fx.Float32
+                )[0]
+            )
+            for w, _ in sources
+        ]
+        row_max = maxima[0]
+        for maximum in maxima[1:]:
+            row_max = fx.maxnumf(row_max, maximum)
+        safe = fx.Float32(
+            (row_max > fx.Float32(float("-inf"))).select(row_max, fx.Float32(0.0))
+        )
+        denom = fx.Float32(0.0)
+        acc = fx.Vector.filled(16, 0.0, fx.Float32)
+        for (_, slot), s_wave, maximum, row_sum in zip(sources, s_waves, maxima, sums):
+            weight = fx.Float32(fx.exp2(maximum - safe, fastmath="afn"))
+            denom = denom + row_sum * weight
+            # Each wave's outputs carry its own S: align them to the largest.
+            weight = weight * self.pow2(s_wave - s_all)
+            acc = acc + self.mem.load(
+                slot * t.MXFP4_O_BYTES + (local * t.MXFP4_O_STRIDE + dim) * 4,
+                fx.Float32,
+                16,
+            ) * fx.full(16, weight, fx.Float32)
+        # A row's max token has p = 1, so the denominator is a normal f32 when
+        # nonzero. A row that sees no token (an MTP position before the
+        # context) stores zeros. The 2**(S - OUT_EXP) restore is exact, down to
+        # subnormal outputs.
+        inv = fx.Float32(
+            (denom > fx.Float32(0.0)).select(
+                fx.Float32(rcp_f32(denom)), fx.Float32(0.0)
+            )
+        )
+        restore = s_all - fx.Int32(self.OUT_EXP)
+        high = fx.max(restore, fx.Int32(-126))
+        values = (
+            (acc * fx.full(16, inv, fx.Float32))
+            * fx.full(16, self.pow2(restore - high), fx.Float32)
+            * fx.full(16, self.pow2(high), fx.Float32)
+        ).to(t.q_dtype)
+        return values, row_max, denom
+
+    @flyc.jit
+    def store_rows(self, merged, local, dim, direct):
+        """Store ``merge_rows`` results. Only a part-filled M-tile branches on
+        its rows, so the stores of full tiles schedule as one block."""
+        t = self.t
+        for m in range_constexpr(t.m_tiles):
+            if const_expr(m * 16 < t.rows):
+                row = m * 16 + local
+                if const_expr((m + 1) * 16 <= t.rows):
+                    self.store_row(merged[m], row, dim, direct)
                 else:
-                    # Packed partials: [KV heads, capacity, query rows, D].
-                    partial = (
-                        fx.Int64(ctx.kv_h) * fx.Int64(ctx.capacity)
-                        + fx.Int64(ctx.task_slot)
-                    ) * (t.rows * t.query_splits) + (
-                        ctx.query_begin * t.query_group_size + row
-                    )
-                    fx.ptr_store(
-                        values,
-                        fx.add_offset(
-                            fx.recast_iter(t.q_dtype, ctx.pout_ptr),
-                            partial * t.head_dim + dim,
-                        ),
-                    )
-                    if tid % 8 == 0:
-                        # The shared reducer expects maxima in natural-log units.
-                        pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
-                        psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
-                        pmax[partial] = row_max * fx.Float32(1.0 / LOG2E)
-                        psum[partial] = denom
+                    if row < t.rows:
+                        self.store_row(merged[m], row, dim, direct)
+
+    @flyc.jit
+    def store_row(self, merged, row, dim, direct):
+        """Final rows without a plan or for a cluster-merged sequence's only
+        task, else packed partials [KV heads, capacity, query rows, D] with
+        natural-log maxima for the reducer or the cluster merge."""
+        t = self.t
+        if const_expr(t.cluster_merge):
+            if direct:
+                self.store_final(merged, row, dim)
+            else:
+                self.store_partial(merged, row, dim)
+        elif const_expr(t.plan_free):
+            self.store_final(merged, row, dim)
+        else:
+            self.store_partial(merged, row, dim)
+
+    def store_final(self, merged, row, dim):
+        ctx, t = self.ctx, self.t
+        position = ctx.query_begin + row // t.query_group_size
+        head = ctx.kv_h * t.query_group_size + row % t.query_group_size
+        fx.ptr_store(
+            merged[0],
+            fx.add_offset(
+                fx.recast_iter(t.q_dtype, ctx.output_ptr),
+                (fx.Int64(ctx.planned_seq) * t.query_length + position)
+                * ctx.stride_q_row
+                + head * ctx.stride_q_head
+                + dim,
+            ),
+        )
+
+    def store_partial(self, merged, row, dim):
+        ctx, t = self.ctx, self.t
+        values, row_max, denom = merged
+        partial = (
+            fx.Int64(ctx.kv_h) * fx.Int64(ctx.capacity) + fx.Int64(ctx.task_slot)
+        ) * (t.rows * t.query_splits) + (ctx.query_begin * t.query_group_size + row)
+        fx.ptr_store(
+            values,
+            fx.add_offset(
+                fx.recast_iter(t.q_dtype, ctx.pout_ptr), partial * t.head_dim + dim
+            ),
+        )
+        # The row's eight threads all store its (equal) maximum and sum: no
+        # exec-mask branch between the rows' stores.
+        pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
+        psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
+        pmax[partial] = row_max * fx.Float32(1.0 / LOG2E)
+        psum[partial] = denom
