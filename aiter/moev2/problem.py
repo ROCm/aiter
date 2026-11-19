@@ -351,6 +351,7 @@ class MoeProblem:
         _exclude_mxmoe=False,
         _has_input_activation_scales=False,
         has_global_scale=False,
+        block_size_M=None,
         *,
         arch: str,
         cu_num: int,
@@ -378,6 +379,8 @@ class MoeProblem:
             extras["disable_inline_sort"] = True
         if _exclude_mxmoe:
             extras["exclude_mxmoe"] = True
+        if block_size_M is not None:
+            extras["block_size_M"] = int(block_size_M)
         q_type = QuantType(q_type)
         return cls(
             arch=arch,
@@ -447,6 +450,7 @@ class MoeProblem:
             "_exclude_mxmoe": bool(self.extras.get("exclude_mxmoe")),
             "_has_input_activation_scales": "a1_scale" in self.features,
             "has_global_scale": "global_scale" in self.features,
+            "block_size_M": self.extras.get("block_size_M"),
         }
         return args, kwargs
 

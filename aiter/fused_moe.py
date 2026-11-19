@@ -4898,6 +4898,8 @@ def get_2stage_cfgs(
             # The a16w4 FlyDSL port ignores per-expert bias and reads W1 in the
             # standard gate/up layout; neither is part of the row key. CK-Tile
             # handles both, so these calls keep the route they had without a row.
+            # Restricted to Swiglu to keep existing SiLU/SiTUv2 model dispatch
+            # selections unchanged within this PR's compatibility scope.
             cfg = None
             logger.warning(
                 "[fused_moe] discarding a16w4 FlyDSL tuned config for a call with "
@@ -4915,6 +4917,8 @@ def get_2stage_cfgs(
             # nothing; stage 2 then raises "sorting layout mismatch". CK-Tile gets
             # block_m at call time, so these calls keep the route they had without
             # a row. The a16w4 prefix leaves a16w16 rows to their ValueError guard.
+            # Restricted to Swiglu to keep existing SiLU/SiTUv2 model dispatch
+            # selections unchanged within this PR's compatibility scope.
             logger.warning(
                 f"[fused_moe] discarding a16w4 FlyDSL tuned config: block_size_M="
                 f"{block_size_M} differs from the row's block_m={cfg['block_m']}; "
@@ -6274,6 +6278,7 @@ def fused_moe_2stages(
         config_file=_metadata_config_file,
         input_dtype=hidden_states.dtype,
         _has_input_activation_scales=a1_scale is not None,
+        block_size_M=block_size_M,
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
