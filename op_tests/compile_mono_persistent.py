@@ -53,8 +53,14 @@ def native_reference(root):
 def compile_one(fn, name, constants, signatures, output):
     source_type = GluonASTSource if fn.is_gluon() else ASTSource
     source = source_type(fn, signature=signatures, constexprs=constants)
+    options = {"num_warps": 4}
+    if (
+        constants.get("PERSISTENT", False)
+        or fn is _fused_dual_rmsnorm_mxfp8_quant_ps_kernel
+    ):
+        options["llvm_fn_attrs"] = "amdgpu-num-sgpr=104"
     kernel = triton.compile(
-        source, target=GPUTarget("hip", "gfx1250", 32), options={"num_warps": 4}
+        source, target=GPUTarget("hip", "gfx1250", 32), options=options
     )
     for suffix in ("glir", "ttir", "ttgir", "llir", "amdgcn"):
         if suffix in kernel.asm:
@@ -87,7 +93,7 @@ def main():
                 if mode == "native"
                 else (
                     _fused_dual_rmsnorm_mxfp8_quant_ps_kernel
-                    if mode in ("persistent2", "persistent4")
+                    if mode.startswith("persistent")
                     else _fused_dual_rmsnorm_mxfp8_quant_kernel
                 )
             )
@@ -99,10 +105,7 @@ def main():
             }
             if mode.startswith("persistent"):
                 constants["NUM_PRGMS"] = 256
-                if mode != "persistent1":
-                    constants["ROWS_PER_ITER"] = int(mode[-1])
-                else:
-                    constants["PERSISTENT"] = True
+                constants["ROWS_PER_ITER"] = int(mode[-1])
             signature = {name: "i32" for name in fn.arg_names}
             signature.update(
                 {

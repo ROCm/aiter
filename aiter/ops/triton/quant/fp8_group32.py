@@ -75,5 +75,6 @@ def quantize_fp8_group32(
             persistent,
             TILES_PER_ITER=batch,
             num_warps=4,
+            llvm_fn_attrs="amdgpu-num-sgpr=104" if persistent else "",
         )
     return out if dequantize else (out, scales)

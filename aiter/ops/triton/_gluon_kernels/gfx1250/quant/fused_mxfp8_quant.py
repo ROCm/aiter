@@ -4,13 +4,17 @@
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.gfx1250.quant.mono_memory import (
+    load_dev,
+    store_dev_ht,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 @gluon.jit(
     repr=make_kernel_repr(
         "_fused_dual_rmsnorm_mxfp8_quant_ps_kernel",
-        ["BLOCK_SIZE_KQ", "BLOCK_SIZE_KK", "ROWS_PER_ITER"],
+        ["BLOCK_SIZE_KQ", "BLOCK_SIZE_KK", "ROWS_PER_ITER", "USE_BUFFER"],
     )
 )
 def _fused_dual_rmsnorm_mxfp8_quant_ps_kernel(
@@ -42,6 +46,7 @@ def _fused_dual_rmsnorm_mxfp8_quant_ps_kernel(
     NUM_PRGMS: gl.constexpr,
     AMAX_FLOOR: gl.constexpr = 0.0,
     ROWS_PER_ITER: gl.constexpr = 4,
+    USE_BUFFER: gl.constexpr = True,
 ):
     # Keep each row's native lane and wave mapping for exact RMS sums.
     q_layout: gl.constexpr = gl.BlockedLayout(
@@ -56,18 +61,31 @@ def _fused_dual_rmsnorm_mxfp8_quant_ps_kernel(
     k_rows = gl.arange(0, ROWS_PER_ITER, layout=gl.SliceLayout(1, k_layout))
     tg = gl.program_id(0) + 16 * gl.program_id(1)
     for first in range(tg, M, NUM_PRGMS * ROWS_PER_ITER):
-        gq = gl.load(gq_ptr + q_cols, q_cols < KQ, other=0).to(gl.float32)
-        gk = gl.load(gk_ptr + k_cols, k_cols < KK, other=0).to(gl.float32)
+        gq = load_dev(gq_ptr, q_cols, q_cols < KQ).to(gl.float32)
+        gk = load_dev(gk_ptr, k_cols, k_cols < KK).to(gl.float32)
         qr = first.to(gl.int64) + q_rows * NUM_PRGMS
         kr = first.to(gl.int64) + k_rows * NUM_PRGMS
         qm = (qr[:, None] < M) & (q_cols[None, :] < KQ)
         km = (kr[:, None] < M) & (k_cols[None, :] < KK)
-        xq = gl.load(
-            q_ptr + qr[:, None] * stride_qm + q_cols[None, :] * stride_qn, qm, other=0
-        ).to(gl.float32)
-        xk = gl.load(
-            k_ptr + kr[:, None] * stride_km + k_cols[None, :] * stride_kn, km, other=0
-        ).to(gl.float32)
+        xq = gl.full((ROWS_PER_ITER, BLOCK_SIZE_KQ), 0, gl.float32, q_layout)
+        xk = gl.full((ROWS_PER_ITER, BLOCK_SIZE_KK), 0, gl.float32, k_layout)
+        # Rebase each row in 64 bits; buffer offsets contain only the column.
+        for slot in gl.static_range(ROWS_PER_ITER):
+            row = first.to(gl.int64) + slot * NUM_PRGMS
+            qv = load_dev(
+                q_ptr + row * stride_qm,
+                q_cols.to(gl.int64) * stride_qn,
+                (row < M) & (q_cols < KQ),
+                USE_BUFFER,
+            ).to(gl.float32)
+            kv = load_dev(
+                k_ptr + row * stride_km,
+                k_cols.to(gl.int64) * stride_kn,
+                (row < M) & (k_cols < KK),
+                USE_BUFFER,
+            ).to(gl.float32)
+            xq = gl.where(q_rows[:, None] == slot, qv[None, :], xq)
+            xk = gl.where(k_rows[:, None] == slot, kv[None, :], xk)
         nq = gl.rsqrt(gl.sum(xq * xq, 1) / KQ + eps_q)
         nk = gl.rsqrt(gl.sum(xk * xk, 1) / KK + eps_k)
         yq = xq * nq[:, None] * gq[None, :]
@@ -86,26 +104,34 @@ def _fused_dual_rmsnorm_mxfp8_quant_ps_kernel(
         scales = (exponent.to(gl.int32) + 127).to(gl.uint8)
         quantized = grouped * gl.exp2(-exponent)
         quantized = gl.reshape(quantized, (ROWS_PER_ITER, BLOCK_SIZE_KQ))
-        gl.store(
-            yq_ptr + qr[:, None] * stride_yqm + q_cols[None, :] * stride_yqn,
-            quantized.to(yq_ptr.dtype.element_ty),
-            qm,
-        )
         scales = gl.reshape(scales, (ROWS_PER_ITER, groups))
         scale_layout: gl.constexpr = scales.type.layout
-        sr = (
-            first.to(gl.int64)
-            + gl.arange(0, ROWS_PER_ITER, layout=gl.SliceLayout(1, scale_layout))
-            * NUM_PRGMS
-        )
+        sr = gl.arange(0, ROWS_PER_ITER, layout=gl.SliceLayout(1, scale_layout))
         sg = gl.arange(0, groups, layout=gl.SliceLayout(0, scale_layout))
-        gl.store(
-            sq_ptr + sr[:, None] * stride_sqm + sg[None, :] * stride_sqn,
-            scales,
-            (sr[:, None] < M) & (sg[None, :] < KQ // QUANT_BLOCK_SIZE),
-        )
-        gl.store(
-            yk_ptr + kr[:, None] * stride_ykm + k_cols[None, :] * stride_ykn,
-            yk.to(yk_ptr.dtype.element_ty),
-            km,
-        )
+        for slot in gl.static_range(ROWS_PER_ITER):
+            row = first.to(gl.int64) + slot * NUM_PRGMS
+            store_dev_ht(
+                yq_ptr + row * stride_yqm,
+                q_rows[:, None].to(gl.int64) * 0
+                + q_cols[None, :].to(gl.int64) * stride_yqn,
+                quantized.to(yq_ptr.dtype.element_ty),
+                qm & (q_rows[:, None] == slot),
+                USE_BUFFER,
+            )
+            store_dev_ht(
+                sq_ptr + row * stride_sqm,
+                sr[:, None].to(gl.int64) * 0 + sg[None, :].to(gl.int64) * stride_sqn,
+                scales,
+                (row < M)
+                & (sr[:, None] == slot)
+                & (sg[None, :] < KQ // QUANT_BLOCK_SIZE),
+                USE_BUFFER,
+            )
+            store_dev_ht(
+                yk_ptr + row * stride_ykm,
+                k_rows[:, None].to(gl.int64) * 0
+                + k_cols[None, :].to(gl.int64) * stride_ykn,
+                yk.to(yk_ptr.dtype.element_ty),
+                km & (k_rows[:, None] == slot),
+                USE_BUFFER,
+            )

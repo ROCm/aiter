@@ -186,15 +186,18 @@ def fused_dual_rmsnorm_mxfp8_quant(
         from aiter.ops.triton.utils.quant_config_utils import get_mono_persistent_config
 
         batch = get_mono_persistent_config("a03", M)["tasks_per_iter"]
-    if persistent and batch > 1:
+    if persistent:
         from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp8_quant import (
             _fused_dual_rmsnorm_mxfp8_quant_ps_kernel,
         )
 
         kernel = _fused_dual_rmsnorm_mxfp8_quant_ps_kernel
         launch_options["ROWS_PER_ITER"] = batch
-    elif persistent:
-        launch_options["PERSISTENT"] = True
+        launch_options["llvm_fn_attrs"] = "amdgpu-num-sgpr=104"
+        launch_options["USE_BUFFER"] = all(
+            (x.shape[-1] - 1) * x.stride(-1) * x.element_size() < 2**32 - 16
+            for x in (q, k, yq, sq, yk)
+        )
     kernel[grid](
         q,
         k,
