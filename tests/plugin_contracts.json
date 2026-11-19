@@ -98,11 +98,13 @@
   "version": 1
  },
  "gemm_a8w8_blockscale_bpreshuffle": {
-  "fingerprint": "dd8528ae4b58d9bb",
-  "signature": "XQ:positional:Tensor, WQ:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, out:positional:Tensor | None=None, -> Tensor",
+  "fingerprint": "62f078b300b11359",
+  "signature": "XQ:positional:Tensor, WQ:positional:Tensor, x_scale:positional:Tensor, w_scale:positional:Tensor, dtype:positional:torch.dtype=dtypes.bf16, out:positional:Tensor | None=None, x_scale_transposed:positional:bool=True, -> Tensor",
   "source": "aiter/ops/gemm_op_a8w8.py",
-  "supersedes": [],
-  "version": 1
+  "supersedes": [
+   1
+  ],
+  "version": 2
  },
  "gemm_a8w8_blockscale_out": {
   "fingerprint": "2dd810d09a75761b",

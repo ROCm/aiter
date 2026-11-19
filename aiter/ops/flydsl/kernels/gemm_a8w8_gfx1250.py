@@ -71,6 +71,7 @@ def launch_gemm_a8w8(
     k_tail: Constexpr[bool] = False,
     arg_scale_out: fx.Pointer = _NULL_SCALE_PTR,
     fuse_quant_out: Constexpr[bool] = False,
+    a_scale_m_major: Constexpr[bool] = False,
 ):
     # fuse_quant_out: the bf16 C tile is group-32 MXFP8-quantized in the
     # epilogue instead of written as bf16. arg_c carries the e4m3 [M,B,N]
@@ -132,15 +133,20 @@ def launch_gemm_a8w8(
             "[FlyDSL gfx1250] the batched mxfp8_32 path reads a row-major "
             "[M, B, K/32] A scale; a_scale_preshuffled is 2-D only"
         )
+    # a_scale_m_major: the 2-D mx128 A scale is row-major [M, K//128] (row stride
+    # stride_ascale_k) instead of column-major, as the batched A scale is.
+    if a_scale_m_major and not mx128:
+        raise ValueError("[FlyDSL gfx1250] a_scale_m_major is mxfp8_128 only")
     if preload and not (
-        batched
+        (batched or (a_scale_m_major and split_k == 1))
         and mx128
         and cluster_m == 1
         and cluster_n == 1
         and preload_ks % (tile_k // 128) == 0
     ):
         raise ValueError(
-            f"[FlyDSL gfx1250] preload_ks={preload_ks} needs batched mx128, no cluster "
+            f"[FlyDSL gfx1250] preload_ks={preload_ks} needs an M-major mx128 A scale "
+            f"(batched, or 2-D with split_k 1), no cluster "
             f"and a multiple of tile_k/128={tile_k // 128}; got batched={batched}, "
             f"cluster={cluster_m}x{cluster_n}"
         )
@@ -180,7 +186,7 @@ def launch_gemm_a8w8(
         )
     )
     SC_WORDS = tile_k // 4  # shuffled 32x4 scale words per 32-row K tile
-    sa_m_major = batched  # batched A-scale is [M, B, K//128]
+    sa_m_major = batched or a_scale_m_major  # batched A-scale is [M, B, K//128]
     SA_SHAPE = (
         (
             (max(1, tile_m // 32), tile_k)
@@ -239,6 +245,7 @@ def launch_gemm_a8w8(
         + ("_aspre" if a_scale_preshuffled else "")
         + ("_bs32x32" if b_scale_32x32 else "")
         + ("_ktail" if k_tail else "")
+        + ("_sam" if a_scale_m_major and not batched else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -431,7 +438,9 @@ def launch_gemm_a8w8(
                 if const_expr(batched):
                     sb_off0 = sb_off0 + bz64 * (fx.Int64(i32_n) // 128) * (k64 // 128)
                 if const_expr(sa_m_major):
-                    sa_off0 = blk_m64 * stride_ask64 + bz64 * (k64 // 128)
+                    sa_off0 = blk_m64 * stride_ask64
+                    if const_expr(batched):
+                        sa_off0 = sa_off0 + bz64 * (k64 // 128)
                     gSA = _gv(
                         arg_scale_a, sa_off0, (mn_oob, i32_k // 128), (stride_ask64, 1)
                     )
