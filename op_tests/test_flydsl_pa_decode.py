@@ -1909,9 +1909,14 @@ _SELECT_INVALID_CASES = [
 ]
 
 
-def _check_output(output, reference):
+def _check_output(output, reference, tol=5e-3):
     assert torch.isfinite(output).all()
-    torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(output.float(), reference, atol=tol, rtol=tol)
+
+
+# gfx1250 MXFP4 runs PV in FP8 with an E4M3 P (3 mantissa bits), as the FP8 KV
+# path does: rows with few tokens keep P's rounding (a 3-token row: 6-8%).
+_MXFP4_GFX1250_TOL = 1.5e-2
 
 
 def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
@@ -2532,7 +2537,15 @@ def _run_pa_decode_case(case, device, monkeypatch):
             assert torch.isfinite(reference).all() and reference.abs().max() > 0.1
         if case["ref_mean_min"]:
             assert reference.mean() > case["ref_mean_min"]
-        _check_output(out, reference)
+        _check_output(
+            out,
+            reference,
+            (
+                _MXFP4_GFX1250_TOL
+                if case["kv_dtype"] == "mxfp4" and arch == "gfx1250"
+                else 5e-3
+            ),
+        )
 
     launch()
     check()

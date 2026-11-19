@@ -1369,6 +1369,10 @@ class Gfx1250Traits:
     plan_free: bool = False
     # MXFP4 partials: plan slots a CTA may run (2: adjacent tiles fuse).
     fuse_tasks: int = 1
+    # MXFP4 cluster merges: each wave stores its own partial (slot NWARP p +
+    # wave of CTA p) for the cluster merge, instead of the CTA merging its
+    # waves through LDS first.
+    wave_partials: bool = False
     # With fuse_tasks 2, CTAs of this size resident at once
     # (mxfp4_gfx1250_resident_ctas): a CTA runs two slots only when the
     # plan's live tasks need more CTAs than this.
@@ -1710,8 +1714,14 @@ class Gfx1250Traits:
     @property
     def total_bytes(self):
         if self.mxfp4:
-            # Only the wave merge after the tile loop uses LDS.
-            return self.mxfp4_stats_offset + 2 * self.NWARP * self.m_tiles * 16 * 4
+            # Only the wave merge after the tile loop uses LDS: per wave and
+            # M-tile the outputs, row maxima and sums, then each wave's four
+            # block scales S_b.
+            return (
+                self.mxfp4_stats_offset
+                + 2 * self.NWARP * self.m_tiles * 16 * 4
+                + self.NWARP * 16
+            )
         units = self.m_tiles * 16 // self.quant_unit
         return self.quant_offset + (units * self.NWARP * 4 if self.quant_output else 0)
 

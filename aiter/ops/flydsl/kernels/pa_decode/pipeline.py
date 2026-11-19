@@ -3300,21 +3300,55 @@ class Gfx1250Mxfp4Pipeline:
     WMMA's B scale (its mantissa scales the scores), so the accumulator holds
     the logit.
 
-    V is dequantized by the same scaled WMMA against E2M1 identity blocks: the
-    product is exact in f32 and lands transposed (lane = dim, registers =
-    tokens), which packed to bf16 is the A operand of the bf16 PV WMMA of every
-    M-tile; P stays in registers as its B operand. The v_cvt_scale_pk8_*_fp4
-    conversions would widen V on the VALU, but on gfx1250 (FlyDSL 0.5.0 LLVM,
-    B0) they ignore their data operand: 0x22222222 and 0x76543210 both convert
-    to the nibbles of 0x7F7F7F7F.
+    PV is FP8, as on the FP8 KV path. V is dequantized by the same scaled WMMA
+    against E2M1 identity blocks, which lands it transposed (lane = dim,
+    registers = tokens), each block's scale taken relative to S_b, the wave's
+    running largest scale of that 32-dim block: V'' = code * 2**(s_b - S_b +
+    V_EXP) <= 384, exact in E4M3 within 2**11 of S_b (fainter tokens add less
+    than 2**-11 of the block's largest V). P'' = P * 2**P_EXP <= 256. One
+    16x16x64 FP8 WMMA per 16 dims and M-tile accumulates 2**(OUT_EXP - S_b) *
+    sum(P V); a growing S_b rescales its dims as a growing maximum rescales its
+    row. The v_cvt_scale_pk8_*_fp4 conversions would widen V on the VALU, but
+    on gfx1250 (FlyDSL 0.5.0 LLVM, B0) they ignore their data operand:
+    0x22222222 and 0x76543210 both convert to the nibbles of 0x7F7F7F7F.
     """
 
     TILE_TOKENS = 64  # per wave
     DIM_TILES = 8  # 16-dim PV output tiles of head_dim 128
-    DEQUANT_GROUP = 4  # dim tiles whose V dequant WMMAs issue back to back
+    DEQUANT_GROUP = 1  # dim tiles whose V dequant WMMAs issue back to back
     STATE = 2 + 8  # per M-tile: running max, denominator, 8 output tiles
     UNIT_SCALES = 0x7F7F7F7F
     MIN_NORMAL_F32 = 1.17549435e-38
+    BLOCKS = 4  # 32-dim E8M0 scale blocks of head_dim 128
+    # FP8 PV: V'' = code * 2**(s_b - S_b + V_EXP) <= 6 * 64 and
+    # P'' = P * 2**P_EXP <= 256 stay within E4M3's 448; dims of block b then
+    # hold 2**(OUT_EXP - S_b) * sum(P V) (127: the E8M0 bias).
+    V_EXP = 6
+    P_EXP = 8
+    OUT_EXP = 127 + V_EXP + P_EXP
+
+    @staticmethod
+    def pow2(k):
+        """2**k as f32 for an Int32 k, flushed to 0 below the normal range."""
+        bits = fx.max(k + fx.Int32(127), fx.Int32(0)) << fx.Int32(23)
+        return fx.Float32(
+            fx.Vector.from_elements([bits], dtype=fx.Int32).bitcast(fx.Float32)[0]
+        )
+
+    @staticmethod
+    def scale_byte(scale, b):
+        """Block ``b``'s E8M0 byte of a scale dword."""
+        return (scale >> fx.Int32(8 * b)) & fx.Int32(0xFF)
+
+    @classmethod
+    def relative_scales(cls, scale, block_s):
+        """A token's scale dword with block b's byte made s_b - S_b + 127 + V_EXP,
+        floored at 0 (2**-127: those values flush to zero in E4M3)."""
+        relative = fx.Int32(0)
+        for b in range(cls.BLOCKS):
+            byte = cls.scale_byte(scale, b) + (fx.Int32(127 + cls.V_EXP) - block_s[b])
+            relative = relative | (fx.max(byte, fx.Int32(0)) << fx.Int32(8 * b))
+        return relative
 
     def __init__(self, ctx):
         self.ctx, self.t = ctx, ctx.traits
@@ -3330,11 +3364,8 @@ class Gfx1250Mxfp4Pipeline:
             ctx.kv_h * t.query_group_size + row % t.query_group_size,
         )
 
-    def query_operand(self, m, lane16, half):
-        """This lane's E4M3 B operand of the QK WMMA (row lane16 of M-tile m),
-        the row's E8M0 scale word and the mantissa of its scale. A bf16 row is
-        normalized by absmax / 448, floored at the smallest normal f32 so
-        1 / scale stays finite and a bf16 subnormal row stays inside E4M3."""
+    def query_load(self, m, lane16, half):
+        """Issue this lane's loads of row lane16 of M-tile m (raw words)."""
         ctx, t = self.ctx, self.t
         position, head = self.row(m, lane16)
         offset = (
@@ -3342,29 +3373,39 @@ class Gfx1250Mxfp4Pipeline:
         ) * ctx.stride_q_row + head * ctx.stride_q_head
         if const_expr(t.query_dtype == "fp8"):
             q = _gptr(ctx.query_ptr, fx.Int32, 16)
-            words = []
-            for j in range_constexpr(4):
-                chunk = fx.ptr_load(
+            return [
+                fx.ptr_load(
                     fx.add_offset(q, fx.Uint32((offset + 16 * (half + 2 * j)) // 4)),
                     result_type=fx.Vector.make_type(4, fx.Int32),
                 )
+                for j in range_constexpr(4)
+            ]
+        q = _gptr(ctx.query_ptr, fx.BFloat16, 16)
+        return [
+            fx.ptr_load(
+                fx.add_offset(q, offset + 16 * (half + 2 * j) + 8 * u),
+                result_type=fx.Vector.make_type(8, fx.BFloat16),
+            )
+            for j in range_constexpr(4)
+            for u in range_constexpr(2)
+        ]
+
+    def query_operand(self, raw):
+        """The E4M3 B operand of the QK WMMA from ``query_load`` words, the row's
+        E8M0 scale word and the mantissa of its scale. A bf16 row is
+        normalized by absmax / 448, floored at the smallest normal f32 so
+        1 / scale stays finite and a bf16 subnormal row stays inside E4M3."""
+        t = self.t
+        if const_expr(t.query_dtype == "fp8"):
+            words = []
+            for chunk in raw:
                 words.extend([chunk[i] for i in range_constexpr(4)])
             return (
                 fx.Vector.from_elements(words, dtype=fx.Int32),
                 fx.Int32(self.UNIT_SCALES),
                 fx.Float32(1.0),
             )
-        q = _gptr(ctx.query_ptr, fx.BFloat16, 16)
-        units = [
-            fx.Vector(
-                fx.ptr_load(
-                    fx.add_offset(q, offset + 16 * (half + 2 * j) + 8 * u),
-                    result_type=fx.Vector.make_type(8, fx.BFloat16),
-                )
-            ).to(fx.Float32)
-            for j in range_constexpr(4)
-            for u in range_constexpr(2)
-        ]
+        units = [fx.Vector(r).to(fx.Float32) for r in raw]
         absmax = fmath.absf(units[0]).reduce(ReductionOp.MAX)
         for u in range_constexpr(1, len(units)):
             absmax = fx.maxnumf(absmax, fmath.absf(units[u]).reduce(ReductionOp.MAX))
@@ -3433,10 +3474,15 @@ class Gfx1250Mxfp4Pipeline:
         self.mem.allocate()
         kv = Gfx1250Mxfp4Loader(ctx, warp, lane16, half)
         begin, end = ctx.planned_start, ctx.planned_end
-        base = kv.base(kv.page_id(begin))
+        # Loads issue in dependency order: the query rows (they need no load),
+        # the first page ids, then K and V. Loads retire in issue order, so
+        # quantizing the query after K/V issue waits for the query alone.
+        q_raw = [self.query_load(m, lane16, half) for m in range_constexpr(tiles)]
+        base = kv.base(kv.first_page_id(begin))
         k_first = kv.load("k", base)
         v_first = kv.load("v", base)
         page_second = kv.page_id(fx.min(begin + 1, end - 1))
+        fx.rocdl.sched_barrier(0)
         # Query position p sees tokens [upper - window, upper), upper =
         # context - query_length + p + 1; the CTA's first and last positions
         # bound which tiles need masks.
@@ -3446,7 +3492,7 @@ class Gfx1250Mxfp4Pipeline:
         last_upper = first_upper + (positions - 1)
         q_ops, q_scales, score_scales, uppers = [], [], [], []
         for m in range_constexpr(tiles):
-            q_op, q_scale, q_mantissa = self.query_operand(m, lane16, half)
+            q_op, q_scale, q_mantissa = self.query_operand(q_raw[m])
             q_ops.append(q_op)
             q_scales.append(q_scale)
             score_scales.append(q_mantissa * fx.Float32(t.softmax_scale * LOG2E))
@@ -3462,17 +3508,23 @@ class Gfx1250Mxfp4Pipeline:
         )
         neg_inf = fx.full(8, float("-inf"), fx.Float32)
         zero8 = fx.full(8, 0, fx.Int32)
-        shift8 = fx.full(8, -float(MXFP4_P_EXP_SHIFT), fx.Float32)
         initial = []
         for m in range_constexpr(tiles):
             initial.extend([fx.Float32(float("-inf")), fx.Float32(0.0)])
             initial.extend(
                 [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range_constexpr(8)]
             )
+        # The wave's running largest scale S_b of each block (class docstring).
+        initial.extend([fx.Int32(0)] * self.BLOCKS)
         initial.extend([k_first, v_first, page_second])
-        loads = tiles * self.STATE
+        loads = tiles * self.STATE + self.BLOCKS
+        p_shift = fx.full(8, float(self.P_EXP), fx.Float32)
+        p_unshift = fx.Float32(2.0**-self.P_EXP)
         for tt_i, state in range(begin, end, 1, init=initial):
             tt = fx.Int32(tt_i)
+            s_prev = [
+                fx.Int32(state[tiles * self.STATE + b]) for b in range_constexpr(4)
+            ]
             k_cur, v_cur, page_next = state[loads], state[loads + 1], state[loads + 2]
             # Unconditional: the last tile re-reads itself rather than branch
             # around loads, which would make their wait counts conservative.
@@ -3507,8 +3559,9 @@ class Gfx1250Mxfp4Pipeline:
                 masked = masked | (first < last_upper - t.sliding_window)
             if masked:
                 # Tiles at the causal edge or a window's start: each row masks
-                # its own bounds. V rows past the context become exact zeros:
-                # E2M1 has no NaN, but a scale byte of 255 does.
+                # its own bounds. V rows past the context become exact zeros
+                # with the smallest scale, which no running S follows: E2M1 has
+                # no NaN, but a scale byte of 255 does.
                 lane_first = first + warp * self.TILE_TOKENS + half * 8
                 for m in range_constexpr(tiles):
                     upper = fx.full(
@@ -3529,9 +3582,27 @@ class Gfx1250Mxfp4Pipeline:
                 for c in range_constexpr(kv.CHUNKS):
                     row_valid = warp * self.TILE_TOKENS + 16 * c + lane16 < tile_valid
                     v_rows[c] = row_valid.select(v_rows[c], zero8)
-                    v_scales[c] = row_valid.select(
-                        v_scales[c], fx.Int32(self.UNIT_SCALES)
-                    )
+                    v_scales[c] = row_valid.select(v_scales[c], fx.Int32(0))
+            # Each lane holds token 16 c + lane16's scales. S_b follows the
+            # largest of the wave's tile; the dequant WMMA takes the scales
+            # relative to it.
+            s_new, s_rescale = [], []
+            for b in range_constexpr(self.BLOCKS):
+                tile_s = self.scale_byte(v_scales[0], b)
+                for c in range_constexpr(1, kv.CHUNKS):
+                    tile_s = fx.max(tile_s, self.scale_byte(v_scales[c], b))
+                for offset in (1, 2, 4, 8):
+                    tile_s = fx.max(tile_s, tile_s.shuffle_xor(offset, t.WAVE))
+                block_s = fx.max(
+                    s_prev[b],
+                    fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.as_ir_value(tile_s))),
+                )
+                s_new.append(block_s)
+                s_rescale.append(self.pow2(s_prev[b] - block_s))
+            v_relative = [
+                self.relative_scales(v_scales[c], s_new)
+                for c in range_constexpr(kv.CHUNKS)
+            ]
             next_state = []
             p_ops, outs = [], []
             for m in range_constexpr(tiles):
@@ -3556,79 +3627,139 @@ class Gfx1250Mxfp4Pipeline:
                 alpha = fx.Float32(
                     fx.exp2((m_prev - safe) * score_scales[m], fastmath="afn")
                 )
-                # P * 2**-MXFP4_P_EXP_SHIFT = exp2((s - max) * scale - shift): a
-                # long sum of large V stays finite in f32. The denominator
-                # carries the same shift, so it cancels in the normalization.
                 safe8 = fx.full(8, safe, fx.Float32)
+                # P'' = P * 2**P_EXP = exp2((s - max) * scale + P_EXP).
                 probs = [
                     fx.Vector(
                         fx.exp2(
-                            fmath.fma(scores[m][c] - safe8, scale8[m], shift8),
+                            fmath.fma(scores[m][c] - safe8, scale8[m], p_shift),
                             fastmath="afn",
                         )
                     )
                     for c in range_constexpr(kv.CHUNKS)
                 ]
                 # Each lane sums its own tokens; the halves combine after the loop.
-                l_new = l_prev * alpha
+                tile_sum = probs[0].reduce(ReductionOp.ADD)
+                for c in range_constexpr(1, kv.CHUNKS):
+                    tile_sum = tile_sum + probs[c].reduce(ReductionOp.ADD)
+                l_new = l_prev * alpha + tile_sum * p_unshift
+                # P'' in the K64 B operand order: chunk c's 8 tokens per dword
+                # pair, as the scores hold them.
+                words = []
                 for c in range_constexpr(kv.CHUNKS):
-                    l_new = l_new + probs[c].reduce(ReductionOp.ADD)
-                p_bf16 = [probs[c].to(fx.BFloat16) for c in range_constexpr(4)]
-                p_ops.append(
-                    [
-                        p_bf16[2 * step].shuffle(p_bf16[2 * step + 1], list(range(16)))
-                        for step in range_constexpr(2)
-                    ]
-                )
-                # alpha is exactly 1 for every row whose maximum held: skip the
-                # rescale unless some row's maximum grew. Raw ballot: FlyDSL has
-                # no wave-vote API.
-                grew = fx.Int32(
-                    fx.rocdl.ballot(T.i32, fx.as_ir_value(alpha != fx.Float32(1.0)))
-                )
+                    packed = self.mem.fp8(probs[c])
+                    words.extend([packed[0], packed[1]])
+                p_ops.append(fx.Vector.from_elements(words, dtype=fx.Int32))
+                # Dims of block b rescale by alpha * 2**(S_b old - S_b new): 1 for
+                # every row whose maximum held while S_b held. Skip the rescale
+                # unless one grew. Raw ballot: FlyDSL has no wave-vote API.
+                held = alpha == fx.Float32(1.0)
+                for b in range_constexpr(self.BLOCKS):
+                    held = held & (s_rescale[b] == fx.Float32(1.0))
+                grew = fx.Int32(fx.rocdl.ballot(T.i32, fx.as_ir_value(~held)))
                 if grew != 0:
-                    alpha8 = fx.full(8, alpha, fx.Float32)
-                    out = [out[j] * alpha8 for j in range_constexpr(self.DIM_TILES)]
+                    out = [
+                        out[j] * fx.full(8, alpha * s_rescale[j // 2], fx.Float32)
+                        for j in range_constexpr(self.DIM_TILES)
+                    ]
                 outs.append(out)
                 next_state.extend([m_new, l_new])
             group = self.DEQUANT_GROUP
-            for step in range_constexpr(2):
-                # Chunks 2 step and 2 step + 1 are the K32 halves of the step.
-                for j0 in range_constexpr(0, self.DIM_TILES, group):
-                    # Dequantize a group of dim tiles before packing any: one
-                    # dequant -> pack -> PV chain at a time leaves each WMMA
-                    # waiting on the last (B16 ctx64k pa_decode 15.0 -> 13.9 us).
-                    raw = [
-                        [
-                            Gfx1250Gemm.mma_mx(
-                                v_rows[c],
-                                self.identity_operand(identity_rows, j),
-                                v_scales[c],
-                                fx.Int32(self.UNIT_SCALES),
-                                Gfx1250Gemm.FMT_E2M1,
-                            )
-                            for c in (2 * step, 2 * step + 1)
-                        ]
-                        for j in range_constexpr(j0, j0 + group)
-                    ]
-                    for j in range_constexpr(j0, j0 + group):
-                        pair = raw[j - j0]
-                        v_op = (
-                            pair[0]
-                            .to(fx.BFloat16)
-                            .shuffle(pair[1].to(fx.BFloat16), list(range(16)))
+            for j0 in range_constexpr(0, self.DIM_TILES, group):
+                # Dequantize a group of dim tiles before converting any: one
+                # dequant -> convert -> PV chain at a time leaves each WMMA
+                # waiting on the last.
+                raw = [
+                    [
+                        Gfx1250Gemm.mma_mx(
+                            v_rows[c],
+                            self.identity_operand(identity_rows, j),
+                            v_relative[c],
+                            fx.Int32(self.UNIT_SCALES),
+                            Gfx1250Gemm.FMT_E2M1,
                         )
-                        # Every M-tile reuses the tile's dequantized V.
-                        for m in range_constexpr(tiles):
-                            outs[m][j] = Gfx1250Gemm.mma(
-                                v_op, p_ops[m][step], outs[m][j], 32, bf16=True
-                            )
+                        for c in range_constexpr(kv.CHUNKS)
+                    ]
+                    for j in range_constexpr(j0, j0 + group)
+                ]
+                for j in range_constexpr(j0, j0 + group):
+                    # V''^T in the K64 A operand order (lane = dim): chunk c's 8
+                    # tokens per dword pair, as the dequant lands them.
+                    words = []
+                    for c in range_constexpr(kv.CHUNKS):
+                        packed = self.mem.fp8(raw[j - j0][c])
+                        words.extend([packed[0], packed[1]])
+                    v_op = fx.Vector.from_elements(words, dtype=fx.Int32)
+                    # Every M-tile reuses the tile's dequantized V.
+                    for m in range_constexpr(tiles):
+                        outs[m][j] = Gfx1250Gemm.mma(v_op, p_ops[m], outs[m][j], 64)
             final_state = []
             for m in range_constexpr(tiles):
                 final_state.extend(next_state[2 * m : 2 * m + 2])
                 final_state.extend(outs[m])
-            final = yield [*final_state, k_next, v_next, page_after]
-        self.store(final, warp, lane16, half, tid, score_scales)
+            final = yield [*final_state, *s_new, k_next, v_next, page_after]
+        if const_expr(t.wave_partials):
+            self.store_wave(final, warp, lane16, half, score_scales)
+        else:
+            self.store(final, warp, lane16, half, tid, score_scales)
+
+    @flyc.jit
+    def store_wave(self, final, warp, lane16, half, score_scales):
+        """Each wave's own rows as a partial of the cluster merge (slot NWARP *
+        task slot + wave), instead of merging the waves through LDS: no
+        workgroup barrier, and the cluster merge's one pass covers both."""
+        ctx, t = self.ctx, self.t
+        tiles = t.m_tiles
+        slot = ctx.task_slot * t.NWARP + warp
+        # Dims of block b hold 2**(OUT_EXP - S_b) * sum(P V): restore exactly,
+        # the factor above -126 last (subnormal rows round once).
+        restore_lo, restore_hi = [], []
+        for b in range_constexpr(self.BLOCKS):
+            restore = fx.Int32(final[tiles * self.STATE + b]) - fx.Int32(self.OUT_EXP)
+            high = fx.max(restore, fx.Int32(-126))
+            restore_lo.append(self.pow2(restore - high))
+            restore_hi.append(self.pow2(high))
+        pout = fx.recast_iter(t.q_dtype, ctx.pout_ptr)
+        pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
+        psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
+        for m in range_constexpr(tiles):
+            row_sum = fx.Float32(final[m * self.STATE + 1])
+            row_sum = row_sum + row_sum.shuffle_xor(16, t.WAVE)
+            # A row that sees no token stores zeros with no mass.
+            inv = fx.Float32(
+                (row_sum > fx.Float32(0.0)).select(
+                    fx.Float32(rcp_f32(row_sum)), fx.Float32(0.0)
+                )
+            )
+            row = m * 16 + lane16
+            partial = (fx.Int64(ctx.kv_h) * fx.Int64(ctx.capacity) + fx.Int64(slot)) * (
+                t.rows * t.query_splits
+            ) + (ctx.query_begin * t.query_group_size + row)
+            values = [
+                (
+                    (
+                        fx.Vector(final[m * self.STATE + 2 + j])
+                        * fx.full(8, inv * restore_lo[j // 2], fx.Float32)
+                    )
+                    * fx.full(8, restore_hi[j // 2], fx.Float32)
+                ).to(t.q_dtype)
+                for j in range_constexpr(self.DIM_TILES)
+            ]
+            # The shared reducer and cluster merge read natural-log maxima.
+            row_max = (
+                fx.Float32(final[m * self.STATE])
+                * score_scales[m]
+                * fx.Float32(1.0 / LOG2E)
+            )
+            if row < t.rows:
+                for j in range_constexpr(self.DIM_TILES):
+                    fx.ptr_store(
+                        values[j],
+                        fx.add_offset(pout, partial * t.head_dim + 16 * j + 8 * half),
+                    )
+                if half == 0:
+                    pmax[partial] = row_max
+                    psum[partial] = row_sum
 
     @flyc.jit
     def store(self, final, warp, lane16, half, tid, score_scales):
@@ -3663,6 +3794,21 @@ class Gfx1250Mxfp4Pipeline:
                     row_sum,
                     fx.Float32,
                 )
+        # The wave's running S_b: dims of block b hold 2**(OUT_EXP - S_b) *
+        # sum(P V).
+        s_slot = stats + 2 * tiles * t.NWARP * 16 * 4
+        if tid % t.WAVE == 0:
+            self.mem.store(
+                s_slot + warp * 16,
+                fx.Vector.from_elements(
+                    [
+                        fx.Int32(final[tiles * self.STATE + b])
+                        for b in range_constexpr(self.BLOCKS)
+                    ],
+                    dtype=fx.Int32,
+                ),
+                fx.Int32,
+            )
         gpu.barrier()
         if const_expr(t.cluster_merge):
             # A sequence's only task stores its rows; others leave partials for
@@ -3671,6 +3817,12 @@ class Gfx1250Mxfp4Pipeline:
         else:
             direct = fx.Int32(int(t.plan_free)) == 1
         local, dim = tid // 8, (tid % 8) * 16
+        # This thread's 16 dims lie in block dim // 32: each wave's S of it.
+        s_waves = [
+            fx.Int32(self.mem.load(s_slot + w * 16 + (dim // 32) * 4, fx.Int32)[0])
+            for w in range_constexpr(t.NWARP)
+        ]
+        s_all = fx.max(fx.max(s_waves[0], s_waves[1]), fx.max(s_waves[2], s_waves[3]))
         for m in range_constexpr(tiles):
             maxima = [
                 fx.Float32(
@@ -3700,22 +3852,30 @@ class Gfx1250Mxfp4Pipeline:
             for w in range_constexpr(t.NWARP):
                 weight = fx.Float32(fx.exp2(maxima[w] - safe, fastmath="afn"))
                 denom = denom + sums[w] * weight
+                # Each wave's outputs carry its own S: align them to the largest.
+                weight = weight * self.pow2(s_waves[w] - s_all)
                 acc = acc + self.mem.load(
                     (w * tiles + m) * t.MXFP4_O_BYTES
                     + (local * t.MXFP4_O_STRIDE + dim) * 4,
                     fx.Float32,
                     16,
                 ) * fx.full(16, weight, fx.Float32)
-            # O and the denominator both carry 2**-MXFP4_P_EXP_SHIFT; a row's
-            # max token has p = 1, so the denominator is a normal f32 when
-            # nonzero. A row that sees no token (an MTP position before the
-            # context) stores zeros.
+            # A row's max token has p = 1, so the denominator is a normal f32
+            # when nonzero. A row that sees no token (an MTP position before the
+            # context) stores zeros. The 2**(S - OUT_EXP) restore is exact, down
+            # to subnormal outputs.
             inv = fx.Float32(
                 (denom > fx.Float32(0.0)).select(
                     fx.Float32(rcp_f32(denom)), fx.Float32(0.0)
                 )
             )
-            values = (acc * fx.full(16, inv, fx.Float32)).to(t.q_dtype)
+            restore = s_all - fx.Int32(self.OUT_EXP)
+            high = fx.max(restore, fx.Int32(-126))
+            values = (
+                (acc * fx.full(16, inv, fx.Float32))
+                * fx.full(16, self.pow2(restore - high), fx.Float32)
+                * fx.full(16, self.pow2(high), fx.Float32)
+            ).to(t.q_dtype)
             row = m * 16 + local
             if row < t.rows:
                 position = ctx.query_begin + row // t.query_group_size
@@ -3751,4 +3911,4 @@ class Gfx1250Mxfp4Pipeline:
                         pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
                         psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
                         pmax[partial] = row_max * fx.Float32(1.0 / LOG2E)
-                        psum[partial] = denom * fx.Float32(2.0**MXFP4_P_EXP_SHIFT)
+                        psum[partial] = denom

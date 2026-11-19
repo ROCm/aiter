@@ -409,12 +409,12 @@ def _pa_decode_mxfp4(
     # rounds at two a CU: 16.4 us against 14.4 us with the reducer), and MTP
     # clusters of 3 and 4 M-tile CTAs, one a CU, stay within the CUs.
     #
-    # Single-token decode merges on chip only where that costs no
-    # parallelism: one tile a cluster CTA, or clusters that fill the CUs.
-    # Otherwise the plan's one-tile tasks and the reducer win (B1 x 8k:
-    # 5.5 us against 5.9 us for 16 two-tile CTAs; B16 x 8k: 6.9 against
-    # 6.6 us). MTP tasks cost more, so they merge on chip whenever the
-    # clusters fit (G16 x MTP4 at B3 x 8k: 7.4 against 7.1 us).
+    # Single-token decode merges on chip with one tile a cluster CTA, or with
+    # clusters over a quarter of the CUs. Below that the plan's one-tile
+    # tasks and the reducer win (G16 B1 x 8k: 5.5 us against 5.8 us for 16
+    # two-tile CTAs; B4 x 8k: 6.0 against 5.8 us; 8 KV heads B1 x 8k: 6.7
+    # against 5.9 us). MTP tasks cost more, so they merge on chip whenever
+    # the clusters fit (G16 x MTP4 at B3 x 8k: 7.4 against 7.1 us).
     splits = mxfp4_gfx1250_query_splits(query_length, group) if gfx1250 else 1
     rows = query_length * group // splits
     resident_ctas = mxfp4_gfx1250_resident_ctas(rows, num_compute_units)
@@ -423,6 +423,12 @@ def _pa_decode_mxfp4(
     cluster_ctas = max(capacity, -(-2 * num_compute_units // num_kv_heads))
     if rows > 32:
         cluster_ctas = -(-resident_ctas // num_kv_heads)
+    if query_length > 1:
+        # MTP clusters shrink until their CTAs fit one round: each CTA runs
+        # more tiles, but the call merges on chip without the reducer (G16 x
+        # MTP4 at B32 x 8k: 14.2 -> 11.7 us with 8-CTA clusters).
+        while cluster_size > 2 and num_seqs * cluster_size * splits > cluster_ctas:
+            cluster_size //= 2
     cluster_merge = (
         cluster_size
         if gfx1250
@@ -431,7 +437,7 @@ def _pa_decode_mxfp4(
         and (
             query_length > 1
             or partitions <= CLUSTER_PARTITIONS
-            or num_seqs * num_kv_heads * cluster_size >= num_compute_units
+            or 4 * num_seqs * num_kv_heads * cluster_size >= num_compute_units
         )
         and num_seqs * cluster_size * splits <= cluster_ctas
         and num_seqs * num_kv_heads * splits <= num_compute_units * 15 // 16
@@ -453,6 +459,30 @@ def _pa_decode_mxfp4(
         and max_tasks * num_kv_heads * splits > resident_ctas
         else 1
     )
+    # As on the FP8/BF16 path: clusters given a length bound give CTA p tiles
+    # [p * run, (p + 1) * run), runs splitting the bound evenly, so each CTA
+    # loads its first page ids with the context length rather than after it.
+    # MTP only: single-token decode measured no faster with runs (G16 B16 x
+    # 8k 6.2 -> 6.3 us), MTP4 faster (B3 x 8k 7.4 -> 6.9 us).
+    bound_tiles = -(-schedule_context_length // KV_COMPUTE_BLOCK)
+    cluster_runs = bool(
+        cluster_merge
+        and query_length > 1
+        and max_context_length is not None
+        and sliding_window == 0
+        and num_seqs * cluster_merge <= capacity
+        and bound_tiles <= 4 * cluster_merge
+    )
+    run_tiles = -(-bound_tiles // cluster_merge) if cluster_runs else 0
+    # Clusters of at most 8 CTAs whose scratch holds a slot per wave merge
+    # each wave's partial directly, skipping the CTA's LDS merge of its four
+    # waves and its barrier (G16 B1 x 1k decode: 4.6 -> 3.8 us).
+    wave_partials = bool(
+        gfx1250
+        and cluster_merge
+        and cluster_merge * 4 <= 32
+        and 4 * num_seqs * cluster_merge <= capacity
+    )
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
             head_dim=head_dim,
@@ -473,7 +503,9 @@ def _pa_decode_mxfp4(
             max_context_length=schedule_context_length,
             direct_output=direct,
             cluster_merge=cluster_merge,
+            cluster_runs=cluster_runs,
             fuse_tasks=fuse_tasks,
+            wave_partials=wave_partials,
         )
     pmax = psum = pout = output
     if not direct:
@@ -534,7 +566,7 @@ def _pa_decode_mxfp4(
                     else ptr_arg(work_plan.reduce_info, fx.Int32)
                 ),
                 flyc.from_c_void_p(fx.Int32, 0),
-                0,
+                run_tiles,
                 # No FP8 output (pa_decode refuses it for MXFP4 KV).
                 flyc.from_c_void_p(fx.Float8E4M3FN, 0),
                 flyc.from_c_void_p(fx.Float32, 0),

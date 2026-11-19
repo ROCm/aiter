@@ -184,6 +184,7 @@ def _pa_decode_tile_kernel_name(
     quant_output=False,
     store_output=True,
     fuse_tasks=1,
+    wave_partials=False,
 ):
     """Trace-visible symbol carrying the main compile-time constants."""
     name = (
@@ -210,6 +211,8 @@ def _pa_decode_tile_kernel_name(
         name += "_quant" if store_output else "_quantonly"
     if fuse_tasks > 1:
         name += f"_fuse{fuse_tasks}"
+    if wave_partials:
+        name += "_wp"
     return name
 
 
@@ -245,6 +248,7 @@ def compile_pa_decode_tile(
     quant_output: bool = False,
     store_output: bool = True,
     fuse_tasks: int = 1,
+    wave_partials: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -353,6 +357,7 @@ def compile_pa_decode_tile(
                 quant_output=quant_output,
                 store_output=store_output,
                 fuse_tasks=fuse_tasks,
+                wave_partials=wave_partials,
             )
         )
     if architecture not in ("gfx942", "gfx950"):
@@ -361,8 +366,8 @@ def compile_pa_decode_tile(
         raise NotImplementedError(
             "cluster_merge, quant_output and a skipped store require gfx1250"
         )
-    if fuse_tasks != 1:
-        raise NotImplementedError("fuse_tasks requires gfx1250 MXFP4")
+    if fuse_tasks != 1 or wave_partials:
+        raise NotImplementedError("fuse_tasks and wave_partials require gfx1250 MXFP4")
     schedule = PaDecodeSchedule.select(
         head_dim=head_dim,
         query_group_size=query_group_size,
@@ -825,6 +830,7 @@ def gfx1250_tile_traits(
     quant_output: bool = False,
     store_output: bool = True,
     fuse_tasks: int = 1,
+    wave_partials: bool = False,
 ) -> Gfx1250Traits:
     """Select the gfx1250 tile ``compile_pa_decode_tile`` compiles.
 
@@ -914,6 +920,7 @@ def gfx1250_tile_traits(
         store_output=store_output,
         plan_free=plan_free,
         fuse_tasks=fuse_tasks,
+        wave_partials=wave_partials,
         resident_ctas=(
             mxfp4_gfx1250_resident_ctas(
                 query_length * query_group_size // query_splits, num_compute_units
@@ -962,6 +969,13 @@ def compile_gfx1250_pa_decode(t):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {t.compute_dtype}")
     if t.plan_free and not t.mxfp4:
         raise ValueError("plan_free requires MXFP4 KV")
+    if t.wave_partials and not (
+        t.mxfp4 and t.cluster_merge and t.cluster_merge * t.NWARP <= t.WAVE
+    ):
+        raise ValueError(
+            "wave_partials requires an MXFP4 cluster merge of at most "
+            f"{32 // 4} CTAs (a lane per partial)"
+        )
     if t.fuse_tasks not in (1, 2) or (
         t.fuse_tasks > 1 and (not t.mxfp4 or t.plan_free or t.cluster_merge)
     ):
@@ -977,7 +991,7 @@ def compile_gfx1250_pa_decode(t):
         and not t.per_token_kv
         and not (t.direct_output or t.merge_partitions)
         and not (t.plan_free and t.cluster_merge)
-        and not (t.cluster_steps or t.cluster_runs or t.cluster_seqs > 1)
+        and not (t.cluster_steps or t.cluster_seqs > 1)
         and not t.quant_output
         and t.store_output
     ):
@@ -986,7 +1000,7 @@ def compile_gfx1250_pa_decode(t):
             f"heads per KV head, at most {MXFP4_GFX1250_MAX_ROWS} query rows a CTA "
             "(query positions / query_splits x heads), a bf16 or e4m3 query, its "
             "in-cache e8m0 scales (no f32 per-token tensors) and reducer, "
-            "cluster-merged (one sequence a cluster, plan-derived tiles) or "
+            "cluster-merged (one sequence a cluster, plan or run tiles) or "
             "plan-free bf16 output (no FP8 output quantization)"
         )
     if t.query_dtype == "fp8" and not t.mxfp4:
@@ -1060,6 +1074,7 @@ def compile_gfx1250_pa_decode(t):
         quant_output=t.quant_output,
         store_output=t.store_output,
         fuse_tasks=t.fuse_tasks,
+        wave_partials=t.wave_partials,
     )
 
     # Every argument that reducer-fed and direct-output kernels read fits in
@@ -1511,8 +1526,10 @@ def compile_gfx1250_pa_decode(t):
             elif (count == 0) & (part == 0) & present:
                 zero_output(seq, output)
         elif const_expr(t.cluster_merge):
-            # Every CTA of a cluster reaches its barrier exactly once.
-            if count > 1:
+            # Every CTA of a cluster reaches its barrier exactly once. With
+            # wave partials even a one-task sequence merges its waves here.
+            waves = t.NWARP if t.wave_partials else 1
+            if count > (0 if t.wave_partials else 1):
                 merge = Gfx1250ClusterMerge(
                     t,
                     pmax,
@@ -1523,7 +1540,7 @@ def compile_gfx1250_pa_decode(t):
                     sq_head,
                     quant if t.quant_output else None,
                 )
-                merge.run(seq, part, first, count, capacity)
+                merge.run(seq, part, first * waves, count * waves, capacity)
             elif const_expr(t.quant_output):
                 pad_row = fx.Int32(gpu.block_id("x")) - sequences * t.cluster_merge
                 if pad_row >= 0:

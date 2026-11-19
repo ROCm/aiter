@@ -2330,6 +2330,16 @@ class Gfx1250Mxfp4Loader:
             self.table[self.ctx.planned_seq * self.ctx.max_blocks_per_seq + page]
         )
 
+    def first_page_id(self, tt):
+        """``page_id(tt)`` of a CTA's first tile. Cluster runs preload the first
+        tile's page ids with the context length (``ctx.stage_pages``: its two
+        pages, then token 0's), so they need not wait for it."""
+        stage_pages = getattr(self.ctx, "stage_pages", None)
+        if const_expr(stage_pages is None or not self.ctx.traits.cluster_runs):
+            return self.page_id(tt)
+        page = (self.page_slot == 0).select(stage_pages[0], stage_pages[1])
+        return (tt * 2 + self.page_slot < self.num_pages).select(page, stage_pages[-1])
+
     def base(self, page_id):
         """Byte offset of this wave's page and KV head (wave-uniform)."""
         page = fx.Int32(fx.rocdl.readfirstlane(T.i32, page_id))
