@@ -1,0 +1,23 @@
+{
+  "aiter/ops/mono_standard/__init__.py": "b3ad7ef70317aa816a0cf12a66b3691e1d24ca488dad460a6a030fc11bd20441",
+  "aiter/ops/mono_standard/atom_helpers.py": "78f02467def3bef464e69c82e3cebde61b708ad262cf8ae2f3310d8628becff2",
+  "aiter/ops/mono_standard/build_callable.py": "9a2564b965aad36c46a04e17dc58bcccecb4c2e70f95e6d4230c61c2ecf13a71",
+  "aiter/ops/mono_standard/codegen.py": "8cd3a3f74229dde92d7bba4c5d14d088a9b6e8eb17146154e5775467d04ae6c1",
+  "aiter/ops/mono_standard/elf.py": "9097b3a4e41d3e05175c1477720f02329fc677a04d288d96a3a716fd081fc94f",
+  "aiter/ops/mono_standard/loader.py": "a90d52ecb4ab793143aef826142e2e5e68a8b66f96d8bbb1216337672f96b7df",
+  "aiter/ops/mono_standard/sources/__init__.py": "67f40716b3545c74b80d459b544bc3a7979acfeaaa12be4ff3ac84efeba3577d",
+  "aiter/ops/mono_standard/sources/inverse_rope_group_quant_mono.cu": "8d6e3f86ebcfec041522ccd4dfd60f7695345c5fdfa495cbcfecb614f12f4a95",
+  "aiter/ops/mono_standard/sources/rope_window_mono.py": "8f5f75c621cdcfb190435546cc2bc230aeab1d6237f0b9d632ac03316b33b333",
+  "aiter/ops/mono_standard/sources.json": "7a96e0d1dda27ba4ed09afadfbe48fee0c867a1a540e3b447abcead660cb95fd",
+  "op_tests/mono_rope/__init__.py": "67f40716b3545c74b80d459b544bc3a7979acfeaaa12be4ff3ac84efeba3577d",
+  "op_tests/mono_rope/audit_contract.py": "2f6f1689ca9fb373cd87965e1d96ff1a9b515515139dcc476b5bd9c0791f144e",
+  "op_tests/mono_rope/audit_runtime.py": "0596d78a2d26f33aceff380db76e5042bf4fba4a76b116e13a0adb3e8a48d75e",
+  "op_tests/mono_rope/capture_sentinel_args.cpp": "59a47b927a6e4f3d075c8582aa84847cfb793ba5551ef58467c3a49a26305129",
+  "op_tests/mono_rope/check_isa.py": "a1051be7ad65784d80227e01432ee236bf6cebcd8f489ca1e6189d191cd56307",
+  "op_tests/mono_rope/compare_binaries.py": "381a767053f55f23020e00d5619c980760663bd65e064487bcf48cd34434e2ba",
+  "op_tests/mono_rope/replay_candidate.py": "c1baae5c535b086c7d34cff32f8b8e4f9006c66d232e8e9af92abc5a3d14fbc5",
+  "op_tests/mono_rope/run_contract.py": "2a20a11803403a57708789e3c41e46057bb4c46ef0b61cacd5d5bbe21c8fc800",
+  "op_tests/mono_rope/runtime_artifacts.py": "4e3dc693939f0485a31a2795508cddb84a1bba99c28b379e647a7ebac8abc3f3",
+  "op_tests/mono_rope/test_import.py": "2046b6b1aaf97741b3d655d29c9ec9957a6f09743a685409b4d838525b74cd29",
+  "op_tests/mono_rope/validate_handoff.py": "7ddcaecb9015f28f8b7f12701fff6cc990555279ef65b8156dcfe61573e89984"
+}

@@ -1,0 +1,119 @@
+{
+  "scope": "MONO rope integration on visible gfx1250 GPUs with a ROCm toolchain",
+  "validation_head": "8f64fe705f40129d1504de7a799e28bc0140bdbf",
+  "configured_environment_passed": true,
+  "shared_jit_modified": false,
+  "native_tests_modified": false,
+  "unmodified_shared_file_sha256": {
+    "aiter/jit/core.py": "e2f32f6e4b7aab3942fb4726dc39ff9f39a4d84c2865fae9daca37a08ab7fb40",
+    "aiter/jit/optCompilerConfig.json": "31e35d54f60fd9cda36912084036acb4c96010226315a798b880c2b070c70551",
+    "aiter/jit/utils/cpp_extension.py": "c0fcd8932eaf70d6edeb2278e31bbe56e85317afa0fbc22856c191fcda6976af",
+    "tests/test_import_without_gpu.py": "128ad24f75df23c46d3913fa604e88e4fc3b2ed724d1de67a334cf7379d0158f",
+    "op_tests/test_build_targets_architecture.py": "83a02f110e31102a701994d943d5fd9116b8cb325028e49e64e95170fcc80964"
+  },
+  "gpu_checks": {
+    "passed": true,
+    "repository": "/git-aiter/aiter/__init__.py",
+    "physical_gpu": "0",
+    "runtime_gfx": "gfx1250",
+    "fresh_cache": true,
+    "native_host_only": false,
+    "core_sha256": "53aba8b4a1857ecf78b08ddf3ab35128501a0166d2216598d8c9108a535307c0",
+    "checks": [
+      {
+        "name": "native_and_mono_gpu_imports_and_native_silu",
+        "passed": true
+      },
+      {
+        "name": "audit_contract_cli_help",
+        "passed": true
+      },
+      {
+        "name": "run_contract_cli_help",
+        "passed": true
+      }
+    ],
+    "imported_modules": [
+      "aiter.ops.mono_standard.atom_helpers",
+      "aiter.ops.mono_standard.codegen",
+      "aiter.ops.mono_standard.elf",
+      "aiter.ops.mono_standard.loader",
+      "aiter.ops.mono_standard.build_callable",
+      "aiter.ops.mono_standard.sources.rope_window_mono",
+      "op_tests.mono_rope.audit_runtime",
+      "op_tests.mono_rope.check_isa",
+      "op_tests.mono_rope.compare_binaries",
+      "op_tests.mono_rope.runtime_artifacts",
+      "op_tests.mono_rope.validate_handoff",
+      "op_tests.mono_rope.replay_candidate"
+    ],
+    "torch": "2.11.0+rocm10.1.0a20260811-bkc.20260820",
+    "hip": "7.16.26315",
+    "script_sha256": "a95be27d6d830236690445eadaa4fa7fd9d08c98483a05dadba809440f2c011c"
+  },
+  "pytest_regressions": {
+    "passed": 1,
+    "failed": 0,
+    "skipped": 0,
+    "tests": [
+      "op_tests/mono_rope/test_import.py"
+    ],
+    "gpu_visible": true,
+    "fresh_jit_cache": true,
+    "explicit_gpu_arch": false,
+    "junit": "/home/amd/qiwan/A05_A07_C16_dsv41_handoff_20261118T060637Z/outputs/git-mono-20261119/gpu-scope/import-regression.xml"
+  },
+  "numerical_replays": 2,
+  "numerical_suite": {
+    "complete": true,
+    "aiter": "/git-aiter/aiter/__init__.py",
+    "runs": [
+      {
+        "name": "verify",
+        "exit_code": 0
+      },
+      {
+        "name": "A05-r0",
+        "exit_code": 0
+      },
+      {
+        "name": "A07-r0",
+        "exit_code": 0
+      }
+    ],
+    "passed": true,
+    "physical_gpu": "1"
+  },
+  "machine_code_identity": {
+    "passed": true,
+    "kernels": [
+      {
+        "operator": "rope_window_mono",
+        "symbol": "_rope_window_fp8_kernel",
+        "body_equal": true,
+        "descriptor_equal": true,
+        "body_sha256": "ed8376c7b80962aeefc3c276ca4e6d92b25bb0f7ca786f1296574d349ee0d826"
+      },
+      {
+        "operator": "inverse_rope_group_quant_mono",
+        "symbol": "_ZN5aiter42inverse_rope_group_quant_persistent_kernelIDF16bfLi512ELi64ELi32ELi32ELi1ELNS_11ScaleLayoutE0ELNS_9TierOrderE0ELb0ELb0EEEvPKT_PDB8_PhPKlPKT0_SD_iiiiiillliiibbii",
+        "body_equal": true,
+        "descriptor_equal": true,
+        "body_sha256": "370d0050694b44903c28625b4cf747b4a6e6710f373c72a96cf4ccb262a799ca"
+      },
+      {
+        "operator": "inverse_rope_group_quant_mono",
+        "symbol": "_ZN5aiter42inverse_rope_group_quant_persistent_kernelIDF16bDF16bLi512ELi64ELi32ELi32ELi1ELNS_11ScaleLayoutE0ELNS_9TierOrderE0ELb0ELb0EEEvPKT_PDB8_PhPKlPKT0_SD_iiiiiillliiibbii",
+        "body_equal": true,
+        "descriptor_equal": true,
+        "body_sha256": "d084438a84a7f1db9ea4d389f9e21c3c09d62bd31f2dcfa300f686ee6f69b14d"
+      }
+    ],
+    "identical_fallback_bodies": 460,
+    "baseline": "/home/amd/qiwan/A05_A07_C16_dsv41_handoff_20261118T060637Z/outputs/git-mono-20261119/import-checks/numerical/artifacts",
+    "candidate": "/home/amd/qiwan/A05_A07_C16_dsv41_handoff_20261118T060637Z/outputs/git-mono-20261119/gpu-scope/numerical/artifacts"
+  },
+  "gpu_less_native_import_in_scope": false,
+  "raw_evidence": "/home/amd/qiwan/A05_A07_C16_dsv41_handoff_20261118T060637Z/outputs/git-mono-20261119/gpu-scope",
+  "new_performance_campaign": false
+}

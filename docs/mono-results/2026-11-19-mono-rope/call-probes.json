@@ -1,0 +1,734 @@
+{
+  "passed": true,
+  "physical_gpu": 0,
+  "runs": [
+    {
+      "rank": 0,
+      "kernel": "A05",
+      "cos_bf16": false,
+      "pattern": 610839776,
+      "gen": 1,
+      "epoch": 9,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A05",
+      "cos_bf16": false,
+      "pattern": 610839776,
+      "gen": 2,
+      "epoch": 18,
+      "mode": "graph",
+      "delayed_TG": 255,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A05",
+      "cos_bf16": false,
+      "pattern": 610839776,
+      "gen": 3,
+      "epoch": 27,
+      "mode": "graph",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A05",
+      "cos_bf16": false,
+      "pattern": 610839776,
+      "gen": 477218587,
+      "epoch": 4294967283,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A05",
+      "cos_bf16": false,
+      "pattern": 1431655765,
+      "gen": 1,
+      "epoch": 9,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A05",
+      "cos_bf16": false,
+      "pattern": 1431655765,
+      "gen": 2,
+      "epoch": 18,
+      "mode": "graph",
+      "delayed_TG": 255,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A05",
+      "cos_bf16": false,
+      "pattern": 1431655765,
+      "gen": 3,
+      "epoch": 27,
+      "mode": "graph",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A05",
+      "cos_bf16": false,
+      "pattern": 1431655765,
+      "gen": 477218587,
+      "epoch": 4294967283,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A05",
+      "cos_bf16": false,
+      "pattern": 270544960,
+      "gen": 1,
+      "epoch": 9,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A05",
+      "cos_bf16": false,
+      "pattern": 270544960,
+      "gen": 2,
+      "epoch": 18,
+      "mode": "graph",
+      "delayed_TG": 255,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A05",
+      "cos_bf16": false,
+      "pattern": 270544960,
+      "gen": 3,
+      "epoch": 27,
+      "mode": "graph",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A05",
+      "cos_bf16": false,
+      "pattern": 270544960,
+      "gen": 477218587,
+      "epoch": 4294967283,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A05",
+      "cos_bf16": false,
+      "pattern": 610839776,
+      "gen": 1,
+      "epoch": 9,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": true,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": false,
+      "pattern": 610839776,
+      "gen": 1,
+      "epoch": 9,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": false,
+      "pattern": 610839776,
+      "gen": 2,
+      "epoch": 18,
+      "mode": "graph",
+      "delayed_TG": 255,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": false,
+      "pattern": 610839776,
+      "gen": 3,
+      "epoch": 27,
+      "mode": "graph",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": false,
+      "pattern": 610839776,
+      "gen": 477218587,
+      "epoch": 4294967283,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": false,
+      "pattern": 1431655765,
+      "gen": 1,
+      "epoch": 9,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": false,
+      "pattern": 1431655765,
+      "gen": 2,
+      "epoch": 18,
+      "mode": "graph",
+      "delayed_TG": 255,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": false,
+      "pattern": 1431655765,
+      "gen": 3,
+      "epoch": 27,
+      "mode": "graph",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": false,
+      "pattern": 1431655765,
+      "gen": 477218587,
+      "epoch": 4294967283,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": false,
+      "pattern": 270544960,
+      "gen": 1,
+      "epoch": 9,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": false,
+      "pattern": 270544960,
+      "gen": 2,
+      "epoch": 18,
+      "mode": "graph",
+      "delayed_TG": 255,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": false,
+      "pattern": 270544960,
+      "gen": 3,
+      "epoch": 27,
+      "mode": "graph",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": false,
+      "pattern": 270544960,
+      "gen": 477218587,
+      "epoch": 4294967283,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": false,
+      "pattern": 610839776,
+      "gen": 1,
+      "epoch": 9,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": true,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": true,
+      "pattern": 610839776,
+      "gen": 1,
+      "epoch": 9,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": true,
+      "pattern": 610839776,
+      "gen": 2,
+      "epoch": 18,
+      "mode": "graph",
+      "delayed_TG": 255,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": true,
+      "pattern": 610839776,
+      "gen": 3,
+      "epoch": 27,
+      "mode": "graph",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": true,
+      "pattern": 610839776,
+      "gen": 477218587,
+      "epoch": 4294967283,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": true,
+      "pattern": 1431655765,
+      "gen": 1,
+      "epoch": 9,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": true,
+      "pattern": 1431655765,
+      "gen": 2,
+      "epoch": 18,
+      "mode": "graph",
+      "delayed_TG": 255,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": true,
+      "pattern": 1431655765,
+      "gen": 3,
+      "epoch": 27,
+      "mode": "graph",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": true,
+      "pattern": 1431655765,
+      "gen": 477218587,
+      "epoch": 4294967283,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": true,
+      "pattern": 270544960,
+      "gen": 1,
+      "epoch": 9,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": true,
+      "pattern": 270544960,
+      "gen": 2,
+      "epoch": 18,
+      "mode": "graph",
+      "delayed_TG": 255,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": true,
+      "pattern": 270544960,
+      "gen": 3,
+      "epoch": 27,
+      "mode": "graph",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": true,
+      "pattern": 270544960,
+      "gen": 477218587,
+      "epoch": 4294967283,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": false,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    },
+    {
+      "rank": 0,
+      "kernel": "A07",
+      "cos_bf16": true,
+      "pattern": 610839776,
+      "gen": 1,
+      "epoch": 9,
+      "mode": "eager",
+      "delayed_TG": null,
+      "negative_control": true,
+      "monitor_ok": true,
+      "flags_ok": true,
+      "all_outputs_copied_with_DEV": [
+        true,
+        true
+      ],
+      "passed": true
+    }
+  ]
+}

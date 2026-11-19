@@ -1,0 +1,101 @@
+{
+  "passed": true,
+  "objects": [
+    {
+      "stage": "A05",
+      "symbol": "_rope_window_fp8_kernel",
+      "binary": "/outputs/git-mono-20261119/suite-audit-a05/A05_persistent_2f0f8093e6e57b9103f3440108c78c18f02755fbd8f87de8bc7c8a5c7e6fde29/kernel.hsaco",
+      "sha256": "2f0f8093e6e57b9103f3440108c78c18f02755fbd8f87de8bc7c8a5c7e6fde29",
+      "loads": 14,
+      "stores": 12,
+      "scalar_loads": [
+        {
+          "offset": 144,
+          "instruction": "s_load_b64 s[0:1], s[0:1], 0x0"
+        },
+        {
+          "offset": 188,
+          "instruction": "s_load_b32 s30, s[20:21], 0x0"
+        },
+        {
+          "offset": 244,
+          "instruction": "s_load_b32 s21, s[22:23], s30 offset:0x4 scale_offset"
+        },
+        {
+          "offset": 296,
+          "instruction": "s_load_b32 s12, s[24:25], s30 offset:0x0 scale_offset"
+        }
+      ],
+      "exits": 1,
+      "sgpr_count": 68,
+      "vgpr_count": 81,
+      "lds_static_bytes": 0,
+      "scratch_bytes": 0,
+      "all_loads_DEV": true,
+      "all_stores_DEV_HT": true,
+      "all_exits_full_EXEC": true,
+      "no_s96_s105_references": true,
+      "internal_branches": 18,
+      "passed": true
+    },
+    {
+      "stage": "A07",
+      "symbol": "_ZN5aiter42inverse_rope_group_quant_persistent_kernelIDF16bfLi512ELi64ELi32ELi32ELi1ELNS_11ScaleLayoutE0ELNS_9TierOrderE0ELb0ELb0EEEvPKT_PDB8_PhPKlPKT0_SD_iiiiiillliiibbii",
+      "binary": "/outputs/git-mono-20261119/suite-audit-a07/kernel.hsaco",
+      "sha256": "2fa0cbdd5ab1b75681ee0d44247d02ae217da679897ef062db1860daf5e4395c",
+      "loads": 22,
+      "stores": 7,
+      "scalar_loads": [
+        {
+          "offset": 1044,
+          "instruction": "s_load_b64 s[38:39], s[38:39], 0x0"
+        },
+        {
+          "offset": 2128,
+          "instruction": "s_load_b64 s[8:9], s[8:9], 0x0"
+        }
+      ],
+      "exits": 2,
+      "sgpr_count": 68,
+      "vgpr_count": 66,
+      "lds_static_bytes": 0,
+      "scratch_bytes": 0,
+      "all_loads_DEV": true,
+      "all_stores_DEV_HT": true,
+      "all_exits_full_EXEC": true,
+      "no_s96_s105_references": true,
+      "internal_branches": 15,
+      "passed": true
+    },
+    {
+      "stage": "A07",
+      "symbol": "_ZN5aiter42inverse_rope_group_quant_persistent_kernelIDF16bDF16bLi512ELi64ELi32ELi32ELi1ELNS_11ScaleLayoutE0ELNS_9TierOrderE0ELb0ELb0EEEvPKT_PDB8_PhPKlPKT0_SD_iiiiiillliiibbii",
+      "binary": "/outputs/git-mono-20261119/suite-audit-a07/kernel.hsaco",
+      "sha256": "2fa0cbdd5ab1b75681ee0d44247d02ae217da679897ef062db1860daf5e4395c",
+      "loads": 14,
+      "stores": 7,
+      "scalar_loads": [
+        {
+          "offset": 1044,
+          "instruction": "s_load_b64 s[38:39], s[38:39], 0x0"
+        },
+        {
+          "offset": 2204,
+          "instruction": "s_load_b64 s[8:9], s[8:9], 0x0"
+        }
+      ],
+      "exits": 2,
+      "sgpr_count": 68,
+      "vgpr_count": 66,
+      "lds_static_bytes": 0,
+      "scratch_bytes": 0,
+      "all_loads_DEV": true,
+      "all_stores_DEV_HT": true,
+      "all_exits_full_EXEC": true,
+      "no_s96_s105_references": true,
+      "internal_branches": 15,
+      "passed": true
+    }
+  ],
+  "scope": "Selected runtime op bodies. Scalar loads are separately enumerated: the C16 review maps them to immutable positions/batch_ids/cu_seqlens_q/slots supplied before launch, not inter-op activations. See scalar-input-review.json. The DEV assertion covers VMEM/TDM activation instructions; it does not assert DEV operands on SMEM. Device calls, live SGPR preservation, all-TG join and payload visibility require run_contract hardware results."
+}

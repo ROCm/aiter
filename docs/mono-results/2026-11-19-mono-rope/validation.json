@@ -1,0 +1,99 @@
+{
+  "branch": "asm_mon_dev",
+  "base_commit": "a8a913883d7be9837c2f46f2e92de8fc701bac26",
+  "git_committed": false,
+  "physical_gpu": 0,
+  "numerical_replays": [
+    {
+      "stage": "A05",
+      "rank": 0,
+      "rounds": 3,
+      "passed": true
+    },
+    {
+      "stage": "A07",
+      "rank": 0,
+      "rounds": 3,
+      "passed": true
+    },
+    {
+      "stage": "A05",
+      "rank": 1,
+      "rounds": 3,
+      "passed": true
+    },
+    {
+      "stage": "A07",
+      "rank": 1,
+      "rounds": 3,
+      "passed": true
+    },
+    {
+      "stage": "A05",
+      "rank": 2,
+      "rounds": 3,
+      "passed": true
+    },
+    {
+      "stage": "A07",
+      "rank": 2,
+      "rounds": 3,
+      "passed": true
+    },
+    {
+      "stage": "A05",
+      "rank": 3,
+      "rounds": 3,
+      "passed": true
+    },
+    {
+      "stage": "A07",
+      "rank": 3,
+      "rounds": 3,
+      "passed": true
+    }
+  ],
+  "numerical_replay_count": 24,
+  "normal_call_probes": 36,
+  "negative_controls": 3,
+  "static_specializations": 3,
+  "migrated_bodies_equal": true,
+  "unchanged_a07_fallback_bodies": 460,
+  "mono_operator_contract_passed": true,
+  "full_pipeline_integrated": false,
+  "new_performance_campaign": false,
+  "evidence_directory": "/home/amd/qiwan/A05_A07_C16_dsv41_handoff_20261118T060637Z/outputs/git-mono-20261119",
+  "container": "qiwan_mono_git_validation",
+  "image": "rocm/fw-bringup-mlperf@sha256:d16b2fdfd689f3be89635f5700de3016cd0b8943fd8c49658f23c0d3af474907",
+  "resolved_setup_failures": [
+    "Initial /tmp compiler permission failure: selected writable TMPDIR under /cache/git-mono.",
+    "Plain-script probe selected the bundled op_tests package: invoke the repository test with python -m.",
+    "An old capture helper failed during A07 launch capture; rebuilt the fixed 16x16x1 helper from this repository. Fresh helper passed both A07 specializations."
+  ],
+  "filename_update": {
+    "sources": [
+      "rope_window_mono.py",
+      "inverse_rope_group_quant_mono.cu"
+    ],
+    "source_bytes_unchanged": true,
+    "python_syntax": "passed",
+    "rank0_numerical_replays": 2,
+    "passed": true,
+    "evidence_directory": "/home/amd/qiwan/A05_A07_C16_dsv41_handoff_20261118T060637Z/outputs/git-mono-20261119/renamed-rope/suite",
+    "test_module": "op_tests.mono_rope.validate_handoff"
+  },
+  "import_validation": {
+    "report": "import-validation.json",
+    "scope": "visible gfx1250 GPU",
+    "validation_head": "8f64fe705f40129d1504de7a799e28bc0140bdbf",
+    "configured_environment_passed": true,
+    "shared_jit_modified": false,
+    "import_checks_passed": 3,
+    "pytest_regressions_passed": 1,
+    "numerical_replays_passed": 2,
+    "identical_persistent_bodies": 3,
+    "identical_fallback_bodies": 460,
+    "import_physical_gpu": "0",
+    "numerical_physical_gpu": "1"
+  }
+}
