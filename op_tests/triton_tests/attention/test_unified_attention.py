@@ -2075,15 +2075,12 @@ def test_triton_unified_attn_k4v8(
     assert (out - ref).abs().max().item() < 0.15
 
 
-# A8K4V4PT PV variants (AITER_UA_FP4PT_PV_MODE) and their bounds on (relative L2, max abs) against the fp32
-# reference over the dequantized K / V. The reference sees exactly the e2m1 * scale values the kernel reads, so
-# the per-token fp4 quantization error is not in the bound, only the kernel's own roundings:
-#   "p": P * s rounded to bf16 (rtz; A8K4V8's P is fp8): ~2^-8 relative per term, so half of A8K4V8's bound.
-#   "fp8": P * s / 2^E in fp8 e4m3, like A8K4V8's fp8 P: A8K4V8's bound (rel L2 0.04, max abs 0.15).
-_K4V4PT_TOL = {"p": (0.02, 0.075), "fp8": (0.04, 0.15)}
+# A8K4V4PT bounds on (relative L2, max abs) against the fp32 reference over the dequantized K / V. The reference
+# sees exactly the e2m1 * scale values the kernel reads, so the per-token fp4 quantization error is not in the
+# bound, only the kernel's own roundings: P * s / 2^E in fp8 e4m3, like A8K4V8's fp8 P, so A8K4V8's bound.
+_K4V4PT_TOL = (0.04, 0.15)
 
 
-@pytest.mark.parametrize("pv_mode", ["p", "fp8"])
 @pytest.mark.parametrize("head_size", [128, 256])
 @pytest.mark.parametrize("num_heads", [(16, 2), (4, 1)])
 @pytest.mark.parametrize(
@@ -2099,19 +2096,16 @@ _K4V4PT_TOL = {"p": (0.02, 0.075), "fp8": (0.04, 0.15)}
 )
 @torch.inference_mode()
 def test_triton_unified_attn_k4v4pt(
-    pv_mode: str,
     head_size: int,
     num_heads: tuple[int, int],
     seq_lens: list[tuple[int, int]],
     equal_seqlen_q: bool,
-    monkeypatch,
 ) -> None:
     """A8K4V4PT on gfx1250 (3D kernel, 128-token pages): fp8 Q, NVFP4 K (as A8K4V8) and an fp4pt V (e2m1 in the
-    NVFP4-V layout + one fp32 scale per token and KV head at the page row's tail), for each PV variant. The
-    reference is fp32 attention over the dequantized K and V (e2m1 * scale)."""
+    NVFP4-V layout + one fp32 scale per token and KV head at the page row's tail). The reference is fp32
+    attention over the dequantized K and V (e2m1 * scale)."""
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("A8K4V4PT runs on the gfx1250 Gluon 3D kernel")
-    monkeypatch.setenv("AITER_UA_FP4PT_PV_MODE", pv_mode)
     torch.manual_seed(0)
     block_size = 128
     num_blocks = (
@@ -2162,7 +2156,7 @@ def test_triton_unified_attn_k4v4pt(
     )
     out = output.float()
     assert not out.isnan().any()
-    rel_max, abs_max = _K4V4PT_TOL[pv_mode]
+    rel_max, abs_max = _K4V4PT_TOL
     rel = ((out - ref).norm() / ref.norm()).item()
     err = (out - ref).abs().max().item()
     assert rel < rel_max, f"relative L2 error {rel:.4f} (bound {rel_max})"
@@ -2181,14 +2175,12 @@ _K4V4PT_PREFILL = [
 ]
 
 
-@pytest.mark.parametrize("pv_mode", ["p", "fp8"])
 @pytest.mark.parametrize("path", ["2d", "3d", "auto"])
 @pytest.mark.parametrize("num_heads", [(16, 2), (4, 1)])
 @pytest.mark.parametrize("gate", [False, True])
 @pytest.mark.parametrize("seq_lens", _K4V4PT_PREFILL)
 @torch.inference_mode()
 def test_triton_unified_attn_k4v4pt_prefill(
-    pv_mode: str,
     path: str,
     num_heads: tuple[int, int],
     gate: bool,
@@ -2197,14 +2189,13 @@ def test_triton_unified_attn_k4v4pt_prefill(
 ) -> None:
     """A8K4V4PT prefill on gfx1250 (d 256, 128-token pages): the 2D kernel (loop variants 1 / 2 at the configs these
     shapes select, tiles of one or two pages), the 3D kernel (prefill over a cached prefix, the PREFILL_MAX_2D_PRGMS
-    route), and the router's choice, for each PV variant. The reference is fp32 attention over the dequantized K
-    and V (e2m1 * scale), with the A8K4V4PT decode bounds (_K4V4PT_TOL): the per-element roundings are the same
-    (P in fp8 or bf16), and the longer key sums only average them down.
+    route), and the router's choice. The reference is fp32 attention over the dequantized K and V (e2m1 * scale),
+    with the A8K4V4PT decode bounds (_K4V4PT_TOL): the per-element roundings are the same (P in fp8), and the
+    longer key sums only average them down.
     gate: the output gate (out * sigmoid(gate)), fused in the 2D kernel's epilogue at any context here, must be
     bitwise the ungated output followed by the unfused sigmoid-mul."""
     if DEVICE_ARCH != "gfx1250":
         pytest.skip("A8K4V4PT runs on the gfx1250 Gluon kernels")
-    monkeypatch.setenv("AITER_UA_FP4PT_PV_MODE", pv_mode)
     module = sys.modules[unified_attention.__module__]
     if path != "auto":
         monkeypatch.setattr(
@@ -2264,7 +2255,7 @@ def test_triton_unified_attn_k4v4pt_prefill(
     )
     out = output.float()
     assert not out.isnan().any()
-    rel_max, abs_max = _K4V4PT_TOL[pv_mode]
+    rel_max, abs_max = _K4V4PT_TOL
     rel = ((out - ref).norm() / ref.norm()).item()
     err = (out - ref).abs().max().item()
     assert rel < rel_max, f"relative L2 error {rel:.4f} (bound {rel_max})"

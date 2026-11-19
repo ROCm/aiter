@@ -152,22 +152,9 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx1250-strict", "gfx950")
 # gate). No sliding window.
 FP4PT_V_DTYPE = torch.float4_e2m1fn_x2
 _FP4PT_BLOCK_SIZE = 128
-# The fp4pt PV variant (V_PT_MODE, the 2D and 3D kernels alike), by AITER_UA_FP4PT_PV_MODE:
-#   "p" / 1: SCALE_ON_P, upcast V to bf16, scale P's columns in fp32, bf16 PV WMMA (the backup)
-#   "fp8" / 2: PV_FP8FP4, P * s in fp8 x the e2m1 V in a scaled WMMA, no V upcast (the default)
-# The default is PV_FP8FP4: the fewest VALU (no V upcast), 1/4 of the bf16 PV WMMAs, ~300 fewer
-# VGPRs than SCALE_ON_P, and 1.11-1.39x A8K4V8's decode speed at the Qwen shapes (SCALE_ON_P:
-# 0.88-1.28x); its P is fp8, as A8K4V8's. (Mode 0, scaling the upcast V rows, was dropped.)
-_FP4PT_PV_MODES = {"p": 1, "fp8": 2, "1": 1, "2": 2}
-_FP4PT_PV_MODE_DEFAULT = "fp8"
-
-
-def _fp4pt_pv_mode() -> int:
-    mode = os.environ.get("AITER_UA_FP4PT_PV_MODE", _FP4PT_PV_MODE_DEFAULT).lower()
-    assert (
-        mode in _FP4PT_PV_MODES
-    ), f"AITER_UA_FP4PT_PV_MODE={mode!r}: one of {sorted(_FP4PT_PV_MODES)}"
-    return _FP4PT_PV_MODES[mode]
+# The fp4pt PV (2D and 3D kernels alike): the per-token scales fold into P, and P * s in fp8 (one e8m0
+# power of two per tile keeps it in range) x the e2m1 V runs as one scaled WMMA, with no V upcast:
+# 1.11-1.39x A8K4V8's decode speed at the Qwen shapes; its P is fp8, as A8K4V8's.
 
 
 def _is_fp4pt_v(dtype) -> bool:
@@ -355,9 +342,7 @@ def _gfx12_split_rebalance(params: _UAParams, tile_size: int):
         params.seqused_k, params.num_kv_heads, tile_size, min_tiles
     )
     kv_cover = max(int(params.max_seqlen_k), _GFX12_UA_SPLIT_REBALANCE_MAX_KV_LEN)
-    num_segments = triton.next_power_of_2(
-        triton.cdiv(kv_cover, min_tiles * tile_size)
-    )
+    num_segments = triton.next_power_of_2(triton.cdiv(kv_cover, min_tiles * tile_size))
     return num_segments, segm_tiles
 
 
@@ -1362,14 +1347,6 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         num_kv_blocks & (num_kv_blocks - 1) == 0
     ), f"TILE_SIZE={TILE_SIZE} must be a power-of-2 multiple of PAGE_SIZE={params.block_size}"
 
-    if _is_fp4pt_v(params.v_cache_dtype) and _fp4pt_pv_mode() == 1:
-        # A8K4V4PT SCALE_ON_P holds V upcast to bf16 (TILE_SIZE x head_size, 512 VGPRs a lane for 128 keys at
-        # d 256) next to P and the accumulator: one-page tiles and at most 16 query rows a warp, 64 a block, keep
-        # it out of scratch (compile-only, Qwen 16 / 2 heads d 256: BLOCK_M 128 or 256-key tiles spill 0.3-2.7 KB)
-        TILE_SIZE = params.block_size
-        if BLOCK_M > 64:
-            BLOCK_M = 64
-        num_warps = max(num_warps, BLOCK_M // 16)
     # the loop variants other than 0 mask at most twice at the end of the loop,
     # and need a tile wider than 32
     query_span = (BLOCK_M - 1) // params.num_queries_per_kv + 1
@@ -1473,7 +1450,6 @@ def _unified_attention_2d_gfx1250(params: _UAParams, output_gate=None):
         KV_NVFP4=kv_nvfp4,
         V_NVFP4=params.v_cache_dtype == torch.uint8,
         V_FP4PT=v_fp4pt,
-        V_PT_MODE=_fp4pt_pv_mode() if v_fp4pt else 2,
         query_scales_ptr=params.q_scales,
         query_scales_stride_0=(
             params.q_scales.stride(0) if params.q_scales is not None else 0
@@ -1519,10 +1495,8 @@ def _unified_attention_3d_gfx1250(
     assert config["BLOCK_Q"] >= 1
     # A8K4V4PT: the kernel reads the fp4pt V cache as bytes; V_CACHE_DTYPE "fp4pt" says how
     v_cache = params.v
-    V_PT_MODE = 2  # unused unless V is fp4pt
     if _is_fp4pt_v(params.v_cache_dtype):
         v_cache = v_cache.view(torch.uint8)
-        V_PT_MODE = _fp4pt_pv_mode()
 
     # spec decode launches the exact block count, so the kernel needs no search
     SEQLEN_Q = int(params.max_seqlen_q) if params.spec_decode else 1
@@ -1602,7 +1576,6 @@ def _unified_attention_3d_gfx1250(
         FP8_PV=params.force_fp8_pv_on_fp4_kv_cache
         and params.v_cache_dtype == torch.uint8,
         V_CACHE_DTYPE=V_CACHE_DTYPE,
-        V_PT_MODE=V_PT_MODE,
         USE_STORE_TDM=True,
         # experiment knob: NVFP4 KV + BF16 PV processed in 2 head-dim halves
         HEAD_SIZE_SPLIT=(

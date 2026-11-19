@@ -143,13 +143,10 @@ class AttentionConfig:
     V_FP4PT: gl.constexpr
     # an e2m1 V (NVFP4 or fp4pt): the shuffled e2m1 page data, its second TDM op and the ds_load_tr4 repacking load
     V_FP4: gl.constexpr
-    # fp4pt PV variant (1 SCALE_ON_P: bf16 PV on the upcast V; 2 PV_FP8FP4: fp8 P x e2m1 V scaled WMMA)
-    V_PT_MODE: gl.constexpr
-    PT_FP8_PV: gl.constexpr
-    # fp4pt: the per-token fp32 scales, as P's columns; PV_FP8FP4: the e8m0 scales of the fp8 P operand
+    # fp4pt: the per-token fp32 scales, as P's columns, and the e8m0 scales of the fp8 P operand
     v_pt_scales_layout: gl.constexpr
     p_scales_layout: gl.constexpr
-    # PV_FP8FP4: the scales read again 8 a lane (warps broadcast) for the tile's maximum, and P's e8m0 scales in
+    # fp4pt: the scales read again 8 a lane (warps broadcast) for the tile's maximum, and P's e8m0 scales in
     # the scaled fp8 downcast's layout (the accumulator's, quotient by 32 keys)
     v_pt_scales_max_layout: gl.constexpr
     p_dc_scales_layout: gl.constexpr
@@ -219,7 +216,6 @@ class AttentionConfig:
         KV_NVFP4=False,
         V_NVFP4=None,
         V_FP4PT=False,
-        V_PT_MODE=2,
     ):
         self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
@@ -316,9 +312,6 @@ class AttentionConfig:
         assert not V_FP4PT or (KV_NVFP4 and not V_NVFP4 and Q_FP8)
         self.V_FP4PT = gl.constexpr(V_FP4PT)
         self.V_FP4 = gl.constexpr(V_NVFP4 or V_FP4PT)
-        assert V_PT_MODE in (1, 2)
-        self.V_PT_MODE = gl.constexpr(V_PT_MODE)
-        self.PT_FP8_PV = gl.constexpr(V_FP4PT and V_PT_MODE == 2)
         # NVFP4 scales are preshuffled in groups of this many page rows (128, or the page when shorter)
         self.SCALE_PRESHUFFLE = gl.constexpr(min(128, BLOCK_SIZE))
         # TDM ops per page load: data, plus the scales of an NVFP4 cache (see _tdm_ops_after)
@@ -363,13 +356,9 @@ class AttentionConfig:
                 gl.amd.AMDWMMALayout(
                     version=3,
                     transposed=True,
-                    # bf16 PV for an NVFP4 V and fp4pt SCALE_ON_P; fp8 (A8K4V8) or the scaled fp8 x e2m1
-                    # 16x16x128 (fp4pt PV_FP8FP4, P as Q and V as K in the QK) otherwise
-                    instr_shape=(
-                        [16, 16, 32]
-                        if V_NVFP4 or (V_FP4PT and not self.PT_FP8_PV)
-                        else [16, 16, FP8_K_DIM_PV]
-                    ),
+                    # bf16 PV for an NVFP4 V; fp8 (A8K4V8) or the scaled fp8 x e2m1 16x16x128 (fp4pt, P as Q and
+                    # V as K in the QK) otherwise
+                    instr_shape=([16, 16, 32] if V_NVFP4 else [16, 16, FP8_K_DIM_PV]),
                     warp_bases=warp_bases,
                 )
             )
@@ -397,8 +386,8 @@ class AttentionConfig:
                     self.k_layout, [TILE_SIZE // 2, HEAD_SIZE // 16], scale_factor=16
                 )
             )
-            # 8 packed bytes (16 e2m1) per lane: unpacks to the k_width-16 bf16 V operand. fp4pt PV_FP8FP4: 16
-            # bytes (32 e2m1), the scaled WMMA's packed B operand, as K's in the QK.
+            # 8 packed bytes (16 e2m1) per lane: unpacks to the k_width-16 bf16 V operand. fp4pt: 16 bytes
+            # (32 e2m1), the scaled WMMA's packed B operand, as K's in the QK.
             self.v_packed_layout = gl.constexpr(
                 gl.DotOperandLayout(
                     1,
@@ -408,7 +397,7 @@ class AttentionConfig:
                         instr_shape=[16, 16, 64],
                         warp_bases=warp_bases,
                     ),
-                    16 if self.PT_FP8_PV else 8,
+                    16 if V_FP4PT else 8,
                 )
             )
             # V scales broadcast over the 16 values of their group, in the V operand's register order (key rows,
@@ -437,12 +426,12 @@ class AttentionConfig:
             self.v_pt_scales_layout = gl.constexpr(
                 gl.SliceLayout(0, self.pv_layout) if V_FP4PT else None
             )
-            # PV_FP8FP4: one e8m0 scale per (P row, 32 keys), all the tile's power of two, for the WMMA ...
+            # fp4pt: one e8m0 scale per (P row, 32 keys), all the tile's power of two, for the WMMA ...
             self.p_scales_layout = gl.constexpr(
                 gl.amd.gfx1250.get_wmma_scale_layout(
                     self.p_layout, [BLOCK_M, TILE_SIZE // 32], scale_factor=32
                 )
-                if self.PT_FP8_PV
+                if V_FP4PT
                 else None
             )
             # ... and for the fp8 downcast of P * s, which divides by it: the accumulator layout (transposed WMMA:
@@ -461,7 +450,7 @@ class AttentionConfig:
                     block_bases=[],
                     shape=[BLOCK_M, TILE_SIZE // 32],
                 )
-                if self.PT_FP8_PV
+                if V_FP4PT
                 else None
             )
             # the scales as P's columns are TILE_SIZE / 2 a lane in the transposed accumulator layout; their maximum
@@ -474,7 +463,7 @@ class AttentionConfig:
                     block_bases=[],
                     shape=[TILE_SIZE],
                 )
-                if self.PT_FP8_PV
+                if V_FP4PT
                 else None
             )
         else:
@@ -1718,7 +1707,7 @@ class AttentionProgram:
     @gluon.jit
     def mask_v_pt_scales(self, s, j, layout: gl.constexpr):
         """Zero the scales of the keys past this block's kv_end, so unwritten page slots (NaN / inf, or a padding
-        page's garbage) cannot reach the accumulator through 0 * s, nor (PV_FP8FP4) the tile's maximum. Only on the
+        page's garbage) cannot reach the accumulator through 0 * s, nor the tile's maximum. Only on the
         loop's epilogue tiles, the only ones that can reach past kv_end."""
         keys_left = self.kv_end - j * self.cfg.TILE_SIZE
         offs = gl.arange(0, self.cfg.TILE_SIZE, layout=layout)
@@ -1726,59 +1715,42 @@ class AttentionProgram:
 
     @gluon.jit
     def v_pt_exponent(self, s_max):
-        """PV_FP8FP4: the biased exponent e of the tile's power of two 2^E > max s (P * s / 2^E < 1 keeps e4m3's
+        """fp4pt: the biased exponent e of the tile's power of two 2^E > max s (P * s / 2^E < 1 keeps e4m3's
         range): the fp8 P operand's e8m0 scale."""
         e = (s_max.to(gl.int32, bitcast=True) >> 23) & 0xFF
         return gl.minimum(e + 1, 253)
 
     @gluon.jit
     def scale_p_v_pt(self, p, s, e):
-        """A8K4V4PT: P[:, t] * s[t] (fp32 P, after the row sum L took the unscaled P), cast for the PV WMMA.
-        SCALE_ON_P: bf16 (rtz) P. PV_FP8FP4: fp8 P * s / 2^E (the scaled downcast divides by e), and 2^E the fp8
-        P operand's e8m0 scale (V's stays 1.0). Returns (P, its e8m0 scales; SCALE_ON_P: e, unused).
+        """A8K4V4PT: P[:, t] * s[t] (fp32 P, after the row sum L took the unscaled P), cast for the PV WMMA:
+        fp8 P * s / 2^E (the scaled downcast divides by e), and 2^E the fp8 P operand's e8m0 scale (V's stays
+        1.0). Returns (P, its e8m0 scales).
         """
-        if self.cfg.PT_FP8_PV:
-            p_dc_scales = (
-                gl.zeros(
-                    [self.cfg.BLOCK_M, self.cfg.TILE_SIZE // 32],
-                    gl.int32,
-                    layout=self.cfg.p_dc_scales_layout,
-                )
-                + e
-            ).to(gl.uint8)
-            p = gl.amd.gfx1250.scaled_downcast(
-                p * s[None, :], p_dc_scales, "e4m3", axis=1
+        p_dc_scales = (
+            gl.zeros(
+                [self.cfg.BLOCK_M, self.cfg.TILE_SIZE // 32],
+                gl.int32,
+                layout=self.cfg.p_dc_scales_layout,
             )
-            p_scales = (
-                gl.zeros(
-                    [self.cfg.BLOCK_M, self.cfg.TILE_SIZE // 32],
-                    gl.int32,
-                    layout=self.cfg.p_scales_layout,
-                )
-                + e
-            ).to(gl.uint8)
-            return p, p_scales
-        else:
-            return (p * s[None, :]).to(gl.bfloat16, fp_downcast_rounding="rtz"), e
+            + e
+        ).to(gl.uint8)
+        p = gl.amd.gfx1250.scaled_downcast(p * s[None, :], p_dc_scales, "e4m3", axis=1)
+        p_scales = (
+            gl.zeros(
+                [self.cfg.BLOCK_M, self.cfg.TILE_SIZE // 32],
+                gl.int32,
+                layout=self.cfg.p_scales_layout,
+            )
+            + e
+        ).to(gl.uint8)
+        return p, p_scales
 
     @gluon.jit
     def compute_pv_fp4pt(self, p, v, acc, p_scales):
-        """A8K4V4PT PV on the packed e2m1 V (one tile, or one head-dim half of it), P from scale_p_v_pt.
-        PV_FP8FP4: the scaled 16x16x128 WMMA, fp8 P (e8m0 p_scales) x e2m1 V (unit scale).
-        SCALE_ON_P: V upcast to bf16 (unit e8m0 scale), bf16 16x16x32 WMMA."""
+        """A8K4V4PT PV on the packed e2m1 V (one tile, or one head-dim half of it), P from scale_p_v_pt: the
+        scaled 16x16x128 WMMA, fp8 P (e8m0 p_scales) x e2m1 V (unit scale)."""
         p = gl.convert_layout(p, self.cfg.p_layout)
-        if self.cfg.PT_FP8_PV:
-            return gl.amd.gfx1250.wmma_scaled(p, p_scales, "e4m3", v, None, "e2m1", acc)
-        else:
-            v_unit_scales = gl.full(
-                (v.shape[0] * 2, v.shape[1]),
-                127,
-                dtype=gl.uint8,
-                layout=self.cfg.v_layout,
-            )  # 1.0 in e8m0
-            v = gl.amd.gfx1250.scaled_upcast(v, v_unit_scales, gl.bfloat16, axis=0)
-            v = gl.convert_layout(v, self.cfg.v_layout, assert_trivial=True)
-            return gl.amd.gfx1250.wmma(p, v, acc)
+        return gl.amd.gfx1250.wmma_scaled(p, p_scales, "e4m3", v, None, "e2m1", acc)
 
     @gluon.jit
     def pv_tile(self, p, v, s, e, acc):
@@ -2160,7 +2132,7 @@ class AttentionProgram:
 @gluon.jit
 def _v_pt_scales(pgm, kv_loader, v, buffer_id, j, MASK: gl.constexpr):
     """fp4pt: the tile's per-token scales as P's columns, read right after load_v_from_shared (same wait, before
-    the buffer can be refilled), masked past kv_end on the epilogue tiles (MASK); and PV_FP8FP4's exponent e of the
+    the buffer can be refilled), masked past kv_end on the epilogue tiles (MASK); and the exponent e of the
     tile's power of two (from a second, compact read). Returns (s, e); other formats (v, v), unused by pv_tile /
     _p_for_pv / _softmax_part1_pv."""
     cfg = pgm.cfg
@@ -2168,13 +2140,10 @@ def _v_pt_scales(pgm, kv_loader, v, buffer_id, j, MASK: gl.constexpr):
         s = kv_loader.load_v_pt_scales(buffer_id, cfg.v_pt_scales_layout)
         if MASK:
             s = pgm.mask_v_pt_scales(s, j, cfg.v_pt_scales_layout)
-        if cfg.PT_FP8_PV:
-            s_c = kv_loader.load_v_pt_scales(buffer_id, cfg.v_pt_scales_max_layout)
-            if MASK:
-                s_c = pgm.mask_v_pt_scales(s_c, j, cfg.v_pt_scales_max_layout)
-            return s, pgm.v_pt_exponent(gl.max(s_c, axis=0))
-        else:
-            return s, s
+        s_c = kv_loader.load_v_pt_scales(buffer_id, cfg.v_pt_scales_max_layout)
+        if MASK:
+            s_c = pgm.mask_v_pt_scales(s_c, j, cfg.v_pt_scales_max_layout)
+        return s, pgm.v_pt_exponent(gl.max(s_c, axis=0))
     else:
         return v, v
 
@@ -2958,11 +2927,11 @@ _unified_attention_gluon_kernel_2d_base_repr = make_kernel_repr(
 
 
 def unified_attention_gluon_kernel_2d_repr(specialization):
-    """The kernel name; an fp4pt V (A8K4V4PT) also names its PV variant, so the other formats keep their names."""
+    """The kernel name; an fp4pt V (A8K4V4PT) is marked, so the other formats keep their names."""
     name = _unified_attention_gluon_kernel_2d_base_repr(specialization)
     constants = specialization.constants
     if constants.get("V_FP4PT"):
-        name += f"_V_FP4PT_V_PT_MODE_{constants.get('V_PT_MODE')}"
+        name += "_V_FP4PT"
     return name
 
 
@@ -3034,9 +3003,8 @@ def _unified_attention_gluon_kernel_2d(
     KV_NVFP4: gl.constexpr = False,
     V_NVFP4: gl.constexpr = None,  # None: as KV_NVFP4; False with KV_NVFP4: A8K4V8 (NVFP4 K, fp8 V)
     # A8K4V4PT (with KV_NVFP4, V_NVFP4 False): an fp4pt V cache (uint8 bytes: e2m1 shuffled as NVFP4 V + one fp32
-    # scale per token at each page row's tail); V_PT_MODE its PV variant, 1 SCALE_ON_P or 2 PV_FP8FP4
+    # scale per token at each page row's tail); PV is fp8 P (carrying the scales) x e2m1 V
     V_FP4PT: gl.constexpr = False,
-    V_PT_MODE: gl.constexpr = 2,
     query_scales_ptr=None,  # Q_NVFP4: [num_tokens, num_query_heads, head_size // 16]
     query_scales_stride_0=0,
     query_scales_stride_1=0,
@@ -3092,7 +3060,6 @@ def _unified_attention_gluon_kernel_2d(
         KV_NVFP4,
         V_NVFP4,
         V_FP4PT,
-        V_PT_MODE,
     )
     if KV_NVFP4:
         # the wait sites of loop variants 0, 1 and 2 (two buffers) name their later loads

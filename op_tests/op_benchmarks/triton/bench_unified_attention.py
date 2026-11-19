@@ -1,7 +1,6 @@
 import argparse
 import functools
 import itertools
-import os
 import sys
 
 import torch
@@ -470,7 +469,7 @@ def _mode_label(args):
     if args.nvfp4:
         parts.append("a4w4_nvfp4")
     elif args.k4v4pt:
-        parts.append(f"a8k4v4pt_pv{args.k4v4pt_mode}")
+        parts.append("a8k4v4pt")
     elif args.k4v8:
         parts.append("a8k4v8")
     elif args.nvfp4_kv:
@@ -853,13 +852,6 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         "head at the page tail); gfx1250 Gluon 2D / 3D kernels (decode, verify, prefill); needs -block_size 128",
     )
     parser.add_argument(
-        "-k4v4pt_mode",
-        choices=["p", "fp8"],
-        default=None,
-        help="With -k4v4pt: the PV variant (AITER_UA_FP4PT_PV_MODE): p = scale on P (bf16 PV), "
-        "fp8 = fp8 P x e2m1 V scaled WMMA; default: the kernel's default (fp8)",
-    )
-    parser.add_argument(
         "-nvfp4",
         action="store_true",
         default=False,
@@ -929,17 +921,7 @@ def main(args: list[str] | None = None) -> None:
             )
         if args.block_size != 128:
             raise ValueError("-k4v4pt needs -block_size 128.")
-        if args.k4v4pt_mode is not None:
-            os.environ["AITER_UA_FP4PT_PV_MODE"] = args.k4v4pt_mode
-        else:
-            from aiter.ops.triton.attention import unified_attention as _ua
-
-            args.k4v4pt_mode = os.environ.get(
-                "AITER_UA_FP4PT_PV_MODE", _ua._FP4PT_PV_MODE_DEFAULT
-            )
         args.nvfp4_kv = True
-    elif args.k4v4pt_mode is not None:
-        raise ValueError("-k4v4pt_mode needs -k4v4pt.")
     if args.k4v8:
         if args.nvfp4 or args.nvfp4_kv or args.fp8_pv:
             raise ValueError(
