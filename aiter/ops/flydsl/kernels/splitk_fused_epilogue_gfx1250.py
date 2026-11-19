@@ -59,7 +59,9 @@ def emit_fused_splitk_epilogue(
     lanes_per_row = tile_n // vec
     rows_per_iter = block // lanes_per_row
     partial_vectors = MAX_PARTIAL_VECTORS // (block // 128)
-    unroll = min(UNROLL, partial_vectors // split_k, reduce_m // rows_per_iter)
+    # Fewer rows than one pass of the block: the surplus threads sit idle.
+    idle = rows_per_iter > reduce_m
+    unroll = max(1, min(UNROLL, partial_vectors // split_k, reduce_m // rows_per_iter))
     row0 = tid // lanes_per_row
     col = (tid % lanes_per_row) * vec
     plane = fx.Int64((peer_m if lean else tile_m) * tile_n)
@@ -145,14 +147,38 @@ def emit_fused_splitk_epilogue(
         ]
 
     def _local(batch, u):
+        if const_expr(idle):
+            row = peer_m + fx.min(row0, reduce_m - 1)
+        else:
+            row = peer_m + row0 + (batch * unroll + u) * rows_per_iter
         return fx.ptr_load(
-            lds_partial
-            + (peer_m + row0 + (batch * unroll + u) * rows_per_iter) * c_lds_row
-            + col,
+            lds_partial + row * c_lds_row + col,
             result_type=T.vec(vec, partial_elem.ir_type),
         )
 
-    for batch in range(reduce_m // (rows_per_iter * unroll)):
+    def _store(row, acc):
+        if const_expr(not lean):
+            fx.ptr_store(acc.to(elem), lds_out + row * c_lds_row + col)
+        elif const_expr(n_oob is not None):
+            if row < valid_rows:
+                if col + vec <= n_oob:
+                    fx.ptr_store(acc.to(elem), output_base + row * ldc64 + col)
+                else:
+                    for j in range_constexpr(vec):
+                        if col + j < n_oob:
+                            fx.ptr_store(
+                                acc[j].to(elem), output_base + row * ldc64 + col + j
+                            )
+        else:
+            buf_copy_store(
+                output_buffer,
+                row * fx.Int32(ldc64 // vec) + col // vec,
+                acc.to(elem),
+                elem,
+                vec,
+            )
+
+    for batch in range(max(1, reduce_m // (rows_per_iter * unroll))):
         partial_indices = [
             tid + (batch * unroll + u) * block for u in range_constexpr(unroll)
         ]
@@ -202,27 +228,11 @@ def emit_fused_splitk_epilogue(
             for s in range_constexpr(1, split_k):
                 acc = acc + values[u][s]
             row = row0 + (batch * unroll + u) * rows_per_iter
-            if const_expr(not lean):
-                fx.ptr_store(acc.to(elem), lds_out + row * c_lds_row + col)
-            elif const_expr(n_oob is not None):
-                if row < valid_rows:
-                    if col + vec <= n_oob:
-                        fx.ptr_store(acc.to(elem), output_base + row * ldc64 + col)
-                    else:
-                        for j in range_constexpr(vec):
-                            if col + j < n_oob:
-                                fx.ptr_store(
-                                    acc[j].to(elem),
-                                    output_base + row * ldc64 + col + j,
-                                )
+            if const_expr(idle):
+                if row < reduce_m:
+                    _store(row, acc)
             else:
-                buf_copy_store(
-                    output_buffer,
-                    row * fx.Int32(ldc64 // vec) + col // vec,
-                    acc.to(elem),
-                    elem,
-                    vec,
-                )
+                _store(row, acc)
 
     if const_expr(not lean):
         workgroup_barrier(use_cluster=False)

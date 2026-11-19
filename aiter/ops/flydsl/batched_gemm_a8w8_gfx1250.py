@@ -588,11 +588,12 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         cfg["n_warp"],
         out_is_f16,
         cfg["num_buffers"],
-        1,  # cluster_m
+        False,  # use_cluster
         1,  # cluster_n
         True,  # is_mxscale
         MX32_BLOCK_K,
         1,  # split_k
+        False,  # fused_splitk
         True,  # batched
         0,  # preload_ks
         False,  # a_preshuffle
@@ -616,6 +617,8 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         b * k_blocks,  # stride_ascale_k: x_scale row stride, [M, B, K//32]
         b * k,  # lda: XQ is [M, B, K]
         b * n,  # ldc: Out is [M, B, N]
+        _ptr_arg(Out),  # arg_out
+        1,  # i32_cm
         cfg["tile_m"],
         tile_n,
         tile_k,
@@ -623,11 +626,12 @@ def run_bmm_a8w8_mxfp8_32_gfx1250(
         cfg["n_warp"],
         out_is_f16,
         cfg["num_buffers"],
-        1,  # cluster_m
+        False,  # use_cluster
         1,  # cluster_n
         True,  # is_mxscale
         MX32_BLOCK_K,
         1,  # split_k
+        False,  # fused_splitk
         True,  # batched
         0,  # preload_ks
         b,
@@ -700,11 +704,12 @@ def run_bmm_a8w8_mxfp8_128_gfx1250(
         cfg["n_warp"],
         1 if out_dtype == "f16" else 0,
         cfg["num_buffers"],
-        1,  # cluster_m
+        False,  # use_cluster
         1,  # cluster_n
         True,  # is_mxscale
         BLOCK_K,
         1,  # split_k
+        False,  # fused_splitk
         True,  # batched
         preload_ks,
         False,  # a_preshuffle
@@ -724,6 +729,8 @@ def run_bmm_a8w8_mxfp8_128_gfx1250(
         b * k_blocks,  # stride_ascale_k: x_scale row stride, [M, B, K//128]
         b * k,  # lda: XQ is [M, B, K]
         b * n,  # ldc: Out is [M, B, N]
+        _ptr_arg(Out),  # arg_out
+        1,  # i32_cm
         cfg["tile_m"],
         tile_n,
         tile_k,
@@ -731,11 +738,12 @@ def run_bmm_a8w8_mxfp8_128_gfx1250(
         cfg["n_warp"],
         1 if out_dtype == "f16" else 0,
         cfg["num_buffers"],
-        1,  # cluster_m
+        False,  # use_cluster
         1,  # cluster_n
         True,  # is_mxscale
         BLOCK_K,
         1,  # split_k
+        False,  # fused_splitk
         True,  # batched
         preload_ks,
         b,
