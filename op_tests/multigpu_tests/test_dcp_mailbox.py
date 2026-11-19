@@ -23,7 +23,7 @@ from aiter.ops.flydsl.dcp_mailbox import (
 )
 from aiter.ops.flydsl.dcp_mailbox.combine import peer_layout
 from aiter.ops.flydsl.dcp_mailbox.common import epoch_offset
-from aiter.ops.flydsl.ipc_heap import UncachedIpcHeap
+from aiter.ops.flydsl.ipc_heap import IpcHeap
 from aiter.ops.flydsl.kernels.communication_ops_utils import EPOCH_MASK
 
 
@@ -467,13 +467,13 @@ def worker(rank, world, tokens):
 
         # One rank failing to allocate must fail every rank at once, not leave
         # the others waiting in the handle broadcast.
-        alloc = UncachedIpcHeap.__dict__["alloc_uncached"]
+        alloc = IpcHeap.__dict__["alloc_uncached"]
 
         def failing_alloc(nbytes):
             raise RuntimeError("hipExtMallocWithFlags failed: out of memory")
 
         if rank == 1:
-            UncachedIpcHeap.alloc_uncached = staticmethod(failing_alloc)
+            IpcHeap.alloc_uncached = staticmethod(failing_alloc)
         start = time.monotonic()
         try:
             CombineWorkspace(group, torch.device("cuda"), hl, 128, max_tokens)
@@ -484,7 +484,7 @@ def worker(rank, world, tokens):
         else:
             raise AssertionError("a failed allocation on one rank must raise")
         finally:
-            UncachedIpcHeap.alloc_uncached = alloc
+            IpcHeap.alloc_uncached = alloc
         dist.barrier(group=group.cpu_group)
 
         if rank == 0:
