@@ -84,9 +84,9 @@ Change these only by editing this section and adding a log line. Code, tests, an
 
 ### 5. Set gate
 
-- [ ] Run the master's set-gate cases: padded tables, missing pages, a cache view spanning more than 4 GiB, row tiles spanning requests, mixed steps, MTP rows, and `n_i <= 512`.
-- [ ] `select err` is the fraction of rows outside the 1.7e-6 window. The gate passes only at 0 on every case.
-- [ ] Tests skip on archs where this path is off.
+- [x] Run the master's set-gate cases: padded tables, missing pages, a cache view spanning more than 4 GiB, row tiles spanning requests, mixed steps, MTP rows, and `n_i <= 512`. All eight of the master's `_SELECT_CASES` ran, including `workspace`.
+- [x] `select err` is the fraction of rows outside the 1.7e-6 window. The gate passes only at 0 on every case. 0 on every case.
+- [x] Tests skip on archs where this path is off. `qsa_indexer_key16_supported` is gfx950 only, and every int16 check that launches the path skips on that reason.
 
 ### 6. Kernel gate
 
@@ -116,6 +116,7 @@ Change these only by editing this section and adding a log line. Code, tests, an
 | Phase 2 store | 2026-11-19 | gfx950 | gpuq, ROCm 7.2.1, bus 0000:75:00.0 | MI355X | rocm-smi GPU 3, use 0%, no other pids |
 | Phase 3 select | 2026-11-19 | gfx950 | gpuq, ROCm 7.2.1, bus 0000:65:00.0 | MI355X | rocm-smi GPU 2, use 0%, no other pids |
 | Phase 4 chunks | 2026-11-19 | gfx950 | gpuq, ROCm 7.2.1, bus 0000:f5:00.0 | MI355X | rocm-smi GPU 7, use 0%, no other pids |
+| Phase 5 set gate | 2026-11-19 | gfx950 | gpuq, ROCm 7.2.1, bus 0000:75:00.0 | MI355X | rocm-smi GPU 3, use 0%, no other pids |
 
 ### Budget
 
@@ -173,6 +174,25 @@ Key bytes are `rows × 65856 × 2`, written once and read once by the select. K 
 
 The short-tail check is `test_qsa_key16_chunks`: 1027 rows, 65856 columns, chunks of 1019 and 8. The tail's keys match a direct score that was told the full batch, the first chunk's block ids match its own select, and the whole step matches the oracle within 1.7e-6. Token ids are the expand, width 2051. CUDA-event mean, 2 warmup and 5 timed, on bus 0000:f5:00.0: 12725.1 µs. That is this host select over two chunks, not the kernel gate.
 
+### 16-bit set gate
+
+`test_qsa_key16_select_gate` runs `qsa_indexer_key16_score_and_select` on the master's `_SELECT_CASES` and grades it with the master's tie gate against the fp32 oracle. Every row must also be packed, valid ids then `-1`, and the token ids must equal the expand of those blocks. The key buffer starts filled with 12345, a valid positive key, so a column the scorer did not write would be ranked and fail the gate. `workspace` runs twice, refilling the buffer with -7 between runs, and the token ids must not change.
+
+Three changes let every case reach this path. The score entry now runs the 16-row tile on any batch except gfx942 at 8 heads. The tile masks rows past the batch, and the 8-row `mtp` case uses the 4-row-by-4-head fold. A table of at most 512 columns, the `emit` case, takes the existing emit path and is not scored. `qsa_indexer_key16_supported` gates the path to gfx950.
+
+| Case | Rows | Columns | Path | `select err` | µs |
+| --- | ---: | ---: | --- | ---: | ---: |
+| pad | 32 | 65856 | key16 | 0 | 1474.69 |
+| missing | 16 | 2352 | key16 | 0 | 1043.73 |
+| wide | 16 | 2352 | key16 | 0 | 1063.55 |
+| span | 16 | 2352 | key16 | 0 | 1056.61 |
+| mixed | 16 | 2352 | key16 | 0 | 1051.46 |
+| mtp | 8 | 2352 | key16 | 0 | 1051.03 |
+| emit | 16 | 392 | emit | 0 | 42.16 |
+| workspace | 32 | 65856 | key16 | 0 | 1446.25 |
+
+CUDA-event means, 2 warmup and 10 timed, on bus 0000:75:00.0. They time this host select and are not the kernel gate. In the same session the Phase 2 to 4 checks passed again. The same-width store ratio was 0.999 (21.576 µs against 21.604 µs fp32).
+
 ### Kernel gate
 
 Median microseconds per QSA layer per step, gfx950. Margin is this path divided by the faster of aiter#5996 and vllm#65188.
@@ -210,7 +230,7 @@ No gate. Filled only if Phase 6 passes.
 
 Phase 0, 2026-11-19: the stop does not fire. At `p128k` and `p256k` the faster arm is aiter#5996, and this path is a change to that arm, so the miss is a strict improvement on its step. The baseline score stage is 2072.9 µs of 3797.3 µs (0.546) and 3905.9 µs of 5861.4 µs (0.666). That share is larger than the miss. Phase 1 is next. The 16-bit counts, 1019 rows per chunk and 17 chunks on the 16384-row cases, are the workspace formula and are not a measured win.
 
-Outcome: open. Option 1 stays a miss in the master. The 16-bit store, the boundary select, and the 2-byte chunks exist. The gate does not.
+Outcome: open. Option 1 stays a miss in the master. The 16-bit store, the boundary select, and the 2-byte chunks exist, and the path passes the set gate. The kernel gate has not run.
 
 Gates met: none. Gate 5 stays closed, as the master applied it.
 
@@ -225,6 +245,8 @@ Phase 2, 2026-11-19: the 16-row scorer can store int16 keys. On the seeded 32K c
 Phase 3, 2026-11-19: `qsa_indexer_key16_select` keeps every key above the 512th and rescores that bucket with the oracle score. On the seeded 32K case the block set matches the oracle within 1.7e-6, the token ids are the expand of those blocks, and the bucket holds 1365 blocks across 128 rows. A short row keeps every visible block and does not rescore. The public dispatch is unchanged. Phase 4 is next.
 
 Phase 4, 2026-11-19: the int16 workspace holds 1019 rows at 65856 columns. A 16384-row step reuses that one buffer across 17 chunks, and an 8-row tail keeps the full-batch scorer. Key traffic is 1029 MiB at `p8k` and 2058 MiB on the 16384-row cases. The public dispatch is unchanged. Phase 5 is next.
+
+Phase 5, 2026-11-19: the int16 path passes the set gate. `select err` is 0 on all eight of the master's cases: padded, missing page, a cache view past 4 GiB, a tile spanning requests, mixed, MTP, `n_i <= 512`, and workspace reuse. The path is gfx950 only, and its tests skip elsewhere. The public dispatch is unchanged. Phase 6 is next.
 
 Fallback key: `_score_key16`, the high 16 bits of the order-preserving fp32 key.
 
@@ -242,3 +264,4 @@ Fallback key: `_score_key16`, the high 16 bits of the order-preserving fp32 key.
 - 2026-11-19: Phase 2 store, gfx950, ROCm 7.2.1, bus 0000:75:00.0, rocm-smi GPU 3 at 0% with no other pids. `test_qsa_score_key16_store` on the seeded 32K case, 128 rows, 8232 columns. The int16 keys match `_score_key16` of the fp32 16-row scorer on every visible column, and the boundary rescore matches that scorer's top-512. Same-width CUDA-event means, 5 warmup and 50 timed, are 21.867 µs (fp32) and 22.018 µs (key16), ratio 1.007. `qsa_indexer_block_ids` still stores fp32. Phase 3 is next. `_fused_select_wins` stays false.
 - 2026-11-19: Phase 3 select, gfx950, ROCm 7.2.1, bus 0000:65:00.0, rocm-smi GPU 2 at 0% with no other pids. `test_qsa_key16_select` on the seeded 32K case and a 16-row context-2048 case. The 32K block set matches the oracle within 1.7e-6, and both cases' token ids match the existing expand, width 2051. The 32K boundary bucket holds 1365 blocks. The short case does not rescore. CUDA-event means, 5 warmup and 10 timed, are 1247.49 µs and 243.90 µs. `qsa_indexer_block_ids` is unchanged. Phase 4 is next. `_fused_select_wins` stays false.
 - 2026-11-19: Phase 4 chunks, gfx950, ROCm 7.2.1, bus 0000:f5:00.0, rocm-smi GPU 7 at 0% with no other pids. The int16 workspace is 1019 rows at 65856 columns. `p8k` is 9 chunks and 1029 MiB of keys. `p32k`, `p128k`, and `p256k` are 17 chunks and 2058 MiB. K is read once per chunk: 4.5, 34, 136, and 272 MiB. An 8-row tail of 1027 rows kept the full-batch scorer, and that step matched the oracle within 1.7e-6. `qsa_indexer_block_ids` is unchanged. Phase 5 is next. `_fused_select_wins` stays false.
+- 2026-11-19: Phase 5 set gate, gfx950, ROCm 7.2.1, bus 0000:75:00.0, rocm-smi GPU 3 at 0% with no other pids. `test_qsa_key16_select_gate` on `pad`, `missing`, `wide`, `span`, `mixed`, `mtp`, `emit`, and `workspace`. `select err` is 0 on every case, every row is packed, and the token ids equal the expand. The key buffer started at 12345, a valid key, and `workspace` gave the same ids after a refill to -7. The score entry now runs the 16-row tile on any batch except gfx942 at 8 heads, so the 8-row `mtp` case uses the head fold. `emit` takes the existing emit path. `qsa_indexer_key16_supported` gates the path to gfx950, and `run_qsa_key16_checks` skips every launching check elsewhere; a patched gfx942 lookup skipped all four runners. The Phase 2 to 4 checks passed again in that session, with a same-width store ratio of 0.999. `qsa_indexer_block_ids` is unchanged. Phase 6 is next. `_fused_select_wins` stays false.

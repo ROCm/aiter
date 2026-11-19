@@ -3298,6 +3298,128 @@ def run_qsa_key16_chunks():
     _summarize("QSA indexer 16-bit chunk tail", [test_qsa_key16_chunks()])
 
 
+# 12345 is a valid positive key. A select that reads a column the scorer did
+# not write would rank it like a real score and fail the set gate.
+_KEY16_STALE = 12345
+
+
+def _launch_key16(built, block_ids, token_ids, keys):
+    return qsa_paged.qsa_indexer_key16_score_and_select(
+        built["q"],
+        built["cache"],
+        built["page_table"],
+        built["token_to_req"],
+        built["qpos"],
+        built["slen"],
+        score_scale=FLASH_NEXT_SCORE_SCALE,
+        block_ids=block_ids,
+        token_ids=token_ids,
+        keys=keys,
+    )
+
+
+@benchmark()
+def test_qsa_key16_select_gate(case):
+    """Set-gate the int16 key path against the fp32 oracle on one geometry."""
+    built = _select_case(case)
+    idx = FLASH_NEXT_INDEXER
+    rows = built["q"].shape[0]
+    n_columns = int(built["page_table"].shape[1]) * _SELECT_PAGE
+    block_ids = torch.full(
+        (rows, idx.block_budget), 2**31 - 1, dtype=dtypes.i32, device="cuda"
+    )
+    token_ids = torch.full(
+        (rows, idx.index_width), 2**31 - 1, dtype=dtypes.i32, device="cuda"
+    )
+    keys = torch.full((rows, n_columns), _KEY16_STALE, dtype=torch.int16, device="cuda")
+    if case == "workspace":
+        _launch_key16(built, block_ids, token_ids, keys)
+        first = token_ids.clone()
+        keys.fill_(-7)
+        block_ids.fill_(2**31 - 1)
+        token_ids.fill_(2**31 - 1)
+        _launch_key16(built, block_ids, token_ids, keys)
+        if not torch.equal(first, token_ids):
+            raise AssertionError("key buffer contents changed the token ids")
+        keys.fill_(_KEY16_STALE)
+    token_ids, us = run_perftest(
+        _launch_key16,
+        built,
+        block_ids,
+        token_ids,
+        keys,
+        num_iters=10,
+        num_warmup=2,
+        use_cuda_event=True,
+    )
+    for i in range(rows):
+        reason = _indexer_row_is_packed(block_ids[i])
+        if reason is not None:
+            raise AssertionError(f"{case}: row {i} {reason}")
+    mismatch = _tie_mismatch(
+        built["blocks"], block_ids, built["scores"], _FP32_TIE_BOUND
+    )
+    err = checkAllclose(
+        torch.zeros(1),
+        torch.tensor([mismatch]),
+        rtol=0,
+        atol=0,
+        msg=f"key16 select gate {case}",
+    )
+    assert err == 0, f"{case}: set mismatch {mismatch:.2%}"
+    expanded = qsa_expand_tail(
+        block_ids,
+        built["qpos"],
+        built["slen"],
+        built["token_to_req"],
+        idx.compress_ratio,
+        idx.token_budget,
+    )
+    if not torch.equal(token_ids, expanded):
+        raise AssertionError(f"{case}: token ids are not the expanded blocks")
+    visible = built["live_blocks"]
+    scored = n_columns > idx.block_budget
+    flops = 2 * rows * idx.n_heads * idx.head_dim * visible if scored else 0
+    live_pages = (visible + _SELECT_PAGE - 1) // _SELECT_PAGE
+    nbytes = (
+        built["q"].numel() * built["q"].element_size()
+        + live_pages * _SELECT_PAGE * idx.head_dim * 2
+        + token_ids.numel() * token_ids.element_size()
+    )
+    if scored:
+        nbytes += 2 * keys.numel() * keys.element_size()
+    return {
+        "gfx": get_gfx_runtime(),
+        "rows": rows,
+        "columns": n_columns,
+        "path": "key16" if scored else "emit",
+        "key16 us": us,
+        "key16 TFLOPS": flops / us / 1e6 if us else 0.0,
+        "key16 TB/s": nbytes / us / 1e6 if us else 0.0,
+        "select err": err,
+    }
+
+
+def run_qsa_key16_select_gate():
+    """The master's set-gate cases on the int16 key path."""
+    if not _enough_memory(5 << 30, "int16 key select wide cache"):
+        raise RuntimeError("wide indexer cache does not fit")
+    rows = [test_qsa_key16_select_gate(case) for case in _SELECT_CASES]
+    _summarize("QSA indexer 16-bit set gate", rows)
+
+
+def run_qsa_key16_checks():
+    """Every int16 key check that launches the path. Skips where it is off."""
+    reason = qsa_paged.qsa_indexer_key16_supported()
+    if reason is not None:
+        aiter.logger.warning("int16 key path skipped: %s", reason)
+        return
+    run_qsa_score_key16_store()
+    run_qsa_key16_select()
+    run_qsa_key16_chunks()
+    run_qsa_key16_select_gate()
+
+
 def run_qsa_score_key16():
     """Key collisions and boundary width on the oracle's three seeded cases."""
     rows = []
@@ -3470,9 +3592,7 @@ def main():
     check_qsa_edges()
     run_qsa_indexer_select_oracle()
     run_qsa_score_key16()
-    run_qsa_score_key16_store()
-    run_qsa_key16_select()
-    run_qsa_key16_chunks()
+    run_qsa_key16_checks()
     run_qsa_indexer_select_gate()
 
     for dtype in args.dtype:

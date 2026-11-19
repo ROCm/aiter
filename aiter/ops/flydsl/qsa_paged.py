@@ -273,8 +273,10 @@ def qsa_indexer_prefill_score_buffer(
         raise ValueError(f"scores dtype must be {want}, got {scores.dtype}")
     arch = _qsa_arch()
     n_requests = int(context_lens.shape[0])
-    if not _indexer_uses_prefill_scorer(n_requests, batch, n_heads, arch):
-        raise ValueError("this launch is not the 16-row scorer")
+    # The tile masks rows past ``m``, so a short batch is correct here even
+    # where the public dispatch picks the one-row scorer.
+    if arch.startswith("gfx942") and n_heads == 8:
+        raise ValueError("the 16-row tile exceeds gfx942 LDS at 8 heads")
     use_k32 = arch == "gfx950"
     wide_cache = span_bytes(k_cache) > (1 << 32)
     k_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
@@ -478,6 +480,22 @@ def qsa_indexer_key16_select(
     )
 
 
+def qsa_indexer_key16_supported() -> str | None:
+    """Why the int16 key path does not run on this GPU, or None.
+
+    gfx950 is the acceptance device. gfx942 stays off until the kernel
+    gate measures it there.
+    """
+    arch, reason = _qsa_support_arch()
+    if reason is not None:
+        return reason
+    if arch is None:
+        return "int16 key select needs a GPU"
+    if arch != "gfx950":
+        return f"int16 key select is gated off on {arch}"
+    return None
+
+
 def _key16_workspace_rows(n_columns: int) -> int:
     """How many int16 key rows of ``n_columns`` fit in 128 MiB."""
     return max(1, _SCORE_WORKSPACE_BYTES // max(int(n_columns) * 2, 1))
@@ -514,10 +532,39 @@ def qsa_indexer_key16_score_and_select(
 
     One key buffer is reused across the chunks of a step. A short last
     chunk keeps the scorer and the selector chosen for the whole batch.
-    ``qsa_indexer_block_ids`` does not call this.
+    A table of at most 512 columns takes the existing emit path and is not
+    scored. ``qsa_indexer_block_ids`` does not call this.
     """
+    from aiter.ops.qsa import qsa_expand_block_indices
+
+    reason = qsa_indexer_key16_supported()
+    if reason is not None:
+        raise ValueError(f"[FlyDSL qsa_indexer_key16_score_and_select] {reason}")
     rows = int(q.shape[0])
     n_columns = int(page_table.shape[1]) * int(k_cache.shape[1])
+    if n_columns <= _K or _indexer_empty_geometry(
+        rows, k_cache, page_table, context_lens
+    ):
+        block_ids = qsa_indexer_block_ids(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            context_lens,
+            out=block_ids,
+            score_scale=score_scale,
+            heads=(int(q.shape[1]),),
+        )
+        return qsa_expand_block_indices(
+            block_ids,
+            query_positions,
+            context_lens,
+            token_to_req,
+            _R,
+            _K * _R,
+            token_ids,
+        )
     rows_per_chunk = _key16_workspace_rows(n_columns)
     slot_rows = min(rows, rows_per_chunk)
     if keys is None:
