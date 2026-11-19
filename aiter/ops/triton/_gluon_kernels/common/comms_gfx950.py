@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Gluon device helpers of the multi-GPU comms kernels, for gfx950 only: bounded Lamport
-polls of IPC inbox slots, error records, 16-byte vector loads and stores, bf16 and e4m3
-packing, and lane exchanges.
+"""Gluon device helpers of the multi-GPU comms kernels, for gfx950 only: bounded polls of
+IPC inbox slots and tagged words, error records, 16-byte vector loads and stores, bf16
+and e4m3 packing, lane exchanges, and the rank sum, RMSNorm and MXFP8 quant of a row.
 
 The helpers use gfx950 instructions (the sc0 sc1 cache bits, v_permlane32_swap,
 v_cvt_pk_bf16_f32 and OCP e4m3) and the CDNA4 buffer loads and stores. A thread holds 4

@@ -1,25 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""All-reduce + residual add + RMSNorm + MXFP8 quant over 2, 4 or 8 GPUs in one kernel.
+"""All-reduce + residual add + RMSNorm + MXFP8 quant over 2, 4 or 8 gfx950 GPUs.
 
-The kernel is a bf16 reduce-scatter, then an all-gather of the bf16 sum. Rank g owns
-the rows g * G to g * G + G - 1, with G = ceil(rows / WORLD). CTA b < G owns a row:
-it reads the rows of the peers from its inbox, adds the ranks in rank order in fp32,
-rounds once to bf16 and pushes the sum to the peers. The other CTAs push the rows of
-this rank to their owners, then receive one sum each. The CTA of each row adds the
-residual, normalizes the row and quantizes it.
-
-The inboxes are Lamport slots. 0xFFFF marks an empty 16-bit word: in bf16 it is a NaN,
-and a sender writes the NaN 0x7FFF in its place. A slot is ready when none of its words
-is 0xFFFF. The reader writes 0xFFFF back. Each launch uses the inbox half of its parity: each CTA
-keeps a launch colour. Each wait has a time limit. A wait that times out writes an
-error record into the buffer of each rank.
-
-The numbers do not depend on the timing. Thread t of A = HIDDEN / 16 threads holds the
-columns 8t to 8t + 7 and HIDDEN / 2 + 8t to HIDDEN / 2 + 8t + 7. It adds the squares
-of its 16 values in column order (no fma). Then a butterfly adds the 64 lanes of a
-wave (lane offsets 32, 16, 8, 4, 2, 1), and the waves are added in order."""
+A bf16 reduce-scatter, then an all-gather of the bf16 sum. Rank g owns the rows g G to
+g G + G - 1 (G = ceil(rows / WORLD)): CTA b < G adds the ranks of one row and pushes
+the sum. The other CTAs push the rows of this rank to their owners and receive one sum.
+The inboxes are Lamport slots (0xFFFF is empty), with one half for each launch parity.
+"""
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -75,12 +63,9 @@ def _all_reduce_rmsnorm_mxfp8_kernel(
     BLOCKS: gl.constexpr,
     PMAX: gl.constexpr,
 ):
-    """inp, res: [rows, HIDDEN] bf16 as int32 (the partial of this rank, the residual).
-    norm_w: [HIDDEN] bf16 as int32. xq: [rows, HIDDEN] e4m3 as int32. xs: [rows,
-    HIDDEN / 32] uint8. res_out: [rows, HIDDEN] bf16 as int32. colors: [BLOCKS] int32.
-    peers: the WORLD buffer addresses of ranks rank, rank + 1, .... RS0 and AG0: byte
-    offsets of the inboxes, each [2 parities][WORLD ranks][GMAX rows][HIDDEN bf16].
-    PMAX: the most push units of a CTA."""
+    """inp, res, res_out: [rows, HIDDEN] bf16 as int32. xq: e4m3 as int32. xs: [rows,
+    HIDDEN / 32] uint8. peers: the buffers of ranks rank, rank + 1, .... RS0, AG0: the
+    byte offsets of the inboxes. PMAX: the most push units of a CTA."""
     W: gl.constexpr = gl.num_warps()
     V: gl.constexpr = 2  # 16-byte vectors of a thread
     NV: gl.constexpr = HIDDEN // 8

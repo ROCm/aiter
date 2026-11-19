@@ -37,15 +37,11 @@ def _push_units(rows, world, blocks):
 
 class AllReduceRmsnormMxfp8(IpcCommBuffers):
     """
-    The IPC buffers and launch colours of ``fused_all_reduce_rmsnorm_mxfp8`` for one
-    group of 2, 4 or 8 ranks on gfx950.
-
-    Each rank has one uncached IPC buffer. It holds an error record, then the
-    reduce-scatter inbox and the all-gather inbox. Each inbox has 2 halves (for odd
-    and even launches) of world x ceil(max_tokens / world) rows of hidden bf16
-    values. The constructor, ``reset`` and ``close`` are collective: all ranks of
-    the group must call them. The error sites are 1 (reduce-scatter) and 2
-    (all-gather).
+    The IPC buffers of ``fused_all_reduce_rmsnorm_mxfp8`` for one group of 2, 4 or 8
+    ranks on gfx950. After the error record, each buffer holds a reduce-scatter inbox
+    and an all-gather inbox of 2 x world x ceil(max_tokens / world) rows. The
+    constructor, ``reset`` and ``close`` are collective. Error sites: 1
+    (reduce-scatter), 2 (all-gather).
 
     Args:
         group: The CPU (gloo) process group of the ranks.
@@ -53,8 +49,8 @@ class AllReduceRmsnormMxfp8(IpcCommBuffers):
         hidden (int): The number of bf16 values in a row.
         timeout_s (float): The time limit of each wait in the kernel.
         config (dict, optional): BLOCKS and num_warps in place of the tuned config,
-            for example for a sweep in the benchmark. All launches of a comm use the
-            same CTAs, so the config belongs to the comm, not to a call.
+            for example for a benchmark sweep. The config is fixed for the comm,
+            because all its launches must use the same CTAs.
     """
 
     def __init__(self, group, max_tokens, hidden, timeout_s=60.0, config=None):
@@ -88,15 +84,12 @@ def fused_all_reduce_rmsnorm_mxfp8(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Returns the MXFP8 quant of RMSNorm(all-reduce(x) + residual) and the new
-    residual, over the ranks of ``comm``, with one kernel launch. All ranks get the
-    same bits.
+    residual over the ranks of ``comm``, in one launch. All ranks get the same bits.
 
-    The all-reduce adds the ranks in rank order in fp32 and rounds once to bf16, as
-    the AITER custom all-reduce does. Then, in fp32: s = h + residual, residual_out =
-    bf16(s), y = bf16(s * rstd * w'), with w' = 1 + weight (gemma) or weight. Each
-    group of 32 values gets the E8M0 scale of ``mx_e8m0_scale(amax, 8)``, as the
-    other AITER MXFP8 ops, and y / 2^(scale - 127) is rounded to e4m3. rstd = 1 /
-    sqrt(mean(s^2) + eps): the sum of squares has a fixed order, see the kernel.
+    The all-reduce adds the ranks in rank order in fp32 and rounds once to bf16. Then
+    s = h + residual, residual_out = bf16(s) and y = bf16(s * rstd * w'), with w' = 1
+    + weight (gemma) or weight. The sum of squares has a fixed order. The E8M0 scale
+    of a group of 32 is ``mx_e8m0_scale(amax, 8)``, as in the other AITER MXFP8 ops.
 
     All ranks must make the same calls in the same order. HIP graphs are supported.
 
@@ -115,10 +108,9 @@ def fused_all_reduce_rmsnorm_mxfp8(
         tuple: x_q [tokens, hidden] float8_e4m3fn, x_scale [tokens, hidden / 32]
         uint8 (E8M0) and residual_out [tokens, hidden] bf16, all rows on each rank.
 
-    Limits: gfx950, 2, 4 or 8 ranks, bf16, hidden a multiple of 64 up to 8192,
-    tokens 1 to comm.max_tokens. All CTAs of the launch must run at the same time.
-    If a wait times out, the outputs are wrong and ``comm.error()`` is not 0. Then
-    call ``comm.reset()`` on all ranks.
+    Limits: gfx950, 2, 4 or 8 ranks, hidden a multiple of 64 up to 8192, tokens 1 to
+    comm.max_tokens. If a wait times out, the outputs are wrong and ``comm.error()``
+    is not 0. Then call ``comm.reset()`` on all ranks.
     """
     tokens, hidden = x.shape
     assert hidden == comm.hidden and 0 < tokens <= comm.max_tokens
