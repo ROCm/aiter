@@ -146,6 +146,136 @@ def _select_gfx1250_variant(tokens, cu, hidden=5120):
     return "gfx1250_large", 1
 
 
+# gfx1250 H=5120 asm kernels (hsa/gfx1250/mega_mhc), opt-in with
+# AITER_MEGA_MHC_ASM=1 during bring-up. Per output: (token tile, largest T).
+# Tiles 16/32 are one cluster of 16 split workgroups per tile, up to the T
+# whose grid fills 256 CUs once (a second round costs 4-7 us); tile 64 is the
+# persistent 16-cluster kernel and takes any T, except without post-mix, where
+# the HIP kernels are faster from four 1024-token rounds (T > 3072) on.
+_ASM_PS_NO_POST_MAX = 3072
+# The HIP split-3 kernels (65..80 token tiles) beat PS's partial second round.
+_ASM_PS_HIP_RANGE = (1025, 1280)
+_ASM_TILES = {
+    "bf16": ((16, 256), (32, 512), (64, None)),
+    "mxfp8": ((16, 256), (32, 512), (64, None)),
+}
+# Collapse mode 2: the collapse reads the BF16-rounded updated residual, the
+# RMS sum of squares the unrounded FP32 values.
+_ASM_CS = 2
+_ASM_SPLITS = 16
+
+
+def _asm_enabled(arch, hidden):
+    return (
+        arch == "gfx1250"
+        and hidden == 5120
+        and os.environ.get("AITER_MEGA_MHC_ASM", "0") == "1"
+        and all(
+            os.environ.get(name) is None
+            for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+        )
+    )
+
+
+def _asm_partial_words(tokens):
+    """FP32 partials of every asm kernel: [16][T][32], then SQC's [16][T]."""
+    return _ASM_SPLITS * tokens * 33
+
+
+def _select_asm_tile(tokens, out_dtype):
+    for tile, most in _ASM_TILES[out_dtype]:
+        if most is None or tokens <= most:
+            return tile
+    return None
+
+
+@compile_ops("module_mega_mhc_asm", fc_name="mega_mhc_asm_available", ffi_type="ctypes")
+def _mega_mhc_gfx1250_asm_available(
+    tile_tokens: int,
+    mxfp8: bool,
+    scale_row_major: bool,
+    has_post: bool,
+    identity_pre: bool,
+    cs: int,
+) -> int: ...
+
+
+@cache
+def _asm_available(tile_tokens, mxfp8, scale_row_major, has_post, identity_pre):
+    return bool(
+        _mega_mhc_gfx1250_asm_available(
+            tile_tokens, mxfp8, scale_row_major, has_post, identity_pre, _ASM_CS
+        )
+    )
+
+
+def _asm_tile(
+    arch,
+    tokens,
+    hidden,
+    out_dtype,
+    has_post,
+    identity_pre,
+    scale_row_major=False,
+    res_preshuffle=False,
+    sinkhorn_repeat=20,
+):
+    """Token tile of the asm kernel a mega_mhc call runs, None for HIP."""
+    if (
+        not tokens
+        or res_preshuffle
+        or sinkhorn_repeat != 20
+        or not _asm_enabled(arch, hidden)
+    ):
+        return None
+    tile = _select_asm_tile(tokens, out_dtype)
+    if tile == 64 and (
+        (not has_post and tokens > _ASM_PS_NO_POST_MAX)
+        or _ASM_PS_HIP_RANGE[0] <= tokens <= _ASM_PS_HIP_RANGE[1]
+    ):
+        return None
+    mxfp8 = out_dtype == "mxfp8"
+    if tile is None or not _asm_available(
+        tile, mxfp8, mxfp8 and scale_row_major, has_post, identity_pre
+    ):
+        return None
+    return tile
+
+
+@compile_ops("module_mega_mhc_asm", fc_name="mega_mhc_asm", ffi_type="ctypes")
+def _mega_mhc_gfx1250_asm_launch(
+    residual_out: Tensor,
+    post_out: Tensor,
+    comb_out: Tensor,
+    layer_input: Tensor,
+    quant_out: Tensor | None,
+    quant_scale: Tensor | None,
+    next_pre: Tensor,
+    residual: Tensor,
+    fn_packed: Tensor,
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    pre_mix: Tensor | None,
+    sublayer_out: Tensor | None,
+    post_mix: Tensor | None,
+    comb_mix: Tensor | None,
+    norm_weight: Tensor,
+    partials: Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult: float,
+    norm_eps: float,
+    sinkhorn_repeat: int,
+    tile_tokens: int,
+    mxfp8: bool,
+    scale_row_major: bool,
+    has_post: bool,
+    identity_pre: bool,
+    cs: int,
+) -> None: ...
+
+
 def mega_mhc_shuffle_fn(fn):
     """[H/32, stream, operand, lane, 8] BF16; the last operand packs hi/lo.
 
@@ -239,6 +369,8 @@ class MegaMHCWorkspace:
     variant: str = "generic"
     generic_partials: Tensor | None = None
     generic_counters: Tensor | None = None
+    # FP32 partials for the gfx1250 asm kernels; None when they are off.
+    asm_partials: Tensor | None = None
 
 
 def _require_tensor(x, name, shape, dtype, device):
@@ -329,6 +461,13 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
             )
         blocks = (tokens + 15) // 16
         cu = torch.cuda.get_device_properties(device).multi_processor_count
+        asm_words = (
+            _asm_partial_words(tokens)
+            if split_k is None
+            and _asm_enabled(arch, hidden)
+            and _select_asm_tile(tokens, "mxfp8") is not None
+            else 0
+        )
         if arch == "gfx950" and hidden in _STREAM_HIDDEN_SIZES:
             variant, selected_split = _select_stream_variant(tokens, hidden)
         elif arch == "gfx1250" and hidden in _STREAM_HIDDEN_SIZES:
@@ -368,15 +507,16 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
             else ((blocks + 7) // 8) * split_k > 32
         ):
             raise ValueError("distributed split grid exceeds one workgroup per CU")
+        hip_words = split_k * blocks * 16 * 32
+        # The HIP and asm kernels share one partial buffer: a call runs one of them.
         if reuse_scratch:
             storage, generic_counters, distributed_counters = _SCRATCH.get(
-                device, split_k * blocks * 16 * 32, blocks * 32
+                device, max(hip_words, asm_words), blocks * 32
             )
-            generic_partials = storage.view(split_k, blocks, 16, 32)
             counters = distributed_counters if tagged else generic_counters
         else:
-            generic_partials = torch.empty(
-                (split_k, blocks, 16, 32), device=device, dtype=torch.float32
+            storage = torch.empty(
+                max(hip_words, asm_words), device=device, dtype=torch.float32
             )
             # Initialize both protocols in one operation for a private workspace.
             counter_storage = torch.zeros(
@@ -386,6 +526,7 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
             )
             counters = counter_storage[0]
             generic_counters = counter_storage[1] if tagged else counters
+        generic_partials = storage[:hip_words].view(split_k, blocks, 16, 32)
         partials = (
             generic_partials.view(-1)[: split_k * tokens * 32]
             if tagged
@@ -401,6 +542,7 @@ def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True
             variant,
             generic_partials,
             generic_counters,
+            storage[:asm_words] if asm_words else None,
         )
 
 
@@ -472,6 +614,15 @@ def mega_mhc(
     H=5120/7168 on gfx950 and gfx1250 uses stream dispatch for Sinkhorn=20;
     other positive repeat counts use the generic stream kernel with the same
     pack.
+
+    AITER_MEGA_MHC_ASM=1 (gfx1250, H=5120, Sinkhorn=20, plain residual layout)
+    runs the asm kernels of hsa/gfx1250/mega_mhc instead, for BF16 and
+    both MXFP8 scale layouts at any T, when the (post, pre, output)
+    specialization is shipped; other calls keep the HIP kernels.
+    Set it before preparing the workspace, which then sizes the partials for
+    the asm kernels. They use the same pack; the collapse reads the updated
+    residual rounded to BF16 and the RMS sum of squares the unrounded FP32
+    values, so results are not bitwise equal to the HIP kernels.
 
     out_dtype="mxfp8" (gfx950 and gfx1250) returns (norm, q, e8m0) in place of
     norm: the BF16 norm (T, H), float8_e4m3fn q (T, H) and uint8 E8M0 exponent
@@ -612,6 +763,55 @@ def mega_mhc(
                 (scale_rows, h // 32), device=device, dtype=torch.uint8
             )
             layer_input = (norm, quant_out, quant_scale)
+        tile = (
+            _asm_tile(
+                arch,
+                t,
+                h,
+                out_dtype,
+                has_post,
+                pre_mix is None,
+                scale_row_major,
+                res_preshuffle,
+                sinkhorn_repeat,
+            )
+            if scratch.asm_partials is not None
+            else None
+        )
+        if tile is not None:
+            mxfp8 = out_dtype == "mxfp8"
+            _mega_mhc_gfx1250_asm_launch(
+                residual_out,
+                post_out,
+                comb_out,
+                norm,
+                quant_out if mxfp8 else None,
+                quant_scale if mxfp8 else None,
+                next_pre,
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                pre_mix,
+                sublayer_out,
+                post_layer_mix,
+                comb_res_mix,
+                norm_weight,
+                scratch.asm_partials,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                norm_eps,
+                sinkhorn_repeat,
+                tile,
+                mxfp8,
+                mxfp8 and scale_row_major,
+                has_post,
+                pre_mix is None,
+                _ASM_CS,
+            )
+            return residual_out, post_out, comb_out, layer_input, next_pre
         partials, counters = scratch.partials, scratch.counters
         variant = scratch.variant
         split_k = scratch.split_k
