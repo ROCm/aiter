@@ -180,6 +180,9 @@ def kernel_unified_attention_2d(
             cur_batch_query_len: tl.int32 = (
                 cur_batch_in_all_stop_index - cur_batch_in_all_start_index
             )
+            # local idx is 0, so the padded-grid empty check below does not run
+            if cur_batch_query_len == 0:
+                return
     else:
         seq_idx = find_seq_idx(
             query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True
@@ -685,6 +688,9 @@ def kernel_unified_attention_3d(
             cur_batch_query_len: tl.int32 = (
                 cur_batch_in_all_stop_index - cur_batch_in_all_start_index
             )
+            # local idx is 0, so the padded-grid empty check below does not run
+            if cur_batch_query_len == 0:
+                return
     else:
         seq_idx = find_seq_idx(
             query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True

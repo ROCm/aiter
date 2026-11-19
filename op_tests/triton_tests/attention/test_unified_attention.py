@@ -2541,6 +2541,9 @@ def test_triton_unified_attn_one_q_block(
     ).float()
     out = output.float()
     if use_descale:
+        # NaN > x is false, so an all-NaN fp8 output would pass the budget below
+        assert torch.isfinite(out).all()
+        assert torch.isfinite(ref).all()
         # fp8 gets the same 0.5% mismatch budget as the fp8 gluon tests
         mismatch = (out - ref).abs() > 1.5e-1 + 1.5e-1 * ref.abs()
         mismatch_fraction = mismatch.float().mean().item()
