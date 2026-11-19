@@ -33,6 +33,21 @@ from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
 )
 from aiter.ops.flydsl.kernels.kernels_common import ceildiv
 
+# Low-level calls kept because no stable FlyDSL API gives the same ISA:
+# - rocdl.sched_barrier / rocdl.s_barrier: phase boundaries of the ping-pong
+#   schedule. fx.barrier also fences memory, which adds an s_waitcnt vmcnt(0)
+#   on the in-flight DMAs at every boundary.
+# - rocdl.raw_ptr_buffer_load_lds: global-to-LDS DMA paced by explicit vmcnt
+#   counts. BufferCopyLDS waits for its own data before the LDS is read.
+# - rocdl.readfirstlane: makes LDS DMA bases wave-uniform SGPR values.
+# - rocdl.mfma_scale_f32_16x16x128_f8f6f4: each MFMA starts from a zero
+#   accumulator so its K-block product can be scaled before accumulation.
+# - rocdl.permlane16_swap, with ir.Type / _llvm.extractvalue for its i32
+#   pair: one-VALU register swap between lane halves; fx.shuffle_* does not
+#   produce v_permlane16_swap.
+# - _llvm.inline_asm: the ScaleB loads (see load_scale_b; rocdl.s_buffer_load
+#   adds an s_waitcnt vmcnt(0) before each) and the K=256 loop bound.
+
 
 def _buffer_resource(tensor, num_records_bytes):
     buffer = rocdl.make_buffer_tensor(tensor, num_records_bytes=num_records_bytes)
@@ -924,16 +939,10 @@ def compile_gemm_fp8_8wave(N, K, preshuffle_b=False):
                     acc_b = Vec(c_frag[None, col_repeat + 1, row_repeat].load())
                     # These 4-column slices share a row but are 64 columns apart.
                     # Round to the output dtype, then pack low/high 16-bit pairs.
-                    if const_expr(out_dtype == fx.BFloat16):
-                        d0_a = rocdl.cvt_pk_bf16_f32(acc_a[0], acc_a[1])
-                        d1_a = rocdl.cvt_pk_bf16_f32(acc_a[2], acc_a[3])
-                        d0_b = rocdl.cvt_pk_bf16_f32(acc_b[0], acc_b[1])
-                        d1_b = rocdl.cvt_pk_bf16_f32(acc_b[2], acc_b[3])
-                    else:
-                        packed_a = acc_a.to(fx.Float16).bitcast(fx.Int32)
-                        packed_b = acc_b.to(fx.Float16).bitcast(fx.Int32)
-                        d0_a, d1_a = packed_a[0].ir_value(), packed_a[1].ir_value()
-                        d0_b, d1_b = packed_b[0].ir_value(), packed_b[1].ir_value()
+                    packed_a = acc_a.to(out_dtype).bitcast(fx.Int32)
+                    packed_b = acc_b.to(out_dtype).bitcast(fx.Int32)
+                    d0_a, d1_a = packed_a[0].ir_value(), packed_a[1].ir_value()
+                    d0_b, d1_b = packed_b[0].ir_value(), packed_b[1].ir_value()
 
                     # | lane | d0_a      | d1_a      | d0_b      | d1_b      |
                     # |------|-----------|-----------|-----------|-----------|
