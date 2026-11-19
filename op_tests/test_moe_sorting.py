@@ -3,6 +3,9 @@
 
 import argparse
 import itertools
+import multiprocessing
+import queue
+import time
 
 import pandas as pd
 import torch
@@ -288,37 +291,180 @@ def test_moe_sorting_opus_aux_outputs(dtype, model_dim):
                 f"block_size={block_size}: {bad}"
             )
             assert not bad, mismatch
-            (
-                sorted_ids,
-                sorted_weights,
-                sorted_expert_ids,
-                _,
-                _,
-                aux_m_indices,
-                aux_reverse_sorted,
-            ) = out
-            expected_capacity = sorted_expert_ids.numel() * block_size
-            assert sorted_ids.numel() == expected_capacity
-            assert sorted_weights.numel() == expected_capacity
-            assert aux_m_indices.numel() == expected_capacity
-            assert aux_reverse_sorted.numel() == topk_ids.numel()
-            num_tokens_post_pad = out[3][0].item()
-            assert torch.equal(
-                aux_m_indices[:num_tokens_post_pad],
-                sorted_ids[:num_tokens_post_pad] & 0x00FFFFFF,
+            _check_aux_outputs(out, topk_ids, block_size)
+
+
+def _check_aux_outputs(out, topk_ids, block_size, expert_mask=None):
+    """Check m_indices and reverse_sorted against the sorted_ids they index."""
+    (
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        _,
+        aux_m_indices,
+        aux_reverse_sorted,
+    ) = out
+    token, topk = topk_ids.shape
+    expected_capacity = sorted_expert_ids.numel() * block_size
+    assert sorted_ids.numel() == expected_capacity
+    assert sorted_weights.numel() == expected_capacity
+    assert aux_m_indices.numel() == expected_capacity
+    assert aux_reverse_sorted.numel() == topk_ids.numel()
+    num_tokens_post_pad = num_valid_ids[0].item()
+    assert torch.equal(
+        aux_m_indices[:num_tokens_post_pad],
+        sorted_ids[:num_tokens_post_pad] & 0x00FFFFFF,
+    )
+    topk_slots = torch.arange(topk, dtype=topk_ids.dtype, device=topk_ids.device)
+    expected_sorted_ids = (
+        topk_slots.unsqueeze(0) << 24
+        | torch.arange(token, dtype=topk_ids.dtype, device=topk_ids.device).unsqueeze(1)
+    ).flatten()
+    # Routes to experts masked out by EP are not sorted; their slots are unused.
+    routed = (
+        torch.ones_like(expected_sorted_ids, dtype=torch.bool)
+        if expert_mask is None
+        else (expert_mask[topk_ids.long()] != 0).flatten()
+    )
+    assert torch.equal(
+        sorted_ids[aux_reverse_sorted[routed].long()], expected_sorted_ids[routed]
+    )
+
+
+# The Opus single kernel keeps one LDS row per sub-token. With the 64 KB host-pass
+# LDS size it has no such row from 819 experts up, and dispatch_policy=1 must then
+# take the multi-phase kernels. 818 is the last expert count that fits.
+LDS_FALLBACK_EXPERTS = (818, 896)
+LDS_FALLBACK_FIRST_EXPERT = 819
+# A sort takes microseconds. No progress for this long means a kernel hangs.
+LDS_FALLBACK_TIMEOUT_S = 300
+
+
+def test_moe_sorting_opus_oneshot_lds_fallback_dispatch(topk=16):
+    """Forced single kernel (dispatch_policy=1) gets an mp workspace when LDS is short."""
+    device_id = torch.cuda.current_device()
+    for E, token in itertools.product((818, 819, 896), (1, 16, 64)):
+        oneshot = aiter.moe_sorting_opus_get_workspace_size(
+            token, E, topk, 1, device_id
+        )
+        multi = aiter.moe_sorting_opus_get_workspace_size(token, E, topk, 2, device_id)
+        if E < LDS_FALLBACK_FIRST_EXPERT:
+            assert oneshot == 0, f"E={E}, M={token}: single kernel fits, got {oneshot}"
+        else:
+            assert oneshot == multi > 0, (
+                f"E={E}, M={token}: single kernel has no LDS sub-token row and "
+                f"must use the mp workspace ({multi}), got {oneshot}"
             )
-            topk_slots = torch.arange(
-                topk, dtype=topk_ids.dtype, device=topk_ids.device
-            )
-            expected_sorted_ids = (
-                topk_slots.unsqueeze(0) << 24
-                | torch.arange(
-                    token, dtype=topk_ids.dtype, device=topk_ids.device
-                ).unsqueeze(1)
-            ).flatten()
-            assert torch.equal(
-                sorted_ids[aux_reverse_sorted.long()], expected_sorted_ids
-            )
+
+
+def _moe_sorting_opus_lds_fallback_worker(progress, dtype, model_dim, topk):
+    """Child process for test_moe_sorting_opus_large_expert_no_hang."""
+    set_moe_sorting_backend("opus")
+    # Reject the fused aux sort, as EP expert_mask, AITER_MOE_SORT_BACKEND=opus or
+    # an uninstantiated shape do, so output_aux=True takes the Opus sort under test.
+    fm._mxfp4_aux_instance_supported = lambda *_args: False
+    device_id = torch.cuda.current_device()
+    for E, block_size, output_aux, has_expert_mask, token in itertools.product(
+        LDS_FALLBACK_EXPERTS,
+        (16, 32, 64),
+        (False, True, fm.AUX_SORT_OPUS),
+        (False, True),
+        (1, 64),
+    ):
+        case = {
+            "E": E,
+            "topk": topk,
+            "block_size": block_size,
+            "output_aux": output_aux,
+            "expert_mask": has_expert_mask,
+            "token": token,
+        }
+        progress.put(("start", case))
+        topk_ids, topk_weights, expert_mask, _ = _build_moe_sorting_inputs(
+            token, model_dim, E, topk, dtype, has_expert_mask, padding_extra=0
+        )
+        ref = run_torch_moe_sorting(topk_ids, topk_weights, E, block_size, expert_mask)
+        # output_aux sorts pick their own dispatch_policy; the plain sort forces
+        # the single kernel, as a C++ caller of dispatch_policy=1 does.
+        out = moe_sorting(
+            topk_ids,
+            topk_weights,
+            E,
+            model_dim,
+            dtype,
+            block_size,
+            expert_mask,
+            dispatch_policy=1,
+            output_aux=output_aux,
+        )
+        torch.cuda.synchronize()
+        errs = _compare_moe_sorting_outputs(ref, out[:5], topk, token)
+        bad = {name: err for name, err in errs.items() if err}
+        assert not bad, f"moe_sorting mismatch at {case}: {bad}"
+        if output_aux:
+            _check_aux_outputs(out, topk_ids, block_size, expert_mask)
+        case["oneshot ws bytes"] = aiter.moe_sorting_opus_get_workspace_size(
+            token, E, topk, 1, device_id
+        )
+        case["err"] = max(errs.values())
+        progress.put(("row", case))
+    progress.put(("done", None))
+
+
+def test_moe_sorting_opus_large_expert_no_hang(dtype, model_dim, topk=16):
+    """Opus sort at the single-kernel LDS limit (818/896 experts, Kimi-K3 topk=16).
+
+    Before the fix, a forced or aux single-kernel sort with >= 819 experts looped
+    forever on the GPU. A hung kernel cannot be stopped from its own process, so
+    the cases run in a child process that is killed when it makes no progress.
+    """
+    # Build or load the JIT module here, so the child does not spend its
+    # timeout on a compile.
+    aiter.moe_sorting_opus_get_workspace_size(1, LDS_FALLBACK_EXPERTS[0], topk, 1)
+
+    ctx = multiprocessing.get_context("spawn")
+    progress = ctx.Queue()
+    proc = ctx.Process(
+        target=_moe_sorting_opus_lds_fallback_worker,
+        args=(progress, dtype, model_dim, topk),
+    )
+    proc.start()
+    rows, current, done = [], "process start", False
+    deadline = time.monotonic() + LDS_FALLBACK_TIMEOUT_S
+    try:
+        while not done and time.monotonic() < deadline:
+            try:
+                kind, payload = progress.get(timeout=1.0)
+            except queue.Empty:
+                if not proc.is_alive():
+                    break
+                continue
+            deadline = time.monotonic() + LDS_FALLBACK_TIMEOUT_S
+            if kind == "start":
+                current = payload
+            elif kind == "row":
+                rows.append(payload)
+            else:
+                done = True
+        proc.join(timeout=60 if done else 1)
+    finally:
+        hung = proc.is_alive()
+        if hung:
+            proc.kill()
+            proc.join()
+    assert not hung, (
+        f"moe_sorting made no progress for {LDS_FALLBACK_TIMEOUT_S}s "
+        f"(GPU hang) at {current}"
+    )
+    assert done and proc.exitcode == 0, (
+        f"moe_sorting large-expert worker failed (exit code {proc.exitcode}) "
+        f"at {current}; see its traceback above"
+    )
+    aiter.logger.info(
+        "moe_sorting Opus single-kernel LDS fallback (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
 
 
 def test_moe_sorting_opus_local_ids_large_expert_auto(dtype, model_dim):
@@ -929,7 +1075,9 @@ def main():
     test_moe_sorting_opus_host_dispatch_boundaries()
     test_moe_sorting_opus_workspace_uses_explicit_device()
     test_moe_sorting_opus_workspace_switches_arch_policy()
+    test_moe_sorting_opus_oneshot_lds_fallback_dispatch()
     for dtype in args.dtype:
+        test_moe_sorting_opus_large_expert_no_hang(dtype, args.model_dim)
         test_moe_sorting_opus_aux_outputs(dtype, args.model_dim)
         test_moe_sorting_opus_local_ids_large_expert_auto(dtype, args.model_dim)
         df = []
