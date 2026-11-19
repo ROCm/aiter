@@ -531,6 +531,8 @@ def make_s1f_stage1(
     block_runs=MB_RB,
     ticket_span=None,
     ctas_per_cu=2,
+    tdm_b_th=0,
+    xcc_queues=0,
 ):
     """Build the S1F stage-1 kernel; returns a ``@flyc.jit`` launcher.
 
@@ -539,7 +541,8 @@ def make_s1f_stage1(
     ``arg_a1_scale`` / ``arg_w1_scale`` / ``arg_a2_scale`` (tensors),
     ``arg_psum`` (pointer), then i64 addresses ``arena, inp_tok, inp_scale,
     inp_wts, send_list, runs, tile_src, ctl``, then ``i32_m`` (GEMM1 rows
-    capacity), ``inp_cur_tok``, ``f32_swiglu_limit``, ``stream``.
+    capacity), ``inp_cur_tok``, ``f32_swiglu_limit``, ``f32_situ_beta``,
+    ``f32_situ_linear_beta``, ``stream``.
 
     ``inp_tok`` holds whole ``row_stride`` wire rows (payload | e8m0 | pad,
     written by the sender quant), so one 16-bit-index TDM gather fetches an
@@ -578,6 +581,16 @@ def make_s1f_stage1(
     tile j; or, for one flag tile of more sources, one lane per source) while
     wave 1 waits on an LDS token and the B / B-scale waves run the weight
     prologue.
+
+    ``xcc_queues``: one GEMM1 queue per XCC instead of the global one. Queue
+    ``x`` holds the m-tiles ``m % 8 == x``, n fastest, so the n-tiles that
+    share an m-tile's A run on one XCC and read it from that XCC's L2 (block
+    ``b`` runs on XCC ``b % 8``). Consumer ``l`` of XCC ``x`` starts on item
+    ``l`` of queue ``x``; a CTA whose queue is exhausted claims from the next
+    queues in turn. Decode m-tiles are one per expert, so B has no reuse to
+    keep; with several m-tiles per expert the global m-major order keeps B's.
+
+    ``tdm_b_th``: GEMM1's B-load TDM cache hint, as in the CSV row.
 
     ``ticket_span`` (default ``workers``): entry tickets per launch, the same
     for every variant sharing one control block. ``ctas_per_cu``: how many
@@ -638,6 +651,7 @@ def make_s1f_stage1(
     G = int(workers)
     P = int(producers)
     GM = int(group_m)
+    XQ = int(bool(xcc_queues))
     SHARED_FIRST = S1F_SHARED_FIRST if S1F_SHARED_FIRST < epr else 0
     N1 = 2 * int(inter_dim)
     assert N1 % tile_n == 0
@@ -720,34 +734,10 @@ def make_s1f_stage1(
     def _w1_blk0(nxt_, slot_):
         return _uniform(readlane(T.i32, arith.unwrap(nxt_), 0))
 
-    @flyc.jit
-    def launch(
-        arg_a2: fx.Tensor,
-        arg_a1: fx.Pointer,
-        arg_w1: fx.Pointer,
-        arg_a1_scale: fx.Tensor,
-        arg_w1_scale: fx.Tensor,
-        arg_a2_scale: fx.Tensor,
-        arg_psum: fx.Pointer,
-        arena: fx.Int64,
-        inp_tok: fx.Int64,
-        inp_scale: fx.Int64,
-        inp_wts: fx.Int64,
-        addr_send: fx.Int64,
-        addr_runs: fx.Int64,
-        addr_tile_src: fx.Int64,
-        addr_ctl: fx.Int64,
-        i32_m: fx.Int32,
-        inp_cur_tok: fx.Int32,
-        f32_swiglu_limit: fx.Float32,
-        stream: fx.Stream,
-    ):
-        g1_buffers = min(num_buffers, max(1, model_dim // tile_k))
-        lds_holder = [None]
-        ready_holder = [None]
-        meta_holder = [None]
-        hooks_holder = [None]
-        g1_task, block, g1_name, _, lay = build_gemm_a8w4_tdm_task(
+    g1_buffers = min(num_buffers, max(1, model_dim // tile_k))
+
+    def _build_g1(lds_holder, ready_holder, meta_holder, hooks_holder):
+        return build_gemm_a8w4_tdm_task(
             K=model_dim,
             tile_m=tile_m,
             tile_n=tile_n,
@@ -769,7 +759,7 @@ def make_s1f_stage1(
             next_stage_prefetch=0,
             num_waves_per_tensor_tdm=2,
             tdm_as_in_prologue=0,
-            tdm_b_th=0,
+            tdm_b_th=tdm_b_th,
             enable_ep_scatter=0,
             ep_arena_handle=0,
             ep_combine_input_offset=0,
@@ -795,6 +785,38 @@ def make_s1f_stage1(
             defer_c_wait=tile_m > 32 and g1_buffers > 2,
             tdm_snop=True,
         )
+
+    @flyc.jit
+    def launch(
+        arg_a2: fx.Tensor,
+        arg_a1: fx.Pointer,
+        arg_w1: fx.Pointer,
+        arg_a1_scale: fx.Tensor,
+        arg_w1_scale: fx.Tensor,
+        arg_a2_scale: fx.Tensor,
+        arg_psum: fx.Pointer,
+        arena: fx.Int64,
+        inp_tok: fx.Int64,
+        inp_scale: fx.Int64,
+        inp_wts: fx.Int64,
+        addr_send: fx.Int64,
+        addr_runs: fx.Int64,
+        addr_tile_src: fx.Int64,
+        addr_ctl: fx.Int64,
+        i32_m: fx.Int32,
+        inp_cur_tok: fx.Int32,
+        f32_swiglu_limit: fx.Float32,
+        f32_situ_beta: fx.Float32,
+        f32_situ_linear_beta: fx.Float32,
+        stream: fx.Stream,
+    ):
+        lds_holder = [None]
+        ready_holder = [None]
+        meta_holder = [None]
+        hooks_holder = [None]
+        g1_task, block, g1_name, _, lay = _build_g1(
+            lds_holder, ready_holder, meta_holder, hooks_holder
+        )
         if block != 4 * WAVE:
             raise ValueError(f"S1F expects the 4-wave GEMM1 block, got {block}")
         ARENA = int(lay["arena"])
@@ -816,6 +838,7 @@ def make_s1f_stage1(
             + f"_poll{POLL}"
             + (f"_sf{SHARED_FIRST}" if SHARED_FIRST else "")
             + (f"_ts{SPAN}" if SPAN != G else "")
+            + ("_xq" if XQ else "")
             + f"_{g1_name}"
         )
 
@@ -839,6 +862,8 @@ def make_s1f_stage1(
             i32_m: fx.Int32,
             inp_cur_tok: fx.Int32,
             f32_swiglu_limit: fx.Float32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_linear_beta: fx.Float32,
         ):
             tid = fx.Int32(fx.thread_idx.x)
             lane = tid & fx.Int32(WAVE - 1)
@@ -1648,16 +1673,31 @@ def make_s1f_stage1(
                 return tinfo_join(tinfo_words(m))
 
             # ---- the GEMM1 work queue ----
-            # One global queue; consumer c = slot_id - P starts on item c
-            # without a claim.
-            SQ = G - P
+            # Global: one queue, consumer c = slot_id - P starts on item c
+            # without a claim. XQ: queue x per XCC, its consumer l starts on
+            # item l of queue x; each queue's first SQ items are static.
+            SQ = CB if XQ else G - P
             groups = (m_tiles + fx.Int32(GM - 1)) // fx.Int32(GM)
             gs_last = m_tiles - (groups - fx.Int32(1)) * fx.Int32(GM)
 
             def q_items(xq):
+                if const_expr(XQ):
+                    mx = fx.Int32(
+                        (m_tiles > xq).select(
+                            (m_tiles - xq + fx.Int32(N_XCC - 1)) // fx.Int32(N_XCC),
+                            fx.Int32(0),
+                        )
+                    )
+                    return mx * fx.Int32(NT)
                 return m_tiles * fx.Int32(NT)
 
             def q_code(xq, w):
+                if const_expr(XQ):
+                    # Queue xq: m-tiles xq, xq + 8, ..., n fastest.
+                    j = w // fx.Int32(NT)
+                    return ((xq + j * fx.Int32(N_XCC)) << fx.Int32(_ITEM_N_BITS)) | (
+                        w - j * fx.Int32(NT)
+                    )
                 # m-major in groups of GM m-tiles, m fastest.
                 k = w // fx.Int32(B1)
                 r = w - k * fx.Int32(B1)
@@ -1673,6 +1713,11 @@ def make_s1f_stage1(
                 return (m_q << fx.Int32(_ITEM_N_BITS)) | rq
 
             def q_head_bytes(xq):
+                if const_expr(XQ):
+                    return (
+                        fx.Int32(CTL_XHEAD)
+                        + (par * fx.Int32(N_XCC) + xq) * fx.Int32(32)
+                    ) * fx.Int32(4)
                 return (fx.Int32(CTL_HEAD) + par * fx.Int32(32)) * fx.Int32(4)
 
             def claim_issue(xq):
@@ -1699,11 +1744,29 @@ def make_s1f_stage1(
                     c, xq_c = steal(xq0)
                 return c, xq_c
 
+            def steal_xcc(xq0):
+                """Wave 0, blocking: the next item of the queues after xq0, or
+                code -1 once every queue is exhausted. Each claim follows an
+                empty one (a claim on a live queue takes its item), and an
+                exhausted queue stays exhausted, so one pass decides the end."""
+                code_s = fx.Int32(-2)
+                xq_s = xq0
+                i = fx.Int32(1)
+                while (code_s == fx.Int32(-2)) & (i < fx.Int32(N_XCC)):
+                    xq_c = (xq0 + i) & fx.Int32(N_XCC - 1)
+                    code_s = claim_resolve(xq_c, claim_issue(xq_c))
+                    xq_s = xq_c
+                    i = i + fx.Int32(1)
+                code_s = fx.Int32((code_s == fx.Int32(-2)).select(fx.Int32(-1), code_s))
+                return code_s, xq_s
+
             def steal(xq0):
                 """Wave 0, blocking: the next item from any queue, or code -1
                 once every queue is exhausted. Per-XCC queues: one probe of all
                 heads, then one claim on the queue with the most items left
                 (retried if another CTA drained it first)."""
+                if const_expr(XQ):
+                    return steal_xcc(xq0)
                 code_s = fx.Int32(-2)
                 xq_s = xq0
                 it = fx.Int32(0)
@@ -1772,22 +1835,36 @@ def make_s1f_stage1(
                 return ok
 
             def flag_load(m, live=None, spin=True):
-                """Lane 0: the tile's 16 B of per-source flags, SCOPE_SYS.
-                ``spin``: volatile, so a poll loop re-issues it (the memory
-                legalizer then also waits right after it); the pre-check
-                load is not volatile and stays in flight until its use."""
+                """Lane 0: the tile's per-source flags, SCOPE_SYS: one b128
+                for npes <= 4, two joined into an 8-wide vector for npes <= 8
+                (MUBUF is dwordx4). ``spin``: volatile, so a poll loop
+                re-issues it (the memory legalizer then also waits right
+                after it); the pre-check load is not volatile and stays in
+                flight until its use."""
                 on = lane == fx.Int32(0)
                 if const_expr(live is not None):
                     on = on & live
-                return fx.Vector(
-                    buffer_load(
-                        rsrc_flag,
-                        m * fx.Int32(FLAG_STRIDE // 4),
-                        vec_width=4,
-                        dtype=T.i32,
-                        mask=on,
-                        cache_modifier=POLL_SCOPE | (_VOLATILE if spin else 0),
+                base = m * fx.Int32(FLAG_STRIDE // 4)
+
+                def _b128(off):
+                    return fx.Vector(
+                        buffer_load(
+                            rsrc_flag,
+                            off,
+                            vec_width=4,
+                            dtype=T.i32,
+                            mask=on,
+                            cache_modifier=POLL_SCOPE | (_VOLATILE if spin else 0),
+                        )
                     )
+
+                if const_expr(int(npes) <= 4):
+                    return _b128(base)
+                lo = _b128(base)
+                hi = _b128(base + fx.Int32(4))
+                return fx.Vector.from_elements(
+                    [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]],
+                    dtype=fx.Int32,
                 )
 
             def flag_load_sub(m, live=None, spin=True):
@@ -1846,11 +1923,13 @@ def make_s1f_stage1(
             code = fx.Int32(-1)
             tinfo = fx.Int32(0)
             ready = fx.Int32(0)
-            queue = fx.Int32(0)
+            queue = xcc if const_expr(XQ) else fx.Int32(0)
             static_ok = fx.Int32(0)
             # Consumers only: a producer's first item would wait for its own
             # runs, and those cover the earliest tiles.
-            q0 = slot_id - fx.Int32(P)
+            # XQ: consumer slots are x-major, so XCC x's consumers are
+            # P + x * CB + l, l < CB.
+            q0 = slot_id - fx.Int32(P) - (xcc * fx.Int32(CB) if XQ else fx.Int32(0))
             static_ok = fx.Int32(
                 ((slot_id >= fx.Int32(P)) & (q0 < q_items(queue))).select(
                     fx.Int32(1), fx.Int32(0)
@@ -2002,8 +2081,8 @@ def make_s1f_stage1(
                     i32_m,
                     n1,
                     f32_swiglu_limit,
-                    fx.Float32(1.0),
-                    fx.Float32(1.0),
+                    f32_situ_beta,
+                    f32_situ_linear_beta,
                     m,
                     n,
                 )
@@ -2032,6 +2111,8 @@ def make_s1f_stage1(
             i32_m,
             inp_cur_tok,
             f32_swiglu_limit,
+            f32_situ_beta,
+            f32_situ_linear_beta,
         ).launch(grid=(G, 1, 1), block=(block, 1, 1), stream=stream)
 
     launch.compile_hints = dict(launch_gemm_a8w4_tdm.compile_hints)
