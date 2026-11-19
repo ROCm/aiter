@@ -1,0 +1,2 @@
+# Preserve native tool output verbatim, including trailing tabs in GPU tables.
+*.log -whitespace

@@ -1,0 +1,25 @@
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+No KFD PIDs currently running
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /app/aiter/aiter/jit/module_aiter_core.so
+[aiter] grouped GEMM data format: a4w4
+[aiter] import [module_moe_asm] under /app/aiter/aiter/jit/module_moe_asm.so
+[aiter] type hints mismatch, override to --> topk_softmax(topk_weights: aiter_tensor_t, topk_indices: aiter_tensor_t, token_expert_indices: aiter_tensor_t, gating_output: aiter_tensor_t, softmax_workspace: aiter_tensor_t, need_renorm: bool, num_shared_experts: int = 0, shared_expert_scoring_func: str = '') -> None
+[aiter] grouped CSV config selected token=8192 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=64x256x128 tile2=64x256x128 buffers=3/3
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[W1119 20:47:41.055488864 collection.cpp:1148] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+[sanity a4w4 situv2] kernel: logits_diff=3.5139e-06 rel_l2=2.6510e-03 (gate<0.01, ref_norm=4.3839e+06)
+[kernel-bench a4w4 situv2] gemm1: us = 199.56, FLOPS = 721554505728, TFLOPS = 3615.74, Bandwidth = 7950.00 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 163.55, FLOPS = 360777252864, TFLOPS = 2205.89, Bandwidth = 9913.42 GB/s
+
+[precision summary]
+| data_format   | act    | data_init   | scale_init   |   seed |   experts |   shared_experts |   tokens |   topk |   model_dim |   inter_dim |   logits_diff |   rel_l2 | pass   | us   |   gemm1_us |   gemm2_us |   gemm1_TFLOPS |   gemm1_Bandwidth (GB/s) |   gemm2_TFLOPS |   gemm2_Bandwidth (GB/s) |
+|:--------------|:-------|:------------|:-------------|-------:|----------:|-----------------:|---------:|-------:|------------:|------------:|--------------:|---------:|:-------|:-----|-----------:|-----------:|---------------:|-------------------------:|---------------:|-------------------------:|
+| a4w4          | situv2 | uniform     | uniform      |      0 |       896 |                0 |     8192 |     16 |        3584 |         384 |   3.51391e-06 | 0.002651 | True   |      |    199.559 |    163.552 |        3615.74 |                     7950 |        2205.89 |                  9913.42 |

@@ -1,0 +1,14 @@
+[
+  {
+    "token": 8192,
+    "config": "main",
+    "log": "fault_check_main",
+    "correctness": "PASS",
+    "gemm1_us": 199.559,
+    "gemm1_tflops": 3615.74,
+    "gemm1_bw_gbs": 7950.0,
+    "gemm2_us": 163.552,
+    "gemm2_tflops": 2205.89,
+    "gemm2_bw_gbs": 9913.42
+  }
+]

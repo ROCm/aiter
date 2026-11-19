@@ -1,0 +1,35 @@
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+KFD process information:
+PID    	PROCESS NAME	GPU(s)	VRAM USED	SDMA USED	CU OCCUPANCY	
+3643515	UNKNOWN     	1     	863080448	0        	0           	
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+No KFD PIDs currently running
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /app/aiter/aiter/jit/module_aiter_core.so
+[aiter] grouped GEMM data format: a4w4
+[aiter] import [module_moe_asm] under /app/aiter/aiter/jit/module_moe_asm.so
+[aiter] type hints mismatch, override to --> topk_softmax(topk_weights: aiter_tensor_t, topk_indices: aiter_tensor_t, token_expert_indices: aiter_tensor_t, gating_output: aiter_tensor_t, softmax_workspace: aiter_tensor_t, need_renorm: bool, num_shared_experts: int = 0, shared_expert_scoring_func: str = '') -> None
+[aiter] grouped CSV config selected token=1 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x256x512 tile2=16x256x256 buffers=4/4
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[W1119 20:40:55.175527282 collection.cpp:1148] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+[sanity a4w4 situv2] kernel: logits_diff=3.2373e-06 rel_l2=2.5446e-03 (gate<0.01, ref_norm=4.8579e+04)
+[kernel-bench a4w4 situv2] gemm1: us = 5.27, FLOPS = 88080384, TFLOPS = 16.73, Bandwidth = 4448.99 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 3.19, FLOPS = 44040192, TFLOPS = 13.82, Bandwidth = 3708.93 GB/s
+
+[precision summary]
+| data_format   | act    | data_init   | scale_init   |   seed |   experts |   shared_experts |   tokens |   topk |   model_dim |   inter_dim |   logits_diff |     rel_l2 | pass   | us   |   gemm1_us |   gemm2_us |   gemm1_TFLOPS |   gemm1_Bandwidth (GB/s) |   gemm2_TFLOPS |   gemm2_Bandwidth (GB/s) |
+|:--------------|:-------|:------------|:-------------|-------:|----------:|-----------------:|---------:|-------:|------------:|------------:|--------------:|-----------:|:-------|:-----|-----------:|-----------:|---------------:|-------------------------:|---------------:|-------------------------:|
+| a4w4          | situv2 | uniform     | uniform      |      0 |       896 |                0 |        1 |     16 |        3584 |         384 |   3.23726e-06 | 0.00254456 | True   |      |    5.26639 |    3.18586 |         16.725 |                  4448.99 |        13.8236 |                  3708.93 |

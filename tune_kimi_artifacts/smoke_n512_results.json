@@ -1,0 +1,14 @@
+[
+  {
+    "token": 1,
+    "config": "n512",
+    "log": "smoke_n512",
+    "correctness": "PASS",
+    "gemm1_us": 5.25617,
+    "gemm1_tflops": 16.7575,
+    "gemm1_bw_gbs": 4457.63,
+    "gemm2_us": 3.25639,
+    "gemm2_tflops": 13.5242,
+    "gemm2_bw_gbs": 3628.59
+  }
+]

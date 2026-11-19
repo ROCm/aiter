@@ -1,0 +1,18 @@
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+No KFD PIDs currently running
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /app/aiter/aiter/jit/module_aiter_core.so
+[aiter] grouped GEMM data format: a4w4
+[aiter] import [module_moe_asm] under /app/aiter/aiter/jit/module_moe_asm.so
+[aiter] type hints mismatch, override to --> topk_softmax(topk_weights: aiter_tensor_t, topk_indices: aiter_tensor_t, token_expert_indices: aiter_tensor_t, gating_output: aiter_tensor_t, softmax_workspace: aiter_tensor_t, need_renorm: bool, num_shared_experts: int = 0, shared_expert_scoring_func: str = '') -> None
+[aiter] grouped CSV config selected token=8192 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=64x256x128 tile2=64x512x256 buffers=3/3
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[W1119 20:47:23.465726679 collection.cpp:1148] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+Memory access fault by GPU node-2 (Agent handle: 0x17ba29c0) on address 0x22000. Reason: Page not present or supervisor privilege.

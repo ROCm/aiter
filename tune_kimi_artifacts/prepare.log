@@ -1,0 +1,113 @@
+{
+  "main_revision": "956fd46d879582fec765f614429638b21c6200cc",
+  "flydsl_version": "0.5.0",
+  "scope": "Kimi3 TP8 A4W4, SiTUv2, all 15 CSV token buckets",
+  "mapping": [
+    {
+      "token": 1,
+      "tile_m": 16,
+      "donor_token": 1,
+      "donor_experts": 96,
+      "donor_topk": 6
+    },
+    {
+      "token": 2,
+      "tile_m": 16,
+      "donor_token": 1,
+      "donor_experts": 96,
+      "donor_topk": 6
+    },
+    {
+      "token": 4,
+      "tile_m": 16,
+      "donor_token": 1,
+      "donor_experts": 96,
+      "donor_topk": 6
+    },
+    {
+      "token": 8,
+      "tile_m": 16,
+      "donor_token": 2,
+      "donor_experts": 96,
+      "donor_topk": 6
+    },
+    {
+      "token": 16,
+      "tile_m": 16,
+      "donor_token": 4,
+      "donor_experts": 96,
+      "donor_topk": 6
+    },
+    {
+      "token": 32,
+      "tile_m": 16,
+      "donor_token": 8,
+      "donor_experts": 96,
+      "donor_topk": 6
+    },
+    {
+      "token": 64,
+      "tile_m": 16,
+      "donor_token": 16,
+      "donor_experts": 96,
+      "donor_topk": 6
+    },
+    {
+      "token": 128,
+      "tile_m": 16,
+      "donor_token": 32,
+      "donor_experts": 96,
+      "donor_topk": 6
+    },
+    {
+      "token": 256,
+      "tile_m": 16,
+      "donor_token": 64,
+      "donor_experts": 96,
+      "donor_topk": 6
+    },
+    {
+      "token": 512,
+      "tile_m": 16,
+      "donor_token": 128,
+      "donor_experts": 96,
+      "donor_topk": 6
+    },
+    {
+      "token": 1024,
+      "tile_m": 32,
+      "donor_token": 256,
+      "donor_experts": 96,
+      "donor_topk": 6
+    },
+    {
+      "token": 2048,
+      "tile_m": 64,
+      "donor_token": 512,
+      "donor_experts": 96,
+      "donor_topk": 6
+    },
+    {
+      "token": 4096,
+      "tile_m": 64,
+      "donor_token": 512,
+      "donor_experts": 96,
+      "donor_topk": 6
+    },
+    {
+      "token": 8192,
+      "tile_m": 64,
+      "donor_token": 512,
+      "donor_experts": 96,
+      "donor_topk": 6
+    },
+    {
+      "token": 16384,
+      "tile_m": 128,
+      "donor_token": 2048,
+      "donor_experts": 96,
+      "donor_topk": 6
+    }
+  ],
+  "main_csv_sha256": "6d80997089befe0d319e5ea4f6bb6861e0f294425f341c15a3ea745c195a6342"
+}

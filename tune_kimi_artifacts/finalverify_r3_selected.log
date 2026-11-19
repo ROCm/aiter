@@ -1,0 +1,98 @@
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+No KFD PIDs currently running
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /app/aiter/aiter/jit/module_aiter_core.so
+[aiter] grouped GEMM data format: a4w4
+
+===== tokens=1 =====
+[aiter] import [module_moe_asm] under /app/aiter/aiter/jit/module_moe_asm.so
+[aiter] type hints mismatch, override to --> topk_softmax(topk_weights: aiter_tensor_t, topk_indices: aiter_tensor_t, token_expert_indices: aiter_tensor_t, gating_output: aiter_tensor_t, softmax_workspace: aiter_tensor_t, need_renorm: bool, num_shared_experts: int = 0, shared_expert_scoring_func: str = '') -> None
+[aiter] grouped CSV config selected token=1 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x64x128 tile2=16x64x128 buffers=4/3
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[W1119 20:50:19.019737355 collection.cpp:1148] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+[sanity a4w4 situv2] kernel: logits_diff=3.2373e-06 rel_l2=2.5446e-03 (gate<0.01, ref_norm=4.8579e+04)
+[kernel-bench a4w4 situv2] gemm1: us = 4.51, FLOPS = 88080384, TFLOPS = 19.54, Bandwidth = 5196.65 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 3.30, FLOPS = 44040192, TFLOPS = 13.36, Bandwidth = 3583.31 GB/s
+
+===== tokens=2 =====
+[aiter] grouped CSV config selected token=2 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x128x512 tile2=16x512x128 buffers=4/2
+[sanity a4w4 situv2] kernel: logits_diff=3.3429e-06 rel_l2=2.5857e-03 (gate<0.01, ref_norm=6.8413e+04)
+[kernel-bench a4w4 situv2] gemm1: us = 5.85, FLOPS = 176160768, TFLOPS = 30.12, Bandwidth = 8012.83 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 4.47, FLOPS = 88080384, TFLOPS = 19.70, Bandwidth = 5284.37 GB/s
+
+===== tokens=4 =====
+[aiter] grouped CSV config selected token=4 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x128x512 tile2=16x256x128 buffers=3/2
+[sanity a4w4 situv2] kernel: logits_diff=3.4271e-06 rel_l2=2.6181e-03 (gate<0.01, ref_norm=9.7096e+04)
+[kernel-bench a4w4 situv2] gemm1: us = 7.65, FLOPS = 352321536, TFLOPS = 46.05, Bandwidth = 12250.92 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 5.34, FLOPS = 176160768, TFLOPS = 33.00, Bandwidth = 8854.03 GB/s
+
+===== tokens=8 =====
+[aiter] grouped CSV config selected token=8 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x64x512 tile2=16x64x128 buffers=2/2
+[sanity a4w4 situv2] kernel: logits_diff=3.4303e-06 rel_l2=2.6193e-03 (gate<0.01, ref_norm=1.3733e+05)
+[kernel-bench a4w4 situv2] gemm1: us = 9.71, FLOPS = 704643072, TFLOPS = 72.57, Bandwidth = 19305.19 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 6.45, FLOPS = 352321536, TFLOPS = 54.63, Bandwidth = 14657.30 GB/s
+
+===== tokens=16 =====
+[aiter] grouped CSV config selected token=16 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x384x128 tile2=16x128x128 buffers=4/2
+[sanity a4w4 situv2] kernel: logits_diff=3.3939e-06 rel_l2=2.6053e-03 (gate<0.01, ref_norm=1.9483e+05)
+[kernel-bench a4w4 situv2] gemm1: us = 22.52, FLOPS = 1409286144, TFLOPS = 62.59, Bandwidth = 16648.52 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 12.46, FLOPS = 704643072, TFLOPS = 56.54, Bandwidth = 15170.01 GB/s
+
+===== tokens=32 =====
+[aiter] grouped CSV config selected token=32 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x128x128 tile2=16x64x128 buffers=2/3
+[sanity a4w4 situv2] kernel: logits_diff=3.4680e-06 rel_l2=2.6336e-03 (gate<0.01, ref_norm=2.7439e+05)
+[kernel-bench a4w4 situv2] gemm1: us = 42.14, FLOPS = 2818572288, TFLOPS = 66.88, Bandwidth = 17790.29 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 20.39, FLOPS = 1409286144, TFLOPS = 69.10, Bandwidth = 18540.41 GB/s
+
+===== tokens=64 =====
+[aiter] grouped CSV config selected token=64 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x384x128 tile2=16x64x128 buffers=2/3
+[sanity a4w4 situv2] kernel: logits_diff=3.5121e-06 rel_l2=2.6503e-03 (gate<0.01, ref_norm=3.8812e+05)
+[kernel-bench a4w4 situv2] gemm1: us = 75.34, FLOPS = 5637144576, TFLOPS = 74.82, Bandwidth = 17419.14 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 36.47, FLOPS = 2818572288, TFLOPS = 77.29, Bandwidth = 18169.85 GB/s
+
+===== tokens=128 =====
+[aiter] grouped CSV config selected token=128 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x128x128 tile2=16x128x128 buffers=3/2
+[sanity a4w4 situv2] kernel: logits_diff=3.5038e-06 rel_l2=2.6472e-03 (gate<0.01, ref_norm=5.4856e+05)
+[kernel-bench a4w4 situv2] gemm1: us = 71.61, FLOPS = 11274289152, TFLOPS = 157.44, Bandwidth = 18356.55 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 37.00, FLOPS = 5637144576, TFLOPS = 152.37, Bandwidth = 18115.03 GB/s
+
+===== tokens=256 =====
+[aiter] grouped CSV config selected token=256 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x256x128 tile2=16x128x128 buffers=2/2
+[sanity a4w4 situv2] kernel: logits_diff=3.5109e-06 rel_l2=2.6499e-03 (gate<0.01, ref_norm=7.7469e+05)
+[kernel-bench a4w4 situv2] gemm1: us = 72.89, FLOPS = 22548578304, TFLOPS = 309.34, Bandwidth = 18092.94 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 36.83, FLOPS = 11274289152, TFLOPS = 306.13, Bandwidth = 18607.46 GB/s
+
+===== tokens=512 =====
+[aiter] grouped CSV config selected token=512 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x128x128 tile2=16x128x128 buffers=2/2
+[sanity a4w4 situv2] kernel: logits_diff=3.5192e-06 rel_l2=2.6530e-03 (gate<0.01, ref_norm=1.0960e+06)
+[kernel-bench a4w4 situv2] gemm1: us = 72.12, FLOPS = 45097156608, TFLOPS = 625.30, Bandwidth = 18406.25 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 39.19, FLOPS = 22548578304, TFLOPS = 575.33, Bandwidth = 18255.82 GB/s
+
+===== tokens=1024 =====
+[aiter] grouped CSV config selected token=1024 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=32x256x128 tile2=32x256x128 buffers=2/2
+[sanity a4w4 situv2] kernel: logits_diff=3.5172e-06 rel_l2=2.6523e-03 (gate<0.01, ref_norm=1.5499e+06)
+[kernel-bench a4w4 situv2] gemm1: us = 79.07, FLOPS = 90194313216, TFLOPS = 1140.73, Bandwidth = 17007.46 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 45.29, FLOPS = 45097156608, TFLOPS = 995.67, Bandwidth = 17130.15 GB/s
+
+===== tokens=2048 =====
+[aiter] grouped CSV config selected token=2048 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=64x256x128 tile2=64x512x256 buffers=3/3
+[sanity a4w4 situv2] kernel: logits_diff=3.5144e-06 rel_l2=2.6512e-03 (gate<0.01, ref_norm=2.1918e+06)
+[kernel-bench a4w4 situv2] gemm1: us = 84.97, FLOPS = 180388626432, TFLOPS = 2122.94, Bandwidth = 16232.19 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 57.11, FLOPS = 90194313216, TFLOPS = 1579.26, Bandwidth = 15700.13 GB/s
+
+===== tokens=4096 =====
+[aiter] grouped CSV config selected token=4096 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=64x256x128 tile2=64x256x128 buffers=3/3
+[sanity a4w4 situv2] kernel: logits_diff=3.5137e-06 rel_l2=2.6509e-03 (gate<0.01, ref_norm=3.1001e+06)
+[kernel-bench a4w4 situv2] gemm1: us = 152.52, FLOPS = 360777252864, TFLOPS = 2365.38, Bandwidth = 9495.86 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 112.60, FLOPS = 180388626432, TFLOPS = 1601.97, Bandwidth = 10108.22 GB/s
+
+===== tokens=8192 =====
+[aiter] grouped CSV config selected token=8192 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=64x256x128 tile2=64x256x128 buffers=3/3
+Memory access fault by GPU node-2 (Agent handle: 0x199dc8d0) on address 0x202000. Reason: Page not present or supervisor privilege.

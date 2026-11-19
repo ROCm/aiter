@@ -1,0 +1,153 @@
+[
+  {
+    "token": 1,
+    "selected": "main",
+    "totals_us": {
+      "main": 7.28851,
+      "n256": 9.03937,
+      "n512": 9.08971
+    },
+    "screen_speedup_pct": 0.0
+  },
+  {
+    "token": 2,
+    "selected": "main",
+    "totals_us": {
+      "main": 9.550699999999999,
+      "n256": 9.817969999999999,
+      "n512": 9.7031
+    },
+    "screen_speedup_pct": 0.0
+  },
+  {
+    "token": 4,
+    "selected": "main",
+    "totals_us": {
+      "main": 10.90083,
+      "n256": 11.917159999999999,
+      "n512": 11.849730000000001
+    },
+    "screen_speedup_pct": 0.0
+  },
+  {
+    "token": 8,
+    "selected": "main",
+    "totals_us": {
+      "main": 15.31987,
+      "n256": 18.7152,
+      "n512": 18.84628
+    },
+    "screen_speedup_pct": 0.0
+  },
+  {
+    "token": 16,
+    "selected": "main",
+    "totals_us": {
+      "main": 34.8458,
+      "n256": 38.6567,
+      "n512": 39.3472
+    },
+    "screen_speedup_pct": 0.0
+  },
+  {
+    "token": 32,
+    "selected": "main",
+    "totals_us": {
+      "main": 62.6034,
+      "n256": 67.6255,
+      "n512": 70.3198
+    },
+    "screen_speedup_pct": 0.0
+  },
+  {
+    "token": 64,
+    "selected": "main",
+    "totals_us": {
+      "main": 110.78110000000001,
+      "n256": 111.8708,
+      "n512": 110.8827
+    },
+    "screen_speedup_pct": 0.0
+  },
+  {
+    "token": 128,
+    "selected": "main",
+    "totals_us": {
+      "main": 107.95080000000002,
+      "n256": 109.9177,
+      "n512": 109.384
+    },
+    "screen_speedup_pct": 0.0
+  },
+  {
+    "token": 256,
+    "selected": "main",
+    "totals_us": {
+      "main": 110.8013,
+      "n256": 110.5421,
+      "n512": 114.35050000000001
+    },
+    "screen_speedup_pct": 0.0
+  },
+  {
+    "token": 512,
+    "selected": "main",
+    "totals_us": {
+      "main": 112.39580000000001,
+      "n256": 112.0883,
+      "n512": 112.3819
+    },
+    "screen_speedup_pct": 0.0
+  },
+  {
+    "token": 1024,
+    "selected": "n256",
+    "totals_us": {
+      "main": 130.47629999999998,
+      "n256": 123.57939999999999,
+      "n512": 123.9276
+    },
+    "screen_speedup_pct": 5.580946338952919
+  },
+  {
+    "token": 2048,
+    "selected": "n512",
+    "totals_us": {
+      "main": 146.211,
+      "n256": 148.0503,
+      "n512": 141.8145
+    },
+    "screen_speedup_pct": 3.100176639201213
+  },
+  {
+    "token": 4096,
+    "selected": "main",
+    "totals_us": {
+      "main": 265.382,
+      "n256": 288.111,
+      "n512": 276.444
+    },
+    "screen_speedup_pct": 0.0
+  },
+  {
+    "token": 8192,
+    "selected": "main",
+    "totals_us": {
+      "main": 364.095,
+      "n256": 364.573,
+      "n512": 342.705
+    },
+    "screen_speedup_pct": 6.241519674355511,
+    "reason": "N512 copied configuration hit GPU memory-access faults in verification and isolated retry; retain main."
+  },
+  {
+    "token": 16384,
+    "selected": "main",
+    "totals_us": {
+      "main": 542.705,
+      "n256": 542.27,
+      "n512": 577.435
+    },
+    "screen_speedup_pct": 0.0
+  }
+]

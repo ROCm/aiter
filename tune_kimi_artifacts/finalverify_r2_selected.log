@@ -1,0 +1,125 @@
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+No KFD PIDs currently running
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] import [module_aiter_core] under /app/aiter/aiter/jit/module_aiter_core.so
+[aiter] grouped GEMM data format: a4w4
+
+===== tokens=1 =====
+[aiter] import [module_moe_asm] under /app/aiter/aiter/jit/module_moe_asm.so
+[aiter] type hints mismatch, override to --> topk_softmax(topk_weights: aiter_tensor_t, topk_indices: aiter_tensor_t, token_expert_indices: aiter_tensor_t, gating_output: aiter_tensor_t, softmax_workspace: aiter_tensor_t, need_renorm: bool, num_shared_experts: int = 0, shared_expert_scoring_func: str = '') -> None
+[aiter] grouped CSV config selected token=1 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x64x128 tile2=16x64x128 buffers=4/3
+/usr/local/lib/python3.12/dist-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+[W1119 20:48:41.864060655 collection.cpp:1148] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+[sanity a4w4 situv2] kernel: logits_diff=3.2373e-06 rel_l2=2.5446e-03 (gate<0.01, ref_norm=4.8579e+04)
+[kernel-bench a4w4 situv2] gemm1: us = 4.54, FLOPS = 88080384, TFLOPS = 19.41, Bandwidth = 5164.42 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 3.31, FLOPS = 44040192, TFLOPS = 13.29, Bandwidth = 3564.79 GB/s
+
+===== tokens=2 =====
+[aiter] grouped CSV config selected token=2 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x128x512 tile2=16x512x128 buffers=4/2
+[sanity a4w4 situv2] kernel: logits_diff=3.3429e-06 rel_l2=2.5857e-03 (gate<0.01, ref_norm=6.8413e+04)
+[kernel-bench a4w4 situv2] gemm1: us = 5.82, FLOPS = 176160768, TFLOPS = 30.27, Bandwidth = 8051.84 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 4.48, FLOPS = 88080384, TFLOPS = 19.67, Bandwidth = 5277.11 GB/s
+
+===== tokens=4 =====
+[aiter] grouped CSV config selected token=4 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x128x512 tile2=16x256x128 buffers=3/2
+[sanity a4w4 situv2] kernel: logits_diff=3.4271e-06 rel_l2=2.6181e-03 (gate<0.01, ref_norm=9.7096e+04)
+[kernel-bench a4w4 situv2] gemm1: us = 7.65, FLOPS = 352321536, TFLOPS = 46.07, Bandwidth = 12254.40 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 5.33, FLOPS = 176160768, TFLOPS = 33.04, Bandwidth = 8863.48 GB/s
+
+===== tokens=8 =====
+[aiter] grouped CSV config selected token=8 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x64x512 tile2=16x64x128 buffers=2/2
+[sanity a4w4 situv2] kernel: logits_diff=3.4303e-06 rel_l2=2.6193e-03 (gate<0.01, ref_norm=1.3733e+05)
+[kernel-bench a4w4 situv2] gemm1: us = 9.46, FLOPS = 704643072, TFLOPS = 74.51, Bandwidth = 19819.53 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 6.42, FLOPS = 352321536, TFLOPS = 54.84, Bandwidth = 14714.22 GB/s
+
+===== tokens=16 =====
+[aiter] grouped CSV config selected token=16 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x384x128 tile2=16x128x128 buffers=4/2
+[sanity a4w4 situv2] kernel: logits_diff=3.3939e-06 rel_l2=2.6053e-03 (gate<0.01, ref_norm=1.9483e+05)
+[kernel-bench a4w4 situv2] gemm1: us = 22.69, FLOPS = 1409286144, TFLOPS = 62.10, Bandwidth = 16519.90 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 12.55, FLOPS = 704643072, TFLOPS = 56.15, Bandwidth = 15066.19 GB/s
+
+===== tokens=32 =====
+[aiter] grouped CSV config selected token=32 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x128x128 tile2=16x64x128 buffers=2/3
+[sanity a4w4 situv2] kernel: logits_diff=3.4680e-06 rel_l2=2.6336e-03 (gate<0.01, ref_norm=2.7439e+05)
+[kernel-bench a4w4 situv2] gemm1: us = 41.52, FLOPS = 2818572288, TFLOPS = 67.89, Bandwidth = 18059.89 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 20.56, FLOPS = 1409286144, TFLOPS = 68.55, Bandwidth = 18393.49 GB/s
+
+===== tokens=64 =====
+[aiter] grouped CSV config selected token=64 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x384x128 tile2=16x64x128 buffers=2/3
+[sanity a4w4 situv2] kernel: logits_diff=3.5121e-06 rel_l2=2.6503e-03 (gate<0.01, ref_norm=3.8812e+05)
+[kernel-bench a4w4 situv2] gemm1: us = 75.43, FLOPS = 5637144576, TFLOPS = 74.73, Bandwidth = 17397.32 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 36.13, FLOPS = 2818572288, TFLOPS = 78.01, Bandwidth = 18341.19 GB/s
+
+===== tokens=128 =====
+[aiter] grouped CSV config selected token=128 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x128x128 tile2=16x128x128 buffers=3/2
+[sanity a4w4 situv2] kernel: logits_diff=3.5038e-06 rel_l2=2.6472e-03 (gate<0.01, ref_norm=5.4856e+05)
+[kernel-bench a4w4 situv2] gemm1: us = 72.29, FLOPS = 11274289152, TFLOPS = 155.96, Bandwidth = 18183.77 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 36.81, FLOPS = 5637144576, TFLOPS = 153.14, Bandwidth = 18206.85 GB/s
+
+===== tokens=256 =====
+[aiter] grouped CSV config selected token=256 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x256x128 tile2=16x128x128 buffers=2/2
+[sanity a4w4 situv2] kernel: logits_diff=3.5109e-06 rel_l2=2.6499e-03 (gate<0.01, ref_norm=7.7469e+05)
+[kernel-bench a4w4 situv2] gemm1: us = 72.68, FLOPS = 22548578304, TFLOPS = 310.24, Bandwidth = 18145.18 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 37.09, FLOPS = 11274289152, TFLOPS = 303.99, Bandwidth = 18477.45 GB/s
+
+===== tokens=512 =====
+[aiter] grouped CSV config selected token=512 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=16x128x128 tile2=16x128x128 buffers=2/2
+[sanity a4w4 situv2] kernel: logits_diff=3.5192e-06 rel_l2=2.6530e-03 (gate<0.01, ref_norm=1.0960e+06)
+[kernel-bench a4w4 situv2] gemm1: us = 73.10, FLOPS = 45097156608, TFLOPS = 616.96, Bandwidth = 18160.65 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 39.10, FLOPS = 22548578304, TFLOPS = 576.73, Bandwidth = 18300.35 GB/s
+
+===== tokens=1024 =====
+[aiter] grouped CSV config selected token=1024 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=32x256x128 tile2=32x256x128 buffers=2/2
+[sanity a4w4 situv2] kernel: logits_diff=3.5172e-06 rel_l2=2.6523e-03 (gate<0.01, ref_norm=1.5499e+06)
+[kernel-bench a4w4 situv2] gemm1: us = 79.62, FLOPS = 90194313216, TFLOPS = 1132.80, Bandwidth = 16889.23 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 43.98, FLOPS = 45097156608, TFLOPS = 1025.38, Bandwidth = 17641.31 GB/s
+
+===== tokens=2048 =====
+[aiter] grouped CSV config selected token=2048 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=64x256x128 tile2=64x512x256 buffers=3/3
+[sanity a4w4 situv2] kernel: logits_diff=3.5144e-06 rel_l2=2.6512e-03 (gate<0.01, ref_norm=2.1918e+06)
+[kernel-bench a4w4 situv2] gemm1: us = 85.05, FLOPS = 180388626432, TFLOPS = 2121.00, Bandwidth = 16217.42 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 57.04, FLOPS = 90194313216, TFLOPS = 1581.36, Bandwidth = 15721.01 GB/s
+
+===== tokens=4096 =====
+[aiter] grouped CSV config selected token=4096 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=64x256x128 tile2=64x256x128 buffers=3/3
+[sanity a4w4 situv2] kernel: logits_diff=3.5137e-06 rel_l2=2.6509e-03 (gate<0.01, ref_norm=3.1001e+06)
+[kernel-bench a4w4 situv2] gemm1: us = 152.50, FLOPS = 360777252864, TFLOPS = 2365.79, Bandwidth = 9497.50 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 112.96, FLOPS = 180388626432, TFLOPS = 1596.87, Bandwidth = 10076.03 GB/s
+
+===== tokens=8192 =====
+[aiter] grouped CSV config selected token=8192 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=64x256x128 tile2=64x256x128 buffers=3/3
+[sanity a4w4 situv2] kernel: logits_diff=3.5139e-06 rel_l2=2.6510e-03 (gate<0.01, ref_norm=4.3839e+06)
+[kernel-bench a4w4 situv2] gemm1: us = 199.51, FLOPS = 721554505728, TFLOPS = 3616.56, Bandwidth = 7951.79 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 163.37, FLOPS = 360777252864, TFLOPS = 2208.31, Bandwidth = 9924.33 GB/s
+
+===== tokens=16384 =====
+[aiter] grouped CSV config selected token=16384 model_dim=3584 inter_dim=384 experts=896 topk=16 ep_fused=0 tile=128x256x256 tile2=128x128x128 buffers=3/3
+[sanity a4w4 situv2] kernel: logits_diff=3.5140e-06 rel_l2=2.6510e-03 (gate<0.01, ref_norm=6.2004e+06)
+[kernel-bench a4w4 situv2] gemm1: us = 242.28, FLOPS = 1443109011456, TFLOPS = 5956.31, Bandwidth = 7688.53 GB/s
+[kernel-bench a4w4 situv2] gemm2: us = 296.91, FLOPS = 721554505728, TFLOPS = 2430.20, Bandwidth = 8715.13 GB/s
+
+[precision summary]
+| data_format   | act    | data_init   | scale_init   |   seed |   experts |   shared_experts |   tokens |   topk |   model_dim |   inter_dim |   logits_diff |     rel_l2 | pass   | us   |   gemm1_us |   gemm2_us |   gemm1_TFLOPS |   gemm1_Bandwidth (GB/s) |   gemm2_TFLOPS |   gemm2_Bandwidth (GB/s) |
+|:--------------|:-------|:------------|:-------------|-------:|----------:|-----------------:|---------:|-------:|------------:|------------:|--------------:|-----------:|:-------|:-----|-----------:|-----------:|---------------:|-------------------------:|---------------:|-------------------------:|
+| a4w4          | situv2 | uniform     | uniform      |      0 |       896 |                0 |        1 |     16 |        3584 |         384 |   3.23726e-06 | 0.00254456 | True   |      |    4.53683 |    3.31468 |        19.4145 |                  5164.42 |        13.2864 |                  3564.79 |
+| a4w4          | situv2 | uniform     | uniform      |      0 |       896 |                0 |        2 |     16 |        3584 |         384 |   3.34289e-06 | 0.00258573 | True   |      |    5.81981 |    4.47826 |        30.2692 |                  8051.84 |        19.6684 |                  5277.11 |
+| a4w4          | situv2 | uniform     | uniform      |      0 |       896 |                0 |        4 |     16 |        3584 |         384 |   3.42707e-06 | 0.00261809 | True   |      |    7.64789 |    5.3325  |        46.0678 |                 12254.4  |        33.0353 |                  8863.48 |
+| a4w4          | situv2 | uniform     | uniform      |      0 |       896 |                0 |        8 |     16 |        3584 |         384 |   3.43034e-06 | 0.0026193  | True   |      |    9.45737 |    6.42433 |        74.5073 |                 19819.5  |        54.8418 |                 14714.2  |
+| a4w4          | situv2 | uniform     | uniform      |      0 |       896 |                0 |       16 |     16 |        3584 |         384 |   3.39394e-06 | 0.00260534 | True   |      |   22.6927  |   12.5485  |        62.1031 |                 16519.9  |        56.1536 |                 15066.2  |
+| a4w4          | situv2 | uniform     | uniform      |      0 |       896 |                0 |       32 |     16 |        3584 |         384 |   3.46801e-06 | 0.00263361 | True   |      |   41.5153  |   20.5571  |        67.8923 |                 18059.9  |        68.5549 |                 18393.5  |
+| a4w4          | situv2 | uniform     | uniform      |      0 |       896 |                0 |       64 |     16 |        3584 |         384 |   3.51208e-06 | 0.0026503  | True   |      |   75.4343  |   36.1289  |        74.7292 |                 17397.3  |        78.0144 |                 18341.2  |
+| a4w4          | situv2 | uniform     | uniform      |      0 |       896 |                0 |      128 |     16 |        3584 |         384 |   3.50376e-06 | 0.00264716 | True   |      |   72.2904  |   36.8101  |       155.958  |                 18183.8  |       153.141  |                 18206.8  |
+| a4w4          | situv2 | uniform     | uniform      |      0 |       896 |                0 |      256 |     16 |        3584 |         384 |   3.51088e-06 | 0.00264985 | True   |      |   72.6821  |   37.0881  |       310.236  |                 18145.2  |       303.987  |                 18477.5  |
+| a4w4          | situv2 | uniform     | uniform      |      0 |       896 |                0 |      512 |     16 |        3584 |         384 |   3.5192e-06  | 0.00265299 | True   |      |   73.0956  |   39.097   |       616.961  |                 18160.6  |       576.734  |                 18300.3  |
+| a4w4          | situv2 | uniform     | uniform      |      0 |       896 |                0 |     1024 |     16 |        3584 |         384 |   3.51723e-06 | 0.00265225 | True   |      |   79.6207  |   43.9809  |      1132.8    |                 16889.2  |      1025.38   |                 17641.3  |
+| a4w4          | situv2 | uniform     | uniform      |      0 |       896 |                0 |     2048 |     16 |        3584 |         384 |   3.51435e-06 | 0.00265117 | True   |      |   85.0487  |   57.036   |      2121      |                 16217.4  |      1581.36   |                 15721    |
+| a4w4          | situv2 | uniform     | uniform      |      0 |       896 |                0 |     4096 |     16 |        3584 |         384 |   3.5137e-06  | 0.00265092 | True   |      |  152.498   |  112.964   |      2365.79   |                  9497.5  |      1596.87   |                 10076    |
+| a4w4          | situv2 | uniform     | uniform      |      0 |       896 |                0 |     8192 |     16 |        3584 |         384 |   3.51391e-06 | 0.002651   | True   |      |  199.514   |  163.372   |      3616.56   |                  7951.79 |      2208.31   |                  9924.33 |
+| a4w4          | situv2 | uniform     | uniform      |      0 |       896 |                0 |    16384 |     16 |        3584 |         384 |   3.51396e-06 | 0.00265102 | True   |      |  242.283   |  296.912   |      5956.31   |                  7688.53 |      2430.2    |                  8715.13 |
