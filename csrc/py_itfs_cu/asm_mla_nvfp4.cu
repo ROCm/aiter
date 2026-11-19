@@ -58,7 +58,7 @@ int device(const aiter_tensor_t* q)
 void arch()
 {
     AITER_CHECK(get_gpu_arch() == "gfx1250", "R1 NVFP4 MLA requires gfx1250 B0+");
-    require_gfx1250_asm_or_throw("mla_nvfp4_n128");
+    require_gfx1250_asm_or_throw("mla_a4w4_qh128_1tg_32mx4_64nx1_r1_np");
 }
 int64_t cache(const aiter_tensor_t* cn, const aiter_tensor_t* ca, int dev)
 {
@@ -116,8 +116,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     if(b == 0)
         return;
     static SynchronizedCache<int, AiterAsmKernel> kernels;
-    auto& kernel = kernels.get_or_create(
-        dev, [] { return AiterAsmKernel("mla_nvfp4_n128", "mla_nvfp4/mla_nvfp4_n128.co"); });
+    auto& kernel = kernels.get_or_create(dev, [] {
+        return AiterAsmKernel("mla_a4w4_qh128_1tg_32mx4_64nx1_r1_np",
+                              "mla/mla_a4w4_qh128_1tg_32mx4_64nx1_r1_np.co");
+    });
     MlaNvfp4Args args{qn->data_ptr(),
                       qa->data_ptr(),
                       cn->data_ptr(),

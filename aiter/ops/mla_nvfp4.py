@@ -19,7 +19,8 @@ G_KV = 89.6
 G_P = 2688.0
 
 
-@compile_ops("module_mla_nvfp4", ffi_type="ctypes")
+# v5 loads the CO from the shared MLA directory; do not reuse old JIT loaders.
+@compile_ops("module_mla_nvfp4_v5", ffi_type="ctypes")
 def mla_nvfp4_asm_fwd(
     q_nope: torch.Tensor,
     q_aux: torch.Tensor,
@@ -34,13 +35,13 @@ def mla_nvfp4_asm_fwd(
 ) -> None: ...
 
 
-@compile_ops("module_mla_nvfp4", ffi_type="ctypes")
+@compile_ops("module_mla_nvfp4_v5", ffi_type="ctypes")
 def _mla_nvfp4_quantize_q(
     q: torch.Tensor, q_nope: torch.Tensor, q_aux: torch.Tensor
 ) -> None: ...
 
 
-@compile_ops("module_mla_nvfp4", ffi_type="ctypes")
+@compile_ops("module_mla_nvfp4_v5", ffi_type="ctypes")
 def _mla_nvfp4_update_cache(
     tiles: torch.Tensor,
     page_ids: torch.Tensor,
@@ -52,7 +53,7 @@ def _mla_nvfp4_update_cache(
 
 
 def prepare_mla_nvfp4_params(
-    *, device, physical_pages: int, sm_scale: float, rebase_threshold: float = 1.0
+    *, device, physical_pages: int, sm_scale: float, rebase_threshold: float = 6.0
 ) -> torch.Tensor:
     """Create the immutable int32[4] ABI bit buffer before graph capture.
 
@@ -68,8 +69,8 @@ def prepare_mla_nvfp4_params(
         raise ValueError("physical_pages must be an integer in [1, INT32_MAX]")
     if not math.isfinite(sm_scale):
         raise ValueError("sm_scale must be finite")
-    if rebase_threshold not in (0.0, 1.0, 6.0):
-        raise ValueError("rebase_threshold must be 0, 1 or 6; use 1 by default")
+    if rebase_threshold != 6.0:
+        raise ValueError("rebase_threshold must be 6 for the N128 decoder")
     device = torch.device(device)
     if device.type != "cuda":
         raise ValueError("params must be prepared on a GPU device")
@@ -172,6 +173,7 @@ def mla_nvfp4_update_cache(
     old FP4. No other stream/request may concurrently write the same tile.
     Publish page lengths/CSR after this operation on the same stream or event.
     This function does not own a tail ring, page allocator or prefix copy-on-write.
+    AUX always uses the N16 token-brick layout consumed by the N128 decoder.
     """
     _mla_nvfp4_update_cache(tiles, page_ids, tile_ids, valid_tokens, kv_nope, kv_aux)
 

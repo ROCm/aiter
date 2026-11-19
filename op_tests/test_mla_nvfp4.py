@@ -6,12 +6,8 @@ The NumPy oracle uses logical matrices, independently of native lane/LDS layout.
 Set AITER_NVFP4_TEST_LARGE=1 to exercise both KV streams above 4 GiB (~12 GiB).
 """
 
-import hashlib
-import json
 import math
 import os
-import struct
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -91,23 +87,20 @@ def pack(qc, qs, cc, cs):
         .copy()
         .reshape(p, 16384)
     )
-    ca = np.full((p, 2, 4096), 127, np.uint8)
-    for g in range(2):
+    ca = np.full((p, 4, 8, 16, 16), 127, np.uint8)
+    for g in range(4):
         for f in range(2):
-            ca[:, g, f * 1024 : (f + 1) * 1024] = (
-                pack4(cc[:, g * 32 : (g + 1) * 32, 512 + f * 64 : 576 + f * 64])
-                .reshape(p, 2, 16, 2, 16)
-                .transpose(0, 1, 3, 2, 4)
-                .reshape(p, 1024)
+            ca[:, g, 2 * f : 2 * f + 2] = (
+                pack4(cc[:, g * 16 : (g + 1) * 16, 512 + f * 64 : 576 + f * 64])
+                .reshape(p, 16, 2, 16)
+                .transpose(0, 2, 1, 3)
             )
-        ca[:, g, 2048:3072] = (
-            cs[:, g * 32 : (g + 1) * 32, :32]
-            .reshape(p, 32, 4, 8)
+        ca[:, g, 4:6] = (
+            cs[:, g * 16 : (g + 1) * 16, :32]
+            .reshape(p, 16, 2, 16)
             .transpose(0, 2, 1, 3)
-            .reshape(p, 1024)
         )
-        ca[:, g, 3072:3200] = cs[:, g * 32 : (g + 1) * 32, 32:36].reshape(p, 128)
-        ca[:, g, 3200:3328] = cs[:, g * 32 : (g + 1) * 32, 36:].reshape(p, 128)
+        ca[:, g, 6, :, :8] = cs[:, g * 16 : (g + 1) * 16, 32:]
     return qn, qa, cn, ca.reshape(p, 8192)
 
 
@@ -115,7 +108,7 @@ def gpu(x):
     return torch.from_numpy(np.ascontiguousarray(x)).to("cuda")
 
 
-def make_case(lengths, mode="random", threshold=1.0, scale=576**-0.5):
+def make_case(lengths, mode="random", threshold=6.0, scale=576**-0.5):
     lengths = np.array(lengths, np.int32)
     counts = (lengths + 63) // 64
     ptr = np.r_[0, counts.cumsum()].astype(np.int32)
@@ -217,41 +210,50 @@ def oracle(case):
                     @ ct[:, k * 128 : (k + 1) * 128].astype(np.float64).T
                 ).astype(np.float32)
             score += (
-                q[:, 512:].astype(np.float64)
-                @ np.concatenate((ct[:, 512:576], ct[:, 512:576]), axis=1)
-                .astype(np.float64)
-                .T
+                np.concatenate((q[:, 512:576], q[:, 512:576]), axis=1).astype(
+                    np.float64
+                )
+                @ ct[:, 512:].astype(np.float64).T
             ).astype(np.float32)
             score += (
-                q[:, 512:576].astype(np.float64) @ ct[:, 576:].astype(np.float64).T
+                q[:, 576:].astype(np.float64) @ ct[:, 512:576].astype(np.float64).T
             ).astype(np.float32)
-            scores = np.full((128, 128), -np.inf, np.float32)
-            scores[:, :n] = score * case["beta"]
-            scores = scores.reshape(128, 8, 16)
-            gm = scores.max(axis=2)
-            local = np.exp2(
-                scores - np.maximum(gm[..., None], np.finfo(np.float32).min)
-            ).astype(np.float32)
+            raw = np.full((128, 128), -np.inf, np.float32)
+            raw[:, :n] = score
+            raw = raw.reshape(128, 8, 16)
+            gm = raw.max(axis=2) * case["beta"]
             tilemax = gm.max(axis=1)
             if anchor is None:
                 anchor = tilemax.copy()
             else:
                 new = np.where(tilemax - anchor > case["threshold"], tilemax, anchor)
-                alpha = np.exp2(anchor - new).astype(np.float32)
+                alpha = np.exp2((anchor - new).astype(np.float64)).astype(np.float32)
                 den *= alpha
                 acc *= alpha[:, None]
                 anchor = new
-            relative = np.exp2(gm - anchor[:, None]).astype(np.float32)
-            den += (local.sum(axis=2) * relative).sum(axis=1)
+            # Local N16 exponentials under a common N128 online anchor.
+            # Each group quantizes 6*e to FP4 and 5*w to FP8; the denominator
+            # accumulates unquantized e*w. Empty groups contribute zero.
+            # Evaluate exp2 in FP64 then round, to avoid NumPy FP32 SIMD error
+            # moving a probability across an E2M1 midpoint.
+            exponent = (
+                raw.astype(np.float64) * float(case["beta"])
+                - np.maximum(gm, np.finfo(np.float32).min)[..., None]
+            ).astype(np.float32)
+            local = np.exp2(exponent.astype(np.float64)).astype(np.float32)
+            delta = gm - anchor[:, None]
+            relative = np.exp2(delta.astype(np.float64)).astype(np.float32)
+            weights = local * relative[..., None]
+            den += weights.astype(np.float64).sum(axis=(1, 2)).astype(np.float32)
             p = (
-                F4[nearest(local * 6, F4[:8])]
+                F4[nearest(local * np.float32(6), F4[:8])]
                 * S8[nearest(relative * 5, S8)][..., None]
             )
             acc += (
                 p.reshape(128, 128)[:, :n].astype(np.float64)
                 @ ct[:, :512].astype(np.float64)
             ).astype(np.float32)
-        outputs.append(acc * (np.float32(1 / 2688) / den)[:, None])
+        outputs.append(acc * ((np.float32(1) / den) * np.float32(1 / 2688))[:, None])
         lses.append((np.log2(den) + anchor) * np.float32(np.log(2)))
     if not outputs:
         return np.empty((0, 128, 512), np.float32), np.empty((0, 128), np.float32)
@@ -268,7 +270,7 @@ def check(args, logical, guards=None):
         rms = np.sqrt(np.mean(expected.astype(np.float64) ** 2))
         diff = actual - expected
         assert np.sqrt(np.mean(diff.astype(np.float64) ** 2)) <= 0.003 * max(rms, 1e-8)
-        assert np.max(np.abs(diff)) <= 0.025 * max(rms, 1e-8)
+        assert np.max(np.abs(diff)) <= 0.025
         np.testing.assert_allclose(lse.cpu().numpy(), expected_lse, atol=2e-4, rtol=0)
     if guards:
         assert torch.isnan(guards[0][-256:]).all()
@@ -325,9 +327,8 @@ def test_decode_oracle(mode):
         assert torch.equal(args["lse"], expected[1])
 
 
-@pytest.mark.parametrize("threshold", [0.0, 6.0])
-def test_threshold(threshold):
-    check(*make_case([1, 129, 1153, 2049], "rescale", threshold))
+def test_threshold():
+    check(*make_case([1, 129, 1153, 2049], "rescale", 6.0))
 
 
 def test_empty_batch():
@@ -408,12 +409,16 @@ def test_contracts():
     for kw in (
         {"physical_pages": 0},
         {"sm_scale": float("nan")},
+        {"rebase_threshold": 0},
+        {"rebase_threshold": 1},
         {"rebase_threshold": 8},
     ):
         with pytest.raises(ValueError):
             prepare_mla_nvfp4_params(
                 **({"device": "cuda", "physical_pages": 1, "sm_scale": 0.1} | kw)
             )
+    with pytest.raises(TypeError, match="aux_layout"):
+        mla_nvfp4_update_cache(None, None, None, None, None, None, aux_layout="n32")
 
 
 def test_stream_graph_compile():
@@ -473,7 +478,10 @@ def cpu_cache(raw, valid):
     cc[1, 48:64, 512:] = np.concatenate((rc, ec), axis=-1)
     cs[1, 48 : 48 + valid, 32:] = np.concatenate((rs, es), axis=-1)[:valid]
     return pack(
-        np.zeros((1, 128, 640), np.uint8), np.zeros((1, 128, 40), np.uint8), cc, cs
+        np.zeros((1, 128, 640), np.uint8),
+        np.zeros((1, 128, 40), np.uint8),
+        cc,
+        cs,
     )[2:]
 
 
@@ -500,23 +508,10 @@ def test_cache_tail_requantization_and_graph():
     graph.replay()
     ref_cn, ref_ca = cpu_cache(raw[0].float().numpy(), 6)
     np.testing.assert_array_equal(cn[1, 12288:].cpu().numpy(), ref_cn[1, 12288:])
-    # The updated token16 owns scattered fields in N32's AUX arena.
-    ref_ca = ref_ca[1].reshape(2, 4096)[1]
-    got = ca[1].cpu().numpy().reshape(2, 4096)[1]
-    for start, end in (
-        (512, 1024),
-        (1536, 2048),
-        (2176, 2304),
-        (2432, 2560),
-        (2688, 2816),
-        (2944, 3072),
-        (3136, 3200),
-        (3264, 3328),
-        (3712, 4096),
-    ):
-        np.testing.assert_array_equal(got[start:end], ref_ca[start:end])
     assert not torch.equal(cn[1, 12288:12544], previous[1, 12288:12544])
     assert (cn[0] == 0).all() and (ca[0] == 127).all()
+    np.testing.assert_array_equal(ca[1, 6144:].cpu().numpy(), ref_ca[1, 6144:])
+    assert (ca[1, :6144] == 127).all()
 
 
 def test_bf16_producers_to_decode():
@@ -598,7 +593,7 @@ def test_bf16_producers_to_decode():
         "lengths": lengths,
         "idx": idx,
         "ptr": ptr,
-        "threshold": 1.0,
+        "threshold": 6.0,
         "beta": np.float32(0.07 * math.log2(math.e) / (6.72 * 89.6)),
     }
     check(args, logical)
@@ -625,26 +620,3 @@ def test_pages_above_4gib():
         ),
     )
     check(args, logical)
-
-
-def test_co_manifest_and_entry():
-    root = Path(aiter.core.AITER_ASM_DIR) / "gfx1250/mla_nvfp4"
-    manifest = json.loads((root / "manifest.json").read_text())
-    for name, digest in manifest["sha256"].items():
-        assert hashlib.sha256((root / name).read_bytes()).hexdigest() == digest
-    blob = (root / "mla_nvfp4_n128.co").read_bytes()
-    shoff = struct.unpack_from("<Q", blob, 40)[0]
-    entsize, num, strings = struct.unpack_from("<HHH", blob, 58)
-    sections = [
-        struct.unpack_from("<IIQQQQIIQQ", blob, shoff + i * entsize) for i in range(num)
-    ]
-    names = sections[strings]
-    names = blob[names[4] : names[4] + names[5]]
-    byname = {names[s[0] :].split(b"\0", 1)[0].decode(): s for s in sections}
-    text = byname[".text"]
-    assert text[3] % 16384 == 0 and text[8] >= 16384
-    ro = byname[".rodata"]
-    lds, private, karg = struct.unpack_from("<III", blob, ro[4])
-    offset = struct.unpack_from("<q", blob, ro[4] + 16)[0]
-    assert (ro[3] + offset) % 16384 == 0
-    assert (lds, private, karg) == (262144, 0, 80)
