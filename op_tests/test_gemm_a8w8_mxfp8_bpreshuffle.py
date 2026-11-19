@@ -143,12 +143,8 @@ def test_gfx1250_smallm_1x32_changed_input_graph_replay(kernel_name):
     m, n, k = 64, 256, 1024
     x = (torch.randn((m, k), device="cuda") * 2).to(dtypes.fp8)
     weight = (torch.randn((n, k), device="cuda") * 2).to(dtypes.fp8)
-    x_scale_u8 = torch.randint(
-        124, 131, (m, k // 32), dtype=torch.uint8, device="cuda"
-    )
-    w_scale_u8 = torch.randint(
-        124, 131, (n, k // 32), dtype=torch.uint8, device="cuda"
-    )
+    x_scale_u8 = torch.randint(124, 131, (m, k // 32), dtype=torch.uint8, device="cuda")
+    w_scale_u8 = torch.randint(124, 131, (n, k // 32), dtype=torch.uint8, device="cuda")
     x_scale = x_scale_u8.view(dtypes.fp8_e8m0)
     w_scale = w_scale_u8.view(dtypes.fp8_e8m0)
     shuffled_weight = shuffle_weight(weight, layout=(16, 16))
@@ -167,9 +163,9 @@ def test_gfx1250_smallm_1x32_changed_input_graph_replay(kernel_name):
 
     def error_ratio(reference):
         return 1.0 - float(
-            torch.isclose(
-                out.float(), reference.float(), atol=0.01, rtol=0.01
-            ).float().mean()
+            torch.isclose(out.float(), reference.float(), atol=0.01, rtol=0.01)
+            .float()
+            .mean()
         )
 
     launch()
@@ -181,9 +177,7 @@ def test_gfx1250_smallm_1x32_changed_input_graph_replay(kernel_name):
         launch()
     x.copy_((torch.randn_like(x.float()) * 1.5).to(dtypes.fp8))
     x_scale_u8.copy_(
-        torch.randint(
-            123, 130, x_scale_u8.shape, dtype=torch.uint8, device="cuda"
-        )
+        torch.randint(123, 130, x_scale_u8.shape, dtype=torch.uint8, device="cuda")
     )
     out.fill_(float("nan"))
     graph.replay()

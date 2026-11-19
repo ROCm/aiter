@@ -312,9 +312,7 @@ def launch_gemm_a8w8(
         split_idx = bid_z
         logical_bid_y = bid_y
         kt_base = fx.Int64(split_idx) * fx.Int64(K_TILES) if split_k > 1 else None
-        kt_base_i32 = (
-            fx.Int32(split_idx) * fx.Int32(K_TILES) if split_k > 1 else None
-        )
+        kt_base_i32 = fx.Int32(split_idx) * fx.Int32(K_TILES) if split_k > 1 else None
         bz64 = fx.Int64(bid_z) if const_expr(batched) else None
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
         lane = tid % WAVE
@@ -782,14 +780,8 @@ def launch_gemm_a8w8(
         def _load_state(buf, sbuf, cur_kt, ks):
             wt = [_rmem(16, load_b(buf, wn, ks)) for wn in range_constexpr(wmma_n_rep)]
             if const_expr(is_mxscale):
-                sb_k = [
-                    load_sb(buf, sbuf, wn, ks)
-                    for wn in range_constexpr(sb_loads)
-                ]
-                sa_k = [
-                    load_sa(buf, sbuf, wm, ks)
-                    for wm in range_constexpr(sa_loads)
-                ]
+                sb_k = [load_sb(buf, sbuf, wn, ks) for wn in range_constexpr(sb_loads)]
+                sa_k = [load_sa(buf, sbuf, wm, ks) for wm in range_constexpr(sa_loads)]
                 return wt, sb_k, sa_k
             return wt, None, None
 
@@ -820,9 +812,7 @@ def launch_gemm_a8w8(
             for ks in range_constexpr(K_WS):
                 nxt_ks = ks + 1 if const_expr(ks + 1 < K_WS) else None
                 pk = prefetch_kt if const_expr(ks == 0) else None
-                state = _kstep(
-                    buf, sbuf, cur_kt, ks, state, nxt_ks, prefetch_kt=pk
-                )
+                state = _kstep(buf, sbuf, cur_kt, ks, state, nxt_ks, prefetch_kt=pk)
             _fr, _bk = front_wm * wmma_n_rep, len(_BACK) * wmma_n_rep
             for _ks in range_constexpr(K_WS):
                 rocdl.sched_dsrd((_BS_DS if _ks == 0 else 0) + front_wm * DS_A)
@@ -867,14 +857,8 @@ def launch_gemm_a8w8(
         def _load_scales(buf, sbuf, cur_kt, ks):
             if const_expr(is_mxscale):
                 return (
-                    [
-                        load_sb(buf, sbuf, wn, ks)
-                        for wn in range_constexpr(sb_loads)
-                    ],
-                    [
-                        load_sa(buf, sbuf, wm, ks)
-                        for wm in range_constexpr(sa_loads)
-                    ],
+                    [load_sb(buf, sbuf, wn, ks) for wn in range_constexpr(sb_loads)],
+                    [load_sa(buf, sbuf, wm, ks) for wm in range_constexpr(sa_loads)],
                 )
             return None, None
 
@@ -1002,9 +986,7 @@ def launch_gemm_a8w8(
             pbuf = _buf_ptr(s)
             buf = _bidx(pbuf)
             pipeline_fence(outstanding=(num_buffers - 2), use_cluster=False)
-            compute_ktile(
-                buf, _scale_buf(pbuf, kt), kt, kt + (num_buffers - 1)
-            )
+            compute_ktile(buf, _scale_buf(pbuf, kt), kt, kt + (num_buffers - 1))
             if const_expr(use_cluster) and kt % num_buffers == num_buffers - 1:
                 cluster.cluster_barrier()
         scale_regs = None
@@ -1039,9 +1021,9 @@ def launch_gemm_a8w8(
                     fx.grid_dim.x * fx.grid_dim.y * split_k * tile_elems * 4
                 ),
             )
-            split_vec_base = (
-                fx.Int64(flat_tile) * split_k + fx.Int64(split_idx)
-            ) * (tile_elems // vec)
+            split_vec_base = (fx.Int64(flat_tile) * split_k + fx.Int64(split_idx)) * (
+                tile_elems // vec
+            )
             for ai in range_constexpr(n_acc):
                 value = Vec(accs[ai])
                 for half in range_constexpr(2):
@@ -1073,8 +1055,7 @@ def launch_gemm_a8w8(
                     for half in range_constexpr(2):
                         total = buf_copy_load(
                             workspace,
-                            (fx.Int64(flat_tile) * split_k)
-                            * (tile_elems // vec)
+                            (fx.Int64(flat_tile) * split_k) * (tile_elems // vec)
                             + (ai * block + tid) * 2
                             + half,
                             fx.Float32,

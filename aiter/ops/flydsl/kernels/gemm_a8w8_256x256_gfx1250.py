@@ -106,19 +106,19 @@ def launch_gemm_a8w8_256x256(
     assert (
         persistent_n_tiles == 1 or split_k == 1
     ), "persistent_n_tiles>1 requires split_k=1"
-    assert not (early_a or early_b) or split_k == 1, (
-        "early A/B merge currently requires split_k=1"
-    )
+    assert (
+        not (early_a or early_b) or split_k == 1
+    ), "early A/B merge currently requires split_k=1"
     cluster_splitk = fused_splitk and split_k > 1
     assert not fused_splitk or (
         split_k > 1 and tile_m % split_k == 0
     ), "a fused split-K epilogue needs split_k > 1 dividing tile_m"
-    assert not fused_splitk or tile_m & (tile_m - 1) == 0, (
-        "the fused split-K row rotation needs a power-of-two tile_m"
-    )
-    assert not fused_splitk or (m_warp * n_warp * 32) % (tile_n // 4) == 0, (
-        "the fused split-K row schedule needs whole rows per wavegroup"
-    )
+    assert (
+        not fused_splitk or tile_m & (tile_m - 1) == 0
+    ), "the fused split-K row rotation needs a power-of-two tile_m"
+    assert (
+        not fused_splitk or (m_warp * n_warp * 32) % (tile_n // 4) == 0
+    ), "the fused split-K row schedule needs whole rows per wavegroup"
     cluster_k = split_k if cluster_splitk else 1
     assert (
         cluster_m * cluster_n * cluster_k <= 16

@@ -528,8 +528,7 @@ def test_gfx1250_compute_catalog_exposes_cluster_local_splitk():
         and not catalog.is_small_kernel(instance)
     ]
     assert [instance.name for instance in generic_fused] == [
-        "flydsl_mxfp8_128_bpreshuffle_wmma_"
-        "t16x32x512_mw1_nw2_nb2_sk4_cm1_cn1_fsk"
+        "flydsl_mxfp8_128_bpreshuffle_wmma_t16x32x512_mw1_nw2_nb2_sk4_cm1_cn1_fsk"
     ]
     assert all(instance.m_warp * instance.n_warp >= 2 for instance in generic_fused)
     parsed = direct.parse_mxfp8_32_wmma_kernel_name(

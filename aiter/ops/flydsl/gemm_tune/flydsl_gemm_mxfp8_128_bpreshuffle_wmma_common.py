@@ -12,10 +12,10 @@ from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     COMPUTE_WMMA_NAME_PREFIX as COMPUTE_NAME_PREFIX,
 )
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
-    WMMA_NAME_PREFIX as NAME_PREFIX,
+    MX32_SMALL_WMMA_NAME_PREFIX as SMALL_NAME_PREFIX,
 )
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
-    MX32_SMALL_WMMA_NAME_PREFIX as SMALL_NAME_PREFIX,
+    WMMA_NAME_PREFIX as NAME_PREFIX,
 )
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     cluster_m_grid_ok,

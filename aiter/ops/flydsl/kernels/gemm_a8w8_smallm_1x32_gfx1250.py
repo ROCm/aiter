@@ -66,9 +66,9 @@ def launch_gemm_a8w8_smallm_1x32(
         (128, 4),
     ), f"unsupported tile/wave pair {tile_n}/{num_waves}"
     assert split_k in (1, 2, 4, 8), f"split_k must be 1/2/4/8, got {split_k}"
-    assert tile_n in SUPPORTED_TILE_N, (
-        f"tile_n must be one of {SUPPORTED_TILE_N}, got {tile_n}"
-    )
+    assert (
+        tile_n in SUPPORTED_TILE_N
+    ), f"tile_n must be one of {SUPPORTED_TILE_N}, got {tile_n}"
     block = num_waves * WAVE
     n_rep = (tile_n // 16) // num_waves
 
@@ -238,9 +238,8 @@ def launch_gemm_a8w8_smallm_1x32(
 
         def load_scale_a(global_k_tile):
             # Four consecutive E8M0 K/32 scales are one WMMA scale word.
-            index = (
-                fx.Int64(block_m + lane16) * fx.Int64(k_scale_words)
-                + fx.Int64(global_k_tile)
+            index = fx.Int64(block_m + lane16) * fx.Int64(k_scale_words) + fx.Int64(
+                global_k_tile
             )
             return fx.Int32(fx.ptr_load(scale_a_i32 + index))
 
@@ -309,16 +308,14 @@ def launch_gemm_a8w8_smallm_1x32(
         out = fx.recast_iter(fx.BFloat16, arg_c)
 
         def fragment_position(local_n):
-            column = (
-                wave * (n_rep * 16) + local_n * 16 + k_group * 8
-            )
+            column = wave * (n_rep * 16) + local_n * 16 + k_group * 8
             return lane16, column
 
         if const_expr(split_k == 1):
             for local_n in range_constexpr(n_rep):
                 row, column = fragment_position(local_n)
-                output_offset = (
-                    fx.Int64(block_m + row) * ldc64 + fx.Int64(block_n + column)
+                output_offset = fx.Int64(block_m + row) * ldc64 + fx.Int64(
+                    block_n + column
                 )
                 fx.ptr_store(
                     accumulators[local_n].load().to(fx.BFloat16),
@@ -328,8 +325,8 @@ def launch_gemm_a8w8_smallm_1x32(
             workspace = fx.recast_iter(fx.Float32, arg_workspace)
             tile_index = bid_m * (i32_n // tile_n) + bid_n
             partial_base = (
-                (fx.Int64(tile_index) * split_k + fx.Int64(k_rank)) * tile_elems
-            )
+                fx.Int64(tile_index) * split_k + fx.Int64(k_rank)
+            ) * tile_elems
             for local_n in range_constexpr(n_rep):
                 row, column = fragment_position(local_n)
                 fx.ptr_store(
@@ -352,15 +349,11 @@ def launch_gemm_a8w8_smallm_1x32(
                     )
                     for rank in range_constexpr(1, split_k):
                         total = total + fx.ptr_load(
-                            workspace
-                            + tile_base
-                            + rank * tile_elems
-                            + offset,
+                            workspace + tile_base + rank * tile_elems + offset,
                             result_type=T.vec(8, T.f32),
                         )
-                    output_offset = (
-                        fx.Int64(block_m + row) * ldc64
-                        + fx.Int64(block_n + column)
+                    output_offset = fx.Int64(block_m + row) * ldc64 + fx.Int64(
+                        block_n + column
                     )
                     fx.ptr_store(total.to(fx.BFloat16), out + output_offset)
 
@@ -376,11 +369,7 @@ def launch_gemm_a8w8_smallm_1x32(
         i32_k,
         i32_lda,
         i32_ldc,
-        value_attrs={
-            "rocdl.cluster_dims": (
-                f"1,1,{split_k}" if split_k > 1 else None
-            )
-        },
+        value_attrs={"rocdl.cluster_dims": (f"1,1,{split_k}" if split_k > 1 else None)},
     ).launch(
         grid=(i32_m // TILE_M, i32_n // tile_n, split_k),
         block=(block, 1, 1),
