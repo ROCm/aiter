@@ -10,6 +10,7 @@ import argparse
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import pandas as pd
 
@@ -32,6 +33,69 @@ class TestFlydslA8w8BpreshuffleCandidates(unittest.TestCase):
             any(ki.use_async_copy for ki in kernels_list_950.values()),
             "gfx950 supports async copy and must keep those tuning candidates",
         )
+
+    def test_int8_4wave_pipeline_follows_the_existing_pipelines(self):
+        from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+            PIPELINES,
+        )
+
+        self.assertEqual(
+            [pipeline.name for pipeline in PIPELINES],
+            ["preshuffle", "8wave", "int8_4wave"],
+        )
+        ids = [set(pipeline.kernels_list) for pipeline in PIPELINES]
+        self.assertFalse(ids[0] & ids[1] or ids[0] & ids[2] or ids[1] & ids[2])
+
+    def test_generic_int8_candidates_are_named_for_replay(self):
+        from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
+            kernel_name_for_quant_dtype,
+            kernels_list_950,
+        )
+
+        generic = next(iter(kernels_list_950.values()))
+        self.assertIn("_I8_I8_", kernel_name_for_quant_dtype(generic, "int8"))
+
+    def test_int8_4wave_candidates_encode_k_topology_and_persistence(self):
+        from aiter.ops.flydsl.gemm_tune import (
+            flydsl_gemm_a8w8_bpreshuffle_common as common,
+        )
+
+        def candidates(cu_num, m, n, k):
+            common.ensure_int8_4wave_candidates(cu_num, k)
+            return [
+                (kernel_id, kernel)
+                for kernel_id, kernel in common.kernels_list_int8_4wave.items()
+                if kernel.cu_num == cu_num
+                and common.kernel_fits_shape_int8_4wave(kernel, m, n, k)
+            ]
+
+        with mock.patch.object(common, "get_gfx", return_value="gfx950"):
+            square = candidates(256, 9450, 5120, 5120)
+            self.assertEqual({i for i, _ in square}, {1_000_044, 1_000_045})
+            self.assertEqual({ki.persistent for _, ki in square}, {False, True})
+            self.assertTrue(all(ki.num_xcds == 8 for _, ki in square))
+            self.assertTrue(all("_k5120" in ki.name for _, ki in square))
+
+            long_k = candidates(256, 9450, 5120, 13824)
+            self.assertEqual({i for i, _ in long_k}, {1_000_046, 1_000_047})
+
+            small_grid = candidates(256, 512, 5120, 5120)
+            self.assertEqual([ki.persistent for _, ki in small_grid], [False])
+
+            for cu_num, num_xcds in ((96, 3), (128, 4), (160, 5)):
+                topology = candidates(cu_num, 9450, 5120, 5120)
+                self.assertEqual(len(topology), 2)
+                self.assertTrue(all(ki.num_xcds == num_xcds for _, ki in topology))
+                self.assertTrue(
+                    all(ki.name.endswith(f"_xcd{num_xcds}") for _, ki in topology)
+                )
+
+            for k in (1024, 8192):
+                self.assertEqual(
+                    sorted(ki.k for _, ki in candidates(256, 9450, 5120, k)), [k, k]
+                )
+            self.assertEqual(candidates(256, 9450, 5119, 5120), [])
+            self.assertEqual(candidates(256, 9450, 5120, 128), [])
 
 
 class _StubTuner:

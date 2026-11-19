@@ -47,11 +47,21 @@ inline bool sparse_arch_supported()
                      "the running device is ",          \
                 get_gpu_arch())
 
-#define SPARSE_DECODE_DISPATCH(H, W)                                          \
-    if(num_idx_heads == (H) && num_waves == (W))                              \
-    {                                                                         \
-        aiter::sparse_attn::SPARSE_DECODE_FN(H, W)(SPARSE_SCORE_DECODE_ARGS); \
-        return;                                                               \
+constexpr int kSparseNvfp4PageBytes =
+    aiter::sparse_attn::nvfp4_page<SPARSE_BLOCK_SIZE, SPARSE_HEAD_DIM>::kBytes;
+
+#define SPARSE_CHECK_NVFP4_PAGE(pass)                 \
+    AITER_CHECK(page_stride >= kSparseNvfp4PageBytes, \
+                pass ": nvfp4 page_stride ",          \
+                page_stride,                          \
+                " < page bytes ",                     \
+                kSparseNvfp4PageBytes)
+
+#define SPARSE_DECODE_DISPATCH(K, H, Q, W)                                          \
+    if(kv_fmt == (K) && num_idx_heads == (H) && q_tiles == (Q) && num_waves == (W)) \
+    {                                                                               \
+        aiter::sparse_attn::SPARSE_DECODE_FN(K, H, Q, W)(SPARSE_SCORE_DECODE_ARGS); \
+        return;                                                                     \
     }
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(pa_sparse_block_score_decode,
@@ -75,6 +85,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(pa_sparse_block_score_decode,
                                      int head_dim,
                                      int num_idx_heads,
                                      int num_waves,
+                                     int kv_fmt,
+                                     int page_stride,
+                                     int q_tiles,
+                                     int req_xor_mask,
+                                     int fill_shift,
                                      hipStream_t stream),
                                     (q_idx_ptr,
                                      key_cache_idx_ptr,
@@ -96,11 +111,25 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(pa_sparse_block_score_decode,
                                      head_dim,
                                      num_idx_heads,
                                      num_waves,
+                                     kv_fmt,
+                                     page_stride,
+                                     q_tiles,
+                                     req_xor_mask,
+                                     fill_shift,
                                      stream))
 {
     SPARSE_CHECK_ARCH("pa_sparse_block_score_decode");
     SPARSE_CHECK_SHAPE("pa_sparse_block_score_decode");
     SPARSE_CHECK_SHARD("pa_sparse_block_score_decode");
+    if(kv_fmt == aiter::sparse_attn::kKvNvfp4)
+    {
+        SPARSE_CHECK_NVFP4_PAGE("pa_sparse_block_score_decode");
+    }
+    AITER_CHECK(fill_shift >= 0 && fill_shift <= 31 && req_xor_mask >= 0,
+                "pa_sparse_block_score_decode: fill_shift=",
+                fill_shift,
+                " req_xor_mask=",
+                req_xor_mask);
 
     const auto* q_idx         = reinterpret_cast<const uint8_t*>(q_idx_ptr);
     const auto* key_cache_idx = reinterpret_cast<const uint8_t*>(key_cache_idx_ptr);
@@ -111,8 +140,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(pa_sparse_block_score_decode,
     SPARSE_DECODE_TABLE(SPARSE_DECODE_DISPATCH)
 
     AITER_CHECK(false,
-                "pa_sparse_block_score_decode: no build for num_idx_heads=",
+                "pa_sparse_block_score_decode: no build for kv_fmt=",
+                kv_fmt,
+                " num_idx_heads=",
                 num_idx_heads,
+                " q_tiles=",
+                q_tiles,
                 " num_waves=",
                 num_waves);
 }
@@ -192,6 +225,110 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(pa_sparse_block_score_prefill,
                 num_idx_heads,
                 " q_tiles=",
                 q_tiles);
+}
+
+// num_q_groups counts groups of 4 * 16 * wave_tiles rows. See
+// nvfp4_prefill_args for the rest.
+AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(pa_sparse_block_score_prefill_nvfp4,
+                                    (size_t q_idx_ptr,
+                                     size_t key_cache_idx_ptr,
+                                     size_t score_ptr,
+                                     size_t block_table_ptr,
+                                     size_t cu_seqlens_q_ptr,
+                                     size_t seq_lens_ptr,
+                                     int num_reqs,
+                                     int num_q_groups,
+                                     int block_table_stride,
+                                     int score_head_stride,
+                                     int score_num_stride,
+                                     int num_chunks,
+                                     int chunk_blocks,
+                                     int init_blocks,
+                                     int local_blocks,
+                                     int page_stride,
+                                     int num_idx_heads,
+                                     int wave_tiles,
+                                     int store_pages,
+                                     int group_xor,
+                                     int req_rot,
+                                     int xcds,
+                                     int req_chunks,
+                                     int grid_chunks,
+                                     hipStream_t stream),
+                                    (q_idx_ptr,
+                                     key_cache_idx_ptr,
+                                     score_ptr,
+                                     block_table_ptr,
+                                     cu_seqlens_q_ptr,
+                                     seq_lens_ptr,
+                                     num_reqs,
+                                     num_q_groups,
+                                     block_table_stride,
+                                     score_head_stride,
+                                     score_num_stride,
+                                     num_chunks,
+                                     chunk_blocks,
+                                     init_blocks,
+                                     local_blocks,
+                                     page_stride,
+                                     num_idx_heads,
+                                     wave_tiles,
+                                     store_pages,
+                                     group_xor,
+                                     req_rot,
+                                     xcds,
+                                     req_chunks,
+                                     grid_chunks,
+                                     stream))
+{
+    SPARSE_CHECK_ARCH("pa_sparse_block_score_prefill_nvfp4");
+    SPARSE_CHECK_NVFP4_PAGE("pa_sparse_block_score_prefill_nvfp4");
+    AITER_CHECK(
+        (num_idx_heads == 1 || num_idx_heads == 2 || num_idx_heads == 4) &&
+            ((wave_tiles == 2 && num_idx_heads <= 2) || wave_tiles == 4 || wave_tiles == 8) &&
+            (store_pages == 1 || (store_pages == 2 && wave_tiles == 8)),
+        "pa_sparse_block_score_prefill_nvfp4: no build for num_idx_heads=",
+        num_idx_heads,
+        " wave_tiles=",
+        wave_tiles,
+        " store_pages=",
+        store_pages);
+    AITER_CHECK(group_xor >= 0 && group_xor < 256 && (num_q_groups & group_xor) == 0 &&
+                    ((group_xor + 1) & group_xor) == 0 && xcds >= 0 && xcds < 256,
+                "pa_sparse_block_score_prefill_nvfp4: group_xor=",
+                group_xor,
+                " num_q_groups=",
+                num_q_groups,
+                " xcds=",
+                xcds);
+
+    const aiter::sparse_attn::nvfp4_prefill_args a{page_stride,
+                                                   num_idx_heads,
+                                                   wave_tiles,
+                                                   store_pages,
+                                                   group_xor,
+                                                   req_rot,
+                                                   xcds,
+                                                   req_chunks,
+                                                   grid_chunks};
+    aiter::sparse_attn::sparse_score_prefill_nvfp4(
+        reinterpret_cast<const uint8_t*>(q_idx_ptr),
+        reinterpret_cast<const uint8_t*>(key_cache_idx_ptr),
+        reinterpret_cast<float*>(score_ptr),
+        reinterpret_cast<const int*>(block_table_ptr),
+        reinterpret_cast<const int*>(cu_seqlens_q_ptr),
+        reinterpret_cast<const int*>(seq_lens_ptr),
+        num_reqs,
+        num_q_groups,
+        block_table_stride,
+        score_head_stride,
+        score_num_stride,
+        num_chunks,
+        chunk_blocks,
+        init_blocks,
+        local_blocks,
+        stream,
+        a);
 }
 
 // ---------------------------------------------------------------------------
