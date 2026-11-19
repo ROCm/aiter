@@ -633,13 +633,12 @@ def test_fused_rope_concat_and_cache_mla(
             raise AssertionError(
                 "fused_qk_concat_and_cache_mla differs from cos 1, sin 0 RoPE"
             )
-    # Positions past a short cos/sin cache must use its last row. In the
-    # padded early-return case only the valid prefix has a reference value.
-    q_checked_max_abs = float((q_out_chk - ref_q_out_chk).abs().max().item())
-    if max_position < num_tokens and max(err_kv, q_checked_max_abs) > 0.05:
+    # Positions past a short cos/sin cache must use its last row. err_q_out
+    # already covers only the rows that have a reference value.
+    if max_position < num_tokens and max(err_kv, err_q_out) > 0.05:
         raise AssertionError(
             f"positions not clamped to a {max_position}-row cos/sin cache: "
-            f"kv_err={err_kv}, q_err={q_checked_max_abs}"
+            f"kv_err={err_kv}, q_err={err_q_out}"
         )
     ret["fused_qk_us"] = avg_us
     ret["num_valid"] = num_valid
