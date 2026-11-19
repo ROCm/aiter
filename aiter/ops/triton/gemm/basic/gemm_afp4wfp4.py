@@ -393,6 +393,10 @@ def gemm_afp4wfp4_preshuffled_scales(
     w = w.T
 
     assert M >= 32, f"M >= 32 is required, but got {M=}"
+    # The shuffled scale mask keeps only valid k-groups for whole 256-element k-chunks.
+    assert (
+        2 * K % 256 == 0
+    ), f"preshuffled scales require K % 256 == 0 (K//32 a multiple of 8), got K={2 * K}"
 
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)

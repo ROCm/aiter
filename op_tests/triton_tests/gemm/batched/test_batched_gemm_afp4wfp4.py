@@ -1,5 +1,6 @@
 import pytest
 import torch
+import triton
 
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_afp4wfp4 import (
     _get_config,
@@ -256,6 +257,10 @@ def test_batched_gemm_afp4_wfp4_masked_k_tail_ignores_stale_lds(M: int):
 
     B, N, K, dtype = 4, 512, 320, torch.bfloat16
     config, _ = _get_config(M, N, K // 2)
+    if arch_info.get_arch() == "gfx950":
+        # The masked tail is reached before every pipeline stage has written LDS.
+        assert config["NUM_KSPLIT"] == 1
+        assert 2 <= triton.cdiv(K, config["BLOCK_SIZE_K"]) <= config["num_stages"]
     # Same config on an even K (no masked lanes) with all-0xFF operands: e8m0 NaN
     # scales fill the LDS buffers that the masked tail of the real GEMM maps to.
     Bp, Mp, Kp = 16, 512, 3 * config["BLOCK_SIZE_K"]
@@ -277,5 +282,5 @@ def test_batched_gemm_afp4_wfp4_masked_k_tail_ignores_stale_lds(M: int):
         batched_gemm_afp4wfp4(
             nan_x, nan_w, nan_x_scales, nan_w_scales, dtype, nan_out, nan_config
         )
-        batched_gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out)
+        batched_gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out, dict(config))
         torch.testing.assert_close(torch_out, out)

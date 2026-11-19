@@ -193,9 +193,10 @@ def _batched_gemm_a16wfp4_kernel(
                 # OOB scale bytes are not guaranteed to be zero, and 0xFF is NaN
                 # in e8m0, which dot_scaled propagates even where the masked-off
                 # data is zero. Mask them with 0, not 127: the data there is 0, so
-                # any finite scale works, and on gfx950 the pipelined loop's async
-                # copies to LDS fill masked-off lanes only with 0. With 127 those
-                # lanes keep stale LDS, which can hold 0xFF.
+                # any finite scale works, and some Triton builds on gfx950 (fixed
+                # upstream in triton-lang/triton#11256) apply only a zero `other`
+                # on async copies to LDS. With 127 those lanes keep stale LDS,
+                # which can hold 0xFF.
                 scale_mask = offs_scale_k[None, :] < (
                     2 * K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
                 )

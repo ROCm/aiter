@@ -151,9 +151,9 @@ def _gemm_afp4wfp4_kernel(
             # OOB scales could contain 0xFF (NaN in e8m0) which propagates
             # through dot_scaled even when the corresponding data is zero.
             # Masked scales are 0, not 127: the data there is 0, so any finite
-            # scale works, and on gfx950 the pipelined loop's async copies to LDS
-            # fill masked-off lanes only with 0. With 127 those lanes keep stale
-            # LDS, which can hold 0xFF.
+            # scale works, and some Triton builds on gfx950 (fixed upstream in
+            # triton-lang/triton#11256) apply only a zero `other` on async copies
+            # to LDS. With 127 those lanes keep stale LDS, which can hold 0xFF.
             if EVEN_K:
                 a_scales = tl.load(a_scale_ptrs)
                 b_scales = tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
