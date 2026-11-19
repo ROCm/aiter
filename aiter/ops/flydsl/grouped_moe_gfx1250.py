@@ -845,7 +845,21 @@ def _grouped_a8w4_tdm_moe(
                 and _fused_sh == _sh_bf16
                 and (shared is None or _sh_bf16)
             )
-            if _fusable and fused_topk_route_quant_supported(
+            _pre = _deferred.prepared
+            if (
+                _pre is not None
+                and _fusable
+                and not _fused_sh
+                and _quant_mode_early == "fp4"
+                and _pre[0] == (int(_align_m), int(contiguous_m), int(wmma_rep))
+                and _pre[1][0].data_ptr() == topk_weight.data_ptr()
+                and _pre[1][1].data_ptr() == topk_ids.data_ptr()
+                and _same_count(_pre[2], _deferred.num_valid_rows)
+            ):
+                # The router kernel already computed this deferral's top-k, routing and
+                # activation quant (fused_gemm_a16w16_router_shared_expert_topk).
+                _prepared_a1 = _pre[1]
+            elif _fusable and fused_topk_route_quant_supported(
                 _deferred.gating_output,
                 hidden_states,
                 _fused_topk,
@@ -2179,13 +2193,21 @@ class _DeferredTopk:
         "gating_output",
         "num_shared",
         "num_valid_rows",
+        "prepared",
         "renormalize",
         "topk_ids",
         "topk_weights",
     )
 
     def __init__(
-        self, topk_weights, topk_ids, gating_output, renormalize, nvr, num_shared=0
+        self,
+        topk_weights,
+        topk_ids,
+        gating_output,
+        renormalize,
+        nvr,
+        num_shared=0,
+        prepared=None,
     ):
         self.topk_weights = topk_weights
         self.topk_ids = topk_ids
@@ -2193,6 +2215,7 @@ class _DeferredTopk:
         self.renormalize = renormalize
         self.num_valid_rows = nvr
         self.num_shared = num_shared
+        self.prepared = prepared
 
     def resolve(self):
         from aiter import topk_softmax
@@ -2237,6 +2260,7 @@ def defer_topk_softmax(
     renormalize: bool,
     num_valid_rows: torch.Tensor | None = None,
     num_fused_shared_experts: int = 0,
+    prepared=None,
 ) -> None:
     """Leave ``topk_softmax(topk_weights, topk_ids, gating_output,
     renormalize, num_valid_rows=...)`` to the next ``fused_moe`` on these
@@ -2253,6 +2277,11 @@ def defer_topk_softmax(
     plain top-k before it reads the buffers. Nothing may read them in between,
     and the next MoE call (or ``resolve_deferred_topk``) must follow: a
     deferral replaces the previous one only after filling its buffers.
+
+    ``prepared`` (``((align_m, contiguous_m, wmma_rep), routed, num_valid_rows)``):
+    the buffers are already filled and ``routed`` is ``fused_topk_route_quant``'s
+    result for that geometry and row count (the folded router kernel); the decode path uses it in place of the
+    launch when its geometry matches (else the plain top-k refills the buffers).
     """
     resolve_deferred_topk()
     if num_fused_shared_experts not in (0, 1):
@@ -2264,6 +2293,7 @@ def defer_topk_softmax(
         renormalize,
         num_valid_rows,
         num_fused_shared_experts,
+        prepared,
     )
 
 
@@ -2456,6 +2486,18 @@ def fused_topk_route_quant_supported(
     )
 
 
+# (token_num, feat_dim, topk) -> (align_m, contiguous_m, wmma_rep) of the grouped MoE's
+# decode fp4 calls, recorded by fused_topk_route_quant: what a router kernel that computes
+# the routing itself (fused_gemm_a16w16_router_shared_expert_topk) must produce.
+_TOPK_ROUTE_QUANT_GEOMETRY: dict = {}
+
+
+def topk_route_quant_decode_geometry(token_num: int, feat_dim: int, topk: int):
+    """``(align_m, contiguous_m, wmma_rep)`` of this row count's fp4 decode call, once an
+    unfused call has run (e.g. the warmup), else None."""
+    return _TOPK_ROUTE_QUANT_GEOMETRY.get((int(token_num), int(feat_dim), int(topk)))
+
+
 def fused_topk_route_quant(
     gating_output: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -2491,6 +2533,11 @@ def fused_topk_route_quant(
     token_num, feat_dim = hidden_states.shape
     experts = int(gating_output.shape[1]) - int(shared)
     n_out = int(topk) + int(shared)
+    if quant_mode == "fp4" and not shared:
+        _TOPK_ROUTE_QUANT_GEOMETRY.setdefault(
+            (int(token_num), int(feat_dim), int(topk)),
+            (int(align_m), int(contiguous_m), int(wmma_rep)),
+        )
     if topk_weights is None:
         topk_weights = torch.empty(
             (token_num, n_out), dtype=torch.float32, device=device
