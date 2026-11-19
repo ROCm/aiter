@@ -1553,6 +1553,14 @@ class CustomAllreduce:
         self._fly_rms = None
         self._init_fly_rms()
 
+        # Rows a source the gfx1250 DCP merge takes, 0 where it does not run
+        # (see custom_dcp_merge).
+        self._dcp_merge_max_rows = (
+            ops.dcp_merge_max_rows_gfx1250(self._ptr)
+            if self._is_gfx1250 and not self.disabled
+            else 0
+        )
+
     def _init_fly_rms(self):
         """Build the exact FlyDSL fused all-reduce+RMSNorm engine."""
 
@@ -1574,12 +1582,6 @@ class CustomAllreduce:
             rms.close()
             return
         self._fly_rms = rms
-
-        # Rows a source the gfx1250 DCP merge takes, 0 where it does not run
-        # (see custom_dcp_merge).
-        self._dcp_merge_max_rows = (
-            ops.dcp_merge_max_rows_gfx1250(self._ptr) if self._is_gfx1250 else 0
-        )
 
     def _init_fly_oneshot(self):
         """Build the FlyDSL exact one-shot that fronts small plain all-reduces,
@@ -2453,6 +2455,43 @@ class CustomAllreduce:
             gemma_norm,
         )
         return out, res_out
+
+    def lamport_fused_ar_rms_quant(
+        self,
+        inp: torch.Tensor,
+        res_inp: torch.Tensor,
+        w: torch.Tensor,
+        eps: float,
+        gemma_norm: bool = False,
+        emit_bf16: bool = False,
+    ):
+        """lamport_fused_ar_rms with the per-token FP8 quant in the same kernel.
+
+        Returns (out, residual_out, scale), and the bf16/fp16 output with
+        emit_bf16, bit for bit those of custom_fused_ar_rms_quant. Check
+        should_lamport_ar_rms first.
+        """
+        out = torch.empty(inp.shape, dtype=fp8, device=inp.device)
+        res_out = torch.empty_like(inp)
+        scale_out = torch.empty(
+            inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device
+        )
+        bf16_out = torch.empty_like(inp) if emit_bf16 else None
+        ops.fused_allreduce_rmsnorm_quant_lamport_gfx1250(
+            self._ptr,
+            _lamport_aligned(inp),
+            _lamport_aligned(res_inp),
+            res_out,
+            out,
+            scale_out,
+            _lamport_aligned(w),
+            eps,
+            gemma_norm,
+            0 if bf16_out is None else bf16_out.data_ptr(),
+        )
+        if emit_bf16:
+            return out, res_out, scale_out, bf16_out
+        return out, res_out, scale_out
 
     def should_lamport_ar_add(self, inp: torch.Tensor, other: torch.Tensor) -> bool:
         """Whether lamport_ar_add takes this call (gfx1250, IPC transport).
