@@ -81,7 +81,7 @@ an entry and how to invalidate it when a kernel source changes:
 | `CompiledFunction.export_to_c(dir, file_name, function_prefix="")` | Writes `<file_name>.o` and `<file_name>.h`. `dir` must exist. Byte-for-byte deterministic for the same input. |
 | `flydsl.compiler.protocol.cache_signature(jit_arg)` | Documented as "for keying user-managed caches of `flyc.compile` handles". For a torch tensor it gives `(TorchTensorJitArg, dtype, align, use_32bit_stride, shape=(-1,…), stride with the unit axis)`. |
 | `flydsl.compiler.JitArgumentRegistry.get(type(v))` | Returns the JIT-argument constructor `flyc.compile` itself uses, for building `cache_signature`. |
-| `flyc.load_module(path)` | Loads an `export_to_c` object in memory (no system linker), checks its schema and host triple, loads the GPU module on the current device (on another device at its first call there) and returns a `CompiledFunction` whose argument marshalling comes from the ABI in the object metadata. In FlyDSL since 0.5.x (not in the 0.5.0 release); without it every key takes the JIT path. |
+| `flyc.load_module(path)` | Loads an `export_to_c` object in memory (no system linker), checks its schema and host triple, loads the GPU module on the current device (on another device at its first call there) and returns a `CompiledFunction` whose argument marshalling comes from the ABI in the object metadata. In FlyDSL since 0.5.1.dev1058, which aiter pins; with an older FlyDSL every key takes the JIT path. |
 
 The object carries `SYM__metadata`, a JSON with the ABI slots, `arch`,
 `backend`, `flydsl_version`, `host_triple` and `schema_version` (3). Each
@@ -90,7 +90,7 @@ its dynamic shape and stride values; a scalar slot holds its value; the stream
 slot holds a `hipStream_t`.
 
 The APIs above are stable under FlyDSL's `docs/api_stability.md`
-(`flyc.load_module` once it is released). The cache also uses three FlyDSL
+(including `flyc.load_module`). The cache also uses three FlyDSL
 internals, which a FlyDSL release may move or rename without notice:
 
 | internal | use |
