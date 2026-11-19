@@ -475,6 +475,15 @@ __device__ __forceinline__ void storeNvfp4VToken(uint8_t* __restrict__ page,
     }
 }
 
+// The NVFP4 index row layout (kNvIndexRows): index_cache is the e2m1 payload [pages, 128, 64]
+// and `scale` its E4M3 plane [pages, 128, 8], rows contiguous, page strides in bytes.
+struct NvIndexRows
+{
+    uint8_t* scale       = nullptr;
+    int64_t payload_page = 0;
+    int64_t scale_page   = 0;
+};
+
 // ---- NVFP4 row layout (main K/V) -------------------------------------------------------
 // Per (page, kv head) a token-major payload [128 tok x 64 B e2m1] (low nibble = even element)
 // and its scale plane [128 tok x 8 B e4m3], each its own tensor with its own page and head
@@ -483,6 +492,10 @@ __device__ __forceinline__ void storeNvfp4VToken(uint8_t* __restrict__ page,
 // saturating at 448), codes = e2m1(x * (1 / scale)) rounded half to even and saturating at 6,
 // sign from x < 0; every division is IEEE. This is the arithmetic of ATOM's Triton
 // _nvfp4_store_kernel, so the bytes match it. Row `pos` of the page/head base pointers.
+// kSignOfScaled takes a code's sign from x * (1 / scale) rather than x, exactly as that
+// store does (they differ only in a zero-scale block: +0 codes rather than -0 codes, the
+// same values); the index rows use it, K/V keep the x sign.
+template <bool kSignOfScaled = false>
 __device__ __forceinline__ void nvRowStore(uint8_t* __restrict__ payload_row,
                                            uint8_t* __restrict__ scale_row,
                                            const float (&v)[kElemsPerLane],
@@ -506,10 +519,11 @@ __device__ __forceinline__ void nvRowStore(uint8_t* __restrict__ payload_row,
 #pragma unroll
     for(int i = 0; i < kElemsPerLane; ++i)
     {
-        const float a = fabsf(v[i] * inv);
+        const float y = v[i] * inv;
+        const float a = fabsf(y);
         const int mag = (a > 0.25f) + (a >= 0.75f) + (a > 1.25f) + (a >= 1.75f) + (a > 2.5f) +
                         (a >= 3.5f) + (a > 5.0f);
-        code[i] = static_cast<uint32_t>(mag) | (v[i] < 0.0f ? 8u : 0u);
+        code[i] = static_cast<uint32_t>(mag) | ((kSignOfScaled ? y : v[i]) < 0.0f ? 8u : 0u);
     }
     nvStoreRowData(payload_row, lane_id, code);
     if(lane_id % kNvLanesPerGroup == 0)
@@ -561,7 +575,8 @@ template <typename scalar_t,
           bool kKvFp4,
           bool kNvfp4,
           bool kQFp8,
-          bool kNvRows = false>
+          bool kNvRows      = false,
+          bool kNvIndexRows = false>
 __global__ void fusedQKNormIdxrQKNormKernel(
     scalar_t* __restrict__ qkv,
     scalar_t* __restrict__ q_out,
@@ -605,7 +620,9 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     int64_t v_s_token,
     int64_t v_s_head,
     // Main Q as unit-scale e4m3 (kQFp8 only; replaces the q_out row).
-    opus::fp8_t* __restrict__ q_fp8_out)
+    opus::fp8_t* __restrict__ q_fp8_out,
+    // The NVFP4 index rows' scale plane and page strides (kNvIndexRows only).
+    NvIndexRows nv_index)
 {
     // NVFP4 is K, V and index-K pages together: never a fallback to the MXFP4 stores.
     static_assert(!kNvfp4 || (kKvFp4 && kIndexFp4), "kNvfp4 requires kKvFp4 and kIndexFp4");
@@ -614,6 +631,9 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     // K and V) k_s_token (page) and v_s_token (head).
     static_assert(!kNvRows || (kKvFp4 && !kNvfp4 && !kIndexFp4),
                   "kNvRows is the main K/V NVFP4 row layout, without fp4 index pages");
+    // The NVFP4 index row layout comes with the row-layout K/V: index_cache is its payload,
+    // nv_index its scale plane and page strides.
+    static_assert(!kNvIndexRows || kNvRows, "kNvIndexRows requires kNvRows");
     const int warps_per_block = blockDim.x / 32;
     const int lane_id = threadIdx.x % 32;
     const int global_warp_idx = blockIdx.x * warps_per_block + (threadIdx.x / 32);
@@ -883,7 +903,26 @@ __global__ void fusedQKNormIdxrQKNormKernel(
             {
                 if(is_ik)
                 {
-                    if constexpr(kNvfp4)
+                    if constexpr(kNvIndexRows)
+                    {
+                        // Rounded to scalar_t first: the bytes index_fp4_store makes of the
+                        // row "auto" would stage.
+                        float v[kElemsPerLane];
+#pragma unroll
+                        for(int i = 0; i < kElemsPerLane; ++i)
+                        {
+                            v[i] = static_cast<float>(static_cast<scalar_t>(elems[i]));
+                        }
+                        const int64_t page = mapped_slot / kNvTokens;
+                        const int pos      = static_cast<int>(mapped_slot % kNvTokens);
+                        nvRowStore<true>(reinterpret_cast<uint8_t*>(index_cache) +
+                                             page * nv_index.payload_page + pos * (kHeadDim / 2),
+                                         nv_index.scale + page * nv_index.scale_page +
+                                             pos * (kHeadDim / 16),
+                                         v,
+                                         lane_id);
+                    }
+                    else if constexpr(kNvfp4)
                     {
                         storeNvfp4IndexRow<scalar_t>(reinterpret_cast<uint8_t*>(index_cache) +
                                                          (mapped_slot / kNvTokens) * kNvIndexPage,
@@ -1037,7 +1076,8 @@ template <typename scalar_t,
           bool kIndexFp4 = false,
           bool kKvFp4 = false,
           bool kNvfp4 = false,
-          bool kNvRows = false>
+          bool kNvRows = false,
+          bool kNvIndexRows = false>
 void launchFusedQKNormIdxrQKNorm(
     scalar_t* qkv,
     scalar_t* q_out,
@@ -1078,7 +1118,8 @@ void launchFusedQKNormIdxrQKNorm(
     bool static_kv_scale,
     bool asm_layout,
     hipStream_t stream,
-    opus::fp8_t* q_fp8_out = nullptr)
+    opus::fp8_t* q_fp8_out = nullptr,
+    NvIndexRows nv_index   = {})
 {
     const int v_slots = insert_kv ? nkv : 0;
     const int idx_slots = process_index ? niq + 1 : 0;
@@ -1108,7 +1149,8 @@ void launchFusedQKNormIdxrQKNorm(
                                 kKvFp4,                                                      \
                                 kNvfp4,                                                      \
                                 QFP8,                                                        \
-                                kNvRows>                                                     \
+                                kNvRows,                                                     \
+                                kNvIndexRows>                                                \
         <<<grid, kBlockSize, 0, stream>>>(qkv,                                               \
                                           q_out,                                             \
                                           index_q_out,                                       \
@@ -1141,7 +1183,8 @@ void launchFusedQKNormIdxrQKNorm(
                                           v_s_block,                                         \
                                           v_s_token,                                         \
                                           v_s_head,                                          \
-                                          q_fp8_out)
+                                          q_fp8_out,                                         \
+                                          nv_index)
 
 // The e4m3 q_out store is compiled in only where it can run (insert mode), so the other
 // instantiations are unchanged.
@@ -1278,7 +1321,8 @@ static void fused_qknorm_idxrqknorm_impl(
     std::optional<aiter_tensor_t> k_scale,
     std::optional<aiter_tensor_t> v_scale,
     bool asm_layout,
-    bool skip_index_branch)
+    bool skip_index_branch,
+    std::optional<aiter_tensor_t> index_scale)
 {
     using namespace fused_qknorm_idxrqknorm_ops;
 
@@ -1318,7 +1362,11 @@ static void fused_qknorm_idxrqknorm_impl(
                 "kv_cache_k and kv_cache_v must be provided together");
     const bool insert_kv = kv_cache_k.has_value();
     const bool nvfp4_kv_cache    = kv_cache_dtype == "nvfp4";
-    const bool nvfp4_index_cache = index_cache_dtype == "nvfp4";
+    // index_cache_dtype='nvfp4' with index_scale is the NVFP4 index row layout (payload
+    // [num_pages, 128, 64] + E4M3 scales [num_pages, 128, 8], addressed by
+    // index_slot_mapping); without it, the 9216 B index pages of the page layout.
+    const bool nvfp4_index_rows  = index_scale.has_value();
+    const bool nvfp4_index_cache = index_cache_dtype == "nvfp4" && !nvfp4_index_rows;
     // kv_cache_dtype='nvfp4' with byte (uint8 / e4m3) k_scale / v_scale is the NVFP4 row
     // layout: K/V payload [num_pages, num_kv_heads, 128, 64] and scale planes
     // [num_pages, num_kv_heads, 128, 8], with any index cache but an fp4 one. With fp32 global
@@ -1334,8 +1382,14 @@ static void fused_qknorm_idxrqknorm_impl(
                     (nvfp4_kv_cache && skip_index_branch),
                 "kv_cache_dtype='nvfp4' and index_cache_dtype='nvfp4' go together "
                 "(index_cache_dtype may be 'auto' only with skip_index_branch)");
-    AITER_CHECK(!nvfp4_rows || (index_cache_dtype != "nvfp4" && index_cache_dtype != "mxfp4"),
-                "the NVFP4 row-layout K/V cache takes an auto or fp8 index cache");
+    AITER_CHECK(!nvfp4_rows || nvfp4_index_rows ||
+                    (index_cache_dtype != "nvfp4" && index_cache_dtype != "mxfp4"),
+                "the NVFP4 row-layout K/V cache takes an auto, fp8 or row-layout nvfp4 "
+                "(index_scale) index cache");
+    AITER_CHECK(!nvfp4_index_rows || (nvfp4_rows && index_cache_dtype == "nvfp4" &&
+                                      insert_kv && has_index && !skip_index_branch),
+                "index_scale (the NVFP4 index row layout) requires index_cache_dtype='nvfp4' "
+                "with the NVFP4 row-layout K/V (byte k_scale / v_scale) and the index branch");
     const bool fp8_kv_cache =
         insert_kv && kv_cache_dtype.rfind("fp8", 0) == 0;
     const bool fp8_kv_per_token =
@@ -1404,12 +1458,30 @@ static void fused_qknorm_idxrqknorm_impl(
                             index_slot_mapping->size(0) >= num_tokens,
                         "index_slot_mapping must be 1D with at least num_tokens elements");
             AITER_CHECK(index_cache.has_value() && index_cache->is_gpu() &&
-                            index_cache->is_contiguous(),
+                            (nvfp4_index_rows || index_cache->is_contiguous()),
                         "sparse insert mode requires contiguous CUDA index_cache");
             AITER_CHECK(index_cache_dtype == "auto" || index_cache_dtype.rfind("fp8", 0) == 0 ||
-                            fp4_index_cache,
+                            fp4_index_cache || nvfp4_index_rows,
                         "sparse insert mode expects index_cache_dtype='auto', fp8, mxfp4 or nvfp4");
-            if(nvfp4_index_cache)
+            if(nvfp4_index_rows)
+            {
+                // Rows contiguous, pages anywhere (each plane its own stride), on qkv's
+                // device: the same 128 tokens a page as the K/V pool.
+                const aiter_tensor_t& ip = *index_cache;
+                const aiter_tensor_t& is = *index_scale;
+                AITER_CHECK(ip.dtype() == AITER_DTYPE_u8 && ip.dim() == 3 &&
+                                ip.size(1) == kNvTokens && ip.size(2) == kHeadDim / 2 &&
+                                ip.stride(2) == 1 && ip.stride(1) == kHeadDim / 2 &&
+                                (is.dtype() == AITER_DTYPE_u8 || is.dtype() == AITER_DTYPE_fp8) &&
+                                is.is_gpu() && is.dim() == 3 && is.size(0) == ip.size(0) &&
+                                is.size(1) == kNvTokens && is.size(2) == kHeadDim / 16 &&
+                                is.stride(2) == 1 && is.stride(1) == kHeadDim / 16 &&
+                                ip.device_id == qkv.device_id && is.device_id == qkv.device_id,
+                            "nvfp4 row-layout index_cache / index_scale must be uint8 "
+                            "[num_pages, 128, 64] and byte [num_pages, 128, 8] planes with "
+                            "contiguous token rows, on qkv's device");
+            }
+            else if(nvfp4_index_cache)
             {
                 AITER_CHECK(index_cache->dtype() == AITER_DTYPE_u8 &&
                                 index_cache->numel() % kNvIndexPage == 0,
@@ -1547,7 +1619,7 @@ static void fused_qknorm_idxrqknorm_impl(
             // The scale-plane strides ride in the page-128 token-stride slots (unused here).
             k_s_token = k_scale->stride(0);
             v_s_token = k_scale->stride(1);
-            if(process_index)
+            if(process_index && !nvfp4_index_rows)
             {
                 // The index rows are addressed by index_slot_mapping alone (a token-major
                 // staging buffer, say), so the KV pages do not size them. Caller contract, as
@@ -1557,6 +1629,9 @@ static void fused_qknorm_idxrqknorm_impl(
                                 index_cache->numel() % kHeadDim == 0,
                             "index_cache must hold contiguous 128-element rows on qkv's device");
             }
+            // The NVFP4 index rows (checked above) are addressed by index_slot_mapping too:
+            // every non-negative entry is below num_pages * 128 of index_cache (caller
+            // contract, as for the K/V pages).
         }
         else if(nvfp4_kv_cache)
         {
@@ -1771,6 +1846,13 @@ static void fused_qknorm_idxrqknorm_impl(
                                                     : nullptr;
         opus::fp8_t* q_fp8_ptr =
             q_is_fp8 ? reinterpret_cast<opus::fp8_t*>(q_out->data_ptr()) : nullptr;
+        NvIndexRows nv_index{};
+        if(nvfp4_index_rows)
+        {
+            nv_index = {reinterpret_cast<uint8_t*>(index_scale->data_ptr()),
+                        index_cache->stride(0),
+                        index_scale->stride(0)};
+        }
         if(fp4_kv_cache || fp4_index_cache)
         {
             // FP4 (MXFP4/NVFP4) main K/V and/or index K (sparse insert only); the other cache
@@ -1783,9 +1865,10 @@ static void fused_qknorm_idxrqknorm_impl(
                                   bool kIndexFp4,
                                   bool kKvFp4,
                                   bool kNv,
-                                  bool kNvRowsT = false>() {
+                                  bool kNvRowsT      = false,
+                                  bool kNvIndexRowsT = false>() {
                 launchFusedQKNormIdxrQKNorm<T, CacheT, IndexT, kv_dt, index_dt, kIndexFp4, kKvFp4,
-                                            kNv, kNvRowsT>(
+                                            kNv, kNvRowsT, kNvIndexRowsT>(
                     reinterpret_cast<T*>(qkv.data_ptr()),
                     q_ptr,
                     index_q_ptr,
@@ -1828,14 +1911,20 @@ static void fused_qknorm_idxrqknorm_impl(
                     fp8_kv_static,
                     asm_layout,
                     stream,
-                    q_fp8_ptr);
+                    q_fp8_ptr,
+                    nv_index);
             };
             using Dt = vllm::Fp8KVCacheDataType;
             if(nvfp4_rows)
             {
-                // The index cache keeps its type (fp8 or the model dtype); an index-less call
-                // never reads it.
-                if(process_index && fp8_index_cache)
+                // The index cache keeps its type (fp8, the model dtype or NVFP4 rows); an
+                // index-less call never reads it.
+                if(process_index && nvfp4_index_rows)
+                {
+                    launch_fp4.template operator()<uint8_t, uint8_t, Dt::kAuto, Dt::kAuto, false,
+                                                   true, false, true, true>();
+                }
+                else if(process_index && fp8_index_cache)
                 {
                     launch_fp4.template operator()<uint8_t, opus::fp8_t, Dt::kAuto, Dt::kFp8E4M3,
                                                    false, true, false, true>();
@@ -2137,7 +2226,8 @@ void fused_qknorm_idxrqknorm(
     std::optional<aiter_tensor_t> k_scale,
     std::optional<aiter_tensor_t> v_scale,
     bool asm_layout,
-    bool skip_index_branch)
+    bool skip_index_branch,
+    std::optional<aiter_tensor_t> index_scale)
 {
     fused_qknorm_idxrqknorm_impl(qkv,
                                                 q_norm_weight,
@@ -2164,7 +2254,8 @@ void fused_qknorm_idxrqknorm(
                                                 k_scale,
                                                 v_scale,
                                                 asm_layout,
-                                                skip_index_branch);
+                                                skip_index_branch,
+                                                index_scale);
 }
 
 } // namespace aiter

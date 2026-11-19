@@ -27,6 +27,12 @@ x < 0. test_nvfp4_rows checks it byte for byte against the same call with "auto"
 quantized in torch, on payloads and scale planes that are strided fields of one pre-filled
 pool (bytes no token owns must stay); q_out, index q_out and the fp8 / bf16 index cache must
 equal "auto"'s.
+
+index_cache_dtype "nvfp4" with index_scale (with the row-layout K/V): the index key in the
+same row layout, payload [pages, 128, 64] + E4M3 scales [pages, 128, 8] as strided fields of
+one pool, addressed by index_slot_mapping. test_nvfp4_index_rows checks it byte for byte
+against "auto" quantized in torch, a code's sign taken from x * (1 / scale) (MiniMax-M3's
+index_fp4_store in ATOM; a zero-scale block stores +0 codes there, where K/V store -0).
 """
 
 import argparse
@@ -460,19 +466,22 @@ ROW_PAYLOAD = HEAD_DIM // 2  # 64 B of e2m1 per token row
 ROW_SCALES = HEAD_DIM // 16  # 8 E4M3 scale bytes per token row
 
 
-def ref_rows(x: torch.Tensor):
+def ref_rows(x: torch.Tensor, sign_of_scaled: bool = False):
     """Model-dtype rows [..., 128] -> (payload uint8 [..., 64], scale bytes uint8 [..., 8]):
     scale = e4m3(amax / 6) (RNE, at most 448), codes = e2m1(x * (1 / scale)) half to even,
-    sign from x < 0 (a -0.0 element codes as +0)."""
+    sign from x < 0 (a -0.0 element codes as +0); ``sign_of_scaled`` (the index rows): sign
+    from x * (1 / scale)."""
     blocks = x.float().unflatten(-1, (-1, 16))
     scale = (blocks.abs().amax(-1) / 6.0).clamp(max=448.0).to(torch.float8_e4m3fn)
     s = scale.float()
     inv = torch.where(s > 0, 1.0 / s, torch.zeros_like(s))
-    a = (blocks * inv[..., None]).abs()
+    y = blocks * inv[..., None]
+    a = y.abs()
     mag = sum((a > t).int() for t in (0.25, 1.25, 2.5, 5.0)) + sum(
         (a >= t).int() for t in (0.75, 1.75, 3.5)
     )
-    codes = (mag | torch.where(blocks < 0, 8, 0)).flatten(-2).unflatten(-1, (-1, 2))
+    sign = torch.where((y if sign_of_scaled else blocks) < 0, 8, 0)
+    codes = (mag | sign).flatten(-2).unflatten(-1, (-1, 2))
     payload = (codes[..., 0] | (codes[..., 1] << 4)).to(torch.uint8)
     return payload, scale.view(torch.uint8)
 
@@ -604,6 +613,91 @@ def test_nvfp4_rows(num_tokens, num_kv_heads, dtype, index_dtype, scale_dtype, s
     return ret
 
 
+def make_index_rows_pool(pages: int, generator: torch.Generator):
+    """The NVFP4 index rows as two fields of one entry-major pool of random bytes (48 B of
+    pad an entry), as a KV pool binds them: (pool, payload [pages, 128, 64], scales
+    [pages, 128, 8])."""
+    pay, sc = PAGE * ROW_PAYLOAD, PAGE * ROW_SCALES
+    entry = pay + sc + 48
+    pool = torch.randint(
+        0, 256, (pages, entry), dtype=torch.uint8, generator=generator, device="cpu"
+    ).cuda()
+    ip = pool[:, :pay].unflatten(1, (PAGE, ROW_PAYLOAD))
+    isc = pool[:, pay : pay + sc].unflatten(1, (PAGE, ROW_SCALES))
+    return pool, ip, isc
+
+
+@benchmark()
+def test_nvfp4_index_rows(num_tokens, dtype):
+    """The index key in the NVFP4 row layout (index_cache_dtype "nvfp4" + index_scale) with
+    the row-layout K/V: index payload and scales against "auto" + ref_rows(sign_of_scaled),
+    K/V against "auto" + ref_rows, byte for byte over both pools (bytes no live token owns
+    stay); q_out and index q_out equal "auto"'s. Some index keys are scaled near zero (zero-
+    and subnormal-scale blocks); every 17th slot is a pad (-1)."""
+    nkv = 1
+    layer = rows_layer(num_tokens, nkv, dtype)
+    nq, niq = layer["nq"], layer["niq"]
+    ik0 = (nq + 2 * nkv + niq) * HEAD_DIM  # the index key follows q, k, v and index q
+    ik = slice(ik0, ik0 + HEAD_DIM)
+    layer["qkv"][2::5, ik] = (layer["qkv"][2::5, ik].float() * 1e-4).to(dtype)
+    pages = -(-num_tokens // PAGE) + 3
+    slots = torch.randperm(pages * PAGE)[:num_tokens].to(torch.int64)
+    slots[1::17] = -1
+
+    ref_k = torch.zeros(pages, PAGE, nkv, HEAD_DIM, dtype=dtype)
+    ref_v = torch.zeros_like(ref_k)
+    ref_index = torch.zeros(pages * PAGE, HEAD_DIM, dtype=dtype)
+    ref_q = torch.empty(num_tokens, nq * HEAD_DIM, dtype=dtype)
+    ref_iq = torch.empty(num_tokens, niq * HEAD_DIM, dtype=dtype)
+    rows_call(layer, slots, ref_k, ref_v, ref_index, ref_q, ref_iq,
+              kv_cache_dtype="auto", index_cache_dtype="auto")  # fmt: skip
+
+    pool, kp, ks, vp, vs = make_rows_pool(pages, nkv, torch.Generator().manual_seed(5))
+    ipool, ip, isc = make_index_rows_pool(pages, torch.Generator().manual_seed(6))
+    before, ibefore = pool.clone(), ipool.clone()
+    q_out = torch.empty_like(ref_q)
+    iq_out = torch.empty_like(ref_iq)
+    rows_kw = {"kv_cache_dtype": "nvfp4", "k_scale": ks, "v_scale": vs,
+               "index_cache_dtype": "nvfp4", "index_scale": isc}  # fmt: skip
+    rows_call(layer, slots, kp, vp, ip, q_out, iq_out, **rows_kw)
+
+    live = slots >= 0
+    page, pos = slots[live] // PAGE, slots[live] % PAGE
+    want = before.clone()
+    for cache, payload, scales in ((ref_k, kp, ks), (ref_v, vp, vs)):
+        want_p, want_s = ref_rows(cache[page, pos])
+        for t, val in ((payload, want_p), (scales, want_s)):
+            want.as_strided(t.shape, t.stride(), t.storage_offset())[page, :, pos] = val
+    iwant = ibefore.clone()
+    want_p, want_s = ref_rows(ref_index[slots[live]], sign_of_scaled=True)
+    for t, val in ((ip, want_p), (isc, want_s)):
+        iwant.as_strided(t.shape, t.stride(), t.storage_offset())[page, pos] = val
+
+    def exact(a, b, msg):
+        return checkAllclose(
+            a.view(torch.uint8).float(), b.view(torch.uint8).float(), 0, 0, msg=msg
+        )
+
+    ret = {
+        "gfx": get_gfx_runtime(),
+        "kv err": exact(pool, want, "row-layout pool: "),
+        "idx err": exact(ipool, iwant, "index rows pool: "),
+        "q err": max(exact(q_out, ref_q, "q_out: "), exact(iq_out, ref_iq, "iq_out: ")),
+    }
+    _, us = run_perftest(
+        rows_call, layer, slots, kp, vp, ip, q_out, iq_out, qkv=layer["qkv"],
+        **rows_kw, num_iters=50, num_warmup=20,
+    )  # fmt: skip
+    nbytes = (
+        layer["qkv"].nbytes
+        + q_out.nbytes
+        + iq_out.nbytes
+        + num_tokens * (2 * nkv + 1) * (ROW_PAYLOAD + ROW_SCALES)
+    )
+    ret["us"], ret["TB/s"] = us, nbytes / us / 1e6
+    return ret
+
+
 def rows_reject_operands():
     """[args], kwargs of a valid row-layout call (fp8 index, two pages, one kv head)."""
     nkv, n = 1, 4
@@ -643,9 +737,30 @@ ROWS_REJECT = {
     # the C++ refusal on gfx950; elsewhere the wrapper's (an fp4 index is gfx950 only)
     "rows fp4 index": (
         lambda a, kw: kw.update(index_cache_dtype="nvfp4"),
-        "auto or fp8 index cache",
+        "row-layout nvfp4 (index_scale) index cache",
+    ),
+    # the NVFP4 index rows: index_scale with index_cache_dtype "nvfp4" and the index planes
+    "rows good fp4 index rows": (lambda a, kw: _index_rows(a, kw), None),
+    "rows index_scale fp8 index": (
+        lambda a, kw: kw.update(index_scale=_index_rows_pool()[2]),
+        "requires index_cache_dtype='nvfp4'",
+    ),
+    "rows index_scale 4 B": (
+        lambda a, kw: _index_rows(a, kw, isc=_index_rows_pool()[2][:, :, :4]),
+        "byte [num_pages, 128, 8] planes",
     ),
 }
+
+
+def _index_rows_pool():
+    return make_index_rows_pool(2, torch.Generator().manual_seed(2))
+
+
+def _index_rows(a, kw, isc=None):
+    """The valid call with NVFP4 index rows (args[15] is index_cache)."""
+    _, ip, isc0 = _index_rows_pool()
+    a[15] = ip
+    kw.update(index_cache_dtype="nvfp4", index_scale=isc0 if isc is None else isc)
 
 
 def run_rows_reject(name):
@@ -758,6 +873,18 @@ def run_rows(args):
     )
     bad = df[["kv err", "idx err", "q err"]].to_numpy().sum()
     assert bad == 0, "nvfp4 row-layout K/V or q differ from the reference"
+    idx_df = pd.DataFrame(
+        [
+            test_nvfp4_index_rows(t, dtypes.d_dtypes[d])
+            for t, d in itertools.product(args.rows_tokens, args.dtype)
+        ]
+    )
+    aiter.logger.info(
+        "nvfp4 row-layout K/V + index rows vs torch reference (markdown):\n%s",
+        idx_df.round(4).to_markdown(index=False),
+    )
+    bad = idx_df[["kv err", "idx err", "q err"]].to_numpy().sum()
+    assert bad == 0, "nvfp4 index rows, K/V or q differ from the reference"
 
 
 def main():

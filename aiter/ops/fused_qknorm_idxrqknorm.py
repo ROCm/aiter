@@ -61,6 +61,7 @@ def _fused_qknorm_idxrqknorm_hip(
     v_scale: Tensor | None = None,
     asm_layout: bool = False,
     skip_index_branch: bool = False,
+    index_scale: Tensor | None = None,
 ) -> None:
     pass
 
@@ -92,6 +93,7 @@ def fused_qknorm_idxrqknorm(
     v_scale: Tensor | None = None,
     asm_layout: bool = False,
     skip_index_branch: bool = False,
+    index_scale: Tensor | None = None,
 ) -> None:
     # The main K/V caches are always passed as separate kv_cache_k / kv_cache_v
     # tensors. asm_layout selects the in-cache addressing: page-16 SHUFFLE
@@ -126,6 +128,14 @@ def fused_qknorm_idxrqknorm(
     #   saturating at 6), IEEE divisions. block_size 128; the index cache is "auto" or fp8
     #   as in the FP8 path, addressed by index_slot_mapping alone (or absent with
     #   skip_index_branch).
+    # index_cache_dtype="nvfp4" with index_scale (with the NVFP4 row-layout K/V above): the
+    #   index key in the same row layout, quantized in the same pass. index_cache is the e2m1
+    #   payload [num_pages, 128, 64] uint8 and index_scale its E4M3 plane [num_pages, 128, 8]
+    #   (uint8 or float8_e4m3fn), rows contiguous, page strides free; addressed by
+    #   index_slot_mapping (slot // 128, slot % 128). The normed, roped key is rounded to the
+    #   model dtype, then quantized as the K/V rows except that a code takes the sign of
+    #   x * (1 / scale): byte for byte what ATOM's index_fp4_store makes of the row "auto"
+    #   would stage.
     # q_out may be an e4m3 tensor (fp8 or uint8, insert mode): unit-scale e4m3 cast, saturating
     #   (+-inf too; NaN stays NaN), written instead of the bf16 q (as index_q_out).
     if index_cache_dtype is None:
@@ -143,7 +153,10 @@ def fused_qknorm_idxrqknorm(
         kv_cache_dtype == "nvfp4"
         and k_scale is not None
         and (k_scale.dtype == torch.uint8 or _is_fp8_e4m3_tensor(k_scale))
-        and index_cache_dtype not in ("mxfp4", "nvfp4")
+        and (
+            index_cache_dtype not in ("mxfp4", "nvfp4")
+            or (index_cache_dtype == "nvfp4" and index_scale is not None)
+        )
     )
     if nvfp4_rows:
         if get_gfx_runtime() not in ("gfx950", "gfx1250"):
@@ -213,4 +226,5 @@ def fused_qknorm_idxrqknorm(
         v_scale,
         asm_layout,
         skip_index_branch,
+        index_scale,
     )
