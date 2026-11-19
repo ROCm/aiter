@@ -30,6 +30,7 @@ from .gemm_common_gfx1250 import (
     workgroup_barrier,
 )
 from .kernels_common import ceildiv
+from .mega_moe_gfx1250 import tdm_prims
 from .mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
     tensor_store_gather,
@@ -237,6 +238,8 @@ def build_gemm_a8w4_tdm_task(
     explicit_cluster=0,
     cluster_active=None,
     prologue_barrier=None,
+    ep_linear_map_offset=0,
+    ep_linear_capacity=0,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -601,7 +604,13 @@ def build_gemm_a8w4_tdm_task(
     _waves_per_tensor = (
         f"_wpt{num_waves_per_tensor_tdm}" if num_waves_per_tensor_tdm != 2 else ""
     )
-    _ep = "_epscatter" if enable_ep_scatter else ""
+    _ep = (
+        ("_eplinear" if ep_linear_capacity else "_epscatter")
+        if enable_ep_scatter
+        else ""
+    )
+    if ep_linear_capacity and (ep_quant_bits or 256 % tile_m or tile_m % num_waves):
+        raise ValueError("linear EP store requires bf16 and source-aligned M tiles")
     _mma_group = (
         f"_mg{sched_mma_group}"
         if sched_first_group == sched_mma_group
@@ -2720,109 +2729,164 @@ def build_gemm_a8w4_tdm_task(
             else:
                 workgroup_barrier()
             if const_expr(enable_ep_scatter):
-                # EP gemm2-fused scatter via TDM gather-store. cco's flat symmetric
-                # VA is peer_va = winBase + pe*perRankSize + off, and comb_inp slots
-                # are padded to a pow2 so perRankSize divides by the slot stride
-                # exactly -- which lets (pe, slot) fold into ONE row index
-                # pe*K + slot over the single base lsa_ptr(0, off). perRankSize is
-                # measured in-kernel from the lsa_ptr stride. Each wave issues the
-                # gather-stores for its row groups, 8 rows per instruction.
-                # Quantized rows are addressed in bytes, scale lines included.
-                elem_bytes = 1 if ep_quant_bits else 2
-                _row_elems = C_ROW_BYTES if ep_quant_bits else STORE_N
-                _lds_row_elems = _lds_row_bytes if ep_quant_bits else STORE_PITCH
-                _stride_elems = ep_slot_stride_bytes // elem_bytes
-                _GRP = SCATTER_GROUP_ROWS
-                _ngrp = scatter_groups
-                _pr = _ep_lsa1 - _ep_lsa0
-                _K = fx.Int32(_pr // fx.Int64(ep_slot_stride_bytes))
-                # OOB row-index bound: valid idx = pe*K+slot < world*K (world<=256,
-                # slot<K); dropped/padding rows use this index so the HW drops them.
-                _oob = _K * fx.Int32(ep_world_size)
-                _comb_ptr_ty = fx.PointerType.get(
-                    T.i8 if ep_quant_bits else T.i16,
-                    address_space=fx.AddressSpace.Global,
-                    alignment=16,
-                )
-                _comb_iter = fx.inttoptr(
-                    _comb_ptr_ty,
-                    _ep_lsa0 + fx.Int64(ep_combine_input_offset),
-                )
-                _comb_view = tensor_view(
-                    _comb_iter, (_oob, _row_elems), (_stride_elems, 1)
-                )
-                _lds_c = tensor_view(
-                    fx.recast_iter(fx.Int8 if ep_quant_bits else oc, c_ep_base_ptr),
-                    (tile_m, _lds_row_elems),
-                    (_lds_row_elems, 1),
-                )
-                if const_expr(ep_quant_bits):
-                    # The tile's first chunk in the slot.
-                    _gboff = blk_n64 // COMBINE_CHUNK * EP_CHUNK_BYTES
+                if const_expr(ep_linear_capacity):
+                    # Each M256 has one source rank and a contiguous home
+                    # landing range. One 2D TDM stores this wave's whole M slice.
+                    rows_per_wave = tile_m // num_waves
+                    row_start = blk_m + wave * rows_per_wave
+                    map_ptr = fx.inttoptr(
+                        fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
+                        _rm_addr + fx.Int64(ep_linear_map_offset),
+                    )
+                    encoded = fx.generic_load(fx.add_offset(map_ptr, row_start // 256))
+                    # No typed wave-uniform cast exists; the TDM address
+                    # must be scalar even though its row came from thread_idx.
+                    encoded = fx.Int32(rocdl.readfirstlane(T.i32, encoded.ir_value()))
+                    peer = encoded // ep_linear_capacity
+                    slot = encoded % ep_linear_capacity + row_start % 256
+                    address = _ep_lsa0 + fx.Int64(peer) * (_ep_lsa1 - _ep_lsa0)
+                    address += (
+                        ep_combine_input_offset + fx.Int64(slot) * ep_slot_stride_bytes
+                    )
+                    address += blk_n64 * 2
+                    target = fx.inttoptr(
+                        fx.PointerType.get(T.i16, fx.AddressSpace.Global, 16), address
+                    )
+                    source = tensor_view(
+                        fx.recast_iter(oc, c_ep_base_ptr),
+                        (tile_m, STORE_PITCH),
+                        (STORE_PITCH, 1),
+                    )
+                    descriptor = tdm_ops.make_tensor_descriptor_2d(
+                        tensor_view(
+                            target,
+                            (rows_per_wave, STORE_N),
+                            (ep_slot_stride_bytes // 2, 1),
+                        ),
+                        source,
+                        (0, 0),
+                        tensor_shape=(rows_per_wave, STORE_N),
+                        strides=(ep_slot_stride_bytes // 2, 1),
+                        tile_shape=(rows_per_wave, STORE_N),
+                        elem_bytes=2,
+                        pad_interval=STORE_N,
+                        pad_amount=STORE_PITCH - STORE_N,
+                        lds_byte_offset=fx.index_cast(
+                            T.index, wave * rows_per_wave * STORE_PITCH * 2
+                        ),
+                        for_store=True,
+                    )
+                    lds_address = fx.Int64(fx.ptrtoint(c_ep_base_ptr))
+                    lds_address += wave * rows_per_wave * STORE_PITCH * 2
+                    descriptor = tdm_ops.TDMDescriptor2D(
+                        tdm_prims.tdm_group0(fx.Int32(lds_address), address),
+                        descriptor.dgroup1,
+                    )
+                    tdm_ops.tensor_store_2d(descriptor)
                 else:
-                    _gboff = blk_n * elem_bytes
-                _passes = scatter_passes
-                # Compute all of this wave's destination indices lane-wise.
-                # The old LDS path scalarized each row first and consequently
-                # expanded signed / and % once per descriptor row.
-                _scatter_idx_lanes = []
-                for scatter_vector in range_constexpr(scatter_dst_vectors):
-                    _rm_dst_lane = _rm_dst_lanes[scatter_vector]
-                    _dst_pe_lane = _rm_dst_lane // fx.Int32(ep_destination_stride)
-                    _dst_slot_lane = _rm_dst_lane % fx.Int32(ep_destination_stride)
-                    _scatter_idx_lane = _dst_pe_lane * _K + _dst_slot_lane
-                    _scatter_keep_lane = _scatter_lane_valids[scatter_vector] & (
-                        _rm_dst_lane >= fx.Int32(0)
+                    # EP gemm2-fused scatter via TDM gather-store. cco's flat symmetric
+                    # VA is peer_va = winBase + pe*perRankSize + off, and comb_inp slots
+                    # are padded to a pow2 so perRankSize divides by the slot stride
+                    # exactly -- which lets (pe, slot) fold into ONE row index
+                    # pe*K + slot over the single base lsa_ptr(0, off). perRankSize is
+                    # measured in-kernel from the lsa_ptr stride. Each wave issues the
+                    # gather-stores for its row groups, 8 rows per instruction.
+                    # Quantized rows are addressed in bytes, scale lines included.
+                    elem_bytes = 1 if ep_quant_bits else 2
+                    _row_elems = C_ROW_BYTES if ep_quant_bits else STORE_N
+                    _lds_row_elems = _lds_row_bytes if ep_quant_bits else STORE_PITCH
+                    _stride_elems = ep_slot_stride_bytes // elem_bytes
+                    _GRP = SCATTER_GROUP_ROWS
+                    _ngrp = scatter_groups
+                    _pr = _ep_lsa1 - _ep_lsa0
+                    _K = fx.Int32(_pr // fx.Int64(ep_slot_stride_bytes))
+                    # OOB row-index bound: valid idx = pe*K+slot < world*K (world<=256,
+                    # slot<K); dropped/padding rows use this index so the HW drops them.
+                    _oob = _K * fx.Int32(ep_world_size)
+                    _comb_ptr_ty = fx.PointerType.get(
+                        T.i8 if ep_quant_bits else T.i16,
+                        address_space=fx.AddressSpace.Global,
+                        alignment=16,
                     )
-                    _scatter_idx_lanes.append(
-                        _scatter_keep_lane.select(_scatter_idx_lane, _oob)
+                    _comb_iter = fx.inttoptr(
+                        _comb_ptr_ty,
+                        _ep_lsa0 + fx.Int64(ep_combine_input_offset),
                     )
+                    _comb_view = tensor_view(
+                        _comb_iter, (_oob, _row_elems), (_stride_elems, 1)
+                    )
+                    _lds_c = tensor_view(
+                        fx.recast_iter(fx.Int8 if ep_quant_bits else oc, c_ep_base_ptr),
+                        (tile_m, _lds_row_elems),
+                        (_lds_row_elems, 1),
+                    )
+                    if const_expr(ep_quant_bits):
+                        # The tile's first chunk in the slot.
+                        _gboff = blk_n64 // COMBINE_CHUNK * EP_CHUNK_BYTES
+                    else:
+                        _gboff = blk_n * elem_bytes
+                    _passes = scatter_passes
+                    # Compute all of this wave's destination indices lane-wise.
+                    # The old LDS path scalarized each row first and consequently
+                    # expanded signed / and % once per descriptor row.
+                    _scatter_idx_lanes = []
+                    for scatter_vector in range_constexpr(scatter_dst_vectors):
+                        _rm_dst_lane = _rm_dst_lanes[scatter_vector]
+                        _dst_pe_lane = _rm_dst_lane // fx.Int32(ep_destination_stride)
+                        _dst_slot_lane = _rm_dst_lane % fx.Int32(ep_destination_stride)
+                        _scatter_idx_lane = _dst_pe_lane * _K + _dst_slot_lane
+                        _scatter_keep_lane = _scatter_lane_valids[scatter_vector] & (
+                            _rm_dst_lane >= fx.Int32(0)
+                        )
+                        _scatter_idx_lanes.append(
+                            _scatter_keep_lane.select(_scatter_idx_lane, _oob)
+                        )
 
-                def issue_scatter_group(group, scatter_vector, vector_pass):
-                    base_row = group * fx.Int32(_GRP)
-                    row_indices = []
-                    for i in range_constexpr(_GRP):
-                        src_lane = fx.Int32(vector_pass * _GRP + i)
-                        row_indices.append(
-                            fx.Int32(
-                                rocdl.readlane(
-                                    T.i32,
-                                    _raw(_scatter_idx_lanes[scatter_vector]),
-                                    _raw(src_lane),
+                    def issue_scatter_group(group, scatter_vector, vector_pass):
+                        base_row = group * fx.Int32(_GRP)
+                        row_indices = []
+                        for i in range_constexpr(_GRP):
+                            src_lane = fx.Int32(vector_pass * _GRP + i)
+                            row_indices.append(
+                                fx.Int32(
+                                    rocdl.readlane(
+                                        T.i32,
+                                        _raw(_scatter_idx_lanes[scatter_vector]),
+                                        _raw(src_lane),
+                                    )
                                 )
                             )
+                        # Geometry is explicit because traced layout leaves are not
+                        # Python integers suitable for the descriptor bitfields.
+                        desc = make_tensor_gather_descriptor(
+                            _comb_view,
+                            _lds_c,
+                            row_indices,
+                            row_width=_lds_row_elems,
+                            tensor_dim0=_row_elems,
+                            tensor_dim1=_oob.ir_value(),
+                            stride=_stride_elems,
+                            elem_bytes=elem_bytes,
+                            index_size=32,
+                            lds_byte_offset=fx.index_cast(
+                                T.index,
+                                base_row * fx.Int32(_lds_row_elems * elem_bytes),
+                            ),
+                            global_byte_offset=_gboff,
                         )
-                    # Geometry is explicit because traced layout leaves are not
-                    # Python integers suitable for the descriptor bitfields.
-                    desc = make_tensor_gather_descriptor(
-                        _comb_view,
-                        _lds_c,
-                        row_indices,
-                        row_width=_lds_row_elems,
-                        tensor_dim0=_row_elems,
-                        tensor_dim1=_oob.ir_value(),
-                        stride=_stride_elems,
-                        elem_bytes=elem_bytes,
-                        index_size=32,
-                        lds_byte_offset=fx.index_cast(
-                            T.index,
-                            base_row * fx.Int32(_lds_row_elems * elem_bytes),
-                        ),
-                        global_byte_offset=_gboff,
-                    )
-                    tensor_store_gather(desc)
+                        tensor_store_gather(desc)
 
-                # Let every wave issue its own groups directly. This avoids
-                # cloning every descriptor behind a wave-selection branch.
-                for scatter_pass in range_constexpr(_passes):
-                    group = wave + fx.Int32(scatter_pass * num_waves)
-                    scatter_vector = scatter_pass // SCATTER_PASSES_PER_VECTOR
-                    vector_pass = scatter_pass % SCATTER_PASSES_PER_VECTOR
-                    if const_expr(_ngrp % num_waves):
-                        if group < fx.Int32(_ngrp):
+                    # Let every wave issue its own groups directly. This avoids
+                    # cloning every descriptor behind a wave-selection branch.
+                    for scatter_pass in range_constexpr(_passes):
+                        group = wave + fx.Int32(scatter_pass * num_waves)
+                        scatter_vector = scatter_pass // SCATTER_PASSES_PER_VECTOR
+                        vector_pass = scatter_pass % SCATTER_PASSES_PER_VECTOR
+                        if const_expr(_ngrp % num_waves):
+                            if group < fx.Int32(_ngrp):
+                                issue_scatter_group(group, scatter_vector, vector_pass)
+                        else:
                             issue_scatter_group(group, scatter_vector, vector_pass)
-                    else:
-                        issue_scatter_group(group, scatter_vector, vector_pass)
                 tdm_ops.tensor_wait(0)
             else:
 
@@ -2974,6 +3038,8 @@ def launch_gemm_a8w4_tdm(
     a_preshuffled: Constexpr[int] = 0,
     m_align: Constexpr[int] = 0,
     k_waves: Constexpr[int] = 1,
+    ep_linear_map_offset: Constexpr[int] = 0,
+    ep_linear_capacity: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -3020,6 +3086,8 @@ def launch_gemm_a8w4_tdm(
         ep_destination_stride=ep_destination_stride,
         ep_world_size=ep_world_size,
         ep_quant_bits=ep_quant_bits,
+        ep_linear_map_offset=ep_linear_map_offset,
+        ep_linear_capacity=ep_linear_capacity,
         row_major_ascale=row_major_ascale,
         a_row_stride_bytes=a_row_stride_bytes,
         a_scale_row_stride_bytes=a_scale_row_stride_bytes,

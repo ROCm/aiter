@@ -17,3 +17,35 @@
    no experimental scheduler/clusters. rocm-smi idle gate before every launch,
    1s polling, 240s process timeout; use shared gpu-lock if present. No foreign
    process termination. Source snapshots and checksums retained per run.
+
+Source-shuffle launch review after reboot: the first committed test exposed a
+null metadata pointer in _plan_args under external-ready. Fixed it to pass
+allocated tile_storage when src_rank_shuffle is set; a host-side test assertion
+checks the argument before any plan launch. Arena/epoch/row bounds re-reviewed;
+existing padding ownership and remote readiness ordering are unchanged. Processes
+exited after the fault, boot ID unchanged and no KFD PIDs remained.
+
+Wave-load three-pass review: (1) one ordinary2D TDM covers four consecutive
+M16 source frames per wave/K segment; source grouping guarantees one owner;
+frame pitch43520B, payload width16384B for1024B K payload, last width10752B
+includes scales. All source and LDS offsets are bounded,128B aligned. (2) one
+wait follows each K-segment load before any LDS read; there are no M16 waits.
+Payload/scale stores retain existing per-wave store wait and A-ready publication.
+For4-buffer planar GEMM, producer leaves a64KiB hole [128KiB,192KiB), and control
+uses only the intersection with the GEMM's existing unused gap. (3) run small
+then full changing-routing correctness, compare native E2E and HIP events with
+baseline, keep GEMM2 unchanged. K can be reduced for smaller LDS constraints.
+
+Linear GEMM2 three-pass prelaunch review:
+1. Source-home slot bound = ceil((max_routes + global_experts*255)/256)*256.
+   Each source expert segment owns a disjoint padded extent. Plan publishes a
+   delta for each expert, a remote M256 landing base, and a local route-to-slot
+   map. Original rowmap/weights are unchanged. All byte addresses widen to i64.
+2. The existing plan completion and external-ready protocol covers the new map
+   stores. GEMM2 retains its LDS barrier and per-wave tensor wait; each wave
+   writes M64 including owned padding. Descriptor tensor width excludes the
+   padded LDS columns, so adjacent N tiles cannot overwrite one another.
+   Combine retains the cross-rank barrier and original top-k summation order.
+3. Feature defaults off, requires source shuffle and bf16 fused combine.
+   Run small then full changing-input correctness before timings. Push reference
+   explicitly disables linear store. Idle gate and boot-ID timeout remain.

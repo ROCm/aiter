@@ -7,6 +7,7 @@ import flydsl.expr as fx
 import torch
 
 from ...tensor_shim import _run_compiled
+from .. import linear_combine
 from ..combine import (
     CHUNK_ELEMS as _COMBINE_CHUNK_ELEMS,
 )
@@ -101,6 +102,7 @@ class _FusedScatterCombine:
     def __init__(self, config: MegaMoEConfig, caps=None):
         self.config = config
         self.res = None
+        self.linear_store = linear_combine.enabled(config)
         self._tiles = {
             bits: _combine_tile(
                 topk=config.topk, hidden_dim=config.hidden_dim, quant_bits=bits
@@ -127,8 +129,11 @@ class _FusedScatterCombine:
             # holds a step on any of them and a quantized one just packs into the
             # front of it at its own pitch.
             "comb_inp": (
-                config.max_tokens_per_rank
-                * config.topk
+                (
+                    linear_combine.capacity(config)
+                    if linear_combine.enabled(config)
+                    else config.max_tokens_per_rank * config.topk
+                )
                 * config.combine_slot_stride_bytes
             ),
         }
@@ -157,6 +162,7 @@ class _FusedScatterCombine:
                         hidden_dim=config.hidden_dim,
                         slot_stride_nbytes=config.combine_slot_stride_for(bits),
                         add_shared=add_shared,
+                        remap_slots=self.linear_store,
                     )
                     continue
                 self._reduces[bits, add_shared] = _make_combine_fused_reduce(
@@ -179,6 +185,8 @@ class _FusedScatterCombine:
     def prepare(self, batch: _DispatchBatch, quant_bits: int) -> _ComputeTarget:
         config, arena = self.config, self.res.arena
         grouped = batch.layout is BatchLayout.EXPERT_GROUPED
+        if self.linear_store and (quant_bits or not grouped):
+            raise ValueError("linear EP store requires grouped bf16 combine")
         scatter = Stage2ScatterContext(
             arena_handle=arena.handle,
             combine_input_offset=arena.offset("comb_inp"),
@@ -188,6 +196,14 @@ class _FusedScatterCombine:
             source_token_map=batch.routing.source_token_map,
             **(batch.grouping.scatter_fields() if grouped else {}),
             combine_quant_bits=quant_bits,
+            linear_tile_map_offset=(
+                arena.offset("ep_linear_tiles") - arena.offset("ep_rowmap")
+                if self.linear_store
+                else 0
+            ),
+            linear_slot_capacity=(
+                linear_combine.capacity(config) if self.linear_store else 0
+            ),
         )
         return _ComputeTarget(
             scatter=scatter, dispatch_context=scatter if grouped else None
@@ -238,6 +254,11 @@ class _FusedScatterCombine:
             res.combine_output.data_ptr(),
             routing.token_count,
             0 if shared_add is None else shared_add.data_ptr(),
+            *(
+                [res.arena.local_ptr("ep_linear_slots") if self.linear_store else 0]
+                if quant_bits == 0
+                else []
+            ),
             *grid,
             stream,
         )

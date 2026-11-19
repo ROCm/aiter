@@ -113,6 +113,8 @@ class Stage2ScatterContext:
     # signature of ``flydsl_grouped_gemm_a8w4_masked``; it runs the fused
     # dispatch + GEMM1 stage-1 kernel instead. None keeps the default GEMM1.
     stage1_gemm1: object = None
+    linear_tile_map_offset: int = 0
+    linear_slot_capacity: int = 0
 
     def __post_init__(self):
         if self.combine_quant_bits not in (0, 8, 4):

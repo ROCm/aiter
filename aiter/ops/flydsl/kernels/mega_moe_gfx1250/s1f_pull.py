@@ -93,6 +93,8 @@ def compile_s1f_pull(
     packed_input=False,
     off_packed=0,
     src_rank_shuffle=False,
+    packed_wave_load=False,
+    packed_load_k_bytes=1024,
 ):
     """Build source-ready/metadata setup and S1F with a pull producer.
 
@@ -248,6 +250,36 @@ def compile_s1f_pull(
             world=world, rank=rank, cap=compact_cap, off_packed=off_packed,
         )
 
+    producer_lds_bytes = 64 * pull_lds_row_pitch(wire_row)
+    producer_lds_gap = None
+    if packed_wave_load:
+        if not src_rank_shuffle or not packed_input or ready_first:
+            raise ValueError("wave loads require source-shuffled external-ready pull")
+        from .packed_wave_copy import make_packed_wave_copy, packed_wave_lds_bytes
+        from .s1f_stage1 import PLANAR_LDS
+
+        producer_lds_bytes = packed_wave_lds_bytes(model_dim, packed_load_k_bytes)
+        reserve_gap = bool(
+            num_buffers >= 4
+            and (PLANAR_LDS or lds_soa_load_interleave)
+            and producer_lds_bytes > 196352
+        )
+        if reserve_gap:
+            wave_bytes = producer_lds_bytes // 4
+            producer_lds_gap = (2 * wave_bytes, 3 * wave_bytes)
+            producer_lds_bytes += wave_bytes
+        if producer_lds_bytes > 327680:
+            raise ValueError("packed wave load exceeds320KiB LDS; reduce K bytes")
+        copy_wave = make_packed_wave_copy(
+            model_dim=model_dim,
+            max_routes=max_routes,
+            rank=rank,
+            cap=compact_cap,
+            off_packed=off_packed,
+            k_bytes=packed_load_k_bytes,
+            control_gap=reserve_gap,
+        )
+
     @flyc.jit
     def producer(
         storage: fx.Pointer,
@@ -299,19 +331,32 @@ def compile_s1f_pull(
             if tile < tile_count:
                 count = (tile_info[tile] >> 16) & 0xFFFF
             end = tile * FLAG_M + count
-            for chunk in range_constexpr(FLAG_M // 16):
-                row0 = tile * FLAG_M + chunk * 16
-                if row0 < end:
-                    copy_tile(
+            if const_expr(packed_wave_load):
+                if count > 0:
+                    copy_wave(
                         lds_rows,
                         output,
                         scale_rows,
                         local + off_rowmap,
                         window.base,
                         window.stride,
-                        row0,
+                        tile * FLAG_M,
                         end,
                     )
+            else:
+                for chunk in range_constexpr(FLAG_M // 16):
+                    row0 = tile * FLAG_M + chunk * 16
+                    if row0 < end:
+                        copy_tile(
+                            lds_rows,
+                            output,
+                            scale_rows,
+                            local + off_rowmap,
+                            window.base,
+                            window.stride,
+                            row0,
+                            end,
+                        )
             comm_ops.waitcnt_stores()
             if const_expr(tile_ready):
                 # Every writer releases before rendezvous. The leader acquires
@@ -590,9 +635,9 @@ def compile_s1f_pull(
         pull_ready_queue=ready_queue,
         pull_cluster_local=cluster_local,
         pull_cluster_config=(
-            (copy_tile, off_ready, off_rowmap, wire_row)
-            if cluster_local else None
+            (copy_tile, off_ready, off_rowmap, wire_row) if cluster_local else None
         ),
-        pull_lds_bytes=64 * pull_lds_row_pitch(wire_row),
+        pull_lds_bytes=producer_lds_bytes,
+        pull_lds_control_gap=producer_lds_gap,
     )
     return (None if ready_first else ready), fused

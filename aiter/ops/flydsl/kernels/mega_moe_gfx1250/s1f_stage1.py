@@ -554,6 +554,7 @@ def make_s1f_stage1(
     pull_producer_group=1,
     pull_tile_ready=False,
     pull_lds_bytes=0,
+    pull_lds_control_gap=None,
     pull_ready_queue=False,
     pull_cluster_local=False,
     pull_cluster_config=None,
@@ -918,7 +919,12 @@ def make_s1f_stage1(
                 f"producer LDS {prod_lds} B exceeds the GEMM arena {ARENA} B"
             )
         gap_start, gap_end = lay["control_gap"]
-        control_offset = ((max(gap_start, prod_lds) + 15) // 16) * 16
+        control_start = max(gap_start, prod_lds)
+        if pull_lds_control_gap is not None:
+            producer_gap_start, producer_gap_end = pull_lds_control_gap
+            control_start = max(gap_start, producer_gap_start)
+            gap_end = min(gap_end, producer_gap_end)
+        control_offset = ((control_start + 15) // 16) * 16
         # The four-buffer planar GEMM fills320KiB, but its64KiB B alignment
         # leaves unused padding. Keep control beyond both producer storage
         # and GEMM/C stores instead of reserving another256B past the limit.

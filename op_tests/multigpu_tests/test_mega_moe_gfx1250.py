@@ -548,7 +548,6 @@ def _check_vmm_bound(ctx):
         check.settle()
 
 
-
 def _check_pull(
     ctx, *, a_preshuffled=True, fused=False, expected_cluster=None,
     expected_affinity=None, ready_first=False, ready_probe=None,
@@ -565,10 +564,15 @@ def _check_pull(
     saved_weights = ctx.wts.clone()
     push = pull = None
     try:
-        with mock.patch.dict(os.environ, {
-            "AITER_MEGA_S1F": "0", "AITER_MEGA_DISPATCH_PULL": "0",
-            "AITER_MEGA_S1F_PULL": "0",
-        }):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AITER_MEGA_S1F": "0",
+                "AITER_MEGA_DISPATCH_PULL": "0",
+                "AITER_MEGA_S1F_PULL": "0",
+                "AITER_MEGA_EP_LINEAR_STORE": "0",
+            },
+        ):
             push = ctx.build(**fields)
         with mock.patch.dict(os.environ, {
             "AITER_MEGA_S1F": "1" if fused else "0",
@@ -580,6 +584,13 @@ def _check_pull(
             pull = ctx.build(**fields)
         check(pull._ep._dispatch._pull is not None, "pull was not selected")
         check(pull._ep._dispatch._pull.fused == fused, "wrong fusion mode")
+        if src_rank_shuffle:
+            helper = pull._ep._dispatch._pull
+            check(
+                helper._plan_args(0, 0, 0, TOKENS, None)[13]
+                == helper.tile_storage.data_ptr(),
+                "source-shuffle planner is missing its metadata pointer",
+            )
         if ready_first:
             check(pull._ep._dispatch._pull.ready_first, "ready-first not selected")
         if expected_producer_group is not None:

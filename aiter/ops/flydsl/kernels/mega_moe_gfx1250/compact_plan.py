@@ -308,6 +308,10 @@ def compile_tdm_compact_plan(
     off_packed: int = 0,
     off_pack_done: int = 0,
     pull_src_shuffle: bool = False,
+    linear_capacity: int = 0,
+    off_linear_base: int = 0,
+    off_linear_tiles: int = 0,
+    off_linear_slots: int = 0,
 ):
     """Compile the compact-plan kernel. ``hist_stride`` is ``npes * row_dwords``.
 
@@ -402,6 +406,8 @@ def compile_tdm_compact_plan(
     plan_threads = plan_waves * WAVE
     if pull_src_shuffle and (not pull_pack or tile_m != 256):
         raise ValueError("source-rank shuffle requires packed pull and M256")
+    if linear_capacity and (not pull_src_shuffle or experts_per_rank % 32):
+        raise ValueError("linear combine requires M256 source groups and E%32=0")
     if pull_pack and (not pull or not write_tok_map or quant_blocks <= 0):
         raise ValueError("packed pull requires quant and a written route map")
     if pull_pack and (plan_blocks > 64 or plan_waves > 32 or quant_blocks > 128):
@@ -413,6 +419,8 @@ def compile_tdm_compact_plan(
     kernel_name = "tdm_compact_plan" + ("_packed_a" if pull_pack else "")
     if pull_src_shuffle:
         kernel_name += "_src256"
+    if linear_capacity:
+        kernel_name += "_linear_ep"
     if plan_blocks != 1:
         kernel_name += f"_b{plan_blocks}"
     quant_blocks = int(quant_blocks)
@@ -629,6 +637,13 @@ def compile_tdm_compact_plan(
         rsrc_mm = create_buffer_resource_from_addr(addr_masked_m)
         rsrc_psum = create_buffer_resource_from_addr(addr_psum)
         rsrc_bar = create_buffer_resource_from_addr(addr_barrier)
+        if const_expr(linear_capacity):
+            rsrc_linear_base = create_buffer_resource_from_addr(
+                lsa(rank, off_linear_base)
+            )
+            rsrc_linear_slots = create_buffer_resource_from_addr(
+                lsa(rank, off_linear_slots)
+            )
         if const_expr(pull_src_shuffle):
             rsrc_src_tiles = create_buffer_resource_from_addr(addr_tile_src)
         if const_expr(pull_ready_first):
@@ -1324,8 +1339,34 @@ def compile_tdm_compact_plan(
                 aligned = _aceil(total)
                 inclusive = _wave32_inclusive_scan_i32(aligned, lane_i)
                 expert_start = carry + inclusive - aligned
+                if const_expr(linear_capacity):
+                    # Independently scan this source's padded expert extents.
+                    # The destination rows and the home landing slots then have
+                    # the same within-segment offset, including tail padding.
+                    prior = fx.Int32(0)
+                    for first in range(fx.Int32(0), dest * epr + chunk, 32):
+                        prior += _aceil(
+                            _ld(lds_matrix, rank * hist_dwords + first + lane_i)
+                        )
+                    prior_scan = _wave32_inclusive_scan_i32(prior, lane_i)
+                    prior_total = fx.Int32(readlane(T.i32, prior_scan.ir_value(), 31))
+                    own_rows = _ld(lds_matrix, rank * hist_dwords + idx)
+                    own_aligned = _aceil(own_rows)
+                    own_scan = _wave32_inclusive_scan_i32(own_aligned, lane_i)
+                    landing = prior_total + own_scan - own_aligned
                 if in_expert:
                     send = expert_start + my_prefix
+                    if const_expr(linear_capacity):
+                        buffer_store(landing - send, rsrc_linear_base, idx)
+                        pointer = fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4)
+                        for row in range(send, send + own_aligned, 256):
+                            if row < compact_cap:
+                                address = (
+                                    lsa(dest, off_linear_tiles)
+                                    + fx.Int64(row // 256) * 4
+                                )
+                                value = rank * linear_capacity + landing + row - send
+                                fx.generic_store(fx.inttoptr(pointer, address), value)
                     if const_expr(pull_src_shuffle):
                         # Each source owns its tail padding: no remote writer
                         # can clear a live route belonging to another source.
@@ -1692,6 +1733,12 @@ def compile_tdm_compact_plan(
                             fx.Uint64.ir_type, fx.AddressSpace.Global, 8
                         )
                         fx.generic_store(fx.inttoptr(pointer_type, reverse), metadata)
+                if const_expr(linear_capacity):
+                    if valid & in_cap:
+                        delta = buffer_load(
+                            rsrc_linear_base, segment, vec_width=1, dtype=T.i32
+                        )
+                        buffer_store(dest_row + delta, rsrc_linear_slots, route)
                 if const_expr(write_tok_map):
                     flat = (dest_row << fx.Int32(peer_bits)) | (
                         dest_pe & fx.Int32(peer_mask)

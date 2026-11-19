@@ -4,12 +4,12 @@
 内的所有有效行都来自同一个 source rank。Padding 行不对应 token，反向路由为
 `(-1, 0)`。这个保证适用于 normal routing，不依赖 balanced routing。**
 
-**Status: source-rank shuffle is implemented but has not passed GPU validation
-or a performance comparison yet.** GPU access was occupied when this checkpoint
-was requested. Do not treat the invariant above as a completed test result.
-The earlier packed-load prototype, without source-segment padding, passed EP4
-correctness at257 and16384 tokens/rank. It is not evidence that the new padding
-implementation is already correct or faster.
+**Status (2026-11-19): wave-level ordinary TDM in GEMM1 and contiguous TDM
+writeback in GEMM2 both pass EP4 correctness at 257 and 16384 tokens/rank.**
+Each size runs six changing-input graph replays, including random routing,
+hot/empty experts, disjoint ownership and unequal source tails. The current
+priority is GEMM1/GEMM2 latency; planner and E2E overhead are recorded separately
+and are not acceptance criteria for this experiment.
 
 This branch also retains the earlier optional scheduling experiments, M256-ready
 support and their tests. Their history is in
@@ -22,15 +22,17 @@ change. This checkpoint was prepared on `dev/yadai_dispatch_pull`; use
 
 DSV4.1 Flash, EP4: **16384 tokens/rank =65536 global tokens**,384 experts,
 96 local experts,topk6,H5120,I2304,MXFP4,8 layers. Use the explicit
-`aiter/configs/model_configs/dsv41_flash_tuned_grouped_fmoe.csv`, whose EP row
-has `topk=-1` and token key65536. Do not confuse this with non-EP token16384.
+`aiter/configs/model_configs/dsv41_flash_tuned_grouped_fmoe.csv`, with EP `topk=-1` lookup. The workload key is65536; inspect the effective
+configuration rather than assuming an exact CSV row exists. Do not confuse
+this with non-EP token16384.
 GEMM1 is256x256x256,2x2 waves,4 buffers;256 workers,P96/C160,affinity3:5,
-legacy instruction prefetch. GEMM2 settings and implementation are unchanged.
+legacy instruction prefetch. GEMM2 stays256x256x256,2x2 waves,4 buffers,WPT1,cluster1x4.
+`AITER_MEGA_EP_LINEAR_STORE=1` changes only its writeback layout and combine
+slot addressing; its GEMM mainloop remains unchanged.
 
-**User priority: measure GEMM1 first. Only try a corresponding GEMM2 optimization
-if GEMM1 shows a clear performance advantage.** Also report compact-plan/quant
-and native E2E: making GEMM1 faster by moving more work into the planner may
-still lose overall. Preserve the fastest existing gather path as the baseline.
+**Latest user priority: get GEMM1 and GEMM2 measured first.** Source packing
+and contiguous landing are allowed even if compact-plan/E2E become slower.
+The original gather path remains the default and the comparison baseline.
 
 ## What source-rank shuffle means
 
@@ -55,8 +57,9 @@ This first implementation pays extra padding/computation under normal routing.
 `masked_m` and `psum` describe **padded compute extents**. Per-M64 `tile_info`
 describes **actual live rows**, including zero-live pieces inside a padded M256.
 The producer never treats a padding row as a source token. Every source clears
-only its own tail's inverse mappings to route=-1,weight=0. Existing GEMM2 scatter
-checks route>=0 and drops padded outputs. No GEMM2 optimization is included.
+only its own tail's inverse mappings to route=-1,weight=0. Existing gather-store GEMM2 drops negative routes. The optional linear-store
+path writes padded rows to separately reserved padding slots; the final reduce
+never reads them.
 
 ## Current execution and synchronization
 
@@ -78,10 +81,11 @@ checks route>=0 and drops padded outputs. No GEMM2 optimization is included.
   In source-shuffle mode it preserves the planner's live-row metadata rather
   than rebuilding dense expert metadata. Histogram completion alone is not
   sufficient for a remote packed-data read.
-- Each producer wave loads an M16 frame with **ordinary `tdm_load`**, waits for
-  that load, and copies the already-shuffled payload and row-major scales out.
-  The current producer still processes four M16 pieces per M64; this checkpoint
-  does not claim a new TDM pipeline. Four waves cover an M256.
+- With source shuffle, each producer wave loads four M16 frames (M64) in one
+  ordinary 2D TDM per K segment. Default1024 payload bytes/row gives three K
+  segments for H5120. There is one tensor wait per M64 K segment, not per M16.
+  Payload is already preshuffled; no gather or producer shuffle is required.
+  `AITER_MEGA_PULL_WAVE_LOAD=0` retains the old per-M16 packed copy.
 - Store completion and the existing A-ready protocol precede consumption.
   Reproduction scripts use the old M64 flags to isolate the layout experiment.
   Consumer scheduling, task prefetch and GEMM code are retained.
@@ -94,9 +98,15 @@ source buffer [destination rank][destination M16 frame]:
   scales  [16 rows][K/32 bytes]      -- row-major scales
 ```
 
-For H5120 a frame is16*(2560+160)=43520 bytes. Producer issues one43520B ordinary
-TDM load into its existing per-wave LDS slice. Packed offsets use64-bit global
-pointers because the sparse source allocation can exceed4GiB.
+For H5120 a frame is16*(2560+160)=43520 bytes. A wave's full M64 wire
+is174080B; four such waves exceed320KiB LDS. Default K payload1024B uses
+three 2D loads per wave: `(4,16384B)`, `(4,16384B)`, `(4,10752B)`, all with
+43520B frame stride. The final load includes scales. Four waves use256KiB
+scratch; for nb4 planar GEMM, a64KiB hole separates waves1/2 so the existing
+GEMM control area remains untouched inside the total320KiB allocation. Scale
+reads use the same shifted wave slice as payload reads. K bytes are tunable
+with `AITER_MEGA_PULL_LOAD_K_BYTES` (positive multiple of16; LDS limits checked).
+Packed offsets use64-bit global pointers because source storage can exceed4GiB.
 
 Allocation is `world * ceil(compact_cap/16) * frame_bytes`, plus small completion
 storage. It is a worst-case sparse allocation, not a storage-optimal design.
@@ -104,11 +114,35 @@ Packed load without source shuffle retains a mixed-source M16 fallback: load eac
 present source frame and store only rows owned by it. With source shuffle that
 fallback should not be needed for live frames; the current code still retains it.
 
+## Optional GEMM2 ordinary TDM writeback
+
+Enable `AITER_MEGA_EP_LINEAR_STORE=1` with packed/source-shuffled S1F pull.
+The first version requires bf16 combine and experts/rank divisible by32.
+Source-aligned M256 alone is insufficient: original `(token, topk slot)`
+destinations are still noncontiguous. The existing compact-plan additionally:
+
+1. Assigns a padded home landing range to each source's global expert segment.
+   Capacity per source is `align256(max_routes + global_experts*255)` rows.
+2. Publishes one destination-rank/landing-base entry per destination M256.
+3. Writes a local original-route-to-home-slot map for the final combine.
+
+GEMM2 retains original weights and rowmap, GEMM tiling, mainloop, and LDS store
+layout. Each wave sends its entire M64 N tile using **one ordinary 2D TDM store**
+instead of eight gather-stores. The tensor extent excludes the16B LDS padding,
+so adjacent N tiles do not overwrite each other. Existing per-wave tensor waits
+and cross-rank combine barrier remain. Combine reads the mapped slots and sums
+in the same top-k order. No extra GPU kernel is introduced for these mappings.
+
+Default is off. This is a GEMM2 latency experiment, not a claim of faster E2E.
+
 ## Code map
 
 | File | Relevant responsibility |
 |---|---|
 | `aiter/ops/flydsl/kernels/mega_moe_gfx1250/compact_plan.py` | `compile_tdm_compact_plan`: source-aligned prefix, padding maps, live metadata, fused quant/packing and local map generations |
+| `aiter/ops/flydsl/kernels/mega_moe_gfx1250/packed_wave_copy.py` | M64 wave-level ordinary TDM and K-segment LDS geometry |
+| `aiter/ops/flydsl/kernels/mega_moe_gfx1250/linear_combine.py` | Feature selection and padded home-slot bound |
+| `aiter/ops/flydsl/kernels/mxfp4_preshuffle_gfx1250_tdm.py` | Optional ordinary TDM GEMM2 writeback |
 | `aiter/ops/flydsl/kernels/mega_moe_gfx1250/packed_copy.py` | `make_packed_copy`: ordinary TDM frame load and contiguous shuffled-A stores |
 | `aiter/ops/flydsl/kernels/mega_moe_gfx1250/stages/pull.py` | Switch validation, packed regions, completion initialization, compile options/cache keys |
 | `aiter/ops/flydsl/kernels/mega_moe_gfx1250/stages/dispatch_compact.py` | Source-group capacity and per-step row bounds |
@@ -145,12 +179,21 @@ bash run_ds41_flash_src_shuffle.sh
 DS41_BALANCED=false bash run_ds41_flash_src_shuffle.sh
 ```
 
-GEMM1 comparison, keeping GEMM2 unchanged (unique run labels required):
+GEMM1 comparison, keeping GEMM2 unchanged unless explicitly enabled (unique run labels required):
 
 ```bash
 BENCH_PLAN_PACK=0 BENCH_SRC_SHUFFLE=0 BENCH_IPF=legacy bash op_tests/multigpu_tests/mega_moe_diagnostics/run.sh affinity events_baseline_01
 BENCH_PLAN_PACK=1 BENCH_SRC_SHUFFLE=1 BENCH_IPF=legacy bash op_tests/multigpu_tests/mega_moe_diagnostics/run.sh affinity events_src_shuffle_01
 ```
+
+Both GEMMs use ordinary TDM transfers (unique label required):
+
+```bash
+BENCH_PLAN_PACK=1 BENCH_SRC_SHUFFLE=1 BENCH_EP_LINEAR_STORE=1 BENCH_IPF=legacy bash op_tests/multigpu_tests/mega_moe_diagnostics/run.sh affinity events_src_linear_01
+```
+
+For correctness, add `BENCH_EP_LINEAR_STORE=1` to the `check_src*` commands.
+For native timing only, use `AITER_MEGA_EP_LINEAR_STORE=1 bash run_ds41_flash_src_shuffle.sh`.
 
 Add `BENCH_BALANCED=false` to both for normal routing. Optionally isolate packing
 without M256 source padding using `BENCH_PLAN_PACK=1 BENCH_SRC_SHUFFLE=0`.
@@ -160,6 +203,24 @@ a subsequent pass, with event overhead. Do not sum stage medians to reconstruct
 native E2E. Confirm logs show `packed_input=True`, `src_rank_shuffle=True`,
 `tile_m=256`, `ready_first=False`, `producer_group=1`,P96/C160. Planner symbol
 contains `_packed_a` and `_src256`; ready symbol contains `_src256`.
+
+## Measured GEMM1 / GEMM2 result
+
+Two runs per configuration, balanced16384/rank, EP4. Values are the arithmetic
+mean of per-run HIP-event medians, then averaged equally across the four GPUs.
+Full per-GPU results, individual runs and symbols are in
+[RESULTS_20261119.md](op_tests/multigpu_tests/mega_moe_diagnostics/RESULTS_20261119.md)
+and [results_20261119.json](op_tests/multigpu_tests/mega_moe_diagnostics/results_20261119.json).
+
+| Configuration | GEMM1 us | GEMM2 us |
+|---|---:|---:|
+| Original gather baseline |545.55|591.92|
+| GEMM1 ordinary TDM, GEMM2 gather-store |533.12|592.61|
+| GEMM1 ordinary TDM + GEMM2 ordinary TDM store |541.17|587.89|
+
+Both-TDM gains are only0.80%/0.68% across GPUs; GPU2 gains are0.94%/1.40%.
+The larger initial GEMM1-only gain did not fully repeat. Fewer TDM instructions
+have not produced a large measured gain. Keep the experiments optional.
 
 ## Fine-cycle findings and limitations
 
@@ -191,24 +252,20 @@ BENCH_IPF=legacy bash op_tests/multigpu_tests/mega_moe_diagnostics/run.sh affini
 python op_tests/multigpu_tests/mega_moe_diagnostics/analyze.py op_tests/multigpu_tests/mega_moe_diagnostics/ipflegacy_p96_cycles_repeat_01
 ```
 
-## Next actions / do not lose these constraints
+## Validation notes and remaining experiments
 
-1. Validate the committed source-rank padding code first; fix issues before timing.
-   Earlier packed-load correctness does not cover this added padding logic.
-2. Compare baseline/packed/source-shuffled GEMM1 and compact-plan with identical
-   settings. Record native E2E and normal-routing padding overhead.
-3. If GEMM1 gains, then investigate applying the same source-rank property to
-   GEMM2/combine. Do not assume same-rank destinations imply contiguous token slots.
-4. Keep source readiness and A readiness distinct. Keep negative padding mappings
-   and live metadata correct across graph generations and empty experts.
-5. Repeat the fine-cycle capture. A packed benchmark was stopped when foreign
-   processes appeared during compilation; no valid packed performance result
-   exists at this checkpoint. Do not recycle that run as a benchmark.
-
-Original raw artifacts are local to the previous host:
-`/workspace/gpubench/s1f_fine_cycles_20261119`,
-`/workspace/gpubench/s1f_plan_pack_20261119`, and
-`/workspace/gpubench/s1f_src_rank_shuffle_20261119`.
-They are not required to run the committed scripts and are not presumed present
-on another machine. No cluster, queue or GEMM2 experiment should be silently
-combined with this comparison.
+- Initial post-reboot source-shuffle validation found a null `tile_storage`
+  pointer in the external-ready planner arguments. It is now passed when source
+  shuffle is enabled, and the existing test checks it before launch. Retry and
+  full-size tests passed. Boot IDs are recorded in each diagnostic directory.
+- Wave-load correctness passed at257 and16384/rank. The full-size check covers
+  the nb4 LDS control gap. Linear GEMM2 passed both sizes with six changing-input
+  replays and original push reference. Ordinary-TDM timing must show `_eplinear`
+  in GEMM2's symbol, not `_epscatter`.
+- Normal routing can increase GEMM work because every source segment rounds up
+  to M256. Balanced timings must not be presented as normal-routing timings.
+- Prior fine-cycle data above are historical. A second uncontended fine-cycle
+  capture remains a separate experiment; current priority is GEMM1/GEMM2 timing.
+- Next-machine commands need the installed AITER/MORI and pinned FlyDSL0.5.0.
+  No temporary overlay under `/workspace/gpubench` is needed for the TDM paths.
+  Keep source readiness, A readiness, and combine completion distinct.

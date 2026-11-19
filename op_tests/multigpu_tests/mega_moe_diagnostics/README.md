@@ -20,5 +20,6 @@ Do not regenerate an overlay while a process is importing/JIT-compiling it.
 Every run records its source and environment under `ipf*_p*_LABEL`. Use unique
 labels, and compare like timing scopes. See REVIEW.md for cycle probe ordering
 and instrumentation caveats. Source-shuffle prelaunch reviews are also recorded
-in the main kernel README. GPU validation of the newly committed source-shuffle
-path is pending.
+in the main kernel README. Wave-load and linear GEMM2 correctness both pass at257 and16384/rank.
+Use `BENCH_EP_LINEAR_STORE=1` with the packed/source-shuffle switches to test
+one ordinary GEMM2 TDM store per wave. See the handoff README for actual timings.

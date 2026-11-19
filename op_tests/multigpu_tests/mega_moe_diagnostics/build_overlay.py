@@ -1,6 +1,7 @@
 """Build opt-in fine cycle instrumentation from the current S1F sources."""
 
 from pathlib import Path
+import textwrap
 
 ROOT = Path(__file__).resolve().parent
 SRC = Path(__file__).resolve().parents[3] / "aiter/ops/flydsl/kernels/mega_moe_gfx1250"
@@ -141,7 +142,7 @@ new = """                    if const_expr(chunk == 0):
                             lds_rows, output, scale_rows, local + off_rowmap,
                             window.base, window.stride, row0, end,
                         )"""
-s = replace(s, old, new)
+s = replace(s, textwrap.indent(old, "    "), textwrap.indent(new, "    "))
 s = replace(
     s,
     "            comm_ops.waitcnt_stores()\n            if const_expr(tile_ready):",

@@ -11,6 +11,7 @@ import torch
 
 from ...moe_apreshuffled_quant_scatter import validate_apre_k
 from ...tensor_shim import _preload_compiled, _run_compiled, ptr_arg
+from .. import linear_combine
 from ..compact_plan import compact_plan_blocks, compile_tdm_compact_plan
 from ..dispatch_pull import compile_pull_dispatch
 from ..s1f_ctl import _QUANT_FUSE_BLOCKS, read_s1f_mode
@@ -36,6 +37,14 @@ def check(config):
         or os.environ.get("AITER_MOE_S1F_PRODUCER_GROUP", "1") != "1"
     ):
         raise ValueError("packed pull requires external-ready S1F group1")
+    if linear_combine.enabled(config) and (
+        not source_shuffle
+        or config.experts_per_rank % 32
+        or config.combine_quant_bits != 0
+    ):
+        raise ValueError(
+            "linear EP store requires source shuffle, E%32=0 and bf16 combine"
+        )
     if config.dispatch_wire != "fp4":
         raise ValueError("AITER_MEGA_DISPATCH_PULL requires FP4 dispatch")
     if os.environ.get("AITER_MEGA_S1F_PULL", "0") == "1":
@@ -77,6 +86,10 @@ def regions(config, geometry):
         if os.environ.get("AITER_MOE_S1F_READY_FIRST", "0") == "1":
             extra["pull_ready"] = 12
         extra["pull_tile_flag"] = (geometry.cap + FLAG_M - 1) // FLAG_M * FLAG_STRIDE
+    if linear_combine.enabled(config):
+        extra["ep_linear_base"] = config.world_size * config.experts_per_rank * 4
+        extra["ep_linear_tiles"] = ((geometry.cap + 255) // 256) * 4
+        extra["ep_linear_slots"] = geometry.max_routes * 4
     return extra
 
 
@@ -109,6 +122,7 @@ class PullDispatch:
         if self.ready_queue and not self.ready_first:
             raise ValueError("ready queue requires pull S1F with READY_FIRST=1")
         self.src_rank_shuffle = os.environ.get("AITER_MEGA_PULL_SRC_SHUFFLE", "0") == "1"
+        self.linear_store = linear_combine.enabled(config)
         self.packed = os.environ.get("AITER_MEGA_PULL_PLAN_PACK", "0") == "1"
         if self.packed and (not self.fused or self.ready_first or self.producer_group != 1):
             raise ValueError("experimental packed pull requires external-ready S1F group1")
@@ -180,7 +194,11 @@ class PullDispatch:
             hidden,
             self.wire_ptr,
             weights,
-            self.tile_storage.data_ptr() if self.ready_first else 0,
+            (
+                self.tile_storage.data_ptr()
+                if self.ready_first or self.src_rank_shuffle
+                else 0
+            ),
             self.affinity_heads.data_ptr() if self.ready_first else 0,
             stream,
         )
@@ -228,6 +246,14 @@ class PullDispatch:
             write_tok_map=self.packed,
             pull_pack=self.packed,
             pull_src_shuffle=self.src_rank_shuffle,
+            linear_capacity=linear_combine.capacity(config) if self.linear_store else 0,
+            off_linear_base=arena.offset("ep_linear_base") if self.linear_store else 0,
+            off_linear_tiles=(
+                arena.offset("ep_linear_tiles") if self.linear_store else 0
+            ),
+            off_linear_slots=(
+                arena.offset("ep_linear_slots") if self.linear_store else 0
+            ),
             off_packed=arena.offset("pull_packed") if self.packed else 0,
             off_pack_done=arena.offset("pull_pack_done") if self.packed else 0,
             off_pull_map=arena.offset("ep_rowmap"),
@@ -410,10 +436,17 @@ class PullDispatch:
             "producer_group": self.producer_group,
             "packed_input": self.packed,
             "src_rank_shuffle": self.src_rank_shuffle,
+            "packed_wave_load": self.src_rank_shuffle
+            and os.environ.get("AITER_MEGA_PULL_WAVE_LOAD", "1") == "1",
+            "packed_load_k_bytes": int(
+                os.environ.get("AITER_MEGA_PULL_LOAD_K_BYTES", "1024")
+            ),
             "off_packed": self.arena.offset("pull_packed") if self.packed else 0,
             "tile_ready": (
-                self.tile_ready and int(kw["tile_m"]) == 256
-                and not self.ready_queue and not self.cluster_local
+                self.tile_ready
+                and int(kw["tile_m"]) == 256
+                and not self.ready_queue
+                and not self.cluster_local
                 and self.producer_group == 1
             ),
         }

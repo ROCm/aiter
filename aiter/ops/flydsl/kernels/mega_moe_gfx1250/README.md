@@ -1118,15 +1118,21 @@ compact-plan; S1F producers use ordinary TDM loads. Add
 `AITER_MEGA_PULL_SRC_SHUFFLE=1` to align every `(expert, source_rank)` segment
 to M256. **Every valid row in an M256 then belongs to the same source rank,
 including normal routing. Padding rows are not tokens and have route=-1.**
-Both new switches default off. This first version requires external-ready S1F,
-one-TG producers and M256. GEMM2 code is unchanged; its existing negative-route
-scatter mask discards padding.
+Both packing switches default off. This version requires external-ready S1F,
+one-TG producers and M256. `AITER_MEGA_PULL_WAVE_LOAD=1` (default when source
+shuffle is on) loads M64 per wave/K segment, with no per-M16 tensor wait.
+`AITER_MEGA_PULL_LOAD_K_BYTES=1024` uses three K segments for H5120.
 
-Status: the earlier packed-load prototype passed EP4 correctness at257 and16384
-per rank; the added source-alignment/padding code is not yet GPU-validated.
-No packed or source-shuffle speedup has been measured. The user requested this
-checkpoint before GPU access became available. First validate, then establish a
-GEMM1 improvement; only afterward experiment on GEMM2.
+`AITER_MEGA_EP_LINEAR_STORE=1` additionally assigns contiguous source-home landing
+slots in compact-plan and replaces GEMM2 gather-stores with one ordinary TDM
+store per wave/M64. The reduce maps those slots back to the original top-k
+order. It currently supports bf16 combine and experts/rank divisible by32.
+
+Status: both wave-level GEMM1 and linear-store GEMM2 passed EP4 correctness at257
+and16384 tokens/rank with six changing-input replays. First timing results and
+reproduction commands are in the handoff README. The latest priority is GEMM1
+and GEMM2 timing, independent of planner/E2E overhead. No stable GEMM2 speedup
+is claimed from a single run.
 
 Three source-shuffle reviews before GPU launch: (1) capacity covers all source
 segment tails, source owners alone invalidate their padding, packed pointers

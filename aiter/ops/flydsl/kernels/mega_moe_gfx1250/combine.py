@@ -140,6 +140,7 @@ def _make_combine_direct_reduce(
     hidden_dim,
     slot_stride_nbytes,
     add_shared=False,
+    remap_slots=False,
 ):
     """Stage B for the bf16 wire without the LDS round trip.
 
@@ -172,6 +173,7 @@ def _make_combine_direct_reduce(
         addr_out: Int64,
         cur_rank_num_token: Int32,
         addr_shared: Int64,
+        addr_slot_map: Int64,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -190,10 +192,22 @@ def _make_combine_direct_reduce(
             in_off = fx.Int64(tok) * fx.Int64(topk * stride_e) + fx.Int64(e0)
             row_off = fx.Int64(tok) * fx.Int64(hidden_dim) + fx.Int64(e0)
             # All loads first, so a lane has topk (+1) b128 in flight at once.
+            slots = []
+            for k in range_constexpr(topk):
+                offset = in_off + k * stride_e
+                if const_expr(remap_slots):
+                    slot = tok * topk + k
+                    slot_ptr = fx.inttoptr(
+                        fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
+                        addr_slot_map,
+                    )
+                    slot = fx.generic_load(fx.add_offset(slot_ptr, slot))
+                    offset = fx.Int64(slot) * stride_e + fx.Int64(e0)
+                slots.append(offset)
             raws = [
                 fx.Vector(
                     fx.generic_load(
-                        fx.add_offset(inp_iter, in_off + k * stride_e),
+                        fx.add_offset(inp_iter, slots[k]),
                         count=8,
                         nontemporal=True,
                     )
@@ -224,6 +238,7 @@ def _make_combine_direct_reduce(
         addr_out: Int64,
         cur_rank_num_token: Int32,
         addr_shared: Int64,
+        addr_slot_map: Int64,
         n_blocks: Int32,
         stream=fx.Stream(None),  # noqa: B008
     ):
@@ -232,6 +247,7 @@ def _make_combine_direct_reduce(
             addr_out,
             cur_rank_num_token,
             addr_shared,
+            addr_slot_map,
         ).launch(
             grid=(n_blocks, 1, 1),
             block=[lanes, 1, 1],
