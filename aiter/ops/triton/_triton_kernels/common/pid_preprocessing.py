@@ -24,6 +24,37 @@ def remap_xcd_chunked(
 
 
 @triton.jit
+def remap_xcd_aid(
+    pid,
+    GRID_MN,
+    NUM_AIDS: tl.constexpr = 2,
+    XCDS_PER_AID: tl.constexpr = 4,
+    AID_CONTIGUOUS: tl.constexpr = True,
+):
+    """AID-aware remap for parts whose L2 is shared by the XCDs inside an AID, such as gfx1250.
+
+    Hardware dispatches round-robin over the W = NUM_AIDS * XCDS_PER_AID XCDs, so this gives each
+    XCD a contiguous run of pids and places same-AID XCDs next to each other. An AID then owns a
+    contiguous super-block of the tile space and operand-sharing tiles hit one shared L2.
+    AID_CONTIGUOUS selects between contiguous XCD groups and interleaved AIDs.
+    """
+    W: tl.constexpr = NUM_AIDS * XCDS_PER_AID
+    # The ragged tail maps to itself, which keeps the remap a bijection without per-XCD counting.
+    if pid >= (GRID_MN // W) * W:
+        return pid
+    xcd_g = pid % W
+    pos = pid // W
+    if AID_CONTIGUOUS:
+        aid = xcd_g // XCDS_PER_AID
+        xcd_l = xcd_g % XCDS_PER_AID
+    else:
+        aid = xcd_g % NUM_AIDS
+        xcd_l = xcd_g // NUM_AIDS
+    lx = aid * XCDS_PER_AID + xcd_l
+    return lx * (GRID_MN // W) + pos
+
+
+@triton.jit
 def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
     # Legacy callers discard the result and rely on the default. Callers using
     # the remapped PID must pass the device's XCD count.

@@ -6,6 +6,7 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._gluon_kernels.gfx1250.layouts import cga_bases
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -62,27 +63,6 @@ _PRESHUFFLE_GLUON_REPR_KEYS = [
 # so at 2x2 each operand tile is fetched once per cluster and multicast to the
 # two CTAs that want it -- half the operand request traffic of four independent
 # CTAs, at unchanged per-CTA LDS.
-
-
-@gluon.constexpr_function
-def cga_bases(ctas_m, ctas_n):
-    """Pure-python ``make_cga_layout([m, n], [m, n], [0, 1])``.
-
-    Deliberately not a call into libtriton's ``make_cga_layout``: gluon's
-    dependency walker inspects the globals of every function a kernel body
-    references and rejects nanobind builtins outright ("Unsupported function
-    referenced"), so even a constexpr_function wrapper around it cannot be used
-    from inside a kernel. Equivalence is asserted in the op test.
-    """
-    bases = []
-    for dim, ctas in ((0, ctas_m), (1, ctas_n)):
-        bit = 1
-        while bit < ctas:
-            basis = [0, 0]
-            basis[dim] = bit
-            bases.append(basis)
-            bit *= 2
-    return bases
 
 
 @gluon.constexpr_function
