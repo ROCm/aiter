@@ -175,14 +175,18 @@ python3 -m pytest op_tests/test_mla_decode_pagesize64.py -k Nvfp4 -q
 python3 op_tests/test_mla_decode_pagesize64.py --kv-layout nvfp4_n128 -b 5120 6144 7168 -c 5120 8192 10240
 ```
 
-The page64 tests start from BF16 Q/KV, call both GPU producers, and check the
-unified decode entry against full FP32 attention on those BF16 inputs. Output
-and finite LSE use `atol=rtol=0.3` with the page64 benchmark's existing 5%
-element-mismatch budget. A per-request normalized RMS output error limit of
-0.3 also rejects zero outputs for long histories. These are
-end-to-end quantization tolerances, separate from the stricter quantized
-oracle checks in `test_mla_nvfp4.py`. Invalid tail tokens are NaN; empty requests
-must return exact zero output and negative-infinity LSE.
+`test_mla_nvfp4.py` compares the decoder with an independent quantized oracle.
+The restored maximum absolute output error is `np.max(np.abs(diff)) <= 0.025`.
+It also requires normalized RMS output error at most `0.003` and LSE absolute
+error at most `2e-4` (`rtol=0`), with no element-mismatch allowance.
+
+The page64 tests start from BF16 Q/KV, call both GPU producers, and compare the
+unified decode entry with full FP32 attention on the original BF16 inputs.
+This comparison includes the full quantization error. Its current NVFP4 limits
+are `atol=rtol=0.3` for output and finite LSE, a 5% element-mismatch budget, and
+per-request normalized RMS output error at most `0.3`. The `0.025` bound above
+applies to the quantized-oracle comparison. Invalid tail tokens are NaN;
+empty requests must return exact zero output and negative-infinity LSE.
 
 The CLI reports mean decode time from 30 HIP-event samples of a 32-dispatch
 graph, with a same-format warm graph before each sample. It excludes
@@ -288,7 +292,8 @@ comparison above uses AITER's original N64-tile FP8 kernel, not the #7987 NVFP4 
 ### Current validation (2026-11-19)
 
 The final public test suite passed **43 selected tests on d07-2**, with no skips,
-using the restored maximum absolute output error of 0.025.
+using the restored maximum absolute output error of 0.025 for the
+quantized-oracle checks.
 
 The N16-only implementation was validated on gfx1250 B0 hardware on d07-2 and
 a07-3 with the same pinned ROCm/PyTorch image. The quantized-oracle checks use
