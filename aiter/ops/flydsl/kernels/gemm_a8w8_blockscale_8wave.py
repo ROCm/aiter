@@ -863,8 +863,13 @@ def compile_gemm_fp8_8wave(N, K, preshuffle_b=False):
                     )
                     end_compute_phase()
 
-            # The last iteration's prefetch reads past K; nothing consumes it.
-            pre_scale_a, pre_scale_b = prefetch_first_phase(kiter + 2)
+            # On the last iteration this prefetch is dead work: it reads stale
+            # A and ScaleA from LDS, loads ScaleB past K, and issues an A DMA
+            # past K that the epilogue must wait for. A single-iteration loop
+            # (K=256) omits it statically. Longer loops keep it: a runtime
+            # branch or a peeled last iteration both spill over 200 VGPRs.
+            if const_expr(num_tiles > 2):
+                pre_scale_a, pre_scale_b = prefetch_first_phase(kiter + 2)
         # Drain the final BR[s1] partial using the state retained by the loop.
         for m0 in range_constexpr(PHASE_M_REP):
             for n0 in range_constexpr(N_REP):
