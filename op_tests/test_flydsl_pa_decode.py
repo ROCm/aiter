@@ -2072,6 +2072,20 @@ _MXFP4_GFX1250_CASES = [
             "lengths": (32768, 30001, 4100),
         },
     ),
+    # Split-row MTP whose clusters give each CTA 8 tiles runs whole: one
+    # 4-M-tile CTA a sequence and KV head, 4-CTA clusters of 8k contexts.
+    (
+        "mxfp4-mtp4-whole-cluster",
+        {
+            **_MXFP4_BASE,
+            "query_dtype": torch.bfloat16,
+            "query_length": 4,
+            "kv_heads": 4,
+            "cluster": 4,
+            "splits": 1,
+            "lengths": (8192, 8000, 7937, 8192) * 4,
+        },
+    ),
     (
         "mxfp4-mtp4-graph",
         {
@@ -2625,6 +2639,7 @@ def _run_pa_decode_case(case, device, monkeypatch):
             "fused": None,
             "pairs": None,
             "dims": None,
+            "splits": None,
             "cluster_seqs": None,
             "cluster_steps": None,
             "cluster_runs": None,
@@ -2969,6 +2984,8 @@ def _run_pa_decode_case(case, device, monkeypatch):
         if case["pairs"] is not None and arch == "gfx1250":
             pairs = any(k.get("wave_pairs") for k in compile_kwargs)
             assert pairs == case["pairs"], compile_kwargs[-1]
+        if case["splits"] is not None and arch == "gfx1250":
+            assert compile_kwargs[-1]["query_splits"] == case["splits"]
         if case["dims"] is not None and arch == "gfx1250":
             dims = any(k.get("wave_dims") for k in compile_kwargs)
             assert dims == case["dims"], compile_kwargs[-1]

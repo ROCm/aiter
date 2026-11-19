@@ -527,6 +527,26 @@ def _pa_decode_mxfp4(
     rows = query_length * group // splits
     resident_ctas = mxfp4_gfx1250_resident_ctas(rows, num_compute_units)
     partitions = 1 if direct else min(work_plan.max_partitions, capacity, seq_tiles)
+    # Split 41-64-row MTP (G16 x MTP4) runs whole, one CTA of 3-4 M-tiles a
+    # CU dequantizing V once rather than once a split, when its clusters fit
+    # one round with at least 8 tiles a CTA (B64 x 8k: 17.5 -> 15.9 us;
+    # B128 x 8k, 2-CTA clusters instead of the reducer: 29.9 -> 25.9 us; 2 KV
+    # heads at B32 x 8k: 17.7 -> 16.5 us). With 4 tiles a CTA the splits'
+    # shorter tiles win (B32 x 8k: 11.5 against 11.7 us).
+    if gfx1250 and splits > 1 and query_length > 1 and 40 < query_length * group:
+        whole_ctas = -(-num_compute_units // num_kv_heads)
+        whole_size = min(partitions, CLUSTER_PARTITIONS)
+        while whole_size > 2 and num_seqs * whole_size > whole_ctas:
+            whole_size //= 2
+        if (
+            same_strides
+            and 2 <= partitions <= CLUSTER_GROUPED_PARTITIONS
+            and num_seqs * whole_size <= whole_ctas
+            and num_seqs * num_kv_heads <= num_compute_units * 15 // 16
+            and seq_tiles >= 8 * whole_size
+        ):
+            splits, rows = 1, query_length * group
+            resident_ctas = mxfp4_gfx1250_resident_ctas(rows, num_compute_units)
     cluster_size = min(partitions, CLUSTER_PARTITIONS)
     cluster_ctas = max(capacity, -(-2 * num_compute_units // num_kv_heads))
     if rows > 32:
@@ -642,6 +662,7 @@ def _pa_decode_mxfp4(
             wave_partials=wave_partials,
             wave_pairs=wave_pairs,
             wave_dims=wave_dims,
+            query_splits=splits if gfx1250 else None,
         )
     pmax = psum = pout = output
     if not direct:
