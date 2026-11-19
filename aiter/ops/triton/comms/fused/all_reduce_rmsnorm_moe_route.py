@@ -1,26 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import ctypes
-
 import torch
-import torch.distributed as dist
 import triton
 
 from aiter.ops.triton._gluon_kernels.gfx950.comms.fused.all_reduce_rmsnorm_moe_route import (
     _all_reduce_rmsnorm_moe_route_kernel,
 )
+from aiter.ops.triton.comms.ipc_buffers import ERROR_BYTES, IpcCommBuffers
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 _CONFIG_NAME = "ALL_REDUCE_RMSNORM_MOE_ROUTE"
-_SUPPORTED_WORLDS = (2, 4, 8)
 _MAX_HIDDEN = 8192
 _MAX_TOKENS = 512
-_ERROR_BYTES = 256  # the error record [flag, rank, colour, site], then padding
 _SCORING = {"sigmoid": 0, "softmax": 1}
 
 
@@ -48,12 +43,11 @@ def _plan_layout(c):
     assert c.nrc > 0, "too many tokens for the CTAs"
     c.tpc = triton.cdiv(ntask, c.nrc)
     hb = c.hidden * 2
-    c.offsets = {"os": _ERROR_BYTES}
+    c.offsets = {"os": ERROR_BYTES}
     c.offsets["rs"] = c.offsets["os"] + 2 * c.world * c.s1max * hb
     c.offsets["ag"] = c.offsets["rs"] + 2 * c.world * c.gmax * hb
     c.offsets["pk"] = c.offsets["ag"] + 2 * c.world * c.gmax * hb
-    end = c.offsets["pk"] + 2 * c.max_tokens * 2 * c.topk * 8
-    c.nbytes = triton.cdiv(end, 2 << 20) * (2 << 20)
+    c.nbytes = c.offsets["pk"] + 2 * c.max_tokens * 2 * c.topk * 8  # _open rounds it up
     # scratch (int64 words): ready words, partial logits [KP][rmax][E], one-shot picks
     c.scx = 0
     c.scl = triton.cdiv(c.rmax, 64) * 64
@@ -82,7 +76,7 @@ def _lds_bytes(c, tokens):
     return max(router, route, sort)
 
 
-class AllReduceRmsnormMoeRoute:
+class AllReduceRmsnormMoeRoute(IpcCommBuffers):
     """
     The IPC buffers, scratch and launch colours of ``fused_all_reduce_rmsnorm_moe_route``
     for one group of 2, 4 or 8 ranks on gfx950, for one model shape.
@@ -90,7 +84,9 @@ class AllReduceRmsnormMoeRoute:
     Each rank has one uncached IPC buffer: an error record, the one-shot inbox, the
     reduce-scatter and all-gather inboxes (2 halves each, for odd and even launches) and the
     exchange of the top-k picks. The constructor, ``reset`` and ``close`` are collective: all
-    ranks of the group must call them.
+    ranks of the group must call them. Call ``reset`` after a wait timed out and at least
+    once every 2^31 launches. The error sites of ``error()`` are 1 (reduce), 2 (all-gather),
+    3 (router), 4 (route) and 5 (sort).
 
     The kernel must fit in the 160 KiB of LDS of a CU for each token count up to max_tokens.
     The constructor rejects the other shapes. Many experts, a large topk and a large max_tokens
@@ -122,13 +118,7 @@ class AllReduceRmsnormMoeRoute:
         timeout_s=60.0,
         config=None,
     ):
-        from aiter.dist.device_communicators.custom_all_reduce import IPCBufferPool
-
-        assert get_arch() == "gfx950", "needs gfx950"
-        self.world = dist.get_world_size(group)
-        assert (
-            self.world in _SUPPORTED_WORLDS
-        ), f"the group size must be one of {_SUPPORTED_WORLDS}"
+        super().__init__(group, timeout_s)
         assert (
             hidden % 64 == 0 and hidden <= _MAX_HIDDEN
         ), f"hidden must be a multiple of 64, up to {_MAX_HIDDEN}"
@@ -137,21 +127,15 @@ class AllReduceRmsnormMoeRoute:
         ), "experts: a multiple of 16"
         assert 1 <= topk <= min(64, num_experts), "topk must be 1 to 64"
         assert 0 < max_tokens <= _MAX_TOKENS, f"max_tokens must be 1 to {_MAX_TOKENS}"
-        self.timeout_us = max(1, int(timeout_s * 1e6))
-        assert self.timeout_us < 2**31, "timeout_s is too large"
-        self.group = group
-        self.rank = dist.get_rank(group)
         self.hidden, self.max_tokens = hidden, max_tokens
         self.num_experts, self.topk, self.router_fp32 = num_experts, topk, router_fp32
-        self.device = torch.device("cuda", torch.cuda.current_device())
         self.config = _get_config()
         if config is not None:
             unknown = sorted(set(config) - set(self.config))
             assert not unknown, f"unknown config keys: {unknown}"
             self.config.update(config)
-        cus = torch.cuda.get_device_properties(self.device).multi_processor_count
         # All CTAs must run at the same time: one CTA a CU.
-        self.blocks = min(self.config["BLOCKS"], cus)
+        self.blocks = min(self.config["BLOCKS"], self.num_cus)
         self.num_warps = self.config["num_warps"]
         _plan_layout(self)
         routed = max(self.routed_rows(t) for t in self.warmup_tokens())
@@ -168,71 +152,12 @@ class AllReduceRmsnormMoeRoute:
         self.scratch = torch.zeros(
             self.scratch_words, dtype=torch.int64, device=self.device
         )
-        self._pool = IPCBufferPool(self.device, group)
-        self._pool.create("inbox", self.nbytes, uncached=True)
-        addrs = self._pool.open_peer_buffers("inbox")
-        # The buffers of ranks rank, rank + 1, ..., rank + world - 1.
-        self.peers = tuple(
-            addrs[(self.rank + d) % self.world] for d in range(self.world)
-        )
-        self.colors = torch.empty(self.blocks, dtype=torch.int32, device=self.device)
-        self._clear()
-        dist.barrier(group=self.group)
+        self._open(self.nbytes, self.blocks)
 
     def _clear(self):
-        """Fills the inboxes with 0xFFFF (empty), clears the error record, the scratch and the
-        colours."""
-        from aiter.dist.device_communicators.custom_all_reduce import (
-            _loaded_hip_runtime,
-        )
-
-        rt = _loaded_hip_runtime()
-        torch.cuda.synchronize(self.device)
-        own = ctypes.c_void_p(self.peers[0])
-        err = rt.hipMemset(own, 0xFF, ctypes.c_size_t(self.nbytes))
-        err = err or rt.hipMemset(own, 0, ctypes.c_size_t(_ERROR_BYTES))
-        assert err == 0, f"hipMemset failed: {err}"
+        """Also clears the scratch."""
         self.scratch.zero_()
-        self.colors.zero_()
-        torch.cuda.synchronize(self.device)
-
-    def error(self):
-        """
-        Returns the error record of this rank: [0, 0, 0, 0], or [1, rank, colour, site] after
-        a wait timed out (site 1: reduce, 2: all-gather, 3: router, 4: route, 5: sort).
-        Synchronizes the device.
-        """
-        from aiter.dist.device_communicators.custom_all_reduce import (
-            _loaded_hip_runtime,
-        )
-
-        record = (ctypes.c_int32 * 4)()
-        torch.cuda.synchronize(self.device)
-        err = _loaded_hip_runtime().hipMemcpy(
-            record, ctypes.c_void_p(self.peers[0]), ctypes.c_size_t(16), 2
-        )
-        assert err == 0, f"hipMemcpy failed: {err}"
-        return list(record)
-
-    def reset(self):
-        """Empties the inboxes, clears the error record, the scratch and the colours. All ranks
-        must call it with no launch in flight, after a time-out and at least once every 2^31
-        launches."""
-        torch.cuda.synchronize(self.device)
-        dist.barrier(group=self.group)
-        self._clear()
-        dist.barrier(group=self.group)
-
-    def close(self):
-        """Unmaps the peer buffers and frees the buffer of this rank. All ranks must call it."""
-        if self._pool is None:
-            return
-        torch.cuda.synchronize(self.device)
-        dist.barrier(group=self.group)
-        self._pool.close_peer_buffers()
-        dist.barrier(group=self.group)  # no peer uses the buffer of this rank now
-        self._pool.close()
-        self._pool = None
+        super()._clear()
 
     def one_shot(self, tokens):
         """The protocol for a call: one-shot push (one hop, every rank reduces and routes every
