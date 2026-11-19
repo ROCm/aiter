@@ -70,6 +70,19 @@ def _fly_aware_lds_extraction():
 
 _DIM0_LO_SGPR = 1  # GROUP1 sgpr1[31:16] holds tensor_dim0[15:0]
 _DIM0_HI_SGPR = 2  # GROUP1 sgpr2[15:0]  holds tensor_dim0[31:16]
+_DIM1_STRIDE_LO_SGPR = 6  # GROUP1 sgpr6[31:16] holds tensor_dim1_stride[15:0]
+
+
+def _with_unit_dim1_stride(desc: TDMDescriptor2D) -> TDMDescriptor2D:
+    """Set a built descriptor's ``tensor_dim1_stride`` to 1, keeping sgpr6[15:0]."""
+    g1 = Vec(desc.dgroup1)
+    lanes = [fx.Uint32(g1[i]) for i in range(8)]
+    word = lanes[_DIM1_STRIDE_LO_SGPR]
+    lanes[_DIM1_STRIDE_LO_SGPR] = (word & 0xFFFF) | fx.Uint32(1 << 16)
+    return TDMDescriptor2D(
+        dgroup0=desc.dgroup0,
+        dgroup1=Vec.from_elements(lanes, fx.Uint32).ir_value(),
+    )
 
 
 def _clamp_inner_extent(desc: TDMDescriptor2D, bound) -> TDMDescriptor2D:
@@ -100,10 +113,19 @@ def clamp_tensor_descriptor_2d_inner_extent(
     return _clamp_inner_extent(desc, bound)
 
 
-def make_tensor_descriptor_2d(*args, oob_inner_bound=None, **kwargs) -> TDMDescriptor2D:
-    """``tdm_ops.make_tensor_descriptor_2d`` accepting a Fly ``lds_memref``."""
+def make_tensor_descriptor_2d(
+    *args, oob_inner_bound=None, unit_dim1_stride=False, **kwargs
+) -> TDMDescriptor2D:
+    """``tdm_ops.make_tensor_descriptor_2d`` accepting a Fly ``lds_memref``.
+
+    ``unit_dim1_stride`` sets ``tensor_dim1_stride`` to 1. The 2-D builder leaves
+    it zero, and a one-row tensor and tile load with a zero stride hangs the
+    data mover.
+    """
     with _fly_aware_lds_extraction():
         desc = _tdm_ops.make_tensor_descriptor_2d(*args, **kwargs)
+    if unit_dim1_stride:
+        desc = _with_unit_dim1_stride(desc)
     if oob_inner_bound is None:
         return desc
     assert (
