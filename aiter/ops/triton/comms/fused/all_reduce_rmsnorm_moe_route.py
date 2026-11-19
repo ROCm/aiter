@@ -106,6 +106,9 @@ class AllReduceRmsnormMoeRoute:
         topk (int): The experts of a token.
         router_fp32 (bool): The router weights are fp32 (else bf16).
         timeout_s (float): The time limit of each wait in the kernel.
+        config (dict, optional): Values that replace the values of the JSON config, for
+            example to sweep them in the benchmark. The keys are BLOCKS, num_warps,
+            ONESHOT_MAX_ROWS, ONESHOT_MAX_BYTES, ROUTER_STEPS_FP32 and ROUTER_STEPS_BF16.
     """
 
     def __init__(
@@ -117,6 +120,7 @@ class AllReduceRmsnormMoeRoute:
         topk,
         router_fp32=True,
         timeout_s=60.0,
+        config=None,
     ):
         from aiter.dist.device_communicators.custom_all_reduce import IPCBufferPool
 
@@ -141,6 +145,10 @@ class AllReduceRmsnormMoeRoute:
         self.num_experts, self.topk, self.router_fp32 = num_experts, topk, router_fp32
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.config = _get_config()
+        if config is not None:
+            unknown = sorted(set(config) - set(self.config))
+            assert not unknown, f"unknown config keys: {unknown}"
+            self.config.update(config)
         cus = torch.cuda.get_device_properties(self.device).multi_processor_count
         # All CTAs must run at the same time: one CTA a CU.
         self.blocks = min(self.config["BLOCKS"], cus)

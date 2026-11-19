@@ -3,8 +3,10 @@
 """Gluon all-reduce + residual add + RMSNorm (+ MXFP8) + router + top-k + moe_sorting on 2,
 4 or 8 gfx950 GPUs. The defaults are the MiniMax-M3.1 decode shape (hidden 6144, 128 experts,
 top-4 sigmoid + bias, Gemma norm, fp32 router). The time is the slowest rank, in a HIP
-graph."""
+graph. ``--sweep KEY=V1,V2`` times each combination of config values as one line: the AITER
+tuner cannot time a kernel that all ranks must launch together."""
 
+import itertools
 import multiprocessing as mp
 
 import torch
@@ -35,13 +37,29 @@ from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
 TOKENS = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 256]
 
 
-def benchmark(args, device, tp, comm):
+def _sweep_configs(args):
+    """The config overrides of the lines: the JSON config, or each combination of the
+    --sweep values."""
+    if not args.sweep:
+        return {"gluon": None}
+    keys, values = [], []
+    for item in args.sweep:
+        key, vals = item.split("=")
+        keys.append(key)
+        values.append([int(v) for v in vals.split(",")])
+    return {
+        ",".join(f"{k}={v}" for k, v in zip(keys, combo)): dict(zip(keys, combo))
+        for combo in itertools.product(*values)
+    }
+
+
+def benchmark(args, device, tp, comms):
     config = triton.testing.Benchmark(
         x_names=["tokens"],
         x_vals=args.tokens,
         line_arg="provider",
-        line_vals=["gluon"],
-        line_names=["gluon"],
+        line_vals=list(comms),
+        line_names=list(comms),
         ylabel="us",
         plot_name=get_caller_name_no_ext(),
         args={},
@@ -61,6 +79,7 @@ def benchmark(args, device, tp, comm):
     @triton.testing.perf_report([config])
     def _run(tokens, provider):
         shape = (tokens, args.hidden)
+        comm = comms[provider]
 
         def gen_rot():
             x = torch.randn(shape, dtype=torch.bfloat16, device=device)
@@ -105,19 +124,28 @@ def _worker(rank, init_method, args):
     torch.cuda.set_device(device)
     aiter.init_dist_env(args.world_size, rank, distributed_init_method=init_method)
     tp = get_tp_group()
-    comm = AllReduceRmsnormMoeRoute(
-        tp.cpu_group,
-        max(args.tokens),
-        args.hidden,
-        args.experts,
-        args.topk,
-        router_fp32=args.router_fp32,
-    )
+    comms = {}
     try:
-        benchmark(args, device, tp, comm)
-        assert comm.error() == [0, 0, 0, 0], "a wait timed out"
+        for name, cfg in _sweep_configs(args).items():
+            try:
+                comms[name] = AllReduceRmsnormMoeRoute(
+                    tp.cpu_group,
+                    max(args.tokens),
+                    args.hidden,
+                    args.experts,
+                    args.topk,
+                    router_fp32=args.router_fp32,
+                    config=cfg,
+                )
+            except AssertionError as err:  # every rank rejects the same config
+                if rank == 0:
+                    logger.warning("config %s skipped: %s", name, err)
+        benchmark(args, device, tp, comms)
+        for comm in comms.values():
+            assert comm.error() == [0, 0, 0, 0], "a wait timed out"
     finally:
-        comm.close()
+        for comm in comms.values():
+            comm.close()
         aiter.destroy_dist_env()
 
 
@@ -138,6 +166,12 @@ def parse_args():
         action="store_false",
         default=True,
         help="bf16 router weights (default fp32)",
+    )
+    parser.add_argument(
+        "--sweep",
+        action="append",
+        metavar="KEY=V1,V2",
+        help="config values to time (repeat for more keys), for example BLOCKS=128,256",
     )
     parser.add_argument(
         "-o", action="store_true", default=False, help="Write results to CSV"
