@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Transport parts that the one-shot, mesh and ring all-reduce kernels share.
+"""Transport parts that the one-shot, mesh, ring and hierarchical all-reduce
+kernels share.
 
 This module contains the tile geometry, the inbox cache-policy table, the peer
 store and load primitives, and the LDS staging factory. The limits and the
@@ -11,7 +12,7 @@ policy records are in ``aiter.ops.flydsl.allreduce_policy``.
 import logging
 
 import flydsl.expr as fx
-from flydsl.expr import rocdl
+from flydsl.expr import gpu, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
 logger = logging.getLogger("aiter")
@@ -221,38 +222,21 @@ def _poll_v4i32(addr_i64):
     return fx.Vector.from_elements(halves, fx.Int64).bitcast(fx.Int32)
 
 
-# Lamport handshake of the mesh and the ring
-# ==========================================
+# Lamport handshake
+# =================
 #
-# An unwritten inbox dword holds the sentinel: the inbox is filled with
-# ``LAMPORT_FILL_BYTE``, and a reader re-arms every dword it has read. A
-# producer keeps its packets off the sentinel (``quick_allreduce_codec.
-# lamport_fix``), so a dword that is not the sentinel has landed. Each dword is
-# written once per round, so a torn 16 B arrival needs no special handling: a
-# dword that has not landed yet still reads as the sentinel.
+# An unwritten inbox dword holds the sentinel; the inbox starts filled with
+# ``LAMPORT_FILL_BYTE``. The protocol and the receive and re-arm helpers of the
+# mesh, ring and hierarchical kernels are in ``quick_allreduce_lamport``.
 LAMPORT_SENTINEL = -1
 LAMPORT_FILL_BYTE = 0xFF
 
 
-def _any_sentinel(vec):
-    """Whether any i32 of *vec* is still the Lamport sentinel."""
-    hit = vec[0] == fx.Int32(LAMPORT_SENTINEL)
-    for e in range(1, vec.numel):
-        hit = hit | (vec[e] == fx.Int32(LAMPORT_SENTINEL))
-    return hit
-
-
-def lamport_rearm_modifier(inbox_memory: str) -> int:
-    """``_CM_*`` bits of the stores that put the sentinel back.
-
-    On a cacheable inbox they write through (``sc0 sc1``): an ``nt`` store
-    could leave the sentinel dirty in our own L2, where it would hide a peer's
-    later push from the poll, and its eviction would overwrite that push. The
-    stores are local, so writing through costs no fabric traffic.
-    """
-    if _INBOX_POLICY[inbox_memory]["release"] is None:
-        return _CM_NT
-    return _CM_SC0 | _CM_SC1
+def _lds_free():
+    """Join the workgroup once this wave's LDS reads have landed, so the next
+    pack cannot overwrite rows that a push still reads."""
+    rocdl.s_waitcnt(lgkmcnt=0)
+    gpu.barrier()
 
 
 def _buffer_ptr(addr_i64, elem_ty, alignment, num_records_bytes=None):

@@ -14,6 +14,7 @@ stays ``ATOMS * rank_tile_bytes``.
 
 The geometry and the cache policy are in ``transport``.
 The wire codec is in ``quick_allreduce_codec``.
+The Lamport receive and re-arm helpers are in ``quick_allreduce_lamport``.
 
 One tuning knob besides the super-tile: ``block``, threads per workgroup. It
 sets the tile (``block * ATOMS * 16 B``), hence how many blocks a payload gets
@@ -42,7 +43,6 @@ from flydsl.expr.typing import T
 
 from ...allreduce_policy import (
     DEFAULT_MESH_KNOBS,
-    HANDSHAKES,
     MESH_CODECS,
     SUPPORTED_ARCHS,
     SUPPORTED_WORLDS,
@@ -61,41 +61,47 @@ from .quick_allreduce_codec import (
     _splat_f16x2,
     codecs_for_block,
     lamport_fix,
-    lamport_slots,
     scale_slot_of,
-    split_lamport_packet,
     thread_lane,
 )
 from .quick_allreduce_epilogue import QuickReducePlainEpilogue
 from .quick_allreduce_fusions import check_fusion_args
+from .quick_allreduce_lamport import (
+    check_handshake,
+    lamport_addrs,
+    lamport_first_reads,
+    lamport_offsets,
+    lamport_packets,
+    lamport_poll,
+    lamport_pushed,
+    lamport_rearm_dwords,
+    lamport_rearm_modifier,
+    lamport_spin,
+)
 from .quick_allreduce_rmsnorm import MeshRMSNormEpilogue
 from .transport import (
     _INBOX_POLICY,
-    _RECV_POLICY,
     ATOMS,
     BLOCK,
     FLAG_I32_PER_LANE,
     FLAG_LANES,
     LAMPORT_FILL_BYTE,
-    LAMPORT_SENTINEL,
     QUAD_LANES,
     QUADS_PER_WAVE,
     TILE_BYTES,
     WORLD,
     _acquire_inbox,
-    _any_sentinel,
     _buffer_load,
     _buffer_ptr,
-    _buffer_store,
     _color_io,
     _i32_to_bytes,
+    _lds_free,
     _load_flag,
     _load_peers,
     _release_inbox,
     _store_flag_peer,
     _store_v4i32_peer,
     _to_sgpr_i64,
-    lamport_rearm_modifier,
     make_pack_storage,
 )
 
@@ -283,9 +289,7 @@ def make_quick_allreduce_mesh_kernel(
     knobs: MeshKnobs = DEFAULT_MESH_KNOBS,
 ):
     check_fusion_args(fusion, hidden, h_pad, mxfp4=mxfp4)
-    if handshake not in HANDSHAKES:
-        raise ValueError(f"handshake must be one of {HANDSHAKES}, got {handshake!r}")
-    lamport = handshake == "lamport"
+    lamport = check_handshake(handshake)
     knobs = MeshKnobs.parse(knobs)
     knobs.check(handshake=handshake, super_tile=super_tile, where="knobs")
     if knobs.prefetch and fusion != "none":
@@ -855,58 +859,21 @@ def make_quick_allreduce_mesh_kernel(
             """
             _prio(knobs.prio)
             _fanout_nt(buf, rank, sub, row0)
-            if const_expr(release_scope is not None):
-                _release_inbox(release_scope)
+            lamport_pushed(release_scope)
             if const_expr(not keep_prio):
                 _prio(0)
 
-        def _poll_spin(got, addrs):
-            """Re-read *addrs* until no dword of *got* is the sentinel.
-
-            ``poll_sleep`` knob: ``s_sleep`` is a pure issue-rate hint (the
-            wave idles ~64 cycles per unit before its next re-read). It
-            orders nothing and the loop exit still depends on the loaded
-            values, so it cannot change which value a poll accepts. FlyDSL has
-            no typed sleep API, hence the raw call; it is emitted only when
-            the knob is non-zero.
-            """
-            while _any_sentinel(got):
-                if const_expr(knobs.poll_sleep != 0):
-                    rocdl.s_sleep(knobs.poll_sleep)
-                got = fx.Vector.from_elements([_load_flag(a) for a in addrs], fx.Int32)
-            return got
-
         def _lamport_rearm(rearm):
-            """Drain the re-arm of the round before this one, then put the
-            sentinel back in every dword this thread read, and drop the
-            ``prio`` boost that the fanout and the poll shared.
-
-            ``vmcnt(0)`` first: the re-arm of the round before this one was
-            issued before these reads and must land before our next push
-            (``LAMPORT_BUFFERS``). On gfx9 the counter retires in order, so the
-            reads have already waited for it, and this costs nothing; it is
-            explicit so that the argument does not rest on that.
-            """
-            rocdl.s_waitcnt(vmcnt=0)
-            armed = fx.Vector.from_elements([fx.Int32(LAMPORT_SENTINEL)], fx.Int32)
-            for off, pred in rearm:
-                if pred:
-                    _buffer_store(inbox, off, armed, rearm_cm)
+            """``lamport_rearm_dwords``, then drop the ``prio`` boost that the
+            fanout and the poll shared."""
+            lamport_rearm_dwords(inbox, rearm, rearm_cm)
             _prio(0)
 
         def _lamport_recv(buf, sub):
             """Every peer's packet of *sub* in *buf*, ``{(src, k): (words,
             scale)}``, once none of the dwords this thread reads is the
-            sentinel; then put the sentinel back in them.
-
-            The first reads all go out before any is tested, past L1 and L2.
-            With ``recv_order="batch"`` (the default), until every dword has
-            landed, all of them are re-read on each pass, together, rather than
-            one source at a time: a serial spin would pay one more round trip
-            per source. The re-reads are relaxed system-scope atomics
-            (``_load_flag``), which go past L1 and L2 and keep the spin from
-            being deleted. Re-reading a dword that has landed is harmless,
-            since nobody writes it again this round.
+            sentinel (``lamport_poll``, ``poll_sleep`` knob); then put the
+            sentinel back in them (``lamport_rearm_dwords``, ``LAMPORT_BUFFERS``).
 
             ``recv_order="per_source"`` keeps the first reads (all issued up
             front, so the round trips still overlap) but tests and re-reads one
@@ -918,71 +885,50 @@ def make_quick_allreduce_mesh_kernel(
             The re-arm and its ``vmcnt(0)`` run once, after the consumer's
             last source (``_LazyPolled.finish``), so no re-arm store is issued
             before a dword of this round has been decoded and every lane of a
-            wave has left every spin: the shared-dword argument below holds.
-
-            ``vmcnt(0)`` after the spin drains the re-arm of the round before
-            this one (``_lamport_rearm``). A dword that several threads read
-            (scale, extra plane) is read only by lanes of one wave, which all
-            leave the spin before its owner re-arms it.
+            wave has left every spin, which the shared-dword re-arm needs.
             """
-            keys, offs, rearm = [], [], []
-            for src in push_peers:
-                for k in range_constexpr(rank_atoms):
-                    base = _sub_tile_i32(buf, fx.Int32(src), sub) + fx.Int32(
-                        k * c.rank_tile_i32
-                    )
-                    for off, pred in lamport_slots(c, tid, scale_slot):
-                        offs.append(base + off)
-                        rearm.append((base + off, pred))
-                    keys.append((src, k))
-            per = len(offs) // len(keys)
+            keys = [(src, k) for src in push_peers for k in range_constexpr(rank_atoms)]
+            offs, rearm = lamport_offsets(
+                c,
+                tid,
+                scale_slot,
+                (
+                    _sub_tile_i32(buf, fx.Int32(src), sub)
+                    + fx.Int32(k * c.rank_tile_i32)
+                    for src, k in keys
+                ),
+            )
             if const_expr(knobs.recv_order == "per_source"):
-                first = [
-                    _buffer_load(inbox, o, 1, fx.Int32, _RECV_POLICY)[0] for o in offs
-                ]
-                addrs = [inbox_base + _i32_to_bytes(o) for o in offs]
-                span = rank_atoms * per
+                first = lamport_first_reads(inbox, offs)
+                addrs = lamport_addrs(inbox_base, offs)
+                span = len(offs) // n_push
 
                 def _fetch(src):
                     i = push_peers.index(src)
                     lo, hi = i * span, (i + 1) * span
-                    got = _poll_spin(
-                        fx.Vector.from_elements(first[lo:hi], fx.Int32), addrs[lo:hi]
+                    got = lamport_spin(
+                        fx.Vector.from_elements(first[lo:hi], fx.Int32),
+                        addrs[lo:hi],
+                        knobs.poll_sleep,
                     )
-                    out = {}
-                    for k in range_constexpr(rank_atoms):
-                        words, word = split_lamport_packet(
-                            c, [got[k * per + j] for j in range_constexpr(per)]
+                    return {
+                        (src, k): (words, _scale_from_word(c, word, pair_in_slot))
+                        for k, (words, word) in enumerate(
+                            lamport_packets(c, got, rank_atoms)
                         )
-                        out[(src, k)] = (words, _scale_from_word(c, word, pair_in_slot))
-                    return out
+                    }
 
                 return _LazyPolled(_fetch, lambda: _lamport_rearm(rearm))
-            got = fx.Vector.from_elements(
-                [_buffer_load(inbox, o, 1, fx.Int32, _RECV_POLICY)[0] for o in offs],
-                fx.Int32,
-            )
-            addrs = [inbox_base + _i32_to_bytes(o) for o in offs]
-            got = _poll_spin(got, addrs)
+            got = lamport_poll(inbox, inbox_base, offs, knobs.poll_sleep)
             _lamport_rearm(rearm)
-            polled = {}
-            for i, key in enumerate(keys):
-                words, word = split_lamport_packet(
-                    c, [got[i * per + j] for j in range_constexpr(per)]
-                )
-                polled[key] = (words, _scale_from_word(c, word, pair_in_slot))
-            return polled
+            return {
+                key: (words, _scale_from_word(c, word, pair_in_slot))
+                for key, (words, word) in zip(keys, lamport_packets(c, got, len(keys)))
+            }
 
         def _next_buf(buf):
             nxt = buf + fx.Int32(1)
             return (nxt >= fx.Int32(LAMPORT_BUFFERS)).select(fx.Int32(0), nxt)
-
-        def _lds_free():
-            """Join the workgroup once this wave's LDS reads have landed, so
-            the next pack cannot overwrite rows a fanout still reads. The flag
-            handshake gets this join from its publish and wait."""
-            rocdl.s_waitcnt(lgkmcnt=0)
-            gpu.barrier()
 
         # ``lds_bufs`` knob: the packs of a group alternate between two LDS
         # buffers by their running index p (ST=1: RS is 0, AG is 1; ST>1: RS
