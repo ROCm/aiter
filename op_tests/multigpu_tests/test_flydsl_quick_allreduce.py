@@ -38,6 +38,14 @@ sweep ends in a markdown table:
   bit-identical to the fp32 reference, which separates a chunk-addressing or
   flag-protocol bug from a codec one. Run through each production schedule's
   ladder on the shipping payloads, so it covers the geometry that ships.
+* ``test_quick_allreduce_hier_local`` -- where the GPUs split into two groups
+  and production runs the hierarchical schedule: every pairing of its local
+  laps, on the fp16 wire, on the default codecs, and back to back.
+* ``test_quick_allreduce_hier_forced`` -- elsewhere (xGMI), a minimal
+  hierarchical sweep on each handshake, the split forced through
+  ``AITER_FLY_AR_GROUPS`` in every rank (``FORCED_HIER_CASES``) on the ladder
+  of ``HIER_TEST_LADDER_CELL``. Each row also checks that the engine was built
+  on the forced groups.
 
 ``--extended`` adds what production never selects: the legacy fixed shipping
 shapes; ``test_quick_allreduce`` again, as a second table, with ``block``
@@ -393,6 +401,29 @@ HIER_LOCAL_TRANSPORT = (
 )
 HIER_LOCAL_SHAPES = ((64, 7168), (1024, 7168), (8192, 7168))
 
+# The hierarchical schedule where the GPUs do not split (xGMI), a minimal
+# sweep with the split forced through ``AITER_FLY_AR_GROUPS``, on each
+# handshake: ``(tp, split, check, local, super_tile, block, tokens, hidden,
+# inbox_memory)``. *split* is ``"halves"`` (``0..G-1`` and ``G..2G-1``, or the
+# exported value when it holds ``tp`` ranks) or ``"interleaved"`` (even and odd
+# ranks). The exact rows pin the fp16 wire and a geometry; ``local`` is the
+# pinned ``(local_rs, local_ag)``. The ``normal`` and ``run_ahead`` rows run
+# ``HIER_TEST_LADDER_CELL``'s ladder at its default codecs: 14 MiB on its
+# mesh/mesh ST=8 rung and 28 MiB on its ring/ring INT5 rung. Lamport also
+# runs back to back on a fine-grained inbox, its late re-arm's reason.
+FORCED_HIER_CASES = (
+    (8, "halves", "exact", ("mesh", "mesh"), 8, 512, 1031, 7168, None),
+    (8, "halves", "exact", ("ring", "ring"), 8, 512, 1031, 7168, None),
+    (8, "halves", "normal", None, None, None, 1024, 7168, None),
+    (8, "halves", "normal", None, None, None, 2048, 7168, None),
+    (8, "halves", "run_ahead", None, None, None, *RUN_AHEAD_SHAPE, None),
+    (8, "interleaved", "exact", ("mesh", "ring"), 1, 256, 333, 7168, None),
+    (4, "halves", "exact", ("ring", "mesh"), 8, 512, 1031, 7168, None),
+)
+FORCED_HIER_LAMPORT_CASES = (
+    (8, "halves", "run_ahead", None, None, None, *RUN_AHEAD_SHAPE, "finegrained"),
+)
+
 # (tp, algorithm, tokens, hidden, block): the shipping INT4 ladder with
 # ``block`` overridden on every rung. ``--extended`` only: no production rung
 # uses most of these widths.
@@ -525,28 +556,55 @@ def _num_tiles(nbytes: int, block: int) -> int:
     return max(1, (nbytes + tile - 1) // tile)
 
 
+# The hierarchical ladder of a platform with none in production -- every
+# xGMI host, whose GPUs do not split into groups -- for the sweep that forces
+# a split with ``AITER_FLY_AR_GROUPS`` (``FORCED_HIER_CASES``): the shipped
+# gfx950 PCIe TP8 rungs.
+HIER_TEST_LADDER_CELL = ("gfx950", "pcie", 8)
+
+
 def _ladder(algorithm: str, world_size: int, link: str) -> tuple:
     if algorithm == "mesh":
         return mesh_st_ladder(world_size=world_size, link=link)
     if algorithm == "hier":
+        if not _has_hier_ladder(world_size, link):
+            return fly_policy.HIER_ST_LADDER[HIER_TEST_LADDER_CELL]
         return hier_st_ladder(world_size=world_size, link=link)
     return ring_st_ladder(world_size=world_size, link=link)
+
+
+def _has_hier_ladder(world_size: int, link: str) -> bool:
+    """Whether production has a hierarchical ladder for this host."""
+    return (ARCH, link, int(world_size)) in fly_policy.HIER_ST_LADDER
 
 
 def _host_groups(world_size: int):
     """The two socket groups the first *world_size* GPUs split into, as
     production dispatch would find them (``AITER_FLY_AR_GROUPS`` first), or
-    None when they do not split into two."""
+    None when they do not split into two. As in ``probe_peer_topology``, an
+    ``AITER_FLY_AR_GROUPS`` that does not hold *world_size* ranks is ignored."""
     from aiter.ops.flydsl import allreduce_host_shared as H
 
-    text = os.environ.get(H.GROUPS_ENV, "").strip()
-    if text:
-        groups = H.parse_groups_env(text, world_size)
-    else:
+    groups = _env_groups(world_size)
+    if groups is None:
         nodes = [H.kfd_node_of_device(i) for i in range(int(world_size))]
         weights = None if None in nodes else H.kfd_link_weights(nodes)
         groups = None if weights is None else H.socket_groups(weights)
     return groups if groups is not None and len(groups) == 2 else None
+
+
+def _env_groups(world_size: int):
+    """``AITER_FLY_AR_GROUPS`` parsed for *world_size* ranks, or None when it
+    is unset or holds another number of ranks."""
+    from aiter.ops.flydsl import allreduce_host_shared as H
+
+    text = os.environ.get(H.GROUPS_ENV, "").strip()
+    if not text:
+        return None
+    try:
+        return H.parse_groups_env(text, world_size)
+    except ValueError:
+        return None
 
 
 def _policy(world_size: int, link: str):
@@ -919,17 +977,28 @@ def _engine(rank: int, tp: int, gloo, device, engine_kw: dict):
     """A ``FlyQuickAllReduce`` with every binary compiled.
 
     The ``super_tile``, ``grid_cap`` and ``block`` keys of *engine_kw* become
-    the engine's ladder; refer to ``_test_ladder``.
+    the engine's ladder; refer to ``_test_ladder``. A hierarchical engine on a
+    host with no production ladder for it runs ``HIER_TEST_LADDER_CELL``'s.
+    ``groups_env``, if given, is exported as ``AITER_FLY_AR_GROUPS`` in this
+    rank's process before the engine is built, so the engine's topology probe
+    reads its groups from there, as production would.
     """
     from aiter.ops.flydsl import FlyQuickAllReduce
+    from aiter.ops.flydsl.allreduce_host_shared import GROUPS_ENV
 
     engine_kw = dict(engine_kw)
+    groups_env = engine_kw.pop("groups_env", None)
+    if groups_env is not None:
+        os.environ[GROUPS_ENV] = groups_env
     knobs = {
         k: engine_kw.pop(k)
         for k in ("super_tile", "grid_cap", "block", "tuning")
         if k in engine_kw
     }
-    if knobs:
+    if knobs or (
+        engine_kw["algorithm"] == "hier"
+        and not _has_hier_ladder(tp, fly_policy.detect_link())
+    ):
         engine_kw["ladder"] = _test_ladder(
             engine_kw["algorithm"], tp, handshake=engine_kw.get("handshake"), **knobs
         )
@@ -1039,6 +1108,8 @@ def _run_rank(
                         **_run_ahead(fly, rank, tp, device, ntok, hidden, group),
                         "link": fly.link,
                         "inbox_memory": fly.inbox_memory,
+                        "handshake": fly.handshake,
+                        "groups": fly.groups,
                     }
                 )
                 continue
@@ -1097,6 +1168,8 @@ def _run_rank(
                         else None
                     ),
                     "cfg_used": tuple(cfg_used),
+                    "handshake": fly.handshake,
+                    "groups": fly.groups,
                     "st_used": int(st_used),
                     "block_used": int(block_used),
                     "grid_by_cfg": {cfg: int(e.grid) for cfg, e in fly._by_cfg.items()},
@@ -1587,9 +1660,10 @@ _HIER_HANDSHAKE: str | None = None
 
 
 def _with_handshake(engine_kw: dict) -> dict:
-    """*engine_kw* with ``--hier-handshake`` on a hierarchical engine."""
+    """*engine_kw* with ``--hier-handshake`` on a hierarchical engine that
+    does not name its own."""
     if _HIER_HANDSHAKE is not None and engine_kw.get("algorithm") == "hier":
-        return {**engine_kw, "handshake": _HIER_HANDSHAKE}
+        return {"handshake": _HIER_HANDSHAKE, **engine_kw}
     return engine_kw
 
 
@@ -2065,6 +2139,119 @@ def test_quick_allreduce_hier_local(
     return {
         "gfx": ARCH,
         "local": f"{local_rs}/{local_ag}",
+        "rs_codec": rows[0].get("rs_codec"),
+        "ag_codec": rows[0].get("ag_codec"),
+        "st_used": rows[0].get("st_used"),
+        "lanes_differing": max(r["lanes_differing"] for r in rows),
+        "sqnr_db": min(r["sqnr_db"] for r in rows),
+        "n_mismatch": (
+            max(r["n_mismatch"] for r in rows) if check == "exact" else None
+        ),
+    }
+
+
+def _forced_groups(tp: int, split: str) -> str:
+    """The ``AITER_FLY_AR_GROUPS`` value of a ``FORCED_HIER_CASES`` split."""
+    if split == "interleaved":
+        groups = (tuple(range(0, tp, 2)), tuple(range(1, tp, 2)))
+    else:
+        groups = _env_groups(tp) or (tuple(range(tp // 2)), tuple(range(tp // 2, tp)))
+    return ";".join(",".join(str(r) for r in g) for g in groups)
+
+
+def _forced_hier_key(
+    tp, split, handshake, local=None, super_tile=None, block=None, inbox_memory=None
+):
+    kw = {
+        "algorithm": "hier",
+        "groups_env": _forced_groups(tp, split),
+        "handshake": handshake,
+    }
+    if local is not None:
+        kw.update(local_rs=local[0], local_ag=local[1])
+    if super_tile is not None:
+        kw.update(
+            rs_codec="fp16",
+            x_codec="fp16",
+            ag_codec="fp16",
+            super_tile=super_tile,
+            grid_cap=TRANSPORT_GRID_CAP,
+            block=block,
+        )
+    if inbox_memory is not None:
+        kw["inbox_memory"] = inbox_memory
+    return _key(tp, **kw)
+
+
+@benchmark()
+def test_quick_allreduce_hier_forced(
+    tp,
+    split,
+    handshake,
+    check,
+    local,
+    super_tile,
+    block,
+    tokens,
+    hidden,
+    inbox_memory,
+):
+    """The hierarchical schedule on a host that does not split, with the
+    split forced through ``AITER_FLY_AR_GROUPS`` (``FORCED_HIER_CASES``);
+    correctness only.
+
+    Every rank must have built its engine on the forced groups and on
+    *handshake*. *check* is ``exact`` (the fp16 wire on an exact-grid input,
+    bit-identical to the fp32 reference, on the pinned local laps),
+    ``normal`` (the default codecs, held to the SQNR floor, on the expected
+    super-tile) or ``run_ahead``.
+    """
+    from aiter.ops.flydsl.allreduce_host_shared import parse_groups_env
+
+    groups_env = _forced_groups(tp, split)
+    label = (
+        f"tp={tp} hier forced {groups_env} {handshake} {check} {tokens}x{hidden} "
+        f"local={local} st={super_tile} block={block} inbox={inbox_memory}"
+    )
+    key = _forced_hier_key(tp, split, handshake, local, super_tile, block, inbox_memory)
+    rows = _result(key, (tokens, hidden, check, False))
+    want = parse_groups_env(groups_env, tp)
+    fails = [
+        f"rank {rank}: built on groups {row['groups']}, handshake "
+        f"{row['handshake']}"
+        for rank, row in enumerate(rows)
+        if row["groups"] != want or row["handshake"] != handshake
+    ]
+    if check == "exact":
+        fails += _identity_fails(rows, "hier")
+        fails += [
+            f"rank {rank}: {row['n_mismatch']} mismatched elements, "
+            f"max |err| {row['max_abs_err']:.3e}, "
+            f"first bad flat index {row['first_bad']}"
+            for rank, row in enumerate(rows)
+            if row["n_mismatch"]
+        ]
+        fails += [
+            f"rank {rank}: ran {row['local']}"
+            for rank, row in enumerate(rows)
+            if row["local"] != "/".join(local)
+        ]
+        _check(label, fails)
+    elif check == "normal":
+        _check(label, fails)
+        _check_sqnr(
+            label,
+            rows,
+            floor=HIER_SQNR_MIN_DB,
+            expected_st=_shipping_st(rows, tokens * hidden * 2, "hier", tp),
+            algorithm="hier",
+        )
+    else:
+        _check(label, fails + _run_ahead_fails(rows, "hier"))
+    return {
+        "gfx": ARCH,
+        "groups": groups_env,
+        "local": rows[0].get("local"),
         "rs_codec": rows[0].get("rs_codec"),
         "ag_codec": rows[0].get("ag_codec"),
         "st_used": rows[0].get("st_used"),
@@ -4247,11 +4434,11 @@ def _verify(args, tps, algos, dts, link) -> None:
             (tokens, hidden, "exact", False),
         )
     # Every pairing of the hierarchical schedule's local laps, where the GPUs
-    # split into two groups.
+    # split into two groups and production runs the hierarchical schedule.
     hier_local = []
     if "hier" in algos:
         for tp in tps:
-            if _host_groups(tp) is None:
+            if not _ships(tp, "hier", link):
                 continue
             for rs, ag in HIER_LOCAL_PAIRS:
                 hier_local += [
@@ -4268,6 +4455,23 @@ def _verify(args, tps, algos, dts, link) -> None:
     for tokens, hidden, tp, rs, ag, check, st, block in hier_local:
         _register(
             _hier_local_key(tp, rs, ag, st, block),
+            (tokens, hidden, check, False),
+        )
+    # Elsewhere, a minimal sweep with the split forced.
+    hier_forced = []
+    if "hier" in algos:
+        for hs in fly_policy.HANDSHAKES:
+            cases = FORCED_HIER_CASES
+            if hs == "lamport":
+                cases += FORCED_HIER_LAMPORT_CASES
+            hier_forced += [
+                (tp, split, hs, check, *rest)
+                for tp, split, check, *rest in cases
+                if tp in tps and not _ships(tp, "hier", link)
+            ]
+    for tp, split, hs, check, local, st, block, tokens, hidden, mem in hier_forced:
+        _register(
+            _forced_hier_key(tp, split, hs, local, st, block, mem),
             (tokens, hidden, check, False),
         )
 
@@ -4355,6 +4559,10 @@ def _verify(args, tps, algos, dts, link) -> None:
     _summarize(
         "flydsl quick allreduce hier local schedules",
         [test_quick_allreduce_hier_local(*case) for case in hier_local],
+    )
+    _summarize(
+        "flydsl quick allreduce hier, split forced by AITER_FLY_AR_GROUPS",
+        [test_quick_allreduce_hier_forced(*case) for case in hier_forced],
     )
     os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = HIP_QR_REGIME
     aiter.qr_max_size()
