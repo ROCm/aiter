@@ -3,6 +3,7 @@
 """Gluon all-reduce + residual add + RMSNorm + MXFP8 quant on 2, 4 or 8 gfx950 GPUs.
 The time is the slowest rank, in a HIP graph."""
 
+import itertools
 import multiprocessing as mp
 
 import torch
@@ -19,6 +20,9 @@ from aiter.ops.triton.comms.fused.all_reduce_rmsnorm_mxfp8 import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_common import ensure_spawn_method
+from op_tests.multigpu_tests.triton_test.test_all_reduce_rmsnorm_mxfp8 import (
+    generate_all_reduce_rmsnorm_mxfp8_inputs,
+)
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_do_bench_graph_kwargs,
     get_parser,
@@ -47,15 +51,20 @@ def benchmark(args, device, tp, comm):
     bencher = RotatingBufferBench.from_dict(
         {**get_rot_bufs_kwargs(args), **get_do_bench_graph_kwargs(args)}
     )
-    weight = torch.randn((args.hidden,), dtype=torch.bfloat16, device=device)
+    rank = dist.get_rank(tp.cpu_group)
+    seeds = itertools.count()
 
     @triton.testing.perf_report([config])
     def _run(tokens, provider):
         shape = (tokens, args.hidden)
+        weight = generate_all_reduce_rmsnorm_mxfp8_inputs(
+            tokens, args.hidden, args.gemma, 0, rank, device
+        )[2]
 
         def gen_rot():
-            x = torch.randn(shape, dtype=torch.bfloat16, device=device)
-            residual = torch.randn(shape, dtype=torch.bfloat16, device=device)
+            x, residual, _ = generate_all_reduce_rmsnorm_mxfp8_inputs(
+                tokens, args.hidden, args.gemma, next(seeds), rank, device
+            )
             x_q = torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
             x_s = torch.empty(
                 (tokens, args.hidden // 32), dtype=torch.uint8, device=device
@@ -86,7 +95,6 @@ def benchmark(args, device, tp, comm):
         dist.all_gather_object(per_rank, ms, group=tp.cpu_group)
         return max(per_rank) * 1e3
 
-    rank = dist.get_rank(tp.cpu_group)
     write_csv = args.o and rank == 0
     _run.run(save_path="." if write_csv else None, print_data=rank == 0)
 

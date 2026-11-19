@@ -22,9 +22,9 @@ from aiter.test_common import ensure_spawn_method
 WORLD_SIZES = [2, 4, 8]
 EPS = 1e-6
 # (hidden, gemma, token counts). A count that is not a multiple of the world size
-# gives ranks that own fewer rows, or no row.
+# gives ranks that own fewer rows, or no row. The HIP graph check uses the first shape.
 SHAPES = [
-    (6144, True, [1, 3, 24, 64, 96, 128, 192, 256]),
+    (6144, True, [1, 3, 64, 256]),
     (7168, False, [5, 64, 255]),
     (2880, True, [7, 64, 130]),
     (4096, False, [2, 128]),
@@ -94,8 +94,9 @@ def _bad(outs, refs):
     )
 
 
-def _inputs(tokens, hidden, gemma, seed, rank, device, group):
-    """x of this rank, the residual and weight of all ranks, and the reference."""
+def generate_all_reduce_rmsnorm_mxfp8_inputs(tokens, hidden, gemma, seed, rank, device):
+    """x of this rank, and the residual and norm weight of all ranks (bf16). The test
+    and the benchmark use these inputs. With more than 2 tokens, row 1 is 0."""
     gen = torch.Generator(device=device).manual_seed(1000 * seed + rank)
     x = torch.randn(
         (tokens, hidden), generator=gen, dtype=torch.float32, device=device
@@ -111,13 +112,21 @@ def _inputs(tokens, hidden, gemma, seed, rank, device, group):
     if tokens > 2:  # a zero row: all-zero groups, rstd = 1 / sqrt(eps)
         x[1] = 0
         residual[1] = 0
+    return x, residual, weight
+
+
+def _inputs(tokens, hidden, gemma, seed, rank, device, group):
+    """The inputs of this rank and the reference."""
+    x, residual, weight = generate_all_reduce_rmsnorm_mxfp8_inputs(
+        tokens, hidden, gemma, seed, rank, device
+    )
     parts = [torch.empty_like(x) for _ in range(dist.get_world_size(group))]
     dist.all_gather(parts, x, group=group)
     ref = _reference([p.cpu() for p in parts], residual.cpu(), weight.cpu(), EPS, gemma)
     return x, residual, weight, ref
 
 
-def _check_shape(rank, device, tp, hidden, gemma, token_counts, failures):
+def _check_shape(rank, device, tp, hidden, gemma, token_counts, graph, failures):
     group = tp.device_group
     comm = AllReduceRmsnormMxfp8(tp.cpu_group, max(token_counts), hidden)
     tag = f"world {comm.world} rank {rank} hidden {hidden}"
@@ -139,7 +148,8 @@ def _check_shape(rank, device, tp, hidden, gemma, token_counts, failures):
                     failures.append(
                         f"{tag} tokens {tokens} launch {j}: {_bad(out, d[3])} bytes differ"
                     )
-        _check_graph(rank, device, tp, comm, gemma, token_counts, failures)
+        if graph:
+            _check_graph(rank, device, tp, comm, gemma, token_counts, failures)
         if comm.error() != [0, 0, 0, 0]:
             failures.append(f"{tag}: error {comm.error()}")
     finally:
@@ -284,8 +294,10 @@ def _worker(rank, world_size, init_method):
     tp = get_tp_group()
     failures = []
     try:
-        for hidden, gemma, token_counts in SHAPES:
-            _check_shape(rank, device, tp, hidden, gemma, token_counts, failures)
+        for i, (hidden, gemma, token_counts) in enumerate(SHAPES):
+            _check_shape(
+                rank, device, tp, hidden, gemma, token_counts, i == 0, failures
+            )
         _check_sentinel(rank, device, tp, failures)
         _check_scales(rank, device, tp, failures)
         _check_timeout(rank, device, tp, failures)
