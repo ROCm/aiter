@@ -96,10 +96,10 @@ def forward(inp: dict, st: dict) -> torch.Tensor:
     ha = torch.empty(M, I * q.FORMATS[af][3] // 8, dtype=torch.uint8, device=x.device)
     hs = torch.empty(M, q.kq(I), 4, dtype=torch.int32, device=x.device)
     run_gg6e(xa, xs, ridx, texp, st["b1"], st["s1"], ha, N=2 * I, K=H, a_fmt=af, b_fmt=st["w_fmt"], epi="swiglu_q", gather=True, gm=8,
-             cfg=gemm_cfg(2 * I, af, bm), out_scales=hs)
+             cfg=gemm_cfg(2 * I, af, bm), out_scales=hs, h_layout="tile_step")
     o = torch.empty(M, H, dtype=torch.bfloat16, device=x.device)
     run_gg6e(ha, hs, ridx, texp, st["b2"], st["s2"], o, N=H, K=I, a_fmt=af, b_fmt=st["w_fmt"], epi="store", gather=False, gm=2,
-             cfg=gemm_cfg(H, af, bm))
+             cfg=gemm_cfg(H, af, bm), h_layout="tile_step")
     return ak.combine(o, pos, w)
 
 
