@@ -412,8 +412,14 @@ def kernel_unified_attention_2d(
                 + offs_shfl
             )
         else:
+            # A tile can span several pages (TILE_SIZE > BLOCK_SIZE): mask the
+            # block-table read too, or the last tile reads up to
+            # TILE_SIZE // BLOCK_SIZE - 1 entries past the sequence's pages,
+            # which faults when the table ends at an unmapped page.
             physical_block_idx = tl.load(
-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
+                mask=tile_mask,
+                other=0,
             ).to(tl.int64)
 
             v_offset = (
@@ -838,8 +844,14 @@ def kernel_unified_attention_3d(
                 + offs_shfl
             )
         else:
+            # A tile can span several pages (TILE_SIZE > BLOCK_SIZE): mask the
+            # block-table read too, or the last tile reads up to
+            # TILE_SIZE // BLOCK_SIZE - 1 entries past the sequence's pages,
+            # which faults when the table ends at an unmapped page.
             physical_block_idx = tl.load(
-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE,
+                mask=tile_mask,
+                other=0,
             ).to(tl.int64)
 
             v_offset = (
