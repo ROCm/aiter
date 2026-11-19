@@ -2,9 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import ctypes
 import itertools
-import math
 import time
 from functools import partial
 
@@ -16,7 +14,6 @@ from torch.profiler import ProfilerActivity, profile
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.jit.utils.torch_guard import is_torch_equal_or_newer
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 OPS = {
@@ -35,7 +32,7 @@ _BITS = {
 
 def make_input(shape, stride, dtype):
     # distinct values with both signs, plus +-0, +-inf and nan at the front. Magnitudes stay at or
-    # above 1e-3 so that no fp32 result is denormal: aiter flushes fp32 denormals, torch does not.
+    # above 1e-3, so results stay normal; test_subnormal_result covers subnormal ones.
     t = torch.empty_strided(shape, stride, dtype=dtype, device="cuda")
     src = torch.randn(shape, dtype=torch.float32, device="cuda") * 4
     src = torch.where(src < 0, src - 1e-3, src + 1e-3)
@@ -237,43 +234,6 @@ HOST_SCALARS = [
     True,
 ]
 
-FLT_MIN = torch.finfo(torch.float32).tiny
-# torch divides by a CPU scalar as a multiply by its reciprocal, formed in double from 2.10 on
-RECIPROCAL_IN_DOUBLE = is_torch_equal_or_newer("2.10.0")
-
-
-def fp32_scalar(op, s, device):
-    # the fp32 scalar the flat kernel applies: for div, the reciprocal torch multiplies by
-    if op == "div":
-        if RECIPROCAL_IN_DOUBLE:
-            s = math.copysign(math.inf, s) if s == 0 else 1.0 / float(s)
-        else:
-            s32 = ctypes.c_float(s).value
-            s = math.copysign(math.inf, s32) if s32 == 0 else 1.0 / s32
-    return torch.tensor(ctypes.c_float(s).value, dtype=torch.float32, device=device)
-
-
-def apply_fp32(op, x32, s32):
-    return {"add": x32 + s32, "sub": x32 - s32, "mul": x32 * s32, "div": x32 * s32}[op]
-
-
-def ftz(v):
-    # what -fgpu-flush-denormals-to-zero does to fp32 values: subnormals become signed zero
-    return torch.where(v.abs() < FLT_MIN, v * 0, v)
-
-
-def subnormal_involved(op, x, s):
-    s32 = fp32_scalar(op, s, x.device)
-    r32 = apply_fp32(op, x.float(), s32)
-    return any(bool(((v != 0) & (v.abs() < FLT_MIN)).any()) for v in (s32, r32))
-
-
-def run_ftz_reference(op, x, s):
-    # aiter's flat kernel flushes subnormal inputs, scalars and results to signed zero, as every
-    # aiter kernel built with -fgpu-flush-denormals-to-zero does; torch keeps subnormals
-    s32 = ftz(fp32_scalar(op, s, x.device))
-    return ftz(apply_fp32(op, ftz(x.float()), s32)).to(x.dtype)
-
 
 def run_torch_scalar(op, inplace, x, s):
     # the torch result, or the exception torch raises
@@ -319,22 +279,16 @@ def test_host_scalar(shape, scalar, op, dtype, inplace):
     out, names = flat_kernels_launched(
         lambda: fn(x, scalar), fresh, label, pattern="operator_flat_scalar_kernel"
     )
-    # Flat-kernel cases with a subnormal fp32 scalar or result (div by 1e39 or 3.4028235e38,
-    # mul by 1e-39 or +-1e-40, add / sub of +-1e-40 at x = +-0, ...) compare against the
-    # flush-to-zero reference; every other case compares against torch directly.
-    ref_kind = "torch"
-    if expect_flat and subnormal_involved(op, x_bits, scalar):
-        ref, ref_kind = run_ftz_reference(op, x_bits, scalar), "ftz"
     if unit:
         # x * 1 is x exactly, so x is accepted as well as torch's result, which may differ in the
         # sign of zero (torch on gfx942 gives +0.0 for an fp16 -0.0 * 1)
         try:
-            err = compare(out, ref, f"{msg}[{ref_kind} reference] ")
+            err = compare(out, ref, msg)
         except AssertionError:
             assert_bitwise(out, x_bits, msg)
             err = 0
     else:
-        err = compare(out, ref, f"{msg}[{ref_kind} reference] ")
+        err = compare(out, ref, msg)
 
     if inplace:
         assert out is x, f"{msg}must return its input"
@@ -357,7 +311,6 @@ def test_host_scalar(shape, scalar, op, dtype, inplace):
         "gfx": gfx,
         "flat": bool(names),
         "torch error": False,
-        "reference": ref_kind,
         "aiter err": err,
     }
     if shape == HOST_SCALAR_SHAPES[0] and scalar == 0.5:
@@ -365,6 +318,67 @@ def test_host_scalar(shape, scalar, op, dtype, inplace):
         ret["aiter us"] = us
         ret["aiter TB/s"] = 2 * nbytes / us / 1e6
     return ret
+
+
+# tensor (op) tensor cases and the kernel families b5b4bf9's dispatch picks for them: contiguous
+# (operator_element_kernel or operator_contiguous_kernel_naive; for mul on gfx950 and gfx942 the
+# flat kernel), odd-sized contiguous (operator_contiguous_big_tile_kernel, never flat), broadcast
+# (operator_bcast_tile_kernel, operator_bcast_scalar_unroll_vectorize_naive) and the transpose tile
+# kernel (operator_tn_big_tile_kernel: same 3-D shape, b non-contiguous with stride(1) == 1)
+SUBNORMAL_CASES = [
+    ((64, 7168), (64, 7168), "contiguous"),
+    ((256, 8192), (256, 8192), "contiguous"),
+    ((1001, 1003), (1001, 1003), "contiguous"),  # odd-sized contiguous
+    ((64, 96, 576), (1, 96, 576), "contiguous"),
+    ((256, 96, 576), (1,), "contiguous"),
+    ((16, 512, 576), (16, 512, 576), "transposed"),
+]
+
+
+def subnormal_operands(shape, other_shape, layout, op, dtype):
+    # a normal numerator, and an operand that puts every result below the dtype's smallest normal;
+    # layout "transposed" makes b a transpose(1, 2) view of a contiguous tensor
+    e, k = (10, 10) if dtype == dtypes.fp16 else (100, 30)
+    sign = torch.randint(0, 2, shape, device="cuda") * 2 - 1
+    a = (sign * (1 + torch.rand(shape, device="cuda")) * 2.0**-e).to(dtype)
+    b_shape = other_shape
+    if layout == "transposed":
+        b_shape = (other_shape[0], other_shape[2], other_shape[1])
+    b = (1 + torch.rand(b_shape, device="cuda")) * 2.0 ** (k if op == "div" else -k)
+    b = b.to(dtype)
+    return a, b.transpose(1, 2) if layout == "transposed" else b
+
+
+@benchmark()
+def test_subnormal_result(shape, other_shape, layout, op, dtype, inplace):
+    # the binary modules keep subnormal inputs and results, as torch does; every case must run an
+    # aiter kernel (all named operator_*), or it would only compare torch with itself
+    a, b = subnormal_operands(shape, other_shape, layout, op, dtype)
+    ref = run_torch(op, a.clone(), b)
+    label = f"{op}{'_' if inplace else ''} {dtype} {shape} {other_shape} {layout}"
+    msg = f"{label}: "
+    subnormal = (ref != 0) & (ref.abs() < torch.finfo(dtype).tiny)
+    assert bool(subnormal.all()), f"{msg}not every torch result is subnormal"
+    fn = INPLACE_OPS[op] if inplace else OPS[op][0]
+    out, names = flat_kernels_launched(
+        lambda: fn(a, b),
+        lambda: partial(fn, *subnormal_operands(shape, other_shape, layout, op, dtype)),
+        label,
+        pattern="operator_",
+    )
+    assert names, f"{msg}no aiter kernel ran"
+    if inplace:
+        assert out is a, f"{msg}must return its input"
+    err = compare(out, ref, msg)
+    _, us = run_perftest(fn, a.clone(), b, num_iters=10, num_rotate_args=1)
+    nbytes = 2 * a.nbytes + b.nbytes
+    return {
+        "gfx": get_gfx_runtime(),
+        "kernel": names[0].split("(")[0],
+        "aiter us": us,
+        "aiter TB/s": nbytes / us / 1e6,
+        "aiter err": err,
+    }
 
 
 def summarize(name, rows):
@@ -562,6 +576,17 @@ def main():
             for shape, inplace in SCALAR_STREAM_CASES
         ]
     summarize("host_scalar", rows)
+
+    rows = [
+        test_subnormal_result(shape, other_shape, layout, op, dtype, inplace)
+        for dtype, op, (shape, other_shape, layout), inplace in itertools.product(
+            args.dtype,
+            [op for op in args.op if op in ("mul", "div")],
+            SUBNORMAL_CASES,
+            [False, True],
+        )
+    ]
+    summarize("subnormal_result", rows)
 
 
 if __name__ == "__main__":
