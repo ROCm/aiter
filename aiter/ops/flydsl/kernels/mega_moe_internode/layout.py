@@ -324,7 +324,6 @@ class Stage1ArenaLayout:
         parity_depth: int = 2,
         num_qp: int = 4,
         embed_stage2_bytes: int = 0,
-        send_queue_capacity: int = 0,
         activation_dtype: str = "fp4",
     ) -> Stage1ArenaLayout:
         if activation_dtype not in ("fp4", "fp8"):
@@ -645,17 +644,7 @@ class Stage1ArenaLayout:
         if max_recv_routes_per_rank < theoretical_routes:
             # Only a tighter receive contract needs a hot-path reservation.
             # Append it so the default EP16 window offsets stay unchanged.
-            # S1_PACK_RA (experiment): routes and compact input slots share one
-            # 8-byte word pair per parity for a single 64-bit reservation atomic.
-            _pack = __import__("os").environ.get("S1_PACK_RA", "0") == "1"
-            specs.append(
-                (
-                    "recv_route_count",
-                    (parity_depth, 2) if _pack else (parity_depth,),
-                    torch.int32,
-                    64,
-                )
-            )
+            specs.append(("recv_route_count", (parity_depth,), torch.int32, 64))
             specs.append(("recv_overflow", (parity_depth,), torch.int32, 64))
             specs.append(("forward_status", (1,), torch.int32, 64))
         if input_capacity < source_capacity:
@@ -667,39 +656,6 @@ class Stage1ArenaLayout:
         specs.append(
             ("node_mask_ready", (parity_depth, 2 * source_nodes), torch.int64, 64)
         )
-
-        if int(send_queue_capacity):
-            if int(send_queue_capacity) < 0:
-                raise ValueError("send_queue_capacity must be nonnegative")
-            # Local metadata-to-copy handoff. Eight-wave metadata batches use
-            # at most this many records; 64 extra ready slots cover terminal
-            # claims by all supported copy roles, without reading out of bounds.
-            send_nb = min(512 // topk, block_m * tile_group) // 8 * 8
-            send_dw = (8 + send_nb + 4 * local_experts + 15) // 16 * 16
-            specs.extend(
-                [
-                    ("send_job_state", (parity_depth, 32), torch.int32, 64),
-                    ("send_job_eos", (parity_depth,), torch.int64, 64),
-                    (
-                        "send_job_ready",
-                        (parity_depth, int(send_queue_capacity) + 64),
-                        torch.int64,
-                        64,
-                    ),
-                    (
-                        "send_job_desc",
-                        (parity_depth, int(send_queue_capacity), send_dw),
-                        torch.int32,
-                        64,
-                    ),
-                    (
-                        "send_join",
-                        (parity_depth, source_nodes * gpus_per_node),
-                        torch.int32,
-                        64,
-                    ),
-                ]
-            )
 
         # Place RDMA (rail GDA) regions first in the window, reserve embed_stage2_bytes,
         # then place other LSA/local regions, including those scaled by max_route_rows.

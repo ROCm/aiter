@@ -27,8 +27,6 @@ Stage1 parameters:
   CTAs can join GMM1 after their communication work. Unsplit accepts 2..31,
   defaulting to 16; split accepts 17..31, defaulting to 17. Missing or invalid
   values fall back without discarding other valid fields.
-* ``data_send_ctas``: 0 copies metadata and payload together; 32 or 64 reserves
-  a separate payload-send pool. Metadata plus payload pools must fit 256 CTAs.
 
 Stage2 parameters:
 * ``gemm2_bm``: M tile. 0 selects the path-dependent default: 64 for xGMI,
@@ -36,7 +34,8 @@ Stage2 parameters:
   the larger tile. SDMA rows retain 0 so a missing SDMA queue can safely fall
   back to the xGMI tile. An explicit tile above 32 may also be used without
   the Stage1 local/remote split; it must divide 32*tile_group.
-* ``gemm2_bn``: GEMM2 N tile, 128 or 256.
+* ``gemm2_bn``: GEMM2 N tile, 128 or 256; model_dim / gemm2_bn must be even
+  (the 8-wave kernel1 runs n_block pairs).
 * ``gemm2_bk``: GEMM2 K tile; 0 or empty selects 256 (one E8M0 word per K tile).
 * ``gemm2_cu``: persistent grid; 0 uses the operator's worker_blocks.
 * ``return_chunk_tokens``: token granularity of rail chunks/readiness signals.
@@ -209,16 +208,11 @@ def _validate_stage1(row: dict, where: str) -> None:
         raise ValueError(
             f"{where}: split_local must be 0 or 1 (got {row['split_local']})"
         )
-    ds = int(row.get("data_send_ctas", 0))
-    if ds not in (0, 32, 64):
-        raise ValueError(f"{where}: data_send_ctas must be 0, 32 or 64 (got {ds})")
     minimum = 17 if row["split_local"] else FANOUT_CTAS_PER_DEST_MIN
     fs = row.get("fanout_ctas_per_dest")
     if fs is None or not minimum <= fs <= FANOUT_CTAS_PER_DEST_MAX:
         fs = default_fanout_ctas_per_dest(row["split_local"])
     row["fanout_ctas_per_dest"] = fs
-    if ds and fs * 8 + ds > 256:
-        raise ValueError(f"{where}: metadata plus data roles exceed the resident grid")
 
 
 def default_split_local(token: int, topk: int) -> int:
@@ -308,7 +302,6 @@ def select_stage1_tile(
                 "tile_group",
                 "split_local",
                 "fanout_ctas_per_dest",
-                "data_send_ctas",
             )
         }
         source = "table"
@@ -317,7 +310,6 @@ def select_stage1_tile(
             "split_local": split,
             "tile_group": default_tile_group(token, expert, split),
             "fanout_ctas_per_dest": default_fanout_ctas_per_dest(split),
-            "data_send_ctas": 0,
         }
         source = "default"
         _validate_stage1(out, "stage1 tile rule")
@@ -325,39 +317,23 @@ def select_stage1_tile(
     return out
 
 
-# Stage1 CTA width.  8 waves (two per SIMD, <= 256 registers each; the PR6881
-# layout the single fused kernel shares with stage2): GMM1 gives each wave a
-# 32-column slice over all rows.
-STAGE1_WAVES = 8
-
-
-def select_stage1_waves(tile_group: int) -> int:
-    """Waves per Stage1 CTA (see STAGE1_WAVES)."""
-    del tile_group  # every tile group runs at STAGE1_WAVES
-    return STAGE1_WAVES
-
-
 # Fused stage2 CTA width.  8 waves (one CTA per CU, each CTA runs an n_block
-# pair over a shared A tile) is the single-kernel shape.
+# pair over a shared A tile), so model_dim / gemm2_bn must be even.
 STAGE2_FUSED_WAVES = 8
 
 
-# Stage1 and the fused Stage2 in one kernel (see single_kernel.py) whenever
-# both run 8-wave CTAs; otherwise the separate launches. Measured faster than
-# the two launches from EP16 TPR32 to TPR512 and at EP32 TPR128;
-# AITER_MEGAMOE_SINGLE_KERNEL=0 restores the two launches.
+# Stage1 and the fused Stage2 in one kernel (see single_kernel.py). Measured
+# faster than the two launches from EP16 TPR32 to TPR512 and at EP32 TPR128;
+# AITER_MEGAMOE_SINGLE_KERNEL=0 restores the two launches (stage1, fused stage2).
 SINGLE_KERNEL = os.environ.get("AITER_MEGAMOE_SINGLE_KERNEL", "1") == "1"
-
-
-def use_single_kernel(stage1_waves: int, stage2_waves: int) -> bool:
-    """Whether to launch Stage1 + fused Stage2 as one kernel."""
-    return bool(SINGLE_KERNEL) and int(stage1_waves) == 8 and int(stage2_waves) == 8
 
 
 def select_stage2_waves(n_blocks: int) -> int:
     """Waves per fused-stage2 CTA (see STAGE2_FUSED_WAVES)."""
     if int(n_blocks) % 2:
-        return 4
+        raise ValueError(
+            f"fused stage2 needs an even GEMM2 n_block count (model_dim / gemm2_bn = {n_blocks})"
+        )
     return STAGE2_FUSED_WAVES
 
 
@@ -375,11 +351,6 @@ STAGE2_INTRA_COMMS = ("xgmi", "sdma")
 DEFAULT_GEMM2_BN = 128
 DEFAULT_GEMM2_CU = 0
 GEMM2_CU_MAX = 2048
-# Kernel1 claims m-blocks dynamically from this max_tok_per_rank up.  Measured
-# on K3 / DSv4.1 EP16: TPR >= 2048 gains 2-14% end to end (static split leaves
-# idle CUs behind the heaviest m-blocks); TPR <= 1024 is even with random
-# routing and 4-5% slower with EPLB (1-2 m-blocks per CTA, the claim is pure cost).
-GEMM2_DYNAMIC_MIN_TPR = 2048
 # From this max_tok_per_rank the fused stage2 ships its intra-node rows with
 # the copy engines (SDMA) instead of xGMI stores from the GEMM2 epilogue.
 STAGE2_SDMA_MIN_TPR = 2048
@@ -389,27 +360,12 @@ STAGE2_SDMA_MIN_TPR = 2048
 # tiles/chunk +9~14% vs xGMI, 512 recovers it).  See select_sdma_chunk_tiles.
 STAGE2_SDMA_CHUNKS = 16
 STAGE2_SDMA_CHUNK_TILES_MIN = 128
-# Small chunks (one compute round each) at the head and the tail of each half
-# around the big ones: the head starts the copy engine early, the tail leaves
-# less to ship after the half's last GEMM2 tile (signal and rail start sooner).
-# 0 = uniform chunks.  Measured 2 vs 0 (46+50, 4 MB puts): even at TPR 16384,
-# +1~3% at 4096 (8 more engine waits); the tail is not what holds stage2 back.
-STAGE2_SDMA_RAMP_CHUNKS = 0
 # Send-buffer size in rows per max_tok_per_rank * topk; rows past it go out as
 # xGMI stores.
 # Bytes per peer that build up before the posted SDMA put is cut (the copy
 # engines reach ~55 GB/s per link from ~4 MB; 1 MB puts only ~44).
 STAGE2_SDMA_PUT_BYTES = 4 << 20
 STAGE2_SDMA_SEND_ROWS_PER_ROUTE = 2
-# Share of each peer's rows sent by SDMA, in 1/64 (the rest go as xGMI stores).
-STAGE2_SDMA_FRAC_Q64 = 64
-# Remote-first stage2: kernel2 part 1 (remote plane reduce + rail post) starts
-# when the node peers' remote halves are in, probed after each local GEMM2
-# unit, instead of blocking at the remote/local boundary.
-STAGE2_PART1_PROBE = True
-# SDMA stage2: only the remote-source half goes by the copy engine; the local
-# half (computed last) goes as xGMI stores.
-STAGE2_SDMA_REMOTE_ONLY = False
 # Single kernel, remote-first stage2: the remote plane goes over the rail in
 # token-completion order (tokens whose rows are all in are reduced between
 # GEMM2 units and sent CHUNK at a time), not per token range at the end.
@@ -455,7 +411,6 @@ TUNE_TABLE = _TuneTable(
     # 0 / "" = the built-in rule
     optional_fields=(
         ("fanout_ctas_per_dest", 0),
-        ("data_send_ctas", 0),
         ("gemm2_bm", 0),
         ("gemm2_bk", 0),
         ("intra_comm", ""),
@@ -525,7 +480,7 @@ def select_gemm2_bn(tuned: dict | None) -> tuple[int, str]:
 
 
 def select_gemm2_bm(
-    tuned: dict | None, *, tile_group: int, fused: bool, sdma: bool
+    tuned: dict | None, *, tile_group: int, remote_first: bool, sdma: bool
 ) -> tuple[int, str]:
     """GEMM2 M tile and its source: table > rule (fused stage2: GEMM2_BM_SDMA
     or GEMM2_BM_XGMI by the intra-node path, while the tile group holds it) > 32.
@@ -537,7 +492,7 @@ def select_gemm2_bm(
     bm = int((tuned or {}).get("gemm2_bm", 0))
     if not bm:
         want = GEMM2_BM_SDMA if sdma else GEMM2_BM_XGMI
-        if fused and (32 * int(tile_group)) % want == 0:
+        if remote_first and (32 * int(tile_group)) % want == 0:
             return want, "default"
         return 32, "default"
     if bm == 32:
@@ -564,11 +519,6 @@ def select_gemm2_grid(tuned: dict | None) -> tuple[int, str]:
             f"gemm2_cu must be in [0, {GEMM2_CU_MAX}] (got {cu}, from {source})"
         )
     return cu, source
-
-
-def use_dynamic_gemm2_claim(max_tok_per_rank: int) -> bool:
-    """Whether kernel1 claims m-blocks dynamically (see GEMM2_DYNAMIC_MIN_TPR)."""
-    return int(max_tok_per_rank) >= GEMM2_DYNAMIC_MIN_TPR
 
 
 def select_stage2_sdma(

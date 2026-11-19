@@ -46,7 +46,6 @@ def gemm2_compute_pipe(
     NW=4,
     a_dtype="fp8",
     b_stages=3,
-    a_by_sub=False,
 ):
     """gemm2_compute_v2 with the K loop unrolled at compile time (K = INTER_MAX).
 
@@ -305,13 +304,23 @@ def gemm2_compute_pipe(
         for J in range_constexpr(numAccN):
             c_frags[i][J].store(zero4)
 
+    # Program-order issue log of per-wave vmem instructions, for exact vmcnt waits.
+    n_b = numAccN * kHalves + nPairs + kScaleSubBlocks
+    log = []
+
     def emit_a(kt):
         if const_expr(kt < K_TILES):
             issue_a(kt)
+            log.append(("A", kt, n_row_groups))
 
     def emit_b(kt):
         if const_expr(kt < K_TILES):
             issue_b(kt)
+            log.append(("B", kt, n_b))
+
+    def after_a(kt):
+        pos = next(i for i, x in enumerate(log) if x[0] == "A" and x[1] == kt)
+        return sum(x[2] for x in log[pos + 1 :])
 
     for kt in range_constexpr(A_AHEAD):
         emit_a(kt)
@@ -335,24 +344,14 @@ def gemm2_compute_pipe(
         emit_a(kt + A_AHEAD)
         emit_b(kt + b_stages - 1)
         rocdl.sched_barrier(0)
-        if const_expr(not a_by_sub):
-            read_a(kt)
+        read_a(kt)
         s = kt % b_stages
         sa = [Vec(st_sa[s][sub].load())[0] for sub in range_constexpr(kScaleSubBlocks)]
         sbw = [Vec(st_bs[s][mni].load())[0] for mni in range_constexpr(nPairs)]
         rocdl.s_setprio(1)
-        # a_by_sub: per 32-row scale group, read its two A chunks and run every
-        # J on them, so only one group's A fragments are live (BM96: 96 -> 32
-        # VGPRs). Each accumulator still sees the same K order.
-        order = (
-            [(J, sub) for sub in range(kScaleSubBlocks) for J in range(numAccN)]
-            if a_by_sub
-            else [(J, sub) for J in range(numAccN) for sub in range(kScaleSubBlocks)]
-        )
+        order = [(J, sub) for J in range(numAccN) for sub in range(kScaleSubBlocks)]
         for oi in range_constexpr(len(order)):
             J, sub = order[oi]
-            if const_expr(a_by_sub and J == 0):
-                read_a(kt, (2 * sub, 2 * sub + 1))
             mma_one_j(
                 J,
                 J % 2,
@@ -365,11 +364,6 @@ def gemm2_compute_pipe(
                 i0=2 * sub,
                 k_halves=kHalves,
             )
-            if const_expr(a_by_sub and J == numAccN - 1):
-                # Keep the next group's A reads behind this group's MFMAs; the
-                # unrolled K loop otherwise hoists every group's reads (BM128:
-                # 1126 spilled VGPRs).
-                rocdl.sched_barrier(0)
         rocdl.s_setprio(0)
         rocdl.sched_barrier(0)
     # The epilogue reuses the A ring as its accumulator slab.

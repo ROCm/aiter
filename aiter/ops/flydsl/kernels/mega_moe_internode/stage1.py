@@ -63,8 +63,6 @@ from .layout import MAX_FUSED_TOKENS_PER_RANK, Stage1ArenaLayout
 BM = 32
 BN = 256
 BK = 256
-THREADS = 256
-WAVES = THREADS // 64
 CCO_TICKET = 0
 # Persistent grid.  The role split (comm / producer / compute tickets) is
 # designed for 256 CTAs, one per CU.
@@ -85,21 +83,11 @@ _COMPILED: dict = {}
 
 def compile_stage1(layout: Stage1ArenaLayout, stage2_layout, **kwargs):
     """Compile (or reuse) one EP16 Stage-1 persistent-kernel shape specialization."""
-    env = __import__("os").environ
     key = (
         repr(layout),
         repr(stage2_layout),
         _rail_ccqe(),
         tuple(sorted(kwargs.items())),
-        tuple(
-            env.get(k)
-            for k in (
-                "S1_PACK_RA",
-                "AITER_MEGAMOE_FAN2_ARRIVAL_ORDER",
-                "SK_G2_EARLY",
-                "SK_GR_COARSE",
-            )
-        ),
     )
     launcher = _COMPILED.get(key)
     if launcher is None:
@@ -115,13 +103,12 @@ def _compile_stage1(
     rank: int,
     stage2_window_offset: int = 0,
     fanout_ctas_per_dest: int = 2,
-    data_send_ctas: int = 0,
     split_local: bool = False,
     activation: str = "silu",
     swiglu_limit: float | None = None,
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
-    waves: int = 4,
+    waves: int = 8,
     group_ready: bool = False,
     buffer_regions: tuple = (),
     lsa_peer_base: int = 0,
@@ -152,22 +139,19 @@ def _compile_stage1(
     # Metadata/payload writes use system write-through, so publication needs no
     # repeated L2 writeback; consumers acquire once per job to preserve weight reuse.
     # Keep constexpr guards outside runtime guards: FlyDSL rewrites them separately.
-    tile_ready = lite_sync = fan_wt = not split_local
-    # ready_q: enqueue a group as soon as it fills. Dispatch reports arriving rows
-    # in batches; the atomic that reaches 32*G rows appends the physical group ID
-    # to the destination's gmm1_ready_q. Sealer phases 1/2 append local/remote tails.
-    # GMM1 consumers claim jobs after their own fanout, without waiting for both
-    # h1_local_eos and h1_queue_eos. Arrival counts require write-through payload
-    # and metadata, as tile_ready does, so also enable fan_wt.
+    tile_ready = lite_sync = not split_local
+    # Ready queue: a group is enqueued as soon as it fills. Dispatch reports arriving
+    # rows in batches; the atomic that reaches 32*G rows appends the physical group
+    # ID to the destination's gmm1_ready_q. Sealer phases 1/2 append local/remote
+    # tails. GMM1 consumers claim jobs after their own fanout, without waiting for
+    # both h1_local_eos and h1_queue_eos. Arrival counts require write-through
+    # payload and metadata, so fanout stores are always write-through.
     # Without split (static_g0), consumer 0 pads tail arrival counts after all
     # reservations complete. Whichever atomic fills GROUP_ROWS enqueues the group;
     # see _rq_pad_tails.
-    ready_q = True
-    if ready_q:
-        fan_wt = True
     # buffer_store cache_modifier, pre-gfx12 encoding: 1=sc0(GLC), 16=sc1(SCC), 2=nt(SLC).
-    _WT_META = 17 if fan_wt else 0
-    _WT_PAY = 19 if fan_wt else 0
+    _WT_META = 17
+    _WT_PAY = 19
 
     if not isinstance(layout, Stage1ArenaLayout):
         raise TypeError("layout must be Stage1ArenaLayout")
@@ -183,13 +167,12 @@ def _compile_stage1(
     # Claim G adjacent BM32 tiles per expert; Stage2 retains the BM32 ABI.
     G = int(layout.tile_group)
     GBM = BM * G
-    # CTA width: 4 waves (one per SIMD, up to 512 registers each) or 8 waves
-    # (two per SIMD, <= 256 registers each; GMM1 gives each wave a 32-column
-    # slice over all rows, see _gemm1_body).
+    # CTA width: 8 waves (two per SIMD, <= 256 registers each; GMM1 gives each
+    # wave a 32-column slice over all rows, see _gemm1_body).
     WAVES = int(waves)
     THREADS = 64 * WAVES
-    if WAVES not in (4, 8):
-        raise ValueError(f"stage1 waves must be 4 or 8, got {WAVES}")
+    if WAVES != 8:
+        raise ValueError(f"stage1 waves must be 8, got {WAVES}")
     group_ready = bool(group_ready)
     GROUP_ROWS = BM * G
     BN = int(layout.block_n)
@@ -253,17 +236,6 @@ def _compile_stage1(
         layout.source_capacity * layout.max_routes_per_token_per_rank
     )
     COMPACT_INPUT = layout.input_capacity < layout.source_capacity
-    # Experiment hook: one 64-bit atomic reserves the batch routes (low word) and
-    # its compact input slots (high word) instead of one atomic per token after
-    # the route vote. Every hit token carries >= 1 route and input_capacity ==
-    # route_capacity here, so an accepted batch's slots stay below capacity even
-    # though rejected batches also advance the input word.
-    PACK_RA = (
-        BOUNDED_RECV
-        and COMPACT_INPUT
-        and layout.input_capacity == layout.route_capacity
-        and __import__("os").environ.get("S1_PACK_RA", "0") == "1"
-    )
     COMM_CTAS = GPUS_PER_NODE
     PRODUCER_FIRST = COMM_CTAS
     PRODUCER_CTAS = min(128, MAX_TOKENS)
@@ -352,29 +324,11 @@ def _compile_stage1(
     # Both paths write h1 by physical group and seal the inverse tile_src_of_dst
     # map for Stage2's indirect A reads. Rail posting CTAs (_POST_LO.._POST_HI)
     # post first and do not receive fanout tokens.
-    data_send_ctas = int(data_send_ctas)
-    if data_send_ctas not in (0, 32, 64):
-        raise ValueError("data_send_ctas must be 0, 32 or 64")
-    SEND_FIRST = GPUS_PER_NODE * fanout_ctas_per_dest
-    SEND_END = SEND_FIRST + data_send_ctas
-    if data_send_ctas and (WAVES != 8 or SEND_END > worker_blocks):
-        raise ValueError("copy roles require eight waves and a resident grid")
     F2S = int(fan2_shards)
     # With more than one remote node, fan2 takes the nodes in arrival order (see
-    # the fan2 loop): EP32 TPR128 a8w4 -1.5~3.7% min-rank, a4w4 even.
-    # AITER_MEGAMOE_FAN2_ARRIVAL_ORDER=0 restores the fixed RECV_ORDER.
-    F2_DYN = NODES > 2 and (
-        __import__("os").environ.get("AITER_MEGAMOE_FAN2_ARRIVAL_ORDER", "1") == "1"
-    )
-    # Experiment hook (single kernel): tickets that skip GMM1 and start GEMM2 early.
-    G2_EARLY = int(__import__("os").environ.get("SK_G2_EARLY") or 0)
-    if not 0 <= G2_EARLY < worker_blocks - COMPUTE_FIRST:
-        raise ValueError("SK_G2_EARLY must leave at least one original GMM1 consumer")
-    # Experiment hook (single kernel): publish GMM1 completion once per CTA
-    # (store drain + L2 write-back + one count when it leaves GMM1; the last CTA
-    # stamps every group's ready word) instead of write-through h1 and a drain,
-    # barrier and count after every job.
-    GR_COARSE = __import__("os").environ.get("SK_GR_COARSE", "0") == "1"
+    # the fan2 loop): EP32 TPR128 a8w4 -1.5~3.7% min-rank, a4w4 even. With one
+    # remote node there is nothing to order.
+    F2_DYN = NODES > 2
     if F2S and F2S > fanout_ctas_per_dest - 1:
         raise ValueError("fan2_shards must be <= fanout_ctas_per_dest - 1")
     _FIN_TICKET = local_rank
@@ -404,13 +358,10 @@ def _compile_stage1(
     max_route_tiles = layout.max_route_tiles
     max_tiles_per_expert = layout.max_tiles_per_expert
     GR_N = max_route_tiles // G + 1  # h1_grp_sync words per half (see layout)
-    N_COMPUTE = (
-        (worker_blocks - COMPUTE_FIRST) + len(_XC) - (G2_EARLY if group_ready else 0)
-    )
     # Tickets that skip GMM1 (single kernel): they reach Stage2 first and can
     # plan the SDMA layout while the others run GMM1 (see single_kernel.py).
     _NC_BASE = [t for t in range(COMPUTE_FIRST) if t not in _XC]
-    N_NONCOMPUTE = len(_NC_BASE) + (G2_EARLY if group_ready else 0)
+    N_NONCOMPUTE = len(_NC_BASE)
     # GMM1 N width is arena.block_n (256; 128 was slower for every tested shape).
     # Count jobs using GNB.
     GBN = BN
@@ -434,11 +385,12 @@ def _compile_stage1(
 
     # A resident non-fanout CTA seals while T0 returns rail credits. The
     # existing sealer EOS acquire is unchanged; no credit or CQ owner moves.
-    SEALER_SPARE = max(SEND_END, ESSENTIAL_CTAS, COMPUTE_FIRST + 1)
+    SEALER_SPARE = max(
+        GPUS_PER_NODE * fanout_ctas_per_dest, ESSENTIAL_CTAS, COMPUTE_FIRST + 1
+    )
     SEPARATE_SEALER = (
         G == 3
         and not split_local
-        and not data_send_ctas
         and local_rank == CCO_TICKET
         and SEALER_SPARE < worker_blocks - 1
     )
@@ -497,6 +449,8 @@ def _compile_stage1(
     # Fixed switches are omitted. split_local represents its associated switches:
     # early local GMM, fan2, lazy padding, and extra consumers, or parallel sealing
     # and static group 0.
+    # In-kernel handoffs of uncached-window data: L1-only acquires, drain-only releases.
+    L1S = comm.UNCACHED_WINDOW
     kernel_name = (
         f"megamoe_stage1_{activation}"
         + (
@@ -521,21 +475,19 @@ def _compile_stage1(
         + (f"_bm{BM}" if BM != 32 else "")
         + (f"_tg{G}" if G != 1 else "")
         + (f"_fos{fanout_ctas_per_dest}" if fanout_ctas_per_dest != 1 else "")
-        + (f"_ds{data_send_ctas}_wtpub" if data_send_ctas else "")
         + ("_slg" if split_local else "_nsl")
-        + (f"_w{WAVES}" if WAVES != 4 else "")
+        + f"_w{WAVES}"
         + ("_gr_sg" if group_ready else "")
         + ("_f2d" if F2_DYN else "")
-        + (f"_g2e{G2_EARLY}" if G2_EARLY and group_ready else "")
-        + ("_grc" if GR_COARSE and group_ready else "")
-        + ("_pra" if PACK_RA else "")
+        + ("_rp" if group_ready else "")
+        + ("_l1s" if L1S else "")
         + ("_c1" if buffer_regions else "")
         + (
             f"_vl{gda_peer_stride}l{gda_peer_lane}b{lsa_peer_base}"
             if gda_peer_stride != 1
             else ""
         )
-        + ("_rq_bounded_ac1_mgloop_c1" if ready_q else "")
+        + "_rq_bounded_ac1_mgloop_c1"
         + ("_recv_status" if BOUNDED_RECV else "")
         # Compile rail CQ polling in CCQE mode.
         + ("_ccqe" if _rail_ccqe() else "")
@@ -651,7 +603,11 @@ def _compile_stage1(
 
         # spin_relaxed uses relaxed polling; the caller performs one acquire afterward.
         _pl32 = comm.load_i32_global_system_relaxed
-        _spin = comm.spin_until_ge_i64_system_rx
+        _spin = (
+            comm.spin_until_ge_i64_system_l1
+            if L1S
+            else comm.spin_until_ge_i64_system_rx
+        )
 
         def _cta_acquire():
             """Acquire for the whole CTA after polling: barrier, wave0 acquire, barrier.
@@ -662,7 +618,7 @@ def _compile_stage1(
             """
             gpu.barrier()
             if wave == fx.Int32(0):
-                comm.fence_system_acquire()
+                (comm.invalidate_l1 if L1S else comm.fence_system_acquire)()
             gpu.barrier()
 
         def peer_local_addr(name, peer):
@@ -801,14 +757,6 @@ def _compile_stage1(
                         ),
                         fx.Int32(0),
                     )
-                    if const_expr(PACK_RA):
-                        buffer_ops.buffer_store(
-                            fx.Int32(0),
-                            buffer_ops.create_buffer_resource_from_addr(
-                                local_addr("recv_route_count")
-                            ),
-                            fx.Int32(1),
-                        )
                 if const_expr(COMPACT_INPUT):
                     buffer_ops.buffer_store(
                         fx.Int32(0),
@@ -823,10 +771,9 @@ def _compile_stage1(
                     )
                     buffer_ops.buffer_store(fx.Int32(0), _jh_res, fx.Int32(0))
                     buffer_ops.buffer_store(fx.Int32(0), _jh_res, fx.Int32(16))
-                    if const_expr(ready_q):
-                        # word 8: ready queue write head; word 9: consumer job claim head.
-                        buffer_ops.buffer_store(fx.Int32(0), _jh_res, fx.Int32(8))
-                        buffer_ops.buffer_store(fx.Int32(0), _jh_res, fx.Int32(9))
+                    # word 8: ready queue write head; word 9: consumer job claim head.
+                    buffer_ops.buffer_store(fx.Int32(0), _jh_res, fx.Int32(8))
+                    buffer_ops.buffer_store(fx.Int32(0), _jh_res, fx.Int32(9))
                 if ntokens != fx.Int32(MAX_TOKENS):
                     comm.atomic_add_system(error_addr, fx.Int32(1))
             if const_expr(static_g0):
@@ -887,36 +834,17 @@ def _compile_stage1(
                                 ),
                                 tr_e,
                             )
-            if const_expr(ready_q and not tile_ready):
+            if const_expr(not tile_ready):
                 # Clear group arrivals before launch_ready; dispatch waits for it before atomics.
                 rq_done = buffer_ops.create_buffer_resource_from_addr(
                     local_addr("tile_row_done")
                 )
                 for rq_i in range(tx, fx.Int32(max_route_tiles), fx.Int32(THREADS)):
                     buffer_ops.buffer_store(fx.Int32(0), rq_done, rq_i)
-            if const_expr(data_send_ctas):
-                js = buffer_ops.create_buffer_resource_from_addr(
-                    local_addr("send_job_state")
-                )
-                if tx < fx.Int32(32):
-                    buffer_ops.buffer_store(fx.Int32(0), js, tx)
-                if tx < fx.Int32(2 * GPUS_PER_NODE):
-                    jd = tx % fx.Int32(GPUS_PER_NODE)
-                    jn = (jd == fx.Int32(0)).select(
-                        fx.Int32(fanout_ctas_per_dest - 1),
-                        fx.Int32(fanout_ctas_per_dest),
-                    )
-                    buffer_ops.buffer_store(
-                        jn,
-                        buffer_ops.create_buffer_resource_from_addr(
-                            local_addr("send_join")
-                        ),
-                        tx,
-                    )
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             if tx == fx.Int32(0):
-                comm.fence_system_release()
+                (comm.publish_uncached if L1S else comm.fence_system_release)()
                 # pub_relaxed: one fence publishes all clears, avoiding an L2 writeback per gate store.
                 _pub_st = comm.store_i64_global_system_relaxed
                 _pub_st(
@@ -1189,7 +1117,7 @@ def _compile_stage1(
                 buffer_ops.buffer_store(
                     local_expert, expert_res, phys, cache_modifier=_WT_META
                 )
-            if const_expr((tile_ready or ready_q) and G > 1):
+            if const_expr(G > 1):
                 # local_expert is relative to the local/remote segment; GMM1 uses it for weights.
                 buffer_ops.buffer_store(
                     local_expert,
@@ -1199,9 +1127,8 @@ def _compile_stage1(
                     base // fx.Int32(G),
                     cache_modifier=_WT_META,
                 )
-            if const_expr(fan_wt):
-                # These stores are write-through; completion makes them peer-visible without an L2 writeback.
-                fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+            # These stores are write-through; completion makes them peer-visible without an L2 writeback.
+            fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             for j in range_constexpr(G):
                 # claim_relaxed: one fence already publishes map/tile_expert; G release stores
                 # would each trigger a full L2 writeback.
@@ -1230,8 +1157,6 @@ def _compile_stage1(
         # Arrival tickets have already been read into registers. Reuse one
         # dword of the reserved 16-dword prefix for the batch acceptance vote.
         _GB_ACCEPT = 4
-        # PACK_RA: the batch's compact input base, also in the reserved prefix.
-        _GB_INBASE = 7
         _GB_CNT = 16
         _GB_BASE = _GB_CNT + LOCAL_EXPERTS
         _GB_HIT = _GB_BASE + LOCAL_EXPERTS
@@ -1346,29 +1271,11 @@ def _compile_stage1(
                     batch_routes = fx.Int32(0)
                     for ex in range_constexpr(LOCAL_EXPERTS):
                         batch_routes += _gb_ld(fx.Int32(_GB_CNT + ex))
-                    if const_expr(PACK_RA):
-                        batch_inputs = fx.Int32(0)
-                        for r2 in range_constexpr(_GB_NB):
-                            batch_inputs += (
-                                _gb_ld(fx.Int32(_GB_HIT + r2)) != fx.Int32(0)
-                            ).select(fx.Int32(1), fx.Int32(0))
-                        prev_pack = fx.Int64(
-                            comm.atomic_add_system(
-                                _peer_addr(dest, "recv_route_count"),
-                                (fx.Int64(batch_inputs) << fx.Int64(32))
-                                | fx.Int64(batch_routes),
-                            )
+                    prev_routes = fx.Int32(
+                        comm.atomic_add_system(
+                            _peer_addr(dest, "recv_route_count"), batch_routes
                         )
-                        prev_routes = fx.Int32(prev_pack & fx.Int64(0xFFFFFFFF))
-                        _gb_st(
-                            fx.Int32(_GB_INBASE), fx.Int32(prev_pack >> fx.Int64(32))
-                        )
-                    else:
-                        prev_routes = fx.Int32(
-                            comm.atomic_add_system(
-                                _peer_addr(dest, "recv_route_count"), batch_routes
-                            )
-                        )
+                    )
                     accepted = prev_routes + batch_routes <= fx.Int32(
                         layout.route_capacity
                     )
@@ -1405,29 +1312,16 @@ def _compile_stage1(
             if const_expr(COMPACT_INPUT):
                 # A token may match several experts on this destination rank,
                 # yet gets exactly one payload slot. Reuse the batch hit word
-                # to carry slot+1 into metadata and optional copy CTAs.
+                # to carry slot+1 into metadata.
                 # Keep the LDS load inside its thread bound; a DSL conjunction
                 # may evaluate both operands before applying the predicate.
-                if const_expr(PACK_RA):
-                    # Slot = batch base + hit tokens before this one. Concurrent
-                    # rewrites of earlier HIT words keep them nonzero (1 -> slot+1).
-                    in_base = _gb_ld(fx.Int32(_GB_INBASE))
-                    in_pre = fx.Int32(0)
-                    for r2 in range_constexpr(_GB_NB):
-                        in_pre += (
-                            (fx.Int32(r2) < tx)
-                            & (_gb_ld(fx.Int32(_GB_HIT + r2)) != fx.Int32(0))
-                        ).select(fx.Int32(1), fx.Int32(0))
                 if tx < fx.Int32(_GB_NB):  # noqa: SIM102
                     if _gb_ld(fx.Int32(_GB_HIT) + tx) != fx.Int32(0):
-                        if const_expr(PACK_RA):
-                            input_slot = in_base + in_pre
-                        else:
-                            input_slot = fx.Int32(
-                                comm.atomic_add_system(
-                                    _peer_addr(dest, "grouped_input_alloc"), fx.Int32(1)
-                                )
+                        input_slot = fx.Int32(
+                            comm.atomic_add_system(
+                                _peer_addr(dest, "grouped_input_alloc"), fx.Int32(1)
                             )
+                        )
                         if input_slot >= fx.Int32(layout.input_capacity):
                             comm.atomic_add_system(error_addr, fx.Int32(1))
                             _llvm_d.intr_trap()
@@ -1502,8 +1396,7 @@ def _compile_stage1(
                     )
                     _pl.append((prec, ptok, vals, sv))
 
-            if const_expr(not data_send_ctas):
-                _issue_payload_loads()
+            _issue_payload_loads()
             # Resolve physical bases for at most two groups covered by [seg,seg+n).
             # P2 already claimed group heads, so this phase only waits, avoiding per-row
             # remote map reads. Two threads per expert resolve the first/last groups;
@@ -1609,385 +1502,77 @@ def _compile_stage1(
                     grow,
                     cache_modifier=_WT_META,
                 )
-            if const_expr(not data_send_ctas):
-                for prec, ptok, vals, sv in _pl:
-                    if _gb_ld(fx.Int32(_GB_HIT) + prec) != fx.Int32(0):
-                        input_row = src_base + ptok
-                        if const_expr(COMPACT_INPUT):
-                            input_row = _gb_ld(fx.Int32(_GB_HIT) + prec) - fx.Int32(1)
-                        dst_payload = buffer_ops.create_buffer_resource_from_addr(
-                            _peer_addr(dest, "grouped_input_q")
-                            + fx.Int64(input_row) * fx.Int64(wire.payload_bytes),
-                            num_records_bytes=wire.payload_bytes,
-                        )
-                        for it in range_constexpr(_GB_IT):
-                            d = (lane + fx.Int32(it * 64)) * fx.Int32(4)
-                            if d < fx.Int32(payload_dwords):
-                                buffer_ops.buffer_store(
-                                    vals[it], dst_payload, d, cache_modifier=_WT_PAY
-                                )
-                        if lane < fx.Int32(scale_dwords):
+            for prec, ptok, vals, sv in _pl:
+                if _gb_ld(fx.Int32(_GB_HIT) + prec) != fx.Int32(0):
+                    input_row = src_base + ptok
+                    if const_expr(COMPACT_INPUT):
+                        input_row = _gb_ld(fx.Int32(_GB_HIT) + prec) - fx.Int32(1)
+                    dst_payload = buffer_ops.create_buffer_resource_from_addr(
+                        _peer_addr(dest, "grouped_input_q")
+                        + fx.Int64(input_row) * fx.Int64(wire.payload_bytes),
+                        num_records_bytes=wire.payload_bytes,
+                    )
+                    for it in range_constexpr(_GB_IT):
+                        d = (lane + fx.Int32(it * 64)) * fx.Int32(4)
+                        if d < fx.Int32(payload_dwords):
                             buffer_ops.buffer_store(
-                                sv,
-                                buffer_ops.create_buffer_resource_from_addr(
-                                    _peer_addr(dest, "grouped_input_scale")
-                                    + fx.Int64(input_row) * fx.Int64(scale_bytes)
-                                ),
-                                lane,
-                                cache_modifier=_WT_PAY,
+                                vals[it], dst_payload, d, cache_modifier=_WT_PAY
                             )
-            if const_expr(not data_send_ctas):
-                gpu.barrier()
-            if const_expr(data_send_ctas):
-                _send_enqueue(tok0, tstride, dest, src_base, remote)
-            elif const_expr(tile_ready or ready_q):
-                # Report group arrivals after all waves' remote metadata/payload stores complete.
-                # [seg,seg+n) spans at most two groups, as assumed by _GB_PH's first/last resolution.
-                # The atomic that reaches GROUP_ROWS is responsible for enqueueing the group.
-                fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-                gpu.barrier()
-                if tx < fx.Int32(LOCAL_EXPERTS):
-                    tr_n = _gb_ld(fx.Int32(_GB_CNT) + tx)
-                    if tr_n > fx.Int32(0):
-                        tr_seg = _gb_ld(fx.Int32(_GB_BASE) + tx)
-                        tr_g0 = tr_seg // fx.Int32(GROUP_ROWS)
-                        tr_g1 = (tr_seg + tr_n - fx.Int32(1)) // fx.Int32(GROUP_ROWS)
-                        tr_group = tr_g0
-                        tr_remaining = tr_n
-                        tr_amount = (tr_g0 + fx.Int32(1)) * fx.Int32(
-                            GROUP_ROWS
-                        ) - tr_seg
-                        while tr_remaining > fx.Int32(0):
-                            tr_amount = (tr_amount < tr_remaining).select(
-                                tr_amount, tr_remaining
-                            )
-                            tr_ph = (tr_group == tr_g0).select(
-                                _gb_ld(fx.Int32(_GB_PH) + tx),
-                                _gb_ld(fx.Int32(_GB_PH + LOCAL_EXPERTS) + tx),
-                            )
-                            if (tr_group > tr_g0) & (tr_group < tr_g1):
-                                tr_ph = buffer_ops.buffer_load(
-                                    buffer_ops.create_buffer_resource_from_addr(
-                                        _peer_addr(dest, "expert_tile_map")
-                                    ),
-                                    (tx + fx.Int32(_EO))
-                                    * fx.Int32(max_tiles_per_expert)
-                                    + tr_group * fx.Int32(G),
-                                    vec_width=1,
-                                    dtype=T.i32,
-                                )
-                            tr_old = fx.Int32(
-                                comm.atomic_add_system(
-                                    _peer_addr(dest, "tile_row_done")
-                                    + fx.Int64(tr_ph) * fx.Int64(4),
-                                    tr_amount,
-                                )
-                            )
-                            if const_expr(ready_q):  # noqa: SIM102
-                                if tr_old + tr_amount == fx.Int32(GROUP_ROWS):
-                                    _rq_push(dest, tr_ph // fx.Int32(G))
-                            tr_remaining -= tr_amount
-                            tr_amount = fx.Int32(GROUP_ROWS)
-                            tr_group += fx.Int32(1)
-
-        # Copy roles consume only completed metadata batches. All descriptors
-        # are local and write-through. No map lookup or remote reservation is
-        # allowed in the copy loop. Generation tags avoid per-launch flag clears.
-        SEND_NB = min(THREADS // TOPK, GROUP_ROWS) // WAVES * WAVES
-        SEND_DW = (8 + SEND_NB + 4 * LOCAL_EXPERTS + 15) // 16 * 16
-        SEND_C0 = 8 + SEND_NB
-        SEND_P0 = SEND_C0 + LOCAL_EXPERTS
-        SEND_C1 = SEND_P0 + LOCAL_EXPERTS
-        SEND_P1 = SEND_C1 + LOCAL_EXPERTS
-
-        def _send_join_done(dest, local_only=False):
-            # One pending join counter: producers are registered at launch;
-            # each queued copy registers before publication. Both retire once.
-            # Thus old==1 has one unique owner and cannot race a late enqueue.
-            jo = GPUS_PER_NODE if local_only else 0
-            ja = local_addr("send_join") + fx.Int64(dest + fx.Int32(jo)) * fx.Int64(4)
-            old = fx.Int32(comm.atomic_add_system(ja, fx.Int32(-1)))
-            if old == fx.Int32(1):
-                if const_expr(local_only):
-                    comm.store_i64_global_system_relaxed(
-                        _peer_addr(dest, "comm_eos")
-                        + fx.Int64(GPUS_PER_NODE + local_rank) * fx.Int64(8),
-                        generation,
-                    )
-                else:
-                    for ci in range_constexpr(
-                        (NODES - 1) * dispatch_chunks * layout.num_qp
-                    ):
-                        comm.atomic_add_system(
-                            local_addr("remote_chunk_consumed") + fx.Int64(ci * 4),
-                            fx.Int32(1),
+                    if lane < fx.Int32(scale_dwords):
+                        buffer_ops.buffer_store(
+                            sv,
+                            buffer_ops.create_buffer_resource_from_addr(
+                                _peer_addr(dest, "grouped_input_scale")
+                                + fx.Int64(input_row) * fx.Int64(scale_bytes)
+                            ),
+                            lane,
+                            cache_modifier=_WT_PAY,
                         )
-                    comm.store_i64_global_system_relaxed(
-                        _peer_addr(dest, "comm_eos") + fx.Int64(local_rank * 8),
-                        generation,
-                    )
-
-        def _send_enqueue(tok0, stride, dest, src_base, remote):
-            # The metadata batch is fully resolved before registering the copy.
-            # All producers are still registered, so neither join can reach zero.
-            if tx == fx.Int32(0):
-                comm.atomic_add_agent(
-                    local_addr("send_join") + fx.Int64(dest) * fx.Int64(4), fx.Int32(1)
-                )
-                if const_expr(split_local and not remote):
-                    comm.atomic_add_agent(
-                        local_addr("send_join")
-                        + fx.Int64(dest + fx.Int32(GPUS_PER_NODE)) * fx.Int64(4),
-                        fx.Int32(1),
-                    )
-                ji = fx.Int32(
-                    comm.atomic_add_agent(local_addr("send_job_state"), fx.Int32(1))
-                )
-                _gb_st(fx.Int32(0), ji)
             gpu.barrier()
-            ji = _gb_ld(fx.Int32(0))
-            dr = buffer_ops.create_buffer_resource_from_addr(
-                local_addr("send_job_desc") + fx.Int64(ji) * fx.Int64(SEND_DW * 4),
-                num_records_bytes=SEND_DW * 4,
-            )
-            if tx == fx.Int32(0):
-                for di, dv in enumerate(
-                    [tok0, stride, dest, fx.Int32(int(remote)), src_base]
-                ):
-                    buffer_ops.buffer_store(
-                        dv, dr, fx.Int32(di), cache_modifier=_WT_META
-                    )
-            if tx < fx.Int32(SEND_NB):
-                hv = fx.Int32(0)
-                if tx < fx.Int32(_GB_NB):
-                    hv = _gb_ld(fx.Int32(_GB_HIT) + tx)
-                buffer_ops.buffer_store(
-                    hv, dr, fx.Int32(8) + tx, cache_modifier=_WT_META
-                )
-            if tx < fx.Int32(LOCAL_EXPERTS):
-                n = _gb_ld(fx.Int32(_GB_CNT) + tx)
-                c0 = fx.Int32(0)
-                c1 = fx.Int32(0)
-                p0 = fx.Int32(0)
-                p1 = fx.Int32(0)
-                if n > fx.Int32(0):
-                    seg = _gb_ld(fx.Int32(_GB_BASE) + tx)
-                    g0 = seg // fx.Int32(GROUP_ROWS)
-                    c0 = (g0 + fx.Int32(1)) * fx.Int32(GROUP_ROWS) - seg
-                    c0 = (c0 < n).select(c0, n)
-                    c1 = n - c0
-                    p0 = _gb_ld(fx.Int32(_GB_PH) + tx)
-                    if c1 > fx.Int32(0):
-                        p1 = _gb_ld(fx.Int32(_GB_PH + LOCAL_EXPERTS) + tx)
-                    if c1 > fx.Int32(GROUP_ROWS):
-                        # Negative C1 denotes multiple following groups. P1 is
-                        # their first logical map index; all maps are published.
-                        # Positive C1 retains the original count/physical pair.
-                        c1 = -c1
-                        p1 = (
-                            tx
-                            + fx.Int32(LOCAL_EXPERTS if split_local and remote else 0)
-                        ) * fx.Int32(max_tiles_per_expert) + (
-                            g0 + fx.Int32(1)
-                        ) * fx.Int32(
-                            G
-                        )
-                for di, dv in [
-                    (SEND_C0, c0),
-                    (SEND_P0, p0),
-                    (SEND_C1, c1),
-                    (SEND_P1, p1),
-                ]:
-                    buffer_ops.buffer_store(
-                        dv, dr, fx.Int32(di) + tx, cache_modifier=_WT_META
-                    )
-            # Covers every metadata and descriptor writer, before ready release.
+            # Report group arrivals after all waves' remote metadata/payload stores complete.
+            # [seg,seg+n) spans at most two groups, as assumed by _GB_PH's first/last resolution.
+            # The atomic that reaches GROUP_ROWS is responsible for enqueueing the group.
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
-            if tx == fx.Int32(0):
-                # All descriptor and row metadata stores are system write-through
-                # and every writer drained before the CTA barrier above. Publish
-                # readiness without flushing unrelated GEMM1 lines from this L2.
-                comm.store_i64_global_system_relaxed(
-                    local_addr("send_job_ready") + fx.Int64(ji) * fx.Int64(8),
-                    generation,
-                )
-
-        def _send_copy_jobs():
-            go = fx.Int32(1) == fx.Int32(1)
-            while go:
-                if tx == fx.Int32(0):
-                    ji = fx.Int32(
-                        comm.atomic_add_agent(
-                            local_addr("send_job_state") + fx.Int64(4), fx.Int32(1)
+            if tx < fx.Int32(LOCAL_EXPERTS):
+                tr_n = _gb_ld(fx.Int32(_GB_CNT) + tx)
+                if tr_n > fx.Int32(0):
+                    tr_seg = _gb_ld(fx.Int32(_GB_BASE) + tx)
+                    tr_g0 = tr_seg // fx.Int32(GROUP_ROWS)
+                    tr_g1 = (tr_seg + tr_n - fx.Int32(1)) // fx.Int32(GROUP_ROWS)
+                    tr_group = tr_g0
+                    tr_remaining = tr_n
+                    tr_amount = (tr_g0 + fx.Int32(1)) * fx.Int32(GROUP_ROWS) - tr_seg
+                    while tr_remaining > fx.Int32(0):
+                        tr_amount = (tr_amount < tr_remaining).select(
+                            tr_amount, tr_remaining
                         )
-                    )
-                    ready_a = local_addr("send_job_ready") + fx.Int64(ji) * fx.Int64(8)
-                    rv = fx.Int64(comm.load_i64_global_system_relaxed(ready_a))
-                    ev = fx.Int64(
-                        comm.load_i64_global_system_relaxed(local_addr("send_job_eos"))
-                    )
-                    while (rv < generation) & (ev < generation):
-                        _mlir_rocdl.s_sleep(16)
-                        rv = fx.Int64(comm.load_i64_global_system_relaxed(ready_a))
-                        ev = fx.Int64(
-                            comm.load_i64_global_system_relaxed(
-                                local_addr("send_job_eos")
-                            )
+                        tr_ph = (tr_group == tr_g0).select(
+                            _gb_ld(fx.Int32(_GB_PH) + tx),
+                            _gb_ld(fx.Int32(_GB_PH + LOCAL_EXPERTS) + tx),
                         )
-                    comm.fence_system_acquire()
-                    total = fx.Int32(_pl32(local_addr("send_job_state")))
-                    live = (rv >= generation) | (ji < total)
-                    if live:
-                        dr = buffer_ops.create_buffer_resource_from_addr(
-                            local_addr("send_job_desc")
-                            + fx.Int64(ji) * fx.Int64(SEND_DW * 4),
-                            num_records_bytes=SEND_DW * 4,
-                        )
-                        for di in range_constexpr(5):
-                            _gb_st(
-                                fx.Int32(di + 1),
-                                buffer_ops.buffer_load(
-                                    dr, fx.Int32(di), vec_width=1, dtype=T.i32
+                        if (tr_group > tr_g0) & (tr_group < tr_g1):
+                            tr_ph = buffer_ops.buffer_load(
+                                buffer_ops.create_buffer_resource_from_addr(
+                                    _peer_addr(dest, "expert_tile_map")
                                 ),
-                            )
-                    _gb_st(fx.Int32(0), live.select(ji, fx.Int32(-1)))
-                gpu.barrier()
-                ji = _gb_ld(fx.Int32(0))
-                go = ji >= fx.Int32(0)
-                if go:
-                    tok0 = _gb_ld(fx.Int32(1))
-                    stride = _gb_ld(fx.Int32(2))
-                    dest = _gb_ld(fx.Int32(3))
-                    remote = _gb_ld(fx.Int32(4))
-                    src_base = _gb_ld(fx.Int32(5))
-                    dr = buffer_ops.create_buffer_resource_from_addr(
-                        local_addr("send_job_desc")
-                        + fx.Int64(ji) * fx.Int64(SEND_DW * 4),
-                        num_records_bytes=SEND_DW * 4,
-                    )
-                    source_node = src_base // fx.Int32(MAX_TOKENS * GPUS_PER_NODE)
-                    source_peer = source_node - (source_node > fx.Int32(node)).select(
-                        fx.Int32(1), fx.Int32(0)
-                    )
-                    remote_base = local_addr("remote_dispatch_rx") + fx.Int64(
-                        source_peer
-                    ) * fx.Int64(plane("remote_dispatch_rx") // (NODES - 1))
-                    rs = buffer_ops.create_buffer_resource_from_addr(
-                        (remote != fx.Int32(0)).select(remote_base, x_q)
-                    )
-                    # Wave-uniform live mask skips every inactive payload row.
-                    # No CTA barrier, atomic, map wait or acquire inside copies.
-                    for rr in range_constexpr(SEND_NB // WAVES):
-                        prec = wave + fx.Int32(rr * WAVES)
-                        hit = buffer_ops.buffer_load(
-                            dr, fx.Int32(8) + prec, vec_width=1, dtype=T.i32
-                        )
-                        ptok = tok0 + prec * stride
-                        if hit != fx.Int32(0):
-                            input_row = src_base + ptok
-                            if const_expr(COMPACT_INPUT):
-                                input_row = hit - fx.Int32(1)
-                            q0 = ptok * fx.Int32(REC_BYTES // 4) + fx.Int32(REC_Q // 4)
-                            vals = []
-                            for it in range_constexpr(_GB_IT):
-                                d = (lane + fx.Int32(it * 64)) * fx.Int32(4)
-                                dc = (d < fx.Int32(payload_dwords)).select(
-                                    d, fx.Int32(0)
-                                )
-                                vals.append(
-                                    buffer_ops.buffer_load(
-                                        rs, q0 + dc, vec_width=4, dtype=T.i32
-                                    )
-                                )
-                            sv = buffer_ops.buffer_load(
-                                rs,
-                                ptok * fx.Int32(REC_BYTES // 4)
-                                + fx.Int32(REC_S // 4)
-                                + (lane < fx.Int32(scale_dwords)).select(
-                                    lane, fx.Int32(0)
-                                ),
+                                (tx + fx.Int32(_EO)) * fx.Int32(max_tiles_per_expert)
+                                + tr_group * fx.Int32(G),
                                 vec_width=1,
                                 dtype=T.i32,
                             )
-                            pay = buffer_ops.create_buffer_resource_from_addr(
-                                _peer_addr(dest, "grouped_input_q")
-                                + fx.Int64(input_row) * fx.Int64(wire.payload_bytes),
-                                num_records_bytes=wire.payload_bytes,
+                        tr_old = fx.Int32(
+                            comm.atomic_add_system(
+                                _peer_addr(dest, "tile_row_done")
+                                + fx.Int64(tr_ph) * fx.Int64(4),
+                                tr_amount,
                             )
-                            for it in range_constexpr(_GB_IT):
-                                d = (lane + fx.Int32(it * 64)) * fx.Int32(4)
-                                if d < fx.Int32(payload_dwords):
-                                    buffer_ops.buffer_store(
-                                        vals[it], pay, d, cache_modifier=_WT_PAY
-                                    )
-                            if lane < fx.Int32(scale_dwords):
-                                buffer_ops.buffer_store(
-                                    sv,
-                                    buffer_ops.create_buffer_resource_from_addr(
-                                        _peer_addr(dest, "grouped_input_scale")
-                                        + fx.Int64(input_row) * fx.Int64(scale_bytes)
-                                    ),
-                                    lane,
-                                    cache_modifier=_WT_PAY,
-                                )
-                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-                    gpu.barrier()
-                    if tx < fx.Int32(LOCAL_EXPERTS):
-                        for ci, pi in [(SEND_C0, SEND_P0), (SEND_C1, SEND_P1)]:
-                            cnt = buffer_ops.buffer_load(
-                                dr, fx.Int32(ci) + tx, vec_width=1, dtype=T.i32
-                            )
-                            if cnt > fx.Int32(0):
-                                ph = buffer_ops.buffer_load(
-                                    dr, fx.Int32(pi) + tx, vec_width=1, dtype=T.i32
-                                )
-                                old = fx.Int32(
-                                    comm.atomic_add_system(
-                                        _peer_addr(dest, "tile_row_done")
-                                        + fx.Int64(ph) * fx.Int64(4),
-                                        cnt,
-                                    )
-                                )
-                                if old + cnt == fx.Int32(GROUP_ROWS):
-                                    _rq_push(dest, ph // fx.Int32(G))
-                            if const_expr(ci == SEND_C1):  # noqa: SIM102
-                                if cnt < fx.Int32(0):
-                                    logical = buffer_ops.buffer_load(
-                                        dr, fx.Int32(pi) + tx, vec_width=1, dtype=T.i32
-                                    )
-                                    remaining = -cnt
-                                    while remaining > fx.Int32(0):
-                                        amount = (
-                                            remaining < fx.Int32(GROUP_ROWS)
-                                        ).select(remaining, fx.Int32(GROUP_ROWS))
-                                        ph = buffer_ops.buffer_load(
-                                            buffer_ops.create_buffer_resource_from_addr(
-                                                _peer_addr(dest, "expert_tile_map")
-                                            ),
-                                            logical,
-                                            vec_width=1,
-                                            dtype=T.i32,
-                                        )
-                                        old = fx.Int32(
-                                            comm.atomic_add_system(
-                                                _peer_addr(dest, "tile_row_done")
-                                                + fx.Int64(ph) * fx.Int64(4),
-                                                amount,
-                                            )
-                                        )
-                                        if old + amount == fx.Int32(GROUP_ROWS):
-                                            _rq_push(dest, ph // fx.Int32(G))
-                                        remaining -= amount
-                                        logical += fx.Int32(G)
-                    # Join only after every publication and RX read has retired.
-                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-                    gpu.barrier()
-                    if tx == fx.Int32(0):
-                        if const_expr(split_local):  # noqa: SIM102
-                            if remote == fx.Int32(0):
-                                _send_join_done(dest, True)
-                        _send_join_done(dest)
+                        )
+                        if tr_old + tr_amount == fx.Int32(GROUP_ROWS):
+                            _rq_push(dest, tr_ph // fx.Int32(G))
+                        tr_remaining -= tr_amount
+                        tr_amount = fx.Int32(GROUP_ROWS)
+                        tr_group += fx.Int32(1)
 
         # early_local_gmm seals padding and group maps over expert*SPL threads instead
         # of serially per expert. F8T2 phase 1 padding took ~12us and map/publication
@@ -2269,13 +1854,12 @@ def _compile_stage1(
                     ),
                     fx.Int32(1),
                 )
-            if const_expr(ready_q):
-                _rq_seal_tails(0)
+            _rq_seal_tails(0)
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
             if const_expr(early_local_gmm):  # noqa: SIM102
                 if tx == fx.Int32(0):
-                    comm.fence_system_release()
+                    (comm.publish_uncached if L1S else comm.fence_system_release)()
                     # The fence already published prior writes; a release store would write back L2 again.
                     (comm.store_i64_global_system_relaxed)(
                         local_addr("h1_local_eos"), generation
@@ -2349,25 +1933,22 @@ def _compile_stage1(
                 fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
                 gpu.barrier()
                 if tx == fx.Int32(0):
-                    if const_expr(data_send_ctas):
-                        _send_join_done(dest, True)
-                    else:
-                        _ldone = (
-                            local_addr("fanout_shard_done")
-                            + fx.Int64(GPUS_PER_NODE * 4)
-                            + fx.Int64(dest) * fx.Int64(4)
+                    _ldone = (
+                        local_addr("fanout_shard_done")
+                        + fx.Int64(GPUS_PER_NODE * 4)
+                        + fx.Int64(dest) * fx.Int64(4)
+                    )
+                    _lprev = fx.Int32(
+                        comm.atomic_add_system_acq_rel(_ldone, fx.Int32(1))
+                    )
+                    if _lprev + fx.Int32(1) == fan_stride:
+                        comm.atomic_add_agent(_ldone, fx.Int32(0) - fan_stride)
+                        comm.fence_system_release()
+                        (comm.store_i64_global_system_relaxed)(
+                            _peer_addr(dest, "comm_eos")
+                            + fx.Int64((GPUS_PER_NODE + local_rank) * 8),
+                            generation,
                         )
-                        _lprev = fx.Int32(
-                            comm.atomic_add_system_acq_rel(_ldone, fx.Int32(1))
-                        )
-                        if _lprev + fx.Int32(1) == fan_stride:
-                            comm.atomic_add_agent(_ldone, fx.Int32(0) - fan_stride)
-                            comm.fence_system_release()
-                            (comm.store_i64_global_system_relaxed)(
-                                _peer_addr(dest, "comm_eos")
-                                + fx.Int64((GPUS_PER_NODE + local_rank) * 8),
-                                generation,
-                            )
             if const_expr(early_local_gmm):  # noqa: SIM102
                 # Seal local groups after intra-node fanout; this does not wait
                 # for remote fanout and stays outside the rail-post pool.
@@ -2542,77 +2123,54 @@ def _compile_stage1(
             # They describe all destination records completing, whereas k1 completes only
             # the local-source half.
             if tx == fx.Int32(0):
-                if const_expr(data_send_ctas):
-                    _send_join_done(dest)
-                    mp = fx.Int32(
-                        comm.atomic_add_agent(
-                            local_addr("send_job_state") + fx.Int64(8), fx.Int32(1)
-                        )
+                # Only the final shard per destination publishes EOS and increments credit.
+                # Each remote_chunk_consumed word must reach exactly GPUS_PER_NODE, not one
+                # increment per shard. Reset by subtraction, as Stage2's arrival protocol does,
+                # rather than relying on next-generation clearing.
+                # The system release RMW publishes this shard's drained remote writes. Its
+                # acquire lets the final arrival observe all shards, then the following
+                # release publishes completion through comm_eos.
+                # Fanout stores are write-through and complete at s_waitcnt(0), avoiding
+                # release's full L2 writeback. Readers still acquire after observing comm_eos.
+                _prev = fx.Int32(
+                    comm.atomic_add_system(
+                        local_addr("fanout_shard_done") + fx.Int64(dest) * fx.Int64(4),
+                        fx.Int32(1),
                     )
-                    if mp + fx.Int32(1) == fx.Int32(SEND_FIRST - 1):
+                )
+                _publish = _prev + fx.Int32(1) == fan_stride
+                if _publish:
+                    comm.atomic_add_agent(
+                        local_addr("fanout_shard_done") + fx.Int64(dest) * fx.Int64(4),
+                        fx.Int32(0) - fan_stride,
+                    )
+                if _publish:
+                    if const_expr(lite_sync):
+                        # The acq_rel RMW already published this CTA's writes and acquired other shards.
+                        # Only local T0 reads consumed, using a system load and acquire fence. Fan RX
+                        # reads completed at s_waitcnt(0), so credit has no race and a relaxed atomic suffices.
+                        for consume_index in range_constexpr(
+                            (NODES - 1) * dispatch_chunks * layout.num_qp
+                        ):
+                            comm.atomic_add_system(
+                                local_addr("remote_chunk_consumed")
+                                + fx.Int64(consume_index * 4),
+                                fx.Int32(1),
+                            )
+                    else:
                         comm.fence_system_release()
-                        comm.store_i64_global_system_relaxed(
-                            local_addr("send_job_eos"), generation
-                        )
-                else:
-                    # Only the final shard per destination publishes EOS and increments credit.
-                    # Each remote_chunk_consumed word must reach exactly GPUS_PER_NODE, not one
-                    # increment per shard. Reset by subtraction, as Stage2's arrival protocol does,
-                    # rather than relying on next-generation clearing.
-                    # The system release RMW publishes this shard's drained remote writes. Its
-                    # acquire lets the final arrival observe all shards, then the following
-                    # release publishes completion through comm_eos.
-                    # With fan_wt, stores are write-through and complete at s_waitcnt(0), avoiding
-                    # release's full L2 writeback. Readers still acquire after observing comm_eos.
-                    _prev = fx.Int32(
-                        (
-                            comm.atomic_add_system
-                            if fan_wt
-                            else comm.atomic_add_system_acq_rel
-                        )(
-                            local_addr("fanout_shard_done")
-                            + fx.Int64(dest) * fx.Int64(4),
-                            fx.Int32(1),
-                        )
+                        for consume_index in range_constexpr(
+                            (NODES - 1) * dispatch_chunks * layout.num_qp
+                        ):
+                            comm.atomic_add_system_acq_rel(
+                                local_addr("remote_chunk_consumed")
+                                + fx.Int64(consume_index * 4),
+                                fx.Int32(1),
+                            )
+                    (comm.store_i64_global_system_relaxed)(
+                        _peer_addr(dest, "comm_eos") + fx.Int64(local_rank) * 8,
+                        generation,
                     )
-                    _publish = _prev + fx.Int32(1) == fan_stride
-                    if _publish:
-                        comm.atomic_add_agent(
-                            local_addr("fanout_shard_done")
-                            + fx.Int64(dest) * fx.Int64(4),
-                            fx.Int32(0) - fan_stride,
-                        )
-                    if _publish:
-                        if const_expr(lite_sync):
-                            # The acq_rel RMW already published this CTA's writes and acquired other shards.
-                            # Only local T0 reads consumed, using a system load and acquire fence. Fan RX
-                            # reads completed at s_waitcnt(0), so credit has no race and a relaxed atomic suffices.
-                            for consume_index in range_constexpr(
-                                (NODES - 1) * dispatch_chunks * layout.num_qp
-                            ):
-                                comm.atomic_add_system(
-                                    local_addr("remote_chunk_consumed")
-                                    + fx.Int64(consume_index * 4),
-                                    fx.Int32(1),
-                                )
-                        else:
-                            comm.fence_system_release()
-                            for consume_index in range_constexpr(
-                                (NODES - 1) * dispatch_chunks * layout.num_qp
-                            ):
-                                comm.atomic_add_system_acq_rel(
-                                    local_addr("remote_chunk_consumed")
-                                    + fx.Int64(consume_index * 4),
-                                    fx.Int32(1),
-                                )
-                        (comm.store_i64_global_system_relaxed)(
-                            _peer_addr(dest, "comm_eos") + fx.Int64(local_rank) * 8,
-                            generation,
-                        )
-
-        if const_expr(data_send_ctas):  # noqa: SIM102
-            if (ticket >= fx.Int32(SEND_FIRST)) & (ticket < fx.Int32(SEND_END)):
-                _send_copy_jobs()
 
         # The CCO CTA is also destination role zero, so delayed-credit progress
         # must run only after the common is_comm path above has contributed its
@@ -2742,8 +2300,7 @@ def _compile_stage1(
             # deep and this costs no LDS and no extra barrier.
             if const_expr(split_local):
                 _seal_perm((0, LOCAL_EXPERTS), (), tiles, False)
-                if const_expr(ready_q):
-                    _rq_seal_tails(LOCAL_EXPERTS)
+                _rq_seal_tails(LOCAL_EXPERTS)
             else:
                 _seal_perm((0,), (), tiles, False, par=True)
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
@@ -2765,7 +2322,7 @@ def _compile_stage1(
                     ),
                     fx.Int32(0),
                 )
-                comm.fence_system_release()
+                (comm.publish_uncached if L1S else comm.fence_system_release)()
                 # The fence already published prior writes; a release store would write back L2 again.
                 (comm.store_i64_global_system_relaxed)(
                     local_addr("h1_queue_eos"), generation
@@ -2800,13 +2357,12 @@ def _compile_stage1(
                 swiglu_limit=swiglu_limit,
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
-                NW=WAVES,
                 aqin_row_base=INPUT_ROW_BASE,
                 aqout_row_base=H1_ROW_BASE,
-                h1_wt=group_ready and not GR_COARSE,
+                h1_wt=group_ready,
                 a_dtype=A_DTYPE,
             )
-            if const_expr(group_ready and not GR_COARSE):
+            if const_expr(group_ready):
                 # Every wave's write-through h1 stores retired, then one count
                 # per job; the group's last job publishes the generation.
                 fx.rocdl.s_waitcnt(vmcnt=0)
@@ -2839,13 +2395,8 @@ def _compile_stage1(
         is_compute = ticket >= fx.Int32(COMPUTE_FIRST)
         for _xt in _XC:
             is_compute = is_compute | (ticket == fx.Int32(_xt))
-        if const_expr(group_ready and G2_EARLY):
-            # Experiment: the last G2_EARLY tickets skip GMM1 and enter the
-            # fused Stage2 once the tables are final, so GEMM2 runs on groups
-            # as their GMM1 completes while the other CTAs drain GMM1.
-            is_compute = is_compute & (ticket < fx.Int32(worker_blocks - G2_EARLY))
         if is_compute:
-            if const_expr(ready_q and not split_local):  # noqa: SIM102
+            if const_expr(not split_local):  # noqa: SIM102
                 # Without split, expert_count is final once all source fan CTAs finish P2.
                 # Consumer 0 adds missing rows to each tail group's arrival count, including
                 # the fully padded static_g0 group for zero-row experts. Padding and real
@@ -2904,24 +2455,34 @@ def _compile_stage1(
                             )
                             if pd_old + pd_add == fx.Int32(GROUP_ROWS):
                                 _rq_push(None, pd_ph // fx.Int32(G))
-            if const_expr(ready_q):
-                # Claim job j and queue entry q=j//GNB. Wait for its generation marker, or
-                # exit once global sealing confirms q exceeds the total groups. The mailbox
-                # follows GMM1 LDS without overlapping the A ring.
-                rq_box = fx.add_offset(fx.recast_iter(fx.Int32, lds_raw), NC_MBOX_DW)
-                rq_view = fx.make_view(rq_box, fx.make_layout(1, 1))
-                rq_qa = local_addr("gmm1_ready_q")
-                rq_ha = local_addr("gmm1_job_head") + fx.Int64(9 * 4)
-                rq_go = fx.Int32(1) == fx.Int32(1)
-                while rq_go:
-                    gpu.barrier()
-                    if tx == fx.Int32(0):
-                        rq_j = fx.Int32(comm.atomic_add_agent(rq_ha, fx.Int32(1)))
-                        rq_q = rq_j // fx.Int32(GNB)
-                        rq_valid = rq_q < fx.Int32(GR_N)
-                        rq_safe_q = rq_valid.select(rq_q, fx.Int32(0))
-                        rq_ea = rq_qa + fx.Int64(rq_safe_q) * fx.Int64(8)
-                        # 0: waiting; 1: entry published; 3: global sealing observed (recheck after acquire).
+            # Claim job j and queue entry q=j//GNB. Wait for its generation marker, or
+            # exit once global sealing confirms q exceeds the total groups. The mailbox
+            # follows GMM1 LDS without overlapping the A ring.
+            rq_box = fx.add_offset(fx.recast_iter(fx.Int32, lds_raw), NC_MBOX_DW)
+            rq_view = fx.make_view(rq_box, fx.make_layout(1, 1))
+            rq_qa = local_addr("gmm1_ready_q")
+            rq_ha = local_addr("gmm1_job_head") + fx.Int64(9 * 4)
+            rq_go = fx.Int32(1) == fx.Int32(1)
+
+            def _rq_claim():
+                gpu.barrier()
+                if tx == fx.Int32(0):
+                    rq_j = fx.Int32(comm.atomic_add_agent(rq_ha, fx.Int32(1)))
+                    rq_q = rq_j // fx.Int32(GNB)
+                    rq_valid = rq_q < fx.Int32(GR_N)
+                    rq_safe_q = rq_valid.select(rq_q, fx.Int32(0))
+                    rq_ea = rq_qa + fx.Int64(rq_safe_q) * fx.Int64(8)
+                    # 0: waiting; 1: entry published; 3: global sealing observed (recheck after acquire).
+                    rq_v = _rq_entry(rq_ea, rq_valid)
+                    rq_e = fx.Int64(
+                        comm.load_i64_global_system_relaxed(local_addr("h1_queue_eos"))
+                    )
+                    rq_st = ((rq_v >> fx.Int64(32)) == fx.Int64(generation)).select(
+                        fx.Int32(1),
+                        (rq_e >= fx.Int64(generation)).select(fx.Int32(3), fx.Int32(0)),
+                    )
+                    while rq_st == fx.Int32(0):
+                        _mlir_rocdl.s_sleep(16)
                         rq_v = _rq_entry(rq_ea, rq_valid)
                         rq_e = fx.Int64(
                             comm.load_i64_global_system_relaxed(
@@ -2934,122 +2495,70 @@ def _compile_stage1(
                                 fx.Int32(3), fx.Int32(0)
                             ),
                         )
-                        while rq_st == fx.Int32(0):
-                            _mlir_rocdl.s_sleep(16)
-                            rq_v = _rq_entry(rq_ea, rq_valid)
-                            rq_e = fx.Int64(
-                                comm.load_i64_global_system_relaxed(
-                                    local_addr("h1_queue_eos")
-                                )
-                            )
-                            rq_st = (
-                                (rq_v >> fx.Int64(32)) == fx.Int64(generation)
-                            ).select(
-                                fx.Int32(1),
-                                (rq_e >= fx.Int64(generation)).select(
-                                    fx.Int32(3), fx.Int32(0)
-                                ),
-                            )
-                        # Only EOS-based termination needs the final allocation
-                        # count here. A ready entry is generation tagged; the
-                        # payload/metadata acquire remains below before GMM1.
-                        rq_in = rq_st == fx.Int32(1)
-                        if rq_st == fx.Int32(3):
-                            comm.fence_system_acquire()
-                            rq_tot = fx.Int32(
-                                _pl32(local_addr("tile_alloc"))
-                            ) // fx.Int32(G)
-                            rq_in = rq_q < rq_tot
-                        # A successful generation-tagged read already owns this
-                        # entry. Only EOS needs the final allocation count; an
-                        # in-range EOS claim still waits for queue publication.
+                    # Only EOS-based termination needs the final allocation
+                    # count here. A ready entry is generation tagged; the
+                    # payload/metadata acquire remains below before GMM1.
+                    rq_in = rq_st == fx.Int32(1)
+                    if rq_st == fx.Int32(3):
+                        (comm.invalidate_l1 if L1S else comm.fence_system_acquire)()
+                        rq_tot = fx.Int32(_pl32(local_addr("tile_alloc"))) // fx.Int32(
+                            G
+                        )
+                        rq_in = rq_q < rq_tot
+                    # A successful generation-tagged read already owns this
+                    # entry. Only EOS needs the final allocation count; an
+                    # in-range EOS claim still waits for queue publication.
+                    rq_w = (rq_v >> fx.Int64(32)) != fx.Int64(generation)
+                    rq_w = rq_w & rq_in
+                    while rq_w:
+                        _mlir_rocdl.s_sleep(16)
+                        rq_v = _rq_entry(rq_ea, rq_valid)
                         rq_w = (rq_v >> fx.Int64(32)) != fx.Int64(generation)
-                        rq_w = rq_w & rq_in
-                        while rq_w:
-                            _mlir_rocdl.s_sleep(16)
-                            rq_v = _rq_entry(rq_ea, rq_valid)
-                            rq_w = (rq_v >> fx.Int64(32)) != fx.Int64(generation)
-                        comm.fence_system_acquire()
-                        fx.ptr_store(
-                            Vec.from_elements(
-                                [
-                                    rq_in.select(
-                                        fx.Int32(rq_v & fx.Int64(0xFFFFFFFF))
-                                        * fx.Int32(GNB)
-                                        + rq_j
-                                        - rq_q * fx.Int32(GNB),
-                                        fx.Int32(-1),
-                                    )
-                                ],
-                                fx.Int32,
-                            ),
-                            rq_box,
-                        )
-                    gpu.barrier()
-                    rq_job = fx.Int32(
-                        rocdl.readfirstlane(T.i32, fx.Int32(Vec(rq_view.load())[0]))
-                    )
-                    rq_has = rq_job >= fx.Int32(0)
-                    if rq_has:
-                        _run_gemm1_job(rq_job)
-                    rq_go = rq_has
-            if const_expr(group_ready and GR_COARSE):
-                # This CTA ran its last GMM1 job: drain its h1 stores, write
-                # back the XCD's L2, count once. The last compute CTA stamps
-                # every group ready (GEMM2's per-group waits are unchanged) and
-                # resets the count by subtraction.
-                fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-                gpu.barrier()
-                gc_box = fx.add_offset(
-                    fx.recast_iter(fx.Int32, lds_raw), NC_MBOX_DW + 2
-                )
-                if tx == fx.Int32(0):
-                    comm.fence_system_release()
-                    gc_old = fx.Int32(
-                        comm.atomic_add_system_acq_rel(
-                            local_addr("h1_grp_sync"), fx.Int32(1)
-                        )
-                    )
+                    (comm.invalidate_l1 if L1S else comm.fence_system_acquire)()
                     fx.ptr_store(
                         Vec.from_elements(
                             [
-                                (gc_old + fx.Int32(1) == fx.Int32(N_COMPUTE)).select(
-                                    fx.Int32(1), fx.Int32(0)
+                                rq_in.select(
+                                    fx.Int32(rq_v & fx.Int64(0xFFFFFFFF))
+                                    * fx.Int32(GNB)
+                                    + rq_j
+                                    - rq_q * fx.Int32(GNB),
+                                    fx.Int32(-1),
                                 )
                             ],
                             fx.Int32,
                         ),
-                        gc_box,
+                        rq_box,
                     )
                 gpu.barrier()
-                gc_last = fx.Int32(
-                    rocdl.readfirstlane(
-                        T.i32,
-                        Vec(fx.make_view(gc_box, fx.make_layout(1, 1)).load())[
-                            0
-                        ].ir_value(),
-                    )
-                ) == fx.Int32(1)
-                if gc_last:
-                    if tx == fx.Int32(0):
-                        comm.atomic_add_agent(
-                            local_addr("h1_grp_sync"), fx.Int32(0 - N_COMPUTE)
-                        )
-                    for gc_i in range(tx, fx.Int32(GR_N), fx.Int32(THREADS)):
-                        comm.store_i32_global_system_relaxed(
-                            local_addr("h1_grp_sync")
-                            + fx.Int64(fx.Int32(GR_N) + gc_i) * fx.Int64(4),
-                            fx.Int32(generation),
-                        )
-                    fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-                    gpu.barrier()
+                rq_job = fx.Int32(
+                    rocdl.readfirstlane(T.i32, fx.Int32(Vec(rq_view.load())[0]))
+                )
+                return rq_job
+
+            while rq_go:
+                rq_job = _rq_claim()
+                rq_has = rq_job >= fx.Int32(0)
+                if rq_has:
+                    _run_gemm1_job(rq_job)
+                rq_go = rq_has
             if tx == fx.Int32(0):
                 # In the fused path, 248 CTAs wait here after fanout for global sealing.
                 # Back off polling to avoid competing with active fanout and credit CTAs for memory.
-                (comm.spin_until_ge_i64_sleep_rx)(
-                    local_addr("h1_queue_eos"), generation, 127
-                )
-            _cta_acquire()
+                if const_expr(gen_lds):
+                    comm.spin_until_ge_i64_sleep_relaxed(
+                        local_addr("h1_queue_eos"), generation, 127
+                    )
+                else:
+                    (comm.spin_until_ge_i64_sleep_rx)(
+                        local_addr("h1_queue_eos"), generation, 127
+                    )
+            if const_expr(gen_lds):
+                # Single kernel: the hand-off's per-XCD invalidate is the acquire;
+                # a per-CTA one here invalidates each XCD's L2 ~31 times.
+                gpu.barrier()
+            else:
+                _cta_acquire()
         if const_expr(gen_lds):
             # Compute CTAs passed the EOS spin above.
             eos_seen = is_compute.select(fx.Int64(1), fx.Int64(0))
@@ -3064,11 +2573,6 @@ def _compile_stage1(
                 nc_e = fx.Int32(-1)
                 for _i, _t in enumerate(_NC_BASE):
                     nc_e = (ticket == fx.Int32(_t)).select(fx.Int32(_i), nc_e)
-                if const_expr(G2_EARLY):
-                    nc_e = (ticket >= fx.Int32(worker_blocks - G2_EARLY)).select(
-                        ticket - fx.Int32(worker_blocks - G2_EARLY - len(_NC_BASE)),
-                        nc_e,
-                    )
                 # i32 words 4/5: this CTA's index among the GMM1-skipping CTAs
                 # (-1: it ran GMM1) and their count.
                 fx.ptr_store(

@@ -46,10 +46,8 @@ from .layout import (
 )
 from .mega_moe_internode_config import (
     NUM_QP,
-    STAGE2_SDMA_FRAC_Q64,
+    SINGLE_KERNEL,
     STAGE2_SDMA_PUT_BYTES,
-    STAGE2_SDMA_RAMP_CHUNKS,
-    STAGE2_SDMA_REMOTE_ONLY,
     STAGE2_SDMA_SEND_ROWS_PER_ROUTE,
     STAGE2_TOKEN_READY,
     lookup_tune,
@@ -59,11 +57,8 @@ from .mega_moe_internode_config import (
     select_gemm2_grid,
     select_sdma_chunk_tiles,
     select_stage1_tile,
-    select_stage1_waves,
     select_stage2_sdma,
     select_stage2_waves,
-    use_dynamic_gemm2_claim,
-    use_single_kernel,
 )
 from .quant import get_rail_record_quant
 from .single_kernel import compile_single_kernel
@@ -93,8 +88,6 @@ GPUS_PER_NODE = 8
 TILE_M = 32
 
 _COMM_QUANT = {"none": "none", "fp8": "fp8_blockwise_1x32"}
-# Largest single NIC registration known to work (TPR 4096 DSv4 registers 0.61 GiB).
-_MAX_RDMA_MR_BYTES = 1 << 30
 _FP4_DTYPES = (torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8))
 
 # Window regions read or written by the rail (GDA RDMA).  Only this prefix of
@@ -166,8 +159,6 @@ def build_window_layout(
     max_recv_routes_per_rank: int | None = None,
     tile_group: int,
     comm_quant: str = "fp8",
-    data_send_ctas: int = 0,
-    fanout_ctas_per_dest: int = 16,
     quant: str = "a4w4",
     world_size: int = WORLD_SIZE,
     gpus_per_node: int = GPUS_PER_NODE,
@@ -208,23 +199,6 @@ def build_window_layout(
         block_m=TILE_M,
         tile_group=tile_group,
         embed_stage2_bytes=int(stage2.total_bytes),
-        # Each destination partitions T records into at most ceil(T/NB)+S
-        # batches per phase. This conservative bound covers both fan1/fan2.
-        send_queue_capacity=(
-            source_nodes
-            * gpus_per_node
-            * (
-                (
-                    max_tok_per_rank
-                    + max(8, min(512 // topk, TILE_M * tile_group) // 8 * 8)
-                    - 1
-                )
-                // max(8, min(512 // topk, TILE_M * tile_group) // 8 * 8)
-                + fanout_ctas_per_dest
-            )
-            if data_send_ctas
-            else 0
-        ),
     )
     return TwoKernelArenaLayout.compose(stage1, stage2)
 
@@ -321,10 +295,8 @@ class MegaMoEInternode:
       and need not be powers of two;
     * ``communicator``: a ``mori.cco`` Communicator owned by the caller
       (default: create one per instance);
-    * ``buffer_layout``: ``"legacy"`` (default) or ``"separate"`` for the C1
-      local-only payload and bounded rail windows. The separate path currently
-      supports xGMI or local-window SDMA, without token-ready. ``local_communicator`` may supply
-      its distinct caller-owned local communicator; absent communicators are
+    * ``local_communicator``: only used by four-GPU logical nodes (a test
+      topology), whose local payload lives in its own windows; absent, it is
       created and owned by the operator;
     * ``max_routes_per_token_per_rank``: upper bound on the experts one
       token routes to within one EP rank (default ``topk``); it sizes the
@@ -343,16 +315,14 @@ class MegaMoEInternode:
         comm_quant: str = "fp8", communicator=None, max_routes_per_token_per_rank: int | None = None,
         max_recv_routes_per_rank: int | None = None,
         act: str | None = None, situ_beta: float = 1.0, situ_linear_beta: float = 1.0,
-        gpus_per_node: int = GPUS_PER_NODE, buffer_layout: str = "legacy",
-        local_communicator=None):
+        gpus_per_node: int = GPUS_PER_NODE, local_communicator=None):
     # fmt: on
         del mega_scheme
-        if buffer_layout not in ("legacy", "separate"):
-            raise ValueError("buffer_layout must be 'legacy' or 'separate'")
+        # One CCO window for all buffers is faster at every TPR; four-GPU
+        # logical nodes need the local payload in windows of their own.
+        buffer_layout = "separate" if int(gpus_per_node) == 4 else "legacy"
         if local_communicator is not None and buffer_layout != "separate":
-            raise ValueError("local_communicator requires buffer_layout='separate'")
-        if int(gpus_per_node) == 4 and buffer_layout != "separate":
-            raise NotImplementedError("four-GPU logical nodes require buffer_layout='separate'")
+            raise ValueError("local_communicator is only used by four-GPU logical nodes")
         self.buffer_layout = buffer_layout
         if act is not None and activation is not None and act != activation:
             raise ValueError("act and activation must agree when both are provided")
@@ -433,7 +403,7 @@ class MegaMoEInternode:
         self._s2_tuned = s2_tuned or None
         self._gemm2_bm, _ = select_gemm2_bm(
             self._s2_tuned, tile_group=int(self._s1_tile["tile_group"]),
-            fused=remote_first, sdma=self._stage2_sdma)
+            remote_first=remote_first, sdma=self._stage2_sdma)
         self._gemm2_bk, _ = select_gemm2_bk(self._s2_tuned)
         # Without a table row: one chunk per rail queue is the balanced
         # point (measured TPR 512 -> 64 and TPR 1024 -> 128 exactly).
@@ -449,12 +419,8 @@ class MegaMoEInternode:
             max_recv_routes_per_rank=self.max_recv_routes_per_rank,
             tile_group=self._s1_tile["tile_group"], comm_quant=self.comm_quant,
             quant=self.quant,
-            data_send_ctas=int(self._s1_tile["data_send_ctas"]),
-            fanout_ctas_per_dest=int(self._s1_tile["fanout_ctas_per_dest"]),
             world_size=self.world_size, gpus_per_node=self.gpus_per_node,
         )
-        # One NIC MR covers the rail prefix; past ~1 GiB rail writes stop
-        # landing (ionic). Refuse here instead of hanging in k2.
         self.buffer_plan = (
             CcoBufferPlan.create(self.layout.stage1, self.layout.stage2)
             if buffer_layout == "separate" else None
@@ -463,14 +429,8 @@ class MegaMoEInternode:
             tuple((r.stage, r.name, i) for i, r in enumerate(self.buffer_plan.regions))
             if self.buffer_plan is not None else ()
         )
-        if self.buffer_plan is None and _align_up(self._rdma_prefix_end(), 64 << 20) > _MAX_RDMA_MR_BYTES:
-            raise ValueError(
-                f"rail-registered prefix {self._rdma_prefix_end() / 2**30:.2f} GiB exceeds "
-                f"{_MAX_RDMA_MR_BYTES / 2**30:.2f} GiB at max_tok_per_rank={self.mtpr}; "
-                "use comm_quant='fp8' or a smaller max_tok_per_rank")
-        s1_waves = select_stage1_waves(self._s1_tile["tile_group"])
         self._s2_waves = select_stage2_waves(self.model_dim // self._gemm2_bn)
-        self._single_kernel = use_single_kernel(s1_waves, self._s2_waves)
+        self._single_kernel = bool(SINGLE_KERNEL)
         # One-kernel Stage2 can post while Stage1 still retires its rail
         # credits. Caller-ordered flushes require independent QP contexts.
         self._stage2_context_base = NUM_QP if self._single_kernel else 0
@@ -500,13 +460,11 @@ class MegaMoEInternode:
                 rank=self.rank,
                 stage2_window_offset=self.layout.stage2_offset,
                 fanout_ctas_per_dest=int(self._s1_tile["fanout_ctas_per_dest"]),
-                data_send_ctas=int(self._s1_tile["data_send_ctas"]),
                 split_local=bool(self._s1_tile["split_local"]),
                 activation=self.activation,
                 swiglu_limit=(self.swiglu_limit or None),
                 situ_beta=self.situ_beta,
                 situ_linear_beta=self.situ_linear_beta,
-                waves=s1_waves,
                 group_ready=self._single_kernel,
                 buffer_regions=self._buffer_regions,
                 **self._transport_compile,
@@ -708,8 +666,7 @@ class MegaMoEInternode:
             memory = communicator.alloc_mem(self.layout.total_bytes)
             # Only the RDMA prefix is registered with the NIC; node-local LSA
             # goes through alloc_mem's P2P mapping of the whole allocation.
-            # Registering the whole window hits ENOMEM at TPR 4096 (7.7 GB),
-            # and rail writes stop landing once one MR exceeds ~1 GiB.
+            # Registering the whole window hits ENOMEM at TPR 4096 (7.7 GB).
             reg_bytes = min(memory.size, _align_up(self._rdma_prefix_end(), 64 << 20))
             window = communicator.register_window(memory.ptr, reg_bytes)
             requirements = CCODevCommRequirements()
@@ -733,7 +690,7 @@ class MegaMoEInternode:
                 # The default M tile follows the path (xGMI stalls at SDMA's 128).
                 self._gemm2_bm, _ = select_gemm2_bm(
                     self._s2_tuned, tile_group=int(self._s1_tile["tile_group"]),
-                    fused=True, sdma=False)
+                    remote_first=True, sdma=False)
             _window_view(window.local_ptr, (self.layout.total_bytes,), "|i1").zero_()
             torch.cuda.synchronize(self.device)
             communicator.barrier()
@@ -847,11 +804,6 @@ class MegaMoEInternode:
             "arrival_delta": arrival_delta, "arrival_delta_step": arrival_delta_step,
             "epoch_planes": tuple(s1.region(n).nbytes // 2 for n in _K1_EPOCH_PLANES),
             "a_tile_map_plane": a_tile_map.nbytes // 2,
-            # Place a tile group's m-blocks on one XCD only for G=2 (K3 TPR128,
-            # DSV4 TPR256: GEMM2 -14~22us).  At G=4 it measured neutral to
-            # +12us (K3 TPR512), so G=4 keeps the plain order.
-            "m_group": 2 if self._s1_tile["tile_group"] == 2 else 1,
-            "dynamic_claim": use_dynamic_gemm2_claim(self.mtpr),
             "resident_ctas": self._device_cus * K1_CTAS_PER_CU,
             # Fused stage2 overlaps the rail with GEMM2 by doing the
             # remote-source m-blocks first (needs Stage1's local/remote split).
@@ -871,7 +823,7 @@ class MegaMoEInternode:
             sd_tiles = (s1.max_route_rows + TILE_M - 1) // TILE_M
             sd_rows = int(STAGE2_SDMA_SEND_ROWS_PER_ROUTE * self.mtpr * self.topk)
             sd_ct = select_sdma_chunk_tiles(self.mtpr * self.topk, self._gemm2_bm // TILE_M)
-            sd_chunks = sd_tiles // sd_ct + 2 + 4 * STAGE2_SDMA_RAMP_CHUNKS
+            sd_chunks = sd_tiles // sd_ct + 2
             # The compact landing map has one source plane per physical node.
             sd_cdone_offset = (256 + s2.source_nodes * self.mtpr * self.topk * 4 + 255) // 256 * 256
             if sd_cdone_offset + sd_chunks * 128 > s2_plane("plane_slot_arrived"):
@@ -885,11 +837,9 @@ class MegaMoEInternode:
                 arg_sd_plan=self._sd_plan.data_ptr(), arg_sd_cdone=self._sd_cdone.data_ptr())
             self._k1_compile.update(
                 sdma=True, sdma_chunk_tiles=sd_ct, sdma_send_rows=sd_rows,
-                sdma_frac_q64=STAGE2_SDMA_FRAC_Q64, sdma_put_bytes=STAGE2_SDMA_PUT_BYTES,
+                sdma_put_bytes=STAGE2_SDMA_PUT_BYTES,
                 sdma_arrival_woff=s2_off("plane_slot_arrived"),
-                sdma_arrival_plane=s2_plane("plane_slot_arrived"), sdma_max_chunks=sd_chunks,
-                sdma_ramp_chunks=STAGE2_SDMA_RAMP_CHUNKS,
-                sdma_remote_only=STAGE2_SDMA_REMOTE_ONLY)
+                sdma_arrival_plane=s2_plane("plane_slot_arrived"), sdma_max_chunks=sd_chunks)
 
         scratch = stage2_scratch_layout(s2.source_nodes, self.mtpr, self._chunk_tokens, NUM_QP)
         self._k2_scratch = torch.zeros(scratch["words"], dtype=torch.int32, device=dev)
@@ -924,13 +874,12 @@ class MegaMoEInternode:
                 forward_status_off=s1.offset("forward_status"),
             )
         s2_waves = self._s2_waves
-        if s2_waves != 4:
-            self._k1_compile["waves"] = s2_waves
-            self._k2_compile["threads"] = 64 * s2_waves
+        self._k1_compile["waves"] = s2_waves
+        self._k2_compile["threads"] = 64 * s2_waves
         # Token-ready rail for the rail-bound low-topk SDMA path. High topk
         # stays on the established local critical path (K3 measured regression).
-        token_ready = (STAGE2_TOKEN_READY and self.buffer_plan is None
-                       and self.world_size == 2 * self.gpus_per_node and self._s2_waves == 8
+        token_ready = (STAGE2_TOKEN_READY
+                       and self.world_size == 2 * self.gpus_per_node
                        and self._k1_compile["remote_first"]
                        and self._stage2_sdma and self.topk <= 8 and self.mtpr >= 2048)
         if token_ready:
@@ -972,7 +921,11 @@ class MegaMoEInternode:
         }
         if self._single_kernel:
             self._launchers["single"] = compile_single_kernel(
-                self._stage1, self._k1_compile, self._k2_compile, DEFAULT_K2_CTAS
+                self._stage1, self._k1_compile, self._k2_compile,
+                # Every CTA runs the combine in the single kernel: the
+                # plane-parallel Phase 1 wants several CTAs per (plane, chunk)
+                # (EP32 TPR128 min-rank: 96 CTAs 340.4, all 256 CTAs 336.0 us).
+                int(self._stage1.grid)
             )
         else:
             self._launchers["stage1"] = self._stage1
