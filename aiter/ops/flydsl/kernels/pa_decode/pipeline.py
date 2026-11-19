@@ -3756,6 +3756,374 @@ class Gfx1250Mxfp4Pipeline:
             self.store(final, warp, lane16, half, tid, score_scales)
 
     @flyc.jit
+    def run_pairs(self):
+        """Wave pairs (64-row CTAs): wave 2 pair + part owns M-tiles 2 pair and
+        2 pair + 1 and tokens [64 part, +64) of each 128-token page. Partners
+        (0, part) and (1, part) read the same rows: each dequantizes four of the
+        eight dim tiles and they swap them through LDS every page."""
+        ctx, t = self.ctx, self.t
+        tid = fx.Int32(gpu.thread_id("x"))
+        warp = fx.Int32(fx.rocdl.readfirstlane(T.i32, tid // t.WAVE))
+        lane = tid % t.WAVE
+        lane16, half = lane % 16, lane // 16
+        kv_query = fx.Int32(gpu.block_id("y"))
+        ctx.kv_h = kv_query
+        ctx.query_begin = fx.Int32(0)
+        self.mem.allocate()
+        pair, part = warp // 2, warp % 2
+        kv = Gfx1250Mxfp4Loader(ctx, warp, lane16, half)
+        kv.pair_rows(part)
+        begin, end = ctx.planned_start * 2, ctx.planned_end * 2
+        last = end - 1
+        own = [pair * 2 + i for i in range_constexpr(2)]
+        q_raw = [self.query_load(own[i], lane16, half) for i in range_constexpr(2)]
+        base = kv.base(kv.step_page_id(begin))
+        k_first = kv.load("k", base)
+        v_first = kv.load("v", base)
+        page_second = kv.step_page_id(fx.min(begin + 1, last))
+        fx.rocdl.sched_barrier(0)
+        first_upper = ctx.planned_context - t.query_length + fx.Int32(1)
+        last_upper = first_upper + (t.query_length - 1)
+        q_ops, q_scales, score_scales, uppers = [], [], [], []
+        for i in range_constexpr(2):
+            q_op, q_scale, q_mantissa = self.query_operand(q_raw[i])
+            q_ops.append(q_op)
+            q_scales.append(q_scale)
+            score_scales.append(q_mantissa * fx.Float32(t.softmax_scale * LOG2E))
+            position, _ = self.row(own[i], lane16)
+            uppers.append(ctx.planned_context - t.query_length + position + 1)
+        scale8 = [fx.full(8, score_scales[i], fx.Float32) for i in range_constexpr(2)]
+        identity_rows = self.identity_rows(lane16, half)
+        mine = pair == 0
+        idents = [
+            mine.select(
+                self.identity_operand(identity_rows, jj),
+                self.identity_operand(identity_rows, 4 + jj),
+            )
+            for jj in range_constexpr(4)
+        ]
+        score_tokens = fx.Vector.from_elements(
+            [float(i) for i in range_constexpr(8)], dtype=fx.Float32
+        )
+        neg_inf = fx.full(8, float("-inf"), fx.Float32)
+        zero8 = fx.full(8, 0, fx.Int32)
+        initial = []
+        for i in range_constexpr(2):
+            initial.extend([fx.Float32(float("-inf")), fx.Float32(0.0)])
+            initial.extend(
+                [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range_constexpr(8)]
+            )
+        initial.extend([fx.Int32(0)] * self.BLOCKS)
+        initial.extend([k_first, v_first, page_second])
+        loads = 2 * self.STATE + self.BLOCKS
+        p_shift = fx.full(8, float(self.P_EXP), fx.Float32)
+        p_unshift = fx.Float32(2.0**-self.P_EXP)
+        for st_i, state in range(begin, end, 1, init=initial):
+            st = fx.Int32(st_i)
+            s_prev = [fx.Int32(state[2 * self.STATE + b]) for b in range_constexpr(4)]
+            k_cur, v_cur, page_next = state[loads], state[loads + 1], state[loads + 2]
+            page_after = kv.step_page_id(fx.min(st + 2, last))
+            base_next = kv.base(page_next)
+            k_rows = [kv.chunk(k_cur, c) for c in range_constexpr(kv.CHUNKS)]
+            scores = [
+                [
+                    Gfx1250Gemm.mma_mx(
+                        k_rows[c][1],
+                        q_ops[i],
+                        k_rows[c][0],
+                        q_scales[i],
+                        Gfx1250Gemm.FMT_E4M3,
+                    )
+                    for c in range_constexpr(kv.CHUNKS)
+                ]
+                for i in range_constexpr(2)
+            ]
+            k_next = kv.load("k", base_next)
+            v_next = kv.load("v", base_next)
+            v_scales, v_rows = [], []
+            for c in range_constexpr(kv.CHUNKS):
+                v_scale, v_row = kv.chunk(v_cur, c)
+                v_scales.append(v_scale)
+                v_rows.append(v_row)
+            first = st * 128
+            masked = first + 128 > first_upper
+            if const_expr(t.sliding_window > 0):
+                masked = masked | (first < last_upper - t.sliding_window)
+            if masked:
+                lane_first = first + part * 64 + half * 8
+                for i in range_constexpr(2):
+                    upper = fx.full(
+                        8, (uppers[i] - lane_first).to(fx.Float32), fx.Float32
+                    )
+                    lower = fx.full(
+                        8,
+                        (uppers[i] - t.sliding_window - lane_first).to(fx.Float32),
+                        fx.Float32,
+                    )
+                    for c in range_constexpr(kv.CHUNKS):
+                        token = score_tokens + fx.full(8, float(16 * c), fx.Float32)
+                        visible = token < upper
+                        if const_expr(t.sliding_window > 0):
+                            visible = visible & (token >= lower)
+                        scores[i][c] = visible.select(scores[i][c], neg_inf)
+                tile_valid = ctx.planned_context - first
+                for c in range_constexpr(kv.CHUNKS):
+                    row_valid = part * 64 + 16 * c + lane16 < tile_valid
+                    v_rows[c] = row_valid.select(v_rows[c], zero8)
+                    v_scales[c] = row_valid.select(v_scales[c], fx.Int32(0))
+            s_new, s_rescale = [], []
+            for b in range_constexpr(self.BLOCKS):
+                tile_s = self.scale_byte(v_scales[0], b)
+                for c in range_constexpr(1, kv.CHUNKS):
+                    tile_s = fx.max(tile_s, self.scale_byte(v_scales[c], b))
+                for offset in (1, 2, 4, 8):
+                    tile_s = fx.max(tile_s, tile_s.shuffle_xor(offset, t.WAVE))
+                block_s = fx.max(
+                    s_prev[b],
+                    fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.as_ir_value(tile_s))),
+                )
+                s_new.append(block_s)
+                s_rescale.append(self.pow2(s_prev[b] - block_s))
+            v_relative = [
+                self.relative_scales(v_scales[c], s_new)
+                for c in range_constexpr(kv.CHUNKS)
+            ]
+            # Output tiles 0-3 are this pair's dims, 4-7 the partner's.
+            tile_rescale = [
+                mine.select(s_rescale[k // 2], s_rescale[2 + k // 2])
+                for k in range_constexpr(4)
+            ] + [
+                mine.select(s_rescale[2 + k // 2], s_rescale[k // 2])
+                for k in range_constexpr(4)
+            ]
+            next_state = []
+            p_ops, outs = [], []
+            for i in range_constexpr(2):
+                m_prev = state[i * self.STATE]
+                l_prev = state[i * self.STATE + 1]
+                out = [state[i * self.STATE + 2 + j] for j in range_constexpr(8)]
+                m_tile = scores[i][0].reduce(ReductionOp.MAX)
+                for c in range_constexpr(1, kv.CHUNKS):
+                    m_tile = fx.maxnumf(m_tile, scores[i][c].reduce(ReductionOp.MAX))
+                m_tile = fx.maxnumf(m_tile, m_tile.shuffle_xor(16, t.WAVE))
+                m_new = fx.maxnumf(m_prev, m_tile)
+                safe = fx.Float32(
+                    (m_new > fx.Float32(float("-inf"))).select(m_new, fx.Float32(0.0))
+                )
+                alpha = fx.Float32(
+                    fx.exp2((m_prev - safe) * score_scales[i], fastmath="afn")
+                )
+                safe8 = fx.full(8, safe, fx.Float32)
+                probs = [
+                    fx.Vector(
+                        fx.exp2(
+                            fmath.fma(scores[i][c] - safe8, scale8[i], p_shift),
+                            fastmath="afn",
+                        )
+                    )
+                    for c in range_constexpr(kv.CHUNKS)
+                ]
+                tile_sum = probs[0].reduce(ReductionOp.ADD)
+                for c in range_constexpr(1, kv.CHUNKS):
+                    tile_sum = tile_sum + probs[c].reduce(ReductionOp.ADD)
+                l_new = l_prev * alpha + tile_sum * p_unshift
+                words = []
+                for c in range_constexpr(kv.CHUNKS):
+                    packed = self.mem.fp8(probs[c])
+                    words.extend([packed[0], packed[1]])
+                p_ops.append(fx.Vector.from_elements(words, dtype=fx.Int32))
+                held = alpha == fx.Float32(1.0)
+                for b in range_constexpr(self.BLOCKS):
+                    held = held & (s_rescale[b] == fx.Float32(1.0))
+                grew = fx.Int32(fx.rocdl.ballot(T.i32, fx.as_ir_value(~held)))
+                if grew != 0:
+                    out = [
+                        out[j] * fx.full(8, alpha * tile_rescale[j], fx.Float32)
+                        for j in range_constexpr(8)
+                    ]
+                outs.append(out)
+                next_state.extend([m_new, l_new])
+            # This pair's four dim tiles of V'', swapped with the partner's.
+            buf = st % 2
+            own_ops = []
+            for jj in range_constexpr(4):
+                words = []
+                for c in range_constexpr(kv.CHUNKS):
+                    packed = self.mem.fp8(
+                        Gfx1250Gemm.mma_mx(
+                            v_rows[c],
+                            idents[jj],
+                            v_relative[c],
+                            fx.Int32(self.UNIT_SCALES),
+                            Gfx1250Gemm.FMT_E2M1,
+                        )
+                    )
+                    words.extend([packed[0], packed[1]])
+                own_ops.append(fx.Vector.from_elements(words, dtype=fx.Int32))
+                self.mem.store(
+                    ((buf * 2 + part) * 8 + pair * 4 + jj) * 1024 + lane * 32,
+                    own_ops[jj],
+                    fx.Int32,
+                )
+            gpu.barrier()
+            other_ops = [
+                self.mem.load(
+                    ((buf * 2 + part) * 8 + (1 - pair) * 4 + jj) * 1024 + lane * 32,
+                    fx.Int32,
+                    8,
+                )
+                for jj in range_constexpr(4)
+            ]
+            v_ops = own_ops + other_ops
+            for j in range_constexpr(8):
+                for i in range_constexpr(2):
+                    outs[i][j] = Gfx1250Gemm.mma(v_ops[j], p_ops[i], outs[i][j], 64)
+            final_state = []
+            for i in range_constexpr(2):
+                final_state.extend(next_state[2 * i : 2 * i + 2])
+                final_state.extend(outs[i])
+            final = yield [*final_state, *s_new, k_next, v_next, page_after]
+        self.store_pairs(final, warp, lane16, half, tid, score_scales, pair)
+
+    @flyc.jit
+    def store_pairs(self, final, warp, lane16, half, tid, score_scales, pair):
+        """Merge each pair's two waves (same rows, tokens of opposite page
+        halves) through LDS and store the rows like ``store``."""
+        ctx, t = self.ctx, self.t
+        tiles = t.m_tiles
+        stats = t.mxfp4_stats_offset
+        mine = pair == 0
+        # The swap area overlaps the merge scratch.
+        gpu.barrier()
+        for i in range_constexpr(2):
+            o_row = (warp * 2 + i) * t.MXFP4_O_BYTES + lane16 * (t.MXFP4_O_STRIDE * 4)
+            for k in range_constexpr(8):
+                j_abs = mine.select(fx.Int32(k), fx.Int32((k + 4) % 8))
+                self.mem.store(
+                    o_row + (16 * j_abs + 8 * half) * 4,
+                    final[i * self.STATE + 2 + k],
+                    fx.Float32,
+                )
+            row_sum = fx.Float32(final[i * self.STATE + 1])
+            row_sum = row_sum + row_sum.shuffle_xor(16, t.WAVE)
+            m_abs = pair * 2 + i
+            if half == 0:
+                self.mem.store(
+                    stats + ((m_abs * t.NWARP + warp) * 16 + lane16) * 4,
+                    fx.Float32(final[i * self.STATE]) * score_scales[i],
+                    fx.Float32,
+                )
+                self.mem.store(
+                    stats + (((tiles + m_abs) * t.NWARP + warp) * 16 + lane16) * 4,
+                    row_sum,
+                    fx.Float32,
+                )
+        s_slot = stats + 2 * tiles * t.NWARP * 16 * 4
+        if tid % t.WAVE == 0:
+            self.mem.store(
+                s_slot + warp * 16,
+                fx.Vector.from_elements(
+                    [
+                        fx.Int32(final[2 * self.STATE + b])
+                        for b in range_constexpr(self.BLOCKS)
+                    ],
+                    dtype=fx.Int32,
+                ),
+                fx.Int32,
+            )
+        gpu.barrier()
+        if const_expr(t.cluster_merge):
+            direct = ctx.task_count == 1
+        else:
+            direct = fx.Int32(int(t.plan_free)) == 1
+        local, dim = tid // 8, (tid % 8) * 16
+        for m in range_constexpr(tiles):
+            waves = [2 * (m // 2), 2 * (m // 2) + 1]
+            s_waves = [
+                fx.Int32(self.mem.load(s_slot + w * 16 + (dim // 32) * 4, fx.Int32)[0])
+                for w in waves
+            ]
+            s_all = fx.max(s_waves[0], s_waves[1])
+            maxima = [
+                fx.Float32(
+                    self.mem.load(
+                        stats + ((m * t.NWARP + w) * 16 + local) * 4, fx.Float32
+                    )[0]
+                )
+                for w in waves
+            ]
+            sums = [
+                fx.Float32(
+                    self.mem.load(
+                        stats + (((tiles + m) * t.NWARP + w) * 16 + local) * 4,
+                        fx.Float32,
+                    )[0]
+                )
+                for w in waves
+            ]
+            row_max = fx.maxnumf(maxima[0], maxima[1])
+            safe = fx.Float32(
+                (row_max > fx.Float32(float("-inf"))).select(row_max, fx.Float32(0.0))
+            )
+            denom = fx.Float32(0.0)
+            acc = fx.Vector.filled(16, 0.0, fx.Float32)
+            for idx in range_constexpr(2):
+                w = waves[idx]
+                weight = fx.Float32(fx.exp2(maxima[idx] - safe, fastmath="afn"))
+                denom = denom + sums[idx] * weight
+                weight = weight * self.pow2(s_waves[idx] - s_all)
+                acc = acc + self.mem.load(
+                    (w * 2 + m % 2) * t.MXFP4_O_BYTES
+                    + (local * t.MXFP4_O_STRIDE + dim) * 4,
+                    fx.Float32,
+                    16,
+                ) * fx.full(16, weight, fx.Float32)
+            inv = fx.Float32(
+                (denom > fx.Float32(0.0)).select(
+                    fx.Float32(rcp_f32(denom)), fx.Float32(0.0)
+                )
+            )
+            restore = s_all - fx.Int32(self.OUT_EXP)
+            high = fx.max(restore, fx.Int32(-126))
+            values = (
+                (acc * fx.full(16, inv, fx.Float32))
+                * fx.full(16, self.pow2(restore - high), fx.Float32)
+                * fx.full(16, self.pow2(high), fx.Float32)
+            ).to(t.q_dtype)
+            row = m * 16 + local
+            if row < t.rows:
+                position = row // t.query_group_size
+                head = ctx.kv_h * t.query_group_size + row % t.query_group_size
+                if direct:
+                    fx.ptr_store(
+                        values,
+                        fx.add_offset(
+                            fx.recast_iter(t.q_dtype, ctx.output_ptr),
+                            (fx.Int64(ctx.planned_seq) * t.query_length + position)
+                            * ctx.stride_q_row
+                            + head * ctx.stride_q_head
+                            + dim,
+                        ),
+                    )
+                else:
+                    partial = (
+                        fx.Int64(ctx.kv_h) * fx.Int64(ctx.capacity)
+                        + fx.Int64(ctx.task_slot)
+                    ) * t.rows + row
+                    fx.ptr_store(
+                        values,
+                        fx.add_offset(
+                            fx.recast_iter(t.q_dtype, ctx.pout_ptr),
+                            partial * t.head_dim + dim,
+                        ),
+                    )
+                    if tid % 8 == 0:
+                        pmax = fx.recast_iter(fx.Float32, ctx.pmax_ptr)
+                        psum = fx.recast_iter(fx.Float32, ctx.psum_ptr)
+                        pmax[partial] = row_max * fx.Float32(1.0 / LOG2E)
+                        psum[partial] = denom
+
+    @flyc.jit
     def store_wave(self, final, warp, lane16, half, score_scales):
         """Each wave's own rows as a partial of the cluster merge (slot NWARP *
         task slot + wave), instead of merging the waves through LDS: no

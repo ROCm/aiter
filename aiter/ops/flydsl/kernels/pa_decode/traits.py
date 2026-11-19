@@ -1516,6 +1516,10 @@ class Gfx1250Traits:
     # wave of CTA p) for the cluster merge, instead of the CTA merging its
     # waves through LDS first.
     wave_partials: bool = False
+    # MXFP4 64-row CTAs: wave 2 g + p owns M-tiles 2 g, 2 g + 1 and the 64
+    # tokens [64 p, +64) of each page; partners (0, p) and (1, p) dequantize
+    # half the dims each and swap them through LDS.
+    wave_pairs: bool = False
     # With fuse_tasks 2, CTAs of this size resident at once
     # (mxfp4_gfx1250_resident_ctas): a CTA runs two slots only when the
     # plan's live tasks need more CTAs than this.
@@ -1702,7 +1706,8 @@ class Gfx1250Traits:
 
     @property
     def m_tiles(self):
-        return (self.rows + 15) // 16
+        # Wave pairs own two M-tiles a pair: four, the last padded if needed.
+        return 4 if self.wave_pairs else (self.rows + 15) // 16
 
     @property
     def q_stride(self):
@@ -1860,11 +1865,15 @@ class Gfx1250Traits:
             # Only the wave merge after the tile loop uses LDS: per wave and
             # M-tile the outputs, row maxima and sums, then each wave's four
             # block scales S_b.
-            return (
+            merge = (
                 self.mxfp4_stats_offset
                 + 2 * self.NWARP * self.m_tiles * 16 * 4
                 + self.NWARP * 16
             )
+            if self.wave_pairs:
+                # Swap area: 2 buffers x 2 halves x 8 dim tiles x 32 lanes x 32 B.
+                return max(merge, 2 * 2 * 8 * 32 * 32)
+            return merge
         units = self.m_tiles * 16 // self.quant_unit
         return self.quant_offset + (units * self.NWARP * 4 if self.quant_output else 0)
 

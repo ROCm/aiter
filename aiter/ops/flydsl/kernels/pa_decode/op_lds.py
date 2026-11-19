@@ -2507,6 +2507,7 @@ class Gfx1250Mxfp4Loader:
 
     def __init__(self, ctx, warp, lane16, half):
         self.ctx = ctx
+        self.lane16, self.half = lane16, half
         self.page_slot = warp // 2
         row = (warp % 2) * 64 + lane16
         self.data_off = row * 64 + half * 16
@@ -2522,6 +2523,20 @@ class Gfx1250Mxfp4Loader:
         }
         self.table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
         self.num_pages = (ctx.planned_context + 127) // 128
+
+    def pair_rows(self, part):
+        """Wave pairs: this wave reads rows [64 part, +64) of each page."""
+        row = part * 64 + self.lane16
+        self.data_off = row * 64 + self.half * 16
+        self.scale_off = row * 4
+
+    def step_page_id(self, step):
+        """Page of 128-token step ``step`` (wave pairs); pages past the context
+        read the sequence's first page, whose tokens are masked."""
+        page = (step < self.num_pages).select(step, fx.Int32(0))
+        return fx.Int32(
+            self.table[self.ctx.planned_seq * self.ctx.max_blocks_per_seq + page]
+        )
 
     def page_id(self, tt):
         """This wave's page of tile ``tt``. Pages past the context (the second

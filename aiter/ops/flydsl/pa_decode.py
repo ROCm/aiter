@@ -567,6 +567,16 @@ def _pa_decode_mxfp4(
         and max_tasks * num_kv_heads * splits > resident_ctas
         else 1
     )
+    # 41-64 query rows that would fuse instead run whole in one CTA, two a CU,
+    # whose wave pairs split the M-tiles and the tokens of each 128-token step
+    # and swap their dequantized V halves (``run_pairs``): half the V dequant
+    # of two query splits (G16 x MTP4 at B3 x 32k: 10.1 -> 9.4 us, B3 x 225k:
+    # 27.0 -> 23.3 us). Where clusters merge, or with 40 rows, more and shorter
+    # CTAs win (B3 x 8k: 7.0 against 9.1 us; G8 x MTP5 at B8 x 32k: 11.4
+    # fused against 12.3 us).
+    wave_pairs = fuse_tasks == 2 and query_length * group > 40
+    if wave_pairs:
+        fuse_tasks = 1
     # As on the FP8/BF16 path: clusters given a length bound give CTA p tiles
     # [p * run, (p + 1) * run), runs splitting the bound evenly, so each CTA
     # loads its first page ids with the context length rather than after it.
@@ -614,6 +624,7 @@ def _pa_decode_mxfp4(
             cluster_runs=cluster_runs,
             fuse_tasks=fuse_tasks,
             wave_partials=wave_partials,
+            wave_pairs=wave_pairs,
         )
     pmax = psum = pout = output
     if not direct:
@@ -719,8 +730,10 @@ def _pa_decode_mxfp4(
             query_seq_len=query_length,
             query_group_size=group,
             head_size=head_dim,
-            # Not bounded by max_context_length: a task may own more tokens than it.
-            max_partitions=min(work_plan.max_partitions, capacity),
+            # As on the FP8/BF16 path: a sequence has at most the tiles its
+            # length bound and window allow, so the reducer takes a shorter
+            # register rung (G16 B1 x 8k decode: 5.4 -> 5.3 us).
+            max_partitions=partitions,
             stream=stream,
             reduce_info=work_plan.reduce_info,
         )

@@ -2001,31 +2001,47 @@ _MXFP4_GFX1250_CASES = [
     ],
     # Enough tiles that a CTA runs two plan slots (fuse_tasks), and more
     # sequences than resident clusters: adjacent tiles of a sequence fuse,
-    # pairs across sequences (and empty ones) run apart.
+    # pairs across sequences (and empty ones) run apart. Over 40 rows the
+    # tasks run whole on wave pairs instead; G8 x MTP5 (40 rows) fuses.
     *[
         (
-            f"mxfp4-mtp4-fused{'-window' if window else ''}",
+            (
+                f"mxfp4-mtp{qlen}-g{group}-{'pairs' if pairs else 'fused'}"
+                f"{'-window' if window else ''}"
+            ),
             {
                 **_MXFP4_BASE,
+                "group_size": group,
                 "query_dtype": torch.bfloat16,
-                "query_length": 4,
+                "query_length": qlen,
                 "window": window,
-                "fused": True,
+                "fused": not pairs,
+                "pairs": pairs,
                 "lengths": (0, 1, 4, 255, 256, 257, 1027, 513) * 32,
             },
         )
-        for window in (0, 300)
+        for qlen, group, pairs, windows in (
+            (4, 16, True, (0, 300)),
+            (5, 8, False, (0, 300)),
+            # Partly filled M-tiles on wave pairs: 48 rows leave the last
+            # pair's second M-tile empty, 60 rows fill it partly.
+            (3, 16, True, (0,)),
+            (5, 12, True, (0,)),
+        )
+        for window in windows
     ],
     # A table-capacity length bound (as ATOM passes) compiles the fusing
     # kernel, but the plan's 56 live tasks fit one round, so each CTA runs one
     # slot.
     (
-        "mxfp4-mtp4-fused-loose-bound",
+        "mxfp4-mtp5-g8-fused-loose-bound",
         {
             **_MXFP4_BASE,
+            "group_size": 8,
             "query_dtype": torch.bfloat16,
-            "query_length": 4,
+            "query_length": 5,
             "fused": True,
+            "pairs": False,
             "lengths": (0, 1, 4, 255, 256, 257, 1027, 513) * 4,
             "table_width": 1024,
             "max_context": 1024 * 128,
@@ -2596,6 +2612,7 @@ def _run_pa_decode_case(case, device, monkeypatch):
             "cluster": None,
             "query_splits": None,
             "fused": None,
+            "pairs": None,
             "cluster_seqs": None,
             "cluster_steps": None,
             "cluster_runs": None,
@@ -2937,6 +2954,9 @@ def _run_pa_decode_case(case, device, monkeypatch):
         if case["fused"] is not None:
             fused = any(k.get("fuse_tasks") == 2 for k in compile_kwargs)
             assert fused == case["fused"], compile_kwargs[-1]
+        if case["pairs"] is not None and arch == "gfx1250":
+            pairs = any(k.get("wave_pairs") for k in compile_kwargs)
+            assert pairs == case["pairs"], compile_kwargs[-1]
         if case["cluster"] is not None and arch == "gfx1250":
             assert compile_kwargs[-1]["cluster_merge"] == case["cluster"]
     if case["nhd_contracts"]:

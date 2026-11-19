@@ -189,6 +189,7 @@ def _pa_decode_tile_kernel_name(
     store_output=True,
     fuse_tasks=1,
     wave_partials=False,
+    wave_pairs=False,
 ):
     """Trace-visible symbol carrying the main compile-time constants."""
     name = (
@@ -217,6 +218,8 @@ def _pa_decode_tile_kernel_name(
         name += f"_fuse{fuse_tasks}"
     if wave_partials:
         name += "_wp"
+    if wave_pairs:
+        name += "_pairs"
     return name
 
 
@@ -253,6 +256,7 @@ def compile_pa_decode_tile(
     store_output: bool = True,
     fuse_tasks: int = 1,
     wave_partials: bool = False,
+    wave_pairs: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -365,6 +369,7 @@ def compile_pa_decode_tile(
                 store_output=store_output,
                 fuse_tasks=fuse_tasks,
                 wave_partials=wave_partials,
+                wave_pairs=wave_pairs,
             )
         )
     if architecture not in ("gfx942", "gfx950"):
@@ -373,8 +378,10 @@ def compile_pa_decode_tile(
         raise NotImplementedError(
             "cluster_merge, quant_output and a skipped store require gfx1250"
         )
-    if fuse_tasks != 1 or wave_partials:
-        raise NotImplementedError("fuse_tasks and wave_partials require gfx1250 MXFP4")
+    if fuse_tasks != 1 or wave_partials or wave_pairs:
+        raise NotImplementedError(
+            "fuse_tasks, wave_partials and wave_pairs require gfx1250 MXFP4"
+        )
     schedule = PaDecodeSchedule.select(
         head_dim=head_dim,
         query_group_size=query_group_size,
@@ -910,6 +917,7 @@ def gfx1250_tile_traits(
     store_output: bool = True,
     fuse_tasks: int = 1,
     wave_partials: bool = False,
+    wave_pairs: bool = False,
 ) -> Gfx1250Traits:
     """Select the gfx1250 tile ``compile_pa_decode_tile`` compiles.
 
@@ -929,6 +937,9 @@ def gfx1250_tile_traits(
         # scale path off, so either per_token_kv selects the same kernel.
         plan_free, direct_output, per_token_kv = direct_output, False, False
         sliding_window = max(sliding_window, 0)
+        if wave_pairs:
+            # One CTA for 33-64 rows: wave pairs split the rows, not the CTA.
+            query_splits = 1
         if query_splits is None:
             query_splits = mxfp4_gfx1250_query_splits(query_length, query_group_size)
     if query_splits is None:
@@ -1000,6 +1011,7 @@ def gfx1250_tile_traits(
         plan_free=plan_free,
         fuse_tasks=fuse_tasks,
         wave_partials=wave_partials,
+        wave_pairs=wave_pairs,
         resident_ctas=(
             mxfp4_gfx1250_resident_ctas(
                 query_length * query_group_size // query_splits, num_compute_units
@@ -1054,6 +1066,17 @@ def compile_gfx1250_pa_decode(t):
         raise ValueError(
             "wave_partials requires an MXFP4 cluster merge of at most "
             f"{32 // 4} CTAs (a lane per partial)"
+        )
+    if t.wave_pairs and not (
+        t.mxfp4
+        and t.query_splits == 1
+        and 32 < t.rows <= 64
+        and t.fuse_tasks == 1
+        and not t.wave_partials
+    ):
+        raise ValueError(
+            "wave_pairs requires one split of 33-64 MXFP4 rows, without fused "
+            "tasks or wave partials"
         )
     if t.fuse_tasks not in (1, 2) or (
         t.fuse_tasks > 1 and (not t.mxfp4 or t.plan_free or t.cluster_merge)
@@ -1154,6 +1177,7 @@ def compile_gfx1250_pa_decode(t):
         store_output=t.store_output,
         fuse_tasks=t.fuse_tasks,
         wave_partials=t.wave_partials,
+        wave_pairs=t.wave_pairs,
     )
 
     # Every argument that reducer-fed and direct-output kernels read fits in
@@ -1567,7 +1591,10 @@ def compile_gfx1250_pa_decode(t):
             if const_expr(t.plan_free):
                 ctx.output_ptr = output
             if const_expr(t.mxfp4):
-                Gfx1250Mxfp4Pipeline(ctx).run()
+                if const_expr(t.wave_pairs):
+                    Gfx1250Mxfp4Pipeline(ctx).run_pairs()
+                else:
+                    Gfx1250Mxfp4Pipeline(ctx).run()
             elif const_expr(t.bf16_wave_query_tiles):
                 Gfx1250Bf16WavePipeline(ctx).run()
             elif const_expr(t.bf16_page128_packed):
