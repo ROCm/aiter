@@ -15,16 +15,19 @@ Wrap a kernel once and call it as before::
 
 The first launch of a key goes through ``kernel[grid]`` and keeps the compiled
 kernel. A later launch with the same key calls its launcher directly. The key
-holds the current device, the knobs that enter Triton's compile options or
-specialization (``runtime.debug``, ``compilation.instrumentation_mode``,
-``compilation.fpsan_homomorphic_casts`` on the Triton builds that have it,
-``amd.use_buffer_ops``), the number of positional arguments, the keyword names,
-and for each argument:
+holds the current device, the knobs ``JITFunction.run`` puts in its cache key
+(``runtime.debug``, ``compilation.instrumentation_mode``,
+``compilation.fpsan_homomorphic_casts`` on the Triton builds that have it), the
+``amd.use_buffer_ops`` knob the HIP backend specializes tensors on, the number
+of positional arguments, the keyword names, and for each argument:
 
 * a tensor: its dtype, whether its data pointer is 16-byte aligned, and whether
   its storage fits in 2 GiB (``HIPBackend.get_tensor_specialization``); and,
   for a kernel under ``@triton.autotune`` or ``@triton.heuristics``, its shape
-  and strides, which a config choice can read;
+  and strides, which a ``@triton.heuristics`` function can read. An autotuner
+  keys on the values of its ``key`` arguments and on dtypes, which the key
+  already holds. ``fast_launch(kernel, key_shapes=False)`` leaves shapes and
+  strides out, for a kernel whose heuristics read none;
 * any other value: its type and value.
 
 With ``fast_launch(kernel, by_specialization=True)``, a plain ``@triton.jit``
@@ -53,6 +56,7 @@ from triton.compiler import CompiledKernel
 from triton.knobs import HookChain
 from triton.runtime import driver
 from triton.runtime.autotuner import Autotuner
+from triton.runtime.interpreter import InterpretedFunction
 from triton.runtime.jit import JITFunction
 
 # `HIPBackend.is_within_2gb`: the storage size up to which buffer ops apply,
@@ -116,7 +120,7 @@ def _wide_int_spec(v: int) -> str:
     elif 0 <= v < 2**64:
         width = "u64"
     else:
-        raise TypeError("int out of range for a Triton argument")
+        raise OverflowError("int out of range for a Triton argument")
     return width if v & 15 else width + "D"
 
 
@@ -152,13 +156,16 @@ class _Entry(NamedTuple):
 class _FastLaunch:
     """A kernel that remembers what it compiled for a given key."""
 
-    def __init__(self, kernel, by_specialization: bool = False):
+    def __init__(
+        self, kernel, by_specialization: bool = False, key_shapes: bool = True
+    ):
         self._kernel = kernel
         self._cache = OrderedDict()
+        self._disabled = False
         # The autotuner and any other decorator wrap the JITFunction that owns
         # the argument binder and the hooks.
         jit = kernel
-        while not isinstance(jit, JITFunction):
+        while not isinstance(jit, (JITFunction, InterpretedFunction)):
             jit = jit.fn
         self._jit = jit
         self._wrapped = jit is not kernel
@@ -168,7 +175,12 @@ class _FastLaunch:
                 "chosen by @triton.autotune or @triton.heuristics can read the "
                 "value of any argument"
             )
+        if isinstance(jit, InterpretedFunction):
+            # TRITON_INTERPRET=1: no compiled kernel to keep.
+            self._disabled = True
+            return
         self._by_spec = by_specialization
+        self._key_shapes = self._wrapped and key_shapes
         runtime = [not p.is_constexpr for p in jit.params]
         self._runtime_at = tuple(runtime)
         self._runtime_named = {p.name: r for p, r in zip(jit.params, runtime)}
@@ -176,7 +188,6 @@ class _FastLaunch:
         self._layouts = {}
         # Types of the constexpr arguments of a launch, seen without a tensor.
         self._tensorless = set()
-        self._disabled = False
         # Bound on the first launch, which assumes the active driver is not
         # swapped afterwards. The device and the stream are still asked for on
         # every launch.
@@ -275,13 +286,13 @@ class _FastLaunch:
         append = key.append
         values = (*args, *kwargs.values()) if kwargs else args
         if not self._by_spec:
-            wrapped = self._wrapped
+            key_shapes = self._key_shapes
             for v in values:
                 if isinstance(v, _Tensor):
                     append(v.dtype)
                     append(v.data_ptr() % 16 == 0)
                     append(v.untyped_storage().nbytes() <= _MAX_INT32)
-                    if wrapped:
+                    if key_shapes:
                         append(tuple(v.shape))
                         append(v.stride())
                     continue
@@ -413,7 +424,9 @@ class _FastLaunch:
         self._cache.clear()
 
 
-def fast_launch(kernel, *, by_specialization: bool = False) -> _FastLaunch:
+def fast_launch(
+    kernel, *, by_specialization: bool = False, key_shapes: bool = True
+) -> _FastLaunch:
     """Wrap ``kernel`` so ``wrapped[grid](...)`` skips Triton's per-call
     dispatch for a key it has launched before.
 
@@ -421,6 +434,9 @@ def fast_launch(kernel, *, by_specialization: bool = False) -> _FastLaunch:
     ``@triton.autotune`` / ``@triton.heuristics``. ``by_specialization=True``
     keys the non-constexpr arguments of a plain kernel by Triton's
     specialization classes instead of by value; it raises ``ValueError`` for a
-    wrapped kernel. Launches return what ``kernel[grid](...)`` returns.
+    wrapped kernel. ``key_shapes=False`` leaves tensor shapes and strides out
+    of the key of a wrapped kernel; pass it only when no ``@triton.heuristics``
+    function of the kernel reads a shape or stride. Launches return what
+    ``kernel[grid](...)`` returns.
     """
-    return _FastLaunch(kernel, by_specialization)
+    return _FastLaunch(kernel, by_specialization, key_shapes)

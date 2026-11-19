@@ -68,21 +68,46 @@ def _offset_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
     tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask) + _OFFSET, mask=mask)
 
 
-# `JITFunction.run` puts this knob in the compile options only on the Triton
-# builds that have it.
+# Not every supported Triton build has this knob.
 _FPSAN = "fpsan_homomorphic_casts" in knobs.compilation.knob_descriptors
+
+# The knobs fast_launch keys on that `JITFunction.run` adds to the launch
+# options. A knob a later Triton adds there and fast_launch misses fails
+# `_run_kwargs`.
+_KEYED_RUN_KNOBS = {"debug", "instrumentation_mode", "fpsan_homomorphic_casts"}
+
+
+class _Stop(Exception):
+    pass
+
+
+def _run_kwargs(kernel, args, kwargs):
+    """The keyword arguments `JITFunction.run` passes on for a launch, knobs
+    included, taken from a real launch that stops before compiling."""
+    seen = []
+
+    def hook(*a, **kw):
+        seen.append(kw)
+        raise _Stop
+
+    kernel.pre_run_hooks.append(hook)
+    try:
+        kernel[(1,)](*args, **kwargs)
+    except _Stop:
+        pass
+    finally:
+        kernel.pre_run_hooks.remove(hook)
+    (run_kwargs,) = seen
+    added = set(run_kwargs) - set(kwargs)
+    assert added <= _KEYED_RUN_KNOBS, added
+    return run_kwargs
 
 
 def _triton_key(kernel, args, kwargs):
     """`JITFunction.run`'s cache key for a launch, from Triton's own binder."""
     backend = make_backend(driver.active.get_current_target())
     binder = create_function_from_signature(kernel.signature, kernel.params, backend)
-    kwargs = dict(kwargs)
-    kwargs["debug"] = kwargs.get("debug", kernel.debug) or knobs.runtime.debug
-    kwargs["instrumentation_mode"] = knobs.compilation.instrumentation_mode
-    if _FPSAN:
-        kwargs["fpsan_homomorphic_casts"] = knobs.compilation.fpsan_homomorphic_casts
-    _, specialization, options = binder(*args, **kwargs)
+    _, specialization, options = binder(*args, **_run_kwargs(kernel, args, kwargs))
     return compute_cache_key({}, specialization, options)
 
 
@@ -429,6 +454,51 @@ def test_a_heuristic_on_a_tensor_shape_is_keyed():
         torch.testing.assert_close(out[:64], x[:64] * 0.5 + y[:64], rtol=0, atol=0)
     blocks = sorted(entry.frozen["BLOCK"] for entry in wrapped._cache.values())
     assert blocks == [32, 128]
+
+
+@pytest.mark.parametrize("key_shapes", [True, False])
+def test_key_shapes_false_shares_an_entry_across_shapes(key_shapes):
+    """For a heuristic that reads no shape, as on the flash_kda kernels."""
+    tuned = triton.heuristics({"BLOCK": lambda args: 128})(_axpy_kernel)
+    wrapped = fast_launch.fast_launch(tuned, key_shapes=key_shapes)
+    grid = lambda meta: (triton.cdiv(meta["n"], meta["BLOCK"]),)
+    for numel in (200, 1024):
+        x, y, out = _axpy_inputs(numel)
+        with fast_launch.recording() as misses:
+            wrapped[grid](x, y, out, 64, 0.5)
+        assert bool(misses) == (key_shapes or numel == 200)
+        torch.testing.assert_close(out[:64], x[:64] * 0.5 + y[:64], rtol=0, atol=0)
+
+
+def test_an_int_out_of_range_fails_only_its_own_launch():
+    """Triton raises OverflowError for that launch; the cache stays on."""
+    wrapped = fast_launch.fast_launch(_axpy_kernel, by_specialization=True)
+    x, y, out = _axpy_inputs(256)
+    _axpy(wrapped, x, y, out)
+    with pytest.raises(OverflowError):
+        wrapped[(2,)](x, y, out, 2**64, 0.5, 128)
+    # The ordinary path records no miss either, so check the wrapper itself.
+    assert not wrapped._disabled
+    with fast_launch.recording() as misses:
+        got = _axpy(wrapped, x, y, out.clone())
+    assert misses == [], "a valid launch after the overflow has to hit"
+    torch.testing.assert_close(got, x * 0.5 + y, rtol=0, atol=0)
+
+
+def test_an_interpreted_kernel_takes_the_ordinary_path(monkeypatch):
+    """Under TRITON_INTERPRET=1, `triton.jit` returns an InterpretedFunction."""
+    monkeypatch.setenv("TRITON_INTERPRET", "1")
+    interpreted = triton.heuristics({"BLOCK": lambda args: 128})(
+        triton.jit(_axpy_kernel.fn)
+    )
+    monkeypatch.delenv("TRITON_INTERPRET")
+    wrapped = fast_launch.fast_launch(interpreted)
+    x, y, out = (t.cpu() for t in _axpy_inputs(256))
+    grid = lambda meta: (triton.cdiv(meta["n"], meta["BLOCK"]),)
+    with fast_launch.recording() as misses:
+        wrapped[grid](x, y, out, 256, 0.5)
+    assert misses == [] and not wrapped._cache
+    torch.testing.assert_close(out, x * 0.5 + y, rtol=0, atol=0)
 
 
 def test_cached_launch_replays_in_a_cuda_graph():
