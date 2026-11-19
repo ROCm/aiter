@@ -898,12 +898,29 @@ def test_padding_validates_before_materialization(
 
 @pytest.mark.parametrize(
     "api,cpu_argument",
-    [("conv3d_ncdhw", "weight"), ("conv3d_ndhwc", "bias"), ("conv3d_general", "bias")],
+    [
+        ("conv3d", "input"),
+        ("conv3d_ncdhw", "weight"),
+        ("conv3d_ndhwc", "bias"),
+        ("conv3d_1x1x1", "bias"),
+        ("conv3d_general", "bias"),
+        ("conv3d_ndhwc_3x3x3", "bias"),
+        ("conv3d_ncdhw_cblocked", "bias"),
+        ("conv3d_winograd_hw_f4x3", "bias"),
+        ("conv3d_winograd_hw_f4x3_cblocked", "bias"),
+    ],
 )
-def test_padding_rejects_device_mismatch(monkeypatch, api, cpu_argument):
-    source = torch.empty((1, 4, 3, 5, 7), device="cuda", dtype=torch.float16)
+def test_conv3d_rejects_invalid_devices_before_preparation(
+    monkeypatch, api, cpu_argument
+):
+    source = torch.empty(
+        (1, 4, 3, 5, 7),
+        device="cpu" if cpu_argument == "input" else "cuda",
+        dtype=torch.float16,
+    )
+    filter_size = 1 if api == "conv3d_1x1x1" else 3
     weight = torch.empty(
-        (4, 4, 1, 1, 1),
+        (4, 4, filter_size, filter_size, filter_size),
         device="cpu" if cpu_argument == "weight" else "cuda",
         dtype=torch.float16,
     )
@@ -911,17 +928,21 @@ def test_padding_rejects_device_mismatch(monkeypatch, api, cpu_argument):
         (4,), device="cpu" if cpu_argument == "bias" else "cuda", dtype=torch.float16
     )
 
-    def unexpected_pad(*args, **kwargs):
-        pytest.fail("device mismatches must be rejected before calling F.pad")
+    def unexpected_preparation(*args, **kwargs):
+        pytest.fail(
+            f"{api}: CPU {cpu_argument} must be rejected before padding or packing"
+        )
 
-    monkeypatch.setattr(F, "pad", unexpected_pad)
-    with pytest.raises(
-        ValueError,
-        match=(
-            "input, weight, and bias must be on the same device, "
-            f"got input={source.device}, weight={weight.device}, bias={bias.device}"
-        ),
-    ):
+    monkeypatch.setattr(conv3d_module, "_prepare_conv_padding", unexpected_preparation)
+    message = (
+        "conv3d input must be a CUDA/ROCm tensor"
+        if cpu_argument == "input"
+        else "conv3d input, weight, and bias must be on the same device"
+    )
+    message += (
+        f", got input={source.device}, weight={weight.device}, bias={bias.device}"
+    )
+    with pytest.raises(ValueError, match=message):
         getattr(conv3d_module, api)(
             source, weight, bias, padding=1, padding_mode="reflect"
         )
