@@ -53,10 +53,10 @@ Change these only by editing this section and adding a log line. Code, tests, an
 
 ### 0. Budget from the master's baseline
 
-- [ ] From the master's [Baseline](qsa-indexer-fused-select-plan.md#baseline), write the fp32 chunk count, score bytes, and `T_score` / `T_topk` / `T_expand` for `p8k`, `p32k`, `p128k`, and `p256k` into [Budget](#budget).
-- [ ] Compute the 16-bit rows-per-chunk and chunk count at the same `n_columns` the baseline used. Record both. Do not treat the doubled count as a measured win.
-- [ ] Name the gap this path can move: score-buffer traffic, and the extra passes over K that come from the chunk loop. Name the gap it cannot move by itself: a top-k that still reads every stored key, and expand.
-- [ ] Stop and record it in [Decision record](#decision-record) if the score-buffer share of the faster arm, at both `p128k` and `p256k`, is smaller than the miss this path would have to close. Otherwise Phase 1 starts.
+- [x] From the master's [Baseline](qsa-indexer-fused-select-plan.md#baseline), write the fp32 chunk count, score bytes, and `T_score` / `T_topk` / `T_expand` for `p8k`, `p32k`, `p128k`, and `p256k` into [Budget](#budget).
+- [x] Compute the 16-bit rows-per-chunk and chunk count at the same `n_columns` the baseline used. Record both. Do not treat the doubled count as a measured win.
+- [x] Name the gap this path can move: score-buffer traffic, and the extra passes over K that come from the chunk loop. Name the gap it cannot move by itself: a top-k that still reads every stored key, and expand.
+- [x] Stop and record it in [Decision record](#decision-record) if the score-buffer share of the faster arm, at both `p128k` and `p256k`, is smaller than the miss this path would have to close. Otherwise Phase 1 starts. Applied 2026-11-19: the stop does not fire. Phase 1 is next.
 
 ### 1. Key and boundary check
 
@@ -117,14 +117,20 @@ Change these only by editing this section and adding a log line. Code, tests, an
 
 ### Budget
 
-fp32 numbers are copied from the master's baseline when Phase 0 runs. The 16-bit chunk count is the formula in [Score buffer and chunks](#score-buffer-and-chunks), not a timed result.
+fp32 chunks, score bytes, and stage times are the aiter#5996 rows of the master's baseline (2026-11-12, bus 0000:f5:00.0). That is the path whose buffer this plan changes. The bench scores `COLUMNS` = 168 × 392 = 65856 on every case, and it counts chunks with `_score_workspace_rows(COLUMNS)`. That is 509 fp32 rows per chunk (`128 MiB / (65856 × 4)`). The same width at 2 bytes is 1019 rows per chunk (`128 MiB / (65856 × 2)`). Score bytes are `rows × 65856 × element_size`, which is the figure the baseline prints. The 16-bit chunk count and byte count are that formula, not a timed result.
 
-| Case | fp32 chunks | fp32 score bytes | `T_score` | `T_topk` | `T_expand` | 16-bit chunks | 16-bit score bytes |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| p8k | | | | | | | |
-| p32k | | | | | | | |
-| p128k | | | | | | | |
-| p256k | | | | | | | |
+| Case | Rows | fp32 chunks | fp32 score bytes | `T_score` | `T_topk` | `T_expand` | `T_step` | 16-bit chunks | 16-bit score bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| p8k | 8192 | 17 | 2058.0 MiB | 328.0 | 438.4 | 83.5 | 849.9 | 9 | 1029.0 MiB |
+| p32k | 16384 | 33 | 4116.0 MiB | 954.3 | 820.6 | 146.9 | 1921.8 | 17 | 2058.0 MiB |
+| p128k | 16384 | 33 | 4116.0 MiB | 2072.9 | 1600.1 | 124.3 | 3797.3 | 17 | 2058.0 MiB |
+| p256k | 16384 | 33 | 4116.0 MiB | 3905.9 | 1833.2 | 122.3 | 5861.4 | 17 | 2058.0 MiB |
+
+What this path can move. The stored buffer is half the bytes, 2058.0 MiB written instead of 4116.0 MiB on the 16384-row cases, and the top-k's read of that buffer halves with it. The chunk loop goes from 33 passes over K to 17 on those cases, and from 17 to 9 at `p8k`. Each pass re-reads the same compressed keys.
+
+What it cannot move by itself. Top-k still reads every stored key, and expand does not touch the score buffer (83.5 to 146.9 µs here). `T_score` is the whole score kernel, compute included, so halving the store does not halve `T_score`. The 16-bit chunk counts above are not a measured speedup.
+
+The faster arm at `p128k` and `p256k` is aiter#5996, both in this baseline (`T_step` 3797.3 and 5861.4) and in the master's probe-free gate (3623.9 and 5845.4). `T_score` is 0.546 and 0.666 of the baseline step. The miss against that arm is a strict improvement on today's indexer, and the score stage is larger than that miss. The Phase 0 stop does not fire. At `p8k` the faster arm is vllm#65188 at 207.3 µs, and the whole aiter score stage is 328.0 µs against a 642.6 µs gap, so the buffer inside that stage cannot be the whole of the 8K miss. That case is not the stop rule. The stop rule is `p128k` and `p256k`.
 
 ### Key check
 
@@ -169,15 +175,17 @@ No gate. Filled only if Phase 6 passes.
 
 ## Decision record
 
-Outcome:
+Phase 0, 2026-11-19: the stop does not fire. At `p128k` and `p256k` the faster arm is aiter#5996, and this path is a change to that arm, so the miss is a strict improvement on its step. The baseline score stage is 2072.9 µs of 3797.3 µs (0.546) and 3905.9 µs of 5861.4 µs (0.666). That share is larger than the miss. Phase 1 is next. The 16-bit counts, 1019 rows per chunk and 17 chunks on the 16384-row cases, are the workspace formula and are not a measured win.
 
-Gates met:
+Outcome: open. Option 1 stays a miss in the master. This fallback has not been built.
 
-Margins:
+Gates met: none. Gate 5 stays closed, as the master applied it.
 
-gfx942 enablement:
+Margins: not measured. The budget is the table under [Budget](#budget).
 
-Fallback key (the `_score_key16` map, or the replacement Phase 1 logged):
+gfx942 enablement: not measured.
+
+Fallback key (the `_score_key16` map, or the replacement Phase 1 logged): not chosen. Phase 1 checks `_score_key16`.
 
 ## Open questions
 
@@ -188,3 +196,4 @@ Fallback key (the `_score_key16` map, or the replacement Phase 1 logged):
 ## Log
 
 - 2026-11-19: Plan opened. The master is [qsa-indexer-fused-select-plan.md](qsa-indexer-fused-select-plan.md), and its fixed decisions carry over. Option 1 misses gate 1 on the probe-free interleaved run: `p128k` fused 3814.2 µs against aiter#5996 at 3623.9 µs, `p256k` 7934.8 µs against 5845.4 µs, and every other case misses, including `p8k` at 1.13× vllm#65188. Option 2 stays out, per the master. This document is the ticket's 16-bit score-buffer fallback. No kernel work has started. `_fused_select_wins` stays false.
+- 2026-11-19: Phase 0 budget, from the master's baseline. No GPU run. aiter#5996 scores 65856 columns, 509 fp32 rows per 128 MiB chunk: 17 chunks at `p8k` (8192 rows) and 33 at `p32k`, `p128k`, and `p256k` (16384 rows). Score bytes are 2058.0 MiB and 4116.0 MiB. The 2-byte formula gives 1019 rows per chunk, 9 chunks at `p8k` and 17 on the 16384-row cases, and half the bytes. Stage times are in [Budget](#budget). The faster arm at `p128k` and `p256k` is aiter#5996, and its score stage is 0.546 and 0.666 of `T_step`, larger than the strict improvement this path has to find. The stop does not fire. Phase 1 is next. At `p8k` the faster arm is vllm#65188 at 207.3 µs and the whole aiter score stage is 328.0 µs, so that miss is not a score-buffer miss. `_fused_select_wins` stays false.
