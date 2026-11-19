@@ -24,7 +24,9 @@ wave (lane offsets 32, 16, 8, 4, 2, 1), and the waves are added in order."""
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import PropagateNan as _PropagateNan
+from triton.language.extra.hip import libdevice
 
+from aiter.ops.triton._gluon_kernels.common.utils import mx_e8m0_scale
 from aiter.ops.triton._gluon_kernels.gfx950.comms.common import (
     _BFLY_ADD,
     _bf_hi,
@@ -48,7 +50,6 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 _NAN_ALL: gl.constexpr = gl.constexpr(_PropagateNan.ALL)
 _SITE_RS: gl.constexpr = gl.constexpr(1)
 _SITE_AG: gl.constexpr = gl.constexpr(2)
-_F32_TINY: gl.constexpr = gl.constexpr(1.1754943508222875e-38)
 
 
 _all_reduce_rmsnorm_mxfp8_repr = make_kernel_repr(
@@ -267,20 +268,18 @@ def _all_reduce_rmsnorm_mxfp8_kernel(
             am = gl.maximum(am, gl.abs(y[e]), propagate_nan=_NAN_ALL)
         am = gl.maximum(am, _quad_xor(am, 1), propagate_nan=_NAN_ALL)
         am = gl.maximum(am, _quad_xor(am, 2), propagate_nan=_NAN_ALL)
-        a = gl.maximum(am, _F32_TINY, propagate_nan=_NAN_ALL)
-        bits = gl.div_rn(a, gl.full(a.shape, 448.0, gl.float32, a.type.layout)).to(
-            gl.int32, bitcast=True
-        )
-        ex = (bits >> 23) & 0xFF
-        sb = ex + gl.where((bits & 0x7FFFFF) != 0, 1, 0)
-        sb = gl.where(ex == 0, 0, gl.minimum(gl.maximum(sb, 0), 254))
-        inv = ((254 - sb) << 23).to(gl.float32, bitcast=True)
-        c0 = _fp8_pack4(y[0] * inv, y[1] * inv, y[2] * inv, y[3] * inv)
-        c1 = _fp8_pack4(y[4] * inv, y[5] * inv, y[6] * inv, y[7] * inv)
+        sb = mx_e8m0_scale(am, 8)
+        # y / 2^(sb - 127) with ldexp: 2^-127 (sb 254) is not a normal fp32 value.
+        n = 127 - sb.to(gl.int32)
+        q = ()
+        for e in gl.static_range(8):
+            q = q + (libdevice.ldexp(y[e], n),)
+        c0 = _fp8_pack4(q[0], q[1], q[2], q[3])
+        c1 = _fp8_pack4(q[4], q[5], q[6], q[7])
         _st2(xq, xrow + 2 * vec, c0, c1, act & has_row, W)
         gl.store(
             xs + tn_c * (HIDDEN // 32) + vec // 4,
-            sb.to(gl.uint8),
+            sb,
             mask=act & has_row & (lane % 4 == 0),
         )
     for j in gl.static_range(V):

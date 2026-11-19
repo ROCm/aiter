@@ -29,7 +29,6 @@ SHAPES = [
     (2880, True, [7, 64, 130]),
     (4096, False, [2, 128]),
 ]
-F32_TINY = torch.finfo(torch.float32).tiny
 
 SKIP = arch_info.get_arch() != "gfx950"
 pytestmark = pytest.mark.skipif(SKIP, reason="needs gfx950")
@@ -68,15 +67,23 @@ def _reference(parts, residual, weight, eps, gemma):
     if gemma:
         w = w + 1.0
     y = ((s * rstd[:, None]) * w).to(torch.bfloat16).float()
-    groups = y.view(tokens, hidden // 32, 32)
-    amax = torch.clamp(groups.abs().amax(-1), min=F32_TINY)
-    bits = (amax / 448.0).view(torch.int32)
-    ex = (bits >> 23) & 0xFF
-    scale = torch.clamp(ex + ((bits & 0x7FFFFF) != 0).to(torch.int32), 0, 254)
-    scale = torch.where(ex == 0, 0, scale)
-    inv = ((254 - scale) << 23).view(torch.float32)
-    x_q = (groups * inv[..., None]).view(tokens, hidden).to(torch.float8_e4m3fn)
-    return x_q, scale.to(torch.uint8), res_out
+    x_q, scale = _mxfp8(y)
+    return x_q, scale, res_out
+
+
+def _mxfp8(y):
+    """MXFP8 of the fp32 y: e4m3 values and an E8M0 scale for each group of 32. The
+    group amax rounds to a power of 2 in fp32, up from 1.75 x 2^e (2^128 is inf). The
+    scale is this power / 2^8, clamped to 2^-127 .. 2^127."""
+    tokens, hidden = y.shape
+    groups = y.view(tokens, hidden // 32, 32).double()
+    amax = groups.abs().amax(-1)
+    mant, exp = torch.frexp(amax)  # amax = mant * 2^exp, 0.5 <= mant < 1
+    pow2 = torch.exp2((exp - 1 + (mant >= 0.875).to(torch.int32)).double())
+    pow2 = torch.where(amax > 0, pow2, 0.0).float().double()
+    k = (torch.log2(pow2) - 8).clamp(-127, 127)
+    x_q = (groups * torch.exp2(-k)[..., None]).float().view(tokens, hidden)
+    return x_q.to(torch.float8_e4m3fn), (k + 127).to(torch.uint8)
 
 
 def _bad(outs, refs):
@@ -194,6 +201,56 @@ def _check_sentinel(rank, device, tp, failures):
         comm.close()
 
 
+# Group amax values at the edges of the MXFP8 scale rule, and their scale bytes.
+EDGE_SCALES = [
+    (1.75 * 2.0**-119, 1),  # the smallest amax with a scale above 2^-127
+    (4e-36, 1),
+    (5.2e-36, 1),
+    (1.75 * 2.0**-118, 2),
+    (2.0**-100, 19),
+    (1.75 / 8, 117),
+    (1.7421875, 119),
+    (1.75, 120),
+    (28.0, 124),
+    (448.0, 128),
+    (2.0**100, 219),
+    (1.75 * 2.0**127, 254),  # amax rounds to 2^128 (inf) in fp32
+    (3.3e38, 254),
+]
+
+
+def _check_scales(rank, device, tp, failures):
+    """Groups of 32 with an amax from EDGE_SCALES. Rank 0 has rows of +-1, the other
+    ranks 0, and the residual is 0: then y = +-weight, and the weight sets the amax."""
+    hidden, tokens = 6144, 4
+    gen = torch.Generator(device=device).manual_seed(77)
+    signs = torch.randint(0, 2, (tokens, hidden), generator=gen, device=device)
+    ones = (2 * signs - 1).to(torch.bfloat16)
+    x = ones if rank == 0 else torch.zeros_like(ones)
+    residual = torch.zeros_like(ones)
+    u = 0.5 + 0.5 * torch.rand(
+        (hidden // 32, 32), generator=gen, dtype=torch.float32, device=device
+    )
+    g = torch.arange(hidden // 32, device=device)
+    u[g, g % 32] = 1.0  # one value of each group is the amax
+    amax = torch.tensor([a for a, _ in EDGE_SCALES], dtype=torch.float32, device=device)
+    weight = (amax[g % len(EDGE_SCALES)][:, None] * u).view(hidden).to(torch.bfloat16)
+    parts = [ones.cpu()] + [torch.zeros_like(ones.cpu())] * (tp.world_size - 1)
+    ref = _reference(parts, residual.cpu(), weight.cpu(), EPS, False)
+    want = torch.tensor([b for _, b in EDGE_SCALES], dtype=torch.uint8)
+    want = want[torch.arange(hidden // 32) % len(EDGE_SCALES)]
+    assert torch.equal(ref[1], want.expand(tokens, -1)), "EDGE_SCALES or _mxfp8"
+    comm = AllReduceRmsnormMxfp8(tp.cpu_group, tokens, hidden)
+    try:
+        torch.cuda.synchronize()
+        dist.barrier(group=tp.cpu_group)
+        out = fused_all_reduce_rmsnorm_mxfp8(x, residual, weight, EPS, comm)
+        if _bad(out, ref) or comm.error() != [0, 0, 0, 0]:
+            failures.append(f"rank {rank}: edge scales: {_bad(out, ref)} bytes differ")
+    finally:
+        comm.close()
+
+
 def _check_timeout(rank, device, tp, failures):
     """The last rank skips a launch. The other ranks must stop at the time limit and
     write the error record of each rank. After reset, a launch is correct again."""
@@ -230,6 +287,7 @@ def _worker(rank, world_size, init_method):
         for hidden, gemma, token_counts in SHAPES:
             _check_shape(rank, device, tp, hidden, gemma, token_counts, failures)
         _check_sentinel(rank, device, tp, failures)
+        _check_scales(rank, device, tp, failures)
         _check_timeout(rank, device, tp, failures)
         return failures
     finally:

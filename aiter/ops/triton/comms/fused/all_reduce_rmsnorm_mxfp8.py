@@ -171,9 +171,9 @@ def fused_all_reduce_rmsnorm_mxfp8(
     The all-reduce adds the ranks in rank order in fp32 and rounds once to bf16, as
     the AITER custom all-reduce does. Then, in fp32: s = h + residual, residual_out =
     bf16(s), y = bf16(s * rstd * w'), with w' = 1 + weight (gemma) or weight. Each
-    group of 32 values gets the E8M0 scale clamp(ceil(log2(amax / 448)) + 127, 0,
-    254), and y / 2^(scale - 127) is rounded to e4m3. rstd = 1 / sqrt(mean(s^2) +
-    eps): the sum of squares has a fixed order, see the kernel.
+    group of 32 values gets the E8M0 scale of ``mx_e8m0_scale(amax, 8)``, as the
+    other AITER MXFP8 ops, and y / 2^(scale - 127) is rounded to e4m3. rstd = 1 /
+    sqrt(mean(s^2) + eps): the sum of squares has a fixed order, see the kernel.
 
     All ranks must make the same calls in the same order. HIP graphs are supported.
 
