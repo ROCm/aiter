@@ -100,6 +100,16 @@ def get_x_vals():
         (256, 1024, 4096),
         (16384, 1024, 4096),
     ]
+    # MLA projections: q_nope x W_UK (N=512, K=128) and o x W_UV (N=128, K=512).
+    # On gfx1151, M=64 takes the unmasked store. M=1 and M=65 take the masked one.
+    x_vals += [
+        (1, 512, 128),
+        (64, 512, 128),
+        (65, 512, 128),
+        (1, 128, 512),
+        (64, 128, 512),
+        (65, 128, 512),
+    ]
     x_vals += [(1, 1, 1)]  # minimal case
     return x_vals
 
