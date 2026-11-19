@@ -52,6 +52,7 @@ from ..kernels_common import ceildiv
 from .transport import (
     BLOCK,
     I32_BYTES,
+    LAMPORT_SENTINEL,
     WAVE,
 )
 
@@ -646,6 +647,72 @@ def _codec_dequant(codec, words, scale, tid, acc=None):
         else:
             out.append(_i32(fx.fma(dq, scale, _f16x2(acc[i]))))
     return fx.Vector.from_elements(out, fx.Int32)
+
+
+def lamport_fix(codec, words, tid):
+    """*words* of one packet, with no dword equal to the Lamport sentinel.
+
+    A Lamport receiver (``handshake="lamport"``) takes a dword as landed once it
+    is not ``0xFFFFFFFF``, so the producer must never write that value. Per
+    plane:
+
+    * Scale: four signed E5M2 bytes of fp16 extrema, exponent field at most
+      28, so no byte is ``0xFF``. Never the sentinel.
+    * INT6 extra plane: the dword is one scale group (a lane pair). The group's
+      extremum maps to ``q <= 0``, code ``<= 32``, extra field ``<= 2``; all
+      sixteen fields 3 cannot happen.
+    * INT5 extra plane: the dword is two scale groups (a lane quartet), one bit
+      per value. All ones means both groups quantize to ``q = 0`` (every code
+      16), so the four threads' nibble words are 0. The quartet's leader moves
+      its value 0 from code 16 to 15 (``q = -1``): one step of a scale that is
+      0, or the INT5 floor ``2**-11`` when the extremum is below ``2**-16``.
+    * Nibble plane: all eight low nibbles 15 can happen, when this thread's
+      eight values all sit at ``q = +7`` against an extremum of the other sign
+      in its pair neighbour. Flip bit 0: one code step on value 0 of this
+      thread.
+    * FP16 passthrough: two NaN halves ``0xFFFF``; becomes ``0x7FFF`` NaN.
+
+    Every reader decodes the same fixed bytes, and a rank that decodes its own
+    packet must decode the fixed one too, so the ranks stay bit-identical.
+    """
+    sentinel = fx.Int32(LAMPORT_SENTINEL)
+    if not codec.has_scale:
+        return tuple((w == sentinel).select(fx.Int32(0x7FFF7FFF), w) for w in words)
+    nib = words[0]
+    rest = tuple(words[1:])
+    if codec.hi2_i32_off is not None and codec.hi_bits == 1:
+        hi = words[1]
+        hit = hi == sentinel
+        leader = (tid & fx.Int32(codec.hi_share - 1)) == fx.Int32(0)
+        nib = hit.select(leader.select(nib | fx.Int32(0xF), nib), nib)
+        rest = (hit.select(hi & fx.Int32(-2), hi),)
+    nib = (nib == sentinel).select(nib ^ fx.Int32(1), nib)
+    return (nib, *rest)
+
+
+def lamport_slots(codec, tid, scale_slot):
+    """``[(i32 offset within the rank-tile, re-arm predicate)]`` of every dword
+    this thread reads from one packet, in :func:`_codec_load` order.
+
+    The predicate picks the one thread that re-arms a dword that several
+    threads read: the extra-plane leader, and the scale group's leader.
+    """
+    slots = list(codec.plane_slots(tid))
+    if codec.has_scale:
+        slots.append(
+            (
+                fx.Int32(codec.scale_i32_off) + scale_slot,
+                (tid % fx.Int32(GROUP)) == fx.Int32(0),
+            )
+        )
+    return slots
+
+
+def split_lamport_packet(codec, got):
+    """``(words, scale_word)`` out of the dwords :func:`lamport_slots` lists,
+    in that order: what :func:`_codec_load` returns for the same packet."""
+    n = codec.n_words_per_thread
+    return tuple(got[:n]), (got[n] if codec.has_scale else None)
 
 
 def _codec_load(codec, get, tid, scale_slot):

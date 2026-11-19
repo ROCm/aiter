@@ -142,7 +142,19 @@ RING_SUPER_TILES = (1, 8, 16, 32)
 RS_CODECS = ("int4", "int6", "fp16")
 AG_CODECS = ("int4", "int6", "fp16")
 
-# Hierarchical algorithm.
+# Mesh and ring algorithms.
+#
+# How a receiver learns that a peer's packet has landed.
+#
+# "flag": the sender drains its payload stores, then writes a colour into a
+# 64 B handshake sector; the receiver spins on the flag.
+#
+# "lamport": no flag. An unwritten inbox dword holds a sentinel, the sender
+# keeps its packets off that value, and the receiver polls the packet words it
+# reads until none is the sentinel, then re-arms them.
+HANDSHAKES = ("flag", "lamport")
+
+# Hierarchical algorithm. It takes either of ``HANDSHAKES`` on all three laps.
 HIER_CODECS = ("int4", "int5", "int6", "fp16")
 HIER_SUPER_TILES = (1, 8, 16, 32)
 HIER_LOCAL_SCHEDULES = ("mesh", "ring")
