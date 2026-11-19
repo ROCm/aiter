@@ -2,7 +2,6 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # ruff: noqa: B008
 # The FlyDSL body uses a typed Stream default for its tracing semantics.
-# Ported from pyhip a3a94c5a34fc525c118649418b76221cd6d91579, fixed to raw DMA.
 """gfx950 FP8 GEMM: C = A @ B.T, FP32 accumulation and BF16/FP16 output.
 
 The blockscale contract is ScaleA[KB, M] and ScaleB[ceil(N/128), KB], KB=K/128.
@@ -27,6 +26,11 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Float8E4M3FN, Float32, T
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
+    TILE_K,
+    TILE_M,
+    TILE_N,
+)
 from aiter.ops.flydsl.kernels.kernels_common import ceildiv
 
 
@@ -45,16 +49,7 @@ def _lds_ptr(dtype, ptr, offset):
     return fx.add_offset(fx.recast_iter(dtype, ptr), fx.make_int_tuple(offset))
 
 
-def compile_gemm_fp8_8wave(
-    TILE_M,
-    TILE_N,
-    TILE_K,
-    N,
-    K,
-    pid_swizzle=True,
-    permlane_epilogue=True,
-    preshuffle_b=False,
-):
+def compile_gemm_fp8_8wave(N, K, preshuffle_b=False):
     """Compile the half-M single-FIFO blockscale kernel with raw A/B DMA.
 
     Scalar B scales, one-phase-ahead B_l reads, and four scalar FMAs per new
@@ -163,14 +158,9 @@ def compile_gemm_fp8_8wave(
     ):
         tid = fx.thread_idx.x
         wave_id = tid // 64
-        num_pid_n = ceildiv(N, TILE_N)
-        if const_expr(pid_swizzle):
-            # Match launch grid; the restricted target prevents OCKL inlining.
-            grid_mn = ceildiv(M, TILE_M) * num_pid_n
-            bid_x, bid_y = get_pids_950(fx.block_idx.x, M, grid_mn, 8, 4)
-        else:
-            bid_x = fx.block_idx.x // num_pid_n
-            bid_y = fx.block_idx.x % num_pid_n
+        # Match launch grid; the restricted target prevents OCKL inlining.
+        grid_mn = ceildiv(M, TILE_M) * ceildiv(N, TILE_N)
+        bid_x, bid_y = get_pids_950(fx.block_idx.x, M, grid_mn, 8, 4)
 
         # Rebase global pointers in i64 before building buffer descriptors.
         # All DMA/store offsets below are local to this WG; physical row
@@ -384,7 +374,12 @@ def compile_gemm_fp8_8wave(
                 fx.Int32(0),
             )
 
-        def load_scale_b_inline(ki):
+        # ScaleB uses inline s_buffer_load_dword: this LLVM's
+        # SITargetLowering::lowerSBuffer() drops the MachineMemOperand, so
+        # LLVM cannot tell which buffer the load reads and adds waitcnts that
+        # cost a lot of performance. Upstream llvm.amdgcn.ptr.s.buffer.load
+        # fixes this.
+        def load_scale_b(ki):
             addr = (bid_y * scaleB_elems + ki) * 4
             result_type = ir.Type.parse("!llvm.struct<(f32, f32)>")
             result = _llvm.inline_asm(
@@ -405,32 +400,6 @@ def compile_gemm_fp8_8wave(
                 ],
                 fx.Float32,
             )
-
-        from aiter.ops.flydsl.kernels import buffer_ops
-
-        def load_scale_b_buffer(ki):
-            offset = bid_y * scaleB_elems + ki
-            scale_l = buffer_ops.buffer_load(
-                scaleB_rsrc, offset, vec_width=1, is_scalar=True
-            )
-            scale_r = buffer_ops.buffer_load(
-                scaleB_rsrc, offset + scaleA_stride, vec_width=1, is_scalar=True
-            )
-            return Vec.from_elements(
-                [
-                    fx.Int32(scale_l).bitcast(fx.Float32),
-                    fx.Int32(scale_r).bitcast(fx.Float32),
-                ],
-                fx.Float32,
-            )
-
-        # Default use the s_buffer_load_dword inline version because of current LLVM version bug.
-        # scalar buffer lowering pass: SITargetLowering::lowerSBuffer()  can't accept MachineMemOperand argument
-        # LLVM can't know the buffer source location. So extra waitcnt would be added by LLVM later and perf drop greatly.
-        # LLVM upstreaming version llvm.amdgcn.ptr.s.buffer.load can handle this.
-        # WA: use the inline for now and avoid the performance drop caused by the current LLVM bug.
-
-        load_scale_b = load_scale_b_inline
 
         def lds_rd_scale_a(buf, bottom, m_slice=0):
             half_offset = bottom * BLOCK_M
@@ -567,7 +536,7 @@ def compile_gemm_fp8_8wave(
                 fx.make_int_tuple(byte_offset),
             )
 
-        # pyhip g2s TV layout: 512 threads = 64 rows x 8 K groups; 1x16 FP8 per thread.
+        # Global-to-LDS TV layout: 512 threads = 64 rows x 8 K groups; 1x16 FP8 per thread.
         _g2s_tile, _g2s_tv = fx.make_layout_tv(
             fx.make_layout((8 * 8, 8), (8, 1)),
             fx.make_layout((1, elements_per_128b), (1, 1)),
@@ -603,7 +572,7 @@ def compile_gemm_fp8_8wave(
             dma_dst_ptr(ldsB_r_wr[1], _b_wave_off_bytes),
         ]
 
-        # Per-thread (row, k) source mapping, matching pyhip a_lane_row = tid//8.
+        # Per-thread (row, k) source mapping: lane row tid // 8, K chunk tid % 8.
         a_lane_row = tid // 8
         a_lane_k = tid % 8 * elements_per_128b
         # Each group of 8 lanes copies one row per load (16 FP8 elements per lane).
@@ -896,15 +865,6 @@ def compile_gemm_fp8_8wave(
 
             # The last iteration's prefetch reads past K; nothing consumes it.
             pre_scale_a, pre_scale_b = prefetch_first_phase(kiter + 2)
-
-        bC_tr = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, 0, 1]
-        bC_bl = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, 1, 0]
-        bC_br = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, 1, 1]
-        transposed_c_layout = fx.make_ordered_layout((BLOCK_N, BLOCK_M), (1, 0))
-        bC_tr = fx.composition(bC_tr, transposed_c_layout)
-        bC_bl = fx.composition(bC_bl, transposed_c_layout)
-        bC_br = fx.composition(bC_br, transposed_c_layout)
-
         # Drain the final BR[s1] partial using the state retained by the loop.
         for m0 in range_constexpr(PHASE_M_REP):
             for n0 in range_constexpr(N_REP):
@@ -919,162 +879,142 @@ def compile_gemm_fp8_8wave(
         out_dtype = argC.dtype
         assert out_dtype in (fx.BFloat16, fx.Float16)
         N_tail = N % TILE_N != 0
-        if const_expr((permlane_epilogue or N_tail) and TILE_N % 256 == 0):
-            # In physical C, lane_id % 16 selects a row within the MFMA tile;
-            # lane_group selects four consecutive columns in that row.
-            pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
-            lane_id = tid % 64
-            wave_m = wave_id // 4
-            wave_n = wave_id % 4
-            lane_group = lane_id // 16
-            fragment_mode_0_repeat = TILE_N // 128
-            fragment_mode_1_repeat = TILE_M // 64
+        # In physical C, lane_id % 16 selects a row within the MFMA tile;
+        # lane_group selects four consecutive columns in that row.
+        pair_type = ir.Type.parse("!llvm.struct<(i32, i32)>")
+        lane_id = tid % 64
+        wave_m = wave_id // 4
+        wave_n = wave_id % 4
+        lane_group = lane_id // 16
+        fragment_mode_0_repeat = TILE_N // 128
+        fragment_mode_1_repeat = TILE_M // 64
 
-            c_stage_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), out_dtype)
-            c_store_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_dtype)
+        c_stage_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), out_dtype)
+        c_store_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_dtype)
 
-            def c_stage_view(c_tile, row_in_tile, col):
-                # C[row, col:col+8] staged in LDS; col is a multiple of 8.
-                offset = row_in_tile * (c_stage_pitch_bytes // 2) + col
-                return fx.make_view(
-                    _lds_ptr(out_dtype, c_rows_ptrs[c_tile], offset),
+        def c_stage_view(c_tile, row_in_tile, col):
+            # C[row, col:col+8] staged in LDS; col is a multiple of 8.
+            offset = row_in_tile * (c_stage_pitch_bytes // 2) + col
+            return fx.make_view(
+                _lds_ptr(out_dtype, c_rows_ptrs[c_tile], offset),
+                fx.make_layout(8, 1),
+            )
+
+        def store_c_quadrant(c_frag, quadrant_m, quadrant_n):
+            for row_repeat in range_constexpr(fragment_mode_1_repeat):
+                for col_repeat in range_constexpr(0, fragment_mode_0_repeat, 2):
+                    acc_a = Vec(c_frag[None, col_repeat, row_repeat].load())
+                    acc_b = Vec(c_frag[None, col_repeat + 1, row_repeat].load())
+                    # These 4-column slices share a row but are 64 columns apart.
+                    # Round to the output dtype, then pack low/high 16-bit pairs.
+                    if const_expr(out_dtype == fx.BFloat16):
+                        d0_a = rocdl.cvt_pk_bf16_f32(acc_a[0], acc_a[1])
+                        d1_a = rocdl.cvt_pk_bf16_f32(acc_a[2], acc_a[3])
+                        d0_b = rocdl.cvt_pk_bf16_f32(acc_b[0], acc_b[1])
+                        d1_b = rocdl.cvt_pk_bf16_f32(acc_b[2], acc_b[3])
+                    else:
+                        packed_a = acc_a.to(fx.Float16).bitcast(fx.Int32)
+                        packed_b = acc_b.to(fx.Float16).bitcast(fx.Int32)
+                        d0_a, d1_a = packed_a[0].ir_value(), packed_a[1].ir_value()
+                        d0_b, d1_b = packed_b[0].ir_value(), packed_b[1].ir_value()
+
+                    # | lane | d0_a      | d1_a      | d0_b      | d1_b      |
+                    # |------|-----------|-----------|-----------|-----------|
+                    # |    0 | [b0,b1]   | [b2,b3]   | [b64,b65] | [b66,b67] |
+                    # |   16 | [b4,b5]   | [b6,b7]   | [b68,b69] | [b70,b71] |
+                    # |   32 | [b8,b9]   | [b10,b11] | [b72,b73] | [b74,b75] |
+                    # |   48 | [b12,b13] | [b14,b15] | [b76,b77] | [b78,b79] |
+                    # Swap a's odd 16-lane groups with b's even groups
+                    # (partner lane = lane_id ^ 16); keep the other values.
+
+                    swap0 = rocdl.permlane16_swap(
+                        pair_type,
+                        d0_a,
+                        d0_b,
+                        False,
+                        False,
+                    )
+                    # | lane | swap0[0]  | d1_a      | swap0[1]  | d1_b      |
+                    # |------|-----------|-----------|-----------|-----------|
+                    # |    0 | [b0,b1]   | [b2,b3]   | [b4,b5]   | [b66,b67] |
+                    # |   16 | [b64,b65] | [b6,b7]   | [b68,b69] | [b70,b71] |
+                    # |   32 | [b8,b9]   | [b10,b11] | [b12,b13] | [b74,b75] |
+                    # |   48 | [b72,b73] | [b14,b15] | [b76,b77] | [b78,b79] |
+                    swap1 = rocdl.permlane16_swap(
+                        pair_type,
+                        d1_a,
+                        d1_b,
+                        False,
+                        False,
+                    )
+                    # | lane | swap0[0]  | swap1[0]  | swap0[1]  | swap1[1]  | columns |
+                    # |------|-----------|-----------|-----------|-----------|---------|
+                    # |    0 | [b0,b1]   | [b2,b3]   | [b4,b5]   | [b6,b7]   | N0-N7   |
+                    # |   16 | [b64,b65] | [b66,b67] | [b68,b69] | [b70,b71] | N64-N71 |
+                    # |   32 | [b8,b9]   | [b10,b11] | [b12,b13] | [b14,b15] | N8-N15  |
+                    # |   48 | [b72,b73] | [b74,b75] | [b76,b77] | [b78,b79] | N72-N79 |
+                    # repack swap0[0] , swap1[0] , swap0[1]  | swap1[1]
+                    packed = Vec.from_elements(
+                        [
+                            fx.Int32(_llvm.extractvalue(T.i32, swap0, [0])),
+                            fx.Int32(_llvm.extractvalue(T.i32, swap1, [0])),
+                            fx.Int32(_llvm.extractvalue(T.i32, swap0, [1])),
+                            fx.Int32(_llvm.extractvalue(T.i32, swap1, [1])),
+                        ],
+                        fx.Int32,
+                    )
+                    # C row quadrant_m * 128 + row_repeat * 32 + row_in_tile.
+                    c_tile = quadrant_m * (TILE_M // 2 // C_ROWS_PER_TILE) + row_repeat
+                    row_in_tile = wave_m * 16 + lane_id % 16
+                    # Groups 0/1/2/3 now start at columns 0/64/8/72,
+                    # relative to the quadrant/repeat/wave N base.
+                    col = (
+                        quadrant_n * (TILE_N // 2)
+                        + col_repeat * 64
+                        + lane_group % 2 * 64
+                        + wave_n * 16
+                        + lane_group // 2 * 8
+                    )
+                    # One 16-byte LDS store per lane: C[row, col:col+8].
+                    c_dst = c_stage_view(c_tile, row_in_tile, col)
+                    staged = fx.make_fragment_like(c_dst)
+                    staged.store(packed.bitcast(out_dtype))
+                    fx.copy(c_stage_copy_atom, staged, c_dst)
+
+        # Before C overwrites the A/B tiles, every wave must be done
+        # reading them, and the prefetch DMAs past K into them must land.
+        rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+        fx.barrier()
+        store_c_quadrant(frag_C_tl, 0, 0)
+        store_c_quadrant(frag_C_tr, 0, 1)
+        store_c_quadrant(frag_C_bl, 1, 0)
+        store_c_quadrant(frag_C_br, 1, 1)
+        fx.barrier()
+        # Each wave store instruction writes two whole 512-byte rows:
+        # lanes 0-31 one row, lanes 32-63 the next, each lane 8
+        # contiguous 16-bit values. Wave w stores rows 4w..4w+3 of every
+        # staged 32-row block.
+        row_of_pair = lane_id // 32
+        lane_col = lane_id % 32 * 8
+        rows_per_wave = C_ROWS_PER_TILE // 8
+        for c_tile in range_constexpr(TILE_M // C_ROWS_PER_TILE):
+            for pair in range_constexpr(rows_per_wave // 2):
+                row_in_tile = wave_id * rows_per_wave + pair * 2 + row_of_pair
+                c_row = c_tile * C_ROWS_PER_TILE + row_in_tile
+                c_src = c_stage_view(c_tile, row_in_tile, lane_col)
+                staged = fx.make_fragment_like(c_src)
+                fx.copy(c_stage_copy_atom, c_src, staged)
+                c_off = c_row * N + lane_col
+                if const_expr(N_tail):
+                    # N % 8 == 0, so each 8-column store is wholly in or
+                    # out. 2**30 elements is 2**31 bytes, past this WG's
+                    # C bound (asserted < 2**31), so the buffer drops it.
+                    c_off = (lane_col < b_rows_left).select(c_off, fx.Int32(2**30))
+                c_dst = fx.make_view(
+                    fx.add_offset(fx.get_iter(C), fx.make_int_tuple(c_off)),
                     fx.make_layout(8, 1),
                 )
-
-            def store_c_quadrant(c_frag, quadrant_m, quadrant_n):
-                for row_repeat in range_constexpr(fragment_mode_1_repeat):
-                    for col_repeat in range_constexpr(0, fragment_mode_0_repeat, 2):
-                        acc_a = Vec(c_frag[None, col_repeat, row_repeat].load())
-                        acc_b = Vec(c_frag[None, col_repeat + 1, row_repeat].load())
-                        # These 4-column slices share a row but are 64 columns apart.
-                        # Round to the output dtype, then pack low/high 16-bit pairs.
-                        if const_expr(out_dtype == fx.BFloat16):
-                            d0_a = rocdl.cvt_pk_bf16_f32(acc_a[0], acc_a[1])
-                            d1_a = rocdl.cvt_pk_bf16_f32(acc_a[2], acc_a[3])
-                            d0_b = rocdl.cvt_pk_bf16_f32(acc_b[0], acc_b[1])
-                            d1_b = rocdl.cvt_pk_bf16_f32(acc_b[2], acc_b[3])
-                        else:
-                            packed_a = acc_a.to(fx.Float16).bitcast(fx.Int32)
-                            packed_b = acc_b.to(fx.Float16).bitcast(fx.Int32)
-                            d0_a, d1_a = packed_a[0].ir_value(), packed_a[1].ir_value()
-                            d0_b, d1_b = packed_b[0].ir_value(), packed_b[1].ir_value()
-
-                        # | lane | d0_a      | d1_a      | d0_b      | d1_b      |
-                        # |------|-----------|-----------|-----------|-----------|
-                        # |    0 | [b0,b1]   | [b2,b3]   | [b64,b65] | [b66,b67] |
-                        # |   16 | [b4,b5]   | [b6,b7]   | [b68,b69] | [b70,b71] |
-                        # |   32 | [b8,b9]   | [b10,b11] | [b72,b73] | [b74,b75] |
-                        # |   48 | [b12,b13] | [b14,b15] | [b76,b77] | [b78,b79] |
-                        # Swap a's odd 16-lane groups with b's even groups
-                        # (partner lane = lane_id ^ 16); keep the other values.
-
-                        swap0 = rocdl.permlane16_swap(
-                            pair_type,
-                            d0_a,
-                            d0_b,
-                            False,
-                            False,
-                        )
-                        # | lane | swap0[0]  | d1_a      | swap0[1]  | d1_b      |
-                        # |------|-----------|-----------|-----------|-----------|
-                        # |    0 | [b0,b1]   | [b2,b3]   | [b4,b5]   | [b66,b67] |
-                        # |   16 | [b64,b65] | [b6,b7]   | [b68,b69] | [b70,b71] |
-                        # |   32 | [b8,b9]   | [b10,b11] | [b12,b13] | [b74,b75] |
-                        # |   48 | [b72,b73] | [b14,b15] | [b76,b77] | [b78,b79] |
-                        swap1 = rocdl.permlane16_swap(
-                            pair_type,
-                            d1_a,
-                            d1_b,
-                            False,
-                            False,
-                        )
-                        # | lane | swap0[0]  | swap1[0]  | swap0[1]  | swap1[1]  | columns |
-                        # |------|-----------|-----------|-----------|-----------|---------|
-                        # |    0 | [b0,b1]   | [b2,b3]   | [b4,b5]   | [b6,b7]   | N0-N7   |
-                        # |   16 | [b64,b65] | [b66,b67] | [b68,b69] | [b70,b71] | N64-N71 |
-                        # |   32 | [b8,b9]   | [b10,b11] | [b12,b13] | [b14,b15] | N8-N15  |
-                        # |   48 | [b72,b73] | [b74,b75] | [b76,b77] | [b78,b79] | N72-N79 |
-                        # repack swap0[0] , swap1[0] , swap0[1]  | swap1[1]
-                        packed = Vec.from_elements(
-                            [
-                                fx.Int32(_llvm.extractvalue(T.i32, swap0, [0])),
-                                fx.Int32(_llvm.extractvalue(T.i32, swap1, [0])),
-                                fx.Int32(_llvm.extractvalue(T.i32, swap0, [1])),
-                                fx.Int32(_llvm.extractvalue(T.i32, swap1, [1])),
-                            ],
-                            fx.Int32,
-                        )
-                        # C row quadrant_m * 128 + row_repeat * 32 + row_in_tile.
-                        c_tile = (
-                            quadrant_m * (TILE_M // 2 // C_ROWS_PER_TILE) + row_repeat
-                        )
-                        row_in_tile = wave_m * 16 + lane_id % 16
-                        # Groups 0/1/2/3 now start at columns 0/64/8/72,
-                        # relative to the quadrant/repeat/wave N base.
-                        col = (
-                            quadrant_n * (TILE_N // 2)
-                            + col_repeat * 64
-                            + lane_group % 2 * 64
-                            + wave_n * 16
-                            + lane_group // 2 * 8
-                        )
-                        # One 16-byte LDS store per lane: C[row, col:col+8].
-                        c_dst = c_stage_view(c_tile, row_in_tile, col)
-                        staged = fx.make_fragment_like(c_dst)
-                        staged.store(packed.bitcast(out_dtype))
-                        fx.copy(c_stage_copy_atom, staged, c_dst)
-
-            # Before C overwrites the A/B tiles, every wave must be done
-            # reading them, and the prefetch DMAs past K into them must land.
-            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
-            fx.barrier()
-            store_c_quadrant(frag_C_tl, 0, 0)
-            store_c_quadrant(frag_C_tr, 0, 1)
-            store_c_quadrant(frag_C_bl, 1, 0)
-            store_c_quadrant(frag_C_br, 1, 1)
-            fx.barrier()
-            # Each store writes two whole rows, 512 B each: lanes 0-31 one
-            # row, lanes 32-63 the next, 8 contiguous 16-bit values per lane.
-            # Wave w stores rows 4w..4w+3 of every staged 32-row block.
-            row_of_pair = lane_id // 32
-            lane_col = lane_id % 32 * 8
-            rows_per_wave = C_ROWS_PER_TILE // 8
-            for c_tile in range_constexpr(TILE_M // C_ROWS_PER_TILE):
-                for pair in range_constexpr(rows_per_wave // 2):
-                    row_in_tile = wave_id * rows_per_wave + pair * 2 + row_of_pair
-                    c_row = c_tile * C_ROWS_PER_TILE + row_in_tile
-                    c_src = c_stage_view(c_tile, row_in_tile, lane_col)
-                    staged = fx.make_fragment_like(c_src)
-                    fx.copy(c_stage_copy_atom, c_src, staged)
-                    c_off = c_row * N + lane_col
-                    if const_expr(N_tail):
-                        # N % 8 == 0, so each 8-column store is wholly in or
-                        # out. 2**30 elements is 2**31 bytes, past this WG's
-                        # C bound (asserted < 2**31), so the buffer drops it.
-                        c_off = (lane_col < b_rows_left).select(c_off, fx.Int32(2**30))
-                    c_dst = fx.make_view(
-                        fx.add_offset(fx.get_iter(C), fx.make_int_tuple(c_off)),
-                        fx.make_layout(8, 1),
-                    )
-                    fx.copy(c_store_copy_atom, staged, c_dst)
-        else:
-            assert (
-                N % TILE_N == 0
-            ), "N must be a multiple of TILE_N for permlane_epilogue=False, not supported for now"
-            c_frag_out = fx.make_fragment_like(frag_C_tl, dtype=out_dtype)
-            store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), out_dtype)
-            store_thr = fx.make_tiled_copy_C(store_atom, tiled_mma).get_slice(tid)
-
-            def store_c_quadrant(c_frag, bC):
-                c_frag_out.store(c_frag.load().to(out_dtype))
-                fx.copy(
-                    store_atom, store_thr.retile(c_frag_out), store_thr.partition_D(bC)
-                )
-
-            store_c_quadrant(frag_C_tl, bC_tl)
-            store_c_quadrant(frag_C_tr, bC_tr)
-            store_c_quadrant(frag_C_bl, bC_bl)
-            store_c_quadrant(frag_C_br, bC_br)
+                fx.copy(c_store_copy_atom, staged, c_dst)
 
     @flyc.jit
     def launch_gemm(

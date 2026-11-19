@@ -9,9 +9,6 @@ import torch
 from torch import Tensor
 
 from .gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
-    TILE_K,
-    TILE_M,
-    TILE_N,
     kernel_fits_shape,
     kernelInstance,
     kernels_by_name,
@@ -92,14 +89,7 @@ def _compile_gemm(
     # The output tensor specializes the epilogue. Keep separate launchers since
     # _run_compiled caches the first typed CompiledFunction on each launcher.
     ki = kernels_by_name[kernel_name]
-    launch = compile_gemm_fp8_8wave(
-        TILE_M,
-        TILE_N,
-        TILE_K,
-        N,
-        K,
-        preshuffle_b=ki.preshuffle_b,
-    )
+    launch = compile_gemm_fp8_8wave(N, K, preshuffle_b=ki.preshuffle_b)
     # Match the prototype's flyc.compile[{"opt_level": 2}] without a global knob.
     launch.compile_hints["opt_level"] = 2
     # LLVM's loop strength reduction slows this kernel's K loop by ~1% on MI355X.
