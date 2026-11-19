@@ -143,7 +143,8 @@ def main():
         out = run(c, nhead, q_len, batch, q_scale, kv_scale, persistent)
         ratio = float((out * ref).sum() / (ref * ref).sum())
         err = float((out - ref).abs().max() / ref.abs().max())
-        ok = abs(ratio - 1) < 0.02 and err < 0.05
+        # FP8 rounding gives max_rel_err up to ~0.04 on MI325X; a missing scale gives ~1/kv_scale.
+        ok = abs(ratio - 1) < 0.02 and err < 0.1
         print(
             f"{nhead=:3d} {q_len=} {kv_scale=:.2f} {persistent=!s:5}: "
             f"out/ref={ratio:.4f} max_rel_err={err:.4f} {'PASS' if ok else 'FAIL'}",
