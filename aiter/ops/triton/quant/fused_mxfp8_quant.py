@@ -193,7 +193,6 @@ def fused_dual_rmsnorm_mxfp8_quant(
 
         kernel = _fused_dual_rmsnorm_mxfp8_quant_ps_kernel
         launch_options["ROWS_PER_ITER"] = batch
-        launch_options["llvm_fn_attrs"] = "amdgpu-num-sgpr=104"
         launch_options["USE_BUFFER"] = all(
             (x.shape[-1] - 1) * x.stride(-1) * x.element_size() < 2**32 - 16
             for x in (q, k, yq, sq, yk)

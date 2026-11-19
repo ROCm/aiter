@@ -54,11 +54,6 @@ def compile_one(fn, name, constants, signatures, output):
     source_type = GluonASTSource if fn.is_gluon() else ASTSource
     source = source_type(fn, signature=signatures, constexprs=constants)
     options = {"num_warps": 4}
-    if (
-        constants.get("PERSISTENT", False)
-        or fn is _fused_dual_rmsnorm_mxfp8_quant_ps_kernel
-    ):
-        options["llvm_fn_attrs"] = "amdgpu-num-sgpr=104"
     kernel = triton.compile(
         source, target=GPUTarget("hip", "gfx1250", 32), options=options
     )

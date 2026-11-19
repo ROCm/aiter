@@ -1,6 +1,14 @@
 # A03/A09 mono review and acceptance
 
-## Current grid correction: 2026-11-19
+## Current SGPR rule: 2026-11-19
+
+Only ASM kernels must avoid s104/s105. HIP, FlyDSL and Triton kernels have
+no such requirement. A03/A09 use Triton/Gluon; remove the 104-register cap
+from their wrappers and offline compiler. Record register resources without
+failing these kernels for an s104/s105 operand. Keep DEV/HT, `(1,256)`,
+128 threads/TG and the existing task batches. GPU validation is pending.
+
+## Previous grid-only candidate: 2026-11-19
 
 The requirement is fixed 256 TGs. The selected A03/A09 PS grid is now
 `(1,256)`, with the TG id from `program_id(1)`. Each TG has 128 threads.

@@ -15,7 +15,7 @@ not been connected to these standalone wrappers.
 | Scheduling | Exactly 256 TGs. The selected grid is `(1,256)`, with `tg = program_id(1)`. Each op processes `task = tg + j*256`. A TG without work returns from the op and still reaches the next join. | Actual main-kernel launch, task coverage, and a join test with idle TGs. For this wrapper, check a `(1,256,1)` TG grid and `(128,1,1)` workgroup. |
 | Residency | All 256 TGs must be able to reside together for the join. The flag array has 256 four-byte entries, or 1 KB. | Resource and residency checks for the final fused launch, plus a join progress test. TG count alone is not residency evidence. |
 | TG shape | Four wave32 waves, or 128 threads, for every op in the launch. | Real dispatch metadata. The join assigns 64 flags to each wave. |
-| SGPRs | The op must neither read nor write `s104` or `s105`. These are ordinary hardware SGPRs reserved by the mono ABI for the main kernel. | Check all actual op instruction operands, including register ranges and helper code. Verify preservation through the main-kernel call path. SH L2148 and L2419 are the supplied references. |
+| SGPRs | Only ASM kernels must avoid reading or writing `s104` or `s105`. HIP, FlyDSL and Triton kernels have no such requirement. A03/A09 use Triton/Gluon and do not impose this register restriction. | Apply reserved-register operand and preservation checks to ASM kernels only. Record compiler resource usage for A03/A09 without an s104/s105 acceptance gate. |
 | Cluster | Every op uses the same physical cluster geometry, currently 1 x 1. | The final launch descriptor and code-object metadata; mono section 4.6.4. |
 | Output stores | DEV scope and HT for every payload, scale and metadata store handed to the next op. This includes ordinary and TDM stores. | Actual loaded ISA and producer/consumer tests; SH section 4.2.1 and Table 78. HT is a retention hint, not a cache-hit or speed guarantee. |
 | Activation loads | DEV scope. TH may be omitted, with default RT. Loads and prefetches start only after the required join. | Actual loaded ISA and ordering in the main-kernel path. Load TH need not match store TH. |
@@ -73,7 +73,17 @@ non-regression or invent an allowed slowdown. Repeat unresolved c16 evidence
 as needed. Model-level non-regression requires the model path to be exercised;
 an isolated op benchmark must be labeled as such.
 
-### Grid correction: 2026-11-19
+### SGPR rule correction: 2026-11-19
+
+The user limited the s104/s105 rule to ASM kernels. A03/A09 are compiled
+Triton/Gluon kernels, so their wrappers and offline compiler no longer set
+`amdgpu-num-sgpr=104`. Their ISA may use these registers. Such use is not
+an acceptance failure. DEV activation loads and DEV + HT output stores
+remain required. The `(1,256)` grid and task batching are unchanged.
+The earlier cap and operand checks below describe historical candidates.
+The current candidate still needs GPU correctness and performance validation.
+
+### Previous grid-only candidate: 2026-11-19
 
 The user clarified that the invariant is 256 TGs, not a 16 x 16 geometry.
 The A03 and A09 PS wrappers now use `(1,256)`. The kernel takes the TG id
