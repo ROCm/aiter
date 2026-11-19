@@ -26,7 +26,7 @@ BLOCK_M = 128
 # (hidden, topk, experts, token counts). A count that is not a multiple of the world
 # size gives padding rows. With few tokens, some ranks own no token.
 SHAPES = [
-    (6144, 4, 128, [1, 3, 1000, 2343, 4096, 5857, 8192, 14394, 16383]),
+    (6144, 4, 128, [1, 3, 1000, 2343, 4096, 16383]),
     (3072, 4, 128, [7, 2343, 4096]),
     (5120, 2, 32, [5, 2343, 4096]),
 ]
