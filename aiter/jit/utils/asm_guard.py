@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import logging
+import os
 
 from .chip_info import get_asic_revision, get_gfx_runtime
 
@@ -43,7 +44,11 @@ def _probe_stepping_ok() -> bool:
 # Probed once at import, not per call: the gate sits at the top of hot ops, and
 # a module-level constant keeps it free under torch.compile (a custom op here
 # costs ~2.4us/call and turns the answer into an opaque graph node).
-_ASM_SUPPORTED = _probe_stepping_ok()
+# AITER_GFX1250_A0_ALLOW_ASM=1 lets the shipped gfx1250 asm load on A0 anyway;
+# only the kernels a deployment has validated on A0 should run this way.
+_ASM_SUPPORTED = (
+    os.environ.get("AITER_GFX1250_A0_ALLOW_ASM") == "1" or _probe_stepping_ok()
+)
 
 
 def is_gfx1250_asm_supported() -> bool:
