@@ -11,7 +11,7 @@
         "NUM_BUFFERS": 2,
         "num_warps": 4
     },
-    "mla_varlen": {
+    "varlen": {
         "causal": {
             "BLOCK_M": 128,
             "BLOCK_N": 128,

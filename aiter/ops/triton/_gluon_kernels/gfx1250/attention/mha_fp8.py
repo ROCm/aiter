@@ -203,7 +203,7 @@ def apply_mask(
 
 
 @gluon.jit
-def apply_mask_varlen_mla(
+def apply_mask_varlen(
     qk,
     subtile: gl.constexpr,
     tile_m,
@@ -767,8 +767,8 @@ def _mha_fwd_subtiled(
     gl.amd.gfx1250.tdm.async_wait(0)
 
 
-_mha_fwd_mla_varlen_repr = make_kernel_repr(
-    "_mha_fwd_mla_varlen",
+_mha_varlen_fwd_kernel_repr = make_kernel_repr(
+    "_mha_varlen_fwd_kernel",
     [
         "BLOCK_M",
         "BLOCK_N",
@@ -781,8 +781,8 @@ _mha_fwd_mla_varlen_repr = make_kernel_repr(
 )
 
 
-@gluon.jit(repr=_mha_fwd_mla_varlen_repr)
-def _mha_fwd_mla_varlen(
+@gluon.jit(repr=_mha_varlen_fwd_kernel_repr)
+def _mha_varlen_fwd_kernel(
     q_ptr,
     k_ptr,
     k_pe_ptr,
@@ -1013,7 +1013,7 @@ def _mha_fwd_mla_varlen(
         qk1 = gl.convert_layout(gl.amd.gfx1250.wmma(q, k1, qk_zeros), LPE)
         qk1 = gl.convert_layout(gl.amd.gfx1250.wmma(q_pe, kp1, qk1), L)
         if tb >= b:
-            qk0 = apply_mask_varlen_mla(
+            qk0 = apply_mask_varlen(
                 qk0,
                 0,
                 tile_m,
@@ -1027,7 +1027,7 @@ def _mha_fwd_mla_varlen(
                 CAUSAL,
                 False,
             )
-            qk1 = apply_mask_varlen_mla(
+            qk1 = apply_mask_varlen(
                 qk1,
                 1,
                 tile_m,
@@ -1148,7 +1148,7 @@ def _mha_fwd_mla_varlen(
                     k_pe_desc, k_pe_smem, c + 3, BLOCK_N, PE_DIM, 1, kc3, c + 3 < te
                 )
                 if c + 1 >= b:
-                    qk0 = apply_mask_varlen_mla(
+                    qk0 = apply_mask_varlen(
                         qk0,
                         0,
                         tile_m,
@@ -1162,7 +1162,7 @@ def _mha_fwd_mla_varlen(
                         CAUSAL,
                         False,
                     )
-                    qk1 = apply_mask_varlen_mla(
+                    qk1 = apply_mask_varlen(
                         qk1,
                         1,
                         tile_m,

@@ -11,7 +11,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.attention.mha_fp8 import (
     _mha_varlen_fwd_fp8,
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.mha_fp8 import (
-    _mha_fwd_mla_varlen,
+    _mha_varlen_fwd_kernel,
     _mha_fwd_subtiled,
 )
 from aiter.ops.triton.attention.utils import lse_merge
@@ -64,9 +64,9 @@ def get_wmma_layouts(BLOCK_M, head_dim_pow2, num_warps):
     return WMMA_LAYOUT_QK, WMMA_LAYOUT_O
 
 
-def get_mla_varlen_config(causal, seqlen_k, total_q, num_heads) -> dict:
+def get_mha_varlen_config(causal, seqlen_k, total_q, num_heads) -> dict:
     cfg_dir = resolve_config_dir("attention", "MHA", backend="gluon")
-    configs = load_config_json(f"{cfg_dir}/DEFAULT.json")["mla_varlen"]
+    configs = load_config_json(f"{cfg_dir}/DEFAULT.json")["varlen"]
     if causal:
         cfg = configs["causal"]
         programs = -(-total_q // cfg["BLOCK_M"]) * num_heads
@@ -93,7 +93,7 @@ def get_mla_varlen_config(causal, seqlen_k, total_q, num_heads) -> dict:
 
 
 @functools.cache
-def _mla_varlen_layouts(block_m, num_warps):
+def _mha_varlen_layouts(block_m, num_warps):
     """WMMA layouts of the 128-dim QK and PV products and of the 64 PE dims."""
     layout = get_wmma_layouts(block_m, 128, num_warps)[0]
     layout_pe = gl.amd.AMDWMMALayout(
@@ -359,7 +359,7 @@ def _mha_varlen_fwd_gfx1250(
     if total_q == 0 or num_seqs == 0:
         return (out, lse) if return_lse else out
 
-    cfg = get_mla_varlen_config(causal, max_seqlen_k, total_q, num_heads)
+    cfg = get_mha_varlen_config(causal, max_seqlen_k, total_q, num_heads)
     cfg.update(config or {})
     BLOCK_M, num_splits = cfg["BLOCK_M"], cfg["NUM_SPLITS"]
     qblk_per_seq = -(-max_seqlen_q // BLOCK_M)
@@ -385,9 +385,9 @@ def _mha_varlen_fwd_gfx1250(
     else:
         o_k = out.unsqueeze(0)
         lse_k = (out if lse is None else lse).unsqueeze(0)
-    wmma_layout, wmma_layout_pe = _mla_varlen_layouts(BLOCK_M, cfg["num_warps"])
+    wmma_layout, wmma_layout_pe = _mha_varlen_layouts(BLOCK_M, cfg["num_warps"])
     fast_rowsum = bool(cfg.get("ROWSUM_MMA", lse is None and o_init is None))
-    _mha_fwd_mla_varlen[(num_qblk * num_heads, num_splits)](
+    _mha_varlen_fwd_kernel[(num_qblk * num_heads, num_splits)](
         q,
         k,
         k_pe,

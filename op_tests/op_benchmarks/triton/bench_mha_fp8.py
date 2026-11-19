@@ -35,7 +35,7 @@ from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
 from op_tests.triton_tests.attention.test_mha_fp8_e2e import (
     _cu,
     generate_mha_varlen_fp8_inputs,
-    generate_mla_varlen_fp8_inputs,
+    generate_varlen_pe_fp8_inputs,
     init_qkv,
 )
 
@@ -44,7 +44,7 @@ MHA_VARLEN_KEYS = [
     "q", "k", "v", "cu_seqlens_q", "cu_seqlens_k",
     "q_descale", "k_descale", "v_descale", "out", "lse",
 ]  # fmt: skip
-MLA_SHARED_PE_KEYS = [
+SHARED_PE_KEYS = [
     "q",
     "k",
     "v",
@@ -62,8 +62,8 @@ def generate_mha_fwd_inputs(b, hq, hk, sq, sk, d, device):
     return q, k, v, q_scale, k_scale, v_scale, o
 
 
-def generate_mla_shared_pe_inputs(b, hq, hk, sq, sk, device):
-    q, k, v, k_pe = generate_mla_varlen_fp8_inputs(
+def generate_shared_pe_inputs(b, hq, hk, sq, sk, device):
+    q, k, v, k_pe = generate_varlen_pe_fp8_inputs(
         [sq] * b, [sk] * b, hq, hk, device=device
     )
     out = torch.empty((b * sq, hq, v.shape[-1]), dtype=torch.bfloat16, device=device)
@@ -76,10 +76,8 @@ def bench_case(
     bencher, b, hq, hk, sq, sk, d, d_pe, causal, varlen, device, shared_pe=False
 ):
     if shared_pe:
-        gen = functools.partial(
-            generate_mla_shared_pe_inputs, b, hq, hk, sq, sk, device
-        )
-        keys = MLA_SHARED_PE_KEYS
+        gen = functools.partial(generate_shared_pe_inputs, b, hq, hk, sq, sk, device)
+        keys = SHARED_PE_KEYS
         kernel_fn = functools.partial(
             mha_varlen_fwd,
             max_seqlen_q=sq,
@@ -152,7 +150,7 @@ def parse_args():
         "--varlen",
         action="store_true",
         default=False,
-        help="benchmark mha_varlen_fwd (MLA prefill layout, gfx950 and gfx1250)",
+        help="benchmark mha_varlen_fwd (packed varlen, shared rope K; gfx950 and gfx1250)",
     )
     parser.add_argument(
         "--shared_pe",
