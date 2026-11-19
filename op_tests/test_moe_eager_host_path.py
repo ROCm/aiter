@@ -9,8 +9,8 @@ each case both ways, "eager" and "op" (all three off: _plain_eager false, as
 under a tracer), checks them bit for bit against each other and against the
 torch reference, and times them. The checks before it cover the plan
 bookkeeping and the cases that keep the original behavior: torch.compile,
-dispatch modes, CUDA graph capture, a wrapped get_2stage_cfgs, two streams and
-the kernel bench hook.
+dispatch modes, CUDA graph capture, a wrapped or raising get_2stage_cfgs, NVFP4
+calls, two streams and the kernel bench hook.
 
 The MoE kernels add the top-k contributions with atomics, so two calls are not
 bitwise equal in general. With one nonzero top-k weight per token (the others
@@ -306,6 +306,119 @@ def test_get_2stage_cfgs_cache_clear_is_honored():
     assert replanned.metadata is not plan.metadata
 
 
+def test_swiglu_limit_calls_resolve_every_time():
+    """get_2stage_cfgs decides whether and where a swiglu_limit is applied (on
+    gfx942 the FlyDSL backend for per-token FP8, otherwise the CK limits). The
+    limit is in the plan key, a backend that takes the call (a full_impl) stores
+    no plan, and a call that takes a plan still runs the lookup, so an error it
+    raises reaches the caller."""
+    _fresh()
+    qt = QuantType.per_Token
+    x, w, ids, mask = _routes(300, False, seed=41)
+    with _original_path():
+        ref = _call(qt, x, w, ids, mask, swiglu_limit=7.0).clone()
+    with _resolutions() as resolved:
+        outs = [_call(qt, x, w, ids, mask, swiglu_limit=7.0) for _ in range(2)]
+    if fm._MOE_PLANS:  # a 2-stage row took the clamp: the second call hit
+        assert len(resolved) == 1
+    else:
+        assert len(resolved) == 2
+    torch.cuda.synchronize()
+    assert all(torch.equal(out, ref) for out in outs)
+
+    _fresh()
+    _call(qt, x, w, ids, mask)
+    assert len(fm._MOE_PLANS) == 1
+
+    def ck_limits(*args, **kwargs):
+        raise NotImplementedError("fused_moe cannot apply swiglu_limit")
+
+    with mock.patch.object(fm, "get_2stage_cfgs", ck_limits):
+        try:
+            _call(qt, x, w, ids, mask)
+        except NotImplementedError:
+            pass
+        else:
+            raise AssertionError("a plan hit skipped the get_2stage_cfgs checks")
+
+
+def _nvfp4_args(E_, H, I, M, seed):
+    """fused_moe arguments with fp4x2 weights and global scales (NVFP4), as
+    op_tests/test_moe_nvfp4.py builds them; only their routing is checked here."""
+    from aiter.ops.shuffle import shuffle_scale_nvfp4_moe
+
+    g = torch.Generator(device=DEV).manual_seed(seed)
+
+    def u8(lo, hi, *s):
+        return torch.randint(lo, hi, s, generator=g, device=DEV).to(torch.uint8)
+
+    f8 = torch.float8_e4m3fn
+    x = torch.randn(M, H, device=DEV, generator=g).to(dtypes.bf16)
+    weights, ids = torch.topk(torch.randn(M, E_, device=DEV, generator=g), 2, dim=-1)
+    w1 = u8(0, 256, E_, 2 * I, H // 2).view(dtypes.fp4x2)
+    w2 = u8(0, 256, E_, H, I // 2).view(dtypes.fp4x2)
+    return {
+        "hidden_states": x,
+        "w1": shuffle_weight(w1, (16, 32)),
+        "w2": shuffle_weight(w2, (16, 32)),
+        "topk_weight": weights.softmax(-1),
+        "topk_ids": ids.to(dtypes.i32),
+        "activation": ActivationType.Swiglu,
+        "w1_scale": shuffle_scale_nvfp4_moe(
+            u8(0x3F, 0x7F, E_, 2 * I, H // 16).view(f8)
+        ),
+        "w2_scale": shuffle_scale_nvfp4_moe(u8(0x3F, 0x7F, E_, H, I // 16).view(f8)),
+        "w1_global_scale": torch.full((E_, 2), 2e-4, device=DEV),
+        "w2_global_scale": torch.full((E_,), 2e-4, device=DEV),
+    }
+
+
+def test_nvfp4_calls_take_no_plan():
+    """Global scales select the NVFP4 full_impl (gfx950 kernels, stubbed here so
+    the routing runs on any arch) on every eager call; they are not in the plan
+    key, so such calls neither store nor take a plan. That includes the check
+    that global scales need fp4x2 weights, which a cached fp8 plan would skip."""
+    import aiter.ops.moe_nvfp4 as nvfp4
+
+    _fresh()
+    qt = QuantType.per_Token
+    x, w, ids, mask = _routes(300, False, seed=43)
+    _call(qt, x, w, ids, mask)
+    plans = dict(fm._MOE_PLANS)
+    scales = {
+        "w1_global_scale": torch.ones(E, 2, device=DEV),
+        "w2_global_scale": torch.ones(E, device=DEV),
+    }
+    try:
+        _call(qt, x, w, ids, mask, **scales)
+    except ValueError as e:
+        assert "need fp4x2 weights" in str(e), e
+    else:
+        raise AssertionError("an fp8 plan served a call with global scales")
+
+    served = []
+
+    def stub(req):
+        served.append((req.w1_global_scale, req.w2_global_scale))
+        return torch.zeros_like(req.hidden_states)
+
+    args = _nvfp4_args(8, 256, 128, 16, seed=44)
+    fm.get_2stage_cfgs.cache_clear()
+    try:
+        with mock.patch.object(nvfp4, "_fused_moe_nvfp4", stub):
+            assert fm._plain_eager(args["hidden_states"])
+            for _ in range(3):
+                fm.fused_moe(**args)
+    finally:
+        fm.get_2stage_cfgs.cache_clear()
+    assert len(served) == 3
+    assert all(
+        g1 is args["w1_global_scale"] and g2 is args["w2_global_scale"]
+        for g1, g2 in served
+    )
+    assert fm._MOE_PLANS == plans
+
+
 def test_plain_eager_only_for_real_eager_tensors():
     from torch._subclasses.fake_tensor import FakeTensorMode
     from torch.utils._python_dispatch import TorchDispatchMode
@@ -509,6 +622,8 @@ def main():
         test_plan_cache_is_bounded,
         test_wrapped_get_2stage_cfgs_is_asked_every_call,
         test_get_2stage_cfgs_cache_clear_is_honored,
+        test_swiglu_limit_calls_resolve_every_time,
+        test_nvfp4_calls_take_no_plan,
         test_plain_eager_only_for_real_eager_tensors,
         test_torch_compile_keeps_the_custom_op,
         test_cuda_graph_capture_and_replay,
