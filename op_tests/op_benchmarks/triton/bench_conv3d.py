@@ -364,9 +364,8 @@ def _is_better(metric: str, triton_value: float, torch_value: float) -> bool:
 
 def _print_layer_table(layers, has_any_repack, metric):
     short_unit, _ = _metric_labels(metric)
-    primary_scope = (
-        "End-to-End" if layers[0]["timing_scope"] == "end_to_end" else "Kernel"
-    )
+    end_to_end = layers[0]["timing_scope"] == "end_to_end"
+    primary_scope = "End-to-End" if end_to_end else "Kernel"
     print("\n" + "=" * 80)
     print("LAYER-BY-LAYER BENCHMARK")
     print("=" * 80)
@@ -383,7 +382,10 @@ def _print_layer_table(layers, has_any_repack, metric):
     headers.append(f"Tri {primary_scope} {short_unit}")
     if has_any_repack:
         headers.append(f"Tri Kernel+Repack {short_unit}")
-    headers.extend([f"Torch {short_unit}", "Winner"])
+    headers.append(
+        f"Torch End-to-End {short_unit}" if end_to_end else f"Torch {short_unit}"
+    )
+    headers.append("Winner")
 
     rows = []
     for index, layer in enumerate(layers):
