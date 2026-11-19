@@ -306,21 +306,19 @@ def _fwd_kernel_stage2_dchunk(
     stride_oh: tl.int64,
     Lv: tl.constexpr,
     mgc: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
     D_CHUNK: tl.constexpr,
     MAX_SPLITS: tl.constexpr,
+    SHORT_BLOCK: tl.constexpr,
 ):
-    """Cross-split merge for v4 nm decode (page_size=1, num_kv_splits > 1).
-
-    Same math as _fwd_kernel_stage2_asm, but Lv is split across grid axis 2 and
-    the splits are reduced as one [MAX_SPLITS, D_CHUNK] tile instead of a serial
-    online-softmax loop: more CTAs, no loop-carried dependency, and a tile small
-    enough to stay out of register pressure at large split counts.
+    """_fwd_kernel_stage2_asm for v4 nm decode, with Lv split across grid axis
+    2 and the splits reduced as one [MAX_SPLITS, D_CHUNK] tile. With at most
+    half of them valid (short KV) the extra CTAs cost more than a serial merge:
+    chunk 0 merges the row SHORT_BLOCK splits at a time, the rest exit.
     """
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
-    offs_d = tl.program_id(2) * D_CHUNK + tl.arange(0, D_CHUNK)
-    mask_d = offs_d < Lv
-    splits = tl.arange(0, MAX_SPLITS)
+    chunk = tl.program_id(2)
 
     kv_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(kv_indptr + cur_batch)
     num_valid = tl.minimum(
@@ -329,27 +327,70 @@ def _fwd_kernel_stage2_dchunk(
         tl.cdiv(kv_len, mgc),
     )
     num_valid = tl.minimum(num_valid, tl.load(valid_split_count + cur_batch))
-    valid = splits < num_valid
+    qo_start = tl.load(qo_indptr + cur_batch)
+    qo_end = tl.load(qo_indptr + cur_batch + 1)
 
-    for cur_qo in range(
-        tl.load(qo_indptr + cur_batch), tl.load(qo_indptr + cur_batch + 1)
-    ):
-        base = cur_qo * stride_mid_ob + cur_head * stride_mid_oh
-        lse = tl.load(
-            Mid_lse + base + splits * stride_mid_os, mask=valid, other=-float("inf")
-        )
-        w = tl.where(valid, tl.exp(lse - tl.max(lse, axis=0)), 0.0)
-        v = tl.load(
-            Mid_O + (base + splits[:, None] * stride_mid_os) * Lv + offs_d[None, :],
-            mask=valid[:, None] & mask_d[None, :],
-            other=0.0,
-        )
-        e_sum = tl.sum(w, axis=0)
-        # No valid split (empty sequence): e_sum == 0, define O = 0.
-        acc = tl.where(e_sum > 0, tl.sum(w[:, None] * v, axis=0) / e_sum, 0.0)
-        tl.store(
-            O + cur_qo * stride_obs + cur_head * stride_oh + offs_d, acc, mask=mask_d
-        )
+    if num_valid > MAX_SPLITS // 2:
+        offs_d = chunk * D_CHUNK + tl.arange(0, D_CHUNK)
+        mask_d = offs_d < Lv
+        splits = tl.arange(0, MAX_SPLITS)
+        valid = splits < num_valid
+        for cur_qo in range(qo_start, qo_end):
+            base = cur_qo * stride_mid_ob + cur_head * stride_mid_oh
+            lse = tl.load(
+                Mid_lse + base + splits * stride_mid_os,
+                mask=valid,
+                other=-float("inf"),
+            )
+            w = tl.where(valid, tl.exp(lse - tl.max(lse, axis=0)), 0.0)
+            v = tl.load(
+                Mid_O + (base + splits[:, None] * stride_mid_os) * Lv + offs_d[None, :],
+                mask=valid[:, None] & mask_d[None, :],
+                other=0.0,
+            )
+            e_sum = tl.sum(w, axis=0)
+            acc = tl.where(e_sum > 0, tl.sum(w[:, None] * v, axis=0) / e_sum, 0.0)
+            tl.store(
+                O + cur_qo * stride_obs + cur_head * stride_oh + offs_d,
+                acc,
+                mask=mask_d,
+            )
+    elif chunk == 0:
+        offs_d = tl.arange(0, BLOCK_DV)
+        mask_d = offs_d < Lv
+        for cur_qo in range(qo_start, qo_end):
+            base = cur_qo * stride_mid_ob + cur_head * stride_mid_oh
+            # Finite, so a split with lse == -inf gets weight 0, not NaN.
+            e_max = -3.0e38
+            e_sum = 0.0
+            acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
+            for split_start in range(0, num_valid, SHORT_BLOCK):
+                splits = split_start + tl.arange(0, SHORT_BLOCK)
+                valid = splits < num_valid
+                lse = tl.load(
+                    Mid_lse + base + splits * stride_mid_os,
+                    mask=valid,
+                    other=-float("inf"),
+                )
+                v = tl.load(
+                    Mid_O
+                    + (base + splits[:, None] * stride_mid_os) * Lv
+                    + offs_d[None, :],
+                    mask=valid[:, None] & mask_d[None, :],
+                    other=0.0,
+                )
+                n_e_max = tl.maximum(tl.max(lse, axis=0), e_max)
+                old_scale = tl.exp(e_max - n_e_max)
+                w = tl.exp(lse - n_e_max)
+                acc = acc * old_scale + tl.sum(w[:, None] * v, axis=0)
+                e_sum = e_sum * old_scale + tl.sum(w, axis=0)
+                e_max = n_e_max
+            # No valid split (empty sequence): e_sum == 0, define O = 0.
+            tl.store(
+                O + cur_qo * stride_obs + cur_head * stride_oh + offs_d,
+                tl.where(e_sum > 0, acc / e_sum, 0.0),
+                mask=mask_d,
+            )
 
 
 def _launch_stage2_dchunk(
@@ -367,13 +408,9 @@ def _launch_stage2_dchunk(
     mgc,
 ):
     max_splits = triton.next_power_of_2(num_kv_splits)
-    # Narrower chunks at more splits keep the CTA count up; cap the tile at 4K
-    # fp32 elements (64 data VGPRs/lane at num_warps=1 on wave64, ~120 total)
-    # so it fits the 128-VGPR budget of waves_per_eu=4 without spilling, up to
-    # 128 splits.
-    d_chunk = min(256 if num_kv_splits <= 8 else 128, triton.next_power_of_2(Lv))
-    while max_splits * d_chunk > 4096 and d_chunk > 32:
-        d_chunk //= 2
+    # The tile stays within 4K fp32 elements (no VGPR spill at waves_per_eu=4
+    # on wave64).
+    d_chunk = min(256, max(32, 4096 // max_splits), triton.next_power_of_2(Lv))
     _fwd_kernel_stage2_dchunk[(num_seqs, num_heads, triton.cdiv(Lv, d_chunk))](
         logits,
         attn_lse,
@@ -382,15 +419,17 @@ def _launch_stage2_dchunk(
         kv_indptr,
         split_indptr,
         valid_split_count,
-        attn_lse.stride(0),  # stride_mid_ob = num_kv_splits * num_heads
-        attn_lse.stride(2),  # stride_mid_oh = 1
-        attn_lse.stride(1),  # stride_mid_os = num_heads
+        attn_lse.stride(0),
+        attn_lse.stride(2),
+        attn_lse.stride(1),
         output.stride(0),
         output.stride(1),
         Lv=Lv,
         mgc=mgc,
+        BLOCK_DV=triton.next_power_of_2(Lv),
         D_CHUNK=d_chunk,
         MAX_SPLITS=max_splits,
+        SHORT_BLOCK=max(1, min(4, max_splits // 2)),
         num_warps=1,
         num_stages=2,
         waves_per_eu=4,
@@ -2563,10 +2602,10 @@ def mla_decode_fwd_v4_nm(
          indptr directly.
       2. Force `out_16_nosplit = 0` -- the kernel's bf16-direct-write path
          does not support multi-pass.
-      3. After the kernel returns FP32 partials, run V3's
-         `_fwd_kernel_stage2_asm` triton kernel which performs the
-         FlashAttention LSE merge across the `num_kv_splits` axis and
-         writes the merged result directly into the BF16 `output` tensor.
+      3. After the kernel returns FP32 partials, a triton kernel
+         (`_fwd_kernel_stage2_dchunk` on small gfx950 grids, else V3's
+         `_fwd_kernel_stage2_asm`) performs the FlashAttention LSE merge across
+         `num_kv_splits` and writes the result into the BF16 `output` tensor.
 
     Fused multi-pass (gfx1250, `2 <= num_kv_splits <= 16`, variant listed in
     `mla_v4_fused_asm.csv`, e.g. qh32 decode):
@@ -2810,7 +2849,7 @@ def mla_decode_fwd_v4_nm(
         kv_last_page_lens,  # tail: unused on nm path, None -> nullptr
     )
 
-    # ---- Cross-split FlashAttention merge via _fwd_kernel_stage2_asm ------
+    # ---- Cross-split FlashAttention merge (triton stage 2) ----------------
     if num_kv_splits > 1:
         device = logits.device
         Lv = v_head_dim
@@ -2826,14 +2865,11 @@ def mla_decode_fwd_v4_nm(
         else:
             mgc = 16
 
-        # Small grids underfill the GPU with one CTA per (seq, head): chunk Lv
-        # across more CTAs and reduce the splits as a tile instead. Large grids
-        # are bandwidth-bound and already full, where the loop kernel is faster.
-        # Tuned on gfx950 (wave64) for up to 128 splits; other archs keep the
-        # loop kernel.
+        # One CTA per (seq, head) underfills the GPU on a small grid; larger
+        # grids are bandwidth-bound. Tuned on gfx950 for auto-pick split counts.
         if (
             runtime_gfx == "gfx950"
-            and num_kv_splits <= 128
+            and num_kv_splits <= _V4_NM_MAX_SPLITS
             and num_seqs * num_heads <= 2048
         ):
             _launch_stage2_dchunk(

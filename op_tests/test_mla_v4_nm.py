@@ -1320,10 +1320,8 @@ def test_v4_nm_one_split_per_seq_on_wide_grid():
     ],
 )
 def test_v4_nm_empty_seq_multi_split(gqa, kv_lens):
-    """A kv_len=0 seq on a multi-split grid has no valid split (stage1 writes
-    neither its partials nor its valid_split_count): both stage-2 merges must
-    write 0 for it (the sink takes all the softmax mass), not 0/0 = NaN, and
-    leave the other seqs untouched."""
+    """A kv_len=0 seq has no valid split: both stage-2 merges must write 0 for
+    it, not 0/0 = NaN."""
     n = len(kv_lens)
     split = {
         "num_kv_splits": 4,

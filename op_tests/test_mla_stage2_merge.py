@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Standalone perf/correctness test for the triton cross-split MLA merge kernel
-``_fwd_kernel_stage2_asm`` (aiter/mla.py).
+"""Standalone perf/correctness test for the triton cross-split MLA merge kernels
+(``_fwd_kernel_stage2_asm`` / ``_fwd_kernel_stage2_dchunk``, aiter/mla.py).
 
 Like ``test_mla_reduce.py`` this runs NO attention stage: it synthesizes the
 per-split partial buffers (``logits`` = Mid_O, ``attn_lse`` = Mid_lse) and the
@@ -14,20 +14,18 @@ The kernel merges ``num_kv_splits`` partial (out, lse) pairs per (token, head)
 into the final attention output. It is memory-bound in decode (small M, wide
 V_HEAD_DIM=512), so TB/s is the metric that matters; TFLOPS is reported too.
 
-Two candidates:
+Candidates:
   ``base`` -- the production ``_fwd_kernel_stage2_asm``. Tuning showed it is
     memory-latency bound (num_stages irrelevant, waves_per_eu=4 optimal) and
     that ``num_warps=1`` beats the old ``num_warps=4`` by 1.7-1.9x on gfx950
     decode shapes -- that value now ships in aiter/mla.py.
-  ``vec`` -- a loop-free variant that loads the whole [MAX_KV_SPLITS, BLOCK_DV]
-    tile and reduces in-register. ~5-16% faster than base for SMALL num_kv_splits
-    (2-4), equal/worse for large N (register pressure). Kept here as a validated
-    alternative; NOT wired into production (the absolute win is <~1.3us on a
-    ~1ms decode and it would need a second kernel + a per-N dispatch).
-  ``dchunk`` -- ``_fwd_kernel_stage2_dchunk``, what ``mla_decode_fwd_v4_nm`` runs
-    when num_seqs * num_heads <= 2048: ``vec`` with Lv split across a third grid
-    axis, so the tile shrinks to [MAX_KV_SPLITS, D_CHUNK] (no register pressure
-    at large N) and the CTA count grows by Lv / D_CHUNK.
+  ``vec`` -- loop-free: loads the whole [MAX_KV_SPLITS, BLOCK_DV] tile and
+    reduces in-register. ~5-16% faster than base for N = 2-4, equal/worse for
+    large N (register pressure). Not in production; ``dchunk`` is its
+    Lv-chunked form.
+  ``dchunk`` -- ``_launch_stage2_dchunk``, what ``mla_decode_fwd_v4_nm`` runs on
+    gfx950 for num_seqs * num_heads <= 2048 and up to 16 splits (timed here on
+    every grid and split count).
 """
 
 import argparse
@@ -162,7 +160,7 @@ def run_torch(logits, attn_lse, num_valid, out_dtype):
 
 @benchmark()
 def test_stage2_merge(
-    num_seqs, num_heads, num_kv_splits, dv, dtype, warps=1, stages=2, wpe=4
+    num_seqs, num_heads, num_kv_splits, dv, dtype, warps=1, stages=2, wpe=4, valid=0
 ):
     T = num_seqs  # decode: one q token per seq (max_seqlen_q == 1)
     N = num_kv_splits
@@ -170,10 +168,9 @@ def test_stage2_merge(
     Lv = dv
     BLOCK_DV = 1 << (Lv - 1).bit_length()  # next_power_of_2(Lv)
 
-    # KV length chosen so every one of the N splits is valid (kv_len >= N * mgc):
-    # num_valid = min(N, cdiv(kv_len, mgc)) == N.
-    kv_len = N * MGC
-    num_valid = N
+    # valid > 0: a short KV fills only that many of the N planned splits.
+    num_valid = min(valid, N) if valid else N
+    kv_len = num_valid * MGC
 
     # --- Synthesize per-split partials (Mid_O / Mid_lse), contiguous ---------
     logits = torch.randn((T, N, H, Lv), dtype=dtypes.fp32)
@@ -191,7 +188,7 @@ def test_stage2_merge(
     kv_indptr = torch.arange(0, T + 1, dtype=dtypes.i32) * kv_len
     kv_last_page_lens = torch.ones(T, dtype=dtypes.i32)
     num_kv_splits_indptr = torch.arange(0, T + 1, dtype=dtypes.i32) * N
-    valid_split_count = torch.full((T,), N, dtype=dtypes.i32)
+    valid_split_count = torch.full((T,), num_valid, dtype=dtypes.i32)
     final_lse_buf = torch.empty((1,), dtype=dtypes.fp32)
 
     out_base = torch.empty((T, H, Lv), dtype=out_dtype)
@@ -220,7 +217,7 @@ def test_stage2_merge(
             0,  # stride_lse_bs (HAS_FINAL_LSE=False)
             page_size=1,
             KV_INDPTR_IS_PAGE_LEVEL=False,
-            MAYBE_FINAL_OUT=True,
+            MAYBE_FINAL_OUT=False,
             HAS_FINAL_LSE=False,
             USE_VALID_SPLIT_COUNT_REDUCE=int(N > 1),
             BATCH_NUM=T,
@@ -302,77 +299,6 @@ def test_stage2_merge(
     return ret
 
 
-def test_stage2_merge_empty_seq(num_heads=16, num_kv_splits=8):
-    """num_valid == 0 (kv_len == 0, valid_split_count == 0, or no splits in
-    num_kv_splits_indptr) must give O == 0 in both merges, not 0/0 = NaN. The
-    unread split slots hold NaN, like a never-written torch.empty buffer."""
-    T, H, N, Lv = 4, num_heads, num_kv_splits, V_HEAD_DIM
-    logits = torch.full((T, N, H, Lv), float("nan"), dtype=dtypes.fp32)
-    attn_lse = torch.full((T, N, H, 1), float("nan"), dtype=dtypes.fp32)
-    logits[0] = torch.randn((N, H, Lv), dtype=dtypes.fp32)
-    attn_lse[0] = torch.randn((N, H, 1), dtype=dtypes.fp32)
-    ref = run_torch(logits[:1], attn_lse[:1], N, dtypes.fp32)[0]
-
-    def indptr(lens):
-        return torch.tensor([0] + lens, dtype=dtypes.i32).cumsum(0).to(dtypes.i32)
-
-    # seq0 valid, seq1 kv_len == 0, seq2 valid_split_count == 0, seq3 no splits
-    qo_indptr = torch.arange(0, T + 1, dtype=dtypes.i32)
-    kv_indptr = indptr([N * MGC, 0, N * MGC, N * MGC])
-    num_kv_splits_indptr = indptr([N, N, N, 0])
-    valid_split_count = torch.tensor([N, N, 0, N], dtype=dtypes.i32)
-
-    out_dchunk = torch.full((T, H, Lv), 7.0, dtype=dtypes.bf16)
-    _launch_stage2_dchunk(
-        logits,
-        attn_lse,
-        out_dchunk,
-        qo_indptr,
-        kv_indptr,
-        num_kv_splits_indptr,
-        valid_split_count,
-        T,
-        H,
-        N,
-        Lv,
-        MGC,
-    )
-    out_base = torch.full((T, H, Lv), 7.0, dtype=dtypes.bf16)
-    _fwd_kernel_stage2_asm[(T, H)](
-        logits,
-        attn_lse,
-        out_base,
-        torch.empty((1,), dtype=dtypes.fp32),
-        qo_indptr,
-        kv_indptr,
-        None,
-        num_kv_splits_indptr,
-        valid_split_count,
-        attn_lse.stride(0),
-        attn_lse.stride(2),
-        attn_lse.stride(1),
-        out_base.stride(0),
-        out_base.stride(1),
-        0,
-        page_size=1,
-        KV_INDPTR_IS_PAGE_LEVEL=False,
-        MAYBE_FINAL_OUT=False,
-        HAS_FINAL_LSE=False,
-        USE_VALID_SPLIT_COUNT_REDUCE=1,
-        BATCH_NUM=T,
-        BLOCK_DV=triton.next_power_of_2(Lv),
-        Lv=Lv,
-        mgc=MGC,
-        num_warps=1,
-        num_stages=2,
-        waves_per_eu=4,
-    )
-    for name, o in (("dchunk", out_dchunk), ("base", out_base)):
-        assert torch.isfinite(o).all(), f"{name}: non-finite O for num_valid == 0"
-        assert bool((o[1:] == 0).all()), f"{name}: O != 0 for num_valid == 0"
-        assertAllclose(ref, o[0].float(), msg=f"{name} empty-seq batch seq0 ")
-
-
 def main():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
@@ -429,24 +355,31 @@ def main():
         default=[4],
         help="waves_per_eu occupancy hint",
     )
+    parser.add_argument(
+        "--valid",
+        type=int,
+        nargs="*",
+        default=[0, 6],
+        help="valid splits per seq (0 = all num_kv_splits; else a short KV)",
+    )
     args = parser.parse_args()
-
-    for heads in args.heads:
-        test_stage2_merge_empty_seq(heads)
 
     for dtype in args.dtype:
         df = []
-        for wpe, stages, warps, heads, splits, batch in itertools.product(
+        for wpe, stages, warps, heads, splits, batch, valid in itertools.product(
             args.wpe,
             args.stages,
             args.warps,
             args.heads,
             args.splits,
             args.batch,
+            args.valid,
         ):
+            if valid >= splits:
+                continue  # same as valid == 0
             df.append(
                 test_stage2_merge(
-                    batch, heads, splits, V_HEAD_DIM, dtype, warps, stages, wpe
+                    batch, heads, splits, V_HEAD_DIM, dtype, warps, stages, wpe, valid
                 )
             )
         df = pd.DataFrame(df)
