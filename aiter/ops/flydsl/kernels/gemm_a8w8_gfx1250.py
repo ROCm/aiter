@@ -80,6 +80,7 @@ def launch_gemm_a8w8(
     arg_out: fx.Pointer = _NULL_SCALE_PTR,
     fused_splitk: Constexpr[bool] = False,
     bounded_m: Constexpr[bool] = True,
+    rank0_splitk: Constexpr[bool] = False,
 ):
     # fuse_quant_out: the bf16 C tile is group-32 MXFP8-quantized in the
     # epilogue instead of written as bf16. arg_c carries the e4m3 [M,B,N]
@@ -1023,7 +1024,7 @@ def launch_gemm_a8w8(
         pipeline_fence(outstanding=0, use_cluster=use_cluster)
         if const_expr(not is_mxscale):
             accs = epilogue_apply_ptpc_scale(scale_regs)
-        if const_expr(cluster_splitk):
+        if const_expr(cluster_splitk and rank0_splitk):
             # Every split publishes its FP32 accumulator fragments in the
             # physical split order. Rank zero then sums that order
             # deterministically and owns the sole final output store.
@@ -1062,9 +1063,9 @@ def launch_gemm_a8w8(
                 out_elem = fx.Float16 if out_is_f16 else fx.BFloat16
                 output = fx.inttoptr(
                     fx.PointerType.get(
-                        out_elem.ir_type, arg_scale_out_k.address_space, alignment=2
+                        out_elem.ir_type, arg_out_k.address_space, alignment=2
                     ),
-                    fx.ptrtoint(arg_scale_out_k),
+                    fx.ptrtoint(arg_out_k),
                 )
                 reduced = []
                 for ai in range_constexpr(n_acc):

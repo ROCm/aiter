@@ -475,7 +475,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
                 tile_m - tile_m // split_k if split_k == 2 else tile_m,
                 tile_n,
             )
-            if compute_bound
+            if (compute_bound or small_native)
             else (
                 ((M + tile_m - 1) // tile_m) * (N // tile_n),
                 split_k,
@@ -554,6 +554,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             specialization_key=specialization + (fuse_quant,),
         )
     else:
+        rank0_splitk = fused and not small_native
         specialization = constexpr_args + (
             scale_block,
             split_k,
@@ -564,6 +565,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             w_scale_32x32,
             fused,
             bounded_m,
+            rank0_splitk,
         )
         _run_compiled(
             _launch_gemm_a8w8,
@@ -582,6 +584,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
             _ptr_arg(Out),  # arg_out
             fused,
             bounded_m,
+            rank0_splitk,
             specialization_key=specialization,
         )
     if partials is not None and not fused:

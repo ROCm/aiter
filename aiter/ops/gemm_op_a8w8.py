@@ -2845,17 +2845,6 @@ def _mxfp8_32_fallback_kernel_name(M: int, N: int, K: int) -> str | None:
     return None
 
 
-_MXFP8_32_RETAINED_SMALLM = {
-    (64, 6144, 768): "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_w2_sk1",
-    (128, 6144, 768): "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_w1_sk1",
-}
-
-
-def _mxfp8_32_retained_smallm_kernel_name(M: int, N: int, K: int) -> str | None:
-    """Return an exact-shape small-M winner retained by graph-replay A/B."""
-    return _MXFP8_32_RETAINED_SMALLM.get((M, N, K))
-
-
 # The w_scale block of every gemm_a8w8_mxfp8_bpreshuffle row so far (gfx1250's
 # 32x4-shuffled and gfx950's row-major scale alike), and of a table from before
 # the w_scale_block key column.
@@ -2897,10 +2886,6 @@ def _get_mxfp8_bpreshuffle_config(
         key[0] for key in _load_mxfp8_bpreshuffle_tuned(tuned_file)
     }:
         gfx = base_gfx_arch(gfx)
-    if gfx == "gfx1250" and cu_num == 256 and w_scale_block == _MXFP8_W_SCALE_BLOCK:
-        retained = _mxfp8_32_retained_smallm_kernel_name(M, N, K)
-        if retained is not None:
-            return "flydsl", retained, 1
     config, padded_m = find_padded_m_row(
         _load_mxfp8_bpreshuffle_tuned(tuned_file),
         lambda pm: (gfx, cu_num, pm, N, K, w_scale_block),

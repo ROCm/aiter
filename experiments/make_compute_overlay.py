@@ -17,7 +17,14 @@ def key(row):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", required=True)
-    parser.add_argument("--results", required=True)
+    parser.add_argument("--results")
+    parser.add_argument("--result-file", action="append", default=[])
+    parser.add_argument(
+        "--exclude-shape",
+        action="append",
+        default=[],
+        help="M,N,K triple to leave unchanged; may be repeated",
+    )
     parser.add_argument("--out", required=True)
     parser.add_argument("--min-speedup", type=float, default=1.02)
     args = parser.parse_args()
@@ -27,8 +34,18 @@ def main():
         rows = list(reader)
     assert fieldnames
     winners = {}
-    for path in glob.glob(f"{args.results}/g*.json"):
-        for result in json.load(open(path)):
+    paths = list(args.result_file)
+    if args.results:
+        paths.extend(glob.glob(f"{args.results}/g*.json"))
+    if not paths:
+        parser.error("one of --results or --result-file is required")
+    excluded = {tuple(map(int, value.split(","))) for value in args.exclude_shape}
+    for path in paths:
+        payload = json.load(open(path))
+        result_rows = payload["results"] if isinstance(payload, dict) else payload
+        for result in result_rows:
+            if (result["M"], result["N"], result["K"]) in excluded:
+                continue
             if result["speedup"] < args.min_speedup:
                 continue
             winner = result["winner"]
