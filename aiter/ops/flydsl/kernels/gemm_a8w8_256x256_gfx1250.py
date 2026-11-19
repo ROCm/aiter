@@ -60,6 +60,7 @@ def launch_gemm_a8w8_256x256(
     split_k: Constexpr[int] = 1,
     a_preshuffle: Constexpr[bool] = False,
     persistent_n_tiles: Constexpr[int] = 1,
+    early_ab: Constexpr[bool] = False,
     fused_splitk: Constexpr[bool] = False,
     bounded_m: Constexpr[bool] = True,
     a_scale_preshuffled: Constexpr[bool] = False,
@@ -99,6 +100,7 @@ def launch_gemm_a8w8_256x256(
     assert (
         persistent_n_tiles == 1 or split_k == 1
     ), "persistent_n_tiles>1 requires split_k=1"
+    assert not early_ab or split_k == 1, "early_ab currently requires split_k=1"
     cluster_splitk = fused_splitk and split_k > 1
     assert not fused_splitk or (
         split_k > 1 and tile_m % split_k == 0
@@ -268,6 +270,7 @@ def launch_gemm_a8w8_256x256(
         f"_cm{cluster_m}_cn{cluster_n}"
         + ("_apre" if a_preshuffle else "")
         + (f"_ps{persistent_n_tiles}" if persistent_n_tiles > 1 else "")
+        + ("_eab" if early_ab else "")
         + ("_fsk" if cluster_splitk else "")
         + ("_aspre" if a_scale_preshuffled else "")
         + ("_bs32x32" if b_scale_32x32 else "")
@@ -528,7 +531,7 @@ def launch_gemm_a8w8_256x256(
                 pad_amount=pad,
                 num_warps=1,
                 workgroup_mask=mask,
-                early_timeout=early and (owner > 1 or k_tiles_class > 1),
+                early_timeout=early and (owner > 1 or k_tiles_class > 1 or early_ab),
                 oob_outer_bound=bound,
                 oob_inner_bound=inner_bound,
             )

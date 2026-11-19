@@ -74,14 +74,18 @@ class WmmaKernelInstance:
     name_prefix: str = NAME_PREFIX
     a_preshuffle: bool = False
     persistent_n_tiles: int = 1
+    early_ab: bool = False
+    fused_splitk: bool = False
 
     def name_for(self, a_preshuffle: bool = False) -> str:
         return (
             f"{self.name_prefix}_t{self.tile_m}x{self.tile_n}x{self.tile_k}_"
             f"mw{self.m_warp}_nw{self.n_warp}_nb{self.num_buffers}_sk{self.split_k}_"
             f"cm{self.cluster_m}_cn{self.cluster_n}"
+            + ("_fsk" if self.fused_splitk else "")
             + ("_apre" if (a_preshuffle or self.a_preshuffle) else "")
             + (f"_ps{self.persistent_n_tiles}" if self.persistent_n_tiles > 1 else "")
+            + ("_eab" if self.early_ab else "")
         )
 
     @property
@@ -198,6 +202,72 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
                         persistent_n_tiles=ps,
                     )
                     idx += 1
+    # Keep the established numeric IDs above stable.  The direct B=1 path does
+    # not need multicast, and on medium/large M its cluster-free compute
+    # pipeline fills the CUs better than forcing 4+ workgroups to co-reside.
+    for sk in _SPLIT_K:
+        for tm, tn, tk, mw, nw, nb in _COMPUTE_PROFILES:
+            for cm, cn in _COMPUTE_UNCLUSTERED:
+                for ps in (1, *_PERSISTENT_N_TILES) if sk == 1 else (1,):
+                    kl[idx] = WmmaKernelInstance(
+                        tile_m=tm,
+                        tile_n=tn,
+                        tile_k=tk,
+                        num_buffers=nb,
+                        split_k=sk,
+                        cluster_m=cm,
+                        cluster_n=cn,
+                        m_warp=mw,
+                        n_warp=nw,
+                        name_prefix=COMPUTE_NAME_PREFIX,
+                        persistent_n_tiles=ps,
+                    )
+                    idx += 1
+    # A/B TDM early merge is a strategy candidate, not the default: it helps
+    # selected wide-N occupancy regimes and can regress narrower grids. Append
+    # split_k=1, non-persistent variants so existing numeric IDs remain stable
+    # and per-shape tuning decides whether to use it.
+    for tm, tn, tk, mw, nw, nb in _COMPUTE_PROFILES:
+        for cm, cn in (*_COMPUTE_CLUSTERS, *_COMPUTE_UNCLUSTERED):
+            kl[idx] = WmmaKernelInstance(
+                tile_m=tm,
+                tile_n=tn,
+                tile_k=tk,
+                num_buffers=nb,
+                split_k=1,
+                cluster_m=cm,
+                cluster_n=cn,
+                m_warp=mw,
+                n_warp=nw,
+                name_prefix=COMPUTE_NAME_PREFIX,
+                early_ab=True,
+            )
+            idx += 1
+    # Cluster-local split-K keeps all splits of an output tile in one hardware
+    # cluster and reduces there, avoiding the global FP32 workspace reduction
+    # launch. It is a separate strategy because the larger cluster can reduce
+    # occupancy; tuning chooses it only where the locality wins.
+    for sk in _SPLIT_K:
+        if sk == 1:
+            continue
+        for tm, tn, tk, mw, nw, nb in _COMPUTE_PROFILES:
+            for cm, cn in (*_COMPUTE_CLUSTERS, *_COMPUTE_UNCLUSTERED):
+                if tm % sk or cm * cn * sk > 16:
+                    continue
+                kl[idx] = WmmaKernelInstance(
+                    tile_m=tm,
+                    tile_n=tn,
+                    tile_k=tk,
+                    num_buffers=nb,
+                    split_k=sk,
+                    cluster_m=cm,
+                    cluster_n=cn,
+                    m_warp=mw,
+                    n_warp=nw,
+                    name_prefix=COMPUTE_NAME_PREFIX,
+                    fused_splitk=True,
+                )
+                idx += 1
     return kl
 
 
@@ -225,6 +295,12 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         if profile not in _COMPUTE_PROFILES:
             return False
         if (ki.cluster_m, ki.cluster_n) not in _COMPUTE_CLUSTERS:
+            return False
+        if ki.fused_splitk and (
+            ki.split_k <= 1
+            or ki.tile_m % ki.split_k
+            or ki.cluster_m * ki.cluster_n * ki.split_k > 16
+        ):
             return False
         # Compute-bound kernels allocate a full tile_m tile; unlike sync WMMA they
         # must not launch when M < tile_m (cluster barrier hang on decode M).

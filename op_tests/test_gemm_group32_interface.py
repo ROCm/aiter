@@ -404,6 +404,97 @@ def test_gfx1250_group32_bpreshuffle_route(monkeypatch, w_rows):
     assert calls == [("lookup", block), ("bmm", (1, 256 // w_rows, 16), False)]
 
 
+def test_gfx1250_group32_direct_2d_row_bypasses_bmm(monkeypatch):
+    """A direct tuned name keeps the public GEMM contract but skips B=1 views."""
+    from aiter.ops.flydsl import batched_gemm_a8w8 as bmm
+    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
+
+    calls = []
+    name = (
+        "flydsl_mxfp8_32_bpreshuffle_wmma_"
+        "t128x128x128_mw2_nw2_nb3_sk1_cm1_cn1"
+    )
+    row = {**BMM_ROW, "kernelName": name}
+
+    def run(x, w, xs, ws, out, kernel_name, w_scale_32x32=False):
+        calls.append(
+            (
+                tuple(x.shape),
+                tuple(w.shape),
+                tuple(xs.shape),
+                tuple(ws.shape),
+                tuple(out.shape),
+                kernel_name,
+                w_scale_32x32,
+            )
+        )
+        return out
+
+    monkeypatch.setattr(gemm_op_a8w8, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setattr(gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lambda *a: row)
+    monkeypatch.setattr(direct, "run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250", run)
+    monkeypatch.setattr(
+        bmm,
+        "run_bmm_a8w8_mxfp8",
+        lambda *a, **kw: pytest.fail("direct B=1 row entered the batched wrapper"),
+    )
+
+    y = gemm_op_a8w8.gemm_a8w8_blockscale_bpreshuffle(
+        *_mxscale_operands(w_rows=1)
+    )
+    assert y.shape == (3, 256)
+    assert calls == [
+        ((3, 512), (256, 512), (3, 16), (256, 16), (3, 256), name, False)
+    ]
+
+
+def test_gfx1250_compute_catalog_exposes_tunable_early_merge():
+    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
+    from aiter.ops.flydsl.gemm_tune import (
+        flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common as catalog,
+    )
+
+    early = [instance for instance in catalog.kernels_list.values() if instance.early_ab]
+    assert early
+    assert all(
+        catalog.is_compute_kernel(instance)
+        and instance.split_k == 1
+        and instance.persistent_n_tiles == 1
+        and instance.name.endswith("_eab")
+        for instance in early
+    )
+    parsed = direct.parse_mxfp8_32_wmma_kernel_name(
+        early[0].name.replace("mxfp8_128", "mxfp8_32")
+    )
+    assert parsed is not None and parsed["early_ab"] is True
+    base = early[0].name.removesuffix("_eab").replace("mxfp8_128", "mxfp8_32")
+    assert direct.parse_mxfp8_32_wmma_kernel_name(base)["early_ab"] is False
+
+
+def test_gfx1250_compute_catalog_exposes_cluster_local_splitk():
+    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
+    from aiter.ops.flydsl.gemm_tune import (
+        flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common as catalog,
+    )
+
+    fused = [
+        instance for instance in catalog.kernels_list.values() if instance.fused_splitk
+    ]
+    assert fused
+    assert all(
+        catalog.is_compute_kernel(instance)
+        and instance.split_k > 1
+        and instance.tile_m % instance.split_k == 0
+        and instance.cluster_m * instance.cluster_n * instance.split_k <= 16
+        and "_fsk" in instance.name
+        for instance in fused
+    )
+    parsed = direct.parse_mxfp8_32_wmma_kernel_name(
+        fused[0].name.replace("mxfp8_128", "mxfp8_32")
+    )
+    assert parsed is not None and parsed["fused_splitk"] is True
+
+
 @pytest.mark.parametrize("w_rows", [1, 32])
 @pytest.mark.parametrize("m", [1, 3])
 def test_mxscale_bpreshuffle_32_wide_w_reaches_blockscale_x_kernel(
