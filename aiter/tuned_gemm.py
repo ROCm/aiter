@@ -26,9 +26,10 @@ from torch import Tensor
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.build_targets import base_gfx_arch
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
+from aiter.plugin import route as _route
 
 # Same idea as SGLANG_OPT_QUARK_BF16_TGEMM_EXACT_M, for every caller of this lookup.
 # Default on. A hipBLASLt solution is for the M it was tuned at; launching that
@@ -136,7 +137,8 @@ def get_GEMM_A16W16_tuned_config(
     cu_num = get_cu_num() if cu_num is None else cu_num
     padded_M = M
     config = None
-    gfx = get_gfx() if gfx is None else gfx
+    if gfx is None:
+        gfx = get_gfx_runtime()
     # A0 bring-up: a gfx1250-strict build has no tuned rows of its own; reuse
     # the gfx1250 family rows for coverage (perf parity is a later follow-up).
     # An exact strict row still wins when one exists; the guard keeps the scan
@@ -172,7 +174,21 @@ def get_GEMM_A16W16_tuned_config(
                 )
                 # None means the tuned CSV names a kernel absent from this
                 # catalog version; it is unrelated to FlyDSL import availability.
-                if flydsl_config is None:
+                if flydsl_config is None or (
+                    bpreshuffle
+                    and (
+                        flydsl_config["policy"] not in ("ft", "sk")
+                        or (
+                            flydsl_config["policy"] == "ft"
+                            and (
+                                flydsl_config["split_k"] != 1
+                                or flydsl_config["k_waves"] != 1
+                            )
+                        )
+                        or gfx != "gfx950"
+                        or str(dtype) != str(dtypes.bf16)
+                    )
+                ):
                     logger.warning(
                         f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
                         "recognized by the current catalog; falling back to next candidate."
@@ -270,7 +286,8 @@ def get_GEMM_A16W16_config(
     cu_num: int | None = None,
 ):
     cu_num = get_cu_num() if cu_num is None else cu_num
-    gfx = get_gfx() if gfx is None else gfx
+    if gfx is None:
+        gfx = get_gfx_runtime()
     config = get_GEMM_A16W16_tuned_config(
         M, N, K, bias, dtype, otype, scaleAB, bpreshuffle, gfx, cu_num
     )
@@ -410,9 +427,16 @@ def gemm_a16w16_out(
 ) -> None:
     """`gemm_a16w16` written into ``out`` -- the [M, N] tensor of ``otype`` --
     for a caller whose consumer reads one fixed address."""
-    _gemm_a16w16(A, B, bias, otype, scale_a, scale_b, scale_c, out)
+    result = _gemm_a16w16(A, B, bias, otype, scale_a, scale_b, scale_c, out)
+    # The return value is dropped here, so a provider that answers in a tensor
+    # of its own would leave `out` unwritten; the native path asserts the same.
+    if result.data_ptr() != out.data_ptr():
+        raise RuntimeError("gemm_a16w16_out: the result was not written into out=")
 
 
+# Routed here, beneath both guarded spellings and `tgemm.mm`, for the reason
+# `rmsnorm` is: every one of them arrives here, so this is where the op begins.
+@_route(op="gemm_a16w16", version=1)
 def _gemm_a16w16(
     A: Tensor,
     B: Tensor,
@@ -423,6 +447,26 @@ def _gemm_a16w16(
     scale_c: Tensor | None = None,
     out: Tensor | None = None,
 ) -> Tensor:
+    """Dense GEMM ``A @ B.T + bias`` in ``otype``, by the tuned backend.
+
+    Returns the ``[*A.shape[:-1], N]`` result. Without ``out`` it is a newly
+    allocated tensor and nothing is written through the arguments. With
+    ``out`` the result is written into ``out`` and ``out`` is returned, viewed
+    to that shape: a provider serving this contract must write it there, since
+    `gemm_a16w16_out` drops the return value and reads only the buffer.
+
+    Args:
+        A: ``[..., K]`` activations, bf16 or fp16 (fp8 with the scales below);
+            the leading dims are the ``M`` rows.
+        B: ``[N, K]`` weights. ``B.is_shuffled`` True says ``B`` holds the
+            preshuffled layout the asm kernels read, not row-major bytes.
+        bias: ``[N]``, added to every row, or None.
+        otype: output dtype; None is ``A``'s dtype.
+        scale_a, scale_b, scale_c: per-tensor scales of a scaled GEMM (``A``
+            and ``B`` dequant, output); all None for a plain 16-bit GEMM.
+        out: ``[M, N]`` buffer of ``otype``, or one shaped like the result;
+            None allocates the result.
+    """
     bpreshuffle = False
     if hasattr(B, "is_shuffled") and B.is_shuffled is True:
         bpreshuffle = True
@@ -431,7 +475,10 @@ def _gemm_a16w16(
             inp_view = A.view(-1, A.size(-1))
             batched = True
         except RuntimeError:
-            return _into(out, F.linear(A, B, bias))
+            if not bpreshuffle:
+                return _into(out, F.linear(A, B, bias))
+            inp_view = A.reshape(-1, A.size(-1))
+            batched = True
     else:
         inp_view = A
         batched = False
@@ -445,7 +492,8 @@ def _gemm_a16w16(
 
     gfx, cu_num = _device_arch_and_cu(inp_view.device)
     if gfx not in SUPPORTED_OPUS_ARCHES:
-        gfx, cu_num = get_gfx(), get_cu_num()
+        gfx = get_gfx_runtime()
+        cu_num = get_cu_num()
     config = get_GEMM_A16W16_config(
         M=m,
         N=n,
@@ -702,7 +750,7 @@ def flydsl_gemm(
         and bias.dtype == inp.dtype
     ):
         fused_bias = bias
-    if skinny or flydsl_config["policy"] == "bs":
+    if skinny or flydsl_config["policy"] in ("bs", *flydsl_gemm_kernels.TDM_POLICIES):
         policy = flydsl_config["policy"]
     else:
         policy = "ht" if flydsl_config["use_half_tile_interleaved"] else "ft"
@@ -724,6 +772,7 @@ def flydsl_gemm(
         b_non_temporal=flydsl_config["b_non_temporal"],
         policy=policy,
         out_dtype=None if skinny else otype,
+        bpreshuffle=bpreshuffle,
     )
 
     if bias is not None and fused_bias is None:

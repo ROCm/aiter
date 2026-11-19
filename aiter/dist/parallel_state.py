@@ -125,6 +125,35 @@ def all_reduce_(
     )
 
 
+def all_reduce_add_fake(
+    tensor: torch.Tensor, other: torch.Tensor, *args, **kwargs
+) -> torch.Tensor:
+    # The fallback all-reduces tensor + other: the shape and dtype of that sum.
+    return torch.empty(
+        torch.broadcast_shapes(tensor.shape, other.shape),
+        dtype=torch.result_type(tensor, other),
+        device=tensor.device,
+    )
+
+
+@torch_compile_guard(gen_fake=all_reduce_add_fake)
+def all_reduce_add_(
+    tensor: torch.Tensor,
+    other: torch.Tensor,
+    group_name: str,
+    ca_use_new: bool,
+    ca_fp8_quant: bool,
+    prefill_support: bool = False,
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._all_reduce_add_out_place(
+        tensor, other, ca_use_new, ca_fp8_quant, prefill_support
+    )
+
+
 def fused_allreduce_rmsnorm_fake(
     inp: torch.Tensor,
     res_inp: torch.Tensor,
@@ -793,6 +822,75 @@ class GroupCoordinator:
         return self.device_communicator.all_reduce(
             input_, ca_use_new, ca_fp8_quant, prefill_support
         )
+
+    def all_reduce_add(
+        self,
+        input_: torch.Tensor,
+        other: torch.Tensor,
+        ca_use_new: bool = True,
+        ca_fp8_quant: bool = False,
+        prefill_support: bool = False,
+    ) -> torch.Tensor:
+        """all_reduce(input_ + other), out of place: the sum over ranks of each
+        rank's input_ + other, with the add fused where the device communicator
+        can."""
+        if self.world_size == 1:
+            return input_ + other
+        return all_reduce_add_(
+            input_,
+            other,
+            group_name=self.unique_name,
+            ca_use_new=ca_use_new,
+            ca_fp8_quant=ca_fp8_quant,
+            prefill_support=prefill_support,
+        )
+
+    def _all_reduce_add_out_place(
+        self,
+        input_: torch.Tensor,
+        other: torch.Tensor,
+        ca_use_new: bool,
+        ca_fp8_quant: bool,
+        prefill_support: bool = False,
+    ) -> torch.Tensor:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        fused = getattr(self.device_communicator, "all_reduce_add", None)
+        if fused is None:
+            return self.device_communicator.all_reduce(input_ + other)
+        return fused(input_, other, ca_use_new, ca_fp8_quant, prefill_support)
+
+    def dcp_lse_merge(
+        self,
+        o: torch.Tensor,
+        lse: torch.Tensor,
+        owned_counts: torch.Tensor | None = None,
+        return_lse: bool = False,
+    ):
+        """Merge decode context parallel partials over this group in one kernel.
+
+        o [B, H, D] and lse [B, H] are this rank's attention partials over its
+        KV shard. The result is [B, H / world_size, D] for this rank's heads,
+        merged by LSE (with return_lse, also the merged LSE). Returns None when
+        no custom kernel takes the inputs; the caller then merges its own way
+        (for example with an all-to-all).
+
+        Whether it returns None depends only on the inputs' shapes, dtypes and
+        strides and on this group, so every rank makes the same choice. Callers
+        rely on that: the kernel and their fallback are both collectives, and
+        ranks that chose differently would hang the group.
+
+        This is the gfx1250 merge (CustomAllreduce.custom_dcp_merge, over the LL
+        scratch). On gfx950, aiter.ops.flydsl.dcp_mailbox.dcp_lse_combine merges
+        a single-node group through a FlyDSL mailbox with a workspace of its own;
+        it is not reached from here.
+        """
+        if self.world_size == 1 or self.device_communicator is None:
+            return None
+        merge = getattr(self.device_communicator, "dcp_lse_merge", None)
+        if merge is None:
+            return None
+        return merge(o, lse, owned_counts, return_lse)
 
     def fused_allreduce_rmsnorm(
         self,
