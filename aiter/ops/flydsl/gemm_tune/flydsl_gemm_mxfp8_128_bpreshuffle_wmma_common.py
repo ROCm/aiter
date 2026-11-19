@@ -219,11 +219,15 @@ def _compute_instances(clusters, fused):
                     )
 
 
-def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
-    base = [
+def _base_instances() -> list[WmmaKernelInstance]:
+    return [
         *_generic_instances(_CLUSTER_OPTS, False),
         *_compute_instances(_COMPUTE_CLUSTERS, False),
     ]
+
+
+def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
+    base = _base_instances()
     # Appended in this order so every existing kernelId keeps its kernel: fused
     # twins, then the wider clusters (their split_k > 1 candidates are fused only,
     # and a fused cluster holds at most 16 workgroups).
@@ -239,6 +243,14 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
 
 
 kernels_list: dict[int, WmmaKernelInstance] = _build_kernels_list()
+_N_BASE = len(_base_instances())
+
+
+def fallback_kernels() -> list[WmmaKernelInstance]:
+    """Candidates of the runtime fallback for shapes without a tuned row: the original
+    unfused kernels, not the widened tuner space (which is the tail of ``kernels_list``).
+    """
+    return [ki for i, ki in kernels_list.items() if i < _N_BASE]
 
 
 def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
