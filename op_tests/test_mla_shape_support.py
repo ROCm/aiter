@@ -168,6 +168,27 @@ def test_non_persistent_asm():
         assert s.backend is MlaBackend.ASM
 
 
+@pytest.mark.parametrize(
+    "qlen,causal",
+    [(1, False), (1, True), (2, False), (2, True), (4, False), (4, True)],
+)
+def test_gfx950_bf16_qh128_mtp_asm(qlen, causal):
+    code, gqa, config_qlen, kernel = mla_decode_asm_query(
+        "gfx950", "bf16", "bf16", 128, 1, qlen, False, causal, False, False
+    )
+    status = _MLA_ASM_STATUSES.get(code, MlaAsmStatus.UNKNOWN)
+    if status is MlaAsmStatus.ARCH_NOT_BUILT:
+        pytest.skip("no gfx950 asm table built")
+    assert status is MlaAsmStatus.OK, status
+    assert (gqa, config_qlen) == (128, 0)
+    expected = (
+        "mla_a16w16_qh128_mtp_mask1E"
+        if qlen == 1 or causal
+        else "mla_a16w16_qh128_mtp_mask0E"
+    )
+    assert kernel.endswith(expected), kernel
+
+
 def test_gfx1250_flydsl_ps1_backend(monkeypatch):
     monkeypatch.delenv("AITER_MLA_DECODE_PS1_ASM", raising=False)
     fp8 = torch.float8_e4m3fn
