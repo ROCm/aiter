@@ -27,7 +27,8 @@ here. Update this file in the same change as any behaviour change.
    or skip it silently.
 3. The whole `SEARCH_SPACE` is swept. No CLI overrides, no caps, no sampling. `BLOCK_SIZE_M/N`
    values below `MIN_DOT_TILE` (8) are vector tiles: only a kernel with `vector_tiles=True` gets
-   them, so the other kernels keep the lists they had. Pruning is: the
+   them, so the other kernels keep the lists they had. With several K steps, `should_skip_generic`
+   keeps `num_stages` 1 only for a vector `BLOCK_SIZE_N`. Pruning is: the
    shape filters, `should_skip_generic`, `exceeds_lds` and `exceeds_registers` (fp32 accumulator per
    thread above `MAX_ACC_PER_THREAD`: 512 on gfx1250, 256 elsewhere) in `space.py`, then the kernel's own
    `should_skip(config)`. Every rule returns True to reject; `build_space` reads as separate

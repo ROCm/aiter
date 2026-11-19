@@ -192,8 +192,14 @@ def should_skip_generic(shape, config, backend):
     if block_k >= 2 * k_per_split:
         return True  # the K tile is more than double the K each split works on
     if backend == "triton" and num_stages is not None:
-        # triton pipelines (num_stages > 1) exactly when there are several K iterations
-        return (num_stages > 1) != (block_k < k_per_split)
+        several_k_steps = block_k < k_per_split
+        if not several_k_steps:
+            return num_stages > 1  # one K step: num_stages makes no other kernel
+        # triton pipelines (num_stages > 1) a dot kernel when there are several K steps;
+        # a vector tile (no tl.dot, BLOCK_SIZE_N below MIN_DOT_TILE) is swept both ways
+        block_n = config.get("BLOCK_SIZE_N", config.get("BLOCK_N"))
+        vector_tile = block_n is not None and block_n < MIN_DOT_TILE
+        return num_stages == 1 and not vector_tile
     return False
 
 
