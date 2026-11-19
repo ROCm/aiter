@@ -1982,6 +1982,13 @@ def test_presorted_moe_std_pipelines():
         ("a4w4", "1", {"quant_dtype_a": dtypes.fp4x2}, {64: 16, 65: 32, 256: 32}),
         ("a16w4", None, {}, {1: 32, 32: 32, 64: 16, 256: 16}),
     )
+    if get_gfx() == "gfx942" or int(os.getenv("AITER_FP4x2", "1")) <= 0:
+        aiter.logger.warning(
+            "build target %s has no HIP fp4x2 quant (-D__Float4_e2m1fn_x2); "
+            "skipping the a4w4 presorted standard-sort cases",
+            get_gfx(),
+        )
+        cases = tuple(case for case in cases if case[0] != "a4w4")
     real_sorting = fm.moe_sorting
     real_cfgs = fm.get_2stage_cfgs
     sort_calls, selected = [], []
