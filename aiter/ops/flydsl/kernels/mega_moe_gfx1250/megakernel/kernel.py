@@ -173,28 +173,13 @@ def make_megakernel(
     from aiter.ops.flydsl.grouped_moe_gfx1250 import get_wmma_m_rep
 
     rep2 = get_wmma_m_rep(TM, int(tile_n2), 1, 4, "gemm2")
-    # Debug only: AITER_DMK_PHASES masks phases out (1 produce routes, 2 GEMM1,
-    # 4 GEMM2, 8 reduce); the protocol (tickets, flags, close) always runs.
-    PH = int(os.environ.get("AITER_DMK_PHASES", "15"))
     # Debug only: AITER_DMK_TRACE=1 has tid 0 of every CTA stamp the phase
     # boundaries into the trace words after the control block.
     TRACE = int(os.environ.get("AITER_DMK_TRACE", "0"))
-    # Debug only: the hand-off cache policies (A loads of GEMM2, GEMM1 output,
-    # EP scatter).
-    # A at the default policy: only the m-tile's own GEMM2 units read its a2
-    # rows, after g1_ready, and the launch started with no line of them cached.
-    POL_A = int(os.environ.get("AITER_DMK_POL_A", "0"))
-    # Debug only: GEMM1's A / A-scale loads (the dispatched rows).
-    POL_A1 = int(os.environ.get("AITER_DMK_POL_A1", "0"))
-    POL_C = int(os.environ.get("AITER_DMK_POL_C", str(SCOPE_DEV)))
-    POL_S = int(os.environ.get("AITER_DMK_POL_S", str(SCOPE_SYS)))
     # Debug only: AITER_DMK_NOTRAP=1 has a timed-out wait count itself in
     # ctl[CTL_FAIL + site] and go on instead of trapping (with a short
     # AITER_DMK_TIMEOUT_S, a hung protocol then shows where it stops).
     NOTRAP = int(os.environ.get("AITER_DMK_NOTRAP", "0"))
-    # Debug only: AITER_DMK_INV=1 has wave 0 of every CTA invalidate the caches
-    # at system scope at launch (a stale cross-launch L2 line test).
-    INV = int(os.environ.get("AITER_DMK_INV", "0"))
     # Debug only: every wave idles this many us after its ticket (lets every
     # rank's launch start before anyone sends).
     DELAY_US = int(os.environ.get("AITER_DMK_DELAY_US", "0"))
@@ -290,7 +275,6 @@ def make_megakernel(
         GATE_S=GATE_S,
         H=H,
         HS=HS,
-        INV=INV,
         K=K,
         MAXR=MAXR,
         MT_PER_E=MT_PER_E,
@@ -300,7 +284,6 @@ def make_megakernel(
         NT1=NT1,
         NT2=NT2,
         PAYLOAD=PAYLOAD,
-        PH=PH,
         PLAN_SLOT=PLAN_SLOT,
         PLAN_TAG=PLAN_TAG,
         PLAN_W=PLAN_W,
@@ -407,8 +390,8 @@ def make_megakernel(
             a_scale_row_stride_bytes=ROW,
             tile_meta=meta1_holder,
             a_ready=ready1_holder if (COMPACT or EARLY) else None,
-            a_cache_modifier=POL_A1,
-            c_cache_modifier=POL_C,
+            a_cache_modifier=0,
+            c_cache_modifier=SCOPE_DEV,
             **common,
         )
         g2_task, block2, g2_name, _, lay2 = build_gemm_a8w4_tdm_task(
@@ -432,8 +415,11 @@ def make_megakernel(
             a_scale_row_stride_bytes=0,
             tile_meta=meta2_holder,
             a_ready=ready2_holder,
-            a_cache_modifier=POL_A,
-            scatter_cache_policy=POL_S,
+            # A at the default policy: only the m-tile's own GEMM2 units read
+            # its a2 rows, after g1_ready, and the launch started with no line
+            # of them cached.
+            a_cache_modifier=0,
+            scatter_cache_policy=SCOPE_SYS,
             defer_ep_wait=DEFER_SC,
             **common,
         )
@@ -455,7 +441,6 @@ def make_megakernel(
         kname = (
             ("mega_compact" if COMPACT else "mega_slots")
             + f"_w{G}_r{rank}of{npes}_c{CAP if not COMPACT else MT_CAP * TM}"
-            + (f"_ph{PH}" if PH != 15 else "")
             + knob_sfx
             + f"__{g1_name}__{g2_name}"
         )

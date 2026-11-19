@@ -57,10 +57,8 @@ CTL_TALLY = 5248  # + 32 * parity: compact layout, tally CTAs done
 CTL_G1 = 6144
 G1_STRIDE = 64
 G1_READY = 32
-#: Words between two CTAs' gate words (one 128 B line each), and where the
-#: packed plan starts inside a plan replica.
+#: Words between two CTAs' gate words (one 128 B line each).
 GATE_STRIDE = 32
-PLAN_PK = 32
 #: Plan replicas: CTA c reads replica c % PLAN_REPS, so a line is read by
 #: G / PLAN_REPS CTAs, not by all of them (32 readers on a line cost ~10 us).
 #: A replica is the experts' row counts: 16 bits each for slots, whose slots
@@ -321,13 +319,10 @@ def start(kc):
     """Entry ticket -> (generation, parity, X1 tag); CTA 0 resets the next
     launch's counters."""
     COMPACT, DELAY_US, EARLY, EPR_CH = kc.COMPACT, kc.DELAY_US, kc.EARLY, kc.EPR_CH
-    EPR_PAD, G, INV, addr_ctl, alive = kc.EPR_PAD, kc.G, kc.INV, kc.addr_ctl, kc.alive
+    EPR_PAD, G, addr_ctl, alive = kc.EPR_PAD, kc.G, kc.addr_ctl, kc.alive
     bc, bid, is_t0, lane, rsrc_actl = kc.bc, kc.bid, kc.is_t0, kc.lane, kc.rsrc_actl
     rsrc_ctl, stamp, wave = kc.rsrc_ctl, kc.stamp, kc.wave
     stamp(0)
-    if const_expr(INV):  # noqa: SIM102 - preserve DSL staging
-        if wave == fx.Int32(0):
-            comm_ops.fence_acquire(fx.rocdl.SyncScope.OneAs)
 
     # ---- entry ticket (u64) -> generation, parity ----
     # CTA b takes its ticket on counter b % N_TICKET, which G / N_TICKET
@@ -721,7 +716,7 @@ def gemm_queue(kc, n_mt):
     the rank's total units)."""
     COMPACT, DEFER_SC, EARLY, EPR = kc.COMPACT, kc.DEFER_SC, kc.EARLY, kc.EPR
     EPR_CH, G, GATE_P, GATE_R, H = kc.EPR_CH, kc.G, kc.GATE_P, kc.GATE_R, kc.H
-    MT_PER_E, N1, NT1, NT2, PH = kc.MT_PER_E, kc.N1, kc.NT1, kc.NT2, kc.PH
+    MT_PER_E, N1, NT1, NT2 = kc.MT_PER_E, kc.N1, kc.NT1, kc.NT2
     POLL_SL, TM, TRACE, addr_ctl = kc.POLL_SL, kc.TM, kc.TRACE, kc.addr_ctl
     alive, arg_a2, arg_a2_scale = kc.alive, kc.arg_a2, kc.arg_a2_scale
     arg_disp, arg_disp_scale, arg_rowmap = kc.arg_disp, kc.arg_disp_scale, kc.arg_rowmap
@@ -773,7 +768,7 @@ def gemm_queue(kc, n_mt):
     n2 = fx.Int32(H)
     rows_cap = i32_rows
 
-    total_units = n_mt * fx.Int32(NT2 if PH & 4 else 0) + fx.Int32(1)
+    total_units = n_mt * fx.Int32(NT2) + fx.Int32(1)
 
     # ================== 3./4. GEMM1 then GEMM2 items ==================
     # One queue: every GEMM1 item (m-major), then every GEMM2 item. A
@@ -781,8 +776,8 @@ def gemm_queue(kc, n_mt):
     # from one agent claim, issued before the current item's body and
     # resolved after it. All GEMM1 items are claimed before any GEMM2
     # item, so a GEMM2 item waits only on GEMM1 items already running.
-    U1 = n_mt * fx.Int32(NT1 if PH & 2 else 0)
-    U = U1 + n_mt * fx.Int32(NT2 if PH & 4 else 0)
+    U1 = n_mt * fx.Int32(NT1)
+    U = U1 + n_mt * fx.Int32(NT2)
     bc_next = fx.Int64(bc + fx.Int32(12))
     u = bid
     n2_done = fx.Int32(0)
@@ -868,8 +863,6 @@ def gemm_queue(kc, n_mt):
                 wait_gate(GATE_P if COMPACT else GATE_R, GATE_STRIDE, 7)
 
             def a_ready(i=i):
-                if const_expr(PH & 16):
-                    return
                 stamp(12)
                 rdy_w = fx.Int32(CTL_G1 + G1_READY) + i * fx.Int32(G1_STRIDE)
                 cur = _uniform(_load_i32_dev(rsrc_ctl, rdy_w))
@@ -956,7 +949,7 @@ def close(kc, n2_done, total_units):
 @device_fn
 def reduce(kc):
     """5. REDUCE: once every peer closed, sum each token's top-k slots."""
-    CF_OFF, E, G, GATE_C, H, K, PH = kc.CF_OFF, kc.E, kc.G, kc.GATE_C, kc.H, kc.K, kc.PH
+    CF_OFF, E, G, GATE_C, H, K = kc.CF_OFF, kc.E, kc.G, kc.GATE_C, kc.H, kc.K
     RED_CH, RED_UN, addr_out, bid = kc.RED_CH, kc.RED_UN, kc.addr_out, kc.bid
     RED_B64 = kc.RED_B64
     comb_slot_stride, lane, off_comb_inp = kc.comb_slot_stride, kc.lane, kc.off_comb_inp
@@ -983,7 +976,7 @@ def reduce(kc):
     if const_expr(not RED_B64):
         rsrc_comb_all = create_buffer_resource_from_addr(comb_base)
     rsrc_out = create_buffer_resource_from_addr(addr_out)
-    n_red = tok * fx.Int32(RED_CH if PH & 8 else 0)
+    n_red = tok * fx.Int32(RED_CH)
     for w in range(wave_gid, n_red, G * 4 * RED_UN):
         # Every item's loads first, then each item's sum in k order (the
         # staged reduce's arithmetic). An item past the end reloads the

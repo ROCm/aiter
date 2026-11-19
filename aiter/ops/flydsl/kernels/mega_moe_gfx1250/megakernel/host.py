@@ -214,25 +214,6 @@ class MegaKernel:
             rows, route = self.rows, 0
         w1_u8 = _grouped_weight_uint8(w1)
         w2_u8 = _grouped_weight_uint8(w2)
-        if os.environ.get("AITER_DMK_DEBUG") and not getattr(self, "_dbg_done", 0):
-            self._dbg_done = 1
-            regs = {
-                n: (arena.local_ptr(n), arena.size(n)) for n, _ in arena.layout.regions
-            }
-            print(
-                f"[dmk r{self.config.rank}] regions="
-                + " ".join(f"{n}:{a:#x}+{z:#x}" for n, (a, z) in regs.items())
-                + f" a2={self.a2.data_ptr():#x}+{self.a2.nbytes:#x}"
-                + f" a2s={self.a2_scale.data_ptr():#x}+{self.a2_scale.nbytes:#x}"
-                + f" ctl={self.ctl.data_ptr():#x}+{self.ctl.nbytes:#x}"
-                + f" w1={w1_u8.data_ptr():#x}+{w1_u8.nbytes:#x}"
-                + f" w1s={w1_scale.data_ptr():#x}+{w1_scale.nbytes:#x}"
-                + f" w2={w2_u8.data_ptr():#x}+{w2_u8.nbytes:#x}"
-                + f" w2s={w2_scale.data_ptr():#x}+{w2_scale.nbytes:#x}"
-                + f" x={hidden_states.data_ptr():#x} out={out.data_ptr():#x}+{out.nbytes:#x}"
-                + f" cap={self.cap} row={self.row} G={self.workers}",
-                flush=True,
-            )
         launch = self._launcher(stage1_act)
         args = (
             ptr(self.a2.data_ptr()),

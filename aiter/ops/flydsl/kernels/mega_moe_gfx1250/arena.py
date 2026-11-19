@@ -93,10 +93,7 @@ _ARENA_REGION_ORDER = (
     "slots_ctl",
     # compact's control regions (X1 rows, peer flags), one per kernel of its
     # tile table (megakernel.COMPACT_TILES, at most COMPACT_MAX_KERNELS); they share
-    # the staged compact rows (disp_out / ep_rowmap) and comb_inp, unless
-    # AITER_LM_OWN_ROWS gives compact its own (debug).
-    "compact_rows",
-    "compact_rowmap",
+    # the staged compact rows (disp_out / ep_rowmap) and comb_inp.
     "compact_ctl",
     "compact_ctl1",
     "compact_ctl2",

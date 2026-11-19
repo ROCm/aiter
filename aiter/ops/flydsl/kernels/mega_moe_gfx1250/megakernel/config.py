@@ -346,10 +346,7 @@ def compact_regions(config) -> dict:
 
 
 def compact_row_regions() -> tuple:
-    """compact's wire rows and rowmap: the staged path's, or (debug,
-    AITER_LM_OWN_ROWS=1) regions of its own."""
-    if os.environ.get("AITER_LM_OWN_ROWS", "0") == "1":
-        return "compact_rows", "compact_rowmap"
+    """compact's wire rows and rowmap: the staged path's."""
     return "disp_out", "ep_rowmap"
 
 

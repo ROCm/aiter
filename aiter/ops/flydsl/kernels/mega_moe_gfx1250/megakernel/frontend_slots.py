@@ -73,7 +73,7 @@ def produce(kc, n_mine):
     """1. PRODUCE; returns (routes this wave produced, this rank's routes)."""
     CAP, DEST_STRIDE, E, EPR, EPR_PAD = kc.CAP, kc.DEST_STRIDE, kc.E, kc.EPR, kc.EPR_PAD
     G, GATE_S, H, HS, K, NG = kc.G, kc.GATE_S, kc.H, kc.HS, kc.K, kc.NG
-    PAYLOAD, PH, ROW, RT_BASE = kc.PAYLOAD, kc.PH, kc.ROW, kc.RT_BASE
+    PAYLOAD, ROW, RT_BASE = kc.PAYLOAD, kc.ROW, kc.RT_BASE
     SRC_OFF, TRACE, addr_ctl, lane = kc.SRC_OFF, kc.TRACE, kc.addr_ctl, kc.lane
     off_ctl, off_disp, off_rowmap, par = kc.off_ctl, kc.off_disp, kc.off_rowmap, kc.par
     peer_va, rank, rsrc_ids, rsrc_wts = kc.peer_va, kc.rank, kc.rsrc_ids, kc.rsrc_wts
@@ -93,7 +93,7 @@ def produce(kc, n_mine):
         w_bits = fx.Int32(
             buffer_load(rsrc_wts, r, vec_width=1, dtype=T.i32, is_scalar=True)
         )
-        valid = (gid >= fx.Int32(0)) & (gid < fx.Int32(E if PH & 1 else 0))
+        valid = (gid >= fx.Int32(0)) & (gid < fx.Int32(E))
         gid_s = fx.Int32(valid.select(gid, fx.Int32(0)))
         dst = gid_s // fx.Int32(EPR)
         le = gid_s - dst * fx.Int32(EPR)
