@@ -22,6 +22,8 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
 from aiter.ops.flydsl.kernels.gfx1250_cluster import compute_mcast_masks_runtime
 from aiter.ops.flydsl.kernels.kernels_common import format_kernel_name
 from aiter.ops.flydsl.kernels.splitk_fused_epilogue_gfx1250 import (
+    MAX_PARTIAL_VECTORS,
+    UNROLL,
     emit_fused_splitk_epilogue,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import (
@@ -182,9 +184,19 @@ def launch_gemm_a8w8(
         lanes_per_row = tile_n // 4
         rows_per_iter, reduce_m = block // lanes_per_row, tile_m // split_k
         tdm_rows = (tile_m - reduce_m, *(() if split_k == 2 else (reduce_m,)))
+        unroll = max(
+            1,
+            min(
+                UNROLL,
+                MAX_PARTIAL_VECTORS // max(1, block // 128) // split_k,
+                reduce_m // max(1, rows_per_iter),
+            ),
+        )
         if (
             block % lanes_per_row
-            or not (reduce_m < rows_per_iter or reduce_m % rows_per_iter == 0)
+            or not (
+                reduce_m < rows_per_iter or reduce_m % (rows_per_iter * unroll) == 0
+            )
             or any(rows % num_waves for rows in tdm_rows)
         ):
             raise ValueError(

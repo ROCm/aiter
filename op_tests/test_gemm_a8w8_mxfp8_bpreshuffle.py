@@ -232,6 +232,32 @@ def test_fused_splitk(block, kernel_name, m, n, k):
     }
 
 
+def test_fused_splitk_whole_row_passes():
+    """The epilogue stores whole passes of rows_per_iter * unroll rows: a 192x256 tile with
+    two splits would leave 32 of 96 rows of every stripe unwritten, so it must take the
+    unfused reduction (the 96 rows of a split are not a whole number of 64-row passes).
+    """
+    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as flydsl_gemm
+    from aiter.ops.flydsl.kernels import splitk_fused_epilogue_gfx1250 as epilogue
+
+    flydsl_gemm._lazy_import()
+    assert (flydsl_gemm._FUSED_UNROLL, flydsl_gemm._FUSED_MAX_PARTIAL_VECTORS) == (
+        epilogue.UNROLL,
+        epilogue.MAX_PARTIAL_VECTORS,
+    )
+    assert not flydsl_gemm.fused_splitk_ok(192, 256, 2, 2, 1, 1, 2)
+    m, n, k = 192, 256, 1024
+    name = "flydsl_mxfp8_128_bpreshuffle_wmma_t192x256x128_mw2_nw2_nb2_sk2_cm1_cn1_fsk"
+    xq, x_scale, weight, w_scale = _fused_splitk_operands(128, m, n, k)
+    ref = run_torch(xq, x_scale, weight, w_scale, (128, 128), x_block=128)
+    x_scale = x_scale.t().contiguous().view(*x_scale.shape)
+    out = torch.full((m, n), float("nan"), dtype=dtypes.bf16)
+    flydsl_gemm.run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
+        xq, shuffle_weight(weight, layout=(16, 16)), x_scale, w_scale, out, name
+    )
+    assertAllclose(ref, out.float(), msg=f"{name}: ")
+
+
 def tuned_shapes():
     table = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE)
     table = table[(table["gfx"] == get_gfx()) & (table["cu_num"] == get_cu_num())]
@@ -263,6 +289,7 @@ if __name__ == "__main__":
         df = pd.DataFrame([test_gemm(*mnk) for mnk in args.mnk or tuned_shapes()])
         aiter.logger.info(f"gemm_a8w8_mxfp8_bpreshuffle summary:\n{df.to_markdown()}")
     if get_gfx() == "gfx1250":
+        test_fused_splitk_whole_row_passes()
         df = pd.DataFrame(
             [
                 test_fused_splitk(block, name, m, n, k)

@@ -36,6 +36,10 @@ MX32_COMPUTE_WMMA_NAME_PREFIX = "flydsl_mxfp8_32_bpreshuffle_compute_wmma"
 _SUPPORTED_NUM_BUFFERS = (2, 3, 4)
 _OUT_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "f16"}
 _MAX_SPLIT_K = 8
+# UNROLL and MAX_PARTIAL_VECTORS of splitk_fused_epilogue_gfx1250, kept here so the
+# tuners can import this module without FlyDSL.
+_FUSED_UNROLL = 32
+_FUSED_MAX_PARTIAL_VECTORS = 128
 
 
 def fused_splitk_ok(
@@ -43,10 +47,19 @@ def fused_splitk_ok(
 ) -> bool:
     """Whether the K splits of a tile can reduce in one cluster (fused split-K).
 
-    The epilogue wraps peer stripes with ``& (split_k - 1)``, so only 2/4/8 splits qualify.
+    The epilogue wraps peer stripes with ``& (split_k - 1)``, so only 2/4/8 splits qualify,
+    and it stores whole passes of ``rows_per_iter * unroll`` rows, so a stripe taller than
+    one row pass must be a whole number of passes.
     """
     waves, lanes_per_row = m_warp * n_warp, tile_n // 4
     rows_per_iter, reduce_m = waves * 32 // lanes_per_row, tile_m // split_k
+    partial_vectors = _FUSED_MAX_PARTIAL_VECTORS // max(1, waves * 32 // 128)
+    unroll = max(
+        1,
+        min(
+            _FUSED_UNROLL, partial_vectors // split_k, reduce_m // max(1, rows_per_iter)
+        ),
+    )
     # The TDM stores of the peer rows (and of the reduced rows past split_k 2)
     # cut their rows evenly over the waves.
     tdm_rows = (tile_m - reduce_m, *(() if split_k == 2 else (reduce_m,)))
@@ -55,7 +68,7 @@ def fused_splitk_ok(
         and tile_m % split_k == 0
         and cluster_m * cluster_n * split_k <= 16
         and waves * 32 % lanes_per_row == 0
-        and (reduce_m < rows_per_iter or reduce_m % rows_per_iter == 0)
+        and (reduce_m < rows_per_iter or reduce_m % (rows_per_iter * unroll) == 0)
         and all(rows % waves == 0 for rows in tdm_rows)
     )
 
