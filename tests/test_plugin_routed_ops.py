@@ -1732,3 +1732,17 @@ def test_the_buffer_free_contracts_resolve_under_torch_ops(op_name):
         f"  registered: {registered}\n"
         f"  contract:   {expected}"
     )
+
+    # Dropping the buffer bumped the op version, so the version a provider may
+    # still serve has to be announced. `status()` is the only place a framework
+    # can read that from.
+    superseded = [
+        entry
+        for entry in plugin.status()["deprecations"]
+        if entry["kind"] == "op-version" and entry["subject"] == op_name
+    ]
+    assert len(superseded) == 1, f"{op_name} does not announce its superseded version"
+    assert (
+        superseded[0]["version"]
+        == plugin.status()["routed_ops"][op_name]["version"] - 1
+    )
