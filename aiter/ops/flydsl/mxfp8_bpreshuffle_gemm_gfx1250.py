@@ -782,13 +782,13 @@ def _run_mxfp8_32_smallm_1x32_gfx1250(
             "[FlyDSL gfx1250 smallm_1x32] x_scale/w_scale must be contiguous"
         )
     if (
-        tile_n not in (32, 128)
+            tile_n not in (32, 64, 128)
         or num_waves not in (1, 2, 4)
         or tile_n // 16 % num_waves
         or split_k not in (1, 2, 4, 8)
     ):
         raise RuntimeError(
-            "[FlyDSL gfx1250 smallm_1x32] tile_n must be 32/128, tile_n/16 "
+                "[FlyDSL gfx1250 smallm_1x32] tile_n must be 32/64/128, tile_n/16 "
             "must be divisible by num_waves 1/2/4, and split_k must be 1/2/4/8"
         )
 
