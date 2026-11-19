@@ -1,38 +1,26 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""All-reduce + residual add + RMSNorm (+ MXFP8) + MoE router + top-k + moe_sorting in one
-persistent kernel over 2, 4 or 8 GPUs (decode steps of tensor-parallel MoE layers).
+"""All-reduce + residual add + RMSNorm (+ MXFP8) + MoE router + top-k + moe_sorting over 2,
+4 or 8 gfx950 GPUs, in one persistent kernel for the decode steps of tensor-parallel MoE
+layers.
 
-One CTA a CU; every CTA is resident (the waits spin). The CTAs take roles by their index and the
-row count:
+Each CU runs one CTA, and all CTAs must be resident. The CTAs have these roles:
 
-- Reduce. One-shot (PROTO 0): every rank pushes its partial rows to every peer; CTA t < rows
-  reduces row t (all rows on every rank). Two-shot (PROTO 1): rank g owns the rows g G to
-  g G + G - 1 (G = ceil(rows / WORLD)); the other ranks push those rows to it, CTA b < G reduces
-  row g G + b and pushes the sum to the peers. Every reduce adds the ranks in rank order in fp32
-  and rounds once to bf16, as the AITER custom all-reduce.
-- Norm. The CTA of a row adds the residual, normalizes (Gemma 1 + w, or w), stores the bf16 row
-  with write-through stores and publishes a tagged ready word, then the new residual and the
-  MXFP8 copy. Two-shot: the CTAs after the owners norm the other ranks' rows as their sums land.
-- Router. Tasks of (16 experts) x (K part) on the last NRC CTAs (TPC tasks a CTA). The weights
-  of the first task are loaded at kernel entry; a task waits for its rows, runs a batched bf16
-  MFMA (a warp a K slice; fp32 weights as three exact bf16 parts), adds the warps in LDS and
-  publishes tagged partial logits.
-- Route. A CTA a routed row (one-shot: the row's CTA; two-shot: the router CTAs): the partial
-  logits in part order (every rank gets the same bits), the scores (sigmoid + bias, or softmax),
-  an optional group limit, the top-k by repeated warp argmax (a lane holds experts lane + 64 j),
-  the weights (renormalized, times the routed scale). One-shot: the picks stay on this rank; two-shot: they go to every rank.
-- Sort. The last CTA: every row's picks -> top-k ids / weights and the moe_sorting outputs, the
-  tokens of each expert in ascending order (LDS bitmaps, popcount ranks).
-- The router CTAs zero moe_buf.
+- Reduce and norm. One-shot (PROTO 0): each rank pushes all its rows to each peer, and CTA t
+  adds the ranks of row t. Two-shot (PROTO 1): rank g owns G = ceil(rows / WORLD) rows. CTA
+  b < G adds the ranks of one owner row and pushes the sum to the peers. Other CTAs norm the
+  rows of the other ranks when their sums arrive.
+- Router. The last NRC CTAs run the router tasks (16 experts x one K part) with bf16 MFMA.
+  The fp32 weights are three exact bf16 parts.
+- Route. One CTA for each routed row adds the partial logits in part order and selects the
+  top-k experts and their weights.
+- Sort. The last CTA writes the top-k outputs and the moe_sorting outputs.
+- The router CTAs also zero moe_buf.
 
-Bulk data between GPUs goes through Lamport inboxes: 0xFFFF marks an empty 16-bit word, a sender
-writes the NaN 0x7FFF in its place, the reader writes 0xFFFF back; two halves by the parity of
-the launch colour. Small hand-offs are tagged 8-byte words ((colour + 1) << 32 | value). Each CTA
-keeps its own launch colour. Every wait has a time limit; a wait that times out writes an error
-record [1, rank, colour, site] into the buffer of every rank, and every waiter that sees it gives
-up."""
+The rows go between GPUs through Lamport inboxes (0xFFFF is empty). Small hand-offs are
+tagged 8-byte words. A wait that times out writes an error record to the buffer of each
+rank."""
 
 import triton
 from triton.experimental import gluon
@@ -607,15 +595,11 @@ def _all_reduce_rmsnorm_moe_route_kernel(
     SCL: gl.constexpr,
     SCP: gl.constexpr,
 ):
-    """inp, res, res_out, xn: [rows, HIDDEN] bf16 as int32. norm_w: [HIDDEN] bf16 as int32.
-    router_w: [E, HIDDEN] fp32 (WFP32) or bf16. bias: [E] fp32. xq: [rows, HIDDEN] e4m3 as
-    int32, xs: [rows, HIDDEN / 32] uint8. topk_ids, topk_w: [rows, TOPK] int32 / fp32. sorted_*,
-    num_valid: the moe_sorting outputs (block SBLK). moe_buf: [rows, HIDDEN] bf16 as int32.
-    scratch: int64 words (ready words at SCX, partial logits at SCL [KP][RMAXL][E], one-shot
-    picks at SCP [SMAX][2 TOPK]). colors: [BLOCKS] int32. peers: the WORLD IPC buffer addresses
-    of ranks rank, rank + 1, ...: error record, one-shot inbox at byte OS0 [2][WORLD][S1MAX]
-    [HIDDEN] bf16, reduce-scatter inbox at RS0 and all-gather inbox at AG0 [2][WORLD][GMAX]
-    [HIDDEN], picks at PK0 (int64 words) [2][SMAX][2 TOPK]."""
+    """inp, res, res_out, xn, moe_buf: [rows, HIDDEN] bf16 as int32. xq: e4m3 as int32. xs:
+    [rows, HIDDEN / 32] uint8. scratch: int64 words: ready words at SCX, partial logits at SCL
+    and one-shot picks at SCP. peers: the IPC buffers of ranks rank, rank + 1, ...: the
+    one-shot inbox at byte OS0, the reduce-scatter and all-gather inboxes at RS0 and AG0, and
+    the picks at PK0."""
     W: gl.constexpr = gl.num_warps()
     T: gl.constexpr = 64 * W
     NV: gl.constexpr = HIDDEN // 8

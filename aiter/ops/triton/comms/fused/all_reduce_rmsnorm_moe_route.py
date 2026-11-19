@@ -79,32 +79,26 @@ def _lds_bytes(c, tokens):
 class AllReduceRmsnormMoeRoute(IpcCommBuffers):
     """
     The IPC buffers, scratch and launch colours of ``fused_all_reduce_rmsnorm_moe_route``
-    for one group of 2, 4 or 8 ranks on gfx950, for one model shape.
-
-    Each rank has one uncached IPC buffer: an error record, the one-shot inbox, the
-    reduce-scatter and all-gather inboxes (2 halves each, for odd and even launches) and the
-    exchange of the top-k picks. The constructor, ``reset`` and ``close`` are collective: all
-    ranks of the group must call them. Call ``reset`` after a wait timed out and at least
-    once every 2^31 launches. The error sites of ``error()`` are 1 (reduce), 2 (all-gather),
-    3 (router), 4 (route) and 5 (sort).
-
-    The kernel must fit in the 160 KiB of LDS of a CU for each token count up to max_tokens.
-    The constructor rejects the other shapes. Many experts, a large topk and a large max_tokens
-    increase the LDS.
+    for one group of 2, 4 or 8 ranks on gfx950 and one model shape. The buffer of a rank
+    holds the error record, the inboxes and the top-k picks. The constructor, ``reset`` and
+    ``close`` are collective. Call ``reset`` after a wait timed out and at least once every
+    2^31 launches. Error sites: 1 (reduce), 2 (all-gather), 3 (router), 4 (route), 5 (sort).
+    The constructor rejects a shape that needs more than the 160 KiB of LDS of a CU.
 
     Args:
         group: The CPU (gloo) process group of the ranks.
-        max_tokens (int): The largest number of tokens of a call, at most 512. Each row
-            of a call's power-of-2 routed bucket takes one CTA, and one CTA must stay
-            free: with 2 ranks and 256 CTAs, max_tokens is at most 256.
+        max_tokens (int): The most tokens of a call, at most 512. Each row of the routed
+            power-of-2 bucket of a call needs one CTA, and one more CTA must be free. For
+            example, with 2 ranks and 256 CTAs, max_tokens is at most 256.
         hidden (int): The number of bf16 values in a row.
         num_experts (int): The number of routed experts.
         topk (int): The experts of a token.
         router_fp32 (bool): The router weights are fp32 (else bf16).
         timeout_s (float): The time limit of each wait in the kernel.
-        config (dict, optional): Values that replace the values of the JSON config, for
-            example to sweep them in the benchmark. The keys are BLOCKS, num_warps,
-            ONESHOT_MAX_ROWS, ONESHOT_MAX_BYTES, ROUTER_STEPS_FP32 and ROUTER_STEPS_BF16.
+        config (dict, optional): Values that replace the values of the JSON config
+            (BLOCKS, num_warps, ONESHOT_MAX_ROWS, ONESHOT_MAX_BYTES, ROUTER_STEPS_FP32,
+            ROUTER_STEPS_BF16), for example in a benchmark sweep. An unknown key is an
+            error.
     """
 
     def __init__(
@@ -275,24 +269,19 @@ def fused_all_reduce_rmsnorm_moe_route(
     out: dict | None = None,
 ) -> dict:
     """
-    Returns the MoE inputs of a tensor-parallel decode step with one kernel launch: the
-    all-reduce of the partial sums x over the ranks of ``comm``, the residual add, the RMSNorm
-    (and its MXFP8 copy), the router logits, the top-k experts and AITER moe_sorting's outputs.
-    All ranks get the same bits.
+    Returns the MoE inputs of a tensor-parallel decode step in one launch: the all-reduce
+    of x over the ranks of ``comm``, the residual add, the RMSNorm and its MXFP8 copy, the
+    router logits, the top-k experts and the moe_sorting outputs. All ranks get the same
+    bits.
 
-    The all-reduce adds the ranks in rank order in fp32 and rounds once to bf16, as the
-    AITER custom all-reduce does. Then s = h + residual (fp32), residual_out = bf16(s),
-    normed = bf16(s * rstd * w'), w' = 1 + weight (gemma) or weight, rstd = 1 /
-    sqrt(mean(s^2) + eps). The E8M0 scale of the MXFP8 copy for a group of 32 values is
-    ``mx_e8m0_scale(amax, 8)``, as in the other AITER MXFP8 ops. The logits are normed @
-    router_weight^T with fp32 accumulation (fp32 weights as three exact bf16 parts). The
-    selection value is sigmoid(logit) + bias, or the logit (softmax); with num_expert_group
-    > 1, only the topk_group best groups (by the sum of their 2 best values with a bias,
-    else their best value) are candidates. Ties go to the lower expert. The weights are the
-    sigmoids (or the softmax over all experts), divided by their sum over the top-k when
-    renormalize, times routed_scaling_factor. sorted_ids hold (slot << 24) | token with each
-    expert's tokens in ascending order, padded to block_size with (topk << 24) | tokens and
-    weight 0; experts with no token get no block.
+    The all-reduce adds the ranks in rank order in fp32 and rounds once to bf16. Then s = h
+    + residual, residual_out = bf16(s) and normed = bf16(s * rstd * w'), with w' = 1 +
+    weight (gemma) or weight. The E8M0 scale of a group of 32 is ``mx_e8m0_scale(amax, 8)``.
+    The logits have fp32 accumulation. The selection value is sigmoid(logit) + bias, or the
+    logit (softmax). With num_expert_group > 1, only the topk_group best groups are
+    candidates (a group's score is the sum of its 2 best values with a bias, else its best
+    value). Ties go to the lower expert. The weights are the sigmoids (or the softmax over
+    all experts), divided by their sum when renormalize, times routed_scaling_factor.
 
     All ranks must make the same calls in the same order. HIP graphs are supported.
 
@@ -319,17 +308,16 @@ def fused_all_reduce_rmsnorm_moe_route(
         out (dict, optional): Output tensors to write into, by the names below.
 
     Returns:
-        dict: normed [tokens, hidden] bf16, residual_out [tokens, hidden] bf16, x_q
-        [tokens, hidden] float8_e4m3fn and x_scale [tokens, hidden / 32] uint8 (when quant),
-        topk_ids [tokens, topk] int32, topk_weights [tokens, topk] fp32, sorted_ids,
-        sorted_weights, sorted_expert_ids, num_valid_ids (int32 [2]: padded rows, tokens) and
-        moe_buf, as aiter.moe_sorting returns them. Every rank gets all rows.
+        dict: normed and residual_out [tokens, hidden] bf16, x_q [tokens, hidden]
+        float8_e4m3fn and x_scale [tokens, hidden / 32] uint8 (when quant), topk_ids
+        [tokens, topk] int32, topk_weights [tokens, topk] fp32, and sorted_ids,
+        sorted_weights, sorted_expert_ids, num_valid_ids and moe_buf as aiter.moe_sorting
+        returns them. Each rank gets all rows.
 
-    Limits: gfx950, 2, 4 or 8 ranks, hidden a multiple of 64 up to 8192, experts a multiple of
-    16 up to 2048, topk up to 64, tokens 1 to comm.max_tokens (at most 512). The kernel must
-    fit in the LDS of a CU: ``AllReduceRmsnormMoeRoute`` rejects the shapes that do not fit.
-    All CTAs of the launch must run at the same time. If a wait times out, the outputs are
-    wrong and ``comm.error()`` is not 0. Then call ``comm.reset()`` on all ranks.
+    Limits: gfx950, 2, 4 or 8 ranks, hidden a multiple of 64 up to 8192, experts a multiple
+    of 16 up to 2048, topk up to 64, tokens 1 to comm.max_tokens. All CTAs of the launch
+    must run at the same time. If a wait times out, the outputs are wrong and
+    ``comm.error()`` is not 0. Then call ``comm.reset()`` on all ranks.
     """
     tokens, hidden = x.shape
     e, k = comm.num_experts, comm.topk
