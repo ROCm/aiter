@@ -52,7 +52,7 @@ def shuffle_weight(
     On gfx1250 the WMMA TDM layout (``_shuffle_weight_gfx1250``) is used; on every
     other arch this delegates to the base ``aiter.ops.shuffle.shuffle_weight``.
     """
-    if (arch or get_arch()) == "gfx1250":
+    if (arch or get_arch()) in ("gfx1250", "gfx1250-strict"):
         if use_int4 or is_guinterleave or gate_up or pad_k_to:
             raise NotImplementedError(
                 "shuffle_weight on gfx1250 does not support use_int4 / is_guinterleave / gate_up / pad_k_to "
@@ -238,7 +238,7 @@ def shuffle_scale_gemm(
     gfx950: preshuffle_factor = 32, scale_kwidth = 8
     gfx1250: preshuffle_factor = 16, scale_kwidth = 4
     """
-    if (arch or get_arch()) == "gfx1250":
+    if (arch or get_arch()) in ("gfx1250", "gfx1250-strict"):
         return _shuffle_scale_tile_gfx1250(scales, preshuffle_factor, scale_kwidth)
 
     if (arch or get_arch()) == "gfx950":
@@ -248,7 +248,7 @@ def shuffle_scale_gemm(
 
 def unshuffle_scale_gemm(scales_shuffled: torch.Tensor, arch=None) -> torch.Tensor:
     """Inverse of ``shuffle_scale_gemm`` (gfx950 layout). gfx1250 has no consumer."""
-    if (arch or get_arch()) == "gfx1250":
+    if (arch or get_arch()) in ("gfx1250", "gfx1250-strict"):
         raise NotImplementedError("unshuffle_scale_gemm is not implemented for gfx1250")
     scales = scales_shuffled.clone()
     sm, sn = scales.shape
@@ -283,7 +283,7 @@ def shuffle_scale_moe(
     arch check of their own.
     """
     arch = arch or get_arch()
-    if arch == "gfx1250":
+    if arch in ("gfx1250", "gfx1250-strict"):
         tiled = _shuffle_scale_tile_gfx1250(
             data.transpose(-1, -2), preshuffle_factor, scale_kwidth
         )
@@ -300,7 +300,9 @@ def shuffle_scale_moe(
 
 
 # --- batched scales (FP4 blockscale16, attention) ---
-def shuffle_scale_batched(data: torch.Tensor, scale_k_width=None) -> torch.Tensor:
+def shuffle_scale_batched(
+    data: torch.Tensor, scale_k_width=None, preshuffle_factor=128
+) -> torch.Tensor:
     """Batched shuffle scales for the FP4 blockscale16 format.
 
     Single-layout permute, no arch branch: the blockscale16 layout is
@@ -311,7 +313,8 @@ def shuffle_scale_batched(data: torch.Tensor, scale_k_width=None) -> torch.Tenso
     data_shape = data.shape
     N = data_shape[-2]
     SCALE_K = data_shape[-1]
-    PRESHUFFLE_FACTOR = 128
+    # rows per preshuffle group: 128, or a smaller page (64-token NVFP4 KV pages)
+    PRESHUFFLE_FACTOR = preshuffle_factor
     if scale_k_width is None:
         SCALE_KWIDTH = (
             min(16, 1 << (SCALE_K - 1).bit_length()) if SCALE_K >= 4 else SCALE_K

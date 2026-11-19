@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import math
 import os
 import shutil
 import sys
@@ -9,14 +10,19 @@ import tempfile
 import time
 from abc import abstractmethod
 from operator import itemgetter
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pandas as pd
 import torch
 
 from aiter import dtypes, logger
-from aiter.jit.utils.chip_info import get_gfx_runtime as _chip_get_gfx
-from aiter.jit.utils.chip_info import gfx_from_cu_num
+from aiter.jit.core import model_config_files
+from aiter.jit.utils import chip_info
+from aiter.utility import dispatch_verification
+from aiter.utility.selection_policy import LATENCY, make_policy, use_policy
+
+_REPOSITORY_ROOT = str(Path(__file__).resolve().parents[2])
 
 INVALID_TIME = -1
 
@@ -29,12 +35,57 @@ def _read_csv(filepath, **kwargs):
     kwargs.setdefault("dtype", {"_tag": str})
     df = pd.read_csv(filepath, **kwargs)
     df.columns = df.columns.str.strip()
-    df = df.loc[:, ~df.columns.str.startswith("Unnamed:")]
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed:")].copy()
     str_cols = df.select_dtypes(include=["object"]).columns
     for col in str_cols:
         df[col] = df[col].apply(lambda v: v.strip() if isinstance(v, str) else v)
     df.dropna(how="all", inplace=True)
     return df
+
+
+def _write_csv_atomic(df, filepath, **kwargs):
+    """Atomically replace filepath, so inference never reads a truncated CSV.
+
+    Keeps the old file's mode (mkstemp alone would leave it 0600) and writes
+    through a symlink rather than replacing it.
+    """
+    filepath = os.path.realpath(filepath)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(filepath),
+        prefix=f".{os.path.basename(filepath)}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", newline="") as f:
+            df.to_csv(f, **kwargs)
+        if os.path.exists(filepath):
+            shutil.copymode(filepath, tmp_path)
+        else:
+            os.chmod(tmp_path, 0o666 & ~_current_umask())
+        os.replace(tmp_path, filepath)
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def _current_umask():
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+def _key_text(value):
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return str(value).strip()
+
+
+def _improvement_pct(text):
+    value = float(text)
+    if not 0.0 <= value < 100.0:
+        raise argparse.ArgumentTypeError(f"must be in [0, 100), got {text}")
+    return value
 
 
 class TunerCommon:
@@ -74,6 +125,15 @@ class TunerCommon:
         torch.float8_e4m3fnuz: 1,
         torch.float8_e4m3fn: 1,
     }
+    # Opt in per tuner. A tuner that only ranks by latency must not stamp
+    # select=power, including ones whose post-pass keeps a kernel for its speed.
+    SUPPORTS_POWER_SELECT = False
+    # Every latency-or-power decision goes through this. ``--select`` sets it.
+    policy = LATENCY
+    # Columns that count as a real package-power measurement. MoE's tuned row
+    # uses ``watts`` (the stage-energy mean); stage columns stay on the profile.
+    POWER_WATT_COLUMNS = ("watts",)
+
     INVALID_TIME = -1  # op not support or error
 
     INF_TIME = float("inf")  # op time is too large
@@ -230,7 +290,7 @@ class TunerCommon:
             "--compare",
             action="store_true",
             required=False,
-            help="Run production-op benchmark before and after tuning, print compare results, and keep a compare candidate CSV.",
+            help="Run production-op benchmark before and after tuning, print compare results, and keep a compare candidate CSV. The report compares latency (e2e us) only.",
         )
         self.parser.add_argument(
             "--update_improved",
@@ -241,15 +301,211 @@ class TunerCommon:
         self.parser.add_argument(
             "--min_improvement_pct",
             dest="min_improvement_pct",
-            type=float,
+            type=_improvement_pct,
             default=defaults.get("min_improvement_pct", 3.0),
             help="With --compare --update_improved, update tuned CSV only when a valid pre/post benchmark shows at least this percent improvement. Shapes with no valid pre-run baseline but passing post-run are still allowed to update.",
         )
+        self.parser.add_argument(
+            "--select",
+            default="latency",
+            help="How to pick the winner among kernels that pass errRatio. "
+            "'latency' (default) keeps the lowest us. "
+            "'power' (experimental; aliases: efficiency, power_efficiency) "
+            "ranks by package energy (us * PPT watts), measured from the GPU PPT "
+            "sysfs node (power1_input) over AITER_POWER_WINDOW_S seconds "
+            "(default 0.4) while the kernel launches back to back, on the "
+            "accurate pass only. It adds no latency "
+            "bound, and the score is an isolated replay under the clock and "
+            "power cap in effect, so the winner can change in another model "
+            "or power-management state. AITER_SELECT does not set this; it "
+            "only picks the tables dispatch loads at runtime. "
+            "PPT is the whole package, so the GPU should otherwise be idle. "
+            "Use --shape_grouped so every candidate for a shape is measured "
+            "on the same GPU. AITER_POWER_PATH overrides the hwmon file; "
+            "with more than one process it must contain {device}. "
+            "Each power row records select, perf_level, power_cap_w, and "
+            "sclk_max_mhz. When -o is a shipped table under aiter/configs/, "
+            "a power tune writes to aiter/configs/power_configs/ instead. "
+            "The fused-MoE tuner writes every surviving pair, ranked, to "
+            "--profile_file (-o2). In power mode that file is "
+            "<tune_file>.ranked.csv when -o2 is omitted.",
+        )
+
+    def _apply_select(self, args):
+        from aiter.utility.tune_result import normalize_select
+
+        select = normalize_select(getattr(args, "select", None))
+        if select not in ("latency", "power"):
+            self.parser.error(
+                f"unknown --select {getattr(args, 'select', None)!r}; use latency or power"
+            )
+        args.select = select
+        self.policy = make_policy(select)
+        if select == "power":
+            if not self.SUPPORTS_POWER_SELECT:
+                self.parser.error(
+                    f"--select power is not supported by {type(self).__name__}"
+                )
+            if getattr(args, "compare", False) and getattr(
+                args, "update_improved", False
+            ):
+                self.parser.error(
+                    "--compare --update_improved gates on latency only and "
+                    "cannot be combined with --select power"
+                )
+            self._redirect_power_output(args)
+        return select
+
+    def policy_for(self, args):
+        """The selection policy for this call; ``args.select`` wins when present."""
+        select = getattr(args, "select", None)
+        return self.policy if select is None else make_policy(select)
+
+    def _redirect_power_output(self, args):
+        """Send a power tune of a shipped table to aiter/configs/power_configs/.
+
+        Writing power rows into a shipped latency table would make the
+        model_configs/ shape merge rank one against the other. Any ``-o``
+        under ``aiter/configs/``, including an explicit ``model_configs/``
+        path, is redirected. A path outside that tree is left alone.
+        """
+        from aiter.jit.core import AITER_ROOT_DIR
+        from aiter.utility.tune_result import POWER_CONFIG_DIRNAME
+
+        tune_file = getattr(args, "tune_file", None)
+        if not tune_file:
+            return
+        first = os.path.abspath(self.get_out_file(tune_file))
+        configs_dir = os.path.abspath(os.path.join(AITER_ROOT_DIR, "aiter", "configs"))
+        power_dir = os.path.join(configs_dir, POWER_CONFIG_DIRNAME)
+        try:
+            shipped = os.path.commonpath([first, configs_dir]) == configs_dir
+        except ValueError:
+            shipped = False
+        if not shipped or os.path.dirname(first) == power_dir:
+            return
+        os.makedirs(power_dir, exist_ok=True)
+        args.tune_file = os.path.join(power_dir, os.path.basename(first))
+        logger.info(
+            f"select=power: writing to {args.tune_file} instead of the shipped "
+            f"table {first}. Load it with AITER_SELECT=power or the op's "
+            "AITER_CONFIG_* variable."
+        )
+
+    def power_metrics(self, df):
+        """Add ``tflops_per_w`` when both inputs exist and the column is absent.
+
+        MoE writes the column from stage energy (``us1*watts1 + us2*watts2``)
+        before this runs. Recomputing ``tflops / watts`` there would replace
+        that pair formula, so an existing column is kept.
+        """
+        if (
+            not isinstance(df, pd.DataFrame)
+            or df.empty
+            or "tflops_per_w" in df.columns
+            or not {"tflops", "watts"} <= set(df.columns)
+        ):
+            return df
+        import math
+
+        def positive(value) -> float | None:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return None
+            if math.isfinite(number) and number > 0:
+                return number
+            return None
+
+        df = df.copy()
+        tflops = pd.to_numeric(df["tflops"], errors="coerce")
+        watts = pd.to_numeric(df["watts"], errors="coerce")
+        per_w = []
+        for tflops_f, watts_f in zip(tflops, watts):
+            tflops_n = positive(tflops_f)
+            watts_n = positive(watts_f)
+            if tflops_n is None or watts_n is None:
+                per_w.append(float("nan"))
+            else:
+                per_w.append(round(tflops_n / watts_n, 6))
+        df["tflops_per_w"] = per_w
+        return df
+
+    def _rows_with_finite_watts(self, df):
+        import math
+
+        def finite_positive(value) -> bool:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return False
+            return math.isfinite(number) and number > 0
+
+        measured = pd.Series(False, index=df.index)
+        for column in self.POWER_WATT_COLUMNS:
+            if column not in df.columns:
+                continue
+            values = pd.to_numeric(df[column], errors="coerce")
+            measured = measured | values.map(finite_positive)
+        return measured
+
+    def _stamp_power_rows(self, results, args):
+        """Keep only rows whose power was measured and record their conditions.
+
+        A shape whose watts are missing was ranked by latency. Writing it to
+        ``power_configs/`` would let that latency pick override the shipped
+        row under ``AITER_SELECT=power``, so it is dropped and stays untuned
+        for the next power tune.
+        """
+        from aiter.utility.tune_result import POWER_ROW_COLUMNS, SELECT_COLUMN
+
+        if (
+            not isinstance(results, pd.DataFrame)
+            or not self.policy_for(args).measures_power
+        ):
+            return results
+        results = self.power_metrics(results)
+        measured = self._rows_with_finite_watts(results)
+        if not bool(measured.all()):
+            keys = [k for k in self.keys if k in results.columns]
+            skipped = results.loc[~measured, keys].to_dict("records")
+            logger.warning(
+                f"select=power: no finite package watts for {len(skipped)} "
+                f"shape(s); not writing them, so they stay untuned: {skipped}"
+            )
+            results = results[measured]
+        if results.empty:
+            return results
+        conditions = getattr(self, "_power_conditions", None)
+        if conditions is None:
+            from aiter.utility.package_power import tune_conditions
+
+            gpu_num = torch.cuda.device_count()
+            mp_num = int(getattr(args, "mp", gpu_num) or gpu_num)
+            if mp_num < 1 or mp_num > gpu_num:
+                mp_num = gpu_num
+            conditions = tune_conditions(range(mp_num))
+            self._power_conditions = conditions
+            logger.info(f"select=power: tune conditions {conditions}")
+        results = results.copy()
+        results[SELECT_COLUMN] = "power"
+        for name, value in conditions.items():
+            results[name] = value
+        # watts / tflops_per_w are power-tune columns. They stay off the
+        # latency CSV schema, which is the column list a latency tune writes.
+        power_columns = ("watts", "tflops_per_w") + POWER_ROW_COLUMNS
+        missing = [
+            c for c in power_columns if c in results.columns and c not in self.columns
+        ]
+        if missing:
+            self.columns = list(self.columns) + missing
+        return results
 
     def parse_args(self):
         args = self.parser.parse_args()
         if args.update_improved and not args.compare:
             self.parser.error("--update_improved requires --compare")
+        self._apply_select(args)
         return args
 
     @abstractmethod
@@ -313,7 +569,7 @@ class TunerCommon:
             merge_df["_tag"] = merge_df["_tag"].fillna("")
             dedup_keys = self.keys + ["_tag"]
         merge_df = (
-            merge_df.sort_values("us")
+            self.policy.sort_frame(merge_df)
             .drop_duplicates(subset=dedup_keys, keep="first")
             .reset_index(drop=True)
         )
@@ -322,11 +578,56 @@ class TunerCommon:
         merge_df.to_csv(new_file_path, index=False)
         return new_file_path
 
+    # Columns of an untuned shape list that name a quantization dtype.
+    _QUANT_DTYPE_COLS: ClassVar[tuple[str, ...]] = ("q_dtype_a", "q_dtype_w")
+
+    @staticmethod
+    def _resolve_fp8_name(value):
+        """Map a 'torch.float8_e4m3*' cell onto the arch-native e4m3 encoding.
+
+        Only one e4m3 encoding exists per chip (gfx942 e4m3fnuz, gfx950 OCP
+        e4m3fn), so a shape list naming the other one describes an unrunnable
+        configuration rather than a distinct problem; left alone it aborts with
+        "Unsupported dtype" or is silently skipped by the tuners that require
+        q_dtype_w == dtypes.fp8.
+
+        Resolved by name lookup rather than eval(): these cells come from CSV
+        files whose path is caller-supplied, and eval() would turn the tuner
+        into a code-execution sink. Anything that is not a recognised e4m3
+        dtype name is returned untouched.
+        """
+        if not isinstance(value, str):
+            return value
+        name = value.strip()
+        if not name.startswith("torch.float8_e4m3"):
+            return value
+        dtype = getattr(torch, name[len("torch.") :], None)
+        if dtype is None:
+            return value
+        return str(dtypes.normalize_fp8_dtype(dtype))
+
+    def _normalize_fp8_columns(self, untunedf):
+        """Resolve the fp8 flavor of every quant-dtype column in a shape list.
+
+        Applied on ingest, in the shared loader, so that every tuner family
+        benefits -- a8w8, a8w8_bpreshuffle, blockscale, batched and fmoe alike.
+        Normalizing here rather than at point of use also keeps the shape keys,
+        the tuned rows we emit and the tuner's own tuned/untuned bookkeeping all
+        agreeing on one dtype; applied late, a tuned row lands as e4m3fnuz while
+        the untuned frame still says e4m3fn and the shape is reported as never
+        tuned.
+        """
+        for col in self._QUANT_DTYPE_COLS:
+            if col in untunedf.columns:
+                untunedf[col] = untunedf[col].map(self._resolve_fp8_name)
+        return untunedf
+
     def get_untuned_gemm_list(self, untuned_gemm_file):
         assert os.path.exists(
             untuned_gemm_file
         ), f"Not exist untuned file: {untuned_gemm_file}"
         untunedf = _read_csv(untuned_gemm_file)
+        untunedf = self._normalize_fp8_columns(untunedf)
         filtered_df = untunedf.drop_duplicates().reset_index(drop=True)
         return filtered_df
 
@@ -370,7 +671,7 @@ class TunerCommon:
             if missing.any():
                 if "cu_num" in tunedf:
                     tunedf.loc[missing, "gfx"] = tunedf.loc[missing, "cu_num"].map(
-                        gfx_from_cu_num
+                        chip_info.gfx_from_cu_num
                     )
                 else:
                     tunedf.loc[missing, "gfx"] = self.get_gfx()
@@ -437,6 +738,16 @@ class TunerCommon:
         if df_updates.empty:
             return df_old
         key_columns = self.keys
+        from aiter.utility.tune_result import POWER_ROW_COLUMNS
+
+        # Power columns exist only on power-tuned rows; a latency result frame
+        # without them stays valid.
+        optional = ("watts", "tflops_per_w") + POWER_ROW_COLUMNS
+        missing = [
+            c for c in self.columns if c in optional and c not in df_updates.columns
+        ]
+        if missing:
+            df_updates = df_updates.assign(**{c: pd.NA for c in missing})
         df_updates = df_updates.loc[:, self.columns]
         # Backfill columns present in the new results but missing from a legacy
         # tuned CSV (for example a newly added gfx key column), so that the
@@ -510,7 +821,7 @@ class TunerCommon:
             tunedf["_tag"] = tunedf["_tag"].fillna("")
             dedup_keys = self.keys + ["_tag"]
         tunedf = self._drop_superseded_rows(tunedf, dedup_keys)
-        tunedf.to_csv(tune_file, index=False)
+        _write_csv_atomic(tunedf, tune_file, index=False)
 
     def _drop_superseded_rows(
         self, tunedf: "pd.DataFrame", dedup_keys: "list[str]"
@@ -525,15 +836,21 @@ class TunerCommon:
         return cu_num
 
     def get_gfx(self):
-        return _chip_get_gfx()
+        return chip_info.get_gfx_runtime()
 
     def post_process(self, rets, args, topk=-1, fast_mode=False):
         """post process, post process all results to return topk results"""
+        from aiter.utility.tune_result import TuneResult
+
         rets = list(rets)
+        policy = self.policy_for(args)
         if args.profile_file != "":
             if args.verbose:
                 logger.info(f"saving profile to {args.profile_file}")
-            profiledf = self.result_to_df(sorted(rets, key=itemgetter(0)))
+            profile_rets = sorted(rets, key=itemgetter(0))
+            profiledf = self.power_metrics(
+                policy.attach_columns(self.result_to_df(profile_rets), profile_rets)
+            )
             if os.path.exists(args.profile_file):
                 old_df = _read_csv(args.profile_file)
             else:
@@ -548,20 +865,27 @@ class TunerCommon:
         grouped_rets = defaultdict(list)
         bestConfigs = []
 
-        for info, us, max_err_ratio in rets:
-            grouped_rets[info[0]].append((info[1:], us, max_err_ratio))
+        for el in rets:
+            info, us, max_err_ratio = el
+            watts = getattr(el, "watts", float("nan"))
+            grouped_rets[info[0]].append((info[1:], us, max_err_ratio, watts))
 
         grouped_results = list(grouped_rets.items())
 
         for info_key, time_list in grouped_results:
             tol_err_ratio = args.errRatio
-            sorted_time = sorted(time_list, key=lambda x: x[1])
+            # Drop invalid candidates before sorting: a NaN timing makes every
+            # comparison False, so sorting first leaves the list out of order.
+            valid_time = [
+                (info_ex, us, max_err_ratio, watts)
+                for info_ex, us, max_err_ratio, watts in time_list
+                if max_err_ratio <= tol_err_ratio and math.isfinite(us) and us > 0
+            ]
             filtered_time = [
-                (info_ex, round(us, 4), max_err_ratio)
-                for info_ex, us, max_err_ratio in sorted_time
-                if max_err_ratio <= tol_err_ratio
-                and us != self.INVALID_TIME
-                and us != self.INF_TIME
+                (info_ex, round(us, 4), max_err_ratio, watts)
+                for info_ex, us, max_err_ratio, watts in sorted(
+                    valid_time, key=lambda x: policy.rank(x[1], x[3])
+                )
             ]
             if len(filtered_time) == 0:
                 logger.error(
@@ -573,14 +897,16 @@ class TunerCommon:
                 print(f"choose {effective_topk} kernels")
             self.topk = effective_topk
             best_config = [
-                ((info_key, *info_ex), us, max_err_ratio)
-                for info_ex, us, max_err_ratio in filtered_time[0:effective_topk]
+                TuneResult((info_key, *info_ex), us, max_err_ratio, watts)
+                for info_ex, us, max_err_ratio, watts in filtered_time[0:effective_topk]
             ]
             if not best_config:
                 logger.info(f"No kernel can be used for {info_key}")
-                best_config = [((info_key, *sorted_time[0][0]), self.INVALID_TIME, 1.0)]
+                best_config = [
+                    TuneResult((info_key, *time_list[0][0]), self.INVALID_TIME, 1.0)
+                ]
             bestConfigs.extend(best_config)
-        resultdf = self.result_to_df(bestConfigs)
+        resultdf = policy.attach_columns(self.result_to_df(bestConfigs), bestConfigs)
         return resultdf
 
     def _summary_shape_keys(self) -> "list[str]":
@@ -626,13 +952,166 @@ class TunerCommon:
     def update_tflops_bw(self, tune_file):
         """update tflops and bw from old tune_file"""
 
+    # Fresh-process dispatch verification (aiter/utility/dispatch_verification.py):
+    # a family opts in by naming the module that runs run_selection_probe.
+    SELECTION_PROBE_MODULE: ClassVar[str | None] = None
+    SELECTION_FAMILY: ClassVar[str | None] = None
+    # --compare also times auto-select (the shape with no row) for shapes that
+    # have a row, and removes a row auto-select beats.
+    COMPARE_AUTOSELECT: ClassVar[bool] = False
+    _substituted_config: str | None = None
+
+    def lookup_key(self, row) -> tuple:
+        """The key a tuned row is found by. Override to canonicalize."""
+        return tuple(_key_text(row[key]) for key in self.keys)
+
+    def stale_reason(self, row) -> str:
+        """Why dispatch no longer honours a tuned row, or "" if it does. A
+        stale row does not count as tuned, so a plain run retunes its shape."""
+        return ""
+
+    def current_rows(self, tunedf):
+        """``tunedf`` without the rows ``stale_reason`` rejects."""
+        if tunedf is None or tunedf.empty:
+            return tunedf
+        reasons = [self.stale_reason(row) for _, row in tunedf.iterrows()]
+        for (_, row), reason in zip(tunedf.iterrows(), reasons):
+            if reason:
+                logger.warning(
+                    f"tuned row for {self.lookup_key(row)} is stale, retuning: {reason}"
+                )
+        return tunedf[[not reason for reason in reasons]]
+
+    def expected_selection(self, row) -> dict[str, Any] | None:
+        """What a fresh process must record for ``row``; None verifies only
+        that the operator runs correctly, as ``unchecked``."""
+        return None
+
+    def verify_dispatch(self, row, config_file, args):
+        """Run ``row`` with ``config_file`` in a fresh process and time it,
+        checking it dispatches as ``expected_selection`` says when that names
+        a selection; None keeps the caller's config."""
+        if self.SELECTION_PROBE_MODULE is None:
+            raise NotImplementedError(f"{self.name} has no selection probe")
+        probe_row = {
+            str(key): value.item() if hasattr(value, "item") else value
+            for key, value in row.items()
+            if pd.notna(value)
+        }
+        expected = self.expected_selection(row)
+        mismatch = self._hardware_mismatch(probe_row)
+        if mismatch:
+            return dispatch_verification.DispatchVerification(
+                "failed", expected, [], None, mismatch, 0.0
+            )
+        return dispatch_verification.verify_dispatch(
+            family=self.SELECTION_FAMILY or self.name,
+            probe_module=self.SELECTION_PROBE_MODULE,
+            row=probe_row,
+            expected=expected,
+            config_env=self.get_arg_defaults().get("config_env_name"),
+            config_file=self._with_model_configs(config_file),
+            warmup=args.warmup,
+            iters=args.iters,
+            timeout=args.timeout,
+            repository_root=_REPOSITORY_ROOT,
+        )
+
+    def _with_model_configs(self, config_file):
+        """``config_file`` plus the model_configs CSVs serving merges with the
+        family's default table, so a duplicate shape fails here as it would
+        there. Only a table the tuner wrote and times itself stands in for the
+        default table; a file the user names, in the config variable or with
+        ``--run_config``, is read as given, as serving reads it."""
+        default = self.ARG_DEFAULTS.get("tune_file", "")
+        name = os.path.splitext(os.path.basename(default))[0]
+        if not config_file or not name or config_file != self._substituted_config:
+            return config_file
+        own = os.path.realpath(config_file)
+        extra = [p for p in model_config_files(name) if os.path.realpath(p) != own]
+        return os.pathsep.join([config_file, *extra])
+
+    def _live_hardware(self):
+        return {
+            "gfx": self.get_gfx,
+            "cu_num": self.get_cu_num,
+        }
+
+    def _hardware_mismatch(self, row) -> str:
+        """Why ``row`` cannot be verified here, or "": the child keys on its own
+        device, as serving does, so a row keyed on other hardware would miss."""
+        for field, resolve in self._live_hardware().items():
+            value = row.get(field)
+            if value is None or str(value).strip() == "":
+                continue
+            live = resolve()
+            if _key_text(value).lower() != _key_text(live).lower():
+                return f"row is keyed on {field}={value}, this GPU is {live}"
+        return ""
+
     def run_config(self, args):
         """Run the production operator for each shape in the untuned CSV.
         Subclasses should override this to call the actual production operator.
         Returns a list of dicts: [{"shape": str, "us": float, "status": "ok"/"error"}]
+        A family with a selection probe gets this for free: each shape runs in
+        a fresh process; when ``expected_selection`` names a selection for the
+        config file's row, the process must dispatch it (``selection``
+        records what it dispatched).
         """
-        logger.info(f"run_config not implemented for {self.name}, skipping benchmark")
-        return []
+        if self.SELECTION_PROBE_MODULE is None:
+            logger.info(
+                f"run_config not implemented for {self.name}, skipping benchmark"
+            )
+            return []
+        env_name = self.get_arg_defaults().get("config_env_name")
+        config_file = os.environ.get(env_name) if env_name else None
+        tuned_rows = {}
+        if config_file:
+            tunedf = self.get_tuned_gemm_list(self._with_model_configs(config_file))
+            if set(self.keys) <= set(tunedf.columns):
+                tuned_rows = {self.lookup_key(r): r for _, r in tunedf.iterrows()}
+        results = []
+        unchecked_rows = 0
+        for _, shape in self.untunedf.iterrows():
+            row = tuned_rows.get(self.lookup_key(shape), shape)
+            stale = self.stale_reason(row) if row is not shape else ""
+            verification = (
+                None if stale else self.verify_dispatch(row, config_file, args)
+            )
+            passed = verification is not None and verification.status in (
+                "verified",
+                "unchecked",
+            )
+            if (
+                row is not shape
+                and verification is not None
+                and verification.status == "unchecked"
+            ):
+                unchecked_rows += 1
+            if stale:
+                status = f"error: stale: {stale}"
+            elif passed:
+                status = "ok"
+            else:
+                status = f"error: {verification.status}: {verification.detail}"
+            results.append(
+                {
+                    "shape": str(tuple(shape[key] for key in self.keys)),
+                    "e2e_us": verification.latency_us if passed else -1,
+                    "status": status,
+                    "selection": "; ".join(
+                        ",".join(f"{k}={v}" for k, v in sorted(observed.items()))
+                        for observed in (verification.observed if verification else [])
+                    ),
+                }
+            )
+        if unchecked_rows:
+            logger.warning(
+                f"{self.SELECTION_FAMILY or self.name}: {unchecked_rows} tuned "
+                "row(s) ran correctly but no selection was checked "
+                "(expected_selection returned None)"
+            )
+        return results
 
     def _clear_op_caches(self):
         """Clear operator-specific config caches. Subclasses should override this
@@ -673,6 +1152,7 @@ class TunerCommon:
 
     def _restore_config_env(self, env_name, old_val, old_rebuild=0):
         """Restore the config env var and AITER_REBUILD to original values."""
+        self._substituted_config = None
         if env_name is None:
             return
         if old_val is None:
@@ -865,6 +1345,8 @@ class TunerCommon:
                 lines.append(f"{shape_str:<40} | {e2e_str:>10} | {status_summary:>8}")
             key_dict = {key: getattr(row, key, "") for key in self.keys}
             lines.append(self._format_benchmark_keys(key_dict))
+            if row.benchmark_selection:
+                lines.append(f"selection: {row.benchmark_selection}")
             if status_detail:
                 lines.append(f"reason: {status_detail}")
             if status_summary in ("ERROR", "MISMATCH"):
@@ -948,6 +1430,7 @@ class TunerCommon:
             "benchmark_status",
             "benchmark_kernel_us",
             "benchmark_e2e_us",
+            "benchmark_selection",
         ]
         if shapes_df is None:
             shapes_df = self.untunedf
@@ -970,12 +1453,26 @@ class TunerCommon:
             row["benchmark_status"] = bench.get("status", "unknown")
             row["benchmark_kernel_us"] = bench.get("kernel_us", None)
             row["benchmark_e2e_us"] = bench.get("e2e_us", -1)
+            row["benchmark_selection"] = bench.get("selection", "")
             rows.append(row)
         return pd.DataFrame(rows, columns=columns)
 
     def _build_compare_update_plan(
-        self, pre_results, post_results, threshold_percent, shapes_df=None
+        self,
+        pre_results,
+        post_results,
+        threshold_percent,
+        shapes_df=None,
+        autoselect_results=None,
+        autoselect_shapes=None,
     ):
+        """Per shape, whether the candidate row replaces the tuned one.
+
+        With auto-select timings (shapes that have a tuned row, run with
+        no row), a candidate must also beat auto-select by the bar, and the
+        tuned row is removed when auto-select beats it (or it failed) and
+        the candidate does not beat auto-select.
+        """
         pre_df = self._benchmark_results_to_df(pre_results, shapes_df=shapes_df)
         post_df = self._benchmark_results_to_df(post_results, shapes_df=shapes_df)
         columns = self.keys + [
@@ -1030,6 +1527,41 @@ class TunerCommon:
             "update_reason",
         ] = "threshold_met"
         comparison.loc[no_baseline, "update_reason"] = "no_baseline"
+        if autoselect_results is not None:
+            auto_df = self._benchmark_results_to_df(
+                autoselect_results, shapes_df=autoselect_shapes
+            ).rename(
+                columns={
+                    "benchmark_e2e_us": "autoselect_us",
+                    "benchmark_status": "autoselect_status",
+                }
+            )
+            comparison = comparison.merge(
+                auto_df[[*self.keys, "autoselect_us", "autoselect_status"]],
+                on=self.keys,
+                how="left",
+            )
+            columns += ["autoselect_us", "autoselect_status"]
+
+            def beats(baseline_ok, baseline_us, candidate_us):
+                if not baseline_ok:
+                    return True
+                margin = (baseline_us - candidate_us) / baseline_us * 100.0
+                return margin >= threshold_percent
+
+            pre_ok = (comparison["pre_status"] == "ok") & (comparison["pre_us"] > 0)
+            post_ok = (comparison["post_status"] == "ok") & (comparison["post_us"] > 0)
+            auto_ok = (comparison["autoselect_status"] == "ok") & (
+                comparison["autoselect_us"] > 0
+            )
+            for i in comparison.index[auto_ok]:
+                auto_us = comparison.at[i, "autoselect_us"]
+                if post_ok[i] and beats(True, auto_us, comparison.at[i, "post_us"]):
+                    continue
+                if beats(pre_ok[i], comparison.at[i, "pre_us"], auto_us):
+                    comparison.at[i, "update_reason"] = "autoselect"
+                else:
+                    comparison.at[i, "update_reason"] = "skip"
         comparison["update"] = comparison["update_reason"] != "skip"
         return comparison[columns]
 
@@ -1053,6 +1585,7 @@ class TunerCommon:
         no_baseline_count = len(
             comparison[comparison["update_reason"] == "no_baseline"]
         )
+        removed_count = len(comparison[comparison["update_reason"] == "autoselect"])
         skip_count = len(comparison[comparison["update_reason"] == "skip"])
         total = len(comparison)
 
@@ -1061,17 +1594,20 @@ class TunerCommon:
 
         lines = [
             "============= Compare Report =============",
+            "Comparison is latency only (pre_us / post_us).",
             (
-                f"Total shapes: {total} | {verb}: {update_count + no_baseline_count} "
-                f"(improved: {update_count}, new: {no_baseline_count}) | Skipped: {skip_count}"
+                f"Total shapes: {total} | {verb}: {total - skip_count} "
+                f"(improved: {update_count}, new: {no_baseline_count}"
+                + (f", removed: {removed_count}" if removed_count else "")
+                + f") | Skipped: {skip_count}"
             ),
             f"Threshold: >= {threshold_percent:.1f}% improvement to update {target_desc}",
             "",
         ]
 
         # Updated shapes first
-        if update_count + no_baseline_count > 0:
-            lines.append(f"--- {verb} ({update_count + no_baseline_count} shapes) ---")
+        if total > skip_count:
+            lines.append(f"--- {verb} ({total - skip_count} shapes) ---")
             header = f"{'Shape':<40} | {'Pre(us)':>10} | {'Post(us)':>10} | {'Improve':>9} | {'Action':>18}"
             lines.append(header)
             lines.append("-" * len(header))
@@ -1093,7 +1629,10 @@ class TunerCommon:
                     if pd.notna(row.improvement_pct)
                     else "N/A"
                 )
-                action = "UPDATE" if row.update_reason == "threshold_met" else "NEW"
+                action = {
+                    "threshold_met": "UPDATE",
+                    "autoselect": "REMOVE (auto-select)",
+                }.get(row.update_reason, "NEW")
                 lines.append(
                     f"{row.shape:<40} | {pre_str:>10} | {post_str:>10} | {improve_str:>9} | {action:>18}"
                 )
@@ -1155,22 +1694,27 @@ class TunerCommon:
         if comparison is None or comparison.empty:
             return old_df
 
-        improved_keys = set(
-            comparison.loc[comparison["update"], self.keys]
-            .astype(str)
-            .apply(tuple, axis=1)
-            .tolist()
-        )
+        def keys_of(rows):
+            if rows.empty:
+                return set()
+            return set(rows[self.keys].astype(str).apply(tuple, axis=1).tolist())
+
+        improved_keys = keys_of(comparison.loc[comparison["update"]])
         if not improved_keys:
             return old_df
+        removed_keys = keys_of(
+            comparison.loc[comparison["update_reason"] == "autoselect"]
+        )
 
-        def key_mask(df):
+        def key_mask(df, keys):
             if df.empty:
                 return pd.Series([], index=df.index, dtype=bool)
-            return df[self.keys].astype(str).apply(tuple, axis=1).isin(improved_keys)
+            return df[self.keys].astype(str).apply(tuple, axis=1).isin(keys)
 
-        kept_old = old_df[~key_mask(old_df)].copy()
-        improved_rows = candidate_df[key_mask(candidate_df)].copy()
+        kept_old = old_df[~key_mask(old_df, improved_keys)].copy()
+        improved_rows = candidate_df[
+            key_mask(candidate_df, improved_keys - removed_keys)
+        ].copy()
         merged = pd.concat([kept_old, improved_rows], ignore_index=True)
         dedup_keys = list(self.keys)
         if "_tag" in merged.columns:
@@ -1190,6 +1734,7 @@ class TunerCommon:
             old_val, old_rebuild = self._set_config_env_for_run_config(
                 args, config_file=config_file
             )
+            self._substituted_config = config_file
             try:
                 return self.run_config(args)
             finally:
@@ -1306,6 +1851,7 @@ class TunerCommon:
         total_batches,
         compare_report_file=None,
         compare_candidate_file=None,
+        autoselect=(None, None),
     ):
         batch_compare_output_file = self._create_batch_compare_output_file(
             args,
@@ -1330,6 +1876,8 @@ class TunerCommon:
                 batch_post_tune_results,
                 args.min_improvement_pct,
                 shapes_df=batch,
+                autoselect_results=autoselect[0],
+                autoselect_shapes=autoselect[1],
             )
             if args.update_improved:
                 final_df = self._merge_compare_filtered_results(
@@ -1337,7 +1885,7 @@ class TunerCommon:
                     batch_compare_output_file,
                     batch_compare_plan,
                 )
-                final_df.to_csv(output_file, index=False)
+                _write_csv_atomic(final_df, output_file, index=False)
                 if os.path.exists(output_file):
                     self.sortResults(output_file, args.sort, self.sort_keys)
                 self.tunedf = self.get_tuned_gemm_list(output_file)
@@ -1345,6 +1893,33 @@ class TunerCommon:
         finally:
             if os.path.exists(batch_compare_output_file):
                 os.remove(batch_compare_output_file)
+
+    def _run_autoselect_benchmark(self, args, batch, output_file, report_file=None):
+        """Time auto-select (no row) for the batch shapes that have a row in
+        ``output_file``; (results, shapes), or (None, None) when off."""
+        if not self.COMPARE_AUTOSELECT or not os.path.exists(output_file):
+            return None, None
+        tunedf = self.get_tuned_gemm_list(output_file)
+        tuned = {self.lookup_key(row) for _, row in tunedf.iterrows()}
+        shapes = batch[[self.lookup_key(row) in tuned for _, row in batch.iterrows()]]
+        if shapes.empty:
+            return None, None
+        fd, empty_table = tempfile.mkstemp(prefix="autoselect-", suffix=".csv")
+        os.close(fd)
+        try:
+            pd.DataFrame(columns=tunedf.columns).to_csv(empty_table, index=False)
+            results = self._run_compare_benchmark(
+                args,
+                shapes,
+                "=== Running auto-select benchmark (no tuned row) ===",
+                "Auto-select",
+                report_file=report_file,
+                config_file=empty_table,
+                print_results=args.verbose,
+            )
+        finally:
+            os.unlink(empty_table)
+        return results, shapes.reset_index(drop=True)
 
     def _record_completed_compare_batch(
         self,
@@ -1404,6 +1979,17 @@ class TunerCommon:
 
     def run(self, args, fast_mode=False):
         """tuner run function"""
+        select = self._apply_select(args)
+        if select == "power":
+            logger.warning(
+                "select=power is experimental: ranking kernels that pass "
+                "errRatio by package energy (us * PPT watts) with no latency "
+                "bound. Keep the GPU otherwise idle."
+            )
+        with use_policy(self.policy):
+            return self._run_selected(args, fast_mode)
+
+    def _run_selected(self, args, fast_mode=False):
         self.pre_process(args)
 
         # Resolve --run_config: can be False, True (no file), or a file path string.
@@ -1509,11 +2095,22 @@ class TunerCommon:
                         batch_header,
                         "Pre-tune",
                         report_file=compare_report_file,
+                        # A probe verifies the row the tuned CSV holds.
+                        config_file=(
+                            output_file
+                            if self.SELECTION_PROBE_MODULE
+                            and os.path.exists(output_file)
+                            else None
+                        ),
                         print_results=args.verbose,
+                    )
+                    autoselect = self._run_autoselect_benchmark(
+                        args, batch, output_file, compare_report_file
                     )
                 all_results = self.tune(batch, self.tunedf, args)
                 if all_results:
                     results = self.post_process(all_results, args, topk)
+                    results = self._stamp_power_rows(results, args)
                     if args.compare:
                         batch_post_tune_results, batch_compare_plan = (
                             self._apply_compare_batch_results(
@@ -1526,6 +2123,7 @@ class TunerCommon:
                                 total_batches,
                                 compare_report_file=compare_report_file,
                                 compare_candidate_file=compare_candidate_file,
+                                autoselect=autoselect,
                             )
                         )
                         self._record_completed_compare_batch(
@@ -1595,6 +2193,10 @@ class TunerCommon:
 
 
 class GemmCommonTuner(TunerCommon):
+    # The accurate pass goes through mp_tuner.worker, which replays via
+    # run_perftest. a6w6 and mixed MXFP override this: their gain guard
+    # keeps a kernel only when it is faster.
+    SUPPORTS_POWER_SELECT = True
 
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
@@ -1645,9 +2247,10 @@ class GemmCommonTuner(TunerCommon):
                 self.tunedf.insert(0, "gfx", self.get_gfx())
 
             untunedf_cols = self.untunedf.columns
-            if len(self.tunedf) != 0:
+            current = self.current_rows(self.tunedf)
+            if len(current) != 0:
                 mask = self.untunedf.apply(tuple, axis=1).isin(
-                    self.tunedf[untunedf_cols].apply(tuple, axis=1)
+                    current[untunedf_cols].apply(tuple, axis=1)
                 )
                 if args.verbose:
                     logger.info("skiped tuned shapes:")
@@ -1659,7 +2262,7 @@ class GemmCommonTuner(TunerCommon):
         ### bpes: (inbpe, w_bpe, outbpe)
         ### gemm flops,bw
         info, time, _err_ratio = results
-        if time == -1:
+        if not math.isfinite(time) or time <= 0:
             return 0, 0
         if len(info[0]) >= 5:  # gfx-aware key: (gfx, cu_num, m, n, k, ...)
             _gfx, _cu_num, m, n, k, *_rest = info[0]
@@ -1689,24 +2292,24 @@ class GemmCommonTuner(TunerCommon):
                 kernelName = "None"
             else:
                 kernelName = str(resolved)
-            tflops, bw = self.calculate(el)
+            tflops, bw = self.calculate((info, time, err_ratio))
             key_dict = dict(zip(self.keys, keys))
-
+            metrics = {
+                "kernelId": [kernelId],
+                "splitK": [splitK],
+                "us": [time],
+                "kernelName": [kernelName],
+                "errRatio": [err_ratio],
+                "tflops": [tflops],
+                "bw": [bw],
+            }
+            extra, watt_text = self.policy.result_metrics(el, tflops)
+            metrics.update(extra)
             if len(results) == self.topk:
                 print(
-                    f"Tuning result for {str(key_dict).strip('{}')} is kernelId={kernelId} {kernelName} {splitK=}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s"
+                    f"Tuning result for {str(key_dict).strip('{}')} is kernelId={kernelId} {kernelName} {splitK=}, {time}us, {err_ratio=}, {tflops=} TFLOPS, {bw=} GB/s{watt_text}"
                 )
-            key_dict.update(
-                {
-                    "kernelId": [kernelId],
-                    "splitK": [splitK],
-                    "us": [time],
-                    "kernelName": [kernelName],
-                    "errRatio": [err_ratio],
-                    "tflops": [tflops],
-                    "bw": [bw],
-                }
-            )
+            key_dict.update(metrics)
             rows.append(key_dict)
         # Build the frame once. Concatenating per row is O(n^2) in both time and
         # allocation: with -o2 (profile of every candidate) a 42-shape x ~600
@@ -1718,29 +2321,23 @@ class GemmCommonTuner(TunerCommon):
     def result_to_csv(self, resultdf, file, concat=False):
         """post process of tuning results"""
         old_df = self.get_tuned_gemm_list(file)
+        numeric_us = pd.to_numeric(resultdf["us"], errors="coerce")
+        valid_time = numeric_us.gt(0) & numeric_us.map(math.isfinite)
         self.failed = pd.concat(
             [
                 self.failed,
-                resultdf[
-                    (resultdf["us"] == self.INVALID_TIME)
-                    | (resultdf["us"] == self.INF_TIME)
-                ],
+                resultdf[~valid_time],
             ],
             ignore_index=True,
         )
         self.success = pd.concat(
             [
                 self.success,
-                resultdf[
-                    (resultdf["us"] != self.INVALID_TIME)
-                    & (resultdf["us"] != self.INF_TIME)
-                ],
+                resultdf[valid_time],
             ],
             ignore_index=True,
         )
-        update_tunedf = resultdf[
-            (resultdf["us"] != self.INVALID_TIME) & (resultdf["us"] != self.INF_TIME)
-        ]  # self.success
+        update_tunedf = resultdf[valid_time]  # self.success
         if not concat:
             resultdf = self.update_tunedf(old_df, update_tunedf)
         else:

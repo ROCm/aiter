@@ -3,12 +3,16 @@
 
 """HERD routing orchestration with FlyDSL candidate selection + finalize."""
 
-import os
-
 import torch
 
 from .kernels.herd_topk import build_herd_finalize_module
-from .kernels.tensor_shim import _run_compiled, wave_size_of
+from .kernels.moe_herd_route_psum import HERD_ROUTE_BLOCK, build_herd_route_psum_module
+from .kernels.tensor_shim import (
+    _run_compiled,
+    current_stream_arg,
+    ptr_arg,
+    wave_size_of,
+)
 from .kernels.topk.topk_per_row_small_k import build_topk_per_row_small_k_module
 
 _KIMI_K3_EXPERTS = 896
@@ -19,13 +23,6 @@ _HERD_MAX_TOKENS = 128
 _DEFAULT_FINALIZE_THREADS = 256
 _K3_CANDIDATE_THREADS = 256
 _K3_FINALIZE_THREADS = 1024
-
-
-def herd_use_fused_drop() -> bool:
-    value = os.environ.get("AITER_HERD_FUSED_DROP", "1")
-    if value not in ("0", "1"):
-        raise ValueError(f"AITER_HERD_FUSED_DROP must be 0 or 1, got {value!r}")
-    return value == "1"
 
 
 def herd_finalize_candidates(
@@ -64,6 +61,64 @@ def herd_finalize_candidates(
     return weights, ids
 
 
+def herd_route_psum(
+    candidate_values: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    experts: int,
+    tile_m: int,
+    routed_scaling_factor: float = 1.0,
+    num_valid_rows: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """``herd_finalize_candidates`` fused with the grouped MoE's route + psum.
+
+    Returns ``(topk_weights, topk_ids, masked_m, topids_to_rows, psum)``: the
+    routes exactly as ``herd_finalize_candidates`` returns them, and the layout
+    ``flydsl_moe_topids_to_rows`` + ``contiguous_psum_remap(tile_m)`` build.
+    Rows at or past ``num_valid_rows`` (device count) are padding: they stay out
+    of the popularity and get ids -1, weights 0 and ``DROPPED_ROUTE_ROW``.
+    """
+    rows, width = candidate_ids.shape
+    if rows > HERD_ROUTE_BLOCK:
+        raise ValueError(
+            f"herd_route_psum takes at most {HERD_ROUTE_BLOCK} rows, got {rows}"
+        )
+    topk = width - 1
+    experts = int(experts)
+    device = candidate_ids.device
+    # ptr_arg keeps only the address: a cast or contiguous copy must stay
+    # referenced until the launch is enqueued.
+    candidate_ids = candidate_ids.to(torch.int32).contiguous()
+    candidate_values = candidate_values.to(torch.float32).contiguous()
+    if num_valid_rows is not None:
+        num_valid_rows = (
+            num_valid_rows.reshape(-1)[:1].to(device=device, dtype=torch.int32)
+        ).contiguous()
+    weights = torch.empty((rows, topk), dtype=torch.float32, device=device)
+    ids = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    topids_to_rows = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    masked_m = torch.empty(experts, dtype=torch.int32, device=device)
+    psum = torch.empty(experts, dtype=torch.int32, device=device)
+    _run_compiled(
+        build_herd_route_psum_module(
+            topk, experts, num_valid_rows is not None, wave_size_of(device.index)
+        ),
+        ptr_arg(candidate_ids),
+        ptr_arg(candidate_values),
+        ptr_arg(weights),
+        ptr_arg(ids),
+        ptr_arg(topids_to_rows),
+        ptr_arg(masked_m),
+        ptr_arg(psum),
+        # Unread without a count; any tensor stands in for the argument.
+        ptr_arg(num_valid_rows if num_valid_rows is not None else psum),
+        rows,
+        tile_m,
+        float(routed_scaling_factor),
+        current_stream_arg(),
+    )
+    return weights, ids, masked_m, topids_to_rows, psum
+
+
 def herd_topk_candidates(
     candidate_values, candidate_ids, logits, correction_bias, score_func
 ):
@@ -71,11 +126,11 @@ def herd_topk_candidates(
     width = candidate_ids.shape[1]
     stream = torch.cuda.current_stream(logits.device)
     packed = logits.contiguous()
-    if score_func == "sigmoid":
-        if correction_bias is None or correction_bias.shape != (experts,):
-            raise ValueError(
-                "sigmoid candidates require one correction bias per expert"
-            )
+    if score_func == "sigmoid" and (
+        correction_bias is None or correction_bias.shape != (experts,)
+    ):
+        raise ValueError("sigmoid candidates require one correction bias per expert")
+    if score_func == "sigmoid" and wave_size_of(logits.device.index) == 64:
         _run_sigmoid_candidate(
             packed,
             correction_bias,
@@ -92,7 +147,9 @@ def herd_topk_candidates(
 
         token_expert_ids = torch.empty_like(candidate_ids)
         topk_softmax(candidate_values, candidate_ids, token_expert_ids, packed, True)
-    elif score_func == "sqrtsoftplus":
+    elif score_func in ("sigmoid", "sqrtsoftplus"):
+        # The FlyDSL sigmoid selector ballots over a 64-lane wave, so wave32
+        # GPUs take the HIP top-k gating kernel sqrtsoftplus always uses.
         from ..topk import topk_gating_fwd
 
         topk_gating_fwd(

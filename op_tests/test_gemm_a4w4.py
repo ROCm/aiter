@@ -46,7 +46,6 @@ pd.set_option("display.width", 1000)
 pd.set_option("display.max_colwidth", 30)
 
 
-@perftest(num_iters=5)
 def run_torch(x, w, x_scales, w_scales, dtype):
     m, _k = x.shape
     n, _k = w.shape
@@ -111,6 +110,40 @@ def run_gemm_asm(
     return out
 
 
+PS_KERNEL = "_ZN5aiter45f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256_psE"
+
+
+def ps_supported(x, w, x_scales, w_scales, out, tile=256):
+    # mirrors ps_supported() in csrc/py_itfs_cu/asm_gemm_a4w4.cu (B preshuffled, no bias term)
+    M, N, K = x.shape[0], w.shape[0], x.shape[1] * 2
+    return (
+        K % 64 == 0
+        and N % 16 == 0
+        and x.stride(0) % 16 == 0
+        and w.stride(0) * 2 == K
+        and x_scales.shape[0] >= (M + tile - 1) // tile * tile
+        and w_scales.shape[0] >= (N + tile - 1) // tile * tile
+        and M * x.stride(0) < 2**32
+        and N * w.stride(0) < 2**32
+        and tile * out.stride(0) * 2 < 2**31
+    )
+
+
+def quantize(dtype, M, N, K):
+    quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+    x = torch.randn((M, K), dtype=dtype)
+    w = torch.randn((N, K), dtype=dtype)
+    _, x_scales = quant_func(x, shuffle=False)
+    _, w_scales = quant_func(w, shuffle=False)
+    x, x_scales_shuffle = quant_func(x, shuffle=True)
+    w, w_scales_shuffle = quant_func(w, shuffle=True)
+    wshuffle = shuffle_weight(w, layout=(16, 16))
+    x_scales = x_scales.view(torch.uint8)
+    w_scales = w_scales.view(torch.uint8)
+    a = run_torch(x, w, x_scales, w_scales, dtype)
+    return a, x, wshuffle, x_scales_shuffle, w_scales_shuffle
+
+
 def _test_gemm_gfx1250(dtype, M, N, K):
     """gemm_a4w4 as ATOM calls it on gfx1250: the weight and the activation scale in the
     32x4 layout, the activation quantized straight into it. ``tuned`` is the public op, so
@@ -128,7 +161,7 @@ def _test_gemm_gfx1250(dtype, M, N, K):
     # The row-major quant is the reference operand; every layout below holds these bytes.
     xq_raw, xs_raw = quant(x, quant_dtype=dtypes.fp4x2, shuffle=False)
     wq_raw, ws_raw = quant(w, quant_dtype=dtypes.fp4x2, shuffle=False)
-    ref, _ = run_torch(
+    ref = run_torch(
         xq_raw, wq_raw, xs_raw.view(torch.uint8), ws_raw.view(torch.uint8), dtype
     )
 
@@ -186,68 +219,128 @@ def test_gemm(dtype, M, N, K):
     wshuffle = shuffle_weight(w, layout=(16, 16))
     x_scales = x_scales.view(torch.uint8)
     w_scales = w_scales.view(torch.uint8)
-    a, _avg_a = run_torch(x, w, x_scales, w_scales, dtype)
-    # out1 = torch.empty(M, N, dtype=dtype)
-    # b, avg_b = run_triton(x, w.T, x_scales, w_scales, out1, dtype)
-    # b, avg_b = a, 0
-    # err_b = checkAllclose(a, b, msg="triton        ")
+    a = run_torch(x, w, x_scales, w_scales, dtype)
+    from aiter.ops.gemm_op_a4w4 import _a4w4_fallback_config, get_GEMM_config
 
-    c, us = run_perftest(
-        aiter.gemm_a4w4,
-        x,
-        wshuffle,
-        x_scales_shuffle,
-        w_scales_shuffle,
-        bpreshuffle=True,
-    )
-    err = checkAllclose(a, c, msg="unified api", catastrophic_check=True)
-    ret["us"] = us
-    ret["TFLOPS"] = M * N * K * 2 / us / 1e6
-    ret["TB/s"] = (x.nbytes + w.nbytes) / us / 1e6
-    ret["err"] = err
+    out_shape = ((M + 31) // 32 * 32, N)
+    candidates = {
+        "tuned": lambda: gemm_a4w4(
+            x, wshuffle, x_scales_shuffle, w_scales_shuffle, dtype=dtype
+        ),
+    }
+    config = get_GEMM_config(M, N, K)
+    ret = {
+        "gfx": get_gfx(),
+        "configured kernel": config["kernelName"] if config else "asm",
+    }
+    if config and str(config["kernelName"]).startswith(("triton_", "flydsl_")):
+        fallback = _a4w4_fallback_config(config)
+        if fallback["kernelName"] and not fallback["kernelName"].startswith("_ZN"):
+            candidates["baseline"] = lambda: aiter.gemm_a4w4_blockscale(
+                x,
+                wshuffle,
+                x_scales_shuffle,
+                w_scales_shuffle,
+                torch.empty(out_shape, dtype=dtype, device=x.device),
+                kernelName=fallback["kernelName"],
+                splitK=fallback["splitK"],
+            )[:M]
+        else:
+            candidates["baseline"] = lambda: aiter.gemm_a4w4_asm(
+                x,
+                wshuffle,
+                x_scales_shuffle,
+                w_scales_shuffle,
+                torch.empty(out_shape, dtype=dtype, device=x.device),
+                fallback["kernelName"],
+                bpreshuffle=True,
+                log2_k_split=fallback["splitK"],
+            )[:M]
+    for name, fn in candidates.items():
+        result, us = run_perftest(fn)
+        err = checkAllclose(
+            a.float(), result.float(), msg=f"{name}: a4w4", catastrophic_check=True
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = M * N * K * 2 / us / 1e6
+        ret[f"{name} TB/s"] = (
+            (
+                x.nbytes
+                + w.nbytes
+                + x_scales_shuffle.nbytes
+                + w_scales_shuffle.nbytes
+                + result.nbytes
+            )
+            / us
+            / 1e6
+        )
+        ret[f"{name} err"] = err
 
-    # kernelName = "" # "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"
-    # log2_k_split = 1
-    # out2 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
-    # d, us = run_gemm_asm(
-    #     x,
-    #     wshuffle,
-    #     x_scales_shuffle,
-    #     w_scales_shuffle,
-    #     out2,
-    #     kernelName,
-    #     bias_f32,
-    #     bpreshuffle=True,
-    #     log2_k_split=log2_k_split,
-    # )
-    # err = checkAllclose(a, d[:M], msg=f"asm {kernelName} log2_k_split_{log2_k_split}")
-    # tag = "asm_dbg"
-    # ret[f"us {tag}"] = us
-    # ret[f"TFLOPS {tag}"] = M * N * K * 2 / us / 1e6
-    # ret[f"TB/s {tag}"] = (x.nbytes + w.nbytes) / us / 1e6
-    # ret[f"err {tag}"] = err
-
-    # out3 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
-    # e, us = run_gemm_ck(x, wshuffle, x_scales_shuffle, w_scales_shuffle, out3)
-    # err = checkAllclose(a, e[:M], msg="ck            ")
-    # tag = "ck"
-    # ret[f"us {tag}"] = us
-    # ret[f"TFLOPS {tag}"] = M * N * K * 2 / us / 1e6
-    # ret[f"TB/s {tag}"] = (x.nbytes + w.nbytes) / us / 1e6
-    # ret[f"err {tag}"] = err
+    out = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
+    if ps_supported(x, wshuffle, x_scales_shuffle, w_scales_shuffle, out):
+        d, us = run_gemm_asm(
+            x, wshuffle, x_scales_shuffle, w_scales_shuffle, out, PS_KERNEL
+        )
+        err = checkAllclose(a, d[:M], msg="asm 256x256 ps", catastrophic_check=True)
+        ret["us 256x256_ps"] = us
+        ret["err 256x256_ps"] = err
+        # a bias with beta 0 adds nothing
+        bias = torch.randn(M, N, dtype=dtypes.fp32)
+        d, _ = run_gemm_asm(
+            x, wshuffle, x_scales_shuffle, w_scales_shuffle, out, PS_KERNEL, bias
+        )
+        ret["err 256x256_ps bias"] = checkAllclose(
+            a, d[:M], msg="asm 256x256 ps, bias, beta 0", catastrophic_check=True
+        )
 
     return ret
 
 
+@benchmark()
+def test_gemm_splitk(dtype, M, N, K, log2_k_split):
+    ret = {}
+    a, x, wshuffle, x_scales_shuffle, w_scales_shuffle = quantize(dtype, M, N, K)
+    for name in ["_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E", PS_KERNEL]:
+        tag = "256x256_ps" if name == PS_KERNEL else "256x256"
+        out = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
+        d, us = run_gemm_asm(
+            x,
+            wshuffle,
+            x_scales_shuffle,
+            w_scales_shuffle,
+            out,
+            name,
+            log2_k_split=log2_k_split,
+        )
+        err = checkAllclose(
+            a,
+            d[:M],
+            msg=f"asm {tag} log2_k_split={log2_k_split}",
+            catastrophic_check=True,
+        )
+        ret[f"us {tag}"] = us
+        ret[f"err {tag}"] = err
+    return ret
+
+
 def tuned_shapes():
-    """Every (M, N, K) the a4w4_mxscale_bpreshuffle tuned table holds for this machine."""
+    """CSV-selected preshuffle shapes on gfx950; all tuned shapes on gfx1250."""
+    gfx950 = get_gfx() == "gfx950"
     try:
         table = pd.read_csv(
-            AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE_FILE
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
+            if gfx950
+            else AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_MXSCALE_BPRESHUFFLE_FILE
         )
     except OSError:
         return []  # no tuned shapes on this install
+    if "gfx" not in table.columns:
+        return []  # legacy overrides have no qualified per-architecture rows
     table = table[(table["gfx"] == get_gfx()) & (table["cu_num"] == get_cu_num())]
+    if gfx950:
+        table = table[
+            table["kernelName"].str.startswith(("triton_", "flydsl_"), na=False)
+        ]
     return sorted(set(table[["M", "N", "K"]].itertuples(index=False, name=None)))
 
 
@@ -365,6 +458,22 @@ def main():
     off-grid M it lacks.
     e.g.: --csv aiter/configs/model_configs/dsr1_a4w4_mxscale_bpreshuffle_tuned_gemm.csv""",
     )
+    parser.add_argument(
+        "-mnk_splitk",
+        "--shape_splitk",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[
+            (256, 256, 8192),
+            (128, 128, 16384),
+            (256, 256, 16384),
+            (256, 512, 8192),
+            (512, 512, 8192),
+            (2048, 2048, 8192),
+        ],
+        help="""Shapes of mnk for split K (log2_k_split 1..3) with the 256x256 kernels.
+    e.g. -mnk_splitk 256,256,8192""",
+    )
     args = parser.parse_args()
 
     gfx1250 = get_gfx() == "gfx1250"
@@ -389,6 +498,8 @@ def main():
         shapes.extend(OFF_GRID_SHAPES)
     else:
         shapes = args.shape
+        if not gfx1250 and args.shape is parser.get_default("shape"):
+            shapes = list(dict.fromkeys([*shapes, *tuned_shapes()]))
     df = []
     for dtype in args.dtype:
         for m, n, k in shapes:
@@ -397,6 +508,17 @@ def main():
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("gemm_a4w4 summary (markdown):\n%s", df_md)
+
+    if gfx1250:
+        return  # the split-K test runs the gfx950 256x256 kernels
+    df = []
+    for dtype in args.dtype:
+        for m, n, k in args.shape_splitk:
+            for log2_k_split in (1, 2, 3):
+                df.append(test_gemm_splitk(dtype, m, n, k, log2_k_split))
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("gemm_a4w4 split K summary (markdown):\n%s", df_md)
 
 
 if __name__ == "__main__":
