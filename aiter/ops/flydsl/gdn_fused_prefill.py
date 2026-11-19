@@ -13,11 +13,21 @@ use to snapshot the recurrent state for prefix caching.
 Callers gate on :func:`gdn_fused_prefill_supported` (passing ``max_seqlen`` so
 it can also reject batches the multi-kernel path runs faster) and keep their
 multi-kernel path wherever it returns False.
+
+With ``AITER_GDN_SPLIT_PREFILL=1``, batches of at least ``_split_min_tokens``
+tokens run as two kernels instead (``kernels/gdr_prefill/gdn_split_prefill.py``):
+a prep kernel does the state-independent work of every chunk in parallel and
+hands it to a serial kernel that keeps only the state chain. Results are bit
+for bit the single kernel's; the hand-off costs 17.25 KiB of transient device
+memory per value head and slot, with (T - 1) // 64 + N + 1 slots for T tokens
+in N sequences.
 """
 
 from __future__ import annotations
 
+import contextlib
 import functools
+import os
 
 import torch
 
@@ -30,6 +40,14 @@ _VD = 128
 # every operand's span must stay below 2^32 bytes. That also keeps the 32-bit
 # element offsets and token strides the launch ABI passes below 2^31.
 _MAX_BYTES = 2**32
+_SPLIT_ENV = "AITER_GDN_SPLIT_PREFILL"
+# Where the split path's parallel prep saves more than its second launch and
+# host work cost (MI355X, op_tests/op_benchmarks/flydsl/bench_gdn_fused_prefill.py):
+# from _SPLIT_MIN_TOKENS tokens at _SPLIT_MIN_HEADS value heads or more; with
+# fewer heads, batches of short sequences were slower, so the sequences must
+# also average _SPLIT_MIN_TOKENS tokens.
+_SPLIT_MIN_TOKENS = 1024
+_SPLIT_MIN_HEADS = 24
 
 
 @functools.cache
@@ -82,6 +100,140 @@ def _token_major(t: torch.Tensor, head_dim: int) -> bool:
         and t.stride(2) == head_dim
         and t.stride(1) >= t.shape[2] * head_dim
     )
+
+
+def _split_enabled() -> bool:
+    """Opt-in gate for the split path. Not memoized, so the env var can be
+    toggled at runtime."""
+    return os.environ.get(_SPLIT_ENV, "") == "1"
+
+
+def _split_min_tokens(N: int, H: int) -> int:
+    """Fewest tokens at which a batch of N sequences and H value heads takes
+    the split path."""
+    return _SPLIT_MIN_TOKENS if H >= _SPLIT_MIN_HEADS else _SPLIT_MIN_TOKENS * N
+
+
+@functools.cache
+def _split_kernels():
+    """The split kernels' module, or None (warned once) if it cannot be
+    imported, in which case the single kernel serves every batch."""
+    try:
+        from .kernels.gdr_prefill import gdn_split_prefill
+    except ImportError as exc:
+        from aiter import logger
+
+        logger.warning(
+            "%s=1 but the split GDN prefill kernels cannot be imported (%s); "
+            "using the single kernel",
+            _SPLIT_ENV,
+            exc,
+        )
+        return None
+    return gdn_split_prefill
+
+
+def _handoff_buffer(numel: int, dtype: torch.dtype, device) -> torch.Tensor:
+    """Uninitialized storage for the split path's hand-off."""
+    return torch.empty(numel, dtype=dtype, device=device)
+
+
+def _torch_stream(stream) -> torch.cuda.Stream:
+    """A launch ``stream`` (a torch stream or a raw handle) as a torch stream."""
+    if isinstance(stream, torch.cuda.Stream):
+        return stream
+    return torch.cuda.ExternalStream(getattr(stream, "cuda_stream", stream))
+
+
+def _split_prefill(
+    split,
+    q,
+    k,
+    v,
+    g,
+    beta,
+    cu,
+    idx,
+    pool,
+    o,
+    trs,
+    tri,
+    init,
+    *,
+    has_track: bool,
+    has_init_flag: bool,
+    scale: float,
+    stream,
+) -> bool:
+    """Run the batch as the split kernels. Returns False, launching nothing,
+    when the hand-off would not fit 32-bit buffer offsets."""
+    T, Hg = q.shape[1], q.shape[2]
+    H = v.shape[2]
+    N = cu.numel() - 1
+    slots = split.handoff_slots(T, N)
+    if slots * H * split.PK_HEAD * 2 >= _MAX_BYTES:
+        return False
+    # The caching allocator orders a block only on the stream it is allocated
+    # on, so the hand-off is allocated on the launch stream.
+    on_launch_stream = (
+        contextlib.nullcontext()
+        if stream is None
+        else torch.cuda.stream(_torch_stream(stream))
+    )
+    with on_launch_stream:
+        pk = _handoff_buffer(slots * H * split.PK_HEAD, torch.bfloat16, q.device)
+        fac = _handoff_buffer(slots * H * split.FAC_HEAD, torch.float32, q.device)
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    qf, kf = _flat(q, _KD), _flat(k, _KD)
+    _run_compiled(
+        split.compile_gdn_split_prep(H=H, Hg=Hg, scale=scale),
+        qf,
+        kf,
+        _flat(g, 1),
+        _flat(beta, 1),
+        cu,
+        idx,
+        pk,
+        fac,
+        q.stride(1),
+        k.stride(1),
+        g.stride(1),
+        beta.stride(1),
+        N,
+        T,
+        (N - 1).bit_length(),
+        slots - 1,
+        stream,
+    )
+    _run_compiled(
+        split.compile_gdn_split_serial(
+            H=H,
+            Hg=Hg,
+            BV=_pick_bv(N, H, q.device),
+            HAS_TRACK=has_track,
+            HAS_INIT_FLAG=has_init_flag,
+        ),
+        qf,
+        kf,
+        _flat(v, _VD),
+        cu,
+        idx,
+        pool.view(-1),
+        o.view(-1),
+        trs,
+        tri,
+        init,
+        pk,
+        fac,
+        q.stride(1),
+        k.stride(1),
+        v.stride(1),
+        T,
+        N,
+        stream,
+    )
+    return True
 
 
 def gdn_fused_prefill_supported(
@@ -161,6 +313,10 @@ def gdn_fused_prefill_fwd(
     stream=None,
 ) -> torch.Tensor:
     """Varlen GDN chunked prefill (BT=64) with in-kernel q/k l2norm.
+
+    With ``AITER_GDN_SPLIT_PREFILL=1`` a batch of at least
+    ``_split_min_tokens(N, H)`` tokens runs as the split prep + serial kernels,
+    with the same results.
 
     Args:
         q, k: [1, T, Hg, 128] bf16, un-normalized.
@@ -255,6 +411,29 @@ def gdn_fused_prefill_fwd(
     o = q.new_empty(1, T, H, _VD)
     if N == 0:
         return o
+    scale = _KD**-0.5 if scale is None else float(scale)
+    if T >= _split_min_tokens(N, H) and _split_enabled():
+        split = _split_kernels()
+        if split is not None and _split_prefill(
+            split,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu,
+            idx,
+            ssm_states,
+            o,
+            trs,
+            tri,
+            init,
+            has_track=has_track,
+            has_init_flag=has_init_flag,
+            scale=scale,
+            stream=stream,
+        ):
+            return o
     if stream is None:
         stream = torch.cuda.current_stream()
 
@@ -264,7 +443,7 @@ def gdn_fused_prefill_fwd(
         BV=_pick_bv(N, H, q.device),
         HAS_TRACK=has_track,
         HAS_INIT_FLAG=has_init_flag,
-        scale=_KD**-0.5 if scale is None else float(scale),
+        scale=scale,
     )
     _run_compiled(
         exe,
