@@ -235,6 +235,8 @@ def test_exact_sigmoid_topk_herd_widths(experts, topk, rows, need_renorm, bias_d
 
     # The public entry sends these rows to the HIP multi-wave kernel.
     assert topk_ops._gfx1250_reg_mw_fits(logits, bias, weights, ids)
+    weights.fill_(-7.0)
+    ids.fill_(-7)
     topk_ops.biased_grouped_topk(
         logits, bias, weights, ids, 1, 1, need_renorm, 2.5, num_valid_rows
     )
@@ -309,31 +311,25 @@ def test_exact_sigmoid_topk_unaligned_base(experts, topk, rows, case, bias_dtype
 
 @pytest.mark.parametrize("unaligned", [False, True])
 def test_exact_sigmoid_topk_compiled_call(unaligned):
-    """_gfx1250_reg_mw_fits traces without a graph break and gives the eager
-    answer, so a compiled call runs the HIP multi-wave kernel as an eager one
-    does and returns the same bits."""
+    """biased_grouped_topk is an opaque custom op, so a compiled call runs the
+    HIP multi-wave kernel as an eager one does and returns the same bits."""
     torch.manual_seed(0)
     logits = torch.randn((64, 896), dtype=torch.bfloat16, device="cuda")
     bias = torch.randn(896, device="cuda", dtype=torch.float32) * 0.1
     if unaligned:
         logits, bias = _unaligned_copy(logits, 4), _unaligned_copy(bias, 0)
-    eager_w = torch.empty((64, 17), dtype=torch.float32, device="cuda")
-    eager_ids = torch.empty((64, 17), dtype=torch.int32, device="cuda")
-    weights, ids = torch.empty_like(eager_w), torch.empty_like(eager_ids)
-
+    eager_w = torch.full((64, 17), -7.0, dtype=torch.float32, device="cuda")
+    eager_ids = torch.full((64, 17), -7, dtype=torch.int32, device="cuda")
     assert topk_ops._gfx1250_reg_mw_fits(logits, bias, eager_w, eager_ids)
-    for dynamic in (False, True):
-        torch._dynamo.reset()
-        traced_fits = torch.compile(
-            topk_ops._gfx1250_reg_mw_fits, fullgraph=True, dynamic=dynamic
-        )
-        assert traced_fits(logits, bias, weights, ids), f"dynamic={dynamic}"
-
     topk_ops.biased_grouped_topk(logits, bias, eager_w, eager_ids, 1, 1, True, 2.5)
-    torch._dynamo.reset()
-    torch.compile(topk_ops.biased_grouped_topk)(
-        logits, bias, weights, ids, 1, 1, True, 2.5
-    )
 
-    assert torch.equal(ids, eager_ids)
-    assert torch.equal(weights, eager_w)
+    weights, ids = torch.empty_like(eager_w), torch.empty_like(eager_ids)
+    for dynamic in (False, True):
+        weights.fill_(-7.0)
+        ids.fill_(-7)
+        torch._dynamo.reset()
+        torch.compile(topk_ops.biased_grouped_topk, fullgraph=True, dynamic=dynamic)(
+            logits, bias, weights, ids, 1, 1, True, 2.5
+        )
+        assert torch.equal(ids, eager_ids), f"dynamic={dynamic}"
+        assert torch.equal(weights, eager_w), f"dynamic={dynamic}"

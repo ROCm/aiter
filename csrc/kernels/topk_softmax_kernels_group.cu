@@ -1179,9 +1179,27 @@ __global__ void topk_reg_kernel(DTYPE_I* __restrict__ gating_output,
 // bit: the same score key and legacy tie rank order the picks, the sigmoid gives
 // the same bits, and the renormalization sums them serially in rank order.
 
-// HIP's math header and opus both offer a templated max/min for unsigned.
-__device__ __forceinline__ uint32_t umax32(uint32_t a, uint32_t b) { return a > b ? a : b; }
-__device__ __forceinline__ uint32_t umin32(uint32_t a, uint32_t b) { return a > b ? b : a; }
+// sigmoid(x) with the bits of the row-per-wave kernels, which round the f64
+// product -C_LOG2E * x to float. For 16-bit inputs a hi/lo split fma gives the
+// same float (checked over every bf16 and fp16 value) without the f64
+// multiply, which runs at 1/32 rate on gfx1250.
+template <typename T>
+__device__ __forceinline__ float sigmoid_neg_log2e(T v)
+{
+    const float x = static_cast<float>(v);
+    float t;
+    if constexpr(std::is_same_v<T, float>)
+        t = static_cast<float>(-C_LOG2E * x);
+    else
+    {
+        static_assert(sizeof(T) == 2, "the split fma matches only for 16-bit inputs");
+        constexpr float kNegLog2eHi = -static_cast<float>(C_LOG2E);
+        constexpr float kNegLog2eLo =
+            static_cast<float>(-C_LOG2E - static_cast<double>(kNegLog2eHi));
+        t = __builtin_fmaf(kNegLog2eHi, x, kNegLog2eLo * x);
+    }
+    return __builtin_amdgcn_rcpf(1.0f + exp2f(t));
+}
 
 // Maximum of v[0..N) as a balanced tree, which the compiler leaves unbalanced
 // when handed a chain.
@@ -1191,7 +1209,7 @@ __device__ __forceinline__ uint32_t umax_tree(const uint32_t* v)
     if constexpr(N == 1)
         return v[0];
     else
-        return umax32(umax_tree<N / 2>(v), umax_tree<N - N / 2>(v + N / 2));
+        return dev_max_<uint32_t>(umax_tree<N / 2>(v), umax_tree<N - N / 2>(v + N / 2));
 }
 
 // Value of lane ^ kXor within a wave32, without an LDS round trip. Every source
@@ -1232,7 +1250,8 @@ __device__ __forceinline__ uint32_t wave32_sort_desc_u32(uint32_t v, int lane)
             constexpr int j            = k - 1 - decltype(js)::value; // J = 1 << j
             const uint32_t keep_larger = ~(lane_bit[j] ^ lane_bit[k]);
             const uint32_t o           = wave32_xor_lane<1 << j>(v);
-            v                          = umax32(umin32(o, v), umin32(umax32(o, v), keep_larger));
+            v                          = dev_max_<uint32_t>(dev_min_<uint32_t>(o, v),
+                                   dev_min_<uint32_t>(dev_max_<uint32_t>(o, v), keep_larger));
         });
     });
     return v;
@@ -1350,29 +1369,19 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
         return;
     }
 
-    // topk_reg_kernel rounds the f64 product -C_LOG2E * x to float, and f64
-    // runs at 1/32 rate on gfx1250. For 16-bit inputs a hi/lo split fma gives
-    // the same sigmoid bits (checked over every bf16 and fp16 value).
-    static_assert(sizeof(DTYPE_I) == 2, "the split fma matches only for 16-bit inputs");
-    constexpr float kNegLog2eHi = -static_cast<float>(C_LOG2E);
-    constexpr float kNegLog2eLo = static_cast<float>(-C_LOG2E - static_cast<double>(kNegLog2eHi));
-
-    auto sigmoid = [](float x) {
-        const float t = __builtin_fmaf(kNegLog2eHi, x, kNegLog2eLo * x);
-        return __builtin_amdgcn_rcpf(1.0f + exp2f(t));
-    };
     float sig[4];
     uint32_t key[4];
 #pragma unroll
     for(int i = 0; i < 4; ++i)
     {
-        sig[i]        = sigmoid(static_cast<float>(g[i]));
+        sig[i]        = sigmoid_neg_log2e(g[i]);
         const float s = sig[i] + static_cast<float>(b[i]);
         // topk_reg_kernel never picks a NaN score either; here it ranks as -inf.
         key[i] = float_order_key(s == s ? s : -INFINITY);
     }
 
-    s_gmax[lane * 8 + wave] = umax32(umax32(key[0], key[1]), umax32(key[2], key[3]));
+    s_gmax[lane * 8 + wave] =
+        dev_max_<uint32_t>(dev_max_<uint32_t>(key[0], key[1]), dev_max_<uint32_t>(key[2], key[3]));
     if(threadIdx.x == 0)
         s_ncand[W - 1] = 0;
     __syncthreads();
@@ -1382,7 +1391,7 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
     uint32_t gk = 0;
 #pragma unroll
     for(int w = 0; w < kWaves; ++w)
-        gk = umax32(gk, s_gmax[lane * 8 + w]);
+        gk = dev_max_<uint32_t>(gk, s_gmax[lane * 8 + w]);
     // A bitonic network rather than lane-rotation ranks: waves sharing a SIMD
     // fill each other's latency gaps here, and the ranks issue more VALU work.
     gk                   = wave32_sort_desc_u32(gk, lane);
@@ -1411,7 +1420,8 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
     {
         const int id = 4 * quad + i;
         // A min rather than hit && slot < cap, which the compiler ands on the SALU.
-        const uint32_t dst = umin32(hit[i] ? uint32_t(slot) : ~0u, kTopKRegCandCap + lane);
+        const uint32_t dst =
+            dev_min_<uint32_t>(hit[i] ? uint32_t(slot) : ~0u, kTopKRegCandCap + lane);
         s_cand[dst]        = make_uint4(key[i],
                                  (uint32_t(~legacy_topk_tie_rank(id)) << 16) | uint32_t(id),
                                  __builtin_bit_cast(uint32_t, sig[i]),
@@ -1462,7 +1472,8 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
             const uint64_t k64[2] = {(uint64_t(c0.x) << 32) | c0.y, (uint64_t(c1.x) << 32) | c1.y};
             int rank[2];
             wave32_rank_desc_dpp(k64, rank);
-            const int d0 = umin32(rank[0], W - 1) * 4, d1 = umin32(rank[1], W - 1) * 4;
+            const int d0 = dev_min_<uint32_t>(rank[0], W - 1) * 4;
+            const int d1 = dev_min_<uint32_t>(rank[1], W - 1) * 4;
             w   = __builtin_bit_cast(float,
                                    __builtin_amdgcn_ds_permute(d0, int(c0.z)) |
                                        __builtin_amdgcn_ds_permute(d1, int(c1.z)));
@@ -1492,7 +1503,7 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
             for(int i = 0; i < 4; ++i)
             {
                 const int e       = 4 * q + i;
-                const float sg    = sigmoid(static_cast<float>(gr[i]));
+                const float sg    = sigmoid_neg_log2e(gr[i]);
                 const float s     = sg + static_cast<float>(br[i]);
                 const uint32_t sk = float_order_key(s == s ? s : -INFINITY);
                 s_sig[e]          = sg;
@@ -1502,10 +1513,10 @@ __global__ __launch_bounds__(kWaves * 32) void topk_reg_mw_kernel(
             }
         }
         __builtin_amdgcn_wave_barrier();
-        auto wave_umax = [](uint32_t v) {
-            opus::static_for<5>(
-                [&](auto s) { v = umax32(v, wave32_xor_lane<1 << decltype(s)::value>(v)); });
-            return v;
+        // Full exec here (wave 0, uniform branch), so every lane gets the wave maximum.
+        auto umax      = [](uint32_t a, uint32_t b) { return dev_max_<uint32_t>(a, b); };
+        auto wave_umax = [&](uint32_t v) {
+            return wave_reduce<uint32_t, decltype(umax), W>(v, umax);
         };
         uint32_t selected_low_mask = 0;
         for(int k = 0; k < topk; ++k)
@@ -2130,11 +2141,6 @@ biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [nu
         return ((legacy_topk_lane_rank(v & 31) & 31) << kLegacyTopKLocalBits) |
                ((v >> 5) << 2) | (e & 3);
     };
-    // grouped_topk_kernel rounds the f64 product -C_LOG2E * x to float. For
-    // 16-bit inputs a hi/lo split fma gives the same float (checked over every
-    // bf16 and fp16 value) without the f64 multiply.
-    constexpr float kNegLog2eHi = -static_cast<float>(C_LOG2E);
-    constexpr float kNegLog2eLo = static_cast<float>(-C_LOG2E - static_cast<double>(kNegLog2eHi));
     // Scores are compared as order-preserving integers: integer max/min skip
     // the NaN canonicalization every float max carried. kDead sits below
     // every score, -inf (what a NaN maps to) included.
@@ -2150,13 +2156,7 @@ biased_grouped_topk_w32_kernel(const DTYPE_I* __restrict__ gating_output, // [nu
 #pragma unroll
     for(int i = 0; i < EPL; ++i)
     {
-        const float xf = static_cast<float>(x[i]);
-        float t;
-        if constexpr(std::is_same_v<DTYPE_I, float>)
-            t = static_cast<float>(-C_LOG2E * xf);
-        else
-            t = __builtin_fmaf(kNegLog2eHi, xf, kNegLog2eLo * xf);
-        sig[i]        = __builtin_amdgcn_rcpf(1.0f + exp2f(t));
+        sig[i]        = sigmoid_neg_log2e(x[i]);
         const float s = sig[i] + static_cast<float>(b[i]);
         key[i]        = to_key(::isnan(s) ? -INFINITY : s);
         id[i]         = i;
@@ -2657,13 +2657,14 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
 
     HipDeviceGuard device_guard(gating_output.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
+    const bool wave32        = get_warp_size_func() == 32;
 
     // wave32: one token per wave, eight experts per lane in registers. A group
     // must cover whole lanes, and the rows are read as naturally aligned
     // eight-element vectors (16 B for 16-bit inputs, 32 B for fp32).
     constexpr int W32_EPL = 8;
     const int vec_bytes   = W32_EPL * gating_output.element_size();
-    if(get_warp_size_func() == 32 && num_experts == 32 * W32_EPL &&
+    if(wave32 && num_experts == 32 * W32_EPL &&
        num_expert_group <= 8 && 32 % num_expert_group == 0 && topk >= 1 && topk <= 32 &&
        topk <= topk_grp * (num_experts / num_expert_group) &&
        stride_gating % W32_EPL == 0 &&
@@ -2721,7 +2722,7 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
     // same topk_reg_mw_args_ok, and checks the pitch below itself.
     const int mw_waves      = num_experts / 128;
     const bool mw_bias_fp32 = correction_bias.dtype() == AITER_DTYPE_fp32;
-    if(topk_grp == num_expert_group &&
+    if(wave32 && topk_grp == num_expert_group &&
        topk_reg_mw_args_ok(num_experts, topk, gating_output.dtype(), correction_bias.dtype()) &&
        stride_gating % 4 == 0)
     {
@@ -2765,7 +2766,7 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
     // TODO: expand usage in the future
     // bool use_opt_sort = false;
     bool use_opt_sort = (topk == 8) && (num_expert_group == 8) && (num_experts == 256) &&
-                        (topk_grp == 4) && (isBiased == true) && (get_warp_size_func() == 64);
+                        (topk_grp == 4) && (isBiased == true) && !wave32;
 
     // No tokens (for example an idle data-parallel rank): a zero-size grid is an invalid launch.
     if(num_tokens == 0)

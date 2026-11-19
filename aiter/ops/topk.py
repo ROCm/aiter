@@ -35,9 +35,6 @@ _VALID_SCORE_FUNCS = {"sqrtsoftplus", "sigmoid", "softmax"}
 _GFX1250_SIGMOID_EXPERTS = {512, 768, 896, 900, 1024}
 # Top-K and the Top-(K+1) candidates HERD routing hands to fused_moe(herd_topk=K).
 _GFX1250_SIGMOID_TOPKS = {4, 5, 8, 9, 16, 17}
-# The same sizes in order, for _as_static.
-_GFX1250_SIGMOID_EXPERTS_SORTED = tuple(sorted(_GFX1250_SIGMOID_EXPERTS))
-_GFX1250_SIGMOID_TOPKS_SORTED = tuple(sorted(_GFX1250_SIGMOID_TOPKS))
 
 
 def _can_use_gfx1250_exact_sigmoid_topk(
@@ -119,30 +116,6 @@ def _reg_mw_supports_cached(
     )
 
 
-@torch.compiler.assume_constant_result
-def _reg_mw_supports_const(
-    num_experts: int,
-    topk: int,
-    gating_dtype: torch.dtype,
-    bias_dtype: torch.dtype,
-    device: int,
-) -> bool:
-    """_reg_mw_supports_cached() as a constant of a traced graph. Dynamo would
-    otherwise trace through the cache into the op, whose fake returns no
-    answer, and so would send every compiled call to Triton."""
-    return _reg_mw_supports_cached(num_experts, topk, gating_dtype, bias_dtype, device)
-
-
-def _as_static(size, values) -> int:
-    """size as the Python int it equals in values, or -1. Under
-    torch.compile(dynamic=True) a size is a SymInt, which
-    assume_constant_result cannot take; each comparison here guards on it."""
-    for value in values:
-        if size == value:
-            return value
-    return -1
-
-
 def _gfx1250_reg_mw_fits(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -155,12 +128,13 @@ def _gfx1250_reg_mw_fits(
     The shape and dtype terms come from topk_reg_mw_supports, the same test the
     HIP entry applies; the two terms below, the pitch and the equal output
     strides, are the rest of it. The kernel's loads take any pointer
-    alignment, so the test reads no data_ptr(), and a call traced by
-    torch.compile picks the same kernel as an eager call of the same tensors."""
+    alignment, so the test reads no data_ptr(). biased_grouped_topk is an
+    opaque custom op, so torch.compile never traces this: compiled and eager
+    calls run it on the same real tensors."""
     return (
-        _reg_mw_supports_const(
-            _as_static(gating_output.shape[1], _GFX1250_SIGMOID_EXPERTS_SORTED),
-            _as_static(topk_ids.shape[1], _GFX1250_SIGMOID_TOPKS_SORTED),
+        _reg_mw_supports_cached(
+            gating_output.shape[1],
+            topk_ids.shape[1],
             gating_output.dtype,
             correction_bias.dtype,
             gating_output.device.index,
