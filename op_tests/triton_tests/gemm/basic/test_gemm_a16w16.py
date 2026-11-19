@@ -5,6 +5,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_atomic import _get_config
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available, gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
@@ -220,6 +221,51 @@ def test_gemm_a16_w16_atomic(M: int, N: int, K: int, output):
         triton_out = gemm_a16w16_atomic(x, w, torch.float32, y).to(torch.bfloat16)
     else:
         triton_out = gemm_a16w16_atomic(x, w, dtype=torch.float32).to(torch.bfloat16)
+
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+# Each value makes cdiv(K, NUM_KSPLIT) odd, so the split is never a multiple of
+# BLOCK_SIZE_K. The last case puts the split below BLOCK_SIZE_K, the regime of the
+# gfx950 M_LEQ_1 bucket.
+@pytest.mark.parametrize(
+    "M, N, K, num_ksplit, split_below_block_k",
+    [
+        (1, 256, 6144, 5, False),
+        (32, 256, 6144, 5, False),
+        (16, 896, 3584, 3, False),
+        (33, 1000, 777, 2, False),
+        (33, 1000, 777, 20, True),
+    ],
+)
+def test_gemm_a16_w16_atomic_uneven_split(
+    M: int, N: int, K: int, num_ksplit: int, split_below_block_k: bool
+):
+    torch.cuda.empty_cache()
+
+    try:
+        base_config, _ = _get_config(M, N, K)
+    except AssertionError:
+        pytest.skip("this architecture ships no gemm_a16w16_atomic config")
+
+    config = {**base_config, "NUM_KSPLIT": num_ksplit}
+    split = -(-K // num_ksplit)
+    # The split is odd and BLOCK_SIZE_K is a power of two, so the case is always an
+    # uneven split. Which side of BLOCK_SIZE_K the split falls on does depend on the
+    # config, so check it: a config change must not silently drop a regime.
+    assert (split < config["BLOCK_SIZE_K"]) == split_below_block_k, (
+        f"split {split} against BLOCK_SIZE_K {config['BLOCK_SIZE_K']}: this "
+        "architecture's config no longer covers the intended regime"
+    )
+
+    x, w, _, _out_dtype, _y = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+
+    torch_out = F.linear(x, w, bias=None)
+    triton_out = gemm_a16w16_atomic(x, w, torch.float32, config=config).to(
+        torch.bfloat16
+    )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
