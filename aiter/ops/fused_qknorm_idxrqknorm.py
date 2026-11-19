@@ -145,9 +145,13 @@ def fused_qknorm_idxrqknorm(
     gfx = base_gfx_arch(get_gfx_runtime())
     if fp4_dtypes and gfx != "gfx950":
         raise refused("fused_qknorm_idxrqknorm mxfp4/nvfp4 caches require gfx950")
+    # The index cache is written only in insert mode with the index branch processed.
+    insert_index = (
+        kv_cache_k is not None and num_index_heads > 0 and not skip_index_branch
+    )
     fp8_stores = (
         (kv_cache_k is not None and kv_cache_dtype.startswith("fp8"))
-        or index_cache_dtype.startswith("fp8")
+        or (insert_index and index_cache_dtype.startswith("fp8"))
         or any(t is not None and t.dtype != qkv.dtype for t in (q_out, index_q_out))
     )
     if fp8_stores and gfx not in _FP8_CVT_GFX:
@@ -191,7 +195,9 @@ def fused_qknorm_idxrqknorm_supports(*args, **kwargs) -> bool:
     """Whether fused_qknorm_idxrqknorm takes this call: the op's own checks, run with
     the same arguments, without launching anything (host only, no sync, no output). A
     caller that has another path asks this instead of restating the op's limits. Only a
-    refusal answers False; a JIT build or module load failure raises."""
+    refusal answers False; a JIT build or module load failure raises. Eager only: under
+    torch.compile (FakeTensor) the C++ checks do not run, so it can answer True for a
+    call the op refuses."""
     try:
         fused_qknorm_idxrqknorm(*args, **kwargs, check_only=True)
     except ValueError:

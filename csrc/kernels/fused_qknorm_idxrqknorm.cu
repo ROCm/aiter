@@ -214,8 +214,9 @@ struct QkvPartials
 // (-fgpu-flush-denormals-to-zero). A lane whose partials or running sums leave the
 // normal range redoes its sum here exactly: each fp32 add is exact in double (both
 // operands are fp32, and where they are 2^29 apart the smaller one cannot change
-// the rounding), then rounded to fp32 with gradual underflow. Never reached by
-// finite real activations; it keeps the result bitwise for every input.
+// the rounding), then rounded to fp32 with gradual underflow. It keeps the result
+// bitwise for every input; besides subnormals it also runs for a sum that is exactly
+// zero (a zero row, cancelling partials), which reads as |acc| < 2^-126.
 __device__ __forceinline__ double exactF32ToDouble(float f)
 {
     const uint32_t u   = __builtin_bit_cast(uint32_t, f);
@@ -2046,6 +2047,8 @@ static void fused_qknorm_idxrqknorm_impl(
         const aiter_tensor_t& qp = *qkv_partials;
         AITER_CHECK(qp.is_gpu() && qp.dtype() == AITER_DTYPE_fp32 && qp.dim() == 3,
                     "qkv_partials must be a float32 CUDA [num_splits, rows, row] tensor");
+        // The launch runs on qkv's device and reads it through a raw pointer.
+        AITER_CHECK(qp.device_id == qkv.device_id, "qkv_partials must be on qkv's device");
         const int64_t splits = qp.size(0);
         AITER_CHECK(splits == 2 || splits == 4 || splits == 8,
                     "qkv_partials supports 2, 4 or 8 splits");

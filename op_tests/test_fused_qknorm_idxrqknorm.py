@@ -2420,23 +2420,28 @@ def reduce_partials(partials: torch.Tensor) -> torch.Tensor:
     return acc.to(torch.bfloat16).to(partials.device)
 
 
-def make_partials(splits: int, rows: int, row: int) -> torch.Tensor:
+def make_partials(splits: int, rows: int, row: int, inf_row: int | None):
     """Random partials plus columns whose sums are subnormal, overflow, NaN or bf16 ties:
-    where the op's denormal-flushing arithmetic could part from the reduce kernel's."""
+    where the op's denormal-flushing arithmetic could part from the reduce kernel's. The
+    overflow and NaN columns go in token inf_row only (none if None), so every other
+    token's heads normalize to finite values that are compared bit for bit."""
     p = torch.randn(splits, rows, row, device="cuda") * 4
     tiny = torch.finfo(torch.float32).tiny
     edges = [
         (1.5 * tiny, -tiny),  # subnormal sum of normal partials
         (3e-39, 1e-39),  # subnormal partials
-        (3.3e38, 3.3e38),  # overflow to inf
-        (float("inf"), float("-inf")),  # NaN
         (1.0, 2.0**-8),  # tie, rounds down to the even 1.0
         (1.0 + 2.0**-7, 2.0**-8),  # tie, rounds up to the even 1 + 2^-6
+        (3.3e38, 3.3e38),  # overflow to inf
+        (float("inf"), float("-inf")),  # NaN
     ]
     for c, (a, b) in enumerate(edges):
+        if c >= 4 and inf_row is None:
+            continue
         cols = slice(c, None, 61)  # a few columns of every head
-        p[:, :, cols] = 0.0
-        p[0, :, cols], p[1, :, cols] = a, b
+        tokens = slice(None) if c < 4 else slice(inf_row, inf_row + 1)
+        p[:, tokens, cols] = 0.0
+        p[0, tokens, cols], p[1, tokens, cols] = a, b
     return p
 
 
@@ -2467,7 +2472,9 @@ def check_qkv_partials(mode, dtype, num_tokens, block_size, rotary_dim):
             num_index_heads=niq,
             rotary_dim=rotary_dim,
         )
-        partials = make_partials(splits, num_tokens + 3, case["qkv"].shape[1])
+        # The last token takes the overflow / NaN sums (a single token takes none).
+        inf_row = num_tokens - 1 if num_tokens > 1 else None
+        partials = make_partials(splits, num_tokens + 3, case["qkv"].shape[1], inf_row)
         partials = partials[:, :num_tokens]
         case["qkv"] = reduce_partials(partials)
         (*want, ref_call), _ = run(case)
@@ -2498,7 +2505,7 @@ def check_qkv_partials_reject():
     case = make_case(
         dtype=torch.bfloat16, num_tokens=4, num_kv_heads=1, num_index_heads=1
     )
-    p = make_partials(2, 4, case["qkv"].shape[1])
+    p = make_partials(2, 4, case["qkv"].shape[1], inf_row=3)
     case["qkv"] = reduce_partials(p)
     run = partial(run_fused_qknorm_idxrqknorm, use_index_slot_mapping=True)
     call = run(case, mode="asm_layout", use_fp8_kv_cache=False, qkv_partials=p)[0][-1]
@@ -2565,9 +2572,14 @@ def check_arg_rejects():
             pass
         else:
             raise AssertionError("supports() hid a load failure")
+    # A call that writes no fp8 (here an fp8 index dtype on a skip_index_branch layer)
+    # is taken on gfx1100 too.
+    no_index = ({15: None}, {"skip_index_branch": True, "index_cache_dtype": "fp8"})
     for gfx, msg in (("gfx1100", "requires one of"), ("gfx1250-strict", None)):
         with mock.patch.object(op, "get_gfx_runtime", return_value=gfx):
-            check_rejects({gfx: (fp8, {}, {}, msg)})
+            check_rejects(
+                {gfx: (fp8, {}, {}, msg), f"{gfx}_skip": (call, *no_index, None)}
+            )
     return 0
 
 
