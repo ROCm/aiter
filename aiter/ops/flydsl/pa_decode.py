@@ -7,7 +7,8 @@ Cache layouts are logical, not preshuffled. K/V use E4M3 FNUZ on gfx942 and
 OCP on gfx950/gfx1250. See ``kernels.pa_decode_kernel`` for Q/P quantization and
 MFMA/WMMA specialization details. Native BF16 uses unscaled, 8-element packed
 K/V caches. gfx1250 also accepts FP16 queries and plain BF16 V caches. MXFP4 K/V
-(e2m1 data, e8m0 scale per 32 elements) run on gfx950 and gfx1250, see ``pa_decode``.
+(e2m1 data, e8m0 scale per 32 elements) run on gfx950 and gfx1250, NVFP4 K/V (e2m1 data, E4M3
+scale per 16 elements) on gfx1250, see ``pa_decode``.
 """
 
 import math
@@ -787,6 +788,55 @@ def _pa_decode_mxfp4(
         )
 
 
+def _check_nvfp4_kv(key_cache, value_cache, key_scale, value_scale, head_dim, dev):
+    """Raise unless the four NVFP4 planes are what the gfx1250 tile reads.
+
+    Payload: contiguous [pages, kv_heads, 128, head_dim // 2] bytes. Scales: E4M3
+    [pages, kv_heads, 128, head_dim // 16] with contiguous rows and pages, page
+    and head strides shared by K and V, 16-byte aligned (the tile DMAs one
+    (page, KV head) of 128 rows as a single span).
+    """
+    if head_dim != 128:
+        raise NotImplementedError(f"NVFP4 pa_decode needs head_dim 128, got {head_dim}")
+    pages, heads = key_cache.shape[:2]
+    payload_shape = (pages, heads, 128, head_dim // 2)
+    for name, t in (("key_cache", key_cache), ("value_cache", value_cache)):
+        if (
+            t.dim() != 4
+            or tuple(t.shape) != payload_shape
+            or t.dtype not in (torch.uint8, dtypes.fp4x2)
+            or t.device != dev
+            or not t.is_contiguous()
+            or t.data_ptr() % 16
+        ):
+            raise ValueError(
+                f"NVFP4 {name} must be a contiguous, 16 B aligned uint8/fp4x2 "
+                f"{list(payload_shape)} on {dev}, got {t.dtype} {tuple(t.shape)} "
+                f"{t.stride()}"
+            )
+    if not isinstance(value_scale, torch.Tensor):
+        raise TypeError("NVFP4 value_scale must be a torch.Tensor")
+    scale_shape = (pages, heads, 128, head_dim // 16)
+    strides = key_scale.stride()
+    for name, t in (("key_scale", key_scale), ("value_scale", value_scale)):
+        if (
+            t.dim() != 4
+            or tuple(t.shape) != scale_shape
+            or t.dtype != torch.float8_e4m3fn
+            or t.device != dev
+            or t.stride() != strides
+            or t.stride()[2:] != (head_dim // 16, 1)
+            or any(x % 16 for x in t.stride()[:2])
+            or t.data_ptr() % 16
+        ):
+            raise ValueError(
+                f"NVFP4 {name} must be a float8_e4m3fn {list(scale_shape)} view on "
+                f"{dev} with contiguous 128-row pages, 16 B aligned page and head "
+                f"strides shared by K and V, got {t.dtype} {tuple(t.shape)} "
+                f"{t.stride()}"
+            )
+
+
 def pa_decode(
     output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
     query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
@@ -939,6 +989,22 @@ def pa_decode(
     block table, without that bound, and needs 16 B aligned query and output base
     pointers.
 
+    NVFP4 K/V (gfx1250): ``key_cache``/``value_cache`` are packed e2m1 views
+    [pages, kv_heads, 128, head_dim // 2] (uint8 or ``dtypes.fp4x2``; element 2j in
+    the low nibble of byte j) and ``key_scale``/``value_scale`` are
+    ``torch.float8_e4m3fn`` views [pages, kv_heads, 128, head_dim // 16], one E4M3
+    scale per 16 consecutive elements of a token's head row, no other scale. The
+    scale dtype is what selects NVFP4 over MXFP4. The caches are contiguous; the
+    scales share page and head strides (multiples of 16 bytes) and are contiguous
+    within a page. Supported: head_dim 128, block size 128, f16/bf16 query and
+    output, one query tile of at most 16 rows (query_length x GQA), the dense
+    causal MTP mask, every gfx1250 output mode and the FP8 output
+    (``quantized_output``). Refused: sinks, sliding windows and ALiBi. QK is FP32
+    over the dequantized K and the query, split into FP8 terms that reproduce
+    BF16/FP16 to 2^-21 of each 16-dim block's maximum; V is dequantized exactly
+    (e2m1 x E4M3 fits BF16) and PV takes BF16 V and P. Tokens at or past a
+    sequence's context are read as zeros.
+
     Refresh ``work_plan`` on the current stream after changing lengths. Its
     max_partitions is bounded by device CUs. Match sliding_window and, for
     windowed plans, query_length. Scratch is [KV heads, capacity, query rows
@@ -963,10 +1029,17 @@ def pa_decode(
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
     block indices in [0, min(key_cache.shape[0], value_cache.shape[0])).
     """
-    mxfp4 = isinstance(key_cache, torch.Tensor) and key_cache.dtype in (
+    fp4_kv = isinstance(key_cache, torch.Tensor) and key_cache.dtype in (
         torch.uint8,
         dtypes.fp4x2,
     )
+    # E4M3 block scales make packed e2m1 caches NVFP4; anything else is MXFP4.
+    nvfp4 = (
+        fp4_kv
+        and isinstance(key_scale, torch.Tensor)
+        and key_scale.dtype == torch.float8_e4m3fn
+    )
+    mxfp4 = fp4_kv and not nvfp4
     if not isinstance(work_plan, PADecodePlan) and not (mxfp4 and work_plan is None):
         raise TypeError("work_plan must be a PADecodePlan")
     if context_partition_size != KV_COMPUTE_BLOCK:
@@ -1111,10 +1184,24 @@ def pa_decode(
             f"context_lengths.shape[0] ({num_seqs})"
         )
 
-    trans_k = key_cache.dim() == 5
-    trans_v = value_cache.dim() == 5
+    if nvfp4:
+        if sinks is not None or sliding_window:
+            raise NotImplementedError("NVFP4 KV supports no sinks or sliding window")
+        if compute_type not in (None, torch.uint8, dtypes.fp4x2):
+            raise NotImplementedError(
+                "NVFP4 KV takes compute_type None, uint8 or fp4x2, "
+                f"got {compute_type}"
+            )
+    # NVFP4 caches are 4D HND byte planes, not the NHD layout.
+    trans_k = key_cache.dim() == 5 or nvfp4
+    trans_v = value_cache.dim() == 5 or nvfp4
     nhd_layout = not trans_k
-    if nhd_layout:
+    if nvfp4:
+        num_blocks, num_kv_heads, block_size = key_cache.shape[:3]
+        _check_nvfp4_kv(
+            key_cache, value_cache, key_scale, value_scale, head_dim, query.device
+        )
+    elif nhd_layout:
         num_blocks, block_size, num_kv_heads, k_head = key_cache.shape
         if k_head != head_dim:
             raise ValueError(
@@ -1136,8 +1223,12 @@ def pa_decode(
         raise NotImplementedError(
             f"pa_decode only supports gfx942, gfx950 and gfx1250, got {arch}"
         )
+    if nvfp4 and arch != "gfx1250":
+        raise NotImplementedError(f"NVFP4 pa_decode supports gfx1250, not {arch}")
     is_bf16_kv = key_cache.dtype == torch.bfloat16
     expected_kv_dtype = torch.bfloat16 if is_bf16_kv else dtypes.fp8
+    if nvfp4:
+        expected_kv_dtype = compute_type = key_cache.dtype
     compute_type = key_cache.dtype if compute_type is None else compute_type
     if compute_type != expected_kv_dtype:
         raise NotImplementedError(
@@ -1157,7 +1248,9 @@ def pa_decode(
 
     # Enforce tile Q-load constraints and the reducer's 1024-thread limit.
     q_chunk = head_dim // 16
-    if not (
+    if nvfp4:
+        pass  # _check_nvfp4_kv checked the NVFP4 shapes.
+    elif not (
         64 <= head_dim <= 1024
         and head_dim % 64 == 0
         and (
@@ -1174,8 +1267,10 @@ def pa_decode(
                 else "are 64 and multiples of 128 in [128, 1024]"
             )
         )
-    if not nhd_layout and (
-        num_hgroups != head_dim // vector_width or hgroup_width != vector_width
+    if (
+        not nhd_layout
+        and not nvfp4
+        and (num_hgroups != head_dim // vector_width or hgroup_width != vector_width)
     ):
         raise ValueError(
             "key_cache shape must be "
@@ -1234,6 +1329,8 @@ def pa_decode(
                 f"{key_cache.stride()} and {value_cache.stride()}"
             )
         v_num_blocks, v_num_kv_heads = num_blocks, num_kv_heads
+    elif nvfp4:
+        v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
     elif trans_v:
         v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
         expected_v_tail = (block_size // vector_width, head_dim, vector_width)
@@ -1328,12 +1425,12 @@ def pa_decode(
         if not output_scale.is_contiguous():
             raise ValueError("output_scale must be contiguous")
 
-    if key_cache.dtype != expected_kv_dtype:
+    if not nvfp4 and key_cache.dtype != expected_kv_dtype:
         raise TypeError(
             f"pa_decode requires {expected_kv_dtype} key cache on {arch}, "
             f"got {key_cache.dtype}"
         )
-    if value_cache.dtype != expected_kv_dtype:
+    if not nvfp4 and value_cache.dtype != expected_kv_dtype:
         raise TypeError(
             f"pa_decode requires {expected_kv_dtype} value cache on {arch}, "
             f"got {value_cache.dtype}"
@@ -1411,7 +1508,13 @@ def pa_decode(
             )
         return scale
 
-    if is_bf16_kv:
+    if nvfp4:
+        # Byte views; the kernel DMAs each (page, KV head)'s scale rows.
+        key_scale_t, value_scale_t = key_scale, value_scale
+        per_token_kv = False
+        stride_ks_block = int(key_scale.stride(0))
+        stride_ks_head = int(key_scale.stride(1))
+    elif is_bf16_kv:
         if key_scale is not None or value_scale is not None:
             raise ValueError(
                 "BF16 KV is unscaled; key_scale and value_scale must be None"
@@ -1616,11 +1719,16 @@ def pa_decode(
         "sliding_window": sliding_window,
         "direct_output": direct_output,
     }
+    if nvfp4:
+        # Tile selection sees NVFP4 as the BF16 operands its wave pipeline
+        # computes in; the compile below passes the real cache and scale dtypes.
+        tile_options["kv_dtype"] = torch.bfloat16
     # The runs and preloaded page ids assume the tile's 128-token steps. Tiles
     # that select 64-token steps (two query tiles, plain BF16 V, wider grids)
     # keep plan-derived clusters.
     cluster_steps = (
-        step_split
+        not nvfp4
+        and step_split
         and CLUSTER_PARTITIONS % step_cluster == 0
         and num_seqs * step_cluster <= work_plan.capacity
         and gfx1250_tile_traits(
@@ -1640,7 +1748,8 @@ def pa_decode(
     # would; shorter rows use fewer CTAs. Runs beyond four tiles gain nothing.
     bound_tiles = -(-schedule_context_length // KV_COMPUTE_BLOCK)
     cluster_runs = bool(
-        cluster_merge
+        not nvfp4
+        and cluster_merge
         and not cluster_steps
         and cluster_seqs == 1
         and block_size == 128
@@ -1680,7 +1789,15 @@ def pa_decode(
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
             architecture=arch,
-            **tile_options,
+            **(
+                {
+                    **tile_options,
+                    "kv_dtype": expected_kv_dtype,
+                    "kv_scale_dtype": torch.float8_e4m3fn,
+                }
+                if nvfp4
+                else tile_options
+            ),
             wide_kv_addressing=wide_kv_addressing,
             kv_buffer_u32=kv_buffer_u32,
             trans_k=trans_k,
@@ -1774,6 +1891,10 @@ def pa_decode(
             # Rows of the FP8 output, padded ones included.
             int(total_q_rows + quantized_pad_rows) if quant_output else int(num_seqs),
         )
+    # NVFP4 caches and scales are byte planes whatever their torch view dtype,
+    # so the launch signature does not depend on the view.
+    kv_fx = fx.Uint8 if nvfp4 else torch_to_fx_dtype(key_cache.dtype)
+    scale_fx = fx.Uint8 if nvfp4 else fx.Float32
     with torch.cuda.device(dev):
         s = torch.cuda.current_stream(dev)
         _run_compiled(
@@ -1789,18 +1910,18 @@ def pa_decode(
                 torch_to_fx_dtype(pout.dtype),
             ),
             ptr_arg(query, torch_to_fx_dtype(query.dtype)),
-            ptr_arg(key_cache, torch_to_fx_dtype(key_cache.dtype)),
-            ptr_arg(value_cache, torch_to_fx_dtype(value_cache.dtype)),
+            ptr_arg(key_cache, kv_fx),
+            ptr_arg(value_cache, kv_fx),
             ptr_arg(block_tables, fx.Int32),
             (
                 flyc.from_c_void_p(fx.Float32, 0)
                 if is_bf16_kv
-                else ptr_arg(key_scale_t, fx.Float32)
+                else ptr_arg(key_scale_t, scale_fx)
             ),
             (
                 flyc.from_c_void_p(fx.Float32, 0)
                 if is_bf16_kv
-                else ptr_arg(value_scale_t, fx.Float32)
+                else ptr_arg(value_scale_t, scale_fx)
             ),
             int(max_blocks_per_seq),
             int(num_seqs),
