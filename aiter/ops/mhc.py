@@ -874,8 +874,10 @@ def _mhc_post_tile(hidden_size: int, arch: str, with_256: bool) -> int:
     """The residual tile `mhc_post` takes for ``hidden_size``, 0 for none.
 
     The widest of 1024 / 512 / 256 columns that divides ``hidden_size`` and fits
-    twice (the kernel prefetches one tile ahead); gfx942 has no 1024-column
-    tile, and the reduce epilogue no 256-column body (``with_256=False``).
+    at least twice -- a dispatch rule kept from the launch's old check (the
+    kernels also run one tile per work-group), which leaves every shape that ran
+    before on its old tile; gfx942 has no 1024-column tile, and the reduce
+    epilogue no 256-column body (``with_256=False``).
 
     MUST stay in lockstep with ``mhc_post_tile`` in csrc/kernels/mhc_kernels.cu,
     which every `mhc_post` / `mhc_post_reduce` launch dispatches on;

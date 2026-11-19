@@ -831,6 +831,13 @@ def test_mhc_post_reduce_operand_guards():
         "comb_res_mix on the CPU": lambda: aiter.mhc_post_reduce(
             torch.empty(m, hidden_size, dtype=x.dtype), x, residual, post, comb.cpu()
         ),
+        "fp32 with no rows": lambda: aiter.mhc_post_reduce(
+            torch.empty(0, hidden_size),
+            torch.empty(0, hidden_size),
+            torch.empty(0, hc_mult, hidden_size),
+            torch.empty(0, hc_mult, 1),
+            torch.empty(0, hc_mult, hc_mult),
+        ),
     }
     rows = []
     for name, launch in refusals.items():

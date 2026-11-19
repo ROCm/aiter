@@ -41,7 +41,6 @@ from typing import Any, ClassVar
 import torch
 import triton
 
-from aiter.ops.mhc import mhc_post_supported
 from aiter.ops.triton.fusions.mhc import mhc, mhc_post
 from aiter.test_common import checkAllclose
 from op_tests.op_benchmarks.triton.utils.argparse import (
@@ -811,6 +810,10 @@ def _validate_with_hip_pre(args) -> None:
 
 def _validate_with_hip_post(args) -> None:
     """Validate --with-hip args for mhc_post; raises AssertionError on failure."""
+    # Imported here: aiter.ops.mhc needs the HIP side of aiter, which a
+    # Triton-only install (AITER_TRITON_ONLY=1) does not import.
+    from aiter.ops.mhc import mhc_post_supported
+
     arch_id = _aiter_chip_info.get_gfx()
     for M_, n_, C_ in get_benchmark_configs(args):
         assert mhc_post_supported(C_, n_, torch.bfloat16, arch_id), (

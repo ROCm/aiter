@@ -1870,8 +1870,11 @@ namespace aiter {
 
     // The residual tile (columns per pipeline stage) mhc_post takes for hidden_size,
     // or 0 where no body serves it: the widest of 1024 / 512 (mhc_post_kernel) and
-    // 256 (mhc_post_kernel_x2vgpr) that divides hidden_size and fits twice, since
-    // the kernel prefetches one tile ahead. gfx942 has no 1024-column tile, and the
+    // 256 (mhc_post_kernel_x2vgpr) that divides hidden_size and fits at least twice.
+    // That bound is kept from the AITER_CHECK the launch used to make; the kernels
+    // themselves also run a single tile per work-group (mhc_post_pick_kblocks can
+    // pick loop == 1), so it is a dispatch rule, not a pipeline limit. Keeping it
+    // leaves every shape that ran before on its old tile. gfx942 has no 1024-column tile, and the
     // reduce epilogue (with_256 = false) only exists in mhc_post_kernel. Every
     // mhc_post / mhc_post_reduce launch dispatches on this; mhc_post_supported and
     // mhc_post_reduce_supported in aiter/ops/mhc.py MUST stay in lockstep with it.
@@ -2055,6 +2058,9 @@ namespace aiter {
         AITER_CHECK(mhc_post_tile(hidden_size, arch_id == "gfx942", false) != 0,
                     "mhc_post_reduce: hidden_size ", hidden_size, " has no tile on ", arch_id,
                     " (see mhc_post_reduce_supported)");
+        // Before the m == 0 return, so an empty call refuses what a full one would.
+        AITER_CHECK(x.dtype() == AITER_DTYPE_bf16 || x.dtype() == AITER_DTYPE_fp16,
+                    "mhc_post_reduce: x, residual and out must be bf16 or fp16");
         if(m == 0)
         {
             return;
