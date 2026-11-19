@@ -46,6 +46,47 @@ inside its own group without us, and send its next cross packet. The cross
 slots are therefore double-buffered by the parity of the colour; group
 ``i + 2`` cannot arrive before we have sent ``i + 1``, which is after we read
 ``i``.
+
+Lamport handshake (``handshake="lamport"``)
+-------------------------------------------
+No flags and no handshake sectors, on all three laps. An unwritten inbox dword
+holds the sentinel (the inbox starts filled with ``LAMPORT_FILL_BYTE``), every
+packet goes through ``lamport_fix`` before it is staged, and a reader polls
+the dwords it reads, one sub-tile at a time, until none is the sentinel. On a
+cacheable inbox each wave writes its pushes back out of L2 with a release
+after every lap (every hop on the ring); there is no drain barrier and no flag
+round trip.
+
+A slot is **re-armed one super-tile group late**. On a fine-grained inbox a
+push can reach the reader by eviction before the writer's release writes the
+line back, and a sentinel put back at once can be overwritten by the same
+old bytes (seen with the cross-exchange mover prototype). A reader therefore
+re-arms a writer's slots only once it holds a later packet from that writer,
+which left after the writer's release:
+
+* Local slots of group ``i - 1``, after group ``i``'s reduce-scatter has
+  landed: every local rank's contribution to it, directly on the mesh or
+  through the ring, left after that rank had finished ``i - 1``.
+* The partner's cross slot of ``i - 1``, after its packet of ``i`` has landed.
+
+Whole slots are re-armed with 16 B write-through stores (``_rearm``).
+
+Buffers:
+
+* Local slots, two by group parity. A local rank writes group ``i + 1`` while
+  we may still read ``i``. It writes ``i + 2``, the buffer of ``i`` again,
+  only after it has our all-gather of ``i + 1``, which we push after the cross
+  poll of ``i + 1``; that poll's ``vmcnt(0)`` drains our re-arm of ``i``,
+  issued after the reduce-scatter of ``i + 1`` landed.
+* Cross slots, three. The partner runs up to a group ahead (above), and our
+  re-arm of ``i`` waits for its packet of ``i + 1``. It writes ``i + 3`` only
+  after it has our ``i + 2``, which we push after the reduce-scatter polls of
+  ``i + 2`` have drained the re-arm.
+
+The colour cycles through ``0 .. 5``: its parity is the local buffer, its
+value mod 3 the cross buffer. Our own cross packet goes into our own inbox as
+on the flag handshake; lap 3 reads it after the partner's has landed, by which
+time every wave's poll has drained its stores.
 """
 
 import flydsl.compiler as flyc
@@ -53,7 +94,12 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from ...allreduce_policy import HIER_CODECS, HIER_LOCAL_SCHEDULES, HIER_SUPER_TILES
+from ...allreduce_policy import (
+    HANDSHAKES,
+    HIER_CODECS,
+    HIER_LOCAL_SCHEDULES,
+    HIER_SUPER_TILES,
+)
 from .quick_allreduce_codec import (
     GROUP,
     SCALE_CODEC_TAG,
@@ -65,20 +111,29 @@ from .quick_allreduce_codec import (
     _i32,
     _scale_from_word,
     codecs_for_block,
+    lamport_fix,
+    lamport_slots,
     scale_slot_of,
+    split_lamport_packet,
     thread_lane,
 )
 from .quick_allreduce_epilogue import QuickReducePlainEpilogue
 from .transport import (
+    _CM_SC1,
     _INBOX_POLICY,
+    _RECV_POLICY,
     ATOMS,
     FLAG_I32_PER_LANE,
     FLAG_LANES,
+    LAMPORT_FILL_BYTE,
+    LAMPORT_SENTINEL,
     QUAD_LANES,
     QUADS_PER_WAVE,
     _acquire_inbox,
+    _any_sentinel,
     _buffer_load,
     _buffer_ptr,
+    _buffer_store,
     _color_io,
     _i32_to_bytes,
     _load_flag,
@@ -87,11 +142,18 @@ from .transport import (
     _store_flag_peer,
     _store_v4i32_peer,
     _to_sgpr_i64,
+    lamport_rearm_modifier,
     make_pack_storage,
 )
 
 # The one 64 B handshake sector at the tail of every slot, in i32.
 _FLAG_SECTOR_I32 = 16
+
+# Inbox buffers and colour cycle of the Lamport handshake; see the module
+# docstring.
+_LAMPORT_LOCAL_BUFFERS = 2
+_LAMPORT_X_BUFFERS = 3
+_LAMPORT_COLORS = 6
 
 
 def check_groups(groups, world_size: int) -> tuple[tuple[int, ...], ...]:
@@ -179,6 +241,7 @@ def make_quick_allreduce_hier_kernel(
     block: int,
     local_rs: str = "mesh",
     local_ag: str = "mesh",
+    handshake: str = "flag",
 ):
     """Build the hierarchical kernel for one *rank*.
 
@@ -186,8 +249,11 @@ def make_quick_allreduce_hier_kernel(
     sorted groups. The rank, its group, its local peers and its partner are
     all trace-time constants, so this is one binary per rank. *local_rs* and
     *local_ag* pick the schedule of the two local laps, ``"mesh"`` or
-    ``"ring"``.
+    ``"ring"``. *handshake* is one of ``HANDSHAKES``, for all three laps.
     """
+    if handshake not in HANDSHAKES:
+        raise ValueError(f"handshake must be one of {HANDSHAKES}, got {handshake!r}")
+    lamport = handshake == "lamport"
     groups = check_groups(groups, world_size)
     if not 0 <= int(rank) < world_size:
         raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
@@ -254,11 +320,14 @@ def make_quick_allreduce_hier_kernel(
     rs, xc, ag = cs[rs_codec], cs[x_codec], cs[ag_codec]
 
     # Inbox geometry, in i32. Each slot is ST sub-tiles of rank_atoms
-    # rank-tiles, then the 64 B handshake sector. Every rank-tile is a whole
-    # number of sectors, so every slot and region stays 64 B aligned.
+    # rank-tiles, then, on the flag handshake, the 64 B handshake sector.
+    # Every rank-tile is a whole number of sectors, so every slot and region
+    # stays 64 B aligned.
+    flag_sector = 0 if lamport else _FLAG_SECTOR_I32
+
     def _slot(c):
         payload = rank_atoms * c.rank_tile_i32
-        return payload, super_tile * payload, super_tile * payload + _FLAG_SECTOR_I32
+        return payload, super_tile * payload, super_tile * payload + flag_sector
 
     rs_payload, rs_release, rs_slot = _slot(rs)
     x_payload, x_release, x_slot = _slot(xc)
@@ -267,12 +336,15 @@ def make_quick_allreduce_hier_kernel(
     # on the ring one per hop, each written only by the ring predecessor.
     rs_n = G - 1 if rs_ring else G
     ag_n = G - 1 if ag_ring else G
-    # LOCAL_RS [grid][rs_n], CROSS [2 parity][grid][2 groups],
-    # LOCAL_AG [grid][ag_n].
+    local_buffers = _LAMPORT_LOCAL_BUFFERS if lamport else 1
+    x_buffers = _LAMPORT_X_BUFFERS if lamport else 2
+    # LOCAL_RS [local_buffers][grid][rs_n], CROSS [x_buffers][grid][2 groups],
+    # LOCAL_AG [local_buffers][grid][ag_n].
     rs_base = 0
-    x_base = rs_base + grid * rs_n * rs_slot
-    ag_base = x_base + 2 * grid * 2 * x_slot
-    inbox_i32 = ag_base + grid * ag_n * ag_slot
+    x_base = rs_base + local_buffers * grid * rs_n * rs_slot
+    ag_base = x_base + x_buffers * grid * 2 * x_slot
+    inbox_i32 = ag_base + local_buffers * grid * ag_n * ag_slot
+    rearm_cm = lamport_rearm_modifier(inbox_memory)
 
     lds_bytes = hier_lds_bytes(
         block, G, rs_codec, x_codec, ag_codec, local_rs, local_ag
@@ -344,19 +416,21 @@ def make_quick_allreduce_hier_kernel(
 
         # Slot offsets, by arithmetic rather than a layout: at G = 4 or 8 a
         # unit mode would not survive coalescing (see the ring kernel).
-        def _local_slot(base, slot, payload, n, idx, sub):
+        def _local_slot(base, slot, payload, n, idx, sub, buf):
+            row = bid if buf is None else buf * fx.Int32(grid) + bid
             return (
                 fx.Int32(base)
-                + (bid * fx.Int32(n) + idx) * fx.Int32(slot)
+                + (row * fx.Int32(n) + idx) * fx.Int32(slot)
                 + sub * fx.Int32(payload)
             )
 
-        def _rs_slot(idx, sub):
-            """Mesh: *idx* is the source local index. Ring: the hop."""
-            return _local_slot(rs_base, rs_slot, rs_payload, rs_n, idx, sub)
+        def _rs_slot(idx, sub, buf=None):
+            """Mesh: *idx* is the source local index. Ring: the hop. *buf* is
+            the Lamport buffer (None on the flag handshake, which has one)."""
+            return _local_slot(rs_base, rs_slot, rs_payload, rs_n, idx, sub, buf)
 
-        def _ag_slot(idx, sub):
-            return _local_slot(ag_base, ag_slot, ag_payload, ag_n, idx, sub)
+        def _ag_slot(idx, sub, buf=None):
+            return _local_slot(ag_base, ag_slot, ag_payload, ag_n, idx, sub, buf)
 
         def _x_slot(parity, grp, sub):
             return (
@@ -577,13 +651,23 @@ def make_quick_allreduce_hier_kernel(
                 _rs_slot(fx.Int32(G - 2), fx.Int32(0)) + fx.Int32(rs_release), color
             )
 
-        def _group_partial(tile, s, k):
-            """Our group's partial sum of atom *k* of our own chunk."""
+        def _group_partial(tile, s, k, polled=None):
+            """Our group's partial sum of atom *k* of our own chunk.
+
+            *polled* is ``_poll_rs``'s result on the Lamport handshake; on the
+            flag handshake the packets are read here."""
+
+            def _packet(idx):
+                if const_expr(polled is None):
+                    return _recv(
+                        rs, _rs_slot(fx.Int32(idx), s) + fx.Int32(k * rs.rank_tile_i32)
+                    )
+                words, word = polled[(idx, k)]
+                return words, _scale_from_word(rs, word, pair_in_slot)
+
             if const_expr(rs_ring):
                 # The ring's last hop: the other G - 1 contributions, plus ours.
-                words, scale = _recv(
-                    rs, _rs_slot(fx.Int32(G - 2), s) + fx.Int32(k * rs.rank_tile_i32)
-                )
+                words, scale = _packet(G - 2)
                 acc = _codec_dequant(rs, words, scale, tid, _own_share(tile, k))
             else:
                 # In local-index order.
@@ -596,10 +680,7 @@ def make_quick_allreduce_hier_kernel(
                         else:
                             acc = _add_f16(own, acc)
                     else:
-                        words, scale = _recv(
-                            rs,
-                            _rs_slot(fx.Int32(m), s) + fx.Int32(k * rs.rank_tile_i32),
-                        )
+                        words, scale = _packet(m)
                         acc = _codec_dequant(rs, words, scale, tid, acc)
             return acc
 
@@ -681,86 +762,421 @@ def make_quick_allreduce_hier_kernel(
                 else:
                     pass
 
-        n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
-        color = _load_color()
-        st_i = fx.Int32(super_tile)
-        for i in range(fx.Int32(0), n_block_tiles, st_i):
-            remain = n_block_tiles - i
-            n_this = (remain < st_i).select(remain, st_i)
-            parity = color & fx.Int32(1)
+        # ---- Lamport handshake; see the module docstring. ----
 
-            # Lap 1: local reduce-scatter.
-            if const_expr(rs_ring):
-                _rs_ring(i, n_this, color)
-            else:
-                _rs_mesh(i, n_this, color)
+        rearm_vec = fx.Vector.from_elements([fx.Int32(LAMPORT_SENTINEL)] * 4, fx.Int32)
 
-            # Lap 2: our group's partial of our own chunk, sent to the partner
-            # and to our own cross slot.
-            for s in range(fx.Int32(0), n_this, fx.Int32(1)):
-                tile = bid + (i + s) * n_blocks
-                for k in range_constexpr(rank_atoms):
-                    acc = _group_partial(tile, s, k)
-                    words, scale, is_leader = _codec_quant(xc, acc, lane, tid)
-                    _lds_write_packet(xc, fx.Int32(k), words, scale, is_leader)
-                gpu.barrier()
-                _store_rows(xc, partner_base, _x_slot(parity, my_group, s))
-                _store_rows(xc, self_base, _x_slot(parity, my_group, s))
-                _next_subtile(s, n_this)
-            _publish_one(
-                partner_base,
-                _x_slot(parity, my_group, fx.Int32(0)) + fx.Int32(x_release),
-                color,
+        def _poll(c, bases):
+            """``[(words, scale_word)]`` of the packets of codec *c* at the i32
+            offsets *bases* of our inbox, raw as ``_recv_raw`` returns them,
+            once none of the dwords this thread reads is the sentinel.
+
+            As the mesh's Lamport receive: every dword is read before any is
+            tested, past L1 and L2, then all are re-read together with relaxed
+            system-scope atomics until every one has landed. There is no
+            re-arm here (``_rearm``); ``vmcnt(0)`` drains every store issued
+            before, the re-arms among them, which the buffer argument needs.
+            """
+            slots = lamport_slots(c, tid, scale_slot)
+            offs = [b + off for b in bases for off, _pred in slots]
+            got = fx.Vector.from_elements(
+                [_buffer_load(inbox, o, 1, fx.Int32, _RECV_POLICY)[0] for o in offs],
+                fx.Int32,
             )
-            _wait_one(
-                _x_slot(parity, 1 - my_group, fx.Int32(0)) + fx.Int32(x_release),
-                color,
-            )
+            addrs = [self_base + _i32_to_bytes(o) for o in offs]
+            while _any_sentinel(got):
+                got = fx.Vector.from_elements([_load_flag(a) for a in addrs], fx.Int32)
+            rocdl.s_waitcnt(vmcnt=0)
+            per = len(slots)
+            return [
+                split_lamport_packet(
+                    c, [got[i * per + j] for j in range_constexpr(per)]
+                )
+                for i in range_constexpr(len(bases))
+            ]
 
-            # Lap 3: the final sum, group 0's packet first on both partners,
-            # quantized once. Our own chunk is decoded from the same packet
-            # and stored now. The packet goes to every local peer (mesh) or to
-            # the successor as the all-gather's first hop (ring).
-            for s in range(fx.Int32(0), n_this, fx.Int32(1)):
-                tile = bid + (i + s) * n_blocks
-                for k in range_constexpr(rank_atoms):
-                    acc = None
-                    for g in range_constexpr(2):
-                        words, scale = _recv(
-                            xc, _x_slot(parity, g, s) + fx.Int32(k * xc.rank_tile_i32)
-                        )
-                        acc = _codec_dequant(xc, words, scale, tid, acc)
-                    words, scale, is_leader = _codec_quant(ag, acc, lane, tid)
-                    for j in range_constexpr(_local_rows(local_ag, G)):
-                        _lds_write_packet(
-                            ag, fx.Int32(j * rank_atoms + k), words, scale, is_leader
-                        )
-                    _stash_own(
-                        tile,
-                        li * rank_atoms + k,
-                        _codec_dequant(
-                            ag, words, _scale_from_word(ag, scale, pair_in_slot), tid
-                        ),
+        def _rearm(base_i32, n_i32):
+            """Put the sentinel back in *n_i32* dwords of our inbox from
+            *base_i32*, 16 B per lane (``lamport_rearm_modifier``)."""
+            n_vec = fx.Int32(n_i32 // 4)
+            for v0 in range(fx.Int32(0), n_vec, fx.Int32(block)):
+                v = v0 + tid
+                if v < n_vec:
+                    _buffer_store(
+                        inbox, base_i32 + v * fx.Int32(4), rearm_vec, rearm_cm
                     )
-                gpu.barrier()
-                if const_expr(ag_ring):
-                    _store_rows(ag, next_base, _ag_slot(fx.Int32(0), s))
-                else:
-                    _fanout_local(ag, _ag_slot(fx.Int32(li), s))
-                _next_subtile(s, n_this)
-            if const_expr(ag_ring):
-                _ag_ring(i, n_this, color)
-            else:
-                _ag_mesh(i, n_this, color)
 
-            color = color + fx.Int32(1)
-            # 0 is the unset sentinel. Wrap to 2, not 1, so that the parity
-            # keeps alternating and the cross slots stay double-buffered.
-            if color == fx.Int32(0):
-                color = fx.Int32(2)
-        if tid == 0:
-            _store_color(color)
-        gpu.barrier()
+        def _rearm_local(buf):
+            """Every local slot of this block in buffer *buf*."""
+            _rearm(_rs_slot(fx.Int32(0), fx.Int32(0), buf), rs_n * rs_slot)
+            _rearm(_ag_slot(fx.Int32(0), fx.Int32(0), buf), ag_n * ag_slot)
+
+        def _rearm_cross(buf):
+            """The partner's cross slot of this block in buffer *buf*."""
+            _rearm(_x_slot(buf, 1 - my_group, fx.Int32(0)), x_slot)
+
+        def _pushed():
+            """After a Lamport lap's (or ring hop's) pushes: on a cacheable
+            inbox this wave writes them back out of L2. No barrier, no flag."""
+            if const_expr(release_scope is not None):
+                _release_inbox(release_scope)
+
+        def _lds_free():
+            """Join the workgroup once this wave's LDS reads have landed, so
+            the next pack cannot overwrite rows a push still reads. The flag
+            handshake gets this join from its publish and wait."""
+            rocdl.s_waitcnt(lgkmcnt=0)
+            gpu.barrier()
+
+        def _rank_tiles(slot_fn, idxs, s, c, buf):
+            """``(keys, bases)``: ``(idx, k)`` and the i32 offset of rank-tile
+            *k* of sub-tile *s* in slot *idx*, for every *idx* of *idxs*."""
+            keys = [(m, k) for m in idxs for k in range_constexpr(rank_atoms)]
+            bases = [
+                slot_fn(fx.Int32(m), s, buf) + fx.Int32(k * c.rank_tile_i32)
+                for m, k in keys
+            ]
+            return keys, bases
+
+        def _poll_rs(s, buf):
+            """The reduce-scatter packets lap 2 reads for sub-tile *s*,
+            ``{(slot, k): (words, scale_word)}``: the ring's last hop, or every
+            other local rank's on the mesh."""
+            idxs = [G - 2] if rs_ring else push_locals
+            keys, bases = _rank_tiles(_rs_slot, idxs, s, rs, buf)
+            return dict(zip(keys, _poll(rs, bases)))
+
+        def _recv_own(c, base):
+            """Our own cross packet, which this block stored into our own
+            inbox in lap 2: from L2 (``sc1``), where its ``nt`` stores may
+            still sit."""
+
+            def _get(off):
+                return _buffer_load(inbox, base + off, 1, fx.Int32, _CM_SC1)[0]
+
+            return _codec_load(c, _get, tid, scale_slot)
+
+        def _rs_mesh_lamport(i, n_this, buf):
+            """Lap 1 on the mesh: as ``_rs_mesh``, without the handshake."""
+            for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                tile = bid + (i + s) * n_blocks
+                _lds_free()
+                for j in range_constexpr(n_push):
+                    for k in range_constexpr(rank_atoms):
+                        atom = _load_atom(tile, push_locals[j] * rank_atoms + k)
+                        words, scale, is_leader = _codec_quant(rs, atom, lane, tid)
+                        words = lamport_fix(rs, words, tid)
+                        _lds_write_packet(
+                            rs, fx.Int32(j * rank_atoms + k), words, scale, is_leader
+                        )
+                gpu.barrier()
+                _fanout_local(rs, _rs_slot(fx.Int32(li), s, buf))
+            _pushed()
+
+        def _rs_ring_lamport(i, n_this, buf):
+            """Lap 1 on the ring: as ``_rs_ring``, each sub-tile of hop ``h``
+            starting as soon as the same sub-tile of hop ``h - 1`` lands."""
+            for _h in range_constexpr(G - 1):
+                h = _h + 1
+                chunk = (li - h) % G
+                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                    tile = bid + (i + s) * n_blocks
+                    if const_expr(h >= 2):
+                        _keys, bases = _rank_tiles(_rs_slot, [h - 2], s, rs, buf)
+                        polled = _poll(rs, bases)
+                    else:
+                        pass  # hop 1 is a pure send
+                    _lds_free()
+                    for k in range_constexpr(rank_atoms):
+                        acc = _load_atom(tile, chunk * rank_atoms + k)
+                        if const_expr(h >= 2):
+                            words, word = polled[k]
+                            acc = _codec_dequant(
+                                rs,
+                                words,
+                                _scale_from_word(rs, word, pair_in_slot),
+                                tid,
+                                acc,
+                            )
+                        else:
+                            pass
+                        words, scale, is_leader = _codec_quant(rs, acc, lane, tid)
+                        words = lamport_fix(rs, words, tid)
+                        _lds_write_packet(rs, fx.Int32(k), words, scale, is_leader)
+                    gpu.barrier()
+                    _store_rows(rs, next_base, _rs_slot(fx.Int32(h - 1), s, buf))
+                _pushed()
+
+        def _ag_mesh_lamport(i, n_this, buf):
+            """The gather on the mesh: every local peer's packet of each
+            sub-tile, as soon as it lands."""
+            for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                tile = bid + (i + s) * n_blocks
+                keys, bases = _rank_tiles(_ag_slot, push_locals, s, ag, buf)
+                polled = dict(zip(keys, _poll(ag, bases)))
+                gathered = []
+                for m in range_constexpr(G):
+                    for k in range_constexpr(rank_atoms):
+                        if const_expr(m == li):
+                            gathered.append(_unstash_own(tile, li * rank_atoms + k))
+                        else:
+                            words, word = polled[(m, k)]
+                            gathered.append(
+                                _codec_dequant(
+                                    ag,
+                                    words,
+                                    _scale_from_word(ag, word, pair_in_slot),
+                                    tid,
+                                )
+                            )
+                _finish_tile(tile, gathered, None)
+
+        def _ag_ring_lamport(i, n_this, buf):
+            """Hops ``2 .. G`` on the ring: as ``_ag_ring``, sub-tile by
+            sub-tile. The forwarded bytes are already off the sentinel."""
+            is_leader = (tid % fx.Int32(GROUP)) == fx.Int32(0)
+            for _h in range_constexpr(G - 1):
+                h = _h + 2
+                chunk = (li - h + 1) % G
+                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                    tile = bid + (i + s) * n_blocks
+                    _keys, bases = _rank_tiles(_ag_slot, [h - 2], s, ag, buf)
+                    polled = _poll(ag, bases)
+                    if const_expr(h < G):
+                        _lds_free()
+                    else:
+                        pass
+                    for k in range_constexpr(rank_atoms):
+                        words, word = polled[k]
+                        _complete(
+                            tile,
+                            chunk * rank_atoms + k,
+                            _codec_dequant(
+                                ag, words, _scale_from_word(ag, word, pair_in_slot), tid
+                            ),
+                            None,
+                        )
+                        if const_expr(h < G):
+                            _lds_write_packet(ag, fx.Int32(k), words, word, is_leader)
+                        else:
+                            pass
+                    if const_expr(h < G):
+                        gpu.barrier()
+                        _store_rows(ag, next_base, _ag_slot(fx.Int32(h - 1), s, buf))
+                    else:
+                        pass  # the last hop receives only
+                if const_expr(h < G):
+                    _pushed()
+                else:
+                    pass
+
+        def _main_lamport():
+            n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
+            color = _load_color()
+            st_i = fx.Int32(super_tile)
+            for i in range(fx.Int32(0), n_block_tiles, st_i):
+                remain = n_block_tiles - i
+                n_this = (remain < st_i).select(remain, st_i)
+                lbuf = color & fx.Int32(1)
+                xbuf = color % fx.Int32(_LAMPORT_X_BUFFERS)
+
+                # Lap 1: local reduce-scatter.
+                if const_expr(rs_ring):
+                    _rs_ring_lamport(i, n_this, lbuf)
+                else:
+                    _rs_mesh_lamport(i, n_this, lbuf)
+
+                # Lap 2: each sub-tile's group partial as soon as its
+                # reduce-scatter packets land, to the partner and to our own
+                # cross slot.
+                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                    tile = bid + (i + s) * n_blocks
+                    polled = _poll_rs(s, lbuf)
+                    _lds_free()
+                    for k in range_constexpr(rank_atoms):
+                        acc = _group_partial(tile, s, k, polled)
+                        words, scale, is_leader = _codec_quant(xc, acc, lane, tid)
+                        words = lamport_fix(xc, words, tid)
+                        _lds_write_packet(xc, fx.Int32(k), words, scale, is_leader)
+                    gpu.barrier()
+                    _store_rows(xc, partner_base, _x_slot(xbuf, my_group, s))
+                    _store_rows(xc, self_base, _x_slot(xbuf, my_group, s))
+                _pushed()
+                # This group's reduce-scatter has landed from every local
+                # rank: the previous group's local slots can be re-armed.
+                _rearm_local(fx.Int32(1) - lbuf)
+
+                # Lap 3: the final sum, group 0's packet first on both
+                # partners, as on the flag handshake. The poll's barrier
+                # (``_lds_free``) follows every wave's ``vmcnt(0)``, so our own
+                # cross packet is in L2 by the time any wave reads it.
+                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                    tile = bid + (i + s) * n_blocks
+                    theirs = _poll(
+                        xc,
+                        [
+                            _x_slot(xbuf, 1 - my_group, s)
+                            + fx.Int32(k * xc.rank_tile_i32)
+                            for k in range_constexpr(rank_atoms)
+                        ],
+                    )
+                    _lds_free()
+                    for k in range_constexpr(rank_atoms):
+                        acc = None
+                        for g in range_constexpr(2):
+                            if const_expr(g == my_group):
+                                words, word = _recv_own(
+                                    xc,
+                                    _x_slot(xbuf, g, s)
+                                    + fx.Int32(k * xc.rank_tile_i32),
+                                )
+                            else:
+                                words, word = theirs[k]
+                            acc = _codec_dequant(
+                                xc,
+                                words,
+                                _scale_from_word(xc, word, pair_in_slot),
+                                tid,
+                                acc,
+                            )
+                        words, scale, is_leader = _codec_quant(ag, acc, lane, tid)
+                        # Before our own decode below, so it decodes what the
+                        # peers do.
+                        words = lamport_fix(ag, words, tid)
+                        for j in range_constexpr(_local_rows(local_ag, G)):
+                            _lds_write_packet(
+                                ag,
+                                fx.Int32(j * rank_atoms + k),
+                                words,
+                                scale,
+                                is_leader,
+                            )
+                        _stash_own(
+                            tile,
+                            li * rank_atoms + k,
+                            _codec_dequant(
+                                ag,
+                                words,
+                                _scale_from_word(ag, scale, pair_in_slot),
+                                tid,
+                            ),
+                        )
+                    gpu.barrier()
+                    if const_expr(ag_ring):
+                        _store_rows(ag, next_base, _ag_slot(fx.Int32(0), s, lbuf))
+                    else:
+                        _fanout_local(ag, _ag_slot(fx.Int32(li), s, lbuf))
+                _pushed()
+                # The partner's packet of this group has landed: its previous
+                # cross slot can be re-armed.
+                _rearm_cross(
+                    (xbuf + fx.Int32(_LAMPORT_X_BUFFERS - 1))
+                    % fx.Int32(_LAMPORT_X_BUFFERS)
+                )
+
+                if const_expr(ag_ring):
+                    _ag_ring_lamport(i, n_this, lbuf)
+                else:
+                    _ag_mesh_lamport(i, n_this, lbuf)
+
+                color = color + fx.Int32(1)
+                if color == fx.Int32(_LAMPORT_COLORS):
+                    color = fx.Int32(0)
+            if tid == 0:
+                _store_color(color)
+            gpu.barrier()
+
+        if const_expr(lamport):
+            _main_lamport()
+        else:
+            n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
+            color = _load_color()
+            st_i = fx.Int32(super_tile)
+            for i in range(fx.Int32(0), n_block_tiles, st_i):
+                remain = n_block_tiles - i
+                n_this = (remain < st_i).select(remain, st_i)
+                parity = color & fx.Int32(1)
+
+                # Lap 1: local reduce-scatter.
+                if const_expr(rs_ring):
+                    _rs_ring(i, n_this, color)
+                else:
+                    _rs_mesh(i, n_this, color)
+
+                # Lap 2: our group's partial of our own chunk, sent to the partner
+                # and to our own cross slot.
+                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                    tile = bid + (i + s) * n_blocks
+                    for k in range_constexpr(rank_atoms):
+                        acc = _group_partial(tile, s, k)
+                        words, scale, is_leader = _codec_quant(xc, acc, lane, tid)
+                        _lds_write_packet(xc, fx.Int32(k), words, scale, is_leader)
+                    gpu.barrier()
+                    _store_rows(xc, partner_base, _x_slot(parity, my_group, s))
+                    _store_rows(xc, self_base, _x_slot(parity, my_group, s))
+                    _next_subtile(s, n_this)
+                _publish_one(
+                    partner_base,
+                    _x_slot(parity, my_group, fx.Int32(0)) + fx.Int32(x_release),
+                    color,
+                )
+                _wait_one(
+                    _x_slot(parity, 1 - my_group, fx.Int32(0)) + fx.Int32(x_release),
+                    color,
+                )
+
+                # Lap 3: the final sum, group 0's packet first on both partners,
+                # quantized once. Our own chunk is decoded from the same packet
+                # and stored now. The packet goes to every local peer (mesh) or to
+                # the successor as the all-gather's first hop (ring).
+                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                    tile = bid + (i + s) * n_blocks
+                    for k in range_constexpr(rank_atoms):
+                        acc = None
+                        for g in range_constexpr(2):
+                            words, scale = _recv(
+                                xc,
+                                _x_slot(parity, g, s) + fx.Int32(k * xc.rank_tile_i32),
+                            )
+                            acc = _codec_dequant(xc, words, scale, tid, acc)
+                        words, scale, is_leader = _codec_quant(ag, acc, lane, tid)
+                        for j in range_constexpr(_local_rows(local_ag, G)):
+                            _lds_write_packet(
+                                ag,
+                                fx.Int32(j * rank_atoms + k),
+                                words,
+                                scale,
+                                is_leader,
+                            )
+                        _stash_own(
+                            tile,
+                            li * rank_atoms + k,
+                            _codec_dequant(
+                                ag,
+                                words,
+                                _scale_from_word(ag, scale, pair_in_slot),
+                                tid,
+                            ),
+                        )
+                    gpu.barrier()
+                    if const_expr(ag_ring):
+                        _store_rows(ag, next_base, _ag_slot(fx.Int32(0), s))
+                    else:
+                        _fanout_local(ag, _ag_slot(fx.Int32(li), s))
+                    _next_subtile(s, n_this)
+                if const_expr(ag_ring):
+                    _ag_ring(i, n_this, color)
+                else:
+                    _ag_mesh(i, n_this, color)
+
+                color = color + fx.Int32(1)
+                # 0 is the unset sentinel. Wrap to 2, not 1, so that the parity
+                # keeps alternating and the cross slots stay double-buffered.
+                if color == fx.Int32(0):
+                    color = fx.Int32(2)
+            if tid == 0:
+                _store_color(color)
+            gpu.barrier()
 
     flat_wg = f"{block},{block}"
 
@@ -799,6 +1215,8 @@ def make_quick_allreduce_hier_kernel(
         f"_g{grid}_{inbox_memory}_{rs_codec}_{x_codec}_{ag_codec}_b{block}"
         f"_{local_rs}_{local_ag}"
     )
+    if lamport:
+        tag += "_lamport"
     launch_quick_allreduce_hier.func.__name__ = f"launch_quick_allreduce_hier_{tag}"
     try:
         quick_allreduce_hier.func.__name__ = f"quick_allreduce_hier_{tag}"
@@ -806,7 +1224,8 @@ def make_quick_allreduce_hier_kernel(
         pass
     return {
         "launch": launch_quick_allreduce_hier,
-        "flags_bytes": 0,  # the handshakes ride in each slot's 64 B tail
+        # The flag handshakes ride in each slot's 64 B tail; Lamport has none.
+        "flags_bytes": 0,
         "data_bytes": inbox_i32 * 4,
         "lds_bytes": lds_bytes,
         "tile_bytes": tile_bytes,
@@ -832,5 +1251,8 @@ def make_quick_allreduce_hier_kernel(
         "grid": grid,
         "block": block,
         "rank": self_rank,
+        "handshake": handshake,
+        # Byte every inbox byte starts as: the Lamport sentinel, or 0.
+        "inbox_fill": LAMPORT_FILL_BYTE if lamport else 0,
         **epilogue.spec(),
     }

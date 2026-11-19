@@ -37,6 +37,7 @@ from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
 from .allreduce_policy import (
     AG_CODECS,
+    HANDSHAKES,
     HIER_CODECS,
     HIER_LOCAL_SCHEDULES,
     HIER_SUPER_TILES,
@@ -349,7 +350,8 @@ class FlyQuickAllReduce:
       the ladder (``HierRung``) picks the mesh or the ring for each local
       lap, and its codecs; ``local_rs`` and ``local_ag`` pin one schedule,
       and ``rs_codec``, ``x_codec`` and ``ag_codec`` one codec, on every
-      rung.
+      rung. ``handshake`` is one of ``HANDSHAKES`` for all three laps
+      (PROTOTYPE: ``"flag"`` unless given).
 
     ``rs_codec`` and ``ag_codec`` are the wire formats of the ring's two laps.
     The reduce-scatter lap requantizes ``N-1`` times and it defaults to ``"int6"``
@@ -395,8 +397,13 @@ class FlyQuickAllReduce:
         groups=None,
         local_rs: str | None = None,
         local_ag: str | None = None,
+        handshake: str | None = None,
     ):
         check_world_size(world_size)
+        if handshake is not None and handshake not in HANDSHAKES:
+            raise ValueError(
+                f"handshake must be one of {HANDSHAKES}, got {handshake!r}"
+            )
         if algorithm not in ALGORITHMS:
             raise ValueError(
                 f"algorithm must be one of {tuple(ALGORITHMS)}, got {algorithm!r}"
@@ -408,10 +415,11 @@ class FlyQuickAllReduce:
         requested_codecs = (rs_codec, x_codec, ag_codec)
         rs_codec, ag_codec = _resolve_codecs(algo, int(world_size), rs_codec, ag_codec)
         if not algo.hierarchical and any(
-            v is not None for v in (x_codec, groups, local_rs, local_ag)
+            v is not None for v in (x_codec, groups, local_rs, local_ag, handshake)
         ):
             raise ValueError(
-                "x_codec, groups, local_rs and local_ag are for algorithm='hier' only"
+                "x_codec, groups, local_rs, local_ag and handshake are for "
+                "algorithm='hier' only"
             )
         for label, sched in (("local_rs", local_rs), ("local_ag", local_ag)):
             if sched is not None and sched not in HIER_LOCAL_SCHEDULES:
@@ -428,6 +436,7 @@ class FlyQuickAllReduce:
         self.x_codec = None
         self.groups = None
         self.local_rs = self.local_ag = None
+        self.handshake = None
         if algo.hierarchical:
             if x_codec is not None and x_codec not in HIER_CODECS:
                 raise ValueError(
@@ -449,7 +458,8 @@ class FlyQuickAllReduce:
                 groups = topo.groups
             groups = check_groups(groups, int(world_size))
             self.groups = groups
-            build_kw = {"groups": groups}
+            self.handshake = handshake or "flag"
+            build_kw = {"groups": groups, "handshake": self.handshake}
         if ladder is None:
             ladder = algo.st_ladder(world_size=world_size, link=link, arch=arch)
         if not ladder:

@@ -1412,6 +1412,17 @@ _FAILURES: list[str] = []
 # ``(reps, rounds)`` for every timed graph; set by ``main()``.
 _TIMING = (fab.DEFAULT_REPS, fab.DEFAULT_ROUNDS)
 _BASELINES = "all"
+# ``--hier-handshake``: the handshake of the hierarchical engines of the verify
+# spawns; None is the engine's default. Production-dispatch spawns build the
+# production communicator and always take the default.
+_HIER_HANDSHAKE: str | None = None
+
+
+def _with_handshake(engine_kw: dict) -> dict:
+    """*engine_kw* with ``--hier-handshake`` on a hierarchical engine."""
+    if _HIER_HANDSHAKE is not None and engine_kw.get("algorithm") == "hier":
+        return {**engine_kw, "handshake": _HIER_HANDSHAKE}
+    return engine_kw
 
 
 def _key(tp: int, **engine_kw) -> tuple:
@@ -1450,7 +1461,7 @@ def _result(key: tuple, case: tuple) -> list[dict]:
             ranks = _spawn(
                 _run_rank,
                 key[0],
-                engine_kw=kw,
+                engine_kw=_with_handshake(kw),
                 cases=cases,
                 timing=_TIMING,
                 window=_WINDOWS.get(key),
@@ -5058,6 +5069,14 @@ def main():
         help="bench, ar_rmsnorm on gfx950: also time each schedule's\n"
         "MXFP4-quantizing fused kernel against its unfused path.",
     )
+    parser.add_argument(
+        "--hier-handshake",
+        choices=fly_policy.HANDSHAKES,
+        default=None,
+        help="verify: handshake of the hier engines (default: the engine's, flag).\n"
+        "The production-dispatch checks always use the default.\n"
+        "    e.g.: --hier-handshake lamport",
+    )
     fab.add_bench_args(parser)
     args = parser.parse_args()
     fab.check_bench_args(parser, args)
@@ -5069,9 +5088,10 @@ def main():
     if args.list_candidates:
         fab.write_candidates(_list_candidates(args))
         return
-    global _TIMING, _BASELINES
+    global _TIMING, _BASELINES, _HIER_HANDSHAKE
     _TIMING = (args.reps, args.rounds)
     _BASELINES = args.baselines
+    _HIER_HANDSHAKE = args.hier_handshake
 
     tps = fab.select_world_sizes(
         args.tp or list(SUPPORTED_WORLDS),
