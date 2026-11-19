@@ -1,0 +1,15 @@
+{
+  "DEFAULT_FALLBACK": true,
+  "M_LEQ_512": {
+    "BLOCK_SIZE_M": 512,
+    "BLOCK_SIZE_N": 1024,
+    "BLOCK_SIZE_K": 128,
+    "num_warps": 4,
+    "NUM_BUFFERS": 3,
+    "num_ctas": 8,
+    "GROUP_M": 1,
+    "B2B_WMMA": 1,
+    "NUM_KSUB": 1,
+    "EPI_SPLIT": 2
+  }
+}
