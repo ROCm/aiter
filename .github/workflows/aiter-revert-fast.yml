@@ -19,7 +19,7 @@ on:
         required: true
         type: choice
         options:
-          - linux-aiter-mi35x-1
+          - linux-aiter-do-mi350x-dpx-1
           - linux-aiter-oci-mi300x-1
           - linux-aiter-do-mi350x-8
           - linux-aiter-do-mi350x-dpx-8
@@ -71,7 +71,7 @@ jobs:
           import re
 
           ALLOWED_RUNNERS = {
-              "linux-aiter-mi35x-1",
+              "linux-aiter-do-mi350x-dpx-1",
               "linux-aiter-oci-mi300x-1",
               "linux-aiter-do-mi350x-8",
               "linux-aiter-do-mi350x-dpx-8",
