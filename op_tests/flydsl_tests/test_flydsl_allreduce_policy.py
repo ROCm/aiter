@@ -1823,3 +1823,39 @@ def test_hier_rung_takes_a_handshake_but_no_knobs():
         assert P.HierRung(**base, handshake=hs).handshake == hs
     with pytest.raises(ValueError, match="knobs"):
         P.HierRung(**base, handshake="lamport", knobs=P.MeshKnobs(stripe="full"))
+
+
+def test_lamport_finegrained_inbox_holds_the_late_rearm_buffers():
+    """On a fine-grained inbox the Lamport mesh and ring re-arm a round late,
+    which takes four buffers on the mesh (three uncached) and three on the
+    ring (two uncached); the flag handshake is the same on both."""
+    mesh = pytest.importorskip("aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh")
+    ring = pytest.importorskip("aiter.ops.flydsl.kernels.comm.quick_allreduce_ring")
+
+    def data_bytes(build, memory, **kw):
+        return build(inbox_memory=memory, rank=0, grid=64, **kw)["data_bytes"]
+
+    for build, kw, ratio in (
+        (
+            mesh.make_quick_allreduce_mesh_kernel,
+            {"world_size": 8, "super_tile": 1, "codec": "int4", "block": 256},
+            (4, 3),
+        ),
+        (
+            ring.make_quick_allreduce_ring_kernel,
+            {
+                "world_size": 8,
+                "super_tile": 8,
+                "rs_codec": "int6",
+                "ag_codec": "int4",
+                "block": 256,
+            },
+            (3, 2),
+        ),
+    ):
+        fine = data_bytes(build, "finegrained", handshake="lamport", **kw)
+        uncached = data_bytes(build, "uncached", handshake="lamport", **kw)
+        assert fine * ratio[1] == uncached * ratio[0]
+        assert data_bytes(build, "finegrained", handshake="flag", **kw) == data_bytes(
+            build, "uncached", handshake="flag", **kw
+        )

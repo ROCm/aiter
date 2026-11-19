@@ -69,6 +69,7 @@ from .quick_allreduce_fusions import check_fusion_args
 from .quick_allreduce_lamport import (
     check_handshake,
     lamport_addrs,
+    lamport_defers_rearm,
     lamport_first_reads,
     lamport_offsets,
     lamport_packets,
@@ -76,6 +77,7 @@ from .quick_allreduce_lamport import (
     lamport_pushed,
     lamport_rearm_dwords,
     lamport_rearm_modifier,
+    lamport_rearm_span,
     lamport_spin,
 )
 from .quick_allreduce_rmsnorm import MeshRMSNormEpilogue
@@ -131,6 +133,16 @@ PHASE_ALL_GATHER = 1
 # again -- only after our push of ``r + 2``. Our re-arm of ``r`` is drained
 # before that push (``_lamport_recv``), so it is never on the critical path.
 LAMPORT_BUFFERS = 3
+
+# Inbox buffers of the Lamport handshake on a cacheable (fine-grained) inbox,
+# where the re-arm is deferred (``lamport_defers_rearm``). After our push of
+# round ``q`` we re-arm every slot of round ``q - 2`` (``_rearm_round``): by
+# then we hold every peer's packet of round ``q - 1``, which it pushed after
+# its release of round ``q - 2``. A peer writes the buffer of ``q - 2`` again
+# in round ``q + 2``, only after our push of ``q + 1``; the poll of round
+# ``q`` comes before that push, and its ``vmcnt(0)`` drains the re-arm, so it
+# stays off the critical path.
+LAMPORT_BUFFERS_DEFERRED = 4
 
 # (world_size, super_tile) → VGPR-limited workgroups per CU, measured on the
 # mesh kernel. Super-tile widens the live atom list, so residency falls as it
@@ -354,6 +366,8 @@ def make_quick_allreduce_mesh_kernel(
     wire_tile_i32 = release_i32_off + (0 if lamport else 16)
     wire_tile_bytes = wire_tile_i32 * 4
     rearm_cm = lamport_rearm_modifier(inbox_memory)
+    # Re-arm a round late, whole slots, rather than each polled dword at once.
+    defer_rearm = lamport and lamport_defers_rearm(inbox_memory)
 
     # This rank's own index as a trace-time constant: its own slice of every
     # tile never leaves registers, and "all peers but me" is only expressible
@@ -422,7 +436,12 @@ def make_quick_allreduce_mesh_kernel(
             f"{grid}"
         )
     flags_i32 = 0 if lamport else PHASES * grid * world_size
-    wire_buffers = LAMPORT_BUFFERS if lamport else PHASES
+    if not lamport:
+        wire_buffers = PHASES
+    elif defer_rearm:
+        wire_buffers = LAMPORT_BUFFERS_DEFERRED
+    else:
+        wire_buffers = LAMPORT_BUFFERS
 
     # One signature for both modes; the plain launcher below passes zeros for
     # the fused operands, which a plain epilogue never reads. See the ring
@@ -865,15 +884,21 @@ def make_quick_allreduce_mesh_kernel(
 
         def _lamport_rearm(rearm):
             """``lamport_rearm_dwords``, then drop the ``prio`` boost that the
-            fanout and the poll shared."""
-            lamport_rearm_dwords(inbox, rearm, rearm_cm)
+            fanout and the poll shared. With the re-arm deferred
+            (``_rearm_round``) only ``vmcnt(0)``: it drains the round re-arm
+            issued before this poll (``LAMPORT_BUFFERS_DEFERRED``)."""
+            if const_expr(defer_rearm):
+                rocdl.s_waitcnt(vmcnt=0)
+            else:
+                lamport_rearm_dwords(inbox, rearm, rearm_cm)
             _prio(0)
 
         def _lamport_recv(buf, sub):
             """Every peer's packet of *sub* in *buf*, ``{(src, k): (words,
             scale)}``, once none of the dwords this thread reads is the
             sentinel (``lamport_poll``, ``poll_sleep`` knob); then put the
-            sentinel back in them (``lamport_rearm_dwords``, ``LAMPORT_BUFFERS``).
+            sentinel back in them (``lamport_rearm_dwords``, ``LAMPORT_BUFFERS``),
+            or, deferred, leave that to ``_rearm_round``.
 
             ``recv_order="per_source"`` keeps the first reads (all issued up
             front, so the round trips still overlap) but tests and re-reads one
@@ -928,7 +953,23 @@ def make_quick_allreduce_mesh_kernel(
 
         def _next_buf(buf):
             nxt = buf + fx.Int32(1)
-            return (nxt >= fx.Int32(LAMPORT_BUFFERS)).select(fx.Int32(0), nxt)
+            return (nxt >= fx.Int32(wire_buffers)).select(fx.Int32(0), nxt)
+
+        def _rearm_round(pushed_buf):
+            """Deferred re-arm, after our push of the round in *pushed_buf*:
+            every slot of this block in the buffer of two rounds before
+            (``LAMPORT_BUFFERS_DEFERRED``)."""
+            if const_expr(defer_rearm):
+                back = pushed_buf - fx.Int32(2)
+                back = (back < fx.Int32(0)).select(back + fx.Int32(wire_buffers), back)
+                lamport_rearm_span(
+                    inbox,
+                    _sub_tile_i32(back, fx.Int32(0), fx.Int32(0)),
+                    world_size * wire_tile_i32,
+                    tid,
+                    block,
+                    rearm_cm,
+                )
 
         # ``lds_bufs`` knob: the packs of a group alternate between two LDS
         # buffers by their running index p (ST=1: RS is 0, AG is 1; ST>1: RS
@@ -1008,6 +1049,7 @@ def make_quick_allreduce_mesh_kernel(
             _pack_reduce_scatter(atoms, rs_row0)
             _pack_join()
             _lamport_fanout(color, fx.Int32(0), rs_row0, keep_prio=True)
+            _rearm_round(color)
             nxt = None
             if const_expr(next_tile is not None):
                 nxt = _load_tile_atoms(next_tile)
@@ -1018,6 +1060,7 @@ def make_quick_allreduce_mesh_kernel(
             own_ag = _pack_all_gather(acc, ag_row0)
             _pack_join()
             _lamport_fanout(ag_buf, fx.Int32(0), ag_row0, keep_prio=True)
+            _rearm_round(ag_buf)
             polled = _lamport_recv(ag_buf, fx.Int32(0))
             gathered = _recv_all_gather(fx.Int32(0), own_ag, polled)
             _finish_tile(tile, gathered, pre)
@@ -1059,6 +1102,7 @@ def make_quick_allreduce_mesh_kernel(
                     _pack_reduce_scatter(atoms, rs_row0)
                     _pack_join()
                     _lamport_fanout(color, s, rs_row0)
+                _rearm_round(color)
 
                 # Each sub-tile is reduced as soon as its own packets land,
                 # not once the whole group has.
@@ -1077,6 +1121,7 @@ def make_quick_allreduce_mesh_kernel(
                         _stash_own(tile, self_rank * rank_atoms + k, own_ag[k])
                     _pack_join()
                     _lamport_fanout(ag_buf, s, ag_row0)
+                _rearm_round(ag_buf)
 
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     tile = bid + (i + s) * n_blocks

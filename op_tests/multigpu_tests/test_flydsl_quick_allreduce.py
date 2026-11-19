@@ -424,6 +424,37 @@ FORCED_HIER_LAMPORT_CASES = (
     (8, "halves", "run_ahead", None, None, None, *RUN_AHEAD_SHAPE, "finegrained"),
 )
 
+# The mesh and the ring on the Lamport handshake and a fine-grained inbox,
+# where they re-arm a round late (``lamport_defers_rearm``), on every host: a
+# minimal sweep, ``(tp, algorithm, check, super_tile, block, tokens, hidden,
+# tuning)``. ``exact`` pins the fp16 wire and a geometry; 1031 rows leave every
+# block several super-tile groups and a partial last one, so the inbox
+# buffers rotate more than once per call. ``run_ahead`` runs back to back
+# under rank skew: the mesh on its shipping ladder and codecs (the rungs'
+# knobs too), the ring on the pinned geometry, which every host can build.
+# One mesh row turns on every knob that changes the receive or the staging.
+LAMPORT_FINEGRAINED_CASES = tuple(
+    case
+    for tp in SUPPORTED_WORLDS
+    for case in (
+        (tp, "mesh", "exact", 4, 256, 1031, 7168, None),
+        (tp, "mesh", "run_ahead", None, None, *RUN_AHEAD_SHAPE, None),
+        (tp, "ring", "exact", 8, 256, 1031, 7168, None),
+        (tp, "ring", "run_ahead", 8, 256, *RUN_AHEAD_SHAPE, None),
+    )
+) + (
+    (
+        8,
+        "mesh",
+        "exact",
+        1,
+        256,
+        333,
+        7168,
+        "stripe=full;recv_order=per_source;prefetch=1;lds_bufs=2",
+    ),
+)
+
 # (tp, algorithm, tokens, hidden, block): the shipping INT4 ladder with
 # ``block`` overridden on every rung. ``--extended`` only: no production rung
 # uses most of these widths.
@@ -1657,13 +1688,21 @@ _BASELINES = "all"
 # spawns; None is the engine's default. Production-dispatch spawns build the
 # production communicator and always take the default.
 _HIER_HANDSHAKE: str | None = None
+# ``--handshake``: the handshake of every mesh, ring and hier engine of the
+# verify spawns (``--hier-handshake`` first on a hier one); None keeps each
+# engine's ladder's.
+_HANDSHAKE: str | None = None
 
 
 def _with_handshake(engine_kw: dict) -> dict:
-    """*engine_kw* with ``--hier-handshake`` on a hierarchical engine that
-    does not name its own."""
-    if _HIER_HANDSHAKE is not None and engine_kw.get("algorithm") == "hier":
-        return {"handshake": _HIER_HANDSHAKE, **engine_kw}
+    """*engine_kw* with ``--hier-handshake`` / ``--handshake`` on an engine
+    that does not name its own."""
+    algorithm = engine_kw.get("algorithm")
+    handshake = _HANDSHAKE
+    if algorithm == "hier" and _HIER_HANDSHAKE is not None:
+        handshake = _HIER_HANDSHAKE
+    if handshake is not None and algorithm in ("mesh", "ring", "hier"):
+        return {"handshake": handshake, **engine_kw}
     return engine_kw
 
 
@@ -2254,6 +2293,69 @@ def test_quick_allreduce_hier_forced(
         "local": rows[0].get("local"),
         "rs_codec": rows[0].get("rs_codec"),
         "ag_codec": rows[0].get("ag_codec"),
+        "st_used": rows[0].get("st_used"),
+        "lanes_differing": max(r["lanes_differing"] for r in rows),
+        "sqnr_db": min(r["sqnr_db"] for r in rows),
+        "n_mismatch": (
+            max(r["n_mismatch"] for r in rows) if check == "exact" else None
+        ),
+    }
+
+
+def _lamport_finegrained_key(tp, algorithm, super_tile, block, tuning):
+    kw = {
+        "algorithm": algorithm,
+        "handshake": "lamport",
+        "inbox_memory": "finegrained",
+    }
+    if super_tile is not None:
+        kw.update(
+            rs_codec="fp16",
+            ag_codec="fp16",
+            super_tile=super_tile,
+            grid_cap=TRANSPORT_GRID_CAP,
+            block=block,
+        )
+    if tuning is not None:
+        kw["tuning"] = tuning
+    return _key(tp, **kw)
+
+
+@benchmark()
+def test_quick_allreduce_lamport_finegrained(
+    tp, algorithm, check, super_tile, block, tokens, hidden, tuning
+):
+    """The mesh or the ring on the Lamport handshake and a fine-grained inbox,
+    which re-arms a round late (``LAMPORT_FINEGRAINED_CASES``); correctness
+    only. *check* is ``exact`` (the fp16 wire, bit-identical to the fp32
+    reference) or ``run_ahead``."""
+    label = (
+        f"tp={tp} {algorithm} lamport finegrained {check} {tokens}x{hidden} "
+        f"st={super_tile} block={block} knobs={tuning}"
+    )
+    rows = _result(
+        _lamport_finegrained_key(tp, algorithm, super_tile, block, tuning),
+        (tokens, hidden, check, False),
+    )
+    fails = [
+        f"rank {rank}: ran handshake {row['handshake']} on {row['inbox_memory']}"
+        for rank, row in enumerate(rows)
+        if row["handshake"] != "lamport" or row["inbox_memory"] != "finegrained"
+    ]
+    if check == "exact":
+        fails += _identity_fails(rows, algorithm)
+        fails += [
+            f"rank {rank}: {row['n_mismatch']} mismatched elements, "
+            f"max |err| {row['max_abs_err']:.3e}, "
+            f"first bad flat index {row['first_bad']}"
+            for rank, row in enumerate(rows)
+            if row["n_mismatch"]
+        ]
+    else:
+        fails += _run_ahead_fails(rows, algorithm)
+    _check(label, fails)
+    return {
+        "gfx": ARCH,
         "st_used": rows[0].get("st_used"),
         "lanes_differing": max(r["lanes_differing"] for r in rows),
         "sqnr_db": min(r["sqnr_db"] for r in rows),
@@ -3490,6 +3592,54 @@ def test_quick_allreduce_rmsnorm_mesh_pinned_st_is_bit_exact(
     return _fused_summary(rows)
 
 
+# The fused mesh and ring on the Lamport handshake and a fine-grained inbox,
+# which re-arm a round late: ``(tp, algorithm, super_tile)`` on a lossless
+# wire, one live rank, 4096 rows of 4096, so every block runs many super-tile
+# groups and the inbox buffers rotate many times per call.
+_FUSED_LAMPORT_FINEGRAINED_CASES = (
+    (2, "mesh", 1),
+    (2, "mesh", 4),
+    (8, "mesh", 1),
+    (8, "mesh", 4),
+    (2, "ring", 8),
+    (8, "ring", 8),
+)
+
+
+@benchmark()
+def test_quick_allreduce_rmsnorm_lamport_finegrained(tp, algorithm, super_tile):
+    """The fused build on the Lamport handshake and a fine-grained inbox
+    (``_FUSED_LAMPORT_FINEGRAINED_CASES``): ``residual_out`` exact."""
+    tokens = hidden = 4096
+    pin = _pinned_st_kw(super_tile) if algorithm == "mesh" else {}
+    batch = _fused_batch(
+        (tp, "lamport-finegrained", algorithm, hidden, super_tile),
+        [(tokens, hidden)],
+        algorithm=algorithm,
+        codecs=("fp16", "fp16"),
+        solo=True,
+        engine_kw={
+            "super_tile": super_tile,
+            **pin,
+            "handshake": "lamport",
+            "inbox_memory": "finegrained",
+        },
+    )
+    rows = batch[(tokens, hidden)]
+    fails = [
+        f"rank {r['rank']} ran {r['variant']}, not a st{super_tile} Lamport "
+        "build on a fine-grained inbox"
+        for r in rows
+        if not all(
+            t in r["variant"]
+            for t in (f"_st{super_tile}_", "_finegrained_", "_lamport")
+        )
+    ]
+    fails += _fused_exact_fails(rows, "the late re-arm lost or reused a packet")
+    _check(f"tp{tp} fused {algorithm} lamport finegrained st{super_tile}", fails)
+    return _fused_summary(rows)
+
+
 # The width the fused first-call-in-capture spawn declares up front.
 FUSED_CAPTURE_HIDDEN = 4096
 FUSED_CAPTURE_EPS = 0.5
@@ -4474,6 +4624,12 @@ def _verify(args, tps, algos, dts, link) -> None:
             _forced_hier_key(tp, split, hs, local, st, block, mem),
             (tokens, hidden, check, False),
         )
+    lamport_fg = [c for c in LAMPORT_FINEGRAINED_CASES if c[0] in tps and c[1] in algos]
+    for tp, algorithm, check, st, block, tokens, hidden, tuning in lamport_fg:
+        _register(
+            _lamport_finegrained_key(tp, algorithm, st, block, tuning),
+            (tokens, hidden, check, False),
+        )
 
     def _rows(cases):
         return [
@@ -4564,6 +4720,10 @@ def _verify(args, tps, algos, dts, link) -> None:
         "flydsl quick allreduce hier, split forced by AITER_FLY_AR_GROUPS",
         [test_quick_allreduce_hier_forced(*case) for case in hier_forced],
     )
+    _summarize(
+        "flydsl quick allreduce lamport on a fine-grained inbox (late re-arm)",
+        [test_quick_allreduce_lamport_finegrained(*case) for case in lamport_fg],
+    )
     os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = HIP_QR_REGIME
     aiter.qr_max_size()
     _summarize(
@@ -4632,6 +4792,14 @@ def _verify_fused(tps, algos, extended: bool) -> None:
             test_quick_allreduce_rmsnorm_run_ahead(tp, *case, algorithm)
             for tp, algorithm in itertools.product(tps, algos)
             if (case := _run_ahead_case(tp, algorithm))
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce rmsnorm lamport on a fine-grained inbox (late re-arm)",
+        [
+            test_quick_allreduce_rmsnorm_lamport_finegrained(tp, algorithm, st)
+            for tp, algorithm, st in _FUSED_LAMPORT_FINEGRAINED_CASES
+            if tp in tps and algorithm in algos
         ],
     )
     _summarize(
@@ -5728,6 +5896,16 @@ def main():
         "The production-dispatch checks always use the default.\n"
         "    e.g.: --hier-handshake lamport",
     )
+    parser.add_argument(
+        "--handshake",
+        choices=("lamport",),
+        default=None,
+        help="verify: run every plain mesh, ring and hier engine on the Lamport\n"
+        "handshake, e.g. on PCIe, whose ladders ship flag (its fine-grained\n"
+        "inbox re-arms a round late). The fused and production-dispatch checks\n"
+        "keep their ladders' handshakes.\n"
+        "    e.g.: --handshake lamport",
+    )
     fab.add_bench_args(parser)
     args = parser.parse_args()
     fab.check_bench_args(parser, args)
@@ -5739,10 +5917,11 @@ def main():
     if args.list_candidates:
         fab.write_candidates(_list_candidates(args))
         return
-    global _TIMING, _BASELINES, _HIER_HANDSHAKE
+    global _TIMING, _BASELINES, _HIER_HANDSHAKE, _HANDSHAKE
     _TIMING = (args.reps, args.rounds)
     _BASELINES = args.baselines
     _HIER_HANDSHAKE = args.hier_handshake
+    _HANDSHAKE = args.handshake
 
     tps = fab.select_world_sizes(
         args.tp or list(SUPPORTED_WORLDS),

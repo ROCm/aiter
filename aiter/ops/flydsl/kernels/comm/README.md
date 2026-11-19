@@ -144,7 +144,16 @@ bit for bit.
 The Lamport mesh rotates three inbox buffers (1.5x the flag inbox): the
 reduce-scatter and all-gather of a tile are two rounds of one sequence, and a
 peer is at most one round ahead. The Lamport ring keeps two buffers per hop,
-by super-tile group parity (2x). The fused builds take the same handshake
+by super-tile group parity (2x).
+
+On a fine-grained (cacheable) inbox a push can reach the reader by eviction
+before the writer's release writes the line back, and a sentinel put back at
+once could be overwritten by the same stale line. There the mesh and the ring
+re-arm a round late instead (`lamport_defers_rearm`): whole slots, once the
+reader holds a later packet from every writer of them, which left after that
+writer's release. It costs one more inbox buffer: four on the mesh (2x the flag
+inbox), three per hop on the ring (3x). The uncached inbox of xGMI keeps the
+re-arm right after the poll. The fused builds take the same handshake
 (`FusedTwoShotRung.handshake`, an optional `"handshake"` key on a rung of the
 ladder file); their epilogue hooks are unchanged. gfx950/xGMI runs Lamport,
 plain and fused; the other platforms run flag until they are measured.
