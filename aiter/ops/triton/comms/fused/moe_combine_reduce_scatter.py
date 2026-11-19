@@ -44,9 +44,13 @@ class MoeCombineReduceScatter(IpcCommBuffers):
         hidden (int): The number of bf16 values in a row.
         topk (int): The number of experts of a token.
         timeout_s (float): The time limit of each wait in the kernel.
+        config (dict, optional): Values that replace the values of the tuned config
+            (BLOCKS, PARTS, LAG, num_warps), for example in a benchmark sweep. An
+            unknown key is an error. The config is fixed for the comm: all its
+            launches must use the same CTAs.
     """
 
-    def __init__(self, group, max_tokens, hidden, topk, timeout_s=60.0):
+    def __init__(self, group, max_tokens, hidden, topk, timeout_s=60.0, config=None):
         super().__init__(group, timeout_s)
         assert (
             hidden,
@@ -55,12 +59,20 @@ class MoeCombineReduceScatter(IpcCommBuffers):
         assert max_tokens > 0
         self.hidden, self.topk, self.max_tokens = hidden, topk, max_tokens
         self.config = _get_config(self.world, hidden)
-        parts = self.config["PARTS"]
+        if config is not None:
+            unknown = sorted(set(config) - set(self.config))
+            assert not unknown, f"unknown config keys: {unknown}"
+            self.config.update(config)
+        parts, warps = self.config["PARTS"], self.config["num_warps"]
         assert hidden // 2 % parts == 0, "PARTS must divide hidden / 2"
+        assert self.config["LAG"] >= 2, "LAG must be 2 or more"
+        assert warps > 0 and warps & (warps - 1) == 0, "num_warps must be a power of 2"
         # All CTAs must run at the same time: one CTA a CU, PARTS CTAs a row.
         self.blocks = min(self.config["BLOCKS"], self.num_cus) // parts * parts
         assert self.blocks > 0, "fewer CUs than PARTS"
         blocks, world = self.blocks, self.world
+        # A thread polls at most 4 done words.
+        assert (world - 1) * blocks <= 4 * 64 * warps, "too few warps for BLOCKS"
         self.rows_max = triton.cdiv(max_tokens, world)
         flags = ERROR_BYTES
         done = flags + (world - 1) * self.rows_max * parts * 4

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Gluon MoE top-k combine + reduce-scatter on 2, 4 or 8 gfx950 GPUs. The time is
-the slowest rank, in a HIP graph."""
+the slowest rank, in a HIP graph. ``--sweep KEY=V1,V2`` times each combination of
+config values: the tuning scripts cannot time a kernel that all ranks must launch
+together."""
 
 import multiprocessing as mp
 
@@ -23,9 +25,11 @@ from op_tests.multigpu_tests.triton_test.test_moe_combine_reduce_scatter import 
     _routing,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    add_sweep_argument,
     get_do_bench_graph_kwargs,
     get_parser,
     get_rot_bufs_kwargs,
+    get_sweep_configs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
@@ -36,13 +40,13 @@ from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
 TOKENS = [2343, 4096, 5857, 8192, 14394, 16383]
 
 
-def benchmark(args, rank, device, tp, comm):
+def benchmark(args, rank, device, tp, comms):
     config = triton.testing.Benchmark(
         x_names=["tokens"],
         x_vals=args.tokens,
         line_arg="provider",
-        line_vals=["gluon"],
-        line_names=["gluon"],
+        line_vals=list(comms),
+        line_names=list(comms),
         ylabel="us",
         plot_name=get_caller_name_no_ext(),
         args={},
@@ -72,7 +76,7 @@ def benchmark(args, rank, device, tp, comm):
 
         def fn(inter, out, rev, sw):
             return fused_moe_combine_reduce_scatter(
-                inter, rev, sw, tokens, comm, out=out
+                inter, rev, sw, tokens, comms[provider], out=out
             )
 
         ms = bencher.bench_synced(fn, dist_group=tp.cpu_group)
@@ -89,15 +93,31 @@ def _worker(rank, init_method, args):
     torch.cuda.set_device(device)
     aiter.init_dist_env(args.world_size, rank, distributed_init_method=init_method)
     tp = get_tp_group()
-    comm = MoeCombineReduceScatter(
-        tp.cpu_group, max(args.tokens), args.hidden, args.topk
-    )
+    comms = {}
     try:
-        benchmark(args, rank, device, tp, comm)
-        assert comm.error() == [0, 0, 0, 0], "a wait timed out"
+        comms = _comms(args, tp)
+        benchmark(args, rank, device, tp, comms)
+        for comm in comms.values():
+            assert comm.error() == [0, 0, 0, 0], "a wait timed out"
     finally:
-        comm.close()
+        for comm in comms.values():
+            comm.close()
         aiter.destroy_dist_env()
+
+
+def _comms(args, tp):
+    """A comm for each config of --sweep, or for the tuned config. The constructors are
+    collective. A config that the constructor rejects is skipped on all ranks."""
+    comms = {}
+    for name, config in get_sweep_configs(args).items():
+        try:
+            comms[name] = MoeCombineReduceScatter(
+                tp.cpu_group, max(args.tokens), args.hidden, args.topk, config=config
+            )
+        except AssertionError as err:
+            if dist.get_rank(tp.cpu_group) == 0:
+                logger.warning("config %s skipped: %s", name, err)
+    return comms
 
 
 def parse_args():
@@ -111,6 +131,7 @@ def parse_args():
     parser.add_argument("--hidden", type=int, default=6144, help="hidden size")
     parser.add_argument("--topk", type=int, default=4, help="experts of a token")
     parser.add_argument("--experts", type=int, default=128, help="number of experts")
+    add_sweep_argument(parser)
     parser.add_argument(
         "-o", action="store_true", default=False, help="Write results to CSV"
     )
