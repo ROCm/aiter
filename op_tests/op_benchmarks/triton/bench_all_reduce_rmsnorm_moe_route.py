@@ -6,7 +6,6 @@ top-4 sigmoid + bias, Gemma norm, fp32 router). The time is the slowest rank, in
 graph. ``--sweep KEY=V1,V2`` times each combination of config values as one line: the AITER
 tuner cannot time a kernel that all ranks must launch together."""
 
-import itertools
 import multiprocessing as mp
 
 import torch
@@ -24,9 +23,11 @@ from aiter.ops.triton.comms.fused.all_reduce_rmsnorm_moe_route import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_common import ensure_spawn_method
 from op_tests.op_benchmarks.triton.utils.argparse import (
+    add_sweep_argument,
     get_do_bench_graph_kwargs,
     get_parser,
     get_rot_bufs_kwargs,
+    get_sweep_configs,
     override_parser_action,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
@@ -35,22 +36,6 @@ from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
 )
 
 TOKENS = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 160, 192, 256]
-
-
-def _sweep_configs(args):
-    """The config overrides of the lines: the JSON config, or each combination of the
-    --sweep values."""
-    if not args.sweep:
-        return {"gluon": None}
-    keys, values = [], []
-    for item in args.sweep:
-        key, vals = item.split("=")
-        keys.append(key)
-        values.append([int(v) for v in vals.split(",")])
-    return {
-        ",".join(f"{k}={v}" for k, v in zip(keys, combo)): dict(zip(keys, combo))
-        for combo in itertools.product(*values)
-    }
 
 
 def benchmark(args, device, tp, comms):
@@ -126,7 +111,7 @@ def _worker(rank, init_method, args):
     tp = get_tp_group()
     comms = {}
     try:
-        for name, cfg in _sweep_configs(args).items():
+        for name, cfg in get_sweep_configs(args).items():
             try:
                 comms[name] = AllReduceRmsnormMoeRoute(
                     tp.cpu_group,
@@ -167,12 +152,7 @@ def parse_args():
         default=True,
         help="bf16 router weights (default fp32)",
     )
-    parser.add_argument(
-        "--sweep",
-        action="append",
-        metavar="KEY=V1,V2",
-        help="config values to time (repeat for more keys), for example BLOCKS=128,256",
-    )
+    add_sweep_argument(parser)
     parser.add_argument(
         "-o", action="store_true", default=False, help="Write results to CSV"
     )

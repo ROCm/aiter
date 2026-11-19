@@ -37,132 +37,38 @@ up."""
 import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from triton.language.core import PropagateNan as _PropagateNan
-from triton.language.extra.hip import libdevice
 
-from aiter.ops.triton._gluon_kernels.common.utils import mx_e8m0_scale
-from aiter.ops.triton._gluon_kernels.gfx950.comms.common import (
-    _BFLY_ADD,
-    _POLL_MAX,
-    _POLL_VGPR,
-    _bf_hi,
-    _bf_lo,
-    _bfly_op,
-    _canon,
-    _chunk,
-    _fail_record,
-    _fp8_pack4,
-    _k4,
-    _ld4,
-    _pack_bf16,
-    _peer,
-    _poll_slots,
-    _quad_xor,
-    _st2,
-    _st4,
-    _tids,
+from aiter.ops.triton._gluon_kernels.common.comms_gfx950 import (
+    BFLY_ADD,
+    bfly_op,
+    canon,
+    dword_idx,
+    fail_record,
+    ld4,
+    peer,
+    poll_slots,
+    poll_tags,
+    rmsnorm_row,
+    row_sum,
+    st4,
+    store_rmsnorm_row,
+    tids,
 )
+from aiter.ops.triton._gluon_kernels.common.utils import fast_sigmoid, sum_combine
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-_NAN_ALL: gl.constexpr = gl.constexpr(_PropagateNan.ALL)
 _SITE_REDUCE: gl.constexpr = gl.constexpr(1)
 _SITE_GATHER: gl.constexpr = gl.constexpr(2)
 _SITE_ROUTER: gl.constexpr = gl.constexpr(3)
 _SITE_ROUTE: gl.constexpr = gl.constexpr(4)
 _SITE_SORT: gl.constexpr = gl.constexpr(5)
-_NEG_LOG2E: gl.constexpr = gl.constexpr(-1.4426950408889634)
 _LOG2E: gl.constexpr = gl.constexpr(1.4426950408889634)
 _BIG: gl.constexpr = gl.constexpr(1 << 30)
-
-
-def _tpoll(n, system):
-    """Bounded poll of n tagged 8-byte words a lane ((tag << 32) | value), in the lanes where act
-    is not 0: loads (system scope for peer memory, device scope for scratch) until the high word
-    of each is tag, the error word is set, or the time limit passes. Outputs: failed, the n low
-    words, scratch. Inputs: act, tag, n addresses, the error-word address, the time limit.
-    """
-    b = _POLL_VGPR
-    scope = "sc0 sc1" if system else "sc1"
-    saved, now, dl, errv, pend = range(n + 1, n + 6)
-    act = n + 6
-    tag = act + 1
-    a0 = tag + 1
-    aerr = a0 + n
-    ticks = aerr + 1
-    lines = [
-        "s_mov_b32 $0, 0",
-        f"v_cmp_ne_u32 vcc, 0, ${act}",
-        f"s_and_saveexec_b64 ${saved}, vcc",
-        "s_cbranch_execz .Ltp_done${:uid}",
-        f"s_memrealtime ${now}",
-        "s_waitcnt lgkmcnt(0)",
-        f"v_lshl_add_u64 ${dl}, ${now}, 0, ${ticks}",
-        ".Ltp_loop${:uid}:",
-    ]
-    lines += [
-        f"global_load_dwordx2 v[{b + 2 * i}:{b + 2 * i + 1}], ${a0 + i}, off {scope}"
-        for i in range(n)
-    ]
-    lines += [
-        f"global_load_dword ${errv}, ${aerr}, off sc0 sc1",
-        "s_waitcnt vmcnt(0)",
-        f"v_cmp_ne_u32 vcc, ${tag}, v{b + 1}",
-        f"s_mov_b64 ${pend}, vcc",
-    ]
-    for i in range(1, n):
-        lines += [
-            f"v_cmp_ne_u32 vcc, ${tag}, v{b + 2 * i + 1}",
-            f"s_or_b64 ${pend}, ${pend}, vcc",
-        ]
-    lines += [
-        f"s_cmp_eq_u64 ${pend}, 0",
-        "s_cbranch_scc1 .Ltp_ok${:uid}",
-        f"v_cmp_ne_u32 vcc, 0, ${errv}",
-        "s_cmp_lg_u64 vcc, 0",
-        "s_cbranch_scc1 .Ltp_give${:uid}",
-        f"s_memrealtime ${now}",
-        "s_waitcnt lgkmcnt(0)",
-        f"v_cmp_ge_u64 vcc, ${now}, ${dl}",
-        "s_cmp_lg_u64 vcc, 0",
-        "s_cbranch_scc1 .Ltp_out${:uid}",
-        "s_sleep 1",
-        "s_branch .Ltp_loop${:uid}",
-        ".Ltp_give${:uid}:",
-        "s_mov_b32 $0, 2",
-        "s_branch .Ltp_ok${:uid}",
-        ".Ltp_out${:uid}:",
-        "s_mov_b32 $0, 1",
-        ".Ltp_ok${:uid}:",
-    ]
-    lines += [f"v_mov_b32 ${1 + i}, v{b + 2 * i}" for i in range(n)]
-    lines += [".Ltp_done${:uid}:", f"s_mov_b64 exec, ${saved}"]
-    cons = (
-        ["=&s"]
-        + ["=&v"] * n
-        + ["=&s", "=&s", "=&v", "=&v", "=&s"]
-        + ["v"] * (n + 4)
-        + ["~{memory}", "~{vcc}", "~{scc}"]
-        + [f"~{{v{b + i}}}" for i in range(2 * n)]
-    )
-    return "\n".join(lines), ",".join(cons)
-
-
-_TPOLL = {(n, s): _tpoll(n, s) for n in range(1, 9) for s in (False, True)}
 
 
 @gluon.constexpr_function
 def _cmax(a, b):
     return max(int(a), int(b))
-
-
-@gluon.constexpr_function
-def _tpoll_asm(n, system):
-    return _TPOLL[(int(n), bool(system))][0]
-
-
-@gluon.constexpr_function
-def _tpoll_cons(n, system):
-    return _TPOLL[(int(n), bool(system))][1]
 
 
 @gluon.jit
@@ -176,13 +82,6 @@ def _lanes(W: gl.constexpr):
 def _exp2(x):
     return gl.inline_asm_elementwise(
         "v_exp_f32 $0, $1", "=v,v", [x], gl.float32, True, 1
-    )
-
-
-@gluon.jit
-def _rcp(x):
-    return gl.inline_asm_elementwise(
-        "v_rcp_f32 $0, $1", "=v,v", [x], gl.float32, True, 1
     )
 
 
@@ -202,32 +101,6 @@ def _drain(x):
 
 
 @gluon.jit
-def _poll_tags(own, addrs, act, tag, ticks, NS: gl.constexpr, SYSTEM: gl.constexpr):
-    """Poll of the NS tagged words at addrs (int64 pointers) for tag. Returns failed and the low
-    word of each."""
-    z = gl.zeros_like(act.to(gl.int32))
-    failed = z
-    vals = ()
-    for c in gl.static_range(0, NS, _POLL_MAX):
-        part = ()
-        for i in gl.static_range(_chunk(NS, c)):
-            part = part + (addrs[c + i],)
-        out = gl.inline_asm_elementwise(
-            _tpoll_asm(_chunk(NS, c), SYSTEM),
-            _tpoll_cons(_chunk(NS, c), SYSTEM),
-            (act.to(gl.int32), tag + z) + part + (own + z, ticks + z.to(gl.int64)),
-            (gl.int32,) * (1 + _chunk(NS, c))
-            + (gl.int64, gl.int64, gl.int64, gl.int32, gl.int64),
-            False,
-            1,
-        )
-        failed = gl.maximum(failed, out[0])
-        for i in gl.static_range(_chunk(NS, c)):
-            vals = vals + (out[1 + i],)
-    return failed, vals
-
-
-@gluon.jit
 def _pair(tag, v):
     """The tagged word of the 32-bit value v."""
     return (tag.to(gl.int64) << 32) | v.to(gl.uint32, bitcast=True).to(gl.int64)
@@ -236,154 +109,6 @@ def _pair(tag, v):
 @gluon.jit
 def _isnan(x):
     return x != x  # noqa: PLR0124 - true only for NaN
-
-
-@gluon.jit
-def _sigmoid(x):
-    return _rcp(_exp2(x * _NEG_LOG2E) + 1.0)
-
-
-@gluon.jit
-def _top2(a1, a2, b1, b2):
-    return gl.maximum(a1, b1), gl.maximum(gl.minimum(a1, b1), gl.maximum(a2, b2))
-
-
-@gluon.jit
-def _add_i32(a, b):
-    return a + b
-
-
-@gluon.jit
-def _row_sum(own_w, got, rank, WORLD: gl.constexpr, V: gl.constexpr, tid):
-    """The bf16 words of the sum over the ranks in rank order (fp32, one rounding): own_w are this
-    rank's words, got[(d - 1) V + j] the words of rank + d."""
-    hw = ()
-    for j in gl.static_range(V):
-        for e in gl.static_range(4):
-            acc_lo = gl.zeros_like(tid).to(gl.float32)
-            acc_hi = gl.zeros_like(tid).to(gl.float32)
-            for src in gl.static_range(WORLD):
-                x = own_w[j][e]
-                for d in gl.static_range(1, WORLD):
-                    x = gl.where((rank + d) % WORLD == src, got[(d - 1) * V + j][e], x)
-                if src == 0:
-                    acc_lo = _bf_lo(x)
-                    acc_hi = _bf_hi(x)
-                else:
-                    acc_lo = acc_lo + _bf_lo(x)
-                    acc_hi = acc_hi + _bf_hi(x)
-            hw = hw + (_pack_bf16(acc_lo, acc_hi),)
-    return hw
-
-
-@gluon.jit
-def _norm_row(
-    hw,
-    res_w,
-    w_w,
-    act,
-    eps,
-    HIDDEN: gl.constexpr,
-    V: gl.constexpr,
-    GEMMA: gl.constexpr,
-    HAS_RES: gl.constexpr,
-    W: gl.constexpr,
-):
-    """s = h + residual (fp32) and the bf16 words of y = s * rstd * w'. The sum of squares adds a
-    thread's 8 V values in column order (no fma), a lane butterfly, then the waves in order.
-    """
-    tid = _tids(W)
-    lane = tid % 64
-    wave = tid // 64
-    NWA: gl.constexpr = (HIDDEN // 8 // V + 63) // 64
-    s = ()
-    for j in gl.static_range(V):
-        for e in gl.static_range(4):
-            if HAS_RES:
-                s = s + (
-                    _bf_lo(hw[4 * j + e]) + _bf_lo(res_w[j][e]),
-                    _bf_hi(hw[4 * j + e]) + _bf_hi(res_w[j][e]),
-                )
-            else:
-                s = s + (_bf_lo(hw[4 * j + e]), _bf_hi(hw[4 * j + e]))
-    sq = s[0] * s[0]
-    for i in gl.static_range(1, 8 * V):
-        sq = sq + s[i] * s[i]
-    sq = _bfly_op(gl.where(act, sq, 0.0), _BFLY_ADD)
-    red = gl.allocate_shared_memory(
-        gl.float32, [64], gl.SwizzledSharedLayout(1, 1, 1, [0])
-    )
-    red.scatter(sq, gl.where(lane == 0, wave, 63), 0)
-    gl.barrier()
-    zi = gl.zeros_like(tid)
-    tot = red.gather(zi, 0)
-    for wv in gl.static_range(1, NWA):
-        tot = tot + red.gather(zi + wv, 0)
-    var = gl.div_rn(tot, gl.full(tot.shape, HIDDEN, gl.float32, tot.type.layout))
-    one = gl.full(tot.shape, 1.0, gl.float32, tot.type.layout)
-    rstd = gl.div_rn(one, gl.sqrt_rn(var + eps))
-    y = ()
-    for j in gl.static_range(V):
-        for e in gl.static_range(4):
-            wl = _bf_lo(w_w[j][e])
-            wh = _bf_hi(w_w[j][e])
-            if GEMMA:
-                wl = 1.0 + wl
-                wh = 1.0 + wh
-            y = y + (
-                _pack_bf16(
-                    (s[8 * j + 2 * e] * rstd) * wl, (s[8 * j + 2 * e + 1] * rstd) * wh
-                ),
-            )
-    return s, y
-
-
-@gluon.jit
-def _store_rest(
-    s,
-    y,
-    xq,
-    xs,
-    res_out,
-    t,
-    act,
-    A: gl.constexpr,
-    HIDDEN: gl.constexpr,
-    V: gl.constexpr,
-    QUANT: gl.constexpr,
-    W: gl.constexpr,
-):
-    """Row t: the new residual bf16(s), and the MXFP8 copy of y (a quad of lanes holds a
-    32-column group). The scale is mx_e8m0_scale(amax, 8)."""
-    tid = _tids(W)
-    lane = tid % 64
-    if QUANT:
-        for j in gl.static_range(V):
-            vec = j * A + tid
-            yv = ()
-            for e in gl.static_range(4):
-                yv = yv + (_bf_lo(y[4 * j + e]), _bf_hi(y[4 * j + e]))
-            am = gl.abs(yv[0])
-            for e in gl.static_range(1, 8):
-                am = gl.maximum(am, gl.abs(yv[e]), propagate_nan=_NAN_ALL)
-            am = gl.maximum(am, _quad_xor(am, 1), propagate_nan=_NAN_ALL)
-            am = gl.maximum(am, _quad_xor(am, 2), propagate_nan=_NAN_ALL)
-            sb = mx_e8m0_scale(am, 8)
-            # y / 2^(sb - 127) with ldexp: 2^-127 (sb 254) is not a normal fp32 value.
-            n = 127 - sb.to(gl.int32)
-            q = ()
-            for e in gl.static_range(8):
-                q = q + (libdevice.ldexp(yv[e], n),)
-            c0 = _fp8_pack4(q[0], q[1], q[2], q[3])
-            c1 = _fp8_pack4(q[4], q[5], q[6], q[7])
-            _st2(xq, t * (HIDDEN // 4) + 2 * vec, c0, c1, act, W)
-            gl.store(xs + t * (HIDDEN // 32) + vec // 4, sb, mask=act & (lane % 4 == 0))
-    for j in gl.static_range(V):
-        vec = j * A + tid
-        rw = ()
-        for e in gl.static_range(4):
-            rw = rw + (_pack_bf16(s[8 * j + 2 * e], s[8 * j + 2 * e + 1]),)
-        _st4(res_out, t * (HIDDEN // 2) + vec * 4, rw, act, W)
 
 
 @gluon.jit
@@ -404,7 +129,7 @@ def _sel_val(
     if REG:
         v = lg.gather(gl.where(e < E, e, 0), 0)
         if SCORE == 0:
-            v = _sigmoid(v)
+            v = fast_sigmoid(v)
         if HAS_BIAS:
             v = v + bias_l[j]
         v = gl.where(_isnan(v) | (e >= E), neg, v)
@@ -449,7 +174,7 @@ def _select(
             ec = gl.where(e < E, e, 0)
             v = lg.gather(ec, 0)
             if SCORE == 0:
-                v = _sigmoid(v)
+                v = fast_sigmoid(v)
             if HAS_BIAS:
                 v = v + bias_s.gather(ec, 0)
             v = gl.where(_isnan(v) | (e >= E), neg, v)
@@ -522,10 +247,10 @@ def _select(
     slot = lane < TOPK
     lgk = lg.gather(my_id, 0)
     if SCORE == 0:
-        my_w = gl.where(slot, _sigmoid(lgk), 0.0)
+        my_w = gl.where(slot, fast_sigmoid(lgk), 0.0)
         my_w = gl.where(_isnan(my_w), 0.0, my_w)
         if RENORM:
-            total = _bfly_op(my_w, _BFLY_ADD)
+            total = bfly_op(my_w, BFLY_ADD)
             w = my_w * gl.div_rn(routed_scale + total * 0.0, gl.maximum(total, 1e-20))
         else:
             w = my_w * routed_scale
@@ -534,7 +259,7 @@ def _select(
             # the largest picked logit: no exp overflow
             top = gl.max(gl.where(slot, lgk, neg), axis=0)
             ex = gl.where(slot, _exp2((lgk - top) * _LOG2E), 0.0)
-            z = _bfly_op(ex, _BFLY_ADD)
+            z = bfly_op(ex, BFLY_ADD)
         else:
             mx = neg
             for j in gl.static_range(EJ):
@@ -549,7 +274,7 @@ def _select(
                 e = lane + 64 * j
                 lgv = lg.gather(gl.where(e < E, e, 0), 0)
                 zz = zz + gl.where(e < E, _exp2((lgv - top) * _LOG2E), 0.0)
-            z = _bfly_op(zz, _BFLY_ADD)
+            z = bfly_op(zz, BFLY_ADD)
         w = gl.div_rn(ex, z) * routed_scale
     return my_id, w
 
@@ -597,7 +322,7 @@ def _route_row(
     KEP: gl.constexpr = triton.next_power_of_2(NRR * T)
     NEB: gl.constexpr = (E + T - 1) // T
     NPK: gl.constexpr = 2 * TOPK
-    tid = _tids(W)
+    tid = tids(W)
     lane = tid % 64
     LB: gl.constexpr = gl.BlockedLayout([1], [64], [W], [0])
     eb = gl.arange(0, T, layout=LB)
@@ -615,8 +340,8 @@ def _route_row(
     for c in gl.static_range(NRR):
         f = gl.minimum(c * T + tid, KE - 1)
         r_addrs = r_addrs + (scratch + SCL + ((f // E) * RMAXL + rj) * E + f % E,)
-    r_failed, r_vals = _poll_tags(own, r_addrs, tid >= 0, tag, ticks, NRR, False)
-    _fail_record(bufs, rank, colour, _SITE_ROUTE, (lane == 0) & (r_failed == 1))
+    r_failed, r_vals = poll_tags(own, r_addrs, tid >= 0, tag, ticks, NRR, False)
+    fail_record(bufs, rank, colour, _SITE_ROUTE, (lane == 0) & (r_failed == 1))
     SL1: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
     plg = gl.allocate_shared_memory(gl.float32, [KEP], SL1)
     lg = gl.allocate_shared_memory(gl.float32, [EP], SL1)
@@ -917,10 +642,10 @@ def _all_reduce_rmsnorm_moe_route_kernel(
         bufs = bufs + (gl.multiple_of(peers[d].to(gl.pointer_type(gl.int32)), 16),)
     own = bufs[0]
     bid = gl.program_id(0)
-    tid = _tids(W)
+    tid = tids(W)
     lane = tid % 64
     act = tid < A
-    k4 = _k4(W)
+    k4 = dword_idx(W)
     LV: gl.constexpr = gl.BlockedLayout([1, 4], [64, 1], [W, 1], [1, 0])
     colour = gl.load(colors + bid)
     par = colour & 1
@@ -1003,8 +728,8 @@ def _all_reduce_rmsnorm_moe_route_kernel(
         else:
             p_slot = RS0 // 4 + ((par * WORLD + rank) * GMAX + p_r) * ROWW
         gl.amd.cdna4.buffer_store(
-            _canon(p_x),
-            _peer(bufs, p_d, WORLD),
+            canon(p_x),
+            peer(bufs, p_d, WORLD),
             (p_slot + p_vec * 4)[:, None] + k4,
             mask=(act & p_ok)[:, None] & (k4 < 4),
         )
@@ -1034,10 +759,10 @@ def _all_reduce_rmsnorm_moe_route_kernel(
         w_w = ()
         for j in gl.static_range(V):
             vec = j * A + tid
-            own_w = own_w + (_ld4(inp, t * ROWW + vec * 4, act, W),)
+            own_w = own_w + (ld4(inp, t * ROWW + vec * 4, act, W),)
             if HAS_RES:
-                res_w = res_w + (_ld4(res, t * ROWW + vec * 4, act, W),)
-            w_w = w_w + (_ld4(norm_w, vec * 4, act, W),)
+                res_w = res_w + (ld4(res, t * ROWW + vec * 4, act, W),)
+            w_w = w_w + (ld4(norm_w, vec * 4, act, W),)
         o_offs = ()
         for o_d in gl.static_range(1, WORLD):
             if PROTO == 0:
@@ -1055,13 +780,13 @@ def _all_reduce_rmsnorm_moe_route_kernel(
         o_addrs = ()
         for q_i in gl.static_range(NP * V):
             o_addrs = o_addrs + (own + o_offs[q_i],)
-        o_failed, o_got = _poll_slots(own, o_addrs, act, ticks, NP * V)
-        _fail_record(bufs, rank, colour, _SITE_REDUCE, (lane == 0) & (o_failed == 1))
-        hw = _row_sum(own_w, o_got, rank, WORLD, V, tid)
-        s, y = _norm_row(hw, res_w, w_w, act, eps, HIDDEN, V, GEMMA, HAS_RES, W)
+        o_failed, o_got = poll_slots(own, o_addrs, act, ticks, NP * V)
+        fail_record(bufs, rank, colour, _SITE_REDUCE, (lane == 0) & (o_failed == 1))
+        hw = row_sum(own_w, o_got, rank, WORLD, V, tid)
+        s, y = rmsnorm_row(hw, res_w, w_w, act, eps, HIDDEN, V, GEMMA, HAS_RES, W)
         for j in gl.static_range(V):
             vec = j * A + tid
-            _st4(
+            st4(
                 xn,
                 t * ROWW + vec * 4,
                 (y[4 * j], y[4 * j + 1], y[4 * j + 2], y[4 * j + 3]),
@@ -1082,14 +807,14 @@ def _all_reduce_rmsnorm_moe_route_kernel(
             o_ag = AG0 // 4 + ((par * WORLD + rank) * GMAX + bid) * ROWW
             for o_j in gl.static_range(V):
                 cw = (
-                    _canon(hw[4 * o_j]),
-                    _canon(hw[4 * o_j + 1]),
-                    _canon(hw[4 * o_j + 2]),
-                    _canon(hw[4 * o_j + 3]),
+                    canon(hw[4 * o_j]),
+                    canon(hw[4 * o_j + 1]),
+                    canon(hw[4 * o_j + 2]),
+                    canon(hw[4 * o_j + 3]),
                 )
                 for o_d in gl.static_range(1, WORLD):
-                    _st4(bufs[o_d], o_ag + (o_j * A + tid) * 4, cw, act, W)
-        _store_rest(s, y, xq, xs, res_out, t, act, A, HIDDEN, V, QUANT, W)
+                    st4(bufs[o_d], o_ag + (o_j * A + tid) * 4, cw, act, W)
+        store_rmsnorm_row(s, y, xq, xs, res_out, t, act, A, HIDDEN, V, QUANT, W)
         for q_i in gl.static_range(NP * V):
             gl.amd.cdna4.buffer_store(
                 sent, own, o_offs[q_i][:, None] + k4, mask=act[:, None] & (k4 < 4)
@@ -1098,10 +823,10 @@ def _all_reduce_rmsnorm_moe_route_kernel(
     # Router tasks: 16 experts x one K part of the routed rows each.
     if is_router:
         rv = tid < nr
-        x_failed, _xr = _poll_tags(
+        x_failed, _xr = poll_tags(
             own, (scratch + SCX + gl.where(rv, tid, 0),), rv, tag, ticks, 1, False
         )
-        _fail_record(bufs, rank, colour, _SITE_ROUTER, (lane == 0) & (x_failed == 1))
+        fail_record(bufs, rank, colour, _SITE_ROUTER, (lane == 0) & (x_failed == 1))
         gl.barrier()
         for tt in gl.static_range(TPC):
             task = rtask + tt * NRC
@@ -1226,26 +951,26 @@ def _all_reduce_rmsnorm_moe_route_kernel(
                 for rj_ in gl.static_range(V):
                     rvec = rj_ * A + tid
                     if HAS_RES:
-                        rres_w = rres_w + (_ld4(res, tc * ROWW + rvec * 4, live, W),)
-                    rw_w = rw_w + (_ld4(norm_w, rvec * 4, live, W),)
+                        rres_w = rres_w + (ld4(res, tc * ROWW + rvec * 4, live, W),)
+                    rw_w = rw_w + (ld4(norm_w, rvec * 4, live, W),)
                 a_base = AG0 // 4 + ((par * WORLD + g_src) * GMAX + r_r) * ROWW
                 a_addrs = ()
                 for r_j in gl.static_range(V):
                     a_addrs = a_addrs + (own + a_base + (r_j * A + tid) * 4,)
-                a_failed, a_got = _poll_slots(own, a_addrs, live, ticks, V)
-                _fail_record(
+                a_failed, a_got = poll_slots(own, a_addrs, live, ticks, V)
+                fail_record(
                     bufs, rank, colour, _SITE_GATHER, (lane == 0) & (a_failed == 1)
                 )
                 rhw = ()
                 for r_j in gl.static_range(V):
                     for r_e in gl.static_range(4):
                         rhw = rhw + (a_got[r_j][r_e],)
-                rs_, ry = _norm_row(
+                rs_, ry = rmsnorm_row(
                     rhw, rres_w, rw_w, live, eps, HIDDEN, V, GEMMA, HAS_RES, W
                 )
                 for rj_ in gl.static_range(V):
                     rvec = rj_ * A + tid
-                    _st4(
+                    st4(
                         xn,
                         tc * ROWW + rvec * 4,
                         (
@@ -1257,7 +982,9 @@ def _all_reduce_rmsnorm_moe_route_kernel(
                         live,
                         W,
                     )
-                _store_rest(rs_, ry, xq, xs, res_out, tc, live, A, HIDDEN, V, QUANT, W)
+                store_rmsnorm_row(
+                    rs_, ry, xq, xs, res_out, tc, live, A, HIDDEN, V, QUANT, W
+                )
                 for r_j in gl.static_range(V):
                     gl.amd.cdna4.buffer_store(
                         sent,
@@ -1300,15 +1027,15 @@ def _all_reduce_rmsnorm_moe_route_kernel(
             sj = spc % TOPK
             if PROTO == 0:
                 a_id = sc64 + SCP + st_ * NPK + sj
-                s_failed, s_vals = _poll_tags(
+                s_failed, s_vals = poll_tags(
                     own, (a_id, a_id + TOPK), spv, tag, ticks, 2, False
                 )
             else:
                 a_id = pk64 + PK0 // 8 + (par * SMAX + st_) * NPK + sj
-                s_failed, s_vals = _poll_tags(
+                s_failed, s_vals = poll_tags(
                     own, (a_id, a_id + TOPK), spv, tag, ticks, 2, True
                 )
-            _fail_record(
+            fail_record(
                 bufs, rank, colour, _SITE_SORT, (ts % 64 == 0) & (s_failed == 1)
             )
             se = gl.minimum(gl.maximum(s_vals[0], 0), E - 1)
@@ -1338,7 +1065,7 @@ def _all_reduce_rmsnorm_moe_route_kernel(
         ee = gl.arange(0, EP, layout=LE)
         n_e = gl.where(ee < E, cnt.load(LE), 0)
         pad = (n_e + SBLK - 1) // SBLK * SBLK
-        incl = gl.associative_scan(pad, 0, _add_i32)
+        incl = gl.associative_scan(pad, 0, sum_combine)
         off_s.store(incl - pad)
         stotal = gl.max(incl, axis=0)
         L2s: gl.constexpr = gl.BlockedLayout([1], [64], [W], [0])
