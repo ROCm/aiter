@@ -91,8 +91,8 @@ Each local lap runs one of two schedules inside the group, picked per rung of
   at each hop, so a ring reduce-scatter left to its default codec runs INT6,
   as a TP`G` ring does. The all-gather forwards the bytes it received.
 
-On a host that splits GPUs into two socket groups, `hier` takes every
-quantized payload.
+On a host that splits GPUs into two socket groups, `hier` takes the quantized
+payloads from its window's floor (28 MiB on PCIe TP8) and the mesh runs below.
 
 Each rank also writes its own exchange packet into its own inbox, so both
 partners add the same two packets in the same order and every rank ends with
@@ -165,7 +165,7 @@ not each dword right after the poll: on a fine-grained inbox a push can reach
 the reader by eviction before the writer's release, and a sentinel put back at
 once could be overwritten by the same stale line. It keeps two local buffers
 and three exchange buffers (see `quick_allreduce_hier.py`). `HIER_ST_LADDER`
-runs flag.
+runs Lamport, like the PCIe mesh ladders.
 
 ### Accuracy limits
 
@@ -219,10 +219,10 @@ levels:
    for each arch, link type and world size. A policy has one payload-size
    window for each algorithm (`AllReduceAlgorithm`): `oneshot`, `mesh`,
    `ring` and `hier`. The `hier` window applies only on a host that splits
-   (`FamilyPolicy.with_topology`); there it comes first, drops the mesh,
-   which is only the fallback for a host that does not split, and moves the
-   start of the ring's window to its own end (on PCIe TP8 `hier` is
-   unbounded, so the ring does not run there). A window includes its minimum and excludes its maximum, and a
+   (`FamilyPolicy.with_topology`); there it comes first, ends the mesh
+   window where its own starts (the mesh runs alone on a host that does not
+   split), and moves the start of the ring's window to its own end (on PCIe
+   TP8 `hier` is unbounded, so the ring does not run there). A window includes its minimum and excludes its maximum, and a
    maximum of `None` means no upper limit. A missing or empty window disables
    the algorithm. A payload that is in no window goes to `cross_device_reduce`
    or RCCL. `FamilyPolicy.select()` gives the algorithm for a payload size.
@@ -453,8 +453,8 @@ is not.
 
 * If a variable is not set, is empty, or is `-1`, the code uses the value from
   the table.
-* On a host that splits into groups and runs `hier`, the `MESH` variables are
-  ignored.
+* On a host that splits into groups and runs `hier`, the mesh window ends at
+  the start of the `hier` window, whatever the `MESH_MAX` variable says.
 * `none` or `inf` sets no upper limit. Only the `MAX` variables accept it.
 * A maximum of `0` disables the algorithm. A minimum that is equal to the
   maximum also disables it.
