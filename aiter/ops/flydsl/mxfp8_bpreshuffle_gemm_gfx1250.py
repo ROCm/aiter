@@ -628,7 +628,8 @@ _MX32_SMALL_KERNEL_NAME_RE = re.compile(
 )
 _MX32_SMALLM_1X32_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(MX32_SMALLM_1X32_NAME_PREFIX)}_"
-    r"w(?P<num_waves>[12])_sk(?P<split_k>1|2|4|8)$"
+    r"(?:(?:tn(?P<tile_n>128)_w(?P<wide_waves>[124]))|"
+    r"(?:w(?P<narrow_waves>[12])))_sk(?P<split_k>1|2|4|8)$"
 )
 
 
@@ -664,7 +665,10 @@ def parse_mxfp8_32_wmma_kernel_name(name: str):
     if smallm is not None:
         return {
             "smallm_1x32": True,
-            "num_waves": int(smallm.group("num_waves")),
+            "tile_n": int(smallm.group("tile_n") or 32),
+            "num_waves": int(
+                smallm.group("wide_waves") or smallm.group("narrow_waves")
+            ),
             "split_k": int(smallm.group("split_k")),
         }
     return _parse_name(
@@ -740,10 +744,11 @@ def _run_mxfp8_32_smallm_1x32_gfx1250(
     w_scale: Tensor,
     Out: Tensor,
     *,
+    tile_n: int,
     num_waves: int,
     split_k: int,
 ) -> Tensor:
-    """Validate and launch the fixed 16x32 native small-M kernel."""
+    """Validate and launch the 16x{32,128} native small-M kernel."""
     if XQ.dim() != 2 or WQ.dim() != 2 or Out.dim() != 2:
         raise RuntimeError("[FlyDSL gfx1250 smallm_1x32] A/B/Out must be 2-D")
     M, K = XQ.shape
@@ -753,10 +758,10 @@ def _run_mxfp8_32_smallm_1x32_gfx1250(
             "[FlyDSL gfx1250 smallm_1x32] shape mismatch: "
             f"A={tuple(XQ.shape)}, B={tuple(WQ.shape)}, Out={tuple(Out.shape)}"
         )
-    if M % 16 or N % 32 or K % (128 * split_k):
+    if M % 16 or N % tile_n or K % (128 * split_k):
         raise RuntimeError(
             "[FlyDSL gfx1250 smallm_1x32] M/N/K must be divisible by "
-            f"16/32/{128 * split_k}, got {M}/{N}/{K}"
+            f"16/{tile_n}/{128 * split_k}, got {M}/{N}/{K}"
         )
     if XQ.element_size() != 1 or WQ.element_size() != 1:
         raise RuntimeError("[FlyDSL gfx1250 smallm_1x32] A/B must be 1-byte FP8")
@@ -772,10 +777,15 @@ def _run_mxfp8_32_smallm_1x32_gfx1250(
         raise RuntimeError(
             "[FlyDSL gfx1250 smallm_1x32] x_scale/w_scale must be contiguous"
         )
-    if num_waves not in (1, 2) or split_k not in (1, 2, 4, 8):
+    if (
+        tile_n not in (32, 128)
+        or num_waves not in (1, 2, 4)
+        or tile_n // 16 % num_waves
+        or split_k not in (1, 2, 4, 8)
+    ):
         raise RuntimeError(
-            "[FlyDSL gfx1250 smallm_1x32] num_waves must be 1/2 and "
-            "split_k must be 1/2/4/8"
+            "[FlyDSL gfx1250 smallm_1x32] tile_n must be 32/128, tile_n/16 "
+            "must be divisible by num_waves 1/2/4, and split_k must be 1/2/4/8"
         )
 
     _lazy_import()
@@ -787,10 +797,10 @@ def _run_mxfp8_32_smallm_1x32_gfx1250(
         else _smallm_1x32_workspace(
             Out.device,
             int(torch_stream.cuda_stream),
-            ((M // 16) * (N // 32), split_k, 16, 32),
+            ((M // 16) * (N // tile_n), split_k, 16, tile_n),
         )
     )
-    specialization = (num_waves, split_k)
+    specialization = (num_waves, split_k, tile_n)
     _run_compiled(
         _launch_gemm_a8w8_smallm_1x32,
         _ptr_arg(Out, dtype=_fx.BFloat16),
@@ -807,6 +817,7 @@ def _run_mxfp8_32_smallm_1x32_gfx1250(
         Out.stride(0),
         num_waves,
         split_k,
+        tile_n,
         specialization_key=specialization,
     )
     return Out
@@ -895,6 +906,7 @@ def run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
             x_scale,
             w_scale,
             Out,
+            tile_n=smallm["tile_n"],
             num_waves=smallm["num_waves"],
             split_k=smallm["split_k"],
         )

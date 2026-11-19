@@ -404,17 +404,22 @@ def test_gfx1250_group32_bpreshuffle_route(monkeypatch, w_rows):
     assert calls == [("lookup", block), ("bmm", (1, 256 // w_rows, 16), False)]
 
 
-@pytest.mark.parametrize("waves", [1, 2])
+@pytest.mark.parametrize(
+    "tile_n,waves",
+    [(32, 1), (32, 2), (128, 1), (128, 2), (128, 4)],
+)
 @pytest.mark.parametrize("split_k", [1, 2, 4, 8])
 def test_gfx1250_smallm_1x32_name_selects_dedicated_kernel(
-    monkeypatch, waves, split_k
+    monkeypatch, tile_n, waves, split_k
 ):
     from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
 
-    name = f"{direct.MX32_SMALLM_1X32_NAME_PREFIX}_w{waves}_sk{split_k}"
+    width = "" if tile_n == 32 else f"tn{tile_n}_"
+    name = f"{direct.MX32_SMALLM_1X32_NAME_PREFIX}_{width}w{waves}_sk{split_k}"
     parsed = direct.parse_mxfp8_32_wmma_kernel_name(name)
     assert parsed == {
         "smallm_1x32": True,
+        "tile_n": tile_n,
         "num_waves": waves,
         "split_k": split_k,
     }
@@ -432,7 +437,11 @@ def test_gfx1250_smallm_1x32_name_selects_dedicated_kernel(
         *operands, out, name
     )
     assert actual is out
-    assert calls[0][-1] == {"num_waves": waves, "split_k": split_k}
+    assert calls[0][-1] == {
+        "tile_n": tile_n,
+        "num_waves": waves,
+        "split_k": split_k,
+    }
 
 
 def test_gfx1250_compute_catalog_exposes_tunable_early_merge():

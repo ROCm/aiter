@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Native gfx1250 16x32 MXFP8 GEMM for small M.
+"""Native gfx1250 16x{32,128} MXFP8 GEMM for small M.
 
 This is intentionally separate from the four-wave compute kernel.  One
-workgroup owns the smallest complete n32k4 scale group, double-buffers only A
+workgroup owns one or four complete n32k4 scale groups, double-buffers only A
 and B through TDM, and reads both E8M0 scale words directly into registers.
 """
 
@@ -23,7 +23,6 @@ from .tensor_shim import (
 )
 
 TILE_M = 16
-TILE_N = 32
 TILE_K = 128
 WAVE = 32
 LDS_PAD_A = 16
@@ -46,8 +45,9 @@ def launch_gemm_a8w8_smallm_1x32(
     i32_ldc: fx.Int32,
     num_waves: Constexpr[int],
     split_k: Constexpr[int],
+    tile_n: Constexpr[int] = 32,
 ):
-    """Launch the fixed 16x32x128 MXFP8 kernel.
+    """Launch a 16x{32,128}x128 MXFP8 kernel.
 
     ``split_k`` workgroups for one output tile are one hardware cluster.  Every
     rank publishes an FP32 tile, then rank zero sums ranks in increasing order
@@ -55,21 +55,25 @@ def launch_gemm_a8w8_smallm_1x32(
     independent of workgroup arrival order.
     """
 
-    assert num_waves in (1, 2), f"num_waves must be 1 or 2, got {num_waves}"
+    assert tile_n in (32, 128), f"tile_n must be 32 or 128, got {tile_n}"
+    assert num_waves in (1, 2, 4), f"num_waves must be 1/2/4, got {num_waves}"
+    assert tile_n // 16 % num_waves == 0, (
+        f"tile_n/16 must be divisible by num_waves, got {tile_n}/{num_waves}"
+    )
     assert split_k in (1, 2, 4, 8), f"split_k must be 1/2/4/8, got {split_k}"
     block = num_waves * WAVE
-    n_rep = 2 // num_waves
+    n_rep = (tile_n // 16) // num_waves
 
     a_lds_row = TILE_K + LDS_PAD_A
     stage_a = TILE_M * a_lds_row
     b_lds_row = TILE_K * 16
-    stage_b = (TILE_N // 16) * b_lds_row
+    stage_b = (tile_n // 16) * b_lds_row
     stage_pitch = ((stage_a + stage_b + 1023) // 1024) * 1024
     arena_bytes = NUM_BUFFERS * stage_pitch
-    tile_elems = TILE_M * TILE_N
+    tile_elems = TILE_M * tile_n
 
     kernel_name = format_kernel_name(
-        f"gemm_a8w8_mx32_smallm_1x32_t{TILE_M}x{TILE_N}x{TILE_K}"
+        f"gemm_a8w8_mx32_smallm_1x32_t{TILE_M}x{tile_n}x{TILE_K}"
         f"_w{num_waves}_nb{NUM_BUFFERS}_sk{split_k}"
     )
 
@@ -94,7 +98,7 @@ def launch_gemm_a8w8_smallm_1x32(
         wave = fx.Int32(rocdl.readfirstlane(T.i32, tid // WAVE))
         bid_m, bid_n, k_rank = fx.block_idx
         block_m = bid_m * TILE_M
-        block_n = bid_n * TILE_N
+        block_n = bid_n * tile_n
         k_tiles = i32_k // (split_k * TILE_K)
         k_tile_base = k_rank * k_tiles
 
@@ -135,12 +139,12 @@ def launch_gemm_a8w8_smallm_1x32(
         )
         block_a = fx.zipped_divide(coord_a, a_tile)[None, (0, None)]
 
-        b_tile = (TILE_N // 16, TILE_K * 16)
+        b_tile = (tile_n // 16, TILE_K * 16)
         b_box_stride = (b_lds_row, 1)
         g_b = _global_view(
             g_b_base,
             b_offset,
-            (TILE_N // 16, i32_k * 16),
+            (tile_n // 16, i32_k * 16),
             (k64 * 16, 1),
         )
         atom_b, coord_b = rocdl.cdna5.make_tiled_tdm_atom(
@@ -233,12 +237,16 @@ def launch_gemm_a8w8_smallm_1x32(
             return fx.Int32(fx.ptr_load(scale_a_i32 + index))
 
         def load_scale_b(global_k_tile, local_n):
-            # n32k4 storage: one 128-byte row per 32 output columns and K/128.
+            # n32k4 storage has one independent pack per 32 output columns.
+            # A 128-column tile spans four packs, whose K strides are not
+            # adjacent in memory; split the relative column into pack/lane.
             column = wave * (n_rep * 16) + local_n * 16 + lane16
+            pack = column // 32
+            pack_lane = column % 32
             index = (
-                fx.Int64(block_n // 32) * (fx.Int64(i32_k) // 4)
+                fx.Int64(block_n // 32 + pack) * (fx.Int64(i32_k) // 4)
                 + fx.Int64(global_k_tile) * 32
-                + fx.Int64(column)
+                + fx.Int64(pack_lane)
             )
             return fx.Int32(fx.ptr_load(scale_b_i32 + index))
 
@@ -305,7 +313,7 @@ def launch_gemm_a8w8_smallm_1x32(
                 )
         else:
             workspace = fx.recast_iter(fx.Float32, arg_workspace)
-            tile_index = bid_m * (i32_n // TILE_N) + bid_n
+            tile_index = bid_m * (i32_n // tile_n) + bid_n
             partial_base = (
                 (fx.Int64(tile_index) * split_k + fx.Int64(k_rank)) * tile_elems
             )
@@ -313,7 +321,7 @@ def launch_gemm_a8w8_smallm_1x32(
                 row, column = fragment_position(local_n)
                 fx.ptr_store(
                     accumulators[local_n].load(),
-                    workspace + partial_base + row * TILE_N + column,
+                    workspace + partial_base + row * tile_n + column,
                 )
 
             llvm.memory_fence(syncscope="agent", ordering=fx.AtomicOrdering.Release)
@@ -324,7 +332,7 @@ def launch_gemm_a8w8_smallm_1x32(
                 tile_base = fx.Int64(tile_index) * split_k * tile_elems
                 for local_n in range_constexpr(n_rep):
                     row, column = fragment_position(local_n)
-                    offset = row * TILE_N + column
+                    offset = row * tile_n + column
                     total = fx.ptr_load(
                         workspace + tile_base + offset,
                         result_type=T.vec(8, T.f32),
@@ -361,7 +369,7 @@ def launch_gemm_a8w8_smallm_1x32(
             )
         },
     ).launch(
-        grid=(i32_m // TILE_M, i32_n // TILE_N, split_k),
+        grid=(i32_m // TILE_M, i32_n // tile_n, split_k),
         block=(block, 1, 1),
         stream=stream,
         cluster=(1, 1, split_k) if split_k > 1 else None,
