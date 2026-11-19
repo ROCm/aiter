@@ -1063,7 +1063,8 @@ class _Recorder(_Provider):
 
 def _serve(monkeypatch, op, candidate):
     provider = _Recorder("aklr", candidate)
-    provider.op_versions = {op: {1}}
+    # the contract's current version, so a bump does not leave the call native
+    provider.op_versions = {op: {plugin._routed_ops[op].op.version}}
     plugin.configure(enable=("aklr",), source="test")
     monkeypatch.setattr(
         plugin, "_entry_points", lambda: (_EntryPoint("aklr", provider),)
@@ -1235,8 +1236,8 @@ def _route_cases():
         ),
         # The provider returns lse alone: an empty tensor when return_lse is False.
         "mla_paged_decode": (
-            lambda: mla_gluon.mla_gluon(**_gluon_args(), kv_scale=2.0),
-            "kv_scale",
+            lambda: mla_gluon.mla_gluon(**_gluon_args(), q_scale=2.0),
+            "q_scale",
             2.0,
             _z(0),
         ),
