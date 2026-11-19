@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Gluon device helpers of the gfx950 comms kernels: bounded Lamport polls of IPC inbox
-slots, error records, 16-byte vector loads and stores, bf16 and e4m3 packing, and lane
-exchanges. A thread holds 4 dwords of a [64 W, 4] block layout (W warps)."""
+"""Gluon device helpers of the multi-GPU comms kernels, for gfx950 only: bounded Lamport
+polls of IPC inbox slots, error records, 16-byte vector loads and stores, bf16 and e4m3
+packing, and lane exchanges.
+
+The helpers use gfx950 instructions (the sc0 sc1 cache bits, v_permlane32_swap,
+v_cvt_pk_bf16_f32 and OCP e4m3) and the CDNA4 buffer loads and stores. A thread holds 4
+dwords of a [64 W, 4] block layout (W warps). The IPC buffer of each rank starts with
+the error record [flag, rank, colour, site]."""
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -143,7 +148,7 @@ def _bfly(op):
 
 _LPOLL = {n: _lpoll(n) for n in range(1, 9)}
 _ERREC = {n: _errec(n) for n in (2, 4, 8)}
-_BFLY_ADD: gl.constexpr = gl.constexpr(_bfly("v_add_f32"))
+BFLY_ADD: gl.constexpr = gl.constexpr(_bfly("v_add_f32"))
 
 
 @gluon.constexpr_function
@@ -172,14 +177,14 @@ def _chunk(ns, c):
 
 
 @gluon.jit
-def _tids(W: gl.constexpr):
+def tids(W: gl.constexpr):
     """The thread index, one value a thread."""
     LV: gl.constexpr = gl.BlockedLayout([1, 4], [64, 1], [W, 1], [1, 0])
     return gl.arange(0, 64 * W, layout=gl.SliceLayout(1, LV))
 
 
 @gluon.jit
-def _k4(W: gl.constexpr):
+def dword_idx(W: gl.constexpr):
     LV: gl.constexpr = gl.BlockedLayout([1, 4], [64, 1], [W, 1], [1, 0])
     return gl.arange(0, 4, layout=gl.SliceLayout(0, LV))[None, :]
 
@@ -187,7 +192,7 @@ def _k4(W: gl.constexpr):
 @gluon.jit
 def _split4(x, W: gl.constexpr):
     """[threads, 4] dwords to 4 tensors of one dword a thread."""
-    k = _k4(W)
+    k = dword_idx(W)
     return (
         gl.sum(gl.where(k == 0, x, 0), axis=1),
         gl.sum(gl.where(k == 1, x, 0), axis=1),
@@ -198,7 +203,7 @@ def _split4(x, W: gl.constexpr):
 
 @gluon.jit
 def _join4(w, W: gl.constexpr):
-    k = _k4(W)
+    k = dword_idx(W)
     return gl.where(
         k == 0,
         w[0][:, None],
@@ -207,23 +212,23 @@ def _join4(w, W: gl.constexpr):
 
 
 @gluon.jit
-def _ld4(ptr, dw, mask, W: gl.constexpr):
+def ld4(ptr, dw, mask, W: gl.constexpr):
     """The 16 bytes at dword dw of ptr (one vector a thread), as 4 dwords."""
-    k = _k4(W)
+    k = dword_idx(W)
     x = gl.amd.cdna4.buffer_load(ptr, dw[:, None] + k, mask=mask[:, None] & (k < 4))
     return _split4(x, W)
 
 
 @gluon.jit
-def _st4(ptr, dw, w, mask, W: gl.constexpr, CACHE: gl.constexpr = ""):
-    k = _k4(W)
+def st4(ptr, dw, w, mask, W: gl.constexpr, CACHE: gl.constexpr = ""):
+    k = dword_idx(W)
     gl.amd.cdna4.buffer_store(
         _join4(w, W), ptr, dw[:, None] + k, mask=mask[:, None] & (k < 4), cache=CACHE
     )
 
 
 @gluon.jit
-def _st2(ptr, dw, w0, w1, mask, W: gl.constexpr):
+def st2(ptr, dw, w0, w1, mask, W: gl.constexpr):
     L2: gl.constexpr = gl.BlockedLayout([1, 2], [64, 1], [W, 1], [1, 0])
     S2: gl.constexpr = gl.SliceLayout(1, L2)
     k = gl.arange(0, 2, layout=gl.SliceLayout(0, L2))[None, :]
@@ -237,7 +242,7 @@ def _st2(ptr, dw, w0, w1, mask, W: gl.constexpr):
 
 
 @gluon.jit
-def _canon(w):
+def canon(w):
     """A 16-bit word 0xFFFF becomes 0x7FFF: still a NaN, but not the empty mark."""
     x = w ^ -1
     nz = ((x & 0x7FFF7FFF) + 0x7FFF7FFF) | x
@@ -245,17 +250,17 @@ def _canon(w):
 
 
 @gluon.jit
-def _bf_lo(w):
+def bf_lo(w):
     return (w << 16).to(gl.float32, bitcast=True)
 
 
 @gluon.jit
-def _bf_hi(w):
+def bf_hi(w):
     return (w & -65536).to(gl.float32, bitcast=True)
 
 
 @gluon.jit
-def _pack_bf16(lo, hi):
+def pack_bf16(lo, hi):
     """Two fp32 values to one dword of 2 bf16 (round to nearest even), lo first."""
     return gl.inline_asm_elementwise(
         "v_cvt_pk_bf16_f32 $0, $1, $2", "=v,v,v", [lo, hi], gl.int32, True, 1
@@ -263,7 +268,7 @@ def _pack_bf16(lo, hi):
 
 
 @gluon.jit
-def _fp8_pack4(a, b, c, d):
+def fp8_pack4(a, b, c, d):
     """Four fp32 values in range to one dword of 4 e4m3 (round to nearest even)."""
     return gl.inline_asm_elementwise(
         "v_cvt_pk_fp8_f32 $0, $1, $2\nv_cvt_pk_fp8_f32 $0, $3, $4 op_sel:[0,0,1]",
@@ -276,13 +281,13 @@ def _fp8_pack4(a, b, c, d):
 
 
 @gluon.jit
-def _bfly_op(x, ASM: gl.constexpr):
+def bfly_op(x, ASM: gl.constexpr):
     out = gl.inline_asm_elementwise(ASM, "=&v,=&v,v", [x], (x.dtype, x.dtype), True, 1)
     return out[0]
 
 
 @gluon.jit
-def _quad_xor(x, P: gl.constexpr):
+def quad_xor(x, P: gl.constexpr):
     """The value of lane ^ P, for P = 1 or 2."""
     if P == 1:
         return gl.inline_asm_elementwise(
@@ -305,7 +310,7 @@ def _quad_xor(x, P: gl.constexpr):
 
 
 @gluon.jit
-def _fail_record(bufs, rank, colour, site: gl.constexpr, active):
+def fail_record(bufs, rank, colour, site: gl.constexpr, active):
     """Writes [1, rank, colour, site] to the error record of each rank."""
     lo = (rank.to(gl.int64) << 32) | 1
     hi = (gl.full(active.shape, site, gl.int64, active.type.layout) << 32) | colour.to(
@@ -327,7 +332,7 @@ def _fail_record(bufs, rank, colour, site: gl.constexpr, active):
 
 
 @gluon.jit
-def _peer(bufs, d, WORLD: gl.constexpr):
+def peer(bufs, d, WORLD: gl.constexpr):
     """bufs[d] for a uniform d in 1 to WORLD - 1."""
     p = bufs[1]
     for q in gl.static_range(2, WORLD):
@@ -336,7 +341,7 @@ def _peer(bufs, d, WORLD: gl.constexpr):
 
 
 @gluon.jit
-def _poll_slots(own, addrs, act, ticks, NS: gl.constexpr):
+def poll_slots(own, addrs, act, ticks, NS: gl.constexpr):
     """Lamport poll of the NS 16-byte slots in addrs. Returns failed and the 4 dwords of each
     slot. Up to _POLL_MAX slots go in one wait."""
     z = gl.zeros_like(act.to(gl.int32))

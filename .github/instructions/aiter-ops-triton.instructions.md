@@ -37,7 +37,8 @@ breaks and how to fix it. The author can be new to these rules.
 - Flag new code that duplicates existing code, also in part. The fix is to
   extend or import the existing code. Look in `utils/`,
   `_triton_kernels/common/` (activations, program ID remapping, split-K
-  reduce, ragged-batch tile lookup), the existing kernels and the test
+  reduce, ragged-batch tile lookup), `_gluon_kernels/common/` (Gluon
+  helpers, gfx950 multi-GPU helpers), the existing kernels and the test
   helpers.
 - Flag a function with a second home: a re-export, a wrapper that only
   forwards the call, or a copy of a core helper in a family loader.

@@ -26,25 +26,25 @@ from triton.experimental.gluon import language as gl
 from triton.language.core import PropagateNan as _PropagateNan
 from triton.language.extra.hip import libdevice
 
-from aiter.ops.triton._gluon_kernels.common.utils import mx_e8m0_scale
-from aiter.ops.triton._gluon_kernels.gfx950.comms.common import (
-    _BFLY_ADD,
-    _bf_hi,
-    _bf_lo,
-    _bfly_op,
-    _canon,
-    _fail_record,
-    _fp8_pack4,
-    _k4,
-    _ld4,
-    _pack_bf16,
-    _peer,
-    _poll_slots,
-    _quad_xor,
-    _st2,
-    _st4,
-    _tids,
+from aiter.ops.triton._gluon_kernels.common.comms_gfx950 import (
+    BFLY_ADD,
+    bf_hi,
+    bf_lo,
+    bfly_op,
+    canon,
+    dword_idx,
+    fail_record,
+    fp8_pack4,
+    ld4,
+    pack_bf16,
+    peer,
+    poll_slots,
+    quad_xor,
+    st2,
+    st4,
+    tids,
 )
+from aiter.ops.triton._gluon_kernels.common.utils import mx_e8m0_scale
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _NAN_ALL: gl.constexpr = gl.constexpr(_PropagateNan.ALL)
@@ -106,11 +106,11 @@ def _all_reduce_rmsnorm_mxfp8_kernel(
         bufs = bufs + (gl.multiple_of(peers[d].to(gl.pointer_type(gl.int32)), 16),)
     own = bufs[0]
     bid = gl.program_id(0)
-    tid = _tids(W)
+    tid = tids(W)
     lane = tid % 64
     wave = tid // 64
     act = tid < A
-    k4 = _k4(W)
+    k4 = dword_idx(W)
     colour = gl.load(colors + bid)
     par = colour & 1
     ticks = wait_us.to(gl.int64) * 100  # s_memrealtime is 100 MHz
@@ -135,10 +135,10 @@ def _all_reduce_rmsnorm_mxfp8_kernel(
     for j in gl.static_range(V):
         vec = j * A + tid
         own_w = own_w + (
-            _ld4(inp, tn_c * (HIDDEN // 2) + vec * 4, act & is_owner & has_row, W),
+            ld4(inp, tn_c * (HIDDEN // 2) + vec * 4, act & is_owner & has_row, W),
         )
-        res_w = res_w + (_ld4(res, tn_c * (HIDDEN // 2) + vec * 4, act & has_row, W),)
-        w_w = w_w + (_ld4(norm_w, vec * 4, act & has_row, W),)
+        res_w = res_w + (ld4(res, tn_c * (HIDDEN // 2) + vec * 4, act & has_row, W),)
+        w_w = w_w + (ld4(norm_w, vec * 4, act & has_row, W),)
 
     # Reduce-scatter push. Unit u is peer d = u % NP + 1, row and vector block
     # u // NP. All loads go out before the first store.
@@ -166,8 +166,8 @@ def _all_reduce_rmsnorm_mxfp8_kernel(
         p_ok, p_d, p_r, p_vec, p_x = plan[p]
         p_slot = RSW + ((par * WORLD + rank) * GMAX + p_r) * (NV * 4)
         gl.amd.cdna4.buffer_store(
-            _canon(p_x),
-            _peer(bufs, p_d, WORLD),
+            canon(p_x),
+            peer(bufs, p_d, WORLD),
             (p_slot + p_vec * 4)[:, None] + k4,
             mask=(act & p_ok)[:, None] & (k4 < 4),
         )
@@ -181,8 +181,8 @@ def _all_reduce_rmsnorm_mxfp8_kernel(
             )
             for o_j in gl.static_range(V):
                 o_addrs = o_addrs + (own + o_base + (o_j * A + tid) * 4,)
-        o_failed, o_got = _poll_slots(own, o_addrs, act & has_row, ticks, NP * V)
-        _fail_record(bufs, rank, colour, _SITE_RS, (lane == 0) & (o_failed == 1))
+        o_failed, o_got = poll_slots(own, o_addrs, act & has_row, ticks, NP * V)
+        fail_record(bufs, rank, colour, _SITE_RS, (lane == 0) & (o_failed == 1))
         hw = ()
         for o_j in gl.static_range(V):
             for o_e in gl.static_range(4):
@@ -197,29 +197,29 @@ def _all_reduce_rmsnorm_mxfp8_kernel(
                             o_x,
                         )
                     if src == 0:
-                        acc_lo = _bf_lo(o_x)
-                        acc_hi = _bf_hi(o_x)
+                        acc_lo = bf_lo(o_x)
+                        acc_hi = bf_hi(o_x)
                     else:
-                        acc_lo = acc_lo + _bf_lo(o_x)
-                        acc_hi = acc_hi + _bf_hi(o_x)
-                hw = hw + (_pack_bf16(acc_lo, acc_hi),)
+                        acc_lo = acc_lo + bf_lo(o_x)
+                        acc_hi = acc_hi + bf_hi(o_x)
+                hw = hw + (pack_bf16(acc_lo, acc_hi),)
         o_ag = AGW + ((par * WORLD + rank) * GMAX + bid) * (NV * 4)
         for o_j in gl.static_range(V):
             cw = (
-                _canon(hw[4 * o_j]),
-                _canon(hw[4 * o_j + 1]),
-                _canon(hw[4 * o_j + 2]),
-                _canon(hw[4 * o_j + 3]),
+                canon(hw[4 * o_j]),
+                canon(hw[4 * o_j + 1]),
+                canon(hw[4 * o_j + 2]),
+                canon(hw[4 * o_j + 3]),
             )
             for o_d in gl.static_range(1, WORLD):
-                _st4(bufs[o_d], o_ag + (o_j * A + tid) * 4, cw, act & has_row, W)
+                st4(bufs[o_d], o_ag + (o_j * A + tid) * 4, cw, act & has_row, W)
     else:
         r_ag = AGW + ((par * WORLD + g_src) * GMAX + r_recv) * (NV * 4)
         r_addrs = ()
         for r_j in gl.static_range(V):
             r_addrs = r_addrs + (own + r_ag + (r_j * A + tid) * 4,)
-        r_failed, r_got = _poll_slots(own, r_addrs, act & has_row, ticks, V)
-        _fail_record(bufs, rank, colour, _SITE_AG, (lane == 0) & (r_failed == 1))
+        r_failed, r_got = poll_slots(own, r_addrs, act & has_row, ticks, V)
+        fail_record(bufs, rank, colour, _SITE_AG, (lane == 0) & (r_failed == 1))
         hw = ()
         for r_j in gl.static_range(V):
             for r_e in gl.static_range(4):
@@ -230,13 +230,13 @@ def _all_reduce_rmsnorm_mxfp8_kernel(
     for j in gl.static_range(V):
         for e in gl.static_range(4):
             s = s + (
-                _bf_lo(hw[4 * j + e]) + _bf_lo(res_w[j][e]),
-                _bf_hi(hw[4 * j + e]) + _bf_hi(res_w[j][e]),
+                bf_lo(hw[4 * j + e]) + bf_lo(res_w[j][e]),
+                bf_hi(hw[4 * j + e]) + bf_hi(res_w[j][e]),
             )
     sq = s[0] * s[0]
     for i in gl.static_range(1, 8 * V):
         sq = sq + s[i] * s[i]
-    sq = _bfly_op(gl.where(act, sq, 0.0), _BFLY_ADD)
+    sq = bfly_op(gl.where(act, sq, 0.0), BFLY_ADD)
     red = gl.allocate_shared_memory(
         gl.float32, [64], gl.SwizzledSharedLayout(1, 1, 1, [0])
     )
@@ -254,29 +254,29 @@ def _all_reduce_rmsnorm_mxfp8_kernel(
         vec = j * A + tid
         y = ()
         for e in gl.static_range(4):
-            wl = _bf_lo(w_w[j][e])
-            wh = _bf_hi(w_w[j][e])
+            wl = bf_lo(w_w[j][e])
+            wh = bf_hi(w_w[j][e])
             if GEMMA:
                 wl = 1.0 + wl
                 wh = 1.0 + wh
-            yp = _pack_bf16(
+            yp = pack_bf16(
                 (s[8 * j + 2 * e] * rstd) * wl, (s[8 * j + 2 * e + 1] * rstd) * wh
             )
-            y = y + (_bf_lo(yp), _bf_hi(yp))
+            y = y + (bf_lo(yp), bf_hi(yp))
         am = gl.abs(y[0])
         for e in gl.static_range(1, 8):
             am = gl.maximum(am, gl.abs(y[e]), propagate_nan=_NAN_ALL)
-        am = gl.maximum(am, _quad_xor(am, 1), propagate_nan=_NAN_ALL)
-        am = gl.maximum(am, _quad_xor(am, 2), propagate_nan=_NAN_ALL)
+        am = gl.maximum(am, quad_xor(am, 1), propagate_nan=_NAN_ALL)
+        am = gl.maximum(am, quad_xor(am, 2), propagate_nan=_NAN_ALL)
         sb = mx_e8m0_scale(am, 8)
         # y / 2^(sb - 127) with ldexp: 2^-127 (sb 254) is not a normal fp32 value.
         n = 127 - sb.to(gl.int32)
         q = ()
         for e in gl.static_range(8):
             q = q + (libdevice.ldexp(y[e], n),)
-        c0 = _fp8_pack4(q[0], q[1], q[2], q[3])
-        c1 = _fp8_pack4(q[4], q[5], q[6], q[7])
-        _st2(xq, xrow + 2 * vec, c0, c1, act & has_row, W)
+        c0 = fp8_pack4(q[0], q[1], q[2], q[3])
+        c1 = fp8_pack4(q[4], q[5], q[6], q[7])
+        st2(xq, xrow + 2 * vec, c0, c1, act & has_row, W)
         gl.store(
             xs + tn_c * (HIDDEN // 32) + vec // 4,
             sb,
@@ -286,8 +286,8 @@ def _all_reduce_rmsnorm_mxfp8_kernel(
         vec = j * A + tid
         rw = ()
         for e in gl.static_range(4):
-            rw = rw + (_pack_bf16(s[8 * j + 2 * e], s[8 * j + 2 * e + 1]),)
-        _st4(res_out, tn_c * (HIDDEN // 2) + vec * 4, rw, act & has_row, W)
+            rw = rw + (pack_bf16(s[8 * j + 2 * e], s[8 * j + 2 * e + 1]),)
+        st4(res_out, tn_c * (HIDDEN // 2) + vec * 4, rw, act & has_row, W)
 
     # Write the empty mark back into the slots of this CTA, then advance the colour.
     sent = gl.full(

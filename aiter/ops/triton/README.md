@@ -151,6 +151,8 @@ Tests use the same folders under `op_tests/triton_tests/`. Old flat imports
 | Split-K second-stage reduce | `_triton_kernels/common/splitk_reduce.py` |
 | Program ID and XCD remapping | `_triton_kernels/common/pid_preprocessing.py` |
 | Tile lookup for ragged batches | `_triton_kernels/common/segment_tile.py` |
+| Gluon helpers: sigmoid, MXFP scale, RoPE | `_gluon_kernels/common/utils.py` |
+| gfx950 multi-GPU Gluon helpers: polls, error records, peer stores | `_gluon_kernels/common/comms_gfx950.py` |
 | Architecture checks | `utils/_triton/arch_info.py::get_arch` |
 | Kernel names in traces | `utils/_triton/kernel_repr.py::make_kernel_repr` |
 | Logging in library code | `utils/logger.py::AiterTritonLogger`, level from `AITER_TRITON_LOG_LEVEL` |
