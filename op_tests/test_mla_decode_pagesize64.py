@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-# gfx1250 / mi400 MLA fp8 decode test.
+# gfx1250 / mi400 MLA FP8 and NVFP4 decode test.
 #
 #   # Single public dispatch case:
 #   python3 op_tests/test_mla_decode_pagesize64.py -n 8,1
@@ -12,8 +12,8 @@
 #   # QH128 automatically uses kv-shuffled PS64 (one query, no KV splitting):
 #   python3 op_tests/test_mla_decode_pagesize64.py -n 128,1
 #
-#   # NVFP4 QH128, BF16 producers + reference, decode-only GPU timing:
-#   python3 op_tests/test_mla_decode_pagesize64.py --kv-layout nvfp4_n128 -b 1536 -c 1024 2048 3072 4096 5120
+#   # O24a NVFP4 QH128, BF16 producers + reference, decode-only GPU timing:
+#   python3 op_tests/test_mla_decode_pagesize64.py --kv-layout nvfp4_n128 -b 5120 6144 7168 -c 5120 8192 10240
 #
 #   # GPU contract tests, including graph replay and all page tails:
 #   python3 -m pytest op_tests/test_mla_decode_pagesize64.py -q
@@ -614,6 +614,8 @@ class TestMlaNvfp4Page64:
         [
             list(range(65)),
             [65, 127, 128, 129, 255, 256, 257, 511, 512, 513],
+            # Every N16/N128 tail after wrapping all four LDS slots.
+            list(range(512, 641)),
             [1024, 2048, 3072, 4096, 5120],
         ],
     )

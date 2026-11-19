@@ -3,7 +3,7 @@
   "padding": 8,
   "raw_src2_bit58": true,
   "native32_count": 720,
-  "code_bytes": 90256,
+  "code_bytes": 94568,
   "vgpr": 1024,
   "sgpr": 106,
   "lds": 262144,
@@ -12,8 +12,12 @@
     16384,
     16384
   ],
-  "probability_quantization": "common_n128_anchor_n32",
+  "version": "O24a",
+  "spi_prefetch": 255,
+  "numerical_mode": "local_n16_exp",
+  "probability_quantization": "local_n16_exp_common_n128_anchor",
+  "instruction_sha256": "017d3f7a9f9b9371fcac3f44b0064016391003249716e72d9f6f0a6d53981be8",
   "sha256": {
-    "mla_nvfp4_n128.co": "1570b4fd58887a540dba40b42f798042d0ae8456558d3175927c3fe6666dcab9"
+    "mla_nvfp4_n128.co": "4a1aa309572fb912ddd11986e80c3231a64351889de7150d4b0727439a04c138"
   }
 }

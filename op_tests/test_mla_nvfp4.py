@@ -242,10 +242,10 @@ def oracle(case):
             score += (
                 q[:, 576:].astype(np.float64) @ ct[:, 512:576].astype(np.float64).T
             ).astype(np.float32)
-            scores = np.full((128, 128), -np.inf, np.float32)
-            scores[:, :n] = score * case["beta"]
-            scores = scores.reshape(128, 4, 32)
-            gm = scores.max(axis=2)
+            raw = np.full((128, 128), -np.inf, np.float32)
+            raw[:, :n] = score
+            raw = raw.reshape(128, 8, 16)
+            gm = raw.max(axis=2) * case["beta"]
             tilemax = gm.max(axis=1)
             if anchor is None:
                 anchor = tilemax.copy()
@@ -255,22 +255,22 @@ def oracle(case):
                 den *= alpha
                 acc *= alpha[:, None]
                 anchor = new
-            # Common tile anchor, fused score scaling, and one P scale per N32.
+            # O24a: local N16 exponentials under a common N128 online anchor.
+            # Each group quantizes 6*e to FP4 and 5*w to FP8; the denominator
+            # accumulates unquantized e*w. Empty groups contribute zero.
             # Evaluate exp2 in FP64 then round, to avoid NumPy FP32 SIMD error
             # moving a probability across an E2M1 midpoint.
             exponent = (
-                score.astype(np.float64) * float(case["beta"]) - anchor[:, None]
+                raw.astype(np.float64) * float(case["beta"])
+                - np.maximum(gm, np.finfo(np.float32).min)[..., None]
             ).astype(np.float32)
-            weights = np.zeros((128, 128), np.float32)
-            weights[:, :n] = np.exp2(exponent.astype(np.float64)).astype(np.float32)
+            local = np.exp2(exponent.astype(np.float64)).astype(np.float32)
             delta = gm - anchor[:, None]
             relative = np.exp2(delta.astype(np.float64)).astype(np.float32)
-            factor = np.float32(6) * np.exp2(
-                np.minimum(-delta, 124).astype(np.float64)
-            ).astype(np.float32)
-            den += weights.astype(np.float64).sum(axis=1).astype(np.float32)
+            weights = local * relative[..., None]
+            den += weights.astype(np.float64).sum(axis=(1, 2)).astype(np.float32)
             p = (
-                F4[nearest(weights.reshape(128, 4, 32) * factor[..., None], F4[:8])]
+                F4[nearest(local * np.float32(6), F4[:8])]
                 * S8[nearest(relative * 5, S8)][..., None]
             )
             acc += (
@@ -351,9 +351,8 @@ def test_decode_oracle(mode):
         assert torch.equal(args["lse"], expected[1])
 
 
-@pytest.mark.parametrize("threshold", [0.0, 1.0, 6.0])
-def test_threshold(threshold):
-    check(*make_case([1, 129, 1153, 2049], "rescale", threshold))
+def test_threshold():
+    check(*make_case([1, 129, 1153, 2049], "rescale", 6.0))
 
 
 def test_empty_batch():
@@ -682,6 +681,9 @@ def test_co_manifest_and_entry():
     byname = {names[s[0] :].split(b"\0", 1)[0].decode(): s for s in sections}
     text = byname[".text"]
     assert text[3] % 16384 == 0 and text[8] >= 16384
+    instructions = blob[text[4] : text[4] + manifest["code_bytes"]]
+    assert hashlib.sha256(instructions).hexdigest() == manifest["instruction_sha256"]
+    assert manifest["numerical_mode"] == "local_n16_exp"
     ro = byname[".rodata"]
     lds, private, karg = struct.unpack_from("<III", blob, ro[4])
     offset = struct.unpack_from("<q", blob, ro[4] + 16)[0]

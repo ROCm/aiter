@@ -44,10 +44,15 @@ with a positive floor of `2**-9`; all-zero blocks use an ideal scale of 1.
 Valid input values must be finite. This is a quantized attention operator:
 agreement with its quantized oracle does not establish full-model accuracy.
 
-The shader uses N128 tiles, FP4 probabilities and delayed threshold rescaling.
-Probabilities use a common N128 anchor and one scale per 32 tokens. The
-pipeline overlaps KV prefetch with QK/PV and uses separate startup and drain
-paths. Output uses LDS staging and tensor stores.
+The O24a shader uses N128 tiles, FP4 probabilities and delayed threshold
+rescaling. Each N16 group computes a local log2 maximum `b` and
+`e = exp2(fma(raw_score, beta, -b))`. With the common N128 online anchor `a`,
+`w = exp2(b - a)`. The numerator uses `FP4(6*e) * FP8(5*w)` and the denominator
+accumulates unquantized FP32 `e*w`. Fully masked groups contribute zero.
+The pipeline overlaps KV prefetch with QK/PV and uses separate startup and drain
+paths. Output uses LDS staging and tensor stores. O24a retains the public ABI
+and N16 AUX cache layout; its probability quantization differs from O21y's N32
+groups, so output bits can change for the same packed inputs.
 The default log2 rescale threshold is 6; 0 and 1 are explicit alternatives.
 Its fixed PSF multiplier 5 folds in the KV gain. Arbitrary global gains or
 unquantized probabilities are not supported by this code object.
@@ -148,8 +153,10 @@ fall back to FP8 kernels without an explicit conversion.
 
 ## Build and verification
 
-The shipped `mla_nvfp4_n128.co` has an 80-byte, ten-pointer ABI, fixed LDS of
+The shipped O24a `mla_nvfp4_n128.co` has an 80-byte, ten-pointer ABI, fixed LDS of
 262144 bytes and a 16KiB aligned instruction entry. Dynamic LDS is zero.
+It contains 94568 instruction bytes, uses 1024 VGPRs / 106 SGPRs and retains
+SPI prefetch 255. Its public symbol remains `mla_nvfp4_n128`.
 Both new HIP producer kernels also request 16KiB instruction alignment.
 The kernel object/descriptor itself is a different address from the entry.
 
@@ -162,7 +169,7 @@ separately and are not distributed with AITER.
 python3 -m pytest op_tests/test_mla_nvfp4.py -q
 AITER_NVFP4_TEST_LARGE=1 python3 -m pytest op_tests/test_mla_nvfp4.py -q
 python3 -m pytest op_tests/test_mla_decode_pagesize64.py -k Nvfp4 -q
-python3 op_tests/test_mla_decode_pagesize64.py --kv-layout nvfp4_n128 -b 1536 -c 1024 2048 3072 4096 5120
+python3 op_tests/test_mla_decode_pagesize64.py --kv-layout nvfp4_n128 -b 5120 6144 7168 -c 5120 8192 10240
 ```
 
 The page64 tests start from BF16 Q/KV, call both GPU producers, and check the
@@ -186,9 +193,35 @@ The optional test allocates approximately 12GiB to put both KV streams above
 4GiB offsets. Full-model accuracy and shape-specific performance tuning remain
 separate from this first integration.
 
-### Current decode benchmark (2026-11-18)
+### O24a validation and decode benchmark (2026-11-19)
 
-On gfx1250 B0, the page64 command above checked every output for batch 1536
+On gfx1250 B0 (d07-2), the NVFP4 and existing FP8 QH128 regression selection
+passed **43 tests**, with no skips. The run used a fresh JIT cache and covered
+the quantized oracle, BF16 producers, B6 rescaling, every tail after the
+four-slot wrap, empty rows, guards, graph replay, fullgraph compile and KV
+addresses above 4GiB. Runtime inspection matched all 94568 decode instruction
+bytes to the manifest and verified 16KiB entries for decode and both producers.
+
+The command above checks all outputs and LSEs for nine shapes, using independent
+random BF16 histories and **threshold 6 only**. All nine passed: output and LSE
+element-mismatch ratios were zero at `atol=rtol=0.3`; the largest per-request
+output NRMS was **0.133525** (limit 0.3).
+
+Mean decode time in microseconds, using 30 HIP-event samples of a 32-dispatch
+graph divided by 32; producers, transfers and reference checks are excluded:
+
+| Batch | KV 5120 | KV 8192 | KV 10240 |
+|---:|---:|---:|---:|
+| 5120 | 1360.15 | 2116.49 | 2635.67 |
+| 6144 | 1635.87 | 2552.81 | 3175.12 |
+| 7168 | 1913.14 | 2987.13 | 3715.40 |
+
+These are O24a measurements; no paired baseline was measured in this sweep.
+
+### Previous O21y decode benchmark (2026-11-18)
+
+These measurements describe the previous O21y CO, not the current O24a CO.
+On gfx1250 B0, the page64 benchmark checked every output for batch 1536
 with independent random BF16 KV histories, QH128, one query, no split and B6.
 Output and LSE element-mismatch ratios were zero at the stated tolerances.
 Mean decode time uses 30 HIP-event samples, each a 32-dispatch graph; producers
@@ -204,8 +237,8 @@ and reference evaluation run outside the timed graph.
 
 ### Previous implementation validation (2026-11-15)
 
-This record applies to the earlier N16 probability implementation. The current
-N32 CO has the same public symbol and ABI but a different numerical contract.
+This record applies to the earlier N16 probability implementation. O21y and
+O24a retain its public symbol and ABI; validation below belongs to that earlier CO.
 
 On gfx1250 B0, the 17 NVFP4 tests passed both from the checkout and from a
 clean wheel installed outside the checkout with a fresh JIT directory. This
