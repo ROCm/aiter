@@ -20,10 +20,11 @@ plus gfx1250's 1x32 (n32k4-shuffled) weight scale. gfx950 also runs 1x32 /
 opus untuned. A K that 128 does not divide runs only on 1x32 / 32x32 (a ragged
 last k-tile); DeepSeek-V4.1's shared-expert down projection has K = 576 at TP4.
 
-On gfx1250 this file also checks the mxfp8_32 GEMM's fused quant epilogue:
-``y_scale_out`` must be byte-identical to quantize_fp8 of the unfused bf16
-output; M above 1024 runs it on the compute-bound kernel. gfx1250-strict runs
-that check and the compute kernelName cases alone.
+On gfx1250 (the mxfp8_32 GEMM) and gfx950 (the bmm) this file also checks
+the fused quant epilogue: ``y_scale_out`` must be byte-identical to
+quantize_fp8 of the unfused bf16 output. On gfx1250, M above 1024 runs it on
+the compute-bound kernel. gfx1250-strict runs that check and the compute
+kernelName cases alone.
 
 Input magnitudes change every 32 K (and every 32 weight rows), so the e8m0
 scales differ block to block and a scale applied to the wrong block shows up
@@ -491,29 +492,46 @@ def test_woa_fused_quant_epilogue(b, m, n, k):
 
     Returns (scale mismatches, fp8 mismatches). The n32k4 weight scale needs
     a whole 128-K tile, and the quant needs N and B*N to be whole groups of 32.
-    Other shapes contribute nothing.
+    Other shapes contribute nothing. gfx950 runs its bmm on the raw 32x32
+    weight scale; it fuses one split, so the bf16 reference runs one too.
     """
     if n % 32 or k % 128 or (b * n) % 32:
         return 0, 0
-    from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
-        run_bmm_a8w8_mxfp8_32_gfx1250,
-    )
-
     torch.manual_seed(SEED)
     o_mbn = blockwise_randn(m, b, k, dtype=dtypes.bf16)
     w_bnk = blockwise_randn(b, n, k, dtype=dtypes.bf16, rows=32)
     x8, xs8 = quant_act_e8m0(o_mbn, 32)
     w8, ws8 = quant_weight_e8m0(w_bnk, 32, 32)
-    w_scale = expand_32x32_to_n32k4(ws8)
     w_shuf = shuffle_weight(w8)
+    if base_gfx_arch(get_gfx_runtime()) == "gfx950":
+        from aiter.ops.flydsl import batched_gemm_a8w8_gfx950 as bmm
+
+        w_scale = ws8
+        scale_args = (32, 32, 32, False)
+        # The unsplit tile the fused call picks for itself, for the reference.
+        picked = (
+            bmm._FUSED_LARGE_M_KERNEL
+            if m > bmm._FUSED_LARGE_M
+            else bmm.pick_bmm_kernel_name(b, m, n, k, *scale_args)
+        )
+        tile = bmm._fused_quant_name(picked, b, m, n, k, scale_args)
+        run_ref = functools.partial(bmm.run_bmm_a8w8_mxfp8_gfx950, kernel_name=tile)
+        run_fused = bmm.run_bmm_a8w8_mxfp8_gfx950
+    else:
+        from aiter.ops.flydsl.batched_gemm_a8w8_gfx1250 import (
+            run_bmm_a8w8_mxfp8_32_gfx1250 as run_ref,
+        )
+
+        w_scale = expand_32x32_to_n32k4(ws8)
+        run_fused = run_ref
 
     y_bf16 = torch.empty(m, b, n, dtype=dtypes.bf16)
-    run_bmm_a8w8_mxfp8_32_gfx1250(x8, w_shuf, xs8, w_scale, y_bf16)
+    run_ref(x8, w_shuf, xs8, w_scale, y_bf16)
     y8_ref, yscale_ref = atom_quantize_fp8(y_bf16.view(m, b * n))
 
     y8 = torch.empty(m, b, n, dtype=dtypes.fp8)
     yscale = torch.empty(m * (b * n // 32), dtype=torch.uint8)
-    run_bmm_a8w8_mxfp8_32_gfx1250(x8, w_shuf, xs8, w_scale, y8, y_scale_out=yscale)
+    run_fused(x8, w_shuf, xs8, w_scale, y8, y_scale_out=yscale)
     scale_mismatch = int((yscale.view(m, b * n // 32) != yscale_ref).sum())
     fp8_mismatch = int(
         (
@@ -660,7 +678,7 @@ def main():
             gemm_rows.append(test_batched_gemm(b, m, n, k, dtype, layout))
         summarize("batched_gemm (a8w4 and a8w8, each vs its BF16 reference)", gemm_rows)
 
-    if arch == "gfx1250":
+    if arch in ("gfx1250", "gfx950"):
         _run_fused_quant(_fused_quant_shapes(args, include_ragged_m=not custom_shape))
 
 

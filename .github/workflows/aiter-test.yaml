@@ -63,7 +63,7 @@ jobs:
           fi
 
           pr_title_lc="$(printf '%s' "${PR_TITLE}" | tr '[:upper:]' '[:lower:]')"
-          if [[ "${PR_HEAD_REF}" == aiter-bot/revert-* ]] || [[ "${pr_title_lc}" == *"bot revert"* ]] || [[ "${pr_title_lc}" == *"[bot revert]"* ]]; then
+          if [[ "${PR_HEAD_REF}" == aiter-bot/revert-* ]] || [[ "${pr_title_lc}" == *"[bot revert]"* ]]; then
             echo "run_tests=false" >> "$GITHUB_OUTPUT"
             echo "run_multigpu_tests=false" >> "$GITHUB_OUTPUT"
             echo "reason=bot_revert_fast_workflow" >> "$GITHUB_OUTPUT"
