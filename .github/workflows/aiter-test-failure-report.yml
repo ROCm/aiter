@@ -42,7 +42,7 @@ jobs:
       - name: Checkout main
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Analyze latest Aiter Test failure
@@ -68,21 +68,22 @@ jobs:
     runs-on: [self-hosted, box308-pr-revert]
     timeout-minutes: 20
     env:
-      AITER_TEST_FAILURE_WORKDIR: aiter-test-failure-report
       GH_TOKEN: ${{ github.token }}
       AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
     steps:
       - name: Checkout main
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Download structured failure report
         uses: actions/download-artifact@v8.0.1
         with:
           name: aiter-test-failure-report-${{ github.run_id }}
-          path: ${{ env.AITER_TEST_FAILURE_WORKDIR }}
+          path: ${{ runner.temp }}/aiter-test-failure-report
 
       - name: Auto-create high-confidence revert PR
+        env:
+          AITER_TEST_FAILURE_WORKDIR: ${{ runner.temp }}/aiter-test-failure-report
         run: .claude/skills/aiter-test-failure-analysis/scripts/create_revert_pr.py --repo "${GITHUB_REPOSITORY}"
