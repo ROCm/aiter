@@ -35,6 +35,7 @@ from aiter import logger
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.utility.graph_alloc import capture_scoped_cache, persistent_alloc
 
+from .aot_cache import FlyDSLAotCache
 from .kernels.bmm_a8w8_mxscale_gfx950 import (
     SCALE_BLOCKS,
     W_SCALE_ROWS,
@@ -44,7 +45,7 @@ from .kernels.bmm_a8w8_mxscale_gfx950 import (
     xcd_swizzle_runs,
 )
 from .kernels.kernels_common import ceildiv
-from .kernels.tensor_shim import _compile_and_run, check_e8m0, ptr_arg
+from .kernels.tensor_shim import check_e8m0, current_raw_stream, ptr_arg
 
 BMM_MFMA_NAME_PREFIX = "flydsl_bmm_mxfp8_mfma"
 
@@ -287,25 +288,55 @@ def _constexprs(name: str, n: int, k: int, b: int, *scale_args) -> tuple:
     return bound.args[_RUNTIME_PARAMS:]
 
 
-# Compiled launchers by their Constexprs. FlyDSL's __call__ binds and hashes
-# every argument on each launch (~50 us); a CompiledFunction takes them as is.
-_COMPILED: dict[tuple, flyc.CompiledFunction] = {}
+_AOT_CACHE = FlyDSLAotCache("bmm_a8w8_mxscale_gfx950")
+
+
+def _bound_launcher(constexprs: tuple):
+    """launch_bmm_a8w8_mxscale with its Constexprs bound, so that every
+    parameter left is a runtime argument the AOT cache can export."""
+
+    @flyc.jit
+    def launch_bmm(
+        arg_c: fx.Pointer,
+        arg_a: fx.Pointer,
+        arg_b: fx.Pointer,
+        arg_scale_a: fx.Pointer,
+        arg_scale_b: fx.Pointer,
+        arg_partials: fx.Pointer,
+        arg_counters: fx.Pointer,
+        i32_m: fx.Int32,
+        stream: fx.Stream,
+    ):
+        launch_bmm_a8w8_mxscale(
+            arg_c,
+            arg_a,
+            arg_b,
+            arg_scale_a,
+            arg_scale_b,
+            arg_partials,
+            arg_counters,
+            i32_m,
+            stream,
+            *constexprs,
+        )
+
+    # The call inlines while tracing; keep the kernel's compile hints.
+    launch_bmm.compile_hints.update(launch_bmm_a8w8_mxscale.compile_hints)
+    return launch_bmm
 
 
 def _launch(tensors, m, stream, constexprs: tuple) -> None:
     """The one call into the kernel, shared by the runtime and AOT paths so
-    both build the same FlyDSL cache key. ``tensors`` are Out, XQ, WQ,
-    x_scale, w_scale, split-K partials and counters; only their addresses
-    reach the kernel. A kernel's first launch compiles (or loads) and runs it
-    through flyc.compile, which returns None under compile-only (AOT)."""
-    args = (*map(ptr_arg, tensors), m, stream, *constexprs)
-    compiled = _COMPILED.get(constexprs)
-    if compiled is not None:
-        compiled(*args)
-        return
-    compiled = _compile_and_run(launch_bmm_a8w8_mxscale, *args)
-    if compiled is not None:
-        _COMPILED[constexprs] = compiled
+    both build the same cache entry. ``tensors`` are Out, XQ, WQ, x_scale,
+    w_scale, split-K partials and counters; only their addresses reach the
+    kernel. Under compile-only (AOT) it builds the entry without launching."""
+    _AOT_CACHE.launch(
+        (constexprs, tensors[0].device),
+        lambda: _bound_launcher(constexprs),
+        *map(ptr_arg, tensors),
+        m,
+        stream,
+    )
 
 
 def compile_bmm_a8w8_mxfp8_gfx950(
@@ -396,7 +427,7 @@ def run_bmm_a8w8_mxfp8_gfx950(
         kernel_name = None
     name = kernel_name or pick_bmm_kernel_name(b, m, n, k, *scale_args)
     cfg = _require_config(name)
-    stream = torch.cuda.current_stream(XQ.device)
+    stream = current_raw_stream(XQ.device)
     partials = counters = Out
     if cfg["splits"] > 1:
         tiles = ceildiv(m, cfg["tile_m"]) * (n // cfg["tile_n"]) * b
@@ -410,9 +441,9 @@ def run_bmm_a8w8_mxfp8_gfx950(
             dtype=torch.float32,
             device=XQ.device,
         )
-        counters = _split_counters(XQ.device.index, stream.cuda_stream)
+        counters = _split_counters(XQ.device.index, stream)
     tensors = (Out, XQ, WQ, x_scale, w_scale, partials, counters)
-    _launch(tensors, m, stream, _constexprs(name, n, k, b, *scale_args))
+    _launch(tensors, m, fx.Stream(stream), _constexprs(name, n, k, b, *scale_args))
     return Out
 
 

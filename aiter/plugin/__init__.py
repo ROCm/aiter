@@ -598,6 +598,25 @@ _CUSTOM_OP_NAMESPACE = "aiter_routed"
 _custom_op_library: Any = None
 
 
+def _fake_or_python_body(
+    routed: Callable[..., Any], fake: Callable[..., Any]
+) -> Callable[..., Any]:
+    """The fake of a registered op, or its Python body while
+    ``run_python_ops_for_real`` is on, as for ops ``torch_compile_guard``
+    registers. The AOT dry run sets it so that a replay entering at a routed
+    op still picks and compiles kernels on FakeTensors; FakeTensorMode stays
+    active around a fake, so the body's own ops still dispatch to fakes."""
+    from aiter.jit.utils.torch_guard import python_ops_run_for_real
+
+    @wraps(fake)
+    def fake_or_python_body(*args: Any, **kwargs: Any) -> Any:
+        if python_ops_run_for_real():
+            return routed(*args, **kwargs)
+        return fake(*args, **kwargs)
+
+    return fake_or_python_body
+
+
 def _as_custom_op(
     op: str,
     native: Callable[..., Any],
@@ -671,7 +690,9 @@ def _as_custom_op(
         _custom_op_library.define(f"{name}{schema}")
         for backend in ("CPU", "CUDA"):
             _custom_op_library.impl(name, routed, backend)
-        register_fake(f"{_CUSTOM_OP_NAMESPACE}::{name}", fake)
+        register_fake(
+            f"{_CUSTOM_OP_NAMESPACE}::{name}", _fake_or_python_body(routed, fake)
+        )
     except Exception as error:  # noqa: BLE001 -- degrade on anything
         logger.debug("plugin: %s stays traced, registration failed: %s", op, error)
         return None

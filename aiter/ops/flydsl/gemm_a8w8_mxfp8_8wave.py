@@ -13,6 +13,8 @@ from torch import Tensor
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
+from .aot_cache import FlyDSLAotCache
+
 # Fixed by the kernel: MFMA_Scale(16, 16, 128) over a 128-deep K tile, one
 # 256x256 block tile, and scales staged a 256-K pair at a time.
 BLOCK_K = 128
@@ -28,22 +30,20 @@ _I32_MAX = 2**31
 
 # Lazily bound flydsl symbols (kept out of the import path when flydsl is absent).
 _compile_mxfp8_gemm_8w = None
-_run_compiled = None
-_fx = None
+_current_stream_arg = None
+
+_AOT_CACHE = FlyDSLAotCache("gemm_a8w8_mxfp8_8wave")
 
 
 def _lazy_import() -> None:
-    global _compile_mxfp8_gemm_8w, _run_compiled, _fx
+    global _compile_mxfp8_gemm_8w, _current_stream_arg
     if _compile_mxfp8_gemm_8w is not None:
         return
-    import flydsl.expr as fx_mod
-
     from .kernels.mxfp8_gemm_8wave import compile_mxfp8_gemm_8w
-    from .kernels.tensor_shim import _run_compiled as run_compiled
+    from .kernels.tensor_shim import current_stream_arg
 
     _compile_mxfp8_gemm_8w = compile_mxfp8_gemm_8w
-    _run_compiled = run_compiled
-    _fx = fx_mod
+    _current_stream_arg = current_stream_arg
 
 
 def lds_bytes(scale_preshuffled: bool = False) -> int:
@@ -234,19 +234,24 @@ def flydsl_mxfp8_8wave_gemm(
         N=N,
     )
 
-    exe = compile_mxfp8_8wave_gemm(
-        K=K,
-        waves_per_eu=int(waves_per_eu),
-        xcd_swizzle=int(xcd_swizzle),
-        scale_preshuffled=scale_preshuffled,
-        w_scale_block=w_scale_block,
-    )
+    compile_kwargs = {
+        "K": K,
+        "waves_per_eu": int(waves_per_eu),
+        "xcd_swizzle": int(xcd_swizzle),
+        "scale_preshuffled": scale_preshuffled,
+        "w_scale_block": w_scale_block,
+    }
 
     out_contig = Out.contiguous()
+    # Every tensor is a flat contiguous uint8 or bf16 view, so the compile
+    # arguments determine the launcher's argument signature. The device keeps
+    # the JIT path's handles apart; entries on disk are shared.
+    key = (tuple(sorted(compile_kwargs.items())), XQ.device)
     # The 8-wave launcher takes (A, B_T, C, A_scale, B_scale, c_m, c_n, stream)
     # -- A first and C *third*, as gemm_a8w8_bpreshuffle_8wave.
-    _run_compiled(
-        exe,
+    _AOT_CACHE.launch(
+        key,
+        lambda: compile_mxfp8_8wave_gemm(**compile_kwargs),
         _as_u8(XQ.contiguous()).view(-1),
         _as_u8(WQ.contiguous()).view(-1),
         out_contig.view(-1),
@@ -254,7 +259,7 @@ def flydsl_mxfp8_8wave_gemm(
         _as_u8(w_scale).view(-1),
         M,
         N,
-        _fx.Stream(torch.cuda.current_stream(device=XQ.device)),
+        _current_stream_arg(XQ.device),
     )
     if out_contig is not Out:
         Out.copy_(out_contig)

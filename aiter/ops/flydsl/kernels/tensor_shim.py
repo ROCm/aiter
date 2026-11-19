@@ -283,10 +283,26 @@ def check_e8m0(
 _get_current_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
 
 
-def current_stream_arg():
+def current_raw_stream(device=None) -> int:
+    """Handle of the current stream on ``device`` (default: the current device).
+
+    About 0.1 us, against about 5 us for ``torch.cuda.current_stream()``,
+    which builds a Python stream object on every call.
+    """
+    if device is None:
+        index = torch.cuda.current_device()
+    else:
+        index = torch.device(device).index
+        if index is None:
+            index = torch.cuda.current_device()
     if _get_current_raw_stream is None:
-        return torch.cuda.current_stream()
-    return fx.Stream(_get_current_raw_stream(torch.cuda.current_device()))
+        return torch.cuda.current_stream(index).cuda_stream
+    return _get_current_raw_stream(index)
+
+
+def current_stream_arg(device=None):
+    """The current stream on ``device`` as a FlyDSL launch argument."""
+    return fx.Stream(current_raw_stream(device))
 
 
 def ptr_arg(t: torch.Tensor, dtype=None):
