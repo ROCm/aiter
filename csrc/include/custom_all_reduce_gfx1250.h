@@ -91,6 +91,18 @@ void fused_allreduce_rmsnorm_lamport(fptr_t _fa,
                                      const aiter_tensor_t& w,
                                      double eps,
                                      bool gemma_norm);
+// The same with the per-token FP8 quant of fused_allreduce_rmsnorm_quant: out
+// FP8, one FP32 scale a row, and the bf16/fp16 output at bf16_out_ptr unless 0.
+void fused_allreduce_rmsnorm_quant_lamport(fptr_t _fa,
+                                           const aiter_tensor_t& inp,
+                                           const aiter_tensor_t& res_inp,
+                                           const aiter_tensor_t& res_out,
+                                           const aiter_tensor_t& out,
+                                           const aiter_tensor_t& scale_out,
+                                           const aiter_tensor_t& w,
+                                           double eps,
+                                           bool gemma_norm,
+                                           int64_t bf16_out_ptr);
 // Lamport one-shot all-reduce of inp + other on the init_lamport_ar_rms inbox.
 void allreduce_add_lamport(fptr_t _fa,
                            const aiter_tensor_t& inp,

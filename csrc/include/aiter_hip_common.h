@@ -218,9 +218,20 @@ extern "C" void __hipRegisterFunction(void* module,
 // aiter/jit/utils/chip_info.py: every visible device is scanned and the lowest
 // stepping wins, so the answer does not depend on which device is current when
 // a kernel happens to be loaded (asm kernels are cached process-wide by name).
+static inline bool gfx1250_a0_asm_allowed()
+{
+    static const bool allowed = [] {
+        const char* e = std::getenv("AITER_GFX1250_A0_ALLOW_ASM");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    return allowed;
+}
+
 static inline bool is_gfx1250_asm_supported()
 {
     static const bool supported = [] {
+        if(gfx1250_a0_asm_allowed())
+            return true;
         int count = 0;
         if(hipGetDeviceCount(&count) != hipSuccess)
             return true; // cannot tell -> do not over-block
@@ -589,14 +600,12 @@ static const std::string get_gpu_arch()
 
     std::string arch_full = dev_prop.gcnArchName;
     size_t colon_pos      = arch_full.find(':');
-    if(colon_pos != std::string::npos)
-    {
-        return arch_full.substr(0, colon_pos);
-    }
-    else
-    {
-        return arch_full;
-    }
+    std::string arch =
+        colon_pos != std::string::npos ? arch_full.substr(0, colon_pos) : arch_full;
+    // With the A0 opt-in, gfx1250-strict loads the gfx1250 asm code objects.
+    if(arch == "gfx1250-strict" && gfx1250_a0_asm_allowed())
+        return "gfx1250";
+    return arch;
 }
 
 static inline bool is_fp8_ocp_arch()
