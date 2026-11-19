@@ -46,7 +46,11 @@ def main(argv=None):
     parser.add_argument("--arch", action="append", help="simulated arch (default: all)")
     args = parser.parse_args(argv)
 
-    sys.path.insert(0, str(_HERE.parent))
+    # `tests` so `moe_dispatch` imports, and the repository root so `aiter` is
+    # this checkout rather than an installed copy.
+    sys.path[:0] = [
+        p for p in (str(_HERE.parent), str(_HERE.parents[1])) if p not in sys.path
+    ]
     from moe_dispatch import snapshot
 
     snapshot._setup()

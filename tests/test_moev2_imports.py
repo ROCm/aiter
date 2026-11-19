@@ -106,3 +106,28 @@ def test_moev2_imports_on_cpu_without_legacy():
     assert not result["moev2_by_aiter"], "`import aiter` must not import aiter.moev2"
     loaded = [m for m in result["loaded"] if _is_legacy(m)]
     assert not loaded, f"importing aiter.moev2 loaded legacy modules: {loaded}"
+
+
+_LEGACY_ENTRY_CHECK = "import aiter.fused_moe\nprint('ok')\n"
+
+
+def test_legacy_fused_moe_imports_with_moev2():
+    """`import aiter.fused_moe` must keep working now that it imports aiter.moev2.
+
+    fused_moe.py pulls the moved helpers back out of aiter.moev2 at module level, so one
+    unimportable moev2 module breaks `import aiter.fused_moe` for every downstream MoE
+    consumer (vLLM, SGLang, ATOM). `import aiter` does not import fused_moe, and the
+    moev2 runtime check above does not import the legacy module, so nothing else here
+    covers that import graph.
+    """
+    env = dict(os.environ)
+    env.setdefault("AITER_LOG_LEVEL", "ERROR")
+    proc = subprocess.run(
+        [sys.executable, "-c", _LEGACY_ENTRY_CHECK],
+        cwd=REPO,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr[-3000:]
