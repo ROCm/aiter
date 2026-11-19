@@ -1,4 +1,17 @@
 {
+    "M_BOUNDS": [
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        5120,
+        8192
+    ],
     "M_LEQ_16": {
         "BLOCK_M": 16,
         "BLOCK_N": 16,
@@ -89,6 +102,18 @@
         "BLOCK_N": 256,
         "NUM_BUFFERS": 4,
         "kernel_type": "compute_bound",
+        "num_warps": 4,
+        "waves_per_eu": 0
+    },
+    "M_LEQ_5120": {
+        "BLOCK_K": 64,
+        "BLOCK_M": 256,
+        "BLOCK_N": 256,
+        "NUM_BUFFERS": 4,
+        "REGISTER_STORE": 0,
+        "SLICED_K": 0,
+        "kernel_type": "compute_bound",
+        "num_ctas": 1,
         "num_warps": 4,
         "waves_per_eu": 0
     },
