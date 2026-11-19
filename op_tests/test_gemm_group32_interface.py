@@ -406,15 +406,7 @@ def test_gfx1250_group32_bpreshuffle_route(monkeypatch, w_rows):
 
 @pytest.mark.parametrize(
     "tile_n,waves",
-    [
-        (32, 1),
-        (32, 2),
-        (64, 1),
-        (64, 2),
-        (128, 1),
-        (128, 2),
-        (128, 4),
-    ],
+    [(16, 1), (32, 1), (32, 2), (64, 1), (64, 2), (128, 1), (128, 2)],
 )
 @pytest.mark.parametrize("split_k", [1, 2, 4, 8])
 def test_gfx1250_smallm_1x32_name_selects_dedicated_kernel(
@@ -422,8 +414,7 @@ def test_gfx1250_smallm_1x32_name_selects_dedicated_kernel(
 ):
     from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
 
-    width = "" if tile_n == 32 else f"tn{tile_n}_"
-    name = f"{direct.MX32_SMALLM_1X32_NAME_PREFIX}_{width}w{waves}_sk{split_k}"
+    name = direct.mxfp8_32_smallm_1x32_kernel_name(tile_n, waves, split_k)
     parsed = direct.parse_mxfp8_32_wmma_kernel_name(name)
     assert parsed == {
         "smallm_1x32": True,
@@ -441,15 +432,24 @@ def test_gfx1250_smallm_1x32_name_selects_dedicated_kernel(
         return output
 
     monkeypatch.setattr(direct, "_run_mxfp8_32_smallm_1x32_gfx1250", run)
-    actual = direct.run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
-        *operands, out, name
-    )
+    actual = direct.run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(*operands, out, name)
     assert actual is out
     assert calls[0][-1] == {
         "tile_n": tile_n,
         "num_waves": waves,
         "split_k": split_k,
     }
+
+
+def test_gfx1250_smallm_1x32_tile_n32_name_stays_stable():
+    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
+
+    assert (
+        direct.mxfp8_32_smallm_1x32_kernel_name(32, 2, 1)
+        == "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_w2_sk1"
+    )
+    with pytest.raises(ValueError, match="cannot run"):
+        direct.mxfp8_32_smallm_1x32_kernel_name(16, 2, 1)
 
 
 def test_gfx1250_compute_catalog_exposes_tunable_early_merge():

@@ -126,12 +126,11 @@ def tuned_shapes():
 @pytest.mark.parametrize(
     "kernel_name",
     [
+        "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_n16_w1_sk1",
         "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_w2_sk1",
         "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_w1_sk4",
-        "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_tn64_w2_sk1",
-        "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_tn64_w1_sk4",
-        "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_tn128_w4_sk1",
-        "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_tn128_w2_sk4",
+        "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_n64_w2_sk1",
+        "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_n128_w2_sk1",
     ],
 )
 def test_gfx1250_smallm_1x32_changed_input_graph_replay(kernel_name):

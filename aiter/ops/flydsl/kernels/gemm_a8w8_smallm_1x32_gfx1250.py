@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Native gfx1250 16x{32,64,128} MXFP8 GEMM for small M.
+"""Native gfx1250 16x{16,32,64,128} MXFP8 GEMM for small M.
 
 This is intentionally separate from the four-wave compute kernel.  One
-workgroup owns one, two, or four complete n32k4 scale groups, double-buffers
-only A and B through TDM, and reads E8M0 scales directly into registers.
+workgroup owns one narrow N tile, double-buffers only A and B through TDM, and
+reads both E8M0 scale words directly into registers.
 """
 
 import flydsl.compiler as flyc
@@ -27,6 +27,7 @@ TILE_K = 128
 WAVE = 32
 LDS_PAD_A = 16
 NUM_BUFFERS = 2
+SUPPORTED_TILE_N = (16, 32, 64, 128)
 
 
 @flyc.jit
@@ -43,11 +44,11 @@ def launch_gemm_a8w8_smallm_1x32(
     i32_k: fx.Int32,
     i32_lda: fx.Int32,
     i32_ldc: fx.Int32,
+    tile_n: Constexpr[int],
     num_waves: Constexpr[int],
     split_k: Constexpr[int],
-    tile_n: Constexpr[int] = 32,
 ):
-    """Launch the 16x{32,64,128}x128 MXFP8 kernel.
+    """Launch a 16x{16,32,64,128}x128 MXFP8 kernel.
 
     ``split_k`` workgroups for one output tile are one hardware cluster.  Every
     rank publishes an FP32 tile, then rank zero sums ranks in increasing order
@@ -55,14 +56,14 @@ def launch_gemm_a8w8_smallm_1x32(
     independent of workgroup arrival order.
     """
 
-    assert tile_n in (32, 64, 128), (
-        f"tile_n must be 32, 64, or 128, got {tile_n}"
-    )
-    assert num_waves in (1, 2, 4), f"num_waves must be 1/2/4, got {num_waves}"
-    assert tile_n // 16 % num_waves == 0, (
-        f"tile_n/16 must be divisible by num_waves, got {tile_n}/{num_waves}"
-    )
+    assert num_waves in (1, 2), f"num_waves must be 1 or 2, got {num_waves}"
     assert split_k in (1, 2, 4, 8), f"split_k must be 1/2/4/8, got {split_k}"
+    assert tile_n in SUPPORTED_TILE_N, (
+        f"tile_n must be one of {SUPPORTED_TILE_N}, got {tile_n}"
+    )
+    assert tile_n >= 16 * num_waves, (
+        f"tile_n={tile_n} cannot give {num_waves} waves a 16-column WMMA tile"
+    )
     block = num_waves * WAVE
     n_rep = (tile_n // 16) // num_waves
 
@@ -239,17 +240,22 @@ def launch_gemm_a8w8_smallm_1x32(
             return fx.Int32(fx.ptr_load(scale_a_i32 + index))
 
         def load_scale_b(global_k_tile, local_n):
-            # n32k4 storage has one independent pack per 32 output columns.
-            # A 128-column tile spans four packs, whose K strides are not
-            # adjacent in memory; split the relative column into pack/lane.
+            # n32k4 storage: one 128-byte row per 32 output columns and K/128.
             column = wave * (n_rep * 16) + local_n * 16 + lane16
-            pack = column // 32
-            pack_lane = column % 32
-            index = (
-                fx.Int64(block_n // 32 + pack) * (fx.Int64(i32_k) // 4)
-                + fx.Int64(global_k_tile) * 32
-                + fx.Int64(pack_lane)
-            )
+            if const_expr(tile_n == 32):
+                # Keep the original TILE_N=32 address expression unchanged.
+                index = (
+                    fx.Int64(block_n // 32) * (fx.Int64(i32_k) // 4)
+                    + fx.Int64(global_k_tile) * 32
+                    + fx.Int64(column)
+                )
+            else:
+                output_column = block_n + column
+                index = (
+                    fx.Int64(output_column // 32) * (fx.Int64(i32_k) // 4)
+                    + fx.Int64(global_k_tile) * 32
+                    + fx.Int64(output_column % 32)
+                )
             return fx.Int32(fx.ptr_load(scale_b_i32 + index))
 
         mma = fx.make_mma_atom(
