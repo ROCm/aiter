@@ -11,6 +11,7 @@ namespace aiter {
 //   input  o       [S, H, head_dim] bf16/fp16, before inverse RoPE
 //   output x_fp8   [S, G, D] fp8, where D = H*head_dim/G
 //   output x_scale e8m0 scale bytes
+//   cos/sin        [max_pos, rd/2], o's dtype, or fp32 with the row-major layout
 // Applies GPT-J inverse RoPE to every head's rope tail, then group-quantizes the
 // flattened per-group rows for the upcoming wo_a grouped FP8 BMM.
 //

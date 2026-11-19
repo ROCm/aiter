@@ -47,7 +47,7 @@ from aiter.ops.flydsl.linear_attention_prefill_kernels import (
 from aiter.ops.prefill_batch_metadata import (
     build_gated_delta_rule_prefill_metadata,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.prefill.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h_opt_vk,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -62,8 +62,6 @@ try:
 except ImportError:
     chunk_gated_delta_rule_fwd_h_hip_fn = None
     _HAS_HIP_K5 = False
-
-torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
 
@@ -422,7 +420,7 @@ def _build_context_lens(full_prompt_len, max_tokens=32768):
 
 def _build_cu_seqlens(context_lens, device="cuda"):
     return torch.tensor(
-        [0] + list(torch.cumsum(torch.tensor(context_lens), 0).tolist()),
+        [0] + list(torch.cumsum(torch.tensor(context_lens, device=device), 0).tolist()),
         dtype=torch.int32,
         device=device,
     )
@@ -592,7 +590,7 @@ def ref_chunk_gated_delta_rule_fwd_h(
                     else:
                         g_seq = g[b_idx, :, i_h]
 
-                    mask = torch.zeros(BT_dim, device=k.device)
+                    mask = torch.zeros(BT_dim, dtype=torch.float32, device=k.device)
                     mask[:actual_bt] = 1.0
                     if g_seq is None:
                         # No decay: valid rows gate to 1, matching the kernel's

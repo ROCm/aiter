@@ -5,7 +5,7 @@
 #include "aiter_stream.h"
 #include "mhc.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     MHC_PYBIND;
 }

@@ -38,8 +38,13 @@ import torch
 import aiter
 import aiter.mla  # main no longer auto-imports submodules; need explicit
 from aiter import dtypes
+from aiter.benchmark_data_init import DATA_DISTS, fill, make_generator
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import (
+    benchmark,
+    checkAllclose,
+    run_perftest,
+)
 
 torch.set_default_device("cuda")
 
@@ -49,30 +54,28 @@ SUPPORTED_GFX = ["gfx1250"]
 
 # ---------------------------------------------------------------------------
 # Variant under test (matches the cfg_mla_v4_asm entry in
-# hsa/gfx1250/mla_v4/mla_v4_asm.csv served by csrc/py_itfs_cu/asm_mla_v4.cu).
+# hsa/gfx1250/mla_v4/mla_v4_asm.csv served by aiter/ops/asm/mla_decode_v4.py).
 # ---------------------------------------------------------------------------
 GQA_RATIO = 16  # num_heads / num_kv_heads
 PAGE_SIZE = 1
 NUM_KV_HEADS = 1
 DIM_NOPE = 448  # FP8 NOPE bytes per token
 DIM_ROPE = 64  # BF16 ROPE elements per token (= 128 bytes; lives in qrope/kvrope)
-DIM_QK_PACKED = 576  # = args.dim(512) + args.k_rotary(64); matches poc_kl stride_Page
+DIM_QK_PACKED = 512  # FP8 NOPE 448 + e8m0 scales + pad; the kernel row stride
 V_HEAD_DIM = 512  # logical V head dim = args.dim = kv_lora_rank
 
 # Perf iteration counts (kept out of the @benchmark signature so they don't
 # become table columns). main() overrides these from --iters / --warmup.
 _PERF = {"num_iters": 2, "num_warmup": 1}
-_SEED = 0
 
 
 # ---------------------------------------------------------------------------
 # gfx1250 v4 nm kernel variants. In this (num_kv_heads=1) test:
 #   nhead       == gqa_ratio        (num query heads)
 #   decode_qlen == q_seq_logical    (logical Q rows per sequence)
-# The single shipped sparse .co (mla_a8w8_qh64_1tg_16mx4_64nx1_sparse) has a
-# 64 q-row tile, so it serves exactly the three "16mx4-64nx1" entries that
-# satisfy nhead*decode_qlen == 64: (16,4), (64,1), (128,1). The sweep
-# auto-skips any combo the dispatcher can't resolve.
+# The qh64 sparse .co has a 64 q-row tile and serves the "16mx4-64nx1"
+# entries (16,4), (64,1), and (128,1). The dedicated qh32 sparse .co has a
+# 32 q-row tile and serves (32,1).
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Mlagfx1250KernelVariant:
@@ -83,6 +86,7 @@ class Mlagfx1250KernelVariant:
 
 _gfx1250_KERNEL_VARIANTS = [
     Mlagfx1250KernelVariant(name="qh16-q4-16mx4-64nx1-np", nhead=16, decode_qlen=4),
+    Mlagfx1250KernelVariant(name="qh32-q1-32mx1-16nx4-sparse", nhead=32, decode_qlen=1),
     Mlagfx1250KernelVariant(name="qh64-q1-16mx4-64nx1-np", nhead=64, decode_qlen=1),
     Mlagfx1250KernelVariant(name="qh128-q1-16mx4-64nx1-np", nhead=128, decode_qlen=1),
 ]
@@ -91,11 +95,8 @@ _gfx1250_VARIANT_BY_KEY = {
 }
 _gfx1250_VARIANT_BY_KEY_NAME = {v.name: v for v in _gfx1250_KERNEL_VARIANTS}
 
-# The shipped qh64 .co has a 64 q-row tile; the dispatcher
-# (csrc/py_itfs_cu/asm_mla_v4.cu) picks sub_Q=64 and launches
-# gdx=ceil(gqa*max_seqlen_q/64) WGs, so a single .co covers three
-# (gqa, q_seq_logical) entry points. Anything else is not shipped.
-_SHIPPED_TILE_VARIANTS = {(16, 4), (64, 1), (128, 1)}
+# Entries shipped in hsa/gfx1250/mla_v4/mla_v4_asm.csv.
+_SHIPPED_TILE_VARIANTS = {(16, 4), (32, 1), (64, 1), (128, 1)}
 
 # Default sweep grids (mirrors test_mla_gfx1250_triton.py).
 _gfx1250_CTX_LENS = [13, 61, 128 + 3, 256 + 67, 1024, 4096, 16384]
@@ -297,6 +298,7 @@ def _build_bf16_inputs(
     kv_seq_lens=64,
     q_seq_logical=4,
     seed=0,
+    data_init="norm",
     device="cuda",
     gqa_ratio=GQA_RATIO,
     attn_sink=True,
@@ -311,19 +313,24 @@ def _build_bf16_inputs(
                mismatch shows up as an err blowup, not a silent pass.
       False -> per-head -inf ("no sink" no-op: exp(-inf - max) = 0).
     """
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    gen = make_generator(seed, device=device)
     total_q = batch * q_seq_logical
     num_page = batch * (kv_seq_lens // PAGE_SIZE)
 
-    q_bf16 = torch.randn(
-        (total_q, gqa_ratio, _QUANT_D), dtype=dtypes.bf16, device=device
-    )
-    kv_bf16 = torch.randn(
-        (num_page, PAGE_SIZE, NUM_KV_HEADS, _QUANT_D),
+    q_bf16 = fill(
+        (total_q * gqa_ratio, _QUANT_D),
+        data_init,
+        gen,
         dtype=dtypes.bf16,
         device=device,
-    )
+    ).view(total_q, gqa_ratio, _QUANT_D)
+    kv_bf16 = fill(
+        (num_page * PAGE_SIZE * NUM_KV_HEADS, _QUANT_D),
+        data_init,
+        gen,
+        dtype=dtypes.bf16,
+        device=device,
+    ).view(num_page, PAGE_SIZE, NUM_KV_HEADS, _QUANT_D)
 
     qo_indptr = (
         torch.arange(0, batch + 1, dtype=torch.int32, device=device) * q_seq_logical
@@ -345,7 +352,16 @@ def _build_bf16_inputs(
     if attn_sink:
         # randn*10 so the sink contributes materially (~15%) to the softmax;
         # well above tolerance, so a dropped/mis-scaled sink is a hard mismatch.
-        sink = torch.randn(num_heads, dtype=torch.float32, device=device) * 10.0
+        sink = (
+            fill(
+                (num_heads,),
+                data_init,
+                gen,
+                dtype=torch.float32,
+                device=device,
+            )
+            * 10.0
+        )
     else:
         sink = torch.full(
             (num_heads,), float("-inf"), dtype=torch.float32, device=device
@@ -377,6 +393,8 @@ def test_mla_v4_nm(
     num_kv_splits=1,
     gqa_ratio=GQA_RATIO,
     attn_sink=True,
+    data_init="norm",
+    seed=0,
 ):
     """Time each v4 nm kernel candidate, check it against the torch fp8-dequant
     reference, and return per-candidate `us` / `TFLOPS` / `TB/s` / `err`.
@@ -398,9 +416,11 @@ def test_mla_v4_nm(
         f"variants {_SHIPPED_TILE_VARIANTS}: the qh64 .co picks sub_Q=64 and "
         f"launches gdx=ceil(gqa*max_seqlen_q/64); only these three pairs resolve."
     )
-    # Multi-split guard: the .co inner KV loop processes pass_size=16 tokens per
-    # iteration; the SMALLEST split must be >= 16 or its tail is dropped.
-    if num_kv_splits > 1:
+    # Multi-split guard: the qh16/qh64 .co inner KV loop processes pass_size=16
+    # tokens per iteration; the SMALLEST split must be >= 16 or its tail is
+    # dropped. The qh32 .co (and its fused variant) handles short and empty
+    # splits, so it is exempt.
+    if num_kv_splits > 1 and (gqa_ratio, q_seq_logical) != (32, 1):
         min_split = kv_seq_lens // num_kv_splits  # page_size=1
         assert min_split >= 16, (
             f"smallest KV split = floor({kv_seq_lens}/{num_kv_splits}) = "
@@ -413,7 +433,8 @@ def test_mla_v4_nm(
         batch=batch,
         kv_seq_lens=kv_seq_lens,
         q_seq_logical=q_seq_logical,
-        seed=_SEED,
+        seed=seed,
+        data_init=data_init,
         gqa_ratio=gqa_ratio,
         attn_sink=attn_sink,
     )
@@ -491,7 +512,12 @@ def test_mla_v4_nm(
         "kv_indptr": inputs["kv_indptr"],
         "kv_page_indices": inputs["kv_page_indices"],
         "kv_last_page_lens": inputs["kv_last_page_lens"],
-        "split_indptr": split_indptr,
+        # Let the qh32 wrapper synthesize its uniform map so the default
+        # dispatch can select the fused path. Other variants retain the
+        # explicit map used by their existing coverage.
+        "split_indptr": (
+            None if (gqa_ratio, q_seq_logical) == (32, 1) else split_indptr
+        ),
         "max_seqlen_q": inputs["max_seqlen_q"],
         "sink": inputs["sink"],
         "sm_scale": sm_scale,
@@ -733,13 +759,18 @@ def main():
         default=[True],
         help="attn sink value(s) to sweep. e.g. --attn-sink True False",
     )
+    parser.add_argument(
+        "--data-init",
+        nargs="+",
+        choices=list(DATA_DISTS),
+        default=["norm"],
+        help="DATA initialization distribution(s) for Q, KV and attention sink",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--iters", type=int, default=50, help="Perf timed iterations")
     parser.add_argument("--warmup", type=int, default=2, help="Perf warmup iterations")
     args = parser.parse_args()
 
-    global _SEED
-    _SEED = args.seed
     _PERF["num_iters"] = args.iters
     _PERF["num_warmup"] = args.warmup
 
@@ -752,8 +783,20 @@ def main():
     ]
 
     df = []
-    for (nhead, decode_qlen), batch, kv_seq_lens, split_kv, sink in itertools.product(
-        nhead_combos, args.batch, args.kv_seq_lens, args.split_kv, args.attn_sink
+    for (
+        (nhead, decode_qlen),
+        batch,
+        kv_seq_lens,
+        split_kv,
+        sink,
+        data_init,
+    ) in itertools.product(
+        nhead_combos,
+        args.batch,
+        args.kv_seq_lens,
+        args.split_kv,
+        args.attn_sink,
+        args.data_init,
     ):
         try:
             df.append(
@@ -764,6 +807,8 @@ def main():
                     num_kv_splits=split_kv,
                     gqa_ratio=nhead,
                     attn_sink=sink,
+                    data_init=data_init,
+                    seed=args.seed,
                 )
             )
         except (RuntimeError, AssertionError) as exc:

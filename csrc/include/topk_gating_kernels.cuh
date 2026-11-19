@@ -21,6 +21,7 @@
 #include "aiter_stream.h"
 #include "hip_reduce.h"
 #include "aiter_opus_plus.h"
+#include "topk_pad_rows.h"
 #include <hip/hip_runtime.h>
 #include <cfloat>
 #include <cstddef>
@@ -36,22 +37,88 @@ struct topk_gating_params
 {
     const void* gating;      // [num_tokens, num_experts], DTYPE_I
     const void* bias;        // [num_experts], DTYPE_B; nullptr when unbiased
-    float*      weights;     // [num_tokens, topk]
-    int*        ids;         // [num_tokens, topk]
+    float*      weights;     // [num_tokens, topk + num_shared_experts]
+    int*        ids;         // [num_tokens, topk]; row stride matches weights
     size_t      stride_tk;
-    int         num_experts;
+    int         num_experts; // routed experts only; shared columns follow them
+    int         gating_stride;
+    int         num_shared_experts;
     int         topk;
     int         num_tokens;
+    const int*  num_valid_rows; // [1] real rows, on device; nullptr: all rows real
     float       routed_scaling_factor;
     bool        need_renorm;
     hipStream_t stream;
 };
+
+// Sigmoid the trailing shared-expert columns and store them after the routed
+// top-k. Those experts are always selected; they do not compete for a slot.
+// One thread per token calls this. num_shared == 0 is a no-op.
+template <typename DTYPE_I>
+__device__ __forceinline__ void store_shared_expert_sigmoid(
+    const DTYPE_I* gating_row,
+    float* weights_row,
+    int num_routed,
+    int topk,
+    int num_shared)
+{
+    for(int i = 0; i < num_shared; ++i)
+    {
+        const float x = static_cast<float>(gating_row[num_routed + i]);
+        weights_row[topk + i] = 1.0f / (1.0f + expf(-x));
+    }
+}
+
+// Writes a pad row in full -- routed columns weight 0 and id -1, shared
+// columns as for any row -- and returns true, so a block holding one row can
+// return before selecting from a row nobody reads. Call it once the row's
+// loads are issued: checked first, the num_valid_rows read would serialize
+// ahead of them on every real row.
+template <typename DTYPE_I>
+__device__ __forceinline__ bool write_if_pad_row(const int* num_valid_rows,
+                                                 int row,
+                                                 const DTYPE_I* gating_row,
+                                                 float* weights_row,
+                                                 int* ids_row,
+                                                 int num_routed,
+                                                 int topk,
+                                                 int num_shared)
+{
+    if(!is_pad_row(num_valid_rows, row))
+        return false;
+    write_pad_row(weights_row, ids_row, topk, threadIdx.x, blockDim.x);
+    if(num_shared > 0 && threadIdx.x == 0)
+        store_shared_expert_sigmoid(gating_row, weights_row, num_routed, topk, num_shared);
+    return true;
+}
 
 // E=128 opt_n (TPW=4) wins on gfx942 but regresses on gfx950; gate to gfx942.
 // Cached: get_gpu_arch() re-queries the driver on every call.
 inline bool topk_gating_prefer_optn_e128()
 {
     static const bool v = (get_gpu_arch() == "gfx942");
+    return v;
+}
+
+// The single-wave kernel and its dispatch are measured on gfx1250 only; other
+// wave32 targets (gfx1201, ...) keep the multiwave / reg kernels. Cached per
+// device: the kernel needs 32-lane waves, so a process driving gfx1250 and a
+// wave64 GPU must not reuse one device's answer for the other.
+inline bool topk_gating_vwave_arch()
+{
+    static SynchronizedCache<int, bool> cache;
+    int device = -1;
+    HIP_CALL(hipGetDevice(&device));
+    return cache.get_or_create(device, []() { return get_gpu_arch() == "gfx1250"; });
+}
+
+// E=512 prefill_n is measured on gfx942 and gfx950. Other archs (gfx1201,
+// gfx1250, ...) stay on the smem fallback until benchmarked.
+// Cached: get_gpu_arch() re-queries the driver on every call.
+inline bool topk_gating_prefer_prefill_n_e512()
+{
+    static const bool v =
+        (get_gpu_arch() == "gfx942" || get_gpu_arch() == "gfx950");
     return v;
 }
 
@@ -108,7 +175,10 @@ __device__ __forceinline__ void warpReduceMax_softplus(float& val_o, int& idx)
     val_o           = max_val;
 }
 
-template <int SCORE_FUNC>
+// SELECT: evaluate the sqrtsoftplus tail for every x and select, same result.
+// Behind the ternary the compiler masks it off per score, which keeps several
+// scores per lane from overlapping; with one score per lane it only costs.
+template <int SCORE_FUNC, bool SELECT = false>
 __device__ __forceinline__ float compute_score(float x)
 {
     if constexpr(SCORE_FUNC == SCORE_SIGMOID)
@@ -137,7 +207,17 @@ __device__ __forceinline__ float compute_score(float x)
         // Highest-precision path: pure libm (expf + log1pf), <=1 ULP.
         // Faster alternatives (commented out, ~0.5-1 ULP extra error):
         //   float sp = x > 20.0f ? x : log1pf(exp2f(x * 1.4426950408889634f));   // exp2f HW
-        float sp = x > 20.0f ? x : log2f(1.0f + exp2f(x * 1.4426950408889634f)) * 0.6931471805599453f;  // both HW
+        float sp;
+        if constexpr(SELECT)
+        {
+            const float sp_small =
+                log2f(1.0f + exp2f(x * 1.4426950408889634f)) * 0.6931471805599453f;
+            sp = x > 20.0f ? x : sp_small;
+        }
+        else
+            sp = x > 20.0f ? x
+                           : log2f(1.0f + exp2f(x * 1.4426950408889634f)) *
+                                 0.6931471805599453f; // both HW
         return sqrtf(sp);
     }
 }
@@ -146,18 +226,42 @@ __device__ __forceinline__ float compute_score(float x)
 // Sorting network (descending, 3 arrays co-permuted: vals, orig, idxs)
 // ---------------------------------------------------------------------------
 
-#define _CAS_DESC(v, o, id, i, j)                                    \
-    do                                                               \
-    {                                                                \
-        if((v)[i] < (v)[j])                                          \
-        {                                                            \
-            float _tv = (v)[i]; (v)[i] = (v)[j]; (v)[j] = _tv;      \
-            float _to = (o)[i]; (o)[i] = (o)[j]; (o)[j] = _to;      \
-            int _ti   = (id)[i]; (id)[i] = (id)[j]; (id)[j] = _ti;  \
-        }                                                            \
-    } while(0)
+// SELECT: swap with selects rather than a branch around the swap, same result.
+// The branch gets masked off one compare-exchange at a time, which serializes
+// the networks of independent lists; with one list per lane it can cost.
+template <bool SELECT>
+__device__ __forceinline__ void cas_desc(float* v, float* o, int* id, int i, int j)
+{
+    if constexpr(SELECT)
+    {
+        const bool sw  = v[i] < v[j];
+        const float vi = v[i], vj = v[j];
+        const float oi = o[i], oj = o[j];
+        const int ii = id[i], ij = id[j];
+        v[i]  = sw ? vj : vi;
+        v[j]  = sw ? vi : vj;
+        o[i]  = sw ? oj : oi;
+        o[j]  = sw ? oi : oj;
+        id[i] = sw ? ij : ii;
+        id[j] = sw ? ii : ij;
+    }
+    else if(v[i] < v[j])
+    {
+        float tv = v[i];
+        v[i]     = v[j];
+        v[j]     = tv;
+        float to = o[i];
+        o[i]     = o[j];
+        o[j]     = to;
+        int ti   = id[i];
+        id[i]    = id[j];
+        id[j]    = ti;
+    }
+}
 
-template <int N>
+#define _CAS_DESC(v, o, id, i, j) cas_desc<SELECT>(v, o, id, i, j)
+
+template <int N, bool SELECT = false>
 __device__ __forceinline__ void sort_network_desc(float* vals, float* orig, int* idxs)
 {
     if constexpr(N <= 1)
@@ -230,6 +334,14 @@ __device__ __forceinline__ void sort_network_desc(float* vals, float* orig, int*
 
 #undef _CAS_DESC
 
+// The reg kernel's select-form sort is measured on gfx950 and gfx1250 only;
+// other targets keep the branch form.
+#if defined(__gfx950__) || defined(__gfx1250__)
+constexpr bool REG_SORT_SELECT = true;
+#else
+constexpr bool REG_SORT_SELECT = false;
+#endif
+
 // ---------------------------------------------------------------------------
 // Register-only kernel (for expert counts divisible by WARP_SIZE)
 //
@@ -254,13 +366,16 @@ __global__ void topk_gating_kernel_opt(
     const size_t stride_tk,
     const int topk,
     const int num_tokens,
-    const float routed_scaling_factor)
+    const float routed_scaling_factor,
+    const int gating_stride,
+    const int num_shared_experts,
+    const int* __restrict__ num_valid_rows)
 {
     static constexpr int EPT = NUM_EXPERTS / WARP_SIZE;
     static_assert(NUM_EXPERTS % WARP_SIZE == 0);
 
     const int token_idx = blockIdx.x;
-    auto const* input_ptr = gating_output + token_idx * NUM_EXPERTS;
+    auto const* input_ptr = gating_output + token_idx * gating_stride;
 
     float vals[EPT];
     float orig[EPT];
@@ -293,8 +408,14 @@ __global__ void topk_gating_kernel_opt(
         vals[i] = fmaxf(vals[i], -INFINITY);
     }
 
+    if(write_if_pad_row(num_valid_rows, token_idx, input_ptr,
+                        topk_weights + token_idx * stride_tk,
+                        topk_ids + token_idx * stride_tk,
+                        NUM_EXPERTS, topk, num_shared_experts))
+        return;
+
     // Step 2: sort thread-local partition descending
-    sort_network_desc<EPT>(vals, orig, idxs);
+    sort_network_desc<EPT, REG_SORT_SELECT>(vals, orig, idxs);
 
     // Step 3: warp-level k-way merge
     // Winning lane = expert_idx & (WARP_SIZE-1) -> readlane broadcasts
@@ -338,6 +459,13 @@ __global__ void topk_gating_kernel_opt(
         topk_weights[token_idx * stride_tk + threadIdx.x] = topk_value * sum;
         topk_ids[token_idx * stride_tk + threadIdx.x]     = topk_indice;
     }
+    if(num_shared_experts > 0 && threadIdx.x == 0)
+    {
+        store_shared_expert_sigmoid(
+            gating_output + token_idx * gating_stride,
+            topk_weights + token_idx * stride_tk,
+            NUM_EXPERTS, topk, num_shared_experts);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +487,10 @@ __global__ void topk_gating_kernel_opt_multiwave(
     const size_t stride_tk,
     const int topk,
     const int num_tokens,
-    const float routed_scaling_factor)
+    const float routed_scaling_factor,
+    const int gating_stride,
+    const int num_shared_experts,
+    const int* __restrict__ num_valid_rows)
 {
     static_assert(WAVES_PER_TOKEN > 1);
     // This kernel is wave32-only (dispatched under get_warp_size_func()==32).
@@ -387,7 +518,7 @@ __global__ void topk_gating_kernel_opt_multiwave(
     const int token_idx = blockIdx.x;
     const int wave_id   = static_cast<int>(threadIdx.x) / LANES;
     const int lane_id   = static_cast<int>(threadIdx.x) & (LANES - 1);
-    auto const* input_ptr = gating_output + token_idx * NUM_EXPERTS;
+    auto const* input_ptr = gating_output + token_idx * gating_stride;
 
     float vals[EPT];
     float orig[EPT];
@@ -410,6 +541,12 @@ __global__ void topk_gating_kernel_opt_multiwave(
         // fmaxf: IEEE maxNum returns the non-NaN operand; see opt kernel.
         vals[i] = fmaxf(vals[i], -INFINITY);
     }
+
+    if(write_if_pad_row(num_valid_rows, token_idx, input_ptr,
+                        topk_weights + token_idx * stride_tk,
+                        topk_ids + token_idx * stride_tk,
+                        NUM_EXPERTS, topk, num_shared_experts))
+        return;
 
     sort_network_desc<EPT>(vals, orig, idxs);
 
@@ -480,6 +617,222 @@ __global__ void topk_gating_kernel_opt_multiwave(
         const int t = static_cast<int>(threadIdx.x);
         topk_weights[token_idx * stride_tk + t] = out_weight[t] * out_scale;
         topk_ids[token_idx * stride_tk + t]     = out_idx[t];
+    }
+    if(num_shared_experts > 0 && threadIdx.x == 0)
+    {
+        store_shared_expert_sigmoid(
+            gating_output + token_idx * gating_stride,
+            topk_weights + token_idx * stride_tk,
+            NUM_EXPERTS, topk, num_shared_experts);
+    }
+}
+
+// ---------------------------------------------------------------------------
+template <int BYTES>
+struct vec_of_bytes;
+template <>
+struct vec_of_bytes<4>
+{
+    using type = uint;
+};
+template <>
+struct vec_of_bytes<8>
+{
+    using type = uint2;
+};
+template <>
+struct vec_of_bytes<16>
+{
+    using type = uint4;
+};
+
+// out[0..N) = p[0..N); VEC: as vector loads of up to 16 bytes, p aligned to
+// N elements (or 16 bytes).
+template <bool VEC, int N, typename T>
+__device__ __forceinline__ void loadv(const T* p, T* out)
+{
+    constexpr int BYTES = N * static_cast<int>(sizeof(T));
+    if constexpr(VEC && BYTES > 16)
+    {
+        loadv<VEC, N / 2>(p, out);
+        loadv<VEC, N / 2>(p + N / 2, out + N / 2);
+    }
+    else if constexpr(VEC && BYTES >= 4)
+    {
+        const auto u = *reinterpret_cast<const typename vec_of_bytes<BYTES>::type*>(p);
+        __builtin_memcpy(out, &u, sizeof(u));
+    }
+    else
+    {
+#pragma unroll
+        for(int j = 0; j < N; j++)
+            out[j] = p[j];
+    }
+}
+
+// Single-wave form of topk_gating_kernel_opt_multiwave<.., NUM_EXPERTS, WPT, ..>
+// for wave32, with its results bit for bit. With C = 32*WPT, the multiwave
+// kernel gives wave w, lane l the experts l + 32*w + C*i (i < EPT), sorts them
+// with sort_network_desc<EPT>, and then orders all experts by (value desc, w,
+// l, position in that sorted list): its in-wave argmax takes the lowest lane on
+// a tie and its merge the lowest wave. 32*w + l is just e % C.
+//
+// Here lane p loads experts C*i + WPT*p + g (g < WPT) -- contiguous, so vector
+// loads. For each g those EPT experts are exactly one of the multiwave lists
+// (the one with e % C == WPT*p + g), sorted with the same network. The order
+// key e % C = WPT*p + g then makes the global pick an argmax over lanes, lowest
+// lane on a tie, of each lane's best list front, lowest g on a tie. A list
+// that runs out yields (-inf, id 0, weight 0), as an exhausted lane does in the
+// multiwave argmax. The renorm sum is summed in selection order. No LDS, no
+// barrier. Requires blockDim.x == 32 and topk <= MAXK. VEC_LOAD: the logit
+// rows and the bias are aligned to WPT elements.
+//
+// WPT == 1 is topk_gating_kernel_opt on wave32 (strided, one list per lane,
+// same lowest-lane tie order), with the same results. Fewer, longer lists
+// select faster; WPT only sets the order among equal scores (by e % C).
+template <typename DTYPE_I,
+          typename DTYPE_B,
+          int NUM_EXPERTS,
+          int WPT,
+          bool need_renorm,
+          int SCORE_FUNC = SCORE_SQRTSOFTPLUS,
+          bool VEC_LOAD  = false>
+__global__ void topk_gating_kernel_opt_vwave(const DTYPE_I* __restrict__ gating_output,
+                                             const DTYPE_B* __restrict__ correction_bias,
+                                             float* __restrict__ topk_weights,
+                                             int* __restrict__ topk_ids,
+                                             const size_t stride_tk,
+                                             const int topk,
+                                             const int num_tokens,
+                                             const float routed_scaling_factor,
+                                             const int gating_stride,
+                                             const int num_shared_experts,
+                                             const int* __restrict__ num_valid_rows)
+{
+    constexpr int LANES = 32;
+    constexpr int G     = WPT;             // lists per lane
+    constexpr int C     = G * LANES;       // experts per chunk
+    constexpr int EPT   = NUM_EXPERTS / C; // list length
+    constexpr int MAXK  = 8;
+    static_assert(NUM_EXPERTS % C == 0 && (G & (G - 1)) == 0);
+
+    const int token_idx   = blockIdx.x;
+    const int lane_id     = static_cast<int>(threadIdx.x) & (LANES - 1);
+    auto const* input_ptr = gating_output + token_idx * gating_stride;
+
+    // All loads go out before any compute.
+    DTYPE_I raw[EPT][G];
+    DTYPE_B bias[EPT][G];
+#pragma unroll
+    for(int i = 0; i < EPT; i++)
+        loadv<VEC_LOAD, G>(input_ptr + i * C + G * lane_id, raw[i]);
+    if(correction_bias != nullptr)
+    {
+#pragma unroll
+        for(int i = 0; i < EPT; i++)
+            loadv<VEC_LOAD, G>(correction_bias + i * C + G * lane_id, bias[i]);
+    }
+
+    float vals[G][EPT];
+    float orig[G][EPT];
+    int idxs[G][EPT];
+#pragma unroll
+    for(int g = 0; g < G; g++)
+    {
+#pragma unroll
+        for(int i = 0; i < EPT; i++)
+        {
+            float score = compute_score<SCORE_FUNC, true>(static_cast<float>(raw[i][g]));
+            orig[g][i]  = ::isnan(score) ? 0.0f : score;
+            vals[g][i]  = score;
+            idxs[g][i]  = i * C + G * lane_id + g;
+            if(correction_bias != nullptr)
+                vals[g][i] += static_cast<float>(bias[i][g]);
+            vals[g][i] = fmaxf(vals[g][i], -INFINITY);
+        }
+    }
+#pragma unroll
+    for(int g = 0; g < G; g++)
+        sort_network_desc<EPT, true>(vals[g], orig[g], idxs[g]);
+
+    float my_w = 0.0f;
+    int my_i   = 0;
+    float sum  = 0.0f;
+#pragma unroll
+    for(int k = 0; k < MAXK; ++k)
+    {
+        if(k >= topk)
+            break;
+        float cv  = vals[0][0];
+        float cwt = orig[0][0];
+        int ci    = idxs[0][0];
+        int cg    = 0;
+#pragma unroll
+        for(int g = 1; g < G; g++)
+        {
+            if(vals[g][0] > cv)
+            {
+                cv  = vals[g][0];
+                cwt = orig[g][0];
+                ci  = idxs[g][0];
+                cg  = g;
+            }
+        }
+        const float max_val   = multithread_reduce_max_dpp<LANES>(cv);
+        const unsigned at_max = static_cast<unsigned>(__ballot(cv == max_val));
+        const int win_lane    = (at_max != 0) ? __builtin_ctz(at_max) : 0;
+
+        const int wg       = __builtin_amdgcn_readlane(cg, win_lane);
+        const float weight = __builtin_bit_cast(
+            float, __builtin_amdgcn_readlane(__builtin_bit_cast(int, cwt), win_lane));
+        const int id = __builtin_amdgcn_readlane(ci, win_lane);
+
+        if(lane_id == win_lane)
+        {
+#pragma unroll
+            for(int g = 0; g < G; g++)
+            {
+                if(wg == g)
+                {
+#pragma unroll
+                    for(int i = 0; i < EPT - 1; i++)
+                    {
+                        vals[g][i] = vals[g][i + 1];
+                        orig[g][i] = orig[g][i + 1];
+                        idxs[g][i] = idxs[g][i + 1];
+                    }
+                    vals[g][EPT - 1] = -INFINITY;
+                    orig[g][EPT - 1] = 0.0f;
+                    idxs[g][EPT - 1] = 0;
+                }
+            }
+        }
+        if constexpr(need_renorm)
+            sum += weight;
+        if(lane_id == k)
+        {
+            my_w = weight;
+            my_i = id;
+        }
+    }
+
+    float out_scale = routed_scaling_factor;
+    if constexpr(need_renorm)
+        out_scale = routed_scaling_factor / fmaxf(sum, RENORM_SUM_FLOOR);
+
+    const bool pad = is_pad_row(num_valid_rows, token_idx);
+    if(lane_id < topk)
+    {
+        topk_weights[token_idx * stride_tk + lane_id] = pad ? 0.0f : my_w * out_scale;
+        topk_ids[token_idx * stride_tk + lane_id]     = pad ? -1 : my_i;
+    }
+    if(num_shared_experts > 0 && threadIdx.x == 0)
+    {
+        store_shared_expert_sigmoid(gating_output + token_idx * gating_stride,
+                                    topk_weights + token_idx * stride_tk,
+                                    NUM_EXPERTS,
+                                    topk,
+                                    num_shared_experts);
     }
 }
 
@@ -553,7 +906,10 @@ __global__ void topk_gating_kernel_opt_n(
     const size_t stride_tk,
     const int topk,
     const int num_tokens,
-    const float routed_scaling_factor)
+    const float routed_scaling_factor,
+    const int gating_stride,
+    const int num_shared_experts,
+    const int* __restrict__ num_valid_rows)
 {
     static constexpr int TOKENS_PER_WARP = TPW;
     static constexpr int THREADS_PER_ROW = WARP_SIZE / TOKENS_PER_WARP;
@@ -570,7 +926,7 @@ __global__ void topk_gating_kernel_opt_n(
     // Guard: trailing tokens of the last block may be out of bounds.
     // Load from token 0 (harmless) and skip the write.
     const bool valid      = token_idx < num_tokens;
-    auto const* input_ptr = gating_output + (valid ? token_idx : 0) * NUM_EXPERTS;
+    auto const* input_ptr = gating_output + (valid ? token_idx : 0) * gating_stride;
 
     float vals[EPT], orig[EPT];
     int   idxs[EPT];
@@ -626,10 +982,18 @@ __global__ void topk_gating_kernel_opt_n(
     else
         sum = routed_scaling_factor;
 
+    const bool pad = is_pad_row(num_valid_rows, token_idx);
     if(lane_in_group < topk && valid)
     {
-        topk_weights[token_idx * stride_tk + lane_in_group] = topk_value * sum;
-        topk_ids[token_idx * stride_tk + lane_in_group]     = topk_indice;
+        topk_weights[token_idx * stride_tk + lane_in_group] = pad ? 0.0f : topk_value * sum;
+        topk_ids[token_idx * stride_tk + lane_in_group]     = pad ? -1 : topk_indice;
+    }
+    if(num_shared_experts > 0 && valid && lane_in_group == 0)
+    {
+        store_shared_expert_sigmoid(
+            gating_output + token_idx * gating_stride,
+            topk_weights + token_idx * stride_tk,
+            NUM_EXPERTS, topk, num_shared_experts);
     }
 }
 
@@ -664,7 +1028,10 @@ void topk_gating_kernel_prefill(
     const size_t stride_tk,
     const int topk,
     const int num_tokens,
-    const float routed_scaling_factor)
+    const float routed_scaling_factor,
+    const int gating_stride,
+    const int num_shared_experts,
+    const int* __restrict__ num_valid_rows)
 {
     static constexpr int TOKENS_PER_WARP = TPW;
     static constexpr int THREADS_PER_ROW = WARP_SIZE / TOKENS_PER_WARP;
@@ -695,7 +1062,7 @@ void topk_gating_kernel_prefill(
     // Threads 0..31 (token A): experts [0, VPT), [VPT, 2*VPT), ...
     // Threads 32..63 (token B): same layout for their own token.
     const DTYPE_I* input_ptr = gating_output
-                             + (valid ? token_idx : 0) * NUM_EXPERTS
+                             + (valid ? token_idx : 0) * gating_stride
                              + lane_in_group * VPT;
 
     float row_chunk[VPT];  // biased selection scores
@@ -859,10 +1226,18 @@ void topk_gating_kernel_prefill(
     else
         sum = routed_scaling_factor;
 
+    const bool pad = is_pad_row(num_valid_rows, token_idx);
     if(lane_in_group < topk && valid)
     {
-        topk_weights[token_idx * stride_tk + lane_in_group] = topk_value * sum;
-        topk_ids[token_idx * stride_tk + lane_in_group]     = topk_indice;
+        topk_weights[token_idx * stride_tk + lane_in_group] = pad ? 0.0f : topk_value * sum;
+        topk_ids[token_idx * stride_tk + lane_in_group]     = pad ? -1 : topk_indice;
+    }
+    if(num_shared_experts > 0 && valid && lane_in_group == 0)
+    {
+        store_shared_expert_sigmoid(
+            gating_output + token_idx * gating_stride,
+            topk_weights + token_idx * stride_tk,
+            NUM_EXPERTS, topk, num_shared_experts);
     }
 }
 
@@ -881,7 +1256,10 @@ __global__ void topk_gating_kernel(
     const int num_experts,
     const int topk,
     const int num_tokens,
-    const float routed_scaling_factor)
+    const float routed_scaling_factor,
+    const int gating_stride,
+    const int num_shared_experts,
+    const int* __restrict__ num_valid_rows)
 {
     extern __shared__ char shared_mem[];
     const int token_idx = blockIdx.x;
@@ -892,11 +1270,15 @@ __global__ void topk_gating_kernel(
     static constexpr int vec_size = opus::vector_traits<f32vec>::size();
     using vec_i                   = opus::vector_t<cktype_i, vec_size>;
     const int num_experts_vec     = num_experts / vec_size;
+    // Top-k scans whole vectors only, so a partial last vector would be skipped.
+    // topk_gating_launch picks f32vec so that vec_size divides num_experts.
+    if(num_experts % vec_size != 0)
+        __builtin_trap();
 
     // Step 1: load + score function
     // For softmax, bias is NOT added here -- it's added AFTER normalization
     // (bias only shifts scores for topk selection, not for softmax computation).
-    auto const* input_ptr = gating_output + token_idx * num_experts;
+    auto const* input_ptr = gating_output + token_idx * gating_stride;
     for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
     {
         vec_i tmp = reinterpret_cast<vec_i const*>(input_ptr)[e];
@@ -923,6 +1305,11 @@ __global__ void topk_gating_kernel(
         }
     }
     __syncthreads();
+    if(write_if_pad_row(num_valid_rows, token_idx, input_ptr,
+                        topk_weights + token_idx * stride_tk,
+                        topk_ids + token_idx * stride_tk,
+                        num_experts, topk, num_shared_experts))
+        return;
 
     // Softmax: normalize first, then add bias for topk selection.
     // scores[] after this block = softmax(x) + bias (biased for selection).
@@ -1010,6 +1397,13 @@ __global__ void topk_gating_kernel(
         topk_weights[token_idx * stride_tk + k] = topk_value * sum;
         topk_ids[token_idx * stride_tk + k]     = topk_indice;
     }
+    if(num_shared_experts > 0 && threadIdx.x == 0)
+    {
+        store_shared_expert_sigmoid(
+            gating_output + token_idx * gating_stride,
+            topk_weights + token_idx * stride_tk,
+            num_experts, topk, num_shared_experts);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,7 +1436,10 @@ __global__ void topk_gating_kernel_smem_n(
     const int num_experts,
     const int topk,
     const int num_tokens,
-    const float routed_scaling_factor)
+    const float routed_scaling_factor,
+    const int gating_stride,
+    const int num_shared_experts,
+    const int* __restrict__ num_valid_rows)
 {
     static constexpr int ROWS_PER_WARP   = RPW;
     static constexpr int THREADS_PER_ROW = WARP_SIZE / ROWS_PER_WARP;
@@ -1066,10 +1463,12 @@ __global__ void topk_gating_kernel_smem_n(
     static constexpr int vec_size = opus::vector_traits<f32vec>::size();
     using vec_i                   = opus::vector_t<cktype_i, vec_size>;
     const int num_experts_vec     = num_experts / vec_size;
+    if(num_experts % vec_size != 0)
+        __builtin_trap();
 
     // Guard: trailing tokens of the last block may be out of range.
     const bool valid      = token_idx < num_tokens;
-    auto const* input_ptr = gating_output + (valid ? token_idx : 0) * num_experts;
+    auto const* input_ptr = gating_output + (valid ? token_idx : 0) * gating_stride;
 
     // -----------------------------------------------------------------------
     // Step 1: load + score (stride = THREADS_PER_ROW within the group)
@@ -1196,10 +1595,18 @@ __global__ void topk_gating_kernel_smem_n(
     else
         sum = routed_scaling_factor;
 
+    const bool pad = is_pad_row(num_valid_rows, token_idx);
     if(lane_in_row < topk && valid)
     {
-        topk_weights[token_idx * stride_tk + lane_in_row] = topk_value * sum;
-        topk_ids[token_idx * stride_tk + lane_in_row]     = topk_indice;
+        topk_weights[token_idx * stride_tk + lane_in_row] = pad ? 0.0f : topk_value * sum;
+        topk_ids[token_idx * stride_tk + lane_in_row]     = pad ? -1 : topk_indice;
+    }
+    if(num_shared_experts > 0 && valid && lane_in_row == 0)
+    {
+        store_shared_expert_sigmoid(
+            gating_output + token_idx * gating_stride,
+            topk_weights + token_idx * stride_tk,
+            num_experts, topk, num_shared_experts);
     }
 }
 
@@ -1215,7 +1622,7 @@ __global__ void topk_gating_kernel_smem_n(
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \
         p.weights,                                       \
         p.ids,                                         \
-        stride_tk, num_experts, topk, num_tokens, routed_scaling_factor);
+        stride_tk, num_experts, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts, p.num_valid_rows);
 
 #define LAUNCH_TOPK_KERNEL_OPT(NE, RENORM, SF)                                                  \
     hipLaunchKernelGGL(                                                                          \
@@ -1225,7 +1632,26 @@ __global__ void topk_gating_kernel_smem_n(
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \
         p.weights,                                       \
         p.ids,                                         \
-        stride_tk, topk, num_tokens, routed_scaling_factor);
+        stride_tk, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts, p.num_valid_rows);
+
+#define LAUNCH_TOPK_KERNEL_VWAVE(NE, WPT, RENORM, SF, VEC)                                        \
+    hipLaunchKernelGGL(                                                                           \
+        (aiter::topk_gating_kernel_opt_vwave<scalar_t, bias_scalar_t, NE, WPT, RENORM, SF, VEC>), \
+        dim3(grid),                                                                               \
+        dim3(block.x),                                                                            \
+        0,                                                                                        \
+        stream,                                                                                   \
+        reinterpret_cast<const scalar_t*>(p.gating),                                              \
+        reinterpret_cast<const bias_scalar_t*>(p.bias),                                           \
+        p.weights,                                                                                \
+        p.ids,                                                                                    \
+        stride_tk,                                                                                \
+        topk,                                                                                     \
+        num_tokens,                                                                               \
+        routed_scaling_factor,                                                                    \
+        p.gating_stride,                                                                          \
+        p.num_shared_experts,                                                                     \
+        p.num_valid_rows);
 
 #define LAUNCH_TOPK_KERNEL_OPT_MULTIWAVE(NE, WPT, RENORM, SF)                                   \
     hipLaunchKernelGGL(                                                                          \
@@ -1235,7 +1661,7 @@ __global__ void topk_gating_kernel_smem_n(
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \
         p.weights,                                       \
         p.ids,                                         \
-        stride_tk, topk, num_tokens, routed_scaling_factor);
+        stride_tk, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts, p.num_valid_rows);
 
 // opt_n: register-only prefill kernel with TOKENS_PER_WARP=TPW.
 #define LAUNCH_TOPK_KERNEL_OPT_N(NE, RENORM, SF, TPW)                                           \
@@ -1245,7 +1671,7 @@ __global__ void topk_gating_kernel_smem_n(
         reinterpret_cast<const scalar_t*>(p.gating),                              \
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \
         p.weights, p.ids, \
-        stride_tk, topk, num_tokens, routed_scaling_factor);
+        stride_tk, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts, p.num_valid_rows);
 
 // smem_n: ROWS_PER_WARP=RPW shared-memory kernel; smem = RPW * num_experts floats.
 #define LAUNCH_TOPK_KERNEL_SMEM_N(VEC_F, RENORM, SF, RPW)                                       \
@@ -1255,7 +1681,7 @@ __global__ void topk_gating_kernel_smem_n(
         reinterpret_cast<const scalar_t*>(p.gating),                              \
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \
         p.weights, p.ids, \
-        stride_tk, num_experts, topk, num_tokens, routed_scaling_factor);
+        stride_tk, num_experts, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts, p.num_valid_rows);
 
 // prefill: vectorized-load scan+invalidate kernel, templatized TPW.
 #define LAUNCH_TOPK_KERNEL_PREFILL_N(NE, RENORM, SF, TPW)                                       \
@@ -1265,7 +1691,7 @@ __global__ void topk_gating_kernel_smem_n(
         reinterpret_cast<const scalar_t*>(p.gating),                              \
         reinterpret_cast<const bias_scalar_t*>(p.bias),  \
         p.weights, p.ids, \
-        stride_tk, topk, num_tokens, routed_scaling_factor);
+        stride_tk, topk, num_tokens, routed_scaling_factor, p.gating_stride, p.num_shared_experts, p.num_valid_rows);
 
 
 // ---------------------------------------------------------------------------
@@ -1336,16 +1762,54 @@ void topk_gating_launch(const topk_gating_params& p)
         else            { LAUNCH_TOPK_KERNEL_OPT_MULTIWAVE(NE, WPT, false, SF) }     \
         return;                                                                      \
     }
-            // E=384 WPT=4 wins up to T=1024 (measured); above that the prefill_n
-            // multi-token path is given a chance (reg fallback is EPT=12 and slow).
+            // Single-wave kernel for topk <= 8: one lane holds WPT * EPT experts.
+            // VEC when the rows and bias allow WPT-element vector loads.
+            auto vwave_vec = [&](int wpt) {
+                return wpt > 1 &&
+                       reinterpret_cast<uintptr_t>(p.gating) % (wpt * sizeof(scalar_t)) == 0 &&
+                       p.gating_stride % wpt == 0 &&
+                       reinterpret_cast<uintptr_t>(p.bias) % (wpt * sizeof(bias_scalar_t)) == 0;
+            };
+#define _DISPATCH_WAVE32_VWAVE_KERNEL(NE, WPT)                              \
+        if(num_experts == NE && topk <= 8 && topk_gating_vwave_arch())      \
+        {                                                                   \
+            const bool vec = vwave_vec(WPT);                                \
+            if(need_renorm)                                                 \
+            {                                                               \
+                if(vec)                                                     \
+                {                                                           \
+                    LAUNCH_TOPK_KERNEL_VWAVE(NE, WPT, true, SF, (WPT > 1))  \
+                }                                                           \
+                else                                                        \
+                {                                                           \
+                    LAUNCH_TOPK_KERNEL_VWAVE(NE, WPT, true, SF, false)      \
+                }                                                           \
+            }                                                               \
+            else                                                            \
+            {                                                               \
+                if(vec)                                                     \
+                {                                                           \
+                    LAUNCH_TOPK_KERNEL_VWAVE(NE, WPT, false, SF, (WPT > 1)) \
+                }                                                           \
+                else                                                        \
+                {                                                           \
+                    LAUNCH_TOPK_KERNEL_VWAVE(NE, WPT, false, SF, false)     \
+                }                                                           \
+            }                                                               \
+            return;                                                         \
+        }
+            // E=384: WPT=2 (EPT=6) measured fastest on gfx1250 up to T=1024 (WPT=4
+            // and WPT=1 are 5-15% slower); above that prefill_n takes over.
             if(num_tokens <= 1024)
             {
+                _DISPATCH_WAVE32_VWAVE_KERNEL(384, 2)
                 _DISPATCH_WAVE32_MULTIWAVE_KERNEL(384, 4)
             }
-            // E=256 WPT=8 (EPT=1) is a low-token decode win across all topk on
-            // gfx1250 (measured ~4.1-6.0us @ T<=256 vs reg ~5.6-6.3us). Above
-            // T=256 the GPU saturates and reg is faster, so fall through.
-            if(num_tokens <= 256)
+            // E=256 WPT=8 (EPT=1) is a low-token decode win on gfx1250 (measured
+            // ~4.1-6.0us @ T<=256 vs reg ~5.6-6.3us); there the single-wave kernel
+            // takes topk <= 8. Above T=256 the GPU saturates and reg is faster, so
+            // fall through.
+            if(num_tokens <= 256 && (topk > 8 || !topk_gating_vwave_arch()))
             {
                 _DISPATCH_WAVE32_MULTIWAVE_KERNEL(256, 8)
             }
@@ -1362,6 +1826,12 @@ void topk_gating_launch(const topk_gating_params& p)
         else            { LAUNCH_TOPK_KERNEL_OPT(NE, false, SF) }         \
         return;                                                            \
     }
+            // On wave32, topk <= 8: the single-wave kernel in the reg layout
+            // (same results as reg), faster at every T measured on gfx1250.
+            _DISPATCH_WAVE32_VWAVE_KERNEL(64, 1)
+            _DISPATCH_WAVE32_VWAVE_KERNEL(128, 1)
+            _DISPATCH_WAVE32_VWAVE_KERNEL(256, 1)
+#undef _DISPATCH_WAVE32_VWAVE_KERNEL
             _DISPATCH_REG_KERNEL(64)
             _DISPATCH_REG_KERNEL(128)
             _DISPATCH_REG_KERNEL(256)
@@ -1433,6 +1903,12 @@ void topk_gating_launch(const topk_gating_params& p)
                 _DISPATCH_PREFILL_N_KERNEL(128, 1)
                 _DISPATCH_PREFILL_N_KERNEL(256, 1)
                 _DISPATCH_PREFILL_N_KERNEL(384, 1)
+                // E=512: prefill_n wins at T<=1024 on gfx942/gfx950; above that
+                // smem is faster. Other archs keep smem until measured.
+                if(num_tokens <= 1024 && topk_gating_prefer_prefill_n_e512())
+                {
+                    _DISPATCH_PREFILL_N_KERNEL(512, 1)
+                }
                 // E=640: prefill_n wins at T<=2048; above that smem is faster.
                 if(num_tokens <= 2048)
                 {

@@ -1,20 +1,17 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-// fmha_v4_fwd is still torch (at::Tensor); the rotate_activation_* quant ops are
-// torch-free (aiter_tensor_t). rocm_ops.hpp supplies pybind11 + `namespace py` +
-// the module_aiter_core-registered aiter_tensor_t type used by the develop=True
-// marshalling; it coexists with <torch/extension.h> (see moe_topk_ck_pybind.cu).
+// Torch (at::Tensor) TU. The torch-free rotate_activation_* quant ops that used
+// to be defined here now live in mha_v4_quant_pybind.cu / module_mha_v4_quant --
+// they take aiter_tensor_t, which only resolves inside module_aiter_core's ABI
+// family, and this module links libtorch and so belongs to the other one.
+// rocm_ops.hpp supplies pybind11 + `namespace py`; it coexists with
+// <torch/extension.h> (see moe_topk_ck_pybind.cu).
 #include "rocm_ops.hpp"
-#include "aiter_stream.h"
 #include "torch/mha_v4_fwd.h"
-#include "mha_v4_quant.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
-    // Required by the develop=True rotate_activation_* ops: lets the Python
-    // marshalling push the current HIP stream into the torch-free TU.
-    AITER_SET_STREAM_PYBIND
     m.def("fmha_v4_fwd",
           &aiter::torch_itfs::fmha_v4_fwd,
           py::arg("q"),
@@ -27,10 +24,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("q_format"),
           py::arg("k_format"),
           py::arg("v_format"),
+          py::arg("v_pack"),
           py::arg("q_scale_mode"),
           py::arg("k_scale_mode"),
           py::arg("v_scale_mode"),
-          py::arg("softmax_scale"));
+          py::arg("softmax_scale"),
+          py::arg("seqlens_k") = std::nullopt,
+          py::arg("lse")       = std::nullopt);
     m.def("fmha_v4_fwd_sparse",
           &aiter::torch_itfs::fmha_v4_fwd_sparse,
           py::arg("q"),
@@ -43,49 +43,58 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("q_format"),
           py::arg("k_format"),
           py::arg("v_format"),
+          py::arg("v_pack"),
           py::arg("q_scale_mode"),
           py::arg("k_scale_mode"),
           py::arg("v_scale_mode"),
           py::arg("softmax_scale"),
           py::arg("kv_block_indices"),
           py::arg("lut_start"),
-          py::arg("lut_count"));
-    m.def("rotate_activation_hd128",
-          &aiter::torch_itfs::rotate_activation_hd128,
+          py::arg("lut_count"),
+          py::arg("q_tile")  = 0,
+          py::arg("kv_tile") = 0,
+          py::arg("lse")     = std::nullopt);
+    m.def("fmha_v4_fwd_sol",
+          &aiter::torch_itfs::fmha_v4_fwd_sol,
+          py::arg("q"),
+          py::arg("k"),
+          py::arg("v"),
+          py::arg("q_descale"),
+          py::arg("k_descale"),
+          py::arg("v_descale"),
           py::arg("out"),
-          py::arg("input"));
-    m.def("rotate_activation_mxfp8_quant",
-          &aiter::torch_itfs::rotate_activation_mxfp8_quant,
-          py::arg("out"),
-          py::arg("scale"),
-          py::arg("input"),
-          py::arg("multiplier"));
-    m.def("rotate_activation_mxfp6_quant",
-          &aiter::torch_itfs::rotate_activation_mxfp6_quant,
-          py::arg("out"),
-          py::arg("scale"),
-          py::arg("input"),
-          py::arg("multiplier"));
-    m.def("rotate_activation_mxfp6_quant_k",
-          &aiter::torch_itfs::rotate_activation_mxfp6_quant_k,
-          py::arg("out"),
-          py::arg("scale"),
-          py::arg("input"));
-    m.def("rotate_activation_mxfp4_quant",
-          &aiter::torch_itfs::rotate_activation_mxfp4_quant,
-          py::arg("out"),
-          py::arg("scale"),
-          py::arg("input"),
-          py::arg("multiplier"));
-    m.def("rotate_activation_mxfp4_quant_k",
-          &aiter::torch_itfs::rotate_activation_mxfp4_quant_k,
-          py::arg("out"),
-          py::arg("scale"),
-          py::arg("input"));
+          py::arg("q_format"),
+          py::arg("k_format"),
+          py::arg("v_format"),
+          py::arg("v_pack"),
+          py::arg("q_scale_mode"),
+          py::arg("k_scale_mode"),
+          py::arg("v_scale_mode"),
+          py::arg("softmax_scale"),
+          py::arg("kv_block_indices"),
+          py::arg("lut_start"),
+          py::arg("lut_count"),
+          py::arg("mean_k"),
+          py::arg("mean_v"),
+          py::arg("block_bitmap"),
+          py::arg("mean_k_scale") = std::nullopt,
+          py::arg("mean_v_scale") = std::nullopt,
+          py::arg("q_tile")           = 0,
+          py::arg("kv_tile")          = 0,
+          py::arg("lse")              = std::nullopt,
+          py::arg("kv_range_tokens")  = 0,
+          py::arg("mean_k_var")       = std::nullopt,
+          py::arg("sorted_dispatch")  = -1,
+          py::arg("mean_k_var_scale") = std::nullopt,
+          py::arg("tilt_rank")         = 0,
+          py::arg("tilt_plane_stride") = 0,
+          py::arg("tilt_shift")        = std::nullopt);
     m.def("mha_v4_sparse_work_table",
           &aiter::torch_itfs::mha_v4_sparse_work_table,
           py::arg("lut_count"),
           py::arg("batch"),
           py::arg("nhead"),
-          py::arg("q_tiles"));
+          py::arg("q_tiles"),
+          py::arg("q_tile")   = 256,
+          py::arg("kv_tiles") = 0);
 }

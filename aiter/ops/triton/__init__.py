@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import importlib.abc
 import importlib.util
 import sys
 import warnings
@@ -8,35 +9,31 @@ from types import SimpleNamespace
 
 # Try to import quant module
 try:
-    from . import quant
+    from aiter.ops.triton import quant
 except (ImportError, AttributeError):
     quant = None
 
-# Try to import comms module (requires iris)
+# Import the comms package. Its Iris-based primitives exist only when Iris is installed.
 try:
-    from . import comms
+    from aiter.ops.triton import comms
+except ImportError:
+    comms = None
 
+IRIS_COMM_AVAILABLE = comms is not None and comms.IRIS_COMM_AVAILABLE
+if IRIS_COMM_AVAILABLE:
     # Re-export communication primitives at this level for convenience
-    from .comms import (  # noqa: F401  deliberate re-export for convenience
-        IRIS_COMM_AVAILABLE,
+    from aiter.ops.triton.comms import (  # noqa: F401  deliberate re-export for convenience
         IrisCommContext,
         all_gather,
         reduce_scatter,
         reduce_scatter_rmsnorm_quant_all_gather,
     )
 
-    _COMMS_AVAILABLE = True
-except ImportError:
-    # Iris not available - comms module won't be available
-    _COMMS_AVAILABLE = False
-    IRIS_COMM_AVAILABLE = False
-    comms = None
-
 __all__ = []
 if quant is not None:
     __all__.append("quant")
 
-if _COMMS_AVAILABLE:
+if IRIS_COMM_AVAILABLE:
     __all__.extend(
         [
             "IRIS_COMM_AVAILABLE",
@@ -54,7 +51,11 @@ for modules that were reorganized so that external repos (like sglang for exampl
 which depend on the old module names, can still import it the old "way" of importing.
 """
 # Paths that only exist for backward compatibility and are on their way out.
-_DEPRECATED_COMPAT_PATHS = ("gluon.gemm_a8w8", "gluon.gemm_a8w8_blockscale")
+_DEPRECATED_COMPAT_PATHS = (
+    "gluon.gemm_a8w8",
+    "gluon.gemm_a8w8_blockscale",
+    "gluon.gemm_afp4wfp4",
+)
 
 
 def _warn_if_deprecated(name, new_path):
@@ -91,6 +92,7 @@ _BACKWARD_COMPAT_MAP = {
     "gemm_a8wfp4": "gemm.basic.gemm_a8wfp4",
     "gemm_afp4wfp4_pre_quant_atomic": "gemm.basic.gemm_afp4wfp4_pre_quant_atomic",
     "gemm_afp4wfp4": "gemm.basic.gemm_afp4wfp4",
+    "gluon.gemm_afp4wfp4": "gemm.basic.gemm_afp4wfp4",
     # Feed-forward modules (gemm/feed_forward/)
     "ff_a16w16_fused_gated": "gemm.feed_forward.ff_a16w16_fused_gated",
     "ff_a16w16_fused_ungated": "gemm.feed_forward.ff_a16w16_fused_ungated",
@@ -102,8 +104,8 @@ _BACKWARD_COMPAT_MAP = {
     "fused_gemm_afp4wfp4_mul_add": "gemm.fused.fused_gemm_afp4wfp4_mul_add",
     "fused_gemm_afp4wfp4_split_cat": "gemm.fused.fused_gemm_afp4wfp4_split_cat",
     "fused_gemm_a8w8_blockscale_split_cat": "gemm.fused.fused_gemm_a8w8_blockscale_split_cat",
-    # Conv modules (conv/)
-    "conv2d": "conv.conv2d",
+    # Grouped GEMM modules (gemm/grouped/)
+    "gmm": "gemm.grouped.gmm",
     # Attention modules (attention/)
     "chunked_pa_prefill": "attention.chunked_pa_prefill",
     "extend_attention": "attention.extend_attention",
@@ -114,7 +116,6 @@ _BACKWARD_COMPAT_MAP = {
     "mha_onekernel_bwd": "attention.mha_onekernel_bwd",
     "mha_v3": "attention.mha_v3",
     "mha": "attention.mha",
-    "mla_decode": "attention.mla_decode",
     "mla_decode_rope": "attention.mla_decode_rope",
     "pa_decode": "attention.pa_decode",
     "pa_mqa_logits": "attention.pa_mqa_logits",
@@ -124,6 +125,8 @@ _BACKWARD_COMPAT_MAP = {
     "unified_attention_sparse_mla": "attention.unified_attention_sparse_mla",
     "unified_attention": "attention.unified_attention",
     # Fusions modules (fusions/)
+    "activation": "fusions.activation",
+    "_triton_kernels.activation": "_triton_kernels.fusions.activation",
     "fused_kv_cache": "fusions.fused_kv_cache",
     "fused_mul_add": "fusions.fused_mul_add",
     "fused_qk_concat": "fusions.fused_qk_concat",
@@ -135,8 +138,11 @@ _BACKWARD_COMPAT_MAP = {
     # Normalization modules (normalization/)
     "fused_add_rmsnorm_pad": "normalization.fused_add_rmsnorm_pad",
     "fused_rmsnorm_add": "normalization.fused_rmsnorm_add",
+    "fused_rmsnorm_add_rmsnorm": "normalization.fused_rmsnorm_add_rmsnorm",
     "norm": "normalization.norm",
     "rmsnorm": "normalization.rmsnorm",
+    # RoPE modules (rope/)
+    "fused_qkv_split_qk_norm_rope_cache": "rope.fused_qkv_split_qk_norm_rope_cache",
     "fused_qkv_split_qk_rope": "rope.fused_qkv_split_qk_rope",
     # Utils modules (utils/)
     "common_utils": "utils.common_utils",
@@ -144,7 +150,7 @@ _BACKWARD_COMPAT_MAP = {
     "device_info": "utils.device_info",
     "gmm_common": "utils.gmm_common",
     "logger": "utils.logger",
-    "mha_kernel_utils": "utils._triton.mha_kernel_utils",
+    "mha_kernel_utils": "_triton_kernels.common.mha_kernel_utils",
     "moe_common": "utils.moe_common",
     "types": "utils.types",
     # Quant modules (quant/)
@@ -172,6 +178,23 @@ def __getattr__(name):
     raise AttributeError(f"module 'aiter.ops.triton' has no attribute '{name}'")
 
 
+class _AliasLoader(importlib.abc.Loader):
+    """Gives an old module path the module that is loaded at its new path.
+
+    The module code runs only one time, so a route or custom op that the module
+    registers is not registered again under the old name.
+    """
+
+    def __init__(self, module):
+        self._module = module
+
+    def create_module(self, spec):
+        return self._module
+
+    def exec_module(self, module):
+        pass
+
+
 def _backward_compat_find_spec(fullname, path, target=None):
     """
     Handles the import of the triton module
@@ -185,10 +208,14 @@ def _backward_compat_find_spec(fullname, path, target=None):
             new_path = f"aiter.ops.triton.{_BACKWARD_COMPAT_MAP[name]}"
             _warn_if_deprecated(name, new_path)
             try:
-                sys.modules[fullname] = importlib.import_module(new_path)
-                return importlib.util.find_spec(new_path)
+                module = importlib.import_module(new_path)
             except ImportError:
-                pass
+                return None
+            return importlib.util.spec_from_loader(
+                fullname,
+                _AliasLoader(module),
+                is_package=hasattr(module, "__path__"),
+            )
     return None
 
 
