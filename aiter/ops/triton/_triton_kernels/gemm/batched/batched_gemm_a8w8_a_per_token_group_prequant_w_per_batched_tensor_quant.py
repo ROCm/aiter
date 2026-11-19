@@ -25,13 +25,20 @@ _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = 
 )
 
 
+_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel_heuristics = {
+    "EVEN_K": lambda args: (
+        (args["K"] % args["SPLITK_BLOCK_SIZE"] == 0)
+        and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
+    ),
+    "EVEN_MN": lambda args: (
+        (args["M"] % args["BLOCK_SIZE_M"] == 0)
+        and (args["N"] % args["BLOCK_SIZE_N"] == 0)
+    ),
+}
+
+
 @triton.heuristics(
-    {
-        "EVEN_K": lambda args: (args["K"] % args["SPLITK_BLOCK_SIZE"] == 0)
-        and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0),
-        "EVEN_MN": lambda args: (args["M"] % args["BLOCK_SIZE_M"] == 0)
-        and (args["N"] % args["BLOCK_SIZE_N"] == 0),
-    }
+    _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel_heuristics
 )
 @triton.jit(
     repr=_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr,
@@ -255,13 +262,16 @@ def _sum_splitk_partials(
     return acc
 
 
-@triton.heuristics(
-    {
-        "ONE_TILE": lambda args: args["N"] <= args["BLOCK_SIZE_N"],
-        "EVEN_MN": lambda args: (args["M"] % args["BLOCK_SIZE_M"] == 0)
-        and (args["N"] % args["BLOCK_SIZE_N"] == 0),
-    }
-)
+_batched_gemm_a8w8_splitk_reduce_per_token_quant_kernel_heuristics = {
+    "ONE_TILE": lambda args: args["N"] <= args["BLOCK_SIZE_N"],
+    "EVEN_MN": lambda args: (
+        (args["M"] % args["BLOCK_SIZE_M"] == 0)
+        and (args["N"] % args["BLOCK_SIZE_N"] == 0)
+    ),
+}
+
+
+@triton.heuristics(_batched_gemm_a8w8_splitk_reduce_per_token_quant_kernel_heuristics)
 @triton.jit(
     repr=_batched_gemm_a8w8_splitk_reduce_per_token_quant_repr,
     do_not_specialize=["M"],

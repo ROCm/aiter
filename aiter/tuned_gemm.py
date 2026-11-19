@@ -63,6 +63,18 @@ tuned_df = pd.DataFrame(
 )
 
 
+def _has_hipblaslt_70200():
+    # Solution indices belong to the loaded library's kernel catalog.
+    try:
+        with open("/proc/self/maps") as mappings:
+            return any(
+                line.rstrip().endswith("/libhipblaslt.so.1.2.70200")
+                for line in mappings
+            )
+    except OSError:
+        return False
+
+
 @functools.lru_cache(maxsize=1)
 def get_GEMM_A16W16_config_():
     tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
@@ -83,6 +95,30 @@ def get_GEMM_A16W16_config_():
                 "bpreshuffle",
             ]
         ).to_dict("index")
+        if not os.getenv("AITER_CONFIG_GEMM_BF16") and _has_hipblaslt_70200():
+            overrides = pd.read_csv(
+                f"{this_dir}/configs/model_configs/qwen38_flash_next_hipblaslt_70200.csv"
+            )
+            for row in overrides.itertuples(index=False):
+                key = (
+                    "gfx942",
+                    80,
+                    row.M,
+                    row.N,
+                    row.K,
+                    False,
+                    "torch.bfloat16",
+                    "torch.bfloat16",
+                    False,
+                    False,
+                )
+                entry = gemm_dict.get(key)
+                if (
+                    entry
+                    and entry["libtype"] == "hipblaslt"
+                    and entry["solidx"] == row.original_solidx
+                ):
+                    entry["solidx"] = row.solidx
     return gemm_dict
 
 
@@ -108,6 +144,42 @@ def is_skinny_default_shape(
             or ((M > 8 and M <= 16 and N <= cu_num) and K <= 256)
         )
     )
+
+
+def _gfx942_decode_config(m, n, k):
+    # BF16, unscaled, row-major, 80 CUs. These rows apply to exact M only.
+    if n == 2560 and (
+        (k == 3072 and m in (2, 4, 6, 8, 12, 16)) or (k == 2560 and m in (6, 12))
+    ):
+        kid = 13
+    elif m in (6, 12) and (n, k) in (
+        (48, 2560),
+        (320, 10240),
+        (513, 2560),
+        (640, 2560),
+    ):
+        kid = 12
+    elif m in (6, 12) and (n, k) == (10240, 320):
+        return {
+            "libtype": "triton",
+            "kernelName": "triton",
+            "solidx": 0,
+            "triton_config": {
+                "BLOCK_SIZE_K": 64,
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "GROUP_SIZE_M": 1,
+                "NUM_KSPLIT": 1,
+                "SPLITK_BLOCK_SIZE": 320,
+                "cache_modifier": None,
+                "num_stages": 1,
+                "num_warps": 4,
+                "waves_per_eu": 0,
+            },
+        }
+    else:
+        return None
+    return {"libtype": "opus", "kernelName": "", "solidx": kid, "splitK": 0}
 
 
 def get_GEMM_A16W16_tuned_config(
@@ -160,6 +232,16 @@ def get_GEMM_A16W16_tuned_config(
             ),
             None,
         )
+        if (
+            gl is None
+            and gfx == "gfx942"
+            and cu_num == 80
+            and str(dtype) == str(otype) == "torch.bfloat16"
+            and not (
+                bias or scaleAB or bpreshuffle or os.getenv("AITER_CONFIG_GEMM_BF16")
+            )
+        ):
+            config = _gfx942_decode_config(M, N, K) or config
         if config is not None:
             if config["libtype"] == "flydsl":
                 flydsl_config = (
@@ -858,7 +940,14 @@ def triton_gemm(
         scale_a is None and scale_b is None and scale_c is None
     ), "Triton gemm_a16w16 does not support scaling yet"
     assert not bpreshuffle, "Triton gemm_a16w16 does not support bpreshuffle yet."
-    return gemm_a16w16(inp, weights, bias=bias, dtype=otype, y=out)
+    return gemm_a16w16(
+        inp,
+        weights,
+        bias=bias,
+        dtype=otype,
+        y=out,
+        config=config.get("triton_config") if config else None,
+    )
 
 
 solMap = {

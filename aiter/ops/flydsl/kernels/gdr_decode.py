@@ -601,6 +601,9 @@ def create_vk_gdr_mtp_kernel(
     # Unused here; a parameter so it joins the cache key.
     WAVES_PER_EU: int = 0,
     min_live_slot: int = 0,
+    separate_read: bool = False,
+    compact_record: bool = False,
+    record_pool_rows: int = 0,
 ):
     """Gated delta rule over a speculative draft window.
 
@@ -624,7 +627,9 @@ def create_vk_gdr_mtp_kernel(
     NO_STATE_WRITE = bool(disable_state_update)
     assert not TREE or SNAPSHOT, "the EAGLE tree is the snapshot mode's"
     assert not TREE or len(inter_strides) == 5, "tree needs a snapshot buffer"
-    SAVE_INTER = SNAPSHOT and len(inter_strides) == 5
+    SAVE_INTER = SNAPSHOT and len(inter_strides) == 5 and not compact_record
+    INDEXED_RECORD = record_pool_rows > 0
+    assert not INDEXED_RECORD or (compact_record and CHAIN and not TREE)
 
     # Only an f32 snapshot reloads exactly; a narrower one rounds.
     LOSSLESS_SNAPSHOT = TREE and "f32" in inter_dtype
@@ -762,7 +767,12 @@ def create_vk_gdr_mtp_kernel(
         if const_expr(CHAIN):
             token_slots = [_slot_at(t) for t in range_constexpr(seq_length)]
 
-        if const_expr(CHAIN):
+        if const_expr(CHAIN and separate_read):
+            read_view = _gview(inter_indices, None, (batch_size, 1), (1, 1))
+            read_slot = fx.Int32(
+                _load_vec(cp_i32, fx.slice(read_view, (b_i, None)), 1, fx.Int32)
+            )
+        elif const_expr(CHAIN):
             nacc_view = _gview(num_accepted, None, (batch_size, 1), (1, 1))
             read_token = (
                 fx.Int32(
@@ -851,6 +861,26 @@ def create_vk_gdr_mtp_kernel(
                 vec_shape,
                 (state_strides[1], state_strides[2], VALUES_PER_THREAD_K, 1),
             )
+
+        if const_expr(compact_record):
+            record_row = b_i
+            record_rows = batch_size
+            if const_expr(INDEXED_RECORD):
+                # CHAIN never consumes parent_tokens. The RTP adapter passes
+                # its stable request-owned replay-pool row through that operand.
+                record_index_view = _gview(parent_tokens, None, (batch_size, 1), (1, 1))
+                record_row = fx.Int32(_load_vec(cp_i32, fx.slice(record_index_view, (b_i, None)), 1, fx.Int32))
+                record_rows = record_pool_rows
+            record_view = _gview(inter_buffer, None,
+                (record_rows, seq_length, num_v_heads, 3, head_k_dim, 1),
+                (seq_length*num_v_heads*3*head_k_dim,
+                 num_v_heads*3*head_k_dim, 3*head_k_dim, head_k_dim, 1, 1))
+            cp_record = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+            cp_record_vec = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+            record_k_view = _gview(inter_buffer, None,
+                (record_rows, seq_length, num_v_heads, 3, head_k_dim//VALUES_PER_THREAD_K, VALUES_PER_THREAD_K),
+                (seq_length*num_v_heads*3*head_k_dim,
+                 num_v_heads*3*head_k_dim, 3*head_k_dim, head_k_dim, VALUES_PER_THREAD_K, 1))
 
         # One descriptor for the sequence's whole record: a step is a layout
         # dimension, since the window's own span stays well inside 32 bits.
@@ -1111,6 +1141,20 @@ def create_vk_gdr_mtp_kernel(
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         sq_vecs[ki] = sq_vecs[ki] * scale_vec
 
+                if const_expr(compact_record):
+                    def _record_key(_sq=sq_i, _decay=r_g, _keys=sk_vecs):
+                        for ki in range_constexpr(WARP_TILE_K_ITERS):
+                            kv = warp_k_vec_start + ki * WARP_TILE_K
+                            _store_vec(cp_record_vec,
+                                fx.slice(record_k_view, (record_row, _sq, hv_i, 0, kv//VALUES_PER_THREAD_K, None)),
+                                _keys[ki], VALUES_PER_THREAD_K, fx.Float32)
+                        if warp_k_vec_start == 0:
+                            _store_vec(cp_record,
+                                fx.slice(record_view, (record_row, _sq, hv_i, 2, 0, None)),
+                                _decay, 1, fx.Float32)
+                    if global_v_start == 0:
+                        _record_key()
+
                 dot_kq_vec = fx.Vector.from_elements(
                     [f32_0 for i in range_constexpr(VALUES_PER_THREAD_K)], fx.Float32
                 )
@@ -1179,8 +1223,15 @@ def create_vk_gdr_mtp_kernel(
 
                     if warp_k_vec_start == 0:
                         _write_q()
+                    if const_expr(compact_record):
+                        def _record_u(_u=v_new, _gv=global_v_i, _sq=sq_i):
+                            _store_vec(cp_record,
+                                fx.slice(record_view, (record_row, _sq, hv_i, 1, _gv, None)),
+                                _u, 1, fx.Float32)
+                        if warp_k_vec_start == 0:
+                            _record_u()
 
-                if const_expr(CHAIN):
+                if const_expr(CHAIN and not NO_STATE_WRITE and (not compact_record or sq_i == seq_length - 1)):
                     write_slot = token_slots[sq_i]
                     write_view = _state_at(write_slot)
 
@@ -1205,8 +1256,12 @@ def create_vk_gdr_mtp_kernel(
                                     state_num,
                                 )
 
-                    if write_slot >= min_live_slot:
-                        _checkpoint()
+                    if const_expr(compact_record):
+                        if (write_slot >= min_live_slot) & (write_slot != read_slot):
+                            _checkpoint()
+                    else:
+                        if write_slot >= min_live_slot:
+                            _checkpoint()
 
                 if const_expr(snapshot != "no"):
                     # The tree rereads a step when it walks to a child; nothing
@@ -1290,6 +1345,19 @@ def create_vk_gdr_mtp_kernel(
                     reload_parents=False,
                     snapshot="guarded" if SAVE_INTER else "no",
                 )
+            if const_expr(INDEXED_RECORD):  # noqa: SIM102 - specialize before the lane predicate
+                # Padding must not write reserved state/record row zero, and
+                # must not leave uninitialized values for downstream FP8 ops.
+                if read_slot < min_live_slot:
+                    for token in range_constexpr(seq_length):
+                        for vi in range_constexpr(WARP_TILE_V_ITERS):
+                            global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
+                            def _zero_output(_sq=token, _gv=global_v_i):
+                                _store_vec(cp_data,
+                                    fx.slice(out_view, (b_i, _sq, hv_i, _gv, None)),
+                                    f32_0.to(data_num), 1, data_num)
+                            if warp_k_vec_start == 0:
+                                _zero_output()
 
     @flyc.jit
     def launch_gdr_mtp_kernel(
