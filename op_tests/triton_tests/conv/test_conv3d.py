@@ -57,7 +57,7 @@ from op_tests.triton_tests.conv._helpers import (
     _winograd_tolerances,
     apply_activation,
     assert_weight_pack_cache_clear_is_scoped,
-    conv3d_padding_reference,
+    conv_padding_reference,
     dynamic_conv_tolerances,
 )
 
@@ -593,7 +593,10 @@ def test_conv3d_execution_rejects_cpu_tensors():
     x = torch.empty((1, 4, 3, 4, 4), dtype=torch.float16, device="cpu")
     w = torch.empty((4, 4, 1, 1, 1), dtype=torch.float16, device="cpu")
 
-    with pytest.raises(ValueError, match="conv3d input must be a CUDA/ROCm tensor"):
+    with pytest.raises(
+        ValueError,
+        match="conv3d input must be a CUDA/ROCm tensor, got input=cpu, weight=cpu, bias=None",
+    ):
         conv3d_general(x, w)
 
 
@@ -708,7 +711,7 @@ def test_padding_matches_reference(
         if api in ("conv3d", "conv3d_general", "conv3d_1x1x1")
         else {}
     )
-    expected = conv3d_padding_reference(
+    expected = conv_padding_reference(
         source.float(),
         weight.float(),
         bias.float(),
@@ -793,7 +796,7 @@ def test_padding_prepacked_input(api):
         actual = function(
             source, weight, padding=padding, padding_mode=mode, x_blocked=packed
         )
-        expected = conv3d_padding_reference(
+        expected = conv_padding_reference(
             source.float(), weight.float(), padding=padding, padding_mode=mode
         )
         tolerances = (
@@ -854,7 +857,11 @@ def test_padding_rejects_device_mismatch(monkeypatch, api, cpu_argument):
 
     monkeypatch.setattr(F, "pad", unexpected_pad)
     with pytest.raises(
-        ValueError, match="input, weight, and bias must be on the same device"
+        ValueError,
+        match=(
+            "input, weight, and bias must be on the same device, "
+            f"got input={source.device}, weight={weight.device}, bias={bias.device}"
+        ),
     ):
         getattr(conv3d_module, api)(
             source, weight, bias, padding=1, padding_mode="reflect"
