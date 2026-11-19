@@ -26,7 +26,7 @@ from aiter.ops import shuffle
 from aiter.ops.gemm_op_a8w8 import _get_mxfp8_bpreshuffle_config
 from aiter.ops.quant import per_group_quant_hip
 from aiter.ops.shuffle import shuffle_mxfp8_bpreshuffle_scale, shuffle_weight
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import assertAllclose, benchmark, checkAllclose, perftest
 
 # Shapes for a gfx950 without tuned rows: DeepSeek-V3 dense projections, ragged M included.
 DEFAULT_MNK_GFX950 = [
@@ -212,7 +212,7 @@ def test_fused_splitk(block, kernel_name, m, n, k):
     fused, us_fused = launch(kernel_name + "_fsk")
     assert reduces[kernel_name] > 0 and reduces[kernel_name + "_fsk"] == 0, reduces
     assert torch.equal(fused, unfused), f"{kernel_name}: fused != unfused at M={m}"
-    err = checkAllclose(ref, fused.float(), msg=f"M={m} N={n} K={k} fused: ")
+    err = assertAllclose(ref, fused.float(), msg=f"M={m} N={n} K={k} fused: ")
 
     out = torch.full((m, n), float("nan"), dtype=dtypes.bf16)
     entry(xq, w_shuf, x_scale, w_scale, out, kernel_name + "_fsk", **kw)

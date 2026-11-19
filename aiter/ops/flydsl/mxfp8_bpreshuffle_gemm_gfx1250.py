@@ -41,14 +41,17 @@ _MAX_SPLIT_K = 8
 def fused_splitk_ok(
     tile_m, tile_n, m_warp, n_warp, cluster_m, cluster_n, split_k
 ) -> bool:
-    """Whether the K splits of a tile can reduce in one cluster (fused split-K)."""
+    """Whether the K splits of a tile can reduce in one cluster (fused split-K).
+
+    The epilogue wraps peer stripes with ``& (split_k - 1)``, so only 2/4/8 splits qualify.
+    """
     waves, lanes_per_row = m_warp * n_warp, tile_n // 4
     rows_per_iter, reduce_m = waves * 32 // lanes_per_row, tile_m // split_k
     # The TDM stores of the peer rows (and of the reduced rows past split_k 2)
     # cut their rows evenly over the waves.
     tdm_rows = (tile_m - reduce_m, *(() if split_k == 2 else (reduce_m,)))
     return bool(
-        split_k > 1
+        split_k in (2, 4, 8)
         and tile_m % split_k == 0
         and cluster_m * cluster_n * split_k <= 16
         and waves * 32 % lanes_per_row == 0
