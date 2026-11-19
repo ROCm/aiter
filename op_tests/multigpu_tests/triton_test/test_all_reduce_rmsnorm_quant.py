@@ -32,17 +32,17 @@ SKIP = torch.cuda.device_count() < WORLD_SIZE or arch_info.get_arch() != "gfx125
 pytestmark = pytest.mark.skipif(SKIP, reason="needs 4 gfx1250 GPUs")
 
 
-def _inputs(tokens, rank, device):
+def _inputs(tokens, rank, device, hidden=HIDDEN):
     """This rank's x, the residual and the weight, and the fp32 references of
     residual_out and out. The 4 inputs are added in rank order, as in the kernel."""
     gen = torch.Generator(device=device).manual_seed(tokens)
-    shape = (tokens, HIDDEN)
+    shape = (tokens, hidden)
     xs = [
         torch.randn(shape, generator=gen, dtype=torch.bfloat16, device=device)
         for _ in range(WORLD_SIZE)
     ]
     residual = torch.randn(shape, generator=gen, dtype=torch.bfloat16, device=device)
-    w = torch.randn(HIDDEN, generator=gen, dtype=torch.bfloat16, device=device)
+    w = torch.randn(hidden, generator=gen, dtype=torch.bfloat16, device=device)
     weight = 0.1 * w  # a Gemma weight: 1 + weight is near 1
     s = xs[0].float() + xs[1].float() + xs[2].float() + xs[3].float() + residual.float()
     out = s * torch.rsqrt(s.pow(2).mean(-1, keepdim=True) + EPS) * (1 + weight.float())
@@ -133,30 +133,45 @@ def test_all_reduce_rmsnorm_quant():
     assert not failures, "\n".join(failures[:20])
 
 
-def _dispatch_worker(rank, init_method):
+def _dispatch_worker(rank, init_method, hidden=HIDDEN):
     os.environ["AITER_GLUON_FUSED_AR"] = "1"  # read when the TP communicator is made
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     aiter.init_dist_env(WORLD_SIZE, rank, distributed_init_method=init_method)
     tp = get_tp_group()
     failures = []
+    fused_calls_before = None
     try:
         if tp.device_communicator.gluon_ar is None:
             failures.append(f"rank {rank}: the TP communicator has no Gluon inboxes")
-        for tokens in (1, 8, 128, 1024, 2048):  # 2048 rows at hidden 2048 are 8 MiB
-            x, residual, weight, *ref = _inputs(tokens, rank, device)
+        else:
+            fused_calls_before = tp.device_communicator.gluon_ar[1][:-1].clone()
+        fused_tokens = (1, 8, 128, 1024, 2048) if hidden == HIDDEN else (1, 8, 128, 256)
+        for tokens in fused_tokens:
+            x, residual, weight, *ref = _inputs(tokens, rank, device, hidden)
             outs = tensor_model_parallel_fused_allreduce_rmsnorm(
                 x, residual, weight, EPS, gemma_norm=True
             )
-            name = f"rank {rank} dispatch tokens {tokens}"
+            name = f"rank {rank} dispatch hidden {hidden} tokens {tokens}"
             failures += _compare(name, outs, *ref, tp.device_group)
+        if fused_calls_before is not None:
+            fused_calls = tp.device_communicator.gluon_ar[1]
+            if torch.equal(fused_calls_before, fused_calls[:-1]):
+                failures.append(
+                    f"rank {rank}: hidden {hidden} did not use the Gluon fused path"
+                )
+            if fused_calls[-1].item():
+                failures.append(
+                    f"rank {rank}: {fused_calls[-1].item()} polls timed out"
+                )
 
         # The plain all-reduce, up to 4 MiB. Bit-exact only on the Gluon path.
         if tp.device_communicator.gluon_ar_plain is None:
             failures.append(f"rank {rank}: no Gluon inboxes for the plain all-reduce")
-        for tokens in (1, 8, 128, 1024):  # 1024 rows at hidden 2048 are 4 MiB
+        plain_tokens = (1, 8, 128, 1024) if hidden == HIDDEN else (1, 8, 128, 256)
+        for tokens in plain_tokens:
             gen = torch.Generator(device=device).manual_seed(1000 + tokens)
-            shape = (tokens, HIDDEN)
+            shape = (tokens, hidden)
             xs = [
                 torch.randn(shape, generator=gen, dtype=torch.bfloat16, device=device)
                 for _ in range(WORLD_SIZE)
@@ -165,7 +180,9 @@ def _dispatch_worker(rank, init_method):
             out = tensor_model_parallel_all_reduce(xs[rank])
             bad = out.view(torch.int16) != ref.to(torch.bfloat16).view(torch.int16)
             if bool(bad.any()):
-                failures.append(f"rank {rank} plain dispatch tokens {tokens}: wrong")
+                failures.append(
+                    f"rank {rank} plain hidden {hidden} tokens {tokens}: wrong"
+                )
     finally:
         aiter.destroy_dist_env()
     return failures
@@ -183,8 +200,22 @@ def test_fused_allreduce_rmsnorm_dispatch():
     assert not failures, "\n".join(failures[:20])
 
 
+def test_fused_allreduce_rmsnorm_dispatch_hidden_6144():
+    ensure_spawn_method()
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    with mp.Pool(processes=WORLD_SIZE) as pool:
+        results = [
+            pool.apply_async(_dispatch_worker, (rank, init_method, 6144))
+            for rank in range(WORLD_SIZE)
+        ]
+        failures = [f for r in results for f in r.get(timeout=1800)]
+    assert not failures, "\n".join(failures[:20])
+
+
 if __name__ == "__main__":  # CI runs the multi-GPU tests as scripts
     if SKIP:
         logger.warning("test_all_reduce_rmsnorm_quant skipped: needs 4 gfx1250 GPUs")
     else:
         test_all_reduce_rmsnorm_quant()
+        test_fused_allreduce_rmsnorm_dispatch()
+        test_fused_allreduce_rmsnorm_dispatch_hidden_6144()
