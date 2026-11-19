@@ -45,11 +45,14 @@ from aiter.ops.mha_v4_quant import (
     mxfp4_v_view,
     mxfp6_k_view,
     mxfp6_k_view_hd256,
+    mxfp8_k_view_hd256,
     quantize_fp8,
     quantize_fp8_rotated,
     quantize_int8,
     quantize_mxfp8_k,
+    quantize_mxfp8_k_hd256,
     quantize_mxfp8_q,
+    quantize_mxfp8_q_hd256,
     quantize_v_fp8,
     quantize_v_mxfp4_fp6_p,
     quantize_v_mxfp6,
@@ -110,9 +113,16 @@ def _production_quantize_mxfp4(query, key, value, softmax_scale):
 
 
 def _production_quantize_mxfp8(query, key, value, softmax_scale):
-    q_fp8, q_scale = quantize_mxfp8_q(query, mha_v4_q_multiplier(softmax_scale))
-    k_fp8, k_scale = quantize_mxfp8_k(key)
+    multiplier = mha_v4_q_multiplier(softmax_scale)
     v_fp8, v_scale = quantize_fp8(value)
+    if key.shape[-1] == MHA_V4_HD256:
+        batch, sequence, heads, _ = key.shape
+        q_fp8, q_scale = quantize_mxfp8_q_hd256(query, multiplier)
+        k_records, k_scale = quantize_mxfp8_k_hd256(key)
+        k_fp8 = mxfp8_k_view_hd256(k_records, batch, sequence, heads)
+        return q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale
+    q_fp8, q_scale = quantize_mxfp8_q(query, multiplier)
+    k_fp8, k_scale = quantize_mxfp8_k(key)
     return q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale
 
 

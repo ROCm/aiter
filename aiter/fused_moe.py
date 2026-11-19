@@ -70,9 +70,11 @@ from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
 )
+from aiter.plugin import route as _route
 from aiter.presorted_moe import (  # noqa: F401  register_presorted_moe is public
     aux_sort_capacity,
     bytes_overlap,
+    drop_presort_after,
     drop_presort_on_error,
     match_presorted_moe,
     pop_presorted_moe,
@@ -1193,7 +1195,7 @@ def resolve_activation_dtype(
     return q_dtype_a
 
 
-@drop_presort_on_error
+@drop_presort_after
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -1618,6 +1620,7 @@ def _can_use_bf16_g1u1_small_m_direct(
 
 
 @torch_compile_guard(gen_fake=fused_moe_fake)
+@_route(op="fused_moe", version=1)
 def fused_moe_(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -1662,6 +1665,59 @@ def fused_moe_(
     herd_routed_scaling_factor: float = 1.0,
     deterministic: bool = False,
 ) -> torch.Tensor:
+    """Route each token to its top-k experts, run both expert projections and
+    combine them, weighted by ``topk_weight``.
+
+    Returns a new ``[M, model_dim]`` tensor of ``dtype`` (``hidden_states``'
+    dtype when None), ``M = topk_ids.shape[0]``, ``model_dim = w2.shape[1]``.
+    Given ``output`` -- contiguous, of exactly that shape, dtype and device, not
+    overlapping ``hidden_states`` -- the result is written into it and
+    ``output`` itself is returned. Nothing else is written through the
+    arguments, except under the stage-2 scatter below.
+
+    This is the layer beneath the public ``fused_moe``, whose signature stays
+    as callers know it. That function sends a call with shared experts (any
+    ``shared_*``) to FHMoE without coming here, turns ``block_size_M=None``
+    into -1 and unpacks ``stage2_scatter`` into the ``ep_*`` fields. What
+    arrives here, for a provider:
+
+    * ``activation`` and ``quant_type`` are ints, the ``.value`` of
+      ``ActivationType`` and ``QuantType``; so is ``quant_type_a`` when given.
+    * ``block_size_M=-1`` leaves the tile to AITER; any other value pins it.
+      ``moe_sorting_dispatch_policy`` only schedules AITER's own sort.
+    * ``ep_source_token_map`` set is expert parallelism's stage-2 scatter,
+      described by the other ``ep_*`` fields (all 0 without it): GEMM2
+      P2P-writes the route-weighted rows into the peers' combine buffers, and
+      the returned tensor is an uninitialised placeholder that does not hold
+      the result. ``output`` is refused with it. A provider that does not do
+      that write must decline these calls.
+    * The activation dtype is not in the signature. AITER chooses it from the
+      weights, ``activation``, ``gate_mode`` and the token count M, and the
+      environment moves it: ``AITER_SITUV2_A8W4`` / ``AITER_SITUV2_A4W4``
+      (fp8 / fp4 SiTUv2 activations, bf16 otherwise),
+      ``AITER_BF16_FP8_MOE_BOUND`` (bf16 below that many tokens, fp8 from it)
+      and ``GPTOSS_SWIGLU_MXFP4_BF16_BOUND`` (bf16 below, fp4 from it).
+      ``resolve_activation_dtype`` answers it as this op does, and
+      ``quant_dtype_a`` overrides it.
+    * ``splitk`` is the caller's split-K request; 0 and 1 are no split. AITER
+      reads it here only to keep its gfx1201 small-M kernel off split calls,
+      and it moves no more than the order of the K sums, so a provider may
+      ignore it.
+    * ``swiglu_limit`` of None, 0 (vLLM's spelling) or inf is no clamp for
+      SiLU.
+    * ``deterministic=True`` asks for a result bitwise independent of the
+      batch and of the run (see the public ``fused_moe``). A provider whose
+      reduction order is not fixed must decline it.
+    * ``herd_topk`` (gfx1250) says ``topk_ids`` and ``topk_weight`` hold K+1
+      HERD candidates per token, scaled by ``herd_routed_scaling_factor``;
+      with ``herd_topk=0`` that factor is unused.
+
+    A caller may hand the next call on its thread a precomputed sort with
+    ``register_presorted_moe``. The registration is consumed below this route,
+    on every native call, and the public ``fused_moe`` clears it when the call
+    ends, so a call that a provider serves leaves none behind. A provider may
+    ignore it. A caller of this layer directly gets no such clean-up.
+    """
     stage2_scatter = None
     if ep_source_token_map is not None:
         stage2_scatter = Stage2ScatterContext(
@@ -5623,27 +5679,22 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
-    # Runtime SiLU clamping is supported only by the non-split CK stage-1 epilogue,
-    # so it must reject ASM 1-stage and FlyDSL whole-graph rows before they resolve.
+    # Runtime SiLU clamping is supported only by the non-split CK stage-1 epilogue
+    # and, for gfx942 per-token FP8, the FlyDSL backend, so it must reject ASM
+    # 1-stage and other FlyDSL whole-graph rows before they resolve.
     clamp_silu_limit = (
         bool(swiglu_limit)
         and q_type in RUNTIME_SILU_LIMIT_QUANT_TYPES
         and activation == ActivationType.Silu
     )
-    if clamp_silu_limit and q_type != QuantType.per_1x128:
-        if q_dtype_w != dtypes.fp8 or q_dtype_a != dtypes.fp8:
-            raise NotImplementedError(
-                f"fused_moe cannot apply swiglu_limit={swiglu_limit!r} for {q_type} "
-                f"SiLU with weight dtype {q_dtype_w} / activation dtype {q_dtype_a}; "
-                "the runtime-limit CK instances are FP8 only."
-            )
-        if inter_dim % 128 != 0:
-            raise NotImplementedError(
-                f"fused_moe cannot apply swiglu_limit={swiglu_limit!r} for {q_type} "
-                f"SiLU at inter_dim={inter_dim}; the runtime-limit CK stage1 needs a "
-                "multiple of 128."
-            )
-    if clamp_silu_limit and cfg is not None:
+    flydsl_gfx942_row = (
+        gfx == "gfx942"
+        and q_type == QuantType.per_Token
+        and q_dtype_w == dtypes.fp8
+        and cfg is not None
+        and str(cfg.get("kernelName1", "")).startswith("impl__flydsl_gfx942__")
+    )
+    if clamp_silu_limit and cfg is not None and not flydsl_gfx942_row:
         cfg_ksplit = int(cfg.get("ksplit", 0) or 0)
         if (
             cfg.get("run_1stage", False)
@@ -5751,6 +5802,20 @@ def get_2stage_cfgs(
             ksplit,
             full_impl=full_impl,
         )
+    # No FlyDSL backend took the clamp, so CK stage 1 must.
+    if clamp_silu_limit and q_type != QuantType.per_1x128:
+        if q_dtype_w != dtypes.fp8 or q_dtype_a != dtypes.fp8:
+            raise NotImplementedError(
+                f"fused_moe cannot apply swiglu_limit={swiglu_limit!r} for {q_type} "
+                f"SiLU with weight dtype {q_dtype_w} / activation dtype {q_dtype_a}; "
+                "the runtime-limit CK instances are FP8 only."
+            )
+        if inter_dim % 128 != 0:
+            raise NotImplementedError(
+                f"fused_moe cannot apply swiglu_limit={swiglu_limit!r} for {q_type} "
+                f"SiLU at inter_dim={inter_dim}; the runtime-limit CK stage1 needs a "
+                "multiple of 128."
+            )
     if config_file is not None and (cfg is None or bypass_tuned_config):
         raise NotImplementedError(
             "The dedicated FHMoE path requires an exact tuned config row for "

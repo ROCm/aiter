@@ -327,7 +327,7 @@ def test_num_local_tokens_dispatch():
     bypassed = kernel(qwen, 1024, 10.0, True, bypass="1")
     assert bypassed == flydsl("64_128_128_True:default:0")
     # Not under EP, nor without an active clamp (vLLM sends 0.0 for none).
-    assert kernel(v41, 1, 10.0, True, is_ep=True) is None
+    assert kernel(qwen, 1, 10.0, True, is_ep=True) is None
     for limit in (None, 0.0):
         assert kernel(v41, 1, limit, True) is None
 
