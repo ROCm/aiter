@@ -92,7 +92,7 @@ RCCL = "rccl"
 # implementation, so a run without one of them does not repaint the rest.
 # Unknown names take the slots after every group's, in sorted order.
 _SLOT_GROUPS = (
-    ("fly_mesh", "fly_ring"),
+    ("fly_mesh", "fly_ring", "fly_hier"),
     (
         "fused bf16",
         "fused mxfp4_qk_mxfp4_v",
@@ -102,7 +102,12 @@ _SLOT_GROUPS = (
     ),
 )
 _KNOWN_IMPLS = tuple(i for group in _SLOT_GROUPS for i in group)
-_LABELS = {"fly_mesh": "FlyDSL mesh", "fly_ring": "FlyDSL ring", RCCL: "RCCL"}
+_LABELS = {
+    "fly_mesh": "FlyDSL mesh",
+    "fly_ring": "FlyDSL ring",
+    "fly_hier": "FlyDSL hier",
+    RCCL: "RCCL",
+}
 # The dataviz reference categorical palette (light), in its fixed order.
 _PALETTE = (
     "#2a78d6",
@@ -155,6 +160,7 @@ def _run_allreduce(tp: int, args) -> list[dict]:
         reps=args.reps or fab.DEFAULT_REPS,
         rounds=args.rounds or fab.DEFAULT_ROUNDS,
         rccl_backend=args.rccl_backend,
+        hier_handshake=args.hier_handshake,
     )
     tokens_of = {f"{m}x{h}": m for m, h in cases}
     return [
@@ -614,7 +620,17 @@ def _parser() -> argparse.ArgumentParser:
     )
     ar.add_argument("--hidden", type=int, default=DEFAULT_HIDDEN)
     ar.add_argument(
-        "--algorithms", nargs="+", choices=("mesh", "ring"), default=["mesh", "ring"]
+        "--algorithms",
+        nargs="+",
+        choices=("mesh", "ring", "hier"),
+        default=["mesh", "ring"],
+        help="hier needs GPUs that split into two socket groups (TP8)",
+    )
+    ar.add_argument(
+        "--hier-handshake",
+        choices=("flag", "lamport"),
+        default=None,
+        help="handshake of the hier algorithm (default: the engine's, flag)",
     )
     ar.add_argument(
         "--reps", type=int, default=None, help="default: flydsl_allreduce_bench's"

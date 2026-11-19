@@ -68,6 +68,7 @@ def _worker(
     rccl_backend,
     hier_super_tile=None,
     hier_codecs=None,
+    hier_handshake=None,
 ):
     import flydsl_allreduce_bench as fab
     import test_flydsl_quick_allreduce as qt
@@ -93,6 +94,8 @@ def _worker(
             kw.update(super_tile=hier_super_tile, block=512, grid_cap=128)
         if kw["algorithm"] == "hier" and hier_codecs is not None:
             kw["rs_codec"], kw["x_codec"], kw["ag_codec"] = hier_codecs
+        if kw["algorithm"] == "hier" and hier_handshake is not None:
+            kw["handshake"] = hier_handshake
         try:
             engines[f"fly_{a}"] = qt._engine(rank, world_size, gloo, device, kw)
         except (NoPolicyError, ValueError) as e:
@@ -155,6 +158,8 @@ def _worker(
 
 
 def main(argv=None) -> int:
+    from aiter.ops.flydsl.allreduce_policy import HANDSHAKES
+
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -186,6 +191,12 @@ def main(argv=None) -> int:
         default=None,
         metavar="RS,X,AG",
         help="pin every hier variant's wire formats, e.g. int5,int5,int4",
+    )
+    p.add_argument(
+        "--hier-handshake",
+        choices=HANDSHAKES,
+        default=None,
+        help="handshake of every hier variant (default: the engine's, flag)",
     )
     p.add_argument(
         "--reps", type=int, default=None, help="default: flydsl_allreduce_bench's"
@@ -225,6 +236,7 @@ def main(argv=None) -> int:
         rccl_backend=args.rccl_backend,
         hier_super_tile=args.hier_super_tile,
         hier_codecs=args.hier_codecs,
+        hier_handshake=args.hier_handshake,
     )
     header = [
         f"- device: {torch.cuda.get_device_name(0)}",
