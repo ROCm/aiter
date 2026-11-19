@@ -105,7 +105,22 @@ def is_merge_commit(sha: str) -> bool:
 
 
 def ensure_origin_main() -> None:
-    run_cmd(["git", "fetch", "origin", "main"], timeout=180)
+    run_cmd(["git", "fetch", "--no-tags", "--depth=1", "origin", "main"], timeout=180)
+
+
+def has_commit(sha: str) -> bool:
+    proc = run_cmd(["git", "cat-file", "-e", f"{sha}^{{commit}}"], check=False, timeout=60)
+    return proc.returncode == 0
+
+
+def fetch_commit(sha: str) -> bool:
+    if has_commit(sha):
+        return True
+    run_cmd(["git", "fetch", "--no-tags", "--depth=2", "origin", sha], check=False, timeout=180)
+    if has_commit(sha):
+        return True
+    run_cmd(["git", "fetch", "--no-tags", "origin", sha], check=False, timeout=180)
+    return has_commit(sha)
 
 
 def remote_branch_exists(branch: str) -> bool:
@@ -255,10 +270,6 @@ def main() -> int:
         append_summary(render_skip("culprit report is not high-confidence auto-revert ready", culprit, sha))
         return 0
 
-    if is_merge_commit(sha):
-        append_summary(render_skip("merge commits are not auto-reverted yet", culprit, sha))
-        return 0
-
     duplicate = None if args.dry_run else open_revert_pr_for_sha(args.repo, sha)
     if duplicate:
         append_summary(
@@ -270,7 +281,11 @@ def main() -> int:
 
     run_id = target_run_id(evidence)
     branch = f"aiter-bot/revert-{sha[:12]}-run-{run_id}"
-    if args.dry_run:
+
+    if args.dry_run and has_commit(sha):
+        if is_merge_commit(sha):
+            append_summary(render_skip("merge commits are not auto-reverted yet", culprit, sha))
+            return 0
         append_summary(
             "## Aiter Auto-Revert\n\n"
             "Dry run passed. The report is high-confidence auto-revert ready, "
@@ -279,6 +294,21 @@ def main() -> int:
         return 0
 
     ensure_origin_main()
+    if not fetch_commit(sha):
+        append_summary(render_skip("culprit commit could not be fetched on the revert runner", culprit, sha))
+        return 0
+    if is_merge_commit(sha):
+        append_summary(render_skip("merge commits are not auto-reverted yet", culprit, sha))
+        return 0
+
+    if args.dry_run:
+        append_summary(
+            "## Aiter Auto-Revert\n\n"
+            "Dry run passed. The report is high-confidence auto-revert ready, "
+            f"`{sha}` is not a merge commit, and the script would create branch `{branch}`."
+        )
+        return 0
+
     if remote_branch_exists(branch):
         append_summary(
             "## Aiter Auto-Revert\n\n"
