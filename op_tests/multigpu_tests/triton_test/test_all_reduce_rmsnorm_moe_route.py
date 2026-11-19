@@ -23,8 +23,9 @@ from aiter.test_common import ensure_spawn_method
 WORLD_SIZES = [2, 4, 8]
 EPS = 1e-6
 # hidden, experts, topk, fp32 router, scoring, bias, groups, topk groups, gemma, quant,
-# routed scale, renormalize, token counts. The counts cover the one-shot and the two-shot
-# protocol, and counts that are not a multiple of the world size.
+# routed scale, renormalize, block size, residual, token counts. The counts cover the
+# one-shot and the two-shot protocol, and counts that are not a multiple of the world size.
+# More than 256 experts keep the selection values in LDS.
 SHAPES = [
     (
         6144,
@@ -39,11 +40,78 @@ SHAPES = [
         True,
         2.0,
         True,
+        16,
+        True,
         [1, 3, 8, 24, 64, 130],
     ),
-    (7168, 256, 8, False, "sigmoid", True, 8, 4, False, True, 2.5, True, [2, 16, 61]),
-    (4096, 128, 8, False, "softmax", False, 1, 1, False, False, 1.0, True, [5, 40]),
-    (2880, 128, 4, True, "softmax", False, 1, 1, False, False, 1.0, False, [4, 33]),
+    (
+        7168,
+        256,
+        8,
+        False,
+        "sigmoid",
+        True,
+        8,
+        4,
+        False,
+        True,
+        2.5,
+        True,
+        32,
+        True,
+        [2, 16, 61],
+    ),
+    (
+        4096,
+        128,
+        8,
+        False,
+        "softmax",
+        False,
+        1,
+        1,
+        False,
+        False,
+        1.0,
+        True,
+        64,
+        False,
+        [5, 40],
+    ),
+    (
+        2880,
+        128,
+        4,
+        True,
+        "softmax",
+        False,
+        1,
+        1,
+        False,
+        False,
+        1.0,
+        False,
+        128,
+        True,
+        [4, 33],
+    ),
+    (
+        2048,
+        384,
+        8,
+        True,
+        "sigmoid",
+        True,
+        8,
+        4,
+        True,
+        True,
+        1.0,
+        True,
+        16,
+        False,
+        [3, 50],
+    ),
 ]
 MAX_TOKENS = 192
 F32_TINY = torch.finfo(torch.float32).tiny
@@ -55,11 +123,13 @@ pytestmark = pytest.mark.skipif(SKIP, reason="needs gfx950")
 def _reference_norm(parts, residual, weight, gemma, num_warps):
     """h, residual out, normed, x_q and x_scale on the CPU. The CPU gives IEEE fp32 division
     and square root, and the sum of squares has the order of the kernel."""
-    tokens, hidden = residual.shape
+    tokens, hidden = parts[0].shape
     h = parts[0].float()
     for p in parts[1:]:
         h = h + p.float()
-    s = h.to(torch.bfloat16).float() + residual.float()
+    s = h.to(torch.bfloat16).float()
+    if residual is not None:
+        s = s + residual.float()
     res_out = s.to(torch.bfloat16)
     nv = hidden // 8
     v_ = -(-nv // (64 * num_warps))
@@ -140,7 +210,8 @@ def _bytes_differ(a, b):
 
 def _check(out, ref, shape, residual_ok, failures, tag):
     """Compares the outputs of one call with the reference."""
-    hidden, e, k, _, scoring, _, groups, topk_group, _, quant, scale, renorm, _ = shape
+    hidden, e, k, _, scoring, _, groups, topk_group, _, quant, scale, renorm, *_ = shape
+    bs = shape[12]
     res_out, y, x_q, x_s, logits, bias = ref
     bad = _bytes_differ(out["residual_out"], res_out) + _bytes_differ(out["normed"], y)
     if quant:
@@ -161,14 +232,14 @@ def _check(out, ref, shape, residual_ok, failures, tag):
     if same.any() and ((w_s - w_r_s).abs() > 1e-5 * w_r_s.abs() + 1e-7).any():
         failures.append(f"{tag}: top-k weights differ")
     sids, sw, seids, nv, _ = moe_sorting(
-        out["topk_ids"], out["topk_weights"], e, hidden, torch.bfloat16, block_size=16
+        out["topk_ids"], out["topk_weights"], e, hidden, torch.bfloat16, block_size=bs
     )
     n = int(nv[0])
     if not (
         torch.equal(nv, out["num_valid_ids"])
         and torch.equal(sids[:n], out["sorted_ids"][:n])
         and torch.equal(sw[:n], out["sorted_weights"][:n])
-        and torch.equal(seids[: n // 16], out["sorted_expert_ids"][: n // 16])
+        and torch.equal(seids[: n // bs], out["sorted_expert_ids"][: n // bs])
     ):
         failures.append(f"{tag}: the sort differs from moe_sorting")
     if not bool((out["moe_buf"] == 0).all()):
@@ -183,18 +254,25 @@ def _inputs(shape, tokens, seed, rank, device, group, weights, num_warps):
     x = torch.randn(
         (tokens, hidden), generator=gen, dtype=torch.float32, device=device
     ).to(torch.bfloat16)
-    gen.manual_seed(1000 * seed + 999)
-    residual = torch.randn(
-        (tokens, hidden), generator=gen, dtype=torch.float32, device=device
-    ).to(torch.bfloat16)
+    residual = None
+    if shape[13]:
+        gen.manual_seed(1000 * seed + 999)
+        residual = torch.randn(
+            (tokens, hidden), generator=gen, dtype=torch.float32, device=device
+        ).to(torch.bfloat16)
     if tokens > 2:  # a zero row: all-zero groups, rstd = 1 / sqrt(eps)
         x[1] = 0
-        residual[1] = 0
+        if residual is not None:
+            residual[1] = 0
     parts = [torch.empty_like(x) for _ in range(dist.get_world_size(group))]
     dist.all_gather(parts, x, group=group)
     norm_w, router_w, bias = weights
     res_out, y, x_q, x_s = _reference_norm(
-        [p.cpu() for p in parts], residual.cpu(), norm_w.cpu(), shape[8], num_warps
+        [p.cpu() for p in parts],
+        residual.cpu() if residual is not None else None,
+        norm_w.cpu(),
+        shape[8],
+        num_warps,
     )
     logits = y.double() @ router_w.cpu().double().T
     ref = (res_out, y, x_q, x_s, logits, bias.cpu() if bias is not None else None)
@@ -203,7 +281,7 @@ def _inputs(shape, tokens, seed, rank, device, group, weights, num_warps):
 
 def _call(x, residual, weights, shape, comm, out=None):
     norm_w, router_w, bias = weights
-    _, _, _, _, scoring, _, groups, topk_group, gemma, quant, scale, renorm, _ = shape
+    _, _, _, _, scoring, _, groups, topk_group, gemma, quant, scale, renorm, *_ = shape
     return fused_all_reduce_rmsnorm_moe_route(
         x,
         residual,
@@ -219,6 +297,7 @@ def _call(x, residual, weights, shape, comm, out=None):
         topk_group=topk_group,
         gemma=gemma,
         quant=quant,
+        block_size=shape[12],
         out=out,
     )
 
@@ -230,7 +309,7 @@ def _ranks_agree(ids, group):
 
 
 def _check_shape(rank, device, tp, shape, failures):
-    hidden, e, k, fp32, _, has_bias, _, _, gemma, _, _, _, token_counts = shape
+    hidden, e, k, fp32, _, has_bias, _, _, gemma, *_, token_counts = shape
     group = tp.device_group
     gen = torch.Generator(device=device).manual_seed(5)
     norm_w = 0.1 * torch.randn(
@@ -312,7 +391,7 @@ def _check_graph(rank, device, tp, comm, shape, weights, failures, tag):
         ]
         for rep in range(3)
     ]
-    static = [(x.clone(), r.clone()) for x, r, _ in data[0]]
+    static = [(x.clone(), r if r is None else r.clone()) for x, r, _ in data[0]]
     bufs = [
         torch.ones((t, shape[0]), dtype=torch.bfloat16, device=device) for t in sizes
     ]
@@ -327,7 +406,8 @@ def _check_graph(rank, device, tp, comm, shape, weights, failures, tag):
     for rep in range(3):
         for (x, r), d, b in zip(static, data[rep], bufs):
             x.copy_(d[0])
-            r.copy_(d[1])
+            if r is not None:
+                r.copy_(d[1])
             b.fill_(1)
         torch.cuda.synchronize()
         dist.barrier(group=tp.cpu_group)
