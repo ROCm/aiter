@@ -220,6 +220,7 @@ M,N,K,q_dtype_w
 128,1280,6144,torch.float8_e4m3fn
 136,1280,6144,torch.float8_e4m3fn
 152,1280,6144,torch.float8_e4m3fn
+160,1280,6144,torch.float8_e4m3fn
 168,1280,6144,torch.float8_e4m3fn
 184,1280,6144,torch.float8_e4m3fn
 192,1280,6144,torch.float8_e4m3fn
