@@ -9,8 +9,8 @@ values when it is tuned.
 Every gfx1250 family has a `DEFAULT.json` here. Shape-specific files
 (`<CONFIG_NAME>-N=...-K=....json`) are not copied.
 
-- Bucketed tables keep only the `"any"` entry (one per section for
-  unified_attention, the `bm*_any` entries for Gluon MoE), except:
+- Bucketed tables keep only the `"any"` entry (the `bm*_any` entries for
+  Gluon MoE), except:
   - fused_sigmoid_mul also keeps `"strided"`.
   - afp4wfp4 preshuffled also keeps the small-M entries, needed for M < 32.
   - Gluon quant also keeps one bucket key, because the loader reads the axis
@@ -19,3 +19,5 @@ Every gfx1250 family has a `DEFAULT.json` here. Shape-specific files
 - Tables keyed by kernel variant (attention, KDA, grouped GEMM,
   block_cat_fused) are exact copies, because the kernels look up every key by
   name.
+- These are exact copies, because `"any"` alone breaks them:
+  - unified_attention (Triton and Gluon): some shapes give wrong results.
