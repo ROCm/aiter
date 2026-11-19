@@ -246,9 +246,7 @@ All weight and scale shuffles are in `utils/shuffle.py`. Flag:
   A device helper that you cannot launch alone does not need a `repr`.
 - Flag a split-K kernel with its own reduce kernel. Use
   `_gemm_splitk_reduce_kernel` or `_batched_gemm_splitk_reduce_kernel` from
-  `_triton_kernels/common/splitk_reduce.py`. For split-K in one launch, use
-  `_tile_on_xcd` and `_sum_splits_on_xcd` from the same file, with the
-  counters and partials from `utils/fused_splitk.py`.
+  `_triton_kernels/common/splitk_reduce.py`.
 - Flag a kernel that tests, benchmarks or other code import or launch
   directly. Only its wrapper launches it. Flag a new kernel without a public
   wrapper.
