@@ -714,13 +714,22 @@ def compile_gemm_fp8_8wave(
         # Initialize the pending P scales once, then let range carry updates.
         fifo_scale_a_1 = Vec.filled(PHASE_M_REP, 0.0, fx.Float32)
         fifo_scale_b_1 = fx.Float32(0)
-        # Rotated TL[s0] reads of the first tick: issued at the end of the
-        # previous iteration (same barrier period), ahead of the loop latch.
-        lds_rd_At(0, 0)
-        pre_scale_a = lds_rd_scale_a(0, 0, 0)
-        pre_scale_b = load_scale_b(ki=fx.Int32(0))
-        async_copy_Ab(lds_idx=1, ki=fx.Int32(1))
-        rocdl.sched_barrier(0)
+
+        def prefetch_first_phase(ki):
+            """Issue the TL s0 loads of even tile ki early.
+
+            Called before the loop and at the end of each iteration, so the
+            loads overlap the previous phase's MFMAs instead of stalling TL s0.
+            Returns TL s0's ScaleA (VGPRs) and ScaleB (SGPRs).
+            """
+            lds_rd_At(0, 0)
+            scale_a = lds_rd_scale_a(0, 0, 0)
+            rocdl.sched_barrier(0)
+            scale_b = load_scale_b(ki=ki)
+            async_copy_Ab(lds_idx=1, ki=ki + 1)
+            return scale_a, scale_b
+
+        pre_scale_a, pre_scale_b = prefetch_first_phase(fx.Int32(0))
 
         for kidx in range(0, num_tiles, 2):
             fifo_scale_a_0 = Vec.filled(PHASE_M_REP, 0.0, fx.Float32)
@@ -842,11 +851,8 @@ def compile_gemm_fp8_8wave(
                     )
                     end_compute_phase()
 
-            lds_rd_At(0, 0)
-            pre_scale_a = lds_rd_scale_a(0, 0, 0)
-            rocdl.sched_barrier(0)
-            pre_scale_b = load_scale_b(ki=kiter + 2)
-            async_copy_Ab(lds_idx=1, ki=kiter + 3)
+            # The last iteration's prefetch reads past K; nothing consumes it.
+            pre_scale_a, pre_scale_b = prefetch_first_phase(kiter + 2)
 
         c_store_rsrc = rocdl.get_buffer_rsrc(fx.get_iter(C))
         bC_tr = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, 0, 1]
