@@ -27,7 +27,7 @@ TILE_K = 128
 WAVE = 32
 LDS_PAD_A = 16
 NUM_BUFFERS = 2
-SUPPORTED_TILE_N = (16, 32, 64, 128)
+SUPPORTED_TILE_N = (32, 64, 128)
 
 
 @flyc.jit
@@ -56,13 +56,18 @@ def launch_gemm_a8w8_smallm_1x32(
     independent of workgroup arrival order.
     """
 
-    assert num_waves in (1, 2), f"num_waves must be 1 or 2, got {num_waves}"
+    assert (tile_n, num_waves) in (
+        (32, 1),
+        (32, 2),
+        (64, 1),
+        (64, 2),
+        (128, 1),
+        (128, 2),
+        (128, 4),
+    ), f"unsupported tile/wave pair {tile_n}/{num_waves}"
     assert split_k in (1, 2, 4, 8), f"split_k must be 1/2/4/8, got {split_k}"
     assert tile_n in SUPPORTED_TILE_N, (
         f"tile_n must be one of {SUPPORTED_TILE_N}, got {tile_n}"
-    )
-    assert tile_n >= 16 * num_waves, (
-        f"tile_n={tile_n} cannot give {num_waves} waves a 16-column WMMA tile"
     )
     block = num_waves * WAVE
     n_rep = (tile_n // 16) // num_waves

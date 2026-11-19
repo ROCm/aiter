@@ -406,7 +406,15 @@ def test_gfx1250_group32_bpreshuffle_route(monkeypatch, w_rows):
 
 @pytest.mark.parametrize(
     "tile_n,waves",
-    [(16, 1), (32, 1), (32, 2), (64, 1), (64, 2), (128, 1), (128, 2)],
+    [
+        (32, 1),
+        (32, 2),
+        (64, 1),
+        (64, 2),
+        (128, 1),
+        (128, 2),
+        (128, 4),
+    ],
 )
 @pytest.mark.parametrize("split_k", [1, 2, 4, 8])
 def test_gfx1250_smallm_1x32_name_selects_dedicated_kernel(
@@ -448,7 +456,7 @@ def test_gfx1250_smallm_1x32_tile_n32_name_stays_stable():
         direct.mxfp8_32_smallm_1x32_kernel_name(32, 2, 1)
         == "flydsl_mxfp8_32_bpreshuffle_smallm_1x32_w2_sk1"
     )
-    with pytest.raises(ValueError, match="cannot run"):
+    with pytest.raises(ValueError, match="tile_n must"):
         direct.mxfp8_32_smallm_1x32_kernel_name(16, 2, 1)
 
 

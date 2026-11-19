@@ -38,7 +38,16 @@ MX32_WMMA_NAME_PREFIX = "flydsl_mxfp8_32_bpreshuffle_wmma"
 MX32_COMPUTE_WMMA_NAME_PREFIX = "flydsl_mxfp8_32_bpreshuffle_compute_wmma"
 MX32_SMALL_WMMA_NAME_PREFIX = "flydsl_mxfp8_32_bpreshuffle_small_wmma"
 MX32_SMALLM_1X32_NAME_PREFIX = "flydsl_mxfp8_32_bpreshuffle_smallm_1x32"
-MX32_SMALLM_1X32_TILE_NS = (16, 32, 64, 128)
+MX32_SMALLM_1X32_TILE_NS = (32, 64, 128)
+MX32_SMALLM_1X32_TILE_WAVES = {
+    (32, 1),
+    (32, 2),
+    (64, 1),
+    (64, 2),
+    (128, 1),
+    (128, 2),
+    (128, 4),
+}
 _SUPPORTED_NUM_BUFFERS = (2, 3, 4)
 _OUT_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "f16"}
 _MAX_SPLIT_K = 8
@@ -629,8 +638,8 @@ _MX32_SMALL_KERNEL_NAME_RE = re.compile(
 )
 _MX32_SMALLM_1X32_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(MX32_SMALLM_1X32_NAME_PREFIX)}_"
-    r"(?:n(?P<tile_n>16|64|128)_)?"
-    r"w(?P<num_waves>[12])_sk(?P<split_k>1|2|4|8)$"
+    r"(?:n(?P<tile_n>64|128)_)?"
+    r"w(?P<num_waves>[124])_sk(?P<split_k>1|2|4|8)$"
 )
 
 
@@ -640,8 +649,8 @@ def mxfp8_32_smallm_1x32_kernel_name(tile_n: int, num_waves: int, split_k: int) 
         raise ValueError(
             f"tile_n must be one of {MX32_SMALLM_1X32_TILE_NS}, got {tile_n}"
         )
-    if num_waves not in (1, 2) or tile_n < 16 * num_waves:
-        raise ValueError(f"tile_n={tile_n} cannot run with num_waves={num_waves}")
+    if (tile_n, num_waves) not in MX32_SMALLM_1X32_TILE_WAVES:
+        raise ValueError(f"unsupported tile/wave pair {tile_n}/{num_waves}")
     if split_k not in (1, 2, 4, 8):
         raise ValueError(f"split_k must be 1/2/4/8, got {split_k}")
     tile = "" if tile_n == 32 else f"n{tile_n}_"
@@ -796,14 +805,14 @@ def _run_mxfp8_32_smallm_1x32_gfx1250(
         raise RuntimeError(
             "[FlyDSL gfx1250 smallm_1x32] x_scale/w_scale must be contiguous"
         )
-    if (
-        num_waves not in (1, 2)
-        or tile_n < 16 * num_waves
-        or split_k not in (1, 2, 4, 8)
+    if (tile_n, num_waves) not in MX32_SMALLM_1X32_TILE_WAVES or split_k not in (
+        1,
+        2,
+        4,
+        8,
     ):
         raise RuntimeError(
-            "[FlyDSL gfx1250 smallm_1x32] num_waves must be 1/2 with at least "
-            "one 16-column tile per wave, and split_k must be 1/2/4/8"
+            "[FlyDSL gfx1250 smallm_1x32] unsupported tile/wave pair or split_k"
         )
 
     _lazy_import()
