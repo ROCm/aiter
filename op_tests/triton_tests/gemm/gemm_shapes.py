@@ -12,6 +12,27 @@ EDGE_CASES = [
     (17, 200, 384),
     (31, 7168, 4608),
     (159, 17389, 597),
+    # Small K: the gluon blockscale wind-down's num_k_iter guards
+    # (BLOCK_SIZE_K=128; K in {128,192,256,320} -> num_k_iter in {1,2,2,3}).
+    (512, 512, 128),
+    (512, 512, 192),
+    (512, 512, 256),
+    (512, 512, 320),
+    # gfx942's tuned a8w8 blockscale preshuffle config splits K=11008 into four
+    # 2816-wide partitions, so the last one runs 256 past K.
+    (16, 4096, 11008),
+    # gfx950's a16w8 blockscale default config splits these K into 256-wide
+    # partitions, so the last one runs past K (K=640 -> 3 x 256).
+    (1, 6144, 640),
+    (1, 6144, 896),
+    (16, 6144, 640),
+    (16, 6144, 896),
+    (64, 6144, 640),
+    (64, 6144, 896),
+    # K = 35 * 32 leaves a ragged tail under any BLOCK_SIZE_K >= 64, after
+    # several full K iterations rather than within the first one.
+    (7, 512, 1120),
+    (16, 128, 1120),
 ]
 
 # (M, N, K), M <= 256
@@ -37,6 +58,11 @@ DECODE = [
     (1, 128, 512),
     (32, 128, 512),
     (128, 128, 512),
+    # GLM MLA: qk_nope_head_dim=192
+    (32, 512, 192),
+    # M < 32
+    (1, 256, 512),
+    (16, 256, 256),
     # very large N
     (256, 106496, 16384),
 ]

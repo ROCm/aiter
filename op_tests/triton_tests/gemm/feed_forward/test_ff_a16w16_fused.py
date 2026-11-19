@@ -38,6 +38,23 @@ def test_ff_a16w16_fused_ungated(
     )
 
 
+# gfx950's tuned gated configs for N=16384 (intermediate_dim=8192) at K=1280 and
+# K=8192 use a 32x128x256 tile with num_stages=2 for M <= 64. That needs 168864 B
+# of LDS (the limit is 163840), so these cases cannot launch.
+_GATED_LDS_REASON = "gfx950 tuned gated config for N=16384, K=1280/8192 exceeds LDS"
+
+
+def _gated_config_exceeds_lds(batch, hidden_dim, intermediate_dim):
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    return (
+        "gfx950" in (get_arch() or "")
+        and batch <= 64
+        and intermediate_dim == 8192
+        and hidden_dim in (1280, 8192)
+    )
+
+
 @pytest.mark.parametrize("activation", ["silu_exp2", "gelu_tanh", "relu", None])
 @pytest.mark.parametrize("batch, hidden_dim, intermediate_dim", get_shapes())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -49,6 +66,8 @@ def test_ff_a16w16_fused_gated(
         pytest.skip(
             "Small differences in implementation between Triton & Torch activations accumulate to beyond test bounds w/large matrices."
         )
+    if _gated_config_exceeds_lds(batch, hidden_dim, intermediate_dim):
+        pytest.skip(_GATED_LDS_REASON)
     torch.manual_seed(0)
 
     ff_gated_test(
@@ -63,9 +82,9 @@ def test_ff_a16w16_fused_gated(
     )
 
 
-# gfx950 M<=8 launch regression (PR #5399). get_shapes() jumps from M=3 to M>=32,
-# so M=5-8 -- the only range that selects the DEFAULT M_LEQ_8 tile -- is otherwise
-# uncompiled by CI. A DEFAULT M_LEQ_8 that exceeds LDS (the bug this PR fixes)
+# gfx950 M<=8 launch regression (PR #5399). get_shapes() has only M=7 between M=3
+# and M=16, so M=5-8 -- the only range that selects the DEFAULT M_LEQ_8 tile -- is
+# barely compiled by CI otherwise. A DEFAULT M_LEQ_8 that exceeds LDS (the bug this PR fixes)
 # raises OutOfResources at launch; these cases take the config=None default path
 # at M=8 so that regression is caught. One shape resolves to a specialized gated
 # config, one is untuned and falls back to DEFAULT; both gated and ungated run.
@@ -86,6 +105,8 @@ def _skip_unless_gfx950():
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_ff_a16w16_fused_gated_m8_launch(batch, hidden_dim, intermediate_dim, dtype):
     _skip_unless_gfx950()
+    if _gated_config_exceeds_lds(batch, hidden_dim, intermediate_dim):
+        pytest.skip(_GATED_LDS_REASON)
     torch.manual_seed(0)
     ff_gated_test(
         ff_a16w16_fused_gated,

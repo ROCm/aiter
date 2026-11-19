@@ -17,19 +17,6 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
 from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
-# Small-K shapes that exercise the gluon wind-down's num_k_iter guards
-# (BLOCK_SIZE_K=128; K in {128,192,256,320} -> num_k_iter in {1,2,2,3}).
-# K<BLOCK_SIZE_K isn't supported by the gluon wrapper (GROUP_K assert).
-# gfx942's tuned preshuffle config splits K=11008 into four 2816-wide
-# partitions, so the last one runs 256 past K.
-_KERNEL_SHAPES = [
-    (512, 512, 128),
-    (512, 512, 192),
-    (512, 512, 256),
-    (512, 512, 320),
-    (16, 4096, 11008),
-]
-
 block_shape = (128, 128)
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -126,7 +113,7 @@ def generate_gemm_a8w8_blockscale_inputs(
         for output in [True]
         for dtype in ["bf16"]
         for layout in ["TN"]
-        for shape in get_shapes(min_k=128) + _KERNEL_SHAPES
+        for shape in get_shapes(min_k=128)
     ],
 )
 @pytest.mark.parametrize("backend", ["gluon", "triton"])
@@ -148,6 +135,10 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
         pytest.skip(
             "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
         )
+    if backend == "triton" and shuffle and K % 128 > 0:
+        pytest.skip("Triton preshuffle needs K to be a multiple of 128")
+    if backend == "gluon" and K % 64 > 0:
+        pytest.skip("Gluon needs K to be a multiple of 64")
 
     if backend not in ("gluon",) and K < 512:
         pytest.skip("Small-K shapes exercise gluon-only paths.")

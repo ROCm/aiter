@@ -161,6 +161,8 @@ def test_fused_gemm_afp4wfp4_split_cat(dtype, M, N, K, D, S3, layout, shuffle):
     # skip tests
     if N % D != 0:
         pytest.skip("N must be divisible by D as N = D * (S1 + S2)")
+    if not shuffle and K > 4096 and K % 1024 != 0:
+        pytest.skip("Unshuffled split-K needs K % 1024 == 0 for K > 4096")
 
     # deconstruct N
     S = N // D

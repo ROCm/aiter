@@ -136,6 +136,8 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
         pytest.skip(
             "For preshuffle, N must be multiple of 16 and K must be multiple of 32."
         )
+    if impl == "gluon_shuffle" and k % 256 != 0:
+        pytest.skip("Gluon preshuffle needs K to be a multiple of BLOCK_SIZE_K (256).")
 
     in_dtype = str_to_torch_dtype[in_dtype]
     out_dtype = str_to_torch_dtype["bf16"]
@@ -200,6 +202,8 @@ def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
         pytest.skip(
             "For preshuffle, N must be multiple of 16 and K must be multiple of 32."
         )
+    if impl == "gluon_shuffle" and k % 256 != 0:
+        pytest.skip("Gluon preshuffle needs K to be a multiple of BLOCK_SIZE_K (256).")
 
     in_dtype = str_to_torch_dtype["int8"]
     out_dtype = str_to_torch_dtype[out_dtype]

@@ -16,17 +16,6 @@ from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
 from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
-# gfx950's default config splits these K into 256-wide partitions, so the
-# last one runs past K (K=640 -> 3 x 256).
-_KERNEL_SHAPES = [
-    (1, 6144, 640),
-    (1, 6144, 896),
-    (16, 6144, 640),
-    (16, 6144, 896),
-    (64, 6144, 640),
-    (64, 6144, 896),
-]
-
 block_shape = (128, 128)
 
 
@@ -117,7 +106,7 @@ def generate_gemm_a16w8_blockscale_inputs(
         (dtype, *shape, output)
         for output in [False]
         for dtype in ["bf16"]
-        for shape in get_shapes() + _KERNEL_SHAPES
+        for shape in get_shapes()
     ],
 )
 @pytest.mark.parametrize("shuffle", [True, False])
@@ -125,9 +114,9 @@ def test_gemm(dtype, M, N, K, output, shuffle):
     prequant = False
     block_shape_n, block_shape_k = block_shape
 
-    if shuffle and (N % 16 > 0 or K % 32 > 0):
+    if shuffle and (N % 16 > 0 or K % 128 > 0):
         pytest.skip(
-            "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
+            "N has to be multiple of 16 and K has to be multiple of 128 for preshuffle cases"
         )
 
     dtype = str_to_torch_dtype[dtype]

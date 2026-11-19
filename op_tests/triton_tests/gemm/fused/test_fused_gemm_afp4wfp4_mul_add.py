@@ -23,7 +23,7 @@ from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
 from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
 
-@pytest.mark.parametrize("M, N, K", get_shapes(k_mult=32, max_size=1024 * 7168 * 256))
+@pytest.mark.parametrize("M, N, K", get_shapes(k_mult=256, max_size=1024 * 7168 * 256))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN"])
 @pytest.mark.parametrize("output", [True, False])

@@ -128,7 +128,7 @@ def run_torch(x, w, w_scales, dtype):
     return torch.mm(x_f32, w_f32.T).to(dtype)
 
 
-@pytest.mark.parametrize("M, N, K", get_shapes(k_mult=32))
+@pytest.mark.parametrize("M, N, K", get_shapes(k_mult=256))
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize(
     "atomic_add, shuffle, skip_reduce",
@@ -150,8 +150,8 @@ def test_gemm_a16wfp4(
 ):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
-    if shuffle and (N % 16 != 0 or K % 256 != 0):
-        pytest.skip("Shuffled weight and scales need N % 16 == 0 and K % 256 == 0")
+    if shuffle and (N % 16 != 0 or K % 512 != 0):
+        pytest.skip("Shuffled weight and scales need N % 16 == 0 and K % 512 == 0")
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 

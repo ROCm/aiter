@@ -20,9 +20,6 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.triton_tests.gemm.gemm_shapes import get_shapes
 
-# M < 32 case.
-_KERNEL_SHAPES = [(1, 256, 512), (16, 256, 256)]
-
 DEVICE_ARCH = arch_info.get_arch()
 
 # Mirrors the arch gate in gemm_afp4wfp4_(): archs with software-emulated FP4
@@ -179,7 +176,7 @@ def run_torch(x, w, x_scales, w_scales, dtype):
     return torch.mm(x_f32, w_f32.T).to(dtype)
 
 
-@pytest.mark.parametrize("M, N, K", get_shapes(k_mult=32) + _KERNEL_SHAPES)
+@pytest.mark.parametrize("M, N, K", get_shapes(k_mult=32))
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("shuffle_weight_scales", [True, False])
 @pytest.mark.parametrize("skip_reduce", [True, False])
@@ -325,7 +322,7 @@ def test_gemm_afp4_wfp4_preshuffle_splitk(M: int, N: int, K: int):
     triton.testing.assert_close(torch_out, triton_out)
 
 
-@pytest.mark.parametrize("M, N, K", get_shapes(k_mult=32) + _KERNEL_SHAPES)
+@pytest.mark.parametrize("M, N, K", get_shapes(k_mult=32))
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TN"])  # "NN", "NT"
 @pytest.mark.parametrize("output", [True, False])
