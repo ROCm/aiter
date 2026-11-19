@@ -140,6 +140,7 @@ def build_moe_topk_route_quant_prefill_module(
     quant_mode: str = "fp4",
     shared: bool = False,
     row_major_scale: bool = False,
+    gather_payload: bool = False,
 ):
     """JIT launcher ``(logits, hidden, num_valid_rows, topk_weights, topk_ids,
     topids_to_rows, masked_m, psum, payload, compact_scale, row_to_token,
@@ -165,7 +166,18 @@ def build_moe_topk_route_quant_prefill_module(
     its payload) for a MoE1 that reads row-major scales; no preshuffle pass,
     and ``row_to_token`` is not written. Tile padding rows stay unwritten
     (MoE1 bounds its scale loads by the expert's rows).
+
+    ``gather_payload`` (needs ``row_major_scale``): ``grouped_payload`` is
+    instead token-major ((token_num, payload_bytes), each token's MXFP4 row
+    written once, right after its quant, before the all-workgroup wait), and
+    ``row_to_token`` gets every route row's token: MoE1 gathers its A rows
+    from the token rows (TDM gather) instead of reading topk copies. The e8m0
+    rows stay per route (row-major).
     """
+    if gather_payload and not row_major_scale:
+        raise NotImplementedError("gather_payload needs row_major_scale")
+    if gather_payload and shared:
+        raise NotImplementedError("gather_payload without a shared expert")
     if experts != 256:
         raise NotImplementedError(
             f"prefill top-k/route/quant: 256 experts, got {experts}"
@@ -218,6 +230,7 @@ def build_moe_topk_route_quant_prefill_module(
         f"_a{align_m}_s{slots}_w{waves}_{quant_mode}_{L.native_tag}"
         f"{'_sh' if shared else ''}"
         f"{'_rms' if row_major_scale else ''}"
+        f"{'_gp' if gather_payload else ''}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[block, 1, 1])
@@ -521,6 +534,18 @@ def build_moe_topk_route_quant_prefill_module(
             qc = _qc(rows[i], pre)
             results, _ = _emit_quant_compute(qc)
             quant.append((qc, results))
+            if const_expr(gather_payload):
+                # The token's own row, once: its position needs no count.
+                tok_live = rows[i] < valid_end
+                tok_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    fx.Int64(ptrtoint(grouped_payload))
+                    + fx.Uint64(fx.Uint32(rows[i])) * L.payload_bytes_per_row,
+                    num_records_bytes=tok_live.select(
+                        fx.Int32(L.payload_bytes_per_row), c0_i32
+                    ),
+                )
+                for mx_block, payload_val, _ in results:
+                    _emit_payload_stores(qc, [tok_rsrc], payload_val, mx_block)
             if const_expr(i + nbuf < slots):
                 # The buffer is free once this slot's LDS reads have landed.
                 rocdl.s_wait_dscnt(0)
@@ -629,7 +654,7 @@ def build_moe_topk_route_quant_prefill_module(
                     rows_t[fx.Int32(row) * fx.Int32(n_out) + fx.Int32(g)] = fx.Int32(
                         lds_misc[1]
                     ) + fx.Int32(row)
-            if const_expr(not row_major_scale):  # noqa: SIM102 - preserve DSL staging
+            if const_expr(not row_major_scale or gather_payload):  # noqa: SIM102
                 if l_valid:
                     r2t_t[l_row] = fx.Int32(row)
             # From the registers, a grouped row at a time (whole 1 KB runs).
@@ -649,9 +674,10 @@ def build_moe_topk_route_quant_prefill_module(
                         ),
                     )
                 )
-            for rsrc in rsrcs:
-                for mx_block, payload_val, _ in results:
-                    _emit_payload_stores(qc, [rsrc], payload_val, mx_block)
+            if const_expr(not gather_payload):
+                for rsrc in rsrcs:
+                    for mx_block, payload_val, _ in results:
+                        _emit_payload_stores(qc, [rsrc], payload_val, mx_block)
             if const_expr(row_major_scale):  # noqa: SIM102 - preserve DSL staging
                 # The token's 64 B e8m0 row to each route's grouped row.
                 if live & (lane < fx.Uint32(sd_per_row)):

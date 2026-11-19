@@ -154,8 +154,13 @@ def flydsl_grouped_gemm_a8w4_masked(
     shared_rows=0,
     shared_a=None,
     shared_c=None,
+    a_row_map=None,
 ):
     """Launch a contiguous-M grouped GEMM, optionally with persistent workers.
+
+    ``a_row_map`` (gemm1): ``a`` is token-major [tokens, K bytes] and this int32
+    (contiguous_m,) map gives each grouped row's token; the kernel gathers its
+    A rows by TDM gather (``gather_a``). Tokens must stay below 0xFFFF.
 
     A positive persistent_workers bounds the grid independently of the routing
     buffer capacity. Workers traverse the live device-side tile range.
@@ -228,6 +233,12 @@ def flydsl_grouped_gemm_a8w4_masked(
                 f"keep the scale plane cache-line aligned, got N={N}"
             )
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
+    if a_row_map is not None:
+        if enable_ep_scatter or shared_w is not None:
+            raise ValueError("a_row_map: no EP scatter or shared expert")
+        if a.reshape(-1, a.shape[-1]).shape[0] >= 0xFFFF:
+            raise ValueError("a_row_map: token rows must stay below 0xFFFF")
+        ep_row_map_tensor = a_row_map
     launch_gemm_a8w4_tdm(
         out,
         ptr_arg(a),
@@ -294,5 +305,30 @@ def flydsl_grouped_gemm_a8w4_masked(
         shared_a16=int(shared_a is not None),
         arg_shared_a=ptr_arg(a if shared_a is None else shared_a),
         arg_shared_c=ptr_arg(a if shared_c is None else shared_c),
+        gather_a=int(a_row_map is not None),
+        scale_prologue=(_gather_scale_prologue() if a_row_map is not None else 0),
     )
     return out
+
+
+def _gather_scale_prologue() -> int:
+    """AITER_TDM_GATHER_SCALE_PROLOGUE (gather_a): 1 A scales, 2 B scales, 3 both
+    loaded once a tile instead of each stage."""
+    value = int(os.environ.get("AITER_TDM_GATHER_SCALE_PROLOGUE", "0"))
+    if value not in (0, 1, 2, 3):
+        raise ValueError("AITER_TDM_GATHER_SCALE_PROLOGUE must be 0..3")
+    return value
+
+
+def gather_a_supported(tile_m, m_warp, n_warp) -> bool:
+    """Whether the TDM GEMM can gather its A rows at this tile / wave grid."""
+    from .kernels.mxfp4_preshuffle_gfx1250_tdm import _gather_owners_if
+
+    sp = _gather_scale_prologue()
+    try:
+        _gather_owners_if(
+            True, int(m_warp) * int(n_warp), int(tile_m), bool(sp & 1), bool(sp & 2)
+        )
+    except ValueError:
+        return False
+    return True

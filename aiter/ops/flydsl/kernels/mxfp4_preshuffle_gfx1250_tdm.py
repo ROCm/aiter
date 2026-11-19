@@ -32,6 +32,8 @@ from .gemm_common_gfx1250 import (
 from .kernels_common import ceildiv
 from .mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
+    make_tensor_gather_dgroup0,
+    tensor_load_gather,
     tensor_store_gather,
 )
 from .mega_moe_gfx1250.types import COMBINE_SCALE_BLOCK
@@ -86,6 +88,136 @@ if FORCE_1X4_CLUSTER not in (0, 1):
     raise ValueError("AITER_FLYDSL_FORCE_1X4_CLUSTER must be 0 or 1")
 if DISABLE_CLUSTER_SYNC not in (0, 1):
     raise ValueError("AITER_FLYDSL_DISABLE_CLUSTER_SYNC must be 0 or 1")
+
+# gather_a: waves that issue the A row gathers (0: the default below).
+GATHER_A_WAVES = int(os.environ.get("AITER_TDM_GATHER_A_WAVES", "0"))
+# A TDM gather takes at most 16 rows (16-bit indices). The descriptor's dim1 is
+# 0xFFFF, so token rows must stay below it. Padding rows never use an OOB index:
+# on 2026-11-18 a 16-bit gather whose padding rows carried index 0xFFFF (== dim1)
+# read ~64 MB past the token buffer and page-faulted GPU0 (MES hung, reboot).
+# They take the tile's first row's token instead (always a route row).
+GATHER_ROWS = 16
+GATHER_OOB = 0xFFFF
+# AITER_TDM_GATHER_TILE_DIM1=1 (default): a gather consumes only its valid rows
+# (descriptor tile_dim1 = rows below the expert's end, at least 1); the LDS rows
+# past them keep stale data, which only padding rows read.
+GATHER_TILE_DIM1 = int(os.environ.get("AITER_TDM_GATHER_TILE_DIM1", "1"))
+# The row-map loads are issued at kernel entry, beside the expert bisect (their
+# address needs only blk_m). =1 marks them volatile so LLVM cannot sink them to
+# their use behind the bisect's dependent loads.
+GATHER_IDX_VOLATILE = int(os.environ.get("AITER_TDM_GATHER_IDX_VOLATILE", "0"))
+# =0: load the row map after the bisect instead (masked address), as first built.
+GATHER_EARLY_IDX = int(os.environ.get("AITER_TDM_GATHER_EARLY_IDX", "1"))
+
+
+def _gather_a_owners(num_waves, tile_m, a_waves_req=0):
+    """TDM owners when the A tile is gathered by row index.
+
+    Returns (A waves, B waves, A-scale waves, B-scale waves, gathers a wave,
+    TDM ops a wave a stage). Every wave issues the same number of TDM ops a
+    stage, so one tensorcnt wait serves every wave: either the A gathers sit
+    on their own waves (one each) and B / the scales on the others, or every
+    wave gathers and also owns one of B / the scales.
+    """
+    if tile_m % GATHER_ROWS:
+        raise ValueError(f"gather_a needs tile_m % {GATHER_ROWS} == 0, got {tile_m}")
+    n_gather = tile_m // GATHER_ROWS
+    a_w = a_waves_req or (n_gather if num_waves - n_gather >= 3 else num_waves)
+    a_w = min(a_w, n_gather, num_waves)
+    if n_gather % a_w:
+        raise ValueError(f"{n_gather} gathers do not split over {a_w} waves")
+    gpw = n_gather // a_w
+    rest = list(range(a_w, num_waves))
+    if len(rest) >= 3:
+        if gpw != 1:
+            raise ValueError("gather owners apart from B need one gather a wave")
+        nb = len(rest) // 2
+        nsa = (len(rest) - nb) // 2
+        b = tuple(rest[:nb])
+        sa = tuple(rest[nb : nb + nsa])
+        sb = tuple(rest[nb + nsa :])
+        tdm_per = 1
+    elif a_w == num_waves:
+        nb = max(1, num_waves // 2)
+        nsa = max(1, (num_waves - nb) // 2)
+        b = tuple(range(nb))
+        sa = tuple(range(nb, nb + nsa))
+        sb = tuple(range(nb + nsa, num_waves))
+        if not sb:
+            raise ValueError(f"gather_a: {num_waves} waves cannot own B/SA/SB apart")
+        tdm_per = gpw + 1
+    else:
+        raise ValueError(
+            f"gather_a: {a_w} A waves leave {len(rest)} for B/SA/SB (need 0 or >= 3)"
+        )
+    return tuple(range(a_w)), b, sa, sb, gpw, tdm_per
+
+
+# Trace-time holder for the gather descriptors: a runtime ``if`` hands its
+# branch copies of the enclosing lists, so a list filled inside ``has_work``
+# would not reach ``issue``. Set and read within one trace (tracing is serial).
+_GATHER_TRACE = {}
+
+
+# gather_a + scale prologue: waves that own B in each stage (0: all the waves
+# without an A gather, or 2 when every wave gathers).
+GATHER_B_WAVES = int(os.environ.get("AITER_TDM_GATHER_B_WAVES", "0"))
+
+
+def _pow2_floor(n):
+    return 1 << (max(1, int(n)).bit_length() - 1)
+
+
+def _gather_a_owners_sp(num_waves, tile_m, sp_a, sp_b):
+    """TDM owners when the scales of the A tile (sp_a) and / or B (sp_b) are
+    loaded once a tile (the scale prologue): a stage carries the A gathers, B
+    and only the scales not preloaded. Waves may issue different numbers of
+    TDM ops a stage (each wave group waits on its own count). Returns (A waves,
+    B waves, A-scale waves, B-scale waves, gathers a wave, None); a preloaded
+    scale's waves are its prologue owners."""
+    if tile_m % GATHER_ROWS:
+        raise ValueError(f"gather_a needs tile_m % {GATHER_ROWS} == 0, got {tile_m}")
+    n_gather = tile_m // GATHER_ROWS
+    a_w = min(GATHER_A_WAVES or n_gather, n_gather, num_waves)
+    if n_gather % a_w:
+        raise ValueError(f"{n_gather} gathers do not split over {a_w} waves")
+    gpw = n_gather // a_w
+    stage_scales = [k for k, pre in (("sa", sp_a), ("sb", sp_b)) if not pre]
+    free = list(range(a_w, num_waves))
+    if len(free) >= 1 + len(stage_scales):
+        pool = free
+        nb = GATHER_B_WAVES or _pow2_floor(len(free) - len(stage_scales))
+    else:
+        pool = list(range(num_waves))
+        nb = GATHER_B_WAVES or min(2, num_waves)
+    if nb + len(stage_scales) > len(pool):
+        raise ValueError(f"gather_a: {nb} B waves + {stage_scales} exceed {pool}")
+    b = tuple(pool[:nb])
+    rest = pool[nb:]
+    last = (num_waves - 1,)
+    second = (num_waves - 2,) if num_waves > 1 else last
+    sa = (rest.pop(0),) if not sp_a else last
+    sb = (rest.pop(0),) if not sp_b else second
+    return tuple(range(a_w)), b, sa, sb, gpw, None
+
+
+def _gather_owners_if(gather_a, num_waves, tile_m, sp_a=False, sp_b=False):
+    """The gather_a owners (see above), None without gather_a."""
+    if not gather_a:
+        return None
+    if sp_a or sp_b:
+        return _gather_a_owners_sp(num_waves, tile_m, sp_a, sp_b)
+    return _gather_a_owners(num_waves, tile_m, GATHER_A_WAVES)
+
+
+def _group_waves_by_jobs(job_waves, num_waves):
+    """[(waves, job indices)]: the waves that issue exactly the same jobs."""
+    sets = {}
+    for w in range(num_waves):
+        key = tuple(i for i, wv in enumerate(job_waves) if w in wv)
+        sets.setdefault(key, []).append(w)
+    return sorted((tuple(ws), key) for key, ws in sets.items())
+
 
 SUPPORT_EXPLICIT_VGPR_PARTITION = bool(
     EXPLICIT_VGPR_PARTITION and is_fx_set_register_available()
@@ -182,8 +314,23 @@ def launch_gemm_a8w4_tdm(
     shared_a16: Constexpr[int] = 0,
     arg_shared_a: fx.Pointer = None,
     arg_shared_c: fx.Pointer = None,
+    gather_a: Constexpr[int] = 0,
+    scale_prologue: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
+
+    ``gather_a``: A is token-major (``arg_a`` [tokens, K bytes]) and
+    ``arg_ep_row_map`` is the int32 grouped row -> token map; each A tile is
+    loaded with TDM gathers (16 rows each) instead of one tile load, so the
+    route/quant writes each token's row once instead of top-k copies. Rows at
+    or past the expert's end gather a real row (the tile's first token; never
+    an OOB index, see GATHER_OOB): their outputs are not stored. gemm1 only (no
+    EP scatter, shared expert, clusters or persistent workers).
+
+    ``scale_prologue`` (gather_a; bit 1: A scales, bit 2: B scales): the tile's
+    full-K scale rows are loaded once, before the first stage, into resident
+    LDS, so a stage carries only the A gathers and B (fewer TDM ops a stage).
+    A scales need ``row_major_ascale``.
 
     ``shared_b`` (FHMoE): the last expert is a shared expert whose B is fp8
     (MXFP8) at ``arg_shared_b``, in the routed weight preshuffle, with its e8m0
@@ -233,6 +380,11 @@ def launch_gemm_a8w4_tdm(
             enable_ep_scatter and ep_quant_bits
         ), "persistent EP scatter requires an unquantized combine wire"
     assert not shared_a16 or shared_b, "shared_a16 needs shared_b"
+    if gather_a:
+        assert not (
+            enable_ep_scatter or shared_b or tdm_as_in_prologue or persistent_workers
+        ), "gather_a: no EP scatter, shared expert, A-scale prologue or persistent"
+        assert cluster_m == 1 and cluster_n == 1, "gather_a: no multicast clusters"
     if shared_b:
         assert not (
             has_bias or enable_ep_scatter or persistent_workers
@@ -362,8 +514,20 @@ def launch_gemm_a8w4_tdm(
         SH_SPLIT,
         SH_GRID,
         shared_a16,
+        gather_a,
+        GATHER_A_WAVES,
+        GATHER_TILE_DIM1,
+        GATHER_IDX_VOLATILE,
+        GATHER_EARLY_IDX,
+        scale_prologue,
+        GATHER_B_WAVES,
     )
     _ = cache_tag
+    SP_SA = bool(gather_a) and bool(scale_prologue & 1)
+    SP_SB = bool(gather_a) and bool(scale_prologue & 2)
+    assert not (SP_SA and not row_major_ascale), "A-scale prologue: row-major scales"
+    assert not ((SP_SA or SP_SB) and (planar_lds_on or tdm_as_in_prologue))
+    GATHER_OWNERS = _gather_owners_if(gather_a, m_warp * n_warp, tile_m, SP_SA, SP_SB)
     if enable_ep_scatter:
         if stage1_act != 0:
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
@@ -402,7 +566,7 @@ def launch_gemm_a8w4_tdm(
     scatter_dst_vectors = (
         scatter_passes + SCATTER_PASSES_PER_VECTOR - 1
     ) // SCATTER_PASSES_PER_VECTOR
-    if (4 * num_waves_per_tensor_tdm) % num_waves:
+    if not gather_a and (4 * num_waves_per_tensor_tdm) % num_waves:
         raise ValueError("A/B/SA/SB ownership must cover every workgroup wave")
 
     A_PACK = 2 if a_is_fp4 else 1
@@ -462,6 +626,9 @@ def launch_gemm_a8w4_tdm(
         else ceildiv(AS_SUPERS * AS_INNER * 4, 16) * 16
     )
     STAGE_SB = ceildiv(SB_SUPERS * SC_INNER * 4, 16) * 16
+    # Scale prologue: a preloaded scale takes no stage space.
+    STAGE_SA = 0 if SP_SA else STAGE_SA
+    STAGE_SB = 0 if SP_SB else STAGE_SB
     # 512-align so per-buffer ptr offset preserves LDS alignment for TDM/ds_b128
     PITCH = ceildiv(STAGE_A + STAGE_B + STAGE_SA + STAGE_SB, 512) * 512
 
@@ -512,7 +679,19 @@ def launch_gemm_a8w4_tdm(
     )
     AS_FULL_OFF = INPUT_LDS_B
     AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
-    ARENA_B = max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
+    # Scale prologue regions behind the stages: A-scale rows of K/128 dwords plus
+    # one pad dword (the per-lane reads walk rows: an odd pitch spreads banks),
+    # B-scale super rows of K/4 dwords (the reads walk one row).
+    SP_SA_ROW = AS_FULL_KDW + 1
+    SP_SA_B = ceildiv(tile_m * SP_SA_ROW * 4, 128) * 128 if SP_SA else 0
+    SP_SB_B = ceildiv(SB_SUPERS * (K // 4) * 4, 128) * 128 if SP_SB else 0
+    SP_SA_OFF = INPUT_LDS_B
+    SP_SB_OFF = INPUT_LDS_B + SP_SA_B
+    ARENA_B = max(
+        AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0),
+        INPUT_LDS_B + SP_SA_B + SP_SB_B,
+        C_STORE_B,
+    )
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -568,6 +747,16 @@ def launch_gemm_a8w4_tdm(
         else ""
     )
     _rm_scale = "_rmscale2" if row_major_ascale == 2 else ""
+    _rm_scale = _rm_scale + (
+        (
+            (f"_gath{GATHER_A_WAVES}" if GATHER_A_WAVES else "_gath")
+            + ("v" if GATHER_TILE_DIM1 else "")
+            + ("i" if GATHER_IDX_VOLATILE else "")
+            + (f"_sp{scale_prologue}b{GATHER_B_WAVES}" if scale_prologue else "")
+        )
+        if gather_a
+        else ""
+    )
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -705,6 +894,36 @@ def launch_gemm_a8w4_tdm(
             elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
         )
         tile_map = fx.recast_iter(i32_ptr, arg_m_tile_map)
+        # gather_a: this wave's rows' tokens (one row a lane, per gather) and the
+        # tile's row 0, loaded before the bisect: blk_m + tile_m <= contiguous_m,
+        # so every row of the tile is inside the map. Masked by the expert's end
+        # once the bisect has found it.
+        early_tok = []
+        if const_expr(gather_a and GATHER_EARLY_IDX):
+            _rm0 = fx.recast_iter(fx.Int32, arg_ep_row_map)
+            _aw0 = wave - GATHER_OWNERS[0][0]
+            for t in range_constexpr(GATHER_OWNERS[4] + 1):
+                if const_expr(t < GATHER_OWNERS[4]):
+                    _r0 = (_aw0 * GATHER_OWNERS[4] + t) * GATHER_ROWS + lane16
+                    _r0 = ((_r0 >= 0) & (_r0 < tile_m)).select(_r0, fx.Int32(0))
+                else:
+                    _r0 = fx.Int32(0)
+                if const_expr(GATHER_IDX_VOLATILE):
+                    _a64 = fx.Int64(fx.ptrtoint(_rm0)) + (
+                        fx.Int64(blk_m) + fx.Int64(_r0)
+                    ) * fx.Int64(4)
+                    _tok = fx.generic_load(
+                        fx.inttoptr(
+                            fx.PointerType.get(
+                                fx.Int32.ir_type, fx.AddressSpace.Global, 4
+                            ),
+                            _a64,
+                        ),
+                        volatile=True,
+                    )
+                else:
+                    _tok = fx.ptr_load(_rm0 + fx.Int64(blk_m) + fx.Int64(_r0))
+                early_tok.append(fx.Int32(_tok))
         has_work = blk_m < tile_map[n_experts - 1]
 
         # In-kernel bisect: find the expert owning this valid M-tile.  Seed the
@@ -913,7 +1132,12 @@ def launch_gemm_a8w4_tdm(
             p32_shared = fx.PointerType.get(
                 elem_ty=fx.Int32.ir_type, address_space=shared, alignment=16
             )
-            if const_expr(tdm_as_in_prologue):
+            if const_expr(gather_a):
+                assert not HAS_K_TAIL, "gather_a needs tile_k to divide K"
+                assert not SHB, "gather_a has no shared-expert body"
+                (A_GW, _gb, _gsa, _gsb, GPW, TDM_PER) = GATHER_OWNERS
+                waves = [A_GW, _gb, _gsa, _gsb]
+            elif const_expr(tdm_as_in_prologue):
                 assert num_waves == 4, "As-prologue requires a four-wave workgroup"
                 # Match the WST rotating-stage assignment. The one-shot A-scale load
                 # is split across all four waves along its K-scale dimension.
@@ -939,6 +1163,14 @@ def launch_gemm_a8w4_tdm(
             )
             jobs = []
             as_prologue_jobs = []
+            sp_jobs = []  # scale prologue (gather_a)
+            # gather_a: the token-major A rows and this workgroup's LDS, as the
+            # gather descriptors address them. _GATHER_TRACE["state"] holds this
+            # wave's gathers (groups 1-3 + its LDS row offset), set per tile.
+            gA_view = tensor_view(gA_base, (tile_m, A_ROW_B), (A_KROW, 1))
+            gA_lds_view = tensor_view(
+                fx.recast_iter(p8_shared, base_ptr), (tile_m, A_LDS_ROW), (A_LDS_ROW, 1)
+            )
 
             def add_tdm_loads(
                 g_base,
@@ -1023,22 +1255,41 @@ def launch_gemm_a8w4_tdm(
                     )
                 )
 
-            add_tdm_loads(
-                gA_base,
-                a_off0,
-                A_GROW,
-                mn_oob,
-                A_ROW_B,
-                tile_m,
-                on_i32=False,
-                lds_off=A_LDS_OFF,
-                lds_stage=A_LDS_STAGE,
-                lds_row=A_LDS_ROW,
-                k_adv=A_ROW_B,
-                wv=waves[0],
-                pad=(A_ROW_B, LDS_PAD_A),
-                wg_mask=a_mcast_mask,
-            )
+            if const_expr(gather_a):
+                # The A gathers: no atom (``emit`` issues them from _GATHER_TRACE,
+                # built per tile once the row map is read).
+                jobs.append(
+                    Job(
+                        None,
+                        None,
+                        False,
+                        A_LDS_OFF,
+                        A_LDS_STAGE,
+                        A_LDS_ROW,
+                        A_ROW_B,
+                        tile_m,
+                        A_ROW_B,
+                        waves[0],
+                        None,
+                    )
+                )
+            else:
+                add_tdm_loads(
+                    gA_base,
+                    a_off0,
+                    A_GROW,
+                    mn_oob,
+                    A_ROW_B,
+                    tile_m,
+                    on_i32=False,
+                    lds_off=A_LDS_OFF,
+                    lds_stage=A_LDS_STAGE,
+                    lds_row=A_LDS_ROW,
+                    k_adv=A_ROW_B,
+                    wv=waves[0],
+                    pad=(A_ROW_B, LDS_PAD_A),
+                    wg_mask=a_mcast_mask,
+                )
             add_tdm_loads(
                 gB_base,
                 b_off0,
@@ -1055,7 +1306,25 @@ def launch_gemm_a8w4_tdm(
                 wg_mask=b_mcast_mask,
                 cache_modifier=tdm_b_th,
             )
-            if const_expr(row_major_ascale and tdm_as_in_prologue):
+            if const_expr(SP_SA):
+                # Scale prologue: the tile's A-scale rows over all of K, once.
+                add_tdm_loads(
+                    gSA_base,
+                    blk_m64 * SA_GROW,
+                    SA_GROW,
+                    mn_oob if row_major_ascale == 2 else None,
+                    AS_FULL_KDW,
+                    tile_m,
+                    on_i32=True,
+                    lds_off=SP_SA_OFF // 4,
+                    lds_stage=0,
+                    lds_row=SP_SA_ROW,
+                    k_adv=0,
+                    wv=waves[2],
+                    pad=(AS_FULL_KDW, 1),
+                    target_jobs=sp_jobs,
+                )
+            elif const_expr(row_major_ascale and tdm_as_in_prologue):
                 # The compact wire is row-major with a padded global row pitch.
                 # Keep that layout in the resident LDS region too: each owner wave
                 # brings in a slice of M rows across the complete K-scale range.
@@ -1129,32 +1398,89 @@ def launch_gemm_a8w4_tdm(
                     wv=waves[2],
                     split_inner=AS_SUPERS < len(waves[2]),
                 )
-            add_tdm_loads(
-                gSB_base,
-                sb_off0,
-                SB_OUTER_STRIDE,
-                None,
-                SC_INNER,
-                SB_SUPERS,
-                on_i32=True,
-                lds_off=SB_LDS_OFF // 4,
-                lds_stage=SB_LDS_STAGE // 4,
-                lds_row=SC_INNER,
-                k_adv=SC_INNER * 4,
-                wv=waves[3],
-                split_inner=SB_SUPERS < len(waves[3]),
-            )
+            if const_expr(SP_SB):
+                # Scale prologue: the tile's B-scale super rows over all of K.
+                add_tdm_loads(
+                    gSB_base,
+                    sb_off0,
+                    SB_OUTER_STRIDE,
+                    None,
+                    K4,
+                    SB_SUPERS,
+                    on_i32=True,
+                    lds_off=SP_SB_OFF // 4,
+                    lds_stage=0,
+                    lds_row=K4,
+                    k_adv=0,
+                    wv=waves[3],
+                    split_inner=SB_SUPERS < len(waves[3]),
+                    target_jobs=sp_jobs,
+                )
+            else:
+                add_tdm_loads(
+                    gSB_base,
+                    sb_off0,
+                    SB_OUTER_STRIDE,
+                    None,
+                    SC_INNER,
+                    SB_SUPERS,
+                    on_i32=True,
+                    lds_off=SB_LDS_OFF // 4,
+                    lds_stage=SB_LDS_STAGE // 4,
+                    lds_row=SC_INNER,
+                    k_adv=SC_INNER * 4,
+                    wv=waves[3],
+                    split_inner=SB_SUPERS < len(waves[3]),
+                )
 
             # Wave ids are runtime, so one stream serves every wave and one test per
             # owner list is the floor. Dispatched bodies receive their jobs directly.
             job_waves = sorted({j.waves for j in jobs})
+            # (waves, job indices): the waves that issue exactly these jobs. The
+            # owner lists partition the waves without gather_a; with it the A
+            # gathers may share waves with B / the scales, so group by job set.
+            if const_expr(gather_a):
+                exec_groups = _group_waves_by_jobs([j.waves for j in jobs], num_waves)
+            else:
+                exec_groups = [
+                    (g, tuple(i for i in range(len(jobs)) if jobs[i].waves == g))
+                    for g in job_waves
+                ]
 
             def owns(wv):
                 """Runtime predicate: is this wave one of ``wv``?"""
+                if const_expr(gather_a and len(wv) > 2 and wv[-1] - wv[0] + 1 == len(wv)):
+                    return (wave >= wv[0]) & (wave <= wv[-1])
                 pred = wave == wv[0]
                 for w in wv[1:]:
                     pred = pred | (wave == w)
                 return pred
+
+            def _job_tdm(j):
+                """TDM ops a stage this job costs each of its waves."""
+                return GPW if j.atom is None else 1
+
+            # Each wave group's TDM ops a stage. Uniform: one tensorcnt wait for
+            # every wave, as always; otherwise each group waits on its own count.
+            GROUP_CNT = [sum(_job_tdm(jobs[i]) for i in ix) for _, ix in exec_groups]
+            UNIFORM = len(set(GROUP_CNT)) == 1
+            TDM_PER = max(GROUP_CNT) if gather_a else TDM_PER
+
+            def tdm_wait_stages(x, my_jobs=None):
+                """Wait until at most ``x`` stages of this wave's loads are out."""
+                if const_expr(my_jobs is not None):
+                    tdm_ops.tensor_wait(sum(_job_tdm(j) for j in my_jobs) * x)
+                elif const_expr(UNIFORM):
+                    tdm_ops.tensor_wait(TDM_PER * x)
+                else:
+                    for g in range_constexpr(len(exec_groups)):
+                        if owns(exec_groups[g][0]):
+                            tdm_ops.tensor_wait(GROUP_CNT[g] * x)
+
+            def fence_stages(x, my_jobs=None):
+                """pipeline_fence(outstanding=<x stages of this wave's loads>)."""
+                tdm_wait_stages(x, my_jobs)
+                workgroup_barrier()
 
             def issue(s, kt, my_jobs=None):
                 base_i8 = fx.recast_iter(p8_shared, base_ptr)
@@ -1167,7 +1493,27 @@ def launch_gemm_a8w4_tdm(
                         kt == K_TILES - 1 if static_kt else fx.Int32(kt) == K_TILES - 1
                     )
 
+                def emit_gather(j):
+                    # This wave's gathers of stage s: only the address group moves.
+                    for t in range_constexpr(GPW):
+                        dg1, dg2, dg3, row_off = _GATHER_TRACE["state"][t]
+                        dg0 = make_tensor_gather_dgroup0(
+                            gA_view,
+                            gA_lds_view,
+                            index_size=16,
+                            lds_byte_offset=fx.Int64(row_off)
+                            + fx.Int64(s * j.lds_stage),
+                            global_byte_offset=fx.Int64(kt * j.k_adv),
+                        )
+                        tensor_load_gather(dg0, dg1, dg2, dg3)
+
                 def emit(j):
+                    if const_expr(j.atom is None):
+                        emit_gather(j)
+                    else:
+                        emit_atom(j)
+
+                def emit_atom(j):
                     base = base_i32 if j.on_i32 else base_i8
                     dst = lds_view(
                         base + j.lds_off + s * j.lds_stage,
@@ -1189,17 +1535,27 @@ def launch_gemm_a8w4_tdm(
                     for j in my_jobs:
                         emit(j)
                 else:
-                    for g in range_constexpr(len(job_waves)):
-                        if owns(job_waves[g]):
-                            for j in jobs:
-                                if const_expr(j.waves == job_waves[g]):
-                                    emit(j)
+                    for g in range_constexpr(len(exec_groups)):
+                        if owns(exec_groups[g][0]):
+                            for i in exec_groups[g][1]:
+                                emit(jobs[i])
 
             def dispatch_wave_job(fn):
                 """Run ``fn`` with the current wave's jobs."""
-                for g in range_constexpr(len(job_waves)):
-                    if owns(job_waves[g]):
-                        fn([j for j in jobs if j.waves == job_waves[g]])
+                for g in range_constexpr(len(exec_groups)):
+                    if owns(exec_groups[g][0]):
+                        fn([jobs[i] for i in exec_groups[g][1]])
+
+            def issue_scale_prologue():
+                """Loads the tile's full-K scales (gather_a scale prologue)."""
+                for job in sp_jobs:
+                    if owns(job.waves):
+                        destination = tensor_view(
+                            base_i32 + job.lds_off,
+                            (job.outer, job.inner),
+                            (job.lds_row, 1),
+                        )
+                        fx.copy(job.atom, job.gt, destination)
 
             def issue_as_prologue():
                 """Loads the full A-scale K range into its resident LDS buffer."""
@@ -1335,6 +1691,11 @@ def launch_gemm_a8w4_tdm(
                 return load_half(wn)
 
             def load_sa(base, sm, ksl, kt):
+                if const_expr(SP_SA):
+                    sp_base = ptr_to_idx(base_ptr) + SP_SA_OFF
+                    row = wave_m * warp_tile_m + sa_lane + sm * SA_ROWS_PER_LOAD
+                    off = (row * SP_SA_ROW + kt * SA_KDW + ksl) * 4
+                    return lds_load_b32(sp_base, fx.Int32(off))[0]
                 off = (ksl * wmma_m_rep + sm * 2) * 16 * 4
                 if const_expr(row_major_ascale and tdm_as_in_prologue):
                     as_base = ptr_to_idx(base_ptr) + AS_FULL_OFF
@@ -1355,7 +1716,19 @@ def launch_gemm_a8w4_tdm(
                     return lds_load_b32(as_base, fx.Int32(off))[0]
                 return lds_load_b32(base, fx.Int32(off))[0]
 
-            def load_sb(base, sn, ksl):
+            # Scale prologue: this lane's B-scale base in the resident super rows.
+            sp_sb_lane = (
+                stC_idx
+                + SP_SB_OFF
+                + fx.index_cast(T.index, ((wnb // 32) * K4 + lane) * 4)
+                if SP_SB
+                else None
+            )
+
+            def load_sb(base, sn, ksl, kt=0):
+                if const_expr(SP_SB):
+                    off = (sn * K4 + kt * SC_INNER + ksl * 32) * 4
+                    return lds_load_b32(sp_sb_lane, fx.Int32(off))[0]
                 off = (sn * SC_INNER + ksl * 32) * 4
                 return lds_load_b32(base, fx.Int32(off))[0]
 
@@ -1558,7 +1931,7 @@ def launch_gemm_a8w4_tdm(
                         ]
                         if SH16
                         else [
-                            load_sb(lds_addr.sb, sn, ksl)
+                            load_sb(lds_addr.sb, sn, ksl, kt)
                             for sn in range_constexpr(sb_pairs)
                         ]
                     )
@@ -1587,7 +1960,7 @@ def launch_gemm_a8w4_tdm(
                             sb_v.append(
                                 load_sb_row(lds_addr.sb, i, ksl)
                                 if SH16
-                                else load_sb(lds_addr.sb, i, ksl)
+                                else load_sb(lds_addr.sb, i, ksl, kt)
                             )
                     slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
                     slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - SB_LOADS]))
@@ -1703,7 +2076,13 @@ def launch_gemm_a8w4_tdm(
                     # Spread the tail issue's TDMs over the WMMA groups: one burst
                     # would block the MFMA pipe for its whole descriptor setup.
                     tdm_schedule = spread(
-                        TDM_PER if (prefetch_kt is not None and ksl + 1 == kws) else 0,
+                        (
+                            sum(_job_tdm(j) for j in my_jobs)
+                            if my_jobs is not None
+                            else TDM_PER
+                        )
+                        if (prefetch_kt is not None and ksl + 1 == kws)
+                        else 0,
                         schedule_slots,
                     )
                     first_ds = min(DS_FIRST_N, future_schedule[0])
@@ -1832,6 +2211,67 @@ def launch_gemm_a8w4_tdm(
                         _rm_weight_rows.append(
                             _weight_valid.select(_weight, fx.Float32(0.0))
                         )
+                if const_expr(gather_a):
+                    # Each A-owner wave reads its rows' tokens once a tile (lane i:
+                    # row i of a gather) into the index groups. Rows at or past the
+                    # expert's end read row 0's entry: a working tile's first row is
+                    # always a route row, so every index is a real token row (see
+                    # GATHER_OOB). Their outputs are never stored.
+                    _GATHER_TRACE["state"] = []
+                    _aw = wave - A_GW[0]
+                    _a_owner = (_aw >= 0) & (_aw < len(A_GW))
+                    for t in range_constexpr(GPW):
+                        _g = _aw * GPW + t
+                        _row = _g * GATHER_ROWS + lane16
+                        _ok = (_row < mn_oob) & _a_owner
+                        if const_expr(GATHER_EARLY_IDX):
+                            _idx = _ok.select(early_tok[t], early_tok[GPW])
+                        else:
+                            _idx = fx.Int32(
+                                fx.ptr_load(
+                                    fx.recast_iter(fx.Int32, arg_ep_row_map)
+                                    + blk_m64
+                                    + fx.Int64(_ok.select(_row, fx.Int32(0)))
+                                )
+                            )
+                        # This gather's valid rows, 1..16 (tile_dim1 option).
+                        _nvalid = mn_oob - _g * GATHER_ROWS
+                        _nvalid = (_nvalid < GATHER_ROWS).select(
+                            _nvalid, fx.Int32(GATHER_ROWS)
+                        )
+                        _nvalid = (_nvalid > 0).select(_nvalid, fx.Int32(1))
+                        _idxs = [
+                            fx.Int32(
+                                rocdl.readlane(T.i32, _raw(_idx), _raw(fx.Int32(i)))
+                            )
+                            for i in range_constexpr(GATHER_ROWS)
+                        ]
+                        _d = make_tensor_gather_descriptor(
+                            gA_view,
+                            gA_lds_view,
+                            _idxs,
+                            row_width=A_ROW_B,
+                            tensor_dim0=A_ROW_B,
+                            tensor_dim1=GATHER_OOB,
+                            stride=A_KROW,
+                            elem_bytes=1,
+                            pad_interval=A_ROW_B,
+                            pad_amount=LDS_PAD_A,
+                            index_size=16,
+                            gather_tile_dim1=_nvalid if GATHER_TILE_DIM1 else None,
+                        )
+                        _GATHER_TRACE["state"].append(
+                            (
+                                _d.dgroup1,
+                                _d.dgroup2,
+                                _d.dgroup3,
+                                fx.Int32(A_LDS_OFF)
+                                + _g * fx.Int32(GATHER_ROWS * A_LDS_ROW),
+                            )
+                        )
+                if const_expr(SP_SA or SP_SB):
+                    # Oldest TDM loads of the tile: the first fence covers them.
+                    issue_scale_prologue()
                 if const_expr(tdm_as_in_prologue):
                     issue_as_prologue()
                     # The first normal pipeline fence covers this oldest TDM load.
@@ -1852,8 +2292,7 @@ def launch_gemm_a8w4_tdm(
                         if const_expr(next_stage_on):
                             # Every rolled iteration reads the carry, so prime it here --
                             # outside ``dispatch_wave_job``, since every wave runs this once.
-                            tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
-                            workgroup_barrier()
+                            fence_stages(num_buffers - 1)
                             first_lds_addr = calc_lds_addr(0)
                             rocdl.sched_barrier(0)
                             load_lds_data(
@@ -1869,9 +2308,7 @@ def launch_gemm_a8w4_tdm(
                                 s = kt % num_buffers
                                 buf = s
                                 if const_expr(not next_stage_on):
-                                    pipeline_fence(
-                                        outstanding=TDM_PER * (num_buffers - 1)
-                                    )
+                                    fence_stages(num_buffers - 1, my_jobs)
                                 next_stage_buf = (
                                     (kt + 1) % num_buffers
                                     if const_expr(next_stage_on)
@@ -1883,8 +2320,12 @@ def launch_gemm_a8w4_tdm(
                                     None,
                                     next_stage_on,
                                     next_stage_buf,
-                                    next_stage_wait=(
-                                        TDM_PER * (num_buffers - 2)
+                                    next_stage_fence_fn=(
+                                        (
+                                            lambda mj=my_jobs: fence_stages(
+                                                num_buffers - 2, mj
+                                            )
+                                        )
                                         if const_expr(next_stage_on)
                                         else None
                                     ),
@@ -1906,9 +2347,8 @@ def launch_gemm_a8w4_tdm(
                             kt = n_steady + j
                             buf = kt % num_buffers
                             has_next = next_stage_on and j + 1 < num_buffers
-                            pipeline_fence(
-                                outstanding=TDM_PER
-                                * max(0, num_buffers - 1 - j - (1 if has_next else 0))
+                            fence_stages(
+                                max(0, num_buffers - 1 - j - (1 if has_next else 0))
                             )
                             next_stage_buf = (
                                 (kt + 1) % num_buffers if const_expr(has_next) else None
@@ -1930,7 +2370,7 @@ def launch_gemm_a8w4_tdm(
                             issue(i, i)
                         n_steady = K_TILES - PRE
                         if const_expr(next_stage_on):
-                            pipeline_fence(outstanding=TDM_PER * (PRE - 1))
+                            fence_stages(PRE - 1)
                             first_lds_addr = calc_lds_addr(0)
                             rocdl.sched_barrier(0)
                             load_lds_data(
@@ -1946,7 +2386,7 @@ def launch_gemm_a8w4_tdm(
                         def steady_mid_iteration(my_jobs, kt, s):
                             buf = s
                             if const_expr(not next_stage_on):
-                                pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
+                                fence_stages(num_buffers - 2, my_jobs)
                                 rocdl.sched_barrier(0)
                                 issue(
                                     (kt + PRE) % num_buffers,
@@ -1968,8 +2408,12 @@ def launch_gemm_a8w4_tdm(
                                 my_jobs,
                                 # At the fence, before this tile's issue: kt+PRE tiles
                                 # are out and everything through kt+1 must have landed.
-                                (
-                                    TDM_PER * (num_buffers - 2)
+                                next_stage_fence_fn=(
+                                    (
+                                        lambda mj=my_jobs: fence_stages(
+                                            num_buffers - 2, mj
+                                        )
+                                    )
                                     if const_expr(next_stage_on)
                                     else None
                                 ),
@@ -2002,14 +2446,9 @@ def launch_gemm_a8w4_tdm(
                             if const_expr(rolled_drain and not isinstance(j, int)):
                                 for wait_stage in range_constexpr(PRE):
                                     if j == wait_stage:
-                                        pipeline_fence(
-                                            outstanding=TDM_PER
-                                            * max(0, num_buffers - 2 - wait_stage)
-                                        )
+                                        fence_stages(max(0, num_buffers - 2 - wait_stage))
                             else:
-                                pipeline_fence(
-                                    outstanding=TDM_PER * max(0, num_buffers - 2 - j)
-                                )
+                                fence_stages(max(0, num_buffers - 2 - j))
 
                         def compute_drain_tile(j, has_next, kws=KWS):
                             kt = n_steady + j

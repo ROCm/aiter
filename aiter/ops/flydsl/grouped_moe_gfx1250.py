@@ -521,6 +521,12 @@ def _build_g2l_lut(
     return lut, None, None
 
 
+def _gather_a_ok(tile_m, m_warp, n_warp) -> bool:
+    from aiter.ops.flydsl.grouped_gemm_mxfp4 import gather_a_supported
+
+    return gather_a_supported(tile_m, m_warp, n_warp)
+
+
 def _tdm_align_up(x: int, a: int) -> int:
     return ((int(x) + a - 1) // a) * a
 
@@ -726,6 +732,8 @@ def _grouped_a8w4_tdm_moe(
     _route_psum_fused = False
     # Set when a deferred top-k was fused with the routing and the quant.
     _prepared_a1 = None
+    # gather_a: MoE1's grouped row -> token map (A rows token-major).
+    _a_row_map = None
     ep_rowmap = None
     if _compact or _is_ep:
         resolve_deferred_topk()
@@ -871,6 +879,12 @@ def _grouped_a8w4_tdm_moe(
                 # Prefill sizes: the same outputs from two launches in place of
                 # the eight of the split path below (one with row-major scales).
                 _prepared_row_major = topk_route_quant_prefill_row_major_scale()
+                _gather_a = (
+                    _prepared_row_major
+                    and moe_gather_a()
+                    and int(token_num) < 0xFFFF
+                    and _gather_a_ok(tile_m, m_warp, n_warp)
+                )
                 _prepared_a1 = fused_topk_route_quant_prefill(
                     _deferred.gating_output,
                     hidden_states,
@@ -883,7 +897,10 @@ def _grouped_a8w4_tdm_moe(
                     topk_ids=topk_ids,
                     shared=_fused_sh,
                     row_major_scale=_prepared_row_major,
+                    gather_payload=_gather_a,
                 )
+                if _gather_a:
+                    _a_row_map = _prepared_a1[7]
             else:
                 _deferred.resolve()
         # TP with a per-pass real row count (ATOM's `Context.scheduled_tokens_gpu`):
@@ -914,7 +931,7 @@ def _grouped_a8w4_tdm_moe(
             and int(E) <= _FUSED_ROUTE_PSUM_MAX_EXPERTS
         )
         if _prepared_a1 is not None:
-            _, _, _masked_m, topids_to_rows, psum, _, _ = _prepared_a1
+            _masked_m, topids_to_rows, psum = _prepared_a1[2:5]
             _route_psum_fused = True
         elif _route_psum_fused:
             # Same alignment as contiguous_psum_remap below.
@@ -1271,6 +1288,7 @@ def _grouped_a8w4_tdm_moe(
             row_major_ascale=_row_major_ascale,
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
+            a_row_map=_a_row_map,
             **_situ_kw,
         )
     else:
@@ -1311,6 +1329,7 @@ def _grouped_a8w4_tdm_moe(
             row_major_ascale=_row_major_ascale,
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
+            a_row_map=_a_row_map,
             **_situ_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
@@ -1951,6 +1970,36 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["n_warp"] = _base_nw
             _tdm_kw["m_warp2"] = _ov_mw2 if _ov_mw2 is not None else _base_mw
             _tdm_kw["n_warp2"] = _ov_nw2 if _ov_nw2 is not None else _base_nw
+        # AITER_MOE_GATHER_CFG=tile_m,tile_n,tile_k,m_warp,n_warp,num_buffers:
+        # MoE1's tiles when it gathers A (AITER_MOE_GATHER_A), from
+        # AITER_MOE_GATHER_CFG_MIN_TOKENS tokens on (default 2048); MoE2 keeps
+        # its own.
+        _gcfg = os.environ.get("AITER_MOE_GATHER_CFG")
+        if (
+            _gcfg
+            and (
+                moe_gather_a()
+                # A/B of a tile config without the gather (benchmarks).
+                or os.environ.get("AITER_MOE_GEMM1_CFG_ANY", "0") == "1"
+            )
+            and int(token_num)
+            >= int(os.environ.get("AITER_MOE_GATHER_CFG_MIN_TOKENS", "2048"))
+        ):
+            _s1 = {
+                "tile_m": _tdm_kw.get("tile_m", tile_m),
+                "tile_n": _tdm_kw.get("tile_n", int(n_warp) * 64),
+                "tile_k": _tdm_kw.get("tile_k", 128),
+                "m_warp": _tdm_kw.get("m_warp", 1),
+                "n_warp": _tdm_kw.get("n_warp", n_warp),
+                "num_buffers": _tdm_kw.get("num_buffers", num_buffers),
+            }
+            # MoE2 keeps the tiles it had (its own, or MoE1's before this).
+            for _k1 in _s1:
+                _k2 = _k1 + "2"
+                if _tdm_kw.get(_k2) is None:
+                    _tdm_kw[_k2] = _s1[_k1]
+            for _k1, _v in zip(_s1, (int(x) for x in _gcfg.split(","))):
+                _tdm_kw[_k1] = _v
         return _grouped_a8w4_tdm_moe(
             hidden_states,
             w1,
@@ -2542,6 +2591,7 @@ def _get_compiled_topk_route_quant_prefill(
     quant_mode: str,
     shared: bool = False,
     row_major_scale: bool = False,
+    gather_payload: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_topk_route_quant_prefill import (
         build_moe_topk_route_quant_prefill_module,
@@ -2557,7 +2607,17 @@ def _get_compiled_topk_route_quant_prefill(
         quant_mode=quant_mode,
         shared=shared,
         row_major_scale=row_major_scale,
+        gather_payload=gather_payload,
     )
+
+
+@functools.cache
+def moe_gather_a() -> bool:
+    """AITER_MOE_GATHER_A=1: at prefill sizes (the prefill top-k / route /
+    quant with row-major scales) the activation's MXFP4 rows are written once a
+    token and MoE1 TDM-gathers its A rows by index, instead of reading the
+    top-k copies the route/quant writes otherwise."""
+    return os.environ.get("AITER_MOE_GATHER_A", "0") in _TRUTHY_ENV
 
 
 @functools.cache
@@ -2693,6 +2753,7 @@ def fused_topk_route_quant_prefill(
     topk_ids: torch.Tensor | None = None,
     shared: bool = False,
     row_major_scale: bool = False,
+    gather_payload: bool = False,
 ):
     """Two launches for the prefill front end of the grouped MoE, in place of
     eight: ``topk_softmax(renormalize)`` + the route/psum/remap + the
@@ -2706,7 +2767,14 @@ def fused_topk_route_quant_prefill(
     ``row_major_scale``: one launch; the scale comes back row-major
     (1, contiguous_m, feat_dim // 32) for MoE1's ``row_major_ascale`` (tile
     padding rows unwritten: MoE1 bounds them by the expert's rows).
+
+    ``gather_payload`` (with ``row_major_scale``): the payload comes back
+    token-major (1, token_num, payload_bytes), one row a token, and an eighth
+    return value is ``row_to_token`` (contiguous_m,) int32 (route rows only;
+    tile padding unwritten) for MoE1's TDM gather of its A rows.
     """
+    if gather_payload and not row_major_scale:
+        raise ValueError("gather_payload needs row_major_scale")
     if quant_mode != "fp4":
         raise NotImplementedError("the prefill route/quant writes MXFP4 only")
     device = hidden_states.device
@@ -2727,7 +2795,9 @@ def fused_topk_route_quant_prefill(
     psum = torch.empty(experts + int(shared), dtype=torch.int32, device=device)
     payload_bytes = feat_dim if quant_mode == "fp8" else feat_dim // 2
     payload = torch.empty(
-        (1, contiguous_m, payload_bytes), dtype=torch.uint8, device=device
+        (1, token_num if gather_payload else contiguous_m, payload_bytes),
+        dtype=torch.uint8,
+        device=device,
     )
     # The kernel writes row_to_token for every route row and -1 on each
     # expert's tile padding; the preshuffle bounds the rest by psum, so
@@ -2736,7 +2806,11 @@ def fused_topk_route_quant_prefill(
         compact = torch.empty(
             (1, int(contiguous_m), feat_dim // 32), dtype=torch.uint8, device=device
         )
-        row_to_token = compact  # not written
+        row_to_token = (
+            torch.empty(int(contiguous_m), dtype=torch.int32, device=device)
+            if gather_payload
+            else compact  # not written
+        )
     else:
         compact = torch.empty(
             (token_num, feat_dim // 32), dtype=torch.uint8, device=device
@@ -2757,6 +2831,7 @@ def fused_topk_route_quant_prefill(
         quant_mode,
         bool(shared),
         bool(row_major_scale),
+        bool(gather_payload),
     )(
         ptr_arg(gating_output),
         ptr_arg(hidden_states),
@@ -2785,7 +2860,7 @@ def fused_topk_route_quant_prefill(
             psum,
             payload,
             compact,
-        )
+        ) + ((row_to_token,) if gather_payload else ())
     scale_w = feat_dim // 32
     scale = torch.empty(
         (1, contiguous_m // wmma_rep, scale_w * wmma_rep),

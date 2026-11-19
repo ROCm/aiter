@@ -297,3 +297,22 @@ def tensor_store_gather(
         dg4,
         cache_policy=cache_policy if cache_policy else None,
     )
+
+
+@dsl_loc_tracing
+def tensor_load_gather(dgroup0, dgroup1, dgroup2, dgroup3, cache_policy: int = 0) -> None:
+    """Issue one TDM gather load (Global -> LDS) from prebuilt descriptor groups.
+
+    The groups are passed apart so a K loop can rebuild only the address group
+    (``make_tensor_gather_dgroup0``) and keep the K-invariant groups 1-3 (the
+    configuration and the row indices) in SGPRs across iterations.
+    """
+    dg4 = _zero_dgroup_v8i32()
+    rocdl.tensor_load_to_lds(
+        dgroup0,
+        dgroup1,
+        dgroup2,
+        dgroup3,
+        dg4,
+        cache_policy=cache_policy if cache_policy else None,
+    )
