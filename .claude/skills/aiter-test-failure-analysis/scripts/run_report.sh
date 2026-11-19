@@ -43,7 +43,7 @@ fi
 REPORT="$WORK_DIR/fallback_report.md"
 if [ -s "$WORK_DIR/prompt.md" ] && { [ -x "$AGENT" ] || command -v "$AGENT" >/dev/null 2>&1; }; then
   set +e
-  env -u GH_TOKEN -u GITHUB_TOKEN timeout "$AGENT_TIMEOUT" \
+  env -u GH_TOKEN -u GITHUB_TOKEN -u AITER_BOT_TOKEN timeout "$AGENT_TIMEOUT" \
     "$AGENT" -p --dangerously-skip-permissions "$(cat "$WORK_DIR/prompt.md")" \
     > "$WORK_DIR/agent_report.md" 2> "$WORK_DIR/agent.err"
   rc=$?
