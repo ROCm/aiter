@@ -81,6 +81,7 @@ class WmmaKernelInstance:
     early_a: bool = False
     early_b: bool = False
     fused_splitk: bool = False
+    disable_arb: bool = False
 
     def name_for(self, a_preshuffle: bool = False) -> str:
         return (
@@ -95,6 +96,7 @@ class WmmaKernelInstance:
                 if self.early_a and self.early_b
                 else ("_ea" if self.early_a else ("_eb" if self.early_b else ""))
             )
+            + ("_das" if self.disable_arb else "")
         )
 
     @property
@@ -279,6 +281,24 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
                     fused_splitk=True,
                 )
                 idx += 1
+    # PeakGemm/flydsl-examples use this gfx1250 arbitration mode for TDM+WMMA.
+    # Keep it an opt-in strategy because scaled FP8 has extra LDS/scale traffic.
+    for tm, tn, tk, mw, nw, nb in _COMPUTE_PROFILES:
+        for cm, cn in (*_COMPUTE_CLUSTERS, *_COMPUTE_UNCLUSTERED):
+            kl[idx] = WmmaKernelInstance(
+                tile_m=tm,
+                tile_n=tn,
+                tile_k=tk,
+                num_buffers=nb,
+                split_k=1,
+                cluster_m=cm,
+                cluster_n=cn,
+                m_warp=mw,
+                n_warp=nw,
+                name_prefix=COMPUTE_NAME_PREFIX,
+                disable_arb=True,
+            )
+            idx += 1
     return kl
 
 

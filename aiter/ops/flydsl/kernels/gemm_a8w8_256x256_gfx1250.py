@@ -62,6 +62,7 @@ def launch_gemm_a8w8_256x256(
     persistent_n_tiles: Constexpr[int] = 1,
     early_a: Constexpr[bool] = False,
     early_b: Constexpr[bool] = False,
+    disable_arb: Constexpr[bool] = False,
     fused_splitk: Constexpr[bool] = False,
     bounded_m: Constexpr[bool] = True,
     a_scale_preshuffled: Constexpr[bool] = False,
@@ -285,6 +286,7 @@ def launch_gemm_a8w8_256x256(
             if early_a and early_b
             else ("_ea" if early_a else ("_eb" if early_b else ""))
         )
+        + ("_das" if disable_arb else "")
         + ("_fsk" if cluster_splitk else "")
         + ("_aspre" if a_scale_preshuffled else "")
         + ("_bs32x32" if b_scale_32x32 else "")
@@ -1850,6 +1852,8 @@ def launch_gemm_a8w8_256x256(
         i32_ldc: fx.Int32,
         arg_out: fx.Pointer,
     ):
+        if const_expr(disable_arb):
+            rocdl.disable_xdl_arb_stall()
         tile_args = (
             arg_c,
             arg_a,

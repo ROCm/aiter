@@ -508,6 +508,26 @@ def test_gfx1250_compute_catalog_exposes_cluster_local_splitk():
     assert parsed is not None and parsed["fused_splitk"] is True
 
 
+def test_gfx1250_compute_catalog_exposes_arbitration_strategy():
+    from aiter.ops.flydsl import mxfp8_bpreshuffle_gemm_gfx1250 as direct
+    from aiter.ops.flydsl.gemm_tune import (
+        flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common as catalog,
+    )
+
+    candidates = [
+        instance for instance in catalog.kernels_list.values() if instance.disable_arb
+    ]
+    assert candidates
+    assert all(
+        catalog.is_compute_kernel(instance) and instance.name.endswith("_das")
+        for instance in candidates
+    )
+    parsed = direct.parse_mxfp8_32_wmma_kernel_name(
+        candidates[0].name.replace("mxfp8_128", "mxfp8_32")
+    )
+    assert parsed is not None and parsed["disable_arb"] is True
+
+
 @pytest.mark.parametrize("w_rows", [1, 32])
 @pytest.mark.parametrize("m", [1, 3])
 def test_mxscale_bpreshuffle_32_wide_w_reaches_blockscale_x_kernel(
