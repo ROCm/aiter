@@ -93,6 +93,14 @@ def run_case(case, tokens):
             per_m = {str(r["token"]): r["us"] for r in rows}
             if len(per_m) != len(rows):
                 raise RuntimeError(f"case {case[0]}: several results per token: {rows}")
+            requested = {str(token) for token in tokens}
+            if set(per_m) != requested:
+                missing = sorted(requested - set(per_m), key=int)
+                unexpected = sorted(set(per_m) - requested, key=int)
+                raise RuntimeError(
+                    f"case {case[0]}: incomplete token results; "
+                    f"missing={missing}, unexpected={unexpected}"
+                )
             return per_m
     raise RuntimeError(f"case {case[0]} failed:\n{proc.stderr[-3000:]}")
 

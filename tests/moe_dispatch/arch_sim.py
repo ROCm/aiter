@@ -105,6 +105,7 @@ def _patched(obj, name, value):
 @contextlib.contextmanager
 def simulated_arch(name):
     import aiter
+    import aiter.fhmoe as _fhmoe  # noqa: F401 - preload before scanning bindings
     import aiter.fused_moe as fm
     from aiter.jit.utils import chip_info
     from aiter.utility import dtypes
