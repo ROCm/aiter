@@ -822,15 +822,28 @@ class Gfx1250Bf16Pipeline:
         )
         # Keep the Q loads ahead of the first page's table lookup.
         fx.rocdl.sched_barrier(0)
-        self.mem.stage_bf16_page(begin, fx.Int32(0))
+        if const_expr(t.nvfp4):
+            self.mem.stage_nvfp4_page(begin, fx.Int32(0))
+        else:
+            self.mem.stage_bf16_page(begin, fx.Int32(0))
         for token_i, state in range(begin, end, 128, init=initial):
             token_base = fx.Int32(token_i)
             buffer = ((token_base - begin) // 128) % 2
             tdm_ops.tensor_wait(0)
             gpu.barrier()
-            kv_off = t.q_bytes + buffer * t.kv_stride
-            if token_base + 128 < end:
-                self.mem.stage_bf16_page(token_base + 128, 1 - buffer)
+            if const_expr(t.nvfp4):
+                # Raw NVFP4 pages are double-buffered, the BF16 V page is not:
+                # the barrier above retired the previous page's reads of both.
+                kv_off = t.q_bytes
+                raw = t.nvfp4_raw_offset + buffer * t.nvfp4_raw_page_bytes
+                if token_base + 128 < end:
+                    self.mem.stage_nvfp4_page(token_base + 128, 1 - buffer)
+                self.mem.widen_nvfp4_v(buffer)
+                gpu.barrier()
+            else:
+                kv_off = t.q_bytes + buffer * t.kv_stride
+                if token_base + 128 < end:
+                    self.mem.stage_bf16_page(token_base + 128, 1 - buffer)
             next_state = []
             for m in range_constexpr(t.m_tiles):
                 row = m * 16 + ctx.lane16
@@ -844,14 +857,28 @@ class Gfx1250Bf16Pipeline:
                 units = []
                 for n in range_constexpr(2):
                     scores = fx.Vector.filled(8, 0.0, fx.Float32)
-                    for d in range_constexpr(t.head_dim // 32):
-                        k = self.mem.bf16_k_operand(
-                            kv_off,
-                            ctx.warp * 32 + n * 16,
-                            d * 32,
-                            ctx.lane16,
-                            ctx.half,
+                    if const_expr(t.nvfp4):
+                        k_scales = self.mem.nvfp4_k_scales(
+                            raw, ctx.warp * 32 + n * 16, ctx.lane16
                         )
+                    for d in range_constexpr(t.head_dim // 32):
+                        if const_expr(t.nvfp4):
+                            k = self.mem.nvfp4_k_operand(
+                                raw,
+                                k_scales,
+                                ctx.warp * 32 + n * 16,
+                                d * 32,
+                                ctx.lane16,
+                                ctx.half,
+                            )
+                        else:
+                            k = self.mem.bf16_k_operand(
+                                kv_off,
+                                ctx.warp * 32 + n * 16,
+                                d * 32,
+                                ctx.lane16,
+                                ctx.half,
+                            )
                         scores = Gfx1250Gemm.mma(k, q_operands[m][d], scores, 32, True)
                     for r in range_constexpr(8):
                         token = token_base + ctx.warp * 32 + n * 16 + ctx.half * 8 + r
@@ -990,13 +1017,46 @@ class Gfx1250Bf16Pipeline:
                                 pmax[partial_row] = row_max
                                 psum[partial_row] = denom
 
+        def store_quantized():
+            # The FP8 output (NVFP4 K/V, one query token, one query tile):
+            # lane16 picks the row (GQA head), warp, half and vh the dims, so
+            # this CTA holds all of the token's values, as in Gfx1250Pipeline.
+            denom = final[1]
+            inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
+            norm = fx.Vector.from_elements([inv], dtype=fx.Float32).broadcast_to(8)
+            values, offsets = [], []
+            for vh in range_constexpr(t.head_dim // 64):
+                values.append((final[2 + vh] * norm).to(t.q_dtype))
+                offsets.append(
+                    self.merge.output_offset(
+                        ctx.lane16, vh * 64 + ctx.warp * 16 + ctx.half * 8
+                    )
+                )
+            ctx.quant.store_cta(
+                self.mem,
+                ctx.planned_seq,
+                ctx.warp,
+                ctx.lane,
+                values,
+                offsets,
+                fx.recast_iter(
+                    t.q_dtype,
+                    ctx.output_ptr if t.merged_output else ctx.pout_ptr,
+                ),
+            )
+
         if const_expr(t.merged_output):
             if ctx.task_count == 1:
-                store(True)
+                if const_expr(t.quant_output):
+                    store_quantized()
+                else:
+                    store(True)
             else:
                 store(False)
                 if const_expr(t.merge_partitions):
                     self.merge.arrive()
+        elif const_expr(t.quant_output):
+            store_quantized()
         else:
             store(t.direct_output)
 

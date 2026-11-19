@@ -33,6 +33,17 @@ row) share this scaffolding and have their own tile: QK is one scaled MFMA (fp4 
 e4m3 Q), V is widened to bf16 through wave-private LDS. A wave owns 64 tokens of the
 tile and all dims, so the tile loop has no barrier; the waves merge once after it.
 
+NVFP4 K/V (``kv_dtype=dtypes.fp4x2`` with ``kv_scale_dtype=torch.float8_e4m3fn``,
+gfx1250, head_dim 128, page 128) are e2m1 with one E4M3 scale per 16 values, stored
+token-major per (page, KV head): [128, 64] payload and [128, 8] scale bytes. Tiles
+of one query tile (<= 16 rows) run ``Gfx1250Nvfp4WavePipeline``: each wave owns 32
+tokens of every page, DMAs them itself, computes QK and dequantizes V with
+``v_wmma_scale16_f32_16x16x128_f8f6f4`` straight from the raw rows and keeps
+softmax and P in registers, so the page loop has no CTA barrier. Wider tiles run
+the BF16 page128 pipeline: tensor DMA double-buffers the raw page in LDS and the
+CTA widens it (``v_cvt_scale_pk8_bf16_fp4`` then a packed BF16 multiply by the
+block scale, exact) into the BF16 layouts that pipeline reads.
+
 Logical layouts (not preshuffled):
 
 * ``query``        [num_seqs * query_length, num_q_heads, head_dim]  f16/bf16
@@ -56,6 +67,8 @@ and LDS movement, MFMA/WMMA, softmax and output operations.
 this module keeps the compilation API and launch wrappers.
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -72,6 +85,7 @@ from .pa_decode.op_merge import (
     Gfx1250ClusterMerge,
     Gfx1250OutputQuant,
 )
+from .pa_decode.pipeline_nvfp4 import Gfx1250Nvfp4WavePipeline
 from .pa_decode.pipeline import (
     Gfx1250Bf16Pipeline,
     Gfx1250Bf16WavePipeline,
@@ -114,6 +128,15 @@ __all__ = [
 # Key by selected specialization, not batch/head/CU scheduling inputs.
 _PA_DECODE_TILE_CACHE = {}
 _GFX1250_PA_DECODE_CACHE = {}
+# NVFP4 tiles of one query tile (<= 16 rows: M3.1 TP4 decode, MTP and prefill
+# rows) run the wave pipeline (scaled-WMMA QK and V dequantization, no
+# per-page CTA barrier). AITER_FLYDSL_NVFP4_PA_LEGACY=1 selects the CTA-shared
+# BF16-widening pipeline instead (A/B benchmarks); wider tiles always use it.
+# AITER_FLYDSL_NVFP4_PA_BUFFERS sets the wave pipeline's page ring (2-4).
+NVFP4_LEGACY = os.environ.get("AITER_FLYDSL_NVFP4_PA_LEGACY", "0") == "1"
+NVFP4_BUFFERS = int(os.environ.get("AITER_FLYDSL_NVFP4_PA_BUFFERS", "3"))
+if NVFP4_BUFFERS not in (2, 3, 4):
+    raise ValueError("AITER_FLYDSL_NVFP4_PA_BUFFERS must be 2, 3 or 4")
 
 
 def _dtype_tag(dtype):
@@ -196,6 +219,7 @@ def compile_pa_decode_tile(
     cluster_merge: int = 0,
     quant_output: bool = False,
     store_output: bool = True,
+    kv_scale_dtype: torch.dtype | None = None,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -206,6 +230,9 @@ def compile_pa_decode_tile(
     MXFP4. ``query_dtype`` is the query's: f16 or bf16, or e4m3fn with MXFP4 KV.
     Non-torch dtypes, such as the former ``"fp8"`` strings, raise TypeError;
     unsupported dtypes and combinations raise ValueError.
+    ``kv_scale_dtype=torch.float8_e4m3fn`` with an fp4x2/uint8 ``kv_dtype`` selects
+    NVFP4 (gfx1250 only): E4M3 block scales of 16 values instead of MXFP4's E8M0
+    of 32.
 
     ``query_splits=None`` selects from host-known grid bounds; an explicit
     count overrides splitting and selects the matching prefetch policy.
@@ -259,6 +286,44 @@ def compile_pa_decode_tile(
     if not trans_k:
         raise NotImplementedError("Non-transposed key cache is not implemented")
     architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
+    nvfp4 = kv_scale_dtype == torch.float8_e4m3fn
+    if kv_scale_dtype is not None and not nvfp4:
+        raise ValueError(f"Unsupported PA KV scale dtype {kv_scale_dtype}")
+    if nvfp4:
+        kv_fx, query_fx = pa_fx_dtypes(kv_dtype, query_dtype)
+        if architecture not in ("gfx1250", "gfx1250-strict"):
+            raise NotImplementedError(
+                f"NVFP4 PA decode supports gfx1250, not {architecture}"
+            )
+        if kv_fx != MXFP4_KV_DTYPE or query_fx not in (fx.Float16, fx.BFloat16):
+            raise ValueError(
+                "NVFP4 PA decode takes fp4x2/uint8 KV with an f16/bf16 query, "
+                f"got {kv_dtype} and {query_dtype}"
+            )
+        wave = (
+            not NVFP4_LEGACY
+            and query_length * query_group_size <= 16
+            and (query_splits is None or query_splits == 1)
+        )
+        return compile_gfx1250_pa_decode(
+            head_dim=head_dim,
+            query_group_size=query_group_size,
+            block_size=block_size,
+            softmax_scale=softmax_scale,
+            query_dtype=_dtype_tag(query_fx),
+            per_token_kv=False,
+            query_length=query_length,
+            trans_v=True,
+            sliding_window=sliding_window,
+            compute_dtype="nvfp4w" if wave else "nvfp4",
+            nvfp4_buffers=NVFP4_BUFFERS if wave else 0,
+            direct_output=direct_output and num_partitions == 1,
+            query_splits=1 if query_splits is None else query_splits,
+            merge_partitions=direct_output and num_partitions > 1,
+            cluster_merge=cluster_merge,
+            quant_output=quant_output,
+            store_output=store_output,
+        )
     if architecture in ("gfx1250", "gfx1250-strict"):
         kv_fx, query_fx = pa_fx_dtypes(kv_dtype, query_dtype)
         if query_fx not in (fx.Float16, fx.BFloat16) or kv_fx not in (
@@ -558,6 +623,7 @@ def compile_gfx1250_pa_decode(
     cluster_merge=0,
     quant_output=False,
     store_output=True,
+    nvfp4_buffers=0,
 ):
     """Compile a gfx1250 tile kernel; merging partitions writes final output.
 
@@ -590,9 +656,29 @@ def compile_gfx1250_pa_decode(
         cluster_merge,
         quant_output,
         store_output,
+        nvfp4_buffers if compute_dtype == "nvfp4w" else 0,
     )
-    if compute_dtype not in ("fp8", "bf16"):
+    if compute_dtype not in ("fp8", "bf16", "nvfp4", "nvfp4w"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
+    if t.nvfp4 and not (
+        head_dim == 128
+        and block_size == 128
+        and trans_v
+        and not per_token_kv
+        and sliding_window == 0
+        and query_splits == 1
+        and t.bf16_page128_packed
+        and not t.bf16_wave_query_tiles
+    ):
+        # The widening pass maps one token (K) and one 8-token x 16-dim block (V)
+        # to each of the 128 threads: head_dim 128 and page 128. Four query
+        # tiles would select the BF16 wave-pair pipeline, which it does not feed.
+        raise ValueError(
+            "NVFP4 PA decode supports head_dim 128, page 128, at most 48 query rows "
+            "(query_length x GQA), no sliding window or query split"
+        )
+    if t.nvfp4_wave and not (t.m_tiles == 1 and 2 <= nvfp4_buffers <= 4):
+        raise ValueError("The NVFP4 wave pipeline takes one query tile, 2-4 buffers")
     if t.bf16 and per_token_kv:
         raise ValueError("BF16 PA decode does not use quantization scales")
     if merge_partitions and (direct_output or head_dim > MERGE_HEAD_DIM):
@@ -623,10 +709,11 @@ def compile_gfx1250_pa_decode(
         query_group_size != 16
         or head_dim != 128
         or query_length != 1
-        or block_size != 16
+        or block_size != (128 if t.nvfp4 else 16)
     ):
         raise ValueError(
-            "quant_output requires query_length=1, GQA=16, head_dim=128 and page16"
+            "quant_output requires query_length=1, GQA=16, head_dim=128 and page16 "
+            "(page128 for NVFP4 K/V)"
         )
     if not (store_output or quant_output):
         raise ValueError("store_output=False requires quant_output")
@@ -658,6 +745,8 @@ def compile_gfx1250_pa_decode(
         quant_output=quant_output,
         store_output=store_output,
     )
+    if t.nvfp4_wave and nvfp4_buffers != 3:
+        kernel_name += f"_ring{nvfp4_buffers}"
 
     # Every argument that reducer-fed and direct-output kernels read fits in
     # the 30 user SGPRs (120 bytes) that preload kernel arguments, ahead of
@@ -810,7 +899,9 @@ def compile_gfx1250_pa_decode(
             if const_expr(t.cluster_merge):
                 ctx.task_count = count
                 ctx.output_ptr = output
-            if const_expr(t.bf16_wave_query_tiles):
+            if const_expr(t.nvfp4_wave):
+                Gfx1250Nvfp4WavePipeline(ctx).run()
+            elif const_expr(t.bf16_wave_query_tiles):
                 Gfx1250Bf16WavePipeline(ctx).run()
             elif const_expr(t.bf16_page128_packed):
                 Gfx1250Bf16Pipeline(ctx).run()

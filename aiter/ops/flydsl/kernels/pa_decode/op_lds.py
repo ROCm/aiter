@@ -1481,6 +1481,161 @@ class Gfx1250Memory:
                 )
 
     @flyc.jit
+    def stage_nvfp4_page(self, token_base, buffer):
+        """DMA one NVFP4 (page, KV head) into raw buffer ``buffer``, one wave a plane.
+
+        Raw buffer: K payload [128, D/2], V payload, K scales [128, D/16], V
+        scales, all token-major as the cache stores them. Rows at or past the
+        context (and pages past it, pinned to block 0) arrive zero-filled, so
+        they widen to zero and stale bytes never reach PV.
+        """
+        ctx, t = self.ctx, self.t
+        safe = (token_base < ctx.planned_context).select(token_base, fx.Int32(0))
+        table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+        page = fx.Int32(table[ctx.planned_seq * ctx.max_blocks_per_seq + safe // 128])
+        valid = fx.max(
+            fx.Int32(0), fx.min(fx.Int32(128), ctx.planned_context - token_base)
+        )
+        raw = t.nvfp4_raw_offset + buffer * t.nvfp4_raw_page_bytes
+        row = t.head_dim // 2
+        srow = t.head_dim // 16
+        # tdm_copy addresses in BF16 elements: every offset here is even.
+        payload = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * (128 * row // 2)
+        scales = (
+            fx.Int64(page) * fx.Int64(ctx.stride_ks_block)
+            + fx.Int64(ctx.kv_h) * fx.Int64(ctx.stride_ks_head)
+        ) // 2
+        if ctx.warp == 0:
+            self.tdm_copy(
+                _gptr(ctx.key_cache_ptr, fx.BFloat16, 16),
+                payload,
+                raw,
+                (128 * row // 2,),
+                (1,),
+                (valid * (row // 2),),
+                8,
+                8,
+            )
+        if ctx.warp == 1:
+            self.tdm_copy(
+                _gptr(ctx.value_cache_ptr, fx.BFloat16, 16),
+                payload,
+                raw + 128 * row,
+                (128 * row // 2,),
+                (1,),
+                (valid * (row // 2),),
+                8,
+                8,
+            )
+        if ctx.warp == 2:
+            self.tdm_copy(
+                _gptr(ctx.key_scale_ptr, fx.BFloat16, 16),
+                scales,
+                raw + 2 * 128 * row,
+                (128 * srow // 2,),
+                (1,),
+                (valid * (srow // 2),),
+                8,
+                8,
+            )
+        if ctx.warp == 3:
+            self.tdm_copy(
+                _gptr(ctx.value_scale_ptr, fx.BFloat16, 16),
+                scales,
+                raw + 2 * 128 * row + 128 * srow,
+                (128 * srow // 2,),
+                (1,),
+                (valid * (srow // 2),),
+                8,
+                8,
+            )
+
+    def _nvfp4_scales(self, words):
+        """E4M3 scale bytes (little-endian in ``words``) as f32, in byte order."""
+        scales = []
+        for w in range_constexpr(len(words)):
+            word = fx.as_ir_value(fx.Int32(words[w]))
+            for b in range_constexpr(4):
+                scales.append(fx.Float32(fx.rocdl.cvt_f32_fp8(T.f32, word, b)))
+        return scales
+
+    def _nvfp4_widen(self, word, scale):
+        """One dword of 8 packed e2m1 (element 2j in the low nibble of byte j)
+        times its E4M3 scale, as 8 BF16 in element order. Exact: an e2m1 value
+        times an E4M3 scale has at most 6 significant bits."""
+        unit = fx.as_ir_value(fx.Int32(0x7F7F7F7F))  # E8M0 1.0 in every byte
+        values = fx.Vector(
+            fx.rocdl.cvt_scale_pk8_bf16_fp4(
+                T.vec(8, T.bf16), fx.as_ir_value(fx.Int32(word)), unit, 0
+            )
+        )
+        factor = (
+            fx.Vector.from_elements([scale], dtype=fx.Float32)
+            .to(fx.BFloat16)
+            .broadcast_to(8)
+        )
+        return values * factor
+
+    def nvfp4_k_scales(self, raw, token, lane16):
+        """The D/16 E4M3 scales of K token ``token + lane16`` of raw buffer
+        ``raw``, as f32."""
+        t = self.t
+        row, srow = t.head_dim // 2, t.head_dim // 16
+        words = self.load(
+            raw + 2 * 128 * row + (token + lane16) * srow, fx.Int32, srow // 4
+        )
+        return self._nvfp4_scales([words[i] for i in range_constexpr(srow // 4)])
+
+    def nvfp4_k_operand(self, raw, scales, token, dim, lane16, half):
+        """``bf16_k_operand`` read from the raw NVFP4 page and widened in registers:
+        dims ``dim + (half + 2j) * 8 + [0, 8)`` of token ``token + lane16``, j = 0, 1,
+        are payload dword ``dim / 8 + half + 2j`` of the token row, in scale block
+        ``dim / 16 + j``."""
+        row = self.t.head_dim // 2
+        values = []
+        for j in range_constexpr(2):
+            word = self.load(
+                raw + (token + lane16) * row + (dim // 8 + half + 2 * j) * 4,
+                fx.Int32,
+                1,
+            )[0]
+            widened = self._nvfp4_widen(word, scales[dim // 16 + j])
+            values.extend([widened[i] for i in range_constexpr(8)])
+        return fx.Vector.from_elements(values, dtype=fx.BFloat16)
+
+    @flyc.jit
+    def widen_nvfp4_v(self, buffer):
+        """Widen raw V of NVFP4 buffer ``buffer`` into the BF16 V page the BF16
+        pipeline reads, [128/8, D, 8] (``bf16_v_operand``): PV contracts over
+        tokens, which the token-major cache keeps apart. Thread t widens the
+        eight tokens x 16 dims (one scale block) (t // (D/16), t % (D/16)). K is
+        widened in registers (``nvfp4_k_operand``), so the page holds V only."""
+        ctx, t = self.ctx, self.t
+        row = t.head_dim // 2
+        srow = t.head_dim // 16
+        raw = t.nvfp4_raw_offset + buffer * t.nvfp4_raw_page_bytes
+        v_raw = raw + 128 * row
+        vs_raw = raw + 2 * 128 * row + 128 * srow
+        kv_off = t.q_bytes + t.k_bytes
+        group, block = ctx.tid // srow, ctx.tid % srow
+        columns = [[] for _ in range_constexpr(16)]
+        for i in range_constexpr(8):
+            token = group * 8 + i
+            pair = self.load(v_raw + token * row + block * 8, fx.Int32, 2)
+            sbyte = fx.Int32(self.load(vs_raw + token * srow + block, fx.Uint8, 1)[0])
+            scale = fx.Float32(fx.rocdl.cvt_f32_fp8(T.f32, fx.as_ir_value(sbyte), 0))
+            for half in range_constexpr(2):
+                values = self._nvfp4_widen(pair[half], scale)
+                for e in range_constexpr(8):
+                    columns[half * 8 + e].append(values[e])
+        for e in range_constexpr(16):
+            self.store(
+                kv_off + (group * t.head_dim + block * 16 + e) * 16,
+                fx.Vector.from_elements(columns[e], dtype=fx.BFloat16),
+                fx.BFloat16,
+            )
+
+    @flyc.jit
     def stage_padded_tdm(self, token_base, kv_off, full_tile):
         ctx, t = self.ctx, self.t
         table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
