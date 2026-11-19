@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc.
 
-"""Non-S1F plan/quant and pull dispatch resources for the compact stage."""
+"""Plan/quant and standalone or S1F pull dispatch resources."""
 
 import logging
 import os
@@ -26,9 +26,24 @@ def check(config):
     """Reject unsupported pull wire/layout combinations before allocation."""
     if not enabled(config):
         return
+    packed = os.environ.get("AITER_MEGA_PULL_PLAN_PACK", "0") == "1"
+    source_shuffle = os.environ.get("AITER_MEGA_PULL_SRC_SHUFFLE", "0") == "1"
+    if source_shuffle and not packed:
+        raise ValueError("source-rank shuffle requires packed pull")
+    if packed and (
+        os.environ.get("AITER_MEGA_S1F_PULL", "0") != "1"
+        or os.environ.get("AITER_MOE_S1F_READY_FIRST", "0") == "1"
+        or os.environ.get("AITER_MOE_S1F_PRODUCER_GROUP", "1") != "1"
+    ):
+        raise ValueError("packed pull requires external-ready S1F group1")
     if config.dispatch_wire != "fp4":
         raise ValueError("AITER_MEGA_DISPATCH_PULL requires FP4 dispatch")
     if os.environ.get("AITER_MEGA_S1F_PULL", "0") == "1":
+        group = int(os.environ.get("AITER_MOE_S1F_PRODUCER_GROUP", "1"))
+        if group not in (1, 4):
+            raise ValueError("AITER_MOE_S1F_PRODUCER_GROUP must be 1 or 4")
+        if group == 4 and int(os.environ.get("AITER_MEGA_S1F_PULL_PRODUCERS", "64")) % 4:
+            raise ValueError("four-TG producers require producers % 4 == 0")
         if not config.stage2_fused:
             raise ValueError("pull S1F requires fused-scatter combine")
         if not read_s1f_mode():
@@ -54,7 +69,13 @@ def regions(config, geometry):
         "pull_done": 4,
         "pull_ready": 4,
     }
+    if os.environ.get("AITER_MEGA_PULL_PLAN_PACK", "0") == "1":
+        frame_bytes = 16 * (config.hidden_dim // 2 + config.hidden_dim // 32)
+        extra["pull_packed"] = config.world_size * ((geometry.cap + 15) // 16) * frame_bytes
+        extra["pull_pack_done"] = (64 + 128 * 32) * 4
     if os.environ.get("AITER_MEGA_S1F_PULL", "0") == "1":
+        if os.environ.get("AITER_MOE_S1F_READY_FIRST", "0") == "1":
+            extra["pull_ready"] = 12
         extra["pull_tile_flag"] = (geometry.cap + FLAG_M - 1) // FLAG_M * FLAG_STRIDE
     return extra
 
@@ -68,13 +89,42 @@ class PullDispatch:
         self.config = config
         self.tdm_gather = os.environ.get("AITER_MEGA_PULL_TDM_GATHER", "0") == "1"
         self.fused = os.environ.get("AITER_MEGA_S1F_PULL", "0") == "1"
+        self.producer_group = int(os.environ.get("AITER_MOE_S1F_PRODUCER_GROUP", "1"))
+        self.tile_ready = os.environ.get("AITER_MOE_S1F_TILE_READY", "1") == "1"
+        self.ready_first = self.fused and os.environ.get(
+            "AITER_MOE_S1F_READY_FIRST", "0"
+        ) == "1"
+        self.cluster_local = os.environ.get(
+            "AITER_MOE_S1F_CLUSTER_LOCAL", "0"
+        ) == "1"
+        if self.cluster_local and not self.ready_first:
+            raise ValueError("cluster-local S1F requires READY_FIRST=1")
+        self.ready_queue = os.environ.get("AITER_MOE_S1F_READY_QUEUE", "0") == "1"
+        if self.producer_group == 4 and (
+            not self.fused or self.cluster_local or self.ready_queue
+        ):
+            raise ValueError("four-TG producers require the original pull S1F consumer")
+        if self.cluster_local and self.ready_queue:
+            raise ValueError("cluster-local S1F cannot use the global ready queue")
+        if self.ready_queue and not self.ready_first:
+            raise ValueError("ready queue requires pull S1F with READY_FIRST=1")
+        self.src_rank_shuffle = os.environ.get("AITER_MEGA_PULL_SRC_SHUFFLE", "0") == "1"
+        self.packed = os.environ.get("AITER_MEGA_PULL_PLAN_PACK", "0") == "1"
+        if self.packed and (not self.fused or self.ready_first or self.producer_group != 1):
+            raise ValueError("experimental packed pull requires external-ready S1F group1")
+        if self.src_rank_shuffle and not self.packed:
+            raise ValueError("source shuffle requires packed pull")
         self.arena = dispatch.res.arena
+        if self.packed:
+            self.arena.zero("pull_pack_done")
         device = dispatch.res.total_recv.device
         routes = geo.max_routes
         segments = config.world_size * config.experts_per_rank
         self.tok_map = torch.empty(routes, dtype=torch.int32, device=device)
         self.block_hist = torch.empty(16 * segments, dtype=torch.int32, device=device)
-        self.send_base = torch.empty(segments, dtype=torch.int32, device=device)
+        self.send_base = torch.empty(
+            segments, dtype=torch.int32, device=device,
+        )
         self.masked_m = torch.empty(
             config.experts_per_rank, dtype=torch.int32, device=device
         )
@@ -89,13 +139,26 @@ class PullDispatch:
         self.wire_ptr = self.arena.local_ptr("pull_wire")
         self._launches = {}
         self._fused_launches = {}
+        self.affinity_heads = None
+        if self.ready_first:
+            from .. import ready_queue
+
+            words = ready_queue.AFFINITY_WORDS
+            if self.ready_queue:
+                words += ready_queue.storage_words((geo.cap + 63) // 64)
+            self.affinity_heads = torch.empty(words, dtype=torch.int32, device=device)
         self.tile_info = None
         self.ctl = None
         if self.fused:
             from ..s1f_stage1 import FLAG_M, s1f_ctl_words
 
             tile_cap = (geo.cap + FLAG_M - 1) // FLAG_M
-            self.tile_info = torch.empty(tile_cap, dtype=torch.int32, device=device)
+            self.tile_storage = torch.empty(
+                tile_cap * (2 if self.ready_first else 1),
+                dtype=torch.int32, device=device,
+            )
+            self.tile_info = self.tile_storage[:tile_cap]
+            self.tile_local_chunks = self.tile_storage[tile_cap:]
             self.ctl = torch.zeros(
                 s1f_ctl_words(npes=config.world_size, tile_cap=tile_cap),
                 dtype=torch.int32,
@@ -117,6 +180,8 @@ class PullDispatch:
             hidden,
             self.wire_ptr,
             weights,
+            self.tile_storage.data_ptr() if self.ready_first else 0,
+            self.affinity_heads.data_ptr() if self.ready_first else 0,
             stream,
         )
 
@@ -160,8 +225,15 @@ class PullDispatch:
             quant_row_stride=geo.wire_row,
             quant_payload_bytes=config.dispatch_token_nbytes,
             pull=True,
-            write_tok_map=False,
+            write_tok_map=self.packed,
+            pull_pack=self.packed,
+            pull_src_shuffle=self.src_rank_shuffle,
+            off_packed=arena.offset("pull_packed") if self.packed else 0,
+            off_pack_done=arena.offset("pull_pack_done") if self.packed else 0,
             off_pull_map=arena.offset("ep_rowmap"),
+            pull_ready_first=self.ready_first,
+            pull_ready_queue=self.ready_queue,
+            off_pull_ready=arena.offset("pull_ready"),
         )
         pull = compile_pull_dispatch(
             rank=config.rank,
@@ -228,11 +300,12 @@ class PullDispatch:
         )
 
     def gemm1(self, out, a, w, a_scales, w_scales, m_tile_map, **kw):
-        """Run readiness followed by fused pull producers and GEMM1 consumers."""
+        """Run fused producers/consumers, with optional in-kernel readiness."""
         from aiter.jit.utils.chip_info import get_cu_num
         from ..s1f_pull import (
             compile_s1f_pull, pull_affinity_geometry, resolve_pull_cluster,
         )
+        from ..s1f_producer_group import validate_producer_group
 
         if kw.get("bias") is not None or not kw.get("stage1_quant_out"):
             raise ValueError("pull S1F requires bias-free fused activation/quant")
@@ -261,9 +334,22 @@ class PullDispatch:
         # producer/consumer roles, so zero retains its full-CU worker count.
         if workers == 0:
             workers = int(get_cu_num())
+        validate_producer_group(self.producer_group, workers, producers, int(kw["tile_m"]))
+        if self.ready_first and not 0 < workers <= min(256, int(get_cu_num())):
+            raise ValueError(
+                "local-ready pull requires resident workers within the "
+                "256-head plan capacity"
+            )
         cluster_m, cluster_n, cluster_reason = 1, 1, "cluster mode disabled"
         affinity_size, affinity_producers = 1, 0
-        if _select_bool_env("AITER_MOE_S1F_AFFINITY", 0):
+        if self.producer_group == 4:
+            if not workers <= min(256, int(get_cu_num())):
+                raise ValueError("four-TG producers require resident workers <= 256")
+            cluster_reason = (
+                "producer-only 2x2 clusters; independent 1x1 GEMM consumers; "
+                f"{producers // 4} affinity queues with cross-queue stealing"
+            )
+        elif self.cluster_local or _select_bool_env("AITER_MOE_S1F_AFFINITY", 0):
             affinity_size, affinity_producers = pull_affinity_geometry(
                 workers, producers
             )
@@ -284,6 +370,18 @@ class PullDispatch:
                 selected_m, requested_n, workers, producers, n_tiles,
                 int(kw["tile_m"]), step.align_m,
             )
+        if self.cluster_local and step.align_m != int(kw["tile_m"]):
+            raise ValueError("cluster-local plan alignment must equal GEMM1 tile_m")
+        if self.ready_queue and (cluster_m != 1 or cluster_n != 1):
+            raise ValueError("ready queue requires independent GEMM consumers")
+        if self.ready_queue and step.align_m != int(kw["tile_m"]):
+            raise ValueError("ready queue requires plan alignment == GEMM1 tile_m")
+        if self.ready_queue:
+            cluster_reason = (
+                "producer affinity retained; consumers share a completed-A queue"
+            )
+        if self.cluster_local:
+            cluster_reason = "cluster-local rounds with hardware signal/wait"
         self.cluster_selection = (cluster_m, cluster_n, cluster_reason)
         self.affinity_selection = (affinity_size, affinity_producers)
         gemm = {
@@ -306,6 +404,18 @@ class PullDispatch:
             "cluster_n": cluster_n,
             "affinity_size": affinity_size,
             "affinity_producers": affinity_producers,
+            "ready_first": self.ready_first,
+            "ready_queue": self.ready_queue,
+            "cluster_local": self.cluster_local,
+            "producer_group": self.producer_group,
+            "packed_input": self.packed,
+            "src_rank_shuffle": self.src_rank_shuffle,
+            "off_packed": self.arena.offset("pull_packed") if self.packed else 0,
+            "tile_ready": (
+                self.tile_ready and int(kw["tile_m"]) == 256
+                and not self.ready_queue and not self.cluster_local
+                and self.producer_group == 1
+            ),
         }
         key = (
             step.align_m,
@@ -346,11 +456,13 @@ class PullDispatch:
                 **gemm,
             )
             mailbox = None
-            if affinity_size > 1:
-                # One 128-byte-separated head per cluster. The existing ready
-                # kernel resets these before every fused launch/graph replay.
-                mailbox = torch.empty(
-                    workers // affinity_size * 32,
+            if self.ready_queue:
+                mailbox = self.affinity_heads
+            elif affinity_size > 1 or self.producer_group == 4:
+                # One 128-byte-separated head per cluster, reset by compact-plan
+                # in local-first mode or by the original ready kernel otherwise.
+                mailbox = self.affinity_heads if self.ready_first else torch.empty(
+                    (producers // 4 if self.producer_group == 4 else workers // affinity_size) * 32,
                     dtype=torch.int32, device=self.ctl.device,
                 )
             elif cluster_n > 1:
@@ -368,16 +480,17 @@ class PullDispatch:
         ready, fused, mailbox = self._fused_launches[key]
         stream = fx.Stream(kw.get("stream") or torch.cuda.current_stream())
         rows = int(kw["contiguous_m"])
-        _run_compiled(
-            ready,
-            self.arena.handle,
-            self.barrier,
-            m_tile_map,
-            self.tile_info,
-            rows,
-            mailbox.data_ptr() if mailbox is not None else 0,
-            stream,
-        )
+        if not self.ready_first:
+            _run_compiled(
+                ready,
+                self.arena.handle,
+                self.barrier,
+                m_tile_map,
+                self.tile_storage,
+                rows,
+                mailbox.data_ptr() if mailbox is not None else 0,
+                stream,
+            )
         _run_compiled(
             fused,
             out,

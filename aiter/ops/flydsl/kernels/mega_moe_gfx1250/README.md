@@ -728,3 +728,409 @@ AITER overrides, so use DS41_BTH with this script. Raw benchmark launches
 can instead use AITER_TDM_B_TH directly. Logs, run-level/rank-level values,
 exact symbols, commands and diffs are under
 /workspace/gpubench/s1f_affinity_bth_20261118/.
+
+## Optional instruction-cache prefetch (zxe port)
+
+`AITER_FLYDSL_INST_PREFETCH=1` enables the shared implementation ported from
+`zxe/mega_update_moe` commit `a85897e1b`. Each hardware wave enables
+MODE.SCALAR_PREFETCH_EN and prefetches its share of 4 KiB instruction chunks,
+capped at 56 KiB and bounded by the assembler-resolved function end.
+
+It runs once at entry for push/pull S1F, static grouped GEMM, and standalone
+persistent grouped GEMM. Persistent task bodies skip it. Enabled GEMM symbols
+contain `_ipf`. Data TDM scheduling, LDS layout and ready flags are unchanged.
+
+Leave the variable unset to retain the original single-wave S1F tail prefetch
+and original standalone GEMM behavior. Explicit `0` disables software
+instruction prefetch, including the old S1F helper; `1` selects the new helper.
+Use separate processes because this switch is read at import time.
+
+```sh
+# Original policy (default).
+env -u AITER_FLYDSL_INST_PREFETCH AITER_MOE_S1F_AFFINITY=1 bash run_ds41_flash_best.sh
+# New prefetch experiment.
+AITER_FLYDSL_INST_PREFETCH=1 AITER_MOE_S1F_AFFINITY=1 bash run_ds41_flash_best.sh
+```
+
+Measured 2026-11-19: EP4, 16384 tokens/rank (65536 global), balanced Flash,
+P96/C160, affinity8p3, unchanged CSV, eight layers, warmup5, iters32. Three
+interleaved runs per variant; values are microseconds averaged over four GPUs
+and three runs. E2E is the native graph-replay median per layer; other columns
+are explicit HIP-event intervals in a separate pass and do not sum to E2E.
+GEMM1 includes its producer and GEMM2 includes scatter.
+
+| Policy | E2E/layer | GEMM1 | GEMM2 | Compact plan | Ready |
+|---|---:|---:|---:|---:|---:|
+| Original commit c3686f50d | 1582.15 | 539.89 | 584.44 | 40.67 | 13.24 |
+| Software prefetch off | 1590.48 | 557.80 | 583.84 | 39.81 | 13.24 |
+| New distributed prefetch | 1585.45 | 542.19 | 593.40 | 39.85 | 12.99 |
+
+New vs original: E2E +0.21%, GEMM1 +0.43%, GEMM2 +1.53% latency. E2E run
+ranges overlap: original1562.67–1594.84, new1568.44–1599.04. No overall gain
+was established, so the old policy remains the default. Static GEMM2 adds the
+new prologue to32640 workgroups; its extra instruction/register cost is a
+plausible explanation for the slowdown, not a counter-verified diagnosis.
+
+Validation: four-GPU PyTorch health passed; small and full Flash changing-input
+output/payload/scale checks passed. Full Flash checks also passed for both the
+final explicit-on and default policies. Nine timing jobs exited successfully.
+Helper AST matches zxe; isolated helper compilation, syntax, Ruff F, shell and
+diff checks passed. The failed consumer-pair experiment was removed from the
+focused diff and preserved in `before.patch` under the artifact directory.
+
+Detailed report, per-run/per-rank timings, symbols, CSV/source snapshots,
+reproduction runners and preserved experimental patch:
+`/workspace/gpubench/s1f_instruction_prefetch_20261118/REPORT.md`.
+
+## Experimental producer-leader readiness
+
+`AITER_MOE_S1F_READY_FIRST=1` removes the standalone ready/setup kernel from
+S1F pull. Default remains `0`: no E2E speedup has been established. This switch
+changes neither push nor non-S1F dispatch. Use separate processes for comparisons.
+
+The current protocol is local-first with one producer leader per GPU; it does
+not use rank-mask scheduling:
+
+1. The existing compact-plan + quant kernel also initializes pull tile metadata,
+   local M16 intervals and affinity queue heads. It invalidates the local
+   all-ready epoch and records the expected epoch. It does not publish source
+   readiness while quantization may still be in flight.
+2. At S1F entry, producer slot 0 publishes source-ready after the complete local
+   plan + quant kernel. It immediately system-acquires the other source epochs.
+   A workgroup barrier transfers these observations to its publishing thread,
+   which agent-release-stores the epoch into one local GMEM all-ready flag.
+3. The leader then processes all its ordinary producer-owned tiles. Other
+   producers can first copy their local-only M16 chunks. Before remote copies,
+   thread 0 of each TG agent-acquires the shared local all-ready flag, followed
+   by a TG barrier. They never independently poll peer-ready flags. No readiness
+   check is added to every token, and ready is latched for the remote drain.
+4. Each M64 still has exactly one wave owner. That wave retires data stores
+   before publishing the original consumer tile-ready flag. Consumer scheduling,
+   GEMM layout, and producer-to-consumer transition are unchanged.
+
+There is one all-ready flag per destination GPU, not one shared across GPUs.
+Source-ready and consumer tile-ready flags have separate roles and are retained.
+The three local words are source epoch (+0), all-ready epoch (+4), and expected
+plan epoch (+8). The plan resets all-ready to epoch-1 before each invocation.
+Metadata is generated from the existing histogram; expert/source-major ordering
+is unchanged. A mixed-source M16 waits for all-ready; a partial M16 can run early
+only when all its valid rows are local. No extra routing padding is introduced.
+Worker count is limited to the CU count and 256-head capacity for this path.
+
+```sh
+AITER_MOE_S1F_AFFINITY=1 AITER_MOE_S1F_READY_FIRST=1 bash run_ds41_flash_best.sh
+# Original separate-ready control:
+AITER_MOE_S1F_AFFINITY=1 AITER_MOE_S1F_READY_FIRST=0 bash run_ds41_flash_best.sh
+```
+
+Before the histogram-first follow-up below, measured 2026-11-19: EP4,
+16384 tokens/rank (65536 global), E384/top6/H5120/I2304,
+unchanged model CSV, original instruction-prefetch, eight layers, warmup5/iters32,
+uniform input and seed0. P96/C160 uses affinity8p3; P64/C192 uses affinity4p1.
+Values are microseconds per layer, averaged over four ranks. Each row is one run;
+controls are refreshed within this experiment. Native E2E and HIP graph-event
+stage timing are separate passes and must not be added together.
+
+| Routing / version | E2E/layer | Plan + quant | Standalone ready | GEMM1 + producer | GEMM2 + scatter |
+|---|---:|---:|---:|---:|---:|
+| Balanced / separate ready / P96 | 1588.67 | 39.27 | 12.74 | 535.39 | 582.43 |
+| Balanced / immediate leader / P96 | 1594.95 | 43.55 | 0.00 | 545.44 | 580.70 |
+| Balanced / immediate leader / P64 | 1609.25 | 42.32 | 0.00 | 568.78 | 587.42 |
+| Random / separate ready / P96 | 1632.45 | 39.84 | 12.64 | 587.20 | 584.13 |
+| Random / immediate leader / P96 | 1639.22 | 43.48 | 0.00 | 601.67 | 585.55 |
+
+The standalone ready interval is zero because the node is absent in all four
+captured graphs. Its necessary synchronization now runs inside GEMM1. Against
+separate-ready P96, the leader version has E2E +0.40% balanced and +0.41% random;
+these small single-run differences do not establish a stable regression or gain.
+GEMM1 is slower by 10.05 us balanced and 14.47 us random; compact-plan also does
+more setup work. P64 did not help, so the reproduction script retains P96.
+
+Full Flash four-GPU correctness passed for P96 and P64, with changing graph
+inputs, random/hot/local-only/unequal-tail routing, exact payload/scale/map checks,
+and a delayed-source probe proving a nonleader can publish a local tile while
+the leader waits. The probe uses runtime pointers and bounded waits. All tests
+and timing jobs in this final leader iteration exited successfully without a
+boot change. No stable E2E improvement is claimed; default remains off.
+
+Current report, historical variants, per-run symbols/source/CSV snapshots and
+native/HIP event results: `/workspace/gpubench/s1f_ready_first_20261119/REPORT.md`.
+
+## Histogram-first initialization follow-up
+
+The retained implementation now submits the histogram before initializing local
+metadata, queue heads and epochs. Flash uses the tagged dense histogram path:
+its asynchronous TDM transfer can remain in flight while independent GMEM setup
+runs. The setup does not write the histogram's LDS source. Its store retirement
+and TG barrier still precede the live metadata scan; histogram tag checks and
+TDM completion before LDS reuse remain unchanged. Sparse and non-tag fallback
+paths retain their original immediate completion waits. Quantization is unchanged.
+
+This is a relocation of one setup block, without a new kernel or feature flag.
+The producer-leader and consumer implementations are unchanged. The comparison
+below has READY_FIRST=1 throughout and only switches initialization order.
+Same EP4/tpr16384/P96 configuration and timing methodology as above; all values
+are microseconds per layer. Execution order for the balanced comparison was
+histogram-first run1, refreshed init-first control, histogram-first run2.
+
+| Routing / order | Plan + quant | GEMM1 + producer | GEMM2 + scatter | Native E2E |
+|---|---:|---:|---:|---:|
+| Balanced / init first, refreshed | 43.24 | 545.39 | 580.02 | 1594.75 |
+| Balanced / histogram first, run 1 | 42.58 | 553.19 | 591.37 | 1596.64 |
+| Balanced / histogram first, run 2 | 42.87 | 549.93 | 585.40 | 1594.79 |
+| Random / init first, saved | 43.48 | 601.67 | 585.55 | 1639.22 |
+| Random / histogram first | 43.65 | 601.03 | 586.03 | 1642.06 |
+
+Balanced plan is0.37–0.66us lower than the refreshed control; random plan is0.17us
+higher than its saved control. This limited sample supports at most a small,
+workload-dependent change, not a stable overall speedup. Native E2E is effectively
+unchanged in the balanced repeat; no E2E improvement is claimed. The reorder is
+retained and READY_FIRST remains opt-in/default0. Earlier leader timing tables
+above predate this reorder and remain historical comparisons.
+
+Validation: ipflegacy_p96_check_hist_overlap_r1 passed the full four-GPU six-routing
+check and delayed-source local-progress probe. All four follow-up timing jobs
+exited0 with unchanged boot IDs. Every opt-in rank graph still has zero ready
+nodes, eight plan nodes and eight nodes for each GEMM. Three review passes and
+paired-source switches are recorded in REVIEW.md. Exact pre/post source is in
+compact_plan_before_hist_overlap.py / compact_plan_hist_overlap.py; per-run full
+source diffs, environments, logs and event timing remain under the run directories.
+
+
+## Completion-driven S1F work queue (experimental)
+
+Set `AITER_MOE_S1F_READY_QUEUE=1` together with the existing pull S1F flags and
+`AITER_MOE_S1F_READY_FIRST=1`. The queue flag defaults to0. This mode requires
+plan alignment equal to GEMM1 tile M and independent GEMM consumers (cluster1x1);
+producer affinity placement may remain enabled. Existing resident-worker guards
+still apply. GEMM tiling, copies/shuffle, GEMM2 and producer-to-consumer transition
+are unchanged.
+
+Previously, consumers claimed a predetermined M/N task and could then wait on
+that specific A tile even when other A tiles were ready. In ready-queue mode,
+each live M64 producer wave retires its stores, publishes its original flag and
+increments an agent AcqRel completion counter for its containing A tile. The
+last live part appends M+1 with a release store. Padding parts do not participate.
+Consumers acquire this entry and independently claim its N tasks. For Flash
+I2304/N256, a single completed A256 exposes18 tasks;18 distinct simultaneously
+available workers are not guaranteed. M order is determined by completion, not
+by a static task-index formula. N index remains ticket%18.
+
+The append-only queue uses one record per A tile, not18 redundant task records.
+Its storage follows the256 affinity heads:64 i32 header words plus two arrays
+of ceil(compact_cap/64) words, for completion counters and queue entries. No new
+LDS is allocated. Compact-plan clears it before each S1F launch/replay. Consumers
+can reserve future queue entries and wait for publication; they do not select an
+unready M tile in advance. A briefly unpublished append reservation can delay a
+claim even if a later entry has published. Producers never wait for consumers.
+The existing A-ready checks and next-task claim/metadata-prefetch hooks remain.
+
+Full EP4/16384 tokens per rank correctness passed six changing graph routing
+cases (random, hot, rank-local, unequal tails), exact payload/scale/map checks,
+queue permutation and completion-count checks, and the delayed-source progress
+probe. No crash or boot change was observed. Three review passes preceded launch.
+
+Balanced Flash E384/topk6/H5120/I2304, P96/C160,8layers, warmup5/iters32;
+GEMM1 tile256x256x256,4buffers,2x2waves. Same CSV and other settings in both modes.
+Numbers are microseconds/layer. E2E is native graph timing, averaged rank medians
+and divided by8; individual stages are means from a separate HIP graph-event
+pass across4ranks,8layers and32replays. Stages must not be summed into native E2E.
+Execution order: on1, off1, off2, on2.
+
+| Ready queue | Run | Plan + quant | GEMM1 + producer | GEMM2 + scatter | Native E2E |
+|---|---:|---:|---:|---:|---:|
+| Off |1|43.12|551.81|598.81|1606.56|
+| Off |2|42.90|548.75|591.99|1602.19|
+| On |1|41.79|568.21|578.63|1593.45|
+| On |2|43.82|568.93|591.57|1617.59|
+
+Mean GEMM1 increases from550.28 to568.57us (+3.32%). Native E2E means are1604.37
+and1605.52us (+0.07%), with overlapping run variation. No performance improvement
+is established. Added completion atomics and one shared claim head, and losing
+consumer-local A reuse, are plausible costs; these timings do not isolate their
+individual contributions. Queue mode remains optional.
+
+Reproduce queue-on/off with BENCH_READY_QUEUE=1/0 and a unique label:
+
+```bash
+BENCH_IPF=legacy BENCH_PRODUCERS=96 BENCH_READY_QUEUE=1 BENCH_BALANCED=true bash /workspace/gpubench/s1f_ready_queue_20261119/run.sh affinity queue_on_unique
+```
+
+Reports, exact commands/environment/source, correctness logs and stage timings:
+`/workspace/gpubench/s1f_ready_queue_20261119/REPORT.md`.
+
+
+## Cluster-local signal/wait experiment
+
+`AITER_MOE_S1F_CLUSTER_LOCAL=1` selects a separate pull S1F scheduler, with
+`AITER_MOE_S1F_READY_FIRST=1` and `AITER_MOE_S1F_READY_QUEUE=0`. Default is0.
+It uses hardware cluster barriers for producer/consumer rendezvous and no global
+atomic RMW in GEMM1 (verified in all four rank code objects). Cross-device source
+readiness still uses release/acquire global loads/stores. Compact-plan is unchanged.
+
+At P96/256 workers, each4x2 physical cluster has3 producers and5 initial consumers.
+A round prepares3 A256 tiles; consumers prefetch B before waiting for all A data.
+Producers then join consumption of54 M/N tasks. A second collective barrier
+finishes the round before the next begins. M ownership is fixed per cluster;
+there is no work stealing or original next-item metadata-prefetch hook in this
+prototype. GEMM tiling, gather/shuffle, A preshuffle and instruction prefetch are
+retained. The new optional GEMM prologue hook lets all waves wait after B issues
+and before A issues. Requirements: aligned plan/GEMM M, WPT1 or2, four-wave GEMM,
+resident workers and a complete mixed-role affinity cluster.
+
+Four-GPU barrier probe and full Flash six-routing graph correctness passed.
+Balanced Flash EP4 at16384 tokens/rank (65536 global), P96,8layers:
+
+| Variant | Plan + quant | GEMM1 + producer | GEMM2 + scatter | Native E2E/layer |
+|---|---:|---:|---:|---:|
+| Affinity, saved two-run mean | 43.01 | 550.28 | 595.40 | 1604.37 |
+| Global ready queue, saved two-run mean | 42.81 | 568.57 | 585.10 | 1605.52 |
+| Cluster signal/wait, new single run | 44.11 | 722.69 | 585.44 | 1763.44 |
+
+Baselines are saved two-run means; cluster mode is one new run. Stages use a
+separate HIP graph-event pass; E2E uses native timing. GEMM1 regresses31.3%, E2E9.9%.
+Collective tile readiness, dispatch/compute round boundaries, fixed ownership
+and loss of next-item metadata overlap are structural costs. Hardware barrier
+latency alone was not isolated. No private scratch allocation or VGPR spilling
+was found; compiler-reported SGPR spilling is lower than the cached baseline.
+
+Full protocol, validation, assembly evidence and reproduction:
+`/workspace/gpubench/s1f_cluster_signal_20261119/REPORT.md`.
+
+## Four-TG cooperative S1F producers (experimental)
+
+`AITER_MOE_S1F_PRODUCER_GROUP=4` makes four producer TGs cooperate on each
+A256. The default is1, retaining the existing producer. This option requires
+pull S1F, GEMM1 M256, a producer count divisible by4, and a resident worker count
+divisible by4 and at most min(256, device CU count). Producer count must be
+positive and smaller than worker count. It is incompatible with ready-queue and
+cluster-local scheduling. Both external-ready and ready-first paths are supported.
+
+Hardware launch clusters are2x2 with homogeneous initial roles: the first P TGs
+form P/4 complete producer clusters. Each TG copies one M64; each of its four
+waves copies one M16 using the existing gather/shuffle helper. Every wave retires
+its payload/scale stores, followed by a release fence, TG barrier and cluster
+signal/wait. After an acquire fence, TG0 publishes the existing four M64 ready
+flags for live parts. Empty/tail members still join the collective. This adds no
+global completion atomic. Finished producers join independent consumers.
+
+GEMM consumers remain1x1: no multicast or consumer cluster barrier is enabled.
+The hardware launch attribute also applies to consumer TGs, but does not make
+their computation collective. Original task-claim, stealing, metadata/ready
+prefetch, same-A reuse and epilogue hooks remain. There are P/4 logical task
+queues corresponding to producer groups. This changes physical placement from
+the old mixed-role affinity clusters; it does not retain their producer/consumer
+cache affinity. Compact-plan and GEMM2 algorithms are unchanged.
+
+Validation passed on four GPUs at16384 tokens/rank (65536 global), including
+both ready paths, changing graph inputs, hot/rank-local routing, unequal tails,
+exact payload/scale/map checks and output comparison with push. A prior small
+P100 check also passed, verifying that P must be divisible by4, not necessarily8.
+
+Balanced Flash E384/topk6/H5120/I2304, P96/C160,8layers, warmup5/iters32,
+legacy instruction prefetch, BTH0, external-ready; same CSV in both variants.
+GEMM1 and GEMM2 use256x256x256,2x2waves,4buffers. GEMM1 uses WPT2; GEMM2 uses
+WPT1 and cluster1x4. Order: baseline1, group4_1, group4_2, baseline2.
+
+| Producer | Run | Plan + quant | Ready | GEMM1 + producer | GEMM2 + scatter | Native E2E/layer |
+|---|---:|---:|---:|---:|---:|---:|
+| Original affinity |1|39.93|12.97|542.01|596.20|1600.90|
+| Original affinity |2|39.44|13.06|534.46|586.00|1588.53|
+| Four TGs per A256 |1|37.33|12.56|578.22|586.22|1607.94|
+| Four TGs per A256 |2|38.12|12.63|578.30|585.61|1605.46|
+
+All times are microseconds. E2E averages native rank medians and divides by8;
+stages average a separate HIP graph-event pass across four ranks, eight layers
+and32 replays. Do not sum stages to reconstruct native E2E. Two-run means:
+GEMM1 increases538.24 to578.26us (+7.44%); E2E increases1594.72 to1606.70us
+(+0.75%). Native arithmetic-mean E2E also regresses1594.96 to1615.07us (+1.26%);
+the first group4 run contains a high-latency replay. No overall gain is established.
+
+The earlier isolated remote-A256 microbenchmark reduced tile completion latency
+from87581 to22292cycles. It did not measure the producer inside full MoE. At
+fixed P96, grouping reduces concurrently produced A256s from at most96 to24;
+lower tile latency does not imply increased aggregate dispatch throughput.
+Changed cache affinity, queue distribution and collective arrival imbalance can
+also cost performance; their individual contributions have not been isolated.
+The group4 mode remains opt-in, and group1 remains the performance default.
+
+Reproduce native timing (use group1 for the original affinity baseline):
+
+```bash
+env -u AITER_FLYDSL_INST_PREFETCH AITER_MOE_S1F_AFFINITY=1 AITER_MOE_S1F_PRODUCER_GROUP=4 AITER_MOE_S1F_READY_FIRST=0 DS41_PRODUCERS=96 bash run_ds41_flash_best.sh
+```
+
+Exact source/environment snapshots, four-run stage timings, correctness logs,
+analysis script and reproduction commands:
+`/workspace/gpubench/s1f_producer_group4_20261119/REPORT.md`.
+
+The subsequent group4 producer-ratio sweep kept256 workers and the same full
+Flash workload. P64 and P96 are two-run means; other ratios have one run.
+
+| Producer TGs | Initial consumer TGs | GEMM1 + producer | GEMM2 + scatter | Combine sync | Native E2E/layer |
+|---:|---:|---:|---:|---:|---:|
+|32|224|956.96|583.47|32.78|1991.53|
+|48|208|690.17|590.29|19.77|1721.11|
+|64|192|567.31|590.44|22.44|1609.15|
+|80|176|567.47|591.17|28.92|1616.49|
+|96|160|578.26|585.92|14.99|1606.70|
+|128|128|584.05|581.55|35.23|1625.95|
+
+Units and timing scopes are unchanged. Combine sync is only
+`ep_combine_fused_sync_0`. P64 lowers GEMM1 by1.89% against P96, but increased
+GEMM2/combination wait intervals offset the saving. Native E2E run ranges overlap;
+there is no established overall gain. P64-P80 is the best observed GEMM1 region,
+while original affinity P96 remains the overall default. Group4 P64 passed the
+full four-GPU correctness test for both ready paths. Use `DS41_PRODUCERS=64` in
+the reproduction command above to select it. Full ratio data and per-run
+variation are in the report's producer/consumer sweep section.
+
+### One ready flag per pull S1F M256
+
+`AITER_MOE_S1F_TILE_READY=1` (default) enables one generation flag per M256
+for the one-TG pull producer. Each of its four waves retires
+its M64 payload/scale stores; a TG barrier and release/acquire ordering precede
+wave 0's publication. Empty/tail waves participate in the same barrier. The
+consumer loads one local-source dword and retains next-task readiness prefetch
+and same-A reuse. The flag reuses the first M64 slot; metadata and arena sizes
+are unchanged. Kernel symbols contain `_readyM256` when selected.
+
+With `AITER_MOE_S1F_READY_FIRST=1`, producer slot 0 publishes local plan/quant
+readiness, collects remote source readiness and publishes the local `all_ready`
+generation before returning to production. Other producers can publish fully
+local M256 tiles before `all_ready`; mixed/remote tiles publish after phase 1.
+No standalone ready kernel is used in this mode.
+
+Set `AITER_MOE_S1F_TILE_READY=0` to compare the old per-M64 protocol. M64/M128
+GEMMs, ready-queue, cluster-local and four-TG producer experiments retain their
+existing protocols. The effective config logs `tile_ready` and keys the JIT
+cache on it. This flag changes shuffled-A completion, not the source-ready
+synchronization required before remote pulls.
+
+### Experimental compact-plan packing and M256 source-rank shuffle
+
+Read [README_dispatch_pull.md](../../../../../README_dispatch_pull.md) before
+continuing this experiment on another host. It contains the full code map,
+layout, readiness protocol, reproducible commands, cycle findings and pending work.
+
+`AITER_MEGA_PULL_PLAN_PACK=1` quantizes and packs source frames in the existing
+compact-plan; S1F producers use ordinary TDM loads. Add
+`AITER_MEGA_PULL_SRC_SHUFFLE=1` to align every `(expert, source_rank)` segment
+to M256. **Every valid row in an M256 then belongs to the same source rank,
+including normal routing. Padding rows are not tokens and have route=-1.**
+Both new switches default off. This first version requires external-ready S1F,
+one-TG producers and M256. GEMM2 code is unchanged; its existing negative-route
+scatter mask discards padding.
+
+Status: the earlier packed-load prototype passed EP4 correctness at257 and16384
+per rank; the added source-alignment/padding code is not yet GPU-validated.
+No packed or source-shuffle speedup has been measured. The user requested this
+checkpoint before GPU access became available. First validate, then establish a
+GEMM1 improvement; only afterward experiment on GEMM2.
+
+Three source-shuffle reviews before GPU launch: (1) capacity covers all source
+segment tails, source owners alone invalidate their padding, packed pointers
+are64-bit; (2) planner-built live metadata survives external-ready, quant waits
+for released route-map generations, existing source/A-ready protocols remain;
+(3) tests check source uniqueness, exact route coverage, live-row metadata,
+outputs and payload/scales/weights under changing and unequal routing.

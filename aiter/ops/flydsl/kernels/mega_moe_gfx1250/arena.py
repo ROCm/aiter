@@ -91,6 +91,8 @@ _ARENA_REGION_ORDER = (
     "pull_done",
     "pull_ready",
     "pull_tile_flag",
+    "pull_packed",
+    "pull_pack_done",
 )
 # cco rounds each allocation up to its VMM granularity -- 2 MiB on the parts
 # MegaMoE runs on -- and, past 2 GiB, to 2 MiB again for the MR registration.

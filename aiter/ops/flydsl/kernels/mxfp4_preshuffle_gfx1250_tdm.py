@@ -18,12 +18,14 @@ from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 from .buffer_ops import buffer_store, create_buffer_resource_from_addr
 from .gemm_common_gfx1250 import (
+    INST_PREFETCH,
     batched_silu_swiglu,
     batched_situv2,
     fused_silu_swiglu_elem,
     fused_situv2_elem,
     make_lds_copy_ops,
     pipeline_fence,
+    prefetch_kernel_code,
     situv2_consts,
     workgroup_barrier,
 )
@@ -234,6 +236,7 @@ def build_gemm_a8w4_tdm_task(
     k_waves=1,
     explicit_cluster=0,
     cluster_active=None,
+    prologue_barrier=None,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -265,6 +268,9 @@ def build_gemm_a8w4_tdm_task(
       or A-scale loads call it before their first A issue (the wait for the
       tile's dispatch flags); the B / B-scale owners issue their prologue
       loads without waiting. Nothing reads the tile's A rows before it returns.
+    - ``prologue_barrier``: optional all-wave callback after B-owner waves
+      issue their initial loads and before A-owner waves issue theirs. Used by
+      cluster-local S1F to wait on a hardware barrier while B TDM is in flight.
     - ``tile_meta`` (S1F, explicit_tile): a one-element list the caller fills
       with ``(expert, rows)`` (wave-uniform i32) before calling the body: the
       tile's expert and its valid rows (``min(tile_m, expert end - blk_m)``).
@@ -301,6 +307,12 @@ def build_gemm_a8w4_tdm_task(
         assert explicit_tile and not tdm_as_in_prologue, (
             "a_ready gates the mainloop's first A issue; an A-scale prologue "
             "load would run ahead of it"
+        )
+    if prologue_barrier is not None:
+        assert a_ready is None, "prologue_barrier owns A readiness"
+        assert explicit_tile and not tdm_as_in_prologue
+        assert num_waves_per_tensor_tdm in (1, 2), (
+            "split prologue requires disjoint A and B owner waves"
         )
     if cluster_active is not None:
         assert explicit_cluster, "runtime multicast gating needs explicit clusters"
@@ -625,6 +637,7 @@ def build_gemm_a8w4_tdm_task(
         f"_et{int(tdm_early_timeout)}{_wmma_2x4}"
         f"{_prefence}_earlyacc"
         f"{_malign}{_kwaves}"
+        f"{'_ipf' if INST_PREFETCH else ''}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -656,6 +669,9 @@ def build_gemm_a8w4_tdm_task(
         task_id: task_index_type,
         schedule_rows: task_index_type,
     ):
+        if const_expr(INST_PREFETCH and not persistent_workers):
+            prefetch_kernel_code(block // WAVE)
+
         A_KROW = K // A_PACK
         Kp16 = (K // 2) * 16
         # Scale dwords per 32-row B super-row: one per k128, padded K included.
@@ -1988,14 +2004,28 @@ def build_gemm_a8w4_tdm_task(
                     if owns(tuple(sorted(set(waves[0]) | set(waves[2])))):
                         a_ready[0]()
 
+            def issue_prologue(stages):
+                if const_expr(prologue_barrier is not None):
+                    # Disjoint owner sets preserve the original TDM count and
+                    # order within each wave, while every wave joins the barrier.
+                    if owns(tuple(sorted(set(waves[1]) | set(waves[3])))):
+                        for i in range_constexpr(stages):
+                            issue(i, i)
+                    prologue_barrier[0]()
+                    if owns(tuple(sorted(set(waves[0]) | set(waves[2])))):
+                        for i in range_constexpr(stages):
+                            issue(i, i)
+                else:
+                    a_ready_gate()
+                    for i in range_constexpr(stages):
+                        issue(i, i)
+
             def run_mainloop(interleaved_lds_load):
                 # Post-compute wins for decode and for shallow pipelines: at
                 # num_buffers<=2 mid-compute prefetches one tile and under-overlaps.
                 if const_expr(tile_m <= 32 or num_buffers <= 2):
                     # Post-compute issue: better for decode (small tile_m).
-                    a_ready_gate()
-                    for i in range_constexpr(num_buffers):
-                        issue(i, i)
+                    issue_prologue(num_buffers)
                     init_accumulators()
                     n_steady = K_TILES - num_buffers
                     if const_expr(next_stage_on):
@@ -2063,9 +2093,7 @@ def build_gemm_a8w4_tdm_task(
                     # Mid-compute prefetch: better for prefill. PRE is both the tiles
                     # resident before the loop and the issue lead; the carry adds one.
                     PRE = num_buffers if next_stage_on else num_buffers - 1
-                    a_ready_gate()
-                    for i in range_constexpr(PRE):
-                        issue(i, i)
+                    issue_prologue(PRE)
                     init_accumulators()
                     n_steady = K_TILES - PRE
                     if const_expr(next_stage_on):
@@ -3020,6 +3048,9 @@ def launch_gemm_a8w4_tdm(
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
     ):
+        if const_expr(INST_PREFETCH):
+            prefetch_kernel_code(block // 32)
+
         def run_task(task_id, rows):
             # i32_m remains the allocation capacity: the scale buffer's
             # descriptor must include the padding in its shuffled layout.

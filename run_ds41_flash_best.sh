@@ -4,10 +4,10 @@
 set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
-# Preserve the public affinity switch; clear stale tuning overrides.
+# Preserve public feature switches; clear stale tuning overrides.
 for name in $(compgen -e); do
   case "$name" in
-    AITER_MOE_S1F_AFFINITY) ;;
+    AITER_MEGA_PULL_PLAN_PACK|AITER_MEGA_PULL_SRC_SHUFFLE|AITER_MOE_S1F_AFFINITY|AITER_MOE_S1F_READY_FIRST|AITER_MOE_S1F_PRODUCER_GROUP|AITER_MOE_S1F_TILE_READY|AITER_FLYDSL_INST_PREFETCH) ;;
     AITER_*|FLYDSL_*|MORI_*|MEGA_*|COMBINE_QUANT|DEBUG_HIP_GRAPH_CLASSIC_PATH)
       unset "$name" ;;
   esac
@@ -22,7 +22,7 @@ export AITER_MEGA_S1F_PULL=1 AITER_MEGA_S1F_PULL_PRODUCERS=${DS41_PRODUCERS:-96}
 export AITER_MEGA_S1F_PULL_CLUSTER=${DS41_CLUSTER:-0}
 export AITER_MOE_S1F_AFFINITY=${AITER_MOE_S1F_AFFINITY:-0}
 export AITER_TDM_B_TH=${DS41_BTH:-0}
-export AITER_MOE_EXPERT_BALANCE=true
+export AITER_MOE_EXPERT_BALANCE=${DS41_BALANCED:-true}
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 
 # Use the benchmark host's MORI build when present, otherwise the installed one.

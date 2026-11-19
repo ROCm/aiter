@@ -551,7 +551,10 @@ def _check_vmm_bound(ctx):
 
 def _check_pull(
     ctx, *, a_preshuffled=True, fused=False, expected_cluster=None,
-    expected_affinity=None,
+    expected_affinity=None, ready_first=False, ready_probe=None,
+    expected_producer_group=None,
+    expected_tile_ready=None,
+    src_rank_shuffle=False,
 ):
     """Validate remote FP4 bytes, inverse maps, and changing graph inputs."""
     from aiter.test_common import checkAllclose
@@ -577,11 +580,31 @@ def _check_pull(
             pull = ctx.build(**fields)
         check(pull._ep._dispatch._pull is not None, "pull was not selected")
         check(pull._ep._dispatch._pull.fused == fused, "wrong fusion mode")
+        if ready_first:
+            check(pull._ep._dispatch._pull.ready_first, "ready-first not selected")
+        if expected_producer_group is not None:
+            check(pull._ep._dispatch._pull.producer_group == expected_producer_group,
+                  "cooperative producer mode not selected")
+        if os.environ.get("AITER_MOE_S1F_CLUSTER_LOCAL", "0") == "1":
+            check(pull._ep._dispatch._pull.cluster_local,
+                  "cluster-local scheduler not selected")
         check.settle()
         # Warm the same addresses used in capture. The input contents change
         # afterward, exercising generations and stale padding/empty experts.
+        if ready_first:
+            # First launch has no old A flags. Give rank0 work independent of
+            # the delayed rank so the readiness test can observe real progress.
+            own = (
+                torch.arange(TOKENS * TOPK, device=ctx.device)
+                % EXPERTS_PER_RANK + ctx.rank * EXPERTS_PER_RANK
+            ).reshape_as(ctx.ids)
+            ctx.ids.copy_(own)
         ctx.layer(push, "bf16")
         ctx.layer(pull, "bf16")
+        if ready_first:
+            if ready_probe is not None:
+                ready_probe(pull)
+            ctx.ids.copy_(saved_ids)
         if expected_affinity is not None:
             selected = pull._ep._dispatch._pull.affinity_selection
             check(selected == expected_affinity,
@@ -592,13 +615,43 @@ def _check_pull(
             check(selected[:2] == expected_cluster,
                   f"cluster {selected} != {expected_cluster}")
             check.settle()
+        tile_flags = None
+        if expected_tile_ready is not None:
+            helper = pull._ep._dispatch._pull
+            configs = [dict(key[-1]) for key in helper._fused_launches]
+            check(bool(configs), "missing S1F compiled configuration")
+            check(all(cfg.get("tile_ready") == expected_tile_ready for cfg in configs),
+                  "wrong M256 ready selection")
+            check.settle()
+            if expected_tile_ready:
+                from aiter.ops.flydsl.kernels.mega_moe_gfx1250.arena import _from_gpu_ptr
+                from aiter.ops.flydsl.kernels.mega_moe_gfx1250.s1f_stage1 import FLAG_STRIDE
+
+                tile_flags = _from_gpu_ptr(
+                    helper.arena.local_ptr("pull_tile_flag"),
+                    (helper.tile_info.numel(), FLAG_STRIDE // 4), torch.int32,
+                )
         torch.cuda.synchronize()
         ctx.comm.barrier()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = ctx.layer(pull, "bf16")
-        for iteration in range(4):
-            if iteration % 2:
+        for iteration in range(6 if ready_first or src_rank_shuffle else 4):
+            if (ready_first and iteration == 2) or (src_rank_shuffle and iteration == 4):
+                # Disjoint source/destination ownership and empty segments.
+                hot = (
+                    torch.arange(TOPK, device=ctx.device, dtype=torch.int32)
+                    + ctx.rank * EXPERTS_PER_RANK
+                )
+                ctx.ids.copy_(hot.expand_as(ctx.ids))
+            elif (ready_first and iteration == 3) or (src_rank_shuffle and iteration == 5):
+                # Unequal, non-M16 source boundaries within otherwise hot
+                # experts. Each rank contributes a different random tail.
+                hot = torch.arange(TOPK, device=ctx.device, dtype=torch.int32)
+                ctx.ids.copy_(hot.expand_as(ctx.ids))
+                tail = min(TOKENS, 3 + ctx.rank * 7)
+                ctx.ids[-tail:].copy_(saved_ids[-tail:])
+            elif iteration % 2:
                 hot = torch.arange(TOPK, device=ctx.device, dtype=torch.int32)
                 ctx.ids.copy_(hot.expand_as(ctx.ids))
             else:
@@ -606,6 +659,10 @@ def _check_pull(
             ctx.x.copy_(torch.roll(saved_x, iteration * 17, dims=1))
             ctx.wts.copy_(torch.roll(saved_weights, iteration, dims=1))
             expected = ctx.layer(push, "bf16").clone()
+            if tile_flags is not None:
+                # A new generation must be published; unused M64/source slots
+                # must stay untouched, so the legacy protocol cannot pass.
+                tile_flags.fill_(-1)
             graph.replay()
             torch.cuda.synchronize()
             err = checkAllclose(
@@ -622,14 +679,44 @@ def _check_pull(
                 quant.view(torch.uint8).cpu(),
                 stage._quant_scales.view(torch.uint8).cpu(),
                 ctx.wts.view(torch.int32).cpu().reshape(-1),
+                ctx.ids.cpu().reshape(-1),
             )
             sources = [None] * ctx.world
             dist.all_gather_object(sources, local)
             counts = helper.masked_m.cpu().tolist()
             ends = helper.psum.cpu().tolist()
+            if tile_flags is not None:
+                flags = tile_flags.cpu()
+                m_tiles = (ends[-1] + 255) // 256
+                check(bool((flags[:m_tiles * 4:4, ctx.rank] != -1).all()),
+                      "missing M256 generation publication")
+                flags[:m_tiles * 4:4, ctx.rank] = -1
+                check(bool((flags == -1).all()),
+                      "M256 ready wrote an M64 or foreign-source flag")
             valid = torch.cat([
                 torch.arange(end - count, end) for count, end in zip(counts, ends)
             ]).long()
+            if src_rank_shuffle:
+                full_map = stage._ep_rowmap.cpu()
+                valid = torch.nonzero(full_map[:ends[-1], 0] >= 0).flatten()
+                check(helper.src_rank_shuffle, "source shuffle not selected")
+                for begin in range(0, ends[-1], 256):
+                    routes = full_map[begin:begin + 256, 0]
+                    routes = routes[routes >= 0]
+                    if routes.numel():
+                        owners = routes // (TOKENS * TOPK)
+                        check(bool((owners == owners[0]).all()),
+                              f"M256 at {begin} crosses source ranks")
+                for source in range(ctx.world):
+                    expect = torch.nonzero(
+                        sources[source][3] // EXPERTS_PER_RANK == ctx.rank
+                    ).flatten()
+                    received = full_map[valid, 0].long()
+                    received = received[
+                        received // (TOKENS * TOPK) == source
+                    ] % (TOKENS * TOPK)
+                    check(torch.equal(received.sort().values, expect),
+                          f"source {source}: missing or duplicate route")
             if fused:
                 # GEMM1 can use a smaller tile than the plan/GEMM2 alignment.
                 # Metadata must count actual rows, excluding alignment holes.
@@ -642,10 +729,58 @@ def _check_pull(
                             expected_counts[tile] += max(
                                 0, min(end, (tile + 1) * 64) - max(start, tile * 64)
                             )
+                if src_rank_shuffle:
+                    expected_counts = torch.bincount(
+                        valid // 64, minlength=metadata.numel()
+                    ).to(torch.int64)
                 check(torch.equal((metadata >> 16) & 0xFFFF, expected_counts),
                       "pull tile metadata includes padding or misses live rows")
                 check(torch.equal((metadata & 0xFF) != 0, expected_counts > 0),
                       "empty pull tiles must not wait for producer flags")
+                if os.environ.get("AITER_MOE_S1F_READY_QUEUE", "0") == "1":
+                    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import ready_queue
+
+                    check(helper.ready_queue, "ready queue not selected")
+                    configs = [dict(key[-1]) for key in helper._fused_launches]
+                    tile_sizes = {cfg["tile_m"] for cfg in configs}
+                    check(len(tile_sizes) == 1, "ambiguous queue tile size")
+                    tile_m = tile_sizes.pop()
+                    sub = tile_m // 64
+                    m_tiles = (ends[-1] + tile_m - 1) // tile_m
+                    cap = metadata.numel()
+                    queue = helper.affinity_heads.cpu()[ready_queue.AFFINITY_WORDS:]
+                    check(int(queue[ready_queue.TAIL]) == m_tiles,
+                          "ready queue lost or duplicated an A tile")
+                    entries = queue[ready_queue.COUNTS + cap:][:m_tiles]
+                    check(torch.equal(entries.sort().values, torch.arange(1, m_tiles + 1)),
+                          "ready queue did not publish every live A tile exactly once")
+                    expected_parts = torch.zeros(m_tiles, dtype=torch.int32)
+                    for part in range(sub):
+                        live = expected_counts[part:m_tiles * sub:sub] > 0
+                        expected_parts[:live.numel()] += live.to(torch.int32)
+                    completed = queue[ready_queue.COUNTS:][:m_tiles]
+                    check(torch.equal(completed, expected_parts),
+                          "ready queue completion count includes padding or duplicates")
+                if ready_first:
+                    # Grade local-only chunk intervals against actual owners,
+                    # independently of histogram-derived planner bounds.
+                    full_map = stage._ep_rowmap.cpu()
+                    max_routes = stage.compact.max_routes
+                    owners = full_map[valid, 0].long() // max_routes
+                    chunks = valid // 16
+                    extent = metadata.numel() * 4
+                    live = torch.bincount(chunks, minlength=extent).reshape(-1, 4)
+                    remote = torch.bincount(
+                        chunks[owners != ctx.rank], minlength=extent
+                    ).reshape(-1, 4)
+                    local = (live > 0) & (remote == 0)
+                    index = torch.arange(4).expand_as(local)
+                    first = torch.where(local, index, 4).amin(dim=1)
+                    end = torch.where(local, index + 1, 0).amax(dim=1)
+                    expected = first | (end << 16)
+                    actual = helper.tile_local_chunks.cpu().to(torch.int64)
+                    check(torch.equal(actual, expected),
+                          "local M16 interval disagrees with received rows")
             rowmap = stage._ep_rowmap.cpu()[valid]
             if a_preshuffled:
                 packed = helper.payload.cpu().reshape(-1, HIDDEN // 32, 16, 16)
@@ -744,6 +879,266 @@ def _check_pull_s1f_affinity(ctx):
         _check_pull(ctx, fused=True, expected_affinity=(8, 3))
 
 
+def _check_pull_s1f_ready_first(ctx, *, expected_tile_ready=None):
+    """Check local-first M16 tails, empty segments and readiness generations."""
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+    import mori.cco.device.flydsl as cco
+
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import s1f_pull
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.arena import _from_gpu_ptr
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.stages import pull as pull_module
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.stages.pull import PullDispatch
+
+    compile_original = s1f_pull.compile_s1f_pull
+    init_original = PullDispatch.__init__
+    progress_views = []
+    probe_storage = []
+    delayed_launchers = {}
+    run_original = pull_module._run_compiled
+    producers = int(os.environ.get("AITER_MEGA_S1F_PULL_PRODUCERS", "96"))
+    expected_affinity = s1f_pull.pull_affinity_geometry(256, producers)
+    probe_flag_offset = 0
+
+    def with_progress(self, dispatch):
+        init_original(self, dispatch)
+        self.send_base = torch.cat((
+            self.send_base,
+            torch.zeros(3, dtype=torch.int32, device=self.send_base.device),
+        ))
+        progress_views.append(self.send_base[-3:])
+        probe_storage.append(self.send_base)
+
+    def arm_probe(pull):
+        # Every rank must finish JIT and its first execution before timing a
+        # source delay; otherwise compilation skew can exhaust the probe.
+        torch.cuda.synchronize()
+        ctx.comm.barrier()
+        previous = [None]
+        if ctx.rank == 0:
+            address = (pull._ep._dispatch._pull.arena.local_ptr("pull_tile_flag")
+                       + probe_flag_offset)
+            previous[0] = _from_gpu_ptr(address, (1,), torch.int32).item()
+        dist.broadcast_object_list(previous, src=0)
+        progress_views[0].copy_(torch.tensor(
+            [1, 0, previous[0]], dtype=torch.int32, device=ctx.device
+        ))
+        torch.cuda.synchronize()
+        ctx.comm.barrier()
+        ctx.layer(pull, "bf16")
+        torch.cuda.synchronize()
+        ctx.comm.barrier()
+
+    def dsl_types(**annotations):
+        # This module postpones annotations; nested FX imports cannot be
+        # resolved by FlyDSL's signature parser. Supply actual runtime types.
+        def annotate(function):
+            function.__annotations__.update(annotations)
+            return function
+        return annotate
+
+    def compile_delayed(**kwargs):
+        nonlocal probe_flag_offset
+        # Cluster 1's first M tile belongs to a nonleader producer, which must
+        # progress while cluster 0's producer leader waits on the delayed rank.
+        probe_flag_offset = kwargs["tile_m"] // 64 * s1f_pull.FLAG_STRIDE
+        ready, fused = compile_original(**kwargs)
+        if ctx.rank != ctx.world - 1:
+            return ready, fused
+        flag_offset = kwargs["off_tile_flag"] + probe_flag_offset
+        probe_offset = kwargs["world"] * kwargs["experts"]
+
+        @flyc.kernel(known_block_size=(32, 1, 1))
+        @dsl_types(arena=fx.Int64, bounds=fx.Tensor)
+        def delay_source(arena: fx.Int64, bounds: fx.Tensor):
+            if fx.thread_idx.x == 0:
+                ptr = fx.PointerType.get(
+                    fx.Int32.ir_type, fx.AddressSpace.Global, 4
+                )
+                if bounds[probe_offset] == 1:
+                    # Rank0's flag must advance from the completed warmup
+                    # generation before this source publishes readiness.
+                    window = cco.CachedWindow(arena)
+                    address = fx.inttoptr(ptr, window.base + flag_offset)
+                    previous = bounds[probe_offset + 2]
+                    value = previous
+                    tries = fx.Int32(0)
+                    while (value == previous) & (tries < 200000):
+                        value = fx.generic_load(
+                            address, memory_order=fx.AtomicOrdering.Acquire,
+                            syncscope="",
+                        )
+                        fx.rocdl.s_sleep(1)
+                        tries += 1
+                    bounds[probe_offset + 1] = fx.Int32(value != previous)
+                    bounds[probe_offset] = 2
+
+        @flyc.jit
+        @dsl_types(arena=fx.Int64, bounds=fx.Tensor, stream=fx.Stream)
+        def delayed_entry(arena: fx.Int64, bounds: fx.Tensor, stream: fx.Stream):
+            delay_source(arena, bounds).launch(
+                grid=(1, 1, 1), block=(32, 1, 1), stream=stream
+            )
+
+        delayed_launchers[fused] = delayed_entry
+        return ready, fused
+
+    def run_with_delay(function, *args):
+        delay = delayed_launchers.get(function)
+        if delay is not None:
+            # Delay the source before S1F publishes its epoch. Production has
+            # no standalone ready kernel; the test-only delay remains bounded.
+            run_original(delay, args[7], probe_storage[0], args[-1])
+        return run_original(function, *args)
+
+    with mock.patch.dict(os.environ, {
+        "AITER_MOE_S1F_READY_FIRST": "1",
+        "AITER_MOE_S1F_AFFINITY": "1",
+        "AITER_MEGA_S1F_PULL_PRODUCERS": str(producers),
+        "AITER_MEGA_S1F_PULL_CLUSTER": "0",
+    }), mock.patch.object(
+        s1f_pull, "compile_s1f_pull", compile_delayed
+    ), mock.patch.object(PullDispatch, "__init__", with_progress), mock.patch.object(
+        pull_module, "_run_compiled", run_with_delay
+    ):
+        _check_pull(
+            ctx, fused=True, expected_affinity=expected_affinity, ready_first=True,
+            ready_probe=arm_probe,
+            expected_tile_ready=expected_tile_ready,
+        )
+    check = _Checks("ready-source progress before delayed source")
+    if ctx.rank == ctx.world - 1:
+        check(progress_views[0].cpu().tolist()[:2] == [2, 1],
+              "producer waited for every rank")
+    check.settle()
+
+
+def _check_pull_s1f_ready_queue(ctx):
+    """Exercise completion-driven scheduling across changing graph routing."""
+    with mock.patch.dict(os.environ, {"AITER_MOE_S1F_READY_QUEUE": "1"}):
+        _check_pull_s1f_ready_first(ctx)
+
+
+def _check_pull_s1f_cluster_local(ctx):
+    """Exercise hardware cluster rounds, partial batches and changing routing."""
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.s1f_pull import pull_affinity_geometry
+
+    producers = int(os.environ.get("AITER_MEGA_S1F_PULL_PRODUCERS", "96"))
+    with mock.patch.dict(os.environ, {
+        "AITER_MOE_S1F_CLUSTER_LOCAL": "1",
+        "AITER_MOE_S1F_READY_FIRST": "1",
+        "AITER_MOE_S1F_READY_QUEUE": "0",
+        "AITER_MOE_S1F_AFFINITY": "1",
+        "AITER_MEGA_S1F_PULL_PRODUCERS": str(producers),
+        "AITER_MEGA_S1F_PULL_CLUSTER": "0",
+    }):
+        _check_pull(
+            ctx, fused=True, ready_first=True,
+            expected_affinity=pull_affinity_geometry(256, producers),
+        )
+
+
+def _check_pull_s1f_producer_group(ctx):
+    """Check four-TG publication, empty members and independent consumers."""
+    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
+
+    original_find = grouped._find_grouped_config
+
+    def configured(**kwargs):
+        row = dict(original_find(**kwargs) or {})
+        # Scale loads must follow A-ready in S1F, including small CSV buckets.
+        row["tdm_as_in_prologue"] = "0"
+        return row
+
+    # Pin the tiling so this collective test does not depend on CSV changes.
+    # P100 also verifies that four-TG grouping does not require P % 8 == 0.
+    producers = int(os.environ.get("CHECK_PRODUCERS", "100"))
+    for ready_first in (False, True):
+        with mock.patch.dict(os.environ, {
+            "AITER_MOE_S1F_PRODUCER_GROUP": "4",
+            "AITER_MOE_S1F_CLUSTER_LOCAL": "0",
+            "AITER_MOE_S1F_READY_QUEUE": "0",
+            "AITER_MOE_S1F_READY_FIRST": str(int(ready_first)),
+            "AITER_MEGA_S1F_PULL_PRODUCERS": str(producers),
+            "AITER_TDM_TILE_M": "256", "AITER_TDM_TILE_N": "256",
+            "AITER_TDM_TILE_K": "256",
+            # Small-token push skips A preshuffle and needs extra scale LDS.
+            "AITER_TDM_NUM_BUFFERS": "4" if TOKENS >= 4096 else "2",
+            "AITER_TDM_M_WARP": "2", "AITER_TDM_N_WARP": "2",
+        }), mock.patch.object(grouped, "_find_grouped_config", configured):
+            _check_pull(
+                ctx, fused=True, ready_first=ready_first,
+                expected_producer_group=4, expected_cluster=(1, 1),
+                expected_affinity=(1, 0),
+            )
+
+
+def _check_pull_s1f_tile_ready(ctx, *, ready_first=False):
+    """Check single M256 publication, graph generations and partial tiles."""
+    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
+
+    original_find = grouped._find_grouped_config
+
+    def configured(**kwargs):
+        row = dict(original_find(**kwargs) or {})
+        row["tdm_as_in_prologue"] = "0"
+        return row
+
+    with mock.patch.dict(os.environ, {
+        "AITER_MOE_S1F_TILE_READY": "1",
+        "AITER_MOE_S1F_PRODUCER_GROUP": "1",
+        "AITER_MOE_S1F_CLUSTER_LOCAL": "0",
+        "AITER_MOE_S1F_READY_QUEUE": "0",
+        "AITER_MOE_S1F_READY_FIRST": str(int(ready_first)),
+        "AITER_MOE_S1F_AFFINITY": os.environ.get("CHECK_AFFINITY", "1"),
+        "AITER_MEGA_S1F_PULL_PRODUCERS": "96",
+        "AITER_MEGA_S1F_PULL_CLUSTER": "0",
+        "AITER_TDM_TILE_M": "256", "AITER_TDM_TILE_N": "256",
+        "AITER_TDM_TILE_K": "256",
+        "AITER_TDM_NUM_BUFFERS": "4" if TOKENS >= 4096 else "2",
+        "AITER_TDM_M_WARP": "2", "AITER_TDM_N_WARP": "2",
+    }), mock.patch.object(grouped, "_find_grouped_config", configured):
+        if ready_first:
+            _check_pull_s1f_ready_first(ctx, expected_tile_ready=True)
+        else:
+            _check_pull(ctx, fused=True, expected_tile_ready=True)
+
+
+def _check_pull_s1f_src_rank_shuffle(ctx):
+    """Check source-homogeneous M256 tiles with arbitrary routing and padding."""
+    from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
+
+    original_find = grouped._find_grouped_config
+
+    def configured(**kwargs):
+        row = dict(original_find(**kwargs) or {})
+        row["tdm_as_in_prologue"] = "0"
+        return row
+
+    with mock.patch.dict(os.environ, {
+        "AITER_MEGA_PULL_PLAN_PACK": "1",
+        "AITER_MEGA_PULL_SRC_SHUFFLE": "1",
+        "AITER_MOE_S1F_TILE_READY": "0",
+        "AITER_MOE_S1F_READY_FIRST": "0",
+        "AITER_MOE_S1F_PRODUCER_GROUP": "1",
+        "AITER_MOE_S1F_CLUSTER_LOCAL": "0",
+        "AITER_MOE_S1F_READY_QUEUE": "0",
+        "AITER_MOE_S1F_AFFINITY": "1",
+        "AITER_MEGA_S1F_PULL_PRODUCERS": "96",
+        "AITER_MEGA_S1F_PULL_CLUSTER": "0",
+        "AITER_TDM_TILE_M": "256", "AITER_TDM_TILE_N": "256",
+        "AITER_TDM_TILE_K": "256",
+        "AITER_TDM_NUM_BUFFERS": "4" if TOKENS >= 4096 else "2",
+        "AITER_TDM_M_WARP": "2", "AITER_TDM_N_WARP": "2",
+    }), mock.patch.object(grouped, "_find_grouped_config", configured):
+        _check_pull(ctx, fused=True, src_rank_shuffle=True)
+
+
+def _check_pull_s1f_tile_ready_leader(ctx):
+    """Check M256 publication while the leader waits for a delayed source."""
+    _check_pull_s1f_tile_ready(ctx, ready_first=True)
+
+
 def _check_pull_s1f_clusters(ctx):
     """Exercise physical cluster roles, multicast, tails and graph generations."""
     from aiter.ops.flydsl.kernels.mega_moe_gfx1250.stages.pull import PullDispatch
@@ -787,6 +1182,13 @@ CHECKS = (
     _check_pull,
     _check_pull_s1f,
     _check_pull_s1f_affinity,
+    _check_pull_s1f_ready_first,
+    _check_pull_s1f_ready_queue,
+    _check_pull_s1f_cluster_local,
+    _check_pull_s1f_producer_group,
+    _check_pull_s1f_tile_ready,
+    _check_pull_s1f_tile_ready_leader,
+    _check_pull_s1f_src_rank_shuffle,
     _check_pull_s1f_clusters,
     _check_pull_s1f_cluster_m_projection,
     _check_pairings,

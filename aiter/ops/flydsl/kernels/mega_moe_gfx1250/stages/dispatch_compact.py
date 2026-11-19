@@ -159,6 +159,7 @@ class _CompactGeometry:
     wire_row: int  # payload, then its e8m0 row, 128 B aligned
     hist_stride: int
     max_routes: int
+    source_groups: int = 1
 
     @classmethod
     def of(cls, config: MegaMoEConfig, tile_m: int | None = None):
@@ -166,12 +167,16 @@ class _CompactGeometry:
 
         tile = _compact_gemm_align_m(config) if tile_m is None else tile_m
         max_routes = config.max_tokens_per_rank * config.topk
+        source_groups = config.world_size if (
+            os.environ.get("AITER_MEGA_DISPATCH_PULL", "0") == "1"
+            and os.environ.get("AITER_MEGA_PULL_SRC_SHUFFLE", "0") == "1"
+        ) else 1
         return cls(
             tile_m=tile,
             cap=compact_row_capacity(
                 max_recv=config.max_recv,
                 topk=config.topk,
-                experts_per_rank=config.experts_per_rank,
+                experts_per_rank=config.experts_per_rank * source_groups,
                 tile_m=tile,
             ),
             wire_row=_align_up(
@@ -183,6 +188,7 @@ class _CompactGeometry:
                 max_routes=max_routes,
             ),
             max_routes=max_routes,
+            source_groups=source_groups,
         )
 
 
@@ -703,10 +709,11 @@ class _CompactDispatch(_Dispatch):
         # monotonic in the token bucket, so a smaller bound can still name a
         # wider tile. Clamping keeps every step inside the allocated rows.
         align_m = min(max(tile_m, tile_m2), geo.tile_m)
+        source_groups = geo.source_groups
         rows = compact_row_capacity(
             max_recv=bound,
             topk=config.topk,
-            experts_per_rank=config.experts_per_rank,
+            experts_per_rank=config.experts_per_rank * source_groups,
             tile_m=align_m,
         )
         # fused_moe clamps both GEMM tiles to the plan alignment.

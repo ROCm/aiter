@@ -13,7 +13,9 @@ from flydsl.expr import const_expr, range_constexpr
 
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
 
+from . import ready_queue as rq
 from .dispatch_pull import make_pull_tile, pull_lds_row_pitch
+from .s1f_producer_group import make_group_producer, validate_producer_group
 from .s1f_stage1 import (
     FLAG_M, FLAG_STRIDE, _trap, make_s1f_stage1,
 )
@@ -83,27 +85,59 @@ def compile_s1f_pull(
     cluster_n=1,
     affinity_size=1,
     affinity_producers=0,
+    ready_first=False,
+    ready_queue=False,
+    cluster_local=False,
+    producer_group=1,
+    tile_ready=False,
+    packed_input=False,
+    off_packed=0,
+    src_rank_shuffle=False,
 ):
     """Build source-ready/metadata setup and S1F with a pull producer.
 
-    A flag tile belongs to one producer wave. That wave gathers and shuffles
-    four M16 chunks, retires its stores, then publishes the original S1F flag.
-    No cross-wave wait or fence is needed to publish a tile. Consumer scheduling,
+    With tile_ready, one TG retires all four M64 pieces and publishes one
+    M256 flag after a workgroup barrier. Otherwise each wave independently
+    publishes its original M64 flag. Consumer scheduling,
     entry tickets, and drain live in make_s1f_stage1. Both clustered and solo
     consumers retain the same readiness and task-prefetch hooks.
     """
+    validate_producer_group(producer_group, workers, producers, tile_m)
+    if tile_ready and (
+        tile_m != 256 or ready_queue or cluster_local or producer_group != 1
+    ):
+        raise ValueError("M256 ready requires the one-TG pull producer")
+    if producer_group == 4 and (
+        ready_queue or cluster_local or cluster_m != 1 or cluster_n != 1
+        or affinity_size != 1
+    ):
+        raise ValueError("four-TG producers require independent GEMM consumers")
     if tile_m not in (64, 128, 256):
         raise ValueError("shared-consumer pull S1F requires M64/128/256")
     if model_dim % 256 or inter_dim % 128:
         raise ValueError("unsupported pull S1F geometry")
     if align_m % tile_m:
         raise ValueError("plan alignment must be a multiple of GEMM1 tile_m")
+    if cluster_local and (
+        not ready_first or ready_queue or affinity_size <= 1
+        or align_m != tile_m or cluster_m != 1 or cluster_n != 1
+    ):
+        raise ValueError("cluster-local S1F requires aligned local-ready affinity")
+    if ready_queue and (not ready_first or align_m != tile_m):
+        raise ValueError("ready queue requires local-ready and aligned GEMM tiles")
     tile_cap = (compact_cap + FLAG_M - 1) // FLAG_M
-    affinity_clusters = workers // affinity_size
-    ready_extent = max(tile_cap, affinity_clusters if affinity_size > 1 else 0)
+    affinity_clusters = producers // 4 if producer_group == 4 else workers // affinity_size
+    queue_affinity = affinity_size > 1 or producer_group == 4
+    ready_extent = max(tile_cap, affinity_clusters if queue_affinity else 0)
     ready_name = f"s1f_pull_ready_ep{world}"
+    if src_rank_shuffle:
+        if not packed_input or ready_first or tile_m != 256:
+            raise ValueError("source shuffle requires external-ready packed M256")
+        ready_name += "_src256"
     if affinity_size > 1:
         ready_name += f"_affinity{affinity_size}"
+    if producer_group == 4:
+        ready_name += "_producer4"
 
     @flyc.kernel(name=ready_name, known_block_size=(128, 1, 1))
     def ready_kernel(
@@ -115,7 +149,7 @@ def compile_s1f_pull(
         queue_heads: fx.Pointer,
     ):
         tid = fx.thread_idx.x
-        if const_expr(affinity_size > 1):
+        if const_expr(queue_affinity):
             index = fx.block_idx.x * 128 + tid
             if index < affinity_clusters:
                 fx.recast_iter(fx.Int32, queue_heads)[index * 32] = 0
@@ -148,31 +182,32 @@ def compile_s1f_pull(
                     spins += 1
                 if value != epoch:
                     _trap()
-        tile = fx.block_idx.x * 128 + tid
-        if tile < tile_cap:
-            row = tile * FLAG_M
-            info = fx.Int32(0)
-            if row < fx.min(rows, psum[experts - 1]):
-                lower = fx.Int32(0)
-                upper = fx.Int32(experts - 1)
-                while lower < upper:
-                    middle = (lower + upper) // 2
-                    if psum[middle] <= row:
-                        lower = middle + 1
-                    else:
-                        upper = middle
-                previous = fx.max(lower - 1, 0)
-                start = ((psum[previous] + align_m - 1) // align_m) * align_m
-                start = (lower > 0).select(start, 0)
-                # The plan may align to GEMM2's larger tile; padding must not
-                # become live GEMM1 rows or dereference stale inverse metadata.
-                count = (row >= start).select(fx.min(FLAG_M, psum[lower] - row), 0)
-                # Pull has one local publisher per flag tile, regardless of
-                # the input rows' source ranks. The consumer mask names that
-                # publisher, using the original per-rank flag slot.
-                source_mask = (count > 0).select(1 << rank, 0)
-                info = source_mask | (lower << 8) | (count << 16)
-            tile_info[tile] = info
+        if const_expr(not src_rank_shuffle):
+            tile = fx.block_idx.x * 128 + tid
+            if tile < tile_cap:
+                row = tile * FLAG_M
+                info = fx.Int32(0)
+                if row < fx.min(rows, psum[experts - 1]):
+                    lower = fx.Int32(0)
+                    upper = fx.Int32(experts - 1)
+                    while lower < upper:
+                        middle = (lower + upper) // 2
+                        if psum[middle] <= row:
+                            lower = middle + 1
+                        else:
+                            upper = middle
+                    previous = fx.max(lower - 1, 0)
+                    start = ((psum[previous] + align_m - 1) // align_m) * align_m
+                    start = (lower > 0).select(start, 0)
+                    # The plan may align to GEMM2's larger tile; padding must not
+                    # become live GEMM1 rows or dereference stale inverse metadata.
+                    count = (row >= start).select(fx.min(FLAG_M, psum[lower] - row), 0)
+                    # Pull has one local publisher per flag tile, regardless of
+                    # the input rows' source ranks. The consumer mask names that
+                    # publisher, using the original per-rank flag slot.
+                    source_mask = (count > 0).select(1 << rank, 0)
+                    info = source_mask | (lower << 8) | (count << 16)
+                tile_info[tile] = info
 
     @flyc.jit
     def ready(
@@ -205,6 +240,13 @@ def compile_s1f_pull(
         off_wire=off_wire,
         tiles_per_block=4,
     )
+
+    if packed_input:
+        from .packed_copy import make_packed_copy
+        copy_tile = make_packed_copy(
+            model_dim=model_dim, wire_row=wire_row, max_routes=max_routes,
+            world=world, rank=rank, cap=compact_cap, off_packed=off_packed,
+        )
 
     @flyc.jit
     def producer(
@@ -241,14 +283,21 @@ def compile_s1f_pull(
             first = (cluster_id + member * affinity_clusters) * (tile_m // FLAG_M) + wave
             stride = affinity_clusters * affinity_producers * (tile_m // FLAG_M)
             live_wave = fx.Int32(wave < tile_m // FLAG_M)
-        for tile in range(
-            live_wave.select(first, (active_rows + FLAG_M - 1) // FLAG_M),
-            (active_rows + FLAG_M - 1) // FLAG_M,
-            stride,
-        ):
-            # Each wave owns the entire flag tile. Its four M16 copies use
-            # its private LDS slice; other waves can publish independently.
-            count = (tile_info[tile] >> 16) & 0xFFFF
+        tile_count = (active_rows + FLAG_M - 1) // FLAG_M
+        loop_first = live_wave.select(first, tile_count)
+        loop_end = tile_count
+        loop_stride = stride
+        if const_expr(tile_ready):
+            # Uniform trip counts keep all four waves at the publication
+            # barrier, including empty experts and a partial final M256.
+            loop_first = first // 4
+            loop_end = (tile_count + 3) // 4
+            loop_stride = stride // 4
+        for item in range(loop_first, loop_end, loop_stride):
+            tile = item * 4 + wave if const_expr(tile_ready) else item
+            count = fx.Int32(0)
+            if tile < tile_count:
+                count = (tile_info[tile] >> 16) & 0xFFFF
             end = tile * FLAG_M + count
             for chunk in range_constexpr(FLAG_M // 16):
                 row0 = tile * FLAG_M + chunk * 16
@@ -263,16 +312,242 @@ def compile_s1f_pull(
                         row0,
                         end,
                     )
-            # Match the push publication contract: retire this wave's data
-            # stores, then publish a relaxed system-scope generation flag.
-            # No WG barrier: all data covered by this flag belongs to us.
             comm_ops.waitcnt_stores()
-            if (lane == 0) & (count > 0):
-                comm_ops.store_i32_global_system_monotonic(
-                    local + off_tile_flag + fx.Int64(tile) * FLAG_STRIDE + rank * 4,
-                    generation,
+            if const_expr(tile_ready):
+                # Every writer releases before rendezvous. The leader acquires
+                # their completion before publishing the original SYS flag.
+                comm_ops.fence_agent_release()
+                fx.gpu.barrier()
+                comm_ops.fence_agent_acquire()
+                if fx.thread_idx.x == 0:
+                    comm_ops.store_i32_global_system_release(
+                        local + off_tile_flag + fx.Int64(item * 4)
+                        * FLAG_STRIDE + rank * 4,
+                        generation,
+                    )
+            else:
+                if (lane == 0) & (count > 0):
+                    comm_ops.store_i32_global_system_monotonic(
+                        local + off_tile_flag + fx.Int64(tile)
+                        * FLAG_STRIDE + rank * 4,
+                        generation,
+                    )
+
+    @flyc.jit
+    def producer_ready_first(
+        storage: fx.Pointer,
+        payload: fx.Pointer,
+        scales: fx.Pointer,
+        psum: fx.Pointer,
+        arena: fx.Int64,
+        addr_tile_info: fx.Int64,
+        rows: fx.Int32,
+        slot: fx.Int32,
+        generation: fx.Int32,
+        addr_queue: fx.Int64 = 0,
+    ):
+        lane = fx.thread_idx.x % 32
+        wave = fx.thread_idx.x // 32
+        window = cco.CachedWindow(arena)
+        local = window.base + rank * window.stride
+        global_i32 = fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4)
+        shared_i32 = fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Shared, 4)
+        info = fx.inttoptr(global_i32, addr_tile_info)
+        lds_rows = fx.recast_iter(shared_i32, storage)
+        scale_rows = fx.recast_iter(global_i32, scales)
+        output = fx.Int64(fx.ptrtoint(payload))
+        ends = fx.recast_iter(global_i32, psum)
+        tile_count = (fx.min(rows, ends[experts - 1]) + FLAG_M - 1) // FLAG_M
+        first = slot * 4 + wave
+        stride = producers * 4
+        if const_expr(affinity_size > 1):
+            cluster_id = slot // affinity_producers
+            member = slot % affinity_producers
+            first = (
+                (cluster_id + member * affinity_clusters) * (tile_m // FLAG_M)
+                + wave
+            )
+            first = (wave < tile_m // FLAG_M).select(first, tile_count)
+            stride = affinity_clusters * affinity_producers * (tile_m // FLAG_M)
+
+        loop_first, loop_end, loop_stride = first, tile_count, stride
+        if const_expr(tile_ready):
+            loop_first = first // 4
+            loop_end = (tile_count + 3) // 4
+            loop_stride = stride // 4
+
+        # This kernel follows the completed local plan/quant launch, so its
+        # coordinator may now publish source readiness without a setup kernel.
+        if (slot == 0) & (fx.thread_idx.x == 0):
+            epoch = fx.generic_load(
+                fx.inttoptr(global_i32, local + off_ready + 8)
+            )
+            fx.generic_store(
+                fx.inttoptr(global_i32, local + off_ready), epoch,
+                memory_order=fx.AtomicOrdering.Release, syncscope="",
+            )
+
+        epoch = fx.generic_load(
+            fx.inttoptr(global_i32, local + off_ready + 8)
+        )
+        all_ready = fx.inttoptr(global_i32, local + off_ready + 4)
+        # The initial producer leader collects readiness immediately, then
+        # becomes an ordinary producer. Other TGs can copy local rows meanwhile.
+        if slot == 0:
+            if (fx.thread_idx.x < world) & (fx.thread_idx.x != rank):
+                peer = fx.inttoptr(
+                    global_i32,
+                    window.base + fx.Int64(fx.thread_idx.x) * window.stride
+                    + off_ready,
+                )
+                value = fx.generic_load(
+                    peer, memory_order=fx.AtomicOrdering.Acquire,
+                    syncscope="",
+                )
+                spins = fx.Int32(0)
+                while (value != epoch) & (spins < 10000000):
+                    fx.rocdl.s_sleep(1)
+                    value = fx.generic_load(
+                        peer, memory_order=fx.AtomicOrdering.Acquire,
+                        syncscope="",
+                    )
+                    spins += 1
+                if value != epoch:
+                    _trap()
+            fx.gpu.barrier()
+            if fx.thread_idx.x == 0:
+                fx.generic_store(
+                    all_ready, epoch,
+                    memory_order=fx.AtomicOrdering.Release,
+                    syncscope="agent",
                 )
 
+        # Share one gather/shuffle body. The leader is already synchronized and
+        # copies all its chunks in phase 1; followers copy local chunks first.
+        first_phase = (slot == 0).select(1, 0)
+        for phase in range(first_phase, fx.Int32(2)):
+            if (phase == 1) & (slot != 0):
+                # Other TGs only poll local memory. The second WG barrier
+                # propagates this acquire to every wave before remote TDM.
+                if fx.thread_idx.x == 0:
+                    value = fx.generic_load(
+                        all_ready, memory_order=fx.AtomicOrdering.Acquire,
+                        syncscope="agent",
+                    )
+                    spins = fx.Int32(0)
+                    while (value != epoch) & (spins < 10000000):
+                        fx.rocdl.s_sleep(1)
+                        value = fx.generic_load(
+                            all_ready, memory_order=fx.AtomicOrdering.Acquire,
+                            syncscope="agent",
+                        )
+                        spins += 1
+                    if value != epoch:
+                        _trap()
+                fx.gpu.barrier()
+            for item in range(loop_first, loop_end, loop_stride):
+                tile = item * 4 + wave if const_expr(tile_ready) else item
+                count = fx.Int32(0)
+                bounds = fx.Int32(0)
+                if tile < tile_count:
+                    count = (info[tile] >> 16) & 0xFFFF
+                    bounds = info[tile_cap + tile]
+                local_first = (slot == 0).select(4, bounds & 0xFFFF)
+                local_end = (slot == 0).select(0, (bounds >> 16) & 0xFFFF)
+                all_local = (local_first == 0) & (
+                    local_end == (count + 15) // 16
+                )
+                first_chunk = (phase == 0).select(local_first, 0)
+                end_chunk = (phase == 0).select(local_end, (count + 15) // 16)
+                # Each copy retires its TDM before returning; unrolling cannot
+                # overlap chunks here. Keep one descriptor/shuffle body.
+                for chunk in range(first_chunk, end_chunk):
+                    own = (chunk >= local_first) & (chunk < local_end)
+                    if own == (phase == 0):
+                        copy_tile(
+                            lds_rows, output, scale_rows, local + off_rowmap,
+                            window.base, window.stride, tile * FLAG_M + chunk * 16,
+                            tile * FLAG_M + count,
+                        )
+                # Local-only tiles publish early. Mixed/remote tiles publish
+                # once, after their remaining chunks have been copied.
+                if const_expr(tile_ready):
+                    # Uniform M256 loops include empty waves in the rendezvous.
+                    # Phase 0 may publish only if every live M64 is local;
+                    # otherwise phase 1 completes it after the leader's ready.
+                    comm_ops.waitcnt_stores()
+                    comm_ops.fence_agent_release()
+                    fx.gpu.barrier()
+                    comm_ops.fence_agent_acquire()
+                    if fx.thread_idx.x == 0:
+                        tile_local = fx.Int32(slot != 0)
+                        for part in range_constexpr(4):
+                            sub = item * 4 + part
+                            if sub < tile_count:
+                                live = (info[sub] >> 16) & 0xFFFF
+                                sub_bounds = info[tile_cap + sub]
+                                local_only = ((sub_bounds & 0xFFFF) == 0) & (
+                                    (sub_bounds >> 16) == (live + 15) // 16
+                                )
+                                tile_local &= fx.Int32((live == 0) | local_only)
+                        if tile_local == fx.Int32(phase == 0):
+                            comm_ops.store_i32_global_system_release(
+                                local + off_tile_flag + fx.Int64(item * 4)
+                                * FLAG_STRIDE + rank * 4,
+                                generation,
+                            )
+                elif (count > 0) & (all_local == (phase == 0)):
+                    comm_ops.waitcnt_stores()
+                    if lane == 0:
+                        comm_ops.store_i32_global_system_monotonic(
+                            local + off_tile_flag + fx.Int64(tile) * FLAG_STRIDE
+                            + rank * 4,
+                            generation,
+                        )
+                        if const_expr(ready_queue):
+                            # Each live M64 publishes exactly once. AcqRel RMWs
+                            # collect every wave's completed payload/scale stores
+                            # before the last wave release-publishes the A tile.
+                            m = tile // (tile_m // FLAG_M)
+                            needed = fx.Int32(0)
+                            for part in range_constexpr(tile_m // FLAG_M):
+                                sub = m * (tile_m // FLAG_M) + part
+                                if sub < tile_cap:
+                                    needed += fx.Int32((info[sub] >> 16) != 0)
+                            base = addr_queue + rq.AFFINITY_WORDS * 4
+                            count_ptr = fx.inttoptr(
+                                global_i32, base + (rq.COUNTS + fx.Int64(m)) * 4
+                            )
+                            previous = fx.atomic_add(
+                                count_ptr, fx.Int32(1), syncscope="agent",
+                                ordering=fx.AtomicOrdering.AcqRel,
+                            )
+                            if previous + 1 == needed:
+                                position = fx.atomic_add(
+                                    fx.inttoptr(global_i32, base + rq.TAIL * 4),
+                                    fx.Int32(1), syncscope="agent",
+                                )
+                                if position >= tile_cap:
+                                    _trap()
+                                entry = fx.inttoptr(
+                                    global_i32, base + (
+                                        rq.COUNTS + tile_cap + fx.Int64(position)
+                                    ) * 4,
+                                )
+                                fx.generic_store(
+                                    entry, m + 1,
+                                    memory_order=fx.AtomicOrdering.Release,
+                                    syncscope="agent",
+                                )
+
+    selected_producer = producer_ready_first if ready_first else producer
+    if producer_group == 4:
+        selected_producer = make_group_producer(
+            copy_tile=copy_tile, rank=rank, world=world, experts=experts,
+            producers=producers, tile_cap=tile_cap, off_ready=off_ready,
+            off_rowmap=off_rowmap, off_tile_flag=off_tile_flag,
+            ready_first=ready_first,
+        )
     fused = make_s1f_stage1(
         rank=rank,
         npes=world,
@@ -309,7 +584,15 @@ def compile_s1f_pull(
         affinity_size=affinity_size,
         affinity_producers=affinity_producers,
         ctas_per_cu=1,
-        pull_producer=producer,
+        pull_producer=selected_producer,
+        pull_producer_group=producer_group,
+        pull_tile_ready=tile_ready,
+        pull_ready_queue=ready_queue,
+        pull_cluster_local=cluster_local,
+        pull_cluster_config=(
+            (copy_tile, off_ready, off_rowmap, wire_row)
+            if cluster_local else None
+        ),
         pull_lds_bytes=64 * pull_lds_row_pitch(wire_row),
     )
-    return ready, fused
+    return (None if ready_first else ready), fused
