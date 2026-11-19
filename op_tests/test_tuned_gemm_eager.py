@@ -454,6 +454,89 @@ def check_plugin_route():
     return rows
 
 
+def check_gfx1250_opus():
+    """On a 96-CU gfx1250 the tuned lookup gives OPUS rows for Kimi-K2 shapes.
+    The fast path asks the lookup with the key `_gemm_a16w16` uses, declines
+    those rows, and the op runs OPUS, or Triton for operands OPUS cannot read.
+
+    The device key and both backends are stubbed: this host has neither the
+    arch nor the kernels, but the lookup and the tuned rows are the real ones.
+    """
+    asked, ran = [], []
+    real_lookup, real_gfx_cu = tuned.get_GEMM_A16W16_config, tuned._gemm_gfx_cu
+
+    def lookup(**kw):
+        asked.append(kw)
+        return real_lookup(**kw)
+
+    def backend(name):
+        def run(inp, B, solidx, bias, otype, *_, config, out):
+            ran.append((name, config))
+            y = F.linear(inp, B, bias).to(otype or inp.dtype)
+            return y if out is None else out.copy_(y)
+
+        return run
+
+    expected = {}
+    for m, n, k in ((4, 2112, 7168), (16, 4096, 512)):
+        expected[m, n, k] = real_lookup(
+            M=m,
+            N=n,
+            K=k,
+            bias=False,
+            dtype=str(BF16),
+            otype=str(BF16),
+            scaleAB=False,
+            bpreshuffle=False,
+            gfx="gfx1250",
+            cu_num=96,
+        )
+        assert expected[m, n, k]["libtype"] == "opus", (m, n, k, expected[m, n, k])
+    x, w = _rand(4, 7168), _rand(2112, 7168, scale=7168**-0.5)
+    wt = _rand(7168, 2112, scale=7168**-0.5).t()  # not K-contiguous
+    x2, w2 = _rand(16, 512), _rand(4096, 512, scale=512**-0.5)
+    buf = torch.empty(16, 4096, dtype=BF16, device="cuda")
+    cases = (
+        ("gfx1250 96 CUs, OPUS row", lambda: tgemm.mm(x, w), (4, 2112, 7168), "opus"),
+        (
+            "gfx1250 96 CUs, OPUS row, B not K-contiguous",
+            lambda: tgemm.mm(x, wt),
+            (4, 2112, 7168),
+            "triton",
+        ),
+        (
+            "gfx1250 96 CUs, OPUS row, gemm_a16w16_out",
+            lambda: tuned.gemm_a16w16_out(x2, w2, buf),
+            (16, 4096, 512),
+            "opus",
+        ),
+    )
+    rows = []
+    tuned._eager_gfx_cu.clear()
+    tuned._gemm_gfx_cu = lambda device: ("gfx1250", 96)
+    tuned.get_GEMM_A16W16_config = lookup
+    solmap = dict(tuned.solMap)
+    tuned.solMap.update(opus=backend("opus"), triton=backend("triton"))
+    try:
+        for case, call, shape, libtype in cases:
+            del asked[:], ran[:]
+            _, calls = _custom_op_calls(call)
+            # The fast path's lookup, then the op's.
+            assert len(asked) == 2 and asked[0] == asked[1], f"{case}: {asked}"
+            assert (asked[0]["gfx"], asked[0]["cu_num"]) == ("gfx1250", 96)
+            assert [name for name, _ in ran] == [libtype], f"{case}: ran {ran}"
+            if libtype == "opus":
+                assert ran[0][1] == expected[shape], f"{case}: {ran[0][1]}"
+            rows.append(_row(case, calls, True))
+    finally:
+        tuned.solMap.clear()
+        tuned.solMap.update(solmap)
+        tuned.get_GEMM_A16W16_config = real_lookup
+        tuned._gemm_gfx_cu = real_gfx_cu
+        tuned._eager_gfx_cu.clear()
+    return rows
+
+
 def check_weight_handles():
     """The fast path keeps converted weights per tensor descriptor. A weight in
     a freed one's memory, a view with the same pointer and another shape, and a
@@ -616,6 +699,7 @@ def main():
     paths += check_declines()
     paths += check_replaced_lookup()
     paths += check_plugin_route()
+    paths += check_gfx1250_opus()
     paths += check_weight_handles()
     paths += check_compile()
     paths += check_cuda_graph()
