@@ -9,20 +9,20 @@ from aiter.ops.triton.utils.unified_attention_utils import (
 
 
 def _mimo_decode_params(*, sliding_window: int, **kwargs):
-    params = dict(
-        head_size=192,
-        head_size_v=128,
-        max_seqlen_q=1,
-        max_seqlen_k=60000,
-        sliding_window=sliding_window,
-        shuffled_kv_cache=False,
-        q_dtype=torch.bfloat16,
-        kv_cache_dtype=torch.bfloat16,
-        block_size=1,
-        num_sms=304,
-        num_2d_prgms=16,
-        num_queries_per_kv=16,
-    )
+    params = {
+        "head_size": 192,
+        "head_size_v": 128,
+        "max_seqlen_q": 1,
+        "max_seqlen_k": 60000,
+        "sliding_window": sliding_window,
+        "shuffled_kv_cache": False,
+        "q_dtype": torch.bfloat16,
+        "kv_cache_dtype": torch.bfloat16,
+        "block_size": 1,
+        "num_sms": 304,
+        "num_2d_prgms": 16,
+        "num_queries_per_kv": 16,
+    }
     params.update(kwargs)
     return SimpleNamespace(**params)
 
@@ -63,10 +63,13 @@ def test_gfx950_mimo_verify_and_prefill_configs():
 
     # DFLASH verify, 8 query tokens per sequence: 15 sequences at 60k context and
     # 4 at 128k (num_2d_prgms = tokens + sequences). The split follows the batch.
-    verify_60k = dict(sliding_window=0, max_seqlen_q=8, num_2d_prgms=135)
-    verify_128k = dict(
-        sliding_window=0, max_seqlen_q=8, max_seqlen_k=131072, num_2d_prgms=36
-    )
+    verify_60k = {"sliding_window": 0, "max_seqlen_q": 8, "num_2d_prgms": 135}
+    verify_128k = {
+        "sliding_window": 0,
+        "max_seqlen_q": 8,
+        "max_seqlen_k": 131072,
+        "num_2d_prgms": 36,
+    }
     for params in (verify_60k, verify_128k):
         assert config("attn_3d", **params) == {
             "BLOCK_M": 64,
