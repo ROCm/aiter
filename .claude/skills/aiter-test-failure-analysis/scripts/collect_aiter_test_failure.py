@@ -658,6 +658,7 @@ def select_culprit(
     has_specific_evidence = bool(snippets or shard_lists or profile.get("failed_test_files"))
     changed_failed_test = any(reason.startswith("changes failed test file") for reason in top.get("reasons", []))
     blockers: list[str] = []
+    warnings: list[str] = []
     reasons = list(top.get("reasons", []))
 
     if not previous_success:
@@ -665,7 +666,7 @@ def select_culprit(
     if not has_specific_evidence:
         blockers.append("no shard list, failed test file, or log snippet was available")
     if download_messages:
-        blockers.append("some logs or artifacts were unavailable")
+        warnings.append("some logs or artifacts were unavailable")
 
     confidence = "low"
     if previous_success and has_specific_evidence:
@@ -697,6 +698,7 @@ def select_culprit(
         "commit_window_size": len(commits),
         "reasons": reasons,
         "blockers": blockers,
+        "warnings": warnings,
     }
 
 
@@ -713,6 +715,8 @@ def render_culprit_summary(culprit: dict[str, Any], repo: str) -> str:
         lines.append(f"- Reason: {reason}")
     for blocker in culprit.get("blockers", [])[:6]:
         lines.append(f"- Blocker: {blocker}")
+    for warning in culprit.get("warnings", [])[:6]:
+        lines.append(f"- Warning: {warning}")
     return "\n".join(lines)
 
 
