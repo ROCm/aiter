@@ -291,6 +291,9 @@ _LAMPORT_AR_1SHOT_MAX_BYTES = {2: 9 * 1024 * 1024, 4: 1280 * 1024}
 _LAMPORT_AR_MAX_SIZE = int(
     os.environ.get("AITER_CUSTOM_AR_LAMPORT_AR_MAX_SIZE", "0") or 0
 )
+# INT4-coded Lamport two-shot (lossy, bf16) window (bytes): (MIN, MAX], MAX also sizes its inbox (0 = off).
+_Q4_2S_MAX_SIZE = int(os.environ.get("AITER_CUSTOM_AR_Q4_2S_MAX_SIZE", "0") or 0)
+_Q4_2S_MIN_SIZE = int(os.environ.get("AITER_CUSTOM_AR_Q4_2S_MIN_SIZE", "0") or 0)
 # Each rank owns 16B packs of whole waves of 32 (kLamportWave).
 _LAMPORT_AR_RMS_GRAIN = 512
 # hidden must be whole waves of 16B packs and a row at most one 1024-thread
@@ -1890,6 +1893,7 @@ class CustomAllreduce:
         self._pool = _SymmMemBufferProxy(meta, inp, (meta_hdl, inp_hdl), self)
         if self._is_gfx1250:
             self._init_lamport_symm(world_size)
+            self._init_lamport_q4_2s(world_size, symm=True)
 
     def _init_gfx1250(self, rank: int, world_size: int, max_size: int):
         """gfx1250 VMM init: used when hipIpc is unusable (ROCm < 7.15). Shares
@@ -2062,6 +2066,7 @@ class CustomAllreduce:
         )
         if self._is_gfx1250:
             self._init_lamport_ar_rms(world_size)
+            self._init_lamport_q4_2s(world_size, symm=False)
         else:
             self._initLamport(world_size)
 
@@ -2105,6 +2110,38 @@ class CustomAllreduce:
             "(inbox %d bytes per rank)",
             max_bytes,
             size,
+        )
+
+    def _init_lamport_q4_2s(self, world_size: int, symm: bool):
+        """The INT4 Lamport two-shot inbox, on the IPC pool or (cross-node) on
+        symm_mem. Sized by AITER_CUSTOM_AR_Q4_2S_MAX_SIZE (0 = off)."""
+        max_bytes = _Q4_2S_MAX_SIZE
+        if max_bytes <= 0:
+            return
+        size = ops.lamport_q4_2s_buffer_size_gfx1250(world_size, max_bytes)
+        if symm:
+            import torch.distributed._symmetric_memory as symm_mem
+
+            buf = symm_mem.empty(size, dtype=torch.uint8, device=self.device)
+            torch.cuda.synchronize()
+            hdl = self._rendezvous(buf, "lamportq4")
+            if hdl is None:
+                return
+            ptrs = list(hdl.buffer_ptrs)
+            self._lamportq4_symm = (buf, hdl)
+        else:
+            _COARSE_GRAIN = 2 * 1024 * 1024
+            size = (size + _COARSE_GRAIN - 1) // _COARSE_GRAIN * _COARSE_GRAIN
+            self._pool.create("lamportq4", size, raw_cached=True)
+            ptrs = self._pool.open_peer_buffers("lamportq4")
+        ops.init_lamport_q4_2s_gfx1250(self._ptr, ptrs, max_bytes)
+        # every rank's sentinel fill must land before any rank's first push
+        dist.barrier(group=self.group)
+        self._lamportq4_max_bytes = max_bytes
+        logger.info(
+            "Custom allreduce gfx1250 INT4 Lamport two-shot (lossy): (%d, %d] bytes",
+            _Q4_2S_MIN_SIZE,
+            max_bytes,
         )
 
     def _init_lamport_ar_rms(self, world_size: int):
@@ -2576,6 +2613,25 @@ class CustomAllreduce:
             )
             self._lamport_zeros = zeros
         return self.lamport_ar_add(inp, zeros[:n].view(inp.shape))
+    def should_lamport_q4_2s(self, inp: torch.Tensor) -> bool:
+        """Opt-in INT4 Lamport two-shot (lossy) for bf16 inputs of
+        AITER_CUSTOM_AR_Q4_2S_MIN_SIZE < bytes <= the inbox cap."""
+        cap = getattr(self, "_lamportq4_max_bytes", 0)
+        if self.disabled or cap <= 0:
+            return False
+        nbytes = inp.numel() * inp.element_size()
+        return (
+            inp.dtype == torch.bfloat16
+            and inp.is_contiguous()
+            and inp.data_ptr() % 8 == 0
+            and _Q4_2S_MIN_SIZE < nbytes <= cap
+            and inp.numel() % (28 * self.world_size) == 0
+        )
+
+    def lamport_all_reduce_q4_2s(self, inp: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(inp)
+        ops.allreduce_lamport_q4_2s_gfx1250(self._ptr, inp, out)
+        return out
 
     def lamport_ar_add(self, inp: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
         """Lamport one-shot all-reduce of inp + other on the AR + RMSNorm inbox,
