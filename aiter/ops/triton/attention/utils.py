@@ -190,7 +190,9 @@ def block_attn_mask_to_ragged_lut(
         rounded up to a power of two and clamped to the arch's BLOCK_KB_MIN and
         BLOCK_KB_MAX from configs/<arch>/triton/attention/block_lut/DEFAULT.json:
         each step is a serial cumsum, so a long row wants few steps, while a width
-        past the row wastes lanes. An explicit BLOCK_KB is used as given.
+        past the row wastes lanes. An explicit BLOCK_KB is used as given. Under
+        torch.compile the default guards on num_kv_blocks, so each new width
+        recompiles; pass BLOCK_KB to keep one graph across row lengths.
     Returns:
         kv_block_indices: 1D int32, concatenation of all KV block index lists.
         lut_start: 1D int32, length batch * num_heads * num_q_blocks. Index
