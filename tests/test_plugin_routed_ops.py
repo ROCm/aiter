@@ -1238,8 +1238,8 @@ def _route_cases():
         ),
         # The provider returns lse alone: an empty tensor when return_lse is False.
         "mla_paged_decode": (
-            lambda: mla_gluon.mla_gluon(**_gluon_args(), kv_scale=2.0),
-            "kv_scale",
+            lambda: mla_gluon.mla_gluon(**_gluon_args(), q_scale=2.0),
+            "q_scale",
             2.0,
             _z(0),
         ),

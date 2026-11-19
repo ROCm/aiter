@@ -9,7 +9,7 @@
 #                        NUM_KV_SPLITS auto-picked to fill ~256 WGs (in {1,2,4}).
 #                        Fast path: when NUM_KV_SPLITS==1, stage-1 writes the
 #                        final output directly to O and stage-2 reduce is skipped.
-#   REGIME='bh16bn128' - bf16 Q + fp8 KV, BLOCK_H=16, BLOCK_N=128,
+#   REGIME='bh16bn128' - bf16 or fp8 Q + fp8 KV, BLOCK_H=16, BLOCK_N=128,
 #                        nhead <= 96, batch_size >= 1,
 #                        (batch, split, head_block*qlen) grid. Full decode
 #                        (stage-1 + stage-2 reduce into the final O). A partial
@@ -24,6 +24,9 @@
 # number of work items shared by the batch, not NUM_KV_SPLITS per sequence.
 # mla_gluon_split_metadata cuts the batch's KV into segments of one length, so a
 # long sequence gets more segments and the call no longer waits on the longest one.
+#
+# fp8 query (bh16bn128): QK and PV run as fp8 MFMA, with P scaled to the fp8 max and cast to
+# fp8. QK operands use k_width 16 (16 B Q and K reads); PV operands stay at k_width 8.
 #
 # The bh16 regimes support num_iter in {1, 2, ...} (no gl.assume(num_iter>=3));
 # only bh64 assumes >= 3. See epilogue-1 handling below.
@@ -62,6 +65,7 @@ from aiter.ops.triton._gluon_kernels.gfx950.gluon.mla_gluon_split import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
+from aiter.ops.triton.utils.types import get_dtype_max
 from aiter.plugin import route as _route
 
 # fmt: off
@@ -77,6 +81,7 @@ def _mla_gluon(
     Attn_sink,
     sm_scale,
     kv_scale,
+    q_scale,  # fp8 query only: its dequant scale (1.0 for bf16)
     stride_q_nope_bs,
     stride_q_nope_s,  # MTP: q_pos (qlen) stride; 0 when QLEN==1
     stride_q_nope_h,
@@ -118,6 +123,9 @@ def _mla_gluon(
     HAS_PE: gl.constexpr,
     HAS_ATTN_SINK: gl.constexpr,
     SPLIT_REBALANCE: gl.constexpr,  # read each work item's KV range from Split_work
+    # fp8 query: max of the fp8 dtype. p <= 1 is scaled into the fp8 range before the
+    # cast, and acc is scaled back. 1.0 for a bf16 query.
+    P_SCALE: gl.constexpr,
 ):
     # Grid mapping: bh64 uses 3-D XCD-aware multi-batch; bh16bn64 and bh16bn128
     # use 2-D (batch, split) - for batch_size=1 this is (1, NUM_KV_SPLITS).
@@ -146,7 +154,6 @@ def _mla_gluon(
     # USE_2D_VIEW=False: flattened VarLen
     # Req_to_tokens = kv_indices[total_kv],           B_seq_len = kv_indptr[batch+1]
     if SPLIT_REBALANCE:
-        gl.static_assert(REGIME != 'bh64')
         # grid axis 0 is the work item; it is also the slot of its partial output
         split_kv_id = gl.program_id(0)
         work_row = Split_work + split_kv_id * 8
@@ -197,6 +204,9 @@ def _mla_gluon(
         score_end = split_kv_end
 
     ######### layout setting begin #########
+    # The query dtype is the MFMA operand dtype. An fp8 query (bh16bn128 only)
+    # runs QK and PV as fp8 MFMA; K and V are fp8 already.
+    Q_FP8: gl.constexpr = Q_nope.type.element_ty.is_fp8()
     # Q-side layouts + mfma_layout: switch by BLOCK_H.
     # bh64 has BLOCK_H=64; bh16bn128 and bh16bn64 share BLOCK_H=16 (identical Q layouts + mfma orientation).
     if BLOCK_H == 64:
@@ -234,26 +244,46 @@ def _mla_gluon(
         )
     else:
         # BLOCK_H == 16: shared by bh16bn128 and bh16bn64. Q is [16, 512] / [16, 64]; warps tile K.
-        blocked_q_nope: gl.constexpr = gl.BlockedLayout(
-            size_per_thread=[1, 8],
-            threads_per_warp=[1, 64],
-            warps_per_cta=[4, 1],
-            order=[1, 0],
-        )
-        shared_q_nope: gl.constexpr = gl.PaddedSharedLayout(
-            interval_padding_pairs=[[512, 16]],
-            offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [1, 0], [2, 0], [4, 0], [8, 0]],
-            cga_layout=[],
-            shape=[16, 512]
-        )
-        blocked_q_pe: gl.constexpr = gl.DistributedLinearLayout(
-            reg_bases=((0, 1), (0, 2), (0, 4)),
-            lane_bases=((0, 8), (0, 16), (0, 32), (1, 0), (2, 0), (4, 0)),
-            warp_bases=((8, 0), (0, 0)),
-            block_bases=[],
-            shape=[16, 64],
-        )
-        shared_q_pe: gl.constexpr = gl.SwizzledSharedLayout(vec=8, per_phase=2, max_phase=8, order=[1, 0])
+        if Q_FP8:
+            # fp8 Q (bh16bn128): 16 B (16 fp8) for each lane, as the KV copies
+            blocked_q_nope: gl.constexpr = gl.BlockedLayout(
+                size_per_thread=[1, 16],
+                threads_per_warp=[2, 32],
+                warps_per_cta=[4, 1],
+                order=[1, 0],
+            )
+            # 16 B chunks XOR-swizzled by row: the MFMA read has no bank conflicts, and each
+            # warp copy (2 rows) stays one contiguous 1024 B block
+            shared_q_nope: gl.constexpr = gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=16, order=[1, 0])
+            blocked_q_pe: gl.constexpr = gl.BlockedLayout(
+                size_per_thread=[1, 16],
+                threads_per_warp=[16, 4],
+                warps_per_cta=[4, 1],
+                order=[1, 0],
+            )
+            # q_pe is 1024 B: one warp copy; the swizzle stays inside it
+            shared_q_pe: gl.constexpr = gl.SwizzledSharedLayout(vec=16, per_phase=1, max_phase=4, order=[1, 0])
+        else:
+            blocked_q_nope: gl.constexpr = gl.BlockedLayout(
+                size_per_thread=[1, 8],
+                threads_per_warp=[1, 64],
+                warps_per_cta=[4, 1],
+                order=[1, 0],
+            )
+            shared_q_nope: gl.constexpr = gl.PaddedSharedLayout(
+                interval_padding_pairs=[[512, 16]],
+                offset_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [0, 256], [1, 0], [2, 0], [4, 0], [8, 0]],
+                cga_layout=[],
+                shape=[16, 512]
+            )
+            blocked_q_pe: gl.constexpr = gl.DistributedLinearLayout(
+                reg_bases=((0, 1), (0, 2), (0, 4)),
+                lane_bases=((0, 8), (0, 16), (0, 32), (1, 0), (2, 0), (4, 0)),
+                warp_bases=((8, 0), (0, 0)),
+                block_bases=[],
+                shape=[16, 64],
+            )
+            shared_q_pe: gl.constexpr = gl.SwizzledSharedLayout(vec=8, per_phase=2, max_phase=8, order=[1, 0])
         mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
             version=4,
             instr_shape=[16, 16, 32],
@@ -376,10 +406,19 @@ def _mla_gluon(
             shape=[512, 64],
         )
 
-    mfma_layout_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=8)
-    mfma_layout_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=8)
+    if Q_FP8:
+        # 16 fp8 for each lane (two MFMA K steps): Q and K are read 16 B at a time
+        QK_K_WIDTH: gl.constexpr = 16
+    else:
+        QK_K_WIDTH: gl.constexpr = 8
+    mfma_layout_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=QK_K_WIDTH)
+    mfma_layout_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=QK_K_WIDTH)
+    # PV operands stay at k_width 8: V keeps its register-only conversion from linear_v
+    mfma_layout_a_pv: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=8)
+    mfma_layout_b_pv: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=8)
     dtype = Q_nope.type.element_ty
     kvtype = Kv_c_cache.type.element_ty
+    out_dtype = O.type.element_ty
     ######### layout setting end #########
 
     buf_q_nope = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_CKV], layout=shared_q_nope)
@@ -410,7 +449,7 @@ def _mla_gluon(
     # logits are (Q @ K_fp8^T) * kv_scale * sm_scale; softmax is shift- but
     # not scale-invariant, so kv_scale must affect qk (not just acc).
     # For bf16 KV the wrapper passes kv_scale=1.0, so this is a no-op.
-    qk_scale = sm_scale * kv_scale
+    qk_scale = sm_scale * kv_scale * q_scale
 
     ### bufs of page_number
     shared_page: gl.constexpr = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0])
@@ -581,13 +620,13 @@ def _mla_gluon(
             p = gl.where(n_e_max[:, None] == float("-inf"), 0.0, p)
         e_sum = e_sum * re_scale + gl.sum(p, 1)
         e_max = n_e_max
-        p = p.to(dtype)
-        p = gl.convert_layout(p, mfma_layout_a)
+        p = (p * P_SCALE).to(dtype)
+        p = gl.convert_layout(p, mfma_layout_a_pv)
         acc *= re_scale[:, None]
         v_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(buf_idx), linear_v)
         v_c = v_c.to(dtype)
         v_c = gl.permute(v_c, [1, 0])
-        v_c = gl.convert_layout(v_c, mfma_layout_b)
+        v_c = gl.convert_layout(v_c, mfma_layout_b_pv)
         acc = gl.amd.cdna4.mfma(p, v_c, acc)
 
         start_n += BLOCK_N
@@ -651,13 +690,13 @@ def _mla_gluon(
             p = gl.where(n_e_max[:, None] == float("-inf"), 0.0, p)
         e_sum = e_sum * re_scale + gl.sum(p, 1)
         e_max = n_e_max
-        p = p.to(dtype)
-        p = gl.convert_layout(p, mfma_layout_a)
+        p = (p * P_SCALE).to(dtype)
+        p = gl.convert_layout(p, mfma_layout_a_pv)
         acc *= re_scale[:, None]
         v_c = bufs_kv.index(buf_idx).load(layout=linear_v)
         v_c = v_c.to(dtype)
         v_c = gl.permute(v_c, [1, 0])
-        v_c = gl.convert_layout(v_c, mfma_layout_b)
+        v_c = gl.convert_layout(v_c, mfma_layout_b_pv)
         acc = gl.amd.cdna4.mfma(p, v_c, acc)
 
         start_n += BLOCK_N
@@ -684,13 +723,13 @@ def _mla_gluon(
         p = gl.where(n_e_max[:, None] == float("-inf"), 0.0, p)
     e_sum = e_sum * re_scale + gl.sum(p, 1)
     e_max = n_e_max
-    p = p.to(dtype)
-    p = gl.convert_layout(p, mfma_layout_a)
+    p = (p * P_SCALE).to(dtype)
+    p = gl.convert_layout(p, mfma_layout_a_pv)
     acc *= re_scale[:, None]
     v_c = bufs_kv.index(buf_idx).load(layout=linear_v)
     v_c = v_c.to(dtype)
     v_c = gl.permute(v_c, [1, 0])
-    v_c = gl.convert_layout(v_c, mfma_layout_b)
+    v_c = gl.convert_layout(v_c, mfma_layout_b_pv)
     acc = gl.amd.cdna4.mfma(p, v_c, acc)
 
     cur_head_o = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, mfma_layout))
@@ -710,9 +749,9 @@ def _mla_gluon(
         e_sum = e_sum * re_scale + gl.exp2((sink - n_e_max) * LOG2E)
         e_max = n_e_max
 
-    acc *= kv_scale
+    acc *= kv_scale * (1.0 / P_SCALE)
     rcp = 1.0 / e_sum
-    stored_value = (acc * rcp[:, None]).to(dtype)
+    stored_value = (acc * rcp[:, None]).to(out_dtype)
     if NHEAD % BLOCK_H != 0:
         gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=(cur_head_o < NHEAD)[:, None])
     else:
@@ -907,6 +946,7 @@ def mla_gluon(
     has_pe=True,
     attn_sink=None,  # [nhead] fp32 per-head sink bias, None means no sink
     kv_split_info=None,  # (work_info, split_meta) from mla_gluon_split_metadata
+    q_scale=1.0,  # dequant scale of an fp8 query
 ):
     """Unified Gluon MLA entry (gfx950 / CDNA4) - decode and DeepSeek V4 sparse prefill.
 
@@ -939,6 +979,12 @@ def mla_gluon(
         the same number of splits. With attn_sink, the reduce adds the sink once
         for each sequence.
 
+    fp8 query (bh16bn128 decode: fp8 KV, has_pe=True): q_nope and q_pe can be
+        float8_e4m3fn, with q_scale (a Python float) as their dequant scale. QK
+        and PV then run as fp8 MFMA: the softmax probabilities are cast to fp8
+        (scaled by 448 first). o must be bf16. For a bf16 query, q_scale must be
+        1.0.
+
     The decode mode (has_pe=True, no attn_sink and no kv_split_info) is the
     routed op `mla_paged_decode`. An enabled kernel plugin can serve it. The
     prefill mode and a call with kv_split_info always run the Gluon kernel:
@@ -959,6 +1005,7 @@ def mla_gluon(
             kv_scale,
             min_kv_seq_len,
             return_lse,
+            q_scale,
         )
         return o, (lse if return_lse else None)
     return _mla_gluon_launch(
@@ -978,6 +1025,7 @@ def mla_gluon(
         has_pe,
         attn_sink,
         kv_split_info,
+        q_scale,
     )
 
 
@@ -995,6 +1043,7 @@ def _mla_paged_decode_fake(
     kv_scale: float = 1.0,
     min_kv_seq_len: int = 1,
     return_lse: bool = False,
+    q_scale: float = 1.0,
 ) -> torch.Tensor:
     """The shape of the returned lse: see :func:`_mla_paged_decode_routed`."""
     if not return_lse:
@@ -1008,7 +1057,7 @@ def _mla_paged_decode_fake(
 # Optional[Tensor], so "no lse" is an empty tensor.
 @_route(
     op="mla_paged_decode",
-    version=1,
+    version=2,
     fake=_mla_paged_decode_fake,
     mutates_args=["o"],
 )
@@ -1026,17 +1075,22 @@ def _mla_paged_decode_routed(
     kv_scale: float = 1.0,
     min_kv_seq_len: int = 1,
     return_lse: bool = False,
+    q_scale: float = 1.0,
 ) -> torch.Tensor:
     """MLA decode over KV rows that a page table selects (page size 1).
 
     This is the decode mode of :func:`mla_gluon`: ``has_pe=True`` and no
     ``attn_sink``. The logits are ``(q_nope . k_nope + q_pe . k_pe) * sm_scale
-    * kv_scale``. The values are the first 512 columns of the KV rows, times
-    ``kv_scale``.
+    * q_scale * kv_scale``. The values are the first 512 columns of the KV rows,
+    times ``kv_scale``.
+
+    Version 2 adds ``q_scale`` and the fp8 query.
 
     Args:
-        q_nope: ``[batch, nhead, 512]`` bf16. MTP: ``[batch, qlen, nhead, 512]``.
-        q_pe: ``[batch, nhead, 64]`` bf16. MTP: ``[batch, qlen, nhead, 64]``.
+        q_nope: ``[batch, nhead, 512]`` bf16, or float8_e4m3fn with fp8 KV.
+            MTP: ``[batch, qlen, nhead, 512]``.
+        q_pe: ``[batch, nhead, 64]``, the dtype of ``q_nope``.
+            MTP: ``[batch, qlen, nhead, 64]``.
         kv_c: KV rows, bf16 or fp8. Shared: ``[N, 576]``, the RoPE part at
             column ``kv_pe_offset`` (512). Split: ``[N, 512]``.
         o: the output, with the shape of ``q_nope``. The op writes it in place.
@@ -1048,12 +1102,18 @@ def _mla_paged_decode_routed(
         k_pe: split mode: ``[N, 64]`` RoPE rows, with ``kv_pe_offset=0``.
             Shared mode: None.
         kv_pe_offset: first column of the RoPE part in its rows.
-        kv_scale: scale of the KV values. Use 1.0 for bf16 KV.
+        kv_scale: scale of the KV values, a Python float. Use 1.0 for bf16 KV.
         min_kv_seq_len: the caller promises that no request has fewer KV rows.
             The value does not change the result.
         return_lse: if True, also return the log-sum-exp.
+        q_scale: dequant scale of an fp8 query, a Python float. Use 1.0 for a
+            bf16 query.
 
     MTP: query ``i`` of ``qlen`` reads the KV rows ``[0, seq_len - qlen + i]``.
+
+    fp8 query: the Gluon kernel casts the softmax probabilities to fp8 for PV,
+    so the result can differ from a bf16 computation by that rounding. ``o`` is
+    bf16.
 
     Returns:
         ``lse``. The attention is written into ``o`` in place. ``lse`` is a new
@@ -1076,6 +1136,7 @@ def _mla_paged_decode_routed(
         return_lse,
         True,
         None,
+        q_scale=q_scale,
     )
     return lse if lse is not None else q_nope.new_empty(0, dtype=torch.float32)
 
@@ -1097,6 +1158,7 @@ def _mla_gluon_launch(
     has_pe,
     attn_sink,
     kv_split_info=None,
+    q_scale=1.0,
 ):
     """Launch the Gluon MLA kernels. The arguments are those of :func:`mla_gluon`."""
     if k_pe is None:
@@ -1136,6 +1198,23 @@ def _mla_gluon_launch(
     # MTP (qlen>1) uses the grid-axis path: q_pos is grid axis 2, so each query
     # position is a separate program.
     REGIME = _mla_gluon_regime(nhead, kv_c.dtype)
+    # a tensor would reach the kernel as a pointer
+    for name, scale in (("q_scale", q_scale), ("kv_scale", kv_scale)):
+        assert isinstance(
+            scale, (int, float)
+        ), f"{name} must be a Python float, got {type(scale).__name__}"
+    fp8_query = q_nope.dtype == torch.float8_e4m3fn
+    if fp8_query:
+        assert REGIME == "bh16bn128" and has_pe, (
+            "an fp8 query needs the bh16bn128 decode (fp8 KV, has_pe=True), "
+            f"got {REGIME}, has_pe={has_pe}"
+        )
+        assert (
+            q_pe.dtype == q_nope.dtype
+        ), f"q_nope/q_pe must have one dtype, got {q_nope.dtype}/{q_pe.dtype}"
+        assert o.dtype == torch.bfloat16, f"o must be bf16, got {o.dtype}"
+    else:
+        assert q_scale == 1.0, f"q_scale is for an fp8 query, got {q_scale}"
 
     PAGE_SIZE = 1
     split_rebalance = False
@@ -1199,9 +1278,9 @@ def _mla_gluon_launch(
             )
             split_rebalance = True
             NUM_KV_SPLITS = split_work.shape[0]
-        assert (
+        assert fp8_query or (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
-        ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
+        ), f"q_nope/q_pe must be bf16 or float8_e4m3fn, got {q_nope.dtype}/{q_pe.dtype}"
         assert (
             kv_c.dtype == kv_dtype and k_pe.dtype == kv_dtype
         ), f"kv_c/k_pe must be {kv_dtype}, got {kv_c.dtype}/{k_pe.dtype}"
@@ -1315,6 +1394,7 @@ def _mla_gluon_launch(
         attn_sink,
         sm_scale,
         kv_scale,
+        q_scale,
         stride_q_nope_bs,
         stride_q_nope_s,
         stride_q_nope_h,
@@ -1357,6 +1437,7 @@ def _mla_gluon_launch(
         # the sink once instead
         HAS_ATTN_SINK=has_attn_sink and not split_rebalance,
         SPLIT_REBALANCE=split_rebalance,
+        P_SCALE=get_dtype_max(q_nope.dtype) if fp8_query else 1.0,
     )
 
     if NUM_KV_SPLITS == 1:

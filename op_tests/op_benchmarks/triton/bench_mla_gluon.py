@@ -6,7 +6,8 @@ The KV length of each sequence is drawn uniformly from [kv_min, kv_max]; with
 kv_min == kv_max all sequences have the same length. The rebalance gets its
 kv_split_info from mla_gluon_split_metadata, built once for each pool entry (a
 caller builds it once for each decode step). The time is the mla_gluon call,
-from CUDA-graph replay over rotating KV caches.
+from CUDA-graph replay over rotating KV caches. --q-dtype fp8 gives an fp8 query
+(fp8 QK and PV; fp8 KV only).
 """
 
 import functools
@@ -31,6 +32,7 @@ from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
     RotatingBufferBench,
 )
 from op_tests.triton_tests.attention.test_mla import (
+    _fp8_query,
     _paged_seq_info,
     _split_rebalance_inputs,
 )
@@ -53,7 +55,7 @@ def _kv_lens(batch, kv_min, kv_max, seed):
     return [rng.randint(kv_min, kv_max) for _ in range(batch)]
 
 
-def _inputs(lens, heads, kv_dtype):
+def _inputs(lens, heads, kv_dtype, fp8_query):
     """One pool entry: q, its own paged KV cache (1-D view), o and kv_split_info."""
     kv_c, block_table, q_nope, q_pe = _split_rebalance_inputs(
         len(lens), 1, heads, kv_dtype, max(lens), KV_LORA_RANK
@@ -62,6 +64,8 @@ def _inputs(lens, heads, kv_dtype):
     page_table, seq_info = _paged_seq_info(block_table, seq_lens, False)
     info = mla_gluon_split_metadata(seq_info, heads, kv_dtype, use_2d_view=False)
     q_nope, q_pe = q_nope[:, 0].contiguous(), q_pe[:, 0].contiguous()
+    if fp8_query:
+        (q_nope, _), (q_pe, _) = _fp8_query(q_nope, 1.0), _fp8_query(q_pe, 1.0)
     o = torch.empty(q_nope.shape, dtype=torch.bfloat16, device="cuda")
     return q_nope, q_pe, kv_c, o, page_table, seq_info, info
 
@@ -87,7 +91,7 @@ def benchmark(args):
     @triton.testing.perf_report([config])
     def bench_mla_gluon(batch, heads, kv_min, kv_max, split):
         lens = _kv_lens(batch, kv_min, kv_max, args.seed)
-        gen = functools.partial(_inputs, lens, heads, kv_dtype)
+        gen = functools.partial(_inputs, lens, heads, kv_dtype, args.q_dtype == "fp8")
         bencher.build_pool([gen], [_POOL_FIELDS])
         if split == "rebalance" and bencher.rot_bufs[0]["info"] is None:
             return float("nan")
@@ -129,6 +133,13 @@ def parse_args():
     )
     parser.add_argument("--kv-dtype", type=str, default="fp8", choices=list(KV_DTYPES))
     parser.add_argument(
+        "--q-dtype",
+        type=str,
+        default="bf16",
+        choices=["bf16", "fp8"],
+        help="fp8: fp8 query (fp8 QK and PV), needs --kv-dtype fp8",
+    )
+    parser.add_argument(
         "--seed", type=positive_int, default=1, help="Seed of the KV lengths"
     )
     override_parser_action(
@@ -142,6 +153,8 @@ def parse_args():
         parser.error("--model is not supported; use --shape")
     if args.shape and args.shape[2] > args.shape[3]:
         parser.error("--shape needs KV_MIN <= KV_MAX")
+    if args.q_dtype == "fp8" and args.kv_dtype != "fp8":
+        parser.error("--q-dtype fp8 needs --kv-dtype fp8")
     return args
 
 
