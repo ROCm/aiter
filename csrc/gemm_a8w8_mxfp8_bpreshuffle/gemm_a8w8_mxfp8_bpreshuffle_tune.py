@@ -492,6 +492,7 @@ KERNEL_ID_BASE_GFX1250_SMALLM = 2_000_000
 MXSCALE_KERNEL_ID = "mxfp8"
 MXSCALE_BMM_KERNEL_ID = "bmm"
 _GFX1250_1X32_LAST_KERNEL = None
+_GFX1250_1X32_LAST_USED_WORKSPACE = False
 
 
 def _bmm_scale_args(w_scale_block):
@@ -643,16 +644,22 @@ def run_gemm_flydsl_gfx1250(x, weight_shuffle, x_scale, w_scale, out, kernel_nam
 
 
 def run_gemm_flydsl_gfx1250_1x32(x, weight_shuffle, x_scale, w_scale, out, kernel_name):
-    global _GFX1250_1X32_LAST_KERNEL
+    global _GFX1250_1X32_LAST_KERNEL, _GFX1250_1X32_LAST_USED_WORKSPACE
     from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
         clear_mxfp8_32_workspace_cache,
+        parse_mxfp8_32_wmma_kernel_name,
         run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250,
     )
 
     if _GFX1250_1X32_LAST_KERNEL != kernel_name:
-        clear_mxfp8_32_workspace_cache()
-        gc.collect()
-        torch.cuda.empty_cache()
+        if _GFX1250_1X32_LAST_USED_WORKSPACE:
+            clear_mxfp8_32_workspace_cache()
+            gc.collect()
+            torch.cuda.empty_cache()
+        config = parse_mxfp8_32_wmma_kernel_name(kernel_name)
+        _GFX1250_1X32_LAST_USED_WORKSPACE = bool(
+            config is not None and config.get("split_k", 1) > 1
+        )
         _GFX1250_1X32_LAST_KERNEL = kernel_name
     return run_gemm_a8w8_mxfp8_32_bpreshuffle_gfx1250(
         x, weight_shuffle, x_scale, w_scale, out, kernel_name
