@@ -453,9 +453,14 @@ def get_mha_fwd_tuned_backend(**key_args) -> str | None:
         return None
     if not ENABLE_CK or not _mha_fwd_has_rows():
         return None
-    if key_args["block_table"] is not None or not (
-        key_args["cu_seqlens_q_padded"] is None
-        and key_args["cu_seqlens_k_padded"] is None
+    # A row records the int its kernel ran with; None has no row to match.
+    if (
+        key_args["block_table"] is not None
+        or key_args["how_v3_bf16_cvt"] is None
+        or not (
+            key_args["cu_seqlens_q_padded"] is None
+            and key_args["cu_seqlens_k_padded"] is None
+        )
     ):
         return None
     q, v = key_args["q"], key_args["v"]

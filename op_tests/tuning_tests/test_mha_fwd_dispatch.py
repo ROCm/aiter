@@ -265,6 +265,14 @@ class TestMhaFwdLookup(_Table):
                         policy.get_mha_fwd_tuned_backend(**_key_args()), backend
                     )
 
+    def test_a_call_without_how_v3_bf16_cvt_auto_selects(self):
+        """int(None) in the key raised before dispatch once a row matched."""
+        self.use([_tuned_row("ck")])
+        with _on_hardware():
+            self.assertIsNone(
+                policy.get_mha_fwd_tuned_backend(**_key_args(how_v3_bf16_cvt=None))
+            )
+
     def test_rows_for_other_hardware_or_head_dims_skip_the_key(self):
         for row in (
             _tuned_row("ck", hdim_q=128, hdim_v=128),
