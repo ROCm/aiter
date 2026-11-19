@@ -17,17 +17,30 @@ fp32 global scale given as k_scale / v_scale, 1.0 for the index key):
   KV page 2 * nkv * 9216 B : [K data | K scale | V data | V scale], each side nkv heads of
     8192 B data + 1024 B scale; K data token-major, K scale in MFMA lane order, V data in
     32-bit words (8 tokens x 4 bit per word), V scale [group][token].
+
+Row layout (kv_cache_dtype "nvfp4" with byte k_scale / v_scale planes, gfx950 and gfx1250):
+per (page, kv head) an e2m1 payload [128 tok x 64 B] (element 2j in the low nibble of byte j)
+and an E4M3 scale plane [128 tok x 8 B], each its own tensor with free page and head strides;
+the layout of MiniMax-M3's sparse NVFP4 pool and of the FlyDSL paged decode's NVFP4 K/V. No
+global scale: scale = e4m3(amax / 6), codes = e2m1(x * (1 / scale)) half to even, sign from
+x < 0. test_nvfp4_rows checks it byte for byte against the same call with "auto" caches,
+quantized in torch, on payloads and scale planes that are strided fields of one pre-filled
+pool (bytes no token owns must stay); q_out, index q_out and the fp8 / bf16 index cache must
+equal "auto"'s.
 """
 
 import argparse
 import itertools
 import subprocess
 import sys
+from unittest import mock
 
 import pandas as pd
 import torch
 
 import aiter
+import aiter.ops.fused_qknorm_idxrqknorm as op
+from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -38,8 +51,9 @@ PAGE = 128
 HEAD_DATA = PAGE * 64  # 8192 B
 HEAD_SCALE = PAGE * 8  # 1024 B
 HEAD_SIDE = HEAD_DATA + HEAD_SCALE  # 9216 B, also an index page
-GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-ONE_SIXTH = torch.tensor(1 / 6, dtype=torch.float32)
+# CPU constants (ref_quantize moves them), so the module imports without a GPU
+GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device="cpu")
+ONE_SIXTH = torch.tensor(1 / 6, dtype=torch.float32, device="cpu")
 
 
 def ref_quantize(x: torch.Tensor, gs: float):
@@ -384,7 +398,7 @@ REJECT = {  # name -> (kwargs of the op call, message of the refusal); a failed 
         {"k_scale": None, "v_scale": None},
         "takes the fp32 global k_scale/v_scale",
     ),
-    "scale [2]": ({"k_scale": torch.ones(2)}, "one element each"),
+    "scale [2]": ({"k_scale": lambda: torch.ones(2)}, "one element each"),
     "block 16": ({"block": 16}, "block_size must be 128"),
     "aliased pages": ({"alias": True}, "page stride must be at least the page size"),
 }
@@ -392,6 +406,9 @@ REJECT = {  # name -> (kwargs of the op call, message of the refusal); a failed 
 
 def run_reject(name):
     """One op call of a valid nvfp4 configuration with the changes of REJECT[name]."""
+    if name in ROWS_REJECT:
+        run_rows_reject(name)
+        return
     nkv, n = 1, 4
     qkv = torch.randn(n, (4 + 2 * nkv + 2) * HEAD_DIM, dtype=torch.bfloat16)
     w = torch.zeros(HEAD_DIM, dtype=torch.bfloat16)
@@ -406,6 +423,9 @@ def run_reject(name):
         "v_scale": torch.ones(1),
     }
     kw.update(REJECT[name][0])
+    kw = {
+        k: v() if callable(v) else v for k, v in kw.items()
+    }  # tensors built here, not at import
     block = kw.pop("block", PAGE)
     idx = torch.zeros(kw.pop("idx_bytes", 2 * HEAD_SIDE), dtype=torch.uint8)
     if kw.pop("alias", False):
@@ -434,6 +454,241 @@ def test_reject():
     return "ok"
 
 
+# ---- row layout ----------------------------------------------------------------------------
+ROWS_GFX = ("gfx950", "gfx1250")
+ROW_PAYLOAD = HEAD_DIM // 2  # 64 B of e2m1 per token row
+ROW_SCALES = HEAD_DIM // 16  # 8 E4M3 scale bytes per token row
+
+
+def ref_rows(x: torch.Tensor):
+    """Model-dtype rows [..., 128] -> (payload uint8 [..., 64], scale bytes uint8 [..., 8]):
+    scale = e4m3(amax / 6) (RNE, at most 448), codes = e2m1(x * (1 / scale)) half to even,
+    sign from x < 0 (a -0.0 element codes as +0)."""
+    blocks = x.float().unflatten(-1, (-1, 16))
+    scale = (blocks.abs().amax(-1) / 6.0).clamp(max=448.0).to(torch.float8_e4m3fn)
+    s = scale.float()
+    inv = torch.where(s > 0, 1.0 / s, torch.zeros_like(s))
+    a = (blocks * inv[..., None]).abs()
+    mag = sum((a > t).int() for t in (0.25, 1.25, 2.5, 5.0)) + sum(
+        (a >= t).int() for t in (0.75, 1.75, 3.5)
+    )
+    codes = (mag | torch.where(blocks < 0, 8, 0)).flatten(-2).unflatten(-1, (-1, 2))
+    payload = (codes[..., 0] | (codes[..., 1] << 4)).to(torch.uint8)
+    return payload, scale.view(torch.uint8)
+
+
+def make_rows_pool(pages: int, nkv: int, generator: torch.Generator):
+    """K / V payloads and scale planes as fields of one entry-major uint8 pool of random
+    bytes (one entry a page, 64 B of pad at its end), the strided views a KV pool hands out:
+    (pool, k payload, k scales, v payload, v scales), each [pages, nkv, 128, width]."""
+    pay, sc = nkv * PAGE * ROW_PAYLOAD, nkv * PAGE * ROW_SCALES
+    entry = 2 * pay + 2 * sc + 64
+    pool = torch.randint(
+        0, 256, (pages, entry), dtype=torch.uint8, generator=generator, device="cpu"
+    ).cuda()
+
+    def field(offset, width):
+        return pool[:, offset : offset + nkv * PAGE * width].unflatten(
+            1, (nkv, PAGE, width)
+        )
+
+    kp, vp = field(0, ROW_PAYLOAD), field(pay, ROW_PAYLOAD)
+    ks, vs = field(2 * pay, ROW_SCALES), field(2 * pay + sc, ROW_SCALES)
+    return pool, kp, ks, vp, vs
+
+
+def rows_layer(num_tokens: int, nkv: int, dtype):
+    """Op operands of an M3-shaped sparse layer (16 q heads and one index head per kv head)
+    whose K (normed) and V (raw) rows spread over E4M3's range, with the V edge rows of
+    stress_qkv (ties, clamps, subnormal scales, signed zeros)."""
+    torch.manual_seed(num_tokens + nkv)
+    nq, niq, rotary_dim = 16 * nkv, 1, 64
+    row = (nq + 2 * nkv + niq + 1) * HEAD_DIM
+    mags = torch.exp2(torch.randint(-8, 6, (num_tokens, row // HEAD_DIM, 1)).float())
+    qkv = (torch.randn(num_tokens, row // HEAD_DIM, HEAD_DIM) * mags).view(
+        num_tokens, row
+    )
+    qkv = qkv.to(dtype)
+    stress_qkv(qkv, nq, nkv, niq)
+    v0 = (nq + nkv) * HEAD_DIM
+    qkv[0, v0 : v0 + HEAD_DIM] = 0  # an all-zero V row
+    w = [(torch.randn(HEAD_DIM) * 0.5 + 1).to(dtype) for _ in range(4)]
+    cos_sin = torch.randn(4096, rotary_dim).to(dtype)
+    pos = torch.randint(0, 4096, (num_tokens,), dtype=torch.int64)
+    return {"qkv": qkv, "w": w, "cos_sin": cos_sin, "pos": pos, "nq": nq, "nkv": nkv,
+            "niq": niq, "rot": rotary_dim}  # fmt: skip
+
+
+def rows_call(layer, slots, k, v, index, q_out, iq_out, *, skip=False, qkv=None, **kw):
+    """One op call; qkv (normed in place) defaults to a fresh copy of the layer's."""
+    w = layer["w"]
+    qkv = layer["qkv"].clone() if qkv is None else qkv
+    aiter.fused_qknorm_idxrqknorm(
+        qkv, w[0], w[1], layer["cos_sin"], layer["pos"], layer["nq"], layer["nkv"],
+        layer["rot"], 1e-6, w[2], w[3], layer["niq"], slots, k, v, index, PAGE, q_out,
+        iq_out, slots, asm_layout=False, skip_index_branch=skip, **kw,
+    )  # fmt: skip
+
+
+@benchmark()
+def test_nvfp4_rows(num_tokens, num_kv_heads, dtype, index_dtype, scale_dtype, skip):
+    """The row-layout K/V write against "auto" + ref_rows, byte for byte. index_dtype "fp8" /
+    "auto" is the index cache (unused with skip, skip_index_branch); scale_dtype the view
+    (uint8 / float8_e4m3fn) the scale planes are passed as. Slots are scattered, every 17th
+    token a pad (-1) that must write nothing."""
+    nkv = num_kv_heads
+    layer = rows_layer(num_tokens, nkv, dtype)
+    nq, niq = layer["nq"], layer["niq"]
+    pages = -(-num_tokens // PAGE) + 3
+    slots = torch.randperm(pages * PAGE)[:num_tokens].to(torch.int64)
+    slots[1::17] = -1
+    idx_t = dtypes.fp8 if index_dtype == "fp8" else dtype
+    i_kw = {"index_cache_dtype": index_dtype}
+
+    # The unfused reference: "auto" K/V into page-128 caches, quantized by ref_rows.
+    ref_k = torch.zeros(pages, PAGE, nkv, HEAD_DIM, dtype=dtype)
+    ref_v = torch.zeros_like(ref_k)
+    ref_index = torch.zeros(pages * PAGE, HEAD_DIM, dtype=idx_t)
+    ref_q = torch.empty(num_tokens, nq * HEAD_DIM, dtype=dtype)
+    ref_iq = torch.full((num_tokens, niq * HEAD_DIM), 1.0, dtype=dtype)
+    rows_call(layer, slots, ref_k, ref_v, ref_index, ref_q, ref_iq, skip=skip,
+              kv_cache_dtype="auto", **i_kw)  # fmt: skip
+
+    pool, kp, ks, vp, vs = make_rows_pool(pages, nkv, torch.Generator().manual_seed(5))
+    before = pool.clone()
+    index = torch.zeros_like(ref_index)
+    q_out = torch.empty_like(ref_q)
+    iq_out = torch.full_like(ref_iq, 1.0)
+    sdt = {"uint8": torch.uint8, "e4m3": torch.float8_e4m3fn}[scale_dtype]
+    rows_kw = {
+        "kv_cache_dtype": "nvfp4",
+        "k_scale": ks.view(sdt),
+        "v_scale": vs.view(sdt),
+    }
+    rows_call(layer, slots, kp, vp, index, q_out, iq_out, skip=skip, **rows_kw, **i_kw)
+
+    want = before.clone()
+    live = slots >= 0
+    page, pos = slots[live] // PAGE, slots[live] % PAGE
+    for cache, payload, scales in ((ref_k, kp, ks), (ref_v, vp, vs)):
+        want_p, want_s = ref_rows(cache[page, pos])  # [live tokens, nkv, ...]
+        for t, val in ((payload, want_p), (scales, want_s)):
+            view = want.as_strided(t.shape, t.stride(), t.storage_offset())
+            view[page, :, pos] = val
+
+    def exact(a, b, msg):
+        return checkAllclose(
+            a.view(torch.uint8).float(), b.view(torch.uint8).float(), 0, 0, msg=msg
+        )
+
+    ret = {
+        "gfx": get_gfx_runtime(),
+        # the whole pool: K / V payload and scale rows, and every byte no live token owns
+        "kv err": exact(pool, want, "row-layout pool: "),
+        "idx err": exact(index, ref_index, "index cache: "),
+        "q err": max(exact(q_out, ref_q, "q_out: "), exact(iq_out, ref_iq, "iq_out: ")),
+    }
+    # timed on one qkv buffer (no copy in the loop); the checks above are done
+    _, us = run_perftest(
+        rows_call, layer, slots, kp, vp, index, q_out, iq_out, skip=skip,
+        qkv=layer["qkv"], **rows_kw, **i_kw, num_iters=50, num_warmup=20,
+    )  # fmt: skip
+    idx_row = 0 if skip else HEAD_DIM * index.element_size()
+    nbytes = (
+        layer["qkv"].nbytes
+        + q_out.nbytes
+        + (0 if skip else iq_out.nbytes)
+        + num_tokens * (2 * nkv * (ROW_PAYLOAD + ROW_SCALES) + idx_row)
+    )
+    ret["us"], ret["TB/s"] = us, nbytes / us / 1e6
+    return ret
+
+
+def rows_reject_operands():
+    """[args], kwargs of a valid row-layout call (fp8 index, two pages, one kv head)."""
+    nkv, n = 1, 4
+    layer = rows_layer(n, nkv, torch.bfloat16)
+    slots = torch.arange(n, dtype=torch.int64)
+    _, kp, ks, vp, vs = make_rows_pool(2, nkv, torch.Generator().manual_seed(1))
+    index = torch.zeros(2 * PAGE, HEAD_DIM, dtype=dtypes.fp8)
+    w = layer["w"]
+    args = [
+        layer["qkv"], w[0], w[1], layer["cos_sin"], layer["pos"], layer["nq"], nkv,
+        layer["rot"], 1e-6, w[2], w[3], layer["niq"], slots, kp, vp, index, PAGE,
+        torch.empty(n, layer["nq"] * HEAD_DIM, dtype=torch.bfloat16),
+        torch.empty(n, HEAD_DIM, dtype=torch.bfloat16), slots,
+    ]  # fmt: skip
+    kw = {"kv_cache_dtype": "nvfp4", "index_cache_dtype": "fp8", "k_scale": ks,
+          "v_scale": vs, "asm_layout": False}  # fmt: skip
+    return args, kw
+
+
+# name -> (edit of the valid call's (args, kwargs), message of the refusal); "rows good" shows
+# the harness is sound. args[13] is kv_cache_k, args[16] block_size.
+ROWS_REJECT = {
+    "rows good": (lambda a, kw: None, None),
+    "rows scale strides": (
+        lambda a, kw: kw.update(v_scale=kw["v_scale"].contiguous()),
+        "equal strides",
+    ),
+    "rows v_scale fp32": (
+        lambda a, kw: kw.update(v_scale=torch.ones(1)),
+        "must both be byte planes",
+    ),
+    "rows block 64": (lambda a, kw: a.__setitem__(16, 64), "block_size must be 128"),
+    "rows payload 72 B": (
+        lambda a, kw: a.__setitem__(13, torch.zeros(2, 1, PAGE, 72, dtype=torch.uint8)),
+        "[num_pages, num_kv_heads, 128, 64]",
+    ),
+    # the C++ refusal on gfx950; elsewhere the wrapper's (an fp4 index is gfx950 only)
+    "rows fp4 index": (
+        lambda a, kw: kw.update(index_cache_dtype="nvfp4"),
+        "auto or fp8 index cache",
+    ),
+}
+
+
+def run_rows_reject(name):
+    args, kw = rows_reject_operands()
+    ROWS_REJECT[name][0](args, kw)
+    aiter.fused_qknorm_idxrqknorm(*args, **kw)
+    torch.cuda.synchronize()
+
+
+def test_rows_reject():
+    """Contract violations of the row layout are refused (each in a child: a failed host
+    check ends the process), and the wrapper's arch gate tells the layouts apart by the
+    scale dtype: byte planes run on gfx950 and gfx1250, fp32 globals on gfx950 only."""
+    gfx = get_gfx_runtime()
+    for name, (_, msg) in ROWS_REJECT.items():
+        if name == "rows fp4 index" and gfx != "gfx950":
+            msg = "require gfx950"
+        r = subprocess.run(
+            [sys.executable, __file__, "--reject", name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if msg is None:
+            assert r.returncode == 0, r.stderr[-500:]
+        else:
+            assert r.returncode != 0 and msg in r.stderr, f"{name}: {r.stderr[-500:]}"
+    args, kw = rows_reject_operands()
+    page_kw = {**kw, "k_scale": torch.ones(1), "v_scale": torch.ones(1)}
+    for gfx, call_kw, msg in (
+        ("gfx942", kw, "requires gfx950 or gfx1250"),
+        ("gfx1250", page_kw, "require gfx950"),
+    ):
+        with mock.patch.object(op, "get_gfx_runtime", return_value=gfx):
+            try:
+                aiter.fused_qknorm_idxrqknorm(*args, **call_kw)
+            except RuntimeError as e:
+                assert msg in str(e), e
+            else:
+                raise AssertionError(f"accepted on {gfx}")
+    return "ok"
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="fused_qknorm_idxrqknorm nvfp4 pages vs the torch reference, byte for byte",
@@ -455,8 +710,54 @@ parser.add_argument(
     help="token counts of the nvfp4 vs mxfp4 / fp8 write timing table",
 )
 parser.add_argument(
+    "--rows_tokens",
+    type=int,
+    nargs="*",
+    default=[1, 37, 3000],
+    help="token counts of the row-layout sweep (with --nkv, --dtype, --index)",
+)
+parser.add_argument(
+    "-d", "--dtype", type=str, nargs="*", default=["bf16", "fp16"], help="row layout"
+)
+parser.add_argument(
+    "--index",
+    type=str,
+    nargs="*",
+    default=["fp8", "auto"],
+    help="index cache dtypes of the row-layout sweep",
+)
+parser.add_argument(
     "--reject", type=str, default=None, help="(child) run one refusal case"
 )
+
+
+def run_rows(args):
+    """The row layout (byte scale planes), on gfx950 and gfx1250."""
+    aiter.logger.info("row-layout reject: %s", test_rows_reject())
+    cases = [
+        (t, n, d, i, "e4m3" if i == "fp8" else "uint8", False)
+        for t, n, d, i in itertools.product(
+            args.rows_tokens, args.nkv, args.dtype, args.index
+        )
+    ]
+    # the index-less (skip_index_branch) call
+    cases += [
+        (t, n, "bf16", "auto", "uint8", True)
+        for t in args.rows_tokens
+        for n in args.nkv
+    ]
+    df = pd.DataFrame(
+        [
+            test_nvfp4_rows(t, n, dtypes.d_dtypes[d], i, s, k)
+            for t, n, d, i, s, k in cases
+        ]
+    )
+    aiter.logger.info(
+        "nvfp4 row-layout write vs torch reference (markdown):\n%s",
+        df.round(4).to_markdown(index=False),
+    )
+    bad = df[["kv err", "idx err", "q err"]].to_numpy().sum()
+    assert bad == 0, "nvfp4 row-layout K/V or q differ from the reference"
 
 
 def main():
@@ -464,11 +765,15 @@ def main():
     if args.reject:
         run_reject(args.reject)
         return
-    # the live GPU, not GPU_ARCHS; the mxfp4 / fp8 timing arms and the e4m3 index q need gfx950
-    if get_gfx_runtime() != "gfx950":
+    # the live GPU, not GPU_ARCHS
+    gfx = get_gfx_runtime()
+    if gfx in ROWS_GFX:
+        run_rows(args)
+    # the page layout, the mxfp4 / fp8 timing arms and the e4m3 index q need gfx950
+    if gfx != "gfx950":
         aiter.logger.warning(
-            "fused_qknorm_idxrqknorm nvfp4 is tested on gfx950 only, not %s: skipping",
-            get_gfx_runtime(),
+            "fused_qknorm_idxrqknorm nvfp4 pages are tested on gfx950 only, not %s: skipping",
+            gfx,
         )
         return
     aiter.logger.info("reject: %s", test_reject())
