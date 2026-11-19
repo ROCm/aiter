@@ -8,6 +8,21 @@ Correctness against torch references + perf, one markdown table per test functio
   test_route          one-block and multi-block routers: placement invariants
   test_mxfp6_moe      whole op vs a torch reference with identical MX numerics, bitwise
                       run-to-run determinism, rel L2 vs bf16
+Tests of kernels/mxfp6_moe_gemm.py's own choices (they belong with that kernel: they fail on one without them):
+  test_agpr_form      no GPU (aiter's dry run). The 256x256 tiles keep their accumulators in AGPRs through the
+                      FlyDSL-unstable rocdl.experimental.sched_agpr and the LLVM option amdgpu-mfma-vgpr-form. A
+                      FlyDSL that keeps both names while its LLVM ignores them compiles a slow form with no error:
+                      fails unless every f8x8 kernel has 0 v_accvgpr_* in its K loop and 0 B of scratch
+  test_h_layout       no GPU (dry run, nothing compiled). run_gg6e's contract for the 6-bit h between the stages:
+                      the layout the two stage calls pick as forward makes them (h_layout="tile_step"), with no
+                      keyword (rows), with h_layout="rows", with H_LAYOUT = "tile_step" and under inference_mode, and
+                      the ValueErrors for bad keywords and a short output
+  test_moe_paths      test_mxfp6_moe on shapes whose kernels its default grid never launches (padded rows and their
+                      copy kernel, A8W6 half tiles, hidden 128, K tails of 2 and 3); fails if the shape stops
+                      reaching its path
+  test_moe_modes      whole op with the row-major h and with the tile-step-major h (both stage calls with that
+                      h_layout), under torch.inference_mode() and torch.no_grad(), and with an x that requires
+                      grad: each vs the torch reference and bitwise equal to the default call
 
     python3 op_tests/test_flydsl_mxfp6_moe.py
     python3 op_tests/test_flydsl_mxfp6_moe.py -s 8192,4608,64,4 -t 4096 32768 --wfmt e2m3 --afmt e2m3 e4m3
@@ -18,6 +33,11 @@ import importlib
 import itertools
 import math
 import os
+import re
+import shutil
+import tempfile
+from pathlib import Path
+from unittest import mock
 
 import pandas as pd
 import torch
@@ -26,9 +46,11 @@ import aiter
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter import dtypes
+from aiter.aot.flydsl.dry_run import dry_run
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl import mxfp6_moe_quant as q
 from aiter.ops.flydsl.kernels import mxfp6_moe_aux as ak
+from aiter.ops.flydsl.kernels import mxfp6_moe_gemm as gemm
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from flydsl.expr import gpu, range_constexpr, rocdl
@@ -253,9 +275,7 @@ def _module(wfmt, afmt):
     return importlib.reload(mxfp6_moe)
 
 
-@benchmark()
-def test_mxfp6_moe(tokens, hidden, inter, experts, topk, wfmt, afmt):
-    m = _module(wfmt, afmt)
+def _moe_inputs(tokens, hidden, inter, experts, topk):
     g = torch.Generator(device="cuda").manual_seed(0)
     layer = {"w1": (torch.randn(experts, 2 * inter, hidden, generator=g, device="cuda") / math.sqrt(hidden)).to(dtypes.bf16),
              "w2": (torch.randn(experts, hidden, inter, generator=g, device="cuda") / math.sqrt(inter)).to(dtypes.bf16)}
@@ -263,7 +283,13 @@ def test_mxfp6_moe(tokens, hidden, inter, experts, topk, wfmt, afmt):
     # random distinct experts per token (uneven per-expert load) and distinct routing weights
     ids = torch.rand(tokens, experts, generator=g, device="cuda").argsort(-1)[:, :topk].int()
     w = torch.rand(tokens, topk, generator=g, device="cuda") + 0.5
-    w = (w / w.sum(-1, keepdim=True)).float()
+    return layer, x, ids, (w / w.sum(-1, keepdim=True)).float()
+
+
+@benchmark()
+def test_mxfp6_moe(tokens, hidden, inter, experts, topk, wfmt, afmt):
+    m = _module(wfmt, afmt)
+    layer, x, ids, w = _moe_inputs(tokens, hidden, inter, experts, topk)
     st = m.run(None, layer)
     inp = {"x": x, "ids": ids, "w": w}
     out, us = run_perftest(m.run, inp, st, num_iters=20, num_warmup=3)
@@ -285,14 +311,209 @@ def test_mxfp6_moe(tokens, hidden, inter, experts, topk, wfmt, afmt):
             "flydsl TB/s": nbytes / us / 1e6, "flydsl err": err, "deterministic": det, "rel_l2_vs_bf16": rel}
 
 
+# ------------------------------------------------------------------------------------------
+# 5. mxfp6_moe_gemm's own choices: the AGPR form (compiled, no GPU), the h layout contract (host only, no GPU),
+#    rarely selected paths and call modes (GPU)
+# ------------------------------------------------------------------------------------------
+def _stage_calls(hidden, inter, experts, topk, tokens, afmt, wfmt="e2m3"):
+    """run_gg6e's arguments for both stages as mxfp6_moe.forward passes them, on empty buffers of the op's shapes
+    (FakeTensors inside aiter's dry run) -> (args, kwargs) of stage 1 and of stage 2, and the tile rows."""
+    m = _module(wfmt, afmt)
+    bm = m.pick_bm(tokens * topk / experts)
+    nt = (tokens * topk + bm - 1) // bm + experts
+    M, bits = nt * bm, q.FORMATS[afmt][3]
+    bn1, bn2 = m.stage_bn(2 * inter, afmt), m.stage_bn(hidden, afmt)
+
+    def e(*shape, d=torch.uint8):
+        return torch.empty(*shape, dtype=d, device="cuda")
+    ridx, texp = e(M, d=torch.int32), e(nt + 1, d=torch.int32)
+    ha, hs = e(M, inter * bits // 8), e(M, q.kq(inter), 4, d=torch.int32)
+    s1 = ((e(tokens, hidden * bits // 8), e(tokens, q.kq(hidden), 4, d=torch.int32), ridx, texp,
+           e(experts, 2 * inter // bn1, hidden // 128, bn1 // 16, 1536), e(experts, 2 * inter // 16, q.kq(hidden), 64, d=torch.int32), ha),
+          {"N": 2 * inter, "K": hidden, "a_fmt": afmt, "b_fmt": wfmt, "epi": "swiglu_q", "gather": True, "gm": 8,
+           "cfg": m.gemm_cfg(2 * inter, afmt, bm), "out_scales": hs, "h_layout": "tile_step"})
+    s2 = ((ha, hs, ridx, texp, e(experts, hidden // bn2, inter // 128, bn2 // 16, 1536),
+           e(experts, hidden // 16, q.kq(inter), 64, d=torch.int32), e(M, hidden, d=dtypes.bf16)),
+          {"N": hidden, "K": inter, "a_fmt": afmt, "b_fmt": wfmt, "epi": "store", "gather": False, "gm": 2,
+           "cfg": m.gemm_cfg(hidden, afmt, bm), "h_layout": "tile_step"})
+    return s1, s2, bm
+
+
+def _k_loop(lines):
+    """The K loop of a kernel's final ISA: the instructions of its longest backward branch."""
+    labels = {m.group(1): i for i, line in enumerate(lines) if (m := re.match(r"^(\.LBB\w+):", line))}
+    best = None
+    for j, line in enumerate(lines):
+        m = re.match(r"\s+s_c?branch\w*\s+(\.LBB\w+)", line)
+        if m and m.group(1) in labels and labels[m.group(1)] < j and (best is None or j - labels[m.group(1)] > best[1] - best[0]):
+            best = (labels[m.group(1)], j)
+    return lines[best[0]:best[1] + 1] if best else []
+
+
+@benchmark()
+def test_agpr_form(hidden, inter, experts, topk, tokens, afmt):
+    # compile only: no torch reference, no timing. FlyDSL reads these at each compile; a cached kernel is not dumped
+    dump = tempfile.mkdtemp(prefix="gg6e_agpr.")
+    env = {"FLYDSL_DEBUG_DUMP_ASM": "1", "FLYDSL_RUNTIME_ENABLE_CACHE": "0", "FLYDSL_DUMP_DIR": dump}
+    gemm.compile_gg6e.cache_clear()
+    try:
+        with mock.patch.dict(os.environ, env), dry_run(SUPPORTED_GFX[0], 256):
+            s1, s2, _ = _stage_calls(hidden, inter, experts, topk, tokens, afmt)
+            gemm.run_gg6e(*s1[0], **s1[1])
+            gemm.run_gg6e(*s2[0], **s2[1])
+        kernels = sorted(Path(dump).glob("gg6e_*_f8x8_*/*_final_isa.s"))
+        copies, scratch, mfma = 0, 0, 0
+        for f in kernels:
+            text = f.read_text()
+            body = [line.split(";")[0] for line in _k_loop(text.splitlines())]
+            mfma += sum(1 for line in body if re.match(r"\s+v_mfma", line))
+            copies += sum(1 for line in body if re.match(r"\s+v_accvgpr_", line))
+            scratch = max(scratch, int(re.search(r"\.private_segment_fixed_size:\s+(\d+)", text).group(1)))
+    finally:
+        gemm.compile_gg6e.cache_clear()  # launchers built in the dry run must not serve a later run on the GPU
+        shutil.rmtree(dump, ignore_errors=True)
+    ok = bool(kernels) and copies == 0 and scratch == 0 and mfma > 0
+    assert ok, (f"f8x8 kernels compiled to the slow form: {copies} v_accvgpr_* in their K loops, {scratch} B scratch "
+                f"({len(kernels)} kernels, {mfma} K-loop MFMAs): the AGPR pin or the amdgpu-mfma-vgpr-form option has "
+                "no effect in this FlyDSL / LLVM")
+    return {"gfx": SUPPORTED_GFX[0], "f8x8 kernels": len(kernels), "K-loop MFMA": mfma, "K-loop v_accvgpr_*": copies,
+            "max scratch B": scratch, "fast form": ok}
+
+
+def _spy_gg6e(picks, real=None):
+    """compile_gg6e replaced by a recorder of the h layout each call picks (1: tile-step-major); real: also compile."""
+    def spy(*a, **kw):
+        picks.append(int(kw.get("H_TILE_STEP", 0)))
+        return real(*a, **kw) if real else None
+    return mock.patch.object(gemm, "compile_gg6e", spy)
+
+
+@benchmark()
+def test_h_layout(hidden, inter, experts, topk, tokens, afmt):
+    # host code only: compile_gg6e is recorded and nothing is compiled or launched, so no reference and no timing
+    six = int(q.FORMATS[afmt][3] == 6)
+    picks, got = [], {}
+
+    def stages(**kw):  # forward's two calls on fresh buffers (kw replaces its keywords) -> the h layout each picked
+        s1, s2, _ = _stage_calls(hidden, inter, experts, topk, tokens, afmt)
+        del picks[:]
+        gemm.run_gg6e(*s1[0], **{**s1[1], **kw})
+        gemm.run_gg6e(*s2[0], **{**s2[1], **kw})
+        return tuple(picks)
+
+    def refused(*args, **kw):
+        try:
+            gemm.run_gg6e(*args, **kw)
+        except ValueError:
+            return True
+        return False
+
+    with dry_run(SUPPORTED_GFX[0], 256), _spy_gg6e(picks), mock.patch.object(gemm, "_run_compiled", lambda *a, **kw: None), \
+            mock.patch.object(gemm, "compile_xpad", lambda *a, **kw: None, create=True):
+        # 6-bit: as forward calls them, stage 1 writes the h tile-step-major and stage 2 reads it so; with no keyword
+        # both use rows, as quant_rows writes them; 8-bit: never tile-step
+        got["forward tile_step"] = stages() == (six, six)
+        got["default rows"] = stages(h_layout=None) == (0, 0)
+        got["h_layout rows"] = stages(h_layout="rows") == (0, 0)
+        with mock.patch.object(gemm, "H_LAYOUT", "tile_step"):
+            got["H_LAYOUT tile_step"] = stages(h_layout=None) == (six, six)
+        with torch.inference_mode():  # tensors without a version counter, as a serving engine makes them
+            got["inference_mode"] = stages() == (six, six)
+        (a2, kw2), bm = _stage_calls(hidden, inter, experts, topk, tokens, afmt)[1:]
+        del picks[:]
+        for name, kw in (("epi", {"epi": "silu"}), ("h_layout", {"h_layout": "row"}), ("h_layout auto", {"h_layout": "auto"}),
+                         ("ablate", {"ablate": "bar"})):
+            got[f"bad {name} refused"] = refused(*a2, **{**kw2, **kw})
+        got["short out refused"] = refused(*a2[:6], a2[6][bm:], **kw2)
+        got["no kernel picked by a refused call"] = not picks
+    bad = [k for k, v in got.items() if not v]
+    assert not bad, f"run_gg6e's h layout contract, {afmt}: {bad}"
+    return {"gfx": SUPPORTED_GFX[0], "checks": len(got), "err": float(len(bad))}
+
+
+# what a whole-op case must reach, from compile_gg6e's positional arguments (N, K, a_fmt, b_fmt, epi, gather, FM, FN,
+# WGM, WGN) of the two stage calls, the op's tile rows bm, and whether the row-padding copy kernel was built
+REACHES = {
+    "padded_rows": lambda calls, bm, padded: padded,
+    "half_tiles": lambda calls, bm, padded: any(a[4] == "swiglu_q" and 16 * a[6] * a[8] < bm for a in calls),
+    "hidden128": lambda calls, bm, padded: any(a[4] == "swiglu_q" and a[1] == 128 for a in calls),
+}
+
+
+@benchmark()
+def test_moe_paths(hidden, inter, experts, topk, tokens, afmt, wfmt, reach):
+    calls, padded = [], []
+    real_gg6e, real_xpad = gemm.compile_gg6e, getattr(gemm, "compile_xpad", None)
+
+    def spy_gg6e(*a, **kw):
+        calls.append(a)
+        return real_gg6e(*a, **kw)
+
+    def spy_xpad(*a, **kw):
+        padded.append(a)
+        return real_xpad(*a, **kw)
+
+    with mock.patch.object(gemm, "compile_gg6e", spy_gg6e), mock.patch.object(gemm, "compile_xpad", spy_xpad, create=True):
+        ret = test_mxfp6_moe(tokens, hidden, inter, experts, topk, wfmt, afmt)
+    ok = REACHES[reach](calls, _module(wfmt, afmt).pick_bm(tokens * topk / experts), bool(padded))
+    assert ok, f"{hidden}x{inter} E{experts} top-{topk} T{tokens} {afmt} no longer reaches {reach}: pick another shape"
+    ret.update({"K tail s1/s2": f"{hidden // 128 % 4}/{inter // 128 % 4}", "reached": ok})
+    return ret
+
+
+@benchmark()
+def test_moe_modes(tokens, hidden, inter, experts, topk, wfmt, afmt):
+    m = _module(wfmt, afmt)
+    layer, x, ids, w = _moe_inputs(tokens, hidden, inter, experts, topk)
+    st = m.run(None, layer)
+    inp = {"x": x, "ids": ids, "w": w}
+    ref = run_torch_mx(x, ids, w, layer["w1"], layer["w2"], wfmt, afmt)
+    six, picks = int(q.FORMATS[afmt][3] == 6), []
+
+    def layout(h_layout):  # both of forward's stage calls with this h_layout
+        def run():
+            with mock.patch.object(m, "run_gg6e", lambda *a, **kw: gemm.run_gg6e(*a, **{**kw, "h_layout": h_layout})):
+                return m.run(inp, st)
+        return run
+
+    def inference_mode():  # as a serving engine runs the model: no tensor made here has a version counter
+        with torch.inference_mode():
+            return m.run({"x": x.clone(), "ids": ids, "w": w}, st)
+
+    def no_grad():
+        with torch.no_grad():
+            return m.run(inp, st)
+
+    candidates = {"default": lambda: m.run(inp, st), "rows": layout("rows"), "tile_step": layout("tile_step"),
+                  "inference_mode": inference_mode, "no_grad": no_grad,
+                  "requires_grad": lambda: m.run({"x": x.clone().requires_grad_(), "ids": ids, "w": w}, st)}
+    flops = 6 * tokens * topk * hidden * inter
+    nbytes = (experts * 3 * hidden * inter * 6 // 8 + tokens * hidden * 2 * 2
+              + tokens * topk * (inter * (6 if six else 8) // 8 + hidden * 2) * 2)
+    ret, outs = {"gfx": get_gfx_runtime()}, {}
+    for name, fn in candidates.items():
+        del picks[:]
+        with _spy_gg6e(picks, gemm.compile_gg6e):
+            out, us = run_perftest(fn, num_iters=5, num_warmup=1)
+        # stage 2 must read the layout stage 1 wrote; "rows" / "tile_step" must run the kernels of that layout
+        assert len(set(picks)) == 1 and picks[0] == {"rows": 0, "tile_step": six}.get(name, picks[0]),             f"{name}: stage calls picked h layouts {picks}"
+        outs[name] = out.detach()
+        err = checkAllclose(ref.to(dtypes.fp32), outs[name].to(dtypes.fp32), rtol=2e-2, atol=2e-2, tol_err_ratio=1e-3,
+                            msg=f"mxfp6_moe {wfmt}/{afmt} {name}: ")
+        assert err < 1e-3, f"{name}: {err:.3%} of elements outside rtol/atol vs the same-numerics reference"
+        assert torch.equal(outs[name], outs["default"]), f"{name}: output bits differ from the default call's"
+        ret.update({f"{name} us": us, f"{name} TFLOPS": flops / us / 1e6, f"{name} TB/s": nbytes / us / 1e6, f"{name} err": err})
+    st.clear()  # the candidates' closures hold it
+    del layer, ref, outs
+    torch.cuda.empty_cache()
+    return ret
+
+
 def summarize(name, rows):
     aiter.logger.info("%s summary (markdown):\n%s", name, pd.DataFrame(rows).to_markdown(index=False))
 
 
 def main():
-    if get_gfx_runtime() not in SUPPORTED_GFX:
-        aiter.logger.warning("mxfp6_moe unsupported on %s; skipping", get_gfx_runtime())
-        return
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
                                      description="FlyDSL MXFP6 grouped MoE")
     parser.add_argument("-s", "--shape", type=dtypes.str2tuple, nargs="*",
@@ -310,7 +531,23 @@ def main():
     parser.add_argument("--route", type=dtypes.str2tuple, nargs="*",
                         default=[(4096, 4, 64, 256), (300, 8, 160, 256), (32768, 8, 64, 256), (5000, 4, 192, 128)],
                         help="tokens,topk,experts,bm")
+    parser.add_argument("--agpr", type=dtypes.str2tuple, nargs="*", default=[(8192, 4608, 64, 4, 4096), (6144, 2048, 64, 4, 4096)],
+                        help="hidden,inter,experts,topk,tokens for the AGPR form and the h layout contract (no GPU)")
+    parser.add_argument("--paths", nargs="*", default=["1408,3072,8,2,4096,e2m3,padded_rows", "10496,1024,8,2,1024,e4m3,half_tiles",
+                                                       "128,768,8,2,4096,e2m3,hidden128"],
+                        help=f"hidden,inter,experts,topk,tokens,afmt,reach with reach one of {', '.join(REACHES)}\n"
+                             "(defaults: K tails of 3 / 2 steps in stage 1, 2 in stage 2)")
+    parser.add_argument("--modes", type=dtypes.str2tuple, nargs="*", default=[(2048, 1024, 8, 4, 4096), (1152, 640, 16, 8, 300)],
+                        help="hidden,inter,experts,topk,tokens for the h layouts and autograd modes (256-row, 128-row tiles)")
     args = parser.parse_args()
+
+    # no GPU needed: aiter's dry run
+    summarize("agpr form", [test_agpr_form(*c, af) for c, af in itertools.product(args.agpr, args.afmt)])
+    summarize("h layout", [test_h_layout(*c, af) for c, af in itertools.product(args.agpr + args.modes, args.afmt)])
+    gfx = get_gfx_runtime() if torch.cuda.is_available() else "no GPU"
+    if gfx not in SUPPORTED_GFX:
+        aiter.logger.warning("mxfp6_moe unsupported on %s; skipping the GPU tests", gfx)
+        return
     torch.set_default_device("cuda")
 
     summarize("mfma contract", [test_mfma_contract(*p.split(",")) for p in args.mfma])
@@ -319,6 +556,10 @@ def main():
     summarize("route", [test_route(r, *c) for r, c in itertools.product(["route", "route_mb"], args.route)])
     summarize("mxfp6_moe", [test_mxfp6_moe(t, h, i, e, k, wf, af) for (h, i, e, k), t, wf, af
                             in itertools.product(args.shape, args.tokens, args.wfmt, args.afmt)])
+    paths = [c.split(",") for c in args.paths]
+    summarize("mxfp6_moe paths", [test_moe_paths(*map(int, c[:5]), c[5], args.wfmt[0], c[6]) for c in paths])
+    summarize("mxfp6_moe modes", [test_moe_modes(t, h, i, e, k, args.wfmt[0], af) for (h, i, e, k, t), af
+                                  in itertools.product(args.modes, args.afmt)])
 
 
 if __name__ == "__main__":
