@@ -3,11 +3,18 @@
 
 """BF16/F16 Flash Attention kernel for gfx1201 (RDNA4).
 
-Inputs and output are flattened BSHD tensors. The kernel uses wave32 16x16x16
-WMMA, online softmax, and pipelined V loads. It requires ``head_dim % 8 == 0``.
-A head_dim that is not a multiple of 16 is padded to the next multiple of 16
-inside the kernel: the padded Q/K/V columns are zero and the padded output
-columns are not stored.
+Q/K/V are BSHD views: head_dim and heads packed, compile-time token strides
+(so views of a packed tensor such as ``qkv[:, :, i]`` of ``[B, S, 3, H, D]`` are
+read in place) and runtime batch strides. O is plain BSHD. K/V may have fewer
+heads than Q (GQA / MQA). Any Q and KV lengths: K rows past the KV length are
+clamped to the last real row and masked, V rows past it read as zero through
+the buffer bound, and Q rows past the Q length are not stored. Optionally the
+kernel also writes the natural-log softmax log-sum-exp of every query row.
+
+The kernel uses wave32 16x16x16 WMMA, online softmax, and pipelined V loads.
+It requires ``head_dim % 8 == 0``. A head_dim that is not a multiple of 16 is
+padded to the next multiple of 16 inside the kernel: the padded Q/K/V columns
+are zero and the padded output columns are not stored.
 """
 
 import math as host_math
@@ -16,10 +23,11 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from ..kernels_common import LOG2E as _LOG2E
-from ..tensor_shim import _run_compiled, buf_base_i64
+from ..tensor_shim import _run_compiled, buf_base_i64, ptr_arg
 from .flash_attn_func_common import (
     flatten_scores,
     kv_load_schedule,
@@ -28,6 +36,7 @@ from .flash_attn_func_common import (
 
 NUM_PREFETCH_K = 1
 NUM_PREFETCH_V = 1
+_LN2 = host_math.log(2.0)
 
 
 def _pad_head_dim(head_dim: int) -> int:
@@ -59,8 +68,29 @@ def build_flash_attn_func_module(
     unsafe_fp_math=True,
     fast_fp_math=True,
     daz=True,
+    num_kv_heads=None,
+    q_token_stride=None,
+    k_token_stride=None,
+    v_token_stride=None,
+    kv_tail=False,
+    return_lse=False,
 ):
-    """Build the gfx1201 Flash Attention kernel."""
+    """Build the gfx1201 Flash Attention kernel.
+
+    num_kv_heads: K / V heads (``None`` = ``num_heads``); query head ``h`` reads
+        K / V head ``h // (num_heads // num_kv_heads)``.
+    q_token_stride, k_token_stride, v_token_stride: elements between consecutive
+        tokens (``None`` = plain BSHD); multiples of 8, at least heads x head_dim.
+    kv_tail: the KV length may not be a multiple of BLOCK_N; K rows past it are
+        clamped to the last real row (their scores are masked).
+    return_lse: also write the natural-log softmax log-sum-exp of every query
+        row, fp32 ``[batch, num_heads, seq_len]``, to the ``LSE`` argument.
+
+    The returned launcher takes ``(Q, K, V, O, batch, seq_len, seq_len_kv_real,
+    seq_len_kv, stream=..., q_batch_stride=..., k_batch_stride=...,
+    v_batch_stride=..., lse=...)``; batch strides are in elements and default to
+    plain BSHD; ``lse`` is required with ``return_lse``.
+    """
 
     WARP_SIZE = 32
     WMMA_M = 16
@@ -116,8 +146,26 @@ def build_flash_attn_func_module(
     HEAD_DIM = head_dim
     CAUSAL = causal
     TAIL_MASK = tail_mask
-    CROSS_ATTN = cross_attn
-    STRIDE_TOKEN = NUM_HEADS * HEAD_DIM
+    # cross_attn no longer changes the kernel: K/V lengths and batch strides are
+    # runtime arguments for self- and cross-attention alike.
+    del cross_attn
+    KV_TAIL = kv_tail
+    RETURN_LSE = return_lse
+    NUM_KV_HEADS = num_heads if num_kv_heads is None else int(num_kv_heads)
+    assert NUM_KV_HEADS >= 1 and NUM_HEADS % NUM_KV_HEADS == 0
+    GROUP = NUM_HEADS // NUM_KV_HEADS
+    TOK_O = NUM_HEADS * HEAD_DIM
+    TOK_Q = TOK_O if q_token_stride is None else int(q_token_stride)
+    TOK_K = NUM_KV_HEADS * HEAD_DIM if k_token_stride is None else int(k_token_stride)
+    TOK_V = NUM_KV_HEADS * HEAD_DIM if v_token_stride is None else int(v_token_stride)
+    for _name, _tok, _row in (
+        ("q", TOK_Q, TOK_O),
+        ("k", TOK_K, NUM_KV_HEADS * HEAD_DIM),
+        ("v", TOK_V, NUM_KV_HEADS * HEAD_DIM),
+    ):
+        assert (
+            _tok % 8 == 0 and _tok >= _row
+        ), f"{_name}_token_stride must be a multiple of 8 and >= {_row}, got {_tok}"
 
     # K/V are row-major in LDS; padding reduces bank conflicts.
     K_STRIDE = HEAD_DIM_PAD + 4
@@ -167,13 +215,17 @@ def build_flash_attn_func_module(
 
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def flash_attn_func_kernel(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        O: fx.Tensor,
+        Q: fx.Pointer,
+        K: fx.Pointer,
+        V: fx.Pointer,
+        O: fx.Pointer,
+        LSE: fx.Pointer,
         seq_len: fx.Int32,
         seq_len_kv_real: fx.Int32,
         seq_len_kv: fx.Int32,
+        q_bstride: fx.Int32,
+        k_bstride: fx.Int32,
+        v_bstride: fx.Int32,
     ):
         elem_dtype = elem_numeric_cls
 
@@ -228,10 +280,6 @@ def build_flash_attn_func_module(
 
         seq_len_v = fx.Uint64(seq_len)
         seq_len_kv_real_v = fx.Uint64(seq_len_kv_real)
-        if const_expr(CROSS_ATTN):
-            seq_len_kv_v = fx.Uint64(seq_len_kv)
-        else:
-            seq_len_kv_v = seq_len_v
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_kv = lds.kv.ptr
@@ -259,6 +307,7 @@ def build_flash_attn_func_module(
         wave_q_offset = wave_id * ROWS_PER_WAVE
 
         head_idx = block_id % NUM_HEADS
+        kv_head_idx = head_idx // GROUP if const_expr(GROUP > 1) else head_idx
         batch_q_tile_id = block_id // NUM_HEADS
         num_q_tiles = (seq_len_v + BLOCK_M - 1) // BLOCK_M
         _q_tile_linear = batch_q_tile_id % num_q_tiles
@@ -270,25 +319,43 @@ def build_flash_attn_func_module(
         batch_idx = batch_q_tile_id // num_q_tiles
         q_start = q_tile_idx * BLOCK_M
 
+        q_batch_base = batch_idx * fx.Uint64(q_bstride)
+        k_batch_base = batch_idx * fx.Uint64(k_bstride)
+
         def global_idx(token_idx, col):
+            return q_batch_base + token_idx * TOK_Q + head_idx * HEAD_DIM + col
+
+        def o_idx(token_idx, col):
             token = batch_idx * seq_len_v + token_idx
-            return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
+            return token * TOK_O + head_idx * HEAD_DIM + col
 
         def kv_global_idx(token_idx, col):
-            token = batch_idx * seq_len_kv_v + token_idx
-            return token * STRIDE_TOKEN + head_idx * HEAD_DIM + col
+            return k_batch_base + token_idx * TOK_K + kv_head_idx * HEAD_DIM + col
 
-        # Hardware OOB handling keeps the tail prefetch branch-free. A batch
-        # slice must fit the descriptor's 32-bit ``num_records`` field.
+        # Hardware OOB handling keeps the tail prefetch branch-free and reads V
+        # rows past the KV length as zero: the descriptor ends at the batch
+        # slice's last real element. It must fit the 32-bit ``num_records``.
         ELEM_BYTES = (elem_numeric_cls.width + 7) // 8
-        v_batch_elems = seq_len_kv_v * fx.Uint64(STRIDE_TOKEN)
+        v_batch_elems = (seq_len_kv_real_v - fx.Uint64(1)) * fx.Uint64(
+            TOK_V
+        ) + fx.Uint64(NUM_KV_HEADS * HEAD_DIM)
         v_buf_ptr = _bounds_checked_buf_ptr(
-            fx.add_offset(v_elem_ptr, fx.Int64(batch_idx * v_batch_elems)),
+            fx.add_offset(v_elem_ptr, fx.Int64(batch_idx * fx.Uint64(v_bstride))),
             fx.Int64(v_batch_elems) * fx.Int64(ELEM_BYTES),
         )
 
         def v_idx(token_idx, col):
-            return token_idx * STRIDE_TOKEN + head_idx * HEAD_DIM + col
+            return token_idx * TOK_V + kv_head_idx * HEAD_DIM + col
+
+        def k_row(row_idx):
+            """K row to read: rows past the KV length read the last real row
+            (finite data; their scores are masked)."""
+            if const_expr(KV_TAIL):
+                row_idx = fx.Int64(row_idx)
+                return (row_idx < fx.Int64(seq_len_kv_real_v)).select(
+                    row_idx, fx.Int64(seq_len_kv_real_v) - fx.Int64(1)
+                )
+            return row_idx
 
         def _load_global_half_vec(elem_ptr, base_idx, width):
             view = fx.make_view(
@@ -349,7 +416,7 @@ def build_flash_attn_func_module(
                 lds_row = linear_chunk // THREADS_PER_ROW_LOAD
                 load_lane = linear_chunk % THREADS_PER_ROW_LOAD
                 load_col_base = load_lane * VEC_WIDTH
-                row_idx = tile_start + lds_row
+                row_idx = k_row(tile_start + lds_row)
                 if const_expr(KV_NEEDS_GUARD):
                     chunk_valid = linear_chunk < fx.Uint64(NUM_KV_CHUNKS)
                     if chunk_valid:
@@ -698,7 +765,7 @@ def build_flash_attn_func_module(
                 o_norm_vec = o_finals[dc] * inv_l_vec
                 o_trunc = Vec(o_norm_vec).to(elem_dtype)
                 d_col = fx.Int64(dc * D_CHUNK) + klane * 8
-                o_global = global_idx(q_row, d_col)
+                o_global = o_idx(q_row, d_col)
                 if const_expr(D_TAIL and dc == D_CHUNKS - 1):
                     # The upper 8 columns of the last chunk are padding.
                     if d_col < fx.Int64(HEAD_DIM):
@@ -706,16 +773,41 @@ def build_flash_attn_func_module(
                 else:
                     _store_global_half(o_elem_ptr, o_global, o_trunc)
 
+        if const_expr(RETURN_LSE):
+            # lse = scale * m + ln(l), m in raw S units: log2 units first, then
+            # times ln 2. Both lane halves hold the row's m and l; lanes 0-15
+            # store, rows past seq_len are not stored.
+            m_final = loop_results[0]
+            log2_l = fx.Float32(fx.rocdl.log(T.f32, fx.Float32(l_final).ir_value()))
+            lse_val = (fx.Float32(m_final) * c_sm_scale_log2e + log2_l) * fx.Float32(
+                _LN2
+            )
+            lse_ptr = fx.inttoptr(
+                fx.PointerType.get(
+                    fx.Float32.ir_type, address_space=fx.AddressSpace.Global
+                ),
+                buf_base_i64(LSE),
+            )
+            if q_in_bounds & (klane == fx.Uint64(0)):
+                lse_off = (batch_idx * NUM_HEADS + head_idx) * seq_len_v + q_row
+                fx.make_view(
+                    fx.add_offset(lse_ptr, fx.Int64(lse_off)), fx.make_layout(1, 1)
+                ).store(Vec.from_elements([lse_val], fx.Float32))
+
     @flyc.jit
     def launch_flash_attn_func(
-        Q: fx.Tensor,
-        K: fx.Tensor,
-        V: fx.Tensor,
-        O: fx.Tensor,
+        Q: fx.Pointer,
+        K: fx.Pointer,
+        V: fx.Pointer,
+        O: fx.Pointer,
+        LSE: fx.Pointer,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_kv_real: fx.Int32,
         seq_len_kv: fx.Int32,
+        q_bstride: fx.Int32,
+        k_bstride: fx.Int32,
+        v_bstride: fx.Int32,
         stream: fx.Stream = fx.Stream(  # noqa: B008  framework idiom: default is evaluated once at import on purpose
             None
         ),
@@ -745,9 +837,13 @@ def build_flash_attn_func_module(
             K,
             V,
             O,
+            LSE,
             seq_len,
             seq_len_kv_real,
             seq_len_kv,
+            q_bstride,
+            k_bstride,
+            v_bstride,
             value_attrs=kernel_attrs,
         )
 
@@ -761,11 +857,7 @@ def build_flash_attn_func_module(
 
     launch_flash_attn_func.compile_hints = dict(_fmha_compile_hints)
 
-    def _launch(*args, **kwargs):
-        stream = kwargs.pop("stream", fx.Stream(None))
-        _run_compiled(launch_flash_attn_func, *args, stream)
-
-    def _compile(
+    def _args(
         Q,
         K,
         V,
@@ -774,19 +866,37 @@ def build_flash_attn_func_module(
         seq_len,
         seq_len_kv_real,
         seq_len_kv,
-        stream=None,
+        q_batch_stride=None,
+        k_batch_stride=None,
+        v_batch_stride=None,
+        lse=None,
     ):
-        return flyc.compile(
-            launch_flash_attn_func,
-            Q,
-            K,
-            V,
-            O,
+        if RETURN_LSE and lse is None:
+            raise ValueError(
+                "built with return_lse=True: pass lse=, fp32 [batch, num_heads, seq_len]"
+            )
+        return (
+            ptr_arg(Q),
+            ptr_arg(K),
+            ptr_arg(V),
+            ptr_arg(O),
+            ptr_arg(O if lse is None else lse),  # not read unless return_lse
             batch_size,
             seq_len,
             seq_len_kv_real,
             seq_len_kv,
-            fx.Stream(stream),
+            seq_len * TOK_Q if q_batch_stride is None else q_batch_stride,
+            seq_len_kv * TOK_K if k_batch_stride is None else k_batch_stride,
+            seq_len_kv * TOK_V if v_batch_stride is None else v_batch_stride,
+        )
+
+    def _launch(*args, stream=None, **kwargs):
+        stream = fx.Stream(None) if stream is None else stream
+        _run_compiled(launch_flash_attn_func, *_args(*args, **kwargs), stream)
+
+    def _compile(*args, stream=None, **kwargs):
+        return flyc.compile(
+            launch_flash_attn_func, *_args(*args, **kwargs), fx.Stream(stream)
         )
 
     _launch.compile = _compile
