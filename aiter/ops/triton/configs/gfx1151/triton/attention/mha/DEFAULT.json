@@ -11,13 +11,25 @@
     },
     "default": {
       "BLOCK_M": 64,
+      "BLOCK_N": 32,
+      "PRELOAD_V": false,
+      "waves_per_eu": 1,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "num_stages": 2
+    },
+    "mid_head": {
+      "BLOCK_M": 128,
       "BLOCK_N": 64,
       "PRELOAD_V": false,
       "waves_per_eu": 2,
-      "num_warps": 4,
+      "num_warps": 8,
       "num_ctas": 1,
       "num_stages": 1
     },
+    "mid_head_skip": [
+      {"max_seqlen_k": 2048}
+    ],
     "pe": {
       "BLOCK_M": 64,
       "BLOCK_N": 16,
