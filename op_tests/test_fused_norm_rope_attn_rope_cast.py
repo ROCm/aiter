@@ -2542,9 +2542,8 @@ def check_public_support_query():
     with patch.dict(
         public_v41.__globals__,
         {"is_fused_norm_rope_attn_rope_cast_supported": lambda *a, **kw: False},
-    ):
-        with _raises(ValueError, match="two-source FP8 attention requires"):
-            public_v41(**kwargs)
+    ), _raises(ValueError, match="two-source FP8 attention requires"):
+        public_v41(**kwargs)
 
 
 def run_contract_checks():

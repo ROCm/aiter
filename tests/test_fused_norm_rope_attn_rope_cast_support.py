@@ -6,12 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from conftest import requires_built_aiter
 
 requires_built_aiter()
 
-from aiter import (  # noqa: E402 - requires_built_aiter must precede this import
+from aiter import (
     is_fused_norm_rope_attn_rope_cast_supported as supports,
 )
 
