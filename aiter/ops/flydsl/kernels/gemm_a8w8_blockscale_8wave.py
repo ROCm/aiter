@@ -39,6 +39,10 @@ def _lds_byte_ptr(ptr, byte_offset):
     )
 
 
+def _lds_ptr(dtype, ptr, offset):
+    return fx.add_offset(fx.recast_iter(dtype, ptr), fx.make_int_tuple(offset))
+
+
 def compile_gemm_fp8_8wave(
     TILE_M,
     TILE_N,
@@ -115,18 +119,33 @@ def compile_gemm_fp8_8wave(
     A_GROUP = 8 * BLOCK_K + 16
     a_lds_elems = (BLOCK_M // 16) * (2 * A_GROUP + 32)
 
+    # The epilogue stages the 16-bit C tile with a 16-byte row pad, which
+    # spreads a column of 16-byte lane stores across the LDS banks.
+    c_stage_pitch_bytes = TILE_N * 2 + 16
+    # Once the K loop is done, each A/B tile holds 32 rows of the C tile.
+    # A union per tile, rather than one over all eight, keeps each tile its
+    # own LDS object, so LLVM can still tell DMA writes from LDS reads.
+    C_ROWS_PER_TILE = 32
+    assert 8 * C_ROWS_PER_TILE == TILE_M
+    assert C_ROWS_PER_TILE * c_stage_pitch_bytes <= a_lds_elems
+
+    @fx.union
+    class TileOrCRows:
+        tile: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+        c_rows: fx.Array[fx.Uint8, C_ROWS_PER_TILE * c_stage_pitch_bytes, 16]
+
     # A/B ping-pong tiles use 132 KiB; ScaleA uses another 4 KiB.
     # ScaleB is wave-uniform and stays on the scalar global-memory path.
     @fx.struct
     class LDS:
-        a_t0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
-        a_b0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
-        a_t1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
-        a_b1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
-        b_l0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
-        b_l1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
-        b_r0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
-        b_r1: fx.Array[Float8E4M3FN, a_lds_elems, 16]
+        a_t0: TileOrCRows
+        a_b0: TileOrCRows
+        a_t1: TileOrCRows
+        a_b1: TileOrCRows
+        b_l0: TileOrCRows
+        b_l1: TileOrCRows
+        b_r0: TileOrCRows
+        b_r1: TileOrCRows
         # scale a ping-pong LDS
         scale_a0: fx.Array[Float32, 512, 4]
         scale_a1: fx.Array[Float32, 512, 4]
@@ -196,7 +215,27 @@ def compile_gemm_fp8_8wave(
         lds_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), element_type)
 
         ### Allocate LDS.
-        lds = fx.SharedAllocator().allocate(LDS).peek()
+        lds_storage = fx.SharedAllocator().allocate(LDS)
+        lds_tiles = [
+            lds_storage.a_t0,
+            lds_storage.a_b0,
+            lds_storage.a_t1,
+            lds_storage.a_b1,
+            lds_storage.b_l0,
+            lds_storage.b_l1,
+            lds_storage.b_r0,
+            lds_storage.b_r1,
+        ]
+        a_t_ptrs = [lds_tiles[0].tile.peek().ptr, lds_tiles[2].tile.peek().ptr]
+        a_b_ptrs = [lds_tiles[1].tile.peek().ptr, lds_tiles[3].tile.peek().ptr]
+        b_l_ptrs = [lds_tiles[4].tile.peek().ptr, lds_tiles[5].tile.peek().ptr]
+        b_r_ptrs = [lds_tiles[6].tile.peek().ptr, lds_tiles[7].tile.peek().ptr]
+        # C rows [32 * i, 32 * i + 32) are staged in lds_tiles[i].
+        c_rows_ptrs = [t.c_rows.peek().ptr for t in lds_tiles]
+        scale_a_lds_ptrs = [
+            lds_storage.scale_a0.peek().ptr,
+            lds_storage.scale_a1.peek().ptr,
+        ]
 
         # ScaleB still needs a global descriptor for the two scalar K-tile loads.
         scaleB_rsrc = _buffer_resource(
@@ -215,10 +254,10 @@ def compile_gemm_fp8_8wave(
             ((8 * BLOCK_K + 16, 2 * (8 * BLOCK_K + 16) + 32, BLOCK_K), (1, 32)),
         )
         ### LDS A write layout and read layout.
-        ldsA_t_wr = [fx.make_view(lds.a_t0.ptr, _wr), fx.make_view(lds.a_t1.ptr, _wr)]
-        ldsA_b_wr = [fx.make_view(lds.a_b0.ptr, _wr), fx.make_view(lds.a_b1.ptr, _wr)]
-        ldsA_t_rd = [fx.make_view(lds.a_t0.ptr, _rd), fx.make_view(lds.a_t1.ptr, _rd)]
-        ldsA_b_rd = [fx.make_view(lds.a_b0.ptr, _rd), fx.make_view(lds.a_b1.ptr, _rd)]
+        ldsA_t_wr = [fx.make_view(a_t_ptrs[0], _wr), fx.make_view(a_t_ptrs[1], _wr)]
+        ldsA_b_wr = [fx.make_view(a_b_ptrs[0], _wr), fx.make_view(a_b_ptrs[1], _wr)]
+        ldsA_t_rd = [fx.make_view(a_t_ptrs[0], _rd), fx.make_view(a_t_ptrs[1], _rd)]
+        ldsA_b_rd = [fx.make_view(a_b_ptrs[0], _rd), fx.make_view(a_b_ptrs[1], _rd)]
         ### LDS B would have different read layout when preshuffled.
         ### LDS B write layout is not useless when preshuffled.
         if const_expr(preshuffle_b):
@@ -231,15 +270,15 @@ def compile_gemm_fp8_8wave(
             )
         else:
             _b_rd = _rd
-        ldsB_l_wr = [fx.make_view(lds.b_l0.ptr, _wr), fx.make_view(lds.b_l1.ptr, _wr)]
-        ldsB_r_wr = [fx.make_view(lds.b_r0.ptr, _wr), fx.make_view(lds.b_r1.ptr, _wr)]
+        ldsB_l_wr = [fx.make_view(b_l_ptrs[0], _wr), fx.make_view(b_l_ptrs[1], _wr)]
+        ldsB_r_wr = [fx.make_view(b_r_ptrs[0], _wr), fx.make_view(b_r_ptrs[1], _wr)]
         ldsB_l_rd = [
-            fx.make_view(lds.b_l0.ptr, _b_rd),
-            fx.make_view(lds.b_l1.ptr, _b_rd),
+            fx.make_view(b_l_ptrs[0], _b_rd),
+            fx.make_view(b_l_ptrs[1], _b_rd),
         ]
         ldsB_r_rd = [
-            fx.make_view(lds.b_r0.ptr, _b_rd),
-            fx.make_view(lds.b_r1.ptr, _b_rd),
+            fx.make_view(b_r_ptrs[0], _b_rd),
+            fx.make_view(b_r_ptrs[1], _b_rd),
         ]
 
         # MMA computes transposed C: B is operand A, A is operand B.
@@ -315,8 +354,8 @@ def compile_gemm_fp8_8wave(
         lane_id = tid % 64
         wave_m = wave_id // 4
         scale_a_lds = [
-            fx.make_view(lds.scale_a0.ptr, fx.make_layout(512, 1)),
-            fx.make_view(lds.scale_a1.ptr, fx.make_layout(512, 1)),
+            fx.make_view(scale_a_lds_ptrs[0], fx.make_layout(512, 1)),
+            fx.make_view(scale_a_lds_ptrs[1], fx.make_layout(512, 1)),
         ]
         scale_lds_copy_atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
         scale_wave_dst_offset = rocdl.readfirstlane(T.i32, (tid * 4).ir_value())
@@ -405,7 +444,7 @@ def compile_gemm_fp8_8wave(
                 )
                 scale_src = fx.make_view(
                     fx.add_offset(
-                        lds.scale_a0.ptr if buf == 0 else lds.scale_a1.ptr,
+                        scale_a_lds_ptrs[buf],
                         scale_offset,
                     ),
                     fx.make_layout(1, 1),
@@ -854,7 +893,6 @@ def compile_gemm_fp8_8wave(
             # The last iteration's prefetch reads past K; nothing consumes it.
             pre_scale_a, pre_scale_b = prefetch_first_phase(kiter + 2)
 
-        c_store_rsrc = rocdl.get_buffer_rsrc(fx.get_iter(C))
         bC_tr = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, 0, 1]
         bC_bl = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, 1, 0]
         bC_br = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, 1, 1]
@@ -887,10 +925,17 @@ def compile_gemm_fp8_8wave(
             lane_group = lane_id // 16
             fragment_mode_0_repeat = TILE_N // 128
             fragment_mode_1_repeat = TILE_M // 64
-            C_PITCH = TILE_N * 2 + 16
-            assert TILE_M * C_PITCH <= 8 * a_lds_elems
-            # a_t0 opens the contiguous A/B ring (declaration order, ISA-checked).
-            c_stage_base = fx.get_iter(fx.make_view(lds.a_t0.ptr, fx.make_layout(1, 1)))
+
+            c_stage_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), out_dtype)
+            c_store_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_dtype)
+
+            def c_stage_view(c_tile, row_in_tile, col):
+                # C[row, col:col+8] staged in LDS; col is a multiple of 8.
+                offset = row_in_tile * (c_stage_pitch_bytes // 2) + col
+                return fx.make_view(
+                    _lds_ptr(out_dtype, c_rows_ptrs[c_tile], offset),
+                    fx.make_layout(8, 1),
+                )
 
             def store_c_quadrant(c_frag, quadrant_m, quadrant_n):
                 for row_repeat in range_constexpr(fragment_mode_1_repeat):
@@ -955,12 +1000,11 @@ def compile_gemm_fp8_8wave(
                             ],
                             fx.Int32,
                         )
-                        row = (
-                            quadrant_m * (TILE_M // 2)
-                            + row_repeat * 32
-                            + wave_m * 16
-                            + lane_id % 16
+                        # C row quadrant_m * 128 + row_repeat * 32 + row_in_tile.
+                        c_tile = (
+                            quadrant_m * (TILE_M // 2 // C_ROWS_PER_TILE) + row_repeat
                         )
+                        row_in_tile = wave_m * 16 + lane_id % 16
                         # Groups 0/1/2/3 now start at columns 0/64/8/72,
                         # relative to the quadrant/repeat/wave N base.
                         col = (
@@ -970,50 +1014,45 @@ def compile_gemm_fp8_8wave(
                             + wave_n * 16
                             + lane_group // 2 * 8
                         )
-                        # vector<4xi32> -> buffer_store_dwordx4:
-                        # one 16-byte store per lane to C[row, col:col+8].
-                        # Stage into the dead A/B ring (padded row pitch).
-                        _llvm.store(
-                            packed.ir_value(),
-                            _lds_byte_ptr(c_stage_base, row * C_PITCH + col * 2),
-                            alignment=16,
-                        )
+                        # One 16-byte LDS store per lane: C[row, col:col+8].
+                        c_dst = c_stage_view(c_tile, row_in_tile, col)
+                        staged = fx.make_fragment_like(c_dst)
+                        staged.store(packed.bitcast(out_dtype))
+                        fx.copy(c_stage_copy_atom, staged, c_dst)
 
-            # All waves finished their final LDS reads and every
-            # speculative DMA into the A/B ring has landed.
-            rocdl.sched_barrier(0)
+            # Before C overwrites the A/B tiles, every wave must be done
+            # reading them, and the speculative DMAs into them must land.
             rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
-            rocdl.s_barrier()
-            rocdl.sched_barrier(0)
+            fx.barrier()
             store_c_quadrant(frag_C_tl, 0, 0)
             store_c_quadrant(frag_C_tr, 0, 1)
             store_c_quadrant(frag_C_bl, 1, 0)
             store_c_quadrant(frag_C_br, 1, 1)
-            rocdl.sched_barrier(0)
-            rocdl.s_waitcnt(lgkmcnt=0)
-            rocdl.s_barrier()
-            rocdl.sched_barrier(0)
-            # Each wave stores 32 whole rows: lanes 0-31 row r, 32-63 row
-            # r+1; each lane 8 contiguous bf16 -> 512 B per row run.
+            fx.barrier()
+            # Each store writes two whole rows, 512 B each: lanes 0-31 one
+            # row, lanes 32-63 the next, 8 contiguous 16-bit values per lane.
+            # Wave w stores rows 4w..4w+3 of every staged 32-row block.
             half = lane_id // 32
             lcol = lane_id % 32 * 8
-            for it in range_constexpr(TILE_M // 8 // 2):
-                srow = wave_id * (TILE_M // 8) + it * 2 + half
-                v = _llvm.load(
-                    T.vec(4, T.i32),
-                    _lds_byte_ptr(c_stage_base, srow * C_PITCH + lcol * 2),
-                    alignment=16,
-                )
-                g_off = (srow * N + lcol) * 2
-                if const_expr(N_tail):
-                    g_off = (lcol < b_rows_left).select(g_off, fx.Int32(0x7FFFFFFF))
-                rocdl.raw_ptr_buffer_store(
-                    v,
-                    c_store_rsrc,
-                    g_off.ir_value(),
-                    fx.Int32(0).ir_value(),
-                    aux=ir.IntegerAttr.get(T.i32, 0),
-                )
+            rows_per_wave = C_ROWS_PER_TILE // 8
+            for c_tile in range_constexpr(TILE_M // C_ROWS_PER_TILE):
+                for pair in range_constexpr(rows_per_wave // 2):
+                    row_in_tile = wave_id * rows_per_wave + pair * 2 + half
+                    srow = c_tile * C_ROWS_PER_TILE + row_in_tile
+                    c_src = c_stage_view(c_tile, row_in_tile, lcol)
+                    staged = fx.make_fragment_like(c_src)
+                    fx.copy(c_stage_copy_atom, c_src, staged)
+                    c_off = srow * N + lcol
+                    if const_expr(N_tail):
+                        # N % 8 == 0, so each 8-column store is wholly in or
+                        # out. 2**30 elements is 2**31 bytes, past this WG's
+                        # C bound (asserted < 2**31), so the buffer drops it.
+                        c_off = (lcol < b_rows_left).select(c_off, fx.Int32(2**30))
+                    c_dst = fx.make_view(
+                        fx.add_offset(fx.get_iter(C), fx.make_int_tuple(c_off)),
+                        fx.make_layout(8, 1),
+                    )
+                    fx.copy(c_store_copy_atom, staged, c_dst)
         else:
             assert (
                 N % TILE_N == 0
