@@ -1,16 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import ctypes
-
 import torch
-import torch.distributed as dist
 import triton
 
 from aiter.ops.triton._gluon_kernels.gfx950.comms.fused.moe_combine_reduce_scatter import (
     _moe_combine_reduce_scatter_kernel,
 )
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.comms.ipc_buffers import ERROR_BYTES, IpcCommBuffers
 from aiter.ops.triton.utils.config_utils import (
     load_config_json,
     resolve_config_dir,
@@ -20,10 +17,8 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 _CONFIG_NAME = "MOE_COMBINE_REDUCE_SCATTER"
-_SUPPORTED_WORLDS = (2, 4, 8)
 # The tested (hidden, topk) pairs. Larger rows or a larger top-k spill registers.
 _SUPPORTED_SHAPES = ((6144, 4), (3072, 4), (5120, 2))
-_ERROR_BYTES = 256  # the error record [flag, rank, colour, site], then padding
 
 
 def _get_config(world: int, hidden: int) -> dict:
@@ -32,7 +27,7 @@ def _get_config(world: int, hidden: int) -> dict:
     return select_leq_config(configs, axes=("WORLD", "N"), WORLD=world, N=hidden)
 
 
-class MoeCombineReduceScatter:
+class MoeCombineReduceScatter(IpcCommBuffers):
     """
     The IPC buffers and launch colours of ``fused_moe_combine_reduce_scatter`` for
     one group of 2, 4 or 8 ranks on gfx950.
@@ -40,7 +35,8 @@ class MoeCombineReduceScatter:
     Each rank has one uncached IPC buffer. It holds an error record, the row flags,
     the done words and an inbox of (world - 1) x ceil(max_tokens / world) rows of
     hidden bf16 values. The constructor, ``reset`` and ``close`` are collective:
-    all ranks of the group must call them.
+    all ranks of the group must call them. Error sites: 1 (done words), 2 (row
+    flags).
 
     Args:
         group: The CPU (gloo) process group of the ranks.
@@ -51,89 +47,25 @@ class MoeCombineReduceScatter:
     """
 
     def __init__(self, group, max_tokens, hidden, topk, timeout_s=60.0):
-        from aiter.dist.device_communicators.custom_all_reduce import IPCBufferPool
-
-        assert get_arch() == "gfx950", "needs gfx950"
-        self.world = dist.get_world_size(group)
-        assert (
-            self.world in _SUPPORTED_WORLDS
-        ), f"the group size must be one of {_SUPPORTED_WORLDS}"
+        super().__init__(group, timeout_s)
         assert (
             hidden,
             topk,
         ) in _SUPPORTED_SHAPES, f"(hidden, topk) must be in {_SUPPORTED_SHAPES}"
         assert max_tokens > 0
-        self.timeout_us = max(1, int(timeout_s * 1e6))
-        assert self.timeout_us < 2**31, "timeout_s is too large"
-        self.group = group
-        self.rank = dist.get_rank(group)
         self.hidden, self.topk, self.max_tokens = hidden, topk, max_tokens
         self.config = _get_config(self.world, hidden)
         blocks, parts = self.config["BLOCKS"], self.config["PARTS"]
         assert hidden // 2 % parts == 0 and blocks % parts == 0
         world = self.world
         self.rows_max = triton.cdiv(max_tokens, world)
-        flags = _ERROR_BYTES
+        flags = ERROR_BYTES
         done = flags + (world - 1) * self.rows_max * parts * 4
         inbox = triton.cdiv(done + world * blocks * 4, 1 << 16) << 16
         self.offsets = {"flags": flags, "done": done, "inbox": inbox}
         size = inbox + (world - 1) * self.rows_max * hidden * 2
-        self.nbytes = triton.cdiv(size, 2 << 20) * (2 << 20)
-        self.device = torch.device("cuda", torch.cuda.current_device())
-        self._pool = IPCBufferPool(self.device, group)
-        self._pool.create("inbox", self.nbytes, uncached=True)  # filled with 0
-        addrs = self._pool.open_peer_buffers("inbox")
-        # The buffers of ranks rank, rank + 1, ..., rank + world - 1.
-        self.peers = tuple(addrs[(self.rank + d) % world] for d in range(world))
-        self.colors = torch.zeros(blocks, dtype=torch.int32, device=self.device)
-
-    def error(self):
-        """
-        Returns the error record of this rank: [0, 0, 0, 0], or [1, rank, colour,
-        site] after a wait timed out (site 1: done words, site 2: row flags).
-        Synchronizes the device.
-        """
-        from aiter.dist.device_communicators.custom_all_reduce import (
-            _loaded_hip_runtime,
-        )
-
-        record = (ctypes.c_int32 * 4)()
-        torch.cuda.synchronize(self.device)
-        err = _loaded_hip_runtime().hipMemcpy(
-            record, ctypes.c_void_p(self.peers[0]), ctypes.c_size_t(16), 2
-        )
-        assert err == 0, f"hipMemcpy failed: {err}"
-        return list(record)
-
-    def reset(self):
-        """Clears the error record, the flags, the done words and the colours, for
-        example after a wait timed out. All ranks must call it with no launch in
-        flight."""
-        from aiter.dist.device_communicators.custom_all_reduce import (
-            _loaded_hip_runtime,
-        )
-
-        torch.cuda.synchronize(self.device)
-        dist.barrier(group=self.group)
-        err = _loaded_hip_runtime().hipMemset(
-            ctypes.c_void_p(self.peers[0]), 0, ctypes.c_size_t(self.offsets["inbox"])
-        )
-        assert err == 0, f"hipMemset failed: {err}"
-        self.colors.zero_()
-        torch.cuda.synchronize(self.device)
-        dist.barrier(group=self.group)
-
-    def close(self):
-        """Unmaps the peer buffers and frees the buffer of this rank. All ranks must
-        call it."""
-        if self._pool is None:
-            return
-        torch.cuda.synchronize(self.device)
-        dist.barrier(group=self.group)
-        self._pool.close_peer_buffers()
-        dist.barrier(group=self.group)  # no peer uses the buffer of this rank now
-        self._pool.close()
-        self._pool = None
+        # A clear zeroes the error record, the flags and the done words.
+        self._open(size, blocks, fill=0, fill_bytes=inbox)
 
 
 def fused_moe_combine_reduce_scatter(
