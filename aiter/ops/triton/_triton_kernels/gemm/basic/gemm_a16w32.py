@@ -38,7 +38,7 @@ _gemm_a16w32_bf16x3_repr = make_kernel_repr(
         and (args["K"] % (args["SPLITK_BLOCK_SIZE"]) == 0),
     }
 )
-@triton.jit(repr=_gemm_a16w32_bf16x3_repr)
+@triton.jit(repr=_gemm_a16w32_bf16x3_repr, do_not_specialize=["M"])
 def _gemm_a16w32_bf16x3_kernel(
     a_ptr,
     b_ptr,
