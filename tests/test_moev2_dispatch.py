@@ -497,7 +497,6 @@ def _per_tensor_op_call():
 def test_claims_only_per_tensor_fp8(monkeypatch):
     from aiter.moev2.migration import a8w8_pt
 
-    monkeypatch.setattr(a8w8_pt, "get_gfx", lambda: "gfx950")
     monkeypatch.setattr(a8w8_pt, "get_gfx_runtime", lambda: "gfx950")
     call = _per_tensor_op_call()
     assert a8w8_pt.claims(call)
@@ -526,6 +525,22 @@ def test_claims_only_per_tensor_fp8(monkeypatch):
     monkeypatch.setattr(a8w8_pt, "get_gfx_runtime", lambda: "gfx1201")
     monkeypatch.delenv("AITER_ONLINE_TUNE")
     assert not a8w8_pt.claims(call)
+
+
+def test_claims_use_the_live_arch_on_multi_target_builds(monkeypatch):
+    from aiter.jit.utils import chip_info
+    from aiter.moev2.migration import a8w8_pt
+
+    monkeypatch.setenv("GPU_ARCHS", "gfx942;gfx1250")
+    chip_info.get_gfx.cache_clear()
+    chip_info.get_gfx_custom_op_core.cache_clear()
+    try:
+        assert chip_info.get_gfx() == "gfx1250"
+        monkeypatch.setattr(a8w8_pt, "get_gfx_runtime", lambda: "gfx942")
+        assert a8w8_pt.claims(_per_tensor_op_call())
+    finally:
+        chip_info.get_gfx.cache_clear()
+        chip_info.get_gfx_custom_op_core.cache_clear()
 
 
 def test_tuned_cache_clear_also_resets_path_caches():
