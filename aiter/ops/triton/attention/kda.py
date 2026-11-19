@@ -22,6 +22,7 @@ if _ARCH in ("gfx1250", "gfx1250-strict"):
         fused_recurrent_kda_packed_decode_kernel,
         get_kda_config,
     )
+    from aiter.ops.triton.attention.kda_one_token import try_kda_one_token_decode
 elif _ARCH == "gfx950":
     from aiter.ops.triton._gluon_kernels.gfx950.attention.kda_decode import (
         fused_recurrent_kda_packed_decode_kernel,
@@ -70,6 +71,11 @@ def fused_recurrent_kda(
     Per token: S = exp(g_t) * S, then S += beta_t * k_t (x) (v_t - S^T k_t),
     then o_t = S^T q_t. Requires triton >= 3.6.0 on gfx1250.
 
+    The one-token path supports paged decode with 12 heads, K=V=128, one token
+    per sequence, BF16 inputs, FP32 state, int32 indices, fused q/k
+    normalization, fused gate and beta sigmoid, and lower_bound=-5. Other calls
+    use the generic path.
+
     Args:
         q: [B, T, H, K] queries
         k: [B, T, H, K] keys
@@ -105,8 +111,11 @@ def fused_recurrent_kda(
             (a, k, err) records per token for replay after verification.
         pad_slot_guard: paged only: state slots <= 0 mark padded sequences
         config: tuning dict (BV, SK, num_warps, num_buffers, use_tdm_store,
-            use_tdm_load, use_tdm_fused_load); None resolves a tuned bucket
-            from ``configs/<arch>/gluon/attention/kda_decode/DEFAULT.json``,
+            use_tdm_load, use_tdm_fused_load, use_one_token_decode, CH).
+            None selects the one-token kernel for supported gfx1250 decode inputs.
+            An explicit config keeps the generic path unless
+            ``use_one_token_decode`` is set. The generic path resolves a tuned
+            bucket from ``configs/<arch>/gluon/attention/kda_decode/DEFAULT.json``,
             and omitted keys inherit the resolved bucket's published values.
 
     Returns:
@@ -125,6 +134,37 @@ def fused_recurrent_kda(
     updated in place when the short convolution is fused (``conv_weight``),
     and ``out_gate`` with ``norm_weight`` fuses the gated RMSNorm into ``o``.
     """
+
+    if _ARCH in ("gfx1250", "gfx1250-strict"):
+        result = try_kda_one_token_decode(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            initial_state,
+            cu_seqlens,
+            ssm_state_indices,
+            out,
+            config=config,
+            state_v_first=state_v_first,
+            inplace_final_state=inplace_final_state,
+            num_accepted_tokens=num_accepted_tokens,
+            cache_state_updates=cache_state_updates,
+            pad_slot_guard=pad_slot_guard,
+            conv_state=conv_state,
+            out_gate=out_gate,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+            allow_neg_eigval=allow_neg_eigval,
+            lower_bound=lower_bound,
+            scale=scale,
+        )
+        if result is not None:
+            return result, initial_state
 
     if fused_recurrent_kda_packed_decode_kernel is None:
         raise RuntimeError(f"kda gluon decode requires gfx950/gfx1250 (found {_ARCH})")
@@ -219,7 +259,13 @@ def fused_recurrent_kda(
     )
     bucket_T = max(avg_T, 2) if bf16_resident else avg_T
     config = get_kda_config(
-        bucket_T, N, HV, K, V, overrides=config, fused=use_conv or use_rms_gate
+        bucket_T,
+        N,
+        HV,
+        K,
+        V,
+        overrides=config,
+        fused=use_conv or use_rms_gate,
     )
     BV = config["BV"]
     SK = config["SK"]

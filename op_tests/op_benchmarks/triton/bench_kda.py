@@ -11,6 +11,13 @@ from aiter.ops.triton.attention.kda import fused_recurrent_kda
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
+from op_tests.op_benchmarks.triton.utils.rotating_buffer_bench import (
+    RotatingBufferBench,
+)
+from op_tests.triton_tests.attention.test_kda_one_token import (
+    make_one_token_inputs,
+    run_one_token,
+)
 
 try:
     from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd as fla_kda
@@ -23,7 +30,12 @@ except ImportError:
 BACKENDS = {
     "gluon": "aiter gluon",
     "fla": "fla triton",
+    "one_token": "one-token",
+    "generic": "packed",
 }
+# gfx1250 decode with one token per sequence. These columns need H=12, T=1,
+# BF16 activations and an FP32 V-first state; the default gluon sweep does not.
+ONE_TOKEN_BACKENDS = ("one_token", "generic")
 
 K3_HEAD_DIM = 128
 K3_NUM_HEADS = [24, 12]  # 96 heads sharded tp4 / tp8
@@ -144,6 +156,25 @@ def traffic_bytes(
     return B * slab + writes + B * T * per_tok
 
 
+def run_one_token_case(inputs, provider):
+    if provider == "generic":
+        return run_one_token(inputs, config={"use_one_token_decode": False})
+    return run_one_token(inputs)
+
+
+def one_token_bytes(inputs):
+    """q, k, v, g, beta, one state read, one state write, and the output."""
+    tokens, h, d = inputs["q"].shape[1:]
+    act = inputs["q"].element_size()
+    state = inputs["initial_state"].element_size()
+    return (
+        tokens * (4 * h * d) * act
+        + tokens * h * inputs["beta"].element_size()
+        + 2 * tokens * h * d * d * state
+        + tokens * h * d * inputs["out"].element_size()
+    )
+
+
 def _time(fn, args):
     """One measurement in ms; cudagraph keeps host launch cost out of the span."""
     if args.timing == "cudagraph":
@@ -254,6 +285,16 @@ def benchmark(args):
     @triton.testing.perf_report(configs)
     def bench_kda(H, B, T, provider):
         torch.manual_seed(0)
+        if provider in ONE_TOKEN_BACKENDS:
+
+            def make():
+                return make_one_token_inputs(B, padded=args.padded)
+
+            def run(case):
+                run_one_token_case(case, provider)
+
+            return _record_case(H, B, T, provider, make, run, one_token_bytes)
+
         inputs = make_inputs(
             B,
             T,
@@ -316,7 +357,34 @@ def benchmark(args):
             def fn():
                 fla_kda(**shared)
 
-        runs = [_time(fn, args) for _ in range(args.runs)]
+        return _record(H, B, T, provider, lambda: _time(fn, args), mem)
+
+    def _record_case(H, B, T, provider, make, run, bytes_of):
+        """Time ``run`` on ``make()``; on a pool of cases for --timing rotating."""
+        case = make()
+        if args.timing == "rotating":
+            bencher = RotatingBufferBench.from_dict(
+                {
+                    "min_pool_len": 1,
+                    "kernels_per_graph": 100,
+                    "num_replays": args.n_replays,
+                }
+            )
+            bencher.build_pool([lambda: tuple(make().values())], [tuple(case)])
+
+            def time_once():
+                ms = bencher.bench(lambda **entry: run(entry))
+                return ms, ms, ms
+
+        else:
+
+            def time_once():
+                return _time(lambda: run(case), args)
+
+        return _record(H, B, T, provider, time_once, bytes_of(case))
+
+    def _record(H, B, T, provider, time_once, mem):
+        runs = [time_once() for _ in range(args.runs)]
         med = sorted(r[0] for r in runs)[len(runs) // 2]
         lo, hi = min(r[1] for r in runs), max(r[2] for r in runs)
         best, worst = min(r[0] for r in runs), max(r[0] for r in runs)
@@ -333,15 +401,17 @@ def benchmark(args):
 
 def report_spread(spread, line_vals, line_names, args):
     name = dict(zip(line_vals, line_names))
-    flush = "no L2 flush, cache-warm" if args.timing == "cudagraph" else "L2 flushed"
+    flush, detail = {
+        "cudagraph": (
+            "no L2 flush, cache-warm",
+            f"{args.n_replays} replays x {args.graph_ms}ms/graph",
+        ),
+        "rotating": ("a pool of input sets, cold state", f"{args.n_replays} replays"),
+        "do_bench": ("L2 flushed", f"rep={args.rep}ms each"),
+    }[args.timing]
     print(
         f"\nvariability (us) -- timing={args.timing} ({flush}), "
-        + (
-            f"{args.runs} run(s) x {args.n_replays} replays "
-            f"x {args.graph_ms}ms/graph"
-            if args.timing == "cudagraph"
-            else f"{args.runs} run(s) x rep={args.rep}ms each"
-        )
+        f"{args.runs} run(s) x {detail}"
     )
     hdr = f"{'H':>4}{'B':>5}{'T':>3}  {'backend':<28}{'best':>9}{'med':>9}{'worst':>9}"
     hdr += f"{'run-run':>9}{'p20-p80':>9}"
@@ -427,6 +497,12 @@ def parse_args():
     parser.add_argument("--paged", action="store_true", default=False)
     parser.add_argument("--fused", action="store_true", default=False)
     parser.add_argument(
+        "--padded",
+        action="store_true",
+        default=False,
+        help="one-token backends: pad beta's token stride and the state row",
+    )
+    parser.add_argument(
         "--backends",
         type=str,
         nargs="+",
@@ -437,12 +513,15 @@ def parse_args():
     parser.add_argument("--rep", type=int, default=100)
     parser.add_argument(
         "--timing",
-        choices=["cudagraph", "do_bench"],
+        choices=["cudagraph", "rotating", "do_bench"],
         default="cudagraph",
         help="cudagraph: capture graph_ms worth of launches and replay n_replays "
         "times, so no host work sits inside the measurement (small batch stops "
         "reporting the ~41 us/call wrapper cost) -- but no L2 flush between "
-        "iterations. do_bench: per-iteration event pairs with a 256 MB flush",
+        "iterations. rotating: a CUDA graph where each call takes the next input "
+        "set of a pool larger than the caches (RotatingBufferBench), so each "
+        "call reads a cold state, as in a decode step; one-token backends "
+        "only. do_bench: per-iteration event pairs with a 256 MB flush",
     )
     parser.add_argument(
         "--n_replays",
@@ -486,8 +565,33 @@ def parse_args():
     return parser.parse_args()
 
 
+def _check_one_token_shapes(args):
+    """The one-token kernel only launches for this decode shape."""
+    problems = []
+    if arch_info.get_arch() not in ("gfx1250", "gfx1250-strict"):
+        problems.append(f"gfx1250 (got {arch_info.get_arch()})")
+    if args.num_heads != [12]:
+        problems.append("--num_heads 12")
+    if args.seq_lens != [1]:
+        problems.append("--seq_lens 1")
+    if args.head_dim != K3_HEAD_DIM:
+        problems.append(f"--head_dim {K3_HEAD_DIM}")
+    if args.dtype != "bf16" or args.state_dtype != "fp32":
+        problems.append("--dtype bf16 --state_dtype fp32")
+    if not args.gate or args.fused or args.num_accepted or args.state_k_first:
+        problems.append("gate on, and no --fused, --num_accepted, or --state_k_first")
+    if problems:
+        sys.exit("one-token backends need " + "; ".join(problems))
+
+
 def run_bench(args):
-    if arch_info.get_arch() not in ("gfx950", "gfx1250"):
+    if any(b in ONE_TOKEN_BACKENDS for b in args.backends):
+        _check_one_token_shapes(args)
+    if args.timing == "rotating" and any(
+        b not in ONE_TOKEN_BACKENDS for b in args.backends
+    ):
+        sys.exit("--timing rotating supports the one-token backends only")
+    if arch_info.get_arch() not in ("gfx950", "gfx1250", "gfx1250-strict"):
         sys.exit(f"KDA gluon decode needs gfx950/gfx1250, got {arch_info.get_arch()}")
     if args.gluon_configs is None:
         # The gfx950 kernel holds the whole [V, K] state: BV == V.

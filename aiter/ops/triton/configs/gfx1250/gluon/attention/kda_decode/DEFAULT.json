@@ -1,4 +1,12 @@
 {
+  "one_token": {
+    "BV": 32,
+    "CH": 16,
+    "SK": 16,
+    "num_warps": 2,
+    "num_buffers": 1,
+    "use_one_token_decode": true
+  },
   "fused": {
     "BV": 128,
     "SK": 16,

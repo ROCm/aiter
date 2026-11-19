@@ -176,7 +176,12 @@ def get_config(monkeypatch, tmp_path):
     # The shipped family lives at <configs>/<arch>/gluon/attention/kda_decode/;
     # a variant is written to the same relative path under tmp_path and the
     # config root is pointed there, so the wrapper resolves the variant.
-    cfg_dir = triton_core.resolve_config_dir("attention", "KDA_DECODE", backend="gluon")
+    cfg_dir = triton_core.resolve_config_dir(
+        "attention",
+        "KDA_DECODE",
+        backend="gluon",
+        arch="gfx1250" if arch == "gfx1250-strict" else arch,
+    )
     with open(f"{cfg_dir}/DEFAULT.json") as f:
         shipped = json.load(f)
     relative = os.path.relpath(cfg_dir, triton_core.AITER_TRITON_CONFIGS_PATH)
