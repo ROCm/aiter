@@ -12,12 +12,11 @@ A wait that times out writes an error record into the buffer of each rank."""
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton._gluon_kernels.gfx950.comms.common import (
-    _bf_hi,
-    _bf_lo,
-    _errec_asm,
-    _errec_cons,
-    _pack_bf16,
+from aiter.ops.triton._gluon_kernels.common.comms_gfx950 import (
+    bf_hi,
+    bf_lo,
+    fail_record,
+    pack_bf16,
 )
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -207,8 +206,6 @@ def _store32_cons():
     return "=v,=&s,v,v,v,~{memory},~{vcc},~{scc}"
 
 
-# The error record [1, rank, colour, site] into n buffers, system scope: the high pair
-# first, then the low pair, which holds the word that the waiters read.
 @gluon.jit
 def _thread_ids(W: gl.constexpr):
     L: gl.constexpr = gl.BlockedLayout([1], [64], [W], [0])
@@ -283,27 +280,6 @@ def _store32_sys(addr, value, active):
         _store32_asm(),
         _store32_cons(),
         [active.to(gl.int32), addr, value],
-        (gl.int32, gl.int64),
-        False,
-        1,
-    )
-
-
-@gluon.jit
-def _fail_record(bufs, rank, colour, site: gl.constexpr, active):
-    """Writes [1, rank, colour, site] to the error record of each rank."""
-    lo = (rank.to(gl.int64) << 32) | 1
-    hi = (gl.full(active.shape, site, gl.int64, active.type.layout) << 32) | colour.to(
-        gl.uint32
-    ).to(gl.int64)
-    lo = gl.full(active.shape, 0, gl.int64, active.type.layout) + lo
-    args = (active.to(gl.int32),)
-    for b in gl.static_range(len(bufs)):
-        args = args + (bufs[b].to(gl.pointer_type(gl.int64)),)
-    gl.inline_asm_elementwise(
-        _errec_asm(len(bufs)),
-        _errec_cons(len(bufs)),
-        args + (hi, lo),
         (gl.int32, gl.int64),
         False,
         1,
@@ -395,9 +371,9 @@ def _combine(
             p = ps[q0 + k]
             ok = (p >= 0) & (p < max_sorted)
             x = xs[q0 + k][c]
-            alo = gl.where(ok, gl.fma(_bf_lo(x), ws[q0 + k], alo), alo)
-            ahi = gl.where(ok, gl.fma(_bf_hi(x), ws[q0 + k], ahi), ahi)
-        out = out + (_pack_bf16(alo, ahi),)
+            alo = gl.where(ok, gl.fma(bf_lo(x), ws[q0 + k], alo), alo)
+            ahi = gl.where(ok, gl.fma(bf_hi(x), ws[q0 + k], ahi), ahi)
+        out = out + (pack_bf16(alo, ahi),)
     return out
 
 
@@ -517,7 +493,7 @@ def _iteration(
     failed = _poll_flags(
         own, rr, part, want, own, wait_ticks, tok, F0, RMAX, PARTS, WORLD, W
     )
-    _fail_record(bufs, rank, colour, _SITE_FLAG, ((tid % 64) == 0) & (failed == 1))
+    fail_record(bufs, rank, colour, _SITE_FLAG, ((tid % 64) == 0) & (failed == 1))
     # All waves drained the pushes of row ii - 1: publish its flags to the peers.
     jp = ii - 1
     vp = (jp >= 0) & (jp < n_it)
@@ -567,14 +543,14 @@ def _iteration(
     own_pk = _combine(ps, ws, xs, NPK, max_sorted, DP, W, TOPK)
     obase = _in_part(out + rr.to(gl.int64) * D, part, DP, PARTS)
     for c in gl.static_range(NCH):
-        olo = _bf_lo(own_pk[c])
-        ohi = _bf_hi(own_pk[c])
-        alo = gl.where(rank == 0, olo, _bf_lo(ins[0][c]))
-        ahi = gl.where(rank == 0, ohi, _bf_hi(ins[0][c]))
+        olo = bf_lo(own_pk[c])
+        ohi = bf_hi(own_pk[c])
+        alo = gl.where(rank == 0, olo, bf_lo(ins[0][c]))
+        ahi = gl.where(rank == 0, ohi, bf_hi(ins[0][c]))
         for src in gl.static_range(1, WORLD):
-            alo = alo + gl.where(rank == src, olo, _bf_lo(ins[src][c]))
-            ahi = ahi + gl.where(rank == src, ohi, _bf_hi(ins[src][c]))
-        val = gl.where(tok, _pack_bf16(alo, ahi), 0)
+            alo = alo + gl.where(rank == src, olo, bf_lo(ins[src][c]))
+            ahi = ahi + gl.where(rank == src, ohi, bf_hi(ins[src][c]))
+        val = gl.where(tok, pack_bf16(alo, ahi), 0)
         gl.amd.cdna4.buffer_store(
             val, obase, _cols(c, DP, W), mask=_cmask(c, DP, W, vred)
         )
@@ -693,7 +669,7 @@ def _moe_combine_reduce_scatter_kernel(
             False,
             1,
         )
-        _fail_record(bufs, rank, colour, _SITE_DONE, ((tid % 64) == 0) & (res[0] == 1))
+        fail_record(bufs, rank, colour, _SITE_DONE, ((tid % 64) == 0) & (res[0] == 1))
         gl.barrier()
     total = n_it + LAG
     # Steps in pairs: the loads alternate between 2 register sets, so the back edge
