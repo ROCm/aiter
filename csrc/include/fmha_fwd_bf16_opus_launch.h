@@ -198,8 +198,8 @@ __global__ void __launch_bounds__(256)
         acc.w += w * x.w;
         sum += w;
     }
-    if(has_sink)
-        sum += __expf(sink_h - m);
+    if(has_sink) // when the sink is m its term is exactly 1, which also covers +inf
+        sum += sink_h >= m ? 1.f : __expf(sink_h - m);
     if(any)
     {
         const float inv = 1.f / sum;
@@ -340,10 +340,10 @@ inline bool d128_preflight(const fmha_fwd_bf16_opus_args& a, bool& ok)
     ok = false;
     // A kv extent reaching 2^32 wraps the async-load offset and silently produces wrong
     // output, so refuse it instead.
-    // Paged KV rebases every tile, so only the contiguous form is bound by it.
+    // Paged KV rebases every tile, so there the bound applies to one 64-row tile.
     const int kv_stride_n = (a.stride_k_n > a.stride_v_n ? a.stride_k_n : a.stride_v_n);
-    if(a.block_table_ptr == nullptr &&
-       static_cast<long long>(a.seqlen_k) * kv_stride_n * 2LL >= (1LL << 32))
+    const long long kv_rows = a.block_table_ptr != nullptr ? 64LL : a.seqlen_k;
+    if(kv_rows * kv_stride_n * 2LL >= (1LL << 32))
         return false;
     ok = true;
     // Nothing to launch, but not an error.
@@ -635,7 +635,8 @@ inline bool fmha_fwd_bf16_opus_launch(const fmha_fwd_bf16_opus_args& a, hipStrea
         AITER_LOG_WARNING("opus fwd: paged and split KV need hdim 128");
         return false;
     }
-    // Only gqa_d128_kernel reads the sink; refuse it where it would be ignored.
+    // Only the symmetric kernels and the split combine read the sink; refuse it where it
+    // would be ignored.
     if(a.sink_ptr != nullptr && a.hdim_q != a.hdim_v)
     {
         AITER_LOG_WARNING("opus fwd: attention sink needs a symmetric head dim");

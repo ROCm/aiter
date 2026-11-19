@@ -21,6 +21,7 @@
 
 #include <ATen/hip/HIPContext.h>
 #include <atomic>
+#include <climits>
 
 namespace {
 
@@ -149,6 +150,13 @@ void launch_d128(at::Tensor& q,
             TORCH_CHECK(bt.stride(1) == 1, "block_table must be contiguous along the page dim");
             TORCH_CHECK(bt.size(1) * 128LL >= max_seqlen_k,
                         "block_table has too few pages for max_seqlen_k");
+            // Each 64-row KV tile gets its own 32-bit descriptor, so its byte extent must
+            // stay under 2^32; the kernel keeps the row and head strides in int.
+            const long long kv_stride_n = std::max(k.stride(1), v.stride(1));
+            const long long kv_stride_h = std::max(k.stride(2), v.stride(2));
+            TORCH_CHECK(64LL * kv_stride_n * 2LL < (1LL << 32) && kv_stride_h <= INT_MAX,
+                        "OPUS D=128: paged k/v row stride ", kv_stride_n, " or head stride ",
+                        kv_stride_h, " is too large for a 32-bit KV tile descriptor");
             args.stride_k_b = 0; args.stride_k_n = static_cast<int>(k.stride(1)); args.stride_k_h = static_cast<int>(k.stride(2));
             args.stride_v_b = 0; args.stride_v_n = static_cast<int>(v.stride(1)); args.stride_v_h = static_cast<int>(v.stride(2));
             args.stride_k_page   = k.stride(0);

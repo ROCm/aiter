@@ -542,8 +542,8 @@ def fmha_fwd_bf16_opus_paged_fwd(
 ) -> Tensor | tuple[Tensor, Tensor]:
     """OPUS gfx950 bf16 D=128 group/varlen forward over a paged KV cache. q is packed
     [total_q, H, 128]; k_cache / v_cache are [num_blocks, 128, H_KV, 128] views of a page
-    pool (any strides with a contiguous head dim, e.g. vLLM's K and V halves of one
-    cache); block_table [num_groups, max_pages] int32 maps each group's pages, and
+    pool (any strides with a contiguous head dim and a row stride below 2^25 elements,
+    e.g. vLLM's K and V halves of one cache); block_table [num_groups, max_pages] int32 maps each group's pages, and
     seqstart_k gives the per-group KV lengths as cumulative sums (pool offsets are not
     used).
 
@@ -552,7 +552,8 @@ def fmha_fwd_bf16_opus_paged_fwd(
 
     `sink` is an optional attention sink, one fp32 logit per query head ([H], natural
     log). It joins the softmax denominator as a key with no value, so rows with no keys
-    get lse = sink and O = 0. A -inf logit means no sink for that head.
+    get lse = sink and O = 0. A -inf logit means no sink for that head; +inf gives
+    O = 0 and lse = +inf.
 
     `num_splits` cuts each Q block's KV range into shares that run as separate
     workgroups, with fp32 partials merged by a combine kernel: 1 is off, 0 picks
@@ -582,7 +583,7 @@ def fmha_fwd_bf16_opus_paged_fwd(
         int(max_seqlen_q),
         int(max_seqlen_k),
         int(window_size_left),
-        sink=None if sink is None else sink.float().contiguous(),
+        sink=sink,
         block_table=block_table,
         num_splits=int(num_splits),
     )

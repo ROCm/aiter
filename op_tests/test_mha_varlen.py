@@ -1950,7 +1950,7 @@ def test_fmha_fwd_bf16_opus_d128_paged(
 ):
     """OPUS D=128 over a paged KV pool, unsplit (bit-identical to the contiguous group
     kernel), auto split, and forced splits that leave some shares empty."""
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("opus D=128 kernel requires gfx950")
     monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
     _run_opus_paged_case(seqlens_q, seqlens_kv, nheads, nheads_k, causal, num_splits)
@@ -1958,7 +1958,7 @@ def test_fmha_fwd_bf16_opus_d128_paged(
 
 def test_fmha_fwd_bf16_opus_d128_split_needs_paged():
     """num_splits > 1 is a paged-only option; contiguous KV refuses it."""
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("opus D=128 kernel requires gfx950")
     q = torch.randn(64, 4, 128, device="cuda", dtype=dtypes.bf16)
     kv = torch.randn(64, 4, 128, device="cuda", dtype=dtypes.bf16)
@@ -2003,7 +2003,7 @@ def test_fmha_fwd_bf16_opus_d128_split_skips_rows_outside_groups(
     """q rows before seqstart_q[0] or past seqstart_q[-1] (padding, e.g. for a CUDA graph)
     belong to no group. A split run must leave their out / lse rows untouched, as the
     unsplit run does."""
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("opus D=128 kernel requires gfx950")
     monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
     q, k_cache, v_cache, block_table, cu_q, cu_k = _opus_split_case()
@@ -2048,7 +2048,7 @@ def test_fmha_fwd_bf16_opus_d128_auto_split_falls_back(monkeypatch):
     """num_splits=0 runs one share where the combine cannot run: out rows that are not
     8-byte aligned, a padded seqstart_q, or no rows. An explicit num_splits > 1 rejects
     the first two; with no rows there is nothing to split, so it runs one share too."""
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("opus D=128 kernel requires gfx950")
     monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
     q, k_cache, v_cache, block_table, cu_q, cu_k = _opus_split_case()
@@ -2099,7 +2099,7 @@ def test_fmha_fwd_bf16_opus_d128_auto_split_falls_back(monkeypatch):
 
 def test_fmha_fwd_bf16_opus_d128_paged_needs_group_mode():
     """A block_table with dense 4-D (batch mode) q/k/v is rejected, not ignored."""
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("opus D=128 kernel requires gfx950")
     q = torch.randn(1, 128, 4, 128, device="cuda", dtype=dtypes.bf16)
     bt = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
@@ -2109,13 +2109,58 @@ def test_fmha_fwd_bf16_opus_d128_paged_needs_group_mode():
         )
 
 
+def test_fmha_fwd_bf16_opus_d128_paged_row_stride_bound(monkeypatch):
+    """Each paged KV tile has its own 32-bit descriptor, so 64 rows of the row stride
+    must stay under 2^32 bytes. A stride just under the bound reads every row (offsets up
+    to ~2^32 bytes) like contiguous KV; 2^25 elements is rejected instead of wrapping.
+    """
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("opus D=128 kernel requires gfx950")
+    wide = 1 << 25  # 64 rows * 2^25 * 2 bytes = 2^32
+    if torch.cuda.mem_get_info()[0] < 128 * wide * 2 + (1 << 30):
+        pytest.skip("needs ~9 GiB of free device memory")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    torch.manual_seed(0)
+    s, d = 128, 128
+    cu = _opus_cumsum([s])
+    q, k, v = (torch.randn(s, 1, d, device="cuda", dtype=dtypes.bf16) for _ in range(3))
+    bt = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
+    args = {
+        "softmax_scale": d**-0.5,
+        "causal": True,
+        "seqstart_q": cu,
+        "seqstart_k": cu,
+        "max_seqlen_q": s,
+        "max_seqlen_k": s,
+        "return_lse": True,
+    }
+    # One page and one KV head; K and V share each row, rows `stride` elements apart.
+    pool = torch.empty_strided(
+        (1, s, 1, 2 * d), (s * wide, wide, 2 * d, 1), device="cuda", dtype=dtypes.bf16
+    )
+    stride = wide - d
+    page = pool.as_strided((1, s, 1, 2 * d), (s * stride, stride, 2 * d, 1))
+    page[0, :, 0, :d] = k[:, 0]
+    page[0, :, 0, d:] = v[:, 0]
+    with torch.no_grad():
+        out, lse = fmha_fwd_bf16_opus_paged_fwd(
+            q, *page.split(d, dim=-1), block_table=bt, num_splits=1, **args
+        )
+        out_c, lse_c = fmha_fwd_bf16_opus_varlen_fwd(q, k, v, **args)
+    assert torch.equal(out, out_c) and torch.equal(lse, lse_c), "wide stride misread"
+    with pytest.raises(RuntimeError, match="32-bit KV tile descriptor"):
+        fmha_fwd_bf16_opus_paged_fwd(
+            q, *pool.split(d, dim=-1), block_table=bt, num_splits=1, **args
+        )
+
+
 # Paged sliding window and attention sink (D=128). A window narrower than the longest
 # group runs the SWA kernel; a wider one folds to the causal kernel.
 #   (q seqlens, kv seqlens, nheads, nheads_k, window_size_left)
 _OPUS_D128_PAGED_SWA_CASES = [
     ([300, 77], [900, 200], 8, 2, 128),  # cross-attention, GQA, partial last pages
     ([256, 256], [0, 256], 8, 2, 64),  # no keys in the first group
-    ([1024, 8], [1, 8], 2, 1, 16),  # rows that see no keys (more queries than keys)
+    ([1024, 8], [1, 8], 2, 1, 4),  # rows that see no keys (more queries than keys)
     ([513, 1025], [513, 1025], 4, 4, 257),  # odd window, bounds inside a page
     ([1] * 64, [4096] * 64, 16, 4, 1000),  # decode rows
     ([824], [66999], 32, 8, 32767),  # long cached prefix, few Q blocks: the split case
@@ -2163,8 +2208,6 @@ def _run_opus_paged_swa_case(
             max_q,
             max_k,
             window_size_left,
-            None,
-            1,
             sink,
         )
         runs = {
@@ -2192,6 +2235,14 @@ def _run_opus_paged_swa_case(
     for s, (out, lse) in runs.items():
         assert not torch.isnan(out).any(), f"S={s}: NaN in out"
         assert not torch.isnan(lse).any(), f"S={s}: NaN in lse"
+    if sink is not None and torch.isposinf(sink).all():
+        # The sink takes all the weight: O = 0 and lse = +inf on every row.
+        for s, (out, lse) in runs.items():
+            assert torch.equal(
+                out, torch.zeros_like(out)
+            ), f"S={s}: +inf sink, out != 0"
+            assert torch.isposinf(lse).all(), f"S={s}: +inf sink, lse != +inf"
+        return
 
     window_size = (window_size_left, 0)
     for g in range(len(seqlens_q)):
@@ -2248,7 +2299,7 @@ def test_fmha_fwd_bf16_opus_d128_paged_swa(
 ):
     """OPUS D=128 over a paged KV pool with a sliding window, with and without a sink,
     unsplit and split. The contiguous window tests never select PAGED or SPLIT."""
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("opus D=128 kernel requires gfx950")
     monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
     gen = torch.Generator(device="cuda").manual_seed(1)
@@ -2258,7 +2309,9 @@ def test_fmha_fwd_bf16_opus_d128_paged_swa(
     )
 
 
-@pytest.mark.parametrize("sink_kind", ["large", "dominant", "negligible", "minus_inf"])
+@pytest.mark.parametrize(
+    "sink_kind", ["large", "dominant", "negligible", "minus_inf", "plus_inf"]
+)
 @pytest.mark.parametrize("window_size_left", [-1, 300])
 def test_fmha_fwd_bf16_opus_d128_paged_sink_range(
     window_size_left, sink_kind, monkeypatch
@@ -2268,8 +2321,9 @@ def test_fmha_fwd_bf16_opus_d128_paged_sink_range(
     8 to 12 nats compete with a whole row's mass. +200 nats dominate it, so the kernel
     must rebase onto the sink instead of overflowing exp2. -200 nats change nothing, and
     -inf is no sink at all, also for rows and groups with no keys (lse = -inf, O = 0).
+    +inf takes all the weight (O = 0, lse = +inf), with no inf - inf NaN.
     """
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("opus D=128 kernel requires gfx950")
     monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
     nheads = 8
@@ -2279,6 +2333,7 @@ def test_fmha_fwd_bf16_opus_d128_paged_sink_range(
         "dominant": lambda: torch.full((nheads,), 200.0, device="cuda"),
         "negligible": lambda: torch.full((nheads,), -200.0, device="cuda"),
         "minus_inf": lambda: torch.full((nheads,), float("-inf"), device="cuda"),
+        "plus_inf": lambda: torch.full((nheads,), float("inf"), device="cuda"),
     }[sink_kind]()
     # The last two groups have rows with no keys and no keys at all.
     _run_opus_paged_swa_case(
@@ -2296,7 +2351,7 @@ def test_fmha_fwd_bf16_opus_d128_paged_sink_range(
 )
 def test_fmha_fwd_bf16_opus_d128_batch_sink(causal, window_size_left, monkeypatch):
     """A sink on the dense batch layout, which uses batch strides in the same store."""
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("opus D=128 kernel requires gfx950")
     monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
     torch.manual_seed(0)
@@ -2344,7 +2399,7 @@ def test_fmha_fwd_bf16_opus_d128_batch_sink(causal, window_size_left, monkeypatc
 
 def test_fmha_fwd_bf16_opus_sink_rejects_bad_input():
     """sink must be contiguous fp32 [H]; the D_QK=192 kernel takes none."""
-    if get_gfx() != "gfx950":
+    if get_gfx_runtime() != "gfx950":
         pytest.skip("opus kernels require gfx950")
     cu = torch.tensor([0, 64], device="cuda", dtype=torch.int32)
 

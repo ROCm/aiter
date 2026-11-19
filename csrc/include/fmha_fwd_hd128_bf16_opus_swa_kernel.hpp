@@ -1070,7 +1070,9 @@ __device__ __attribute__((always_inline)) void gqa_d128_swa_impl(opus_gqa_kargs 
             if (l_row > D_ACC(0.0f)) {
                 m_fin = m_row > s2 ? m_row : s2;
                 const D_ACC alpha = __builtin_amdgcn_exp2f(m_row - m_fin);
-                l_fin = l_row * alpha + __builtin_amdgcn_exp2f(s2 - m_fin);
+                // Avoid exp2(+inf - +inf): when the sink is M its contribution is exactly 1.
+                l_fin = l_row * alpha +
+                        ((s2 >= m_fin) ? D_ACC(1.0f) : __builtin_amdgcn_exp2f(s2 - m_fin));
                 l_inv = alpha / l_fin;
             } else {
                 m_fin = s2;

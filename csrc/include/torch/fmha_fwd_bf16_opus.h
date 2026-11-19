@@ -40,7 +40,8 @@
 //
 // `sink` (optional) is an attention sink: one fp32 logit per query head, [H], contiguous,
 // natural log. It joins the softmax denominator as a valueless extra key, attenuating O and
-// raising lse. Symmetric head dims only. A -inf logit means no sink for that head.
+// raising lse. Symmetric head dims only. A -inf logit means no sink for that head; +inf
+// gives O = 0 and lse = +inf.
 //
 // Group / varlen (all four seqstart tensors are int32, length num_groups+1; pass
 // std::nullopt for batch mode):
@@ -50,9 +51,10 @@
 //   max_seqlen_q / max_seqlen_k      : upper bounds driving the grid (group mode only)
 //
 // Paged KV (D=128, group mode): k/v are [num_blocks, 128, H_KV, D] views of a page pool
-// and block_table [num_groups, max_pages] int32 maps each group's pages; seqstart_k still
-// gives the lengths. `num_splits` (paged only) cuts each Q block's KV range into shares
-// merged by a combine kernel: 1 = off, 0 = auto, max 16.
+// (row stride below 2^25 elements) and block_table [num_groups, max_pages] int32 maps
+// each group's pages; seqstart_k still gives the lengths. `num_splits` (paged only) cuts
+// each Q block's KV range into shares merged by a combine kernel: 1 = off, 0 = auto,
+// max 16.
 void fmha_fwd_bf16_opus_fwd(at::Tensor& q,
                             at::Tensor& k,
                             at::Tensor& v,
