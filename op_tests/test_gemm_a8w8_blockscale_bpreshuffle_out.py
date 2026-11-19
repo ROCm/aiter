@@ -132,5 +132,86 @@ def test_fp16_output_on_asm_row_uses_ck(monkeypatch):
     torch.testing.assert_close(y.float(), ref.float(), atol=0.5, rtol=0.02)
 
 
+# MiMo-V2.6-Pro MIXED-step QKV projection: N = (q + k + v heads) * head_dim,
+# K = hidden. The M values are the prefill token counts seen in the gfx950 trace.
+MIMO_QKV_N, MIMO_QKV_K = 3392, 6144
+MIMO_QKV_M = [20464, 22928, 26984, 31944, 32768]
+
+
+def make_mimo_qkv_inputs(m, seed=0):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    n, k = MIMO_QKV_N, MIMO_QKV_K
+    x = (torch.rand(m, k, device="cuda", generator=g) * 2 - 1).to(dtypes.fp8)
+    w = (torch.rand(n, k, device="cuda", generator=g) * 2 - 1).to(dtypes.fp8)
+    # SGLang passes the per-1x128 activation scales as an (M, K/128) view over
+    # [K/128, M] bytes, i.e. strides (1, M).
+    x_scale = (torch.rand(k // 128, m, device="cuda", generator=g) * 0.02 + 1e-3).t()
+    w_scale = (
+        torch.rand((n + 127) // 128, k // 128, device="cuda", generator=g) * 0.02 + 1e-3
+    )
+    return x, w, shuffle_weight(w, layout=(16, 16)), x_scale, w_scale
+
+
+def dequant_linear_rows(x, w, x_scale, w_scale, rows):
+    """FP32 dequantize-then-linear for a row subset of the blockscale GEMM."""
+    k = x.shape[1]
+    xs = x[rows].float().view(len(rows), k // 128, 128) * x_scale[rows].unsqueeze(-1)
+    ws = w_scale.repeat_interleave(128, 0)[: w.shape[0]].repeat_interleave(128, 1)
+    return xs.view(len(rows), k) @ (w.float() * ws).t()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or gemm_mod.get_gfx() != "gfx950"
+    or torch.cuda.get_device_properties(0).multi_processor_count != 256,
+    reason="the MiMo QKV FlyDSL rows are tuned for gfx950 with 256 CUs",
+)
+@pytest.mark.parametrize("m", MIMO_QKV_M)
+def test_mimo_qkv_rows_dispatch_flydsl(monkeypatch, m):
+    x, w, w_shuffled, x_scale, w_scale = make_mimo_qkv_inputs(m)
+    flydsl_calls = []
+    real_flydsl = gemm_mod.gemm_a8w8_blockscale_flydsl
+
+    def spy_flydsl(*args, **kwargs):
+        flydsl_calls.append(args[5]["kernelName"])
+        return real_flydsl(*args, **kwargs)
+
+    monkeypatch.setattr(gemm_mod, "gemm_a8w8_blockscale_flydsl", spy_flydsl)
+
+    out = torch.full((m, MIMO_QKV_N), float("nan"), dtype=dtypes.bf16, device="cuda")
+    y = aiter.gemm_a8w8_blockscale_bpreshuffle(
+        x, w_shuffled, x_scale, w_scale, dtypes.bf16, out=out
+    )
+    torch.cuda.synchronize()
+    assert flydsl_calls == ["flydsl_blockscale_8w_256x256x128_F8_F8_B16_ps1"]
+    assert y.data_ptr() == out.data_ptr()
+
+    ck = torch.empty_like(out)
+    aiter.gemm_a8w8_blockscale_bpreshuffle_ck(x, w_shuffled, x_scale, w_scale, ck)
+    torch.testing.assert_close(out.float(), ck.float(), atol=1e-3, rtol=1e-2)
+
+    rows = torch.cat(
+        [
+            torch.arange(0, 64, device="cuda"),
+            torch.arange(m - 64, m, device="cuda"),
+            torch.randint(0, m, (128,), device="cuda"),
+        ]
+    )
+    ref = dequant_linear_rows(x, w, x_scale, w_scale, rows)
+    torch.testing.assert_close(out[rows].float(), ref, atol=2e-3, rtol=1e-2)
+
+    out.fill_(float("nan"))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        aiter.gemm_a8w8_blockscale_bpreshuffle(
+            x, w_shuffled, x_scale, w_scale, dtypes.bf16, out=out
+        )
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    assert flydsl_calls == ["flydsl_blockscale_8w_256x256x128_F8_F8_B16_ps1"] * 2
+    torch.testing.assert_close(out.float(), ck.float(), atol=1e-3, rtol=1e-2)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

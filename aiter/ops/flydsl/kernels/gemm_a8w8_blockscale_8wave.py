@@ -48,6 +48,8 @@ def compile_gemm_fp8_8wave(
     pid_swizzle=True,
     permlane_epilogue=True,
     preshuffle_b=False,
+    C_LDS_STAGE=True,
+    C_AUX=0,
 ):
     """Compile the half-M single-FIFO blockscale kernel with raw A/B DMA.
 
@@ -615,9 +617,10 @@ def compile_gemm_fp8_8wave(
             ]
             lds_wave_offset = rocdl.readfirstlane(T.i32, (wave_id * 1024).ir_value())
 
-            def preshuffle_g2s(root_view, quadrant, ki):
-                byte_offset = fx.Int32(ki) * BLOCK_K * 16
-                rsrc = dma_resource(b_iter, b_num_bytes, byte_offset)
+            def preshuffle_g2s(root_view, quadrant, ki, rsrc=None):
+                if const_expr(rsrc is None):
+                    byte_offset = fx.Int32(ki) * BLOCK_K * 16
+                    rsrc = dma_resource(b_iter, b_num_bytes, byte_offset)
                 for chunk in range_constexpr(2):
                     dest_lds_m0 = _lds_byte_ptr(
                         fx.get_iter(root_view), lds_wave_offset + chunk * 8192
@@ -644,15 +647,15 @@ def compile_gemm_fp8_8wave(
                 ki,
             )
 
-        def async_copy_Bl(lds_idx, ki):
+        def async_copy_Bl(lds_idx, ki, rsrc=None):
             if const_expr(preshuffle_b):
-                preshuffle_g2s(ldsB_l_rd[lds_idx], 0, ki)
+                preshuffle_g2s(ldsB_l_rd[lds_idx], 0, ki, rsrc)
             else:
                 raw_g2s(b_iter, b_num_bytes, dma_bL_dst[lds_idx], 0, ki)
 
-        def async_copy_Br(lds_idx, ki):
+        def async_copy_Br(lds_idx, ki, rsrc=None):
             if const_expr(preshuffle_b):
-                preshuffle_g2s(ldsB_r_rd[lds_idx], 1, ki)
+                preshuffle_g2s(ldsB_r_rd[lds_idx], 1, ki, rsrc)
             else:
                 raw_g2s(
                     b_iter,
@@ -713,6 +716,13 @@ def compile_gemm_fp8_8wave(
         # Initialize the pending P scales once, then let range carry updates.
         fifo_scale_a_1 = Vec.filled(PHASE_M_REP, 0.0, fx.Float32)
         fifo_scale_b_1 = fx.Float32(0)
+        # Rotated TL[s0] reads of the first tick: issued at the end of the
+        # previous iteration (same barrier period), ahead of the loop latch.
+        lds_rd_At(0, 0)
+        pre_scale_a = lds_rd_scale_a(0, 0, 0)
+        pre_scale_b = load_scale_b(ki=fx.Int32(0))
+        async_copy_Ab(lds_idx=1, ki=fx.Int32(1))
+        rocdl.sched_barrier(0)
 
         for kidx in range(0, num_tiles, 2):
             fifo_scale_a_0 = Vec.filled(PHASE_M_REP, 0.0, fx.Float32)
@@ -744,9 +754,13 @@ def compile_gemm_fp8_8wave(
                 tock = 1 - unroll_idx
                 ki = kiter + unroll_idx
                 for m_slice in range_constexpr(2):
-                    lds_rd_At(tick, m_slice)
-                    mfma_scaleA = lds_rd_scale_a(tick, 0, m_slice)
-                    if const_expr(m_slice == 0):
+                    if const_expr(unroll_idx == 0 and m_slice == 0):
+                        mfma_scaleA = pre_scale_a
+                        mfma_scaleB = pre_scale_b
+                    else:
+                        lds_rd_At(tick, m_slice)
+                        mfma_scaleA = lds_rd_scale_a(tick, 0, m_slice)
+                    if const_expr(m_slice == 0 and unroll_idx == 1):
                         mfma_scaleB = load_scale_b(ki=ki)
                         async_copy_Ab(lds_idx=tock, ki=ki + 1)
                     rocdl.sched_barrier(0)
@@ -765,6 +779,12 @@ def compile_gemm_fp8_8wave(
 
                     if const_expr(m_slice == 0):
                         lds_rd_Br(tick)
+                        # Build k+2's B descriptor here, under this
+                        # reads-only half's LDS latency, not in the next
+                        # (critical) half that issues the B DMA.
+                        b_rsrc_k2 = dma_resource(
+                            b_iter, b_num_bytes, (ki + 2) * BLOCK_K * 16
+                        )
                     else:
                         async_copy_At(lds_idx=tick, ki=ki + 2)
 
@@ -782,10 +802,11 @@ def compile_gemm_fp8_8wave(
 
                     lds_rd_Ab(lds_idx=tick, m_slice=m_slice)
                     mfma_scaleA = lds_rd_scale_a(tick, 1, m_slice)
+                    rocdl.sched_barrier(0)
                     if const_expr(m_slice == 0):
                         # B survives in registers through slice1; its LDS
                         # slot is already free after slice0's reads.
-                        async_copy_Bl(lds_idx=tick, ki=ki + 2)
+                        async_copy_Bl(lds_idx=tick, ki=ki + 2, rsrc=b_rsrc_k2)
                     else:
                         # Six k+2 A/B loads follow all k+1 loads; ScaleA(k+2)
                         # has not issued yet. W6 before BL[s1].begin lets
@@ -805,10 +826,11 @@ def compile_gemm_fp8_8wave(
                     end_compute_phase()
 
                     if const_expr(m_slice == 0):
-                        async_copy_Br(lds_idx=tick, ki=ki + 2)
+                        async_copy_Br(lds_idx=tick, ki=ki + 2, rsrc=b_rsrc_k2)
                     else:
-                        async_copy_scale_a(lds_idx=tick, ki=ki + 2)
                         lds_rd_Bl(lds_idx=tock)
+                        rocdl.sched_barrier(0)
+                        async_copy_scale_a(lds_idx=tick, ki=ki + 2)
 
                     fifo_scale_a_1, fifo_scale_b_1 = mfma_scaleA, mfma_scaleB[1]
                     begin_compute_phase()
@@ -821,6 +843,12 @@ def compile_gemm_fp8_8wave(
                         m_slice,
                     )
                     end_compute_phase()
+
+            lds_rd_At(0, 0)
+            pre_scale_a = lds_rd_scale_a(0, 0, 0)
+            rocdl.sched_barrier(0)
+            pre_scale_b = load_scale_b(ki=kiter + 2)
+            async_copy_Ab(lds_idx=1, ki=kiter + 3)
 
         c_store_rsrc = rocdl.get_buffer_rsrc(fx.get_iter(C))
         bC_tr = fx.flat_divide(C, (BLOCK_M, BLOCK_N))[None, None, 0, 1]
@@ -855,6 +883,10 @@ def compile_gemm_fp8_8wave(
             lane_group = lane_id // 16
             fragment_mode_0_repeat = TILE_N // 128
             fragment_mode_1_repeat = TILE_M // 64
+            C_PITCH = TILE_N * 2 + 16
+            assert TILE_M * C_PITCH <= 8 * a_lds_elems
+            # a_t0 opens the contiguous A/B ring (declaration order, ISA-checked).
+            c_stage_base = fx.get_iter(fx.make_view(lds.a_t0.ptr, fx.make_layout(1, 1)))
 
             def store_c_quadrant(c_frag, quadrant_m, quadrant_n):
                 for row_repeat in range_constexpr(fragment_mode_1_repeat):
@@ -942,18 +974,59 @@ def compile_gemm_fp8_8wave(
                             )
                         # vector<4xi32> -> buffer_store_dwordx4:
                         # one 16-byte store per lane to C[row, col:col+8].
-                        rocdl.raw_ptr_buffer_store(
-                            packed.ir_value(),
-                            c_store_rsrc,
-                            byte_offset.ir_value(),
-                            fx.Int32(0).ir_value(),
-                            aux=ir.IntegerAttr.get(T.i32, 0),
-                        )
+                        if const_expr(C_LDS_STAGE):
+                            # Stage into the dead A/B ring (padded row pitch).
+                            _llvm.store(
+                                packed.ir_value(),
+                                _lds_byte_ptr(c_stage_base, row * C_PITCH + col * 2),
+                                alignment=16,
+                            )
+                        else:
+                            rocdl.raw_ptr_buffer_store(
+                                packed.ir_value(),
+                                c_store_rsrc,
+                                byte_offset.ir_value(),
+                                fx.Int32(0).ir_value(),
+                                aux=ir.IntegerAttr.get(T.i32, C_AUX),
+                            )
 
+            if const_expr(C_LDS_STAGE):
+                # All waves finished their final LDS reads and every
+                # speculative DMA into the A/B ring has landed.
+                rocdl.sched_barrier(0)
+                rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                rocdl.s_barrier()
+                rocdl.sched_barrier(0)
             store_c_quadrant(frag_C_tl, 0, 0)
             store_c_quadrant(frag_C_tr, 0, 1)
             store_c_quadrant(frag_C_bl, 1, 0)
             store_c_quadrant(frag_C_br, 1, 1)
+            if const_expr(C_LDS_STAGE):
+                rocdl.sched_barrier(0)
+                rocdl.s_waitcnt(lgkmcnt=0)
+                rocdl.s_barrier()
+                rocdl.sched_barrier(0)
+                # Each wave stores 32 whole rows: lanes 0-31 row r, 32-63 row
+                # r+1; each lane 8 contiguous bf16 -> 512 B per row run.
+                half = lane_id // 32
+                lcol = lane_id % 32 * 8
+                for it in range_constexpr(TILE_M // 8 // 2):
+                    srow = wave_id * (TILE_M // 8) + it * 2 + half
+                    v = _llvm.load(
+                        T.vec(4, T.i32),
+                        _lds_byte_ptr(c_stage_base, srow * C_PITCH + lcol * 2),
+                        alignment=16,
+                    )
+                    g_off = (srow * N + lcol) * 2
+                    if const_expr(N_tail):
+                        g_off = (lcol < b_rows_left).select(g_off, fx.Int32(0x7FFFFFFF))
+                    rocdl.raw_ptr_buffer_store(
+                        v,
+                        c_store_rsrc,
+                        g_off.ir_value(),
+                        fx.Int32(0).ir_value(),
+                        aux=ir.IntegerAttr.get(T.i32, C_AUX),
+                    )
         else:
             assert (
                 N % TILE_N == 0

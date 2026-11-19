@@ -102,6 +102,8 @@ def _compile_gemm(
     )
     # Match the prototype's flyc.compile[{"opt_level": 2}] without a global knob.
     launch.compile_hints["opt_level"] = 2
+    # LLVM's loop strength reduction costs ~1% on this kernel's K loop.
+    launch.compile_hints["llvm_options"] = {"disable-lsr": True}
     return launch
 
 
