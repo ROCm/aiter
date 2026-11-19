@@ -30,6 +30,7 @@ from aiter.ops.flydsl.kernels.communication_ops_utils import (
     atomic_add_system,
     fence_system_acquire,
     fence_system_release,
+    invalidate_l1,
     load_i64_global,
     store_i32_system,
     store_i64_global_system,
@@ -48,6 +49,7 @@ __all__ = [
     "load_i64_global_agent_relaxed",
     "load_i64_global_system",
     "load_i64_global_system_relaxed",
+    "spin_until_ge_i64_sleep_relaxed",
     "spin_until_ge_i64_sleep_rx",
     "spin_until_ge_i64_system_rx",
     "store_i32_global_system_relaxed",
@@ -93,6 +95,26 @@ def load_i64_global_system(addr_i64):
         ordering=_llvm_d.AtomicOrdering.acquire,
         syncscope="one-as",
     ).result
+
+
+def _uncached_window() -> bool:
+    import os
+
+    return os.environ.get("CCO_UNCACHED_WINDOW", "1") != "0"
+
+
+# CCO windows are uncached (MORI's default since hipMemAllocationTypeUncached): stores to them
+# bypass L2, so in-kernel handoffs of window data need only a store drain on the writer and an
+# L1 drop on the reader. MORI PR 996 relies on the same (EpInterNodePublishStaging).
+UNCACHED_WINDOW = _uncached_window()
+
+
+def publish_uncached():
+    """Publish this wave's earlier stores to the uncached window: wait for their completion.
+    The memory clobber keeps the compiler from moving memory ops across it."""
+    _llvm_d.InlineAsmOp(
+        None, [], "s_waitcnt vmcnt(0)", "~{memory}", has_side_effects=True
+    )
 
 
 def load_i32_global_system_relaxed(addr_i64):
@@ -237,6 +259,17 @@ def spin_until_ge_i64_system_rx(addr_i64, expected):
 
 
 @flyc.jit
+def spin_until_ge_i64_system_l1(addr_i64, expected):
+    """spin_until_ge_i64_system_rx for uncached-window data: relaxed polls, then drop only this
+    CU's L1 (the guarded data never sits in L2)."""
+    cur = fx.Int64(load_i64_global_system_relaxed(addr_i64))
+    while cur < fx.Int64(expected):
+        cur = fx.Int64(load_i64_global_system_relaxed(addr_i64))
+    invalidate_l1()
+    return cur
+
+
+@flyc.jit
 def spin_until_ge_i64_sleep_rx(addr_i64, expected, sleep):
     """Poll as in spin_until_ge_i64_sleep, with one acquire load on exit (see _system_rx)."""
     cur = fx.Int64(load_i64_global_system_relaxed(addr_i64))
@@ -244,6 +277,17 @@ def spin_until_ge_i64_sleep_rx(addr_i64, expected, sleep):
         _mlir_rocdl.s_sleep(sleep)
         cur = fx.Int64(load_i64_global_system_relaxed(addr_i64))
     return fx.Int64(load_i64_global_system(addr_i64))
+
+
+@flyc.jit
+def spin_until_ge_i64_sleep_relaxed(addr_i64, expected, sleep):
+    """spin_until_ge_i64_sleep_rx without the acquire load on exit: for callers
+    whose acquire happens elsewhere (single kernel: the per-XCD hand-off invalidate)."""
+    cur = fx.Int64(load_i64_global_system_relaxed(addr_i64))
+    while cur < fx.Int64(expected):
+        _mlir_rocdl.s_sleep(sleep)
+        cur = fx.Int64(load_i64_global_system_relaxed(addr_i64))
+    return cur
 
 
 def ccqe_enabled() -> bool:

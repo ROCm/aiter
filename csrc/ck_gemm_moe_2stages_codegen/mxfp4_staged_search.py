@@ -219,7 +219,7 @@ def _source_pair(
             "pipeline pair block_m does not match its GEMM1 and GEMM2 identities"
         )
     _validate_gemm1_contract(shape_row, parsed_gemm1)
-    _validate_gemm2_contract(gemm2.kernel_name, block_m, parsed_gemm1["out_dtype"])
+    _validate_gemm2_contract(gemm2.kernel_name, block_m)
     expected_inline_quant = block_m == 16
     if bool(parsed_gemm1["inline_quant"]) != expected_inline_quant:
         raise ValueError(
@@ -244,13 +244,10 @@ def _source_pair(
 def _validate_gemm1_contract(
     shape_row: Mapping[str, Any], parsed_gemm1: Mapping[str, Any]
 ) -> None:
-    a_dtype = (
-        "fp8" if str(shape_row.get("q_dtype_a")) == "torch.float8_e4m3fn" else "fp4"
-    )
-    if parsed_gemm1["a_dtype"] != a_dtype:
-        raise ValueError(f"GEMM1 a_dtype must be {a_dtype} for staged MXFP4 search")
-    if parsed_gemm1["out_dtype"] != a_dtype:
-        raise ValueError(f"GEMM1 out_dtype must be {a_dtype} for staged MXFP4 search")
+    if parsed_gemm1["a_dtype"] != "fp4":
+        raise ValueError("GEMM1 a_dtype must be fp4 for staged MXFP4 search")
+    if parsed_gemm1["out_dtype"] != "fp4":
+        raise ValueError("GEMM1 out_dtype must be fp4 for staged MXFP4 search")
     expected_activation = _shape_activation(shape_row)
     if parsed_gemm1["act"] != expected_activation:
         raise ValueError(
@@ -267,14 +264,12 @@ def _shape_activation(shape_row: Mapping[str, Any]) -> str:
     raise ValueError(f"unsupported MXFP4 activation: {activation!r}")
 
 
-def _validate_gemm2_contract(
-    kernel_name: str, block_m: int, a_dtype: str = "fp4"
-) -> None:
+def _validate_gemm2_contract(kernel_name: str, block_m: int) -> None:
     parsed_v2 = parse_flydsl_v2_gemm2_kernel(kernel_name)
     if parsed_v2 is None:
         raise ValueError("GEMM2 must be layout-v2 for staged MXFP4 search")
     for field, expected in (
-        ("a_dtype", a_dtype),
+        ("a_dtype", "fp4"),
         ("b_dtype", "fp4"),
         ("out_dtype", "bf16"),
     ):

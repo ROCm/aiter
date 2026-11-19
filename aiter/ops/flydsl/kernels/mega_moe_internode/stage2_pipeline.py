@@ -7,12 +7,11 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu
 
-from .mega_moe_internode_config import STAGE2_PART1_PROBE
 from .stage2 import compile_mega_moe_stage2, compile_stage2_node_combine
 
 
 def compile_stage2_pipeline(k1_kw: dict, k2_kw: dict, k2_ctas: int):
-    k1 = compile_mega_moe_stage2(**k1_kw, fused=True)
+    k1 = compile_mega_moe_stage2(**k1_kw)
     k2 = compile_stage2_node_combine(**k2_kw)
     k1_body, k2_body = k1.body, k2.body
     grid = int(k1.grid_ctas)
@@ -88,8 +87,7 @@ def compile_stage2_pipeline(k1_kw: dict, k2_kw: dict, k2_ctas: int):
                 i32_hidden, arg_arrival_count, i64_generation, arg_a_tile_map, i32_local_rank,
                 fx.block_idx.x, arg_expert_count=arg_expert_count,
                 boundary_hook=remote_half_done if remote_first and not tr else None,
-                boundary_probe=(remote_half_probe if remote_first and STAGE2_PART1_PROBE
-                                and not tr else None),
+                boundary_probe=remote_half_probe if remote_first and not tr else None,
                 arg_tr_mcnt=arg_tr_mcnt, arg_tr_sdprog=arg_tr_sdprog, unit_hook=tr_unit if tr else None,
                 tail_hook=tr_tail if tr else None,
                 dev_comm=dev_comm, arg_sd_send=arg_sd_send, arg_sd_tb=arg_sd_tb,

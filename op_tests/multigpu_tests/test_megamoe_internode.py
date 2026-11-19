@@ -23,7 +23,9 @@ case runs in that process, largest TPR first:
              arithmetic), then CUDA-graph replays vs eager, with changed
              inputs and swapped routing in between (--no-check skips all)
   total      GPU events around the full graph replay, including quantization
-             and communication; per-rank min/median, mean over all 16 ranks.
+             and communication; global minimum across all ranks and mean of
+             each rank's mean, both over the last 20 timed replays.
+             With --iters 40, both estimators use replays 21-40.
              Also report the per-replay maximum across ranks at p50/p90.
              Mega and SmallOp use the same warmup and sampling procedure
   breakdown  fused only: torch.profiler over --prof-replays more replays;
@@ -152,13 +154,6 @@ def parse_args(argv=None):
     p.add_argument("--inter-dim", type=int)
     p.add_argument("--experts", type=int)
     p.add_argument("--topk", type=int)
-    p.add_argument(
-        "--logical-gpus-per-node",
-        type=int,
-        choices=(4, 8),
-        default=8,
-        help="logical fused-MoE node width; 4 simulates four nodes on two 8-GPU hosts",
-    )
     p.add_argument("--activation", "--act", choices=("silu", "situv2"))
     p.add_argument("--situ-beta", type=float, default=1.0)
     p.add_argument("--situ-linear-beta", type=float, default=1.0)
@@ -210,13 +205,14 @@ def parse_args(argv=None):
         help="node-partial format: fp8 quantizes both local and remote partials; none keeps BF16",
     )
     p.add_argument("--smallop-quant", choices=("a4w4", "a8w4"))
-    p.add_argument("--fused-quant", choices=("a4w4", "a8w4"), default="a4w4")
     p.add_argument(
-        "--cco-buffer-layout",
-        choices=("legacy", "separate"),
-        default="legacy",
-        help="fused CCO allocation layout; separate supports xGMI or local-window SDMA",
+        "--mori-kernel",
+        choices=("v1_ll", "v2_ll"),
+        default="v1_ll",
+        help="MORI dispatch/combine for the reference and small-op; v2_ll requires a8w4",
     )
+    p.add_argument("--mori-num-qp", type=int, default=8)
+    p.add_argument("--fused-quant", choices=("a4w4", "a8w4"), default="a4w4")
     p.add_argument(
         "--max-recv-routes-per-rank",
         type=int,
@@ -301,6 +297,17 @@ def parse_args(argv=None):
         p.error("--tpr-list is empty")
     if not 1 <= args.prof_tail <= args.prof_replays or args.iters < 1:
         p.error("need iters >= 1 and 1 <= prof-tail <= prof-replays")
+    if args.mori_num_qp < 1:
+        p.error("--mori-num-qp must be positive")
+    if args.mori_kernel == "v2_ll":
+        for network in args.networks:
+            smallop_quant = args.smallop_quant or NETWORKS[network]["smallop_quant"]
+            if (
+                args.check and "fused" in args.paths and args.fused_quant != "a8w4"
+            ) or ("smallop" in args.paths and smallop_quant != "a8w4"):
+                p.error(
+                    "--mori-kernel v2_ll requires a8w4 for the reference and small-op"
+                )
     return args
 
 
@@ -895,7 +902,7 @@ def stage2_tile(net, tpr, s1, *, quant="a4w4", gpus_per_node=8):
     sdma, comm_source = select_stage2_sdma(tpr, tuned)
     sdma = sdma and remote_first and gpus_per_node == 8
     bm, _ = select_gemm2_bm(
-        tuned, tile_group=s1["tile_group"], fused=remote_first, sdma=sdma
+        tuned, tile_group=s1["tile_group"], remote_first=remote_first, sdma=sdma
     )
     # 0 means kernel1 launches the operator's worker_blocks (256) CTAs.
     return {
@@ -1080,7 +1087,7 @@ class PooledCommunicator:
 
 
 class MoriSmallOp:
-    """Quant + MORI InterNodeV1LL dispatch + fused_moe + MORI combine.
+    """Quant + MORI dispatch + fused_moe + MORI combine.
 
     a4w4: FP4 activations on the fused operator's own weights; it is also the
     accuracy reference of the fused path.  a8w4 (DSV4): FP8 activations and
@@ -1101,6 +1108,8 @@ class MoriSmallOp:
         situ_linear_beta=1.0,
         a8w4_weights=None,
         separated_weights=False,
+        mori_kernel="v1_ll",
+        mori_num_qp=8,
     ):
         import mori
         import torch
@@ -1143,6 +1152,61 @@ class MoriSmallOp:
             data_type = torch.float8_e4m3fn
         self.swiglu_limit = float(swiglu_limit)
         self._fused_moe = fused_moe
+        self.mori_kernel = mori_kernel
+        self.mori_comm = None
+        self.mori_config = None
+        if mori_kernel == "v2_ll":
+            import torch.distributed as dist
+            from mori.cco import Communicator
+            from mori.ops.dispatch_combine_v2 import (
+                EpDispatchCombineConfig,
+                EpDispatchCombineOp,
+            )
+
+            if quant != "a8w4":
+                raise ValueError("MORI V2LL test path requires FP8 dispatch (a8w4)")
+            uid = [Communicator.get_unique_id() if rank == 0 else None]
+            dist.broadcast_object_list(uid, src=0)
+            window_bytes = EP_SIZE * shape.tokens * shape.hidden * 8 + (1 << 24)
+            self.mori_comm = Communicator.init(
+                EP_SIZE, rank, uid[0], per_rank_vmm=2 * window_bytes + (1 << 28)
+            )
+            try:
+                config = EpDispatchCombineConfig(
+                    rank=rank,
+                    world_size=EP_SIZE,
+                    gpu_per_node=GPUS_PER_NODE,
+                    hidden_dim=shape.hidden,
+                    max_num_inp_token_per_rank=shape.tokens,
+                    num_experts_per_rank=shape.local_experts,
+                    num_experts_per_token=shape.topk,
+                    data_type=torch.bfloat16,
+                    dispatch_data_type=torch.float8_e4m3fn,
+                    combine_data_type=torch.bfloat16,
+                    scale_dim=shape.hidden // 32,
+                    scale_type_size=1,
+                    quant_type="none",
+                    internode_kernel="v2_ll",
+                    kernel_backend="hip",
+                    num_qp_per_pe=mori_num_qp,
+                )
+                self.op = EpDispatchCombineOp(config, self.mori_comm)
+                assert self.op.scale_stride_bytes() == shape.hidden // 32
+                self.mori_config = {
+                    "kernel": mori_kernel,
+                    "num_qp_per_pe": mori_num_qp,
+                    "scale_stride_bytes": self.op.scale_stride_bytes(),
+                    "resolved": self.op.kernel_config(
+                        shape.tokens, shape.tokens
+                    )._asdict(),
+                }
+            except Exception:
+                self.mori_comm.destroy()
+                self.mori_comm = None
+                raise
+            if rank == 0:
+                print("[MORI_CONFIG] " + json.dumps(self.mori_config), flush=True)
+            return
         config = mori.ops.EpDispatchCombineConfig(
             data_type=data_type,
             rank=rank,
@@ -1199,15 +1263,30 @@ class MoriSmallOp:
             x_q, x_scale = shared.a_quant[:tokens], shared.a_scale[:tokens]
         else:
             x_q, x_scale = self._quant_op(shared.x[:tokens], quant_mode="fp8")
-        dispatched, recv_weights, recv_scales, recv_ids, recv_tokens = self.op.dispatch(
-            x_q,
-            route_weights,
-            x_scale,
-            route_ids,
-            block_num=self.blocks,
-            rdma_block_num=self.rdma_blocks,
-            warp_per_block=8,
-        )
+        if self.mori_kernel == "v2_ll":
+            dispatched, recv_weights, recv_scales, recv_ids, recv_tokens, routing = (
+                self.op.dispatch(
+                    x_q,
+                    route_weights,
+                    x_scale,
+                    route_ids,
+                    return_routing=True,
+                    max_num_inp_token_across_ranks=tokens,
+                )
+            )
+            recv_scales = recv_scales.view(torch.uint8)
+        else:
+            dispatched, recv_weights, recv_scales, recv_ids, recv_tokens = (
+                self.op.dispatch(
+                    x_q,
+                    route_weights,
+                    x_scale,
+                    route_ids,
+                    block_num=self.blocks,
+                    rdma_block_num=self.rdma_blocks,
+                    warp_per_block=8,
+                )
+            )
         w1, w1_scale, w2, w2_scale = self.weights
         import aiter
 
@@ -1241,15 +1320,24 @@ class MoriSmallOp:
                     else {}
                 ),
             )
-        result = self.op.combine(
-            local_out,
-            None,
-            route_ids,
-            block_num=self.blocks,
-            rdma_block_num=self.rdma_blocks,
-            warp_per_block=4,
-        )
+        if self.mori_kernel == "v2_ll":
+            result = self.op.combine(local_out, None, route_ids, routing=routing)
+        else:
+            result = self.op.combine(
+                local_out,
+                None,
+                route_ids,
+                block_num=self.blocks,
+                rdma_block_num=self.rdma_blocks,
+                warp_per_block=4,
+            )
         return result[0] if isinstance(result, tuple) else result
+
+    def close(self):
+        if self.mori_comm is not None:
+            self.op.close()
+            self.mori_comm.destroy()
+            self.mori_comm = None
 
     def _reference_a8(self, dispatched, scales, ids, weights, num_tokens):
         """Independent FP32 matmuls on the candidate's quantized weights.
@@ -1451,16 +1539,26 @@ def profile_breakdown(torch, dist, graph, device, replays, tail, trace_file):
 
 
 def gpu_stats(rank_samples):
-    """Preserve every rank's samples and summarize full-forward GPU latency."""
+    """Global minimum and mean of rank means over the last 20 timed replays.
+
+    Both estimators use replays 21-40 with the default --iters 40.
+    Shorter runs use all available samples.
+    Keep every sample and the per-replay max-rank statistics for diagnostics.
+    """
     if (
         not rank_samples
         or not rank_samples[0]
         or len({len(s) for s in rank_samples}) != 1
     ):
         raise ValueError("GPU samples must be nonempty with equal replay counts")
-    mins = [min(s) for s in rank_samples]
-    medians = [statistics.median(s) for s in rank_samples]
-    slowest = [max(values) for values in zip(*rank_samples)]
+    count = len(rank_samples[0])
+    tail_start = max(0, count - 20)
+    tail = [s[tail_start:] for s in rank_samples]
+    mins = [min(s) for s in tail]
+    means = [statistics.mean(s) for s in tail]
+    global_min = min(mins)
+    mean = statistics.mean(means)
+    slowest = [max(values) for values in zip(*tail)]
     ordered = sorted(slowest)
     position = (len(ordered) - 1) * 0.9
     lower = int(position)
@@ -1469,15 +1567,28 @@ def gpu_stats(rank_samples):
     ) * (position - lower)
     return {
         "metric": "full-forward GPU events, including quantization and communication",
-        "min": statistics.mean(mins),
-        "median": statistics.mean(medians),
-        "pooled_min": min(mins),
-        "worst_median": max(medians),
+        "min": global_min,
+        "global_min": global_min,
+        "min_sample_window_1based": [tail_start + 1, count],
+        "min_aggregation": "minimum across all ranks and retained replays",
+        "mean": mean,
+        "mean_of_rank_means": mean,
+        "mean_sample_window_1based": [tail_start + 1, count],
+        "mean_aggregation": "mean across ranks of each rank's mean",
+        "sample_window_1based": [tail_start + 1, count],
+        "pooled_min": global_min,
+        "tail_pooled_min": global_min,
+        "tail_sample_window_1based": [tail_start + 1, count],
         "max_rank_p50": statistics.median(slowest),
         "max_rank_p90": p90,
         "max_rank_samples_us": slowest,
         "ranks": [
-            {"rank": rank, "samples_us": samples}
+            {
+                "rank": rank,
+                "min_us": mins[rank],
+                "mean_us": means[rank],
+                "samples_us": samples,
+            }
             for rank, samples in enumerate(rank_samples)
         ],
     }
@@ -1510,7 +1621,8 @@ class Runner:
         self.rank, world, self.device = setup_dist(
             str(self.out_root / "preflight"),
             int(args.max_idle_vram_gib * 2**30),
-            use_shmem="smallop" in args.paths or args.check,
+            use_shmem=args.mori_kernel == "v1_ll"
+            and ("smallop" in args.paths or args.check),
             max_idle_gpu_use=args.max_idle_gpu_use,
         )
         if world != EP_SIZE:
@@ -1523,7 +1635,7 @@ class Runner:
             item.partition("=")[0] in TILE_ENV_KEYS for item in args.env_set
         )
         self.comm = None  # created by the first fused case
-        self.local_comm = None
+        self._smallop_paths = []
         # Weights depend on the shape only: prepare them once for every case.
         self.weights = prepare_weights(
             self.shape(1), self.rank, self.device, seed=args.seed
@@ -1552,11 +1664,21 @@ class Runner:
             experts=net["experts"],
             topk=net["topk"],
             ep_size=EP_SIZE,
-            gpus_per_node=self.args.logical_gpus_per_node,
+            gpus_per_node=GPUS_PER_NODE,
             activation=net["activation"],
         )
         shape.validate()
         return shape
+
+    def make_smallop(self, *args, **kwargs):
+        path = MoriSmallOp(
+            *args,
+            mori_kernel=self.args.mori_kernel,
+            mori_num_qp=self.args.mori_num_qp,
+            **kwargs,
+        )
+        self._smallop_paths.append(path)
+        return path
 
     def log(self, msg):
         if self.rank == 0:
@@ -1644,7 +1766,7 @@ class Runner:
         if (args.check and "fused" in args.paths) or (
             quant == "a4w4" and "smallop" in args.paths
         ):
-            reference = MoriSmallOp(
+            reference = self.make_smallop(
                 args.fused_quant if "fused" in args.paths else "a4w4",
                 shape,
                 shared,
@@ -1662,7 +1784,7 @@ class Runner:
                 if quant == "a4w4"
                 and reference is not None
                 and reference.quant == quant
-                else MoriSmallOp(
+                else self.make_smallop(
                     quant,
                     shape,
                     shared,
@@ -1675,6 +1797,11 @@ class Runner:
             )
             rec["smallop"] = self.run_smallop(shape, small, fixture)
             del small
+        self.torch.cuda.synchronize(self.device)
+        self.dist.barrier()
+        for path in self._smallop_paths:
+            path.close()
+        self._smallop_paths.clear()
         del reference, shared
         self.tune_log.lines.clear()
         gc.collect()
@@ -1691,24 +1818,15 @@ class Runner:
             # TPR 16384 needs a ~30 GiB window (K3/DSv4); the pool lives for the
             # whole run, so size it for the largest TPR of the run.
             vmm = 40 * 1024**3 if max(self.args.tprs) > 4096 else 16 * 1024**3
-            separate = args.cco_buffer_layout == "separate"
-            if separate:
-                self.local_comm = PooledCommunicator(
-                    self.rank, EP_SIZE, per_rank_vmm=vmm, multiple_windows=True
-                )
-            self.comm = PooledCommunicator(
-                self.rank, EP_SIZE, per_rank_vmm=vmm, multiple_windows=separate
-            )
+            self.comm = PooledCommunicator(self.rank, EP_SIZE, per_rank_vmm=vmm)
 
         op = getattr(self, "_route_fused_op", None)
         if op is None:
             self.comm.begin_allocations()
-            if self.local_comm is not None:
-                self.local_comm.begin_allocations()
             op = MegaMoEInternode(
                 rank=self.rank,
                 world_size=EP_SIZE,
-                gpus_per_node=args.logical_gpus_per_node,
+                gpus_per_node=GPUS_PER_NODE,
                 model_dim=shape.hidden,
                 inter_dim=shape.inter,
                 experts=shape.experts,
@@ -1725,8 +1843,6 @@ class Runner:
                 situ_linear_beta=args.situ_linear_beta,
                 comm_quant=args.comm_quant,
                 communicator=self.comm,
-                local_communicator=self.local_comm,
-                buffer_layout=args.cco_buffer_layout,
                 max_routes_per_token_per_rank=cap,
                 max_recv_routes_per_rank=args.max_recv_routes_per_rank,
             )
@@ -1753,6 +1869,8 @@ class Runner:
                 if args.fused_quant == "a8w4"
                 else "mori_fused_moe"
             ),
+            "mori_kernel": args.mori_kernel,
+            "mori_config": reference.mori_config if reference is not None else None,
             "stage1_kernel": op.stage1_kernel_name,
             "stage1_tile": dict(op._s1_tile),
             "stage2_tile": stage2_tile(
@@ -1765,26 +1883,6 @@ class Runner:
             "input_rows": self.gather(tokens),
             "checks": [],
         }
-        if args.logical_gpus_per_node == 4:
-            buffers = op._runtime.buffers
-            transport = {
-                "rank": self.rank,
-                "physical_lsa_size": buffers.local_dev_comm.lsa_size,
-                "physical_lsa_rank": buffers.local_dev_comm.lsa_rank,
-                "lsa_peer_base": buffers.lsa_peer_base,
-                "gda_peer_stride": buffers.gda_peer_stride,
-                "gda_peer_lane": buffers.gda_peer_lane,
-            }
-            transports = [None] * EP_SIZE
-            dist.all_gather_object(transports, transport)
-            res["transport_by_rank"] = transports
-            for peer_rank, peer in enumerate(transports):
-                assert peer["rank"] == peer_rank
-                assert peer["physical_lsa_size"] == GPUS_PER_NODE
-                assert peer["physical_lsa_rank"] == peer_rank % GPUS_PER_NODE
-                assert peer["lsa_peer_base"] == (peer_rank % GPUS_PER_NODE // 4) * 4
-                assert peer["gda_peer_stride"] == 4
-                assert peer["gda_peer_lane"] == peer_rank % 4
         coalesce = fixture == "permuted"
         graph = None
         do_check = args.check
@@ -1956,7 +2054,11 @@ class Runner:
             del graph
 
     def run_smallop(self, shape, path, fixture):
-        res = {"quant": path.quant}
+        res = {
+            "quant": path.quant,
+            "mori_kernel": path.mori_kernel,
+            "mori_config": path.mori_config,
+        }
         if self.args.timing:
             graph, _ = capture_graph(self.torch, self.dist, path.forward, self.device)
             self.time_path(
@@ -2058,14 +2160,16 @@ class Runner:
 
     def close(self):
         self.dist.barrier()
+        self.torch.cuda.synchronize(self.device)
+        for path in self._smallop_paths:
+            path.close()
+        self._smallop_paths.clear()
         op = getattr(self, "_route_fused_op", None)
         if op is not None:
             op.close()
             self._route_fused_op = None
         if self.comm is not None:
             self.comm.destroy()
-        if self.local_comm is not None:
-            self.local_comm.destroy()
         self.dist.destroy_process_group()
 
 
@@ -2079,12 +2183,15 @@ def fmt(value):
 
 
 def compare(rec):
-    """Speedup (small-op / fused) of one case's total time."""
+    """Small-op / fused ratios for both complete-forward timing estimators."""
     fused, small = rec.get("fused") or {}, rec.get("smallop") or {}
-    ft, st = (fused.get("total") or {}).get("min"), (small.get("total") or {}).get(
-        "min"
-    )
-    return {"speedup": st / ft if ft and st else None}
+    ft, st = fused.get("total") or {}, small.get("total") or {}
+    fmin, smin = ft.get("min"), st.get("min")
+    fmean, smean = ft.get("mean"), st.get("mean")
+    return {
+        "speedup": smin / fmin if fmin and smin else None,
+        "mean_speedup": smean / fmean if fmean and smean else None,
+    }
 
 
 def fmt_x(value):
@@ -2127,15 +2234,22 @@ def print_case(net, args, rec):
     ft = (fused or {}).get("total")
     st = (small or {}).get("total")
     if ft or st:
-        speed = f"  speedup {fmt_x(rec['compare']['speedup'])}" if ft and st else ""
-        p(
-            f"  GPU total (us, full forward including quant and communication; "
-            f"per-rank min / median, mean over ranks)  "
-            f"fused {fmt((ft or {}).get('min'))} / {fmt((ft or {}).get('median'))}"
-            f"  | small-op {fmt((st or {}).get('min'))} / {fmt((st or {}).get('median'))}{speed}"
+        speed = (
+            f"  speedup min/mean {fmt_x(rec['compare']['speedup'])} / "
+            f"{fmt_x(rec['compare']['mean_speedup'])}"
+            if ft and st
+            else ""
         )
         p(
-            "  GPU max-rank (us, maximum across ranks at each replay; p50 / p90)  "
+            f"  GPU total (us, full forward including quant and communication; "
+            f"last {min(20, args.iters)} replays; "
+            f"min=global min, mean=mean(rank mean))  "
+            f"fused {fmt((ft or {}).get('min'))} / {fmt((ft or {}).get('mean'))}"
+            f"  | small-op {fmt((st or {}).get('min'))} / {fmt((st or {}).get('mean'))}{speed}"
+        )
+        p(
+            f"  GPU max-rank (us, last {min(20, args.iters)} replays; "
+            f"maximum across ranks at each replay; p50 / p90)  "
             f"fused {fmt((ft or {}).get('max_rank_p50'))} / "
             f"{fmt((ft or {}).get('max_rank_p90'))} | small-op "
             f"{fmt((st or {}).get('max_rank_p50'))} / "
@@ -2177,14 +2291,17 @@ def print_case(net, args, rec):
 def print_summary(args, results):
     print(
         f"[SUMMARY] network={args.network} (us; GPU totals include quantization and "
-        f"communication, mean of per-rank minima; speedup = SmallOp GPU / Mega GPU; "
+        f"communication; last {min(20, args.iters)} replays; "
+        f"min=global min, mean=mean(rank mean); "
+        f"speedup = SmallOp GPU / Mega GPU for each estimator; "
         f"quant/stage1/stage2/sum come from separate profiling)",
         flush=True,
     )
     print(
         f"  {'TPR':>5} {'fixture':<9} {'check':<5} {'relL2':>8} "
         f"{'quant':>9} {'stage1':>9} {'stage2':>9} {'q+s1+s2':>9} "
-        f"{'Mega GPU':>9} {'SmallOp GPU':>11} {'speedup':>8} "
+        f"{'Mega min':>9} {'Small min':>11} {'min speed':>9} "
+        f"{'Mega mean':>11} {'Small mean':>12} {'mean speed':>10} "
         f"{'Mega max50':>10} {'Mega max90':>10} "
         f"{'Small max50':>11} {'Small max90':>11} {'load max/mean':>13}",
         flush=True,
@@ -2212,7 +2329,9 @@ def print_summary(args, results):
             f"{'-' if rel is None else f'{rel:.5f}':>8} "
             f"{fmt(fb.get('quant')):>9} {fmt(fb.get('stage1')):>9} "
             f"{fmt(fb.get('stage2')):>9} {fmt(fb.get('device_total')):>9} "
-            f"{fmt(ft):>9} {fmt(st):>11} {fmt_x(rec['compare']['speedup']):>8} "
+            f"{fmt(ft):>9} {fmt(st):>11} {fmt_x(rec['compare']['speedup']):>9} "
+            f"{fmt(mt.get('mean')):>11} {fmt(stotal.get('mean')):>12} "
+            f"{fmt_x(rec['compare']['mean_speedup']):>10} "
             f"{fmt(mt.get('max_rank_p50')):>10} {fmt(mt.get('max_rank_p90')):>10} "
             f"{fmt(stotal.get('max_rank_p50')):>11} {fmt(stotal.get('max_rank_p90')):>11} "
             f"{fmt((rec.get('receive_load') or {}).get('max_mean')):>13}",

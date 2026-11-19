@@ -8,10 +8,9 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
 from ..mxfp4_gemm1_kernels import _assert_supported
-from . import buffer_ops, dpp_utils
+from . import dpp_utils
 from .mxfp4_gemm_common import (
     _activation_mul_batch,
-    _buffer_rsrc,
     _e8m0_from_amax,
     _fabs_f32,
     _global_f32_at,
@@ -1265,27 +1264,31 @@ def _gemm1_body(
     scales_per_mr = [None] * EPILOGUE_M_REPS
 
     def run_epilogue(split):
-        # Sorted payloads can exceed 2 GiB. The buffer resource starts at this
-        # block's first sorted row in i64, so each lane's byte offset stays below
-        # BM * OUT_ROW_BYTES and fits the i32 buffer offset.
-        assert BM * OUT_ROW_BYTES < 1 << 31
-        aqout_rsrc = _buffer_rsrc(
-            arg_aqout + fx.Int64(m_row) * fx.Int64(OUT_ROW_BYTES), BM * OUT_ROW_BYTES
-        )
+        aqout_tiles = _global_scalar_tiles(arg_aqout, fx.Int32, 1 << 24)
 
-        def store_payload(row_local, packed0, packed1):
-            row_off = row_local * fx.Int32(OUT_ROW_BYTES)
+        def store_payload(payload_row, packed0, packed1):
             if const_expr(out_dtype == "fp8"):
                 byte_pos = (
                     n_block_idx * fx.Int32(BN_INT)
                     + wave_grp * fx.Int32(32)
                     + kk * fx.Int32(8)
                 )
-                buffer_ops.buffer_store(
-                    fx.Vector.from_elements([packed0, packed1], fx.Int32),
-                    aqout_rsrc,
-                    row_off + byte_pos,
-                    offset_is_bytes=True,
+                # Sorted payloads can exceed 2 GiB. Keep the byte offset in
+                # i64 through division so global stores cannot sign-wrap.
+                store_off = fx.Int64(payload_row) * fx.Int64(OUT_ROW_BYTES) + fx.Int64(
+                    byte_pos
+                )
+                _scalar_store(
+                    aqout_tiles,
+                    store_off // fx.Int64(4),
+                    packed0,
+                    fx.Int32,
+                )
+                _scalar_store(
+                    aqout_tiles,
+                    (store_off + fx.Int64(4)) // fx.Int64(4),
+                    packed1,
+                    fx.Int32,
                 )
             else:
                 byte_pos = (
@@ -1293,8 +1296,14 @@ def _gemm1_body(
                     + wave_grp * fx.Int32(16)
                     + kk * fx.Int32(4)
                 )
-                buffer_ops.buffer_store(
-                    packed0, aqout_rsrc, row_off + byte_pos, offset_is_bytes=True
+                store_off = fx.Int64(payload_row) * fx.Int64(OUT_ROW_BYTES) + fx.Int64(
+                    byte_pos
+                )
+                _scalar_store(
+                    aqout_tiles,
+                    store_off // fx.Int64(4),
+                    packed0,
+                    fx.Int32,
                 )
 
         if const_expr(enable_bias):
@@ -1350,6 +1359,7 @@ def _gemm1_body(
             scales_per_mr[mr] = e8m0
 
             qscale_raw = as_ir_value(qscale)
+            sorted_out_row = m_row + row_local
             if const_expr(out_dtype == "fp8"):
                 i16x2 = fx.Vector.make_type(2, fx.Int16)
                 zero16 = fx.full(2, 0, fx.Int16)
@@ -1386,7 +1396,7 @@ def _gemm1_body(
                     1,
                 )
                 store_payload(
-                    row_local,
+                    sorted_out_row,
                     fx.Vector(packed0).bitcast(fx.Int32)[0],
                     fx.Vector(packed1).bitcast(fx.Int32)[0],
                 )
@@ -1402,7 +1412,7 @@ def _gemm1_body(
                         w,
                     )
                 store_payload(
-                    row_local,
+                    sorted_out_row,
                     fx.Int32(packed_i32),
                     fx.Int32(0),
                 )

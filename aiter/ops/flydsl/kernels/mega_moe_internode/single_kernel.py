@@ -25,19 +25,15 @@ from flydsl.expr.typing import Vector as Vec
 from .. import communication_ops_utils as comm
 from . import communication as comm2
 from .buffer_addressing import region_local_address
-from .mega_moe_internode_config import STAGE2_PART1_PROBE
-from .stage2 import gemm2_mode_key
+from .stage2 import SK_POLL  # ready-word poll back-off (s_sleep units)
 from .stage2_pipeline import compile_stage2_pipeline
 
-# Ready-word poll back-off (s_sleep units) of the hand-off and GEMM2 group waits.
-SK_POLL = int(__import__("os").environ.get("SK_POLL_SLEEP") or 32)
-# CTAs that skip GMM1 can plan the SDMA layout while the compute CTAs run
-# GMM1. AITER_MEGAMOE_EARLY_SDMA_PLAN=0 restores the previous planning split.
-SK_EARLY_PLAN = (
-    __import__("os").environ.get("AITER_MEGAMOE_EARLY_SDMA_PLAN", "1") == "1"
-)
-
-_CACHE = {}
+# The GMM1-skipping CTAs reach Stage2 hundreds of us early and plan the SDMA
+# layout while GMM1 runs (EP16 TPR2048 min: a8w4 -3.4%, a4w4 -5.6%); the compute
+# CTAs then find it done (plan_ctx below).
+# The hand-off EOS word is polled relaxed (an acquire load invalidates the XCD L2
+# on every poll); the per-XCD invalidate below is the acquire. Stage1 then skips
+# its per-CTA acquire after the EOS spin.
 
 
 def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int):
@@ -58,6 +54,7 @@ def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int)
             "the single kernel needs Stage1 compiled with group_ready=True"
         )
     xcd_inv_off = int(stage1_launch.xcd_inv_off)
+    _sk_poll = comm2.load_i64_global_system_relaxed
     buffer_regions = stage1_launch.buffer_regions
     region_indices = {(stage, name): index for stage, name, index in buffer_regions}
     remote_first = pipeline.remote_first
@@ -71,10 +68,9 @@ def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int)
         + k1.kernel_name[len("megamoe_") :]
         + "__"
         + k2.kernel_name[len("megamoe_") :]
-        + (f"_k2c{pipeline.k2_ctas}" if pipeline.k2_ctas != grid else "")
-        + ("_p1q" if remote_first and STAGE2_PART1_PROBE else "")
-        + f"_ps{SK_POLL}_xi"
-        + ("_epl" if SK_EARLY_PLAN else "")
+        + ("_p1q" if remote_first else "")
+        + f"_ps{SK_POLL}_xi_epl_rp"
+        + (f"_k2c{int(k2_ctas)}" if int(k2_ctas) != 96 else "")
     )
 
     @fx.struct
@@ -104,12 +100,10 @@ def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int)
         gl = Vec(fx.make_view(fx.recast_iter(fx.Int64, lds), fx.make_layout(2, 1)).load())
         gen = fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(gl[0]).ir_value()))
         eos_seen = fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(gl[1]).ir_value()))
-        plan_ctx = None
-        if const_expr(SK_EARLY_PLAN):
-            pw = Vec(fx.make_view(fx.add_offset(fx.recast_iter(fx.Int32, lds), 4),
-                                  fx.make_layout(2, 1)).load())
-            plan_ctx = (fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(pw[0]).ir_value())),
-                        fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(pw[1]).ir_value())))
+        pw = Vec(fx.make_view(fx.add_offset(fx.recast_iter(fx.Int32, lds), 4),
+                              fx.make_layout(2, 1)).load())
+        plan_ctx = (fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(pw[0]).ir_value())),
+                    fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(pw[1]).ir_value())))
         if fx.Int32(gpu.thread_id("x")) == fx.Int32(0):
             # Hand-off (see the module docstring): CTAs that did not pass
             # Stage1's EOS spin wait until its tables are final.
@@ -118,10 +112,10 @@ def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int)
                        + (gen & fx.Int64(1)) * fx.Int64(gsync["eos_plane"]))
                 if const_expr(bool(buffer_regions)):
                     eos = region_local_address(arena_ptr, region_indices[1, "h1_queue_eos"], gen & fx.Int64(1))
-                ev = fx.Int64(comm2.load_i64_global_system(eos))
+                ev = fx.Int64(_sk_poll(eos))
                 while ev < gen:
                     rocdl.s_sleep(SK_POLL)
-                    ev = fx.Int64(comm2.load_i64_global_system(eos))
+                    ev = fx.Int64(_sk_poll(eos))
             # One L2 invalidate per XCD and generation (MegaMoEV2 style): a
             # per-CTA buffer_inv sc1 wipes the XCD's shared L2 32 times and
             # stalls this CTA's first load ~7-12us behind it. The word holds
@@ -174,82 +168,3 @@ def compile_single_kernel(stage1_launch, k1_kw: dict, k2_kw: dict, k2_ctas: int)
 
     launch.kernel_name = kernel_name
     return launch
-
-
-def run_single_kernel(
-    *,
-    stage1_launch,
-    s1_args: tuple,
-    k1_ptrs: dict,
-    k1_compile: dict,
-    k2_compile: dict,
-    k2_ctas: int,
-    arg_output_bf16,
-    arg_scratch,
-    local_tokens,
-    stream,
-    run_compiled,
-):
-    """Compile (once per configuration) and launch the single fused kernel.
-
-    ``s1_args`` = (dev_comm, arena_win, arena_ptr, x_q, input_scale,
-    route_weights, topk_ids, w1q, w1scale, ntokens) as Stage1 takes them.
-    """
-    key = (
-        stage1_launch.kernel_name,
-        tuple(sorted(k1_compile.items())),
-        tuple(sorted(k2_compile.items())),
-        int(k2_ctas),
-        gemm2_mode_key(),
-    )
-    launch = _CACHE.get(key)
-    if launch is None:
-        launch = _CACHE[key] = compile_single_kernel(
-            stage1_launch, k1_compile, k2_compile, k2_ctas
-        )
-    p = k1_ptrs
-    from .stage2 import BM
-
-    run_compiled(
-        launch,
-        *(fx.Int64(int(v)) for v in s1_args[:9]),
-        fx.Int32(int(s1_args[9])),
-        *(
-            fx.Int64(int(p[k]))
-            for k in (
-                "arg_aq",
-                "arg_ascale",
-                "arg_bq",
-                "arg_bscale",
-                "arg_eids",
-                "arg_cumsum",
-                "arg_stids",
-                "arg_sweights",
-                "arg_trb",
-                "arg_p2p",
-            )
-        ),
-        fx.Int32((p["row_capacity"] + BM - 1) // BM),
-        fx.Int32(k1_compile["inter_dim"]),
-        fx.Int32(k1_compile["model_dim"]),
-        fx.Int64(int(p["arg_arrival_count"])),
-        fx.Int64(int(p["arg_generation"])),
-        fx.Int64(int(p["arg_a_tile_map"])),
-        fx.Int32(int(p["local_rank"])),
-        fx.Int64(int(arg_output_bf16)),
-        fx.Int64(int(arg_scratch)),
-        fx.Int32(int(local_tokens)),
-        fx.Int64(int(p.get("arg_expert_count", 0))),
-        *(
-            fx.Int64(int(p.get(k, 0)))
-            for k in (
-                "arg_sd_send",
-                "arg_sd_tb",
-                "arg_sd_plan",
-                "arg_sd_cdone",
-                "arg_tr_mcnt",
-                "arg_tr_sdprog",
-            )
-        ),
-        stream,
-    )

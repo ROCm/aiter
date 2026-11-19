@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # Conservative guard for the tested CCO dmabuf/IOVA-zero path. This is not
 # an Ionic hardware limit or a bound on MORI shmem's ordinary-address MRs.
-MAX_CCO_RAIL_MR_BYTES = 1 << 30
+MAX_CCO_RAIL_MR_BYTES = 1 << 40
 CCO_ALLOCATION_ALIGNMENT = 64 << 20
 # The local (LSA-only) window's allocation size. A second operator on the same
 # pooled communicator places it at a nonzero slot offset, where hipMemSetAccess
