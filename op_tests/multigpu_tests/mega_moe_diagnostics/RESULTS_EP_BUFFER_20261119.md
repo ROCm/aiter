@@ -1,5 +1,30 @@
 # Persistent GEMM2 buffer-scatter experiment — 2026-11-19
 
+**The original sections below describe commit5e22c9bb4.** Follow-up experiments
+retain a faster full-N row writer, still slower than TDM. One run per buffer
+variant gives:
+
+| Buffer variant | GEMM2 us | E2E/layer us |
+|---|---:|---:|
+| Original coalesced compute-wave rows | 729.77 | 1685.21 |
+| Precomputed row addresses | 703.63 | 1686.20 |
+| Precomputed addresses + four-row grouping | 696.44 | 1668.43 |
+| Full-N rows + four-row grouping (retained) | 669.89 | 1650.96 |
+
+The retained Flash writer uses64 buffer_store_b128 instructions, zero tensor
+stores, and one exit-only storecnt at `.LBB0_51`, line4619 in its saved ISA.
+Rows/addresses use zero descriptor bounds for invalid routes. Cross-wave LDS
+reads use the existing raw dscnt + signal/wait barrier. Tests passed at257 and
+16384/rank. Raw per-GPU results are in `results_ep_buffer_fullrow4_20261119.json`;
+preaddr/group4 results have corresponding JSON files. The optional NT cache
+policy passed correctness only and is preserved in `ep_buffer_nt_experiment.patch`.
+
+LLVM branches and raw barriers implicitly drain XCNT. Comparing only explicit
+XCNT instruction counts misses these drains; neither count proves a stall cost.
+The newer [interleaved TDM comparison](RESULTS_EP_TDM_PERSIST_20261119.md)
+selects persistent256 TDM for both GEMM2 and E2E. Do not pool that fresh paired
+comparison with the single-run history below.
+
 The buffer-store path satisfies the assembly requirement but is slower. Keep
 `AITER_MOE_EP_BUFFER_STORE=0` (default) for the best measured E2E result.
 

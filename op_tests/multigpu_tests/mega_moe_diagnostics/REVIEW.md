@@ -161,3 +161,68 @@ Final review after row-writeback validation:
    keep opt-in disabled. Formatting/comments and unused-import cleanup leave
    the tested kernel AST identical. Commit lightweight metrics and ISA audit,
    not compilation caches. All successful runs retained their boot ID.
+
+Precomputed row-address experiment, three prelaunch review passes:
+1. Compute each route's peer/slot address in16 lanes during metadata setup;
+   preserve64-bit pointers and identical fp32 weighting/bf16/LDS output layout.
+   Invalid M rows or negative routes select source slot0 but descriptor bound0.
+2. Epilogue reads low/high address and byte bound with readlane, making SGPR
+   descriptors. Dynamic zero bounds suppress all8-byte writes for invalid rows.
+   Columns retain exact row bounds. LDS reads stay within each wave's own tile.
+3. No EXEC branch for valid rows: allow LDS reads/store setup to overlap. Keep
+   final store retirement and task barriers identical to the validated version.
+   Run small/full changing-routing checks plus ISA audit before native timing.
+
+Four-row buffer-store grouping, three review passes:
+1. All addresses, zero bounds, output weighting and per-wave row/column
+   ownership are identical to preaddr, which passed small/full checks.
+2. Allocate four independent value/resource pairs. An empty inline-asm use
+   keeps all pairs live together; public buffer tensors/fx.copy still emit
+   every store. This does not suppress any wait or claim completion.
+3. Existing final store drain and LDS barriers remain. Verify compilation of
+   buffer-resource pointer operands, no spills, CFG storecnt placement, and
+   small/full changing-input correctness before measuring the grouped path.
+
+Full-N row writer, three prelaunch review passes:
+1. For M divisible by16*num_waves, repartition C output into disjoint full-N
+   stripes: wave w owns rows w*(M/num_waves) through the next stripe. Weighting
+   stays in the original compute-wave layout; only row-map addressing/writeback
+   ownership changes. Smaller M retains the validated compute-wave partition.
+2. Before cross-wave C reads, dscnt plus raw TG signal/wait ensures all C stores
+   to LDS completed. Closing task barrier still protects every LDS reader.
+   VMEM output remains in flight until the existing final exit storecnt.
+3. At M256/N256/w2x2 each wave writes64 rows of512B using BufferCopy128b.
+   Four-row resource lifetimes remain grouped. Bounds/negative-route masking
+   and64-bit address math are preserved. Run small/full changing-routing checks
+   and exact full-row symbol audit before timing.
+
+Non-temporal output policy, three prelaunch review passes:
+1. Change only BufferCopy cache aux from SCOPE_SYS to SCOPE_SYS|TH_NT.
+   LLVM SIDefines.h defines gfx12 TH_NT=1 (not pre-gfx12 NT=2).
+2. Addressing, masking, ownership, raw LDS barriers and final output completion
+   are unchanged from the small/full validated full-row4 path. System scope
+   remains enabled; no waits are removed.
+3. Re-run the full target changing-input correctness and emitted-ISA audit,
+   then timing. The full test exercises reuse of the same landing addresses,
+   which can expose stale-cache behavior. Small geometry is unchanged.
+
+Selected persistent-TDM control, final three review passes:
+1. User selected persistent256 plus original TDM gather scatter. Buffer mode
+   is disabled; original GEMM1/S1F, CSV, allocation capacity and combine stay.
+2. Timed graph symbols confirm pw256/epscatter without epbuffer, grid256 versus
+   default32640. Device psum bounds each replay's tasks; cluster1x4 stride stays
+   divisible by4. Re-run six changing-routing checks on this exact combination.
+3. Two interleaved timing runs per mode confirm E2E improvement in this session.
+   Keep the unmeasured NT experiment as a patch; retain regular full-row4 as the
+   best measured buffer implementation, still opt-in and slower than TDM.
+
+Final selected-mode outcome (2026-11-19):
+- Persistent TDM full-size test exited0; all four GPUs passed six changing-route
+  graph replays against the existing push/persistent-TDM reference. This is
+  differential coverage, not an independent fp32 oracle for persistent scheduling.
+- Interleaved runs02/03 give GEMM2 591.41 -> 548.64us and native E2E/layer
+  1590.27 -> 1533.50us. Original buffer mode stays off by default.
+- Retained regular fullrow4 ISA audit passes:64 buffer stores, zero tensor
+  stores, one storecnt in exit block .LBB0_51, outside all CFG cycles.
+- AST parse, shell syntax and git diff whitespace checks pass. Post-test edits
+  only add reports/results; no kernel change follows final validation.

@@ -93,6 +93,13 @@ def audit(path: Path) -> dict:
         "store_waits": waits,
         "xcnt_waits": counts["s_wait_xcnt"],
         "xcnt_scope": "XNACK address-translation operand protection, not store completion",
+        "xcnt_implicit_drain_sites": sum(
+            n for op, n in counts.items()
+            if op == "s_branch" or op.startswith("s_cbranch")
+            or op.startswith("s_barrier") or op in ("s_endpgm", "s_sendmsg")
+        ),
+        "xcnt_note": "Branches and barriers also drain XCNT implicitly; static sites are not dynamic stall counts",
+        "xcnt_reference": "https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/AMDGPU/SIInstrInfo.cpp",
         "cyclic_blocks": len(cyclic),
         "wait_instructions": {
             op: n for op, n in counts.items() if op.startswith("s_wait")

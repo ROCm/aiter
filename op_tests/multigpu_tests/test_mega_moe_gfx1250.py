@@ -555,7 +555,7 @@ def _check_pull(
     expected_tile_ready=None,
     src_rank_shuffle=False,
     unique_pull=False,
-    ep_buffer_store=False,
+    persistent_ep_scatter=False,
 ):
     """Validate remote FP4 bytes, inverse maps, and changing graph inputs."""
     from aiter.test_common import checkAllclose
@@ -651,15 +651,15 @@ def _check_pull(
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = ctx.layer(pull, "bf16")
-        for iteration in range(6 if ready_first or src_rank_shuffle or unique_pull or ep_buffer_store else 4):
-            if (ready_first and iteration == 2) or ((src_rank_shuffle or unique_pull or ep_buffer_store) and iteration == 4):
+        for iteration in range(6 if ready_first or src_rank_shuffle or unique_pull or persistent_ep_scatter else 4):
+            if (ready_first and iteration == 2) or ((src_rank_shuffle or unique_pull or persistent_ep_scatter) and iteration == 4):
                 # Disjoint source/destination ownership and empty segments.
                 hot = (
                     torch.arange(TOPK, device=ctx.device, dtype=torch.int32)
                     + ctx.rank * EXPERTS_PER_RANK
                 )
                 ctx.ids.copy_(hot.expand_as(ctx.ids))
-            elif (ready_first and iteration == 3) or ((src_rank_shuffle or unique_pull or ep_buffer_store) and iteration == 5):
+            elif (ready_first and iteration == 3) or ((src_rank_shuffle or unique_pull or persistent_ep_scatter) and iteration == 5):
                 # Unequal, non-M16 source boundaries within otherwise hot
                 # experts. Each rank contributes a different random tail.
                 hot = torch.arange(TOPK, device=ctx.device, dtype=torch.int32)
@@ -1160,8 +1160,8 @@ def _check_pull_s1f_unique(ctx):
         _check_pull(ctx, fused=True, unique_pull=True, a_preshuffled=False)
 
 
-def _check_pull_s1f_ep_buffer(ctx):
-    """Check persistent GEMM2 buffer stores across changing graph replays."""
+def _check_pull_s1f_ep_scatter(ctx, *, buffer_store):
+    """Check either persistent GEMM2 epilogue across changing graph replays."""
     from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
 
     original_find = grouped._find_grouped_config
@@ -1173,7 +1173,7 @@ def _check_pull_s1f_ep_buffer(ctx):
 
     with mock.patch.dict(os.environ, {
         "AITER_MEGA_PULL_UNIQUE": "0",
-        "AITER_MOE_EP_BUFFER_STORE": "1",
+        "AITER_MOE_EP_BUFFER_STORE": str(int(buffer_store)),
         "AITER_FLYDSL_PERSISTENT_WORKERS2": "256",
         "AITER_MEGA_PULL_PLAN_PACK": "0",
         "AITER_MEGA_PULL_SRC_SHUFFLE": "0",
@@ -1190,7 +1190,17 @@ def _check_pull_s1f_ep_buffer(ctx):
         "AITER_TDM_NUM_BUFFERS": "4" if TOKENS >= 4096 else "2",
         "AITER_TDM_M_WARP": "2", "AITER_TDM_N_WARP": "2",
     }), mock.patch.object(grouped, "_find_grouped_config", configured):
-        _check_pull(ctx, fused=True, ep_buffer_store=True)
+        _check_pull(ctx, fused=True, persistent_ep_scatter=True)
+
+
+def _check_pull_s1f_ep_buffer(ctx):
+    """Check persistent GEMM2 buffer scatter."""
+    _check_pull_s1f_ep_scatter(ctx, buffer_store=True)
+
+
+def _check_pull_s1f_ep_tdm(ctx):
+    """Check persistent GEMM2 TDM gather scatter with preshuffled input."""
+    _check_pull_s1f_ep_scatter(ctx, buffer_store=False)
 
 
 def _check_pull_s1f_src_rank_shuffle(ctx):
@@ -1280,6 +1290,7 @@ CHECKS = (
     _check_pull_s1f_src_rank_shuffle,
     _check_pull_s1f_unique,
     _check_pull_s1f_ep_buffer,
+    _check_pull_s1f_ep_tdm,
     _check_pull_s1f_clusters,
     _check_pull_s1f_cluster_m_projection,
     _check_pairings,

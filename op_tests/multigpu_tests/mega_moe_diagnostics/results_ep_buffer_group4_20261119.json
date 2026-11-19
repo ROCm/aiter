@@ -1,0 +1,79 @@
+{
+  "per_gpu": [
+    {
+      "run": "ipflegacy_p96_events_ep_buffer_group4_flash_01",
+      "rank": 0,
+      "gemm1_median_us": 531.9369733333588,
+      "gemm2_median_us": 701.1905014514923,
+      "plan_median_us": 36.11399978399277,
+      "ready_median_us": 12.017999775707722,
+      "native_e2e_median_us_per_layer": 1668.3241250348146,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_epbuffer_group4_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    },
+    {
+      "run": "ipflegacy_p96_events_ep_buffer_group4_flash_01",
+      "rank": 1,
+      "gemm1_median_us": 534.741997718811,
+      "gemm2_median_us": 700.5115151405334,
+      "plan_median_us": 35.092998296022415,
+      "ready_median_us": 9.073499590158463,
+      "native_e2e_median_us_per_layer": 1668.7017499634749,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_epbuffer_group4_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    },
+    {
+      "run": "ipflegacy_p96_events_ep_buffer_group4_flash_01",
+      "rank": 2,
+      "gemm1_median_us": 512.1669769287109,
+      "gemm2_median_us": 685.7064962387085,
+      "plan_median_us": 41.74249991774559,
+      "ready_median_us": 14.862500131130219,
+      "native_e2e_median_us_per_layer": 1668.197875005717,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_epbuffer_group4_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    },
+    {
+      "run": "ipflegacy_p96_events_ep_buffer_group4_flash_01",
+      "rank": 3,
+      "gemm1_median_us": 534.061998128891,
+      "gemm2_median_us": 698.3489990234375,
+      "plan_median_us": 35.652998834848404,
+      "ready_median_us": 8.813499938696623,
+      "native_e2e_median_us_per_layer": 1668.5152500031109,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_epbuffer_group4_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    }
+  ],
+  "mean_of_gpu_medians": {
+    "gemm1_median_us": 528.2269865274429,
+    "gemm2_median_us": 696.4393779635429,
+    "plan_median_us": 37.150624208152294,
+    "ready_median_us": 11.191874858923256,
+    "native_e2e_median_us_per_layer": 1668.4347500017793
+  }
+}

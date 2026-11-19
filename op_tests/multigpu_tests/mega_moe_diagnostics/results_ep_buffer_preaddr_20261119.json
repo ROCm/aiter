@@ -1,0 +1,79 @@
+{
+  "per_gpu": [
+    {
+      "run": "ipflegacy_p96_events_ep_buffer_preaddr_flash_01",
+      "rank": 0,
+      "gemm1_median_us": 528.1924903392792,
+      "gemm2_median_us": 709.6250057220459,
+      "plan_median_us": 39.299000054597855,
+      "ready_median_us": 15.302999876439571,
+      "native_e2e_median_us_per_layer": 1686.0567499179524,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_epbuffer_preaddr_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    },
+    {
+      "run": "ipflegacy_p96_events_ep_buffer_preaddr_flash_01",
+      "rank": 1,
+      "gemm1_median_us": 551.769495010376,
+      "gemm2_median_us": 710.6485068798065,
+      "plan_median_us": 36.19450144469738,
+      "ready_median_us": 8.772999979555607,
+      "native_e2e_median_us_per_layer": 1686.7218749894164,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_epbuffer_preaddr_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    },
+    {
+      "run": "ipflegacy_p96_events_ep_buffer_preaddr_flash_01",
+      "rank": 2,
+      "gemm1_median_us": 511.28748059272766,
+      "gemm2_median_us": 688.6529922485352,
+      "plan_median_us": 45.447999611496925,
+      "ready_median_us": 15.022000297904015,
+      "native_e2e_median_us_per_layer": 1686.5406250872184,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_epbuffer_preaddr_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    },
+    {
+      "run": "ipflegacy_p96_events_ep_buffer_preaddr_flash_01",
+      "rank": 3,
+      "gemm1_median_us": 531.6799879074097,
+      "gemm2_median_us": 705.6020200252533,
+      "plan_median_us": 36.956001073122025,
+      "ready_median_us": 15.10199997574091,
+      "native_e2e_median_us_per_layer": 1685.4931249099536,
+      "symbols": {
+        "gemm1": [
+          "s1f_pull_p96_w256_gm8_r8d3s4_ps64_mb8i2l3_poll1_affinity8p3_mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K5120_e96_act1_q1r8_prefetch_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ],
+        "gemm2": [
+          "mxfp4_tdm_fp4_apre_t256x256x256_w2x2_b4_K2304_e96_cluster1x4_prefetch_wpt1_epscatter_mg2_dsgroup3_fencewait_regpart_planarlds_interleavelds_pw256_et1_wmma2x4_order_epbuffer_preaddr_prebarrier4_barrier4_ksl0tail_4_ksl0prefix2_ab2_earlyacc"
+        ]
+      }
+    }
+  ],
+  "mean_of_gpu_medians": {
+    "gemm1_median_us": 530.7323634624481,
+    "gemm2_median_us": 703.6321312189102,
+    "plan_median_us": 39.474375545978546,
+    "ready_median_us": 13.550000032410026,
+    "native_e2e_median_us_per_layer": 1686.2030937261352
+  }
+}

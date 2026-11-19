@@ -481,6 +481,11 @@ def build_gemm_a8w4_tdm_task(
             )
     output_n_rep = warp_tile_n // 16
     num_waves = m_warp * n_warp
+    buffer_full_row = ep_buffer_store and tile_m % (num_waves * 16) == 0
+    buffer_rows = tile_m // num_waves if buffer_full_row else warp_tile_m
+    buffer_cols = tile_n if buffer_full_row else warp_tile_n
+    buffer_values = 8 if buffer_full_row else 4
+    buffer_dwords = buffer_values // 2
     block = num_waves * k_waves * WAVE
     SCATTER_GROUP_ROWS = 8
     SCATTER_PASSES_PER_VECTOR = WAVE // SCATTER_GROUP_ROWS
@@ -651,7 +656,9 @@ def build_gemm_a8w4_tdm_task(
     _drain = "_rolleddrain" if rolled_drain else ""
     _wmma_2x4 = "_wmma2x4_order" if wmma_2x4 else ""
     _prefence = (
-        "_epbuffer_rows" if ep_buffer_store else ""
+        ("_epbuffer_fullrow4" if buffer_full_row else "_epbuffer_group4")
+        if ep_buffer_store
+        else ""
     ) + f"_prebarrier{ksl1_prefence_mma}_barrier{wmma_in_barrier}"
     _prefence += f"_ksl0tail_{ksl0_fence_mma}"
     if a_is_fp4 and KWS > 1 and ksl0_prefix_mma:
@@ -1005,9 +1012,13 @@ def build_gemm_a8w4_tdm_task(
                 _ep_lsa0 = scalar_address(_ep_lsa0)
                 _ep_lsa1 = scalar_address(_ep_lsa1)
                 _ep_store_atom = fx.make_copy_atom(
-                    fx.rocdl.BufferCopy64b(3 << 3), fx.Int32
+                    (
+                        fx.rocdl.BufferCopy128b(3 << 3)
+                        if buffer_full_row
+                        else fx.rocdl.BufferCopy64b(3 << 3)
+                    ),
+                    fx.Int32,
                 )
-                _ep_store_value = fx.make_rmem_tensor(fx.make_layout(2, 1), fx.Int32)
         b_outer_row = eb64 * B_BATCH_ROWS + blk_n64 // 16
         a_off0 = blk_m64 * A_GROW
         b_off0 = b_outer_row * Kp16
@@ -1350,6 +1361,8 @@ def build_gemm_a8w4_tdm_task(
 
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
+        buffer_row_base = wave * buffer_rows if buffer_full_row else wmb
+        buffer_col_base = 0 if buffer_full_row else wnb
 
         # Keep stage/lane bases separate from the constant DS load offsets.
         lds_a_lane_off = (
@@ -2022,20 +2035,39 @@ def build_gemm_a8w4_tdm_task(
                 # LDS allocation, barrier, and four epilogue LDS reads. Their
                 # latency is likewise covered by the mainloop.
                 _rm_weight_rows = []
-                _rm_buffer_rows = []
+                _rm_buffer_addresses = []
+                _rm_buffer_valids = []
                 for wm in range_constexpr(wmma_m_rep):
                     _weight_row = wmb + wm * 16 + lane16
                     _weight_valid = _weight_row < mn_oob
                     _weight_safe_row = _weight_valid.select(_weight_row, fx.Int32(0))
-                    if const_expr(ep_buffer_store):
-                        _rm_buffer_rows.append(
-                            fx.Int32(
-                                fx.ptr_load(
-                                    _rm_i32
-                                    + blk_m64 * 2
-                                    + fx.Int64(_weight_safe_row) * 2
-                                )
+                    if const_expr(ep_buffer_store and wm < buffer_rows // 16):
+                        scatter_row = buffer_row_base + wm * 16 + lane16
+                        scatter_valid = scatter_row < mn_oob
+                        scatter_safe_row = scatter_valid.select(
+                            scatter_row, fx.Int32(0)
+                        )
+                        destination = fx.Int32(
+                            fx.ptr_load(
+                                _rm_i32 + blk_m64 * 2 + fx.Int64(scatter_safe_row) * 2
                             )
+                        )
+                        valid = scatter_valid & (destination >= 0)
+                        safe_destination = valid.select(destination, fx.Int32(0))
+                        peer = safe_destination // ep_destination_stride
+                        slot = safe_destination % ep_destination_stride
+                        # Compute all16 row addresses in parallel while inputs
+                        # are in flight, rather than serial SALU work per row.
+                        address = (
+                            _ep_lsa0
+                            + fx.Int64(peer) * (_ep_lsa1 - _ep_lsa0)
+                            + ep_combine_input_offset
+                            + fx.Int64(slot) * ep_slot_stride_bytes
+                            + fx.Int64(blk_n + buffer_col_base) * 2
+                        )
+                        _rm_buffer_addresses.append(address)
+                        _rm_buffer_valids.append(
+                            valid.select(fx.Int32(buffer_cols * 2), fx.Int32(0))
                         )
                     _weight_bits = fx.Int32(
                         fx.ptr_load(
@@ -2778,62 +2810,108 @@ def build_gemm_a8w4_tdm_task(
                                 )
 
             if const_expr(ep_buffer_store):
-                # Each wave reads only the M/N region it staged itself. Adjacent
-                # lanes now write adjacent K bytes, rather than short fragments
-                # scattered across 16 output rows. Closing task_barrier protects
-                # all LDS reads before any wave starts the next task's TDM loads.
-                rocdl.s_wait_dscnt(0)
+                # Full-row writers read C from all compute waves. The raw
+                # LDS barrier transfers ownership without draining peer stores.
+                if const_expr(buffer_full_row):
+                    task_barrier()
+                else:
+                    rocdl.s_wait_dscnt(0)
                 ep_lds_ptr = fx.recast_iter(fx.Int32, c_ep_base_ptr)
-                for wm in range_constexpr(wmma_m_rep):
-                    for row in range(16):
-                        destination = fx.Int32(
-                            fx.gpu.shuffle_idx(_rm_buffer_rows[wm], row, 32)
-                        )
-                        destination = fx.Int32(
-                            rocdl.readfirstlane(T.i32, destination.ir_value())
-                        )
-                        row_rel = wmb + wm * 16 + row
-                        valid = fx.Int32(
-                            ((row_rel < mn_oob) & (destination >= 0)).select(
-                                fx.Int32(1), fx.Int32(0)
-                            )
-                        )
-                        valid = fx.Int32(rocdl.readfirstlane(T.i32, valid.ir_value()))
-                        if valid != 0:
-                            peer = destination // ep_destination_stride
-                            slot = destination % ep_destination_stride
-                            address = (
-                                _ep_lsa0
-                                + fx.Int64(peer) * (_ep_lsa1 - _ep_lsa0)
-                                + ep_combine_input_offset
-                                + fx.Int64(slot) * ep_slot_stride_bytes
-                                + fx.Int64(blk_n + wnb) * 2
-                            )
-                            pointer = fx.inttoptr(
-                                fx.PointerType.get(T.i32, fx.AddressSpace.Global, 8),
-                                scalar_address(address),
-                            )
-                            view = fx.make_view(
-                                pointer, fx.make_layout(warp_tile_n // 2, 1)
-                            )
-                            buffer = fx.rocdl.make_buffer_tensor(
-                                fx.Tensor(view),
-                                max_size=False,
-                                num_records_bytes=warp_tile_n * 2,
-                            )
-                            pieces = fx.logical_divide(buffer, fx.make_layout(2, 1))
-                            for vector in range(lane, warp_tile_n // 4, 32):
-                                offset = (row_rel * STORE_PITCH + wnb + vector * 4) // 2
-                                data = fx.generic_load(ep_lds_ptr + offset, count=2)
-                                fx.memref_store_vec(data, _ep_store_value)
-                                index = (blk_n + wnb + vector * 4 < i32_n).select(
-                                    vector, fx.Int32(warp_tile_n // 4)
+                for wm in range_constexpr(buffer_rows // 16):
+                    for row_group in range_constexpr(0, 16, 4):
+                        for vector in range(lane, buffer_cols // buffer_values, 32):
+                            row_pieces = []
+                            row_values = []
+                            live_operands = []
+                            for row_offset in range_constexpr(4):
+                                row = row_group + row_offset
+                                row_rel = buffer_row_base + wm * 16 + row
+                                # No typed SGPR broadcast exists for descriptors.
+                                low = fx.Int32(
+                                    rocdl.readlane(
+                                        T.i32,
+                                        fx.Int32(_rm_buffer_addresses[wm]).ir_value(),
+                                        fx.Int32(row).ir_value(),
+                                    )
                                 )
+                                high = fx.Int32(
+                                    rocdl.readlane(
+                                        T.i32,
+                                        fx.Int32(
+                                            _rm_buffer_addresses[wm] >> 32
+                                        ).ir_value(),
+                                        fx.Int32(row).ir_value(),
+                                    )
+                                )
+                                bound = fx.Int32(
+                                    rocdl.readlane(
+                                        T.i32,
+                                        fx.Int32(_rm_buffer_valids[wm]).ir_value(),
+                                        fx.Int32(row).ir_value(),
+                                    )
+                                )
+                                address = fx.Int64(fx.Uint32(low)) | (
+                                    fx.Int64(high) << 32
+                                )
+                                pointer = fx.inttoptr(
+                                    fx.PointerType.get(
+                                        T.i32,
+                                        fx.AddressSpace.Global,
+                                        16 if buffer_full_row else 8,
+                                    ),
+                                    address,
+                                )
+                                view = fx.make_view(
+                                    pointer, fx.make_layout(buffer_cols // 2, 1)
+                                )
+                                buffer = fx.rocdl.make_buffer_tensor(
+                                    fx.Tensor(view),
+                                    max_size=False,
+                                    num_records_bytes=bound,
+                                )
+                                pieces = fx.logical_divide(
+                                    buffer, fx.make_layout(buffer_dwords, 1)
+                                )
+                                index = (
+                                    blk_n + buffer_col_base + vector * buffer_values
+                                    < i32_n
+                                ).select(vector, fx.Int32(buffer_cols // buffer_values))
+                                row_pieces.append(fx.slice(pieces, (None, index)))
+                                offset = (
+                                    row_rel * STORE_PITCH
+                                    + buffer_col_base
+                                    + vector * buffer_values
+                                ) // 2
+                                data = fx.generic_load(
+                                    ep_lds_ptr + offset, count=buffer_dwords
+                                )
+                                value = fx.make_rmem_tensor(
+                                    fx.make_layout(buffer_dwords, 1), fx.Int32
+                                )
+                                fx.memref_store_vec(data, value)
+                                row_values.append(value)
+                                live_operands.append(
+                                    fx.rocdl.get_buffer_rsrc(fx.get_iter(buffer))
+                                )
+                                live_operands.append(fx.Vector(data).ir_value())
+                            for row_offset in range_constexpr(4):
                                 fx.copy(
                                     _ep_store_atom,
-                                    _ep_store_value,
-                                    fx.slice(pieces, (None, index)),
+                                    row_values[row_offset],
+                                    row_pieces[row_offset],
                                 )
+                            # No public register-lifetime anchor exists. Actual
+                            # preaddr ISA reuses the descriptor after every store
+                            # and emits XCNT waits. Keep four descriptor/data
+                            # pairs live together; all transfers still use fx.copy.
+                            llvm_dialect.InlineAsmOp(
+                                res=None,
+                                operands_=live_operands,
+                                asm_string="",
+                                constraints="s,v,s,v,s,v,s,v",
+                                has_side_effects=True,
+                                is_align_stack=False,
+                            )
 
             # -- Shared LDS -> global --
             # dscnt-only barrier: the store reads LDS, not the e8m0 scales still

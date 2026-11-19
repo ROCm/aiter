@@ -1,5 +1,20 @@
 # S1F pull dispatch: current code and experiment handoff
 
+**Latest measured selection (2026-11-19): original gather/preshuffled S1F,
+P96/C160 with affinity3:5, and GEMM2 TDM gather scatter with persistent256.**
+At16384 tokens/rank (65536 global), two interleaved runs per mode give
+GEMM2 **591.41 -> 548.64 us** and native E2E/layer **1590.27 -> 1533.50 us**
+versus the same workspace's default GEMM2 grid. Full-size changing-routing
+correctness passed. This is not a comparison against a fresh origin/main.
+See [paired results and reproduction](op_tests/multigpu_tests/mega_moe_diagnostics/RESULTS_EP_TDM_PERSIST_20261119.md).
+
+```bash
+AITER_MOE_EP_BUFFER_STORE=0 AITER_FLYDSL_PERSISTENT_WORKERS2=256 AITER_MOE_S1F_AFFINITY=1 bash run_ds41_flash_best.sh
+```
+
+The source-shuffle and buffer-store experiments below remain optional; this
+selected configuration uses neither. Older sections retain experiment history.
+
 **当前实现的关键保证：开启 `AITER_MEGA_PULL_SRC_SHUFFLE=1` 后，每个 M256
 内的所有有效行都来自同一个 source rank。Padding 行不对应 token，反向路由为
 `(-1, 0)`。这个保证适用于 normal routing，不依赖 balanced routing。**
@@ -339,9 +354,12 @@ GEMM2's unquantized EP scatter. Start from the original gather/preshuffled S1F
 baseline, with unique pull, source packing and linear GEMM2 stores disabled.
 
 Each compute wave weights its accumulator in fp32, converts to bf16, and
-stages its output in the existing LDS layout. It reads only its own M/N region
-and issues `buffer_store_b64` along contiguous columns:32 lanes write four
-bf16 values each (256 contiguous bytes per wave). Wave-uniform row descriptors
+stages its output in the existing LDS layout. For M divisible by16*num_waves,
+output ownership becomes full-N row stripes: at M256/N256/waves2x2 each wave
+writes64 rows of512B using `buffer_store_b128`. A raw LDS barrier precedes
+cross-wave reads. Smaller M retains compute-wave ownership and64b stores.
+Row addresses are precomputed lane-wise; four descriptor/data pairs are kept
+live together to reduce premature resource reuse. Wave-uniform row descriptors
 select the source rank's combine landing slot; invalid rows/columns are masked.
 Output uses no TDM stores, so the next task's tensor counter covers input only.
 
@@ -367,14 +385,17 @@ CHECK_TPR=257 CHECK_EP_BUFFER=1 BENCH_EP_BUFFER_STORE=1 BENCH_GEMM2_WORKERS=256 
 `audit_ep_buffer_asm.py PATH_TO_22_final_isa.s` checks the emitted CFG: no
 storecnt wait can belong to a control-flow cycle, the sole store wait must be
 in the exit block, and output must contain buffer stores without tensor stores.
-The runtime symbol contains `_pw256_` and `_epbuffer_`; A remains preshuffled.
+The runtime symbol contains `_pw256_` and `_epbuffer_fullrow4_` for the Flash
+shape (or `_epbuffer_group4_` for smaller M); A remains preshuffled.
 The mode rejects quantized combine, linear landing maps, split-K, nonpersistent
 launches, and per-peer landing extents reaching4GiB.
 
-**This option is slower and remains disabled by default.** At16384 tokens/rank,
-GEMM2/E2E are729.77/1685.21us versus578.35/1553.67us for the original default.
-Persistent256 with TDM scatter measures553.17/1574.99us. All values average the
-four GPU medians; E2E is per layer. Small and full changing-routing checks passed.
-The emitted full-size kernel has128 static buffer stores, no tensor stores and
-one exit-only storecnt wait. See [results and analysis](op_tests/multigpu_tests/mega_moe_diagnostics/RESULTS_EP_BUFFER_20261119.md)
-and [actual ISA excerpt](op_tests/multigpu_tests/mega_moe_diagnostics/ep_buffer_assembly_excerpt.s).
+**This option is slower and remains disabled by default.** The retained full-row4
+version measured GEMM2/E2E **669.89/1650.96 us** in one run. Earlier compute-wave
+rows measured729.77/1685.21 us. The full-row version has64 static buffer_store_b128
+instructions, no tensor stores and one exit-only storecnt. Small/full changing
+routing checks passed. A non-temporal variant passed full correctness but was
+not timed; it is saved in `ep_buffer_nt_experiment.patch`, not enabled in source.
+XCNT also drains implicitly at branches/raw barriers, so explicit wait counts
+alone cannot establish latency. See [buffer experiment history](op_tests/multigpu_tests/mega_moe_diagnostics/RESULTS_EP_BUFFER_20261119.md)
+and [selected TDM comparison](op_tests/multigpu_tests/mega_moe_diagnostics/RESULTS_EP_TDM_PERSIST_20261119.md).

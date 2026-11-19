@@ -22,6 +22,7 @@ suite.HIDDEN, suite.INTER, suite.TOPK = 5120, 2304, 6
 suite.TOKENS = int(os.environ.get("CHECK_TPR", "257"))
 suite.EXPERTS_PER_RANK = 96
 suite.CHECKS = (
+    suite._check_pull_s1f_ep_tdm if os.environ.get("CHECK_EP_TDM") == "1" else
     suite._check_pull_s1f_ep_buffer if os.environ.get("CHECK_EP_BUFFER") == "1" else
     suite._check_pull_s1f_unique if os.environ.get("CHECK_UNIQUE") == "1"
     else suite._check_pull_s1f_src_rank_shuffle,
