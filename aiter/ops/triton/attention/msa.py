@@ -416,10 +416,13 @@ def _fast(fn):
 
 # k4v8 Gluon K / V loading: async copy into LDS (default) or registers.
 _KV_LDS = __import__("os").getenv("AITER_MSA_KV_LDS", "1") == "1"
-# BLOCK_M 32 / 64 prefill: per-wave key split (each wave its own softmax state over
-# its 32 keys of a page, one merge after the loop; with KV_LDS the K scales are
-# async-copied too). Opt-in.
-_WSPLIT = __import__("os").getenv("AITER_MSA_WAVE_SPLIT", "0") == "1"
+# BLOCK_M 32 prefill (one segment): per-wave key split (each wave its own softmax
+# state over its 32 keys of a page, one merge after the loop), each query row
+# computing only the pages it picked; with KV_LDS the K scales are async-copied
+# too. Default on (0: the masked 32-row tile). AgentX top-k dumps, 16384 rows:
+# 470 / 487 / 470 -> 429 / 429 / 428 us (FlyDSL NVFP4: 430 / 441 / 429).
+# The kernel takes BLOCK_M 64 (4 rows) too, but slower (1 wave a SIMD: 269 VGPRs): off.
+_WSPLIT = __import__("os").getenv("AITER_MSA_WAVE_SPLIT", "1") == "1"
 
 
 _PLANS: dict = {}
@@ -542,7 +545,7 @@ def _gluon_plan(
             raise ValueError("out_mxfp8 rows must be dense")
     elif out is not None and rows and (out.stride(-1) != 1 or out.stride(-2) != HEAD_DIM):
         raise ValueError("out must be [rows, H, 128] with contiguous heads")
-    wsplit = _WSPLIT and block_q in (2, 4) and qt == 1 and num_warps == 4
+    wsplit = _WSPLIT and block_q == 2 and qt == 1 and num_warps == 4 and nseg == 1 and not decode
     return dict(
         rows=rows, num_kv_heads=num_kv_heads, decode=decode, n_topk=n_topk, num_heads=num_heads,
         qt=qt, hg=hg, block_m=block_m, block_q=block_q, groups=groups, seg_pages=seg_pages,
