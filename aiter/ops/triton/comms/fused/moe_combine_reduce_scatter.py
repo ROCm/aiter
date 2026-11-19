@@ -55,9 +55,12 @@ class MoeCombineReduceScatter(IpcCommBuffers):
         assert max_tokens > 0
         self.hidden, self.topk, self.max_tokens = hidden, topk, max_tokens
         self.config = _get_config(self.world, hidden)
-        blocks, parts = self.config["BLOCKS"], self.config["PARTS"]
-        assert hidden // 2 % parts == 0 and blocks % parts == 0
-        world = self.world
+        parts = self.config["PARTS"]
+        assert hidden // 2 % parts == 0, "PARTS must divide hidden / 2"
+        # All CTAs must run at the same time: one CTA a CU, PARTS CTAs a row.
+        self.blocks = min(self.config["BLOCKS"], self.num_cus) // parts * parts
+        assert self.blocks > 0, "fewer CUs than PARTS"
+        blocks, world = self.blocks, self.world
         self.rows_max = triton.cdiv(max_tokens, world)
         flags = ERROR_BYTES
         done = flags + (world - 1) * self.rows_max * parts * 4
@@ -134,7 +137,7 @@ def fused_moe_combine_reduce_scatter(
     )
 
     config = comm.config
-    _moe_combine_reduce_scatter_kernel[(config["BLOCKS"],)](
+    _moe_combine_reduce_scatter_kernel[(comm.blocks,)](
         inter.view(torch.int32),
         reverse_sorted,
         sorted_weights,
@@ -150,7 +153,7 @@ def fused_moe_combine_reduce_scatter(
         TOPK=topk,
         WORLD=comm.world,
         PARTS=config["PARTS"],
-        BLOCKS=config["BLOCKS"],
+        BLOCKS=comm.blocks,
         RMAX=comm.rows_max,
         FLAG0=comm.offsets["flags"],
         DONE0=comm.offsets["done"],
