@@ -1,13 +1,16 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
+import functools
 import itertools
+import os
 
 import torch
 import triton
 
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a4w4 import (
     _moe_gemm_a4w4_decode,
+    _moe_gemm_a4w4_decode_pipelined,
     _moe_gemm_a4w4_prefill,
     get_moe_a4w4_layouts_decode,
     get_moe_a4w4_layouts_prefill,
@@ -485,7 +488,90 @@ def moe_gemm_a4w4(
     grid = grid_m * grid_n * split_k
 
     # launch kernel
-    if use_gluon and block_m == 16:
+    decode_n_iters = int(
+        os.environ.get(
+            "AITER_A4W4_DECODE_NITERS" if block_m == 16 else "AITER_A4W4_PREFILL_NITERS", "0"
+        )
+    )
+    use_pipelined_decode = (
+        use_gluon
+        and decode_n_iters > 0
+        and grid_n % decode_n_iters == 0
+        and preshuffle_weights
+        and swizzle_mx_scale == "GFX1250_SCALE"
+        and K % config["block_k"] == 0
+        and not fused_ep_scatter
+        and dst_row is None
+    )
+    if use_pipelined_decode:
+        layout_fn = (
+            get_moe_a4w4_layouts_decode
+            if block_m == 16
+            else functools.partial(get_moe_a4w4_layouts_prefill, num_ctas=1)
+        )
+        layouts = layout_fn(
+            BLOCK_M=config["block_m"],
+            BLOCK_N=config["block_n"],
+            BLOCK_K=config["block_k"],
+            num_warps=config["num_warps"],
+            ACTIVATION_REDUCTION_N=reduction_n_matmul,
+            PRESHUFFLE_WEIGHTS=preshuffle_weights,
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            has_GatherIndx=gather_indx is not None,
+            gather_idx_bitwidth=_gather_idx_bitwidth(gather_indx),
+            X_SCALES_TDM=True,
+        )
+        layouts = {k: v for k, v in layouts.items() if k not in ("BLOCKED_LAYOUT_X_SCALES", "SHARED_LAYOUT_Y")}
+        _moe_gemm_a4w4_decode_pipelined[(grid_m * (grid_n // decode_n_iters),)](
+            y_ptr,
+            stride_y_m,
+            stride_y_n,
+            x,
+            x.stride(0),
+            x.stride(1),
+            x_scales,
+            x_scales.stride(0),
+            x_scales.stride(1),
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales,
+            w_scales.stride(0),
+            w_scales.stride(1),
+            w_scales.stride(2),
+            bias,
+            stride_bias,
+            gammas,
+            num_tokens,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_block_pid_map,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            swiglu_add_residual,
+            routing_data.n_expts_act,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            NUM_BUFFERS=int(os.environ.get("AITER_A4W4_DECODE_NB", config["num_buffers"])),
+            N_ITERS=decode_n_iters,
+            UPCAST_INDICES=should_upcast_indices(x, w, y_ptr),
+            **layouts,
+            YMxScale=y_scale,
+            stride_y_mx_m=stride_y_mx_m,
+            stride_y_mx_n=stride_y_mx_n,
+            HAS_MX_OUT=out_mx_quant,
+            num_warps=config["num_warps"],
+            waves_per_eu=config["waves_per_eu"],
+        )
+    elif use_gluon and block_m == 16:
         layouts = get_moe_a4w4_layouts_decode(
             BLOCK_M=config["block_m"],
             BLOCK_N=config["block_n"],
