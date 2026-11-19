@@ -75,12 +75,12 @@ _S1F_MAX_RECV = 4096
 #: 8192 tokens/rank: 886 vs 959 us/layer on EP2, 900 vs 1063 on EP4. Top-7 is
 #: the same model with its shared expert fused: 1200 vs 1405 on EP2. Past
 #: 4096 tokens this compiles a few more plan widths (7 instead of 4 at 8192).
-#: An 8192 bound runs fused at 249 vs 273 us/layer on EP8 (1024 tokens/rank)
-#: and 175 vs 186 on EP16 (512 tokens/rank); wider steps there are unmeasured.
+#: EP8 runs fused at 249 vs 273 us/layer at 1024 tokens/rank and 577 vs 668
+#: at 4096; EP16 at 175 vs 186 at 512 tokens/rank. Wider steps are unmeasured.
 _S1F_MAX_RECV_BY_SHAPE: dict = {
     (2, 6): 1 << 30,
     (4, 6): 1 << 30,
-    (8, 6): 8192,
+    (8, 6): 32768,
     (16, 6): 8192,
     (2, 7): 1 << 30,
     (4, 7): 1 << 30,
