@@ -33,6 +33,13 @@ constexpr int kBlockSize = 256; // every launch of the kernel
 constexpr int kMultiRows = 4;
 constexpr int64_t kMultiRowMinRowsPerCu = 128;
 
+// The multi-row kernels and the fused split-K partials load are built for gfx1250 only.
+static bool isGfx1250()
+{
+    static const bool is_gfx1250 = get_gpu_arch() == "gfx1250"; // queries the driver
+    return is_gfx1250;
+}
+
 // On gfx12 a 32-lane warp is a whole wave32 wave, so what depends only on the warp
 // index is wave-uniform: readfirstlane keeps it in SGPRs (scalar loads of the
 // per-token tables, scalar branches on the slot kind). A wave64 wave holds two warps.
@@ -51,20 +58,16 @@ __device__ __forceinline__ float shflXor(float v)
 {
 #if defined(__GFX12__)
     static_assert(kMask == 1 || kMask == 2 || kMask == 4 || kMask == 8 || kMask == 16);
-    const int i = __builtin_bit_cast(int, v);
     if constexpr(kMask == 16)
     {
-        // lane L reads lane L of the other 16-lane row
-        return __builtin_bit_cast(
-            float, __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false));
+        return warp_permlanex16(v); // lane L reads lane L of the other 16-lane row
     }
     else
     {
         // DPP row_xmask: lane L reads lane L ^ kMask of its row. No lane reads outside
         // its row, so bound_ctrl changes nothing; it lets the compiler fold the move
         // into the add or max that consumes it.
-        return __builtin_bit_cast(
-            float, __builtin_amdgcn_mov_dpp(i, 0x160 | kMask, 0xf, 0xf, true));
+        return opus::mov_dpp(v, opus::number<0x160 | kMask>{});
     }
 #else
     return __shfl_xor(v, kMask, 32);
@@ -242,9 +245,10 @@ __device__ __forceinline__ uint16_t bf16BitsOfF32(double x)
 {
     if(fabs(x) < 0x1p-126) // round the subnormal's fp32 bits to nearest even
     {
-        const uint32_t u = (signbit(x) ? 0x80000000u : 0u) |
-                           static_cast<uint32_t>(fabs(x) * 0x1p149);
-        return static_cast<uint16_t>((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+        const uint32_t mag = static_cast<uint32_t>(fabs(x) * 0x1p149);
+        __builtin_assume(mag < 0x00800000u); // a subnormal: not inf/NaN, as the helper checks
+        return opus::fp32_to_bf16_rtn_raw(
+            __builtin_bit_cast(float, (signbit(x) ? 0x80000000u : 0u) | mag));
     }
     return __builtin_bit_cast(uint16_t, static_cast<__bf16>(static_cast<float>(x)));
 }
@@ -880,7 +884,8 @@ __global__ void fusedQKNormIdxrQKNormKernel(
     // NVFP4 is K, V and index-K pages together: never a fallback to the MXFP4 stores.
     static_assert(!kNvfp4 || (kKvFp4 && kIndexFp4), "kNvfp4 requires kKvFp4 and kIndexFp4");
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1250__)
-    static_assert(kRows == 1, "several rows per warp are compiled for gfx1250 only");
+    static_assert(kRows == 1 && !kPartials,
+                  "several rows per warp and the partials load are compiled for gfx1250 only");
 #endif
     constexpr int warps_per_block = kBlockSize / kNumLanes;
     const int lane_id = threadIdx.x % 32;
@@ -1385,19 +1390,20 @@ void launchFusedQKNormIdxrQKNorm(
     const int slots_per_token = nq + nkv + v_slots + idx_slots;
     constexpr int kWarpsPerBlock = kBlockSize / 32;
     const int64_t total_rows = static_cast<int64_t>(num_tokens) * slots_per_token;
-    // Several rows per warp on gfx1250 only. The fp4 caches, which run on gfx950 only (the
-    // Python op refuses them elsewhere), have no multi-row instantiation, nor does the
-    // split-K partials load. Only the host and gfx1250 passes instantiate the multi-row
-    // kernels: the other device passes skip them, so other archs do not build kernels that
-    // never run there (their host-side launch below is not taken off gfx1250).
+    // Several rows per warp, and the split-K partials load, on gfx1250 only. The fp4 caches,
+    // which run on gfx950 only (the Python op refuses them elsewhere), have no multi-row
+    // instantiation, nor does the split-K partials load. Only the host and gfx1250 passes
+    // instantiate these kernels: the other device passes skip them, so other archs do not
+    // build kernels that never run there (their host-side launch is not taken off gfx1250).
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1250__)
     constexpr int kMultiRowsCfg = 1;
+    constexpr bool kPartialsCfg = false;
 #else
     constexpr int kMultiRowsCfg = kKvFp4 || kIndexFp4 ? 1 : kMultiRows;
+    constexpr bool kPartialsCfg = true;
 #endif
-    static const bool multi_row_arch = get_gpu_arch() == "gfx1250"; // queries the driver
     static const int64_t multi_row_min_rows = kMultiRowMinRowsPerCu * get_num_cu_func();
-    const int rows_per_warp = kMultiRowsCfg > 1 && multi_row_arch && partials.num_splits == 0 &&
+    const int rows_per_warp = kMultiRowsCfg > 1 && isGfx1250() && partials.num_splits == 0 &&
                                       total_rows >= multi_row_min_rows
                                   ? kMultiRowsCfg
                                   : 1;
@@ -1475,8 +1481,8 @@ void launchFusedQKNormIdxrQKNorm(
     } while(0)
 
 // The e4m3 q_out store is compiled in only where it can run (insert mode), so the other
-// instantiations are unchanged. So is the split-K partials load: bf16 insert modes that
-// cover every qkv column, one row per warp (the host reduces the partials of any other
+// instantiations are unchanged. So is the split-K partials load: gfx1250, bf16 insert modes
+// that cover every qkv column, one row per warp (the host reduces the partials of any other
 // call first).
 #define LAUNCH(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE)               \
     do                                                                                       \
@@ -1489,7 +1495,7 @@ void launchFusedQKNormIdxrQKNorm(
             }                                                                                \
             else if(partials.num_splits > 0)                                                 \
             {                                                                                \
-                if constexpr(std::is_same_v<scalar_t, hip_bfloat16> &&                       \
+                if constexpr(kPartialsCfg && std::is_same_v<scalar_t, hip_bfloat16> &&       \
                              (!(IS_SPARSE) || (PROCESS_INDEX)) && !kKvFp4 && !kIndexFp4)     \
                 {                                                                            \
                     LAUNCH_Q(IS_SPARSE, PROCESS_INDEX, INSERT, ASM, PER_TOKEN, STATIC_SCALE, false, true, 1); \
@@ -1864,12 +1870,6 @@ static void fused_qknorm_idxrqknorm_impl(
             // distinct pages.
             AITER_CHECK(kv_cache_k->size(0) <= 1 || kv_cache_k->stride(0) >= kv_cache_k->size(1),
                         "nvfp4 kv_cache page stride must be at least the page size");
-            // The launch runs on qkv's device and reads these through raw pointers.
-            AITER_CHECK(kv_cache_k->device_id == qkv.device_id &&
-                            k_scale->device_id == qkv.device_id &&
-                            v_scale->device_id == qkv.device_id &&
-                            (!process_index || index_cache->device_id == qkv.device_id),
-                        "nvfp4 kv_cache, k_scale, v_scale and index_cache must be on qkv's device");
             k_s_block = kv_cache_k->stride(0);
             v_s_block = k_s_block;
             if(process_index)
@@ -2040,6 +2040,28 @@ static void fused_qknorm_idxrqknorm_impl(
                     "index_q_out must have num_tokens * num_index_heads * 128 elements");
     }
 
+    // The launches run on qkv's device and read or write every tensor of the call they use
+    // through a raw pointer.
+    const auto on_qkv_device = [&](const std::optional<aiter_tensor_t>& t) {
+        return !t.has_value() || t->device_id == qkv.device_id;
+    };
+    const bool kv_scaled = fp8_kv_per_token || fp8_kv_static || nvfp4_kv_cache;
+    AITER_CHECK(q_norm_weight.device_id == qkv.device_id &&
+                    k_norm_weight.device_id == qkv.device_id &&
+                    cos_sin_cache.device_id == qkv.device_id &&
+                    positions.device_id == qkv.device_id && on_qkv_device(q_out) &&
+                    on_qkv_device(qkv_partials) &&
+                    (!process_index ||
+                     (on_qkv_device(index_q_out) && on_qkv_device(index_q_norm_weight) &&
+                      on_qkv_device(index_k_norm_weight))) &&
+                    (!insert_kv ||
+                     (on_qkv_device(slot_mapping) && on_qkv_device(kv_cache_k) &&
+                      on_qkv_device(kv_cache_v) &&
+                      (!kv_scaled || (on_qkv_device(k_scale) && on_qkv_device(v_scale))) &&
+                      (!process_index || (on_qkv_device(index_slot_mapping) &&
+                                          on_qkv_device(index_cache))))),
+                "every tensor the call reads or writes must be on qkv's device");
+
     QkvPartials partials{};
     if(qkv_partials.has_value())
     {
@@ -2047,8 +2069,6 @@ static void fused_qknorm_idxrqknorm_impl(
         const aiter_tensor_t& qp = *qkv_partials;
         AITER_CHECK(qp.is_gpu() && qp.dtype() == AITER_DTYPE_fp32 && qp.dim() == 3,
                     "qkv_partials must be a float32 CUDA [num_splits, rows, row] tensor");
-        // The launch runs on qkv's device and reads it through a raw pointer.
-        AITER_CHECK(qp.device_id == qkv.device_id, "qkv_partials must be on qkv's device");
         const int64_t splits = qp.size(0);
         AITER_CHECK(splits == 2 || splits == 4 || splits == 8,
                     "qkv_partials supports 2, 4 or 8 splits");
@@ -2074,9 +2094,9 @@ static void fused_qknorm_idxrqknorm_impl(
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
     // The main kernel sums the partials as it reads qkv where it writes every qkv column
-    // back: the insert mode with every slot processed, no fp4 cache and no e4m3 q. Any
-    // other call reduces them into qkv first.
-    const bool fuse_partials = insert_kv && (!has_index || process_index) &&
+    // back: on gfx1250, the insert mode with every slot processed, no fp4 cache and no
+    // e4m3 q. Any other call reduces them into qkv first.
+    const bool fuse_partials = isGfx1250() && insert_kv && (!has_index || process_index) &&
                                !fp4_kv_cache && !fp4_index_cache && !q_is_fp8;
     if(partials.num_splits > 0 && !fuse_partials)
     {
@@ -2112,7 +2132,6 @@ static void fused_qknorm_idxrqknorm_impl(
         {
             // FP4 (MXFP4/NVFP4) main K/V and/or index K (sparse insert only); the other cache
             // keeps its type.
-            const bool kv_scaled = fp8_kv_per_token || fp8_kv_static || nvfp4_kv_cache;
             auto launch_fp4 = [&]<typename CacheT,
                                   typename IndexT,
                                   vllm::Fp8KVCacheDataType kv_dt,

@@ -2421,10 +2421,11 @@ def reduce_partials(partials: torch.Tensor) -> torch.Tensor:
 
 
 def make_partials(splits: int, rows: int, row: int, inf_row: int | None):
-    """Random partials plus columns whose sums are subnormal, overflow, NaN or bf16 ties:
-    where the op's denormal-flushing arithmetic could part from the reduce kernel's. The
-    overflow and NaN columns go in token inf_row only (none if None), so every other
-    token's heads normalize to finite values that are compared bit for bit."""
+    """Random partials plus columns whose partials, running sums or sums are subnormal,
+    or whose sums overflow, are NaN or bf16 ties: where the op's denormal-flushing
+    arithmetic could part from the reduce kernel's. The overflow and NaN columns go in
+    token inf_row only (none if None), so every other token's heads normalize to finite
+    values that are compared bit for bit."""
     p = torch.randn(splits, rows, row, device="cuda") * 4
     tiny = torch.finfo(torch.float32).tiny
     edges = [
@@ -2432,16 +2433,22 @@ def make_partials(splits: int, rows: int, row: int, inf_row: int | None):
         (3e-39, 1e-39),  # subnormal partials
         (1.0, 2.0**-8),  # tie, rounds down to the even 1.0
         (1.0 + 2.0**-7, 2.0**-8),  # tie, rounds up to the even 1 + 2^-6
+        # a subnormal partial after the first: flushed, the sum would round to even
+        torch.tensor([0x00808000, 1], dtype=torch.int32).view(torch.float32).tolist(),
+        # a subnormal running sum the next split makes normal again: flushed, the
+        # sum would be tiny, not 1.5 tiny
+        (1.5 * tiny, -tiny, tiny),
         (3.3e38, 3.3e38),  # overflow to inf
         (float("inf"), float("-inf")),  # NaN
     ]
-    for c, (a, b) in enumerate(edges):
-        if c >= 4 and inf_row is None:
+    for c, sums in enumerate(edges):
+        if c >= 6 and inf_row is None:
             continue
         cols = slice(c, None, 61)  # a few columns of every head
-        tokens = slice(None) if c < 4 else slice(inf_row, inf_row + 1)
+        tokens = slice(None) if c < 6 else slice(inf_row, inf_row + 1)
         p[:, tokens, cols] = 0.0
-        p[0, tokens, cols], p[1, tokens, cols] = a, b
+        for s, v in enumerate(sums[:splits]):
+            p[s, tokens, cols] = v
     return p
 
 
@@ -2572,13 +2579,23 @@ def check_arg_rejects():
             pass
         else:
             raise AssertionError("supports() hid a load failure")
-    # A call that writes no fp8 (here an fp8 index dtype on a skip_index_branch layer)
-    # is taken on gfx1100 too.
+    # A call that writes no fp8 (an fp8 index dtype, or an fp8 index_q_out, on a
+    # skip_index_branch layer) is taken on gfx1100 too.
     no_index = ({15: None}, {"skip_index_branch": True, "index_cache_dtype": "fp8"})
+    iq8 = torch.zeros(qkv.shape[0], HEAD_DIM, dtype=dtypes.fp8, device="cuda")
     for gfx, msg in (("gfx1100", "requires one of"), ("gfx1250-strict", None)):
         with mock.patch.object(op, "get_gfx_runtime", return_value=gfx):
             check_rejects(
-                {gfx: (fp8, {}, {}, msg), f"{gfx}_skip": (call, *no_index, None)}
+                {
+                    gfx: (fp8, {}, {}, msg),
+                    f"{gfx}_skip": (call, *no_index, None),
+                    f"{gfx}_skip_fp8_index_q": (
+                        call,
+                        {15: None, 18: iq8},
+                        {"skip_index_branch": True},
+                        None,
+                    ),
+                }
             )
     return 0
 
@@ -2634,24 +2651,34 @@ DEFAULT_CASES += [
     ("mxfp4_scale_rule", "bf16", 4096, 128, 64, 1),
     ("mxfp4_reject", "bf16", 32, 16, 64, 1),
 ]
-# gfx1250 runs 4 rows per warp from 128 rows per CU on: a launch above that, with a row
-# count (num_tokens * 29 slots in insert mode, 16 q / 4 kv / 4 index heads) not a multiple
-# of 4, so the last warp has tail rows.
+# gfx1250 runs 4 rows per warp from 128 rows per CU on (every mode but the fp4 caches and
+# qkv_partials): launches above that, at least 20 (token, slot) rows per token. An odd
+# token count gives the 25 and 29 slot modes (16 q / 4 kv / 4 index heads) a row count
+# that is not a multiple of 4, so the last warp has tail rows.
 if base_gfx_arch(get_gfx_runtime()) == "gfx1250":
     multi_row_tokens = (
-        128 * torch.cuda.get_device_properties(0).multi_processor_count + 28
-    ) // 29 | 1
+        128 * torch.cuda.get_device_properties(0).multi_processor_count + 19
+    ) // 20 | 1
     DEFAULT_CASES += [
-        (mode, "bf16", multi_row_tokens, 16, 64, 4)
-        for mode in ("insert", "asm_layout_fp8_pertoken")
+        (mode, dtype_name, multi_row_tokens, block_size, 64, niq)
+        for mode, dtype_name, block_size, niq in (
+            ("insert", "bf16", 16, 4),
+            ("insert", "fp16", 16, 4),
+            ("asm_layout", "bf16", 16, 4),
+            ("asm_layout_fp8_pertoken", "bf16", 16, 4),
+            ("inplace", "bf16", 16, 0),
+            ("inplace", "bf16", 16, 4),
+            ("q_fp8_out", "bf16", 128, 1),
+        )
     ]
-# the live GPU, not GPU_ARCHS (CI exports "gfx942;gfx950" and get_gfx() takes the last one)
+# the live GPU, not GPU_ARCHS (CI exports "gfx942;gfx950" and get_gfx() takes the last one).
+# The e4m3 q_out runs wherever opus converts to fp8, the fp4 caches on gfx950 only.
 if get_gfx_runtime() != "gfx950":
+    q_fp8 = ["q_fp8_out"] if base_gfx_arch(get_gfx_runtime()) in op._FP8_CVT_GFX else []
     aiter.logger.warning(
-        "mxfp4 caches and the e4m3 q_out are tested on gfx950 only, not %s: skipping",
-        get_gfx_runtime(),
+        "mxfp4 caches are tested on gfx950 only, not %s: skipping", get_gfx_runtime()
     )
-    DEFAULT_CASES = [case for case in DEFAULT_CASES if case[0] not in MXFP4]
+    DEFAULT_CASES = [c for c in DEFAULT_CASES if c[0] not in MXFP4 or c[0] in q_fp8]
 
 l_mode = [
     "insert",

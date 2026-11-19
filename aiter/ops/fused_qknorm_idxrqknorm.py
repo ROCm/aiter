@@ -22,8 +22,16 @@ _FP8_E4M3_DTYPES = tuple(
 )
 
 
+_FP4 = ("mxfp4", "nvfp4")
+
 # Targets with opus::fp32_to_fp8 (opus.hpp).
 _FP8_CVT_GFX = ("gfx942", "gfx950", "gfx1200", "gfx1201", "gfx1250")
+
+
+# The live arch, a constant to torch.compile (no graph break on the driver query).
+@torch.compiler.assume_constant_result
+def _gfx() -> str:
+    return base_gfx_arch(get_gfx_runtime())
 
 
 def _is_fp8_e4m3_tensor(t: Tensor | None) -> bool:
@@ -128,7 +136,8 @@ def fused_qknorm_idxrqknorm(
     #   qkv slot processed (no skip_index_branch), no fp4 cache and no fp8 q_out; by a
     #   reduce kernel launched first otherwise.
     # Refused arguments raise RuntimeError before anything is launched; the C++ entry
-    #   checks every argument the kernels read.
+    #   checks the dtype, layout, size and device of every tensor the kernels read or
+    #   write (not the values: slot_mapping and positions entries are the caller's).
     # check_only: run every check of the call, launch nothing; a refusal raises ValueError
     #   (see fused_qknorm_idxrqknorm_supports).
     if index_cache_dtype is None:
@@ -139,22 +148,30 @@ def fused_qknorm_idxrqknorm(
         )
 
     # opus has no fp4 conversion off gfx950 and no fp8 conversion on gfx1100/gfx115x: the
-    # stores would silently write zeros.
+    # stores would silently write zeros. The arch is looked up only for such a store.
     refused = ValueError if check_only else RuntimeError
-    fp4_dtypes = {"mxfp4", "nvfp4"} & {kv_cache_dtype, index_cache_dtype}
-    gfx = base_gfx_arch(get_gfx_runtime())
-    if fp4_dtypes and gfx != "gfx950":
+    if (kv_cache_dtype in _FP4 or index_cache_dtype in _FP4) and _gfx() != "gfx950":
         raise refused("fused_qknorm_idxrqknorm mxfp4/nvfp4 caches require gfx950")
-    # The index cache is written only in insert mode with the index branch processed.
-    insert_index = (
-        kv_cache_k is not None and num_index_heads > 0 and not skip_index_branch
-    )
-    fp8_stores = (
-        (kv_cache_k is not None and kv_cache_dtype.startswith("fp8"))
-        or (insert_index and index_cache_dtype.startswith("fp8"))
-        or any(t is not None and t.dtype != qkv.dtype for t in (q_out, index_q_out))
-    )
-    if fp8_stores and gfx not in _FP8_CVT_GFX:
+    # The index cache and index_q_out are written only with the index branch processed,
+    # the index cache in insert mode only. Per call: "auto" first (cheaper than startswith),
+    # qkv.dtype read once.
+    index_branch = num_index_heads > 0 and not skip_index_branch
+    dt = qkv.dtype
+    if (
+        (
+            kv_cache_k is not None
+            and (
+                (kv_cache_dtype != "auto" and kv_cache_dtype.startswith("fp8"))
+                or (
+                    index_branch
+                    and index_cache_dtype != "auto"
+                    and index_cache_dtype.startswith("fp8")
+                )
+            )
+        )
+        or (q_out is not None and q_out.dtype != dt)
+        or (index_branch and index_q_out is not None and index_q_out.dtype != dt)
+    ) and _gfx() not in _FP8_CVT_GFX:
         raise refused(
             f"an fp8 cache, q_out or index_q_out requires one of {_FP8_CVT_GFX}"
         )
